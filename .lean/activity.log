@@ -200,3 +200,11 @@
   summary: "Added verification status API: GET /oxide/v1/verified returns static manifest of all 11 Kani proofs with kernel names, harness IDs, proven properties, and caveats about what IS/ISN'T proven."
   iteration: 3
   max_iterations: 10
+
+- timestamp: "2026-06-15T22:15:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2c-kani-ci"
+  summary: "Added GitHub Actions workflow for continuous Kani verification on every PR. Verifies oxide-kernels (8 proofs) and oxide-engine (3 proofs). Kani version pinned to 0.67.0."
+  iteration: 4
+  max_iterations: 10

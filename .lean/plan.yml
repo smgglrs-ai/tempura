@@ -340,7 +340,8 @@ items:
     title: Kani in CI
     description: >
       cargo kani runs on every PR. Verification is continuous, not one-time.
-    status: planned
+    status: done
+    progress: 100
     priority: medium
     effort: S
     depends_on: [2a-kani-kernels, 2a-kani-kvcache]
