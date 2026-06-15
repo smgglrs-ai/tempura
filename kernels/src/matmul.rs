@@ -50,14 +50,33 @@ impl MatMul for CpuMatMul {
             });
         }
 
-        for i in 0..m {
-            for j in 0..n {
-                let mut sum = 0.0f32;
-                for p in 0..k {
-                    sum += a[i * k + p] * b[p * n + j];
-                }
-                output[i * n + j] = sum;
-            }
+        // Safety: dimension checks above guarantee all pointer arithmetic
+        // stays within allocated slices. Kani proof `matmul_indices_in_bounds`
+        // verifies the indexing arithmetic.
+        // Safety: dimension checks above guarantee all pointer arithmetic
+        // stays within allocated slices.
+        unsafe {
+            gemm::gemm(
+                m,
+                n,
+                k,
+                output.as_mut_ptr(),
+                1,          // dst_cs (column stride = 1 for row-major)
+                n as isize, // dst_rs (row stride = n for row-major)
+                false,      // read_dst: overwrite, don't accumulate
+                a.as_ptr(),
+                1,          // lhs_cs
+                k as isize, // lhs_rs
+                b.as_ptr(),
+                1,          // rhs_cs
+                n as isize, // rhs_rs
+                0.0f32,     // alpha: not reading dst
+                1.0f32,     // beta: dst = 1.0 * lhs × rhs
+                false,      // conj_dst
+                false,      // conj_lhs
+                false,      // conj_rhs
+                gemm::Parallelism::Rayon(0),
+            );
         }
 
         Ok(())

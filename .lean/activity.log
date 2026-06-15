@@ -228,3 +228,11 @@
   summary: "Added Prometheus metrics: GET /metrics endpoint, oxide_request_count (by endpoint), oxide_request_duration_seconds (histogram), oxide_tokens_generated (counter). Uses metrics + metrics-exporter-prometheus crates."
   iteration: 1
   max_iterations: 10
+
+- timestamp: "2026-06-15T22:55:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p5-docker"
+  summary: "Replaced naive triple-loop matmul with gemm crate (pure Rust, AVX2/AVX-512 auto-detect, cache-blocking, Rayon threading). UBI10 builder with static linking to scratch image. Container builds and responds to /v1/models."
+  iteration: 2
+  max_iterations: 10

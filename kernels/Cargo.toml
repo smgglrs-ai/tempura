@@ -17,6 +17,7 @@ cuda = []
 thiserror = "2"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
+gemm = "0.18"
 
 [dev-dependencies]
 approx = "0.5"

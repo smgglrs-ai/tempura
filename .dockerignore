@@ -1,0 +1,6 @@
+target/
+.git/
+.github/
+.lean/
+.claude/
+*.md
