@@ -268,7 +268,8 @@ items:
       oxide-specific endpoints for inference traces. Requests with
       oxide_trace_level field get a trace_id in the response. Traces
       stored in bounded in-memory ring buffer.
-    status: planned
+    status: done
+    progress: 100
     priority: high
     effort: M
     depends_on: [2b-wire-api]

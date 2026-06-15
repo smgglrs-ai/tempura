@@ -20,6 +20,11 @@ pub fn router() -> Router<AppState> {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/models", get(list_models))
+        .route("/oxide/v1/traces", get(list_traces))
+        .route(
+            "/oxide/v1/traces/{trace_id}",
+            get(get_trace).delete(delete_trace),
+        )
         .route("/health", get(health))
 }
 
@@ -307,6 +312,34 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
             owned_by: "oxide-serve".to_string(),
         }],
     })
+}
+
+async fn list_traces(State(state): State<AppState>) -> impl IntoResponse {
+    let store = state.trace_store.lock().await;
+    Json(store.list())
+}
+
+async fn get_trace(
+    State(state): State<AppState>,
+    axum::extract::Path(trace_id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let store = state.trace_store.lock().await;
+    store
+        .get(&trace_id)
+        .map(|t| Json(t.clone()))
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn delete_trace(
+    State(state): State<AppState>,
+    axum::extract::Path(trace_id): axum::extract::Path<String>,
+) -> StatusCode {
+    let mut store = state.trace_store.lock().await;
+    if store.remove(&trace_id) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 async fn health() -> &'static str {

@@ -148,3 +148,11 @@
   summary: "Added SSE streaming: generate_with_callback in engine, chat_completions handler returns SSE when stream=true with per-token ChatCompletionChunk events and [DONE] sentinel"
   iteration: 1
   max_iterations: 10
+
+- timestamp: "2026-06-15T21:15:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2c-trace-api"
+  summary: "Added TraceStore (bounded ring buffer) and oxide trace API: GET/DELETE /oxide/v1/traces/{id}, GET /oxide/v1/traces list, --max-traces CLI arg. 4 new trace_store tests."
+  iteration: 2
+  max_iterations: 10

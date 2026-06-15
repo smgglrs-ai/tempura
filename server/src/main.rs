@@ -2,6 +2,7 @@
 mod api;
 mod batch;
 mod sse;
+mod trace_store;
 
 use clap::Parser;
 use oxide_engine::pipeline::KernelPipeline;
@@ -33,6 +34,9 @@ struct Args {
 
     #[arg(long, default_value_t = 4096, help = "Maximum sequence length")]
     max_seq_len: usize,
+
+    #[arg(long, default_value_t = 100, help = "Maximum stored traces")]
+    max_traces: usize,
 }
 
 pub type CpuModel = TransformerModel<
@@ -49,6 +53,7 @@ pub struct AppState {
     pub tokenizer: Option<Arc<Tokenizer>>,
     pub model_id: String,
     pub scheduler: Arc<Mutex<batch::BatchScheduler>>,
+    pub trace_store: Arc<Mutex<trace_store::TraceStore>>,
 }
 
 #[tokio::main]
@@ -81,11 +86,13 @@ async fn main() {
     });
 
     let scheduler = batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len);
+    let traces = trace_store::TraceStore::new(args.max_traces);
     let state = AppState {
         model: Arc::new(model),
         tokenizer,
         model_id,
         scheduler: Arc::new(Mutex::new(scheduler)),
+        trace_store: Arc::new(Mutex::new(traces)),
     };
 
     let app = api::router()
