@@ -26,6 +26,7 @@ pub fn router() -> Router<AppState> {
             get(get_trace).delete(delete_trace),
         )
         .route("/oxide/v1/compare", post(compare_pipelines))
+        .route("/oxide/v1/verified", get(verification_status))
         .route("/oxide/v1/replay", post(replay))
         .route("/health", get(health))
 }
@@ -381,6 +382,10 @@ async fn compare_pipelines(
     );
 
     Ok(Json(result))
+}
+
+async fn verification_status() -> impl IntoResponse {
+    Json(oxide_kernels::verification_manifest::manifest())
 }
 
 async fn replay(

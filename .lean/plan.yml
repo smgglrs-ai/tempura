@@ -289,7 +289,8 @@ items:
     description: >
       Report which kernels have Kani proofs and what properties are proven.
       Static manifest compiled into the binary.
-    status: planned
+    status: done
+    progress: 100
     priority: medium
     effort: S
     depends_on: [2a-kani-kernels]

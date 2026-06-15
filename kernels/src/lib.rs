@@ -4,6 +4,7 @@ pub mod matmul;
 pub mod rmsnorm;
 pub mod rope;
 pub mod sampling;
+pub mod verification_manifest;
 
 pub use attention::Attention;
 pub use layernorm::LayerNorm;

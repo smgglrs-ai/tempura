@@ -192,3 +192,11 @@
   summary: "Added deterministic replay API: POST /oxide/v1/replay accepts token_ids+seed or trace_id, runs inference twice with same seed, returns per-token match comparison. 2 replay tests."
   iteration: 2
   max_iterations: 10
+
+- timestamp: "2026-06-15T22:10:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2c-verify-api"
+  summary: "Added verification status API: GET /oxide/v1/verified returns static manifest of all 11 Kani proofs with kernel names, harness IDs, proven properties, and caveats about what IS/ISN'T proven."
+  iteration: 3
+  max_iterations: 10
