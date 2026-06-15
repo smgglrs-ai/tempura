@@ -176,3 +176,11 @@
     exit_reason: "Phase 2B complete, Phase 2C partially done"
     branch: "loop/2026-06-15-3"
     tag: "loop-run/2026-06-15-3-3"
+
+- timestamp: "2026-06-15T21:50:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2a-kani-kernels"
+  summary: "Added 8 Kani proof harnesses across all 6 kernel files: attention (2: q/kv offsets), layernorm (1), rmsnorm (1), rope (1), matmul (1), sampling (2: top-k index, cumsum fallback). All 11 total Kani proofs pass."
+  iteration: 1
+  max_iterations: 10

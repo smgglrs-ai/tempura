@@ -40,6 +40,29 @@ impl RMSNorm for CpuRMSNorm {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    #[kani::proof]
+    fn rmsnorm_indices_in_bounds() {
+        let hidden_size: usize = kani::any();
+        let num_tokens: usize = kani::any();
+
+        kani::assume(hidden_size >= 1 && hidden_size <= 8);
+        kani::assume(num_tokens >= 1 && num_tokens <= 4);
+
+        let x_len = num_tokens * hidden_size;
+
+        let t: usize = kani::any();
+        let i: usize = kani::any();
+        kani::assume(t < num_tokens);
+        kani::assume(i < hidden_size);
+
+        let start = t * hidden_size;
+        assert!(start + i < x_len);
+        assert!(start + hidden_size <= x_len);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

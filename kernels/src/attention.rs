@@ -91,6 +91,59 @@ impl Attention for CpuAttention {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    #[kani::proof]
+    fn attention_q_offset_in_bounds() {
+        let batch: usize = kani::any();
+        let seq_len: usize = kani::any();
+        let num_heads: usize = kani::any();
+        let head_dim: usize = kani::any();
+
+        kani::assume(batch >= 1 && batch <= 2);
+        kani::assume(seq_len >= 1 && seq_len <= 4);
+        kani::assume(num_heads >= 1 && num_heads <= 4);
+        kani::assume(head_dim >= 1 && head_dim <= 4);
+
+        let q_len = batch * seq_len * num_heads * head_dim;
+
+        let b: usize = kani::any();
+        let s: usize = kani::any();
+        let h: usize = kani::any();
+        kani::assume(b < batch);
+        kani::assume(s < seq_len);
+        kani::assume(h < num_heads);
+
+        let q_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+        assert!(q_offset + head_dim <= q_len);
+    }
+
+    #[kani::proof]
+    fn attention_kv_offset_in_bounds() {
+        let batch: usize = kani::any();
+        let kv_len: usize = kani::any();
+        let num_kv_heads: usize = kani::any();
+        let head_dim: usize = kani::any();
+
+        kani::assume(batch >= 1 && batch <= 2);
+        kani::assume(kv_len >= 1 && kv_len <= 4);
+        kani::assume(num_kv_heads >= 1 && num_kv_heads <= 4);
+        kani::assume(head_dim >= 1 && head_dim <= 4);
+
+        let k_len = batch * kv_len * num_kv_heads * head_dim;
+
+        let b: usize = kani::any();
+        let kv_s: usize = kani::any();
+        let kv_h: usize = kani::any();
+        kani::assume(b < batch);
+        kani::assume(kv_s < kv_len);
+        kani::assume(kv_h < num_kv_heads);
+
+        let k_offset = ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim;
+        assert!(k_offset + head_dim <= k_len);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Kernel traits and CPU reference implementations for oxide-serve"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [features]
 default = ["cpu"]
 cpu = []

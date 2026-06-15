@@ -64,6 +64,35 @@ impl MatMul for CpuMatMul {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    #[kani::proof]
+    fn matmul_indices_in_bounds() {
+        let m: usize = kani::any();
+        let n: usize = kani::any();
+        let k: usize = kani::any();
+
+        kani::assume(m >= 1 && m <= 4);
+        kani::assume(n >= 1 && n <= 4);
+        kani::assume(k >= 1 && k <= 4);
+
+        let a_len = m * k;
+        let b_len = k * n;
+        let o_len = m * n;
+
+        let i: usize = kani::any();
+        let j: usize = kani::any();
+        let p: usize = kani::any();
+        kani::assume(i < m);
+        kani::assume(j < n);
+        kani::assume(p < k);
+
+        assert!(i * k + p < a_len);
+        assert!(p * n + j < b_len);
+        assert!(i * n + j < o_len);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

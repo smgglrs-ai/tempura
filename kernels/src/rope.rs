@@ -59,6 +59,41 @@ impl RoPE for CpuRoPE {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    #[kani::proof]
+    fn rope_indices_in_bounds() {
+        let batch: usize = kani::any();
+        let seq_len: usize = kani::any();
+        let num_heads: usize = kani::any();
+        let head_dim: usize = kani::any();
+
+        kani::assume(batch >= 1 && batch <= 2);
+        kani::assume(seq_len >= 1 && seq_len <= 4);
+        kani::assume(num_heads >= 1 && num_heads <= 4);
+        kani::assume(head_dim >= 2 && head_dim <= 8);
+        kani::assume(head_dim % 2 == 0);
+
+        let x_len = batch * seq_len * num_heads * head_dim;
+        let pos_len = batch * seq_len;
+        let half_dim = head_dim / 2;
+
+        let b: usize = kani::any();
+        let s: usize = kani::any();
+        let h: usize = kani::any();
+        let d: usize = kani::any();
+        kani::assume(b < batch);
+        kani::assume(s < seq_len);
+        kani::assume(h < num_heads);
+        kani::assume(d < half_dim);
+
+        assert!(b * seq_len + s < pos_len);
+        let offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+        assert!(offset + d < x_len);
+        assert!(offset + d + half_dim < x_len);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

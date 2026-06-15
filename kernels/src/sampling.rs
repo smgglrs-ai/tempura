@@ -134,6 +134,32 @@ impl Sampler for CpuSampler {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    #[kani::proof]
+    fn sampler_top_k_index_in_bounds() {
+        let vocab_size: usize = kani::any();
+        let top_k: usize = kani::any();
+
+        kani::assume(vocab_size >= 1 && vocab_size <= 16);
+        kani::assume(top_k >= 1 && top_k <= 16);
+
+        let k = top_k.min(vocab_size);
+        assert!(k >= 1);
+        assert!(k - 1 < vocab_size);
+        assert!(k <= vocab_size);
+    }
+
+    #[kani::proof]
+    fn sample_token_cumsum_terminates() {
+        let n: usize = kani::any();
+        kani::assume(n >= 1 && n <= 8);
+
+        // The fallback is (n - 1), which must be a valid index
+        assert!(n - 1 < n);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

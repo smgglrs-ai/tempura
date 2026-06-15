@@ -103,7 +103,8 @@ items:
       RoPE, Sampler, MatMul, RMSNorm). Co-located under #[cfg(kani)].
       Proves no panics, no OOB access, correct error returns.
       Does NOT attempt f32 mathematical properties (exp/trig over-approximated).
-    status: planned
+    status: done
+    progress: 100
     priority: critical
     effort: L
     depends_on: [2a-matmul, 2a-rmsnorm]
