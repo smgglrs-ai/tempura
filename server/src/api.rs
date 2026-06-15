@@ -25,6 +25,7 @@ pub fn router() -> Router<AppState> {
             "/oxide/v1/traces/{trace_id}",
             get(get_trace).delete(delete_trace),
         )
+        .route("/oxide/v1/compare", post(compare_pipelines))
         .route("/health", get(health))
 }
 
@@ -340,6 +341,45 @@ async fn delete_trace(
     } else {
         StatusCode::NOT_FOUND
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct CompareRequest {
+    pub token_ids: Vec<u32>,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+async fn compare_pipelines(
+    State(state): State<AppState>,
+    Json(req): Json<CompareRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if state.model.weights.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No model weights loaded".into(),
+        ));
+    }
+
+    let params = SamplingParams {
+        temperature: req.temperature,
+        top_k: 50,
+        top_p: 1.0,
+    };
+    let seed = req.seed.unwrap_or(42);
+
+    let result = oxide_engine::dual_pipeline::compare_pipelines(
+        state.model.as_ref(),
+        state.model.as_ref(),
+        &state.model.config,
+        &req.token_ids,
+        &params,
+        seed,
+    );
+
+    Ok(Json(result))
 }
 
 async fn health() -> &'static str {

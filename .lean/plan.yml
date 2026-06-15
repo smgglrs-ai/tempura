@@ -321,7 +321,8 @@ items:
     description: >
       Run two kernel pipeline configs on same input, report divergence.
       Initially CPU vs CPU configs; later CPU vs CUDA for GPU validation.
-    status: planned
+    status: done
+    progress: 100
     priority: medium
     effort: M
     depends_on: [2b-pipeline, 2b-forward-pass]

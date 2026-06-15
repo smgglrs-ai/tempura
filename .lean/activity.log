@@ -156,3 +156,11 @@
   summary: "Added TraceStore (bounded ring buffer) and oxide trace API: GET/DELETE /oxide/v1/traces/{id}, GET /oxide/v1/traces list, --max-traces CLI arg. 4 new trace_store tests."
   iteration: 2
   max_iterations: 10
+
+- timestamp: "2026-06-15T21:30:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2c-dual-pipeline"
+  summary: "Added DualPipeline comparison: compare_pipelines() reports per-layer divergence (max abs diff, L2), logits divergence, token match. POST /oxide/v1/compare endpoint. 1 zero-divergence test."
+  iteration: 3
+  max_iterations: 10
