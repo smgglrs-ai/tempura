@@ -40,3 +40,15 @@
   summary: "Added 3 Kani proofs for KvCache: append_kv offset bounds, k/v slice bounds, remaining_capacity consistency. Proves indexing arithmetic without Vec allocation (avoids CBMC unwinding explosion)."
   iteration: 3
   max_iterations: 10
+
+- timestamp: "2026-06-15T18:55:00+02:00"
+  actor: claude
+  action: loop-complete
+  summary: "Loop finished: 3 items completed (2a-trace-types, 2a-weights, 2a-kani-kvcache). Exit: No unblocked items remaining in notify scope"
+  details:
+    iterations: 3
+    max_iterations: 10
+    completed: [2a-trace-types, 2a-weights, 2a-kani-kvcache]
+    exit_reason: "No unblocked items remaining in notify scope"
+    branch: "loop/2026-06-15"
+    tag: "loop-run/2026-06-15-3"
