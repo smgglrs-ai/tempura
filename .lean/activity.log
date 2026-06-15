@@ -52,3 +52,11 @@
     exit_reason: "No unblocked items remaining in notify scope"
     branch: "loop/2026-06-15"
     tag: "loop-run/2026-06-15-3"
+
+- timestamp: "2026-06-15T19:15:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2a-matmul"
+  summary: "Added MatMul trait + CpuMatMul with naive triple-loop implementation and 5 tests (identity, 2x2, 3x3, non-square, dimension mismatch)"
+  iteration: 1
+  max_iterations: 10

@@ -9,7 +9,8 @@ items:
       Add MatMul trait to oxide-kernels with CpuMatMul behind cpu feature.
       Every transformer projection needs matrix multiply — currently absent.
       Signature: forward(&self, a, b, output, m, n, k) on &[f32] slices.
-    status: planned
+    status: done
+    progress: 100
     priority: critical
     effort: S
     scope:
