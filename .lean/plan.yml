@@ -165,7 +165,8 @@ items:
       Bundle kernel implementations into a composable unit with 5 type params
       (Attention, RMSNorm, RoPE, MatMul, Sampler). Records per-kernel stats
       into LayerSnapshot based on TraceLevel.
-    status: planned
+    status: done
+    progress: 100
     priority: critical
     effort: M
     depends_on: [2a-matmul, 2a-rmsnorm, 2a-trace-types]

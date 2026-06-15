@@ -1,31 +1,27 @@
 use crate::config::ModelConfig;
+use crate::pipeline::KernelPipeline;
 use crate::session::InferenceSession;
 use crate::weights::ModelWeights;
-use oxide_kernels::{Attention, LayerNorm, RoPE, Sampler, SamplingParams};
+use oxide_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
 
-pub struct TransformerModel<A, L, R, S> {
+pub struct TransformerModel<A, N, R, M, S> {
     pub config: ModelConfig,
-    pub attention: A,
-    pub layernorm: L,
-    pub rope: R,
-    pub sampler: S,
+    pub pipeline: KernelPipeline<A, N, R, M, S>,
     pub weights: Option<ModelWeights>,
 }
 
-impl<A, L, R, S> TransformerModel<A, L, R, S>
+impl<A, N, R, M, S> TransformerModel<A, N, R, M, S>
 where
     A: Attention,
-    L: LayerNorm,
+    N: RMSNorm,
     R: RoPE,
+    M: MatMul,
     S: Sampler,
 {
-    pub fn new(config: ModelConfig, attention: A, layernorm: L, rope: R, sampler: S) -> Self {
+    pub fn new(config: ModelConfig, pipeline: KernelPipeline<A, N, R, M, S>) -> Self {
         Self {
             config,
-            attention,
-            layernorm,
-            rope,
-            sampler,
+            pipeline,
             weights: None,
         }
     }
@@ -49,7 +45,7 @@ where
         params: &SamplingParams,
     ) -> oxide_kernels::Result<Vec<f32>> {
         let mut probs = vec![0.0; logits.len()];
-        self.sampler.apply(logits, &mut probs, params)?;
+        self.pipeline.sampler.apply(logits, &mut probs, params)?;
         Ok(probs)
     }
 }

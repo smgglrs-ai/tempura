@@ -2,6 +2,7 @@ pub mod config;
 pub mod kv_cache;
 pub mod loader;
 pub mod model;
+pub mod pipeline;
 pub mod session;
 pub mod tokenizer;
 pub mod trace;

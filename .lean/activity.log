@@ -84,3 +84,11 @@
   summary: "Created InferenceSession (per-request state: KvCache, trace, position, seeded RNG). Refactored TransformerModel to take &mut InferenceSession in forward(). 2 new tests."
   iteration: 4
   max_iterations: 10
+
+- timestamp: "2026-06-15T19:55:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2b-pipeline"
+  summary: "Created KernelPipeline<A,N,R,M,S> bundling 5 kernel types with trace-aware wrappers. cpu_verified() factory. TransformerModel now parameterized by pipeline. 3 new tests."
+  iteration: 5
+  max_iterations: 10
