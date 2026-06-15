@@ -31,6 +31,13 @@ struct Args {
     #[arg(long, help = "Path to tokenizer.json")]
     tokenizer: Option<String>,
 
+    #[arg(
+        long,
+        default_value = "llama2-7b",
+        help = "Model config preset: llama2-7b, micro-llama, tiny-test"
+    )]
+    model_config: String,
+
     #[arg(long, default_value_t = 32, help = "Maximum batch size")]
     max_batch_size: usize,
 
@@ -67,7 +74,11 @@ async fn main() {
 
     let args = Args::parse();
 
-    let config = ModelConfig::llama2_7b();
+    let config = match args.model_config.as_str() {
+        "micro-llama" => ModelConfig::micro_llama(),
+        "tiny-test" => ModelConfig::tiny_test(),
+        _ => ModelConfig::llama2_7b(),
+    };
     let pipeline = KernelPipeline::cpu_verified();
     let mut model = TransformerModel::new(config, pipeline);
 

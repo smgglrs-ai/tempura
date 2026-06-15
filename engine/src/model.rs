@@ -107,13 +107,13 @@ where
             let mut v = vec![0.0f32; seq_len * kv_dim];
 
             self.pipeline
-                .matmul(&normed, q_w, &mut q, seq_len, q_dim, h)
+                .matmul_bt(&normed, q_w, &mut q, seq_len, q_dim, h)
                 .unwrap();
             self.pipeline
-                .matmul(&normed, k_w, &mut k, seq_len, kv_dim, h)
+                .matmul_bt(&normed, k_w, &mut k, seq_len, kv_dim, h)
                 .unwrap();
             self.pipeline
-                .matmul(&normed, v_w, &mut v, seq_len, kv_dim, h)
+                .matmul_bt(&normed, v_w, &mut v, seq_len, kv_dim, h)
                 .unwrap();
 
             self.pipeline
@@ -165,7 +165,7 @@ where
 
             let mut o_proj = vec![0.0f32; seq_len * h];
             self.pipeline
-                .matmul(&attn_out, o_w, &mut o_proj, seq_len, h, q_dim)
+                .matmul_bt(&attn_out, o_w, &mut o_proj, seq_len, h, q_dim)
                 .unwrap();
 
             for i in 0..hidden.len() {
@@ -201,10 +201,10 @@ where
             let mut gate = vec![0.0f32; seq_len * inter];
             let mut up = vec![0.0f32; seq_len * inter];
             self.pipeline
-                .matmul(&normed2, gate_w, &mut gate, seq_len, inter, h)
+                .matmul_bt(&normed2, gate_w, &mut gate, seq_len, inter, h)
                 .unwrap();
             self.pipeline
-                .matmul(&normed2, up_w, &mut up, seq_len, inter, h)
+                .matmul_bt(&normed2, up_w, &mut up, seq_len, inter, h)
                 .unwrap();
 
             // SiLU(gate) * up
@@ -215,7 +215,7 @@ where
 
             let mut down_out = vec![0.0f32; seq_len * h];
             self.pipeline
-                .matmul(&gate, down_w, &mut down_out, seq_len, h, inter)
+                .matmul_bt(&gate, down_w, &mut down_out, seq_len, h, inter)
                 .unwrap();
 
             for i in 0..hidden.len() {
@@ -248,7 +248,7 @@ where
         let last_hidden = &hidden[(seq_len - 1) * h..seq_len * h];
         let mut logits = vec![0.0f32; cfg.vocab_size];
         self.pipeline
-            .matmul(last_hidden, lm_head_w, &mut logits, 1, cfg.vocab_size, h)
+            .matmul_bt(last_hidden, lm_head_w, &mut logits, 1, cfg.vocab_size, h)
             .unwrap();
 
         logits

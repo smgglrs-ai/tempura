@@ -15,6 +15,21 @@ pub trait MatMul: Send + Sync {
         n: usize,
         k: usize,
     ) -> Result<()>;
+
+    /// Matrix multiplication with transposed B: output = a × bᵀ
+    ///
+    /// - `a`: [m, k] row-major
+    /// - `b`: [n, k] row-major (stored transposed, as in PyTorch Linear weights)
+    /// - `output`: [m, n] row-major
+    fn forward_b_transposed(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()>;
 }
 
 #[cfg(feature = "cpu")]
@@ -75,6 +90,62 @@ impl MatMul for CpuMatMul {
                 false,      // conj_dst
                 false,      // conj_lhs
                 false,      // conj_rhs
+                gemm::Parallelism::Rayon(0),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn forward_b_transposed(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if a.len() != m * k {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
+        }
+        if b.len() != n * k {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: n * k,
+                got: b.len(),
+            });
+        }
+        if output.len() != m * n {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
+        }
+
+        // b is [n, k] row-major — swap rhs strides to read it as [k, n]
+        unsafe {
+            gemm::gemm(
+                m,
+                n,
+                k,
+                output.as_mut_ptr(),
+                1,          // dst_cs
+                n as isize, // dst_rs
+                false,
+                a.as_ptr(),
+                1,          // lhs_cs
+                k as isize, // lhs_rs
+                b.as_ptr(),
+                k as isize, // rhs_cs: stride between columns = k (transposed)
+                1,          // rhs_rs: stride between rows = 1 (transposed)
+                0.0f32,
+                1.0f32,
+                false,
+                false,
+                false,
                 gemm::Parallelism::Rayon(0),
             );
         }

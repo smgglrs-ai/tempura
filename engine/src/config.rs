@@ -28,6 +28,21 @@ impl ModelConfig {
         }
     }
 
+    pub fn micro_llama() -> Self {
+        Self {
+            hidden_size: 1024,
+            intermediate_size: 5632,
+            num_attention_heads: 16,
+            num_kv_heads: 4,
+            num_layers: 12,
+            vocab_size: 32000,
+            max_seq_len: 2048,
+            head_dim: 64,
+            rope_theta: 10000.0,
+            layer_norm_eps: 1e-5,
+        }
+    }
+
     pub fn tiny_test() -> Self {
         Self {
             hidden_size: 64,

@@ -96,6 +96,20 @@ where
         self.matmul.forward(a, b, output, m, n, k)
     }
 
+    /// Matrix multiply with B transposed: output = a × bᵀ
+    /// b is [n, k] row-major (PyTorch Linear weight convention)
+    pub fn matmul_bt(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> oxide_kernels::Result<()> {
+        self.matmul.forward_b_transposed(a, b, output, m, n, k)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn rope(
         &self,
