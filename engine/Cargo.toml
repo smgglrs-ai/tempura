@@ -1,0 +1,12 @@
+[package]
+name = "oxide-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Inference engine for oxide-serve: model loading, KV-cache, forward pass"
+
+[dependencies]
+oxide-kernels = { path = "../kernels" }
+safetensors = "0.5"
+tokenizers = "0.21"
+thiserror = "2"

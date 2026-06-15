@@ -1,0 +1,18 @@
+- timestamp: "2026-06-14T22:56:08+02:00"
+  actor: "Fabien Dupont"
+  action: commit
+  summary: "Initial scaffold: three-crate workspace for Rust LLM inference server"
+
+- timestamp: "2026-06-15T14:00:00+02:00"
+  actor: claude
+  action: plan-revision
+  summary: >
+    Restructured Phase 2 around four differentiating pillars: verified (Kani),
+    observable (inference traces), composable (KernelPipeline/DualPipeline),
+    deterministic (seeded RNG). Pulled Kani verification from Phase 3 into
+    Phase 2. Elevated cuda-oxide GPU kernels to Phase 3 (core product target).
+    Deferred continuous batching to Phase 4. Added 18 refined work items across
+    2A (foundation), 2B (forward pass), 2C (differentiating API). Research:
+    TurboQuant/PQO for verified KV-cache compression (Phase 3), deterministic
+    GPU inference via cuda-oxide controlled reduction order, model-internal
+    observability as an unclaimed gap in the serving space.

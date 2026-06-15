@@ -1,0 +1,456 @@
+version: 1
+items:
+  # Phase 2A: Foundation (Kernels + Weights + Traces)
+  # All 2A items are independent and can be developed in parallel.
+
+  - id: 2a-matmul
+    title: MatMul kernel trait + CPU reference implementation
+    description: >
+      Add MatMul trait to oxide-kernels with CpuMatMul behind cpu feature.
+      Every transformer projection needs matrix multiply — currently absent.
+      Signature: forward(&self, a, b, output, m, n, k) on &[f32] slices.
+    status: planned
+    priority: critical
+    effort: S
+    scope:
+      - kernels/src/matmul.rs
+      - kernels/src/lib.rs
+    acceptance:
+      - "MatMul trait with forward signature operating on &[f32] slices"
+      - "CpuMatMul behind cpu feature flag"
+      - "Tests: identity matrix, known-value 2x2/3x3 cases, dimension mismatch error"
+      - "Trait re-exported from kernels/src/lib.rs"
+
+  - id: 2a-rmsnorm
+    title: RMSNorm kernel trait + CPU reference implementation
+    description: >
+      Add RMSNorm trait alongside existing LayerNorm. LLaMA uses RMSNorm
+      (no mean subtraction). Keep LayerNorm for other architectures.
+    status: planned
+    priority: critical
+    effort: S
+    scope:
+      - kernels/src/rmsnorm.rs
+      - kernels/src/lib.rs
+    acceptance:
+      - "RMSNorm trait with forward(&self, x, weight, hidden_size, eps)"
+      - "CpuRMSNorm behind cpu feature"
+      - "Tests: output has unit RMS with identity weights, dimension mismatch error"
+
+  - id: 2a-trace-types
+    title: InferenceTrace type system
+    description: >
+      Define trace data model before building the forward pass. Pure data
+      structures with Serialize/Deserialize. TraceLevel enum controls
+      granularity: Off, Metadata, Summary, Full.
+    status: planned
+    priority: critical
+    effort: S
+    scope:
+      - engine/src/trace.rs
+      - engine/src/lib.rs
+      - engine/Cargo.toml
+    acceptance:
+      - "InferenceTrace, LayerSnapshot, NormStats, SamplingSnapshot, TimingInfo structs"
+      - "TraceLevel enum: Off, Metadata, Summary, Full"
+      - "All types derive Debug, Clone, Serialize, Deserialize"
+      - "Round-trip serialization test passes"
+
+  - id: 2a-weights
+    title: ModelWeights storage
+    description: >
+      Replace _weights_loaded bool placeholder with HashMap<String, Vec<f32>>
+      keyed by safetensors tensor names. Validation against ModelConfig.
+    status: planned
+    priority: critical
+    effort: M
+    scope:
+      - engine/src/weights.rs
+      - engine/src/model.rs
+      - engine/src/lib.rs
+    acceptance:
+      - "ModelWeights::load(loader, config) with required tensor name validation"
+      - "Standard LLaMA tensor naming (model.layers.{n}.self_attn.{q,k,v,o}_proj.weight, etc.)"
+      - "ModelWeights::get(name) accessor returns Option<&[f32]>"
+      - "Test with mock WeightLoader returning correctly-sized zero tensors"
+
+  - id: 2a-token-selection
+    title: Token selection in Sampler (deterministic)
+    description: >
+      CpuSampler returns probabilities but never picks a token. Add seeded
+      RNG token selection. Foundation for deterministic reproducibility.
+    status: planned
+    priority: critical
+    effort: S
+    scope:
+      - kernels/src/sampling.rs
+      - kernels/Cargo.toml
+    acceptance:
+      - "sample_token(probs, rng) -> u32 method on Sampler trait"
+      - "Greedy mode (temperature=0): argmax without RNG"
+      - "Same seed = same token selection (deterministic reproducibility test)"
+      - "Different seeds produce different tokens (probabilistic test)"
+
+  - id: 2a-kani-kernels
+    title: Kani harnesses for all CPU kernel implementations
+    description: >
+      Write Kani proof harnesses for all 6 CPU kernels (Attention, LayerNorm,
+      RoPE, Sampler, MatMul, RMSNorm). Co-located under #[cfg(kani)].
+      Proves no panics, no OOB access, correct error returns.
+      Does NOT attempt f32 mathematical properties (exp/trig over-approximated).
+    status: planned
+    priority: critical
+    effort: L
+    depends_on: [2a-matmul, 2a-rmsnorm]
+    scope:
+      - kernels/src/attention.rs
+      - kernels/src/layernorm.rs
+      - kernels/src/rope.rs
+      - kernels/src/sampling.rs
+      - kernels/src/matmul.rs
+      - kernels/src/rmsnorm.rs
+      - kernels/Cargo.toml
+    acceptance:
+      - "Each kernel file has at least one #[kani::proof] harness"
+      - "kani::assume bounds: batch 1..=2, seq_len 1..=4, heads 1..=4, head_dim 4..8"
+      - "All harnesses use #[kani::unwind(N)] with appropriate bounds"
+      - "cargo kani --package oxide-kernels passes all harnesses"
+
+  - id: 2a-kani-kvcache
+    title: KvCache Kani proofs
+    description: >
+      KV cache does raw slice indexing with computed offsets — prime Kani target.
+      Prove append_kv, k_slice, v_slice, remaining_capacity safety.
+    status: planned
+    priority: high
+    effort: S
+    scope:
+      - engine/src/kv_cache.rs
+      - engine/Cargo.toml
+    acceptance:
+      - "Prove append_kv never panics when seq_len + new_tokens <= max_seq_len"
+      - "Prove k_slice/v_slice never return slices past allocated memory"
+      - "Prove remaining_capacity is consistent with seq_len and max_seq_len"
+
+  # Phase 2B: Working Forward Pass (Traced from Birth)
+
+  - id: 2b-session
+    title: InferenceSession extraction
+    description: >
+      Separate per-request state (KV cache, trace, position, RNG) from shared
+      model state (weights, kernels). Required for batching and trace isolation.
+    status: planned
+    priority: critical
+    effort: S
+    depends_on: [2a-trace-types, 2a-token-selection]
+    scope:
+      - engine/src/session.rs
+      - engine/src/model.rs
+      - engine/src/lib.rs
+    acceptance:
+      - "InferenceSession::new(config, trace_level, seed) constructor"
+      - "TransformerModel::forward takes &mut InferenceSession"
+      - "Existing tests adapted to pass a session"
+
+  - id: 2b-pipeline
+    title: KernelPipeline abstraction
+    description: >
+      Bundle kernel implementations into a composable unit with 5 type params
+      (Attention, RMSNorm, RoPE, MatMul, Sampler). Records per-kernel stats
+      into LayerSnapshot based on TraceLevel.
+    status: planned
+    priority: critical
+    effort: M
+    depends_on: [2a-matmul, 2a-rmsnorm, 2a-trace-types]
+    scope:
+      - engine/src/pipeline.rs
+      - engine/src/model.rs
+      - engine/src/lib.rs
+    acceptance:
+      - "KernelPipeline<A, N, R, M, S> struct with 5 kernel type params"
+      - "KernelPipeline::cpu_verified() factory for default CPU stack"
+      - "Methods wrap each kernel forward and optionally record to trace"
+      - "TransformerModel parameterized by KernelPipeline"
+
+  - id: 2b-forward-pass
+    title: Forward pass implementation (LLaMA architecture)
+    description: >
+      Embedding lookup, layer loop (RMSNorm, QKV projection, RoPE, attention +
+      KV cache, output projection, residual, RMSNorm, SiLU-gated FFN, residual),
+      final norm, lm_head. Uses KernelPipeline. Populates LayerSnapshot per layer.
+    status: planned
+    priority: critical
+    effort: L
+    depends_on: [2a-weights, 2b-session, 2b-pipeline]
+    scope:
+      - engine/src/model.rs
+      - engine/src/pipeline.rs
+    acceptance:
+      - "Non-zero logits with tiny_test() config + random weights"
+      - "Each layer records LayerSnapshot at configured TraceLevel"
+      - "TraceLevel::Summary records per-layer norm stats; Full records attention scores"
+      - "At least 2 new tests: shape correctness, no-panic with random weights"
+      - "cargo test --workspace passes"
+
+  - id: 2b-generate
+    title: Token generation loop
+    description: >
+      Autoregressive generation: forward -> sample -> select token -> record
+      to trace -> repeat. Stops at max_tokens or EOS. Records SamplingSnapshot
+      per step. Deterministic with seeded RNG.
+    status: planned
+    priority: critical
+    effort: M
+    depends_on: [2a-token-selection, 2b-forward-pass]
+    scope:
+      - engine/src/model.rs
+    acceptance:
+      - "generate(session, token_ids, max_new_tokens, params) -> Vec<u32>"
+      - "Stops at max_tokens or EOS token"
+      - "Each step records SamplingSnapshot (top-k logits, probs, selected token, RNG state)"
+      - "Deterministic reproducibility test: same seed = identical output"
+
+  - id: 2b-wire-api
+    title: Wire API to real inference
+    description: >
+      Connect Axum endpoints to engine. AppState gains TransformerModel and
+      Tokenizer. Load model at startup from CLI paths.
+    status: planned
+    priority: critical
+    effort: M
+    depends_on: [2b-generate]
+    scope:
+      - server/src/main.rs
+      - server/src/api.rs
+    acceptance:
+      - "POST /v1/chat/completions returns model-generated text (not stub)"
+      - "POST /v1/completions returns model-generated text"
+      - "GET /v1/models returns loaded model ID from --model CLI arg"
+      - "Error responses with meaningful messages when model not loaded"
+      - "cargo test --workspace passes"
+
+  - id: 2b-sse
+    title: SSE streaming
+    description: >
+      Token-by-token streaming via existing SSE types. Generation yields tokens
+      through a channel; handler converts to ChatCompletionChunk events.
+    status: planned
+    priority: high
+    effort: M
+    depends_on: [2b-wire-api]
+    scope:
+      - server/src/api.rs
+      - server/src/sse.rs
+      - engine/src/model.rs
+    acceptance:
+      - "stream: true triggers SSE response with ChatCompletionChunk events"
+      - "[DONE] sentinel after generation completes"
+      - "Non-streaming requests still work"
+      - "cargo test --workspace passes"
+
+  # Phase 2C: Differentiating API Surface
+
+  - id: 2c-trace-api
+    title: Trace retrieval API
+    description: >
+      oxide-specific endpoints for inference traces. Requests with
+      oxide_trace_level field get a trace_id in the response. Traces
+      stored in bounded in-memory ring buffer.
+    status: planned
+    priority: high
+    effort: M
+    depends_on: [2b-wire-api]
+    scope:
+      - server/src/api.rs
+      - server/src/trace_store.rs
+      - server/src/main.rs
+    acceptance:
+      - "GET /oxide/v1/traces/{id} returns full InferenceTrace as JSON"
+      - "GET /oxide/v1/traces lists recent trace IDs with metadata"
+      - "DELETE /oxide/v1/traces/{id} removes a trace"
+      - "Configurable via --max-traces (default 100)"
+
+  - id: 2c-verify-api
+    title: Verification status API
+    description: >
+      Report which kernels have Kani proofs and what properties are proven.
+      Static manifest compiled into the binary.
+    status: planned
+    priority: medium
+    effort: S
+    depends_on: [2a-kani-kernels]
+    scope:
+      - kernels/src/verification_manifest.rs
+      - server/src/api.rs
+    acceptance:
+      - "GET /oxide/v1/verified returns JSON listing each kernel, proof status, properties"
+      - "Includes caveats about what IS and ISN'T proven (safety vs math correctness)"
+
+  - id: 2c-replay-api
+    title: Deterministic replay API
+    description: >
+      Replay a previous inference and verify bit-identical output.
+      Accepts trace_id or explicit (tokens, seed, params).
+    status: planned
+    priority: medium
+    effort: M
+    depends_on: [2b-generate, 2c-trace-api]
+    scope:
+      - server/src/api.rs
+      - server/src/replay.rs
+    acceptance:
+      - "POST /oxide/v1/replay accepts trace_id or explicit (tokens, seed, params)"
+      - "Returns match: true/false with per-token comparison"
+      - "Replay with same seed produces match: true"
+
+  - id: 2c-dual-pipeline
+    title: DualPipeline comparison endpoint
+    description: >
+      Run two kernel pipeline configs on same input, report divergence.
+      Initially CPU vs CPU configs; later CPU vs CUDA for GPU validation.
+    status: planned
+    priority: medium
+    effort: M
+    depends_on: [2b-pipeline, 2b-forward-pass]
+    scope:
+      - engine/src/dual_pipeline.rs
+      - server/src/api.rs
+    acceptance:
+      - "POST /oxide/v1/compare reports per-layer max abs diff, L2 distance, token match"
+      - "Two identical pipelines produce zero divergence"
+
+  - id: 2c-kani-ci
+    title: Kani in CI
+    description: >
+      cargo kani runs on every PR. Verification is continuous, not one-time.
+    status: planned
+    priority: medium
+    effort: S
+    depends_on: [2a-kani-kernels, 2a-kani-kvcache]
+    scope:
+      - .github/workflows/kani.yml
+    acceptance:
+      - "CI job runs cargo kani --package oxide-kernels and oxide-engine"
+      - "Kani version pinned for reproducibility"
+      - "Job fails if any harness fails"
+
+  # Phase 3: cuda-oxide GPU Kernels (core product differentiator)
+
+  - id: p3-cuda-toolchain
+    title: cuda-oxide toolchain setup
+    description: >
+      Set up cuda-oxide custom rustc and cargo oxide build.
+      The production target — CPU is the verification baseline.
+    status: planned
+    priority: high
+    effort: M
+    scope:
+      - Cargo.toml
+      - rust-toolchain.toml
+
+  - id: p3-cuda-kernels
+    title: GPU kernel implementations via cuda-oxide
+    description: >
+      CudaAttention, CudaRMSNorm, CudaRoPE, CudaMatMul behind cuda feature.
+      Same Kani harnesses verify against the same trait contract as CPU.
+      Deterministic GPU reduction order by design.
+    status: planned
+    priority: high
+    effort: XL
+    depends_on: [p3-cuda-toolchain, 2a-kani-kernels]
+    scope:
+      - kernels/src/
+
+  - id: p3-gpu-validation
+    title: DualPipeline CPU vs GPU validation
+    description: >
+      Use DualPipeline to validate GPU kernel output against proven
+      CPU references. Benchmark GPU vs CPU performance.
+    status: planned
+    priority: high
+    effort: M
+    depends_on: [p3-cuda-kernels, 2c-dual-pipeline]
+    scope:
+      - benches/
+
+  - id: p3-turboquant
+    title: TurboQuant/PQO KV-cache compression kernel
+    description: >
+      Verified GPU kernel for KV-cache compression using PolarQuant
+      (without QJL). Rust reference exists at github.com/SaschaOnTour/turboquant.
+    status: planned
+    priority: medium
+    effort: L
+    depends_on: [p3-cuda-kernels]
+    scope:
+      - kernels/src/
+
+  # Phase 4: Continuous Batching + Scheduling
+
+  - id: p4-kvcache-pool
+    title: Multi-sequence KV cache (slot-based pool)
+    description: >
+      Refactor KvCache from single-sequence to slot-based pool.
+      Required for continuous batching.
+    status: planned
+    priority: medium
+    effort: L
+    scope:
+      - engine/src/kv_cache.rs
+
+  - id: p4-batch-scheduler
+    title: Verified continuous batching with preemption
+    description: >
+      Upgrade BatchScheduler to iteration-level continuous batching with
+      preemption. Kani proofs for fairness and no-starvation.
+    status: planned
+    priority: medium
+    effort: L
+    depends_on: [p4-kvcache-pool]
+    scope:
+      - server/src/batch.rs
+      - engine/src/kv_cache.rs
+
+  # Phase 5: Production Hardening
+
+  - id: p5-speculative-decoding
+    title: Speculative decoding
+    status: planned
+    priority: low
+    effort: XL
+
+  - id: p5-tensor-parallelism
+    title: Tensor parallelism
+    status: planned
+    priority: low
+    effort: XL
+
+  - id: p5-quantization
+    title: Quantization support (GPTQ, AWQ, GGUF)
+    status: planned
+    priority: low
+    effort: L
+
+  - id: p5-metrics
+    title: Prometheus metrics
+    status: planned
+    priority: medium
+    effort: S
+    scope:
+      - server/src/main.rs
+      - server/Cargo.toml
+    acceptance:
+      - "GET /metrics returns Prometheus-format metrics"
+      - "At least request_count, request_duration, tokens_generated tracked"
+
+  - id: p5-docker
+    title: Docker/container support
+    status: planned
+    priority: medium
+    effort: S
+    scope:
+      - Dockerfile
+      - .dockerignore
+    acceptance:
+      - "Dockerfile builds successfully"
+      - "Container starts and responds to GET /v1/models"

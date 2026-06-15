@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build*)",
+      "Bash(cargo test*)",
+      "Bash(cargo check*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo fmt*)",
+      "Bash(cargo run*)",
+      "Bash(cargo doc*)",
+      "Bash(cargo tree*)",
+      "Bash(cargo metadata*)",
+      "Bash(cargo bench*)",
+      "Bash(cargo expand*)",
+      "Bash(cargo search*)",
+      "Bash(rustfmt*)",
+      "Bash(rustup*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git status*)",
+      "Bash(git branch*)",
+      "Bash(git merge*)",
+      "Bash(git worktree*)",
+      "Bash(python3 .claude/hooks/*)"
+    ],
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git reset --hard*)",
+      "Bash(rm -rf /*)",
+      "Bash(sudo*)"
+    ],
+    "additionalDirectories": [
+      "/home/fdupont/.claude/projects/-home-fdupont-Code-github-com-smgglrs-ai-oxide-serve"
+    ]
+  }
+}

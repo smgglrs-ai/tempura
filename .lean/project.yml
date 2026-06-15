@@ -1,0 +1,76 @@
+version: 1
+
+name: oxide-serve
+version: "0.1.0"
+description: Rust-native LLM inference server designed to use cuda-oxide for GPU kernels
+repository: https://github.com/smgglrs-ai/oxide-serve
+type: monorepo
+license: Apache-2.0
+
+stack:
+  language: Rust
+  edition: "2021"
+  build: cargo build
+  test: cargo test --workspace
+  lint: cargo clippy --workspace -- -D warnings
+  format: cargo fmt --all
+  run: cargo run --
+
+workspace:
+  members:
+    - kernels
+    - engine
+    - server
+
+autonomy:
+  autonomous:
+    scope:
+      - refactoring (behavior-preserving)
+      - test coverage improvements
+      - clippy and rustfmt fixes
+      - documentation updates
+      - dead code removal
+      - dependency patches (minor versions)
+    guard: all existing tests must pass, cargo clippy clean
+    reporting: activity log entry
+
+  notify:
+    scope:
+      - internal API changes (private functions, module structure)
+      - configuration changes
+      - new utility functions
+      - test refactoring
+      - new dev-dependencies
+    guard: tests pass, clippy clean, changes on branch
+    reporting: detailed summary
+
+  approve:
+    scope:
+      - public API changes (trait signatures, endpoint contracts)
+      - new features (forward pass, GPU integration)
+      - architectural changes (new crates, dependency restructuring)
+      - kernel implementations (correctness-critical)
+    mechanism: ADR draft + plan item (pending_approval)
+    reporting: full proposal with rationale
+
+  discuss:
+    scope:
+      - cuda-oxide integration decisions
+      - security model changes
+      - breaking changes to OpenAI-compatible API
+      - performance vs correctness tradeoffs
+    mechanism: discussion item in plan.yml
+
+verification:
+  quick: cargo test --workspace
+  full: cargo test --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check
+
+loop:
+  max_iterations: 10
+  scope: autonomous
+  sandbox: openshell
+  git:
+    branch_prefix: loop
+    tag_runs: true
+    push_after_each: false
+    commit_style: conventional

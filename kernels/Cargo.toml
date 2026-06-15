@@ -1,0 +1,17 @@
+[package]
+name = "oxide-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kernel traits and CPU reference implementations for oxide-serve"
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = []
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+approx = "0.5"
