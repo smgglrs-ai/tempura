@@ -6,6 +6,7 @@ mod sse;
 mod trace_store;
 
 use clap::Parser;
+use metrics_exporter_prometheus::PrometheusHandle;
 use oxide_engine::pipeline::KernelPipeline;
 use oxide_engine::tokenizer::Tokenizer;
 use oxide_engine::{ModelConfig, TransformerModel};
@@ -55,6 +56,7 @@ pub struct AppState {
     pub model_id: String,
     pub scheduler: Arc<Mutex<batch::BatchScheduler>>,
     pub trace_store: Arc<Mutex<trace_store::TraceStore>>,
+    pub metrics_handle: PrometheusHandle,
 }
 
 #[tokio::main]
@@ -86,6 +88,9 @@ async fn main() {
         Arc::new(tok)
     });
 
+    let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+    let metrics_handle = prometheus_builder.install_recorder().unwrap();
+
     let scheduler = batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len);
     let traces = trace_store::TraceStore::new(args.max_traces);
     let state = AppState {
@@ -94,6 +99,7 @@ async fn main() {
         model_id,
         scheduler: Arc::new(Mutex::new(scheduler)),
         trace_store: Arc::new(Mutex::new(traces)),
+        metrics_handle,
     };
 
     let app = api::router()

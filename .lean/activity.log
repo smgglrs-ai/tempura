@@ -220,3 +220,11 @@
     exit_reason: "Phase 2 complete — no more Phase 2 items remaining"
     branch: "loop/2026-06-15-4"
     tag: "loop-run/2026-06-15-4-4"
+
+- timestamp: "2026-06-15T22:35:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p5-metrics"
+  summary: "Added Prometheus metrics: GET /metrics endpoint, oxide_request_count (by endpoint), oxide_request_duration_seconds (histogram), oxide_tokens_generated (counter). Uses metrics + metrics-exporter-prometheus crates."
+  iteration: 1
+  max_iterations: 10

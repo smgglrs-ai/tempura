@@ -451,7 +451,8 @@ items:
 
   - id: p5-metrics
     title: Prometheus metrics
-    status: planned
+    status: done
+    progress: 100
     priority: medium
     effort: S
     scope:

@@ -28,6 +28,7 @@ pub fn router() -> Router<AppState> {
         .route("/oxide/v1/compare", post(compare_pipelines))
         .route("/oxide/v1/verified", get(verification_status))
         .route("/oxide/v1/replay", post(replay))
+        .route("/metrics", get(metrics_handler))
         .route("/health", get(health))
 }
 
@@ -207,6 +208,9 @@ async fn chat_completions(
             .keep_alive(axum::response::sse::KeepAlive::default())
             .into_response())
     } else {
+        let start = std::time::Instant::now();
+        metrics::counter!("oxide_request_count", "endpoint" => "chat_completions").increment(1);
+
         let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, 42);
         let generated = state.model.generate(
             &mut session,
@@ -222,6 +226,10 @@ async fn chat_completions(
 
         let prompt_tokens = token_ids.len() as u32;
         let completion_tokens = generated.len() as u32;
+
+        metrics::counter!("oxide_tokens_generated").increment(completion_tokens as u64);
+        metrics::histogram!("oxide_request_duration_seconds", "endpoint" => "chat_completions")
+            .record(start.elapsed().as_secs_f64());
 
         Ok(Json(ChatCompletionResponse {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -272,6 +280,9 @@ async fn completions(
         top_p: 1.0,
     };
 
+    let start = std::time::Instant::now();
+    metrics::counter!("oxide_request_count", "endpoint" => "completions").increment(1);
+
     let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, 42);
     let generated = state.model.generate(
         &mut session,
@@ -287,6 +298,10 @@ async fn completions(
 
     let prompt_tokens = token_ids.len() as u32;
     let completion_tokens = generated.len() as u32;
+
+    metrics::counter!("oxide_tokens_generated").increment(completion_tokens as u64);
+    metrics::histogram!("oxide_request_duration_seconds", "endpoint" => "completions")
+        .record(start.elapsed().as_secs_f64());
 
     Ok(Json(CompletionResponse {
         id: format!("cmpl-{}", uuid::Uuid::new_v4()),
@@ -433,6 +448,10 @@ async fn replay(
         original,
         replay_tokens,
     )))
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    state.metrics_handle.render()
 }
 
 async fn health() -> &'static str {
