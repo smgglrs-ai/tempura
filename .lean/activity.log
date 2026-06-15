@@ -184,3 +184,11 @@
   summary: "Added 8 Kani proof harnesses across all 6 kernel files: attention (2: q/kv offsets), layernorm (1), rmsnorm (1), rope (1), matmul (1), sampling (2: top-k index, cumsum fallback). All 11 total Kani proofs pass."
   iteration: 1
   max_iterations: 10
+
+- timestamp: "2026-06-15T22:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2c-replay-api"
+  summary: "Added deterministic replay API: POST /oxide/v1/replay accepts token_ids+seed or trace_id, runs inference twice with same seed, returns per-token match comparison. 2 replay tests."
+  iteration: 2
+  max_iterations: 10

@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_imports)]
 mod api;
 mod batch;
+pub mod replay;
 mod sse;
 mod trace_store;
 

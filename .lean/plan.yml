@@ -305,7 +305,8 @@ items:
     description: >
       Replay a previous inference and verify bit-identical output.
       Accepts trace_id or explicit (tokens, seed, params).
-    status: planned
+    status: done
+    progress: 100
     priority: medium
     effort: M
     depends_on: [2b-generate, 2c-trace-api]

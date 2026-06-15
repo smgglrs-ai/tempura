@@ -26,6 +26,7 @@ pub fn router() -> Router<AppState> {
             get(get_trace).delete(delete_trace),
         )
         .route("/oxide/v1/compare", post(compare_pipelines))
+        .route("/oxide/v1/replay", post(replay))
         .route("/health", get(health))
 }
 
@@ -380,6 +381,53 @@ async fn compare_pipelines(
     );
 
     Ok(Json(result))
+}
+
+async fn replay(
+    State(state): State<AppState>,
+    Json(req): Json<crate::replay::ReplayRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if state.model.weights.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No model weights loaded".into(),
+        ));
+    }
+
+    let token_ids = if let Some(ref ids) = req.token_ids {
+        ids.clone()
+    } else if let Some(ref trace_id) = req.trace_id {
+        let store = state.trace_store.lock().await;
+        let trace = store
+            .get(trace_id)
+            .ok_or((StatusCode::NOT_FOUND, format!("Trace {trace_id} not found")))?;
+        // Use the seed from the trace for replay
+        let _seed = trace.seed;
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "Replay from trace_id requires stored token_ids (not yet implemented)".into(),
+        ));
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Must provide either token_ids or trace_id".into(),
+        ));
+    };
+
+    let seed = req.seed.unwrap_or(42);
+    let params = SamplingParams {
+        temperature: req.temperature,
+        top_k: req.top_k.unwrap_or(50),
+        top_p: req.top_p.unwrap_or(1.0),
+    };
+
+    let (original, replay_tokens) =
+        crate::replay::replay_from_params(&state.model, &token_ids, seed, req.max_tokens, &params);
+
+    Ok(Json(crate::replay::build_replay_result(
+        original,
+        replay_tokens,
+    )))
 }
 
 async fn health() -> &'static str {
