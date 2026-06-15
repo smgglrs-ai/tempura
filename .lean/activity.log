@@ -164,3 +164,15 @@
   summary: "Added DualPipeline comparison: compare_pipelines() reports per-layer divergence (max abs diff, L2), logits divergence, token match. POST /oxide/v1/compare endpoint. 1 zero-divergence test."
   iteration: 3
   max_iterations: 10
+
+- timestamp: "2026-06-15T21:35:00+02:00"
+  actor: claude
+  action: loop-complete
+  summary: "Loop finished: 3 items completed (2b-sse, 2c-trace-api, 2c-dual-pipeline). Phase 2B complete. Exit: Phase 2C partially done, remaining items blocked on 2a-kani-kernels"
+  details:
+    iterations: 3
+    max_iterations: 10
+    completed: [2b-sse, 2c-trace-api, 2c-dual-pipeline]
+    exit_reason: "Phase 2B complete, Phase 2C partially done"
+    branch: "loop/2026-06-15-3"
+    tag: "loop-run/2026-06-15-3-3"
