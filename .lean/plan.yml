@@ -186,7 +186,8 @@ items:
       Embedding lookup, layer loop (RMSNorm, QKV projection, RoPE, attention +
       KV cache, output projection, residual, RMSNorm, SiLU-gated FFN, residual),
       final norm, lm_head. Uses KernelPipeline. Populates LayerSnapshot per layer.
-    status: planned
+    status: done
+    progress: 100
     priority: critical
     effort: L
     depends_on: [2a-weights, 2b-session, 2b-pipeline]
