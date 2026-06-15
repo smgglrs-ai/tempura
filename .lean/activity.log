@@ -24,3 +24,11 @@
   summary: "Added InferenceTrace type system: TraceLevel, TimingInfo, NormStats, SamplingSnapshot, LayerSnapshot, InferenceTrace with serde support and 4 tests"
   iteration: 1
   max_iterations: 10
+
+- timestamp: "2026-06-15T18:35:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2a-weights"
+  summary: "Added ModelWeights with HashMap<String, Vec<f32>> storage, LLaMA tensor naming, load validation, and 5 tests. Replaced _weights_loaded placeholder in TransformerModel."
+  iteration: 2
+  max_iterations: 10

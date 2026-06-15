@@ -1,5 +1,6 @@
 use crate::config::ModelConfig;
 use crate::kv_cache::KvCache;
+use crate::weights::ModelWeights;
 use oxide_kernels::{Attention, LayerNorm, RoPE, Sampler, SamplingParams};
 
 pub struct TransformerModel<A, L, R, S> {
@@ -9,8 +10,7 @@ pub struct TransformerModel<A, L, R, S> {
     pub layernorm: L,
     pub rope: R,
     pub sampler: S,
-    // placeholder for actual weight storage
-    _weights_loaded: bool,
+    pub weights: Option<ModelWeights>,
 }
 
 impl<A, L, R, S> TransformerModel<A, L, R, S>
@@ -29,8 +29,16 @@ where
             layernorm,
             rope,
             sampler,
-            _weights_loaded: false,
+            weights: None,
         }
+    }
+
+    pub fn load_weights(
+        &mut self,
+        loader: &dyn crate::loader::WeightLoader,
+    ) -> Result<(), crate::weights::WeightsError> {
+        self.weights = Some(ModelWeights::load(loader, &self.config)?);
+        Ok(())
     }
 
     /// Run a forward pass for a single token and return logits.
@@ -53,7 +61,11 @@ where
         vec![0.0; self.config.vocab_size]
     }
 
-    pub fn sample(&self, logits: &[f32], params: &SamplingParams) -> oxide_kernels::Result<Vec<f32>> {
+    pub fn sample(
+        &self,
+        logits: &[f32],
+        params: &SamplingParams,
+    ) -> oxide_kernels::Result<Vec<f32>> {
         let mut probs = vec![0.0; logits.len()];
         self.sampler.apply(logits, &mut probs, params)?;
         Ok(probs)

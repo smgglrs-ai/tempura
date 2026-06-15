@@ -62,7 +62,8 @@ items:
     description: >
       Replace _weights_loaded bool placeholder with HashMap<String, Vec<f32>>
       keyed by safetensors tensor names. Validation against ModelConfig.
-    status: planned
+    status: done
+    progress: 100
     priority: critical
     effort: M
     scope:
