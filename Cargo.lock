@@ -869,6 +869,7 @@ name = "oxide-kernels"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "rand",
  "thiserror",
 ]
 

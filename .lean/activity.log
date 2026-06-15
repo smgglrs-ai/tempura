@@ -68,3 +68,11 @@
   summary: "Added RMSNorm trait + CpuRMSNorm (no mean subtraction, LLaMA-style) with 4 tests including unit RMS verification and multi-token handling"
   iteration: 2
   max_iterations: 10
+
+- timestamp: "2026-06-15T19:30:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2a-token-selection"
+  summary: "Added sample_token(probs, rng) to Sampler trait with RngCore-based sampling, greedy argmax when rng=None, and deterministic reproducibility tests"
+  iteration: 3
+  max_iterations: 10
