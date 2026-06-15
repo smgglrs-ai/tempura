@@ -857,6 +857,7 @@ name = "oxide-engine"
 version = "0.1.0"
 dependencies = [
  "oxide-kernels",
+ "rand",
  "safetensors",
  "serde",
  "serde_json",

@@ -76,3 +76,11 @@
   summary: "Added sample_token(probs, rng) to Sampler trait with RngCore-based sampling, greedy argmax when rng=None, and deterministic reproducibility tests"
   iteration: 3
   max_iterations: 10
+
+- timestamp: "2026-06-15T19:40:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2b-session"
+  summary: "Created InferenceSession (per-request state: KvCache, trace, position, seeded RNG). Refactored TransformerModel to take &mut InferenceSession in forward(). 2 new tests."
+  iteration: 4
+  max_iterations: 10

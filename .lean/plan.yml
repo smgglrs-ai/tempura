@@ -145,7 +145,8 @@ items:
     description: >
       Separate per-request state (KV cache, trace, position, RNG) from shared
       model state (weights, kernels). Required for batching and trace isolation.
-    status: planned
+    status: done
+    progress: 100
     priority: critical
     effort: S
     depends_on: [2a-trace-types, 2a-token-selection]
