@@ -4,6 +4,10 @@ mod batch;
 mod sse;
 
 use clap::Parser;
+use oxide_engine::pipeline::KernelPipeline;
+use oxide_engine::tokenizer::Tokenizer;
+use oxide_engine::{ModelConfig, TransformerModel};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
@@ -31,8 +35,19 @@ struct Args {
     max_seq_len: usize,
 }
 
+pub type CpuModel = TransformerModel<
+    oxide_kernels::attention::CpuAttention,
+    oxide_kernels::rmsnorm::CpuRMSNorm,
+    oxide_kernels::rope::CpuRoPE,
+    oxide_kernels::matmul::CpuMatMul,
+    oxide_kernels::sampling::CpuSampler,
+>;
+
 #[derive(Clone)]
 pub struct AppState {
+    pub model: Arc<CpuModel>,
+    pub tokenizer: Option<Arc<Tokenizer>>,
+    pub model_id: String,
     pub scheduler: Arc<Mutex<batch::BatchScheduler>>,
 }
 
@@ -44,8 +59,32 @@ async fn main() {
 
     let args = Args::parse();
 
+    let config = ModelConfig::llama2_7b();
+    let pipeline = KernelPipeline::cpu_verified();
+    let mut model = TransformerModel::new(config, pipeline);
+
+    let model_id = if let Some(ref model_path) = args.model {
+        let loader =
+            oxide_engine::loader::SafetensorsLoader::from_file(Path::new(model_path)).unwrap();
+        model.load_weights(&loader).unwrap();
+        tracing::info!("Loaded model weights from {}", model_path);
+        model_path.clone()
+    } else {
+        tracing::warn!("No --model provided, running with unloaded weights (stub responses)");
+        "oxide-serve-unloaded".to_string()
+    };
+
+    let tokenizer = args.tokenizer.as_ref().map(|path| {
+        let tok = Tokenizer::from_file(Path::new(path)).unwrap();
+        tracing::info!("Loaded tokenizer from {}", path);
+        Arc::new(tok)
+    });
+
     let scheduler = batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len);
     let state = AppState {
+        model: Arc::new(model),
+        tokenizer,
+        model_id,
         scheduler: Arc::new(Mutex::new(scheduler)),
     };
 

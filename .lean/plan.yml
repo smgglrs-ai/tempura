@@ -225,7 +225,8 @@ items:
     description: >
       Connect Axum endpoints to engine. AppState gains TransformerModel and
       Tokenizer. Load model at startup from CLI paths.
-    status: planned
+    status: done
+    progress: 100
     priority: critical
     effort: M
     depends_on: [2b-generate]

@@ -120,3 +120,11 @@
   summary: "Implemented autoregressive token generation loop with SamplingSnapshot recording per step, EOS stopping, and deterministic reproducibility. 4 new tests."
   iteration: 1
   max_iterations: 10
+
+- timestamp: "2026-06-15T20:45:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2b-wire-api"
+  summary: "Wired Axum API to real inference: AppState holds TransformerModel+Tokenizer, handlers tokenize/generate/decode, model loaded from CLI --model/--tokenizer, error responses when unloaded"
+  iteration: 2
+  max_iterations: 10
