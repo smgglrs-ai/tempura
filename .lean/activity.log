@@ -128,3 +128,15 @@
   summary: "Wired Axum API to real inference: AppState holds TransformerModel+Tokenizer, handlers tokenize/generate/decode, model loaded from CLI --model/--tokenizer, error responses when unloaded"
   iteration: 2
   max_iterations: 10
+
+- timestamp: "2026-06-15T20:50:00+02:00"
+  actor: claude
+  action: loop-complete
+  summary: "Loop finished: 2 items completed (2b-generate, 2b-wire-api). Exit: API wired to real inference — Phase 2B serving layer complete"
+  details:
+    iterations: 2
+    max_iterations: 10
+    completed: [2b-generate, 2b-wire-api]
+    exit_reason: "API wired to real inference — Phase 2B serving layer milestone"
+    branch: "loop/2026-06-15-2"
+    tag: "loop-run/2026-06-15-2-2"
