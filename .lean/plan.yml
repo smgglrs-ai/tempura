@@ -245,7 +245,8 @@ items:
     description: >
       Token-by-token streaming via existing SSE types. Generation yields tokens
       through a channel; handler converts to ChatCompletionChunk events.
-    status: planned
+    status: done
+    progress: 100
     priority: high
     effort: M
     depends_on: [2b-wire-api]

@@ -140,3 +140,11 @@
     exit_reason: "API wired to real inference — Phase 2B serving layer milestone"
     branch: "loop/2026-06-15-2"
     tag: "loop-run/2026-06-15-2-2"
+
+- timestamp: "2026-06-15T21:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2b-sse"
+  summary: "Added SSE streaming: generate_with_callback in engine, chat_completions handler returns SSE when stream=true with per-token ChatCompletionChunk events and [DONE] sentinel"
+  iteration: 1
+  max_iterations: 10

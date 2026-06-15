@@ -318,6 +318,66 @@ where
         generated
     }
 
+    pub fn generate_with_callback(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        mut on_token: impl FnMut(u32) -> bool,
+    ) -> Vec<u32> {
+        let logits = self.forward(session, token_ids);
+        session.trace.prompt_tokens = token_ids.len();
+
+        let mut probs = vec![0.0f32; logits.len()];
+        self.pipeline
+            .sampler
+            .apply(&logits, &mut probs, params)
+            .unwrap();
+
+        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+            None
+        } else {
+            Some(&mut session.rng)
+        };
+        let first_token = self.pipeline.sampler.sample_token(&probs, rng_ref);
+
+        let mut generated = vec![first_token];
+        if !on_token(first_token) {
+            session.trace.generated_tokens = generated.len();
+            return generated;
+        }
+
+        for _step in 1..max_new_tokens {
+            if eos_token == Some(*generated.last().unwrap()) {
+                break;
+            }
+
+            let logits = self.forward(session, &[*generated.last().unwrap()]);
+            let mut probs = vec![0.0f32; logits.len()];
+            self.pipeline
+                .sampler
+                .apply(&logits, &mut probs, params)
+                .unwrap();
+
+            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                None
+            } else {
+                Some(&mut session.rng)
+            };
+            let token = self.pipeline.sampler.sample_token(&probs, rng_ref);
+
+            generated.push(token);
+            if !on_token(token) {
+                break;
+            }
+        }
+
+        session.trace.generated_tokens = generated.len();
+        generated
+    }
+
     fn record_sampling_snapshot(
         &self,
         session: &mut InferenceSession,

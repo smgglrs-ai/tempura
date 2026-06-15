@@ -1,5 +1,6 @@
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -7,7 +8,11 @@ use oxide_engine::session::InferenceSession;
 use oxide_engine::trace::TraceLevel;
 use oxide_kernels::SamplingParams;
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 
+use crate::sse::{ChatCompletionChunk, ChunkChoice, ChunkDelta};
 use crate::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -114,7 +119,7 @@ fn default_temperature() -> f32 {
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<Json<ChatCompletionResponse>, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
     let tokenizer = state.tokenizer.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "No tokenizer loaded".into(),
@@ -144,41 +149,93 @@ async fn chat_completions(
         top_p: req.top_p.unwrap_or(1.0),
     };
 
-    let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, 42);
-    let generated = state.model.generate(
-        &mut session,
-        &token_ids,
-        req.max_tokens as usize,
-        &params,
-        None,
-    );
+    if req.stream {
+        let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+        let model_name = req.model.clone();
+        let model = state.model.clone();
+        let tokenizer = tokenizer.clone();
 
-    let text = tokenizer
-        .decode(&generated)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
 
-    let prompt_tokens = token_ids.len() as u32;
-    let completion_tokens = generated.len() as u32;
+        tokio::task::spawn_blocking(move || {
+            let mut session = InferenceSession::new(&model.config, TraceLevel::Off, 42);
+            let id_clone = id.clone();
+            let model_clone = model_name.clone();
 
-    Ok(Json(ChatCompletionResponse {
-        id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-        object: "chat.completion".to_string(),
-        created: 0,
-        model: req.model,
-        choices: vec![ChatChoice {
-            index: 0,
-            message: ChatMessage {
-                role: "assistant".to_string(),
-                content: text,
+            model.generate_with_callback(
+                &mut session,
+                &token_ids,
+                params.top_k.min(256),
+                &params,
+                None,
+                |token| {
+                    let text = tokenizer.decode(&[token]).unwrap_or_default();
+                    let chunk = ChatCompletionChunk {
+                        id: id_clone.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        created: 0,
+                        model: model_clone.clone(),
+                        choices: vec![ChunkChoice {
+                            index: 0,
+                            delta: ChunkDelta {
+                                role: None,
+                                content: Some(text),
+                            },
+                            finish_reason: None,
+                        }],
+                    };
+                    let data = serde_json::to_string(&chunk).unwrap();
+                    let event = Event::default().data(data);
+                    tx.blocking_send(Ok(event)).is_ok()
+                },
+            );
+
+            let done = Event::default().data("[DONE]");
+            let _ = tx.blocking_send(Ok(done));
+        });
+
+        let stream = ReceiverStream::new(rx);
+        Ok(Sse::new(stream)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response())
+    } else {
+        let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, 42);
+        let generated = state.model.generate(
+            &mut session,
+            &token_ids,
+            req.max_tokens as usize,
+            &params,
+            None,
+        );
+
+        let text = tokenizer
+            .decode(&generated)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let prompt_tokens = token_ids.len() as u32;
+        let completion_tokens = generated.len() as u32;
+
+        Ok(Json(ChatCompletionResponse {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: req.model,
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: text,
+                },
+                finish_reason: "stop".to_string(),
+            }],
+            usage: Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
             },
-            finish_reason: "stop".to_string(),
-        }],
-        usage: Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-        },
-    }))
+        })
+        .into_response())
+    }
 }
 
 async fn completions(
