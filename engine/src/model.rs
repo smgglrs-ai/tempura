@@ -1,7 +1,7 @@
 use crate::config::ModelConfig;
 use crate::pipeline::KernelPipeline;
 use crate::session::InferenceSession;
-use crate::trace::{LayerSnapshot, TraceLevel};
+use crate::trace::{LayerSnapshot, SamplingSnapshot, TraceLevel};
 use crate::weights::ModelWeights;
 use oxide_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
 
@@ -263,6 +263,101 @@ where
         self.pipeline.sampler.apply(logits, &mut probs, params)?;
         Ok(probs)
     }
+
+    pub fn generate(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+    ) -> Vec<u32> {
+        let logits = self.forward(session, token_ids);
+        session.trace.prompt_tokens = token_ids.len();
+
+        let mut probs = vec![0.0f32; logits.len()];
+        self.pipeline
+            .sampler
+            .apply(&logits, &mut probs, params)
+            .unwrap();
+
+        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+            None
+        } else {
+            Some(&mut session.rng)
+        };
+        let first_token = self.pipeline.sampler.sample_token(&probs, rng_ref);
+
+        let mut generated = vec![first_token];
+        self.record_sampling_snapshot(session, 0, &logits, &probs, first_token, params);
+
+        for step in 1..max_new_tokens {
+            if eos_token == Some(*generated.last().unwrap()) {
+                break;
+            }
+
+            let logits = self.forward(session, &[*generated.last().unwrap()]);
+            let mut probs = vec![0.0f32; logits.len()];
+            self.pipeline
+                .sampler
+                .apply(&logits, &mut probs, params)
+                .unwrap();
+
+            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                None
+            } else {
+                Some(&mut session.rng)
+            };
+            let token = self.pipeline.sampler.sample_token(&probs, rng_ref);
+
+            self.record_sampling_snapshot(session, step, &logits, &probs, token, params);
+            generated.push(token);
+        }
+
+        session.trace.generated_tokens = generated.len();
+        generated
+    }
+
+    fn record_sampling_snapshot(
+        &self,
+        session: &mut InferenceSession,
+        step: usize,
+        logits: &[f32],
+        probs: &[f32],
+        selected: u32,
+        params: &SamplingParams,
+    ) {
+        if session.trace_level < TraceLevel::Summary {
+            return;
+        }
+
+        let k = 5.min(logits.len());
+        let mut indexed_logits: Vec<(u32, f32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i as u32, v))
+            .collect();
+        indexed_logits.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        let mut indexed_probs: Vec<(u32, f32)> = probs
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v > 0.0)
+            .map(|(i, &v)| (i as u32, v))
+            .collect();
+        indexed_probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        session.trace.sampling_steps.push(SamplingSnapshot {
+            step,
+            top_logits: indexed_logits[..k].to_vec(),
+            top_probs: indexed_probs[..k.min(indexed_probs.len())].to_vec(),
+            selected_token: selected,
+            temperature: params.temperature,
+            top_k: params.top_k,
+            top_p: params.top_p,
+            rng_seed: session.seed,
+        });
+    }
 }
 
 pub use oxide_kernels::sampling::SamplingParams as SampleParams;
@@ -378,6 +473,129 @@ mod tests {
 
         let all_zero = logits.iter().all(|&v| v == 0.0);
         assert!(!all_zero, "logits should be non-zero with random weights");
+    }
+
+    #[test]
+    fn test_generate_returns_tokens() {
+        let config = ModelConfig::tiny_test();
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(config.clone(), pipeline);
+        let loader = RandomWeightLoader::from_config(&config, 42);
+        model.load_weights(&loader).unwrap();
+
+        let mut session = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 50,
+            top_p: 1.0,
+        };
+        let tokens = model.generate(&mut session, &[1, 2, 3], 5, &params, None);
+
+        assert_eq!(tokens.len(), 5);
+        assert_eq!(session.trace.prompt_tokens, 3);
+        assert_eq!(session.trace.generated_tokens, 5);
+    }
+
+    #[test]
+    fn test_generate_stops_at_eos() {
+        let config = ModelConfig::tiny_test();
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(config.clone(), pipeline);
+        let loader = RandomWeightLoader::from_config(&config, 42);
+        model.load_weights(&loader).unwrap();
+
+        let mut session = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 50,
+            top_p: 1.0,
+        };
+        let tokens = model.generate(
+            &mut session,
+            &[1],
+            100,
+            &params,
+            Some(tokens_first(&model, &config)),
+        );
+
+        // Should stop before 100 if EOS is hit
+        assert!(tokens.len() <= 100);
+    }
+
+    fn tokens_first<A: Attention, N: RMSNorm, R: RoPE, M: MatMul, S: Sampler>(
+        model: &TransformerModel<A, N, R, M, S>,
+        config: &ModelConfig,
+    ) -> u32 {
+        let mut session = InferenceSession::new(config, TraceLevel::Off, 42);
+        let logits = model.forward(&mut session, &[1]);
+        let mut probs = vec![0.0; logits.len()];
+        model
+            .pipeline
+            .sampler
+            .apply(
+                &logits,
+                &mut probs,
+                &SamplingParams {
+                    temperature: 1.0,
+                    top_k: 50,
+                    top_p: 1.0,
+                },
+            )
+            .unwrap();
+        model
+            .pipeline
+            .sampler
+            .sample_token(&probs, Some(&mut session.rng))
+    }
+
+    #[test]
+    fn test_generate_deterministic() {
+        let config = ModelConfig::tiny_test();
+        let loader = RandomWeightLoader::from_config(&config, 42);
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 50,
+            top_p: 1.0,
+        };
+
+        let pipeline1 = KernelPipeline::cpu_verified();
+        let mut model1 = TransformerModel::new(config.clone(), pipeline1);
+        model1.load_weights(&loader).unwrap();
+        let mut session1 = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let tokens1 = model1.generate(&mut session1, &[1, 2], 10, &params, None);
+
+        let pipeline2 = KernelPipeline::cpu_verified();
+        let mut model2 = TransformerModel::new(config.clone(), pipeline2);
+        model2.load_weights(&loader).unwrap();
+        let mut session2 = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let tokens2 = model2.generate(&mut session2, &[1, 2], 10, &params, None);
+
+        assert_eq!(tokens1, tokens2, "same seed must produce identical output");
+    }
+
+    #[test]
+    fn test_generate_with_sampling_trace() {
+        let config = ModelConfig::tiny_test();
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(config.clone(), pipeline);
+        let loader = RandomWeightLoader::from_config(&config, 42);
+        model.load_weights(&loader).unwrap();
+
+        let mut session = InferenceSession::new(&config, TraceLevel::Summary, 42);
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 50,
+            top_p: 1.0,
+        };
+        let tokens = model.generate(&mut session, &[1], 3, &params, None);
+
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(session.trace.sampling_steps.len(), 3);
+        for (i, snap) in session.trace.sampling_steps.iter().enumerate() {
+            assert_eq!(snap.step, i);
+            assert!(!snap.top_logits.is_empty());
+            assert!(!snap.top_probs.is_empty());
+        }
     }
 
     #[test]

@@ -112,3 +112,11 @@
     exit_reason: "Forward pass milestone reached — remaining items available for next run"
     branch: "loop/2026-06-15"
     tag: "loop-run/2026-06-15-6"
+
+- timestamp: "2026-06-15T20:30:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2b-generate"
+  summary: "Implemented autoregressive token generation loop with SamplingSnapshot recording per step, EOS stopping, and deterministic reproducibility. 4 new tests."
+  iteration: 1
+  max_iterations: 10

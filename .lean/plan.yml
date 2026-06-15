@@ -207,7 +207,8 @@ items:
       Autoregressive generation: forward -> sample -> select token -> record
       to trace -> repeat. Stops at max_tokens or EOS. Records SamplingSnapshot
       per step. Deterministic with seeded RNG.
-    status: planned
+    status: done
+    progress: 100
     priority: critical
     effort: M
     depends_on: [2a-token-selection, 2b-forward-pass]
