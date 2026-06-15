@@ -16,3 +16,11 @@
     TurboQuant/PQO for verified KV-cache compression (Phase 3), deterministic
     GPU inference via cuda-oxide controlled reduction order, model-internal
     observability as an unclaimed gap in the serving space.
+
+- timestamp: "2026-06-15T18:30:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2a-trace-types"
+  summary: "Added InferenceTrace type system: TraceLevel, TimingInfo, NormStats, SamplingSnapshot, LayerSnapshot, InferenceTrace with serde support and 4 tests"
+  iteration: 1
+  max_iterations: 10

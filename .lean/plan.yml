@@ -43,7 +43,8 @@ items:
       Define trace data model before building the forward pass. Pure data
       structures with Serialize/Deserialize. TraceLevel enum controls
       granularity: Off, Metadata, Summary, Full.
-    status: planned
+    status: done
+    progress: 100
     priority: critical
     effort: S
     scope:
