@@ -27,7 +27,8 @@ items:
     description: >
       Add RMSNorm trait alongside existing LayerNorm. LLaMA uses RMSNorm
       (no mean subtraction). Keep LayerNorm for other architectures.
-    status: planned
+    status: done
+    progress: 100
     priority: critical
     effort: S
     scope:

@@ -1,12 +1,14 @@
 pub mod attention;
 pub mod layernorm;
 pub mod matmul;
+pub mod rmsnorm;
 pub mod rope;
 pub mod sampling;
 
 pub use attention::Attention;
 pub use layernorm::LayerNorm;
 pub use matmul::MatMul;
+pub use rmsnorm::RMSNorm;
 pub use rope::RoPE;
 pub use sampling::{Sampler, SamplingParams};
 

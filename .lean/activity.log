@@ -60,3 +60,11 @@
   summary: "Added MatMul trait + CpuMatMul with naive triple-loop implementation and 5 tests (identity, 2x2, 3x3, non-square, dimension mismatch)"
   iteration: 1
   max_iterations: 10
+
+- timestamp: "2026-06-15T19:20:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2a-rmsnorm"
+  summary: "Added RMSNorm trait + CpuRMSNorm (no mean subtraction, LLaMA-style) with 4 tests including unit RMS verification and multi-token handling"
+  iteration: 2
+  max_iterations: 10
