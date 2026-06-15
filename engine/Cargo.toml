@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Inference engine for oxide-serve: model loading, KV-cache, forward pass"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [dependencies]
 oxide-kernels = { path = "../kernels" }
 safetensors = "0.5"

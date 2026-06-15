@@ -123,7 +123,8 @@ items:
     description: >
       KV cache does raw slice indexing with computed offsets — prime Kani target.
       Prove append_kv, k_slice, v_slice, remaining_capacity safety.
-    status: planned
+    status: done
+    progress: 100
     priority: high
     effort: S
     scope:

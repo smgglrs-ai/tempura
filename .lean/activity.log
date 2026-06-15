@@ -32,3 +32,11 @@
   summary: "Added ModelWeights with HashMap<String, Vec<f32>> storage, LLaMA tensor naming, load validation, and 5 tests. Replaced _weights_loaded placeholder in TransformerModel."
   iteration: 2
   max_iterations: 10
+
+- timestamp: "2026-06-15T18:50:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "2a-kani-kvcache"
+  summary: "Added 3 Kani proofs for KvCache: append_kv offset bounds, k/v slice bounds, remaining_capacity consistency. Proves indexing arithmetic without Vec allocation (avoids CBMC unwinding explosion)."
+  iteration: 3
+  max_iterations: 10
