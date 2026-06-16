@@ -52,6 +52,48 @@ impl InferenceSession {
             self.seed,
         );
     }
+
+    pub fn to_transfer(&self) -> SessionTransfer {
+        SessionTransfer {
+            cache: self.cache.to_transfer(),
+            position: self.position,
+            seed: self.seed,
+            last_logits: Vec::new(),
+        }
+    }
+
+    pub fn to_transfer_with_logits(&self, logits: Vec<f32>) -> SessionTransfer {
+        SessionTransfer {
+            cache: self.cache.to_transfer(),
+            position: self.position,
+            seed: self.seed,
+            last_logits: logits,
+        }
+    }
+
+    pub fn from_transfer(
+        transfer: SessionTransfer,
+        config: &ModelConfig,
+        trace_level: TraceLevel,
+    ) -> Self {
+        let cache = KvCache::from_transfer(transfer.cache, config);
+        Self {
+            cache,
+            trace: InferenceTrace::new(String::new(), trace_level, String::new(), transfer.seed),
+            trace_level,
+            position: transfer.position,
+            rng: StdRng::seed_from_u64(transfer.seed),
+            seed: transfer.seed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionTransfer {
+    pub cache: crate::kv_cache::KvCacheTransfer,
+    pub position: usize,
+    pub seed: u64,
+    pub last_logits: Vec<f32>,
 }
 
 #[cfg(test)]

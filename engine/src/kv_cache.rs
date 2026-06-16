@@ -204,6 +204,42 @@ impl KvCache {
         }
         self.seq_len = new_seq_len;
     }
+
+    pub fn to_transfer(&self) -> KvCacheTransfer {
+        let k_data: Vec<Vec<f32>> = (0..self.num_layers)
+            .map(|layer| self.k_slice(layer).to_vec())
+            .collect();
+        let v_data: Vec<Vec<f32>> = (0..self.num_layers)
+            .map(|layer| self.v_slice(layer).to_vec())
+            .collect();
+        KvCacheTransfer {
+            k_data,
+            v_data,
+            seq_len: self.seq_len,
+            num_layers: self.num_layers,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+        }
+    }
+
+    pub fn from_transfer(transfer: KvCacheTransfer, config: &ModelConfig) -> Self {
+        let mut cache = Self::new(config);
+        for (layer, (k, v)) in transfer.k_data.iter().zip(transfer.v_data.iter()).enumerate() {
+            cache.append_kv(layer, k, v, transfer.seq_len);
+        }
+        cache.advance(transfer.seq_len);
+        cache
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KvCacheTransfer {
+    pub k_data: Vec<Vec<f32>>,
+    pub v_data: Vec<Vec<f32>>,
+    pub seq_len: usize,
+    pub num_layers: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
 }
 
 #[derive(Debug)]

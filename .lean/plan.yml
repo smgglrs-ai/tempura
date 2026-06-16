@@ -1622,7 +1622,8 @@ items:
     quick: cargo test --package oxide-server
 - id: p11-disaggregated-serving
   title: Disaggregated prefill/decode serving
-  status: planned
+  status: done
+  progress: 100
   priority: medium
   effort: XL
   depends_on:

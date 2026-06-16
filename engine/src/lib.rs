@@ -1,5 +1,6 @@
 pub mod batch_invariant;
 pub mod config;
+pub mod disaggregated;
 pub mod dual_pipeline;
 pub mod kv_cache;
 pub mod loader;
