@@ -1473,7 +1473,8 @@ items:
     quick: cargo test --package oxide-server
 - id: p9-model-tool-parsers
   title: Model-specific tool call parsers
-  status: planned
+  status: done
+  progress: 100
   priority: high
   effort: L
   depends_on:
