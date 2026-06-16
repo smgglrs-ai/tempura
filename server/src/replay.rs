@@ -3,7 +3,7 @@ use oxide_engine::trace::TraceLevel;
 use oxide_kernels::SamplingParams;
 use serde::{Deserialize, Serialize};
 
-use crate::CpuModel;
+use crate::ActiveModel;
 
 #[derive(Debug, Deserialize)]
 pub struct ReplayRequest {
@@ -36,7 +36,7 @@ pub struct ReplayResult {
 }
 
 pub fn replay_from_params(
-    model: &CpuModel,
+    model: &ActiveModel,
     token_ids: &[u32],
     seed: u64,
     max_tokens: usize,

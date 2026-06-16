@@ -112,9 +112,14 @@ pub type CudaModel = TransformerModel<
     oxide_kernels::sampling::CudaSampler,
 >;
 
+#[cfg(not(feature = "cuda"))]
+pub type ActiveModel = CpuModel;
+#[cfg(feature = "cuda")]
+pub type ActiveModel = CudaModel;
+
 #[derive(Clone)]
 pub struct AppState {
-    pub model: Arc<CpuModel>,
+    pub model: Arc<ActiveModel>,
     pub tokenizer: Option<Arc<Tokenizer>>,
     pub model_id: String,
     pub scheduler: Arc<Mutex<batch::BatchScheduler>>,
@@ -205,8 +210,12 @@ async fn main() {
 async fn run_server(args: ServeArgs) {
     init_tracing(&args.otlp_endpoint);
 
-    if args.device == "cuda" {
-        tracing::warn!("--device cuda requested but GPU inference pipeline is not yet wired into API handlers. Running on CPU.");
+    if args.device == "cuda" && !cfg!(feature = "cuda") {
+        eprintln!("Error: --device cuda requires building with --features cuda");
+        std::process::exit(1);
+    }
+    if args.device == "cpu" && cfg!(feature = "cuda") {
+        tracing::warn!("Built with cuda feature but --device cpu requested; compile-time kernel selection uses CUDA");
     }
 
     let model_path = args.model.as_deref().map(Path::new);
@@ -234,7 +243,11 @@ async fn run_server(args: ServeArgs) {
         let gguf = oxide_engine::gguf_loader::GgufLoader::from_file(model_p).unwrap();
         let config = gguf.config.clone();
         tracing::info!("Loaded GGUF model from {}", model_p.display(),);
-        let mut model = TransformerModel::new(config.clone(), KernelPipeline::cpu_verified());
+        #[cfg(feature = "cuda")]
+        let pipeline = KernelPipeline::cuda();
+        #[cfg(not(feature = "cuda"))]
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(config.clone(), pipeline);
         model.load_weights(&gguf).unwrap();
 
         let tokenizer = if let Some(path) = args.tokenizer.as_ref() {
@@ -316,7 +329,11 @@ async fn run_server(args: ServeArgs) {
         (config, "oxide-serve-unloaded".to_string())
     };
 
-    let mut model = TransformerModel::new(config, KernelPipeline::cpu_verified());
+    #[cfg(feature = "cuda")]
+    let pipeline = KernelPipeline::cuda();
+    #[cfg(not(feature = "cuda"))]
+    let pipeline = KernelPipeline::cpu_verified();
+    let mut model = TransformerModel::new(config, pipeline);
 
     if let Some(model_p) = model_path {
         if is_model_dir {
