@@ -364,3 +364,11 @@
     exit_reason: "Remaining 6 items lack acceptance criteria"
     branch: "loop/2026-06-16"
     tag: "loop-run/2026-06-16-7"
+
+- timestamp: "2026-06-16T14:30:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p3-turboquant"
+  summary: "Implemented TurboQuant/PQO KV-cache compression kernel with KvCacheCompressor trait, CpuPolarQuant (group-quantized 3-bit), CudaPolarQuant stub, KvCache compressed mode, Kani harnesses, verification manifest entries"
+  iteration: 1
+  max_iterations: 10

@@ -86,6 +86,24 @@ pub fn manifest() -> VerificationManifest {
                 properties: vec!["seq_len + remaining = max_seq_len"],
                 status: "proven",
             },
+            KernelProof {
+                kernel: "CpuPolarQuant",
+                harness: "compress_indices_in_bounds",
+                properties: vec![
+                    "Vector start offset within data bounds",
+                    "Angle index within quantized_angles bounds",
+                ],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "CpuPolarQuant",
+                harness: "decompress_indices_in_bounds",
+                properties: vec![
+                    "Angle lookup within compressed buffer bounds",
+                    "Output vector indexing within allocated bounds",
+                ],
+                status: "proven",
+            },
         ],
         caveats: vec![
             "Proofs cover memory safety (no OOB, no panics) — NOT mathematical correctness",

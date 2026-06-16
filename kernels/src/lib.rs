@@ -6,6 +6,7 @@ pub mod matmul;
 pub mod rmsnorm;
 pub mod rope;
 pub mod sampling;
+pub mod turboquant;
 pub mod verification_manifest;
 
 pub use attention::Attention;
@@ -14,6 +15,7 @@ pub use matmul::MatMul;
 pub use rmsnorm::RMSNorm;
 pub use rope::RoPE;
 pub use sampling::{Sampler, SamplingParams};
+pub use turboquant::KvCacheCompressor;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KernelError {

@@ -515,7 +515,8 @@ items:
       optional compression layer extending sequence capacity ~5x. Adapts
       the PQO variant (no QJL bias correction) into the existing kernel
       trait pattern with Kani verification harnesses.
-    status: planned
+    status: done
+    progress: 100
     priority: medium
     effort: L
     depends_on: [p3-cuda-matmul]

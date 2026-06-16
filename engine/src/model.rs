@@ -141,17 +141,15 @@ where
 
             session.cache.append_kv(layer, &k, &v, seq_len);
             let kv_len = session.cache.seq_len + seq_len;
-            let kv_stride = n_kv_heads * head_dim;
-            let kv_slice_len = kv_len * kv_stride;
-            let k_cache = &session.cache.k[layer][..kv_slice_len];
-            let v_cache = &session.cache.v[layer][..kv_slice_len];
+            let k_cache = session.cache.k_data(layer, kv_len);
+            let v_cache = session.cache.v_data(layer, kv_len);
 
             let mut attn_out = vec![0.0f32; seq_len * q_dim];
             self.pipeline
                 .attention(
                     &q,
-                    k_cache,
-                    v_cache,
+                    &k_cache,
+                    &v_cache,
                     &mut attn_out,
                     1,
                     seq_len,
@@ -426,7 +424,6 @@ pub use oxide_kernels::sampling::SamplingParams as SampleParams;
 mod tests {
     use super::*;
     use crate::pipeline::KernelPipeline;
-    use crate::weights::ModelWeights;
     use std::collections::HashMap;
 
     struct RandomWeightLoader {
