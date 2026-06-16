@@ -11,6 +11,52 @@ pub struct ModelConfig {
     pub rope_theta: f32,
     pub layer_norm_eps: f32,
     pub tensor_parallel_size: usize,
+    pub quantization: Option<QuantConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuantConfig {
+    pub format: QuantFormat,
+    pub bits: u8,
+    pub group_size: usize,
+    pub symmetric: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantFormat {
+    None,
+    Gptq,
+    Awq,
+    Gguf,
+}
+
+impl QuantConfig {
+    pub fn gptq(bits: u8, group_size: usize) -> Self {
+        Self {
+            format: QuantFormat::Gptq,
+            bits,
+            group_size,
+            symmetric: true,
+        }
+    }
+
+    pub fn awq(bits: u8, group_size: usize) -> Self {
+        Self {
+            format: QuantFormat::Awq,
+            bits,
+            group_size,
+            symmetric: false,
+        }
+    }
+
+    pub fn gguf(bits: u8) -> Self {
+        Self {
+            format: QuantFormat::Gguf,
+            bits,
+            group_size: 32,
+            symmetric: true,
+        }
+    }
 }
 
 impl ModelConfig {
@@ -27,6 +73,7 @@ impl ModelConfig {
             rope_theta: 10000.0,
             layer_norm_eps: 1e-5,
             tensor_parallel_size: 1,
+            quantization: None,
         }
     }
 
@@ -43,6 +90,7 @@ impl ModelConfig {
             rope_theta: 10000.0,
             layer_norm_eps: 1e-5,
             tensor_parallel_size: 1,
+            quantization: None,
         }
     }
 
@@ -59,6 +107,7 @@ impl ModelConfig {
             rope_theta: 10000.0,
             layer_norm_eps: 1e-5,
             tensor_parallel_size: 1,
+            quantization: None,
         }
     }
 }

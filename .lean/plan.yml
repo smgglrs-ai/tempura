@@ -671,7 +671,8 @@ items:
       f32-only ModelWeights), dequantization kernels converting packed
       integers to f32 at matmul time, format-specific loaders parsing
       quantization metadata, and a quantized matmul path in CPU/GPU pipelines.
-    status: planned
+    status: done
+    progress: 100
     priority: low
     effort: XL
     scope:

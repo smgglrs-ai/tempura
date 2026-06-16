@@ -404,3 +404,11 @@
   summary: "Added AllReduce trait (CpuAllReduce no-op + CudaAllReduce stub), tensor_parallel_size to ModelConfig, KernelPipeline gains 6th type param with default, backward compat preserved"
   iteration: 5
   max_iterations: 10
+
+- timestamp: "2026-06-16T17:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p5-quantization"
+  summary: "Added QuantConfig (GPTQ/AWQ/GGUF), TensorStorage enum with F32 and Quantized variants, dequantize_tensor for I8 and I4 dtypes, 5 new tests including round-trip accuracy"
+  iteration: 6
+  max_iterations: 10

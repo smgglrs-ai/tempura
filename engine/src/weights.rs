@@ -17,6 +17,106 @@ pub enum WeightsError {
     Load(#[from] LoadError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorDtype {
+    F32,
+    F16,
+    I8,
+    I4,
+}
+
+#[derive(Debug)]
+pub enum TensorStorage {
+    F32(Vec<f32>),
+    Quantized {
+        data: Vec<u8>,
+        scales: Vec<f32>,
+        zeros: Vec<f32>,
+        dtype: TensorDtype,
+        num_elements: usize,
+        group_size: usize,
+    },
+}
+
+impl TensorStorage {
+    pub fn as_f32(&self) -> Option<&[f32]> {
+        match self {
+            TensorStorage::F32(v) => Some(v),
+            TensorStorage::Quantized { .. } => None,
+        }
+    }
+
+    pub fn dequantize(&self) -> Vec<f32> {
+        match self {
+            TensorStorage::F32(v) => v.clone(),
+            TensorStorage::Quantized {
+                data,
+                scales,
+                zeros,
+                dtype,
+                num_elements,
+                group_size,
+            } => dequantize_tensor(data, scales, zeros, *dtype, *num_elements, *group_size),
+        }
+    }
+
+    pub fn dtype(&self) -> TensorDtype {
+        match self {
+            TensorStorage::F32(_) => TensorDtype::F32,
+            TensorStorage::Quantized { dtype, .. } => *dtype,
+        }
+    }
+}
+
+fn dequantize_tensor(
+    data: &[u8],
+    scales: &[f32],
+    zeros: &[f32],
+    dtype: TensorDtype,
+    num_elements: usize,
+    group_size: usize,
+) -> Vec<f32> {
+    let mut output = Vec::with_capacity(num_elements);
+    let num_groups = scales.len();
+
+    match dtype {
+        TensorDtype::I8 => {
+            for g in 0..num_groups {
+                let scale = scales[g];
+                let zero = zeros[g];
+                let start = g * group_size;
+                let end = (start + group_size).min(num_elements);
+                for &byte in &data[start..end] {
+                    output.push(byte as f32 * scale + zero);
+                }
+            }
+        }
+        TensorDtype::I4 => {
+            for g in 0..num_groups {
+                let scale = scales[g];
+                let zero = zeros[g];
+                let start = g * group_size;
+                let end = (start + group_size).min(num_elements);
+                for i in start..end {
+                    let byte = data[i / 2];
+                    let nibble = if i % 2 == 0 {
+                        byte & 0x0F
+                    } else {
+                        (byte >> 4) & 0x0F
+                    };
+                    let q = nibble as i8 - 8;
+                    output.push(q as f32 * scale + zero);
+                }
+            }
+        }
+        TensorDtype::F16 | TensorDtype::F32 => {
+            panic!("dequantize called on non-quantized dtype");
+        }
+    }
+
+    output
+}
+
 #[derive(Debug)]
 pub struct ModelWeights {
     tensors: HashMap<String, Vec<f32>>,
@@ -214,5 +314,111 @@ mod tests {
         let names = ModelWeights::required_tensor_names(&config);
         // 3 global + 9 per layer * num_layers
         assert_eq!(names.len(), 3 + 9 * config.num_layers);
+    }
+
+    #[test]
+    fn test_tensor_storage_f32() {
+        let storage = TensorStorage::F32(vec![1.0, 2.0, 3.0]);
+        assert_eq!(storage.dtype(), TensorDtype::F32);
+        assert_eq!(storage.as_f32().unwrap(), &[1.0, 2.0, 3.0]);
+        assert_eq!(storage.dequantize(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_tensor_storage_i8_dequantize() {
+        let group_size = 4;
+        let data: Vec<u8> = vec![0, 1, 2, 3]; // i8 values: 0, 1, 2, 3
+        let scales = vec![0.5f32];
+        let zeros = vec![0.0f32];
+
+        let storage = TensorStorage::Quantized {
+            data,
+            scales,
+            zeros,
+            dtype: TensorDtype::I8,
+            num_elements: 4,
+            group_size,
+        };
+
+        assert_eq!(storage.dtype(), TensorDtype::I8);
+        assert!(storage.as_f32().is_none());
+
+        let deq = storage.dequantize();
+        assert_eq!(deq, vec![0.0, 0.5, 1.0, 1.5]);
+    }
+
+    #[test]
+    fn test_tensor_storage_i4_dequantize() {
+        let group_size = 4;
+        // 4 nibbles packed in 2 bytes: [low=0x98, high=0xBA]
+        // byte 0: low nibble = 8 (q=0), high nibble = 9 (q=1)
+        // byte 1: low nibble = A (q=2), high nibble = B (q=3)
+        let data: Vec<u8> = vec![0x98, 0xBA];
+        let scales = vec![1.0f32];
+        let zeros = vec![0.0f32];
+
+        let storage = TensorStorage::Quantized {
+            data,
+            scales,
+            zeros,
+            dtype: TensorDtype::I4,
+            num_elements: 4,
+            group_size,
+        };
+
+        let deq = storage.dequantize();
+        assert_eq!(deq.len(), 4);
+        // nibble 0 = 0x8 = 8, q = 8-8 = 0
+        assert_eq!(deq[0], 0.0);
+        // nibble 1 = 0x9 = 9, q = 9-8 = 1
+        assert_eq!(deq[1], 1.0);
+    }
+
+    #[test]
+    fn test_quant_config_gptq() {
+        use crate::config::QuantConfig;
+        let qc = QuantConfig::gptq(4, 128);
+        assert_eq!(qc.bits, 4);
+        assert_eq!(qc.group_size, 128);
+        assert!(qc.symmetric);
+    }
+
+    #[test]
+    fn test_dequantize_i8_accuracy() {
+        let original: Vec<f32> = vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8];
+        let group_size = 8;
+
+        let min_val = original.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = original.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let scale = (max_val - min_val) / 255.0;
+        let zero = min_val;
+
+        let quantized: Vec<u8> = original
+            .iter()
+            .map(|&v| ((v - zero) / scale).round() as u8)
+            .collect();
+
+        let storage = TensorStorage::Quantized {
+            data: quantized,
+            scales: vec![scale],
+            zeros: vec![zero],
+            dtype: TensorDtype::I8,
+            num_elements: 8,
+            group_size,
+        };
+
+        let deq = storage.dequantize();
+        let norm: f32 = original.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let diff: f32 = original
+            .iter()
+            .zip(&deq)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum::<f32>()
+            .sqrt();
+        let relative_error = diff / norm;
+        assert!(
+            relative_error < 0.01,
+            "8-bit dequant error {relative_error} >= 1%"
+        );
     }
 }
