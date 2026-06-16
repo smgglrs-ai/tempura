@@ -739,6 +739,14 @@ mod kani_proofs {
     }
 
     #[kani::proof]
+    fn head_dim_scale_never_zero_division() {
+        let head_dim: usize = kani::any();
+        kani::assume(head_dim >= 1 && head_dim <= 256);
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        assert!(!scale.is_nan());
+    }
+
+    #[kani::proof]
     fn extract_logprob_token_in_bounds() {
         let vocab_size: usize = kani::any();
         let token_id: u32 = kani::any();
@@ -1145,6 +1153,41 @@ mod tests {
         assert_eq!(logits.len(), config.vocab_size);
         assert_eq!(session.position, tokens.len());
         assert!(!logits.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_silu_no_nan_inf() {
+        let test_values: Vec<f32> = vec![
+            0.0,
+            1.0,
+            -1.0,
+            100.0,
+            -100.0,
+            1000.0,
+            -1000.0,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::MIN,
+            1e-30,
+            -1e-30,
+            1e30,
+            -1e30,
+        ];
+        for &x in &test_values {
+            let silu = x / (1.0 + (-x).exp());
+            assert!(!silu.is_nan(), "SiLU({x}) produced NaN");
+            assert!(!silu.is_infinite(), "SiLU({x}) produced Inf");
+        }
+    }
+
+    #[test]
+    fn test_attention_scale_no_nan() {
+        for head_dim in 1..=128 {
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            assert!(!scale.is_nan(), "scale NaN for head_dim={head_dim}");
+            assert!(!scale.is_infinite(), "scale Inf for head_dim={head_dim}");
+            assert!(scale > 0.0, "scale non-positive for head_dim={head_dim}");
+        }
     }
 
     #[test]

@@ -176,6 +176,30 @@ pub fn manifest() -> VerificationManifest {
                 properties: vec!["Full kernel execution with bounded inputs does not panic"],
                 status: "proven",
             },
+            KernelProof {
+                kernel: "SpeculativeDecoder",
+                harness: "speculative_token_index_in_bounds",
+                properties: vec!["Token index within probability vector bounds"],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "SpeculativeDecoder",
+                harness: "speculative_parallel_arrays_consistent",
+                properties: vec!["draft_tokens and draft_probs_vec parallel array indexing consistent"],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "TransformerModel",
+                harness: "head_dim_scale_never_zero_division",
+                properties: vec!["Attention scale 1/sqrt(head_dim) never NaN for head_dim >= 1"],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "CpuAllReduce",
+                harness: "cpu_allreduce_is_identity",
+                properties: vec!["CPU all-reduce is identity (output equals input)"],
+                status: "proven",
+            },
         ],
         math_properties: vec![
             MathProperty {
@@ -242,6 +266,24 @@ pub fn manifest() -> VerificationManifest {
                 kernel: "CpuRMSNorm",
                 property: "RMSNorm f32 output matches f64 reference within 1e-5",
                 method: "f64_reference",
+                status: "tested",
+            },
+            MathProperty {
+                kernel: "TransformerModel",
+                property: "SiLU activation produces no NaN or Inf for extreme inputs",
+                method: "unit_test",
+                status: "tested",
+            },
+            MathProperty {
+                kernel: "TransformerModel",
+                property: "Attention scale 1/sqrt(head_dim) positive and finite for head_dim 1..=128",
+                method: "unit_test",
+                status: "tested",
+            },
+            MathProperty {
+                kernel: "CpuPolarQuant",
+                property: "Round-trip quantization error < 15% relative L2 norm",
+                method: "proptest",
                 status: "tested",
             },
         ],

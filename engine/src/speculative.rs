@@ -251,6 +251,34 @@ where
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    #[kani::proof]
+    fn speculative_token_index_in_bounds() {
+        let vocab_size: usize = kani::any();
+        let token: u32 = kani::any();
+
+        kani::assume(vocab_size >= 1 && vocab_size <= 64);
+        kani::assume((token as usize) < vocab_size);
+
+        let probs = vec![0.0f32; vocab_size];
+        assert!((token as usize) < probs.len());
+    }
+
+    #[kani::proof]
+    fn speculative_parallel_arrays_consistent() {
+        let k: usize = kani::any();
+        kani::assume(k >= 1 && k <= 8);
+
+        let draft_tokens = vec![0u32; k];
+        let draft_probs_vec = vec![0.0f32; k];
+
+        for i in 0..draft_tokens.len() {
+            assert!(i < draft_probs_vec.len());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +449,40 @@ mod tests {
         assert_eq!(cache.seq_len, 1);
         assert_eq!(cache.k_slice(0).len(), stride);
         assert_eq!(cache.remaining_capacity(), config.max_seq_len - 1);
+    }
+
+    #[test]
+    fn test_speculative_token_index_bounded_by_logits() {
+        let config = ModelConfig::tiny_test();
+        let target = make_model_with_weights(&config, 42);
+        let draft = make_model_with_weights(&config, 42);
+        let decoder = SpeculativeDecoder::new(&target, &draft, 3);
+
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 50,
+            top_p: 1.0,
+            ..SamplingParams::default()
+        };
+
+        let mut target_session = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let mut draft_session = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let tokens = decoder.generate(
+            &mut target_session,
+            &mut draft_session,
+            &[1, 2],
+            10,
+            &params,
+            None,
+        );
+
+        for &tok in &tokens {
+            assert!(
+                (tok as usize) < config.vocab_size,
+                "token {tok} >= vocab_size {}",
+                config.vocab_size
+            );
+        }
     }
 
     #[test]

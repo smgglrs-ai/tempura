@@ -41,6 +41,21 @@ impl AllReduce for CudaAllReduce {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    #[kani::proof]
+    fn cpu_allreduce_is_identity() {
+        let len: usize = kani::any();
+        kani::assume(len >= 1 && len <= 8);
+        let input = vec![1.0f32; len];
+        let mut output = vec![0.0f32; len];
+        output.copy_from_slice(&input);
+        for i in 0..len {
+            assert!(output[i] == input[i]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

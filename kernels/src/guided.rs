@@ -400,4 +400,70 @@ mod tests {
         decoder.update_internal_state("[1,2]");
         assert!(decoder.is_complete());
     }
+
+    #[test]
+    fn test_literal_empty_remaining_no_panic() {
+        let vocab = simple_vocab();
+        let mut decoder = JsonGuidedDecoder::new(vocab);
+        decoder.update_internal_state("true");
+        assert!(decoder.is_complete());
+        assert!(decoder.literal_remaining.is_empty());
+    }
+
+    #[test]
+    fn test_all_valid_json_forms_complete() {
+        let vocab = simple_vocab();
+        let cases = vec![
+            "{}",
+            "[]",
+            "\"ab\"",
+            "12",
+            "true",
+            "null",
+            "{\"a\":1}",
+            "[1,2]",
+        ];
+        for json in cases {
+            let mut decoder = JsonGuidedDecoder::new(vocab.clone());
+            decoder.update_internal_state(json);
+            assert!(decoder.is_complete(), "{json} should be complete");
+        }
+    }
+
+    #[test]
+    fn test_invalid_transitions_return_none() {
+        let mut stack = Vec::new();
+        let mut literal = Vec::new();
+        assert!(JsonGuidedDecoder::advance_state(
+            JsonState::ExpectValue,
+            '}',
+            &mut stack,
+            &mut literal
+        )
+        .is_none());
+        assert!(JsonGuidedDecoder::advance_state(
+            JsonState::ExpectColon,
+            'a',
+            &mut stack,
+            &mut literal
+        )
+        .is_none());
+        assert!(JsonGuidedDecoder::advance_state(
+            JsonState::InStringEscape,
+            'z',
+            &mut stack,
+            &mut literal
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_no_panic_on_any_ascii_continuation() {
+        let vocab = simple_vocab();
+        let decoder = JsonGuidedDecoder::new(vocab);
+        for byte in 0u8..=127 {
+            let s = String::from(byte as char);
+            let _ = decoder.is_valid_continuation(&s);
+        }
+    }
 }

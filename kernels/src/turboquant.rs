@@ -458,6 +458,32 @@ mod tests {
         assert!(err < 0.05, "error {err} >= 5%");
     }
 
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn prop_round_trip_error_bounded(
+                values in prop::collection::vec(-5.0f32..5.0f32, 8..32),
+            ) {
+                let head_dim = values.len();
+                let compressor = CpuPolarQuant::default_3bit();
+                let compressed = compressor.compress(&values, head_dim).unwrap();
+                let decompressed = compressor.decompress(&compressed).unwrap();
+
+                let norm: f32 = values.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm < 1e-6 {
+                    return Ok(());
+                }
+                let error: f32 = values.iter().zip(decompressed.iter())
+                    .map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
+                let relative = error / norm;
+                prop_assert!(relative < 0.15, "round-trip error {:.4} >= 15%", relative);
+            }
+        }
+    }
+
     #[test]
     fn test_realistic_head_dim_64() {
         use rand::rngs::StdRng;
