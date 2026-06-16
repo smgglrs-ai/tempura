@@ -31,6 +31,7 @@ tracing-opentelemetry = { version = "0.28", optional = true }
 
 [features]
 default = []
+cuda = ["oxide-engine/cuda"]
 otlp = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 
 [dev-dependencies]

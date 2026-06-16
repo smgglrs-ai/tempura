@@ -90,6 +90,9 @@ struct ServeArgs {
         help = "OTLP gRPC endpoint for OpenTelemetry export (e.g. http://localhost:4317)"
     )]
     otlp_endpoint: Option<String>,
+
+    #[arg(long, default_value = "cpu", help = "Device: cpu or cuda")]
+    device: String,
 }
 
 pub type CpuModel = TransformerModel<
@@ -98,6 +101,15 @@ pub type CpuModel = TransformerModel<
     oxide_kernels::rope::CpuRoPE,
     oxide_kernels::matmul::CpuMatMul,
     oxide_kernels::sampling::CpuSampler,
+>;
+
+#[cfg(feature = "cuda")]
+pub type CudaModel = TransformerModel<
+    oxide_kernels::attention::CudaAttention,
+    oxide_kernels::rmsnorm::CudaRMSNorm,
+    oxide_kernels::rope::CudaRoPE,
+    oxide_kernels::matmul::CudaMatMul,
+    oxide_kernels::sampling::CudaSampler,
 >;
 
 #[derive(Clone)]
@@ -183,6 +195,7 @@ async fn main() {
                 shutdown_timeout: 30,
                 request_timeout_secs: 300,
                 otlp_endpoint: None,
+                device: "cpu".into(),
             })
             .await;
         }
@@ -191,6 +204,10 @@ async fn main() {
 
 async fn run_server(args: ServeArgs) {
     init_tracing(&args.otlp_endpoint);
+
+    if args.device == "cuda" {
+        tracing::warn!("--device cuda requested but GPU inference pipeline is not yet wired into API handlers. Running on CPU.");
+    }
 
     let model_path = args.model.as_deref().map(Path::new);
     let is_model_dir = model_path.is_some_and(|p| p.is_dir());
@@ -217,8 +234,7 @@ async fn run_server(args: ServeArgs) {
         let gguf = oxide_engine::gguf_loader::GgufLoader::from_file(model_p).unwrap();
         let config = gguf.config.clone();
         tracing::info!("Loaded GGUF model from {}", model_p.display(),);
-        let pipeline = KernelPipeline::cpu_verified();
-        let mut model = TransformerModel::new(config.clone(), pipeline);
+        let mut model = TransformerModel::new(config.clone(), KernelPipeline::cpu_verified());
         model.load_weights(&gguf).unwrap();
 
         let tokenizer = if let Some(path) = args.tokenizer.as_ref() {
@@ -300,8 +316,7 @@ async fn run_server(args: ServeArgs) {
         (config, "oxide-serve-unloaded".to_string())
     };
 
-    let pipeline = KernelPipeline::cpu_verified();
-    let mut model = TransformerModel::new(config, pipeline);
+    let mut model = TransformerModel::new(config, KernelPipeline::cpu_verified());
 
     if let Some(model_p) = model_path {
         if is_model_dir {
