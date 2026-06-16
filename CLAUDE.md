@@ -79,62 +79,56 @@ Three-crate workspace:
 - [x] SSE streaming types
 - [x] 7 passing tests
 
+## What's Done (Phases 2–8)
+
+- [x] All kernel traits + CPU reference implementations (Attention, RMSNorm, RoPE, MatMul, Sampler)
+- [x] Kani formal verification harnesses for all kernels and KvCache
+- [x] InferenceTrace type system with configurable granularity
+- [x] Forward pass (LLaMA architecture) with trace observability
+- [x] Token generation loop (autoregressive, deterministic)
+- [x] cuda-oxide GPU kernels (Attention, RMSNorm, RoPE, MatMul) behind `cuda` feature
+- [x] TurboQuant/PQO KV-cache compression kernel
+- [x] Continuous batching with preemption, KV cache pool
+- [x] Speculative decoding, tensor parallelism, quantization (GPTQ/AWQ/GGUF)
+- [x] OpenAI-compatible API: chat completions (streaming + non-streaming), completions, models
+- [x] Logprobs, stop sequences, N completions, presence/frequency penalties
+- [x] Chat templates (Jinja2/HF), response_format (json_object/json_schema), tool/function calling
+- [x] BatchScheduler wired into API handlers with backpressure
+- [x] Chunked prefill, prefix caching (hash-based KV reuse)
+- [x] Per-request timeouts, graceful shutdown, readiness probes
+- [x] Prometheus metrics (TTFT, ITL, queue depth, KV usage), OpenTelemetry export
+- [x] HuggingFace config.json auto-loading, Dockerfile
+- [x] Inference traces, deterministic replay, DualPipeline comparison, batch-invariant verification
+- [x] 148 passing tests
+
 ## What's Next
 
-### Phase 2: Verified, Observable, Composable Inference Foundation
-#### 2A — Foundation (parallel)
-- [ ] MatMul kernel trait + CPU reference
-- [ ] RMSNorm kernel trait + CPU reference
-- [ ] InferenceTrace type system (TraceLevel: Off/Metadata/Summary/Full)
-- [ ] ModelWeights storage (replace `_weights_loaded` placeholder)
-- [ ] Token selection in Sampler (seeded RNG for deterministic reproducibility)
-- [ ] Kani harnesses for all CPU kernels (no-panic, bounds safety)
-- [ ] Kani proofs for KvCache (append/slice bounds)
+### Phase 9: API Completeness
+- [ ] `stream_options.include_usage` in streaming responses
+- [ ] Expose `seed` parameter on API requests
+- [ ] Support `max_completion_tokens` alias
+- [ ] Model-specific tool call parsers (hermes, mistral, llama3)
+- [ ] Wire guided decoding into tool_choice modes
 
-#### 2B — Forward pass (traced from birth)
-- [ ] InferenceSession extraction (per-request state: cache, trace, RNG)
-- [ ] KernelPipeline abstraction (5-trait bundle, trace-aware)
-- [ ] Forward pass implementation (LLaMA arch, populates LayerSnapshot)
-- [ ] Token generation loop (autoregressive, deterministic)
-- [ ] Wire API to real inference
-- [ ] SSE streaming
+### Phase 10: Production Hardening
+- [ ] Priority-based request scheduling (SLA differentiation)
+- [ ] Black-box health check with priority inference (`/health/inference`)
+- [ ] Prefix cache tenant isolation (`cache_salt`)
 
-#### 2C — Differentiating API surface
-- [ ] Trace retrieval API (`/oxide/v1/traces`)
-- [ ] Verification status API (`/oxide/v1/verified`)
-- [ ] Deterministic replay API (`/oxide/v1/replay`)
-- [ ] DualPipeline comparison endpoint (`/oxide/v1/compare`)
-- [ ] Kani in CI (`cargo kani` on every PR)
-
-### Phase 3: cuda-oxide GPU Kernels (core product target)
-- [ ] cuda-oxide toolchain setup
-- [ ] GPU kernel implementations (CudaAttention, CudaRMSNorm, CudaRoPE, CudaMatMul)
-  - Same Kani harnesses verify against same trait contract as CPU
-  - Deterministic GPU reduction order by design
-- [ ] DualPipeline CPU vs GPU validation
-- [ ] TurboQuant/PQO KV-cache compression kernel (verified)
-
-### Phase 4: Continuous Batching + Scheduling
-- [ ] Multi-sequence KV cache (slot-based pool)
-- [ ] Verified continuous batching with preemption (Kani proofs for fairness)
-
-### Phase 5: Production hardening
-- [ ] Speculative decoding
-- [ ] Tensor parallelism
-- [ ] Quantization support (GPTQ, AWQ, GGUF)
-- [ ] Prometheus metrics
-- [ ] Docker/container support
+### Phase 11: Forward-Looking
+- [ ] OpenAI Responses API (`/v1/responses`)
+- [ ] Disaggregated prefill/decode serving
 
 ## Build & Test
 
 ```sh
 cargo build              # build all crates
-cargo test               # run all tests (7 currently)
+cargo test               # run all tests (148 currently)
 cargo run -- --help      # see CLI options
 cargo run -- --port 8080 # start server (stub responses)
 ```
 
-## Formal Verification (future)
+## Formal Verification
 
 ```sh
 cargo kani --package oxide-kernels  # verify kernel properties

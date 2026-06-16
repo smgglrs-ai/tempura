@@ -649,3 +649,15 @@
     exit_reason: "No unblocked items remaining in approve scope"
     branch: "loop/2026-06-16-7"
     tag: "loop-run/2026-06-16-2-approve-r7"
+- timestamp: "2026-06-16T20:15:00Z"
+  actor: claude
+  action: plan-revision
+  summary: >
+    Deep research (109 agents, 26 sources, 15 confirmed findings) identified
+    gaps vs vLLM/TGI/SGLang/TensorRT-LLM. Added 10 items across 3 phases:
+    Phase 9 (API completeness): stream_options.include_usage, seed parameter,
+    max_completion_tokens alias, model-specific tool parsers, constrained tool
+    args. Phase 10 (production hardening): priority scheduling, black-box
+    health inference probe, cache_salt tenant isolation. Phase 11 (forward-
+    looking): Responses API, disaggregated serving. Total plan: 67 items
+    (57 done, 10 planned).

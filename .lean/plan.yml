@@ -1407,3 +1407,239 @@ items:
   - cargo test --package oxide-kernels passes
   verification:
     quick: cargo test --package oxide-kernels
+- id: p9-stream-usage
+  title: stream_options.include_usage in streaming responses
+  status: planned
+  priority: critical
+  effort: S
+  scope:
+  - server/src/api.rs
+  - server/src/sse.rs
+  description: 'Add stream_options field to ChatCompletionRequest (with include_usage bool). When enabled,
+    the final SSE chunk before [DONE] includes a usage object with prompt_tokens, completion_tokens, and
+    total_tokens. Currently the streaming path records metrics internally but never sends usage data to
+    the client, so callers cannot track token consumption without parsing every chunk. This is required
+    by the OpenAI spec and used by cost-tracking tools like Langfuse.'
+  acceptance:
+  - ChatCompletionRequest accepts an optional stream_options field with include_usage bool
+  - 'When stream_options.include_usage is true, the final SSE chunk (before [DONE]) includes a usage object
+    with prompt_tokens, completion_tokens, and total_tokens matching the non-streaming response format'
+  - When stream_options is absent or include_usage is false, streaming behavior is unchanged (no usage chunk)
+  - Non-streaming requests ignore stream_options entirely
+  - cargo test --package oxide-server passes with at least one new test verifying usage presence in streaming
+  verification:
+    quick: cargo test --package oxide-server
+- id: p9-seed-param
+  title: Expose seed parameter on API requests
+  status: planned
+  priority: critical
+  effort: S
+  scope:
+  - server/src/api.rs
+  description: 'Add an optional seed field to ChatCompletionRequest and CompletionRequest. When provided,
+    the seed is passed through to InferenceSession instead of the hardcoded 42. This enables callers to
+    request deterministic output (same seed = same tokens) and matches the OpenAI API spec. The response
+    should echo the system_fingerprint field (a fixed string identifying the server version) so clients
+    can verify determinism. Currently the generate loop uses seed 42 (or 42+i for n>1) regardless of what
+    the client sends.'
+  acceptance:
+  - ChatCompletionRequest and CompletionRequest accept an optional seed field (Option<u64>)
+  - When seed is provided, InferenceSession uses that seed instead of the default 42
+  - When seed is absent, behavior is unchanged (backward compatible)
+  - 'Response includes system_fingerprint field (e.g. "oxide-serve-{version}")'
+  - 'Determinism test: two requests with the same seed produce identical output'
+  - cargo test --package oxide-server passes
+  verification:
+    quick: cargo test --package oxide-server
+- id: p9-max-completion-tokens
+  title: Support max_completion_tokens alias
+  status: planned
+  priority: high
+  effort: XS
+  scope:
+  - server/src/api.rs
+  description: 'OpenAI renamed max_tokens to max_completion_tokens in newer API versions. Both names should
+    be accepted on ChatCompletionRequest and CompletionRequest, with max_completion_tokens taking precedence
+    when both are provided. This is a trivial deserialization change using serde alias.'
+  acceptance:
+  - ChatCompletionRequest accepts max_completion_tokens as an alias for max_tokens
+  - CompletionRequest accepts max_completion_tokens as an alias for max_tokens
+  - When both are provided, max_completion_tokens takes precedence
+  - Existing requests using max_tokens continue to work unchanged
+  verification:
+    quick: cargo test --package oxide-server
+- id: p9-model-tool-parsers
+  title: Model-specific tool call parsers
+  status: planned
+  priority: high
+  effort: L
+  depends_on:
+  - p6-tool-calling
+  scope:
+  - engine/src/tool_call.rs
+  - server/src/api.rs
+  description: 'Different model families emit tool calls in different formats — Hermes uses <tool_call>
+    XML tags, Mistral uses [TOOL_CALLS] markers, LLaMA 3 uses <|python_tag|> or JSON blocks, DeepSeek
+    uses specific JSON structures, etc. The current ToolCallParser assumes a single generic JSON format
+    which will fail on most real models. Add a registry of model-specific parsers keyed by model family
+    name (detected from tokenizer_config.json or model config), with the generic parser as fallback. Each
+    parser implements the same ToolCallParser trait but handles model-specific framing and extraction.'
+  acceptance:
+  - ToolCallParser becomes a trait with parse(text) -> Option<Vec<ToolCall>> method
+  - At least 3 model-specific implementations (hermes, mistral, llama3_json) plus generic fallback
+  - Parser selection is automatic based on model family detected from tokenizer_config.json or CLI flag
+  - Each parser has unit tests with real example outputs from that model family
+  - 'Fallback: if no model-specific parser matches, the generic JSON parser is used'
+  - cargo test --workspace passes
+  verification:
+    quick: cargo test --package oxide-engine -- tool_call
+- id: p9-constrained-tool-args
+  title: Wire guided decoding into tool_choice modes
+  status: planned
+  priority: high
+  effort: M
+  depends_on:
+  - p6-tool-calling
+  - p6-guided-decoding
+  scope:
+  - server/src/api.rs
+  - engine/src/model.rs
+  description: 'When tool_choice is "required" or names a specific function, the model output MUST be valid
+    JSON conforming to the function parameter schema. The existing guided decoder (JsonGuidedDecoder) should
+    be activated automatically for these modes, using the function''s parameters JSON Schema to constrain
+    generation. For tool_choice="auto", guided decoding is only activated when the tools have strict:true
+    set. This ensures tool call arguments are always valid JSON without relying on the model to produce
+    well-formed output.'
+  acceptance:
+  - tool_choice="required" activates guided decoding with JSON object grammar
+  - tool_choice={"type":"function","function":{"name":"X"}} activates guided decoding with X's parameter schema
+  - tool_choice="auto" does not activate guided decoding unless strict:true is set on the tool
+  - tool_choice="none" never activates guided decoding
+  - Generated tool call arguments validate against the function parameter schema
+  - cargo test --workspace passes
+  verification:
+    quick: cargo test --workspace
+- id: p10-priority-scheduling
+  title: Priority-based request scheduling
+  status: planned
+  priority: critical
+  effort: M
+  scope:
+  - server/src/batch.rs
+  - server/src/api.rs
+  description: 'Replace FIFO ordering in BatchScheduler with priority-based scheduling. Requests carry
+    a priority level (0=lowest, 10=highest) settable via an extra_body or X-Request-Priority header.
+    Higher-priority requests are admitted before lower-priority ones when slots are available, and preemption
+    targets the lowest-priority active sequence. Health check inference probes run at priority 10. Default
+    priority is 5 for normal requests. This enables SLA differentiation and prevents health probes from
+    starving under load.'
+  acceptance:
+  - InferenceRequest gains a priority field (u8, default 5)
+  - BatchScheduler.admit_new_requests sorts candidates by priority (highest first) before slot allocation
+  - Preemption targets the lowest-priority active sequence (not just lowest age)
+  - API handlers accept an optional priority field or X-Request-Priority header
+  - 'Test: high-priority request preempts low-priority request when slots are full'
+  - Existing tests pass unchanged (default priority preserves current behavior)
+  verification:
+    quick: cargo test --package oxide-server
+- id: p10-health-inference-probe
+  title: Black-box health check with priority inference
+  status: planned
+  priority: critical
+  effort: S
+  depends_on:
+  - p10-priority-scheduling
+  scope:
+  - server/src/api.rs
+  - server/src/main.rs
+  description: 'Add a /health/inference endpoint that runs a minimal 1-token inference request through
+    the full pipeline (tokenize, forward, sample) at the highest scheduling priority. Unlike the existing
+    /ready endpoint which only checks if weights and tokenizer are loaded, this probe detects silent hangs
+    (GPU deadlocks, CUDA errors, corrupted model state) by verifying the model can actually produce output.
+    Databricks found this eliminated false liveness failures that occurred several times per week with
+    passive health checks. The probe returns 200 with latency_ms on success, 503 on failure or timeout.'
+  acceptance:
+  - GET /health/inference runs a 1-token inference at priority 10 (highest)
+  - Returns 200 with JSON {"healthy":true,"latency_ms":N} on success
+  - Returns 503 with JSON {"healthy":false,"error":"..."} on failure or timeout (5s default)
+  - Does not interfere with normal request processing (uses scheduler, releases slot)
+  - Existing /health and /ready endpoints remain unchanged
+  - cargo test --package oxide-server passes
+  verification:
+    quick: cargo test --package oxide-server
+- id: p10-cache-salt
+  title: Prefix cache tenant isolation (cache_salt)
+  status: planned
+  priority: high
+  effort: S
+  scope:
+  - engine/src/kv_cache.rs
+  - server/src/api.rs
+  description: 'In multi-tenant deployments, different tenants may share the same prefix token sequence
+    but should not share cached KV data (security isolation). Add a cache_salt field to the API request
+    that is mixed into the prefix cache hash, ensuring tenant A''s cached prefix is never served to tenant
+    B even if the token sequences are identical. vLLM implements this as an extra_body parameter. Without
+    this, a multi-tenant deployment leaks KV-cache state across tenants.'
+  acceptance:
+  - ChatCompletionRequest and CompletionRequest accept an optional cache_salt (Option<String>)
+  - PrefixCacheTable.hash_tokens includes the cache_salt in the hash computation when provided
+  - Two requests with identical token_ids but different cache_salt values produce independent cache entries
+  - Requests without cache_salt behave identically to current behavior (backward compatible)
+  - cargo test --package oxide-engine passes with a new test verifying salt isolation
+  verification:
+    quick: cargo test --package oxide-engine -- prefix_cache
+- id: p11-responses-api
+  title: OpenAI Responses API (/v1/responses)
+  status: planned
+  priority: medium
+  effort: L
+  scope:
+  - server/src/api.rs
+  - server/src/main.rs
+  description: 'Implement the OpenAI Responses API (POST /v1/responses) alongside the existing Chat Completions
+    endpoint. The Responses API is OpenAI''s newer primary text generation endpoint (introduced March 2025)
+    and is being adopted by vLLM, SGLang, and TensorRT-LLM. Start with a stateless implementation (similar
+    to vLLM''s approach) that accepts the Responses API request format and returns the response format,
+    without implementing full conversation state management (previous_response_id, compaction). The endpoint
+    should support text input, streaming, and tool use. Stateful conversation management can be added later.'
+  acceptance:
+  - POST /v1/responses accepts the OpenAI Responses API request format (model, input, instructions, tools)
+  - Response format matches OpenAI spec (id, object="response", output array with message items)
+  - Streaming mode returns SSE events matching the Responses API streaming format
+  - Tool use works through the Responses API (same underlying ToolCallParser)
+  - Requests without tools produce text output equivalent to chat completions
+  - cargo test --package oxide-server passes
+  verification:
+    quick: cargo test --package oxide-server
+- id: p11-disaggregated-serving
+  title: Disaggregated prefill/decode serving
+  status: planned
+  priority: medium
+  effort: XL
+  depends_on:
+  - p7-wire-batch-scheduler
+  - p7-chunked-prefill
+  scope:
+  - engine/src/model.rs
+  - engine/src/session.rs
+  - engine/src/kv_cache.rs
+  - server/src/batch.rs
+  - server/src/main.rs
+  description: 'Separate prefill (compute-bound) and decode (memory-bound) phases onto different GPU pools
+    to eliminate phase interference. In aggregated serving, a long prefill blocks decode iterations for
+    all active sequences, spiking inter-token latency. Disaggregated serving runs prefill on dedicated
+    GPUs, then transfers KV-cache state to decode GPUs. This requires a KV transfer protocol between
+    prefill and decode workers, a coordinator that routes requests to the appropriate phase worker, and
+    modifications to InferenceSession to serialize/deserialize KV-cache state across process boundaries.
+    Benchmarks from NVIDIA show 1.4-6x throughput improvements depending on workload. This is a Phase 3
+    cuda-oxide concern since KV transfer overhead dominates on CPU.'
+  acceptance:
+  - Engine supports serializing InferenceSession KV-cache state to bytes and deserializing on another instance
+  - A PrefillWorker and DecodeWorker abstraction allows running prefill and decode on separate model instances
+  - KV transfer protocol moves cache state between workers (initially via shared memory, later via RDMA)
+  - Coordinator routes new requests to prefill workers and transfers to decode workers after prefill completes
+  - 'End-to-end test: prefill on worker A, transfer KV, decode on worker B produces identical output to
+    single-worker inference'
+  - Existing single-worker mode continues to work unchanged
+  verification:
+    quick: cargo test --workspace
