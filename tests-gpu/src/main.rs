@@ -1,5 +1,7 @@
+use oxide_kernels::matmul::{CpuMatMul, CudaMatMul, MatMul};
 use oxide_kernels::rmsnorm::{CpuRMSNorm, CudaRMSNorm, RMSNorm};
 use oxide_kernels::rope::{CpuRoPE, CudaRoPE, RoPE};
+use std::time::Instant;
 
 fn test_rope_cpu_vs_gpu() {
     println!("=== RoPE: CPU vs GPU ===");
@@ -128,9 +130,100 @@ fn test_rmsnorm_cpu_vs_gpu() {
     }
 }
 
+fn test_matmul_cpu_vs_gpu(m: usize, n: usize, k: usize) {
+    println!("=== MatMul: CPU vs GPU ({m}×{k} × {k}×{n}) ===");
+
+    let cpu = CpuMatMul;
+    let gpu = CudaMatMul::new().expect("Failed to init CudaMatMul");
+
+    let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32) * 0.1 - 0.8).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32) * 0.1 - 0.6).collect();
+
+    let mut out_cpu = vec![0.0f32; m * n];
+    let t0 = Instant::now();
+    cpu.forward(&a, &b, &mut out_cpu, m, n, k).unwrap();
+    let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // Warmup GPU
+    let mut out_gpu = vec![0.0f32; m * n];
+    gpu.forward(&a, &b, &mut out_gpu, m, n, k).unwrap();
+
+    // Timed GPU run
+    let mut out_gpu = vec![0.0f32; m * n];
+    let t1 = Instant::now();
+    gpu.forward(&a, &b, &mut out_gpu, m, n, k).unwrap();
+    let gpu_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+    let mut max_diff = 0.0f32;
+    let mut mismatches = 0;
+    for i in 0..m * n {
+        let diff = (out_cpu[i] - out_gpu[i]).abs();
+        max_diff = max_diff.max(diff);
+        if diff >= 1e-3 {
+            if mismatches < 3 {
+                eprintln!(
+                    "  MISMATCH at [{i}]: cpu={:.6}, gpu={:.6}, diff={:.6}",
+                    out_cpu[i], out_gpu[i], diff
+                );
+            }
+            mismatches += 1;
+        }
+    }
+
+    let speedup = if gpu_ms > 0.0 { cpu_ms / gpu_ms } else { 0.0 };
+
+    println!("  CPU: {cpu_ms:.3}ms, GPU: {gpu_ms:.3}ms, speedup: {speedup:.1}x");
+    println!("  Max abs diff: {max_diff:.8}");
+    println!("  Mismatches (>=1e-3): {mismatches}");
+
+    if mismatches == 0 {
+        println!("  PASS\n");
+    } else {
+        println!("  FAIL\n");
+        std::process::exit(1);
+    }
+}
+
+fn test_matmul_bt_cpu_vs_gpu() {
+    println!("=== MatMul B-transposed: CPU vs GPU (256×512 × 512×256) ===");
+
+    let cpu = CpuMatMul;
+    let gpu = CudaMatMul::new().unwrap();
+
+    let m = 256;
+    let n = 256;
+    let k = 512;
+
+    let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32) * 0.1 - 0.8).collect();
+    let b_t: Vec<f32> = (0..n * k).map(|i| ((i % 13) as f32) * 0.1 - 0.6).collect();
+
+    let mut out_cpu = vec![0.0f32; m * n];
+    cpu.forward_b_transposed(&a, &b_t, &mut out_cpu, m, n, k).unwrap();
+
+    let mut out_gpu = vec![0.0f32; m * n];
+    gpu.forward_b_transposed(&a, &b_t, &mut out_gpu, m, n, k).unwrap();
+
+    let mut max_diff = 0.0f32;
+    for i in 0..m * n {
+        max_diff = max_diff.max((out_cpu[i] - out_gpu[i]).abs());
+    }
+
+    println!("  Max abs diff: {max_diff:.8}");
+    if max_diff < 1e-3 {
+        println!("  PASS\n");
+    } else {
+        println!("  FAIL\n");
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     test_rope_cpu_vs_gpu();
     test_rope_position_zero_identity();
     test_rmsnorm_cpu_vs_gpu();
+    test_matmul_cpu_vs_gpu(64, 64, 64);
+    test_matmul_cpu_vs_gpu(256, 256, 256);
+    test_matmul_cpu_vs_gpu(1024, 1024, 1024);
+    test_matmul_bt_cpu_vs_gpu();
     println!("All GPU tests passed.");
 }

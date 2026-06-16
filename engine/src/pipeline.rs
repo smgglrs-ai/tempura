@@ -57,7 +57,7 @@ impl
             attention: CudaAttention,
             rmsnorm: CudaRMSNorm::new().expect("Failed to initialize CudaRMSNorm"),
             rope: CudaRoPE::new().expect("Failed to initialize CudaRoPE"),
-            matmul: CudaMatMul,
+            matmul: CudaMatMul::new().expect("Failed to initialize CudaMatMul"),
             sampler: CudaSampler,
         }
     }

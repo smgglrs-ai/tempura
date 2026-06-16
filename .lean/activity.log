@@ -316,3 +316,11 @@
     exit_reason: "MatMul next — needs perf benchmarking, stopping for focused work"
     branch: "loop/2026-06-16"
     tag: "loop-run/2026-06-16-4"
+
+- timestamp: "2026-06-16T13:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p3-cuda-matmul"
+  summary: "CudaMatMul: tiled 16x16 shared-memory GEMM + B-transposed variant. CPU vs GPU max diff 2.38e-6 at 1024x1024. GPU slower than CPU gemm due to transfer overhead (expected — GPU wins when data stays on-device)."
+  iteration: 5
+  max_iterations: 10

@@ -155,32 +155,127 @@ impl MatMul for CpuMatMul {
 }
 
 #[cfg(feature = "cuda")]
-pub struct CudaMatMul;
+pub struct CudaMatMul {
+    gpu: crate::gpu::GpuContext,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for CudaMatMul {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for CudaMatMul {}
+
+#[cfg(feature = "cuda")]
+impl CudaMatMul {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            gpu: crate::gpu::GpuContext::new(0)?,
+        })
+    }
+
+    fn launch_gemm(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        transposed_b: bool,
+    ) -> Result<()> {
+        use cuda_core::LaunchConfig;
+
+        let stream = self.gpu.stream();
+        let a_dev = crate::gpu::to_device(&stream, a)?;
+        let b_dev = crate::gpu::to_device(&stream, b)?;
+        let mut c_dev = crate::gpu::to_device(&stream, &vec![0.0f32; m * n])?;
+
+        let module = crate::gpu::matmul_kernel::kernels::load(self.gpu.context())
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+        let block = 16u32;
+        let grid_x = (n as u32).div_ceil(block);
+        let grid_y = (m as u32).div_ceil(block);
+        let config = LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (block, block, 1),
+            shared_mem_bytes: 0,
+        };
+
+        if transposed_b {
+            module
+                .sgemm_tiled_bt(
+                    &stream,
+                    config,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    &a_dev,
+                    &b_dev,
+                    &mut c_dev,
+                )
+                .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        } else {
+            module
+                .sgemm_tiled(
+                    &stream,
+                    config,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    &a_dev,
+                    &b_dev,
+                    &mut c_dev,
+                )
+                .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        }
+
+        crate::gpu::copy_back(&stream, &c_dev, output)?;
+        Ok(())
+    }
+}
 
 #[cfg(feature = "cuda")]
 impl MatMul for CudaMatMul {
     fn forward(
         &self,
-        _a: &[f32],
-        _b: &[f32],
-        _output: &mut [f32],
-        _m: usize,
-        _n: usize,
-        _k: usize,
+        a: &[f32],
+        b: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<()> {
-        todo!("CudaMatMul: requires cargo oxide build")
+        if a.len() != m * k {
+            return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+        }
+        if b.len() != k * n {
+            return Err(crate::KernelError::DimensionMismatch { expected: k * n, got: b.len() });
+        }
+        if output.len() != m * n {
+            return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+        }
+        self.launch_gemm(a, b, output, m, n, k, false)
     }
 
     fn forward_b_transposed(
         &self,
-        _a: &[f32],
-        _b: &[f32],
-        _output: &mut [f32],
-        _m: usize,
-        _n: usize,
-        _k: usize,
+        a: &[f32],
+        b: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> Result<()> {
-        todo!("CudaMatMul: requires cargo oxide build")
+        if a.len() != m * k {
+            return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+        }
+        if b.len() != n * k {
+            return Err(crate::KernelError::DimensionMismatch { expected: n * k, got: b.len() });
+        }
+        if output.len() != m * n {
+            return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+        }
+        self.launch_gemm(a, b, output, m, n, k, true)
     }
 }
 
