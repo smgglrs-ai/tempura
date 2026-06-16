@@ -724,3 +724,14 @@
   summary: "Added /v1/responses endpoint: stateless Responses API accepting text or message array input, instructions field, returns response object with output_text content, usage"
   iteration: 9
   max_iterations: 10
+- timestamp: "2026-06-16T22:15:00Z"
+  actor: claude
+  action: loop-complete
+  summary: "Loop finished: 9 items completed (p9-stream-usage, p9-seed-param, p10-priority-scheduling, p9-max-completion-tokens, p9-constrained-tool-args, p10-health-inference-probe, p10-cache-salt, p9-model-tool-parsers, p11-responses-api). Exit: Remaining item p11-disaggregated-serving is XL effort"
+  details:
+    iterations: 9
+    max_iterations: 10
+    completed: [p9-stream-usage, p9-seed-param, p10-priority-scheduling, p9-max-completion-tokens, p9-constrained-tool-args, p10-health-inference-probe, p10-cache-salt, p9-model-tool-parsers, p11-responses-api]
+    exit_reason: "Remaining item is XL-effort architectural change requiring dedicated session"
+    branch: "loop/2026-06-16-8"
+    tag: "loop-run/2026-06-16-9-approve-r8"
