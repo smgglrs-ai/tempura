@@ -564,3 +564,10 @@
   summary: "Added chat template support: minijinja-based Jinja2 rendering, tokenizer_config.json loading, ChatML fallback, bos/eos token variables, 5 new tests"
   iteration: 1
   max_iterations: 10
+- timestamp: "2026-06-16T16:30:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p7-wire-batch-scheduler"
+  summary: "Wired BatchScheduler into API handlers: acquire/release slot helpers, 429 backpressure, scheduler gauges, streaming slot lifecycle, withdraw_pending for rejected requests, integration test"
+  iteration: 2
+  max_iterations: 10

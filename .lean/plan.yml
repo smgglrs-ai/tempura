@@ -1097,6 +1097,8 @@ items:
     quick: cargo test --package oxide-server && cargo build --package oxide-server
 - id: p7-wire-batch-scheduler
   title: Wire BatchScheduler into API handlers
+  status: done
+  progress: 100
   description: The BatchScheduler in server/src/batch.rs has full slot allocation, preemption, and lifecycle
     management, but the API handlers in server/src/api.rs bypass it entirely — they create InferenceSession
     directly and call model.generate() inline. AppState already holds an Arc<Mutex<BatchScheduler>> that
@@ -1105,7 +1107,6 @@ items:
     complete_sequence() on finish. The streaming path must also go through the scheduler so slot accounting
     is correct under concurrent SSE connections. Metrics for pending/active/preempted counts should be
     emitted so the scheduler state is observable.
-  status: planned
   priority: critical
   effort: M
   depends_on:

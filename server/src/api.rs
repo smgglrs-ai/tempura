@@ -12,6 +12,7 @@ use std::convert::Infallible;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
+use crate::batch::InferenceRequest;
 use crate::sse::{ChatCompletionChunk, ChunkChoice, ChunkDelta};
 use crate::AppState;
 
@@ -190,6 +191,54 @@ fn default_temperature() -> f32 {
     1.0
 }
 
+async fn acquire_slot(
+    state: &AppState,
+    request_id: &str,
+    token_ids: Vec<u32>,
+    max_new_tokens: u32,
+    temperature: f32,
+    top_p: f32,
+) -> Result<(), (StatusCode, String)> {
+    let mut scheduler = state.scheduler.lock().await;
+    scheduler.submit(InferenceRequest {
+        id: request_id.to_string(),
+        token_ids,
+        max_new_tokens,
+        temperature,
+        top_p,
+    });
+    scheduler.admit_new_requests();
+
+    record_scheduler_gauges(&scheduler);
+
+    let admitted = scheduler
+        .active_sequences()
+        .iter()
+        .any(|s| s.request_id == request_id);
+
+    if admitted {
+        Ok(())
+    } else {
+        scheduler.withdraw_pending(request_id);
+        Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Server is at capacity, please retry".into(),
+        ))
+    }
+}
+
+async fn release_slot(state: &AppState, request_id: &str) {
+    let mut scheduler = state.scheduler.lock().await;
+    scheduler.complete_sequence(request_id);
+    record_scheduler_gauges(&scheduler);
+}
+
+fn record_scheduler_gauges(scheduler: &crate::batch::BatchScheduler) {
+    metrics::gauge!("oxide_scheduler_active_sequences").set(scheduler.active_count() as f64);
+    metrics::gauge!("oxide_scheduler_queue_depth")
+        .set((scheduler.pending_count() + scheduler.preempted_count()) as f64);
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
@@ -250,18 +299,30 @@ async fn chat_completions(
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
     };
 
+    let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+
+    acquire_slot(
+        &state,
+        &request_id,
+        token_ids.clone(),
+        req.max_tokens,
+        req.temperature,
+        req.top_p.unwrap_or(1.0),
+    )
+    .await?;
+
     if req.stream {
-        let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-        let model_name = req.model.clone();
         let model = state.model.clone();
         let tokenizer = tokenizer.clone();
+        let scheduler = state.scheduler.clone();
+        let rid = request_id.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
 
         tokio::task::spawn_blocking(move || {
             let mut session = InferenceSession::new(&model.config, TraceLevel::Off, 42);
-            let id_clone = id.clone();
-            let model_clone = model_name.clone();
+            let id_clone = rid.clone();
+            let model_name = req.model.clone();
 
             model.generate_with_callback(
                 &mut session,
@@ -275,7 +336,7 @@ async fn chat_completions(
                         id: id_clone.clone(),
                         object: "chat.completion.chunk".to_string(),
                         created: 0,
-                        model: model_clone.clone(),
+                        model: model_name.clone(),
                         choices: vec![ChunkChoice {
                             index: 0,
                             delta: ChunkDelta {
@@ -293,6 +354,14 @@ async fn chat_completions(
 
             let done = Event::default().data("[DONE]");
             let _ = tx.blocking_send(Ok(done));
+
+            // Release the scheduler slot after generation completes (or client disconnects)
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                let mut sched = scheduler.lock().await;
+                sched.complete_sequence(&rid);
+                record_scheduler_gauges(&sched);
+            });
         });
 
         let stream = ReceiverStream::new(rx);
@@ -311,75 +380,82 @@ async fn chat_completions(
         let mut choices = Vec::new();
         let mut total_completion_tokens = 0u32;
 
-        for i in 0..req.n {
-            let seed = 42u64.wrapping_add(i as u64);
-            let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, seed);
+        let result = (|| -> Result<(), (StatusCode, String)> {
+            for i in 0..req.n {
+                let seed = 42u64.wrapping_add(i as u64);
+                let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, seed);
 
-            let (generated, token_logprobs) = if want_logprobs {
-                state.model.generate_with_logprobs(
-                    &mut session,
-                    &token_ids,
-                    req.max_tokens as usize,
-                    &params,
-                    None,
-                    top_n.max(1),
-                )
-            } else {
-                let tokens = state.model.generate(
-                    &mut session,
-                    &token_ids,
-                    req.max_tokens as usize,
-                    &params,
-                    None,
-                );
-                (tokens, Vec::new())
-            };
+                let (generated, token_logprobs) = if want_logprobs {
+                    state.model.generate_with_logprobs(
+                        &mut session,
+                        &token_ids,
+                        req.max_tokens as usize,
+                        &params,
+                        None,
+                        top_n.max(1),
+                    )
+                } else {
+                    let tokens = state.model.generate(
+                        &mut session,
+                        &token_ids,
+                        req.max_tokens as usize,
+                        &params,
+                        None,
+                    );
+                    (tokens, Vec::new())
+                };
 
-            let full_text = tokenizer
-                .decode(&generated)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            let (text, finish_reason) = check_stop_sequences(&full_text, &stop_sequences);
-            total_completion_tokens += generated.len() as u32;
+                let full_text = tokenizer
+                    .decode(&generated)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                let (text, finish_reason) = check_stop_sequences(&full_text, &stop_sequences);
+                total_completion_tokens += generated.len() as u32;
 
-            let logprobs_response = if want_logprobs {
-                Some(ChoiceLogprobs {
-                    content: token_logprobs
-                        .iter()
-                        .map(|lp| TokenLogprobInfo {
-                            token: format!("token_{}", lp.token_id),
-                            logprob: lp.logprob,
-                            top_logprobs: lp
-                                .top_logprobs
-                                .iter()
-                                .map(|t| TopLogprobInfo {
-                                    token: format!("token_{}", t.token_id),
-                                    logprob: t.logprob,
-                                })
-                                .collect(),
-                        })
-                        .collect(),
-                })
-            } else {
-                None
-            };
+                let logprobs_response = if want_logprobs {
+                    Some(ChoiceLogprobs {
+                        content: token_logprobs
+                            .iter()
+                            .map(|lp| TokenLogprobInfo {
+                                token: format!("token_{}", lp.token_id),
+                                logprob: lp.logprob,
+                                top_logprobs: lp
+                                    .top_logprobs
+                                    .iter()
+                                    .map(|t| TopLogprobInfo {
+                                        token: format!("token_{}", t.token_id),
+                                        logprob: t.logprob,
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                    })
+                } else {
+                    None
+                };
 
-            choices.push(ChatChoice {
-                index: i,
-                message: ChatMessage {
-                    role: "assistant".to_string(),
-                    content: text.to_string(),
-                },
-                finish_reason: finish_reason.to_string(),
-                logprobs: logprobs_response,
-            });
-        }
+                choices.push(ChatChoice {
+                    index: i,
+                    message: ChatMessage {
+                        role: "assistant".to_string(),
+                        content: text.to_string(),
+                    },
+                    finish_reason: finish_reason.to_string(),
+                    logprobs: logprobs_response,
+                });
+            }
+            Ok(())
+        })();
+
+        release_slot(&state, &request_id).await;
+
+        result?;
 
         metrics::counter!("oxide_tokens_generated").increment(total_completion_tokens as u64);
         metrics::histogram!("oxide_request_duration_seconds", "endpoint" => "chat_completions")
             .record(start.elapsed().as_secs_f64());
 
         Ok(Json(ChatCompletionResponse {
-            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            id: request_id,
             object: "chat.completion".to_string(),
             created: 0,
             model: req.model,
@@ -422,16 +498,27 @@ async fn completions(
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
     };
 
+    let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
+
+    acquire_slot(
+        &state,
+        &request_id,
+        token_ids.clone(),
+        req.max_tokens,
+        req.temperature,
+        1.0,
+    )
+    .await?;
+
     let start = std::time::Instant::now();
     metrics::counter!("oxide_request_count", "endpoint" => "completions").increment(1);
 
-    let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, 42);
     let want_logprobs = req.logprobs.is_some();
     let top_n = req.logprobs.unwrap_or(0).min(20) as usize;
 
     let (generated, token_logprobs) = if want_logprobs {
         state.model.generate_with_logprobs(
-            &mut session,
+            &mut InferenceSession::new(&state.model.config, TraceLevel::Off, 42),
             &token_ids,
             req.max_tokens as usize,
             &params,
@@ -440,7 +527,7 @@ async fn completions(
         )
     } else {
         let tokens = state.model.generate(
-            &mut session,
+            &mut InferenceSession::new(&state.model.config, TraceLevel::Off, 42),
             &token_ids,
             req.max_tokens as usize,
             &params,
@@ -449,9 +536,15 @@ async fn completions(
         (tokens, Vec::new())
     };
 
-    let full_text = tokenizer
-        .decode(&generated)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let full_text = tokenizer.decode(&generated).map_err(|e| {
+        // Release slot before returning error
+        let state = state.clone();
+        let rid = request_id.clone();
+        tokio::task::spawn(async move { release_slot(&state, &rid).await });
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    release_slot(&state, &request_id).await;
 
     let stop_sequences: Vec<String> = req.stop.map(|s| s.into_vec()).unwrap_or_default();
     let (text, finish_reason) = check_stop_sequences(&full_text, &stop_sequences);
@@ -486,7 +579,7 @@ async fn completions(
     };
 
     Ok(Json(CompletionResponse {
-        id: format!("cmpl-{}", uuid::Uuid::new_v4()),
+        id: request_id,
         object: "text_completion".to_string(),
         created: 0,
         model: req.model,
@@ -605,7 +698,6 @@ async fn replay(
         let trace = store
             .get(trace_id)
             .ok_or((StatusCode::NOT_FOUND, format!("Trace {trace_id} not found")))?;
-        // Use the seed from the trace for replay
         let _seed = trace.seed;
         return Err((
             StatusCode::NOT_IMPLEMENTED,
@@ -701,7 +793,6 @@ mod tests {
 
         let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let metrics_handle = prometheus_builder.install_recorder().unwrap_or_else(|_| {
-            // recorder already installed in another test
             metrics_exporter_prometheus::PrometheusBuilder::new()
                 .build_recorder()
                 .handle()
@@ -709,11 +800,7 @@ mod tests {
 
         AppState {
             model: std::sync::Arc::new(model),
-            tokenizer: if with_tokenizer {
-                None // no real tokenizer available in tests
-            } else {
-                None
-            },
+            tokenizer: if with_tokenizer { None } else { None },
             model_id: "test".to_string(),
             scheduler: std::sync::Arc::new(tokio::sync::Mutex::new(
                 crate::batch::BatchScheduler::new(1, 128, 1),
@@ -788,5 +875,72 @@ mod tests {
             s.into_vec(),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_gates_concurrent_requests() {
+        let config = oxide_engine::ModelConfig::tiny_test();
+        let pipeline = oxide_engine::pipeline::KernelPipeline::cpu_verified();
+        let model = oxide_engine::TransformerModel::new(config, pipeline);
+
+        let scheduler = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::batch::BatchScheduler::new(1, 128, 1),
+        ));
+
+        let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+        let metrics_handle = prometheus_builder.install_recorder().unwrap_or_else(|_| {
+            metrics_exporter_prometheus::PrometheusBuilder::new()
+                .build_recorder()
+                .handle()
+        });
+
+        let state = AppState {
+            model: std::sync::Arc::new(model),
+            tokenizer: None,
+            model_id: "test".to_string(),
+            scheduler: scheduler.clone(),
+            trace_store: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::trace_store::TraceStore::new(10),
+            )),
+            metrics_handle,
+        };
+
+        // First request acquires the only slot
+        acquire_slot(&state, "req-1", vec![1, 2], 10, 1.0, 1.0)
+            .await
+            .unwrap();
+
+        {
+            let sched = scheduler.lock().await;
+            assert_eq!(sched.active_count(), 1);
+            assert_eq!(sched.allocated_slot_count(), 1);
+        }
+
+        // Second request should be rejected (max_batch_size=1, num_slots=1)
+        let result = acquire_slot(&state, "req-2", vec![3, 4], 10, 1.0, 1.0).await;
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // Release first slot
+        release_slot(&state, "req-1").await;
+
+        {
+            let sched = scheduler.lock().await;
+            assert_eq!(sched.active_count(), 0);
+            assert_eq!(sched.allocated_slot_count(), 0);
+        }
+
+        // Now third request succeeds
+        acquire_slot(&state, "req-3", vec![5, 6], 10, 1.0, 1.0)
+            .await
+            .unwrap();
+
+        {
+            let sched = scheduler.lock().await;
+            assert_eq!(sched.active_count(), 1);
+        }
+
+        release_slot(&state, "req-3").await;
     }
 }

@@ -193,6 +193,10 @@ impl BatchScheduler {
         self.max_seq_len
     }
 
+    pub fn withdraw_pending(&mut self, request_id: &str) {
+        self.pending.retain(|r| r.id != request_id);
+    }
+
     pub fn allocated_slot_count(&self) -> usize {
         self.allocated_slots.iter().filter(|&&used| used).count()
     }
