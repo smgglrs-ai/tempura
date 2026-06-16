@@ -1282,3 +1282,105 @@ items:
     invariance can be checked in Phase 3
   verification:
     quick: cargo test --package oxide-engine batch_invariant
+- id: auto-rustfmt
+  title: Fix rustfmt violations in speculative.rs
+  status: planned
+  priority: critical
+  effort: XS
+  scope:
+  - engine/src/speculative.rs
+  description: cargo fmt --all -- --check reports formatting violations in engine/src/speculative.rs
+    (line breaks in method chains). Run cargo fmt to fix.
+  acceptance:
+  - cargo fmt --all -- --check passes with no diff
+  verification:
+    quick: cargo fmt --all -- --check
+- id: auto-gitignore
+  title: Add .playwright-mcp/ to .gitignore
+  status: done
+  progress: 100
+  priority: critical
+  effort: XS
+  scope:
+  - .gitignore
+  description: The .playwright-mcp/ directory (Playwright MCP server cache) is untracked and shows
+    up in git status. Add it to .gitignore alongside the existing /target entry.
+  acceptance:
+  - .gitignore contains .playwright-mcp/ entry
+  - git status --porcelain shows no untracked files outside .gitignore
+  verification:
+    quick: git status --porcelain
+- id: auto-dead-code-cleanup
+  title: Remove unused InferenceResult and false dead_code annotation
+  status: planned
+  priority: high
+  effort: XS
+  scope:
+  - server/src/batch.rs
+  - engine/src/kv_cache.rs
+  description: 'Two dead code issues: (1) InferenceResult struct in server/src/batch.rs is defined
+    but never referenced anywhere — remove it and its FinishReason enum if also unused. (2) KvCache
+    in engine/src/kv_cache.rs has #[allow(dead_code)] but the struct is actively used throughout
+    the engine — remove the false annotation.'
+  acceptance:
+  - InferenceResult struct removed from server/src/batch.rs (and FinishReason if unused)
+  - '#[allow(dead_code)] removed from KvCache in engine/src/kv_cache.rs'
+  - cargo build --workspace succeeds
+  - cargo test --workspace passes
+  verification:
+    quick: cargo build --workspace && cargo test --workspace
+- id: auto-test-config
+  title: Add unit tests for ModelConfig and QuantConfig
+  status: planned
+  priority: high
+  effort: S
+  scope:
+  - engine/src/config.rs
+  description: engine/src/config.rs has no test module. Add tests covering the three ModelConfig
+    presets (llama2_7b, micro_llama, tiny_test) verify correct field values and invariants
+    (head_dim == hidden_size / num_attention_heads, num_kv_heads <= num_attention_heads), and
+    QuantConfig factory methods (gptq, awq, gguf) produce correct format/bits/group_size.
+  acceptance:
+  - '#[cfg(test)] mod tests block added to engine/src/config.rs'
+  - Tests for all three ModelConfig presets verifying key field values
+  - Tests for QuantConfig::gptq(), awq(), gguf() verifying format, bits, group_size, symmetric
+  - head_dim consistency check (hidden_size / num_attention_heads == head_dim)
+  - cargo test --package oxide-engine passes
+  verification:
+    quick: cargo test --package oxide-engine
+- id: auto-test-sse
+  title: Add unit tests for SSE helper functions
+  status: planned
+  priority: high
+  effort: S
+  scope:
+  - server/src/sse.rs
+  description: server/src/sse.rs has no test module. Add tests for chunk_to_event (serializes
+    ChatCompletionChunk to SSE data correctly) and done_event (produces [DONE] sentinel).
+    Verify serialization round-trip of ChatCompletionChunk with various field combinations.
+  acceptance:
+  - '#[cfg(test)] mod tests block added to server/src/sse.rs'
+  - Test that chunk_to_event produces valid SSE Event with JSON data
+  - Test that done_event produces Event with data "[DONE]"
+  - Test ChatCompletionChunk serialization with content, finish_reason, and role fields
+  - cargo test --package oxide-server passes
+  verification:
+    quick: cargo test --package oxide-server
+- id: auto-test-verification-manifest
+  title: Add unit tests for verification manifest
+  status: planned
+  priority: medium
+  effort: XS
+  scope:
+  - kernels/src/verification_manifest.rs
+  description: kernels/src/verification_manifest.rs has no test module. Add tests verifying that
+    manifest() returns a non-empty VerificationManifest with expected kernel names, all entries
+    have non-empty properties, and JSON serialization round-trips correctly.
+  acceptance:
+  - '#[cfg(test)] mod tests block added to kernels/src/verification_manifest.rs'
+  - Test that manifest() returns non-empty kernels list
+  - Test that all kernel proof entries have status "proven"
+  - Test that manifest serializes to valid JSON
+  - cargo test --package oxide-kernels passes
+  verification:
+    quick: cargo test --package oxide-kernels
