@@ -12,7 +12,7 @@ pub mod weights;
 
 pub use config::{ConfigError, ModelConfig, QuantConfig, QuantFormat};
 pub use kv_cache::{KvCache, KvCachePool, PoolError};
-pub use model::TransformerModel;
+pub use model::{TokenLogprob, TopLogprob, TransformerModel};
 pub use session::InferenceSession;
 pub use trace::{
     InferenceTrace, LayerSnapshot, NormStats, SamplingSnapshot, TimingInfo, TraceLevel,

@@ -4,7 +4,52 @@ use crate::session::InferenceSession;
 use crate::trace::{LayerSnapshot, SamplingSnapshot, TimingInfo, TraceLevel};
 use crate::weights::ModelWeights;
 use oxide_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
+use serde::Serialize;
 use std::time::Instant;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenLogprob {
+    pub token_id: u32,
+    pub logprob: f32,
+    pub top_logprobs: Vec<TopLogprob>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopLogprob {
+    pub token_id: u32,
+    pub logprob: f32,
+}
+
+fn extract_logprob(probs: &[f32], token_id: u32, top_n: usize) -> TokenLogprob {
+    let logprob = if probs[token_id as usize] > 0.0 {
+        probs[token_id as usize].ln()
+    } else {
+        f32::NEG_INFINITY
+    };
+
+    let mut indexed: Vec<(u32, f32)> = probs
+        .iter()
+        .enumerate()
+        .filter(|(_, &p)| p > 0.0)
+        .map(|(i, &p)| (i as u32, p))
+        .collect();
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    let top_logprobs: Vec<TopLogprob> = indexed
+        .iter()
+        .take(top_n.min(20))
+        .map(|&(id, p)| TopLogprob {
+            token_id: id,
+            logprob: p.ln(),
+        })
+        .collect();
+
+    TokenLogprob {
+        token_id,
+        logprob,
+        top_logprobs,
+    }
+}
 
 pub struct TransformerModel<A, N, R, M, S> {
     pub config: ModelConfig,
@@ -334,6 +379,78 @@ where
             },
         });
         generated
+    }
+
+    pub fn generate_with_logprobs(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        top_n: usize,
+    ) -> (Vec<u32>, Vec<TokenLogprob>) {
+        let total_start = Instant::now();
+        let prompt_start = Instant::now();
+        let logits = self.forward(session, token_ids);
+        let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.prompt_tokens = token_ids.len();
+        let gen_start = Instant::now();
+
+        let mut probs = vec![0.0f32; logits.len()];
+        self.pipeline
+            .sampler
+            .apply(&logits, &mut probs, params)
+            .unwrap();
+
+        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+            None
+        } else {
+            Some(&mut session.rng)
+        };
+        let first_token = self.pipeline.sampler.sample_token(&probs, rng_ref);
+
+        let mut generated = vec![first_token];
+        let mut logprobs = vec![extract_logprob(&probs, first_token, top_n)];
+
+        for _step in 1..max_new_tokens {
+            if eos_token == Some(*generated.last().unwrap()) {
+                break;
+            }
+
+            let mut step_logits = self.forward(session, &[*generated.last().unwrap()]);
+            params.apply_penalties(&mut step_logits, &generated);
+            let mut step_probs = vec![0.0f32; step_logits.len()];
+            self.pipeline
+                .sampler
+                .apply(&step_logits, &mut step_probs, params)
+                .unwrap();
+
+            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                None
+            } else {
+                Some(&mut session.rng)
+            };
+            let token = self.pipeline.sampler.sample_token(&step_probs, rng_ref);
+
+            logprobs.push(extract_logprob(&step_probs, token, top_n));
+            generated.push(token);
+        }
+
+        let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.generated_tokens = generated.len();
+        session.trace.timing = Some(TimingInfo {
+            total_ms,
+            prompt_ms,
+            generation_ms,
+            tokens_per_second: if generation_ms > 0.0 {
+                generated.len() as f64 / (generation_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+        (generated, logprobs)
     }
 
     pub fn generate_with_callback(
@@ -753,6 +870,60 @@ mod tests {
                 snap.layer_index
             );
         }
+    }
+
+    #[test]
+    fn test_generate_with_logprobs() {
+        let config = ModelConfig::tiny_test();
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(config.clone(), pipeline);
+        let loader = RandomWeightLoader::from_config(&config, 42);
+        model.load_weights(&loader).unwrap();
+
+        let mut session = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 50,
+            top_p: 1.0,
+            ..SamplingParams::default()
+        };
+        let (tokens, logprobs) =
+            model.generate_with_logprobs(&mut session, &[1, 2, 3], 5, &params, None, 5);
+
+        assert_eq!(tokens.len(), 5);
+        assert_eq!(logprobs.len(), 5);
+        for lp in &logprobs {
+            assert!(lp.logprob <= 0.0);
+            assert!(!lp.top_logprobs.is_empty());
+            assert!(lp.top_logprobs.len() <= 5);
+            for top in &lp.top_logprobs {
+                assert!(top.logprob <= 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_without_logprobs_unchanged() {
+        let config = ModelConfig::tiny_test();
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(config.clone(), pipeline);
+        let loader = RandomWeightLoader::from_config(&config, 42);
+        model.load_weights(&loader).unwrap();
+
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 50,
+            top_p: 1.0,
+            ..SamplingParams::default()
+        };
+
+        let mut s1 = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let tokens1 = model.generate(&mut s1, &[1, 2, 3], 5, &params, None);
+
+        let mut s2 = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let (tokens2, _) = model.generate_with_logprobs(&mut s2, &[1, 2, 3], 5, &params, None, 5);
+
+        assert_eq!(tokens1, tokens2);
     }
 
     #[test]

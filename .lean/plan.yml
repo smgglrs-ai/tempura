@@ -721,7 +721,8 @@ items:
   - Container starts and responds to GET /v1/models
 - id: p6-logprobs
   title: Logprobs in API responses
-  status: planned
+  status: done
+  progress: 100
   priority: critical
   effort: M
   scope:

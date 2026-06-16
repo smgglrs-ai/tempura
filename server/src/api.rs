@@ -49,6 +49,10 @@ pub struct ChatCompletionRequest {
     pub presence_penalty: Option<f32>,
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    #[serde(default)]
+    pub top_logprobs: Option<u8>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -72,6 +76,26 @@ pub struct ChatChoice {
     pub index: u32,
     pub message: ChatMessage,
     pub finish_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChoiceLogprobs {
+    pub content: Vec<TokenLogprobInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TokenLogprobInfo {
+    pub token: String,
+    pub logprob: f32,
+    pub top_logprobs: Vec<TopLogprobInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TopLogprobInfo {
+    pub token: String,
+    pub logprob: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +112,8 @@ pub struct CompletionRequest {
     pub presence_penalty: Option<f32>,
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub logprobs: Option<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +131,8 @@ pub struct CompletionChoice {
     pub index: u32,
     pub text: String,
     pub finish_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,13 +251,28 @@ async fn chat_completions(
         metrics::counter!("oxide_request_count", "endpoint" => "chat_completions").increment(1);
 
         let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, 42);
-        let generated = state.model.generate(
-            &mut session,
-            &token_ids,
-            req.max_tokens as usize,
-            &params,
-            None,
-        );
+        let want_logprobs = req.logprobs.unwrap_or(false);
+        let top_n = req.top_logprobs.unwrap_or(0).min(20) as usize;
+
+        let (generated, token_logprobs) = if want_logprobs {
+            state.model.generate_with_logprobs(
+                &mut session,
+                &token_ids,
+                req.max_tokens as usize,
+                &params,
+                None,
+                top_n.max(1),
+            )
+        } else {
+            let tokens = state.model.generate(
+                &mut session,
+                &token_ids,
+                req.max_tokens as usize,
+                &params,
+                None,
+            );
+            (tokens, Vec::new())
+        };
 
         let text = tokenizer
             .decode(&generated)
@@ -241,6 +284,28 @@ async fn chat_completions(
         metrics::counter!("oxide_tokens_generated").increment(completion_tokens as u64);
         metrics::histogram!("oxide_request_duration_seconds", "endpoint" => "chat_completions")
             .record(start.elapsed().as_secs_f64());
+
+        let logprobs_response = if want_logprobs {
+            Some(ChoiceLogprobs {
+                content: token_logprobs
+                    .iter()
+                    .map(|lp| TokenLogprobInfo {
+                        token: format!("token_{}", lp.token_id),
+                        logprob: lp.logprob,
+                        top_logprobs: lp
+                            .top_logprobs
+                            .iter()
+                            .map(|t| TopLogprobInfo {
+                                token: format!("token_{}", t.token_id),
+                                logprob: t.logprob,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+        } else {
+            None
+        };
 
         Ok(Json(ChatCompletionResponse {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -254,6 +319,7 @@ async fn chat_completions(
                     content: text,
                 },
                 finish_reason: "stop".to_string(),
+                logprobs: logprobs_response,
             }],
             usage: Usage {
                 prompt_tokens,
@@ -297,13 +363,28 @@ async fn completions(
     metrics::counter!("oxide_request_count", "endpoint" => "completions").increment(1);
 
     let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, 42);
-    let generated = state.model.generate(
-        &mut session,
-        &token_ids,
-        req.max_tokens as usize,
-        &params,
-        None,
-    );
+    let want_logprobs = req.logprobs.is_some();
+    let top_n = req.logprobs.unwrap_or(0).min(20) as usize;
+
+    let (generated, token_logprobs) = if want_logprobs {
+        state.model.generate_with_logprobs(
+            &mut session,
+            &token_ids,
+            req.max_tokens as usize,
+            &params,
+            None,
+            top_n.max(1),
+        )
+    } else {
+        let tokens = state.model.generate(
+            &mut session,
+            &token_ids,
+            req.max_tokens as usize,
+            &params,
+            None,
+        );
+        (tokens, Vec::new())
+    };
 
     let text = tokenizer
         .decode(&generated)
@@ -316,6 +397,28 @@ async fn completions(
     metrics::histogram!("oxide_request_duration_seconds", "endpoint" => "completions")
         .record(start.elapsed().as_secs_f64());
 
+    let logprobs_response = if want_logprobs {
+        Some(ChoiceLogprobs {
+            content: token_logprobs
+                .iter()
+                .map(|lp| TokenLogprobInfo {
+                    token: format!("token_{}", lp.token_id),
+                    logprob: lp.logprob,
+                    top_logprobs: lp
+                        .top_logprobs
+                        .iter()
+                        .map(|t| TopLogprobInfo {
+                            token: format!("token_{}", t.token_id),
+                            logprob: t.logprob,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+    } else {
+        None
+    };
+
     Ok(Json(CompletionResponse {
         id: format!("cmpl-{}", uuid::Uuid::new_v4()),
         object: "text_completion".to_string(),
@@ -325,6 +428,7 @@ async fn completions(
             index: 0,
             text,
             finish_reason: "stop".to_string(),
+            logprobs: logprobs_response,
         }],
         usage: Usage {
             prompt_tokens,

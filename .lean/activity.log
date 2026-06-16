@@ -525,3 +525,10 @@
     exit_reason: "Remaining items all M-effort features requiring focused attention"
     branch: "loop/2026-06-16-4"
     tag: "loop-run/2026-06-16-5-approve"
+- timestamp: "2026-06-16T13:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p6-logprobs"
+  summary: "Added logprobs support: TokenLogprob/TopLogprob types, generate_with_logprobs method, logprobs/top_logprobs API fields on requests and responses, 2 new tests"
+  iteration: 1
+  max_iterations: 10
