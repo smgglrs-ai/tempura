@@ -346,4 +346,116 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_causal_masking_prefill_matches_sequential() {
+        let attn = CpuAttention;
+        let head_dim = 4;
+        let num_heads = 1;
+        let num_kv_heads = 1;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q_data = vec![
+            1.0, 0.0, 0.0, 0.0, // token 0
+            0.0, 1.0, 0.0, 0.0, // token 1
+            0.0, 0.0, 1.0, 0.0, // token 2
+        ];
+        let k_data = q_data.clone();
+        let v_data = vec![
+            1.0, 2.0, 3.0, 4.0, // token 0
+            5.0, 6.0, 7.0, 8.0, // token 1
+            9.0, 10.0, 11.0, 12.0, // token 2
+        ];
+
+        // Prefill: all 3 tokens at once (causal masked)
+        let mut prefill_out = vec![0.0f32; 3 * head_dim];
+        attn.forward(
+            &q_data,
+            &k_data,
+            &v_data,
+            &mut prefill_out,
+            1,
+            3,
+            3,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .unwrap();
+
+        // Sequential: process one token at a time, accumulating KV
+        // Token 0: attends only to itself
+        let mut seq_out_0 = vec![0.0f32; head_dim];
+        attn.forward(
+            &q_data[0..head_dim],
+            &k_data[0..head_dim],
+            &v_data[0..head_dim],
+            &mut seq_out_0,
+            1,
+            1,
+            1,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .unwrap();
+
+        // Token 1: attends to tokens 0-1
+        let mut seq_out_1 = vec![0.0f32; head_dim];
+        attn.forward(
+            &q_data[head_dim..2 * head_dim],
+            &k_data[0..2 * head_dim],
+            &v_data[0..2 * head_dim],
+            &mut seq_out_1,
+            1,
+            1,
+            2,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .unwrap();
+
+        // Token 2: attends to tokens 0-2
+        let mut seq_out_2 = vec![0.0f32; head_dim];
+        attn.forward(
+            &q_data[2 * head_dim..3 * head_dim],
+            &k_data[0..3 * head_dim],
+            &v_data[0..3 * head_dim],
+            &mut seq_out_2,
+            1,
+            1,
+            3,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .unwrap();
+
+        // Prefill output for each position must match sequential output
+        for d in 0..head_dim {
+            assert!(
+                (prefill_out[d] - seq_out_0[d]).abs() < 1e-5,
+                "pos 0, dim {d}: prefill={} seq={}",
+                prefill_out[d],
+                seq_out_0[d]
+            );
+            assert!(
+                (prefill_out[head_dim + d] - seq_out_1[d]).abs() < 1e-5,
+                "pos 1, dim {d}: prefill={} seq={}",
+                prefill_out[head_dim + d],
+                seq_out_1[d]
+            );
+            assert!(
+                (prefill_out[2 * head_dim + d] - seq_out_2[d]).abs() < 1e-5,
+                "pos 2, dim {d}: prefill={} seq={}",
+                prefill_out[2 * head_dim + d],
+                seq_out_2[d]
+            );
+        }
+    }
 }
