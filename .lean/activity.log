@@ -396,3 +396,11 @@
   summary: "Implemented SpeculativeDecoder with draft-then-verify loop, rejection sampling, KvCache rollback, SpeculativeSnapshot trace recording, greedy and sampled modes"
   iteration: 4
   max_iterations: 10
+
+- timestamp: "2026-06-16T16:30:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p5-tensor-parallelism"
+  summary: "Added AllReduce trait (CpuAllReduce no-op + CudaAllReduce stub), tensor_parallel_size to ModelConfig, KernelPipeline gains 6th type param with default, backward compat preserved"
+  iteration: 5
+  max_iterations: 10

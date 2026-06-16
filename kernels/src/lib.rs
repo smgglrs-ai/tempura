@@ -1,3 +1,4 @@
+pub mod allreduce;
 pub mod attention;
 #[cfg(feature = "cuda")]
 pub mod gpu;
@@ -9,6 +10,7 @@ pub mod sampling;
 pub mod turboquant;
 pub mod verification_manifest;
 
+pub use allreduce::AllReduce;
 pub use attention::Attention;
 pub use layernorm::LayerNorm;
 pub use matmul::MatMul;

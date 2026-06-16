@@ -1,0 +1,56 @@
+use crate::Result;
+
+pub trait AllReduce: Send + Sync {
+    fn sum_in_place(&self, data: &mut [f32]) -> Result<()>;
+}
+
+#[cfg(feature = "cpu")]
+pub struct CpuAllReduce;
+
+#[cfg(feature = "cpu")]
+impl AllReduce for CpuAllReduce {
+    fn sum_in_place(&self, _data: &mut [f32]) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct CudaAllReduce {
+    #[allow(dead_code)]
+    gpu: crate::gpu::GpuContext,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for CudaAllReduce {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for CudaAllReduce {}
+
+#[cfg(feature = "cuda")]
+impl CudaAllReduce {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            gpu: crate::gpu::GpuContext::new(0)?,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl AllReduce for CudaAllReduce {
+    fn sum_in_place(&self, _data: &mut [f32]) -> Result<()> {
+        todo!("CudaAllReduce: NCCL-backed all-reduce not yet implemented")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cpu_allreduce_is_identity() {
+        let ar = CpuAllReduce;
+        let mut data = vec![1.0, 2.0, 3.0, 4.0];
+        let original = data.clone();
+        ar.sum_in_place(&mut data).unwrap();
+        assert_eq!(data, original);
+    }
+}

@@ -640,7 +640,8 @@ items:
       Requires AllReduce communication primitive, multi-device GpuContext,
       sharded ModelWeights, and updated forward pass with inter-GPU sync
       at layer boundaries.
-    status: planned
+    status: done
+    progress: 100
     priority: low
     effort: XL
     scope:

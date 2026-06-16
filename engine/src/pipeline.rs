@@ -1,13 +1,14 @@
-use oxide_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler};
+use oxide_kernels::{AllReduce, Attention, MatMul, RMSNorm, RoPE, Sampler};
 
 use crate::trace::{LayerSnapshot, NormStats, TraceLevel};
 
-pub struct KernelPipeline<A, N, R, M, S> {
+pub struct KernelPipeline<A, N, R, M, S, AR = oxide_kernels::allreduce::CpuAllReduce> {
     pub attention: A,
     pub rmsnorm: N,
     pub rope: R,
     pub matmul: M,
     pub sampler: S,
+    pub allreduce: AR,
 }
 
 impl
@@ -20,6 +21,7 @@ impl
     >
 {
     pub fn cpu_verified() -> Self {
+        use oxide_kernels::allreduce::CpuAllReduce;
         use oxide_kernels::attention::CpuAttention;
         use oxide_kernels::matmul::CpuMatMul;
         use oxide_kernels::rmsnorm::CpuRMSNorm;
@@ -32,6 +34,7 @@ impl
             rope: CpuRoPE,
             matmul: CpuMatMul,
             sampler: CpuSampler,
+            allreduce: CpuAllReduce,
         }
     }
 }
@@ -44,9 +47,11 @@ impl
         oxide_kernels::rope::CudaRoPE,
         oxide_kernels::matmul::CudaMatMul,
         oxide_kernels::sampling::CudaSampler,
+        oxide_kernels::allreduce::CpuAllReduce,
     >
 {
     pub fn cuda() -> Self {
+        use oxide_kernels::allreduce::CpuAllReduce;
         use oxide_kernels::attention::CudaAttention;
         use oxide_kernels::matmul::CudaMatMul;
         use oxide_kernels::rmsnorm::CudaRMSNorm;
@@ -59,18 +64,24 @@ impl
             rope: CudaRoPE::new().expect("Failed to initialize CudaRoPE"),
             matmul: CudaMatMul::new().expect("Failed to initialize CudaMatMul"),
             sampler: CudaSampler,
+            allreduce: CpuAllReduce,
         }
     }
 }
 
-impl<A, N, R, M, S> KernelPipeline<A, N, R, M, S>
+impl<A, N, R, M, S, AR> KernelPipeline<A, N, R, M, S, AR>
 where
     A: Attention,
     N: RMSNorm,
     R: RoPE,
     M: MatMul,
     S: Sampler,
+    AR: AllReduce,
 {
+    pub fn allreduce_sum(&self, data: &mut [f32]) -> oxide_kernels::Result<()> {
+        self.allreduce.sum_in_place(data)
+    }
+
     pub fn rmsnorm(
         &self,
         x: &mut [f32],

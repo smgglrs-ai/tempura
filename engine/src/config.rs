@@ -10,6 +10,7 @@ pub struct ModelConfig {
     pub head_dim: usize,
     pub rope_theta: f32,
     pub layer_norm_eps: f32,
+    pub tensor_parallel_size: usize,
 }
 
 impl ModelConfig {
@@ -25,6 +26,7 @@ impl ModelConfig {
             head_dim: 128,
             rope_theta: 10000.0,
             layer_norm_eps: 1e-5,
+            tensor_parallel_size: 1,
         }
     }
 
@@ -40,6 +42,7 @@ impl ModelConfig {
             head_dim: 64,
             rope_theta: 10000.0,
             layer_norm_eps: 1e-5,
+            tensor_parallel_size: 1,
         }
     }
 
@@ -55,6 +58,7 @@ impl ModelConfig {
             head_dim: 16,
             rope_theta: 10000.0,
             layer_norm_eps: 1e-5,
+            tensor_parallel_size: 1,
         }
     }
 }
