@@ -78,6 +78,10 @@ pub struct ChatCompletionRequest {
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub tools: Option<Vec<oxide_engine::tool_call::ToolDefinition>>,
+    #[serde(default)]
+    pub tool_choice: Option<oxide_engine::tool_call::ToolChoice>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,10 +103,15 @@ fn default_n() -> u32 {
     1
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<oxide_engine::tool_call::ToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +131,12 @@ pub struct ChatChoice {
     pub finish_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChoiceLogprobs>,
+}
+
+impl ChatMessage {
+    fn content_str(&self) -> String {
+        self.content.clone().unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -293,7 +308,7 @@ async fn chat_completions(
         .iter()
         .map(|m| oxide_engine::ChatMessageInput {
             role: m.role.clone(),
-            content: m.content.clone(),
+            content: m.content_str(),
         })
         .collect();
 
@@ -302,7 +317,7 @@ async fn chat_completions(
         .unwrap_or_else(|_| {
             req.messages
                 .iter()
-                .map(|m| format!("{}: {}", m.role, m.content))
+                .map(|m| format!("{}: {}", m.role, m.content_str()))
                 .collect::<Vec<_>>()
                 .join("\n")
         });
@@ -402,6 +417,7 @@ async fn chat_completions(
                             delta: ChunkDelta {
                                 role: None,
                                 content: Some(text),
+                                tool_calls: None,
                             },
                             finish_reason: None,
                         }],
@@ -514,13 +530,58 @@ async fn chat_completions(
                     None
                 };
 
+                let (msg, fr) = if let Some(ref tools) = req.tools {
+                    if !tools.is_empty() && !req.tool_choice.as_ref().is_some_and(|tc| tc.is_none())
+                    {
+                        let parser = oxide_engine::tool_call::ToolCallParser::new(tools);
+                        if let Some(tool_calls) = parser.parse(text) {
+                            (
+                                ChatMessage {
+                                    role: "assistant".to_string(),
+                                    content: None,
+                                    tool_calls: Some(tool_calls),
+                                    tool_call_id: None,
+                                },
+                                "tool_calls".to_string(),
+                            )
+                        } else {
+                            (
+                                ChatMessage {
+                                    role: "assistant".to_string(),
+                                    content: Some(text.to_string()),
+                                    tool_calls: None,
+                                    tool_call_id: None,
+                                },
+                                finish_reason.to_string(),
+                            )
+                        }
+                    } else {
+                        (
+                            ChatMessage {
+                                role: "assistant".to_string(),
+                                content: Some(text.to_string()),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            },
+                            finish_reason.to_string(),
+                        )
+                    }
+                } else {
+                    (
+                        ChatMessage {
+                            role: "assistant".to_string(),
+                            content: Some(text.to_string()),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        },
+                        finish_reason.to_string(),
+                    )
+                };
+
                 choices.push(ChatChoice {
                     index: i,
-                    message: ChatMessage {
-                        role: "assistant".to_string(),
-                        content: text.to_string(),
-                    },
-                    finish_reason: finish_reason.to_string(),
+                    message: msg,
+                    finish_reason: fr,
                     logprobs: logprobs_response,
                 });
             }

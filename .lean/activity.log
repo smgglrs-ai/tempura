@@ -624,3 +624,10 @@
     exit_reason: "Remaining items are L-effort features requiring focused sessions"
     branch: "loop/2026-06-16-6"
     tag: "loop-run/2026-06-16-8-approve-r6"
+- timestamp: "2026-06-16T19:15:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p6-tool-calling"
+  summary: "Added tool/function calling: ToolCallParser with JSON extraction, tools/tool_choice on request, tool_calls/tool_call_id on ChatMessage, ChunkDelta tool_calls for SSE, finish_reason=tool_calls, 7 new tests"
+  iteration: 1
+  max_iterations: 10

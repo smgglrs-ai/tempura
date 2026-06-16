@@ -8,6 +8,7 @@ pub mod pipeline;
 pub mod session;
 pub mod speculative;
 pub mod tokenizer;
+pub mod tool_call;
 pub mod trace;
 pub mod weights;
 

@@ -24,6 +24,27 @@ pub struct ChunkDelta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChunkToolCall>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChunkToolCall {
+    pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "type")]
+    pub call_type: Option<String>,
+    pub function: ChunkFunction,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChunkFunction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 pub fn keep_alive() -> KeepAlive {
@@ -54,6 +75,7 @@ mod tests {
                 delta: ChunkDelta {
                     role: None,
                     content: content.map(|s| s.to_string()),
+                    tool_calls: None,
                 },
                 finish_reason: finish_reason.map(|s| s.to_string()),
             }],
@@ -85,6 +107,7 @@ mod tests {
                 delta: ChunkDelta {
                     role: Some("assistant".to_string()),
                     content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],

@@ -922,7 +922,8 @@ items:
     quick: cargo test --workspace
 - id: p6-tool-calling
   title: Tool/function calling
-  status: planned
+  status: done
+  progress: 100
   priority: high
   effort: L
   depends_on:
