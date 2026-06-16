@@ -2,6 +2,7 @@ pub mod batch_invariant;
 pub mod config;
 pub mod disaggregated;
 pub mod dual_pipeline;
+pub mod gguf_loader;
 pub mod kv_cache;
 pub mod loader;
 pub mod model;

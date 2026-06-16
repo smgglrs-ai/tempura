@@ -15,6 +15,10 @@ pub enum LoadError {
         expected: usize,
         got: usize,
     },
+    #[error("no safetensors files found in directory")]
+    NoFiles,
+    #[error("GGUF parse error: {0}")]
+    GgufParse(String),
 }
 
 pub trait WeightLoader {
@@ -63,9 +67,38 @@ fn f16_to_f32(bits: u16) -> f32 {
 impl SafetensorsLoader {
     pub fn from_file(path: &Path) -> Result<Self, LoadError> {
         let data = std::fs::read(path)?;
-        let tensors_view = safetensors::SafeTensors::deserialize(&data)?;
+        let mut tensors = HashMap::new();
+        Self::load_tensors_from_bytes(&data, &mut tensors)?;
+        Ok(Self { tensors })
+    }
+
+    pub fn from_dir(dir: &Path) -> Result<Self, LoadError> {
+        let mut paths: Vec<_> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "safetensors"))
+            .collect();
+
+        if paths.is_empty() {
+            return Err(LoadError::NoFiles);
+        }
+
+        paths.sort();
 
         let mut tensors = HashMap::new();
+        for path in &paths {
+            let data = std::fs::read(path)?;
+            Self::load_tensors_from_bytes(&data, &mut tensors)?;
+        }
+
+        Ok(Self { tensors })
+    }
+
+    fn load_tensors_from_bytes(
+        data: &[u8],
+        tensors: &mut HashMap<String, Vec<f32>>,
+    ) -> Result<(), LoadError> {
+        let tensors_view = safetensors::SafeTensors::deserialize(data)?;
         for (name, view) in tensors_view.tensors() {
             let bytes = view.data();
             let floats = match view.dtype() {
@@ -88,8 +121,7 @@ impl SafetensorsLoader {
             };
             tensors.insert(name.to_string(), floats);
         }
-
-        Ok(Self { tensors })
+        Ok(())
     }
 }
 
@@ -103,5 +135,62 @@ impl WeightLoader for SafetensorsLoader {
 
     fn tensor_names(&self) -> Vec<String> {
         self.tensors.keys().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn write_safetensors(dir: &Path, filename: &str, tensors: &HashMap<&str, Vec<f32>>) {
+        let data: HashMap<String, safetensors::tensor::TensorView<'_>> = tensors
+            .iter()
+            .map(|(name, values)| {
+                let bytes: &[u8] = bytemuck::cast_slice(values.as_slice());
+                let view = safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F32,
+                    vec![values.len()],
+                    bytes,
+                )
+                .unwrap();
+                (name.to_string(), view)
+            })
+            .collect();
+        let serialized = safetensors::tensor::serialize(&data, &None).unwrap();
+        std::fs::write(dir.join(filename), serialized).unwrap();
+    }
+
+    #[test]
+    fn from_dir_loads_all_shards() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut t1 = HashMap::new();
+        t1.insert("layer.0.weight", vec![1.0_f32, 2.0, 3.0]);
+        write_safetensors(dir.path(), "model-00001.safetensors", &t1);
+
+        let mut t2 = HashMap::new();
+        t2.insert("layer.1.weight", vec![4.0_f32, 5.0, 6.0]);
+        write_safetensors(dir.path(), "model-00002.safetensors", &t2);
+
+        let loader = SafetensorsLoader::from_dir(dir.path()).unwrap();
+        let names = loader.tensor_names();
+        assert!(names.contains(&"layer.0.weight".to_string()));
+        assert!(names.contains(&"layer.1.weight".to_string()));
+        assert_eq!(
+            loader.load_tensor("layer.0.weight").unwrap(),
+            vec![1.0, 2.0, 3.0]
+        );
+        assert_eq!(
+            loader.load_tensor("layer.1.weight").unwrap(),
+            vec![4.0, 5.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn from_dir_empty_returns_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = SafetensorsLoader::from_dir(dir.path());
+        assert!(matches!(result, Err(LoadError::NoFiles)));
     }
 }

@@ -95,10 +95,59 @@ async fn main() {
 
     let model_path = args.model.as_deref().map(Path::new);
     let is_model_dir = model_path.is_some_and(|p| p.is_dir());
+    let is_gguf = model_path.is_some_and(|p| {
+        p.extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+    });
 
-    let config = if is_model_dir {
+    let (config, model_id) = if is_gguf {
+        let model_p = model_path.unwrap();
+        let gguf = oxide_engine::gguf_loader::GgufLoader::from_file(model_p).unwrap();
+        let config = gguf.config.clone();
+        tracing::info!("Loaded GGUF model from {}", model_p.display(),);
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(config.clone(), pipeline);
+        model.load_weights(&gguf).unwrap();
+
+        let tokenizer = args.tokenizer.as_ref().map(|path| {
+            let tok = Tokenizer::from_file(Path::new(path)).unwrap();
+            tracing::info!("Loaded tokenizer from {}", path);
+            Arc::new(tok)
+        });
+
+        let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+        let metrics_handle = prometheus_builder.install_recorder().unwrap();
+
+        let scheduler =
+            batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len, args.max_batch_size);
+        let traces = trace_store::TraceStore::new(args.max_traces);
+        let state = AppState {
+            model: Arc::new(model),
+            tokenizer,
+            model_id: model_p.display().to_string(),
+            scheduler: Arc::new(Mutex::new(scheduler)),
+            trace_store: Arc::new(Mutex::new(traces)),
+            metrics_handle,
+            request_timeout: std::time::Duration::from_secs(args.request_timeout_secs),
+        };
+
+        let app = api::router()
+            .layer(CorsLayer::permissive())
+            .with_state(state);
+
+        let addr = format!("{}:{}", args.host, args.port);
+        tracing::info!("Starting oxide-serve on {}", addr);
+
+        let shutdown_timeout = std::time::Duration::from_secs(args.shutdown_timeout);
+        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal(shutdown_timeout))
+            .await
+            .unwrap();
+        return;
+    } else if is_model_dir {
         let config_path = model_path.unwrap().join("config.json");
-        if config_path.exists() {
+        let config = if config_path.exists() {
             let c = ModelConfig::from_hf_config(&config_path).unwrap();
             tracing::info!("Loaded model config from {}", config_path.display());
             c
@@ -109,40 +158,38 @@ async fn main() {
                 "tiny-test" => ModelConfig::tiny_test(),
                 _ => ModelConfig::llama2_7b(),
             }
-        }
-    } else {
-        match args.model_config.as_str() {
+        };
+        (config, model_path.unwrap().display().to_string())
+    } else if let Some(model_p) = model_path {
+        let config = match args.model_config.as_str() {
             "micro-llama" => ModelConfig::micro_llama(),
             "tiny-test" => ModelConfig::tiny_test(),
             _ => ModelConfig::llama2_7b(),
-        }
+        };
+        (config, model_p.display().to_string())
+    } else {
+        let config = match args.model_config.as_str() {
+            "micro-llama" => ModelConfig::micro_llama(),
+            "tiny-test" => ModelConfig::tiny_test(),
+            _ => ModelConfig::llama2_7b(),
+        };
+        tracing::warn!("No --model provided, running with unloaded weights (stub responses)");
+        (config, "oxide-serve-unloaded".to_string())
     };
+
     let pipeline = KernelPipeline::cpu_verified();
     let mut model = TransformerModel::new(config, pipeline);
 
-    let model_id = if let Some(model_p) = model_path {
+    if let Some(model_p) = model_path {
         if is_model_dir {
-            let safetensors: Vec<_> = std::fs::read_dir(model_p)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
-                .collect();
-            if let Some(entry) = safetensors.first() {
-                let loader =
-                    oxide_engine::loader::SafetensorsLoader::from_file(&entry.path()).unwrap();
-                model.load_weights(&loader).unwrap();
-                tracing::info!("Loaded model weights from {}", entry.path().display());
-            }
-            model_p.display().to_string()
+            let loader = oxide_engine::loader::SafetensorsLoader::from_dir(model_p).unwrap();
+            model.load_weights(&loader).unwrap();
+            tracing::info!("Loaded model weights from {}", model_p.display());
         } else {
             let loader = oxide_engine::loader::SafetensorsLoader::from_file(model_p).unwrap();
             model.load_weights(&loader).unwrap();
             tracing::info!("Loaded model weights from {}", model_p.display());
-            model_p.display().to_string()
         }
-    } else {
-        tracing::warn!("No --model provided, running with unloaded weights (stub responses)");
-        "oxide-serve-unloaded".to_string()
     };
 
     let tokenizer = if is_model_dir {

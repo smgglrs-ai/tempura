@@ -1,0 +1,856 @@
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::config::{ModelConfig, QuantConfig};
+use crate::loader::{LoadError, WeightLoader};
+
+const GGUF_MAGIC: u32 = 0x46554747;
+const GGUF_VERSION: u32 = 3;
+const ALIGNMENT: usize = 32;
+
+#[derive(Debug, Clone)]
+pub enum GgufValue {
+    U8(u8),
+    I8(i8),
+    U16(u16),
+    I16(i16),
+    U32(u32),
+    I32(i32),
+    F32(f32),
+    Bool(bool),
+    String(String),
+    Array(Vec<GgufValue>),
+    U64(u64),
+    I64(i64),
+    F64(f64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+enum GgmlType {
+    F32 = 0,
+    F16 = 1,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    Q8_0 = 7,
+    BF16 = 30,
+}
+
+impl GgmlType {
+    fn from_u32(v: u32) -> Result<Self, LoadError> {
+        match v {
+            0 => Ok(GgmlType::F32),
+            1 => Ok(GgmlType::F16),
+            2 => Ok(GgmlType::Q4_0),
+            3 => Ok(GgmlType::Q4_1),
+            7 => Ok(GgmlType::Q8_0),
+            30 => Ok(GgmlType::BF16),
+            _ => Err(LoadError::GgufParse(format!("unsupported GGML type: {v}"))),
+        }
+    }
+}
+
+struct TensorInfo {
+    name: String,
+    dims: Vec<u64>,
+    dtype: GgmlType,
+    offset: u64,
+}
+
+fn read_u8(data: &[u8], offset: &mut usize) -> Result<u8, LoadError> {
+    if *offset + 1 > data.len() {
+        return Err(LoadError::GgufParse("unexpected EOF reading u8".into()));
+    }
+    let v = data[*offset];
+    *offset += 1;
+    Ok(v)
+}
+
+fn read_i8(data: &[u8], offset: &mut usize) -> Result<i8, LoadError> {
+    Ok(read_u8(data, offset)? as i8)
+}
+
+fn read_u16(data: &[u8], offset: &mut usize) -> Result<u16, LoadError> {
+    if *offset + 2 > data.len() {
+        return Err(LoadError::GgufParse("unexpected EOF reading u16".into()));
+    }
+    let v = u16::from_le_bytes([data[*offset], data[*offset + 1]]);
+    *offset += 2;
+    Ok(v)
+}
+
+fn read_i16(data: &[u8], offset: &mut usize) -> Result<i16, LoadError> {
+    Ok(read_u16(data, offset)? as i16)
+}
+
+fn read_u32(data: &[u8], offset: &mut usize) -> Result<u32, LoadError> {
+    if *offset + 4 > data.len() {
+        return Err(LoadError::GgufParse("unexpected EOF reading u32".into()));
+    }
+    let v = u32::from_le_bytes([
+        data[*offset],
+        data[*offset + 1],
+        data[*offset + 2],
+        data[*offset + 3],
+    ]);
+    *offset += 4;
+    Ok(v)
+}
+
+fn read_i32(data: &[u8], offset: &mut usize) -> Result<i32, LoadError> {
+    if *offset + 4 > data.len() {
+        return Err(LoadError::GgufParse("unexpected EOF reading i32".into()));
+    }
+    let v = i32::from_le_bytes([
+        data[*offset],
+        data[*offset + 1],
+        data[*offset + 2],
+        data[*offset + 3],
+    ]);
+    *offset += 4;
+    Ok(v)
+}
+
+fn read_f32(data: &[u8], offset: &mut usize) -> Result<f32, LoadError> {
+    if *offset + 4 > data.len() {
+        return Err(LoadError::GgufParse("unexpected EOF reading f32".into()));
+    }
+    let v = f32::from_le_bytes([
+        data[*offset],
+        data[*offset + 1],
+        data[*offset + 2],
+        data[*offset + 3],
+    ]);
+    *offset += 4;
+    Ok(v)
+}
+
+fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64, LoadError> {
+    if *offset + 8 > data.len() {
+        return Err(LoadError::GgufParse("unexpected EOF reading u64".into()));
+    }
+    let v = u64::from_le_bytes([
+        data[*offset],
+        data[*offset + 1],
+        data[*offset + 2],
+        data[*offset + 3],
+        data[*offset + 4],
+        data[*offset + 5],
+        data[*offset + 6],
+        data[*offset + 7],
+    ]);
+    *offset += 8;
+    Ok(v)
+}
+
+fn read_i64(data: &[u8], offset: &mut usize) -> Result<i64, LoadError> {
+    if *offset + 8 > data.len() {
+        return Err(LoadError::GgufParse("unexpected EOF reading i64".into()));
+    }
+    let v = i64::from_le_bytes([
+        data[*offset],
+        data[*offset + 1],
+        data[*offset + 2],
+        data[*offset + 3],
+        data[*offset + 4],
+        data[*offset + 5],
+        data[*offset + 6],
+        data[*offset + 7],
+    ]);
+    *offset += 8;
+    Ok(v)
+}
+
+fn read_f64(data: &[u8], offset: &mut usize) -> Result<f64, LoadError> {
+    if *offset + 8 > data.len() {
+        return Err(LoadError::GgufParse("unexpected EOF reading f64".into()));
+    }
+    let v = f64::from_le_bytes([
+        data[*offset],
+        data[*offset + 1],
+        data[*offset + 2],
+        data[*offset + 3],
+        data[*offset + 4],
+        data[*offset + 5],
+        data[*offset + 6],
+        data[*offset + 7],
+    ]);
+    *offset += 8;
+    Ok(v)
+}
+
+fn read_string(data: &[u8], offset: &mut usize) -> Result<String, LoadError> {
+    let len = read_u64(data, offset)? as usize;
+    if *offset + len > data.len() {
+        return Err(LoadError::GgufParse("unexpected EOF reading string".into()));
+    }
+    let s = std::str::from_utf8(&data[*offset..*offset + len])
+        .map_err(|e| LoadError::GgufParse(format!("invalid UTF-8 in string: {e}")))?
+        .to_string();
+    *offset += len;
+    Ok(s)
+}
+
+fn read_metadata_value(
+    data: &[u8],
+    offset: &mut usize,
+    value_type: u32,
+) -> Result<GgufValue, LoadError> {
+    match value_type {
+        0 => Ok(GgufValue::U8(read_u8(data, offset)?)),
+        1 => Ok(GgufValue::I8(read_i8(data, offset)?)),
+        2 => Ok(GgufValue::U16(read_u16(data, offset)?)),
+        3 => Ok(GgufValue::I16(read_i16(data, offset)?)),
+        4 => Ok(GgufValue::U32(read_u32(data, offset)?)),
+        5 => Ok(GgufValue::I32(read_i32(data, offset)?)),
+        6 => Ok(GgufValue::F32(read_f32(data, offset)?)),
+        7 => {
+            let v = read_u8(data, offset)?;
+            Ok(GgufValue::Bool(v != 0))
+        }
+        8 => Ok(GgufValue::String(read_string(data, offset)?)),
+        9 => {
+            let elem_type = read_u32(data, offset)?;
+            let count = read_u64(data, offset)? as usize;
+            let mut arr = Vec::with_capacity(count);
+            for _ in 0..count {
+                arr.push(read_metadata_value(data, offset, elem_type)?);
+            }
+            Ok(GgufValue::Array(arr))
+        }
+        10 => Ok(GgufValue::U64(read_u64(data, offset)?)),
+        11 => Ok(GgufValue::I64(read_i64(data, offset)?)),
+        12 => Ok(GgufValue::F64(read_f64(data, offset)?)),
+        _ => Err(LoadError::GgufParse(format!(
+            "unknown metadata type: {value_type}"
+        ))),
+    }
+}
+
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+
+    if exp == 0 {
+        if frac == 0 {
+            return f32::from_bits(sign << 31);
+        }
+        let mut e = exp;
+        let mut f = frac;
+        while (f & 0x400) == 0 {
+            f <<= 1;
+            e = e.wrapping_sub(1);
+        }
+        f &= 0x3ff;
+        let f32_exp = 127 - 15 + 1 + e;
+        f32::from_bits((sign << 31) | (f32_exp << 23) | (f << 13))
+    } else if exp == 31 {
+        if frac == 0 {
+            f32::from_bits((sign << 31) | (0xff << 23))
+        } else {
+            f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13))
+        }
+    } else {
+        let f32_exp = exp + 127 - 15;
+        f32::from_bits((sign << 31) | (f32_exp << 23) | (frac << 13))
+    }
+}
+
+fn dequant_f32(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(num_elements);
+    for i in 0..num_elements {
+        let start = i * 4;
+        let v = f32::from_le_bytes([
+            data[start],
+            data[start + 1],
+            data[start + 2],
+            data[start + 3],
+        ]);
+        out.push(v);
+    }
+    out
+}
+
+fn dequant_f16(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(num_elements);
+    for i in 0..num_elements {
+        let start = i * 2;
+        let bits = u16::from_le_bytes([data[start], data[start + 1]]);
+        out.push(f16_to_f32(bits));
+    }
+    out
+}
+
+fn dequant_bf16(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(num_elements);
+    for i in 0..num_elements {
+        let start = i * 2;
+        let bits = u16::from_le_bytes([data[start], data[start + 1]]);
+        out.push(bf16_to_f32(bits));
+    }
+    out
+}
+
+fn dequant_q4_0(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 32;
+    let block_size = 18;
+    let mut out = Vec::with_capacity(num_elements);
+    for b in 0..num_blocks {
+        let block_start = b * block_size;
+        let scale_bits = u16::from_le_bytes([data[block_start], data[block_start + 1]]);
+        let scale = f16_to_f32(scale_bits);
+        for i in 0..16 {
+            let byte = data[block_start + 2 + i];
+            let lo = (byte & 0x0F) as i32 - 8;
+            let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+            out.push(lo as f32 * scale);
+            out.push(hi as f32 * scale);
+        }
+    }
+    out
+}
+
+fn dequant_q4_1(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 32;
+    let block_size = 20;
+    let mut out = Vec::with_capacity(num_elements);
+    for b in 0..num_blocks {
+        let block_start = b * block_size;
+        let scale_bits = u16::from_le_bytes([data[block_start], data[block_start + 1]]);
+        let scale = f16_to_f32(scale_bits);
+        let min_bits = u16::from_le_bytes([data[block_start + 2], data[block_start + 3]]);
+        let min = f16_to_f32(min_bits);
+        for i in 0..16 {
+            let byte = data[block_start + 4 + i];
+            let lo = (byte & 0x0F) as f32;
+            let hi = ((byte >> 4) & 0x0F) as f32;
+            out.push(lo * scale + min);
+            out.push(hi * scale + min);
+        }
+    }
+    out
+}
+
+fn dequant_q8_0(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 32;
+    let block_size = 34;
+    let mut out = Vec::with_capacity(num_elements);
+    for b in 0..num_blocks {
+        let block_start = b * block_size;
+        let scale_bits = u16::from_le_bytes([data[block_start], data[block_start + 1]]);
+        let scale = f16_to_f32(scale_bits);
+        for i in 0..32 {
+            let q = data[block_start + 2 + i] as i8;
+            out.push(q as f32 * scale);
+        }
+    }
+    out
+}
+
+fn tensor_data_size(dtype: GgmlType, num_elements: u64) -> u64 {
+    match dtype {
+        GgmlType::F32 => num_elements * 4,
+        GgmlType::F16 | GgmlType::BF16 => num_elements * 2,
+        GgmlType::Q4_0 => (num_elements / 32) * 18,
+        GgmlType::Q4_1 => (num_elements / 32) * 20,
+        GgmlType::Q8_0 => (num_elements / 32) * 34,
+    }
+}
+
+fn map_gguf_name(gguf_name: &str) -> Option<String> {
+    match gguf_name {
+        "token_embd.weight" => return Some("model.embed_tokens.weight".into()),
+        "output_norm.weight" => return Some("model.norm.weight".into()),
+        "output.weight" => return Some("lm_head.weight".into()),
+        _ => {}
+    }
+
+    if let Some(rest) = gguf_name.strip_prefix("blk.") {
+        let dot_pos = rest.find('.')?;
+        let n = &rest[..dot_pos];
+        let suffix = &rest[dot_pos + 1..];
+        let hf_suffix = match suffix {
+            "attn_norm.weight" => "input_layernorm.weight",
+            "ffn_norm.weight" => "post_attention_layernorm.weight",
+            "attn_q.weight" => "self_attn.q_proj.weight",
+            "attn_k.weight" => "self_attn.k_proj.weight",
+            "attn_v.weight" => "self_attn.v_proj.weight",
+            "attn_output.weight" => "self_attn.o_proj.weight",
+            "ffn_gate.weight" => "mlp.gate_proj.weight",
+            "ffn_up.weight" => "mlp.up_proj.weight",
+            "ffn_down.weight" => "mlp.down_proj.weight",
+            _ => return None,
+        };
+        return Some(format!("model.layers.{n}.{hf_suffix}"));
+    }
+
+    None
+}
+
+impl GgufValue {
+    fn as_u32(&self) -> Option<u32> {
+        match self {
+            GgufValue::U32(v) => Some(*v),
+            GgufValue::I32(v) => Some(*v as u32),
+            GgufValue::U64(v) => Some(*v as u32),
+            _ => None,
+        }
+    }
+
+    fn as_u64(&self) -> Option<u64> {
+        match self {
+            GgufValue::U64(v) => Some(*v),
+            GgufValue::U32(v) => Some(*v as u64),
+            GgufValue::I32(v) => Some(*v as u64),
+            _ => None,
+        }
+    }
+
+    fn as_f32(&self) -> Option<f32> {
+        match self {
+            GgufValue::F32(v) => Some(*v),
+            GgufValue::F64(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+}
+
+pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConfig, LoadError> {
+    let get_usize = |keys: &[&str]| -> Option<usize> {
+        for key in keys {
+            if let Some(val) = metadata.get(*key) {
+                if let Some(n) = val.as_u64() {
+                    return Some(n as usize);
+                }
+                if let Some(n) = val.as_u32() {
+                    return Some(n as usize);
+                }
+            }
+        }
+        None
+    };
+
+    let hidden_size = get_usize(&["llama.embedding_length", "general.embedding_length"])
+        .ok_or_else(|| LoadError::GgufParse("missing embedding_length in metadata".into()))?;
+
+    let intermediate_size = get_usize(&["llama.feed_forward_length"])
+        .ok_or_else(|| LoadError::GgufParse("missing feed_forward_length in metadata".into()))?;
+
+    let num_attention_heads = get_usize(&["llama.attention.head_count"])
+        .ok_or_else(|| LoadError::GgufParse("missing attention.head_count in metadata".into()))?;
+
+    let num_kv_heads = get_usize(&["llama.attention.head_count_kv"]).unwrap_or(num_attention_heads);
+
+    let num_layers = get_usize(&["llama.block_count"])
+        .ok_or_else(|| LoadError::GgufParse("missing block_count in metadata".into()))?;
+
+    let vocab_size = get_usize(&["llama.vocab_size", "general.vocab_size"]).unwrap_or(32000);
+
+    let max_seq_len = get_usize(&["llama.context_length"]).unwrap_or(4096);
+
+    let rope_theta = metadata
+        .get("llama.rope.freq_base")
+        .and_then(|v| v.as_f32())
+        .unwrap_or(10000.0);
+
+    let layer_norm_eps = metadata
+        .get("llama.attention.layer_norm_rms_epsilon")
+        .and_then(|v| v.as_f32())
+        .unwrap_or(1e-5);
+
+    let head_dim = hidden_size / num_attention_heads;
+
+    let file_type = metadata.get("general.file_type").and_then(|v| v.as_u32());
+    let quantization = file_type.and_then(|ft| match ft {
+        0 | 1 => None,
+        2 | 3 => Some(QuantConfig::gguf(4)),
+        7 => Some(QuantConfig::gguf(8)),
+        _ => Some(QuantConfig::gguf(4)),
+    });
+
+    Ok(ModelConfig {
+        hidden_size,
+        intermediate_size,
+        num_attention_heads,
+        num_kv_heads,
+        num_layers,
+        vocab_size,
+        max_seq_len,
+        head_dim,
+        rope_theta,
+        layer_norm_eps,
+        tensor_parallel_size: 1,
+        quantization,
+    })
+}
+
+#[derive(Debug)]
+pub struct GgufLoader {
+    tensors: HashMap<String, Vec<f32>>,
+    pub config: ModelConfig,
+}
+
+impl GgufLoader {
+    pub fn from_file(path: &Path) -> Result<Self, LoadError> {
+        let data = std::fs::read(path)?;
+        Self::from_bytes(&data)
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, LoadError> {
+        let mut offset = 0usize;
+
+        let magic = read_u32(data, &mut offset)?;
+        if magic != GGUF_MAGIC {
+            return Err(LoadError::GgufParse(format!(
+                "invalid magic: expected 0x{GGUF_MAGIC:08X}, got 0x{magic:08X}"
+            )));
+        }
+
+        let version = read_u32(data, &mut offset)?;
+        if version != GGUF_VERSION {
+            return Err(LoadError::GgufParse(format!(
+                "unsupported GGUF version: {version} (expected {GGUF_VERSION})"
+            )));
+        }
+
+        let tensor_count = read_u64(data, &mut offset)? as usize;
+        let metadata_kv_count = read_u64(data, &mut offset)? as usize;
+
+        let mut metadata = HashMap::new();
+        for _ in 0..metadata_kv_count {
+            let key = read_string(data, &mut offset)?;
+            let value_type = read_u32(data, &mut offset)?;
+            let value = read_metadata_value(data, &mut offset, value_type)?;
+            metadata.insert(key, value);
+        }
+
+        let mut tensor_infos = Vec::with_capacity(tensor_count);
+        for _ in 0..tensor_count {
+            let name = read_string(data, &mut offset)?;
+            let n_dims = read_u32(data, &mut offset)? as usize;
+            let mut dims = Vec::with_capacity(n_dims);
+            for _ in 0..n_dims {
+                dims.push(read_u64(data, &mut offset)?);
+            }
+            let dtype = GgmlType::from_u32(read_u32(data, &mut offset)?)?;
+            let tensor_offset = read_u64(data, &mut offset)?;
+            tensor_infos.push(TensorInfo {
+                name,
+                dims,
+                dtype,
+                offset: tensor_offset,
+            });
+        }
+
+        let data_start = offset.div_ceil(ALIGNMENT) * ALIGNMENT;
+
+        let mut tensors = HashMap::new();
+        for info in &tensor_infos {
+            let num_elements: u64 = info.dims.iter().product();
+            let byte_size = tensor_data_size(info.dtype, num_elements) as usize;
+            let abs_offset = data_start + info.offset as usize;
+
+            if abs_offset + byte_size > data.len() {
+                return Err(LoadError::GgufParse(format!(
+                    "tensor '{}' data out of bounds: offset {} + size {} > file size {}",
+                    info.name,
+                    abs_offset,
+                    byte_size,
+                    data.len()
+                )));
+            }
+
+            let tensor_data = &data[abs_offset..abs_offset + byte_size];
+            let ne = num_elements as usize;
+
+            let floats = match info.dtype {
+                GgmlType::F32 => dequant_f32(tensor_data, ne),
+                GgmlType::F16 => dequant_f16(tensor_data, ne),
+                GgmlType::BF16 => dequant_bf16(tensor_data, ne),
+                GgmlType::Q4_0 => dequant_q4_0(tensor_data, ne),
+                GgmlType::Q4_1 => dequant_q4_1(tensor_data, ne),
+                GgmlType::Q8_0 => dequant_q8_0(tensor_data, ne),
+            };
+
+            let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
+            tensors.insert(mapped_name, floats);
+        }
+
+        let config = extract_config(&metadata)?;
+
+        Ok(Self { tensors, config })
+    }
+}
+
+impl WeightLoader for GgufLoader {
+    fn load_tensor(&self, name: &str) -> Result<Vec<f32>, LoadError> {
+        self.tensors
+            .get(name)
+            .cloned()
+            .ok_or_else(|| LoadError::MissingTensor(name.to_string()))
+    }
+
+    fn tensor_names(&self) -> Vec<String> {
+        self.tensors.keys().cloned().collect()
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    #[kani::proof]
+    fn gguf_header_parse_in_bounds() {
+        let data_len: usize = kani::any();
+        kani::assume(data_len >= 24);
+        let mut offset = 0usize;
+
+        assert!(offset + 4 <= data_len);
+        offset += 4;
+        assert!(offset + 4 <= data_len);
+        offset += 4;
+        assert!(offset + 8 <= data_len);
+        offset += 8;
+        assert!(offset + 8 <= data_len);
+        offset += 8;
+        assert_eq!(offset, 24);
+    }
+
+    #[kani::proof]
+    fn gguf_dequant_q4_0_block_size() {
+        let num_elements: usize = kani::any();
+        kani::assume(num_elements >= 32 && num_elements <= 256);
+        kani::assume(num_elements % 32 == 0);
+
+        let num_blocks = num_elements / 32;
+        let block_size = 18;
+        let total_bytes = num_blocks * block_size;
+
+        for b in 0..num_blocks {
+            let block_start = b * block_size;
+            assert!(block_start + 2 <= total_bytes);
+            assert!(block_start + 2 + 16 <= total_bytes);
+        }
+    }
+
+    #[kani::proof]
+    fn gguf_dequant_q8_0_block_size() {
+        let num_elements: usize = kani::any();
+        kani::assume(num_elements >= 32 && num_elements <= 256);
+        kani::assume(num_elements % 32 == 0);
+
+        let num_blocks = num_elements / 32;
+        let block_size = 34;
+        let total_bytes = num_blocks * block_size;
+
+        for b in 0..num_blocks {
+            let block_start = b * block_size;
+            assert!(block_start + 2 <= total_bytes);
+            assert!(block_start + 2 + 32 <= total_bytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GGUF_ALIGNMENT: usize = 32;
+
+    #[test]
+    fn test_map_gguf_name() {
+        assert_eq!(
+            map_gguf_name("token_embd.weight"),
+            Some("model.embed_tokens.weight".into())
+        );
+        assert_eq!(
+            map_gguf_name("output_norm.weight"),
+            Some("model.norm.weight".into())
+        );
+        assert_eq!(
+            map_gguf_name("output.weight"),
+            Some("lm_head.weight".into())
+        );
+        assert_eq!(
+            map_gguf_name("blk.0.attn_norm.weight"),
+            Some("model.layers.0.input_layernorm.weight".into())
+        );
+        assert_eq!(
+            map_gguf_name("blk.5.ffn_norm.weight"),
+            Some("model.layers.5.post_attention_layernorm.weight".into())
+        );
+        assert_eq!(
+            map_gguf_name("blk.12.attn_q.weight"),
+            Some("model.layers.12.self_attn.q_proj.weight".into())
+        );
+        assert_eq!(
+            map_gguf_name("blk.3.attn_k.weight"),
+            Some("model.layers.3.self_attn.k_proj.weight".into())
+        );
+        assert_eq!(
+            map_gguf_name("blk.3.attn_v.weight"),
+            Some("model.layers.3.self_attn.v_proj.weight".into())
+        );
+        assert_eq!(
+            map_gguf_name("blk.3.attn_output.weight"),
+            Some("model.layers.3.self_attn.o_proj.weight".into())
+        );
+        assert_eq!(
+            map_gguf_name("blk.7.ffn_gate.weight"),
+            Some("model.layers.7.mlp.gate_proj.weight".into())
+        );
+        assert_eq!(
+            map_gguf_name("blk.7.ffn_up.weight"),
+            Some("model.layers.7.mlp.up_proj.weight".into())
+        );
+        assert_eq!(
+            map_gguf_name("blk.7.ffn_down.weight"),
+            Some("model.layers.7.mlp.down_proj.weight".into())
+        );
+        assert_eq!(map_gguf_name("blk.0.unknown.weight"), None);
+        assert_eq!(map_gguf_name("some_random_tensor"), None);
+    }
+
+    #[test]
+    fn test_dequant_q8_0_identity() {
+        let scale_bytes = 0x3C00u16.to_le_bytes();
+        let mut block = Vec::new();
+        block.extend_from_slice(&scale_bytes);
+        for i in 0..32i8 {
+            block.push(i as u8);
+        }
+        assert_eq!(block.len(), 34);
+
+        let result = dequant_q8_0(&block, 32);
+        assert_eq!(result.len(), 32);
+        for i in 0..32 {
+            assert!(
+                (result[i] - i as f32).abs() < 1e-5,
+                "index {i}: expected {i}, got {}",
+                result[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_dequant_q4_0_basic() {
+        let scale_bytes = 0x3C00u16.to_le_bytes();
+        let mut block = Vec::new();
+        block.extend_from_slice(&scale_bytes);
+        for _ in 0..16 {
+            block.push(0x00);
+        }
+        assert_eq!(block.len(), 18);
+
+        let result = dequant_q4_0(&block, 32);
+        assert_eq!(result.len(), 32);
+        for i in 0..32 {
+            assert!(
+                (result[i] - (-8.0)).abs() < 1e-5,
+                "index {i}: expected -8.0, got {}",
+                result[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_gguf_header_magic() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"NOTG");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let result = GgufLoader::from_bytes(&data);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("invalid magic"));
+    }
+
+    #[test]
+    fn test_gguf_header_version() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let result = GgufLoader::from_bytes(&data);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("unsupported GGUF version"));
+    }
+
+    fn build_minimal_gguf(
+        metadata: &[(&str, u32, &[u8])],
+        tensor_infos: &[(&str, &[u64], u32, u64)],
+        tensor_data: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&GGUF_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(tensor_infos.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+
+        for (key, vtype, vdata) in metadata {
+            let key_bytes = key.as_bytes();
+            buf.extend_from_slice(&(key_bytes.len() as u64).to_le_bytes());
+            buf.extend_from_slice(key_bytes);
+            buf.extend_from_slice(&vtype.to_le_bytes());
+            buf.extend_from_slice(vdata);
+        }
+
+        for (name, dims, dtype, offset) in tensor_infos {
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u64).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for d in *dims {
+                buf.extend_from_slice(&d.to_le_bytes());
+            }
+            buf.extend_from_slice(&dtype.to_le_bytes());
+            buf.extend_from_slice(&offset.to_le_bytes());
+        }
+
+        let pad = (GGUF_ALIGNMENT - (buf.len() % GGUF_ALIGNMENT)) % GGUF_ALIGNMENT;
+        buf.extend(std::iter::repeat(0u8).take(pad));
+
+        buf.extend_from_slice(tensor_data);
+        buf
+    }
+
+    fn u32_metadata_bytes(v: u32) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+
+    #[test]
+    fn test_gguf_roundtrip_f32_tensor() {
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let tensor_bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let hs = u32_metadata_bytes(64);
+        let is = u32_metadata_bytes(128);
+        let hc = u32_metadata_bytes(4);
+        let hckv = u32_metadata_bytes(4);
+        let bc = u32_metadata_bytes(2);
+
+        let metadata: Vec<(&str, u32, &[u8])> = vec![
+            ("llama.embedding_length", 4, &hs),
+            ("llama.feed_forward_length", 4, &is),
+            ("llama.attention.head_count", 4, &hc),
+            ("llama.attention.head_count_kv", 4, &hckv),
+            ("llama.block_count", 4, &bc),
+        ];
+
+        let tensor_infos = vec![("token_embd.weight", [4u64].as_slice(), 0u32, 0u64)];
+
+        let data = build_minimal_gguf(&metadata, &tensor_infos, &tensor_bytes);
+        let loader = GgufLoader::from_bytes(&data).unwrap();
+
+        let loaded = loader.load_tensor("model.embed_tokens.weight").unwrap();
+        assert_eq!(loaded, values);
+    }
+}
