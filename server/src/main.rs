@@ -112,14 +112,9 @@ pub type CudaModel = TransformerModel<
     oxide_kernels::sampling::CudaSampler,
 >;
 
-#[cfg(not(feature = "cuda"))]
-pub type ActiveModel = CpuModel;
-#[cfg(feature = "cuda")]
-pub type ActiveModel = CudaModel;
-
 #[derive(Clone)]
 pub struct AppState {
-    pub model: Arc<ActiveModel>,
+    pub model: Arc<dyn oxide_engine::InferenceModel>,
     pub tokenizer: Option<Arc<Tokenizer>>,
     pub model_id: String,
     pub scheduler: Arc<Mutex<batch::BatchScheduler>>,
@@ -214,9 +209,15 @@ async fn run_server(args: ServeArgs) {
         eprintln!("Error: --device cuda requires building with --features cuda");
         std::process::exit(1);
     }
-    if args.device == "cpu" && cfg!(feature = "cuda") {
-        tracing::warn!("Built with cuda feature but --device cpu requested; compile-time kernel selection uses CUDA");
-    }
+    let use_cuda = args.device == "cuda" && cfg!(feature = "cuda");
+    tracing::info!(
+        "Using {} kernels",
+        if use_cuda {
+            "CUDA GPU"
+        } else {
+            "CPU reference"
+        }
+    );
 
     let model_path = args.model.as_deref().map(Path::new);
     let is_model_dir = model_path.is_some_and(|p| p.is_dir());
@@ -238,17 +239,28 @@ async fn run_server(args: ServeArgs) {
         false
     });
 
+    let build_model = |config: &ModelConfig,
+                       loader: &dyn oxide_engine::loader::WeightLoader|
+     -> Arc<dyn oxide_engine::InferenceModel> {
+        #[cfg(feature = "cuda")]
+        if use_cuda {
+            let pipeline = KernelPipeline::cuda();
+            let mut model = TransformerModel::new(config.clone(), pipeline);
+            model.load_weights(loader).unwrap();
+            return Arc::new(model);
+        }
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(config.clone(), pipeline);
+        model.load_weights(loader).unwrap();
+        Arc::new(model)
+    };
+
     let (config, model_id) = if is_gguf {
         let model_p = model_path.unwrap();
         let gguf = oxide_engine::gguf_loader::GgufLoader::from_file(model_p).unwrap();
         let config = gguf.config.clone();
         tracing::info!("Loaded GGUF model from {}", model_p.display(),);
-        #[cfg(feature = "cuda")]
-        let pipeline = KernelPipeline::cuda();
-        #[cfg(not(feature = "cuda"))]
-        let pipeline = KernelPipeline::cpu_verified();
-        let mut model = TransformerModel::new(config.clone(), pipeline);
-        model.load_weights(&gguf).unwrap();
+        let model = build_model(&config, &gguf);
 
         let tokenizer = if let Some(path) = args.tokenizer.as_ref() {
             let tok = Tokenizer::from_file(Path::new(path)).unwrap();
@@ -274,7 +286,7 @@ async fn run_server(args: ServeArgs) {
             batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len, args.max_batch_size);
         let traces = trace_store::TraceStore::new(args.max_traces);
         let state = AppState {
-            model: Arc::new(model),
+            model,
             tokenizer,
             model_id: model_p.display().to_string(),
             scheduler: Arc::new(Mutex::new(scheduler)),
@@ -329,22 +341,19 @@ async fn run_server(args: ServeArgs) {
         (config, "oxide-serve-unloaded".to_string())
     };
 
-    #[cfg(feature = "cuda")]
-    let pipeline = KernelPipeline::cuda();
-    #[cfg(not(feature = "cuda"))]
-    let pipeline = KernelPipeline::cpu_verified();
-    let mut model = TransformerModel::new(config, pipeline);
-
-    if let Some(model_p) = model_path {
+    let model: Arc<dyn oxide_engine::InferenceModel> = if let Some(model_p) = model_path {
         if is_model_dir {
             let loader = oxide_engine::loader::SafetensorsLoader::from_dir(model_p).unwrap();
-            model.load_weights(&loader).unwrap();
             tracing::info!("Loaded model weights from {}", model_p.display());
+            build_model(&config, &loader)
         } else {
             let loader = oxide_engine::loader::SafetensorsLoader::from_file(model_p).unwrap();
-            model.load_weights(&loader).unwrap();
             tracing::info!("Loaded model weights from {}", model_p.display());
+            build_model(&config, &loader)
         }
+    } else {
+        let pipeline = KernelPipeline::cpu_verified();
+        Arc::new(TransformerModel::new(config.clone(), pipeline))
     };
 
     let tokenizer = if is_model_dir {
@@ -375,7 +384,7 @@ async fn run_server(args: ServeArgs) {
         batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len, args.max_batch_size);
     let traces = trace_store::TraceStore::new(args.max_traces);
     let state = AppState {
-        model: Arc::new(model),
+        model,
         tokenizer,
         model_id,
         scheduler: Arc::new(Mutex::new(scheduler)),

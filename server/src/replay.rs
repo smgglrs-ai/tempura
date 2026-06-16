@@ -3,7 +3,7 @@ use oxide_engine::trace::TraceLevel;
 use oxide_kernels::SamplingParams;
 use serde::{Deserialize, Serialize};
 
-use crate::ActiveModel;
+use oxide_engine::InferenceModel;
 
 #[derive(Debug, Deserialize)]
 pub struct ReplayRequest {
@@ -36,16 +36,16 @@ pub struct ReplayResult {
 }
 
 pub fn replay_from_params(
-    model: &ActiveModel,
+    model: &dyn InferenceModel,
     token_ids: &[u32],
     seed: u64,
     max_tokens: usize,
     params: &SamplingParams,
 ) -> (Vec<u32>, Vec<u32>) {
-    let mut session1 = InferenceSession::new(&model.config, TraceLevel::Off, seed);
+    let mut session1 = InferenceSession::new(model.config(), TraceLevel::Off, seed);
     let tokens1 = model.generate(&mut session1, token_ids, max_tokens, params, None);
 
-    let mut session2 = InferenceSession::new(&model.config, TraceLevel::Off, seed);
+    let mut session2 = InferenceSession::new(model.config(), TraceLevel::Off, seed);
     let tokens2 = model.generate(&mut session2, token_ids, max_tokens, params, None);
 
     (tokens1, tokens2)

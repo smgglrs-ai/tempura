@@ -48,58 +48,67 @@ pub mod kernels {
 
         let q_base = ((b * sl + s) * nh + h) * hd;
 
+        let cache_offset = kvl - sl;
+        let causal_limit = cache_offset + s;
+
         // Compute dot products and online softmax
         let mut max_score = f32::NEG_INFINITY;
         let mut kv_s = 0usize;
 
-        // First pass: find max score
+        // First pass: find max score (with causal mask)
         while kv_s < kvl {
-            let k_base = ((b * kvl + kv_s) * nkv + kv_h) * hd;
-            let mut dot = 0.0f32;
-            let mut dd = 0usize;
-            while dd < hd {
-                dot += q[q_base + dd] * k[k_base + dd];
-                dd += 1;
-            }
-            let score = dot * scale;
-            if score > max_score {
-                max_score = score;
+            if kv_s <= causal_limit {
+                let k_base = ((b * kvl + kv_s) * nkv + kv_h) * hd;
+                let mut dot = 0.0f32;
+                let mut dd = 0usize;
+                while dd < hd {
+                    dot += q[q_base + dd] * k[k_base + dd];
+                    dd += 1;
+                }
+                let score = dot * scale;
+                if score > max_score {
+                    max_score = score;
+                }
             }
             kv_s += 1;
         }
 
-        // Second pass: compute exp and sum
+        // Second pass: compute exp and sum (with causal mask)
         let mut exp_sum = 0.0f32;
         kv_s = 0;
         while kv_s < kvl {
-            let k_base = ((b * kvl + kv_s) * nkv + kv_h) * hd;
-            let mut dot = 0.0f32;
-            let mut dd = 0usize;
-            while dd < hd {
-                dot += q[q_base + dd] * k[k_base + dd];
-                dd += 1;
+            if kv_s <= causal_limit {
+                let k_base = ((b * kvl + kv_s) * nkv + kv_h) * hd;
+                let mut dot = 0.0f32;
+                let mut dd = 0usize;
+                while dd < hd {
+                    dot += q[q_base + dd] * k[k_base + dd];
+                    dd += 1;
+                }
+                let score = dot * scale;
+                exp_sum += (score - max_score).exp();
             }
-            let score = dot * scale;
-            exp_sum += (score - max_score).exp();
             kv_s += 1;
         }
 
-        // Third pass: weighted sum of values for this d
+        // Third pass: weighted sum of values for this d (with causal mask)
         let mut val = 0.0f32;
         kv_s = 0;
         while kv_s < kvl {
-            let k_base = ((b * kvl + kv_s) * nkv + kv_h) * hd;
-            let mut dot = 0.0f32;
-            let mut dd = 0usize;
-            while dd < hd {
-                dot += q[q_base + dd] * k[k_base + dd];
-                dd += 1;
-            }
-            let score = dot * scale;
-            let weight = (score - max_score).exp() / exp_sum;
+            if kv_s <= causal_limit {
+                let k_base = ((b * kvl + kv_s) * nkv + kv_h) * hd;
+                let mut dot = 0.0f32;
+                let mut dd = 0usize;
+                while dd < hd {
+                    dot += q[q_base + dd] * k[k_base + dd];
+                    dd += 1;
+                }
+                let score = dot * scale;
+                let weight = (score - max_score).exp() / exp_sum;
 
-            let v_base = ((b * kvl + kv_s) * nkv + kv_h) * hd;
-            val += weight * v[v_base + d];
+                let v_base = ((b * kvl + kv_s) * nkv + kv_h) * hd;
+                val += weight * v[v_base + d];
+            }
             kv_s += 1;
         }
 

@@ -7,6 +7,51 @@ use oxide_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
 use serde::Serialize;
 use std::time::Instant;
 
+pub trait InferenceModel: Send + Sync {
+    fn config(&self) -> &ModelConfig;
+    fn has_weights(&self) -> bool;
+    fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32>;
+    fn generate(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+    ) -> Vec<u32>;
+    fn generate_with_logprobs(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        top_n: usize,
+    ) -> (Vec<u32>, Vec<TokenLogprob>);
+    fn generate_with_callback(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Vec<u32>;
+    fn generate_guided(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        decoder: &mut dyn oxide_kernels::GuidedDecoder,
+    ) -> Vec<u32>;
+    fn load_weights(
+        &mut self,
+        loader: &dyn crate::loader::WeightLoader,
+    ) -> Result<(), crate::weights::WeightsError>;
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenLogprob {
     pub token_id: u32,
@@ -697,6 +742,88 @@ where
             rng_seed: session.seed,
             tokens_masked,
         });
+    }
+}
+
+impl<A, N, R, M, S> InferenceModel for TransformerModel<A, N, R, M, S>
+where
+    A: Attention,
+    N: RMSNorm,
+    R: RoPE,
+    M: MatMul,
+    S: Sampler,
+{
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+    fn has_weights(&self) -> bool {
+        self.weights.is_some()
+    }
+    fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
+        self.forward(session, token_ids)
+    }
+    fn generate(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+    ) -> Vec<u32> {
+        self.generate(session, token_ids, max_new_tokens, params, eos_token)
+    }
+    fn generate_with_logprobs(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        top_n: usize,
+    ) -> (Vec<u32>, Vec<TokenLogprob>) {
+        self.generate_with_logprobs(session, token_ids, max_new_tokens, params, eos_token, top_n)
+    }
+    fn generate_with_callback(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Vec<u32> {
+        self.generate_with_callback(
+            session,
+            token_ids,
+            max_new_tokens,
+            params,
+            eos_token,
+            on_token,
+        )
+    }
+    fn generate_guided(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        decoder: &mut dyn oxide_kernels::GuidedDecoder,
+    ) -> Vec<u32> {
+        self.generate_guided(
+            session,
+            token_ids,
+            max_new_tokens,
+            params,
+            eos_token,
+            decoder,
+        )
+    }
+    fn load_weights(
+        &mut self,
+        loader: &dyn crate::loader::WeightLoader,
+    ) -> Result<(), crate::weights::WeightsError> {
+        self.load_weights(loader)
     }
 }
 

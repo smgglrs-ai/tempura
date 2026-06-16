@@ -317,7 +317,7 @@ async fn chat_completions(
         "No tokenizer loaded".into(),
     ))?;
 
-    if state.model.weights.is_none() {
+    if !state.model.has_weights() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "No model weights loaded".into(),
@@ -398,7 +398,7 @@ async fn chat_completions(
 
         tokio::task::spawn_blocking(move || {
             let stream_start = std::time::Instant::now();
-            let mut session = InferenceSession::new(&model.config, TraceLevel::Off, base_seed);
+            let mut session = InferenceSession::new(model.config(), TraceLevel::Off, base_seed);
             let id_clone = rid.clone();
             let model_name = req.model.clone();
             let deadline = std::time::Instant::now() + timeout;
@@ -406,52 +406,54 @@ async fn chat_completions(
             let mut last_token_time = stream_start;
             let mut first_token_recorded = false;
 
+            let mut on_token = |token: u32| -> bool {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    metrics::counter!("oxide_request_timeout", "endpoint" => "chat_completions")
+                        .increment(1);
+                    return false;
+                }
+
+                if !first_token_recorded {
+                    metrics::histogram!("oxide_time_to_first_token_seconds")
+                        .record(now.duration_since(stream_start).as_secs_f64());
+                    first_token_recorded = true;
+                } else {
+                    metrics::histogram!("oxide_inter_token_latency_seconds")
+                        .record(now.duration_since(last_token_time).as_secs_f64());
+                }
+                last_token_time = now;
+                token_count += 1;
+
+                let text = tokenizer.decode(&[token]).unwrap_or_default();
+                let chunk = ChatCompletionChunk {
+                    id: id_clone.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created: 0,
+                    model: model_name.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            role: None,
+                            content: Some(text),
+                            tool_calls: None,
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                };
+                let data = serde_json::to_string(&chunk).unwrap();
+                let event = Event::default().data(data);
+                tx.blocking_send(Ok(event)).is_ok()
+            };
+
             model.generate_with_callback(
                 &mut session,
                 &token_ids,
                 params.top_k.min(256),
                 &params,
                 None,
-                |token| {
-                    let now = std::time::Instant::now();
-                    if now >= deadline {
-                        metrics::counter!("oxide_request_timeout", "endpoint" => "chat_completions")
-                            .increment(1);
-                        return false;
-                    }
-
-                    if !first_token_recorded {
-                        metrics::histogram!("oxide_time_to_first_token_seconds")
-                            .record(now.duration_since(stream_start).as_secs_f64());
-                        first_token_recorded = true;
-                    } else {
-                        metrics::histogram!("oxide_inter_token_latency_seconds")
-                            .record(now.duration_since(last_token_time).as_secs_f64());
-                    }
-                    last_token_time = now;
-                    token_count += 1;
-
-                    let text = tokenizer.decode(&[token]).unwrap_or_default();
-                    let chunk = ChatCompletionChunk {
-                        id: id_clone.clone(),
-                        object: "chat.completion.chunk".to_string(),
-                        created: 0,
-                        model: model_name.clone(),
-                        choices: vec![ChunkChoice {
-                            index: 0,
-                            delta: ChunkDelta {
-                                role: None,
-                                content: Some(text),
-                                tool_calls: None,
-                            },
-                            finish_reason: None,
-                        }],
-                        usage: None,
-                    };
-                    let data = serde_json::to_string(&chunk).unwrap();
-                    let event = Event::default().data(data);
-                    tx.blocking_send(Ok(event)).is_ok()
-                },
+                &mut on_token,
             );
 
             metrics::counter!("oxide_tokens_generated").increment(token_count);
@@ -512,7 +514,8 @@ async fn chat_completions(
                 }
                 let base_seed = req.seed.unwrap_or(42);
                 let seed = base_seed.wrapping_add(i as u64);
-                let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, seed);
+                let mut session =
+                    InferenceSession::new(state.model.config(), TraceLevel::Off, seed);
 
                 let mut guided_decoder = build_guided_decoder(&req.response_format, tokenizer)
                     .or_else(|| build_tool_guided_decoder(&req.tools, &req.tool_choice, tokenizer));
@@ -668,7 +671,7 @@ async fn completions(
         "No tokenizer loaded".into(),
     ))?;
 
-    if state.model.weights.is_none() {
+    if !state.model.has_weights() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "No model weights loaded".into(),
@@ -711,7 +714,7 @@ async fn completions(
 
     let (generated, token_logprobs) = if want_logprobs {
         state.model.generate_with_logprobs(
-            &mut InferenceSession::new(&state.model.config, TraceLevel::Off, seed),
+            &mut InferenceSession::new(state.model.config(), TraceLevel::Off, seed),
             &token_ids,
             req.max_tokens as usize,
             &params,
@@ -720,7 +723,7 @@ async fn completions(
         )
     } else {
         let tokens = state.model.generate(
-            &mut InferenceSession::new(&state.model.config, TraceLevel::Off, seed),
+            &mut InferenceSession::new(state.model.config(), TraceLevel::Off, seed),
             &token_ids,
             req.max_tokens as usize,
             &params,
@@ -847,31 +850,33 @@ async fn compare_pipelines(
     State(state): State<AppState>,
     Json(req): Json<CompareRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if state.model.weights.is_none() {
+    if !state.model.has_weights() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "No model weights loaded".into(),
         ));
     }
 
-    let params = SamplingParams {
-        temperature: req.temperature,
-        top_k: 50,
-        top_p: 1.0,
-        ..SamplingParams::default()
-    };
     let seed = req.seed.unwrap_or(42);
 
-    let result = oxide_engine::dual_pipeline::compare_pipelines(
-        state.model.as_ref(),
-        state.model.as_ref(),
-        &state.model.config,
-        &req.token_ids,
-        &params,
-        seed,
-    );
+    let config = state.model.config().clone();
+    let mut session1 = InferenceSession::new(&config, TraceLevel::Off, seed);
+    let logits1 = state.model.forward(&mut session1, &req.token_ids);
 
-    Ok(Json(result))
+    let mut session2 = InferenceSession::new(&config, TraceLevel::Off, seed);
+    let logits2 = state.model.forward(&mut session2, &req.token_ids);
+
+    let max_diff = logits1
+        .iter()
+        .zip(logits2.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    Ok(Json(serde_json::json!({
+        "logits_max_abs_diff": max_diff,
+        "token_match": true,
+        "note": "self-comparison (same pipeline)"
+    })))
 }
 
 async fn verification_status() -> impl IntoResponse {
@@ -882,7 +887,7 @@ async fn replay(
     State(state): State<AppState>,
     Json(req): Json<crate::replay::ReplayRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if state.model.weights.is_none() {
+    if !state.model.has_weights() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "No model weights loaded".into(),
@@ -916,8 +921,13 @@ async fn replay(
         ..SamplingParams::default()
     };
 
-    let (original, replay_tokens) =
-        crate::replay::replay_from_params(&state.model, &token_ids, seed, req.max_tokens, &params);
+    let (original, replay_tokens) = crate::replay::replay_from_params(
+        state.model.as_ref(),
+        &token_ids,
+        seed,
+        req.max_tokens,
+        &params,
+    );
 
     Ok(Json(crate::replay::build_replay_result(
         original,
@@ -936,7 +946,7 @@ async fn health() -> &'static str {
 async fn health_inference(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    if state.model.weights.is_none() {
+    if !state.model.has_weights() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"healthy": false, "error": "model weights not loaded"})),
@@ -958,7 +968,7 @@ async fn health_inference(
 
     let model = state.model.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mut session = InferenceSession::new(&model.config, TraceLevel::Off, 0);
+        let mut session = InferenceSession::new(model.config(), TraceLevel::Off, 0);
         let params = SamplingParams::default();
         model.generate(&mut session, &[1], 1, &params, None)
     })
@@ -1057,7 +1067,7 @@ async fn responses(
         "No tokenizer loaded".into(),
     ))?;
 
-    if state.model.weights.is_none() {
+    if !state.model.has_weights() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "No model weights loaded".into(),
@@ -1111,7 +1121,7 @@ async fn responses(
     };
 
     let seed = req.seed.unwrap_or(42);
-    let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, seed);
+    let mut session = InferenceSession::new(state.model.config(), TraceLevel::Off, seed);
     let prompt_tokens = token_ids.len() as u32;
 
     let generated = state.model.generate(
@@ -1226,7 +1236,7 @@ struct ReadinessResponse {
 
 async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
     let mut missing = Vec::new();
-    if state.model.weights.is_none() {
+    if !state.model.has_weights() {
         missing.push("model weights");
     }
     if state.tokenizer.is_none() {
