@@ -546,3 +546,14 @@
   summary: "Added n parameter to ChatCompletionRequest/CompletionRequest: multiple completions per request with distinct seeds, validation (1-128), streaming+n>1 rejection"
   iteration: 3
   max_iterations: 10
+- timestamp: "2026-06-16T13:50:00Z"
+  actor: claude
+  action: loop-complete
+  summary: "Loop finished: 3 items completed (p6-logprobs, p6-stop-sequences, p6-n-completions). Exit: Remaining items are complex M/L-effort features"
+  details:
+    iterations: 3
+    max_iterations: 10
+    completed: [p6-logprobs, p6-stop-sequences, p6-n-completions]
+    exit_reason: "Remaining items are complex M/L-effort features requiring focused sessions"
+    branch: "loop/2026-06-16-5"
+    tag: "loop-run/2026-06-16-3-approve-r3"
