@@ -689,3 +689,10 @@
   summary: "Added serde alias max_completion_tokens for max_tokens on both request types"
   iteration: 4
   max_iterations: 10
+- timestamp: "2026-06-16T21:15:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p9-constrained-tool-args"
+  summary: "Wired guided decoding into tool_choice modes: build_tool_guided_decoder activates JSON grammar for required/named modes, fixed PrefixCacheTable LRU tick increment in store()"
+  iteration: 5
+  max_iterations: 10

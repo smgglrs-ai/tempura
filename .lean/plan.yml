@@ -1498,7 +1498,8 @@ items:
     quick: cargo test --package oxide-engine -- tool_call
 - id: p9-constrained-tool-args
   title: Wire guided decoding into tool_choice modes
-  status: planned
+  status: done
+  progress: 100
   priority: high
   effort: M
   depends_on:

@@ -324,6 +324,7 @@ impl PrefixCacheTable {
         if token_ids.is_empty() || cache.seq_len == 0 {
             return;
         }
+        self.tick += 1;
 
         if self.entries.len() >= self.max_entries {
             self.evict_lru();

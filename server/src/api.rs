@@ -508,7 +508,8 @@ async fn chat_completions(
                 let seed = base_seed.wrapping_add(i as u64);
                 let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, seed);
 
-                let mut guided_decoder = build_guided_decoder(&req.response_format, tokenizer);
+                let mut guided_decoder = build_guided_decoder(&req.response_format, tokenizer)
+                    .or_else(|| build_tool_guided_decoder(&req.tools, &req.tool_choice, tokenizer));
 
                 let (generated, token_logprobs) = if want_logprobs {
                     state.model.generate_with_logprobs(
@@ -950,6 +951,38 @@ fn build_guided_decoder(
         }
         _ => None,
     }
+}
+
+fn build_tool_guided_decoder(
+    tools: &Option<Vec<oxide_engine::tool_call::ToolDefinition>>,
+    tool_choice: &Option<oxide_engine::tool_call::ToolChoice>,
+    tokenizer: &oxide_engine::tokenizer::Tokenizer,
+) -> Option<Box<dyn oxide_kernels::GuidedDecoder>> {
+    let tc = tool_choice.as_ref()?;
+    let tools = tools.as_ref()?;
+    if tools.is_empty() || tc.is_none() {
+        return None;
+    }
+
+    if tc.is_required() {
+        let vocab = tokenizer.vocab_strings();
+        return Some(oxide_kernels::guided::create_json_decoder(vocab));
+    }
+
+    if let Some(func_name) = tc.specific_function() {
+        let schema = tools
+            .iter()
+            .find(|t| t.function.name == func_name)
+            .and_then(|t| t.function.parameters.as_ref())
+            .cloned()
+            .unwrap_or(serde_json::json!({"type": "object"}));
+        let vocab = tokenizer.vocab_strings();
+        return Some(oxide_kernels::guided::create_json_schema_decoder(
+            vocab, &schema,
+        ));
+    }
+
+    None
 }
 
 fn check_stop_sequences<'a>(text: &'a str, stop_sequences: &[String]) -> (&'a str, &'static str) {
