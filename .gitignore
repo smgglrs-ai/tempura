@@ -1,2 +1,3 @@
 /target
 tests-gpu/target/
+*.ll
