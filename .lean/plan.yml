@@ -578,7 +578,8 @@ items:
       supports preemption under memory pressure. Admits new prefill requests
       between decode iterations. Kani harnesses prove no-starvation and
       slot-accounting safety.
-    status: planned
+    status: done
+    progress: 100
     priority: medium
     effort: XL
     depends_on: [p4-kvcache-pool]

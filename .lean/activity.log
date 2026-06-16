@@ -380,3 +380,11 @@
   summary: "Added KvCachePool with acquire/release semantics, PoolError type, InferenceSession::with_cache()/take_cache() for pool integration, 4 new tests verifying slot isolation and backward compat"
   iteration: 2
   max_iterations: 10
+
+- timestamp: "2026-06-16T15:30:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p4-batch-scheduler"
+  summary: "Replaced stub FIFO BatchScheduler with iteration-level continuous batching: ActiveSequence tracking, slot allocation/release, preemption of lowest-priority sequences, Kani harnesses for slot accounting, 7 new tests"
+  iteration: 3
+  max_iterations: 10
