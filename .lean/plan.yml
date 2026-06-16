@@ -410,7 +410,8 @@ items:
       Elementwise kernel — no shared memory, no reductions. Validates
       the full pipeline: kernel authoring, build, launch, verify against
       CPU reference via DualPipeline.
-    status: planned
+    status: done
+    progress: 100
     priority: high
     effort: S
     depends_on: [p3-cuda-infra]

@@ -1,3 +1,5 @@
+pub mod rope_kernel;
+
 use std::sync::Arc;
 
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
@@ -31,6 +33,13 @@ pub fn to_device(stream: &CudaStream, data: &[f32]) -> Result<DeviceBuffer<f32>,
 pub fn to_host(stream: &CudaStream, buf: &DeviceBuffer<f32>) -> Result<Vec<f32>, KernelError> {
     buf.to_host_vec(stream)
         .map_err(|e| KernelError::InvalidConfig(e.to_string()))
+}
+
+pub fn to_device_u32(
+    stream: &CudaStream,
+    data: &[u32],
+) -> Result<DeviceBuffer<u32>, KernelError> {
+    DeviceBuffer::from_host(stream, data).map_err(|e| KernelError::InvalidConfig(e.to_string()))
 }
 
 pub fn to_device_mut(stream: &CudaStream, data: &[f32]) -> Result<DeviceBuffer<f32>, KernelError> {

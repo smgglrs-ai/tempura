@@ -1,0 +1,12 @@
+[package]
+name = "oxide-tests-gpu"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+oxide-kernels = { path = "../kernels", features = ["cpu", "cuda"] }
+cuda-core = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-core" }
+cuda-device = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-device" }
+cuda-host = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-host" }
