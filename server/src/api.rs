@@ -54,7 +54,7 @@ pub fn router() -> Router<AppState> {
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
-    #[serde(default = "default_max_tokens")]
+    #[serde(default = "default_max_tokens", alias = "max_completion_tokens")]
     pub max_tokens: u32,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
@@ -172,7 +172,7 @@ pub struct TopLogprobInfo {
 pub struct CompletionRequest {
     pub model: String,
     pub prompt: String,
-    #[serde(default = "default_max_tokens")]
+    #[serde(default = "default_max_tokens", alias = "max_completion_tokens")]
     pub max_tokens: u32,
     #[serde(default = "default_temperature")]
     pub temperature: f32,

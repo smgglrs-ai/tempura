@@ -682,3 +682,10 @@
   summary: "Added priority field (u8, default 5) to InferenceRequest/ActiveSequence, priority-sorted admission, priority-based preemption, new test for priority preemption"
   iteration: 3
   max_iterations: 10
+- timestamp: "2026-06-16T21:05:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p9-max-completion-tokens"
+  summary: "Added serde alias max_completion_tokens for max_tokens on both request types"
+  iteration: 4
+  max_iterations: 10

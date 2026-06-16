@@ -1455,7 +1455,8 @@ items:
     quick: cargo test --package oxide-server
 - id: p9-max-completion-tokens
   title: Support max_completion_tokens alias
-  status: planned
+  status: done
+  progress: 100
   priority: high
   effort: XS
   scope:
