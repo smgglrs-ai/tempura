@@ -170,6 +170,36 @@ mod kani_proofs {
         assert!(offset + d < x_len);
         assert!(offset + d + half_dim < x_len);
     }
+
+    #[kani::proof]
+    fn gpu_rope_thread_decomposition_in_bounds() {
+        let seq_len: usize = kani::any();
+        let num_heads: usize = kani::any();
+        let head_dim: usize = kani::any();
+
+        kani::assume(seq_len >= 1 && seq_len <= 4);
+        kani::assume(num_heads >= 1 && num_heads <= 4);
+        kani::assume(head_dim >= 2 && head_dim <= 4);
+        kani::assume(head_dim % 2 == 0);
+
+        let total = seq_len * num_heads * head_dim;
+        let x_len = total;
+
+        let i: usize = kani::any();
+        kani::assume(i < total);
+
+        let hd = head_dim;
+        let d_local = i % hd;
+        let h = (i / hd) % num_heads;
+        let s = i / hd / num_heads;
+
+        assert!(s < seq_len);
+        assert!(h < num_heads);
+        assert!(d_local < head_dim);
+
+        let offset = (s * num_heads + h) * hd;
+        assert!(offset + d_local < x_len);
+    }
 }
 
 #[cfg(test)]

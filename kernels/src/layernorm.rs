@@ -95,6 +95,22 @@ mod kani_proofs {
         assert!(start + i < x_len);
         assert!(start + hidden_size <= x_len);
     }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn layernorm_full_execution_no_panic() {
+        let hidden_size: usize = kani::any();
+        kani::assume(hidden_size >= 1 && hidden_size <= 4);
+
+        let mut x = vec![1.0f32; hidden_size];
+        let weight = vec![1.0f32; hidden_size];
+        let bias = vec![0.0f32; hidden_size];
+        let eps = 1e-6f32;
+
+        let ln = super::CpuLayerNorm;
+        let result = ln.forward(&mut x, &weight, Some(&bias), hidden_size, eps);
+        assert!(result.is_ok());
+    }
 }
 
 #[cfg(test)]

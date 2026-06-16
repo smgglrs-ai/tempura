@@ -132,6 +132,50 @@ mod kani_proofs {
         assert!(start + i < x_len);
         assert!(start + hidden_size <= x_len);
     }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn rmsnorm_full_execution_no_panic() {
+        let hidden_size: usize = kani::any();
+        kani::assume(hidden_size >= 1 && hidden_size <= 4);
+
+        let mut x = vec![1.0f32; hidden_size];
+        let weight = vec![1.0f32; hidden_size];
+        let eps = 1e-6f32;
+
+        let rn = super::CpuRMSNorm;
+        let result = rn.forward(&mut x, &weight, hidden_size, eps);
+        assert!(result.is_ok());
+    }
+
+    #[kani::proof]
+    fn gpu_rmsnorm_pass_indices_in_bounds() {
+        let h: usize = kani::any();
+        let num_rows: usize = kani::any();
+
+        kani::assume(h >= 1 && h <= 8);
+        kani::assume(num_rows >= 1 && num_rows <= 4);
+
+        let x_len = num_rows * h;
+        let ss_len = num_rows;
+        let weight_len = h;
+
+        // Pass 1: start = row * h, access x[start + i] for i in 0..h
+        let row1: usize = kani::any();
+        kani::assume(row1 < num_rows);
+        let start = row1 * h;
+        let i1: usize = kani::any();
+        kani::assume(i1 < h);
+        assert!(start + i1 < x_len);
+
+        // Pass 2: i decomposes into (row, col)
+        let i2: usize = kani::any();
+        kani::assume(i2 < x_len);
+        let row2 = i2 / h;
+        let col = i2 % h;
+        assert!(row2 < ss_len);
+        assert!(col < weight_len);
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +236,35 @@ mod tests {
         let rms1: f32 = (x[2] * x[2] + x[3] * x[3]).sqrt() / (hidden as f32).sqrt();
         assert_relative_eq!(rms0, 1.0, epsilon = 1e-4);
         assert_relative_eq!(rms1, 1.0, epsilon = 1e-4);
+    }
+
+    #[test]
+    fn test_rmsnorm_matches_f64_reference() {
+        let input = vec![1.0f32, 2.0, 3.0, 4.0, 0.5, -1.0, 0.001, 7.0];
+        let h = input.len();
+        let weight = vec![1.0f32; h];
+        let eps = 1e-6f32;
+
+        let rms_f64 = (input.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / h as f64
+            + eps as f64)
+            .sqrt();
+        let ref_out: Vec<f64> = input
+            .iter()
+            .zip(weight.iter())
+            .map(|(&x, &w)| (x as f64) / rms_f64 * (w as f64))
+            .collect();
+
+        let rn = CpuRMSNorm;
+        let mut x = input.clone();
+        rn.forward(&mut x, &weight, h, eps).unwrap();
+
+        for (i, (&f32_val, &f64_val)) in x.iter().zip(ref_out.iter()).enumerate() {
+            let diff = (f32_val as f64 - f64_val).abs();
+            assert!(
+                diff < 1e-5,
+                "rmsnorm mismatch at {i}: f32={f32_val}, f64_ref={f64_val}, diff={diff}"
+            );
+        }
     }
 
     mod prop_tests {

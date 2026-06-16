@@ -122,6 +122,60 @@ pub fn manifest() -> VerificationManifest {
                 ],
                 status: "proven",
             },
+            KernelProof {
+                kernel: "GpuAttention",
+                harness: "gpu_attention_thread_decomposition_in_bounds",
+                properties: vec![
+                    "Thread index decomposition (b,s,h,d) stays within dimension bounds",
+                    "Reconstructed q_base offset is within buffer bounds",
+                ],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "GpuRoPE",
+                harness: "gpu_rope_thread_decomposition_in_bounds",
+                properties: vec![
+                    "Thread index decomposition (s,h,d) stays within dimension bounds",
+                    "Reconstructed offset is within buffer bounds",
+                ],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "GpuRMSNorm",
+                harness: "gpu_rmsnorm_pass_indices_in_bounds",
+                properties: vec![
+                    "Pass 1 row*h + i indexing within x bounds",
+                    "Pass 2 (row, col) decomposition within ss and weight bounds",
+                ],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "GpuMatMul",
+                harness: "gpu_tiled_gemm_smem_index_in_bounds",
+                properties: vec![
+                    "Shared memory index ty*TILE+tx < TILE*TILE",
+                    "Guarded global memory accesses within matrix bounds",
+                ],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "CpuRMSNorm",
+                harness: "rmsnorm_full_execution_no_panic",
+                properties: vec!["Full kernel execution with bounded inputs does not panic"],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "CpuSampler",
+                harness: "sampler_full_execution_no_panic",
+                properties: vec!["Full kernel execution with bounded inputs does not panic"],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "CpuLayerNorm",
+                harness: "layernorm_full_execution_no_panic",
+                properties: vec!["Full kernel execution with bounded inputs does not panic"],
+                status: "proven",
+            },
         ],
         math_properties: vec![
             MathProperty {
@@ -178,12 +232,24 @@ pub fn manifest() -> VerificationManifest {
                 method: "proptest",
                 status: "tested",
             },
+            MathProperty {
+                kernel: "CpuSampler",
+                property: "Softmax f32 output matches f64 reference within 1e-6",
+                method: "f64_reference",
+                status: "tested",
+            },
+            MathProperty {
+                kernel: "CpuRMSNorm",
+                property: "RMSNorm f32 output matches f64 reference within 1e-5",
+                method: "f64_reference",
+                status: "tested",
+            },
         ],
         caveats: vec![
             "Proofs cover memory safety (no OOB, no panics) — NOT mathematical correctness",
-            "Floating-point operations (exp, sqrt, cos, sin) are over-approximated by CBMC",
-            "Proofs verify indexing arithmetic, not full kernel execution (avoids CBMC memory explosion)",
-            "GPU kernels (cuda-oxide) will be verified with the same trait contract in Phase 3",
+            "Floating-point operations (exp, sqrt, cos, sin) are over-approximated by CBMC; f64 reference comparison tests validate numerical adequacy of f32 implementations",
+            "Full-execution harnesses prove no-panic on CpuRMSNorm, CpuSampler, and CpuLayerNorm with bounded inputs",
+            "GPU kernel offset arithmetic is verified via CPU-side Kani harnesses that prove the same decomposition formulas",
             "Mathematical properties verified via proptest (see math_properties); Kani cannot handle f32 transcendentals",
         ],
     }

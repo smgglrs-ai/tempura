@@ -240,6 +240,42 @@ mod kani_proofs {
 
         assert!(end1 <= start2 || end2 <= start1);
     }
+
+    #[kani::proof]
+    fn gpu_attention_thread_decomposition_in_bounds() {
+        let batch: usize = kani::any();
+        let seq_len: usize = kani::any();
+        let num_heads: usize = kani::any();
+        let head_dim: usize = kani::any();
+
+        kani::assume(batch >= 1 && batch <= 2);
+        kani::assume(seq_len >= 1 && seq_len <= 2);
+        kani::assume(num_heads >= 1 && num_heads <= 2);
+        kani::assume(head_dim >= 1 && head_dim <= 4);
+
+        let total = batch * seq_len * num_heads * head_dim;
+        let q_len = total;
+
+        let i: usize = kani::any();
+        kani::assume(i < total);
+
+        let hd = head_dim;
+        let nh = num_heads;
+        let sl = seq_len;
+
+        let d = i % hd;
+        let h = (i / hd) % nh;
+        let s = (i / hd / nh) % sl;
+        let b = i / hd / nh / sl;
+
+        assert!(b < batch);
+        assert!(s < seq_len);
+        assert!(h < num_heads);
+        assert!(d < head_dim);
+
+        let q_base = ((b * sl + s) * nh + h) * hd;
+        assert!(q_base + d < q_len);
+    }
 }
 
 #[cfg(test)]

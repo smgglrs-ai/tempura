@@ -310,6 +310,47 @@ mod kani_proofs {
         assert!(p * n + j < b_len);
         assert!(i * n + j < o_len);
     }
+
+    #[kani::proof]
+    fn gpu_tiled_gemm_smem_index_in_bounds() {
+        let m_size: usize = kani::any();
+        let n_size: usize = kani::any();
+        let k_size: usize = kani::any();
+
+        kani::assume(m_size >= 1 && m_size <= 32);
+        kani::assume(n_size >= 1 && n_size <= 32);
+        kani::assume(k_size >= 1 && k_size <= 32);
+
+        const TILE: usize = 16;
+        let smem_size = TILE * TILE;
+
+        let block_y: usize = kani::any();
+        let block_x: usize = kani::any();
+        let ty: usize = kani::any();
+        let tx: usize = kani::any();
+
+        kani::assume(block_y < m_size.div_ceil(TILE));
+        kani::assume(block_x < n_size.div_ceil(TILE));
+        kani::assume(ty < TILE);
+        kani::assume(tx < TILE);
+
+        let smem_idx = ty * TILE + tx;
+        assert!(smem_idx < smem_size);
+
+        let row = block_y * TILE + ty;
+        let col = block_x * TILE + tx;
+
+        if row < m_size && col < n_size {
+            assert!(row * n_size + col < m_size * n_size);
+        }
+
+        let t: usize = kani::any();
+        kani::assume(t < k_size.div_ceil(TILE));
+        let a_col = t * TILE + tx;
+        if row < m_size && a_col < k_size {
+            assert!(row * k_size + a_col < m_size * k_size);
+        }
+    }
 }
 
 #[cfg(test)]

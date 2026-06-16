@@ -189,6 +189,26 @@ mod kani_proofs {
     }
 
     #[kani::proof]
+    #[kani::unwind(17)]
+    fn sampler_full_execution_no_panic() {
+        let vocab_size: usize = kani::any();
+        kani::assume(vocab_size >= 2 && vocab_size <= 8);
+
+        let logits = vec![1.0f32; vocab_size];
+        let mut output = vec![0.0f32; vocab_size];
+        let params = super::SamplingParams {
+            temperature: 1.0,
+            top_k: vocab_size,
+            top_p: 1.0,
+            ..super::SamplingParams::default()
+        };
+
+        let sampler = super::CpuSampler;
+        let result = sampler.apply(&logits, &mut output, &params);
+        assert!(result.is_ok());
+    }
+
+    #[kani::proof]
     fn sample_token_cumsum_terminates() {
         let n: usize = kani::any();
         kani::assume(n >= 1 && n <= 8);
@@ -332,6 +352,35 @@ mod tests {
         let params = SamplingParams::default();
         params.apply_penalties(&mut logits, &[0, 1, 2]);
         assert_eq!(logits, original);
+    }
+
+    #[test]
+    fn test_softmax_matches_f64_reference() {
+        let logits: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 100.0, -100.0, 0.001];
+
+        let logits_f64: Vec<f64> = logits.iter().map(|&x| x as f64).collect();
+        let max_val = logits_f64.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let exp_sum: f64 = logits_f64.iter().map(|x| (x - max_val).exp()).sum();
+        let ref_probs: Vec<f64> = logits_f64
+            .iter()
+            .map(|x| (x - max_val).exp() / exp_sum)
+            .collect();
+
+        let sampler = CpuSampler;
+        let mut output = vec![0.0f32; logits.len()];
+        let params = SamplingParams {
+            top_k: logits.len(),
+            ..SamplingParams::default()
+        };
+        sampler.apply(&logits, &mut output, &params).unwrap();
+
+        for (i, (&f32_val, &f64_val)) in output.iter().zip(ref_probs.iter()).enumerate() {
+            let diff = (f32_val as f64 - f64_val).abs();
+            assert!(
+                diff < 1e-6,
+                "softmax mismatch at {i}: f32={f32_val}, f64_ref={f64_val}, diff={diff}"
+            );
+        }
     }
 
     mod prop_tests {
