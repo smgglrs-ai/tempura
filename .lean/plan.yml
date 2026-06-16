@@ -847,7 +847,8 @@ items:
     quick: cargo test --package oxide-engine
 - id: p6-sampling-penalties
   title: Presence and frequency penalties
-  status: planned
+  status: done
+  progress: 100
   priority: high
   effort: M
   scope:

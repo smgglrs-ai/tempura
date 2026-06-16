@@ -45,6 +45,10 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -80,6 +84,10 @@ pub struct CompletionRequest {
     pub temperature: f32,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -157,6 +165,8 @@ async fn chat_completions(
         temperature: req.temperature,
         top_k: 50,
         top_p: req.top_p.unwrap_or(1.0),
+        presence_penalty: req.presence_penalty.unwrap_or(0.0),
+        frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
     };
 
     if req.stream {
@@ -279,6 +289,8 @@ async fn completions(
         temperature: req.temperature,
         top_k: 50,
         top_p: 1.0,
+        presence_penalty: req.presence_penalty.unwrap_or(0.0),
+        frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
     };
 
     let start = std::time::Instant::now();
@@ -385,6 +397,7 @@ async fn compare_pipelines(
         temperature: req.temperature,
         top_k: 50,
         top_p: 1.0,
+        ..SamplingParams::default()
     };
     let seed = req.seed.unwrap_or(42);
 
@@ -440,6 +453,7 @@ async fn replay(
         temperature: req.temperature,
         top_k: req.top_k.unwrap_or(50),
         top_p: req.top_p.unwrap_or(1.0),
+        ..SamplingParams::default()
     };
 
     let (original, replay_tokens) =

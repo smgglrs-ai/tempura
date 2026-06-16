@@ -5,6 +5,8 @@ pub struct SamplingParams {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
 }
 
 impl Default for SamplingParams {
@@ -13,6 +15,28 @@ impl Default for SamplingParams {
             temperature: 1.0,
             top_k: 50,
             top_p: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+        }
+    }
+}
+
+impl SamplingParams {
+    pub fn apply_penalties(&self, logits: &mut [f32], prior_tokens: &[u32]) {
+        if self.presence_penalty == 0.0 && self.frequency_penalty == 0.0 {
+            return;
+        }
+
+        let mut counts = std::collections::HashMap::new();
+        for &tok in prior_tokens {
+            *counts.entry(tok).or_insert(0u32) += 1;
+        }
+
+        for (&tok, &count) in &counts {
+            if (tok as usize) < logits.len() {
+                logits[tok as usize] -=
+                    self.frequency_penalty * count as f32 + self.presence_penalty;
+            }
         }
     }
 }
@@ -192,6 +216,7 @@ mod tests {
                     temperature: 0.01,
                     top_k: 4,
                     top_p: 1.0,
+                    ..SamplingParams::default()
                 },
             )
             .unwrap();
@@ -269,5 +294,43 @@ mod tests {
         }
 
         assert_ne!(results1, results2);
+    }
+
+    #[test]
+    fn test_presence_penalty_suppresses_seen_tokens() {
+        let mut logits = vec![5.0, 5.0, 5.0, 5.0];
+        let params = SamplingParams {
+            presence_penalty: 2.0,
+            ..SamplingParams::default()
+        };
+        params.apply_penalties(&mut logits, &[0, 2]);
+        assert!(logits[0] < 5.0);
+        assert_eq!(logits[1], 5.0);
+        assert!(logits[2] < 5.0);
+        assert_eq!(logits[3], 5.0);
+    }
+
+    #[test]
+    fn test_frequency_penalty_proportional() {
+        let mut logits = vec![5.0, 5.0, 5.0, 5.0];
+        let params = SamplingParams {
+            frequency_penalty: 1.0,
+            ..SamplingParams::default()
+        };
+        params.apply_penalties(&mut logits, &[0, 0, 0, 2]);
+        // token 0 appeared 3x, token 2 appeared 1x
+        assert!((logits[0] - 2.0).abs() < 1e-5);
+        assert_eq!(logits[1], 5.0);
+        assert!((logits[2] - 4.0).abs() < 1e-5);
+        assert_eq!(logits[3], 5.0);
+    }
+
+    #[test]
+    fn test_zero_penalties_no_change() {
+        let mut logits = vec![1.0, 2.0, 3.0];
+        let original = logits.clone();
+        let params = SamplingParams::default();
+        params.apply_penalties(&mut logits, &[0, 1, 2]);
+        assert_eq!(logits, original);
     }
 }

@@ -351,6 +351,7 @@ mod tests {
             temperature: 0.0,
             top_k: 50,
             top_p: 1.0,
+            ..SamplingParams::default()
         };
 
         let mut target_session = InferenceSession::new(&config, TraceLevel::Off, 42);
@@ -378,6 +379,7 @@ mod tests {
             temperature: 0.0,
             top_k: 50,
             top_p: 1.0,
+            ..SamplingParams::default()
         };
 
         let mut target_session = InferenceSession::new(&config, TraceLevel::Summary, 42);

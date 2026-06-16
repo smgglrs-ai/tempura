@@ -301,7 +301,8 @@ where
                 break;
             }
 
-            let logits = self.forward(session, &[*generated.last().unwrap()]);
+            let mut logits = self.forward(session, &[*generated.last().unwrap()]);
+            params.apply_penalties(&mut logits, &generated);
             let mut probs = vec![0.0f32; logits.len()];
             self.pipeline
                 .sampler
@@ -387,7 +388,8 @@ where
                 break;
             }
 
-            let logits = self.forward(session, &[*generated.last().unwrap()]);
+            let mut logits = self.forward(session, &[*generated.last().unwrap()]);
+            params.apply_penalties(&mut logits, &generated);
             let mut probs = vec![0.0f32; logits.len()];
             self.pipeline
                 .sampler
@@ -592,6 +594,7 @@ mod tests {
             temperature: 1.0,
             top_k: 50,
             top_p: 1.0,
+            ..SamplingParams::default()
         };
         let tokens = model.generate(&mut session, &[1, 2, 3], 5, &params, None);
 
@@ -613,6 +616,7 @@ mod tests {
             temperature: 1.0,
             top_k: 50,
             top_p: 1.0,
+            ..SamplingParams::default()
         };
         let tokens = model.generate(
             &mut session,
@@ -643,6 +647,7 @@ mod tests {
                     temperature: 1.0,
                     top_k: 50,
                     top_p: 1.0,
+                    ..SamplingParams::default()
                 },
             )
             .unwrap();
@@ -660,6 +665,7 @@ mod tests {
             temperature: 1.0,
             top_k: 50,
             top_p: 1.0,
+            ..SamplingParams::default()
         };
 
         let pipeline1 = KernelPipeline::cpu_verified();
@@ -690,6 +696,7 @@ mod tests {
             temperature: 1.0,
             top_k: 50,
             top_p: 1.0,
+            ..SamplingParams::default()
         };
         let tokens = model.generate(&mut session, &[1], 3, &params, None);
 
@@ -715,6 +722,7 @@ mod tests {
             temperature: 1.0,
             top_k: 50,
             top_p: 1.0,
+            ..SamplingParams::default()
         };
         let _tokens = model.generate(&mut session, &[1, 2, 3], 5, &params, None);
 

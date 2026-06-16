@@ -507,3 +507,10 @@
   summary: "Added timing instrumentation to generate/generate_with_callback (TimingInfo) and per-layer duration in forward pass, 2 new tests"
   iteration: 4
   max_iterations: 10
+- timestamp: "2026-06-16T12:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p6-sampling-penalties"
+  summary: "Added presence_penalty/frequency_penalty to SamplingParams with apply_penalties method, wired into generate loops and API request types, 3 new tests"
+  iteration: 5
+  max_iterations: 10
