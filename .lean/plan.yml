@@ -1035,7 +1035,8 @@ items:
     quick: cargo test --package oxide-server
 - id: p7-request-timeouts
   title: Per-request timeouts
-  status: planned
+  status: done
+  progress: 100
   priority: high
   effort: M
   scope:

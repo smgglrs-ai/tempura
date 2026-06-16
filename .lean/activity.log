@@ -578,3 +578,10 @@
   summary: "Added structured output / JSON mode: GuidedDecoder trait, JSON state machine with character-level grammar validation, generate_guided method, response_format API field, trace tokens_masked, 8 new tests"
   iteration: 3
   max_iterations: 10
+- timestamp: "2026-06-16T17:30:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p7-request-timeouts"
+  summary: "Added per-request timeouts: --request-timeout-secs CLI flag (default 300), timeout_secs request field override, 504 on timeout, oxide_request_timeout counter metric, streaming deadline check in on_token callback"
+  iteration: 4
+  max_iterations: 10

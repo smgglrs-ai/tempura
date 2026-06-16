@@ -76,6 +76,8 @@ pub struct ChatCompletionRequest {
     pub n: u32,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -162,6 +164,8 @@ pub struct CompletionRequest {
     pub n: u32,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -252,6 +256,13 @@ async fn release_slot(state: &AppState, request_id: &str) {
     record_scheduler_gauges(&scheduler);
 }
 
+fn resolve_timeout(state: &AppState, timeout_secs: Option<u64>) -> std::time::Duration {
+    match timeout_secs {
+        Some(secs) => std::time::Duration::from_secs(secs),
+        None => state.request_timeout,
+    }
+}
+
 fn record_scheduler_gauges(scheduler: &crate::batch::BatchScheduler) {
     metrics::gauge!("oxide_scheduler_active_sequences").set(scheduler.active_count() as f64);
     metrics::gauge!("oxide_scheduler_queue_depth")
@@ -330,6 +341,8 @@ async fn chat_completions(
     )
     .await?;
 
+    let timeout = resolve_timeout(&state, req.timeout_secs);
+
     if req.stream {
         let model = state.model.clone();
         let tokenizer = tokenizer.clone();
@@ -342,6 +355,7 @@ async fn chat_completions(
             let mut session = InferenceSession::new(&model.config, TraceLevel::Off, 42);
             let id_clone = rid.clone();
             let model_name = req.model.clone();
+            let deadline = std::time::Instant::now() + timeout;
 
             model.generate_with_callback(
                 &mut session,
@@ -350,6 +364,11 @@ async fn chat_completions(
                 &params,
                 None,
                 |token| {
+                    if std::time::Instant::now() >= deadline {
+                        metrics::counter!("oxide_request_timeout", "endpoint" => "chat_completions")
+                            .increment(1);
+                        return false;
+                    }
                     let text = tokenizer.decode(&[token]).unwrap_or_default();
                     let chunk = ChatCompletionChunk {
                         id: id_clone.clone(),
@@ -389,6 +408,7 @@ async fn chat_completions(
             .into_response())
     } else {
         let start = std::time::Instant::now();
+        let deadline = start + timeout;
         metrics::counter!("oxide_request_count", "endpoint" => "chat_completions").increment(1);
 
         let want_logprobs = req.logprobs.unwrap_or(false);
@@ -401,6 +421,11 @@ async fn chat_completions(
 
         let result = (|| -> Result<(), (StatusCode, String)> {
             for i in 0..req.n {
+                if std::time::Instant::now() >= deadline {
+                    metrics::counter!("oxide_request_timeout", "endpoint" => "chat_completions")
+                        .increment(1);
+                    return Err((StatusCode::GATEWAY_TIMEOUT, "Request timed out".into()));
+                }
                 let seed = 42u64.wrapping_add(i as u64);
                 let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, seed);
 
@@ -531,6 +556,8 @@ async fn completions(
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
 
+    let timeout = resolve_timeout(&state, req.timeout_secs);
+
     acquire_slot(
         &state,
         &request_id,
@@ -567,8 +594,13 @@ async fn completions(
         (tokens, Vec::new())
     };
 
+    if start.elapsed() >= timeout {
+        release_slot(&state, &request_id).await;
+        metrics::counter!("oxide_request_timeout", "endpoint" => "completions").increment(1);
+        return Err((StatusCode::GATEWAY_TIMEOUT, "Request timed out".into()));
+    }
+
     let full_text = tokenizer.decode(&generated).map_err(|e| {
-        // Release slot before returning error
         let state = state.clone();
         let rid = request_id.clone();
         tokio::task::spawn(async move { release_slot(&state, &rid).await });
@@ -866,6 +898,7 @@ mod tests {
                 crate::trace_store::TraceStore::new(10),
             )),
             metrics_handle,
+            request_timeout: std::time::Duration::from_secs(300),
         }
     }
 
@@ -960,6 +993,7 @@ mod tests {
                 crate::trace_store::TraceStore::new(10),
             )),
             metrics_handle,
+            request_timeout: std::time::Duration::from_secs(300),
         };
 
         // First request acquires the only slot

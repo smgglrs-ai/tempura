@@ -53,6 +53,13 @@ struct Args {
         help = "Graceful shutdown timeout in seconds"
     )]
     shutdown_timeout: u64,
+
+    #[arg(
+        long,
+        default_value_t = 300,
+        help = "Default request timeout in seconds"
+    )]
+    request_timeout_secs: u64,
 }
 
 pub type CpuModel = TransformerModel<
@@ -71,6 +78,7 @@ pub struct AppState {
     pub scheduler: Arc<Mutex<batch::BatchScheduler>>,
     pub trace_store: Arc<Mutex<trace_store::TraceStore>>,
     pub metrics_handle: PrometheusHandle,
+    pub request_timeout: std::time::Duration,
 }
 
 #[tokio::main]
@@ -167,6 +175,7 @@ async fn main() {
         scheduler: Arc::new(Mutex::new(scheduler)),
         trace_store: Arc::new(Mutex::new(traces)),
         metrics_handle,
+        request_timeout: std::time::Duration::from_secs(args.request_timeout_secs),
     };
 
     let app = api::router()
