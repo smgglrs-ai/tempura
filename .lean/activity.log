@@ -447,3 +447,10 @@
   summary: "Removed unused InferenceResult/FinishReason from batch.rs, removed false #[allow(dead_code)] from KvCache"
   iteration: 2
   max_iterations: 10
+- timestamp: "2026-06-16T10:10:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "auto-test-config"
+  summary: "Added 6 unit tests for ModelConfig presets and QuantConfig factories in engine/src/config.rs"
+  iteration: 3
+  max_iterations: 10

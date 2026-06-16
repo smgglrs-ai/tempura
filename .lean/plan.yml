@@ -1333,7 +1333,8 @@ items:
     quick: cargo build --workspace && cargo test --workspace
 - id: auto-test-config
   title: Add unit tests for ModelConfig and QuantConfig
-  status: planned
+  status: done
+  progress: 100
   priority: high
   effort: S
   scope:

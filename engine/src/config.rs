@@ -111,3 +111,83 @@ impl ModelConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_head_dim_consistent(config: &ModelConfig) {
+        assert_eq!(
+            config.head_dim,
+            config.hidden_size / config.num_attention_heads
+        );
+    }
+
+    fn assert_kv_heads_valid(config: &ModelConfig) {
+        assert!(config.num_kv_heads <= config.num_attention_heads);
+        assert_eq!(config.num_attention_heads % config.num_kv_heads, 0);
+    }
+
+    #[test]
+    fn test_llama2_7b_preset() {
+        let c = ModelConfig::llama2_7b();
+        assert_eq!(c.hidden_size, 4096);
+        assert_eq!(c.num_attention_heads, 32);
+        assert_eq!(c.num_kv_heads, 32);
+        assert_eq!(c.num_layers, 32);
+        assert_eq!(c.vocab_size, 32000);
+        assert_head_dim_consistent(&c);
+        assert_kv_heads_valid(&c);
+        assert!(c.quantization.is_none());
+    }
+
+    #[test]
+    fn test_micro_llama_preset() {
+        let c = ModelConfig::micro_llama();
+        assert_eq!(c.hidden_size, 1024);
+        assert_eq!(c.num_attention_heads, 16);
+        assert_eq!(c.num_kv_heads, 4);
+        assert_eq!(c.num_layers, 12);
+        assert_head_dim_consistent(&c);
+        assert_kv_heads_valid(&c);
+    }
+
+    #[test]
+    fn test_tiny_test_preset() {
+        let c = ModelConfig::tiny_test();
+        assert_eq!(c.hidden_size, 64);
+        assert_eq!(c.num_attention_heads, 4);
+        assert_eq!(c.num_kv_heads, 4);
+        assert_eq!(c.num_layers, 2);
+        assert_eq!(c.vocab_size, 256);
+        assert_head_dim_consistent(&c);
+        assert_kv_heads_valid(&c);
+    }
+
+    #[test]
+    fn test_quant_config_gptq() {
+        let q = QuantConfig::gptq(4, 128);
+        assert_eq!(q.format, QuantFormat::Gptq);
+        assert_eq!(q.bits, 4);
+        assert_eq!(q.group_size, 128);
+        assert!(q.symmetric);
+    }
+
+    #[test]
+    fn test_quant_config_awq() {
+        let q = QuantConfig::awq(4, 128);
+        assert_eq!(q.format, QuantFormat::Awq);
+        assert_eq!(q.bits, 4);
+        assert_eq!(q.group_size, 128);
+        assert!(!q.symmetric);
+    }
+
+    #[test]
+    fn test_quant_config_gguf() {
+        let q = QuantConfig::gguf(4);
+        assert_eq!(q.format, QuantFormat::Gguf);
+        assert_eq!(q.bits, 4);
+        assert_eq!(q.group_size, 32);
+        assert!(q.symmetric);
+    }
+}
