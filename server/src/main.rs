@@ -122,11 +122,22 @@ async fn main() {
         let mut model = TransformerModel::new(config.clone(), pipeline);
         model.load_weights(&gguf).unwrap();
 
-        let tokenizer = args.tokenizer.as_ref().map(|path| {
+        let tokenizer = if let Some(path) = args.tokenizer.as_ref() {
             let tok = Tokenizer::from_file(Path::new(path)).unwrap();
             tracing::info!("Loaded tokenizer from {}", path);
-            Arc::new(tok)
-        });
+            Some(Arc::new(tok))
+        } else {
+            match Tokenizer::from_gguf_metadata(&gguf.metadata) {
+                Ok(tok) => {
+                    tracing::info!("Extracted tokenizer from GGUF metadata");
+                    Some(Arc::new(tok))
+                }
+                Err(e) => {
+                    tracing::warn!("Could not extract tokenizer from GGUF metadata: {e}");
+                    None
+                }
+            }
+        };
 
         let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let metrics_handle = prometheus_builder.install_recorder().unwrap();

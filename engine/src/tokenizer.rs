@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use minijinja::{context, Environment};
 use serde::Deserialize;
+
+use crate::gguf_loader::GgufValue;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TokenizerError {
@@ -130,6 +133,70 @@ impl Tokenizer {
         } else {
             ChatTemplate::chatml()
         };
+
+        Ok(Self {
+            inner,
+            chat_template,
+        })
+    }
+
+    pub fn from_gguf_metadata(
+        metadata: &HashMap<String, GgufValue>,
+    ) -> Result<Self, TokenizerError> {
+        let tokens = metadata
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| v.as_string_array())
+            .ok_or_else(|| {
+                TokenizerError::Load("missing tokenizer.ggml.tokens in GGUF metadata".into())
+            })?;
+
+        if tokens.is_empty() {
+            return Err(TokenizerError::Load(
+                "empty token list in GGUF metadata".into(),
+            ));
+        }
+
+        let merges = metadata
+            .get("tokenizer.ggml.merges")
+            .and_then(|v| v.as_string_array());
+
+        let mut vocab = tokenizers::models::bpe::Vocab::new();
+        for (id, token) in tokens.iter().enumerate() {
+            vocab.insert((*token).to_string(), id as u32);
+        }
+
+        let merge_pairs: tokenizers::models::bpe::Merges = merges
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| {
+                let (a, b) = m.split_once(' ')?;
+                Some((a.to_string(), b.to_string()))
+            })
+            .collect();
+
+        let bpe = tokenizers::models::bpe::BPE::builder()
+            .vocab_and_merges(vocab, merge_pairs)
+            .byte_fallback(true)
+            .build()
+            .map_err(|e| TokenizerError::Load(format!("failed to build BPE from GGUF: {e}")))?;
+
+        let inner = tokenizers::Tokenizer::new(bpe);
+
+        let bos_token = metadata
+            .get("tokenizer.ggml.bos_token_id")
+            .and_then(|v| v.as_u32())
+            .and_then(|id| tokens.get(id as usize))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let eos_token = metadata
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(|v| v.as_u32())
+            .and_then(|id| tokens.get(id as usize))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let chat_template = ChatTemplate::new(CHATML_TEMPLATE.to_string(), bos_token, eos_token);
 
         Ok(Self {
             inner,
@@ -307,5 +374,67 @@ mod tests {
         }];
         let result = tmpl.apply(&messages, false).unwrap();
         assert_eq!(result, "<s>test</s>");
+    }
+
+    #[test]
+    fn test_from_gguf_metadata_basic() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            GgufValue::Array(vec![
+                GgufValue::String("hello".to_string()),
+                GgufValue::String("world".to_string()),
+                GgufValue::String("<s>".to_string()),
+                GgufValue::String("</s>".to_string()),
+            ]),
+        );
+        metadata.insert("tokenizer.ggml.bos_token_id".to_string(), GgufValue::U32(2));
+        metadata.insert("tokenizer.ggml.eos_token_id".to_string(), GgufValue::U32(3));
+
+        let tok = Tokenizer::from_gguf_metadata(&metadata).unwrap();
+        assert_eq!(tok.vocab_size(), 4);
+    }
+
+    #[test]
+    fn test_from_gguf_metadata_with_merges() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            GgufValue::Array(vec![
+                GgufValue::String("h".to_string()),
+                GgufValue::String("e".to_string()),
+                GgufValue::String("l".to_string()),
+                GgufValue::String("o".to_string()),
+                GgufValue::String("he".to_string()),
+            ]),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".to_string(),
+            GgufValue::Array(vec![GgufValue::String("h e".to_string())]),
+        );
+
+        let tok = Tokenizer::from_gguf_metadata(&metadata).unwrap();
+        assert_eq!(tok.vocab_size(), 5);
+
+        let ids = tok.encode("he").unwrap();
+        assert_eq!(ids, vec![4]);
+    }
+
+    #[test]
+    fn test_from_gguf_metadata_missing_tokens() {
+        let metadata = HashMap::new();
+        let result = Tokenizer::from_gguf_metadata(&metadata);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_gguf_metadata_empty_tokens() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            GgufValue::Array(vec![]),
+        );
+        let result = Tokenizer::from_gguf_metadata(&metadata);
+        assert!(result.is_err());
     }
 }

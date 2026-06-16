@@ -423,8 +423,181 @@ fn dequant_q6k(data: &[u8], num_elements: usize) -> Vec<f32> {
     output
 }
 
-fn dequant_fallback(num_elements: usize) -> Vec<f32> {
-    vec![0.0f32; num_elements]
+fn dequant_q5_1(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 32;
+    let block_size = 24; // 2 bytes scale + 2 bytes min + 4 bytes high-bits + 16 bytes low nibbles
+    let mut output = Vec::with_capacity(num_elements);
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let scale = f16_to_f32(u16::from_le_bytes([data[bs], data[bs + 1]]));
+        let min = f16_to_f32(u16::from_le_bytes([data[bs + 2], data[bs + 3]]));
+        let high_bits =
+            u32::from_le_bytes([data[bs + 4], data[bs + 5], data[bs + 6], data[bs + 7]]);
+
+        for j in 0..32 {
+            let byte_idx = bs + 8 + j / 2;
+            let nibble = if j % 2 == 0 {
+                data[byte_idx] & 0x0F
+            } else {
+                data[byte_idx] >> 4
+            };
+            let high = ((high_bits >> j) & 1) as u8;
+            let q = (nibble | (high << 4)) as f32;
+            output.push(q * scale + min);
+        }
+    }
+    output
+}
+
+fn dequant_q2k(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 256;
+    let block_size = 84;
+    let mut output = Vec::with_capacity(num_elements);
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let scales = &data[bs..bs + 16];
+        let qs = &data[bs + 16..bs + 80];
+        let d = f16_to_f32(u16::from_le_bytes([data[bs + 80], data[bs + 81]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([data[bs + 82], data[bs + 83]]));
+
+        for (j, &scale_byte) in scales.iter().enumerate() {
+            let sc = (scale_byte & 0xF) as f32;
+            let m = (scale_byte >> 4) as f32;
+
+            for i in 0..16 {
+                let elem = j * 16 + i;
+                let byte_idx = elem / 4;
+                let shift = (elem % 4) * 2;
+                let q = ((qs[byte_idx] >> shift) & 3) as f32;
+                output.push(d * sc * q - dmin * m);
+            }
+        }
+    }
+    output
+}
+
+fn dequant_q3k(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 256;
+    let block_size = 110;
+    let mut output = Vec::with_capacity(num_elements);
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let hmask = &data[bs..bs + 32];
+        let qs = &data[bs + 32..bs + 96];
+        let packed_scales = &data[bs + 96..bs + 108];
+        let d = f16_to_f32(u16::from_le_bytes([data[bs + 108], data[bs + 109]]));
+
+        // Unpack 6-bit scales from 12 bytes into 16 scale values
+        // The 12 bytes encode 16 6-bit values:
+        //   scales[0..3]: low 6 bits from packed_scales[0..3] (mask 0x3F)
+        //   scales[4..7]: low 6 bits from packed_scales[4..7] (mask 0x3F)
+        //   scales[8..11]: combine packed_scales[0..3] >> 6 (2 bits) with packed_scales[8..11] low 4 bits
+        //   scales[12..15]: combine packed_scales[4..7] >> 6 (2 bits) with packed_scales[8..11] high 4 bits
+        let mut sc = [0i32; 16];
+        for i in 0..4 {
+            sc[i] = (packed_scales[i] & 0x3F) as i32;
+            sc[i + 4] = (packed_scales[i + 4] & 0x3F) as i32;
+            sc[i + 8] =
+                (((packed_scales[i] >> 6) | ((packed_scales[i + 8] & 0x0F) << 2)) & 0x3F) as i32;
+            sc[i + 12] =
+                (((packed_scales[i + 4] >> 6) | ((packed_scales[i + 8] >> 4) << 2)) & 0x3F) as i32;
+        }
+        // Convert to signed: subtract 32
+        for s in sc.iter_mut() {
+            *s -= 32;
+        }
+
+        for j in 0..256 {
+            let low2 = (qs[j / 4] >> (2 * (j % 4))) & 3;
+            let high1 = (hmask[j / 8] >> (j % 8)) & 1;
+            let q = ((low2 | (high1 << 2)) as i32) - 4;
+            let scale_idx = j / 16;
+            output.push(d * sc[scale_idx] as f32 * q as f32);
+        }
+    }
+    output
+}
+
+fn unpack_q4k_scales(packed: &[u8]) -> ([f32; 8], [f32; 8]) {
+    let mut sc = [0u8; 8];
+    let mut m = [0u8; 8];
+
+    for i in 0..4 {
+        sc[i] = packed[i] & 0x3F;
+        sc[i + 4] = ((packed[i] >> 6) | ((packed[i + 8] & 0x0F) << 2)) & 0x3F;
+        m[i] = packed[i + 4] & 0x3F;
+        m[i + 4] = ((packed[i + 4] >> 6) | ((packed[i + 8] >> 4) << 2)) & 0x3F;
+    }
+
+    let sc_f: [f32; 8] = std::array::from_fn(|i| sc[i] as f32);
+    let m_f: [f32; 8] = std::array::from_fn(|i| m[i] as f32);
+    (sc_f, m_f)
+}
+
+fn dequant_q4k(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 256;
+    let block_size = 144;
+    let mut output = Vec::with_capacity(num_elements);
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let d = f16_to_f32(u16::from_le_bytes([data[bs], data[bs + 1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([data[bs + 2], data[bs + 3]]));
+        let packed_scales = &data[bs + 4..bs + 16];
+        let qs = &data[bs + 16..bs + 144];
+
+        let (sc, m) = unpack_q4k_scales(packed_scales);
+
+        for j in 0..8 {
+            for i in 0..32 {
+                let elem = j * 32 + i;
+                let byte_idx = elem / 2;
+                let q = if elem % 2 == 0 {
+                    (qs[byte_idx] & 0x0F) as f32
+                } else {
+                    (qs[byte_idx] >> 4) as f32
+                };
+                output.push(d * sc[j] * q - dmin * m[j]);
+            }
+        }
+    }
+    output
+}
+
+fn dequant_q5k(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 256;
+    let block_size = 176;
+    let mut output = Vec::with_capacity(num_elements);
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let d = f16_to_f32(u16::from_le_bytes([data[bs], data[bs + 1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([data[bs + 2], data[bs + 3]]));
+        let packed_scales = &data[bs + 4..bs + 16];
+        let qh = &data[bs + 16..bs + 48];
+        let qs = &data[bs + 48..bs + 176];
+
+        let (sc, m) = unpack_q4k_scales(packed_scales);
+
+        for j in 0..8 {
+            for i in 0..32 {
+                let elem = j * 32 + i;
+                let byte_idx = elem / 2;
+                let low4 = if elem % 2 == 0 {
+                    qs[byte_idx] & 0x0F
+                } else {
+                    qs[byte_idx] >> 4
+                };
+                let high1 = (qh[elem / 8] >> (elem % 8)) & 1;
+                let q = (low4 | (high1 << 4)) as f32;
+                output.push(d * sc[j] * q - dmin * m[j]);
+            }
+        }
+    }
+    output
 }
 
 fn tensor_data_size(dtype: GgmlType, num_elements: u64) -> u64 {
@@ -475,7 +648,7 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
 }
 
 impl GgufValue {
-    fn as_u32(&self) -> Option<u32> {
+    pub fn as_u32(&self) -> Option<u32> {
         match self {
             GgufValue::U32(v) => Some(*v),
             GgufValue::I32(v) => Some(*v as u32),
@@ -496,6 +669,32 @@ impl GgufValue {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             GgufValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_string_array(&self) -> Option<Vec<&str>> {
+        match self {
+            GgufValue::Array(arr) => {
+                let mut result = Vec::with_capacity(arr.len());
+                for v in arr {
+                    result.push(v.as_str()?);
+                }
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_f32_array(&self) -> Option<Vec<f32>> {
+        match self {
+            GgufValue::Array(arr) => {
+                let mut result = Vec::with_capacity(arr.len());
+                for v in arr {
+                    result.push(v.as_f32()?);
+                }
+                Some(result)
+            }
             _ => None,
         }
     }
@@ -609,6 +808,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
 pub struct GgufLoader {
     tensors: HashMap<String, Vec<f32>>,
     pub config: ModelConfig,
+    pub metadata: HashMap<String, GgufValue>,
 }
 
 impl GgufLoader {
@@ -691,12 +891,12 @@ impl GgufLoader {
                 GgmlType::Q4_0 => dequant_q4_0(tensor_data, ne),
                 GgmlType::Q4_1 => dequant_q4_1(tensor_data, ne),
                 GgmlType::Q5_0 => dequant_q5_0(tensor_data, ne),
-                GgmlType::Q5_1 => dequant_fallback(ne),
+                GgmlType::Q5_1 => dequant_q5_1(tensor_data, ne),
                 GgmlType::Q8_0 => dequant_q8_0(tensor_data, ne),
-                GgmlType::Q2K => dequant_fallback(ne),
-                GgmlType::Q3K => dequant_fallback(ne),
-                GgmlType::Q4K => dequant_fallback(ne),
-                GgmlType::Q5K => dequant_fallback(ne),
+                GgmlType::Q2K => dequant_q2k(tensor_data, ne),
+                GgmlType::Q3K => dequant_q3k(tensor_data, ne),
+                GgmlType::Q4K => dequant_q4k(tensor_data, ne),
+                GgmlType::Q5K => dequant_q5k(tensor_data, ne),
                 GgmlType::Q6K => dequant_q6k(tensor_data, ne),
             };
 
@@ -716,7 +916,11 @@ impl GgufLoader {
             }
         }
 
-        Ok(Self { tensors, config })
+        Ok(Self {
+            tensors,
+            config,
+            metadata,
+        })
     }
 }
 
@@ -985,5 +1189,154 @@ mod tests {
 
         let loaded = loader.load_tensor("model.embed_tokens.weight").unwrap();
         assert_eq!(loaded, values);
+    }
+
+    fn f32_to_f16_bytes(v: f32) -> [u8; 2] {
+        let bits = v.to_bits();
+        let sign = (bits >> 31) & 1;
+        let exp = ((bits >> 23) & 0xFF) as i32;
+        let frac = bits & 0x7FFFFF;
+
+        if exp == 0 {
+            return ((sign << 15) as u16).to_le_bytes();
+        }
+
+        let new_exp = exp - 127 + 15;
+        if new_exp <= 0 {
+            return ((sign << 15) as u16).to_le_bytes();
+        }
+        if new_exp >= 31 {
+            return (((sign << 15) | (0x1F << 10)) as u16).to_le_bytes();
+        }
+        let new_frac = frac >> 13;
+        let h = ((sign << 15) | ((new_exp as u32) << 10) | new_frac) as u16;
+        h.to_le_bytes()
+    }
+
+    #[test]
+    fn test_dequant_q2k_zeros() {
+        let block = vec![0u8; 84];
+        let result = dequant_q2k(&block, 256);
+        assert_eq!(result.len(), 256);
+        for v in &result {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_dequant_q2k_nonzero() {
+        let mut block = vec![0u8; 84];
+        let d_bytes = f32_to_f16_bytes(1.0);
+        block[80] = d_bytes[0];
+        block[81] = d_bytes[1];
+        block[0] = 0x02; // scale=2, min=0 for sub-block 0
+        block[16] = 0x01; // qs: first element q=1
+
+        let result = dequant_q2k(&block, 256);
+        assert_eq!(result.len(), 256);
+        assert!((result[0] - 2.0).abs() < 1e-3, "got {}", result[0]);
+        assert!((result[1] - 0.0).abs() < 1e-3, "got {}", result[1]);
+    }
+
+    #[test]
+    fn test_dequant_q3k_zeros() {
+        let block = vec![0u8; 110];
+        let result = dequant_q3k(&block, 256);
+        assert_eq!(result.len(), 256);
+        for v in &result {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_dequant_q3k_nonzero() {
+        let mut block = vec![0u8; 110];
+        let d_bytes = f32_to_f16_bytes(1.0);
+        block[108] = d_bytes[0];
+        block[109] = d_bytes[1];
+        // packed_scales[0] = 33 → after -32 bias, scale[0] = 1
+        block[96] = 33;
+        // qs element 0 low 2 bits = 1, hmask bit 0 = 0 → q = 1 - 4 = -3
+        block[32] = 0x01;
+
+        let result = dequant_q3k(&block, 256);
+        assert_eq!(result.len(), 256);
+        assert!((result[0] - (-3.0)).abs() < 1e-3, "got {}", result[0]);
+    }
+
+    #[test]
+    fn test_dequant_q4k_zeros() {
+        let block = vec![0u8; 144];
+        let result = dequant_q4k(&block, 256);
+        assert_eq!(result.len(), 256);
+        for v in &result {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_dequant_q4k_nonzero() {
+        let mut block = vec![0u8; 144];
+        let d_bytes = f32_to_f16_bytes(1.0);
+        block[0] = d_bytes[0];
+        block[1] = d_bytes[1];
+        block[4] = 0x03; // scale for sub-block 0 = 3
+        block[16] = 0x52; // qs: low nibble=2, high nibble=5
+
+        let result = dequant_q4k(&block, 256);
+        assert_eq!(result.len(), 256);
+        assert!((result[0] - 6.0).abs() < 1e-3, "got {}", result[0]);
+        assert!((result[1] - 15.0).abs() < 1e-3, "got {}", result[1]);
+    }
+
+    #[test]
+    fn test_dequant_q5k_zeros() {
+        let block = vec![0u8; 176];
+        let result = dequant_q5k(&block, 256);
+        assert_eq!(result.len(), 256);
+        for v in &result {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_dequant_q5k_nonzero() {
+        let mut block = vec![0u8; 176];
+        let d_bytes = f32_to_f16_bytes(1.0);
+        block[0] = d_bytes[0];
+        block[1] = d_bytes[1];
+        block[4] = 0x02; // scale for sub-block 0 = 2
+        block[48] = 0x03; // qs low 4 bits = 3
+        block[16] = 0x01; // qh high bit = 1 → q = 3 | 16 = 19
+
+        let result = dequant_q5k(&block, 256);
+        assert_eq!(result.len(), 256);
+        assert!((result[0] - 38.0).abs() < 1e-3, "got {}", result[0]);
+    }
+
+    #[test]
+    fn test_dequant_q5_1_zeros() {
+        let block = vec![0u8; 24];
+        let result = dequant_q5_1(&block, 32);
+        assert_eq!(result.len(), 32);
+        for v in &result {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_dequant_q5_1_nonzero() {
+        let mut block = vec![0u8; 24];
+        let s_bytes = f32_to_f16_bytes(1.0);
+        block[0] = s_bytes[0];
+        block[1] = s_bytes[1];
+        let m_bytes = f32_to_f16_bytes(0.5);
+        block[2] = m_bytes[0];
+        block[3] = m_bytes[1];
+        block[8] = 0x07; // low nibble = 7, high bit = 0 → q = 7
+
+        let result = dequant_q5_1(&block, 32);
+        assert_eq!(result.len(), 32);
+        assert!((result[0] - 7.5).abs() < 1e-3, "got {}", result[0]);
     }
 }
