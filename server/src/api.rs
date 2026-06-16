@@ -47,6 +47,7 @@ pub fn router() -> Router<AppState> {
         .route("/oxide/v1/replay", post(replay))
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health))
+        .route("/health/inference", get(health_inference))
         .route("/ready", get(readiness))
 }
 
@@ -925,6 +926,59 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn health_inference(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    if state.model.weights.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"healthy": false, "error": "model weights not loaded"})),
+        ));
+    }
+
+    let probe_id = format!("health-{}", uuid::Uuid::new_v4());
+    let acquire_result = acquire_slot(&state, &probe_id, vec![1], 1, 1.0, 1.0, 10).await;
+
+    if acquire_result.is_err() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"healthy": false, "error": "scheduler at capacity"})),
+        ));
+    }
+
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(5);
+
+    let model = state.model.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut session = InferenceSession::new(&model.config, TraceLevel::Off, 0);
+        let params = SamplingParams::default();
+        model.generate(&mut session, &[1], 1, &params, None)
+    })
+    .await;
+
+    release_slot(&state, &probe_id).await;
+
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    if start.elapsed() >= timeout {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"healthy": false, "error": "inference timeout"})),
+        ));
+    }
+
+    match result {
+        Ok(tokens) if !tokens.is_empty() => Ok(Json(
+            serde_json::json!({"healthy": true, "latency_ms": latency_ms}),
+        )),
+        _ => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"healthy": false, "error": "inference produced no output"})),
+        )),
+    }
 }
 
 fn build_guided_decoder(

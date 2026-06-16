@@ -696,3 +696,10 @@
   summary: "Wired guided decoding into tool_choice modes: build_tool_guided_decoder activates JSON grammar for required/named modes, fixed PrefixCacheTable LRU tick increment in store()"
   iteration: 5
   max_iterations: 10
+- timestamp: "2026-06-16T21:25:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p10-health-inference-probe"
+  summary: "Added /health/inference endpoint: 1-token inference at priority 10, returns healthy+latency_ms on success, 503 on failure/timeout"
+  iteration: 6
+  max_iterations: 10

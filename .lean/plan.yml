@@ -1549,7 +1549,8 @@ items:
     quick: cargo test --package oxide-server
 - id: p10-health-inference-probe
   title: Black-box health check with priority inference
-  status: planned
+  status: done
+  progress: 100
   priority: critical
   effort: S
   depends_on:
