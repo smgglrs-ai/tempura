@@ -84,6 +84,8 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<oxide_engine::tool_call::ToolChoice>,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +130,7 @@ pub struct ChatCompletionResponse {
     pub object: String,
     pub created: u64,
     pub model: String,
+    pub system_fingerprint: String,
     pub choices: Vec<ChatChoice>,
     pub usage: Usage,
 }
@@ -189,6 +192,8 @@ pub struct CompletionRequest {
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -376,6 +381,7 @@ async fn chat_completions(
         let rid = request_id.clone();
         let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
         let prompt_tokens = token_ids.len() as u32;
+        let base_seed = req.seed.unwrap_or(42);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
 
@@ -383,7 +389,7 @@ async fn chat_completions(
 
         tokio::task::spawn_blocking(move || {
             let stream_start = std::time::Instant::now();
-            let mut session = InferenceSession::new(&model.config, TraceLevel::Off, 42);
+            let mut session = InferenceSession::new(&model.config, TraceLevel::Off, base_seed);
             let id_clone = rid.clone();
             let model_name = req.model.clone();
             let deadline = std::time::Instant::now() + timeout;
@@ -495,7 +501,8 @@ async fn chat_completions(
                         .increment(1);
                     return Err((StatusCode::GATEWAY_TIMEOUT, "Request timed out".into()));
                 }
-                let seed = 42u64.wrapping_add(i as u64);
+                let base_seed = req.seed.unwrap_or(42);
+                let seed = base_seed.wrapping_add(i as u64);
                 let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, seed);
 
                 let mut guided_decoder = build_guided_decoder(&req.response_format, tokenizer);
@@ -629,6 +636,7 @@ async fn chat_completions(
             object: "chat.completion".to_string(),
             created: 0,
             model: req.model,
+            system_fingerprint: format!("oxide-serve-{}", env!("CARGO_PKG_VERSION")),
             choices,
             usage: Usage {
                 prompt_tokens,
@@ -688,10 +696,11 @@ async fn completions(
 
     let want_logprobs = req.logprobs.is_some();
     let top_n = req.logprobs.unwrap_or(0).min(20) as usize;
+    let seed = req.seed.unwrap_or(42);
 
     let (generated, token_logprobs) = if want_logprobs {
         state.model.generate_with_logprobs(
-            &mut InferenceSession::new(&state.model.config, TraceLevel::Off, 42),
+            &mut InferenceSession::new(&state.model.config, TraceLevel::Off, seed),
             &token_ids,
             req.max_tokens as usize,
             &params,
@@ -700,7 +709,7 @@ async fn completions(
         )
     } else {
         let tokens = state.model.generate(
-            &mut InferenceSession::new(&state.model.config, TraceLevel::Off, 42),
+            &mut InferenceSession::new(&state.model.config, TraceLevel::Off, seed),
             &token_ids,
             req.max_tokens as usize,
             &params,

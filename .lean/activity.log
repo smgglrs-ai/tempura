@@ -668,3 +668,10 @@
   summary: "Added stream_options.include_usage: StreamOptions struct, final SSE chunk with usage (prompt_tokens, completion_tokens, total_tokens) before [DONE], ChunkUsage type"
   iteration: 1
   max_iterations: 10
+- timestamp: "2026-06-16T20:40:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p9-seed-param"
+  summary: "Added seed field to ChatCompletionRequest and CompletionRequest, wired through to InferenceSession, system_fingerprint in responses"
+  iteration: 2
+  max_iterations: 10

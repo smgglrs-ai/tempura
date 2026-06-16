@@ -1432,7 +1432,8 @@ items:
     quick: cargo test --package oxide-server
 - id: p9-seed-param
   title: Expose seed parameter on API requests
-  status: planned
+  status: done
+  progress: 100
   priority: critical
   effort: S
   scope:
