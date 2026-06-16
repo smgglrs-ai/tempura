@@ -291,18 +291,29 @@ impl PrefixCacheTable {
         }
     }
 
-    fn hash_tokens(token_ids: &[u32]) -> u64 {
+    fn hash_tokens(token_ids: &[u32], salt: Option<&str>) -> u64 {
         let mut hasher = DefaultHasher::new();
+        if let Some(s) = salt {
+            s.hash(&mut hasher);
+        }
         token_ids.hash(&mut hasher);
         hasher.finish()
     }
 
     pub fn probe(&mut self, token_ids: &[u32]) -> Option<PrefixMatch> {
+        self.probe_with_salt(token_ids, None)
+    }
+
+    pub fn probe_with_salt(
+        &mut self,
+        token_ids: &[u32],
+        salt: Option<&str>,
+    ) -> Option<PrefixMatch> {
         self.tick += 1;
 
         for len in (1..=token_ids.len()).rev() {
             let prefix = &token_ids[..len];
-            let hash = Self::hash_tokens(prefix);
+            let hash = Self::hash_tokens(prefix, salt);
             if let Some(entry) = self.entries.get_mut(&hash) {
                 if entry.token_ids == prefix {
                     entry.last_used = self.tick;
@@ -321,6 +332,10 @@ impl PrefixCacheTable {
     }
 
     pub fn store(&mut self, token_ids: &[u32], cache: &KvCache) {
+        self.store_with_salt(token_ids, cache, None);
+    }
+
+    pub fn store_with_salt(&mut self, token_ids: &[u32], cache: &KvCache, salt: Option<&str>) {
         if token_ids.is_empty() || cache.seq_len == 0 {
             return;
         }
@@ -330,7 +345,7 @@ impl PrefixCacheTable {
             self.evict_lru();
         }
 
-        let hash = Self::hash_tokens(token_ids);
+        let hash = Self::hash_tokens(token_ids, salt);
         let k_data: Vec<Vec<f32>> = (0..cache.num_layers)
             .map(|layer| cache.k_slice(layer).to_vec())
             .collect();
@@ -352,7 +367,11 @@ impl PrefixCacheTable {
     }
 
     pub fn release(&mut self, token_ids: &[u32]) {
-        let hash = Self::hash_tokens(token_ids);
+        self.release_with_salt(token_ids, None);
+    }
+
+    pub fn release_with_salt(&mut self, token_ids: &[u32], salt: Option<&str>) {
+        let hash = Self::hash_tokens(token_ids, salt);
         if let Some(entry) = self.entries.get_mut(&hash) {
             entry.ref_count = entry.ref_count.saturating_sub(1);
         }
@@ -804,5 +823,35 @@ mod tests {
         assert_eq!(target.seq_len, 2);
         assert_eq!(target.k_slice(0), source.k_slice(0));
         assert_eq!(target.v_slice(0), source.v_slice(0));
+    }
+
+    #[test]
+    fn test_prefix_cache_salt_isolation() {
+        let config = ModelConfig::tiny_test();
+        let stride = config.num_kv_heads * config.head_dim;
+
+        let mut cache = KvCache::new(&config);
+        let k: Vec<f32> = (0..stride).map(|i| i as f32).collect();
+        let v = k.clone();
+        cache.append_kv(0, &k, &v, 1);
+        cache.advance(1);
+
+        let mut table = PrefixCacheTable::new(10);
+
+        table.store_with_salt(&[1, 2, 3], &cache, Some("tenant-a"));
+        table.store_with_salt(&[1, 2, 3], &cache, Some("tenant-b"));
+
+        assert_eq!(table.len(), 2);
+
+        assert!(table
+            .probe_with_salt(&[1, 2, 3], Some("tenant-a"))
+            .is_some());
+        assert!(table
+            .probe_with_salt(&[1, 2, 3], Some("tenant-b"))
+            .is_some());
+        assert!(table
+            .probe_with_salt(&[1, 2, 3], Some("tenant-c"))
+            .is_none());
+        assert!(table.probe_with_salt(&[1, 2, 3], None).is_none());
     }
 }

@@ -703,3 +703,10 @@
   summary: "Added /health/inference endpoint: 1-token inference at priority 10, returns healthy+latency_ms on success, 503 on failure/timeout"
   iteration: 6
   max_iterations: 10
+- timestamp: "2026-06-16T21:35:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p10-cache-salt"
+  summary: "Added cache_salt to API requests and PrefixCacheTable: hash_tokens includes salt, probe/store/release_with_salt methods, salt isolation test"
+  iteration: 7
+  max_iterations: 10

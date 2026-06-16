@@ -87,6 +87,8 @@ pub struct ChatCompletionRequest {
     pub stream_options: Option<StreamOptions>,
     #[serde(default)]
     pub seed: Option<u64>,
+    #[serde(default)]
+    pub cache_salt: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -195,6 +197,8 @@ pub struct CompletionRequest {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub seed: Option<u64>,
+    #[serde(default)]
+    pub cache_salt: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
