@@ -484,14 +484,24 @@ items:
   - id: p3-gpu-validation
     title: DualPipeline CPU vs GPU validation
     description: >
-      Use DualPipeline to validate GPU kernel output against proven
-      CPU references. Benchmark GPU vs CPU performance.
+      Formalize GPU kernel validation as a benchmark suite. Add timing
+      for all kernels at inference-realistic sizes (MicroLlama-scale
+      projections), report speedup ratios, and validate correctness.
     status: planned
     priority: high
-    effort: M
+    effort: S
     depends_on: [p3-cuda-matmul, p3-cuda-attention, 2c-dual-pipeline]
     scope:
-      - benches/
+      - tests-gpu/src/main.rs
+    acceptance:
+      - "tests-gpu binary tests all 4 GPU kernels with CPU vs GPU comparison"
+      - "Each kernel reports max abs diff AND timing (CPU ms, GPU ms, speedup)"
+      - "MatMul benchmark includes inference-realistic sizes: 1x1024x1024, 1x5632x1024, 1x32000x1024"
+      - "Attention benchmark includes MHA and GQA at seq_len=128 with head_dim=64"
+      - "All tests pass with max diff < 1e-3"
+      - "GPU speedup > 1x demonstrated for at least one matmul size"
+    verification:
+      quick: "cd tests-gpu && cargo oxide run"
 
   - id: p3-turboquant
     title: TurboQuant/PQO KV-cache compression kernel
