@@ -82,6 +82,14 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<oxide_engine::tool_call::ToolDefinition>>,
     #[serde(default)]
     pub tool_choice: Option<oxide_engine::tool_call::ToolChoice>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -366,6 +374,8 @@ async fn chat_completions(
         let tokenizer = tokenizer.clone();
         let scheduler = state.scheduler.clone();
         let rid = request_id.clone();
+        let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
+        let prompt_tokens = token_ids.len() as u32;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
 
@@ -421,6 +431,7 @@ async fn chat_completions(
                             },
                             finish_reason: None,
                         }],
+                        usage: None,
                     };
                     let data = serde_json::to_string(&chunk).unwrap();
                     let event = Event::default().data(data);
@@ -431,6 +442,23 @@ async fn chat_completions(
             metrics::counter!("oxide_tokens_generated").increment(token_count);
             metrics::histogram!("oxide_request_duration_seconds", "endpoint" => "chat_completions")
                 .record(stream_start.elapsed().as_secs_f64());
+
+            if include_usage {
+                let usage_chunk = ChatCompletionChunk {
+                    id: id_clone.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created: 0,
+                    model: model_name.clone(),
+                    choices: vec![],
+                    usage: Some(crate::sse::ChunkUsage {
+                        prompt_tokens,
+                        completion_tokens: token_count as u32,
+                        total_tokens: prompt_tokens + token_count as u32,
+                    }),
+                };
+                let data = serde_json::to_string(&usage_chunk).unwrap();
+                let _ = tx.blocking_send(Ok(Event::default().data(data)));
+            }
 
             let done = Event::default().data("[DONE]");
             let _ = tx.blocking_send(Ok(done));

@@ -661,3 +661,10 @@
     health inference probe, cache_salt tenant isolation. Phase 11 (forward-
     looking): Responses API, disaggregated serving. Total plan: 67 items
     (57 done, 10 planned).
+- timestamp: "2026-06-16T20:30:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p9-stream-usage"
+  summary: "Added stream_options.include_usage: StreamOptions struct, final SSE chunk with usage (prompt_tokens, completion_tokens, total_tokens) before [DONE], ChunkUsage type"
+  iteration: 1
+  max_iterations: 10

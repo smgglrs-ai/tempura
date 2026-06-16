@@ -1409,7 +1409,8 @@ items:
     quick: cargo test --package oxide-kernels
 - id: p9-stream-usage
   title: stream_options.include_usage in streaming responses
-  status: planned
+  status: done
+  progress: 100
   priority: critical
   effort: S
   scope:

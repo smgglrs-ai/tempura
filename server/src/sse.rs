@@ -9,6 +9,15 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ChunkUsage>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChunkUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +88,7 @@ mod tests {
                 },
                 finish_reason: finish_reason.map(|s| s.to_string()),
             }],
+            usage: None,
         }
     }
 
@@ -111,6 +121,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         let json = serde_json::to_string(&chunk).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
