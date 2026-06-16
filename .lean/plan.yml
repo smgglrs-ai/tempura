@@ -507,60 +507,186 @@ items:
   - id: p3-turboquant
     title: TurboQuant/PQO KV-cache compression kernel
     description: >
-      Verified GPU kernel for KV-cache compression using PolarQuant
-      (without QJL). Rust reference exists at github.com/SaschaOnTour/turboquant.
+      Add a KV-cache compression kernel using PolarQuant-Only (PQO) from
+      TurboQuant (ICLR 2026). Introduces a KvCacheCompressor trait with
+      compress/decompress operations that quantize KV vectors to 3 bits
+      using polar coordinate encoding, a CPU reference, and a cuda-oxide
+      GPU kernel behind the cuda feature flag. The engine KvCache gains an
+      optional compression layer extending sequence capacity ~5x. Adapts
+      the PQO variant (no QJL bias correction) into the existing kernel
+      trait pattern with Kani verification harnesses.
     status: planned
     priority: medium
     effort: L
     depends_on: [p3-cuda-matmul]
     scope:
-      - kernels/src/
+      - kernels/src/turboquant.rs
+      - kernels/src/lib.rs
+      - kernels/src/gpu/turboquant_kernel.rs
+      - kernels/src/gpu/mod.rs
+      - kernels/src/verification_manifest.rs
+      - kernels/Cargo.toml
+      - engine/src/kv_cache.rs
+      - engine/src/pipeline.rs
+      - engine/src/dual_pipeline.rs
+    acceptance:
+      - "KvCacheCompressor trait with compress(&[f32], head_dim) -> CompressedKV and decompress methods"
+      - "CpuPolarQuant: round-trip error below 5% relative L2 norm (property-tested)"
+      - "CudaPolarQuant behind cuda feature flag, matching CPU output within GPU tolerance"
+      - "KvCache optional CompressedKvCache mode (compress on append, decompress on read)"
+      - "Kani harnesses prove compress/decompress bounds-safety (no OOB, no panics)"
+      - "DualPipeline comparison: compressed vs uncompressed KvCache divergence report"
+    verification:
+      quick: "cargo test --package oxide-kernels --package oxide-engine"
 
   # Phase 4: Continuous Batching + Scheduling
 
   - id: p4-kvcache-pool
     title: Multi-sequence KV cache (slot-based pool)
     description: >
-      Refactor KvCache from single-sequence to slot-based pool.
-      Required for continuous batching.
+      Refactor KvCache from single-sequence to slot-based pool managing
+      multiple concurrent sequences. Pre-allocate fixed slots with
+      acquire/release semantics. InferenceSession references a slot
+      instead of owning a cache. Prerequisite for continuous batching —
+      without it, all requests serialize through a single cache.
     status: planned
     priority: medium
-    effort: L
+    effort: M
     scope:
       - engine/src/kv_cache.rs
+      - engine/src/session.rs
+      - engine/src/model.rs
+      - server/src/batch.rs
+      - server/src/api.rs
+    acceptance:
+      - "KvCachePool with configurable num_slots, independent K/V buffers per slot"
+      - "acquire() returns SlotHandle or error; release(slot) resets and returns to pool"
+      - "InferenceSession holds slot index, model.forward() routes through pool"
+      - "BatchScheduler.next_batch() acquires slots, releases on completion, backpressure when exhausted"
+      - "Pool of size 1 behaves identically to current KvCache (backward compat)"
+      - "Concurrent slot isolation tested: two slots produce independent K/V slices"
+    verification:
+      quick: "cargo test --workspace"
 
   - id: p4-batch-scheduler
     title: Verified continuous batching with preemption
     description: >
-      Upgrade BatchScheduler to iteration-level continuous batching with
-      preemption. Kani proofs for fairness and no-starvation.
+      Replace stub FIFO BatchScheduler with iteration-level continuous
+      batching. Tracks active sequences, manages slot-based KV cache pool,
+      supports preemption under memory pressure. Admits new prefill requests
+      between decode iterations. Kani harnesses prove no-starvation and
+      slot-accounting safety.
     status: planned
     priority: medium
-    effort: L
+    effort: XL
     depends_on: [p4-kvcache-pool]
     scope:
-      - server/src/batch.rs
       - engine/src/kv_cache.rs
+      - server/src/batch.rs
+      - server/src/api.rs
+      - server/src/main.rs
+      - engine/src/session.rs
+    acceptance:
+      - "Scheduler tracks per-sequence state (slot id, position, priority/age), admits between iterations"
+      - "KvCachePool with allocate/release/preempt operations"
+      - "Preemption evicts lowest-priority sequence, preserves token_ids for recompute"
+      - "API handlers submit through BatchScheduler instead of creating InferenceSession inline"
+      - "Kani proofs: slot accounting (no double-alloc, no OOB), no-starvation"
+      - "Tests: mixed prefill/decode batches, preemption under full pool, re-admission"
+    verification:
+      quick: "cargo test --workspace"
 
   # Phase 5: Production Hardening
 
   - id: p5-speculative-decoding
     title: Speculative decoding
-    status: planned
-    priority: low
-    effort: XL
-
-  - id: p5-tensor-parallelism
-    title: Tensor parallelism
-    status: planned
-    priority: low
-    effort: XL
-
-  - id: p5-quantization
-    title: Quantization support (GPTQ, AWQ, GGUF)
+    description: >
+      Accelerate autoregressive generation with a draft model that proposes
+      K candidate tokens per step, verified in a single batched target
+      forward pass. Requires SpeculativeDecoder orchestrator coordinating
+      two TransformerModel instances, rejection-sampling verification loop
+      maintaining distribution equivalence, KvCache rollback on rejected
+      tokens, and server integration via CLI flags.
     status: planned
     priority: low
     effort: L
+    scope:
+      - engine/src/speculative.rs
+      - engine/src/kv_cache.rs
+      - engine/src/session.rs
+      - engine/src/model.rs
+      - engine/src/trace.rs
+      - server/src/main.rs
+      - server/src/api.rs
+    acceptance:
+      - "Draft model produces K candidates with log-probabilities"
+      - "Rejection sampling guarantees identical output distribution to standard decoding"
+      - "KvCache rollback on rejection — no stale entries (tested against standard generate)"
+      - "Bit-identical output when draft=target (determinism test)"
+      - "InferenceTrace records speculative metadata (proposed, accepted, rejected, acceptance rate)"
+      - "CLI flags --draft-model, --speculative-k; endpoints use when configured"
+    verification:
+      quick: "cargo test --workspace"
+
+  - id: p5-tensor-parallelism
+    title: Tensor parallelism
+    description: >
+      Distribute model layers across multiple GPUs via column-parallel
+      (QKV/gate/up) and row-parallel (output/down) weight sharding.
+      Requires AllReduce communication primitive, multi-device GpuContext,
+      sharded ModelWeights, and updated forward pass with inter-GPU sync
+      at layer boundaries.
+    status: planned
+    priority: low
+    effort: XL
+    scope:
+      - kernels/src/allreduce.rs
+      - kernels/src/gpu/mod.rs
+      - engine/src/config.rs
+      - engine/src/weights.rs
+      - engine/src/pipeline.rs
+      - engine/src/model.rs
+      - engine/src/session.rs
+      - server/src/main.rs
+    acceptance:
+      - "ModelConfig accepts tensor_parallel_size (default 1)"
+      - "GpuContext supports multi-device initialization with per-rank CudaContext"
+      - "AllReduce kernel (NCCL or ring-reduce fallback) with CPU no-op reference for TP=1"
+      - "Bit-identical logits for TP=1 vs TP=N (DualPipeline verification)"
+      - "CLI --tensor-parallel N flag"
+      - "Integration test with tiny_test TP=2 on CPU verifies shape and numerical equivalence"
+    verification:
+      quick: "cargo test --workspace"
+
+  - id: p5-quantization
+    title: Quantization support (GPTQ, AWQ, GGUF)
+    description: >
+      Load and run inference on quantized weights in GPTQ, AWQ, and GGUF
+      formats. Requires quantization-aware weight representation (replacing
+      f32-only ModelWeights), dequantization kernels converting packed
+      integers to f32 at matmul time, format-specific loaders parsing
+      quantization metadata, and a quantized matmul path in CPU/GPU pipelines.
+    status: planned
+    priority: low
+    effort: XL
+    scope:
+      - kernels/src/matmul.rs
+      - engine/src/loader.rs
+      - engine/src/weights.rs
+      - engine/src/config.rs
+      - engine/src/model.rs
+      - engine/src/pipeline.rs
+      - server/src/main.rs
+      - kernels/src/gpu/
+    acceptance:
+      - "WeightLoader supports non-f32 dtypes (int4, int8, float16) with dtype metadata"
+      - "QuantConfig type (format, bits, group_size, symmetric/asymmetric)"
+      - "GPTQ loader reads qweight/qzeros/scales from safetensors"
+      - "AWQ loader reads AWQ-specific tensor layout"
+      - "GGUF loader parses binary container, loads Q4_0/Q4_1/Q8_0 blocks"
+      - "Dequantize-fused matmul within 1e-2 relative error of f32 equivalent"
+    verification:
+      quick: "cargo test --workspace"
 
   - id: p5-metrics
     title: Prometheus metrics
