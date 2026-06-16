@@ -249,6 +249,7 @@ async fn acquire_slot(
     max_new_tokens: u32,
     temperature: f32,
     top_p: f32,
+    priority: u8,
 ) -> Result<(), (StatusCode, String)> {
     let mut scheduler = state.scheduler.lock().await;
     scheduler.submit(InferenceRequest {
@@ -257,6 +258,7 @@ async fn acquire_slot(
         max_new_tokens,
         temperature,
         top_p,
+        priority,
     });
     scheduler.admit_new_requests();
 
@@ -369,6 +371,7 @@ async fn chat_completions(
         req.max_tokens,
         req.temperature,
         req.top_p.unwrap_or(1.0),
+        5,
     )
     .await?;
 
@@ -688,6 +691,7 @@ async fn completions(
         req.max_tokens,
         req.temperature,
         1.0,
+        5,
     )
     .await?;
 
@@ -1121,7 +1125,7 @@ mod tests {
         };
 
         // First request acquires the only slot
-        acquire_slot(&state, "req-1", vec![1, 2], 10, 1.0, 1.0)
+        acquire_slot(&state, "req-1", vec![1, 2], 10, 1.0, 1.0, 5)
             .await
             .unwrap();
 
@@ -1132,7 +1136,7 @@ mod tests {
         }
 
         // Second request should be rejected (max_batch_size=1, num_slots=1)
-        let result = acquire_slot(&state, "req-2", vec![3, 4], 10, 1.0, 1.0).await;
+        let result = acquire_slot(&state, "req-2", vec![3, 4], 10, 1.0, 1.0, 5).await;
         assert!(result.is_err());
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
@@ -1147,7 +1151,7 @@ mod tests {
         }
 
         // Now third request succeeds
-        acquire_slot(&state, "req-3", vec![5, 6], 10, 1.0, 1.0)
+        acquire_slot(&state, "req-3", vec![5, 6], 10, 1.0, 1.0, 5)
             .await
             .unwrap();
 

@@ -1523,7 +1523,8 @@ items:
     quick: cargo test --workspace
 - id: p10-priority-scheduling
   title: Priority-based request scheduling
-  status: planned
+  status: done
+  progress: 100
   priority: critical
   effort: M
   scope:

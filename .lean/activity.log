@@ -675,3 +675,10 @@
   summary: "Added seed field to ChatCompletionRequest and CompletionRequest, wired through to InferenceSession, system_fingerprint in responses"
   iteration: 2
   max_iterations: 10
+- timestamp: "2026-06-16T21:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p10-priority-scheduling"
+  summary: "Added priority field (u8, default 5) to InferenceRequest/ActiveSequence, priority-sorted admission, priority-based preemption, new test for priority preemption"
+  iteration: 3
+  max_iterations: 10

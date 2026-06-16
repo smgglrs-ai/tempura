@@ -7,6 +7,7 @@ pub struct InferenceRequest {
     pub max_new_tokens: u32,
     pub temperature: f32,
     pub top_p: f32,
+    pub priority: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +29,7 @@ pub struct ActiveSequence {
     pub token_ids: Vec<u32>,
     pub prefill_offset: usize,
     pub prefix_matched_len: usize,
+    pub priority: u8,
 }
 
 pub struct BatchScheduler {
@@ -92,7 +94,7 @@ impl BatchScheduler {
             .active
             .iter()
             .enumerate()
-            .min_by_key(|(_, s)| s.age)
+            .min_by_key(|(_, s)| (s.priority, s.age))
             .unwrap();
 
         let evicted = self.active.remove(idx);
@@ -105,6 +107,7 @@ impl BatchScheduler {
             max_new_tokens: evicted.max_new_tokens - evicted.generated_tokens.len() as u32,
             temperature: 0.0,
             top_p: 1.0,
+            priority: evicted.priority,
         });
 
         Some(slot_id)
@@ -120,11 +123,12 @@ impl BatchScheduler {
         self.tick += 1;
         let mut admitted = Vec::new();
 
-        let sources: Vec<InferenceRequest> = self
+        let mut sources: Vec<InferenceRequest> = self
             .preempted
             .drain(..)
             .chain(self.pending.drain(..))
             .collect();
+        sources.sort_by_key(|r| std::cmp::Reverse(r.priority));
 
         for req in sources {
             if self.active.len() >= self.max_batch_size {
@@ -154,6 +158,7 @@ impl BatchScheduler {
                 token_ids: req.token_ids,
                 prefill_offset: 0,
                 prefix_matched_len: 0,
+                priority: req.priority,
             };
 
             admitted.push(ActiveSequence {
@@ -167,6 +172,7 @@ impl BatchScheduler {
                 token_ids: seq.token_ids.clone(),
                 prefill_offset: 0,
                 prefix_matched_len: 0,
+                priority: seq.priority,
             });
 
             self.active.push(seq);
@@ -275,6 +281,7 @@ mod tests {
             max_new_tokens: 10,
             temperature: 1.0,
             top_p: 1.0,
+            priority: 5,
         }
     }
 
@@ -419,5 +426,27 @@ mod tests {
         let total =
             scheduler.active_count() + scheduler.pending_count() + scheduler.preempted_count();
         assert_eq!(total, 3, "no request should be silently dropped");
+    }
+
+    #[test]
+    fn test_priority_preempts_low_priority() {
+        let mut scheduler = BatchScheduler::new(4, 4096, 1);
+
+        let mut low = make_request("low", vec![1]);
+        low.priority = 1;
+        scheduler.submit(low);
+        scheduler.admit_new_requests();
+        assert_eq!(scheduler.active_count(), 1);
+
+        let mut high = make_request("high", vec![2]);
+        high.priority = 10;
+        scheduler.submit(high);
+        let admitted = scheduler.admit_new_requests();
+
+        assert!(
+            admitted.iter().any(|s| s.request_id == "high"),
+            "high-priority request should be admitted via preemption"
+        );
+        assert_eq!(scheduler.preempted_count(), 1);
     }
 }
