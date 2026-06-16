@@ -1,9 +1,10 @@
 use crate::config::ModelConfig;
 use crate::pipeline::KernelPipeline;
 use crate::session::InferenceSession;
-use crate::trace::{LayerSnapshot, SamplingSnapshot, TraceLevel};
+use crate::trace::{LayerSnapshot, SamplingSnapshot, TimingInfo, TraceLevel};
 use crate::weights::ModelWeights;
 use oxide_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
+use std::time::Instant;
 
 pub struct TransformerModel<A, N, R, M, S> {
     pub config: ModelConfig,
@@ -61,6 +62,7 @@ where
             .collect();
 
         for layer in 0..cfg.num_layers {
+            let layer_start = Instant::now();
             let prefix = format!("model.layers.{layer}");
 
             let mut snapshot = LayerSnapshot {
@@ -221,6 +223,7 @@ where
             }
 
             if session.trace_level >= TraceLevel::Summary {
+                snapshot.duration = Some(layer_start.elapsed());
                 session.trace.layers.push(snapshot);
             }
         }
@@ -270,8 +273,12 @@ where
         params: &SamplingParams,
         eos_token: Option<u32>,
     ) -> Vec<u32> {
+        let total_start = Instant::now();
+        let prompt_start = Instant::now();
         let logits = self.forward(session, token_ids);
+        let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
         session.trace.prompt_tokens = token_ids.len();
+        let gen_start = Instant::now();
 
         let mut probs = vec![0.0f32; logits.len()];
         self.pipeline
@@ -312,7 +319,19 @@ where
             generated.push(token);
         }
 
+        let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
         session.trace.generated_tokens = generated.len();
+        session.trace.timing = Some(TimingInfo {
+            total_ms,
+            prompt_ms,
+            generation_ms,
+            tokens_per_second: if generation_ms > 0.0 {
+                generated.len() as f64 / (generation_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
         generated
     }
 
@@ -325,8 +344,12 @@ where
         eos_token: Option<u32>,
         mut on_token: impl FnMut(u32) -> bool,
     ) -> Vec<u32> {
+        let total_start = Instant::now();
+        let prompt_start = Instant::now();
         let logits = self.forward(session, token_ids);
+        let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
         session.trace.prompt_tokens = token_ids.len();
+        let gen_start = Instant::now();
 
         let mut probs = vec![0.0f32; logits.len()];
         self.pipeline
@@ -343,7 +366,19 @@ where
 
         let mut generated = vec![first_token];
         if !on_token(first_token) {
+            let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+            let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
             session.trace.generated_tokens = generated.len();
+            session.trace.timing = Some(TimingInfo {
+                total_ms,
+                prompt_ms,
+                generation_ms,
+                tokens_per_second: if generation_ms > 0.0 {
+                    generated.len() as f64 / (generation_ms / 1000.0)
+                } else {
+                    0.0
+                },
+            });
             return generated;
         }
 
@@ -372,7 +407,19 @@ where
             }
         }
 
+        let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
         session.trace.generated_tokens = generated.len();
+        session.trace.timing = Some(TimingInfo {
+            total_ms,
+            prompt_ms,
+            generation_ms,
+            tokens_per_second: if generation_ms > 0.0 {
+                generated.len() as f64 / (generation_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
         generated
     }
 
@@ -652,6 +699,51 @@ mod tests {
             assert_eq!(snap.step, i);
             assert!(!snap.top_logits.is_empty());
             assert!(!snap.top_probs.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_timing_info_populated() {
+        let config = ModelConfig::tiny_test();
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(config.clone(), pipeline);
+        let loader = RandomWeightLoader::from_config(&config, 42);
+        model.load_weights(&loader).unwrap();
+
+        let mut session = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 50,
+            top_p: 1.0,
+        };
+        let _tokens = model.generate(&mut session, &[1, 2, 3], 5, &params, None);
+
+        let timing = session.trace.timing.as_ref().expect("timing should be set");
+        assert!(timing.total_ms > 0.0);
+        assert!(timing.prompt_ms > 0.0);
+        assert!(timing.generation_ms > 0.0);
+        assert!(timing.tokens_per_second > 0.0);
+        assert!(timing.total_ms >= timing.prompt_ms + timing.generation_ms - 0.01);
+    }
+
+    #[test]
+    fn test_layer_duration_populated_at_summary() {
+        let config = ModelConfig::tiny_test();
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(config.clone(), pipeline);
+        let loader = RandomWeightLoader::from_config(&config, 42);
+        model.load_weights(&loader).unwrap();
+
+        let mut session = InferenceSession::new(&config, TraceLevel::Summary, 42);
+        let _logits = model.forward(&mut session, &[1, 2]);
+
+        assert_eq!(session.trace.layers.len(), config.num_layers);
+        for snap in &session.trace.layers {
+            assert!(
+                snap.duration.is_some(),
+                "layer {} should have duration",
+                snap.layer_index
+            );
         }
     }
 

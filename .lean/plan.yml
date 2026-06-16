@@ -1199,7 +1199,8 @@ items:
     `generation_ms`, and `tokens_per_second` to fill `TimingInfo` before the methods return. The `forward`
     method should also record per-layer `duration` in each `LayerSnapshot` when tracing is at Summary
     level or above (the field exists but is always set to `None`).'
-  status: planned
+  status: done
+  progress: 100
   priority: high
   effort: S
   scope:

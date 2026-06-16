@@ -500,3 +500,10 @@
   summary: "Added graceful shutdown with SIGTERM/SIGINT handling via axum with_graceful_shutdown, --shutdown-timeout CLI flag (default 30s)"
   iteration: 3
   max_iterations: 10
+- timestamp: "2026-06-16T11:40:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p8-timing-info"
+  summary: "Added timing instrumentation to generate/generate_with_callback (TimingInfo) and per-layer duration in forward pass, 2 new tests"
+  iteration: 4
+  max_iterations: 10
