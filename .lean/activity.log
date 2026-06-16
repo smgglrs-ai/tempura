@@ -613,3 +613,14 @@
   summary: "Added BatchInvariantVerifier with verify_batch_invariance function, Kani harness proving attention batch offset isolation, verification manifest entry, 3 integration tests (solo vs batch-2/4, prepopulated cache)"
   iteration: 8
   max_iterations: 10
+- timestamp: "2026-06-16T18:45:00Z"
+  actor: claude
+  action: loop-complete
+  summary: "Loop finished: 8 items completed (p6-chat-templates, p7-wire-batch-scheduler, p6-guided-decoding, p7-request-timeouts, p7-comprehensive-metrics, p7-chunked-prefill, p8-opentelemetry, p8-batch-invariant-verification). Exit: Remaining items are L-effort features"
+  details:
+    iterations: 8
+    max_iterations: 10
+    completed: [p6-chat-templates, p7-wire-batch-scheduler, p6-guided-decoding, p7-request-timeouts, p7-comprehensive-metrics, p7-chunked-prefill, p8-opentelemetry, p8-batch-invariant-verification]
+    exit_reason: "Remaining items are L-effort features requiring focused sessions"
+    branch: "loop/2026-06-16-6"
+    tag: "loop-run/2026-06-16-8-approve-r6"
