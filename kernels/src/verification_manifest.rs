@@ -113,3 +113,49 @@ pub fn manifest() -> VerificationManifest {
         ],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_manifest_non_empty() {
+        let m = manifest();
+        assert!(!m.kernels.is_empty());
+        assert!(!m.caveats.is_empty());
+    }
+
+    #[test]
+    fn test_all_proofs_have_proven_status() {
+        let m = manifest();
+        for proof in &m.kernels {
+            assert_eq!(
+                proof.status, "proven",
+                "kernel {} harness {} is not proven",
+                proof.kernel, proof.harness
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_proofs_have_properties() {
+        let m = manifest();
+        for proof in &m.kernels {
+            assert!(
+                !proof.properties.is_empty(),
+                "kernel {} harness {} has no properties",
+                proof.kernel,
+                proof.harness
+            );
+        }
+    }
+
+    #[test]
+    fn test_manifest_serializes_to_json() {
+        let m = manifest();
+        let json = serde_json::to_string(&m).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["kernels"].is_array());
+        assert!(v["caveats"].is_array());
+    }
+}

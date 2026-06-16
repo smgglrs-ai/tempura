@@ -1372,7 +1372,8 @@ items:
     quick: cargo test --package oxide-server
 - id: auto-test-verification-manifest
   title: Add unit tests for verification manifest
-  status: planned
+  status: done
+  progress: 100
   priority: medium
   effort: XS
   scope:
