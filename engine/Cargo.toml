@@ -8,6 +8,10 @@ description = "Inference engine for oxide-serve: model loading, KV-cache, forwar
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
+[features]
+default = []
+cuda = ["oxide-kernels/cuda"]
+
 [dependencies]
 oxide-kernels = { path = "../kernels" }
 safetensors = "0.5"

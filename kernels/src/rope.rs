@@ -59,6 +59,25 @@ impl RoPE for CpuRoPE {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub struct CudaRoPE;
+
+#[cfg(feature = "cuda")]
+impl RoPE for CudaRoPE {
+    fn forward(
+        &self,
+        _x: &mut [f32],
+        _batch: usize,
+        _seq_len: usize,
+        _num_heads: usize,
+        _head_dim: usize,
+        _positions: &[u32],
+        _theta: f32,
+    ) -> Result<()> {
+        todo!("CudaRoPE: requires cargo oxide build")
+    }
+}
+
 #[cfg(kani)]
 mod kani_proofs {
     #[kani::proof]

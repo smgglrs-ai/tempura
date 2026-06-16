@@ -36,6 +36,33 @@ impl
     }
 }
 
+#[cfg(feature = "cuda")]
+impl
+    KernelPipeline<
+        oxide_kernels::attention::CudaAttention,
+        oxide_kernels::rmsnorm::CudaRMSNorm,
+        oxide_kernels::rope::CudaRoPE,
+        oxide_kernels::matmul::CudaMatMul,
+        oxide_kernels::sampling::CudaSampler,
+    >
+{
+    pub fn cuda() -> Self {
+        use oxide_kernels::attention::CudaAttention;
+        use oxide_kernels::matmul::CudaMatMul;
+        use oxide_kernels::rmsnorm::CudaRMSNorm;
+        use oxide_kernels::rope::CudaRoPE;
+        use oxide_kernels::sampling::CudaSampler;
+
+        Self {
+            attention: CudaAttention,
+            rmsnorm: CudaRMSNorm,
+            rope: CudaRoPE,
+            matmul: CudaMatMul,
+            sampler: CudaSampler,
+        }
+    }
+}
+
 impl<A, N, R, M, S> KernelPipeline<A, N, R, M, S>
 where
     A: Attention,

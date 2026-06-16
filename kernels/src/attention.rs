@@ -91,6 +91,29 @@ impl Attention for CpuAttention {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub struct CudaAttention;
+
+#[cfg(feature = "cuda")]
+impl Attention for CudaAttention {
+    fn forward(
+        &self,
+        _q: &[f32],
+        _k: &[f32],
+        _v: &[f32],
+        _output: &mut [f32],
+        _batch: usize,
+        _seq_len: usize,
+        _kv_len: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _scale: f32,
+    ) -> Result<()> {
+        todo!("CudaAttention: requires cargo oxide build")
+    }
+}
+
 #[cfg(kani)]
 mod kani_proofs {
     #[kani::proof]

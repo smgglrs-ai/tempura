@@ -40,6 +40,22 @@ impl RMSNorm for CpuRMSNorm {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub struct CudaRMSNorm;
+
+#[cfg(feature = "cuda")]
+impl RMSNorm for CudaRMSNorm {
+    fn forward(
+        &self,
+        _x: &mut [f32],
+        _weight: &[f32],
+        _hidden_size: usize,
+        _eps: f32,
+    ) -> Result<()> {
+        todo!("CudaRMSNorm: requires cargo oxide build")
+    }
+}
+
 #[cfg(kani)]
 mod kani_proofs {
     #[kani::proof]

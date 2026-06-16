@@ -154,6 +154,36 @@ impl MatMul for CpuMatMul {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub struct CudaMatMul;
+
+#[cfg(feature = "cuda")]
+impl MatMul for CudaMatMul {
+    fn forward(
+        &self,
+        _a: &[f32],
+        _b: &[f32],
+        _output: &mut [f32],
+        _m: usize,
+        _n: usize,
+        _k: usize,
+    ) -> Result<()> {
+        todo!("CudaMatMul: requires cargo oxide build")
+    }
+
+    fn forward_b_transposed(
+        &self,
+        _a: &[f32],
+        _b: &[f32],
+        _output: &mut [f32],
+        _m: usize,
+        _n: usize,
+        _k: usize,
+    ) -> Result<()> {
+        todo!("CudaMatMul: requires cargo oxide build")
+    }
+}
+
 #[cfg(kani)]
 mod kani_proofs {
     #[kani::proof]

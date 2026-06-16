@@ -248,3 +248,11 @@
     exit_reason: "Production hardening quick wins complete"
     branch: "loop/2026-06-15-5"
     tag: "loop-run/2026-06-15-5-2"
+
+- timestamp: "2026-06-16T10:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p3-cuda-toolchain"
+  summary: "Added stub Cuda* structs (CudaAttention, CudaMatMul, CudaRMSNorm, CudaRoPE, CudaSampler) behind cuda feature flag with todo!() bodies. KernelPipeline::cuda() factory. cuda feature forwarded from engine to kernels. Updated acceptance criteria after discovering cuda-oxide is a compiler backend, not a crate dependency."
+  iteration: 1
+  max_iterations: 10

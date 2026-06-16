@@ -57,6 +57,23 @@ impl LayerNorm for CpuLayerNorm {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub struct CudaLayerNorm;
+
+#[cfg(feature = "cuda")]
+impl LayerNorm for CudaLayerNorm {
+    fn forward(
+        &self,
+        _x: &mut [f32],
+        _weight: &[f32],
+        _bias: Option<&[f32]>,
+        _hidden_size: usize,
+        _eps: f32,
+    ) -> Result<()> {
+        todo!("CudaLayerNorm: requires cargo oxide build")
+    }
+}
+
 #[cfg(kani)]
 mod kani_proofs {
     #[kani::proof]

@@ -134,6 +134,20 @@ impl Sampler for CpuSampler {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub struct CudaSampler;
+
+#[cfg(feature = "cuda")]
+impl Sampler for CudaSampler {
+    fn apply(&self, _logits: &[f32], _output: &mut [f32], _params: &SamplingParams) -> Result<()> {
+        todo!("CudaSampler: requires cargo oxide build")
+    }
+
+    fn sample_token(&self, _probs: &[f32], _rng: Option<&mut dyn RngCore>) -> u32 {
+        todo!("CudaSampler: requires cargo oxide build")
+    }
+}
+
 #[cfg(kani)]
 mod kani_proofs {
     #[kani::proof]
