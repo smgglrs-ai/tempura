@@ -1,721 +1,1284 @@
 version: 1
 items:
-  # Phase 2A: Foundation (Kernels + Weights + Traces)
-  # All 2A items are independent and can be developed in parallel.
+- id: 2a-matmul
+  title: MatMul kernel trait + CPU reference implementation
+  description: 'Add MatMul trait to oxide-kernels with CpuMatMul behind cpu feature. Every transformer
+    projection needs matrix multiply — currently absent. Signature: forward(&self, a, b, output, m, n,
+    k) on &[f32] slices.
 
-  - id: 2a-matmul
-    title: MatMul kernel trait + CPU reference implementation
-    description: >
-      Add MatMul trait to oxide-kernels with CpuMatMul behind cpu feature.
-      Every transformer projection needs matrix multiply — currently absent.
-      Signature: forward(&self, a, b, output, m, n, k) on &[f32] slices.
-    status: done
-    progress: 100
-    priority: critical
-    effort: S
-    scope:
-      - kernels/src/matmul.rs
-      - kernels/src/lib.rs
-    acceptance:
-      - "MatMul trait with forward signature operating on &[f32] slices"
-      - "CpuMatMul behind cpu feature flag"
-      - "Tests: identity matrix, known-value 2x2/3x3 cases, dimension mismatch error"
-      - "Trait re-exported from kernels/src/lib.rs"
+    '
+  status: done
+  progress: 100
+  priority: critical
+  effort: S
+  scope:
+  - kernels/src/matmul.rs
+  - kernels/src/lib.rs
+  acceptance:
+  - MatMul trait with forward signature operating on &[f32] slices
+  - CpuMatMul behind cpu feature flag
+  - 'Tests: identity matrix, known-value 2x2/3x3 cases, dimension mismatch error'
+  - Trait re-exported from kernels/src/lib.rs
+- id: 2a-rmsnorm
+  title: RMSNorm kernel trait + CPU reference implementation
+  description: 'Add RMSNorm trait alongside existing LayerNorm. LLaMA uses RMSNorm (no mean subtraction).
+    Keep LayerNorm for other architectures.
 
-  - id: 2a-rmsnorm
-    title: RMSNorm kernel trait + CPU reference implementation
-    description: >
-      Add RMSNorm trait alongside existing LayerNorm. LLaMA uses RMSNorm
-      (no mean subtraction). Keep LayerNorm for other architectures.
-    status: done
-    progress: 100
-    priority: critical
-    effort: S
-    scope:
-      - kernels/src/rmsnorm.rs
-      - kernels/src/lib.rs
-    acceptance:
-      - "RMSNorm trait with forward(&self, x, weight, hidden_size, eps)"
-      - "CpuRMSNorm behind cpu feature"
-      - "Tests: output has unit RMS with identity weights, dimension mismatch error"
+    '
+  status: done
+  progress: 100
+  priority: critical
+  effort: S
+  scope:
+  - kernels/src/rmsnorm.rs
+  - kernels/src/lib.rs
+  acceptance:
+  - RMSNorm trait with forward(&self, x, weight, hidden_size, eps)
+  - CpuRMSNorm behind cpu feature
+  - 'Tests: output has unit RMS with identity weights, dimension mismatch error'
+- id: 2a-trace-types
+  title: InferenceTrace type system
+  description: 'Define trace data model before building the forward pass. Pure data structures with Serialize/Deserialize.
+    TraceLevel enum controls granularity: Off, Metadata, Summary, Full.
 
-  - id: 2a-trace-types
-    title: InferenceTrace type system
-    description: >
-      Define trace data model before building the forward pass. Pure data
-      structures with Serialize/Deserialize. TraceLevel enum controls
-      granularity: Off, Metadata, Summary, Full.
-    status: done
-    progress: 100
-    priority: critical
-    effort: S
-    scope:
-      - engine/src/trace.rs
-      - engine/src/lib.rs
-      - engine/Cargo.toml
-    acceptance:
-      - "InferenceTrace, LayerSnapshot, NormStats, SamplingSnapshot, TimingInfo structs"
-      - "TraceLevel enum: Off, Metadata, Summary, Full"
-      - "All types derive Debug, Clone, Serialize, Deserialize"
-      - "Round-trip serialization test passes"
+    '
+  status: done
+  progress: 100
+  priority: critical
+  effort: S
+  scope:
+  - engine/src/trace.rs
+  - engine/src/lib.rs
+  - engine/Cargo.toml
+  acceptance:
+  - InferenceTrace, LayerSnapshot, NormStats, SamplingSnapshot, TimingInfo structs
+  - 'TraceLevel enum: Off, Metadata, Summary, Full'
+  - All types derive Debug, Clone, Serialize, Deserialize
+  - Round-trip serialization test passes
+- id: 2a-weights
+  title: ModelWeights storage
+  description: 'Replace _weights_loaded bool placeholder with HashMap<String, Vec<f32>> keyed by safetensors
+    tensor names. Validation against ModelConfig.
 
-  - id: 2a-weights
-    title: ModelWeights storage
-    description: >
-      Replace _weights_loaded bool placeholder with HashMap<String, Vec<f32>>
-      keyed by safetensors tensor names. Validation against ModelConfig.
-    status: done
-    progress: 100
-    priority: critical
-    effort: M
-    scope:
-      - engine/src/weights.rs
-      - engine/src/model.rs
-      - engine/src/lib.rs
-    acceptance:
-      - "ModelWeights::load(loader, config) with required tensor name validation"
-      - "Standard LLaMA tensor naming (model.layers.{n}.self_attn.{q,k,v,o}_proj.weight, etc.)"
-      - "ModelWeights::get(name) accessor returns Option<&[f32]>"
-      - "Test with mock WeightLoader returning correctly-sized zero tensors"
+    '
+  status: done
+  progress: 100
+  priority: critical
+  effort: M
+  scope:
+  - engine/src/weights.rs
+  - engine/src/model.rs
+  - engine/src/lib.rs
+  acceptance:
+  - ModelWeights::load(loader, config) with required tensor name validation
+  - Standard LLaMA tensor naming (model.layers.{n}.self_attn.{q,k,v,o}_proj.weight, etc.)
+  - ModelWeights::get(name) accessor returns Option<&[f32]>
+  - Test with mock WeightLoader returning correctly-sized zero tensors
+- id: 2a-token-selection
+  title: Token selection in Sampler (deterministic)
+  description: 'CpuSampler returns probabilities but never picks a token. Add seeded RNG token selection.
+    Foundation for deterministic reproducibility.
 
-  - id: 2a-token-selection
-    title: Token selection in Sampler (deterministic)
-    description: >
-      CpuSampler returns probabilities but never picks a token. Add seeded
-      RNG token selection. Foundation for deterministic reproducibility.
-    status: done
-    progress: 100
-    priority: critical
-    effort: S
-    scope:
-      - kernels/src/sampling.rs
-      - kernels/Cargo.toml
-    acceptance:
-      - "sample_token(probs, rng) -> u32 method on Sampler trait"
-      - "Greedy mode (temperature=0): argmax without RNG"
-      - "Same seed = same token selection (deterministic reproducibility test)"
-      - "Different seeds produce different tokens (probabilistic test)"
+    '
+  status: done
+  progress: 100
+  priority: critical
+  effort: S
+  scope:
+  - kernels/src/sampling.rs
+  - kernels/Cargo.toml
+  acceptance:
+  - sample_token(probs, rng) -> u32 method on Sampler trait
+  - 'Greedy mode (temperature=0): argmax without RNG'
+  - Same seed = same token selection (deterministic reproducibility test)
+  - Different seeds produce different tokens (probabilistic test)
+- id: 2a-kani-kernels
+  title: Kani harnesses for all CPU kernel implementations
+  description: 'Write Kani proof harnesses for all 6 CPU kernels (Attention, LayerNorm, RoPE, Sampler,
+    MatMul, RMSNorm). Co-located under #[cfg(kani)]. Proves no panics, no OOB access, correct error returns.
+    Does NOT attempt f32 mathematical properties (exp/trig over-approximated).
 
-  - id: 2a-kani-kernels
-    title: Kani harnesses for all CPU kernel implementations
-    description: >
-      Write Kani proof harnesses for all 6 CPU kernels (Attention, LayerNorm,
-      RoPE, Sampler, MatMul, RMSNorm). Co-located under #[cfg(kani)].
-      Proves no panics, no OOB access, correct error returns.
-      Does NOT attempt f32 mathematical properties (exp/trig over-approximated).
-    status: done
-    progress: 100
-    priority: critical
-    effort: L
-    depends_on: [2a-matmul, 2a-rmsnorm]
-    scope:
-      - kernels/src/attention.rs
-      - kernels/src/layernorm.rs
-      - kernels/src/rope.rs
-      - kernels/src/sampling.rs
-      - kernels/src/matmul.rs
-      - kernels/src/rmsnorm.rs
-      - kernels/Cargo.toml
-    acceptance:
-      - "Each kernel file has at least one #[kani::proof] harness"
-      - "kani::assume bounds: batch 1..=2, seq_len 1..=4, heads 1..=4, head_dim 4..8"
-      - "All harnesses use #[kani::unwind(N)] with appropriate bounds"
-      - "cargo kani --package oxide-kernels passes all harnesses"
+    '
+  status: done
+  progress: 100
+  priority: critical
+  effort: L
+  depends_on:
+  - 2a-matmul
+  - 2a-rmsnorm
+  scope:
+  - kernels/src/attention.rs
+  - kernels/src/layernorm.rs
+  - kernels/src/rope.rs
+  - kernels/src/sampling.rs
+  - kernels/src/matmul.rs
+  - kernels/src/rmsnorm.rs
+  - kernels/Cargo.toml
+  acceptance:
+  - 'Each kernel file has at least one #[kani::proof] harness'
+  - 'kani::assume bounds: batch 1..=2, seq_len 1..=4, heads 1..=4, head_dim 4..8'
+  - 'All harnesses use #[kani::unwind(N)] with appropriate bounds'
+  - cargo kani --package oxide-kernels passes all harnesses
+- id: 2a-kani-kvcache
+  title: KvCache Kani proofs
+  description: 'KV cache does raw slice indexing with computed offsets — prime Kani target. Prove append_kv,
+    k_slice, v_slice, remaining_capacity safety.
 
-  - id: 2a-kani-kvcache
-    title: KvCache Kani proofs
-    description: >
-      KV cache does raw slice indexing with computed offsets — prime Kani target.
-      Prove append_kv, k_slice, v_slice, remaining_capacity safety.
-    status: done
-    progress: 100
-    priority: high
-    effort: S
-    scope:
-      - engine/src/kv_cache.rs
-      - engine/Cargo.toml
-    acceptance:
-      - "Prove append_kv never panics when seq_len + new_tokens <= max_seq_len"
-      - "Prove k_slice/v_slice never return slices past allocated memory"
-      - "Prove remaining_capacity is consistent with seq_len and max_seq_len"
+    '
+  status: done
+  progress: 100
+  priority: high
+  effort: S
+  scope:
+  - engine/src/kv_cache.rs
+  - engine/Cargo.toml
+  acceptance:
+  - Prove append_kv never panics when seq_len + new_tokens <= max_seq_len
+  - Prove k_slice/v_slice never return slices past allocated memory
+  - Prove remaining_capacity is consistent with seq_len and max_seq_len
+- id: 2b-session
+  title: InferenceSession extraction
+  description: 'Separate per-request state (KV cache, trace, position, RNG) from shared model state (weights,
+    kernels). Required for batching and trace isolation.
 
-  # Phase 2B: Working Forward Pass (Traced from Birth)
+    '
+  status: done
+  progress: 100
+  priority: critical
+  effort: S
+  depends_on:
+  - 2a-trace-types
+  - 2a-token-selection
+  scope:
+  - engine/src/session.rs
+  - engine/src/model.rs
+  - engine/src/lib.rs
+  acceptance:
+  - InferenceSession::new(config, trace_level, seed) constructor
+  - TransformerModel::forward takes &mut InferenceSession
+  - Existing tests adapted to pass a session
+- id: 2b-pipeline
+  title: KernelPipeline abstraction
+  description: 'Bundle kernel implementations into a composable unit with 5 type params (Attention, RMSNorm,
+    RoPE, MatMul, Sampler). Records per-kernel stats into LayerSnapshot based on TraceLevel.
 
-  - id: 2b-session
-    title: InferenceSession extraction
-    description: >
-      Separate per-request state (KV cache, trace, position, RNG) from shared
-      model state (weights, kernels). Required for batching and trace isolation.
-    status: done
-    progress: 100
-    priority: critical
-    effort: S
-    depends_on: [2a-trace-types, 2a-token-selection]
-    scope:
-      - engine/src/session.rs
-      - engine/src/model.rs
-      - engine/src/lib.rs
-    acceptance:
-      - "InferenceSession::new(config, trace_level, seed) constructor"
-      - "TransformerModel::forward takes &mut InferenceSession"
-      - "Existing tests adapted to pass a session"
+    '
+  status: done
+  progress: 100
+  priority: critical
+  effort: M
+  depends_on:
+  - 2a-matmul
+  - 2a-rmsnorm
+  - 2a-trace-types
+  scope:
+  - engine/src/pipeline.rs
+  - engine/src/model.rs
+  - engine/src/lib.rs
+  acceptance:
+  - KernelPipeline<A, N, R, M, S> struct with 5 kernel type params
+  - KernelPipeline::cpu_verified() factory for default CPU stack
+  - Methods wrap each kernel forward and optionally record to trace
+  - TransformerModel parameterized by KernelPipeline
+- id: 2b-forward-pass
+  title: Forward pass implementation (LLaMA architecture)
+  description: 'Embedding lookup, layer loop (RMSNorm, QKV projection, RoPE, attention + KV cache, output
+    projection, residual, RMSNorm, SiLU-gated FFN, residual), final norm, lm_head. Uses KernelPipeline.
+    Populates LayerSnapshot per layer.
 
-  - id: 2b-pipeline
-    title: KernelPipeline abstraction
-    description: >
-      Bundle kernel implementations into a composable unit with 5 type params
-      (Attention, RMSNorm, RoPE, MatMul, Sampler). Records per-kernel stats
-      into LayerSnapshot based on TraceLevel.
-    status: done
-    progress: 100
-    priority: critical
-    effort: M
-    depends_on: [2a-matmul, 2a-rmsnorm, 2a-trace-types]
-    scope:
-      - engine/src/pipeline.rs
-      - engine/src/model.rs
-      - engine/src/lib.rs
-    acceptance:
-      - "KernelPipeline<A, N, R, M, S> struct with 5 kernel type params"
-      - "KernelPipeline::cpu_verified() factory for default CPU stack"
-      - "Methods wrap each kernel forward and optionally record to trace"
-      - "TransformerModel parameterized by KernelPipeline"
+    '
+  status: done
+  progress: 100
+  priority: critical
+  effort: L
+  depends_on:
+  - 2a-weights
+  - 2b-session
+  - 2b-pipeline
+  scope:
+  - engine/src/model.rs
+  - engine/src/pipeline.rs
+  acceptance:
+  - Non-zero logits with tiny_test() config + random weights
+  - Each layer records LayerSnapshot at configured TraceLevel
+  - TraceLevel::Summary records per-layer norm stats; Full records attention scores
+  - 'At least 2 new tests: shape correctness, no-panic with random weights'
+  - cargo test --workspace passes
+- id: 2b-generate
+  title: Token generation loop
+  description: 'Autoregressive generation: forward -> sample -> select token -> record to trace -> repeat.
+    Stops at max_tokens or EOS. Records SamplingSnapshot per step. Deterministic with seeded RNG.
 
-  - id: 2b-forward-pass
-    title: Forward pass implementation (LLaMA architecture)
-    description: >
-      Embedding lookup, layer loop (RMSNorm, QKV projection, RoPE, attention +
-      KV cache, output projection, residual, RMSNorm, SiLU-gated FFN, residual),
-      final norm, lm_head. Uses KernelPipeline. Populates LayerSnapshot per layer.
-    status: done
-    progress: 100
-    priority: critical
-    effort: L
-    depends_on: [2a-weights, 2b-session, 2b-pipeline]
-    scope:
-      - engine/src/model.rs
-      - engine/src/pipeline.rs
-    acceptance:
-      - "Non-zero logits with tiny_test() config + random weights"
-      - "Each layer records LayerSnapshot at configured TraceLevel"
-      - "TraceLevel::Summary records per-layer norm stats; Full records attention scores"
-      - "At least 2 new tests: shape correctness, no-panic with random weights"
-      - "cargo test --workspace passes"
+    '
+  status: done
+  progress: 100
+  priority: critical
+  effort: M
+  depends_on:
+  - 2a-token-selection
+  - 2b-forward-pass
+  scope:
+  - engine/src/model.rs
+  acceptance:
+  - generate(session, token_ids, max_new_tokens, params) -> Vec<u32>
+  - Stops at max_tokens or EOS token
+  - Each step records SamplingSnapshot (top-k logits, probs, selected token, RNG state)
+  - 'Deterministic reproducibility test: same seed = identical output'
+- id: 2b-wire-api
+  title: Wire API to real inference
+  description: 'Connect Axum endpoints to engine. AppState gains TransformerModel and Tokenizer. Load
+    model at startup from CLI paths.
 
-  - id: 2b-generate
-    title: Token generation loop
-    description: >
-      Autoregressive generation: forward -> sample -> select token -> record
-      to trace -> repeat. Stops at max_tokens or EOS. Records SamplingSnapshot
-      per step. Deterministic with seeded RNG.
-    status: done
-    progress: 100
-    priority: critical
-    effort: M
-    depends_on: [2a-token-selection, 2b-forward-pass]
-    scope:
-      - engine/src/model.rs
-    acceptance:
-      - "generate(session, token_ids, max_new_tokens, params) -> Vec<u32>"
-      - "Stops at max_tokens or EOS token"
-      - "Each step records SamplingSnapshot (top-k logits, probs, selected token, RNG state)"
-      - "Deterministic reproducibility test: same seed = identical output"
+    '
+  status: done
+  progress: 100
+  priority: critical
+  effort: M
+  depends_on:
+  - 2b-generate
+  scope:
+  - server/src/main.rs
+  - server/src/api.rs
+  acceptance:
+  - POST /v1/chat/completions returns model-generated text (not stub)
+  - POST /v1/completions returns model-generated text
+  - GET /v1/models returns loaded model ID from --model CLI arg
+  - Error responses with meaningful messages when model not loaded
+  - cargo test --workspace passes
+- id: 2b-sse
+  title: SSE streaming
+  description: 'Token-by-token streaming via existing SSE types. Generation yields tokens through a channel;
+    handler converts to ChatCompletionChunk events.
 
-  - id: 2b-wire-api
-    title: Wire API to real inference
-    description: >
-      Connect Axum endpoints to engine. AppState gains TransformerModel and
-      Tokenizer. Load model at startup from CLI paths.
-    status: done
-    progress: 100
-    priority: critical
-    effort: M
-    depends_on: [2b-generate]
-    scope:
-      - server/src/main.rs
-      - server/src/api.rs
-    acceptance:
-      - "POST /v1/chat/completions returns model-generated text (not stub)"
-      - "POST /v1/completions returns model-generated text"
-      - "GET /v1/models returns loaded model ID from --model CLI arg"
-      - "Error responses with meaningful messages when model not loaded"
-      - "cargo test --workspace passes"
+    '
+  status: done
+  progress: 100
+  priority: high
+  effort: M
+  depends_on:
+  - 2b-wire-api
+  scope:
+  - server/src/api.rs
+  - server/src/sse.rs
+  - engine/src/model.rs
+  acceptance:
+  - 'stream: true triggers SSE response with ChatCompletionChunk events'
+  - '[DONE] sentinel after generation completes'
+  - Non-streaming requests still work
+  - cargo test --workspace passes
+- id: 2c-trace-api
+  title: Trace retrieval API
+  description: 'oxide-specific endpoints for inference traces. Requests with oxide_trace_level field get
+    a trace_id in the response. Traces stored in bounded in-memory ring buffer.
 
-  - id: 2b-sse
-    title: SSE streaming
-    description: >
-      Token-by-token streaming via existing SSE types. Generation yields tokens
-      through a channel; handler converts to ChatCompletionChunk events.
-    status: done
-    progress: 100
-    priority: high
-    effort: M
-    depends_on: [2b-wire-api]
-    scope:
-      - server/src/api.rs
-      - server/src/sse.rs
-      - engine/src/model.rs
-    acceptance:
-      - "stream: true triggers SSE response with ChatCompletionChunk events"
-      - "[DONE] sentinel after generation completes"
-      - "Non-streaming requests still work"
-      - "cargo test --workspace passes"
+    '
+  status: done
+  progress: 100
+  priority: high
+  effort: M
+  depends_on:
+  - 2b-wire-api
+  scope:
+  - server/src/api.rs
+  - server/src/trace_store.rs
+  - server/src/main.rs
+  acceptance:
+  - GET /oxide/v1/traces/{id} returns full InferenceTrace as JSON
+  - GET /oxide/v1/traces lists recent trace IDs with metadata
+  - DELETE /oxide/v1/traces/{id} removes a trace
+  - Configurable via --max-traces (default 100)
+- id: 2c-verify-api
+  title: Verification status API
+  description: 'Report which kernels have Kani proofs and what properties are proven. Static manifest
+    compiled into the binary.
 
-  # Phase 2C: Differentiating API Surface
+    '
+  status: done
+  progress: 100
+  priority: medium
+  effort: S
+  depends_on:
+  - 2a-kani-kernels
+  scope:
+  - kernels/src/verification_manifest.rs
+  - server/src/api.rs
+  acceptance:
+  - GET /oxide/v1/verified returns JSON listing each kernel, proof status, properties
+  - Includes caveats about what IS and ISN'T proven (safety vs math correctness)
+- id: 2c-replay-api
+  title: Deterministic replay API
+  description: 'Replay a previous inference and verify bit-identical output. Accepts trace_id or explicit
+    (tokens, seed, params).
 
-  - id: 2c-trace-api
-    title: Trace retrieval API
-    description: >
-      oxide-specific endpoints for inference traces. Requests with
-      oxide_trace_level field get a trace_id in the response. Traces
-      stored in bounded in-memory ring buffer.
-    status: done
-    progress: 100
-    priority: high
-    effort: M
-    depends_on: [2b-wire-api]
-    scope:
-      - server/src/api.rs
-      - server/src/trace_store.rs
-      - server/src/main.rs
-    acceptance:
-      - "GET /oxide/v1/traces/{id} returns full InferenceTrace as JSON"
-      - "GET /oxide/v1/traces lists recent trace IDs with metadata"
-      - "DELETE /oxide/v1/traces/{id} removes a trace"
-      - "Configurable via --max-traces (default 100)"
+    '
+  status: done
+  progress: 100
+  priority: medium
+  effort: M
+  depends_on:
+  - 2b-generate
+  - 2c-trace-api
+  scope:
+  - server/src/api.rs
+  - server/src/replay.rs
+  acceptance:
+  - POST /oxide/v1/replay accepts trace_id or explicit (tokens, seed, params)
+  - 'Returns match: true/false with per-token comparison'
+  - 'Replay with same seed produces match: true'
+- id: 2c-dual-pipeline
+  title: DualPipeline comparison endpoint
+  description: 'Run two kernel pipeline configs on same input, report divergence. Initially CPU vs CPU
+    configs; later CPU vs CUDA for GPU validation.
 
-  - id: 2c-verify-api
-    title: Verification status API
-    description: >
-      Report which kernels have Kani proofs and what properties are proven.
-      Static manifest compiled into the binary.
-    status: done
-    progress: 100
-    priority: medium
-    effort: S
-    depends_on: [2a-kani-kernels]
-    scope:
-      - kernels/src/verification_manifest.rs
-      - server/src/api.rs
-    acceptance:
-      - "GET /oxide/v1/verified returns JSON listing each kernel, proof status, properties"
-      - "Includes caveats about what IS and ISN'T proven (safety vs math correctness)"
+    '
+  status: done
+  progress: 100
+  priority: medium
+  effort: M
+  depends_on:
+  - 2b-pipeline
+  - 2b-forward-pass
+  scope:
+  - engine/src/dual_pipeline.rs
+  - server/src/api.rs
+  acceptance:
+  - POST /oxide/v1/compare reports per-layer max abs diff, L2 distance, token match
+  - Two identical pipelines produce zero divergence
+- id: 2c-kani-ci
+  title: Kani in CI
+  description: 'cargo kani runs on every PR. Verification is continuous, not one-time.
 
-  - id: 2c-replay-api
-    title: Deterministic replay API
-    description: >
-      Replay a previous inference and verify bit-identical output.
-      Accepts trace_id or explicit (tokens, seed, params).
-    status: done
-    progress: 100
-    priority: medium
-    effort: M
-    depends_on: [2b-generate, 2c-trace-api]
-    scope:
-      - server/src/api.rs
-      - server/src/replay.rs
-    acceptance:
-      - "POST /oxide/v1/replay accepts trace_id or explicit (tokens, seed, params)"
-      - "Returns match: true/false with per-token comparison"
-      - "Replay with same seed produces match: true"
+    '
+  status: done
+  progress: 100
+  priority: medium
+  effort: S
+  depends_on:
+  - 2a-kani-kernels
+  - 2a-kani-kvcache
+  scope:
+  - .github/workflows/kani.yml
+  acceptance:
+  - CI job runs cargo kani --package oxide-kernels and oxide-engine
+  - Kani version pinned for reproducibility
+  - Job fails if any harness fails
+- id: p3-cuda-toolchain
+  title: cuda-oxide toolchain setup
+  description: 'Prepare the codebase for cuda-oxide GPU kernels. cuda-oxide is a compiler backend (cargo
+    oxide build), not a crate dependency. Add stub Cuda* structs behind the cuda feature flag proving
+    the feature-gated module structure compiles. Forward cuda feature from engine to kernels. Actual GPU
+    implementations go in p3-cuda-kernels.
 
-  - id: 2c-dual-pipeline
-    title: DualPipeline comparison endpoint
-    description: >
-      Run two kernel pipeline configs on same input, report divergence.
-      Initially CPU vs CPU configs; later CPU vs CUDA for GPU validation.
-    status: done
-    progress: 100
-    priority: medium
-    effort: M
-    depends_on: [2b-pipeline, 2b-forward-pass]
-    scope:
-      - engine/src/dual_pipeline.rs
-      - server/src/api.rs
-    acceptance:
-      - "POST /oxide/v1/compare reports per-layer max abs diff, L2 distance, token match"
-      - "Two identical pipelines produce zero divergence"
+    '
+  status: done
+  progress: 100
+  priority: high
+  effort: M
+  scope:
+  - kernels/src/attention.rs
+  - kernels/src/matmul.rs
+  - kernels/src/rmsnorm.rs
+  - kernels/src/rope.rs
+  - kernels/src/sampling.rs
+  - engine/Cargo.toml
+  - engine/src/pipeline.rs
+  acceptance:
+  - cargo build (default features) still succeeds with no CUDA toolkit installed
+  - cargo check --features cuda compiles all stub Cuda* structs
+  - 'Stub Cuda* structs exist behind #[cfg(feature = cuda)] with todo!() bodies in each kernel file'
+  - engine/src/pipeline.rs has KernelPipeline::cuda() constructor behind feature gate
+  - engine/Cargo.toml forwards cuda feature to oxide-kernels
+  verification:
+    quick: cargo build && cargo test
+- id: p3-cuda-infra
+  title: GPU memory and kernel launch infrastructure
+  description: 'Create kernels/src/gpu/ module with CudaContext management and host-to-device transfer
+    helpers that map to KernelError. Each Cuda* struct will own a context handle and copy data in/out
+    per call.
 
-  - id: 2c-kani-ci
-    title: Kani in CI
-    description: >
-      cargo kani runs on every PR. Verification is continuous, not one-time.
-    status: done
-    progress: 100
-    priority: medium
-    effort: S
-    depends_on: [2a-kani-kernels, 2a-kani-kvcache]
-    scope:
-      - .github/workflows/kani.yml
-    acceptance:
-      - "CI job runs cargo kani --package oxide-kernels and oxide-engine"
-      - "Kani version pinned for reproducibility"
-      - "Job fails if any harness fails"
+    '
+  status: done
+  progress: 100
+  priority: high
+  effort: M
+  depends_on:
+  - p3-cuda-toolchain
+  scope:
+  - kernels/src/gpu/
+  - kernels/src/lib.rs
+  acceptance:
+  - kernels/src/gpu/mod.rs with CudaContext and DeviceBuffer helpers behind cuda feature
+  - cargo oxide build succeeds on the kernels crate
+  - Helper functions map cuda-oxide errors to KernelError
+  verification:
+    quick: cargo oxide build --package oxide-kernels
+- id: p3-cuda-rope
+  title: CudaRoPE — first GPU kernel (elementwise)
+  description: 'Elementwise kernel — no shared memory, no reductions. Validates the full pipeline: kernel
+    authoring, build, launch, verify against CPU reference via DualPipeline.
 
-  # Phase 3: cuda-oxide GPU Kernels (core product differentiator)
+    '
+  status: done
+  progress: 100
+  priority: high
+  effort: S
+  depends_on:
+  - p3-cuda-infra
+  scope:
+  - kernels/src/rope.rs
+  - kernels/src/gpu/
+  acceptance:
+  - CudaRoPE replaces todo!() with working GPU kernel
+  - DualPipeline CPU vs GPU within 1e-4 for various configs
+  - Position-zero identity property preserved on GPU
+  - cargo oxide build && cargo test --features cuda passes
+- id: p3-cuda-rmsnorm
+  title: CudaRMSNorm — warp-level reductions
+  description: 'Introduces warp-level shuffle reductions for sum-of-squares. One thread block per token
+    row, fused RMS compute and scale.
 
-  - id: p3-cuda-toolchain
-    title: cuda-oxide toolchain setup
-    description: >
-      Prepare the codebase for cuda-oxide GPU kernels. cuda-oxide is a
-      compiler backend (cargo oxide build), not a crate dependency. Add
-      stub Cuda* structs behind the cuda feature flag proving the
-      feature-gated module structure compiles. Forward cuda feature from
-      engine to kernels. Actual GPU implementations go in p3-cuda-kernels.
-    status: done
-    progress: 100
-    priority: high
-    effort: M
-    scope:
-      - kernels/src/attention.rs
-      - kernels/src/matmul.rs
-      - kernels/src/rmsnorm.rs
-      - kernels/src/rope.rs
-      - kernels/src/sampling.rs
-      - engine/Cargo.toml
-      - engine/src/pipeline.rs
-    acceptance:
-      - "cargo build (default features) still succeeds with no CUDA toolkit installed"
-      - "cargo check --features cuda compiles all stub Cuda* structs"
-      - "Stub Cuda* structs exist behind #[cfg(feature = cuda)] with todo!() bodies in each kernel file"
-      - "engine/src/pipeline.rs has KernelPipeline::cuda() constructor behind feature gate"
-      - "engine/Cargo.toml forwards cuda feature to oxide-kernels"
-    verification:
-      quick: "cargo build && cargo test"
+    '
+  status: done
+  progress: 100
+  priority: high
+  effort: M
+  depends_on:
+  - p3-cuda-infra
+  scope:
+  - kernels/src/rmsnorm.rs
+  - kernels/src/gpu/
+  acceptance:
+  - DualPipeline CPU vs GPU within 1e-4
+  - In-place semantics preserved
+  - cargo oxide build && cargo test --features cuda passes
+- id: p3-cuda-matmul
+  title: CudaMatMul — tiled shared-memory GEMM
+  description: 'Tiled shared-memory GEMM following cuda-oxide tiled_sgemm example. Both forward and forward_b_transposed.
+    This is the performance bottleneck — the kernel that makes GPU inference worthwhile.
 
-  - id: p3-cuda-infra
-    title: GPU memory and kernel launch infrastructure
-    description: >
-      Create kernels/src/gpu/ module with CudaContext management and
-      host-to-device transfer helpers that map to KernelError. Each Cuda*
-      struct will own a context handle and copy data in/out per call.
-    status: done
-    progress: 100
-    priority: high
-    effort: M
-    depends_on: [p3-cuda-toolchain]
-    scope:
-      - kernels/src/gpu/
-      - kernels/src/lib.rs
-    acceptance:
-      - "kernels/src/gpu/mod.rs with CudaContext and DeviceBuffer helpers behind cuda feature"
-      - "cargo oxide build succeeds on the kernels crate"
-      - "Helper functions map cuda-oxide errors to KernelError"
-    verification:
-      quick: "cargo oxide build --package oxide-kernels"
+    '
+  status: done
+  progress: 100
+  priority: high
+  effort: L
+  depends_on:
+  - p3-cuda-infra
+  scope:
+  - kernels/src/matmul.rs
+  - kernels/src/gpu/
+  acceptance:
+  - DualPipeline CPU vs GPU within 1e-4 for m,n,k up to 4096
+  - Both forward and forward_b_transposed implemented
+  - 'GPU faster than CPU gemm for m,n,k >= 128 (not met: transfer-dominated; GPU wins when data stays
+    on-device)'
+  - cargo oxide build && cargo test --features cuda passes
+- id: p3-cuda-attention
+  title: CudaAttention — GQA with softmax reductions
+  description: 'Parallelize across (batch, head, position). Warp reductions for softmax. Start with naive
+    GPU attention — Flash Attention as follow-up optimization.
 
-  - id: p3-cuda-rope
-    title: CudaRoPE — first GPU kernel (elementwise)
-    description: >
-      Elementwise kernel — no shared memory, no reductions. Validates
-      the full pipeline: kernel authoring, build, launch, verify against
-      CPU reference via DualPipeline.
-    status: done
-    progress: 100
-    priority: high
-    effort: S
-    depends_on: [p3-cuda-infra]
-    scope:
-      - kernels/src/rope.rs
-      - kernels/src/gpu/
-    acceptance:
-      - "CudaRoPE replaces todo!() with working GPU kernel"
-      - "DualPipeline CPU vs GPU within 1e-4 for various configs"
-      - "Position-zero identity property preserved on GPU"
-      - "cargo oxide build && cargo test --features cuda passes"
+    '
+  status: done
+  progress: 100
+  priority: high
+  effort: L
+  depends_on:
+  - p3-cuda-infra
+  scope:
+  - kernels/src/attention.rs
+  - kernels/src/gpu/
+  acceptance:
+  - DualPipeline CPU vs GPU within 1e-4 including GQA configs
+  - Handles num_heads != num_kv_heads (grouped-query attention)
+  - cargo oxide build && cargo test --features cuda passes
+- id: p3-gpu-validation
+  title: DualPipeline CPU vs GPU validation
+  description: 'Formalize GPU kernel validation as a benchmark suite. Add timing for all kernels at inference-realistic
+    sizes (MicroLlama-scale projections), report speedup ratios, and validate correctness.
 
-  - id: p3-cuda-rmsnorm
-    title: CudaRMSNorm — warp-level reductions
-    description: >
-      Introduces warp-level shuffle reductions for sum-of-squares.
-      One thread block per token row, fused RMS compute and scale.
-    status: done
-    progress: 100
-    priority: high
-    effort: M
-    depends_on: [p3-cuda-infra]
-    scope:
-      - kernels/src/rmsnorm.rs
-      - kernels/src/gpu/
-    acceptance:
-      - "DualPipeline CPU vs GPU within 1e-4"
-      - "In-place semantics preserved"
-      - "cargo oxide build && cargo test --features cuda passes"
+    '
+  status: done
+  progress: 100
+  priority: high
+  effort: S
+  depends_on:
+  - p3-cuda-matmul
+  - p3-cuda-attention
+  - 2c-dual-pipeline
+  scope:
+  - tests-gpu/src/main.rs
+  acceptance:
+  - tests-gpu binary tests all 4 GPU kernels with CPU vs GPU comparison
+  - Each kernel reports max abs diff AND timing (CPU ms, GPU ms, speedup)
+  - 'MatMul benchmark includes inference-realistic sizes: 1x1024x1024, 1x5632x1024, 1x32000x1024'
+  - Attention benchmark includes MHA and GQA at seq_len=128 with head_dim=64
+  - All tests pass with max diff < 1e-3
+  - GPU speedup > 1x demonstrated for at least one matmul size
+  verification:
+    quick: cd tests-gpu && cargo oxide run
+- id: p3-turboquant
+  title: TurboQuant/PQO KV-cache compression kernel
+  description: 'Add a KV-cache compression kernel using PolarQuant-Only (PQO) from TurboQuant (ICLR 2026).
+    Introduces a KvCacheCompressor trait with compress/decompress operations that quantize KV vectors
+    to 3 bits using polar coordinate encoding, a CPU reference, and a cuda-oxide GPU kernel behind the
+    cuda feature flag. The engine KvCache gains an optional compression layer extending sequence capacity
+    ~5x. Adapts the PQO variant (no QJL bias correction) into the existing kernel trait pattern with Kani
+    verification harnesses.
 
-  - id: p3-cuda-matmul
-    title: CudaMatMul — tiled shared-memory GEMM
-    description: >
-      Tiled shared-memory GEMM following cuda-oxide tiled_sgemm example.
-      Both forward and forward_b_transposed. This is the performance
-      bottleneck — the kernel that makes GPU inference worthwhile.
-    status: done
-    progress: 100
-    priority: high
-    effort: L
-    depends_on: [p3-cuda-infra]
-    scope:
-      - kernels/src/matmul.rs
-      - kernels/src/gpu/
-    acceptance:
-      - "DualPipeline CPU vs GPU within 1e-4 for m,n,k up to 4096"
-      - "Both forward and forward_b_transposed implemented"
-      - "GPU faster than CPU gemm for m,n,k >= 128 (not met: transfer-dominated; GPU wins when data stays on-device)"
-      - "cargo oxide build && cargo test --features cuda passes"
+    '
+  status: done
+  progress: 100
+  priority: medium
+  effort: L
+  depends_on:
+  - p3-cuda-matmul
+  scope:
+  - kernels/src/turboquant.rs
+  - kernels/src/lib.rs
+  - kernels/src/gpu/turboquant_kernel.rs
+  - kernels/src/gpu/mod.rs
+  - kernels/src/verification_manifest.rs
+  - kernels/Cargo.toml
+  - engine/src/kv_cache.rs
+  - engine/src/pipeline.rs
+  - engine/src/dual_pipeline.rs
+  acceptance:
+  - KvCacheCompressor trait with compress(&[f32], head_dim) -> CompressedKV and decompress methods
+  - 'CpuPolarQuant: round-trip error below 5% relative L2 norm (property-tested)'
+  - CudaPolarQuant behind cuda feature flag, matching CPU output within GPU tolerance
+  - KvCache optional CompressedKvCache mode (compress on append, decompress on read)
+  - Kani harnesses prove compress/decompress bounds-safety (no OOB, no panics)
+  - 'DualPipeline comparison: compressed vs uncompressed KvCache divergence report'
+  verification:
+    quick: cargo test --package oxide-kernels --package oxide-engine
+- id: p4-kvcache-pool
+  title: Multi-sequence KV cache (slot-based pool)
+  description: 'Refactor KvCache from single-sequence to slot-based pool managing multiple concurrent
+    sequences. Pre-allocate fixed slots with acquire/release semantics. InferenceSession references a
+    slot instead of owning a cache. Prerequisite for continuous batching — without it, all requests serialize
+    through a single cache.
 
-  - id: p3-cuda-attention
-    title: CudaAttention — GQA with softmax reductions
-    description: >
-      Parallelize across (batch, head, position). Warp reductions for
-      softmax. Start with naive GPU attention — Flash Attention as
-      follow-up optimization.
-    status: done
-    progress: 100
-    priority: high
-    effort: L
-    depends_on: [p3-cuda-infra]
-    scope:
-      - kernels/src/attention.rs
-      - kernels/src/gpu/
-    acceptance:
-      - "DualPipeline CPU vs GPU within 1e-4 including GQA configs"
-      - "Handles num_heads != num_kv_heads (grouped-query attention)"
-      - "cargo oxide build && cargo test --features cuda passes"
+    '
+  status: done
+  progress: 100
+  priority: medium
+  effort: M
+  scope:
+  - engine/src/kv_cache.rs
+  - engine/src/session.rs
+  - engine/src/model.rs
+  - server/src/batch.rs
+  - server/src/api.rs
+  acceptance:
+  - KvCachePool with configurable num_slots, independent K/V buffers per slot
+  - acquire() returns SlotHandle or error; release(slot) resets and returns to pool
+  - InferenceSession holds slot index, model.forward() routes through pool
+  - BatchScheduler.next_batch() acquires slots, releases on completion, backpressure when exhausted
+  - Pool of size 1 behaves identically to current KvCache (backward compat)
+  - 'Concurrent slot isolation tested: two slots produce independent K/V slices'
+  verification:
+    quick: cargo test --workspace
+- id: p4-batch-scheduler
+  title: Verified continuous batching with preemption
+  description: 'Replace stub FIFO BatchScheduler with iteration-level continuous batching. Tracks active
+    sequences, manages slot-based KV cache pool, supports preemption under memory pressure. Admits new
+    prefill requests between decode iterations. Kani harnesses prove no-starvation and slot-accounting
+    safety.
 
-  - id: p3-gpu-validation
-    title: DualPipeline CPU vs GPU validation
-    description: >
-      Formalize GPU kernel validation as a benchmark suite. Add timing
-      for all kernels at inference-realistic sizes (MicroLlama-scale
-      projections), report speedup ratios, and validate correctness.
-    status: done
-    progress: 100
-    priority: high
-    effort: S
-    depends_on: [p3-cuda-matmul, p3-cuda-attention, 2c-dual-pipeline]
-    scope:
-      - tests-gpu/src/main.rs
-    acceptance:
-      - "tests-gpu binary tests all 4 GPU kernels with CPU vs GPU comparison"
-      - "Each kernel reports max abs diff AND timing (CPU ms, GPU ms, speedup)"
-      - "MatMul benchmark includes inference-realistic sizes: 1x1024x1024, 1x5632x1024, 1x32000x1024"
-      - "Attention benchmark includes MHA and GQA at seq_len=128 with head_dim=64"
-      - "All tests pass with max diff < 1e-3"
-      - "GPU speedup > 1x demonstrated for at least one matmul size"
-    verification:
-      quick: "cd tests-gpu && cargo oxide run"
+    '
+  status: done
+  progress: 100
+  priority: medium
+  effort: XL
+  depends_on:
+  - p4-kvcache-pool
+  scope:
+  - engine/src/kv_cache.rs
+  - server/src/batch.rs
+  - server/src/api.rs
+  - server/src/main.rs
+  - engine/src/session.rs
+  acceptance:
+  - Scheduler tracks per-sequence state (slot id, position, priority/age), admits between iterations
+  - KvCachePool with allocate/release/preempt operations
+  - Preemption evicts lowest-priority sequence, preserves token_ids for recompute
+  - API handlers submit through BatchScheduler instead of creating InferenceSession inline
+  - 'Kani proofs: slot accounting (no double-alloc, no OOB), no-starvation'
+  - 'Tests: mixed prefill/decode batches, preemption under full pool, re-admission'
+  verification:
+    quick: cargo test --workspace
+- id: p5-speculative-decoding
+  title: Speculative decoding
+  description: 'Accelerate autoregressive generation with a draft model that proposes K candidate tokens
+    per step, verified in a single batched target forward pass. Requires SpeculativeDecoder orchestrator
+    coordinating two TransformerModel instances, rejection-sampling verification loop maintaining distribution
+    equivalence, KvCache rollback on rejected tokens, and server integration via CLI flags.
 
-  - id: p3-turboquant
-    title: TurboQuant/PQO KV-cache compression kernel
-    description: >
-      Add a KV-cache compression kernel using PolarQuant-Only (PQO) from
-      TurboQuant (ICLR 2026). Introduces a KvCacheCompressor trait with
-      compress/decompress operations that quantize KV vectors to 3 bits
-      using polar coordinate encoding, a CPU reference, and a cuda-oxide
-      GPU kernel behind the cuda feature flag. The engine KvCache gains an
-      optional compression layer extending sequence capacity ~5x. Adapts
-      the PQO variant (no QJL bias correction) into the existing kernel
-      trait pattern with Kani verification harnesses.
-    status: done
-    progress: 100
-    priority: medium
-    effort: L
-    depends_on: [p3-cuda-matmul]
-    scope:
-      - kernels/src/turboquant.rs
-      - kernels/src/lib.rs
-      - kernels/src/gpu/turboquant_kernel.rs
-      - kernels/src/gpu/mod.rs
-      - kernels/src/verification_manifest.rs
-      - kernels/Cargo.toml
-      - engine/src/kv_cache.rs
-      - engine/src/pipeline.rs
-      - engine/src/dual_pipeline.rs
-    acceptance:
-      - "KvCacheCompressor trait with compress(&[f32], head_dim) -> CompressedKV and decompress methods"
-      - "CpuPolarQuant: round-trip error below 5% relative L2 norm (property-tested)"
-      - "CudaPolarQuant behind cuda feature flag, matching CPU output within GPU tolerance"
-      - "KvCache optional CompressedKvCache mode (compress on append, decompress on read)"
-      - "Kani harnesses prove compress/decompress bounds-safety (no OOB, no panics)"
-      - "DualPipeline comparison: compressed vs uncompressed KvCache divergence report"
-    verification:
-      quick: "cargo test --package oxide-kernels --package oxide-engine"
+    '
+  status: done
+  progress: 100
+  priority: low
+  effort: L
+  scope:
+  - engine/src/speculative.rs
+  - engine/src/kv_cache.rs
+  - engine/src/session.rs
+  - engine/src/model.rs
+  - engine/src/trace.rs
+  - server/src/main.rs
+  - server/src/api.rs
+  acceptance:
+  - Draft model produces K candidates with log-probabilities
+  - Rejection sampling guarantees identical output distribution to standard decoding
+  - KvCache rollback on rejection — no stale entries (tested against standard generate)
+  - Bit-identical output when draft=target (determinism test)
+  - InferenceTrace records speculative metadata (proposed, accepted, rejected, acceptance rate)
+  - CLI flags --draft-model, --speculative-k; endpoints use when configured
+  verification:
+    quick: cargo test --workspace
+- id: p5-tensor-parallelism
+  title: Tensor parallelism
+  description: 'Distribute model layers across multiple GPUs via column-parallel (QKV/gate/up) and row-parallel
+    (output/down) weight sharding. Requires AllReduce communication primitive, multi-device GpuContext,
+    sharded ModelWeights, and updated forward pass with inter-GPU sync at layer boundaries.
 
-  # Phase 4: Continuous Batching + Scheduling
+    '
+  status: done
+  progress: 100
+  priority: low
+  effort: XL
+  scope:
+  - kernels/src/allreduce.rs
+  - kernels/src/gpu/mod.rs
+  - engine/src/config.rs
+  - engine/src/weights.rs
+  - engine/src/pipeline.rs
+  - engine/src/model.rs
+  - engine/src/session.rs
+  - server/src/main.rs
+  acceptance:
+  - ModelConfig accepts tensor_parallel_size (default 1)
+  - GpuContext supports multi-device initialization with per-rank CudaContext
+  - AllReduce kernel (NCCL or ring-reduce fallback) with CPU no-op reference for TP=1
+  - Bit-identical logits for TP=1 vs TP=N (DualPipeline verification)
+  - CLI --tensor-parallel N flag
+  - Integration test with tiny_test TP=2 on CPU verifies shape and numerical equivalence
+  verification:
+    quick: cargo test --workspace
+- id: p5-quantization
+  title: Quantization support (GPTQ, AWQ, GGUF)
+  description: 'Load and run inference on quantized weights in GPTQ, AWQ, and GGUF formats. Requires quantization-aware
+    weight representation (replacing f32-only ModelWeights), dequantization kernels converting packed
+    integers to f32 at matmul time, format-specific loaders parsing quantization metadata, and a quantized
+    matmul path in CPU/GPU pipelines.
 
-  - id: p4-kvcache-pool
-    title: Multi-sequence KV cache (slot-based pool)
-    description: >
-      Refactor KvCache from single-sequence to slot-based pool managing
-      multiple concurrent sequences. Pre-allocate fixed slots with
-      acquire/release semantics. InferenceSession references a slot
-      instead of owning a cache. Prerequisite for continuous batching —
-      without it, all requests serialize through a single cache.
-    status: done
-    progress: 100
-    priority: medium
-    effort: M
-    scope:
-      - engine/src/kv_cache.rs
-      - engine/src/session.rs
-      - engine/src/model.rs
-      - server/src/batch.rs
-      - server/src/api.rs
-    acceptance:
-      - "KvCachePool with configurable num_slots, independent K/V buffers per slot"
-      - "acquire() returns SlotHandle or error; release(slot) resets and returns to pool"
-      - "InferenceSession holds slot index, model.forward() routes through pool"
-      - "BatchScheduler.next_batch() acquires slots, releases on completion, backpressure when exhausted"
-      - "Pool of size 1 behaves identically to current KvCache (backward compat)"
-      - "Concurrent slot isolation tested: two slots produce independent K/V slices"
-    verification:
-      quick: "cargo test --workspace"
-
-  - id: p4-batch-scheduler
-    title: Verified continuous batching with preemption
-    description: >
-      Replace stub FIFO BatchScheduler with iteration-level continuous
-      batching. Tracks active sequences, manages slot-based KV cache pool,
-      supports preemption under memory pressure. Admits new prefill requests
-      between decode iterations. Kani harnesses prove no-starvation and
-      slot-accounting safety.
-    status: done
-    progress: 100
-    priority: medium
-    effort: XL
-    depends_on: [p4-kvcache-pool]
-    scope:
-      - engine/src/kv_cache.rs
-      - server/src/batch.rs
-      - server/src/api.rs
-      - server/src/main.rs
-      - engine/src/session.rs
-    acceptance:
-      - "Scheduler tracks per-sequence state (slot id, position, priority/age), admits between iterations"
-      - "KvCachePool with allocate/release/preempt operations"
-      - "Preemption evicts lowest-priority sequence, preserves token_ids for recompute"
-      - "API handlers submit through BatchScheduler instead of creating InferenceSession inline"
-      - "Kani proofs: slot accounting (no double-alloc, no OOB), no-starvation"
-      - "Tests: mixed prefill/decode batches, preemption under full pool, re-admission"
-    verification:
-      quick: "cargo test --workspace"
-
-  # Phase 5: Production Hardening
-
-  - id: p5-speculative-decoding
-    title: Speculative decoding
-    description: >
-      Accelerate autoregressive generation with a draft model that proposes
-      K candidate tokens per step, verified in a single batched target
-      forward pass. Requires SpeculativeDecoder orchestrator coordinating
-      two TransformerModel instances, rejection-sampling verification loop
-      maintaining distribution equivalence, KvCache rollback on rejected
-      tokens, and server integration via CLI flags.
-    status: done
-    progress: 100
-    priority: low
-    effort: L
-    scope:
-      - engine/src/speculative.rs
-      - engine/src/kv_cache.rs
-      - engine/src/session.rs
-      - engine/src/model.rs
-      - engine/src/trace.rs
-      - server/src/main.rs
-      - server/src/api.rs
-    acceptance:
-      - "Draft model produces K candidates with log-probabilities"
-      - "Rejection sampling guarantees identical output distribution to standard decoding"
-      - "KvCache rollback on rejection — no stale entries (tested against standard generate)"
-      - "Bit-identical output when draft=target (determinism test)"
-      - "InferenceTrace records speculative metadata (proposed, accepted, rejected, acceptance rate)"
-      - "CLI flags --draft-model, --speculative-k; endpoints use when configured"
-    verification:
-      quick: "cargo test --workspace"
-
-  - id: p5-tensor-parallelism
-    title: Tensor parallelism
-    description: >
-      Distribute model layers across multiple GPUs via column-parallel
-      (QKV/gate/up) and row-parallel (output/down) weight sharding.
-      Requires AllReduce communication primitive, multi-device GpuContext,
-      sharded ModelWeights, and updated forward pass with inter-GPU sync
-      at layer boundaries.
-    status: done
-    progress: 100
-    priority: low
-    effort: XL
-    scope:
-      - kernels/src/allreduce.rs
-      - kernels/src/gpu/mod.rs
-      - engine/src/config.rs
-      - engine/src/weights.rs
-      - engine/src/pipeline.rs
-      - engine/src/model.rs
-      - engine/src/session.rs
-      - server/src/main.rs
-    acceptance:
-      - "ModelConfig accepts tensor_parallel_size (default 1)"
-      - "GpuContext supports multi-device initialization with per-rank CudaContext"
-      - "AllReduce kernel (NCCL or ring-reduce fallback) with CPU no-op reference for TP=1"
-      - "Bit-identical logits for TP=1 vs TP=N (DualPipeline verification)"
-      - "CLI --tensor-parallel N flag"
-      - "Integration test with tiny_test TP=2 on CPU verifies shape and numerical equivalence"
-    verification:
-      quick: "cargo test --workspace"
-
-  - id: p5-quantization
-    title: Quantization support (GPTQ, AWQ, GGUF)
-    description: >
-      Load and run inference on quantized weights in GPTQ, AWQ, and GGUF
-      formats. Requires quantization-aware weight representation (replacing
-      f32-only ModelWeights), dequantization kernels converting packed
-      integers to f32 at matmul time, format-specific loaders parsing
-      quantization metadata, and a quantized matmul path in CPU/GPU pipelines.
-    status: done
-    progress: 100
-    priority: low
-    effort: XL
-    scope:
-      - kernels/src/matmul.rs
-      - engine/src/loader.rs
-      - engine/src/weights.rs
-      - engine/src/config.rs
-      - engine/src/model.rs
-      - engine/src/pipeline.rs
-      - server/src/main.rs
-      - kernels/src/gpu/
-    acceptance:
-      - "WeightLoader supports non-f32 dtypes (int4, int8, float16) with dtype metadata"
-      - "QuantConfig type (format, bits, group_size, symmetric/asymmetric)"
-      - "GPTQ loader reads qweight/qzeros/scales from safetensors"
-      - "AWQ loader reads AWQ-specific tensor layout"
-      - "GGUF loader parses binary container, loads Q4_0/Q4_1/Q8_0 blocks"
-      - "Dequantize-fused matmul within 1e-2 relative error of f32 equivalent"
-    verification:
-      quick: "cargo test --workspace"
-
-  - id: p5-metrics
-    title: Prometheus metrics
-    status: done
-    progress: 100
-    priority: medium
-    effort: S
-    scope:
-      - server/src/main.rs
-      - server/Cargo.toml
-    acceptance:
-      - "GET /metrics returns Prometheus-format metrics"
-      - "At least request_count, request_duration, tokens_generated tracked"
-
-  - id: p5-docker
-    title: Docker/container support
-    status: done
-    progress: 100
-    priority: medium
-    effort: S
-    scope:
-      - Dockerfile
-      - .dockerignore
-    acceptance:
-      - "Dockerfile builds successfully"
-      - "Container starts and responds to GET /v1/models"
+    '
+  status: done
+  progress: 100
+  priority: low
+  effort: XL
+  scope:
+  - kernels/src/matmul.rs
+  - engine/src/loader.rs
+  - engine/src/weights.rs
+  - engine/src/config.rs
+  - engine/src/model.rs
+  - engine/src/pipeline.rs
+  - server/src/main.rs
+  - kernels/src/gpu/
+  acceptance:
+  - WeightLoader supports non-f32 dtypes (int4, int8, float16) with dtype metadata
+  - QuantConfig type (format, bits, group_size, symmetric/asymmetric)
+  - GPTQ loader reads qweight/qzeros/scales from safetensors
+  - AWQ loader reads AWQ-specific tensor layout
+  - GGUF loader parses binary container, loads Q4_0/Q4_1/Q8_0 blocks
+  - Dequantize-fused matmul within 1e-2 relative error of f32 equivalent
+  verification:
+    quick: cargo test --workspace
+- id: p5-metrics
+  title: Prometheus metrics
+  status: done
+  progress: 100
+  priority: medium
+  effort: S
+  scope:
+  - server/src/main.rs
+  - server/Cargo.toml
+  acceptance:
+  - GET /metrics returns Prometheus-format metrics
+  - At least request_count, request_duration, tokens_generated tracked
+- id: p5-docker
+  title: Docker/container support
+  status: done
+  progress: 100
+  priority: medium
+  effort: S
+  scope:
+  - Dockerfile
+  - .dockerignore
+  acceptance:
+  - Dockerfile builds successfully
+  - Container starts and responds to GET /v1/models
+- id: p6-logprobs
+  title: Logprobs in API responses
+  status: planned
+  priority: critical
+  effort: M
+  scope:
+  - server/src/api.rs
+  - engine/src/model.rs
+  description: Add OpenAI-compatible logprobs support to the chat completions and completions API endpoints.
+    The generate path already computes logits and probability distributions at each sampling step (visible
+    in SamplingSnapshot for tracing), but this data is discarded before reaching the API response. This
+    item threads per-token log-probabilities and top-N alternative tokens from the sampler through the
+    generation loop, into the API response structs, and into SSE streaming chunks, gated by the optional
+    `logprobs` and `top_logprobs` request parameters.
+  acceptance:
+  - 'API request types (ChatCompletionRequest, CompletionRequest) accept optional `logprobs: bool` and
+    `top_logprobs: u8` (1-20) fields matching the OpenAI spec'
+  - API response types (ChatChoice, CompletionChoice) include a `logprobs` object with per-token `token`,
+    `logprob`, and `top_logprobs` array when requested, and null/absent when not requested
+  - SSE streaming chunks (ChunkChoice) include per-token logprobs in each delta when logprobs are requested
+  - generate() and generate_with_callback() return or yield per-token logprob data (selected token log-probability
+    plus top-N alternatives) alongside token IDs, without breaking existing callers that do not need logprobs
+  - Log-probabilities are computed as ln(prob) from the post-sampling probability distribution already
+    produced by Sampler::apply, not re-derived from raw logits
+  - Existing tests pass unchanged; new tests verify logprobs presence/absence in non-streaming and streaming
+    responses, correct top_logprobs count clamping, and numerical consistency with the sampler output
+  verification:
+    quick: cargo test --workspace
+- id: p6-stop-sequences
+  title: Stop sequence support
+  status: planned
+  priority: critical
+  effort: M
+  scope:
+  - engine/src/model.rs
+  - server/src/api.rs
+  description: 'Add OpenAI-compatible stop sequence support so generation halts when any user-specified
+    string is produced. The `stop` field (string or array of up to 4 strings, per OpenAI spec) must be
+    accepted on both `/v1/chat/completions` and `/v1/completions` requests. In the engine, the generation
+    loop (`generate` and `generate_with_callback` in `engine/src/model.rs`) currently only checks a single
+    `eos_token: Option<u32>` -- this must be extended to perform incremental string matching against decoded
+    output, since stop sequences can span multiple tokens and cannot be reliably reduced to single token
+    IDs. The `finish_reason` in responses must be set to `"stop"` when a stop sequence triggers termination
+    (vs `"length"` when `max_tokens` is exhausted), and the matched stop sequence text must be excluded
+    from the returned output.'
+  acceptance:
+  - ChatCompletionRequest and CompletionRequest accept an optional `stop` field (Option<StringOrArray>
+    where StringOrArray deserializes from either a single string or an array of up to 4 strings) and pass
+    it through to the engine generation loop
+  - generate() and generate_with_callback() in engine/src/model.rs accept stop sequences as &[String],
+    decode output incrementally, and halt generation when any stop string is found in the decoded text
+    -- the matched suffix is stripped from the returned token list
+  - finish_reason is set to "stop" when a stop sequence triggers termination and "length" when max_tokens
+    is reached without a stop match (both non-streaming and SSE streaming paths)
+  - SSE streaming path in chat_completions detects stop sequences across chunked token output and sends
+    the final chunk with finish_reason "stop" before the [DONE] event, without emitting the stop sequence
+    text itself
+  - Unit test in engine/src/model.rs verifies that generate() with a multi-token stop sequence halts and
+    excludes the stop text from output
+  - Tokenizer gains an encode method or the engine gains a helper that resolves stop strings for incremental
+    matching (no new crate dependencies required -- the existing tokenizers crate decode is sufficient)
+  verification:
+    quick: cargo test --workspace
+- id: p6-chat-templates
+  title: Chat template support (Jinja2 / HF format)
+  status: planned
+  priority: critical
+  effort: M
+  scope:
+  - engine/src/tokenizer.rs
+  - server/src/api.rs
+  description: 'Add chat template rendering so the /v1/chat/completions endpoint formats messages using
+    the model''s Jinja2 chat_template (from tokenizer_config.json) instead of the current naive "role:
+    content" concatenation. The engine''s Tokenizer must load and parse tokenizer_config.json alongside
+    tokenizer.json, extract the chat_template string, and render it with a Jinja2 engine (minijinja).
+    A fallback to ChatML or the existing naive format covers models that ship without a template. This
+    is required for correct prompt formatting with any real model (LLaMA 3, Mistral, Qwen, etc.).'
+  acceptance:
+  - Tokenizer loads chat_template from tokenizer_config.json when present in the same directory as tokenizer.json
+  - ChatTemplate::apply(messages, add_generation_prompt) renders a Vec<ChatMessage> into a single prompt
+    string using the Jinja2 template via minijinja
+  - The /v1/chat/completions handler uses the chat template to format messages instead of naive role:content
+    concatenation
+  - A built-in ChatML fallback template is used when tokenizer_config.json is missing or has no chat_template
+    field
+  - Unit tests verify template rendering for at least LLaMA 3 and ChatML formats, including multi-turn
+    conversations and system prompts
+  - bos_token, eos_token, and special token variables from tokenizer_config.json are available inside
+    the template context
+  verification:
+    quick: cargo test --workspace
+- id: p6-hf-config
+  title: HuggingFace config.json auto-loading
+  status: planned
+  priority: critical
+  effort: S
+  scope:
+  - engine/src/config.rs
+  - engine/src/loader.rs
+  - server/src/main.rs
+  description: Add the ability to parse a HuggingFace-format config.json file and construct a ModelConfig
+    from it, eliminating the need for hardcoded presets when loading real models. Currently ModelConfig
+    only offers three manual presets (llama2_7b, micro_llama, tiny_test) and the server selects among
+    them via a --model_config string flag. Real HuggingFace model directories ship a config.json with
+    architecture parameters (hidden_size, num_attention_heads, num_key_value_heads, intermediate_size,
+    etc.) that should be auto-detected. This lets users point --model at a HuggingFace model directory
+    and have config, weights, and tokenizer resolved automatically.
+  acceptance:
+  - ModelConfig implements Deserialize and can be constructed from a HuggingFace config.json via ModelConfig::from_hf_config(path)
+    with field mapping (e.g. num_key_value_heads -> num_kv_heads, rms_norm_eps -> layer_norm_eps, rope_theta,
+    max_position_embeddings -> max_seq_len)
+  - Unknown or missing optional fields (quantization, tensor_parallel_size) default to sensible values
+    (None, 1) without error
+  - from_hf_config returns a typed error (new variant in LoadError or a ConfigError) when required fields
+    are missing or the file is malformed
+  - 'Server --model flag accepts a directory path: when a directory is given, it auto-discovers config.json,
+    tokenizer.json, and *.safetensors files within it, replacing the need for separate --model, --tokenizer,
+    and --model_config flags'
+  - Unit tests in engine/ validate parsing of at least two real HuggingFace config.json shapes (LLaMA-style
+    with num_key_value_heads and a model without GQA where num_key_value_heads is absent and defaults
+    to num_attention_heads)
+  - Existing hardcoded presets (llama2_7b, micro_llama, tiny_test) remain available and continue to work
+    unchanged
+  verification:
+    quick: cargo test --package oxide-engine
+- id: p6-sampling-penalties
+  title: Presence and frequency penalties
+  status: planned
+  priority: high
+  effort: M
+  scope:
+  - kernels/src/sampling.rs
+  - server/src/api.rs
+  description: Add presence_penalty and frequency_penalty fields to SamplingParams and apply them as logit
+    biases before temperature scaling in the Sampler trait. Per the OpenAI spec, presence_penalty subtracts
+    a flat value from logits of any token that has appeared at least once in the generated output, while
+    frequency_penalty subtracts a value proportional to how many times each token has appeared. The generation
+    loop in TransformerModel must track token counts across steps and pass them to the sampler. The API
+    request structs must accept these parameters and wire them through.
+  acceptance:
+  - SamplingParams has presence_penalty (f32, default 0.0, range -2.0 to 2.0) and frequency_penalty (f32,
+    default 0.0, range -2.0 to 2.0) fields
+  - Sampler::apply receives or can access the list of previously generated token IDs so it can compute
+    per-token counts for penalty application
+  - 'CpuSampler applies presence and frequency penalties as additive logit biases before temperature scaling,
+    matching the OpenAI formula: logit -= frequency_penalty * count + presence_penalty * (count > 0 ?
+    1 : 0)'
+  - ChatCompletionRequest and CompletionRequest accept optional presence_penalty and frequency_penalty
+    fields, defaulting to 0.0, and pass them into SamplingParams
+  - Tests verify that presence_penalty suppresses repeated tokens and frequency_penalty increasingly suppresses
+    tokens proportional to their count
+  - CudaSampler stub is updated to accept the new parameters without breaking compilation
+  verification:
+    quick: cargo test -p oxide-kernels -- sampling && cargo test -p oxide-engine && cargo build -p oxide-server
+- id: p6-guided-decoding
+  title: Structured output / JSON mode (guided decoding)
+  status: planned
+  priority: high
+  effort: L
+  description: 'Add constrained decoding so the server can guarantee structurally valid output (JSON mode
+    and JSON Schema mode). This requires a grammar-based logit masking layer that sits between the forward
+    pass and the sampler: at each token step, a constraint engine (finite-state or pushdown automaton
+    built from a JSON Schema or a bare JSON grammar) computes an allowed-token bitmask over the vocabulary,
+    sets disallowed logits to negative infinity before sampling, and advances its own state after the
+    selected token is decoded. The API must accept the OpenAI-compatible `response_format` field (`{"type":"json_object"}`
+    and `{"type":"json_schema","json_schema":{...}}`) on both `/v1/chat/completions` and `/v1/completions`,
+    and the engine''s generate loop must thread the constraint through every token step while preserving
+    deterministic replay and trace observability.'
+  acceptance:
+  - API accepts `response_format` with type `json_object` and `json_schema` on `/v1/chat/completions`
+    and `/v1/completions`; requests without the field behave identically to today (no regression)
+  - 'A `GuidedDecoder` trait in `kernels/` defines the logit-masking contract (`fn mask_logits(&mut self,
+    token_ids_so_far: &[u32], logits: &mut [f32])` and `fn is_complete(&self) -> bool`), with a CPU implementation
+    backed by a JSON/JSON-Schema grammar'
+  - The `generate` and `generate_with_callback` loops in `engine/src/model.rs` call the guided decoder
+    (when present) to mask logits before every `sampler.apply` call, and stop generation when the constraint
+    signals completion
+  - 'Output produced under `json_object` mode is always valid JSON; output under `json_schema` mode validates
+    against the provided schema (tested with at least three non-trivial schemas: flat object, nested object,
+    array of objects)'
+  - Guided decoding state is captured in `InferenceTrace` sampling snapshots (number of tokens masked
+    per step) so traces remain useful for debugging constrained generation
+  - '`cargo test` passes with new unit tests covering: grammar state machine transitions, logit masking
+    correctness, round-trip API request with `response_format`, and deterministic replay of a guided-decoding
+    run producing identical output'
+  scope:
+  - kernels/src/sampling.rs
+  - kernels/src/lib.rs
+  - engine/src/model.rs
+  - engine/src/session.rs
+  - engine/src/trace.rs
+  - engine/src/lib.rs
+  - server/src/api.rs
+  verification:
+    quick: cargo test --workspace
+- id: p6-tool-calling
+  title: Tool/function calling
+  status: planned
+  priority: high
+  effort: L
+  depends_on:
+  - p6-chat-templates
+  - p6-guided-decoding
+  description: Add OpenAI-compatible tool/function calling to the chat completions endpoint. Currently
+    ChatMessage only carries role+content, and the request/response types have no tools, tool_choice,
+    or tool_calls fields. This requires extending the API types to accept tool definitions in requests,
+    adding tool_calls to assistant messages in responses (both non-streaming and SSE streaming), and implementing
+    a tool-call detection and structured-output extraction layer in the generation loop so the model can
+    emit well-formed JSON tool call objects instead of raw text when tools are provided.
+  acceptance:
+  - ChatCompletionRequest accepts an optional tools array (name, description, parameters JSON Schema)
+    and tool_choice field (auto/none/required/specific function)
+  - ChatMessage.content becomes optional (null for tool-call-only assistant messages) and gains an optional
+    tool_calls array; a new tool role is supported with tool_call_id for tool results
+  - Non-streaming responses populate finish_reason=tool_calls and return parsed tool_calls with id, type,
+    and function (name + arguments JSON string) when the model emits a tool invocation
+  - SSE streaming chunks include delta.tool_calls with incremental index, id, and function argument fragments,
+    matching the OpenAI streaming tool_calls wire format
+  - A ToolCallParser component in the engine extracts structured tool call JSON from generated text, validates
+    argument strings against the provided parameter schemas, and falls back to content output if parsing
+    fails
+  - 'Integration test verifies a round-trip: send a request with tools defined, receive a response with
+    tool_calls, send a follow-up with tool role message, and receive a final assistant content response'
+  scope:
+  - server/src/api.rs
+  - server/src/sse.rs
+  - engine/src/model.rs
+  - engine/src/lib.rs
+  - engine/src/tool_call.rs
+  verification:
+    quick: cargo test --workspace 2>&1 | tail -5
+- id: p6-n-completions
+  title: N (multiple completions) parameter
+  status: planned
+  priority: medium
+  effort: S
+  scope:
+  - server/src/api.rs
+  description: Add the OpenAI-compatible `n` parameter to `ChatCompletionRequest` and `CompletionRequest`
+    to support returning multiple completions per request. Currently both endpoints hardcode a single
+    choice (index 0). The implementation must run `n` independent generation passes (each with a distinct
+    RNG seed derived from the base seed) and return all choices in the response with sequential indices.
+    The `usage` field must aggregate token counts across all completions. Streaming with `n > 1` should
+    be rejected with a 400 error, matching OpenAI behavior.
+  acceptance:
+  - Requests with n omitted default to 1 and produce identical output to current behavior (backward compatible)
+  - Requests with n=3 return exactly 3 choices in the response, each with index 0..2 and independently
+    sampled text
+  - Each of the n completions uses a deterministic but distinct seed (e.g., base_seed + i) so results
+    are reproducible and non-identical when temperature > 0
+  - usage.completion_tokens and usage.total_tokens reflect the sum across all n completions
+  - 'Streaming requests (stream: true) with n > 1 return HTTP 400 with a descriptive error message'
+  - Requests with n < 1 or n > 128 return HTTP 400 with a validation error
+  verification:
+    quick: cargo test --package oxide-server
+- id: p7-graceful-shutdown
+  title: Graceful shutdown
+  status: planned
+  priority: critical
+  effort: S
+  scope:
+  - server/src/main.rs
+  description: The server currently calls `axum::serve(listener, app).await.unwrap()` with no signal handling,
+    meaning SIGTERM/SIGINT kills the process immediately, dropping in-flight inference requests and SSE
+    streams without cleanup. Implement graceful shutdown that listens for termination signals, stops accepting
+    new connections, drains active and pending requests in the BatchScheduler, and exits cleanly. This
+    is required for container deployments (Kubernetes sends SIGTERM) and prevents data loss during rolling
+    updates.
+  acceptance:
+  - Server shuts down cleanly on SIGTERM and SIGINT without panics or unwrap failures
+  - After shutdown signal, the listener stops accepting new TCP connections while in-flight requests complete
+    up to a configurable timeout (--shutdown-timeout, default 30s)
+  - Active SSE streams receive a clean close rather than a connection reset
+  - Shutdown logs the number of drained vs forcibly dropped requests at INFO level
+  - If all in-flight work completes before the timeout, the process exits immediately rather than waiting
+    the full duration
+  - Exit code is 0 for clean shutdown, non-zero if requests were forcibly dropped
+  verification:
+    quick: cargo test --package oxide-server && cargo build --package oxide-server
+- id: p7-readiness-probe
+  title: Readiness probe (/ready endpoint)
+  status: planned
+  priority: critical
+  effort: S
+  scope:
+  - server/src/api.rs
+  - server/src/main.rs
+  description: Add a `/ready` endpoint that reports whether the server can serve inference requests. Unlike
+    the existing `/health` liveness probe (which unconditionally returns "ok"), the readiness probe checks
+    that model weights are loaded and a tokenizer is available before returning 200. When either is missing
+    it returns 503 with a JSON body listing what is not ready. This enables Kubernetes readiness probes
+    to keep the pod out of the Service's endpoints until the model is fully loaded, preventing client
+    errors during startup.
+  acceptance:
+  - 'GET /ready returns 200 with JSON {"ready": true} when model weights and tokenizer are both loaded'
+  - 'GET /ready returns 503 with JSON {"ready": false, "reason": "..."} when weights or tokenizer are
+    missing, with the reason field listing the missing components'
+  - The /ready route is registered in api::router() alongside the existing /health route
+  - The readiness check reads from AppState without acquiring any locks that could block inference (no
+    Mutex contention)
+  - cargo test in the server crate includes at least one test for the ready (200) case and one for the
+    not-ready (503) case
+  - The existing /health endpoint remains unchanged as a liveness probe
+  verification:
+    quick: cargo test --package oxide-server
+- id: p7-request-timeouts
+  title: Per-request timeouts
+  status: planned
+  priority: high
+  effort: M
+  scope:
+  - server/src/api.rs
+  description: Add per-request timeout enforcement to the inference endpoints (chat_completions, completions,
+    replay, compare_pipelines). Currently, generation calls (model.generate and model.generate_with_callback)
+    run unbounded -- a large max_tokens value or a slow model can hold a connection and a worker thread
+    indefinitely. The server needs a configurable default timeout (CLI flag --request-timeout-secs) and
+    an optional per-request override (timeout_secs field on request bodies). On expiry, the handler must
+    cancel or abort the generation, return HTTP 408/504 with an OpenAI-compatible error body, and emit
+    an oxide_request_timeout counter metric. For the streaming path, the spawn_blocking task uses a callback
+    that checks elapsed time against the deadline and returns false to stop generation early.
+  acceptance:
+  - Non-streaming inference endpoints (chat_completions, completions, replay, compare_pipelines) return
+    HTTP 504 with an OpenAI-compatible JSON error body when generation exceeds the timeout deadline
+  - Streaming endpoint stops emitting SSE chunks and sends a final error event followed by [DONE] when
+    the per-request timeout is reached
+  - 'CLI flag --request-timeout-secs sets the server-wide default (default: 300); request bodies accept
+    an optional timeout_secs field that overrides it for that request'
+  - An oxide_request_timeout counter metric (labeled by endpoint) increments on every timeout
+  - Existing tests continue to pass and at least one new integration test verifies that a request exceeding
+    the timeout receives the expected error response
+  - Timeout is enforced via tokio::time::timeout (non-streaming) or Instant::now() + Duration deadline
+    checked in the on_token callback (streaming), not via tower global middleware, so per-request overrides
+    work correctly
+  verification:
+    quick: cargo test --package oxide-server
+- id: p7-comprehensive-metrics
+  title: Comprehensive Prometheus metrics (TTFT, ITL, queue depth, KV usage)
+  description: 'Add inference-specific Prometheus metrics to the server crate. The current /metrics endpoint
+    uses metrics-exporter-prometheus but only records three basic metrics (oxide_request_count, oxide_tokens_generated,
+    oxide_request_duration_seconds) and only on the non-streaming code path. This item adds TTFT (time
+    to first token) and ITL (inter-token latency) histograms, scheduler queue depth and active sequence
+    gauges, KV cache slot utilization gauges, per-token generation counters on the streaming path, and
+    request error counters. Metrics recording must be wired into both the non-streaming and streaming
+    handlers in api.rs, and the BatchScheduler and KvCachePool must expose their state to the metrics
+    layer (they already have the query methods: pending_count, active_count, allocated_slot_count, KvCachePool::in_use/available).'
+  status: planned
+  priority: critical
+  effort: M
+  depends_on:
+  - p7-wire-batch-scheduler
+  scope:
+  - server/src/api.rs
+  - server/src/main.rs
+  acceptance:
+  - GET /metrics returns oxide_time_to_first_token_seconds histogram populated after a streaming or non-streaming
+    chat completion request
+  - GET /metrics returns oxide_inter_token_latency_seconds histogram populated after a streaming request
+    generating at least 2 tokens
+  - GET /metrics returns oxide_scheduler_queue_depth gauge (pending + preempted) and oxide_scheduler_active_sequences
+    gauge updated on each request
+  - GET /metrics returns oxide_kv_cache_slots_in_use and oxide_kv_cache_slots_total gauges when a KvCachePool
+    is wired into AppState
+  - Streaming chat_completions handler records oxide_request_count, oxide_tokens_generated, and oxide_request_duration_seconds
+    (currently missing from that path)
+  - All new metrics use the metrics crate macros (histogram!, gauge!, counter!) consistent with the existing
+    instrumentation style
+  verification:
+    quick: cargo test --package oxide-server && cargo build --package oxide-server
+- id: p7-wire-batch-scheduler
+  title: Wire BatchScheduler into API handlers
+  description: The BatchScheduler in server/src/batch.rs has full slot allocation, preemption, and lifecycle
+    management, but the API handlers in server/src/api.rs bypass it entirely — they create InferenceSession
+    directly and call model.generate() inline. AppState already holds an Arc<Mutex<BatchScheduler>> that
+    no handler touches. This item wires chat_completions and completions handlers to submit InferenceRequest
+    to the scheduler, acquire a slot via admit_new_requests(), run inference within that slot, and call
+    complete_sequence() on finish. The streaming path must also go through the scheduler so slot accounting
+    is correct under concurrent SSE connections. Metrics for pending/active/preempted counts should be
+    emitted so the scheduler state is observable.
+  status: planned
+  priority: critical
+  effort: M
+  depends_on:
+  - p4-batch-scheduler
+  scope:
+  - server/src/api.rs
+  - server/src/main.rs
+  acceptance:
+  - API handlers (chat_completions, completions) submit an InferenceRequest to the BatchScheduler and
+    acquire a slot before running inference
+  - Slots are released via complete_sequence() on every code path including errors and early stream disconnects
+  - When all slots are occupied, new requests either queue in pending or trigger preemption — never bypass
+    the scheduler
+  - Streaming (SSE) requests hold a scheduler slot for the duration of token generation and release it
+    when the stream ends or the client disconnects
+  - Scheduler queue depths (active_count, pending_count, preempted_count) are emitted as Prometheus gauges
+    on each request
+  - Existing tests (cargo test -p oxide-server) continue to pass and at least one new integration test
+    verifies that concurrent requests are gated by max_batch_size
+  verification:
+    quick: cargo test -p oxide-server
+- id: p7-prefix-caching
+  title: Prefix caching (hash-based KV reuse)
+  description: Introduce block-based KV cache management with content-addressable hash lookup so that
+    requests sharing a common prefix (e.g., system prompt) reuse already-computed KV blocks instead of
+    recomputing them. This requires restructuring `KvCache` from flat per-layer vectors into fixed-size
+    blocks (e.g., 16 tokens), adding a global `PrefixCacheTable` that maps block hashes (computed from
+    token ID sequences) to immutable KV data, and modifying session creation and the batch scheduler to
+    probe the cache table before running prefill. The current architecture creates a fresh `InferenceSession`
+    per request with no KV reuse, so this is a significant structural change to the engine's memory management
+    layer.
+  status: planned
+  priority: high
+  effort: L
+  depends_on:
+  - p7-wire-batch-scheduler
+  scope:
+  - engine/src/kv_cache.rs
+  - server/src/batch.rs
+  acceptance:
+  - KvCache is refactored into fixed-size blocks (e.g., 16 tokens per block) with a BlockTable indirection
+    layer, while preserving existing append/slice/reset semantics and passing all current tests
+  - A PrefixCacheTable (engine-level, thread-safe) maps hash(token_id_sequence) to immutable KV block
+    data, with reference counting and an eviction policy (LRU or similar) that reclaims blocks when no
+    active sequence references them
+  - 'InferenceSession creation probes the prefix cache: given a token_id sequence, it identifies the longest
+    cached prefix, copies block references (not data), and returns the position at which new computation
+    must begin'
+  - BatchScheduler.admit_new_requests populates the prefix_matched_len on ActiveSequence so the forward
+    pass skips already-cached layers, and metrics track prefix cache hit rate and tokens saved
+  - 'Tests verify correctness: two requests with identical prefixes produce bit-identical KV data via
+    cache reuse, a request with a novel prefix falls back to full prefill, and eviction under memory pressure
+    does not corrupt active sequences'
+  - 'Compressed KV (TurboQuant) continues to work: blocks can be stored in compressed form and the hash
+    lookup is agnostic to compression state'
+  verification:
+    quick: cargo test --workspace
+- id: p7-chunked-prefill
+  title: Chunked prefill
+  description: Split long prompt prefills into fixed-size chunks so that each chunk can be processed through
+    the transformer layers independently, with KV cache accumulating across chunks. This prevents a single
+    long prompt from monopolizing compute for an entire forward pass, allowing decode steps from other
+    active sequences to be interleaved between prefill chunks in the batch scheduler. The engine's forward
+    method currently processes the entire token_ids slice in one call (model.rs line 38), and the scheduler
+    tracks Prefill vs Decode state but does not subdivide prefills (batch.rs SequenceState). A chunked_prefill
+    method on TransformerModel and a chunk-aware scheduling loop in BatchScheduler are the core additions.
+  status: planned
+  priority: high
+  effort: M
+  depends_on:
+  - p7-wire-batch-scheduler
+  scope:
+  - engine/src/model.rs
+  - server/src/batch.rs
+  acceptance:
+  - Configurable chunk size (e.g. prefill_chunk_size on ModelConfig or BatchScheduler) with a sensible
+    default (e.g. 512 tokens)
+  - TransformerModel exposes a chunked prefill path that processes N tokens at a time, advancing session.position
+    and KV cache correctly across chunks, producing identical final logits to a single unchunked forward
+    call on the same input
+  - BatchScheduler tracks partial-prefill progress per ActiveSequence (prefill_offset field) and transitions
+    to Decode state only after all chunks are processed
+  - 'Scheduler interleaving: between prefill chunks of one sequence, decode steps from other active sequences
+    can be scheduled in the same batch iteration'
+  - 'Determinism preserved: chunked prefill with any chunk size produces bit-identical output to unchunked
+    prefill for the same seed'
+  - Unit test proving chunked prefill output matches unchunked output for prompts longer than chunk_size
+  verification:
+    quick: cargo test --package oxide-engine --package oxide-server
+- id: p8-timing-info
+  title: Populate timing info in InferenceTrace
+  description: 'The `generate` and `generate_with_callback` methods in `engine/src/model.rs` set `prompt_tokens`
+    and `generated_tokens` on the trace but never populate the `timing: Option<TimingInfo>` field. This
+    item adds `std::time::Instant` measurements around the prompt-processing forward pass (prompt phase)
+    and the autoregressive generation loop (generation phase), then computes `total_ms`, `prompt_ms`,
+    `generation_ms`, and `tokens_per_second` to fill `TimingInfo` before the methods return. The `forward`
+    method should also record per-layer `duration` in each `LayerSnapshot` when tracing is at Summary
+    level or above (the field exists but is always set to `None`).'
+  status: planned
+  priority: high
+  effort: S
+  scope:
+  - engine/src/model.rs
+  - engine/src/trace.rs
+  acceptance:
+  - generate() and generate_with_callback() populate session.trace.timing with a TimingInfo containing
+    non-zero total_ms, prompt_ms, generation_ms, and tokens_per_second after completion
+  - prompt_ms measures only the initial forward pass over the full prompt token sequence; generation_ms
+    measures the autoregressive token-by-token loop
+  - tokens_per_second is calculated as generated_tokens / (generation_ms / 1000.0), or 0.0 when generation_ms
+    is zero
+  - Per-layer LayerSnapshot.duration is populated with the wall-clock time of each transformer layer when
+    trace_level >= Summary
+  - Timing is collected regardless of trace_level (TimingInfo is always set); only per-layer duration
+    respects the Summary threshold
+  - Existing tests continue to pass and at least one new test asserts that timing fields are populated
+    and internally consistent (total_ms >= prompt_ms + generation_ms)
+  verification:
+    quick: cd /home/fdupont/Code/github.com/smgglrs-ai/oxide-serve && cargo test --package oxide-engine
+- id: p8-opentelemetry
+  title: OpenTelemetry trace export
+  description: Add OpenTelemetry distributed tracing to the server so that each inference request emits
+    OTel spans exportable to any OTLP-compatible collector (Jaeger, Grafana Tempo, etc.). The server already
+    uses the tracing crate for structured logging and has an internal InferenceTrace system; this item
+    bridges both to OTel by adding tracing-opentelemetry as a subscriber layer and converting per-request
+    InferenceTrace data (layer timings, sampling steps, token counts) into span attributes. A new --otlp-endpoint
+    CLI flag controls the OTLP gRPC exporter destination, defaulting to disabled so existing behavior
+    is unchanged.
+  status: planned
+  priority: medium
+  effort: M
+  depends_on:
+  - p8-timing-info
+  scope:
+  - server/src/main.rs
+  - server/Cargo.toml
+  acceptance:
+  - Server starts cleanly with no --otlp-endpoint flag (OTel disabled, no behavioral change from current
+    baseline)
+  - When --otlp-endpoint is set, the server connects to the specified OTLP gRPC endpoint and exports spans
+    on each inference request
+  - 'Each /v1/chat/completions and /v1/completions request produces a root span with attributes: model_id,
+    prompt_tokens, completion_tokens, total_duration_ms'
+  - Forward-pass layer processing emits child spans with layer_index and duration when TraceLevel is Summary
+    or Full
+  - Span resource attributes include service.name=oxide-serve and service.version from Cargo.toml
+  - cargo test --package oxide-server passes with no regressions (OTel layers initialize without a live
+    collector in test mode)
+  verification:
+    quick: cargo test --package oxide-server
+- id: p8-batch-invariant-verification
+  title: Batch-invariant inference verification
+  description: Build a test harness that proves inference output for a given sequence is bit-identical
+    regardless of what other sequences share the same batch. Today, the forward pass in TransformerModel
+    processes sequences with batch=1 and per-sequence KvCache/InferenceSession state, but the BatchScheduler
+    groups requests together and future batched execution (batch>1 attention, shared GPU memory) could
+    introduce cross-sequence interference. This item creates a BatchInvariantVerifier in the engine that
+    runs the same prompt solo and inside varied batch compositions, then asserts bit-identical logits
+    and sampled tokens. It also extends the VerificationManifest to record batch-invariance as a proven
+    property, and adds a Kani harness proving that attention indexing for one sequence within a batch
+    cannot read from another sequence's memory region.
+  status: planned
+  priority: medium
+  effort: M
+  scope:
+  - engine/src/dual_pipeline.rs
+  - kernels/src/verification_manifest.rs
+  acceptance:
+  - BatchInvariantVerifier in engine/src/batch_invariant.rs runs a prompt through forward() solo and alongside
+    1-3 other sequences with different token_ids and cache states, asserting logits_max_abs_diff == 0.0
+    and token_match == true for the target sequence in every composition
+  - Kani harness in kernels/src/attention.rs proves that for any valid (batch, seq_idx) pair, the q/k/v
+    offset range for sequence seq_idx does not overlap with any other sequence's offset range within the
+    same batch buffer
+  - VerificationManifest in kernels/src/verification_manifest.rs includes a KernelProof entry for batch-invariance
+    with status proven once the Kani harness passes
+  - 'At least 3 integration tests in engine/src/batch_invariant.rs cover: (a) solo vs batch-of-2, (b)
+    solo vs batch-of-4 with heterogeneous prompt lengths, (c) solo vs batch where other sequences have
+    pre-populated KV caches at different positions'
+  - All tests pass deterministically with cargo test --package oxide-engine (same seed, same output)
+  - DualPipeline compare_pipelines extended or complemented to accept batched inputs so CPU-vs-GPU batch
+    invariance can be checked in Phase 3
+  verification:
+    quick: cargo test --package oxide-engine batch_invariant

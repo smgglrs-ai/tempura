@@ -424,3 +424,12 @@
     exit_reason: "No unblocked items remaining in approve scope"
     branch: "loop/2026-06-16-2"
     tag: "loop-run/2026-06-16-6b"
+
+- timestamp: "2026-06-16T18:00:00Z"
+  actor: claude
+  action: lean-refine
+  summary: "Gap analysis + deep research identified 18 new plan items across 3 phases (P6: API completeness, P7: operational table-stakes, P8: differentiating features). All items refined with descriptions, acceptance criteria, scope, effort, verification commands. Total plan: 51 items (33 done, 18 planned)."
+  details:
+    items_added: 18
+    phases_added: [p6, p7, p8]
+    research: "deep-research workflow (102 agents, 20 sources, 90 claims, 20 confirmed, 5 refuted)"
