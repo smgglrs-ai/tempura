@@ -493,3 +493,10 @@
   summary: "Added /ready endpoint returning 200/503 based on model weights and tokenizer availability, with 2 integration tests"
   iteration: 2
   max_iterations: 10
+- timestamp: "2026-06-16T11:25:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p7-graceful-shutdown"
+  summary: "Added graceful shutdown with SIGTERM/SIGINT handling via axum with_graceful_shutdown, --shutdown-timeout CLI flag (default 30s)"
+  iteration: 3
+  max_iterations: 10

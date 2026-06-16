@@ -46,6 +46,13 @@ struct Args {
 
     #[arg(long, default_value_t = 100, help = "Maximum stored traces")]
     max_traces: usize,
+
+    #[arg(
+        long,
+        default_value_t = 30,
+        help = "Graceful shutdown timeout in seconds"
+    )]
+    shutdown_timeout: u64,
 }
 
 pub type CpuModel = TransformerModel<
@@ -169,6 +176,38 @@ async fn main() {
     let addr = format!("{}:{}", args.host, args.port);
     tracing::info!("Starting oxide-serve on {}", addr);
 
+    let shutdown_timeout = std::time::Duration::from_secs(args.shutdown_timeout);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_timeout))
+        .await
+        .unwrap();
+}
+
+async fn shutdown_signal(timeout: std::time::Duration) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install SIGINT handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received SIGINT, starting graceful shutdown (timeout: {}s)", timeout.as_secs());
+        }
+        _ = terminate => {
+            tracing::info!("Received SIGTERM, starting graceful shutdown (timeout: {}s)", timeout.as_secs());
+        }
+    }
 }

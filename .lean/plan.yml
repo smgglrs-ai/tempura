@@ -977,7 +977,8 @@ items:
     quick: cargo test --package oxide-server
 - id: p7-graceful-shutdown
   title: Graceful shutdown
-  status: planned
+  status: done
+  progress: 100
   priority: critical
   effort: S
   scope:
