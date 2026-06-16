@@ -557,3 +557,10 @@
     exit_reason: "Remaining items are complex M/L-effort features requiring focused sessions"
     branch: "loop/2026-06-16-5"
     tag: "loop-run/2026-06-16-3-approve-r3"
+- timestamp: "2026-06-16T16:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p6-chat-templates"
+  summary: "Added chat template support: minijinja-based Jinja2 rendering, tokenizer_config.json loading, ChatML fallback, bos/eos token variables, 5 new tests"
+  iteration: 1
+  max_iterations: 10

@@ -14,6 +14,7 @@ pub use config::{ConfigError, ModelConfig, QuantConfig, QuantFormat};
 pub use kv_cache::{KvCache, KvCachePool, PoolError};
 pub use model::{TokenLogprob, TopLogprob, TransformerModel};
 pub use session::InferenceSession;
+pub use tokenizer::{ChatMessageInput, ChatTemplate};
 pub use trace::{
     InferenceTrace, LayerSnapshot, NormStats, SamplingSnapshot, TimingInfo, TraceLevel,
 };

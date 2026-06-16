@@ -206,12 +206,24 @@ async fn chat_completions(
         ));
     }
 
-    let prompt: String = req
+    let chat_messages: Vec<oxide_engine::ChatMessageInput> = req
         .messages
         .iter()
-        .map(|m| format!("{}: {}", m.role, m.content))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(|m| oxide_engine::ChatMessageInput {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        })
+        .collect();
+
+    let prompt = tokenizer
+        .apply_chat_template(&chat_messages, true)
+        .unwrap_or_else(|_| {
+            req.messages
+                .iter()
+                .map(|m| format!("{}: {}", m.role, m.content))
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
 
     let token_ids = tokenizer
         .encode(&prompt)

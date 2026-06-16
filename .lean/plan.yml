@@ -786,7 +786,8 @@ items:
     quick: cargo test --workspace
 - id: p6-chat-templates
   title: Chat template support (Jinja2 / HF format)
-  status: planned
+  status: done
+  progress: 100
   priority: critical
   effort: M
   scope:
