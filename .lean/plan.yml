@@ -1353,7 +1353,8 @@ items:
     quick: cargo test --package oxide-engine
 - id: auto-test-sse
   title: Add unit tests for SSE helper functions
-  status: planned
+  status: done
+  progress: 100
   priority: high
   effort: S
   scope:
