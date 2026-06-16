@@ -479,3 +479,10 @@
     exit_reason: "No unblocked items remaining in autonomous scope"
     branch: "loop/2026-06-16-3"
     tag: "loop-run/2026-06-16-5"
+- timestamp: "2026-06-16T11:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p6-hf-config"
+  summary: "Added ModelConfig::from_hf_config() with HF field mapping, ConfigError type, directory auto-discovery in server, 4 new tests"
+  iteration: 1
+  max_iterations: 10

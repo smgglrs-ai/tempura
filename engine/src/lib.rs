@@ -10,7 +10,7 @@ pub mod tokenizer;
 pub mod trace;
 pub mod weights;
 
-pub use config::{ModelConfig, QuantConfig, QuantFormat};
+pub use config::{ConfigError, ModelConfig, QuantConfig, QuantFormat};
 pub use kv_cache::{KvCache, KvCachePool, PoolError};
 pub use model::TransformerModel;
 pub use session::InferenceSession;

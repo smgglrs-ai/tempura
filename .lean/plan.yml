@@ -812,7 +812,8 @@ items:
     quick: cargo test --workspace
 - id: p6-hf-config
   title: HuggingFace config.json auto-loading
-  status: planned
+  status: done
+  progress: 100
   priority: critical
   effort: S
   scope:

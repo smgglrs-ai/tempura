@@ -1,3 +1,15 @@
+use std::path::Path;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("json parse error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("missing required field: {0}")]
+    MissingField(&'static str),
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub hidden_size: usize,
@@ -110,6 +122,71 @@ impl ModelConfig {
             quantization: None,
         }
     }
+
+    pub fn from_hf_config(path: &Path) -> Result<Self, ConfigError> {
+        let data = std::fs::read_to_string(path)?;
+        Self::from_hf_json(&data)
+    }
+
+    pub fn from_hf_json(json: &str) -> Result<Self, ConfigError> {
+        let v: serde_json::Value = serde_json::from_str(json)?;
+
+        let hidden_size = v["hidden_size"]
+            .as_u64()
+            .ok_or(ConfigError::MissingField("hidden_size"))? as usize;
+        let num_attention_heads = v["num_attention_heads"]
+            .as_u64()
+            .ok_or(ConfigError::MissingField("num_attention_heads"))?
+            as usize;
+        let num_kv_heads = v
+            .get("num_key_value_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(num_attention_heads as u64) as usize;
+        let num_layers = v["num_hidden_layers"]
+            .as_u64()
+            .ok_or(ConfigError::MissingField("num_hidden_layers"))?
+            as usize;
+        let intermediate_size = v["intermediate_size"]
+            .as_u64()
+            .ok_or(ConfigError::MissingField("intermediate_size"))?
+            as usize;
+        let vocab_size = v["vocab_size"]
+            .as_u64()
+            .ok_or(ConfigError::MissingField("vocab_size"))? as usize;
+        let max_seq_len = v
+            .get("max_position_embeddings")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4096) as usize;
+        let head_dim = v
+            .get("head_dim")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(hidden_size / num_attention_heads);
+        let rope_theta = v
+            .get("rope_theta")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(10000.0) as f32;
+        let layer_norm_eps = v
+            .get("rms_norm_eps")
+            .or_else(|| v.get("layer_norm_eps"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1e-5) as f32;
+
+        Ok(Self {
+            hidden_size,
+            intermediate_size,
+            num_attention_heads,
+            num_kv_heads,
+            num_layers,
+            vocab_size,
+            max_seq_len,
+            head_dim,
+            rope_theta,
+            layer_norm_eps,
+            tensor_parallel_size: 1,
+            quantization: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -189,5 +266,63 @@ mod tests {
         assert_eq!(q.bits, 4);
         assert_eq!(q.group_size, 32);
         assert!(q.symmetric);
+    }
+
+    #[test]
+    fn test_from_hf_json_llama_style() {
+        let json = r#"{
+            "hidden_size": 4096,
+            "intermediate_size": 11008,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 32,
+            "vocab_size": 32000,
+            "max_position_embeddings": 4096,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 500000.0
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.hidden_size, 4096);
+        assert_eq!(c.num_attention_heads, 32);
+        assert_eq!(c.num_kv_heads, 8);
+        assert_eq!(c.num_layers, 32);
+        assert_eq!(c.vocab_size, 32000);
+        assert_eq!(c.max_seq_len, 4096);
+        assert_eq!(c.head_dim, 128);
+        assert_eq!(c.rope_theta, 500000.0);
+        assert!(c.quantization.is_none());
+        assert_eq!(c.tensor_parallel_size, 1);
+        assert_head_dim_consistent(&c);
+    }
+
+    #[test]
+    fn test_from_hf_json_no_gqa() {
+        let json = r#"{
+            "hidden_size": 768,
+            "intermediate_size": 3072,
+            "num_attention_heads": 12,
+            "num_hidden_layers": 12,
+            "vocab_size": 30522
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.num_kv_heads, 12);
+        assert_eq!(c.max_seq_len, 4096);
+        assert_eq!(c.rope_theta, 10000.0);
+        assert_eq!(c.layer_norm_eps, 1e-5);
+        assert_head_dim_consistent(&c);
+        assert_kv_heads_valid(&c);
+    }
+
+    #[test]
+    fn test_from_hf_json_missing_required_field() {
+        let json = r#"{"hidden_size": 4096}"#;
+        let err = ModelConfig::from_hf_json(json).unwrap_err();
+        assert!(err.to_string().contains("missing required field"));
+    }
+
+    #[test]
+    fn test_from_hf_json_malformed() {
+        let err = ModelConfig::from_hf_json("not json").unwrap_err();
+        assert!(matches!(err, ConfigError::Json(_)));
     }
 }

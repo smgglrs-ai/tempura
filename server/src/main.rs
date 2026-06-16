@@ -74,30 +74,78 @@ async fn main() {
 
     let args = Args::parse();
 
-    let config = match args.model_config.as_str() {
-        "micro-llama" => ModelConfig::micro_llama(),
-        "tiny-test" => ModelConfig::tiny_test(),
-        _ => ModelConfig::llama2_7b(),
+    let model_path = args.model.as_deref().map(Path::new);
+    let is_model_dir = model_path.is_some_and(|p| p.is_dir());
+
+    let config = if is_model_dir {
+        let config_path = model_path.unwrap().join("config.json");
+        if config_path.exists() {
+            let c = ModelConfig::from_hf_config(&config_path).unwrap();
+            tracing::info!("Loaded model config from {}", config_path.display());
+            c
+        } else {
+            tracing::warn!("No config.json in model directory, using preset");
+            match args.model_config.as_str() {
+                "micro-llama" => ModelConfig::micro_llama(),
+                "tiny-test" => ModelConfig::tiny_test(),
+                _ => ModelConfig::llama2_7b(),
+            }
+        }
+    } else {
+        match args.model_config.as_str() {
+            "micro-llama" => ModelConfig::micro_llama(),
+            "tiny-test" => ModelConfig::tiny_test(),
+            _ => ModelConfig::llama2_7b(),
+        }
     };
     let pipeline = KernelPipeline::cpu_verified();
     let mut model = TransformerModel::new(config, pipeline);
 
-    let model_id = if let Some(ref model_path) = args.model {
-        let loader =
-            oxide_engine::loader::SafetensorsLoader::from_file(Path::new(model_path)).unwrap();
-        model.load_weights(&loader).unwrap();
-        tracing::info!("Loaded model weights from {}", model_path);
-        model_path.clone()
+    let model_id = if let Some(model_p) = model_path {
+        if is_model_dir {
+            let safetensors: Vec<_> = std::fs::read_dir(model_p)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
+                .collect();
+            if let Some(entry) = safetensors.first() {
+                let loader =
+                    oxide_engine::loader::SafetensorsLoader::from_file(&entry.path()).unwrap();
+                model.load_weights(&loader).unwrap();
+                tracing::info!("Loaded model weights from {}", entry.path().display());
+            }
+            model_p.display().to_string()
+        } else {
+            let loader = oxide_engine::loader::SafetensorsLoader::from_file(model_p).unwrap();
+            model.load_weights(&loader).unwrap();
+            tracing::info!("Loaded model weights from {}", model_p.display());
+            model_p.display().to_string()
+        }
     } else {
         tracing::warn!("No --model provided, running with unloaded weights (stub responses)");
         "oxide-serve-unloaded".to_string()
     };
 
-    let tokenizer = args.tokenizer.as_ref().map(|path| {
-        let tok = Tokenizer::from_file(Path::new(path)).unwrap();
-        tracing::info!("Loaded tokenizer from {}", path);
-        Arc::new(tok)
-    });
+    let tokenizer = if is_model_dir {
+        let tok_path = model_path.unwrap().join("tokenizer.json");
+        if tok_path.exists() {
+            let tok = Tokenizer::from_file(&tok_path).unwrap();
+            tracing::info!("Loaded tokenizer from {}", tok_path.display());
+            Some(Arc::new(tok))
+        } else {
+            args.tokenizer.as_ref().map(|path| {
+                let tok = Tokenizer::from_file(Path::new(path)).unwrap();
+                tracing::info!("Loaded tokenizer from {}", path);
+                Arc::new(tok)
+            })
+        }
+    } else {
+        args.tokenizer.as_ref().map(|path| {
+            let tok = Tokenizer::from_file(Path::new(path)).unwrap();
+            tracing::info!("Loaded tokenizer from {}", path);
+            Arc::new(tok)
+        })
+    };
 
     let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
     let metrics_handle = prometheus_builder.install_recorder().unwrap();
