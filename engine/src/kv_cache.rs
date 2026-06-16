@@ -165,6 +165,43 @@ impl KvCache {
     pub fn remaining_capacity(&self) -> usize {
         self.max_seq_len - self.seq_len
     }
+
+    pub fn rollback(&mut self, new_seq_len: usize) {
+        assert!(new_seq_len <= self.seq_len);
+        if self.compressed {
+            if new_seq_len == 0 {
+                for c in &mut self.k_compressed {
+                    *c = None;
+                }
+                for c in &mut self.v_compressed {
+                    *c = None;
+                }
+            } else if new_seq_len < self.seq_len {
+                let compressor = self.compressor.as_ref().unwrap();
+                let stride = self.num_kv_heads * self.head_dim;
+                let truncated_len = new_seq_len * stride;
+                for layer in 0..self.num_layers {
+                    if let Some(ref existing) = self.k_compressed[layer] {
+                        let full = compressor.decompress(existing).unwrap();
+                        self.k_compressed[layer] = Some(
+                            compressor
+                                .compress(&full[..truncated_len], self.head_dim)
+                                .unwrap(),
+                        );
+                    }
+                    if let Some(ref existing) = self.v_compressed[layer] {
+                        let full = compressor.decompress(existing).unwrap();
+                        self.v_compressed[layer] = Some(
+                            compressor
+                                .compress(&full[..truncated_len], self.head_dim)
+                                .unwrap(),
+                        );
+                    }
+                }
+            }
+        }
+        self.seq_len = new_seq_len;
+    }
 }
 
 #[derive(Debug)]

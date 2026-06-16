@@ -5,6 +5,7 @@ pub mod loader;
 pub mod model;
 pub mod pipeline;
 pub mod session;
+pub mod speculative;
 pub mod tokenizer;
 pub mod trace;
 pub mod weights;

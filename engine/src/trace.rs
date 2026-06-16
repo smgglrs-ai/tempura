@@ -48,6 +48,15 @@ pub struct LayerSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeculativeSnapshot {
+    pub step: usize,
+    pub draft_proposed: Vec<u32>,
+    pub accepted: Vec<u32>,
+    pub rejected: Vec<u32>,
+    pub acceptance_rate: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceTrace {
     pub trace_id: String,
     pub level: TraceLevel,
@@ -58,6 +67,7 @@ pub struct InferenceTrace {
     pub timing: Option<TimingInfo>,
     pub layers: Vec<LayerSnapshot>,
     pub sampling_steps: Vec<SamplingSnapshot>,
+    pub speculative_steps: Vec<SpeculativeSnapshot>,
 }
 
 impl InferenceTrace {
@@ -72,6 +82,7 @@ impl InferenceTrace {
             timing: None,
             layers: Vec::new(),
             sampling_steps: Vec::new(),
+            speculative_steps: Vec::new(),
         }
     }
 }

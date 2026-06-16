@@ -610,7 +610,8 @@ items:
       two TransformerModel instances, rejection-sampling verification loop
       maintaining distribution equivalence, KvCache rollback on rejected
       tokens, and server integration via CLI flags.
-    status: planned
+    status: done
+    progress: 100
     priority: low
     effort: L
     scope:

@@ -388,3 +388,11 @@
   summary: "Replaced stub FIFO BatchScheduler with iteration-level continuous batching: ActiveSequence tracking, slot allocation/release, preemption of lowest-priority sequences, Kani harnesses for slot accounting, 7 new tests"
   iteration: 3
   max_iterations: 10
+
+- timestamp: "2026-06-16T16:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p5-speculative-decoding"
+  summary: "Implemented SpeculativeDecoder with draft-then-verify loop, rejection sampling, KvCache rollback, SpeculativeSnapshot trace recording, greedy and sampled modes"
+  iteration: 4
+  max_iterations: 10
