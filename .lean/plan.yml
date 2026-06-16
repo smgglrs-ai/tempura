@@ -1240,7 +1240,8 @@ items:
     InferenceTrace data (layer timings, sampling steps, token counts) into span attributes. A new --otlp-endpoint
     CLI flag controls the OTLP gRPC exporter destination, defaulting to disabled so existing behavior
     is unchanged.
-  status: planned
+  status: done
+  progress: 100
   priority: medium
   effort: M
   depends_on:

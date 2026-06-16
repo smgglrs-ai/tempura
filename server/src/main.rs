@@ -60,6 +60,12 @@ struct Args {
         help = "Default request timeout in seconds"
     )]
     request_timeout_secs: u64,
+
+    #[arg(
+        long,
+        help = "OTLP gRPC endpoint for OpenTelemetry export (e.g. http://localhost:4317)"
+    )]
+    otlp_endpoint: Option<String>,
 }
 
 pub type CpuModel = TransformerModel<
@@ -83,11 +89,9 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
     let args = Args::parse();
+
+    init_tracing(&args.otlp_endpoint);
 
     let model_path = args.model.as_deref().map(Path::new);
     let is_model_dir = model_path.is_some_and(|p| p.is_dir());
@@ -219,4 +223,47 @@ async fn shutdown_signal(timeout: std::time::Duration) {
             tracing::info!("Received SIGTERM, starting graceful shutdown (timeout: {}s)", timeout.as_secs());
         }
     }
+}
+
+fn init_tracing(_otlp_endpoint: &Option<String>) {
+    #[cfg(feature = "otlp")]
+    {
+        if let Some(endpoint) = _otlp_endpoint {
+            use opentelemetry::trace::TracerProvider;
+            use opentelemetry_otlp::WithExportConfig;
+            use tracing_subscriber::layer::SubscriberExt;
+
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .build()
+                .expect("failed to create OTLP exporter");
+
+            let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+                .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                .with_resource(opentelemetry_sdk::Resource::new(vec![
+                    opentelemetry::KeyValue::new("service.name", "oxide-serve"),
+                    opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+                ]))
+                .build();
+
+            let tracer = provider.tracer("oxide-serve");
+            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+            let subscriber = tracing_subscriber::Registry::default()
+                .with(EnvFilter::from_default_env())
+                .with(tracing_subscriber::fmt::layer())
+                .with(otel_layer);
+
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("failed to set global subscriber");
+
+            tracing::info!("OpenTelemetry enabled, exporting to {}", endpoint);
+            return;
+        }
+    }
+
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
 }

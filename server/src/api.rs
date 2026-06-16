@@ -271,6 +271,7 @@ fn record_scheduler_gauges(scheduler: &crate::batch::BatchScheduler) {
     metrics::gauge!("oxide_kv_cache_slots_total").set(scheduler.max_batch_size() as f64);
 }
 
+#[tracing::instrument(skip(state, req), fields(model = %req.model))]
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
@@ -550,6 +551,7 @@ async fn chat_completions(
     }
 }
 
+#[tracing::instrument(skip(state, req), fields(model = %req.model))]
 async fn completions(
     State(state): State<AppState>,
     Json(req): Json<CompletionRequest>,

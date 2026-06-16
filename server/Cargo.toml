@@ -23,6 +23,14 @@ uuid = { version = "1", features = ["v4"] }
 tokio-stream = "0.1"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["tonic"], optional = true }
+tracing-opentelemetry = { version = "0.28", optional = true }
+
+[features]
+default = []
+otlp = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 
 [dev-dependencies]
 tower = "0.5"

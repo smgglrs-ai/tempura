@@ -599,3 +599,10 @@
   summary: "Added chunked prefill: chunked_forward method on TransformerModel, prefill_offset on ActiveSequence, configurable prefill_chunk_size on BatchScheduler (default 512), 3 new tests"
   iteration: 6
   max_iterations: 10
+- timestamp: "2026-06-16T18:20:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p8-opentelemetry"
+  summary: "Added OpenTelemetry export: otlp feature flag, --otlp-endpoint CLI flag, TracerProvider with OTLP gRPC exporter, tracing-opentelemetry subscriber layer, #[instrument] on inference endpoints, disabled by default"
+  iteration: 7
+  max_iterations: 10
