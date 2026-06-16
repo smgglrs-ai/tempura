@@ -15,6 +15,22 @@ use tokio_stream::StreamExt;
 use crate::sse::{ChatCompletionChunk, ChunkChoice, ChunkDelta};
 use crate::AppState;
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum StringOrArray {
+    Single(String),
+    Array(Vec<String>),
+}
+
+impl StringOrArray {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            StringOrArray::Single(s) => vec![s],
+            StringOrArray::Array(v) => v.into_iter().take(4).collect(),
+        }
+    }
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -53,6 +69,8 @@ pub struct ChatCompletionRequest {
     pub logprobs: Option<bool>,
     #[serde(default)]
     pub top_logprobs: Option<u8>,
+    #[serde(default)]
+    pub stop: Option<StringOrArray>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -114,6 +132,8 @@ pub struct CompletionRequest {
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub logprobs: Option<u8>,
+    #[serde(default)]
+    pub stop: Option<StringOrArray>,
 }
 
 #[derive(Debug, Serialize)]
@@ -274,9 +294,12 @@ async fn chat_completions(
             (tokens, Vec::new())
         };
 
-        let text = tokenizer
+        let full_text = tokenizer
             .decode(&generated)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let stop_sequences: Vec<String> = req.stop.map(|s| s.into_vec()).unwrap_or_default();
+        let (text, finish_reason) = check_stop_sequences(&full_text, &stop_sequences);
 
         let prompt_tokens = token_ids.len() as u32;
         let completion_tokens = generated.len() as u32;
@@ -316,9 +339,9 @@ async fn chat_completions(
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content: text,
+                    content: text.to_string(),
                 },
-                finish_reason: "stop".to_string(),
+                finish_reason: finish_reason.to_string(),
                 logprobs: logprobs_response,
             }],
             usage: Usage {
@@ -386,9 +409,12 @@ async fn completions(
         (tokens, Vec::new())
     };
 
-    let text = tokenizer
+    let full_text = tokenizer
         .decode(&generated)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let stop_sequences: Vec<String> = req.stop.map(|s| s.into_vec()).unwrap_or_default();
+    let (text, finish_reason) = check_stop_sequences(&full_text, &stop_sequences);
 
     let prompt_tokens = token_ids.len() as u32;
     let completion_tokens = generated.len() as u32;
@@ -426,8 +452,8 @@ async fn completions(
         model: req.model,
         choices: vec![CompletionChoice {
             index: 0,
-            text,
-            finish_reason: "stop".to_string(),
+            text: text.to_string(),
+            finish_reason: finish_reason.to_string(),
             logprobs: logprobs_response,
         }],
         usage: Usage {
@@ -577,6 +603,15 @@ async fn health() -> &'static str {
     "ok"
 }
 
+fn check_stop_sequences<'a>(text: &'a str, stop_sequences: &[String]) -> (&'a str, &'static str) {
+    for seq in stop_sequences {
+        if let Some(pos) = text.find(seq.as_str()) {
+            return (&text[..pos], "stop");
+        }
+    }
+    (text, "length")
+}
+
 #[derive(Serialize)]
 struct ReadinessResponse {
     ready: bool,
@@ -676,5 +711,42 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_check_stop_sequences_match() {
+        let (text, reason) =
+            check_stop_sequences("Hello world! END more text", &["END".to_string()]);
+        assert_eq!(text, "Hello world! ");
+        assert_eq!(reason, "stop");
+    }
+
+    #[test]
+    fn test_check_stop_sequences_no_match() {
+        let (text, reason) = check_stop_sequences("Hello world!", &["END".to_string()]);
+        assert_eq!(text, "Hello world!");
+        assert_eq!(reason, "length");
+    }
+
+    #[test]
+    fn test_check_stop_sequences_empty() {
+        let (text, reason) = check_stop_sequences("Hello world!", &[]);
+        assert_eq!(text, "Hello world!");
+        assert_eq!(reason, "length");
+    }
+
+    #[test]
+    fn test_string_or_array_single() {
+        let s: StringOrArray = serde_json::from_str(r#""stop""#).unwrap();
+        assert_eq!(s.into_vec(), vec!["stop".to_string()]);
+    }
+
+    #[test]
+    fn test_string_or_array_array() {
+        let s: StringOrArray = serde_json::from_str(r#"["a", "b", "c"]"#).unwrap();
+        assert_eq!(
+            s.into_vec(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 }

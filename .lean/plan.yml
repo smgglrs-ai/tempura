@@ -750,7 +750,8 @@ items:
     quick: cargo test --workspace
 - id: p6-stop-sequences
   title: Stop sequence support
-  status: planned
+  status: done
+  progress: 100
   priority: critical
   effort: M
   scope:

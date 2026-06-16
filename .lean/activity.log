@@ -532,3 +532,10 @@
   summary: "Added logprobs support: TokenLogprob/TopLogprob types, generate_with_logprobs method, logprobs/top_logprobs API fields on requests and responses, 2 new tests"
   iteration: 1
   max_iterations: 10
+- timestamp: "2026-06-16T13:30:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p6-stop-sequences"
+  summary: "Added stop sequence support: StringOrArray deserialization, stop field on requests, check_stop_sequences helper, finish_reason stop/length, 5 new tests"
+  iteration: 2
+  max_iterations: 10
