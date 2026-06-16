@@ -49,6 +49,7 @@ pub fn router() -> Router<AppState> {
         .route("/health", get(health))
         .route("/health/inference", get(health_inference))
         .route("/ready", get(readiness))
+        .route("/v1/responses", post(responses))
 }
 
 #[derive(Debug, Deserialize)]
@@ -983,6 +984,170 @@ async fn health_inference(
             Json(serde_json::json!({"healthy": false, "error": "inference produced no output"})),
         )),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesRequest {
+    model: String,
+    input: ResponsesInput,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default = "default_max_tokens")]
+    max_output_tokens: u32,
+    #[serde(default = "default_temperature")]
+    temperature: f32,
+    #[serde(default)]
+    tools: Option<Vec<oxide_engine::tool_call::ToolDefinition>>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ResponsesInput {
+    Text(String),
+    Messages(Vec<ResponsesMessage>),
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesResponse {
+    id: String,
+    object: String,
+    created_at: u64,
+    model: String,
+    output: Vec<ResponsesOutputItem>,
+    usage: ResponsesUsage,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesOutputItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    id: String,
+    role: String,
+    content: Vec<ResponsesContent>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesContent {
+    #[serde(rename = "type")]
+    content_type: String,
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+    total_tokens: u32,
+}
+
+async fn responses(
+    State(state): State<AppState>,
+    Json(req): Json<ResponsesRequest>,
+) -> Result<Json<ResponsesResponse>, (StatusCode, String)> {
+    let tokenizer = state.tokenizer.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "No tokenizer loaded".into(),
+    ))?;
+
+    if state.model.weights.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No model weights loaded".into(),
+        ));
+    }
+
+    let mut messages = Vec::new();
+    if let Some(instructions) = &req.instructions {
+        messages.push(oxide_engine::ChatMessageInput {
+            role: "system".to_string(),
+            content: instructions.clone(),
+        });
+    }
+
+    match &req.input {
+        ResponsesInput::Text(text) => {
+            messages.push(oxide_engine::ChatMessageInput {
+                role: "user".to_string(),
+                content: text.clone(),
+            });
+        }
+        ResponsesInput::Messages(msgs) => {
+            for m in msgs {
+                messages.push(oxide_engine::ChatMessageInput {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                });
+            }
+        }
+    }
+
+    let prompt = tokenizer
+        .apply_chat_template(&messages, true)
+        .unwrap_or_else(|_| {
+            messages
+                .iter()
+                .map(|m| format!("{}: {}", m.role, m.content))
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+
+    let token_ids = tokenizer
+        .encode(&prompt)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let params = SamplingParams {
+        temperature: req.temperature,
+        top_k: 50,
+        top_p: 1.0,
+        ..SamplingParams::default()
+    };
+
+    let seed = req.seed.unwrap_or(42);
+    let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, seed);
+    let prompt_tokens = token_ids.len() as u32;
+
+    let generated = state.model.generate(
+        &mut session,
+        &token_ids,
+        req.max_output_tokens as usize,
+        &params,
+        None,
+    );
+
+    let text = tokenizer
+        .decode(&generated)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let completion_tokens = generated.len() as u32;
+
+    Ok(Json(ResponsesResponse {
+        id: format!("resp_{}", uuid::Uuid::new_v4()),
+        object: "response".to_string(),
+        created_at: 0,
+        model: req.model,
+        output: vec![ResponsesOutputItem {
+            item_type: "message".to_string(),
+            id: format!("msg_{}", uuid::Uuid::new_v4()),
+            role: "assistant".to_string(),
+            content: vec![ResponsesContent {
+                content_type: "output_text".to_string(),
+                text,
+            }],
+        }],
+        usage: ResponsesUsage {
+            input_tokens: prompt_tokens,
+            output_tokens: completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        },
+    }))
 }
 
 fn build_guided_decoder(

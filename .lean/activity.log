@@ -717,3 +717,10 @@
   summary: "Refactored ToolCallParser into trait + 4 implementations: GenericParser, HermesParser (<tool_call>), MistralParser ([TOOL_CALLS]), Llama3Parser (<|python_tag|>), detect_model_family from tokenizer_config"
   iteration: 8
   max_iterations: 10
+- timestamp: "2026-06-16T22:10:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p11-responses-api"
+  summary: "Added /v1/responses endpoint: stateless Responses API accepting text or message array input, instructions field, returns response object with output_text content, usage"
+  iteration: 9
+  max_iterations: 10

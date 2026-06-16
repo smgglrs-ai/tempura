@@ -1598,7 +1598,8 @@ items:
     quick: cargo test --package oxide-engine -- prefix_cache
 - id: p11-responses-api
   title: OpenAI Responses API (/v1/responses)
-  status: planned
+  status: done
+  progress: 100
   priority: medium
   effort: L
   scope:
