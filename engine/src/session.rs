@@ -26,6 +26,21 @@ impl InferenceSession {
         }
     }
 
+    pub fn with_cache(cache: KvCache, trace_level: TraceLevel, seed: u64) -> Self {
+        Self {
+            cache,
+            trace: InferenceTrace::new(String::new(), trace_level, String::new(), seed),
+            trace_level,
+            position: 0,
+            rng: StdRng::seed_from_u64(seed),
+            seed,
+        }
+    }
+
+    pub fn take_cache(self) -> KvCache {
+        self.cache
+    }
+
     pub fn reset(&mut self) {
         self.cache.reset();
         self.position = 0;

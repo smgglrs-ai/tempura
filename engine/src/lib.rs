@@ -10,7 +10,7 @@ pub mod trace;
 pub mod weights;
 
 pub use config::ModelConfig;
-pub use kv_cache::KvCache;
+pub use kv_cache::{KvCache, KvCachePool, PoolError};
 pub use model::TransformerModel;
 pub use session::InferenceSession;
 pub use trace::{

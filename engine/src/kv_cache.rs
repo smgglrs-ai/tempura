@@ -167,6 +167,63 @@ impl KvCache {
     }
 }
 
+#[derive(Debug)]
+pub enum PoolError {
+    NoFreeSlots,
+}
+
+impl std::fmt::Display for PoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PoolError::NoFreeSlots => write!(f, "no free KV cache slots available"),
+        }
+    }
+}
+
+impl std::error::Error for PoolError {}
+
+pub struct KvCachePool {
+    free: Vec<KvCache>,
+    config: ModelConfig,
+    num_slots: usize,
+}
+
+impl KvCachePool {
+    pub fn new(config: &ModelConfig, num_slots: usize) -> Self {
+        let free = (0..num_slots).map(|_| KvCache::new(config)).collect();
+        Self {
+            free,
+            config: config.clone(),
+            num_slots,
+        }
+    }
+
+    pub fn acquire(&mut self) -> Result<KvCache, PoolError> {
+        self.free.pop().ok_or(PoolError::NoFreeSlots)
+    }
+
+    pub fn release(&mut self, mut cache: KvCache) {
+        cache.reset();
+        self.free.push(cache);
+    }
+
+    pub fn num_slots(&self) -> usize {
+        self.num_slots
+    }
+
+    pub fn available(&self) -> usize {
+        self.free.len()
+    }
+
+    pub fn in_use(&self) -> usize {
+        self.num_slots - self.free.len()
+    }
+
+    pub fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+}
+
 #[cfg(kani)]
 mod kani_proofs {
     // Prove KvCache indexing arithmetic is safe without constructing
@@ -336,6 +393,112 @@ mod tests {
 
         assert_eq!(cache.seq_len, 0);
         assert!(cache.k_compressed[0].is_none());
+    }
+
+    #[test]
+    fn test_pool_acquire_release() {
+        let config = ModelConfig::tiny_test();
+        let mut pool = KvCachePool::new(&config, 3);
+
+        assert_eq!(pool.num_slots(), 3);
+        assert_eq!(pool.available(), 3);
+        assert_eq!(pool.in_use(), 0);
+
+        let cache1 = pool.acquire().unwrap();
+        assert_eq!(pool.available(), 2);
+        assert_eq!(pool.in_use(), 1);
+
+        let cache2 = pool.acquire().unwrap();
+        let cache3 = pool.acquire().unwrap();
+        assert_eq!(pool.available(), 0);
+        assert_eq!(pool.in_use(), 3);
+
+        assert!(pool.acquire().is_err());
+
+        pool.release(cache1);
+        assert_eq!(pool.available(), 1);
+
+        let _cache4 = pool.acquire().unwrap();
+        assert_eq!(pool.available(), 0);
+
+        pool.release(cache2);
+        pool.release(cache3);
+    }
+
+    #[test]
+    fn test_pool_size_one_backward_compat() {
+        let config = ModelConfig::tiny_test();
+        let mut pool = KvCachePool::new(&config, 1);
+        let mut cache = pool.acquire().unwrap();
+
+        let stride = config.num_kv_heads * config.head_dim;
+        let k_data: Vec<f32> = (0..stride).map(|i| i as f32).collect();
+        let v_data: Vec<f32> = (0..stride).map(|i| (i as f32) * 2.0).collect();
+
+        cache.append_kv(0, &k_data, &v_data, 1);
+        cache.advance(1);
+        assert_eq!(cache.seq_len, 1);
+        assert_eq!(cache.k_slice(0).len(), stride);
+
+        pool.release(cache);
+        let cache2 = pool.acquire().unwrap();
+        assert_eq!(cache2.seq_len, 0);
+    }
+
+    #[test]
+    fn test_pool_slot_isolation() {
+        let config = ModelConfig::tiny_test();
+        let mut pool = KvCachePool::new(&config, 2);
+
+        let mut cache_a = pool.acquire().unwrap();
+        let mut cache_b = pool.acquire().unwrap();
+
+        let stride = config.num_kv_heads * config.head_dim;
+        let k_a: Vec<f32> = (0..stride).map(|i| i as f32 * 1.0).collect();
+        let v_a: Vec<f32> = (0..stride).map(|i| i as f32 * 2.0).collect();
+        let k_b: Vec<f32> = (0..stride).map(|i| i as f32 * 10.0).collect();
+        let v_b: Vec<f32> = (0..stride).map(|i| i as f32 * 20.0).collect();
+
+        cache_a.append_kv(0, &k_a, &v_a, 1);
+        cache_a.advance(1);
+
+        cache_b.append_kv(0, &k_b, &v_b, 1);
+        cache_b.advance(1);
+
+        let k_slice_a = cache_a.k_data(0, 1);
+        let k_slice_b = cache_b.k_data(0, 1);
+
+        assert_ne!(&*k_slice_a, &*k_slice_b, "slots must be independent");
+
+        for i in 0..stride {
+            assert!(
+                (k_slice_a[i] - k_a[i]).abs() < 1e-6,
+                "slot A k corrupted at {i}"
+            );
+            assert!(
+                (k_slice_b[i] - k_b[i]).abs() < 1e-6,
+                "slot B k corrupted at {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pool_release_resets_cache() {
+        let config = ModelConfig::tiny_test();
+        let mut pool = KvCachePool::new(&config, 1);
+
+        let mut cache = pool.acquire().unwrap();
+        let stride = config.num_kv_heads * config.head_dim;
+        let k_data: Vec<f32> = (0..stride).map(|i| i as f32 + 1.0).collect();
+        let v_data = k_data.clone();
+        cache.append_kv(0, &k_data, &v_data, 1);
+        cache.advance(1);
+        assert_eq!(cache.seq_len, 1);
+
+        pool.release(cache);
+
+        let reacquired = pool.acquire().unwrap();
+        assert_eq!(reacquired.seq_len, 0, "released cache must be reset");
     }
 
     #[test]

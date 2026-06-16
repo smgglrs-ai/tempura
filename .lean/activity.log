@@ -372,3 +372,11 @@
   summary: "Implemented TurboQuant/PQO KV-cache compression kernel with KvCacheCompressor trait, CpuPolarQuant (group-quantized 3-bit), CudaPolarQuant stub, KvCache compressed mode, Kani harnesses, verification manifest entries"
   iteration: 1
   max_iterations: 10
+
+- timestamp: "2026-06-16T15:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p4-kvcache-pool"
+  summary: "Added KvCachePool with acquire/release semantics, PoolError type, InferenceSession::with_cache()/take_cache() for pool integration, 4 new tests verifying slot isolation and backward compat"
+  iteration: 2
+  max_iterations: 10

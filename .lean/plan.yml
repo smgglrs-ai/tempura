@@ -550,7 +550,8 @@ items:
       acquire/release semantics. InferenceSession references a slot
       instead of owning a cache. Prerequisite for continuous batching —
       without it, all requests serialize through a single cache.
-    status: planned
+    status: done
+    progress: 100
     priority: medium
     effort: M
     scope:
