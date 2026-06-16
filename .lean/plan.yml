@@ -1176,7 +1176,8 @@ items:
     method currently processes the entire token_ids slice in one call (model.rs line 38), and the scheduler
     tracks Prefill vs Decode state but does not subdivide prefills (batch.rs SequenceState). A chunked_prefill
     method on TransformerModel and a chunk-aware scheduling loop in BatchScheduler are the core additions.
-  status: planned
+  status: done
+  progress: 100
   priority: high
   effort: M
   depends_on:

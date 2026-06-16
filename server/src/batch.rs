@@ -26,6 +26,7 @@ pub struct ActiveSequence {
     pub state: SequenceState,
     pub age: u64,
     pub token_ids: Vec<u32>,
+    pub prefill_offset: usize,
 }
 
 pub struct BatchScheduler {
@@ -37,6 +38,7 @@ pub struct BatchScheduler {
     num_slots: usize,
     allocated_slots: Vec<bool>,
     tick: u64,
+    prefill_chunk_size: usize,
 }
 
 impl BatchScheduler {
@@ -50,7 +52,17 @@ impl BatchScheduler {
             num_slots,
             allocated_slots: vec![false; num_slots],
             tick: 0,
+            prefill_chunk_size: 512,
         }
+    }
+
+    pub fn with_prefill_chunk_size(mut self, size: usize) -> Self {
+        self.prefill_chunk_size = size;
+        self
+    }
+
+    pub fn prefill_chunk_size(&self) -> usize {
+        self.prefill_chunk_size
     }
 
     pub fn submit(&mut self, request: InferenceRequest) {
@@ -139,6 +151,7 @@ impl BatchScheduler {
                 state: SequenceState::Prefill,
                 age: self.tick,
                 token_ids: req.token_ids,
+                prefill_offset: 0,
             };
 
             admitted.push(ActiveSequence {
@@ -150,6 +163,7 @@ impl BatchScheduler {
                 state: seq.state,
                 age: seq.age,
                 token_ids: seq.token_ids.clone(),
+                prefill_offset: 0,
             });
 
             self.active.push(seq);

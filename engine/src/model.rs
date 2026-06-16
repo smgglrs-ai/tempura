@@ -300,6 +300,27 @@ where
         logits
     }
 
+    pub fn chunked_forward(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        chunk_size: usize,
+    ) -> Vec<f32> {
+        if token_ids.len() <= chunk_size {
+            return self.forward(session, token_ids);
+        }
+
+        let mut logits = Vec::new();
+        let mut offset = 0;
+        while offset < token_ids.len() {
+            let end = (offset + chunk_size).min(token_ids.len());
+            let chunk = &token_ids[offset..end];
+            logits = self.forward(session, chunk);
+            offset = end;
+        }
+        logits
+    }
+
     pub fn sample(
         &self,
         logits: &[f32],
@@ -1037,5 +1058,65 @@ mod tests {
             assert!(snap.pre_norm.is_some());
             assert!(snap.post_norm.is_some());
         }
+    }
+
+    #[test]
+    fn test_chunked_forward_large_chunk_matches_unchunked() {
+        let config = ModelConfig::tiny_test();
+        let loader = RandomWeightLoader::from_config(&config, 42);
+        let tokens = [1u32, 2, 3, 4, 5, 6];
+
+        let pipeline1 = KernelPipeline::cpu_verified();
+        let mut model1 = TransformerModel::new(config.clone(), pipeline1);
+        model1.load_weights(&loader).unwrap();
+        let mut session1 = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let logits_unchunked = model1.forward(&mut session1, &tokens);
+
+        let pipeline2 = KernelPipeline::cpu_verified();
+        let mut model2 = TransformerModel::new(config.clone(), pipeline2);
+        model2.load_weights(&loader).unwrap();
+        let mut session2 = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let logits_chunked = model2.chunked_forward(&mut session2, &tokens, 512);
+
+        assert_eq!(logits_unchunked, logits_chunked);
+        assert_eq!(session1.position, session2.position);
+    }
+
+    #[test]
+    fn test_chunked_forward_small_chunk_valid_output() {
+        let config = ModelConfig::tiny_test();
+        let loader = RandomWeightLoader::from_config(&config, 42);
+        let tokens = [1u32, 2, 3, 4, 5, 6];
+
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(config.clone(), pipeline);
+        model.load_weights(&loader).unwrap();
+        let mut session = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let logits = model.chunked_forward(&mut session, &tokens, 2);
+
+        assert_eq!(logits.len(), config.vocab_size);
+        assert_eq!(session.position, tokens.len());
+        assert!(!logits.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_chunked_forward_deterministic() {
+        let config = ModelConfig::tiny_test();
+        let loader = RandomWeightLoader::from_config(&config, 42);
+        let tokens = [1u32, 2, 3, 4, 5, 6];
+
+        let pipeline1 = KernelPipeline::cpu_verified();
+        let mut model1 = TransformerModel::new(config.clone(), pipeline1);
+        model1.load_weights(&loader).unwrap();
+        let mut s1 = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let logits1 = model1.chunked_forward(&mut s1, &tokens, 3);
+
+        let pipeline2 = KernelPipeline::cpu_verified();
+        let mut model2 = TransformerModel::new(config.clone(), pipeline2);
+        model2.load_weights(&loader).unwrap();
+        let mut s2 = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let logits2 = model2.chunked_forward(&mut s2, &tokens, 3);
+
+        assert_eq!(logits1, logits2);
     }
 }

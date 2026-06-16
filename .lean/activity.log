@@ -592,3 +592,10 @@
   summary: "Added TTFT/ITL histograms on streaming path, oxide_kv_cache_slots_in_use/total gauges, streaming path now records request_count/tokens_generated/duration like non-streaming"
   iteration: 5
   max_iterations: 10
+- timestamp: "2026-06-16T18:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p7-chunked-prefill"
+  summary: "Added chunked prefill: chunked_forward method on TransformerModel, prefill_offset on ActiveSequence, configurable prefill_chunk_size on BatchScheduler (default 512), 3 new tests"
+  iteration: 6
+  max_iterations: 10
