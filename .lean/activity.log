@@ -585,3 +585,10 @@
   summary: "Added per-request timeouts: --request-timeout-secs CLI flag (default 300), timeout_secs request field override, 504 on timeout, oxide_request_timeout counter metric, streaming deadline check in on_token callback"
   iteration: 4
   max_iterations: 10
+- timestamp: "2026-06-16T17:45:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p7-comprehensive-metrics"
+  summary: "Added TTFT/ITL histograms on streaming path, oxide_kv_cache_slots_in_use/total gauges, streaming path now records request_count/tokens_generated/duration like non-streaming"
+  iteration: 5
+  max_iterations: 10

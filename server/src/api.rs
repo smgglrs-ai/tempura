@@ -267,6 +267,8 @@ fn record_scheduler_gauges(scheduler: &crate::batch::BatchScheduler) {
     metrics::gauge!("oxide_scheduler_active_sequences").set(scheduler.active_count() as f64);
     metrics::gauge!("oxide_scheduler_queue_depth")
         .set((scheduler.pending_count() + scheduler.preempted_count()) as f64);
+    metrics::gauge!("oxide_kv_cache_slots_in_use").set(scheduler.allocated_slot_count() as f64);
+    metrics::gauge!("oxide_kv_cache_slots_total").set(scheduler.max_batch_size() as f64);
 }
 
 async fn chat_completions(
@@ -351,11 +353,17 @@ async fn chat_completions(
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
 
+        metrics::counter!("oxide_request_count", "endpoint" => "chat_completions").increment(1);
+
         tokio::task::spawn_blocking(move || {
+            let stream_start = std::time::Instant::now();
             let mut session = InferenceSession::new(&model.config, TraceLevel::Off, 42);
             let id_clone = rid.clone();
             let model_name = req.model.clone();
             let deadline = std::time::Instant::now() + timeout;
+            let mut token_count = 0u64;
+            let mut last_token_time = stream_start;
+            let mut first_token_recorded = false;
 
             model.generate_with_callback(
                 &mut session,
@@ -364,11 +372,24 @@ async fn chat_completions(
                 &params,
                 None,
                 |token| {
-                    if std::time::Instant::now() >= deadline {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
                         metrics::counter!("oxide_request_timeout", "endpoint" => "chat_completions")
                             .increment(1);
                         return false;
                     }
+
+                    if !first_token_recorded {
+                        metrics::histogram!("oxide_time_to_first_token_seconds")
+                            .record(now.duration_since(stream_start).as_secs_f64());
+                        first_token_recorded = true;
+                    } else {
+                        metrics::histogram!("oxide_inter_token_latency_seconds")
+                            .record(now.duration_since(last_token_time).as_secs_f64());
+                    }
+                    last_token_time = now;
+                    token_count += 1;
+
                     let text = tokenizer.decode(&[token]).unwrap_or_default();
                     let chunk = ChatCompletionChunk {
                         id: id_clone.clone(),
@@ -390,10 +411,13 @@ async fn chat_completions(
                 },
             );
 
+            metrics::counter!("oxide_tokens_generated").increment(token_count);
+            metrics::histogram!("oxide_request_duration_seconds", "endpoint" => "chat_completions")
+                .record(stream_start.elapsed().as_secs_f64());
+
             let done = Event::default().data("[DONE]");
             let _ = tx.blocking_send(Ok(done));
 
-            // Release the scheduler slot after generation completes (or client disconnects)
             let rt = tokio::runtime::Handle::current();
             rt.block_on(async {
                 let mut sched = scheduler.lock().await;

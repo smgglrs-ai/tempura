@@ -1074,7 +1074,8 @@ items:
     request error counters. Metrics recording must be wired into both the non-streaming and streaming
     handlers in api.rs, and the BatchScheduler and KvCachePool must expose their state to the metrics
     layer (they already have the query methods: pending_count, active_count, allocated_slot_count, KvCachePool::in_use/available).'
-  status: planned
+  status: done
+  progress: 100
   priority: critical
   effort: M
   depends_on:
