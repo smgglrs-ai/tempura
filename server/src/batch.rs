@@ -102,8 +102,7 @@ impl BatchScheduler {
         self.preempted.push_back(InferenceRequest {
             id: evicted.request_id,
             token_ids: evicted.token_ids,
-            max_new_tokens: evicted.max_new_tokens
-                - evicted.generated_tokens.len() as u32,
+            max_new_tokens: evicted.max_new_tokens - evicted.generated_tokens.len() as u32,
             temperature: 0.0,
             top_p: 1.0,
         });
@@ -323,7 +322,11 @@ mod tests {
         let admitted = scheduler.admit_new_requests();
 
         assert!(admitted.len() >= 1, "r3 should be admitted via preemption");
-        assert_eq!(scheduler.preempted_count(), 1, "evicted request should be in preempted queue");
+        assert_eq!(
+            scheduler.preempted_count(),
+            1,
+            "evicted request should be in preempted queue"
+        );
         assert_eq!(scheduler.active_count(), 2, "all slots remain in use");
     }
 
@@ -405,9 +408,8 @@ mod tests {
 
         scheduler.admit_new_requests();
 
-        let total = scheduler.active_count()
-            + scheduler.pending_count()
-            + scheduler.preempted_count();
+        let total =
+            scheduler.active_count() + scheduler.pending_count() + scheduler.preempted_count();
         assert_eq!(total, 3, "no request should be silently dropped");
     }
 }

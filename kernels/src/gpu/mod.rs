@@ -38,10 +38,7 @@ pub fn to_host(stream: &CudaStream, buf: &DeviceBuffer<f32>) -> Result<Vec<f32>,
         .map_err(|e| KernelError::InvalidConfig(e.to_string()))
 }
 
-pub fn to_device_u32(
-    stream: &CudaStream,
-    data: &[u32],
-) -> Result<DeviceBuffer<u32>, KernelError> {
+pub fn to_device_u32(stream: &CudaStream, data: &[u32]) -> Result<DeviceBuffer<u32>, KernelError> {
     DeviceBuffer::from_host(stream, data).map_err(|e| KernelError::InvalidConfig(e.to_string()))
 }
 
@@ -65,7 +62,8 @@ mod tests {
 
     #[test]
     fn test_gpu_round_trip() {
-        let gpu = GpuContext::new(0).expect("Failed to create GPU context — is an NVIDIA GPU available?");
+        let gpu =
+            GpuContext::new(0).expect("Failed to create GPU context — is an NVIDIA GPU available?");
         let stream = gpu.stream();
 
         let data: Vec<f32> = (0..1024).map(|i| i as f32 * 0.1).collect();

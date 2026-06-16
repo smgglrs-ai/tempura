@@ -1,4 +1,4 @@
-use cuda_device::{DisjointSlice, kernel, thread};
+use cuda_device::{kernel, thread, DisjointSlice};
 use cuda_host::cuda_module;
 
 #[cuda_module]

@@ -102,7 +102,8 @@ async fn main() {
     let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
     let metrics_handle = prometheus_builder.install_recorder().unwrap();
 
-    let scheduler = batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len, args.max_batch_size);
+    let scheduler =
+        batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len, args.max_batch_size);
     let traces = trace_store::TraceStore::new(args.max_traces);
     let state = AppState {
         model: Arc::new(model),

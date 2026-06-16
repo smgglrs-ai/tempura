@@ -192,12 +192,16 @@ mod tests {
         let positions: Vec<u32> = (0..seq_len as u32).collect();
 
         let mut x_cpu = x_orig.clone();
-        cpu.forward(&mut x_cpu, 1, seq_len, num_heads, head_dim, &positions, theta)
-            .unwrap();
+        cpu.forward(
+            &mut x_cpu, 1, seq_len, num_heads, head_dim, &positions, theta,
+        )
+        .unwrap();
 
         let mut x_gpu = x_orig.clone();
-        gpu.forward(&mut x_gpu, 1, seq_len, num_heads, head_dim, &positions, theta)
-            .unwrap();
+        gpu.forward(
+            &mut x_gpu, 1, seq_len, num_heads, head_dim, &positions, theta,
+        )
+        .unwrap();
 
         for i in 0..n {
             let diff = (x_cpu[i] - x_gpu[i]).abs();

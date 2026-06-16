@@ -1283,8 +1283,9 @@ items:
   verification:
     quick: cargo test --package oxide-engine batch_invariant
 - id: auto-rustfmt
-  title: Fix rustfmt violations in speculative.rs
-  status: planned
+  title: Fix rustfmt violations across workspace
+  status: done
+  progress: 100
   priority: critical
   effort: XS
   scope:

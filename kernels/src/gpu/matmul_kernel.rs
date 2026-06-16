@@ -1,4 +1,4 @@
-use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
+use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
 use cuda_host::cuda_module;
 
 const TILE: usize = 16;

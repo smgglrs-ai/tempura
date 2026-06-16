@@ -204,27 +204,13 @@ impl CudaMatMul {
         if transposed_b {
             module
                 .sgemm_tiled_bt(
-                    &stream,
-                    config,
-                    m as u32,
-                    n as u32,
-                    k as u32,
-                    &a_dev,
-                    &b_dev,
-                    &mut c_dev,
+                    &stream, config, m as u32, n as u32, k as u32, &a_dev, &b_dev, &mut c_dev,
                 )
                 .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
         } else {
             module
                 .sgemm_tiled(
-                    &stream,
-                    config,
-                    m as u32,
-                    n as u32,
-                    k as u32,
-                    &a_dev,
-                    &b_dev,
-                    &mut c_dev,
+                    &stream, config, m as u32, n as u32, k as u32, &a_dev, &b_dev, &mut c_dev,
                 )
                 .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
         }
@@ -246,13 +232,22 @@ impl MatMul for CudaMatMul {
         k: usize,
     ) -> Result<()> {
         if a.len() != m * k {
-            return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
         }
         if b.len() != k * n {
-            return Err(crate::KernelError::DimensionMismatch { expected: k * n, got: b.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: k * n,
+                got: b.len(),
+            });
         }
         if output.len() != m * n {
-            return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
         }
         self.launch_gemm(a, b, output, m, n, k, false)
     }
@@ -267,13 +262,22 @@ impl MatMul for CudaMatMul {
         k: usize,
     ) -> Result<()> {
         if a.len() != m * k {
-            return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
         }
         if b.len() != n * k {
-            return Err(crate::KernelError::DimensionMismatch { expected: n * k, got: b.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: n * k,
+                got: b.len(),
+            });
         }
         if output.len() != m * n {
-            return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
         }
         self.launch_gemm(a, b, output, m, n, k, true)
     }

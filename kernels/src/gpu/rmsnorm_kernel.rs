@@ -1,4 +1,4 @@
-use cuda_device::{DisjointSlice, kernel, thread};
+use cuda_device::{kernel, thread, DisjointSlice};
 use cuda_host::cuda_module;
 
 #[cuda_module]
@@ -10,11 +10,7 @@ pub mod kernels {
     /// For hidden_size <= 4096 this is fast enough; warp reductions
     /// can optimize later.
     #[kernel]
-    pub fn rmsnorm_sum_sq(
-        x: &[f32],
-        mut ss_out: DisjointSlice<f32>,
-        hidden_size: u32,
-    ) {
+    pub fn rmsnorm_sum_sq(x: &[f32], mut ss_out: DisjointSlice<f32>, hidden_size: u32) {
         let idx = thread::index_1d();
         let row = idx.get();
 

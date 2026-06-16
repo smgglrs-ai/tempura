@@ -111,9 +111,9 @@ where
             }
 
             if draft_tokens.is_empty() {
-                let logits =
-                    self.target
-                        .forward(target_session, &[*generated.last().unwrap()]);
+                let logits = self
+                    .target
+                    .forward(target_session, &[*generated.last().unwrap()]);
                 let mut probs = vec![0.0f32; logits.len()];
                 self.target
                     .pipeline
@@ -125,11 +125,7 @@ where
                 } else {
                     Some(&mut target_session.rng)
                 };
-                let token = self
-                    .target
-                    .pipeline
-                    .sampler
-                    .sample_token(&probs, rng_ref);
+                let token = self.target.pipeline.sampler.sample_token(&probs, rng_ref);
                 generated.push(token);
                 continue;
             }
@@ -142,8 +138,7 @@ where
             let mut verify_token = *generated.last().unwrap();
 
             for (i, &draft_token) in draft_tokens.iter().enumerate() {
-                let target_logits =
-                    self.target.forward(target_session, &[verify_token]);
+                let target_logits = self.target.forward(target_session, &[verify_token]);
                 let mut target_probs = vec![0.0f32; target_logits.len()];
                 self.target
                     .pipeline
@@ -174,8 +169,7 @@ where
                     verify_token = draft_token;
                 } else {
                     rejected.push(draft_token);
-                    let rng_ref: Option<&mut dyn rand::RngCore> =
-                        Some(&mut target_session.rng);
+                    let rng_ref: Option<&mut dyn rand::RngCore> = Some(&mut target_session.rng);
                     let corrected = self
                         .target
                         .pipeline
@@ -187,9 +181,9 @@ where
             }
 
             if rejected.is_empty() {
-                let last_logits =
-                    self.target
-                        .forward(target_session, &[*accepted.last().unwrap()]);
+                let last_logits = self
+                    .target
+                    .forward(target_session, &[*accepted.last().unwrap()]);
                 let mut last_probs = vec![0.0f32; last_logits.len()];
                 self.target
                     .pipeline
@@ -215,7 +209,14 @@ where
             draft_session.cache.rollback(saved_draft_seq_len);
             draft_session.position = saved_draft_pos;
             for &token in &accepted {
-                let _ = self.draft.forward(draft_session, &[if generated.is_empty() { token } else { *generated.last().unwrap_or(&token) }]);
+                let _ = self.draft.forward(
+                    draft_session,
+                    &[if generated.is_empty() {
+                        token
+                    } else {
+                        *generated.last().unwrap_or(&token)
+                    }],
+                );
             }
 
             generated.extend_from_slice(&accepted);
@@ -232,9 +233,7 @@ where
                     .push(SpeculativeSnapshot {
                         step,
                         draft_proposed: draft_tokens,
-                        accepted: accepted
-                            [..accepted.len().min(num_accepted_from_draft)]
-                            .to_vec(),
+                        accepted: accepted[..accepted.len().min(num_accepted_from_draft)].to_vec(),
                         rejected,
                         acceptance_rate,
                     });
@@ -356,8 +355,14 @@ mod tests {
 
         let mut target_session = InferenceSession::new(&config, TraceLevel::Off, 42);
         let mut draft_session = InferenceSession::new(&config, TraceLevel::Off, 42);
-        let tokens =
-            decoder.generate(&mut target_session, &mut draft_session, &[1, 2], 5, &params, None);
+        let tokens = decoder.generate(
+            &mut target_session,
+            &mut draft_session,
+            &[1, 2],
+            5,
+            &params,
+            None,
+        );
 
         assert_eq!(tokens.len(), 5, "should produce exactly max_new_tokens");
     }
@@ -377,8 +382,14 @@ mod tests {
 
         let mut target_session = InferenceSession::new(&config, TraceLevel::Summary, 42);
         let mut draft_session = InferenceSession::new(&config, TraceLevel::Off, 42);
-        let tokens =
-            decoder.generate(&mut target_session, &mut draft_session, &[1], 4, &params, None);
+        let tokens = decoder.generate(
+            &mut target_session,
+            &mut draft_session,
+            &[1],
+            4,
+            &params,
+            None,
+        );
 
         assert!(!tokens.is_empty());
         assert_eq!(target_session.trace.prompt_tokens, 1);
