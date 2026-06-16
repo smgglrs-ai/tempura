@@ -53,8 +53,15 @@ impl Attention for CpuAttention {
                     let q_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
                     let q_vec = &q[q_offset..q_offset + head_dim];
 
+                    let cache_offset = kv_len - seq_len;
+                    let causal_limit = cache_offset + s;
+
                     let mut scores = vec![0.0f32; kv_len];
                     for (kv_s, score) in scores.iter_mut().enumerate() {
+                        if kv_s > causal_limit {
+                            *score = f32::NEG_INFINITY;
+                            continue;
+                        }
                         let k_offset = ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim;
                         let k_vec = &k[k_offset..k_offset + head_dim];
                         let dot: f32 = q_vec.iter().zip(k_vec).map(|(a, b)| a * b).sum();
