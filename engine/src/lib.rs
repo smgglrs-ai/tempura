@@ -1,3 +1,4 @@
+pub mod batch_invariant;
 pub mod config;
 pub mod dual_pipeline;
 pub mod kv_cache;

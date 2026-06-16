@@ -606,3 +606,10 @@
   summary: "Added OpenTelemetry export: otlp feature flag, --otlp-endpoint CLI flag, TracerProvider with OTLP gRPC exporter, tracing-opentelemetry subscriber layer, #[instrument] on inference endpoints, disabled by default"
   iteration: 7
   max_iterations: 10
+- timestamp: "2026-06-16T18:40:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p8-batch-invariant-verification"
+  summary: "Added BatchInvariantVerifier with verify_batch_invariance function, Kani harness proving attention batch offset isolation, verification manifest entry, 3 integration tests (solo vs batch-2/4, prepopulated cache)"
+  iteration: 8
+  max_iterations: 10

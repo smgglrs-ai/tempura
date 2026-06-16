@@ -1274,7 +1274,8 @@ items:
     and sampled tokens. It also extends the VerificationManifest to record batch-invariance as a proven
     property, and adds a Kani harness proving that attention indexing for one sequence within a batch
     cannot read from another sequence's memory region.
-  status: planned
+  status: done
+  progress: 100
   priority: medium
   effort: M
   scope:

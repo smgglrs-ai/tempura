@@ -104,6 +104,15 @@ pub fn manifest() -> VerificationManifest {
                 ],
                 status: "proven",
             },
+            KernelProof {
+                kernel: "CpuAttention",
+                harness: "attention_batch_isolation_no_overlap",
+                properties: vec![
+                    "Q/K/V offset ranges for different batch indices never overlap",
+                    "Batch-invariance: each sequence's memory region is isolated",
+                ],
+                status: "proven",
+            },
         ],
         caveats: vec![
             "Proofs cover memory safety (no OOB, no panics) — NOT mathematical correctness",

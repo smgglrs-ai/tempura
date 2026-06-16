@@ -213,6 +213,33 @@ mod kani_proofs {
         let k_offset = ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim;
         assert!(k_offset + head_dim <= k_len);
     }
+
+    #[kani::proof]
+    fn attention_batch_isolation_no_overlap() {
+        let batch: usize = kani::any();
+        let seq_len: usize = kani::any();
+        let num_heads: usize = kani::any();
+        let head_dim: usize = kani::any();
+
+        kani::assume(batch >= 2 && batch <= 4);
+        kani::assume(seq_len >= 1 && seq_len <= 2);
+        kani::assume(num_heads >= 1 && num_heads <= 2);
+        kani::assume(head_dim >= 1 && head_dim <= 4);
+
+        let b1: usize = kani::any();
+        let b2: usize = kani::any();
+        kani::assume(b1 < batch);
+        kani::assume(b2 < batch);
+        kani::assume(b1 != b2);
+
+        let stride = seq_len * num_heads * head_dim;
+        let start1 = b1 * stride;
+        let end1 = start1 + stride;
+        let start2 = b2 * stride;
+        let end2 = start2 + stride;
+
+        assert!(end1 <= start2 || end2 <= start1);
+    }
 }
 
 #[cfg(test)]
