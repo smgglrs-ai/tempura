@@ -27,6 +27,7 @@ pub struct ActiveSequence {
     pub age: u64,
     pub token_ids: Vec<u32>,
     pub prefill_offset: usize,
+    pub prefix_matched_len: usize,
 }
 
 pub struct BatchScheduler {
@@ -152,6 +153,7 @@ impl BatchScheduler {
                 age: self.tick,
                 token_ids: req.token_ids,
                 prefill_offset: 0,
+                prefix_matched_len: 0,
             };
 
             admitted.push(ActiveSequence {
@@ -164,6 +166,7 @@ impl BatchScheduler {
                 age: seq.age,
                 token_ids: seq.token_ids.clone(),
                 prefill_offset: 0,
+                prefix_matched_len: 0,
             });
 
             self.active.push(seq);

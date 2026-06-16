@@ -13,7 +13,9 @@ pub mod trace;
 pub mod weights;
 
 pub use config::{ConfigError, ModelConfig, QuantConfig, QuantFormat};
-pub use kv_cache::{KvCache, KvCachePool, PoolError};
+pub use kv_cache::{
+    KvCache, KvCachePool, PoolError, PrefixCacheTable, PrefixMatch, SharedPrefixCache,
+};
 pub use model::{TokenLogprob, TopLogprob, TransformerModel};
 pub use session::InferenceSession;
 pub use tokenizer::{ChatMessageInput, ChatTemplate};

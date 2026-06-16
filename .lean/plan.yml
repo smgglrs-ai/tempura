@@ -1142,7 +1142,8 @@ items:
     probe the cache table before running prefill. The current architecture creates a fresh `InferenceSession`
     per request with no KV reuse, so this is a significant structural change to the engine's memory management
     layer.
-  status: planned
+  status: done
+  progress: 100
   priority: high
   effort: L
   depends_on:

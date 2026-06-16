@@ -1,4 +1,7 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 use crate::config::ModelConfig;
 use oxide_kernels::turboquant::{CompressedKV, KvCacheCompressor};
@@ -258,6 +261,151 @@ impl KvCachePool {
     pub fn config(&self) -> &ModelConfig {
         &self.config
     }
+}
+
+struct PrefixEntry {
+    token_ids: Vec<u32>,
+    k_data: Vec<Vec<f32>>,
+    v_data: Vec<Vec<f32>>,
+    seq_len: usize,
+    ref_count: usize,
+    last_used: u64,
+}
+
+pub struct PrefixCacheTable {
+    entries: HashMap<u64, PrefixEntry>,
+    max_entries: usize,
+    tick: u64,
+    hits: u64,
+    tokens_saved: u64,
+}
+
+impl PrefixCacheTable {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries,
+            tick: 0,
+            hits: 0,
+            tokens_saved: 0,
+        }
+    }
+
+    fn hash_tokens(token_ids: &[u32]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        token_ids.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    pub fn probe(&mut self, token_ids: &[u32]) -> Option<PrefixMatch> {
+        self.tick += 1;
+
+        for len in (1..=token_ids.len()).rev() {
+            let prefix = &token_ids[..len];
+            let hash = Self::hash_tokens(prefix);
+            if let Some(entry) = self.entries.get_mut(&hash) {
+                if entry.token_ids == prefix {
+                    entry.last_used = self.tick;
+                    entry.ref_count += 1;
+                    self.hits += 1;
+                    self.tokens_saved += len as u64;
+                    return Some(PrefixMatch {
+                        matched_len: entry.seq_len,
+                        k_data: entry.k_data.clone(),
+                        v_data: entry.v_data.clone(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    pub fn store(&mut self, token_ids: &[u32], cache: &KvCache) {
+        if token_ids.is_empty() || cache.seq_len == 0 {
+            return;
+        }
+
+        if self.entries.len() >= self.max_entries {
+            self.evict_lru();
+        }
+
+        let hash = Self::hash_tokens(token_ids);
+        let k_data: Vec<Vec<f32>> = (0..cache.num_layers)
+            .map(|layer| cache.k_slice(layer).to_vec())
+            .collect();
+        let v_data: Vec<Vec<f32>> = (0..cache.num_layers)
+            .map(|layer| cache.v_slice(layer).to_vec())
+            .collect();
+
+        self.entries.insert(
+            hash,
+            PrefixEntry {
+                token_ids: token_ids.to_vec(),
+                k_data,
+                v_data,
+                seq_len: cache.seq_len,
+                ref_count: 0,
+                last_used: self.tick,
+            },
+        );
+    }
+
+    pub fn release(&mut self, token_ids: &[u32]) {
+        let hash = Self::hash_tokens(token_ids);
+        if let Some(entry) = self.entries.get_mut(&hash) {
+            entry.ref_count = entry.ref_count.saturating_sub(1);
+        }
+    }
+
+    fn evict_lru(&mut self) {
+        let evict_key = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.ref_count == 0)
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(&k, _)| k);
+
+        if let Some(key) = evict_key {
+            self.entries.remove(&key);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn hit_count(&self) -> u64 {
+        self.hits
+    }
+
+    pub fn tokens_saved(&self) -> u64 {
+        self.tokens_saved
+    }
+}
+
+pub struct PrefixMatch {
+    pub matched_len: usize,
+    pub k_data: Vec<Vec<f32>>,
+    pub v_data: Vec<Vec<f32>>,
+}
+
+impl PrefixMatch {
+    pub fn populate_cache(&self, cache: &mut KvCache) {
+        for (layer, (k, v)) in self.k_data.iter().zip(self.v_data.iter()).enumerate() {
+            cache.append_kv(layer, k, v, self.matched_len);
+        }
+        cache.advance(self.matched_len);
+    }
+}
+
+pub type SharedPrefixCache = Arc<Mutex<PrefixCacheTable>>;
+
+pub fn new_shared_prefix_cache(max_entries: usize) -> SharedPrefixCache {
+    Arc::new(Mutex::new(PrefixCacheTable::new(max_entries)))
 }
 
 #[cfg(kani)]
@@ -551,5 +699,109 @@ mod tests {
         let result = cache.k_data(0, 1);
         assert!(matches!(result, Cow::Borrowed(_)));
         assert_eq!(result.len(), stride);
+    }
+
+    #[test]
+    fn test_prefix_cache_store_and_probe() {
+        let config = ModelConfig::tiny_test();
+        let mut cache = KvCache::new(&config);
+        let stride = config.num_kv_heads * config.head_dim;
+
+        let k_data: Vec<f32> = (0..stride * 3).map(|i| i as f32 * 0.1).collect();
+        let v_data: Vec<f32> = (0..stride * 3).map(|i| i as f32 * 0.2).collect();
+        cache.append_kv(0, &k_data, &v_data, 3);
+        cache.advance(3);
+
+        let mut table = PrefixCacheTable::new(10);
+        table.store(&[1, 2, 3], &cache);
+        assert_eq!(table.len(), 1);
+
+        let matched = table.probe(&[1, 2, 3]).unwrap();
+        assert_eq!(matched.matched_len, 3);
+        assert_eq!(table.hit_count(), 1);
+        assert_eq!(table.tokens_saved(), 3);
+    }
+
+    #[test]
+    fn test_prefix_cache_identical_prefix_reuse() {
+        let config = ModelConfig::tiny_test();
+        let mut cache = KvCache::new(&config);
+        let stride = config.num_kv_heads * config.head_dim;
+
+        let k_data: Vec<f32> = (0..stride * 2).map(|i| i as f32 * 0.1).collect();
+        let v_data: Vec<f32> = (0..stride * 2).map(|i| i as f32 * 0.2).collect();
+        cache.append_kv(0, &k_data, &v_data, 2);
+        cache.advance(2);
+
+        let mut table = PrefixCacheTable::new(10);
+        table.store(&[10, 20], &cache);
+
+        // Two requests with the same prefix get identical KV data
+        let match1 = table.probe(&[10, 20]).unwrap();
+        let match2 = table.probe(&[10, 20]).unwrap();
+        assert_eq!(match1.k_data, match2.k_data);
+        assert_eq!(match1.v_data, match2.v_data);
+    }
+
+    #[test]
+    fn test_prefix_cache_novel_prefix_miss() {
+        let config = ModelConfig::tiny_test();
+        let mut cache = KvCache::new(&config);
+        let stride = config.num_kv_heads * config.head_dim;
+
+        let k_data: Vec<f32> = (0..stride).map(|i| i as f32).collect();
+        let v_data = k_data.clone();
+        cache.append_kv(0, &k_data, &v_data, 1);
+        cache.advance(1);
+
+        let mut table = PrefixCacheTable::new(10);
+        table.store(&[1], &cache);
+
+        assert!(table.probe(&[99]).is_none());
+    }
+
+    #[test]
+    fn test_prefix_cache_lru_eviction() {
+        let config = ModelConfig::tiny_test();
+        let mut table = PrefixCacheTable::new(2);
+
+        for i in 0..3 {
+            let mut cache = KvCache::new(&config);
+            let stride = config.num_kv_heads * config.head_dim;
+            let k_data: Vec<f32> = (0..stride).map(|j| (i * 100 + j) as f32).collect();
+            let v_data = k_data.clone();
+            cache.append_kv(0, &k_data, &v_data, 1);
+            cache.advance(1);
+            table.store(&[i as u32], &cache);
+        }
+
+        // Max 2 entries, so the least recently used should be evicted
+        assert_eq!(table.len(), 2);
+        // Entry [0] was stored first and never accessed, so it should be evicted
+        assert!(table.probe(&[0]).is_none());
+    }
+
+    #[test]
+    fn test_prefix_match_populates_cache() {
+        let config = ModelConfig::tiny_test();
+        let stride = config.num_kv_heads * config.head_dim;
+
+        let mut source = KvCache::new(&config);
+        let k: Vec<f32> = (0..stride * 2).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let v: Vec<f32> = (0..stride * 2).map(|i| (i as f32 + 1.0) * 0.3).collect();
+        source.append_kv(0, &k, &v, 2);
+        source.advance(2);
+
+        let mut table = PrefixCacheTable::new(10);
+        table.store(&[5, 6], &source);
+
+        let prefix_match = table.probe(&[5, 6]).unwrap();
+
+        let mut target = KvCache::new(&config);
+        prefix_match.populate_cache(&mut target);
+
+        assert_eq!(target.seq_len, 2);
+        assert_eq!(target.k_slice(0), source.k_slice(0));
+        assert_eq!(target.v_slice(0), source.v_slice(0));
     }
 }

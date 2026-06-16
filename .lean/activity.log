@@ -631,3 +631,10 @@
   summary: "Added tool/function calling: ToolCallParser with JSON extraction, tools/tool_choice on request, tool_calls/tool_call_id on ChatMessage, ChunkDelta tool_calls for SSE, finish_reason=tool_calls, 7 new tests"
   iteration: 1
   max_iterations: 10
+- timestamp: "2026-06-16T19:45:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p7-prefix-caching"
+  summary: "Added PrefixCacheTable with hash-based KV lookup, LRU eviction, reference counting, PrefixMatch::populate_cache for KV reuse, prefix_matched_len on ActiveSequence, SharedPrefixCache type, 5 new tests"
+  iteration: 2
+  max_iterations: 10
