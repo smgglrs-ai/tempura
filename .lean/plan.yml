@@ -429,7 +429,8 @@ items:
     description: >
       Introduces warp-level shuffle reductions for sum-of-squares.
       One thread block per token row, fused RMS compute and scale.
-    status: planned
+    status: done
+    progress: 100
     priority: high
     effort: M
     depends_on: [p3-cuda-infra]

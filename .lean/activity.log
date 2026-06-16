@@ -296,3 +296,11 @@
     exit_reason: "First GPU kernel milestone — CPU vs GPU verified within 2.4e-7"
     branch: "loop/2026-06-16"
     tag: "loop-run/2026-06-16-3"
+
+- timestamp: "2026-06-16T12:15:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p3-cuda-rmsnorm"
+  summary: "CudaRMSNorm GPU kernel: two-pass (sum-of-squares reduction + elementwise normalize). CPU vs GPU max diff 4.8e-7 on RTX 5090."
+  iteration: 4
+  max_iterations: 10

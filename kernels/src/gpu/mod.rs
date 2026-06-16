@@ -1,3 +1,4 @@
+pub mod rmsnorm_kernel;
 pub mod rope_kernel;
 
 use std::sync::Arc;

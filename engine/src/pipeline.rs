@@ -55,7 +55,7 @@ impl
 
         Self {
             attention: CudaAttention,
-            rmsnorm: CudaRMSNorm,
+            rmsnorm: CudaRMSNorm::new().expect("Failed to initialize CudaRMSNorm"),
             rope: CudaRoPE::new().expect("Failed to initialize CudaRoPE"),
             matmul: CudaMatMul,
             sampler: CudaSampler,

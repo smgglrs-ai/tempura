@@ -41,18 +41,73 @@ impl RMSNorm for CpuRMSNorm {
 }
 
 #[cfg(feature = "cuda")]
-pub struct CudaRMSNorm;
+pub struct CudaRMSNorm {
+    gpu: crate::gpu::GpuContext,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for CudaRMSNorm {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for CudaRMSNorm {}
+
+#[cfg(feature = "cuda")]
+impl CudaRMSNorm {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            gpu: crate::gpu::GpuContext::new(0)?,
+        })
+    }
+}
 
 #[cfg(feature = "cuda")]
 impl RMSNorm for CudaRMSNorm {
-    fn forward(
-        &self,
-        _x: &mut [f32],
-        _weight: &[f32],
-        _hidden_size: usize,
-        _eps: f32,
-    ) -> Result<()> {
-        todo!("CudaRMSNorm: requires cargo oxide build")
+    fn forward(&self, x: &mut [f32], weight: &[f32], hidden_size: usize, eps: f32) -> Result<()> {
+        use cuda_core::LaunchConfig;
+
+        if weight.len() != hidden_size {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: hidden_size,
+                got: weight.len(),
+            });
+        }
+
+        let stream = self.gpu.stream();
+        let num_tokens = x.len() / hidden_size;
+        let total = num_tokens * hidden_size;
+
+        let x_dev = crate::gpu::to_device(&stream, x)?;
+        let w_dev = crate::gpu::to_device(&stream, weight)?;
+        let mut ss_dev = crate::gpu::to_device(&stream, &vec![0.0f32; num_tokens])?;
+        let mut out_dev = crate::gpu::to_device(&stream, &vec![0.0f32; total])?;
+
+        let module = crate::gpu::rmsnorm_kernel::kernels::load(self.gpu.context())
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+        module
+            .rmsnorm_sum_sq(
+                &stream,
+                LaunchConfig::for_num_elems(num_tokens as u32),
+                &x_dev,
+                &mut ss_dev,
+                hidden_size as u32,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+        module
+            .rmsnorm_apply(
+                &stream,
+                LaunchConfig::for_num_elems(total as u32),
+                &x_dev,
+                &w_dev,
+                &ss_dev,
+                &mut out_dev,
+                hidden_size as u32,
+                eps,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+        crate::gpu::copy_back(&stream, &out_dev, x)?;
+        Ok(())
     }
 }
 
