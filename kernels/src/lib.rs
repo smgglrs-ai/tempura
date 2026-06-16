@@ -2,6 +2,7 @@ pub mod allreduce;
 pub mod attention;
 #[cfg(feature = "cuda")]
 pub mod gpu;
+pub mod guided;
 pub mod layernorm;
 pub mod matmul;
 pub mod rmsnorm;
@@ -12,6 +13,7 @@ pub mod verification_manifest;
 
 pub use allreduce::AllReduce;
 pub use attention::Attention;
+pub use guided::GuidedDecoder;
 pub use layernorm::LayerNorm;
 pub use matmul::MatMul;
 pub use rmsnorm::RMSNorm;

@@ -339,7 +339,7 @@ where
         let first_token = self.pipeline.sampler.sample_token(&probs, rng_ref);
 
         let mut generated = vec![first_token];
-        self.record_sampling_snapshot(session, 0, &logits, &probs, first_token, params);
+        self.record_sampling_snapshot(session, 0, &logits, &probs, first_token, params, None);
 
         for step in 1..max_new_tokens {
             if eos_token == Some(*generated.last().unwrap()) {
@@ -361,7 +361,7 @@ where
             };
             let token = self.pipeline.sampler.sample_token(&probs, rng_ref);
 
-            self.record_sampling_snapshot(session, step, &logits, &probs, token, params);
+            self.record_sampling_snapshot(session, step, &logits, &probs, token, params, None);
             generated.push(token);
         }
 
@@ -542,6 +542,99 @@ where
         generated
     }
 
+    pub fn generate_guided(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        decoder: &mut dyn oxide_kernels::GuidedDecoder,
+    ) -> Vec<u32> {
+        let total_start = Instant::now();
+        let prompt_start = Instant::now();
+        let mut logits = self.forward(session, token_ids);
+        let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.prompt_tokens = token_ids.len();
+        let gen_start = Instant::now();
+
+        decoder.mask_logits(&[], &mut logits);
+        let masked = decoder.tokens_masked_last_step();
+        let mut probs = vec![0.0f32; logits.len()];
+        self.pipeline
+            .sampler
+            .apply(&logits, &mut probs, params)
+            .unwrap();
+
+        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+            None
+        } else {
+            Some(&mut session.rng)
+        };
+        let first_token = self.pipeline.sampler.sample_token(&probs, rng_ref);
+
+        let mut generated = vec![first_token];
+        self.record_sampling_snapshot(
+            session,
+            0,
+            &logits,
+            &probs,
+            first_token,
+            params,
+            Some(masked),
+        );
+
+        for step in 1..max_new_tokens {
+            if eos_token == Some(*generated.last().unwrap()) || decoder.is_complete() {
+                break;
+            }
+
+            let mut logits = self.forward(session, &[*generated.last().unwrap()]);
+            params.apply_penalties(&mut logits, &generated);
+            decoder.mask_logits(&generated, &mut logits);
+            let masked = decoder.tokens_masked_last_step();
+            let mut probs = vec![0.0f32; logits.len()];
+            self.pipeline
+                .sampler
+                .apply(&logits, &mut probs, params)
+                .unwrap();
+
+            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                None
+            } else {
+                Some(&mut session.rng)
+            };
+            let token = self.pipeline.sampler.sample_token(&probs, rng_ref);
+
+            self.record_sampling_snapshot(
+                session,
+                step,
+                &logits,
+                &probs,
+                token,
+                params,
+                Some(masked),
+            );
+            generated.push(token);
+        }
+
+        let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.generated_tokens = generated.len();
+        session.trace.timing = Some(TimingInfo {
+            total_ms,
+            prompt_ms,
+            generation_ms,
+            tokens_per_second: if generation_ms > 0.0 {
+                generated.len() as f64 / (generation_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+        generated
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn record_sampling_snapshot(
         &self,
         session: &mut InferenceSession,
@@ -550,6 +643,7 @@ where
         probs: &[f32],
         selected: u32,
         params: &SamplingParams,
+        tokens_masked: Option<usize>,
     ) {
         if session.trace_level < TraceLevel::Summary {
             return;
@@ -580,6 +674,7 @@ where
             top_k: params.top_k,
             top_p: params.top_p,
             rng_seed: session.seed,
+            tokens_masked,
         });
     }
 }

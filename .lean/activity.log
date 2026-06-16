@@ -571,3 +571,10 @@
   summary: "Wired BatchScheduler into API handlers: acquire/release slot helpers, 429 backpressure, scheduler gauges, streaming slot lifecycle, withdraw_pending for rejected requests, integration test"
   iteration: 2
   max_iterations: 10
+- timestamp: "2026-06-16T17:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p6-guided-decoding"
+  summary: "Added structured output / JSON mode: GuidedDecoder trait, JSON state machine with character-level grammar validation, generate_guided method, response_format API field, trace tokens_masked, 8 new tests"
+  iteration: 3
+  max_iterations: 10

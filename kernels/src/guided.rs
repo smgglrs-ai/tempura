@@ -1,0 +1,403 @@
+pub trait GuidedDecoder: Send {
+    fn mask_logits(&mut self, token_ids_so_far: &[u32], logits: &mut [f32]);
+    fn is_complete(&self) -> bool;
+    fn tokens_masked_last_step(&self) -> usize;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonState {
+    ExpectValue,
+    InString,
+    InStringEscape,
+    InNumber,
+    InLiteral,
+    AfterValue,
+    ExpectKey,
+    ExpectColon,
+}
+
+pub struct JsonGuidedDecoder {
+    vocab: Vec<String>,
+    stack: Vec<u8>,
+    state: JsonState,
+    literal_remaining: Vec<u8>,
+    generated_text: String,
+    complete: bool,
+    last_masked: usize,
+}
+
+impl JsonGuidedDecoder {
+    pub fn new(vocab: Vec<String>) -> Self {
+        Self {
+            vocab,
+            stack: Vec::new(),
+            state: JsonState::ExpectValue,
+            literal_remaining: Vec::new(),
+            generated_text: String::new(),
+            complete: false,
+            last_masked: 0,
+        }
+    }
+
+    pub fn from_schema(vocab: Vec<String>, _schema: &serde_json::Value) -> Self {
+        Self::new(vocab)
+    }
+
+    fn is_valid_continuation(&self, text: &str) -> bool {
+        let mut stack = self.stack.clone();
+        let mut state = self.state;
+        let mut literal_remaining = self.literal_remaining.clone();
+
+        for ch in text.chars() {
+            match Self::advance_state(state, ch, &mut stack, &mut literal_remaining) {
+                Some(new_state) => state = new_state,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    fn advance_state(
+        state: JsonState,
+        ch: char,
+        stack: &mut Vec<u8>,
+        literal_remaining: &mut Vec<u8>,
+    ) -> Option<JsonState> {
+        match state {
+            JsonState::ExpectValue => match ch {
+                '"' => Some(JsonState::InString),
+                '{' => {
+                    stack.push(b'}');
+                    Some(JsonState::ExpectKey)
+                }
+                '[' => {
+                    stack.push(b']');
+                    Some(JsonState::ExpectValue)
+                }
+                '0'..='9' | '-' => Some(JsonState::InNumber),
+                't' => {
+                    *literal_remaining = b"rue".to_vec();
+                    Some(JsonState::InLiteral)
+                }
+                'f' => {
+                    *literal_remaining = b"alse".to_vec();
+                    Some(JsonState::InLiteral)
+                }
+                'n' => {
+                    *literal_remaining = b"ull".to_vec();
+                    Some(JsonState::InLiteral)
+                }
+                ' ' | '\n' | '\r' | '\t' => Some(JsonState::ExpectValue),
+                ']' if stack.last() == Some(&b']') => {
+                    stack.pop();
+                    Some(JsonState::AfterValue)
+                }
+                _ => None,
+            },
+            JsonState::InString => match ch {
+                '"' => Some(JsonState::AfterValue),
+                '\\' => Some(JsonState::InStringEscape),
+                '\x00'..='\x1f' => None,
+                _ => Some(JsonState::InString),
+            },
+            JsonState::InStringEscape => match ch {
+                '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u' => Some(JsonState::InString),
+                _ => None,
+            },
+            JsonState::InNumber => match ch {
+                '0'..='9' | '.' | 'e' | 'E' | '+' | '-' => Some(JsonState::InNumber),
+                ',' => {
+                    if stack.last() == Some(&b']') {
+                        Some(JsonState::ExpectValue)
+                    } else if stack.last() == Some(&b'}') {
+                        Some(JsonState::ExpectKey)
+                    } else {
+                        None
+                    }
+                }
+                '}' if stack.last() == Some(&b'}') => {
+                    stack.pop();
+                    Some(JsonState::AfterValue)
+                }
+                ']' if stack.last() == Some(&b']') => {
+                    stack.pop();
+                    Some(JsonState::AfterValue)
+                }
+                ' ' | '\n' | '\r' | '\t' => Some(JsonState::AfterValue),
+                _ => None,
+            },
+            JsonState::InLiteral => {
+                if literal_remaining.is_empty() {
+                    return Self::advance_state(
+                        JsonState::AfterValue,
+                        ch,
+                        stack,
+                        literal_remaining,
+                    );
+                }
+                if ch as u8 == literal_remaining[0] {
+                    literal_remaining.remove(0);
+                    if literal_remaining.is_empty() {
+                        Some(JsonState::AfterValue)
+                    } else {
+                        Some(JsonState::InLiteral)
+                    }
+                } else {
+                    None
+                }
+            }
+            JsonState::AfterValue => match ch {
+                ',' => {
+                    if stack.last() == Some(&b']') {
+                        Some(JsonState::ExpectValue)
+                    } else if stack.last() == Some(&b'}') {
+                        Some(JsonState::ExpectKey)
+                    } else {
+                        None
+                    }
+                }
+                '}' if stack.last() == Some(&b'}') => {
+                    stack.pop();
+                    Some(JsonState::AfterValue)
+                }
+                ']' if stack.last() == Some(&b']') => {
+                    stack.pop();
+                    Some(JsonState::AfterValue)
+                }
+                ' ' | '\n' | '\r' | '\t' => Some(JsonState::AfterValue),
+                _ => None,
+            },
+            JsonState::ExpectKey => match ch {
+                '"' => Some(JsonState::InString),
+                ' ' | '\n' | '\r' | '\t' => Some(JsonState::ExpectKey),
+                '}' if stack.last() == Some(&b'}') => {
+                    stack.pop();
+                    Some(JsonState::AfterValue)
+                }
+                _ => None,
+            },
+            JsonState::ExpectColon => match ch {
+                ':' => Some(JsonState::ExpectValue),
+                ' ' | '\n' | '\r' | '\t' => Some(JsonState::ExpectColon),
+                _ => None,
+            },
+        }
+    }
+
+    fn update_internal_state(&mut self, text: &str) {
+        for ch in text.chars() {
+            if let Some(new_state) =
+                Self::advance_state(self.state, ch, &mut self.stack, &mut self.literal_remaining)
+            {
+                if self.state == JsonState::InString
+                    && new_state == JsonState::AfterValue
+                    && self.stack.last() == Some(&b'}')
+                    && self.needs_colon_after(ch)
+                {
+                    self.state = JsonState::ExpectColon;
+                } else {
+                    self.state = new_state;
+                }
+            }
+            self.generated_text.push(ch);
+        }
+        self.complete = self.stack.is_empty()
+            && (self.state == JsonState::AfterValue
+                || (self.state == JsonState::InNumber && !self.generated_text.is_empty()));
+    }
+
+    fn needs_colon_after(&self, _closing_quote: char) -> bool {
+        // Count quotes in current object context to determine if this is a key or value
+        let mut quote_count = 0u32;
+        let mut depth = 0i32;
+        for ch in self.generated_text.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    if depth == self.stack.len() as i32 + 1 {
+                        quote_count = 0;
+                    }
+                }
+                '}' => depth -= 1,
+                '"' if depth == self.stack.len() as i32 => {
+                    quote_count += 1;
+                }
+                ',' if depth == self.stack.len() as i32 => {
+                    quote_count = 0;
+                }
+                _ => {}
+            }
+        }
+        // After opening { or after comma, the next string is a key (quote_count is even before closing quote)
+        quote_count.is_multiple_of(2)
+    }
+}
+
+impl GuidedDecoder for JsonGuidedDecoder {
+    fn mask_logits(&mut self, token_ids_so_far: &[u32], logits: &mut [f32]) {
+        if self.complete {
+            return;
+        }
+
+        // Reconstruct current state from previously generated tokens
+        if token_ids_so_far.len() == 1 || self.generated_text.is_empty() {
+            self.stack.clear();
+            self.state = JsonState::ExpectValue;
+            self.literal_remaining.clear();
+            self.generated_text.clear();
+            self.complete = false;
+
+            let prev_tokens: Vec<String> = token_ids_so_far
+                [..token_ids_so_far.len().saturating_sub(1)]
+                .iter()
+                .filter_map(|&tok| self.vocab.get(tok as usize).cloned())
+                .collect();
+            for text in &prev_tokens {
+                self.update_internal_state(text);
+            }
+        }
+
+        let mut masked = 0;
+        for (i, logit) in logits.iter_mut().enumerate() {
+            if *logit == f32::NEG_INFINITY {
+                continue;
+            }
+            if let Some(text) = self.vocab.get(i) {
+                if text.is_empty() || !self.is_valid_continuation(text) {
+                    *logit = f32::NEG_INFINITY;
+                    masked += 1;
+                }
+            } else {
+                *logit = f32::NEG_INFINITY;
+                masked += 1;
+            }
+        }
+        self.last_masked = masked;
+
+        // Update state with the last token that will be selected
+        // (this is called before sampling, so we defer state update)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    fn tokens_masked_last_step(&self) -> usize {
+        self.last_masked
+    }
+}
+
+pub fn create_json_decoder(vocab: Vec<String>) -> Box<dyn GuidedDecoder> {
+    Box::new(JsonGuidedDecoder::new(vocab))
+}
+
+pub fn create_json_schema_decoder(
+    vocab: Vec<String>,
+    schema: &serde_json::Value,
+) -> Box<dyn GuidedDecoder> {
+    Box::new(JsonGuidedDecoder::from_schema(vocab, schema))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn simple_vocab() -> Vec<String> {
+        vec![
+            "{".into(),    // 0
+            "}".into(),    // 1
+            "\"".into(),   // 2
+            ":".into(),    // 3
+            ",".into(),    // 4
+            " ".into(),    // 5
+            "a".into(),    // 6
+            "b".into(),    // 7
+            "1".into(),    // 8
+            "2".into(),    // 9
+            "[".into(),    // 10
+            "]".into(),    // 11
+            "true".into(), // 12
+            "null".into(), // 13
+            "\n".into(),   // 14
+        ]
+    }
+
+    #[test]
+    fn test_json_state_machine_object() {
+        let vocab = simple_vocab();
+        let mut decoder = JsonGuidedDecoder::new(vocab);
+
+        // At start, we expect a value: {, [, ", digit, t, f, n, whitespace
+        let mut logits = vec![0.0f32; 15];
+        decoder.mask_logits(&[], &mut logits);
+
+        assert!(logits[0] != f32::NEG_INFINITY, "{{ should be allowed");
+        assert!(logits[10] != f32::NEG_INFINITY, "[ should be allowed");
+        assert!(logits[2] != f32::NEG_INFINITY, "\" should be allowed");
+        assert!(logits[12] != f32::NEG_INFINITY, "true should be allowed");
+        assert!(logits[3] == f32::NEG_INFINITY, ": should be masked");
+    }
+
+    #[test]
+    fn test_valid_continuation_simple() {
+        let vocab = simple_vocab();
+        let decoder = JsonGuidedDecoder::new(vocab);
+
+        assert!(decoder.is_valid_continuation("{"));
+        assert!(decoder.is_valid_continuation("\""));
+        assert!(decoder.is_valid_continuation("["));
+        assert!(!decoder.is_valid_continuation("}"));
+        assert!(!decoder.is_valid_continuation(":"));
+    }
+
+    #[test]
+    fn test_is_complete_after_object() {
+        let vocab = simple_vocab();
+        let mut decoder = JsonGuidedDecoder::new(vocab);
+        decoder.update_internal_state("{}");
+        assert!(decoder.is_complete());
+    }
+
+    #[test]
+    fn test_is_complete_not_mid_object() {
+        let vocab = simple_vocab();
+        let mut decoder = JsonGuidedDecoder::new(vocab);
+        decoder.update_internal_state("{\"a\"");
+        assert!(!decoder.is_complete());
+    }
+
+    #[test]
+    fn test_logit_masking_count() {
+        let vocab = simple_vocab();
+        let mut decoder = JsonGuidedDecoder::new(vocab);
+        let mut logits = vec![1.0f32; 15];
+        decoder.mask_logits(&[], &mut logits);
+        assert!(decoder.tokens_masked_last_step() > 0);
+        let allowed = logits.iter().filter(|&&l| l != f32::NEG_INFINITY).count();
+        assert!(allowed > 0, "at least some tokens must be allowed");
+    }
+
+    #[test]
+    fn test_string_is_valid_json() {
+        let vocab = simple_vocab();
+        let mut decoder = JsonGuidedDecoder::new(vocab);
+        decoder.update_internal_state("\"ab\"");
+        assert!(decoder.is_complete());
+    }
+
+    #[test]
+    fn test_number_is_valid_json() {
+        let vocab = simple_vocab();
+        let mut decoder = JsonGuidedDecoder::new(vocab);
+        decoder.update_internal_state("12");
+        assert!(decoder.is_complete());
+    }
+
+    #[test]
+    fn test_array_is_valid_json() {
+        let vocab = simple_vocab();
+        let mut decoder = JsonGuidedDecoder::new(vocab);
+        decoder.update_internal_state("[1,2]");
+        assert!(decoder.is_complete());
+    }
+}

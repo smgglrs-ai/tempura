@@ -36,6 +36,8 @@ pub struct SamplingSnapshot {
     pub top_k: usize,
     pub top_p: f32,
     pub rng_seed: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_masked: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +134,7 @@ mod tests {
             top_k: 50,
             top_p: 0.9,
             rng_seed: 42,
+            tokens_masked: None,
         });
 
         let json = serde_json::to_string(&trace).expect("serialize");

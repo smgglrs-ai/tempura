@@ -17,6 +17,7 @@ cuda = ["dep:cuda-device", "dep:cuda-host", "dep:cuda-core"]
 thiserror = "2"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 gemm = "0.18"
 cuda-device = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-device", optional = true }
 cuda-host = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-host", optional = true }

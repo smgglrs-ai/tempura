@@ -74,6 +74,23 @@ pub struct ChatCompletionRequest {
     pub stop: Option<StringOrArray>,
     #[serde(default = "default_n")]
     pub n: u32,
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResponseFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
+    #[serde(default)]
+    pub json_schema: Option<JsonSchemaSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JsonSchemaSpec {
+    pub name: String,
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
 }
 
 fn default_n() -> u32 {
@@ -143,6 +160,8 @@ pub struct CompletionRequest {
     pub stop: Option<StringOrArray>,
     #[serde(default = "default_n")]
     pub n: u32,
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
 }
 
 #[derive(Debug, Serialize)]
@@ -385,6 +404,8 @@ async fn chat_completions(
                 let seed = 42u64.wrapping_add(i as u64);
                 let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, seed);
 
+                let mut guided_decoder = build_guided_decoder(&req.response_format, tokenizer);
+
                 let (generated, token_logprobs) = if want_logprobs {
                     state.model.generate_with_logprobs(
                         &mut session,
@@ -394,6 +415,16 @@ async fn chat_completions(
                         None,
                         top_n.max(1),
                     )
+                } else if let Some(ref mut decoder) = guided_decoder {
+                    let tokens = state.model.generate_guided(
+                        &mut session,
+                        &token_ids,
+                        req.max_tokens as usize,
+                        &params,
+                        None,
+                        decoder.as_mut(),
+                    );
+                    (tokens, Vec::new())
                 } else {
                     let tokens = state.model.generate(
                         &mut session,
@@ -733,6 +764,32 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+fn build_guided_decoder(
+    response_format: &Option<ResponseFormat>,
+    tokenizer: &oxide_engine::tokenizer::Tokenizer,
+) -> Option<Box<dyn oxide_kernels::GuidedDecoder>> {
+    let rf = response_format.as_ref()?;
+    match rf.format_type.as_str() {
+        "json_object" => {
+            let vocab = tokenizer.vocab_strings();
+            Some(oxide_kernels::guided::create_json_decoder(vocab))
+        }
+        "json_schema" => {
+            let vocab = tokenizer.vocab_strings();
+            let schema = rf
+                .json_schema
+                .as_ref()
+                .and_then(|s| s.schema.as_ref())
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            Some(oxide_kernels::guided::create_json_schema_decoder(
+                vocab, &schema,
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn check_stop_sequences<'a>(text: &'a str, stop_sequences: &[String]) -> (&'a str, &'static str) {

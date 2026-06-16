@@ -880,7 +880,8 @@ items:
     quick: cargo test -p oxide-kernels -- sampling && cargo test -p oxide-engine && cargo build -p oxide-server
 - id: p6-guided-decoding
   title: Structured output / JSON mode (guided decoding)
-  status: planned
+  status: done
+  progress: 100
   priority: high
   effort: L
   description: 'Add constrained decoding so the server can guarantee structurally valid output (JSON mode

@@ -176,6 +176,13 @@ impl Tokenizer {
         self.inner.get_vocab_size(true)
     }
 
+    pub fn vocab_strings(&self) -> Vec<String> {
+        let size = self.vocab_size();
+        (0..size as u32)
+            .map(|id| self.decode(&[id]).unwrap_or_default())
+            .collect()
+    }
+
     pub fn chat_template(&self) -> &ChatTemplate {
         &self.chat_template
     }
