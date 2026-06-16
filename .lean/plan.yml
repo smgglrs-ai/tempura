@@ -357,14 +357,34 @@ items:
   - id: p3-cuda-toolchain
     title: cuda-oxide toolchain setup
     description: >
-      Set up cuda-oxide custom rustc and cargo oxide build.
-      The production target — CPU is the verification baseline.
+      Set up the cuda-oxide toolchain so cargo oxide build can compile GPU
+      kernels within the oxide-serve workspace. Pin the required Rust nightly
+      in rust-toolchain.toml, add cuda-oxide crate dependencies behind the
+      existing cuda feature flag, and add stub Cuda* structs proving the
+      feature-gated module structure compiles. No GPU kernel implementations
+      — only toolchain and dependency wiring.
     status: planned
     priority: high
     effort: M
     scope:
-      - Cargo.toml
       - rust-toolchain.toml
+      - kernels/Cargo.toml
+      - kernels/src/attention.rs
+      - kernels/src/matmul.rs
+      - kernels/src/rmsnorm.rs
+      - kernels/src/rope.rs
+      - kernels/src/sampling.rs
+      - engine/Cargo.toml
+      - engine/src/pipeline.rs
+    acceptance:
+      - "rust-toolchain.toml pins nightly with rust-src, rustc-dev, llvm-tools components"
+      - "kernels/Cargo.toml has cuda-oxide deps gated behind cuda feature — default cpu build adds zero new deps"
+      - "cargo build (default features) still succeeds with no CUDA toolkit installed"
+      - "cargo build --features cuda resolves cuda-oxide crates on a properly configured machine"
+      - "Stub Cuda* structs exist behind #[cfg(feature = cuda)] with todo!() bodies in each kernel file"
+      - "engine/src/pipeline.rs has KernelPipeline::cuda() constructor behind feature gate"
+    verification:
+      quick: "cargo build && cargo test"
 
   - id: p3-cuda-kernels
     title: GPU kernel implementations via cuda-oxide
