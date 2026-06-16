@@ -18,14 +18,38 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(name = "oxide-serve", about = "Rust-native LLM inference server")]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Start the inference server (default)
+    Serve(ServeArgs),
+    /// Download a model from HuggingFace
+    Pull {
+        /// HuggingFace repo ID (e.g. TinyLlama/TinyLlama-1.1B-Chat-v1.0)
+        repo_id: String,
+    },
+    /// List downloaded models
+    List,
+    /// Inspect a model (show config, format, architecture)
+    Inspect {
+        /// Path to model file or directory
+        path: String,
+    },
+}
+
+#[derive(clap::Args, Debug)]
+struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
 
     #[arg(long, default_value_t = 8080)]
     port: u16,
 
-    #[arg(long, help = "Path to model weights (safetensors)")]
+    #[arg(long, help = "Path to model weights (safetensors or GGUF)")]
     model: Option<String>,
 
     #[arg(long, help = "Path to tokenizer.json")]
@@ -89,8 +113,83 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
+    match cli.command {
+        Some(Command::Pull { repo_id }) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::from_default_env())
+                .init();
+            let store = oxide_server_model::store::ModelStore::open();
+            match oxide_server_model::hub::pull(&store, &repo_id) {
+                Ok(entry) => {
+                    println!("Downloaded {} to {}", entry.repo_id, entry.path.display());
+                    println!(
+                        "  Format: {}, Size: {:.1} MB",
+                        entry.format,
+                        entry.size_bytes as f64 / 1_048_576.0
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some(Command::List) => {
+            let store = oxide_server_model::store::ModelStore::open();
+            let models = store.list();
+            if models.is_empty() {
+                println!("No models installed. Use `oxide-serve pull <repo-id>` to download one.");
+            } else {
+                println!("{:<40} {:<15} {:>10}", "NAME", "FORMAT", "SIZE");
+                println!("{}", "-".repeat(67));
+                for m in &models {
+                    let size_mb = m.size_bytes as f64 / 1_048_576.0;
+                    let size_str = if size_mb > 1024.0 {
+                        format!("{:.1} GB", size_mb / 1024.0)
+                    } else {
+                        format!("{:.0} MB", size_mb)
+                    };
+                    println!("{:<40} {:<15} {:>10}", m.name, m.format, size_str);
+                }
+            }
+            return;
+        }
+        Some(Command::Inspect { path }) => {
+            match oxide_server_model::inspect::inspect(Path::new(&path)) {
+                Ok(info) => print!("{info}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some(Command::Serve(args)) => {
+            run_server(args).await;
+        }
+        None => {
+            run_server(ServeArgs {
+                host: "0.0.0.0".into(),
+                port: 8080,
+                model: None,
+                tokenizer: None,
+                model_config: "llama2-7b".into(),
+                max_batch_size: 32,
+                max_seq_len: 4096,
+                max_traces: 100,
+                shutdown_timeout: 30,
+                request_timeout_secs: 300,
+                otlp_endpoint: None,
+            })
+            .await;
+        }
+    }
+}
+
+async fn run_server(args: ServeArgs) {
     init_tracing(&args.otlp_endpoint);
 
     let model_path = args.model.as_deref().map(Path::new);

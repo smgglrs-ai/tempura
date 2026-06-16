@@ -11,6 +11,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 [dependencies]
 oxide-engine = { path = "../engine" }
 oxide-kernels = { path = "../kernels" }
+oxide-server-model = { path = "../model" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
