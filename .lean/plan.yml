@@ -383,18 +383,98 @@ items:
     verification:
       quick: "cargo build && cargo test"
 
-  - id: p3-cuda-kernels
-    title: GPU kernel implementations via cuda-oxide
+  - id: p3-cuda-infra
+    title: GPU memory and kernel launch infrastructure
     description: >
-      CudaAttention, CudaRMSNorm, CudaRoPE, CudaMatMul behind cuda feature.
-      Same Kani harnesses verify against the same trait contract as CPU.
-      Deterministic GPU reduction order by design.
+      Create kernels/src/gpu/ module with CudaContext management and
+      host-to-device transfer helpers that map to KernelError. Each Cuda*
+      struct will own a context handle and copy data in/out per call.
     status: planned
     priority: high
-    effort: XL
-    depends_on: [p3-cuda-toolchain, 2a-kani-kernels]
+    effort: M
+    depends_on: [p3-cuda-toolchain]
     scope:
-      - kernels/src/
+      - kernels/src/gpu/
+      - kernels/src/lib.rs
+    acceptance:
+      - "kernels/src/gpu/mod.rs with CudaContext and DeviceBuffer helpers behind cuda feature"
+      - "cargo oxide build succeeds on the kernels crate"
+      - "Helper functions map cuda-oxide errors to KernelError"
+    verification:
+      quick: "cargo oxide build --package oxide-kernels"
+
+  - id: p3-cuda-rope
+    title: CudaRoPE — first GPU kernel (elementwise)
+    description: >
+      Elementwise kernel — no shared memory, no reductions. Validates
+      the full pipeline: kernel authoring, build, launch, verify against
+      CPU reference via DualPipeline.
+    status: planned
+    priority: high
+    effort: S
+    depends_on: [p3-cuda-infra]
+    scope:
+      - kernels/src/rope.rs
+      - kernels/src/gpu/
+    acceptance:
+      - "CudaRoPE replaces todo!() with working GPU kernel"
+      - "DualPipeline CPU vs GPU within 1e-4 for various configs"
+      - "Position-zero identity property preserved on GPU"
+      - "cargo oxide build && cargo test --features cuda passes"
+
+  - id: p3-cuda-rmsnorm
+    title: CudaRMSNorm — warp-level reductions
+    description: >
+      Introduces warp-level shuffle reductions for sum-of-squares.
+      One thread block per token row, fused RMS compute and scale.
+    status: planned
+    priority: high
+    effort: M
+    depends_on: [p3-cuda-infra]
+    scope:
+      - kernels/src/rmsnorm.rs
+      - kernels/src/gpu/
+    acceptance:
+      - "DualPipeline CPU vs GPU within 1e-4"
+      - "In-place semantics preserved"
+      - "cargo oxide build && cargo test --features cuda passes"
+
+  - id: p3-cuda-matmul
+    title: CudaMatMul — tiled shared-memory GEMM
+    description: >
+      Tiled shared-memory GEMM following cuda-oxide tiled_sgemm example.
+      Both forward and forward_b_transposed. This is the performance
+      bottleneck — the kernel that makes GPU inference worthwhile.
+    status: planned
+    priority: high
+    effort: L
+    depends_on: [p3-cuda-infra]
+    scope:
+      - kernels/src/matmul.rs
+      - kernels/src/gpu/
+    acceptance:
+      - "DualPipeline CPU vs GPU within 1e-4 for m,n,k up to 4096"
+      - "Both forward and forward_b_transposed implemented"
+      - "GPU faster than CPU gemm for m,n,k >= 128"
+      - "cargo oxide build && cargo test --features cuda passes"
+
+  - id: p3-cuda-attention
+    title: CudaAttention — GQA with softmax reductions
+    description: >
+      Parallelize across (batch, head, position). Warp reductions for
+      softmax. Start with naive GPU attention — Flash Attention as
+      follow-up optimization.
+    status: planned
+    priority: high
+    effort: L
+    depends_on: [p3-cuda-infra]
+    scope:
+      - kernels/src/attention.rs
+      - kernels/src/gpu/
+    acceptance:
+      - "DualPipeline CPU vs GPU within 1e-4 including GQA configs"
+      - "Handles num_heads != num_kv_heads (grouped-query attention)"
+      - "cargo oxide build && cargo test --features cuda passes"
 
   - id: p3-gpu-validation
     title: DualPipeline CPU vs GPU validation
@@ -404,7 +484,7 @@ items:
     status: planned
     priority: high
     effort: M
-    depends_on: [p3-cuda-kernels, 2c-dual-pipeline]
+    depends_on: [p3-cuda-matmul, p3-cuda-attention, 2c-dual-pipeline]
     scope:
       - benches/
 
@@ -416,7 +496,7 @@ items:
     status: planned
     priority: medium
     effort: L
-    depends_on: [p3-cuda-kernels]
+    depends_on: [p3-cuda-matmul]
     scope:
       - kernels/src/
 
