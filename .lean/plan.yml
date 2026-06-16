@@ -1313,7 +1313,8 @@ items:
     quick: git status --porcelain
 - id: auto-dead-code-cleanup
   title: Remove unused InferenceResult and false dead_code annotation
-  status: planned
+  status: done
+  progress: 100
   priority: high
   effort: XS
   scope:

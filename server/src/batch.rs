@@ -9,19 +9,6 @@ pub struct InferenceRequest {
     pub top_p: f32,
 }
 
-#[derive(Debug)]
-pub struct InferenceResult {
-    pub id: String,
-    pub output_tokens: Vec<u32>,
-    pub finish_reason: FinishReason,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum FinishReason {
-    Stop,
-    Length,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceState {
     Prefill,

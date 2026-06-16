@@ -3,7 +3,6 @@ use std::borrow::Cow;
 use crate::config::ModelConfig;
 use oxide_kernels::turboquant::{CompressedKV, KvCacheCompressor};
 
-#[allow(dead_code)]
 pub struct KvCache {
     pub k: Vec<Vec<f32>>,
     pub v: Vec<Vec<f32>>,
