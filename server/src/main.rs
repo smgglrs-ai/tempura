@@ -96,8 +96,21 @@ async fn main() {
     let model_path = args.model.as_deref().map(Path::new);
     let is_model_dir = model_path.is_some_and(|p| p.is_dir());
     let is_gguf = model_path.is_some_and(|p| {
-        p.extension()
+        if p.extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        {
+            return true;
+        }
+        if p.is_file() {
+            if let Ok(mut f) = std::fs::File::open(p) {
+                let mut magic = [0u8; 4];
+                use std::io::Read;
+                if f.read_exact(&mut magic).is_ok() {
+                    return &magic == b"GGUF";
+                }
+            }
+        }
+        false
     });
 
     let (config, model_id) = if is_gguf {

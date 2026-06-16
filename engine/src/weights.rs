@@ -127,11 +127,19 @@ impl ModelWeights {
         let required = Self::required_tensor_names(config);
         let expected_sizes = Self::expected_tensor_sizes(config);
 
-        let mut tensors = HashMap::new();
+        let mut tensors: HashMap<String, Vec<f32>> = HashMap::new();
         for name in &required {
-            let data = loader
-                .load_tensor(name)
-                .map_err(|_| WeightsError::MissingTensor(name.clone()))?;
+            let data = match loader.load_tensor(name) {
+                Ok(d) => d,
+                Err(_) if name == "lm_head.weight" => {
+                    if let Some(embed) = tensors.get("model.embed_tokens.weight") {
+                        embed.clone()
+                    } else {
+                        return Err(WeightsError::MissingTensor(name.clone()));
+                    }
+                }
+                Err(_) => return Err(WeightsError::MissingTensor(name.clone())),
+            };
 
             if let Some(&expected) = expected_sizes.get(name.as_str()) {
                 if data.len() != expected {

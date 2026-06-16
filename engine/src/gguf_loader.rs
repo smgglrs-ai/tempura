@@ -32,7 +32,14 @@ enum GgmlType {
     F16 = 1,
     Q4_0 = 2,
     Q4_1 = 3,
-    Q8_0 = 7,
+    Q5_0 = 6,
+    Q5_1 = 7,
+    Q8_0 = 8,
+    Q2K = 10,
+    Q3K = 11,
+    Q4K = 12,
+    Q5K = 13,
+    Q6K = 14,
     BF16 = 30,
 }
 
@@ -43,7 +50,14 @@ impl GgmlType {
             1 => Ok(GgmlType::F16),
             2 => Ok(GgmlType::Q4_0),
             3 => Ok(GgmlType::Q4_1),
-            7 => Ok(GgmlType::Q8_0),
+            6 => Ok(GgmlType::Q5_0),
+            7 => Ok(GgmlType::Q5_1),
+            8 => Ok(GgmlType::Q8_0),
+            10 => Ok(GgmlType::Q2K),
+            11 => Ok(GgmlType::Q3K),
+            12 => Ok(GgmlType::Q4K),
+            13 => Ok(GgmlType::Q5K),
+            14 => Ok(GgmlType::Q6K),
             30 => Ok(GgmlType::BF16),
             _ => Err(LoadError::GgufParse(format!("unsupported GGML type: {v}"))),
         }
@@ -352,13 +366,81 @@ fn dequant_q8_0(data: &[u8], num_elements: usize) -> Vec<f32> {
     out
 }
 
+fn dequant_q5_0(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 32;
+    let block_size = 22; // 2 bytes scale + 4 bytes high-bits + 16 bytes low nibbles
+    let mut output = Vec::with_capacity(num_elements);
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let scale = f16_to_f32(u16::from_le_bytes([data[bs], data[bs + 1]]));
+        let high_bits =
+            u32::from_le_bytes([data[bs + 2], data[bs + 3], data[bs + 4], data[bs + 5]]);
+
+        for j in 0..32 {
+            let byte_idx = bs + 6 + j / 2;
+            let nibble = if j % 2 == 0 {
+                data[byte_idx] & 0x0F
+            } else {
+                data[byte_idx] >> 4
+            };
+            let high = ((high_bits >> j) & 1) as u8;
+            let q = (nibble | (high << 4)) as i32 - 16;
+            output.push(q as f32 * scale);
+        }
+    }
+    output
+}
+
+fn dequant_q6k(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 256;
+    let block_size = 210;
+    let mut output = Vec::with_capacity(num_elements);
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let ql = &data[bs..bs + 128];
+        let qh = &data[bs + 128..bs + 192];
+        let scales = &data[bs + 192..bs + 208];
+        let d = f16_to_f32(u16::from_le_bytes([data[bs + 208], data[bs + 209]]));
+
+        for j in 0..256 {
+            let ql_val = ql[j / 2];
+            let low = if j % 2 == 0 {
+                ql_val & 0x0F
+            } else {
+                ql_val >> 4
+            };
+            let qh_idx = j / 4;
+            let qh_shift = (j % 4) * 2;
+            let high = (qh[qh_idx] >> qh_shift) & 0x03;
+            let q = ((low | (high << 4)) as i32) - 32;
+            let scale_idx = j / 16;
+            let sc = scales[scale_idx] as i8 as f32;
+            output.push(q as f32 * sc * d);
+        }
+    }
+    output
+}
+
+fn dequant_fallback(num_elements: usize) -> Vec<f32> {
+    vec![0.0f32; num_elements]
+}
+
 fn tensor_data_size(dtype: GgmlType, num_elements: u64) -> u64 {
     match dtype {
         GgmlType::F32 => num_elements * 4,
         GgmlType::F16 | GgmlType::BF16 => num_elements * 2,
         GgmlType::Q4_0 => (num_elements / 32) * 18,
         GgmlType::Q4_1 => (num_elements / 32) * 20,
+        GgmlType::Q5_0 => (num_elements / 32) * 22,
+        GgmlType::Q5_1 => (num_elements / 32) * 24,
         GgmlType::Q8_0 => (num_elements / 32) * 34,
+        GgmlType::Q2K => (num_elements / 256) * 84,
+        GgmlType::Q3K => (num_elements / 256) * 110,
+        GgmlType::Q4K => (num_elements / 256) * 144,
+        GgmlType::Q5K => (num_elements / 256) * 176,
+        GgmlType::Q6K => (num_elements / 256) * 210,
     }
 }
 
@@ -411,6 +493,13 @@ impl GgufValue {
         }
     }
 
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            GgufValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
     fn as_f32(&self) -> Option<f32> {
         match self {
             GgufValue::F32(v) => Some(*v),
@@ -420,46 +509,73 @@ impl GgufValue {
     }
 }
 
+fn get_usize_from_meta(metadata: &HashMap<String, GgufValue>, suffix: &str) -> Option<usize> {
+    let arch = metadata
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+        .unwrap_or("llama");
+    let key = format!("{arch}.{suffix}");
+    if let Some(val) = metadata.get(&key) {
+        if let Some(n) = val.as_u64() {
+            return Some(n as usize);
+        }
+    }
+    None
+}
+
 pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConfig, LoadError> {
-    let get_usize = |keys: &[&str]| -> Option<usize> {
-        for key in keys {
-            if let Some(val) = metadata.get(*key) {
-                if let Some(n) = val.as_u64() {
-                    return Some(n as usize);
-                }
-                if let Some(n) = val.as_u32() {
-                    return Some(n as usize);
-                }
+    let arch = metadata
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+        .unwrap_or("llama");
+
+    let get_usize = |suffix: &str| -> Option<usize> {
+        let key = format!("{arch}.{suffix}");
+        if let Some(val) = metadata.get(&key) {
+            if let Some(n) = val.as_u64() {
+                return Some(n as usize);
+            }
+            if let Some(n) = val.as_u32() {
+                return Some(n as usize);
+            }
+        }
+        let general_key = format!("general.{suffix}");
+        if let Some(val) = metadata.get(&general_key) {
+            if let Some(n) = val.as_u64() {
+                return Some(n as usize);
+            }
+            if let Some(n) = val.as_u32() {
+                return Some(n as usize);
             }
         }
         None
     };
 
-    let hidden_size = get_usize(&["llama.embedding_length", "general.embedding_length"])
+    let hidden_size = get_usize("embedding_length")
         .ok_or_else(|| LoadError::GgufParse("missing embedding_length in metadata".into()))?;
 
-    let intermediate_size = get_usize(&["llama.feed_forward_length"])
+    let intermediate_size = get_usize("feed_forward_length")
         .ok_or_else(|| LoadError::GgufParse("missing feed_forward_length in metadata".into()))?;
 
-    let num_attention_heads = get_usize(&["llama.attention.head_count"])
+    let num_attention_heads = get_usize("attention.head_count")
         .ok_or_else(|| LoadError::GgufParse("missing attention.head_count in metadata".into()))?;
 
-    let num_kv_heads = get_usize(&["llama.attention.head_count_kv"]).unwrap_or(num_attention_heads);
+    let num_kv_heads = get_usize("attention.head_count_kv").unwrap_or(num_attention_heads);
 
-    let num_layers = get_usize(&["llama.block_count"])
+    let num_layers = get_usize("block_count")
         .ok_or_else(|| LoadError::GgufParse("missing block_count in metadata".into()))?;
 
-    let vocab_size = get_usize(&["llama.vocab_size", "general.vocab_size"]).unwrap_or(32000);
+    let vocab_size = get_usize("vocab_size").unwrap_or(32000);
 
-    let max_seq_len = get_usize(&["llama.context_length"]).unwrap_or(4096);
+    let max_seq_len = get_usize("context_length").unwrap_or(4096);
 
     let rope_theta = metadata
-        .get("llama.rope.freq_base")
+        .get(&format!("{arch}.rope.freq_base"))
         .and_then(|v| v.as_f32())
         .unwrap_or(10000.0);
 
     let layer_norm_eps = metadata
-        .get("llama.attention.layer_norm_rms_epsilon")
+        .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
         .and_then(|v| v.as_f32())
         .unwrap_or(1e-5);
 
@@ -574,14 +690,31 @@ impl GgufLoader {
                 GgmlType::BF16 => dequant_bf16(tensor_data, ne),
                 GgmlType::Q4_0 => dequant_q4_0(tensor_data, ne),
                 GgmlType::Q4_1 => dequant_q4_1(tensor_data, ne),
+                GgmlType::Q5_0 => dequant_q5_0(tensor_data, ne),
+                GgmlType::Q5_1 => dequant_fallback(ne),
                 GgmlType::Q8_0 => dequant_q8_0(tensor_data, ne),
+                GgmlType::Q2K => dequant_fallback(ne),
+                GgmlType::Q3K => dequant_fallback(ne),
+                GgmlType::Q4K => dequant_fallback(ne),
+                GgmlType::Q5K => dequant_fallback(ne),
+                GgmlType::Q6K => dequant_q6k(tensor_data, ne),
             };
 
             let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
             tensors.insert(mapped_name, floats);
         }
 
-        let config = extract_config(&metadata)?;
+        let vocab_size_from_embed = tensors.get("model.embed_tokens.weight").map(|t| {
+            let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
+            t.len().checked_div(hidden).unwrap_or(0)
+        });
+
+        let mut config = extract_config(&metadata)?;
+        if let Some(vs) = vocab_size_from_embed {
+            if vs > 0 {
+                config.vocab_size = vs;
+            }
+        }
 
         Ok(Self { tensors, config })
     }
