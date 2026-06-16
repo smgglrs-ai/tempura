@@ -1,4 +1,6 @@
 pub mod attention;
+#[cfg(feature = "cuda")]
+pub mod gpu;
 pub mod layernorm;
 pub mod matmul;
 pub mod rmsnorm;

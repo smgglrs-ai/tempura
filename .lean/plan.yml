@@ -389,7 +389,8 @@ items:
       Create kernels/src/gpu/ module with CudaContext management and
       host-to-device transfer helpers that map to KernelError. Each Cuda*
       struct will own a context handle and copy data in/out per call.
-    status: planned
+    status: done
+    progress: 100
     priority: high
     effort: M
     depends_on: [p3-cuda-toolchain]

@@ -268,3 +268,11 @@
     exit_reason: "Remaining items require GPU hardware (p3-cuda-kernels) or lack acceptance criteria (p4/p5)"
     branch: "loop/2026-06-16"
     tag: "loop-run/2026-06-16-1"
+
+- timestamp: "2026-06-16T10:45:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p3-cuda-infra"
+  summary: "Created kernels/src/gpu/ module with GpuContext (Arc<CudaContext> wrapper), DeviceBuffer helpers (to_device, to_host, copy_back), error mapping to KernelError. Added cuda-device/cuda-host/cuda-core as optional deps behind cuda feature. cargo oxide build succeeds."
+  iteration: 2
+  max_iterations: 10
