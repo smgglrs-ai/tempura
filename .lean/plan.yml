@@ -956,7 +956,8 @@ items:
     quick: cargo test --workspace 2>&1 | tail -5
 - id: p6-n-completions
   title: N (multiple completions) parameter
-  status: planned
+  status: done
+  progress: 100
   priority: medium
   effort: S
   scope:

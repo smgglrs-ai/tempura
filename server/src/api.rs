@@ -71,6 +71,12 @@ pub struct ChatCompletionRequest {
     pub top_logprobs: Option<u8>,
     #[serde(default)]
     pub stop: Option<StringOrArray>,
+    #[serde(default = "default_n")]
+    pub n: u32,
+}
+
+fn default_n() -> u32 {
+    1
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -134,6 +140,8 @@ pub struct CompletionRequest {
     pub logprobs: Option<u8>,
     #[serde(default)]
     pub stop: Option<StringOrArray>,
+    #[serde(default = "default_n")]
+    pub n: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -209,6 +217,19 @@ async fn chat_completions(
         .encode(&prompt)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
+    if req.n < 1 || req.n > 128 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "n must be between 1 and 128".into(),
+        ));
+    }
+    if req.stream && req.n > 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "n > 1 is not supported with streaming".into(),
+        ));
+    }
+
     let params = SamplingParams {
         temperature: req.temperature,
         top_k: 50,
@@ -270,84 +291,91 @@ async fn chat_completions(
         let start = std::time::Instant::now();
         metrics::counter!("oxide_request_count", "endpoint" => "chat_completions").increment(1);
 
-        let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, 42);
         let want_logprobs = req.logprobs.unwrap_or(false);
         let top_n = req.top_logprobs.unwrap_or(0).min(20) as usize;
-
-        let (generated, token_logprobs) = if want_logprobs {
-            state.model.generate_with_logprobs(
-                &mut session,
-                &token_ids,
-                req.max_tokens as usize,
-                &params,
-                None,
-                top_n.max(1),
-            )
-        } else {
-            let tokens = state.model.generate(
-                &mut session,
-                &token_ids,
-                req.max_tokens as usize,
-                &params,
-                None,
-            );
-            (tokens, Vec::new())
-        };
-
-        let full_text = tokenizer
-            .decode(&generated)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
         let stop_sequences: Vec<String> = req.stop.map(|s| s.into_vec()).unwrap_or_default();
-        let (text, finish_reason) = check_stop_sequences(&full_text, &stop_sequences);
-
         let prompt_tokens = token_ids.len() as u32;
-        let completion_tokens = generated.len() as u32;
 
-        metrics::counter!("oxide_tokens_generated").increment(completion_tokens as u64);
-        metrics::histogram!("oxide_request_duration_seconds", "endpoint" => "chat_completions")
-            .record(start.elapsed().as_secs_f64());
+        let mut choices = Vec::new();
+        let mut total_completion_tokens = 0u32;
 
-        let logprobs_response = if want_logprobs {
-            Some(ChoiceLogprobs {
-                content: token_logprobs
-                    .iter()
-                    .map(|lp| TokenLogprobInfo {
-                        token: format!("token_{}", lp.token_id),
-                        logprob: lp.logprob,
-                        top_logprobs: lp
-                            .top_logprobs
-                            .iter()
-                            .map(|t| TopLogprobInfo {
-                                token: format!("token_{}", t.token_id),
-                                logprob: t.logprob,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            })
-        } else {
-            None
-        };
+        for i in 0..req.n {
+            let seed = 42u64.wrapping_add(i as u64);
+            let mut session = InferenceSession::new(&state.model.config, TraceLevel::Off, seed);
 
-        Ok(Json(ChatCompletionResponse {
-            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-            object: "chat.completion".to_string(),
-            created: 0,
-            model: req.model,
-            choices: vec![ChatChoice {
-                index: 0,
+            let (generated, token_logprobs) = if want_logprobs {
+                state.model.generate_with_logprobs(
+                    &mut session,
+                    &token_ids,
+                    req.max_tokens as usize,
+                    &params,
+                    None,
+                    top_n.max(1),
+                )
+            } else {
+                let tokens = state.model.generate(
+                    &mut session,
+                    &token_ids,
+                    req.max_tokens as usize,
+                    &params,
+                    None,
+                );
+                (tokens, Vec::new())
+            };
+
+            let full_text = tokenizer
+                .decode(&generated)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let (text, finish_reason) = check_stop_sequences(&full_text, &stop_sequences);
+            total_completion_tokens += generated.len() as u32;
+
+            let logprobs_response = if want_logprobs {
+                Some(ChoiceLogprobs {
+                    content: token_logprobs
+                        .iter()
+                        .map(|lp| TokenLogprobInfo {
+                            token: format!("token_{}", lp.token_id),
+                            logprob: lp.logprob,
+                            top_logprobs: lp
+                                .top_logprobs
+                                .iter()
+                                .map(|t| TopLogprobInfo {
+                                    token: format!("token_{}", t.token_id),
+                                    logprob: t.logprob,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+            } else {
+                None
+            };
+
+            choices.push(ChatChoice {
+                index: i,
                 message: ChatMessage {
                     role: "assistant".to_string(),
                     content: text.to_string(),
                 },
                 finish_reason: finish_reason.to_string(),
                 logprobs: logprobs_response,
-            }],
+            });
+        }
+
+        metrics::counter!("oxide_tokens_generated").increment(total_completion_tokens as u64);
+        metrics::histogram!("oxide_request_duration_seconds", "endpoint" => "chat_completions")
+            .record(start.elapsed().as_secs_f64());
+
+        Ok(Json(ChatCompletionResponse {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: req.model,
+            choices,
             usage: Usage {
                 prompt_tokens,
-                completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
+                completion_tokens: total_completion_tokens,
+                total_tokens: prompt_tokens + total_completion_tokens,
             },
         })
         .into_response())

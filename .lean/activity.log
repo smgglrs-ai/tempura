@@ -539,3 +539,10 @@
   summary: "Added stop sequence support: StringOrArray deserialization, stop field on requests, check_stop_sequences helper, finish_reason stop/length, 5 new tests"
   iteration: 2
   max_iterations: 10
+- timestamp: "2026-06-16T13:45:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p6-n-completions"
+  summary: "Added n parameter to ChatCompletionRequest/CompletionRequest: multiple completions per request with distinct seeds, validation (1-128), streaming+n>1 rejection"
+  iteration: 3
+  max_iterations: 10
