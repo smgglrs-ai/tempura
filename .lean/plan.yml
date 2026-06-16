@@ -487,7 +487,8 @@ items:
       Formalize GPU kernel validation as a benchmark suite. Add timing
       for all kernels at inference-realistic sizes (MicroLlama-scale
       projections), report speedup ratios, and validate correctness.
-    status: planned
+    status: done
+    progress: 100
     priority: high
     effort: S
     depends_on: [p3-cuda-matmul, p3-cuda-attention, 2c-dual-pipeline]

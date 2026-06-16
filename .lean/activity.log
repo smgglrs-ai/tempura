@@ -344,3 +344,11 @@
     exit_reason: "Remaining items lack acceptance criteria or are blocked"
     branch: "loop/2026-06-16"
     tag: "loop-run/2026-06-16-6"
+
+- timestamp: "2026-06-16T14:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p3-gpu-validation"
+  summary: "GPU validation suite with inference-realistic sizes (MicroLlama: 1x1024x1024, 1x5632x1024, 1x32000x1024, GQA 16h/4kv seq=128 d=64). All correct. GPU slower per-kernel due to H2D/D2H transfers — speedup requires on-device data pipeline."
+  iteration: 7
+  max_iterations: 10
