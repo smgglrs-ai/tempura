@@ -92,25 +92,73 @@ impl Attention for CpuAttention {
 }
 
 #[cfg(feature = "cuda")]
-pub struct CudaAttention;
+pub struct CudaAttention {
+    gpu: crate::gpu::GpuContext,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for CudaAttention {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for CudaAttention {}
+
+#[cfg(feature = "cuda")]
+impl CudaAttention {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            gpu: crate::gpu::GpuContext::new(0)?,
+        })
+    }
+}
 
 #[cfg(feature = "cuda")]
 impl Attention for CudaAttention {
     fn forward(
         &self,
-        _q: &[f32],
-        _k: &[f32],
-        _v: &[f32],
-        _output: &mut [f32],
-        _batch: usize,
-        _seq_len: usize,
-        _kv_len: usize,
-        _num_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _scale: f32,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        output: &mut [f32],
+        batch: usize,
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
     ) -> Result<()> {
-        todo!("CudaAttention: requires cargo oxide build")
+        use cuda_core::LaunchConfig;
+
+        let stream = self.gpu.stream();
+        let total = batch * seq_len * num_heads * head_dim;
+
+        let q_dev = crate::gpu::to_device(&stream, q)?;
+        let k_dev = crate::gpu::to_device(&stream, k)?;
+        let v_dev = crate::gpu::to_device(&stream, v)?;
+        let mut out_dev = crate::gpu::to_device(&stream, &vec![0.0f32; total])?;
+
+        let module = crate::gpu::attention_kernel::kernels::load(self.gpu.context())
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+        module
+            .attention_forward(
+                &stream,
+                LaunchConfig::for_num_elems(total as u32),
+                &q_dev,
+                &k_dev,
+                &v_dev,
+                &mut out_dev,
+                batch as u32,
+                seq_len as u32,
+                kv_len as u32,
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                scale,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+        crate::gpu::copy_back(&stream, &out_dev, output)?;
+        Ok(())
     }
 }
 

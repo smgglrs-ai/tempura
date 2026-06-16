@@ -468,7 +468,8 @@ items:
       Parallelize across (batch, head, position). Warp reductions for
       softmax. Start with naive GPU attention — Flash Attention as
       follow-up optimization.
-    status: planned
+    status: done
+    progress: 100
     priority: high
     effort: L
     depends_on: [p3-cuda-infra]

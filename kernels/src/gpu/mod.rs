@@ -1,3 +1,4 @@
+pub mod attention_kernel;
 pub mod matmul_kernel;
 pub mod rmsnorm_kernel;
 pub mod rope_kernel;

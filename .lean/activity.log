@@ -324,3 +324,11 @@
   summary: "CudaMatMul: tiled 16x16 shared-memory GEMM + B-transposed variant. CPU vs GPU max diff 2.38e-6 at 1024x1024. GPU slower than CPU gemm due to transfer overhead (expected — GPU wins when data stays on-device)."
   iteration: 5
   max_iterations: 10
+
+- timestamp: "2026-06-16T13:30:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p3-cuda-attention"
+  summary: "CudaAttention: naive GPU attention with GQA support. MHA max diff 2.4e-7, GQA (4h/2kv) max diff 6e-8. All 4 GPU kernels now verified against CPU on RTX 5090."
+  iteration: 6
+  max_iterations: 10

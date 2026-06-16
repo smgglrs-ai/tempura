@@ -1,3 +1,4 @@
+use oxide_kernels::attention::{Attention, CpuAttention, CudaAttention};
 use oxide_kernels::matmul::{CpuMatMul, CudaMatMul, MatMul};
 use oxide_kernels::rmsnorm::{CpuRMSNorm, CudaRMSNorm, RMSNorm};
 use oxide_kernels::rope::{CpuRoPE, CudaRoPE, RoPE};
@@ -217,6 +218,86 @@ fn test_matmul_bt_cpu_vs_gpu() {
     }
 }
 
+fn test_attention_cpu_vs_gpu() {
+    println!("=== Attention: CPU vs GPU (MHA) ===");
+
+    let cpu = CpuAttention;
+    let gpu = CudaAttention::new().expect("Failed to init CudaAttention");
+
+    let batch = 1;
+    let seq_len = 4;
+    let kv_len = 4;
+    let num_heads = 4;
+    let num_kv_heads = 4;
+    let head_dim = 16;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let q: Vec<f32> = (0..batch * seq_len * num_heads * head_dim)
+        .map(|i| ((i % 7) as f32) * 0.1)
+        .collect();
+    let k: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 11) as f32) * 0.1)
+        .collect();
+    let v: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 13) as f32) * 0.1)
+        .collect();
+
+    let mut out_cpu = vec![0.0f32; batch * seq_len * num_heads * head_dim];
+    cpu.forward(&q, &k, &v, &mut out_cpu, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale)
+        .unwrap();
+
+    let mut out_gpu = vec![0.0f32; batch * seq_len * num_heads * head_dim];
+    gpu.forward(&q, &k, &v, &mut out_gpu, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale)
+        .unwrap();
+
+    let mut max_diff = 0.0f32;
+    let mut mismatches = 0;
+    for i in 0..out_cpu.len() {
+        let diff = (out_cpu[i] - out_gpu[i]).abs();
+        max_diff = max_diff.max(diff);
+        if diff >= 1e-3 {
+            if mismatches < 3 {
+                eprintln!("  MISMATCH [{i}]: cpu={:.6}, gpu={:.6}", out_cpu[i], out_gpu[i]);
+            }
+            mismatches += 1;
+        }
+    }
+
+    println!("  Elements: {}", out_cpu.len());
+    println!("  Max abs diff: {max_diff:.8}");
+    println!("  Mismatches (>=1e-3): {mismatches}");
+    if mismatches == 0 { println!("  PASS\n"); } else { println!("  FAIL\n"); std::process::exit(1); }
+}
+
+fn test_attention_gqa_cpu_vs_gpu() {
+    println!("=== Attention: CPU vs GPU (GQA, 4 heads / 2 kv heads) ===");
+
+    let cpu = CpuAttention;
+    let gpu = CudaAttention::new().unwrap();
+
+    let batch = 1;
+    let seq_len = 2;
+    let kv_len = 4;
+    let num_heads = 4;
+    let num_kv_heads = 2;
+    let head_dim = 8;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let q: Vec<f32> = (0..batch * seq_len * num_heads * head_dim).map(|i| (i as f32) * 0.01).collect();
+    let k: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim).map(|i| (i as f32) * 0.01).collect();
+    let v: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim).map(|i| (i as f32) * 0.01).collect();
+
+    let mut out_cpu = vec![0.0f32; batch * seq_len * num_heads * head_dim];
+    cpu.forward(&q, &k, &v, &mut out_cpu, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
+
+    let mut out_gpu = vec![0.0f32; batch * seq_len * num_heads * head_dim];
+    gpu.forward(&q, &k, &v, &mut out_gpu, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
+
+    let max_diff: f32 = out_cpu.iter().zip(&out_gpu).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    println!("  Max abs diff: {max_diff:.8}");
+    if max_diff < 1e-3 { println!("  PASS\n"); } else { println!("  FAIL\n"); std::process::exit(1); }
+}
+
 fn main() {
     test_rope_cpu_vs_gpu();
     test_rope_position_zero_identity();
@@ -225,5 +306,7 @@ fn main() {
     test_matmul_cpu_vs_gpu(256, 256, 256);
     test_matmul_cpu_vs_gpu(1024, 1024, 1024);
     test_matmul_bt_cpu_vs_gpu();
+    test_attention_cpu_vs_gpu();
+    test_attention_gqa_cpu_vs_gpu();
     println!("All GPU tests passed.");
 }
