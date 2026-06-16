@@ -333,4 +333,63 @@ mod tests {
         params.apply_penalties(&mut logits, &[0, 1, 2]);
         assert_eq!(logits, original);
     }
+
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn prop_softmax_sums_to_one(
+                logits in prop::collection::vec(-100.0f32..100.0f32, 4..64)
+            ) {
+                let sampler = CpuSampler;
+                let mut output = vec![0.0; logits.len()];
+                let params = SamplingParams { top_k: logits.len(), ..SamplingParams::default() };
+                sampler.apply(&logits, &mut output, &params).unwrap();
+                let sum: f32 = output.iter().sum();
+                prop_assert!((sum - 1.0).abs() < 1e-4, "sum={sum}");
+            }
+
+            #[test]
+            fn prop_all_probabilities_non_negative(
+                logits in prop::collection::vec(-100.0f32..100.0f32, 4..64)
+            ) {
+                let sampler = CpuSampler;
+                let mut output = vec![0.0; logits.len()];
+                sampler.apply(&logits, &mut output, &SamplingParams::default()).unwrap();
+                for (i, &p) in output.iter().enumerate() {
+                    prop_assert!(p >= 0.0, "negative probability at index {i}: {p}");
+                }
+            }
+
+            #[test]
+            fn prop_top_k_limits_nonzero_count(
+                logits in prop::collection::vec(0.0f32..10.0f32, 10..50),
+                k in 1usize..10usize,
+            ) {
+                let sampler = CpuSampler;
+                let mut output = vec![0.0; logits.len()];
+                let params = SamplingParams { top_k: k, ..SamplingParams::default() };
+                sampler.apply(&logits, &mut output, &params).unwrap();
+                let nonzero = output.iter().filter(|&&p| p > 0.0).count();
+                prop_assert!(nonzero <= k, "got {nonzero} nonzero, expected <={k}");
+            }
+
+            #[test]
+            fn prop_greedy_selects_argmax(
+                logits in prop::collection::vec(-10.0f32..10.0f32, 4..32)
+            ) {
+                let sampler = CpuSampler;
+                let mut output = vec![0.0; logits.len()];
+                let params = SamplingParams { temperature: 0.01, top_k: logits.len(), ..SamplingParams::default() };
+                sampler.apply(&logits, &mut output, &params).unwrap();
+                let token = sampler.sample_token(&output, None);
+                let expected = logits.iter().enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i as u32).unwrap();
+                prop_assert_eq!(token, expected);
+            }
+        }
+    }
 }

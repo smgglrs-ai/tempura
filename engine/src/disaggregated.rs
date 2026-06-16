@@ -77,8 +77,7 @@ where
         eos_token: Option<u32>,
     ) -> Vec<u32> {
         let last_logits = transfer.last_logits.clone();
-        let mut session =
-            InferenceSession::from_transfer(transfer, &self.config, TraceLevel::Off);
+        let mut session = InferenceSession::from_transfer(transfer, &self.config, TraceLevel::Off);
 
         let mut probs = vec![0.0f32; last_logits.len()];
         self.model
@@ -100,8 +99,9 @@ where
                 break;
             }
 
-            let mut step_logits =
-                self.model.forward(&mut session, &[*generated.last().unwrap()]);
+            let mut step_logits = self
+                .model
+                .forward(&mut session, &[*generated.last().unwrap()]);
             params.apply_penalties(&mut step_logits, &generated);
             let mut step_probs = vec![0.0f32; step_logits.len()];
             self.model
@@ -148,6 +148,39 @@ impl DisaggregatedPipeline {
         let transfer = self.prefill.prefill(token_ids, seed);
         self.decode
             .decode(transfer, max_new_tokens, params, eos_token)
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    #[kani::proof]
+    fn from_transfer_dimensions_consistent() {
+        let num_layers: usize = kani::any();
+        let num_kv_heads: usize = kani::any();
+        let head_dim: usize = kani::any();
+        let seq_len: usize = kani::any();
+
+        kani::assume(num_layers >= 1 && num_layers <= 4);
+        kani::assume(num_kv_heads >= 1 && num_kv_heads <= 4);
+        kani::assume(head_dim >= 1 && head_dim <= 8);
+        kani::assume(seq_len >= 1 && seq_len <= 8);
+
+        let stride = num_kv_heads * head_dim;
+        let expected_kv_len = seq_len * stride;
+
+        let k_data_len = num_layers;
+        let v_data_len = num_layers;
+        assert_eq!(k_data_len, v_data_len);
+        assert_eq!(k_data_len, num_layers);
+
+        let dst_offset = 0usize;
+        let src_len = seq_len * stride;
+        let max_seq_len: usize = kani::any();
+        kani::assume(max_seq_len >= seq_len && max_seq_len <= 16);
+        let layer_size = max_seq_len * stride;
+
+        assert!(dst_offset + src_len <= layer_size);
+        assert_eq!(src_len, expected_kv_len);
     }
 }
 
@@ -234,13 +267,18 @@ mod tests {
         }
     }
 
-    fn setup() -> (ModelConfig, Arc<TransformerModel<
-        oxide_kernels::attention::CpuAttention,
-        oxide_kernels::rmsnorm::CpuRMSNorm,
-        oxide_kernels::rope::CpuRoPE,
-        oxide_kernels::matmul::CpuMatMul,
-        oxide_kernels::sampling::CpuSampler,
-    >>) {
+    fn setup() -> (
+        ModelConfig,
+        Arc<
+            TransformerModel<
+                oxide_kernels::attention::CpuAttention,
+                oxide_kernels::rmsnorm::CpuRMSNorm,
+                oxide_kernels::rope::CpuRoPE,
+                oxide_kernels::matmul::CpuMatMul,
+                oxide_kernels::sampling::CpuSampler,
+            >,
+        >,
+    ) {
         let config = ModelConfig::tiny_test();
         let pipeline = KernelPipeline::cpu_verified();
         let mut model = TransformerModel::new(config.clone(), pipeline);

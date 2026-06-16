@@ -224,7 +224,12 @@ impl KvCache {
 
     pub fn from_transfer(transfer: KvCacheTransfer, config: &ModelConfig) -> Self {
         let mut cache = Self::new(config);
-        for (layer, (k, v)) in transfer.k_data.iter().zip(transfer.v_data.iter()).enumerate() {
+        for (layer, (k, v)) in transfer
+            .k_data
+            .iter()
+            .zip(transfer.v_data.iter())
+            .enumerate()
+        {
             cache.append_kv(layer, k, v, transfer.seq_len);
         }
         cache.advance(transfer.seq_len);

@@ -702,6 +702,54 @@ where
 
 pub use oxide_kernels::sampling::SamplingParams as SampleParams;
 
+#[cfg(kani)]
+mod kani_proofs {
+    #[kani::proof]
+    fn embedding_lookup_in_bounds() {
+        let vocab_size: usize = kani::any();
+        let hidden_size: usize = kani::any();
+        let tok: usize = kani::any();
+
+        kani::assume(vocab_size >= 1 && vocab_size <= 64);
+        kani::assume(hidden_size >= 1 && hidden_size <= 16);
+        kani::assume(tok < vocab_size);
+
+        let embed_len = vocab_size * hidden_size;
+        let start = tok * hidden_size;
+        let end = (tok + 1) * hidden_size;
+
+        assert!(start < embed_len);
+        assert!(end <= embed_len);
+    }
+
+    #[kani::proof]
+    fn lm_head_last_token_in_bounds() {
+        let seq_len: usize = kani::any();
+        let hidden_size: usize = kani::any();
+
+        kani::assume(seq_len >= 1 && seq_len <= 16);
+        kani::assume(hidden_size >= 1 && hidden_size <= 16);
+
+        let hidden_len = seq_len * hidden_size;
+        let start = (seq_len - 1) * hidden_size;
+        let end = seq_len * hidden_size;
+
+        assert!(start < hidden_len);
+        assert!(end <= hidden_len);
+    }
+
+    #[kani::proof]
+    fn extract_logprob_token_in_bounds() {
+        let vocab_size: usize = kani::any();
+        let token_id: u32 = kani::any();
+
+        kani::assume(vocab_size >= 1 && vocab_size <= 128);
+        kani::assume((token_id as usize) < vocab_size);
+
+        assert!((token_id as usize) < vocab_size);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

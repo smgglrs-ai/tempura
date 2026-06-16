@@ -276,4 +276,31 @@ mod tests {
         // first token attends more to itself (q[0] dot k[0] > q[0] dot k[1])
         assert!(output[0] < 3.0); // closer to v[0]=1 than v[4]=5
     }
+
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn prop_attention_output_bounded(
+                head_dim in 2usize..8usize,
+            ) {
+                let attn = CpuAttention;
+                let seq_len = 2;
+                let q = vec![0.1f32; seq_len * head_dim];
+                let k = vec![0.1f32; seq_len * head_dim];
+                let v: Vec<f32> = (0..seq_len * head_dim).map(|i| (i as f32) * 0.1).collect();
+                let mut output = vec![0.0f32; seq_len * head_dim];
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                attn.forward(&q, &k, &v, &mut output, 1, seq_len, seq_len, 1, 1, head_dim, scale).unwrap();
+                let v_max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let v_min = v.iter().cloned().fold(f32::INFINITY, f32::min);
+                for (i, &o) in output.iter().enumerate() {
+                    prop_assert!(o >= v_min - 1e-4 && o <= v_max + 1e-4,
+                        "output[{i}]={o} outside value range [{v_min}, {v_max}]");
+                }
+            }
+        }
+    }
 }

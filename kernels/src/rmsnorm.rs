@@ -193,4 +193,24 @@ mod tests {
         assert_relative_eq!(rms0, 1.0, epsilon = 1e-4);
         assert_relative_eq!(rms1, 1.0, epsilon = 1e-4);
     }
+
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn prop_output_has_unit_rms(
+                input in prop::collection::vec(0.1f32..10.0f32, 4..32)
+            ) {
+                let rn = CpuRMSNorm;
+                let h = input.len();
+                let weight = vec![1.0f32; h];
+                let mut x = input.clone();
+                rn.forward(&mut x, &weight, h, 1e-6).unwrap();
+                let rms = (x.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
+                prop_assert!((rms - 1.0).abs() < 1e-3, "rms={rms}");
+            }
+        }
+    }
 }

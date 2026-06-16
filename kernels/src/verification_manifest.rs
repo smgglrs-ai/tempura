@@ -9,8 +9,17 @@ pub struct KernelProof {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct MathProperty {
+    pub kernel: &'static str,
+    pub property: &'static str,
+    pub method: &'static str,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct VerificationManifest {
     pub kernels: Vec<KernelProof>,
+    pub math_properties: Vec<MathProperty>,
     pub caveats: Vec<&'static str>,
 }
 
@@ -114,11 +123,68 @@ pub fn manifest() -> VerificationManifest {
                 status: "proven",
             },
         ],
+        math_properties: vec![
+            MathProperty {
+                kernel: "CpuSampler",
+                property: "Softmax output sums to 1.0",
+                method: "proptest",
+                status: "tested",
+            },
+            MathProperty {
+                kernel: "CpuSampler",
+                property: "All probabilities non-negative",
+                method: "proptest",
+                status: "tested",
+            },
+            MathProperty {
+                kernel: "CpuSampler",
+                property: "Top-k limits nonzero probability count",
+                method: "proptest",
+                status: "tested",
+            },
+            MathProperty {
+                kernel: "CpuSampler",
+                property: "Near-greedy temperature selects argmax",
+                method: "proptest",
+                status: "tested",
+            },
+            MathProperty {
+                kernel: "CpuRMSNorm",
+                property: "Output has unit RMS with identity weights",
+                method: "proptest",
+                status: "tested",
+            },
+            MathProperty {
+                kernel: "CpuRMSNorm",
+                property: "Weight scaling applied correctly",
+                method: "unit_test",
+                status: "tested",
+            },
+            MathProperty {
+                kernel: "CpuRoPE",
+                property: "Rotation preserves L2 norm",
+                method: "proptest",
+                status: "tested",
+            },
+            MathProperty {
+                kernel: "CpuRoPE",
+                property: "Position zero is identity transform",
+                method: "proptest",
+                status: "tested",
+            },
+            MathProperty {
+                kernel: "CpuAttention",
+                property: "Output bounded by value range (convex combination)",
+                method: "proptest",
+                status: "tested",
+            },
+        ],
         caveats: vec![
             "Proofs cover memory safety (no OOB, no panics) — NOT mathematical correctness",
             "Floating-point operations (exp, sqrt, cos, sin) are over-approximated by CBMC",
             "Proofs verify indexing arithmetic, not full kernel execution (avoids CBMC memory explosion)",
             "GPU kernels (cuda-oxide) will be verified with the same trait contract in Phase 3",
+            "Mathematical properties verified via proptest (see math_properties); Kani cannot handle f32 transcendentals",
         ],
     }
 }

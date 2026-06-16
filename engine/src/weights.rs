@@ -189,6 +189,51 @@ impl ModelWeights {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    #[kani::proof]
+    fn dequant_i8_group_indices_in_bounds() {
+        let num_elements: usize = kani::any();
+        let group_size: usize = kani::any();
+
+        kani::assume(num_elements >= 1 && num_elements <= 32);
+        kani::assume(group_size >= 1 && group_size <= 16);
+
+        let num_groups = (num_elements + group_size - 1) / group_size;
+        let data_len = num_elements;
+
+        for g in 0..num_groups {
+            let start = g * group_size;
+            let end = (start + group_size).min(num_elements);
+            assert!(start <= data_len);
+            assert!(end <= data_len);
+            assert!(g < num_groups);
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn dequant_i4_packed_index_in_bounds() {
+        let num_elements: usize = kani::any();
+        let group_size: usize = kani::any();
+
+        kani::assume(num_elements >= 1 && num_elements <= 16);
+        kani::assume(group_size >= 1 && group_size <= 8);
+
+        let packed_len = (num_elements + 1) / 2;
+        let num_groups = (num_elements + group_size - 1) / group_size;
+
+        for g in 0..num_groups {
+            let start = g * group_size;
+            let end = (start + group_size).min(num_elements);
+            for i in start..end {
+                let packed_idx = i / 2;
+                assert!(packed_idx < packed_len);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

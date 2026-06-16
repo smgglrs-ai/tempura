@@ -250,4 +250,39 @@ mod tests {
             assert!((a - b).abs() < 1e-6);
         }
     }
+
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn prop_rotation_preserves_l2_norm(
+                head_dim in (2usize..8usize).prop_filter("must be even", |d| d % 2 == 0),
+                position in 0u32..128u32,
+            ) {
+                let rope = CpuRoPE;
+                let mut data: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+                let l2_before: f32 = data.iter().map(|v| v * v).sum::<f32>().sqrt();
+                rope.forward(&mut data, 1, 1, 1, head_dim, &[position], 10000.0).unwrap();
+                let l2_after: f32 = data.iter().map(|v| v * v).sum::<f32>().sqrt();
+                prop_assert!((l2_before - l2_after).abs() < 1e-4,
+                    "L2 changed: {l2_before} -> {l2_after}");
+            }
+
+            #[test]
+            fn prop_position_zero_is_identity(
+                head_dim in (2usize..8usize).prop_filter("must be even", |d| d % 2 == 0),
+            ) {
+                let rope = CpuRoPE;
+                let original: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.3).collect();
+                let mut data = original.clone();
+                rope.forward(&mut data, 1, 1, 1, head_dim, &[0], 10000.0).unwrap();
+                for (i, (a, b)) in original.iter().zip(data.iter()).enumerate() {
+                    prop_assert!((a - b).abs() < 1e-5,
+                        "position 0 should be identity, diff at {i}: {a} vs {b}");
+                }
+            }
+        }
+    }
 }
