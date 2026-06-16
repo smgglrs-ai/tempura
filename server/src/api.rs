@@ -30,6 +30,7 @@ pub fn router() -> Router<AppState> {
         .route("/oxide/v1/replay", post(replay))
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health))
+        .route("/ready", get(readiness))
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,4 +457,106 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+#[derive(Serialize)]
+struct ReadinessResponse {
+    ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
+    let mut missing = Vec::new();
+    if state.model.weights.is_none() {
+        missing.push("model weights");
+    }
+    if state.tokenizer.is_none() {
+        missing.push("tokenizer");
+    }
+
+    if missing.is_empty() {
+        (
+            StatusCode::OK,
+            Json(ReadinessResponse {
+                ready: true,
+                reason: None,
+            }),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadinessResponse {
+                ready: false,
+                reason: Some(format!("not loaded: {}", missing.join(", "))),
+            }),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn test_state(with_tokenizer: bool) -> AppState {
+        let config = oxide_engine::ModelConfig::tiny_test();
+        let pipeline = oxide_engine::pipeline::KernelPipeline::cpu_verified();
+        let model = oxide_engine::TransformerModel::new(config, pipeline);
+
+        let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+        let metrics_handle = prometheus_builder.install_recorder().unwrap_or_else(|_| {
+            // recorder already installed in another test
+            metrics_exporter_prometheus::PrometheusBuilder::new()
+                .build_recorder()
+                .handle()
+        });
+
+        AppState {
+            model: std::sync::Arc::new(model),
+            tokenizer: if with_tokenizer {
+                None // no real tokenizer available in tests
+            } else {
+                None
+            },
+            model_id: "test".to_string(),
+            scheduler: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::batch::BatchScheduler::new(1, 128, 1),
+            )),
+            trace_store: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::trace_store::TraceStore::new(10),
+            )),
+            metrics_handle,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ready_returns_503_without_model() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .uri("/ready")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ready"], false);
+        assert!(v["reason"].as_str().unwrap().contains("model weights"));
+    }
+
+    #[tokio::test]
+    async fn test_health_returns_ok() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }

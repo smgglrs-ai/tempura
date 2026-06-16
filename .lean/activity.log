@@ -486,3 +486,10 @@
   summary: "Added ModelConfig::from_hf_config() with HF field mapping, ConfigError type, directory auto-discovery in server, 4 new tests"
   iteration: 1
   max_iterations: 10
+- timestamp: "2026-06-16T11:15:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p7-readiness-probe"
+  summary: "Added /ready endpoint returning 200/503 based on model weights and tokenizer availability, with 2 integration tests"
+  iteration: 2
+  max_iterations: 10

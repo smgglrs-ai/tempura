@@ -1001,7 +1001,8 @@ items:
     quick: cargo test --package oxide-server && cargo build --package oxide-server
 - id: p7-readiness-probe
   title: Readiness probe (/ready endpoint)
-  status: planned
+  status: done
+  progress: 100
   priority: critical
   effort: S
   scope:

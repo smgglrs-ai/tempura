@@ -23,3 +23,6 @@ uuid = { version = "1", features = ["v4"] }
 tokio-stream = "0.1"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+
+[dev-dependencies]
+tower = "0.5"
