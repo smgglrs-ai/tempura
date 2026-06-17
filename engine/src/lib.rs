@@ -3,6 +3,8 @@ pub mod config;
 pub mod disaggregated;
 pub mod dual_pipeline;
 pub mod gguf_loader;
+#[cfg(feature = "cuda")]
+pub mod gpu_scratchpad;
 pub mod kv_cache;
 pub mod loader;
 pub mod model;
@@ -15,6 +17,8 @@ pub mod trace;
 pub mod weights;
 
 pub use config::{ConfigError, ModelConfig, QuantConfig, QuantFormat};
+#[cfg(feature = "cuda")]
+pub use gpu_scratchpad::GpuScratchpad;
 #[cfg(feature = "cuda")]
 pub use kv_cache::GpuKvCache;
 pub use kv_cache::{

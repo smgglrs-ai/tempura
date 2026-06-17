@@ -249,19 +249,26 @@ async fn run_server(args: ServeArgs) {
             model.load_weights(loader).unwrap();
 
             let ctx = model.pipeline.matmul.gpu().context().clone();
-            let gpu_weights =
-                oxide_engine::GpuWeights::upload_from(model.weights.as_ref().unwrap(), &ctx)
-                    .expect("GPU weight upload failed");
+            let gpu_weights = oxide_engine::GpuWeights::upload_from_with_concat(
+                model.weights.as_ref().unwrap(),
+                config,
+                &ctx,
+            )
+            .expect("GPU weight upload failed");
             ctx.bind_to_thread().unwrap();
             let stream = ctx.default_stream();
             let gpu_cache = oxide_engine::GpuKvCache::new(config, &stream)
                 .expect("GPU KV cache allocation failed");
+
+            let scratchpad = oxide_engine::GpuScratchpad::new(config, &stream)
+                .expect("GPU scratchpad allocation failed");
 
             tracing::info!("Uploaded weights and KV cache to GPU");
             return Arc::new(oxide_engine::GpuInferenceWrapper {
                 model,
                 gpu_weights,
                 gpu_cache: std::sync::Mutex::new(gpu_cache),
+                scratchpad: std::sync::Mutex::new(scratchpad),
             });
         }
         let pipeline = KernelPipeline::cpu_verified();

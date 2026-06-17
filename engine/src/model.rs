@@ -763,6 +763,7 @@ impl
         &self,
         gpu_weights: &crate::weights::GpuWeights,
         gpu_cache: &mut crate::kv_cache::GpuKvCache,
+        scratch: &mut crate::gpu_scratchpad::GpuScratchpad,
         token_ids: &[u32],
         position: usize,
     ) -> Vec<f32> {
@@ -789,8 +790,7 @@ impl
             let src = &embed_host[tok as usize * h..(tok as usize + 1) * h];
             hidden_host[t * h..(t + 1) * h].copy_from_slice(src);
         }
-        let mut hidden_dev = cuda_core::DeviceBuffer::from_host(&stream, &hidden_host)
-            .expect("upload hidden states");
+        scratch.upload_hidden(&stream, &hidden_host);
 
         let positions: Vec<u32> = (position..position + seq_len).map(|p| p as u32).collect();
         let positions_dev =
@@ -803,63 +803,50 @@ impl
             let input_ln_w = gpu_weights
                 .get(&format!("{prefix}.input_layernorm.weight"))
                 .unwrap();
-            let mut normed_dev =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc normed");
             self.pipeline
                 .rmsnorm
                 .forward_device(
-                    &hidden_dev,
+                    &scratch.hidden,
                     input_ln_w,
-                    &mut normed_dev,
+                    &mut scratch.normed,
                     h,
                     cfg.layer_norm_eps,
                 )
                 .expect("rmsnorm");
 
-            // --- QKV projections ---
-            let q_w = gpu_weights
-                .get(&format!("{prefix}.self_attn.q_proj.weight"))
-                .unwrap();
-            let k_w = gpu_weights
-                .get(&format!("{prefix}.self_attn.k_proj.weight"))
-                .unwrap();
-            let v_w = gpu_weights
-                .get(&format!("{prefix}.self_attn.v_proj.weight"))
-                .unwrap();
-
+            // --- QKV projection (fused) ---
             let q_dim = n_heads * head_dim;
             let kv_dim = n_kv_heads * head_dim;
+            let qkv_dim = q_dim + 2 * kv_dim;
 
-            let mut q_dev =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * q_dim).expect("alloc q");
-            let mut k_dev =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * kv_dim).expect("alloc k");
-            let mut v_dev =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * kv_dim).expect("alloc v");
+            let qkv_w = gpu_weights
+                .get(&format!("{prefix}.self_attn.qkv_proj.weight"))
+                .unwrap();
+            self.pipeline
+                .matmul
+                .forward_bt_device(&scratch.normed, qkv_w, &mut scratch.qkv, seq_len, qkv_dim, h)
+                .expect("qkv proj");
 
-            self.pipeline
-                .matmul
-                .forward_bt_device(&normed_dev, q_w, &mut q_dev, seq_len, q_dim, h)
-                .expect("q proj");
-            self.pipeline
-                .matmul
-                .forward_bt_device(&normed_dev, k_w, &mut k_dev, seq_len, kv_dim, h)
-                .expect("k proj");
-            self.pipeline
-                .matmul
-                .forward_bt_device(&normed_dev, v_w, &mut v_dev, seq_len, kv_dim, h)
-                .expect("v proj");
+            let ctx = self.pipeline.matmul.gpu().context().clone();
+            oxide_kernels::gpu::slice_columns_device(
+                &ctx, &stream, &scratch.qkv, &mut scratch.q,
+                seq_len, qkv_dim, 0, q_dim,
+            ).expect("slice q");
+            oxide_kernels::gpu::slice_columns_device(
+                &ctx, &stream, &scratch.qkv, &mut scratch.k,
+                seq_len, qkv_dim, q_dim, kv_dim,
+            ).expect("slice k");
+            oxide_kernels::gpu::slice_columns_device(
+                &ctx, &stream, &scratch.qkv, &mut scratch.v,
+                seq_len, qkv_dim, q_dim + kv_dim, kv_dim,
+            ).expect("slice v");
 
             // --- RoPE ---
-            let mut q_rotated =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * q_dim).expect("alloc q_rot");
-            let mut k_rotated =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * kv_dim).expect("alloc k_rot");
             self.pipeline
                 .rope
                 .forward_device(
-                    &q_dev,
-                    &mut q_rotated,
+                    &scratch.q,
+                    &mut scratch.q_rotated,
                     &positions_dev,
                     seq_len,
                     n_heads,
@@ -870,8 +857,8 @@ impl
             self.pipeline
                 .rope
                 .forward_device(
-                    &k_dev,
-                    &mut k_rotated,
+                    &scratch.k,
+                    &mut scratch.k_rotated,
                     &positions_dev,
                     seq_len,
                     n_kv_heads,
@@ -888,7 +875,7 @@ impl
             oxide_kernels::gpu::copy_region_device(
                 &ctx,
                 &stream,
-                &k_rotated,
+                &scratch.k_rotated,
                 &mut gpu_cache.k[layer],
                 0,
                 dst_offset,
@@ -898,7 +885,7 @@ impl
             oxide_kernels::gpu::copy_region_device(
                 &ctx,
                 &stream,
-                &v_dev,
+                &scratch.v,
                 &mut gpu_cache.v[layer],
                 0,
                 dst_offset,
@@ -908,15 +895,13 @@ impl
 
             // --- Attention ---
             let kv_len = gpu_cache.seq_len + seq_len;
-            let mut attn_out_dev =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * q_dim).expect("alloc attn_out");
             self.pipeline
                 .attention
                 .forward_device(
-                    &q_rotated,
+                    &scratch.q_rotated,
                     &gpu_cache.k[layer],
                     &gpu_cache.v[layer],
-                    &mut attn_out_dev,
+                    &mut scratch.attn_out,
                     1,
                     seq_len,
                     kv_len,
@@ -931,129 +916,121 @@ impl
             let o_w = gpu_weights
                 .get(&format!("{prefix}.self_attn.o_proj.weight"))
                 .unwrap();
-            let mut o_proj_dev =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc o_proj");
             self.pipeline
                 .matmul
-                .forward_bt_device(&attn_out_dev, o_w, &mut o_proj_dev, seq_len, h, q_dim)
+                .forward_bt_device(&scratch.attn_out, o_w, &mut scratch.o_proj, seq_len, h, q_dim)
                 .expect("o proj");
 
             // --- Residual add (on device) ---
-            let mut residual_dev =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc residual");
             let ctx = self.pipeline.matmul.gpu().context().clone();
             oxide_kernels::gpu::vector_add_device(
                 &ctx,
                 &stream,
-                &hidden_dev,
-                &o_proj_dev,
-                &mut residual_dev,
+                &scratch.hidden,
+                &scratch.o_proj,
+                &mut scratch.hidden_swap,
             )
             .expect("residual add");
-            hidden_dev = residual_dev;
+            std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_swap);
 
             // --- FFN block ---
             let post_ln_w = gpu_weights
                 .get(&format!("{prefix}.post_attention_layernorm.weight"))
                 .unwrap();
-            let mut normed2_dev =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc normed2");
             self.pipeline
                 .rmsnorm
                 .forward_device(
-                    &hidden_dev,
+                    &scratch.hidden,
                     post_ln_w,
-                    &mut normed2_dev,
+                    &mut scratch.normed2,
                     h,
                     cfg.layer_norm_eps,
                 )
                 .expect("rmsnorm2");
 
-            let gate_w = gpu_weights
-                .get(&format!("{prefix}.mlp.gate_proj.weight"))
-                .unwrap();
-            let up_w = gpu_weights
-                .get(&format!("{prefix}.mlp.up_proj.weight"))
+            let gate_up_w = gpu_weights
+                .get(&format!("{prefix}.mlp.gate_up_proj.weight"))
                 .unwrap();
             let down_w = gpu_weights
                 .get(&format!("{prefix}.mlp.down_proj.weight"))
                 .unwrap();
 
-            let mut gate_dev =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * inter).expect("alloc gate");
-            let mut up_dev =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * inter).expect("alloc up");
             self.pipeline
                 .matmul
-                .forward_bt_device(&normed2_dev, gate_w, &mut gate_dev, seq_len, inter, h)
-                .expect("gate proj");
-            self.pipeline
-                .matmul
-                .forward_bt_device(&normed2_dev, up_w, &mut up_dev, seq_len, inter, h)
-                .expect("up proj");
+                .forward_bt_device(
+                    &scratch.normed2, gate_up_w, &mut scratch.gate_up,
+                    seq_len, 2 * inter, h,
+                )
+                .expect("gate_up proj");
+
+            let ctx = self.pipeline.matmul.gpu().context().clone();
+            oxide_kernels::gpu::slice_columns_device(
+                &ctx, &stream, &scratch.gate_up, &mut scratch.gate,
+                seq_len, 2 * inter, 0, inter,
+            ).expect("slice gate");
+            oxide_kernels::gpu::slice_columns_device(
+                &ctx, &stream, &scratch.gate_up, &mut scratch.up,
+                seq_len, 2 * inter, inter, inter,
+            ).expect("slice up");
 
             // --- SiLU(gate) * up (on device) ---
-            let mut silu_dev =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * inter).expect("alloc silu");
             let ctx = self.pipeline.matmul.gpu().context().clone();
-            oxide_kernels::gpu::silu_mul_device(&ctx, &stream, &gate_dev, &up_dev, &mut silu_dev)
-                .expect("silu_mul");
+            oxide_kernels::gpu::silu_mul_device(
+                &ctx,
+                &stream,
+                &scratch.gate,
+                &scratch.up,
+                &mut scratch.silu_out,
+            )
+            .expect("silu_mul");
 
-            let mut down_dev =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc down");
             self.pipeline
                 .matmul
-                .forward_bt_device(&silu_dev, down_w, &mut down_dev, seq_len, h, inter)
+                .forward_bt_device(&scratch.silu_out, down_w, &mut scratch.down, seq_len, h, inter)
                 .expect("down proj");
 
             // --- FFN residual add (on device) ---
-            let mut residual2_dev =
-                oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc residual2");
             let ctx = self.pipeline.matmul.gpu().context().clone();
             oxide_kernels::gpu::vector_add_device(
                 &ctx,
                 &stream,
-                &hidden_dev,
-                &down_dev,
-                &mut residual2_dev,
+                &scratch.hidden,
+                &scratch.down,
+                &mut scratch.hidden_swap,
             )
             .expect("ffn residual add");
-            hidden_dev = residual2_dev;
+            std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_swap);
         }
 
         gpu_cache.advance(seq_len);
 
         // Final norm + lm_head
         let final_norm_w = gpu_weights.get("model.norm.weight").unwrap();
-        let mut final_normed =
-            oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc final norm");
         self.pipeline
             .rmsnorm
             .forward_device(
-                &hidden_dev,
+                &scratch.hidden,
                 final_norm_w,
-                &mut final_normed,
+                &mut scratch.final_normed,
                 h,
                 cfg.layer_norm_eps,
             )
             .expect("final norm");
 
         let lm_head_w = gpu_weights.get("lm_head.weight").unwrap();
-        let mut logits_dev = oxide_kernels::gpu::alloc_device(&stream, seq_len * cfg.vocab_size)
-            .expect("alloc logits");
         self.pipeline
             .matmul
             .forward_bt_device(
-                &final_normed,
+                &scratch.final_normed,
                 lm_head_w,
-                &mut logits_dev,
+                &mut scratch.logits,
                 seq_len,
                 cfg.vocab_size,
                 h,
             )
             .expect("lm head");
 
-        let all_logits = logits_dev.to_host_vec(&stream).expect("logits to host");
+        let all_logits = scratch.logits.to_host_vec(&stream).expect("logits to host");
         let last_start = (seq_len - 1) * cfg.vocab_size;
         all_logits[last_start..last_start + cfg.vocab_size].to_vec()
     }
@@ -1070,6 +1047,7 @@ pub struct GpuInferenceWrapper {
     >,
     pub gpu_weights: crate::weights::GpuWeights,
     pub gpu_cache: std::sync::Mutex<crate::kv_cache::GpuKvCache>,
+    pub scratchpad: std::sync::Mutex<crate::gpu_scratchpad::GpuScratchpad>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1082,9 +1060,11 @@ impl InferenceModel for GpuInferenceWrapper {
     }
     fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
         let mut gpu_cache = self.gpu_cache.lock().unwrap();
+        let mut scratch = self.scratchpad.lock().unwrap();
         let logits = self.model.forward_gpu(
             &self.gpu_weights,
             &mut gpu_cache,
+            &mut scratch,
             token_ids,
             session.position,
         );

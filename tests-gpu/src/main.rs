@@ -131,6 +131,48 @@ fn test_rmsnorm_cpu_vs_gpu() {
     }
 }
 
+fn test_rmsnorm_cpu_vs_gpu_large() {
+    println!("=== RMSNorm: CPU vs GPU (hidden=4096, tokens=8) ===");
+
+    let cpu = CpuRMSNorm;
+    let gpu = CudaRMSNorm::new().expect("Failed to init CudaRMSNorm");
+
+    let hidden_size = 4096;
+    let num_tokens = 8;
+    let n = num_tokens * hidden_size;
+    let eps = 1e-6f32;
+
+    let x_orig: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.001).sin()).collect();
+    let weight: Vec<f32> = (0..hidden_size).map(|i| 1.0 + (i as f32 * 0.0001).cos()).collect();
+
+    let mut x_cpu = x_orig.clone();
+    cpu.forward(&mut x_cpu, &weight, hidden_size, eps).unwrap();
+
+    let mut x_gpu = x_orig.clone();
+    gpu.forward(&mut x_gpu, &weight, hidden_size, eps).unwrap();
+
+    let mut max_diff = 0.0f32;
+    let mut mismatches = 0;
+    for i in 0..n {
+        let diff = (x_cpu[i] - x_gpu[i]).abs();
+        max_diff = max_diff.max(diff);
+        if diff >= 1e-4 {
+            mismatches += 1;
+        }
+    }
+
+    println!("  Elements: {n}");
+    println!("  Max abs diff: {max_diff:.8}");
+    println!("  Mismatches (>=1e-4): {mismatches}");
+
+    if mismatches == 0 {
+        println!("  PASS\n");
+    } else {
+        println!("  FAIL\n");
+        std::process::exit(1);
+    }
+}
+
 fn test_matmul_cpu_vs_gpu(m: usize, n: usize, k: usize) {
     println!("=== MatMul: CPU vs GPU ({m}×{k} × {k}×{n}) ===");
 
@@ -268,6 +310,7 @@ fn main() {
     test_rope_cpu_vs_gpu();
     test_rope_position_zero_identity();
     test_rmsnorm_cpu_vs_gpu();
+    test_rmsnorm_cpu_vs_gpu_large();
 
     // --- MatMul: small sizes (transfer-dominated) ---
     test_matmul_cpu_vs_gpu(64, 64, 64);
@@ -294,5 +337,62 @@ fn main() {
     // MicroLlama: 16 heads, 4 kv heads, head_dim=64
     test_attention_timed("GQA MicroLlama", 8, 128, 16, 4, 64);
 
+    // --- Slice columns (fused projection support) ---
+    test_slice_columns();
+
     println!("All GPU tests passed.");
+}
+
+fn test_slice_columns() {
+    println!("=== Slice columns: fused QKV extraction ===");
+
+    let gpu_ctx = oxide_kernels::gpu::GpuContext::new(0).unwrap();
+    let ctx = gpu_ctx.context().clone();
+    let stream = ctx.default_stream();
+
+    // Simulate fused QKV output: [4 rows, 10 total_cols]
+    // Q: cols 0..4, K: cols 4..7, V: cols 7..10
+    let rows = 4usize;
+    let total_cols = 10usize;
+    let data: Vec<f32> = (0..rows * total_cols).map(|i| i as f32).collect();
+
+    let src_dev = oxide_kernels::gpu::to_device(&stream, &data).unwrap();
+
+    // Extract Q (cols 0..4)
+    let q_cols = 4usize;
+    let mut q_dev = oxide_kernels::gpu::alloc_device(&stream, rows * q_cols).unwrap();
+    oxide_kernels::gpu::slice_columns_device(
+        &ctx, &stream, &src_dev, &mut q_dev, rows, total_cols, 0, q_cols,
+    )
+    .unwrap();
+    let q_host = oxide_kernels::gpu::to_host(&stream, &q_dev).unwrap();
+
+    // Extract K (cols 4..7)
+    let k_cols = 3usize;
+    let mut k_dev = oxide_kernels::gpu::alloc_device(&stream, rows * k_cols).unwrap();
+    oxide_kernels::gpu::slice_columns_device(
+        &ctx, &stream, &src_dev, &mut k_dev, rows, total_cols, q_cols, k_cols,
+    )
+    .unwrap();
+    let k_host = oxide_kernels::gpu::to_host(&stream, &k_dev).unwrap();
+
+    // Verify Q: row r, col c -> data[r * 10 + c]
+    for r in 0..rows {
+        for c in 0..q_cols {
+            let expected = (r * total_cols + c) as f32;
+            let got = q_host[r * q_cols + c];
+            assert_eq!(expected, got, "Q mismatch at [{r},{c}]");
+        }
+    }
+
+    // Verify K: row r, col c -> data[r * 10 + 4 + c]
+    for r in 0..rows {
+        for c in 0..k_cols {
+            let expected = (r * total_cols + q_cols + c) as f32;
+            let got = k_host[r * k_cols + c];
+            assert_eq!(expected, got, "K mismatch at [{r},{c}]");
+        }
+    }
+
+    println!("  PASS");
 }

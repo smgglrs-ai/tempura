@@ -116,6 +116,36 @@ pub fn silu_mul_device(
     Ok(())
 }
 
+pub fn slice_columns_device(
+    ctx: &Arc<CudaContext>,
+    stream: &CudaStream,
+    src: &DeviceBuffer<f32>,
+    dst: &mut DeviceBuffer<f32>,
+    rows: usize,
+    total_cols: usize,
+    col_offset: usize,
+    slice_cols: usize,
+) -> Result<(), KernelError> {
+    use cuda_core::LaunchConfig;
+    bind_context(ctx)?;
+    let module = elementwise_kernel::kernels::load(ctx)
+        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+    let total_elems = rows * slice_cols;
+    module
+        .slice_columns(
+            stream,
+            LaunchConfig::for_num_elems(total_elems as u32),
+            src,
+            dst,
+            rows as u32,
+            total_cols as u32,
+            col_offset as u32,
+            slice_cols as u32,
+        )
+        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+    Ok(())
+}
+
 pub fn copy_region_device(
     ctx: &Arc<CudaContext>,
     stream: &CudaStream,

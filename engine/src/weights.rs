@@ -228,6 +228,57 @@ impl GpuWeights {
         Ok(Self { tensors })
     }
 
+    pub fn upload_from_with_concat(
+        weights: &ModelWeights,
+        config: &crate::config::ModelConfig,
+        ctx: &std::sync::Arc<cuda_core::CudaContext>,
+    ) -> Result<Self, WeightsError> {
+        let mut gpu = Self::upload_from(weights, ctx)?;
+        let stream = ctx.default_stream();
+        let h = config.hidden_size;
+        let q_dim = config.num_attention_heads * config.head_dim;
+        let kv_dim = config.num_kv_heads * config.head_dim;
+        let inter = config.intermediate_size;
+
+        for layer in 0..config.num_layers {
+            let prefix = format!("model.layers.{layer}");
+
+            // QKV: concat Q [q_dim, h] + K [kv_dim, h] + V [kv_dim, h] -> [q_dim+2*kv_dim, h]
+            let q_name = format!("{prefix}.self_attn.q_proj.weight");
+            let k_name = format!("{prefix}.self_attn.k_proj.weight");
+            let v_name = format!("{prefix}.self_attn.v_proj.weight");
+            if let (Some(q), Some(k), Some(v)) = (
+                weights.get(&q_name),
+                weights.get(&k_name),
+                weights.get(&v_name),
+            ) {
+                let mut qkv = Vec::with_capacity(q.len() + k.len() + v.len());
+                qkv.extend_from_slice(q);
+                qkv.extend_from_slice(k);
+                qkv.extend_from_slice(v);
+                let dev_buf = cuda_core::DeviceBuffer::from_host(&stream, &qkv)
+                    .map_err(|e| WeightsError::GpuUpload(format!("qkv concat L{layer}: {e}")))?;
+                gpu.tensors
+                    .insert(format!("{prefix}.self_attn.qkv_proj.weight"), dev_buf);
+            }
+
+            // Gate+Up: concat Gate [inter, h] + Up [inter, h] -> [2*inter, h]
+            let gate_name = format!("{prefix}.mlp.gate_proj.weight");
+            let up_name = format!("{prefix}.mlp.up_proj.weight");
+            if let (Some(gate), Some(up)) = (weights.get(&gate_name), weights.get(&up_name)) {
+                let mut gate_up = Vec::with_capacity(gate.len() + up.len());
+                gate_up.extend_from_slice(gate);
+                gate_up.extend_from_slice(up);
+                let dev_buf = cuda_core::DeviceBuffer::from_host(&stream, &gate_up)
+                    .map_err(|e| WeightsError::GpuUpload(format!("gate_up concat L{layer}: {e}")))?;
+                gpu.tensors
+                    .insert(format!("{prefix}.mlp.gate_up_proj.weight"), dev_buf);
+            }
+        }
+
+        Ok(gpu)
+    }
+
     pub fn get(&self, name: &str) -> Option<&cuda_core::DeviceBuffer<f32>> {
         self.tensors.get(name)
     }
