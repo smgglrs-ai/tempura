@@ -50,20 +50,26 @@ impl
         oxide_kernels::allreduce::CpuAllReduce,
     >
 {
-    pub fn cuda() -> Self {
+    pub fn cuda() -> KernelPipeline<
+        oxide_kernels::attention::CudaAttention,
+        oxide_kernels::rmsnorm::CudaRMSNorm,
+        oxide_kernels::rope::CudaRoPE,
+        oxide_kernels::matmul::CudaMatMul,
+        oxide_kernels::sampling::CpuSampler,
+    > {
         use oxide_kernels::allreduce::CpuAllReduce;
         use oxide_kernels::attention::CudaAttention;
         use oxide_kernels::matmul::CudaMatMul;
         use oxide_kernels::rmsnorm::CudaRMSNorm;
         use oxide_kernels::rope::CudaRoPE;
-        use oxide_kernels::sampling::CudaSampler;
+        use oxide_kernels::sampling::CpuSampler;
 
-        Self {
+        KernelPipeline {
             attention: CudaAttention::new().expect("Failed to initialize CudaAttention"),
             rmsnorm: CudaRMSNorm::new().expect("Failed to initialize CudaRMSNorm"),
             rope: CudaRoPE::new().expect("Failed to initialize CudaRoPE"),
             matmul: CudaMatMul::new().expect("Failed to initialize CudaMatMul"),
-            sampler: CudaSampler,
+            sampler: CpuSampler,
             allreduce: CpuAllReduce,
         }
     }

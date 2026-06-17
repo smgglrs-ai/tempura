@@ -135,6 +135,7 @@ impl Attention for CudaAttention {
     ) -> Result<()> {
         use cuda_core::LaunchConfig;
 
+        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let total = batch * seq_len * num_heads * head_dim;
 

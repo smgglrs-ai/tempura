@@ -29,6 +29,11 @@ impl GpuContext {
     }
 }
 
+pub fn bind_context(ctx: &CudaContext) -> Result<(), KernelError> {
+    ctx.bind_to_thread()
+        .map_err(|e| KernelError::InvalidConfig(e.to_string()))
+}
+
 pub fn to_device(stream: &CudaStream, data: &[f32]) -> Result<DeviceBuffer<f32>, KernelError> {
     DeviceBuffer::from_host(stream, data).map_err(|e| KernelError::InvalidConfig(e.to_string()))
 }

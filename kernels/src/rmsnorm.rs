@@ -71,6 +71,7 @@ impl RMSNorm for CudaRMSNorm {
             });
         }
 
+        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let num_tokens = x.len() / hidden_size;
         let total = num_tokens * hidden_size;

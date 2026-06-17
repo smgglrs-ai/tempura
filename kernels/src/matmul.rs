@@ -184,6 +184,7 @@ impl CudaMatMul {
     ) -> Result<()> {
         use cuda_core::LaunchConfig;
 
+        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let a_dev = crate::gpu::to_device(&stream, a)?;
         let b_dev = crate::gpu::to_device(&stream, b)?;

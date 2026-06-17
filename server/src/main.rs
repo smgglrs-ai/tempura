@@ -109,7 +109,7 @@ pub type CudaModel = TransformerModel<
     oxide_kernels::rmsnorm::CudaRMSNorm,
     oxide_kernels::rope::CudaRoPE,
     oxide_kernels::matmul::CudaMatMul,
-    oxide_kernels::sampling::CudaSampler,
+    oxide_kernels::sampling::CpuSampler,
 >;
 
 #[derive(Clone)]
