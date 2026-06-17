@@ -114,6 +114,10 @@ unsafe impl Sync for CudaAttention {}
 
 #[cfg(feature = "cuda")]
 impl CudaAttention {
+    pub fn gpu(&self) -> &crate::gpu::GpuContext {
+        &self.gpu
+    }
+
     pub fn new() -> Result<Self> {
         let gpu = crate::gpu::GpuContext::new(0)?;
         let module = crate::gpu::attention_kernel::kernels::load(gpu.context())

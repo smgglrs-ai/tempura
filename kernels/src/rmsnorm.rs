@@ -56,6 +56,10 @@ unsafe impl Sync for CudaRMSNorm {}
 
 #[cfg(feature = "cuda")]
 impl CudaRMSNorm {
+    pub fn gpu(&self) -> &crate::gpu::GpuContext {
+        &self.gpu
+    }
+
     pub fn new() -> Result<Self> {
         let gpu = crate::gpu::GpuContext::new(0)?;
         let module = crate::gpu::rmsnorm_kernel::kernels::load(gpu.context())
