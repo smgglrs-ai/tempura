@@ -1653,3 +1653,544 @@ items:
   - Existing single-worker mode continues to work unchanged
   verification:
     quick: cargo test --workspace
+
+  # ============================================================================
+  # Phase 12: Foundation — Ecosystem Architecture
+  # Rename to tempura, split crates, enable runtime model dispatch.
+  # ============================================================================
+
+- id: p12-rename
+  title: Rename oxide-serve → tempura-serve
+  description: 'Rename the project and all crate references from oxide-* to tempura-*.
+    This is a mechanical but comprehensive change: Cargo.toml package names, crate
+    imports, module prefixes (oxide_kernels → tempura_kernels, oxide_engine → tempura_engine),
+    binary names, Docker labels, CI workflows, metrics prefixes (oxide_request_count →
+    tempura_request_count), API paths (/oxide/v1/ → /tempura/v1/), README, CLAUDE.md,
+    and repository name. Preserve git history. The repo moves from smgglrs-ai/oxide-serve
+    to smgglrs-ai/tempura-serve.'
+  status: pending
+  priority: critical
+  effort: M
+  scope:
+  - Cargo.toml
+  - kernels/Cargo.toml
+  - engine/Cargo.toml
+  - server/Cargo.toml
+  - server/src/api.rs
+  - server/src/main.rs
+  - README.md
+  - CLAUDE.md
+  - Dockerfile
+  - .github/workflows/
+  acceptance:
+  - All Cargo.toml package names use tempura-* (tempura-kernels, tempura-engine, tempura-serve)
+  - All Rust import paths use tempura_* (tempura_kernels::Attention, etc.)
+  - API paths /oxide/v1/* renamed to /tempura/v1/*
+  - Prometheus metrics prefixed with tempura_ instead of oxide_
+  - system_fingerprint in API responses reads tempura-serve-{version}
+  - cargo build --workspace && cargo test --workspace passes
+  - No remaining references to oxide-serve, oxide_kernels, oxide_engine in source
+  verification:
+    quick: cargo build --workspace && cargo test --workspace && ! grep -r 'oxide.serve\|oxide_kernels\|oxide_engine' --include='*.rs' .
+
+- id: p12-crate-split
+  title: Split tempura-kernels into tempura-kernel-api + tempura-kernels
+  description: 'Extract all kernel traits and shared types into a new tempura-kernel-api
+    crate that contains zero implementations. This is the stable contract 3rd parties
+    code against. tempura-kernels depends on tempura-kernel-api and provides the CPU
+    and CUDA implementations. tempura-engine depends on tempura-kernel-api (for trait
+    bounds) but not tempura-kernels (implementations selected at composition time).
+    The API crate contains: Attention, RMSNorm, RoPE, MatMul, Sampler, LayerNorm,
+    AllReduce, KvCacheCompressor, GuidedDecoder traits, SamplingParams, CompressedKV,
+    KernelError, and Result type.'
+  status: pending
+  priority: critical
+  effort: L
+  depends_on:
+  - p12-rename
+  scope:
+  - kernel-api/Cargo.toml
+  - kernel-api/src/lib.rs
+  - kernels/Cargo.toml
+  - kernels/src/lib.rs
+  - engine/Cargo.toml
+  - Cargo.toml
+  acceptance:
+  - New kernel-api/ crate with all 9 kernel traits, zero implementations
+  - tempura-kernels depends on tempura-kernel-api, re-exports traits for convenience
+  - tempura-engine depends on tempura-kernel-api only (not tempura-kernels)
+  - 3rd party crate can implement traits by depending only on tempura-kernel-api
+  - cargo build --workspace && cargo test --workspace passes
+  - 'Verify independence: cargo build -p tempura-engine compiles without tempura-kernels in the dep tree'
+  verification:
+    quick: cargo build --workspace && cargo test --workspace
+
+- id: p12-dyn-inference-model
+  title: Object-safe InferenceModel for runtime model dispatch
+  description: 'Make InferenceModel fully object-safe so it can be used as Box<dyn InferenceModel>.
+    Currently the trait methods use &self and return owned types, which should be
+    object-safe already. Verify, add a type-erased ModelHandle wrapper, and update
+    AppState to hold Arc<dyn InferenceModel + Send + Sync> instead of a concrete
+    TransformerModel<A,N,R,M,S>. This enables multi-model serving and runtime device
+    selection without recompilation. The vtable indirection cost is negligible —
+    one indirect call (~5ns) per forward() that takes milliseconds.'
+  status: pending
+  priority: high
+  effort: M
+  scope:
+  - engine/src/model.rs
+  - engine/src/lib.rs
+  - server/src/main.rs
+  - server/src/api.rs
+  acceptance:
+  - InferenceModel is object-safe (compiles as Box<dyn InferenceModel + Send + Sync>)
+  - AppState holds Arc<dyn InferenceModel + Send + Sync>
+  - Server startup constructs the concrete model type, then erases it into the dyn trait
+  - All API handlers work unchanged through the dyn dispatch
+  - 'Benchmark: no measurable latency difference vs monomorphized dispatch on tiny_test model'
+  - cargo test --workspace passes
+  verification:
+    quick: cargo test --workspace
+
+- id: p12-verification-toolkit
+  title: Create tempura-kernel-verify crate
+  description: 'Publish a verification toolkit crate that makes it trivial for 3rd
+    party kernel authors to verify their implementations. Contains: (1) DualPipeline
+    runner that compares any trait implementation against the CPU reference with
+    configurable epsilon thresholds, (2) Kani harness templates that 3rd parties
+    instantiate with their types, (3) numerical equivalence test generators that
+    produce randomized inputs for each kernel trait, (4) a VerificationReport type
+    capturing results per-kernel. The goal: implementing a kernel trait and running
+    cargo tempura verify gives you a full verification report with zero boilerplate.'
+  status: pending
+  priority: critical
+  effort: L
+  depends_on:
+  - p12-crate-split
+  scope:
+  - kernel-verify/Cargo.toml
+  - kernel-verify/src/lib.rs
+  - kernel-verify/src/dual_pipeline.rs
+  - kernel-verify/src/kani_templates.rs
+  - kernel-verify/src/test_generators.rs
+  - Cargo.toml
+  acceptance:
+  - New kernel-verify/ crate with DualPipeline runner, Kani templates, test generators
+  - DualPipelineRunner::compare<T: Attention>(impl, reference, configs) returns VerificationReport
+  - Kani harness macros generate proof harnesses for any type implementing a kernel trait
+  - Test generators produce randomized inputs at configurable sizes for each trait
+  - VerificationReport includes per-kernel max_abs_diff, L2_distance, pass/fail, tier assignment
+  - 'Dogfood: tempura-kernels own tests use tempura-kernel-verify to verify CpuAttention etc.'
+  verification:
+    quick: cargo test --workspace
+
+  # ============================================================================
+  # Phase 13: Verification Framework
+  # Tiered verification, composition proofs, agent-friendly interfaces.
+  # ============================================================================
+
+- id: p13-tiered-verification
+  title: Tiered verification levels (Proven / Tested / Compiled)
+  description: 'Add a VerificationTier enum (Proven, Tested, Compiled) to the kernel
+    API and record it in InferenceTrace. Each kernel implementation declares its tier
+    via a const fn or associated type. KernelPipeline aggregates the tiers of its
+    components and records the overall tier in every trace. The API response includes
+    a verification_tier field in the oxide-specific metadata. Users see exactly what
+    level of verification produced each response. Proven = Kani proofs pass +
+    DualPipeline equivalence within epsilon. Tested = DualPipeline equivalence only.
+    Compiled = type-checks against traits, no equivalence data.'
+  status: pending
+  priority: critical
+  effort: M
+  depends_on:
+  - p12-verification-toolkit
+  scope:
+  - kernel-api/src/lib.rs
+  - engine/src/pipeline.rs
+  - engine/src/trace.rs
+  - server/src/api.rs
+  acceptance:
+  - VerificationTier enum in tempura-kernel-api with Proven, Tested, Compiled variants
+  - Each kernel trait gains a verification_tier() method with default Compiled
+  - CPU reference implementations return Proven; Cuda stubs return Tested
+  - KernelPipeline computes min(component tiers) as the pipeline tier
+  - InferenceTrace includes pipeline_verification_tier field
+  - API responses include verification_tier in tempura-specific metadata
+  - GET /tempura/v1/verified reflects per-kernel tiers
+  verification:
+    quick: cargo test --workspace
+
+- id: p13-graph-composition-proofs
+  title: Compositionality — prove graphs from proven operations
+  description: 'Formal framework for proving that a sequence of individually-proven
+    kernel operations composes into a proven graph. The key insight: if each operation
+    is proven safe (no panics, no OOB) and the wiring between operations preserves
+    slice bounds (output of op N fits input of op N+1), then the composed graph is
+    safe. Implement a CompositionVerifier that takes a sequence of kernel invocations
+    (the layer computation graph), checks dimensional compatibility at each boundary,
+    and generates a Kani harness proving the composition. DualPipeline then verifies
+    numerical equivalence of the composed graph vs individual operations. This is
+    the theoretical foundation for NPU graph-level traits: prove the unfused version,
+    verify the fused version matches.'
+  status: pending
+  priority: high
+  effort: L
+  depends_on:
+  - p12-verification-toolkit
+  scope:
+  - kernel-verify/src/composition.rs
+  - engine/src/pipeline.rs
+  acceptance:
+  - CompositionVerifier validates dimensional compatibility across kernel boundaries
+  - 'Kani harness template: given ops [RMSNorm, MatMul, RoPE, Attention], prove that
+    the output buffer of each op is a valid input for the next'
+  - DualPipeline comparison of composed-sequential vs individual-then-compose
+  - A single transformer layer (norm → QKV → rope → attn → proj → residual → norm →
+    FFN → residual) verified as a composed graph
+  - Composition proof recorded in VerificationManifest
+  verification:
+    quick: cargo test --workspace
+
+- id: p13-agent-friendly-api
+  title: Agent-friendly verification API and kernel registration
+  description: 'Make the verification framework accessible to AI coding agents.
+    (1) Machine-readable JSON schema for all kernel traits (input/output shapes,
+    constraints, type requirements) so agents can generate implementations.
+    (2) GET /tempura/v1/schema/{trait_name} returns the trait contract as structured
+    JSON. (3) POST /tempura/v1/verify accepts a kernel implementation (as source or
+    compiled artifact) and runs the verification toolkit, returning a structured
+    VerificationReport. (4) Verification CLI: cargo tempura verify --kernel my-attention
+    runs the full suite and outputs JSON. This enables an AI agent workflow: read
+    schema → generate implementation → verify → iterate.'
+  status: pending
+  priority: high
+  effort: M
+  depends_on:
+  - p13-tiered-verification
+  scope:
+  - kernel-api/src/schema.rs
+  - kernel-verify/src/cli.rs
+  - server/src/api.rs
+  acceptance:
+  - GET /tempura/v1/schema returns JSON listing all kernel traits with parameter types and constraints
+  - GET /tempura/v1/schema/{trait_name} returns detailed schema for one trait
+  - cargo tempura verify --kernel <name> runs DualPipeline + Kani and outputs JSON report
+  - Schema includes dimensional constraints (e.g., q length = batch * seq_len * num_heads * head_dim)
+  - VerificationReport is machine-parseable (JSON with pass/fail, metrics, tier)
+  verification:
+    quick: cargo test --workspace
+
+  # ============================================================================
+  # Phase 14: Trace Tooling — the Wireshark of Inference
+  # Binary format, diff engine, TUI viewer.
+  # ============================================================================
+
+- id: p14-trace-serialization
+  title: Binary trace serialization format
+  description: 'Add compact binary serialization for InferenceTrace alongside the
+    existing JSON. Use MessagePack (rmp-serde) for ~10x size reduction vs JSON.
+    Summary-level traces for a 32-layer model generating 100 tokens should be ~16KB.
+    Add trace export/import CLI commands. The binary format is the "pcap" equivalent —
+    small enough to store for every production request. Full-level traces (with
+    attention matrices) use streaming serialization to avoid memory spikes. Add
+    .tempura-trace file extension with a magic number header for format detection.'
+  status: pending
+  priority: high
+  effort: M
+  scope:
+  - engine/src/trace.rs
+  - engine/Cargo.toml
+  - server/src/trace_store.rs
+  - server/src/api.rs
+  acceptance:
+  - InferenceTrace serializes to MessagePack via rmp-serde
+  - 'Size target: Summary-level trace for 32-layer/100-token is under 20KB in binary'
+  - GET /tempura/v1/traces/{id}?format=binary returns MessagePack
+  - .tempura-trace file format with 4-byte magic header + version byte
+  - Full-level traces use streaming serialization (write layer-by-layer, not buffer-all)
+  - Round-trip test: binary encode → decode produces identical InferenceTrace
+  verification:
+    quick: cargo test --workspace
+
+- id: p14-trace-diff-engine
+  title: Structured trace diff engine
+  description: 'A diff algorithm that takes two InferenceTrace objects and produces
+    a structured TraceDiff report. Aligns by layer index and token position. Reports
+    first divergence point with epsilon-aware comparison. Per-layer comparison of
+    NormStats (mean, variance, max_abs). Per-token comparison of top logits, selected
+    token, probability distribution. Divergence classification: none (within epsilon),
+    numerical (small drift, same tokens), semantic (different tokens selected).
+    Output enables bisecting where two inference runs diverge — the core diagnostic
+    for comparing kernel implementations, quantization effects, or cross-device
+    behavior.'
+  status: pending
+  priority: high
+  effort: M
+  depends_on:
+  - p14-trace-serialization
+  scope:
+  - engine/src/trace_diff.rs
+  - engine/src/lib.rs
+  acceptance:
+  - TraceDiff struct with per-layer and per-token divergence reports
+  - 'Divergence levels: None, Numerical(max_abs_diff), Semantic(token_a, token_b)'
+  - First divergence point identified with layer index and token position
+  - Configurable epsilon threshold for numerical comparison
+  - 'Two identical traces produce TraceDiff { divergence: None }'
+  - 'CPU vs CPU-with-different-order produces Numerical divergence at specific layer'
+  - Diff from binary and JSON trace files supported
+  verification:
+    quick: cargo test --package tempura-engine
+
+- id: p14-trace-cli
+  title: Trace CLI viewer and TUI
+  description: 'A ratatui-based TUI for navigating, filtering, and diffing inference
+    traces. Like wireshark but for transformer layer statistics. Features: (1) trace
+    list view with metadata (model, tokens, timing, tier), (2) single-trace drill-down
+    by layer with norm stats and sampling snapshots, (3) side-by-side diff view
+    highlighting divergence points, (4) filter by layer range, token range, divergence
+    threshold, (5) export filtered views to JSON/CSV. CLI: tempura-trace view <file>,
+    tempura-trace diff <file_a> <file_b> --threshold 1e-4. Can also connect to a
+    running server: tempura-trace watch --server localhost:8080.'
+  status: pending
+  priority: medium
+  effort: L
+  depends_on:
+  - p14-trace-diff-engine
+  scope:
+  - tools/trace-cli/Cargo.toml
+  - tools/trace-cli/src/main.rs
+  - tools/trace-cli/src/tui.rs
+  - tools/trace-cli/src/diff_view.rs
+  - Cargo.toml
+  acceptance:
+  - tempura-trace view <file> renders a scrollable TUI with layer-by-layer stats
+  - tempura-trace diff <a> <b> shows side-by-side comparison with color-coded divergence
+  - Filter by layer range (--layers 10-15), token range (--tokens 30-50)
+  - Export filtered data to JSON or CSV (--export json)
+  - tempura-trace watch --server <url> streams live traces from a running server
+  - Works with both .tempura-trace (binary) and .json trace files
+  verification:
+    quick: cargo build -p tempura-trace
+
+  # ============================================================================
+  # Phase 15: Quantized Verification
+  # Quantized kernel traits with proven math properties.
+  # ============================================================================
+
+- id: p15-quantized-kernel-traits
+  title: Quantized kernel traits (MatMulQ, dequantize)
+  description: 'Add quantization-aware kernel traits alongside the existing f32 traits.
+    MatMulQ operates on packed int4/int8 data with scale factors and zero points,
+    producing f32 output. Dequantize trait converts quantized tensors to f32 for
+    verification. QuantizedStorage types for int4 (packed u8), int8, and fp16 with
+    group metadata. These traits go in tempura-kernel-api so 3rd parties can implement
+    quantized backends. CPU reference implementations use the existing dequantize_tensor
+    logic from engine/src/weights.rs but formalized as trait implementations.'
+  status: pending
+  priority: high
+  effort: M
+  depends_on:
+  - p12-crate-split
+  scope:
+  - kernel-api/src/quantized.rs
+  - kernel-api/src/lib.rs
+  - kernels/src/quantized.rs
+  acceptance:
+  - MatMulQ trait with forward(a_f32, b_quantized, scales, zeros, output, m, n, k, group_size)
+  - Dequantize trait with dequantize(quantized, scales, zeros, output, group_size)
+  - QuantizedStorage types for Int4 (packed), Int8, Fp16 with group metadata
+  - CpuMatMulQ and CpuDequantize implementations in tempura-kernels
+  - DualPipeline comparison of MatMulQ vs dequantize-then-MatMul within bounded error
+  - 'Tests: round-trip accuracy, group boundary correctness, various bit widths'
+  verification:
+    quick: cargo test --workspace
+
+- id: p15-quantized-kani-proofs
+  title: Kani proofs for quantization math properties
+  description: 'Formal verification of quantization arithmetic — properties nobody
+    proves today. (1) Bounded error: |dequant(quant(x)) - x| <= step_size/2 for
+    symmetric quantization. (2) Monotonicity: x > y implies quant(x) >= quant(y)
+    within the same group. (3) Range safety: int32 accumulator in quantized matmul
+    does not overflow for any valid input within quantization range. (4) Group
+    boundary safety: group quantization index arithmetic never reads across group
+    boundaries. (5) Scale invariance: group dequantization produces values within
+    the declared range [min, max]. These proofs apply to CpuDequantize and CpuMatMulQ.
+    Published as part of the verification manifest.'
+  status: pending
+  priority: high
+  effort: L
+  depends_on:
+  - p15-quantized-kernel-traits
+  scope:
+  - kernels/src/quantized.rs
+  - kernels/src/verification_manifest.rs
+  acceptance:
+  - 'Kani proof: bounded error for symmetric int8 dequantization'
+  - 'Kani proof: monotonicity preservation within groups for int8 and int4'
+  - 'Kani proof: int32 accumulator no-overflow in quantized matmul for group_size <= 128'
+  - 'Kani proof: group index arithmetic stays within group boundaries'
+  - All proofs pass with cargo kani --package tempura-kernels
+  - VerificationManifest includes quantization proofs with proven status
+  - Proofs use realistic bounds (group_size 32-128, hidden_size up to 8192)
+  verification:
+    quick: cargo kani --package tempura-kernels
+
+  # ============================================================================
+  # Phase 16: Composable Architectures
+  # Declarative model definitions, optimized loading.
+  # ============================================================================
+
+- id: p16-architecture-registry
+  title: Declarative model architecture registry
+  description: 'Replace hardcoded LLaMA forward pass with a composable architecture
+    system. Define model architectures as sequences of typed blocks: PreNormAttention
+    (norm → QKV → rope → attn → proj → residual), PostNormAttention, SiLUFFN,
+    GeGLUFFN, ParallelAttentionFFN (GPT-J style). An Architecture struct composes
+    blocks declaratively. The registry ships named architectures (llama, mistral,
+    phi, gemma, gpt-neox, qwen2) auto-detected from config.json model_type field.
+    The forward pass becomes generic over Architecture instead of hardcoded. New
+    architectures are added by composing existing blocks — no new Rust code for
+    standard transformer variants.'
+  status: pending
+  priority: medium
+  effort: L
+  depends_on:
+  - p12-crate-split
+  scope:
+  - engine/src/architecture.rs
+  - engine/src/blocks.rs
+  - engine/src/model.rs
+  - engine/src/config.rs
+  acceptance:
+  - Architecture struct defines a sequence of typed block compositions
+  - 'At least 4 named architectures: llama, mistral, phi, gemma'
+  - Auto-detection from HF config.json model_type field
+  - Forward pass is generic over Architecture, not hardcoded to LLaMA
+  - Adding a new standard transformer variant requires no new Rust code (block composition only)
+  - Architecture diffing function reports structural differences between two architectures
+  - Existing LLaMA tests pass unchanged through the new architecture path
+  verification:
+    quick: cargo test --package tempura-engine
+
+- id: p16-loader-optimization
+  title: Optimized model loading (mmap, streaming, verified)
+  description: 'Three loading optimizations: (1) Memory-mapped loading — mmap the
+    safetensors file and cast aligned slices directly instead of copying to Vec<f32>.
+    Reduces peak memory by ~50%% during loading. (2) Streaming/lazy loading — load
+    transformer layers on demand as they are first accessed, not all at startup.
+    Critical for edge devices with limited RAM. (3) Verified loading — hash each
+    tensor shard against a manifest file, track provenance (checkpoint source, format,
+    quantization). Reject weights that fail integrity check. No existing crate does
+    all three.'
+  status: pending
+  priority: medium
+  effort: M
+  scope:
+  - engine/src/weights.rs
+  - engine/src/loader.rs
+  - engine/src/model.rs
+  acceptance:
+  - 'Mmap loader: safetensors files memory-mapped, tensors accessed as &[f32] without copy'
+  - 'Lazy loading: layers loaded on first access, not all at startup'
+  - 'Verified loading: optional .tempura-manifest.json with per-tensor SHA-256 hashes'
+  - 'Load rejects weights with hash mismatch (integrity check)'
+  - 'Peak memory during loading reduced by >=30%% vs current Vec<f32> approach'
+  - Existing SafetensorsLoader continues to work unchanged (backward compat)
+  - Benchmark comparing mmap vs copy loading times for a multi-GB model
+  verification:
+    quick: cargo test --package tempura-engine
+
+  # ============================================================================
+  # Phase 17: Device Targets — NPU / Edge
+  # Graph-level traits, NPU scaffold, power metrics.
+  # ============================================================================
+
+- id: p17-graph-level-traits
+  title: Graph-level kernel traits for NPU backends
+  description: 'Add a second trait level alongside operation-level traits. NPUs
+    (Intel NPU, Qualcomm Hexagon, Apple ANE) compile subgraphs — they cannot implement
+    individual Attention::forward() or RMSNorm::forward() efficiently. Graph-level
+    traits let NPU backends implement entire layer blocks as compiled blobs.
+    FusedTransformerLayer takes full layer inputs (hidden_state, positions, kv_cache)
+    and produces full layer outputs. CompiledPrefill takes a token sequence and
+    produces KV cache entries. DualPipeline verifies graph-level output against the
+    composition of individual operations. Per-operation trace granularity is lost
+    inside fused blocks, but per-block I/O verification is preserved.'
+  status: pending
+  priority: medium
+  effort: M
+  depends_on:
+  - p13-graph-composition-proofs
+  scope:
+  - kernel-api/src/graph.rs
+  - kernel-api/src/lib.rs
+  - kernel-verify/src/graph_verify.rs
+  - engine/src/pipeline.rs
+  acceptance:
+  - FusedTransformerLayer trait in tempura-kernel-api
+  - CompiledPrefill and CompiledDecodeStep traits for phase-level fusion
+  - CPU reference implementation that delegates to individual operation-level kernels
+  - DualPipeline comparison of graph-level vs operation-level for numerical equivalence
+  - InferenceTrace records fused blocks with per-block I/O stats (no per-op detail inside)
+  - VerificationTier::Tested achievable for graph-level implementations via DualPipeline
+  verification:
+    quick: cargo test --workspace
+
+- id: p17-npu-scaffold
+  title: NPU backend scaffold (feature flags, build structure)
+  description: 'Prepare the crate structure for NPU backends, mirroring the cuda feature
+    flag pattern. Add npu-intel, npu-qualcomm feature flags to tempura-kernel-api and
+    tempura-kernels. Stub implementations for Intel NPU (via OpenVINO Runtime / NPU
+    plugin) and Qualcomm Hexagon (via QNN SDK). Each stub implements the graph-level
+    traits with todo!() bodies, proving the feature-gated module structure compiles.
+    Actual NPU implementations require vendor SDKs and hardware — this item sets up
+    the scaffolding.'
+  status: pending
+  priority: low
+  effort: M
+  depends_on:
+  - p17-graph-level-traits
+  scope:
+  - kernel-api/Cargo.toml
+  - kernels/Cargo.toml
+  - kernels/src/npu/mod.rs
+  - kernels/src/npu/intel.rs
+  - kernels/src/npu/qualcomm.rs
+  acceptance:
+  - 'Feature flags: npu-intel, npu-qualcomm in both kernel-api and kernels crates'
+  - Stub IntelNpuLayer and QualcommHexagonLayer behind respective feature flags
+  - Stubs implement FusedTransformerLayer with todo!() bodies
+  - cargo build (default features) succeeds with no NPU SDK installed
+  - cargo check --features npu-intel compiles the stub module
+  - Module structure mirrors kernels/src/gpu/ pattern for consistency
+  verification:
+    quick: cargo build --workspace
+
+- id: p17-power-metrics
+  title: Power and efficiency metrics for edge inference
+  description: 'Add power and efficiency telemetry to InferenceTrace and Prometheus
+    metrics for edge deployment monitoring. (1) Joules-per-token metric using RAPL
+    (Intel) or platform-specific power interfaces. (2) Memory high-water-mark per
+    request. (3) Tokens-per-watt efficiency ratio. (4) Thermal throttle detection
+    (clock frequency drop during inference). These metrics are critical for edge
+    deployment where power budget is constrained. Gate behind an edge-metrics feature
+    flag since RAPL requires specific kernel access.'
+  status: pending
+  priority: low
+  effort: S
+  depends_on:
+  - p17-npu-scaffold
+  scope:
+  - engine/src/trace.rs
+  - server/src/api.rs
+  - server/Cargo.toml
+  acceptance:
+  - 'EdgeMetrics struct: joules_per_token, memory_peak_bytes, tokens_per_watt, clock_mhz_min'
+  - InferenceTrace gains optional edge_metrics field (populated when edge-metrics feature enabled)
+  - RAPL energy reading on Linux via /sys/class/powercap (Intel platforms)
+  - Prometheus gauges for tempura_joules_per_token, tempura_memory_peak_bytes
+  - 'Graceful degradation: when RAPL unavailable, edge_metrics is None (no error)'
+  - Feature flag edge-metrics gates the platform-specific code
+  verification:
+    quick: cargo test --workspace

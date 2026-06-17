@@ -2,3 +2,4 @@
 tests-gpu/target/
 *.ll
 .playwright-mcp/
+docs/public/
