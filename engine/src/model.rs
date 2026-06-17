@@ -100,6 +100,8 @@ pub struct TransformerModel<A, N, R, M, S> {
     pub config: ModelConfig,
     pub pipeline: KernelPipeline<A, N, R, M, S>,
     pub weights: Option<ModelWeights>,
+    #[cfg(feature = "cuda")]
+    pub gpu_weights: Option<crate::weights::GpuWeights>,
 }
 
 impl<A, N, R, M, S> TransformerModel<A, N, R, M, S>
@@ -115,6 +117,8 @@ where
             config,
             pipeline,
             weights: None,
+            #[cfg(feature = "cuda")]
+            gpu_weights: None,
         }
     }
 
@@ -742,6 +746,606 @@ where
             rng_seed: session.seed,
             tokens_masked,
         });
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl
+    TransformerModel<
+        oxide_kernels::attention::CudaAttention,
+        oxide_kernels::rmsnorm::CudaRMSNorm,
+        oxide_kernels::rope::CudaRoPE,
+        oxide_kernels::matmul::CudaMatMul,
+        oxide_kernels::sampling::CpuSampler,
+    >
+{
+    pub fn forward_gpu(
+        &self,
+        gpu_weights: &crate::weights::GpuWeights,
+        gpu_cache: &mut crate::kv_cache::GpuKvCache,
+        token_ids: &[u32],
+        position: usize,
+    ) -> Vec<f32> {
+        let ctx = self.pipeline.matmul.gpu().context().clone();
+        ctx.bind_to_thread().expect("bind CUDA context");
+        let stream = self.pipeline.matmul.gpu().stream();
+
+        let cfg = &self.config;
+        let seq_len = token_ids.len();
+        let h = cfg.hidden_size;
+        let n_heads = cfg.num_attention_heads;
+        let n_kv_heads = cfg.num_kv_heads;
+        let head_dim = cfg.head_dim;
+        let inter = cfg.intermediate_size;
+
+        let embed_host = self
+            .weights
+            .as_ref()
+            .unwrap()
+            .get("model.embed_tokens.weight")
+            .unwrap();
+        let mut hidden_host = vec![0.0f32; seq_len * h];
+        for (t, &tok) in token_ids.iter().enumerate() {
+            let src = &embed_host[tok as usize * h..(tok as usize + 1) * h];
+            hidden_host[t * h..(t + 1) * h].copy_from_slice(src);
+        }
+        let mut hidden_dev = cuda_core::DeviceBuffer::from_host(&stream, &hidden_host)
+            .expect("upload hidden states");
+
+        let positions: Vec<u32> = (position..position + seq_len).map(|p| p as u32).collect();
+        let positions_dev =
+            cuda_core::DeviceBuffer::from_host(&stream, &positions).expect("upload positions");
+
+        for layer in 0..cfg.num_layers {
+            let prefix = format!("model.layers.{layer}");
+
+            // --- RMSNorm ---
+            let input_ln_w = gpu_weights
+                .get(&format!("{prefix}.input_layernorm.weight"))
+                .unwrap();
+            let mut normed_dev =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc normed");
+            self.pipeline
+                .rmsnorm
+                .forward_device(
+                    &hidden_dev,
+                    input_ln_w,
+                    &mut normed_dev,
+                    h,
+                    cfg.layer_norm_eps,
+                )
+                .expect("rmsnorm");
+
+            // --- QKV projections ---
+            let q_w = gpu_weights
+                .get(&format!("{prefix}.self_attn.q_proj.weight"))
+                .unwrap();
+            let k_w = gpu_weights
+                .get(&format!("{prefix}.self_attn.k_proj.weight"))
+                .unwrap();
+            let v_w = gpu_weights
+                .get(&format!("{prefix}.self_attn.v_proj.weight"))
+                .unwrap();
+
+            let q_dim = n_heads * head_dim;
+            let kv_dim = n_kv_heads * head_dim;
+
+            let mut q_dev =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * q_dim).expect("alloc q");
+            let mut k_dev =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * kv_dim).expect("alloc k");
+            let mut v_dev =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * kv_dim).expect("alloc v");
+
+            self.pipeline
+                .matmul
+                .forward_bt_device(&normed_dev, q_w, &mut q_dev, seq_len, q_dim, h)
+                .expect("q proj");
+            self.pipeline
+                .matmul
+                .forward_bt_device(&normed_dev, k_w, &mut k_dev, seq_len, kv_dim, h)
+                .expect("k proj");
+            self.pipeline
+                .matmul
+                .forward_bt_device(&normed_dev, v_w, &mut v_dev, seq_len, kv_dim, h)
+                .expect("v proj");
+
+            // --- RoPE ---
+            let mut q_rotated =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * q_dim).expect("alloc q_rot");
+            let mut k_rotated =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * kv_dim).expect("alloc k_rot");
+            self.pipeline
+                .rope
+                .forward_device(
+                    &q_dev,
+                    &mut q_rotated,
+                    &positions_dev,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    cfg.rope_theta,
+                )
+                .expect("rope q");
+            self.pipeline
+                .rope
+                .forward_device(
+                    &k_dev,
+                    &mut k_rotated,
+                    &positions_dev,
+                    seq_len,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rope_theta,
+                )
+                .expect("rope k");
+
+            // --- KV Cache append (device-side copy) ---
+            let stride = n_kv_heads * head_dim;
+            let dst_offset = gpu_cache.seq_len * stride;
+            let src_len = seq_len * stride;
+            let ctx = self.pipeline.matmul.gpu().context().clone();
+            oxide_kernels::gpu::copy_region_device(
+                &ctx,
+                &stream,
+                &k_rotated,
+                &mut gpu_cache.k[layer],
+                0,
+                dst_offset,
+                src_len,
+            )
+            .expect("kv cache k append");
+            oxide_kernels::gpu::copy_region_device(
+                &ctx,
+                &stream,
+                &v_dev,
+                &mut gpu_cache.v[layer],
+                0,
+                dst_offset,
+                src_len,
+            )
+            .expect("kv cache v append");
+
+            // --- Attention ---
+            let kv_len = gpu_cache.seq_len + seq_len;
+            let mut attn_out_dev =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * q_dim).expect("alloc attn_out");
+            self.pipeline
+                .attention
+                .forward_device(
+                    &q_rotated,
+                    &gpu_cache.k[layer],
+                    &gpu_cache.v[layer],
+                    &mut attn_out_dev,
+                    1,
+                    seq_len,
+                    kv_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    1.0 / (head_dim as f32).sqrt(),
+                )
+                .expect("attention");
+
+            // --- Output projection ---
+            let o_w = gpu_weights
+                .get(&format!("{prefix}.self_attn.o_proj.weight"))
+                .unwrap();
+            let mut o_proj_dev =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc o_proj");
+            self.pipeline
+                .matmul
+                .forward_bt_device(&attn_out_dev, o_w, &mut o_proj_dev, seq_len, h, q_dim)
+                .expect("o proj");
+
+            // --- Residual add (on device) ---
+            let mut residual_dev =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc residual");
+            let ctx = self.pipeline.matmul.gpu().context().clone();
+            oxide_kernels::gpu::vector_add_device(
+                &ctx,
+                &stream,
+                &hidden_dev,
+                &o_proj_dev,
+                &mut residual_dev,
+            )
+            .expect("residual add");
+            hidden_dev = residual_dev;
+
+            // --- FFN block ---
+            let post_ln_w = gpu_weights
+                .get(&format!("{prefix}.post_attention_layernorm.weight"))
+                .unwrap();
+            let mut normed2_dev =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc normed2");
+            self.pipeline
+                .rmsnorm
+                .forward_device(
+                    &hidden_dev,
+                    post_ln_w,
+                    &mut normed2_dev,
+                    h,
+                    cfg.layer_norm_eps,
+                )
+                .expect("rmsnorm2");
+
+            let gate_w = gpu_weights
+                .get(&format!("{prefix}.mlp.gate_proj.weight"))
+                .unwrap();
+            let up_w = gpu_weights
+                .get(&format!("{prefix}.mlp.up_proj.weight"))
+                .unwrap();
+            let down_w = gpu_weights
+                .get(&format!("{prefix}.mlp.down_proj.weight"))
+                .unwrap();
+
+            let mut gate_dev =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * inter).expect("alloc gate");
+            let mut up_dev =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * inter).expect("alloc up");
+            self.pipeline
+                .matmul
+                .forward_bt_device(&normed2_dev, gate_w, &mut gate_dev, seq_len, inter, h)
+                .expect("gate proj");
+            self.pipeline
+                .matmul
+                .forward_bt_device(&normed2_dev, up_w, &mut up_dev, seq_len, inter, h)
+                .expect("up proj");
+
+            // --- SiLU(gate) * up (on device) ---
+            let mut silu_dev =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * inter).expect("alloc silu");
+            let ctx = self.pipeline.matmul.gpu().context().clone();
+            oxide_kernels::gpu::silu_mul_device(&ctx, &stream, &gate_dev, &up_dev, &mut silu_dev)
+                .expect("silu_mul");
+
+            let mut down_dev =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc down");
+            self.pipeline
+                .matmul
+                .forward_bt_device(&silu_dev, down_w, &mut down_dev, seq_len, h, inter)
+                .expect("down proj");
+
+            // --- FFN residual add (on device) ---
+            let mut residual2_dev =
+                oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc residual2");
+            let ctx = self.pipeline.matmul.gpu().context().clone();
+            oxide_kernels::gpu::vector_add_device(
+                &ctx,
+                &stream,
+                &hidden_dev,
+                &down_dev,
+                &mut residual2_dev,
+            )
+            .expect("ffn residual add");
+            hidden_dev = residual2_dev;
+        }
+
+        gpu_cache.advance(seq_len);
+
+        // Final norm + lm_head
+        let final_norm_w = gpu_weights.get("model.norm.weight").unwrap();
+        let mut final_normed =
+            oxide_kernels::gpu::alloc_device(&stream, seq_len * h).expect("alloc final norm");
+        self.pipeline
+            .rmsnorm
+            .forward_device(
+                &hidden_dev,
+                final_norm_w,
+                &mut final_normed,
+                h,
+                cfg.layer_norm_eps,
+            )
+            .expect("final norm");
+
+        let lm_head_w = gpu_weights.get("lm_head.weight").unwrap();
+        let mut logits_dev = oxide_kernels::gpu::alloc_device(&stream, seq_len * cfg.vocab_size)
+            .expect("alloc logits");
+        self.pipeline
+            .matmul
+            .forward_bt_device(
+                &final_normed,
+                lm_head_w,
+                &mut logits_dev,
+                seq_len,
+                cfg.vocab_size,
+                h,
+            )
+            .expect("lm head");
+
+        let all_logits = logits_dev.to_host_vec(&stream).expect("logits to host");
+        let last_start = (seq_len - 1) * cfg.vocab_size;
+        all_logits[last_start..last_start + cfg.vocab_size].to_vec()
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct GpuInferenceWrapper {
+    pub model: TransformerModel<
+        oxide_kernels::attention::CudaAttention,
+        oxide_kernels::rmsnorm::CudaRMSNorm,
+        oxide_kernels::rope::CudaRoPE,
+        oxide_kernels::matmul::CudaMatMul,
+        oxide_kernels::sampling::CpuSampler,
+    >,
+    pub gpu_weights: crate::weights::GpuWeights,
+    pub gpu_cache: std::sync::Mutex<crate::kv_cache::GpuKvCache>,
+}
+
+#[cfg(feature = "cuda")]
+impl InferenceModel for GpuInferenceWrapper {
+    fn config(&self) -> &ModelConfig {
+        &self.model.config
+    }
+    fn has_weights(&self) -> bool {
+        self.model.weights.is_some()
+    }
+    fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
+        let mut gpu_cache = self.gpu_cache.lock().unwrap();
+        let logits = self.model.forward_gpu(
+            &self.gpu_weights,
+            &mut gpu_cache,
+            token_ids,
+            session.position,
+        );
+        session.position += token_ids.len();
+        session.cache.advance(token_ids.len());
+        logits
+    }
+    fn generate(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+    ) -> Vec<u32> {
+        let total_start = Instant::now();
+        let prompt_start = Instant::now();
+        let logits = self.forward(session, token_ids);
+        let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.prompt_tokens = token_ids.len();
+        let gen_start = Instant::now();
+
+        let mut probs = vec![0.0f32; logits.len()];
+        self.model
+            .pipeline
+            .sampler
+            .apply(&logits, &mut probs, params)
+            .unwrap();
+
+        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+            None
+        } else {
+            Some(&mut session.rng)
+        };
+        let first_token = self.model.pipeline.sampler.sample_token(&probs, rng_ref);
+
+        let mut generated = vec![first_token];
+
+        for _step in 1..max_new_tokens {
+            if eos_token == Some(*generated.last().unwrap()) {
+                break;
+            }
+            let mut logits = self.forward(session, &[*generated.last().unwrap()]);
+            params.apply_penalties(&mut logits, &generated);
+            let mut probs = vec![0.0f32; logits.len()];
+            self.model
+                .pipeline
+                .sampler
+                .apply(&logits, &mut probs, params)
+                .unwrap();
+
+            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                None
+            } else {
+                Some(&mut session.rng)
+            };
+            let token = self.model.pipeline.sampler.sample_token(&probs, rng_ref);
+            generated.push(token);
+        }
+
+        let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.generated_tokens = generated.len();
+        session.trace.timing = Some(TimingInfo {
+            total_ms,
+            prompt_ms,
+            generation_ms,
+            tokens_per_second: if generation_ms > 0.0 {
+                generated.len() as f64 / (generation_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+        generated
+    }
+    fn generate_with_logprobs(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        top_n: usize,
+    ) -> (Vec<u32>, Vec<TokenLogprob>) {
+        let total_start = Instant::now();
+        let prompt_start = Instant::now();
+        let logits = self.forward(session, token_ids);
+        let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.prompt_tokens = token_ids.len();
+        let gen_start = Instant::now();
+
+        let mut probs = vec![0.0f32; logits.len()];
+        self.model
+            .pipeline
+            .sampler
+            .apply(&logits, &mut probs, params)
+            .unwrap();
+
+        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+            None
+        } else {
+            Some(&mut session.rng)
+        };
+        let first_token = self.model.pipeline.sampler.sample_token(&probs, rng_ref);
+
+        let mut generated = vec![first_token];
+        let mut logprobs = vec![extract_logprob(&probs, first_token, top_n)];
+
+        for _step in 1..max_new_tokens {
+            if eos_token == Some(*generated.last().unwrap()) {
+                break;
+            }
+            let mut step_logits = self.forward(session, &[*generated.last().unwrap()]);
+            params.apply_penalties(&mut step_logits, &generated);
+            let mut step_probs = vec![0.0f32; step_logits.len()];
+            self.model
+                .pipeline
+                .sampler
+                .apply(&step_logits, &mut step_probs, params)
+                .unwrap();
+
+            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                None
+            } else {
+                Some(&mut session.rng)
+            };
+            let token = self
+                .model
+                .pipeline
+                .sampler
+                .sample_token(&step_probs, rng_ref);
+            logprobs.push(extract_logprob(&step_probs, token, top_n));
+            generated.push(token);
+        }
+
+        let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.generated_tokens = generated.len();
+        session.trace.timing = Some(TimingInfo {
+            total_ms,
+            prompt_ms,
+            generation_ms,
+            tokens_per_second: if generation_ms > 0.0 {
+                generated.len() as f64 / (generation_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+        (generated, logprobs)
+    }
+    fn generate_with_callback(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Vec<u32> {
+        let total_start = Instant::now();
+        let prompt_start = Instant::now();
+        let logits = self.forward(session, token_ids);
+        let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.prompt_tokens = token_ids.len();
+        let gen_start = Instant::now();
+
+        let mut probs = vec![0.0f32; logits.len()];
+        self.model
+            .pipeline
+            .sampler
+            .apply(&logits, &mut probs, params)
+            .unwrap();
+
+        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+            None
+        } else {
+            Some(&mut session.rng)
+        };
+        let first_token = self.model.pipeline.sampler.sample_token(&probs, rng_ref);
+
+        let mut generated = vec![first_token];
+        if !on_token(first_token) {
+            let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+            let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+            session.trace.generated_tokens = generated.len();
+            session.trace.timing = Some(TimingInfo {
+                total_ms,
+                prompt_ms,
+                generation_ms,
+                tokens_per_second: if generation_ms > 0.0 {
+                    generated.len() as f64 / (generation_ms / 1000.0)
+                } else {
+                    0.0
+                },
+            });
+            return generated;
+        }
+
+        for _step in 1..max_new_tokens {
+            if eos_token == Some(*generated.last().unwrap()) {
+                break;
+            }
+            let mut logits = self.forward(session, &[*generated.last().unwrap()]);
+            params.apply_penalties(&mut logits, &generated);
+            let mut probs = vec![0.0f32; logits.len()];
+            self.model
+                .pipeline
+                .sampler
+                .apply(&logits, &mut probs, params)
+                .unwrap();
+
+            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                None
+            } else {
+                Some(&mut session.rng)
+            };
+            let token = self.model.pipeline.sampler.sample_token(&probs, rng_ref);
+            generated.push(token);
+            if !on_token(token) {
+                break;
+            }
+        }
+
+        let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.generated_tokens = generated.len();
+        session.trace.timing = Some(TimingInfo {
+            total_ms,
+            prompt_ms,
+            generation_ms,
+            tokens_per_second: if generation_ms > 0.0 {
+                generated.len() as f64 / (generation_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+        generated
+    }
+    fn generate_guided(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        decoder: &mut dyn oxide_kernels::GuidedDecoder,
+    ) -> Vec<u32> {
+        self.model.generate_guided(
+            session,
+            token_ids,
+            max_new_tokens,
+            params,
+            eos_token,
+            decoder,
+        )
+    }
+    fn load_weights(
+        &mut self,
+        _loader: &dyn crate::loader::WeightLoader,
+    ) -> Result<(), crate::weights::WeightsError> {
+        Ok(())
     }
 }
 

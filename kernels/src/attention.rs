@@ -1,5 +1,8 @@
 use crate::Result;
 
+#[cfg(feature = "cuda")]
+use cuda_core::DeviceBuffer;
+
 #[allow(clippy::too_many_arguments)]
 pub trait Attention: Send + Sync {
     /// Compute scaled dot-product attention.
@@ -101,6 +104,7 @@ impl Attention for CpuAttention {
 #[cfg(feature = "cuda")]
 pub struct CudaAttention {
     gpu: crate::gpu::GpuContext,
+    module: crate::gpu::attention_kernel::kernels::LoadedModule,
 }
 
 #[cfg(feature = "cuda")]
@@ -111,9 +115,53 @@ unsafe impl Sync for CudaAttention {}
 #[cfg(feature = "cuda")]
 impl CudaAttention {
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            gpu: crate::gpu::GpuContext::new(0)?,
-        })
+        let gpu = crate::gpu::GpuContext::new(0)?;
+        let module = crate::gpu::attention_kernel::kernels::load(gpu.context())
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Self { gpu, module })
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+impl CudaAttention {
+    pub fn forward_device(
+        &self,
+        q: &DeviceBuffer<f32>,
+        k: &DeviceBuffer<f32>,
+        v: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        batch: usize,
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+        let total = batch * seq_len * num_heads * head_dim;
+        let module = &self.module;
+        module
+            .attention_forward(
+                &stream,
+                LaunchConfig::for_num_elems(total as u32),
+                q,
+                k,
+                v,
+                output,
+                batch as u32,
+                seq_len as u32,
+                kv_len as u32,
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                scale,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -144,8 +192,7 @@ impl Attention for CudaAttention {
         let v_dev = crate::gpu::to_device(&stream, v)?;
         let mut out_dev = crate::gpu::to_device(&stream, &vec![0.0f32; total])?;
 
-        let module = crate::gpu::attention_kernel::kernels::load(self.gpu.context())
-            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        let module = &self.module;
 
         module
             .attention_forward(

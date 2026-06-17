@@ -1,4 +1,5 @@
 pub mod attention_kernel;
+pub mod elementwise_kernel;
 pub mod matmul_kernel;
 pub mod rmsnorm_kernel;
 pub mod rope_kernel;
@@ -58,6 +59,80 @@ pub fn copy_back(
 ) -> Result<(), KernelError> {
     let host = to_host(stream, buf)?;
     dst.copy_from_slice(&host);
+    Ok(())
+}
+
+pub fn alloc_device(stream: &CudaStream, len: usize) -> Result<DeviceBuffer<f32>, KernelError> {
+    DeviceBuffer::zeroed(stream, len).map_err(|e| KernelError::InvalidConfig(e.to_string()))
+}
+
+pub fn alloc_device_u32(stream: &CudaStream, len: usize) -> Result<DeviceBuffer<u32>, KernelError> {
+    DeviceBuffer::zeroed(stream, len).map_err(|e| KernelError::InvalidConfig(e.to_string()))
+}
+
+pub fn vector_add_device(
+    ctx: &Arc<CudaContext>,
+    stream: &CudaStream,
+    a: &DeviceBuffer<f32>,
+    b: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<f32>,
+) -> Result<(), KernelError> {
+    use cuda_core::LaunchConfig;
+    bind_context(ctx)?;
+    let module = elementwise_kernel::kernels::load(ctx)
+        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+    module
+        .vector_add(
+            stream,
+            LaunchConfig::for_num_elems(a.len() as u32),
+            a,
+            b,
+            output,
+        )
+        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+    Ok(())
+}
+
+pub fn silu_mul_device(
+    ctx: &Arc<CudaContext>,
+    stream: &CudaStream,
+    gate: &DeviceBuffer<f32>,
+    up: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<f32>,
+) -> Result<(), KernelError> {
+    use cuda_core::LaunchConfig;
+    bind_context(ctx)?;
+    let module = elementwise_kernel::kernels::load(ctx)
+        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+    module
+        .silu_mul(
+            stream,
+            LaunchConfig::for_num_elems(gate.len() as u32),
+            gate,
+            up,
+            output,
+        )
+        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+    Ok(())
+}
+
+pub fn copy_region_device(
+    ctx: &Arc<CudaContext>,
+    stream: &CudaStream,
+    src: &DeviceBuffer<f32>,
+    dst: &mut DeviceBuffer<f32>,
+    src_offset: usize,
+    dst_offset: usize,
+    count: usize,
+) -> Result<(), KernelError> {
+    bind_context(ctx)?;
+    let byte_count = count * std::mem::size_of::<f32>();
+    let src_ptr = src.cu_deviceptr() + (src_offset * std::mem::size_of::<f32>()) as u64;
+    let dst_ptr = dst.cu_deviceptr() + (dst_offset * std::mem::size_of::<f32>()) as u64;
+    unsafe {
+        cuda_core::memory::memcpy_dtod_async(dst_ptr, src_ptr, byte_count, stream.cu_stream())
+    }
+    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
     Ok(())
 }
 

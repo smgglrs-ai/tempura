@@ -10,7 +10,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [features]
 default = []
-cuda = ["oxide-kernels/cuda"]
+cuda = ["oxide-kernels/cuda", "dep:cuda-core"]
 
 [dependencies]
 oxide-kernels = { path = "../kernels" }
@@ -21,6 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.9"
 minijinja = "2"
+cuda-core = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-core", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

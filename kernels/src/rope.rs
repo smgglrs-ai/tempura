@@ -1,5 +1,8 @@
 use crate::Result;
 
+#[cfg(feature = "cuda")]
+use cuda_core::DeviceBuffer;
+
 #[allow(clippy::too_many_arguments)]
 pub trait RoPE: Send + Sync {
     /// Apply rotary position embeddings in-place.
@@ -62,6 +65,7 @@ impl RoPE for CpuRoPE {
 #[cfg(feature = "cuda")]
 pub struct CudaRoPE {
     gpu: crate::gpu::GpuContext,
+    module: crate::gpu::rope_kernel::kernels::LoadedModule,
 }
 
 #[cfg(feature = "cuda")]
@@ -72,9 +76,44 @@ unsafe impl Sync for CudaRoPE {}
 #[cfg(feature = "cuda")]
 impl CudaRoPE {
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            gpu: crate::gpu::GpuContext::new(0)?,
-        })
+        let gpu = crate::gpu::GpuContext::new(0)?;
+        let module = crate::gpu::rope_kernel::kernels::load(gpu.context())
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Self { gpu, module })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl CudaRoPE {
+    pub fn forward_device(
+        &self,
+        x_in: &DeviceBuffer<f32>,
+        x_out: &mut DeviceBuffer<f32>,
+        positions: &DeviceBuffer<u32>,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        theta: f32,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+        let total = seq_len * num_heads * head_dim;
+        let module = &self.module;
+        module
+            .rope_forward(
+                &stream,
+                LaunchConfig::for_num_elems(total as u32),
+                x_in,
+                positions,
+                x_out,
+                seq_len as u32,
+                num_heads as u32,
+                head_dim as u32,
+                theta,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -100,8 +139,7 @@ impl RoPE for CudaRoPE {
         let pos_dev = crate::gpu::to_device_u32(&stream, positions)?;
         let mut out_dev = crate::gpu::to_device(&stream, &vec![0.0f32; total_elems])?;
 
-        let module = crate::gpu::rope_kernel::kernels::load(self.gpu.context())
-            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        let module = &self.module;
 
         for b in 0..batch {
             let b_offset = b * seq_len * num_heads * head_dim;

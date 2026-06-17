@@ -1,5 +1,8 @@
 use crate::Result;
 
+#[cfg(feature = "cuda")]
+use cuda_core::DeviceBuffer;
+
 pub trait MatMul: Send + Sync {
     /// Matrix multiplication: output = a × b
     ///
@@ -157,6 +160,7 @@ impl MatMul for CpuMatMul {
 #[cfg(feature = "cuda")]
 pub struct CudaMatMul {
     gpu: crate::gpu::GpuContext,
+    module: crate::gpu::matmul_kernel::kernels::LoadedModule,
 }
 
 #[cfg(feature = "cuda")]
@@ -167,11 +171,19 @@ unsafe impl Sync for CudaMatMul {}
 #[cfg(feature = "cuda")]
 impl CudaMatMul {
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            gpu: crate::gpu::GpuContext::new(0)?,
-        })
+        let gpu = crate::gpu::GpuContext::new(0)?;
+        let module = crate::gpu::matmul_kernel::kernels::load(gpu.context())
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Self { gpu, module })
     }
 
+    pub fn gpu(&self) -> &crate::gpu::GpuContext {
+        &self.gpu
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl CudaMatMul {
     fn launch_gemm(
         &self,
         a: &[f32],
@@ -190,8 +202,7 @@ impl CudaMatMul {
         let b_dev = crate::gpu::to_device(&stream, b)?;
         let mut c_dev = crate::gpu::to_device(&stream, &vec![0.0f32; m * n])?;
 
-        let module = crate::gpu::matmul_kernel::kernels::load(self.gpu.context())
-            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        let module = &self.module;
 
         let block = 16u32;
         let grid_x = (n as u32).div_ceil(block);
@@ -217,6 +228,63 @@ impl CudaMatMul {
         }
 
         crate::gpu::copy_back(&stream, &c_dev, output)?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl CudaMatMul {
+    pub fn forward_device(
+        &self,
+        a: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+        let module = &self.module;
+        let block = 16u32;
+        let grid_x = (n as u32).div_ceil(block);
+        let grid_y = (m as u32).div_ceil(block);
+        let config = LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (block, block, 1),
+            shared_mem_bytes: 0,
+        };
+        module
+            .sgemm_tiled(&stream, config, m as u32, n as u32, k as u32, a, b, output)
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn forward_bt_device(
+        &self,
+        a: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+        let module = &self.module;
+        let block = 16u32;
+        let grid_x = (n as u32).div_ceil(block);
+        let grid_y = (m as u32).div_ceil(block);
+        let config = LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (block, block, 1),
+            shared_mem_bytes: 0,
+        };
+        module
+            .sgemm_tiled_bt(&stream, config, m as u32, n as u32, k as u32, a, b, output)
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
         Ok(())
     }
 }

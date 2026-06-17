@@ -15,6 +15,8 @@ pub enum WeightsError {
     },
     #[error(transparent)]
     Load(#[from] LoadError),
+    #[error("GPU upload failed: {0}")]
+    GpuUpload(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +163,10 @@ impl ModelWeights {
         self.tensors.get(name).map(|v| v.as_slice())
     }
 
+    pub fn tensor_names(&self) -> Vec<String> {
+        self.tensors.keys().cloned().collect()
+    }
+
     fn required_tensor_names(config: &ModelConfig) -> Vec<String> {
         let mut names = vec![
             "model.embed_tokens.weight".to_string(),
@@ -194,6 +200,36 @@ impl ModelWeights {
         sizes.insert("model.norm.weight", h);
         sizes.insert("lm_head.weight", v * h);
         sizes
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct GpuWeights {
+    tensors: HashMap<String, cuda_core::DeviceBuffer<f32>>,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuWeights {
+    pub fn upload_from(
+        weights: &ModelWeights,
+        ctx: &std::sync::Arc<cuda_core::CudaContext>,
+    ) -> Result<Self, WeightsError> {
+        ctx.bind_to_thread()
+            .map_err(|e| WeightsError::GpuUpload(e.to_string()))?;
+        let stream = ctx.default_stream();
+        let mut tensors = HashMap::new();
+        for name in weights.tensor_names() {
+            if let Some(data) = weights.get(&name) {
+                let dev_buf = cuda_core::DeviceBuffer::from_host(&stream, data)
+                    .map_err(|e| WeightsError::GpuUpload(format!("{name}: {e}")))?;
+                tensors.insert(name, dev_buf);
+            }
+        }
+        Ok(Self { tensors })
+    }
+
+    pub fn get(&self, name: &str) -> Option<&cuda_core::DeviceBuffer<f32>> {
+        self.tensors.get(name)
     }
 }
 
