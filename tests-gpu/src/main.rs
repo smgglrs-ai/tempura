@@ -349,7 +349,9 @@ fn main() {
 
     // --- MMA GEMM (tensor core) ---
     test_matmul_mma_bt_identity();
-    test_mma_single_tile();
+    test_matmul_mma_bt(32, 32, 16);
+    test_matmul_mma_bt(64, 64, 64);
+    test_matmul_mma_bt(128, 128, 128);
 
     println!("All GPU tests passed.");
 }
@@ -484,9 +486,9 @@ fn test_mma_single_tile() {
     println!("  Max abs diff: {max_diff:.8}");
     println!("  Mismatches (>=1e-3): {mismatches}");
 
-    println!("\n  --- Simple ramp test (A[r,c]=r, B[r,c]=c) ---");
-    let a2: Vec<f32> = (0..m * k).map(|i| (i / k) as f32).collect();
-    let b2: Vec<f32> = (0..n * k).map(|i| (i % k) as f32).collect();
+    println!("\n  --- Random data test ---");
+    let a2: Vec<f32> = (0..m * k).map(|i| ((i * 7 + 3) % 37) as f32 * 0.1).collect();
+    let b2: Vec<f32> = (0..n * k).map(|i| ((i * 11 + 5) % 41) as f32 * 0.1).collect();
 
     let mut out_cpu2 = vec![0.0f32; m * n];
     cpu.forward_b_transposed(&a2, &b2, &mut out_cpu2, m, n, k).unwrap();
