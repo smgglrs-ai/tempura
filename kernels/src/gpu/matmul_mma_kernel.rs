@@ -107,17 +107,19 @@ pub mod kernels {
             let a_frag_top: [u32; 4];
             let a_frag_bot: [u32; 4];
             unsafe {
+                // PTX ISA Fig.78: reg order is {a0,a1}=top/K0, {a2,a3}=bot/K0,
+                // {a4,a5}=top/K1, {a6,a7}=bot/K1. Pack swaps: odd col first.
                 a_frag_top = [
-                    pack_f16x2(A_TILE[at_r0 * MMA_K + tid * 2], A_TILE[at_r0 * MMA_K + tid * 2 + 1]),
-                    pack_f16x2(A_TILE[at_r0 * MMA_K + tid * 2 + 8], A_TILE[at_r0 * MMA_K + tid * 2 + 9]),
-                    pack_f16x2(A_TILE[at_r1 * MMA_K + tid * 2], A_TILE[at_r1 * MMA_K + tid * 2 + 1]),
-                    pack_f16x2(A_TILE[at_r1 * MMA_K + tid * 2 + 8], A_TILE[at_r1 * MMA_K + tid * 2 + 9]),
+                    pack_f16x2(A_TILE[at_r0 * MMA_K + tid * 2 + 1], A_TILE[at_r0 * MMA_K + tid * 2]),
+                    pack_f16x2(A_TILE[at_r1 * MMA_K + tid * 2 + 1], A_TILE[at_r1 * MMA_K + tid * 2]),
+                    pack_f16x2(A_TILE[at_r0 * MMA_K + tid * 2 + 9], A_TILE[at_r0 * MMA_K + tid * 2 + 8]),
+                    pack_f16x2(A_TILE[at_r1 * MMA_K + tid * 2 + 9], A_TILE[at_r1 * MMA_K + tid * 2 + 8]),
                 ];
                 a_frag_bot = [
-                    pack_f16x2(A_TILE[ab_r0 * MMA_K + tid * 2], A_TILE[ab_r0 * MMA_K + tid * 2 + 1]),
-                    pack_f16x2(A_TILE[ab_r0 * MMA_K + tid * 2 + 8], A_TILE[ab_r0 * MMA_K + tid * 2 + 9]),
-                    pack_f16x2(A_TILE[ab_r1 * MMA_K + tid * 2], A_TILE[ab_r1 * MMA_K + tid * 2 + 1]),
-                    pack_f16x2(A_TILE[ab_r1 * MMA_K + tid * 2 + 8], A_TILE[ab_r1 * MMA_K + tid * 2 + 9]),
+                    pack_f16x2(A_TILE[ab_r0 * MMA_K + tid * 2 + 1], A_TILE[ab_r0 * MMA_K + tid * 2]),
+                    pack_f16x2(A_TILE[ab_r1 * MMA_K + tid * 2 + 1], A_TILE[ab_r1 * MMA_K + tid * 2]),
+                    pack_f16x2(A_TILE[ab_r0 * MMA_K + tid * 2 + 9], A_TILE[ab_r0 * MMA_K + tid * 2 + 8]),
+                    pack_f16x2(A_TILE[ab_r1 * MMA_K + tid * 2 + 9], A_TILE[ab_r1 * MMA_K + tid * 2 + 8]),
                 ];
             }
 
@@ -128,8 +130,8 @@ pub mod kernels {
                 let n = ni * 8 + group_id;
                 unsafe {
                     b_frags[ni] = [
-                        pack_f16x2(B_TILE[n * MMA_K + tid * 2], B_TILE[n * MMA_K + tid * 2 + 1]),
-                        pack_f16x2(B_TILE[n * MMA_K + tid * 2 + 8], B_TILE[n * MMA_K + tid * 2 + 9]),
+                        pack_f16x2(B_TILE[n * MMA_K + tid * 2 + 1], B_TILE[n * MMA_K + tid * 2]),
+                        pack_f16x2(B_TILE[n * MMA_K + tid * 2 + 9], B_TILE[n * MMA_K + tid * 2 + 8]),
                     ];
                 }
                 ni += 1;
