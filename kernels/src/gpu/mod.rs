@@ -1,6 +1,7 @@
 pub mod attention_kernel;
 pub mod elementwise_kernel;
 pub mod flash_attention_kernel;
+pub mod flash_decode_kernel;
 pub mod matmul_kernel;
 pub mod matmul_mma_kernel;
 pub mod mma_sync;
@@ -66,6 +67,14 @@ pub fn copy_back(
 }
 
 pub fn alloc_device(stream: &CudaStream, len: usize) -> Result<DeviceBuffer<f32>, KernelError> {
+    DeviceBuffer::zeroed(stream, len).map_err(|e| KernelError::InvalidConfig(e.to_string()))
+}
+
+pub fn to_device_u16(stream: &CudaStream, data: &[u16]) -> Result<DeviceBuffer<u16>, KernelError> {
+    DeviceBuffer::from_host(stream, data).map_err(|e| KernelError::InvalidConfig(e.to_string()))
+}
+
+pub fn alloc_device_u16(stream: &CudaStream, len: usize) -> Result<DeviceBuffer<u16>, KernelError> {
     DeviceBuffer::zeroed(stream, len).map_err(|e| KernelError::InvalidConfig(e.to_string()))
 }
 

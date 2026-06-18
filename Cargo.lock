@@ -1960,6 +1960,7 @@ dependencies = [
  "cuda-device",
  "cuda-host",
  "gemm",
+ "half",
  "proptest",
  "rand 0.9.4",
  "serde",

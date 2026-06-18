@@ -106,6 +106,7 @@ pub struct CudaAttention {
     gpu: crate::gpu::GpuContext,
     module: crate::gpu::attention_kernel::kernels::LoadedModule,
     flash_module: Option<crate::gpu::flash_attention_kernel::kernels::LoadedModule>,
+    decode_module: Option<crate::gpu::flash_decode_kernel::kernels::LoadedModule>,
 }
 
 #[cfg(feature = "cuda")]
@@ -126,10 +127,14 @@ impl CudaAttention {
         let flash_module = crate::gpu::flash_attention_kernel::kernels::load(gpu.context())
             .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))
             .ok();
+        let decode_module = crate::gpu::flash_decode_kernel::kernels::load(gpu.context())
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))
+            .ok();
         Ok(Self {
             gpu,
             module,
             flash_module,
+            decode_module,
         })
     }
 }
@@ -156,6 +161,65 @@ impl CudaAttention {
         let stream = self.gpu.stream();
 
         if head_dim == 128 && seq_len > 0 {
+            if seq_len == 1 && kv_len >= 512 {
+                if let Some(ref decode) = self.decode_module {
+                    let kv_per_split = 256usize;
+                    let num_splits = kv_len.div_ceil(kv_per_split);
+                    let partials_size =
+                        batch * num_heads * num_splits * (head_dim + 2);
+                    let mut partials =
+                        crate::gpu::alloc_device(&stream, partials_size)?;
+
+                    let partial_config = LaunchConfig {
+                        grid_dim: (
+                            num_heads as u32,
+                            num_splits as u32,
+                            batch as u32,
+                        ),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    decode
+                        .flash_decode_partial(
+                            &stream,
+                            partial_config,
+                            q,
+                            k,
+                            v,
+                            &mut partials,
+                            batch as u32,
+                            kv_len as u32,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            num_splits as u32,
+                            kv_per_split as u32,
+                            scale,
+                        )
+                        .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+                    let reduce_config = LaunchConfig {
+                        grid_dim: (num_heads as u32, 1, batch as u32),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    decode
+                        .flash_decode_reduce(
+                            &stream,
+                            reduce_config,
+                            &partials,
+                            output,
+                            batch as u32,
+                            num_heads as u32,
+                            head_dim as u32,
+                            num_splits as u32,
+                        )
+                        .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+                    return Ok(());
+                }
+            }
+
             if let Some(ref flash) = self.flash_module {
                 let config = LaunchConfig {
                     grid_dim: (
@@ -206,6 +270,99 @@ impl CudaAttention {
             )
             .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
         Ok(())
+    }
+
+    pub fn forward_device_naive(
+        &self,
+        q: &DeviceBuffer<f32>,
+        k: &DeviceBuffer<f32>,
+        v: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        batch: usize,
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+        let total = batch * seq_len * num_heads * head_dim;
+        self.module
+            .attention_forward(
+                &stream,
+                LaunchConfig::for_num_elems(total as u32),
+                q,
+                k,
+                v,
+                output,
+                batch as u32,
+                seq_len as u32,
+                kv_len as u32,
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+                scale,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn forward_device_f16kv(
+        &self,
+        q: &DeviceBuffer<f32>,
+        k: &DeviceBuffer<u16>,
+        v: &DeviceBuffer<u16>,
+        output: &mut DeviceBuffer<f32>,
+        batch: usize,
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+
+        if head_dim == 128 && seq_len > 0 {
+            if let Some(ref flash) = self.flash_module {
+                let config = LaunchConfig {
+                    grid_dim: (
+                        num_heads as u32,
+                        (seq_len as u32).div_ceil(64),
+                        batch as u32,
+                    ),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                flash
+                    .flash_attention_forward_f16(
+                        &stream,
+                        config,
+                        q,
+                        k,
+                        v,
+                        output,
+                        batch as u32,
+                        seq_len as u32,
+                        kv_len as u32,
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        scale,
+                    )
+                    .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+                return Ok(());
+            }
+        }
+
+        Err(crate::KernelError::InvalidConfig(
+            "FP16 KV attention requires head_dim=128 and flash module".to_string(),
+        ))
     }
 }
 

@@ -884,6 +884,7 @@ dependencies = [
  "cuda-device",
  "cuda-host",
  "gemm",
+ "half",
  "rand",
  "serde",
  "serde_json",
@@ -897,6 +898,7 @@ dependencies = [
  "cuda-core",
  "cuda-device",
  "cuda-host",
+ "half",
  "oxide-engine",
  "oxide-kernels",
 ]

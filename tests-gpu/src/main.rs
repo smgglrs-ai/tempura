@@ -1,5 +1,6 @@
 mod test_pack;
 
+use half::f16;
 use oxide_kernels::attention::{Attention, CpuAttention, CudaAttention};
 use oxide_kernels::matmul::{CpuMatMul, CudaMatMul, MatMul};
 use oxide_kernels::rmsnorm::{CpuRMSNorm, CudaRMSNorm, RMSNorm};
@@ -443,6 +444,320 @@ fn bench_flash_attention(
     }
 }
 
+fn bench_flash_vs_naive(
+    label: &str,
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) {
+    println!("=== Flash vs Naive GPU: {label} (seq={seq_len}, kv={kv_len}, h={num_heads}/{num_kv_heads}, d={head_dim}) ===");
+
+    let gpu = CudaAttention::new().unwrap();
+    let batch = 1;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let total = batch * seq_len * num_heads * head_dim;
+
+    let q: Vec<f32> = (0..batch * seq_len * num_heads * head_dim)
+        .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+        .collect();
+    let k: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 11) as f32) * 0.1 - 0.5)
+        .collect();
+    let v: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 13) as f32) * 0.1 - 0.6)
+        .collect();
+
+    let stream = gpu.gpu().stream();
+    let q_dev = oxide_kernels::gpu::to_device(&stream, &q).unwrap();
+    let k_dev = oxide_kernels::gpu::to_device(&stream, &k).unwrap();
+    let v_dev = oxide_kernels::gpu::to_device(&stream, &v).unwrap();
+
+    let iters = 20;
+    let warmup = 5;
+
+    // Benchmark naive GPU
+    let mut out_naive = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+    for _ in 0..warmup {
+        gpu.forward_device_naive(
+            &q_dev, &k_dev, &v_dev, &mut out_naive, batch, seq_len, kv_len,
+            num_heads, num_kv_heads, head_dim, scale,
+        ).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        gpu.forward_device_naive(
+            &q_dev, &k_dev, &v_dev, &mut out_naive, batch, seq_len, kv_len,
+            num_heads, num_kv_heads, head_dim, scale,
+        ).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let naive_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+    // Benchmark flash GPU
+    let mut out_flash = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+    for _ in 0..warmup {
+        gpu.forward_device(
+            &q_dev, &k_dev, &v_dev, &mut out_flash, batch, seq_len, kv_len,
+            num_heads, num_kv_heads, head_dim, scale,
+        ).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let t1 = Instant::now();
+    for _ in 0..iters {
+        gpu.forward_device(
+            &q_dev, &k_dev, &v_dev, &mut out_flash, batch, seq_len, kv_len,
+            num_heads, num_kv_heads, head_dim, scale,
+        ).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let flash_us = t1.elapsed().as_micros() as f64 / iters as f64;
+
+    // Compare outputs
+    let out_n = oxide_kernels::gpu::to_host(&stream, &out_naive).unwrap();
+    let out_f = oxide_kernels::gpu::to_host(&stream, &out_flash).unwrap();
+    let max_diff: f32 = out_n.iter().zip(&out_f).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+
+    let speedup = if flash_us > 0.0 { naive_us / flash_us } else { 0.0 };
+    println!("  Naive GPU:  {naive_us:.1}µs");
+    println!("  Flash GPU:  {flash_us:.1}µs");
+    println!("  Speedup:    {speedup:.2}x");
+    println!("  Max diff (flash vs naive): {max_diff:.8}");
+    println!();
+}
+
+fn bench_decode_splitk(
+    label: &str,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) {
+    println!("=== Decode Split-K: {label} (kv={kv_len}, h={num_heads}/{num_kv_heads}, d={head_dim}) ===");
+
+    let cpu = CpuAttention;
+    let gpu = CudaAttention::new().unwrap();
+    let batch = 1;
+    let seq_len = 1;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let total = batch * seq_len * num_heads * head_dim;
+
+    let q: Vec<f32> = (0..total)
+        .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+        .collect();
+    let k: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 11) as f32) * 0.1 - 0.5)
+        .collect();
+    let v: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 13) as f32) * 0.1 - 0.6)
+        .collect();
+
+    // CPU reference
+    let mut out_cpu = vec![0.0f32; total];
+    cpu.forward(&q, &k, &v, &mut out_cpu, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
+
+    // GPU decode (split-K, dispatched automatically for seq_len=1)
+    let stream = gpu.gpu().stream();
+    let q_dev = oxide_kernels::gpu::to_device(&stream, &q).unwrap();
+    let k_dev = oxide_kernels::gpu::to_device(&stream, &k).unwrap();
+    let v_dev = oxide_kernels::gpu::to_device(&stream, &v).unwrap();
+
+    let iters = 20;
+    let warmup = 5;
+
+    let mut out_dev = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+    for _ in 0..warmup {
+        gpu.forward_device(&q_dev, &k_dev, &v_dev, &mut out_dev, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        gpu.forward_device(&q_dev, &k_dev, &v_dev, &mut out_dev, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let decode_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+    // Compare vs CPU
+    let out_gpu = oxide_kernels::gpu::to_host(&stream, &out_dev).unwrap();
+    let max_diff: f32 = out_cpu.iter().zip(&out_gpu).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+
+    // Also time the naive path for comparison
+    let mut out_naive = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+    for _ in 0..warmup {
+        gpu.forward_device_naive(&q_dev, &k_dev, &v_dev, &mut out_naive, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let t1 = Instant::now();
+    for _ in 0..iters {
+        gpu.forward_device_naive(&q_dev, &k_dev, &v_dev, &mut out_naive, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let naive_us = t1.elapsed().as_micros() as f64 / iters as f64;
+
+    let speedup_vs_naive = if decode_us > 0.0 { naive_us / decode_us } else { 0.0 };
+
+    println!("  Decode split-K: {decode_us:.1}µs");
+    println!("  Naive GPU:      {naive_us:.1}µs");
+    println!("  Speedup vs naive: {speedup_vs_naive:.1}x");
+    println!("  Max diff vs CPU:  {max_diff:.8}");
+    if max_diff < 0.01 {
+        println!("  PASS\n");
+    } else {
+        println!("  FAIL (diff too large)\n");
+        std::process::exit(1);
+    }
+}
+
+fn test_flash_attention_f16kv(
+    label: &str,
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    tolerance: f32,
+) {
+    println!("=== Flash F16 KV: {label} (seq={seq_len}, kv={kv_len}, h={num_heads}/{num_kv_heads}, d={head_dim}) ===");
+
+    let cpu = CpuAttention;
+    let gpu = CudaAttention::new().unwrap();
+    let batch = 1;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let q: Vec<f32> = (0..batch * seq_len * num_heads * head_dim)
+        .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+        .collect();
+    let k_f32: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 11) as f32) * 0.1 - 0.5)
+        .collect();
+    let v_f32: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 13) as f32) * 0.1 - 0.6)
+        .collect();
+
+    let mut out_cpu = vec![0.0f32; batch * seq_len * num_heads * head_dim];
+    cpu.forward(
+        &q, &k_f32, &v_f32, &mut out_cpu, batch, seq_len, kv_len, num_heads, num_kv_heads,
+        head_dim, scale,
+    )
+    .unwrap();
+
+    let k_f16: Vec<u16> = k_f32.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
+    let v_f16: Vec<u16> = v_f32.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
+
+    let stream = gpu.gpu().stream();
+    let q_dev = oxide_kernels::gpu::to_device(&stream, &q).unwrap();
+    let k_dev = oxide_kernels::gpu::to_device_u16(&stream, &k_f16).unwrap();
+    let v_dev = oxide_kernels::gpu::to_device_u16(&stream, &v_f16).unwrap();
+    let total = batch * seq_len * num_heads * head_dim;
+    let mut out_dev = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+
+    gpu.forward_device_f16kv(
+        &q_dev, &k_dev, &v_dev, &mut out_dev, batch, seq_len, kv_len, num_heads, num_kv_heads,
+        head_dim, scale,
+    )
+    .unwrap();
+
+    let out_gpu = oxide_kernels::gpu::to_host(&stream, &out_dev).unwrap();
+
+    let mut max_diff = 0.0f32;
+    let mut mismatches = 0;
+    for i in 0..out_cpu.len() {
+        let diff = (out_cpu[i] - out_gpu[i]).abs();
+        max_diff = max_diff.max(diff);
+        if diff >= tolerance {
+            if mismatches < 5 {
+                eprintln!(
+                    "  MISMATCH at [{i}]: cpu={:.6}, gpu={:.6}, diff={:.6}",
+                    out_cpu[i], out_gpu[i], diff
+                );
+            }
+            mismatches += 1;
+        }
+    }
+
+    println!("  Max abs diff: {max_diff:.8}");
+    println!("  Mismatches (>={tolerance}): {mismatches}");
+    if mismatches == 0 {
+        println!("  PASS\n");
+    } else {
+        println!("  FAIL ({mismatches}/{} elements)\n", out_cpu.len());
+        std::process::exit(1);
+    }
+}
+
+fn bench_flash_f32_vs_f16kv(
+    label: &str,
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) {
+    println!("=== Flash F32 vs F16 KV: {label} (seq={seq_len}, kv={kv_len}, h={num_heads}/{num_kv_heads}, d={head_dim}) ===");
+
+    let gpu = CudaAttention::new().unwrap();
+    let batch = 1;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let total = batch * seq_len * num_heads * head_dim;
+
+    let q: Vec<f32> = (0..batch * seq_len * num_heads * head_dim)
+        .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+        .collect();
+    let k_f32: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 11) as f32) * 0.1 - 0.5)
+        .collect();
+    let v_f32: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 13) as f32) * 0.1 - 0.6)
+        .collect();
+
+    let k_f16: Vec<u16> = k_f32.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
+    let v_f16: Vec<u16> = v_f32.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
+
+    let stream = gpu.gpu().stream();
+    let q_dev = oxide_kernels::gpu::to_device(&stream, &q).unwrap();
+    let k_dev_f32 = oxide_kernels::gpu::to_device(&stream, &k_f32).unwrap();
+    let v_dev_f32 = oxide_kernels::gpu::to_device(&stream, &v_f32).unwrap();
+    let k_dev_f16 = oxide_kernels::gpu::to_device_u16(&stream, &k_f16).unwrap();
+    let v_dev_f16 = oxide_kernels::gpu::to_device_u16(&stream, &v_f16).unwrap();
+
+    let iters = 20;
+    let warmup = 5;
+
+    // Benchmark flash f32
+    let mut out_f32 = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+    for _ in 0..warmup {
+        gpu.forward_device(&q_dev, &k_dev_f32, &v_dev_f32, &mut out_f32, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        gpu.forward_device(&q_dev, &k_dev_f32, &v_dev_f32, &mut out_f32, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let f32_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+    // Benchmark flash f16kv
+    let mut out_f16 = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+    for _ in 0..warmup {
+        gpu.forward_device_f16kv(&q_dev, &k_dev_f16, &v_dev_f16, &mut out_f16, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let t1 = Instant::now();
+    for _ in 0..iters {
+        gpu.forward_device_f16kv(&q_dev, &k_dev_f16, &v_dev_f16, &mut out_f16, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
+    }
+    stream.synchronize().unwrap();
+    let f16_us = t1.elapsed().as_micros() as f64 / iters as f64;
+
+    let speedup = if f16_us > 0.0 { f32_us / f16_us } else { 0.0 };
+    println!("  Flash F32:   {f32_us:.1}µs");
+    println!("  Flash F16KV: {f16_us:.1}µs");
+    println!("  Speedup:     {speedup:.2}x");
+    println!();
+}
+
 fn main() {
     println!("╔══════════════════════════════════════════════════════╗");
     println!("║  oxide-serve GPU Validation Suite (RTX 5090)        ║");
@@ -502,9 +817,44 @@ fn main() {
     test_flash_attention("multi-tile KV", 32, 256, 4, 2, 128, 0.05);
     test_flash_attention("long context", 128, 512, 8, 4, 128, 0.05);
 
-    // Benchmark at larger scale
+    // Benchmark: flash vs CPU
     bench_flash_attention("LLaMA-7B decode", 1, 2048, 32, 8, 128);
     bench_flash_attention("LLaMA-7B prefill-128", 128, 128, 32, 8, 128);
+
+    // Benchmark: flash vs naive GPU (the real comparison)
+    bench_flash_vs_naive("decode s=1 kv=256", 1, 256, 32, 8, 128);
+    bench_flash_vs_naive("decode s=1 kv=2048", 1, 2048, 32, 8, 128);
+    bench_flash_vs_naive("decode s=1 kv=4096", 1, 4096, 32, 8, 128);
+    bench_flash_vs_naive("decode s=1 kv=8192", 1, 8192, 32, 8, 128);
+    bench_flash_vs_naive("prefill s=128 kv=128", 128, 128, 32, 8, 128);
+    bench_flash_vs_naive("prefill s=256 kv=256", 256, 256, 32, 8, 128);
+    bench_flash_vs_naive("prefill s=512 kv=512", 512, 512, 32, 8, 128);
+    bench_flash_vs_naive("prefill s=1024 kv=1024", 1024, 1024, 32, 8, 128);
+    bench_flash_vs_naive("prefill s=2048 kv=2048", 2048, 2048, 32, 8, 128);
+    bench_flash_vs_naive("prefill s=4096 kv=4096", 4096, 4096, 32, 8, 128);
+
+    // --- Decode split-K vs prefill-as-decode benchmark ---
+    bench_decode_splitk("decode kv=64", 64, 32, 8, 128);
+    bench_decode_splitk("decode kv=256", 256, 32, 8, 128);
+    bench_decode_splitk("decode kv=1024", 1024, 32, 8, 128);
+    bench_decode_splitk("decode kv=2048", 2048, 32, 8, 128);
+    bench_decode_splitk("decode kv=4096", 4096, 32, 8, 128);
+    bench_decode_splitk("decode kv=8192", 8192, 32, 8, 128);
+
+    // --- Flash Attention F16 KV correctness ---
+    test_flash_attention_f16kv("MHA small f16kv", 4, 4, 4, 4, 128, 0.05);
+    test_flash_attention_f16kv("GQA f16kv", 4, 16, 8, 2, 128, 0.05);
+    test_flash_attention_f16kv("causal prefill f16kv", 64, 64, 1, 1, 128, 0.05);
+    test_flash_attention_f16kv("decode f16kv", 1, 256, 8, 4, 128, 0.05);
+
+    // --- Flash F32 vs F16 KV bandwidth benchmark ---
+    bench_flash_f32_vs_f16kv("prefill s=128", 128, 128, 32, 8, 128);
+    bench_flash_f32_vs_f16kv("prefill s=256", 256, 256, 32, 8, 128);
+    bench_flash_f32_vs_f16kv("prefill s=512", 512, 512, 32, 8, 128);
+    bench_flash_f32_vs_f16kv("prefill s=1024", 1024, 1024, 32, 8, 128);
+    bench_flash_f32_vs_f16kv("prefill s=2048", 2048, 2048, 32, 8, 128);
+    bench_flash_f32_vs_f16kv("prefill s=4096", 4096, 4096, 32, 8, 128);
+    bench_flash_f32_vs_f16kv("decode s=1 kv=2048", 1, 2048, 32, 8, 128);
 
     println!("All GPU tests passed.");
 }

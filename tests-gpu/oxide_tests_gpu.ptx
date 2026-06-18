@@ -6,14 +6,60 @@
 .target sm_120a
 .address_size 64
 
+	// .globl	test_mma_raw            // -- Begin function test_mma_raw
+                                        // @test_mma_raw
+.visible .entry test_mma_raw(
+	.param .u64 .ptr .align 1 test_mma_raw_param_0,
+	.param .u64 test_mma_raw_param_1
+)
+{
+	.reg .pred 	%p<3>;
+	.reg .b32 	%r<15>;
+	.reg .b64 	%rd<6>;
+
+// %bb.0:                               // %entry
+	ld.param.b64 	%rd3, [test_mma_raw_param_0];
+	cvta.to.global.u64 	%rd1, %rd3;
+	mov.u32 	%r1, %tid.x;
+	cvt.u64.u32 	%rd4, %r1;
+	mov.u32 	%r2, %ctaid.x;
+	mov.u32 	%r3, %ntid.x;
+	mul.wide.u32 	%rd5, %r2, %r3;
+	add.s64 	%rd2, %rd5, %rd4;
+	setp.gt.u64 	%p1, %rd2, 31;
+	@%p1 bra 	$L__BB0_3;
+// %bb.1:                               // %bb3
+	mov.b32 	%r8, 1006648320;
+	mov.b32 	%r9, 0;
+	// begin inline asm
+	mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%r4,%r5,%r6,%r7}, {%r8,%r8,%r8,%r8}, {%r8,%r8}, {%r9,%r9,%r9,%r9};
+	// end inline asm
+	mov.b32 	%r14, 1073758208;
+	// begin inline asm
+	{{ .reg .b32 %ra<4>, %rb<2>; mov.b32 %ra0, %r8; mov.b32 %ra1, %r8; mov.b32 %ra2, %r14; mov.b32 %ra3, %r14; mov.b32 %rb0, %r8; mov.b32 %rb1, %r8; mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%r10,%r11,%r12,%r13}, {%ra0,%ra1,%ra2,%ra3}, {%rb0,%rb1}, {%r9,%r9,%r9,%r9}; }}
+	// end inline asm
+	setp.ne.b64 	%p2, %rd2, 0;
+	@%p2 bra 	$L__BB0_3;
+// %bb.2:                               // %bb6
+	st.global.b32 	[%rd1], %r4;
+	st.global.b32 	[%rd1+4], %r5;
+	st.global.b32 	[%rd1+8], %r6;
+	st.global.b32 	[%rd1+12], %r7;
+	st.global.b32 	[%rd1+16], %r10;
+	st.global.b32 	[%rd1+20], %r11;
+	st.global.b32 	[%rd1+24], %r12;
+	st.global.b32 	[%rd1+28], %r13;
+$L__BB0_3:                              // %bb8
+	ret;
+                                        // -- End function
+}
 	// .globl	test_four_outputs       // -- Begin function test_four_outputs
-                                        // @test_four_outputs
 .visible .entry test_four_outputs(
 	.param .u64 .ptr .align 1 test_four_outputs_param_0,
 	.param .u64 test_four_outputs_param_1,
 	.param .u64 .ptr .align 1 test_four_outputs_param_2,
 	.param .u64 test_four_outputs_param_3
-)
+)                                       // @test_four_outputs
 {
 	.reg .pred 	%p<2>;
 	.reg .b32 	%r<12>;
@@ -31,7 +77,7 @@
 	mul.wide.u32 	%rd6, %r2, %r3;
 	or.b64 	%rd7, %rd6, %rd5;
 	setp.ne.b64 	%p1, %rd7, 0;
-	@%p1 bra 	$L__BB0_2;
+	@%p1 bra 	$L__BB1_2;
 // %bb.1:                               // %bb3
 	ld.global.b32 	%r11, [%rd1+12];
 	ld.global.b32 	%r10, [%rd1+8];
@@ -44,7 +90,7 @@
 	st.global.b32 	[%rd2+4], %r5;
 	st.global.b32 	[%rd2+8], %r6;
 	st.global.b32 	[%rd2+12], %r7;
-$L__BB0_2:                              // %bb9
+$L__BB1_2:                              // %bb9
 	ret;
                                         // -- End function
 }
@@ -77,7 +123,7 @@ $L__BB0_2:                              // %bb9
 	mul.wide.u32 	%rd12, %r2, %r3;
 	add.s64 	%rd4, %rd12, %rd11;
 	setp.ge.u64 	%p1, %rd4, %rd8;
-	@%p1 bra 	$L__BB1_3;
+	@%p1 bra 	$L__BB2_3;
 // %bb.1:                               // %bb4
 	ld.param.b64 	%rd6, [test_pack_f16x2_param_5];
 	shl.b64 	%rd13, %rd4, 2;
@@ -89,57 +135,11 @@ $L__BB0_2:                              // %bb9
 	cvt.rn.f16x2.f32 %r4, %r6, %r5;
 	// end inline asm
 	setp.ge.u64 	%p2, %rd4, %rd6;
-	@%p2 bra 	$L__BB1_3;
+	@%p2 bra 	$L__BB2_3;
 // %bb.2:                               // %bb7
 	add.s64 	%rd5, %rd3, %rd13;
 	st.global.b32 	[%rd5], %r4;
-$L__BB1_3:                              // %bb9
-	ret;
-                                        // -- End function
-}
-	// .globl	test_mma_raw            // -- Begin function test_mma_raw
-.visible .entry test_mma_raw(
-	.param .u64 .ptr .align 1 test_mma_raw_param_0,
-	.param .u64 test_mma_raw_param_1
-)                                       // @test_mma_raw
-{
-	.reg .pred 	%p<3>;
-	.reg .b32 	%r<15>;
-	.reg .b64 	%rd<6>;
-
-// %bb.0:                               // %entry
-	ld.param.b64 	%rd3, [test_mma_raw_param_0];
-	cvta.to.global.u64 	%rd1, %rd3;
-	mov.u32 	%r1, %tid.x;
-	cvt.u64.u32 	%rd4, %r1;
-	mov.u32 	%r2, %ctaid.x;
-	mov.u32 	%r3, %ntid.x;
-	mul.wide.u32 	%rd5, %r2, %r3;
-	add.s64 	%rd2, %rd5, %rd4;
-	setp.gt.u64 	%p1, %rd2, 31;
-	@%p1 bra 	$L__BB2_3;
-// %bb.1:                               // %bb3
-	mov.b32 	%r8, 1006648320;
-	mov.b32 	%r9, 0;
-	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%r4,%r5,%r6,%r7}, {%r8,%r8,%r8,%r8}, {%r8,%r8}, {%r9,%r9,%r9,%r9};
-	// end inline asm
-	mov.b32 	%r14, 1073758208;
-	// begin inline asm
-	{{ .reg .b32 %ra<4>, %rb<2>; mov.b32 %ra0, %r8; mov.b32 %ra1, %r8; mov.b32 %ra2, %r14; mov.b32 %ra3, %r14; mov.b32 %rb0, %r8; mov.b32 %rb1, %r8; mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%r10,%r11,%r12,%r13}, {%ra0,%ra1,%ra2,%ra3}, {%rb0,%rb1}, {%r9,%r9,%r9,%r9}; }}
-	// end inline asm
-	setp.ne.b64 	%p2, %rd2, 0;
-	@%p2 bra 	$L__BB2_3;
-// %bb.2:                               // %bb6
-	st.global.b32 	[%rd1], %r4;
-	st.global.b32 	[%rd1+4], %r5;
-	st.global.b32 	[%rd1+8], %r6;
-	st.global.b32 	[%rd1+12], %r7;
-	st.global.b32 	[%rd1+16], %r10;
-	st.global.b32 	[%rd1+20], %r11;
-	st.global.b32 	[%rd1+24], %r12;
-	st.global.b32 	[%rd1+28], %r13;
-$L__BB2_3:                              // %bb8
+$L__BB2_3:                              // %bb9
 	ret;
                                         // -- End function
 }
