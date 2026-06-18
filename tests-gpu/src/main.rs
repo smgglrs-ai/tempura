@@ -1,3 +1,5 @@
+mod test_pack;
+
 use oxide_kernels::attention::{Attention, CpuAttention, CudaAttention};
 use oxide_kernels::matmul::{CpuMatMul, CudaMatMul, MatMul};
 use oxide_kernels::rmsnorm::{CpuRMSNorm, CudaRMSNorm, RMSNorm};
@@ -340,7 +342,243 @@ fn main() {
     // --- Slice columns (fused projection support) ---
     test_slice_columns();
 
+    // --- Pack f16x2 diagnostic ---
+    test_pack::run_pack_test();
+    test_pack::run_four_output_test();
+    test_pack::run_mma_raw_test();
+
+    // --- MMA GEMM (tensor core) ---
+    test_matmul_mma_bt_identity();
+    test_mma_single_tile();
+
     println!("All GPU tests passed.");
+}
+
+fn test_matmul_mma_bt_identity() {
+    println!("=== MatMul MMA BT: identity test (16×16 × 16×16) ===");
+
+    // A = I_16 (16×16 identity), B = I_16 (16×16 identity, B-transposed)
+    // C = A × B^T = I_16 × I_16 = I_16 → C[i,j] = 1 if i==j else 0
+    let m = 16usize;
+    let n = 16;
+    let k = 16;
+
+    let mut a = vec![0.0f32; m * k];
+    let mut b = vec![0.0f32; n * k];
+    let mut i = 0;
+    while i < 16 {
+        a[i * k + i] = 1.0;
+        b[i * k + i] = 1.0;
+        i += 1;
+    }
+
+    let cpu = CpuMatMul;
+    let mut out_cpu = vec![0.0f32; m * n];
+    cpu.forward_b_transposed(&a, &b, &mut out_cpu, m, n, k).unwrap();
+
+    let gpu_ctx = oxide_kernels::gpu::GpuContext::new(0).unwrap();
+    let ctx = gpu_ctx.context().clone();
+    let stream = ctx.default_stream();
+    let a_dev = oxide_kernels::gpu::to_device(&stream, &a).unwrap();
+    let b_dev = oxide_kernels::gpu::to_device(&stream, &b).unwrap();
+    let mut c_dev = oxide_kernels::gpu::alloc_device(&stream, m * n).unwrap();
+
+    let mma_module = oxide_kernels::gpu::matmul_mma_kernel::kernels::load(&ctx).unwrap();
+    let config = cuda_core::LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(32), (m as u32).div_ceil(32), 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    mma_module
+        .sgemm_mma_32x32(&stream, config, m as u32, n as u32, k as u32, &a_dev, &b_dev, &mut c_dev)
+        .unwrap();
+
+    let out_gpu = oxide_kernels::gpu::to_host(&stream, &c_dev).unwrap();
+
+    println!("  CPU[0..8]:  {:?}", &out_cpu[0..8]);
+    println!("  GPU[0..8]:  {:?}", &out_gpu[0..8]);
+    println!("  CPU[16..24]: {:?}", &out_cpu[16..24]);
+    println!("  GPU[16..24]: {:?}", &out_gpu[16..24]);
+
+    let mut max_diff = 0.0f32;
+    let mut mismatches = 0;
+    let mut i = 0;
+    while i < m * n {
+        let diff = (out_cpu[i] - out_gpu[i]).abs();
+        max_diff = max_diff.max(diff);
+        if diff >= 1e-3 {
+            mismatches += 1;
+        }
+        i += 1;
+    }
+
+    println!("  Max abs diff: {max_diff:.8}");
+    println!("  Mismatches (>=1e-3): {mismatches}");
+    if mismatches == 0 {
+        println!("  PASS\n");
+    } else {
+        println!("  FAIL ({mismatches}/{} elements)\n", m * n);
+        std::process::exit(1);
+    }
+}
+
+fn test_mma_single_tile() {
+    println!("=== MMA single-tile diagnostic (m=16, n=8, k=16) ===");
+
+    let m = 16usize;
+    let n = 8usize;
+    let k = 16usize;
+
+    let mut a = vec![0.0f32; m * k];
+    for i in 0..16 {
+        a[i * k + i] = 1.0;
+    }
+
+    let mut b = vec![0.0f32; n * k];
+    for i in 0..8 {
+        b[i * k + i] = 1.0;
+    }
+
+    let cpu = CpuMatMul;
+    let mut out_cpu = vec![0.0f32; m * n];
+    cpu.forward_b_transposed(&a, &b, &mut out_cpu, m, n, k).unwrap();
+
+    let gpu_ctx = oxide_kernels::gpu::GpuContext::new(0).unwrap();
+    let ctx = gpu_ctx.context().clone();
+    let stream = ctx.default_stream();
+    let a_dev = oxide_kernels::gpu::to_device(&stream, &a).unwrap();
+    let b_dev = oxide_kernels::gpu::to_device(&stream, &b).unwrap();
+    let mut c_dev = oxide_kernels::gpu::alloc_device(&stream, m * n).unwrap();
+
+    let mma_module = oxide_kernels::gpu::matmul_mma_kernel::kernels::load(&ctx).unwrap();
+    let config = cuda_core::LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(32), (m as u32).div_ceil(32), 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    mma_module
+        .sgemm_mma_32x32(&stream, config, m as u32, n as u32, k as u32, &a_dev, &b_dev, &mut c_dev)
+        .unwrap();
+
+    let out_gpu = oxide_kernels::gpu::to_host(&stream, &c_dev).unwrap();
+
+    println!("  Expected: identity top-left 8x8, zeros elsewhere");
+    println!("  Row-by-row comparison (CPU | GPU):");
+    for row in 0..m {
+        let cpu_row: Vec<String> = (0..n).map(|c| format!("{:5.2}", out_cpu[row * n + c])).collect();
+        let gpu_row: Vec<String> = (0..n).map(|c| format!("{:5.2}", out_gpu[row * n + c])).collect();
+        let marker = if cpu_row != gpu_row { " <-- DIFF" } else { "" };
+        println!("    r{row:02}: CPU=[{}]  GPU=[{}]{marker}", cpu_row.join(", "), gpu_row.join(", "));
+    }
+
+    let mut max_diff = 0.0f32;
+    let mut mismatches = 0;
+    for i in 0..m * n {
+        let diff = (out_cpu[i] - out_gpu[i]).abs();
+        max_diff = max_diff.max(diff);
+        if diff >= 1e-3 {
+            mismatches += 1;
+        }
+    }
+
+    println!("  Max abs diff: {max_diff:.8}");
+    println!("  Mismatches (>=1e-3): {mismatches}");
+
+    println!("\n  --- Simple ramp test (A[r,c]=r, B[r,c]=c) ---");
+    let a2: Vec<f32> = (0..m * k).map(|i| (i / k) as f32).collect();
+    let b2: Vec<f32> = (0..n * k).map(|i| (i % k) as f32).collect();
+
+    let mut out_cpu2 = vec![0.0f32; m * n];
+    cpu.forward_b_transposed(&a2, &b2, &mut out_cpu2, m, n, k).unwrap();
+
+    let a2_dev = oxide_kernels::gpu::to_device(&stream, &a2).unwrap();
+    let b2_dev = oxide_kernels::gpu::to_device(&stream, &b2).unwrap();
+    let mut c2_dev = oxide_kernels::gpu::alloc_device(&stream, m * n).unwrap();
+    mma_module
+        .sgemm_mma_32x32(&stream, config, m as u32, n as u32, k as u32, &a2_dev, &b2_dev, &mut c2_dev)
+        .unwrap();
+    let out_gpu2 = oxide_kernels::gpu::to_host(&stream, &c2_dev).unwrap();
+
+    println!("  Row-by-row (first 4 cols):");
+    let mut row = 0usize;
+    while row < m {
+        println!(
+            "    r{row:02}: CPU=[{:.0}, {:.0}, {:.0}, {:.0}] GPU=[{:.0}, {:.0}, {:.0}, {:.0}]",
+            out_cpu2[row * n], out_cpu2[row * n + 1], out_cpu2[row * n + 2], out_cpu2[row * n + 3],
+            out_gpu2[row * n], out_gpu2[row * n + 1], out_gpu2[row * n + 2], out_gpu2[row * n + 3],
+        );
+        row += 1;
+    }
+    let mut max_diff2 = 0.0f32;
+    for i in 0..m * n {
+        max_diff2 = max_diff2.max((out_cpu2[i] - out_gpu2[i]).abs());
+    }
+    println!("  Max abs diff: {max_diff2:.8}");
+
+    if mismatches == 0 && max_diff2 < 1e-2 {
+        println!("  PASS\n");
+    } else {
+        println!("  FAIL (identity mismatches={mismatches}, sequential max_diff={max_diff2:.6})\n");
+    }
+}
+
+fn test_matmul_mma_bt(m: usize, n: usize, k: usize) {
+    println!("=== MatMul MMA BT: ({m}×{k} × {n}×{k}) ===");
+
+    let cpu = CpuMatMul;
+
+    let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32) * 0.1 - 0.8).collect();
+    let b: Vec<f32> = (0..n * k).map(|i| ((i % 13) as f32) * 0.1 - 0.6).collect();
+
+    let mut out_cpu = vec![0.0f32; m * n];
+    cpu.forward_b_transposed(&a, &b, &mut out_cpu, m, n, k).unwrap();
+
+    let gpu_ctx = oxide_kernels::gpu::GpuContext::new(0).unwrap();
+    let ctx = gpu_ctx.context().clone();
+    let stream = ctx.default_stream();
+
+    let a_dev = oxide_kernels::gpu::to_device(&stream, &a).unwrap();
+    let b_dev = oxide_kernels::gpu::to_device(&stream, &b).unwrap();
+    let mut c_dev = oxide_kernels::gpu::alloc_device(&stream, m * n).unwrap();
+
+    let mma_module = oxide_kernels::gpu::matmul_mma_kernel::kernels::load(&ctx).unwrap();
+    let block = 32u32;
+    let config = cuda_core::LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(block), (m as u32).div_ceil(block), 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    mma_module
+        .sgemm_mma_32x32(&stream, config, m as u32, n as u32, k as u32, &a_dev, &b_dev, &mut c_dev)
+        .unwrap();
+
+    let out_gpu = oxide_kernels::gpu::to_host(&stream, &c_dev).unwrap();
+
+    let mut max_diff = 0.0f32;
+    let mut mismatches = 0;
+    for i in 0..m * n {
+        let diff = (out_cpu[i] - out_gpu[i]).abs();
+        max_diff = max_diff.max(diff);
+        if diff >= 1e-2 {
+            if mismatches < 5 {
+                eprintln!(
+                    "  MISMATCH at [{i}]: cpu={:.6}, gpu={:.6}, diff={:.6}",
+                    out_cpu[i], out_gpu[i], diff
+                );
+            }
+            mismatches += 1;
+        }
+    }
+
+    println!("  Max abs diff: {max_diff:.8}");
+    println!("  Mismatches (>=1e-2): {mismatches}");
+
+    if mismatches == 0 {
+        println!("  PASS\n");
+    } else {
+        println!("  FAIL ({mismatches}/{} elements)\n", m * n);
+        std::process::exit(1);
+    }
 }
 
 fn test_slice_columns() {
