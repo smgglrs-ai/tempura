@@ -303,6 +303,146 @@ fn test_attention_timed(
     if max_diff < 1e-3 { println!("  PASS\n"); } else { println!("  FAIL\n"); std::process::exit(1); }
 }
 
+fn test_flash_attention(
+    label: &str,
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    tolerance: f32,
+) {
+    println!("=== Flash Attention: {label} (seq={seq_len}, kv={kv_len}, h={num_heads}/{num_kv_heads}, d={head_dim}) ===");
+
+    let cpu = CpuAttention;
+    let gpu = CudaAttention::new().unwrap();
+    let batch = 1;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let q: Vec<f32> = (0..batch * seq_len * num_heads * head_dim)
+        .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+        .collect();
+    let k: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 11) as f32) * 0.1 - 0.5)
+        .collect();
+    let v: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 13) as f32) * 0.1 - 0.6)
+        .collect();
+
+    let mut out_cpu = vec![0.0f32; batch * seq_len * num_heads * head_dim];
+    cpu.forward(
+        &q, &k, &v, &mut out_cpu, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim,
+        scale,
+    )
+    .unwrap();
+
+    let mut out_gpu = vec![0.0f32; batch * seq_len * num_heads * head_dim];
+    gpu.forward(
+        &q, &k, &v, &mut out_gpu, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim,
+        scale,
+    )
+    .unwrap();
+
+    let mut max_diff = 0.0f32;
+    let mut mismatches = 0;
+    for i in 0..out_cpu.len() {
+        let diff = (out_cpu[i] - out_gpu[i]).abs();
+        max_diff = max_diff.max(diff);
+        if diff >= tolerance {
+            if mismatches < 5 {
+                eprintln!(
+                    "  MISMATCH at [{i}]: cpu={:.6}, gpu={:.6}, diff={:.6}",
+                    out_cpu[i], out_gpu[i], diff
+                );
+            }
+            mismatches += 1;
+        }
+    }
+
+    println!("  Max abs diff: {max_diff:.8}");
+    println!("  Mismatches (>={tolerance}): {mismatches}");
+
+    if mismatches == 0 {
+        println!("  PASS\n");
+    } else {
+        println!(
+            "  FAIL ({mismatches}/{} elements)\n",
+            out_cpu.len()
+        );
+        std::process::exit(1);
+    }
+}
+
+fn bench_flash_attention(
+    label: &str,
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) {
+    println!("=== Flash Attention Bench: {label} ===");
+
+    let cpu = CpuAttention;
+    let gpu = CudaAttention::new().unwrap();
+    let batch = 1;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let q: Vec<f32> = (0..batch * seq_len * num_heads * head_dim)
+        .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+        .collect();
+    let k: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 11) as f32) * 0.1 - 0.5)
+        .collect();
+    let v: Vec<f32> = (0..batch * kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 13) as f32) * 0.1 - 0.6)
+        .collect();
+
+    let mut out_cpu = vec![0.0f32; batch * seq_len * num_heads * head_dim];
+    let t0 = Instant::now();
+    cpu.forward(
+        &q, &k, &v, &mut out_cpu, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim,
+        scale,
+    )
+    .unwrap();
+    let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // Warmup
+    let mut out_gpu = vec![0.0f32; batch * seq_len * num_heads * head_dim];
+    gpu.forward(
+        &q, &k, &v, &mut out_gpu, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim,
+        scale,
+    )
+    .unwrap();
+
+    let iters = 10;
+    let mut out_gpu = vec![0.0f32; batch * seq_len * num_heads * head_dim];
+    let t1 = Instant::now();
+    for _ in 0..iters {
+        gpu.forward(
+            &q, &k, &v, &mut out_gpu, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim,
+            scale,
+        )
+        .unwrap();
+    }
+    let gpu_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+    let max_diff: f32 = out_cpu
+        .iter()
+        .zip(&out_gpu)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    let speedup = if gpu_ms > 0.0 { cpu_ms / gpu_ms } else { 0.0 };
+
+    println!("  CPU: {cpu_ms:.3}ms, GPU: {gpu_ms:.3}ms ({iters} iters avg), speedup: {speedup:.1}x");
+    println!("  Max abs diff: {max_diff:.8}");
+    if max_diff < 0.05 {
+        println!("  PASS\n");
+    } else {
+        println!("  WARN: large diff (FP16 accumulation expected)\n");
+    }
+}
+
 fn main() {
     println!("╔══════════════════════════════════════════════════════╗");
     println!("║  oxide-serve GPU Validation Suite (RTX 5090)        ║");
@@ -352,6 +492,19 @@ fn main() {
     test_matmul_mma_bt(32, 32, 16);
     test_matmul_mma_bt(64, 64, 64);
     test_matmul_mma_bt(128, 128, 128);
+
+    // --- Flash Attention (MMA tensor core) ---
+    // head_dim=128 triggers the flash kernel path
+    test_flash_attention("MHA small", 4, 4, 4, 4, 128, 0.05);
+    test_flash_attention("GQA small", 4, 16, 8, 2, 128, 0.05);
+    test_flash_attention("causal prefill", 64, 64, 1, 1, 128, 0.05);
+    test_flash_attention("decode single-token", 1, 256, 8, 4, 128, 0.05);
+    test_flash_attention("multi-tile KV", 32, 256, 4, 2, 128, 0.05);
+    test_flash_attention("long context", 128, 512, 8, 4, 128, 0.05);
+
+    // Benchmark at larger scale
+    bench_flash_attention("LLaMA-7B decode", 1, 2048, 32, 8, 128);
+    bench_flash_attention("LLaMA-7B prefill-128", 128, 128, 32, 8, 128);
 
     println!("All GPU tests passed.");
 }

@@ -1,5 +1,6 @@
 pub mod attention_kernel;
 pub mod elementwise_kernel;
+pub mod flash_attention_kernel;
 pub mod matmul_kernel;
 pub mod matmul_mma_kernel;
 pub mod mma_sync;
