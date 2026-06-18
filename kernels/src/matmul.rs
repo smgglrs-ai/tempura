@@ -161,6 +161,7 @@ impl MatMul for CpuMatMul {
 pub struct CudaMatMul {
     gpu: crate::gpu::GpuContext,
     module: crate::gpu::matmul_kernel::kernels::LoadedModule,
+    mma_module: Option<crate::gpu::matmul_mma_kernel::kernels::LoadedModule>,
 }
 
 #[cfg(feature = "cuda")]
@@ -174,7 +175,12 @@ impl CudaMatMul {
         let gpu = crate::gpu::GpuContext::new(0)?;
         let module = crate::gpu::matmul_kernel::kernels::load(gpu.context())
             .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
-        Ok(Self { gpu, module })
+        let mma_module = crate::gpu::matmul_mma_kernel::kernels::load(gpu.context()).ok();
+        Ok(Self {
+            gpu,
+            module,
+            mma_module,
+        })
     }
 
     pub fn gpu(&self) -> &crate::gpu::GpuContext {
@@ -273,6 +279,21 @@ impl CudaMatMul {
         use cuda_core::LaunchConfig;
         crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
+
+        if let Some(ref mma) = self.mma_module {
+            let block = 32u32;
+            let grid_x = (n as u32).div_ceil(block);
+            let grid_y = (m as u32).div_ceil(block);
+            let config = LaunchConfig {
+                grid_dim: (grid_x, grid_y, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            return mma
+                .sgemm_mma_32x32(&stream, config, m as u32, n as u32, k as u32, a, b, output)
+                .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()));
+        }
+
         let module = &self.module;
         let block = 16u32;
         let grid_x = (n as u32).div_ceil(block);
