@@ -202,6 +202,68 @@ impl MatMulQ for CpuMatMulQ4K {
     }
 }
 
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q4k_dot_block_avx2(block: &[u8], a: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let d = q4k_block_d(block);
+    let dmin = q4k_block_dmin(block);
+    let packed_scales = &block[4..16];
+    let qs = &block[16..144];
+    let (sc, m) = q4k_unpack_scales(packed_scales);
+
+    let mut acc = _mm256_setzero_ps();
+
+    for j in 0..4 {
+        let d1 = d * sc[2 * j];
+        let m1 = dmin * m[2 * j];
+        let d2 = d * sc[2 * j + 1];
+        let m2 = dmin * m[2 * j + 1];
+
+        let d1_vec = _mm256_set1_ps(d1);
+        let m1_vec = _mm256_set1_ps(m1);
+        let d2_vec = _mm256_set1_ps(d2);
+        let m2_vec = _mm256_set1_ps(m2);
+
+        // Process low nibbles (elements j*64+0..j*64+31) in chunks of 8
+        for chunk in 0..4 {
+            let base = chunk * 8;
+            let q_f32 = _mm256_set_ps(
+                (qs[j*32+base+7] & 0x0F) as f32, (qs[j*32+base+6] & 0x0F) as f32,
+                (qs[j*32+base+5] & 0x0F) as f32, (qs[j*32+base+4] & 0x0F) as f32,
+                (qs[j*32+base+3] & 0x0F) as f32, (qs[j*32+base+2] & 0x0F) as f32,
+                (qs[j*32+base+1] & 0x0F) as f32, (qs[j*32+base]   & 0x0F) as f32,
+            );
+            let a_vec = _mm256_loadu_ps(a.as_ptr().add(j * 64 + base));
+            let w = _mm256_fmsub_ps(d1_vec, q_f32, m1_vec);
+            acc = _mm256_fmadd_ps(a_vec, w, acc);
+        }
+
+        // Process high nibbles (elements j*64+32..j*64+63) in chunks of 8
+        for chunk in 0..4 {
+            let base = chunk * 8;
+            let q_f32 = _mm256_set_ps(
+                (qs[j*32+base+7] >> 4) as f32, (qs[j*32+base+6] >> 4) as f32,
+                (qs[j*32+base+5] >> 4) as f32, (qs[j*32+base+4] >> 4) as f32,
+                (qs[j*32+base+3] >> 4) as f32, (qs[j*32+base+2] >> 4) as f32,
+                (qs[j*32+base+1] >> 4) as f32, (qs[j*32+base]   >> 4) as f32,
+            );
+            let a_vec = _mm256_loadu_ps(a.as_ptr().add(j * 64 + 32 + base));
+            let w = _mm256_fmsub_ps(d2_vec, q_f32, m2_vec);
+            acc = _mm256_fmadd_ps(a_vec, w, acc);
+        }
+    }
+
+    // Horizontal sum
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let sum128 = _mm_add_ps(lo, hi);
+    let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+    let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
+    _mm_cvtss_f32(sum32)
+}
+
 #[cfg(feature = "cpu")]
 pub struct CpuMatMulQ4KOpt;
 
@@ -269,22 +331,23 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         }
 
         if m == 1 {
-            // Optimized m=1 decode path: dequant block → vectorizable dot
             let a_row = &a[0..k];
-            let mut tmp = [0.0f32; Q4K_BLOCK_SIZE];
             for j in 0..n {
                 let mut sum = 0.0f32;
                 for blk in 0..blocks_per_row {
                     let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
                     let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                    q4k_dequant_block(block, &mut tmp);
                     let a_slice = &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                    // Separate loop — compiler can vectorize this with AVX
-                    let mut block_sum = 0.0f32;
-                    for idx in 0..Q4K_BLOCK_SIZE {
-                        block_sum += a_slice[idx] * tmp[idx];
+
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                            sum += unsafe { q4k_dot_block_avx2(block, a_slice) };
+                            continue;
+                        }
                     }
-                    sum += block_sum;
+
+                    sum += q4k_dot_block(block, a_slice);
                 }
                 output[j] = sum;
             }
