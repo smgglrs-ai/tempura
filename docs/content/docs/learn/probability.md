@@ -139,6 +139,31 @@ Why does this matter?
 - **Verification:** [DualPipeline](../../foundations/dual-pipeline/) compares two implementations. If sampling were truly random, you couldn't tell whether a different output was caused by a bug or by different random numbers.
 - **Debugging:** when something goes wrong, you can replay the exact inference with the same seed and investigate.
 
+## Entropy: measuring uncertainty
+
+One more concept that helps build intuition. **Entropy** measures how "spread out" a probability distribution is:
+
+$$
+H = -\sum_i p_i \log_2(p_i)
+$$
+
+- A distribution $[1.0, 0, 0]$ has entropy 0 — no uncertainty, the outcome is certain.
+- A distribution $[0.5, 0.5]$ has entropy 1 — maximum uncertainty between two options.
+- A distribution $[0.25, 0.25, 0.25, 0.25]$ has entropy 2 — maximum uncertainty among four options.
+
+Temperature controls entropy. Low temperature → low entropy → confident model. High temperature → high entropy → uncertain model.
+
+When you see a model generating repetitive or generic text, it might have low entropy (too confident). When it generates incoherent or random text, it has high entropy (too uncertain). Temperature tuning is finding the sweet spot for your task.
+
+## Check your understanding
+
+1. Compute $\text{softmax}([1, 1, 1])$. What distribution does this produce?
+2. If a model gives the correct next word probability 0.01, what is the cross-entropy loss $-\log(0.01)$?
+3. With probabilities $[0.7, 0.2, 0.1]$ and a random number $r = 0.85$, which word is selected?
+4. Why does top-p with $p = 0.9$ include fewer words when the model is confident?
+
+Answers: (1) $[1/3, 1/3, 1/3]$ — equal scores produce a uniform distribution. (2) $-\log(0.01) \approx 4.6$ — a high loss, the model was very wrong. (3) Word B — cumulative probability is $0.7, 0.9, 1.0$ and $0.85$ falls in the $[0.7, 0.9)$ range. (4) Because a confident model puts most probability mass on one word — that single word already exceeds $p = 0.9$, so no others are included.
+
 ## Summary
 
 | Concept | What it is | Why it matters |
@@ -147,5 +172,6 @@ Why does this matter?
 | Softmax | Converts scores → probabilities | The bridge from logits to decisions |
 | Temperature | Scales scores before softmax | Controls randomness vs determinism |
 | Sampling | Picking from a distribution | How the model generates each token |
+| Entropy | Measure of uncertainty | Quantifies how "confident" the model is |
 
 **Next:** [Learning](../learning/) — how a model acquires its knowledge.

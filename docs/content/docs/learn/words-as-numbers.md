@@ -104,13 +104,37 @@ Each entry in the logits vector is a dot product between the hidden state and on
 
 The circle is complete: words → token IDs → embedding vectors → transformer → hidden state → dot product with embeddings → logits → softmax → probabilities → next word.
 
+## Why subword tokenization is clever
+
+Subword tokenization is a compromise between word-level and character-level:
+
+| Approach | Vocabulary size | Handles new words? | Sequence length |
+|----------|----------------|-------------------|----------------|
+| Character-level | ~256 | Yes (any character) | Very long (many tokens per word) |
+| Word-level | ~1 million+ | No (unknown words → `[UNK]`) | Short (one token per word) |
+| Subword (BPE/SentencePiece) | 32K–128K | Yes (compose from pieces) | Medium |
+
+The algorithm (**Byte Pair Encoding** or **SentencePiece**) learns which character sequences appear most often in the training data and merges them into single tokens. Common words like "the" become single tokens; rare words like "unforgettable" are split into known pieces.
+
+This means the tokenizer has its own kind of learned knowledge — it "knows" that "un-" is a prefix, "-ing" is a suffix, and "quantum" appears often enough to be a single token.
+
+## Check your understanding
+
+1. Why does the model use subword tokens instead of whole words?
+2. If the embedding dimension is 4096 and the vocabulary is 32,000 tokens, how large is the embedding table (in number of parameters)?
+3. Why does the output projection compute a dot product between the hidden state and each token's embedding?
+4. If "king" - "man" + "woman" ≈ "queen" in embedding space, what does this suggest about how the model represents gender?
+
+Answers: (1) Whole words would require a vocabulary too large to handle, and couldn't represent novel words. Subwords can compose any word from known pieces. (2) $32{,}000 \times 4096 = 131$ million parameters. (3) The dot product measures similarity (from [Vectors](../vectors/)) — the hidden state should be most similar to the embedding of the correct next token. (4) Gender is represented as a direction in the embedding space — you can move along that direction to change gender while preserving other meaning.
+
 ## Summary
 
 | Concept | What it is | Why it matters |
 |---------|-----------|---------------|
 | Tokenization | Text → token IDs | Makes text processable as numbers |
-| Embedding table | Token ID → vector | Gives each token a learnable representation |
+| Embedding table | Token ID → vector ($V \times d$) | Gives each token a learnable representation |
+| Subword tokenization | BPE/SentencePiece — learned vocabulary | Handles any text with a fixed vocabulary |
 | Semantic similarity | Nearby vectors = similar meaning | Emergent property of training |
-| Output projection | Hidden state → vocabulary scores | Converts network output back to word probabilities |
+| Output projection | Hidden state → vocabulary scores via dot product | Converts network output back to word probabilities |
 
 **Next:** [The Transformer](../the-transformer/) — the architecture that puts it all together.

@@ -139,6 +139,40 @@ $$
 
 Key property: $e^x$ is always positive, and it grows very fast for positive $x$. This makes it useful for converting arbitrary numbers into positive values — which is exactly what [softmax](../probability/) needs to create probability distributions.
 
+## Why does non-linearity enable complexity?
+
+This deserves a concrete example. Suppose you want a network to classify points in 2D space — inside a circle (yes) or outside (no). The decision boundary is a circle: $x^2 + y^2 < r^2$.
+
+A single linear layer can only learn a straight line as a decision boundary. No straight line can separate the inside of a circle from the outside.
+
+But two layers with a non-linear activation *can*:
+
+- **Layer 1** computes features like $\text{ReLU}(ax + by + c)$ — each feature detects one side of a line
+- **Layer 2** combines these features — "above line 1 AND below line 2 AND right of line 3" approximates a curved region
+
+With enough hidden dimensions, this can approximate any boundary to any desired accuracy. This is the **universal approximation theorem** — it's why neural networks with non-linear activations can represent almost any function, while networks without them cannot.
+
+## The activation landscape
+
+| Activation | Formula | Range | Used in |
+|-----------|---------|-------|---------|
+| ReLU | $\max(0, x)$ | $[0, \infty)$ | Older models, simple |
+| SiLU/Swish | $x \cdot \sigma(x)$ | $(-0.28, \infty)$ | LLaMA, Mistral, modern LLMs |
+| GELU | $x \cdot \Phi(x)$ | $(-0.17, \infty)$ | GPT-2, BERT |
+| Sigmoid | $1/(1+e^{-x})$ | $(0, 1)$ | Gates, probabilities |
+| Tanh | $(e^x - e^{-x})/(e^x + e^{-x})$ | $(-1, 1)$ | Older RNNs |
+
+tempura uses SiLU in the FFN (feed-forward network) layers, following the LLaMA architecture. The choice of activation affects training dynamics but doesn't change the fundamental structure — the non-linearity is what matters, not which specific non-linearity.
+
+## Check your understanding
+
+1. If $A$ and $B$ are two matrices, is $f(x) = A(Bx)$ linear or non-linear? Why?
+2. Compute $\text{ReLU}([3, -1, 0, -5, 2])$.
+3. What's the sigmoid of 0? What's the sigmoid of a very large positive number?
+4. Why can't you just use a really big single matrix instead of multiple layers with activations?
+
+Answers: (1) Linear — $A(Bx) = (AB)x$, equivalent to a single matrix. (2) $[3, 0, 0, 0, 2]$. (3) $\sigma(0) = 0.5$; $\sigma(\text{large}) \approx 1$. (4) A single matrix (no matter how big) can only compute linear functions — it can never learn curved decision boundaries.
+
 ## Summary
 
 | Concept | What it is | Why it matters |
@@ -147,5 +181,6 @@ Key property: $e^x$ is always positive, and it grows very fast for positive $x$.
 | Non-linear function | Everything else ($x^2$, ReLU, sigmoid, ...) | Breaks linearity — enables complex patterns |
 | Activation function | Non-linearity applied after each matrix multiply | Makes deep networks more powerful than shallow ones |
 | Sigmoid | Squashes to $(0, 1)$ | Foundation of softmax and SiLU |
+| Universal approximation | Non-linear networks can represent any function | The theoretical foundation of deep learning |
 
 **Next:** [Probability](../probability/) — how to turn numbers into decisions.

@@ -109,6 +109,31 @@ tempura does NOT do steps 2–4. It doesn't compute gradients, doesn't update we
 
 This distinction matters: inference is simpler than training (no backward pass, no gradient computation), but it still involves all the matrix multiplications, activations, and softmax computations from the previous pages. Making these fast, correct, and verifiable is tempura's purpose.
 
+## The scale of training
+
+To give you a sense of what training involves:
+
+| Aspect | Typical values (7B model) |
+|--------|--------------------------|
+| Training data | 1–2 trillion tokens of text |
+| Training steps | ~1 million gradient updates |
+| Training time | 100,000+ GPU-hours |
+| Compute cost | $1–5 million |
+| Power consumption | ~1 GWh (a small town for a month) |
+
+After training, the model's weights are saved to files. These files — typically 14 GB for a 7B model in float16 — are what tempura loads and runs.
+
+**The asymmetry:** training is enormously expensive but happens once. Inference is cheap per request but happens billions of times. A model trained for $2 million might serve 100 million users over its lifetime. This is why inference efficiency matters — and why tempura focuses on making inference fast, correct, and verifiable.
+
+## Check your understanding
+
+1. If a model assigns probability 0.5 to the correct next word, what is the cross-entropy loss?
+2. What happens if the learning rate $\eta$ is too large?
+3. Why doesn't tempura need to compute gradients?
+4. A model has 7 billion parameters. If each gradient update adjusts every parameter, how many multiplications does one training step require at minimum?
+
+Answers: (1) $-\log(0.5) \approx 0.69$. (2) The weight updates overshoot — the loss oscillates or increases instead of decreasing. (3) tempura does inference (using frozen weights), not training — no backward pass needed. (4) At least 7 billion — one per parameter — plus the forward pass computation.
+
 ## Summary
 
 | Concept | What it is | Why it matters |

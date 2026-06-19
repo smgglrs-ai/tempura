@@ -117,6 +117,27 @@ $$
 
 Normalize before each sublayer, apply the sublayer, add the residual.
 
+## What each layer "learns"
+
+A natural question: what do the intermediate hidden states *mean*? Research on this is ongoing, but some findings:
+
+**Early layers** (1–5) tend to capture surface-level features: word identity, part of speech, local syntax ("adjective before noun").
+
+**Middle layers** (6–20) capture more abstract features: semantic roles ("who did what to whom"), entity types ("Paris is a city"), basic reasoning patterns.
+
+**Late layers** (21–32) capture task-specific features: format expectations ("this looks like a list"), factual recall, and the final prediction.
+
+This is why a 32-layer model is more capable than a 4-layer model — not just because it has more parameters, but because it can represent more levels of abstraction. Each layer builds on what the previous layers extracted.
+
+## Check your understanding
+
+1. In the worked example, what would happen if the input were $x = [0, 0]$? Trace through both layers.
+2. Why does $h + \text{Layer}(h)$ help with deep networks?
+3. If a model has width 4096 and depth 32, with four $d \times d$ matrices per layer, approximately how many parameters does it have?
+4. What happens to activations in a 100-layer network without normalization?
+
+Answers: (1) $W_1 [0,0] + b_1 = [0.1, 0, -0.2]$, $\text{ReLU} = [0.1, 0, 0]$; then $W_2 [0.1, 0, 0] = [0.03, -0.05]$. (2) If the layer has nothing useful to compute, it can output near-zero and the signal passes through unchanged — information isn't destroyed. (3) $32 \times 4 \times 4096^2 \approx 2.1$ billion — close to a "2B" model. (4) They grow or shrink exponentially — even 1.01x per layer gives $1.01^{100} \approx 2.7$x growth, 0.99x gives $0.99^{100} \approx 0.37$x shrinkage.
+
 ## Summary
 
 | Concept | What it is | Why it matters |
@@ -126,5 +147,6 @@ Normalize before each sublayer, apply the sublayer, add the residual.
 | Width | Dimension of hidden states | More features per layer |
 | Depth | Number of layers | More complex transformations |
 | Residual connection | $h + \text{Layer}(h)$ | Prevents signal loss in deep networks |
+| Normalization | Constrains scale between layers | Keeps deep networks stable |
 
 **Next:** [Words as Numbers](../words-as-numbers/) — how text becomes vectors.

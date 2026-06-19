@@ -11,9 +11,9 @@ toc = true
 
 You don't need a computer science degree. You don't need to know what a neural network is. You don't even need to remember much math from school — we'll rebuild what we need as we go.
 
-This section takes you from "I've heard of AI but I don't know how it works" to "I understand what happens inside a language model when it generates text." Each page builds on the previous one, with worked examples using small numbers you can verify with a calculator or by hand.
+This section takes you from "I've heard of AI but I don't know how it works" to "I understand what happens inside a language model when it generates text, and how GPUs execute the math." Each page builds on the previous one, with worked examples using small numbers you can verify with a calculator or by hand.
 
-## The path
+## Part I: The Math
 
 | # | Topic | What you'll understand | What you need first |
 |---|-------|----------------------|-------------------|
@@ -28,12 +28,22 @@ This section takes you from "I've heard of AI but I don't know how it works" to 
 | 8 | [The Transformer](the-transformer/) | The architecture behind ChatGPT, Claude, and LLaMA | Everything above |
 | 9 | [Inference](inference/) | What happens when you use a model — and what tempura does | The transformer |
 
+## Part II: The Hardware
+
+| # | Topic | What you'll understand | What you need first |
+|---|-------|----------------------|-------------------|
+| 10 | [GPU Computing](gpu-computing/) | Why GPUs, not CPUs, run AI — and how they think differently | Part I complete |
+| 11 | [Memory Hierarchy](memory-hierarchy/) | Why memory speed matters more than compute speed | GPU Computing |
+| 12 | [Writing GPU Kernels](writing-gpu-kernels/) | Threads, blocks, shared memory — the CUDA programming model | Memory Hierarchy |
+| 13 | [cuda-oxide](cuda-oxide/) | GPU kernels in Rust — what cuda-oxide changes | Writing GPU Kernels |
+| 14 | [From Math to Metal](from-math-to-metal/) | How tempura maps attention and matmul to GPU hardware | cuda-oxide |
+
 ## How to read this
 
-**Go in order.** Each page builds on the previous one. If something doesn't make sense, go back one page — you may have missed a building block.
+**Part I** stands alone — you can stop after Chapter 9 and understand how language models work. **Part II** goes deeper into how the math runs on hardware, which is essential if you want to understand tempura's GPU kernels and formal verification of GPU code.
 
-**Do the examples.** When we compute $3 \times 1 + 4 \times 2 = 11$, do it yourself. When we show a table of numbers, trace through the calculation. Understanding comes from doing, not reading.
+**Go in order.** Each page builds on the previous one. If something doesn't make sense, go back one page.
 
-**Don't worry about remembering everything.** You can always come back. The goal is to build intuition, not memorize formulas.
+**Do the examples.** Understanding comes from computing, not reading.
 
-**Then read [Foundations](../foundations/).** Once you've completed this track, the Foundations section covers the same concepts at implementation depth — with the rigor needed to understand tempura's code and proofs.
+**Then read [Foundations](../foundations/).** The Foundations section covers the same concepts at implementation depth — with the rigor needed to understand tempura's code and proofs.
