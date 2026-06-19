@@ -11,40 +11,109 @@ math = true
 
 ## What is a harness?
 
-A Kani harness is a Rust function annotated with `#[kani::proof]` that describes the property to verify. It declares symbolic inputs (values that represent "any possible value"), calls the code under test, and asserts the property that should hold for all inputs.
+A Kani harness is a Rust function annotated with `#[kani::proof]` that describes the property to verify. It has three parts:
 
-## Anatomy of a harness
+1. **Declare** symbolic inputs — values that represent "any possible value"
+2. **Constrain** them to valid ranges with `kani::assume()`
+3. **Assert** the property that must hold for all valid inputs
 
-A typical tempura harness has three parts:
+If Kani finds any input that satisfies all assumptions but violates an assertion, it reports a counterexample. If no such input exists, the property is proven.
 
-1. **Input declaration** — `kani::any()` generates symbolic values. `kani::assume()` constrains them to valid ranges.
-2. **Operation** — call the function being verified with the symbolic inputs.
-3. **Assertion** — `assert!()` the property that must hold for all valid inputs.
+## Walkthrough: `attention_q_offset_in_bounds`
 
-## Walkthrough: attention offset safety
+This harness from [`kernels/src/attention.rs`](https://github.com/smgglrs-ai/tempura/tree/main/kernels/src/attention.rs) proves that the query offset arithmetic in the attention kernel never produces an out-of-bounds index. Let's read it line by line.
 
-<!-- TODO: Use the actual attention Kani harness from kernels/src/attention.rs.
-     Annotate each line explaining:
-     - What the symbolic inputs represent (batch, seq_len, num_heads, head_dim)
-     - What the assume() constraints mean (why these bounds)
-     - What the assert! proves (Q/KV offset never exceeds buffer length)
-     - What this means for the math (attention reads exactly the right memory)
-     Show the harness code with inline annotations. -->
+### Part 1: Declare the shape parameters
+
+```rust
+#[kani::proof]
+fn attention_q_offset_in_bounds() {
+    let batch: usize = kani::any();
+    let seq_len: usize = kani::any();
+    let num_heads: usize = kani::any();
+    let head_dim: usize = kani::any();
+```
+
+`kani::any()` creates a symbolic value — it represents *every* possible `usize` simultaneously. At this point, `batch` could be 0, 1, 1000, or $2^{64} - 1$. The SAT solver will consider all of them.
+
+### Part 2: Constrain to valid ranges
+
+```rust
+    kani::assume(batch >= 1 && batch <= 2);
+    kani::assume(seq_len >= 1 && seq_len <= 4);
+    kani::assume(num_heads >= 1 && num_heads <= 4);
+    kani::assume(head_dim >= 1 && head_dim <= 4);
+```
+
+`kani::assume()` restricts the search space. The solver only considers inputs satisfying these constraints. This means:
+
+- $\text{batch} \in \\{1, 2\\}$
+- $\text{seq\_len} \in \\{1, 2, 3, 4\\}$
+- $\text{num\_heads} \in \\{1, 2, 3, 4\\}$
+- $\text{head\_dim} \in \\{1, 2, 3, 4\\}$
+
+That's $2 \times 4 \times 4 \times 4 = 128$ shape combinations. For each, the solver will try every possible index.
+
+**Why these bounds?** They're small enough for the SAT solver to handle quickly, but large enough to exercise every code path. The offset arithmetic is linear — `((b * seq_len + s) * num_heads + h) * head_dim` — so if it's safe at 4, it's safe at 4096 (assuming no integer overflow, which is checked separately).
+
+### Part 3: Compute the buffer size
+
+```rust
+    let q_len = batch * seq_len * num_heads * head_dim;
+```
+
+This is the total size of the Q buffer. In the actual attention implementation, the caller allocates a buffer of this size. The harness needs to know the buffer size to check if offsets stay within it.
+
+### Part 4: Declare the loop indices
+
+```rust
+    let b: usize = kani::any();
+    let s: usize = kani::any();
+    let h: usize = kani::any();
+    kani::assume(b < batch);
+    kani::assume(s < seq_len);
+    kani::assume(h < num_heads);
+```
+
+Three more symbolic values representing a specific position in the iteration space: batch element `b`, sequence position `s`, head `h`. The assumptions constrain them to valid loop bounds.
+
+### Part 5: The property
+
+```rust
+    let q_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+    assert!(q_offset + head_dim <= q_len);
+}
+```
+
+This is the actual offset arithmetic from the attention kernel. The assertion states: *the offset plus the number of elements we'll read (`head_dim`) never exceeds the buffer length*.
+
+If this assertion can be violated for any combination of valid shape parameters and valid indices, Kani will find it. If it can't, the property is proven.
+
+## What this proves in plain language
+
+> For any batch size (1–2), sequence length (1–4), number of heads (1–4), and head dimension (1–4), and for any valid batch/sequence/head index within those ranges, the query offset arithmetic `((b * seq_len + s) * num_heads + h) * head_dim` produces an offset that, together with `head_dim` elements, stays within the allocated buffer.
+
+This means the attention kernel's inner loop — which reads `head_dim` consecutive f32 values starting at `q_offset` — never reads past the end of the Q buffer.
+
+## The companion harness: `attention_kv_offset_in_bounds`
+
+A second harness proves the same property for the key/value buffers, which have different dimensions (they use `kv_len` and `num_kv_heads` instead of `seq_len` and `num_heads`). The GQA head-group mapping `h * num_kv_heads / num_heads` is also covered.
 
 ## How to read a harness in a PR
 
-<!-- TODO: Practical guide for reviewers:
-     1. Read the assert! first — that's the property
-     2. Read the assume() — those are the valid input constraints
-     3. Check: does the property still hold after the code change?
-     4. Check: are the assumptions still valid? (common mistake: tightening
-        assumptions to make a proof pass, which weakens what's proven)
-     5. If the harness changed, ask: was the old property wrong, or is the
-        new code weaker? -->
+When reviewing a PR that modifies a Kani harness:
 
-## Common patterns
+1. **Read the `assert!` first.** That's the property being proven. Did it change?
+2. **Read the `kani::assume()` calls.** Those define what "valid input" means. Did the assumptions get tighter? Tighter assumptions make the proof easier to pass but weaken what it guarantees — this is the most common mistake.
+3. **Compare the offset arithmetic** to the actual kernel code. Does the harness match the implementation? If the kernel changed its indexing formula, the harness must change too — otherwise it's proving a property of code that no longer exists.
+4. **Check the bounds.** Are they large enough? If the PR introduces a new code path that only triggers at `num_heads > 4`, and the harness only covers `num_heads <= 4`, the new path is unverified.
 
-<!-- TODO: The offset-bounds pattern (attention, matmul).
-     The capacity-accounting pattern (KvCache).
-     The index-isolation pattern (batch invariant).
-     How to recognize which pattern a harness uses. -->
+## Common harness patterns in tempura
+
+**Offset-bounds pattern** (attention, matmul): declare shape parameters, constrain loop indices, compute offset, assert offset + element count ≤ buffer length.
+
+**Capacity-accounting pattern** (KvCache): declare cache capacity and operations (append, advance), assert slot count invariants (allocated ≤ capacity, released ≤ allocated).
+
+**Index-isolation pattern** (batch invariant): declare two different batch indices, compute their offsets, assert the memory ranges don't overlap.
+
+Recognizing the pattern helps you read new harnesses quickly — most tempura proofs follow one of these three.
