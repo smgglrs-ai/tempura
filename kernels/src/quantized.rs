@@ -933,6 +933,50 @@ impl PreQuantizedActivations {
 
 #[cfg(feature = "cpu")]
 impl CpuMatMulQ4KOpt {
+    /// Fused Q4K matmul: two independent matmuls with the same pre-quantized input
+    /// in a single rayon dispatch. Eliminates one sync point.
+    pub fn fused_q4k_preq_2(
+        &self,
+        preq: &PreQuantizedActivations,
+        b1: &[u8], out1: &mut [f32], n1: usize,
+        b2: &[u8], out2: &mut [f32], n2: usize,
+    ) {
+        let k = preq.k;
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let total = n1 + n2;
+
+        #[cfg(target_arch = "x86_64")]
+        let use_vnni = is_x86_feature_detected!("avxvnni");
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_vnni = false;
+
+        let chunk_size = (total / rayon::current_num_threads()).max(64);
+
+        // Conceptually: outputs 0..n1 come from b1, outputs n1..n1+n2 come from b2.
+        // Each thread processes a range spanning potentially both outputs.
+        (0..total).into_par_iter().with_min_len(chunk_size).for_each(|idx| {
+            let (b_quantized, j, out_ptr) = if idx < n1 {
+                (b1, idx, unsafe { out1.as_ptr().add(idx) as *mut f32 })
+            } else {
+                (b2, idx - n1, unsafe { out2.as_ptr().add(idx - n1) as *mut f32 })
+            };
+            let mut sum = 0.0f32;
+            for blk in 0..blocks_per_row {
+                let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                let aq_slice = &preq.q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                let a_sc = preq.scales[blk];
+                let a_gsums = &preq.group_sums_q4k[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
+                sum += if use_vnni {
+                    unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
+                } else {
+                    unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
+                };
+            }
+            unsafe { *out_ptr = sum; }
+        });
+    }
+
     pub fn forward_q4k_preq(
         &self,
         preq: &PreQuantizedActivations,

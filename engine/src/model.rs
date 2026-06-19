@@ -478,29 +478,55 @@ where
             }
         };
 
-        for layer in 0..cfg.num_layers {
-            let prefix = format!("model.layers.{layer}");
+        // Pre-compute all weight names to avoid 252 string allocations per token
+        let layer_names: Vec<_> = (0..cfg.num_layers).map(|l| {
+            let p = format!("model.layers.{l}");
+            (
+                format!("{p}.input_layernorm.weight"),
+                format!("{p}.post_attention_layernorm.weight"),
+                format!("{p}.self_attn.q_proj.weight"),
+                format!("{p}.self_attn.k_proj.weight"),
+                format!("{p}.self_attn.v_proj.weight"),
+                format!("{p}.self_attn.o_proj.weight"),
+                format!("{p}.self_attn.q_norm.weight"),
+                format!("{p}.self_attn.k_norm.weight"),
+                format!("{p}.mlp.gate_proj.weight"),
+                format!("{p}.mlp.up_proj.weight"),
+                format!("{p}.mlp.down_proj.weight"),
+            )
+        }).collect();
 
-            // RMSNorm → normed
+        for layer in 0..cfg.num_layers {
+            let (ref input_ln_name, ref post_ln_name, ref q_w_name, ref k_w_name,
+                 ref v_w_name, ref o_w_name, ref q_norm_name, ref k_norm_name,
+                 ref gate_w_name, ref up_w_name, ref down_w_name) = layer_names[layer];
+
             normed.copy_from_slice(&hidden);
-            let input_ln_w = qweights.get_f32(&format!("{prefix}.input_layernorm.weight")).unwrap();
+            let input_ln_w = qweights.get_f32(input_ln_name).unwrap();
             self.pipeline.rmsnorm(&mut normed, input_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
 
             let normed_preq = if seq_len == 1 { Some(PreQuantizedActivations::from_f32(&normed[..h])) } else { None };
 
-            let q_w_name = format!("{prefix}.self_attn.q_proj.weight");
-            let k_w_name = format!("{prefix}.self_attn.k_proj.weight");
-            let v_w_name = format!("{prefix}.self_attn.v_proj.weight");
-            let o_w_name = format!("{prefix}.self_attn.o_proj.weight");
-
             q.fill(0.0); k.fill(0.0); v.fill(0.0);
-            qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q[..seq_len * q_dim], seq_len, q_dim, h);
-            qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..seq_len * kv_dim], seq_len, kv_dim, h);
+            // Fuse Q+K into single dispatch when both are Q4K and decode (m=1)
+            if seq_len == 1 {
+                if let (Some(pq), Some(qw), Some(kw)) =
+                    (normed_preq.as_ref(), qweights.get_q4k(&q_w_name), qweights.get_q4k(&k_w_name))
+                {
+                    q4k.fused_q4k_preq_2(pq, qw, &mut q[..q_dim], q_dim, kw, &mut k[..kv_dim], kv_dim);
+                } else {
+                    qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q[..q_dim], 1, q_dim, h);
+                    qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..kv_dim], 1, kv_dim, h);
+                }
+            } else {
+                qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q[..seq_len * q_dim], seq_len, q_dim, h);
+                qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..seq_len * kv_dim], seq_len, kv_dim, h);
+            }
             qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..seq_len * kv_dim], seq_len, kv_dim, h);
 
             if cfg.use_qk_norm {
-                let q_norm_w = qweights.get_f32(&format!("{prefix}.self_attn.q_norm.weight")).unwrap();
-                let k_norm_w = qweights.get_f32(&format!("{prefix}.self_attn.k_norm.weight")).unwrap();
+                let q_norm_w = qweights.get_f32(q_norm_name).unwrap();
+                let k_norm_w = qweights.get_f32(k_norm_name).unwrap();
                 apply_head_rmsnorm(&mut q, q_norm_w, seq_len, n_heads, head_dim, cfg.layer_norm_eps);
                 apply_head_rmsnorm(&mut k, k_norm_w, seq_len, n_kv_heads, head_dim, cfg.layer_norm_eps);
             }
@@ -523,18 +549,26 @@ where
 
             // FFN block
             normed2.copy_from_slice(&hidden);
-            let post_ln_w = qweights.get_f32(&format!("{prefix}.post_attention_layernorm.weight")).unwrap();
+            let post_ln_w = qweights.get_f32(post_ln_name).unwrap();
             self.pipeline.rmsnorm(&mut normed2, post_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
 
             let normed2_preq = if seq_len == 1 { Some(PreQuantizedActivations::from_f32(&normed2[..h])) } else { None };
 
-            let gate_w_name = format!("{prefix}.mlp.gate_proj.weight");
-            let up_w_name = format!("{prefix}.mlp.up_proj.weight");
-            let down_w_name = format!("{prefix}.mlp.down_proj.weight");
-
             gate.fill(0.0); up.fill(0.0);
-            qmm(normed2_preq.as_ref(), &normed2, &gate_w_name, &mut gate[..seq_len * inter], seq_len, inter, h);
-            qmm(normed2_preq.as_ref(), &normed2, &up_w_name, &mut up[..seq_len * inter], seq_len, inter, h);
+            // Fuse gate+up into single dispatch when both are Q4K and decode
+            if seq_len == 1 {
+                if let (Some(pq), Some(gw), Some(uw)) =
+                    (normed2_preq.as_ref(), qweights.get_q4k(&gate_w_name), qweights.get_q4k(&up_w_name))
+                {
+                    q4k.fused_q4k_preq_2(pq, gw, &mut gate[..inter], inter, uw, &mut up[..inter], inter);
+                } else {
+                    qmm(normed2_preq.as_ref(), &normed2, &gate_w_name, &mut gate[..inter], 1, inter, h);
+                    qmm(normed2_preq.as_ref(), &normed2, &up_w_name, &mut up[..inter], 1, inter, h);
+                }
+            } else {
+                qmm(normed2_preq.as_ref(), &normed2, &gate_w_name, &mut gate[..seq_len * inter], seq_len, inter, h);
+                qmm(normed2_preq.as_ref(), &normed2, &up_w_name, &mut up[..seq_len * inter], seq_len, inter, h);
+            }
 
             for i in 0..seq_len * inter {
                 let silu = gate[i] / (1.0 + (-gate[i]).exp());
