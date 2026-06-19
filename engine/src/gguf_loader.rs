@@ -905,8 +905,7 @@ impl GgufLoader {
 
             let keep_raw = info.dtype == GgmlType::Q4K
                 && !mapped_name.contains("embed_tokens")
-                && !mapped_name.contains("norm.weight")
-                && mapped_name != "lm_head.weight";
+                && !mapped_name.contains("norm.weight");
 
             if !keep_raw {
                 let floats = match info.dtype {
@@ -1071,17 +1070,21 @@ impl GgufLoader {
 impl GgufLoader {
     pub fn to_quantized_weights(&self) -> crate::weights::QuantizedWeights {
         let mut q4k_tensors = HashMap::new();
+        let mut q6k_tensors = HashMap::new();
         let mut f32_tensors = HashMap::new();
 
-        for (name, _dtype) in &self.tensor_dtypes {
+        for (name, dtype) in &self.tensor_dtypes {
             if let Some(f32_data) = self.tensors.get(name) {
                 f32_tensors.insert(name.clone(), f32_data.clone());
             } else if let Some(raw) = self.raw_tensors.get(name) {
-                q4k_tensors.insert(name.clone(), raw.clone());
+                match dtype {
+                    GgmlType::Q6K => q6k_tensors.insert(name.clone(), raw.clone()),
+                    _ => q4k_tensors.insert(name.clone(), raw.clone()),
+                };
             }
         }
 
-        crate::weights::QuantizedWeights::new(q4k_tensors, f32_tensors)
+        crate::weights::QuantizedWeights::new(q4k_tensors, q6k_tensors, f32_tensors)
     }
 
     pub fn tensor_dtype(&self, name: &str) -> Option<GgmlType> {

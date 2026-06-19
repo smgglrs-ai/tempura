@@ -5,9 +5,24 @@ pub const Q4K_BLOCK_BYTES: usize = 144;
 pub const Q4K_GROUPS: usize = 8;
 pub const Q4K_GROUP_SIZE: usize = 32;
 
+pub const Q6K_BLOCK_SIZE: usize = 256;
+pub const Q6K_BLOCK_BYTES: usize = 210;
+pub const Q6K_GROUPS: usize = 16;
+pub const Q6K_GROUP_SIZE: usize = 16;
+
 #[allow(clippy::too_many_arguments)]
 pub trait MatMulQ: Send + Sync {
     fn forward_b_transposed_q4k(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()>;
+
+    fn forward_b_transposed_q6k(
         &self,
         a: &[f32],
         b_quantized: &[u8],
@@ -143,6 +158,193 @@ pub fn q4k_dot_block(block: &[u8], a: &[f32]) -> f32 {
     sum
 }
 
+pub fn q6k_dot_block(block: &[u8], a: &[f32]) -> f32 {
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let scales = &block[192..208];
+    let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+
+    let mut sum = 0.0f32;
+    for half in 0..2 {
+        let ql_off = half * 64;
+        let qh_off = half * 32;
+        let y_off = half * 128;
+
+        for l in 0..32 {
+            let is = l / 16;
+            let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+            let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+            let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+            let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+
+            let sc0 = scales[half * 8 + is] as i8 as f32;
+            let sc1 = scales[half * 8 + is + 2] as i8 as f32;
+            let sc2 = scales[half * 8 + is + 4] as i8 as f32;
+            let sc3 = scales[half * 8 + is + 6] as i8 as f32;
+
+            sum += a[y_off + l] * d * sc0 * q1 as f32;
+            sum += a[y_off + l + 32] * d * sc1 * q2 as f32;
+            sum += a[y_off + l + 64] * d * sc2 * q3 as f32;
+            sum += a[y_off + l + 96] * d * sc3 * q4 as f32;
+        }
+    }
+    sum
+}
+
+/// Integer-domain Q6_K dot product with pre-quantized Q8 activations.
+/// Q6_K values are unsigned 0-63. The -32 offset is handled via activation sum correction:
+///   sum(a_i * (d*sc*(q6_i - 32))) = d*sc*(sum(a_q_i * q6_i)*a_scale - 32*sum(a_i))
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q6k_dot_q8_avx2(
+    block: &[u8],
+    a_q8: &[i8],
+    a_scale: f32,
+    a_group_sums: &[f32],
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let scales = &block[192..208];
+    let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+
+    let mask_low = _mm256_set1_epi8(0x0F);
+    let mask_2bit = _mm256_set1_epi8(0x03);
+    let ones_16 = _mm256_set1_epi16(1);
+
+    let mut result = 0.0f32;
+
+    for half in 0..2usize {
+        let ql_off = half * 64;
+        let qh_off = half * 32;
+        let y_off = half * 128;
+
+        // Load 32 bytes of qh for this half
+        let qh_vec = _mm256_loadu_si256(qh.as_ptr().add(qh_off) as *const __m256i);
+
+        // 4 element groups per half, each producing 32 output elements
+        // Group layout within a half:
+        //   y[y_off+l]     uses ql[ql_off+l] low    + qh bits 0-1, scale is[0]
+        //   y[y_off+l+32]  uses ql[ql_off+l+32] low + qh bits 2-3, scale is[2]
+        //   y[y_off+l+64]  uses ql[ql_off+l] high   + qh bits 4-5, scale is[4]
+        //   y[y_off+l+96]  uses ql[ql_off+l+32] high+ qh bits 6-7, scale is[6]
+
+        // Load 64 bytes of ql for this half
+        let ql_a = _mm256_loadu_si256(ql.as_ptr().add(ql_off) as *const __m256i);
+        let ql_b = _mm256_loadu_si256(ql.as_ptr().add(ql_off + 32) as *const __m256i);
+
+        // Extract 6-bit values as u8
+        let q6_0 = _mm256_or_si256(
+            _mm256_and_si256(ql_a, mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(qh_vec, mask_2bit), 4),
+        );
+        let q6_1 = _mm256_or_si256(
+            _mm256_and_si256(ql_b, mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh_vec, 2), mask_2bit), 4),
+        );
+        let q6_2 = _mm256_or_si256(
+            _mm256_and_si256(_mm256_srli_epi16(ql_a, 4), mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh_vec, 4), mask_2bit), 4),
+        );
+        let q6_3 = _mm256_or_si256(
+            _mm256_and_si256(_mm256_srli_epi16(ql_b, 4), mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh_vec, 6), mask_2bit), 4),
+        );
+
+        // Load pre-quantized activations
+        let aq_0 = _mm256_loadu_si256(a_q8.as_ptr().add(y_off) as *const __m256i);
+        let aq_1 = _mm256_loadu_si256(a_q8.as_ptr().add(y_off + 32) as *const __m256i);
+        let aq_2 = _mm256_loadu_si256(a_q8.as_ptr().add(y_off + 64) as *const __m256i);
+        let aq_3 = _mm256_loadu_si256(a_q8.as_ptr().add(y_off + 96) as *const __m256i);
+
+        // Integer dot: u8 × i8 → i16 → i32
+        let p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(q6_0, aq_0), ones_16);
+        let p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(q6_1, aq_1), ones_16);
+        let p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(q6_2, aq_2), ones_16);
+        let p3 = _mm256_madd_epi16(_mm256_maddubs_epi16(q6_3, aq_3), ones_16);
+
+        let idot_0 = hsum_i32(p0);
+        let idot_1 = hsum_i32(p1);
+        let idot_2 = hsum_i32(p2);
+        let idot_3 = hsum_i32(p3);
+
+        // Scales: Q6_K has 16 scales (i8), 1 per 16 elements
+        // For the 32-element groups, each uses 2 consecutive scales
+        // Group 0 (elements y_off..y_off+31): scales[half*8 + 0] and scales[half*8 + 1]
+        // But maddubs mixed them — need to split or use averaged scale
+        // Actually, the scale repeats for l=0..15 (is=0) and l=16..31 (is=1)
+        // maddubs processes all 32 at once with one scale pattern
+        // We can split the hsum into two halves for the two sub-scales
+
+        // Simpler approach: use one average scale for the 32 elements
+        // More accurate: split 32 into 2×16 and apply different scales
+        // For now, use the full-group approach — sum the integer dot,
+        // then apply per-group scales in f32
+
+        // Per-half, we have 4 groups of 32 elements.
+        // Scale indices for half h: scales[h*8 + {0,2,4,6}] for l=0..15,
+        //                           scales[h*8 + {0,2,4,6}+1] for l=16..31
+        // But maddubs mixes l=0..15 with l=16..31 in one vector.
+        // Need to separate the low 16 and high 16 results.
+
+        // Actually, the __m256i from maddubs has:
+        //   lane 0 (128-bit): results for bytes 0..15 of the input
+        //   lane 1 (128-bit): results for bytes 16..31
+        // After madd_epi16 with ones:
+        //   lane 0: 4 i32 sums from elements 0..15
+        //   lane 1: 4 i32 sums from elements 16..31
+        // These correspond to is=0 and is=1 respectively.
+
+        let lo_0 = hsum_i32_128(_mm256_castsi256_si128(p0));
+        let hi_0 = hsum_i32_128(_mm256_extracti128_si256(p0, 1));
+        let lo_1 = hsum_i32_128(_mm256_castsi256_si128(p1));
+        let hi_1 = hsum_i32_128(_mm256_extracti128_si256(p1, 1));
+        let lo_2 = hsum_i32_128(_mm256_castsi256_si128(p2));
+        let hi_2 = hsum_i32_128(_mm256_extracti128_si256(p2, 1));
+        let lo_3 = hsum_i32_128(_mm256_castsi256_si128(p3));
+        let hi_3 = hsum_i32_128(_mm256_extracti128_si256(p3, 1));
+
+        let sc = |idx: usize| -> f32 { scales[idx] as i8 as f32 };
+
+        // q6 values are 0-63 (unsigned). The formula is d * sc * (q6 - 32).
+        // We computed sum(a_q8 * q6) via maddubs. Need to subtract 32 * sum(a_q8).
+        // sum(a * (d*sc*(q6-32))) = d*sc*(a_scale*sum(a_q8*q6) - 32*sum(a))
+
+        // Group sum indices: a_group_sums has Q6K_GROUPS=16 entries per block,
+        // 1 per 16 elements. Groups map as:
+        //   half=0: y_off=0, elements 0..127
+        //   half=1: y_off=128, elements 128..255
+        // Group g covers elements g*16..(g+1)*16
+
+        let gs = |g: usize| -> f32 { a_group_sums[y_off / Q6K_GROUP_SIZE + g] };
+
+        // Group 0: elements y_off+0..y_off+31 → 2 sub-groups of 16
+        result += d * sc(half*8 + 0) * (a_scale * lo_0 as f32 - 32.0 * gs(0));
+        result += d * sc(half*8 + 1) * (a_scale * hi_0 as f32 - 32.0 * gs(1));
+        // Group 1: elements y_off+32..y_off+63
+        result += d * sc(half*8 + 2) * (a_scale * lo_1 as f32 - 32.0 * gs(2));
+        result += d * sc(half*8 + 3) * (a_scale * hi_1 as f32 - 32.0 * gs(3));
+        // Group 2: elements y_off+64..y_off+95
+        result += d * sc(half*8 + 4) * (a_scale * lo_2 as f32 - 32.0 * gs(4));
+        result += d * sc(half*8 + 5) * (a_scale * hi_2 as f32 - 32.0 * gs(5));
+        // Group 3: elements y_off+96..y_off+127
+        result += d * sc(half*8 + 6) * (a_scale * lo_3 as f32 - 32.0 * gs(6));
+        result += d * sc(half*8 + 7) * (a_scale * hi_3 as f32 - 32.0 * gs(7));
+    }
+
+    result
+}
+
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_i32_128(v: std::arch::x86_64::__m128i) -> i32 {
+    use std::arch::x86_64::*;
+    let sum64 = _mm_add_epi32(v, _mm_srli_si128(v, 8));
+    let sum32 = _mm_add_epi32(sum64, _mm_srli_si128(sum64, 4));
+    _mm_cvtsi128_si32(sum32)
+}
+
 #[cfg(feature = "cpu")]
 pub struct CpuMatMulQ4K;
 
@@ -198,6 +400,39 @@ impl MatMulQ for CpuMatMulQ4K {
             }
         }
 
+        Ok(())
+    }
+
+    fn forward_b_transposed_q6k(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if a.len() != m * k { return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() }); }
+        if output.len() != m * n { return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() }); }
+        if k % Q6K_BLOCK_SIZE != 0 { return Err(crate::KernelError::InvalidConfig(format!("k={k} not divisible by {Q6K_BLOCK_SIZE}"))); }
+
+        let blocks_per_row = k / Q6K_BLOCK_SIZE;
+        let expected_b_bytes = n * blocks_per_row * Q6K_BLOCK_BYTES;
+        if b_quantized.len() != expected_b_bytes { return Err(crate::KernelError::DimensionMismatch { expected: expected_b_bytes, got: b_quantized.len() }); }
+
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for blk in 0..blocks_per_row {
+                    let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                    let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
+                    let a_slice = &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
+                    sum += q6k_dot_block(block, a_slice);
+                }
+                output[i * n + j] = sum;
+            }
+        }
         Ok(())
     }
 }
@@ -599,6 +834,135 @@ impl MatMulQ for CpuMatMulQ4KOpt {
 
         Ok(())
     }
+
+    fn forward_b_transposed_q6k(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if a.len() != m * k { return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() }); }
+        if output.len() != m * n { return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() }); }
+        if k % Q6K_BLOCK_SIZE != 0 { return Err(crate::KernelError::InvalidConfig(format!("k={k} not divisible by {Q6K_BLOCK_SIZE}"))); }
+
+        let blocks_per_row = k / Q6K_BLOCK_SIZE;
+        let expected_b_bytes = n * blocks_per_row * Q6K_BLOCK_BYTES;
+        if b_quantized.len() != expected_b_bytes { return Err(crate::KernelError::DimensionMismatch { expected: expected_b_bytes, got: b_quantized.len() }); }
+
+        if m == 1 {
+            let a_row = &a[0..k];
+
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") {
+                let (a_q8, a_scales, a_group_sums) =
+                    unsafe { quantize_row_q8_avx2_q6k(a_row) };
+
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for blk in 0..blocks_per_row {
+                        let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                        let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
+                        let aq_slice = &a_q8[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
+                        let a_sc = a_scales[blk];
+                        let a_gsums = &a_group_sums[blk * Q6K_GROUPS..(blk + 1) * Q6K_GROUPS];
+                        sum += unsafe { q6k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) };
+                    }
+                    output[j] = sum;
+                }
+                return Ok(());
+            }
+
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for blk in 0..blocks_per_row {
+                    let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                    let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
+                    let a_slice = &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
+                    sum += q6k_dot_block(block, a_slice);
+                }
+                output[j] = sum;
+            }
+        } else {
+            for i in 0..m {
+                let a_row = &a[i * k..(i + 1) * k];
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for blk in 0..blocks_per_row {
+                        let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                        let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
+                        let a_slice = &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
+                        sum += q6k_dot_block(block, a_slice);
+                    }
+                    output[i * n + j] = sum;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Quantize activation row for Q6_K groups (16 elements per group).
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn quantize_row_q8_avx2_q6k(a: &[f32]) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
+    use std::arch::x86_64::*;
+
+    let k = a.len();
+    let n_blocks = k / Q6K_BLOCK_SIZE;
+    let mut a_q8 = vec![0i8; k];
+    let mut scales = vec![0.0f32; n_blocks];
+    let mut group_sums = vec![0.0f32; n_blocks * Q6K_GROUPS];
+
+    for blk in 0..n_blocks {
+        let base = blk * Q6K_BLOCK_SIZE;
+        let block_a = &a[base..base + Q6K_BLOCK_SIZE];
+
+        let mut vmax = _mm256_setzero_ps();
+        let sign_mask = _mm256_set1_ps(-0.0);
+        for chunk in 0..32 {
+            let v = _mm256_loadu_ps(block_a.as_ptr().add(chunk * 8));
+            vmax = _mm256_max_ps(vmax, _mm256_andnot_ps(sign_mask, v));
+        }
+        let hi = _mm256_extractf128_ps(vmax, 1);
+        let lo = _mm256_castps256_ps128(vmax);
+        let max128 = _mm_max_ps(lo, hi);
+        let max64 = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
+        let max32 = _mm_max_ss(max64, _mm_shuffle_ps(max64, max64, 1));
+        let max_abs = _mm_cvtss_f32(max32);
+
+        let scale = max_abs / 127.0;
+        scales[blk] = scale;
+        let inv_scale = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
+        let inv_vec = _mm256_set1_ps(inv_scale);
+
+        for chunk in 0..32 {
+            let cb = chunk * 8;
+            let v = _mm256_loadu_ps(block_a.as_ptr().add(cb));
+            let scaled = _mm256_mul_ps(v, inv_vec);
+            let rounded = _mm256_cvtps_epi32(_mm256_round_ps(
+                scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+            ));
+            let lo128 = _mm256_castsi256_si128(rounded);
+            let hi128 = _mm256_extracti128_si256(rounded, 1);
+            let packed16 = _mm_packs_epi32(lo128, hi128);
+            let packed8 = _mm_packs_epi16(packed16, packed16);
+            let ptr = a_q8.as_mut_ptr().add(base + cb) as *mut i64;
+            *ptr = _mm_cvtsi128_si64(packed8);
+        }
+
+        for g in 0..Q6K_GROUPS {
+            let mut gsum = 0.0f32;
+            for i in 0..Q6K_GROUP_SIZE {
+                gsum += block_a[g * Q6K_GROUP_SIZE + i];
+            }
+            group_sums[blk * Q6K_GROUPS + g] = gsum;
+        }
+    }
+
+    (a_q8, scales, group_sums)
 }
 
 #[cfg(kani)]

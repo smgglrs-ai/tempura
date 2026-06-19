@@ -458,23 +458,15 @@ where
             let v_w_name = format!("{prefix}.self_attn.v_proj.weight");
             let o_w_name = format!("{prefix}.self_attn.o_proj.weight");
 
-            if let Some(q_w) = qweights.get_q4k(&q_w_name) {
-                q4k.forward_b_transposed_q4k(&normed, q_w, &mut q, seq_len, q_dim, h).unwrap();
-            } else {
-                let q_w = qweights.get_f32(&q_w_name).unwrap();
-                self.pipeline.matmul_bt(&normed, q_w, &mut q, seq_len, q_dim, h).unwrap();
-            }
-            if let Some(k_w) = qweights.get_q4k(&k_w_name) {
-                q4k.forward_b_transposed_q4k(&normed, k_w, &mut k, seq_len, kv_dim, h).unwrap();
-            } else {
-                let k_w = qweights.get_f32(&k_w_name).unwrap();
-                self.pipeline.matmul_bt(&normed, k_w, &mut k, seq_len, kv_dim, h).unwrap();
-            }
-            if let Some(v_w) = qweights.get_q4k(&v_w_name) {
-                q4k.forward_b_transposed_q4k(&normed, v_w, &mut v, seq_len, kv_dim, h).unwrap();
-            } else {
-                let v_w = qweights.get_f32(&v_w_name).unwrap();
-                self.pipeline.matmul_bt(&normed, v_w, &mut v, seq_len, kv_dim, h).unwrap();
+            for (name, out, out_dim) in [(&q_w_name, &mut q, q_dim), (&k_w_name, &mut k, kv_dim), (&v_w_name, &mut v, kv_dim)] {
+                if let Some(w) = qweights.get_q4k(name) {
+                    q4k.forward_b_transposed_q4k(&normed, w, out, seq_len, out_dim, h).unwrap();
+                } else if let Some(w) = qweights.get_q6k(name) {
+                    q4k.forward_b_transposed_q6k(&normed, w, out, seq_len, out_dim, h).unwrap();
+                } else {
+                    let w = qweights.get_f32(name).unwrap();
+                    self.pipeline.matmul_bt(&normed, w, out, seq_len, out_dim, h).unwrap();
+                }
             }
 
             if cfg.use_qk_norm {
@@ -502,11 +494,13 @@ where
             self.pipeline.attention(&q, &k_cache, &v_cache, &mut attn_out, 1, seq_len, kv_len, n_heads, n_kv_heads, head_dim, 1.0 / (head_dim as f32).sqrt()).unwrap();
 
             let mut o_proj = vec![0.0f32; seq_len * h];
-            if let Some(o_w) = qweights.get_q4k(&o_w_name) {
-                q4k.forward_b_transposed_q4k(&attn_out, o_w, &mut o_proj, seq_len, h, q_dim).unwrap();
+            if let Some(w) = qweights.get_q4k(&o_w_name) {
+                q4k.forward_b_transposed_q4k(&attn_out, w, &mut o_proj, seq_len, h, q_dim).unwrap();
+            } else if let Some(w) = qweights.get_q6k(&o_w_name) {
+                q4k.forward_b_transposed_q6k(&attn_out, w, &mut o_proj, seq_len, h, q_dim).unwrap();
             } else {
-                let o_w = qweights.get_f32(&o_w_name).unwrap();
-                self.pipeline.matmul_bt(&attn_out, o_w, &mut o_proj, seq_len, h, q_dim).unwrap();
+                let w = qweights.get_f32(&o_w_name).unwrap();
+                self.pipeline.matmul_bt(&attn_out, w, &mut o_proj, seq_len, h, q_dim).unwrap();
             }
             for i in 0..hidden.len() {
                 hidden[i] += o_proj[i];
@@ -525,31 +519,30 @@ where
             let mut gate = vec![0.0f32; seq_len * inter];
             let mut up = vec![0.0f32; seq_len * inter];
 
-            if let Some(gw) = qweights.get_q4k(&gate_w_name) {
-                q4k.forward_b_transposed_q4k(&normed2, gw, &mut gate, seq_len, inter, h).unwrap();
-            } else {
-                let gw = qweights.get_f32(&gate_w_name).unwrap();
-                self.pipeline.matmul_bt(&normed2, gw, &mut gate, seq_len, inter, h).unwrap();
-            }
-            if let Some(uw) = qweights.get_q4k(&up_w_name) {
-                q4k.forward_b_transposed_q4k(&normed2, uw, &mut up, seq_len, inter, h).unwrap();
-            } else {
-                let uw = qweights.get_f32(&up_w_name).unwrap();
-                self.pipeline.matmul_bt(&normed2, uw, &mut up, seq_len, inter, h).unwrap();
+            for (name, out, out_dim) in [(&gate_w_name, &mut gate, inter), (&up_w_name, &mut up, inter)] {
+                if let Some(w) = qweights.get_q4k(name) {
+                    q4k.forward_b_transposed_q4k(&normed2, w, out, seq_len, out_dim, h).unwrap();
+                } else if let Some(w) = qweights.get_q6k(name) {
+                    q4k.forward_b_transposed_q6k(&normed2, w, out, seq_len, out_dim, h).unwrap();
+                } else {
+                    let w = qweights.get_f32(name).unwrap();
+                    self.pipeline.matmul_bt(&normed2, w, out, seq_len, out_dim, h).unwrap();
+                }
             }
 
-            // SiLU(gate) * up
             for i in 0..gate.len() {
                 let silu = gate[i] / (1.0 + (-gate[i]).exp());
                 gate[i] = silu * up[i];
             }
 
             let mut down_out = vec![0.0f32; seq_len * h];
-            if let Some(dw) = qweights.get_q4k(&down_w_name) {
-                q4k.forward_b_transposed_q4k(&gate, dw, &mut down_out, seq_len, h, inter).unwrap();
+            if let Some(w) = qweights.get_q4k(&down_w_name) {
+                q4k.forward_b_transposed_q4k(&gate, w, &mut down_out, seq_len, h, inter).unwrap();
+            } else if let Some(w) = qweights.get_q6k(&down_w_name) {
+                q4k.forward_b_transposed_q6k(&gate, w, &mut down_out, seq_len, h, inter).unwrap();
             } else {
-                let dw = qweights.get_f32(&down_w_name).unwrap();
-                self.pipeline.matmul_bt(&gate, dw, &mut down_out, seq_len, h, inter).unwrap();
+                let w = qweights.get_f32(&down_w_name).unwrap();
+                self.pipeline.matmul_bt(&gate, w, &mut down_out, seq_len, h, inter).unwrap();
             }
             for i in 0..hidden.len() {
                 hidden[i] += down_out[i];
@@ -559,7 +552,6 @@ where
         session.cache.advance(seq_len);
         session.position += seq_len;
 
-        // Final norm
         let mut final_normed = hidden.clone();
         let final_norm_w = qweights.get_f32("model.norm.weight").unwrap();
         self.pipeline.rmsnorm(&mut final_normed, final_norm_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
@@ -568,11 +560,13 @@ where
         let last_hidden = &final_normed[(seq_len - 1) * h..seq_len * h];
         let mut logits = vec![0.0f32; cfg.vocab_size];
         let lm_head_name = "lm_head.weight";
-        if let Some(lm_w) = qweights.get_q4k(lm_head_name) {
-            q4k.forward_b_transposed_q4k(last_hidden, lm_w, &mut logits, 1, cfg.vocab_size, h).unwrap();
+        if let Some(w) = qweights.get_q4k(lm_head_name) {
+            q4k.forward_b_transposed_q4k(last_hidden, w, &mut logits, 1, cfg.vocab_size, h).unwrap();
+        } else if let Some(w) = qweights.get_q6k(lm_head_name) {
+            q4k.forward_b_transposed_q6k(last_hidden, w, &mut logits, 1, cfg.vocab_size, h).unwrap();
         } else {
-            let lm_w = qweights.get_f32(lm_head_name).unwrap();
-            self.pipeline.matmul_bt(last_hidden, lm_w, &mut logits, 1, cfg.vocab_size, h).unwrap();
+            let w = qweights.get_f32(lm_head_name).unwrap();
+            self.pipeline.matmul_bt(last_hidden, w, &mut logits, 1, cfg.vocab_size, h).unwrap();
         }
 
         logits
