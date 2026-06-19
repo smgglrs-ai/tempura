@@ -192,10 +192,197 @@ pub fn q6k_dot_block(block: &[u8], a: &[f32]) -> f32 {
     sum
 }
 
-/// F32-domain Q6_K dot product using AVX2 for 6-bit extraction and FMA for accumulation.
-/// Activations stay in f32 — no i8 quantization, no error accumulation across layers.
+/// i16-domain Q6_K dot product: quantize activations to i16 (not i8), multiply
+/// signed q6 values (-32..31) by i16 activations using madd_epi16.
+/// i16 quantization has 256x less error than i8, preventing cross-layer divergence.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
+unsafe fn q6k_dot_block_avx2_i16(block: &[u8], a: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let scales = &block[192..208];
+    let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+
+    let mask_low = _mm256_set1_epi8(0x0F);
+    let mask_2bit = _mm256_set1_epi8(0x03);
+    let offset_32_i16 = _mm256_set1_epi16(32);
+
+    // Quantize 256 activations to i16 (one scale per block)
+    let mut max_abs = 0.0f32;
+    for i in 0..256 { let v = a[i].abs(); if v > max_abs { max_abs = v; } }
+    let a_scale = max_abs / 32767.0;
+    let inv_scale = if max_abs > 0.0 { 32767.0 / max_abs } else { 0.0 };
+
+    let mut a_i16 = [0i16; 256];
+    let inv_vec = _mm256_set1_ps(inv_scale);
+    for chunk in 0..32 {
+        let base = chunk * 8;
+        let v = _mm256_loadu_ps(a.as_ptr().add(base));
+        let scaled = _mm256_mul_ps(v, inv_vec);
+        let rounded = _mm256_cvtps_epi32(_mm256_round_ps(
+            scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+        ));
+        // Pack i32 → i16 with saturation
+        let lo = _mm256_castsi256_si128(rounded);
+        let hi = _mm256_extracti128_si256(rounded, 1);
+        let packed = _mm_packs_epi32(lo, hi); // 8 i16 values
+        _mm_storeu_si128(a_i16.as_mut_ptr().add(base) as *mut __m128i, packed);
+    }
+
+    let mut result = 0.0f32;
+
+    for half in 0..2usize {
+        let ql_off = half * 64;
+        let qh_off = half * 32;
+        let y_off = half * 128;
+
+        let qh_vec = _mm256_loadu_si256(qh.as_ptr().add(qh_off) as *const __m256i);
+        let ql_a = _mm256_loadu_si256(ql.as_ptr().add(ql_off) as *const __m256i);
+        let ql_b = _mm256_loadu_si256(ql.as_ptr().add(ql_off + 32) as *const __m256i);
+
+        // Extract 6-bit values as u8
+        let q6_0 = _mm256_or_si256(
+            _mm256_and_si256(ql_a, mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(qh_vec, mask_2bit), 4),
+        );
+        let q6_1 = _mm256_or_si256(
+            _mm256_and_si256(ql_b, mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh_vec, 2), mask_2bit), 4),
+        );
+        let q6_2 = _mm256_or_si256(
+            _mm256_and_si256(_mm256_srli_epi16(ql_a, 4), mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh_vec, 4), mask_2bit), 4),
+        );
+        let q6_3 = _mm256_or_si256(
+            _mm256_and_si256(_mm256_srli_epi16(ql_b, 4), mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh_vec, 6), mask_2bit), 4),
+        );
+
+        // For each group of 32 q6 values: widen to i16, subtract 32, madd with i16 activations
+        // Then split by 128-bit lane for per-16-element scale application
+        macro_rules! process_group {
+            ($q6:expr, $a_off:expr, $sc_idx0:expr, $sc_idx1:expr) => {{
+                let q6_vec = $q6;
+                // Widen u8 → i16 for low 16 bytes and high 16 bytes
+                let lo_128 = _mm256_castsi256_si128(q6_vec);
+                let hi_128 = _mm256_extracti128_si256(q6_vec, 1);
+
+                // Low 16 elements: q6[0..15] → i16, subtract 32
+                let q_lo = _mm256_sub_epi16(_mm256_cvtepu8_epi16(lo_128), offset_32_i16);
+                let a_lo = _mm256_loadu_si256(a_i16.as_ptr().add($a_off) as *const __m256i);
+                // madd_epi16: i16 × i16 → i32, sums adjacent pairs → 8 i32
+                let dot_lo = _mm256_madd_epi16(q_lo, a_lo);
+                let idot_lo = hsum_i32(dot_lo);
+
+                // High 16 elements: q6[16..31] → i16, subtract 32
+                let q_hi = _mm256_sub_epi16(_mm256_cvtepu8_epi16(hi_128), offset_32_i16);
+                let a_hi = _mm256_loadu_si256(a_i16.as_ptr().add($a_off + 16) as *const __m256i);
+                let dot_hi = _mm256_madd_epi16(q_hi, a_hi);
+                let idot_hi = hsum_i32(dot_hi);
+
+                let sc0 = scales[$sc_idx0] as i8 as f32;
+                let sc1 = scales[$sc_idx1] as i8 as f32;
+                result += d * sc0 * a_scale * idot_lo as f32;
+                result += d * sc1 * a_scale * idot_hi as f32;
+            }};
+        }
+
+        process_group!(q6_0, y_off,      half * 8,     half * 8 + 1);
+        process_group!(q6_1, y_off + 32,  half * 8 + 2, half * 8 + 3);
+        process_group!(q6_2, y_off + 64,  half * 8 + 4, half * 8 + 5);
+        process_group!(q6_3, y_off + 96,  half * 8 + 6, half * 8 + 7);
+    }
+
+    result
+}
+
+/// i16-domain Q6_K dot with PRE-QUANTIZED i16 activations (no per-call quantization).
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q6k_dot_preq_i16(
+    block: &[u8],
+    a_i16: &[i16],
+    a_scale: f32,
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let scales = &block[192..208];
+    let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+
+    let mask_low = _mm256_set1_epi8(0x0F);
+    let mask_2bit = _mm256_set1_epi8(0x03);
+    let offset_32_i16 = _mm256_set1_epi16(32);
+
+    let mut result = 0.0f32;
+
+    for half in 0..2usize {
+        let ql_off = half * 64;
+        let qh_off = half * 32;
+        let y_off = half * 128;
+
+        let qh_vec = _mm256_loadu_si256(qh.as_ptr().add(qh_off) as *const __m256i);
+        let ql_a = _mm256_loadu_si256(ql.as_ptr().add(ql_off) as *const __m256i);
+        let ql_b = _mm256_loadu_si256(ql.as_ptr().add(ql_off + 32) as *const __m256i);
+
+        let q6_0 = _mm256_or_si256(
+            _mm256_and_si256(ql_a, mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(qh_vec, mask_2bit), 4),
+        );
+        let q6_1 = _mm256_or_si256(
+            _mm256_and_si256(ql_b, mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh_vec, 2), mask_2bit), 4),
+        );
+        let q6_2 = _mm256_or_si256(
+            _mm256_and_si256(_mm256_srli_epi16(ql_a, 4), mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh_vec, 4), mask_2bit), 4),
+        );
+        let q6_3 = _mm256_or_si256(
+            _mm256_and_si256(_mm256_srli_epi16(ql_b, 4), mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh_vec, 6), mask_2bit), 4),
+        );
+
+        macro_rules! process_group {
+            ($q6:expr, $a_off:expr, $sc_idx0:expr, $sc_idx1:expr) => {{
+                let q6_vec = $q6;
+                let lo_128 = _mm256_castsi256_si128(q6_vec);
+                let hi_128 = _mm256_extracti128_si256(q6_vec, 1);
+
+                let q_lo = _mm256_sub_epi16(_mm256_cvtepu8_epi16(lo_128), offset_32_i16);
+                let a_lo = _mm256_loadu_si256(a_i16.as_ptr().add($a_off) as *const __m256i);
+                let dot_lo = _mm256_madd_epi16(q_lo, a_lo);
+                let idot_lo = hsum_i32(dot_lo);
+
+                let q_hi = _mm256_sub_epi16(_mm256_cvtepu8_epi16(hi_128), offset_32_i16);
+                let a_hi = _mm256_loadu_si256(a_i16.as_ptr().add($a_off + 16) as *const __m256i);
+                let dot_hi = _mm256_madd_epi16(q_hi, a_hi);
+                let idot_hi = hsum_i32(dot_hi);
+
+                let sc0 = scales[$sc_idx0] as i8 as f32;
+                let sc1 = scales[$sc_idx1] as i8 as f32;
+                result += d * sc0 * a_scale * idot_lo as f32;
+                result += d * sc1 * a_scale * idot_hi as f32;
+            }};
+        }
+
+        process_group!(q6_0, y_off,      half * 8,     half * 8 + 1);
+        process_group!(q6_1, y_off + 32,  half * 8 + 2, half * 8 + 3);
+        process_group!(q6_2, y_off + 64,  half * 8 + 4, half * 8 + 5);
+        process_group!(q6_3, y_off + 96,  half * 8 + 6, half * 8 + 7);
+    }
+
+    result
+}
+
+/// F32-domain Q6_K dot product using AVX2 for 6-bit extraction and FMA for accumulation.
+/// Activations stay in f32 — no quantization, no error accumulation across layers.
+/// Kept as fallback for non-AVX2 or when precision is critical.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+#[allow(dead_code)]
 unsafe fn q6k_dot_block_avx2(block: &[u8], a: &[f32]) -> f32 {
     use std::arch::x86_64::*;
 
@@ -889,7 +1076,9 @@ impl CpuMatMulQ4KOpt {
 #[cfg(feature = "cpu")]
 pub struct PreQuantizedActivations {
     pub q8: Vec<i8>,
+    pub q16: Vec<i16>,
     pub scales: Vec<f32>,
+    pub scales_i16: Vec<f32>,
     pub group_sums_q4k: Vec<f32>,
     pub group_sums_q6k: Vec<f32>,
     pub k: usize,
@@ -914,12 +1103,31 @@ impl PreQuantizedActivations {
                     group_sums_q6k[blk * Q6K_GROUPS + g] = s;
                 }
             }
-            return Self { q8, scales, group_sums_q4k, group_sums_q6k, k };
+            // Also quantize to i16 for Q6K (256x less error than i8)
+            let n_blocks_i16 = k / Q6K_BLOCK_SIZE;
+            let mut q16 = vec![0i16; k];
+            let mut scales_i16 = vec![0.0f32; n_blocks_i16];
+            for blk in 0..n_blocks_i16 {
+                let base = blk * Q6K_BLOCK_SIZE;
+                let block_a = &a[base..base + Q6K_BLOCK_SIZE];
+                let mut max_abs = 0.0f32;
+                for &v in block_a { let av = v.abs(); if av > max_abs { max_abs = av; } }
+                let scale = max_abs / 32767.0;
+                scales_i16[blk] = scale;
+                let inv = if max_abs > 0.0 { 32767.0 / max_abs } else { 0.0 };
+                for i in 0..Q6K_BLOCK_SIZE {
+                    q16[base + i] = (block_a[i] * inv).round() as i16;
+                }
+            }
+
+            return Self { q8, q16, scales, scales_i16, group_sums_q4k, group_sums_q6k, k };
         }
 
         Self {
             q8: Vec::new(),
+            q16: Vec::new(),
             scales: Vec::new(),
+            scales_i16: Vec::new(),
             group_sums_q4k: Vec::new(),
             group_sums_q6k: Vec::new(),
             k,
@@ -1037,13 +1245,13 @@ impl CpuMatMulQ4KOpt {
 
     pub fn forward_q6k_preq(
         &self,
-        _preq: &PreQuantizedActivations,
+        preq: &PreQuantizedActivations,
         a_f32: &[f32],
         b_quantized: &[u8],
         output: &mut [f32],
         n: usize,
     ) -> Result<()> {
-        let k = _preq.k;
+        let k = preq.k;
         let blocks_per_row = k / Q6K_BLOCK_SIZE;
 
         #[cfg(target_arch = "x86_64")]
@@ -1229,7 +1437,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                             let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
                             let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
                             let a_slice = &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                            sum += unsafe { q6k_dot_block_avx2(block, a_slice) };
+                            sum += unsafe { q6k_dot_block_avx2_i16(block, a_slice) };
                         }
                         *out = sum;
                     }
