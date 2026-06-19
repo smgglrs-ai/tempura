@@ -117,3 +117,42 @@ When reviewing a PR that modifies a Kani harness:
 **Index-isolation pattern** (batch invariant): declare two different batch indices, compute their offsets, assert the memory ranges don't overlap.
 
 Recognizing the pattern helps you read new harnesses quickly — most tempura proofs follow one of these three.
+
+## GPU thread decomposition proofs
+
+tempura also verifies CUDA kernel index arithmetic. GPU kernels launch thousands of threads, each computing its position from a flat thread index. A GPU harness proves that this decomposition stays in bounds:
+
+```rust
+#[kani::proof]
+fn gpu_attention_thread_decomposition_in_bounds() {
+    // ... shape parameters with kani::any() and assume ...
+    let total = batch * seq_len * num_heads * head_dim;
+    let i: usize = kani::any();
+    kani::assume(i < total);
+    
+    let d = i % head_dim;
+    let h = (i / head_dim) % num_heads;
+    let s = (i / (head_dim * num_heads)) % seq_len;
+    let b = i / (head_dim * num_heads * seq_len);
+    
+    assert!(b < batch);
+    assert!(s < seq_len);
+    assert!(h < num_heads);
+    let q_base = ((b * seq_len + s) * num_heads + h) * head_dim;
+    assert!(q_base + d < q_len);
+}
+```
+
+This proves that a flat thread index `i` decomposes into valid `(batch, seq, head, dim)` coordinates, and the reconstructed offset stays within the buffer. Every CUDA kernel in tempura has a companion decomposition proof.
+
+## The full proof inventory
+
+| Kernel | Proofs | What's proven |
+|--------|--------|--------------|
+| Attention | 5 | Q offset, KV offset, batch isolation, GPU thread decomposition (×2) |
+| RMSNorm | 3 | Index bounds, full execution no-panic, GPU two-pass index safety |
+| RoPE | 2 | Split-half index bounds + position array, GPU thread decomposition |
+| Sampler | 3 | Top-k index bounds, full execution no-panic, cumsum termination |
+| MatMul | 2 | Triple-loop index bounds, GPU tiled GEMM shared memory + output indices |
+
+All harnesses run in CI via `cargo kani --package tempura-kernels`.

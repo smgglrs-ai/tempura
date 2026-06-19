@@ -48,7 +48,7 @@ The analogy to Fourier analysis is deliberate: just as a Fourier transform repre
 
 ## The full RoPE formula
 
-For a $d$-dimensional vector at position $m$, RoPE processes pairs of dimensions:
+The mathematical definition pairs adjacent dimensions $(x_{2i}, x_{2i+1})$:
 
 $$
 f(x, m)_{2i} = x_{2i} \cos(m\theta_i) - x_{2i+1} \sin(m\theta_i)
@@ -59,7 +59,20 @@ $$
 
 This is equivalent to applying $d/2$ independent 2D rotation matrices, one per dimension pair.
 
-**In tempura**, RoPE is applied to Q and K vectors *after* projection and *before* the dot product. The `RoPE::forward` signature takes the head dimension and position offset, applying rotations to each pair of elements.
+## Split-half layout
+
+tempura (like LLaMA and most modern implementations) uses a **split-half** layout instead of the interleaved layout above. Instead of pairing $(x_0, x_1)$, $(x_2, x_3)$, ..., it pairs $(x_0, x_{d/2})$, $(x_1, x_{d/2+1})$, ...:
+
+$$
+f(x, m)_i = x_i \cos(m\theta_i) - x_{i + d/2} \sin(m\theta_i)
+$$
+$$
+f(x, m)_{i + d/2} = x_i \sin(m\theta_i) + x_{i + d/2} \cos(m\theta_i)
+$$
+
+for $i \in [0, d/2)$. The mathematical properties are identical — both are 2D rotations of the same pairs — but the memory access pattern differs. The split-half layout is more cache-friendly on modern hardware because the two halves of each pair are separated by exactly `head_dim / 2` elements, enabling vectorized loads.
+
+RoPE is applied to Q and K vectors *after* projection and *before* the dot product. The `RoPE::forward` signature takes position indices per token, and the base frequency $\theta$ as parameters.
 
 ## Position at zero
 
@@ -81,7 +94,11 @@ tempura's `RoPE` trait accepts the base frequency as a parameter, making these s
 
 ## What we prove
 
-Kani verifies the index arithmetic in the RoPE implementation: for any valid `head_dim` (must be even) and `seq_len` within bounded ranges, the paired-element rotation loop never accesses memory beyond the Q/K buffer lengths. The proof covers the `2i` and `2i+1` indexing pattern that processes dimension pairs.
+Kani verifies two properties of the RoPE implementation:
+
+**Index safety for the split-half pattern.** tempura's RoPE uses the split-half layout: for a `head_dim`-sized vector, dimension $d$ is paired with dimension $d + \text{head\_dim}/2$. The harness proves that for any valid `batch`, `seq_len`, `num_heads`, and `head_dim` (constrained to even values) within bounded ranges, both `offset + d` and `offset + d + half_dim` stay within the buffer length.
+
+**Position array bounds.** The harness also proves that the position lookup `positions[b * seq_len + s]` never exceeds the positions array length.
 
 ## What we do NOT prove
 
@@ -91,4 +108,4 @@ Kani verifies the index arithmetic in the RoPE implementation: for any valid `he
 
 ## Implementation
 
-The CPU reference is in [`kernels/src/rope.rs`](https://github.com/smgglrs-ai/tempura/tree/main/kernels/src/rope.rs). The `RoPE` trait is defined in the kernel API crate. The implementation processes dimension pairs sequentially, computing $\cos(m\theta_i)$ and $\sin(m\theta_i)$ for each pair and applying the 2D rotation.
+The CPU reference is in [`kernels/src/rope.rs`](https://github.com/smgglrs-ai/tempura/tree/main/kernels/src/rope.rs). The `RoPE` trait takes a `positions: &[u32]` array (one position per token per batch element) and the base frequency `theta: f32`. The implementation uses the split-half layout, processing the first half and second half of each head vector simultaneously. The CUDA kernel launches one thread per element for single-batch inputs.
