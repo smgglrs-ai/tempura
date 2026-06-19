@@ -49,7 +49,7 @@ cargo kani --package tempura-kernels   # verify kernel safety properties
 ## Project structure
 
 ```
-tempura-serve/
+tempura/
   kernel-api/    # Trait definitions (the verification contract)
   kernels/       # CPU and CUDA implementations
   engine/        # Inference engine, model loading, traces

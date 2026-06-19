@@ -34,7 +34,7 @@ First-party implementations: CPU reference (always available) and CUDA via cuda-
 
 Inference engine generic over kernel traits. Contains `TransformerModel`, `KernelPipeline`, `InferenceSession`, `InferenceTrace`, `DualPipeline`, weight loading, tokenizer integration.
 
-### tempura-serve
+### tempura
 
 HTTP serving layer. Axum-based, OpenAI-compatible API. Continuous batching, speculative decoding, prefix caching, Prometheus metrics, OpenTelemetry export.
 

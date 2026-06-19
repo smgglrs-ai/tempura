@@ -7,7 +7,7 @@ url = "/docs/getting-started/"
 url_button = "Get started"
 repo_version = "GitHub"
 repo_license = "Open-source Apache-2.0 License."
-repo_url = "https://github.com/smgglrs-ai/tempura-serve"
+repo_url = "https://github.com/smgglrs-ai/tempura"
 
 [[extra.menu.main]]
 name = "Docs"

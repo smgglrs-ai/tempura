@@ -1662,27 +1662,53 @@ items:
 - id: e2e-fix-garbled-output
   title: Fix garbled output on real model inference
   description: 'End-to-end inference with Qwen3-8B GGUF produces garbled text
-    ("åľ¨æľªæĿ¥ Becker" etc). The logprobs are reasonable (-0.5 to -3.0), suggesting
-    the model forward pass is computing something meaningful but either: (1) the GGUF
-    tokenizer extraction reconstructs the BPE vocabulary incorrectly (most likely —
-    Qwen3 uses a 151K vocab with complex merges), or (2) there is a subtle numerics
-    bug in the forward pass (wrong transpose, layout mismatch between GGUF weight
-    ordering and our tensor name mapping). Debug by comparing token IDs and decoded
-    text against llama.cpp on the same prompt, and inspecting the tokenizer BPE
-    vocabulary.'
+    ("Becker" repeating). Confirmed: (1) tokenizer encoding is correct (same 5
+    tokens as llama.cpp for "The capital of France is"), (2) QK-norm is now applied
+    (changed output from Chinese to "Becker" — partial fix), (3) quantized and
+    f32 paths produce identical garbled output (bug is in forward pass, not
+    dequantization). Most likely remaining causes: (a) GGUF weight layout differs
+    from what matmul_bt expects — GGUF ne[0] is the fast dimension, need to verify
+    our matmul consumes the transposed weight correctly, (b) RoPE theta or
+    frequency base may be extracted incorrectly from GGUF metadata, (c) attention
+    scale or bias handling may differ for Qwen3. Debug by comparing layer-by-layer
+    activations against llama.cpp or a reference PyTorch implementation.'
   status: pending
   priority: critical
   effort: M
   scope:
   - engine/src/gguf_loader.rs
-  - engine/src/tokenizer.rs
   - engine/src/model.rs
-  - engine/src/weights.rs
   acceptance:
-  - "The capital of France is" → model outputs coherent English text
+  - "The capital of France is" → model outputs "Paris" or coherent English
   - Token IDs match llama.cpp output for the same prompt and temperature=0
-  - Tokenizer encode/decode round-trips correctly for ASCII and Unicode text
   - At least 3 prompts produce sensible output on CPU inference
+  verification:
+    quick: cargo test --workspace
+
+- id: e2e-cpu-optimized-kernels
+  title: CPU-optimized quantized MatMul (SIMD, target-cpu=native)
+  description: 'Current CpuMatMulQ4K is a scalar reference implementation for Kani
+    proofs — 0.16 tok/s on Qwen3-8B. llama.cpp gets ~6 tok/s using AVX2/AVX-512
+    SIMD for the Q4_K dot product. Add CpuMatMulQ4KOpt that: (1) dequantizes one
+    Q4_K block (256 elements) to a stack-allocated f32 buffer, (2) uses the gemm
+    crate SIMD dot product for the block-level accumulation. Alternatively, structure
+    the inner loop for compiler auto-vectorization with -C target-cpu=native. The
+    optimized kernel is validated against CpuMatMulQ4K (the proven reference) via
+    DualPipeline — exact match expected since both use the same dequant formula,
+    just different accumulation order. Keep CpuMatMulQ4K as the formal verification
+    reference; CpuMatMulQ4KOpt is the production CPU path.'
+  status: pending
+  priority: high
+  effort: M
+  depends_on:
+  - e2e-fix-garbled-output
+  scope:
+  - kernels/src/quantized.rs
+  acceptance:
+  - CpuMatMulQ4KOpt produces identical output to CpuMatMulQ4K (DualPipeline exact match)
+  - At least 10x speedup over CpuMatMulQ4K on Qwen3-8B scale matmuls
+  - Benchmark comparing CpuMatMulQ4KOpt vs llama.cpp CPU Q4_K performance
+  - Compiles with -C target-cpu=native for AVX2/AVX-512 auto-vectorization
   verification:
     quick: cargo test --workspace
 
@@ -2293,3 +2319,108 @@ items:
   - Feature flag edge-metrics gates the platform-specific code
   verification:
     quick: cargo test --workspace
+
+  # ============================================================================
+  # Phase 18: Foundations — Educational Documentation
+  # Math, verification theory, and the connection between them.
+  # Makes tempura a pedagogical artifact, not just an inference server.
+  # ============================================================================
+
+- id: p18-foundations-math
+  title: "Foundations: math behind the kernels"
+  description: 'Educational documentation covering the mathematics that tempura
+    kernels implement. Each page teaches the theory with proper KaTeX notation,
+    intuitions, numerical considerations, and links to the Rust implementation.
+    Topics: (1) Scaled dot-product attention — QKV projections, softmax, multi-head
+    and GQA, the linear algebra and why it works. (2) RMS normalization — the
+    variance invariant, why no mean subtraction, numerical stability. (3) Rotary
+    position embeddings — the rotation matrix, frequency bands, extrapolation
+    properties. (4) Sampling — temperature as energy scaling, top-k/top-p as
+    distribution truncation, the probability space. (5) Quantization — what
+    rounding preserves and destroys, group quantization, error bounds, why
+    monotonicity matters for softmax ordering. Each page should be understandable
+    by someone with undergraduate linear algebra who has not worked on LLMs before.'
+  status: pending
+  priority: high
+  effort: L
+  scope:
+  - docs/content/docs/foundations/
+  - docs/content/docs/foundations/attention.md
+  - docs/content/docs/foundations/normalization.md
+  - docs/content/docs/foundations/positional-encoding.md
+  - docs/content/docs/foundations/sampling.md
+  - docs/content/docs/foundations/quantization.md
+  acceptance:
+  - 5 foundation pages with KaTeX equations rendering correctly
+  - Each page links to the corresponding kernel source file
+  - Each page includes at least one worked numerical example
+  - A reviewer unfamiliar with transformers can follow the math from first principles
+  - Pages cross-reference each other where concepts connect
+  verification:
+    quick: cd docs && zola build
+
+- id: p18-foundations-verification
+  title: "Foundations: verification theory"
+  description: 'Educational documentation covering the formal verification theory
+    behind tempura. Teaches what bounded model checking is, how to read a Kani
+    harness, what is and is not being proven, the compositionality argument for
+    graph-level safety, and how DualPipeline complements formal proofs with
+    empirical equivalence testing. Topics: (1) Bounded model checking — what Kani
+    does, SAT/SMT under the hood, the bounded nature of proofs, what "all inputs"
+    means within bounds. (2) Reading a Kani harness — annotated walkthrough of a
+    real harness from the codebase, mapping code to property. (3) Compositionality
+    — if each op is safe and the wiring preserves dimensions, the graph is safe.
+    The formal argument and its assumptions. (4) DualPipeline — what formal proofs
+    miss (numerical drift, precision), how runtime comparison catches it, epsilon
+    thresholds. (5) Verification tiers — what each tier guarantees, when to use
+    which, the tradeoff between proof strength and development velocity.'
+  status: pending
+  priority: high
+  effort: L
+  depends_on:
+  - p18-foundations-math
+  scope:
+  - docs/content/docs/foundations/bounded-model-checking.md
+  - docs/content/docs/foundations/reading-kani-harnesses.md
+  - docs/content/docs/foundations/compositionality.md
+  - docs/content/docs/foundations/dual-pipeline.md
+  - docs/content/docs/foundations/verification-tiers.md
+  acceptance:
+  - 5 verification theory pages with annotated code examples from the actual codebase
+  - The Kani walkthrough uses a real harness (not a toy example)
+  - Compositionality page includes the dimensional compatibility argument
+  - A reviewer can read a PR that modifies a Kani harness and understand what changed
+  - Pages explain both what IS proven and what IS NOT proven (explicit caveats)
+  verification:
+    quick: cd docs && zola build
+
+- id: p18-foundations-connection
+  title: "Foundations: connecting math to proofs"
+  description: 'The bridge layer that connects kernel math to verification. Each
+    kernel foundation page gains a "What we prove" section that maps the math
+    property to the Kani harness, and a "What we do not prove" section that
+    explains what falls to DualPipeline or testing. For example: attention page
+    links the softmax output-bounds property to the Kani harness that proves
+    Q/KV offset safety, explaining what the proof targets and why that property
+    matters for the mathematical operation. This is the layer that makes review
+    tractable: a PR changing attention code can be evaluated against the math
+    AND the proof, not just "does it compile and pass tests."'
+  status: pending
+  priority: high
+  effort: M
+  depends_on:
+  - p18-foundations-math
+  - p18-foundations-verification
+  scope:
+  - docs/content/docs/foundations/attention.md
+  - docs/content/docs/foundations/normalization.md
+  - docs/content/docs/foundations/positional-encoding.md
+  - docs/content/docs/foundations/sampling.md
+  - docs/content/docs/foundations/quantization.md
+  acceptance:
+  - Each math page has a "What we prove" section linking to specific Kani harnesses
+  - Each link explains in plain language what the harness proves about the math
+  - Explicit "What we do NOT prove" subsection per kernel
+  - A reviewer can trace any kernel change through code to math to proof to consequence
+  verification:
+    quick: cd docs && zola build
