@@ -536,9 +536,9 @@ fn unpack_q4k_scales(packed: &[u8]) -> ([f32; 8], [f32; 8]) {
 
     for i in 0..4 {
         sc[i] = packed[i] & 0x3F;
-        sc[i + 4] = ((packed[i] >> 6) | ((packed[i + 8] & 0x0F) << 2)) & 0x3F;
+        sc[i + 4] = ((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F;
         m[i] = packed[i + 4] & 0x3F;
-        m[i + 4] = ((packed[i + 4] >> 6) | ((packed[i + 8] >> 4) << 2)) & 0x3F;
+        m[i + 4] = ((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F;
     }
 
     let sc_f: [f32; 8] = std::array::from_fn(|i| sc[i] as f32);

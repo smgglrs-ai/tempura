@@ -63,9 +63,9 @@ pub fn q4k_unpack_scales(packed: &[u8]) -> ([f32; Q4K_GROUPS], [f32; Q4K_GROUPS]
     let mut i = 0;
     while i < 4 {
         sc[i] = packed[i] & 0x3F;
-        sc[i + 4] = ((packed[i] >> 6) | ((packed[i + 8] & 0x0F) << 2)) & 0x3F;
+        sc[i + 4] = ((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F;
         m[i] = packed[i + 4] & 0x3F;
-        m[i + 4] = ((packed[i + 4] >> 6) | ((packed[i + 8] >> 4) << 2)) & 0x3F;
+        m[i + 4] = ((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F;
         i += 1;
     }
 
