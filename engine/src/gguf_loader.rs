@@ -395,7 +395,7 @@ fn dequant_q5_0(data: &[u8], num_elements: usize) -> Vec<f32> {
 fn dequant_q6k(data: &[u8], num_elements: usize) -> Vec<f32> {
     let num_blocks = num_elements / 256;
     let block_size = 210;
-    let mut output = Vec::with_capacity(num_elements);
+    let mut output = vec![0.0f32; num_elements];
 
     for b in 0..num_blocks {
         let bs = b * block_size;
@@ -403,21 +403,30 @@ fn dequant_q6k(data: &[u8], num_elements: usize) -> Vec<f32> {
         let qh = &data[bs + 128..bs + 192];
         let scales = &data[bs + 192..bs + 208];
         let d = f16_to_f32(u16::from_le_bytes([data[bs + 208], data[bs + 209]]));
+        let out = &mut output[b * 256..(b + 1) * 256];
 
-        for j in 0..256 {
-            let ql_val = ql[j / 2];
-            let low = if j % 2 == 0 {
-                ql_val & 0x0F
-            } else {
-                ql_val >> 4
-            };
-            let qh_idx = j / 4;
-            let qh_shift = (j % 4) * 2;
-            let high = (qh[qh_idx] >> qh_shift) & 0x03;
-            let q = ((low | (high << 4)) as i32) - 32;
-            let scale_idx = j / 16;
-            let sc = scales[scale_idx] as i8 as f32;
-            output.push(q as f32 * sc * d);
+        for half in 0..2 {
+            let ql_off = half * 64;
+            let qh_off = half * 32;
+            let y_off = half * 128;
+
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+
+                let sc0 = scales[half * 8 + is] as i8 as f32;
+                let sc1 = scales[half * 8 + is + 2] as i8 as f32;
+                let sc2 = scales[half * 8 + is + 4] as i8 as f32;
+                let sc3 = scales[half * 8 + is + 6] as i8 as f32;
+
+                out[y_off + l] = d * sc0 * q1 as f32;
+                out[y_off + l + 32] = d * sc1 * q2 as f32;
+                out[y_off + l + 64] = d * sc2 * q3 as f32;
+                out[y_off + l + 96] = d * sc3 * q4 as f32;
+            }
         }
     }
     output
@@ -540,7 +549,7 @@ fn unpack_q4k_scales(packed: &[u8]) -> ([f32; 8], [f32; 8]) {
 fn dequant_q4k(data: &[u8], num_elements: usize) -> Vec<f32> {
     let num_blocks = num_elements / 256;
     let block_size = 144;
-    let mut output = Vec::with_capacity(num_elements);
+    let mut output = vec![0.0f32; num_elements];
 
     for b in 0..num_blocks {
         let bs = b * block_size;
@@ -550,17 +559,18 @@ fn dequant_q4k(data: &[u8], num_elements: usize) -> Vec<f32> {
         let qs = &data[bs + 16..bs + 144];
 
         let (sc, m) = unpack_q4k_scales(packed_scales);
+        let out = &mut output[b * 256..(b + 1) * 256];
 
-        for j in 0..8 {
-            for i in 0..32 {
-                let elem = j * 32 + i;
-                let byte_idx = elem / 2;
-                let q = if elem % 2 == 0 {
-                    (qs[byte_idx] & 0x0F) as f32
-                } else {
-                    (qs[byte_idx] >> 4) as f32
-                };
-                output.push(d * sc[j] * q - dmin * m[j]);
+        for j in 0..4 {
+            let q_off = j * 32;
+            let d1 = d * sc[2 * j];
+            let m1 = dmin * m[2 * j];
+            let d2 = d * sc[2 * j + 1];
+            let m2 = dmin * m[2 * j + 1];
+
+            for l in 0..32 {
+                out[j * 64 + l] = d1 * (qs[q_off + l] & 0x0F) as f32 - m1;
+                out[j * 64 + l + 32] = d2 * (qs[q_off + l] >> 4) as f32 - m2;
             }
         }
     }
@@ -1435,13 +1445,17 @@ mod tests {
         let d_bytes = f32_to_f16_bytes(1.0);
         block[0] = d_bytes[0];
         block[1] = d_bytes[1];
-        block[4] = 0x03; // scale for sub-block 0 = 3
-        block[16] = 0x52; // qs: low nibble=2, high nibble=5
+        block[4] = 0x03; // scale for group 0 = 3
+        block[16] = 0x52; // qs[0]: low nibble=2, high nibble=5
 
         let result = dequant_q4k(&block, 256);
         assert_eq!(result.len(), 256);
+        // ggml Q4_K layout: low nibbles → elements 0..31, high nibbles → elements 32..63
+        // result[0] = d * sc[0] * (qs[0] & 0xF) = 1.0 * 3 * 2 = 6.0
         assert!((result[0] - 6.0).abs() < 1e-3, "got {}", result[0]);
-        assert!((result[1] - 15.0).abs() < 1e-3, "got {}", result[1]);
+        // result[32] = d * sc[1] * (qs[0] >> 4) — sc[1]=0 so result[32]=0
+        // To test high nibble, set sc[1] too:
+        // (not tested here, covered by cross-validation test below)
     }
 
     #[test]

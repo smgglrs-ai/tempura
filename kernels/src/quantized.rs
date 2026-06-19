@@ -96,18 +96,21 @@ pub fn q4k_dequant_block(block: &[u8], output: &mut [f32; Q4K_BLOCK_SIZE]) {
     let qs = &block[16..144];
     let (sc, m) = q4k_unpack_scales(packed_scales);
 
-    let mut group = 0;
-    while group < Q4K_GROUPS {
-        let d_sc = d * sc[group];
-        let dm = dmin * m[group];
-        let mut gi = 0;
-        while gi < Q4K_GROUP_SIZE {
-            let elem = group * Q4K_GROUP_SIZE + gi;
-            let q = q4k_nibble(qs, elem) as f32;
-            output[elem] = d_sc * q - dm;
-            gi += 1;
+    let mut j = 0;
+    while j < 4 {
+        let q_off = j * 32;
+        let d1 = d * sc[2 * j];
+        let m1 = dmin * m[2 * j];
+        let d2 = d * sc[2 * j + 1];
+        let m2 = dmin * m[2 * j + 1];
+
+        let mut l = 0;
+        while l < 32 {
+            output[j * 64 + l] = d1 * (qs[q_off + l] & 0x0F) as f32 - m1;
+            output[j * 64 + l + 32] = d2 * (qs[q_off + l] >> 4) as f32 - m2;
+            l += 1;
         }
-        group += 1;
+        j += 1;
     }
 }
 
@@ -119,19 +122,23 @@ pub fn q4k_dot_block(block: &[u8], a: &[f32]) -> f32 {
     let (sc, m) = q4k_unpack_scales(packed_scales);
 
     let mut sum = 0.0f32;
-    let mut group = 0;
-    while group < Q4K_GROUPS {
-        let d_sc = d * sc[group];
-        let dm = dmin * m[group];
-        let mut gi = 0;
-        while gi < Q4K_GROUP_SIZE {
-            let elem = group * Q4K_GROUP_SIZE + gi;
-            let q = q4k_nibble(qs, elem) as f32;
-            let w = d_sc * q - dm;
-            sum += a[elem] * w;
-            gi += 1;
+    let mut j = 0;
+    while j < 4 {
+        let q_off = j * 32;
+        let d1 = d * sc[2 * j];
+        let m1 = dmin * m[2 * j];
+        let d2 = d * sc[2 * j + 1];
+        let m2 = dmin * m[2 * j + 1];
+
+        let mut l = 0;
+        while l < 32 {
+            let w1 = d1 * (qs[q_off + l] & 0x0F) as f32 - m1;
+            let w2 = d2 * (qs[q_off + l] >> 4) as f32 - m2;
+            sum += a[j * 64 + l] * w1;
+            sum += a[j * 64 + l + 32] * w2;
+            l += 1;
         }
-        group += 1;
+        j += 1;
     }
     sum
 }
@@ -352,11 +359,16 @@ mod tests {
         // sc[4..8] = 0 (no high bits)
         // m[4..8] = 0
 
-        // Pack nibbles
-        for i in 0..128 {
-            let lo = values[i * 2];
-            let hi = values[i * 2 + 1];
-            block[16 + i] = (lo & 0x0F) | ((hi & 0x0F) << 4);
+        // Pack nibbles in ggml Q4_K interleaved layout:
+        // Each group of 64 elements uses 32 bytes.
+        // Low nibbles of 32 bytes → elements 0..31 (within the 64-elem group)
+        // High nibbles of the same 32 bytes → elements 32..63
+        for j in 0..4 {
+            for l in 0..32 {
+                let lo_val = values[j * 64 + l];
+                let hi_val = values[j * 64 + l + 32];
+                block[16 + j * 32 + l] = (lo_val & 0x0F) | ((hi_val & 0x0F) << 4);
+            }
         }
 
         block

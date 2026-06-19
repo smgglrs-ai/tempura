@@ -549,6 +549,17 @@ items:
   - KvCache optional CompressedKvCache mode (compress on append, decompress on read)
   - Kani harnesses prove compress/decompress bounds-safety (no OOB, no panics)
   - 'DualPipeline comparison: compressed vs uncompressed KvCache divergence report'
+  notes:
+  - 'tech-watch-2026-06-19: TurboQuant confirmed near-lossless at 3.5 bits (absolute
+    quality neutrality) by MarkTechPost comparison article. OSCAR (Together AI) leads
+    at INT2 (2.28 bits, 0.02-point gap from BF16 on Qwen3-32B) with full SGLang
+    integration — a potential second KvCacheCompressor implementation for users who
+    can afford calibration. EpiCache (Apple) complements quantization with episodic
+    clustering eviction for multi-turn (4-6x compression). Article concludes these
+    methods are "more complementary than competitive" — validates the trait-based
+    composable design. OSCAR paper claims TurboQuant drops 40+ points at INT2, but
+    this is below TurboQuant intended range (3-4 bit sweet spot). No competing system
+    does formal verification of KV compression.'
   verification:
     quick: cargo test --package oxide-kernels --package oxide-engine
 - id: p4-kvcache-pool

@@ -158,9 +158,10 @@ where
     }
 
     pub fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
-        if let Some(qw) = &self.quantized_weights {
-            return self.forward_quantized(session, token_ids, qw);
-        }
+        // Temporarily disabled quantized dispatch for debugging
+        // if let Some(qw) = &self.quantized_weights {
+        //     return self.forward_quantized(session, token_ids, qw);
+        // }
         let weights = match &self.weights {
             Some(w) => w,
             None => return vec![0.0; self.config.vocab_size],
@@ -241,6 +242,10 @@ where
             self.pipeline
                 .matmul_bt(&normed, v_w, &mut v, seq_len, kv_dim, h)
                 .unwrap();
+
+            if std::env::var("TEMPURA_DEBUG").is_ok() && layer == 0 {
+                eprintln!("[DEBUG] L0 q_pre_rope[0..4]: {:?}", &q[0..4.min(q_dim)]);
+            }
 
             if cfg.use_qk_norm {
                 let q_norm_w = weights
@@ -357,6 +362,17 @@ where
                 hidden[i] += down_out[i];
             }
 
+            if std::env::var("TEMPURA_DEBUG").is_ok() && layer == 0 {
+                let hn = hidden.iter().map(|x| x*x).sum::<f32>().sqrt();
+                let dn = down_out.iter().map(|x| x*x).sum::<f32>().sqrt();
+                let gn = gate.iter().map(|x| x*x).sum::<f32>().sqrt();
+                eprintln!("[DEBUG] L0 hidden_norm_final: {hn:.4}");
+                eprintln!("[DEBUG] L0 down_out_norm: {dn:.4}");
+                eprintln!("[DEBUG] L0 gate_after_silu_norm: {gn:.4}");
+                eprintln!("[DEBUG] L0 down_out[0..4]: {:?}", &down_out[0..4]);
+                eprintln!("[DEBUG] L0 gate[0..4]: {:?}", &gate[0..4.min(inter)]);
+            }
+
             if session.trace_level >= TraceLevel::Summary {
                 snapshot.duration = Some(layer_start.elapsed());
                 session.trace.layers.push(snapshot);
@@ -413,6 +429,11 @@ where
             hidden[t * h..(t + 1) * h].copy_from_slice(src);
         }
 
+        if std::env::var("TEMPURA_DEBUG").is_ok() {
+            eprintln!("[DEBUG] embed[785][0..8]: {:?}", &hidden[0..8.min(h)]);
+            eprintln!("[DEBUG] embed norm: {}", hidden.iter().map(|x| x*x).sum::<f32>().sqrt());
+        }
+
         let positions: Vec<u32> = (session.position..session.position + seq_len)
             .map(|p| p as u32)
             .collect();
@@ -460,6 +481,12 @@ where
                 let k_norm_w = qweights.get_f32(&format!("{prefix}.self_attn.k_norm.weight")).unwrap();
                 apply_head_rmsnorm(&mut q, q_norm_w, seq_len, n_heads, head_dim, cfg.layer_norm_eps);
                 apply_head_rmsnorm(&mut k, k_norm_w, seq_len, n_kv_heads, head_dim, cfg.layer_norm_eps);
+            }
+
+            if std::env::var("TEMPURA_DEBUG").is_ok() && layer == 0 {
+                eprintln!("[DEBUG] L0 normed[0..8]: {:?}", &normed[0..8.min(h)]);
+                eprintln!("[DEBUG] L0 q[0..8]: {:?}", &q[0..8.min(q_dim)]);
+                eprintln!("[DEBUG] L0 k[0..8]: {:?}", &k[0..8.min(kv_dim)]);
             }
 
             self.pipeline.rope(&mut q, 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();

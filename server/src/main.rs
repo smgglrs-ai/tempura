@@ -279,9 +279,11 @@ async fn run_server(args: ServeArgs) {
 
     let (config, model_id) = if is_gguf {
         let model_p = model_path.unwrap();
-        let gguf = oxide_engine::gguf_loader::GgufLoader::from_file_quantized(model_p).unwrap();
+        let gguf = oxide_engine::gguf_loader::GgufLoader::from_file(model_p).unwrap();
         let config = gguf.config.clone();
         tracing::info!("Loaded GGUF model from {}", model_p.display());
+
+        let model = build_model(&config, &gguf);
 
         let tokenizer = if let Some(path) = args.tokenizer.as_ref() {
             let tok = Tokenizer::from_file(Path::new(path)).unwrap();
@@ -299,14 +301,7 @@ async fn run_server(args: ServeArgs) {
                 }
             }
         };
-
-        let qweights = gguf.to_quantized_weights();
         drop(gguf);
-        let pipeline = KernelPipeline::cpu_verified();
-        let mut model = TransformerModel::new(config.clone(), pipeline);
-        model.quantized_weights = Some(qweights);
-        tracing::info!("Using quantized weights");
-        let model: Arc<dyn oxide_engine::InferenceModel> = Arc::new(model);
 
         let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let metrics_handle = prometheus_builder.install_recorder().unwrap();
