@@ -1,6 +1,6 @@
 +++
 title = "Learn"
-description = "From high-school math to understanding how language models work — a progressive course."
+description = "From zero to understanding how AI language models work — no prerequisites."
 sort_by = "weight"
 weight = 5
 template = "docs/section.html"
@@ -9,28 +9,31 @@ template = "docs/section.html"
 toc = true
 +++
 
-This section builds your understanding from the ground up. No machine learning background required — just high-school algebra and curiosity.
+You don't need a computer science degree. You don't need to know what a neural network is. You don't even need to remember much math from school — we'll rebuild what we need as we go.
 
-Each page introduces one concept, uses it to build the next, and includes worked examples with small, concrete numbers you can verify by hand. By the end, you'll understand what a language model is, how it generates text, and what tempura does to make that process verifiable and observable.
+This section takes you from "I've heard of AI but I don't know how it works" to "I understand what happens inside a language model when it generates text." Each page builds on the previous one, with worked examples using small numbers you can verify with a calculator or by hand.
 
 ## The path
 
-| # | Topic | You'll learn | You'll need |
-|---|-------|-------------|-------------|
-| 1 | [Vectors](vectors/) | How to represent things as lists of numbers | Basic arithmetic |
-| 2 | [Matrices](matrices/) | How to transform vectors, matrix multiplication | Vectors |
-| 3 | [Functions](functions/) | Linear vs non-linear transformations, activation functions | Matrices |
-| 4 | [Probability](probability/) | Distributions, softmax, sampling from distributions | Functions |
-| 5 | [Learning](learning/) | How a model learns from data — loss, gradients, optimization | Probability |
-| 6 | [Neural Networks](neural-networks/) | Composing layers into a network, the forward pass | Learning |
-| 7 | [Words as Numbers](words-as-numbers/) | Tokenization, embeddings, meaning in vector space | Neural networks |
-| 8 | [The Transformer](the-transformer/) | Attention, the architecture that powers modern AI | Everything above |
+| # | Topic | What you'll understand | What you need first |
+|---|-------|----------------------|-------------------|
+| 0 | [What is a Model?](what-is-a-model/) | What AI models actually are (and aren't) | Nothing — start here |
+| 1 | [Vectors](vectors/) | How to represent things as lists of numbers | Chapter 0 |
+| 2 | [Matrices](matrices/) | How to transform vectors systematically | Vectors |
+| 3 | [Functions](functions/) | Why neural networks need non-linearity | Matrices |
+| 4 | [Probability](probability/) | How models express uncertainty and make choices | Functions |
+| 5 | [Learning](learning/) | How a model learns from examples | Probability |
+| 6 | [Neural Networks](neural-networks/) | How layers stack into a thinking machine | Learning |
+| 7 | [Words as Numbers](words-as-numbers/) | How text becomes math | Neural networks |
+| 8 | [The Transformer](the-transformer/) | The architecture behind ChatGPT, Claude, and LLaMA | Everything above |
 | 9 | [Inference](inference/) | What happens when you use a model — and what tempura does | The transformer |
 
 ## How to read this
 
-**Go in order.** Each page builds on the previous one. Skipping ahead will leave gaps.
+**Go in order.** Each page builds on the previous one. If something doesn't make sense, go back one page — you may have missed a building block.
 
-**Do the examples.** When we show $[3, 4] \cdot [1, 2] = 3 \times 1 + 4 \times 2 = 11$, verify it. The numbers are small on purpose — understanding comes from computing, not just reading.
+**Do the examples.** When we compute $3 \times 1 + 4 \times 2 = 11$, do it yourself. When we show a table of numbers, trace through the calculation. Understanding comes from doing, not reading.
 
-**Then read [Foundations](../foundations/).** Once you've completed this track, the Foundations section goes deeper into the specific operations tempura implements — the same concepts, but at the level of detail needed to understand the code and the proofs.
+**Don't worry about remembering everything.** You can always come back. The goal is to build intuition, not memorize formulas.
+
+**Then read [Foundations](../foundations/).** Once you've completed this track, the Foundations section covers the same concepts at implementation depth — with the rigor needed to understand tempura's code and proofs.
