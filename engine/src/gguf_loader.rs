@@ -903,7 +903,7 @@ impl GgufLoader {
             let ne = num_elements as usize;
             let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
 
-            let keep_raw = info.dtype == GgmlType::Q4K
+            let keep_raw = (info.dtype == GgmlType::Q4K || info.dtype == GgmlType::Q6K)
                 && !mapped_name.contains("embed_tokens")
                 && !mapped_name.contains("norm.weight");
 

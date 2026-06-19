@@ -191,11 +191,109 @@ pub fn q6k_dot_block(block: &[u8], a: &[f32]) -> f32 {
     sum
 }
 
+/// F32-domain Q6_K dot product using AVX2 for 6-bit extraction and FMA for accumulation.
+/// Activations stay in f32 — no i8 quantization, no error accumulation across layers.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q6k_dot_block_avx2(block: &[u8], a: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let scales = &block[192..208];
+    let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+
+    let mask_low = _mm256_set1_epi8(0x0F);
+    let mask_2bit = _mm256_set1_epi8(0x03);
+    let offset_32 = _mm256_set1_ps(32.0);
+    let mut acc = _mm256_setzero_ps();
+
+    for half in 0..2usize {
+        let ql_off = half * 64;
+        let qh_off = half * 32;
+        let y_off = half * 128;
+
+        let qh_vec = _mm256_loadu_si256(qh.as_ptr().add(qh_off) as *const __m256i);
+        let ql_a = _mm256_loadu_si256(ql.as_ptr().add(ql_off) as *const __m256i);
+        let ql_b = _mm256_loadu_si256(ql.as_ptr().add(ql_off + 32) as *const __m256i);
+
+        // Extract 6-bit values as u8 (0-63)
+        let q6_0 = _mm256_or_si256(
+            _mm256_and_si256(ql_a, mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(qh_vec, mask_2bit), 4),
+        );
+        let q6_1 = _mm256_or_si256(
+            _mm256_and_si256(ql_b, mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh_vec, 2), mask_2bit), 4),
+        );
+        let q6_2 = _mm256_or_si256(
+            _mm256_and_si256(_mm256_srli_epi16(ql_a, 4), mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh_vec, 4), mask_2bit), 4),
+        );
+        let q6_3 = _mm256_or_si256(
+            _mm256_and_si256(_mm256_srli_epi16(ql_b, 4), mask_low),
+            _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh_vec, 6), mask_2bit), 4),
+        );
+
+        // For each group of 32 elements, process in 4 chunks of 8
+        // q6_0 → elements y_off+0..31, scales half*8+{0,1}
+        // q6_1 → elements y_off+32..63, scales half*8+{2,3}
+        // q6_2 → elements y_off+64..95, scales half*8+{4,5}
+        // q6_3 → elements y_off+96..127, scales half*8+{6,7}
+
+        macro_rules! process_q6_group {
+            ($q6:expr, $elem_off:expr, $sc_base:expr) => {{
+                let q6_vec = $q6;
+                let lo128 = _mm256_castsi256_si128(q6_vec);
+                let hi128 = _mm256_extracti128_si256(q6_vec, 1);
+
+                // Scale for elements 0..15 (is=0) and 16..31 (is=1)
+                let sc0 = d * (scales[$sc_base] as i8 as f32);
+                let sc1 = d * (scales[$sc_base + 1] as i8 as f32);
+                let sc0_vec = _mm256_set1_ps(sc0);
+                let sc1_vec = _mm256_set1_ps(sc1);
+
+                // Chunks 0-1: elements 0..15 with sc0
+                for chunk in 0..2 {
+                    let src = if chunk == 0 { lo128 } else { _mm_srli_si128(lo128, 8) };
+                    let i32v = _mm256_cvtepu8_epi32(src);
+                    let f32v = _mm256_cvtepi32_ps(i32v);
+                    let w = _mm256_mul_ps(sc0_vec, _mm256_sub_ps(f32v, offset_32));
+                    let av = _mm256_loadu_ps(a.as_ptr().add($elem_off + chunk * 8));
+                    acc = _mm256_fmadd_ps(av, w, acc);
+                }
+                // Chunks 2-3: elements 16..31 with sc1
+                for chunk in 0..2 {
+                    let src = if chunk == 0 { hi128 } else { _mm_srli_si128(hi128, 8) };
+                    let i32v = _mm256_cvtepu8_epi32(src);
+                    let f32v = _mm256_cvtepi32_ps(i32v);
+                    let w = _mm256_mul_ps(sc1_vec, _mm256_sub_ps(f32v, offset_32));
+                    let av = _mm256_loadu_ps(a.as_ptr().add($elem_off + 16 + chunk * 8));
+                    acc = _mm256_fmadd_ps(av, w, acc);
+                }
+            }};
+        }
+
+        process_q6_group!(q6_0, y_off,      half * 8);
+        process_q6_group!(q6_1, y_off + 32,  half * 8 + 2);
+        process_q6_group!(q6_2, y_off + 64,  half * 8 + 4);
+        process_q6_group!(q6_3, y_off + 96,  half * 8 + 6);
+    }
+
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let sum128 = _mm_add_ps(lo, hi);
+    let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+    let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
+    _mm_cvtss_f32(sum32)
+}
+
 /// Integer-domain Q6_K dot product with pre-quantized Q8 activations.
-/// Q6_K values are unsigned 0-63. The -32 offset is handled via activation sum correction:
-///   sum(a_i * (d*sc*(q6_i - 32))) = d*sc*(sum(a_q_i * q6_i)*a_scale - 32*sum(a_i))
+/// KNOWN ISSUE: i8 activation quantization error (~2.6%) compounds across layers.
+/// Use q6k_dot_block_avx2 (f32 FMA) instead for correct multi-layer inference.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
+#[allow(dead_code)]
 unsafe fn q6k_dot_q8_avx2(
     block: &[u8],
     a_q8: &[i8],
@@ -856,19 +954,14 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             let a_row = &a[0..k];
 
             #[cfg(target_arch = "x86_64")]
-            if is_x86_feature_detected!("avx2") {
-                let (a_q8, a_scales, a_group_sums) =
-                    unsafe { quantize_row_q8_avx2_q6k(a_row) };
-
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                 for j in 0..n {
                     let mut sum = 0.0f32;
                     for blk in 0..blocks_per_row {
                         let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
                         let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
-                        let aq_slice = &a_q8[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                        let a_sc = a_scales[blk];
-                        let a_gsums = &a_group_sums[blk * Q6K_GROUPS..(blk + 1) * Q6K_GROUPS];
-                        sum += unsafe { q6k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) };
+                        let a_slice = &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
+                        sum += unsafe { q6k_dot_block_avx2(block, a_slice) };
                     }
                     output[j] = sum;
                 }
