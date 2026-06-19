@@ -156,6 +156,19 @@ impl ModelWeights {
             tensors.insert(name.clone(), data);
         }
 
+        // Load optional QK-norm tensors (Qwen3-style per-head norms)
+        if config.use_qk_norm {
+            for i in 0..config.num_layers {
+                let prefix = format!("model.layers.{i}");
+                for suffix in ["self_attn.q_norm.weight", "self_attn.k_norm.weight"] {
+                    let name = format!("{prefix}.{suffix}");
+                    if let Ok(data) = loader.load_tensor(&name) {
+                        tensors.insert(name, data);
+                    }
+                }
+            }
+        }
+
         Ok(Self { tensors })
     }
 

@@ -24,6 +24,7 @@ pub struct ModelConfig {
     pub layer_norm_eps: f32,
     pub tensor_parallel_size: usize,
     pub quantization: Option<QuantConfig>,
+    pub use_qk_norm: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +87,7 @@ impl ModelConfig {
             layer_norm_eps: 1e-5,
             tensor_parallel_size: 1,
             quantization: None,
+            use_qk_norm: false,
         }
     }
 
@@ -103,6 +105,7 @@ impl ModelConfig {
             layer_norm_eps: 1e-5,
             tensor_parallel_size: 1,
             quantization: None,
+            use_qk_norm: false,
         }
     }
 
@@ -120,6 +123,7 @@ impl ModelConfig {
             layer_norm_eps: 1e-5,
             tensor_parallel_size: 1,
             quantization: None,
+            use_qk_norm: false,
         }
     }
 
@@ -185,6 +189,7 @@ impl ModelConfig {
             layer_norm_eps,
             tensor_parallel_size: 1,
             quantization: None,
+            use_qk_norm: false,
         })
     }
 }

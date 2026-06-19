@@ -753,3 +753,22 @@
     exit_reason: "All items complete"
     branch: "loop/2026-06-16-9"
     tag: "loop-run/2026-06-16-1-p11"
+- timestamp: "2026-06-19T09:00:00Z"
+  actor: claude
+  action: session
+  item: "flash-attention-session"
+  summary: "Flash Attention v2 + decode split-K + FP16 KV + llama.cpp benchmarks + e2e model loading"
+  details:
+    completed:
+    - "Flash Attention v2 MMA kernel (30-190x over naive GPU, 152x over CPU at prefill-128)"
+    - "Decode split-K kernel (3-5x over flash-prefill for seq=1, 105x over naive at kv=2048)"
+    - "FP16 KV Flash Attention kernel variant (correct, no perf gain — compute-bound)"
+    - "llama.cpp RTX 5090 benchmarks (8674 t/s pp128, 245 t/s tg128 FA-on)"
+    - "End-to-end model loading: Qwen3-8B GGUF loads and generates (1.32 tok/s CPU, garbled output)"
+    findings:
+    - "Flash Attention is compute-bound, not memory-bound — FP16 KV doesn't help throughput"
+    - "1.8x gap vs llama.cpp at pp4096 is compute efficiency, not memory bandwidth"
+    - "E2E output is garbled — tokenizer extraction or numerics bug"
+    - "32GB f32 weights don't fit in 32GB VRAM — need quantized GEMM or hybrid memory"
+    plan_updates:
+    - "Added Phase E2E: fix garbled output (critical), quantized GEMM (critical), memory management (high)"

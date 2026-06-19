@@ -1655,6 +1655,105 @@ items:
     quick: cargo test --workspace
 
   # ============================================================================
+  # Phase E2E: End-to-End Correctness & Performance
+  # Fix real-model inference, add quantized GEMM, memory management.
+  # ============================================================================
+
+- id: e2e-fix-garbled-output
+  title: Fix garbled output on real model inference
+  description: 'End-to-end inference with Qwen3-8B GGUF produces garbled text
+    ("åľ¨æľªæĿ¥ Becker" etc). The logprobs are reasonable (-0.5 to -3.0), suggesting
+    the model forward pass is computing something meaningful but either: (1) the GGUF
+    tokenizer extraction reconstructs the BPE vocabulary incorrectly (most likely —
+    Qwen3 uses a 151K vocab with complex merges), or (2) there is a subtle numerics
+    bug in the forward pass (wrong transpose, layout mismatch between GGUF weight
+    ordering and our tensor name mapping). Debug by comparing token IDs and decoded
+    text against llama.cpp on the same prompt, and inspecting the tokenizer BPE
+    vocabulary.'
+  status: pending
+  priority: critical
+  effort: M
+  scope:
+  - engine/src/gguf_loader.rs
+  - engine/src/tokenizer.rs
+  - engine/src/model.rs
+  - engine/src/weights.rs
+  acceptance:
+  - "The capital of France is" → model outputs coherent English text
+  - Token IDs match llama.cpp output for the same prompt and temperature=0
+  - Tokenizer encode/decode round-trips correctly for ASCII and Unicode text
+  - At least 3 prompts produce sensible output on CPU inference
+  verification:
+    quick: cargo test --workspace
+
+- id: e2e-quantized-gemm
+  title: Quantized GEMM kernel (Q4_K/Q8_0 blocks → f32 output)
+  description: 'GPU kernel that reads quantized weight blocks directly from VRAM
+    and dequantizes per-thread during the dot product. This is THE critical missing
+    piece for competitive inference — without it, 8B models do not fit in 32GB VRAM
+    (4.9GB quantized vs 32GB f32). The kernel operates on Q4_K blocks (256 elements:
+    f16 scale + f16 min + 256×4-bit deltas = 132 bytes). Each thread dequantizes a
+    block, computes partial dot product with the activation vector, and accumulates.
+    Warp-level reduction produces the final output element. This is what llama.cpp
+    CUDA GEMM kernels do. Start with Q4_K (most common GGUF format), add Q8_0 and
+    Q6_K later. The error bound: max per-element quantization error ≈ scale/16, total
+    dot product error bounded by Cauchy-Schwarz as O(sqrt(d) × scale/16).
+    Verification: DualPipeline comparison of quantized GEMM vs dequantize-then-f32-GEMM
+    within the theoretical error bound.'
+  status: pending
+  priority: critical
+  effort: L
+  scope:
+  - kernels/src/gpu/quantized_gemm_kernel.rs
+  - kernels/src/matmul.rs
+  - engine/src/weights.rs
+  - engine/src/model.rs
+  acceptance:
+  - CudaMatMulQ4K kernel reads Q4_K blocks from DeviceBuffer, dequantizes per-thread
+  - Qwen3-8B Q4_K_M fits entirely in 32GB VRAM (4.9GB weights + KV cache + scratch)
+  - DualPipeline comparison within theoretical error bound vs f32 reference
+  - GPU forward pass works with quantized weights end-to-end
+  - Benchmark at LLaMA-7B scale shows competitive tok/s vs llama.cpp
+  verification:
+    quick: cargo test --workspace
+
+- id: e2e-memory-management
+  title: Hybrid memory management layer (VRAM ↔ system RAM ↔ converged)
+  description: 'Unified memory management supporting three modes:
+    (1) VRAM-only: all weights + KV cache in GPU memory (current, works for small models).
+    (2) Hybrid CPU/GPU: weights partitioned across VRAM and system RAM. Layer-by-layer
+    streaming — upload layer N weights to GPU, compute, discard, upload layer N+1.
+    Peak VRAM = 1 layer of weights + KV cache + scratch, not all layers.
+    (3) Converged: for unified memory architectures (GX10 128GB LPDDR5X, Grace Hopper
+    NVLink-C2C, AMD APU), pin system memory and pass device pointers directly — zero
+    copy. Runtime detection via cudaDeviceGetAttribute(cudaDevAttrUnifiedAddressing).
+    The memory manager is a trait (MemoryPool) with implementations for each mode.
+    Weight tensors are accessed via WeightHandle that abstracts over resident/streaming/
+    pinned backing. ModelConfig gains a memory_mode field (auto/vram/hybrid/converged).
+    Auto mode selects based on model size vs available VRAM.'
+  status: pending
+  priority: high
+  effort: XL
+  depends_on:
+  - e2e-quantized-gemm
+  scope:
+  - engine/src/memory.rs
+  - engine/src/weights.rs
+  - engine/src/model.rs
+  - engine/src/config.rs
+  - kernels/src/gpu/mod.rs
+  acceptance:
+  - MemoryPool trait with alloc/free/pin/stream_to_device/stream_from_device
+  - WeightHandle abstracts over resident (VRAM), streaming (CPU→GPU per layer), pinned (unified)
+  - Hybrid mode runs Qwen3-8B with peak VRAM < 8GB (1 layer + KV + scratch)
+  - Converged mode detects unified memory and avoids copies
+  - Auto mode selects best strategy based on model size vs cudaMemGetInfo
+  - Forward pass works transparently across all modes (same ModelConfig, different memory_mode)
+  - Benchmark comparing VRAM-only vs hybrid latency at various model sizes
+  verification:
+    quick: cargo test --workspace
+
+  # ============================================================================
   # Phase 12: Foundation — Ecosystem Architecture
   # Rename to tempura, split crates, enable runtime model dispatch.
   # ============================================================================

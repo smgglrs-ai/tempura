@@ -636,6 +636,8 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "attn_k.weight" => "self_attn.k_proj.weight",
             "attn_v.weight" => "self_attn.v_proj.weight",
             "attn_output.weight" => "self_attn.o_proj.weight",
+            "attn_q_norm.weight" => "self_attn.q_norm.weight",
+            "attn_k_norm.weight" => "self_attn.k_norm.weight",
             "ffn_gate.weight" => "mlp.gate_proj.weight",
             "ffn_up.weight" => "mlp.up_proj.weight",
             "ffn_down.weight" => "mlp.down_proj.weight",
@@ -801,6 +803,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         layer_norm_eps,
         tensor_parallel_size: 1,
         quantization,
+        use_qk_norm: false,
     })
 }
 
@@ -915,6 +918,8 @@ impl GgufLoader {
                 config.vocab_size = vs;
             }
         }
+
+        config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
 
         Ok(Self {
             tensors,

@@ -7,6 +7,31 @@ use oxide_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
 use serde::Serialize;
 use std::time::Instant;
 
+fn apply_head_rmsnorm(
+    x: &mut [f32],
+    weight: &[f32],
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) {
+    for s in 0..seq_len {
+        for h in 0..num_heads {
+            let offset = (s * num_heads + h) * head_dim;
+            let head = &mut x[offset..offset + head_dim];
+            let mut sum_sq = 0.0f32;
+            for &v in head.iter() {
+                sum_sq += v * v;
+            }
+            let rms = ((sum_sq / head_dim as f32) + eps).sqrt();
+            let inv_rms = 1.0 / rms;
+            for (d, v) in head.iter_mut().enumerate() {
+                *v = *v * inv_rms * weight[d];
+            }
+        }
+    }
+}
+
 pub trait InferenceModel: Send + Sync {
     fn config(&self) -> &ModelConfig;
     fn has_weights(&self) -> bool;
@@ -211,6 +236,17 @@ where
             self.pipeline
                 .matmul_bt(&normed, v_w, &mut v, seq_len, kv_dim, h)
                 .unwrap();
+
+            if cfg.use_qk_norm {
+                let q_norm_w = weights
+                    .get(&format!("{prefix}.self_attn.q_norm.weight"))
+                    .unwrap();
+                let k_norm_w = weights
+                    .get(&format!("{prefix}.self_attn.k_norm.weight"))
+                    .unwrap();
+                apply_head_rmsnorm(&mut q, q_norm_w, seq_len, n_heads, head_dim, cfg.layer_norm_eps);
+                apply_head_rmsnorm(&mut k, k_norm_w, seq_len, n_kv_heads, head_dim, cfg.layer_norm_eps);
+            }
 
             self.pipeline
                 .rope(
@@ -840,6 +876,45 @@ impl
                 &ctx, &stream, &scratch.qkv, &mut scratch.v,
                 seq_len, qkv_dim, q_dim + kv_dim, kv_dim,
             ).expect("slice v");
+
+            // --- QK-norm (Qwen3) ---
+            if cfg.use_qk_norm {
+                let q_norm_w = gpu_weights
+                    .get(&format!("{prefix}.self_attn.q_norm.weight"))
+                    .unwrap();
+                self.pipeline
+                    .rmsnorm
+                    .forward_device(
+                        &scratch.q,
+                        &mut scratch.q_rotated,
+                        q_norm_w,
+                        head_dim,
+                        seq_len * n_heads,
+                        cfg.layer_norm_eps,
+                    )
+                    .expect("qk norm q");
+                oxide_kernels::gpu::copy_region_device(
+                    &ctx, &stream, &scratch.q_rotated, &mut scratch.q, 0, 0, seq_len * q_dim,
+                ).expect("copy q norm");
+
+                let k_norm_w = gpu_weights
+                    .get(&format!("{prefix}.self_attn.k_norm.weight"))
+                    .unwrap();
+                self.pipeline
+                    .rmsnorm
+                    .forward_device(
+                        &scratch.k,
+                        &mut scratch.k_rotated,
+                        k_norm_w,
+                        head_dim,
+                        seq_len * n_kv_heads,
+                        cfg.layer_norm_eps,
+                    )
+                    .expect("qk norm k");
+                oxide_kernels::gpu::copy_region_device(
+                    &ctx, &stream, &scratch.k_rotated, &mut scratch.k, 0, 0, seq_len * kv_dim,
+                ).expect("copy k norm");
+            }
 
             // --- RoPE ---
             self.pipeline
