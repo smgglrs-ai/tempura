@@ -652,6 +652,53 @@ unsafe fn q4k_dot_q8_avx2(
     result
 }
 
+/// VNNI variant: uses _mm256_dpbusd_epi32 (single instruction u8×i8→i32 accumulate)
+/// instead of the two-instruction maddubs+madd chain. ~1.5-2x throughput.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn q4k_dot_q8_vnni(
+    block: &[u8],
+    a_q8: &[i8],
+    a_scale: f32,
+    a_group_sums: &[f32],
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    let d = q4k_block_d(block);
+    let dmin = q4k_block_dmin(block);
+    let packed_scales = &block[4..16];
+    let qs = &block[16..144];
+    let (sc, m) = q4k_unpack_scales(packed_scales);
+
+    let mask_low = _mm256_set1_epi8(0x0F);
+
+    let mut result = 0.0f32;
+
+    for j in 0..4 {
+        let raw = _mm256_loadu_si256(qs.as_ptr().add(j * 32) as *const __m256i);
+        let lo_nib = _mm256_and_si256(raw, mask_low);
+        let hi_nib = _mm256_and_si256(_mm256_srli_epi16(raw, 4), mask_low);
+
+        let aq_lo = _mm256_loadu_si256(a_q8.as_ptr().add(j * 64) as *const __m256i);
+        let aq_hi = _mm256_loadu_si256(a_q8.as_ptr().add(j * 64 + 32) as *const __m256i);
+
+        // dpbusd: for each i32 lane, sum 4 u8×i8 products and accumulate
+        // Replaces maddubs_epi16 + madd_epi16 in a single instruction
+        let s_lo = _mm256_dpbusd_epi32(_mm256_setzero_si256(), lo_nib, aq_lo);
+        let s_hi = _mm256_dpbusd_epi32(_mm256_setzero_si256(), hi_nib, aq_hi);
+
+        let idot_lo = hsum_i32(s_lo);
+        let idot_hi = hsum_i32(s_hi);
+
+        result += d * sc[2 * j] * a_scale * idot_lo as f32;
+        result += d * sc[2 * j + 1] * a_scale * idot_hi as f32;
+        result -= dmin * m[2 * j] * a_group_sums[2 * j];
+        result -= dmin * m[2 * j + 1] * a_group_sums[2 * j + 1];
+    }
+
+    result
+}
+
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
 #[allow(dead_code)]
@@ -898,6 +945,11 @@ impl CpuMatMulQ4KOpt {
         let blocks_per_row = k / Q4K_BLOCK_SIZE;
 
         if preq.is_quantized() {
+            #[cfg(target_arch = "x86_64")]
+            let use_vnni = is_x86_feature_detected!("avxvnni");
+            #[cfg(not(target_arch = "x86_64"))]
+            let use_vnni = false;
+
             let chunk_size = (n / rayon::current_num_threads()).max(64);
             output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, chunk)| {
                 let j_start = chunk_idx * chunk_size;
@@ -910,7 +962,11 @@ impl CpuMatMulQ4KOpt {
                         let aq_slice = &preq.q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
                         let a_sc = preq.scales[blk];
                         let a_gsums = &preq.group_sums_q4k[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
-                        sum += unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) };
+                        sum += if use_vnni {
+                            unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
+                        } else {
+                            unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
+                        };
                     }
                     *out = sum;
                 }
@@ -1031,6 +1087,11 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 let (a_q8, a_scales, a_group_sums) =
                     unsafe { quantize_row_q8_avx2(a_row) };
 
+                #[cfg(target_arch = "x86_64")]
+                let use_vnni = is_x86_feature_detected!("avxvnni");
+                #[cfg(not(target_arch = "x86_64"))]
+                let use_vnni = false;
+
                 let chunk_size = (n / rayon::current_num_threads()).max(64);
                 output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, chunk)| {
                     let j_start = chunk_idx * chunk_size;
@@ -1043,8 +1104,10 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                             let aq_slice = &a_q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
                             let a_sc = a_scales[blk];
                             let a_gsums = &a_group_sums[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
-                            sum += unsafe {
-                                q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums)
+                            sum += if use_vnni {
+                                unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
+                            } else {
+                                unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
                             };
                         }
                         *out = sum;
