@@ -838,6 +838,153 @@ impl CpuMatMulQ4KOpt {
     }
 }
 
+/// Pre-quantized activation data for reuse across multiple matmuls.
+#[cfg(feature = "cpu")]
+pub struct PreQuantizedActivations {
+    pub q8: Vec<i8>,
+    pub scales: Vec<f32>,
+    pub group_sums_q4k: Vec<f32>,
+    pub group_sums_q6k: Vec<f32>,
+    pub k: usize,
+}
+
+#[cfg(feature = "cpu")]
+impl PreQuantizedActivations {
+    pub fn from_f32(a: &[f32]) -> Self {
+        let k = a.len();
+
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            let (q8, scales, group_sums_q4k) = unsafe { quantize_row_q8_avx2(a) };
+            let n_blocks = k / Q6K_BLOCK_SIZE;
+            let mut group_sums_q6k = vec![0.0f32; n_blocks * Q6K_GROUPS];
+            for blk in 0..n_blocks {
+                for g in 0..Q6K_GROUPS {
+                    let mut s = 0.0f32;
+                    for i in 0..Q6K_GROUP_SIZE {
+                        s += a[blk * Q6K_BLOCK_SIZE + g * Q6K_GROUP_SIZE + i];
+                    }
+                    group_sums_q6k[blk * Q6K_GROUPS + g] = s;
+                }
+            }
+            return Self { q8, scales, group_sums_q4k, group_sums_q6k, k };
+        }
+
+        Self {
+            q8: Vec::new(),
+            scales: Vec::new(),
+            group_sums_q4k: Vec::new(),
+            group_sums_q6k: Vec::new(),
+            k,
+        }
+    }
+
+    pub fn is_quantized(&self) -> bool {
+        !self.q8.is_empty()
+    }
+}
+
+#[cfg(feature = "cpu")]
+impl CpuMatMulQ4KOpt {
+    pub fn forward_q4k_preq(
+        &self,
+        preq: &PreQuantizedActivations,
+        a_f32: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        n: usize,
+    ) -> Result<()> {
+        let k = preq.k;
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+
+        if preq.is_quantized() {
+            let chunk_size = (n / rayon::current_num_threads()).max(64);
+            output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, chunk)| {
+                let j_start = chunk_idx * chunk_size;
+                for (local, out) in chunk.iter_mut().enumerate() {
+                    let j = j_start + local;
+                    let mut sum = 0.0f32;
+                    for blk in 0..blocks_per_row {
+                        let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                        let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                        let aq_slice = &preq.q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                        let a_sc = preq.scales[blk];
+                        let a_gsums = &preq.group_sums_q4k[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
+                        sum += unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) };
+                    }
+                    *out = sum;
+                }
+            });
+        } else {
+            let chunk_size = (n / rayon::current_num_threads()).max(64);
+            output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, chunk)| {
+                let j_start = chunk_idx * chunk_size;
+                for (local, out) in chunk.iter_mut().enumerate() {
+                    let j = j_start + local;
+                    let mut sum = 0.0f32;
+                    for blk in 0..blocks_per_row {
+                        let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                        let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                        let a_slice = &a_f32[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                        sum += q4k_dot_block(block, a_slice);
+                    }
+                    *out = sum;
+                }
+            });
+        }
+        Ok(())
+    }
+
+    pub fn forward_q6k_preq(
+        &self,
+        _preq: &PreQuantizedActivations,
+        a_f32: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        n: usize,
+    ) -> Result<()> {
+        let k = _preq.k;
+        let blocks_per_row = k / Q6K_BLOCK_SIZE;
+
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            let chunk_size = (n / rayon::current_num_threads()).max(64);
+            output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(ci, chunk)| {
+                let j_start = ci * chunk_size;
+                for (local, out) in chunk.iter_mut().enumerate() {
+                    let j = j_start + local;
+                    let mut sum = 0.0f32;
+                    for blk in 0..blocks_per_row {
+                        let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                        let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
+                        let a_slice = &a_f32[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
+                        sum += unsafe { q6k_dot_block_avx2(block, a_slice) };
+                    }
+                    *out = sum;
+                }
+            });
+            return Ok(());
+        }
+
+        let chunk_size = (n / rayon::current_num_threads()).max(64);
+        output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(ci, chunk)| {
+            let j_start = ci * chunk_size;
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let j = j_start + local;
+                let mut sum = 0.0f32;
+                for blk in 0..blocks_per_row {
+                    let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                    let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
+                    let a_slice = &a_f32[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
+                    sum += q6k_dot_block(block, a_slice);
+                }
+                *out = sum;
+            }
+        });
+        Ok(())
+    }
+}
+
 #[cfg(feature = "cpu")]
 impl MatMulQ for CpuMatMulQ4KOpt {
     fn forward_b_transposed_q4k(

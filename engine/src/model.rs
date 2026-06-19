@@ -421,10 +421,26 @@ where
         let seq_len = token_ids.len();
 
         let q4k = oxide_kernels::quantized::CpuMatMulQ4KOpt;
-        use oxide_kernels::quantized::MatMulQ;
+        use oxide_kernels::quantized::{MatMulQ, PreQuantizedActivations};
+
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let inter = cfg.intermediate_size;
+
+        // Pre-allocate scratchpad buffers (reused across layers)
+        let mut hidden = vec![0.0f32; seq_len * h];
+        let mut normed = vec![0.0f32; seq_len * h];
+        let mut q = vec![0.0f32; seq_len * q_dim];
+        let mut k = vec![0.0f32; seq_len * kv_dim];
+        let mut v = vec![0.0f32; seq_len * kv_dim];
+        let mut attn_out = vec![0.0f32; seq_len * q_dim];
+        let mut o_proj = vec![0.0f32; seq_len * h];
+        let mut normed2 = vec![0.0f32; seq_len * h];
+        let mut gate = vec![0.0f32; seq_len * inter];
+        let mut up = vec![0.0f32; seq_len * inter];
+        let mut down_out = vec![0.0f32; seq_len * h];
 
         let embed = qweights.get_f32("model.embed_tokens.weight").unwrap();
-        let mut hidden = vec![0.0f32; seq_len * h];
         for (t, &tok) in token_ids.iter().enumerate() {
             let src = &embed[tok as usize * h..(tok as usize + 1) * h];
             hidden[t * h..(t + 1) * h].copy_from_slice(src);
@@ -439,35 +455,49 @@ where
             .map(|p| p as u32)
             .collect();
 
+        // Helper: dispatch quantized matmul. Uses pre-quantized activations for m=1 decode.
+        let qmm = |preq: Option<&PreQuantizedActivations>, a_f32: &[f32], name: &str, out: &mut [f32], m: usize, n: usize, k: usize| {
+            if m == 1 {
+                if let Some(pq) = preq {
+                    if let Some(w) = qweights.get_q4k(name) {
+                        q4k.forward_q4k_preq(pq, a_f32, w, out, n).unwrap();
+                        return;
+                    }
+                    if let Some(w) = qweights.get_q6k(name) {
+                        q4k.forward_q6k_preq(pq, a_f32, w, out, n).unwrap();
+                        return;
+                    }
+                }
+            }
+            if let Some(w) = qweights.get_q4k(name) {
+                q4k.forward_b_transposed_q4k(a_f32, w, out, m, n, k).unwrap();
+            } else if let Some(w) = qweights.get_q6k(name) {
+                q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k).unwrap();
+            } else {
+                let w = qweights.get_f32(name).unwrap();
+                self.pipeline.matmul_bt(a_f32, w, out, m, n, k).unwrap();
+            }
+        };
+
         for layer in 0..cfg.num_layers {
             let prefix = format!("model.layers.{layer}");
 
-            // attention block
-            let mut normed = hidden.clone();
+            // RMSNorm → normed
+            normed.copy_from_slice(&hidden);
             let input_ln_w = qweights.get_f32(&format!("{prefix}.input_layernorm.weight")).unwrap();
             self.pipeline.rmsnorm(&mut normed, input_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
 
-            let q_dim = n_heads * head_dim;
-            let kv_dim = n_kv_heads * head_dim;
-            let mut q = vec![0.0f32; seq_len * q_dim];
-            let mut k = vec![0.0f32; seq_len * kv_dim];
-            let mut v = vec![0.0f32; seq_len * kv_dim];
+            let normed_preq = if seq_len == 1 { Some(PreQuantizedActivations::from_f32(&normed[..h])) } else { None };
 
             let q_w_name = format!("{prefix}.self_attn.q_proj.weight");
             let k_w_name = format!("{prefix}.self_attn.k_proj.weight");
             let v_w_name = format!("{prefix}.self_attn.v_proj.weight");
             let o_w_name = format!("{prefix}.self_attn.o_proj.weight");
 
-            for (name, out, out_dim) in [(&q_w_name, &mut q, q_dim), (&k_w_name, &mut k, kv_dim), (&v_w_name, &mut v, kv_dim)] {
-                if let Some(w) = qweights.get_q4k(name) {
-                    q4k.forward_b_transposed_q4k(&normed, w, out, seq_len, out_dim, h).unwrap();
-                } else if let Some(w) = qweights.get_q6k(name) {
-                    q4k.forward_b_transposed_q6k(&normed, w, out, seq_len, out_dim, h).unwrap();
-                } else {
-                    let w = qweights.get_f32(name).unwrap();
-                    self.pipeline.matmul_bt(&normed, w, out, seq_len, out_dim, h).unwrap();
-                }
-            }
+            q.fill(0.0); k.fill(0.0); v.fill(0.0);
+            qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q[..seq_len * q_dim], seq_len, q_dim, h);
+            qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..seq_len * kv_dim], seq_len, kv_dim, h);
+            qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..seq_len * kv_dim], seq_len, kv_dim, h);
 
             if cfg.use_qk_norm {
                 let q_norm_w = qweights.get_f32(&format!("{prefix}.self_attn.q_norm.weight")).unwrap();
@@ -476,77 +506,46 @@ where
                 apply_head_rmsnorm(&mut k, k_norm_w, seq_len, n_kv_heads, head_dim, cfg.layer_norm_eps);
             }
 
-            if std::env::var("TEMPURA_DEBUG").is_ok() && layer == 0 {
-                eprintln!("[DEBUG] L0 normed[0..8]: {:?}", &normed[0..8.min(h)]);
-                eprintln!("[DEBUG] L0 q[0..8]: {:?}", &q[0..8.min(q_dim)]);
-                eprintln!("[DEBUG] L0 k[0..8]: {:?}", &k[0..8.min(kv_dim)]);
-            }
-
             self.pipeline.rope(&mut q, 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
             self.pipeline.rope(&mut k, 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
 
-            session.cache.append_kv(layer, &k, &v, seq_len);
+            session.cache.append_kv(layer, &k[..seq_len * kv_dim], &v[..seq_len * kv_dim], seq_len);
             let kv_len = session.cache.seq_len + seq_len;
             let k_cache = session.cache.k_data(layer, kv_len);
             let v_cache = session.cache.v_data(layer, kv_len);
 
-            let mut attn_out = vec![0.0f32; seq_len * q_dim];
-            self.pipeline.attention(&q, &k_cache, &v_cache, &mut attn_out, 1, seq_len, kv_len, n_heads, n_kv_heads, head_dim, 1.0 / (head_dim as f32).sqrt()).unwrap();
+            attn_out.fill(0.0);
+            self.pipeline.attention(&q, &k_cache, &v_cache, &mut attn_out[..seq_len * q_dim], 1, seq_len, kv_len, n_heads, n_kv_heads, head_dim, 1.0 / (head_dim as f32).sqrt()).unwrap();
 
-            let mut o_proj = vec![0.0f32; seq_len * h];
-            if let Some(w) = qweights.get_q4k(&o_w_name) {
-                q4k.forward_b_transposed_q4k(&attn_out, w, &mut o_proj, seq_len, h, q_dim).unwrap();
-            } else if let Some(w) = qweights.get_q6k(&o_w_name) {
-                q4k.forward_b_transposed_q6k(&attn_out, w, &mut o_proj, seq_len, h, q_dim).unwrap();
-            } else {
-                let w = qweights.get_f32(&o_w_name).unwrap();
-                self.pipeline.matmul_bt(&attn_out, w, &mut o_proj, seq_len, h, q_dim).unwrap();
-            }
-            for i in 0..hidden.len() {
-                hidden[i] += o_proj[i];
-            }
+            o_proj.fill(0.0);
+            let attn_preq = if seq_len == 1 { Some(PreQuantizedActivations::from_f32(&attn_out[..q_dim])) } else { None };
+            qmm(attn_preq.as_ref(), &attn_out[..seq_len * q_dim], &o_w_name, &mut o_proj[..seq_len * h], seq_len, h, q_dim);
+            for i in 0..seq_len * h { hidden[i] += o_proj[i]; }
 
             // FFN block
-            let mut normed2 = hidden.clone();
+            normed2.copy_from_slice(&hidden);
             let post_ln_w = qweights.get_f32(&format!("{prefix}.post_attention_layernorm.weight")).unwrap();
             self.pipeline.rmsnorm(&mut normed2, post_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
 
-            let inter = cfg.intermediate_size;
+            let normed2_preq = if seq_len == 1 { Some(PreQuantizedActivations::from_f32(&normed2[..h])) } else { None };
+
             let gate_w_name = format!("{prefix}.mlp.gate_proj.weight");
             let up_w_name = format!("{prefix}.mlp.up_proj.weight");
             let down_w_name = format!("{prefix}.mlp.down_proj.weight");
 
-            let mut gate = vec![0.0f32; seq_len * inter];
-            let mut up = vec![0.0f32; seq_len * inter];
+            gate.fill(0.0); up.fill(0.0);
+            qmm(normed2_preq.as_ref(), &normed2, &gate_w_name, &mut gate[..seq_len * inter], seq_len, inter, h);
+            qmm(normed2_preq.as_ref(), &normed2, &up_w_name, &mut up[..seq_len * inter], seq_len, inter, h);
 
-            for (name, out, out_dim) in [(&gate_w_name, &mut gate, inter), (&up_w_name, &mut up, inter)] {
-                if let Some(w) = qweights.get_q4k(name) {
-                    q4k.forward_b_transposed_q4k(&normed2, w, out, seq_len, out_dim, h).unwrap();
-                } else if let Some(w) = qweights.get_q6k(name) {
-                    q4k.forward_b_transposed_q6k(&normed2, w, out, seq_len, out_dim, h).unwrap();
-                } else {
-                    let w = qweights.get_f32(name).unwrap();
-                    self.pipeline.matmul_bt(&normed2, w, out, seq_len, out_dim, h).unwrap();
-                }
-            }
-
-            for i in 0..gate.len() {
+            for i in 0..seq_len * inter {
                 let silu = gate[i] / (1.0 + (-gate[i]).exp());
                 gate[i] = silu * up[i];
             }
 
-            let mut down_out = vec![0.0f32; seq_len * h];
-            if let Some(w) = qweights.get_q4k(&down_w_name) {
-                q4k.forward_b_transposed_q4k(&gate, w, &mut down_out, seq_len, h, inter).unwrap();
-            } else if let Some(w) = qweights.get_q6k(&down_w_name) {
-                q4k.forward_b_transposed_q6k(&gate, w, &mut down_out, seq_len, h, inter).unwrap();
-            } else {
-                let w = qweights.get_f32(&down_w_name).unwrap();
-                self.pipeline.matmul_bt(&gate, w, &mut down_out, seq_len, h, inter).unwrap();
-            }
-            for i in 0..hidden.len() {
-                hidden[i] += down_out[i];
-            }
+            down_out.fill(0.0);
+            let gate_preq = if seq_len == 1 { Some(PreQuantizedActivations::from_f32(&gate[..inter])) } else { None };
+            qmm(gate_preq.as_ref(), &gate[..seq_len * inter], &down_w_name, &mut down_out[..seq_len * h], seq_len, h, inter);
+            for i in 0..seq_len * h { hidden[i] += down_out[i]; }
         }
 
         session.cache.advance(seq_len);
