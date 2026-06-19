@@ -174,6 +174,8 @@ impl Sampler for CudaSampler {
 
 #[cfg(kani)]
 mod kani_proofs {
+    use super::Sampler;
+
     #[kani::proof]
     fn sampler_top_k_index_in_bounds() {
         let vocab_size: usize = kani::any();

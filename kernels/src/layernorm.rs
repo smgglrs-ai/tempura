@@ -76,6 +76,8 @@ impl LayerNorm for CudaLayerNorm {
 
 #[cfg(kani)]
 mod kani_proofs {
+    use super::LayerNorm;
+
     #[kani::proof]
     fn layernorm_indices_in_bounds() {
         let hidden_size: usize = kani::any();

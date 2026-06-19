@@ -181,6 +181,8 @@ impl RMSNorm for CudaRMSNorm {
 
 #[cfg(kani)]
 mod kani_proofs {
+    use super::RMSNorm;
+
     #[kani::proof]
     fn rmsnorm_indices_in_bounds() {
         let hidden_size: usize = kani::any();
