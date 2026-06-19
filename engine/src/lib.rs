@@ -34,4 +34,4 @@ pub use trace::{
 };
 #[cfg(feature = "cuda")]
 pub use weights::GpuWeights;
-pub use weights::ModelWeights;
+pub use weights::{ModelWeights, QuantizedWeights};

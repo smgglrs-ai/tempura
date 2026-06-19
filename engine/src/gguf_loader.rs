@@ -27,7 +27,7 @@ pub enum GgufValue {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-enum GgmlType {
+pub enum GgmlType {
     F32 = 0,
     F16 = 1,
     Q4_0 = 2,
@@ -810,6 +810,8 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
 #[derive(Debug)]
 pub struct GgufLoader {
     tensors: HashMap<String, Vec<f32>>,
+    raw_tensors: HashMap<String, Vec<u8>>,
+    tensor_dtypes: HashMap<String, GgmlType>,
     pub config: ModelConfig,
     pub metadata: HashMap<String, GgufValue>,
 }
@@ -869,6 +871,8 @@ impl GgufLoader {
         let data_start = offset.div_ceil(ALIGNMENT) * ALIGNMENT;
 
         let mut tensors = HashMap::new();
+        let mut raw_tensors = HashMap::new();
+        let mut tensor_dtypes = HashMap::new();
         for info in &tensor_infos {
             let num_elements: u64 = info.dims.iter().product();
             let byte_size = tensor_data_size(info.dtype, num_elements) as usize;
@@ -904,6 +908,8 @@ impl GgufLoader {
             };
 
             let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
+            raw_tensors.insert(mapped_name.clone(), tensor_data.to_vec());
+            tensor_dtypes.insert(mapped_name.clone(), info.dtype);
             tensors.insert(mapped_name, floats);
         }
 
@@ -923,9 +929,41 @@ impl GgufLoader {
 
         Ok(Self {
             tensors,
+            raw_tensors,
+            tensor_dtypes,
             config,
             metadata,
         })
+    }
+}
+
+impl GgufLoader {
+    pub fn to_quantized_weights(&self) -> crate::weights::QuantizedWeights {
+        let mut q4k_tensors = HashMap::new();
+        let mut f32_tensors = HashMap::new();
+
+        for (name, dtype) in &self.tensor_dtypes {
+            match dtype {
+                GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K
+                | GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q8_0
+                | GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q5_0 | GgmlType::Q5_1 => {
+                    if let Some(raw) = self.raw_tensors.get(name) {
+                        q4k_tensors.insert(name.clone(), raw.clone());
+                    }
+                }
+                _ => {
+                    if let Some(f32_data) = self.tensors.get(name) {
+                        f32_tensors.insert(name.clone(), f32_data.clone());
+                    }
+                }
+            }
+        }
+
+        crate::weights::QuantizedWeights::new(q4k_tensors, f32_tensors)
+    }
+
+    pub fn tensor_dtype(&self, name: &str) -> Option<GgmlType> {
+        self.tensor_dtypes.get(name).copied()
     }
 }
 

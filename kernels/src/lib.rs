@@ -5,6 +5,7 @@ pub mod gpu;
 pub mod guided;
 pub mod layernorm;
 pub mod matmul;
+pub mod quantized;
 pub mod rmsnorm;
 pub mod rope;
 pub mod sampling;
@@ -19,6 +20,7 @@ pub use matmul::MatMul;
 pub use rmsnorm::RMSNorm;
 pub use rope::RoPE;
 pub use sampling::{Sampler, SamplingParams};
+pub use quantized::MatMulQ;
 pub use turboquant::KvCacheCompressor;
 
 #[derive(Debug, thiserror::Error)]

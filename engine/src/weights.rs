@@ -216,6 +216,26 @@ impl ModelWeights {
     }
 }
 
+#[derive(Debug)]
+pub struct QuantizedWeights {
+    q4k_tensors: HashMap<String, Vec<u8>>,
+    f32_tensors: HashMap<String, Vec<f32>>,
+}
+
+impl QuantizedWeights {
+    pub fn new(q4k_tensors: HashMap<String, Vec<u8>>, f32_tensors: HashMap<String, Vec<f32>>) -> Self {
+        Self { q4k_tensors, f32_tensors }
+    }
+
+    pub fn get_q4k(&self, name: &str) -> Option<&[u8]> {
+        self.q4k_tensors.get(name).map(|v| v.as_slice())
+    }
+
+    pub fn get_f32(&self, name: &str) -> Option<&[f32]> {
+        self.f32_tensors.get(name).map(|v| v.as_slice())
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub struct GpuWeights {
     tensors: HashMap<String, cuda_core::DeviceBuffer<f32>>,
