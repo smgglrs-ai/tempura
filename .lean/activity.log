@@ -772,3 +772,47 @@
     - "32GB f32 weights don't fit in 32GB VRAM — need quantized GEMM or hybrid memory"
     plan_updates:
     - "Added Phase E2E: fix garbled output (critical), quantized GEMM (critical), memory management (high)"
+
+- timestamp: "2026-06-19T16:00:00+02:00"
+  actor: claude
+  action: tech-watch
+  summary: >
+    2 sources analyzed (reactive mode). Enriched p3-turboquant with competitive
+    landscape: TurboQuant confirmed near-lossless at 3.5 bits, OSCAR leads INT2
+    (2.28 bits), EpiCache complements both with episodic eviction. Investigating
+    OSCAR as potential second KvCacheCompressor. Watching EpiCache for multi-turn.
+    Dismissed PEFT article (fine-tuning, not serving). No verification found in
+    any competing KV compression system — Kani proofs remain unique.
+- timestamp: "2026-06-19T21:00:00Z"
+  actor: claude
+  action: session
+  item: "quantized-inference-session"
+  summary: "Quantized CPU inference: e2e correct output at 1.14 tok/s, 7.4GB, 45 Kani proofs"
+  details:
+    completed:
+    - "Flash Attention v2 MMA kernel (30-190x over naive GPU)"
+    - "Decode split-K kernel (3-5x over flash-prefill for seq=1)"
+    - "FP16 KV Flash Attention kernel variant"
+    - "llama.cpp RTX 5090 head-to-head benchmarks"
+    - "Q4_K/Q6_K dequantization fixes (3 bugs: nibble interleave, scale bits, Q6K layout)"
+    - "Qwen3 QK-norm support (per-head RMSNorm)"
+    - "CpuMatMulQ4K scalar reference + 5 Kani proofs"
+    - "CpuMatMulQ4KOpt: AVX2 FMA → maddubs integer dot → VNNI dpbusd"
+    - "Q6K i16 integer dot (madd_epi16, 256x less error than i8)"
+    - "Rayon multithreaded matmul + fused Q+K / gate+up dispatches"
+    - "Pre-allocated scratchpad + shared activation quantization"
+    - "Pre-computed weight names (eliminate 396 string allocs/token)"
+    - "Quantized inference path (QuantizedWeights, forward_quantized)"
+    - "GGUF from_file_quantized (Q4K/Q6K raw, no f32 dequant)"
+    - "6 additional Kani proofs for Q4K/Q6K dequantization"
+    - "End-to-end: 'The capital of France is' → 'Paris' (correct!)"
+    metrics:
+      tok_per_sec: 1.14
+      memory_gb: 7.4
+      kani_proofs: 45
+      tests: 185
+    next:
+    - "GPU quantized GEMM (CudaMatMulQ4K) — fits 8B model in 32GB VRAM"
+    - "Hybrid memory management (VRAM ↔ system RAM ↔ converged)"
+    - "Tighter SIMD inner loop for Q4K (assembly-level, ~3x gap to llama.cpp)"
+    - "Residual+RMSNorm fusion"

@@ -61,6 +61,7 @@ Three-crate workspace:
 - No comments unless the WHY is non-obvious
 - Tests go in `#[cfg(test)] mod tests` at bottom of each file
 - Feature flags: `cpu` (default), `cuda` (future)
+- NEVER RUN MULTIPLE INSTANCES AT THE SAME TIME. CHECK AVAILABLE MEMORY.
 
 ## What's Implemented
 
