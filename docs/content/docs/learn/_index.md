@@ -1,6 +1,6 @@
 +++
 title = "Learn"
-description = "From zero to understanding AI — math, transformers, GPU hardware, and formal verification."
+description = "From zero to operating a production inference server — math, hardware, serving, and verification."
 sort_by = "weight"
 weight = 5
 template = "docs/section.html"
@@ -24,11 +24,19 @@ id = "kernel-math"
 [[extra.sidebar_parts]]
 title = "Part IV: Verification"
 id = "verification"
+
+[[extra.sidebar_parts]]
+title = "Part V: Serving"
+id = "serving"
+
+[[extra.sidebar_parts]]
+title = "Part VI: Production"
+id = "production"
 +++
 
 You don't need a computer science degree. You don't need to know what a neural network is. You do need basic arithmetic and simple algebra — multiplication, fractions, and expressions like $f(x) = 2x + 3$. Everything beyond that, we build from scratch.
 
-This section takes you from "I've heard of AI but I don't know how it works" all the way to understanding how GPU kernels are formally verified.
+This section takes you from "I've heard of AI but I don't know how it works" all the way to understanding how to build, verify, and operate a production inference server.
 
 ## Part I: The Math
 
@@ -56,9 +64,7 @@ This section takes you from "I've heard of AI but I don't know how it works" all
 | 13 | [cuda-oxide](cuda-oxide/) | GPU kernels in Rust — what cuda-oxide changes |
 | 14 | [From Math to Metal](from-math-to-metal/) | How tempura maps attention and matmul to GPU hardware |
 
-## Part III: Foundations
-
-### Kernel math
+## Part III: Kernel Math
 
 | # | Topic | What you'll understand |
 |---|-------|----------------------|
@@ -78,16 +84,43 @@ This section takes you from "I've heard of AI but I don't know how it works" all
 | 23 | [DualPipeline](dual-pipeline/) | Empirical equivalence testing — what formal proofs miss |
 | 24 | [Verification Tiers](verification-tiers/) | Proven, Tested, Compiled — what each tier guarantees |
 
+## Part V: Serving
+
+| # | Topic | What you'll understand |
+|---|-------|----------------------|
+| 25 | HTTP and APIs | What REST is, request/response, why OpenAI's API became the standard |
+| 26 | Chat Templates | How chat messages become token sequences — Jinja2, ChatML, role markers |
+| 27 | Streaming | SSE, token-by-token delivery, why users see text appear word by word |
+| 28 | Continuous Batching | Why serving one request at a time is wasteful, how requests enter/exit mid-step |
+| 29 | PagedAttention | Virtual memory for KV cache — pages, block tables, copy-on-write prefix sharing |
+| 30 | Tool Calling and Structured Output | Function calling, JSON mode, guided decoding, grammar-based constraints |
+| 31 | Speculative Decoding | Draft-verify loop, why a small fast model + a large slow model beats one medium model |
+
+## Part VI: Production
+
+| # | Topic | What you'll understand |
+|---|-------|----------------------|
+| 32 | Observability | Prometheus metrics (TTFT, ITL, queue depth), OpenTelemetry, what to alert on |
+| 33 | Kernel Fusion and CUDA Graphs | Fusing operations, capturing the forward pass, eliminating launch overhead |
+| 34 | Performance Tuning | Prefill vs decode bottlenecks, FP8 KV cache, FlashDecoding, batch size tuning |
+| 35 | Deployment | Containers, health/readiness probes, graceful shutdown, resource sizing |
+| 36 | Multi-GPU and Scaling | Tensor parallelism, disaggregated prefill/decode, when to scale out vs up |
+| 37 | Security and Isolation | Batch isolation (and how Kani proves it), cache_salt, request timeouts |
+
 ## How to read this
 
-**Part I** stands alone — stop after Chapter 9 and you'll understand how language models work, end to end. No hardware or verification knowledge needed.
+**Part I** stands alone — stop after Chapter 9 and you'll understand how language models work, end to end.
 
-**Part II** explains how the math runs on GPUs. Read this if you want to understand why inference is fast, what cuda-oxide changes, and how tempura's kernels map to hardware.
+**Part II** explains how the math runs on GPUs — threads, memory, kernels, cuda-oxide.
 
-**Part III** covers each kernel's math at implementation depth — equations, numerical considerations, and links to the source code.
+**Part III** covers each kernel's math at implementation depth — equations, numerical stability, and links to the source code.
 
-**Part IV** covers the verification system — what Kani proves, how to read proof harnesses, compositionality, DualPipeline, and verification tiers. Read this if you want to understand or contribute to tempura's proofs.
+**Part IV** covers the verification system — what Kani proves, how to read proofs, compositionality, DualPipeline.
 
-**Go in order** within each part. Parts II, III, and IV can be read in any order after Part I.
+**Part V** explains what makes an inference *server* — APIs, batching, memory management, tool calling. This is where PagedAttention, streaming, and speculative decoding live.
+
+**Part VI** covers operating a production server — observability, performance tuning, deployment, multi-GPU, and security.
+
+**Go in order** within each part. After Part I, the other parts can be read in any order based on interest.
 
 **Do the examples.** The numbers are small on purpose — understanding comes from computing, not reading.

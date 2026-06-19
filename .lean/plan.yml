@@ -2443,30 +2443,302 @@ items:
 
 - id: p19-learn
   title: "Learn: from high-school math to inference"
-  description: 'A progressive educational track that starts from high-school
-    mathematics and builds to understanding what a language model is and how
-    inference works. Each page builds on the previous one, introducing only
-    the concepts needed for the next step. The goal: a reader with no ML
-    background can follow the entire track and understand what tempura does
-    and why. Pages: (1) Vectors — arrays of numbers, dot products, similarity.
-    (2) Matrices — transformations, matrix multiplication. (3) Functions —
-    linear vs non-linear, activation functions. (4) Probability — distributions,
-    softmax, sampling. (5) Learning — loss functions, gradients, the idea of
-    optimization. (6) Neural networks — composing layers, the forward pass.
-    (7) Words as numbers — tokenization, embeddings. (8) The transformer —
-    attention as the core mechanism. (9) From training to inference — what
-    tempura does and where it sits. KaTeX for all equations, worked numerical
-    examples throughout.'
+  description: 'Progressive educational track in 6 parts: Part I (Math, ch.0-9),
+    Part II (Hardware, ch.10-14), Part III (Kernel Math, ch.15-19), Part IV
+    (Verification, ch.20-24), Part V (Serving, ch.25-31), Part VI (Production,
+    ch.32-37). 37 chapters total, from "what is AI" to "how to operate a
+    production inference cluster."'
   status: in_progress
   priority: high
   effort: XL
   scope:
   - docs/content/docs/learn/
   acceptance:
-  - 9 pages forming a progressive curriculum with KaTeX equations
-  - Each page includes worked numerical examples with small concrete numbers
-  - A reader with high-school math (algebra, basic functions) can follow without external references
-  - The final page connects to tempura and links to the Foundations section for depth
-  - Pages build strictly on prior pages — no forward references to unexplained concepts
+  - 37 pages forming a progressive curriculum with KaTeX equations
+  - Each page includes worked numerical examples
+  - Parts I-IV complete, Parts V-VI scaffolded
+  - Sidebar groups pages by part with headers
   verification:
     quick: cd docs && zola build
+
+  # ============================================================================
+  # Phase 20: Memory — PagedAttention + FP8 KV Cache
+  # Table-stakes memory management for production throughput.
+  # ============================================================================
+
+- id: p20-paged-attention
+  title: PagedAttention — virtual memory for KV cache
+  description: 'Replace contiguous KV cache allocation with paged allocation.
+    Divide GPU memory into fixed-size pages (e.g., 16 tokens). Each request
+    maps logical KV positions to physical pages via a block table. Pages
+    allocated on demand, freed immediately on completion. The Attention trait
+    gains a block_table parameter. The attention kernel reads K/V through
+    the block table. KvCachePool becomes a page allocator. BatchScheduler
+    tracks pages per request, preempts by releasing pages. Prefix sharing
+    becomes copy-on-write at the page level.'
+  status: pending
+  priority: critical
+  effort: XL
+  depends_on:
+  - p12-crate-split
+  scope:
+  - kernel-api/src/lib.rs
+  - kernels/src/attention.rs
+  - kernels/src/gpu/mod.rs
+  - engine/src/kv_cache.rs
+  - engine/src/session.rs
+  - server/src/batch.rs
+  acceptance:
+  - Attention trait accepts block_table parameter for paged KV access
+  - KvCachePool allocates/frees fixed-size pages, not contiguous slots
+  - Block table maps logical position to physical page + offset
+  - Prefix sharing via copy-on-write pages
+  - 'Memory utilization: <5% waste vs ~90% waste with contiguous allocation'
+  - Kani proof for block table index arithmetic (logical → physical offset in bounds)
+  - DualPipeline confirms paged attention matches contiguous attention numerically
+  - Existing tests pass unchanged
+  verification:
+    quick: cargo test --workspace
+
+- id: p20-fp8-kv-cache
+  title: FP8 KV cache — halve cache memory
+  description: 'Store KV cache values in FP8 (E4M3 or E5M2) instead of FP16,
+    halving per-token cache memory. Quantize K/V on write, dequantize on read
+    during attention. The quantization is per-page (one scale per page of 16
+    tokens). Kani proves the quantization index arithmetic. DualPipeline
+    verifies FP8 vs FP16 output divergence is within acceptable epsilon.'
+  status: pending
+  priority: high
+  effort: L
+  depends_on:
+  - p20-paged-attention
+  scope:
+  - engine/src/kv_cache.rs
+  - kernels/src/attention.rs
+  acceptance:
+  - KV cache supports FP8 storage mode (configurable, FP16 remains default)
+  - Per-page scale factors for FP8 quantization
+  - DualPipeline FP8 vs FP16 divergence within 1e-3 per layer
+  - Memory reduction confirmed (2x more sequences at same GPU memory)
+  verification:
+    quick: cargo test --workspace
+
+  # ============================================================================
+  # Phase 21: Kernel Fusion — CUDA Graphs + Fused Operations
+  # Eliminate kernel launch overhead, reduce HBM traffic.
+  # ============================================================================
+
+- id: p21-fused-kernels
+  title: Fused kernels — RMSNorm+residual, SiLU×gate
+  description: 'Combine commonly sequential operations into single kernel
+    launches to reduce HBM traffic and kernel launch overhead. Priority
+    fusions: (1) RMSNorm + residual add — read hidden state once, normalize
+    and add residual in one pass. (2) SiLU activation × gate multiply —
+    the gated FFN pattern. (3) Bias + residual add. Each fused kernel has
+    a Kani proof and DualPipeline comparison against the sequential version.'
+  status: pending
+  priority: high
+  effort: L
+  depends_on:
+  - p12-crate-split
+  scope:
+  - kernels/src/fused.rs
+  - kernels/src/gpu/fused.rs
+  - engine/src/model.rs
+  acceptance:
+  - Fused RMSNorm+residual kernel with Kani proof
+  - Fused SiLU×gate kernel with Kani proof
+  - DualPipeline confirms fused matches sequential within epsilon
+  - Measurable reduction in kernel launch count per forward pass
+  verification:
+    quick: cargo test --workspace
+
+- id: p21-cuda-graphs
+  title: CUDA Graphs — capture and replay the forward pass
+  description: 'Capture the decode-phase forward pass (fixed-shape operations)
+    as a CUDA graph and replay it without per-kernel launch overhead. The
+    first decode step runs normally and records the kernel sequence. Subsequent
+    steps replay the graph, updating only the input pointers. This eliminates
+    ~1ms of CPU-side kernel launch overhead per step. DualPipeline verifies
+    graph replay matches non-graph execution.'
+  status: pending
+  priority: high
+  effort: L
+  depends_on:
+  - p21-fused-kernels
+  scope:
+  - engine/src/model.rs
+  - kernels/src/gpu/mod.rs
+  acceptance:
+  - Decode-phase forward pass captured as CUDA graph
+  - Graph replay produces bit-identical output to non-graph execution
+  - Latency reduction of 10-30% on decode steps
+  - Graph automatically invalidated when batch shape changes
+  verification:
+    quick: cargo test --workspace
+
+- id: p21-flash-decoding
+  title: FlashDecoding — optimized decode-phase attention
+  description: 'During decode, Q has 1 token but KV cache has thousands. Standard
+    attention underutilizes the GPU because the parallelism is only over heads.
+    FlashDecoding splits the KV cache across thread blocks, each computing
+    partial attention, then reduces. This parallelizes over both heads and KV
+    length. Critical for long-context inference.'
+  status: pending
+  priority: high
+  effort: L
+  depends_on:
+  - p20-paged-attention
+  scope:
+  - kernels/src/gpu/attention.rs
+  acceptance:
+  - Decode attention splits KV across thread blocks with partial softmax
+  - Correct reduction of partial attention outputs
+  - 2-8x speedup on decode for sequences > 1024 tokens
+  - Kani proof for split/reduce index arithmetic
+  - DualPipeline confirms FlashDecoding matches standard attention
+  verification:
+    quick: cargo test --workspace
+
+  # ============================================================================
+  # Phase 22: Serving Techniques
+  # Multi-LoRA, RadixAttention, structured generation v2.
+  # ============================================================================
+
+- id: p22-sliding-window
+  title: Sliding window attention
+  description: 'Support Mistral/Gemma-style sliding window attention where each
+    token only attends to the last W tokens (e.g., W=4096). KV cache only
+    stores W tokens per layer, enabling long contexts with O(n) memory instead
+    of O(n²). The window size comes from the model config. Requires
+    architecture registry update to declare window_size per model.'
+  status: pending
+  priority: high
+  effort: M
+  depends_on:
+  - p20-paged-attention
+  scope:
+  - kernel-api/src/lib.rs
+  - kernels/src/attention.rs
+  - engine/src/kv_cache.rs
+  - engine/src/config.rs
+  acceptance:
+  - Attention trait supports optional window_size parameter
+  - KV cache evicts entries beyond the window
+  - 'Memory: O(W) per sequence instead of O(seq_len)'
+  - Kani proof for windowed offset arithmetic
+  - Correct output for Mistral-style models with window=4096
+  verification:
+    quick: cargo test --workspace
+
+- id: p22-multi-lora
+  title: Multi-LoRA serving
+  description: 'Serve multiple LoRA adapters from a single base model. Each
+    request specifies a LoRA adapter ID. The forward pass applies the adapter
+    weights (low-rank A and B matrices) on top of the base model weights.
+    Adapters are loaded/unloaded dynamically. Multiple requests with different
+    adapters can be batched together.'
+  status: pending
+  priority: medium
+  effort: L
+  scope:
+  - engine/src/lora.rs
+  - engine/src/model.rs
+  - server/src/api.rs
+  acceptance:
+  - API accepts lora_adapter parameter per request
+  - Base model weights shared, adapter weights loaded per-adapter
+  - Batched inference with mixed adapters in the same batch
+  - Adapter hot-loading without server restart
+  verification:
+    quick: cargo test --workspace
+
+- id: p22-radix-attention
+  title: RadixAttention — tree-based prefix sharing
+  description: 'Extend prefix caching from hash-based to radix-tree-based
+    (SGLang approach). Multi-turn conversations share KV cache for common
+    prefixes at the page level. The radix tree tracks which pages are shared
+    and reference-counted. Eviction follows LRU on leaf nodes.'
+  status: pending
+  priority: medium
+  effort: L
+  depends_on:
+  - p20-paged-attention
+  scope:
+  - engine/src/prefix_cache.rs
+  - engine/src/kv_cache.rs
+  acceptance:
+  - Radix tree indexes cached KV pages by token prefix
+  - Multi-turn conversations reuse KV cache for shared history
+  - Reference counting prevents eviction of shared pages
+  - Higher cache hit rate than hash-based approach for chat workloads
+  verification:
+    quick: cargo test --workspace
+
+- id: p22-structured-gen-v2
+  title: Structured generation v2 — grammar with jump-ahead
+  description: 'Improve constrained decoding with grammar-guided jump-ahead
+    (SGLang approach). When the grammar forces the next N tokens (e.g.,
+    closing braces, required field names in JSON schema), skip sampling
+    and emit them directly. Reduces structured output latency by 2-5x
+    for schema-heavy responses.'
+  status: pending
+  priority: medium
+  effort: M
+  depends_on:
+  - p12-crate-split
+  scope:
+  - engine/src/guided.rs
+  - server/src/api.rs
+  acceptance:
+  - Grammar detects forced-token sequences and emits without sampling
+  - JSON schema output 2-5x faster than token-by-token constrained decoding
+  - Correctness unchanged (output still valid against the schema)
+  verification:
+    quick: cargo test --workspace
+
+  # ============================================================================
+  # Phase 23: Forward-Looking Architecture
+  # MoE, multi-token prediction, vision-language.
+  # ============================================================================
+
+- id: p23-moe
+  title: Mixture-of-Experts support
+  description: 'Support MoE architectures (Mixtral, DBRX, DeepSeek-V2).
+    The FFN layer selects K of N experts per token via a gating network.
+    Only the selected experts weights are read from memory. Requires
+    expert-parallel execution across GPUs for large expert counts.'
+  status: pending
+  priority: medium
+  effort: XL
+  scope:
+  - engine/src/architecture.rs
+  - engine/src/model.rs
+  - kernels/src/moe.rs
+  acceptance:
+  - Architecture registry supports MoE layer definition
+  - Top-K expert selection with gating network
+  - Only selected expert weights loaded per token
+  - Correct output on Mixtral-8x7B
+  verification:
+    quick: cargo test --workspace
+
+- id: p23-multi-token
+  title: Multi-token prediction (Medusa/Eagle)
+  description: 'Predict multiple tokens per forward pass using lightweight
+    draft heads. Verify all draft tokens against the main model in a single
+    forward pass. Accept matching tokens, reject and resample from the first
+    mismatch. 2-3x throughput with no quality loss.'
+  status: pending
+  priority: medium
+  effort: L
+  scope:
+  - engine/src/speculative.rs
+  - engine/src/model.rs
+  acceptance:
+  - Draft heads predict 2-4 tokens per step
+  - Verification pass accepts/rejects draft tokens
+  - Output distribution identical to single-token generation
+  - Measurable throughput improvement (tokens/sec)
+  verification:
+    quick: cargo test --workspace
