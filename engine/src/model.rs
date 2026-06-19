@@ -455,7 +455,6 @@ where
             .map(|p| p as u32)
             .collect();
 
-        // Helper: dispatch quantized matmul. Uses pre-quantized activations for m=1 decode.
         let qmm = |preq: Option<&PreQuantizedActivations>, a_f32: &[f32], name: &str, out: &mut [f32], m: usize, n: usize, k: usize| {
             if m == 1 {
                 if let Some(pq) = preq {
