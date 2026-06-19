@@ -4,7 +4,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use crate::config::ModelConfig;
-use oxide_kernels::turboquant::{CompressedKV, KvCacheCompressor};
+use tempura_kernels::turboquant::{CompressedKV, KvCacheCompressor};
 
 pub struct KvCache {
     pub k: Vec<Vec<f32>>,
@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn test_compressed_kv_cache_round_trip() {
-        use oxide_kernels::turboquant::CpuPolarQuant;
+        use tempura_kernels::turboquant::CpuPolarQuant;
 
         let config = ModelConfig::tiny_test();
         let compressor = Box::new(CpuPolarQuant::default_3bit());
@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn test_compressed_kv_cache_multiple_appends() {
-        use oxide_kernels::turboquant::CpuPolarQuant;
+        use tempura_kernels::turboquant::CpuPolarQuant;
 
         let config = ModelConfig::tiny_test();
         let compressor = Box::new(CpuPolarQuant::default_3bit());
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn test_compressed_kv_cache_reset() {
-        use oxide_kernels::turboquant::CpuPolarQuant;
+        use tempura_kernels::turboquant::CpuPolarQuant;
 
         let config = ModelConfig::tiny_test();
         let compressor = Box::new(CpuPolarQuant::default_3bit());

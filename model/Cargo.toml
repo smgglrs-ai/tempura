@@ -1,12 +1,12 @@
 [package]
-name = "oxide-server-model"
+name = "tempura-model"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Model management for oxide-serve: download, store, list, inspect"
+description = "Model management for tempura-serve: download, store, list, inspect"
 
 [dependencies]
-oxide-engine = { path = "../engine" }
+tempura-engine = { path = "../engine" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

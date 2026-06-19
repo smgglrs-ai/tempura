@@ -1,4 +1,4 @@
-# oxide-serve
+# tempura-serve
 
 Rust-native LLM inference server. Uses cuda-oxide (https://github.com/NVlabs/cuda-oxide)
 for GPU kernels once stabilized; currently runs CPU reference implementations.
@@ -7,20 +7,20 @@ for GPU kernels once stabilized; currently runs CPU reference implementations.
 
 Three-crate workspace:
 
-- **kernels/** (`oxide-kernels`) — Kernel traits + CPU reference impls
+- **kernels/** (`tempura-kernels`) — Kernel traits + CPU reference impls
   - `Attention`, `LayerNorm`, `RoPE`, `Sampler` traits in separate modules
   - CPU implementations behind `cpu` feature (default on)
   - `cuda` feature flag reserved for cuda-oxide backends
   - Tests use `approx` crate for floating-point comparison
 
-- **engine/** (`oxide-engine`) — Inference engine
+- **engine/** (`tempura-engine`) — Inference engine
   - `ModelConfig` — architecture parameters (has presets: `llama2_7b()`, `tiny_test()`)
   - `KvCache` — pre-allocated key-value cache with slot management
   - `WeightLoader` trait + `SafetensorsLoader` implementation
   - `TransformerModel<A, L, R, S>` — generic over kernel implementations
   - `Tokenizer` — wrapper around HF `tokenizers` crate
 
-- **server/** (`oxide-server`) — HTTP serving layer
+- **server/** (`tempura-server`) — HTTP serving layer
   - Axum-based, OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`)
   - `BatchScheduler` — continuous batching (stub implementation)
   - SSE streaming types for token-by-token output
@@ -132,5 +132,5 @@ cargo run -- --port 8080 # start server (stub responses)
 ## Formal Verification
 
 ```sh
-cargo kani --package oxide-kernels  # verify kernel properties
+cargo kani --package tempura-kernels  # verify kernel properties
 ```

@@ -1,9 +1,9 @@
-use oxide_engine::session::InferenceSession;
-use oxide_engine::trace::TraceLevel;
-use oxide_kernels::SamplingParams;
+use tempura_engine::session::InferenceSession;
+use tempura_engine::trace::TraceLevel;
+use tempura_kernels::SamplingParams;
 use serde::{Deserialize, Serialize};
 
-use oxide_engine::InferenceModel;
+use tempura_engine::InferenceModel;
 
 #[derive(Debug, Deserialize)]
 pub struct ReplayRequest {

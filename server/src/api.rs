@@ -4,9 +4,9 @@ use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use oxide_engine::session::InferenceSession;
-use oxide_engine::trace::TraceLevel;
-use oxide_kernels::SamplingParams;
+use tempura_engine::session::InferenceSession;
+use tempura_engine::trace::TraceLevel;
+use tempura_kernels::SamplingParams;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use tokio_stream::wrappers::ReceiverStream;
@@ -37,14 +37,14 @@ pub fn router() -> Router<AppState> {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/models", get(list_models))
-        .route("/oxide/v1/traces", get(list_traces))
+        .route("/tempura/v1/traces", get(list_traces))
         .route(
-            "/oxide/v1/traces/{trace_id}",
+            "/tempura/v1/traces/{trace_id}",
             get(get_trace).delete(delete_trace),
         )
-        .route("/oxide/v1/compare", post(compare_pipelines))
-        .route("/oxide/v1/verified", get(verification_status))
-        .route("/oxide/v1/replay", post(replay))
+        .route("/tempura/v1/compare", post(compare_pipelines))
+        .route("/tempura/v1/verified", get(verification_status))
+        .route("/tempura/v1/replay", post(replay))
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health))
         .route("/health/inference", get(health_inference))
@@ -81,9 +81,9 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
-    pub tools: Option<Vec<oxide_engine::tool_call::ToolDefinition>>,
+    pub tools: Option<Vec<tempura_engine::tool_call::ToolDefinition>>,
     #[serde(default)]
-    pub tool_choice: Option<oxide_engine::tool_call::ToolChoice>,
+    pub tool_choice: Option<tempura_engine::tool_call::ToolChoice>,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
     #[serde(default)]
@@ -123,7 +123,7 @@ pub struct ChatMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<oxide_engine::tool_call::ToolCall>>,
+    pub tool_calls: Option<Vec<tempura_engine::tool_call::ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
@@ -300,11 +300,11 @@ fn resolve_timeout(state: &AppState, timeout_secs: Option<u64>) -> std::time::Du
 }
 
 fn record_scheduler_gauges(scheduler: &crate::batch::BatchScheduler) {
-    metrics::gauge!("oxide_scheduler_active_sequences").set(scheduler.active_count() as f64);
-    metrics::gauge!("oxide_scheduler_queue_depth")
+    metrics::gauge!("tempura_scheduler_active_sequences").set(scheduler.active_count() as f64);
+    metrics::gauge!("tempura_scheduler_queue_depth")
         .set((scheduler.pending_count() + scheduler.preempted_count()) as f64);
-    metrics::gauge!("oxide_kv_cache_slots_in_use").set(scheduler.allocated_slot_count() as f64);
-    metrics::gauge!("oxide_kv_cache_slots_total").set(scheduler.max_batch_size() as f64);
+    metrics::gauge!("tempura_kv_cache_slots_in_use").set(scheduler.allocated_slot_count() as f64);
+    metrics::gauge!("tempura_kv_cache_slots_total").set(scheduler.max_batch_size() as f64);
 }
 
 #[tracing::instrument(skip(state, req), fields(model = %req.model))]
@@ -324,10 +324,10 @@ async fn chat_completions(
         ));
     }
 
-    let chat_messages: Vec<oxide_engine::ChatMessageInput> = req
+    let chat_messages: Vec<tempura_engine::ChatMessageInput> = req
         .messages
         .iter()
-        .map(|m| oxide_engine::ChatMessageInput {
+        .map(|m| tempura_engine::ChatMessageInput {
             role: m.role.clone(),
             content: m.content_str(),
         })
@@ -394,7 +394,7 @@ async fn chat_completions(
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
 
-        metrics::counter!("oxide_request_count", "endpoint" => "chat_completions").increment(1);
+        metrics::counter!("tempura_request_count", "endpoint" => "chat_completions").increment(1);
 
         tokio::task::spawn_blocking(move || {
             let stream_start = std::time::Instant::now();
@@ -409,17 +409,17 @@ async fn chat_completions(
             let mut on_token = |token: u32| -> bool {
                 let now = std::time::Instant::now();
                 if now >= deadline {
-                    metrics::counter!("oxide_request_timeout", "endpoint" => "chat_completions")
+                    metrics::counter!("tempura_request_timeout", "endpoint" => "chat_completions")
                         .increment(1);
                     return false;
                 }
 
                 if !first_token_recorded {
-                    metrics::histogram!("oxide_time_to_first_token_seconds")
+                    metrics::histogram!("tempura_time_to_first_token_seconds")
                         .record(now.duration_since(stream_start).as_secs_f64());
                     first_token_recorded = true;
                 } else {
-                    metrics::histogram!("oxide_inter_token_latency_seconds")
+                    metrics::histogram!("tempura_inter_token_latency_seconds")
                         .record(now.duration_since(last_token_time).as_secs_f64());
                 }
                 last_token_time = now;
@@ -456,8 +456,8 @@ async fn chat_completions(
                 &mut on_token,
             );
 
-            metrics::counter!("oxide_tokens_generated").increment(token_count);
-            metrics::histogram!("oxide_request_duration_seconds", "endpoint" => "chat_completions")
+            metrics::counter!("tempura_tokens_generated").increment(token_count);
+            metrics::histogram!("tempura_request_duration_seconds", "endpoint" => "chat_completions")
                 .record(stream_start.elapsed().as_secs_f64());
 
             if include_usage {
@@ -495,7 +495,7 @@ async fn chat_completions(
     } else {
         let start = std::time::Instant::now();
         let deadline = start + timeout;
-        metrics::counter!("oxide_request_count", "endpoint" => "chat_completions").increment(1);
+        metrics::counter!("tempura_request_count", "endpoint" => "chat_completions").increment(1);
 
         let want_logprobs = req.logprobs.unwrap_or(false);
         let top_n = req.top_logprobs.unwrap_or(0).min(20) as usize;
@@ -508,7 +508,7 @@ async fn chat_completions(
         let result = (|| -> Result<(), (StatusCode, String)> {
             for i in 0..req.n {
                 if std::time::Instant::now() >= deadline {
-                    metrics::counter!("oxide_request_timeout", "endpoint" => "chat_completions")
+                    metrics::counter!("tempura_request_timeout", "endpoint" => "chat_completions")
                         .increment(1);
                     return Err((StatusCode::GATEWAY_TIMEOUT, "Request timed out".into()));
                 }
@@ -581,7 +581,7 @@ async fn chat_completions(
                 let (msg, fr) = if let Some(ref tools) = req.tools {
                     if !tools.is_empty() && !req.tool_choice.as_ref().is_some_and(|tc| tc.is_none())
                     {
-                        let parser = oxide_engine::tool_call::ToolCallParser::new(tools);
+                        let parser = tempura_engine::tool_call::ToolCallParser::new(tools);
                         if let Some(tool_calls) = parser.parse(text) {
                             (
                                 ChatMessage {
@@ -640,8 +640,8 @@ async fn chat_completions(
 
         result?;
 
-        metrics::counter!("oxide_tokens_generated").increment(total_completion_tokens as u64);
-        metrics::histogram!("oxide_request_duration_seconds", "endpoint" => "chat_completions")
+        metrics::counter!("tempura_tokens_generated").increment(total_completion_tokens as u64);
+        metrics::histogram!("tempura_request_duration_seconds", "endpoint" => "chat_completions")
             .record(start.elapsed().as_secs_f64());
 
         Ok(Json(ChatCompletionResponse {
@@ -649,7 +649,7 @@ async fn chat_completions(
             object: "chat.completion".to_string(),
             created: 0,
             model: req.model,
-            system_fingerprint: format!("oxide-serve-{}", env!("CARGO_PKG_VERSION")),
+            system_fingerprint: format!("tempura-serve-{}", env!("CARGO_PKG_VERSION")),
             choices,
             usage: Usage {
                 prompt_tokens,
@@ -706,7 +706,7 @@ async fn completions(
     .await?;
 
     let start = std::time::Instant::now();
-    metrics::counter!("oxide_request_count", "endpoint" => "completions").increment(1);
+    metrics::counter!("tempura_request_count", "endpoint" => "completions").increment(1);
 
     let want_logprobs = req.logprobs.is_some();
     let top_n = req.logprobs.unwrap_or(0).min(20) as usize;
@@ -734,7 +734,7 @@ async fn completions(
 
     if start.elapsed() >= timeout {
         release_slot(&state, &request_id).await;
-        metrics::counter!("oxide_request_timeout", "endpoint" => "completions").increment(1);
+        metrics::counter!("tempura_request_timeout", "endpoint" => "completions").increment(1);
         return Err((StatusCode::GATEWAY_TIMEOUT, "Request timed out".into()));
     }
 
@@ -753,8 +753,8 @@ async fn completions(
     let prompt_tokens = token_ids.len() as u32;
     let completion_tokens = generated.len() as u32;
 
-    metrics::counter!("oxide_tokens_generated").increment(completion_tokens as u64);
-    metrics::histogram!("oxide_request_duration_seconds", "endpoint" => "completions")
+    metrics::counter!("tempura_tokens_generated").increment(completion_tokens as u64);
+    metrics::histogram!("tempura_request_duration_seconds", "endpoint" => "completions")
         .record(start.elapsed().as_secs_f64());
 
     let logprobs_response = if want_logprobs {
@@ -804,7 +804,7 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
         data: vec![ModelInfo {
             id: state.model_id.clone(),
             object: "model".to_string(),
-            owned_by: "oxide-serve".to_string(),
+            owned_by: "tempura-serve".to_string(),
         }],
     })
 }
@@ -880,7 +880,7 @@ async fn compare_pipelines(
 }
 
 async fn verification_status() -> impl IntoResponse {
-    Json(oxide_kernels::verification_manifest::manifest())
+    Json(tempura_kernels::verification_manifest::manifest())
 }
 
 async fn replay(
@@ -1007,7 +1007,7 @@ struct ResponsesRequest {
     #[serde(default = "default_temperature")]
     temperature: f32,
     #[serde(default)]
-    tools: Option<Vec<oxide_engine::tool_call::ToolDefinition>>,
+    tools: Option<Vec<tempura_engine::tool_call::ToolDefinition>>,
     #[serde(default)]
     pub seed: Option<u64>,
 }
@@ -1076,7 +1076,7 @@ async fn responses(
 
     let mut messages = Vec::new();
     if let Some(instructions) = &req.instructions {
-        messages.push(oxide_engine::ChatMessageInput {
+        messages.push(tempura_engine::ChatMessageInput {
             role: "system".to_string(),
             content: instructions.clone(),
         });
@@ -1084,14 +1084,14 @@ async fn responses(
 
     match &req.input {
         ResponsesInput::Text(text) => {
-            messages.push(oxide_engine::ChatMessageInput {
+            messages.push(tempura_engine::ChatMessageInput {
                 role: "user".to_string(),
                 content: text.clone(),
             });
         }
         ResponsesInput::Messages(msgs) => {
             for m in msgs {
-                messages.push(oxide_engine::ChatMessageInput {
+                messages.push(tempura_engine::ChatMessageInput {
                     role: m.role.clone(),
                     content: m.content.clone(),
                 });
@@ -1162,13 +1162,13 @@ async fn responses(
 
 fn build_guided_decoder(
     response_format: &Option<ResponseFormat>,
-    tokenizer: &oxide_engine::tokenizer::Tokenizer,
-) -> Option<Box<dyn oxide_kernels::GuidedDecoder>> {
+    tokenizer: &tempura_engine::tokenizer::Tokenizer,
+) -> Option<Box<dyn tempura_kernels::GuidedDecoder>> {
     let rf = response_format.as_ref()?;
     match rf.format_type.as_str() {
         "json_object" => {
             let vocab = tokenizer.vocab_strings();
-            Some(oxide_kernels::guided::create_json_decoder(vocab))
+            Some(tempura_kernels::guided::create_json_decoder(vocab))
         }
         "json_schema" => {
             let vocab = tokenizer.vocab_strings();
@@ -1178,7 +1178,7 @@ fn build_guided_decoder(
                 .and_then(|s| s.schema.as_ref())
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
-            Some(oxide_kernels::guided::create_json_schema_decoder(
+            Some(tempura_kernels::guided::create_json_schema_decoder(
                 vocab, &schema,
             ))
         }
@@ -1187,10 +1187,10 @@ fn build_guided_decoder(
 }
 
 fn build_tool_guided_decoder(
-    tools: &Option<Vec<oxide_engine::tool_call::ToolDefinition>>,
-    tool_choice: &Option<oxide_engine::tool_call::ToolChoice>,
-    tokenizer: &oxide_engine::tokenizer::Tokenizer,
-) -> Option<Box<dyn oxide_kernels::GuidedDecoder>> {
+    tools: &Option<Vec<tempura_engine::tool_call::ToolDefinition>>,
+    tool_choice: &Option<tempura_engine::tool_call::ToolChoice>,
+    tokenizer: &tempura_engine::tokenizer::Tokenizer,
+) -> Option<Box<dyn tempura_kernels::GuidedDecoder>> {
     let tc = tool_choice.as_ref()?;
     let tools = tools.as_ref()?;
     if tools.is_empty() || tc.is_none() {
@@ -1199,7 +1199,7 @@ fn build_tool_guided_decoder(
 
     if tc.is_required() {
         let vocab = tokenizer.vocab_strings();
-        return Some(oxide_kernels::guided::create_json_decoder(vocab));
+        return Some(tempura_kernels::guided::create_json_decoder(vocab));
     }
 
     if let Some(func_name) = tc.specific_function() {
@@ -1210,7 +1210,7 @@ fn build_tool_guided_decoder(
             .cloned()
             .unwrap_or(serde_json::json!({"type": "object"}));
         let vocab = tokenizer.vocab_strings();
-        return Some(oxide_kernels::guided::create_json_schema_decoder(
+        return Some(tempura_kernels::guided::create_json_schema_decoder(
             vocab, &schema,
         ));
     }
@@ -1270,9 +1270,9 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state(with_tokenizer: bool) -> AppState {
-        let config = oxide_engine::ModelConfig::tiny_test();
-        let pipeline = oxide_engine::pipeline::KernelPipeline::cpu_verified();
-        let model = oxide_engine::TransformerModel::new(config, pipeline);
+        let config = tempura_engine::ModelConfig::tiny_test();
+        let pipeline = tempura_engine::pipeline::KernelPipeline::cpu_verified();
+        let model = tempura_engine::TransformerModel::new(config, pipeline);
 
         let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let metrics_handle = prometheus_builder.install_recorder().unwrap_or_else(|_| {
@@ -1363,9 +1363,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_gates_concurrent_requests() {
-        let config = oxide_engine::ModelConfig::tiny_test();
-        let pipeline = oxide_engine::pipeline::KernelPipeline::cpu_verified();
-        let model = oxide_engine::TransformerModel::new(config, pipeline);
+        let config = tempura_engine::ModelConfig::tiny_test();
+        let pipeline = tempura_engine::pipeline::KernelPipeline::cpu_verified();
+        let model = tempura_engine::TransformerModel::new(config, pipeline);
 
         let scheduler = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::batch::BatchScheduler::new(1, 128, 1),

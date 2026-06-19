@@ -1,12 +1,12 @@
 [package]
-name = "oxide-tests-gpu"
+name = "tempura-tests-gpu"
 version = "0.1.0"
 edition = "2021"
 
 [workspace]
 
 [[bin]]
-name = "oxide-tests-gpu"
+name = "tempura-tests-gpu"
 path = "src/main.rs"
 
 [[bin]]
@@ -18,8 +18,8 @@ name = "bench-e2e"
 path = "src/bench_e2e.rs"
 
 [dependencies]
-oxide-kernels = { path = "../kernels", features = ["cpu", "cuda"] }
-oxide-engine = { path = "../engine", features = ["cuda"] }
+tempura-kernels = { path = "../kernels", features = ["cpu", "cuda"] }
+tempura-engine = { path = "../engine", features = ["cuda"] }
 cuda-core = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-core" }
 cuda-device = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-device" }
 cuda-host = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-host" }

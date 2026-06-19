@@ -44,7 +44,7 @@ fn is_gguf_magic(path: &Path) -> bool {
 }
 
 fn inspect_gguf(path: &Path) -> Result<ModelInfo, ModelError> {
-    let loader = oxide_engine::gguf_loader::GgufLoader::from_file(path)
+    let loader = tempura_engine::gguf_loader::GgufLoader::from_file(path)
         .map_err(|e| ModelError::Format(e.to_string()))?;
 
     let config = &loader.config;
@@ -62,7 +62,7 @@ fn inspect_gguf(path: &Path) -> Result<ModelInfo, ModelError> {
 
     let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
-    use oxide_engine::loader::WeightLoader;
+    use tempura_engine::loader::WeightLoader;
     Ok(ModelInfo {
         format: "gguf".to_string(),
         architecture: arch,
@@ -83,7 +83,7 @@ fn inspect_dir(path: &Path) -> Result<ModelInfo, ModelError> {
         return Err(ModelError::Format("no config.json in directory".into()));
     }
 
-    let config = oxide_engine::ModelConfig::from_hf_config(&config_path)
+    let config = tempura_engine::ModelConfig::from_hf_config(&config_path)
         .map_err(|e| ModelError::Format(e.to_string()))?;
 
     let safetensors_count = fs::read_dir(path)
@@ -133,10 +133,10 @@ fn inspect_dir(path: &Path) -> Result<ModelInfo, ModelError> {
 fn inspect_safetensors(path: &Path) -> Result<ModelInfo, ModelError> {
     let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
-    let loader = oxide_engine::loader::SafetensorsLoader::from_file(path)
+    let loader = tempura_engine::loader::SafetensorsLoader::from_file(path)
         .map_err(|e| ModelError::Format(e.to_string()))?;
 
-    use oxide_engine::loader::WeightLoader;
+    use tempura_engine::loader::WeightLoader;
     let tensor_count = loader.tensor_names().len();
 
     Ok(ModelInfo {

@@ -1,10 +1,10 @@
 mod test_pack;
 
 use half::f16;
-use oxide_kernels::attention::{Attention, CpuAttention, CudaAttention};
-use oxide_kernels::matmul::{CpuMatMul, CudaMatMul, MatMul};
-use oxide_kernels::rmsnorm::{CpuRMSNorm, CudaRMSNorm, RMSNorm};
-use oxide_kernels::rope::{CpuRoPE, CudaRoPE, RoPE};
+use tempura_kernels::attention::{Attention, CpuAttention, CudaAttention};
+use tempura_kernels::matmul::{CpuMatMul, CudaMatMul, MatMul};
+use tempura_kernels::rmsnorm::{CpuRMSNorm, CudaRMSNorm, RMSNorm};
+use tempura_kernels::rope::{CpuRoPE, CudaRoPE, RoPE};
 use std::time::Instant;
 
 fn test_rope_cpu_vs_gpu() {
@@ -470,15 +470,15 @@ fn bench_flash_vs_naive(
         .collect();
 
     let stream = gpu.gpu().stream();
-    let q_dev = oxide_kernels::gpu::to_device(&stream, &q).unwrap();
-    let k_dev = oxide_kernels::gpu::to_device(&stream, &k).unwrap();
-    let v_dev = oxide_kernels::gpu::to_device(&stream, &v).unwrap();
+    let q_dev = tempura_kernels::gpu::to_device(&stream, &q).unwrap();
+    let k_dev = tempura_kernels::gpu::to_device(&stream, &k).unwrap();
+    let v_dev = tempura_kernels::gpu::to_device(&stream, &v).unwrap();
 
     let iters = 20;
     let warmup = 5;
 
     // Benchmark naive GPU
-    let mut out_naive = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+    let mut out_naive = tempura_kernels::gpu::alloc_device(&stream, total).unwrap();
     for _ in 0..warmup {
         gpu.forward_device_naive(
             &q_dev, &k_dev, &v_dev, &mut out_naive, batch, seq_len, kv_len,
@@ -497,7 +497,7 @@ fn bench_flash_vs_naive(
     let naive_us = t0.elapsed().as_micros() as f64 / iters as f64;
 
     // Benchmark flash GPU
-    let mut out_flash = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+    let mut out_flash = tempura_kernels::gpu::alloc_device(&stream, total).unwrap();
     for _ in 0..warmup {
         gpu.forward_device(
             &q_dev, &k_dev, &v_dev, &mut out_flash, batch, seq_len, kv_len,
@@ -516,8 +516,8 @@ fn bench_flash_vs_naive(
     let flash_us = t1.elapsed().as_micros() as f64 / iters as f64;
 
     // Compare outputs
-    let out_n = oxide_kernels::gpu::to_host(&stream, &out_naive).unwrap();
-    let out_f = oxide_kernels::gpu::to_host(&stream, &out_flash).unwrap();
+    let out_n = tempura_kernels::gpu::to_host(&stream, &out_naive).unwrap();
+    let out_f = tempura_kernels::gpu::to_host(&stream, &out_flash).unwrap();
     let max_diff: f32 = out_n.iter().zip(&out_f).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
 
     let speedup = if flash_us > 0.0 { naive_us / flash_us } else { 0.0 };
@@ -560,14 +560,14 @@ fn bench_decode_splitk(
 
     // GPU decode (split-K, dispatched automatically for seq_len=1)
     let stream = gpu.gpu().stream();
-    let q_dev = oxide_kernels::gpu::to_device(&stream, &q).unwrap();
-    let k_dev = oxide_kernels::gpu::to_device(&stream, &k).unwrap();
-    let v_dev = oxide_kernels::gpu::to_device(&stream, &v).unwrap();
+    let q_dev = tempura_kernels::gpu::to_device(&stream, &q).unwrap();
+    let k_dev = tempura_kernels::gpu::to_device(&stream, &k).unwrap();
+    let v_dev = tempura_kernels::gpu::to_device(&stream, &v).unwrap();
 
     let iters = 20;
     let warmup = 5;
 
-    let mut out_dev = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+    let mut out_dev = tempura_kernels::gpu::alloc_device(&stream, total).unwrap();
     for _ in 0..warmup {
         gpu.forward_device(&q_dev, &k_dev, &v_dev, &mut out_dev, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
     }
@@ -580,11 +580,11 @@ fn bench_decode_splitk(
     let decode_us = t0.elapsed().as_micros() as f64 / iters as f64;
 
     // Compare vs CPU
-    let out_gpu = oxide_kernels::gpu::to_host(&stream, &out_dev).unwrap();
+    let out_gpu = tempura_kernels::gpu::to_host(&stream, &out_dev).unwrap();
     let max_diff: f32 = out_cpu.iter().zip(&out_gpu).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
 
     // Also time the naive path for comparison
-    let mut out_naive = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+    let mut out_naive = tempura_kernels::gpu::alloc_device(&stream, total).unwrap();
     for _ in 0..warmup {
         gpu.forward_device_naive(&q_dev, &k_dev, &v_dev, &mut out_naive, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
     }
@@ -647,11 +647,11 @@ fn test_flash_attention_f16kv(
     let v_f16: Vec<u16> = v_f32.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
 
     let stream = gpu.gpu().stream();
-    let q_dev = oxide_kernels::gpu::to_device(&stream, &q).unwrap();
-    let k_dev = oxide_kernels::gpu::to_device_u16(&stream, &k_f16).unwrap();
-    let v_dev = oxide_kernels::gpu::to_device_u16(&stream, &v_f16).unwrap();
+    let q_dev = tempura_kernels::gpu::to_device(&stream, &q).unwrap();
+    let k_dev = tempura_kernels::gpu::to_device_u16(&stream, &k_f16).unwrap();
+    let v_dev = tempura_kernels::gpu::to_device_u16(&stream, &v_f16).unwrap();
     let total = batch * seq_len * num_heads * head_dim;
-    let mut out_dev = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+    let mut out_dev = tempura_kernels::gpu::alloc_device(&stream, total).unwrap();
 
     gpu.forward_device_f16kv(
         &q_dev, &k_dev, &v_dev, &mut out_dev, batch, seq_len, kv_len, num_heads, num_kv_heads,
@@ -659,7 +659,7 @@ fn test_flash_attention_f16kv(
     )
     .unwrap();
 
-    let out_gpu = oxide_kernels::gpu::to_host(&stream, &out_dev).unwrap();
+    let out_gpu = tempura_kernels::gpu::to_host(&stream, &out_dev).unwrap();
 
     let mut max_diff = 0.0f32;
     let mut mismatches = 0;
@@ -716,17 +716,17 @@ fn bench_flash_f32_vs_f16kv(
     let v_f16: Vec<u16> = v_f32.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
 
     let stream = gpu.gpu().stream();
-    let q_dev = oxide_kernels::gpu::to_device(&stream, &q).unwrap();
-    let k_dev_f32 = oxide_kernels::gpu::to_device(&stream, &k_f32).unwrap();
-    let v_dev_f32 = oxide_kernels::gpu::to_device(&stream, &v_f32).unwrap();
-    let k_dev_f16 = oxide_kernels::gpu::to_device_u16(&stream, &k_f16).unwrap();
-    let v_dev_f16 = oxide_kernels::gpu::to_device_u16(&stream, &v_f16).unwrap();
+    let q_dev = tempura_kernels::gpu::to_device(&stream, &q).unwrap();
+    let k_dev_f32 = tempura_kernels::gpu::to_device(&stream, &k_f32).unwrap();
+    let v_dev_f32 = tempura_kernels::gpu::to_device(&stream, &v_f32).unwrap();
+    let k_dev_f16 = tempura_kernels::gpu::to_device_u16(&stream, &k_f16).unwrap();
+    let v_dev_f16 = tempura_kernels::gpu::to_device_u16(&stream, &v_f16).unwrap();
 
     let iters = 20;
     let warmup = 5;
 
     // Benchmark flash f32
-    let mut out_f32 = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+    let mut out_f32 = tempura_kernels::gpu::alloc_device(&stream, total).unwrap();
     for _ in 0..warmup {
         gpu.forward_device(&q_dev, &k_dev_f32, &v_dev_f32, &mut out_f32, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
     }
@@ -739,7 +739,7 @@ fn bench_flash_f32_vs_f16kv(
     let f32_us = t0.elapsed().as_micros() as f64 / iters as f64;
 
     // Benchmark flash f16kv
-    let mut out_f16 = oxide_kernels::gpu::alloc_device(&stream, total).unwrap();
+    let mut out_f16 = tempura_kernels::gpu::alloc_device(&stream, total).unwrap();
     for _ in 0..warmup {
         gpu.forward_device_f16kv(&q_dev, &k_dev_f16, &v_dev_f16, &mut out_f16, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale).unwrap();
     }
@@ -760,7 +760,7 @@ fn bench_flash_f32_vs_f16kv(
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════╗");
-    println!("║  oxide-serve GPU Validation Suite (RTX 5090)        ║");
+    println!("║  tempura-serve GPU Validation Suite (RTX 5090)        ║");
     println!("╚══════════════════════════════════════════════════════╝\n");
 
     // --- Correctness tests ---
@@ -881,14 +881,14 @@ fn test_matmul_mma_bt_identity() {
     let mut out_cpu = vec![0.0f32; m * n];
     cpu.forward_b_transposed(&a, &b, &mut out_cpu, m, n, k).unwrap();
 
-    let gpu_ctx = oxide_kernels::gpu::GpuContext::new(0).unwrap();
+    let gpu_ctx = tempura_kernels::gpu::GpuContext::new(0).unwrap();
     let ctx = gpu_ctx.context().clone();
     let stream = ctx.default_stream();
-    let a_dev = oxide_kernels::gpu::to_device(&stream, &a).unwrap();
-    let b_dev = oxide_kernels::gpu::to_device(&stream, &b).unwrap();
-    let mut c_dev = oxide_kernels::gpu::alloc_device(&stream, m * n).unwrap();
+    let a_dev = tempura_kernels::gpu::to_device(&stream, &a).unwrap();
+    let b_dev = tempura_kernels::gpu::to_device(&stream, &b).unwrap();
+    let mut c_dev = tempura_kernels::gpu::alloc_device(&stream, m * n).unwrap();
 
-    let mma_module = oxide_kernels::gpu::matmul_mma_kernel::kernels::load(&ctx).unwrap();
+    let mma_module = tempura_kernels::gpu::matmul_mma_kernel::kernels::load(&ctx).unwrap();
     let config = cuda_core::LaunchConfig {
         grid_dim: ((n as u32).div_ceil(32), (m as u32).div_ceil(32), 1),
         block_dim: (32, 1, 1),
@@ -898,7 +898,7 @@ fn test_matmul_mma_bt_identity() {
         .sgemm_mma_32x32(&stream, config, m as u32, n as u32, k as u32, &a_dev, &b_dev, &mut c_dev)
         .unwrap();
 
-    let out_gpu = oxide_kernels::gpu::to_host(&stream, &c_dev).unwrap();
+    let out_gpu = tempura_kernels::gpu::to_host(&stream, &c_dev).unwrap();
 
     println!("  CPU[0..8]:  {:?}", &out_cpu[0..8]);
     println!("  GPU[0..8]:  {:?}", &out_gpu[0..8]);
@@ -948,14 +948,14 @@ fn test_mma_single_tile() {
     let mut out_cpu = vec![0.0f32; m * n];
     cpu.forward_b_transposed(&a, &b, &mut out_cpu, m, n, k).unwrap();
 
-    let gpu_ctx = oxide_kernels::gpu::GpuContext::new(0).unwrap();
+    let gpu_ctx = tempura_kernels::gpu::GpuContext::new(0).unwrap();
     let ctx = gpu_ctx.context().clone();
     let stream = ctx.default_stream();
-    let a_dev = oxide_kernels::gpu::to_device(&stream, &a).unwrap();
-    let b_dev = oxide_kernels::gpu::to_device(&stream, &b).unwrap();
-    let mut c_dev = oxide_kernels::gpu::alloc_device(&stream, m * n).unwrap();
+    let a_dev = tempura_kernels::gpu::to_device(&stream, &a).unwrap();
+    let b_dev = tempura_kernels::gpu::to_device(&stream, &b).unwrap();
+    let mut c_dev = tempura_kernels::gpu::alloc_device(&stream, m * n).unwrap();
 
-    let mma_module = oxide_kernels::gpu::matmul_mma_kernel::kernels::load(&ctx).unwrap();
+    let mma_module = tempura_kernels::gpu::matmul_mma_kernel::kernels::load(&ctx).unwrap();
     let config = cuda_core::LaunchConfig {
         grid_dim: ((n as u32).div_ceil(32), (m as u32).div_ceil(32), 1),
         block_dim: (32, 1, 1),
@@ -965,7 +965,7 @@ fn test_mma_single_tile() {
         .sgemm_mma_32x32(&stream, config, m as u32, n as u32, k as u32, &a_dev, &b_dev, &mut c_dev)
         .unwrap();
 
-    let out_gpu = oxide_kernels::gpu::to_host(&stream, &c_dev).unwrap();
+    let out_gpu = tempura_kernels::gpu::to_host(&stream, &c_dev).unwrap();
 
     println!("  Expected: identity top-left 8x8, zeros elsewhere");
     println!("  Row-by-row comparison (CPU | GPU):");
@@ -996,13 +996,13 @@ fn test_mma_single_tile() {
     let mut out_cpu2 = vec![0.0f32; m * n];
     cpu.forward_b_transposed(&a2, &b2, &mut out_cpu2, m, n, k).unwrap();
 
-    let a2_dev = oxide_kernels::gpu::to_device(&stream, &a2).unwrap();
-    let b2_dev = oxide_kernels::gpu::to_device(&stream, &b2).unwrap();
-    let mut c2_dev = oxide_kernels::gpu::alloc_device(&stream, m * n).unwrap();
+    let a2_dev = tempura_kernels::gpu::to_device(&stream, &a2).unwrap();
+    let b2_dev = tempura_kernels::gpu::to_device(&stream, &b2).unwrap();
+    let mut c2_dev = tempura_kernels::gpu::alloc_device(&stream, m * n).unwrap();
     mma_module
         .sgemm_mma_32x32(&stream, config, m as u32, n as u32, k as u32, &a2_dev, &b2_dev, &mut c2_dev)
         .unwrap();
-    let out_gpu2 = oxide_kernels::gpu::to_host(&stream, &c2_dev).unwrap();
+    let out_gpu2 = tempura_kernels::gpu::to_host(&stream, &c2_dev).unwrap();
 
     println!("  Row-by-row (first 4 cols):");
     let mut row = 0usize;
@@ -1038,15 +1038,15 @@ fn test_matmul_mma_bt(m: usize, n: usize, k: usize) {
     let mut out_cpu = vec![0.0f32; m * n];
     cpu.forward_b_transposed(&a, &b, &mut out_cpu, m, n, k).unwrap();
 
-    let gpu_ctx = oxide_kernels::gpu::GpuContext::new(0).unwrap();
+    let gpu_ctx = tempura_kernels::gpu::GpuContext::new(0).unwrap();
     let ctx = gpu_ctx.context().clone();
     let stream = ctx.default_stream();
 
-    let a_dev = oxide_kernels::gpu::to_device(&stream, &a).unwrap();
-    let b_dev = oxide_kernels::gpu::to_device(&stream, &b).unwrap();
-    let mut c_dev = oxide_kernels::gpu::alloc_device(&stream, m * n).unwrap();
+    let a_dev = tempura_kernels::gpu::to_device(&stream, &a).unwrap();
+    let b_dev = tempura_kernels::gpu::to_device(&stream, &b).unwrap();
+    let mut c_dev = tempura_kernels::gpu::alloc_device(&stream, m * n).unwrap();
 
-    let mma_module = oxide_kernels::gpu::matmul_mma_kernel::kernels::load(&ctx).unwrap();
+    let mma_module = tempura_kernels::gpu::matmul_mma_kernel::kernels::load(&ctx).unwrap();
     let block = 32u32;
     let config = cuda_core::LaunchConfig {
         grid_dim: ((n as u32).div_ceil(block), (m as u32).div_ceil(block), 1),
@@ -1057,7 +1057,7 @@ fn test_matmul_mma_bt(m: usize, n: usize, k: usize) {
         .sgemm_mma_32x32(&stream, config, m as u32, n as u32, k as u32, &a_dev, &b_dev, &mut c_dev)
         .unwrap();
 
-    let out_gpu = oxide_kernels::gpu::to_host(&stream, &c_dev).unwrap();
+    let out_gpu = tempura_kernels::gpu::to_host(&stream, &c_dev).unwrap();
 
     let mut max_diff = 0.0f32;
     let mut mismatches = 0;
@@ -1089,7 +1089,7 @@ fn test_matmul_mma_bt(m: usize, n: usize, k: usize) {
 fn test_slice_columns() {
     println!("=== Slice columns: fused QKV extraction ===");
 
-    let gpu_ctx = oxide_kernels::gpu::GpuContext::new(0).unwrap();
+    let gpu_ctx = tempura_kernels::gpu::GpuContext::new(0).unwrap();
     let ctx = gpu_ctx.context().clone();
     let stream = ctx.default_stream();
 
@@ -1099,25 +1099,25 @@ fn test_slice_columns() {
     let total_cols = 10usize;
     let data: Vec<f32> = (0..rows * total_cols).map(|i| i as f32).collect();
 
-    let src_dev = oxide_kernels::gpu::to_device(&stream, &data).unwrap();
+    let src_dev = tempura_kernels::gpu::to_device(&stream, &data).unwrap();
 
     // Extract Q (cols 0..4)
     let q_cols = 4usize;
-    let mut q_dev = oxide_kernels::gpu::alloc_device(&stream, rows * q_cols).unwrap();
-    oxide_kernels::gpu::slice_columns_device(
+    let mut q_dev = tempura_kernels::gpu::alloc_device(&stream, rows * q_cols).unwrap();
+    tempura_kernels::gpu::slice_columns_device(
         &ctx, &stream, &src_dev, &mut q_dev, rows, total_cols, 0, q_cols,
     )
     .unwrap();
-    let q_host = oxide_kernels::gpu::to_host(&stream, &q_dev).unwrap();
+    let q_host = tempura_kernels::gpu::to_host(&stream, &q_dev).unwrap();
 
     // Extract K (cols 4..7)
     let k_cols = 3usize;
-    let mut k_dev = oxide_kernels::gpu::alloc_device(&stream, rows * k_cols).unwrap();
-    oxide_kernels::gpu::slice_columns_device(
+    let mut k_dev = tempura_kernels::gpu::alloc_device(&stream, rows * k_cols).unwrap();
+    tempura_kernels::gpu::slice_columns_device(
         &ctx, &stream, &src_dev, &mut k_dev, rows, total_cols, q_cols, k_cols,
     )
     .unwrap();
-    let k_host = oxide_kernels::gpu::to_host(&stream, &k_dev).unwrap();
+    let k_host = tempura_kernels::gpu::to_host(&stream, &k_dev).unwrap();
 
     // Verify Q: row r, col c -> data[r * 10 + c]
     for r in 0..rows {

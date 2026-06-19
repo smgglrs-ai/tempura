@@ -2,7 +2,7 @@ version: 1
 items:
 - id: 2a-matmul
   title: MatMul kernel trait + CPU reference implementation
-  description: 'Add MatMul trait to oxide-kernels with CpuMatMul behind cpu feature. Every transformer
+  description: 'Add MatMul trait to tempura-kernels with CpuMatMul behind cpu feature. Every transformer
     projection needs matrix multiply — currently absent. Signature: forward(&self, a, b, output, m, n,
     k) on &[f32] slices.
 
@@ -118,7 +118,7 @@ items:
   - 'Each kernel file has at least one #[kani::proof] harness'
   - 'kani::assume bounds: batch 1..=2, seq_len 1..=4, heads 1..=4, head_dim 4..8'
   - 'All harnesses use #[kani::unwind(N)] with appropriate bounds'
-  - cargo kani --package oxide-kernels passes all harnesses
+  - cargo kani --package tempura-kernels passes all harnesses
 - id: 2a-kani-kvcache
   title: KvCache Kani proofs
   description: 'KV cache does raw slice indexing with computed offsets — prime Kani target. Prove append_kv,
@@ -268,7 +268,7 @@ items:
   - cargo test --workspace passes
 - id: 2c-trace-api
   title: Trace retrieval API
-  description: 'oxide-specific endpoints for inference traces. Requests with oxide_trace_level field get
+  description: 'tempura-specific endpoints for inference traces. Requests with tempura_trace_level field get
     a trace_id in the response. Traces stored in bounded in-memory ring buffer.
 
     '
@@ -283,9 +283,9 @@ items:
   - server/src/trace_store.rs
   - server/src/main.rs
   acceptance:
-  - GET /oxide/v1/traces/{id} returns full InferenceTrace as JSON
-  - GET /oxide/v1/traces lists recent trace IDs with metadata
-  - DELETE /oxide/v1/traces/{id} removes a trace
+  - GET /tempura/v1/traces/{id} returns full InferenceTrace as JSON
+  - GET /tempura/v1/traces lists recent trace IDs with metadata
+  - DELETE /tempura/v1/traces/{id} removes a trace
   - Configurable via --max-traces (default 100)
 - id: 2c-verify-api
   title: Verification status API
@@ -303,7 +303,7 @@ items:
   - kernels/src/verification_manifest.rs
   - server/src/api.rs
   acceptance:
-  - GET /oxide/v1/verified returns JSON listing each kernel, proof status, properties
+  - GET /tempura/v1/verified returns JSON listing each kernel, proof status, properties
   - Includes caveats about what IS and ISN'T proven (safety vs math correctness)
 - id: 2c-replay-api
   title: Deterministic replay API
@@ -322,7 +322,7 @@ items:
   - server/src/api.rs
   - server/src/replay.rs
   acceptance:
-  - POST /oxide/v1/replay accepts trace_id or explicit (tokens, seed, params)
+  - POST /tempura/v1/replay accepts trace_id or explicit (tokens, seed, params)
   - 'Returns match: true/false with per-token comparison'
   - 'Replay with same seed produces match: true'
 - id: 2c-dual-pipeline
@@ -342,7 +342,7 @@ items:
   - engine/src/dual_pipeline.rs
   - server/src/api.rs
   acceptance:
-  - POST /oxide/v1/compare reports per-layer max abs diff, L2 distance, token match
+  - POST /tempura/v1/compare reports per-layer max abs diff, L2 distance, token match
   - Two identical pipelines produce zero divergence
 - id: 2c-kani-ci
   title: Kani in CI
@@ -359,7 +359,7 @@ items:
   scope:
   - .github/workflows/kani.yml
   acceptance:
-  - CI job runs cargo kani --package oxide-kernels and oxide-engine
+  - CI job runs cargo kani --package tempura-kernels and tempura-engine
   - Kani version pinned for reproducibility
   - Job fails if any harness fails
 - id: p3-cuda-toolchain
@@ -387,7 +387,7 @@ items:
   - cargo check --features cuda compiles all stub Cuda* structs
   - 'Stub Cuda* structs exist behind #[cfg(feature = cuda)] with todo!() bodies in each kernel file'
   - engine/src/pipeline.rs has KernelPipeline::cuda() constructor behind feature gate
-  - engine/Cargo.toml forwards cuda feature to oxide-kernels
+  - engine/Cargo.toml forwards cuda feature to tempura-kernels
   verification:
     quick: cargo build && cargo test
 - id: p3-cuda-infra
@@ -411,7 +411,7 @@ items:
   - cargo oxide build succeeds on the kernels crate
   - Helper functions map cuda-oxide errors to KernelError
   verification:
-    quick: cargo oxide build --package oxide-kernels
+    quick: cargo oxide build --package tempura-kernels
 - id: p3-cuda-rope
   title: CudaRoPE — first GPU kernel (elementwise)
   description: 'Elementwise kernel — no shared memory, no reductions. Validates the full pipeline: kernel
@@ -561,7 +561,7 @@ items:
     this is below TurboQuant intended range (3-4 bit sweet spot). No competing system
     does formal verification of KV compression.'
   verification:
-    quick: cargo test --package oxide-kernels --package oxide-engine
+    quick: cargo test --package tempura-kernels --package tempura-engine
 - id: p4-kvcache-pool
   title: Multi-sequence KV cache (slot-based pool)
   description: 'Refactor KvCache from single-sequence to slot-based pool managing multiple concurrent
@@ -858,7 +858,7 @@ items:
   - Existing hardcoded presets (llama2_7b, micro_llama, tiny_test) remain available and continue to work
     unchanged
   verification:
-    quick: cargo test --package oxide-engine
+    quick: cargo test --package tempura-engine
 - id: p6-sampling-penalties
   title: Presence and frequency penalties
   status: done
@@ -888,7 +888,7 @@ items:
     tokens proportional to their count
   - CudaSampler stub is updated to accept the new parameters without breaking compilation
   verification:
-    quick: cargo test -p oxide-kernels -- sampling && cargo test -p oxide-engine && cargo build -p oxide-server
+    quick: cargo test -p tempura-kernels -- sampling && cargo test -p tempura-engine && cargo build -p tempura-server
 - id: p6-guided-decoding
   title: Structured output / JSON mode (guided decoding)
   status: done
@@ -992,7 +992,7 @@ items:
   - 'Streaming requests (stream: true) with n > 1 return HTTP 400 with a descriptive error message'
   - Requests with n < 1 or n > 128 return HTTP 400 with a validation error
   verification:
-    quick: cargo test --package oxide-server
+    quick: cargo test --package tempura-server
 - id: p7-graceful-shutdown
   title: Graceful shutdown
   status: done
@@ -1017,7 +1017,7 @@ items:
     the full duration
   - Exit code is 0 for clean shutdown, non-zero if requests were forcibly dropped
   verification:
-    quick: cargo test --package oxide-server && cargo build --package oxide-server
+    quick: cargo test --package tempura-server && cargo build --package tempura-server
 - id: p7-readiness-probe
   title: Readiness probe (/ready endpoint)
   status: done
@@ -1044,7 +1044,7 @@ items:
     not-ready (503) case
   - The existing /health endpoint remains unchanged as a liveness probe
   verification:
-    quick: cargo test --package oxide-server
+    quick: cargo test --package tempura-server
 - id: p7-request-timeouts
   title: Per-request timeouts
   status: done
@@ -1059,7 +1059,7 @@ items:
     indefinitely. The server needs a configurable default timeout (CLI flag --request-timeout-secs) and
     an optional per-request override (timeout_secs field on request bodies). On expiry, the handler must
     cancel or abort the generation, return HTTP 408/504 with an OpenAI-compatible error body, and emit
-    an oxide_request_timeout counter metric. For the streaming path, the spawn_blocking task uses a callback
+    an tempura_request_timeout counter metric. For the streaming path, the spawn_blocking task uses a callback
     that checks elapsed time against the deadline and returns false to stop generation early.
   acceptance:
   - Non-streaming inference endpoints (chat_completions, completions, replay, compare_pipelines) return
@@ -1068,19 +1068,19 @@ items:
     the per-request timeout is reached
   - 'CLI flag --request-timeout-secs sets the server-wide default (default: 300); request bodies accept
     an optional timeout_secs field that overrides it for that request'
-  - An oxide_request_timeout counter metric (labeled by endpoint) increments on every timeout
+  - An tempura_request_timeout counter metric (labeled by endpoint) increments on every timeout
   - Existing tests continue to pass and at least one new integration test verifies that a request exceeding
     the timeout receives the expected error response
   - Timeout is enforced via tokio::time::timeout (non-streaming) or Instant::now() + Duration deadline
     checked in the on_token callback (streaming), not via tower global middleware, so per-request overrides
     work correctly
   verification:
-    quick: cargo test --package oxide-server
+    quick: cargo test --package tempura-server
 - id: p7-comprehensive-metrics
   title: Comprehensive Prometheus metrics (TTFT, ITL, queue depth, KV usage)
   description: 'Add inference-specific Prometheus metrics to the server crate. The current /metrics endpoint
-    uses metrics-exporter-prometheus but only records three basic metrics (oxide_request_count, oxide_tokens_generated,
-    oxide_request_duration_seconds) and only on the non-streaming code path. This item adds TTFT (time
+    uses metrics-exporter-prometheus but only records three basic metrics (tempura_request_count, tempura_tokens_generated,
+    tempura_request_duration_seconds) and only on the non-streaming code path. This item adds TTFT (time
     to first token) and ITL (inter-token latency) histograms, scheduler queue depth and active sequence
     gauges, KV cache slot utilization gauges, per-token generation counters on the streaming path, and
     request error counters. Metrics recording must be wired into both the non-streaming and streaming
@@ -1096,20 +1096,20 @@ items:
   - server/src/api.rs
   - server/src/main.rs
   acceptance:
-  - GET /metrics returns oxide_time_to_first_token_seconds histogram populated after a streaming or non-streaming
+  - GET /metrics returns tempura_time_to_first_token_seconds histogram populated after a streaming or non-streaming
     chat completion request
-  - GET /metrics returns oxide_inter_token_latency_seconds histogram populated after a streaming request
+  - GET /metrics returns tempura_inter_token_latency_seconds histogram populated after a streaming request
     generating at least 2 tokens
-  - GET /metrics returns oxide_scheduler_queue_depth gauge (pending + preempted) and oxide_scheduler_active_sequences
+  - GET /metrics returns tempura_scheduler_queue_depth gauge (pending + preempted) and tempura_scheduler_active_sequences
     gauge updated on each request
-  - GET /metrics returns oxide_kv_cache_slots_in_use and oxide_kv_cache_slots_total gauges when a KvCachePool
+  - GET /metrics returns tempura_kv_cache_slots_in_use and tempura_kv_cache_slots_total gauges when a KvCachePool
     is wired into AppState
-  - Streaming chat_completions handler records oxide_request_count, oxide_tokens_generated, and oxide_request_duration_seconds
+  - Streaming chat_completions handler records tempura_request_count, tempura_tokens_generated, and tempura_request_duration_seconds
     (currently missing from that path)
   - All new metrics use the metrics crate macros (histogram!, gauge!, counter!) consistent with the existing
     instrumentation style
   verification:
-    quick: cargo test --package oxide-server && cargo build --package oxide-server
+    quick: cargo test --package tempura-server && cargo build --package tempura-server
 - id: p7-wire-batch-scheduler
   title: Wire BatchScheduler into API handlers
   status: done
@@ -1139,10 +1139,10 @@ items:
     when the stream ends or the client disconnects
   - Scheduler queue depths (active_count, pending_count, preempted_count) are emitted as Prometheus gauges
     on each request
-  - Existing tests (cargo test -p oxide-server) continue to pass and at least one new integration test
+  - Existing tests (cargo test -p tempura-server) continue to pass and at least one new integration test
     verifies that concurrent requests are gated by max_batch_size
   verification:
-    quick: cargo test -p oxide-server
+    quick: cargo test -p tempura-server
 - id: p7-prefix-caching
   title: Prefix caching (hash-based KV reuse)
   description: Introduce block-based KV cache management with content-addressable hash lookup so that
@@ -1212,7 +1212,7 @@ items:
     prefill for the same seed'
   - Unit test proving chunked prefill output matches unchunked output for prompts longer than chunk_size
   verification:
-    quick: cargo test --package oxide-engine --package oxide-server
+    quick: cargo test --package tempura-engine --package tempura-server
 - id: p8-timing-info
   title: Populate timing info in InferenceTrace
   description: 'The `generate` and `generate_with_callback` methods in `engine/src/model.rs` set `prompt_tokens`
@@ -1243,7 +1243,7 @@ items:
   - Existing tests continue to pass and at least one new test asserts that timing fields are populated
     and internally consistent (total_ms >= prompt_ms + generation_ms)
   verification:
-    quick: cd /home/fdupont/Code/github.com/smgglrs-ai/oxide-serve && cargo test --package oxide-engine
+    quick: cd /home/fdupont/Code/github.com/smgglrs-ai/tempura-serve && cargo test --package tempura-engine
 - id: p8-opentelemetry
   title: OpenTelemetry trace export
   description: Add OpenTelemetry distributed tracing to the server so that each inference request emits
@@ -1271,11 +1271,11 @@ items:
     prompt_tokens, completion_tokens, total_duration_ms'
   - Forward-pass layer processing emits child spans with layer_index and duration when TraceLevel is Summary
     or Full
-  - Span resource attributes include service.name=oxide-serve and service.version from Cargo.toml
-  - cargo test --package oxide-server passes with no regressions (OTel layers initialize without a live
+  - Span resource attributes include service.name=tempura-serve and service.version from Cargo.toml
+  - cargo test --package tempura-server passes with no regressions (OTel layers initialize without a live
     collector in test mode)
   verification:
-    quick: cargo test --package oxide-server
+    quick: cargo test --package tempura-server
 - id: p8-batch-invariant-verification
   title: Batch-invariant inference verification
   description: Build a test harness that proves inference output for a given sequence is bit-identical
@@ -1306,11 +1306,11 @@ items:
   - 'At least 3 integration tests in engine/src/batch_invariant.rs cover: (a) solo vs batch-of-2, (b)
     solo vs batch-of-4 with heterogeneous prompt lengths, (c) solo vs batch where other sequences have
     pre-populated KV caches at different positions'
-  - All tests pass deterministically with cargo test --package oxide-engine (same seed, same output)
+  - All tests pass deterministically with cargo test --package tempura-engine (same seed, same output)
   - DualPipeline compare_pipelines extended or complemented to accept batched inputs so CPU-vs-GPU batch
     invariance can be checked in Phase 3
   verification:
-    quick: cargo test --package oxide-engine batch_invariant
+    quick: cargo test --package tempura-engine batch_invariant
 - id: auto-rustfmt
   title: Fix rustfmt violations across workspace
   status: done
@@ -1377,9 +1377,9 @@ items:
   - Tests for all three ModelConfig presets verifying key field values
   - Tests for QuantConfig::gptq(), awq(), gguf() verifying format, bits, group_size, symmetric
   - head_dim consistency check (hidden_size / num_attention_heads == head_dim)
-  - cargo test --package oxide-engine passes
+  - cargo test --package tempura-engine passes
   verification:
-    quick: cargo test --package oxide-engine
+    quick: cargo test --package tempura-engine
 - id: auto-test-sse
   title: Add unit tests for SSE helper functions
   status: done
@@ -1396,9 +1396,9 @@ items:
   - Test that chunk_to_event produces valid SSE Event with JSON data
   - Test that done_event produces Event with data "[DONE]"
   - Test ChatCompletionChunk serialization with content, finish_reason, and role fields
-  - cargo test --package oxide-server passes
+  - cargo test --package tempura-server passes
   verification:
-    quick: cargo test --package oxide-server
+    quick: cargo test --package tempura-server
 - id: auto-test-verification-manifest
   title: Add unit tests for verification manifest
   status: done
@@ -1415,9 +1415,9 @@ items:
   - Test that manifest() returns non-empty kernels list
   - Test that all kernel proof entries have status "proven"
   - Test that manifest serializes to valid JSON
-  - cargo test --package oxide-kernels passes
+  - cargo test --package tempura-kernels passes
   verification:
-    quick: cargo test --package oxide-kernels
+    quick: cargo test --package tempura-kernels
 - id: p9-stream-usage
   title: stream_options.include_usage in streaming responses
   status: done
@@ -1438,9 +1438,9 @@ items:
     with prompt_tokens, completion_tokens, and total_tokens matching the non-streaming response format'
   - When stream_options is absent or include_usage is false, streaming behavior is unchanged (no usage chunk)
   - Non-streaming requests ignore stream_options entirely
-  - cargo test --package oxide-server passes with at least one new test verifying usage presence in streaming
+  - cargo test --package tempura-server passes with at least one new test verifying usage presence in streaming
   verification:
-    quick: cargo test --package oxide-server
+    quick: cargo test --package tempura-server
 - id: p9-seed-param
   title: Expose seed parameter on API requests
   status: done
@@ -1459,11 +1459,11 @@ items:
   - ChatCompletionRequest and CompletionRequest accept an optional seed field (Option<u64>)
   - When seed is provided, InferenceSession uses that seed instead of the default 42
   - When seed is absent, behavior is unchanged (backward compatible)
-  - 'Response includes system_fingerprint field (e.g. "oxide-serve-{version}")'
+  - 'Response includes system_fingerprint field (e.g. "tempura-serve-{version}")'
   - 'Determinism test: two requests with the same seed produce identical output'
-  - cargo test --package oxide-server passes
+  - cargo test --package tempura-server passes
   verification:
-    quick: cargo test --package oxide-server
+    quick: cargo test --package tempura-server
 - id: p9-max-completion-tokens
   title: Support max_completion_tokens alias
   status: done
@@ -1481,7 +1481,7 @@ items:
   - When both are provided, max_completion_tokens takes precedence
   - Existing requests using max_tokens continue to work unchanged
   verification:
-    quick: cargo test --package oxide-server
+    quick: cargo test --package tempura-server
 - id: p9-model-tool-parsers
   title: Model-specific tool call parsers
   status: done
@@ -1507,7 +1507,7 @@ items:
   - 'Fallback: if no model-specific parser matches, the generic JSON parser is used'
   - cargo test --workspace passes
   verification:
-    quick: cargo test --package oxide-engine -- tool_call
+    quick: cargo test --package tempura-engine -- tool_call
 - id: p9-constrained-tool-args
   title: Wire guided decoding into tool_choice modes
   status: done
@@ -1558,7 +1558,7 @@ items:
   - 'Test: high-priority request preempts low-priority request when slots are full'
   - Existing tests pass unchanged (default priority preserves current behavior)
   verification:
-    quick: cargo test --package oxide-server
+    quick: cargo test --package tempura-server
 - id: p10-health-inference-probe
   title: Black-box health check with priority inference
   status: done
@@ -1582,9 +1582,9 @@ items:
   - Returns 503 with JSON {"healthy":false,"error":"..."} on failure or timeout (5s default)
   - Does not interfere with normal request processing (uses scheduler, releases slot)
   - Existing /health and /ready endpoints remain unchanged
-  - cargo test --package oxide-server passes
+  - cargo test --package tempura-server passes
   verification:
-    quick: cargo test --package oxide-server
+    quick: cargo test --package tempura-server
 - id: p10-cache-salt
   title: Prefix cache tenant isolation (cache_salt)
   status: done
@@ -1604,9 +1604,9 @@ items:
   - PrefixCacheTable.hash_tokens includes the cache_salt in the hash computation when provided
   - Two requests with identical token_ids but different cache_salt values produce independent cache entries
   - Requests without cache_salt behave identically to current behavior (backward compatible)
-  - cargo test --package oxide-engine passes with a new test verifying salt isolation
+  - cargo test --package tempura-engine passes with a new test verifying salt isolation
   verification:
-    quick: cargo test --package oxide-engine -- prefix_cache
+    quick: cargo test --package tempura-engine -- prefix_cache
 - id: p11-responses-api
   title: OpenAI Responses API (/v1/responses)
   status: done
@@ -1628,9 +1628,9 @@ items:
   - Streaming mode returns SSE events matching the Responses API streaming format
   - Tool use works through the Responses API (same underlying ToolCallParser)
   - Requests without tools produce text output equivalent to chat completions
-  - cargo test --package oxide-server passes
+  - cargo test --package tempura-server passes
   verification:
-    quick: cargo test --package oxide-server
+    quick: cargo test --package tempura-server
 - id: p11-disaggregated-serving
   title: Disaggregated prefill/decode serving
   status: done
@@ -1791,16 +1791,17 @@ items:
   # ============================================================================
 
 - id: p12-rename
-  title: Rename oxide-serve → tempura-serve
+  title: Rename tempura-serve → tempura-serve
   description: 'Rename the project and all crate references from oxide-* to tempura-*.
     This is a mechanical but comprehensive change: Cargo.toml package names, crate
-    imports, module prefixes (oxide_kernels → tempura_kernels, oxide_engine → tempura_engine),
-    binary names, Docker labels, CI workflows, metrics prefixes (oxide_request_count →
-    tempura_request_count), API paths (/oxide/v1/ → /tempura/v1/), README, CLAUDE.md,
-    and repository name. Preserve git history. The repo moves from smgglrs-ai/oxide-serve
+    imports, module prefixes (tempura_kernels → tempura_kernels, tempura_engine → tempura_engine),
+    binary names, Docker labels, CI workflows, metrics prefixes (tempura_request_count →
+    tempura_request_count), API paths (/tempura/v1/ → /tempura/v1/), README, CLAUDE.md,
+    and repository name. Preserve git history. The repo moves from smgglrs-ai/tempura-serve
     to smgglrs-ai/tempura-serve.'
-  status: pending
+  status: done
   priority: critical
+  progress: 100
   effort: M
   scope:
   - Cargo.toml
@@ -1816,13 +1817,13 @@ items:
   acceptance:
   - All Cargo.toml package names use tempura-* (tempura-kernels, tempura-engine, tempura-serve)
   - All Rust import paths use tempura_* (tempura_kernels::Attention, etc.)
-  - API paths /oxide/v1/* renamed to /tempura/v1/*
+  - API paths /tempura/v1/* renamed to /tempura/v1/*
   - Prometheus metrics prefixed with tempura_ instead of oxide_
   - system_fingerprint in API responses reads tempura-serve-{version}
   - cargo build --workspace && cargo test --workspace passes
-  - No remaining references to oxide-serve, oxide_kernels, oxide_engine in source
+  - No remaining references to tempura-serve, tempura_kernels, tempura_engine in source
   verification:
-    quick: cargo build --workspace && cargo test --workspace && ! grep -r 'oxide.serve\|oxide_kernels\|oxide_engine' --include='*.rs' .
+    quick: cargo build --workspace && cargo test --workspace && ! grep -r 'oxide.serve\|tempura_kernels\|tempura_engine' --include='*.rs' .
 
 - id: p12-crate-split
   title: Split tempura-kernels into tempura-kernel-api + tempura-kernels
@@ -1926,7 +1927,7 @@ items:
     API and record it in InferenceTrace. Each kernel implementation declares its tier
     via a const fn or associated type. KernelPipeline aggregates the tiers of its
     components and records the overall tier in every trace. The API response includes
-    a verification_tier field in the oxide-specific metadata. Users see exactly what
+    a verification_tier field in the tempura-specific metadata. Users see exactly what
     level of verification produced each response. Proven = Kani proofs pass +
     DualPipeline equivalence within epsilon. Tested = DualPipeline equivalence only.
     Compiled = type-checks against traits, no equivalence data.'

@@ -2,7 +2,7 @@ use crate::config::ModelConfig;
 use crate::model::TransformerModel;
 use crate::session::{InferenceSession, SessionTransfer};
 use crate::trace::TraceLevel;
-use oxide_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
+use tempura_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
 
 pub trait PrefillWorker: Send + Sync {
     fn prefill(&self, token_ids: &[u32], seed: u64) -> SessionTransfer;
@@ -271,11 +271,11 @@ mod tests {
         ModelConfig,
         Arc<
             TransformerModel<
-                oxide_kernels::attention::CpuAttention,
-                oxide_kernels::rmsnorm::CpuRMSNorm,
-                oxide_kernels::rope::CpuRoPE,
-                oxide_kernels::matmul::CpuMatMul,
-                oxide_kernels::sampling::CpuSampler,
+                tempura_kernels::attention::CpuAttention,
+                tempura_kernels::rmsnorm::CpuRMSNorm,
+                tempura_kernels::rope::CpuRoPE,
+                tempura_kernels::matmul::CpuMatMul,
+                tempura_kernels::sampling::CpuSampler,
             >,
         >,
     ) {

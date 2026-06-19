@@ -21,7 +21,7 @@ pub fn pull(store: &ModelStore, repo_id: &str) -> Result<ModelEntry, ModelError>
     let files = ["config.json", "tokenizer.json", "tokenizer_config.json"];
 
     let client = reqwest::blocking::Client::builder()
-        .user_agent("oxide-serve/0.1.0")
+        .user_agent("tempura-serve/0.1.0")
         .build()
         .map_err(|e| ModelError::Download(e.to_string()))?;
 

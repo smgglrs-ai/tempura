@@ -1,8 +1,8 @@
-use oxide_kernels::{AllReduce, Attention, MatMul, RMSNorm, RoPE, Sampler};
+use tempura_kernels::{AllReduce, Attention, MatMul, RMSNorm, RoPE, Sampler};
 
 use crate::trace::{LayerSnapshot, NormStats, TraceLevel};
 
-pub struct KernelPipeline<A, N, R, M, S, AR = oxide_kernels::allreduce::CpuAllReduce> {
+pub struct KernelPipeline<A, N, R, M, S, AR = tempura_kernels::allreduce::CpuAllReduce> {
     pub attention: A,
     pub rmsnorm: N,
     pub rope: R,
@@ -13,20 +13,20 @@ pub struct KernelPipeline<A, N, R, M, S, AR = oxide_kernels::allreduce::CpuAllRe
 
 impl
     KernelPipeline<
-        oxide_kernels::attention::CpuAttention,
-        oxide_kernels::rmsnorm::CpuRMSNorm,
-        oxide_kernels::rope::CpuRoPE,
-        oxide_kernels::matmul::CpuMatMul,
-        oxide_kernels::sampling::CpuSampler,
+        tempura_kernels::attention::CpuAttention,
+        tempura_kernels::rmsnorm::CpuRMSNorm,
+        tempura_kernels::rope::CpuRoPE,
+        tempura_kernels::matmul::CpuMatMul,
+        tempura_kernels::sampling::CpuSampler,
     >
 {
     pub fn cpu_verified() -> Self {
-        use oxide_kernels::allreduce::CpuAllReduce;
-        use oxide_kernels::attention::CpuAttention;
-        use oxide_kernels::matmul::CpuMatMul;
-        use oxide_kernels::rmsnorm::CpuRMSNorm;
-        use oxide_kernels::rope::CpuRoPE;
-        use oxide_kernels::sampling::CpuSampler;
+        use tempura_kernels::allreduce::CpuAllReduce;
+        use tempura_kernels::attention::CpuAttention;
+        use tempura_kernels::matmul::CpuMatMul;
+        use tempura_kernels::rmsnorm::CpuRMSNorm;
+        use tempura_kernels::rope::CpuRoPE;
+        use tempura_kernels::sampling::CpuSampler;
 
         Self {
             attention: CpuAttention,
@@ -42,27 +42,27 @@ impl
 #[cfg(feature = "cuda")]
 impl
     KernelPipeline<
-        oxide_kernels::attention::CudaAttention,
-        oxide_kernels::rmsnorm::CudaRMSNorm,
-        oxide_kernels::rope::CudaRoPE,
-        oxide_kernels::matmul::CudaMatMul,
-        oxide_kernels::sampling::CudaSampler,
-        oxide_kernels::allreduce::CpuAllReduce,
+        tempura_kernels::attention::CudaAttention,
+        tempura_kernels::rmsnorm::CudaRMSNorm,
+        tempura_kernels::rope::CudaRoPE,
+        tempura_kernels::matmul::CudaMatMul,
+        tempura_kernels::sampling::CudaSampler,
+        tempura_kernels::allreduce::CpuAllReduce,
     >
 {
     pub fn cuda() -> KernelPipeline<
-        oxide_kernels::attention::CudaAttention,
-        oxide_kernels::rmsnorm::CudaRMSNorm,
-        oxide_kernels::rope::CudaRoPE,
-        oxide_kernels::matmul::CudaMatMul,
-        oxide_kernels::sampling::CpuSampler,
+        tempura_kernels::attention::CudaAttention,
+        tempura_kernels::rmsnorm::CudaRMSNorm,
+        tempura_kernels::rope::CudaRoPE,
+        tempura_kernels::matmul::CudaMatMul,
+        tempura_kernels::sampling::CpuSampler,
     > {
-        use oxide_kernels::allreduce::CpuAllReduce;
-        use oxide_kernels::attention::CudaAttention;
-        use oxide_kernels::matmul::CudaMatMul;
-        use oxide_kernels::rmsnorm::CudaRMSNorm;
-        use oxide_kernels::rope::CudaRoPE;
-        use oxide_kernels::sampling::CpuSampler;
+        use tempura_kernels::allreduce::CpuAllReduce;
+        use tempura_kernels::attention::CudaAttention;
+        use tempura_kernels::matmul::CudaMatMul;
+        use tempura_kernels::rmsnorm::CudaRMSNorm;
+        use tempura_kernels::rope::CudaRoPE;
+        use tempura_kernels::sampling::CpuSampler;
 
         KernelPipeline {
             attention: CudaAttention::new().expect("Failed to initialize CudaAttention"),
@@ -84,7 +84,7 @@ where
     S: Sampler,
     AR: AllReduce,
 {
-    pub fn allreduce_sum(&self, data: &mut [f32]) -> oxide_kernels::Result<()> {
+    pub fn allreduce_sum(&self, data: &mut [f32]) -> tempura_kernels::Result<()> {
         self.allreduce.sum_in_place(data)
     }
 
@@ -96,7 +96,7 @@ where
         eps: f32,
         trace_level: TraceLevel,
         snapshot: &mut Option<&mut LayerSnapshot>,
-    ) -> oxide_kernels::Result<()> {
+    ) -> tempura_kernels::Result<()> {
         if trace_level >= TraceLevel::Summary {
             if let Some(ref mut snap) = snapshot {
                 let mean = x.iter().sum::<f32>() / x.len() as f32;
@@ -136,7 +136,7 @@ where
         m: usize,
         n: usize,
         k: usize,
-    ) -> oxide_kernels::Result<()> {
+    ) -> tempura_kernels::Result<()> {
         self.matmul.forward(a, b, output, m, n, k)
     }
 
@@ -150,7 +150,7 @@ where
         m: usize,
         n: usize,
         k: usize,
-    ) -> oxide_kernels::Result<()> {
+    ) -> tempura_kernels::Result<()> {
         self.matmul.forward_b_transposed(a, b, output, m, n, k)
     }
 
@@ -164,7 +164,7 @@ where
         head_dim: usize,
         positions: &[u32],
         theta: f32,
-    ) -> oxide_kernels::Result<()> {
+    ) -> tempura_kernels::Result<()> {
         self.rope
             .forward(x, batch, seq_len, num_heads, head_dim, positions, theta)
     }
@@ -183,7 +183,7 @@ where
         num_kv_heads: usize,
         head_dim: usize,
         scale: f32,
-    ) -> oxide_kernels::Result<()> {
+    ) -> tempura_kernels::Result<()> {
         self.attention.forward(
             q,
             k,

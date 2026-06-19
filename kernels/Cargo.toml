@@ -1,9 +1,9 @@
 [package]
-name = "oxide-kernels"
+name = "tempura-kernels"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Kernel traits and CPU reference implementations for oxide-serve"
+description = "Kernel traits and CPU reference implementations for tempura-serve"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

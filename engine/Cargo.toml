@@ -1,19 +1,19 @@
 [package]
-name = "oxide-engine"
+name = "tempura-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Inference engine for oxide-serve: model loading, KV-cache, forward pass"
+description = "Inference engine for tempura-serve: model loading, KV-cache, forward pass"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [features]
 default = []
-cuda = ["oxide-kernels/cuda", "dep:cuda-core"]
+cuda = ["tempura-kernels/cuda", "dep:cuda-core"]
 
 [dependencies]
-oxide-kernels = { path = "../kernels" }
+tempura-kernels = { path = "../kernels" }
 safetensors = "0.5"
 tokenizers = "0.21"
 thiserror = "2"

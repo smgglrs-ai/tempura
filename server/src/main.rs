@@ -7,9 +7,9 @@ mod trace_store;
 
 use clap::Parser;
 use metrics_exporter_prometheus::PrometheusHandle;
-use oxide_engine::pipeline::KernelPipeline;
-use oxide_engine::tokenizer::Tokenizer;
-use oxide_engine::{ModelConfig, TransformerModel};
+use tempura_engine::pipeline::KernelPipeline;
+use tempura_engine::tokenizer::Tokenizer;
+use tempura_engine::{ModelConfig, TransformerModel};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -17,7 +17,7 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "oxide-serve", about = "Rust-native LLM inference server")]
+#[command(name = "tempura-serve", about = "Rust-native LLM inference server")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -96,25 +96,25 @@ struct ServeArgs {
 }
 
 pub type CpuModel = TransformerModel<
-    oxide_kernels::attention::CpuAttention,
-    oxide_kernels::rmsnorm::CpuRMSNorm,
-    oxide_kernels::rope::CpuRoPE,
-    oxide_kernels::matmul::CpuMatMul,
-    oxide_kernels::sampling::CpuSampler,
+    tempura_kernels::attention::CpuAttention,
+    tempura_kernels::rmsnorm::CpuRMSNorm,
+    tempura_kernels::rope::CpuRoPE,
+    tempura_kernels::matmul::CpuMatMul,
+    tempura_kernels::sampling::CpuSampler,
 >;
 
 #[cfg(feature = "cuda")]
 pub type CudaModel = TransformerModel<
-    oxide_kernels::attention::CudaAttention,
-    oxide_kernels::rmsnorm::CudaRMSNorm,
-    oxide_kernels::rope::CudaRoPE,
-    oxide_kernels::matmul::CudaMatMul,
-    oxide_kernels::sampling::CpuSampler,
+    tempura_kernels::attention::CudaAttention,
+    tempura_kernels::rmsnorm::CudaRMSNorm,
+    tempura_kernels::rope::CudaRoPE,
+    tempura_kernels::matmul::CudaMatMul,
+    tempura_kernels::sampling::CpuSampler,
 >;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub model: Arc<dyn oxide_engine::InferenceModel>,
+    pub model: Arc<dyn tempura_engine::InferenceModel>,
     pub tokenizer: Option<Arc<Tokenizer>>,
     pub model_id: String,
     pub scheduler: Arc<Mutex<batch::BatchScheduler>>,
@@ -132,8 +132,8 @@ async fn main() {
             tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::from_default_env())
                 .init();
-            let store = oxide_server_model::store::ModelStore::open();
-            match oxide_server_model::hub::pull(&store, &repo_id) {
+            let store = tempura_model::store::ModelStore::open();
+            match tempura_model::hub::pull(&store, &repo_id) {
                 Ok(entry) => {
                     println!("Downloaded {} to {}", entry.repo_id, entry.path.display());
                     println!(
@@ -150,10 +150,10 @@ async fn main() {
             return;
         }
         Some(Command::List) => {
-            let store = oxide_server_model::store::ModelStore::open();
+            let store = tempura_model::store::ModelStore::open();
             let models = store.list();
             if models.is_empty() {
-                println!("No models installed. Use `oxide-serve pull <repo-id>` to download one.");
+                println!("No models installed. Use `tempura-serve pull <repo-id>` to download one.");
             } else {
                 println!("{:<40} {:<15} {:>10}", "NAME", "FORMAT", "SIZE");
                 println!("{}", "-".repeat(67));
@@ -170,7 +170,7 @@ async fn main() {
             return;
         }
         Some(Command::Inspect { path }) => {
-            match oxide_server_model::inspect::inspect(Path::new(&path)) {
+            match tempura_model::inspect::inspect(Path::new(&path)) {
                 Ok(info) => print!("{info}"),
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -240,8 +240,8 @@ async fn run_server(args: ServeArgs) {
     });
 
     let build_model = |config: &ModelConfig,
-                       loader: &dyn oxide_engine::loader::WeightLoader|
-     -> Arc<dyn oxide_engine::InferenceModel> {
+                       loader: &dyn tempura_engine::loader::WeightLoader|
+     -> Arc<dyn tempura_engine::InferenceModel> {
         #[cfg(feature = "cuda")]
         if use_cuda {
             let pipeline = KernelPipeline::cuda();
@@ -249,7 +249,7 @@ async fn run_server(args: ServeArgs) {
             model.load_weights(loader).unwrap();
 
             let ctx = model.pipeline.matmul.gpu().context().clone();
-            let gpu_weights = oxide_engine::GpuWeights::upload_from_with_concat(
+            let gpu_weights = tempura_engine::GpuWeights::upload_from_with_concat(
                 model.weights.as_ref().unwrap(),
                 config,
                 &ctx,
@@ -257,14 +257,14 @@ async fn run_server(args: ServeArgs) {
             .expect("GPU weight upload failed");
             ctx.bind_to_thread().unwrap();
             let stream = ctx.default_stream();
-            let gpu_cache = oxide_engine::GpuKvCache::new(config, &stream)
+            let gpu_cache = tempura_engine::GpuKvCache::new(config, &stream)
                 .expect("GPU KV cache allocation failed");
 
-            let scratchpad = oxide_engine::GpuScratchpad::new(config, &stream)
+            let scratchpad = tempura_engine::GpuScratchpad::new(config, &stream)
                 .expect("GPU scratchpad allocation failed");
 
             tracing::info!("Uploaded weights and KV cache to GPU");
-            return Arc::new(oxide_engine::GpuInferenceWrapper {
+            return Arc::new(tempura_engine::GpuInferenceWrapper {
                 model,
                 gpu_weights,
                 gpu_cache: std::sync::Mutex::new(gpu_cache),
@@ -279,7 +279,7 @@ async fn run_server(args: ServeArgs) {
 
     let (config, model_id) = if is_gguf {
         let model_p = model_path.unwrap();
-        let gguf = oxide_engine::gguf_loader::GgufLoader::from_file_quantized(model_p).unwrap();
+        let gguf = tempura_engine::gguf_loader::GgufLoader::from_file_quantized(model_p).unwrap();
         let config = gguf.config.clone();
         tracing::info!("Loaded GGUF model from {}", model_p.display());
 
@@ -306,7 +306,7 @@ async fn run_server(args: ServeArgs) {
         let mut model = TransformerModel::new(config.clone(), pipeline);
         model.quantized_weights = Some(qweights);
         tracing::info!("Using quantized weights");
-        let model: Arc<dyn oxide_engine::InferenceModel> = Arc::new(model);
+        let model: Arc<dyn tempura_engine::InferenceModel> = Arc::new(model);
 
         let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let metrics_handle = prometheus_builder.install_recorder().unwrap();
@@ -329,7 +329,7 @@ async fn run_server(args: ServeArgs) {
             .with_state(state);
 
         let addr = format!("{}:{}", args.host, args.port);
-        tracing::info!("Starting oxide-serve on {}", addr);
+        tracing::info!("Starting tempura-serve on {}", addr);
 
         let shutdown_timeout = std::time::Duration::from_secs(args.shutdown_timeout);
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
@@ -367,16 +367,16 @@ async fn run_server(args: ServeArgs) {
             _ => ModelConfig::llama2_7b(),
         };
         tracing::warn!("No --model provided, running with unloaded weights (stub responses)");
-        (config, "oxide-serve-unloaded".to_string())
+        (config, "tempura-serve-unloaded".to_string())
     };
 
-    let model: Arc<dyn oxide_engine::InferenceModel> = if let Some(model_p) = model_path {
+    let model: Arc<dyn tempura_engine::InferenceModel> = if let Some(model_p) = model_path {
         if is_model_dir {
-            let loader = oxide_engine::loader::SafetensorsLoader::from_dir(model_p).unwrap();
+            let loader = tempura_engine::loader::SafetensorsLoader::from_dir(model_p).unwrap();
             tracing::info!("Loaded model weights from {}", model_p.display());
             build_model(&config, &loader)
         } else {
-            let loader = oxide_engine::loader::SafetensorsLoader::from_file(model_p).unwrap();
+            let loader = tempura_engine::loader::SafetensorsLoader::from_file(model_p).unwrap();
             tracing::info!("Loaded model weights from {}", model_p.display());
             build_model(&config, &loader)
         }
@@ -427,7 +427,7 @@ async fn run_server(args: ServeArgs) {
         .with_state(state);
 
     let addr = format!("{}:{}", args.host, args.port);
-    tracing::info!("Starting oxide-serve on {}", addr);
+    tracing::info!("Starting tempura-serve on {}", addr);
 
     let shutdown_timeout = std::time::Duration::from_secs(args.shutdown_timeout);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
@@ -482,12 +482,12 @@ fn init_tracing(_otlp_endpoint: &Option<String>) {
             let provider = opentelemetry_sdk::trace::TracerProvider::builder()
                 .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
                 .with_resource(opentelemetry_sdk::Resource::new(vec![
-                    opentelemetry::KeyValue::new("service.name", "oxide-serve"),
+                    opentelemetry::KeyValue::new("service.name", "tempura-serve"),
                     opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
                 ]))
                 .build();
 
-            let tracer = provider.tracer("oxide-serve");
+            let tracer = provider.tracer("tempura-serve");
             let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
             let subscriber = tracing_subscriber::Registry::default()

@@ -1,10 +1,10 @@
-use oxide_engine::config::ModelConfig;
-use oxide_engine::gpu_scratchpad::GpuScratchpad;
-use oxide_engine::kv_cache::GpuKvCache;
-use oxide_engine::loader::WeightLoader;
-use oxide_engine::pipeline::KernelPipeline;
-use oxide_engine::weights::GpuWeights;
-use oxide_engine::TransformerModel;
+use tempura_engine::config::ModelConfig;
+use tempura_engine::gpu_scratchpad::GpuScratchpad;
+use tempura_engine::kv_cache::GpuKvCache;
+use tempura_engine::loader::WeightLoader;
+use tempura_engine::pipeline::KernelPipeline;
+use tempura_engine::weights::GpuWeights;
+use tempura_engine::TransformerModel;
 use std::time::Instant;
 
 const WARMUP: usize = 5;
@@ -49,11 +49,11 @@ impl RandomWeightLoader {
 }
 
 impl WeightLoader for RandomWeightLoader {
-    fn load_tensor(&self, name: &str) -> Result<Vec<f32>, oxide_engine::loader::LoadError> {
+    fn load_tensor(&self, name: &str) -> Result<Vec<f32>, tempura_engine::loader::LoadError> {
         self.tensors
             .get(name)
             .cloned()
-            .ok_or_else(|| oxide_engine::loader::LoadError::MissingTensor(name.to_string()))
+            .ok_or_else(|| tempura_engine::loader::LoadError::MissingTensor(name.to_string()))
     }
 
     fn tensor_names(&self) -> Vec<String> {
@@ -63,7 +63,7 @@ impl WeightLoader for RandomWeightLoader {
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════╗");
-    println!("║  oxide-serve End-to-End GPU Benchmark                ║");
+    println!("║  tempura-serve End-to-End GPU Benchmark                ║");
     println!("╚══════════════════════════════════════════════════════╝\n");
 
     let config = ModelConfig::tiny_test();

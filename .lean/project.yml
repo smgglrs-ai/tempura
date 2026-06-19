@@ -1,9 +1,9 @@
 version: 1
 
-name: oxide-serve
+name: tempura
 version: "0.1.0"
 description: Rust-native LLM inference server designed to use cuda-oxide for GPU kernels
-repository: https://github.com/smgglrs-ai/oxide-serve
+repository: https://github.com/smgglrs-ai/tempura-serve
 type: monorepo
 license: Apache-2.0
 

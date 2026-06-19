@@ -1,0 +1,51 @@
+date: "2026-06-19"
+mode: reactive
+sources:
+  - url: "https://huggingface.co/blog/peft-beyond-lora"
+    title: "Beyond LoRA: PEFT Method Comparison"
+    impact: LOW
+    relationship: irrelevant
+
+  - url: "https://www.marktechpost.com/2026/06/18/the-kv-cache-compression-race-turboquant-vs-oscar-vs-epicache/"
+    title: "The KV Cache Compression Race: TurboQuant vs OSCAR vs EpiCache"
+    impact: HIGH
+    relationship: validates
+
+findings:
+  - source: "https://www.marktechpost.com/2026/06/18/the-kv-cache-compression-race-turboquant-vs-oscar-vs-epicache/"
+    title: "TurboQuant near-lossless at 3.5 bits confirmed"
+    action: enrich
+    item_id: "p3-turboquant"
+    detail: "Article confirms TurboQuant excels at 3-4 bit data-oblivious regime, absolute quality neutrality at 3.5 bits. Validates PQO implementation choice."
+
+  - source: "https://www.marktechpost.com/2026/06/18/the-kv-cache-compression-race-turboquant-vs-oscar-vs-epicache/"
+    title: "OSCAR calibration-aware rotation for INT2"
+    action: investigate
+    questions:
+      - "Can OSCAR's eigenbasis rotation be implemented as a KvCacheCompressor variant?"
+      - "What is the calibration cost (data, compute, per-model)?"
+      - "Does OSCAR's paged-cache integration conflict with tempura's block-based prefix caching?"
+      - "Is the RotationZoo precomputed rotation compatible with tempura's model config?"
+    detail: "OSCAR (Together AI) achieves 2.28-bit KV compression with 0.02-point gap on Qwen3-32B. Uses attention-aware rotation into eigenbasis of query covariance. Full SGLang integration with fused Triton kernels. Potential second KvCacheCompressor implementation for users who can afford calibration."
+
+  - source: "https://www.marktechpost.com/2026/06/18/the-kv-cache-compression-race-turboquant-vs-oscar-vs-epicache/"
+    title: "EpiCache episodic clustering for multi-turn"
+    action: watch
+    detail: "Apple's EpiCache segments multi-turn conversations into semantic episodes, routes queries to relevant episodes, achieves 4-6x compression via intelligent eviction. Composes directly with quantization (TurboQuant/OSCAR). Different abstraction level — eviction policy, not compressor. Monitor for GA and API stability."
+
+  - source: "https://huggingface.co/blog/peft-beyond-lora"
+    title: "PEFT ecosystem convergence on LoRA adapters"
+    action: dismiss
+    detail: "Fine-tuning ecosystem survey. OFT dominates LoRA on image gen, but serving infra only supports LoRA. Not relevant to tempura (inference server, not fine-tuning)."
+
+  - source: "https://www.marktechpost.com/2026/06/18/the-kv-cache-compression-race-turboquant-vs-oscar-vs-epicache/"
+    title: "No verification in KV compression landscape"
+    action: enrich
+    item_id: "p3-turboquant"
+    detail: "Confirms no competing system provides formal verification of KV compression. Tempura's Kani proofs on compress/decompress remain unique differentiation."
+
+summary: |
+  2 sources analyzed. 1 existing item enriched (p3-turboquant — competitive landscape
+  context added). 1 item flagged for investigation (OSCAR calibration-aware rotation as
+  potential second KvCacheCompressor). 1 item on watch (EpiCache episodic clustering).
+  1 item dismissed (PEFT article — fine-tuning, not serving).

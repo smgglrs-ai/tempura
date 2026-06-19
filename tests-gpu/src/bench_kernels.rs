@@ -1,6 +1,6 @@
-use oxide_kernels::attention::{CpuAttention, CudaAttention, Attention};
-use oxide_kernels::matmul::{CpuMatMul, CudaMatMul, MatMul};
-use oxide_kernels::rmsnorm::{CpuRMSNorm, CudaRMSNorm, RMSNorm};
+use tempura_kernels::attention::{CpuAttention, CudaAttention, Attention};
+use tempura_kernels::matmul::{CpuMatMul, CudaMatMul, MatMul};
+use tempura_kernels::rmsnorm::{CpuRMSNorm, CudaRMSNorm, RMSNorm};
 use std::time::Instant;
 
 const WARMUP: usize = 10;
@@ -12,9 +12,9 @@ fn bench_matmul(gpu: &CudaMatMul, cpu: &CpuMatMul, m: usize, n: usize, k: usize)
 
     let _ctx = gpu.gpu().context().clone();
     let stream = gpu.gpu().stream();
-    let a_dev = oxide_kernels::gpu::to_device(&stream, &a).unwrap();
-    let b_dev = oxide_kernels::gpu::to_device(&stream, &b).unwrap();
-    let mut c_dev = oxide_kernels::gpu::alloc_device(&stream, m * n).unwrap();
+    let a_dev = tempura_kernels::gpu::to_device(&stream, &a).unwrap();
+    let b_dev = tempura_kernels::gpu::to_device(&stream, &b).unwrap();
+    let mut c_dev = tempura_kernels::gpu::alloc_device(&stream, m * n).unwrap();
 
     for _ in 0..WARMUP {
         gpu.forward_bt_device(&a_dev, &b_dev, &mut c_dev, m, n, k).unwrap();
@@ -52,9 +52,9 @@ fn bench_rmsnorm(gpu: &CudaRMSNorm, cpu: &CpuRMSNorm, hidden_size: usize, num_to
     let eps = 1e-6f32;
 
     let stream = gpu.gpu().stream();
-    let x_dev = oxide_kernels::gpu::to_device(&stream, &x).unwrap();
-    let w_dev = oxide_kernels::gpu::to_device(&stream, &weight).unwrap();
-    let mut out_dev = oxide_kernels::gpu::alloc_device(&stream, n).unwrap();
+    let x_dev = tempura_kernels::gpu::to_device(&stream, &x).unwrap();
+    let w_dev = tempura_kernels::gpu::to_device(&stream, &weight).unwrap();
+    let mut out_dev = tempura_kernels::gpu::alloc_device(&stream, n).unwrap();
 
     for _ in 0..WARMUP {
         gpu.forward_device(&x_dev, &w_dev, &mut out_dev, hidden_size, eps).unwrap();
@@ -108,11 +108,11 @@ fn bench_attention(
     let scale = 1.0 / (head_dim as f32).sqrt();
 
     let stream = gpu.gpu().stream();
-    let q_dev = oxide_kernels::gpu::to_device(&stream, &q).unwrap();
-    let k_dev = oxide_kernels::gpu::to_device(&stream, &k).unwrap();
-    let v_dev = oxide_kernels::gpu::to_device(&stream, &v).unwrap();
+    let q_dev = tempura_kernels::gpu::to_device(&stream, &q).unwrap();
+    let k_dev = tempura_kernels::gpu::to_device(&stream, &k).unwrap();
+    let v_dev = tempura_kernels::gpu::to_device(&stream, &v).unwrap();
     let mut out_dev =
-        oxide_kernels::gpu::alloc_device(&stream, batch * seq_len * num_heads * head_dim).unwrap();
+        tempura_kernels::gpu::alloc_device(&stream, batch * seq_len * num_heads * head_dim).unwrap();
 
     for _ in 0..WARMUP {
         gpu.forward_device(
@@ -159,7 +159,7 @@ fn bench_attention(
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════╗");
-    println!("║  oxide-serve Kernel Microbenchmarks                  ║");
+    println!("║  tempura-serve Kernel Microbenchmarks                  ║");
     println!("╚══════════════════════════════════════════════════════╝");
     println!("  Warmup: {WARMUP} iters, Measured: {ITERS} iters\n");
 

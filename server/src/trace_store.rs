@@ -1,4 +1,4 @@
-use oxide_engine::trace::InferenceTrace;
+use tempura_engine::trace::InferenceTrace;
 use std::collections::VecDeque;
 
 pub struct TraceStore {
@@ -49,7 +49,7 @@ impl TraceStore {
 pub struct TraceSummary {
     pub trace_id: String,
     pub model_id: String,
-    pub level: oxide_engine::trace::TraceLevel,
+    pub level: tempura_engine::trace::TraceLevel,
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
 }
@@ -57,7 +57,7 @@ pub struct TraceSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxide_engine::trace::{InferenceTrace, TraceLevel};
+    use tempura_engine::trace::{InferenceTrace, TraceLevel};
 
     fn make_trace(id: &str) -> InferenceTrace {
         InferenceTrace::new(id.to_string(), TraceLevel::Summary, "test".to_string(), 0)

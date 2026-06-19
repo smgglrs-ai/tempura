@@ -4,7 +4,7 @@ use crate::config::ModelConfig;
 use crate::session::InferenceSession;
 use crate::trace::TraceLevel;
 use crate::TransformerModel;
-use oxide_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
+use tempura_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BatchInvariantResult {
@@ -157,11 +157,11 @@ mod tests {
     fn setup_model() -> (
         ModelConfig,
         crate::TransformerModel<
-            oxide_kernels::attention::CpuAttention,
-            oxide_kernels::rmsnorm::CpuRMSNorm,
-            oxide_kernels::rope::CpuRoPE,
-            oxide_kernels::matmul::CpuMatMul,
-            oxide_kernels::sampling::CpuSampler,
+            tempura_kernels::attention::CpuAttention,
+            tempura_kernels::rmsnorm::CpuRMSNorm,
+            tempura_kernels::rope::CpuRoPE,
+            tempura_kernels::matmul::CpuMatMul,
+            tempura_kernels::sampling::CpuSampler,
         >,
     ) {
         let config = ModelConfig::tiny_test();

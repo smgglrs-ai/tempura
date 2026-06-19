@@ -1,4 +1,4 @@
-# oxide-serve
+# tempura-serve
 
 Rust-native LLM inference server designed to use [cuda-oxide](https://github.com/NVlabs/cuda-oxide) for GPU kernels. Currently runs on CPU with reference kernel implementations; cuda-oxide integration is planned behind a feature flag once the compiler stabilizes.
 

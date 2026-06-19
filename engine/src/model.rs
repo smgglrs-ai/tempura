@@ -3,7 +3,7 @@ use crate::pipeline::KernelPipeline;
 use crate::session::InferenceSession;
 use crate::trace::{LayerSnapshot, SamplingSnapshot, TimingInfo, TraceLevel};
 use crate::weights::ModelWeights;
-use oxide_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
+use tempura_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
 use serde::Serialize;
 use std::time::Instant;
 
@@ -69,7 +69,7 @@ pub trait InferenceModel: Send + Sync {
         max_new_tokens: usize,
         params: &SamplingParams,
         eos_token: Option<u32>,
-        decoder: &mut dyn oxide_kernels::GuidedDecoder,
+        decoder: &mut dyn tempura_kernels::GuidedDecoder,
     ) -> Vec<u32>;
     fn load_weights(
         &mut self,
@@ -420,8 +420,8 @@ where
         let head_dim = cfg.head_dim;
         let seq_len = token_ids.len();
 
-        let q4k = oxide_kernels::quantized::CpuMatMulQ4KOpt;
-        use oxide_kernels::quantized::{MatMulQ, PreQuantizedActivations};
+        let q4k = tempura_kernels::quantized::CpuMatMulQ4KOpt;
+        use tempura_kernels::quantized::{MatMulQ, PreQuantizedActivations};
 
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
@@ -629,7 +629,7 @@ where
         &self,
         logits: &[f32],
         params: &SamplingParams,
-    ) -> oxide_kernels::Result<Vec<f32>> {
+    ) -> tempura_kernels::Result<Vec<f32>> {
         let mut probs = vec![0.0; logits.len()];
         self.pipeline.sampler.apply(logits, &mut probs, params)?;
         Ok(probs)
@@ -874,7 +874,7 @@ where
         max_new_tokens: usize,
         params: &SamplingParams,
         eos_token: Option<u32>,
-        decoder: &mut dyn oxide_kernels::GuidedDecoder,
+        decoder: &mut dyn tempura_kernels::GuidedDecoder,
     ) -> Vec<u32> {
         let total_start = Instant::now();
         let prompt_start = Instant::now();
@@ -1007,11 +1007,11 @@ where
 #[cfg(feature = "cuda")]
 impl
     TransformerModel<
-        oxide_kernels::attention::CudaAttention,
-        oxide_kernels::rmsnorm::CudaRMSNorm,
-        oxide_kernels::rope::CudaRoPE,
-        oxide_kernels::matmul::CudaMatMul,
-        oxide_kernels::sampling::CpuSampler,
+        tempura_kernels::attention::CudaAttention,
+        tempura_kernels::rmsnorm::CudaRMSNorm,
+        tempura_kernels::rope::CudaRoPE,
+        tempura_kernels::matmul::CudaMatMul,
+        tempura_kernels::sampling::CpuSampler,
     >
 {
     pub fn forward_gpu(
@@ -1083,15 +1083,15 @@ impl
                 .expect("qkv proj");
 
             let ctx = self.pipeline.matmul.gpu().context().clone();
-            oxide_kernels::gpu::slice_columns_device(
+            tempura_kernels::gpu::slice_columns_device(
                 &ctx, &stream, &scratch.qkv, &mut scratch.q,
                 seq_len, qkv_dim, 0, q_dim,
             ).expect("slice q");
-            oxide_kernels::gpu::slice_columns_device(
+            tempura_kernels::gpu::slice_columns_device(
                 &ctx, &stream, &scratch.qkv, &mut scratch.k,
                 seq_len, qkv_dim, q_dim, kv_dim,
             ).expect("slice k");
-            oxide_kernels::gpu::slice_columns_device(
+            tempura_kernels::gpu::slice_columns_device(
                 &ctx, &stream, &scratch.qkv, &mut scratch.v,
                 seq_len, qkv_dim, q_dim + kv_dim, kv_dim,
             ).expect("slice v");
@@ -1112,7 +1112,7 @@ impl
                         cfg.layer_norm_eps,
                     )
                     .expect("qk norm q");
-                oxide_kernels::gpu::copy_region_device(
+                tempura_kernels::gpu::copy_region_device(
                     &ctx, &stream, &scratch.q_rotated, &mut scratch.q, 0, 0, seq_len * q_dim,
                 ).expect("copy q norm");
 
@@ -1130,7 +1130,7 @@ impl
                         cfg.layer_norm_eps,
                     )
                     .expect("qk norm k");
-                oxide_kernels::gpu::copy_region_device(
+                tempura_kernels::gpu::copy_region_device(
                     &ctx, &stream, &scratch.k_rotated, &mut scratch.k, 0, 0, seq_len * kv_dim,
                 ).expect("copy k norm");
             }
@@ -1166,7 +1166,7 @@ impl
             let dst_offset = gpu_cache.seq_len * stride;
             let src_len = seq_len * stride;
             let ctx = self.pipeline.matmul.gpu().context().clone();
-            oxide_kernels::gpu::copy_region_device(
+            tempura_kernels::gpu::copy_region_device(
                 &ctx,
                 &stream,
                 &scratch.k_rotated,
@@ -1176,7 +1176,7 @@ impl
                 src_len,
             )
             .expect("kv cache k append");
-            oxide_kernels::gpu::copy_region_device(
+            tempura_kernels::gpu::copy_region_device(
                 &ctx,
                 &stream,
                 &scratch.v,
@@ -1217,7 +1217,7 @@ impl
 
             // --- Residual add (on device) ---
             let ctx = self.pipeline.matmul.gpu().context().clone();
-            oxide_kernels::gpu::vector_add_device(
+            tempura_kernels::gpu::vector_add_device(
                 &ctx,
                 &stream,
                 &scratch.hidden,
@@ -1258,18 +1258,18 @@ impl
                 .expect("gate_up proj");
 
             let ctx = self.pipeline.matmul.gpu().context().clone();
-            oxide_kernels::gpu::slice_columns_device(
+            tempura_kernels::gpu::slice_columns_device(
                 &ctx, &stream, &scratch.gate_up, &mut scratch.gate,
                 seq_len, 2 * inter, 0, inter,
             ).expect("slice gate");
-            oxide_kernels::gpu::slice_columns_device(
+            tempura_kernels::gpu::slice_columns_device(
                 &ctx, &stream, &scratch.gate_up, &mut scratch.up,
                 seq_len, 2 * inter, inter, inter,
             ).expect("slice up");
 
             // --- SiLU(gate) * up (on device) ---
             let ctx = self.pipeline.matmul.gpu().context().clone();
-            oxide_kernels::gpu::silu_mul_device(
+            tempura_kernels::gpu::silu_mul_device(
                 &ctx,
                 &stream,
                 &scratch.gate,
@@ -1285,7 +1285,7 @@ impl
 
             // --- FFN residual add (on device) ---
             let ctx = self.pipeline.matmul.gpu().context().clone();
-            oxide_kernels::gpu::vector_add_device(
+            tempura_kernels::gpu::vector_add_device(
                 &ctx,
                 &stream,
                 &scratch.hidden,
@@ -1333,11 +1333,11 @@ impl
 #[cfg(feature = "cuda")]
 pub struct GpuInferenceWrapper {
     pub model: TransformerModel<
-        oxide_kernels::attention::CudaAttention,
-        oxide_kernels::rmsnorm::CudaRMSNorm,
-        oxide_kernels::rope::CudaRoPE,
-        oxide_kernels::matmul::CudaMatMul,
-        oxide_kernels::sampling::CpuSampler,
+        tempura_kernels::attention::CudaAttention,
+        tempura_kernels::rmsnorm::CudaRMSNorm,
+        tempura_kernels::rope::CudaRoPE,
+        tempura_kernels::matmul::CudaMatMul,
+        tempura_kernels::sampling::CpuSampler,
     >,
     pub gpu_weights: crate::weights::GpuWeights,
     pub gpu_cache: std::sync::Mutex<crate::kv_cache::GpuKvCache>,
@@ -1604,7 +1604,7 @@ impl InferenceModel for GpuInferenceWrapper {
         max_new_tokens: usize,
         params: &SamplingParams,
         eos_token: Option<u32>,
-        decoder: &mut dyn oxide_kernels::GuidedDecoder,
+        decoder: &mut dyn tempura_kernels::GuidedDecoder,
     ) -> Vec<u32> {
         self.model.generate_guided(
             session,
@@ -1686,7 +1686,7 @@ where
         max_new_tokens: usize,
         params: &SamplingParams,
         eos_token: Option<u32>,
-        decoder: &mut dyn oxide_kernels::GuidedDecoder,
+        decoder: &mut dyn tempura_kernels::GuidedDecoder,
     ) -> Vec<u32> {
         self.generate_guided(
             session,
@@ -1705,7 +1705,7 @@ where
     }
 }
 
-pub use oxide_kernels::sampling::SamplingParams as SampleParams;
+pub use tempura_kernels::sampling::SamplingParams as SampleParams;
 
 #[cfg(kani)]
 mod kani_proofs {

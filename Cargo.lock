@@ -1935,82 +1935,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxide-engine"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "cuda-core",
- "minijinja",
- "oxide-kernels",
- "rand 0.9.4",
- "rayon",
- "safetensors",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokenizers",
-]
-
-[[package]]
-name = "oxide-kernels"
-version = "0.1.0"
-dependencies = [
- "approx",
- "cuda-core",
- "cuda-device",
- "cuda-host",
- "gemm",
- "half",
- "proptest",
- "rand 0.9.4",
- "rayon",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "oxide-server"
-version = "0.1.0"
-dependencies = [
- "axum 0.8.9",
- "clap",
- "metrics",
- "metrics-exporter-prometheus",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "oxide-engine",
- "oxide-kernels",
- "oxide-server-model",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "oxide-server-model"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "oxide-engine",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2866,6 +2790,82 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tempura-engine"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "cuda-core",
+ "minijinja",
+ "rand 0.9.4",
+ "rayon",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tempura-kernels",
+ "thiserror 2.0.18",
+ "tokenizers",
+]
+
+[[package]]
+name = "tempura-kernels"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
+ "gemm",
+ "half",
+ "proptest",
+ "rand 0.9.4",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "tempura-model"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tempura-engine",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "tempura-serve"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.9",
+ "clap",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "serde",
+ "serde_json",
+ "tempura-engine",
+ "tempura-kernels",
+ "tempura-model",
+ "tokio",
+ "tokio-stream",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

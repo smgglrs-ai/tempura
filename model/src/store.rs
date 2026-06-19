@@ -22,7 +22,7 @@ impl ModelStore {
     pub fn default_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".oxide-serve")
+            .join(".tempura-serve")
             .join("models")
     }
 

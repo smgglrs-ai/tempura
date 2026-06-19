@@ -1,17 +1,17 @@
 [package]
-name = "oxide-server"
+name = "tempura-serve"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "OpenAI-compatible HTTP server for oxide-serve"
+description = "OpenAI-compatible HTTP server for tempura-serve"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [dependencies]
-oxide-engine = { path = "../engine" }
-oxide-kernels = { path = "../kernels" }
-oxide-server-model = { path = "../model" }
+tempura-engine = { path = "../engine" }
+tempura-kernels = { path = "../kernels" }
+tempura-model = { path = "../model" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -31,7 +31,7 @@ tracing-opentelemetry = { version = "0.28", optional = true }
 
 [features]
 default = []
-cuda = ["oxide-engine/cuda"]
+cuda = ["tempura-engine/cuda"]
 otlp = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 
 [dev-dependencies]

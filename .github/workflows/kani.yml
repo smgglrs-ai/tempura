@@ -19,8 +19,8 @@ jobs:
       - name: Install Kani
         run: cargo install --version ${{ env.KANI_VERSION }} --locked kani-verifier && cargo kani setup
 
-      - name: Verify oxide-kernels
-        run: cargo kani --package oxide-kernels
+      - name: Verify tempura-kernels
+        run: cargo kani --package tempura-kernels
 
-      - name: Verify oxide-engine
-        run: cargo kani --package oxide-engine
+      - name: Verify tempura-engine
+        run: cargo kani --package tempura-engine
