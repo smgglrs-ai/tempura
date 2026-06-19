@@ -218,7 +218,7 @@ Verify: $\|[0.6, 0.8]\| = \sqrt{0.36 + 0.64} = \sqrt{1} = 1$ ✓
 
 Why normalize? Because sometimes you care about *direction* (what kind of pattern) but not *magnitude* (how strong the pattern is). Normalization lets you compare patterns regardless of scale.
 
-We'll see normalization again in [Neural Networks](../neural-networks/), where [RMS Normalization](../../foundations/normalization/) prevents numbers from growing out of control as they pass through many layers.
+We'll see normalization again in [Neural Networks](../neural-networks/), where [RMS Normalization](normalization/) prevents numbers from growing out of control as they pass through many layers.
 
 ## Vectors in higher dimensions
 

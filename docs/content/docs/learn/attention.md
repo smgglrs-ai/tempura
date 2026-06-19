@@ -1,7 +1,7 @@
 +++
-title = "Attention"
+title = "15. Attention"
 description = "Scaled dot-product attention — the linear algebra, softmax, multi-head, and GQA."
-weight = 10
+weight = 150
 template = "docs/page.html"
 
 [extra]

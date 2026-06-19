@@ -133,7 +133,7 @@ One set of Q, K, V captures one type of relationship. **Multi-head attention** r
 - Head 2 might attend to nearby words (local context)
 - Head 3 might attend to semantic similarity (related concepts)
 
-The results are concatenated and projected back to the model dimension. See [Attention](../../foundations/attention/) for the full details and GQA.
+The results are concatenated and projected back to the model dimension. See [Attention](attention/) for the full details and GQA.
 
 ## One transformer layer
 
@@ -163,7 +163,7 @@ Input hidden state (h)
 Output hidden state (h'')
 ```
 
-Every operation here — RMSNorm, MatMul, RoPE, Attention — is a kernel in tempura, with [Kani proofs](../../foundations/reading-kani-harnesses/) for index safety.
+Every operation here — RMSNorm, MatMul, RoPE, Attention — is a kernel in tempura, with [Kani proofs](reading-kani-harnesses/) for index safety.
 
 ## The feed-forward network (FFN)
 

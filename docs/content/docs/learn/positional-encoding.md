@@ -1,7 +1,7 @@
 +++
-title = "Positional Encoding"
+title = "17. Positional Encoding"
 description = "Rotary Position Embeddings (RoPE) — the rotation matrix, frequency bands, and length extrapolation."
-weight = 30
+weight = 170
 template = "docs/page.html"
 
 [extra]

@@ -111,7 +111,7 @@ This prevents the model from occasionally picking very unlikely words.
 
 Result: consider words A and B, ignore C. The advantage over top-k: when the model is very confident (one word has 95% probability), only that word is considered. When it's uncertain, more words are included.
 
-tempura implements all of these in its [Sampler kernel](../../foundations/sampling/).
+tempura implements all of these in its [Sampler kernel](sampling/).
 
 ## Conditional probability
 
@@ -136,7 +136,7 @@ In tempura, sampling uses a **seeded random number generator**. Given the same s
 Why does this matter?
 
 - **Reproducibility:** the same prompt with the same seed produces the same response, every time.
-- **Verification:** [DualPipeline](../../foundations/dual-pipeline/) compares two implementations. If sampling were truly random, you couldn't tell whether a different output was caused by a bug or by different random numbers.
+- **Verification:** [DualPipeline](dual-pipeline/) compares two implementations. If sampling were truly random, you couldn't tell whether a different output was caused by a bug or by different random numbers.
 - **Debugging:** when something goes wrong, you can replay the exact inference with the same seed and investigate.
 
 ## Entropy: measuring uncertainty

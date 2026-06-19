@@ -1,7 +1,7 @@
 +++
-title = "Sampling"
+title = "18. Sampling (Deep Dive)"
 description = "Temperature, top-k, top-p — the probability space of token generation."
-weight = 40
+weight = 180
 template = "docs/page.html"
 
 [extra]

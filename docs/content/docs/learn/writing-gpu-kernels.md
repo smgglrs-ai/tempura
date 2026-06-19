@@ -60,7 +60,7 @@ $$
 
 This thread processes element 810 of the input array.
 
-**This is exactly the arithmetic that tempura's Kani proofs verify.** The [attention offset harness](../../foundations/reading-kani-harnesses/) proves that a more complex version of this indexing — `((b * seq_len + s) * num_heads + h) * head_dim` — never exceeds the buffer length for any valid thread assignment.
+**This is exactly the arithmetic that tempura's Kani proofs verify.** The [attention offset harness](reading-kani-harnesses/) proves that a more complex version of this indexing — `((b * seq_len + s) * num_heads + h) * head_dim` — never exceeds the buffer length for any valid thread assignment.
 
 ## A real example: vector scaling
 
@@ -162,7 +162,7 @@ GPU bugs are particularly nasty because:
 
 **Divergence.** Threads in a warp must execute the same instruction. If an `if` statement sends half the warp one way and half the other, both paths execute (with inactive threads masked out), halving performance.
 
-**Floating-point non-determinism.** A tree reduction adds numbers in a different order than a sequential sum. With floating-point arithmetic, $(a + b) + c \neq a + (b + c)$ at the limits of precision. Different results on GPU vs CPU, even with no bugs. This is exactly what [DualPipeline](../../foundations/dual-pipeline/) detects and quantifies.
+**Floating-point non-determinism.** A tree reduction adds numbers in a different order than a sequential sum. With floating-point arithmetic, $(a + b) + c \neq a + (b + c)$ at the limits of precision. Different results on GPU vs CPU, even with no bugs. This is exactly what [DualPipeline](dual-pipeline/) detects and quantifies.
 
 ## Check your understanding
 

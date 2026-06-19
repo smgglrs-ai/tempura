@@ -1,7 +1,7 @@
 +++
-title = "Reading Kani Harnesses"
+title = "21. Reading Kani Harnesses"
 description = "Annotated walkthrough of a real Kani proof harness from the tempura codebase."
-weight = 70
+weight = 210
 template = "docs/page.html"
 
 [extra]

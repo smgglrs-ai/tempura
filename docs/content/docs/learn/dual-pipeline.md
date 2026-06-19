@@ -1,7 +1,7 @@
 +++
-title = "DualPipeline"
+title = "23. DualPipeline"
 description = "Empirical equivalence testing — what formal proofs miss and how runtime comparison catches it."
-weight = 90
+weight = 230
 template = "docs/page.html"
 
 [extra]

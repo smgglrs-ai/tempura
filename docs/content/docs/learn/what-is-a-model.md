@@ -92,6 +92,6 @@ By the end, there will be no mystery left. You'll understand every operation fro
 
 Most inference engines are black boxes — text goes in, text comes out, and you have to trust that the math was done correctly.
 
-tempura is different. It **proves** that certain operations are safe (using a tool called [Kani](../../foundations/bounded-model-checking/)), **compares** different implementations to verify they produce the same results (using [DualPipeline](../../foundations/dual-pipeline/)), and **records** what happened at every step (using [InferenceTrace](../../trace-tooling/)). The [Foundations](../../foundations/) section covers the verification in depth — but first, let's learn the math.
+tempura is different. It **proves** that certain operations are safe (using a tool called [Kani](bounded-model-checking/)), **compares** different implementations to verify they produce the same results (using [DualPipeline](dual-pipeline/)), and **records** what happened at every step (using [InferenceTrace](../../trace-tooling/)). Part III of this course covers the verification in depth — but first, let's learn the math.
 
 **Next:** [Vectors](../vectors/) — the first building block.

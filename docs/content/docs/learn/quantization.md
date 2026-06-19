@@ -1,7 +1,7 @@
 +++
-title = "Quantization"
+title = "19. Quantization"
 description = "What rounding preserves and destroys — group quantization, error bounds, and provable properties."
-weight = 50
+weight = 190
 template = "docs/page.html"
 
 [extra]

@@ -71,7 +71,7 @@ The key trick: softmax is computed *online* — you don't need to see all scores
 
 ## RMSNorm: two passes
 
-[RMS Normalization](../../foundations/normalization/) requires a reduction (sum of squares) followed by an elementwise operation (divide by RMS). These can't be fused into one kernel because the division needs the completed sum.
+[RMS Normalization](normalization/) requires a reduction (sum of squares) followed by an elementwise operation (divide by RMS). These can't be fused into one kernel because the division needs the completed sum.
 
 **Pass 1 — Sum of squares:**
 - Launch one warp (32 threads) per token (row of the hidden state)
@@ -87,7 +87,7 @@ The key trick: softmax is computed *online* — you don't need to see all scores
 
 ## RoPE: elementwise rotation
 
-[RoPE](../../foundations/positional-encoding/) applies a 2D rotation to pairs of dimensions. Each pair is independent — perfect for GPU parallelism.
+[RoPE](positional-encoding/) applies a 2D rotation to pairs of dimensions. Each pair is independent — perfect for GPU parallelism.
 
 **Mapping:** one thread per element. Thread $i$ computes its position in the tensor:
 
@@ -165,7 +165,7 @@ No magic anywhere. Just arithmetic — addition, multiplication, exponentiation 
 
 ## Where to go next
 
-- **[Foundations](../../foundations/)** — each kernel's math at implementation depth, with Kani proof walkthroughs
+- **Part III (Chapters 15–24)** — each kernel's math at implementation depth, with Kani proof walkthroughs
 - **[Architecture](../../architecture/)** — how tempura's crates are organized
 - **[Getting Started](../../getting-started/)** — build and run tempura yourself
 - **[Framework Guide](../../framework/)** — implement your own kernel backend

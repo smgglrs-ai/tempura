@@ -91,7 +91,7 @@ pub struct CudaAttention { /* GPU context */ }
 impl Attention for CudaAttention { /* launches GPU kernel */ }
 ```
 
-The trait signature is identical. The CPU version is the reference; the GPU version is the optimized implementation. [DualPipeline](../../foundations/dual-pipeline/) compares them.
+The trait signature is identical. The CPU version is the reference; the GPU version is the optimized implementation. [DualPipeline](dual-pipeline/) compares them.
 
 ## Building with cuda-oxide
 

@@ -1,7 +1,7 @@
 +++
-title = "Normalization"
+title = "16. Normalization"
 description = "RMS normalization — the variance invariant, numerical stability, and why LLMs skip mean subtraction."
-weight = 20
+weight = 160
 template = "docs/page.html"
 
 [extra]

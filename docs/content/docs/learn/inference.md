@@ -58,7 +58,7 @@ The **KV cache** stores all previously computed key and value vectors:
 
 Each generation step is a constant-cost operation (plus the attention computation, which scales linearly with sequence length). Without the KV cache, cost would grow quadratically.
 
-**In tempura**, the `KvCache` struct manages this storage. Kani proves the cache's slot management never goes out of bounds — see [Reading Kani Harnesses](../../foundations/reading-kani-harnesses/).
+**In tempura**, the `KvCache` struct manages this storage. Kani proves the cache's slot management never goes out of bounds — see [Reading Kani Harnesses](reading-kani-harnesses/).
 
 ## Two phases of inference
 
@@ -98,7 +98,7 @@ The math is straightforward — it's the same [matrix multiplications](../matric
 
 **Throughput.** Users expect multiple tokens per second. Every token requires a full forward pass — 32+ layers of attention and FFN. Optimized kernels, batching, and caching are essential.
 
-**Correctness.** A bug in attention indexing doesn't produce an error message — it silently reads the wrong data and generates plausible but wrong text. This is why tempura uses [Kani proofs](../../foundations/bounded-model-checking/) for index safety and [DualPipeline](../../foundations/dual-pipeline/) for numerical equivalence.
+**Correctness.** A bug in attention indexing doesn't produce an error message — it silently reads the wrong data and generates plausible but wrong text. This is why tempura uses [Kani proofs](bounded-model-checking/) for index safety and [DualPipeline](dual-pipeline/) for numerical equivalence.
 
 **Determinism.** Given the same prompt and seed, the same output should be produced every time. This requires controlling floating-point reduction order, RNG seeding, and cache state — things that most inference servers treat as optional.
 
@@ -122,7 +122,7 @@ The unique contribution: verification and observability. Most inference servers 
 
 You've completed the learning track. You now understand every operation a language model performs — from [vectors](../vectors/) to inference. Here's where to go deeper:
 
-- **[Foundations](../../foundations/)** — the same concepts at implementation depth, with equations, Kani proof walkthroughs, and links to the source code
+- **Part III (Chapters 15–24)** — the same concepts at implementation depth, with equations, Kani proof walkthroughs, and links to the source code
 - **[Architecture](../../architecture/)** — how tempura's crates are organized
 - **[Getting Started](../../getting-started/)** — build and run tempura
 - **[API Reference](../../api/)** — the endpoints you can call

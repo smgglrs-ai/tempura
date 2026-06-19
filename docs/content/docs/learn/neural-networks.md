@@ -104,7 +104,7 @@ In modern transformers, every attention block and every FFN block uses a residua
 
 ## Why normalization appears between layers
 
-As you stack more layers, the hidden state values can grow. After 32 layers of matrix multiplications and additions, even small growth per layer compounds. [RMS Normalization](../../foundations/normalization/) constrains the scale of the hidden state at each layer boundary, keeping the values in a numerically well-behaved range.
+As you stack more layers, the hidden state values can grow. After 32 layers of matrix multiplications and additions, even small growth per layer compounds. [RMS Normalization](normalization/) constrains the scale of the hidden state at each layer boundary, keeping the values in a numerically well-behaved range.
 
 In a transformer, the pattern is:
 

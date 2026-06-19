@@ -147,7 +147,7 @@ $$
 \begin{pmatrix} \cos\theta & -\sin\theta \\\\ \sin\theta & \cos\theta \end{pmatrix}
 $$
 
-This is exactly what [RoPE](../../foundations/positional-encoding/) uses to encode word position in a sentence — rotating vectors by an angle proportional to their position.
+This is exactly what [RoPE](positional-encoding/) uses to encode word position in a sentence — rotating vectors by an angle proportional to their position.
 
 **Projection:** a non-square matrix changes dimensions. A $2 \times 100$ matrix collapses a 100-dimensional vector down to 2 dimensions (like summarizing a complex thing into two numbers). A $100 \times 2$ matrix does the opposite — expands a simple representation into a rich one.
 
@@ -166,7 +166,7 @@ Here is the key fact: **almost everything a language model does is matrix multip
 
 A 7B parameter model stores 7 billion numbers arranged in these matrices. The matrices *are* the model. When people say "the model learned X," they mean "the numbers in the model's matrices are arranged so that the math produces the right output for inputs related to X."
 
-tempura's `MatMul` kernel implements matrix multiplication, and [Kani proves](../../foundations/reading-kani-harnesses/) that the index arithmetic — which determines where in the matrix to read each number — never goes out of bounds.
+tempura's `MatMul` kernel implements matrix multiplication, and [Kani proves](reading-kani-harnesses/) that the index arithmetic — which determines where in the matrix to read each number — never goes out of bounds.
 
 ## Summary
 
