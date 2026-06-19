@@ -2424,3 +2424,38 @@ items:
   - A reviewer can trace any kernel change through code to math to proof to consequence
   verification:
     quick: cd docs && zola build
+
+  # ============================================================================
+  # Phase 19: Learn — From High-School Math to Inference
+  # A didactic track building from vectors to transformers.
+  # ============================================================================
+
+- id: p19-learn
+  title: "Learn: from high-school math to inference"
+  description: 'A progressive educational track that starts from high-school
+    mathematics and builds to understanding what a language model is and how
+    inference works. Each page builds on the previous one, introducing only
+    the concepts needed for the next step. The goal: a reader with no ML
+    background can follow the entire track and understand what tempura does
+    and why. Pages: (1) Vectors — arrays of numbers, dot products, similarity.
+    (2) Matrices — transformations, matrix multiplication. (3) Functions —
+    linear vs non-linear, activation functions. (4) Probability — distributions,
+    softmax, sampling. (5) Learning — loss functions, gradients, the idea of
+    optimization. (6) Neural networks — composing layers, the forward pass.
+    (7) Words as numbers — tokenization, embeddings. (8) The transformer —
+    attention as the core mechanism. (9) From training to inference — what
+    tempura does and where it sits. KaTeX for all equations, worked numerical
+    examples throughout.'
+  status: in_progress
+  priority: high
+  effort: XL
+  scope:
+  - docs/content/docs/learn/
+  acceptance:
+  - 9 pages forming a progressive curriculum with KaTeX equations
+  - Each page includes worked numerical examples with small concrete numbers
+  - A reader with high-school math (algebra, basic functions) can follow without external references
+  - The final page connects to tempura and links to the Foundations section for depth
+  - Pages build strictly on prior pages — no forward references to unexplained concepts
+  verification:
+    quick: cd docs && zola build
