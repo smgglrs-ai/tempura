@@ -1482,4 +1482,104 @@ mod tests {
             "max diff {max_diff} too large at 4096x4096"
         );
     }
+
+    #[test]
+    fn test_q6k_opt_vs_scalar() {
+        let k = 256;
+        let m = 1;
+        let n = 4;
+
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32) * 0.02 - 0.18).collect();
+
+        // Build valid Q6_K blocks: 210 bytes each
+        let blocks_per_row = k / Q6K_BLOCK_SIZE;
+        let mut b_q = vec![0u8; n * blocks_per_row * Q6K_BLOCK_BYTES];
+        for blk in 0..(n * blocks_per_row) {
+            let base = blk * Q6K_BLOCK_BYTES;
+            // ql: 128 bytes
+            for i in 0..128 {
+                b_q[base + i] = ((blk * 128 + i) * 7 % 256) as u8;
+            }
+            // qh: 64 bytes
+            for i in 0..64 {
+                b_q[base + 128 + i] = ((blk * 64 + i) * 13 % 256) as u8;
+            }
+            // scales: 16 i8 values
+            for i in 0..16 {
+                b_q[base + 192 + i] = ((blk * 16 + i) * 11 % 127) as u8;
+            }
+            // d: f16
+            let d_bits = half::f16::from_f32(0.001).to_bits();
+            b_q[base + 208] = d_bits as u8;
+            b_q[base + 209] = (d_bits >> 8) as u8;
+        }
+
+        let ref_kernel = CpuMatMulQ4K;
+        let opt_kernel = CpuMatMulQ4KOpt;
+
+        let mut out_ref = vec![0.0f32; m * n];
+        let mut out_opt = vec![0.0f32; m * n];
+
+        ref_kernel.forward_b_transposed_q6k(&a, &b_q, &mut out_ref, m, n, k).unwrap();
+        opt_kernel.forward_b_transposed_q6k(&a, &b_q, &mut out_opt, m, n, k).unwrap();
+
+        let max_diff: f32 = out_ref.iter().zip(&out_opt)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+
+        // Int8 quantization introduces small errors — allow 5% relative tolerance
+        let max_abs = out_ref.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let rel_tol = if max_abs > 0.0 { max_diff / max_abs } else { max_diff };
+        eprintln!("  Q6K small: max_diff={max_diff:.6}, max_abs={max_abs:.6}, rel={rel_tol:.4}");
+        assert!(
+            rel_tol < 0.05,
+            "Q6K opt vs scalar: max_diff={max_diff}, max_abs={max_abs}, rel={rel_tol:.4}"
+        );
+    }
+
+    #[test]
+    fn test_q6k_opt_vs_scalar_large() {
+        let k = 4096;
+        let m = 1;
+        let n = 128;
+
+        let a: Vec<f32> = (0..m * k).map(|i| {
+            let x = (i as f32) * 0.001 - 2.0;
+            x.sin() * 0.5
+        }).collect();
+
+        let blocks_per_row = k / Q6K_BLOCK_SIZE;
+        let mut b_q = vec![0u8; n * blocks_per_row * Q6K_BLOCK_BYTES];
+        for blk_idx in 0..(n * blocks_per_row) {
+            let base = blk_idx * Q6K_BLOCK_BYTES;
+            for i in 0..128 { b_q[base + i] = ((blk_idx * 128 + i) * 37 % 256) as u8; }
+            for i in 0..64 { b_q[base + 128 + i] = ((blk_idx * 64 + i) * 53 % 256) as u8; }
+            for i in 0..16 { b_q[base + 192 + i] = (((blk_idx * 16 + i) * 41 % 255) as i8).to_le_bytes()[0]; }
+            let d_bits = half::f16::from_f32(0.0005 + (blk_idx as f32) * 0.00001).to_bits();
+            b_q[base + 208] = d_bits as u8;
+            b_q[base + 209] = (d_bits >> 8) as u8;
+        }
+
+        let ref_kernel = CpuMatMulQ4K;
+        let opt_kernel = CpuMatMulQ4KOpt;
+
+        let mut out_ref = vec![0.0f32; m * n];
+        let mut out_opt = vec![0.0f32; m * n];
+
+        ref_kernel.forward_b_transposed_q6k(&a, &b_q, &mut out_ref, m, n, k).unwrap();
+        opt_kernel.forward_b_transposed_q6k(&a, &b_q, &mut out_opt, m, n, k).unwrap();
+
+        let mut max_diff = 0.0f32;
+        let mut max_abs = 0.0f32;
+        let mut worst_idx = 0;
+        for i in 0..m * n {
+            let diff = (out_ref[i] - out_opt[i]).abs();
+            if diff > max_diff { max_diff = diff; worst_idx = i; }
+            max_abs = max_abs.max(out_ref[i].abs());
+        }
+        let rel_tol = if max_abs > 0.0 { max_diff / max_abs } else { max_diff };
+        eprintln!("  Q6K large: max_diff={max_diff:.6} at [{worst_idx}], ref={:.6}, opt={:.6}, rel={rel_tol:.4}",
+            out_ref[worst_idx], out_opt[worst_idx]);
+        assert!(rel_tol < 0.05, "Q6K large: rel_tol={rel_tol:.4}");
+    }
 }
