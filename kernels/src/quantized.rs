@@ -202,6 +202,218 @@ impl MatMulQ for CpuMatMulQ4K {
     }
 }
 
+/// Quantize an activation row to Q8 format: per-block i8 values with per-block f32 scales.
+/// Also computes per-group activation sums for the Q4_K min correction.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn quantize_row_q8_avx2(a: &[f32]) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
+    use std::arch::x86_64::*;
+
+    let k = a.len();
+    let n_blocks = k / Q4K_BLOCK_SIZE;
+    let mut a_q8 = vec![0i8; k];
+    let mut scales = vec![0.0f32; n_blocks];
+    let mut group_sums = vec![0.0f32; n_blocks * Q4K_GROUPS];
+
+    for blk in 0..n_blocks {
+        let base = blk * Q4K_BLOCK_SIZE;
+        let block_a = &a[base..base + Q4K_BLOCK_SIZE];
+
+        // Find max abs using AVX2
+        let mut vmax = _mm256_setzero_ps();
+        let sign_mask = _mm256_set1_ps(-0.0);
+        for chunk in 0..32 {
+            let v = _mm256_loadu_ps(block_a.as_ptr().add(chunk * 8));
+            let abs_v = _mm256_andnot_ps(sign_mask, v);
+            vmax = _mm256_max_ps(vmax, abs_v);
+        }
+        let hi = _mm256_extractf128_ps(vmax, 1);
+        let lo = _mm256_castps256_ps128(vmax);
+        let max128 = _mm_max_ps(lo, hi);
+        let max64 = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
+        let max32 = _mm_max_ss(max64, _mm_shuffle_ps(max64, max64, 1));
+        let max_abs = _mm_cvtss_f32(max32);
+
+        let scale = max_abs / 127.0;
+        scales[blk] = scale;
+        let inv_scale = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
+        let inv_vec = _mm256_set1_ps(inv_scale);
+
+        // Quantize to i8 and compute group sums
+        for chunk in 0..32 {
+            let cb = chunk * 8;
+            let v = _mm256_loadu_ps(block_a.as_ptr().add(cb));
+            let scaled = _mm256_mul_ps(v, inv_vec);
+            let rounded = _mm256_cvtps_epi32(_mm256_round_ps(
+                scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+            ));
+            let lo128 = _mm256_castsi256_si128(rounded);
+            let hi128 = _mm256_extracti128_si256(rounded, 1);
+            let packed16 = _mm_packs_epi32(lo128, hi128);
+            let packed8 = _mm_packs_epi16(packed16, packed16);
+            let ptr = a_q8.as_mut_ptr().add(base + cb) as *mut i64;
+            *ptr = _mm_cvtsi128_si64(packed8);
+        }
+
+        // Compute per-group activation sums (8 groups of 32)
+        for g in 0..Q4K_GROUPS {
+            let mut gsum = 0.0f32;
+            for i in 0..Q4K_GROUP_SIZE {
+                gsum += block_a[g * Q4K_GROUP_SIZE + i];
+            }
+            group_sums[blk * Q4K_GROUPS + g] = gsum;
+        }
+    }
+
+    (a_q8, scales, group_sums)
+}
+
+/// Integer-domain Q4_K dot product with pre-quantized Q8 activations.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q4k_dot_q8_avx2(
+    block: &[u8],
+    a_q8: &[i8],
+    a_scale: f32,
+    a_group_sums: &[f32],
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    let d = q4k_block_d(block);
+    let dmin = q4k_block_dmin(block);
+    let packed_scales = &block[4..16];
+    let qs = &block[16..144];
+    let (sc, m) = q4k_unpack_scales(packed_scales);
+
+    let mask_low = _mm256_set1_epi8(0x0F);
+    let ones_16 = _mm256_set1_epi16(1);
+
+    let mut result = 0.0f32;
+
+    for j in 0..4 {
+        let raw = _mm256_loadu_si256(qs.as_ptr().add(j * 32) as *const __m256i);
+        let lo_nib = _mm256_and_si256(raw, mask_low);
+        let hi_nib = _mm256_and_si256(_mm256_srli_epi16(raw, 4), mask_low);
+
+        let aq_lo = _mm256_loadu_si256(a_q8.as_ptr().add(j * 64) as *const __m256i);
+        let aq_hi = _mm256_loadu_si256(a_q8.as_ptr().add(j * 64 + 32) as *const __m256i);
+
+        // u8 × i8 → i16 paired sums (32 mults → 16 sums per call)
+        let p_lo = _mm256_maddubs_epi16(lo_nib, aq_lo);
+        let p_hi = _mm256_maddubs_epi16(hi_nib, aq_hi);
+
+        // i16 → i32 (sum adjacent pairs)
+        let s_lo = _mm256_madd_epi16(p_lo, ones_16);
+        let s_hi = _mm256_madd_epi16(p_hi, ones_16);
+
+        let idot_lo = hsum_i32(s_lo);
+        let idot_hi = hsum_i32(s_hi);
+
+        result += d * sc[2 * j] * a_scale * idot_lo as f32;
+        result += d * sc[2 * j + 1] * a_scale * idot_hi as f32;
+        result -= dmin * m[2 * j] * a_group_sums[2 * j];
+        result -= dmin * m[2 * j + 1] * a_group_sums[2 * j + 1];
+    }
+
+    result
+}
+
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+#[allow(dead_code)]
+unsafe fn q4k_dot_block_avx2_int8(block: &[u8], a: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let d = q4k_block_d(block);
+    let dmin = q4k_block_dmin(block);
+    let packed_scales = &block[4..16];
+    let qs = &block[16..144];
+    let (sc, m) = q4k_unpack_scales(packed_scales);
+
+    let mask_low = _mm256_set1_epi8(0x0F);
+    let ones_16 = _mm256_set1_epi16(1);
+
+    // Quantize 256 f32 activations to i8
+    let mut max_abs = 0.0f32;
+    for i in 0..Q4K_BLOCK_SIZE {
+        let v = a[i].abs();
+        if v > max_abs { max_abs = v; }
+    }
+    let a_scale = max_abs / 127.0;
+    let inv_scale = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
+
+    let mut a_q8 = [0i8; Q4K_BLOCK_SIZE];
+    let inv_scale_vec = _mm256_set1_ps(inv_scale);
+    for chunk in 0..32 {
+        let base = chunk * 8;
+        let av = _mm256_loadu_ps(a.as_ptr().add(base));
+        let scaled = _mm256_mul_ps(av, inv_scale_vec);
+        let rounded = _mm256_cvtps_epi32(_mm256_round_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        // Pack i32 → i16 → i8 (with saturation)
+        let lo128 = _mm256_castsi256_si128(rounded);
+        let hi128 = _mm256_extracti128_si256(rounded, 1);
+        let packed16 = _mm_packs_epi32(lo128, hi128);
+        let packed8 = _mm_packs_epi16(packed16, packed16);
+        // Store 8 bytes
+        let ptr = a_q8.as_mut_ptr().add(base) as *mut i64;
+        *ptr = _mm_cvtsi128_si64(packed8);
+    }
+
+    let mut result = 0.0f32;
+
+    for j in 0..4 {
+        // Load 32 qs bytes, extract low and high nibbles
+        let raw = _mm256_loadu_si256(qs.as_ptr().add(j * 32) as *const __m256i);
+        let lo_nib = _mm256_and_si256(raw, mask_low);
+        let hi_nib = _mm256_and_si256(_mm256_srli_epi16(raw, 4), mask_low);
+
+        // Load 64 quantized activation bytes
+        let aq_lo = _mm256_loadu_si256(a_q8.as_ptr().add(j * 64) as *const __m256i);
+        let aq_hi = _mm256_loadu_si256(a_q8.as_ptr().add(j * 64 + 32) as *const __m256i);
+
+        // Integer dot: u8 × i8 → i16 paired sums
+        let p_lo = _mm256_maddubs_epi16(lo_nib, aq_lo);
+        let p_hi = _mm256_maddubs_epi16(hi_nib, aq_hi);
+
+        // i16 → i32 (sum adjacent pairs)
+        let s_lo = _mm256_madd_epi16(p_lo, ones_16);
+        let s_hi = _mm256_madd_epi16(p_hi, ones_16);
+
+        // Horizontal sum each to a single i32
+        let hsum_lo = hsum_i32(s_lo);
+        let hsum_hi = hsum_i32(s_hi);
+
+        // Activation sums per group (for min correction)
+        // sum(a_q8[group]) — use madd with ones to sum i8 as i16 pairs, then i32
+        let aq_lo_16 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(aq_lo)), ones_16);
+        let aq_lo_16b = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_extracti128_si256(aq_lo, 1)), ones_16);
+        let asum_lo = hsum_i32(_mm256_add_epi32(aq_lo_16, aq_lo_16b));
+
+        let aq_hi_16 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(aq_hi)), ones_16);
+        let aq_hi_16b = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_extracti128_si256(aq_hi, 1)), ones_16);
+        let asum_hi = hsum_i32(_mm256_add_epi32(aq_hi_16, aq_hi_16b));
+
+        result += d * sc[2 * j] * a_scale * hsum_lo as f32
+                - dmin * m[2 * j] * a_scale * asum_lo as f32;
+        result += d * sc[2 * j + 1] * a_scale * hsum_hi as f32
+                - dmin * m[2 * j + 1] * a_scale * asum_hi as f32;
+    }
+
+    result
+}
+
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_i32(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    let hi = _mm256_extracti128_si256(v, 1);
+    let lo = _mm256_castsi256_si128(v);
+    let sum128 = _mm_add_epi32(lo, hi);
+    let sum64 = _mm_add_epi32(sum128, _mm_srli_si128(sum128, 8));
+    let sum32 = _mm_add_epi32(sum64, _mm_srli_si128(sum64, 4));
+    _mm_cvtsi128_si32(sum32)
+}
+
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn q4k_dot_block_avx2(block: &[u8], a: &[f32]) -> f32 {
@@ -332,21 +544,36 @@ impl MatMulQ for CpuMatMulQ4KOpt {
 
         if m == 1 {
             let a_row = &a[0..k];
+
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // Quantize activation row to i8 ONCE, reuse for all n columns
+                let (a_q8, a_scales, a_group_sums) =
+                    unsafe { quantize_row_q8_avx2(a_row) };
+
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for blk in 0..blocks_per_row {
+                        let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                        let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                        let aq_slice = &a_q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                        let a_sc = a_scales[blk];
+                        let a_gsums = &a_group_sums[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
+                        sum += unsafe {
+                            q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums)
+                        };
+                    }
+                    output[j] = sum;
+                }
+                return Ok(());
+            }
+
             for j in 0..n {
                 let mut sum = 0.0f32;
                 for blk in 0..blocks_per_row {
                     let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
                     let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
                     let a_slice = &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                            sum += unsafe { q4k_dot_block_avx2(block, a_slice) };
-                            continue;
-                        }
-                    }
-
                     sum += q4k_dot_block(block, a_slice);
                 }
                 output[j] = sum;
