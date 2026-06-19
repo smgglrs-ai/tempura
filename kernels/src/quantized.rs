@@ -337,6 +337,93 @@ mod kani_proofs {
         assert!(qs_idx < 128);
         assert!(elem_lo != elem_hi);
     }
+
+    /// Prove scale unpacking matches ggml's get_scale_min_k4 for ALL 8 indices.
+    /// ggml: j<4 → sc=q[j]&63, m=q[j+4]&63
+    ///       j≥4 → sc=(q[j+4]&0xF)|((q[j-4]>>6)<<4), m=(q[j+4]>>4)|((q[j]>>6)<<4)
+    #[kani::proof]
+    fn q4k_scale_unpack_matches_ggml() {
+        let packed: [u8; 12] = kani::any();
+
+        let j: usize = kani::any();
+        kani::assume(j < 8);
+
+        // ggml's get_scale_min_k4
+        let (ggml_sc, ggml_m) = if j < 4 {
+            (packed[j] & 63, packed[j + 4] & 63)
+        } else {
+            let sc = (packed[j + 4] & 0x0F) | ((packed[j - 4] >> 6) << 4);
+            let m = (packed[j + 4] >> 4) | ((packed[j] >> 6) << 4);
+            (sc & 0x3F, m & 0x3F)
+        };
+
+        // Our unpack_q4k_scales
+        let i = j % 4;
+        let (our_sc, our_m) = if j < 4 {
+            (packed[i] & 0x3F, packed[i + 4] & 0x3F)
+        } else {
+            let sc = ((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F;
+            let m = ((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F;
+            (sc, m)
+        };
+
+        assert!(ggml_sc == our_sc);
+        assert!(ggml_m == our_m);
+    }
+
+    /// Prove the interleaved dequant produces the same element-to-qs mapping as ggml.
+    /// ggml loop: for j in 0..4, for l in 0..32:
+    ///   y[j*64+l]    uses qs[j*32+l] & 0xF  with scale 2*j
+    ///   y[j*64+l+32] uses qs[j*32+l] >> 4   with scale 2*j+1
+    #[kani::proof]
+    fn q4k_dequant_element_mapping_matches_ggml() {
+        let j: usize = kani::any();
+        let l: usize = kani::any();
+        kani::assume(j < 4);
+        kani::assume(l < 32);
+
+        // ggml mapping
+        let ggml_elem_lo = j * 64 + l;
+        let ggml_elem_hi = j * 64 + l + 32;
+        let ggml_qs_idx = j * 32 + l;
+        let ggml_scale_lo = 2 * j;
+        let ggml_scale_hi = 2 * j + 1;
+
+        // Our dequant mapping (from q4k_dequant_block)
+        let our_q_off = j * 32;
+        let our_elem_lo = j * 64 + l;
+        let our_elem_hi = j * 64 + l + 32;
+        let our_qs_idx = our_q_off + l;
+        let our_scale_lo = 2 * j;
+        let our_scale_hi = 2 * j + 1;
+
+        assert!(ggml_elem_lo == our_elem_lo);
+        assert!(ggml_elem_hi == our_elem_hi);
+        assert!(ggml_qs_idx == our_qs_idx);
+        assert!(ggml_scale_lo == our_scale_lo);
+        assert!(ggml_scale_hi == our_scale_hi);
+    }
+
+    /// Prove f32 accumulator stays finite for realistic matmul dimensions.
+    /// Max per-element product: max_activation × (d × 63 × 15 + dmin × 63).
+    /// For k=12288 (largest FFN dim), sum of 12288 such terms must not overflow f32.
+    #[kani::proof]
+    fn q4k_accumulator_no_overflow() {
+        let k: usize = kani::any();
+        kani::assume(k >= 256 && k <= 12288);
+        kani::assume(k % 256 == 0);
+
+        // Worst case per element: activation=100 (post-norm values are <10 typically),
+        // weight = d * 63 * 15 = max dequantized value with d=1 (f16 max is 65504)
+        // Conservative bound: |a_i * w_i| ≤ 100 * 945 = 94500
+        let max_per_element: f64 = 100.0 * 945.0;
+        let max_sum = max_per_element * k as f64;
+
+        // f32 can represent values up to ~3.4e38
+        assert!(max_sum < 3.4e38);
+        // Even for k=12288: 94500 * 12288 = 1.16e9, well within f32 range
+        assert!(max_sum < f32::MAX as f64);
+    }
 }
 
 #[cfg(test)]

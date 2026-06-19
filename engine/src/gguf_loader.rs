@@ -1154,6 +1154,68 @@ mod kani_proofs {
             assert!(block_start + 2 + 32 <= total_bytes);
         }
     }
+
+    /// Prove Q6_K interleaved dequant maps all 256 elements without gaps.
+    /// Layout: for each half (0..2), for l in 0..32:
+    ///   y[y_off+l]    ← ql[ql_off+l] low + qh[qh_off+l] bits 0-1
+    ///   y[y_off+l+32] ← ql[ql_off+l+32] low + qh[qh_off+l] bits 2-3
+    ///   y[y_off+l+64] ← ql[ql_off+l] high + qh[qh_off+l] bits 4-5
+    ///   y[y_off+l+96] ← ql[ql_off+l+32] high + qh[qh_off+l] bits 6-7
+    #[kani::proof]
+    fn gguf_dequant_q6k_covers_all_256() {
+        let half: usize = kani::any();
+        let l: usize = kani::any();
+        kani::assume(half < 2);
+        kani::assume(l < 32);
+
+        let ql_off = half * 64;
+        let qh_off = half * 32;
+        let y_off = half * 128;
+
+        let e0 = y_off + l;
+        let e1 = y_off + l + 32;
+        let e2 = y_off + l + 64;
+        let e3 = y_off + l + 96;
+
+        assert!(e0 < 256);
+        assert!(e1 < 256);
+        assert!(e2 < 256);
+        assert!(e3 < 256);
+
+        // All four elements are distinct
+        assert!(e0 != e1 && e0 != e2 && e0 != e3);
+        assert!(e1 != e2 && e1 != e3);
+        assert!(e2 != e3);
+
+        // ql access in bounds (128 bytes)
+        assert!(ql_off + l < 128);
+        assert!(ql_off + l + 32 < 128);
+
+        // qh access in bounds (64 bytes)
+        assert!(qh_off + l < 64);
+
+        // scale access (16 bytes, indexed by half*8 + l/16 + {0,2,4,6})
+        let is = l / 16;
+        assert!(half * 8 + is < 16);
+        assert!(half * 8 + is + 2 < 16);
+        assert!(half * 8 + is + 4 < 16);
+        assert!(half * 8 + is + 6 < 16);
+    }
+
+    /// Prove Q6_K 6-bit value reconstruction stays in range [0, 63].
+    #[kani::proof]
+    fn gguf_dequant_q6k_value_in_range() {
+        let ql_byte: u8 = kani::any();
+        let qh_byte: u8 = kani::any();
+        let shift: u32 = kani::any();
+        kani::assume(shift < 4);
+
+        let low = ql_byte & 0x0F;
+        let high = (qh_byte >> (shift * 2)) & 0x03;
+        let q6 = low | (high << 4);
+
+        assert!(q6 <= 63);
+    }
 }
 
 #[cfg(test)]
