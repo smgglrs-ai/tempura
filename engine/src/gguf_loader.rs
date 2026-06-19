@@ -822,6 +822,127 @@ impl GgufLoader {
         Self::from_bytes(&data)
     }
 
+    pub fn from_file_quantized(path: &Path) -> Result<Self, LoadError> {
+        let data = std::fs::read(path)?;
+        Self::from_bytes_quantized(&data)
+    }
+
+    fn from_bytes_quantized(data: &[u8]) -> Result<Self, LoadError> {
+        let mut offset = 0usize;
+
+        let magic = read_u32(data, &mut offset)?;
+        if magic != GGUF_MAGIC {
+            return Err(LoadError::GgufParse(format!(
+                "invalid magic: expected 0x{GGUF_MAGIC:08X}, got 0x{magic:08X}"
+            )));
+        }
+        let version = read_u32(data, &mut offset)?;
+        if version != GGUF_VERSION {
+            return Err(LoadError::GgufParse(format!(
+                "unsupported GGUF version: {version} (expected {GGUF_VERSION})"
+            )));
+        }
+
+        let tensor_count = read_u64(data, &mut offset)? as usize;
+        let metadata_kv_count = read_u64(data, &mut offset)? as usize;
+
+        let mut metadata = HashMap::new();
+        for _ in 0..metadata_kv_count {
+            let key = read_string(data, &mut offset)?;
+            let value_type = read_u32(data, &mut offset)?;
+            let value = read_metadata_value(data, &mut offset, value_type)?;
+            metadata.insert(key, value);
+        }
+
+        let mut tensor_infos = Vec::with_capacity(tensor_count);
+        for _ in 0..tensor_count {
+            let name = read_string(data, &mut offset)?;
+            let n_dims = read_u32(data, &mut offset)? as usize;
+            let mut dims = Vec::with_capacity(n_dims);
+            for _ in 0..n_dims {
+                dims.push(read_u64(data, &mut offset)?);
+            }
+            let dtype = GgmlType::from_u32(read_u32(data, &mut offset)?)?;
+            let tensor_offset = read_u64(data, &mut offset)?;
+            tensor_infos.push(TensorInfo {
+                name,
+                dims,
+                dtype,
+                offset: tensor_offset,
+            });
+        }
+
+        let data_start = offset.div_ceil(ALIGNMENT) * ALIGNMENT;
+
+        let mut tensors = HashMap::new();
+        let mut raw_tensors = HashMap::new();
+        let mut tensor_dtypes = HashMap::new();
+
+        for info in &tensor_infos {
+            let num_elements: u64 = info.dims.iter().product();
+            let byte_size = tensor_data_size(info.dtype, num_elements) as usize;
+            let abs_offset = data_start + info.offset as usize;
+
+            if abs_offset + byte_size > data.len() {
+                return Err(LoadError::GgufParse(format!(
+                    "tensor '{}' data out of bounds", info.name,
+                )));
+            }
+
+            let tensor_data = &data[abs_offset..abs_offset + byte_size];
+            let ne = num_elements as usize;
+            let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
+
+            let keep_raw = info.dtype == GgmlType::Q4K
+                && !mapped_name.contains("embed_tokens")
+                && !mapped_name.contains("norm.weight")
+                && mapped_name != "lm_head.weight";
+
+            if !keep_raw {
+                let floats = match info.dtype {
+                    GgmlType::F32 => dequant_f32(tensor_data, ne),
+                    GgmlType::F16 => dequant_f16(tensor_data, ne),
+                    GgmlType::BF16 => dequant_bf16(tensor_data, ne),
+                    GgmlType::Q4_0 => dequant_q4_0(tensor_data, ne),
+                    GgmlType::Q4_1 => dequant_q4_1(tensor_data, ne),
+                    GgmlType::Q5_0 => dequant_q5_0(tensor_data, ne),
+                    GgmlType::Q5_1 => dequant_q5_1(tensor_data, ne),
+                    GgmlType::Q8_0 => dequant_q8_0(tensor_data, ne),
+                    GgmlType::Q2K => dequant_q2k(tensor_data, ne),
+                    GgmlType::Q3K => dequant_q3k(tensor_data, ne),
+                    GgmlType::Q4K => dequant_q4k(tensor_data, ne),
+                    GgmlType::Q5K => dequant_q5k(tensor_data, ne),
+                    GgmlType::Q6K => dequant_q6k(tensor_data, ne),
+                };
+                tensors.insert(mapped_name.clone(), floats);
+            } else {
+                raw_tensors.insert(mapped_name.clone(), tensor_data.to_vec());
+            }
+            tensor_dtypes.insert(mapped_name, info.dtype);
+        }
+
+        let vocab_size_from_embed = tensors.get("model.embed_tokens.weight").map(|t| {
+            let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
+            t.len().checked_div(hidden).unwrap_or(0)
+        });
+
+        let mut config = extract_config(&metadata)?;
+        if let Some(vs) = vocab_size_from_embed {
+            if vs > 0 {
+                config.vocab_size = vs;
+            }
+        }
+        config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
+
+        Ok(Self {
+            tensors,
+            raw_tensors,
+            tensor_dtypes,
+            config,
+            metadata,
+        })
+    }
+
     pub fn from_bytes(data: &[u8]) -> Result<Self, LoadError> {
         let mut offset = 0usize;
 
@@ -942,20 +1063,11 @@ impl GgufLoader {
         let mut q4k_tensors = HashMap::new();
         let mut f32_tensors = HashMap::new();
 
-        for (name, dtype) in &self.tensor_dtypes {
-            match dtype {
-                GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K
-                | GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q8_0
-                | GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q5_0 | GgmlType::Q5_1 => {
-                    if let Some(raw) = self.raw_tensors.get(name) {
-                        q4k_tensors.insert(name.clone(), raw.clone());
-                    }
-                }
-                _ => {
-                    if let Some(f32_data) = self.tensors.get(name) {
-                        f32_tensors.insert(name.clone(), f32_data.clone());
-                    }
-                }
+        for (name, _dtype) in &self.tensor_dtypes {
+            if let Some(f32_data) = self.tensors.get(name) {
+                f32_tensors.insert(name.clone(), f32_data.clone());
+            } else if let Some(raw) = self.raw_tensors.get(name) {
+                q4k_tensors.insert(name.clone(), raw.clone());
             }
         }
 

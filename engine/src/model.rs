@@ -125,6 +125,7 @@ pub struct TransformerModel<A, N, R, M, S> {
     pub config: ModelConfig,
     pub pipeline: KernelPipeline<A, N, R, M, S>,
     pub weights: Option<ModelWeights>,
+    pub quantized_weights: Option<crate::weights::QuantizedWeights>,
     #[cfg(feature = "cuda")]
     pub gpu_weights: Option<crate::weights::GpuWeights>,
 }
@@ -142,6 +143,7 @@ where
             config,
             pipeline,
             weights: None,
+            quantized_weights: None,
             #[cfg(feature = "cuda")]
             gpu_weights: None,
         }
@@ -156,6 +158,9 @@ where
     }
 
     pub fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
+        if let Some(qw) = &self.quantized_weights {
+            return self.forward_quantized(session, token_ids, qw);
+        }
         let weights = match &self.weights {
             Some(w) => w,
             None => return vec![0.0; self.config.vocab_size],
@@ -1576,7 +1581,7 @@ where
         &self.config
     }
     fn has_weights(&self) -> bool {
-        self.weights.is_some()
+        self.weights.is_some() || self.quantized_weights.is_some()
     }
     fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
         self.forward(session, token_ids)
