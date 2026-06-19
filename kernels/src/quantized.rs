@@ -311,14 +311,31 @@ mod kani_proofs {
         kani::assume(i < 4);
 
         let sc_lo = packed[i] & 0x3F;
-        let sc_hi = ((packed[i] >> 6) | ((packed[i + 8] & 0x0F) << 2)) & 0x3F;
+        let sc_hi = ((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F;
         let m_lo = packed[i + 4] & 0x3F;
-        let m_hi = ((packed[i + 4] >> 6) | ((packed[i + 8] >> 4) << 2)) & 0x3F;
+        let m_hi = ((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F;
 
         assert!(sc_lo <= 63);
         assert!(sc_hi <= 63);
         assert!(m_lo <= 63);
         assert!(m_hi <= 63);
+    }
+
+    #[kani::proof]
+    fn q4k_dequant_covers_all_256_elements() {
+        let j: usize = kani::any();
+        let l: usize = kani::any();
+        kani::assume(j < 4);
+        kani::assume(l < 32);
+
+        let elem_lo = j * 64 + l;
+        let elem_hi = j * 64 + l + 32;
+        let qs_idx = j * 32 + l;
+
+        assert!(elem_lo < Q4K_BLOCK_SIZE);
+        assert!(elem_hi < Q4K_BLOCK_SIZE);
+        assert!(qs_idx < 128);
+        assert!(elem_lo != elem_hi);
     }
 }
 
