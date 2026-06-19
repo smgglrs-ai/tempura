@@ -202,6 +202,115 @@ impl MatMulQ for CpuMatMulQ4K {
     }
 }
 
+#[cfg(feature = "cpu")]
+pub struct CpuMatMulQ4KOpt;
+
+#[cfg(feature = "cpu")]
+impl CpuMatMulQ4KOpt {
+    #[inline(always)]
+    fn dequant_row(b_quantized: &[u8], row: usize, k: usize, buf: &mut [f32]) {
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        for blk in 0..blocks_per_row {
+            let block_offset = (row * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+            let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+            let out = &mut buf[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+            let mut tmp = [0.0f32; Q4K_BLOCK_SIZE];
+            q4k_dequant_block(block, &mut tmp);
+            out.copy_from_slice(&tmp);
+        }
+    }
+
+    #[inline(always)]
+    fn dot(a: &[f32], b: &[f32]) -> f32 {
+        let mut sum = 0.0f32;
+        for i in 0..a.len() {
+            sum += a[i] * b[i];
+        }
+        sum
+    }
+}
+
+#[cfg(feature = "cpu")]
+impl MatMulQ for CpuMatMulQ4KOpt {
+    fn forward_b_transposed_q4k(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if a.len() != m * k {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
+        }
+        if output.len() != m * n {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
+        }
+        if k % Q4K_BLOCK_SIZE != 0 {
+            return Err(crate::KernelError::InvalidConfig(
+                format!("k={k} must be divisible by Q4K block size {Q4K_BLOCK_SIZE}"),
+            ));
+        }
+
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let expected_b_bytes = n * blocks_per_row * Q4K_BLOCK_BYTES;
+        if b_quantized.len() != expected_b_bytes {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: expected_b_bytes,
+                got: b_quantized.len(),
+            });
+        }
+
+        if m == 1 {
+            // Optimized m=1 decode path: dequant block → vectorizable dot
+            let a_row = &a[0..k];
+            let mut tmp = [0.0f32; Q4K_BLOCK_SIZE];
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for blk in 0..blocks_per_row {
+                    let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                    let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                    q4k_dequant_block(block, &mut tmp);
+                    let a_slice = &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                    // Separate loop — compiler can vectorize this with AVX
+                    let mut block_sum = 0.0f32;
+                    for idx in 0..Q4K_BLOCK_SIZE {
+                        block_sum += a_slice[idx] * tmp[idx];
+                    }
+                    sum += block_sum;
+                }
+                output[j] = sum;
+            }
+        } else {
+            // Batched path: dequant full row, use gemm for SIMD matmul
+            let mut b_f32 = vec![0.0f32; n * k];
+            for j in 0..n {
+                Self::dequant_row(b_quantized, j, k, &mut b_f32[j * k..(j + 1) * k]);
+            }
+            unsafe {
+                gemm::gemm(
+                    m, n, k,
+                    output.as_mut_ptr(), 1, n as isize, false,
+                    a.as_ptr(), 1, k as isize,
+                    b_f32.as_ptr(), k as isize, 1,
+                    0.0f32, 1.0f32,
+                    false, false, false,
+                    gemm::Parallelism::Rayon(0),
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
@@ -584,6 +693,139 @@ mod tests {
         assert!(
             (dot_result - expected_dot).abs() < 1e-3,
             "dot_block={dot_result}, sum(dequant)={expected_dot}"
+        );
+    }
+
+    #[test]
+    fn test_opt_matches_reference() {
+        let k = 512;
+        let m = 2;
+        let n = 4;
+
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32) * 0.01 - 0.08).collect();
+
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let mut b_q = vec![0u8; n * blocks_per_row * Q4K_BLOCK_BYTES];
+        // Set valid f16 scales for each block, random qs data
+        for blk in 0..(n * blocks_per_row) {
+            let base = blk * Q4K_BLOCK_BYTES;
+            let d_bits = half::f16::from_f32(0.01).to_bits();
+            b_q[base] = d_bits as u8;
+            b_q[base + 1] = (d_bits >> 8) as u8;
+            let dmin_bits = half::f16::from_f32(0.005).to_bits();
+            b_q[base + 2] = dmin_bits as u8;
+            b_q[base + 3] = (dmin_bits >> 8) as u8;
+            for i in 4..Q4K_BLOCK_BYTES {
+                b_q[base + i] = ((blk * 144 + i) * 13 % 256) as u8;
+            }
+        }
+
+        let ref_kernel = CpuMatMulQ4K;
+        let opt_kernel = CpuMatMulQ4KOpt;
+
+        let mut out_ref = vec![0.0f32; m * n];
+        let mut out_opt = vec![0.0f32; m * n];
+
+        ref_kernel
+            .forward_b_transposed_q4k(&a, &b_q, &mut out_ref, m, n, k)
+            .unwrap();
+        opt_kernel
+            .forward_b_transposed_q4k(&a, &b_q, &mut out_opt, m, n, k)
+            .unwrap();
+
+        for i in 0..m * n {
+            assert!(
+                (out_ref[i] - out_opt[i]).abs() < 1e-4,
+                "mismatch at [{i}]: ref={}, opt={}",
+                out_ref[i],
+                out_opt[i]
+            );
+        }
+    }
+
+    #[test]
+    fn bench_opt_vs_reference() {
+        let configs = [(1, 4096, 4096), (1, 12288, 4096), (5, 4096, 4096)];
+        for (m, n, k) in configs {
+            bench_one(m, n, k);
+        }
+    }
+
+    fn bench_one(m: usize, n: usize, k: usize) {
+
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 23) as f32) * 0.005 - 0.05).collect();
+
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let mut b_q = vec![0u8; n * blocks_per_row * Q4K_BLOCK_BYTES];
+        for blk in 0..(n * blocks_per_row) {
+            let base = blk * Q4K_BLOCK_BYTES;
+            let d_bits = half::f16::from_f32(0.001).to_bits();
+            b_q[base] = d_bits as u8;
+            b_q[base + 1] = (d_bits >> 8) as u8;
+            let dmin_bits = half::f16::from_f32(0.0005).to_bits();
+            b_q[base + 2] = dmin_bits as u8;
+            b_q[base + 3] = (dmin_bits >> 8) as u8;
+            for i in 4..Q4K_BLOCK_BYTES {
+                b_q[base + i] = ((blk * 37 + i * 11) % 256) as u8;
+            }
+        }
+
+        let ref_kernel = CpuMatMulQ4K;
+        let opt_kernel = CpuMatMulQ4KOpt;
+        let iters = 5;
+
+        let mut out = vec![0.0f32; m * n];
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            ref_kernel.forward_b_transposed_q4k(&a, &b_q, &mut out, m, n, k).unwrap();
+        }
+        let ref_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            opt_kernel.forward_b_transposed_q4k(&a, &b_q, &mut out, m, n, k).unwrap();
+        }
+        let opt_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        let speedup = ref_ms / opt_ms;
+        eprintln!("  Q4K matmul {m}x{n}x{k}: ref={ref_ms:.1}ms, opt={opt_ms:.1}ms, speedup={speedup:.1}x");
+    }
+
+    #[test]
+    fn test_opt_larger_matmul() {
+        let k = 4096;
+        let m = 1;
+        let n = 4096;
+
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 23) as f32) * 0.005 - 0.05).collect();
+
+        let mut b_q = vec![0u8; n * (k / Q4K_BLOCK_SIZE) * Q4K_BLOCK_BYTES];
+        for (i, byte) in b_q.iter_mut().enumerate() {
+            *byte = ((i * 11 + 3) % 256) as u8;
+        }
+
+        let ref_kernel = CpuMatMulQ4K;
+        let opt_kernel = CpuMatMulQ4KOpt;
+
+        let mut out_ref = vec![0.0f32; m * n];
+        let mut out_opt = vec![0.0f32; m * n];
+
+        ref_kernel
+            .forward_b_transposed_q4k(&a, &b_q, &mut out_ref, m, n, k)
+            .unwrap();
+        opt_kernel
+            .forward_b_transposed_q4k(&a, &b_q, &mut out_opt, m, n, k)
+            .unwrap();
+
+        let max_diff: f32 = out_ref
+            .iter()
+            .zip(&out_opt)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            max_diff < 1e-3,
+            "max diff {max_diff} too large at 4096x4096"
         );
     }
 }

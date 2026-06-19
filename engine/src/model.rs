@@ -158,10 +158,9 @@ where
     }
 
     pub fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
-        // Temporarily disabled quantized dispatch for debugging
-        // if let Some(qw) = &self.quantized_weights {
-        //     return self.forward_quantized(session, token_ids, qw);
-        // }
+        if let Some(qw) = &self.quantized_weights {
+            return self.forward_quantized(session, token_ids, qw);
+        }
         let weights = match &self.weights {
             Some(w) => w,
             None => return vec![0.0; self.config.vocab_size],
@@ -362,15 +361,17 @@ where
                 hidden[i] += down_out[i];
             }
 
-            if std::env::var("TEMPURA_DEBUG").is_ok() && layer == 0 {
-                let hn = hidden.iter().map(|x| x*x).sum::<f32>().sqrt();
-                let dn = down_out.iter().map(|x| x*x).sum::<f32>().sqrt();
-                let gn = gate.iter().map(|x| x*x).sum::<f32>().sqrt();
-                eprintln!("[DEBUG] L0 hidden_norm_final: {hn:.4}");
-                eprintln!("[DEBUG] L0 down_out_norm: {dn:.4}");
-                eprintln!("[DEBUG] L0 gate_after_silu_norm: {gn:.4}");
-                eprintln!("[DEBUG] L0 down_out[0..4]: {:?}", &down_out[0..4]);
-                eprintln!("[DEBUG] L0 gate[0..4]: {:?}", &gate[0..4.min(inter)]);
+            if std::env::var("TEMPURA_DEBUG").is_ok() && layer == 0 && seq_len > 1 {
+                let h_before_ffn = hidden[0..h].iter().map(|x| x*x).sum::<f32>().sqrt();
+                let n2_norm = normed2[0..h].iter().map(|x| x*x).sum::<f32>().sqrt();
+                let gate_tok0 = gate[0..inter.min(4)].to_vec();
+                let up_tok0 = up[0..inter.min(4)].to_vec();
+                let gate_n = gate[0..inter].iter().map(|x| x*x).sum::<f32>().sqrt();
+                let dn = down_out[0..h].iter().map(|x| x*x).sum::<f32>().sqrt();
+                let hn = hidden[0..h].iter().map(|x| x*x).sum::<f32>().sqrt();
+                eprintln!("[DEBUG] L0 tok0: h_pre_ffn={h_before_ffn:.4} normed2={n2_norm:.4} gate_norm={gate_n:.4} down={dn:.4} h_final={hn:.4}");
+                eprintln!("[DEBUG] L0 tok0 gate[0..4]: {gate_tok0:?}");
+                eprintln!("[DEBUG] L0 tok0 up[0..4]: {up_tok0:?}");
             }
 
             if session.trace_level >= TraceLevel::Summary {
@@ -419,7 +420,7 @@ where
         let head_dim = cfg.head_dim;
         let seq_len = token_ids.len();
 
-        let q4k = oxide_kernels::quantized::CpuMatMulQ4K;
+        let q4k = oxide_kernels::quantized::CpuMatMulQ4KOpt;
         use oxide_kernels::quantized::MatMulQ;
 
         let embed = qweights.get_f32("model.embed_tokens.weight").unwrap();
