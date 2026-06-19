@@ -7,17 +7,35 @@ template = "docs/section.html"
 
 [extra]
 toc = true
+no_card_list = true
+
+[[extra.sidebar_parts]]
+title = "Part I: The Math"
+id = "math"
+
+[[extra.sidebar_parts]]
+title = "Part II: The Hardware"
+id = "hardware"
+
+[[extra.sidebar_parts]]
+title = "Part III: Kernel Math"
+id = "kernel-math"
+
+[[extra.sidebar_parts]]
+title = "Part IV: Verification"
+id = "verification"
 +++
 
-You don't need a computer science degree. You don't need to know what a neural network is. You don't even need to remember much math from school — we'll rebuild what we need as we go.
+You don't need a computer science degree. You don't need to know what a neural network is. You do need basic arithmetic and simple algebra — multiplication, fractions, and expressions like $f(x) = 2x + 3$. Everything beyond that, we build from scratch.
 
-This section takes you from "I've heard of AI but I don't know how it works" all the way to understanding how GPU kernels are formally verified. Each page builds on the previous one, with worked examples you can verify by hand.
+This section takes you from "I've heard of AI but I don't know how it works" all the way to understanding how GPU kernels are formally verified.
 
 ## Part I: The Math
 
 | # | Topic | What you'll understand |
 |---|-------|----------------------|
 | 0 | [What is a Model?](what-is-a-model/) | What AI models actually are (and aren't) |
+| 0.5 | [Reading Math Notation](reading-math/) | A guide to every symbol we use — $\sum$, $\in$, $\mathbb{R}$, Greek letters |
 | 1 | [Vectors](vectors/) | How to represent things as lists of numbers |
 | 2 | [Matrices](matrices/) | How to transform vectors systematically |
 | 3 | [Functions](functions/) | Why neural networks need non-linearity |
@@ -40,8 +58,6 @@ This section takes you from "I've heard of AI but I don't know how it works" all
 
 ## Part III: Foundations
 
-The same operations from Part I, now at implementation depth — with equations, Kani proof walkthroughs, and links to the source code.
-
 ### Kernel math
 
 | # | Topic | What you'll understand |
@@ -52,7 +68,7 @@ The same operations from Part I, now at implementation depth — with equations,
 | 18 | [Sampling](sampling/) | Temperature as Boltzmann, top-k/top-p, deterministic RNG |
 | 19 | [Quantization](quantization/) | Bounded error, group quantization, monotonicity, GPTQ/AWQ/GGUF |
 
-### Verification theory
+## Part IV: Verification Theory
 
 | # | Topic | What you'll understand |
 |---|-------|----------------------|
@@ -64,8 +80,14 @@ The same operations from Part I, now at implementation depth — with equations,
 
 ## How to read this
 
-**Part I** stands alone — you can stop after Chapter 9 and understand how language models work. **Part II** explains how the math runs on GPU hardware. **Part III** goes to implementation depth on each kernel and the verification system.
+**Part I** stands alone — stop after Chapter 9 and you'll understand how language models work, end to end. No hardware or verification knowledge needed.
 
-**Go in order** within each part. Parts II and III can be read in either order after Part I.
+**Part II** explains how the math runs on GPUs. Read this if you want to understand why inference is fast, what cuda-oxide changes, and how tempura's kernels map to hardware.
 
-**Do the examples.** Understanding comes from computing, not reading.
+**Part III** covers each kernel's math at implementation depth — equations, numerical considerations, and links to the source code.
+
+**Part IV** covers the verification system — what Kani proves, how to read proof harnesses, compositionality, DualPipeline, and verification tiers. Read this if you want to understand or contribute to tempura's proofs.
+
+**Go in order** within each part. Parts II, III, and IV can be read in any order after Part I.
+
+**Do the examples.** The numbers are small on purpose — understanding comes from computing, not reading.

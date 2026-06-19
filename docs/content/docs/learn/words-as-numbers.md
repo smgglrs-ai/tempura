@@ -5,6 +5,7 @@ weight = 70
 template = "docs/page.html"
 
 [extra]
+part = "math"
 toc = true
 math = true
 +++

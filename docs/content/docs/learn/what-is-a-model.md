@@ -5,6 +5,7 @@ weight = 5
 template = "docs/page.html"
 
 [extra]
+part = "math"
 toc = true
 math = true
 +++
@@ -94,4 +95,4 @@ Most inference engines are black boxes — text goes in, text comes out, and you
 
 tempura is different. It **proves** that certain operations are safe (using a tool called [Kani](bounded-model-checking/)), **compares** different implementations to verify they produce the same results (using [DualPipeline](dual-pipeline/)), and **records** what happened at every step (using [InferenceTrace](../../trace-tooling/)). Part III of this course covers the verification in depth — but first, let's learn the math.
 
-**Next:** [Vectors](../vectors/) — the first building block.
+**Next:** [Reading Math Notation](../reading-math/) — a guide to the symbols we'll use, so $\sum$ and $\in$ are never a mystery. (If you're comfortable with math notation, skip to [Vectors](../vectors/).)

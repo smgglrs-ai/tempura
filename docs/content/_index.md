@@ -10,6 +10,12 @@ repo_license = "Open-source Apache-2.0 License."
 repo_url = "https://github.com/smgglrs-ai/tempura"
 
 [[extra.menu.main]]
+name = "Learn"
+section = "docs"
+url = "/docs/learn/"
+weight = 5
+
+[[extra.menu.main]]
 name = "Docs"
 section = "docs"
 url = "/docs/getting-started/"

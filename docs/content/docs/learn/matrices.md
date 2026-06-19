@@ -5,6 +5,7 @@ weight = 20
 template = "docs/page.html"
 
 [extra]
+part = "math"
 toc = true
 math = true
 +++
@@ -95,13 +96,15 @@ The number of **columns** in the matrix must match the number of **components** 
 
 What if you want to transform multiple vectors at once? Or chain two transformations together? That's matrix-matrix multiplication.
 
-Two matrices $A$ ($m \times p$) and $B$ ($p \times n$) multiply to produce a result $C$ ($m \times n$):
+Two matrices $A$ ($m \times p$) and $B$ ($p \times n$) multiply to produce a result $C$ ($m \times n$). The rule: each entry in the result is a [dot product](../vectors/). Specifically, the entry in row $i$, column $j$ of the result (written $C_{ij}$) is the dot product of row $i$ of $A$ with column $j$ of $B$.
+
+In compact notation (see [Reading Math Notation](../reading-math/)):
 
 $$
 C_{ij} = \sum_{k=1}^{p} A_{ik} \times B_{kj}
 $$
 
-That looks abstract. Here's what it means: entry $C_{ij}$ (row $i$, column $j$ of the result) is the dot product of row $i$ of $A$ with column $j$ of $B$.
+This says: "multiply matching elements from row $i$ of $A$ and column $j$ of $B$, then add them up." Let's see it concretely.
 
 **Worked example:**
 

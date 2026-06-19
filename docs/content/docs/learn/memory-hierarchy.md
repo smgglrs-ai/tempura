@@ -5,6 +5,7 @@ weight = 110
 template = "docs/page.html"
 
 [extra]
+part = "hardware"
 toc = true
 math = true
 +++

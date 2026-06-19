@@ -5,6 +5,7 @@ weight = 10
 template = "docs/page.html"
 
 [extra]
+part = "math"
 toc = true
 math = true
 +++
@@ -117,11 +118,19 @@ Let's be very explicit about what happens:
 | 2nd | 4 | 2 | $4 \times 2 = 8$ |
 | | | **Sum:** | **11** |
 
-The general formula for vectors with $n$ components:
+The general formula for vectors with $n$ components — written out in full, then in compact notation (see [Reading Math Notation](../reading-math/) if the symbols are unfamiliar):
 
 $$
-a \cdot b = a_1 b_1 + a_2 b_2 + \cdots + a_n b_n = \sum_{i=1}^{n} a_i b_i
+a \cdot b = a_1 b_1 + a_2 b_2 + \cdots + a_n b_n
 $$
+
+In compact form, $\sum$ means "add up for every value of $i$":
+
+$$
+a \cdot b = \sum_{i=1}^{n} a_i b_i
+$$
+
+Both lines say the same thing: multiply each pair of matching components and add the results.
 
 **Try these yourself:**
 
@@ -180,16 +189,18 @@ This is the heart of the [attention mechanism](../the-transformer/) — and it's
 
 ## Vector length (norm)
 
-How "big" is a vector? Its **length** (also called **norm** or **magnitude**) is computed using the Pythagorean theorem, extended to any number of dimensions:
+How "big" is a vector? Its **length** (also called **norm** or **magnitude**) is computed using the Pythagorean theorem. For a 2D vector $[3, 4]$:
+
+$$
+\text{length} = \sqrt{3 \times 3 + 4 \times 4} = \sqrt{9 + 16} = \sqrt{25} = 5
+$$
+
+If you draw $[3, 4]$ as an arrow from the origin, it's exactly 5 units long — a 3-4-5 right triangle.
+
+The general formula uses the notation $a_i^2$ to mean "$a_i$ multiplied by itself" and $\|a\|$ (double bars) to mean "the length of $a$":
 
 $$
 \|a\| = \sqrt{a_1^2 + a_2^2 + \cdots + a_n^2}
-$$
-
-**For 2D**, this is the familiar distance formula. A vector $[3, 4]$ has length:
-
-$$
-\|[3, 4]\| = \sqrt{3^2 + 4^2} = \sqrt{9 + 16} = \sqrt{25} = 5
 $$
 
 If you draw $[3, 4]$ as an arrow from the origin, it's exactly 5 units long — a 3-4-5 right triangle.

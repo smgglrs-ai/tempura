@@ -5,6 +5,7 @@ weight = 160
 template = "docs/page.html"
 
 [extra]
+part = "kernel-math"
 toc = true
 math = true
 +++

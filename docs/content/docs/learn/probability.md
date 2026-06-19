@@ -5,6 +5,7 @@ weight = 40
 template = "docs/page.html"
 
 [extra]
+part = "math"
 toc = true
 math = true
 +++
@@ -30,13 +31,15 @@ The probabilities tell you how likely each outcome is. To **sample** from a dist
 
 ## Softmax: from scores to probabilities
 
-**Softmax** is the function that converts a vector of arbitrary scores into a probability distribution:
+**Softmax** is the function that converts a vector of arbitrary scores into a probability distribution. The idea: raise $e$ (approximately 2.718) to the power of each score to make everything positive, then divide by the total so the results sum to 1.
+
+In compact notation (see [Reading Math Notation](../reading-math/) if $\sum$ or $e^{z_i}$ are unfamiliar):
 
 $$
 \text{softmax}(z)_i = \frac{e^{z_i}}{\sum_j e^{z_j}}
 $$
 
-Let's compute it step by step for scores $z = [2, 1, 0]$:
+This says: "for each score $z_i$, compute $e^{z_i}$ (the exponential), then divide by the sum of all the exponentials." Let's compute it step by step for scores $z = [2, 1, 0]$:
 
 **Step 1:** Exponentiate each score:
 
