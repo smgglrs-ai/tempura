@@ -10,6 +10,16 @@ pub enum KernelError {
 
 pub type Result<T> = std::result::Result<T, KernelError>;
 
+// ── VerificationTier ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationTier {
+    Compiled,
+    Tested,
+    Proven,
+}
+
 // ── Attention ───────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -28,6 +38,10 @@ pub trait Attention: Send + Sync {
         head_dim: usize,
         scale: f32,
     ) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
 }
 
 // ── MatMul ──────────────────────────────────────────────────────────────────
@@ -52,12 +66,20 @@ pub trait MatMul: Send + Sync {
         n: usize,
         k: usize,
     ) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
 }
 
 // ── RMSNorm ─────────────────────────────────────────────────────────────────
 
 pub trait RMSNorm: Send + Sync {
     fn forward(&self, x: &mut [f32], weight: &[f32], hidden_size: usize, eps: f32) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
 }
 
 // ── RoPE ────────────────────────────────────────────────────────────────────
@@ -74,6 +96,10 @@ pub trait RoPE: Send + Sync {
         positions: &[u32],
         theta: f32,
     ) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
 }
 
 // ── Sampler ─────────────────────────────────────────────────────────────────
@@ -121,6 +147,10 @@ impl SamplingParams {
 pub trait Sampler: Send + Sync {
     fn apply(&self, logits: &[f32], output: &mut [f32], params: &SamplingParams) -> Result<()>;
     fn sample_token(&self, probs: &[f32], rng: Option<&mut dyn RngCore>) -> u32;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
 }
 
 // ── LayerNorm ───────────────────────────────────────────────────────────────
@@ -134,12 +164,20 @@ pub trait LayerNorm: Send + Sync {
         hidden_size: usize,
         eps: f32,
     ) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
 }
 
 // ── AllReduce ───────────────────────────────────────────────────────────────
 
 pub trait AllReduce: Send + Sync {
     fn sum_in_place(&self, data: &mut [f32]) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
 }
 
 // ── KvCacheCompressor ───────────────────────────────────────────────────────

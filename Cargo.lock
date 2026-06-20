@@ -2836,6 +2836,7 @@ name = "tempura-kernel-api"
 version = "0.1.0"
 dependencies = [
  "rand 0.9.4",
+ "serde",
  "thiserror 2.0.18",
 ]
 

@@ -7,6 +7,10 @@ pub struct CpuSampler;
 
 #[cfg(feature = "cpu")]
 impl Sampler for CpuSampler {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Proven
+    }
+
     fn apply(&self, logits: &[f32], output: &mut [f32], params: &SamplingParams) -> Result<()> {
         let vocab_size = logits.len();
 

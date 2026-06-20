@@ -848,3 +848,11 @@
   summary: "Created tempura-kernel-verify crate: DualPipelineRunner comparing any trait impl against reference with configurable epsilon, test generators for Attention/MatMul/RMSNorm/RoPE, VerificationReport with per-kernel pass/fail/tier. 5 new tests, 226 total."
   iteration: 4
   max_iterations: 10
+
+- timestamp: "2026-06-20T12:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p13-tiered-verification"
+  summary: "Added VerificationTier (Compiled/Tested/Proven) to kernel-api, default verification_tier() on all 7 kernel traits, CPU impls return Proven, KernelPipeline computes min(components), InferenceTrace gains pipeline_verification_tier field. 226 tests pass."
+  iteration: 5
+  max_iterations: 10

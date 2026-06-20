@@ -9,6 +9,10 @@ pub struct CpuAttention;
 
 #[cfg(feature = "cpu")]
 impl Attention for CpuAttention {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Proven
+    }
+
     fn forward(
         &self,
         q: &[f32],

@@ -8,3 +8,4 @@ description = "Kernel trait definitions for tempura — the stable contract for 
 [dependencies]
 thiserror = "2"
 rand = "0.9"
+serde = { version = "1", features = ["derive"] }

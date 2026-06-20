@@ -1935,7 +1935,8 @@ items:
     level of verification produced each response. Proven = Kani proofs pass +
     DualPipeline equivalence within epsilon. Tested = DualPipeline equivalence only.
     Compiled = type-checks against traits, no equivalence data.'
-  status: pending
+  status: done
+  progress: 100
   priority: critical
   effort: M
   depends_on:

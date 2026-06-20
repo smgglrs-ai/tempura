@@ -12,13 +12,7 @@ pub struct VerificationReport {
     pub tier: VerificationTier,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VerificationTier {
-    Proven,
-    Tested,
-    Compiled,
-}
+pub use tempura_kernel_api::VerificationTier;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct KernelTestResult {

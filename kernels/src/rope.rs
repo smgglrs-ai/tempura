@@ -9,6 +9,10 @@ pub struct CpuRoPE;
 
 #[cfg(feature = "cpu")]
 impl RoPE for CpuRoPE {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Proven
+    }
+
     fn forward(
         &self,
         x: &mut [f32],

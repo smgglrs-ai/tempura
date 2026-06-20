@@ -6,6 +6,10 @@ pub struct CpuAllReduce;
 
 #[cfg(feature = "cpu")]
 impl AllReduce for CpuAllReduce {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Proven
+    }
+
     fn sum_in_place(&self, _data: &mut [f32]) -> Result<()> {
         Ok(())
     }

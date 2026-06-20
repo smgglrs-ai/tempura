@@ -6,6 +6,10 @@ pub struct CpuLayerNorm;
 
 #[cfg(feature = "cpu")]
 impl LayerNorm for CpuLayerNorm {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Proven
+    }
+
     fn forward(
         &self,
         x: &mut [f32],

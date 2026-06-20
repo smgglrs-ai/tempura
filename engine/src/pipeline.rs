@@ -1,4 +1,4 @@
-use tempura_kernels::{AllReduce, Attention, MatMul, RMSNorm, RoPE, Sampler};
+use tempura_kernels::{AllReduce, Attention, MatMul, RMSNorm, RoPE, Sampler, VerificationTier};
 
 use crate::trace::{LayerSnapshot, NormStats, TraceLevel};
 
@@ -84,6 +84,20 @@ where
     S: Sampler,
     AR: AllReduce,
 {
+    pub fn verification_tier(&self) -> VerificationTier {
+        [
+            self.attention.verification_tier(),
+            self.rmsnorm.verification_tier(),
+            self.rope.verification_tier(),
+            self.matmul.verification_tier(),
+            self.sampler.verification_tier(),
+            self.allreduce.verification_tier(),
+        ]
+        .into_iter()
+        .min()
+        .unwrap_or(VerificationTier::Compiled)
+    }
+
     pub fn allreduce_sum(&self, data: &mut [f32]) -> tempura_kernels::Result<()> {
         self.allreduce.sum_in_place(data)
     }

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tempura_kernel_api::VerificationTier;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +71,8 @@ pub struct InferenceTrace {
     pub layers: Vec<LayerSnapshot>,
     pub sampling_steps: Vec<SamplingSnapshot>,
     pub speculative_steps: Vec<SpeculativeSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_verification_tier: Option<VerificationTier>,
 }
 
 pub const TRACE_MAGIC: [u8; 4] = [0x54, 0x50, 0x52, 0x41]; // "TPRA"
@@ -88,6 +91,7 @@ impl InferenceTrace {
             layers: Vec::new(),
             sampling_steps: Vec::new(),
             speculative_steps: Vec::new(),
+            pipeline_verification_tier: None,
         }
     }
 
