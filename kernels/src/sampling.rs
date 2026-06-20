@@ -1,66 +1,16 @@
 use crate::Result;
+pub use crate::{Sampler, SamplingParams};
 use rand::RngCore;
-
-pub struct SamplingParams {
-    pub temperature: f32,
-    pub top_k: usize,
-    pub top_p: f32,
-    pub presence_penalty: f32,
-    pub frequency_penalty: f32,
-}
-
-impl Default for SamplingParams {
-    fn default() -> Self {
-        Self {
-            temperature: 1.0,
-            top_k: 50,
-            top_p: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-        }
-    }
-}
-
-impl SamplingParams {
-    pub fn apply_penalties(&self, logits: &mut [f32], prior_tokens: &[u32]) {
-        if self.presence_penalty == 0.0 && self.frequency_penalty == 0.0 {
-            return;
-        }
-
-        let mut counts = std::collections::HashMap::new();
-        for &tok in prior_tokens {
-            *counts.entry(tok).or_insert(0u32) += 1;
-        }
-
-        for (&tok, &count) in &counts {
-            if (tok as usize) < logits.len() {
-                logits[tok as usize] -=
-                    self.frequency_penalty * count as f32 + self.presence_penalty;
-            }
-        }
-    }
-}
-
-pub trait Sampler: Send + Sync {
-    /// Apply temperature, top-k, and top-p filtering to logits, then return
-    /// the probability distribution (softmax over filtered logits).
-    ///
-    /// - `logits`: [vocab_size] — raw logits for a single token position
-    /// - `output`: [vocab_size] — filtered probabilities (zeros for pruned tokens)
-    fn apply(&self, logits: &[f32], output: &mut [f32], params: &SamplingParams) -> Result<()>;
-
-    /// Select a token from the probability distribution.
-    ///
-    /// - `probs`: [vocab_size] — probability distribution (from `apply`)
-    /// - `rng`: mutable RNG reference, or None for greedy (argmax)
-    fn sample_token(&self, probs: &[f32], rng: Option<&mut dyn RngCore>) -> u32;
-}
 
 #[cfg(feature = "cpu")]
 pub struct CpuSampler;
 
 #[cfg(feature = "cpu")]
 impl Sampler for CpuSampler {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Proven
+    }
+
     fn apply(&self, logits: &[f32], output: &mut [f32], params: &SamplingParams) -> Result<()> {
         let vocab_size = logits.len();
 

@@ -1,32 +1,18 @@
 use crate::Result;
+pub use crate::RoPE;
 
 #[cfg(feature = "cuda")]
 use cuda_core::DeviceBuffer;
-
-#[allow(clippy::too_many_arguments)]
-pub trait RoPE: Send + Sync {
-    /// Apply rotary position embeddings in-place.
-    ///
-    /// - `x`: [batch, seq_len, num_heads, head_dim]
-    /// - `positions`: [batch, seq_len] — position indices
-    /// - `theta`: base frequency (typically 10000.0)
-    fn forward(
-        &self,
-        x: &mut [f32],
-        batch: usize,
-        seq_len: usize,
-        num_heads: usize,
-        head_dim: usize,
-        positions: &[u32],
-        theta: f32,
-    ) -> Result<()>;
-}
 
 #[cfg(feature = "cpu")]
 pub struct CpuRoPE;
 
 #[cfg(feature = "cpu")]
 impl RoPE for CpuRoPE {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Proven
+    }
+
     fn forward(
         &self,
         x: &mut [f32],

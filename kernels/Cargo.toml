@@ -14,6 +14,7 @@ cpu = []
 cuda = ["dep:cuda-device", "dep:cuda-host", "dep:cuda-core"]
 
 [dependencies]
+tempura-kernel-api = { path = "../kernel-api" }
 thiserror = "2"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }

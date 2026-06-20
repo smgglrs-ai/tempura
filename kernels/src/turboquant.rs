@@ -1,26 +1,5 @@
 use crate::Result;
-
-#[derive(Debug, Clone)]
-pub struct CompressedKV {
-    pub mins: Vec<f32>,
-    pub maxs: Vec<f32>,
-    pub quantized: Vec<u8>,
-    pub num_vectors: usize,
-    pub head_dim: usize,
-    pub group_size: usize,
-    pub bits: u8,
-}
-
-impl CompressedKV {
-    pub fn groups_per_vector(&self) -> usize {
-        self.head_dim.div_ceil(self.group_size)
-    }
-}
-
-pub trait KvCacheCompressor: Send + Sync {
-    fn compress(&self, data: &[f32], head_dim: usize) -> Result<CompressedKV>;
-    fn decompress(&self, compressed: &CompressedKV) -> Result<Vec<f32>>;
-}
+pub use crate::{CompressedKV, KvCacheCompressor};
 
 #[cfg(feature = "cpu")]
 pub struct CpuPolarQuant {

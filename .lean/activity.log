@@ -816,3 +816,80 @@
     - "Hybrid memory management (VRAM ↔ system RAM ↔ converged)"
     - "Tighter SIMD inner loop for Q4K (assembly-level, ~3x gap to llama.cpp)"
     - "Residual+RMSNorm fusion"
+
+- timestamp: "2026-06-20T10:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p12-crate-split"
+  summary: "Split tempura-kernels into tempura-kernel-api (traits only) + tempura-kernels (implementations). 10 traits, 2 types, 8 constants, error enum extracted. 212 tests pass."
+  iteration: 1
+  max_iterations: 10
+
+- timestamp: "2026-06-20T10:30:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p14-trace-serialization"
+  summary: "Added MessagePack binary trace serialization with TPRA magic header, format versioning, to_binary/from_binary methods, GET ?format=binary API support, and 4 new tests. 216 tests pass."
+  iteration: 2
+  max_iterations: 10
+
+- timestamp: "2026-06-20T11:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p14-trace-diff-engine"
+  summary: "Added structured trace diff engine: TraceDiff with None/Numerical/Semantic divergence levels, per-layer NormDiff, per-token comparison, first divergence point, configurable epsilon. 5 new tests, 221 total."
+  iteration: 3
+  max_iterations: 10
+
+- timestamp: "2026-06-20T11:30:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p12-verification-toolkit"
+  summary: "Created tempura-kernel-verify crate: DualPipelineRunner comparing any trait impl against reference with configurable epsilon, test generators for Attention/MatMul/RMSNorm/RoPE, VerificationReport with per-kernel pass/fail/tier. 5 new tests, 226 total."
+  iteration: 4
+  max_iterations: 10
+
+- timestamp: "2026-06-20T12:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p13-tiered-verification"
+  summary: "Added VerificationTier (Compiled/Tested/Proven) to kernel-api, default verification_tier() on all 7 kernel traits, CPU impls return Proven, KernelPipeline computes min(components), InferenceTrace gains pipeline_verification_tier field. 226 tests pass."
+  iteration: 5
+  max_iterations: 10
+
+- timestamp: "2026-06-20T12:30:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p13-agent-friendly-api"
+  summary: "Added machine-readable kernel schema API: SchemaRegistry with all 10 traits, GET /tempura/v1/schema lists all, GET /tempura/v1/schema/{trait} returns per-trait contract with parameter types and descriptions. 4 new tests, 230 total."
+  iteration: 6
+  max_iterations: 10
+
+- timestamp: "2026-06-20T13:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p16-loader-optimization"
+  summary: "Added mmap loading (from_file_mmap, from_dir_mmap via memmap2), SHA-256 integrity manifests (generate_manifest, verify_integrity, IntegrityManifest save/load), integrity error variant. 4 new tests, 234 total."
+  iteration: 7
+  max_iterations: 10
+
+- timestamp: "2026-06-20T13:15:00+02:00"
+  actor: claude
+  action: loop-complete
+  summary: "Loop finished: 7 items completed (p12-crate-split, p12-dyn-inference-model, p14-trace-serialization, p14-trace-diff-engine, p12-verification-toolkit, p13-tiered-verification, p13-agent-friendly-api, p16-loader-optimization) + 1 marked done (e2e-cpu-optimized-kernels). Exit: remaining items all L/XL effort."
+  details:
+    iterations: 7
+    max_iterations: 10
+    completed:
+    - p12-crate-split
+    - p12-dyn-inference-model
+    - p14-trace-serialization
+    - p14-trace-diff-engine
+    - p12-verification-toolkit
+    - p13-tiered-verification
+    - p13-agent-friendly-api
+    - p16-loader-optimization
+    - e2e-cpu-optimized-kernels
+    exit_reason: "Remaining unblocked items all L/XL effort — stopping for review"
+    branch: "loop/2026-06-20"
+    tag: "loop-run/2026-06-20-7"

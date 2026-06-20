@@ -1,22 +1,18 @@
+pub use crate::RMSNorm;
 use crate::Result;
 
 #[cfg(feature = "cuda")]
 use cuda_core::DeviceBuffer;
-
-pub trait RMSNorm: Send + Sync {
-    /// Apply RMS normalization in-place.
-    ///
-    /// - `x`: [batch * seq_len, hidden_size] (flattened)
-    /// - `weight`: [hidden_size] (gamma)
-    /// - `eps`: small constant for numerical stability
-    fn forward(&self, x: &mut [f32], weight: &[f32], hidden_size: usize, eps: f32) -> Result<()>;
-}
 
 #[cfg(feature = "cpu")]
 pub struct CpuRMSNorm;
 
 #[cfg(feature = "cpu")]
 impl RMSNorm for CpuRMSNorm {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Proven
+    }
+
     fn forward(&self, x: &mut [f32], weight: &[f32], hidden_size: usize, eps: f32) -> Result<()> {
         if weight.len() != hidden_size {
             return Err(crate::KernelError::DimensionMismatch {

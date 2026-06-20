@@ -1,0 +1,248 @@
+use rand::RngCore;
+
+#[derive(Debug, thiserror::Error)]
+pub enum KernelError {
+    #[error("dimension mismatch: expected {expected}, got {got}")]
+    DimensionMismatch { expected: usize, got: usize },
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+}
+
+pub type Result<T> = std::result::Result<T, KernelError>;
+
+// ── VerificationTier ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationTier {
+    Compiled,
+    Tested,
+    Proven,
+}
+
+// ── Attention ───────────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+pub trait Attention: Send + Sync {
+    fn forward(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        output: &mut [f32],
+        batch: usize,
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
+}
+
+// ── MatMul ──────────────────────────────────────────────────────────────────
+
+pub trait MatMul: Send + Sync {
+    fn forward(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()>;
+
+    fn forward_b_transposed(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
+}
+
+// ── RMSNorm ─────────────────────────────────────────────────────────────────
+
+pub trait RMSNorm: Send + Sync {
+    fn forward(&self, x: &mut [f32], weight: &[f32], hidden_size: usize, eps: f32) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
+}
+
+// ── RoPE ────────────────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+pub trait RoPE: Send + Sync {
+    fn forward(
+        &self,
+        x: &mut [f32],
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        positions: &[u32],
+        theta: f32,
+    ) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
+}
+
+// ── Sampler ─────────────────────────────────────────────────────────────────
+
+pub struct SamplingParams {
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            temperature: 1.0,
+            top_k: 50,
+            top_p: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+        }
+    }
+}
+
+impl SamplingParams {
+    pub fn apply_penalties(&self, logits: &mut [f32], prior_tokens: &[u32]) {
+        if self.presence_penalty == 0.0 && self.frequency_penalty == 0.0 {
+            return;
+        }
+
+        let mut counts = std::collections::HashMap::new();
+        for &tok in prior_tokens {
+            *counts.entry(tok).or_insert(0u32) += 1;
+        }
+
+        for (&tok, &count) in &counts {
+            if (tok as usize) < logits.len() {
+                logits[tok as usize] -=
+                    self.frequency_penalty * count as f32 + self.presence_penalty;
+            }
+        }
+    }
+}
+
+pub trait Sampler: Send + Sync {
+    fn apply(&self, logits: &[f32], output: &mut [f32], params: &SamplingParams) -> Result<()>;
+    fn sample_token(&self, probs: &[f32], rng: Option<&mut dyn RngCore>) -> u32;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
+}
+
+// ── LayerNorm ───────────────────────────────────────────────────────────────
+
+pub trait LayerNorm: Send + Sync {
+    fn forward(
+        &self,
+        x: &mut [f32],
+        weight: &[f32],
+        bias: Option<&[f32]>,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
+}
+
+// ── AllReduce ───────────────────────────────────────────────────────────────
+
+pub trait AllReduce: Send + Sync {
+    fn sum_in_place(&self, data: &mut [f32]) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
+}
+
+// ── KvCacheCompressor ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct CompressedKV {
+    pub mins: Vec<f32>,
+    pub maxs: Vec<f32>,
+    pub quantized: Vec<u8>,
+    pub num_vectors: usize,
+    pub head_dim: usize,
+    pub group_size: usize,
+    pub bits: u8,
+}
+
+impl CompressedKV {
+    pub fn groups_per_vector(&self) -> usize {
+        self.head_dim.div_ceil(self.group_size)
+    }
+}
+
+pub trait KvCacheCompressor: Send + Sync {
+    fn compress(&self, data: &[f32], head_dim: usize) -> Result<CompressedKV>;
+    fn decompress(&self, compressed: &CompressedKV) -> Result<Vec<f32>>;
+}
+
+// ── MatMulQ (quantized) ─────────────────────────────────────────────────────
+
+pub const Q4K_BLOCK_SIZE: usize = 256;
+pub const Q4K_BLOCK_BYTES: usize = 144;
+pub const Q4K_GROUPS: usize = 8;
+pub const Q4K_GROUP_SIZE: usize = 32;
+
+pub const Q6K_BLOCK_SIZE: usize = 256;
+pub const Q6K_BLOCK_BYTES: usize = 210;
+pub const Q6K_GROUPS: usize = 16;
+pub const Q6K_GROUP_SIZE: usize = 16;
+
+#[allow(clippy::too_many_arguments)]
+pub trait MatMulQ: Send + Sync {
+    fn forward_b_transposed_q4k(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()>;
+
+    fn forward_b_transposed_q6k(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()>;
+}
+
+// ── GuidedDecoder ───────────────────────────────────────────────────────────
+
+pub trait GuidedDecoder: Send {
+    fn mask_logits(&mut self, token_ids_so_far: &[u32], logits: &mut [f32]);
+    fn is_complete(&self) -> bool;
+    fn tokens_masked_last_step(&self) -> usize;
+}

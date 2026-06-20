@@ -1710,7 +1710,8 @@ items:
     DualPipeline — exact match expected since both use the same dequant formula,
     just different accumulation order. Keep CpuMatMulQ4K as the formal verification
     reference; CpuMatMulQ4KOpt is the production CPU path.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: M
   depends_on:
@@ -1835,7 +1836,8 @@ items:
     The API crate contains: Attention, RMSNorm, RoPE, MatMul, Sampler, LayerNorm,
     AllReduce, KvCacheCompressor, GuidedDecoder traits, SamplingParams, CompressedKV,
     KernelError, and Result type.'
-  status: pending
+  status: done
+  progress: 100
   priority: critical
   effort: L
   depends_on:
@@ -1866,7 +1868,8 @@ items:
     TransformerModel<A,N,R,M,S>. This enables multi-model serving and runtime device
     selection without recompilation. The vtable indirection cost is negligible —
     one indirect call (~5ns) per forward() that takes milliseconds.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: M
   scope:
@@ -1894,7 +1897,8 @@ items:
     produce randomized inputs for each kernel trait, (4) a VerificationReport type
     capturing results per-kernel. The goal: implementing a kernel trait and running
     cargo tempura verify gives you a full verification report with zero boilerplate.'
-  status: pending
+  status: done
+  progress: 100
   priority: critical
   effort: L
   depends_on:
@@ -1931,7 +1935,8 @@ items:
     level of verification produced each response. Proven = Kani proofs pass +
     DualPipeline equivalence within epsilon. Tested = DualPipeline equivalence only.
     Compiled = type-checks against traits, no equivalence data.'
-  status: pending
+  status: done
+  progress: 100
   priority: critical
   effort: M
   depends_on:
@@ -1994,7 +1999,8 @@ items:
     VerificationReport. (4) Verification CLI: cargo tempura verify --kernel my-attention
     runs the full suite and outputs JSON. This enables an AI agent workflow: read
     schema → generate implementation → verify → iterate.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: M
   depends_on:
@@ -2026,7 +2032,8 @@ items:
     small enough to store for every production request. Full-level traces (with
     attention matrices) use streaming serialization to avoid memory spikes. Add
     .tempura-trace file extension with a magic number header for format detection.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: M
   scope:
@@ -2055,7 +2062,8 @@ items:
     Output enables bisecting where two inference runs diverge — the core diagnostic
     for comparing kernel implementations, quantization effects, or cross-device
     behavior.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: M
   depends_on:
@@ -2215,7 +2223,8 @@ items:
     tensor shard against a manifest file, track provenance (checkpoint source, format,
     quantization). Reject weights that fail integrity check. No existing crate does
     all three.'
-  status: pending
+  status: done
+  progress: 100
   priority: medium
   effort: M
   scope:

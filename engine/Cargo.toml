@@ -13,12 +13,16 @@ default = []
 cuda = ["tempura-kernels/cuda", "dep:cuda-core"]
 
 [dependencies]
+tempura-kernel-api = { path = "../kernel-api" }
 tempura-kernels = { path = "../kernels" }
 safetensors = "0.5"
 tokenizers = "0.21"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rmp-serde = "1"
+memmap2 = "0.9"
+sha2 = "0.10"
 rand = "0.9"
 rayon = "1"
 minijinja = "2"

@@ -44,6 +44,8 @@ pub fn router() -> Router<AppState> {
         )
         .route("/tempura/v1/compare", post(compare_pipelines))
         .route("/tempura/v1/verified", get(verification_status))
+        .route("/tempura/v1/schema", get(schema_list))
+        .route("/tempura/v1/schema/{trait_name}", get(schema_get))
         .route("/tempura/v1/replay", post(replay))
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health))
@@ -817,12 +819,22 @@ async fn list_traces(State(state): State<AppState>) -> impl IntoResponse {
 async fn get_trace(
     State(state): State<AppState>,
     axum::extract::Path(trace_id): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Response, StatusCode> {
     let store = state.trace_store.lock().await;
-    store
-        .get(&trace_id)
-        .map(|t| Json(t.clone()))
-        .ok_or(StatusCode::NOT_FOUND)
+    let trace = store.get(&trace_id).ok_or(StatusCode::NOT_FOUND)?;
+
+    if params.get("format").map(|s| s.as_str()) == Some("binary") {
+        let binary = trace
+            .to_binary()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(axum::response::Response::builder()
+            .header("content-type", "application/x-tempura-trace")
+            .body(axum::body::Body::from(binary))
+            .unwrap())
+    } else {
+        Ok(Json(trace.clone()).into_response())
+    }
 }
 
 async fn delete_trace(
@@ -881,6 +893,18 @@ async fn compare_pipelines(
 
 async fn verification_status() -> impl IntoResponse {
     Json(tempura_kernels::verification_manifest::manifest())
+}
+
+async fn schema_list() -> impl IntoResponse {
+    Json(tempura_engine::schema::registry())
+}
+
+async fn schema_get(
+    axum::extract::Path(trait_name): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    tempura_engine::schema::get_schema(&trait_name)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn replay(
