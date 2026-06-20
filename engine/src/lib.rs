@@ -30,7 +30,8 @@ pub use model::{InferenceModel, TokenLogprob, TopLogprob, TransformerModel};
 pub use session::InferenceSession;
 pub use tokenizer::{ChatMessageInput, ChatTemplate};
 pub use trace::{
-    InferenceTrace, LayerSnapshot, NormStats, SamplingSnapshot, TimingInfo, TraceLevel,
+    InferenceTrace, LayerSnapshot, NormStats, SamplingSnapshot, TimingInfo, TraceDecodeError,
+    TraceLevel, TRACE_FORMAT_VERSION, TRACE_MAGIC,
 };
 #[cfg(feature = "cuda")]
 pub use weights::GpuWeights;

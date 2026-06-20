@@ -817,12 +817,22 @@ async fn list_traces(State(state): State<AppState>) -> impl IntoResponse {
 async fn get_trace(
     State(state): State<AppState>,
     axum::extract::Path(trace_id): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Response, StatusCode> {
     let store = state.trace_store.lock().await;
-    store
-        .get(&trace_id)
-        .map(|t| Json(t.clone()))
-        .ok_or(StatusCode::NOT_FOUND)
+    let trace = store.get(&trace_id).ok_or(StatusCode::NOT_FOUND)?;
+
+    if params.get("format").map(|s| s.as_str()) == Some("binary") {
+        let binary = trace
+            .to_binary()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        Ok(axum::response::Response::builder()
+            .header("content-type", "application/x-tempura-trace")
+            .body(axum::body::Body::from(binary))
+            .unwrap())
+    } else {
+        Ok(Json(trace.clone()).into_response())
+    }
 }
 
 async fn delete_trace(

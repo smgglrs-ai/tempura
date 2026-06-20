@@ -824,3 +824,11 @@
   summary: "Split tempura-kernels into tempura-kernel-api (traits only) + tempura-kernels (implementations). 10 traits, 2 types, 8 constants, error enum extracted. 212 tests pass."
   iteration: 1
   max_iterations: 10
+
+- timestamp: "2026-06-20T10:30:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p14-trace-serialization"
+  summary: "Added MessagePack binary trace serialization with TPRA magic header, format versioning, to_binary/from_binary methods, GET ?format=binary API support, and 4 new tests. 216 tests pass."
+  iteration: 2
+  max_iterations: 10

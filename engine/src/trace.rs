@@ -72,6 +72,9 @@ pub struct InferenceTrace {
     pub speculative_steps: Vec<SpeculativeSnapshot>,
 }
 
+pub const TRACE_MAGIC: [u8; 4] = [0x54, 0x50, 0x52, 0x41]; // "TPRA"
+pub const TRACE_FORMAT_VERSION: u8 = 1;
+
 impl InferenceTrace {
     pub fn new(trace_id: String, level: TraceLevel, model_id: String, seed: u64) -> Self {
         Self {
@@ -87,7 +90,50 @@ impl InferenceTrace {
             speculative_steps: Vec::new(),
         }
     }
+
+    pub fn to_binary(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+        let payload = rmp_serde::to_vec(self)?;
+        let mut buf = Vec::with_capacity(5 + payload.len());
+        buf.extend_from_slice(&TRACE_MAGIC);
+        buf.push(TRACE_FORMAT_VERSION);
+        buf.extend_from_slice(&payload);
+        Ok(buf)
+    }
+
+    pub fn from_binary(data: &[u8]) -> Result<Self, TraceDecodeError> {
+        if data.len() < 5 {
+            return Err(TraceDecodeError::TooShort);
+        }
+        if data[0..4] != TRACE_MAGIC {
+            return Err(TraceDecodeError::BadMagic);
+        }
+        if data[4] != TRACE_FORMAT_VERSION {
+            return Err(TraceDecodeError::UnsupportedVersion(data[4]));
+        }
+        rmp_serde::from_slice(&data[5..]).map_err(TraceDecodeError::Decode)
+    }
 }
+
+#[derive(Debug)]
+pub enum TraceDecodeError {
+    TooShort,
+    BadMagic,
+    UnsupportedVersion(u8),
+    Decode(rmp_serde::decode::Error),
+}
+
+impl std::fmt::Display for TraceDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort => write!(f, "trace data too short (need at least 5 bytes)"),
+            Self::BadMagic => write!(f, "invalid trace magic (expected TPRA)"),
+            Self::UnsupportedVersion(v) => write!(f, "unsupported trace format version {v}"),
+            Self::Decode(e) => write!(f, "trace decode error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for TraceDecodeError {}
 
 #[cfg(test)]
 mod tests {
@@ -174,5 +220,90 @@ mod tests {
         assert!(restored.layers.is_empty());
         assert!(restored.sampling_steps.is_empty());
         assert!(restored.timing.is_none());
+    }
+
+    #[test]
+    fn test_binary_round_trip() {
+        let mut trace = InferenceTrace::new(
+            "bin-001".to_string(),
+            TraceLevel::Summary,
+            "test-model".to_string(),
+            99,
+        );
+        trace.prompt_tokens = 20;
+        trace.generated_tokens = 10;
+        trace.timing = Some(TimingInfo {
+            total_ms: 200.0,
+            prompt_ms: 80.0,
+            generation_ms: 120.0,
+            tokens_per_second: 83.3,
+        });
+        trace.layers.push(LayerSnapshot {
+            layer_index: 0,
+            pre_norm: Some(NormStats {
+                mean: 0.5,
+                variance: 0.1,
+                max_abs: 2.0,
+            }),
+            post_norm: None,
+            attention_scores: None,
+            duration: Some(Duration::from_micros(750)),
+        });
+        trace.sampling_steps.push(SamplingSnapshot {
+            step: 0,
+            top_logits: vec![(10, 5.0), (20, 3.0)],
+            top_probs: vec![(10, 0.8), (20, 0.15)],
+            selected_token: 10,
+            temperature: 1.0,
+            top_k: 40,
+            top_p: 0.95,
+            rng_seed: 99,
+            tokens_masked: Some(5),
+        });
+
+        let binary = trace.to_binary().expect("to_binary");
+        assert_eq!(&binary[0..4], &TRACE_MAGIC);
+        assert_eq!(binary[4], TRACE_FORMAT_VERSION);
+
+        let restored = InferenceTrace::from_binary(&binary).expect("from_binary");
+        assert_eq!(restored.trace_id, "bin-001");
+        assert_eq!(restored.level, TraceLevel::Summary);
+        assert_eq!(restored.prompt_tokens, 20);
+        assert_eq!(restored.generated_tokens, 10);
+        assert_eq!(restored.seed, 99);
+        assert_eq!(restored.layers.len(), 1);
+        assert_eq!(restored.sampling_steps.len(), 1);
+        assert_eq!(restored.sampling_steps[0].tokens_masked, Some(5));
+        assert!(restored.timing.is_some());
+
+        let json = serde_json::to_string(&trace).expect("json");
+        assert!(binary.len() < json.len());
+    }
+
+    #[test]
+    fn test_binary_bad_magic() {
+        let data = [0x00, 0x00, 0x00, 0x00, 0x01];
+        assert!(matches!(
+            InferenceTrace::from_binary(&data),
+            Err(TraceDecodeError::BadMagic)
+        ));
+    }
+
+    #[test]
+    fn test_binary_too_short() {
+        let data = [0x54, 0x50, 0x52];
+        assert!(matches!(
+            InferenceTrace::from_binary(&data),
+            Err(TraceDecodeError::TooShort)
+        ));
+    }
+
+    #[test]
+    fn test_binary_unsupported_version() {
+        let data = [0x54, 0x50, 0x52, 0x41, 0xFF];
+        assert!(matches!(
+            InferenceTrace::from_binary(&data),
+            Err(TraceDecodeError::UnsupportedVersion(0xFF))
+        ));
     }
 }

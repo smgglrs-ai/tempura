@@ -1867,7 +1867,8 @@ items:
     TransformerModel<A,N,R,M,S>. This enables multi-model serving and runtime device
     selection without recompilation. The vtable indirection cost is negligible —
     one indirect call (~5ns) per forward() that takes milliseconds.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: M
   scope:
@@ -2027,7 +2028,8 @@ items:
     small enough to store for every production request. Full-level traces (with
     attention matrices) use streaming serialization to avoid memory spikes. Add
     .tempura-trace file extension with a magic number header for format detection.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: M
   scope:
