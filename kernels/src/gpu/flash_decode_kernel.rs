@@ -246,8 +246,7 @@ pub mod kernels {
         // Write partial results to global memory
         // Layout: partials[batch][head][split][0..head_dim+2]
         let stride = hd + 2;
-        let partial_base =
-            ((batch_idx * nh + head_idx) * n_splits + split_idx) * stride;
+        let partial_base = ((batch_idx * nh + head_idx) * n_splits + split_idx) * stride;
 
         // Each thread writes its 4 dims of output
         qi = 0;

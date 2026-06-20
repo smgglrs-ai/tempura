@@ -488,7 +488,12 @@ pub mod kernels {
                     }
 
                     let base = ci * 4;
-                    let mut tmp = [o_acc[base], o_acc[base + 1], o_acc[base + 2], o_acc[base + 3]];
+                    let mut tmp = [
+                        o_acc[base],
+                        o_acc[base + 1],
+                        o_acc[base + 2],
+                        o_acc[base + 3],
+                    ];
                     unsafe {
                         cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(
                             &mut tmp, &p_frag, &v_frag,
@@ -748,8 +753,16 @@ pub mod kernels {
             // Scale + causal mask
             let global_q_row_0 = q_row_start + warp_row_base + group_id;
             let global_q_row_1 = q_row_start + warp_row_base + group_id + 8;
-            let limit_0 = if global_q_row_0 < sl { cache_offset + global_q_row_0 } else { 0 };
-            let limit_1 = if global_q_row_1 < sl { cache_offset + global_q_row_1 } else { 0 };
+            let limit_0 = if global_q_row_0 < sl {
+                cache_offset + global_q_row_0
+            } else {
+                0
+            };
+            let limit_1 = if global_q_row_1 < sl {
+                cache_offset + global_q_row_1
+            } else {
+                0
+            };
 
             let mut ni = 0usize;
             while ni < 8 {
@@ -794,8 +807,16 @@ pub mod kernels {
 
             let new_max_0 = max_f32(row_max_0, local_max_0);
             let new_max_1 = max_f32(row_max_1, local_max_1);
-            let correction_0 = if row_max_0 > f32::NEG_INFINITY { exp_f32(row_max_0 - new_max_0) } else { 0.0 };
-            let correction_1 = if row_max_1 > f32::NEG_INFINITY { exp_f32(row_max_1 - new_max_1) } else { 0.0 };
+            let correction_0 = if row_max_0 > f32::NEG_INFINITY {
+                exp_f32(row_max_0 - new_max_0)
+            } else {
+                0.0
+            };
+            let correction_1 = if row_max_1 > f32::NEG_INFINITY {
+                exp_f32(row_max_1 - new_max_1)
+            } else {
+                0.0
+            };
 
             let mut ci = 0usize;
             while ci < 16 {
@@ -814,10 +835,26 @@ pub mod kernels {
             ni = 0;
             while ni < 8 {
                 let base = ni * 4;
-                s_acc[base] = if s_acc[base] > f32::NEG_INFINITY { exp_f32(s_acc[base] - new_max_0) } else { 0.0 };
-                s_acc[base + 1] = if s_acc[base + 1] > f32::NEG_INFINITY { exp_f32(s_acc[base + 1] - new_max_0) } else { 0.0 };
-                s_acc[base + 2] = if s_acc[base + 2] > f32::NEG_INFINITY { exp_f32(s_acc[base + 2] - new_max_1) } else { 0.0 };
-                s_acc[base + 3] = if s_acc[base + 3] > f32::NEG_INFINITY { exp_f32(s_acc[base + 3] - new_max_1) } else { 0.0 };
+                s_acc[base] = if s_acc[base] > f32::NEG_INFINITY {
+                    exp_f32(s_acc[base] - new_max_0)
+                } else {
+                    0.0
+                };
+                s_acc[base + 1] = if s_acc[base + 1] > f32::NEG_INFINITY {
+                    exp_f32(s_acc[base + 1] - new_max_0)
+                } else {
+                    0.0
+                };
+                s_acc[base + 2] = if s_acc[base + 2] > f32::NEG_INFINITY {
+                    exp_f32(s_acc[base + 2] - new_max_1)
+                } else {
+                    0.0
+                };
+                s_acc[base + 3] = if s_acc[base + 3] > f32::NEG_INFINITY {
+                    exp_f32(s_acc[base + 3] - new_max_1)
+                } else {
+                    0.0
+                };
                 local_sum_0 += s_acc[base] + s_acc[base + 1];
                 local_sum_1 += s_acc[base + 2] + s_acc[base + 3];
                 ni += 1;
@@ -917,7 +954,12 @@ pub mod kernels {
                     }
 
                     let base = ci * 4;
-                    let mut tmp = [o_acc[base], o_acc[base + 1], o_acc[base + 2], o_acc[base + 3]];
+                    let mut tmp = [
+                        o_acc[base],
+                        o_acc[base + 1],
+                        o_acc[base + 2],
+                        o_acc[base + 3],
+                    ];
                     unsafe {
                         cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(
                             &mut tmp, &p_frag, &v_frag,
@@ -937,8 +979,16 @@ pub mod kernels {
         }
 
         // --- Phase 4: Finalize ---
-        let inv_sum_0 = if row_sum_0 > 0.0 { 1.0 / row_sum_0 } else { 0.0 };
-        let inv_sum_1 = if row_sum_1 > 0.0 { 1.0 / row_sum_1 } else { 0.0 };
+        let inv_sum_0 = if row_sum_0 > 0.0 {
+            1.0 / row_sum_0
+        } else {
+            0.0
+        };
+        let inv_sum_1 = if row_sum_1 > 0.0 {
+            1.0 / row_sum_1
+        } else {
+            0.0
+        };
 
         let mut ci = 0usize;
         while ci < 16 {
@@ -961,19 +1011,27 @@ pub mod kernels {
 
             if r0 < sl && c0 < hd {
                 let out_idx = ((batch_idx * sl + r0) * nh + head_idx) * hd + c0;
-                unsafe { *output.get_unchecked_mut(out_idx) = o_acc[base]; }
+                unsafe {
+                    *output.get_unchecked_mut(out_idx) = o_acc[base];
+                }
             }
             if r0 < sl && c1 < hd {
                 let out_idx = ((batch_idx * sl + r0) * nh + head_idx) * hd + c1;
-                unsafe { *output.get_unchecked_mut(out_idx) = o_acc[base + 1]; }
+                unsafe {
+                    *output.get_unchecked_mut(out_idx) = o_acc[base + 1];
+                }
             }
             if r1 < sl && c0 < hd {
                 let out_idx = ((batch_idx * sl + r1) * nh + head_idx) * hd + c0;
-                unsafe { *output.get_unchecked_mut(out_idx) = o_acc[base + 2]; }
+                unsafe {
+                    *output.get_unchecked_mut(out_idx) = o_acc[base + 2];
+                }
             }
             if r1 < sl && c1 < hd {
                 let out_idx = ((batch_idx * sl + r1) * nh + head_idx) * hd + c1;
-                unsafe { *output.get_unchecked_mut(out_idx) = o_acc[base + 3]; }
+                unsafe {
+                    *output.get_unchecked_mut(out_idx) = o_acc[base + 3];
+                }
             }
             ci += 1;
         }

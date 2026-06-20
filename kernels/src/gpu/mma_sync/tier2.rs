@@ -5,7 +5,6 @@
 ///
 /// m16n8k32 for FP8/FP6, m16n8k64 for FP4.
 /// Per-thread fragments: D[4×f32], A[4×u32], B[2×u32], C[4×f32].
-
 use cuda_device::ptx_asm;
 
 // --- FP8 (E4M3) variants ---

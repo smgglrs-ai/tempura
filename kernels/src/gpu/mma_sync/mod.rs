@@ -15,7 +15,6 @@
 /// - C (accumulator): 4 × f32 per thread
 ///
 /// Block-scaled variants (Tier 3-4) add scale factor operands.
-
 pub mod tier1;
 pub mod tier2;
 pub mod tier3;

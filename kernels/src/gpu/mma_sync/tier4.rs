@@ -5,7 +5,6 @@
 /// (vs MXFP4's E8M0 with block size 32).
 ///
 /// Compilation requires: `-gencode arch=compute_120a,code=sm_120a`
-
 use cuda_device::ptx_asm;
 
 /// NVFP4 with E4M3 scales, block size 16.

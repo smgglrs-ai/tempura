@@ -110,16 +110,40 @@ pub mod kernels {
                 // PTX ISA Fig.78: reg order is {a0,a1}=top/K0, {a2,a3}=bot/K0,
                 // {a4,a5}=top/K1, {a6,a7}=bot/K1. Pack swaps: odd col first.
                 a_frag_top = [
-                    pack_f16x2(A_TILE[at_r0 * MMA_K + tid * 2 + 1], A_TILE[at_r0 * MMA_K + tid * 2]),
-                    pack_f16x2(A_TILE[at_r1 * MMA_K + tid * 2 + 1], A_TILE[at_r1 * MMA_K + tid * 2]),
-                    pack_f16x2(A_TILE[at_r0 * MMA_K + tid * 2 + 9], A_TILE[at_r0 * MMA_K + tid * 2 + 8]),
-                    pack_f16x2(A_TILE[at_r1 * MMA_K + tid * 2 + 9], A_TILE[at_r1 * MMA_K + tid * 2 + 8]),
+                    pack_f16x2(
+                        A_TILE[at_r0 * MMA_K + tid * 2 + 1],
+                        A_TILE[at_r0 * MMA_K + tid * 2],
+                    ),
+                    pack_f16x2(
+                        A_TILE[at_r1 * MMA_K + tid * 2 + 1],
+                        A_TILE[at_r1 * MMA_K + tid * 2],
+                    ),
+                    pack_f16x2(
+                        A_TILE[at_r0 * MMA_K + tid * 2 + 9],
+                        A_TILE[at_r0 * MMA_K + tid * 2 + 8],
+                    ),
+                    pack_f16x2(
+                        A_TILE[at_r1 * MMA_K + tid * 2 + 9],
+                        A_TILE[at_r1 * MMA_K + tid * 2 + 8],
+                    ),
                 ];
                 a_frag_bot = [
-                    pack_f16x2(A_TILE[ab_r0 * MMA_K + tid * 2 + 1], A_TILE[ab_r0 * MMA_K + tid * 2]),
-                    pack_f16x2(A_TILE[ab_r1 * MMA_K + tid * 2 + 1], A_TILE[ab_r1 * MMA_K + tid * 2]),
-                    pack_f16x2(A_TILE[ab_r0 * MMA_K + tid * 2 + 9], A_TILE[ab_r0 * MMA_K + tid * 2 + 8]),
-                    pack_f16x2(A_TILE[ab_r1 * MMA_K + tid * 2 + 9], A_TILE[ab_r1 * MMA_K + tid * 2 + 8]),
+                    pack_f16x2(
+                        A_TILE[ab_r0 * MMA_K + tid * 2 + 1],
+                        A_TILE[ab_r0 * MMA_K + tid * 2],
+                    ),
+                    pack_f16x2(
+                        A_TILE[ab_r1 * MMA_K + tid * 2 + 1],
+                        A_TILE[ab_r1 * MMA_K + tid * 2],
+                    ),
+                    pack_f16x2(
+                        A_TILE[ab_r0 * MMA_K + tid * 2 + 9],
+                        A_TILE[ab_r0 * MMA_K + tid * 2 + 8],
+                    ),
+                    pack_f16x2(
+                        A_TILE[ab_r1 * MMA_K + tid * 2 + 9],
+                        A_TILE[ab_r1 * MMA_K + tid * 2 + 8],
+                    ),
                 ];
             }
 
@@ -131,7 +155,10 @@ pub mod kernels {
                 unsafe {
                     b_frags[ni] = [
                         pack_f16x2(B_TILE[n * MMA_K + tid * 2 + 1], B_TILE[n * MMA_K + tid * 2]),
-                        pack_f16x2(B_TILE[n * MMA_K + tid * 2 + 9], B_TILE[n * MMA_K + tid * 2 + 8]),
+                        pack_f16x2(
+                            B_TILE[n * MMA_K + tid * 2 + 9],
+                            B_TILE[n * MMA_K + tid * 2 + 8],
+                        ),
                     ];
                 }
                 ni += 1;
@@ -139,14 +166,46 @@ pub mod kernels {
 
             // Issue 8 MMA ops via compiler intrinsic (proper register allocation)
             unsafe {
-                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(&mut acc_t0, &a_frag_top, &b_frags[0]);
-                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(&mut acc_t1, &a_frag_top, &b_frags[1]);
-                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(&mut acc_t2, &a_frag_top, &b_frags[2]);
-                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(&mut acc_t3, &a_frag_top, &b_frags[3]);
-                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(&mut acc_b0, &a_frag_bot, &b_frags[0]);
-                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(&mut acc_b1, &a_frag_bot, &b_frags[1]);
-                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(&mut acc_b2, &a_frag_bot, &b_frags[2]);
-                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(&mut acc_b3, &a_frag_bot, &b_frags[3]);
+                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(
+                    &mut acc_t0,
+                    &a_frag_top,
+                    &b_frags[0],
+                );
+                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(
+                    &mut acc_t1,
+                    &a_frag_top,
+                    &b_frags[1],
+                );
+                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(
+                    &mut acc_t2,
+                    &a_frag_top,
+                    &b_frags[2],
+                );
+                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(
+                    &mut acc_t3,
+                    &a_frag_top,
+                    &b_frags[3],
+                );
+                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(
+                    &mut acc_b0,
+                    &a_frag_bot,
+                    &b_frags[0],
+                );
+                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(
+                    &mut acc_b1,
+                    &a_frag_bot,
+                    &b_frags[1],
+                );
+                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(
+                    &mut acc_b2,
+                    &a_frag_bot,
+                    &b_frags[2],
+                );
+                cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(
+                    &mut acc_b3,
+                    &a_frag_bot,
+                    &b_frags[3],
+                );
             }
 
             thread::sync_threads();
@@ -161,17 +220,32 @@ pub mod kernels {
         // its lane_id within the warp. groupID and tid partition the 16×8 output
         // tile without overlap, and the CTA-level row/col offsets are block-unique.
         unsafe {
-            write_acc(&mut c, &acc_t0, row_start, col_start, 0, 0, group_id, tid, m_size, n_size);
-            write_acc(&mut c, &acc_t1, row_start, col_start, 0, 8, group_id, tid, m_size, n_size);
-            write_acc(&mut c, &acc_t2, row_start, col_start, 0, 16, group_id, tid, m_size, n_size);
-            write_acc(&mut c, &acc_t3, row_start, col_start, 0, 24, group_id, tid, m_size, n_size);
-            write_acc(&mut c, &acc_b0, row_start, col_start, 16, 0, group_id, tid, m_size, n_size);
-            write_acc(&mut c, &acc_b1, row_start, col_start, 16, 8, group_id, tid, m_size, n_size);
-            write_acc(&mut c, &acc_b2, row_start, col_start, 16, 16, group_id, tid, m_size, n_size);
-            write_acc(&mut c, &acc_b3, row_start, col_start, 16, 24, group_id, tid, m_size, n_size);
+            write_acc(
+                &mut c, &acc_t0, row_start, col_start, 0, 0, group_id, tid, m_size, n_size,
+            );
+            write_acc(
+                &mut c, &acc_t1, row_start, col_start, 0, 8, group_id, tid, m_size, n_size,
+            );
+            write_acc(
+                &mut c, &acc_t2, row_start, col_start, 0, 16, group_id, tid, m_size, n_size,
+            );
+            write_acc(
+                &mut c, &acc_t3, row_start, col_start, 0, 24, group_id, tid, m_size, n_size,
+            );
+            write_acc(
+                &mut c, &acc_b0, row_start, col_start, 16, 0, group_id, tid, m_size, n_size,
+            );
+            write_acc(
+                &mut c, &acc_b1, row_start, col_start, 16, 8, group_id, tid, m_size, n_size,
+            );
+            write_acc(
+                &mut c, &acc_b2, row_start, col_start, 16, 16, group_id, tid, m_size, n_size,
+            );
+            write_acc(
+                &mut c, &acc_b3, row_start, col_start, 16, 24, group_id, tid, m_size, n_size,
+            );
         }
     }
-
 
     /// SAFETY: caller must ensure (row_start + row_offset + groupID{+8}, col_start + col_offset + tid*2{+1})
     /// positions are unique per thread across all write_acc calls for this CTA.

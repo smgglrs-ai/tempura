@@ -8,7 +8,6 @@
 ///
 /// Compilation requires: `-gencode arch=compute_120a,code=sm_120a`
 /// (or sm_121a for GB10/GX10).
-
 use cuda_device::ptx_asm;
 
 /// Block-scaled FP8 × FP8.

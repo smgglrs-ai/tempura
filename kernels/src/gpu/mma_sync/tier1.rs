@@ -3,7 +3,6 @@
 /// m16n8k16 for f16/bf16, m16n8k8 for tf32.
 /// Per-thread fragments: D[4×f32], A[4×u32], B[2×u32], C[4×f32].
 /// (tf32 uses A[2×u32], B[1×u32] with k=8.)
-
 use cuda_device::ptx_asm;
 
 /// mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
