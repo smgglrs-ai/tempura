@@ -832,3 +832,11 @@
   summary: "Added MessagePack binary trace serialization with TPRA magic header, format versioning, to_binary/from_binary methods, GET ?format=binary API support, and 4 new tests. 216 tests pass."
   iteration: 2
   max_iterations: 10
+
+- timestamp: "2026-06-20T11:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p14-trace-diff-engine"
+  summary: "Added structured trace diff engine: TraceDiff with None/Numerical/Semantic divergence levels, per-layer NormDiff, per-token comparison, first divergence point, configurable epsilon. 5 new tests, 221 total."
+  iteration: 3
+  max_iterations: 10

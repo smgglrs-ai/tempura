@@ -14,6 +14,7 @@ pub mod speculative;
 pub mod tokenizer;
 pub mod tool_call;
 pub mod trace;
+pub mod trace_diff;
 pub mod weights;
 
 pub use config::{ConfigError, ModelConfig, QuantConfig, QuantFormat};
@@ -33,6 +34,7 @@ pub use trace::{
     InferenceTrace, LayerSnapshot, NormStats, SamplingSnapshot, TimingInfo, TraceDecodeError,
     TraceLevel, TRACE_FORMAT_VERSION, TRACE_MAGIC,
 };
+pub use trace_diff::{diff_traces, DivergenceLevel, TraceDiff};
 #[cfg(feature = "cuda")]
 pub use weights::GpuWeights;
 pub use weights::{ModelWeights, QuantizedWeights};

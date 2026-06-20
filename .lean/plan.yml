@@ -2058,7 +2058,8 @@ items:
     Output enables bisecting where two inference runs diverge — the core diagnostic
     for comparing kernel implementations, quantization effects, or cross-device
     behavior.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: M
   depends_on:
