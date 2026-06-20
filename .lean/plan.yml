@@ -1999,7 +1999,8 @@ items:
     VerificationReport. (4) Verification CLI: cargo tempura verify --kernel my-attention
     runs the full suite and outputs JSON. This enables an AI agent workflow: read
     schema → generate implementation → verify → iterate.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: M
   depends_on:

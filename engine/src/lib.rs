@@ -9,6 +9,7 @@ pub mod kv_cache;
 pub mod loader;
 pub mod model;
 pub mod pipeline;
+pub mod schema;
 pub mod session;
 pub mod speculative;
 pub mod tokenizer;

@@ -44,6 +44,8 @@ pub fn router() -> Router<AppState> {
         )
         .route("/tempura/v1/compare", post(compare_pipelines))
         .route("/tempura/v1/verified", get(verification_status))
+        .route("/tempura/v1/schema", get(schema_list))
+        .route("/tempura/v1/schema/{trait_name}", get(schema_get))
         .route("/tempura/v1/replay", post(replay))
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health))
@@ -891,6 +893,18 @@ async fn compare_pipelines(
 
 async fn verification_status() -> impl IntoResponse {
     Json(tempura_kernels::verification_manifest::manifest())
+}
+
+async fn schema_list() -> impl IntoResponse {
+    Json(tempura_engine::schema::registry())
+}
+
+async fn schema_get(
+    axum::extract::Path(trait_name): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    tempura_engine::schema::get_schema(&trait_name)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn replay(

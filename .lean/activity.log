@@ -856,3 +856,11 @@
   summary: "Added VerificationTier (Compiled/Tested/Proven) to kernel-api, default verification_tier() on all 7 kernel traits, CPU impls return Proven, KernelPipeline computes min(components), InferenceTrace gains pipeline_verification_tier field. 226 tests pass."
   iteration: 5
   max_iterations: 10
+
+- timestamp: "2026-06-20T12:30:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p13-agent-friendly-api"
+  summary: "Added machine-readable kernel schema API: SchemaRegistry with all 10 traits, GET /tempura/v1/schema lists all, GET /tempura/v1/schema/{trait} returns per-trait contract with parameter types and descriptions. 4 new tests, 230 total."
+  iteration: 6
+  max_iterations: 10
