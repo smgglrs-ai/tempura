@@ -2223,7 +2223,8 @@ items:
     tensor shard against a manifest file, track provenance (checkpoint source, format,
     quantization). Reject weights that fail integrity check. No existing crate does
     all three.'
-  status: pending
+  status: done
+  progress: 100
   priority: medium
   effort: M
   scope:

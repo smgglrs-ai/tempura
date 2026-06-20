@@ -864,3 +864,11 @@
   summary: "Added machine-readable kernel schema API: SchemaRegistry with all 10 traits, GET /tempura/v1/schema lists all, GET /tempura/v1/schema/{trait} returns per-trait contract with parameter types and descriptions. 4 new tests, 230 total."
   iteration: 6
   max_iterations: 10
+
+- timestamp: "2026-06-20T13:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p16-loader-optimization"
+  summary: "Added mmap loading (from_file_mmap, from_dir_mmap via memmap2), SHA-256 integrity manifests (generate_manifest, verify_integrity, IntegrityManifest save/load), integrity error variant. 4 new tests, 234 total."
+  iteration: 7
+  max_iterations: 10

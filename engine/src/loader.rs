@@ -19,6 +19,12 @@ pub enum LoadError {
     NoFiles,
     #[error("GGUF parse error: {0}")]
     GgufParse(String),
+    #[error("integrity check failed for tensor {name}: expected {expected}, got {got}")]
+    IntegrityMismatch {
+        name: String,
+        expected: String,
+        got: String,
+    },
 }
 
 pub trait WeightLoader {
@@ -28,6 +34,25 @@ pub trait WeightLoader {
 
 pub struct SafetensorsLoader {
     tensors: HashMap<String, Vec<f32>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IntegrityManifest {
+    pub tensor_hashes: HashMap<String, String>,
+}
+
+impl IntegrityManifest {
+    pub fn from_file(path: &Path) -> Result<Self, LoadError> {
+        let data = std::fs::read_to_string(path)?;
+        serde_json::from_str(&data).map_err(|e| LoadError::GgufParse(e.to_string()))
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), LoadError> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| LoadError::GgufParse(e.to_string()))?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
 }
 
 fn bf16_to_f32(bits: u16) -> f32 {
@@ -72,7 +97,23 @@ impl SafetensorsLoader {
         Ok(Self { tensors })
     }
 
+    pub fn from_file_mmap(path: &Path) -> Result<Self, LoadError> {
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let mut tensors = HashMap::new();
+        Self::load_tensors_from_bytes(&mmap, &mut tensors)?;
+        Ok(Self { tensors })
+    }
+
     pub fn from_dir(dir: &Path) -> Result<Self, LoadError> {
+        Self::from_dir_impl(dir, false)
+    }
+
+    pub fn from_dir_mmap(dir: &Path) -> Result<Self, LoadError> {
+        Self::from_dir_impl(dir, true)
+    }
+
+    fn from_dir_impl(dir: &Path, use_mmap: bool) -> Result<Self, LoadError> {
         let mut paths: Vec<_> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -87,11 +128,52 @@ impl SafetensorsLoader {
 
         let mut tensors = HashMap::new();
         for path in &paths {
-            let data = std::fs::read(path)?;
-            Self::load_tensors_from_bytes(&data, &mut tensors)?;
+            if use_mmap {
+                let file = std::fs::File::open(path)?;
+                let mmap = unsafe { memmap2::Mmap::map(&file)? };
+                Self::load_tensors_from_bytes(&mmap, &mut tensors)?;
+            } else {
+                let data = std::fs::read(path)?;
+                Self::load_tensors_from_bytes(&data, &mut tensors)?;
+            }
         }
 
         Ok(Self { tensors })
+    }
+
+    pub fn verify_integrity(&self, manifest: &IntegrityManifest) -> Result<(), LoadError> {
+        use sha2::{Digest, Sha256};
+        for (name, expected_hash) in &manifest.tensor_hashes {
+            let tensor = self
+                .tensors
+                .get(name.as_str())
+                .ok_or_else(|| LoadError::MissingTensor(name.clone()))?;
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(tensor.as_ptr() as *const u8, tensor.len() * 4) };
+            let got = format!("{:x}", Sha256::digest(bytes));
+            if got != *expected_hash {
+                return Err(LoadError::IntegrityMismatch {
+                    name: name.clone(),
+                    expected: expected_hash.clone(),
+                    got,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn generate_manifest(&self) -> IntegrityManifest {
+        use sha2::{Digest, Sha256};
+        let mut hashes = HashMap::new();
+        for (name, tensor) in &self.tensors {
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(tensor.as_ptr() as *const u8, tensor.len() * 4) };
+            let hash = format!("{:x}", Sha256::digest(bytes));
+            hashes.insert(name.clone(), hash);
+        }
+        IntegrityManifest {
+            tensor_hashes: hashes,
+        }
     }
 
     fn load_tensors_from_bytes(
@@ -192,5 +274,79 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = SafetensorsLoader::from_dir(dir.path());
         assert!(matches!(result, Err(LoadError::NoFiles)));
+    }
+
+    #[test]
+    fn from_file_mmap_matches_regular_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = HashMap::new();
+        t.insert("weight_a", vec![1.0f32, 2.0, 3.0, 4.0]);
+        t.insert("weight_b", vec![5.0f32, 6.0]);
+        write_safetensors(dir.path(), "model.safetensors", &t);
+
+        let regular = SafetensorsLoader::from_file(&dir.path().join("model.safetensors")).unwrap();
+        let mmap = SafetensorsLoader::from_file_mmap(&dir.path().join("model.safetensors")).unwrap();
+
+        assert_eq!(
+            regular.load_tensor("weight_a").unwrap(),
+            mmap.load_tensor("weight_a").unwrap()
+        );
+        assert_eq!(
+            regular.load_tensor("weight_b").unwrap(),
+            mmap.load_tensor("weight_b").unwrap()
+        );
+    }
+
+    #[test]
+    fn from_dir_mmap_loads_all_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t1 = HashMap::new();
+        t1.insert("a", vec![1.0f32, 2.0]);
+        write_safetensors(dir.path(), "shard-01.safetensors", &t1);
+
+        let mut t2 = HashMap::new();
+        t2.insert("b", vec![3.0f32, 4.0]);
+        write_safetensors(dir.path(), "shard-02.safetensors", &t2);
+
+        let loader = SafetensorsLoader::from_dir_mmap(dir.path()).unwrap();
+        assert_eq!(loader.load_tensor("a").unwrap(), vec![1.0, 2.0]);
+        assert_eq!(loader.load_tensor("b").unwrap(), vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn integrity_manifest_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = HashMap::new();
+        t.insert("w", vec![1.0f32, 2.0, 3.0]);
+        write_safetensors(dir.path(), "model.safetensors", &t);
+
+        let loader = SafetensorsLoader::from_file(&dir.path().join("model.safetensors")).unwrap();
+        let manifest = loader.generate_manifest();
+
+        assert!(manifest.tensor_hashes.contains_key("w"));
+
+        let manifest_path = dir.path().join("manifest.json");
+        manifest.save(&manifest_path).unwrap();
+        let loaded = IntegrityManifest::from_file(&manifest_path).unwrap();
+        assert_eq!(loaded.tensor_hashes["w"], manifest.tensor_hashes["w"]);
+
+        assert!(loader.verify_integrity(&loaded).is_ok());
+    }
+
+    #[test]
+    fn integrity_check_detects_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = HashMap::new();
+        t.insert("w", vec![1.0f32, 2.0, 3.0]);
+        write_safetensors(dir.path(), "model.safetensors", &t);
+
+        let loader = SafetensorsLoader::from_file(&dir.path().join("model.safetensors")).unwrap();
+        let mut manifest = loader.generate_manifest();
+        manifest
+            .tensor_hashes
+            .insert("w".into(), "deadbeef".into());
+
+        let result = loader.verify_integrity(&manifest);
+        assert!(matches!(result, Err(LoadError::IntegrityMismatch { .. })));
     }
 }
