@@ -1,8 +1,4 @@
-pub trait GuidedDecoder: Send {
-    fn mask_logits(&mut self, token_ids_so_far: &[u32], logits: &mut [f32]);
-    fn is_complete(&self) -> bool;
-    fn tokens_masked_last_step(&self) -> usize;
-}
+pub use crate::GuidedDecoder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonState {

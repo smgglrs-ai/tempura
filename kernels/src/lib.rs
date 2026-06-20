@@ -1,3 +1,10 @@
+pub use tempura_kernel_api::{
+    AllReduce, Attention, CompressedKV, GuidedDecoder, KernelError, KvCacheCompressor, LayerNorm,
+    MatMul, MatMulQ, RMSNorm, Result, RoPE, Sampler, SamplingParams, Q4K_BLOCK_BYTES,
+    Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE, Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, Q6K_GROUPS,
+    Q6K_GROUP_SIZE,
+};
+
 pub mod allreduce;
 pub mod attention;
 #[cfg(feature = "cuda")]
@@ -11,24 +18,3 @@ pub mod rope;
 pub mod sampling;
 pub mod turboquant;
 pub mod verification_manifest;
-
-pub use allreduce::AllReduce;
-pub use attention::Attention;
-pub use guided::GuidedDecoder;
-pub use layernorm::LayerNorm;
-pub use matmul::MatMul;
-pub use rmsnorm::RMSNorm;
-pub use rope::RoPE;
-pub use sampling::{Sampler, SamplingParams};
-pub use quantized::MatMulQ;
-pub use turboquant::KvCacheCompressor;
-
-#[derive(Debug, thiserror::Error)]
-pub enum KernelError {
-    #[error("dimension mismatch: expected {expected}, got {got}")]
-    DimensionMismatch { expected: usize, got: usize },
-    #[error("invalid configuration: {0}")]
-    InvalidConfig(String),
-}
-
-pub type Result<T> = std::result::Result<T, KernelError>;

@@ -1,32 +1,8 @@
+pub use crate::Attention;
 use crate::Result;
 
 #[cfg(feature = "cuda")]
 use cuda_core::DeviceBuffer;
-
-#[allow(clippy::too_many_arguments)]
-pub trait Attention: Send + Sync {
-    /// Compute scaled dot-product attention.
-    ///
-    /// - `q`: [batch, seq_len, num_heads, head_dim]
-    /// - `k`: [batch, kv_len, num_kv_heads, head_dim]
-    /// - `v`: [batch, kv_len, num_kv_heads, head_dim]
-    /// - `output`: [batch, seq_len, num_heads, head_dim]
-    /// - `scale`: typically 1/sqrt(head_dim)
-    fn forward(
-        &self,
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        output: &mut [f32],
-        batch: usize,
-        seq_len: usize,
-        kv_len: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        scale: f32,
-    ) -> Result<()>;
-}
 
 #[cfg(feature = "cpu")]
 pub struct CpuAttention;
@@ -165,17 +141,11 @@ impl CudaAttention {
                 if let Some(ref decode) = self.decode_module {
                     let kv_per_split = 256usize;
                     let num_splits = kv_len.div_ceil(kv_per_split);
-                    let partials_size =
-                        batch * num_heads * num_splits * (head_dim + 2);
-                    let mut partials =
-                        crate::gpu::alloc_device(&stream, partials_size)?;
+                    let partials_size = batch * num_heads * num_splits * (head_dim + 2);
+                    let mut partials = crate::gpu::alloc_device(&stream, partials_size)?;
 
                     let partial_config = LaunchConfig {
-                        grid_dim: (
-                            num_heads as u32,
-                            num_splits as u32,
-                            batch as u32,
-                        ),
+                        grid_dim: (num_heads as u32, num_splits as u32, batch as u32),
                         block_dim: (32, 1, 1),
                         shared_mem_bytes: 0,
                     };

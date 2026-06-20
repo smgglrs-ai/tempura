@@ -13,6 +13,7 @@ default = []
 cuda = ["tempura-kernels/cuda", "dep:cuda-core"]
 
 [dependencies]
+tempura-kernel-api = { path = "../kernel-api" }
 tempura-kernels = { path = "../kernels" }
 safetensors = "0.5"
 tokenizers = "0.21"

@@ -1,38 +1,9 @@
 use crate::Result;
+pub use crate::{
+    MatMulQ, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE, Q6K_BLOCK_BYTES,
+    Q6K_BLOCK_SIZE, Q6K_GROUPS, Q6K_GROUP_SIZE,
+};
 use rayon::prelude::*;
-
-pub const Q4K_BLOCK_SIZE: usize = 256;
-pub const Q4K_BLOCK_BYTES: usize = 144;
-pub const Q4K_GROUPS: usize = 8;
-pub const Q4K_GROUP_SIZE: usize = 32;
-
-pub const Q6K_BLOCK_SIZE: usize = 256;
-pub const Q6K_BLOCK_BYTES: usize = 210;
-pub const Q6K_GROUPS: usize = 16;
-pub const Q6K_GROUP_SIZE: usize = 16;
-
-#[allow(clippy::too_many_arguments)]
-pub trait MatMulQ: Send + Sync {
-    fn forward_b_transposed_q4k(
-        &self,
-        a: &[f32],
-        b_quantized: &[u8],
-        output: &mut [f32],
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<()>;
-
-    fn forward_b_transposed_q6k(
-        &self,
-        a: &[f32],
-        b_quantized: &[u8],
-        output: &mut [f32],
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<()>;
-}
 
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
@@ -86,12 +57,24 @@ pub fn q4k_unpack_scales(packed: &[u8]) -> ([f32; Q4K_GROUPS], [f32; Q4K_GROUPS]
     }
 
     let sc_f: [f32; Q4K_GROUPS] = [
-        sc[0] as f32, sc[1] as f32, sc[2] as f32, sc[3] as f32,
-        sc[4] as f32, sc[5] as f32, sc[6] as f32, sc[7] as f32,
+        sc[0] as f32,
+        sc[1] as f32,
+        sc[2] as f32,
+        sc[3] as f32,
+        sc[4] as f32,
+        sc[5] as f32,
+        sc[6] as f32,
+        sc[7] as f32,
     ];
     let m_f: [f32; Q4K_GROUPS] = [
-        m[0] as f32, m[1] as f32, m[2] as f32, m[3] as f32,
-        m[4] as f32, m[5] as f32, m[6] as f32, m[7] as f32,
+        m[0] as f32,
+        m[1] as f32,
+        m[2] as f32,
+        m[3] as f32,
+        m[4] as f32,
+        m[5] as f32,
+        m[6] as f32,
+        m[7] as f32,
     ];
     (sc_f, m_f)
 }
@@ -211,9 +194,18 @@ unsafe fn q6k_dot_block_avx2_i16(block: &[u8], a: &[f32]) -> f32 {
 
     // Quantize 256 activations to i16 (one scale per block)
     let mut max_abs = 0.0f32;
-    for i in 0..256 { let v = a[i].abs(); if v > max_abs { max_abs = v; } }
+    for i in 0..256 {
+        let v = a[i].abs();
+        if v > max_abs {
+            max_abs = v;
+        }
+    }
     let a_scale = max_abs / 32767.0;
-    let inv_scale = if max_abs > 0.0 { 32767.0 / max_abs } else { 0.0 };
+    let inv_scale = if max_abs > 0.0 {
+        32767.0 / max_abs
+    } else {
+        0.0
+    };
 
     let mut a_i16 = [0i16; 256];
     let inv_vec = _mm256_set1_ps(inv_scale);
@@ -222,7 +214,8 @@ unsafe fn q6k_dot_block_avx2_i16(block: &[u8], a: &[f32]) -> f32 {
         let v = _mm256_loadu_ps(a.as_ptr().add(base));
         let scaled = _mm256_mul_ps(v, inv_vec);
         let rounded = _mm256_cvtps_epi32(_mm256_round_ps(
-            scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+            scaled,
+            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
         ));
         // Pack i32 → i16 with saturation
         let lo = _mm256_castsi256_si128(rounded);
@@ -289,10 +282,10 @@ unsafe fn q6k_dot_block_avx2_i16(block: &[u8], a: &[f32]) -> f32 {
             }};
         }
 
-        process_group!(q6_0, y_off,      half * 8,     half * 8 + 1);
-        process_group!(q6_1, y_off + 32,  half * 8 + 2, half * 8 + 3);
-        process_group!(q6_2, y_off + 64,  half * 8 + 4, half * 8 + 5);
-        process_group!(q6_3, y_off + 96,  half * 8 + 6, half * 8 + 7);
+        process_group!(q6_0, y_off, half * 8, half * 8 + 1);
+        process_group!(q6_1, y_off + 32, half * 8 + 2, half * 8 + 3);
+        process_group!(q6_2, y_off + 64, half * 8 + 4, half * 8 + 5);
+        process_group!(q6_3, y_off + 96, half * 8 + 6, half * 8 + 7);
     }
 
     result
@@ -301,11 +294,7 @@ unsafe fn q6k_dot_block_avx2_i16(block: &[u8], a: &[f32]) -> f32 {
 /// i16-domain Q6_K dot with PRE-QUANTIZED i16 activations (no per-call quantization).
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn q6k_dot_preq_i16(
-    block: &[u8],
-    a_i16: &[i16],
-    a_scale: f32,
-) -> f32 {
+unsafe fn q6k_dot_preq_i16(block: &[u8], a_i16: &[i16], a_scale: f32) -> f32 {
     use std::arch::x86_64::*;
 
     let ql = &block[0..128];
@@ -368,10 +357,10 @@ unsafe fn q6k_dot_preq_i16(
             }};
         }
 
-        process_group!(q6_0, y_off,      half * 8,     half * 8 + 1);
-        process_group!(q6_1, y_off + 32,  half * 8 + 2, half * 8 + 3);
-        process_group!(q6_2, y_off + 64,  half * 8 + 4, half * 8 + 5);
-        process_group!(q6_3, y_off + 96,  half * 8 + 6, half * 8 + 7);
+        process_group!(q6_0, y_off, half * 8, half * 8 + 1);
+        process_group!(q6_1, y_off + 32, half * 8 + 2, half * 8 + 3);
+        process_group!(q6_2, y_off + 64, half * 8 + 4, half * 8 + 5);
+        process_group!(q6_3, y_off + 96, half * 8 + 6, half * 8 + 7);
     }
 
     result
@@ -443,7 +432,11 @@ unsafe fn q6k_dot_block_avx2(block: &[u8], a: &[f32]) -> f32 {
 
                 // Chunks 0-1: elements 0..15 with sc0
                 for chunk in 0..2 {
-                    let src = if chunk == 0 { lo128 } else { _mm_srli_si128(lo128, 8) };
+                    let src = if chunk == 0 {
+                        lo128
+                    } else {
+                        _mm_srli_si128(lo128, 8)
+                    };
                     let i32v = _mm256_cvtepu8_epi32(src);
                     let f32v = _mm256_cvtepi32_ps(i32v);
                     let w = _mm256_mul_ps(sc0_vec, _mm256_sub_ps(f32v, offset_32));
@@ -452,7 +445,11 @@ unsafe fn q6k_dot_block_avx2(block: &[u8], a: &[f32]) -> f32 {
                 }
                 // Chunks 2-3: elements 16..31 with sc1
                 for chunk in 0..2 {
-                    let src = if chunk == 0 { hi128 } else { _mm_srli_si128(hi128, 8) };
+                    let src = if chunk == 0 {
+                        hi128
+                    } else {
+                        _mm_srli_si128(hi128, 8)
+                    };
                     let i32v = _mm256_cvtepu8_epi32(src);
                     let f32v = _mm256_cvtepi32_ps(i32v);
                     let w = _mm256_mul_ps(sc1_vec, _mm256_sub_ps(f32v, offset_32));
@@ -462,10 +459,10 @@ unsafe fn q6k_dot_block_avx2(block: &[u8], a: &[f32]) -> f32 {
             }};
         }
 
-        process_q6_group!(q6_0, y_off,      half * 8);
-        process_q6_group!(q6_1, y_off + 32,  half * 8 + 2);
-        process_q6_group!(q6_2, y_off + 64,  half * 8 + 4);
-        process_q6_group!(q6_3, y_off + 96,  half * 8 + 6);
+        process_q6_group!(q6_0, y_off, half * 8);
+        process_q6_group!(q6_1, y_off + 32, half * 8 + 2);
+        process_q6_group!(q6_2, y_off + 64, half * 8 + 4);
+        process_q6_group!(q6_3, y_off + 96, half * 8 + 6);
     }
 
     let hi = _mm256_extractf128_ps(acc, 1);
@@ -482,12 +479,7 @@ unsafe fn q6k_dot_block_avx2(block: &[u8], a: &[f32]) -> f32 {
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[allow(dead_code)]
-unsafe fn q6k_dot_q8_avx2(
-    block: &[u8],
-    a_q8: &[i8],
-    a_scale: f32,
-    a_group_sums: &[f32],
-) -> f32 {
+unsafe fn q6k_dot_q8_avx2(block: &[u8], a_q8: &[i8], a_scale: f32, a_group_sums: &[f32]) -> f32 {
     use std::arch::x86_64::*;
 
     let ql = &block[0..128];
@@ -606,17 +598,17 @@ unsafe fn q6k_dot_q8_avx2(
         let gs = |g: usize| -> f32 { a_group_sums[y_off / Q6K_GROUP_SIZE + g] };
 
         // Group 0: elements y_off+0..y_off+31 → 2 sub-groups of 16
-        result += d * sc(half*8 + 0) * (a_scale * lo_0 as f32 - 32.0 * gs(0));
-        result += d * sc(half*8 + 1) * (a_scale * hi_0 as f32 - 32.0 * gs(1));
+        result += d * sc(half * 8 + 0) * (a_scale * lo_0 as f32 - 32.0 * gs(0));
+        result += d * sc(half * 8 + 1) * (a_scale * hi_0 as f32 - 32.0 * gs(1));
         // Group 1: elements y_off+32..y_off+63
-        result += d * sc(half*8 + 2) * (a_scale * lo_1 as f32 - 32.0 * gs(2));
-        result += d * sc(half*8 + 3) * (a_scale * hi_1 as f32 - 32.0 * gs(3));
+        result += d * sc(half * 8 + 2) * (a_scale * lo_1 as f32 - 32.0 * gs(2));
+        result += d * sc(half * 8 + 3) * (a_scale * hi_1 as f32 - 32.0 * gs(3));
         // Group 2: elements y_off+64..y_off+95
-        result += d * sc(half*8 + 4) * (a_scale * lo_2 as f32 - 32.0 * gs(4));
-        result += d * sc(half*8 + 5) * (a_scale * hi_2 as f32 - 32.0 * gs(5));
+        result += d * sc(half * 8 + 4) * (a_scale * lo_2 as f32 - 32.0 * gs(4));
+        result += d * sc(half * 8 + 5) * (a_scale * hi_2 as f32 - 32.0 * gs(5));
         // Group 3: elements y_off+96..y_off+127
-        result += d * sc(half*8 + 6) * (a_scale * lo_3 as f32 - 32.0 * gs(6));
-        result += d * sc(half*8 + 7) * (a_scale * hi_3 as f32 - 32.0 * gs(7));
+        result += d * sc(half * 8 + 6) * (a_scale * lo_3 as f32 - 32.0 * gs(6));
+        result += d * sc(half * 8 + 7) * (a_scale * hi_3 as f32 - 32.0 * gs(7));
     }
 
     result
@@ -658,9 +650,9 @@ impl MatMulQ for CpuMatMulQ4K {
             });
         }
         if k % Q4K_BLOCK_SIZE != 0 {
-            return Err(crate::KernelError::InvalidConfig(
-                format!("k={k} must be divisible by Q4K block size {Q4K_BLOCK_SIZE}"),
-            ));
+            return Err(crate::KernelError::InvalidConfig(format!(
+                "k={k} must be divisible by Q4K block size {Q4K_BLOCK_SIZE}"
+            )));
         }
 
         let blocks_per_row = k / Q4K_BLOCK_SIZE;
@@ -698,13 +690,32 @@ impl MatMulQ for CpuMatMulQ4K {
         n: usize,
         k: usize,
     ) -> Result<()> {
-        if a.len() != m * k { return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() }); }
-        if output.len() != m * n { return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() }); }
-        if k % Q6K_BLOCK_SIZE != 0 { return Err(crate::KernelError::InvalidConfig(format!("k={k} not divisible by {Q6K_BLOCK_SIZE}"))); }
+        if a.len() != m * k {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
+        }
+        if output.len() != m * n {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
+        }
+        if k % Q6K_BLOCK_SIZE != 0 {
+            return Err(crate::KernelError::InvalidConfig(format!(
+                "k={k} not divisible by {Q6K_BLOCK_SIZE}"
+            )));
+        }
 
         let blocks_per_row = k / Q6K_BLOCK_SIZE;
         let expected_b_bytes = n * blocks_per_row * Q6K_BLOCK_BYTES;
-        if b_quantized.len() != expected_b_bytes { return Err(crate::KernelError::DimensionMismatch { expected: expected_b_bytes, got: b_quantized.len() }); }
+        if b_quantized.len() != expected_b_bytes {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: expected_b_bytes,
+                got: b_quantized.len(),
+            });
+        }
 
         for i in 0..m {
             let a_row = &a[i * k..(i + 1) * k];
@@ -766,7 +777,8 @@ unsafe fn quantize_row_q8_avx2(a: &[f32]) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
             let v = _mm256_loadu_ps(block_a.as_ptr().add(cb));
             let scaled = _mm256_mul_ps(v, inv_vec);
             let rounded = _mm256_cvtps_epi32(_mm256_round_ps(
-                scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+                scaled,
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
             ));
             let lo128 = _mm256_castsi256_si128(rounded);
             let hi128 = _mm256_extracti128_si256(rounded, 1);
@@ -792,12 +804,7 @@ unsafe fn quantize_row_q8_avx2(a: &[f32]) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
 /// Integer-domain Q4_K dot product with pre-quantized Q8 activations.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn q4k_dot_q8_avx2(
-    block: &[u8],
-    a_q8: &[i8],
-    a_scale: f32,
-    a_group_sums: &[f32],
-) -> f32 {
+unsafe fn q4k_dot_q8_avx2(block: &[u8], a_q8: &[i8], a_scale: f32, a_group_sums: &[f32]) -> f32 {
     use std::arch::x86_64::*;
 
     let d = q4k_block_d(block);
@@ -843,12 +850,7 @@ unsafe fn q4k_dot_q8_avx2(
 /// instead of the two-instruction maddubs+madd chain. ~1.5-2x throughput.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,avxvnni")]
-unsafe fn q4k_dot_q8_vnni(
-    block: &[u8],
-    a_q8: &[i8],
-    a_scale: f32,
-    a_group_sums: &[f32],
-) -> f32 {
+unsafe fn q4k_dot_q8_vnni(block: &[u8], a_q8: &[i8], a_scale: f32, a_group_sums: &[f32]) -> f32 {
     use std::arch::x86_64::*;
 
     let d = q4k_block_d(block);
@@ -905,7 +907,9 @@ unsafe fn q4k_dot_block_avx2_int8(block: &[u8], a: &[f32]) -> f32 {
     let mut max_abs = 0.0f32;
     for i in 0..Q4K_BLOCK_SIZE {
         let v = a[i].abs();
-        if v > max_abs { max_abs = v; }
+        if v > max_abs {
+            max_abs = v;
+        }
     }
     let a_scale = max_abs / 127.0;
     let inv_scale = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
@@ -916,7 +920,10 @@ unsafe fn q4k_dot_block_avx2_int8(block: &[u8], a: &[f32]) -> f32 {
         let base = chunk * 8;
         let av = _mm256_loadu_ps(a.as_ptr().add(base));
         let scaled = _mm256_mul_ps(av, inv_scale_vec);
-        let rounded = _mm256_cvtps_epi32(_mm256_round_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        let rounded = _mm256_cvtps_epi32(_mm256_round_ps(
+            scaled,
+            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+        ));
         // Pack i32 → i16 → i8 (with saturation)
         let lo128 = _mm256_castsi256_si128(rounded);
         let hi128 = _mm256_extracti128_si256(rounded, 1);
@@ -953,18 +960,26 @@ unsafe fn q4k_dot_block_avx2_int8(block: &[u8], a: &[f32]) -> f32 {
 
         // Activation sums per group (for min correction)
         // sum(a_q8[group]) — use madd with ones to sum i8 as i16 pairs, then i32
-        let aq_lo_16 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(aq_lo)), ones_16);
-        let aq_lo_16b = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_extracti128_si256(aq_lo, 1)), ones_16);
+        let aq_lo_16 =
+            _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(aq_lo)), ones_16);
+        let aq_lo_16b = _mm256_madd_epi16(
+            _mm256_cvtepi8_epi16(_mm256_extracti128_si256(aq_lo, 1)),
+            ones_16,
+        );
         let asum_lo = hsum_i32(_mm256_add_epi32(aq_lo_16, aq_lo_16b));
 
-        let aq_hi_16 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(aq_hi)), ones_16);
-        let aq_hi_16b = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_extracti128_si256(aq_hi, 1)), ones_16);
+        let aq_hi_16 =
+            _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(aq_hi)), ones_16);
+        let aq_hi_16b = _mm256_madd_epi16(
+            _mm256_cvtepi8_epi16(_mm256_extracti128_si256(aq_hi, 1)),
+            ones_16,
+        );
         let asum_hi = hsum_i32(_mm256_add_epi32(aq_hi_16, aq_hi_16b));
 
-        result += d * sc[2 * j] * a_scale * hsum_lo as f32
-                - dmin * m[2 * j] * a_scale * asum_lo as f32;
+        result +=
+            d * sc[2 * j] * a_scale * hsum_lo as f32 - dmin * m[2 * j] * a_scale * asum_lo as f32;
         result += d * sc[2 * j + 1] * a_scale * hsum_hi as f32
-                - dmin * m[2 * j + 1] * a_scale * asum_hi as f32;
+            - dmin * m[2 * j + 1] * a_scale * asum_hi as f32;
     }
 
     result
@@ -1010,10 +1025,14 @@ unsafe fn q4k_dot_block_avx2(block: &[u8], a: &[f32]) -> f32 {
         for chunk in 0..4 {
             let base = chunk * 8;
             let q_f32 = _mm256_set_ps(
-                (qs[j*32+base+7] & 0x0F) as f32, (qs[j*32+base+6] & 0x0F) as f32,
-                (qs[j*32+base+5] & 0x0F) as f32, (qs[j*32+base+4] & 0x0F) as f32,
-                (qs[j*32+base+3] & 0x0F) as f32, (qs[j*32+base+2] & 0x0F) as f32,
-                (qs[j*32+base+1] & 0x0F) as f32, (qs[j*32+base]   & 0x0F) as f32,
+                (qs[j * 32 + base + 7] & 0x0F) as f32,
+                (qs[j * 32 + base + 6] & 0x0F) as f32,
+                (qs[j * 32 + base + 5] & 0x0F) as f32,
+                (qs[j * 32 + base + 4] & 0x0F) as f32,
+                (qs[j * 32 + base + 3] & 0x0F) as f32,
+                (qs[j * 32 + base + 2] & 0x0F) as f32,
+                (qs[j * 32 + base + 1] & 0x0F) as f32,
+                (qs[j * 32 + base] & 0x0F) as f32,
             );
             let a_vec = _mm256_loadu_ps(a.as_ptr().add(j * 64 + base));
             let w = _mm256_fmsub_ps(d1_vec, q_f32, m1_vec);
@@ -1024,10 +1043,14 @@ unsafe fn q4k_dot_block_avx2(block: &[u8], a: &[f32]) -> f32 {
         for chunk in 0..4 {
             let base = chunk * 8;
             let q_f32 = _mm256_set_ps(
-                (qs[j*32+base+7] >> 4) as f32, (qs[j*32+base+6] >> 4) as f32,
-                (qs[j*32+base+5] >> 4) as f32, (qs[j*32+base+4] >> 4) as f32,
-                (qs[j*32+base+3] >> 4) as f32, (qs[j*32+base+2] >> 4) as f32,
-                (qs[j*32+base+1] >> 4) as f32, (qs[j*32+base]   >> 4) as f32,
+                (qs[j * 32 + base + 7] >> 4) as f32,
+                (qs[j * 32 + base + 6] >> 4) as f32,
+                (qs[j * 32 + base + 5] >> 4) as f32,
+                (qs[j * 32 + base + 4] >> 4) as f32,
+                (qs[j * 32 + base + 3] >> 4) as f32,
+                (qs[j * 32 + base + 2] >> 4) as f32,
+                (qs[j * 32 + base + 1] >> 4) as f32,
+                (qs[j * 32 + base] >> 4) as f32,
             );
             let a_vec = _mm256_loadu_ps(a.as_ptr().add(j * 64 + 32 + base));
             let w = _mm256_fmsub_ps(d2_vec, q_f32, m2_vec);
@@ -1111,16 +1134,33 @@ impl PreQuantizedActivations {
                 let base = blk * Q6K_BLOCK_SIZE;
                 let block_a = &a[base..base + Q6K_BLOCK_SIZE];
                 let mut max_abs = 0.0f32;
-                for &v in block_a { let av = v.abs(); if av > max_abs { max_abs = av; } }
+                for &v in block_a {
+                    let av = v.abs();
+                    if av > max_abs {
+                        max_abs = av;
+                    }
+                }
                 let scale = max_abs / 32767.0;
                 scales_i16[blk] = scale;
-                let inv = if max_abs > 0.0 { 32767.0 / max_abs } else { 0.0 };
+                let inv = if max_abs > 0.0 {
+                    32767.0 / max_abs
+                } else {
+                    0.0
+                };
                 for i in 0..Q6K_BLOCK_SIZE {
                     q16[base + i] = (block_a[i] * inv).round() as i16;
                 }
             }
 
-            return Self { q8, q16, scales, scales_i16, group_sums_q4k, group_sums_q6k, k };
+            return Self {
+                q8,
+                q16,
+                scales,
+                scales_i16,
+                group_sums_q4k,
+                group_sums_q6k,
+                k,
+            };
         }
 
         Self {
@@ -1146,8 +1186,12 @@ impl CpuMatMulQ4KOpt {
     pub fn fused_q4k_preq_2(
         &self,
         preq: &PreQuantizedActivations,
-        b1: &[u8], out1: &mut [f32], n1: usize,
-        b2: &[u8], out2: &mut [f32], n2: usize,
+        b1: &[u8],
+        out1: &mut [f32],
+        n1: usize,
+        b2: &[u8],
+        out2: &mut [f32],
+        n2: usize,
     ) {
         let k = preq.k;
         let blocks_per_row = k / Q4K_BLOCK_SIZE;
@@ -1162,27 +1206,34 @@ impl CpuMatMulQ4KOpt {
 
         // Conceptually: outputs 0..n1 come from b1, outputs n1..n1+n2 come from b2.
         // Each thread processes a range spanning potentially both outputs.
-        (0..total).into_par_iter().with_min_len(chunk_size).for_each(|idx| {
-            let (b_quantized, j, out_ptr) = if idx < n1 {
-                (b1, idx, unsafe { out1.as_ptr().add(idx) as *mut f32 })
-            } else {
-                (b2, idx - n1, unsafe { out2.as_ptr().add(idx - n1) as *mut f32 })
-            };
-            let mut sum = 0.0f32;
-            for blk in 0..blocks_per_row {
-                let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                let aq_slice = &preq.q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                let a_sc = preq.scales[blk];
-                let a_gsums = &preq.group_sums_q4k[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
-                sum += if use_vnni {
-                    unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
+        (0..total)
+            .into_par_iter()
+            .with_min_len(chunk_size)
+            .for_each(|idx| {
+                let (b_quantized, j, out_ptr) = if idx < n1 {
+                    (b1, idx, unsafe { out1.as_ptr().add(idx) as *mut f32 })
                 } else {
-                    unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
+                    (b2, idx - n1, unsafe {
+                        out2.as_ptr().add(idx - n1) as *mut f32
+                    })
                 };
-            }
-            unsafe { *out_ptr = sum; }
-        });
+                let mut sum = 0.0f32;
+                for blk in 0..blocks_per_row {
+                    let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                    let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                    let aq_slice = &preq.q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                    let a_sc = preq.scales[blk];
+                    let a_gsums = &preq.group_sums_q4k[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
+                    sum += if use_vnni {
+                        unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
+                    } else {
+                        unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
+                    };
+                }
+                unsafe {
+                    *out_ptr = sum;
+                }
+            });
     }
 
     pub fn forward_q4k_preq(
@@ -1203,42 +1254,50 @@ impl CpuMatMulQ4KOpt {
             let use_vnni = false;
 
             let chunk_size = (n / rayon::current_num_threads()).max(64);
-            output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, chunk)| {
-                let j_start = chunk_idx * chunk_size;
-                for (local, out) in chunk.iter_mut().enumerate() {
-                    let j = j_start + local;
-                    let mut sum = 0.0f32;
-                    for blk in 0..blocks_per_row {
-                        let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                        let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                        let aq_slice = &preq.q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                        let a_sc = preq.scales[blk];
-                        let a_gsums = &preq.group_sums_q4k[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
-                        sum += if use_vnni {
-                            unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
-                        } else {
-                            unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
-                        };
+            output[..n]
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let j_start = chunk_idx * chunk_size;
+                    for (local, out) in chunk.iter_mut().enumerate() {
+                        let j = j_start + local;
+                        let mut sum = 0.0f32;
+                        for blk in 0..blocks_per_row {
+                            let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                            let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                            let aq_slice =
+                                &preq.q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                            let a_sc = preq.scales[blk];
+                            let a_gsums =
+                                &preq.group_sums_q4k[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
+                            sum += if use_vnni {
+                                unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
+                            } else {
+                                unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
+                            };
+                        }
+                        *out = sum;
                     }
-                    *out = sum;
-                }
-            });
+                });
         } else {
             let chunk_size = (n / rayon::current_num_threads()).max(64);
-            output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, chunk)| {
-                let j_start = chunk_idx * chunk_size;
-                for (local, out) in chunk.iter_mut().enumerate() {
-                    let j = j_start + local;
-                    let mut sum = 0.0f32;
-                    for blk in 0..blocks_per_row {
-                        let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                        let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                        let a_slice = &a_f32[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                        sum += q4k_dot_block(block, a_slice);
+            output[..n]
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let j_start = chunk_idx * chunk_size;
+                    for (local, out) in chunk.iter_mut().enumerate() {
+                        let j = j_start + local;
+                        let mut sum = 0.0f32;
+                        for blk in 0..blocks_per_row {
+                            let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                            let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                            let a_slice = &a_f32[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                            sum += q4k_dot_block(block, a_slice);
+                        }
+                        *out = sum;
                     }
-                    *out = sum;
-                }
-            });
+                });
         }
         Ok(())
     }
@@ -1257,7 +1316,31 @@ impl CpuMatMulQ4KOpt {
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             let chunk_size = (n / rayon::current_num_threads()).max(64);
-            output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(ci, chunk)| {
+            output[..n]
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(ci, chunk)| {
+                    let j_start = ci * chunk_size;
+                    for (local, out) in chunk.iter_mut().enumerate() {
+                        let j = j_start + local;
+                        let mut sum = 0.0f32;
+                        for blk in 0..blocks_per_row {
+                            let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                            let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
+                            let a_slice = &a_f32[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
+                            sum += unsafe { q6k_dot_block_avx2(block, a_slice) };
+                        }
+                        *out = sum;
+                    }
+                });
+            return Ok(());
+        }
+
+        let chunk_size = (n / rayon::current_num_threads()).max(64);
+        output[..n]
+            .par_chunks_mut(chunk_size)
+            .enumerate()
+            .for_each(|(ci, chunk)| {
                 let j_start = ci * chunk_size;
                 for (local, out) in chunk.iter_mut().enumerate() {
                     let j = j_start + local;
@@ -1266,29 +1349,11 @@ impl CpuMatMulQ4KOpt {
                         let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
                         let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
                         let a_slice = &a_f32[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                        sum += unsafe { q6k_dot_block_avx2(block, a_slice) };
+                        sum += q6k_dot_block(block, a_slice);
                     }
                     *out = sum;
                 }
             });
-            return Ok(());
-        }
-
-        let chunk_size = (n / rayon::current_num_threads()).max(64);
-        output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(ci, chunk)| {
-            let j_start = ci * chunk_size;
-            for (local, out) in chunk.iter_mut().enumerate() {
-                let j = j_start + local;
-                let mut sum = 0.0f32;
-                for blk in 0..blocks_per_row {
-                    let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
-                    let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
-                    let a_slice = &a_f32[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                    sum += q6k_dot_block(block, a_slice);
-                }
-                *out = sum;
-            }
-        });
         Ok(())
     }
 }
@@ -1317,9 +1382,9 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             });
         }
         if k % Q4K_BLOCK_SIZE != 0 {
-            return Err(crate::KernelError::InvalidConfig(
-                format!("k={k} must be divisible by Q4K block size {Q4K_BLOCK_SIZE}"),
-            ));
+            return Err(crate::KernelError::InvalidConfig(format!(
+                "k={k} must be divisible by Q4K block size {Q4K_BLOCK_SIZE}"
+            )));
         }
 
         let blocks_per_row = k / Q4K_BLOCK_SIZE;
@@ -1336,8 +1401,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
 
             #[cfg(target_arch = "x86_64")]
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                let (a_q8, a_scales, a_group_sums) =
-                    unsafe { quantize_row_q8_avx2(a_row) };
+                let (a_q8, a_scales, a_group_sums) = unsafe { quantize_row_q8_avx2(a_row) };
 
                 #[cfg(target_arch = "x86_64")]
                 let use_vnni = is_x86_feature_detected!("avxvnni");
@@ -1345,7 +1409,39 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 let use_vnni = false;
 
                 let chunk_size = (n / rayon::current_num_threads()).max(64);
-                output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, chunk)| {
+                output[..n].par_chunks_mut(chunk_size).enumerate().for_each(
+                    |(chunk_idx, chunk)| {
+                        let j_start = chunk_idx * chunk_size;
+                        for (local, out) in chunk.iter_mut().enumerate() {
+                            let j = j_start + local;
+                            let mut sum = 0.0f32;
+                            for blk in 0..blocks_per_row {
+                                let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                                let block =
+                                    &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                                let aq_slice =
+                                    &a_q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                                let a_sc = a_scales[blk];
+                                let a_gsums =
+                                    &a_group_sums[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
+                                sum += if use_vnni {
+                                    unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
+                                } else {
+                                    unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
+                                };
+                            }
+                            *out = sum;
+                        }
+                    },
+                );
+                return Ok(());
+            }
+
+            let chunk_size = (n / rayon::current_num_threads()).max(64);
+            output[..n]
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
                     let j_start = chunk_idx * chunk_size;
                     for (local, out) in chunk.iter_mut().enumerate() {
                         let j = j_start + local;
@@ -1353,36 +1449,12 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                         for blk in 0..blocks_per_row {
                             let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
                             let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                            let aq_slice = &a_q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                            let a_sc = a_scales[blk];
-                            let a_gsums = &a_group_sums[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
-                            sum += if use_vnni {
-                                unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
-                            } else {
-                                unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
-                            };
+                            let a_slice = &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                            sum += q4k_dot_block(block, a_slice);
                         }
                         *out = sum;
                     }
                 });
-                return Ok(());
-            }
-
-            let chunk_size = (n / rayon::current_num_threads()).max(64);
-            output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, chunk)| {
-                let j_start = chunk_idx * chunk_size;
-                for (local, out) in chunk.iter_mut().enumerate() {
-                    let j = j_start + local;
-                    let mut sum = 0.0f32;
-                    for blk in 0..blocks_per_row {
-                        let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                        let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                        let a_slice = &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                        sum += q4k_dot_block(block, a_slice);
-                    }
-                    *out = sum;
-                }
-            });
         } else {
             // Batched path: dequant full row, use gemm for SIMD matmul
             let mut b_f32 = vec![0.0f32; n * k];
@@ -1391,12 +1463,24 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             }
             unsafe {
                 gemm::gemm(
-                    m, n, k,
-                    output.as_mut_ptr(), 1, n as isize, false,
-                    a.as_ptr(), 1, k as isize,
-                    b_f32.as_ptr(), k as isize, 1,
-                    0.0f32, 1.0f32,
-                    false, false, false,
+                    m,
+                    n,
+                    k,
+                    output.as_mut_ptr(),
+                    1,
+                    n as isize,
+                    false,
+                    a.as_ptr(),
+                    1,
+                    k as isize,
+                    b_f32.as_ptr(),
+                    k as isize,
+                    1,
+                    0.0f32,
+                    1.0f32,
+                    false,
+                    false,
+                    false,
                     gemm::Parallelism::Rayon(0),
                 );
             }
@@ -1414,13 +1498,32 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         n: usize,
         k: usize,
     ) -> Result<()> {
-        if a.len() != m * k { return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() }); }
-        if output.len() != m * n { return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() }); }
-        if k % Q6K_BLOCK_SIZE != 0 { return Err(crate::KernelError::InvalidConfig(format!("k={k} not divisible by {Q6K_BLOCK_SIZE}"))); }
+        if a.len() != m * k {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
+        }
+        if output.len() != m * n {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
+        }
+        if k % Q6K_BLOCK_SIZE != 0 {
+            return Err(crate::KernelError::InvalidConfig(format!(
+                "k={k} not divisible by {Q6K_BLOCK_SIZE}"
+            )));
+        }
 
         let blocks_per_row = k / Q6K_BLOCK_SIZE;
         let expected_b_bytes = n * blocks_per_row * Q6K_BLOCK_BYTES;
-        if b_quantized.len() != expected_b_bytes { return Err(crate::KernelError::DimensionMismatch { expected: expected_b_bytes, got: b_quantized.len() }); }
+        if b_quantized.len() != expected_b_bytes {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: expected_b_bytes,
+                got: b_quantized.len(),
+            });
+        }
 
         if m == 1 {
             let a_row = &a[0..k];
@@ -1428,7 +1531,33 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             #[cfg(target_arch = "x86_64")]
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                 let chunk_size = (n / rayon::current_num_threads()).max(64);
-                output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(ci, chunk)| {
+                output[..n]
+                    .par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let j_start = ci * chunk_size;
+                        for (local, out) in chunk.iter_mut().enumerate() {
+                            let j = j_start + local;
+                            let mut sum = 0.0f32;
+                            for blk in 0..blocks_per_row {
+                                let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                                let block =
+                                    &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
+                                let a_slice =
+                                    &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
+                                sum += unsafe { q6k_dot_block_avx2_i16(block, a_slice) };
+                            }
+                            *out = sum;
+                        }
+                    });
+                return Ok(());
+            }
+
+            let chunk_size = (n / rayon::current_num_threads()).max(64);
+            output[..n]
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(ci, chunk)| {
                     let j_start = ci * chunk_size;
                     for (local, out) in chunk.iter_mut().enumerate() {
                         let j = j_start + local;
@@ -1437,29 +1566,11 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                             let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
                             let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
                             let a_slice = &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                            sum += unsafe { q6k_dot_block_avx2_i16(block, a_slice) };
+                            sum += q6k_dot_block(block, a_slice);
                         }
                         *out = sum;
                     }
                 });
-                return Ok(());
-            }
-
-            let chunk_size = (n / rayon::current_num_threads()).max(64);
-            output[..n].par_chunks_mut(chunk_size).enumerate().for_each(|(ci, chunk)| {
-                let j_start = ci * chunk_size;
-                for (local, out) in chunk.iter_mut().enumerate() {
-                    let j = j_start + local;
-                    let mut sum = 0.0f32;
-                    for blk in 0..blocks_per_row {
-                        let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
-                        let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
-                        let a_slice = &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                        sum += q6k_dot_block(block, a_slice);
-                    }
-                    *out = sum;
-                }
-            });
         } else {
             for i in 0..m {
                 let a_row = &a[i * k..(i + 1) * k];
@@ -1518,7 +1629,8 @@ unsafe fn quantize_row_q8_avx2_q6k(a: &[f32]) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
             let v = _mm256_loadu_ps(block_a.as_ptr().add(cb));
             let scaled = _mm256_mul_ps(v, inv_vec);
             let rounded = _mm256_cvtps_epi32(_mm256_round_ps(
-                scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+                scaled,
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
             ));
             let lo128 = _mm256_castsi256_si128(rounded);
             let hi128 = _mm256_extracti128_si256(rounded, 1);
@@ -1852,10 +1964,7 @@ mod tests {
         // Groups 4..7 have sc=0, so those contribute 0
         // Groups 0..3: 4 * 32 = 128 elements, each contributing 1*1 = 1
         // Total = 128
-        assert!(
-            (dot - 128.0).abs() < 1e-2,
-            "dot={dot}, expected=128.0"
-        );
+        assert!((dot - 128.0).abs() < 1e-2, "dot={dot}, expected=128.0");
     }
 
     #[test]
@@ -1931,7 +2040,9 @@ mod tests {
         let m = 2;
         let n = 4;
 
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32) * 0.01 - 0.08).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 17) as f32) * 0.01 - 0.08)
+            .collect();
 
         let blocks_per_row = k / Q4K_BLOCK_SIZE;
         let mut b_q = vec![0u8; n * blocks_per_row * Q4K_BLOCK_BYTES];
@@ -1981,8 +2092,9 @@ mod tests {
     }
 
     fn bench_one(m: usize, n: usize, k: usize) {
-
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 23) as f32) * 0.005 - 0.05).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 23) as f32) * 0.005 - 0.05)
+            .collect();
 
         let blocks_per_row = k / Q4K_BLOCK_SIZE;
         let mut b_q = vec![0u8; n * blocks_per_row * Q4K_BLOCK_BYTES];
@@ -2007,18 +2119,24 @@ mod tests {
 
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
-            ref_kernel.forward_b_transposed_q4k(&a, &b_q, &mut out, m, n, k).unwrap();
+            ref_kernel
+                .forward_b_transposed_q4k(&a, &b_q, &mut out, m, n, k)
+                .unwrap();
         }
         let ref_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
         let t1 = std::time::Instant::now();
         for _ in 0..iters {
-            opt_kernel.forward_b_transposed_q4k(&a, &b_q, &mut out, m, n, k).unwrap();
+            opt_kernel
+                .forward_b_transposed_q4k(&a, &b_q, &mut out, m, n, k)
+                .unwrap();
         }
         let opt_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
         let speedup = ref_ms / opt_ms;
-        eprintln!("  Q4K matmul {m}x{n}x{k}: ref={ref_ms:.1}ms, opt={opt_ms:.1}ms, speedup={speedup:.1}x");
+        eprintln!(
+            "  Q4K matmul {m}x{n}x{k}: ref={ref_ms:.1}ms, opt={opt_ms:.1}ms, speedup={speedup:.1}x"
+        );
     }
 
     #[test]
@@ -2027,7 +2145,9 @@ mod tests {
         let m = 1;
         let n = 4096;
 
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 23) as f32) * 0.005 - 0.05).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 23) as f32) * 0.005 - 0.05)
+            .collect();
 
         let mut b_q = vec![0u8; n * (k / Q4K_BLOCK_SIZE) * Q4K_BLOCK_BYTES];
         for (i, byte) in b_q.iter_mut().enumerate() {
@@ -2064,7 +2184,9 @@ mod tests {
         let m = 1;
         let n = 4;
 
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32) * 0.02 - 0.18).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 19) as f32) * 0.02 - 0.18)
+            .collect();
 
         // Build valid Q6_K blocks: 210 bytes each
         let blocks_per_row = k / Q6K_BLOCK_SIZE;
@@ -2095,16 +2217,26 @@ mod tests {
         let mut out_ref = vec![0.0f32; m * n];
         let mut out_opt = vec![0.0f32; m * n];
 
-        ref_kernel.forward_b_transposed_q6k(&a, &b_q, &mut out_ref, m, n, k).unwrap();
-        opt_kernel.forward_b_transposed_q6k(&a, &b_q, &mut out_opt, m, n, k).unwrap();
+        ref_kernel
+            .forward_b_transposed_q6k(&a, &b_q, &mut out_ref, m, n, k)
+            .unwrap();
+        opt_kernel
+            .forward_b_transposed_q6k(&a, &b_q, &mut out_opt, m, n, k)
+            .unwrap();
 
-        let max_diff: f32 = out_ref.iter().zip(&out_opt)
+        let max_diff: f32 = out_ref
+            .iter()
+            .zip(&out_opt)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f32::max);
 
         // Int8 quantization introduces small errors — allow 5% relative tolerance
         let max_abs = out_ref.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-        let rel_tol = if max_abs > 0.0 { max_diff / max_abs } else { max_diff };
+        let rel_tol = if max_abs > 0.0 {
+            max_diff / max_abs
+        } else {
+            max_diff
+        };
         eprintln!("  Q6K small: max_diff={max_diff:.6}, max_abs={max_abs:.6}, rel={rel_tol:.4}");
         assert!(
             rel_tol < 0.05,
@@ -2118,18 +2250,26 @@ mod tests {
         let m = 1;
         let n = 128;
 
-        let a: Vec<f32> = (0..m * k).map(|i| {
-            let x = (i as f32) * 0.001 - 2.0;
-            x.sin() * 0.5
-        }).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| {
+                let x = (i as f32) * 0.001 - 2.0;
+                x.sin() * 0.5
+            })
+            .collect();
 
         let blocks_per_row = k / Q6K_BLOCK_SIZE;
         let mut b_q = vec![0u8; n * blocks_per_row * Q6K_BLOCK_BYTES];
         for blk_idx in 0..(n * blocks_per_row) {
             let base = blk_idx * Q6K_BLOCK_BYTES;
-            for i in 0..128 { b_q[base + i] = ((blk_idx * 128 + i) * 37 % 256) as u8; }
-            for i in 0..64 { b_q[base + 128 + i] = ((blk_idx * 64 + i) * 53 % 256) as u8; }
-            for i in 0..16 { b_q[base + 192 + i] = (((blk_idx * 16 + i) * 41 % 255) as i8).to_le_bytes()[0]; }
+            for i in 0..128 {
+                b_q[base + i] = ((blk_idx * 128 + i) * 37 % 256) as u8;
+            }
+            for i in 0..64 {
+                b_q[base + 128 + i] = ((blk_idx * 64 + i) * 53 % 256) as u8;
+            }
+            for i in 0..16 {
+                b_q[base + 192 + i] = (((blk_idx * 16 + i) * 41 % 255) as i8).to_le_bytes()[0];
+            }
             let d_bits = half::f16::from_f32(0.0005 + (blk_idx as f32) * 0.00001).to_bits();
             b_q[base + 208] = d_bits as u8;
             b_q[base + 209] = (d_bits >> 8) as u8;
@@ -2141,18 +2281,29 @@ mod tests {
         let mut out_ref = vec![0.0f32; m * n];
         let mut out_opt = vec![0.0f32; m * n];
 
-        ref_kernel.forward_b_transposed_q6k(&a, &b_q, &mut out_ref, m, n, k).unwrap();
-        opt_kernel.forward_b_transposed_q6k(&a, &b_q, &mut out_opt, m, n, k).unwrap();
+        ref_kernel
+            .forward_b_transposed_q6k(&a, &b_q, &mut out_ref, m, n, k)
+            .unwrap();
+        opt_kernel
+            .forward_b_transposed_q6k(&a, &b_q, &mut out_opt, m, n, k)
+            .unwrap();
 
         let mut max_diff = 0.0f32;
         let mut max_abs = 0.0f32;
         let mut worst_idx = 0;
         for i in 0..m * n {
             let diff = (out_ref[i] - out_opt[i]).abs();
-            if diff > max_diff { max_diff = diff; worst_idx = i; }
+            if diff > max_diff {
+                max_diff = diff;
+                worst_idx = i;
+            }
             max_abs = max_abs.max(out_ref[i].abs());
         }
-        let rel_tol = if max_abs > 0.0 { max_diff / max_abs } else { max_diff };
+        let rel_tol = if max_abs > 0.0 {
+            max_diff / max_abs
+        } else {
+            max_diff
+        };
         eprintln!("  Q6K large: max_diff={max_diff:.6} at [{worst_idx}], ref={:.6}, opt={:.6}, rel={rel_tol:.4}",
             out_ref[worst_idx], out_opt[worst_idx]);
         assert!(rel_tol < 0.05, "Q6K large: rel_tol={rel_tol:.4}");

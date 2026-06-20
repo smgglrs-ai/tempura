@@ -1,21 +1,5 @@
+pub use crate::LayerNorm;
 use crate::Result;
-
-pub trait LayerNorm: Send + Sync {
-    /// Apply layer normalization in-place.
-    ///
-    /// - `x`: [batch * seq_len, hidden_size] (flattened)
-    /// - `weight`: [hidden_size] (gamma)
-    /// - `bias`: [hidden_size] (beta), optional
-    /// - `eps`: small constant for numerical stability
-    fn forward(
-        &self,
-        x: &mut [f32],
-        weight: &[f32],
-        bias: Option<&[f32]>,
-        hidden_size: usize,
-        eps: f32,
-    ) -> Result<()>;
-}
 
 #[cfg(feature = "cpu")]
 pub struct CpuLayerNorm;

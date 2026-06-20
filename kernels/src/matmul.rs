@@ -1,39 +1,8 @@
+pub use crate::MatMul;
 use crate::Result;
 
 #[cfg(feature = "cuda")]
 use cuda_core::DeviceBuffer;
-
-pub trait MatMul: Send + Sync {
-    /// Matrix multiplication: output = a × b
-    ///
-    /// - `a`: [m, k] row-major
-    /// - `b`: [k, n] row-major
-    /// - `output`: [m, n] row-major
-    fn forward(
-        &self,
-        a: &[f32],
-        b: &[f32],
-        output: &mut [f32],
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<()>;
-
-    /// Matrix multiplication with transposed B: output = a × bᵀ
-    ///
-    /// - `a`: [m, k] row-major
-    /// - `b`: [n, k] row-major (stored transposed, as in PyTorch Linear weights)
-    /// - `output`: [m, n] row-major
-    fn forward_b_transposed(
-        &self,
-        a: &[f32],
-        b: &[f32],
-        output: &mut [f32],
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<()>;
-}
 
 #[cfg(feature = "cpu")]
 pub struct CpuMatMul;

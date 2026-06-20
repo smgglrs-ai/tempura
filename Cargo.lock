@@ -2805,9 +2805,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tempura-kernel-api",
  "tempura-kernels",
  "thiserror 2.0.18",
  "tokenizers",
+]
+
+[[package]]
+name = "tempura-kernel-api"
+version = "0.1.0"
+dependencies = [
+ "rand 0.9.4",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2825,6 +2834,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "tempura-kernel-api",
  "thiserror 2.0.18",
 ]
 

@@ -1835,7 +1835,8 @@ items:
     The API crate contains: Attention, RMSNorm, RoPE, MatMul, Sampler, LayerNorm,
     AllReduce, KvCacheCompressor, GuidedDecoder traits, SamplingParams, CompressedKV,
     KernelError, and Result type.'
-  status: pending
+  status: done
+  progress: 100
   priority: critical
   effort: L
   depends_on:

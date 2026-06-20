@@ -1,8 +1,5 @@
+pub use crate::AllReduce;
 use crate::Result;
-
-pub trait AllReduce: Send + Sync {
-    fn sum_in_place(&self, data: &mut [f32]) -> Result<()>;
-}
 
 #[cfg(feature = "cpu")]
 pub struct CpuAllReduce;
