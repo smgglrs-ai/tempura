@@ -1710,7 +1710,8 @@ items:
     DualPipeline — exact match expected since both use the same dequant formula,
     just different accumulation order. Keep CpuMatMulQ4K as the formal verification
     reference; CpuMatMulQ4KOpt is the production CPU path.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: M
   depends_on:
@@ -1896,7 +1897,8 @@ items:
     produce randomized inputs for each kernel trait, (4) a VerificationReport type
     capturing results per-kernel. The goal: implementing a kernel trait and running
     cargo tempura verify gives you a full verification report with zero boilerplate.'
-  status: pending
+  status: done
+  progress: 100
   priority: critical
   effort: L
   depends_on:

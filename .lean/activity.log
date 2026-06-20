@@ -840,3 +840,11 @@
   summary: "Added structured trace diff engine: TraceDiff with None/Numerical/Semantic divergence levels, per-layer NormDiff, per-token comparison, first divergence point, configurable epsilon. 5 new tests, 221 total."
   iteration: 3
   max_iterations: 10
+
+- timestamp: "2026-06-20T11:30:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p12-verification-toolkit"
+  summary: "Created tempura-kernel-verify crate: DualPipelineRunner comparing any trait impl against reference with configurable epsilon, test generators for Attention/MatMul/RMSNorm/RoPE, VerificationReport with per-kernel pass/fail/tier. 5 new tests, 226 total."
+  iteration: 4
+  max_iterations: 10

@@ -2840,6 +2840,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tempura-kernel-verify"
+version = "0.1.0"
+dependencies = [
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "tempura-engine",
+ "tempura-kernel-api",
+ "tempura-kernels",
+]
+
+[[package]]
 name = "tempura-kernels"
 version = "0.1.0"
 dependencies = [

@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel-api", "kernels", "engine", "model", "server"]
+members = ["kernel-api", "kernels", "kernel-verify", "engine", "model", "server"]
 resolver = "2"
 
 [workspace.package]
