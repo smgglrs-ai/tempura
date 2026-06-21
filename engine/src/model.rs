@@ -909,9 +909,21 @@ where
             Some(masked),
         );
 
-        for step in 1..max_new_tokens {
+        let mut step = 1;
+        while step < max_new_tokens {
             if eos_token == Some(*generated.last().unwrap()) || decoder.is_complete() {
                 break;
+            }
+
+            if let Some(forced) = decoder.forced_tokens() {
+                for &tok in &forced {
+                    if step >= max_new_tokens || decoder.is_complete() {
+                        break;
+                    }
+                    generated.push(tok);
+                    step += 1;
+                }
+                continue;
             }
 
             let mut logits = self.forward(session, &[*generated.last().unwrap()]);
@@ -941,6 +953,7 @@ where
                 Some(masked),
             );
             generated.push(token);
+            step += 1;
         }
 
         let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;

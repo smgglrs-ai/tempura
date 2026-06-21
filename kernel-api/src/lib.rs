@@ -281,4 +281,8 @@ pub trait GuidedDecoder: Send {
     fn mask_logits(&mut self, token_ids_so_far: &[u32], logits: &mut [f32]);
     fn is_complete(&self) -> bool;
     fn tokens_masked_last_step(&self) -> usize;
+
+    fn forced_tokens(&self) -> Option<Vec<u32>> {
+        None
+    }
 }

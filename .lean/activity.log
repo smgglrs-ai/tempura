@@ -909,3 +909,11 @@
   summary: "Added Dequantize trait, QuantDtype enum (Int4/Int8/Fp16), QuantizedTensor struct to kernel-api. CpuDequantize implementation with Int4 packed nibble, Int8, and Fp16 support. 234 tests pass."
   iteration: 2
   max_iterations: 10
+
+- timestamp: "2026-06-21T11:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p22-structured-gen-v2"
+  summary: "Added grammar jump-ahead: forced_tokens() on GuidedDecoder trait, forced_string() detects deterministic continuations (literals, colons), generate_guided skips forward pass for forced tokens. Fixed needs_colon_after quote counting. 3 new tests, 237 total."
+  iteration: 3
+  max_iterations: 10

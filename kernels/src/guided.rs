@@ -202,6 +202,34 @@ impl JsonGuidedDecoder {
                 || (self.state == JsonState::InNumber && !self.generated_text.is_empty()));
     }
 
+    fn forced_string(&self) -> String {
+        let mut forced = String::new();
+
+        if self.state == JsonState::InLiteral && !self.literal_remaining.is_empty() {
+            for &b in &self.literal_remaining {
+                forced.push(b as char);
+            }
+        }
+
+        if !forced.is_empty() {
+            return forced;
+        }
+
+        if self.state == JsonState::ExpectColon {
+            forced.push(':');
+        }
+
+        if !forced.is_empty() {
+            return forced;
+        }
+
+        if self.state == JsonState::AfterValue && self.stack.is_empty() {
+            return forced;
+        }
+
+        forced
+    }
+
     fn needs_colon_after(&self, _closing_quote: char) -> bool {
         // Count quotes in current object context to determine if this is a key or value
         let mut quote_count = 0u32;
@@ -224,8 +252,8 @@ impl JsonGuidedDecoder {
                 _ => {}
             }
         }
-        // After opening { or after comma, the next string is a key (quote_count is even before closing quote)
-        quote_count.is_multiple_of(2)
+        // quote_count is odd means the closing quote completes a key (open=1st, close=2nd=key done)
+        quote_count % 2 == 1
     }
 }
 
@@ -280,6 +308,44 @@ impl GuidedDecoder for JsonGuidedDecoder {
 
     fn tokens_masked_last_step(&self) -> usize {
         self.last_masked
+    }
+
+    fn forced_tokens(&self) -> Option<Vec<u32>> {
+        if self.complete {
+            return None;
+        }
+
+        let forced_str = self.forced_string();
+        if forced_str.is_empty() {
+            return None;
+        }
+
+        let mut tokens = Vec::new();
+        let mut remaining = forced_str.as_str();
+        while !remaining.is_empty() {
+            let mut best_len = 0;
+            let mut best_tok = None;
+            for (i, text) in self.vocab.iter().enumerate() {
+                if !text.is_empty() && remaining.starts_with(text.as_str()) && text.len() > best_len
+                {
+                    best_len = text.len();
+                    best_tok = Some(i as u32);
+                }
+            }
+            match best_tok {
+                Some(tok) => {
+                    tokens.push(tok);
+                    remaining = &remaining[best_len..];
+                }
+                None => break,
+            }
+        }
+
+        if tokens.is_empty() {
+            None
+        } else {
+            Some(tokens)
+        }
     }
 }
 
@@ -451,6 +517,40 @@ mod tests {
             &mut literal
         )
         .is_none());
+    }
+
+    #[test]
+    fn test_forced_tokens_literal() {
+        let vocab = simple_vocab();
+        let mut decoder = JsonGuidedDecoder::new(vocab);
+        decoder.update_internal_state("t");
+        // After 't', the grammar forces "rue"
+        assert_eq!(decoder.state, JsonState::InLiteral);
+        assert_eq!(decoder.literal_remaining, b"rue");
+        let forced = decoder.forced_string();
+        assert_eq!(forced, "rue");
+    }
+
+    #[test]
+    fn test_forced_tokens_colon() {
+        let vocab = simple_vocab();
+        let mut decoder = JsonGuidedDecoder::new(vocab);
+        decoder.update_internal_state("{\"a\"");
+        assert_eq!(decoder.state, JsonState::ExpectColon);
+        let forced = decoder.forced_string();
+        assert_eq!(forced, ":");
+        let tokens = decoder.forced_tokens();
+        assert!(tokens.is_some());
+        assert_eq!(tokens.unwrap(), vec![3]); // ":" is token 3
+    }
+
+    #[test]
+    fn test_forced_tokens_none_in_string() {
+        let vocab = simple_vocab();
+        let mut decoder = JsonGuidedDecoder::new(vocab);
+        decoder.update_internal_state("{\"");
+        assert_eq!(decoder.state, JsonState::InString);
+        assert!(decoder.forced_tokens().is_none());
     }
 
     #[test]
