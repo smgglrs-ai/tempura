@@ -925,3 +925,19 @@
   summary: "Added architecture registry: Architecture struct with typed blocks (PreNormAttention, ParallelAttentionFfn, etc.), NormType, FfnType, PositionEncoding, AttentionType enums. 6 named architectures (llama, mistral, phi, gemma, qwen2, gpt-neox). Auto-detect from model_type. diff_architectures for comparison. 6 new tests, 243 total."
   iteration: 4
   max_iterations: 10
+
+- timestamp: "2026-06-21T11:45:00+02:00"
+  actor: claude
+  action: loop-complete
+  summary: "Loop finished: 4 items completed + 1 quantized traits. Exit: remaining items all L/XL effort."
+  details:
+    iterations: 4
+    max_iterations: 10
+    completed:
+    - e2e-quantized-gemm-gpu
+    - p15-quantized-kernel-traits
+    - p22-structured-gen-v2
+    - p16-architecture-registry
+    exit_reason: "Remaining unblocked items all L/XL effort — stopping for review"
+    branch: "loop/2026-06-21"
+    tag: "loop-run/2026-06-21-4"
