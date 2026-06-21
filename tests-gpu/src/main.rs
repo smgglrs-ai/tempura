@@ -4,7 +4,7 @@ use half::f16;
 use std::time::Instant;
 use tempura_kernels::attention::{Attention, CpuAttention, CudaAttention};
 use tempura_kernels::matmul::{CpuMatMul, CudaMatMul, MatMul};
-use tempura_kernels::quantized::{CpuMatMulQ4K, CudaMatMulQ4K, MatMulQ};
+use tempura_kernels::quantized::{CpuMatMulQ4K, CpuMatMulQ4KOpt, CudaMatMulQ4K, MatMulQ};
 use tempura_kernels::rmsnorm::{CpuRMSNorm, CudaRMSNorm, RMSNorm};
 use tempura_kernels::rope::{CpuRoPE, CudaRoPE, RoPE};
 use tempura_kernels::{Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE};
@@ -817,6 +817,48 @@ fn test_q4k_cpu_vs_gpu(m: usize, n: usize, k: usize) {
     }
 }
 
+fn bench_q4k_gpu(m: usize, n: usize, k: usize, label: &str) {
+    println!("=== Q4K Bench: {label}  m={m} n={n} k={k} ===");
+
+    let cpu_opt = CpuMatMulQ4KOpt;
+    let gpu = CudaMatMulQ4K::new().expect("Failed to init CudaMatMulQ4K");
+
+    let a: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+    let blocks_per_row = k / Q4K_BLOCK_SIZE;
+    let b_bytes = n * blocks_per_row * Q4K_BLOCK_BYTES;
+    let b_quantized: Vec<u8> = (0..b_bytes).map(|i| (i % 256) as u8).collect();
+    let mut output = vec![0.0f32; m * n];
+
+    // Warmup GPU (includes module load + first kernel launch)
+    gpu.forward_b_transposed_q4k(&a, &b_quantized, &mut output, m, n, k).unwrap();
+
+    // Benchmark GPU (3 runs, take median)
+    let mut gpu_times = Vec::new();
+    for _ in 0..5 {
+        let t = Instant::now();
+        gpu.forward_b_transposed_q4k(&a, &b_quantized, &mut output, m, n, k).unwrap();
+        gpu_times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    gpu_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let gpu_median = gpu_times[2];
+
+    // Benchmark CPU optimized (3 runs, take median)
+    let mut cpu_times = Vec::new();
+    for _ in 0..3 {
+        let t = Instant::now();
+        cpu_opt.forward_b_transposed_q4k(&a, &b_quantized, &mut output, m, n, k).unwrap();
+        cpu_times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    cpu_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let cpu_median = cpu_times[1];
+
+    let speedup = cpu_median / gpu_median;
+    let gflops_equiv = 2.0 * m as f64 * n as f64 * k as f64 / (gpu_median / 1000.0) / 1e9;
+
+    println!("  CPU (opt): {cpu_median:.2}ms  GPU: {gpu_median:.2}ms  Speedup: {speedup:.1}x");
+    println!("  GPU equiv GFLOPS: {gflops_equiv:.1}\n");
+}
+
 fn main() {
     println!("╔══════════════════════════════════════════════════════╗");
     println!("║  tempura-serve GPU Validation Suite (RTX 5090)        ║");
@@ -915,11 +957,18 @@ fn main() {
     bench_flash_f32_vs_f16kv("prefill s=4096", 4096, 4096, 32, 8, 128);
     bench_flash_f32_vs_f16kv("decode s=1 kv=2048", 1, 2048, 32, 8, 128);
 
-    // --- Quantized GEMM Q4K: CPU vs GPU ---
+    // --- Quantized GEMM Q4K: CPU vs GPU correctness ---
     test_q4k_cpu_vs_gpu(1, 16, 256);
     test_q4k_cpu_vs_gpu(1, 64, 256);
     test_q4k_cpu_vs_gpu(1, 256, 512);
     test_q4k_cpu_vs_gpu(1, 1024, 1024);
+
+    // --- Quantized GEMM Q4K: performance benchmarks ---
+    bench_q4k_gpu(1, 3584, 3584, "qkv_proj (decode)");
+    bench_q4k_gpu(1, 18944, 3584, "gate_proj (decode)");
+    bench_q4k_gpu(1, 3584, 18944, "down_proj (decode)");
+    bench_q4k_gpu(1, 151936, 3584, "lm_head (decode)");
+    bench_q4k_gpu(128, 3584, 3584, "qkv_proj (prefill-128)");
 
     println!("All GPU tests passed.");
 }
