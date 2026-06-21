@@ -917,3 +917,11 @@
   summary: "Added grammar jump-ahead: forced_tokens() on GuidedDecoder trait, forced_string() detects deterministic continuations (literals, colons), generate_guided skips forward pass for forced tokens. Fixed needs_colon_after quote counting. 3 new tests, 237 total."
   iteration: 3
   max_iterations: 10
+
+- timestamp: "2026-06-21T11:30:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p16-architecture-registry"
+  summary: "Added architecture registry: Architecture struct with typed blocks (PreNormAttention, ParallelAttentionFfn, etc.), NormType, FfnType, PositionEncoding, AttentionType enums. 6 named architectures (llama, mistral, phi, gemma, qwen2, gpt-neox). Auto-detect from model_type. diff_architectures for comparison. 6 new tests, 243 total."
+  iteration: 4
+  max_iterations: 10

@@ -1,3 +1,4 @@
+pub mod architecture;
 pub mod batch_invariant;
 pub mod config;
 pub mod disaggregated;

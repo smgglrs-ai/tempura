@@ -2194,7 +2194,8 @@ items:
     The forward pass becomes generic over Architecture instead of hardcoded. New
     architectures are added by composing existing blocks — no new Rust code for
     standard transformer variants.'
-  status: pending
+  status: done
+  progress: 100
   priority: medium
   effort: L
   depends_on:
