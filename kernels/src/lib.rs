@@ -1,8 +1,8 @@
 pub use tempura_kernel_api::{
-    AllReduce, Attention, CompressedKV, GuidedDecoder, KernelError, KvCacheCompressor, LayerNorm,
-    MatMul, MatMulQ, RMSNorm, Result, RoPE, Sampler, SamplingParams, VerificationTier,
-    Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE, Q6K_BLOCK_BYTES,
-    Q6K_BLOCK_SIZE, Q6K_GROUPS, Q6K_GROUP_SIZE,
+    AllReduce, Attention, CompressedKV, Dequantize, GuidedDecoder, KernelError, KvCacheCompressor,
+    LayerNorm, MatMul, MatMulQ, QuantDtype, QuantizedTensor, RMSNorm, Result, RoPE, Sampler,
+    SamplingParams, VerificationTier, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE, Q4K_GROUPS,
+    Q4K_GROUP_SIZE, Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, Q6K_GROUPS, Q6K_GROUP_SIZE,
 };
 
 pub mod allreduce;

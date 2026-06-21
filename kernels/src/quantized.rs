@@ -1,7 +1,7 @@
 use crate::Result;
 pub use crate::{
-    MatMulQ, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE, Q6K_BLOCK_BYTES,
-    Q6K_BLOCK_SIZE, Q6K_GROUPS, Q6K_GROUP_SIZE,
+    Dequantize, MatMulQ, QuantDtype, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE,
+    Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, Q6K_GROUPS, Q6K_GROUP_SIZE,
 };
 use rayon::prelude::*;
 
@@ -1650,6 +1650,69 @@ unsafe fn quantize_row_q8_avx2_q6k(a: &[f32]) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
     }
 
     (a_q8, scales, group_sums)
+}
+
+#[cfg(feature = "cpu")]
+pub struct CpuDequantize;
+
+#[cfg(feature = "cpu")]
+impl Dequantize for CpuDequantize {
+    fn dequantize(
+        &self,
+        quantized: &[u8],
+        scales: &[f32],
+        zeros: &[f32],
+        output: &mut [f32],
+        dtype: QuantDtype,
+        group_size: usize,
+    ) -> Result<()> {
+        if group_size == 0 {
+            return Err(crate::KernelError::InvalidConfig(
+                "group_size must be > 0".into(),
+            ));
+        }
+        match dtype {
+            QuantDtype::Int8 => {
+                for (i, &q) in quantized.iter().enumerate() {
+                    let group = i / group_size;
+                    if group >= scales.len() || group >= zeros.len() || i >= output.len() {
+                        break;
+                    }
+                    output[i] = (q as i8 as f32 - zeros[group]) * scales[group];
+                }
+            }
+            QuantDtype::Int4 => {
+                for (byte_idx, &byte) in quantized.iter().enumerate() {
+                    let elem_lo = byte_idx * 2;
+                    let elem_hi = elem_lo + 1;
+                    let lo = (byte & 0x0F) as f32;
+                    let hi = (byte >> 4) as f32;
+                    let group_lo = elem_lo / group_size;
+                    let group_hi = elem_hi / group_size;
+                    if elem_lo < output.len() && group_lo < scales.len() {
+                        output[elem_lo] = (lo - zeros[group_lo]) * scales[group_lo];
+                    }
+                    if elem_hi < output.len() && group_hi < scales.len() {
+                        output[elem_hi] = (hi - zeros[group_hi]) * scales[group_hi];
+                    }
+                }
+            }
+            QuantDtype::Fp16 => {
+                for (i, chunk) in quantized.chunks_exact(2).enumerate() {
+                    if i >= output.len() {
+                        break;
+                    }
+                    let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    output[i] = f16_to_f32(bits);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Tested
+    }
 }
 
 #[cfg(feature = "cuda")]

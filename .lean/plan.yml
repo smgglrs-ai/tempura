@@ -2128,7 +2128,8 @@ items:
     group metadata. These traits go in tempura-kernel-api so 3rd parties can implement
     quantized backends. CPU reference implementations use the existing dequantize_tensor
     logic from engine/src/weights.rs but formalized as trait implementations.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: M
   depends_on:

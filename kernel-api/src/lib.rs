@@ -239,6 +239,42 @@ pub trait MatMulQ: Send + Sync {
     ) -> Result<()>;
 }
 
+// ── Dequantize ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantDtype {
+    Int4,
+    Int8,
+    Fp16,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuantizedTensor {
+    pub data: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub zeros: Vec<f32>,
+    pub dtype: QuantDtype,
+    pub num_elements: usize,
+    pub group_size: usize,
+}
+
+pub trait Dequantize: Send + Sync {
+    fn dequantize(
+        &self,
+        quantized: &[u8],
+        scales: &[f32],
+        zeros: &[f32],
+        output: &mut [f32],
+        dtype: QuantDtype,
+        group_size: usize,
+    ) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
+}
+
 // ── GuidedDecoder ───────────────────────────────────────────────────────────
 
 pub trait GuidedDecoder: Send {
