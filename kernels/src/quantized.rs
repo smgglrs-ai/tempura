@@ -1652,6 +1652,114 @@ unsafe fn quantize_row_q8_avx2_q6k(a: &[f32]) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
     (a_q8, scales, group_sums)
 }
 
+#[cfg(feature = "cuda")]
+pub struct CudaMatMulQ4K {
+    gpu: crate::gpu::GpuContext,
+    module: crate::gpu::quantized_gemm_kernel::kernels::LoadedModule,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for CudaMatMulQ4K {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for CudaMatMulQ4K {}
+
+#[cfg(feature = "cuda")]
+impl CudaMatMulQ4K {
+    pub fn new() -> crate::Result<Self> {
+        let gpu = crate::gpu::GpuContext::new(0)?;
+        let module = crate::gpu::quantized_gemm_kernel::kernels::load(gpu.context())
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Self { gpu, module })
+    }
+
+    pub fn gpu(&self) -> &crate::gpu::GpuContext {
+        &self.gpu
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl MatMulQ for CudaMatMulQ4K {
+    fn forward_b_transposed_q4k(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        if k % Q4K_BLOCK_SIZE != 0 {
+            return Err(crate::KernelError::InvalidConfig(format!(
+                "k={k} not divisible by {Q4K_BLOCK_SIZE}"
+            )));
+        }
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+
+        let a_dev = crate::gpu::to_device(&stream, a)?;
+        let b_dev = crate::gpu::to_device_u8(&stream, b_quantized)?;
+        let mut c_dev = crate::gpu::alloc_device(&stream, m * n)?;
+
+        let total = (m * n) as u32;
+        self.module
+            .gemm_q4k_bt(
+                &stream,
+                LaunchConfig::for_num_elems(total),
+                m as u32,
+                n as u32,
+                k as u32,
+                &a_dev,
+                &b_dev,
+                &mut c_dev,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+        crate::gpu::copy_back(&stream, &c_dev, output)?;
+        Ok(())
+    }
+
+    fn forward_b_transposed_q6k(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        if k % Q6K_BLOCK_SIZE != 0 {
+            return Err(crate::KernelError::InvalidConfig(format!(
+                "k={k} not divisible by {Q6K_BLOCK_SIZE}"
+            )));
+        }
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+
+        let a_dev = crate::gpu::to_device(&stream, a)?;
+        let b_dev = crate::gpu::to_device_u8(&stream, b_quantized)?;
+        let mut c_dev = crate::gpu::alloc_device(&stream, m * n)?;
+
+        let total = (m * n) as u32;
+        self.module
+            .gemm_q6k_bt(
+                &stream,
+                LaunchConfig::for_num_elems(total),
+                m as u32,
+                n as u32,
+                k as u32,
+                &a_dev,
+                &b_dev,
+                &mut c_dev,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+        crate::gpu::copy_back(&stream, &c_dev, output)?;
+        Ok(())
+    }
+}
+
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;

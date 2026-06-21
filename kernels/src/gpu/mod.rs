@@ -5,6 +5,7 @@ pub mod flash_decode_kernel;
 pub mod matmul_kernel;
 pub mod matmul_mma_kernel;
 pub mod mma_sync;
+pub mod quantized_gemm_kernel;
 pub mod rmsnorm_kernel;
 pub mod rope_kernel;
 
@@ -76,6 +77,10 @@ pub fn to_device_u16(stream: &CudaStream, data: &[u16]) -> Result<DeviceBuffer<u
 
 pub fn alloc_device_u16(stream: &CudaStream, len: usize) -> Result<DeviceBuffer<u16>, KernelError> {
     DeviceBuffer::zeroed(stream, len).map_err(|e| KernelError::InvalidConfig(e.to_string()))
+}
+
+pub fn to_device_u8(stream: &CudaStream, data: &[u8]) -> Result<DeviceBuffer<u8>, KernelError> {
+    DeviceBuffer::from_host(stream, data).map_err(|e| KernelError::InvalidConfig(e.to_string()))
 }
 
 pub fn alloc_device_u32(stream: &CudaStream, len: usize) -> Result<DeviceBuffer<u32>, KernelError> {

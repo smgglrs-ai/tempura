@@ -1733,7 +1733,8 @@ items:
     against the CPU reference via DualPipeline. This enables Qwen3-8B to fit
     entirely in 32GB VRAM (4.9GB Q4K weights + KV cache + scratch < 8GB).
     Also need Q6_K GPU kernel for ffn_down and output weights.'
-  status: pending
+  status: done
+  progress: 100
   priority: critical
   effort: L
   scope:

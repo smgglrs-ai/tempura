@@ -1,11 +1,13 @@
 mod test_pack;
 
 use half::f16;
+use std::time::Instant;
 use tempura_kernels::attention::{Attention, CpuAttention, CudaAttention};
 use tempura_kernels::matmul::{CpuMatMul, CudaMatMul, MatMul};
+use tempura_kernels::quantized::{CpuMatMulQ4K, CudaMatMulQ4K, MatMulQ};
 use tempura_kernels::rmsnorm::{CpuRMSNorm, CudaRMSNorm, RMSNorm};
 use tempura_kernels::rope::{CpuRoPE, CudaRoPE, RoPE};
-use std::time::Instant;
+use tempura_kernels::{Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE};
 
 fn test_rope_cpu_vs_gpu() {
     println!("=== RoPE: CPU vs GPU ===");
@@ -758,6 +760,63 @@ fn bench_flash_f32_vs_f16kv(
     println!();
 }
 
+fn test_q4k_cpu_vs_gpu(m: usize, n: usize, k: usize) {
+    println!("=== Q4K MatMul: CPU vs GPU  m={m} n={n} k={k} ===");
+
+    assert!(k % Q4K_BLOCK_SIZE == 0, "k must be multiple of 256");
+
+    let cpu = CpuMatMulQ4K;
+    let gpu = CudaMatMulQ4K::new().expect("Failed to init CudaMatMulQ4K");
+
+    let a: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+
+    let blocks_per_row = k / Q4K_BLOCK_SIZE;
+    let b_bytes = n * blocks_per_row * Q4K_BLOCK_BYTES;
+    let b_quantized: Vec<u8> = (0..b_bytes).map(|i| (i % 256) as u8).collect();
+
+    let mut out_cpu = vec![0.0f32; m * n];
+    let mut out_gpu = vec![0.0f32; m * n];
+
+    let t_cpu = Instant::now();
+    cpu.forward_b_transposed_q4k(&a, &b_quantized, &mut out_cpu, m, n, k)
+        .unwrap();
+    let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1000.0;
+
+    let t_gpu = Instant::now();
+    gpu.forward_b_transposed_q4k(&a, &b_quantized, &mut out_gpu, m, n, k)
+        .unwrap();
+    let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1000.0;
+
+    let mut max_abs_diff = 0.0f32;
+    let mut max_rel_diff = 0.0f32;
+    let mut mismatches = 0;
+    for i in 0..m * n {
+        let abs_diff = (out_cpu[i] - out_gpu[i]).abs();
+        let denom = out_cpu[i].abs().max(1e-6);
+        let rel_diff = abs_diff / denom;
+        max_abs_diff = max_abs_diff.max(abs_diff);
+        max_rel_diff = max_rel_diff.max(rel_diff);
+        if rel_diff > 1e-4 {
+            if mismatches < 3 {
+                eprintln!(
+                    "  MISMATCH [{i}]: cpu={:.4}, gpu={:.4}, abs={:.6}, rel={:.6}",
+                    out_cpu[i], out_gpu[i], abs_diff, rel_diff
+                );
+            }
+            mismatches += 1;
+        }
+    }
+
+    println!("  CPU: {cpu_ms:.2}ms  GPU: {gpu_ms:.2}ms");
+    println!("  Max abs diff: {max_abs_diff:.6}  Max rel diff: {max_rel_diff:.8}");
+    if mismatches == 0 {
+        println!("  PASS\n");
+    } else {
+        println!("  FAIL: {mismatches} elements with relative error > 1e-4\n");
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     println!("╔══════════════════════════════════════════════════════╗");
     println!("║  tempura-serve GPU Validation Suite (RTX 5090)        ║");
@@ -855,6 +914,12 @@ fn main() {
     bench_flash_f32_vs_f16kv("prefill s=2048", 2048, 2048, 32, 8, 128);
     bench_flash_f32_vs_f16kv("prefill s=4096", 4096, 4096, 32, 8, 128);
     bench_flash_f32_vs_f16kv("decode s=1 kv=2048", 1, 2048, 32, 8, 128);
+
+    // --- Quantized GEMM Q4K: CPU vs GPU ---
+    test_q4k_cpu_vs_gpu(1, 16, 256);
+    test_q4k_cpu_vs_gpu(1, 64, 256);
+    test_q4k_cpu_vs_gpu(1, 256, 512);
+    test_q4k_cpu_vs_gpu(1, 1024, 1024);
 
     println!("All GPU tests passed.");
 }

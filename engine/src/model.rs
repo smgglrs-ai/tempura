@@ -1105,10 +1105,9 @@ impl
                     .rmsnorm
                     .forward_device(
                         &scratch.q,
-                        &mut scratch.q_rotated,
                         q_norm_w,
+                        &mut scratch.q_rotated,
                         head_dim,
-                        seq_len * n_heads,
                         cfg.layer_norm_eps,
                     )
                     .expect("qk norm q");
@@ -1123,10 +1122,9 @@ impl
                     .rmsnorm
                     .forward_device(
                         &scratch.k,
-                        &mut scratch.k_rotated,
                         k_norm_w,
+                        &mut scratch.k_rotated,
                         head_dim,
-                        seq_len * n_kv_heads,
                         cfg.layer_norm_eps,
                     )
                     .expect("qk norm k");

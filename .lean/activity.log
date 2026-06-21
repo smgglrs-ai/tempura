@@ -893,3 +893,11 @@
     exit_reason: "Remaining unblocked items all L/XL effort — stopping for review"
     branch: "loop/2026-06-20"
     tag: "loop-run/2026-06-20-7"
+
+- timestamp: "2026-06-21T10:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "e2e-quantized-gemm-gpu"
+  summary: "GPU quantized GEMM: CudaMatMulQ4K (Q4_K dequant-fused matmul) and gemm_q6k_bt (Q6_K). Both cuda-oxide kernels compile and pass DualPipeline validation (max relative error 5e-7). GPU faster than CPU at 1024x1024. Also fixed pre-existing QK-norm forward_device arg order bug."
+  iteration: 1
+  max_iterations: 10
