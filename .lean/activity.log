@@ -941,3 +941,11 @@
     exit_reason: "Remaining unblocked items all L/XL effort — stopping for review"
     branch: "loop/2026-06-21"
     tag: "loop-run/2026-06-21-4"
+
+- timestamp: "2026-06-22T10:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p21-fused-kernels"
+  summary: "Added fused kernel traits: FusedRMSNormResidual (norm + residual add in one pass), FusedSiluGate (SiLU × gate). CPU implementations verified against sequential equivalents. 5 new tests, 248 total."
+  iteration: 5
+  max_iterations: 10

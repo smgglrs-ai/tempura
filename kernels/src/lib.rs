@@ -7,6 +7,7 @@ pub use tempura_kernel_api::{
 
 pub mod allreduce;
 pub mod attention;
+pub mod fused;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 pub mod guided;

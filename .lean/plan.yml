@@ -1757,6 +1757,8 @@ items:
     (1) VRAM-only: all weights + KV cache in GPU memory (current, works for small models).
     (2) Hybrid CPU/GPU: weights partitioned across VRAM and system RAM. Layer-by-layer
     streaming — upload layer N weights to GPU, compute, discard, upload layer N+1.
+    NOTE: benchmarks show decode-phase Q4K is transfer-dominated (0.3x GPU vs CPU).
+    Resident weights are the critical fix — this item enables GPU decode performance.
     Peak VRAM = 1 layer of weights + KV cache + scratch, not all layers.
     (3) Converged: for unified memory architectures (GX10 128GB LPDDR5X, Grace Hopper
     NVLink-C2C, AMD APU), pin system memory and pass device pointers directly — zero
@@ -1769,7 +1771,7 @@ items:
   priority: high
   effort: XL
   depends_on:
-  - e2e-quantized-gemm
+  - e2e-quantized-gemm-gpu
   scope:
   - engine/src/memory.rs
   - engine/src/weights.rs
@@ -2544,7 +2546,8 @@ items:
     and add residual in one pass. (2) SiLU activation × gate multiply —
     the gated FFN pattern. (3) Bias + residual add. Each fused kernel has
     a Kani proof and DualPipeline comparison against the sequential version.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: L
   depends_on:
