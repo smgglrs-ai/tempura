@@ -342,6 +342,123 @@ pub mod kernels {
         }
     }
 
+    /// Intra-block cooperative Q4_K GEMV: 32 lanes dequant one block together.
+    ///
+    /// Each lane reads 4 qs bytes → 8 elements (4 low nibbles + 4 high nibbles).
+    /// All lanes read from the SAME block → coalesced 128-byte read for qs.
+    /// Per-block partial sums reduced via warp shuffle.
+    /// Outer loop: one warp iterates over all blocks for one output column.
+    ///
+    /// Grid: (ceil(n/WARPS_Y), 1, 1), Block: (32, WARPS_Y, 1)
+    #[kernel]
+    pub fn gemv_q4k_coop(
+        n: u32,
+        k: u32,
+        a: &[f32],
+        b_q4k: &[u8],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let lane = warp::lane_id() as usize;
+        let col = (thread::blockIdx_x() as usize) * (thread::blockDim_y() as usize)
+            + thread::threadIdx_y() as usize;
+
+        let n = n as usize;
+        let k = k as usize;
+        if col >= n {
+            return;
+        }
+
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let mut col_sum = 0.0f32;
+
+        // Lane L reads qs bytes [L*4 .. L*4+3] from each block.
+        // group = (L*4) / 32, local_offset = (L*4) % 32
+        let qs_byte_off = lane * 4;
+        let group = qs_byte_off / 32; // 0..3
+        let local = qs_byte_off % 32; // 0..31
+
+        // Element indices for this lane's low and high nibbles:
+        // low:  group*64 + local + {0,1,2,3}
+        // high: group*64 + 32 + local + {0,1,2,3}
+        let elem_lo_base = group * 64 + local;
+        let elem_hi_base = group * 64 + 32 + local;
+
+        // Sub-group indices for scale lookup:
+        // low nibbles use sc[2*group], m[2*group]
+        // high nibbles use sc[2*group+1], m[2*group+1]
+        let sc_idx_lo = 2 * group;
+        let sc_idx_hi = 2 * group + 1;
+
+        let mut blk = 0usize;
+        while blk < blocks_per_row {
+            let block_offset = (col * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+
+            // All 32 lanes read the same d/dmin (broadcast — same address)
+            let d = f16_bits_to_f32(
+                (b_q4k[block_offset] as u16) | ((b_q4k[block_offset + 1] as u16) << 8),
+            );
+            let dmin = f16_bits_to_f32(
+                (b_q4k[block_offset + 2] as u16) | ((b_q4k[block_offset + 3] as u16) << 8),
+            );
+
+            // Unpack scales — each lane computes its own group's scale/min
+            let packed = &b_q4k[block_offset + 4..];
+            let mut sc = [0.0f32; 8];
+            let mut mins = [0.0f32; 8];
+            let mut i = 0usize;
+            while i < 4 {
+                sc[i] = (packed[i] & 0x3F) as f32;
+                sc[i + 4] =
+                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                mins[i] = (packed[i + 4] & 0x3F) as f32;
+                mins[i + 4] =
+                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                i += 1;
+            }
+
+            let d_lo = d * sc[sc_idx_lo];
+            let m_lo = dmin * mins[sc_idx_lo];
+            let d_hi = d * sc[sc_idx_hi];
+            let m_hi = dmin * mins[sc_idx_hi];
+
+            // Each lane reads 4 consecutive qs bytes — coalesced across warp
+            let qs = &b_q4k[block_offset + 16..];
+            let a_base = blk * Q4K_BLOCK_SIZE;
+
+            let mut partial = 0.0f32;
+            let mut li = 0usize;
+            while li < 4 {
+                let byte = qs[qs_byte_off + li];
+                let q_lo = (byte & 0x0F) as f32;
+                let q_hi = (byte >> 4) as f32;
+
+                partial += a[a_base + elem_lo_base + li] * (d_lo * q_lo - m_lo);
+                partial += a[a_base + elem_hi_base + li] * (d_hi * q_hi - m_hi);
+                li += 1;
+            }
+
+            // Warp-wide reduction: sum 32 partial products for this block
+            partial += warp::shuffle_xor_f32(partial, 16);
+            partial += warp::shuffle_xor_f32(partial, 8);
+            partial += warp::shuffle_xor_f32(partial, 4);
+            partial += warp::shuffle_xor_f32(partial, 2);
+            partial += warp::shuffle_xor_f32(partial, 1);
+
+            // Only lane 0 accumulates the block sum
+            if lane == 0 {
+                col_sum += partial;
+            }
+
+            blk += 1;
+        }
+
+        if lane == 0 {
+            unsafe {
+                *output.get_unchecked_mut(col) = col_sum;
+            }
+        }
+    }
+
     /// GPU Q6_K dequantize-fused matmul: output[i,j] = dot(a[i,:], dequant(b_q6k[j,:]))
     /// Q6_K block layout (210 bytes per 256 elements):
     ///   ql[128]: low 4 bits of each element

@@ -965,6 +965,76 @@ fn bench_q4k_warp(n: usize, k: usize, label: &str) {
     println!("  Speedup: {speedup:.2}x  (max_rel_diff={max_rel:.2e})\n");
 }
 
+fn bench_q4k_coop(n: usize, k: usize, label: &str) {
+    println!("=== Q4K Coop Bench: {label}  n={n} k={k} ===");
+
+    let gpu = CudaMatMulQ4K::new().expect("Failed to init CudaMatMulQ4K");
+    let ctx = gpu.gpu().context().clone();
+    ctx.bind_to_thread().unwrap();
+    let stream = ctx.default_stream();
+
+    let a: Vec<f32> = (0..k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+    let blocks_per_row = k / Q4K_BLOCK_SIZE;
+    let b_bytes = n * blocks_per_row * Q4K_BLOCK_BYTES;
+    let b_quantized: Vec<u8> = (0..b_bytes).map(|i| (i % 256) as u8).collect();
+
+    let a_dev = tempura_kernels::gpu::to_device(&stream, &a).unwrap();
+    let b_dev = tempura_kernels::gpu::to_device_u8(&stream, &b_quantized).unwrap();
+    let mut c_coop = tempura_kernels::gpu::alloc_device(&stream, n).unwrap();
+    let mut c_ref = tempura_kernels::gpu::alloc_device(&stream, n).unwrap();
+
+    // Reference: naive kernel
+    gpu.forward_q4k_device(&a_dev, &b_dev, &mut c_ref, 1, n, k).unwrap();
+
+    // Warmup coop kernel
+    gpu.gemv_q4k_coop_device(&a_dev, &b_dev, &mut c_coop, n, k).unwrap();
+
+    // Correctness check
+    let out_coop = tempura_kernels::gpu::to_host(&stream, &c_coop).unwrap();
+    let out_ref = tempura_kernels::gpu::to_host(&stream, &c_ref).unwrap();
+    let max_abs: f32 = out_coop.iter().zip(out_ref.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let max_rel: f32 = out_coop.iter().zip(out_ref.iter())
+        .map(|(a, b)| (a - b).abs() / b.abs().max(1e-6))
+        .fold(0.0f32, f32::max);
+
+    // Benchmark naive (resident)
+    let mut naive_times = Vec::new();
+    for _ in 0..10 {
+        let t = Instant::now();
+        gpu.forward_q4k_device(&a_dev, &b_dev, &mut c_ref, 1, n, k).unwrap();
+        stream.synchronize().unwrap();
+        naive_times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    naive_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let naive_ms = naive_times[5];
+
+    // Benchmark coop kernel
+    let mut coop_times = Vec::new();
+    for _ in 0..10 {
+        let t = Instant::now();
+        gpu.gemv_q4k_coop_device(&a_dev, &b_dev, &mut c_coop, n, k).unwrap();
+        stream.synchronize().unwrap();
+        coop_times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    coop_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let coop_ms = coop_times[5];
+
+    let gflops = 2.0 * n as f64 * k as f64 / (coop_ms / 1000.0) / 1e9;
+    let speedup = naive_ms / coop_ms;
+    let weight_bytes = n as f64 * (k as f64 / 256.0) * 144.0;
+    let bw_gbps = weight_bytes / (coop_ms / 1000.0) / 1e9;
+
+    println!("  Naive:  {naive_ms:.3}ms");
+    println!("  Coop:   {coop_ms:.3}ms  {gflops:.0} GFLOPS  {bw_gbps:.0} GB/s");
+    println!("  Speedup: {speedup:.2}x  max_abs={max_abs:.2e}  max_rel={max_rel:.2e}");
+    if max_rel > 1e-3 {
+        eprintln!("  WARN: coop vs naive relative diff {max_rel:.6}");
+    }
+    println!();
+}
+
 fn bench_q4k_gpu(m: usize, n: usize, k: usize, label: &str) {
     println!("=== Q4K Bench: {label}  m={m} n={n} k={k} ===");
 
@@ -1138,6 +1208,12 @@ fn main() {
     bench_q4k_warp(18944, 3584, "gate_proj (decode)");
     bench_q4k_warp(3584, 18944, "down_proj (decode)");
     bench_q4k_warp(151936, 3584, "lm_head (decode)");
+
+    // --- Intra-block cooperative Q4K GEMV ---
+    bench_q4k_coop(3584, 3584, "qkv_proj (decode)");
+    bench_q4k_coop(18944, 3584, "gate_proj (decode)");
+    bench_q4k_coop(3584, 18944, "down_proj (decode)");
+    bench_q4k_coop(151936, 3584, "lm_head (decode)");
 
     println!("All GPU tests passed.");
 }
