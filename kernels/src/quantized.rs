@@ -1874,6 +1874,39 @@ impl CudaMatMulQ4K {
         Ok(())
     }
 
+    pub fn fused_gate_up_silu_device(
+        &self,
+        a: &cuda_core::DeviceBuffer<f32>,
+        b_gate: &cuda_core::DeviceBuffer<u8>,
+        b_up: &cuda_core::DeviceBuffer<u8>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+        let warps_per_block = 4u32;
+        let grid_x = ((n as u32) + warps_per_block - 1) / warps_per_block;
+        self.module
+            .gemv_q4k_fused_gate_up_silu(
+                &stream,
+                LaunchConfig {
+                    grid_dim: (grid_x, 1, 1),
+                    block_dim: (32, warps_per_block, 1),
+                    shared_mem_bytes: 0,
+                },
+                n as u32,
+                k as u32,
+                a,
+                b_gate,
+                b_up,
+                output,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
+    }
+
     pub fn forward_q6k_device(
         &self,
         a: &cuda_core::DeviceBuffer<f32>,

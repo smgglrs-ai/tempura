@@ -459,6 +459,153 @@ pub mod kernels {
         }
     }
 
+    /// Fused gate_proj + up_proj + SiLU×gate in one kernel.
+    /// Reads activation vector ONCE, computes two Q4K dot products (gate and up),
+    /// applies SiLU(gate) × up, writes one output value.
+    /// Saves: 1 activation read, 2 kernel launches, 1 SiLU elementwise launch.
+    ///
+    /// Grid: (ceil(n/WARPS_Y), 1, 1), Block: (32, WARPS_Y, 1)
+    /// n = intermediate_size (same for gate and up)
+    /// k = hidden_size
+    #[kernel]
+    pub fn gemv_q4k_fused_gate_up_silu(
+        n: u32,
+        k: u32,
+        a: &[f32],
+        b_gate: &[u8],
+        b_up: &[u8],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let lane = warp::lane_id() as usize;
+        let col = (thread::blockIdx_x() as usize) * (thread::blockDim_y() as usize)
+            + thread::threadIdx_y() as usize;
+
+        let n = n as usize;
+        let k = k as usize;
+        if col >= n {
+            return;
+        }
+
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let mut gate_sum = 0.0f32;
+        let mut up_sum = 0.0f32;
+
+        let qs_byte_off = lane * 4;
+        let group = qs_byte_off / 32;
+        let local = qs_byte_off % 32;
+        let elem_lo_base = group * 64 + local;
+        let elem_hi_base = group * 64 + 32 + local;
+        let sc_idx_lo = 2 * group;
+        let sc_idx_hi = 2 * group + 1;
+
+        let mut blk = 0usize;
+        while blk < blocks_per_row {
+            let a_base = blk * Q4K_BLOCK_SIZE;
+
+            // --- Gate weight block ---
+            let g_off = (col * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+            let g_d = f16_bits_to_f32(
+                (b_gate[g_off] as u16) | ((b_gate[g_off + 1] as u16) << 8),
+            );
+            let g_dmin = f16_bits_to_f32(
+                (b_gate[g_off + 2] as u16) | ((b_gate[g_off + 3] as u16) << 8),
+            );
+            let g_packed = &b_gate[g_off + 4..];
+            let mut g_sc = [0.0f32; 8];
+            let mut g_mins = [0.0f32; 8];
+            let mut i = 0usize;
+            while i < 4 {
+                g_sc[i] = (g_packed[i] & 0x3F) as f32;
+                g_sc[i + 4] =
+                    (((g_packed[i + 8] & 0x0F) | ((g_packed[i] >> 6) << 4)) & 0x3F) as f32;
+                g_mins[i] = (g_packed[i + 4] & 0x3F) as f32;
+                g_mins[i + 4] =
+                    (((g_packed[i + 8] >> 4) | ((g_packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                i += 1;
+            }
+            let g_d_lo = g_d * g_sc[sc_idx_lo];
+            let g_m_lo = g_dmin * g_mins[sc_idx_lo];
+            let g_d_hi = g_d * g_sc[sc_idx_hi];
+            let g_m_hi = g_dmin * g_mins[sc_idx_hi];
+            let g_qs = &b_gate[g_off + 16..];
+
+            // --- Up weight block ---
+            let u_off = (col * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+            let u_d = f16_bits_to_f32(
+                (b_up[u_off] as u16) | ((b_up[u_off + 1] as u16) << 8),
+            );
+            let u_dmin = f16_bits_to_f32(
+                (b_up[u_off + 2] as u16) | ((b_up[u_off + 3] as u16) << 8),
+            );
+            let u_packed = &b_up[u_off + 4..];
+            let mut u_sc = [0.0f32; 8];
+            let mut u_mins = [0.0f32; 8];
+            i = 0;
+            while i < 4 {
+                u_sc[i] = (u_packed[i] & 0x3F) as f32;
+                u_sc[i + 4] =
+                    (((u_packed[i + 8] & 0x0F) | ((u_packed[i] >> 6) << 4)) & 0x3F) as f32;
+                u_mins[i] = (u_packed[i + 4] & 0x3F) as f32;
+                u_mins[i + 4] =
+                    (((u_packed[i + 8] >> 4) | ((u_packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                i += 1;
+            }
+            let u_d_lo = u_d * u_sc[sc_idx_lo];
+            let u_m_lo = u_dmin * u_mins[sc_idx_lo];
+            let u_d_hi = u_d * u_sc[sc_idx_hi];
+            let u_m_hi = u_dmin * u_mins[sc_idx_hi];
+            let u_qs = &b_up[u_off + 16..];
+
+            // --- Shared activation read, dual accumulation ---
+            let mut g_partial = 0.0f32;
+            let mut u_partial = 0.0f32;
+            let mut li = 0usize;
+            while li < 4 {
+                let a_lo = a[a_base + elem_lo_base + li];
+                let a_hi = a[a_base + elem_hi_base + li];
+
+                let g_byte = g_qs[qs_byte_off + li];
+                g_partial += a_lo * (g_d_lo * (g_byte & 0x0F) as f32 - g_m_lo);
+                g_partial += a_hi * (g_d_hi * (g_byte >> 4) as f32 - g_m_hi);
+
+                let u_byte = u_qs[qs_byte_off + li];
+                u_partial += a_lo * (u_d_lo * (u_byte & 0x0F) as f32 - u_m_lo);
+                u_partial += a_hi * (u_d_hi * (u_byte >> 4) as f32 - u_m_hi);
+
+                li += 1;
+            }
+
+            // Reduce both sums across warp
+            g_partial += warp::shuffle_xor_f32(g_partial, 16);
+            g_partial += warp::shuffle_xor_f32(g_partial, 8);
+            g_partial += warp::shuffle_xor_f32(g_partial, 4);
+            g_partial += warp::shuffle_xor_f32(g_partial, 2);
+            g_partial += warp::shuffle_xor_f32(g_partial, 1);
+
+            u_partial += warp::shuffle_xor_f32(u_partial, 16);
+            u_partial += warp::shuffle_xor_f32(u_partial, 8);
+            u_partial += warp::shuffle_xor_f32(u_partial, 4);
+            u_partial += warp::shuffle_xor_f32(u_partial, 2);
+            u_partial += warp::shuffle_xor_f32(u_partial, 1);
+
+            if lane == 0 {
+                gate_sum += g_partial;
+                up_sum += u_partial;
+            }
+
+            blk += 1;
+        }
+
+        // SiLU(gate) × up
+        if lane == 0 {
+            let silu_gate = gate_sum / (1.0 + (-gate_sum).exp());
+            let result = silu_gate * up_sum;
+            unsafe {
+                *output.get_unchecked_mut(col) = result;
+            }
+        }
+    }
+
     /// GPU Q6_K dequantize-fused matmul: output[i,j] = dot(a[i,:], dequant(b_q6k[j,:]))
     /// Q6_K block layout (210 bytes per 256 elements):
     ///   ql[128]: low 4 bits of each element

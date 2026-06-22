@@ -1011,3 +1011,18 @@
     vs llama.cpp 209 tok/s: gap closed from 3.3x to 1.5x
   iteration: 9
   max_iterations: 10
+
+- timestamp: "2026-06-22T14:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "fused-gate-up-gpu"
+  summary: >
+    Fused gate+up+SiLU GPU kernel: single launch, shared activation read,
+    dual Q4K dequant, SiLU×gate in one pass. DualPipeline validation:
+    max_rel=0.0 (bit-identical to CPU sequential). BUT 3.4x slower than
+    separate coop calls — register pressure kills occupancy. Fusion helps
+    on CPU (cache reuse) but hurts on GPU (occupancy > data reuse at 1.8 TB/s).
+    llama.cpp doesn't fuse gate+up either. Keeping the kernel as verified
+    reference; production path uses separate coop calls.
+  iteration: 10
+  max_iterations: 10

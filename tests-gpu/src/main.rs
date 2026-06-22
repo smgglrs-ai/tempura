@@ -1035,6 +1035,88 @@ fn bench_q4k_coop(n: usize, k: usize, label: &str) {
     println!();
 }
 
+fn bench_fused_gate_up(n: usize, k: usize, label: &str) {
+    println!("=== Fused gate+up+SiLU Bench: {label}  n={n} k={k} ===");
+
+    let cpu = CpuMatMulQ4K;
+    let gpu = CudaMatMulQ4K::new().expect("Failed to init CudaMatMulQ4K");
+    let ctx = gpu.gpu().context().clone();
+    ctx.bind_to_thread().unwrap();
+    let stream = ctx.default_stream();
+
+    let a: Vec<f32> = (0..k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+    let blocks_per_row = k / Q4K_BLOCK_SIZE;
+    let b_bytes = n * blocks_per_row * Q4K_BLOCK_BYTES;
+    let b_gate: Vec<u8> = (0..b_bytes).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+    let b_up: Vec<u8> = (0..b_bytes).map(|i| ((i * 13 + 5) % 256) as u8).collect();
+
+    // --- CPU sequential reference (DualPipeline) ---
+    let mut gate_out = vec![0.0f32; n];
+    let mut up_out = vec![0.0f32; n];
+    cpu.forward_b_transposed_q4k(&a, &b_gate, &mut gate_out, 1, n, k).unwrap();
+    cpu.forward_b_transposed_q4k(&a, &b_up, &mut up_out, 1, n, k).unwrap();
+    let mut cpu_ref = vec![0.0f32; n];
+    for i in 0..n {
+        let silu = gate_out[i] / (1.0 + (-gate_out[i]).exp());
+        cpu_ref[i] = silu * up_out[i];
+    }
+
+    // --- GPU fused ---
+    let a_dev = tempura_kernels::gpu::to_device(&stream, &a).unwrap();
+    let bg_dev = tempura_kernels::gpu::to_device_u8(&stream, &b_gate).unwrap();
+    let bu_dev = tempura_kernels::gpu::to_device_u8(&stream, &b_up).unwrap();
+    let mut out_dev = tempura_kernels::gpu::alloc_device(&stream, n).unwrap();
+
+    gpu.fused_gate_up_silu_device(&a_dev, &bg_dev, &bu_dev, &mut out_dev, n, k).unwrap();
+    let gpu_out = tempura_kernels::gpu::to_host(&stream, &out_dev).unwrap();
+
+    // DualPipeline comparison
+    let max_abs: f32 = cpu_ref.iter().zip(gpu_out.iter())
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_rel: f32 = cpu_ref.iter().zip(gpu_out.iter())
+        .map(|(a, b)| (a - b).abs() / a.abs().max(1e-6)).fold(0.0f32, f32::max);
+
+    // Benchmark: fused vs 2× coop + silu
+    let mut sep_times = Vec::new();
+    let mut cg = tempura_kernels::gpu::alloc_device(&stream, n).unwrap();
+    let mut cu = tempura_kernels::gpu::alloc_device(&stream, n).unwrap();
+    gpu.gemv_q4k_coop_device(&a_dev, &bg_dev, &mut cg, n, k).unwrap();
+    gpu.gemv_q4k_coop_device(&a_dev, &bu_dev, &mut cu, n, k).unwrap();
+    for _ in 0..10 {
+        let t = Instant::now();
+        gpu.gemv_q4k_coop_device(&a_dev, &bg_dev, &mut cg, n, k).unwrap();
+        gpu.gemv_q4k_coop_device(&a_dev, &bu_dev, &mut cu, n, k).unwrap();
+        tempura_kernels::gpu::silu_mul_device(&ctx, &stream, &cg, &cu, &mut out_dev).unwrap();
+        stream.synchronize().unwrap();
+        sep_times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    sep_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let sep_ms = sep_times[5];
+
+    let mut fused_times = Vec::new();
+    for _ in 0..10 {
+        let t = Instant::now();
+        gpu.fused_gate_up_silu_device(&a_dev, &bg_dev, &bu_dev, &mut out_dev, n, k).unwrap();
+        stream.synchronize().unwrap();
+        fused_times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    fused_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let fused_ms = fused_times[5];
+
+    let speedup = sep_ms / fused_ms;
+    let weight_bytes = 2.0 * n as f64 * (k as f64 / 256.0) * 144.0;
+    let bw = weight_bytes / (fused_ms / 1000.0) / 1e9;
+
+    println!("  Separate (2×coop + silu): {sep_ms:.3}ms");
+    println!("  Fused:                    {fused_ms:.3}ms  {bw:.0} GB/s");
+    println!("  Speedup: {speedup:.2}x");
+    println!("  DualPipeline: max_abs={max_abs:.2e}  max_rel={max_rel:.2e}");
+    if max_rel > 1e-3 {
+        eprintln!("  WARN: fused vs CPU sequential relative diff {max_rel:.6}");
+    }
+    println!();
+}
+
 fn bench_q4k_gpu(m: usize, n: usize, k: usize, label: &str) {
     println!("=== Q4K Bench: {label}  m={m} n={n} k={k} ===");
 
@@ -1214,6 +1296,9 @@ fn main() {
     bench_q4k_coop(18944, 3584, "gate_proj (decode)");
     bench_q4k_coop(3584, 18944, "down_proj (decode)");
     bench_q4k_coop(151936, 3584, "lm_head (decode)");
+
+    // --- Fused gate+up+SiLU (DualPipeline validated) ---
+    bench_fused_gate_up(18944, 3584, "Qwen3-8B FFN");
 
     println!("All GPU tests passed.");
 }
