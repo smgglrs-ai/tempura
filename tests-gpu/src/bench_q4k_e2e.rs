@@ -175,5 +175,56 @@ fn main() {
         }
     }
 
+    // --- Multi-warp kernel comparison ---
+    println!("─── Multi-Warp Kernel (8 warps/col) ───");
+    let mut mr_times = Vec::new();
+    let mut lm_out_mr = tempura_kernels::gpu::alloc_device(&stream, config.vocab_size).unwrap();
+    // Warmup
+    for layer in 0..2.min(config.num_layers) {
+        let prefix = format!("model.layers.{layer}");
+        let name = format!("{prefix}.self_attn.q_proj.weight");
+        if let Some(w) = gpu_weights.get_quantized_device(&name) {
+            q4k.gemv_q4k_multirow_device(&a_dev, w, &mut out_q, q_dim, h, 8).unwrap();
+        }
+    }
+    stream.synchronize().unwrap();
+
+    for _ in 0..iters {
+        let start = Instant::now();
+        for layer in 0..config.num_layers {
+            let prefix = format!("model.layers.{layer}");
+            macro_rules! run_mr {
+                ($proj:expr, $a:expr, $out:expr, $n:expr, $k:expr, $nw:expr) => {
+                    let name = format!("{}.{}", prefix, $proj);
+                    if let Some(w) = gpu_weights.get_quantized_device(&name) {
+                        q4k.gemv_q4k_multirow_device($a, w, $out, $n, $k, $nw).unwrap();
+                    }
+                };
+            }
+            run_mr!("self_attn.q_proj.weight", &a_dev, &mut out_q, q_dim, h, 8);
+            run_mr!("self_attn.k_proj.weight", &a_dev, &mut out_kv, kv_dim, h, 4);
+            run_mr!("self_attn.v_proj.weight", &a_dev, &mut out_kv, kv_dim, h, 4);
+            run_mr!("self_attn.o_proj.weight", &a_dev, &mut out_h, h, h, 8);
+            run_mr!("mlp.gate_proj.weight", &a_dev, &mut out_inter, inter, h, 4);
+            run_mr!("mlp.up_proj.weight", &a_dev, &mut out_inter, inter, h, 4);
+            run_mr!("mlp.down_proj.weight", &a_inter_dev, &mut out_h, h, inter, 8);
+        }
+        if let Some(w) = gpu_weights.get_quantized_device("lm_head.weight") {
+            q4k.gemv_q4k_multirow_device(&a_dev, w, &mut lm_out_mr, config.vocab_size, h, 4).unwrap();
+        }
+        stream.synchronize().unwrap();
+        mr_times.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    mr_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mr_median = mr_times[iters / 2];
+    let mr_tps = 1000.0 / mr_median;
+    let speedup = median / mr_median;
+
+    println!("  Multi-warp forward:  {mr_median:.2}ms → {mr_tps:.0} tok/s");
+    println!("  vs coop (1 warp):    {median:.2}ms → {tok_s:.0} tok/s");
+    println!("  Speedup: {speedup:.2}x");
+    println!("  llama.cpp reference: 209 tok/s");
+    println!("  Ratio: {:.2}x", mr_tps / 209.0);
+
     println!("\nDone.");
 }
