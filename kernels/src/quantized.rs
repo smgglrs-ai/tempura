@@ -1955,6 +1955,39 @@ impl CudaMatMulQ4K {
         Ok(())
     }
 
+    pub fn gemv_q4k_ptx_device(
+        &self,
+        a: &cuda_core::DeviceBuffer<f32>,
+        b_quantized: &cuda_core::DeviceBuffer<u8>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        n: usize,
+        k: usize,
+        n_warps_per_col: usize,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+        let warps_per_block = n_warps_per_col as u32;
+        let grid_x = n as u32;
+        self.module
+            .gemv_q4k_ptx(
+                &stream,
+                LaunchConfig {
+                    grid_dim: (grid_x, 1, 1),
+                    block_dim: (32, warps_per_block, 1),
+                    shared_mem_bytes: 0,
+                },
+                n as u32,
+                k as u32,
+                n_warps_per_col as u32,
+                a,
+                b_quantized,
+                output,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
+    }
+
     pub fn gemv_q4k_intacc_device(
         &self,
         a: &cuda_core::DeviceBuffer<f32>,

@@ -129,6 +129,34 @@ cargo run -- --help      # see CLI options
 cargo run -- --port 8080 # start server (stub responses)
 ```
 
+## GPU Kernels (cuda-oxide)
+
+We use a fork of cuda-oxide at `~/Code/github.com/NVLabs/cuda-oxide` with
+mma.sync intrinsics and invariant.load codegen. **`cargo oxide build` uses a
+cached backend `.so` from `~/.cargo/cuda-oxide/`, built from upstream — NOT
+the fork.** You MUST point it at the local build:
+
+```sh
+# Build the codegen backend from our fork (once, or after fork changes)
+cd ~/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codegen-cuda
+cargo build --release
+
+# Set this in every shell that runs cargo oxide build
+export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
+```
+
+Build and benchmark GPU kernels:
+
+```sh
+cd kernels && cargo oxide build                       # standalone kernel compile
+cd tests-gpu && cargo oxide build bench-q4k-e2e       # Q4K e2e benchmark
+cd tests-gpu && cargo oxide run --bin bench-q4k-e2e   # run benchmark
+cd tests-gpu && cargo oxide run --bin tempura-tests-gpu  # full GPU test suite
+```
+
+If you see `Symbol cuda_device__mma_sync__... not found`, the backend is stale.
+Rebuild it from the fork and set `CUDA_OXIDE_BACKEND`.
+
 ## Formal Verification
 
 ```sh

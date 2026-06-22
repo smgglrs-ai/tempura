@@ -8,6 +8,41 @@ const Q8_BLOCK_SIZE: usize = 32;
 const Q8_BLOCK_BYTES: usize = 36; // 4 bytes header (f16 d, f16 s) + 32 int8 values
 
 #[inline(always)]
+fn ld_global_b32(ptr: &[u8], byte_offset: usize) -> u32 {
+    (ptr[byte_offset] as u32)
+        | ((ptr[byte_offset + 1] as u32) << 8)
+        | ((ptr[byte_offset + 2] as u32) << 16)
+        | ((ptr[byte_offset + 3] as u32) << 24)
+}
+
+#[inline(always)]
+fn q4k_dequant_dot_8(
+    raw: u32,
+    a_lo: &[f32],
+    a_lo_off: usize,
+    a_hi: &[f32],
+    a_hi_off: usize,
+    d_sc: f32,
+    d_min: f32,
+) -> f32 {
+    // 4 low nibbles × 4 activations
+    let dot_lo = a_lo[a_lo_off] * (raw & 0x0F) as f32
+        + a_lo[a_lo_off + 1] * ((raw >> 8) & 0x0F) as f32
+        + a_lo[a_lo_off + 2] * ((raw >> 16) & 0x0F) as f32
+        + a_lo[a_lo_off + 3] * ((raw >> 24) & 0x0F) as f32;
+    let sum_lo = a_lo[a_lo_off] + a_lo[a_lo_off + 1] + a_lo[a_lo_off + 2] + a_lo[a_lo_off + 3];
+
+    // 4 high nibbles × 4 activations
+    let dot_hi = a_hi[a_hi_off] * ((raw >> 4) & 0x0F) as f32
+        + a_hi[a_hi_off + 1] * ((raw >> 12) & 0x0F) as f32
+        + a_hi[a_hi_off + 2] * ((raw >> 20) & 0x0F) as f32
+        + a_hi[a_hi_off + 3] * ((raw >> 28) & 0x0F) as f32;
+    let sum_hi = a_hi[a_hi_off] + a_hi[a_hi_off + 1] + a_hi[a_hi_off + 2] + a_hi[a_hi_off + 3];
+
+    d_sc * dot_lo - d_min * sum_lo + d_sc * dot_hi - d_min * sum_hi
+}
+
+#[inline(always)]
 fn dp4a_u32_i32(a: u32, b: u32, c: i32) -> i32 {
     let result: i32;
     unsafe {
@@ -720,6 +755,147 @@ pub mod kernels {
             unsafe {
                 *output.get_unchecked_mut(col) = total;
             }
+        }
+    }
+
+    /// PTX inner loop: bypass LLVM for the hot dequant-multiply path.
+    /// Same structure as gemv_q4k_multirow but inner 4-byte processing
+    /// uses ptx_asm! for tighter instruction scheduling.
+    #[kernel]
+    pub fn gemv_q4k_ptx(
+        n: u32,
+        k: u32,
+        n_warps_per_col: u32,
+        a: &[f32],
+        b_q4k: &[u8],
+        mut output: DisjointSlice<f32>,
+    ) {
+        static mut WARP_SUMS: SharedArray<f32, 64> = SharedArray::UNINIT;
+
+        let lane = warp::lane_id() as usize;
+        let warp_id = thread::threadIdx_y() as usize;
+        let nwpc = n_warps_per_col as usize;
+        let col_in_cta = warp_id / nwpc;
+        let warp_in_col = warp_id % nwpc;
+        let cols_per_cta = (thread::blockDim_y() as usize) / nwpc;
+        let col = (thread::blockIdx_x() as usize) * cols_per_cta + col_in_cta;
+
+        let n = n as usize;
+        let k = k as usize;
+        if col >= n {
+            return;
+        }
+
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let qs_byte_off = lane * 4;
+        let group = qs_byte_off / 32;
+        let local = qs_byte_off % 32;
+        let elem_lo_base = group * 64 + local;
+        let elem_hi_base = group * 64 + 32 + local;
+        let sc_idx_lo = 2 * group;
+        let sc_idx_hi = 2 * group + 1;
+
+        let mut lane_sum = 0.0f32;
+        let mut blk = warp_in_col;
+        while blk < blocks_per_row {
+            let block_offset = (col * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+
+            let d = f16_bits_to_f32(
+                (b_q4k[block_offset] as u16) | ((b_q4k[block_offset + 1] as u16) << 8),
+            );
+            let dmin = f16_bits_to_f32(
+                (b_q4k[block_offset + 2] as u16) | ((b_q4k[block_offset + 3] as u16) << 8),
+            );
+
+            let packed = &b_q4k[block_offset + 4..];
+            let mut sc = [0.0f32; 8];
+            let mut mins = [0.0f32; 8];
+            let mut i = 0usize;
+            while i < 4 {
+                sc[i] = (packed[i] & 0x3F) as f32;
+                sc[i + 4] =
+                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                mins[i] = (packed[i + 4] & 0x3F) as f32;
+                mins[i + 4] =
+                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                i += 1;
+            }
+
+            let d_lo = d * sc[sc_idx_lo];
+            let m_lo = dmin * mins[sc_idx_lo];
+            let d_hi = d * sc[sc_idx_hi];
+            let m_hi = dmin * mins[sc_idx_hi];
+
+            let qs = &b_q4k[block_offset + 16..];
+            let a_base = blk * Q4K_BLOCK_SIZE;
+
+            // PTX inner loop: process 4 bytes, 8 elements
+            // Load activations normally (these ARE the bottleneck reads)
+            let a0_lo = a[a_base + elem_lo_base];
+            let a1_lo = a[a_base + elem_lo_base + 1];
+            let a2_lo = a[a_base + elem_lo_base + 2];
+            let a3_lo = a[a_base + elem_lo_base + 3];
+            let a0_hi = a[a_base + elem_hi_base];
+            let a1_hi = a[a_base + elem_hi_base + 1];
+            let a2_hi = a[a_base + elem_hi_base + 2];
+            let a3_hi = a[a_base + elem_hi_base + 3];
+
+            // Load 4 qs bytes and extract nibbles via PTX bfe
+            let b0 = qs[qs_byte_off] as u32;
+            let b1 = qs[qs_byte_off + 1] as u32;
+            let b2 = qs[qs_byte_off + 2] as u32;
+            let b3 = qs[qs_byte_off + 3] as u32;
+
+            // PTX: extract nibble and convert to float in fewer instructions
+            // bfe.u32 extracts a bit field; cvt converts
+            let mut q0_lo_f: f32;
+            let mut q0_hi_f: f32;
+            unsafe {
+                // Extract low nibble and convert to float
+                let mut tmp: u32;
+                ptx_asm!("bfe.u32 %0, %1, 0, 4;", out("=r") tmp, in("r") b0);
+                ptx_asm!("cvt.rn.f32.u32 %0, %1;", out("=f") q0_lo_f, in("r") tmp);
+                ptx_asm!("bfe.u32 %0, %1, 4, 4;", out("=r") tmp, in("r") b0);
+                ptx_asm!("cvt.rn.f32.u32 %0, %1;", out("=f") q0_hi_f, in("r") tmp);
+            }
+
+            // For bytes 1-3, use Rust (LLVM generates same quality for these)
+            let q1_lo_f = (b1 & 0x0F) as f32;
+            let q1_hi_f = (b1 >> 4) as f32;
+            let q2_lo_f = (b2 & 0x0F) as f32;
+            let q2_hi_f = (b2 >> 4) as f32;
+            let q3_lo_f = (b3 & 0x0F) as f32;
+            let q3_hi_f = (b3 >> 4) as f32;
+
+            // FMA: d*sc*q - dmin*m using fused multiply-add
+            lane_sum += d_lo * (a0_lo * q0_lo_f + a1_lo * q1_lo_f + a2_lo * q2_lo_f + a3_lo * q3_lo_f)
+                      - m_lo * (a0_lo + a1_lo + a2_lo + a3_lo)
+                      + d_hi * (a0_hi * q0_hi_f + a1_hi * q1_hi_f + a2_hi * q2_hi_f + a3_hi * q3_hi_f)
+                      - m_hi * (a0_hi + a1_hi + a2_hi + a3_hi);
+
+            blk += nwpc;
+        }
+
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 16);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 8);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 4);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 2);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 1);
+
+        if lane == 0 {
+            unsafe { WARP_SUMS[warp_id] = lane_sum; }
+        }
+        thread::sync_threads();
+
+        if warp_in_col == 0 && lane == 0 {
+            let smem_base = col_in_cta * nwpc;
+            let mut total = 0.0f32;
+            let mut w = 0usize;
+            while w < nwpc {
+                total += unsafe { WARP_SUMS[smem_base + w] };
+                w += 1;
+            }
+            unsafe { *output.get_unchecked_mut(col) = total; }
         }
     }
 
