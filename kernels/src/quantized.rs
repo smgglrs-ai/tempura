@@ -1715,6 +1715,53 @@ impl Dequantize for CpuDequantize {
     }
 }
 
+pub struct ActivationQ8 {
+    pub data: Vec<u32>,
+    pub num_blocks: usize,
+}
+
+impl ActivationQ8 {
+    pub fn from_f32(a: &[f32]) -> Self {
+        let num_blocks = (a.len() + 31) / 32;
+        let mut data = Vec::with_capacity(num_blocks * 10);
+
+        for blk in 0..num_blocks {
+            let start = blk * 32;
+            let end = (start + 32).min(a.len());
+
+            let mut amax = 0.0f32;
+            for i in start..end {
+                amax = amax.max(a[i].abs());
+            }
+
+            let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+
+            let mut sum = 0.0f32;
+            let mut qs = [0i8; 32];
+            for i in 0..(end - start) {
+                let v = (a[start + i] * id).round();
+                let v = v.max(-128.0).min(127.0) as i8;
+                qs[i] = v;
+                sum += v as f32;
+            }
+
+            data.push(d.to_bits());
+            data.push((d * sum).to_bits());
+
+            for chunk in 0..8 {
+                let word = (qs[chunk * 4] as u8 as u32)
+                    | ((qs[chunk * 4 + 1] as u8 as u32) << 8)
+                    | ((qs[chunk * 4 + 2] as u8 as u32) << 16)
+                    | ((qs[chunk * 4 + 3] as u8 as u32) << 24);
+                data.push(word);
+            }
+        }
+
+        Self { data, num_blocks }
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub struct CudaMatMulQ4K {
     gpu: crate::gpu::GpuContext,
@@ -1858,6 +1905,68 @@ impl CudaMatMulQ4K {
         let grid_x = ((n as u32) + warps_per_block - 1) / warps_per_block;
         self.module
             .gemv_q4k_coop(
+                &stream,
+                LaunchConfig {
+                    grid_dim: (grid_x, 1, 1),
+                    block_dim: (32, warps_per_block, 1),
+                    shared_mem_bytes: 0,
+                },
+                n as u32,
+                k as u32,
+                a,
+                b_quantized,
+                output,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn gemv_q4k_q8_dp4a_device(
+        &self,
+        a_q8: &cuda_core::DeviceBuffer<u32>,
+        b_quantized: &cuda_core::DeviceBuffer<u8>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+        let warps_per_block = 4u32;
+        let grid_x = ((n as u32) + warps_per_block - 1) / warps_per_block;
+        self.module
+            .gemv_q4k_q8_dp4a(
+                &stream,
+                LaunchConfig {
+                    grid_dim: (grid_x, 1, 1),
+                    block_dim: (32, warps_per_block, 1),
+                    shared_mem_bytes: 0,
+                },
+                n as u32,
+                k as u32,
+                a_q8,
+                b_quantized,
+                output,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn gemv_q4k_coop_v2_device(
+        &self,
+        a: &cuda_core::DeviceBuffer<f32>,
+        b_quantized: &cuda_core::DeviceBuffer<u8>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+        let warps_per_block = 4u32;
+        let grid_x = ((n as u32) + warps_per_block - 1) / warps_per_block;
+        self.module
+            .gemv_q4k_coop_v2(
                 &stream,
                 LaunchConfig {
                     grid_dim: (grid_x, 1, 1),

@@ -4,7 +4,7 @@ use half::f16;
 use std::time::Instant;
 use tempura_kernels::attention::{Attention, CpuAttention, CudaAttention};
 use tempura_kernels::matmul::{CpuMatMul, CudaMatMul, MatMul};
-use tempura_kernels::quantized::{CpuMatMulQ4K, CpuMatMulQ4KOpt, CudaMatMulQ4K, MatMulQ};
+use tempura_kernels::quantized::{ActivationQ8, CpuMatMulQ4K, CpuMatMulQ4KOpt, CudaMatMulQ4K, MatMulQ};
 use tempura_kernels::rmsnorm::{CpuRMSNorm, CudaRMSNorm, RMSNorm};
 use tempura_kernels::rope::{CpuRoPE, CudaRoPE, RoPE};
 use tempura_kernels::{Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE};
@@ -1035,6 +1035,135 @@ fn bench_q4k_coop(n: usize, k: usize, label: &str) {
     println!();
 }
 
+fn bench_q4k_dp4a(n: usize, k: usize, label: &str) {
+    println!("=== Q4K dp4a Bench: {label}  n={n} k={k} ===");
+
+    let cpu = CpuMatMulQ4K;
+    let gpu = CudaMatMulQ4K::new().expect("Failed to init CudaMatMulQ4K");
+    let ctx = gpu.gpu().context().clone();
+    ctx.bind_to_thread().unwrap();
+    let stream = ctx.default_stream();
+
+    let a: Vec<f32> = (0..k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+    let blocks_per_row = k / Q4K_BLOCK_SIZE;
+    let b_bytes = n * blocks_per_row * Q4K_BLOCK_BYTES;
+    let b_quantized: Vec<u8> = (0..b_bytes).map(|i| (i % 256) as u8).collect();
+
+    // Pre-quantize activation to Q8
+    let a_q8 = ActivationQ8::from_f32(&a);
+
+    // CPU reference (f32 path)
+    let mut cpu_out = vec![0.0f32; n];
+    cpu.forward_b_transposed_q4k(&a, &b_quantized, &mut cpu_out, 1, n, k).unwrap();
+
+    // GPU dp4a path
+    let a_q8_dev = tempura_kernels::gpu::to_device_u32(&stream, &a_q8.data).unwrap();
+    let b_dev = tempura_kernels::gpu::to_device_u8(&stream, &b_quantized).unwrap();
+    let mut c_dp4a = tempura_kernels::gpu::alloc_device(&stream, n).unwrap();
+    let mut c_coop = tempura_kernels::gpu::alloc_device(&stream, n).unwrap();
+
+    gpu.gemv_q4k_q8_dp4a_device(&a_q8_dev, &b_dev, &mut c_dp4a, n, k).unwrap();
+    let gpu_out = tempura_kernels::gpu::to_host(&stream, &c_dp4a).unwrap();
+
+    // DualPipeline: compare dp4a vs CPU f32
+    let max_abs: f32 = cpu_out.iter().zip(gpu_out.iter())
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_rel: f32 = cpu_out.iter().zip(gpu_out.iter())
+        .map(|(a, b)| (a - b).abs() / a.abs().max(1e-6)).fold(0.0f32, f32::max);
+
+    // Bench coop v1 (f32 activation)
+    let a_dev = tempura_kernels::gpu::to_device(&stream, &a).unwrap();
+    gpu.gemv_q4k_coop_device(&a_dev, &b_dev, &mut c_coop, n, k).unwrap();
+    let mut coop_times = Vec::new();
+    for _ in 0..10 {
+        let t = Instant::now();
+        gpu.gemv_q4k_coop_device(&a_dev, &b_dev, &mut c_coop, n, k).unwrap();
+        stream.synchronize().unwrap();
+        coop_times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    coop_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let coop_ms = coop_times[5];
+
+    // Bench dp4a
+    let mut dp4a_times = Vec::new();
+    for _ in 0..10 {
+        let t = Instant::now();
+        gpu.gemv_q4k_q8_dp4a_device(&a_q8_dev, &b_dev, &mut c_dp4a, n, k).unwrap();
+        stream.synchronize().unwrap();
+        dp4a_times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    dp4a_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let dp4a_ms = dp4a_times[5];
+
+    let speedup = coop_ms / dp4a_ms;
+    let weight_bytes = n as f64 * (k as f64 / 256.0) * 144.0;
+    let bw = weight_bytes / (dp4a_ms / 1000.0) / 1e9;
+
+    println!("  Coop v1 (f32): {coop_ms:.3}ms");
+    println!("  dp4a (Q8):     {dp4a_ms:.3}ms  {bw:.0} GB/s");
+    println!("  Speedup: {speedup:.2}x");
+    println!("  DualPipeline vs CPU: max_abs={max_abs:.2e}  max_rel={max_rel:.2e}\n");
+}
+
+fn bench_q4k_coop_v2(n: usize, k: usize, label: &str) {
+    println!("=== Q4K Coop v2 Bench: {label}  n={n} k={k} ===");
+
+    let gpu = CudaMatMulQ4K::new().expect("Failed to init CudaMatMulQ4K");
+    let ctx = gpu.gpu().context().clone();
+    ctx.bind_to_thread().unwrap();
+    let stream = ctx.default_stream();
+
+    let a: Vec<f32> = (0..k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+    let blocks_per_row = k / Q4K_BLOCK_SIZE;
+    let b_bytes = n * blocks_per_row * Q4K_BLOCK_BYTES;
+    let b_quantized: Vec<u8> = (0..b_bytes).map(|i| (i % 256) as u8).collect();
+
+    let a_dev = tempura_kernels::gpu::to_device(&stream, &a).unwrap();
+    let b_dev = tempura_kernels::gpu::to_device_u8(&stream, &b_quantized).unwrap();
+    let mut c_v2 = tempura_kernels::gpu::alloc_device(&stream, n).unwrap();
+    let mut c_v1 = tempura_kernels::gpu::alloc_device(&stream, n).unwrap();
+
+    // Reference: coop v1
+    gpu.gemv_q4k_coop_device(&a_dev, &b_dev, &mut c_v1, n, k).unwrap();
+    gpu.gemv_q4k_coop_v2_device(&a_dev, &b_dev, &mut c_v2, n, k).unwrap();
+
+    let out_v1 = tempura_kernels::gpu::to_host(&stream, &c_v1).unwrap();
+    let out_v2 = tempura_kernels::gpu::to_host(&stream, &c_v2).unwrap();
+    let max_rel: f32 = out_v1.iter().zip(out_v2.iter())
+        .map(|(a, b)| (a - b).abs() / a.abs().max(1e-6))
+        .fold(0.0f32, f32::max);
+
+    // Bench v1
+    let mut v1_times = Vec::new();
+    for _ in 0..10 {
+        let t = Instant::now();
+        gpu.gemv_q4k_coop_device(&a_dev, &b_dev, &mut c_v1, n, k).unwrap();
+        stream.synchronize().unwrap();
+        v1_times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    v1_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let v1_ms = v1_times[5];
+
+    // Bench v2
+    let mut v2_times = Vec::new();
+    for _ in 0..10 {
+        let t = Instant::now();
+        gpu.gemv_q4k_coop_v2_device(&a_dev, &b_dev, &mut c_v2, n, k).unwrap();
+        stream.synchronize().unwrap();
+        v2_times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    v2_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let v2_ms = v2_times[5];
+
+    let speedup = v1_ms / v2_ms;
+    let weight_bytes = n as f64 * (k as f64 / 256.0) * 144.0;
+    let bw = weight_bytes / (v2_ms / 1000.0) / 1e9;
+
+    println!("  Coop v1: {v1_ms:.3}ms");
+    println!("  Coop v2: {v2_ms:.3}ms  {bw:.0} GB/s");
+    println!("  Speedup: {speedup:.2}x  max_rel={max_rel:.2e}\n");
+}
+
 fn bench_fused_gate_up(n: usize, k: usize, label: &str) {
     println!("=== Fused gate+up+SiLU Bench: {label}  n={n} k={k} ===");
 
@@ -1296,6 +1425,18 @@ fn main() {
     bench_q4k_coop(18944, 3584, "gate_proj (decode)");
     bench_q4k_coop(3584, 18944, "down_proj (decode)");
     bench_q4k_coop(151936, 3584, "lm_head (decode)");
+
+    // --- dp4a: Q4K × Q8 integer dot product ---
+    bench_q4k_dp4a(3584, 3584, "qkv_proj (decode)");
+    bench_q4k_dp4a(18944, 3584, "gate_proj (decode)");
+    bench_q4k_dp4a(3584, 18944, "down_proj (decode)");
+    bench_q4k_dp4a(151936, 3584, "lm_head (decode)");
+
+    // --- Coop v2: shared-memory activation tile ---
+    bench_q4k_coop_v2(3584, 3584, "qkv_proj (decode)");
+    bench_q4k_coop_v2(18944, 3584, "gate_proj (decode)");
+    bench_q4k_coop_v2(3584, 18944, "down_proj (decode)");
+    bench_q4k_coop_v2(151936, 3584, "lm_head (decode)");
 
     // --- Fused gate+up+SiLU (DualPipeline validated) ---
     bench_fused_gate_up(18944, 3584, "Qwen3-8B FFN");
