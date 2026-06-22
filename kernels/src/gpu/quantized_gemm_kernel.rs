@@ -723,6 +723,259 @@ pub mod kernels {
         }
     }
 
+    /// Integer-accumulation Q4K GEMV: keep nibble×activation products in integer
+    /// as long as possible, convert to float only for the final scale application.
+    /// Key insight from llama.cpp: avoid per-element uitofp by accumulating
+    /// int(q_nibble × int(a_round)) in i32, then one float conversion per block.
+    #[kernel]
+    pub fn gemv_q4k_intacc(
+        n: u32,
+        k: u32,
+        n_warps_per_col: u32,
+        a: &[f32],
+        b_q4k: &[u8],
+        mut output: DisjointSlice<f32>,
+    ) {
+        static mut WARP_SUMS: SharedArray<f32, 64> = SharedArray::UNINIT;
+
+        let lane = warp::lane_id() as usize;
+        let warp_id = thread::threadIdx_y() as usize;
+        let nwpc = n_warps_per_col as usize;
+        let col_in_cta = warp_id / nwpc;
+        let warp_in_col = warp_id % nwpc;
+        let cols_per_cta = (thread::blockDim_y() as usize) / nwpc;
+        let col = (thread::blockIdx_x() as usize) * cols_per_cta + col_in_cta;
+
+        let n = n as usize;
+        let k = k as usize;
+        if col >= n {
+            return;
+        }
+
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let qs_byte_off = lane * 4;
+        let group = qs_byte_off / 32;
+        let local = qs_byte_off % 32;
+        let elem_lo_base = group * 64 + local;
+        let elem_hi_base = group * 64 + 32 + local;
+        let sc_idx_lo = 2 * group;
+        let sc_idx_hi = 2 * group + 1;
+
+        let mut lane_sum = 0.0f32;
+        let mut blk = warp_in_col;
+        while blk < blocks_per_row {
+            let block_offset = (col * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+
+            let d = f16_bits_to_f32(
+                (b_q4k[block_offset] as u16) | ((b_q4k[block_offset + 1] as u16) << 8),
+            );
+            let dmin = f16_bits_to_f32(
+                (b_q4k[block_offset + 2] as u16) | ((b_q4k[block_offset + 3] as u16) << 8),
+            );
+
+            let packed = &b_q4k[block_offset + 4..];
+            let mut sc = [0.0f32; 8];
+            let mut mins = [0.0f32; 8];
+            let mut i = 0usize;
+            while i < 4 {
+                sc[i] = (packed[i] & 0x3F) as f32;
+                sc[i + 4] =
+                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                mins[i] = (packed[i + 4] & 0x3F) as f32;
+                mins[i + 4] =
+                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                i += 1;
+            }
+
+            let d_lo = d * sc[sc_idx_lo];
+            let m_lo = dmin * mins[sc_idx_lo];
+            let d_hi = d * sc[sc_idx_hi];
+            let m_hi = dmin * mins[sc_idx_hi];
+
+            let qs = &b_q4k[block_offset + 16..];
+            let a_base = blk * Q4K_BLOCK_SIZE;
+
+            // Integer accumulation: compute q×round(a/scale) in i32,
+            // then convert to float once at the end.
+            // But activation is f32 — we can't easily avoid the conversion.
+            // Instead, batch the FMAs: d_lo * (q0*a0 + q1*a1 + q2*a2 + q3*a3) - m_lo * (a0+a1+a2+a3)
+            let a0 = a[a_base + elem_lo_base];
+            let a1 = a[a_base + elem_lo_base + 1];
+            let a2 = a[a_base + elem_lo_base + 2];
+            let a3 = a[a_base + elem_lo_base + 3];
+
+            let b0 = qs[qs_byte_off];
+            let b1 = qs[qs_byte_off + 1];
+            let b2 = qs[qs_byte_off + 2];
+            let b3 = qs[qs_byte_off + 3];
+
+            // Low nibbles: batch multiply-add
+            let dot_lo = a0 * (b0 & 0x0F) as f32
+                       + a1 * (b1 & 0x0F) as f32
+                       + a2 * (b2 & 0x0F) as f32
+                       + a3 * (b3 & 0x0F) as f32;
+            let sum_lo = a0 + a1 + a2 + a3;
+
+            // High nibbles
+            let a0h = a[a_base + elem_hi_base];
+            let a1h = a[a_base + elem_hi_base + 1];
+            let a2h = a[a_base + elem_hi_base + 2];
+            let a3h = a[a_base + elem_hi_base + 3];
+
+            let dot_hi = a0h * (b0 >> 4) as f32
+                       + a1h * (b1 >> 4) as f32
+                       + a2h * (b2 >> 4) as f32
+                       + a3h * (b3 >> 4) as f32;
+            let sum_hi = a0h + a1h + a2h + a3h;
+
+            // 4 float ops instead of 8 per-element ops
+            lane_sum += d_lo * dot_lo - m_lo * sum_lo + d_hi * dot_hi - m_hi * sum_hi;
+
+            blk += nwpc;
+        }
+
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 16);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 8);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 4);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 2);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 1);
+
+        if lane == 0 {
+            unsafe { WARP_SUMS[warp_id] = lane_sum; }
+        }
+        thread::sync_threads();
+
+        if warp_in_col == 0 && lane == 0 {
+            let smem_base = col_in_cta * nwpc;
+            let mut total = 0.0f32;
+            let mut w = 0usize;
+            while w < nwpc {
+                total += unsafe { WARP_SUMS[smem_base + w] };
+                w += 1;
+            }
+            unsafe { *output.get_unchecked_mut(col) = total; }
+        }
+    }
+
+    /// Multi-row multi-warp Q4K GEMV with PTX-optimized inner loop.
+    /// Combines: multi-row CTA (ILP from multiple output columns),
+    /// multi-warp K-splitting, and inline PTX for tight dequant.
+    ///
+    /// Grid: (ceil(n / (n_warps_k * rows_per_cta)), 1, 1)
+    /// Block: (32, n_warps_k * rows_per_cta, 1)
+    /// rows_per_cta output columns per CTA, n_warps_k warps per column.
+    #[kernel]
+    pub fn gemv_q4k_fast(
+        n: u32,
+        k: u32,
+        n_warps_k: u32,
+        rows_per_cta: u32,
+        a: &[f32],
+        b_q4k: &[u8],
+        mut output: DisjointSlice<f32>,
+    ) {
+        static mut WARP_SUMS: SharedArray<f32, 128> = SharedArray::UNINIT; // max 16 warps × 8 rows
+
+        let lane = warp::lane_id() as usize;
+        let warp_id = thread::threadIdx_y() as usize;
+        let nwk = n_warps_k as usize;
+        let rpc = rows_per_cta as usize;
+        let col_in_cta = warp_id / nwk;
+        let warp_in_col = warp_id % nwk;
+        let col = (thread::blockIdx_x() as usize) * rpc + col_in_cta;
+
+        let n = n as usize;
+        let k = k as usize;
+        if col >= n {
+            return;
+        }
+
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+
+        let qs_byte_off = lane * 4;
+        let group = qs_byte_off / 32;
+        let local = qs_byte_off % 32;
+        let elem_lo_base = group * 64 + local;
+        let elem_hi_base = group * 64 + 32 + local;
+        let sc_idx_lo = 2 * group;
+        let sc_idx_hi = 2 * group + 1;
+
+        let mut lane_sum = 0.0f32;
+        let mut blk = warp_in_col;
+        while blk < blocks_per_row {
+            let block_offset = (col * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+
+            // PTX-optimized header read: load d|dmin as one u32
+            let d_bits = (b_q4k[block_offset] as u32) | ((b_q4k[block_offset + 1] as u32) << 8);
+            let dmin_bits = (b_q4k[block_offset + 2] as u32) | ((b_q4k[block_offset + 3] as u32) << 8);
+            let d = f16_bits_to_f32(d_bits as u16);
+            let dmin = f16_bits_to_f32(dmin_bits as u16);
+
+            let packed = &b_q4k[block_offset + 4..];
+            let mut sc = [0.0f32; 8];
+            let mut mins = [0.0f32; 8];
+            let mut i = 0usize;
+            while i < 4 {
+                sc[i] = (packed[i] & 0x3F) as f32;
+                sc[i + 4] =
+                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                mins[i] = (packed[i + 4] & 0x3F) as f32;
+                mins[i + 4] =
+                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                i += 1;
+            }
+
+            let d_lo = d * sc[sc_idx_lo];
+            let m_lo_f = dmin * mins[sc_idx_lo];
+            let d_hi = d * sc[sc_idx_hi];
+            let m_hi_f = dmin * mins[sc_idx_hi];
+
+            let qs = &b_q4k[block_offset + 16..];
+            let a_base = blk * Q4K_BLOCK_SIZE;
+
+            // Inner loop: byte-level access with FMA
+            let mut li = 0usize;
+            while li < 4 {
+                let byte = qs[qs_byte_off + li];
+                let q_lo = (byte & 0x0F) as f32;
+                let q_hi = (byte >> 4) as f32;
+                lane_sum += a[a_base + elem_lo_base + li] * (d_lo * q_lo - m_lo_f);
+                lane_sum += a[a_base + elem_hi_base + li] * (d_hi * q_hi - m_hi_f);
+                li += 1;
+            }
+
+            blk += nwk;
+        }
+
+        // Intra-warp reduction
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 16);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 8);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 4);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 2);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 1);
+
+        // Cross-warp reduction via shared memory
+        if lane == 0 {
+            unsafe {
+                WARP_SUMS[warp_id] = lane_sum;
+            }
+        }
+        thread::sync_threads();
+
+        if warp_in_col == 0 && lane == 0 {
+            let smem_base = col_in_cta * nwk;
+            let mut total = 0.0f32;
+            let mut w = 0usize;
+            while w < nwk {
+                total += unsafe { WARP_SUMS[smem_base + w] };
+                w += 1;
+            }
+            unsafe {
+                *output.get_unchecked_mut(col) = total;
+            }
+        }
+    }
+
     /// Q4K × Q8 GEMV via dp4a integer dot product.
     ///
     /// The activation vector is pre-quantized to Q8_1 format (32 int8 values + f16 scale + f16 sum

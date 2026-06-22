@@ -1026,3 +1026,32 @@
     reference; production path uses separate coop calls.
   iteration: 10
   max_iterations: 10
+
+- timestamp: "2026-06-22T16:00:00+02:00"
+  actor: claude
+  action: loop-complete
+  summary: >
+    GPU kernel optimization session complete. Final: 172 tok/s via cached
+    dispatch (0.82x llama.cpp 209 tok/s), measured on real Qwen3-8B Q4_K_M.
+    Experiments that didn't help: packed nibble extraction (+register pressure),
+    separated scale/min accumulation (same LLVM codegen), multi-row CTA
+    (enough parallelism already), fused gate+up (occupancy loss), dp4a
+    (memory-bound), shared-memory activation tile (L1 already handles it).
+    The 18% gap is cuda-oxide's LLVM→PTX codegen quality vs NVCC.
+    Next: cuda-oxide fork codegen improvements or inline PTX inner loop.
+  details:
+    completed:
+    - "GPU quantized GEMM (naive → coop → multi-warp → dispatch)"
+    - "Fused kernels (CPU traits + GPU experiment)"
+    - "Q8 pre-quantization + dp4a"
+    - "Kernel dispatch layer (cached, branchless)"
+    - "Multi-row CTA experiment"
+    - "Integer accumulation experiment"
+    - "Real GGUF e2e benchmark"
+    - "Learn ch.20 documentation"
+    metrics:
+      tempura_tok_s: 172
+      llama_cpp_tok_s: 209
+      ratio: 0.82
+      improvement_from_start: "151x (1.14 → 172 tok/s)"
+    branch: "loop/2026-06-21"

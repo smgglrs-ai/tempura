@@ -306,5 +306,91 @@ fn main() {
     println!("  llama.cpp reference: 209 tok/s");
     println!("  Ratio: {:.2}x", cd_tps / 209.0);
 
+    // --- Multi-row fast kernel sweep ---
+    println!("─── Fast Kernel (multi-row × multi-warp) ───");
+    for (rpc, nwk) in [(1, 8), (2, 4), (4, 2), (2, 8), (4, 4)] {
+        let label = format!("rows={rpc} warps_k={nwk}");
+        let mut ft = Vec::new();
+        // Warmup
+        for layer in 0..2.min(config.num_layers) {
+            let p = format!("model.layers.{layer}");
+            if let Some(w) = gpu_weights.get_quantized_device(&format!("{p}.self_attn.q_proj.weight")) {
+                let _ = q4k.gemv_q4k_fast_device(&a_dev, w, &mut out_q, q_dim, h, nwk, rpc);
+            }
+        }
+        stream.synchronize().unwrap();
+
+        for _ in 0..iters {
+            let start = Instant::now();
+            for layer in 0..config.num_layers {
+                let p = format!("model.layers.{layer}");
+                macro_rules! fast {
+                    ($proj:expr, $a:expr, $out:expr, $no:expr, $ki:expr) => {
+                        if let Some(w) = gpu_weights.get_quantized_device(&format!("{}.{}", p, $proj)) {
+                            q4k.gemv_q4k_fast_device($a, w, $out, $no, $ki, nwk, rpc).unwrap();
+                        }
+                    };
+                }
+                fast!("self_attn.q_proj.weight", &a_dev, &mut out_q, q_dim, h);
+                fast!("self_attn.k_proj.weight", &a_dev, &mut out_kv, kv_dim, h);
+                fast!("self_attn.v_proj.weight", &a_dev, &mut out_kv, kv_dim, h);
+                fast!("self_attn.o_proj.weight", &a_dev, &mut out_h, h, h);
+                fast!("mlp.gate_proj.weight", &a_dev, &mut out_inter, inter, h);
+                fast!("mlp.up_proj.weight", &a_dev, &mut out_inter, inter, h);
+                fast!("mlp.down_proj.weight", &a_inter_dev, &mut out_h, h, inter);
+            }
+            if let Some(w) = gpu_weights.get_quantized_device("lm_head.weight") {
+                q4k.gemv_q4k_fast_device(&a_dev, w, &mut lm_out, config.vocab_size, h, nwk, rpc).unwrap();
+            }
+            stream.synchronize().unwrap();
+            ft.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        ft.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = ft[iters / 2];
+        let tps = 1000.0 / med;
+        println!("  {label:>20}: {med:.2}ms → {tps:.0} tok/s ({:.2}x llama.cpp)", tps / 209.0);
+    }
+
+    // --- Integer-accumulation kernel ---
+    println!("─── IntAcc Kernel (batched scale application) ───");
+    let mut ia_times = Vec::new();
+    // Warmup
+    for layer in 0..2.min(config.num_layers) {
+        let p = format!("model.layers.{layer}");
+        if let Some(w) = gpu_weights.get_quantized_device(&format!("{p}.self_attn.q_proj.weight")) {
+            q4k.gemv_q4k_intacc_device(&a_dev, w, &mut out_q, q_dim, h, 8).unwrap();
+        }
+    }
+    stream.synchronize().unwrap();
+    for _ in 0..iters {
+        let start = Instant::now();
+        for layer in 0..config.num_layers {
+            let p = format!("model.layers.{layer}");
+            macro_rules! ia {
+                ($proj:expr, $a:expr, $out:expr, $no:expr, $ki:expr) => {
+                    if let Some(w) = gpu_weights.get_quantized_device(&format!("{}.{}", p, $proj)) {
+                        q4k.gemv_q4k_intacc_device($a, w, $out, $no, $ki, 8).unwrap();
+                    }
+                };
+            }
+            ia!("self_attn.q_proj.weight", &a_dev, &mut out_q, q_dim, h);
+            ia!("self_attn.k_proj.weight", &a_dev, &mut out_kv, kv_dim, h);
+            ia!("self_attn.v_proj.weight", &a_dev, &mut out_kv, kv_dim, h);
+            ia!("self_attn.o_proj.weight", &a_dev, &mut out_h, h, h);
+            ia!("mlp.gate_proj.weight", &a_dev, &mut out_inter, inter, h);
+            ia!("mlp.up_proj.weight", &a_dev, &mut out_inter, inter, h);
+            ia!("mlp.down_proj.weight", &a_inter_dev, &mut out_h, h, inter);
+        }
+        if let Some(w) = gpu_weights.get_quantized_device("lm_head.weight") {
+            q4k.gemv_q4k_intacc_device(&a_dev, w, &mut lm_out, config.vocab_size, h, 8).unwrap();
+        }
+        stream.synchronize().unwrap();
+        ia_times.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    ia_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let ia_med = ia_times[iters / 2];
+    let ia_tps = 1000.0 / ia_med;
+    println!("  IntAcc (8 warps):    {ia_med:.2}ms → {ia_tps:.0} tok/s ({:.2}x llama.cpp)", ia_tps / 209.0);
+
     println!("\nDone.");
 }
