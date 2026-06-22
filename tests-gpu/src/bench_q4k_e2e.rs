@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use tempura_engine::weights::GpuWeights;
-use tempura_kernels::dispatch::GpuKernelDispatcher;
+use tempura_kernels::dispatch::{CachedDispatch, GpuArch, GpuKernelDispatcher};
 use tempura_kernels::quantized::CudaMatMulQ4K;
 
 fn main() {
@@ -227,56 +227,84 @@ fn main() {
     println!("  llama.cpp reference: 209 tok/s");
     println!("  Ratio: {:.2}x", mr_tps / 209.0);
 
-    // --- Dispatcher-based (auto-selects kernel per projection) ---
-    println!("─── Dispatcher (auto kernel selection) ───");
-    let dispatcher = GpuKernelDispatcher::new().expect("dispatcher init");
-    println!("  GPU arch: {:?}", dispatcher.arch);
+    // --- Cached dispatcher (zero-overhead dispatch) ---
+    println!("─── Cached Dispatcher ───");
+    let arch = GpuArch::detect(q4k.gpu());
+    println!("  GPU arch: {:?}", arch);
+    let cached = CachedDispatch::from_model_dims(
+        arch,
+        config.num_layers, h, n_heads, n_kv, head_dim, inter, config.vocab_size,
+    ).expect("cached dispatch init");
 
-    let mut disp_times = Vec::new();
-    let mut lm_out_disp = tempura_kernels::gpu::alloc_device(&stream, config.vocab_size).unwrap();
+    let mut cd_times = Vec::new();
+    let mut lm_out_cd = tempura_kernels::gpu::alloc_device(&stream, config.vocab_size).unwrap();
     // Warmup
     for layer in 0..2.min(config.num_layers) {
         let prefix = format!("model.layers.{layer}");
         let name = format!("{prefix}.self_attn.q_proj.weight");
         if let Some(w) = gpu_weights.get_quantized_device(&name) {
-            dispatcher.gemv_q4k(&a_dev, w, &mut out_q, q_dim, h).unwrap();
+            cached.gemv(&name, &a_dev, w, &mut out_q, q_dim, h).unwrap();
         }
     }
     stream.synchronize().unwrap();
 
+    // Pre-resolve weight DeviceBuffer refs + indices (done once, not per iteration)
+    // Pre-resolve weight refs (done once, zero allocation in hot path)
+    struct LayerW<'a> {
+        q: Option<&'a cuda_core::DeviceBuffer<u8>>,
+        k: Option<&'a cuda_core::DeviceBuffer<u8>>,
+        v: Option<&'a cuda_core::DeviceBuffer<u8>>,
+        o: Option<&'a cuda_core::DeviceBuffer<u8>>,
+        gate: Option<&'a cuda_core::DeviceBuffer<u8>>,
+        up: Option<&'a cuda_core::DeviceBuffer<u8>>,
+        down: Option<&'a cuda_core::DeviceBuffer<u8>>,
+    }
+    let layer_weights: Vec<LayerW> = (0..config.num_layers).map(|l| {
+        let p = format!("model.layers.{l}");
+        LayerW {
+            q: gpu_weights.get_quantized_device(&format!("{p}.self_attn.q_proj.weight")),
+            k: gpu_weights.get_quantized_device(&format!("{p}.self_attn.k_proj.weight")),
+            v: gpu_weights.get_quantized_device(&format!("{p}.self_attn.v_proj.weight")),
+            o: gpu_weights.get_quantized_device(&format!("{p}.self_attn.o_proj.weight")),
+            gate: gpu_weights.get_quantized_device(&format!("{p}.mlp.gate_proj.weight")),
+            up: gpu_weights.get_quantized_device(&format!("{p}.mlp.up_proj.weight")),
+            down: gpu_weights.get_quantized_device(&format!("{p}.mlp.down_proj.weight")),
+        }
+    }).collect();
+    let lm_w = gpu_weights.get_quantized_device("lm_head.weight");
+
+    macro_rules! cd {
+        ($cached:expr, $idx:expr, $a:expr, $w:expr, $out:expr, $n:expr, $k:expr) => {
+            if let Some(w) = $w { $cached.gemv_idx($idx, $a, w, $out, $n, $k).unwrap(); }
+        };
+    }
+
     for _ in 0..iters {
         let start = Instant::now();
         for layer in 0..config.num_layers {
-            let prefix = format!("model.layers.{layer}");
-            macro_rules! run_disp {
-                ($proj:expr, $a:expr, $out:expr, $n:expr, $k:expr) => {
-                    let name = format!("{}.{}", prefix, $proj);
-                    if let Some(w) = gpu_weights.get_quantized_device(&name) {
-                        dispatcher.gemv_q4k($a, w, $out, $n, $k).unwrap();
-                    }
-                };
-            }
-            run_disp!("self_attn.q_proj.weight", &a_dev, &mut out_q, q_dim, h);
-            run_disp!("self_attn.k_proj.weight", &a_dev, &mut out_kv, kv_dim, h);
-            run_disp!("self_attn.v_proj.weight", &a_dev, &mut out_kv, kv_dim, h);
-            run_disp!("self_attn.o_proj.weight", &a_dev, &mut out_h, h, h);
-            run_disp!("mlp.gate_proj.weight", &a_dev, &mut out_inter, inter, h);
-            run_disp!("mlp.up_proj.weight", &a_dev, &mut out_inter, inter, h);
-            run_disp!("mlp.down_proj.weight", &a_inter_dev, &mut out_h, h, inter);
+            let base = cached.layer_base_idx(layer);
+            let lw = &layer_weights[layer];
+            cd!(cached, base, &a_dev, lw.q, &mut out_q, q_dim, h);
+            cd!(cached, base+1, &a_dev, lw.k, &mut out_kv, kv_dim, h);
+            cd!(cached, base+2, &a_dev, lw.v, &mut out_kv, kv_dim, h);
+            cd!(cached, base+3, &a_dev, lw.o, &mut out_h, h, h);
+            cd!(cached, base+4, &a_dev, lw.gate, &mut out_inter, inter, h);
+            cd!(cached, base+5, &a_dev, lw.up, &mut out_inter, inter, h);
+            cd!(cached, base+6, &a_inter_dev, lw.down, &mut out_h, h, inter);
         }
-        if let Some(w) = gpu_weights.get_quantized_device("lm_head.weight") {
-            dispatcher.gemv_q4k(&a_dev, w, &mut lm_out_disp, config.vocab_size, h).unwrap();
+        if let Some(w) = lm_w {
+            cached.gemv_idx(cached.lm_head_idx(), &a_dev, w, &mut lm_out_cd, config.vocab_size, h).unwrap();
         }
         stream.synchronize().unwrap();
-        disp_times.push(start.elapsed().as_secs_f64() * 1000.0);
+        cd_times.push(start.elapsed().as_secs_f64() * 1000.0);
     }
-    disp_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let disp_median = disp_times[iters / 2];
-    let disp_tps = 1000.0 / disp_median;
+    cd_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let cd_median = cd_times[iters / 2];
+    let cd_tps = 1000.0 / cd_median;
 
-    println!("  Dispatched forward:  {disp_median:.2}ms → {disp_tps:.0} tok/s");
+    println!("  Cached dispatch:     {cd_median:.2}ms → {cd_tps:.0} tok/s");
     println!("  llama.cpp reference: 209 tok/s");
-    println!("  Ratio: {:.2}x", disp_tps / 209.0);
+    println!("  Ratio: {:.2}x", cd_tps / 209.0);
 
     println!("\nDone.");
 }

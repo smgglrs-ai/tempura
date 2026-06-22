@@ -152,6 +152,113 @@ impl GpuKernelDispatcher {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub struct CachedDispatch {
+    q4k: crate::quantized::CudaMatMulQ4K,
+    nwarps: Vec<u8>,
+    index: std::collections::HashMap<String, usize>,
+}
+
+#[cfg(feature = "cuda")]
+impl CachedDispatch {
+    pub fn new(
+        arch: GpuArch,
+        projections: &[(&str, usize, usize)],
+    ) -> crate::Result<Self> {
+        let q4k = crate::quantized::CudaMatMulQ4K::new()?;
+        let mut nwarps = Vec::with_capacity(projections.len());
+        let mut index = std::collections::HashMap::with_capacity(projections.len());
+        for (i, (name, n, k)) in projections.iter().enumerate() {
+            nwarps.push(Q4KKernelConfig::select(arch, *n, *k).n_warps_per_col as u8);
+            index.insert(name.to_string(), i);
+        }
+        Ok(Self { q4k, nwarps, index })
+    }
+
+    pub fn from_model_dims(
+        arch: GpuArch,
+        num_layers: usize,
+        hidden_size: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        intermediate_size: usize,
+        vocab_size: usize,
+    ) -> crate::Result<Self> {
+        let q4k = crate::quantized::CudaMatMulQ4K::new()?;
+        let h = hidden_size;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let inter = intermediate_size;
+
+        let mut nwarps = Vec::new();
+        let mut index = std::collections::HashMap::new();
+        for layer in 0..num_layers {
+            let prefix = format!("model.layers.{layer}");
+            for (proj, n, k) in [
+                ("self_attn.q_proj.weight", q_dim, h),
+                ("self_attn.k_proj.weight", kv_dim, h),
+                ("self_attn.v_proj.weight", kv_dim, h),
+                ("self_attn.o_proj.weight", h, h),
+                ("mlp.gate_proj.weight", inter, h),
+                ("mlp.up_proj.weight", inter, h),
+                ("mlp.down_proj.weight", h, inter),
+            ] {
+                let idx = nwarps.len();
+                nwarps.push(Q4KKernelConfig::select(arch, n, k).n_warps_per_col as u8);
+                index.insert(format!("{prefix}.{proj}"), idx);
+            }
+        }
+        let idx = nwarps.len();
+        nwarps.push(Q4KKernelConfig::select(arch, vocab_size, h).n_warps_per_col as u8);
+        index.insert("lm_head.weight".into(), idx);
+
+        Ok(Self { q4k, nwarps, index })
+    }
+
+    #[inline]
+    pub fn gemv(
+        &self,
+        name: &str,
+        a: &cuda_core::DeviceBuffer<f32>,
+        b: &cuda_core::DeviceBuffer<u8>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        let nw = match self.index.get(name) {
+            Some(&idx) => self.nwarps[idx] as usize,
+            None => 8,
+        };
+        self.q4k.gemv_q4k_multirow_device(a, b, output, n, k, nw)
+    }
+
+    #[inline(always)]
+    pub fn gemv_idx(
+        &self,
+        idx: usize,
+        a: &cuda_core::DeviceBuffer<f32>,
+        b: &cuda_core::DeviceBuffer<u8>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        self.q4k.gemv_q4k_multirow_device(a, b, output, n, k, self.nwarps[idx] as usize)
+    }
+
+    pub fn layer_base_idx(&self, layer: usize) -> usize {
+        layer * 7 // 7 projections per layer
+    }
+
+    pub fn lm_head_idx(&self) -> usize {
+        self.nwarps.len() - 1
+    }
+
+    pub fn q4k(&self) -> &crate::quantized::CudaMatMulQ4K {
+        &self.q4k
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
