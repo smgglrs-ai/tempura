@@ -1,4 +1,4 @@
-use cuda_device::{kernel, thread, DisjointSlice};
+use cuda_device::{kernel, thread, warp, DisjointSlice};
 use cuda_host::cuda_module;
 
 const Q4K_BLOCK_SIZE: usize = 256;
@@ -249,6 +249,96 @@ pub mod kernels {
 
         if let Some(elem) = output.get_mut(idx) {
             *elem = sum;
+        }
+    }
+
+    /// Warp-cooperative Q4_K matvec for decode (m=1).
+    /// One warp (32 lanes) per output column. Lanes split K blocks:
+    /// lane i processes blocks i, i+32, i+64, ... then warp-shuffle reduce.
+    /// Grid: (ceil(n/COLS_PER_BLOCK), 1, 1), Block: (32, COLS_PER_BLOCK, 1)
+    /// COLS_PER_BLOCK warps run in parallel within a CTA for better occupancy.
+    #[kernel]
+    pub fn gemv_q4k_warp(
+        n: u32,
+        k: u32,
+        a: &[f32],
+        b_q4k: &[u8],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let lane = warp::lane_id() as usize;
+        let col = (thread::blockIdx_x() as usize) * (thread::blockDim_y() as usize)
+            + thread::threadIdx_y() as usize;
+
+        let n = n as usize;
+        let k = k as usize;
+        if col >= n {
+            return;
+        }
+
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let mut sum = 0.0f32;
+
+        let mut blk = lane;
+        while blk < blocks_per_row {
+            let block_offset = (col * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+
+            let d = f16_bits_to_f32(
+                (b_q4k[block_offset] as u16) | ((b_q4k[block_offset + 1] as u16) << 8),
+            );
+            let dmin = f16_bits_to_f32(
+                (b_q4k[block_offset + 2] as u16) | ((b_q4k[block_offset + 3] as u16) << 8),
+            );
+
+            let packed = &b_q4k[block_offset + 4..];
+            let mut sc = [0.0f32; 8];
+            let mut mins = [0.0f32; 8];
+            let mut i = 0usize;
+            while i < 4 {
+                sc[i] = (packed[i] & 0x3F) as f32;
+                sc[i + 4] =
+                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                mins[i] = (packed[i + 4] & 0x3F) as f32;
+                mins[i + 4] =
+                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                i += 1;
+            }
+
+            let qs = &b_q4k[block_offset + 16..];
+            let a_base = blk * Q4K_BLOCK_SIZE;
+
+            let mut j = 0usize;
+            while j < 4 {
+                let q_off = j * 32;
+                let d1 = d * sc[2 * j];
+                let m1 = dmin * mins[2 * j];
+                let d2 = d * sc[2 * j + 1];
+                let m2 = dmin * mins[2 * j + 1];
+                let elem_base = j * 64;
+                let mut l = 0usize;
+                while l < 32 {
+                    let q_lo = (qs[q_off + l] & 0x0F) as f32;
+                    let q_hi = (qs[q_off + l] >> 4) as f32;
+                    sum += a[a_base + elem_base + l] * (d1 * q_lo - m1);
+                    sum += a[a_base + elem_base + l + 32] * (d2 * q_hi - m2);
+                    l += 1;
+                }
+                j += 1;
+            }
+
+            blk += 32;
+        }
+
+        // Warp-shuffle reduction: sum across 32 lanes
+        sum += warp::shuffle_xor_f32(sum, 16);
+        sum += warp::shuffle_xor_f32(sum, 8);
+        sum += warp::shuffle_xor_f32(sum, 4);
+        sum += warp::shuffle_xor_f32(sum, 2);
+        sum += warp::shuffle_xor_f32(sum, 1);
+
+        if lane == 0 {
+            unsafe {
+                *output.get_unchecked_mut(col) = sum;
+            }
         }
     }
 
