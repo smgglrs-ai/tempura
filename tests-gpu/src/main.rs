@@ -817,6 +817,91 @@ fn test_q4k_cpu_vs_gpu(m: usize, n: usize, k: usize) {
     }
 }
 
+fn bench_q4k_resident(m: usize, n: usize, k: usize, label: &str) {
+    println!("=== Q4K Resident Bench: {label}  m={m} n={n} k={k} ===");
+
+    let gpu = CudaMatMulQ4K::new().expect("Failed to init CudaMatMulQ4K");
+    let ctx = gpu.gpu().context().clone();
+    ctx.bind_to_thread().unwrap();
+    let stream = ctx.default_stream();
+
+    let a: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+    let blocks_per_row = k / Q4K_BLOCK_SIZE;
+    let b_bytes = n * blocks_per_row * Q4K_BLOCK_BYTES;
+    let b_quantized: Vec<u8> = (0..b_bytes).map(|i| (i % 256) as u8).collect();
+
+    let a_dev = tempura_kernels::gpu::to_device(&stream, &a).unwrap();
+    let b_dev = tempura_kernels::gpu::to_device_u8(&stream, &b_quantized).unwrap();
+    let mut c_dev = tempura_kernels::gpu::alloc_device(&stream, m * n).unwrap();
+
+    // Warmup
+    gpu.forward_q4k_device(&a_dev, &b_dev, &mut c_dev, m, n, k).unwrap();
+
+    let mut times = Vec::new();
+    for _ in 0..10 {
+        let t = Instant::now();
+        gpu.forward_q4k_device(&a_dev, &b_dev, &mut c_dev, m, n, k).unwrap();
+        stream.synchronize().unwrap();
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = times[5];
+    let gflops = 2.0 * m as f64 * n as f64 * k as f64 / (median / 1000.0) / 1e9;
+
+    println!("  Kernel-only (no transfer): {median:.3}ms  {gflops:.0} GFLOPS\n");
+}
+
+fn bench_q4k_splitk(n: usize, k: usize, num_splits: usize, label: &str) {
+    println!("=== Q4K Split-K Bench: {label}  n={n} k={k} splits={num_splits} ===");
+
+    let gpu = CudaMatMulQ4K::new().expect("Failed to init CudaMatMulQ4K");
+    let ctx = gpu.gpu().context().clone();
+    ctx.bind_to_thread().unwrap();
+    let stream = ctx.default_stream();
+
+    let a: Vec<f32> = (0..k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+    let blocks_per_row = k / Q4K_BLOCK_SIZE;
+    let b_bytes = n * blocks_per_row * Q4K_BLOCK_BYTES;
+    let b_quantized: Vec<u8> = (0..b_bytes).map(|i| (i % 256) as u8).collect();
+
+    let a_dev = tempura_kernels::gpu::to_device(&stream, &a).unwrap();
+    let b_dev = tempura_kernels::gpu::to_device_u8(&stream, &b_quantized).unwrap();
+    let mut c_dev = tempura_kernels::gpu::alloc_device(&stream, n).unwrap();
+    let mut partials = tempura_kernels::gpu::alloc_device(&stream, n * num_splits).unwrap();
+
+    // Warmup
+    gpu.forward_q4k_splitk_device(&a_dev, &b_dev, &mut c_dev, n, k, num_splits, &mut partials).unwrap();
+
+    // Correctness check vs non-split
+    let mut c_ref = tempura_kernels::gpu::alloc_device(&stream, n).unwrap();
+    gpu.forward_q4k_device(&a_dev, &b_dev, &mut c_ref, 1, n, k).unwrap();
+    let out_splitk = tempura_kernels::gpu::to_host(&stream, &c_dev).unwrap();
+    let out_ref = tempura_kernels::gpu::to_host(&stream, &c_ref).unwrap();
+    let max_diff: f32 = out_splitk.iter().zip(out_ref.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let max_rel: f32 = out_splitk.iter().zip(out_ref.iter())
+        .map(|(a, b)| (a - b).abs() / b.abs().max(1e-6))
+        .fold(0.0f32, f32::max);
+
+    let mut times = Vec::new();
+    for _ in 0..10 {
+        let t = Instant::now();
+        gpu.forward_q4k_splitk_device(&a_dev, &b_dev, &mut c_dev, n, k, num_splits, &mut partials).unwrap();
+        stream.synchronize().unwrap();
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = times[5];
+    let gflops = 2.0 * n as f64 * k as f64 / (median / 1000.0) / 1e9;
+
+    println!("  Split-K: {median:.3}ms  {gflops:.0} GFLOPS  (max_rel_diff={max_rel:.2e})");
+    if max_rel > 1e-3 {
+        println!("  WARN: split-K vs non-split relative diff {max_rel:.6}");
+    }
+    println!();
+}
+
 fn bench_q4k_gpu(m: usize, n: usize, k: usize, label: &str) {
     println!("=== Q4K Bench: {label}  m={m} n={n} k={k} ===");
 
@@ -969,6 +1054,21 @@ fn main() {
     bench_q4k_gpu(1, 3584, 18944, "down_proj (decode)");
     bench_q4k_gpu(1, 151936, 3584, "lm_head (decode)");
     bench_q4k_gpu(128, 3584, 3584, "qkv_proj (prefill-128)");
+
+    // --- Quantized GEMM Q4K: resident weights (kernel-only, no transfer) ---
+    bench_q4k_resident(1, 3584, 3584, "qkv_proj (decode)");
+    bench_q4k_resident(1, 18944, 3584, "gate_proj (decode)");
+    bench_q4k_resident(1, 3584, 18944, "down_proj (decode)");
+    bench_q4k_resident(1, 151936, 3584, "lm_head (decode)");
+    bench_q4k_resident(128, 3584, 3584, "qkv_proj (prefill-128)");
+
+    // --- Split-K: decode matmul bottleneck optimization ---
+    bench_q4k_splitk(3584, 18944, 4, "down_proj 4-split");
+    bench_q4k_splitk(3584, 18944, 8, "down_proj 8-split");
+    bench_q4k_splitk(3584, 18944, 16, "down_proj 16-split");
+    bench_q4k_splitk(3584, 18944, 32, "down_proj 32-split");
+    bench_q4k_splitk(3584, 3584, 8, "qkv_proj 8-split");
+    bench_q4k_splitk(18944, 3584, 8, "gate_proj 8-split");
 
     println!("All GPU tests passed.");
 }

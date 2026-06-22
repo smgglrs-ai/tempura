@@ -1738,6 +1738,107 @@ impl CudaMatMulQ4K {
     pub fn gpu(&self) -> &crate::gpu::GpuContext {
         &self.gpu
     }
+
+    pub fn forward_q4k_device(
+        &self,
+        a: &cuda_core::DeviceBuffer<f32>,
+        b_quantized: &cuda_core::DeviceBuffer<u8>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+        let total = (m * n) as u32;
+        self.module
+            .gemm_q4k_bt(
+                &stream,
+                LaunchConfig::for_num_elems(total),
+                m as u32,
+                n as u32,
+                k as u32,
+                a,
+                b_quantized,
+                output,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn forward_q4k_splitk_device(
+        &self,
+        a: &cuda_core::DeviceBuffer<f32>,
+        b_quantized: &cuda_core::DeviceBuffer<u8>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        n: usize,
+        k: usize,
+        num_splits: usize,
+        partials: &mut cuda_core::DeviceBuffer<f32>,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+
+        self.module
+            .gemm_q4k_bt_splitk(
+                &stream,
+                LaunchConfig {
+                    grid_dim: (n as u32, num_splits as u32, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                n as u32,
+                k as u32,
+                num_splits as u32,
+                a,
+                b_quantized,
+                partials,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+        self.module
+            .reduce_splitk(
+                &stream,
+                LaunchConfig::for_num_elems(n as u32),
+                n as u32,
+                num_splits as u32,
+                partials,
+                output,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+        Ok(())
+    }
+
+    pub fn forward_q6k_device(
+        &self,
+        a: &cuda_core::DeviceBuffer<f32>,
+        b_quantized: &cuda_core::DeviceBuffer<u8>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        crate::gpu::bind_context(self.gpu.context())?;
+        let stream = self.gpu.stream();
+        let total = (m * n) as u32;
+        self.module
+            .gemm_q6k_bt(
+                &stream,
+                LaunchConfig::for_num_elems(total),
+                m as u32,
+                n as u32,
+                k as u32,
+                a,
+                b_quantized,
+                output,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cuda")]

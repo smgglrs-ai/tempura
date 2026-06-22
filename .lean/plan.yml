@@ -1767,7 +1767,8 @@ items:
     Weight tensors are accessed via WeightHandle that abstracts over resident/streaming/
     pinned backing. ModelConfig gains a memory_mode field (auto/vram/hybrid/converged).
     Auto mode selects based on model size vs available VRAM.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: XL
   depends_on:

@@ -248,6 +248,7 @@ impl QuantizedWeights {
 #[cfg(feature = "cuda")]
 pub struct GpuWeights {
     tensors: HashMap<String, cuda_core::DeviceBuffer<f32>>,
+    quantized_tensors: HashMap<String, cuda_core::DeviceBuffer<u8>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -267,7 +268,29 @@ impl GpuWeights {
                 tensors.insert(name, dev_buf);
             }
         }
-        Ok(Self { tensors })
+        Ok(Self {
+            tensors,
+            quantized_tensors: HashMap::new(),
+        })
+    }
+
+    pub fn upload_quantized(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        ctx: &std::sync::Arc<cuda_core::CudaContext>,
+    ) -> Result<(), WeightsError> {
+        ctx.bind_to_thread()
+            .map_err(|e| WeightsError::GpuUpload(e.to_string()))?;
+        let stream = ctx.default_stream();
+        let dev_buf = cuda_core::DeviceBuffer::from_host(&stream, data)
+            .map_err(|e| WeightsError::GpuUpload(format!("{name}: {e}")))?;
+        self.quantized_tensors.insert(name.to_string(), dev_buf);
+        Ok(())
+    }
+
+    pub fn get_quantized_device(&self, name: &str) -> Option<&cuda_core::DeviceBuffer<u8>> {
+        self.quantized_tensors.get(name)
     }
 
     pub fn upload_from_with_concat(

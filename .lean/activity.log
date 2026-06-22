@@ -949,3 +949,17 @@
   summary: "Added fused kernel traits: FusedRMSNormResidual (norm + residual add in one pass), FusedSiluGate (SiLU × gate). CPU implementations verified against sequential equivalents. 5 new tests, 248 total."
   iteration: 5
   max_iterations: 10
+
+- timestamp: "2026-06-22T11:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "e2e-memory-management"
+  summary: >
+    GPU-resident weight infrastructure: forward_q4k_device/forward_q6k_device
+    (zero-copy), GpuWeights.upload_quantized, split-K GEMM kernel for decode.
+    Resident weights: 5-30x over host-transfer path, 1770 GFLOPS on lm_head.
+    Split-K did not improve down_proj (memory-bound, not compute-bound).
+    vs llama.cpp (245 tok/s): projected ~33 tok/s matmul-only (7.4x gap).
+    Gap is memory access pattern (per-thread sequential reads vs warp-cooperative).
+  iteration: 6
+  max_iterations: 10
