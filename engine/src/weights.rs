@@ -293,6 +293,43 @@ impl GpuWeights {
         self.quantized_tensors.get(name)
     }
 
+    pub fn upload_from_quantized(
+        qweights: &QuantizedWeights,
+        ctx: &std::sync::Arc<cuda_core::CudaContext>,
+    ) -> Result<Self, WeightsError> {
+        ctx.bind_to_thread()
+            .map_err(|e| WeightsError::GpuUpload(e.to_string()))?;
+        let stream = ctx.default_stream();
+
+        let mut tensors = HashMap::new();
+        for (name, data) in &qweights.f32_tensors {
+            let dev_buf = cuda_core::DeviceBuffer::from_host(&stream, data)
+                .map_err(|e| WeightsError::GpuUpload(format!("{name}: {e}")))?;
+            tensors.insert(name.clone(), dev_buf);
+        }
+
+        let mut quantized_tensors = HashMap::new();
+        for (name, data) in &qweights.q4k_tensors {
+            let dev_buf = cuda_core::DeviceBuffer::from_host(&stream, data)
+                .map_err(|e| WeightsError::GpuUpload(format!("{name}: {e}")))?;
+            quantized_tensors.insert(name.clone(), dev_buf);
+        }
+        for (name, data) in &qweights.q6k_tensors {
+            let dev_buf = cuda_core::DeviceBuffer::from_host(&stream, data)
+                .map_err(|e| WeightsError::GpuUpload(format!("{name}: {e}")))?;
+            quantized_tensors.insert(name.clone(), dev_buf);
+        }
+
+        Ok(Self {
+            tensors,
+            quantized_tensors,
+        })
+    }
+
+    pub fn is_quantized(&self, name: &str) -> bool {
+        self.quantized_tensors.contains_key(name)
+    }
+
     pub fn upload_from_with_concat(
         weights: &ModelWeights,
         config: &crate::config::ModelConfig,
