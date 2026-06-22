@@ -963,3 +963,11 @@
     Gap is memory access pattern (per-thread sequential reads vs warp-cooperative).
   iteration: 6
   max_iterations: 10
+
+- timestamp: "2026-06-22T12:00:00+02:00"
+  actor: claude
+  action: loop-iteration
+  item: "p18-foundations-math"
+  summary: "Wrote Learn ch.20: Quantized MatMul on GPUs. Q4_K layout, arithmetic intensity (3.6 FLOPs/byte = memory-bound), three kernel strategies with RTX 5090 benchmarks. Honest comparison: tempura 64 tok/s matmul-only vs llama.cpp 209 tok/s full forward (measured with llama-bench, same hardware). Gap is 3.3x in bandwidth utilization."
+  iteration: 8
+  max_iterations: 10
