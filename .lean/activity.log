@@ -971,3 +971,27 @@
   summary: "Wrote Learn ch.20: Quantized MatMul on GPUs. Q4_K layout, arithmetic intensity (3.6 FLOPs/byte = memory-bound), three kernel strategies with RTX 5090 benchmarks. Honest comparison: tempura 64 tok/s matmul-only vs llama.cpp 209 tok/s full forward (measured with llama-bench, same hardware). Gap is 3.3x in bandwidth utilization."
   iteration: 8
   max_iterations: 10
+
+- timestamp: "2026-06-22T12:30:00+02:00"
+  actor: claude
+  action: loop-complete
+  summary: "Loop finished: 8 items across 2 sessions. GPU quantized GEMM (naive + warp-coop), fused kernels, quantized traits, architecture registry, structured gen v2, Learn ch.20 with measured llama.cpp comparison."
+  details:
+    iterations: 8
+    max_iterations: 10
+    completed:
+    - e2e-quantized-gemm-gpu
+    - p15-quantized-kernel-traits
+    - p22-structured-gen-v2
+    - p16-architecture-registry
+    - p21-fused-kernels
+    - e2e-memory-management
+    - "GPU warp-cooperative Q4K GEMV kernel"
+    - "Learn ch.20: Quantized MatMul on GPUs"
+    exit_reason: "Loop items complete, performance documented"
+    branch: "loop/2026-06-21"
+    tag: "loop-run/2026-06-22-8"
+    benchmarks:
+      llama_cpp_decode: "209 tok/s (4.78ms, measured)"
+      tempura_matmul_only: "64 tok/s (15.7ms, kernel-only)"
+      gap: "3.3x — bandwidth utilization 200 vs 750 GB/s"
