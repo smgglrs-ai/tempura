@@ -2677,7 +2677,9 @@ items:
     quick: cargo test --workspace
 
 - id: p22-radix-attention
-  title: RadixAttention — tree-based prefix sharing
+  title: RadixAttention
+  status: done
+  progress: 100 — tree-based prefix sharing
   description: 'Extend prefix caching from hash-based to radix-tree-based
     (SGLang approach). Multi-turn conversations share KV cache for common
     prefixes at the page level. The radix tree tracks which pages are shared
@@ -2732,7 +2734,6 @@ items:
     The FFN layer selects K of N experts per token via a gating network.
     Only the selected experts weights are read from memory. Requires
     expert-parallel execution across GPUs for large expert counts.'
-  status: pending
   priority: medium
   effort: XL
   scope:
