@@ -2,7 +2,10 @@ use rand::{Rng, SeedableRng};
 use serde::Serialize;
 use tempura_kernel_api::{Attention, MatMul, RMSNorm, RoPE};
 
+pub mod composition;
 pub mod test_generators;
+
+pub use composition::{CompositionReport, CompositionVerifier, OpShape};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VerificationReport {

@@ -1973,7 +1973,8 @@ items:
     numerical equivalence of the composed graph vs individual operations. This is
     the theoretical foundation for NPU graph-level traits: prove the unfused version,
     verify the fused version matches.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: L
   depends_on:

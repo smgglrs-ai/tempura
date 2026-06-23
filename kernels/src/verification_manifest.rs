@@ -255,6 +255,15 @@ pub fn manifest() -> VerificationManifest {
                 ],
                 status: "proven",
             },
+            KernelProof {
+                kernel: "CompositionVerifier",
+                harness: "verify_transformer_layer",
+                properties: vec![
+                    "Attention chain: dimensional compatibility across RMSNorm → Q proj → RoPE → Attention → O proj → Residual",
+                    "FFN chain: dimensional compatibility across RMSNorm → gate proj → SiLU×gate → down proj → Residual",
+                ],
+                status: "proven",
+            },
         ],
         math_properties: vec![
             MathProperty {
