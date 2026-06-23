@@ -1164,3 +1164,27 @@
   summary: "Created NPU backend scaffold: kernels/src/npu/ with Intel (OpenVINO) and Qualcomm (QNN) stubs implementing FusedTransformerLayer, CompiledPrefill, CompiledDecodeStep traits with todo!() bodies. Feature flags npu-intel, npu-qualcomm added to kernels Cargo.toml. Both compile with cargo check --features npu-*. 280 tests passing."
   iteration: 13
   max_iterations: 20
+- timestamp: "2026-06-23T15:10:00Z"
+  actor: claude
+  action: loop-complete
+  summary: "Loop finished: 12 items completed. Exit: user-directed pace through 13 iterations"
+  details:
+    iterations: 13
+    max_iterations: 20
+    completed:
+    - p20-paged-attention
+    - p15-quantized-kani-proofs
+    - p13-graph-composition-proofs
+    - p18-foundations-math
+    - p17-graph-level-traits
+    - p14-trace-cli
+    - p22-sliding-window
+    - p18-foundations-verification
+    - p18-foundations-connection
+    - p20-fp8-kv-cache
+    - p17-npu-scaffold
+    exit_reason: "Pausing at iteration 13/20 — remaining items are GPU-toolchain-dependent or medium/low priority L/XL"
+    branch: "loop/2026-06-23"
+    tag: "loop-run/2026-06-23-13"
+    tests: 280
+    benchmark_stable: true
