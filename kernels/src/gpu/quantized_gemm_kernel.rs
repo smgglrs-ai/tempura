@@ -637,6 +637,135 @@ pub mod kernels {
         }
     }
 
+    /// Multi-warp Q4K×Q8 GEMV via dp4a: combines multi-warp K-splitting with
+    /// integer dot products. Activations pre-quantized to Q8 (32 int8 per block,
+    /// scale+sum as f32, packed as 10 u32 words per block).
+    /// 2.9x fewer instructions than f32 FMA path via dp4a.
+    ///
+    /// Grid: (n, 1, 1), Block: (32, n_warps_per_col, 1)
+    #[kernel]
+    pub fn gemv_q4k_q8_mw(
+        n: u32,
+        k: u32,
+        n_warps_per_col: u32,
+        a_q8: &[u32],
+        b_q4k: &[u8],
+        mut output: DisjointSlice<f32>,
+    ) {
+        static mut WARP_SUMS: SharedArray<f32, 64> = SharedArray::UNINIT;
+
+        let lane = warp::lane_id() as usize;
+        let warp_id = thread::threadIdx_y() as usize;
+        let nwpc = n_warps_per_col as usize;
+        let col_in_cta = warp_id / nwpc;
+        let warp_in_col = warp_id % nwpc;
+        let cols_per_cta = (thread::blockDim_y() as usize) / nwpc;
+        let col = (thread::blockIdx_x() as usize) * cols_per_cta + col_in_cta;
+
+        let n = n as usize;
+        let k = k as usize;
+        if col >= n {
+            return;
+        }
+
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let q8_blocks_per_q4k = Q4K_BLOCK_SIZE / Q8_BLOCK_SIZE; // 8
+
+        let qs_byte_off = lane * 4;
+        let group = qs_byte_off / 32;
+        let local = qs_byte_off % 32;
+        let sc_idx_lo = 2 * group;
+        let sc_idx_hi = 2 * group + 1;
+
+        // Q8 block indices for this lane's elements
+        let q8_idx_lo = (group * 64 + local) / Q8_BLOCK_SIZE;
+        let q8_idx_hi = (group * 64 + 32 + local) / Q8_BLOCK_SIZE;
+        let q8_off_lo = (group * 64 + local) % Q8_BLOCK_SIZE;
+        let q8_off_hi = (group * 64 + 32 + local) % Q8_BLOCK_SIZE;
+
+        let mut lane_sum = 0.0f32;
+        let mut blk = warp_in_col;
+        while blk < blocks_per_row {
+            let block_offset = (col * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+
+            let d4 = f16_bits_to_f32(
+                (b_q4k[block_offset] as u16) | ((b_q4k[block_offset + 1] as u16) << 8),
+            );
+            let dmin4 = f16_bits_to_f32(
+                (b_q4k[block_offset + 2] as u16) | ((b_q4k[block_offset + 3] as u16) << 8),
+            );
+
+            let packed = &b_q4k[block_offset + 4..];
+            let mut sc = [0u8; 8];
+            let mut mins = [0u8; 8];
+            let mut i = 0usize;
+            while i < 4 {
+                sc[i] = packed[i] & 0x3F;
+                sc[i + 4] = ((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F;
+                mins[i] = packed[i + 4] & 0x3F;
+                mins[i + 4] = ((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F;
+                i += 1;
+            }
+
+            // Load Q4K nibbles as packed u32
+            let qs = &b_q4k[block_offset + 16..];
+            let raw = (qs[qs_byte_off] as u32)
+                | ((qs[qs_byte_off + 1] as u32) << 8)
+                | ((qs[qs_byte_off + 2] as u32) << 16)
+                | ((qs[qs_byte_off + 3] as u32) << 24);
+            let v_lo = raw & 0x0F0F0F0F;
+            let v_hi = (raw >> 4) & 0x0F0F0F0F;
+
+            // Load Q8 activation data
+            let q8_base = blk * q8_blocks_per_q4k;
+            let q8_lo_base = (q8_base + q8_idx_lo) * 10;
+            let q8_hi_base = (q8_base + q8_idx_hi) * 10;
+
+            let d8_lo = f32::from_bits(a_q8[q8_lo_base]);
+            let d8_hi = f32::from_bits(a_q8[q8_hi_base]);
+
+            let u_lo = a_q8[q8_lo_base + 2 + q8_off_lo / 4];
+            let u_hi = a_q8[q8_hi_base + 2 + q8_off_hi / 4];
+
+            // dp4a: 2 instructions for 8 element products
+            let dot_lo = dp4a_u32_i32(v_lo, u_lo, 0);
+            let dot_hi = dp4a_u32_i32(v_hi, u_hi, 0);
+            let sum_lo = dp4a_u32_i32(0x01010101, u_lo, 0);
+            let sum_hi = dp4a_u32_i32(0x01010101, u_hi, 0);
+
+            // Float scale application (4 FMAs instead of 8 cvt+FMA)
+            lane_sum += d4 * (sc[sc_idx_lo] as f32) * d8_lo * (dot_lo as f32)
+                - dmin4 * (mins[sc_idx_lo] as f32) * d8_lo * (sum_lo as f32)
+                + d4 * (sc[sc_idx_hi] as f32) * d8_hi * (dot_hi as f32)
+                - dmin4 * (mins[sc_idx_hi] as f32) * d8_hi * (sum_hi as f32);
+
+            blk += nwpc;
+        }
+
+        // Intra-warp reduction
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 16);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 8);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 4);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 2);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 1);
+
+        if lane == 0 {
+            unsafe { WARP_SUMS[warp_id] = lane_sum; }
+        }
+        thread::sync_threads();
+
+        if warp_in_col == 0 && lane == 0 {
+            let smem_base = col_in_cta * nwpc;
+            let mut total = 0.0f32;
+            let mut w = 0usize;
+            while w < nwpc {
+                total += unsafe { WARP_SUMS[smem_base + w] };
+                w += 1;
+            }
+            unsafe { *output.get_unchecked_mut(col) = total; }
+        }
+    }
+
     /// Multi-warp cooperative Q4K GEMV: N_WARPS warps share one output column.
     /// Each warp handles blocks_per_row/N_WARPS blocks with intra-block cooperation.
     /// Cross-warp reduction via shared memory. 8x more in-flight memory requests.

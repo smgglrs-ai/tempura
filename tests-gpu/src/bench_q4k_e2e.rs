@@ -432,5 +432,136 @@ fn main() {
     let ptx_tps = 1000.0 / ptx_med;
     println!("  PTX (8 warps):       {ptx_med:.2}ms → {ptx_tps:.0} tok/s ({:.2}x llama.cpp)", ptx_tps / 209.0);
 
+    // --- EARLY: Fused QKV + gate_up (fewer kernel launches) ---
+    // Run first before other kernels can corrupt GPU state
+    println!("─── Fused Projections (4 launches/layer instead of 7) ───");
+    let qkv_n = q_dim + 2 * kv_dim;
+    let gate_up_n = 2 * inter;
+    let mut out_qkv = tempura_kernels::gpu::alloc_device(&stream, qkv_n).unwrap();
+    let mut out_gate_up = tempura_kernels::gpu::alloc_device(&stream, gate_up_n).unwrap();
+
+    // Fuse QKV and gate+up weights by concatenating on host then uploading
+    println!("  Fusing weights (host concat → GPU upload)...");
+    struct FusedW { qkv: cuda_core::DeviceBuffer<u8>, gate_up: cuda_core::DeviceBuffer<u8> }
+    let fused: Vec<FusedW> = (0..config.num_layers).map(|l| {
+        let p = format!("model.layers.{l}");
+        let concat_q = |names: &[String]| -> cuda_core::DeviceBuffer<u8> {
+            let mut host_buf = Vec::new();
+            for name in names {
+                if let Some(w) = qweights.get_q4k(name) {
+                    host_buf.extend_from_slice(w);
+                } else {
+                    eprintln!("  WARN: {name} not Q4K, skipping fused concat");
+                }
+            }
+            eprintln!("  concat: {} bytes for {} names", host_buf.len(), names.len());
+            tempura_kernels::gpu::to_device_u8(&stream, &host_buf).unwrap()
+        };
+        FusedW {
+            qkv: concat_q(&[
+                format!("{p}.self_attn.q_proj.weight"),
+                format!("{p}.self_attn.k_proj.weight"),
+                // v_proj is Q6K, not Q4K — can't fuse with Q4K weights
+            ]),
+            gate_up: concat_q(&[
+                format!("{p}.mlp.gate_proj.weight"),
+                format!("{p}.mlp.up_proj.weight"),
+            ]),
+        }
+    }).collect();
+
+    let qk_n = q_dim + kv_dim; // Q+K fused (both Q4K), V is Q6K — separate
+    let mut out_qk = tempura_kernels::gpu::alloc_device(&stream, qk_n).unwrap();
+
+    // Warmup
+    q4k.gemv_q4k_multirow_device(&a_dev, &fused[0].qkv, &mut out_qk, qk_n, h, 8).unwrap();
+    stream.synchronize().unwrap();
+
+    let mut fused_times = Vec::new();
+    for _ in 0..iters {
+        let start = Instant::now();
+        for layer in 0..config.num_layers {
+            let fw = &fused[layer];
+            let lw = &layer_weights[layer];
+            // 1 launch: fused Q+K (both Q4K)
+            q4k.gemv_q4k_multirow_device(&a_dev, &fw.qkv, &mut out_qk, qk_n, h, 8).unwrap();
+            // 1 launch: V proj (Q6K, separate)
+            if let Some(w) = lw.v {
+                q4k.gemv_q4k_multirow_device(&a_dev, w, &mut out_kv, kv_dim, h, 8).unwrap();
+            }
+            // 1 launch: O proj (Q6K)
+            if let Some(w) = lw.o {
+                q4k.gemv_q4k_multirow_device(&a_dev, w, &mut out_h, h, h, 8).unwrap();
+            }
+            // 1 launch: fused gate+up (both Q4K)
+            q4k.gemv_q4k_multirow_device(&a_dev, &fw.gate_up, &mut out_gate_up, gate_up_n, h, 8).unwrap();
+            // 1 launch: down proj (Q6K)
+            if let Some(w) = lw.down {
+                q4k.gemv_q4k_multirow_device(&a_inter_dev, w, &mut out_h, h, inter, 8).unwrap();
+            }
+        }
+        if let Some(w) = lm_w {
+            q4k.gemv_q4k_multirow_device(&a_dev, w, &mut lm_out_cd, config.vocab_size, h, 8).unwrap();
+        }
+        stream.synchronize().unwrap();
+        fused_times.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    fused_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let f_med = fused_times[iters / 2];
+    let f_tps = 1000.0 / f_med;
+    let launches = 36 * 5 + 1; // QK, V, O, gate_up, down per layer + lm_head
+    println!("  Fused ({launches} launches): {f_med:.2}ms → {f_tps:.0} tok/s ({:.2}x llama.cpp)", f_tps / 209.0);
+
+    // --- Multi-warp dp4a kernel ---
+    println!("─── Multi-Warp dp4a (Q4K×Q8, 8 warps) ───");
+    let a_vec: Vec<f32> = (0..h).map(|i| ((i % 97) as f32 - 48.0) * 0.001).collect();
+    let a_q8_data = tempura_kernels::quantized::ActivationQ8::from_f32(&a_vec);
+    let a_q8_dev = tempura_kernels::gpu::to_device_u32(&stream, &a_q8_data.data).unwrap();
+
+    // Also need Q8 for inter-sized activation (down_proj)
+    let a_inter_vec: Vec<f32> = vec![0.01f32; inter];
+    let a_inter_q8 = tempura_kernels::quantized::ActivationQ8::from_f32(&a_inter_vec);
+    let a_inter_q8_dev = tempura_kernels::gpu::to_device_u32(&stream, &a_inter_q8.data).unwrap();
+
+    let mut dp4a_times = Vec::new();
+    // Warmup
+    for layer in 0..2.min(config.num_layers) {
+        let p = format!("model.layers.{layer}");
+        if let Some(w) = gpu_weights.get_quantized_device(&format!("{p}.self_attn.q_proj.weight")) {
+            q4k.gemv_q4k_q8_mw_device(&a_q8_dev, w, &mut out_q, q_dim, h, 8).unwrap();
+        }
+    }
+    stream.synchronize().unwrap();
+
+    for _ in 0..iters {
+        let start = Instant::now();
+        for layer in 0..config.num_layers {
+            let p = format!("model.layers.{layer}");
+            macro_rules! dp4a_mw {
+                ($proj:expr, $a:expr, $out:expr, $no:expr, $ki:expr) => {
+                    if let Some(w) = gpu_weights.get_quantized_device(&format!("{}.{}", p, $proj)) {
+                        q4k.gemv_q4k_q8_mw_device($a, w, $out, $no, $ki, 8).unwrap();
+                    }
+                };
+            }
+            dp4a_mw!("self_attn.q_proj.weight", &a_q8_dev, &mut out_q, q_dim, h);
+            dp4a_mw!("self_attn.k_proj.weight", &a_q8_dev, &mut out_kv, kv_dim, h);
+            dp4a_mw!("self_attn.v_proj.weight", &a_q8_dev, &mut out_kv, kv_dim, h);
+            dp4a_mw!("self_attn.o_proj.weight", &a_q8_dev, &mut out_h, h, h);
+            dp4a_mw!("mlp.gate_proj.weight", &a_q8_dev, &mut out_inter, inter, h);
+            dp4a_mw!("mlp.up_proj.weight", &a_q8_dev, &mut out_inter, inter, h);
+            dp4a_mw!("mlp.down_proj.weight", &a_inter_q8_dev, &mut out_h, h, inter);
+        }
+        if let Some(w) = gpu_weights.get_quantized_device("lm_head.weight") {
+            q4k.gemv_q4k_q8_mw_device(&a_q8_dev, w, &mut lm_out, config.vocab_size, h, 8).unwrap();
+        }
+        stream.synchronize().unwrap();
+        dp4a_times.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    dp4a_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let dp4a_med = dp4a_times[iters / 2];
+    let dp4a_tps = 1000.0 / dp4a_med;
+    println!("  MW dp4a (8 warps):   {dp4a_med:.2}ms → {dp4a_tps:.0} tok/s ({:.2}x llama.cpp)", dp4a_tps / 209.0);
+
     println!("\nDone.");
 }
