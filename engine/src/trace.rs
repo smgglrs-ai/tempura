@@ -60,6 +60,14 @@ pub struct SpeculativeSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeMetrics {
+    pub joules_per_token: Option<f64>,
+    pub memory_peak_bytes: Option<u64>,
+    pub tokens_per_watt: Option<f64>,
+    pub clock_mhz_min: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceTrace {
     pub trace_id: String,
     pub level: TraceLevel,
@@ -73,6 +81,8 @@ pub struct InferenceTrace {
     pub speculative_steps: Vec<SpeculativeSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_verification_tier: Option<VerificationTier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_metrics: Option<EdgeMetrics>,
 }
 
 pub const TRACE_MAGIC: [u8; 4] = [0x54, 0x50, 0x52, 0x41]; // "TPRA"
@@ -92,6 +102,7 @@ impl InferenceTrace {
             sampling_steps: Vec::new(),
             speculative_steps: Vec::new(),
             pipeline_verification_tier: None,
+            edge_metrics: None,
         }
     }
 
@@ -115,6 +126,62 @@ impl InferenceTrace {
             return Err(TraceDecodeError::UnsupportedVersion(data[4]));
         }
         rmp_serde::from_slice(&data[5..]).map_err(TraceDecodeError::Decode)
+    }
+}
+
+impl EdgeMetrics {
+    pub fn read_rapl_energy_uj() -> Option<u64> {
+        std::fs::read_to_string("/sys/class/powercap/intel-rapl:0/energy_uj")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    }
+
+    pub fn current_rss_bytes() -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| {
+                    let pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
+                    Some(pages * 4096)
+                })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    pub fn from_measurement(
+        energy_before_uj: Option<u64>,
+        energy_after_uj: Option<u64>,
+        tokens_generated: usize,
+        _duration_secs: f64,
+    ) -> Option<Self> {
+        let joules_per_token = match (energy_before_uj, energy_after_uj) {
+            (Some(before), Some(after)) if tokens_generated > 0 && after >= before => {
+                let joules = (after - before) as f64 / 1_000_000.0;
+                Some(joules / tokens_generated as f64)
+            }
+            _ => None,
+        };
+
+        let tokens_per_watt = joules_per_token.map(|jpt| {
+            if jpt > 0.0 {
+                1.0 / jpt
+            } else {
+                0.0
+            }
+        });
+
+        let memory_peak = Self::current_rss_bytes();
+
+        Some(Self {
+            joules_per_token,
+            memory_peak_bytes: memory_peak,
+            tokens_per_watt,
+            clock_mhz_min: None,
+        })
     }
 }
 

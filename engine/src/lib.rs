@@ -36,8 +36,8 @@ pub use model::{InferenceModel, TokenLogprob, TopLogprob, TransformerModel};
 pub use session::InferenceSession;
 pub use tokenizer::{ChatMessageInput, ChatTemplate};
 pub use trace::{
-    InferenceTrace, LayerSnapshot, NormStats, SamplingSnapshot, TimingInfo, TraceDecodeError,
-    TraceLevel, TRACE_FORMAT_VERSION, TRACE_MAGIC,
+    EdgeMetrics, InferenceTrace, LayerSnapshot, NormStats, SamplingSnapshot, TimingInfo,
+    TraceDecodeError, TraceLevel, TRACE_FORMAT_VERSION, TRACE_MAGIC,
 };
 pub use trace_diff::{diff_traces, DivergenceLevel, TraceDiff};
 #[cfg(feature = "cuda")]

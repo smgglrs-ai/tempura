@@ -11,6 +11,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 [features]
 default = []
 cuda = ["tempura-kernels/cuda", "dep:cuda-core"]
+edge-metrics = []
 
 [dependencies]
 tempura-kernel-api = { path = "../kernel-api" }
