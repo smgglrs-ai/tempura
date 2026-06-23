@@ -294,27 +294,48 @@ where
                 )
                 .unwrap();
 
-            session.cache.append_kv(layer, &k, &v, seq_len);
-            let kv_len = session.cache.seq_len + seq_len;
-            let k_cache = session.cache.k_data(layer, kv_len);
-            let v_cache = session.cache.v_data(layer, kv_len);
-
             let mut attn_out = vec![0.0f32; seq_len * q_dim];
-            self.pipeline
-                .attention(
-                    &q,
-                    &k_cache,
-                    &v_cache,
-                    &mut attn_out,
-                    1,
-                    seq_len,
-                    kv_len,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    1.0 / (head_dim as f32).sqrt(),
-                )
-                .unwrap();
+            if let Some(ref mut paged) = session.paged_cache {
+                paged.append_kv(layer, &k, &v, seq_len);
+                let kv_len = paged.seq_len + seq_len;
+                let k_cont = paged.k_contiguous(layer, kv_len);
+                let v_cont = paged.v_contiguous(layer, kv_len);
+                self.pipeline
+                    .attention(
+                        &q,
+                        &k_cont,
+                        &v_cont,
+                        &mut attn_out,
+                        1,
+                        seq_len,
+                        kv_len,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        1.0 / (head_dim as f32).sqrt(),
+                    )
+                    .unwrap();
+            } else {
+                session.cache.append_kv(layer, &k, &v, seq_len);
+                let kv_len = session.cache.seq_len + seq_len;
+                let k_cache = session.cache.k_data(layer, kv_len);
+                let v_cache = session.cache.v_data(layer, kv_len);
+                self.pipeline
+                    .attention(
+                        &q,
+                        &k_cache,
+                        &v_cache,
+                        &mut attn_out,
+                        1,
+                        seq_len,
+                        kv_len,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        1.0 / (head_dim as f32).sqrt(),
+                    )
+                    .unwrap();
+            }
 
             let mut o_proj = vec![0.0f32; seq_len * h];
             self.pipeline
@@ -394,7 +415,11 @@ where
             }
         }
 
-        session.cache.advance(seq_len);
+        if let Some(ref mut paged) = session.paged_cache {
+            paged.advance(seq_len);
+        } else {
+            session.cache.advance(seq_len);
+        }
         session.position += seq_len;
 
         // final norm
@@ -2551,5 +2576,63 @@ mod tests {
         let logits2 = model2.chunked_forward(&mut s2, &tokens, 3);
 
         assert_eq!(logits1, logits2);
+    }
+
+    #[test]
+    fn test_paged_forward_matches_contiguous() {
+        let config = ModelConfig::tiny_test();
+        let loader = RandomWeightLoader::from_config(&config, 42);
+        let tokens = [1u32, 2, 3, 4, 5];
+
+        let pipeline1 = KernelPipeline::cpu_verified();
+        let mut model1 = TransformerModel::new(config.clone(), pipeline1);
+        model1.load_weights(&loader).unwrap();
+        let mut s1 = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let logits_contiguous = model1.forward(&mut s1, &tokens);
+
+        let pipeline2 = KernelPipeline::cpu_verified();
+        let mut model2 = TransformerModel::new(config.clone(), pipeline2);
+        model2.load_weights(&loader).unwrap();
+        let mut s2 = InferenceSession::new_paged(&config, 64, 4, TraceLevel::Off, 42);
+        let logits_paged = model2.forward(&mut s2, &tokens);
+
+        assert_eq!(logits_contiguous.len(), logits_paged.len());
+        for i in 0..logits_contiguous.len() {
+            assert!(
+                (logits_contiguous[i] - logits_paged[i]).abs() < 1e-5,
+                "logit divergence at {i}: contiguous={} paged={}",
+                logits_contiguous[i],
+                logits_paged[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_paged_generate_matches_contiguous() {
+        let config = ModelConfig::tiny_test();
+        let loader = RandomWeightLoader::from_config(&config, 42);
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 50,
+            top_p: 1.0,
+            ..SamplingParams::default()
+        };
+
+        let pipeline1 = KernelPipeline::cpu_verified();
+        let mut model1 = TransformerModel::new(config.clone(), pipeline1);
+        model1.load_weights(&loader).unwrap();
+        let mut s1 = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let tokens_contiguous = model1.generate(&mut s1, &[1, 2], 5, &params, None);
+
+        let pipeline2 = KernelPipeline::cpu_verified();
+        let mut model2 = TransformerModel::new(config.clone(), pipeline2);
+        model2.load_weights(&loader).unwrap();
+        let mut s2 = InferenceSession::new_paged(&config, 64, 4, TraceLevel::Off, 42);
+        let tokens_paged = model2.generate(&mut s2, &[1, 2], 5, &params, None);
+
+        assert_eq!(
+            tokens_contiguous, tokens_paged,
+            "paged generate must produce identical tokens"
+        );
     }
 }

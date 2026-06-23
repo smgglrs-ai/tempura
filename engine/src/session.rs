@@ -2,11 +2,12 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::config::ModelConfig;
-use crate::kv_cache::KvCache;
+use crate::kv_cache::{KvCache, PagedKvCache};
 use crate::trace::{InferenceTrace, TraceLevel};
 
 pub struct InferenceSession {
     pub cache: KvCache,
+    pub paged_cache: Option<PagedKvCache>,
     pub trace: InferenceTrace,
     pub trace_level: TraceLevel,
     pub position: usize,
@@ -18,6 +19,25 @@ impl InferenceSession {
     pub fn new(config: &ModelConfig, trace_level: TraceLevel, seed: u64) -> Self {
         Self {
             cache: KvCache::new(config),
+            paged_cache: None,
+            trace: InferenceTrace::new(String::new(), trace_level, String::new(), seed),
+            trace_level,
+            position: 0,
+            rng: StdRng::seed_from_u64(seed),
+            seed,
+        }
+    }
+
+    pub fn new_paged(
+        config: &ModelConfig,
+        total_pages: usize,
+        block_size: usize,
+        trace_level: TraceLevel,
+        seed: u64,
+    ) -> Self {
+        Self {
+            cache: KvCache::new(config),
+            paged_cache: Some(PagedKvCache::new(config, total_pages, block_size)),
             trace: InferenceTrace::new(String::new(), trace_level, String::new(), seed),
             trace_level,
             position: 0,
@@ -29,6 +49,7 @@ impl InferenceSession {
     pub fn with_cache(cache: KvCache, trace_level: TraceLevel, seed: u64) -> Self {
         Self {
             cache,
+            paged_cache: None,
             trace: InferenceTrace::new(String::new(), trace_level, String::new(), seed),
             trace_level,
             position: 0,
@@ -37,12 +58,19 @@ impl InferenceSession {
         }
     }
 
+    pub fn uses_paged_cache(&self) -> bool {
+        self.paged_cache.is_some()
+    }
+
     pub fn take_cache(self) -> KvCache {
         self.cache
     }
 
     pub fn reset(&mut self) {
         self.cache.reset();
+        if let Some(ref mut paged) = self.paged_cache {
+            paged.reset();
+        }
         self.position = 0;
         self.rng = StdRng::seed_from_u64(self.seed);
         self.trace = InferenceTrace::new(
@@ -79,6 +107,7 @@ impl InferenceSession {
         let cache = KvCache::from_transfer(transfer.cache, config);
         Self {
             cache,
+            paged_cache: None,
             trace: InferenceTrace::new(String::new(), trace_level, String::new(), transfer.seed),
             trace_level,
             position: transfer.position,

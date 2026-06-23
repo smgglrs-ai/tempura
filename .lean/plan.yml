@@ -2487,8 +2487,8 @@ items:
     the block table. KvCachePool becomes a page allocator. BatchScheduler
     tracks pages per request, preempts by releasing pages. Prefix sharing
     becomes copy-on-write at the page level.'
-  status: in_progress
-  progress: 60
+  status: done
+  progress: 100
   priority: critical
   effort: XL
   depends_on:
