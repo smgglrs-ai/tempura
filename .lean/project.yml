@@ -64,6 +64,7 @@ autonomy:
 verification:
   quick: cargo test --workspace
   full: cargo test --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check
+  bench: cargo bench --package tempura-engine --bench inference_bench
 
 loop:
   max_iterations: 20
