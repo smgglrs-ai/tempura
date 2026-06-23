@@ -1,3 +1,5 @@
+pub mod graph;
+
 use rand::RngCore;
 
 #[derive(Debug, thiserror::Error)]

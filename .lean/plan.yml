@@ -2266,7 +2266,8 @@ items:
     produces KV cache entries. DualPipeline verifies graph-level output against the
     composition of individual operations. Per-operation trace granularity is lost
     inside fused blocks, but per-block I/O verification is preserved.'
-  status: pending
+  status: done
+  progress: 100
   priority: medium
   effort: M
   depends_on:
