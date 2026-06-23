@@ -3,9 +3,9 @@ use crate::pipeline::KernelPipeline;
 use crate::session::InferenceSession;
 use crate::trace::{LayerSnapshot, SamplingSnapshot, TimingInfo, TraceLevel};
 use crate::weights::ModelWeights;
-use tempura_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
 use serde::Serialize;
 use std::time::Instant;
+use tempura_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
 
 fn apply_head_rmsnorm(
     x: &mut [f32],
@@ -253,8 +253,22 @@ where
                 let k_norm_w = weights
                     .get(&format!("{prefix}.self_attn.k_norm.weight"))
                     .unwrap();
-                apply_head_rmsnorm(&mut q, q_norm_w, seq_len, n_heads, head_dim, cfg.layer_norm_eps);
-                apply_head_rmsnorm(&mut k, k_norm_w, seq_len, n_kv_heads, head_dim, cfg.layer_norm_eps);
+                apply_head_rmsnorm(
+                    &mut q,
+                    q_norm_w,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    cfg.layer_norm_eps,
+                );
+                apply_head_rmsnorm(
+                    &mut k,
+                    k_norm_w,
+                    seq_len,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.layer_norm_eps,
+                );
             }
 
             self.pipeline
@@ -362,13 +376,13 @@ where
             }
 
             if std::env::var("TEMPURA_DEBUG").is_ok() && layer == 0 && seq_len > 1 {
-                let h_before_ffn = hidden[0..h].iter().map(|x| x*x).sum::<f32>().sqrt();
-                let n2_norm = normed2[0..h].iter().map(|x| x*x).sum::<f32>().sqrt();
+                let h_before_ffn = hidden[0..h].iter().map(|x| x * x).sum::<f32>().sqrt();
+                let n2_norm = normed2[0..h].iter().map(|x| x * x).sum::<f32>().sqrt();
                 let gate_tok0 = gate[0..inter.min(4)].to_vec();
                 let up_tok0 = up[0..inter.min(4)].to_vec();
-                let gate_n = gate[0..inter].iter().map(|x| x*x).sum::<f32>().sqrt();
-                let dn = down_out[0..h].iter().map(|x| x*x).sum::<f32>().sqrt();
-                let hn = hidden[0..h].iter().map(|x| x*x).sum::<f32>().sqrt();
+                let gate_n = gate[0..inter].iter().map(|x| x * x).sum::<f32>().sqrt();
+                let dn = down_out[0..h].iter().map(|x| x * x).sum::<f32>().sqrt();
+                let hn = hidden[0..h].iter().map(|x| x * x).sum::<f32>().sqrt();
                 eprintln!("[DEBUG] L0 tok0: h_pre_ffn={h_before_ffn:.4} normed2={n2_norm:.4} gate_norm={gate_n:.4} down={dn:.4} h_final={hn:.4}");
                 eprintln!("[DEBUG] L0 tok0 gate[0..4]: {gate_tok0:?}");
                 eprintln!("[DEBUG] L0 tok0 up[0..4]: {up_tok0:?}");
@@ -448,14 +462,23 @@ where
 
         if std::env::var("TEMPURA_DEBUG").is_ok() {
             eprintln!("[DEBUG] embed[785][0..8]: {:?}", &hidden[0..8.min(h)]);
-            eprintln!("[DEBUG] embed norm: {}", hidden.iter().map(|x| x*x).sum::<f32>().sqrt());
+            eprintln!(
+                "[DEBUG] embed norm: {}",
+                hidden.iter().map(|x| x * x).sum::<f32>().sqrt()
+            );
         }
 
         let positions: Vec<u32> = (session.position..session.position + seq_len)
             .map(|p| p as u32)
             .collect();
 
-        let qmm = |preq: Option<&PreQuantizedActivations>, a_f32: &[f32], name: &str, out: &mut [f32], m: usize, n: usize, k: usize| {
+        let qmm = |preq: Option<&PreQuantizedActivations>,
+                   a_f32: &[f32],
+                   name: &str,
+                   out: &mut [f32],
+                   m: usize,
+                   n: usize,
+                   k: usize| {
             if m == 1 {
                 if let Some(pq) = preq {
                     if let Some(w) = qweights.get_q4k(name) {
@@ -469,9 +492,11 @@ where
                 }
             }
             if let Some(w) = qweights.get_q4k(name) {
-                q4k.forward_b_transposed_q4k(a_f32, w, out, m, n, k).unwrap();
+                q4k.forward_b_transposed_q4k(a_f32, w, out, m, n, k)
+                    .unwrap();
             } else if let Some(w) = qweights.get_q6k(name) {
-                q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k).unwrap();
+                q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k)
+                    .unwrap();
             } else {
                 let w = qweights.get_f32(name).unwrap();
                 self.pipeline.matmul_bt(a_f32, w, out, m, n, k).unwrap();
@@ -479,95 +504,295 @@ where
         };
 
         // Pre-compute all weight names to avoid 252 string allocations per token
-        let layer_names: Vec<_> = (0..cfg.num_layers).map(|l| {
-            let p = format!("model.layers.{l}");
-            (
-                format!("{p}.input_layernorm.weight"),
-                format!("{p}.post_attention_layernorm.weight"),
-                format!("{p}.self_attn.q_proj.weight"),
-                format!("{p}.self_attn.k_proj.weight"),
-                format!("{p}.self_attn.v_proj.weight"),
-                format!("{p}.self_attn.o_proj.weight"),
-                format!("{p}.self_attn.q_norm.weight"),
-                format!("{p}.self_attn.k_norm.weight"),
-                format!("{p}.mlp.gate_proj.weight"),
-                format!("{p}.mlp.up_proj.weight"),
-                format!("{p}.mlp.down_proj.weight"),
-            )
-        }).collect();
+        let layer_names: Vec<_> = (0..cfg.num_layers)
+            .map(|l| {
+                let p = format!("model.layers.{l}");
+                (
+                    format!("{p}.input_layernorm.weight"),
+                    format!("{p}.post_attention_layernorm.weight"),
+                    format!("{p}.self_attn.q_proj.weight"),
+                    format!("{p}.self_attn.k_proj.weight"),
+                    format!("{p}.self_attn.v_proj.weight"),
+                    format!("{p}.self_attn.o_proj.weight"),
+                    format!("{p}.self_attn.q_norm.weight"),
+                    format!("{p}.self_attn.k_norm.weight"),
+                    format!("{p}.mlp.gate_proj.weight"),
+                    format!("{p}.mlp.up_proj.weight"),
+                    format!("{p}.mlp.down_proj.weight"),
+                )
+            })
+            .collect();
 
         for layer in 0..cfg.num_layers {
-            let (ref input_ln_name, ref post_ln_name, ref q_w_name, ref k_w_name,
-                 ref v_w_name, ref o_w_name, ref q_norm_name, ref k_norm_name,
-                 ref gate_w_name, ref up_w_name, ref down_w_name) = layer_names[layer];
+            let (
+                ref input_ln_name,
+                ref post_ln_name,
+                ref q_w_name,
+                ref k_w_name,
+                ref v_w_name,
+                ref o_w_name,
+                ref q_norm_name,
+                ref k_norm_name,
+                ref gate_w_name,
+                ref up_w_name,
+                ref down_w_name,
+            ) = layer_names[layer];
 
             normed.copy_from_slice(&hidden);
             let input_ln_w = qweights.get_f32(input_ln_name).unwrap();
-            self.pipeline.rmsnorm(&mut normed, input_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+            self.pipeline
+                .rmsnorm(
+                    &mut normed,
+                    input_ln_w,
+                    h,
+                    cfg.layer_norm_eps,
+                    TraceLevel::Off,
+                    &mut None,
+                )
+                .unwrap();
 
-            let normed_preq = if seq_len == 1 { Some(PreQuantizedActivations::from_f32(&normed[..h])) } else { None };
+            let normed_preq = if seq_len == 1 {
+                Some(PreQuantizedActivations::from_f32(&normed[..h]))
+            } else {
+                None
+            };
 
-            q.fill(0.0); k.fill(0.0); v.fill(0.0);
+            q.fill(0.0);
+            k.fill(0.0);
+            v.fill(0.0);
             // Fuse Q+K into single dispatch when both are Q4K and decode (m=1)
             if seq_len == 1 {
-                if let (Some(pq), Some(qw), Some(kw)) =
-                    (normed_preq.as_ref(), qweights.get_q4k(&q_w_name), qweights.get_q4k(&k_w_name))
-                {
-                    q4k.fused_q4k_preq_2(pq, qw, &mut q[..q_dim], q_dim, kw, &mut k[..kv_dim], kv_dim);
+                if let (Some(pq), Some(qw), Some(kw)) = (
+                    normed_preq.as_ref(),
+                    qweights.get_q4k(&q_w_name),
+                    qweights.get_q4k(&k_w_name),
+                ) {
+                    q4k.fused_q4k_preq_2(
+                        pq,
+                        qw,
+                        &mut q[..q_dim],
+                        q_dim,
+                        kw,
+                        &mut k[..kv_dim],
+                        kv_dim,
+                    );
                 } else {
-                    qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q[..q_dim], 1, q_dim, h);
-                    qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..kv_dim], 1, kv_dim, h);
+                    qmm(
+                        normed_preq.as_ref(),
+                        &normed,
+                        &q_w_name,
+                        &mut q[..q_dim],
+                        1,
+                        q_dim,
+                        h,
+                    );
+                    qmm(
+                        normed_preq.as_ref(),
+                        &normed,
+                        &k_w_name,
+                        &mut k[..kv_dim],
+                        1,
+                        kv_dim,
+                        h,
+                    );
                 }
             } else {
-                qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q[..seq_len * q_dim], seq_len, q_dim, h);
-                qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..seq_len * kv_dim], seq_len, kv_dim, h);
+                qmm(
+                    normed_preq.as_ref(),
+                    &normed,
+                    &q_w_name,
+                    &mut q[..seq_len * q_dim],
+                    seq_len,
+                    q_dim,
+                    h,
+                );
+                qmm(
+                    normed_preq.as_ref(),
+                    &normed,
+                    &k_w_name,
+                    &mut k[..seq_len * kv_dim],
+                    seq_len,
+                    kv_dim,
+                    h,
+                );
             }
-            qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..seq_len * kv_dim], seq_len, kv_dim, h);
+            qmm(
+                normed_preq.as_ref(),
+                &normed,
+                &v_w_name,
+                &mut v[..seq_len * kv_dim],
+                seq_len,
+                kv_dim,
+                h,
+            );
 
             if cfg.use_qk_norm {
                 let q_norm_w = qweights.get_f32(q_norm_name).unwrap();
                 let k_norm_w = qweights.get_f32(k_norm_name).unwrap();
-                apply_head_rmsnorm(&mut q, q_norm_w, seq_len, n_heads, head_dim, cfg.layer_norm_eps);
-                apply_head_rmsnorm(&mut k, k_norm_w, seq_len, n_kv_heads, head_dim, cfg.layer_norm_eps);
+                apply_head_rmsnorm(
+                    &mut q,
+                    q_norm_w,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    cfg.layer_norm_eps,
+                );
+                apply_head_rmsnorm(
+                    &mut k,
+                    k_norm_w,
+                    seq_len,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.layer_norm_eps,
+                );
             }
 
-            self.pipeline.rope(&mut q, 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
-            self.pipeline.rope(&mut k, 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+            self.pipeline
+                .rope(
+                    &mut q,
+                    1,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    &positions,
+                    cfg.rope_theta,
+                )
+                .unwrap();
+            self.pipeline
+                .rope(
+                    &mut k,
+                    1,
+                    seq_len,
+                    n_kv_heads,
+                    head_dim,
+                    &positions,
+                    cfg.rope_theta,
+                )
+                .unwrap();
 
-            session.cache.append_kv(layer, &k[..seq_len * kv_dim], &v[..seq_len * kv_dim], seq_len);
+            session.cache.append_kv(
+                layer,
+                &k[..seq_len * kv_dim],
+                &v[..seq_len * kv_dim],
+                seq_len,
+            );
             let kv_len = session.cache.seq_len + seq_len;
             let k_cache = session.cache.k_data(layer, kv_len);
             let v_cache = session.cache.v_data(layer, kv_len);
 
             attn_out.fill(0.0);
-            self.pipeline.attention(&q, &k_cache, &v_cache, &mut attn_out[..seq_len * q_dim], 1, seq_len, kv_len, n_heads, n_kv_heads, head_dim, 1.0 / (head_dim as f32).sqrt()).unwrap();
+            self.pipeline
+                .attention(
+                    &q,
+                    &k_cache,
+                    &v_cache,
+                    &mut attn_out[..seq_len * q_dim],
+                    1,
+                    seq_len,
+                    kv_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    1.0 / (head_dim as f32).sqrt(),
+                )
+                .unwrap();
 
             o_proj.fill(0.0);
-            let attn_preq = if seq_len == 1 { Some(PreQuantizedActivations::from_f32(&attn_out[..q_dim])) } else { None };
-            qmm(attn_preq.as_ref(), &attn_out[..seq_len * q_dim], &o_w_name, &mut o_proj[..seq_len * h], seq_len, h, q_dim);
-            for i in 0..seq_len * h { hidden[i] += o_proj[i]; }
+            let attn_preq = if seq_len == 1 {
+                Some(PreQuantizedActivations::from_f32(&attn_out[..q_dim]))
+            } else {
+                None
+            };
+            qmm(
+                attn_preq.as_ref(),
+                &attn_out[..seq_len * q_dim],
+                &o_w_name,
+                &mut o_proj[..seq_len * h],
+                seq_len,
+                h,
+                q_dim,
+            );
+            for i in 0..seq_len * h {
+                hidden[i] += o_proj[i];
+            }
 
             // FFN block
             normed2.copy_from_slice(&hidden);
             let post_ln_w = qweights.get_f32(post_ln_name).unwrap();
-            self.pipeline.rmsnorm(&mut normed2, post_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+            self.pipeline
+                .rmsnorm(
+                    &mut normed2,
+                    post_ln_w,
+                    h,
+                    cfg.layer_norm_eps,
+                    TraceLevel::Off,
+                    &mut None,
+                )
+                .unwrap();
 
-            let normed2_preq = if seq_len == 1 { Some(PreQuantizedActivations::from_f32(&normed2[..h])) } else { None };
+            let normed2_preq = if seq_len == 1 {
+                Some(PreQuantizedActivations::from_f32(&normed2[..h]))
+            } else {
+                None
+            };
 
-            gate.fill(0.0); up.fill(0.0);
+            gate.fill(0.0);
+            up.fill(0.0);
             // Fuse gate+up into single dispatch when both are Q4K and decode
             if seq_len == 1 {
-                if let (Some(pq), Some(gw), Some(uw)) =
-                    (normed2_preq.as_ref(), qweights.get_q4k(&gate_w_name), qweights.get_q4k(&up_w_name))
-                {
-                    q4k.fused_q4k_preq_2(pq, gw, &mut gate[..inter], inter, uw, &mut up[..inter], inter);
+                if let (Some(pq), Some(gw), Some(uw)) = (
+                    normed2_preq.as_ref(),
+                    qweights.get_q4k(&gate_w_name),
+                    qweights.get_q4k(&up_w_name),
+                ) {
+                    q4k.fused_q4k_preq_2(
+                        pq,
+                        gw,
+                        &mut gate[..inter],
+                        inter,
+                        uw,
+                        &mut up[..inter],
+                        inter,
+                    );
                 } else {
-                    qmm(normed2_preq.as_ref(), &normed2, &gate_w_name, &mut gate[..inter], 1, inter, h);
-                    qmm(normed2_preq.as_ref(), &normed2, &up_w_name, &mut up[..inter], 1, inter, h);
+                    qmm(
+                        normed2_preq.as_ref(),
+                        &normed2,
+                        &gate_w_name,
+                        &mut gate[..inter],
+                        1,
+                        inter,
+                        h,
+                    );
+                    qmm(
+                        normed2_preq.as_ref(),
+                        &normed2,
+                        &up_w_name,
+                        &mut up[..inter],
+                        1,
+                        inter,
+                        h,
+                    );
                 }
             } else {
-                qmm(normed2_preq.as_ref(), &normed2, &gate_w_name, &mut gate[..seq_len * inter], seq_len, inter, h);
-                qmm(normed2_preq.as_ref(), &normed2, &up_w_name, &mut up[..seq_len * inter], seq_len, inter, h);
+                qmm(
+                    normed2_preq.as_ref(),
+                    &normed2,
+                    &gate_w_name,
+                    &mut gate[..seq_len * inter],
+                    seq_len,
+                    inter,
+                    h,
+                );
+                qmm(
+                    normed2_preq.as_ref(),
+                    &normed2,
+                    &up_w_name,
+                    &mut up[..seq_len * inter],
+                    seq_len,
+                    inter,
+                    h,
+                );
             }
 
             for i in 0..seq_len * inter {
@@ -576,9 +801,23 @@ where
             }
 
             down_out.fill(0.0);
-            let gate_preq = if seq_len == 1 { Some(PreQuantizedActivations::from_f32(&gate[..inter])) } else { None };
-            qmm(gate_preq.as_ref(), &gate[..seq_len * inter], &down_w_name, &mut down_out[..seq_len * h], seq_len, h, inter);
-            for i in 0..seq_len * h { hidden[i] += down_out[i]; }
+            let gate_preq = if seq_len == 1 {
+                Some(PreQuantizedActivations::from_f32(&gate[..inter]))
+            } else {
+                None
+            };
+            qmm(
+                gate_preq.as_ref(),
+                &gate[..seq_len * inter],
+                &down_w_name,
+                &mut down_out[..seq_len * h],
+                seq_len,
+                h,
+                inter,
+            );
+            for i in 0..seq_len * h {
+                hidden[i] += down_out[i];
+            }
         }
 
         session.cache.advance(seq_len);
@@ -586,19 +825,32 @@ where
 
         let mut final_normed = hidden.clone();
         let final_norm_w = qweights.get_f32("model.norm.weight").unwrap();
-        self.pipeline.rmsnorm(&mut final_normed, final_norm_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+        self.pipeline
+            .rmsnorm(
+                &mut final_normed,
+                final_norm_w,
+                h,
+                cfg.layer_norm_eps,
+                TraceLevel::Off,
+                &mut None,
+            )
+            .unwrap();
 
         // lm_head
         let last_hidden = &final_normed[(seq_len - 1) * h..seq_len * h];
         let mut logits = vec![0.0f32; cfg.vocab_size];
         let lm_head_name = "lm_head.weight";
         if let Some(w) = qweights.get_q4k(lm_head_name) {
-            q4k.forward_b_transposed_q4k(last_hidden, w, &mut logits, 1, cfg.vocab_size, h).unwrap();
+            q4k.forward_b_transposed_q4k(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
+                .unwrap();
         } else if let Some(w) = qweights.get_q6k(lm_head_name) {
-            q4k.forward_b_transposed_q6k(last_hidden, w, &mut logits, 1, cfg.vocab_size, h).unwrap();
+            q4k.forward_b_transposed_q6k(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
+                .unwrap();
         } else {
             let w = qweights.get_f32(lm_head_name).unwrap();
-            self.pipeline.matmul_bt(last_hidden, w, &mut logits, 1, cfg.vocab_size, h).unwrap();
+            self.pipeline
+                .matmul_bt(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
+                .unwrap();
         }
 
         logits
@@ -1092,22 +1344,50 @@ impl
                 .unwrap();
             self.pipeline
                 .matmul
-                .forward_bt_device(&scratch.normed, qkv_w, &mut scratch.qkv, seq_len, qkv_dim, h)
+                .forward_bt_device(
+                    &scratch.normed,
+                    qkv_w,
+                    &mut scratch.qkv,
+                    seq_len,
+                    qkv_dim,
+                    h,
+                )
                 .expect("qkv proj");
 
             let ctx = self.pipeline.matmul.gpu().context().clone();
             tempura_kernels::gpu::slice_columns_device(
-                &ctx, &stream, &scratch.qkv, &mut scratch.q,
-                seq_len, qkv_dim, 0, q_dim,
-            ).expect("slice q");
+                &ctx,
+                &stream,
+                &scratch.qkv,
+                &mut scratch.q,
+                seq_len,
+                qkv_dim,
+                0,
+                q_dim,
+            )
+            .expect("slice q");
             tempura_kernels::gpu::slice_columns_device(
-                &ctx, &stream, &scratch.qkv, &mut scratch.k,
-                seq_len, qkv_dim, q_dim, kv_dim,
-            ).expect("slice k");
+                &ctx,
+                &stream,
+                &scratch.qkv,
+                &mut scratch.k,
+                seq_len,
+                qkv_dim,
+                q_dim,
+                kv_dim,
+            )
+            .expect("slice k");
             tempura_kernels::gpu::slice_columns_device(
-                &ctx, &stream, &scratch.qkv, &mut scratch.v,
-                seq_len, qkv_dim, q_dim + kv_dim, kv_dim,
-            ).expect("slice v");
+                &ctx,
+                &stream,
+                &scratch.qkv,
+                &mut scratch.v,
+                seq_len,
+                qkv_dim,
+                q_dim + kv_dim,
+                kv_dim,
+            )
+            .expect("slice v");
 
             // --- QK-norm (Qwen3) ---
             if cfg.use_qk_norm {
@@ -1125,8 +1405,15 @@ impl
                     )
                     .expect("qk norm q");
                 tempura_kernels::gpu::copy_region_device(
-                    &ctx, &stream, &scratch.q_rotated, &mut scratch.q, 0, 0, seq_len * q_dim,
-                ).expect("copy q norm");
+                    &ctx,
+                    &stream,
+                    &scratch.q_rotated,
+                    &mut scratch.q,
+                    0,
+                    0,
+                    seq_len * q_dim,
+                )
+                .expect("copy q norm");
 
                 let k_norm_w = gpu_weights
                     .get(&format!("{prefix}.self_attn.k_norm.weight"))
@@ -1142,8 +1429,15 @@ impl
                     )
                     .expect("qk norm k");
                 tempura_kernels::gpu::copy_region_device(
-                    &ctx, &stream, &scratch.k_rotated, &mut scratch.k, 0, 0, seq_len * kv_dim,
-                ).expect("copy k norm");
+                    &ctx,
+                    &stream,
+                    &scratch.k_rotated,
+                    &mut scratch.k,
+                    0,
+                    0,
+                    seq_len * kv_dim,
+                )
+                .expect("copy k norm");
             }
 
             // --- RoPE ---
@@ -1223,7 +1517,14 @@ impl
                 .unwrap();
             self.pipeline
                 .matmul
-                .forward_bt_device(&scratch.attn_out, o_w, &mut scratch.o_proj, seq_len, h, q_dim)
+                .forward_bt_device(
+                    &scratch.attn_out,
+                    o_w,
+                    &mut scratch.o_proj,
+                    seq_len,
+                    h,
+                    q_dim,
+                )
                 .expect("o proj");
 
             // --- Residual add (on device) ---
@@ -1263,20 +1564,38 @@ impl
             self.pipeline
                 .matmul
                 .forward_bt_device(
-                    &scratch.normed2, gate_up_w, &mut scratch.gate_up,
-                    seq_len, 2 * inter, h,
+                    &scratch.normed2,
+                    gate_up_w,
+                    &mut scratch.gate_up,
+                    seq_len,
+                    2 * inter,
+                    h,
                 )
                 .expect("gate_up proj");
 
             let ctx = self.pipeline.matmul.gpu().context().clone();
             tempura_kernels::gpu::slice_columns_device(
-                &ctx, &stream, &scratch.gate_up, &mut scratch.gate,
-                seq_len, 2 * inter, 0, inter,
-            ).expect("slice gate");
+                &ctx,
+                &stream,
+                &scratch.gate_up,
+                &mut scratch.gate,
+                seq_len,
+                2 * inter,
+                0,
+                inter,
+            )
+            .expect("slice gate");
             tempura_kernels::gpu::slice_columns_device(
-                &ctx, &stream, &scratch.gate_up, &mut scratch.up,
-                seq_len, 2 * inter, inter, inter,
-            ).expect("slice up");
+                &ctx,
+                &stream,
+                &scratch.gate_up,
+                &mut scratch.up,
+                seq_len,
+                2 * inter,
+                inter,
+                inter,
+            )
+            .expect("slice up");
 
             // --- SiLU(gate) * up (on device) ---
             let ctx = self.pipeline.matmul.gpu().context().clone();
@@ -1291,7 +1610,14 @@ impl
 
             self.pipeline
                 .matmul
-                .forward_bt_device(&scratch.silu_out, down_w, &mut scratch.down, seq_len, h, inter)
+                .forward_bt_device(
+                    &scratch.silu_out,
+                    down_w,
+                    &mut scratch.down,
+                    seq_len,
+                    h,
+                    inter,
+                )
                 .expect("down proj");
 
             // --- FFN residual add (on device) ---

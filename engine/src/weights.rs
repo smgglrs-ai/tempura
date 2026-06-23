@@ -229,7 +229,11 @@ impl QuantizedWeights {
         q6k_tensors: HashMap<String, Vec<u8>>,
         f32_tensors: HashMap<String, Vec<f32>>,
     ) -> Self {
-        Self { q4k_tensors, q6k_tensors, f32_tensors }
+        Self {
+            q4k_tensors,
+            q6k_tensors,
+            f32_tensors,
+        }
     }
 
     pub fn get_q4k(&self, name: &str) -> Option<&[u8]> {
@@ -371,8 +375,10 @@ impl GpuWeights {
                 let mut gate_up = Vec::with_capacity(gate.len() + up.len());
                 gate_up.extend_from_slice(gate);
                 gate_up.extend_from_slice(up);
-                let dev_buf = cuda_core::DeviceBuffer::from_host(&stream, &gate_up)
-                    .map_err(|e| WeightsError::GpuUpload(format!("gate_up concat L{layer}: {e}")))?;
+                let dev_buf =
+                    cuda_core::DeviceBuffer::from_host(&stream, &gate_up).map_err(|e| {
+                        WeightsError::GpuUpload(format!("gate_up concat L{layer}: {e}"))
+                    })?;
                 gpu.tensors
                     .insert(format!("{prefix}.mlp.gate_up_proj.weight"), dev_buf);
             }

@@ -2487,7 +2487,8 @@ items:
     the block table. KvCachePool becomes a page allocator. BatchScheduler
     tracks pages per request, preempts by releasing pages. Prefix sharing
     becomes copy-on-write at the page level.'
-  status: pending
+  status: in_progress
+  progress: 60
   priority: critical
   effort: XL
   depends_on:
@@ -2508,6 +2509,12 @@ items:
   - Kani proof for block table index arithmetic (logical → physical offset in bounds)
   - DualPipeline confirms paged attention matches contiguous attention numerically
   - Existing tests pass unchanged
+  notes:
+  - '2026-06-23: forward_paged added to Attention trait with default gather-then-forward
+    impl. PageAllocator, BlockTable, PagedKvCache data structures implemented with
+    append/advance/reset/contiguous access. 2 Kani proofs for block table arithmetic.
+    9 new tests including paged-vs-contiguous equivalence. Remaining: CoW prefix sharing,
+    session/model wiring, BatchScheduler page tracking.'
   verification:
     quick: cargo test --workspace
 

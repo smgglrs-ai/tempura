@@ -14,10 +14,7 @@ pub enum GpuArch {
 impl GpuArch {
     #[cfg(feature = "cuda")]
     pub fn detect(ctx: &GpuContext) -> Self {
-        let (major, minor) = ctx
-            .context()
-            .compute_capability()
-            .unwrap_or((0, 0));
+        let (major, minor) = ctx.context().compute_capability().unwrap_or((0, 0));
         Self::from_sm(major, minor)
     }
 
@@ -126,16 +123,11 @@ impl GpuKernelDispatcher {
     ) -> crate::Result<()> {
         let config = Q4KKernelConfig::select(self.arch, n, k);
         match config.variant {
-            QuantKernelVariant::Naive => {
-                self.q4k.forward_q4k_device(a, b, output, 1, n, k)
-            }
-            QuantKernelVariant::Coop => {
-                self.q4k.gemv_q4k_coop_device(a, b, output, n, k)
-            }
+            QuantKernelVariant::Naive => self.q4k.forward_q4k_device(a, b, output, 1, n, k),
+            QuantKernelVariant::Coop => self.q4k.gemv_q4k_coop_device(a, b, output, n, k),
             QuantKernelVariant::CoopMultiWarp => {
-                self.q4k.gemv_q4k_multirow_device(
-                    a, b, output, n, k, config.n_warps_per_col,
-                )
+                self.q4k
+                    .gemv_q4k_multirow_device(a, b, output, n, k, config.n_warps_per_col)
             }
         }
     }
@@ -161,10 +153,7 @@ pub struct CachedDispatch {
 
 #[cfg(feature = "cuda")]
 impl CachedDispatch {
-    pub fn new(
-        arch: GpuArch,
-        projections: &[(&str, usize, usize)],
-    ) -> crate::Result<Self> {
+    pub fn new(arch: GpuArch, projections: &[(&str, usize, usize)]) -> crate::Result<Self> {
         let q4k = crate::quantized::CudaMatMulQ4K::new()?;
         let mut nwarps = Vec::with_capacity(projections.len());
         let mut index = std::collections::HashMap::with_capacity(projections.len());
@@ -243,7 +232,8 @@ impl CachedDispatch {
         n: usize,
         k: usize,
     ) -> crate::Result<()> {
-        self.q4k.gemv_q4k_multirow_device(a, b, output, n, k, self.nwarps[idx] as usize)
+        self.q4k
+            .gemv_q4k_multirow_device(a, b, output, n, k, self.nwarps[idx] as usize)
     }
 
     pub fn layer_base_idx(&self, layer: usize) -> usize {

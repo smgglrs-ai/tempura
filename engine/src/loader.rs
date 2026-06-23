@@ -48,8 +48,8 @@ impl IntegrityManifest {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), LoadError> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| LoadError::GgufParse(e.to_string()))?;
+        let json =
+            serde_json::to_string_pretty(self).map_err(|e| LoadError::GgufParse(e.to_string()))?;
         std::fs::write(path, json)?;
         Ok(())
     }
@@ -148,8 +148,9 @@ impl SafetensorsLoader {
                 .tensors
                 .get(name.as_str())
                 .ok_or_else(|| LoadError::MissingTensor(name.clone()))?;
-            let bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(tensor.as_ptr() as *const u8, tensor.len() * 4) };
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(tensor.as_ptr() as *const u8, tensor.len() * 4)
+            };
             let got = format!("{:x}", Sha256::digest(bytes));
             if got != *expected_hash {
                 return Err(LoadError::IntegrityMismatch {
@@ -166,8 +167,9 @@ impl SafetensorsLoader {
         use sha2::{Digest, Sha256};
         let mut hashes = HashMap::new();
         for (name, tensor) in &self.tensors {
-            let bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(tensor.as_ptr() as *const u8, tensor.len() * 4) };
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(tensor.as_ptr() as *const u8, tensor.len() * 4)
+            };
             let hash = format!("{:x}", Sha256::digest(bytes));
             hashes.insert(name.clone(), hash);
         }
@@ -285,7 +287,8 @@ mod tests {
         write_safetensors(dir.path(), "model.safetensors", &t);
 
         let regular = SafetensorsLoader::from_file(&dir.path().join("model.safetensors")).unwrap();
-        let mmap = SafetensorsLoader::from_file_mmap(&dir.path().join("model.safetensors")).unwrap();
+        let mmap =
+            SafetensorsLoader::from_file_mmap(&dir.path().join("model.safetensors")).unwrap();
 
         assert_eq!(
             regular.load_tensor("weight_a").unwrap(),
@@ -342,9 +345,7 @@ mod tests {
 
         let loader = SafetensorsLoader::from_file(&dir.path().join("model.safetensors")).unwrap();
         let mut manifest = loader.generate_manifest();
-        manifest
-            .tensor_hashes
-            .insert("w".into(), "deadbeef".into());
+        manifest.tensor_hashes.insert("w".into(), "deadbeef".into());
 
         let result = loader.verify_integrity(&manifest);
         assert!(matches!(result, Err(LoadError::IntegrityMismatch { .. })));

@@ -128,9 +128,7 @@ pub fn from_model_type(model_type: &str) -> Option<Architecture> {
         "gemma" | "gemma2" | "GemmaForCausalLM" | "Gemma2ForCausalLM" => {
             Some(Architecture::gemma())
         }
-        "qwen2" | "Qwen2ForCausalLM" | "qwen3" | "Qwen3ForCausalLM" => {
-            Some(Architecture::qwen2())
-        }
+        "qwen2" | "Qwen2ForCausalLM" | "qwen3" | "Qwen3ForCausalLM" => Some(Architecture::qwen2()),
         "gpt_neox" | "GPTNeoXForCausalLM" => Some(Architecture::gpt_neox()),
         _ => None,
     }
@@ -139,10 +137,7 @@ pub fn from_model_type(model_type: &str) -> Option<Architecture> {
 pub fn diff_architectures(a: &Architecture, b: &Architecture) -> Vec<String> {
     let mut diffs = Vec::new();
     if a.norm_type != b.norm_type {
-        diffs.push(format!(
-            "norm: {:?} vs {:?}",
-            a.norm_type, b.norm_type
-        ));
+        diffs.push(format!("norm: {:?} vs {:?}", a.norm_type, b.norm_type));
     }
     if a.ffn_type != b.ffn_type {
         diffs.push(format!("ffn: {:?} vs {:?}", a.ffn_type, b.ffn_type));

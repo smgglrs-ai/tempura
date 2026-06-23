@@ -144,11 +144,9 @@ pub mod kernels {
             let mut i = 0usize;
             while i < 4 {
                 sc[i] = (packed[i] & 0x3F) as f32;
-                sc[i + 4] =
-                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                sc[i + 4] = (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
                 mins[i] = (packed[i + 4] & 0x3F) as f32;
-                mins[i + 4] =
-                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                mins[i + 4] = (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
                 i += 1;
             }
 
@@ -237,11 +235,9 @@ pub mod kernels {
             let mut i = 0usize;
             while i < 4 {
                 sc[i] = (packed[i] & 0x3F) as f32;
-                sc[i + 4] =
-                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                sc[i + 4] = (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
                 mins[i] = (packed[i + 4] & 0x3F) as f32;
-                mins[i + 4] =
-                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                mins[i + 4] = (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
                 i += 1;
             }
 
@@ -311,13 +307,7 @@ pub mod kernels {
     /// Grid: (ceil(n/COLS_PER_BLOCK), 1, 1), Block: (32, COLS_PER_BLOCK, 1)
     /// COLS_PER_BLOCK warps run in parallel within a CTA for better occupancy.
     #[kernel]
-    pub fn gemv_q4k_warp(
-        n: u32,
-        k: u32,
-        a: &[f32],
-        b_q4k: &[u8],
-        mut output: DisjointSlice<f32>,
-    ) {
+    pub fn gemv_q4k_warp(n: u32, k: u32, a: &[f32], b_q4k: &[u8], mut output: DisjointSlice<f32>) {
         let lane = warp::lane_id() as usize;
         let col = (thread::blockIdx_x() as usize) * (thread::blockDim_y() as usize)
             + thread::threadIdx_y() as usize;
@@ -348,11 +338,9 @@ pub mod kernels {
             let mut i = 0usize;
             while i < 4 {
                 sc[i] = (packed[i] & 0x3F) as f32;
-                sc[i + 4] =
-                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                sc[i + 4] = (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
                 mins[i] = (packed[i + 4] & 0x3F) as f32;
-                mins[i + 4] =
-                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                mins[i + 4] = (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
                 i += 1;
             }
 
@@ -404,13 +392,7 @@ pub mod kernels {
     ///
     /// Grid: (ceil(n/WARPS_Y), 1, 1), Block: (32, WARPS_Y, 1)
     #[kernel]
-    pub fn gemv_q4k_coop(
-        n: u32,
-        k: u32,
-        a: &[f32],
-        b_q4k: &[u8],
-        mut output: DisjointSlice<f32>,
-    ) {
+    pub fn gemv_q4k_coop(n: u32, k: u32, a: &[f32], b_q4k: &[u8], mut output: DisjointSlice<f32>) {
         let lane = warp::lane_id() as usize;
         let col = (thread::blockIdx_x() as usize) * (thread::blockDim_y() as usize)
             + thread::threadIdx_y() as usize;
@@ -463,11 +445,9 @@ pub mod kernels {
             let mut i = 0usize;
             while i < 4 {
                 sc[i] = (packed[i] & 0x3F) as f32;
-                sc[i + 4] =
-                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                sc[i + 4] = (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
                 mins[i] = (packed[i + 4] & 0x3F) as f32;
-                mins[i + 4] =
-                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                mins[i + 4] = (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
                 i += 1;
             }
 
@@ -531,8 +511,7 @@ pub mod kernels {
 
         let lane = warp::lane_id() as usize;
         let warp_in_cta = thread::threadIdx_y() as usize;
-        let col = (thread::blockIdx_x() as usize) * (thread::blockDim_y() as usize)
-            + warp_in_cta;
+        let col = (thread::blockIdx_x() as usize) * (thread::blockDim_y() as usize) + warp_in_cta;
 
         let n = n as usize;
         let k = k as usize;
@@ -585,11 +564,9 @@ pub mod kernels {
             let mut i = 0usize;
             while i < 4 {
                 sc[i] = (packed[i] & 0x3F) as f32;
-                sc[i + 4] =
-                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                sc[i + 4] = (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
                 mins[i] = (packed[i + 4] & 0x3F) as f32;
-                mins[i + 4] =
-                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                mins[i + 4] = (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
                 i += 1;
             }
 
@@ -750,7 +727,9 @@ pub mod kernels {
         lane_sum += warp::shuffle_xor_f32(lane_sum, 1);
 
         if lane == 0 {
-            unsafe { WARP_SUMS[warp_id] = lane_sum; }
+            unsafe {
+                WARP_SUMS[warp_id] = lane_sum;
+            }
         }
         thread::sync_threads();
 
@@ -762,7 +741,9 @@ pub mod kernels {
                 total += unsafe { WARP_SUMS[smem_base + w] };
                 w += 1;
             }
-            unsafe { *output.get_unchecked_mut(col) = total; }
+            unsafe {
+                *output.get_unchecked_mut(col) = total;
+            }
         }
     }
 
@@ -828,11 +809,9 @@ pub mod kernels {
             let mut i = 0usize;
             while i < 4 {
                 sc[i] = (packed[i] & 0x3F) as f32;
-                sc[i + 4] =
-                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                sc[i + 4] = (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
                 mins[i] = (packed[i + 4] & 0x3F) as f32;
-                mins[i + 4] =
-                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                mins[i + 4] = (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
                 i += 1;
             }
 
@@ -942,11 +921,9 @@ pub mod kernels {
             let mut i = 0usize;
             while i < 4 {
                 sc[i] = (packed[i] & 0x3F) as f32;
-                sc[i + 4] =
-                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                sc[i + 4] = (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
                 mins[i] = (packed[i + 4] & 0x3F) as f32;
-                mins[i + 4] =
-                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                mins[i + 4] = (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
                 i += 1;
             }
 
@@ -997,10 +974,11 @@ pub mod kernels {
             let q3_hi_f = (b3 >> 4) as f32;
 
             // FMA: d*sc*q - dmin*m using fused multiply-add
-            lane_sum += d_lo * (a0_lo * q0_lo_f + a1_lo * q1_lo_f + a2_lo * q2_lo_f + a3_lo * q3_lo_f)
-                      - m_lo * (a0_lo + a1_lo + a2_lo + a3_lo)
-                      + d_hi * (a0_hi * q0_hi_f + a1_hi * q1_hi_f + a2_hi * q2_hi_f + a3_hi * q3_hi_f)
-                      - m_hi * (a0_hi + a1_hi + a2_hi + a3_hi);
+            lane_sum += d_lo
+                * (a0_lo * q0_lo_f + a1_lo * q1_lo_f + a2_lo * q2_lo_f + a3_lo * q3_lo_f)
+                - m_lo * (a0_lo + a1_lo + a2_lo + a3_lo)
+                + d_hi * (a0_hi * q0_hi_f + a1_hi * q1_hi_f + a2_hi * q2_hi_f + a3_hi * q3_hi_f)
+                - m_hi * (a0_hi + a1_hi + a2_hi + a3_hi);
 
             blk += nwpc;
         }
@@ -1012,7 +990,9 @@ pub mod kernels {
         lane_sum += warp::shuffle_xor_f32(lane_sum, 1);
 
         if lane == 0 {
-            unsafe { WARP_SUMS[warp_id] = lane_sum; }
+            unsafe {
+                WARP_SUMS[warp_id] = lane_sum;
+            }
         }
         thread::sync_threads();
 
@@ -1024,7 +1004,9 @@ pub mod kernels {
                 total += unsafe { WARP_SUMS[smem_base + w] };
                 w += 1;
             }
-            unsafe { *output.get_unchecked_mut(col) = total; }
+            unsafe {
+                *output.get_unchecked_mut(col) = total;
+            }
         }
     }
 
@@ -1084,11 +1066,9 @@ pub mod kernels {
             let mut i = 0usize;
             while i < 4 {
                 sc[i] = (packed[i] & 0x3F) as f32;
-                sc[i + 4] =
-                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                sc[i + 4] = (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
                 mins[i] = (packed[i + 4] & 0x3F) as f32;
-                mins[i + 4] =
-                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                mins[i + 4] = (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
                 i += 1;
             }
 
@@ -1116,9 +1096,9 @@ pub mod kernels {
 
             // Low nibbles: batch multiply-add
             let dot_lo = a0 * (b0 & 0x0F) as f32
-                       + a1 * (b1 & 0x0F) as f32
-                       + a2 * (b2 & 0x0F) as f32
-                       + a3 * (b3 & 0x0F) as f32;
+                + a1 * (b1 & 0x0F) as f32
+                + a2 * (b2 & 0x0F) as f32
+                + a3 * (b3 & 0x0F) as f32;
             let sum_lo = a0 + a1 + a2 + a3;
 
             // High nibbles
@@ -1128,9 +1108,9 @@ pub mod kernels {
             let a3h = a[a_base + elem_hi_base + 3];
 
             let dot_hi = a0h * (b0 >> 4) as f32
-                       + a1h * (b1 >> 4) as f32
-                       + a2h * (b2 >> 4) as f32
-                       + a3h * (b3 >> 4) as f32;
+                + a1h * (b1 >> 4) as f32
+                + a2h * (b2 >> 4) as f32
+                + a3h * (b3 >> 4) as f32;
             let sum_hi = a0h + a1h + a2h + a3h;
 
             // 4 float ops instead of 8 per-element ops
@@ -1146,7 +1126,9 @@ pub mod kernels {
         lane_sum += warp::shuffle_xor_f32(lane_sum, 1);
 
         if lane == 0 {
-            unsafe { WARP_SUMS[warp_id] = lane_sum; }
+            unsafe {
+                WARP_SUMS[warp_id] = lane_sum;
+            }
         }
         thread::sync_threads();
 
@@ -1158,7 +1140,9 @@ pub mod kernels {
                 total += unsafe { WARP_SUMS[smem_base + w] };
                 w += 1;
             }
-            unsafe { *output.get_unchecked_mut(col) = total; }
+            unsafe {
+                *output.get_unchecked_mut(col) = total;
+            }
         }
     }
 
@@ -1212,7 +1196,8 @@ pub mod kernels {
 
             // PTX-optimized header read: load d|dmin as one u32
             let d_bits = (b_q4k[block_offset] as u32) | ((b_q4k[block_offset + 1] as u32) << 8);
-            let dmin_bits = (b_q4k[block_offset + 2] as u32) | ((b_q4k[block_offset + 3] as u32) << 8);
+            let dmin_bits =
+                (b_q4k[block_offset + 2] as u32) | ((b_q4k[block_offset + 3] as u32) << 8);
             let d = f16_bits_to_f32(d_bits as u16);
             let dmin = f16_bits_to_f32(dmin_bits as u16);
 
@@ -1222,11 +1207,9 @@ pub mod kernels {
             let mut i = 0usize;
             while i < 4 {
                 sc[i] = (packed[i] & 0x3F) as f32;
-                sc[i + 4] =
-                    (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
+                sc[i + 4] = (((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F) as f32;
                 mins[i] = (packed[i + 4] & 0x3F) as f32;
-                mins[i + 4] =
-                    (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
+                mins[i + 4] = (((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F) as f32;
                 i += 1;
             }
 
@@ -1361,7 +1344,7 @@ pub mod kernels {
                 | ((qs[qs_byte_off + 1] as u32) << 8)
                 | ((qs[qs_byte_off + 2] as u32) << 16)
                 | ((qs[qs_byte_off + 3] as u32) << 24);
-            let v_lo = raw & 0x0F0F0F0F;       // low nibbles: 4 × u8
+            let v_lo = raw & 0x0F0F0F0F; // low nibbles: 4 × u8
             let v_hi = (raw >> 4) & 0x0F0F0F0F; // high nibbles: 4 × u8
 
             // Load Q8 activations as packed i32 (4 × i8)
@@ -1467,12 +1450,9 @@ pub mod kernels {
 
             // --- Gate weight block ---
             let g_off = (col * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-            let g_d = f16_bits_to_f32(
-                (b_gate[g_off] as u16) | ((b_gate[g_off + 1] as u16) << 8),
-            );
-            let g_dmin = f16_bits_to_f32(
-                (b_gate[g_off + 2] as u16) | ((b_gate[g_off + 3] as u16) << 8),
-            );
+            let g_d = f16_bits_to_f32((b_gate[g_off] as u16) | ((b_gate[g_off + 1] as u16) << 8));
+            let g_dmin =
+                f16_bits_to_f32((b_gate[g_off + 2] as u16) | ((b_gate[g_off + 3] as u16) << 8));
             let g_packed = &b_gate[g_off + 4..];
             let mut g_sc = [0.0f32; 8];
             let mut g_mins = [0.0f32; 8];
@@ -1494,12 +1474,9 @@ pub mod kernels {
 
             // --- Up weight block ---
             let u_off = (col * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-            let u_d = f16_bits_to_f32(
-                (b_up[u_off] as u16) | ((b_up[u_off + 1] as u16) << 8),
-            );
-            let u_dmin = f16_bits_to_f32(
-                (b_up[u_off + 2] as u16) | ((b_up[u_off + 3] as u16) << 8),
-            );
+            let u_d = f16_bits_to_f32((b_up[u_off] as u16) | ((b_up[u_off + 1] as u16) << 8));
+            let u_dmin =
+                f16_bits_to_f32((b_up[u_off + 2] as u16) | ((b_up[u_off + 3] as u16) << 8));
             let u_packed = &b_up[u_off + 4..];
             let mut u_sc = [0.0f32; 8];
             let mut u_mins = [0.0f32; 8];
@@ -1607,8 +1584,7 @@ pub mod kernels {
             let qh = &b_q6k[block_offset + 128..];
             let scales = &b_q6k[block_offset + 192..];
             let d = f16_bits_to_f32(
-                (b_q6k[block_offset + 208] as u16)
-                    | ((b_q6k[block_offset + 209] as u16) << 8),
+                (b_q6k[block_offset + 208] as u16) | ((b_q6k[block_offset + 209] as u16) << 8),
             );
 
             let a_base = row * k + blk * Q6K_BLOCK_SIZE;
@@ -1621,20 +1597,14 @@ pub mod kernels {
                 let mut l = 0usize;
                 while l < 32 {
                     let is = l / 16;
-                    let q1 = ((ql[ql_off + l] & 0xF)
-                        | (((qh[qh_off + l] >> 0) & 3) << 4))
+                    let q1 =
+                        ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+                    let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4))
                         as i32
                         - 32;
-                    let q2 = ((ql[ql_off + l + 32] & 0xF)
-                        | (((qh[qh_off + l] >> 2) & 3) << 4))
-                        as i32
-                        - 32;
-                    let q3 = ((ql[ql_off + l] >> 4)
-                        | (((qh[qh_off + l] >> 4) & 3) << 4))
-                        as i32
-                        - 32;
-                    let q4 = ((ql[ql_off + l + 32] >> 4)
-                        | (((qh[qh_off + l] >> 6) & 3) << 4))
+                    let q3 =
+                        ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                    let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4))
                         as i32
                         - 32;
 

@@ -66,7 +66,7 @@ verification:
   full: cargo test --workspace && cargo clippy --workspace -- -D warnings && cargo fmt --all -- --check
 
 loop:
-  max_iterations: 10
+  max_iterations: 20
   scope: autonomous
   sandbox: openshell
   git:

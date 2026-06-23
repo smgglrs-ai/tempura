@@ -413,9 +413,11 @@ fn dequant_q6k(data: &[u8], num_elements: usize) -> Vec<f32> {
             for l in 0..32 {
                 let is = l / 16;
                 let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
-                let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q2 =
+                    ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
                 let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
-                let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+                let q4 =
+                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
 
                 let sc0 = scales[half * 8 + is] as i8 as f32;
                 let sc1 = scales[half * 8 + is + 2] as i8 as f32;
@@ -895,7 +897,8 @@ impl GgufLoader {
 
             if abs_offset + byte_size > data.len() {
                 return Err(LoadError::GgufParse(format!(
-                    "tensor '{}' data out of bounds", info.name,
+                    "tensor '{}' data out of bounds",
+                    info.name,
                 )));
             }
 

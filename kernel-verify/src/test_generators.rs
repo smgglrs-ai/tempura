@@ -31,21 +31,9 @@ pub fn attention_configs() -> Vec<AttentionConfig> {
 
 pub fn matmul_configs() -> Vec<MatMulConfig> {
     vec![
-        MatMulConfig {
-            m: 1,
-            n: 16,
-            k: 8,
-        },
-        MatMulConfig {
-            m: 4,
-            n: 32,
-            k: 16,
-        },
-        MatMulConfig {
-            m: 8,
-            n: 64,
-            k: 64,
-        },
+        MatMulConfig { m: 1, n: 16, k: 8 },
+        MatMulConfig { m: 4, n: 32, k: 16 },
+        MatMulConfig { m: 8, n: 64, k: 64 },
         MatMulConfig {
             m: 1,
             n: 1024,

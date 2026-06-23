@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use tempura_engine::session::InferenceSession;
 use tempura_engine::trace::TraceLevel;
 use tempura_kernels::SamplingParams;
-use serde::{Deserialize, Serialize};
 
 use tempura_engine::InferenceModel;
 

@@ -4,11 +4,11 @@ use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use tempura_engine::session::InferenceSession;
 use tempura_engine::trace::TraceLevel;
 use tempura_kernels::SamplingParams;
-use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 

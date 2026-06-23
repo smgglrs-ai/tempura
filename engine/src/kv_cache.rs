@@ -469,6 +469,255 @@ pub fn new_shared_prefix_cache(max_entries: usize) -> SharedPrefixCache {
     Arc::new(Mutex::new(PrefixCacheTable::new(max_entries)))
 }
 
+// ── Paged KV Cache ─────────────────────────────────────────────────────────
+
+pub const DEFAULT_BLOCK_SIZE: usize = 16;
+
+pub struct PageAllocator {
+    free_pages: Vec<usize>,
+    total_pages: usize,
+}
+
+impl PageAllocator {
+    pub fn new(total_pages: usize) -> Self {
+        let free_pages = (0..total_pages).rev().collect();
+        Self {
+            free_pages,
+            total_pages,
+        }
+    }
+
+    pub fn allocate(&mut self) -> Option<usize> {
+        self.free_pages.pop()
+    }
+
+    pub fn free(&mut self, page_id: usize) {
+        self.free_pages.push(page_id);
+    }
+
+    pub fn available(&self) -> usize {
+        self.free_pages.len()
+    }
+
+    pub fn in_use(&self) -> usize {
+        self.total_pages - self.free_pages.len()
+    }
+
+    pub fn total(&self) -> usize {
+        self.total_pages
+    }
+}
+
+pub struct BlockTable {
+    table: Vec<u32>,
+    num_blocks: usize,
+}
+
+impl BlockTable {
+    pub fn new(max_blocks: usize) -> Self {
+        Self {
+            table: vec![u32::MAX; max_blocks],
+            num_blocks: 0,
+        }
+    }
+
+    pub fn set_block(&mut self, logical_idx: usize, physical_page: usize) {
+        self.table[logical_idx] = physical_page as u32;
+        if logical_idx >= self.num_blocks {
+            self.num_blocks = logical_idx + 1;
+        }
+    }
+
+    pub fn get_block(&self, logical_idx: usize) -> Option<usize> {
+        if logical_idx < self.num_blocks && self.table[logical_idx] != u32::MAX {
+            Some(self.table[logical_idx] as usize)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u32] {
+        &self.table[..self.num_blocks]
+    }
+
+    pub fn num_blocks(&self) -> usize {
+        self.num_blocks
+    }
+
+    pub fn max_blocks(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn clear(&mut self) -> Vec<usize> {
+        let pages: Vec<usize> = self.table[..self.num_blocks]
+            .iter()
+            .filter(|&&p| p != u32::MAX)
+            .map(|&p| p as usize)
+            .collect();
+        self.table.fill(u32::MAX);
+        self.num_blocks = 0;
+        pages
+    }
+
+    pub fn clone_from_cow(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+            num_blocks: self.num_blocks,
+        }
+    }
+}
+
+pub struct PagedKvCache {
+    k_pages: Vec<Vec<f32>>,
+    v_pages: Vec<Vec<f32>>,
+    block_tables: Vec<BlockTable>,
+    allocator: PageAllocator,
+    pub seq_len: usize,
+    num_layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    page_stride: usize,
+}
+
+impl PagedKvCache {
+    pub fn new(config: &crate::config::ModelConfig, total_pages: usize, block_size: usize) -> Self {
+        let page_stride = block_size * config.num_kv_heads * config.head_dim;
+        let k_pages = (0..config.num_layers)
+            .map(|_| vec![0.0f32; total_pages * page_stride])
+            .collect();
+        let v_pages = (0..config.num_layers)
+            .map(|_| vec![0.0f32; total_pages * page_stride])
+            .collect();
+        let max_blocks = (config.max_seq_len + block_size - 1) / block_size;
+        let block_tables = (0..config.num_layers)
+            .map(|_| BlockTable::new(max_blocks))
+            .collect();
+
+        Self {
+            k_pages,
+            v_pages,
+            block_tables,
+            allocator: PageAllocator::new(total_pages),
+            seq_len: 0,
+            num_layers: config.num_layers,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+            block_size,
+            page_stride,
+        }
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    pub fn allocator(&self) -> &PageAllocator {
+        &self.allocator
+    }
+
+    fn ensure_blocks_for(&mut self, layer: usize, needed_tokens: usize) {
+        let needed_blocks = (needed_tokens + self.block_size - 1) / self.block_size;
+        let bt = &mut self.block_tables[layer];
+        let current_blocks = bt.num_blocks();
+        for _ in current_blocks..needed_blocks {
+            let page_id = self.allocator.allocate().expect("out of KV cache pages");
+            let idx = bt.num_blocks();
+            bt.set_block(idx, page_id);
+        }
+    }
+
+    pub fn append_kv(&mut self, layer: usize, new_k: &[f32], new_v: &[f32], num_new_tokens: usize) {
+        let stride = self.num_kv_heads * self.head_dim;
+        let total_after = self.seq_len + num_new_tokens;
+        self.ensure_blocks_for(layer, total_after);
+
+        for t in 0..num_new_tokens {
+            let global_pos = self.seq_len + t;
+            let block_idx = global_pos / self.block_size;
+            let block_offset = global_pos % self.block_size;
+            let phys_page = self.block_tables[layer].get_block(block_idx).unwrap();
+            let page_base = phys_page * self.page_stride + block_offset * stride;
+            let src_base = t * stride;
+
+            self.k_pages[layer][page_base..page_base + stride]
+                .copy_from_slice(&new_k[src_base..src_base + stride]);
+            self.v_pages[layer][page_base..page_base + stride]
+                .copy_from_slice(&new_v[src_base..src_base + stride]);
+        }
+    }
+
+    pub fn advance(&mut self, num_tokens: usize) {
+        self.seq_len += num_tokens;
+    }
+
+    pub fn reset(&mut self) {
+        for layer in 0..self.num_layers {
+            let pages = self.block_tables[layer].clear();
+            for p in pages {
+                self.allocator.free(p);
+            }
+        }
+        self.seq_len = 0;
+    }
+
+    pub fn k_pages(&self, layer: usize) -> &[f32] {
+        &self.k_pages[layer]
+    }
+
+    pub fn v_pages(&self, layer: usize) -> &[f32] {
+        &self.v_pages[layer]
+    }
+
+    pub fn block_table(&self, layer: usize) -> &BlockTable {
+        &self.block_tables[layer]
+    }
+
+    pub fn k_contiguous(&self, layer: usize, kv_len: usize) -> Vec<f32> {
+        let stride = self.num_kv_heads * self.head_dim;
+        let mut out = vec![0.0f32; kv_len * stride];
+        for pos in 0..kv_len {
+            let block_idx = pos / self.block_size;
+            let block_offset = pos % self.block_size;
+            let phys_page = self.block_tables[layer].get_block(block_idx).unwrap();
+            let page_base = phys_page * self.page_stride + block_offset * stride;
+            let dst = pos * stride;
+            out[dst..dst + stride]
+                .copy_from_slice(&self.k_pages[layer][page_base..page_base + stride]);
+        }
+        out
+    }
+
+    pub fn v_contiguous(&self, layer: usize, kv_len: usize) -> Vec<f32> {
+        let stride = self.num_kv_heads * self.head_dim;
+        let mut out = vec![0.0f32; kv_len * stride];
+        for pos in 0..kv_len {
+            let block_idx = pos / self.block_size;
+            let block_offset = pos % self.block_size;
+            let phys_page = self.block_tables[layer].get_block(block_idx).unwrap();
+            let page_base = phys_page * self.page_stride + block_offset * stride;
+            let dst = pos * stride;
+            out[dst..dst + stride]
+                .copy_from_slice(&self.v_pages[layer][page_base..page_base + stride]);
+        }
+        out
+    }
+
+    pub fn remaining_pages(&self) -> usize {
+        self.allocator.available()
+    }
+
+    pub fn waste_ratio(&self) -> f64 {
+        if self.seq_len == 0 {
+            return 0.0;
+        }
+        let needed_blocks = (self.seq_len + self.block_size - 1) / self.block_size;
+        let allocated_tokens = needed_blocks * self.block_size;
+        let wasted = allocated_tokens - self.seq_len;
+        wasted as f64 / allocated_tokens as f64
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub struct GpuKvCache {
     pub k: Vec<cuda_core::DeviceBuffer<f32>>,
@@ -564,6 +813,48 @@ mod kani_proofs {
 
         // k_slice / v_slice: &self.k[layer][..slice_len]
         assert!(slice_len <= layer_size);
+    }
+
+    #[kani::proof]
+    fn paged_block_table_offset_in_bounds() {
+        let block_size: usize = kani::any();
+        let num_kv_heads: usize = kani::any();
+        let head_dim: usize = kani::any();
+        let total_pages: usize = kani::any();
+        let pos: usize = kani::any();
+        let phys_page: usize = kani::any();
+
+        kani::assume(block_size >= 1 && block_size <= 16);
+        kani::assume(num_kv_heads >= 1 && num_kv_heads <= 4);
+        kani::assume(head_dim >= 1 && head_dim <= 8);
+        kani::assume(total_pages >= 1 && total_pages <= 8);
+        kani::assume(phys_page < total_pages);
+        kani::assume(pos < total_pages * block_size);
+
+        let stride = num_kv_heads * head_dim;
+        let page_stride = block_size * stride;
+        let pool_size = total_pages * page_stride;
+
+        let block_offset = pos % block_size;
+        let page_base = phys_page * page_stride + block_offset * stride;
+
+        assert!(page_base + stride <= pool_size);
+    }
+
+    #[kani::proof]
+    fn paged_block_index_in_bounds() {
+        let block_size: usize = kani::any();
+        let max_seq_len: usize = kani::any();
+        let pos: usize = kani::any();
+
+        kani::assume(block_size >= 1 && block_size <= 16);
+        kani::assume(max_seq_len >= 1 && max_seq_len <= 64);
+        kani::assume(pos < max_seq_len);
+
+        let max_blocks = (max_seq_len + block_size - 1) / block_size;
+        let block_idx = pos / block_size;
+
+        assert!(block_idx < max_blocks);
     }
 
     #[kani::proof]
@@ -910,6 +1201,200 @@ mod tests {
         assert_eq!(target.seq_len, 2);
         assert_eq!(target.k_slice(0), source.k_slice(0));
         assert_eq!(target.v_slice(0), source.v_slice(0));
+    }
+
+    #[test]
+    fn test_paged_kv_cache_basic() {
+        let config = ModelConfig::tiny_test();
+        let block_size = 4;
+        let total_pages = 16;
+        let mut cache = PagedKvCache::new(&config, total_pages, block_size);
+
+        let stride = config.num_kv_heads * config.head_dim;
+        let k_data: Vec<f32> = (0..stride).map(|i| i as f32 * 0.1).collect();
+        let v_data: Vec<f32> = (0..stride).map(|i| i as f32 * 0.2).collect();
+
+        cache.append_kv(0, &k_data, &v_data, 1);
+        cache.advance(1);
+
+        assert_eq!(cache.seq_len, 1);
+
+        let k_out = cache.k_contiguous(0, 1);
+        let v_out = cache.v_contiguous(0, 1);
+        assert_eq!(k_out.len(), stride);
+        assert_eq!(v_out.len(), stride);
+        for i in 0..stride {
+            assert!(
+                (k_out[i] - k_data[i]).abs() < 1e-6,
+                "k mismatch at {i}: {} vs {}",
+                k_out[i],
+                k_data[i]
+            );
+            assert!((v_out[i] - v_data[i]).abs() < 1e-6, "v mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn test_paged_kv_cache_multi_token() {
+        let config = ModelConfig::tiny_test();
+        let block_size = 4;
+        let total_pages = 16;
+        let mut cache = PagedKvCache::new(&config, total_pages, block_size);
+
+        let stride = config.num_kv_heads * config.head_dim;
+        let num_tokens = 7;
+        let k_data: Vec<f32> = (0..num_tokens * stride).map(|i| i as f32 * 0.01).collect();
+        let v_data: Vec<f32> = (0..num_tokens * stride).map(|i| i as f32 * 0.02).collect();
+
+        cache.append_kv(0, &k_data, &v_data, num_tokens);
+        cache.advance(num_tokens);
+
+        assert_eq!(cache.seq_len, 7);
+
+        let k_out = cache.k_contiguous(0, 7);
+        for i in 0..num_tokens * stride {
+            assert!((k_out[i] - k_data[i]).abs() < 1e-6, "k mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn test_paged_kv_cache_incremental_append() {
+        let config = ModelConfig::tiny_test();
+        let block_size = 4;
+        let total_pages = 16;
+        let mut cache = PagedKvCache::new(&config, total_pages, block_size);
+
+        let stride = config.num_kv_heads * config.head_dim;
+        let mut all_k = Vec::new();
+
+        for t in 0..6 {
+            let k: Vec<f32> = (0..stride).map(|i| (t * 100 + i) as f32).collect();
+            let v: Vec<f32> = (0..stride).map(|i| (t * 200 + i) as f32).collect();
+            cache.append_kv(0, &k, &v, 1);
+            cache.advance(1);
+            all_k.extend_from_slice(&k);
+        }
+
+        assert_eq!(cache.seq_len, 6);
+        let k_out = cache.k_contiguous(0, 6);
+        for i in 0..all_k.len() {
+            assert!(
+                (k_out[i] - all_k[i]).abs() < 1e-6,
+                "k mismatch at {i}: {} vs {}",
+                k_out[i],
+                all_k[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_paged_kv_cache_reset() {
+        let config = ModelConfig::tiny_test();
+        let block_size = 4;
+        let total_pages = 8;
+        let mut cache = PagedKvCache::new(&config, total_pages, block_size);
+
+        let stride = config.num_kv_heads * config.head_dim;
+        let k: Vec<f32> = vec![1.0; stride * 5];
+        let v = k.clone();
+        cache.append_kv(0, &k, &v, 5);
+        cache.advance(5);
+
+        let pages_before = cache.remaining_pages();
+        cache.reset();
+        assert_eq!(cache.seq_len, 0);
+        assert_eq!(cache.remaining_pages(), total_pages);
+        assert!(cache.remaining_pages() > pages_before);
+    }
+
+    #[test]
+    fn test_paged_kv_cache_low_waste() {
+        let config = ModelConfig::tiny_test();
+        let block_size = 16;
+        let total_pages = 64;
+        let mut cache = PagedKvCache::new(&config, total_pages, block_size);
+
+        let stride = config.num_kv_heads * config.head_dim;
+        let k: Vec<f32> = vec![1.0; stride * 100];
+        let v = k.clone();
+        cache.append_kv(0, &k, &v, 100);
+        cache.advance(100);
+
+        let waste = cache.waste_ratio();
+        assert!(
+            waste < 0.16,
+            "waste ratio {waste:.2} should be <16% for block_size=16"
+        );
+    }
+
+    #[test]
+    fn test_paged_matches_contiguous() {
+        let config = ModelConfig::tiny_test();
+
+        let mut contiguous = KvCache::new(&config);
+        let mut paged = PagedKvCache::new(&config, 32, 4);
+
+        let stride = config.num_kv_heads * config.head_dim;
+        for t in 0..10 {
+            let k: Vec<f32> = (0..stride).map(|i| (t * 100 + i) as f32 * 0.1).collect();
+            let v: Vec<f32> = (0..stride).map(|i| (t * 200 + i) as f32 * 0.1).collect();
+
+            contiguous.append_kv(0, &k, &v, 1);
+            contiguous.advance(1);
+
+            paged.append_kv(0, &k, &v, 1);
+            paged.advance(1);
+        }
+
+        let k_cont = contiguous.k_slice(0);
+        let k_paged = paged.k_contiguous(0, 10);
+        assert_eq!(k_cont.len(), k_paged.len());
+        for i in 0..k_cont.len() {
+            assert!(
+                (k_cont[i] - k_paged[i]).abs() < 1e-6,
+                "k divergence at {i}: contiguous={} paged={}",
+                k_cont[i],
+                k_paged[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_page_allocator() {
+        let mut alloc = PageAllocator::new(4);
+        assert_eq!(alloc.available(), 4);
+        assert_eq!(alloc.in_use(), 0);
+
+        let p0 = alloc.allocate().unwrap();
+        let p1 = alloc.allocate().unwrap();
+        assert_eq!(alloc.available(), 2);
+        assert_eq!(alloc.in_use(), 2);
+        assert_ne!(p0, p1);
+
+        alloc.free(p0);
+        assert_eq!(alloc.available(), 3);
+
+        let p2 = alloc.allocate().unwrap();
+        assert_eq!(p2, p0);
+    }
+
+    #[test]
+    fn test_block_table() {
+        let mut bt = BlockTable::new(8);
+        assert_eq!(bt.num_blocks(), 0);
+
+        bt.set_block(0, 5);
+        bt.set_block(1, 3);
+        assert_eq!(bt.num_blocks(), 2);
+        assert_eq!(bt.get_block(0), Some(5));
+        assert_eq!(bt.get_block(1), Some(3));
+        assert_eq!(bt.get_block(2), None);
+
+        let freed = bt.clear();
+        assert_eq!(freed.len(), 2);
+        assert!(freed.contains(&5));
+        assert!(freed.contains(&3));
+        assert_eq!(bt.num_blocks(), 0);
     }
 
     #[test]

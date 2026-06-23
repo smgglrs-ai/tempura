@@ -12,7 +12,9 @@ pub type Result<T> = std::result::Result<T, KernelError>;
 
 // ── VerificationTier ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationTier {
     Compiled,
@@ -38,6 +40,55 @@ pub trait Attention: Send + Sync {
         head_dim: usize,
         scale: f32,
     ) -> Result<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_paged(
+        &self,
+        q: &[f32],
+        k_pages: &[f32],
+        v_pages: &[f32],
+        output: &mut [f32],
+        block_table: &[u32],
+        num_blocks: usize,
+        block_size: usize,
+        batch: usize,
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<()> {
+        let stride = num_kv_heads * head_dim;
+        let mut k_contiguous = vec![0.0f32; batch * kv_len * stride];
+        let mut v_contiguous = vec![0.0f32; batch * kv_len * stride];
+        for b in 0..batch {
+            for pos in 0..kv_len {
+                let block_idx = pos / block_size;
+                let block_offset = pos % block_size;
+                let phys_block = block_table[b * num_blocks + block_idx] as usize;
+                let page_base = phys_block * block_size * stride + block_offset * stride;
+                let dst = (b * kv_len + pos) * stride;
+                k_contiguous[dst..dst + stride]
+                    .copy_from_slice(&k_pages[page_base..page_base + stride]);
+                v_contiguous[dst..dst + stride]
+                    .copy_from_slice(&v_pages[page_base..page_base + stride]);
+            }
+        }
+        self.forward(
+            q,
+            &k_contiguous,
+            &v_contiguous,
+            output,
+            batch,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+    }
 
     fn verification_tier(&self) -> VerificationTier {
         VerificationTier::Compiled

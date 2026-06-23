@@ -1,5 +1,5 @@
-use tempura_engine::trace::InferenceTrace;
 use std::collections::VecDeque;
+use tempura_engine::trace::InferenceTrace;
 
 pub struct TraceStore {
     traces: VecDeque<InferenceTrace>,

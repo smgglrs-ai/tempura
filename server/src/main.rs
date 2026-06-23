@@ -7,11 +7,11 @@ mod trace_store;
 
 use clap::Parser;
 use metrics_exporter_prometheus::PrometheusHandle;
+use std::path::Path;
+use std::sync::Arc;
 use tempura_engine::pipeline::KernelPipeline;
 use tempura_engine::tokenizer::Tokenizer;
 use tempura_engine::{ModelConfig, TransformerModel};
-use std::path::Path;
-use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
@@ -153,7 +153,9 @@ async fn main() {
             let store = tempura_model::store::ModelStore::open();
             let models = store.list();
             if models.is_empty() {
-                println!("No models installed. Use `tempura-serve pull <repo-id>` to download one.");
+                println!(
+                    "No models installed. Use `tempura-serve pull <repo-id>` to download one."
+                );
             } else {
                 println!("{:<40} {:<15} {:>10}", "NAME", "FORMAT", "SIZE");
                 println!("{}", "-".repeat(67));
