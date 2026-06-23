@@ -1150,3 +1150,10 @@
   summary: "Added 'What we prove' and 'What we do NOT prove' sections to all 5 math foundation pages. Each section names specific Kani harnesses and explains in plain language what the proof covers. Proptest and f64 reference validations listed as complementary methods for what Kani cannot handle."
   iteration: 11
   max_iterations: 20
+- timestamp: "2026-06-23T14:45:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p20-fp8-kv-cache"
+  summary: "Implemented Fp8PagedKvCache with E4M3 FP8 encoding (1 byte/element vs 4 bytes f32, 4x memory reduction). FP8 encode/decode functions handle the full E4M3 format (4-bit exponent, 3-bit mantissa, bias 7, max 448, NaN). 5 new tests: round-trip accuracy, basic KV, multi-token, reset, memory savings. 280 tests passing, benchmark stable."
+  iteration: 12
+  max_iterations: 20

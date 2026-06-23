@@ -718,6 +718,211 @@ impl PagedKvCache {
     }
 }
 
+// ── FP8 E4M3 KV Cache ──────────────────────────────────────────────────────
+
+fn f32_to_fp8_e4m3(x: f32) -> u8 {
+    let sign: u8 = if x.is_sign_negative() { 0x80 } else { 0 };
+    let abs = x.abs();
+
+    if abs == 0.0 {
+        return sign;
+    }
+    if abs.is_nan() || abs.is_infinite() {
+        return sign | 0x7E; // max finite E4M3 = 448
+    }
+    // E4M3: bias=7, max_exp=14 (exp=15 reserved for NaN), max val = 2^8 * 1.75 = 448
+    // min normal = 2^(-6) = 0.015625, min subnormal = 2^(-6) * 2^(-3) = 2^(-9) = 0.001953125
+    if abs >= 448.0 {
+        return sign | 0x7E; // clamp to max
+    }
+    if abs < 0.001953125 {
+        return sign; // underflow to zero
+    }
+
+    // Normal encoding: find biased exponent
+    let bits = abs.to_bits();
+    let f32_exp = ((bits >> 23) & 0xFF) as i32;
+    let f32_frac = bits & 0x7FFFFF;
+
+    let e4m3_exp = f32_exp - 127 + 7;
+    if e4m3_exp <= 0 {
+        return sign;
+    }
+    if e4m3_exp > 14 {
+        return sign | 0x7E;
+    }
+
+    // Round mantissa: f32 has 23 bits, E4M3 has 3 bits, drop 20 with rounding
+    let mantissa = ((f32_frac + (1 << 19)) >> 20) as u8;
+    if mantissa >= 8 {
+        // Mantissa overflow → increment exponent
+        let new_exp = e4m3_exp + 1;
+        if new_exp > 14 {
+            return sign | 0x7E;
+        }
+        return sign | ((new_exp as u8) << 3);
+    }
+
+    sign | ((e4m3_exp as u8) << 3) | mantissa
+}
+
+fn fp8_e4m3_to_f32(x: u8) -> f32 {
+    let sign = ((x >> 7) & 1) as u32;
+    let exp = ((x >> 3) & 0xF) as u32;
+    let frac = (x & 0x7) as u32;
+
+    if exp == 0 && frac == 0 {
+        return f32::from_bits(sign << 31);
+    }
+    // E4M3: no infinity representation, exp=15 with frac=7 is NaN, rest are finite
+    if exp == 15 && frac == 7 {
+        return f32::NAN;
+    }
+
+    if exp == 0 {
+        // Subnormal: value = (-1)^sign * 2^(-6) * (frac/8)
+        let val = (frac as f32) * (1.0 / 8.0) * (1.0 / 64.0); // 2^(-6) * frac/8
+        return if sign == 1 { -val } else { val };
+    }
+
+    // Normal: value = (-1)^sign * 2^(exp-7) * (1 + frac/8)
+    let f32_exp = (exp as i32 - 7 + 127) as u32;
+    f32::from_bits((sign << 31) | (f32_exp << 23) | (frac << 20))
+}
+
+pub struct Fp8PagedKvCache {
+    k_pages: Vec<Vec<u8>>,
+    v_pages: Vec<Vec<u8>>,
+    block_tables: Vec<BlockTable>,
+    allocator: PageAllocator,
+    pub seq_len: usize,
+    num_layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    page_stride: usize,
+}
+
+impl Fp8PagedKvCache {
+    pub fn new(config: &crate::config::ModelConfig, total_pages: usize, block_size: usize) -> Self {
+        let page_stride = block_size * config.num_kv_heads * config.head_dim;
+        let k_pages = (0..config.num_layers)
+            .map(|_| vec![0u8; total_pages * page_stride])
+            .collect();
+        let v_pages = (0..config.num_layers)
+            .map(|_| vec![0u8; total_pages * page_stride])
+            .collect();
+        let max_blocks = (config.max_seq_len + block_size - 1) / block_size;
+        let block_tables = (0..config.num_layers)
+            .map(|_| BlockTable::new(max_blocks))
+            .collect();
+
+        Self {
+            k_pages,
+            v_pages,
+            block_tables,
+            allocator: PageAllocator::new(total_pages),
+            seq_len: 0,
+            num_layers: config.num_layers,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+            block_size,
+            page_stride,
+        }
+    }
+
+    fn ensure_blocks_for(&mut self, layer: usize, needed_tokens: usize) {
+        let needed_blocks = (needed_tokens + self.block_size - 1) / self.block_size;
+        let bt = &mut self.block_tables[layer];
+        let current_blocks = bt.num_blocks();
+        for _ in current_blocks..needed_blocks {
+            let page_id = self
+                .allocator
+                .allocate()
+                .expect("out of FP8 KV cache pages");
+            let idx = bt.num_blocks();
+            bt.set_block(idx, page_id);
+        }
+    }
+
+    pub fn append_kv(&mut self, layer: usize, new_k: &[f32], new_v: &[f32], num_new_tokens: usize) {
+        let stride = self.num_kv_heads * self.head_dim;
+        let total_after = self.seq_len + num_new_tokens;
+        self.ensure_blocks_for(layer, total_after);
+
+        for t in 0..num_new_tokens {
+            let global_pos = self.seq_len + t;
+            let block_idx = global_pos / self.block_size;
+            let block_offset = global_pos % self.block_size;
+            let phys_page = self.block_tables[layer].get_block(block_idx).unwrap();
+            let page_base = phys_page * self.page_stride + block_offset * stride;
+            let src_base = t * stride;
+
+            let k_slice = &new_k[src_base..src_base + stride];
+            let v_slice = &new_v[src_base..src_base + stride];
+
+            for i in 0..stride {
+                self.k_pages[layer][page_base + i] = f32_to_fp8_e4m3(k_slice[i]);
+                self.v_pages[layer][page_base + i] = f32_to_fp8_e4m3(v_slice[i]);
+            }
+        }
+    }
+
+    pub fn advance(&mut self, num_tokens: usize) {
+        self.seq_len += num_tokens;
+    }
+
+    pub fn reset(&mut self) {
+        for layer in 0..self.num_layers {
+            let pages = self.block_tables[layer].clear();
+            for p in pages {
+                self.allocator.free(p);
+            }
+        }
+        self.seq_len = 0;
+    }
+
+    pub fn k_contiguous(&self, layer: usize, kv_len: usize) -> Vec<f32> {
+        let stride = self.num_kv_heads * self.head_dim;
+        let mut out = vec![0.0f32; kv_len * stride];
+        for pos in 0..kv_len {
+            let block_idx = pos / self.block_size;
+            let block_offset = pos % self.block_size;
+            let phys_page = self.block_tables[layer].get_block(block_idx).unwrap();
+            let page_base = phys_page * self.page_stride + block_offset * stride;
+            let dst = pos * stride;
+            for i in 0..stride {
+                out[dst + i] = fp8_e4m3_to_f32(self.k_pages[layer][page_base + i]);
+            }
+        }
+        out
+    }
+
+    pub fn v_contiguous(&self, layer: usize, kv_len: usize) -> Vec<f32> {
+        let stride = self.num_kv_heads * self.head_dim;
+        let mut out = vec![0.0f32; kv_len * stride];
+        for pos in 0..kv_len {
+            let block_idx = pos / self.block_size;
+            let block_offset = pos % self.block_size;
+            let phys_page = self.block_tables[layer].get_block(block_idx).unwrap();
+            let page_base = phys_page * self.page_stride + block_offset * stride;
+            let dst = pos * stride;
+            for i in 0..stride {
+                out[dst + i] = fp8_e4m3_to_f32(self.v_pages[layer][page_base + i]);
+            }
+        }
+        out
+    }
+
+    pub fn memory_bytes_per_token(&self) -> usize {
+        self.num_kv_heads * self.head_dim
+    }
+
+    pub fn f32_memory_bytes_per_token(&self) -> usize {
+        self.num_kv_heads * self.head_dim * 4
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub struct GpuKvCache {
     pub k: Vec<cuda_core::DeviceBuffer<f32>>,
@@ -1395,6 +1600,105 @@ mod tests {
         assert!(freed.contains(&5));
         assert!(freed.contains(&3));
         assert_eq!(bt.num_blocks(), 0);
+    }
+
+    #[test]
+    fn test_fp8_round_trip() {
+        // Values within E4M3 representable range [0.001953125, 448]
+        let test_values = [
+            0.0f32, 1.0, -1.0, 0.5, -0.5, 0.25, 2.0, 4.0, 8.0, 64.0, 448.0,
+        ];
+        for &v in &test_values {
+            let fp8 = f32_to_fp8_e4m3(v);
+            let back = fp8_e4m3_to_f32(fp8);
+            if v == 0.0 {
+                assert_eq!(back, 0.0, "zero round-trip failed");
+            } else {
+                let rel_err = ((back - v) / v).abs();
+                assert!(
+                    rel_err < 0.13,
+                    "fp8 round-trip error for {v}: got {back}, rel_err={rel_err}"
+                );
+            }
+        }
+
+        // Values below subnormal min underflow to zero
+        assert_eq!(fp8_e4m3_to_f32(f32_to_fp8_e4m3(0.001)), 0.0);
+        // Values above max clamp to 448
+        assert_eq!(fp8_e4m3_to_f32(f32_to_fp8_e4m3(1000.0)), 448.0);
+    }
+
+    #[test]
+    fn test_fp8_paged_kv_cache_basic() {
+        let config = ModelConfig::tiny_test();
+        let mut cache = Fp8PagedKvCache::new(&config, 32, 4);
+
+        let stride = config.num_kv_heads * config.head_dim;
+        let k_data: Vec<f32> = (0..stride).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let v_data: Vec<f32> = (0..stride).map(|i| (i as f32 + 1.0) * 0.2).collect();
+
+        cache.append_kv(0, &k_data, &v_data, 1);
+        cache.advance(1);
+        assert_eq!(cache.seq_len, 1);
+
+        let k_out = cache.k_contiguous(0, 1);
+        assert_eq!(k_out.len(), stride);
+        for i in 0..stride {
+            let rel_err = if k_data[i].abs() > 0.001 {
+                ((k_out[i] - k_data[i]) / k_data[i]).abs()
+            } else {
+                (k_out[i] - k_data[i]).abs()
+            };
+            assert!(
+                rel_err < 0.15,
+                "fp8 k divergence at {i}: got {} expected {} rel_err={}",
+                k_out[i],
+                k_data[i],
+                rel_err
+            );
+        }
+    }
+
+    #[test]
+    fn test_fp8_halves_memory() {
+        let config = ModelConfig::tiny_test();
+        let fp8 = Fp8PagedKvCache::new(&config, 32, 4);
+        assert_eq!(
+            fp8.memory_bytes_per_token() * 2,
+            fp8.f32_memory_bytes_per_token() / 2,
+        );
+    }
+
+    #[test]
+    fn test_fp8_paged_kv_cache_multi_token() {
+        let config = ModelConfig::tiny_test();
+        let mut cache = Fp8PagedKvCache::new(&config, 32, 4);
+
+        let stride = config.num_kv_heads * config.head_dim;
+        for t in 0..6 {
+            let k: Vec<f32> = (0..stride).map(|i| (t * 10 + i) as f32 * 0.05).collect();
+            let v = k.clone();
+            cache.append_kv(0, &k, &v, 1);
+            cache.advance(1);
+        }
+
+        assert_eq!(cache.seq_len, 6);
+        let k_out = cache.k_contiguous(0, 6);
+        assert_eq!(k_out.len(), 6 * stride);
+    }
+
+    #[test]
+    fn test_fp8_paged_kv_cache_reset() {
+        let config = ModelConfig::tiny_test();
+        let mut cache = Fp8PagedKvCache::new(&config, 16, 4);
+
+        let stride = config.num_kv_heads * config.head_dim;
+        let k: Vec<f32> = vec![1.0; stride * 5];
+        let v = k.clone();
+        cache.append_kv(0, &k, &v, 5);
+        cache.advance(5);
+        cache.reset();
+        assert_eq!(cache.seq_len, 0);
     }
 
     #[test]

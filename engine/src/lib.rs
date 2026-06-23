@@ -25,8 +25,8 @@ pub use gpu_scratchpad::GpuScratchpad;
 #[cfg(feature = "cuda")]
 pub use kv_cache::GpuKvCache;
 pub use kv_cache::{
-    BlockTable, KvCache, KvCachePool, PageAllocator, PagedKvCache, PoolError, PrefixCacheTable,
-    PrefixMatch, SharedPrefixCache, DEFAULT_BLOCK_SIZE,
+    BlockTable, Fp8PagedKvCache, KvCache, KvCachePool, PageAllocator, PagedKvCache, PoolError,
+    PrefixCacheTable, PrefixMatch, SharedPrefixCache, DEFAULT_BLOCK_SIZE,
 };
 #[cfg(feature = "cuda")]
 pub use model::GpuInferenceWrapper;

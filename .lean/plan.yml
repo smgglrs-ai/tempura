@@ -2525,7 +2525,8 @@ items:
     during attention. The quantization is per-page (one scale per page of 16
     tokens). Kani proves the quantization index arithmetic. DualPipeline
     verifies FP8 vs FP16 output divergence is within acceptable epsilon.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: L
   depends_on:
