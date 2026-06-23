@@ -2755,3 +2755,129 @@ items:
   - Measurable throughput improvement (tokens/sec)
   verification:
     quick: cargo test --workspace
+
+  # ============================================================================
+  # Phase E2E-GPU: Close the llama.cpp Gap
+  # Current: 179 tok/s (0.86x llama.cpp 209 tok/s) on RTX 5090, Qwen3-8B Q4_K_M.
+  # Matmul-only, formally verified via DualPipeline against Kani-proven CPU ref.
+  # ============================================================================
+
+- id: gpu-codegen-vectorized-load
+  title: "cuda-oxide: vectorized byte loads (ld.b32 for 4 consecutive i8)"
+  description: 'In the MIR importer, detect 4 consecutive i8 loads from the same
+    base pointer with stride-1 offsets. Fuse them into a single i32 load + byte
+    extract. Currently each qs[offset+i] becomes a separate ld.global.u8; the
+    fused version emits one ld.global.b32 and 4 byte-extract shifts. Saves ~3
+    instructions per Q4K block per lane.'
+  status: pending
+  priority: high
+  effort: M
+  scope:
+  - ~/Code/github.com/NVLabs/cuda-oxide/crates/mir-importer/src/translator/rvalue.rs
+  acceptance:
+  - Generated NVVM IR uses i32 loads where 4 consecutive i8 loads existed
+  - No correctness regression (DualPipeline CPU vs GPU match unchanged)
+  - Measurable reduction in instruction count per Q4K block
+  verification:
+    quick: cd tests-gpu && CUDA_OXIDE_BACKEND=... cargo oxide run --bin bench-q4k-e2e
+
+- id: gpu-codegen-packed-scales
+  title: "cuda-oxide: packed scale unpacking via u16 bitwise ops"
+  description: 'The Q4K scale unpacking reads 12 bytes and performs ~40 bitwise
+    ops to extract 8 6-bit scales and 8 6-bit mins. Currently each byte is loaded
+    individually. Optimize by loading as 3 u32 or 6 u16 and using packed bitwise
+    ops. Saves ~8 instructions per block.'
+  status: pending
+  priority: high
+  effort: M
+  depends_on:
+  - gpu-codegen-vectorized-load
+  scope:
+  - ~/Code/github.com/NVLabs/cuda-oxide/crates/mir-importer/src/translator/rvalue.rs
+  acceptance:
+  - Scale unpacking uses fewer loads and bitwise ops
+  - No correctness regression
+  verification:
+    quick: cd tests-gpu && CUDA_OXIDE_BACKEND=... cargo oxide run --bin bench-q4k-e2e
+
+- id: gpu-codegen-bfe-cvt-fusion
+  title: "cuda-oxide: fused bfe.u32 + cvt.rn.f32.u32 for nibble→float"
+  description: 'Pattern-match (x & 0x0F) as f32 and (x >> 4) as f32 in the LLVM
+    export layer. Emit bfe.u32 + cvt.rn.f32.u32 as a scheduled pair that the PTX
+    JIT can pipeline. Currently LLVM emits and.b32 + cvt separately with possible
+    register spill between. Saves ~4 instructions per block. This is the hardest
+    codegen improvement — may require an NVVM-level peephole pass.'
+  status: pending
+  priority: medium
+  effort: L
+  depends_on:
+  - gpu-codegen-vectorized-load
+  scope:
+  - ~/Code/github.com/NVLabs/cuda-oxide/crates/llvm-export/src/export/ops.rs
+  acceptance:
+  - Nibble extraction + float conversion uses fewer instructions
+  - No correctness regression
+  verification:
+    quick: cd tests-gpu && CUDA_OXIDE_BACKEND=... cargo oxide run --bin bench-q4k-e2e
+
+- id: gpu-e2e-forward-pass
+  title: Wire full GPU forward pass (matmul + attention + norms + KV cache)
+  description: 'Connect GpuInferenceWrapper to QuantizedWeights with the coop
+    multi-warp Q4K kernel + existing flash attention + RMSNorm + RoPE GPU kernels.
+    The server should detect GGUF models and use the GPU quantized path
+    automatically. This gives a REAL tok/s number (not matmul-only projection)
+    that can be compared head-to-head with llama-bench.
+
+    Current state: all GPU kernels exist and work independently.
+    Missing: forward_gpu_quantized() that orchestrates them into a full
+    forward pass with activations staying on GPU throughout.
+
+    The mma_sync cross-crate build issue is fixed by using
+    CUDA_OXIDE_BACKEND env var (see CLAUDE.md).'
+  status: pending
+  priority: critical
+  effort: XL
+  scope:
+  - engine/src/model.rs
+  - server/src/main.rs
+  acceptance:
+  - Server loads GGUF, uploads Q4K/Q6K weights to VRAM, runs full GPU forward
+  - Real tok/s measured via server endpoint (not kernel microbenchmark)
+  - Head-to-head comparison with llama-bench on same model+GPU
+  - DualPipeline validation of GPU forward output vs CPU forward output
+  verification:
+    quick: cargo test --workspace
+
+  # ============================================================================
+  # Performance Reference (measured 2026-06-23, RTX 5090, Qwen3-8B Q4_K_M)
+  # ============================================================================
+  #
+  # llama.cpp (llama-bench, build 468bdec):
+  #   Decode tg128: 209 tok/s (4.78ms/token)
+  #   Prefill pp128: 7335 tok/s
+  #
+  # tempura (matmul-only, resident weights, best kernel):
+  #   Multi-warp coop (8 warps): 179 tok/s (5.58ms)
+  #   Cached dispatch:           171 tok/s (5.85ms)
+  #   Gap: 0.86x (matmul-only vs llama.cpp full forward)
+  #
+  # Kernel evolution (this session):
+  #   CPU quantized:    1.14 tok/s
+  #   Naive GPU:        34 tok/s  (transfer-dominated)
+  #   Resident weights: 64 tok/s  (eliminate host↔device copies)
+  #   Intra-block coop: 144 tok/s (coalesced weight reads)
+  #   Deferred reduce:  157 tok/s (1 shuffle/column instead of per-block)
+  #   Multi-warp (8):   179 tok/s (8x more in-flight memory requests)
+  #
+  # Experiments that didn't help:
+  #   Shared-memory activation tile (L1 already handles it)
+  #   Fused gate+up GPU kernel (register pressure kills occupancy)
+  #   dp4a integer dot product (Q8 header reads > cvt savings)
+  #   Packed nibble extraction (LLVM generates same code)
+  #   Separated scale/min accumulation (same LLVM codegen)
+  #   Multi-row CTA (enough parallelism already on 170 SMs)
+  #   Fused QKV weights (larger N doesn't improve bandwidth)
+  #   invariant.load metadata (no effect on sm_120 Blackwell)
+  #
+  # All GPU kernels validated via DualPipeline against Kani-proven CPU reference.
+  # ============================================================================

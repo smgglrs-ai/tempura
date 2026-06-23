@@ -1055,3 +1055,28 @@
       ratio: 0.82
       improvement_from_start: "151x (1.14 → 172 tok/s)"
     branch: "loop/2026-06-21"
+
+- timestamp: "2026-06-23T16:00:00+02:00"
+  actor: claude
+  action: session-summary
+  summary: >
+    GPU kernel optimization session. 179 tok/s matmul-only on Qwen3-8B Q4_K_M
+    RTX 5090 (0.86x llama.cpp 209 tok/s). Kernel evolution: naive (34) → resident
+    weights (64) → intra-block coop (144) → deferred reduce (157) → multi-warp
+    (179). 7 experiments that didn't help documented. cuda-oxide fork: rebased
+    on upstream, added invariant.load codegen (no perf effect on sm_120), fixed
+    stale backend cache (CUDA_OXIDE_BACKEND env var documented in CLAUDE.md).
+    Remaining gap is cuda-oxide codegen quality (~15 extra instructions/block vs
+    NVCC). Estimated 2-3 weeks of compiler work for ~10-15% improvement.
+  details:
+    branch: "loop/2026-06-21"
+    metrics:
+      tempura_tok_s: 179
+      llama_cpp_tok_s: 209
+      ratio: 0.86
+      tests_passing: 253
+    next:
+    - "gpu-e2e-forward-pass: wire full GPU forward for real tok/s"
+    - "gpu-codegen-vectorized-load: ld.b32 for 4 consecutive i8 (2-3 days)"
+    - "gpu-codegen-packed-scales: u16 bitwise scale unpacking (2-3 days)"
+    - "gpu-codegen-bfe-cvt-fusion: nibble→float fusion (1 week)"
