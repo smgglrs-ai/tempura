@@ -1143,3 +1143,10 @@
   summary: "Created 5 verification theory pages: bounded model checking, reading Kani harnesses, compositionality, DualPipeline, verification tiers. Each with annotated code examples from the codebase. Docs build: 37 pages."
   iteration: 10
   max_iterations: 20
+- timestamp: "2026-06-23T14:15:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p18-foundations-connection"
+  summary: "Added 'What we prove' and 'What we do NOT prove' sections to all 5 math foundation pages. Each section names specific Kani harnesses and explains in plain language what the proof covers. Proptest and f64 reference validations listed as complementary methods for what Kani cannot handle."
+  iteration: 11
+  max_iterations: 20

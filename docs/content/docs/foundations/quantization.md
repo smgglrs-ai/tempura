@@ -79,6 +79,23 @@ $$
 
 The dequantized range for this group: $[-0.025, 1.475]$.
 
+## What we prove
+
+- **`int8_dequant_bounded_error`**: Symmetric int8 quantization round-trip error is at most step_size/2.
+- **`q4k_monotonicity_within_group`**: Larger nibble → larger dequantized value (for fixed scale/min within a group).
+- **`int8_monotonicity`**: Int8 dequant preserves ordering for fixed scale.
+- **`i32_accumulator_no_overflow_quantized_matmul`**: i32 accumulator cannot overflow for group_size ≤ 128.
+- **`q4k_group_boundary_safety`**: Element and qs byte indices stay within their group's range — no cross-group aliasing.
+- **`q6k_group_boundary_safety`**: Q6K element, ql, and qh indices within their respective ranges.
+- **`q4k_scale_unpack_matches_ggml`**: Our scale unpacking produces identical results to ggml's `get_scale_min_k4` for all 8 group indices and all possible 12-byte packed arrays.
+- **`q4k_dequant_element_mapping_matches_ggml`**: Element-to-qs mapping matches ggml's interleaved layout.
+
+## What we do NOT prove
+
+- **Quantization quality**: That Q4K produces "good enough" approximations for inference — this is an empirical quality metric, not a safety property.
+- **Floating-point accumulation order**: The f32 accumulator proof bounds the magnitude but doesn't guarantee identical results across reduction orders (GPU vs CPU may sum in different order).
+- **Scale factor selection**: How d and dmin are chosen during quantization — tempura only dequantizes, it doesn't quantize.
+
 ## Source code
 
 - **Trait**: [`kernel-api/src/lib.rs`](https://github.com/smgglrs-ai/tempura/blob/main/kernel-api/src/lib.rs) — `MatMulQ` trait for quantized matmul, `Dequantize` trait

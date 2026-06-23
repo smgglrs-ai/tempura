@@ -81,6 +81,19 @@ With top-p=0.8: cumulative $[0.574, 0.786, 0.914, ...]$ — need tokens 0, 1, 2 
 
 Temperature $\tau = 0$ (or equivalently, top-k=1) always selects the highest-probability token. Deterministic — same input always produces the same output. Used for benchmarking and reproducibility.
 
+## What we prove
+
+- **`sampler_top_k_index_in_bounds`**: Top-k index access is within vocabulary bounds for any valid (vocab_size, top_k).
+- **`sample_token_cumsum_terminates`**: The cumulative probability scan in `sample_token` always finds a valid token — the fallback index is within bounds.
+- **`sampler_full_execution_no_panic`**: Complete `CpuSampler::apply` does not panic for bounded inputs.
+
+## What we do NOT prove
+
+- **Probabilities sum to 1.0**: Validated by proptest (`prop_softmax_sums_to_one`), not formally proven.
+- **All probabilities non-negative**: Validated by proptest (`prop_all_probabilities_non_negative`).
+- **Greedy selects argmax**: Validated by proptest (`prop_greedy_selects_argmax`) — that temperature=0 always picks the highest-logit token.
+- **Top-p correctness**: That the nucleus set is minimal — tested but not proven.
+
 ## Source code
 
 - **Trait**: [`kernel-api/src/lib.rs`](https://github.com/smgglrs-ai/tempura/blob/main/kernel-api/src/lib.rs) — `Sampler` trait with `apply` (logits → probs) and `sample_token` (probs → token)

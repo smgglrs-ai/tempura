@@ -53,6 +53,17 @@ $$
 
 Verify: the output's RMS is $\sqrt{(0.849^2 + 1.131^2)/2} = \sqrt{(0.72 + 1.28)/2} = 1.0$. RMSNorm produces unit RMS — this is the invariant.
 
+## What we prove
+
+- **`rmsnorm_indices_in_bounds`**: Row indexing `x[row * hidden_size + i]` is within buffer bounds for any valid (tokens, hidden_size, i).
+- **`rmsnorm_full_execution_no_panic`**: Complete `CpuRMSNorm::forward` execution does not panic for any valid bounded input (tokens 1–2, hidden 1–8).
+
+## What we do NOT prove
+
+- **Output has unit RMS**: Validated by proptest (`prop_output_has_unit_rms`), not formally proven — Kani cannot reason about `sqrt()` and division precision.
+- **Numerical match to f64 reference**: Validated by `test_rmsnorm_matches_f64_reference`, which checks the f32 implementation matches an f64 computation within 1e-5.
+- **Epsilon prevents division by zero**: The $\epsilon$ guard is structurally present in the code, but Kani doesn't prove the resulting `1.0 / rms` is finite — that's a floating-point property.
+
 ## Source code
 
 - **Trait**: [`kernel-api/src/lib.rs`](https://github.com/smgglrs-ai/tempura/blob/main/kernel-api/src/lib.rs) — `RMSNorm` trait

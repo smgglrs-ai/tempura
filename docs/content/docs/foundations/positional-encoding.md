@@ -57,6 +57,16 @@ $$
 
 The first pair rotates significantly ($\theta_0 = 1$ rad), while the second barely moves ($\theta_1 = 0.01$ rad).
 
+## What we prove
+
+- **`rope_indices_in_bounds`**: Position lookup and rotation pair indexing are within buffer bounds for any valid (batch, seq_len, num_heads, head_dim, position).
+
+## What we do NOT prove
+
+- **Norm preservation**: $\|R_m q\| = \|q\|$ is validated by proptest (`prop_rotation_preserves_l2_norm`), not formally proven — Kani cannot reason about `cos²(θ) + sin²(θ) = 1`.
+- **Position-zero identity**: $R_0 = I$ validated by proptest (`prop_position_zero_is_identity`), not Kani-proven.
+- **Relative position encoding**: The property that $q_m \cdot k_n$ depends only on $m - n$ is a mathematical consequence of the rotation group structure — not testable per se, but follows from the correct implementation of the rotation matrix.
+
 ## Source code
 
 - **Trait**: [`kernel-api/src/lib.rs`](https://github.com/smgglrs-ai/tempura/blob/main/kernel-api/src/lib.rs) — `RoPE` trait with `positions` array

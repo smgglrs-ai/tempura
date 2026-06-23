@@ -2426,7 +2426,8 @@ items:
     matters for the mathematical operation. This is the layer that makes review
     tractable: a PR changing attention code can be evaluated against the math
     AND the proof, not just "does it compile and pass tests."'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: M
   depends_on:

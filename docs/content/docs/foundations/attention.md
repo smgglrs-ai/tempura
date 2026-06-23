@@ -63,6 +63,22 @@ $$
 
 After softmax: token 0 attends 100% to itself → output $[1, 2]$. Token 1 attends ~73% to itself, ~27% to token 0 → output $\approx [2.46, 3.46]$.
 
+## What we prove
+
+Kani harnesses in `kernels/src/attention.rs` prove:
+
+- **`attention_q_offset_in_bounds`**: For any valid (batch, seq_len, num_heads, head_dim) and loop index (b, s, h), the Q vector access `q[q_offset..q_offset + head_dim]` is within the allocated buffer. This prevents out-of-bounds panics in the inner loop.
+- **`attention_kv_offset_in_bounds`**: The K/V vector access is within bounds for any valid (batch, kv_len, num_kv_heads, head_dim) and loop index.
+- **`attention_batch_isolation_no_overlap`**: For any two distinct batch indices, their Q/K/V memory ranges do not overlap. This is the formal basis for batch-invariant inference.
+- **`gpu_attention_thread_decomposition_in_bounds`**: The GPU thread index decomposition (converting a flat thread ID into batch/seq/head/dim indices) stays within dimension bounds.
+
+## What we do NOT prove
+
+- **Softmax sums to 1.0**: Kani over-approximates `exp()`. Validated by proptest (`prop_softmax_sums_to_one`) and f64 reference comparison.
+- **Output is a convex combination of values**: Validated by proptest (`prop_attention_output_bounded`), not formally proven.
+- **Causal mask correctness**: The mask logic (positions > causal_limit get $-\infty$) is correct by construction but not Kani-verified — Kani checks memory safety of the mask application, not its semantics.
+- **Numerical stability of softmax**: The max-subtraction trick prevents overflow in practice; Kani cannot reason about floating-point overflow in `exp()`.
+
 ## Source code
 
 - **Trait**: [`kernel-api/src/lib.rs`](https://github.com/smgglrs-ai/tempura/blob/main/kernel-api/src/lib.rs) — `Attention` trait with `forward` and `forward_paged`
