@@ -1136,3 +1136,10 @@
   summary: "Added sliding window attention: forward_windowed in Attention trait with default fallback to full attention. CpuAttention implements windowed masking (positions outside window get -inf). ModelConfig gains sliding_window field, parsed from HF config.json. Two tests verify windowed-vs-full divergence and large-window equivalence. 275 tests, benchmark stable."
   iteration: 9
   max_iterations: 20
+- timestamp: "2026-06-23T14:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p18-foundations-verification"
+  summary: "Created 5 verification theory pages: bounded model checking, reading Kani harnesses, compositionality, DualPipeline, verification tiers. Each with annotated code examples from the codebase. Docs build: 37 pages."
+  iteration: 10
+  max_iterations: 20

@@ -2393,16 +2393,9 @@ items:
     behind tempura. Teaches what bounded model checking is, how to read a Kani
     harness, what is and is not being proven, the compositionality argument for
     graph-level safety, and how DualPipeline complements formal proofs with
-    empirical equivalence testing. Topics: (1) Bounded model checking — what Kani
-    does, SAT/SMT under the hood, the bounded nature of proofs, what "all inputs"
-    means within bounds. (2) Reading a Kani harness — annotated walkthrough of a
-    real harness from the codebase, mapping code to property. (3) Compositionality
-    — if each op is safe and the wiring preserves dimensions, the graph is safe.
-    The formal argument and its assumptions. (4) DualPipeline — what formal proofs
-    miss (numerical drift, precision), how runtime comparison catches it, epsilon
-    thresholds. (5) Verification tiers — what each tier guarantees, when to use
-    which, the tradeoff between proof strength and development velocity.'
-  status: pending
+    empirical equivalence testing.'
+  status: done
+  progress: 100
   priority: high
   effort: L
   depends_on:
