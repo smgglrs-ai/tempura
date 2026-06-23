@@ -2637,7 +2637,8 @@ items:
     stores W tokens per layer, enabling long contexts with O(n) memory instead
     of O(n²). The window size comes from the model config. Requires
     architecture registry update to declare window_size per model.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: M
   depends_on:

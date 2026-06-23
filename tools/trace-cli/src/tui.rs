@@ -64,8 +64,11 @@ pub fn run_tui(
                 trace.generated_tokens,
                 trace.level,
             );
-            let header_widget = Paragraph::new(header)
-                .block(Block::default().borders(Borders::ALL).title("tempura-trace"));
+            let header_widget = Paragraph::new(header).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("tempura-trace"),
+            );
             f.render_widget(header_widget, chunks[0]);
 
             match state.tab {
@@ -121,8 +124,18 @@ fn render_layers(
     trace: &InferenceTrace,
     state: &AppState,
 ) {
-    let header = Row::new(vec!["Layer", "Pre-norm mean", "Pre-norm var", "Post-norm mean", "Duration"])
-        .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow));
+    let header = Row::new(vec![
+        "Layer",
+        "Pre-norm mean",
+        "Pre-norm var",
+        "Post-norm mean",
+        "Duration",
+    ])
+    .style(
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::Yellow),
+    );
 
     let rows: Vec<Row> = trace
         .layers
@@ -188,8 +201,11 @@ fn render_sampling(
     trace: &InferenceTrace,
     state: &AppState,
 ) {
-    let header = Row::new(vec!["Step", "Token", "Top Logit", "Top Prob", "Masked"])
-        .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow));
+    let header = Row::new(vec!["Step", "Token", "Top Logit", "Top Prob", "Masked"]).style(
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::Yellow),
+    );
 
     let rows: Vec<Row> = trace
         .sampling_steps

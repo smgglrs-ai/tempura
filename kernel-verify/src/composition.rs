@@ -195,12 +195,12 @@ impl CompositionVerifier {
         );
 
         let attn_chain = vec![
-            ops[0].clone(),  // RMSNorm
-            ops[1].clone(),  // Q proj
-            ops[4].clone(),  // RoPE(Q)
-            ops[6].clone(),  // Attention
-            ops[7].clone(),  // O proj
-            ops[8].clone(),  // Residual
+            ops[0].clone(), // RMSNorm
+            ops[1].clone(), // Q proj
+            ops[4].clone(), // RoPE(Q)
+            ops[6].clone(), // Attention
+            ops[7].clone(), // O proj
+            ops[8].clone(), // Residual
         ];
         let attn_report = Self::verify_sequence(&attn_chain);
 
@@ -245,9 +245,21 @@ mod tests {
     #[test]
     fn test_compatible_sequence() {
         let ops = vec![
-            OpShape { name: "A", input_elements: 100, output_elements: 200 },
-            OpShape { name: "B", input_elements: 200, output_elements: 200 },
-            OpShape { name: "C", input_elements: 200, output_elements: 50 },
+            OpShape {
+                name: "A",
+                input_elements: 100,
+                output_elements: 200,
+            },
+            OpShape {
+                name: "B",
+                input_elements: 200,
+                output_elements: 200,
+            },
+            OpShape {
+                name: "C",
+                input_elements: 200,
+                output_elements: 50,
+            },
         ];
         let report = CompositionVerifier::verify_sequence(&ops);
         assert!(report.composed_safe);
@@ -258,8 +270,16 @@ mod tests {
     #[test]
     fn test_incompatible_sequence() {
         let ops = vec![
-            OpShape { name: "A", input_elements: 100, output_elements: 200 },
-            OpShape { name: "B", input_elements: 300, output_elements: 50 },
+            OpShape {
+                name: "A",
+                input_elements: 100,
+                output_elements: 200,
+            },
+            OpShape {
+                name: "B",
+                input_elements: 300,
+                output_elements: 50,
+            },
         ];
         let report = CompositionVerifier::verify_sequence(&ops);
         assert!(!report.composed_safe);
@@ -274,7 +294,11 @@ mod tests {
 
     #[test]
     fn test_single_op() {
-        let ops = vec![OpShape { name: "A", input_elements: 10, output_elements: 20 }];
+        let ops = vec![OpShape {
+            name: "A",
+            input_elements: 10,
+            output_elements: 20,
+        }];
         let report = CompositionVerifier::verify_sequence(&ops);
         assert!(report.composed_safe);
         assert!(report.boundaries.is_empty());
@@ -282,9 +306,7 @@ mod tests {
 
     #[test]
     fn test_transformer_layer_llama_7b() {
-        let report = CompositionVerifier::verify_transformer_layer(
-            1, 4096, 32, 32, 128, 11008,
-        );
+        let report = CompositionVerifier::verify_transformer_layer(1, 4096, 32, 32, 128, 11008);
         assert!(
             report.composed_safe,
             "LLaMA-7B layer composition failed: {}",
@@ -295,18 +317,22 @@ mod tests {
 
     #[test]
     fn test_transformer_layer_tiny_test() {
-        let report = CompositionVerifier::verify_transformer_layer(
-            4, 64, 4, 4, 16, 256,
+        let report = CompositionVerifier::verify_transformer_layer(4, 64, 4, 4, 16, 256);
+        assert!(
+            report.composed_safe,
+            "tiny_test composition failed: {}",
+            report.detail
         );
-        assert!(report.composed_safe, "tiny_test composition failed: {}", report.detail);
     }
 
     #[test]
     fn test_transformer_layer_gqa() {
-        let report = CompositionVerifier::verify_transformer_layer(
-            1, 4096, 32, 8, 128, 14336,
+        let report = CompositionVerifier::verify_transformer_layer(1, 4096, 32, 8, 128, 14336);
+        assert!(
+            report.composed_safe,
+            "GQA composition failed: {}",
+            report.detail
         );
-        assert!(report.composed_safe, "GQA composition failed: {}", report.detail);
     }
 
     #[test]

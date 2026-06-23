@@ -26,9 +26,8 @@ impl RandomWeightLoader {
         let inter = config.intermediate_size;
 
         let mut tensors = HashMap::new();
-        let mut rand_vec = |size: usize| -> Vec<f32> {
-            (0..size).map(|_| rng.random_range(-0.1..0.1)).collect()
-        };
+        let mut rand_vec =
+            |size: usize| -> Vec<f32> { (0..size).map(|_| rng.random_range(-0.1..0.1)).collect() };
 
         tensors.insert("model.embed_tokens.weight".into(), rand_vec(v * h));
         tensors.insert("model.norm.weight".into(), vec![1.0; h]);
@@ -114,9 +113,10 @@ fn main() {
     let prompt = [1u32, 2, 3, 4, 5, 6, 7, 8];
 
     println!("tempura inference benchmark (tiny_test model)");
-    println!("  hidden={} layers={} heads={} vocab={}",
-        config.hidden_size, config.num_layers,
-        config.num_attention_heads, config.vocab_size);
+    println!(
+        "  hidden={} layers={} heads={} vocab={}",
+        config.hidden_size, config.num_layers, config.num_attention_heads, config.vocab_size
+    );
     println!();
 
     // --- Forward pass ---
@@ -132,20 +132,21 @@ fn main() {
         });
 
         bench("paged KV cache (block_size=4)", 2, 50, || {
-            let mut session =
-                InferenceSession::new_paged(&config, 64, 4, TraceLevel::Off, 42);
+            let mut session = InferenceSession::new_paged(&config, 64, 4, TraceLevel::Off, 42);
             let _ = model.forward(&mut session, &prompt);
         });
 
         bench("paged KV cache (block_size=16)", 2, 50, || {
-            let mut session =
-                InferenceSession::new_paged(&config, 64, 16, TraceLevel::Off, 42);
+            let mut session = InferenceSession::new_paged(&config, 64, 16, TraceLevel::Off, 42);
             let _ = model.forward(&mut session, &prompt);
         });
     }
 
     // --- Generate ---
-    println!("\nGenerate (prompt={} tokens, generate 10 tokens):", prompt.len());
+    println!(
+        "\nGenerate (prompt={} tokens, generate 10 tokens):",
+        prompt.len()
+    );
     {
         let pipeline = KernelPipeline::cpu_verified();
         let mut model = TransformerModel::new(config.clone(), pipeline);
@@ -157,8 +158,7 @@ fn main() {
         });
 
         bench("paged KV cache (block_size=16)", 1, 20, || {
-            let mut session =
-                InferenceSession::new_paged(&config, 64, 16, TraceLevel::Off, 42);
+            let mut session = InferenceSession::new_paged(&config, 64, 16, TraceLevel::Off, 42);
             let _ = model.generate(&mut session, &prompt, 10, &params, None);
         });
     }

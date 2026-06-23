@@ -1129,3 +1129,10 @@
   summary: "Created tempura-trace TUI binary (ratatui). Commands: view (scrollable layer/sampling tables with filter), diff (structured TraceDiff JSON output), export (JSON/CSV), info (metadata summary). Supports .tempura-trace binary and .json formats. Falls back to text output when not in terminal."
   iteration: 8
   max_iterations: 20
+- timestamp: "2026-06-23T13:30:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p22-sliding-window"
+  summary: "Added sliding window attention: forward_windowed in Attention trait with default fallback to full attention. CpuAttention implements windowed masking (positions outside window get -inf). ModelConfig gains sliding_window field, parsed from HF config.json. Two tests verify windowed-vs-full divergence and large-window equivalence. 275 tests, benchmark stable."
+  iteration: 9
+  max_iterations: 20

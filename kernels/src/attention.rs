@@ -79,6 +79,77 @@ impl Attention for CpuAttention {
 
         Ok(())
     }
+
+    fn forward_windowed(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        output: &mut [f32],
+        batch: usize,
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        window_size: usize,
+    ) -> Result<()> {
+        let heads_per_group = num_heads / num_kv_heads;
+
+        for b in 0..batch {
+            for h in 0..num_heads {
+                let kv_h = h / heads_per_group;
+                for s in 0..seq_len {
+                    let q_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                    let q_vec = &q[q_offset..q_offset + head_dim];
+
+                    let cache_offset = kv_len - seq_len;
+                    let causal_limit = cache_offset + s;
+                    let window_start = if causal_limit >= window_size {
+                        causal_limit - window_size + 1
+                    } else {
+                        0
+                    };
+
+                    let mut scores = vec![0.0f32; kv_len];
+                    for (kv_s, score) in scores.iter_mut().enumerate() {
+                        if kv_s > causal_limit || kv_s < window_start {
+                            *score = f32::NEG_INFINITY;
+                            continue;
+                        }
+                        let k_offset = ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim;
+                        let k_vec = &k[k_offset..k_offset + head_dim];
+                        let dot: f32 = q_vec.iter().zip(k_vec).map(|(a, b)| a * b).sum();
+                        *score = dot * scale;
+                    }
+
+                    let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0f32;
+                    for s in &mut scores {
+                        *s = (*s - max_score).exp();
+                        sum += *s;
+                    }
+                    for s in &mut scores {
+                        *s /= sum;
+                    }
+
+                    let o_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                    for d in 0..head_dim {
+                        let mut val = 0.0f32;
+                        for (kv_s, &score) in scores.iter().enumerate() {
+                            let v_offset =
+                                ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim + d;
+                            val += score * v[v_offset];
+                        }
+                        output[o_offset + d] = val;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -533,6 +604,131 @@ mod tests {
         assert_eq!(output.len(), 8);
         // first token attends more to itself (q[0] dot k[0] > q[0] dot k[1])
         assert!(output[0] < 3.0); // closer to v[0]=1 than v[4]=5
+    }
+
+    #[test]
+    fn test_sliding_window_attention() {
+        let attn = CpuAttention;
+        let head_dim = 4;
+        let seq_len = 4;
+        let num_heads = 1;
+        let num_kv_heads = 1;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..seq_len * head_dim).map(|i| (i as f32) * 0.1).collect();
+        let k = q.clone();
+        let v: Vec<f32> = (0..seq_len * head_dim)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
+
+        let mut out_full = vec![0.0f32; seq_len * head_dim];
+        attn.forward(
+            &q,
+            &k,
+            &v,
+            &mut out_full,
+            1,
+            seq_len,
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .unwrap();
+
+        let mut out_windowed = vec![0.0f32; seq_len * head_dim];
+        attn.forward_windowed(
+            &q,
+            &k,
+            &v,
+            &mut out_windowed,
+            1,
+            seq_len,
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            2,
+        )
+        .unwrap();
+
+        // Token 0: window=2 but only 1 token visible → same as full
+        for d in 0..head_dim {
+            assert!(
+                (out_full[d] - out_windowed[d]).abs() < 1e-5,
+                "token 0 dim {d}: full={} windowed={}",
+                out_full[d],
+                out_windowed[d]
+            );
+        }
+
+        // Token 3: full attention sees all 4 tokens, windowed sees only tokens 2-3
+        // Outputs should differ because windowed ignores tokens 0-1
+        let tok3_full = &out_full[3 * head_dim..4 * head_dim];
+        let tok3_wind = &out_windowed[3 * head_dim..4 * head_dim];
+        let max_diff: f32 = tok3_full
+            .iter()
+            .zip(tok3_wind)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            max_diff > 1e-3,
+            "token 3 should differ between full and windowed attention (max_diff={max_diff})"
+        );
+    }
+
+    #[test]
+    fn test_sliding_window_large_window_equals_full() {
+        let attn = CpuAttention;
+        let head_dim = 4;
+        let seq_len = 4;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..seq_len * head_dim).map(|i| (i as f32) * 0.1).collect();
+        let k = q.clone();
+        let v = q.clone();
+
+        let mut out_full = vec![0.0f32; seq_len * head_dim];
+        attn.forward(
+            &q,
+            &k,
+            &v,
+            &mut out_full,
+            1,
+            seq_len,
+            seq_len,
+            1,
+            1,
+            head_dim,
+            scale,
+        )
+        .unwrap();
+
+        let mut out_windowed = vec![0.0f32; seq_len * head_dim];
+        attn.forward_windowed(
+            &q,
+            &k,
+            &v,
+            &mut out_windowed,
+            1,
+            seq_len,
+            seq_len,
+            1,
+            1,
+            head_dim,
+            scale,
+            1000,
+        )
+        .unwrap();
+
+        for i in 0..out_full.len() {
+            assert!(
+                (out_full[i] - out_windowed[i]).abs() < 1e-6,
+                "large window should equal full attention at {i}"
+            );
+        }
     }
 
     mod prop_tests {

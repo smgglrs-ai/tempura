@@ -816,6 +816,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         tensor_parallel_size: 1,
         quantization,
         use_qk_norm: false,
+        sliding_window: None,
     })
 }
 

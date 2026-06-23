@@ -23,11 +23,7 @@ pub struct LayerOutput {
 }
 
 pub trait FusedTransformerLayer: Send + Sync {
-    fn forward(
-        &self,
-        input: &LayerInput,
-        weights: &LayerWeights,
-    ) -> Result<LayerOutput>;
+    fn forward(&self, input: &LayerInput, weights: &LayerWeights) -> Result<LayerOutput>;
 
     fn verification_tier(&self) -> VerificationTier {
         VerificationTier::Compiled

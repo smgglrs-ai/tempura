@@ -44,6 +44,37 @@ pub trait Attention: Send + Sync {
     ) -> Result<()>;
 
     #[allow(clippy::too_many_arguments)]
+    fn forward_windowed(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        output: &mut [f32],
+        batch: usize,
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        _window_size: usize,
+    ) -> Result<()> {
+        self.forward(
+            q,
+            k,
+            v,
+            output,
+            batch,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn forward_paged(
         &self,
         q: &[f32],

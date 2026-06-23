@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use tempura_engine::trace::InferenceTrace;
 
 #[derive(Parser)]
-#[command(name = "tempura-trace", about = "TUI viewer for tempura inference traces")]
+#[command(
+    name = "tempura-trace",
+    about = "TUI viewer for tempura inference traces"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -176,7 +179,10 @@ fn cmd_export(path: &PathBuf, format: &str, output: &Option<PathBuf>) -> Result<
                     .as_ref()
                     .map(|d| d.as_secs_f64() * 1000.0)
                     .unwrap_or(0.0);
-                lines.push(format!("{},{:.6},{:.6},{:.3}", snap.layer_index, mean, var, dur));
+                lines.push(format!(
+                    "{},{:.6},{:.6},{:.3}",
+                    snap.layer_index, mean, var, dur
+                ));
             }
             lines.join("\n")
         }

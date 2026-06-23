@@ -25,6 +25,7 @@ pub struct ModelConfig {
     pub tensor_parallel_size: usize,
     pub quantization: Option<QuantConfig>,
     pub use_qk_norm: bool,
+    pub sliding_window: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +89,7 @@ impl ModelConfig {
             tensor_parallel_size: 1,
             quantization: None,
             use_qk_norm: false,
+            sliding_window: None,
         }
     }
 
@@ -106,6 +108,7 @@ impl ModelConfig {
             tensor_parallel_size: 1,
             quantization: None,
             use_qk_norm: false,
+            sliding_window: None,
         }
     }
 
@@ -124,6 +127,7 @@ impl ModelConfig {
             tensor_parallel_size: 1,
             quantization: None,
             use_qk_norm: false,
+            sliding_window: None,
         }
     }
 
@@ -190,6 +194,10 @@ impl ModelConfig {
             tensor_parallel_size: 1,
             quantization: None,
             use_qk_norm: false,
+            sliding_window: v
+                .get("sliding_window")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
         })
     }
 }
