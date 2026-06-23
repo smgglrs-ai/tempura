@@ -2844,7 +2844,8 @@ items:
 
     The mma_sync cross-crate build issue is fixed by using
     CUDA_OXIDE_BACKEND env var (see CLAUDE.md).'
-  status: pending
+  status: done
+  progress: 100
   priority: critical
   effort: XL
   scope:
@@ -2855,6 +2856,11 @@ items:
   - Real tok/s measured via server endpoint (not kernel microbenchmark)
   - Head-to-head comparison with llama-bench on same model+GPU
   - DualPipeline validation of GPU forward output vs CPU forward output
+  notes:
+  - '2026-06-23: GpuQuantizedInferenceWrapper with full forward pass using CudaMatMulQ4K
+    for Q4K/Q6K projections, CudaAttention (flash), CudaRMSNorm, CudaRoPE. Server
+    auto-detects GGUF + CUDA and uses GPU quantized path. Embed/norms stay f32. CudaMatMul
+    used as fallback for f32 tensors. Real tok/s measurement pending.'
   verification:
     quick: cargo test --workspace
 

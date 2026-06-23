@@ -334,6 +334,14 @@ impl GpuWeights {
         self.quantized_tensors.contains_key(name)
     }
 
+    pub fn quantized_count(&self) -> usize {
+        self.quantized_tensors.len()
+    }
+
+    pub fn f32_count(&self) -> usize {
+        self.tensors.len()
+    }
+
     pub fn upload_from_with_concat(
         weights: &ModelWeights,
         config: &crate::config::ModelConfig,

@@ -1985,6 +1985,533 @@ impl InferenceModel for GpuInferenceWrapper {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub struct GpuQuantizedInferenceWrapper {
+    pub config: ModelConfig,
+    pub attention: tempura_kernels::attention::CudaAttention,
+    pub rmsnorm: tempura_kernels::rmsnorm::CudaRMSNorm,
+    pub rope: tempura_kernels::rope::CudaRoPE,
+    pub matmul: tempura_kernels::matmul::CudaMatMul,
+    pub q4k_matmul: tempura_kernels::quantized::CudaMatMulQ4K,
+    pub sampler: tempura_kernels::sampling::CpuSampler,
+    pub gpu_weights: crate::weights::GpuWeights,
+    pub gpu_cache: std::sync::Mutex<crate::kv_cache::GpuKvCache>,
+    pub scratchpad: std::sync::Mutex<crate::gpu_scratchpad::GpuScratchpad>,
+    pub embed_host: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuQuantizedInferenceWrapper {
+    fn forward_gpu_quantized(&self, token_ids: &[u32], position: usize) -> Vec<f32> {
+        let ctx = self.q4k_matmul.gpu().context().clone();
+        ctx.bind_to_thread().expect("bind CUDA context");
+        let stream = self.q4k_matmul.gpu().stream();
+
+        let cfg = &self.config;
+        let seq_len = token_ids.len();
+        let h = cfg.hidden_size;
+        let n_heads = cfg.num_attention_heads;
+        let n_kv_heads = cfg.num_kv_heads;
+        let head_dim = cfg.head_dim;
+        let inter = cfg.intermediate_size;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let mut gpu_cache = self.gpu_cache.lock().unwrap();
+        let mut scratch_guard = self.scratchpad.lock().unwrap();
+        let scratch = &mut *scratch_guard;
+
+        let mut hidden_host = vec![0.0f32; seq_len * h];
+        for (t, &tok) in token_ids.iter().enumerate() {
+            let src = &self.embed_host[tok as usize * h..(tok as usize + 1) * h];
+            hidden_host[t * h..(t + 1) * h].copy_from_slice(src);
+        }
+        scratch.upload_hidden(&stream, &hidden_host);
+
+        let positions: Vec<u32> = (position..position + seq_len).map(|p| p as u32).collect();
+        let positions_dev =
+            cuda_core::DeviceBuffer::from_host(&stream, &positions).expect("upload positions");
+
+        for layer in 0..cfg.num_layers {
+            let prefix = format!("model.layers.{layer}");
+
+            let input_ln_w = self
+                .gpu_weights
+                .get(&format!("{prefix}.input_layernorm.weight"))
+                .unwrap();
+            self.rmsnorm
+                .forward_device(
+                    &scratch.hidden,
+                    input_ln_w,
+                    &mut scratch.normed,
+                    h,
+                    cfg.layer_norm_eps,
+                )
+                .expect("rmsnorm");
+
+            let q_name = format!("{prefix}.self_attn.q_proj.weight");
+            let k_name = format!("{prefix}.self_attn.k_proj.weight");
+            let v_name = format!("{prefix}.self_attn.v_proj.weight");
+
+            if let Some(qw) = self.gpu_weights.get_quantized_device(&q_name) {
+                self.q4k_matmul
+                    .gemv_q4k_coop_device(&scratch.normed, qw, &mut scratch.q, q_dim, h)
+                    .expect("q proj q4k");
+            } else {
+                let w = self.gpu_weights.get(&q_name).unwrap();
+                self.matmul
+                    .forward_bt_device(&scratch.normed, w, &mut scratch.q, seq_len, q_dim, h)
+                    .expect("q proj f32");
+            }
+
+            if let Some(kw) = self.gpu_weights.get_quantized_device(&k_name) {
+                self.q4k_matmul
+                    .gemv_q4k_coop_device(&scratch.normed, kw, &mut scratch.k, kv_dim, h)
+                    .expect("k proj q4k");
+            } else {
+                let w = self.gpu_weights.get(&k_name).unwrap();
+                self.matmul
+                    .forward_bt_device(&scratch.normed, w, &mut scratch.k, seq_len, kv_dim, h)
+                    .expect("k proj f32");
+            }
+
+            let v_w_name = format!("{prefix}.self_attn.v_proj.weight");
+            if let Some(vw) = self.gpu_weights.get_quantized_device(&v_w_name) {
+                self.q4k_matmul
+                    .gemv_q4k_coop_device(&scratch.normed, vw, &mut scratch.v, kv_dim, h)
+                    .expect("v proj q4k");
+            } else {
+                let w = self.gpu_weights.get(&v_w_name).unwrap();
+                self.matmul
+                    .forward_bt_device(&scratch.normed, w, &mut scratch.v, seq_len, kv_dim, h)
+                    .expect("v proj f32");
+            }
+
+            if cfg.use_qk_norm {
+                let q_norm_w = self
+                    .gpu_weights
+                    .get(&format!("{prefix}.self_attn.q_norm.weight"))
+                    .unwrap();
+                self.rmsnorm
+                    .forward_device(
+                        &scratch.q,
+                        q_norm_w,
+                        &mut scratch.q_rotated,
+                        head_dim,
+                        cfg.layer_norm_eps,
+                    )
+                    .expect("qk norm q");
+                tempura_kernels::gpu::copy_region_device(
+                    &ctx,
+                    &stream,
+                    &scratch.q_rotated,
+                    &mut scratch.q,
+                    0,
+                    0,
+                    seq_len * q_dim,
+                )
+                .expect("copy q norm");
+
+                let k_norm_w = self
+                    .gpu_weights
+                    .get(&format!("{prefix}.self_attn.k_norm.weight"))
+                    .unwrap();
+                self.rmsnorm
+                    .forward_device(
+                        &scratch.k,
+                        k_norm_w,
+                        &mut scratch.k_rotated,
+                        head_dim,
+                        cfg.layer_norm_eps,
+                    )
+                    .expect("qk norm k");
+                tempura_kernels::gpu::copy_region_device(
+                    &ctx,
+                    &stream,
+                    &scratch.k_rotated,
+                    &mut scratch.k,
+                    0,
+                    0,
+                    seq_len * kv_dim,
+                )
+                .expect("copy k norm");
+            }
+
+            self.rope
+                .forward_device(
+                    &scratch.q,
+                    &mut scratch.q_rotated,
+                    &positions_dev,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    cfg.rope_theta,
+                )
+                .expect("rope q");
+            self.rope
+                .forward_device(
+                    &scratch.k,
+                    &mut scratch.k_rotated,
+                    &positions_dev,
+                    seq_len,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rope_theta,
+                )
+                .expect("rope k");
+
+            let stride = n_kv_heads * head_dim;
+            let dst_offset = gpu_cache.seq_len * stride;
+            let src_len = seq_len * stride;
+            tempura_kernels::gpu::copy_region_device(
+                &ctx,
+                &stream,
+                &scratch.k_rotated,
+                &mut gpu_cache.k[layer],
+                0,
+                dst_offset,
+                src_len,
+            )
+            .expect("kv cache k append");
+            tempura_kernels::gpu::copy_region_device(
+                &ctx,
+                &stream,
+                &scratch.v,
+                &mut gpu_cache.v[layer],
+                0,
+                dst_offset,
+                src_len,
+            )
+            .expect("kv cache v append");
+
+            let kv_len = gpu_cache.seq_len + seq_len;
+            self.attention
+                .forward_device(
+                    &scratch.q_rotated,
+                    &gpu_cache.k[layer],
+                    &gpu_cache.v[layer],
+                    &mut scratch.attn_out,
+                    1,
+                    seq_len,
+                    kv_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    1.0 / (head_dim as f32).sqrt(),
+                )
+                .expect("attention");
+
+            let o_name = format!("{prefix}.self_attn.o_proj.weight");
+            if let Some(ow) = self.gpu_weights.get_quantized_device(&o_name) {
+                self.q4k_matmul
+                    .gemv_q4k_coop_device(&scratch.attn_out, ow, &mut scratch.o_proj, h, q_dim)
+                    .expect("o proj q4k");
+            } else {
+                let w = self.gpu_weights.get(&o_name).unwrap();
+                self.matmul
+                    .forward_bt_device(&scratch.attn_out, w, &mut scratch.o_proj, seq_len, h, q_dim)
+                    .expect("o proj f32");
+            }
+
+            tempura_kernels::gpu::vector_add_device(
+                &ctx,
+                &stream,
+                &scratch.hidden,
+                &scratch.o_proj,
+                &mut scratch.hidden_swap,
+            )
+            .expect("residual add");
+            std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_swap);
+
+            let post_ln_w = self
+                .gpu_weights
+                .get(&format!("{prefix}.post_attention_layernorm.weight"))
+                .unwrap();
+            self.rmsnorm
+                .forward_device(
+                    &scratch.hidden,
+                    post_ln_w,
+                    &mut scratch.normed2,
+                    h,
+                    cfg.layer_norm_eps,
+                )
+                .expect("rmsnorm2");
+
+            let gate_name = format!("{prefix}.mlp.gate_proj.weight");
+            let up_name = format!("{prefix}.mlp.up_proj.weight");
+            let down_name = format!("{prefix}.mlp.down_proj.weight");
+
+            if let Some(gw) = self.gpu_weights.get_quantized_device(&gate_name) {
+                self.q4k_matmul
+                    .gemv_q4k_coop_device(&scratch.normed2, gw, &mut scratch.gate, inter, h)
+                    .expect("gate proj q4k");
+            } else {
+                let w = self.gpu_weights.get(&gate_name).unwrap();
+                self.matmul
+                    .forward_bt_device(&scratch.normed2, w, &mut scratch.gate, seq_len, inter, h)
+                    .expect("gate proj f32");
+            }
+
+            if let Some(uw) = self.gpu_weights.get_quantized_device(&up_name) {
+                self.q4k_matmul
+                    .gemv_q4k_coop_device(&scratch.normed2, uw, &mut scratch.up, inter, h)
+                    .expect("up proj q4k");
+            } else {
+                let w = self.gpu_weights.get(&up_name).unwrap();
+                self.matmul
+                    .forward_bt_device(&scratch.normed2, w, &mut scratch.up, seq_len, inter, h)
+                    .expect("up proj f32");
+            }
+
+            tempura_kernels::gpu::silu_mul_device(
+                &ctx,
+                &stream,
+                &scratch.gate,
+                &scratch.up,
+                &mut scratch.silu_out,
+            )
+            .expect("silu_mul");
+
+            if let Some(dw) = self.gpu_weights.get_quantized_device(&down_name) {
+                self.q4k_matmul
+                    .gemv_q4k_coop_device(&scratch.silu_out, dw, &mut scratch.down, h, inter)
+                    .expect("down proj q4k");
+            } else {
+                let w = self.gpu_weights.get(&down_name).unwrap();
+                self.matmul
+                    .forward_bt_device(&scratch.silu_out, w, &mut scratch.down, seq_len, h, inter)
+                    .expect("down proj f32");
+            }
+
+            tempura_kernels::gpu::vector_add_device(
+                &ctx,
+                &stream,
+                &scratch.hidden,
+                &scratch.down,
+                &mut scratch.hidden_swap,
+            )
+            .expect("ffn residual add");
+            std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_swap);
+        }
+
+        gpu_cache.advance(seq_len);
+
+        let final_norm_w = self.gpu_weights.get("model.norm.weight").unwrap();
+        self.rmsnorm
+            .forward_device(
+                &scratch.hidden,
+                final_norm_w,
+                &mut scratch.final_normed,
+                h,
+                cfg.layer_norm_eps,
+            )
+            .expect("final norm");
+
+        let lm_head_name = "lm_head.weight";
+        if let Some(lw) = self.gpu_weights.get_quantized_device(lm_head_name) {
+            self.q4k_matmul
+                .gemv_q4k_coop_device(
+                    &scratch.final_normed,
+                    lw,
+                    &mut scratch.logits,
+                    cfg.vocab_size,
+                    h,
+                )
+                .expect("lm head q4k");
+        } else {
+            let w = self.gpu_weights.get(lm_head_name).unwrap();
+            self.matmul
+                .forward_bt_device(
+                    &scratch.final_normed,
+                    w,
+                    &mut scratch.logits,
+                    seq_len,
+                    cfg.vocab_size,
+                    h,
+                )
+                .expect("lm head f32");
+        }
+
+        let all_logits = scratch.logits.to_host_vec(&stream).expect("logits to host");
+        let last_start = (seq_len - 1) * cfg.vocab_size;
+        all_logits[last_start..last_start + cfg.vocab_size].to_vec()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl InferenceModel for GpuQuantizedInferenceWrapper {
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+    fn has_weights(&self) -> bool {
+        true
+    }
+    fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
+        let logits = self.forward_gpu_quantized(token_ids, session.position);
+        session.position += token_ids.len();
+        session.cache.advance(token_ids.len());
+        logits
+    }
+    fn generate(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+    ) -> Vec<u32> {
+        let total_start = Instant::now();
+        let prompt_start = Instant::now();
+        let logits = self.forward(session, token_ids);
+        let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.prompt_tokens = token_ids.len();
+        let gen_start = Instant::now();
+
+        let mut probs = vec![0.0f32; logits.len()];
+        self.sampler.apply(&logits, &mut probs, params).unwrap();
+
+        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+            None
+        } else {
+            Some(&mut session.rng)
+        };
+        let first_token = self.sampler.sample_token(&probs, rng_ref);
+        let mut generated = vec![first_token];
+
+        for _step in 1..max_new_tokens {
+            if eos_token == Some(*generated.last().unwrap()) {
+                break;
+            }
+            let mut logits = self.forward(session, &[*generated.last().unwrap()]);
+            params.apply_penalties(&mut logits, &generated);
+            let mut probs = vec![0.0f32; logits.len()];
+            self.sampler.apply(&logits, &mut probs, params).unwrap();
+            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                None
+            } else {
+                Some(&mut session.rng)
+            };
+            let token = self.sampler.sample_token(&probs, rng_ref);
+            generated.push(token);
+        }
+
+        let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.generated_tokens = generated.len();
+        session.trace.timing = Some(TimingInfo {
+            total_ms,
+            prompt_ms,
+            generation_ms,
+            tokens_per_second: if generation_ms > 0.0 {
+                generated.len() as f64 / (generation_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+        generated
+    }
+    fn generate_with_logprobs(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        top_n: usize,
+    ) -> (Vec<u32>, Vec<TokenLogprob>) {
+        let logits = self.forward(session, token_ids);
+        let mut probs = vec![0.0f32; logits.len()];
+        self.sampler.apply(&logits, &mut probs, params).unwrap();
+        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+            None
+        } else {
+            Some(&mut session.rng)
+        };
+        let first_token = self.sampler.sample_token(&probs, rng_ref);
+        let mut generated = vec![first_token];
+        let mut logprobs = vec![extract_logprob(&probs, first_token, top_n)];
+
+        for _step in 1..max_new_tokens {
+            if eos_token == Some(*generated.last().unwrap()) {
+                break;
+            }
+            let mut logits = self.forward(session, &[*generated.last().unwrap()]);
+            params.apply_penalties(&mut logits, &generated);
+            let mut probs = vec![0.0f32; logits.len()];
+            self.sampler.apply(&logits, &mut probs, params).unwrap();
+            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                None
+            } else {
+                Some(&mut session.rng)
+            };
+            let token = self.sampler.sample_token(&probs, rng_ref);
+            logprobs.push(extract_logprob(&probs, token, top_n));
+            generated.push(token);
+        }
+        (generated, logprobs)
+    }
+    fn generate_with_callback(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Vec<u32> {
+        let logits = self.forward(session, token_ids);
+        let mut probs = vec![0.0f32; logits.len()];
+        self.sampler.apply(&logits, &mut probs, params).unwrap();
+        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+            None
+        } else {
+            Some(&mut session.rng)
+        };
+        let first_token = self.sampler.sample_token(&probs, rng_ref);
+        let mut generated = vec![first_token];
+        if !on_token(first_token) {
+            return generated;
+        }
+        for _step in 1..max_new_tokens {
+            if eos_token == Some(*generated.last().unwrap()) {
+                break;
+            }
+            let mut logits = self.forward(session, &[*generated.last().unwrap()]);
+            params.apply_penalties(&mut logits, &generated);
+            let mut probs = vec![0.0f32; logits.len()];
+            self.sampler.apply(&logits, &mut probs, params).unwrap();
+            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                None
+            } else {
+                Some(&mut session.rng)
+            };
+            let token = self.sampler.sample_token(&probs, rng_ref);
+            generated.push(token);
+            if !on_token(token) {
+                break;
+            }
+        }
+        generated
+    }
+    fn generate_guided(
+        &self,
+        _session: &mut InferenceSession,
+        _token_ids: &[u32],
+        _max_new_tokens: usize,
+        _params: &SamplingParams,
+        _eos_token: Option<u32>,
+        _decoder: &mut dyn tempura_kernels::GuidedDecoder,
+    ) -> Vec<u32> {
+        todo!("guided decoding not yet supported on GPU quantized path")
+    }
+    fn load_weights(
+        &mut self,
+        _loader: &dyn crate::loader::WeightLoader,
+    ) -> Result<(), crate::weights::WeightsError> {
+        Ok(())
+    }
+}
+
 impl<A, N, R, M, S> InferenceModel for TransformerModel<A, N, R, M, S>
 where
     A: Attention,

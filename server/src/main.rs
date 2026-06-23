@@ -304,11 +304,70 @@ async fn run_server(args: ServeArgs) {
 
         let qweights = gguf.to_quantized_weights();
         drop(gguf);
-        let pipeline = KernelPipeline::cpu_verified();
-        let mut model = TransformerModel::new(config.clone(), pipeline);
-        model.quantized_weights = Some(qweights);
-        tracing::info!("Using quantized weights");
-        let model: Arc<dyn tempura_engine::InferenceModel> = Arc::new(model);
+
+        #[allow(unused_mut)]
+        let mut model: Arc<dyn tempura_engine::InferenceModel> = {
+            #[cfg(feature = "cuda")]
+            if use_cuda {
+                let attention = tempura_kernels::attention::CudaAttention::new().unwrap();
+                let rmsnorm = tempura_kernels::rmsnorm::CudaRMSNorm::new().unwrap();
+                let rope = tempura_kernels::rope::CudaRoPE::new().unwrap();
+                let matmul = tempura_kernels::matmul::CudaMatMul::new().unwrap();
+                let q4k_matmul = tempura_kernels::quantized::CudaMatMulQ4K::new().unwrap();
+
+                let ctx = q4k_matmul.gpu().context().clone();
+                let gpu_weights =
+                    tempura_engine::GpuWeights::upload_from_quantized(&qweights, &ctx)
+                        .expect("GPU quantized weight upload failed");
+
+                ctx.bind_to_thread().unwrap();
+                let stream_ref = ctx.default_stream();
+                let gpu_cache = tempura_engine::GpuKvCache::new(&config, &stream_ref)
+                    .expect("GPU KV cache allocation failed");
+                let scratchpad = tempura_engine::GpuScratchpad::new(&config, &stream_ref)
+                    .expect("GPU scratchpad allocation failed");
+
+                let embed = qweights
+                    .get_f32("model.embed_tokens.weight")
+                    .unwrap()
+                    .to_vec();
+                tracing::info!(
+                    "Uploaded quantized weights to GPU ({} Q4K + {} Q6K + {} f32 tensors)",
+                    gpu_weights.quantized_count(),
+                    0, // Q6K counted in quantized_count
+                    gpu_weights.f32_count(),
+                );
+
+                Arc::new(tempura_engine::GpuQuantizedInferenceWrapper {
+                    config: config.clone(),
+                    attention,
+                    rmsnorm,
+                    rope,
+                    matmul,
+                    q4k_matmul,
+                    sampler: tempura_kernels::sampling::CpuSampler,
+                    gpu_weights,
+                    gpu_cache: std::sync::Mutex::new(gpu_cache),
+                    scratchpad: std::sync::Mutex::new(scratchpad),
+                    embed_host: embed,
+                })
+            } else {
+                let pipeline = KernelPipeline::cpu_verified();
+                let mut model = TransformerModel::new(config.clone(), pipeline);
+                model.quantized_weights = Some(qweights);
+                tracing::info!("Using CPU quantized weights");
+                Arc::new(model)
+            }
+
+            #[cfg(not(feature = "cuda"))]
+            {
+                let pipeline = KernelPipeline::cpu_verified();
+                let mut model = TransformerModel::new(config.clone(), pipeline);
+                model.quantized_weights = Some(qweights);
+                tracing::info!("Using CPU quantized weights");
+                Arc::new(model)
+            }
+        };
 
         let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
         let metrics_handle = prometheus_builder.install_recorder().unwrap();
