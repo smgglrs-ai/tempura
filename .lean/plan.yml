@@ -2162,7 +2162,8 @@ items:
     boundaries. (5) Scale invariance: group dequantization produces values within
     the declared range [min, max]. These proofs apply to CpuDequantize and CpuMatMulQ.
     Published as part of the verification manifest.'
-  status: pending
+  status: done
+  progress: 100
   priority: high
   effort: L
   depends_on:

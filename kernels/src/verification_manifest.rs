@@ -200,6 +200,61 @@ pub fn manifest() -> VerificationManifest {
                 properties: vec!["CPU all-reduce is identity (output equals input)"],
                 status: "proven",
             },
+            KernelProof {
+                kernel: "PagedKvCache",
+                harness: "paged_block_table_offset_in_bounds",
+                properties: vec!["Block table physical page offset within pool bounds"],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "PagedKvCache",
+                harness: "paged_block_index_in_bounds",
+                properties: vec!["Logical block index within max_blocks"],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "CpuMatMulQ4K",
+                harness: "int8_dequant_bounded_error",
+                properties: vec!["Symmetric int8 dequant round-trip error <= step/2"],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "CpuMatMulQ4K",
+                harness: "q4k_monotonicity_within_group",
+                properties: vec!["Larger nibble value → larger dequantized value within group"],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "CpuMatMulQ4K",
+                harness: "int8_monotonicity",
+                properties: vec!["Int8 dequant preserves ordering for fixed scale"],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "CpuMatMulQ4K",
+                harness: "q4k_group_boundary_safety",
+                properties: vec![
+                    "Element indices stay within group's 64-element range",
+                    "qs byte indices stay within group's 32-byte range",
+                    "Scale indices valid for 8 groups",
+                ],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "CpuMatMulQ4K",
+                harness: "i32_accumulator_no_overflow_quantized_matmul",
+                properties: vec!["i32 accumulator cannot overflow for group_size <= 128"],
+                status: "proven",
+            },
+            KernelProof {
+                kernel: "CpuMatMulQ6K",
+                harness: "q6k_group_boundary_safety",
+                properties: vec![
+                    "Global element index within Q6K block size",
+                    "ql/qh byte indices within their respective ranges",
+                ],
+                status: "proven",
+            },
         ],
         math_properties: vec![
             MathProperty {

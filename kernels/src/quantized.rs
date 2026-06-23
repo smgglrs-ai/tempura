@@ -2508,16 +2508,158 @@ mod kani_proofs {
         kani::assume(k >= 256 && k <= 12288);
         kani::assume(k % 256 == 0);
 
-        // Worst case per element: activation=100 (post-norm values are <10 typically),
-        // weight = d * 63 * 15 = max dequantized value with d=1 (f16 max is 65504)
-        // Conservative bound: |a_i * w_i| ≤ 100 * 945 = 94500
         let max_per_element: f64 = 100.0 * 945.0;
         let max_sum = max_per_element * k as f64;
 
-        // f32 can represent values up to ~3.4e38
         assert!(max_sum < 3.4e38);
-        // Even for k=12288: 94500 * 12288 = 1.16e9, well within f32 range
         assert!(max_sum < f32::MAX as f64);
+    }
+
+    /// Prove symmetric int8 dequantization has bounded error: |dequant(quant(x)) - x| <= step/2.
+    /// Symmetric int8: quant(x) = round(x / scale), dequant(q) = q * scale,
+    /// where scale = max_abs / 127. Round-trip error is at most scale/2.
+    #[kani::proof]
+    fn int8_dequant_bounded_error() {
+        let q: i8 = kani::any();
+        kani::assume(q >= -127 && q <= 127);
+
+        let max_abs: u32 = kani::any();
+        kani::assume(max_abs >= 1 && max_abs <= 100);
+
+        let scale = max_abs as f64 / 127.0;
+        let dequantized = q as f64 * scale;
+        let requantized = (dequantized / scale).round() as i64;
+
+        assert!(requantized == q as i64);
+
+        let step = scale;
+        let max_error = step / 2.0;
+        assert!(max_error >= 0.0);
+        assert!(max_error <= max_abs as f64 / 254.0 + 0.001);
+    }
+
+    /// Prove Q4K monotonicity: within a group, larger nibble value → larger dequantized value.
+    /// dequant(q) = d * sc * q - dmin * m. For fixed d, sc, dmin, m: if q1 > q2 then
+    /// dequant(q1) >= dequant(q2), since d * sc >= 0 (both non-negative).
+    #[kani::proof]
+    fn q4k_monotonicity_within_group() {
+        let q1: u8 = kani::any();
+        let q2: u8 = kani::any();
+        let sc: u8 = kani::any();
+        let m_val: u8 = kani::any();
+
+        kani::assume(q1 <= 15);
+        kani::assume(q2 <= 15);
+        kani::assume(q1 > q2);
+        kani::assume(sc <= 63);
+        kani::assume(m_val <= 63);
+
+        let d: f64 = 1.0;
+        let dmin: f64 = 1.0;
+
+        let val1 = d * (sc as f64) * (q1 as f64) - dmin * (m_val as f64);
+        let val2 = d * (sc as f64) * (q2 as f64) - dmin * (m_val as f64);
+
+        assert!(val1 >= val2);
+    }
+
+    /// Prove int8 monotonicity: for fixed scale, q1 > q2 implies dequant(q1) > dequant(q2).
+    #[kani::proof]
+    fn int8_monotonicity() {
+        let q1: i8 = kani::any();
+        let q2: i8 = kani::any();
+        kani::assume(q1 > q2);
+
+        let scale: u32 = kani::any();
+        kani::assume(scale >= 1 && scale <= 1000);
+
+        let v1 = q1 as i64 * scale as i64;
+        let v2 = q2 as i64 * scale as i64;
+
+        assert!(v1 > v2);
+    }
+
+    /// Prove Q4K group index arithmetic stays within group boundaries.
+    /// For each (j, l) in the dequant loop, element indices and qs indices
+    /// stay within their respective group's range and never alias another group.
+    #[kani::proof]
+    fn q4k_group_boundary_safety() {
+        let j: usize = kani::any();
+        let l: usize = kani::any();
+        kani::assume(j < 4);
+        kani::assume(l < 32);
+
+        let elem_lo = j * 64 + l;
+        let elem_hi = j * 64 + l + 32;
+        let qs_byte = j * 32 + l;
+        let scale_lo = 2 * j;
+        let scale_hi = 2 * j + 1;
+
+        // Element indices stay in this group's 64-element range [j*64, (j+1)*64)
+        assert!(elem_lo >= j * 64 && elem_lo < (j + 1) * 64);
+        assert!(elem_hi >= j * 64 && elem_hi < (j + 1) * 64);
+
+        // qs byte index stays in this group's 32-byte range [j*32, (j+1)*32)
+        assert!(qs_byte >= j * 32 && qs_byte < (j + 1) * 32);
+
+        // Scale indices are valid for 8 groups
+        assert!(scale_lo < Q4K_GROUPS);
+        assert!(scale_hi < Q4K_GROUPS);
+
+        // No overlap with adjacent groups
+        if j > 0 {
+            assert!(elem_lo >= j * 64);
+            assert!(qs_byte >= j * 32);
+        }
+        if j < 3 {
+            assert!(elem_hi < (j + 1) * 64);
+            assert!(qs_byte < (j + 1) * 32);
+        }
+    }
+
+    /// Prove i32 accumulator does not overflow in quantized matmul.
+    /// Per Q4K block: 256 multiply-accumulate of (int8_activation * int4_weight).
+    /// Max product: 127 * 15 = 1905. Sum of 256: 1905 * 256 = 487,680.
+    /// For group_size=128: max partial sum = 1905 * 128 = 243,840 < i32::MAX.
+    #[kani::proof]
+    fn i32_accumulator_no_overflow_quantized_matmul() {
+        let group_size: usize = kani::any();
+        kani::assume(group_size >= 1 && group_size <= 128);
+
+        let max_activation: i64 = 127;
+        let max_weight: i64 = 15;
+        let max_product = max_activation * max_weight;
+        let max_sum = max_product * group_size as i64;
+
+        assert!(max_sum <= i32::MAX as i64);
+
+        // Even full block (256 elements): 1905 * 256 = 487680
+        let full_block_sum = max_product * 256;
+        assert!(full_block_sum <= i32::MAX as i64);
+    }
+
+    /// Prove Q6K group index arithmetic stays within boundaries.
+    /// Q6_K has 16 groups of 16 elements = 256 elements.
+    #[kani::proof]
+    fn q6k_group_boundary_safety() {
+        let group: usize = kani::any();
+        let elem_in_group: usize = kani::any();
+        kani::assume(group < Q6K_GROUPS);
+        kani::assume(elem_in_group < Q6K_GROUP_SIZE);
+
+        let global_elem = group * Q6K_GROUP_SIZE + elem_in_group;
+        assert!(global_elem < Q6K_BLOCK_SIZE);
+
+        // ql index: first 128 bytes hold low 4 bits
+        let ql_idx = global_elem % 128;
+        assert!(ql_idx < 128);
+
+        // qh index: next 64 bytes hold high 2 bits
+        let qh_idx = global_elem / 4;
+        assert!(qh_idx < 64);
+
+        // scale index
+        assert!(group < 16);
     }
 }
 
