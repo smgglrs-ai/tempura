@@ -1157,3 +1157,10 @@
   summary: "Implemented Fp8PagedKvCache with E4M3 FP8 encoding (1 byte/element vs 4 bytes f32, 4x memory reduction). FP8 encode/decode functions handle the full E4M3 format (4-bit exponent, 3-bit mantissa, bias 7, max 448, NaN). 5 new tests: round-trip accuracy, basic KV, multi-token, reset, memory savings. 280 tests passing, benchmark stable."
   iteration: 12
   max_iterations: 20
+- timestamp: "2026-06-23T15:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p17-npu-scaffold"
+  summary: "Created NPU backend scaffold: kernels/src/npu/ with Intel (OpenVINO) and Qualcomm (QNN) stubs implementing FusedTransformerLayer, CompiledPrefill, CompiledDecodeStep traits with todo!() bodies. Feature flags npu-intel, npu-qualcomm added to kernels Cargo.toml. Both compile with cargo check --features npu-*. 280 tests passing."
+  iteration: 13
+  max_iterations: 20

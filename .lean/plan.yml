@@ -2297,7 +2297,8 @@ items:
     traits with todo!() bodies, proving the feature-gated module structure compiles.
     Actual NPU implementations require vendor SDKs and hardware — this item sets up
     the scaffolding.'
-  status: pending
+  status: done
+  progress: 100
   priority: low
   effort: M
   depends_on:

@@ -12,6 +12,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 default = ["cpu"]
 cpu = []
 cuda = ["dep:cuda-device", "dep:cuda-host", "dep:cuda-core"]
+npu-intel = []
+npu-qualcomm = []
 
 [dependencies]
 tempura-kernel-api = { path = "../kernel-api" }

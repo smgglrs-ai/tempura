@@ -12,6 +12,8 @@ pub mod fused;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 pub mod guided;
+#[cfg(any(feature = "npu-intel", feature = "npu-qualcomm"))]
+pub mod npu;
 pub mod layernorm;
 pub mod matmul;
 pub mod quantized;
