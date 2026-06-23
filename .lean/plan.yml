@@ -2374,6 +2374,8 @@ items:
   - docs/content/docs/foundations/positional-encoding.md
   - docs/content/docs/foundations/sampling.md
   - docs/content/docs/foundations/quantization.md
+  status: done
+  progress: 100
   acceptance:
   - 5 foundation pages with KaTeX equations rendering correctly
   - Each page links to the corresponding kernel source file

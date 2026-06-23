@@ -1108,3 +1108,10 @@
   summary: "Created CompositionVerifier in kernel-verify crate. Validates dimensional compatibility across kernel boundaries for transformer layer computation graphs. Supports LLaMA-7B, GQA, and tiny_test configs. 8 new tests. Composition proof recorded in VerificationManifest. Benchmark stable."
   iteration: 5
   max_iterations: 20
+- timestamp: "2026-06-23T12:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p18-foundations-math"
+  summary: "Created 5 foundation math pages (attention, normalization, positional encoding, sampling, quantization) with KaTeX equations, worked examples, source links to kernels/src/, cross-references, and Kani proof links. Docs build succeeds (32 pages, 9 sections). Benchmark stable."
+  iteration: 6
+  max_iterations: 20
