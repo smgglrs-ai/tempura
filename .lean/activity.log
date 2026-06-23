@@ -1202,3 +1202,10 @@
   summary: "Added EdgeMetrics struct (joules_per_token, memory_peak_bytes, tokens_per_watt, clock_mhz_min) to InferenceTrace. RAPL energy reading from /sys/class/powercap, RSS from /proc/self/statm. edge-metrics feature flag in engine Cargo.toml. Graceful degradation: None when RAPL unavailable."
   iteration: 15
   max_iterations: 20
+- timestamp: "2026-06-23T17:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p22-multi-lora"
+  summary: "Created LoRA adapter system: LoraAdapter with low-rank A/B matrices, apply_to_output for additive weight deltas, scaling (alpha/rank). LoraRegistry with register/get/remove/list for hot-loading. 5 tests covering apply, no-op, registry, hot reload. 285 tests passing."
+  iteration: 16
+  max_iterations: 20

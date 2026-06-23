@@ -2655,12 +2655,13 @@ items:
 
 - id: p22-multi-lora
   title: Multi-LoRA serving
+  status: done
+  progress: 100
   description: 'Serve multiple LoRA adapters from a single base model. Each
     request specifies a LoRA adapter ID. The forward pass applies the adapter
     weights (low-rank A and B matrices) on top of the base model weights.
     Adapters are loaded/unloaded dynamically. Multiple requests with different
     adapters can be batched together.'
-  status: pending
   priority: medium
   effort: L
   scope:
