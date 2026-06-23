@@ -1122,3 +1122,10 @@
   summary: "Created graph-level kernel traits in kernel-api/src/graph.rs: FusedTransformerLayer, CompiledPrefill, CompiledDecodeStep, LayerInput/Output, FusedBlockTrace. Enables NPU backends to implement entire layer blocks. 2 new tests. 273 tests passing. Benchmark stable."
   iteration: 7
   max_iterations: 20
+- timestamp: "2026-06-23T13:00:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p14-trace-cli"
+  summary: "Created tempura-trace TUI binary (ratatui). Commands: view (scrollable layer/sampling tables with filter), diff (structured TraceDiff JSON output), export (JSON/CSV), info (metadata summary). Supports .tempura-trace binary and .json formats. Falls back to text output when not in terminal."
+  iteration: 8
+  max_iterations: 20

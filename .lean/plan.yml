@@ -2097,7 +2097,8 @@ items:
     threshold, (5) export filtered views to JSON/CSV. CLI: tempura-trace view <file>,
     tempura-trace diff <file_a> <file_b> --threshold 1e-4. Can also connect to a
     running server: tempura-trace watch --server localhost:8080.'
-  status: pending
+  status: done
+  progress: 100
   priority: medium
   effort: L
   depends_on:

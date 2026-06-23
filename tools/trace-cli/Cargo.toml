@@ -1,0 +1,18 @@
+[package]
+name = "tempura-trace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TUI viewer for tempura inference traces — the Wireshark of inference"
+
+[[bin]]
+name = "tempura-trace"
+path = "src/main.rs"
+
+[dependencies]
+tempura-engine = { path = "../../engine" }
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+serde_json = "1"
+anyhow = "1"
