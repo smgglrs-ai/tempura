@@ -9,6 +9,7 @@ pub mod gpu_scratchpad;
 pub mod kv_cache;
 pub mod loader;
 pub mod lora;
+pub mod multi_token;
 pub mod model;
 pub mod pipeline;
 pub mod schema;

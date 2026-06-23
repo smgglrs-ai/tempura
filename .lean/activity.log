@@ -1209,3 +1209,10 @@
   summary: "Created LoRA adapter system: LoraAdapter with low-rank A/B matrices, apply_to_output for additive weight deltas, scaling (alpha/rank). LoraRegistry with register/get/remove/list for hot-loading. 5 tests covering apply, no-op, registry, hot reload. 285 tests passing."
   iteration: 16
   max_iterations: 20
+- timestamp: "2026-06-23T17:15:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "p23-multi-token"
+  summary: "Created multi-token prediction (Medusa-style): MedusaHead for draft token prediction, MultiTokenPredictor with configurable draft heads, verify_and_accept for greedy verification against target logits. MultiTokenTrace for observability. 6 new tests. 289 tests passing."
+  iteration: 17
+  max_iterations: 20

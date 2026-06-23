@@ -2749,11 +2749,13 @@ items:
 
 - id: p23-multi-token
   title: Multi-token prediction (Medusa/Eagle)
+  status: done
+  progress: 100
   description: 'Predict multiple tokens per forward pass using lightweight
     draft heads. Verify all draft tokens against the main model in a single
     forward pass. Accept matching tokens, reject and resample from the first
     mismatch. 2-3x throughput with no quality loss.'
-  status: pending
+
   priority: medium
   effort: L
   scope:
