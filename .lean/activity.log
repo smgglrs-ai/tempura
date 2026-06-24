@@ -1253,3 +1253,10 @@
     tag: "loop-run/2026-06-23-18"
     tests: 296
     benchmark_stable: true
+- timestamp: "2026-06-24T08:30:00Z"
+  actor: claude
+  action: loop-iteration
+  item: "gpu-e2e-forward-pass"
+  summary: "Fixed three server startup issues: (1) flash attention shared memory 96KB→48KB by reducing BR/BC 64→32, (2) shared CUDA context via with_context() constructors to avoid 5 separate contexts, (3) --max-seq-len CLI override for GGUF models. Server starts and loads Qwen3-8B Q4K to GPU (217 quantized + 182 f32 tensors). Inference request reaches forward pass but produces NaN logits — GPU kernel pipeline needs layer-by-layer numerical validation."
+  iteration: 19
+  max_iterations: 20
