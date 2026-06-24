@@ -91,6 +91,16 @@ pub fn alloc_device_u32(stream: &CudaStream, len: usize) -> Result<DeviceBuffer<
     DeviceBuffer::zeroed(stream, len).map_err(|e| KernelError::InvalidConfig(e.to_string()))
 }
 
+fn cached_elementwise_module(
+    ctx: &Arc<CudaContext>,
+) -> &'static elementwise_kernel::kernels::LoadedModule {
+    use std::sync::OnceLock;
+    static MODULE: OnceLock<elementwise_kernel::kernels::LoadedModule> = OnceLock::new();
+    MODULE.get_or_init(|| {
+        elementwise_kernel::kernels::load(ctx).expect("elementwise kernel module load")
+    })
+}
+
 pub fn vector_add_device(
     ctx: &Arc<CudaContext>,
     stream: &CudaStream,
@@ -100,8 +110,7 @@ pub fn vector_add_device(
 ) -> Result<(), KernelError> {
     use cuda_core::LaunchConfig;
     bind_context(ctx)?;
-    let module = elementwise_kernel::kernels::load(ctx)
-        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+    let module = cached_elementwise_module(ctx);
     module
         .vector_add(
             stream,
@@ -123,8 +132,7 @@ pub fn silu_mul_device(
 ) -> Result<(), KernelError> {
     use cuda_core::LaunchConfig;
     bind_context(ctx)?;
-    let module = elementwise_kernel::kernels::load(ctx)
-        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+    let module = cached_elementwise_module(ctx);
     module
         .silu_mul(
             stream,
@@ -149,8 +157,7 @@ pub fn slice_columns_device(
 ) -> Result<(), KernelError> {
     use cuda_core::LaunchConfig;
     bind_context(ctx)?;
-    let module = elementwise_kernel::kernels::load(ctx)
-        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+    let module = cached_elementwise_module(ctx);
     let total_elems = rows * slice_cols;
     module
         .slice_columns(
