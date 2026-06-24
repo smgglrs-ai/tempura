@@ -67,6 +67,13 @@ impl CudaRoPE {
             .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
         Ok(Self { gpu, module })
     }
+
+    pub fn with_context(ctx: std::sync::Arc<cuda_core::CudaContext>) -> Result<Self> {
+        let gpu = crate::gpu::GpuContext::from_context(ctx);
+        let module = crate::gpu::rope_kernel::kernels::load(gpu.context())
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Self { gpu, module })
+    }
 }
 
 #[cfg(feature = "cuda")]

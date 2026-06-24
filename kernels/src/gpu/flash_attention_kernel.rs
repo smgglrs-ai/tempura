@@ -1,12 +1,12 @@
 use cuda_device::{kernel, ptx_asm, thread, warp, DisjointSlice, SharedArray};
 use cuda_host::cuda_module;
 
-const BR: usize = 64;
-const BC: usize = 64;
+const BR: usize = 32;
+const BC: usize = 32;
 const HD: usize = 128;
 const MMA_K: usize = 16;
 
-const SMEM_QKV: usize = BR * HD; // 8192 floats per tile
+const SMEM_QKV: usize = BR * HD; // 4096 floats per tile (16KB), 3 tiles = 48KB
 
 #[inline(always)]
 fn pack_f16x2(lo: f32, hi: f32) -> u32 {

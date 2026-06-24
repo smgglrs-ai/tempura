@@ -156,6 +156,18 @@ impl CudaMatMul {
         })
     }
 
+    pub fn with_context(ctx: std::sync::Arc<cuda_core::CudaContext>) -> Result<Self> {
+        let gpu = crate::gpu::GpuContext::from_context(ctx);
+        let module = crate::gpu::matmul_kernel::kernels::load(gpu.context())
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        let mma_module = crate::gpu::matmul_mma_kernel::kernels::load(gpu.context()).ok();
+        Ok(Self {
+            gpu,
+            module,
+            mma_module,
+        })
+    }
+
     pub fn gpu(&self) -> &crate::gpu::GpuContext {
         &self.gpu
     }

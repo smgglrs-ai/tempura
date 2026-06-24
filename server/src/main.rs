@@ -282,7 +282,7 @@ async fn run_server(args: ServeArgs) {
     let (config, model_id) = if is_gguf {
         let model_p = model_path.unwrap();
         let gguf = tempura_engine::gguf_loader::GgufLoader::from_file_quantized(model_p).unwrap();
-        let config = gguf.config.clone();
+        let mut config = gguf.config.clone();
         tracing::info!("Loaded GGUF model from {}", model_p.display());
 
         let tokenizer = if let Some(path) = args.tokenizer.as_ref() {
@@ -304,28 +304,40 @@ async fn run_server(args: ServeArgs) {
 
         let qweights = gguf.to_quantized_weights();
         drop(gguf);
+        config.max_seq_len = config.max_seq_len.min(args.max_seq_len);
+        tracing::info!("Using max_seq_len={}", config.max_seq_len);
 
         #[allow(unused_mut)]
         let mut model: Arc<dyn tempura_engine::InferenceModel> = {
             #[cfg(feature = "cuda")]
             if use_cuda {
-                let attention = tempura_kernels::attention::CudaAttention::new().unwrap();
-                let rmsnorm = tempura_kernels::rmsnorm::CudaRMSNorm::new().unwrap();
-                let rope = tempura_kernels::rope::CudaRoPE::new().unwrap();
-                let matmul = tempura_kernels::matmul::CudaMatMul::new().unwrap();
                 let q4k_matmul = tempura_kernels::quantized::CudaMatMulQ4K::new().unwrap();
-
                 let ctx = q4k_matmul.gpu().context().clone();
+                ctx.bind_to_thread().unwrap();
+
+                let attention =
+                    tempura_kernels::attention::CudaAttention::with_context(ctx.clone()).unwrap();
+                let rmsnorm =
+                    tempura_kernels::rmsnorm::CudaRMSNorm::with_context(ctx.clone()).unwrap();
+                let rope =
+                    tempura_kernels::rope::CudaRoPE::with_context(ctx.clone()).unwrap();
+                let matmul =
+                    tempura_kernels::matmul::CudaMatMul::with_context(ctx.clone()).unwrap();
+                eprintln!("[gpu] uploading quantized weights...");
                 let gpu_weights =
                     tempura_engine::GpuWeights::upload_from_quantized(&qweights, &ctx)
                         .expect("GPU quantized weight upload failed");
+                eprintln!("[gpu] weights uploaded: {} q + {} f32", gpu_weights.quantized_count(), gpu_weights.f32_count());
 
                 ctx.bind_to_thread().unwrap();
                 let stream_ref = ctx.default_stream();
+                eprintln!("[gpu] allocating KV cache (max_seq_len={})...", config.max_seq_len);
                 let gpu_cache = tempura_engine::GpuKvCache::new(&config, &stream_ref)
                     .expect("GPU KV cache allocation failed");
+                eprintln!("[gpu] KV cache allocated, allocating scratchpad...");
                 let scratchpad = tempura_engine::GpuScratchpad::new(&config, &stream_ref)
                     .expect("GPU scratchpad allocation failed");
+                eprintln!("[gpu] scratchpad allocated");
 
                 let embed = qweights
                     .get_f32("model.embed_tokens.weight")

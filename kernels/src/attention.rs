@@ -188,6 +188,24 @@ impl CudaAttention {
             decode_module,
         })
     }
+
+    pub fn with_context(ctx: std::sync::Arc<cuda_core::CudaContext>) -> Result<Self> {
+        let gpu = crate::gpu::GpuContext::from_context(ctx);
+        let module = crate::gpu::attention_kernel::kernels::load(gpu.context())
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        let flash_module = crate::gpu::flash_attention_kernel::kernels::load(gpu.context())
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))
+            .ok();
+        let decode_module = crate::gpu::flash_decode_kernel::kernels::load(gpu.context())
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))
+            .ok();
+        Ok(Self {
+            gpu,
+            module,
+            flash_module,
+            decode_module,
+        })
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -269,10 +287,10 @@ impl CudaAttention {
                 let config = LaunchConfig {
                     grid_dim: (
                         num_heads as u32,
-                        (seq_len as u32).div_ceil(64),
+                        (seq_len as u32).div_ceil(32),
                         batch as u32,
                     ),
-                    block_dim: (128, 1, 1),
+                    block_dim: (64, 1, 1),
                     shared_mem_bytes: 0,
                 };
                 flash
@@ -378,10 +396,10 @@ impl CudaAttention {
                 let config = LaunchConfig {
                     grid_dim: (
                         num_heads as u32,
-                        (seq_len as u32).div_ceil(64),
+                        (seq_len as u32).div_ceil(32),
                         batch as u32,
                     ),
-                    block_dim: (128, 1, 1),
+                    block_dim: (64, 1, 1),
                     shared_mem_bytes: 0,
                 };
                 flash

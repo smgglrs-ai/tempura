@@ -26,6 +26,10 @@ impl GpuContext {
         Ok(Self { ctx })
     }
 
+    pub fn from_context(ctx: Arc<CudaContext>) -> Self {
+        Self { ctx }
+    }
+
     pub fn context(&self) -> &Arc<CudaContext> {
         &self.ctx
     }
