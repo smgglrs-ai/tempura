@@ -2002,6 +2002,31 @@ pub struct GpuQuantizedInferenceWrapper {
 
 #[cfg(feature = "cuda")]
 impl GpuQuantizedInferenceWrapper {
+    fn gpu_gemv(
+        &self,
+        name: &str,
+        input: &cuda_core::DeviceBuffer<f32>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        n: usize,
+        k: usize,
+        seq_len: usize,
+    ) {
+        if let Some(w) = self.gpu_weights.get_q4k_device(name) {
+            self.q4k_matmul
+                .gemv_q4k_coop_device(input, w, output, n, k)
+                .expect(name);
+        } else if let Some(w) = self.gpu_weights.get_q6k_device(name) {
+            self.q4k_matmul
+                .forward_q6k_device(input, w, output, seq_len, n, k)
+                .expect(name);
+        } else {
+            let w = self.gpu_weights.get(name).unwrap();
+            self.matmul
+                .forward_bt_device(input, w, output, seq_len, n, k)
+                .expect(name);
+        }
+    }
+
     fn forward_gpu_quantized(&self, token_ids: &[u32], position: usize) -> Vec<f32> {
         let ctx = self.q4k_matmul.gpu().context().clone();
         ctx.bind_to_thread().expect("bind CUDA context");
@@ -2027,6 +2052,19 @@ impl GpuQuantizedInferenceWrapper {
             hidden_host[t * h..(t + 1) * h].copy_from_slice(src);
         }
         scratch.upload_hidden(&stream, &hidden_host);
+        let debug_gpu = std::env::var("TEMPURA_DEBUG_GPU").is_ok();
+
+        let dbg = |name: &str, buf: &cuda_core::DeviceBuffer<f32>, stream: &cuda_core::CudaStream| {
+            if !debug_gpu { return; }
+            let v = buf.to_host_vec(stream).unwrap();
+            let n = v.len().min(4);
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let has_nan = v.iter().any(|x| x.is_nan());
+            let has_inf = v.iter().any(|x| x.is_infinite());
+            eprintln!("[gpu-dbg] {name}: norm={norm:.4} nan={has_nan} inf={has_inf} first={:?}", &v[..n]);
+        };
+
+        dbg("embed", &scratch.hidden, &stream);
 
         let positions: Vec<u32> = (position..position + seq_len).map(|p| p as u32).collect();
         let positions_dev =
@@ -2049,42 +2087,20 @@ impl GpuQuantizedInferenceWrapper {
                 )
                 .expect("rmsnorm");
 
+            if layer == 0 { dbg("L0 normed", &scratch.normed, &stream); }
+
             let q_name = format!("{prefix}.self_attn.q_proj.weight");
             let k_name = format!("{prefix}.self_attn.k_proj.weight");
             let v_name = format!("{prefix}.self_attn.v_proj.weight");
 
-            if let Some(qw) = self.gpu_weights.get_quantized_device(&q_name) {
-                self.q4k_matmul
-                    .gemv_q4k_coop_device(&scratch.normed, qw, &mut scratch.q, q_dim, h)
-                    .expect("q proj q4k");
-            } else {
-                let w = self.gpu_weights.get(&q_name).unwrap();
-                self.matmul
-                    .forward_bt_device(&scratch.normed, w, &mut scratch.q, seq_len, q_dim, h)
-                    .expect("q proj f32");
-            }
+            self.gpu_gemv(&q_name, &scratch.normed, &mut scratch.q, q_dim, h, seq_len);
+            self.gpu_gemv(&k_name, &scratch.normed, &mut scratch.k, kv_dim, h, seq_len);
+            self.gpu_gemv(&v_name, &scratch.normed, &mut scratch.v, kv_dim, h, seq_len);
 
-            if let Some(kw) = self.gpu_weights.get_quantized_device(&k_name) {
-                self.q4k_matmul
-                    .gemv_q4k_coop_device(&scratch.normed, kw, &mut scratch.k, kv_dim, h)
-                    .expect("k proj q4k");
-            } else {
-                let w = self.gpu_weights.get(&k_name).unwrap();
-                self.matmul
-                    .forward_bt_device(&scratch.normed, w, &mut scratch.k, seq_len, kv_dim, h)
-                    .expect("k proj f32");
-            }
-
-            let v_w_name = format!("{prefix}.self_attn.v_proj.weight");
-            if let Some(vw) = self.gpu_weights.get_quantized_device(&v_w_name) {
-                self.q4k_matmul
-                    .gemv_q4k_coop_device(&scratch.normed, vw, &mut scratch.v, kv_dim, h)
-                    .expect("v proj q4k");
-            } else {
-                let w = self.gpu_weights.get(&v_w_name).unwrap();
-                self.matmul
-                    .forward_bt_device(&scratch.normed, w, &mut scratch.v, seq_len, kv_dim, h)
-                    .expect("v proj f32");
+            if layer == 0 {
+                dbg("L0 q_proj", &scratch.q, &stream);
+                dbg("L0 k_proj", &scratch.k, &stream);
+                dbg("L0 v_proj", &scratch.v, &stream);
             }
 
             if cfg.use_qk_norm {
@@ -2201,17 +2217,10 @@ impl GpuQuantizedInferenceWrapper {
                 )
                 .expect("attention");
 
+            if layer == 0 { dbg("L0 attn_out", &scratch.attn_out, &stream); }
+
             let o_name = format!("{prefix}.self_attn.o_proj.weight");
-            if let Some(ow) = self.gpu_weights.get_quantized_device(&o_name) {
-                self.q4k_matmul
-                    .gemv_q4k_coop_device(&scratch.attn_out, ow, &mut scratch.o_proj, h, q_dim)
-                    .expect("o proj q4k");
-            } else {
-                let w = self.gpu_weights.get(&o_name).unwrap();
-                self.matmul
-                    .forward_bt_device(&scratch.attn_out, w, &mut scratch.o_proj, seq_len, h, q_dim)
-                    .expect("o proj f32");
-            }
+            self.gpu_gemv(&o_name, &scratch.attn_out, &mut scratch.o_proj, h, q_dim, seq_len);
 
             tempura_kernels::gpu::vector_add_device(
                 &ctx,
@@ -2222,6 +2231,8 @@ impl GpuQuantizedInferenceWrapper {
             )
             .expect("residual add");
             std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_swap);
+
+            if layer == 0 { dbg("L0 hidden_post_attn", &scratch.hidden, &stream); }
 
             let post_ln_w = self
                 .gpu_weights
@@ -2241,26 +2252,13 @@ impl GpuQuantizedInferenceWrapper {
             let up_name = format!("{prefix}.mlp.up_proj.weight");
             let down_name = format!("{prefix}.mlp.down_proj.weight");
 
-            if let Some(gw) = self.gpu_weights.get_quantized_device(&gate_name) {
-                self.q4k_matmul
-                    .gemv_q4k_coop_device(&scratch.normed2, gw, &mut scratch.gate, inter, h)
-                    .expect("gate proj q4k");
-            } else {
-                let w = self.gpu_weights.get(&gate_name).unwrap();
-                self.matmul
-                    .forward_bt_device(&scratch.normed2, w, &mut scratch.gate, seq_len, inter, h)
-                    .expect("gate proj f32");
-            }
+            self.gpu_gemv(&gate_name, &scratch.normed2, &mut scratch.gate, inter, h, seq_len);
+            self.gpu_gemv(&up_name, &scratch.normed2, &mut scratch.up, inter, h, seq_len);
 
-            if let Some(uw) = self.gpu_weights.get_quantized_device(&up_name) {
-                self.q4k_matmul
-                    .gemv_q4k_coop_device(&scratch.normed2, uw, &mut scratch.up, inter, h)
-                    .expect("up proj q4k");
-            } else {
-                let w = self.gpu_weights.get(&up_name).unwrap();
-                self.matmul
-                    .forward_bt_device(&scratch.normed2, w, &mut scratch.up, seq_len, inter, h)
-                    .expect("up proj f32");
+            if layer == 0 {
+                dbg("L0 normed2", &scratch.normed2, &stream);
+                dbg("L0 gate", &scratch.gate, &stream);
+                dbg("L0 up", &scratch.up, &stream);
             }
 
             tempura_kernels::gpu::silu_mul_device(
@@ -2272,16 +2270,11 @@ impl GpuQuantizedInferenceWrapper {
             )
             .expect("silu_mul");
 
-            if let Some(dw) = self.gpu_weights.get_quantized_device(&down_name) {
-                self.q4k_matmul
-                    .gemv_q4k_coop_device(&scratch.silu_out, dw, &mut scratch.down, h, inter)
-                    .expect("down proj q4k");
-            } else {
-                let w = self.gpu_weights.get(&down_name).unwrap();
-                self.matmul
-                    .forward_bt_device(&scratch.silu_out, w, &mut scratch.down, seq_len, h, inter)
-                    .expect("down proj f32");
-            }
+            if layer == 0 { dbg("L0 silu_out", &scratch.silu_out, &stream); }
+
+            self.gpu_gemv(&down_name, &scratch.silu_out, &mut scratch.down, h, inter, seq_len);
+
+            if layer == 0 { dbg("L0 down_proj", &scratch.down, &stream); }
 
             tempura_kernels::gpu::vector_add_device(
                 &ctx,
@@ -2292,9 +2285,18 @@ impl GpuQuantizedInferenceWrapper {
             )
             .expect("ffn residual add");
             std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_swap);
+
+            if layer == 0 { dbg("L0 hidden_post_ffn", &scratch.hidden, &stream); }
+            if layer > 0 && debug_gpu {
+                let v = scratch.hidden.to_host_vec(&stream).unwrap();
+                let has_nan = v.iter().any(|x| x.is_nan());
+                if has_nan { eprintln!("[gpu-dbg] NaN detected at layer {layer}!"); break; }
+            }
         }
 
         gpu_cache.advance(seq_len);
+
+        dbg("final_hidden", &scratch.hidden, &stream);
 
         let final_norm_w = self.gpu_weights.get("model.norm.weight").unwrap();
         self.rmsnorm
@@ -2308,29 +2310,7 @@ impl GpuQuantizedInferenceWrapper {
             .expect("final norm");
 
         let lm_head_name = "lm_head.weight";
-        if let Some(lw) = self.gpu_weights.get_quantized_device(lm_head_name) {
-            self.q4k_matmul
-                .gemv_q4k_coop_device(
-                    &scratch.final_normed,
-                    lw,
-                    &mut scratch.logits,
-                    cfg.vocab_size,
-                    h,
-                )
-                .expect("lm head q4k");
-        } else {
-            let w = self.gpu_weights.get(lm_head_name).unwrap();
-            self.matmul
-                .forward_bt_device(
-                    &scratch.final_normed,
-                    w,
-                    &mut scratch.logits,
-                    seq_len,
-                    cfg.vocab_size,
-                    h,
-                )
-                .expect("lm head f32");
-        }
+        self.gpu_gemv(lm_head_name, &scratch.final_normed, &mut scratch.logits, cfg.vocab_size, h, seq_len);
 
         let all_logits = scratch.logits.to_host_vec(&stream).expect("logits to host");
         let last_start = (seq_len - 1) * cfg.vocab_size;

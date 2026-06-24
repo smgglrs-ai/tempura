@@ -253,6 +253,8 @@ impl QuantizedWeights {
 pub struct GpuWeights {
     tensors: HashMap<String, cuda_core::DeviceBuffer<f32>>,
     quantized_tensors: HashMap<String, cuda_core::DeviceBuffer<u8>>,
+    q4k_names: std::collections::HashSet<String>,
+    q6k_names: std::collections::HashSet<String>,
 }
 
 #[cfg(feature = "cuda")]
@@ -275,6 +277,8 @@ impl GpuWeights {
         Ok(Self {
             tensors,
             quantized_tensors: HashMap::new(),
+            q4k_names: std::collections::HashSet::new(),
+            q6k_names: std::collections::HashSet::new(),
         })
     }
 
@@ -313,25 +317,55 @@ impl GpuWeights {
         }
 
         let mut quantized_tensors = HashMap::new();
+        let mut q4k_names = std::collections::HashSet::new();
+        let mut q6k_names = std::collections::HashSet::new();
         for (name, data) in &qweights.q4k_tensors {
             let dev_buf = cuda_core::DeviceBuffer::from_host(&stream, data)
                 .map_err(|e| WeightsError::GpuUpload(format!("{name}: {e}")))?;
             quantized_tensors.insert(name.clone(), dev_buf);
+            q4k_names.insert(name.clone());
         }
         for (name, data) in &qweights.q6k_tensors {
             let dev_buf = cuda_core::DeviceBuffer::from_host(&stream, data)
                 .map_err(|e| WeightsError::GpuUpload(format!("{name}: {e}")))?;
             quantized_tensors.insert(name.clone(), dev_buf);
+            q6k_names.insert(name.clone());
         }
 
         Ok(Self {
             tensors,
             quantized_tensors,
+            q4k_names,
+            q6k_names,
         })
     }
 
     pub fn is_quantized(&self, name: &str) -> bool {
         self.quantized_tensors.contains_key(name)
+    }
+
+    pub fn is_q4k(&self, name: &str) -> bool {
+        self.q4k_names.contains(name)
+    }
+
+    pub fn is_q6k(&self, name: &str) -> bool {
+        self.q6k_names.contains(name)
+    }
+
+    pub fn get_q4k_device(&self, name: &str) -> Option<&cuda_core::DeviceBuffer<u8>> {
+        if self.q4k_names.contains(name) {
+            self.quantized_tensors.get(name)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_q6k_device(&self, name: &str) -> Option<&cuda_core::DeviceBuffer<u8>> {
+        if self.q6k_names.contains(name) {
+            self.quantized_tensors.get(name)
+        } else {
+            None
+        }
     }
 
     pub fn quantized_count(&self) -> usize {
