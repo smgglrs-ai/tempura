@@ -2012,14 +2012,30 @@ impl GpuQuantizedInferenceWrapper {
         seq_len: usize,
     ) {
         if let Some(w) = self.gpu_weights.get_q4k_device(name) {
-            self.q4k_matmul
-                .gemv_q4k_coop_device(input, w, output, n, k)
-                .expect(name);
+            if std::env::var("TEMPURA_DEBUG_GPU").is_ok() {
+                eprintln!("[gpu-gemv] {name}: Q4K m={seq_len} n={n} k={k} wbytes={}", w.len());
+            }
+            if seq_len == 1 {
+                self.q4k_matmul
+                    .gemv_q4k_coop_device(input, w, output, n, k)
+                    .expect(name);
+            } else {
+                self.q4k_matmul
+                    .forward_q4k_device(input, w, output, seq_len, n, k)
+                    .expect(name);
+            }
         } else if let Some(w) = self.gpu_weights.get_q6k_device(name) {
+            if std::env::var("TEMPURA_DEBUG_GPU").is_ok() {
+                eprintln!("[gpu-gemv] {name}: Q6K m={seq_len} n={n} k={k} wbytes={}", w.len());
+            }
+            // Use naive per-thread Q6K kernel
             self.q4k_matmul
                 .forward_q6k_device(input, w, output, seq_len, n, k)
                 .expect(name);
         } else {
+            if std::env::var("TEMPURA_DEBUG_GPU").is_ok() {
+                eprintln!("[gpu-gemv] {name}: f32 m={seq_len} n={n} k={k}");
+            }
             let w = self.gpu_weights.get(name).unwrap();
             self.matmul
                 .forward_bt_device(input, w, output, seq_len, n, k)
@@ -2057,14 +2073,27 @@ impl GpuQuantizedInferenceWrapper {
         let dbg = |name: &str, buf: &cuda_core::DeviceBuffer<f32>, stream: &cuda_core::CudaStream| {
             if !debug_gpu { return; }
             let v = buf.to_host_vec(stream).unwrap();
-            let n = v.len().min(4);
-            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let has_nan = v.iter().any(|x| x.is_nan());
-            let has_inf = v.iter().any(|x| x.is_infinite());
-            eprintln!("[gpu-dbg] {name}: norm={norm:.4} nan={has_nan} inf={has_inf} first={:?}", &v[..n]);
+            let valid = v.len().min(seq_len * h.max(q_dim).max(inter).max(kv_dim));
+            let n = valid.min(4);
+            let norm = v[..valid].iter().map(|x| x * x).sum::<f32>().sqrt();
+            let has_nan = v[..valid].iter().any(|x| x.is_nan());
+            let has_inf = v[..valid].iter().any(|x| x.is_infinite());
+            eprintln!("[gpu-dbg] {name}: norm={norm:.4} nan={has_nan} inf={has_inf} first={:?} (valid={valid}/{} total)", &v[..n], v.len());
         };
 
         dbg("embed", &scratch.hidden, &stream);
+
+        if debug_gpu {
+            let normed_host = {
+                let input_ln_w = self.gpu_weights.get("model.layers.0.input_layernorm.weight").unwrap();
+                let ln_w_host = input_ln_w.to_host_vec(&stream).unwrap();
+                let mut normed = hidden_host.clone();
+                tempura_kernels::rmsnorm::CpuRMSNorm.forward(&mut normed, &ln_w_host, h, cfg.layer_norm_eps).unwrap();
+                normed
+            };
+            eprintln!("[cpu-ref] L0 normed: first={:?} norm={:.4}",
+                &normed_host[..4], normed_host.iter().map(|x| x*x).sum::<f32>().sqrt());
+        }
 
         let positions: Vec<u32> = (position..position + seq_len).map(|p| p as u32).collect();
         let positions_dev =
@@ -2255,10 +2284,10 @@ impl GpuQuantizedInferenceWrapper {
             self.gpu_gemv(&gate_name, &scratch.normed2, &mut scratch.gate, inter, h, seq_len);
             self.gpu_gemv(&up_name, &scratch.normed2, &mut scratch.up, inter, h, seq_len);
 
-            if layer == 0 {
-                dbg("L0 normed2", &scratch.normed2, &stream);
-                dbg("L0 gate", &scratch.gate, &stream);
-                dbg("L0 up", &scratch.up, &stream);
+            if layer <= 6 {
+                dbg(&format!("L{layer} normed2"), &scratch.normed2, &stream);
+                dbg(&format!("L{layer} gate"), &scratch.gate, &stream);
+                dbg(&format!("L{layer} up"), &scratch.up, &stream);
             }
 
             tempura_kernels::gpu::silu_mul_device(
@@ -2270,11 +2299,25 @@ impl GpuQuantizedInferenceWrapper {
             )
             .expect("silu_mul");
 
-            if layer == 0 { dbg("L0 silu_out", &scratch.silu_out, &stream); }
+            if layer <= 6 { dbg(&format!("L{layer} silu_out"), &scratch.silu_out, &stream); }
 
             self.gpu_gemv(&down_name, &scratch.silu_out, &mut scratch.down, h, inter, seq_len);
 
-            if layer == 0 { dbg("L0 down_proj", &scratch.down, &stream); }
+            if layer <= 6 { dbg(&format!("L{layer} down_proj"), &scratch.down, &stream); }
+
+            if layer == 6 && debug_gpu {
+                let silu_host = scratch.silu_out.to_host_vec(&stream).unwrap();
+                let silu_valid = &silu_host[..inter];
+                if let Some(dw_bytes) = self.gpu_weights.get_q6k_device(&down_name) {
+                    let dw_host = dw_bytes.to_host_vec(&stream).unwrap();
+                    let q6k_cpu = tempura_kernels::quantized::CpuMatMulQ4KOpt;
+                    let mut cpu_out = vec![0.0f32; h];
+                    use tempura_kernels::MatMulQ;
+                    q6k_cpu.forward_b_transposed_q6k(silu_valid, &dw_host, &mut cpu_out, 1, h, inter).unwrap();
+                    let cpu_norm = cpu_out.iter().map(|x| x*x).sum::<f32>().sqrt();
+                    eprintln!("[cpu-ref] L6 down_proj: norm={cpu_norm:.4} first={:?}", &cpu_out[..4]);
+                }
+            }
 
             tempura_kernels::gpu::vector_add_device(
                 &ctx,
@@ -2287,10 +2330,13 @@ impl GpuQuantizedInferenceWrapper {
             std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_swap);
 
             if layer == 0 { dbg("L0 hidden_post_ffn", &scratch.hidden, &stream); }
-            if layer > 0 && debug_gpu {
+            if debug_gpu {
                 let v = scratch.hidden.to_host_vec(&stream).unwrap();
-                let has_nan = v.iter().any(|x| x.is_nan());
-                if has_nan { eprintln!("[gpu-dbg] NaN detected at layer {layer}!"); break; }
+                let valid = seq_len * h;
+                let norm = v[..valid].iter().map(|x| x*x).sum::<f32>().sqrt();
+                let has_nan = v[..valid].iter().any(|x| x.is_nan());
+                eprintln!("[gpu-dbg] L{layer} hidden[0..{valid}]: norm={norm:.2} first={:?}", &v[..4]);
+                if has_nan { eprintln!("[gpu-dbg] NaN at layer {layer}!"); break; }
             }
         }
 

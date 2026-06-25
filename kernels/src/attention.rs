@@ -229,8 +229,8 @@ impl CudaAttention {
         crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
 
-        if head_dim == 128 && seq_len > 0 {
-            if seq_len == 1 && kv_len >= 512 {
+        if head_dim == 128 && seq_len == 1 {
+            if kv_len >= 512 {
                 if let Some(ref decode) = self.decode_module {
                     let kv_per_split = 256usize;
                     let num_splits = kv_len.div_ceil(kv_per_split);
