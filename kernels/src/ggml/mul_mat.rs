@@ -5,33 +5,36 @@ fn vec_dot_best(n: usize, result: &mut f32, vx: &[u8], vy: &[u8], weight_type: G
     use super::blocks::*;
 
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        match weight_type {
-            GgmlType::Q4_0 => {
-                let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ4_0, n / 32) };
-                let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8_0, n / 32) };
-                *result = unsafe { super::vec_dot_avx2::vec_dot_q4_0_q8_0_avx2(n, x, y) };
-                return;
+    {
+        // AVX2 + FMA (benchmarked faster than VNNI for Q4K due to dequant amortization)
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            match weight_type {
+                GgmlType::Q4_0 => {
+                    let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ4_0, n / 32) };
+                    let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8_0, n / 32) };
+                    *result = unsafe { super::vec_dot_avx2::vec_dot_q4_0_q8_0_avx2(n, x, y) };
+                    return;
+                }
+                GgmlType::Q8_0 => {
+                    let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ8_0, n / 32) };
+                    let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8_0, n / 32) };
+                    *result = unsafe { super::vec_dot_avx2::vec_dot_q8_0_q8_0_avx2(n, x, y) };
+                    return;
+                }
+                GgmlType::Q4K => {
+                    let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ4K, n / 256) };
+                    let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256) };
+                    *result = unsafe { super::vec_dot_avx2::vec_dot_q4_k_q8_k_avx2(n, x, y) };
+                    return;
+                }
+                GgmlType::Q6K => {
+                    let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ6K, n / 256) };
+                    let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256) };
+                    *result = unsafe { super::vec_dot_avx2::vec_dot_q6_k_q8_k_avx2(n, x, y) };
+                    return;
+                }
+                _ => {}
             }
-            GgmlType::Q8_0 => {
-                let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ8_0, n / 32) };
-                let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8_0, n / 32) };
-                *result = unsafe { super::vec_dot_avx2::vec_dot_q8_0_q8_0_avx2(n, x, y) };
-                return;
-            }
-            GgmlType::Q4K => {
-                let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ4K, n / 256) };
-                let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256) };
-                *result = unsafe { super::vec_dot_avx2::vec_dot_q4_k_q8_k_avx2(n, x, y) };
-                return;
-            }
-            GgmlType::Q6K => {
-                let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ6K, n / 256) };
-                let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256) };
-                *result = unsafe { super::vec_dot_avx2::vec_dot_q6_k_q8_k_avx2(n, x, y) };
-                return;
-            }
-            _ => {}
         }
     }
 

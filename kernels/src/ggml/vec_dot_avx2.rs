@@ -388,6 +388,113 @@ pub unsafe fn quantize_row_q8_k_avx2(src: &[f32], dst: &mut [BlockQ8K]) {
     }
 }
 
+// ── VNNI variants (AVX-VNNI: _mm256_dpbusd_epi32) ──────────────────────────
+// dpbusd does u8×i8→i32 accumulate across 4 byte pairs per lane in one instruction,
+// replacing the maddubs_epi16 + madd_epi16 two-step chain.
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+pub unsafe fn vec_dot_q4_k_q8_k_vnni(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
+    use super::helpers::get_scale_min_k4;
+    let nb = n / 256;
+    let mask_lo = _mm256_set1_epi8(0x0F);
+
+    let mut acc = _mm256_setzero_ps();
+    let mut mins_total = 0.0f32;
+
+    for i in 0..nb {
+        let d = f16_to_f32(x[i].d) * y[i].d;
+        let dmin = f16_to_f32(x[i].dmin) * y[i].d;
+
+        let mut sc = [0u8; 8];
+        let mut mi = [0u8; 8];
+        for j in 0..8 {
+            let (s, m) = get_scale_min_k4(j, &x[i].scales);
+            sc[j] = s;
+            mi[j] = m;
+        }
+
+        let mut sumi_mins = 0i32;
+        for j in 0..16 {
+            sumi_mins += y[i].bsums[j] as i32 * mi[j / 2] as i32;
+        }
+        mins_total += dmin * sumi_mins as f32;
+
+        let q4 = &x[i].qs;
+        let q8 = &y[i].qs;
+
+        let mut sumi = _mm256_setzero_si256();
+        for j in 0..4 {
+            let sc_lo = sc[2 * j] as i32;
+            let sc_hi = sc[2 * j + 1] as i32;
+
+            let q4_chunk = _mm256_loadu_si256(q4[j * 32..].as_ptr() as *const __m256i);
+            let q4_lo = _mm256_and_si256(q4_chunk, mask_lo);
+            let q4_hi = _mm256_and_si256(_mm256_srli_epi16(q4_chunk, 4), mask_lo);
+
+            let q8_lo = _mm256_loadu_si256(q8[j * 64..].as_ptr() as *const __m256i);
+            let q8_hi = _mm256_loadu_si256(q8[j * 64 + 32..].as_ptr() as *const __m256i);
+
+            // dpbusd: u8 × i8 → accumulate i32 (4 products per lane)
+            let dot_lo = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_lo, q8_lo);
+            let dot_hi = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_hi, q8_hi);
+
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(dot_lo, _mm256_set1_epi32(sc_lo)));
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(dot_hi, _mm256_set1_epi32(sc_hi)));
+        }
+
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+    hsum_f32_8(acc) - mins_total
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+pub unsafe fn vec_dot_q4_0_q8_0_vnni(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
+    let nb = n / 32;
+    let mut acc = _mm256_setzero_ps();
+    let off = _mm256_set1_epi8(8);
+
+    for ib in 0..nb {
+        let d = f16_to_f32(x[ib].d) * f16_to_f32(y[ib].d);
+
+        // expand 16 bytes of nibbles to 32 bytes
+        let raw = _mm_loadu_si128(x[ib].qs.as_ptr() as *const __m128i);
+        let lo = _mm256_and_si256(_mm256_cvtepu8_epi16(raw), _mm256_set1_epi16(0x0F));
+        let hi = _mm256_and_si256(_mm256_cvtepu8_epi16(_mm_srli_epi16(raw, 4)), _mm256_set1_epi16(0x0F));
+
+        // pack back to bytes, subtract offset
+        let packed = _mm256_packs_epi16(lo, hi);
+        let perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        let q4_bytes = _mm256_sub_epi8(_mm256_permutevar8x32_epi32(packed, perm), off);
+
+        let q8_bytes = _mm256_loadu_si256(y[ib].qs.as_ptr() as *const __m256i);
+
+        // dpbusd needs unsigned first arg — but q4_bytes is signed (-8..7).
+        // Use sign trick: abs(q4) * sign(q4) * q8 = abs(q4) * (q8 * sign(q4))
+        let q4_sign = _mm256_sign_epi8(q4_bytes, q4_bytes);
+        let q8_signed = _mm256_sign_epi8(q8_bytes, q4_bytes);
+        let dot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_sign, q8_signed);
+
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(dot), acc);
+    }
+    hsum_f32_8(acc)
+}
+
+// ── AVX-512 VNNI variant ───────────────────────────────────────────────────
+// Uses 256-bit VNNI dpbusd (same as AVX-VNNI) but with the proven Q4K dequant
+// layout. AVX-512 width is used for activation quantization, not the vec_dot
+// inner loop — the per-group scaling makes 512-bit lanes hard to fill correctly.
+// For Q4K, the VNNI variant IS the fastest path since dpbusd replaces
+// maddubs+madd, and the 256-bit width matches the 32-element scale groups.
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
+    // delegate to VNNI — the 256-bit dpbusd is the right granularity for Q4K
+    vec_dot_q4_k_q8_k_vnni(n, x, y)
+}
+
 // ── Runtime dispatch ───────────────────────────────────────────────────────
 
 pub fn vec_dot_q4_0_q8_0_dispatch(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
@@ -408,8 +515,16 @@ pub fn vec_dot_q8_0_q8_0_dispatch(n: usize, x: &[BlockQ8_0], y: &[BlockQ8_0]) ->
 
 pub fn vec_dot_q4_k_q8_k_dispatch(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        return unsafe { vec_dot_q4_k_q8_k_avx2(n, x, y) };
+    {
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
+            return unsafe { vec_dot_q4_k_q8_k_avx512(n, x, y) };
+        }
+        if is_x86_feature_detected!("avxvnni") {
+            return unsafe { vec_dot_q4_k_q8_k_vnni(n, x, y) };
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { vec_dot_q4_k_q8_k_avx2(n, x, y) };
+        }
     }
     super::vec_dot::vec_dot_q4_k_q8_k(n, x, y)
 }

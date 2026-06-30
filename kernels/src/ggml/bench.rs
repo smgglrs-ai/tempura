@@ -80,7 +80,38 @@ mod bench_tests {
         let old_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
         let old_speedup = old_ms / avx2_ms;
         eprintln!("  CpuMatMulQ4KOpt: {old_ms:.2} ms");
-        eprintln!("  ggml AVX2 vs old: {old_speedup:.2}x");
+        eprintln!("  ggml dispatch vs old: {old_speedup:.2}x");
+
+        // Pure VNNI (skip dispatch overhead)
+        if is_x86_feature_detected!("avxvnni") {
+            let x = unsafe { std::slice::from_raw_parts(weights.as_ptr() as *const BlockQ4K, n * (k / 256)) };
+            let mut q8k_blocks = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }; k / 256];
+            super::super::quantize::quantize_row_q8_k(&activations, &mut q8k_blocks);
+            let start = Instant::now();
+            for _ in 0..iters {
+                let mut s = 0.0f32;
+                for row in 0..n {
+                    let rx = &x[row * (k / 256)..(row + 1) * (k / 256)];
+                    s += unsafe { super::super::vec_dot_avx2::vec_dot_q4_k_q8_k_vnni(k, rx, &q8k_blocks) };
+                }
+                out[0] = s;
+            }
+            let vnni_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            eprintln!("  Pure VNNI vec_dot: {vnni_ms:.2} ms ({:.2}x vs old)", old_ms / vnni_ms);
+
+            // Pure AVX2 dequant approach
+            let start = Instant::now();
+            for _ in 0..iters {
+                let mut s = 0.0f32;
+                for row in 0..n {
+                    let rx = &x[row * (k / 256)..(row + 1) * (k / 256)];
+                    s += unsafe { super::super::vec_dot_avx2::vec_dot_q4_k_q8_k_avx2(k, rx, &q8k_blocks) };
+                }
+                out[0] = s;
+            }
+            let avx2_pure_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            eprintln!("  Pure AVX2 vec_dot: {avx2_pure_ms:.2} ms ({:.2}x vs old)", old_ms / avx2_pure_ms);
+        }
     }
 
     #[test]
