@@ -21,6 +21,13 @@ path = "src/bench_e2e.rs"
 name = "bench-q4k-e2e"
 path = "src/bench_q4k_e2e.rs"
 
+[[bin]]
+name = "bench-attn-matrix"
+path = "src/bench_attn_matrix.rs"
+
+[features]
+cuda = []
+
 [dependencies]
 tempura-kernels = { path = "../kernels", features = ["cpu", "cuda"] }
 tempura-engine = { path = "../engine", features = ["cuda"] }

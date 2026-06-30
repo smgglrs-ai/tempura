@@ -93,6 +93,13 @@ struct ServeArgs {
 
     #[arg(long, default_value = "cpu", help = "Device: cpu or cuda")]
     device: String,
+
+    #[arg(
+        long,
+        default_value = "auto",
+        help = "Attention mode: auto, naive-f32, naive-f16, flash-f32, flash-f16"
+    )]
+    attn_mode: String,
 }
 
 pub type CpuModel = TransformerModel<
@@ -198,6 +205,7 @@ async fn main() {
                 request_timeout_secs: 300,
                 otlp_endpoint: None,
                 device: "cpu".into(),
+                attn_mode: "auto".into(),
             })
             .await;
         }
@@ -317,9 +325,9 @@ async fn run_server(args: ServeArgs) {
 
                 let attention =
                     tempura_kernels::attention::CudaAttention::with_context(ctx.clone()).unwrap();
-                let rmsnorm =
+                let mut rmsnorm =
                     tempura_kernels::rmsnorm::CudaRMSNorm::with_context(ctx.clone()).unwrap();
-                let rope =
+                let mut rope =
                     tempura_kernels::rope::CudaRoPE::with_context(ctx.clone()).unwrap();
                 let matmul =
                     tempura_kernels::matmul::CudaMatMul::with_context(ctx.clone()).unwrap();
@@ -350,6 +358,33 @@ async fn run_server(args: ServeArgs) {
                     gpu_weights.f32_count(),
                 );
 
+                let attn_mode: tempura_kernels::AttentionMode = args.attn_mode.parse()
+                    .unwrap_or_else(|e| { eprintln!("invalid --attn-mode: {e}"); std::process::exit(1); });
+                if attn_mode == tempura_kernels::AttentionMode::NaiveF32
+                    || std::env::var("TEMPURA_DETERMINISTIC").is_ok()
+                {
+                    rmsnorm.deterministic = true;
+                    rope.deterministic = true;
+                    let table = tempura_kernels::rope::build_cos_sin_table(
+                        config.max_seq_len, config.head_dim, config.rope_theta,
+                    );
+                    rope.upload_cos_sin_table(&table).expect("upload RoPE table");
+                    eprintln!("[gpu] deterministic RMSNorm + RoPE table enabled");
+                }
+                eprintln!("[gpu] attention mode: {attn_mode}");
+                let cpu_model = if std::env::var("TEMPURA_CPU_OPS").is_ok() {
+                    eprintln!("[gpu] CPU_OPS: using CPU forward path for bit-identical output");
+                    eprintln!("[gpu] CPU_OPS: reloading weights for CPU model...");
+                    let gguf2 = tempura_engine::gguf_loader::GgufLoader::from_file_quantized(model_p).unwrap();
+                    let qw2 = gguf2.to_quantized_weights();
+                    drop(gguf2);
+                    let pipeline = KernelPipeline::cpu_verified();
+                    let mut model = TransformerModel::new(config.clone(), pipeline);
+                    model.quantized_weights = Some(qw2);
+                    Some(std::sync::Mutex::new(model))
+                } else {
+                    None
+                };
                 Arc::new(tempura_engine::GpuQuantizedInferenceWrapper {
                     config: config.clone(),
                     attention,
@@ -362,6 +397,8 @@ async fn run_server(args: ServeArgs) {
                     gpu_cache: std::sync::Mutex::new(gpu_cache),
                     scratchpad: std::sync::Mutex::new(scratchpad),
                     embed_host: embed,
+                    attn_mode,
+                    cpu_model,
                 })
             } else {
                 let pipeline = KernelPipeline::cpu_verified();

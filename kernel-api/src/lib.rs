@@ -24,6 +24,50 @@ pub enum VerificationTier {
     Proven,
 }
 
+// ── AttentionMode ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttentionMode {
+    Auto,
+    NaiveF32,
+    NaiveF16,
+    FlashF32,
+    FlashF16,
+}
+
+impl Default for AttentionMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl std::fmt::Display for AttentionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::NaiveF32 => write!(f, "naive-f32"),
+            Self::NaiveF16 => write!(f, "naive-f16"),
+            Self::FlashF32 => write!(f, "flash-f32"),
+            Self::FlashF16 => write!(f, "flash-f16"),
+        }
+    }
+}
+
+impl std::str::FromStr for AttentionMode {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "naive-f32" => Ok(Self::NaiveF32),
+            "naive-f16" => Ok(Self::NaiveF16),
+            "flash-f32" => Ok(Self::FlashF32),
+            "flash-f16" => Ok(Self::FlashF16),
+            _ => Err(format!("unknown attention mode: {s}")),
+        }
+    }
+}
+
 // ── Attention ───────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -300,6 +344,12 @@ pub const Q6K_BLOCK_BYTES: usize = 210;
 pub const Q6K_GROUPS: usize = 16;
 pub const Q6K_GROUP_SIZE: usize = 16;
 
+pub const TQ2_BLOCK_SIZE: usize = 256;
+pub const TQ2_BLOCK_BYTES: usize = 66;
+
+pub const I2S_BLOCK_SIZE: usize = 256;
+pub const I2S_BLOCK_BYTES: usize = 64;
+
 #[allow(clippy::too_many_arguments)]
 pub trait MatMulQ: Send + Sync {
     fn forward_b_transposed_q4k(
@@ -313,6 +363,26 @@ pub trait MatMulQ: Send + Sync {
     ) -> Result<()>;
 
     fn forward_b_transposed_q6k(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()>;
+
+    fn forward_b_transposed_tq2(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()>;
+
+    fn forward_b_transposed_i2s(
         &self,
         a: &[f32],
         b_quantized: &[u8],
@@ -368,5 +438,75 @@ pub trait GuidedDecoder: Send {
 
     fn forced_tokens(&self) -> Option<Vec<u32>> {
         None
+    }
+}
+
+// ── Verification contracts ─────────────────────────────────────────────────
+//
+// Shared trait contracts for struct invariants. Both the real implementation
+// and the Verus verification crate implement these traits, ensuring the
+// specification stays in sync with the code.
+//
+// The real impl uses debug_assert!(self.well_formed()) in methods.
+// The Verus crate proves well_formed() is preserved for ALL inputs.
+
+pub trait VerifiedKvCache {
+    fn seq_len(&self) -> usize;
+    fn max_seq_len(&self) -> usize;
+    fn num_kv_heads(&self) -> usize;
+    fn head_dim(&self) -> usize;
+    fn stride(&self) -> usize { self.num_kv_heads() * self.head_dim() }
+    fn layer_size(&self) -> usize { self.max_seq_len() * self.stride() }
+    fn remaining_capacity(&self) -> usize { self.max_seq_len() - self.seq_len() }
+
+    fn well_formed(&self) -> bool {
+        self.seq_len() <= self.max_seq_len()
+            && self.num_kv_heads() >= 1
+            && self.head_dim() >= 1
+            && self.max_seq_len() >= 1
+    }
+}
+
+pub trait VerifiedPageAllocator {
+    fn available(&self) -> usize;
+    fn total(&self) -> usize;
+    fn in_use(&self) -> usize { self.total() - self.available() }
+
+    fn well_formed(&self) -> bool {
+        self.available() <= self.total()
+    }
+
+    fn conservation_holds(&self) -> bool {
+        self.available() + self.in_use() == self.total()
+    }
+}
+
+pub trait VerifiedBlockTable {
+    fn num_blocks(&self) -> usize;
+    fn max_blocks(&self) -> usize;
+
+    fn well_formed(&self) -> bool {
+        self.num_blocks() <= self.max_blocks()
+    }
+}
+
+pub trait VerifiedSession {
+    fn position(&self) -> usize;
+    fn cache_seq_len(&self) -> usize;
+    fn max_seq_len(&self) -> usize;
+
+    fn consistent(&self) -> bool {
+        self.position() == self.cache_seq_len()
+            && self.position() <= self.max_seq_len()
+    }
+}
+
+pub trait VerifiedPrefixCache {
+    fn num_entries(&self) -> usize;
+    fn max_entries(&self) -> usize;
+    fn tick(&self) -> u64;
+
+    fn well_formed(&self) -> bool {
+        self.num_entries() <= self.max_entries()
     }
 }

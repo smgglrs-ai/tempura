@@ -4,8 +4,370 @@ use crate::Result;
 #[cfg(feature = "cuda")]
 use cuda_core::DeviceBuffer;
 
+// ── Dot product strategies ─────────────────────────────────────────────────
+
+#[cfg(feature = "cpu")]
+#[inline(always)]
+fn dot_f32(q: &[f32], k: &[f32]) -> f32 {
+    q.iter().zip(k).map(|(a, b)| a * b).sum()
+}
+
+#[cfg(feature = "cpu")]
+#[inline(always)]
+fn dot_f16(q: &[f32], k: &[f32]) -> f32 {
+    q.iter()
+        .zip(k)
+        .map(|(a, b)| half::f16::from_f32(*a).to_f32() * half::f16::from_f32(*b).to_f32())
+        .sum()
+}
+
+// ── Naive attention (parameterized by dot product) ─────────────────────────
+
+#[cfg(feature = "cpu")]
+#[allow(clippy::too_many_arguments)]
+fn naive_attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    output: &mut [f32],
+    batch: usize,
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    window: Option<usize>,
+    dot_fn: fn(&[f32], &[f32]) -> f32,
+) -> Result<()> {
+    let heads_per_group = num_heads / num_kv_heads;
+
+    for b in 0..batch {
+        for h in 0..num_heads {
+            let kv_h = h / heads_per_group;
+            for s in 0..seq_len {
+                let q_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                let q_vec = &q[q_offset..q_offset + head_dim];
+
+                let cache_offset = kv_len - seq_len;
+                let causal_limit = cache_offset + s;
+                let window_start = match window {
+                    Some(w) if causal_limit >= w => causal_limit - w + 1,
+                    _ => 0,
+                };
+
+                let mut scores = vec![0.0f32; kv_len];
+                for (kv_s, score) in scores.iter_mut().enumerate() {
+                    if kv_s > causal_limit || kv_s < window_start {
+                        *score = f32::NEG_INFINITY;
+                        continue;
+                    }
+                    let k_offset = ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim;
+                    let k_vec = &k[k_offset..k_offset + head_dim];
+                    *score = dot_fn(q_vec, k_vec) * scale;
+                }
+
+                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores {
+                    *s = crate::portable_math::portable_exp(*s - max_score);
+                    sum += *s;
+                }
+                for s in &mut scores {
+                    *s /= sum;
+                }
+
+                let o_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                for d in 0..head_dim {
+                    let mut val = 0.0f32;
+                    for (kv_s, &score) in scores.iter().enumerate() {
+                        let v_offset =
+                            ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim + d;
+                        val += score * v[v_offset];
+                    }
+                    output[o_offset + d] = val;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// GGML-compatible naive attention: f64 softmax sum, standard expf.
+/// Translated from ggml.c:14576 (softmax) + ggml.c:16660 (mul_mat for QKV).
+#[cfg(feature = "cpu")]
+#[allow(clippy::too_many_arguments)]
+fn naive_attention_ggml(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    output: &mut [f32],
+    batch: usize,
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    window: Option<usize>,
+) -> Result<()> {
+    let heads_per_group = num_heads / num_kv_heads;
+
+    for b in 0..batch {
+        for h in 0..num_heads {
+            let kv_h = h / heads_per_group;
+            for s in 0..seq_len {
+                let q_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                let q_vec = &q[q_offset..q_offset + head_dim];
+
+                let cache_offset = kv_len - seq_len;
+                let causal_limit = cache_offset + s;
+                let window_start = match window {
+                    Some(w) if causal_limit >= w => causal_limit - w + 1,
+                    _ => 0,
+                };
+
+                // C: QK dot product with scale
+                let mut scores = vec![0.0f32; kv_len];
+                for (kv_s, score) in scores.iter_mut().enumerate() {
+                    if kv_s > causal_limit || kv_s < window_start {
+                        *score = f32::NEG_INFINITY;
+                        continue;
+                    }
+                    let k_offset = ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim;
+                    let k_vec = &k[k_offset..k_offset + head_dim];
+                    // C: ggml_vec_dot_f32 then scale
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_vec[d] * k_vec[d];
+                    }
+                    *score = dot * scale;
+                }
+
+                // C: ggml_vec_max_f32
+                let mut max_score = f32::NEG_INFINITY;
+                for &s in &scores {
+                    if s > max_score { max_score = s; }
+                }
+
+                // C: ggml_vec_soft_max_f32 — scalar path: expf + f64 sum
+                let mut sum: f64 = 0.0;
+                for s in &mut scores {
+                    // C: float val = expf(x[i] - max);
+                    let val = crate::portable_math::ggml_exp(*s - max_score);
+                    // C: sum += (ggml_float)val;
+                    sum += val as f64;
+                    *s = val;
+                }
+
+                // C: sum = 1.0/sum; ggml_vec_scale_f32(nc, dp, sum);
+                let inv_sum = (1.0 / sum) as f32;
+                for s in &mut scores {
+                    *s *= inv_sum;
+                }
+
+                // C: V weighted sum
+                let o_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                for d in 0..head_dim {
+                    let mut val = 0.0f32;
+                    for (kv_s, &score) in scores.iter().enumerate() {
+                        let v_offset =
+                            ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim + d;
+                        val += score * v[v_offset];
+                    }
+                    output[o_offset + d] = val;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Flash attention (tiled online softmax, parameterized by dot product) ───
+
+#[cfg(feature = "cpu")]
+const FLASH_BC: usize = 32;
+
+#[cfg(feature = "cpu")]
+#[allow(clippy::too_many_arguments)]
+fn flash_attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    output: &mut [f32],
+    batch: usize,
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    dot_fn: fn(&[f32], &[f32]) -> f32,
+) -> Result<()> {
+    let heads_per_group = num_heads / num_kv_heads;
+
+    for b in 0..batch {
+        for h in 0..num_heads {
+            let kv_h = h / heads_per_group;
+            for s in 0..seq_len {
+                let q_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                let q_vec = &q[q_offset..q_offset + head_dim];
+
+                let cache_offset = kv_len - seq_len;
+                let causal_limit = cache_offset + s;
+
+                let mut o_acc = vec![0.0f32; head_dim];
+                let mut row_max = f32::NEG_INFINITY;
+                let mut row_sum = 0.0f32;
+
+                let num_tiles = kv_len.div_ceil(FLASH_BC);
+                for tile in 0..num_tiles {
+                    let tile_start = tile * FLASH_BC;
+                    let tile_end = (tile_start + FLASH_BC).min(kv_len);
+
+                    let mut tile_max = f32::NEG_INFINITY;
+                    let mut tile_scores = vec![0.0f32; tile_end - tile_start];
+
+                    for (i, kv_s) in (tile_start..tile_end).enumerate() {
+                        if kv_s > causal_limit {
+                            tile_scores[i] = f32::NEG_INFINITY;
+                            continue;
+                        }
+                        let k_offset =
+                            ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim;
+                        let k_vec = &k[k_offset..k_offset + head_dim];
+                        tile_scores[i] = dot_fn(q_vec, k_vec) * scale;
+                        if tile_scores[i] > tile_max {
+                            tile_max = tile_scores[i];
+                        }
+                    }
+
+                    if tile_max == f32::NEG_INFINITY {
+                        continue;
+                    }
+
+                    let new_max = row_max.max(tile_max);
+                    let correction = if row_max > f32::NEG_INFINITY {
+                        crate::portable_math::portable_exp(row_max - new_max)
+                    } else {
+                        0.0
+                    };
+
+                    for val in &mut o_acc {
+                        *val *= correction;
+                    }
+                    row_sum *= correction;
+
+                    let mut tile_sum = 0.0f32;
+                    for score in &mut tile_scores {
+                        if *score > f32::NEG_INFINITY {
+                            *score = crate::portable_math::portable_exp(*score - new_max);
+                        } else {
+                            *score = 0.0;
+                        }
+                        tile_sum += *score;
+                    }
+
+                    for (i, kv_s) in (tile_start..tile_end).enumerate() {
+                        let w = tile_scores[i];
+                        if w == 0.0 {
+                            continue;
+                        }
+                        let v_base =
+                            ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim;
+                        for d in 0..head_dim {
+                            o_acc[d] += w * v[v_base + d];
+                        }
+                    }
+
+                    row_sum += tile_sum;
+                    row_max = new_max;
+                }
+
+                let o_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                let inv_sum = if row_sum > 0.0 { 1.0 / row_sum } else { 0.0 };
+                for d in 0..head_dim {
+                    output[o_offset + d] = o_acc[d] * inv_sum;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Concrete CPU attention structs ─────────────────────────────────────────
+
+#[cfg(feature = "cpu")]
+pub struct CpuAttentionGgml;
+
+#[cfg(feature = "cpu")]
+impl Attention for CpuAttentionGgml {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Tested
+    }
+
+    fn forward(
+        &self,
+        q: &[f32], k: &[f32], v: &[f32], output: &mut [f32],
+        batch: usize, seq_len: usize, kv_len: usize,
+        num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
+    ) -> Result<()> {
+        naive_attention_ggml(q, k, v, output, batch, seq_len, kv_len,
+                            num_heads, num_kv_heads, head_dim, scale, None)
+    }
+
+    fn forward_windowed(
+        &self,
+        q: &[f32], k: &[f32], v: &[f32], output: &mut [f32],
+        batch: usize, seq_len: usize, kv_len: usize,
+        num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
+        window_size: usize,
+    ) -> Result<()> {
+        naive_attention_ggml(q, k, v, output, batch, seq_len, kv_len,
+                            num_heads, num_kv_heads, head_dim, scale, Some(window_size))
+    }
+}
+
 #[cfg(feature = "cpu")]
 pub struct CpuAttention;
+
+#[cfg(feature = "cpu")]
+pub struct CpuAttentionF16;
+
+#[cfg(feature = "cpu")]
+pub struct CpuFlashAttention;
+
+#[cfg(feature = "cpu")]
+pub struct CpuFlashAttentionF16;
+
+#[cfg(feature = "cpu")]
+macro_rules! impl_cpu_attention {
+    ($name:ident, $algo:ident, $dot:ident $(, $extra:expr)?) => {
+        #[cfg(feature = "cpu")]
+        impl Attention for $name {
+            fn verification_tier(&self) -> crate::VerificationTier {
+                crate::VerificationTier::Tested
+            }
+
+            fn forward(
+                &self,
+                q: &[f32], k: &[f32], v: &[f32], output: &mut [f32],
+                batch: usize, seq_len: usize, kv_len: usize,
+                num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
+            ) -> Result<()> {
+                $algo(q, k, v, output, batch, seq_len, kv_len,
+                      num_heads, num_kv_heads, head_dim, scale, $($extra,)? $dot)
+            }
+        }
+    };
+}
+
+impl_cpu_attention!(CpuAttentionF16, naive_attention, dot_f16, None);
+impl_cpu_attention!(CpuFlashAttention, flash_attention, dot_f32);
+impl_cpu_attention!(CpuFlashAttentionF16, flash_attention, dot_f16);
 
 #[cfg(feature = "cpu")]
 impl Attention for CpuAttention {
@@ -15,140 +377,24 @@ impl Attention for CpuAttention {
 
     fn forward(
         &self,
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        output: &mut [f32],
-        batch: usize,
-        seq_len: usize,
-        kv_len: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        scale: f32,
+        q: &[f32], k: &[f32], v: &[f32], output: &mut [f32],
+        batch: usize, seq_len: usize, kv_len: usize,
+        num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
     ) -> Result<()> {
-        let heads_per_group = num_heads / num_kv_heads;
-
-        for b in 0..batch {
-            for h in 0..num_heads {
-                let kv_h = h / heads_per_group;
-                for s in 0..seq_len {
-                    let q_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
-                    let q_vec = &q[q_offset..q_offset + head_dim];
-
-                    let cache_offset = kv_len - seq_len;
-                    let causal_limit = cache_offset + s;
-
-                    let mut scores = vec![0.0f32; kv_len];
-                    for (kv_s, score) in scores.iter_mut().enumerate() {
-                        if kv_s > causal_limit {
-                            *score = f32::NEG_INFINITY;
-                            continue;
-                        }
-                        let k_offset = ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim;
-                        let k_vec = &k[k_offset..k_offset + head_dim];
-                        let dot: f32 = q_vec.iter().zip(k_vec).map(|(a, b)| a * b).sum();
-                        *score = dot * scale;
-                    }
-
-                    // softmax
-                    let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum = 0.0f32;
-                    for s in &mut scores {
-                        *s = (*s - max_score).exp();
-                        sum += *s;
-                    }
-                    for s in &mut scores {
-                        *s /= sum;
-                    }
-
-                    // weighted sum of values
-                    let o_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
-                    for d in 0..head_dim {
-                        let mut val = 0.0f32;
-                        for (kv_s, &score) in scores.iter().enumerate() {
-                            let v_offset =
-                                ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim + d;
-                            val += score * v[v_offset];
-                        }
-                        output[o_offset + d] = val;
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        naive_attention(q, k, v, output, batch, seq_len, kv_len,
+                       num_heads, num_kv_heads, head_dim, scale, None, dot_f32)
     }
 
     fn forward_windowed(
         &self,
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        output: &mut [f32],
-        batch: usize,
-        seq_len: usize,
-        kv_len: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        scale: f32,
-        window_size: usize,
+        q: &[f32], k: &[f32], v: &[f32], output: &mut [f32],
+        batch: usize, seq_len: usize, kv_len: usize,
+        num_heads: usize, num_kv_heads: usize, head_dim: usize,
+        scale: f32, window_size: usize,
     ) -> Result<()> {
-        let heads_per_group = num_heads / num_kv_heads;
-
-        for b in 0..batch {
-            for h in 0..num_heads {
-                let kv_h = h / heads_per_group;
-                for s in 0..seq_len {
-                    let q_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
-                    let q_vec = &q[q_offset..q_offset + head_dim];
-
-                    let cache_offset = kv_len - seq_len;
-                    let causal_limit = cache_offset + s;
-                    let window_start = if causal_limit >= window_size {
-                        causal_limit - window_size + 1
-                    } else {
-                        0
-                    };
-
-                    let mut scores = vec![0.0f32; kv_len];
-                    for (kv_s, score) in scores.iter_mut().enumerate() {
-                        if kv_s > causal_limit || kv_s < window_start {
-                            *score = f32::NEG_INFINITY;
-                            continue;
-                        }
-                        let k_offset = ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim;
-                        let k_vec = &k[k_offset..k_offset + head_dim];
-                        let dot: f32 = q_vec.iter().zip(k_vec).map(|(a, b)| a * b).sum();
-                        *score = dot * scale;
-                    }
-
-                    let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum = 0.0f32;
-                    for s in &mut scores {
-                        *s = (*s - max_score).exp();
-                        sum += *s;
-                    }
-                    for s in &mut scores {
-                        *s /= sum;
-                    }
-
-                    let o_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
-                    for d in 0..head_dim {
-                        let mut val = 0.0f32;
-                        for (kv_s, &score) in scores.iter().enumerate() {
-                            let v_offset =
-                                ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim + d;
-                            val += score * v[v_offset];
-                        }
-                        output[o_offset + d] = val;
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        naive_attention(q, k, v, output, batch, seq_len, kv_len,
+                       num_heads, num_kv_heads, head_dim, scale,
+                       Some(window_size), dot_f32)
     }
 }
 
@@ -226,7 +472,6 @@ impl CudaAttention {
         scale: f32,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
 
         if head_dim == 128 && seq_len == 1 {
@@ -335,6 +580,89 @@ impl CudaAttention {
         Ok(())
     }
 
+    pub fn forward_device_with_mode(
+        &self,
+        q: &DeviceBuffer<f32>,
+        k: &DeviceBuffer<f32>,
+        v: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        batch: usize,
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        mode: crate::AttentionMode,
+    ) -> crate::Result<()> {
+        use crate::AttentionMode::*;
+        use cuda_core::LaunchConfig;
+        let stream = self.gpu.stream();
+
+        match mode {
+            NaiveF32 => {
+                let total = batch * seq_len * num_heads * head_dim;
+                self.module
+                    .attention_forward(
+                        &stream, LaunchConfig::for_num_elems(total as u32),
+                        q, k, v, output,
+                        batch as u32, seq_len as u32, kv_len as u32,
+                        num_heads as u32, num_kv_heads as u32, head_dim as u32, scale,
+                    )
+                    .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+            }
+            NaiveF16 => {
+                let total = batch * seq_len * num_heads * head_dim;
+                self.module
+                    .attention_forward_f16(
+                        &stream, LaunchConfig::for_num_elems(total as u32),
+                        q, k, v, output,
+                        batch as u32, seq_len as u32, kv_len as u32,
+                        num_heads as u32, num_kv_heads as u32, head_dim as u32, scale,
+                    )
+                    .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+            }
+            FlashF16 => {
+                let flash = self.flash_module.as_ref().ok_or_else(|| {
+                    crate::KernelError::InvalidConfig("flash module not loaded".into())
+                })?;
+                let config = LaunchConfig {
+                    grid_dim: (num_heads as u32, (seq_len as u32).div_ceil(32), batch as u32),
+                    block_dim: (64, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                flash
+                    .flash_attention_forward(
+                        &stream, config, q, k, v, output,
+                        batch as u32, seq_len as u32, kv_len as u32,
+                        num_heads as u32, num_kv_heads as u32, head_dim as u32, scale,
+                    )
+                    .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+            }
+            FlashF32 => {
+                let flash = self.flash_module.as_ref().ok_or_else(|| {
+                    crate::KernelError::InvalidConfig("flash module not loaded".into())
+                })?;
+                let total = batch * seq_len * num_heads;
+                let config = LaunchConfig::for_num_elems(total as u32);
+                flash
+                    .flash_attention_forward_f32(
+                        &stream, config, q, k, v, output,
+                        batch as u32, seq_len as u32, kv_len as u32,
+                        num_heads as u32, num_kv_heads as u32, head_dim as u32, scale,
+                    )
+                    .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+            }
+            Auto => {
+                return self.forward_device(
+                    q, k, v, output, batch, seq_len, kv_len,
+                    num_heads, num_kv_heads, head_dim, scale,
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn forward_device_naive(
         &self,
         q: &DeviceBuffer<f32>,
@@ -350,7 +678,6 @@ impl CudaAttention {
         scale: f32,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let total = batch * seq_len * num_heads * head_dim;
         self.module
@@ -388,7 +715,6 @@ impl CudaAttention {
         scale: f32,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
 
         if head_dim == 128 && seq_len > 0 {
@@ -445,7 +771,6 @@ impl Attention for CudaAttention {
         head_dim: usize,
         scale: f32,
     ) -> Result<()> {
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let total = batch * seq_len * num_heads * head_dim;
 
@@ -886,5 +1211,59 @@ mod tests {
                 seq_out_2[d]
             );
         }
+    }
+
+    #[test]
+    fn test_cpu_attention_precision_matrix() {
+        let head_dim = 128;
+        let seq_len = 1;
+        let kv_len = 16;
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..seq_len * num_heads * head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.3)
+            .collect();
+        let k: Vec<f32> = (0..kv_len * num_kv_heads * head_dim)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.25)
+            .collect();
+        let v: Vec<f32> = (0..kv_len * num_kv_heads * head_dim)
+            .map(|i| ((i % 19) as f32 - 9.0) * 0.1)
+            .collect();
+
+        let run = |attn: &dyn Attention| -> Vec<f32> {
+            let mut out = vec![0.0f32; seq_len * num_heads * head_dim];
+            attn.forward(&q, &k, &v, &mut out, 1, seq_len, kv_len,
+                         num_heads, num_kv_heads, head_dim, scale).unwrap();
+            out
+        };
+
+        let ref_out = run(&CpuAttention);
+        let f16_naive = run(&CpuAttentionF16);
+        let f32_flash = run(&CpuFlashAttention);
+        let f16_flash = run(&CpuFlashAttentionF16);
+
+        let max_diff = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        };
+
+        let d_f16_naive = max_diff(&ref_out, &f16_naive);
+        let d_f32_flash = max_diff(&ref_out, &f32_flash);
+        let d_f16_flash = max_diff(&ref_out, &f16_flash);
+        let d_f16_cross = max_diff(&f16_naive, &f16_flash);
+
+        eprintln!("  naive-f32 vs naive-f16:  {d_f16_naive:.6}");
+        eprintln!("  naive-f32 vs flash-f32:  {d_f32_flash:.6}");
+        eprintln!("  naive-f32 vs flash-f16:  {d_f16_flash:.6}");
+        eprintln!("  naive-f16 vs flash-f16:  {d_f16_cross:.6}");
+
+        // f32 flash must match f32 naive exactly (same precision, different algorithm)
+        assert!(d_f32_flash < 1e-5, "flash-f32 diverges from naive-f32: {d_f32_flash}");
+        // f16 variants must match each other (same precision, different algorithm)
+        assert!(d_f16_cross < 1e-5, "naive-f16 diverges from flash-f16: {d_f16_cross}");
+        // f16 vs f32 should differ (proving f16 truncation has an effect) but not wildly
+        assert!(d_f16_naive > 1e-6, "f16 truncation should have measurable effect");
+        assert!(d_f16_naive < 0.1, "f16 divergence too large: {d_f16_naive}");
     }
 }

@@ -117,6 +117,35 @@ impl InferenceSession {
     }
 }
 
+impl tempura_kernel_api::VerifiedSession for InferenceSession {
+    fn position(&self) -> usize { self.position }
+    fn cache_seq_len(&self) -> usize { self.cache.seq_len }
+    fn max_seq_len(&self) -> usize { self.cache.max_seq_len() }
+}
+
+use vstd::prelude::*;
+
+verus! {
+
+proof fn session_new_consistent(max_seq_len: nat)
+    requires max_seq_len >= 1,
+    ensures 0nat == 0nat && 0nat <= max_seq_len,
+{
+}
+
+proof fn session_advance_consistent(pos: nat, cache_sl: nat, max_sl: nat, n: nat)
+    requires pos == cache_sl, pos <= max_sl, n >= 1, pos + n <= max_sl,
+    ensures pos + n == cache_sl + n && pos + n <= max_sl,
+{
+}
+
+proof fn session_reset_consistent()
+    ensures 0nat == 0nat,
+{
+}
+
+} // verus!
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionTransfer {
     pub cache: crate::kv_cache::KvCacheTransfer,

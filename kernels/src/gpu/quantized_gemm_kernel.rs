@@ -459,16 +459,20 @@ pub mod kernels {
             let qs = &b_q4k[block_offset + 16..];
             let a_base = blk * Q4K_BLOCK_SIZE;
 
-            let mut li = 0usize;
-            while li < 4 {
-                let byte = qs[qs_byte_off + li];
-                let q_lo = (byte & 0x0F) as f32;
-                let q_hi = (byte >> 4) as f32;
+            let raw = ld_global_b32(qs, qs_byte_off);
+            let b0 = (raw & 0xFF) as u8;
+            let b1 = ((raw >> 8) & 0xFF) as u8;
+            let b2 = ((raw >> 16) & 0xFF) as u8;
+            let b3 = ((raw >> 24) & 0xFF) as u8;
 
-                lane_sum += a[a_base + elem_lo_base + li] * (d_lo * q_lo - m_lo);
-                lane_sum += a[a_base + elem_hi_base + li] * (d_hi * q_hi - m_hi);
-                li += 1;
-            }
+            lane_sum += a[a_base + elem_lo_base] * (d_lo * (b0 & 0x0F) as f32 - m_lo);
+            lane_sum += a[a_base + elem_hi_base] * (d_hi * (b0 >> 4) as f32 - m_hi);
+            lane_sum += a[a_base + elem_lo_base + 1] * (d_lo * (b1 & 0x0F) as f32 - m_lo);
+            lane_sum += a[a_base + elem_hi_base + 1] * (d_hi * (b1 >> 4) as f32 - m_hi);
+            lane_sum += a[a_base + elem_lo_base + 2] * (d_lo * (b2 & 0x0F) as f32 - m_lo);
+            lane_sum += a[a_base + elem_hi_base + 2] * (d_hi * (b2 >> 4) as f32 - m_hi);
+            lane_sum += a[a_base + elem_lo_base + 3] * (d_lo * (b3 & 0x0F) as f32 - m_lo);
+            lane_sum += a[a_base + elem_hi_base + 3] * (d_hi * (b3 >> 4) as f32 - m_hi);
 
             blk += 1;
         }
@@ -1618,6 +1622,473 @@ pub mod kernels {
                     sum += a[a_base + elem_base + l + 32] * d * sc1 * q2 as f32;
                     sum += a[a_base + elem_base + l + 64] * d * sc2 * q3 as f32;
                     sum += a[a_base + elem_base + l + 96] * d * sc3 * q4 as f32;
+                    l += 1;
+                }
+                half += 1;
+            }
+
+            blk += 1;
+        }
+
+        if let Some(elem) = output.get_mut(idx) {
+            *elem = sum;
+        }
+    }
+
+    /// Warp-cooperative Q6K GEMV for decode (m=1, f32 activations).
+    /// Same pattern as gemv_q4k_coop: one warp per output column, 32 lanes
+    /// process one Q6K block (256 elements) together, accumulate across all
+    /// blocks, single warp reduction at the end.
+    ///
+    /// Grid: (ceil(n/WARPS_Y), 1, 1), Block: (32, WARPS_Y, 1)
+    #[kernel]
+    pub fn gemv_q6k_coop(
+        n: u32,
+        k: u32,
+        a: &[f32],
+        b_q6k: &[u8],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let lane = warp::lane_id() as usize;
+        let col = (thread::blockIdx_x() as usize) * (thread::blockDim_y() as usize)
+            + thread::threadIdx_y() as usize;
+
+        let n = n as usize;
+        let k = k as usize;
+        if col >= n {
+            return;
+        }
+
+        let blocks_per_row = k / Q6K_BLOCK_SIZE;
+        let mut lane_sum = 0.0f32;
+
+        let l = lane; // each lane handles l=lane across both halves
+        let is = l / 16;
+
+        let mut blk = 0usize;
+        while blk < blocks_per_row {
+            let block_offset = (col * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+            let ql = &b_q6k[block_offset..];
+            let qh = &b_q6k[block_offset + 128..];
+            let scales = &b_q6k[block_offset + 192..];
+            let d = f16_bits_to_f32(
+                (b_q6k[block_offset + 208] as u16) | ((b_q6k[block_offset + 209] as u16) << 8),
+            );
+
+            let a_base = blk * Q6K_BLOCK_SIZE;
+
+            // Half 0: elements 0..127
+            let ql_off0 = 0usize;
+            let qh_off0 = 0usize;
+
+            let q1_0 = ((ql[ql_off0 + l] & 0xF) | (((qh[qh_off0 + l] >> 0) & 3) << 4)) as i32 - 32;
+            let q2_0 = ((ql[ql_off0 + l + 32] & 0xF) | (((qh[qh_off0 + l] >> 2) & 3) << 4)) as i32 - 32;
+            let q3_0 = ((ql[ql_off0 + l] >> 4) | (((qh[qh_off0 + l] >> 4) & 3) << 4)) as i32 - 32;
+            let q4_0 = ((ql[ql_off0 + l + 32] >> 4) | (((qh[qh_off0 + l] >> 6) & 3) << 4)) as i32 - 32;
+
+            let sc0_0 = d * (scales[is] as i8 as f32);
+            let sc1_0 = d * (scales[is + 2] as i8 as f32);
+            let sc2_0 = d * (scales[is + 4] as i8 as f32);
+            let sc3_0 = d * (scales[is + 6] as i8 as f32);
+
+            lane_sum += a[a_base + l] * sc0_0 * q1_0 as f32;
+            lane_sum += a[a_base + l + 32] * sc1_0 * q2_0 as f32;
+            lane_sum += a[a_base + l + 64] * sc2_0 * q3_0 as f32;
+            lane_sum += a[a_base + l + 96] * sc3_0 * q4_0 as f32;
+
+            // Half 1: elements 128..255
+            let ql_off1 = 64usize;
+            let qh_off1 = 32usize;
+
+            let q1_1 = ((ql[ql_off1 + l] & 0xF) | (((qh[qh_off1 + l] >> 0) & 3) << 4)) as i32 - 32;
+            let q2_1 = ((ql[ql_off1 + l + 32] & 0xF) | (((qh[qh_off1 + l] >> 2) & 3) << 4)) as i32 - 32;
+            let q3_1 = ((ql[ql_off1 + l] >> 4) | (((qh[qh_off1 + l] >> 4) & 3) << 4)) as i32 - 32;
+            let q4_1 = ((ql[ql_off1 + l + 32] >> 4) | (((qh[qh_off1 + l] >> 6) & 3) << 4)) as i32 - 32;
+
+            let sc0_1 = d * (scales[8 + is] as i8 as f32);
+            let sc1_1 = d * (scales[8 + is + 2] as i8 as f32);
+            let sc2_1 = d * (scales[8 + is + 4] as i8 as f32);
+            let sc3_1 = d * (scales[8 + is + 6] as i8 as f32);
+
+            lane_sum += a[a_base + 128 + l] * sc0_1 * q1_1 as f32;
+            lane_sum += a[a_base + 128 + l + 32] * sc1_1 * q2_1 as f32;
+            lane_sum += a[a_base + 128 + l + 64] * sc2_1 * q3_1 as f32;
+            lane_sum += a[a_base + 128 + l + 96] * sc3_1 * q4_1 as f32;
+
+            blk += 1;
+        }
+
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 16);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 8);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 4);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 2);
+        lane_sum += warp::shuffle_xor_f32(lane_sum, 1);
+
+        if lane == 0 {
+            unsafe {
+                *output.get_unchecked_mut(col) = lane_sum;
+            }
+        }
+    }
+
+    /// Deterministic batched Q4K×Q8 matmul: one thread per output element,
+    /// sequential accumulation matching CPU order. No warp reduction.
+    /// a_q8: [m * q8_blocks_per_row * 10] packed Q8 activations (row-major)
+    /// b_q4k: [n * blocks_per_row * Q4K_BLOCK_BYTES] packed Q4K weights
+    /// output: [m, n]
+    #[kernel]
+    pub fn gemm_q4k_q8_det(
+        m: u32,
+        n: u32,
+        k: u32,
+        a_q8: &[u32],
+        b_q4k: &[u8],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let tid = idx.get();
+        let m = m as usize;
+        let n = n as usize;
+        let k = k as usize;
+
+        if tid >= m * n {
+            return;
+        }
+
+        let row = tid / n;
+        let col = tid % n;
+
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let q8_blocks_per_q4k = Q4K_BLOCK_SIZE / Q8_BLOCK_SIZE;
+        let q8_blocks_per_row = k / Q8_BLOCK_SIZE;
+        let q8_row_stride = q8_blocks_per_row * 10;
+
+        let mut sum = 0.0f32;
+
+        let mut blk = 0usize;
+        while blk < blocks_per_row {
+            let block_offset = (col * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+
+            let d4 = f16_bits_to_f32(
+                (b_q4k[block_offset] as u16) | ((b_q4k[block_offset + 1] as u16) << 8),
+            );
+            let dmin4 = f16_bits_to_f32(
+                (b_q4k[block_offset + 2] as u16) | ((b_q4k[block_offset + 3] as u16) << 8),
+            );
+
+            let packed = &b_q4k[block_offset + 4..];
+            let mut sc = [0u8; 8];
+            let mut mins = [0u8; 8];
+            let mut i = 0usize;
+            while i < 4 {
+                sc[i] = packed[i] & 0x3F;
+                sc[i + 4] = ((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F;
+                mins[i] = packed[i + 4] & 0x3F;
+                mins[i + 4] = ((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F;
+                i += 1;
+            }
+
+            let qs = &b_q4k[block_offset + 16..];
+            let q8_base_blk = blk * q8_blocks_per_q4k;
+
+            let mut j = 0usize;
+            while j < 4 {
+                let q_off = j * 32;
+                let d_sc = d4 * (sc[2 * j] as f32);
+                let d_min = dmin4 * (mins[2 * j] as f32);
+                let d_sc_hi = d4 * (sc[2 * j + 1] as f32);
+                let d_min_hi = dmin4 * (mins[2 * j + 1] as f32);
+
+                let elem_lo_base = j * 64;
+                let elem_hi_base = j * 64 + 32;
+
+                let mut l = 0usize;
+                while l < 32 {
+                    let q_lo = (qs[q_off + l] & 0x0F) as f32;
+                    let q_hi = (qs[q_off + l] >> 4) as f32;
+
+                    let lo_elem = elem_lo_base + l;
+                    let hi_elem = elem_hi_base + l;
+
+                    let lo_q8_blk = q8_base_blk + lo_elem / Q8_BLOCK_SIZE;
+                    let lo_q8_off = lo_elem % Q8_BLOCK_SIZE;
+                    let lo_q8_base = row * q8_row_stride + lo_q8_blk * 10;
+                    let d8_lo = f32::from_bits(a_q8[lo_q8_base]);
+                    let q8_word_lo = a_q8[lo_q8_base + 2 + lo_q8_off / 4];
+                    let q8_byte_lo = ((q8_word_lo >> ((lo_q8_off % 4) * 8)) & 0xFF) as i8;
+                    let a_lo = d8_lo * (q8_byte_lo as f32);
+
+                    let hi_q8_blk = q8_base_blk + hi_elem / Q8_BLOCK_SIZE;
+                    let hi_q8_off = hi_elem % Q8_BLOCK_SIZE;
+                    let hi_q8_base = row * q8_row_stride + hi_q8_blk * 10;
+                    let d8_hi = f32::from_bits(a_q8[hi_q8_base]);
+                    let q8_word_hi = a_q8[hi_q8_base + 2 + hi_q8_off / 4];
+                    let q8_byte_hi = ((q8_word_hi >> ((hi_q8_off % 4) * 8)) & 0xFF) as i8;
+                    let a_hi = d8_hi * (q8_byte_hi as f32);
+
+                    sum += a_lo * (d_sc * q_lo - d_min);
+                    sum += a_hi * (d_sc_hi * q_hi - d_min_hi);
+
+                    l += 1;
+                }
+                j += 1;
+            }
+
+            blk += 1;
+        }
+
+        if let Some(elem) = output.get_mut(idx) {
+            *elem = sum;
+        }
+    }
+
+    /// Q6K × Q8 GEMV via integer dot products.
+    ///
+    /// Q6K layout (210 bytes / 256 elements): ql[128] + qh[64] + scales[16] + d(f16).
+    /// Each element is a signed 6-bit value (-32..31): low 4 bits from ql, high 2 from qh.
+    /// 16 groups of 16 elements each, with an i8 per-group scale.
+    /// Formula: weight = d * group_scale * q6_value
+    ///
+    /// Grid: (ceil(n/WARPS_Y), 1, 1), Block: (32, WARPS_Y, 1)
+    /// One warp per output column. Each lane processes 8 elements (4 from each half).
+    #[kernel]
+    pub fn gemv_q6k_q8_dp4a(
+        n: u32,
+        k: u32,
+        a_q8: &[u32],
+        b_q6k: &[u8],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let lane = warp::lane_id() as usize;
+        let col = (thread::blockIdx_x() as usize) * (thread::blockDim_y() as usize)
+            + thread::threadIdx_y() as usize;
+
+        let n = n as usize;
+        let k = k as usize;
+        if col >= n {
+            return;
+        }
+
+        let blocks_per_row = k / Q6K_BLOCK_SIZE;
+        let q8_blocks_per_q6k = Q6K_BLOCK_SIZE / Q8_BLOCK_SIZE; // 8
+
+        let mut col_sum = 0.0f32;
+
+        let mut blk = 0usize;
+        while blk < blocks_per_row {
+            let block_offset = (col * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+            let ql = &b_q6k[block_offset..];
+            let qh = &b_q6k[block_offset + 128..];
+            let scales = &b_q6k[block_offset + 192..];
+            let d = f16_bits_to_f32(
+                (b_q6k[block_offset + 208] as u16) | ((b_q6k[block_offset + 209] as u16) << 8),
+            );
+
+            let q8_base = blk * q8_blocks_per_q6k;
+
+            // Each lane handles 8 elements across two halves:
+            // half=0: elements from first 128 of the block
+            // half=1: elements from second 128
+            // Within each half, lane L handles elements at positions determined by
+            // the Q6K interleaved layout.
+            //
+            // Q6K has 16 groups of 16: half 0 has groups 0..7, half 1 has groups 8..15.
+            // Within a half, 4 sub-quadrants of 32 elements each:
+            //   q1: ql[l] & 0xF       | qh[l] bits 0..1  -> elem_base + l         (group is/is)
+            //   q2: ql[l+32] & 0xF    | qh[l] bits 2..3  -> elem_base + l + 32    (group is+2)
+            //   q3: ql[l] >> 4        | qh[l] bits 4..5  -> elem_base + l + 64    (group is+4)
+            //   q4: ql[l+32] >> 4     | qh[l] bits 6..7  -> elem_base + l + 96    (group is+6)
+            // where is = l / 16
+
+            let mut half = 0usize;
+            while half < 2 {
+                let ql_off = half * 64;
+                let qh_off = half * 32;
+                let elem_base = half * 128;
+
+                // Each lane takes one l value (0..31 spread across 32 lanes)
+                // Lane handles l = lane (if lane < 32, which it always is for warp)
+                let l = lane;
+                let is = l / 16;
+
+                let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+
+                let sc0 = scales[half * 8 + is] as i8 as f32;
+                let sc1 = scales[half * 8 + is + 2] as i8 as f32;
+                let sc2 = scales[half * 8 + is + 4] as i8 as f32;
+                let sc3 = scales[half * 8 + is + 6] as i8 as f32;
+
+                // Look up Q8 activation values
+                let e0 = elem_base + l;
+                let e1 = elem_base + l + 32;
+                let e2 = elem_base + l + 64;
+                let e3 = elem_base + l + 96;
+
+                let q8b0 = q8_base + e0 / Q8_BLOCK_SIZE;
+                let q8o0 = e0 % Q8_BLOCK_SIZE;
+                let q8base0 = q8b0 * 10;
+                let d8_0 = f32::from_bits(a_q8[q8base0]);
+                let q8w0 = a_q8[q8base0 + 2 + q8o0 / 4];
+                let a0 = d8_0 * (((q8w0 >> ((q8o0 % 4) * 8)) & 0xFF) as i8 as f32);
+
+                let q8b1 = q8_base + e1 / Q8_BLOCK_SIZE;
+                let q8o1 = e1 % Q8_BLOCK_SIZE;
+                let q8base1 = q8b1 * 10;
+                let d8_1 = f32::from_bits(a_q8[q8base1]);
+                let q8w1 = a_q8[q8base1 + 2 + q8o1 / 4];
+                let a1 = d8_1 * (((q8w1 >> ((q8o1 % 4) * 8)) & 0xFF) as i8 as f32);
+
+                let q8b2 = q8_base + e2 / Q8_BLOCK_SIZE;
+                let q8o2 = e2 % Q8_BLOCK_SIZE;
+                let q8base2 = q8b2 * 10;
+                let d8_2 = f32::from_bits(a_q8[q8base2]);
+                let q8w2 = a_q8[q8base2 + 2 + q8o2 / 4];
+                let a2 = d8_2 * (((q8w2 >> ((q8o2 % 4) * 8)) & 0xFF) as i8 as f32);
+
+                let q8b3 = q8_base + e3 / Q8_BLOCK_SIZE;
+                let q8o3 = e3 % Q8_BLOCK_SIZE;
+                let q8base3 = q8b3 * 10;
+                let d8_3 = f32::from_bits(a_q8[q8base3]);
+                let q8w3 = a_q8[q8base3 + 2 + q8o3 / 4];
+                let a3 = d8_3 * (((q8w3 >> ((q8o3 % 4) * 8)) & 0xFF) as i8 as f32);
+
+                let mut partial = d * sc0 * (q1 as f32) * a0
+                    + d * sc1 * (q2 as f32) * a1
+                    + d * sc2 * (q3 as f32) * a2
+                    + d * sc3 * (q4 as f32) * a3;
+
+                // Warp reduction
+                partial += warp::shuffle_xor_f32(partial, 16);
+                partial += warp::shuffle_xor_f32(partial, 8);
+                partial += warp::shuffle_xor_f32(partial, 4);
+                partial += warp::shuffle_xor_f32(partial, 2);
+                partial += warp::shuffle_xor_f32(partial, 1);
+
+                if lane == 0 {
+                    col_sum += partial;
+                }
+
+                half += 1;
+            }
+
+            blk += 1;
+        }
+
+        if lane == 0 {
+            unsafe {
+                *output.get_unchecked_mut(col) = col_sum;
+            }
+        }
+    }
+
+    /// Deterministic batched Q6K×Q8 matmul: one thread per output element,
+    /// sequential accumulation. Same approach as gemm_q4k_q8_det but for Q6K weights.
+    /// a_q8: [m * q8_blocks_per_row * 10] packed Q8 activations
+    /// b_q6k: [n * blocks_per_row * Q6K_BLOCK_BYTES] packed Q6K weights
+    /// output: [m, n]
+    #[kernel]
+    pub fn gemm_q6k_q8_det(
+        m: u32,
+        n: u32,
+        k: u32,
+        a_q8: &[u32],
+        b_q6k: &[u8],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let tid = idx.get();
+        let m = m as usize;
+        let n = n as usize;
+        let k = k as usize;
+
+        if tid >= m * n {
+            return;
+        }
+
+        let row = tid / n;
+        let col = tid % n;
+
+        let blocks_per_row = k / Q6K_BLOCK_SIZE;
+        let q8_blocks_per_q6k = Q6K_BLOCK_SIZE / Q8_BLOCK_SIZE;
+        let q8_blocks_per_row = k / Q8_BLOCK_SIZE;
+        let q8_row_stride = q8_blocks_per_row * 10;
+
+        let mut sum = 0.0f32;
+
+        let mut blk = 0usize;
+        while blk < blocks_per_row {
+            let block_offset = (col * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+            let ql = &b_q6k[block_offset..];
+            let qh = &b_q6k[block_offset + 128..];
+            let scales = &b_q6k[block_offset + 192..];
+            let d = f16_bits_to_f32(
+                (b_q6k[block_offset + 208] as u16) | ((b_q6k[block_offset + 209] as u16) << 8),
+            );
+
+            let q8_base_blk = blk * q8_blocks_per_q6k;
+
+            let mut half = 0usize;
+            while half < 2 {
+                let ql_off = half * 64;
+                let qh_off = half * 32;
+                let elem_base = half * 128;
+
+                let mut l = 0usize;
+                while l < 32 {
+                    let is = l / 16;
+
+                    let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+                    let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                    let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                    let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+
+                    let sc0 = scales[half * 8 + is] as i8 as f32;
+                    let sc1 = scales[half * 8 + is + 2] as i8 as f32;
+                    let sc2 = scales[half * 8 + is + 4] as i8 as f32;
+                    let sc3 = scales[half * 8 + is + 6] as i8 as f32;
+
+                    // 4 elements: at positions elem_base+l, +l+32, +l+64, +l+96
+                    let e0 = elem_base + l;
+                    let e1 = elem_base + l + 32;
+                    let e2 = elem_base + l + 64;
+                    let e3 = elem_base + l + 96;
+
+                    let q8b0 = q8_base_blk + e0 / Q8_BLOCK_SIZE;
+                    let q8o0 = e0 % Q8_BLOCK_SIZE;
+                    let q8base0 = row * q8_row_stride + q8b0 * 10;
+                    let d8_0 = f32::from_bits(a_q8[q8base0]);
+                    let q8w0 = a_q8[q8base0 + 2 + q8o0 / 4];
+                    let a0 = d8_0 * (((q8w0 >> ((q8o0 % 4) * 8)) & 0xFF) as i8 as f32);
+
+                    let q8b1 = q8_base_blk + e1 / Q8_BLOCK_SIZE;
+                    let q8o1 = e1 % Q8_BLOCK_SIZE;
+                    let q8base1 = row * q8_row_stride + q8b1 * 10;
+                    let d8_1 = f32::from_bits(a_q8[q8base1]);
+                    let q8w1 = a_q8[q8base1 + 2 + q8o1 / 4];
+                    let a1 = d8_1 * (((q8w1 >> ((q8o1 % 4) * 8)) & 0xFF) as i8 as f32);
+
+                    let q8b2 = q8_base_blk + e2 / Q8_BLOCK_SIZE;
+                    let q8o2 = e2 % Q8_BLOCK_SIZE;
+                    let q8base2 = row * q8_row_stride + q8b2 * 10;
+                    let d8_2 = f32::from_bits(a_q8[q8base2]);
+                    let q8w2 = a_q8[q8base2 + 2 + q8o2 / 4];
+                    let a2 = d8_2 * (((q8w2 >> ((q8o2 % 4) * 8)) & 0xFF) as i8 as f32);
+
+                    let q8b3 = q8_base_blk + e3 / Q8_BLOCK_SIZE;
+                    let q8o3 = e3 % Q8_BLOCK_SIZE;
+                    let q8base3 = row * q8_row_stride + q8b3 * 10;
+                    let d8_3 = f32::from_bits(a_q8[q8base3]);
+                    let q8w3 = a_q8[q8base3 + 2 + q8o3 / 4];
+                    let a3 = d8_3 * (((q8w3 >> ((q8o3 % 4) * 8)) & 0xFF) as i8 as f32);
+
+                    sum += d * sc0 * (q1 as f32) * a0;
+                    sum += d * sc1 * (q2 as f32) * a1;
+                    sum += d * sc2 * (q3 as f32) * a2;
+                    sum += d * sc3 * (q4 as f32) * a3;
+
                     l += 1;
                 }
                 half += 1;

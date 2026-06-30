@@ -48,10 +48,136 @@ impl RoPE for CpuRoPE {
     }
 }
 
+/// GGML-compatible RoPE: adjacent pairs, multiplicative theta accumulation.
+/// Translated from ggml.c:14943-15066 (non-NeoX mode, ext_factor=0).
+#[cfg(feature = "cpu")]
+pub struct CpuRoPEGgml;
+
+#[cfg(feature = "cpu")]
+impl RoPE for CpuRoPEGgml {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Tested
+    }
+
+    fn forward(
+        &self,
+        x: &mut [f32],
+        _batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        positions: &[u32],
+        freq_base: f32,
+    ) -> Result<()> {
+        // C: const float theta_scale = powf(freq_base, -2.0f/n_dims);
+        let theta_scale: f32 = freq_base.powf(-2.0 / head_dim as f32);
+
+        for s in 0..seq_len {
+            // C: const int64_t p = pos[i2];
+            let p = positions[s] as f32;
+
+            // C: ggml_rope_cache_init — simplified for ext_factor=0, freq_scale=1, no freq_factors
+            // C: float theta = theta_base;  (theta_base = p)
+            // C: for (i0 = 0; i0 < ne0; i0 += 2) { cos = cosf(theta); sin = sinf(theta); theta *= theta_scale; }
+            let mut theta: f32 = p;
+
+            for i0 in (0..head_dim).step_by(2) {
+                let cos_theta = theta.cos();
+                let sin_theta = theta.sin();
+
+                // C: for (i1 = 0; i1 < ne1; i1++) — iterate over heads
+                for h in 0..num_heads {
+                    let offset = (s * num_heads + h) * head_dim;
+                    // C: const float x0 = src[0]; const float x1 = src[1];
+                    let x0 = x[offset + i0];
+                    let x1 = x[offset + i0 + 1];
+                    // C: dst_data[0] = x0*cos_theta - x1*sin_theta;
+                    // C: dst_data[1] = x0*sin_theta + x1*cos_theta;
+                    x[offset + i0] = x0 * cos_theta - x1 * sin_theta;
+                    x[offset + i0 + 1] = x0 * sin_theta + x1 * cos_theta;
+                }
+
+                // C: theta *= theta_scale;
+                theta *= theta_scale;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cpu")]
+pub struct CpuRoPETable {
+    pub table: Vec<f32>,
+    pub head_dim: usize,
+}
+
+#[cfg(feature = "cpu")]
+impl CpuRoPETable {
+    pub fn new(max_pos: usize, head_dim: usize, theta: f32) -> Self {
+        Self { table: build_cos_sin_table(max_pos, head_dim, theta), head_dim }
+    }
+}
+
+#[cfg(feature = "cpu")]
+impl RoPE for CpuRoPETable {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Tested
+    }
+
+    fn forward(
+        &self,
+        x: &mut [f32],
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        positions: &[u32],
+        _theta: f32,
+    ) -> Result<()> {
+        let half = head_dim / 2;
+        for b in 0..batch {
+            for s in 0..seq_len {
+                let pos = positions[b * seq_len + s] as usize;
+                for h in 0..num_heads {
+                    let offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                    for d in 0..half {
+                        let idx = (pos * half + d) * 2;
+                        let cos_val = self.table[idx];
+                        let sin_val = self.table[idx + 1];
+                        let x0 = x[offset + d];
+                        let x1 = x[offset + d + half];
+                        x[offset + d] = x0 * cos_val - x1 * sin_val;
+                        x[offset + d + half] = x0 * sin_val + x1 * cos_val;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn build_cos_sin_table(max_pos: usize, head_dim: usize, theta: f32) -> Vec<f32> {
+    let half = head_dim / 2;
+    let mut table = vec![0.0f32; max_pos * half * 2];
+    for pos in 0..max_pos {
+        for d in 0..half {
+            let freq = pos as f64 / (theta as f64).powf(2.0 * d as f64 / head_dim as f64);
+            let cos_val = freq.cos() as f32;
+            let sin_val = freq.sin() as f32;
+            table[(pos * half + d) * 2] = cos_val;
+            table[(pos * half + d) * 2 + 1] = sin_val;
+        }
+    }
+    table
+}
+
 #[cfg(feature = "cuda")]
 pub struct CudaRoPE {
     gpu: crate::gpu::GpuContext,
     module: crate::gpu::rope_kernel::kernels::LoadedModule,
+    cos_sin_table_dev: std::sync::Mutex<Option<DeviceBuffer<f32>>>,
+    pub deterministic: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -65,14 +191,22 @@ impl CudaRoPE {
         let gpu = crate::gpu::GpuContext::new(0)?;
         let module = crate::gpu::rope_kernel::kernels::load(gpu.context())
             .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
-        Ok(Self { gpu, module })
+        Ok(Self { gpu, module, cos_sin_table_dev: std::sync::Mutex::new(None), deterministic: false })
     }
 
     pub fn with_context(ctx: std::sync::Arc<cuda_core::CudaContext>) -> Result<Self> {
         let gpu = crate::gpu::GpuContext::from_context(ctx);
         let module = crate::gpu::rope_kernel::kernels::load(gpu.context())
             .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
-        Ok(Self { gpu, module })
+        Ok(Self { gpu, module, cos_sin_table_dev: std::sync::Mutex::new(None), deterministic: false })
+    }
+
+    pub fn upload_cos_sin_table(&self, table: &[f32]) -> crate::Result<()> {
+        let stream = self.gpu.stream();
+        let dev = DeviceBuffer::from_host(&stream, table)
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        *self.cos_sin_table_dev.lock().unwrap() = Some(dev);
+        Ok(())
     }
 }
 
@@ -89,10 +223,30 @@ impl CudaRoPE {
         theta: f32,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let total = seq_len * num_heads * head_dim;
         let module = &self.module;
+
+        if self.deterministic {
+            let guard = self.cos_sin_table_dev.lock().unwrap();
+            if let Some(ref table_dev) = *guard {
+                module
+                    .rope_forward_table(
+                        &stream,
+                        LaunchConfig::for_num_elems(total as u32),
+                        x_in,
+                        positions,
+                        table_dev,
+                        x_out,
+                        seq_len as u32,
+                        num_heads as u32,
+                        head_dim as u32,
+                    )
+                    .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+                return Ok(());
+            }
+        }
+
         module
             .rope_forward(
                 &stream,
@@ -124,7 +278,6 @@ impl RoPE for CudaRoPE {
     ) -> Result<()> {
         use cuda_core::LaunchConfig;
 
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let total_elems = batch * seq_len * num_heads * head_dim;
 

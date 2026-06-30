@@ -220,6 +220,8 @@ impl ModelWeights {
 pub struct QuantizedWeights {
     q4k_tensors: HashMap<String, Vec<u8>>,
     q6k_tensors: HashMap<String, Vec<u8>>,
+    tq2_tensors: HashMap<String, Vec<u8>>,
+    i2s_tensors: HashMap<String, Vec<u8>>,
     f32_tensors: HashMap<String, Vec<f32>>,
 }
 
@@ -232,6 +234,24 @@ impl QuantizedWeights {
         Self {
             q4k_tensors,
             q6k_tensors,
+            tq2_tensors: HashMap::new(),
+            i2s_tensors: HashMap::new(),
+            f32_tensors,
+        }
+    }
+
+    pub fn new_with_ternary(
+        q4k_tensors: HashMap<String, Vec<u8>>,
+        q6k_tensors: HashMap<String, Vec<u8>>,
+        tq2_tensors: HashMap<String, Vec<u8>>,
+        i2s_tensors: HashMap<String, Vec<u8>>,
+        f32_tensors: HashMap<String, Vec<f32>>,
+    ) -> Self {
+        Self {
+            q4k_tensors,
+            q6k_tensors,
+            tq2_tensors,
+            i2s_tensors,
             f32_tensors,
         }
     }
@@ -242,6 +262,14 @@ impl QuantizedWeights {
 
     pub fn get_q6k(&self, name: &str) -> Option<&[u8]> {
         self.q6k_tensors.get(name).map(|v| v.as_slice())
+    }
+
+    pub fn get_tq2(&self, name: &str) -> Option<&[u8]> {
+        self.tq2_tensors.get(name).map(|v| v.as_slice())
+    }
+
+    pub fn get_i2s(&self, name: &str) -> Option<&[u8]> {
+        self.i2s_tensors.get(name).map(|v| v.as_slice())
     }
 
     pub fn get_f32(&self, name: &str) -> Option<&[f32]> {

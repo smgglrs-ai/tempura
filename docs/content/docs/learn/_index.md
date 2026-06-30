@@ -73,16 +73,20 @@ This section takes you from "I've heard of AI but I don't know how it works" all
 | 17 | [Positional Encoding](positional-encoding/) | RoPE rotation matrix, frequency bands, length extrapolation |
 | 18 | [Sampling](sampling/) | Temperature as Boltzmann, top-k/top-p, deterministic RNG |
 | 19 | [Quantization](quantization/) | Bounded error, group quantization, monotonicity, GPTQ/AWQ/GGUF |
+| 20 | [Quantized MatMul on GPUs](quantized-matmul-gpu/) | Q4_K block layout, decode vs prefill parallelism, warp-cooperative kernels |
+| 21 | [Ternary Weights](ternary-weights/) | When weights are just -1, 0, or +1 — BitNet, BitLinear, and why verification loves ternary |
+| 22 | [Ternary Bit-Packing](ternary-packing/) | TQ2_0, TQ1_0, STQ1_0 — three ways to pack {-1,0,1} and why the choice shapes GPU kernels |
+| 23 | [Ternary GPU Kernels](ternary-gpu-kernels/) | dp4a integer paths, LUT approaches, and why ternary is even more memory-bound than Q4_K |
 
 ## Part IV: Verification Theory
 
 | # | Topic | What you'll understand |
 |---|-------|----------------------|
-| 20 | [Bounded Model Checking](bounded-model-checking/) | What Kani proves, SAT/SMT, what "all inputs" means within bounds |
-| 21 | [Reading Kani Harnesses](reading-kani-harnesses/) | Annotated walkthrough of a real proof from tempura |
-| 22 | [Compositionality](compositionality/) | Why proving individual operations proves the graph |
-| 23 | [DualPipeline](dual-pipeline/) | Empirical equivalence testing — what formal proofs miss |
-| 24 | [Verification Tiers](verification-tiers/) | Proven, Tested, Compiled — what each tier guarantees |
+| 24 | [Bounded Model Checking](bounded-model-checking/) | What Kani proves, SAT/SMT, what "all inputs" means within bounds |
+| 25 | [Reading Kani Harnesses](reading-kani-harnesses/) | Annotated walkthrough of a real proof from tempura |
+| 26 | [Compositionality](compositionality/) | Why proving individual operations proves the graph |
+| 27 | [DualPipeline](dual-pipeline/) | Empirical equivalence testing — what formal proofs miss |
+| 28 | [Verification Tiers](verification-tiers/) | Proven, Tested, Compiled — what each tier guarantees |
 
 ## Part V: Serving
 

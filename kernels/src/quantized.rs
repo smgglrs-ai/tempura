@@ -1,7 +1,8 @@
 use crate::Result;
 pub use crate::{
     Dequantize, MatMulQ, QuantDtype, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE,
-    Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, Q6K_GROUPS, Q6K_GROUP_SIZE,
+    Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, Q6K_GROUPS, Q6K_GROUP_SIZE, TQ2_BLOCK_BYTES, TQ2_BLOCK_SIZE,
+    I2S_BLOCK_BYTES, I2S_BLOCK_SIZE,
 };
 use rayon::prelude::*;
 
@@ -623,6 +624,207 @@ unsafe fn hsum_i32_128(v: std::arch::x86_64::__m128i) -> i32 {
     _mm_cvtsi128_si32(sum32)
 }
 
+// ── TQ2_0 ternary (2-bit packing, 2.0625 bpw) ─────────────────────────────
+
+pub fn tq2_block_d(block: &[u8]) -> f32 {
+    f16_to_f32(u16::from_le_bytes([block[64], block[65]]))
+}
+
+pub fn tq2_dequant_block(block: &[u8], output: &mut [f32; TQ2_BLOCK_SIZE]) {
+    let d = tq2_block_d(block);
+    let qs = &block[0..64];
+    let mut idx = 0;
+    for &byte in qs {
+        for shift in (0..8).step_by(2) {
+            let bits = (byte >> shift) & 0x03;
+            output[idx] = d * (bits as f32 - 1.0);
+            idx += 1;
+        }
+    }
+}
+
+pub fn tq2_dot_block(block: &[u8], a: &[f32]) -> f32 {
+    let d = tq2_block_d(block);
+    let qs = &block[0..64];
+    let mut sum = 0.0f32;
+    let mut idx = 0;
+    for &byte in qs {
+        for shift in (0..8).step_by(2) {
+            let trit = ((byte >> shift) & 0x03) as i8 - 1;
+            match trit {
+                1 => sum += a[idx],
+                -1 => sum -= a[idx],
+                _ => {}
+            }
+            idx += 1;
+        }
+    }
+    sum * d
+}
+
+pub fn tq2_encode_block(values: &[f32; TQ2_BLOCK_SIZE]) -> [u8; TQ2_BLOCK_BYTES] {
+    let mut block = [0u8; TQ2_BLOCK_BYTES];
+    let mut amax = 0.0f32;
+    for &v in values {
+        let av = v.abs();
+        if av > amax {
+            amax = av;
+        }
+    }
+    let id = if amax > 0.0 { 1.0 / amax } else { 0.0 };
+
+    let mut idx = 0;
+    for byte_idx in 0..64 {
+        let mut packed = 0u8;
+        for shift in (0..8).step_by(2) {
+            let v = values[idx];
+            let q = (v * id).round().max(-1.0).min(1.0) as i8;
+            let encoded = (q + 1) as u8;
+            packed |= encoded << shift;
+            idx += 1;
+        }
+        block[byte_idx] = packed;
+    }
+
+    let d_bits = f32_to_f16(amax);
+    block[64] = d_bits as u8;
+    block[65] = (d_bits >> 8) as u8;
+    block
+}
+
+fn f32_to_f16(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let frac = bits & 0x7fffff;
+
+    if exp == 0 {
+        return (sign << 15) as u16;
+    }
+    if exp == 0xff {
+        if frac == 0 {
+            return ((sign << 15) | 0x7c00) as u16;
+        }
+        return ((sign << 15) | 0x7c00 | (frac >> 13).max(1)) as u16;
+    }
+
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        return ((sign << 15) | 0x7c00) as u16;
+    }
+    if new_exp <= 0 {
+        return (sign << 15) as u16;
+    }
+    ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
+}
+
+// ── I2_S ternary (bitnet.cpp format: 2-bit packed + per-tensor f32 scale) ──
+//
+// Translated line-by-line from bitnet.cpp (ggml.c + ggml-bitnet-mad.cpp).
+// Data layout per tensor: [packed_2bit_weights (n*k/4 bytes) | f32 scale]
+//
+// Source functions translated:
+//   nearest_int()       — ggml.c:12536
+//   quantize_row_i8_s() — ggml-quants.c:3503
+//   ggml_vec_dot_i2_i8_s_1x1() — ggml-bitnet-mad.cpp:198
+//   mul_mat rescaling   — ggml.c:12521
+
+/// Translated from ggml.c:12536-12541.
+/// Banker's rounding via the magic-number trick.
+#[inline]
+fn nearest_int(fval: f32) -> i32 {
+    // C: float val = fval + 12582912.f;
+    let val: f32 = fval + 12582912.0;
+    // C: int i; memcpy(&i, &val, sizeof(int));
+    let i: i32 = i32::from_ne_bytes(val.to_ne_bytes());
+    // C: return (i & 0x007fffff) - 0x00400000;
+    (i & 0x007fffff) - 0x00400000
+}
+
+/// Translated from ggml-quants.c:3503-3522.
+/// Quantizes f32 activations to i8 per-tensor, returns (scale, sum).
+fn quantize_row_i8_s(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
+    // C: double min = 0.00001; double max = min;
+    let mut max: f64 = 0.00001;
+    // C: for (int i = 0; i < n; ++i) max = MAX(max, (double)fabs((double)x[i]));
+    for &v in x {
+        let av = (v as f64).abs();
+        if av > max {
+            max = av;
+        }
+    }
+    // C: float s = 127 / max;
+    let s: f32 = (127.0f64 / max) as f32;
+    // C: int32_t sum = 0;
+    let mut sum: i32 = 0;
+    // C: for (int i = 0; i < n; ++i) {
+    for (i, &v) in x.iter().enumerate() {
+        // C: int v = nearest_int(x[i] * s);
+        let mut q: i32 = nearest_int(v * s);
+        // C: if (v > 127) v = 127; if (v < -128) v = -128;
+        if q > 127 { q = 127; }
+        if q < -128 { q = -128; }
+        // C: sum += v;
+        sum += q;
+        // C: dst[i] = (int8_t)(v);
+        dst[i] = q as i8;
+    }
+    (s, sum)
+}
+
+/// Translated from ggml-bitnet-mad.cpp:198-296, scalar path (nrc=1).
+/// Computes unsigned dot product of 2-bit packed weights × i8 activations.
+///
+/// Weight layout: 128 elements per 32-byte group.
+/// Byte b (0..31) contains 4 2-bit values:
+///   bits[7:6] → element b       (group_idx=0)
+///   bits[5:4] → element 32+b    (group_idx=1)
+///   bits[3:2] → element 64+b    (group_idx=2)
+///   bits[1:0] → element 96+b    (group_idx=3)
+/// Values {0,1,2} represent ternary {-1,0,+1}.
+fn vec_dot_i2_i8_s(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
+    // C: const int nb = n / QK_I2_S;  // QK_I2_S = 128
+    let nb = k / 128;
+    let mut accu: i32 = 0;
+
+    for i in 0..nb {
+        // C: const uint8_t *px = x_row + i * 1024;  // but simplified for scalar
+        // C: const int8_t  *py = y + i * 4096;      // but simplified for scalar
+        let px = i * 32;
+        let py = i * 128;
+
+        for j in 0..32 {
+            let byte = packed[px + j];
+            // C: xq8_0 = (byte >> 6) & 0x03  → element j
+            // C: xq8_1 = (byte >> 4) & 0x03  → element 32+j
+            // C: xq8_2 = (byte >> 2) & 0x03  → element 64+j
+            // C: xq8_3 = (byte >> 0) & 0x03  → element 96+j
+            let w0 = ((byte >> 6) & 0x03) as i32;
+            let w1 = ((byte >> 4) & 0x03) as i32;
+            let w2 = ((byte >> 2) & 0x03) as i32;
+            let w3 = (byte & 0x03) as i32;
+            // C: maddubs(xq8_0, yq8_0) — unsigned × signed multiply-add
+            accu += w0 * a_q[py + j] as i32;
+            accu += w1 * a_q[py + 32 + j] as i32;
+            accu += w2 * a_q[py + 64 + j] as i32;
+            accu += w3 * a_q[py + 96 + j] as i32;
+        }
+    }
+    accu
+}
+
+pub fn i2s_dequant_block(block: &[u8], output: &mut [f32; I2S_BLOCK_SIZE]) {
+    for g in 0..(I2S_BLOCK_SIZE / 128) {
+        for b in 0..32 {
+            let byte = block[g * 32 + b];
+            output[g * 128 + b]      = ((byte >> 6) & 0x03) as f32 - 1.0;
+            output[g * 128 + 32 + b] = ((byte >> 4) & 0x03) as f32 - 1.0;
+            output[g * 128 + 64 + b] = ((byte >> 2) & 0x03) as f32 - 1.0;
+            output[g * 128 + 96 + b] = (byte & 0x03) as f32 - 1.0;
+        }
+    }
+}
+
 #[cfg(feature = "cpu")]
 pub struct CpuMatMulQ4K;
 
@@ -728,6 +930,103 @@ impl MatMulQ for CpuMatMulQ4K {
                     sum += q6k_dot_block(block, a_slice);
                 }
                 output[i * n + j] = sum;
+            }
+        }
+        Ok(())
+    }
+
+    fn forward_b_transposed_tq2(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if a.len() != m * k {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
+        }
+        if output.len() != m * n {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
+        }
+        if k % TQ2_BLOCK_SIZE != 0 {
+            return Err(crate::KernelError::InvalidConfig(format!(
+                "k={k} must be divisible by TQ2 block size {TQ2_BLOCK_SIZE}"
+            )));
+        }
+
+        let blocks_per_row = k / TQ2_BLOCK_SIZE;
+        let expected_b_bytes = n * blocks_per_row * TQ2_BLOCK_BYTES;
+        if b_quantized.len() != expected_b_bytes {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: expected_b_bytes,
+                got: b_quantized.len(),
+            });
+        }
+
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for blk in 0..blocks_per_row {
+                    let block_offset = (j * blocks_per_row + blk) * TQ2_BLOCK_BYTES;
+                    let block = &b_quantized[block_offset..block_offset + TQ2_BLOCK_BYTES];
+                    let a_slice = &a_row[blk * TQ2_BLOCK_SIZE..(blk + 1) * TQ2_BLOCK_SIZE];
+                    sum += tq2_dot_block(block, a_slice);
+                }
+                output[i * n + j] = sum;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn forward_b_transposed_i2s(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if a.len() != m * k {
+            return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+        }
+        if output.len() != m * n {
+            return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+        }
+
+        // C: const float * scale = (float *)((uint8_t*)(src0->data) + (ne00 * ne01 / 4));
+        let packed_bytes = n * k / 4;
+        let row_packed_bytes = k / 4;
+        let w_scale = f32::from_ne_bytes([
+            b_quantized[packed_bytes],
+            b_quantized[packed_bytes + 1],
+            b_quantized[packed_bytes + 2],
+            b_quantized[packed_bytes + 3],
+        ]);
+
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+
+            // C: quantize_row_i8_s(src1_row, wdata, ne10, &act_scale, &act_sum);
+            let mut a_q = vec![0i8; k];
+            let (act_scale, act_sum) = quantize_row_i8_s(a_row, &mut a_q);
+
+            for j in 0..n {
+                // C: vec_dot(ne00, &tmp, 0, src0_row + ir0 * nb01 / 4, 0, src1_col_de, 0, 1);
+                let w_packed = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
+                let raw = vec_dot_i2_i8_s(w_packed, &a_q, k);
+                // C: tmp = (tmp - act_sums[i1]) / (act_scales[i1]) * (*scale);
+                output[i * n + j] = (raw - act_sum) as f32 / act_scale * w_scale;
             }
         }
         Ok(())
@@ -1455,8 +1754,24 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                         *out = sum;
                     }
                 });
+        } else if std::env::var("TEMPURA_DETERMINISTIC").is_ok() {
+            // Deterministic batched: per-element q4k_dot_block, matches GPU accumulation order
+            let blocks_per_row = k / Q4K_BLOCK_SIZE;
+            output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
+                let a_row = &a[i * k..(i + 1) * k];
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for blk in 0..blocks_per_row {
+                        let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                        let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                        let a_slice = &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                        sum += q4k_dot_block(block, a_slice);
+                    }
+                    row_out[j] = sum;
+                }
+            });
         } else {
-            // Batched path: dequant full row, use gemm for SIMD matmul
+            // Fast batched path: dequant full row, use gemm for SIMD matmul
             let mut b_f32 = vec![0.0f32; n * k];
             for j in 0..n {
                 Self::dequant_row(b_quantized, j, k, &mut b_f32[j * k..(j + 1) * k]);
@@ -1587,6 +1902,79 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             }
         }
         Ok(())
+    }
+
+    fn forward_b_transposed_tq2(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if a.len() != m * k {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
+        }
+        if output.len() != m * n {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
+        }
+        if k % TQ2_BLOCK_SIZE != 0 {
+            return Err(crate::KernelError::InvalidConfig(format!(
+                "k={k} not divisible by {TQ2_BLOCK_SIZE}"
+            )));
+        }
+
+        let blocks_per_row = k / TQ2_BLOCK_SIZE;
+        let expected_b_bytes = n * blocks_per_row * TQ2_BLOCK_BYTES;
+        if b_quantized.len() != expected_b_bytes {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: expected_b_bytes,
+                got: b_quantized.len(),
+            });
+        }
+
+        let chunk_size = (n / rayon::current_num_threads()).max(64);
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+            output[i * n..(i + 1) * n]
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(ci, chunk)| {
+                    let j_start = ci * chunk_size;
+                    for (local, out) in chunk.iter_mut().enumerate() {
+                        let j = j_start + local;
+                        let mut sum = 0.0f32;
+                        for blk in 0..blocks_per_row {
+                            let block_offset = (j * blocks_per_row + blk) * TQ2_BLOCK_BYTES;
+                            let block = &b_quantized[block_offset..block_offset + TQ2_BLOCK_BYTES];
+                            let a_slice = &a_row[blk * TQ2_BLOCK_SIZE..(blk + 1) * TQ2_BLOCK_SIZE];
+                            sum += tq2_dot_block(block, a_slice);
+                        }
+                        *out = sum;
+                    }
+                });
+        }
+        Ok(())
+    }
+
+    fn forward_b_transposed_i2s(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let cpu = CpuMatMulQ4K;
+        cpu.forward_b_transposed_i2s(a, b_quantized, output, m, n, k)
     }
 }
 
@@ -1803,7 +2191,6 @@ impl CudaMatMulQ4K {
         k: usize,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let total = (m * n) as u32;
         self.module
@@ -1832,7 +2219,6 @@ impl CudaMatMulQ4K {
         partials: &mut cuda_core::DeviceBuffer<f32>,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
 
         self.module
@@ -1875,7 +2261,6 @@ impl CudaMatMulQ4K {
         k: usize,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let warps_per_block = 4u32;
         let grid_x = ((n as u32) + warps_per_block - 1) / warps_per_block;
@@ -1906,7 +2291,6 @@ impl CudaMatMulQ4K {
         k: usize,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let warps_per_block = 4u32;
         let grid_x = ((n as u32) + warps_per_block - 1) / warps_per_block;
@@ -1938,7 +2322,6 @@ impl CudaMatMulQ4K {
         n_warps_per_col: usize,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let cols_per_cta = 1usize;
         let warps_per_block = (n_warps_per_col * cols_per_cta) as u32;
@@ -1972,7 +2355,6 @@ impl CudaMatMulQ4K {
         n_warps_per_col: usize,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let warps_per_block = n_warps_per_col as u32;
         let grid_x = n as u32;
@@ -2005,7 +2387,6 @@ impl CudaMatMulQ4K {
         n_warps_per_col: usize,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let warps_per_block = n_warps_per_col as u32;
         let grid_x = n as u32;
@@ -2038,7 +2419,6 @@ impl CudaMatMulQ4K {
         n_warps_per_col: usize,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let cols_per_cta = 1usize;
         let warps_per_block = (n_warps_per_col * cols_per_cta) as u32;
@@ -2073,7 +2453,6 @@ impl CudaMatMulQ4K {
         rows_per_cta: usize,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let warps_per_block = (n_warps_k * rows_per_cta) as u32;
         let grid_x = ((n + rows_per_cta - 1) / rows_per_cta) as u32;
@@ -2106,7 +2485,6 @@ impl CudaMatMulQ4K {
         k: usize,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let warps_per_block = 4u32;
         let grid_x = ((n as u32) + warps_per_block - 1) / warps_per_block;
@@ -2137,7 +2515,6 @@ impl CudaMatMulQ4K {
         k: usize,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let warps_per_block = 4u32;
         let grid_x = ((n as u32) + warps_per_block - 1) / warps_per_block;
@@ -2169,7 +2546,6 @@ impl CudaMatMulQ4K {
         k: usize,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let warps_per_block = 4u32;
         let grid_x = ((n as u32) + warps_per_block - 1) / warps_per_block;
@@ -2192,6 +2568,120 @@ impl CudaMatMulQ4K {
         Ok(())
     }
 
+    pub fn gemm_q4k_q8_det_device(
+        &self,
+        a_q8: &cuda_core::DeviceBuffer<u32>,
+        b_quantized: &cuda_core::DeviceBuffer<u8>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        let stream = self.gpu.stream();
+        let total = (m * n) as u32;
+        self.module
+            .gemm_q4k_q8_det(
+                &stream,
+                LaunchConfig::for_num_elems(total),
+                m as u32,
+                n as u32,
+                k as u32,
+                a_q8,
+                b_quantized,
+                output,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn gemv_q6k_coop_device(
+        &self,
+        a: &cuda_core::DeviceBuffer<f32>,
+        b_quantized: &cuda_core::DeviceBuffer<u8>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        let stream = self.gpu.stream();
+        let warps_per_block = 4u32;
+        let grid_x = ((n as u32) + warps_per_block - 1) / warps_per_block;
+        self.module
+            .gemv_q6k_coop(
+                &stream,
+                LaunchConfig {
+                    grid_dim: (grid_x, 1, 1),
+                    block_dim: (32, warps_per_block, 1),
+                    shared_mem_bytes: 0,
+                },
+                n as u32,
+                k as u32,
+                a,
+                b_quantized,
+                output,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn gemv_q6k_q8_dp4a_device(
+        &self,
+        a_q8: &cuda_core::DeviceBuffer<u32>,
+        b_quantized: &cuda_core::DeviceBuffer<u8>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        let stream = self.gpu.stream();
+        let warps_per_block = 4u32;
+        let grid_x = ((n as u32) + warps_per_block - 1) / warps_per_block;
+        self.module
+            .gemv_q6k_q8_dp4a(
+                &stream,
+                LaunchConfig {
+                    grid_dim: (grid_x, 1, 1),
+                    block_dim: (32, warps_per_block, 1),
+                    shared_mem_bytes: 0,
+                },
+                n as u32,
+                k as u32,
+                a_q8,
+                b_quantized,
+                output,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn gemm_q6k_q8_det_device(
+        &self,
+        a_q8: &cuda_core::DeviceBuffer<u32>,
+        b_quantized: &cuda_core::DeviceBuffer<u8>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        use cuda_core::LaunchConfig;
+        let stream = self.gpu.stream();
+        let total = (m * n) as u32;
+        self.module
+            .gemm_q6k_q8_det(
+                &stream,
+                LaunchConfig::for_num_elems(total),
+                m as u32,
+                n as u32,
+                k as u32,
+                a_q8,
+                b_quantized,
+                output,
+            )
+            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        Ok(())
+    }
+
     pub fn forward_q6k_device(
         &self,
         a: &cuda_core::DeviceBuffer<f32>,
@@ -2202,7 +2692,6 @@ impl CudaMatMulQ4K {
         k: usize,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let total = (m * n) as u32;
         self.module
@@ -2238,7 +2727,6 @@ impl MatMulQ for CudaMatMulQ4K {
             )));
         }
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
 
         let a_dev = crate::gpu::to_device(&stream, a)?;
@@ -2278,7 +2766,6 @@ impl MatMulQ for CudaMatMulQ4K {
             )));
         }
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
 
         let a_dev = crate::gpu::to_device(&stream, a)?;
@@ -2301,6 +2788,32 @@ impl MatMulQ for CudaMatMulQ4K {
 
         crate::gpu::copy_back(&stream, &c_dev, output)?;
         Ok(())
+    }
+
+    fn forward_b_transposed_tq2(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        let cpu = CpuMatMulQ4K;
+        cpu.forward_b_transposed_tq2(a, b_quantized, output, m, n, k)
+    }
+
+    fn forward_b_transposed_i2s(
+        &self,
+        a: &[f32],
+        b_quantized: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        let cpu = CpuMatMulQ4K;
+        cpu.forward_b_transposed_i2s(a, b_quantized, output, m, n, k)
     }
 }
 
@@ -2667,6 +3180,128 @@ mod kani_proofs {
 
         // scale index
         assert!(group < 16);
+    }
+
+    #[kani::proof]
+    fn tq2_block_access_in_bounds() {
+        let idx: usize = kani::any();
+        kani::assume(idx < TQ2_BLOCK_SIZE);
+
+        // qs occupies bytes 0..63
+        let byte_idx = idx / 4;
+        assert!(byte_idx < 64);
+        // d occupies bytes 64..65
+        assert!(64 + 2 <= TQ2_BLOCK_BYTES);
+    }
+
+    #[kani::proof]
+    fn tq2_decode_value_in_range() {
+        let byte_val: u8 = kani::any();
+        let shift: u32 = kani::any();
+        kani::assume(shift < 4);
+        let bits = (byte_val >> (shift * 2)) & 0x03;
+        let trit = bits as i8 - 1;
+        assert!(trit >= -1);
+        assert!(trit <= 1);
+    }
+
+    #[kani::proof]
+    fn tq2_encode_decode_roundtrip() {
+        let trit: i8 = kani::any();
+        kani::assume(trit >= -1 && trit <= 1);
+        let encoded = (trit + 1) as u8;
+        assert!(encoded <= 2);
+        let decoded = encoded as i8 - 1;
+        assert!(decoded == trit);
+    }
+
+    #[kani::proof]
+    fn tq2_matmul_index_safety() {
+        let m: usize = kani::any();
+        let n: usize = kani::any();
+        let k: usize = kani::any();
+
+        kani::assume(m >= 1 && m <= 4);
+        kani::assume(n >= 1 && n <= 4);
+        kani::assume(k == 256 || k == 512);
+
+        let blocks_per_row = k / TQ2_BLOCK_SIZE;
+        let i: usize = kani::any();
+        let j: usize = kani::any();
+        let blk: usize = kani::any();
+
+        kani::assume(i < m);
+        kani::assume(j < n);
+        kani::assume(blk < blocks_per_row);
+
+        let a_offset = i * k + blk * TQ2_BLOCK_SIZE;
+        assert!(a_offset + TQ2_BLOCK_SIZE <= m * k);
+
+        let block_offset = (j * blocks_per_row + blk) * TQ2_BLOCK_BYTES;
+        assert!(block_offset + TQ2_BLOCK_BYTES <= n * blocks_per_row * TQ2_BLOCK_BYTES);
+
+        let out_idx = i * n + j;
+        assert!(out_idx < m * n);
+    }
+}
+
+#[cfg(test)]
+mod prop_tests {
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_q4k_dequant_value_bounded(
+            q in 0u8..=15,
+            sc in 0u8..=63,
+            m_val in 0u8..=63,
+            d_bits in proptest::num::f32::NORMAL | proptest::num::f32::SUBNORMAL | proptest::num::f32::ZERO,
+            dmin_bits in proptest::num::f32::NORMAL | proptest::num::f32::SUBNORMAL | proptest::num::f32::ZERO,
+        ) {
+            let d = d_bits.abs();
+            let dmin = dmin_bits.abs();
+
+            let value = d * (sc as f32) * (q as f32) - dmin * (m_val as f32);
+            let max_positive = d * 63.0 * 15.0;
+            let max_negative = dmin * 63.0;
+
+            if !d.is_nan() && !dmin.is_nan() && d.is_finite() && dmin.is_finite() {
+                prop_assert!(
+                    value <= max_positive + 1e-6 || value.is_nan(),
+                    "value {} > max_positive {} for q={} sc={} d={}",
+                    value, max_positive, q, sc, d
+                );
+                prop_assert!(
+                    value >= -max_negative - 1e-6 || value.is_nan(),
+                    "value {} < -max_negative {} for m={} dmin={}",
+                    value, max_negative, m_val, dmin
+                );
+            }
+        }
+
+        #[test]
+        fn prop_int8_dequant_bounded_error(
+            q in -127i8..=127,
+            max_abs in 1u32..=10000,
+        ) {
+            let scale = max_abs as f64 / 127.0;
+            let dequantized = q as f64 * scale;
+            let requantized = (dequantized / scale).round() as i64;
+
+            prop_assert_eq!(
+                requantized, q as i64,
+                "round-trip failed: q={}, scale={}, dequant={}, requant={}",
+                q, scale, dequantized, requantized
+            );
+
+            let max_error = scale / 2.0;
+            prop_assert!(max_error >= 0.0);
+            prop_assert!(
+                max_error <= max_abs as f64 / 254.0 + 0.001,
+                "max_error {} > bound {} for max_abs={}",
+                max_error, max_abs as f64 / 254.0 + 0.001, max_abs
+            );
+        }
     }
 }
 
@@ -3101,5 +3736,106 @@ mod tests {
         eprintln!("  Q6K large: max_diff={max_diff:.6} at [{worst_idx}], ref={:.6}, opt={:.6}, rel={rel_tol:.4}",
             out_ref[worst_idx], out_opt[worst_idx]);
         assert!(rel_tol < 0.05, "Q6K large: rel_tol={rel_tol:.4}");
+    }
+
+    #[test]
+    fn test_tq2_encode_decode_roundtrip() {
+        let mut values = [0.0f32; TQ2_BLOCK_SIZE];
+        for i in 0..TQ2_BLOCK_SIZE {
+            values[i] = match i % 3 {
+                0 => -1.0,
+                1 => 0.0,
+                _ => 1.0,
+            };
+        }
+        let block = tq2_encode_block(&values);
+        let mut decoded = [0.0f32; TQ2_BLOCK_SIZE];
+        tq2_dequant_block(&block, &mut decoded);
+        for i in 0..TQ2_BLOCK_SIZE {
+            assert!(
+                (decoded[i] - values[i]).abs() < 1e-3,
+                "tq2 roundtrip mismatch at [{i}]: got {}, expected {}",
+                decoded[i],
+                values[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_tq2_dot_block_manual() {
+        let mut values = [0.0f32; TQ2_BLOCK_SIZE];
+        values[0] = 1.0;
+        values[1] = -1.0;
+        values[2] = 0.0;
+        values[3] = 1.0;
+        let block = tq2_encode_block(&values);
+
+        let mut a = [0.0f32; TQ2_BLOCK_SIZE];
+        a[0] = 2.0;
+        a[1] = 3.0;
+        a[2] = 5.0;
+        a[3] = 7.0;
+
+        let dot = tq2_dot_block(&block, &a);
+        // Expected: 1*2 + (-1)*3 + 0*5 + 1*7 = 2 - 3 + 0 + 7 = 6
+        // Scale d = max(|values|) = 1.0, so d≈1.0 (fp16 roundtrip)
+        assert!(
+            (dot - 6.0).abs() < 0.1,
+            "tq2 dot expected ~6.0, got {dot}"
+        );
+    }
+
+    #[test]
+    fn test_tq2_matmul_identity_like() {
+        let k = 256;
+        let n = 2;
+        let m = 1;
+
+        let mut row0_vals = [0.0f32; 256];
+        row0_vals[0] = 1.0;
+        let mut row1_vals = [0.0f32; 256];
+        row1_vals[1] = 1.0;
+
+        let block0 = tq2_encode_block(&row0_vals);
+        let block1 = tq2_encode_block(&row1_vals);
+
+        let mut b_quantized = Vec::with_capacity(n * TQ2_BLOCK_BYTES);
+        b_quantized.extend_from_slice(&block0);
+        b_quantized.extend_from_slice(&block1);
+
+        let mut a = vec![0.0f32; k];
+        a[0] = 10.0;
+        a[1] = 20.0;
+
+        let mut output = vec![0.0f32; n];
+        let matmul = CpuMatMulQ4K;
+        matmul
+            .forward_b_transposed_tq2(&a, &b_quantized, &mut output, m, n, k)
+            .unwrap();
+
+        assert!(
+            (output[0] - 10.0).abs() < 0.5,
+            "row 0: expected ~10.0, got {}",
+            output[0]
+        );
+        assert!(
+            (output[1] - 20.0).abs() < 0.5,
+            "row 1: expected ~20.0, got {}",
+            output[1]
+        );
+    }
+
+    #[test]
+    fn test_squared_relu() {
+        let inputs = [-2.0f32, -0.5, 0.0, 0.5, 1.0, 3.0];
+        let expected = [0.0, 0.0, 0.0, 0.25, 1.0, 9.0];
+        for (x, exp) in inputs.iter().zip(expected.iter()) {
+            let relu = x.max(0.0);
+            let result = relu * relu;
+            assert!(
+                (result - exp).abs() < 1e-6,
+                "squared_relu({x}) = {result}, expected {exp}"
+            );
+        }
     }
 }

@@ -1,7 +1,7 @@
 +++
-title = "24. Verification Tiers"
+title = "28. Verification Tiers"
 description = "Proven, Tested, Compiled — what each tier guarantees and when to use which."
-weight = 240
+weight = 280
 template = "docs/page.html"
 
 [extra]

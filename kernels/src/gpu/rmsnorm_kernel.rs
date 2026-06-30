@@ -45,9 +45,36 @@ pub mod kernels {
         }
     }
 
+    /// Deterministic sum-of-squares: one thread per row, sequential
+    /// accumulation matching CPU order. ss_out has 1 element per row.
+    #[kernel]
+    pub fn rmsnorm_sum_sq_det(x: &[f32], mut ss_out: DisjointSlice<f32>, hidden_size: u32) {
+        let idx = thread::index_1d();
+        let row = idx.get();
+
+        let h = hidden_size as usize;
+        let start = row * h;
+
+        if start + h > x.len() {
+            return;
+        }
+
+        let mut sum = 0.0f32;
+        let mut i = 0usize;
+        while i < h {
+            let v = x[start + i];
+            sum += v * v;
+            i += 1;
+        }
+
+        if let Some(elem) = ss_out.get_mut(idx) {
+            *elem = sum;
+        }
+    }
+
     /// Pass 2: apply normalization.
     /// One thread per element. Reads the precomputed sum-of-squares
-    /// for its row (at stride 32 in ss buffer) and applies normalization.
+    /// for its row (at stride ss_stride in ss buffer) and applies normalization.
     #[kernel]
     pub fn rmsnorm_apply(
         x_in: &[f32],

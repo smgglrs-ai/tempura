@@ -7,6 +7,7 @@ const HD: usize = 128;
 const MMA_K: usize = 16;
 
 const SMEM_QKV: usize = BR * HD; // 4096 floats per tile (16KB), 3 tiles = 48KB
+const N_SCORE_GROUPS: usize = BC / 8; // MMA n-groups for Q·K^T score computation
 
 #[inline(always)]
 fn pack_f16x2(lo: f32, hi: f32) -> u32 {
@@ -23,16 +24,39 @@ fn pack_f16x2(lo: f32, hi: f32) -> u32 {
 }
 
 #[inline(always)]
-fn exp_f32(x: f32) -> f32 {
+fn f16_roundtrip(x: f32) -> f32 {
+    let h: u16;
     let result: f32;
     unsafe {
-        ptx_asm!(
-            "ex2.approx.ftz.f32 %0, %1;",
-            out("=f") result,
-            in("f") x * 1.442695041, // log2(e)
-        );
+        ptx_asm!("cvt.rn.f16.f32 %0, %1;", out("=h") h, in("f") x);
+        ptx_asm!("cvt.f32.f16 %0, %1;", out("=f") result, in("h") h);
     }
     result
+}
+
+#[inline(always)]
+fn pack_residual_f16x2(a: f32, b: f32) -> u32 {
+    pack_f16x2(a - f16_roundtrip(a), b - f16_roundtrip(b))
+}
+
+#[inline(always)]
+fn exp_f32(x: f32) -> f32 {
+    const LN2_HI: f32 = 0.693145752;
+    const LN2_LO: f32 = 1.428606820e-6;
+    const LOG2E: f32 = 1.442695041;
+    if x > 88.7 { return f32::INFINITY; }
+    if x < -87.3 { return 0.0; }
+    let n = (x * LOG2E + 0.5).floor();
+    let ni = n as i32;
+    let r = (x - n * LN2_HI) - n * LN2_LO;
+    let mut p = 0.001388888f32;
+    p = p * r + 0.008333360;
+    p = p * r + 0.041666653;
+    p = p * r + 0.166666672;
+    p = p * r + 0.5;
+    p = p * r + 1.0;
+    p = p * r + 1.0;
+    p * f32::from_bits(((ni + 127) as u32) << 23)
 }
 
 #[inline(always)]
@@ -133,7 +157,7 @@ pub mod kernels {
             unsafe {
                 if global_row < sl && col < hd {
                     let q_idx = ((batch_idx * sl + global_row) * nh + head_idx) * hd + col;
-                    Q_SMEM[elem] = q[q_idx];
+                    Q_SMEM[elem] = q[q_idx] * scale;
                 } else {
                     Q_SMEM[elem] = 0.0;
                 }
@@ -142,9 +166,6 @@ pub mod kernels {
         }
         thread::sync_threads();
 
-        // --- Phase 2: Init online softmax state ---
-        // Output accumulator: flat [f32; 64] = 16 col-groups × 4 MMA elements.
-        // o_acc[ci*4+j] corresponds to MMA output for col-group ci, element j.
         let mut o_acc = [0.0f32; 64];
         let mut row_max_0 = f32::NEG_INFINITY;
         let mut row_max_1 = f32::NEG_INFINITY;
@@ -191,8 +212,7 @@ pub mod kernels {
             thread::sync_threads();
 
             // --- 3b: Compute S = Q · K^T via MMA ---
-            // Score accumulators: flat [f32; 32] = 8 col-groups × 4.
-            let mut s_acc = [0.0f32; 32];
+            let mut s_acc = [0.0f32; N_SCORE_GROUPS * 4];
 
             let mut kt = 0usize;
             while kt < HD / MMA_K {
@@ -202,45 +222,47 @@ pub mod kernels {
                 let at_r1 = warp_row_base + group_id + 8;
 
                 let a_frag: [u32; 4];
+                let a_lo_frag: [u32; 4];
                 unsafe {
+                    let q00 = Q_SMEM[at_r0 * HD + k_offset + tid * 2];
+                    let q01 = Q_SMEM[at_r0 * HD + k_offset + tid * 2 + 1];
+                    let q10 = Q_SMEM[at_r1 * HD + k_offset + tid * 2];
+                    let q11 = Q_SMEM[at_r1 * HD + k_offset + tid * 2 + 1];
+                    let q08 = Q_SMEM[at_r0 * HD + k_offset + tid * 2 + 8];
+                    let q09 = Q_SMEM[at_r0 * HD + k_offset + tid * 2 + 9];
+                    let q18 = Q_SMEM[at_r1 * HD + k_offset + tid * 2 + 8];
+                    let q19 = Q_SMEM[at_r1 * HD + k_offset + tid * 2 + 9];
+
                     a_frag = [
-                        pack_f16x2(
-                            Q_SMEM[at_r0 * HD + k_offset + tid * 2 + 1],
-                            Q_SMEM[at_r0 * HD + k_offset + tid * 2],
-                        ),
-                        pack_f16x2(
-                            Q_SMEM[at_r1 * HD + k_offset + tid * 2 + 1],
-                            Q_SMEM[at_r1 * HD + k_offset + tid * 2],
-                        ),
-                        pack_f16x2(
-                            Q_SMEM[at_r0 * HD + k_offset + tid * 2 + 9],
-                            Q_SMEM[at_r0 * HD + k_offset + tid * 2 + 8],
-                        ),
-                        pack_f16x2(
-                            Q_SMEM[at_r1 * HD + k_offset + tid * 2 + 9],
-                            Q_SMEM[at_r1 * HD + k_offset + tid * 2 + 8],
-                        ),
+                        pack_f16x2(q01, q00),
+                        pack_f16x2(q11, q10),
+                        pack_f16x2(q09, q08),
+                        pack_f16x2(q19, q18),
+                    ];
+                    a_lo_frag = [
+                        pack_residual_f16x2(q01, q00),
+                        pack_residual_f16x2(q11, q10),
+                        pack_residual_f16x2(q09, q08),
+                        pack_residual_f16x2(q19, q18),
                     ];
                 }
 
                 let mut ni = 0usize;
-                while ni < 8 {
+                while ni < N_SCORE_GROUPS {
                     let kn = ni * 8 + group_id;
                     let b_frag: [u32; 2];
+                    let b_lo_frag: [u32; 2];
                     unsafe {
-                        b_frag = [
-                            pack_f16x2(
-                                K_SMEM[kn * HD + k_offset + tid * 2 + 1],
-                                K_SMEM[kn * HD + k_offset + tid * 2],
-                            ),
-                            pack_f16x2(
-                                K_SMEM[kn * HD + k_offset + tid * 2 + 9],
-                                K_SMEM[kn * HD + k_offset + tid * 2 + 8],
-                            ),
-                        ];
+                        let k0 = K_SMEM[kn * HD + k_offset + tid * 2];
+                        let k1 = K_SMEM[kn * HD + k_offset + tid * 2 + 1];
+                        let k8 = K_SMEM[kn * HD + k_offset + tid * 2 + 8];
+                        let k9 = K_SMEM[kn * HD + k_offset + tid * 2 + 9];
+
+                        b_frag = [pack_f16x2(k1, k0), pack_f16x2(k9, k8)];
+                        b_lo_frag = [pack_residual_f16x2(k1, k0), pack_residual_f16x2(k9, k8)];
                     }
 
-                    // MMA into s_acc[ni*4..ni*4+4] — use temp to avoid 2-level projection
+                    // Ozaki split: Q·K = Q_hi·K_hi + Q_hi·K_lo + Q_lo·K_hi
                     let mut tmp = [
                         s_acc[ni * 4],
                         s_acc[ni * 4 + 1],
@@ -250,6 +272,12 @@ pub mod kernels {
                     unsafe {
                         cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(
                             &mut tmp, &a_frag, &b_frag,
+                        );
+                        cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(
+                            &mut tmp, &a_frag, &b_lo_frag,
+                        );
+                        cuda_device::mma_sync::mma_sync_m16n8k16_f32_f16(
+                            &mut tmp, &a_lo_frag, &b_frag,
                         );
                     }
                     s_acc[ni * 4] = tmp[0];
@@ -278,12 +306,8 @@ pub mod kernels {
             };
 
             let mut ni = 0usize;
-            while ni < 8 {
+            while ni < N_SCORE_GROUPS {
                 let base = ni * 4;
-                s_acc[base] *= scale;
-                s_acc[base + 1] *= scale;
-                s_acc[base + 2] *= scale;
-                s_acc[base + 3] *= scale;
 
                 let global_kv_col_0 = kv_col_start + ni * 8 + tid * 2;
                 let global_kv_col_1 = kv_col_start + ni * 8 + tid * 2 + 1;
@@ -309,7 +333,7 @@ pub mod kernels {
             let mut local_max_0 = f32::NEG_INFINITY;
             let mut local_max_1 = f32::NEG_INFINITY;
             ni = 0;
-            while ni < 8 {
+            while ni < N_SCORE_GROUPS {
                 let base = ni * 4;
                 local_max_0 = max_f32(local_max_0, max_f32(s_acc[base], s_acc[base + 1]));
                 local_max_1 = max_f32(local_max_1, max_f32(s_acc[base + 2], s_acc[base + 3]));
@@ -354,7 +378,7 @@ pub mod kernels {
             let mut local_sum_0 = 0.0f32;
             let mut local_sum_1 = 0.0f32;
             ni = 0;
-            while ni < 8 {
+            while ni < N_SCORE_GROUPS {
                 let base = ni * 4;
                 s_acc[base] = if s_acc[base] > f32::NEG_INFINITY {
                     exp_f32(s_acc[base] - new_max_0)
@@ -396,7 +420,7 @@ pub mod kernels {
 
             // --- 3e: Write P to K_SMEM (reuse as P_SMEM) ---
             ni = 0;
-            while ni < 8 {
+            while ni < N_SCORE_GROUPS {
                 let base = ni * 4;
                 let pr0 = warp_row_base + group_id;
                 let pr1 = warp_row_base + group_id + 8;
@@ -628,7 +652,7 @@ pub mod kernels {
             unsafe {
                 if global_row < sl && col < hd {
                     let q_idx = ((batch_idx * sl + global_row) * nh + head_idx) * hd + col;
-                    Q_SMEM[elem] = q[q_idx];
+                    Q_SMEM[elem] = q[q_idx] * scale;
                 } else {
                     Q_SMEM[elem] = 0.0;
                 }
@@ -682,7 +706,7 @@ pub mod kernels {
             thread::sync_threads();
 
             // --- 3b–3e: identical to f32 variant ---
-            let mut s_acc = [0.0f32; 32];
+            let mut s_acc = [0.0f32; N_SCORE_GROUPS * 4];
 
             let mut kt = 0usize;
             while kt < HD / MMA_K {
@@ -713,7 +737,7 @@ pub mod kernels {
                 }
 
                 let mut ni = 0usize;
-                while ni < 8 {
+                while ni < N_SCORE_GROUPS {
                     let kn = ni * 8 + group_id;
                     let b_frag: [u32; 2];
                     unsafe {
@@ -765,12 +789,8 @@ pub mod kernels {
             };
 
             let mut ni = 0usize;
-            while ni < 8 {
+            while ni < N_SCORE_GROUPS {
                 let base = ni * 4;
-                s_acc[base] *= scale;
-                s_acc[base + 1] *= scale;
-                s_acc[base + 2] *= scale;
-                s_acc[base + 3] *= scale;
 
                 let global_kv_col_0 = kv_col_start + ni * 8 + tid * 2;
                 let global_kv_col_1 = kv_col_start + ni * 8 + tid * 2 + 1;
@@ -794,7 +814,7 @@ pub mod kernels {
             let mut local_max_0 = f32::NEG_INFINITY;
             let mut local_max_1 = f32::NEG_INFINITY;
             ni = 0;
-            while ni < 8 {
+            while ni < N_SCORE_GROUPS {
                 let base = ni * 4;
                 local_max_0 = max_f32(local_max_0, max_f32(s_acc[base], s_acc[base + 1]));
                 local_max_1 = max_f32(local_max_1, max_f32(s_acc[base + 2], s_acc[base + 3]));
@@ -833,7 +853,7 @@ pub mod kernels {
             let mut local_sum_0 = 0.0f32;
             let mut local_sum_1 = 0.0f32;
             ni = 0;
-            while ni < 8 {
+            while ni < N_SCORE_GROUPS {
                 let base = ni * 4;
                 s_acc[base] = if s_acc[base] > f32::NEG_INFINITY {
                     exp_f32(s_acc[base] - new_max_0)
@@ -870,7 +890,7 @@ pub mod kernels {
 
             // Write P to K_SMEM
             ni = 0;
-            while ni < 8 {
+            while ni < N_SCORE_GROUPS {
                 let base = ni * 4;
                 let pr0 = warp_row_base + group_id;
                 let pr1 = warp_row_base + group_id + 8;
@@ -1034,6 +1054,149 @@ pub mod kernels {
                 }
             }
             ci += 1;
+        }
+    }
+
+    /// Flash Attention with f32 scalar dot products (no MMA).
+    /// Same tiled online softmax algorithm as the f16 variant, but all
+    /// arithmetic stays in f32. One thread per (batch, head, query_row).
+    /// Grid: (num_heads, ceil(seq_len/1), batch), Block: (1, 1, 1)
+    #[kernel]
+    pub fn flash_attention_forward_f32(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        mut output: DisjointSlice<f32>,
+        _batch: u32,
+        seq_len: u32,
+        kv_len: u32,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        scale: f32,
+    ) {
+        let idx = thread::index_1d();
+        let tid = idx.get();
+
+        let sl = seq_len as usize;
+        let kvl = kv_len as usize;
+        let nh = num_heads as usize;
+        let nkv = num_kv_heads as usize;
+        let hd = head_dim as usize;
+
+        let total = sl * nh;
+        if tid >= total {
+            return;
+        }
+
+        let head_idx = tid % nh;
+        let q_row = tid / nh;
+
+        let heads_per_group = nh / nkv;
+        let kv_head_idx = head_idx / heads_per_group;
+
+        let q_base = (q_row * nh + head_idx) * hd;
+        let cache_offset = kvl - sl;
+        let causal_limit = cache_offset + q_row;
+
+        let mut o_acc = [0.0f32; 256];
+        let mut row_max = f32::NEG_INFINITY;
+        let mut row_sum = 0.0f32;
+
+        let num_tiles = kvl.div_ceil(BC);
+        let mut tile = 0usize;
+        while tile < num_tiles {
+            let tile_start = tile * BC;
+            let tile_end = if tile_start + BC < kvl {
+                tile_start + BC
+            } else {
+                kvl
+            };
+
+            let mut tile_max = f32::NEG_INFINITY;
+            let mut tile_scores = [0.0f32; 32]; // BC = 32
+
+            let mut ti = 0usize;
+            while ti < tile_end - tile_start {
+                let kv_s = tile_start + ti;
+                if kv_s > causal_limit {
+                    tile_scores[ti] = f32::NEG_INFINITY;
+                } else {
+                    let k_base = (kv_s * nkv + kv_head_idx) * hd;
+                    let mut dot = 0.0f32;
+                    let mut dd = 0usize;
+                    while dd < hd {
+                        dot += q[q_base + dd] * k[k_base + dd];
+                        dd += 1;
+                    }
+                    tile_scores[ti] = dot * scale;
+                    if tile_scores[ti] > tile_max {
+                        tile_max = tile_scores[ti];
+                    }
+                }
+                ti += 1;
+            }
+
+            if tile_max == f32::NEG_INFINITY {
+                tile += 1;
+                continue;
+            }
+
+            let new_max = if row_max > tile_max { row_max } else { tile_max };
+            let correction = if row_max > f32::NEG_INFINITY {
+                exp_f32(row_max - new_max)
+            } else {
+                0.0
+            };
+
+            let mut dd = 0usize;
+            while dd < hd {
+                o_acc[dd] *= correction;
+                dd += 1;
+            }
+            row_sum *= correction;
+
+            let mut tile_sum = 0.0f32;
+            ti = 0;
+            while ti < tile_end - tile_start {
+                if tile_scores[ti] > f32::NEG_INFINITY {
+                    tile_scores[ti] = exp_f32(tile_scores[ti] - new_max);
+                } else {
+                    tile_scores[ti] = 0.0;
+                }
+                tile_sum += tile_scores[ti];
+                ti += 1;
+            }
+
+            ti = 0;
+            while ti < tile_end - tile_start {
+                let w = tile_scores[ti];
+                if w > 0.0 {
+                    let kv_s = tile_start + ti;
+                    let v_base = (kv_s * nkv + kv_head_idx) * hd;
+                    dd = 0;
+                    while dd < hd {
+                        o_acc[dd] += w * v[v_base + dd];
+                        dd += 1;
+                    }
+                }
+                ti += 1;
+            }
+
+            row_sum += tile_sum;
+            row_max = new_max;
+            tile += 1;
+        }
+
+        let inv_sum = if row_sum > 0.0 { 1.0 / row_sum } else { 0.0 };
+        let out_base = (q_row * nh + head_idx) * hd;
+        let mut dd = 0usize;
+        while dd < hd {
+            let out_idx = out_base + dd;
+            unsafe {
+                *output.get_unchecked_mut(out_idx) = o_acc[dd] * inv_sum;
+            }
+            dd += 1;
         }
     }
 }

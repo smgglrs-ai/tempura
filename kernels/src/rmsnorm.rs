@@ -39,10 +39,108 @@ impl RMSNorm for CpuRMSNorm {
     }
 }
 
+/// GGML-compatible RMSNorm: f64 accumulation matching ggml_compute_forward_rms_norm_f32.
+/// Translated from ggml.c:12073-12119 + llm_build_norm (ggml_mul for weights).
+#[cfg(feature = "cpu")]
+pub struct CpuRMSNormGgml;
+
+#[cfg(feature = "cpu")]
+impl RMSNorm for CpuRMSNormGgml {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Tested
+    }
+
+    fn forward(&self, x: &mut [f32], weight: &[f32], hidden_size: usize, eps: f32) -> Result<()> {
+        if weight.len() != hidden_size {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: hidden_size,
+                got: weight.len(),
+            });
+        }
+
+        let num_tokens = x.len() / hidden_size;
+        for t in 0..num_tokens {
+            let start = t * hidden_size;
+            let row = &mut x[start..start + hidden_size];
+
+            // C: ggml_float sum = 0.0;  (ggml_float = double)
+            // C: for (i00 = 0; i00 < ne00; i00++) sum += (ggml_float)(x[i00] * x[i00]);
+            let mut sum: f64 = 0.0;
+            for i in 0..hidden_size {
+                sum += (row[i] * row[i]) as f64;
+            }
+
+            // C: const float mean = sum/ne00;
+            let mean: f32 = (sum / hidden_size as f64) as f32;
+
+            // C: const float scale = 1.0f/sqrtf(mean + eps);
+            let scale: f32 = 1.0f32 / (mean + eps).sqrt();
+
+            // C: ggml_vec_scale_f32(ne00, y, scale);
+            // Then separately: ggml_mul(ctx, cur, mw)  — element-wise multiply by weight
+            for i in 0..hidden_size {
+                row[i] = row[i] * scale * weight[i];
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Deterministic CPU RMSNorm: sequential accumulation matching GPU kernel order.
+/// Prevents auto-vectorization by using a while loop with volatile-style reads.
+#[cfg(feature = "cpu")]
+pub struct CpuRMSNormDet;
+
+#[cfg(feature = "cpu")]
+impl RMSNorm for CpuRMSNormDet {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Tested
+    }
+
+    #[inline(never)]
+    fn forward(&self, x: &mut [f32], weight: &[f32], hidden_size: usize, eps: f32) -> Result<()> {
+        if weight.len() != hidden_size {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: hidden_size,
+                got: weight.len(),
+            });
+        }
+
+        let num_tokens = x.len() / hidden_size;
+        let mut t = 0;
+        while t < num_tokens {
+            let start = t * hidden_size;
+
+            let mut sum_sq = 0.0f32;
+            let mut i = 0;
+            while i < hidden_size {
+                let v = x[start + i];
+                sum_sq += v * v;
+                i += 1;
+            }
+
+            let rms = (sum_sq / hidden_size as f32 + eps).sqrt();
+            let inv_rms = 1.0 / rms;
+
+            i = 0;
+            while i < hidden_size {
+                x[start + i] = x[start + i] * inv_rms * weight[i];
+                i += 1;
+            }
+            t += 1;
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub struct CudaRMSNorm {
     gpu: crate::gpu::GpuContext,
     module: crate::gpu::rmsnorm_kernel::kernels::LoadedModule,
+    ss_cache: std::sync::Mutex<Option<DeviceBuffer<f32>>>,
+    pub deterministic: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -60,14 +158,14 @@ impl CudaRMSNorm {
         let gpu = crate::gpu::GpuContext::new(0)?;
         let module = crate::gpu::rmsnorm_kernel::kernels::load(gpu.context())
             .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
-        Ok(Self { gpu, module })
+        Ok(Self { gpu, module, ss_cache: std::sync::Mutex::new(None), deterministic: false })
     }
 
     pub fn with_context(ctx: std::sync::Arc<cuda_core::CudaContext>) -> Result<Self> {
         let gpu = crate::gpu::GpuContext::from_context(ctx);
         let module = crate::gpu::rmsnorm_kernel::kernels::load(gpu.context())
             .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
-        Ok(Self { gpu, module })
+        Ok(Self { gpu, module, ss_cache: std::sync::Mutex::new(None), deterministic: false })
     }
 }
 
@@ -82,41 +180,69 @@ impl CudaRMSNorm {
         eps: f32,
     ) -> crate::Result<()> {
         use cuda_core::LaunchConfig;
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let num_tokens = x.len() / hidden_size;
-        let warp_size = 32u32;
-
-        // Padded buffer: one warp (32 lanes) per row, all lanes write
-        let mut ss_dev = DeviceBuffer::zeroed(&stream, num_tokens * warp_size as usize)
-            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
-
         let module = &self.module;
 
-        // Pass 1: warp-parallel sum of squares (one warp per row)
-        let sum_sq_config = LaunchConfig {
-            grid_dim: (num_tokens as u32, 1, 1),
-            block_dim: (warp_size, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        module
-            .rmsnorm_sum_sq(&stream, sum_sq_config, x, &mut ss_dev, hidden_size as u32)
-            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        if self.deterministic {
+            let mut ss_guard = self.ss_cache.lock().unwrap();
+            if ss_guard.as_ref().map_or(true, |buf| buf.len() < num_tokens) {
+                *ss_guard = Some(
+                    DeviceBuffer::zeroed(&stream, num_tokens)
+                        .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?,
+                );
+            }
+            let ss_dev = ss_guard.as_mut().unwrap();
 
-        // Pass 2: apply normalization (ss read at stride 32)
-        module
-            .rmsnorm_apply(
-                &stream,
-                LaunchConfig::for_num_elems((num_tokens * hidden_size) as u32),
-                x,
-                weight,
-                &ss_dev,
-                output,
-                hidden_size as u32,
-                warp_size,
-                eps,
-            )
-            .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+            module
+                .rmsnorm_sum_sq_det(
+                    &stream,
+                    LaunchConfig::for_num_elems(num_tokens as u32),
+                    x,
+                    ss_dev,
+                    hidden_size as u32,
+                )
+                .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+            module
+                .rmsnorm_apply(
+                    &stream,
+                    LaunchConfig::for_num_elems((num_tokens * hidden_size) as u32),
+                    x, weight, ss_dev, output,
+                    hidden_size as u32, 1, eps,
+                )
+                .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        } else {
+            let warp_size = 32u32;
+            let needed = num_tokens * warp_size as usize;
+
+            let mut ss_guard = self.ss_cache.lock().unwrap();
+            if ss_guard.as_ref().map_or(true, |buf| buf.len() < needed) {
+                *ss_guard = Some(
+                    DeviceBuffer::zeroed(&stream, needed)
+                        .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?,
+                );
+            }
+            let ss_dev = ss_guard.as_mut().unwrap();
+
+            let sum_sq_config = LaunchConfig {
+                grid_dim: (num_tokens as u32, 1, 1),
+                block_dim: (warp_size, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            module
+                .rmsnorm_sum_sq(&stream, sum_sq_config, x, ss_dev, hidden_size as u32)
+                .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+
+            module
+                .rmsnorm_apply(
+                    &stream,
+                    LaunchConfig::for_num_elems((num_tokens * hidden_size) as u32),
+                    x, weight, ss_dev, output,
+                    hidden_size as u32, warp_size, eps,
+                )
+                .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
+        }
 
         Ok(())
     }
@@ -134,7 +260,6 @@ impl RMSNorm for CudaRMSNorm {
             });
         }
 
-        crate::gpu::bind_context(self.gpu.context())?;
         let stream = self.gpu.stream();
         let num_tokens = x.len() / hidden_size;
         let total = num_tokens * hidden_size;

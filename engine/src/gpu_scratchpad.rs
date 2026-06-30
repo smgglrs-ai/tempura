@@ -21,6 +21,7 @@ pub struct GpuScratchpad {
     pub down: DeviceBuffer<f32>,
     pub final_normed: DeviceBuffer<f32>,
     pub logits: DeviceBuffer<f32>,
+    pub q8_activation: DeviceBuffer<u32>,
 }
 
 impl GpuScratchpad {
@@ -38,6 +39,14 @@ impl GpuScratchpad {
         let alloc = |len: usize| -> Result<DeviceBuffer<f32>, crate::weights::WeightsError> {
             DeviceBuffer::zeroed(stream, len).map_err(|e| {
                 crate::weights::WeightsError::GpuUpload(format!("scratchpad alloc: {e}"))
+            })
+        };
+
+        let max_act_elems = s * h.max(inter);
+        let q8_words = ((max_act_elems + 31) / 32) * 10;
+        let alloc_u32 = |len: usize| -> Result<DeviceBuffer<u32>, crate::weights::WeightsError> {
+            DeviceBuffer::zeroed(stream, len).map_err(|e| {
+                crate::weights::WeightsError::GpuUpload(format!("scratchpad alloc u32: {e}"))
             })
         };
 
@@ -61,20 +70,20 @@ impl GpuScratchpad {
             down: alloc(s * h)?,
             final_normed: alloc(s * h)?,
             logits: alloc(s * vocab)?,
+            q8_activation: alloc_u32(q8_words)?,
         })
     }
 
     pub fn upload_hidden(&mut self, stream: &CudaStream, data: &[f32]) {
-        let src = cuda_core::DeviceBuffer::from_host(stream, data).expect("upload hidden");
         let byte_count = data.len() * std::mem::size_of::<f32>();
         unsafe {
-            cuda_core::memory::memcpy_dtod_async(
+            cuda_core::memory::memcpy_htod_async(
                 self.hidden.cu_deviceptr(),
-                src.cu_deviceptr(),
+                data.as_ptr(),
                 byte_count,
                 stream.cu_stream(),
             )
         }
-        .expect("copy hidden to scratchpad");
+        .expect("upload hidden to scratchpad");
     }
 }

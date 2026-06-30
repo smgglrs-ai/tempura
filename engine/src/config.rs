@@ -26,6 +26,8 @@ pub struct ModelConfig {
     pub quantization: Option<QuantConfig>,
     pub use_qk_norm: bool,
     pub sliding_window: Option<usize>,
+    pub hidden_act: HiddenAct,
+    pub rope_type: RopeType,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +44,19 @@ pub enum QuantFormat {
     Gptq,
     Awq,
     Gguf,
+    Tq2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiddenAct {
+    SiluGate,
+    SquaredRelu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeType {
+    Neox,
+    Norm,
 }
 
 impl QuantConfig {
@@ -90,6 +105,8 @@ impl ModelConfig {
             quantization: None,
             use_qk_norm: false,
             sliding_window: None,
+            hidden_act: HiddenAct::SiluGate,
+            rope_type: RopeType::Neox,
         }
     }
 
@@ -109,6 +126,8 @@ impl ModelConfig {
             quantization: None,
             use_qk_norm: false,
             sliding_window: None,
+            hidden_act: HiddenAct::SiluGate,
+            rope_type: RopeType::Neox,
         }
     }
 
@@ -128,6 +147,8 @@ impl ModelConfig {
             quantization: None,
             use_qk_norm: false,
             sliding_window: None,
+            hidden_act: HiddenAct::SiluGate,
+            rope_type: RopeType::Neox,
         }
     }
 
@@ -180,6 +201,28 @@ impl ModelConfig {
             .and_then(|v| v.as_f64())
             .unwrap_or(1e-5) as f32;
 
+        let hidden_act = match v.get("hidden_act").and_then(|v| v.as_str()) {
+            Some("relu2") => HiddenAct::SquaredRelu,
+            _ => HiddenAct::SiluGate,
+        };
+
+        let model_type = v.get("model_type").and_then(|v| v.as_str());
+
+        let rope_type = match model_type {
+            Some("bitnet") => RopeType::Norm,
+            _ => RopeType::Neox,
+        };
+
+        let quantization = match model_type {
+            Some("bitnet") => Some(QuantConfig {
+                format: QuantFormat::Tq2,
+                bits: 2,
+                group_size: 256,
+                symmetric: true,
+            }),
+            _ => None,
+        };
+
         Ok(Self {
             hidden_size,
             intermediate_size,
@@ -192,12 +235,14 @@ impl ModelConfig {
             rope_theta,
             layer_norm_eps,
             tensor_parallel_size: 1,
-            quantization: None,
+            quantization,
             use_qk_norm: false,
             sliding_window: v
                 .get("sliding_window")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize),
+            hidden_act,
+            rope_type,
         })
     }
 }
@@ -324,6 +369,35 @@ mod tests {
         assert_eq!(c.layer_norm_eps, 1e-5);
         assert_head_dim_consistent(&c);
         assert_kv_heads_valid(&c);
+    }
+
+    #[test]
+    fn test_from_hf_json_bitnet() {
+        let json = r#"{
+            "model_type": "bitnet",
+            "hidden_size": 2560,
+            "intermediate_size": 6912,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 5,
+            "num_hidden_layers": 30,
+            "vocab_size": 128256,
+            "hidden_act": "relu2",
+            "rms_norm_eps": 1e-5,
+            "max_position_embeddings": 4096,
+            "rope_theta": 500000.0
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.hidden_size, 2560);
+        assert_eq!(c.intermediate_size, 6912);
+        assert_eq!(c.num_attention_heads, 20);
+        assert_eq!(c.num_kv_heads, 5);
+        assert_eq!(c.num_layers, 30);
+        assert_eq!(c.vocab_size, 128256);
+        assert_eq!(c.hidden_act, HiddenAct::SquaredRelu);
+        assert!(c.quantization.is_some());
+        let q = c.quantization.unwrap();
+        assert_eq!(q.format, QuantFormat::Tq2);
+        assert_eq!(q.bits, 2);
     }
 
     #[test]

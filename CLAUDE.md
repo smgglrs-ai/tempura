@@ -5,7 +5,7 @@ for GPU kernels once stabilized; currently runs CPU reference implementations.
 
 ## Architecture
 
-Three-crate workspace:
+Three-crate workspace + standalone verification crate:
 
 - **kernels/** (`tempura-kernels`) — Kernel traits + CPU reference impls
   - `Attention`, `LayerNorm`, `RoPE`, `Sampler` traits in separate modules
@@ -26,6 +26,24 @@ Three-crate workspace:
   - SSE streaming types for token-by-token output
   - CLI via clap: `--host`, `--port`, `--model`, `--tokenizer`, `--max-batch-size`, `--max-seq-len`
 
+- **verus-verified/** (standalone, NOT in workspace) — Verus deductive proofs
+  - Own `rust-toolchain.toml` (stable 1.96.0, Verus requirement)
+  - Re-declares critical structures with `verus!{}` blocks and formal specs
+  - Proves properties for ALL inputs (unbounded), complementing Kani's bounded checks
+  - 14 indexing modules (mirror Kani): kv_cache, attention, rmsnorm, layernorm,
+    rope, matmul, sampling, turboquant, quantized, model, speculative,
+    disaggregated, weights, gguf
+  - 36 invariant modules (beyond Kani): kv_cache_invariant, page_allocator,
+    block_table, chunked_forward, tick_monotonicity, session_consistency,
+    speculative_invariant, prefix_cache, batch_scheduler, model_config,
+    radix_tree, token_generation, forward_pass, gqa, fused_kernels, medusa,
+    projection_shapes, kv_append_advance, sampling_penalties, trace_invariant,
+    gpu_tiles, paged_kv_cache, causal_mask, flash_tiles, fp8, weight_shapes,
+    lora, trace_diff, guided_decoding, config_validation, rope_frequency,
+    tensor_parallel, fp8_kv_cache, quantized_forward, gguf_alignment,
+    position_encoding
+  - 59 modules total, 757 verification conditions
+
 ## Key Design Decisions
 
 1. **Kernel traits as the verification contract.** Engine code is generic over kernel
@@ -40,10 +58,16 @@ Three-crate workspace:
    The crate structure is ready behind a feature flag. Phase 2 builds the verified
    foundation; Phase 3 delivers GPU implementations.
 
-4. **Three-layer verification architecture:**
-   - **Kani** proves safety (no panics, no OOB access) on Rust code — CPU and GPU
+4. **Four-layer verification architecture:**
+   - **Kani** proves safety (no panics, no OOB access) on Rust code — bounded instances
+   - **Verus** proves properties for ALL inputs (deductive, unbounded) via SMT
    - **DualPipeline** validates numerical equivalence between kernel implementations
    - **Property tests** cover mathematical properties Kani can't handle (f32 exp/trig)
+   - **Shared trait contracts** (`Verified*` traits in kernel-api) bind real impls to
+     Verus specs — `debug_assert!(well_formed())` in methods, drift detection in CI
+   - **Inline `verus!{}` blocks** in engine source (kv_cache.rs, session.rs) — compiled
+     to nothing by normal `cargo build` (vstd ghost erasure), canonical verification
+     runs against `verus-verified/` crate
    - cuda-oxide and NVIDIA hardware are trusted infrastructure (like rustc/CPU)
 
 5. **Inference traces are first-class.** Every forward pass produces a structured
@@ -53,6 +77,12 @@ Three-crate workspace:
 6. **Deterministic by design.** Seeded RNG for sampling, controlled reduction order
    in kernels. Same input + seed = bit-identical output. On GPU, cuda-oxide's
    Rust-level control enables deterministic reduction without post-hoc hacks.
+
+7. **BitNet ternary models as a verification showcase.** Ternary weight operations
+   ({-1,0,1} → add/sub/skip) are fully decidable by Kani — no floating-point
+   approximation in the weight path. The bit-packing roundtrip is a textbook
+   formal verification target. TQ2_0 format first (GPU-friendly 2-bit packing),
+   TQ1_0 later (CPU-only, base-3 packing is SIMD-unfriendly).
 
 ## Conventions
 
@@ -120,6 +150,15 @@ Three-crate workspace:
 - [ ] OpenAI Responses API (`/v1/responses`)
 - [ ] Disaggregated prefill/decode serving
 
+### Phase 12: BitNet Ternary Model Support
+- [ ] TQ2_0 block struct + decode in kernel-api
+- [ ] BitLinear CPU kernel (per-tensor INT8 activation quant, integer add/sub)
+- [ ] Squared ReLU activation function
+- [ ] GGUF loader: detect `model_type: "bitnet"`, route to BitLinear layers
+- [ ] TQ2_0 cuda-oxide GPU kernel (dp4a path, shared-memory tile unpack)
+- [ ] TQ1_0 CPU-only decode
+- [ ] Validation against microsoft/bitnet-b1.58-2B-4T-gguf
+
 ## Build & Test
 
 ```sh
@@ -160,5 +199,18 @@ Rebuild it from the fork and set `CUDA_OXIDE_BACKEND`.
 ## Formal Verification
 
 ```sh
-cargo kani --package tempura-kernels  # verify kernel properties
+cargo kani --package tempura-kernels  # Kani: bounded model checking (57 harnesses)
+./scripts/run-verus.sh               # Verus: deductive unbounded proofs (757 verification conditions)
 ```
+
+Verus requires a pre-built binary at `~/.local/verus/verus-x86-linux/verus`
+(or set `VERUS_PATH`). Download from https://github.com/verus-lang/verus/releases.
+The `verus-verified/` crate is standalone (own toolchain, own workspace) — do NOT
+add it to the main workspace.
+
+Verus covers 56 of 57 Kani harnesses unboundedly (54 directly, 2 restated as
+integer arithmetic: `q4k_monotonicity_within_group`, `q4k_accumulator_no_overflow`).
+The 3 excluded require f32/f64 reasoning which Verus does not support; these are
+covered by proptest instead: `head_dim_scale_never_zero_division` (engine),
+`int8_dequant_bounded_error`, `q4k_dequant_value_bounded` (kernels).
+The remaining `cpu_allreduce_is_identity` is a runtime Vec execution test — Kani-only.

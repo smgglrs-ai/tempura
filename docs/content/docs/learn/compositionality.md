@@ -1,7 +1,7 @@
 +++
-title = "22. Compositionality"
+title = "26. Compositionality"
 description = "Why proving individual operations proves the graph — and the assumptions that make this work."
-weight = 220
+weight = 260
 template = "docs/page.html"
 
 [extra]

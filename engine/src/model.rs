@@ -362,9 +362,6 @@ where
                 )
                 .unwrap();
 
-            let gate_w = weights
-                .get(&format!("{prefix}.mlp.gate_proj.weight"))
-                .unwrap();
             let up_w = weights
                 .get(&format!("{prefix}.mlp.up_proj.weight"))
                 .unwrap();
@@ -374,17 +371,38 @@ where
 
             let mut gate = vec![0.0f32; seq_len * inter];
             let mut up = vec![0.0f32; seq_len * inter];
-            self.pipeline
-                .matmul_bt(&normed2, gate_w, &mut gate, seq_len, inter, h)
-                .unwrap();
-            self.pipeline
-                .matmul_bt(&normed2, up_w, &mut up, seq_len, inter, h)
-                .unwrap();
 
-            // SiLU(gate) * up
-            for i in 0..gate.len() {
-                let silu = gate[i] / (1.0 + (-gate[i]).exp());
-                gate[i] = silu * up[i];
+            match self.config.hidden_act {
+                crate::config::HiddenAct::SiluGate => {
+                    let gate_w = weights
+                        .get(&format!("{prefix}.mlp.gate_proj.weight"))
+                        .unwrap();
+                    self.pipeline
+                        .matmul_bt(&normed2, gate_w, &mut gate, seq_len, inter, h)
+                        .unwrap();
+                    self.pipeline
+                        .matmul_bt(&normed2, up_w, &mut up, seq_len, inter, h)
+                        .unwrap();
+                    for i in 0..gate.len() {
+                        let silu = gate[i] / (1.0 + (-gate[i]).exp());
+                        gate[i] = silu * up[i];
+                    }
+                }
+                crate::config::HiddenAct::SquaredRelu => {
+                    let gate_w = weights
+                        .get(&format!("{prefix}.mlp.gate_proj.weight"))
+                        .unwrap();
+                    self.pipeline
+                        .matmul_bt(&normed2, gate_w, &mut gate, seq_len, inter, h)
+                        .unwrap();
+                    self.pipeline
+                        .matmul_bt(&normed2, up_w, &mut up, seq_len, inter, h)
+                        .unwrap();
+                    for i in 0..gate.len() {
+                        let relu = gate[i].max(0.0);
+                        gate[i] = relu * relu * up[i];
+                    }
+                }
             }
 
             let mut down_out = vec![0.0f32; seq_len * h];
@@ -462,6 +480,26 @@ where
         let q4k = tempura_kernels::quantized::CpuMatMulQ4KOpt;
         use tempura_kernels::quantized::{MatMulQ, PreQuantizedActivations};
 
+        let det_rmsnorm: Option<Box<dyn tempura_kernels::RMSNorm>> =
+            if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu
+                || std::env::var("TEMPURA_DETERMINISTIC").is_ok()
+            {
+                Some(Box::new(tempura_kernels::rmsnorm::CpuRMSNormGgml))
+            } else {
+                None
+            };
+
+        let det_rope: Option<Box<dyn tempura_kernels::RoPE>> =
+            if cfg.rope_type == crate::config::RopeType::Norm {
+                Some(Box::new(tempura_kernels::rope::CpuRoPEGgml))
+            } else if std::env::var("TEMPURA_DETERMINISTIC").is_ok() {
+                Some(Box::new(tempura_kernels::rope::CpuRoPETable::new(
+                    cfg.max_seq_len, head_dim, cfg.rope_theta,
+                )))
+            } else {
+                None
+            };
+
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
         let inter = cfg.intermediate_size;
@@ -516,7 +554,13 @@ where
                     }
                 }
             }
-            if let Some(w) = qweights.get_q4k(name) {
+            if let Some(w) = qweights.get_i2s(name) {
+                q4k.forward_b_transposed_i2s(a_f32, w, out, m, n, k)
+                    .unwrap();
+            } else if let Some(w) = qweights.get_tq2(name) {
+                q4k.forward_b_transposed_tq2(a_f32, w, out, m, n, k)
+                    .unwrap();
+            } else if let Some(w) = qweights.get_q4k(name) {
                 q4k.forward_b_transposed_q4k(a_f32, w, out, m, n, k)
                     .unwrap();
             } else if let Some(w) = qweights.get_q6k(name) {
@@ -544,6 +588,8 @@ where
                     format!("{p}.mlp.gate_proj.weight"),
                     format!("{p}.mlp.up_proj.weight"),
                     format!("{p}.mlp.down_proj.weight"),
+                    format!("{p}.self_attn.attn_sub_norm.weight"),
+                    format!("{p}.mlp.ffn_sub_norm.weight"),
                 )
             })
             .collect();
@@ -561,10 +607,16 @@ where
                 ref gate_w_name,
                 ref up_w_name,
                 ref down_w_name,
+                ref attn_sub_norm_name,
+                ref ffn_sub_norm_name,
             ) = layer_names[layer];
 
             normed.copy_from_slice(&hidden);
             let input_ln_w = qweights.get_f32(input_ln_name).unwrap();
+            if let Some(ref drn) = det_rmsnorm {
+                use tempura_kernels::RMSNorm;
+                drn.forward(&mut normed, input_ln_w, h, cfg.layer_norm_eps).unwrap();
+            } else {
             self.pipeline
                 .rmsnorm(
                     &mut normed,
@@ -575,6 +627,10 @@ where
                     &mut None,
                 )
                 .unwrap();
+            }
+            if det_rmsnorm.is_some() {
+                tempura_kernels::portable_math::q8_snap(&mut normed[..seq_len * h]);
+            }
 
             let normed_preq = if seq_len == 1 {
                 Some(PreQuantizedActivations::from_f32(&normed[..h]))
@@ -654,14 +710,10 @@ where
             if cfg.use_qk_norm {
                 let q_norm_w = qweights.get_f32(q_norm_name).unwrap();
                 let k_norm_w = qweights.get_f32(k_norm_name).unwrap();
-                apply_head_rmsnorm(
-                    &mut q,
-                    q_norm_w,
-                    seq_len,
-                    n_heads,
-                    head_dim,
-                    cfg.layer_norm_eps,
-                );
+                apply_head_rmsnorm(&mut q, q_norm_w, seq_len, n_heads, head_dim, cfg.layer_norm_eps);
+                if det_rmsnorm.is_some() {
+                    tempura_kernels::portable_math::q8_snap(&mut q[..seq_len * q_dim]);
+                }
                 apply_head_rmsnorm(
                     &mut k,
                     k_norm_w,
@@ -670,30 +722,19 @@ where
                     head_dim,
                     cfg.layer_norm_eps,
                 );
+                if det_rmsnorm.is_some() {
+                    tempura_kernels::portable_math::q8_snap(&mut k[..seq_len * kv_dim]);
+                }
             }
 
-            self.pipeline
-                .rope(
-                    &mut q,
-                    1,
-                    seq_len,
-                    n_heads,
-                    head_dim,
-                    &positions,
-                    cfg.rope_theta,
-                )
-                .unwrap();
-            self.pipeline
-                .rope(
-                    &mut k,
-                    1,
-                    seq_len,
-                    n_kv_heads,
-                    head_dim,
-                    &positions,
-                    cfg.rope_theta,
-                )
-                .unwrap();
+            if let Some(ref rope_table) = det_rope {
+                use tempura_kernels::RoPE;
+                rope_table.forward(&mut q, 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                rope_table.forward(&mut k, 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+            } else {
+                self.pipeline.rope(&mut q, 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                self.pipeline.rope(&mut k, 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+            }
 
             session.cache.append_kv(
                 layer,
@@ -706,21 +747,33 @@ where
             let v_cache = session.cache.v_data(layer, kv_len);
 
             attn_out.fill(0.0);
-            self.pipeline
-                .attention(
-                    &q,
-                    &k_cache,
-                    &v_cache,
-                    &mut attn_out[..seq_len * q_dim],
-                    1,
-                    seq_len,
-                    kv_len,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    1.0 / (head_dim as f32).sqrt(),
-                )
-                .unwrap();
+            if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
+                tempura_kernels::attention::CpuAttentionGgml
+                    .forward(
+                        &q, &k_cache, &v_cache,
+                        &mut attn_out[..seq_len * q_dim],
+                        1, seq_len, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        1.0 / (head_dim as f32).sqrt(),
+                    )
+                    .unwrap();
+            } else {
+                self.pipeline
+                    .attention(
+                        &q, &k_cache, &v_cache,
+                        &mut attn_out[..seq_len * q_dim],
+                        1, seq_len, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        1.0 / (head_dim as f32).sqrt(),
+                    )
+                    .unwrap();
+            }
+
+            if let Some(sub_norm_w) = qweights.get_f32(attn_sub_norm_name) {
+                self.pipeline
+                    .rmsnorm(&mut attn_out[..seq_len * q_dim], sub_norm_w, q_dim, cfg.layer_norm_eps, TraceLevel::Off, &mut None)
+                    .unwrap();
+            }
 
             o_proj.fill(0.0);
             let attn_preq = if seq_len == 1 {
@@ -741,19 +794,24 @@ where
                 hidden[i] += o_proj[i];
             }
 
+            if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer == 0 {
+                let last = &hidden[(seq_len - 1) * h..seq_len * h];
+                let norm: f32 = last.iter().map(|x| x * x).sum::<f32>().sqrt();
+                eprintln!("L0 post-attn hidden[last][0..8]: {:?} norm={norm:.4}", &last[..8.min(h)]);
+            }
+
             // FFN block
             normed2.copy_from_slice(&hidden);
             let post_ln_w = qweights.get_f32(post_ln_name).unwrap();
-            self.pipeline
-                .rmsnorm(
-                    &mut normed2,
-                    post_ln_w,
-                    h,
-                    cfg.layer_norm_eps,
-                    TraceLevel::Off,
-                    &mut None,
-                )
-                .unwrap();
+            if let Some(ref drn) = det_rmsnorm {
+                use tempura_kernels::RMSNorm;
+                drn.forward(&mut normed2, post_ln_w, h, cfg.layer_norm_eps).unwrap();
+            } else {
+                self.pipeline.rmsnorm(&mut normed2, post_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+            }
+            if det_rmsnorm.is_some() {
+                tempura_kernels::portable_math::q8_snap(&mut normed2[..seq_len * h]);
+            }
 
             let normed2_preq = if seq_len == 1 {
                 Some(PreQuantizedActivations::from_f32(&normed2[..h]))
@@ -764,28 +822,77 @@ where
             gate.fill(0.0);
             up.fill(0.0);
             // Fuse gate+up into single dispatch when both are Q4K and decode
-            if seq_len == 1 {
-                if let (Some(pq), Some(gw), Some(uw)) = (
-                    normed2_preq.as_ref(),
-                    qweights.get_q4k(&gate_w_name),
-                    qweights.get_q4k(&up_w_name),
-                ) {
-                    q4k.fused_q4k_preq_2(
-                        pq,
-                        gw,
-                        &mut gate[..inter],
-                        inter,
-                        uw,
-                        &mut up[..inter],
-                        inter,
-                    );
-                } else {
+            match self.config.hidden_act {
+                crate::config::HiddenAct::SiluGate => {
+                    if seq_len == 1 {
+                        if let (Some(pq), Some(gw), Some(uw)) = (
+                            normed2_preq.as_ref(),
+                            qweights.get_q4k(&gate_w_name),
+                            qweights.get_q4k(&up_w_name),
+                        ) {
+                            q4k.fused_q4k_preq_2(
+                                pq,
+                                gw,
+                                &mut gate[..inter],
+                                inter,
+                                uw,
+                                &mut up[..inter],
+                                inter,
+                            );
+                        } else {
+                            qmm(
+                                normed2_preq.as_ref(),
+                                &normed2,
+                                &gate_w_name,
+                                &mut gate[..inter],
+                                1,
+                                inter,
+                                h,
+                            );
+                            qmm(
+                                normed2_preq.as_ref(),
+                                &normed2,
+                                &up_w_name,
+                                &mut up[..inter],
+                                1,
+                                inter,
+                                h,
+                            );
+                        }
+                    } else {
+                        qmm(
+                            normed2_preq.as_ref(),
+                            &normed2,
+                            &gate_w_name,
+                            &mut gate[..seq_len * inter],
+                            seq_len,
+                            inter,
+                            h,
+                        );
+                        qmm(
+                            normed2_preq.as_ref(),
+                            &normed2,
+                            &up_w_name,
+                            &mut up[..seq_len * inter],
+                            seq_len,
+                            inter,
+                            h,
+                        );
+                    }
+                    for i in 0..seq_len * inter {
+                        gate[i] = tempura_kernels::portable_math::portable_silu(gate[i]) * up[i];
+                    }
+                    if det_rmsnorm.is_some() {
+                        tempura_kernels::portable_math::q8_snap(&mut gate[..seq_len * inter]);
+                    }
+                }
+                crate::config::HiddenAct::SquaredRelu => {
                     qmm(
                         normed2_preq.as_ref(),
                         &normed2,
                         &gate_w_name,
-                        &mut gate[..inter],
-                        1,
+                        &mut gate[..seq_len * inter],
+                        seq_len,
                         inter,
                         h,
                     );
@@ -793,36 +900,35 @@ where
                         normed2_preq.as_ref(),
                         &normed2,
                         &up_w_name,
-                        &mut up[..inter],
-                        1,
+                        &mut up[..seq_len * inter],
+                        seq_len,
                         inter,
                         h,
                     );
+                    if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer == 0 {
+                        let last_g = &gate[(seq_len-1)*inter..seq_len*inter];
+                        let last_u = &up[(seq_len-1)*inter..seq_len*inter];
+                        let gn: f32 = last_g.iter().map(|x| x*x).sum::<f32>().sqrt();
+                        let un: f32 = last_u.iter().map(|x| x*x).sum::<f32>().sqrt();
+                        eprintln!("L0 FFN gate[0..8]: {:?} norm={gn:.4}", &last_g[..8.min(inter)]);
+                        eprintln!("L0 FFN up[0..8]: {:?} norm={un:.4}", &last_u[..8.min(inter)]);
+                    }
+                    for i in 0..seq_len * inter {
+                        let relu = gate[i].max(0.0);
+                        gate[i] = relu * relu * up[i];
+                    }
+                    if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer == 0 {
+                        let last = &gate[(seq_len-1)*inter..seq_len*inter];
+                        let norm: f32 = last.iter().map(|x| x*x).sum::<f32>().sqrt();
+                        eprintln!("L0 FFN after relu²*up[0..8]: {:?} norm={norm:.4}", &last[..8.min(inter)]);
+                    }
                 }
-            } else {
-                qmm(
-                    normed2_preq.as_ref(),
-                    &normed2,
-                    &gate_w_name,
-                    &mut gate[..seq_len * inter],
-                    seq_len,
-                    inter,
-                    h,
-                );
-                qmm(
-                    normed2_preq.as_ref(),
-                    &normed2,
-                    &up_w_name,
-                    &mut up[..seq_len * inter],
-                    seq_len,
-                    inter,
-                    h,
-                );
             }
 
-            for i in 0..seq_len * inter {
-                let silu = gate[i] / (1.0 + (-gate[i]).exp());
-                gate[i] = silu * up[i];
+            if let Some(sub_norm_w) = qweights.get_f32(ffn_sub_norm_name) {
+                self.pipeline
+                    .rmsnorm(&mut gate[..seq_len * inter], sub_norm_w, inter, cfg.layer_norm_eps, TraceLevel::Off, &mut None)
+                    .unwrap();
             }
 
             down_out.fill(0.0);
@@ -843,6 +949,12 @@ where
             for i in 0..seq_len * h {
                 hidden[i] += down_out[i];
             }
+
+            if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer < 3 {
+                let last = &hidden[(seq_len - 1) * h..seq_len * h];
+                let norm: f32 = last.iter().map(|x| x * x).sum::<f32>().sqrt();
+                eprintln!("L{layer} hidden[last][0..8]: {:?} norm={norm:.4}", &last[..8.min(h)]);
+            }
         }
 
         session.cache.advance(seq_len);
@@ -850,22 +962,27 @@ where
 
         let mut final_normed = hidden.clone();
         let final_norm_w = qweights.get_f32("model.norm.weight").unwrap();
-        self.pipeline
-            .rmsnorm(
-                &mut final_normed,
-                final_norm_w,
-                h,
-                cfg.layer_norm_eps,
-                TraceLevel::Off,
-                &mut None,
-            )
-            .unwrap();
+        if let Some(ref drn) = det_rmsnorm {
+            use tempura_kernels::RMSNorm;
+            drn.forward(&mut final_normed, final_norm_w, h, cfg.layer_norm_eps).unwrap();
+        } else {
+            self.pipeline.rmsnorm(&mut final_normed, final_norm_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+        }
+        if det_rmsnorm.is_some() {
+            tempura_kernels::portable_math::q8_snap(&mut final_normed[..seq_len * h]);
+        }
 
         // lm_head
         let last_hidden = &final_normed[(seq_len - 1) * h..seq_len * h];
         let mut logits = vec![0.0f32; cfg.vocab_size];
         let lm_head_name = "lm_head.weight";
-        if let Some(w) = qweights.get_q4k(lm_head_name) {
+        if let Some(w) = qweights.get_i2s(lm_head_name) {
+            q4k.forward_b_transposed_i2s(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
+                .unwrap();
+        } else if let Some(w) = qweights.get_tq2(lm_head_name) {
+            q4k.forward_b_transposed_tq2(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
+                .unwrap();
+        } else if let Some(w) = qweights.get_q4k(lm_head_name) {
             q4k.forward_b_transposed_q4k(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
                 .unwrap();
         } else if let Some(w) = qweights.get_q6k(lm_head_name) {
@@ -876,6 +993,25 @@ where
             self.pipeline
                 .matmul_bt(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
                 .unwrap();
+        }
+
+        if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() {
+            eprint!("LOGITS_RAW:");
+            for i in 0..20.min(logits.len()) {
+                eprint!(" {:.6}", logits[i]);
+            }
+            eprintln!();
+            let mut scored: Vec<(f32, usize)> = logits.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            eprint!("TOP10:");
+            for i in 0..10.min(scored.len()) {
+                eprint!(" {}:{:.4}", scored[i].1, scored[i].0);
+            }
+            eprintln!();
+            let sum: f32 = logits.iter().sum();
+            let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let min = logits.iter().cloned().fold(f32::INFINITY, f32::min);
+            eprintln!("STATS: mean={:.6} min={:.6} max={:.6}", sum / logits.len() as f32, min, max);
         }
 
         logits
@@ -1998,11 +2134,66 @@ pub struct GpuQuantizedInferenceWrapper {
     pub gpu_cache: std::sync::Mutex<crate::kv_cache::GpuKvCache>,
     pub scratchpad: std::sync::Mutex<crate::gpu_scratchpad::GpuScratchpad>,
     pub embed_host: Vec<f32>,
+    pub attn_mode: tempura_kernels::AttentionMode,
+    pub cpu_model: Option<std::sync::Mutex<TransformerModel<
+        tempura_kernels::attention::CpuAttention,
+        tempura_kernels::rmsnorm::CpuRMSNorm,
+        tempura_kernels::rope::CpuRoPE,
+        tempura_kernels::matmul::CpuMatMul,
+        tempura_kernels::sampling::CpuSampler,
+    >>>,
 }
 
 #[cfg(feature = "cuda")]
 impl GpuQuantizedInferenceWrapper {
-    fn gpu_gemv(
+    fn gpu_quantize_q8(
+        &self,
+        input: &cuda_core::DeviceBuffer<f32>,
+        q8_out: &mut cuda_core::DeviceBuffer<u32>,
+        count: usize,
+    ) {
+        let ctx = self.q4k_matmul.gpu().context().clone();
+        let stream = self.q4k_matmul.gpu().stream();
+        tempura_kernels::gpu::quantize_q8_device(&ctx, &stream, input, q8_out, count)
+            .expect("q8 quantize");
+    }
+
+    fn gpu_gemv_q8_or_f32(
+        &self,
+        name: &str,
+        f32_input: &cuda_core::DeviceBuffer<f32>,
+        q8_input: &cuda_core::DeviceBuffer<u32>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        n: usize,
+        k: usize,
+        seq_len: usize,
+    ) {
+        if let Some(w) = self.gpu_weights.get_q4k_device(name) {
+            if seq_len == 1 {
+                self.q4k_matmul
+                    .gemv_q4k_q8_dp4a_device(q8_input, w, output, n, k)
+                    .expect(name);
+            } else {
+                self.q4k_matmul
+                    .gemm_q4k_q8_det_device(q8_input, w, output, seq_len, n, k)
+                    .expect(name);
+            }
+        } else if let Some(w) = self.gpu_weights.get_q6k_device(name) {
+            if seq_len == 1 {
+                self.q4k_matmul
+                    .gemv_q6k_q8_dp4a_device(q8_input, w, output, n, k)
+                    .expect(name);
+            } else {
+                self.q4k_matmul
+                    .gemm_q6k_q8_det_device(q8_input, w, output, seq_len, n, k)
+                    .expect(name);
+            }
+        } else {
+            self.gpu_gemv_f32(name, f32_input, output, n, k, seq_len);
+        }
+    }
+
+    fn gpu_gemv_f32(
         &self,
         name: &str,
         input: &cuda_core::DeviceBuffer<f32>,
@@ -2012,9 +2203,6 @@ impl GpuQuantizedInferenceWrapper {
         seq_len: usize,
     ) {
         if let Some(w) = self.gpu_weights.get_q4k_device(name) {
-            if std::env::var("TEMPURA_DEBUG_GPU").is_ok() {
-                eprintln!("[gpu-gemv] {name}: Q4K m={seq_len} n={n} k={k} wbytes={}", w.len());
-            }
             if seq_len == 1 {
                 self.q4k_matmul
                     .gemv_q4k_coop_device(input, w, output, n, k)
@@ -2025,21 +2213,110 @@ impl GpuQuantizedInferenceWrapper {
                     .expect(name);
             }
         } else if let Some(w) = self.gpu_weights.get_q6k_device(name) {
-            if std::env::var("TEMPURA_DEBUG_GPU").is_ok() {
-                eprintln!("[gpu-gemv] {name}: Q6K m={seq_len} n={n} k={k} wbytes={}", w.len());
+            if seq_len == 1 {
+                self.q4k_matmul
+                    .gemv_q6k_coop_device(input, w, output, n, k)
+                    .expect(name);
+            } else {
+                self.q4k_matmul
+                    .forward_q6k_device(input, w, output, seq_len, n, k)
+                    .expect(name);
             }
-            // Use naive per-thread Q6K kernel
-            self.q4k_matmul
-                .forward_q6k_device(input, w, output, seq_len, n, k)
-                .expect(name);
         } else {
-            if std::env::var("TEMPURA_DEBUG_GPU").is_ok() {
-                eprintln!("[gpu-gemv] {name}: f32 m={seq_len} n={n} k={k}");
-            }
             let w = self.gpu_weights.get(name).unwrap();
             self.matmul
                 .forward_bt_device(input, w, output, seq_len, n, k)
                 .expect(name);
+        }
+    }
+
+    fn gpu_fused_gate_up_silu(
+        &self,
+        gate_name: &str,
+        up_name: &str,
+        input: &cuda_core::DeviceBuffer<f32>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        n: usize,
+        k: usize,
+    ) {
+        let gate_w = self.gpu_weights.get_q4k_device(gate_name).expect("fused: gate not Q4K");
+        let up_w = self.gpu_weights.get_q4k_device(up_name).expect("fused: up not Q4K");
+        self.q4k_matmul
+            .fused_gate_up_silu_device(input, gate_w, up_w, output, n, k)
+            .expect("fused gate_up_silu");
+    }
+
+    fn cpu_rmsnorm_on_gpu(
+        &self,
+        x: &mut cuda_core::DeviceBuffer<f32>,
+        weight: &cuda_core::DeviceBuffer<f32>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        hidden_size: usize,
+        seq_len: usize,
+        eps: f32,
+    ) {
+        let stream = self.q4k_matmul.gpu().stream();
+        let mut host = x.to_host_vec(&stream).unwrap();
+        let w = weight.to_host_vec(&stream).unwrap();
+        use tempura_kernels::RMSNorm;
+        tempura_kernels::rmsnorm::CpuRMSNormDet
+            .forward(&mut host[..seq_len * hidden_size], &w, hidden_size, eps)
+            .unwrap();
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                output.cu_deviceptr(), host.as_ptr(),
+                seq_len * hidden_size * 4, stream.cu_stream(),
+            ).unwrap();
+        }
+    }
+
+    fn cpu_silu_on_gpu(
+        &self,
+        gate: &cuda_core::DeviceBuffer<f32>,
+        up: &cuda_core::DeviceBuffer<f32>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        count: usize,
+    ) {
+        let stream = self.q4k_matmul.gpu().stream();
+        let g = gate.to_host_vec(&stream).unwrap();
+        let u = up.to_host_vec(&stream).unwrap();
+        let mut out = vec![0.0f32; count];
+        for i in 0..count {
+            out[i] = tempura_kernels::portable_math::portable_silu(g[i]) * u[i];
+        }
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                output.cu_deviceptr(), out.as_ptr(),
+                count * 4, stream.cu_stream(),
+            ).unwrap();
+        }
+    }
+
+    fn cpu_attention_on_gpu(
+        &self,
+        q: &cuda_core::DeviceBuffer<f32>,
+        k: &cuda_core::DeviceBuffer<f32>,
+        v: &cuda_core::DeviceBuffer<f32>,
+        output: &mut cuda_core::DeviceBuffer<f32>,
+        seq_len: usize, kv_len: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, scale: f32,
+    ) {
+        let stream = self.q4k_matmul.gpu().stream();
+        let qh = q.to_host_vec(&stream).unwrap();
+        let kh = k.to_host_vec(&stream).unwrap();
+        let vh = v.to_host_vec(&stream).unwrap();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let mut out = vec![0.0f32; seq_len * q_dim];
+        tempura_kernels::attention::CpuAttention.forward(
+            &qh[..seq_len * q_dim], &kh[..kv_len * kv_dim], &vh[..kv_len * kv_dim],
+            &mut out, 1, seq_len, kv_len, n_heads, n_kv_heads, head_dim, scale,
+        ).unwrap();
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                output.cu_deviceptr(), out.as_ptr(),
+                out.len() * 4, stream.cu_stream(),
+            ).unwrap();
         }
     }
 
@@ -2053,6 +2330,9 @@ impl GpuQuantizedInferenceWrapper {
         let h = cfg.hidden_size;
         let n_heads = cfg.num_attention_heads;
         let n_kv_heads = cfg.num_kv_heads;
+        let cpu_ops = std::env::var("TEMPURA_CPU_OPS").is_ok();
+        let use_dp4a = self.attn_mode == tempura_kernels::AttentionMode::NaiveF32
+            || std::env::var("TEMPURA_DP4A").is_ok();
         let head_dim = cfg.head_dim;
         let inter = cfg.intermediate_size;
         let q_dim = n_heads * head_dim;
@@ -2069,6 +2349,7 @@ impl GpuQuantizedInferenceWrapper {
         }
         scratch.upload_hidden(&stream, &hidden_host);
         let debug_gpu = std::env::var("TEMPURA_DEBUG_GPU").is_ok();
+        let q8_snap = std::env::var("TEMPURA_DETERMINISTIC").is_ok();
 
         let dbg = |name: &str, buf: &cuda_core::DeviceBuffer<f32>, stream: &cuda_core::CudaStream| {
             if !debug_gpu { return; }
@@ -2099,6 +2380,29 @@ impl GpuQuantizedInferenceWrapper {
         let positions_dev =
             cuda_core::DeviceBuffer::from_host(&stream, &positions).expect("upload positions");
 
+        let profile = std::env::var("TEMPURA_PROFILE").is_ok();
+        let mut t_matmul = 0u128;
+        let mut t_rmsnorm = 0u128;
+        let mut t_rope = 0u128;
+        let mut t_attn = 0u128;
+        let mut t_elem = 0u128;
+        let mut t_kvcopy = 0u128;
+        macro_rules! timed {
+            ($accum:ident, $body:expr) => {{
+                if profile {
+                    stream.synchronize().unwrap();
+                    let _t0 = std::time::Instant::now();
+                    let _r = $body;
+                    stream.synchronize().unwrap();
+                    $accum += _t0.elapsed().as_micros();
+                    _r
+                } else {
+                    $body
+                }
+            }};
+        }
+
+        let fwd_start = std::time::Instant::now();
         for layer in 0..cfg.num_layers {
             let prefix = format!("model.layers.{layer}");
 
@@ -2106,25 +2410,48 @@ impl GpuQuantizedInferenceWrapper {
                 .gpu_weights
                 .get(&format!("{prefix}.input_layernorm.weight"))
                 .unwrap();
-            self.rmsnorm
-                .forward_device(
-                    &scratch.hidden,
-                    input_ln_w,
-                    &mut scratch.normed,
-                    h,
-                    cfg.layer_norm_eps,
-                )
-                .expect("rmsnorm");
+            if cpu_ops {
+                self.cpu_rmsnorm_on_gpu(&mut scratch.hidden, input_ln_w, &mut scratch.normed, h, seq_len, cfg.layer_norm_eps);
+            } else {
+                self.rmsnorm.forward_device(&scratch.hidden, input_ln_w, &mut scratch.normed, h, cfg.layer_norm_eps).expect("rmsnorm");
+            }
+
+            if q8_snap {
+                tempura_kernels::gpu::q8_snap_device(&ctx, &stream, &mut scratch.normed, seq_len * h).expect("q8 snap normed");
+            }
 
             if layer == 0 { dbg("L0 normed", &scratch.normed, &stream); }
+
+            if std::env::var("TEMPURA_COMPARE").is_ok() && layer == 0 {
+                let gpu_normed = scratch.normed.to_host_vec(&stream).unwrap();
+                let gpu_hidden = scratch.hidden.to_host_vec(&stream).unwrap();
+                let ln_w = input_ln_w.to_host_vec(&stream).unwrap();
+
+                let mut cpu_normed = gpu_hidden[..seq_len * h].to_vec();
+                tempura_kernels::rmsnorm::CpuRMSNormDet.forward(&mut cpu_normed, &ln_w, h, cfg.layer_norm_eps).unwrap();
+
+                let max_diff: f32 = cpu_normed.iter().zip(&gpu_normed[..seq_len * h])
+                    .map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+                let num_diff = cpu_normed.iter().zip(&gpu_normed[..seq_len * h])
+                    .filter(|(a, b)| a != b).count();
+                eprintln!("[compare] L0 RMSNorm: max_diff={max_diff:.10}, diff_elems={num_diff}/{}",
+                    seq_len * h);
+            }
 
             let q_name = format!("{prefix}.self_attn.q_proj.weight");
             let k_name = format!("{prefix}.self_attn.k_proj.weight");
             let v_name = format!("{prefix}.self_attn.v_proj.weight");
 
-            self.gpu_gemv(&q_name, &scratch.normed, &mut scratch.q, q_dim, h, seq_len);
-            self.gpu_gemv(&k_name, &scratch.normed, &mut scratch.k, kv_dim, h, seq_len);
-            self.gpu_gemv(&v_name, &scratch.normed, &mut scratch.v, kv_dim, h, seq_len);
+            if use_dp4a {
+                self.gpu_quantize_q8(&scratch.normed, &mut scratch.q8_activation, seq_len * h);
+                self.gpu_gemv_q8_or_f32(&q_name, &scratch.normed, &scratch.q8_activation, &mut scratch.q, q_dim, h, seq_len);
+                self.gpu_gemv_q8_or_f32(&k_name, &scratch.normed, &scratch.q8_activation, &mut scratch.k, kv_dim, h, seq_len);
+                self.gpu_gemv_q8_or_f32(&v_name, &scratch.normed, &scratch.q8_activation, &mut scratch.v, kv_dim, h, seq_len);
+            } else {
+                self.gpu_gemv_f32(&q_name, &scratch.normed, &mut scratch.q, q_dim, h, seq_len);
+                self.gpu_gemv_f32(&k_name, &scratch.normed, &mut scratch.k, kv_dim, h, seq_len);
+                self.gpu_gemv_f32(&v_name, &scratch.normed, &mut scratch.v, kv_dim, h, seq_len);
+            }
 
             if layer == 0 {
                 dbg("L0 q_proj", &scratch.q, &stream);
@@ -2137,73 +2464,52 @@ impl GpuQuantizedInferenceWrapper {
                     .gpu_weights
                     .get(&format!("{prefix}.self_attn.q_norm.weight"))
                     .unwrap();
-                self.rmsnorm
-                    .forward_device(
-                        &scratch.q,
-                        q_norm_w,
-                        &mut scratch.q_rotated,
-                        head_dim,
-                        cfg.layer_norm_eps,
-                    )
-                    .expect("qk norm q");
+                if cpu_ops {
+                    self.cpu_rmsnorm_on_gpu(&mut scratch.q, q_norm_w, &mut scratch.q_rotated, head_dim, seq_len * n_heads, cfg.layer_norm_eps);
+                } else {
+                    self.rmsnorm.forward_device(&scratch.q, q_norm_w, &mut scratch.q_rotated, head_dim, cfg.layer_norm_eps).expect("qk norm q");
+                }
+                if q8_snap {
+                    tempura_kernels::gpu::q8_snap_device(&ctx, &stream, &mut scratch.q_rotated, seq_len * q_dim).expect("q8 snap qk q");
+                }
                 tempura_kernels::gpu::copy_region_device(
-                    &ctx,
-                    &stream,
-                    &scratch.q_rotated,
-                    &mut scratch.q,
-                    0,
-                    0,
-                    seq_len * q_dim,
-                )
-                .expect("copy q norm");
+                    &ctx, &stream, &scratch.q_rotated, &mut scratch.q, 0, 0, seq_len * q_dim,
+                ).expect("copy q norm");
 
                 let k_norm_w = self
                     .gpu_weights
                     .get(&format!("{prefix}.self_attn.k_norm.weight"))
                     .unwrap();
-                self.rmsnorm
-                    .forward_device(
-                        &scratch.k,
-                        k_norm_w,
-                        &mut scratch.k_rotated,
-                        head_dim,
-                        cfg.layer_norm_eps,
-                    )
-                    .expect("qk norm k");
+                if cpu_ops {
+                    self.cpu_rmsnorm_on_gpu(&mut scratch.k, k_norm_w, &mut scratch.k_rotated, head_dim, seq_len * n_kv_heads, cfg.layer_norm_eps);
+                } else {
+                    self.rmsnorm.forward_device(&scratch.k, k_norm_w, &mut scratch.k_rotated, head_dim, cfg.layer_norm_eps).expect("qk norm k");
+                }
+                if q8_snap {
+                    tempura_kernels::gpu::q8_snap_device(&ctx, &stream, &mut scratch.k_rotated, seq_len * kv_dim).expect("q8 snap qk k");
+                }
                 tempura_kernels::gpu::copy_region_device(
-                    &ctx,
-                    &stream,
-                    &scratch.k_rotated,
-                    &mut scratch.k,
-                    0,
-                    0,
+                    &ctx, &stream, &scratch.k_rotated, &mut scratch.k, 0, 0,
                     seq_len * kv_dim,
                 )
                 .expect("copy k norm");
             }
 
-            self.rope
-                .forward_device(
-                    &scratch.q,
-                    &mut scratch.q_rotated,
-                    &positions_dev,
-                    seq_len,
-                    n_heads,
-                    head_dim,
-                    cfg.rope_theta,
-                )
-                .expect("rope q");
-            self.rope
-                .forward_device(
-                    &scratch.k,
-                    &mut scratch.k_rotated,
-                    &positions_dev,
-                    seq_len,
-                    n_kv_heads,
-                    head_dim,
-                    cfg.rope_theta,
-                )
-                .expect("rope k");
+            if cpu_ops {
+                let mut qh = scratch.q.to_host_vec(&stream).unwrap();
+                let mut kh = scratch.k.to_host_vec(&stream).unwrap();
+                let rope_table = tempura_kernels::rope::CpuRoPETable::new(cfg.max_seq_len, head_dim, cfg.rope_theta);
+                use tempura_kernels::RoPE;
+                rope_table.forward(&mut qh[..seq_len * q_dim], 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                rope_table.forward(&mut kh[..seq_len * kv_dim], 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                unsafe {
+                    cuda_core::memory::memcpy_htod_async(scratch.q_rotated.cu_deviceptr(), qh.as_ptr(), seq_len * q_dim * 4, stream.cu_stream()).unwrap();
+                    cuda_core::memory::memcpy_htod_async(scratch.k_rotated.cu_deviceptr(), kh.as_ptr(), seq_len * kv_dim * 4, stream.cu_stream()).unwrap();
+                }
+            } else {
+                self.rope.forward_device(&scratch.q, &mut scratch.q_rotated, &positions_dev, seq_len, n_heads, head_dim, cfg.rope_theta).expect("rope q");
+                self.rope.forward_device(&scratch.k, &mut scratch.k_rotated, &positions_dev, seq_len, n_kv_heads, head_dim, cfg.rope_theta).expect("rope k");
+            }
 
             let stride = n_kv_heads * head_dim;
             let dst_offset = gpu_cache.seq_len * stride;
@@ -2230,36 +2536,60 @@ impl GpuQuantizedInferenceWrapper {
             .expect("kv cache v append");
 
             let kv_len = gpu_cache.seq_len + seq_len;
-            self.attention
-                .forward_device(
-                    &scratch.q_rotated,
-                    &gpu_cache.k[layer],
-                    &gpu_cache.v[layer],
-                    &mut scratch.attn_out,
-                    1,
-                    seq_len,
-                    kv_len,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
+            if cpu_ops {
+                self.cpu_attention_on_gpu(
+                    &scratch.q_rotated, &gpu_cache.k[layer], &gpu_cache.v[layer],
+                    &mut scratch.attn_out, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
                     1.0 / (head_dim as f32).sqrt(),
-                )
-                .expect("attention");
+                );
+            } else {
+                self.attention.forward_device_with_mode(
+                    &scratch.q_rotated, &gpu_cache.k[layer], &gpu_cache.v[layer],
+                    &mut scratch.attn_out, 1, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+                    1.0 / (head_dim as f32).sqrt(), self.attn_mode,
+                ).expect("attention");
+            }
 
             if layer == 0 { dbg("L0 attn_out", &scratch.attn_out, &stream); }
 
-            let o_name = format!("{prefix}.self_attn.o_proj.weight");
-            self.gpu_gemv(&o_name, &scratch.attn_out, &mut scratch.o_proj, h, q_dim, seq_len);
+            if std::env::var("TEMPURA_COMPARE").is_ok() && layer == 0 {
+                let gpu_attn = scratch.attn_out.to_host_vec(&stream).unwrap();
+                let gpu_q = scratch.q_rotated.to_host_vec(&stream).unwrap();
+                let gpu_k = gpu_cache.k[0].to_host_vec(&stream).unwrap();
+                let gpu_v = gpu_cache.v[0].to_host_vec(&stream).unwrap();
 
-            tempura_kernels::gpu::vector_add_device(
-                &ctx,
-                &stream,
-                &scratch.hidden,
-                &scratch.o_proj,
-                &mut scratch.hidden_swap,
-            )
-            .expect("residual add");
-            std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_swap);
+                let mut cpu_attn = vec![0.0f32; seq_len * q_dim];
+                tempura_kernels::attention::CpuAttention.forward(
+                    &gpu_q[..seq_len * q_dim], &gpu_k[..kv_len * kv_dim], &gpu_v[..kv_len * kv_dim],
+                    &mut cpu_attn, 1, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+                    1.0 / (head_dim as f32).sqrt(),
+                ).unwrap();
+
+                let max_diff: f32 = cpu_attn.iter().zip(&gpu_attn[..seq_len * q_dim])
+                    .map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+                let num_diff = cpu_attn.iter().zip(&gpu_attn[..seq_len * q_dim])
+                    .filter(|(a, b)| a != b).count();
+                eprintln!("[compare] L0 attention: max_diff={max_diff:.10}, diff_elems={num_diff}/{}",
+                    seq_len * q_dim);
+            }
+
+            let o_name = format!("{prefix}.self_attn.o_proj.weight");
+            if use_dp4a {
+                self.gpu_quantize_q8(&scratch.attn_out, &mut scratch.q8_activation, seq_len * q_dim);
+                self.gpu_gemv_q8_or_f32(&o_name, &scratch.attn_out, &scratch.q8_activation, &mut scratch.o_proj, h, q_dim, seq_len);
+            } else {
+                self.gpu_gemv_f32(&o_name, &scratch.attn_out, &mut scratch.o_proj, h, q_dim, seq_len);
+            }
+
+            if cpu_ops {
+                let mut hh = scratch.hidden.to_host_vec(&stream).unwrap();
+                let oh = scratch.o_proj.to_host_vec(&stream).unwrap();
+                for i in 0..seq_len * h { hh[i] += oh[i]; }
+                unsafe { cuda_core::memory::memcpy_htod_async(scratch.hidden.cu_deviceptr(), hh.as_ptr(), seq_len * h * 4, stream.cu_stream()).unwrap(); }
+            } else {
+                tempura_kernels::gpu::vector_add_device(&ctx, &stream, &scratch.hidden, &scratch.o_proj, &mut scratch.hidden_swap).expect("residual add");
+                std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_swap);
+            }
 
             if layer == 0 { dbg("L0 hidden_post_attn", &scratch.hidden, &stream); }
 
@@ -2267,41 +2597,81 @@ impl GpuQuantizedInferenceWrapper {
                 .gpu_weights
                 .get(&format!("{prefix}.post_attention_layernorm.weight"))
                 .unwrap();
-            self.rmsnorm
-                .forward_device(
-                    &scratch.hidden,
-                    post_ln_w,
-                    &mut scratch.normed2,
-                    h,
-                    cfg.layer_norm_eps,
-                )
-                .expect("rmsnorm2");
+            if cpu_ops {
+                self.cpu_rmsnorm_on_gpu(&mut scratch.hidden, post_ln_w, &mut scratch.normed2, h, seq_len, cfg.layer_norm_eps);
+            } else {
+                self.rmsnorm.forward_device(&scratch.hidden, post_ln_w, &mut scratch.normed2, h, cfg.layer_norm_eps).expect("rmsnorm2");
+            }
+
+            if q8_snap {
+                tempura_kernels::gpu::q8_snap_device(&ctx, &stream, &mut scratch.normed2, seq_len * h).expect("q8 snap normed2");
+            }
 
             let gate_name = format!("{prefix}.mlp.gate_proj.weight");
             let up_name = format!("{prefix}.mlp.up_proj.weight");
             let down_name = format!("{prefix}.mlp.down_proj.weight");
 
-            self.gpu_gemv(&gate_name, &scratch.normed2, &mut scratch.gate, inter, h, seq_len);
-            self.gpu_gemv(&up_name, &scratch.normed2, &mut scratch.up, inter, h, seq_len);
+            let can_fuse_gate_up = !use_dp4a && !cpu_ops && seq_len == 1
+                && self.gpu_weights.get_q4k_device(&gate_name).is_some()
+                && self.gpu_weights.get_q4k_device(&up_name).is_some();
+
+            if can_fuse_gate_up {
+                self.gpu_fused_gate_up_silu(&gate_name, &up_name, &scratch.normed2, &mut scratch.silu_out, inter, h);
+            } else if use_dp4a {
+                self.gpu_quantize_q8(&scratch.normed2, &mut scratch.q8_activation, seq_len * h);
+                self.gpu_gemv_q8_or_f32(&gate_name, &scratch.normed2, &scratch.q8_activation, &mut scratch.gate, inter, h, seq_len);
+                self.gpu_gemv_q8_or_f32(&up_name, &scratch.normed2, &scratch.q8_activation, &mut scratch.up, inter, h, seq_len);
+
+                if cpu_ops {
+                    self.cpu_silu_on_gpu(&scratch.gate, &scratch.up, &mut scratch.silu_out, seq_len * inter);
+                } else {
+                    tempura_kernels::gpu::silu_mul_device(&ctx, &stream, &scratch.gate, &scratch.up, &mut scratch.silu_out).expect("silu_mul");
+                }
+            } else {
+                self.gpu_gemv_f32(&gate_name, &scratch.normed2, &mut scratch.gate, inter, h, seq_len);
+                self.gpu_gemv_f32(&up_name, &scratch.normed2, &mut scratch.up, inter, h, seq_len);
+
+                if cpu_ops {
+                    self.cpu_silu_on_gpu(&scratch.gate, &scratch.up, &mut scratch.silu_out, seq_len * inter);
+                } else {
+                    tempura_kernels::gpu::silu_mul_device(&ctx, &stream, &scratch.gate, &scratch.up, &mut scratch.silu_out).expect("silu_mul");
+                }
+            }
+
+            if q8_snap {
+                tempura_kernels::gpu::q8_snap_device(&ctx, &stream, &mut scratch.silu_out, seq_len * inter).expect("q8 snap silu");
+            }
 
             if layer <= 6 {
                 dbg(&format!("L{layer} normed2"), &scratch.normed2, &stream);
-                dbg(&format!("L{layer} gate"), &scratch.gate, &stream);
-                dbg(&format!("L{layer} up"), &scratch.up, &stream);
             }
-
-            tempura_kernels::gpu::silu_mul_device(
-                &ctx,
-                &stream,
-                &scratch.gate,
-                &scratch.up,
-                &mut scratch.silu_out,
-            )
-            .expect("silu_mul");
 
             if layer <= 6 { dbg(&format!("L{layer} silu_out"), &scratch.silu_out, &stream); }
 
-            self.gpu_gemv(&down_name, &scratch.silu_out, &mut scratch.down, h, inter, seq_len);
+            if std::env::var("TEMPURA_COMPARE").is_ok() && layer == 0 {
+                let gpu_gate = scratch.gate.to_host_vec(&stream).unwrap();
+                let gpu_up = scratch.up.to_host_vec(&stream).unwrap();
+                let gpu_silu = scratch.silu_out.to_host_vec(&stream).unwrap();
+
+                let mut cpu_silu = vec![0.0f32; seq_len * inter];
+                for i in 0..seq_len * inter {
+                    cpu_silu[i] = tempura_kernels::portable_math::portable_silu(gpu_gate[i]) * gpu_up[i];
+                }
+
+                let max_diff: f32 = cpu_silu.iter().zip(&gpu_silu[..seq_len * inter])
+                    .map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+                let num_diff = cpu_silu.iter().zip(&gpu_silu[..seq_len * inter])
+                    .filter(|(a, b)| a != b).count();
+                eprintln!("[compare] L0 SiLU: max_diff={max_diff:.10}, diff_elems={num_diff}/{}",
+                    seq_len * inter);
+            }
+
+            if use_dp4a {
+                self.gpu_quantize_q8(&scratch.silu_out, &mut scratch.q8_activation, seq_len * inter);
+                self.gpu_gemv_q8_or_f32(&down_name, &scratch.silu_out, &scratch.q8_activation, &mut scratch.down, h, inter, seq_len);
+            } else {
+                self.gpu_gemv_f32(&down_name, &scratch.silu_out, &mut scratch.down, h, inter, seq_len);
+            }
 
             if layer <= 6 { dbg(&format!("L{layer} down_proj"), &scratch.down, &stream); }
 
@@ -2319,15 +2689,15 @@ impl GpuQuantizedInferenceWrapper {
                 }
             }
 
-            tempura_kernels::gpu::vector_add_device(
-                &ctx,
-                &stream,
-                &scratch.hidden,
-                &scratch.down,
-                &mut scratch.hidden_swap,
-            )
-            .expect("ffn residual add");
-            std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_swap);
+            if cpu_ops {
+                let mut hh = scratch.hidden.to_host_vec(&stream).unwrap();
+                let dh = scratch.down.to_host_vec(&stream).unwrap();
+                for i in 0..seq_len * h { hh[i] += dh[i]; }
+                unsafe { cuda_core::memory::memcpy_htod_async(scratch.hidden.cu_deviceptr(), hh.as_ptr(), seq_len * h * 4, stream.cu_stream()).unwrap(); }
+            } else {
+                tempura_kernels::gpu::vector_add_device(&ctx, &stream, &scratch.hidden, &scratch.down, &mut scratch.hidden_swap).expect("ffn residual add");
+                std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_swap);
+            }
 
             if layer == 0 { dbg("L0 hidden_post_ffn", &scratch.hidden, &stream); }
             if debug_gpu {
@@ -2340,23 +2710,42 @@ impl GpuQuantizedInferenceWrapper {
             }
         }
 
+        if profile {
+            stream.synchronize().unwrap();
+            let layers_ms = fwd_start.elapsed().as_millis();
+            eprintln!("[profile] {} layers: {layers_ms}ms ({:.2}ms/layer)",
+                cfg.num_layers, layers_ms as f64 / cfg.num_layers as f64);
+        }
+
         gpu_cache.advance(seq_len);
 
         dbg("final_hidden", &scratch.hidden, &stream);
 
         let final_norm_w = self.gpu_weights.get("model.norm.weight").unwrap();
-        self.rmsnorm
-            .forward_device(
-                &scratch.hidden,
-                final_norm_w,
-                &mut scratch.final_normed,
-                h,
-                cfg.layer_norm_eps,
-            )
-            .expect("final norm");
+        if cpu_ops {
+            self.cpu_rmsnorm_on_gpu(&mut scratch.hidden, final_norm_w, &mut scratch.final_normed, h, seq_len, cfg.layer_norm_eps);
+        } else {
+            self.rmsnorm.forward_device(&scratch.hidden, final_norm_w, &mut scratch.final_normed, h, cfg.layer_norm_eps).expect("final norm");
+        }
+
+        if q8_snap {
+            tempura_kernels::gpu::q8_snap_device(&ctx, &stream, &mut scratch.final_normed, seq_len * h).expect("q8 snap final");
+        }
 
         let lm_head_name = "lm_head.weight";
-        self.gpu_gemv(lm_head_name, &scratch.final_normed, &mut scratch.logits, cfg.vocab_size, h, seq_len);
+        let lm_start = std::time::Instant::now();
+        if use_dp4a {
+            self.gpu_quantize_q8(&scratch.final_normed, &mut scratch.q8_activation, seq_len * h);
+            self.gpu_gemv_q8_or_f32(lm_head_name, &scratch.final_normed, &scratch.q8_activation, &mut scratch.logits, cfg.vocab_size, h, seq_len);
+        } else {
+            self.gpu_gemv_f32(lm_head_name, &scratch.final_normed, &mut scratch.logits, cfg.vocab_size, h, seq_len);
+        }
+        if profile {
+            stream.synchronize().unwrap();
+            let lm_ms = lm_start.elapsed().as_millis();
+            let total_ms = fwd_start.elapsed().as_millis();
+            eprintln!("[profile] lm_head: {lm_ms}ms, total fwd: {total_ms}ms");
+        }
 
         let all_logits = scratch.logits.to_host_vec(&stream).expect("logits to host");
         let last_start = (seq_len - 1) * cfg.vocab_size;
@@ -2373,6 +2762,11 @@ impl InferenceModel for GpuQuantizedInferenceWrapper {
         true
     }
     fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
+        if let Some(ref cpu_model) = self.cpu_model {
+            let mut model = cpu_model.lock().unwrap();
+            let qw = model.quantized_weights.as_ref().unwrap() as *const crate::weights::QuantizedWeights;
+            return model.forward_quantized(session, token_ids, unsafe { &*qw });
+        }
         let logits = self.forward_gpu_quantized(token_ids, session.position);
         session.position += token_ids.len();
         session.cache.advance(token_ids.len());
@@ -2408,7 +2802,9 @@ impl InferenceModel for GpuQuantizedInferenceWrapper {
             if eos_token == Some(*generated.last().unwrap()) {
                 break;
             }
+            let step_start = Instant::now();
             let mut logits = self.forward(session, &[*generated.last().unwrap()]);
+            let fwd_us = step_start.elapsed().as_micros();
             params.apply_penalties(&mut logits, &generated);
             let mut probs = vec![0.0f32; logits.len()];
             self.sampler.apply(&logits, &mut probs, params).unwrap();
@@ -2418,6 +2814,10 @@ impl InferenceModel for GpuQuantizedInferenceWrapper {
                 Some(&mut session.rng)
             };
             let token = self.sampler.sample_token(&probs, rng_ref);
+            let step_us = step_start.elapsed().as_micros();
+            if _step <= 3 || _step == max_new_tokens - 1 {
+                eprintln!("[gen] step {_step}: fwd={fwd_us}us total={step_us}us token={token}");
+            }
             generated.push(token);
         }
 
@@ -2675,6 +3075,21 @@ mod kani_proofs {
         kani::assume((token_id as usize) < vocab_size);
 
         assert!((token_id as usize) < vocab_size);
+    }
+}
+
+#[cfg(test)]
+mod prop_tests {
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_head_dim_scale_never_zero_division(head_dim in 1usize..=16384) {
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            prop_assert!(!scale.is_nan(), "1/sqrt({}) = NaN", head_dim);
+            prop_assert!(!scale.is_infinite(), "1/sqrt({}) = Inf", head_dim);
+            prop_assert!(scale > 0.0, "1/sqrt({}) = {} <= 0", head_dim, scale);
+        }
     }
 }
 

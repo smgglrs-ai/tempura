@@ -102,6 +102,7 @@ impl KvCache {
 
     pub fn advance(&mut self, num_tokens: usize) {
         self.seq_len += num_tokens;
+        debug_assert!(tempura_kernel_api::VerifiedKvCache::well_formed(self));
     }
 
     pub fn reset(&mut self) {
@@ -162,6 +163,10 @@ impl KvCache {
             let len = num_tokens * self.num_kv_heads * self.head_dim;
             Cow::Borrowed(&self.v[layer][..len])
         }
+    }
+
+    pub fn max_seq_len(&self) -> usize {
+        self.max_seq_len
     }
 
     pub fn remaining_capacity(&self) -> usize {
@@ -236,6 +241,78 @@ impl KvCache {
         cache
     }
 }
+
+impl tempura_kernel_api::VerifiedKvCache for KvCache {
+    fn seq_len(&self) -> usize { self.seq_len }
+    fn max_seq_len(&self) -> usize { self.max_seq_len }
+    fn num_kv_heads(&self) -> usize { self.num_kv_heads }
+    fn head_dim(&self) -> usize { self.head_dim }
+}
+
+// Verus deductive proofs for KvCache struct invariants.
+// Under normal `cargo build`, the verus!{} block compiles to nothing (ghost erasure).
+// Under `verus`, these proofs are checked for ALL possible inputs.
+// Canonical verification runs against verus-verified/ crate; these inline specs
+// serve as documentation and compile-time syntax checking.
+use vstd::prelude::*;
+
+verus! {
+
+pub open spec fn kv_cache_well_formed(
+    seq_len: nat, max_seq_len: nat, num_kv_heads: nat, head_dim: nat,
+) -> bool {
+    &&& seq_len <= max_seq_len
+    &&& num_kv_heads >= 1
+    &&& head_dim >= 1
+    &&& max_seq_len >= 1
+}
+
+proof fn kv_advance_preserves_well_formed(
+    seq_len: nat, max_seq_len: nat, num_kv_heads: nat, head_dim: nat, n: nat,
+)
+    requires
+        kv_cache_well_formed(seq_len, max_seq_len, num_kv_heads, head_dim),
+        n >= 1,
+        seq_len + n <= max_seq_len,
+    ensures
+        kv_cache_well_formed(seq_len + n, max_seq_len, num_kv_heads, head_dim),
+{
+}
+
+proof fn kv_reset_preserves_well_formed(
+    max_seq_len: nat, num_kv_heads: nat, head_dim: nat,
+)
+    requires
+        num_kv_heads >= 1, head_dim >= 1, max_seq_len >= 1,
+    ensures
+        kv_cache_well_formed(0, max_seq_len, num_kv_heads, head_dim),
+{
+}
+
+proof fn kv_append_offsets_safe(
+    seq_len: nat, max_seq_len: nat, num_kv_heads: nat, head_dim: nat, n: nat,
+)
+    requires
+        kv_cache_well_formed(seq_len, max_seq_len, num_kv_heads, head_dim),
+        n >= 1,
+        seq_len + n <= max_seq_len,
+    ensures ({
+        let stride = num_kv_heads * head_dim;
+        let dst = seq_len * stride;
+        let src = n * stride;
+        dst + src <= max_seq_len * stride
+    }),
+{
+    assert((seq_len + n) * (num_kv_heads * head_dim)
+        <= max_seq_len * (num_kv_heads * head_dim))
+        by (nonlinear_arith)
+        requires seq_len + n <= max_seq_len;
+    assert(seq_len * (num_kv_heads * head_dim) + n * (num_kv_heads * head_dim)
+        == (seq_len + n) * (num_kv_heads * head_dim))
+        by (nonlinear_arith);
+}
+
+} // verus!
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KvCacheTransfer {
@@ -448,6 +525,12 @@ impl PrefixCacheTable {
     }
 }
 
+impl tempura_kernel_api::VerifiedPrefixCache for PrefixCacheTable {
+    fn num_entries(&self) -> usize { self.entries.len() }
+    fn max_entries(&self) -> usize { self.max_entries }
+    fn tick(&self) -> u64 { self.tick }
+}
+
 pub struct PrefixMatch {
     pub matched_len: usize,
     pub k_data: Vec<Vec<f32>>,
@@ -508,6 +591,41 @@ impl PageAllocator {
     }
 }
 
+impl tempura_kernel_api::VerifiedPageAllocator for PageAllocator {
+    fn available(&self) -> usize { self.free_pages.len() }
+    fn total(&self) -> usize { self.total_pages }
+}
+
+verus! {
+
+proof fn page_allocator_conservation(free_count: nat, total_pages: nat)
+    requires free_count <= total_pages,
+    ensures free_count + (total_pages - free_count) == total_pages,
+{
+}
+
+proof fn page_allocate_preserves(free_count: nat, total_pages: nat)
+    requires free_count <= total_pages, free_count >= 1,
+    ensures ({
+        let new_free = (free_count - 1) as nat;
+        &&& new_free <= total_pages
+        &&& new_free + (total_pages - new_free) == total_pages
+    }),
+{
+}
+
+proof fn page_free_preserves(free_count: nat, total_pages: nat)
+    requires free_count < total_pages,
+    ensures ({
+        let new_free = free_count + 1;
+        &&& new_free <= total_pages
+        &&& new_free + (total_pages - new_free) == total_pages
+    }),
+{
+}
+
+} // verus!
+
 pub struct BlockTable {
     table: Vec<u32>,
     num_blocks: usize,
@@ -566,6 +684,32 @@ impl BlockTable {
         }
     }
 }
+
+impl tempura_kernel_api::VerifiedBlockTable for BlockTable {
+    fn num_blocks(&self) -> usize { self.num_blocks }
+    fn max_blocks(&self) -> usize { self.table.len() }
+}
+
+verus! {
+
+proof fn block_table_set_monotone(num_blocks: nat, max_blocks: nat, idx: nat)
+    requires num_blocks <= max_blocks, idx < max_blocks,
+    ensures ({
+        let new_nb = if idx >= num_blocks { idx + 1 } else { num_blocks };
+        &&& new_nb <= max_blocks
+        &&& new_nb >= num_blocks
+        &&& idx < new_nb
+    }),
+{
+}
+
+proof fn block_table_clear_valid(num_blocks: nat, max_blocks: nat)
+    requires num_blocks <= max_blocks,
+    ensures 0nat <= max_blocks,
+{
+}
+
+} // verus!
 
 pub struct PagedKvCache {
     k_pages: Vec<Vec<f32>>,

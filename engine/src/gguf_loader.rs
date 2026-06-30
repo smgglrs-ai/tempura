@@ -41,6 +41,8 @@ pub enum GgmlType {
     Q5K = 13,
     Q6K = 14,
     BF16 = 30,
+    TQ1_0 = 36,  // upstream llama.cpp: base-3 ternary; bitnet.cpp: I2_S (2-bit ternary, no scale)
+    TQ2_0 = 37,
 }
 
 impl GgmlType {
@@ -59,6 +61,8 @@ impl GgmlType {
             13 => Ok(GgmlType::Q5K),
             14 => Ok(GgmlType::Q6K),
             30 => Ok(GgmlType::BF16),
+            36 => Ok(GgmlType::TQ1_0),
+            37 => Ok(GgmlType::TQ2_0),
             _ => Err(LoadError::GgufParse(format!("unsupported GGML type: {v}"))),
         }
     }
@@ -254,15 +258,9 @@ fn f16_to_f32(bits: u16) -> f32 {
         if frac == 0 {
             return f32::from_bits(sign << 31);
         }
-        let mut e = exp;
-        let mut f = frac;
-        while (f & 0x400) == 0 {
-            f <<= 1;
-            e = e.wrapping_sub(1);
-        }
-        f &= 0x3ff;
-        let f32_exp = 127 - 15 + 1 + e;
-        f32::from_bits((sign << 31) | (f32_exp << 23) | (f << 13))
+        let scale = f32::from_bits((127 - 14) << 23);
+        let mantissa = frac as f32 / 1024.0;
+        return if sign == 0 { scale * mantissa } else { -scale * mantissa };
     } else if exp == 31 {
         if frac == 0 {
             f32::from_bits((sign << 31) | (0xff << 23))
@@ -612,7 +610,37 @@ fn dequant_q5k(data: &[u8], num_elements: usize) -> Vec<f32> {
     output
 }
 
-fn tensor_data_size(dtype: GgmlType, num_elements: u64) -> u64 {
+fn dequant_tq2(data: &[u8], num_elements: usize) -> Vec<f32> {
+    use tempura_kernels::TQ2_BLOCK_SIZE;
+    let block_bytes = 66;
+    let num_blocks = num_elements / TQ2_BLOCK_SIZE;
+    let mut output = vec![0.0f32; num_elements];
+    for blk in 0..num_blocks {
+        let block = &data[blk * block_bytes..(blk + 1) * block_bytes];
+        let mut buf = [0.0f32; 256];
+        tempura_kernels::quantized::tq2_dequant_block(block, &mut buf);
+        output[blk * TQ2_BLOCK_SIZE..(blk + 1) * TQ2_BLOCK_SIZE].copy_from_slice(&buf);
+    }
+    output
+}
+
+fn dequant_tq1(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let packed_bytes = num_elements / 4;
+    let mut output = vec![0.0f32; num_elements];
+    for i in 0..packed_bytes {
+        let byte = data[i];
+        for shift in (0..8).step_by(2) {
+            let idx = i * 4 + (3 - shift / 2);
+            if idx < num_elements {
+                let bits = (byte >> shift) & 0x03;
+                output[idx] = bits as f32 - 1.0;
+            }
+        }
+    }
+    output
+}
+
+fn tensor_data_size(dtype: GgmlType, num_elements: u64, dims: &[u64]) -> u64 {
     match dtype {
         GgmlType::F32 => num_elements * 4,
         GgmlType::F16 | GgmlType::BF16 => num_elements * 2,
@@ -626,6 +654,11 @@ fn tensor_data_size(dtype: GgmlType, num_elements: u64) -> u64 {
         GgmlType::Q4K => (num_elements / 256) * 144,
         GgmlType::Q5K => (num_elements / 256) * 176,
         GgmlType::Q6K => (num_elements / 256) * 210,
+        GgmlType::TQ1_0 => {
+            // I2_S in bitnet.cpp: 2-bit packed (ne/4) + one f32 scale per tensor
+            num_elements / 4 + 4
+        }
+        GgmlType::TQ2_0 => (num_elements / 256) * 66,
     }
 }
 
@@ -653,6 +686,8 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "ffn_gate.weight" => "mlp.gate_proj.weight",
             "ffn_up.weight" => "mlp.up_proj.weight",
             "ffn_down.weight" => "mlp.down_proj.weight",
+            "ffn_sub_norm.weight" => "mlp.ffn_sub_norm.weight",
+            "attn_sub_norm.weight" => "self_attn.attn_sub_norm.weight",
             _ => return None,
         };
         return Some(format!("model.layers.{n}.{hf_suffix}"));
@@ -794,13 +829,37 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
 
     let head_dim = hidden_size / num_attention_heads;
 
+    let is_bitnet = arch.contains("bitnet");
+
     let file_type = metadata.get("general.file_type").and_then(|v| v.as_u32());
-    let quantization = file_type.and_then(|ft| match ft {
-        0 | 1 => None,
-        2 | 3 => Some(QuantConfig::gguf(4)),
-        7 => Some(QuantConfig::gguf(8)),
-        _ => Some(QuantConfig::gguf(4)),
-    });
+    let quantization = if is_bitnet {
+        Some(QuantConfig {
+            format: crate::config::QuantFormat::Tq2,
+            bits: 2,
+            group_size: 256,
+            symmetric: true,
+        })
+    } else {
+        file_type.and_then(|ft| match ft {
+            0 | 1 => None,
+            2 | 3 => Some(QuantConfig::gguf(4)),
+            7 => Some(QuantConfig::gguf(8)),
+            _ => Some(QuantConfig::gguf(4)),
+        })
+    };
+
+    let hidden_act = if is_bitnet {
+        crate::config::HiddenAct::SquaredRelu
+    } else {
+        crate::config::HiddenAct::SiluGate
+    };
+
+    // BitNet GGUF converter (convert-hf-to-gguf-bitnet.py) does NOT permute Q/K
+    // weights, so they remain in HuggingFace layout (split-half = NeoX RoPE).
+    // LLaMA GGUF converter permutes Q/K for adjacent-pair (Norm) RoPE.
+    // The GGUF metadata says ROPE_TYPE_NORM for both, but the actual weight
+    // layout determines which RoPE to use.
+    let rope_type = crate::config::RopeType::Neox;
 
     Ok(ModelConfig {
         hidden_size,
@@ -817,6 +876,8 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         quantization,
         use_qk_norm: false,
         sliding_window: None,
+        hidden_act,
+        rope_type,
     })
 }
 
@@ -893,7 +954,7 @@ impl GgufLoader {
 
         for info in &tensor_infos {
             let num_elements: u64 = info.dims.iter().product();
-            let byte_size = tensor_data_size(info.dtype, num_elements) as usize;
+            let byte_size = tensor_data_size(info.dtype, num_elements, &info.dims) as usize;
             let abs_offset = data_start + info.offset as usize;
 
             if abs_offset + byte_size > data.len() {
@@ -907,7 +968,8 @@ impl GgufLoader {
             let ne = num_elements as usize;
             let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
 
-            let keep_raw = (info.dtype == GgmlType::Q4K || info.dtype == GgmlType::Q6K)
+            let keep_raw = (info.dtype == GgmlType::Q4K || info.dtype == GgmlType::Q6K
+                || info.dtype == GgmlType::TQ2_0 || info.dtype == GgmlType::TQ1_0)
                 && !mapped_name.contains("embed_tokens")
                 && !mapped_name.contains("norm.weight");
 
@@ -926,12 +988,14 @@ impl GgufLoader {
                     GgmlType::Q4K => dequant_q4k(tensor_data, ne),
                     GgmlType::Q5K => dequant_q5k(tensor_data, ne),
                     GgmlType::Q6K => dequant_q6k(tensor_data, ne),
+                    GgmlType::TQ2_0 => dequant_tq2(tensor_data, ne),
+                    GgmlType::TQ1_0 => dequant_tq1(tensor_data, ne),
                 };
                 tensors.insert(mapped_name.clone(), floats);
             } else {
                 raw_tensors.insert(mapped_name.clone(), tensor_data.to_vec());
             }
-            tensor_dtypes.insert(mapped_name, info.dtype);
+            tensor_dtypes.insert(mapped_name.clone(), info.dtype);
         }
 
         let vocab_size_from_embed = tensors.get("model.embed_tokens.weight").map(|t| {
@@ -946,6 +1010,13 @@ impl GgufLoader {
             }
         }
         config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
+
+        if !tensors.contains_key("lm_head.weight") && !raw_tensors.contains_key("lm_head.weight") {
+            if let Some(embed) = tensors.get("model.embed_tokens.weight") {
+                tensors.insert("lm_head.weight".into(), embed.clone());
+                tensor_dtypes.insert("lm_head.weight".into(), GgmlType::F32);
+            }
+        }
 
         Ok(Self {
             tensors,
@@ -1009,7 +1080,7 @@ impl GgufLoader {
         let mut tensor_dtypes = HashMap::new();
         for info in &tensor_infos {
             let num_elements: u64 = info.dims.iter().product();
-            let byte_size = tensor_data_size(info.dtype, num_elements) as usize;
+            let byte_size = tensor_data_size(info.dtype, num_elements, &info.dims) as usize;
             let abs_offset = data_start + info.offset as usize;
 
             if abs_offset + byte_size > data.len() {
@@ -1039,6 +1110,8 @@ impl GgufLoader {
                 GgmlType::Q4K => dequant_q4k(tensor_data, ne),
                 GgmlType::Q5K => dequant_q5k(tensor_data, ne),
                 GgmlType::Q6K => dequant_q6k(tensor_data, ne),
+                GgmlType::TQ2_0 => dequant_tq2(tensor_data, ne),
+                GgmlType::TQ1_0 => dequant_tq1(tensor_data, ne),
             };
 
             let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
@@ -1075,6 +1148,8 @@ impl GgufLoader {
     pub fn to_quantized_weights(&self) -> crate::weights::QuantizedWeights {
         let mut q4k_tensors = HashMap::new();
         let mut q6k_tensors = HashMap::new();
+        let mut tq2_tensors = HashMap::new();
+        let mut i2s_tensors = HashMap::new();
         let mut f32_tensors = HashMap::new();
 
         for (name, dtype) in &self.tensor_dtypes {
@@ -1082,13 +1157,15 @@ impl GgufLoader {
                 f32_tensors.insert(name.clone(), f32_data.clone());
             } else if let Some(raw) = self.raw_tensors.get(name) {
                 match dtype {
-                    GgmlType::Q6K => q6k_tensors.insert(name.clone(), raw.clone()),
-                    _ => q4k_tensors.insert(name.clone(), raw.clone()),
+                    GgmlType::Q6K => { q6k_tensors.insert(name.clone(), raw.clone()); }
+                    GgmlType::TQ2_0 => { tq2_tensors.insert(name.clone(), raw.clone()); }
+                    GgmlType::TQ1_0 => { i2s_tensors.insert(name.clone(), raw.clone()); }
+                    _ => { q4k_tensors.insert(name.clone(), raw.clone()); }
                 };
             }
         }
 
-        crate::weights::QuantizedWeights::new(q4k_tensors, q6k_tensors, f32_tensors)
+        crate::weights::QuantizedWeights::new_with_ternary(q4k_tensors, q6k_tensors, tq2_tensors, i2s_tensors, f32_tensors)
     }
 
     pub fn tensor_dtype(&self, name: &str) -> Option<GgmlType> {

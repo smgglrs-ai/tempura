@@ -116,6 +116,8 @@ pub struct ChatMessageInput {
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
     chat_template: ChatTemplate,
+    bos_token_id: Option<u32>,
+    add_bos: bool,
 }
 
 impl Tokenizer {
@@ -137,6 +139,8 @@ impl Tokenizer {
         Ok(Self {
             inner,
             chat_template,
+            bos_token_id: None,
+            add_bos: false,
         })
     }
 
@@ -180,7 +184,26 @@ impl Tokenizer {
             .build()
             .map_err(|e| TokenizerError::Load(format!("failed to build BPE from GGUF: {e}")))?;
 
-        let inner = tokenizers::Tokenizer::new(bpe);
+        let mut inner = tokenizers::Tokenizer::new(bpe);
+
+        let model_type = metadata
+            .get("tokenizer.ggml.model")
+            .and_then(|v| match v {
+                GgufValue::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
+
+        let is_gpt2_bpe = model_type == "gpt2";
+
+        if is_gpt2_bpe {
+            inner.with_pre_tokenizer(Some(
+                tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, true, false),
+            ));
+            inner.with_decoder(Some(
+                tokenizers::decoders::byte_level::ByteLevel::default(),
+            ));
+        }
 
         let bos_token = metadata
             .get("tokenizer.ggml.bos_token_id")
@@ -196,11 +219,25 @@ impl Tokenizer {
             .map(|s| s.to_string())
             .unwrap_or_default();
 
+        let bos_token_id = metadata
+            .get("tokenizer.ggml.bos_token_id")
+            .and_then(|v| v.as_u32());
+
+        let add_bos = metadata
+            .get("tokenizer.ggml.add_bos_token")
+            .and_then(|v| match v {
+                GgufValue::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(false);
+
         let chat_template = ChatTemplate::new(CHATML_TEMPLATE.to_string(), bos_token, eos_token);
 
         Ok(Self {
             inner,
             chat_template,
+            bos_token_id,
+            add_bos,
         })
     }
 
@@ -230,7 +267,16 @@ impl Tokenizer {
             .inner
             .encode(text, false)
             .map_err(|e| TokenizerError::Encode(e.to_string()))?;
-        Ok(encoding.get_ids().to_vec())
+        let ids = encoding.get_ids();
+        if self.add_bos {
+            if let Some(bos) = self.bos_token_id {
+                let mut result = Vec::with_capacity(ids.len() + 1);
+                result.push(bos);
+                result.extend_from_slice(ids);
+                return Ok(result);
+            }
+        }
+        Ok(ids.to_vec())
     }
 
     pub fn decode(&self, ids: &[u32]) -> Result<String, TokenizerError> {

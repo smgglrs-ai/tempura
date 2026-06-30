@@ -109,7 +109,6 @@ pub fn vector_add_device(
     output: &mut DeviceBuffer<f32>,
 ) -> Result<(), KernelError> {
     use cuda_core::LaunchConfig;
-    bind_context(ctx)?;
     let module = cached_elementwise_module(ctx);
     module
         .vector_add(
@@ -131,7 +130,6 @@ pub fn silu_mul_device(
     output: &mut DeviceBuffer<f32>,
 ) -> Result<(), KernelError> {
     use cuda_core::LaunchConfig;
-    bind_context(ctx)?;
     let module = cached_elementwise_module(ctx);
     module
         .silu_mul(
@@ -156,7 +154,6 @@ pub fn slice_columns_device(
     slice_cols: usize,
 ) -> Result<(), KernelError> {
     use cuda_core::LaunchConfig;
-    bind_context(ctx)?;
     let module = cached_elementwise_module(ctx);
     let total_elems = rows * slice_cols;
     module
@@ -174,6 +171,45 @@ pub fn slice_columns_device(
     Ok(())
 }
 
+pub fn q8_snap_device(
+    ctx: &Arc<CudaContext>,
+    stream: &CudaStream,
+    x: &mut DeviceBuffer<f32>,
+    count: usize,
+) -> Result<(), KernelError> {
+    use cuda_core::LaunchConfig;
+    let module = cached_elementwise_module(ctx);
+    let num_blocks = ((count + 31) / 32) as u32;
+    let mut tmp = alloc_device(stream, count)?;
+    module
+        .q8_snap(stream, LaunchConfig::for_num_elems(num_blocks), x, &mut tmp, num_blocks)
+        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+    let byte_count = count * std::mem::size_of::<f32>();
+    unsafe {
+        cuda_core::memory::memcpy_dtod_async(
+            x.cu_deviceptr(), tmp.cu_deviceptr(), byte_count, stream.cu_stream(),
+        )
+    }
+    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+    Ok(())
+}
+
+pub fn quantize_q8_device(
+    ctx: &Arc<CudaContext>,
+    stream: &CudaStream,
+    x: &DeviceBuffer<f32>,
+    q8_out: &mut DeviceBuffer<u32>,
+    count: usize,
+) -> Result<(), KernelError> {
+    use cuda_core::LaunchConfig;
+    let module = cached_elementwise_module(ctx);
+    let num_blocks = ((count + 31) / 32) as u32;
+    module
+        .quantize_q8(stream, LaunchConfig::for_num_elems(num_blocks), x, q8_out, num_blocks)
+        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+    Ok(())
+}
+
 pub fn copy_region_device(
     ctx: &Arc<CudaContext>,
     stream: &CudaStream,
@@ -183,7 +219,6 @@ pub fn copy_region_device(
     dst_offset: usize,
     count: usize,
 ) -> Result<(), KernelError> {
-    bind_context(ctx)?;
     let byte_count = count * std::mem::size_of::<f32>();
     let src_ptr = src.cu_deviceptr() + (src_offset * std::mem::size_of::<f32>()) as u64;
     let dst_ptr = dst.cu_deviceptr() + (dst_offset * std::mem::size_of::<f32>()) as u64;

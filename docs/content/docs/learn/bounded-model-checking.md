@@ -1,7 +1,7 @@
 +++
-title = "20. Bounded Model Checking"
+title = "24. Bounded Model Checking"
 description = "What Kani proves, how SAT/SMT works under the hood, and what 'all inputs' means within bounds."
-weight = 200
+weight = 240
 template = "docs/page.html"
 
 [extra]

@@ -1260,3 +1260,18 @@
   summary: "Fixed three server startup issues: (1) flash attention shared memory 96KB→48KB by reducing BR/BC 64→32, (2) shared CUDA context via with_context() constructors to avoid 5 separate contexts, (3) --max-seq-len CLI override for GGUF models. Server starts and loads Qwen3-8B Q4K to GPU (217 quantized + 182 f32 tensors). Inference request reaches forward pass but produces NaN logits — GPU kernel pipeline needs layer-by-layer numerical validation."
   iteration: 19
   max_iterations: 20
+- timestamp: "2026-06-30T01:00:00Z"
+  actor: claude
+  action: session-work
+  item: "gpu-e2e-forward-pass"
+  summary: >
+    DP4A GPU kernels: wrote quantize_q8 (GPU-side activation quantization),
+    gemv_q6k_q8_dp4a (warp-coop Q6K decode), gemm_q6k_q8_det (Q6K batched prefill),
+    gemm_q4k_q8_det_device wrapper. Eliminated all CPU download-compute-upload
+    fallbacks from gpu_gemv. Added gemv_q6k_coop (warp-coop Q6K f32 GEMV).
+    Removed ~600 bind_context calls/token. Cached Q8 quantization per shared input.
+    Wired fused_gate_up_silu for non-DP4A decode. Performance: 9.7 tok/s decode
+    (was 6-8), llama.cpp 246 tok/s. Profiling shows 103ms/token, 650 kernels/token,
+    158us avg per kernel. Single matmul benchmark was 179 tok/s — gap is in
+    inter-kernel overhead or implicit serialization, not kernel speed itself.
+    307 tests passing. Coherent output verified on Qwen3-8B Q4K via chat completions.
