@@ -312,26 +312,19 @@ pub unsafe fn quantize_row_q8_k_avx2(src: &[f32], dst: &mut [BlockQ8K]) {
     assert_eq!(src.len() % 256, 0);
     assert_eq!(dst.len(), nb);
 
+    let sign_mask = _mm256_set1_ps(f32::from_bits(0x7FFFFFFF));
+    let perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
     for i in 0..nb {
         let x = &src[i * 256..][..256];
 
-        // find max absolute value across 256 elements
+        // find amax and max (signed) across 256 elements using AVX2
         let mut amax_vec = _mm256_setzero_ps();
-        let sign_mask = _mm256_set1_ps(f32::from_bits(0x7FFFFFFF));
         for chunk in 0..32 {
             let v = _mm256_loadu_ps(x[chunk * 8..].as_ptr());
             amax_vec = _mm256_max_ps(amax_vec, _mm256_and_ps(v, sign_mask));
         }
         let amax = hmax_f32_8(amax_vec);
-
-        // find max (signed) for iscale direction
-        let mut max = 0.0f32;
-        for j in 0..256 {
-            if x[j].abs() >= amax - 1e-10 {
-                max = x[j];
-                break;
-            }
-        }
 
         if amax == 0.0 {
             dst[i].d = 0.0;
@@ -340,31 +333,55 @@ pub unsafe fn quantize_row_q8_k_avx2(src: &[f32], dst: &mut [BlockQ8K]) {
             continue;
         }
 
-        let iscale = -127.0 / max;
-        let mul = _mm256_set1_ps(iscale);
-
-        for chunk in 0..32 {
-            let v = _mm256_loadu_ps(x[chunk * 8..].as_ptr());
-            let scaled = _mm256_mul_ps(v, mul);
-            let rounded = _mm256_cvtps_epi32(scaled);
-            // clamp to [-127, 127]
-            let clamped = _mm256_max_epi32(rounded, _mm256_set1_epi32(-127));
-            let clamped = _mm256_min_epi32(clamped, _mm256_set1_epi32(127));
-
-            // extract and store as i8
-            let vals: [i32; 8] = std::mem::transmute(clamped);
-            for k in 0..8 {
-                dst[i].qs[chunk * 8 + k] = vals[k] as i8;
+        // find signed max (same direction as ggml scalar reference)
+        let mut max = 0.0f32;
+        for j in 0..256 {
+            if x[j].abs() >= amax - 1e-10 {
+                max = x[j];
+                break;
             }
         }
 
-        // compute bsums
+        let iscale = -127.0 / max;
+        let mul = _mm256_set1_ps(iscale);
+
+        // quantize 32 elements at a time using AVX2 pack chain
+        for chunk in 0..8 {
+            let base = chunk * 32;
+            let v0 = _mm256_loadu_ps(x[base..].as_ptr());
+            let v1 = _mm256_loadu_ps(x[base + 8..].as_ptr());
+            let v2 = _mm256_loadu_ps(x[base + 16..].as_ptr());
+            let v3 = _mm256_loadu_ps(x[base + 24..].as_ptr());
+
+            let r0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, mul));
+            let r1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, mul));
+            let r2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, mul));
+            let r3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, mul));
+
+            // clamp to [-127, 127]
+            let min_val = _mm256_set1_epi32(-127);
+            let max_val = _mm256_set1_epi32(127);
+            let r0 = _mm256_min_epi32(_mm256_max_epi32(r0, min_val), max_val);
+            let r1 = _mm256_min_epi32(_mm256_max_epi32(r1, min_val), max_val);
+            let r2 = _mm256_min_epi32(_mm256_max_epi32(r2, min_val), max_val);
+            let r3 = _mm256_min_epi32(_mm256_max_epi32(r3, min_val), max_val);
+
+            let r01 = _mm256_packs_epi32(r0, r1);
+            let r23 = _mm256_packs_epi32(r2, r3);
+            let packed = _mm256_packs_epi16(r01, r23);
+            let result = _mm256_permutevar8x32_epi32(packed, perm);
+
+            _mm256_storeu_si256(dst[i].qs[base..].as_mut_ptr() as *mut __m256i, result);
+        }
+
+        // compute bsums using AVX2
         for j in 0..16 {
-            let mut sum = 0i32;
-            for k in 0..16 {
-                sum += dst[i].qs[j * 16 + k] as i32;
-            }
-            dst[i].bsums[j] = sum as i16;
+            let base = j * 16;
+            let v = _mm_loadu_si128(dst[i].qs[base..].as_ptr() as *const __m128i);
+            let lo = _mm256_cvtepi8_epi16(v);
+            let ones = _mm256_set1_epi16(1);
+            let sums = _mm256_madd_epi16(lo, ones); // pairwise sum → 8 i32
+            dst[i].bsums[j] = hsum_i32_8(sums) as i16;
         }
 
         dst[i].d = 1.0 / iscale;
@@ -589,6 +606,34 @@ mod tests {
         for j in 0..32 {
             let diff = (scalar_out[0].qs[j] as i32 - avx2_out[0].qs[j] as i32).abs();
             assert!(diff <= 1, "qs[{j}]: scalar={}, avx2={}", scalar_out[0].qs[j], avx2_out[0].qs[j]);
+        }
+    }
+
+    #[test]
+    fn avx2_quantize_q8_k_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") { return; }
+
+        let src: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
+
+        let mut scalar_out = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        quantize_row_q8_k(&src, &mut scalar_out);
+
+        let mut avx2_out = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        unsafe { quantize_row_q8_k_avx2(&src, &mut avx2_out); }
+
+        let d_diff = (scalar_out[0].d - avx2_out[0].d).abs();
+        assert!(d_diff < 1e-6, "d mismatch: scalar={}, avx2={}", scalar_out[0].d, avx2_out[0].d);
+
+        let mut max_qs_diff = 0i32;
+        for j in 0..256 {
+            let diff = (scalar_out[0].qs[j] as i32 - avx2_out[0].qs[j] as i32).abs();
+            max_qs_diff = max_qs_diff.max(diff);
+        }
+        assert!(max_qs_diff <= 1, "qs max_diff={max_qs_diff}");
+
+        for j in 0..16 {
+            let diff = (scalar_out[0].bsums[j] as i32 - avx2_out[0].bsums[j] as i32).abs();
+            assert!(diff <= 16, "bsums[{j}] diff={diff}");
         }
     }
 

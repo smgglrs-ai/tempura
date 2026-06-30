@@ -502,6 +502,84 @@ pub fn vec_dot_iq4_nl_q8_0(n: usize, x: &[BlockIQ4NL], y: &[BlockQ8_0]) -> f32 {
     sumf
 }
 
+pub fn vec_dot_mxfp4_q8_0(n: usize, x: &[BlockMxfp4], y: &[BlockQ8_0]) -> f32 {
+    use super::iq_tables::KVALUES_MXFP4;
+    const QK: usize = 32;
+    let nb = n / QK;
+    assert_eq!(n % QK, 0);
+    let mut sumf = 0.0f32;
+    for ib in 0..nb {
+        // E8M0 shared exponent → scale
+        let e8m0 = x[ib].e;
+        let scale = if e8m0 == 0 { 0.0f32 } else { f32::from_bits((e8m0 as u32) << 23) };
+        let d = f16_to_f32(y[ib].d) * scale * 0.5; // kvalues are doubled (int representation)
+        let mut sumi1 = 0i32;
+        let mut sumi2 = 0i32;
+        for j in 0..QK / 2 {
+            sumi1 += y[ib].qs[j] as i32 * KVALUES_MXFP4[(x[ib].qs[j] & 0xF) as usize] as i32;
+            sumi2 += y[ib].qs[j + QK / 2] as i32 * KVALUES_MXFP4[(x[ib].qs[j] >> 4) as usize] as i32;
+        }
+        sumf += d * (sumi1 + sumi2) as f32;
+    }
+    sumf
+}
+
+pub fn vec_dot_nvfp4_q8_0(n: usize, x: &[BlockNvfp4], y: &[BlockQ8_0]) -> f32 {
+    use super::iq_tables::KVALUES_MXFP4;
+    const QK: usize = 64;
+    const SUB: usize = 16;
+    let nb = n / QK;
+    assert_eq!(n % QK, 0);
+    let mut sumf = 0.0f32;
+    for ib in 0..nb {
+        for s_idx in 0..4usize {
+            let ue4m3_byte = x[ib].d[s_idx];
+            let d_sub = super::dequantize::ue4m3_to_f32_pub(ue4m3_byte);
+            let q8_block = s_idx / 2;
+            let q8_off = (s_idx % 2) * SUB;
+            let dy = f16_to_f32(y[2 * ib + q8_block].d);
+            let mut sumi_lo = 0i32;
+            let mut sumi_hi = 0i32;
+            for j in 0..SUB / 2 {
+                let qv = x[ib].qs[s_idx * (SUB / 2) + j];
+                sumi_lo += y[2 * ib + q8_block].qs[q8_off + j] as i32 * KVALUES_MXFP4[(qv & 0xF) as usize] as i32;
+                sumi_hi += y[2 * ib + q8_block].qs[q8_off + j + SUB / 2] as i32 * KVALUES_MXFP4[(qv >> 4) as usize] as i32;
+            }
+            sumf += dy * d_sub * (sumi_lo + sumi_hi) as f32;
+        }
+    }
+    sumf
+}
+
+pub fn vec_dot_q1_0_q8_0(n: usize, x: &[BlockQ1_0], y: &[BlockQ8_0]) -> f32 {
+    const QK: usize = 128; // Q1_0 block = 128 elements, spans 4 Q8_0 blocks
+    let nb = n / QK;
+    assert_eq!(n % QK, 0);
+    let mut sumf = 0.0f32;
+    for i in 0..nb {
+        let d0 = f16_to_f32(x[i].d);
+        let mut sumi = 0.0f32;
+        for k in 0..4 {
+            let yb = &y[i * 4 + k];
+            let d1 = f16_to_f32(yb.d);
+            let mut sumi_block = 0i32;
+            let bits = &x[i].qs[k * 4..k * 4 + 4];
+            let mut q8_idx = 0usize;
+            for b in 0..4u8 {
+                let mask = bits[b as usize];
+                for bit in 0..8u8 {
+                    let sign = if (mask >> bit) & 1 == 1 { 1i32 } else { -1 };
+                    sumi_block += sign * yb.qs[q8_idx] as i32;
+                    q8_idx += 1;
+                }
+            }
+            sumi += d1 * sumi_block as f32;
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
 fn grid_u64_bytes(grid: &[u64], idx: usize) -> [u8; 8] {
     grid[idx].to_le_bytes()
 }
@@ -992,6 +1070,21 @@ pub fn vec_dot(n: usize, result: &mut f32, vx: &[u8], vy: &[u8], weight_type: su
             let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockIQ1M, n / 256) };
             let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256) };
             *result = vec_dot_iq1_m_q8_k(n, x, y);
+        }
+        MXFP4 => {
+            let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockMxfp4, n / 32) };
+            let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8_0, n / 32) };
+            *result = vec_dot_mxfp4_q8_0(n, x, y);
+        }
+        NVFP4 => {
+            let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockNvfp4, n / 64) };
+            let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8_0, n / 32) };
+            *result = vec_dot_nvfp4_q8_0(n, x, y);
+        }
+        Q1_0 => {
+            let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ1_0, n / 128) };
+            let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8_0, n / 32) };
+            *result = vec_dot_q1_0_q8_0(n, x, y);
         }
         _ => unimplemented!("vec_dot not implemented for {}", weight_type.name()),
     }

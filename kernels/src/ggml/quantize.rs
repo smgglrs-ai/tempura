@@ -89,6 +89,11 @@ pub fn quantize_activations(src: &[f32], dst: &mut [u8], ggml_type: super::GgmlT
             let blocks = unsafe {
                 std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut BlockQ8_0, nb)
             };
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                unsafe { super::vec_dot_avx2::quantize_row_q8_0_avx2(src, blocks) };
+                return;
+            }
             quantize_row_q8_0(src, blocks);
         }
         Q8_1 => {
@@ -107,6 +112,11 @@ pub fn quantize_activations(src: &[f32], dst: &mut [u8], ggml_type: super::GgmlT
             let blocks = unsafe {
                 std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut BlockQ8K, nb)
             };
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                unsafe { super::vec_dot_avx2::quantize_row_q8_k_avx2(src, blocks) };
+                return;
+            }
             quantize_row_q8_k(src, blocks);
         }
         _ => unimplemented!("quantize not supported for {}", ggml_type.name()),

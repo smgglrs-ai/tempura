@@ -386,6 +386,8 @@ pub fn dequantize_row_nvfp4(blocks: &[BlockNvfp4], output: &mut [f32]) {
     }
 }
 
+pub(crate) fn ue4m3_to_f32_pub(byte: u8) -> f32 { ue4m3_to_f32(byte) }
+
 fn ue4m3_to_f32(byte: u8) -> f32 {
     let exp = (byte >> 3) as i32;
     let mant = (byte & 7) as f32 / 8.0 + 1.0;
