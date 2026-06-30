@@ -939,6 +939,150 @@ mod tests {
         assert!((out[3] - (-1.0)).abs() < 0.01);
     }
 
+    fn load_test_vector(name: &str) -> Option<Vec<u8>> {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+        let workspace = std::path::Path::new(&manifest).parent().unwrap_or(std::path::Path::new("."));
+        let path = workspace.join("tests-ggml").join(name);
+        std::fs::read(&path).ok()
+    }
+
+    fn load_f32_vector(name: &str) -> Option<Vec<f32>> {
+        let data = load_test_vector(name)?;
+        let n = data.len() / 4;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(f32::from_le_bytes([data[i*4], data[i*4+1], data[i*4+2], data[i*4+3]]));
+        }
+        Some(out)
+    }
+
+    #[test]
+    fn ggml_crossval_q4_0_dequantize() {
+        let Some(q4_data) = load_test_vector("q4_0_quantized.bin") else {
+            eprintln!("SKIP: test vectors not generated (run tests-ggml/run_crossval.sh)");
+            return;
+        };
+        let ggml_deq = load_f32_vector("q4_0_dequantized.bin").unwrap();
+        let k = ggml_deq.len();
+        let mut our_deq = vec![0.0f32; k];
+        dequantize_row(&q4_data, &mut our_deq, super::super::GgmlType::Q4_0, k);
+
+        let mut max_diff = 0.0f32;
+        for i in 0..k {
+            let diff = (our_deq[i] - ggml_deq[i]).abs();
+            max_diff = max_diff.max(diff);
+        }
+        eprintln!("Q4_0 dequant cross-val: max_abs_diff={max_diff:.6e} across {k} elements");
+        assert!(max_diff < 1e-5, "Q4_0 dequant mismatch: max_diff={max_diff}");
+    }
+
+    #[test]
+    fn ggml_crossval_q4k_dequantize() {
+        let Some(q4k_data) = load_test_vector("q4k_quantized.bin") else {
+            eprintln!("SKIP: test vectors not generated");
+            return;
+        };
+        let ggml_deq = load_f32_vector("q4k_dequantized.bin").unwrap();
+        let k = ggml_deq.len();
+        let mut our_deq = vec![0.0f32; k];
+        dequantize_row(&q4k_data, &mut our_deq, super::super::GgmlType::Q4K, k);
+
+        let mut max_diff = 0.0f32;
+        for i in 0..k {
+            let diff = (our_deq[i] - ggml_deq[i]).abs();
+            max_diff = max_diff.max(diff);
+        }
+        eprintln!("Q4_K dequant cross-val: max_abs_diff={max_diff:.6e} across {k} elements");
+        assert!(max_diff < 1e-5, "Q4_K dequant mismatch: max_diff={max_diff}");
+    }
+
+    #[test]
+    fn ggml_crossval_q6k_dequantize() {
+        let Some(q6k_data) = load_test_vector("q6k_quantized.bin") else {
+            eprintln!("SKIP: test vectors not generated");
+            return;
+        };
+        let ggml_deq = load_f32_vector("q6k_dequantized.bin").unwrap();
+        let k = ggml_deq.len();
+        let mut our_deq = vec![0.0f32; k];
+        dequantize_row(&q6k_data, &mut our_deq, super::super::GgmlType::Q6K, k);
+
+        let mut max_diff = 0.0f32;
+        for i in 0..k {
+            let diff = (our_deq[i] - ggml_deq[i]).abs();
+            max_diff = max_diff.max(diff);
+        }
+        eprintln!("Q6_K dequant cross-val: max_abs_diff={max_diff:.6e} across {k} elements");
+        assert!(max_diff < 1e-5, "Q6_K dequant mismatch: max_diff={max_diff}");
+    }
+
+    #[test]
+    fn ggml_crossval_q4_0_quantize_q8_0() {
+        let Some(src_data) = load_f32_vector("q4_0_src.bin") else {
+            eprintln!("SKIP: test vectors not generated");
+            return;
+        };
+        let ggml_q8 = load_test_vector("q4_0_q8_0_activations.bin").unwrap();
+        let k = src_data.len();
+        let nb = k / 32;
+        let mut our_q8 = vec![0u8; nb * 34];
+        super::super::quantize::quantize_activations(&src_data, &mut our_q8, super::super::GgmlType::Q8_0);
+
+        let mut max_diff = 0u8;
+        let mut diff_count = 0usize;
+        for i in 0..our_q8.len() {
+            let diff = (our_q8[i] as i16 - ggml_q8[i] as i16).unsigned_abs() as u8;
+            if diff > 0 {
+                diff_count += 1;
+                let blk = i / 34;
+                let off = i % 34;
+                if off >= 2 {
+                    let j = off - 2;
+                    let sv = src_data[blk * 32 + j];
+                    let blk_src = &src_data[blk*32..(blk+1)*32];
+                    let amax: f32 = blk_src.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                    let d = amax / 127.0;
+                    let scaled = sv / d;
+                    eprintln!("  DIFF blk {blk} qs[{j}]: ggml={} ours={} src={sv:.8} scaled={scaled:.8}", ggml_q8[i] as i8, our_q8[i] as i8);
+                } else {
+                    eprintln!("  DIFF blk {blk} d_byte[{off}]: ggml=0x{:02x} ours=0x{:02x}", ggml_q8[i], our_q8[i]);
+                }
+            }
+            max_diff = max_diff.max(diff);
+        }
+        eprintln!("Q8_0 quantize cross-val: max_byte_diff={max_diff}, {diff_count} diffs across {} bytes", our_q8.len());
+        assert!(max_diff <= 1, "Q8_0 quantize mismatch: max_diff={max_diff}");
+    }
+
+    #[test]
+    fn ggml_crossval_q4k_quantize_q8k() {
+        let Some(src_data) = load_f32_vector("q4k_src.bin") else {
+            eprintln!("SKIP: test vectors not generated");
+            return;
+        };
+        let ggml_q8k = load_test_vector("q4k_q8k_activations.bin").unwrap();
+        let k = src_data.len();
+        let nb = k / 256;
+        let mut our_q8k = vec![0u8; nb * 292];
+        super::super::quantize::quantize_activations(&src_data, &mut our_q8k, super::super::GgmlType::Q8K);
+
+        // Compare d (f32) at offset 0
+        let ggml_d = f32::from_le_bytes([ggml_q8k[0], ggml_q8k[1], ggml_q8k[2], ggml_q8k[3]]);
+        let our_d = f32::from_le_bytes([our_q8k[0], our_q8k[1], our_q8k[2], our_q8k[3]]);
+        let d_diff = (ggml_d - our_d).abs();
+        eprintln!("Q8_K quantize cross-val: d_diff={d_diff:.6e} (ggml={ggml_d}, ours={our_d})");
+        assert!(d_diff < 1e-6, "Q8_K d mismatch");
+
+        // Compare qs bytes (offset 4..260)
+        let mut max_qs_diff = 0u8;
+        for i in 4..260 {
+            let diff = (our_q8k[i] as i16 - ggml_q8k[i] as i16).unsigned_abs() as u8;
+            max_qs_diff = max_qs_diff.max(diff);
+        }
+        eprintln!("Q8_K quantize cross-val: max_qs_diff={max_qs_diff}");
+        assert!(max_qs_diff <= 1, "Q8_K qs mismatch: max_diff={max_qs_diff}");
+    }
+
     #[test]
     fn dequant_row_dispatch_q4k() {
         let blk = BlockQ4K {

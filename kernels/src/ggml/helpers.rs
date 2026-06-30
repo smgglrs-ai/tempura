@@ -53,7 +53,15 @@ pub fn f32_to_f16(val: f32) -> u16 {
         return (sign << 15) | (m as u16 & 0x3ff);
     }
 
-    (sign << 15) | ((new_exp as u16) << 10) | ((mant >> 13) as u16 & 0x3ff)
+    // round-to-nearest-even (IEEE 754)
+    let truncated = (mant >> 13) as u16 & 0x3ff;
+    let remainder = mant & 0x1fff;
+    let round_up = remainder > 0x1000 || (remainder == 0x1000 && (truncated & 1) != 0);
+    let mut h = (sign << 15) | ((new_exp as u16) << 10) | truncated;
+    if round_up {
+        h += 1;
+    }
+    h
 }
 
 pub fn bf16_to_f32(bits: u16) -> f32 {
