@@ -1,0 +1,16 @@
+[package]
+name = "verus-verified"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+name = "verus_verified"
+path = "src/lib.rs"
+
+[dependencies]
+
+[workspace]
+
+[package.metadata.verus]
+verify = true

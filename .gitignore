@@ -4,3 +4,14 @@ tests-gpu/target/
 .playwright-mcp/
 docs/public/
 *.ptx
+
+# Debug/benchmark logs
+tempura-*.log
+tempura-debug-out.txt
+
+# Build artifacts (non-default target dirs)
+target-nofma/
+
+# Claude Code worktrees
+.claude/worktrees/
+verus-verified/target/
