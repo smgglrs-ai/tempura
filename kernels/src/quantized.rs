@@ -1103,7 +1103,7 @@ unsafe fn quantize_row_q8_avx2(a: &[f32]) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
 /// Integer-domain Q4_K dot product with pre-quantized Q8 activations.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn q4k_dot_q8_avx2(block: &[u8], a_q8: &[i8], a_scale: f32, a_group_sums: &[f32]) -> f32 {
+pub unsafe fn q4k_dot_q8_avx2(block: &[u8], a_q8: &[i8], a_scale: f32, a_group_sums: &[f32]) -> f32 {
     use std::arch::x86_64::*;
 
     let d = q4k_block_d(block);

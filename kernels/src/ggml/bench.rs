@@ -82,6 +82,49 @@ mod bench_tests {
         eprintln!("  CpuMatMulQ4KOpt: {old_ms:.2} ms");
         eprintln!("  ggml dispatch vs old: {old_speedup:.2}x");
 
+        // mul_mat_q_preq (amortized quantization)
+        {
+            let preq = super::super::mul_mat::PreQuantizedQ8::from_f32(&activations, k, GgmlType::Q4K);
+            let start = Instant::now();
+            for _ in 0..iters {
+                super::super::mul_mat::mul_mat_q_preq(GgmlType::Q4K, &weights, &preq, &mut out, n);
+            }
+            let preq_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            eprintln!("  mul_mat_q_preq: {preq_ms:.2} ms ({:.2}x vs old)", old_ms / preq_ms);
+        }
+
+        // Per-block microbenchmark: ggml shuffle vs old hsum approach
+        if is_x86_feature_detected!("avx2") {
+            let one_blk = unsafe { &*(weights.as_ptr() as *const BlockQ4K) };
+            let mut q8k_blk = BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] };
+            super::super::quantize::quantize_row_q8_k(&activations[..256], std::slice::from_mut(&mut q8k_blk));
+
+            let micro_iters = 1_000_000;
+            let start = Instant::now();
+            let mut s = 0.0f32;
+            for _ in 0..micro_iters {
+                s += unsafe { super::super::vec_dot_avx2::vec_dot_q4_k_q8_k_avx2(256, std::slice::from_ref(one_blk), std::slice::from_ref(&q8k_blk)) };
+            }
+            let ns = start.elapsed().as_nanos() as f64 / micro_iters as f64;
+            eprintln!("  ggml AVX2 per-block: {ns:.1} ns (dummy={s:.3})");
+
+            // old approach
+            let block_bytes = unsafe { std::slice::from_raw_parts(weights.as_ptr(), 144) };
+            let a_q8 = &q8k_blk.qs[..];
+            let a_scale = q8k_blk.d;
+            let mut a_gsums = [0.0f32; 8];
+            for g in 0..8 { a_gsums[g] = activations[g * 32..g * 32 + 32].iter().sum(); }
+            let start = Instant::now();
+            let mut s2 = 0.0f32;
+            for iter in 0..micro_iters {
+                let a_sc = a_scale + (iter as f32 * 1e-20);
+                s2 += unsafe { crate::quantized::q4k_dot_q8_avx2(block_bytes, a_q8, a_sc, &a_gsums) };
+            }
+            let ns2 = start.elapsed().as_nanos() as f64 / micro_iters as f64;
+            eprintln!("  old AVX2 per-block: {ns2:.1} ns (dummy={s2:.3})");
+            eprintln!("  ggml/old per-block ratio: {:.2}x", ns / ns2);
+        }
+
         // Pure VNNI (skip dispatch overhead)
         if is_x86_feature_detected!("avxvnni") {
             let x = unsafe { std::slice::from_raw_parts(weights.as_ptr() as *const BlockQ4K, n * (k / 256)) };

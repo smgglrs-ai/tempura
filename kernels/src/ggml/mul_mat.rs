@@ -53,6 +53,21 @@ fn vec_dot_best(n: usize, result: &mut f32, vx: &[u8], vy: &[u8], weight_type: G
 /// Algorithm:
 /// 1. Quantize each src1 row to vec_dot_type (Q8_0 or Q8_K)
 /// 2. For each (src1_row, weight_row), call vec_dot → one output element
+type VecDotFnPtr = fn(usize, &mut f32, &[u8], &[u8], GgmlType);
+
+fn resolve_vec_dot(weight_type: GgmlType) -> VecDotFnPtr {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        match weight_type {
+            GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q6K => {
+                return vec_dot_best;
+            }
+            _ => {}
+        }
+    }
+    super::vec_dot::vec_dot
+}
+
 pub fn mul_mat_q(
     src0_type: GgmlType,
     src0: &[u8],
@@ -78,11 +93,81 @@ pub fn mul_mat_q(
         quantize_activations(src_row, dst_row, vdt);
     }
 
+    // For Q4K with AVX2, call the optimized path directly to avoid per-call dispatch
+    use rayon::prelude::*;
+
+    if m == 1 {
+        // Decode path: parallelize over output columns (not rows — there's only 1)
+        let act_row = &act_quantized[..act_row_bytes];
+        dst.par_iter_mut()
+            .enumerate()
+            .for_each(|(col, out)| {
+                let weight_row = &src0[col * weight_row_bytes..(col + 1) * weight_row_bytes];
+                vec_dot_best(k, out, weight_row, act_row, src0_type);
+            });
+    } else {
+        // Batch path: parallelize over rows
+        dst.par_chunks_mut(n)
+            .enumerate()
+            .for_each(|(row, dst_row)| {
+                let act_row = &act_quantized[row * act_row_bytes..(row + 1) * act_row_bytes];
+                for col in 0..n {
+                    let weight_row = &src0[col * weight_row_bytes..(col + 1) * weight_row_bytes];
+                    vec_dot_best(k, &mut dst_row[col], weight_row, act_row, src0_type);
+                }
+            });
+    }
+}
+
+/// Pre-quantized activations for reuse across multiple mul_mat_q calls.
+pub struct PreQuantizedQ8 {
+    pub data: Vec<u8>,
+    pub vec_dot_type: GgmlType,
+    pub k: usize,
+    pub m: usize,
+}
+
+impl PreQuantizedQ8 {
+    pub fn from_f32(src: &[f32], k: usize, weight_type: GgmlType) -> Self {
+        let vdt = weight_type.vec_dot_type();
+        let m = src.len() / k;
+        let act_row_bytes = quantized_row_size(k, vdt);
+        let mut data = vec![0u8; m * act_row_bytes];
+        for row in 0..m {
+            let src_row = &src[row * k..(row + 1) * k];
+            let dst_row = &mut data[row * act_row_bytes..(row + 1) * act_row_bytes];
+            quantize_activations(src_row, dst_row, vdt);
+        }
+        Self { data, vec_dot_type: vdt, k, m }
+    }
+
+    pub fn row_bytes(&self) -> usize {
+        quantized_row_size(self.k, self.vec_dot_type)
+    }
+}
+
+/// mul_mat with pre-quantized activations — avoids re-quantizing when
+/// the same activations are used across multiple weight tensors.
+pub fn mul_mat_q_preq(
+    src0_type: GgmlType,
+    src0: &[u8],
+    preq: &PreQuantizedQ8,
+    dst: &mut [f32],
+    n: usize,
+) {
+    let k = preq.k;
+    let m = preq.m;
+    let weight_row_bytes = quantized_row_size(k, src0_type);
+    let act_row_bytes = preq.row_bytes();
+
+    assert_eq!(src0.len(), n * weight_row_bytes, "src0 size mismatch");
+    assert_eq!(dst.len(), m * n, "dst size mismatch");
+
     use rayon::prelude::*;
     dst.par_chunks_mut(n)
         .enumerate()
         .for_each(|(row, dst_row)| {
-            let act_row = &act_quantized[row * act_row_bytes..(row + 1) * act_row_bytes];
+            let act_row = &preq.data[row * act_row_bytes..(row + 1) * act_row_bytes];
             for col in 0..n {
                 let weight_row = &src0[col * weight_row_bytes..(col + 1) * weight_row_bytes];
                 vec_dot_best(k, &mut dst_row[col], weight_row, act_row, src0_type);
@@ -223,7 +308,56 @@ mod tests {
         assert!(out[0].abs() < 0.1, "expected ~0, got {}", out[0]);
     }
 
-    // ── DualPipeline: scalar vs AVX2 mul_mat at inference-realistic sizes ──
+    // ── Determinism: same input → bit-identical output ──
+
+    #[test]
+    fn determinism_q4k_avx2() {
+        let n = 16;
+        let k = 1024;
+        let m = 1;
+        let weights = make_q4k_weights(n, k, 42);
+        let activations = make_activations(m, k);
+
+        let mut out1 = vec![0.0f32; m * n];
+        let mut out2 = vec![0.0f32; m * n];
+
+        mul_mat_q(GgmlType::Q4K, &weights, &activations, &mut out1, m, n, k);
+        mul_mat_q(GgmlType::Q4K, &weights, &activations, &mut out2, m, n, k);
+
+        for j in 0..m * n {
+            assert_eq!(
+                out1[j].to_bits(), out2[j].to_bits(),
+                "Q4K determinism failure at [{j}]: run1={} run2={}", out1[j], out2[j]
+            );
+        }
+    }
+
+    #[test]
+    fn determinism_q6k_avx2() {
+        let n = 16;
+        let k = 1024;
+        let m = 1;
+        let weights = make_q6k_weights(n, k, 17);
+        let activations = make_activations(m, k);
+
+        let mut out1 = vec![0.0f32; m * n];
+        let mut out2 = vec![0.0f32; m * n];
+
+        mul_mat_q(GgmlType::Q6K, &weights, &activations, &mut out1, m, n, k);
+        mul_mat_q(GgmlType::Q6K, &weights, &activations, &mut out2, m, n, k);
+
+        for j in 0..m * n {
+            assert_eq!(
+                out1[j].to_bits(), out2[j].to_bits(),
+                "Q6K determinism failure at [{j}]: run1={} run2={}", out1[j], out2[j]
+            );
+        }
+    }
+
+    // ── Scalar vs AVX2 equivalence (not bit-identical due to f32 associativity) ──
+    // madd_epi16(scale, maddubs(q4, q8)) computes scale*(a0*b0+a1*b1)
+    // scalar computes scale*a0*b0 + scale*a1*b1 — different rounding.
+    // Tolerance: < 0.01 relative error (acceptable for quantized inference).
 
     fn make_q4k_weights(n: usize, k: usize, seed: u8) -> Vec<u8> {
         let blocks_per_row = k / 256;
