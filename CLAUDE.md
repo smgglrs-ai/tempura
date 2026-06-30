@@ -42,7 +42,7 @@ Three-crate workspace + standalone verification crate:
     lora, trace_diff, guided_decoding, config_validation, rope_frequency,
     tensor_parallel, fp8_kv_cache, quantized_forward, gguf_alignment,
     position_encoding
-  - 59 modules total, 757 verification conditions
+  - 62 modules total, 828 verification conditions
 
 ## Key Design Decisions
 
@@ -58,16 +58,20 @@ Three-crate workspace + standalone verification crate:
    The crate structure is ready behind a feature flag. Phase 2 builds the verified
    foundation; Phase 3 delivers GPU implementations.
 
-4. **Four-layer verification architecture:**
-   - **Kani** proves safety (no panics, no OOB access) on Rust code — bounded instances
-   - **Verus** proves properties for ALL inputs (deductive, unbounded) via SMT
+4. **Verification-first architecture — every property gets the strongest proof
+   available.** New code without verification is incomplete code.
+   - **Kani** proves safety (no panics, no OOB) on Rust code — bounded instances
+   - **Verus** proves properties for ALL inputs (deductive, unbounded) via SMT —
+     struct invariants, loop termination, state machines, GQA, causal masking,
+     tensor parallel sharding, BitNet packing roundtrips, end-to-end composition
+   - **Property tests** cover f32/f64 properties Kani/Verus can't handle
    - **DualPipeline** validates numerical equivalence between kernel implementations
-   - **Property tests** cover mathematical properties Kani can't handle (f32 exp/trig)
-   - **Shared trait contracts** (`Verified*` traits in kernel-api) bind real impls to
-     Verus specs — `debug_assert!(well_formed())` in methods, drift detection in CI
-   - **Inline `verus!{}` blocks** in engine source (kv_cache.rs, session.rs) — compiled
-     to nothing by normal `cargo build` (vstd ghost erasure), canonical verification
-     runs against `verus-verified/` crate
+   - **Shared trait contracts** (`Verified*` traits in kernel-api) bind real impls
+     to Verus specs — `debug_assert!(well_formed())` in methods
+   - **Inline `verus!{}` blocks** in engine source — compiled to nothing by normal
+     `cargo build` (vstd ghost erasure), canonical proofs in `verus-verified/`
+   - **Drift detection** in `run-verus.sh` — compares struct fields and function
+     names between source and Verus re-declarations
    - cuda-oxide and NVIDIA hardware are trusted infrastructure (like rustc/CPU)
 
 5. **Inference traces are first-class.** Every forward pass produces a structured
@@ -198,19 +202,75 @@ Rebuild it from the fork and set `CUDA_OXIDE_BACKEND`.
 
 ## Formal Verification
 
+**Every new feature, struct, or algorithm MUST be verified to the maximum extent
+each tool supports.** This is not optional — formal proof coverage is a first-class
+deliverable, not a follow-up task. When adding or modifying code:
+
+1. **Add Kani harnesses** for bounded safety (no panics, no OOB) — any function
+   with indexing arithmetic, buffer slicing, or integer overflow risk.
+2. **Add Verus proofs** for unbounded deductive properties — struct invariants,
+   loop termination, state machine transitions, resource conservation, and all
+   Kani harnesses that can be generalized (pure integer/bit, no f32/f64).
+3. **Add property tests** (proptest) for floating-point properties Kani/Verus
+   can't handle — round-trip error bounds, monotonicity, NaN/Inf avoidance.
+4. **Implement `Verified*` traits** for any new struct with a well-formedness
+   invariant — add `debug_assert!(well_formed())` in mutating methods.
+5. **Add inline `verus!{}` blocks** next to the real code when the proof mirrors
+   the implementation closely — serves as documentation + compile-time syntax check.
+6. **Update `run-verus.sh`** with any new Verus module.
+
+### Running Verification
+
 ```sh
+cargo test                           # unit + property tests (307+ tests)
 cargo kani --package tempura-kernels  # Kani: bounded model checking (57 harnesses)
-./scripts/run-verus.sh               # Verus: deductive unbounded proofs (757 verification conditions)
+./scripts/run-verus.sh               # Verus: deductive unbounded proofs (828 verification conditions)
 ```
+
+### Tools
+
+| Tool | What it proves | Scope | When to use |
+|------|---------------|-------|-------------|
+| **Kani** | Safety (no panics, no OOB, no overflow) | Bounded instances (e.g. max_seq_len≤8) | Any function with indexing or arithmetic |
+| **Verus** | Properties for ALL inputs (unbounded) via SMT | Integer/bit arithmetic, struct invariants, state machines | Everything Kani proves + struct lifecycle + composition |
+| **Property tests** | Probabilistic confidence for f32/f64 properties | Randomized (millions of inputs) | Float round-trip, monotonicity, NaN avoidance |
+| **`Verified*` traits** | Impl-spec sync at compile time | Trait method signatures | Any struct with well-formedness invariant |
+| **Inline `verus!{}`** | Documentation + syntax check | Same source file | Struct invariants, key algorithms |
+| **Drift detection** | Struct field / function name sync | `run-verus.sh` script | Automatic on every Verus run |
+
+### Coverage Summary
+
+**Kani:** 57 bounded harnesses across kernels/ and engine/ — indexing arithmetic
+for attention, RMSNorm, RoPE, matmul, sampling, turboquant, quantized (Q4K/Q6K/TQ2),
+KV cache, model, speculative, disaggregated, weights, GGUF.
+
+**Verus:** 62 modules, 828 verification conditions — 56 of 57 Kani harnesses
+proven unboundedly (54 directly + 2 restated as integer arithmetic), plus 48
+modules of struct invariants, loop proofs, state machines, GPU kernel
+decomposition, GQA head mapping, tensor parallel sharding, causal masking,
+flash attention tiles, FP8/f16 encoding, BitNet TQ2/I2S packing, end-to-end
+pipeline composition, and weight shape validation.
+
+**Property tests:** 3 float-specific harnesses (`head_dim_scale_never_zero_division`,
+`int8_dequant_bounded_error`, `q4k_dequant_value_bounded`) that require IEEE 754
+reasoning beyond Verus/Kani capability.
+
+**Kani-only:** 1 runtime execution test (`cpu_allreduce_is_identity`) — requires
+Vec allocation, not expressible in Verus.
+
+**Shared trait contracts:** 5 `Verified*` traits in kernel-api — `VerifiedKvCache`,
+`VerifiedPageAllocator`, `VerifiedBlockTable`, `VerifiedSession`, `VerifiedPrefixCache`.
+Implemented on real structs with `debug_assert!(well_formed())`.
+
+### Setup
 
 Verus requires a pre-built binary at `~/.local/verus/verus-x86-linux/verus`
 (or set `VERUS_PATH`). Download from https://github.com/verus-lang/verus/releases.
 The `verus-verified/` crate is standalone (own toolchain, own workspace) — do NOT
 add it to the main workspace.
 
-Verus covers 56 of 57 Kani harnesses unboundedly (54 directly, 2 restated as
-integer arithmetic: `q4k_monotonicity_within_group`, `q4k_accumulator_no_overflow`).
-The 3 excluded require f32/f64 reasoning which Verus does not support; these are
-covered by proptest instead: `head_dim_scale_never_zero_division` (engine),
-`int8_dequant_bounded_error`, `q4k_dequant_value_bounded` (kernels).
-The remaining `cpu_allreduce_is_identity` is a runtime Vec execution test — Kani-only.
+Verus covers 56 of 57 Kani harnesses unboundedly. The 6 excluded from Verus:
+- 2 restated as integer proofs: `q4k_monotonicity_within_group`, `q4k_accumulator_no_overflow`
+- 3 covered by proptest (f32/f64): `head_dim_scale_never_zero_division`,
+  `int8_dequant_bounded_error`, `q4k_dequant_value_bounded`
+- 1 Kani-only (runtime Vec): `cpu_allreduce_is_identity`
