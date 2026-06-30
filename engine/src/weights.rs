@@ -223,6 +223,7 @@ pub struct QuantizedWeights {
     tq2_tensors: HashMap<String, Vec<u8>>,
     i2s_tensors: HashMap<String, Vec<u8>>,
     f32_tensors: HashMap<String, Vec<f32>>,
+    typed_tensors: HashMap<String, (tempura_kernels::ggml::GgmlType, Vec<u8>)>,
 }
 
 impl QuantizedWeights {
@@ -237,6 +238,7 @@ impl QuantizedWeights {
             tq2_tensors: HashMap::new(),
             i2s_tensors: HashMap::new(),
             f32_tensors,
+            typed_tensors: HashMap::new(),
         }
     }
 
@@ -253,6 +255,34 @@ impl QuantizedWeights {
             tq2_tensors,
             i2s_tensors,
             f32_tensors,
+            typed_tensors: HashMap::new(),
+        }
+    }
+
+    pub fn new_typed(
+        typed_tensors: HashMap<String, (tempura_kernels::ggml::GgmlType, Vec<u8>)>,
+        f32_tensors: HashMap<String, Vec<f32>>,
+    ) -> Self {
+        use tempura_kernels::ggml::GgmlType;
+        let mut q4k_tensors = HashMap::new();
+        let mut q6k_tensors = HashMap::new();
+        let mut tq2_tensors = HashMap::new();
+        let mut i2s_tensors = HashMap::new();
+        for (name, (dtype, data)) in &typed_tensors {
+            match dtype {
+                GgmlType::Q6K => { q6k_tensors.insert(name.clone(), data.clone()); }
+                GgmlType::TQ2_0 => { tq2_tensors.insert(name.clone(), data.clone()); }
+                GgmlType::TQ1_0 => { i2s_tensors.insert(name.clone(), data.clone()); }
+                _ => { q4k_tensors.insert(name.clone(), data.clone()); }
+            }
+        }
+        Self {
+            q4k_tensors,
+            q6k_tensors,
+            tq2_tensors,
+            i2s_tensors,
+            f32_tensors,
+            typed_tensors,
         }
     }
 
@@ -274,6 +304,16 @@ impl QuantizedWeights {
 
     pub fn get_f32(&self, name: &str) -> Option<&[f32]> {
         self.f32_tensors.get(name).map(|v| v.as_slice())
+    }
+
+    pub fn get_typed(&self, name: &str) -> Option<(tempura_kernels::ggml::GgmlType, &[u8])> {
+        self.typed_tensors
+            .get(name)
+            .map(|(t, d)| (*t, d.as_slice()))
+    }
+
+    pub fn tensor_type(&self, name: &str) -> Option<tempura_kernels::ggml::GgmlType> {
+        self.typed_tensors.get(name).map(|(t, _)| *t)
     }
 }
 

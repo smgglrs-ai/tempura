@@ -7,6 +7,7 @@ pub use tempura_kernel_api::{
     I2S_BLOCK_BYTES, I2S_BLOCK_SIZE,
 };
 
+pub mod ggml;
 pub mod portable_math;
 pub mod allreduce;
 pub mod attention;

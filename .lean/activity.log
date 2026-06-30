@@ -1275,3 +1275,35 @@
     158us avg per kernel. Single matmul benchmark was 179 tok/s — gap is in
     inter-kernel overhead or implicit serialization, not kernel speed itself.
     307 tests passing. Coherent output verified on Qwen3-8B Q4K via chat completions.
+- timestamp: "2026-06-30T16:30:00Z"
+  actor: claude
+  action: session-work
+  item: "ggml-translation"
+  summary: >
+    Bottom-up translation of ggml quantized ops to Rust. Created kernels/src/ggml/
+    module with 11 files. Layer 0: GgmlType enum (matching ggml IDs exactly) + 25
+    #[repr(C)] block structs with const_assert size checks. Layer 1: 15 dequantize
+    functions (Q4_0 through NVFP4, plus IQ4_NL). Layer 2: Q8_0/Q8_1/Q8_K activation
+    quantization. Layer 3: 13 vec_dot scalar reference functions (all non-IQ + IQ4_NL).
+    Layer 5: Registry-driven mul_mat_q with rayon parallelism. Layers 6-7: QuantizedWeights
+    refactored with GgmlType-tagged typed_tensors, GGUF loader propagates types,
+    forward_quantized() has ggml::mul_mat_q fallback for any format. Layer 8: IQ lookup
+    tables auto-extracted from ggml-common.h (6 grid tables, 4 constant tables). Layer 9:
+    15 Kani proof harnesses for dequantize/quantize/vec_dot bounds safety. 340 tests
+    passing, 33 new ggml-specific tests. Remaining IQ vec_dot/dequantize (IQ1/IQ2/IQ3/IQ4_XS)
+    need grid table lookups in the vec_dot implementations — tables are extracted, implementations
+    TODO.
+- timestamp: "2026-06-30T17:30:00Z"
+  actor: claude
+  action: session-work
+  item: "ggml-translation"
+  summary: >
+    Completed all IQ format implementations. Added vec_dot for IQ2_XXS, IQ2_XS,
+    IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, IQ4_XS (8 new vec_dot functions).
+    Added dequantize for all 9 IQ formats. Grid lookup tables (iq2xxs_grid 256×u64,
+    iq2xs_grid 512×u64, iq2s_grid 1024×u64, iq3xxs_grid 256×u32, iq3s_grid 512×u32,
+    iq1s_grid 2048×u64) auto-extracted from ggml-common.h. All IQ types wired into
+    type-erased dispatch in both vec_dot and dequantize. Total: 4042 lines across
+    9 files in kernels/src/ggml/. Every ggml quantization format now has vec_dot +
+    dequantize implementations: 22 vec_dot functions, 25 dequantize functions,
+    16 Kani harnesses. 340 workspace tests passing.

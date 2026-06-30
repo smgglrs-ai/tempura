@@ -566,6 +566,8 @@ where
             } else if let Some(w) = qweights.get_q6k(name) {
                 q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k)
                     .unwrap();
+            } else if let Some((dtype, w)) = qweights.get_typed(name) {
+                tempura_kernels::ggml::mul_mat::mul_mat_q(dtype, w, a_f32, out, m, n, k);
             } else {
                 let w = qweights.get_f32(name).unwrap();
                 self.pipeline.matmul_bt(a_f32, w, out, m, n, k).unwrap();

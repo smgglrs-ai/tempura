@@ -1146,26 +1146,40 @@ impl GgufLoader {
 
 impl GgufLoader {
     pub fn to_quantized_weights(&self) -> crate::weights::QuantizedWeights {
-        let mut q4k_tensors = HashMap::new();
-        let mut q6k_tensors = HashMap::new();
-        let mut tq2_tensors = HashMap::new();
-        let mut i2s_tensors = HashMap::new();
+        let mut typed_tensors = HashMap::new();
         let mut f32_tensors = HashMap::new();
 
         for (name, dtype) in &self.tensor_dtypes {
             if let Some(f32_data) = self.tensors.get(name) {
                 f32_tensors.insert(name.clone(), f32_data.clone());
             } else if let Some(raw) = self.raw_tensors.get(name) {
-                match dtype {
-                    GgmlType::Q6K => { q6k_tensors.insert(name.clone(), raw.clone()); }
-                    GgmlType::TQ2_0 => { tq2_tensors.insert(name.clone(), raw.clone()); }
-                    GgmlType::TQ1_0 => { i2s_tensors.insert(name.clone(), raw.clone()); }
-                    _ => { q4k_tensors.insert(name.clone(), raw.clone()); }
-                };
+                let ggml_type = self.to_ggml_type(*dtype);
+                typed_tensors.insert(name.clone(), (ggml_type, raw.clone()));
             }
         }
 
-        crate::weights::QuantizedWeights::new_with_ternary(q4k_tensors, q6k_tensors, tq2_tensors, i2s_tensors, f32_tensors)
+        crate::weights::QuantizedWeights::new_typed(typed_tensors, f32_tensors)
+    }
+
+    fn to_ggml_type(&self, dtype: GgmlType) -> tempura_kernels::ggml::GgmlType {
+        use tempura_kernels::ggml::GgmlType as GT;
+        match dtype {
+            GgmlType::F32 => GT::F32,
+            GgmlType::F16 => GT::F16,
+            GgmlType::Q4_0 => GT::Q4_0,
+            GgmlType::Q4_1 => GT::Q4_1,
+            GgmlType::Q5_0 => GT::Q5_0,
+            GgmlType::Q5_1 => GT::Q5_1,
+            GgmlType::Q8_0 => GT::Q8_0,
+            GgmlType::Q2K => GT::Q2K,
+            GgmlType::Q3K => GT::Q3K,
+            GgmlType::Q4K => GT::Q4K,
+            GgmlType::Q5K => GT::Q5K,
+            GgmlType::Q6K => GT::Q6K,
+            GgmlType::BF16 => GT::BF16,
+            GgmlType::TQ1_0 => GT::TQ1_0,
+            GgmlType::TQ2_0 => GT::TQ2_0,
+        }
     }
 
     pub fn tensor_dtype(&self, name: &str) -> Option<GgmlType> {
