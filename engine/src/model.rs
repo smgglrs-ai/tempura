@@ -71,6 +71,18 @@ pub trait InferenceModel: Send + Sync {
         eos_token: Option<u32>,
         decoder: &mut dyn tempura_kernels::GuidedDecoder,
     ) -> Vec<u32>;
+    fn generate_with_sampler_chain(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        chain: &mut tempura_kernels::sampler_chain::SamplerChain,
+    ) -> Vec<u32> {
+        let _ = chain;
+        self.generate(session, token_ids, max_new_tokens, params, eos_token)
+    }
     fn load_weights(
         &mut self,
         loader: &dyn crate::loader::WeightLoader,
@@ -311,46 +323,39 @@ where
                 .unwrap();
 
             let mut attn_out = vec![0.0f32; seq_len * q_dim];
+            let attn_scale = 1.0 / (head_dim as f32).sqrt();
             if let Some(ref mut paged) = session.paged_cache {
                 paged.append_kv(layer, &k, &v, seq_len);
                 let kv_len = paged.seq_len + seq_len;
                 let k_cont = paged.k_contiguous(layer, kv_len);
                 let v_cont = paged.v_contiguous(layer, kv_len);
-                self.pipeline
-                    .attention(
-                        &q,
-                        &k_cont,
-                        &v_cont,
-                        &mut attn_out,
-                        1,
-                        seq_len,
-                        kv_len,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        1.0 / (head_dim as f32).sqrt(),
-                    )
-                    .unwrap();
+                if let Some(cap) = cfg.attn_logit_softcapping {
+                    tempura_kernels::attention::CpuAttentionSoftcap::new(cap)
+                        .forward(&q, &k_cont, &v_cont, &mut attn_out,
+                                 1, seq_len, kv_len, n_heads, n_kv_heads, head_dim, attn_scale)
+                        .unwrap();
+                } else {
+                    self.pipeline
+                        .attention(&q, &k_cont, &v_cont, &mut attn_out,
+                                   1, seq_len, kv_len, n_heads, n_kv_heads, head_dim, attn_scale)
+                        .unwrap();
+                }
             } else {
                 session.cache.append_kv(layer, &k, &v, seq_len);
                 let kv_len = session.cache.seq_len + seq_len;
                 let k_cache = session.cache.k_data(layer, kv_len);
                 let v_cache = session.cache.v_data(layer, kv_len);
-                self.pipeline
-                    .attention(
-                        &q,
-                        &k_cache,
-                        &v_cache,
-                        &mut attn_out,
-                        1,
-                        seq_len,
-                        kv_len,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        1.0 / (head_dim as f32).sqrt(),
-                    )
-                    .unwrap();
+                if let Some(cap) = cfg.attn_logit_softcapping {
+                    tempura_kernels::attention::CpuAttentionSoftcap::new(cap)
+                        .forward(&q, &k_cache, &v_cache, &mut attn_out,
+                                 1, seq_len, kv_len, n_heads, n_kv_heads, head_dim, attn_scale)
+                        .unwrap();
+                } else {
+                    self.pipeline
+                        .attention(&q, &k_cache, &v_cache, &mut attn_out,
+                                   1, seq_len, kv_len, n_heads, n_kv_heads, head_dim, attn_scale)
+                        .unwrap();
+                }
             }
 
             let mut o_proj = vec![0.0f32; seq_len * h];
@@ -615,6 +620,9 @@ where
         } else {
             None
         };
+
+        let softcap_attn: Option<tempura_kernels::attention::CpuAttentionSoftcap> =
+            cfg.attn_logit_softcapping.map(tempura_kernels::attention::CpuAttentionSoftcap::new);
 
         let layernorm: Option<tempura_kernels::layernorm::CpuLayerNorm> = if cfg.use_layernorm {
             Some(tempura_kernels::layernorm::CpuLayerNorm)
@@ -919,6 +927,15 @@ where
             if let Some(ref alibi) = alibi_attn {
                 alibi
                     .forward(
+                        &q, &k_cache, &v_cache,
+                        &mut attn_out[..seq_len * q_dim],
+                        1, seq_len, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        1.0 / (head_dim as f32).sqrt(),
+                    )
+                    .unwrap();
+            } else if let Some(ref sc) = softcap_attn {
+                sc.forward(
                         &q, &k_cache, &v_cache,
                         &mut attn_out[..seq_len * q_dim],
                         1, seq_len, kv_len,
@@ -1727,6 +1744,80 @@ where
             );
             generated.push(token);
             step += 1;
+        }
+
+        let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.generated_tokens = generated.len();
+        session.trace.timing = Some(TimingInfo {
+            total_ms,
+            prompt_ms,
+            generation_ms,
+            tokens_per_second: if generation_ms > 0.0 {
+                generated.len() as f64 / (generation_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+        generated
+    }
+
+    pub fn generate_with_sampler_chain(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        chain: &mut tempura_kernels::sampler_chain::SamplerChain,
+    ) -> Vec<u32> {
+        let total_start = Instant::now();
+        let prompt_start = Instant::now();
+        let mut logits = self.forward(session, token_ids);
+        let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.prompt_tokens = token_ids.len();
+        let gen_start = Instant::now();
+
+        chain.apply_all(&mut logits, &[]);
+        let mut probs = vec![0.0f32; logits.len()];
+        self.pipeline
+            .sampler
+            .apply(&logits, &mut probs, params)
+            .unwrap();
+
+        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+            None
+        } else {
+            Some(&mut session.rng)
+        };
+        let first_token = self.pipeline.sampler.sample_token(&probs, rng_ref);
+
+        let mut generated = vec![first_token];
+        self.record_sampling_snapshot(session, 0, &logits, &probs, first_token, params, None);
+
+        for step in 1..max_new_tokens {
+            if eos_token == Some(*generated.last().unwrap()) {
+                break;
+            }
+
+            let mut logits = self.forward(session, &[*generated.last().unwrap()]);
+            params.apply_penalties(&mut logits, &generated);
+            chain.apply_all(&mut logits, &generated);
+            let mut probs = vec![0.0f32; logits.len()];
+            self.pipeline
+                .sampler
+                .apply(&logits, &mut probs, params)
+                .unwrap();
+
+            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                None
+            } else {
+                Some(&mut session.rng)
+            };
+            let token = self.pipeline.sampler.sample_token(&probs, rng_ref);
+
+            self.record_sampling_snapshot(session, step, &logits, &probs, token, params, None);
+            generated.push(token);
         }
 
         let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
@@ -3371,6 +3462,17 @@ where
             eos_token,
             decoder,
         )
+    }
+    fn generate_with_sampler_chain(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        chain: &mut tempura_kernels::sampler_chain::SamplerChain,
+    ) -> Vec<u32> {
+        self.generate_with_sampler_chain(session, token_ids, max_new_tokens, params, eos_token, chain)
     }
     fn load_weights(
         &mut self,

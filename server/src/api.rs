@@ -92,6 +92,30 @@ pub struct ChatCompletionRequest {
     pub seed: Option<u64>,
     #[serde(default)]
     pub cache_salt: Option<String>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub typical_p: Option<f32>,
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
+    #[serde(default)]
+    pub penalty_last_n: Option<usize>,
+    #[serde(default)]
+    pub mirostat: Option<u8>,
+    #[serde(default)]
+    pub mirostat_tau: Option<f32>,
+    #[serde(default)]
+    pub mirostat_eta: Option<f32>,
+    #[serde(default)]
+    pub logit_bias: Option<std::collections::HashMap<String, f32>>,
+    #[serde(default)]
+    pub dry_multiplier: Option<f32>,
+    #[serde(default)]
+    pub dry_base: Option<f32>,
+    #[serde(default)]
+    pub dry_allowed_length: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -183,6 +207,8 @@ pub struct CompletionRequest {
     #[serde(default = "default_temperature")]
     pub temperature: f32,
     #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
     pub stream: bool,
     #[serde(default)]
     pub presence_penalty: Option<f32>,
@@ -202,6 +228,30 @@ pub struct CompletionRequest {
     pub seed: Option<u64>,
     #[serde(default)]
     pub cache_salt: Option<String>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub typical_p: Option<f32>,
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
+    #[serde(default)]
+    pub penalty_last_n: Option<usize>,
+    #[serde(default)]
+    pub mirostat: Option<u8>,
+    #[serde(default)]
+    pub mirostat_tau: Option<f32>,
+    #[serde(default)]
+    pub mirostat_eta: Option<f32>,
+    #[serde(default)]
+    pub logit_bias: Option<std::collections::HashMap<String, f32>>,
+    #[serde(default)]
+    pub dry_multiplier: Option<f32>,
+    #[serde(default)]
+    pub dry_base: Option<f32>,
+    #[serde(default)]
+    pub dry_allowed_length: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -364,12 +414,19 @@ async fn chat_completions(
 
     let params = SamplingParams {
         temperature: req.temperature,
-        top_k: 50,
+        top_k: req.top_k.unwrap_or(50),
         top_p: req.top_p.unwrap_or(1.0),
+        min_p: req.min_p.unwrap_or(0.0),
+        typical_p: req.typical_p.unwrap_or(1.0),
+        repeat_penalty: req.repeat_penalty.unwrap_or(1.0),
+        penalty_last_n: req.penalty_last_n.unwrap_or(64),
         presence_penalty: req.presence_penalty.unwrap_or(0.0),
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
-        ..SamplingParams::default()
     };
+
+    let mut sampler_chain = build_sampler_chain(&req.mirostat, &req.mirostat_tau, &req.mirostat_eta,
+        &req.logit_bias, &req.dry_multiplier, &req.dry_base, &req.dry_allowed_length,
+        &req.min_p, &req.typical_p, &req.repeat_penalty, &req.penalty_last_n);
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
 
@@ -542,6 +599,16 @@ async fn chat_completions(
                         decoder.as_mut(),
                     );
                     (tokens, Vec::new())
+                } else if !sampler_chain.is_empty() {
+                    let tokens = state.model.generate_with_sampler_chain(
+                        &mut session,
+                        &token_ids,
+                        req.max_tokens as usize,
+                        &params,
+                        None,
+                        &mut sampler_chain,
+                    );
+                    (tokens, Vec::new())
                 } else {
                     let tokens = state.model.generate(
                         &mut session,
@@ -687,12 +754,19 @@ async fn completions(
 
     let params = SamplingParams {
         temperature: req.temperature,
-        top_k: 50,
-        top_p: 1.0,
+        top_k: req.top_k.unwrap_or(50),
+        top_p: req.top_p.unwrap_or(1.0),
+        min_p: req.min_p.unwrap_or(0.0),
+        typical_p: req.typical_p.unwrap_or(1.0),
+        repeat_penalty: req.repeat_penalty.unwrap_or(1.0),
+        penalty_last_n: req.penalty_last_n.unwrap_or(64),
         presence_penalty: req.presence_penalty.unwrap_or(0.0),
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
-        ..SamplingParams::default()
     };
+
+    let _sampler_chain = build_sampler_chain(&req.mirostat, &req.mirostat_tau, &req.mirostat_eta,
+        &req.logit_bias, &req.dry_multiplier, &req.dry_base, &req.dry_allowed_length,
+        &req.min_p, &req.typical_p, &req.repeat_penalty, &req.penalty_last_n);
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
 
@@ -1244,6 +1318,86 @@ fn build_tool_guided_decoder(
     None
 }
 
+fn build_sampler_chain(
+    mirostat: &Option<u8>,
+    mirostat_tau: &Option<f32>,
+    mirostat_eta: &Option<f32>,
+    logit_bias: &Option<std::collections::HashMap<String, f32>>,
+    dry_multiplier: &Option<f32>,
+    dry_base: &Option<f32>,
+    dry_allowed_length: &Option<usize>,
+    min_p: &Option<f32>,
+    typical_p: &Option<f32>,
+    repeat_penalty: &Option<f32>,
+    penalty_last_n: &Option<usize>,
+) -> tempura_kernels::sampler_chain::SamplerChain {
+    use tempura_kernels::sampler_chain::*;
+    use tempura_kernels::sampler_advanced::*;
+
+    let mut chain = SamplerChain::new();
+
+    if let Some(rp) = repeat_penalty {
+        if *rp != 1.0 {
+            chain.push(Box::new(RepetitionPenalizer {
+                penalty: *rp,
+                last_n: penalty_last_n.unwrap_or(64),
+            }));
+        }
+    }
+
+    if let Some(mp) = min_p {
+        if *mp > 0.0 {
+            chain.push(Box::new(MinPSampler {
+                min_p: *mp,
+                min_keep: 1,
+            }));
+        }
+    }
+
+    if let Some(tp) = typical_p {
+        if *tp < 1.0 {
+            chain.push(Box::new(TypicalSampler {
+                typical_p: *tp,
+                min_keep: 1,
+            }));
+        }
+    }
+
+    if let Some(mode) = mirostat {
+        let tau = mirostat_tau.unwrap_or(5.0);
+        let eta = mirostat_eta.unwrap_or(0.1);
+        match mode {
+            2 => chain.push(Box::new(MirostatV2Sampler::new(tau, eta))),
+            1 => chain.push(Box::new(MirostatV1Sampler::new(32000, tau, eta, 100))),
+            _ => {}
+        }
+    }
+
+    if let Some(dm) = dry_multiplier {
+        if *dm > 0.0 {
+            chain.push(Box::new(DrySampler {
+                multiplier: *dm,
+                base: dry_base.unwrap_or(1.75),
+                allowed_length: dry_allowed_length.unwrap_or(2),
+                penalty_last_n: penalty_last_n.unwrap_or(64),
+                breakers: Vec::new(),
+            }));
+        }
+    }
+
+    if let Some(ref biases) = logit_bias {
+        let pairs: Vec<(u32, f32)> = biases
+            .iter()
+            .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|id| (id, v)))
+            .collect();
+        if !pairs.is_empty() {
+            chain.push(Box::new(LogitBiaser { biases: pairs }));
+        }
+    }
+
+    chain
+}
+
 fn check_stop_sequences<'a>(text: &'a str, stop_sequences: &[String]) -> (&'a str, &'static str) {
     for seq in stop_sequences {
         if let Some(pos) = text.find(seq.as_str()) {
@@ -1453,5 +1607,116 @@ mod tests {
         }
 
         release_slot(&state, "req-3").await;
+    }
+
+    #[test]
+    fn test_chat_request_with_sampler_fields_deserializes() {
+        let json = r#"{
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "min_p": 0.05,
+            "typical_p": 0.9,
+            "repeat_penalty": 1.1,
+            "penalty_last_n": 32,
+            "top_k": 40,
+            "mirostat": 2,
+            "mirostat_tau": 5.0,
+            "mirostat_eta": 0.1,
+            "logit_bias": {"42": 1.5, "100": -2.0},
+            "dry_multiplier": 0.8,
+            "dry_base": 1.75,
+            "dry_allowed_length": 3
+        }"#;
+
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.min_p, Some(0.05));
+        assert_eq!(req.typical_p, Some(0.9));
+        assert_eq!(req.repeat_penalty, Some(1.1));
+        assert_eq!(req.penalty_last_n, Some(32));
+        assert_eq!(req.top_k, Some(40));
+        assert_eq!(req.mirostat, Some(2));
+        assert_eq!(req.mirostat_tau, Some(5.0));
+        assert_eq!(req.mirostat_eta, Some(0.1));
+        assert_eq!(req.dry_multiplier, Some(0.8));
+        assert_eq!(req.dry_base, Some(1.75));
+        assert_eq!(req.dry_allowed_length, Some(3));
+
+        let biases = req.logit_bias.unwrap();
+        assert_eq!(biases.get("42"), Some(&1.5));
+        assert_eq!(biases.get("100"), Some(&-2.0));
+    }
+
+    #[test]
+    fn test_chat_request_defaults_backward_compatible() {
+        let json = r#"{
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }"#;
+
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.min_p.is_none());
+        assert!(req.typical_p.is_none());
+        assert!(req.repeat_penalty.is_none());
+        assert!(req.mirostat.is_none());
+        assert!(req.logit_bias.is_none());
+        assert!(req.dry_multiplier.is_none());
+        assert!(req.top_k.is_none());
+    }
+
+    #[test]
+    fn test_completion_request_with_sampler_fields() {
+        let json = r#"{
+            "model": "test",
+            "prompt": "hello",
+            "min_p": 0.1,
+            "mirostat": 1,
+            "top_k": 30
+        }"#;
+
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.min_p, Some(0.1));
+        assert_eq!(req.mirostat, Some(1));
+        assert_eq!(req.top_k, Some(30));
+    }
+
+    #[test]
+    fn test_build_sampler_chain_empty_when_defaults() {
+        let chain = build_sampler_chain(
+            &None, &None, &None, &None, &None, &None, &None,
+            &None, &None, &None, &None,
+        );
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn test_build_sampler_chain_with_min_p() {
+        let chain = build_sampler_chain(
+            &None, &None, &None, &None, &None, &None, &None,
+            &Some(0.05), &None, &None, &None,
+        );
+        assert_eq!(chain.len(), 1);
+    }
+
+    #[test]
+    fn test_build_sampler_chain_with_mirostat_v2() {
+        let chain = build_sampler_chain(
+            &Some(2), &Some(5.0), &Some(0.1), &None, &None, &None, &None,
+            &None, &None, &None, &None,
+        );
+        assert_eq!(chain.len(), 1);
+    }
+
+    #[test]
+    fn test_build_sampler_chain_multiple_processors() {
+        let mut biases = std::collections::HashMap::new();
+        biases.insert("42".to_string(), 1.5f32);
+
+        let chain = build_sampler_chain(
+            &Some(2), &Some(5.0), &Some(0.1),
+            &Some(biases),
+            &Some(0.8), &Some(1.75), &Some(2),
+            &Some(0.05), &Some(0.9), &Some(1.1), &Some(64),
+        );
+        assert_eq!(chain.len(), 6);
     }
 }

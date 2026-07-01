@@ -185,6 +185,92 @@ fn naive_attention_ggml(
     Ok(())
 }
 
+/// GGML-compatible attention with logit softcapping.
+/// After computing score = dot(q, k) * scale, applies tanh(score/cap) * cap
+/// before softmax. Used by Gemma 2 and similar architectures.
+#[cfg(feature = "cpu")]
+#[allow(clippy::too_many_arguments)]
+fn naive_attention_ggml_softcap(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    output: &mut [f32],
+    batch: usize,
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    window: Option<usize>,
+    cap: f32,
+) -> Result<()> {
+    let heads_per_group = num_heads / num_kv_heads;
+
+    for b in 0..batch {
+        for h in 0..num_heads {
+            let kv_h = h / heads_per_group;
+            for s in 0..seq_len {
+                let q_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                let q_vec = &q[q_offset..q_offset + head_dim];
+
+                let cache_offset = kv_len - seq_len;
+                let causal_limit = cache_offset + s;
+                let window_start = match window {
+                    Some(w) if causal_limit >= w => causal_limit - w + 1,
+                    _ => 0,
+                };
+
+                let mut scores = vec![0.0f32; kv_len];
+                for (kv_s, score) in scores.iter_mut().enumerate() {
+                    if kv_s > causal_limit || kv_s < window_start {
+                        *score = f32::NEG_INFINITY;
+                        continue;
+                    }
+                    let k_offset = ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim;
+                    let k_vec = &k[k_offset..k_offset + head_dim];
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_vec[d] * k_vec[d];
+                    }
+                    let raw = dot * scale;
+                    *score = (raw / cap).tanh() * cap;
+                }
+
+                let mut max_score = f32::NEG_INFINITY;
+                for &s in &scores {
+                    if s > max_score { max_score = s; }
+                }
+
+                let mut sum: f64 = 0.0;
+                for s in &mut scores {
+                    let val = crate::portable_math::ggml_exp(*s - max_score);
+                    sum += val as f64;
+                    *s = val;
+                }
+
+                let inv_sum = (1.0 / sum) as f32;
+                for s in &mut scores {
+                    *s *= inv_sum;
+                }
+
+                let o_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                for d in 0..head_dim {
+                    let mut val = 0.0f32;
+                    for (kv_s, &score) in scores.iter().enumerate() {
+                        let v_offset =
+                            ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim + d;
+                        val += score * v[v_offset];
+                    }
+                    output[o_offset + d] = val;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ── Flash attention (tiled online softmax, parameterized by dot product) ───
 
 #[cfg(feature = "cpu")]
@@ -473,6 +559,48 @@ impl Attention for CpuAttentionGgml {
     ) -> Result<()> {
         naive_attention_ggml(q, k, v, output, batch, seq_len, kv_len,
                             num_heads, num_kv_heads, head_dim, scale, Some(window_size))
+    }
+}
+
+/// GGML attention with logit softcapping: tanh(score/cap)*cap before softmax.
+/// Used by Gemma 2 and similar models.
+#[cfg(feature = "cpu")]
+pub struct CpuAttentionSoftcap {
+    pub cap: f32,
+}
+
+#[cfg(feature = "cpu")]
+impl CpuAttentionSoftcap {
+    pub fn new(cap: f32) -> Self {
+        Self { cap }
+    }
+}
+
+#[cfg(feature = "cpu")]
+impl Attention for CpuAttentionSoftcap {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Tested
+    }
+
+    fn forward(
+        &self,
+        q: &[f32], k: &[f32], v: &[f32], output: &mut [f32],
+        batch: usize, seq_len: usize, kv_len: usize,
+        num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
+    ) -> Result<()> {
+        naive_attention_ggml_softcap(q, k, v, output, batch, seq_len, kv_len,
+                            num_heads, num_kv_heads, head_dim, scale, None, self.cap)
+    }
+
+    fn forward_windowed(
+        &self,
+        q: &[f32], k: &[f32], v: &[f32], output: &mut [f32],
+        batch: usize, seq_len: usize, kv_len: usize,
+        num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
+        window_size: usize,
+    ) -> Result<()> {
+        naive_attention_ggml_softcap(q, k, v, output, batch, seq_len, kv_len,
+                            num_heads, num_kv_heads, head_dim, scale, Some(window_size), self.cap)
     }
 }
 
@@ -1809,5 +1937,62 @@ mod tests {
             diff_tok2 < 1e-5,
             "last token should match causal (diff={diff_tok2})"
         );
+    }
+
+    #[test]
+    fn test_softcapping_reduces_extreme_scores() {
+        let cap = 5.0f32;
+        let head_dim = 4;
+        let seq_len = 1;
+        let kv_len = 2;
+
+        // Large Q and K values to produce extreme scores
+        let q = vec![20.0, 20.0, 20.0, 20.0];
+        let k = vec![20.0, 20.0, 20.0, 20.0, 1.0, 1.0, 1.0, 1.0];
+        let v = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        // Normal score0 = dot(q,k0)*scale = 1600*0.5 = 800
+        // Normal score1 = dot(q,k1)*scale = 80*0.5 = 40
+        // Huge gap => normal attention puts ~100% on key0
+        // Softcap: tanh(800/5)*5 ≈ 5.0, tanh(40/5)*5 ≈ 5.0 (both saturated)
+        // So softcapped attention is ~50/50 between the two keys
+
+        let mut out_normal = vec![0.0f32; head_dim];
+        CpuAttentionGgml
+            .forward(&q, &k, &v, &mut out_normal, 1, seq_len, kv_len, 1, 1, head_dim, scale)
+            .unwrap();
+
+        let mut out_softcap = vec![0.0f32; head_dim];
+        CpuAttentionSoftcap::new(cap)
+            .forward(&q, &k, &v, &mut out_softcap, 1, seq_len, kv_len, 1, 1, head_dim, scale)
+            .unwrap();
+
+        let diff: f32 = (0..head_dim)
+            .map(|d| (out_normal[d] - out_softcap[d]).abs())
+            .fold(0.0, f32::max);
+        assert!(diff > 0.01, "softcapping should change attention output (diff={diff})");
+
+        // Softcapped output should be closer to the average of the two V rows
+        // than the normal output (which heavily favors V[0])
+        let avg_v0 = 0.5;
+        let normal_dist = (out_normal[0] - avg_v0).abs();
+        let softcap_dist = (out_softcap[0] - avg_v0).abs();
+        assert!(softcap_dist < normal_dist,
+            "softcapped output should be more uniform: normal_dist={normal_dist}, softcap_dist={softcap_dist}");
+    }
+
+    #[test]
+    fn test_softcapping_tanh_clamps_extreme_values() {
+        let cap = 10.0f32;
+        let large_val = 1000.0f32;
+        let result = (large_val / cap).tanh() * cap;
+        assert!((result - cap).abs() < 0.01,
+            "tanh(x/cap)*cap should approach cap for large x: got {result}");
+
+        let small_val = 0.1f32;
+        let result_small = (small_val / cap).tanh() * cap;
+        assert!((result_small - small_val).abs() < 0.01,
+            "tanh(x/cap)*cap should approximate x for small x: got {result_small}, expected ~{small_val}");
     }
 }

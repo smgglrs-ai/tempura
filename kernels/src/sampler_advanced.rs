@@ -1,6 +1,4 @@
-pub trait LogitProcessor: Send + Sync {
-    fn apply(&mut self, logits: &mut [f32], prior_tokens: &[u32]);
-}
+use crate::sampler_chain::LogitProcessor;
 
 // DRY (Don't Repeat Yourself) sampler
 // Ported from llama.cpp llama_sampler_dry_impl (originally from Koboldcpp).
