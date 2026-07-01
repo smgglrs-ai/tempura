@@ -8,6 +8,7 @@ pub use tempura_kernel_api::{
 };
 
 pub mod portable_math;
+pub mod thread_pool;
 pub mod tl2;
 pub mod allreduce;
 pub mod attention;

@@ -2673,46 +2673,26 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             b_quantized[packed_bytes + 3],
         ]);
 
-        // Use rayon par_chunks_mut with coarse granularity: n/8 columns per task
-        // to saturate memory bandwidth without excessive sync overhead.
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx512f")
             && is_x86_feature_detected!("avx512bw")
             && is_x86_feature_detected!("avx512vnni")
         {
-            let n_tasks = 8.min(n);
-            let chunk_size = (n + n_tasks - 1) / n_tasks;
-            output[..n]
-                .par_chunks_mut(chunk_size)
-                .enumerate()
-                .for_each(|(ci, chunk)| {
-                    let j_start = ci * chunk_size;
-                    for (local, out) in chunk.iter_mut().enumerate() {
-                        let j = j_start + local;
-                        let w_packed = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
-                        let raw = unsafe { vec_dot_i2_i8_s_avx512(w_packed, preq_q8, k) };
-                        *out = (raw - preq_sum) as f32 / preq_scale * w_scale;
-                    }
-                });
+            for j in 0..n {
+                let w_packed = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
+                let raw = unsafe { vec_dot_i2_i8_s_avx512(w_packed, preq_q8, k) };
+                output[j] = (raw - preq_sum) as f32 / preq_scale * w_scale;
+            }
             return Ok(());
         }
 
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2") {
-            let n_tasks = 8.min(n);
-            let chunk_size = (n + n_tasks - 1) / n_tasks;
-            output[..n]
-                .par_chunks_mut(chunk_size)
-                .enumerate()
-                .for_each(|(ci, chunk)| {
-                    let j_start = ci * chunk_size;
-                    for (local, out) in chunk.iter_mut().enumerate() {
-                        let j = j_start + local;
-                        let w_packed = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
-                        let raw = unsafe { vec_dot_i2_i8_s_avx2(w_packed, preq_q8, k) };
-                        *out = (raw - preq_sum) as f32 / preq_scale * w_scale;
-                    }
-                });
+            for j in 0..n {
+                let w_packed = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
+                let raw = unsafe { vec_dot_i2_i8_s_avx2(w_packed, preq_q8, k) };
+                output[j] = (raw - preq_sum) as f32 / preq_scale * w_scale;
+            }
             return Ok(());
         }
 
