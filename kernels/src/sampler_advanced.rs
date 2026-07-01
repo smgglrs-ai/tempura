@@ -280,6 +280,112 @@ impl LogitProcessor for InfillSampler {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn dry_no_panic() {
+        let multiplier: f32 = kani::any();
+        let base: f32 = kani::any();
+        kani::assume(multiplier.is_finite() && multiplier >= 0.0 && multiplier < 5.0);
+        kani::assume(base.is_finite() && base >= 1.0 && base < 5.0);
+        let mut logits = [0.0f32; 8];
+        for l in &mut logits {
+            *l = kani::any();
+            kani::assume(l.is_finite());
+        }
+        let prior: [u32; 4] = [kani::any(), kani::any(), kani::any(), kani::any()];
+        for &t in &prior {
+            kani::assume(t < 8);
+        }
+        let mut sampler = DrySampler {
+            multiplier,
+            base,
+            allowed_length: 1,
+            penalty_last_n: 8,
+            breakers: vec![],
+        };
+        sampler.apply(&mut logits, &prior);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn xtc_no_panic() {
+        let probability: f32 = kani::any();
+        let threshold: f32 = kani::any();
+        kani::assume(probability.is_finite() && probability >= 0.0 && probability <= 1.0);
+        kani::assume(threshold.is_finite() && threshold >= 0.0 && threshold <= 0.5);
+        let mut logits = [0.0f32; 8];
+        for l in &mut logits {
+            *l = kani::any();
+            kani::assume(l.is_finite() && *l > -50.0 && *l < 50.0);
+        }
+        let mut sampler = XtcSampler {
+            probability,
+            threshold,
+            min_keep: 1,
+            rng: 12345,
+        };
+        sampler.apply(&mut logits, &[]);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn xtc_probability_zero_is_noop() {
+        let mut logits = [0.0f32; 8];
+        for l in &mut logits {
+            *l = kani::any();
+            kani::assume(l.is_finite());
+        }
+        let original = logits;
+        let mut sampler = XtcSampler {
+            probability: 0.0,
+            threshold: 0.1,
+            min_keep: 1,
+            rng: 12345,
+        };
+        sampler.apply(&mut logits, &[]);
+        for i in 0..8 {
+            assert!(logits[i] == original[i]);
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn adaptive_p_no_panic() {
+        let target: f32 = kani::any();
+        let decay: f32 = kani::any();
+        let current_p: f32 = kani::any();
+        kani::assume(target.is_finite() && target >= 0.0 && target <= 1.0);
+        kani::assume(decay.is_finite() && decay >= 0.0 && decay <= 1.0);
+        kani::assume(current_p.is_finite() && current_p >= 0.0 && current_p <= 1.0);
+        let mut logits = [0.0f32; 8];
+        for l in &mut logits {
+            *l = kani::any();
+            kani::assume(l.is_finite() && *l > -50.0 && *l < 50.0);
+        }
+        let mut sampler = AdaptivePSampler { target, decay, current_p };
+        sampler.apply(&mut logits, &[]);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn infill_blocks_tokens() {
+        let mut logits = [0.0f32; 8];
+        for l in &mut logits {
+            *l = kani::any();
+            kani::assume(l.is_finite());
+        }
+        let blocked: u32 = kani::any();
+        kani::assume(blocked < 8);
+        let mut sampler = InfillSampler { blocked_tokens: vec![blocked] };
+        sampler.apply(&mut logits, &[]);
+        assert!(logits[blocked as usize] == f32::NEG_INFINITY);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

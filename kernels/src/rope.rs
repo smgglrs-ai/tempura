@@ -559,6 +559,56 @@ mod kani_proofs {
     }
 
     #[kani::proof]
+    #[kani::unwind(10)]
+    fn unified_no_panic() {
+        let head_dim: usize = kani::any();
+        kani::assume(head_dim >= 2 && head_dim <= 8);
+        kani::assume(head_dim % 2 == 0);
+        let n_dims = head_dim;
+        let seq_len = 1;
+        let num_heads = 1;
+        let n = seq_len * num_heads * head_dim;
+
+        let mut x = [0.0f32; 8];
+        for i in 0..n {
+            x[i] = kani::any();
+            kani::assume(x[i].is_finite() && x[i] > -100.0 && x[i] < 100.0);
+        }
+        let pos: u32 = kani::any();
+        kani::assume(pos <= 128);
+        let positions = [pos];
+
+        let rope = super::CpuRoPEUnified::new(super::RoPEMode::Normal, n_dims);
+        let _ = rope.forward(&mut x[..n], 1, seq_len, num_heads, head_dim, &positions, 10000.0);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn unified_position_zero_identity() {
+        let head_dim: usize = kani::any();
+        kani::assume(head_dim >= 2 && head_dim <= 8);
+        kani::assume(head_dim % 2 == 0);
+        let n_dims = head_dim;
+        let n = head_dim;
+
+        let mut x = [0.0f32; 8];
+        for i in 0..n {
+            x[i] = kani::any();
+            kani::assume(x[i].is_finite() && x[i] > -100.0 && x[i] < 100.0);
+        }
+        let original = x;
+        let positions = [0u32];
+
+        let rope = super::CpuRoPEUnified::new(super::RoPEMode::Normal, n_dims);
+        let _ = rope.forward(&mut x[..n], 1, 1, 1, head_dim, &positions, 10000.0);
+
+        // At position 0: theta=0, cos(0)=1, sin(0)=0 → identity
+        for i in 0..n {
+            assert!((x[i] - original[i]).abs() < 1e-5);
+        }
+    }
+
+    #[kani::proof]
     fn gpu_rope_thread_decomposition_in_bounds() {
         let seq_len: usize = kani::any();
         let num_heads: usize = kani::any();

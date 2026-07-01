@@ -1155,6 +1155,45 @@ mod kani_proofs {
     }
 
     #[kani::proof]
+    #[kani::unwind(10)]
+    fn alibi_slopes_no_panic() {
+        let n_heads: usize = kani::any();
+        kani::assume(n_heads >= 1 && n_heads <= 8);
+        let max_bias: f32 = kani::any();
+        kani::assume(max_bias.is_finite() && max_bias >= 0.0 && max_bias <= 16.0);
+        let slopes = super::alibi_slopes(n_heads, max_bias);
+        assert!(slopes.len() == n_heads);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn alibi_slopes_decreasing() {
+        let n_heads: usize = kani::any();
+        kani::assume(n_heads >= 2 && n_heads <= 8);
+        // Use power-of-two heads so all slopes come from the same geometric series
+        kani::assume(n_heads == 2 || n_heads == 4 || n_heads == 8);
+        let max_bias: f32 = kani::any();
+        kani::assume(max_bias.is_finite() && max_bias > 0.0 && max_bias <= 16.0);
+        let slopes = super::alibi_slopes(n_heads, max_bias);
+        for i in 1..slopes.len() {
+            assert!(slopes[i] <= slopes[i - 1]);
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn alibi_slopes_positive() {
+        let n_heads: usize = kani::any();
+        kani::assume(n_heads >= 1 && n_heads <= 8);
+        let max_bias: f32 = kani::any();
+        kani::assume(max_bias.is_finite() && max_bias > 0.0 && max_bias <= 16.0);
+        let slopes = super::alibi_slopes(n_heads, max_bias);
+        for &s in &slopes {
+            assert!(s > 0.0);
+        }
+    }
+
+    #[kani::proof]
     fn gpu_attention_thread_decomposition_in_bounds() {
         let batch: usize = kani::any();
         let seq_len: usize = kani::any();

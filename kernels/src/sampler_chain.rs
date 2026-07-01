@@ -338,6 +338,143 @@ impl LogitProcessor for TopNSigmaSampler {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn min_p_no_panic() {
+        let min_p: f32 = kani::any();
+        kani::assume(min_p.is_finite());
+        let mut logits = [0.0f32; 8];
+        for l in &mut logits {
+            *l = kani::any();
+            kani::assume(l.is_finite());
+        }
+        let mut sampler = MinPSampler { min_p, min_keep: 1 };
+        sampler.apply(&mut logits, &[]);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn min_p_preserves_max() {
+        let min_p: f32 = kani::any();
+        kani::assume(min_p.is_finite() && min_p > 0.0 && min_p < 1.0);
+        let mut logits = [0.0f32; 8];
+        for l in &mut logits {
+            *l = kani::any();
+            kani::assume(l.is_finite());
+        }
+        let max_before = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let max_idx = logits.iter().position(|&l| l == max_before).unwrap();
+        let mut sampler = MinPSampler { min_p, min_keep: 1 };
+        sampler.apply(&mut logits, &[]);
+        assert!(logits[max_idx] == max_before);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn typical_no_panic() {
+        let typical_p: f32 = kani::any();
+        kani::assume(typical_p.is_finite() && typical_p >= 0.0 && typical_p <= 1.0);
+        let mut logits = [0.0f32; 8];
+        for l in &mut logits {
+            *l = kani::any();
+            kani::assume(l.is_finite() && *l > -50.0 && *l < 50.0);
+        }
+        let mut sampler = TypicalSampler { typical_p, min_keep: 1 };
+        sampler.apply(&mut logits, &[]);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn mirostat_v2_no_panic() {
+        let tau: f32 = kani::any();
+        let eta: f32 = kani::any();
+        kani::assume(tau.is_finite() && tau > 0.0 && tau < 20.0);
+        kani::assume(eta.is_finite() && eta > 0.0 && eta < 2.0);
+        let mut logits = [0.0f32; 8];
+        for l in &mut logits {
+            *l = kani::any();
+            kani::assume(l.is_finite() && *l > -50.0 && *l < 50.0);
+        }
+        let mut sampler = MirostatV2Sampler::new(tau, eta);
+        sampler.apply(&mut logits, &[]);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn repetition_penalty_no_panic() {
+        let penalty: f32 = kani::any();
+        kani::assume(penalty.is_finite() && penalty > 0.0 && penalty < 10.0);
+        let mut logits = [0.0f32; 8];
+        for l in &mut logits {
+            *l = kani::any();
+            kani::assume(l.is_finite());
+        }
+        let prior_tokens: [u32; 4] = [kani::any(), kani::any(), kani::any(), kani::any()];
+        for &t in &prior_tokens {
+            kani::assume(t < 8);
+        }
+        let mut penalizer = RepetitionPenalizer { penalty, last_n: 64 };
+        penalizer.apply(&mut logits, &prior_tokens);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn repetition_penalty_symmetric() {
+        let penalty: f32 = kani::any();
+        kani::assume(penalty.is_finite() && penalty > 1.0 && penalty < 10.0);
+        let mut logits = [0.0f32; 8];
+        for l in &mut logits {
+            *l = kani::any();
+            kani::assume(l.is_finite() && *l > 0.0);
+        }
+        let original = logits;
+        let token_idx: u32 = kani::any();
+        kani::assume(token_idx < 8);
+        let prior_tokens = [token_idx];
+        let mut penalizer = RepetitionPenalizer { penalty, last_n: 64 };
+        penalizer.apply(&mut logits, &prior_tokens);
+        // Positive logit of repeated token is divided by penalty (> 1), so it decreases
+        assert!(logits[token_idx as usize] <= original[token_idx as usize]);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn logit_bias_adds_correctly() {
+        let bias: f32 = kani::any();
+        kani::assume(bias.is_finite());
+        let mut logits = [0.0f32; 8];
+        for l in &mut logits {
+            *l = kani::any();
+            kani::assume(l.is_finite());
+        }
+        let target_idx: u32 = kani::any();
+        kani::assume(target_idx < 8);
+        let original_val = logits[target_idx as usize];
+        let mut biaser = LogitBiaser { biases: vec![(target_idx, bias)] };
+        biaser.apply(&mut logits, &[]);
+        let expected = original_val + bias;
+        assert!(logits[target_idx as usize] == expected);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn top_n_sigma_no_panic() {
+        let n_sigma: f32 = kani::any();
+        kani::assume(n_sigma.is_finite() && n_sigma >= 0.0 && n_sigma < 10.0);
+        let mut logits = [0.0f32; 8];
+        for l in &mut logits {
+            *l = kani::any();
+            kani::assume(l.is_finite() && *l > -100.0 && *l < 100.0);
+        }
+        let mut sampler = TopNSigmaSampler { n_sigma, min_keep: 1 };
+        sampler.apply(&mut logits, &[]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
