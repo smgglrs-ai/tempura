@@ -3040,7 +3040,13 @@ impl InferenceModel for GpuQuantizedInferenceWrapper {
         if let Some(ref cpu_model) = self.cpu_model {
             let mut model = cpu_model.lock().unwrap();
             let qw = model.quantized_weights.as_ref().unwrap() as *const crate::weights::QuantizedWeights;
-            return model.forward_quantized(session, token_ids, unsafe { &*qw });
+            let qwr = unsafe { &*qw };
+            if model.config.hidden_act == crate::config::HiddenAct::SquaredRelu
+                && token_ids.len() == 1
+            {
+                return model.forward_bitnet_decode(session, token_ids[0], qwr);
+            }
+            return model.forward_quantized(session, token_ids, qwr);
         }
         let logits = self.forward_gpu_quantized(token_ids, session.position);
         session.position += token_ids.len();
