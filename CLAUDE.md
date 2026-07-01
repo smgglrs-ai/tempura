@@ -166,6 +166,9 @@ Three-crate workspace + standalone verification crate:
 - [x] Pre-quantized activation sharing across q/k/v and gate/up projections
 - [x] Layer-level rayon::join parallelism for independent projections
 - [x] LUT-based dot product infrastructure (scalar + AVX2 shuffle, verified correct)
+- [x] Persistent thread pool (condvar + per-worker generation tracking)
+- [x] forward_bitnet_decode: dedicated decode path with pre-allocated buffers
+- [x] i2s_quantize_into: zero-allocation activation quantization
 
 ## Build & Test
 

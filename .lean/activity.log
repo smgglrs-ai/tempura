@@ -37,6 +37,21 @@
     Reverted production path to maddubs; LUT infrastructure (trait, tests, transpose)
     retained for future tiled kernel implementation. 317 tests, all passing.
 
+    Translated bitnet.cpp's threading model to Rust:
+    - TL2 kernel (tl2.rs): per_tensor_quant, three/two_lut_ctor, three/two_tbl_impl,
+      preprocessor, qgemm_lut — direct translation of codegen_tl2.py output
+    - SpinBarrier from ggml_barrier (atomic counter spin)
+    - PersistentPool: condvar-based, per-worker generation tracking, ~2μs wake
+    - forward_bitnet_decode: dedicated BitNet decode path with persistent pool
+      per-matmul, pre-allocated i8 quantization buffers (zero Vec allocs per token)
+    - i2s_quantize_into: write quantized i8 into pre-allocated buffer
+    - i2s_gemv_cols: public column-range GEMV for thread-level slicing
+    - Wired into GpuQuantizedInferenceWrapper::forward() server dispatch
+    - Microbenchmark: dot product at 42.8 tok/s (matches bitnet.cpp exactly)
+    - End-to-end: 19.0 tok/s (bitnet.cpp: 42.7 with 8 threads, 27.3 single-threaded)
+    - Gap is condvar wake cost per matmul (~2μs × 210 = 0.4ms) plus DRAM bandwidth
+    - 325 tests passing, correct output verified
+
 - timestamp: "2026-06-14T22:56:08+02:00"
   actor: "Fabien Dupont"
   action: commit
