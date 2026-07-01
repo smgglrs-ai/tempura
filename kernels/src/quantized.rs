@@ -1185,6 +1185,49 @@ unsafe fn vec_dot_i2_i8_s_avx512(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
     result
 }
 
+/// Single-threaded I2S GEMV on column range [col_start, col_end).
+/// Called by layer-level threading — each thread processes its own column slice.
+/// Uses raw addresses to satisfy Sync bounds in parallel closures.
+#[cfg(target_arch = "x86_64")]
+pub fn i2s_gemv_cols(
+    preq_q8: &[i8],
+    preq_scale: f32,
+    preq_sum: i32,
+    b_quantized: &[u8],
+    w_scale: f32,
+    output_addr: usize,
+    col_start: usize,
+    col_end: usize,
+    k: usize,
+) {
+    let row_packed_bytes = k / 4;
+    let has_avx512 = is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512vnni");
+
+    for j in col_start..col_end {
+        let w = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
+        let raw = if has_avx512 {
+            unsafe { vec_dot_i2_i8_s_avx512(w, preq_q8, k) }
+        } else {
+            unsafe { vec_dot_i2_i8_s_avx2(w, preq_q8, k) }
+        };
+        unsafe { *(output_addr as *mut f32).add(j) = (raw - preq_sum) as f32 / preq_scale * w_scale; }
+    }
+}
+
+/// Extract the per-tensor f32 scale from I2S weight data.
+#[inline]
+pub fn i2s_weight_scale(b_quantized: &[u8], n: usize, k: usize) -> f32 {
+    let packed_bytes = n * k / 4;
+    f32::from_ne_bytes([
+        b_quantized[packed_bytes],
+        b_quantized[packed_bytes + 1],
+        b_quantized[packed_bytes + 2],
+        b_quantized[packed_bytes + 3],
+    ])
+}
+
 // ── LUT-based I2S ternary dot product (bitnet.cpp TL2 translation) ─────────
 //
 // Instead of maddubs(weight_u8, activation_i8), precompute ALL possible
