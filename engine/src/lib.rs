@@ -12,6 +12,7 @@ pub mod lora;
 pub mod multi_token;
 pub mod prefix_cache;
 pub mod model;
+pub mod moe;
 pub mod pipeline;
 pub mod schema;
 pub mod session;

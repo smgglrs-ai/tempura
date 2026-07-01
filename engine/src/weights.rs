@@ -286,6 +286,21 @@ impl QuantizedWeights {
         }
     }
 
+    pub fn empty() -> Self {
+        Self {
+            q4k_tensors: HashMap::new(),
+            q6k_tensors: HashMap::new(),
+            tq2_tensors: HashMap::new(),
+            i2s_tensors: HashMap::new(),
+            f32_tensors: HashMap::new(),
+            typed_tensors: HashMap::new(),
+        }
+    }
+
+    pub fn insert_f32(&mut self, name: String, data: Vec<f32>) {
+        self.f32_tensors.insert(name, data);
+    }
+
     pub fn get_q4k(&self, name: &str) -> Option<&[u8]> {
         self.q4k_tensors.get(name).map(|v| v.as_slice())
     }

@@ -28,6 +28,10 @@ pub struct ModelConfig {
     pub sliding_window: Option<usize>,
     pub hidden_act: HiddenAct,
     pub rope_type: RopeType,
+    /// Number of experts (0 = dense, non-MoE model).
+    pub n_experts: usize,
+    /// Number of experts activated per token (top-k).
+    pub n_experts_used: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +111,8 @@ impl ModelConfig {
             sliding_window: None,
             hidden_act: HiddenAct::SiluGate,
             rope_type: RopeType::Neox,
+            n_experts: 0,
+            n_experts_used: 0,
         }
     }
 
@@ -128,6 +134,8 @@ impl ModelConfig {
             sliding_window: None,
             hidden_act: HiddenAct::SiluGate,
             rope_type: RopeType::Neox,
+            n_experts: 0,
+            n_experts_used: 0,
         }
     }
 
@@ -149,6 +157,8 @@ impl ModelConfig {
             sliding_window: None,
             hidden_act: HiddenAct::SiluGate,
             rope_type: RopeType::Neox,
+            n_experts: 0,
+            n_experts_used: 0,
         }
     }
 
@@ -223,6 +233,15 @@ impl ModelConfig {
             _ => None,
         };
 
+        let n_experts = v
+            .get("num_local_experts")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let n_experts_used = v
+            .get("num_experts_per_tok")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
         Ok(Self {
             hidden_size,
             intermediate_size,
@@ -243,6 +262,8 @@ impl ModelConfig {
                 .map(|v| v as usize),
             hidden_act,
             rope_type,
+            n_experts,
+            n_experts_used,
         })
     }
 }
@@ -398,6 +419,50 @@ mod tests {
         let q = c.quantization.unwrap();
         assert_eq!(q.format, QuantFormat::Tq2);
         assert_eq!(q.bits, 2);
+    }
+
+    #[test]
+    fn test_from_hf_json_mixtral_moe() {
+        let json = r#"{
+            "hidden_size": 4096,
+            "intermediate_size": 14336,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 32,
+            "vocab_size": 32000,
+            "max_position_embeddings": 32768,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 1000000.0,
+            "num_local_experts": 8,
+            "num_experts_per_tok": 2,
+            "sliding_window": 4096
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.n_experts, 8);
+        assert_eq!(c.n_experts_used, 2);
+        assert_eq!(c.hidden_size, 4096);
+        assert_eq!(c.intermediate_size, 14336);
+    }
+
+    #[test]
+    fn test_from_hf_json_dense_no_experts() {
+        let json = r#"{
+            "hidden_size": 4096,
+            "intermediate_size": 11008,
+            "num_attention_heads": 32,
+            "num_hidden_layers": 32,
+            "vocab_size": 32000
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.n_experts, 0);
+        assert_eq!(c.n_experts_used, 0);
+    }
+
+    #[test]
+    fn test_llama2_7b_is_dense() {
+        let c = ModelConfig::llama2_7b();
+        assert_eq!(c.n_experts, 0);
+        assert_eq!(c.n_experts_used, 0);
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod gpu;
 pub mod guided;
 pub mod layernorm;
 pub mod matmul;
+pub mod moe;
 #[cfg(any(feature = "npu-intel", feature = "npu-qualcomm"))]
 pub mod npu;
 pub mod quantized;

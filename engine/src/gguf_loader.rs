@@ -470,6 +470,9 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
     // layout determines which RoPE to use.
     let rope_type = crate::config::RopeType::Neox;
 
+    let n_experts = get_usize("expert_count").unwrap_or(0);
+    let n_experts_used = get_usize("expert_used_count").unwrap_or(0);
+
     Ok(ModelConfig {
         hidden_size,
         intermediate_size,
@@ -487,6 +490,8 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         sliding_window: None,
         hidden_act,
         rope_type,
+        n_experts,
+        n_experts_used,
     })
 }
 
