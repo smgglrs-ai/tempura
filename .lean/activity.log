@@ -1,3 +1,42 @@
+- timestamp: "2026-06-30T21:15:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-refinement"
+  summary: >
+    BitNet refinement complete. Added 4 I2S unit tests, 4 I2S Kani harnesses,
+    1 BitNet e2e forward pass test (314 tests, 61 Kani harnesses).
+    Validated against microsoft/bitnet-b1.58-2B-4T-gguf (ggml-model-i2_s.gguf):
+    loaded 1.2GB I2S model, extracted tokenizer from GGUF metadata,
+    tested 4 prompts — all produce coherent, factually correct output
+    ("2+2=4", transformer definition, haiku, prime numbers).
+    CPU inference ~1.5 tok/s (scalar). Added AVX2 vec_dot_i2_i8_s_avx2
+    (maddubs), AVX2 quantize_row_i8_s_avx2, and rayon-parallel matmul
+    in CpuMatMulQ4KOpt::forward_b_transposed_i2s. Result: ~17 tok/s
+    (11x speedup). Added test_i2s_avx2_matches_scalar correctness test.
+    315 tests passing. Phase 12: 6/7 items done, only TQ2 GPU kernel remaining.
+
+    Validated against bitnet.cpp on same hardware: bitnet.cpp 42.7 tok/s (8 threads),
+    tempura 17 tok/s (maddubs+AVX2+rayon). Gap is algorithmic: bitnet.cpp uses
+    LUT-based dot product (precompute activation pair sums, use weight nibbles as
+    shuffle indices). Translated the LUT approach to Rust:
+    - i2s_build_pair_lut: 16-entry i16 LUT per activation pair
+    - vec_dot_i2_i8_s_lut_scalar: scalar LUT-based dot product
+    - transpose_i2s_weights: column-major weight layout for cache-friendly access
+    - forward_i2s_lut: trait method + impls on CpuMatMulQ4K/Q4KOpt
+    - Wired into GGUF loader (auto-transpose at load time) and model forward pass
+    LUT correctness verified (matches maddubs to <0.01). 317 tests passing.
+    Implemented three AVX2 LUT variants:
+    (a) i8 LUT (63-scale) + cmpgt sign-extend per position: 10.2 tok/s
+    (b) i16 pre-split lo/hi byte LUT (127-scale) + 4 shuffles per position: 6.7 tok/s
+    (c) Scalar LUT fallback: ~8 tok/s
+    All three are slower than maddubs (17 tok/s) due to per-position LUT load
+    overhead — each byte position loads 32-64 bytes of LUT tables from memory.
+    bitnet.cpp's speed (42.7 tok/s) comes from BM=160 tiled layout where weights
+    are pre-loaded in registers and shared across many output rows. Our transposed
+    layout processes 32 columns at once but thrashes L1 with per-position LUT loads.
+    Reverted production path to maddubs; LUT infrastructure (trait, tests, transpose)
+    retained for future tiled kernel implementation. 317 tests, all passing.
+
 - timestamp: "2026-06-14T22:56:08+02:00"
   actor: "Fabien Dupont"
   action: commit

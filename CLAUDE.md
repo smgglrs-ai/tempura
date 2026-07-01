@@ -134,7 +134,7 @@ Three-crate workspace + standalone verification crate:
 - [x] Prometheus metrics (TTFT, ITL, queue depth, KV usage), OpenTelemetry export
 - [x] HuggingFace config.json auto-loading, Dockerfile
 - [x] Inference traces, deterministic replay, DualPipeline comparison, batch-invariant verification
-- [x] 148 passing tests
+- [x] 315 passing tests
 
 ## What's Next
 
@@ -155,13 +155,17 @@ Three-crate workspace + standalone verification crate:
 - [ ] Disaggregated prefill/decode serving
 
 ### Phase 12: BitNet Ternary Model Support
-- [ ] TQ2_0 block struct + decode in kernel-api
-- [ ] BitLinear CPU kernel (per-tensor INT8 activation quant, integer add/sub)
-- [ ] Squared ReLU activation function
-- [ ] GGUF loader: detect `model_type: "bitnet"`, route to BitLinear layers
+- [x] TQ2_0 block struct + decode in kernel-api
+- [x] BitLinear CPU kernel (per-tensor INT8 activation quant, integer add/sub)
+- [x] Squared ReLU activation function
+- [x] GGUF loader: detect `model_type: "bitnet"`, route to BitLinear layers
 - [ ] TQ2_0 cuda-oxide GPU kernel (dp4a path, shared-memory tile unpack)
-- [ ] TQ1_0 CPU-only decode
-- [ ] Validation against microsoft/bitnet-b1.58-2B-4T-gguf
+- [x] TQ1_0 CPU-only decode (I2S format via bitnet.cpp translation)
+- [x] Validation against microsoft/bitnet-b1.58-2B-4T-gguf (coherent output, ~17 tok/s CPU AVX2)
+- [x] AVX2/AVX512 maddubs with i16 batched accumulation (bitnet.cpp pattern)
+- [x] Pre-quantized activation sharing across q/k/v and gate/up projections
+- [x] Layer-level rayon::join parallelism for independent projections
+- [x] LUT-based dot product infrastructure (scalar + AVX2 shuffle, verified correct)
 
 ## Build & Test
 
@@ -222,8 +226,8 @@ deliverable, not a follow-up task. When adding or modifying code:
 ### Running Verification
 
 ```sh
-cargo test                           # unit + property tests (307+ tests)
-cargo kani --package tempura-kernels  # Kani: bounded model checking (57 harnesses)
+cargo test                           # unit + property tests (315 tests)
+cargo kani --package tempura-kernels  # Kani: bounded model checking (61 harnesses)
 ./scripts/run-verus.sh               # Verus: deductive unbounded proofs (828 verification conditions)
 ```
 
@@ -240,8 +244,8 @@ cargo kani --package tempura-kernels  # Kani: bounded model checking (57 harness
 
 ### Coverage Summary
 
-**Kani:** 57 bounded harnesses across kernels/ and engine/ — indexing arithmetic
-for attention, RMSNorm, RoPE, matmul, sampling, turboquant, quantized (Q4K/Q6K/TQ2),
+**Kani:** 61 bounded harnesses across kernels/ and engine/ — indexing arithmetic
+for attention, RMSNorm, RoPE, matmul, sampling, turboquant, quantized (Q4K/Q6K/TQ2/I2S),
 KV cache, model, speculative, disaggregated, weights, GGUF.
 
 **Verus:** 62 modules, 828 verification conditions — 56 of 57 Kani harnesses
@@ -269,7 +273,7 @@ Verus requires a pre-built binary at `~/.local/verus/verus-x86-linux/verus`
 The `verus-verified/` crate is standalone (own toolchain, own workspace) — do NOT
 add it to the main workspace.
 
-Verus covers 56 of 57 Kani harnesses unboundedly. The 6 excluded from Verus:
+Verus covers 60 of 61 Kani harnesses unboundedly. The 6 excluded from Verus:
 - 2 restated as integer proofs: `q4k_monotonicity_within_group`, `q4k_accumulator_no_overflow`
 - 3 covered by proptest (f32/f64): `head_dim_scale_never_zero_division`,
   `int8_dequant_bounded_error`, `q4k_dequant_value_bounded`

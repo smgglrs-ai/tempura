@@ -885,6 +885,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
 pub struct GgufLoader {
     tensors: HashMap<String, Vec<f32>>,
     raw_tensors: HashMap<String, Vec<u8>>,
+    raw_tensor_dims: HashMap<String, Vec<u64>>,
     tensor_dtypes: HashMap<String, GgmlType>,
     pub config: ModelConfig,
     pub metadata: HashMap<String, GgufValue>,
@@ -950,6 +951,7 @@ impl GgufLoader {
 
         let mut tensors = HashMap::new();
         let mut raw_tensors = HashMap::new();
+        let mut raw_tensor_dims: HashMap<String, Vec<u64>> = HashMap::new();
         let mut tensor_dtypes = HashMap::new();
 
         for info in &tensor_infos {
@@ -994,6 +996,7 @@ impl GgufLoader {
                 tensors.insert(mapped_name.clone(), floats);
             } else {
                 raw_tensors.insert(mapped_name.clone(), tensor_data.to_vec());
+                raw_tensor_dims.insert(mapped_name.clone(), info.dims.clone());
             }
             tensor_dtypes.insert(mapped_name.clone(), info.dtype);
         }
@@ -1021,6 +1024,7 @@ impl GgufLoader {
         Ok(Self {
             tensors,
             raw_tensors,
+            raw_tensor_dims,
             tensor_dtypes,
             config,
             metadata,
@@ -1137,6 +1141,7 @@ impl GgufLoader {
         Ok(Self {
             tensors,
             raw_tensors,
+            raw_tensor_dims: HashMap::new(),
             tensor_dtypes,
             config,
             metadata,
@@ -1165,7 +1170,24 @@ impl GgufLoader {
             }
         }
 
-        crate::weights::QuantizedWeights::new_with_ternary(q4k_tensors, q6k_tensors, tq2_tensors, i2s_tensors, f32_tensors)
+        let mut qw = crate::weights::QuantizedWeights::new_with_ternary(q4k_tensors, q6k_tensors, tq2_tensors, i2s_tensors, f32_tensors);
+
+        // Build LUT-format (transposed) I2S tensors for the shuffle-based kernel
+        let mut i2s_shapes = std::collections::HashMap::new();
+        for (name, dtype) in &self.tensor_dtypes {
+            if *dtype == GgmlType::TQ1_0 {
+                if let Some(info) = self.raw_tensor_dims.get(name) {
+                    if info.len() >= 2 {
+                        i2s_shapes.insert(name.clone(), (info[1] as usize, info[0] as usize));
+                    }
+                }
+            }
+        }
+        if !i2s_shapes.is_empty() {
+            qw.build_i2s_lut_tensors(&i2s_shapes);
+        }
+
+        qw
     }
 
     pub fn tensor_dtype(&self, name: &str) -> Option<GgmlType> {

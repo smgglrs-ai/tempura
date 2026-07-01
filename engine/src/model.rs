@@ -535,6 +535,9 @@ where
             .map(|p| p as u32)
             .collect();
 
+        let fwd_start = std::time::Instant::now();
+        let qmm_nanos = std::sync::atomic::AtomicU64::new(0);
+
         let qmm = |preq: Option<&PreQuantizedActivations>,
                    a_f32: &[f32],
                    name: &str,
@@ -542,6 +545,7 @@ where
                    m: usize,
                    n: usize,
                    k: usize| {
+            let _qmm_t = std::time::Instant::now();
             if m == 1 {
                 if let Some(pq) = preq {
                     if let Some(w) = qweights.get_q4k(name) {
@@ -555,6 +559,13 @@ where
                 }
             }
             if let Some(w) = qweights.get_i2s(name) {
+                if m == 1 {
+                    if let Some(pq) = preq {
+                        q4k.forward_i2s_preq(&pq.i2s_q8, pq.i2s_scale, pq.i2s_sum, w, out, n, k)
+                            .unwrap();
+                        return;
+                    }
+                }
                 q4k.forward_b_transposed_i2s(a_f32, w, out, m, n, k)
                     .unwrap();
             } else if let Some(w) = qweights.get_tq2(name) {
@@ -633,7 +644,11 @@ where
             }
 
             let normed_preq = if seq_len == 1 {
-                Some(PreQuantizedActivations::from_f32(&normed[..h]))
+                if cfg.hidden_act == crate::config::HiddenAct::SquaredRelu {
+                    Some(PreQuantizedActivations::i2s_only(&normed[..h]))
+                } else {
+                    Some(PreQuantizedActivations::from_f32(&normed[..h]))
+                }
             } else {
                 None
             };
@@ -641,41 +656,27 @@ where
             q.fill(0.0);
             k.fill(0.0);
             v.fill(0.0);
-            // Fuse Q+K into single dispatch when both are Q4K and decode (m=1)
             if seq_len == 1 {
-                if let (Some(pq), Some(qw), Some(kw)) = (
+                if let (Some(pq), Some(qw), Some(kw), Some(vw)) = (
+                    normed_preq.as_ref(),
+                    qweights.get_i2s(&q_w_name),
+                    qweights.get_i2s(&k_w_name),
+                    qweights.get_i2s(&v_w_name),
+                ) {
+                    q4k.forward_i2s_preq(&pq.i2s_q8, pq.i2s_scale, pq.i2s_sum, qw, &mut q[..q_dim], q_dim, h).unwrap();
+                    q4k.forward_i2s_preq(&pq.i2s_q8, pq.i2s_scale, pq.i2s_sum, kw, &mut k[..kv_dim], kv_dim, h).unwrap();
+                    q4k.forward_i2s_preq(&pq.i2s_q8, pq.i2s_scale, pq.i2s_sum, vw, &mut v[..kv_dim], kv_dim, h).unwrap();
+                } else if let (Some(pq), Some(qw), Some(kw)) = (
                     normed_preq.as_ref(),
                     qweights.get_q4k(&q_w_name),
                     qweights.get_q4k(&k_w_name),
                 ) {
-                    q4k.fused_q4k_preq_2(
-                        pq,
-                        qw,
-                        &mut q[..q_dim],
-                        q_dim,
-                        kw,
-                        &mut k[..kv_dim],
-                        kv_dim,
-                    );
+                    q4k.fused_q4k_preq_2(pq, qw, &mut q[..q_dim], q_dim, kw, &mut k[..kv_dim], kv_dim);
+                    qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..kv_dim], 1, kv_dim, h);
                 } else {
-                    qmm(
-                        normed_preq.as_ref(),
-                        &normed,
-                        &q_w_name,
-                        &mut q[..q_dim],
-                        1,
-                        q_dim,
-                        h,
-                    );
-                    qmm(
-                        normed_preq.as_ref(),
-                        &normed,
-                        &k_w_name,
-                        &mut k[..kv_dim],
-                        1,
-                        kv_dim,
-                        h,
-                    );
+                    qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q[..q_dim], 1, q_dim, h);
+                    qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..kv_dim], 1, kv_dim, h);
+                    qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..kv_dim], 1, kv_dim, h);
                 }
             } else {
                 qmm(
@@ -697,15 +698,18 @@ where
                     h,
                 );
             }
-            qmm(
-                normed_preq.as_ref(),
-                &normed,
-                &v_w_name,
-                &mut v[..seq_len * kv_dim],
-                seq_len,
-                kv_dim,
-                h,
-            );
+            // v_proj: already done in I2S parallel path for decode, else do it here
+            if seq_len > 1 || qweights.get_i2s(&v_w_name).is_none() {
+                qmm(
+                    normed_preq.as_ref(),
+                    &normed,
+                    &v_w_name,
+                    &mut v[..seq_len * kv_dim],
+                    seq_len,
+                    kv_dim,
+                    h,
+                );
+            }
 
             if cfg.use_qk_norm {
                 let q_norm_w = qweights.get_f32(q_norm_name).unwrap();
@@ -777,7 +781,11 @@ where
 
             o_proj.fill(0.0);
             let attn_preq = if seq_len == 1 {
-                Some(PreQuantizedActivations::from_f32(&attn_out[..q_dim]))
+                if cfg.hidden_act == crate::config::HiddenAct::SquaredRelu {
+                    Some(PreQuantizedActivations::i2s_only(&attn_out[..q_dim]))
+                } else {
+                    Some(PreQuantizedActivations::from_f32(&attn_out[..q_dim]))
+                }
             } else {
                 None
             };
@@ -814,7 +822,11 @@ where
             }
 
             let normed2_preq = if seq_len == 1 {
-                Some(PreQuantizedActivations::from_f32(&normed2[..h]))
+                if cfg.hidden_act == crate::config::HiddenAct::SquaredRelu {
+                    Some(PreQuantizedActivations::i2s_only(&normed2[..h]))
+                } else {
+                    Some(PreQuantizedActivations::from_f32(&normed2[..h]))
+                }
             } else {
                 None
             };
@@ -887,24 +899,22 @@ where
                     }
                 }
                 crate::config::HiddenAct::SquaredRelu => {
-                    qmm(
-                        normed2_preq.as_ref(),
-                        &normed2,
-                        &gate_w_name,
-                        &mut gate[..seq_len * inter],
-                        seq_len,
-                        inter,
-                        h,
-                    );
-                    qmm(
-                        normed2_preq.as_ref(),
-                        &normed2,
-                        &up_w_name,
-                        &mut up[..seq_len * inter],
-                        seq_len,
-                        inter,
-                        h,
-                    );
+                    if seq_len == 1 {
+                        if let (Some(pq), Some(gw), Some(uw)) = (
+                            normed2_preq.as_ref(),
+                            qweights.get_i2s(&gate_w_name),
+                            qweights.get_i2s(&up_w_name),
+                        ) {
+                            q4k.forward_i2s_preq(&pq.i2s_q8, pq.i2s_scale, pq.i2s_sum, gw, &mut gate[..inter], inter, h).unwrap();
+                            q4k.forward_i2s_preq(&pq.i2s_q8, pq.i2s_scale, pq.i2s_sum, uw, &mut up[..inter], inter, h).unwrap();
+                        } else {
+                            qmm(normed2_preq.as_ref(), &normed2, &gate_w_name, &mut gate[..inter], 1, inter, h);
+                            qmm(normed2_preq.as_ref(), &normed2, &up_w_name, &mut up[..inter], 1, inter, h);
+                        }
+                    } else {
+                        qmm(normed2_preq.as_ref(), &normed2, &gate_w_name, &mut gate[..seq_len * inter], seq_len, inter, h);
+                        qmm(normed2_preq.as_ref(), &normed2, &up_w_name, &mut up[..seq_len * inter], seq_len, inter, h);
+                    }
                     if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer == 0 {
                         let last_g = &gate[(seq_len-1)*inter..seq_len*inter];
                         let last_u = &up[(seq_len-1)*inter..seq_len*inter];
@@ -933,7 +943,11 @@ where
 
             down_out.fill(0.0);
             let gate_preq = if seq_len == 1 {
-                Some(PreQuantizedActivations::from_f32(&gate[..inter]))
+                if cfg.hidden_act == crate::config::HiddenAct::SquaredRelu {
+                    Some(PreQuantizedActivations::i2s_only(&gate[..inter]))
+                } else {
+                    Some(PreQuantizedActivations::from_f32(&gate[..inter]))
+                }
             } else {
                 None
             };
@@ -993,6 +1007,10 @@ where
             self.pipeline
                 .matmul_bt(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
                 .unwrap();
+        }
+
+        if std::env::var("TEMPURA_PROFILE").is_ok() {
+            eprintln!("[PROFILE] forward_quantized: {:.2}ms", fwd_start.elapsed().as_secs_f64() * 1000.0);
         }
 
         if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() {
@@ -3601,6 +3619,126 @@ mod tests {
         assert_eq!(
             tokens_contiguous, tokens_paged,
             "paged generate must produce identical tokens"
+        );
+    }
+
+    fn make_i2s_tensor(n: usize, k: usize, seed: u64) -> Vec<u8> {
+        // I2S format: n*k/4 packed bytes + 4-byte f32 scale
+        // 2-bit values: 0=-1, 1=0, 2=+1
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let packed_bytes = n * k / 4;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut data: Vec<u8> = (0..packed_bytes)
+            .map(|_| {
+                let mut byte = 0u8;
+                for shift in (0..8).step_by(2) {
+                    let trit: u8 = rng.random_range(0..3); // {0,1,2} → {-1,0,+1}
+                    byte |= trit << shift;
+                }
+                byte
+            })
+            .collect();
+        data.extend_from_slice(&1.0f32.to_ne_bytes());
+        data
+    }
+
+    #[test]
+    fn test_bitnet_forward_pass() {
+        let h = 128;
+        let heads = 2;
+        let kv_heads = 2;
+        let head_dim = h / heads;
+        let inter = 256;
+        let vocab = 32;
+        let layers = 1;
+
+        let config = ModelConfig {
+            hidden_size: h,
+            num_attention_heads: heads,
+            num_kv_heads: kv_heads,
+            head_dim,
+            intermediate_size: inter,
+            num_layers: layers,
+            vocab_size: vocab,
+            max_seq_len: 64,
+            rope_theta: 10000.0,
+            layer_norm_eps: 1e-5,
+            hidden_act: crate::config::HiddenAct::SquaredRelu,
+            rope_type: crate::config::RopeType::Norm,
+            quantization: Some(crate::config::QuantConfig {
+                format: crate::config::QuantFormat::Tq2,
+                bits: 2,
+                group_size: 256,
+                symmetric: true,
+            }),
+            tensor_parallel_size: 1,
+            use_qk_norm: false,
+            sliding_window: None,
+        };
+
+        let q_dim = heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
+
+        let mut i2s = HashMap::new();
+        let mut f32_tensors = HashMap::new();
+
+        // Embedding and final norm are f32
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(99);
+        let rand_vec = |rng: &mut StdRng, size: usize| -> Vec<f32> {
+            (0..size).map(|_| rng.random_range(-0.1..0.1)).collect()
+        };
+
+        f32_tensors.insert("model.embed_tokens.weight".into(), rand_vec(&mut rng, vocab * h));
+        f32_tensors.insert("model.norm.weight".into(), vec![1.0; h]);
+
+        for l in 0..layers {
+            let p = format!("model.layers.{l}");
+            f32_tensors.insert(format!("{p}.input_layernorm.weight"), vec![1.0; h]);
+            f32_tensors.insert(format!("{p}.post_attention_layernorm.weight"), vec![1.0; h]);
+            f32_tensors.insert(format!("{p}.self_attn.attn_sub_norm.weight"), vec![1.0; q_dim]);
+            f32_tensors.insert(format!("{p}.mlp.ffn_sub_norm.weight"), vec![1.0; inter]);
+
+            // All projections as I2S ternary weights (unique seeds for diversity)
+            let base = l as u64 * 10;
+            i2s.insert(format!("{p}.self_attn.q_proj.weight"), make_i2s_tensor(q_dim, h, base + 1));
+            i2s.insert(format!("{p}.self_attn.k_proj.weight"), make_i2s_tensor(kv_dim, h, base + 2));
+            i2s.insert(format!("{p}.self_attn.v_proj.weight"), make_i2s_tensor(kv_dim, h, base + 3));
+            i2s.insert(format!("{p}.self_attn.o_proj.weight"), make_i2s_tensor(h, q_dim, base + 4));
+            i2s.insert(format!("{p}.mlp.gate_proj.weight"), make_i2s_tensor(inter, h, base + 5));
+            i2s.insert(format!("{p}.mlp.up_proj.weight"), make_i2s_tensor(inter, h, base + 6));
+            i2s.insert(format!("{p}.mlp.down_proj.weight"), make_i2s_tensor(h, inter, base + 7));
+        }
+
+        // lm_head as I2S
+        i2s.insert("lm_head.weight".into(), make_i2s_tensor(vocab, h, 100));
+
+        let qw = crate::weights::QuantizedWeights::new_with_ternary(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            i2s,
+            f32_tensors,
+        );
+
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(config.clone(), pipeline);
+        model.quantized_weights = Some(qw);
+
+        let mut session = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let logits = model.forward(&mut session, &[1, 2, 3]);
+
+        assert_eq!(logits.len(), vocab, "logits should have vocab_size elements");
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "all logits must be finite, got: {:?}",
+            &logits[..8.min(vocab)]
+        );
+        assert!(
+            !logits.iter().all(|&v| v == 0.0),
+            "logits should not all be zero"
         );
     }
 }

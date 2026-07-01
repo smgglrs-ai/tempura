@@ -216,12 +216,32 @@ impl ModelWeights {
     }
 }
 
+/// Transpose I2S weights from row-major to column-major by byte position.
+///
+/// Original: row j has bytes [0..k/4). Row j byte b at offset j*(k/4)+b.
+/// Transposed: byte position b has n rows contiguous. Position b row j at offset b*n+j.
+/// The per-tensor f32 scale is preserved at the end.
+pub fn transpose_i2s_weights(data: &[u8], n: usize, k: usize) -> Vec<u8> {
+    let row_bytes = k / 4;
+    let packed_bytes = n * row_bytes;
+    let mut transposed = vec![0u8; packed_bytes + 4];
+
+    for j in 0..n {
+        for b in 0..row_bytes {
+            transposed[b * n + j] = data[j * row_bytes + b];
+        }
+    }
+    transposed[packed_bytes..packed_bytes + 4].copy_from_slice(&data[packed_bytes..packed_bytes + 4]);
+    transposed
+}
+
 #[derive(Debug)]
 pub struct QuantizedWeights {
     q4k_tensors: HashMap<String, Vec<u8>>,
     q6k_tensors: HashMap<String, Vec<u8>>,
     tq2_tensors: HashMap<String, Vec<u8>>,
     i2s_tensors: HashMap<String, Vec<u8>>,
+    i2s_lut_tensors: HashMap<String, Vec<u8>>,
     f32_tensors: HashMap<String, Vec<f32>>,
 }
 
@@ -236,6 +256,7 @@ impl QuantizedWeights {
             q6k_tensors,
             tq2_tensors: HashMap::new(),
             i2s_tensors: HashMap::new(),
+            i2s_lut_tensors: HashMap::new(),
             f32_tensors,
         }
     }
@@ -251,6 +272,7 @@ impl QuantizedWeights {
             q4k_tensors,
             q6k_tensors,
             tq2_tensors,
+            i2s_lut_tensors: HashMap::new(),
             i2s_tensors,
             f32_tensors,
         }
@@ -272,8 +294,21 @@ impl QuantizedWeights {
         self.i2s_tensors.get(name).map(|v| v.as_slice())
     }
 
+    pub fn get_i2s_lut(&self, name: &str) -> Option<&[u8]> {
+        self.i2s_lut_tensors.get(name).map(|v| v.as_slice())
+    }
+
     pub fn get_f32(&self, name: &str) -> Option<&[f32]> {
         self.f32_tensors.get(name).map(|v| v.as_slice())
+    }
+
+    pub fn build_i2s_lut_tensors(&mut self, tensor_shapes: &HashMap<String, (usize, usize)>) {
+        for (name, data) in &self.i2s_tensors {
+            if let Some(&(n, k)) = tensor_shapes.get(name) {
+                let transposed = transpose_i2s_weights(data, n, k);
+                self.i2s_lut_tensors.insert(name.clone(), transposed);
+            }
+        }
     }
 }
 

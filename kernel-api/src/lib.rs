@@ -391,6 +391,30 @@ pub trait MatMulQ: Send + Sync {
         n: usize,
         k: usize,
     ) -> Result<()>;
+
+    /// I2S matmul with pre-quantized activations — skips per-call quantization.
+    fn forward_i2s_preq(
+        &self,
+        preq_q8: &[i8],
+        preq_scale: f32,
+        preq_sum: i32,
+        b_quantized: &[u8],
+        output: &mut [f32],
+        n: usize,
+        k: usize,
+    ) -> Result<()>;
+
+    /// LUT-based I2S matmul with column-major (transposed) weights.
+    /// `b_transposed` layout: byte position b from all n rows contiguous.
+    fn forward_i2s_lut(
+        &self,
+        a: &[f32],
+        b_transposed: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()>;
 }
 
 // ── Dequantize ──────────────────────────────────────────────────────────────
