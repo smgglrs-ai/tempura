@@ -298,6 +298,151 @@ fn flash_attention(
     Ok(())
 }
 
+// ── ALiBi slope computation ───────────────────────────────────────────────
+//
+// Translated from ggml's ggml_compute_forward_soft_max_f32 (ops.cpp:5348-5370).
+// For n_heads heads with max_bias > 0:
+//   n_head_log2 = 1 << floor(log2(n_heads))
+//   m0 = 2^(-max_bias / n_head_log2)
+//   m1 = 2^(-max_bias / 2 / n_head_log2)
+//   slope(h) = m0^(h+1)                    if h < n_head_log2
+//            = m1^(2*(h-n_head_log2)+1)     otherwise
+
+#[cfg(feature = "cpu")]
+pub fn alibi_slopes(n_heads: usize, max_bias: f32) -> Vec<f32> {
+    if max_bias <= 0.0 || n_heads == 0 {
+        return vec![1.0; n_heads];
+    }
+    let n_head_log2 = 1u32 << (n_heads as f32).log2().floor() as u32;
+    let m0 = 2.0f32.powf(-max_bias / n_head_log2 as f32);
+    let m1 = 2.0f32.powf(-max_bias / 2.0 / n_head_log2 as f32);
+
+    (0..n_heads)
+        .map(|h| {
+            if (h as u32) < n_head_log2 {
+                m0.powf(h as f32 + 1.0)
+            } else {
+                m1.powf(2.0 * (h as u32 - n_head_log2) as f32 + 1.0)
+            }
+        })
+        .collect()
+}
+
+// ── Masked attention with ALiBi ──────────────────────────────────────────
+//
+// Supports:
+// - Additive mask: mask[q_pos * kv_len + k_pos] added to score before softmax
+// - ALiBi slopes: slope[h] * (k_pos - q_pos) added to score
+// - Both: mask + alibi combined
+// - Neither: falls back to causal masking
+//
+// Uses ggml-compatible softmax: f64 sum accumulation, ggml_exp.
+
+#[cfg(feature = "cpu")]
+#[allow(clippy::too_many_arguments)]
+fn naive_attention_masked(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    output: &mut [f32],
+    batch: usize,
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    mask: Option<&[f32]>,
+    slopes: Option<&[f32]>,
+    window: Option<usize>,
+) -> Result<()> {
+    let heads_per_group = num_heads / num_kv_heads;
+    let has_mask = mask.is_some();
+
+    for b in 0..batch {
+        for h in 0..num_heads {
+            let kv_h = h / heads_per_group;
+            let slope = slopes.map_or(0.0, |s| s[h]);
+
+            for s in 0..seq_len {
+                let q_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                let q_vec = &q[q_offset..q_offset + head_dim];
+
+                let cache_offset = kv_len - seq_len;
+                let q_pos = cache_offset + s;
+                let causal_limit = q_pos;
+                let window_start = match window {
+                    Some(w) if causal_limit >= w => causal_limit - w + 1,
+                    _ => 0,
+                };
+
+                let mut scores = vec![0.0f32; kv_len];
+                for (kv_s, score) in scores.iter_mut().enumerate() {
+                    if has_mask {
+                        let mask_val = mask.unwrap()[s * kv_len + kv_s];
+                        if mask_val == f32::NEG_INFINITY {
+                            *score = f32::NEG_INFINITY;
+                            continue;
+                        }
+                    } else if kv_s > causal_limit || kv_s < window_start {
+                        *score = f32::NEG_INFINITY;
+                        continue;
+                    }
+
+                    let k_offset = ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim;
+                    let k_vec = &k[k_offset..k_offset + head_dim];
+
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_vec[d] * k_vec[d];
+                    }
+                    *score = dot * scale;
+
+                    if has_mask {
+                        *score += mask.unwrap()[s * kv_len + kv_s];
+                    }
+
+                    if slopes.is_some() {
+                        *score += slope * (kv_s as f32 - q_pos as f32);
+                    }
+                }
+
+                let mut max_score = f32::NEG_INFINITY;
+                for &sc in &scores {
+                    if sc > max_score {
+                        max_score = sc;
+                    }
+                }
+
+                let mut sum: f64 = 0.0;
+                for sc in &mut scores {
+                    let val = crate::portable_math::ggml_exp(*sc - max_score);
+                    sum += val as f64;
+                    *sc = val;
+                }
+
+                let inv_sum = (1.0 / sum) as f32;
+                for sc in &mut scores {
+                    *sc *= inv_sum;
+                }
+
+                let o_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                for d in 0..head_dim {
+                    let mut val = 0.0f32;
+                    for (kv_s, &score) in scores.iter().enumerate() {
+                        let v_offset =
+                            ((b * kv_len + kv_s) * num_kv_heads + kv_h) * head_dim + d;
+                        val += score * v[v_offset];
+                    }
+                    output[o_offset + d] = val;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ── Concrete CPU attention structs ─────────────────────────────────────────
 
 #[cfg(feature = "cpu")]
@@ -328,6 +473,138 @@ impl Attention for CpuAttentionGgml {
     ) -> Result<()> {
         naive_attention_ggml(q, k, v, output, batch, seq_len, kv_len,
                             num_heads, num_kv_heads, head_dim, scale, Some(window_size))
+    }
+}
+
+/// ALiBi-aware attention with optional additive mask support.
+///
+/// Computes per-head ALiBi slopes from `max_bias` (ggml convention).
+/// When `max_bias > 0`, adds `slope[h] * (k_pos - q_pos)` to each score.
+/// Accepts an optional additive mask that replaces built-in causal masking.
+#[cfg(feature = "cpu")]
+pub struct CpuAttentionAlibi {
+    slopes: Vec<f32>,
+}
+
+#[cfg(feature = "cpu")]
+impl CpuAttentionAlibi {
+    pub fn new(n_heads: usize, max_bias: f32) -> Self {
+        Self {
+            slopes: alibi_slopes(n_heads, max_bias),
+        }
+    }
+
+    pub fn slopes(&self) -> &[f32] {
+        &self.slopes
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_masked(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        output: &mut [f32],
+        batch: usize,
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        mask: Option<&[f32]>,
+    ) -> Result<()> {
+        naive_attention_masked(
+            q, k, v, output, batch, seq_len, kv_len,
+            num_heads, num_kv_heads, head_dim, scale,
+            mask, Some(&self.slopes), None,
+        )
+    }
+}
+
+#[cfg(feature = "cpu")]
+impl Attention for CpuAttentionAlibi {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Tested
+    }
+
+    fn forward(
+        &self,
+        q: &[f32], k: &[f32], v: &[f32], output: &mut [f32],
+        batch: usize, seq_len: usize, kv_len: usize,
+        num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
+    ) -> Result<()> {
+        naive_attention_masked(
+            q, k, v, output, batch, seq_len, kv_len,
+            num_heads, num_kv_heads, head_dim, scale,
+            None, Some(&self.slopes), None,
+        )
+    }
+
+    fn forward_windowed(
+        &self,
+        q: &[f32], k: &[f32], v: &[f32], output: &mut [f32],
+        batch: usize, seq_len: usize, kv_len: usize,
+        num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
+        window_size: usize,
+    ) -> Result<()> {
+        naive_attention_masked(
+            q, k, v, output, batch, seq_len, kv_len,
+            num_heads, num_kv_heads, head_dim, scale,
+            None, Some(&self.slopes), Some(window_size),
+        )
+    }
+}
+
+/// Attention with additive mask support (no ALiBi).
+/// Mask shape: [seq_len, kv_len], additive (use -inf for masked positions).
+/// When mask is None, applies causal masking as usual.
+#[cfg(feature = "cpu")]
+pub struct CpuAttentionMasked;
+
+#[cfg(feature = "cpu")]
+impl CpuAttentionMasked {
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_mask(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        output: &mut [f32],
+        batch: usize,
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        mask: &[f32],
+    ) -> Result<()> {
+        naive_attention_masked(
+            q, k, v, output, batch, seq_len, kv_len,
+            num_heads, num_kv_heads, head_dim, scale,
+            Some(mask), None, None,
+        )
+    }
+}
+
+#[cfg(feature = "cpu")]
+impl Attention for CpuAttentionMasked {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Tested
+    }
+
+    fn forward(
+        &self,
+        q: &[f32], k: &[f32], v: &[f32], output: &mut [f32],
+        batch: usize, seq_len: usize, kv_len: usize,
+        num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
+    ) -> Result<()> {
+        naive_attention_masked(
+            q, k, v, output, batch, seq_len, kv_len,
+            num_heads, num_kv_heads, head_dim, scale,
+            None, None, None,
+        )
     }
 }
 
@@ -1265,5 +1542,233 @@ mod tests {
         // f16 vs f32 should differ (proving f16 truncation has an effect) but not wildly
         assert!(d_f16_naive > 1e-6, "f16 truncation should have measurable effect");
         assert!(d_f16_naive < 0.1, "f16 divergence too large: {d_f16_naive}");
+    }
+
+    #[test]
+    fn test_alibi_slopes_power_of_two_heads() {
+        // 8 heads, max_bias=8 → standard ALiBi slopes
+        // n_head_log2=8, m0 = 2^(-8/8) = 0.5
+        // slopes: 0.5^1, 0.5^2, ..., 0.5^8
+        let slopes = alibi_slopes(8, 8.0);
+        assert_eq!(slopes.len(), 8);
+        let expected = [0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125, 0.00390625];
+        for (i, (&got, &want)) in slopes.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "slope[{i}]: got={got}, want={want}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_alibi_slopes_non_power_of_two_heads() {
+        // 6 heads, max_bias=8 → n_head_log2=4
+        // m0 = 2^(-8/4) = 0.25
+        // m1 = 2^(-8/2/4) = 2^(-1) = 0.5
+        // heads 0..3: m0^(h+1) = 0.25, 0.0625, 0.015625, 0.00390625
+        // heads 4..5: m1^(2*(h-4)+1) = 0.5^1, 0.5^3
+        let slopes = alibi_slopes(6, 8.0);
+        assert_eq!(slopes.len(), 6);
+        assert!((slopes[0] - 0.25).abs() < 1e-6);
+        assert!((slopes[1] - 0.0625).abs() < 1e-6);
+        assert!((slopes[4] - 0.5).abs() < 1e-6);
+        assert!((slopes[5] - 0.125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_alibi_slopes_no_bias() {
+        let slopes = alibi_slopes(4, 0.0);
+        assert!(slopes.iter().all(|&s| s == 1.0));
+    }
+
+    #[test]
+    fn test_alibi_attention_biases_scores() {
+        let head_dim = 4;
+        let seq_len = 1;
+        let kv_len = 4;
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Uniform Q and K so all dot products are equal → without ALiBi,
+        // attention weights would be uniform over visible positions.
+        let q = vec![1.0f32; seq_len * num_heads * head_dim];
+        let k = vec![1.0f32; kv_len * num_kv_heads * head_dim];
+        let v: Vec<f32> = (0..kv_len * num_kv_heads * head_dim)
+            .map(|i| i as f32)
+            .collect();
+
+        // Without ALiBi
+        let baseline = CpuAttentionGgml;
+        let mut out_baseline = vec![0.0f32; seq_len * num_heads * head_dim];
+        baseline
+            .forward(&q, &k, &v, &mut out_baseline, 1, seq_len, kv_len,
+                     num_heads, num_kv_heads, head_dim, scale)
+            .unwrap();
+
+        // With ALiBi (max_bias=8)
+        let alibi = CpuAttentionAlibi::new(num_heads, 8.0);
+        let mut out_alibi = vec![0.0f32; seq_len * num_heads * head_dim];
+        alibi
+            .forward(&q, &k, &v, &mut out_alibi, 1, seq_len, kv_len,
+                     num_heads, num_kv_heads, head_dim, scale)
+            .unwrap();
+
+        // ALiBi should shift attention toward more recent tokens (higher positions)
+        // so output should differ from uniform baseline
+        let max_diff: f32 = out_baseline
+            .iter()
+            .zip(&out_alibi)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            max_diff > 0.01,
+            "ALiBi should change attention output (max_diff={max_diff})"
+        );
+    }
+
+    #[test]
+    fn test_alibi_recency_bias() {
+        // ALiBi adds slope*(k_pos - q_pos) which is negative for past tokens,
+        // more negative the further away. This biases attention toward recent tokens.
+        let head_dim = 4;
+        let seq_len = 1;
+        let kv_len = 8;
+        let num_heads = 1;
+        let num_kv_heads = 1;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q = vec![0.5f32; seq_len * num_heads * head_dim];
+        let k = vec![0.5f32; kv_len * num_kv_heads * head_dim];
+        // V = [0,0,0,0, 1,1,1,1, ...] — later tokens have higher values
+        let v: Vec<f32> = (0..kv_len * num_kv_heads * head_dim)
+            .map(|i| (i / head_dim) as f32)
+            .collect();
+
+        // Strong ALiBi slope
+        let alibi = CpuAttentionAlibi::new(num_heads, 8.0);
+        let mut out_alibi = vec![0.0f32; seq_len * num_heads * head_dim];
+        alibi
+            .forward(&q, &k, &v, &mut out_alibi, 1, seq_len, kv_len,
+                     num_heads, num_kv_heads, head_dim, scale)
+            .unwrap();
+
+        // Without ALiBi, uniform weights → mean value ≈ 3.5
+        // With ALiBi, recency bias → output should be > 3.5 (biased toward later tokens)
+        let mean_val = out_alibi.iter().sum::<f32>() / out_alibi.len() as f32;
+        assert!(
+            mean_val > 3.5,
+            "ALiBi should bias toward recent tokens, got mean={mean_val}"
+        );
+    }
+
+    #[test]
+    fn test_masked_attention_matches_causal() {
+        let head_dim = 4;
+        let seq_len = 3;
+        let kv_len = 3;
+        let num_heads = 1;
+        let num_kv_heads = 1;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..seq_len * num_heads * head_dim)
+            .map(|i| (i as f32) * 0.1 + 0.1)
+            .collect();
+        let k = q.clone();
+        let v: Vec<f32> = (0..kv_len * num_kv_heads * head_dim)
+            .map(|i| (i as f32 + 1.0) * 0.2)
+            .collect();
+
+        // Causal output from CpuAttentionGgml
+        let causal = CpuAttentionGgml;
+        let mut out_causal = vec![0.0f32; seq_len * num_heads * head_dim];
+        causal
+            .forward(&q, &k, &v, &mut out_causal, 1, seq_len, kv_len,
+                     num_heads, num_kv_heads, head_dim, scale)
+            .unwrap();
+
+        // Build equivalent causal mask: lower-triangular = 0, upper = -inf
+        let mut mask = vec![0.0f32; seq_len * kv_len];
+        for s in 0..seq_len {
+            for kv_s in 0..kv_len {
+                if kv_s > s {
+                    mask[s * kv_len + kv_s] = f32::NEG_INFINITY;
+                }
+            }
+        }
+
+        let masked = CpuAttentionMasked;
+        let mut out_masked = vec![0.0f32; seq_len * num_heads * head_dim];
+        masked
+            .forward_with_mask(&q, &k, &v, &mut out_masked, 1, seq_len, kv_len,
+                               num_heads, num_kv_heads, head_dim, scale, &mask)
+            .unwrap();
+
+        for i in 0..out_causal.len() {
+            assert!(
+                (out_causal[i] - out_masked[i]).abs() < 1e-5,
+                "causal vs masked differ at {i}: causal={}, masked={}",
+                out_causal[i],
+                out_masked[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_masked_attention_bidirectional() {
+        // Mask with all zeros = bidirectional (no masking)
+        let head_dim = 4;
+        let seq_len = 3;
+        let kv_len = 3;
+        let num_heads = 1;
+        let num_kv_heads = 1;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0,
+                               0.0, 1.0, 0.0, 0.0,
+                               0.0, 0.0, 1.0, 0.0];
+        let k = q.clone();
+        let v: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0,
+                               5.0, 6.0, 7.0, 8.0,
+                               9.0, 10.0, 11.0, 12.0];
+
+        // All-zero mask = attend everywhere
+        let mask = vec![0.0f32; seq_len * kv_len];
+        let masked = CpuAttentionMasked;
+        let mut out = vec![0.0f32; seq_len * num_heads * head_dim];
+        masked
+            .forward_with_mask(&q, &k, &v, &mut out, 1, seq_len, kv_len,
+                               num_heads, num_kv_heads, head_dim, scale, &mask)
+            .unwrap();
+
+        // Token 0 with bidirectional mask can see all 3 tokens,
+        // causal would only see token 0. So token 0's output should reflect all V rows.
+        // With causal, out[0..4] = v[0..4] = [1,2,3,4] exactly.
+        // With bidirectional, it's a weighted mix of all V rows.
+        let causal = CpuAttentionGgml;
+        let mut out_causal = vec![0.0f32; seq_len * num_heads * head_dim];
+        causal
+            .forward(&q, &k, &v, &mut out_causal, 1, seq_len, kv_len,
+                     num_heads, num_kv_heads, head_dim, scale)
+            .unwrap();
+
+        // Token 0 should differ (bidirectional sees more tokens)
+        let diff_tok0: f32 = (0..head_dim)
+            .map(|d| (out[d] - out_causal[d]).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            diff_tok0 > 0.1,
+            "bidirectional mask should differ from causal for token 0 (diff={diff_tok0})"
+        );
+
+        // Token 2 (last) should be the same since causal already sees all tokens
+        let off = 2 * head_dim;
+        let diff_tok2: f32 = (0..head_dim)
+            .map(|d| (out[off + d] - out_causal[off + d]).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            diff_tok2 < 1e-5,
+            "last token should match causal (diff={diff_tok2})"
+        );
     }
 }
