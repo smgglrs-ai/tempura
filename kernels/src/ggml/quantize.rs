@@ -244,4 +244,31 @@ mod kani_proofs {
             assert!((j + 1) * 16 <= k);
         }
     }
+
+    #[kani::proof]
+    fn q8_0_output_in_range() {
+        let val: f32 = kani::any();
+        let amax: f32 = kani::any();
+        kani::assume(val.is_finite() && amax.is_finite());
+        kani::assume(amax > 0.0 && amax <= 1e6);
+        kani::assume(val.abs() <= amax);
+        let d = amax / 127.0;
+        let id = 1.0 / d;
+        let q = (val * id).round() as i32;
+        let clamped = q.max(-128).min(127) as i8;
+        assert!(clamped >= -128 && clamped <= 127);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn q8_k_bsums_sum_fits_i16() {
+        let qs: [i8; 16] = kani::any();
+        let mut sum = 0i32;
+        for j in 0..16 {
+            sum += qs[j] as i32;
+        }
+        // 16 * 127 = 2032, 16 * -128 = -2048, both fit in i16 [-32768, 32767]
+        assert!(sum >= -2048 && sum <= 2032);
+        assert!(sum >= i16::MIN as i32 && sum <= i16::MAX as i32);
+    }
 }

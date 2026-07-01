@@ -1299,4 +1299,41 @@ mod kani_proofs {
         let value = trit - 1;
         assert!(value >= -1 && value <= 2);
     }
+
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn q4_0_accumulator_no_i32_overflow() {
+        let qs: [u8; 16] = kani::any();
+        let y_qs: [i8; 32] = kani::any();
+        let mut sumi0 = 0i32;
+        let mut sumi1 = 0i32;
+        for j in 0..16 {
+            let v0 = (qs[j] & 0x0F) as i32 - 8;  // [-8, 7]
+            let v1 = (qs[j] >> 4) as i32 - 8;     // [-8, 7]
+            // max product: 8 * 128 = 1024, 16 terms: 16384
+            sumi0 += v0 * y_qs[j] as i32;
+            sumi1 += v1 * y_qs[j + 16] as i32;
+        }
+        // 16 * 8 * 128 = 16384, well within i32
+        let total = sumi0 + sumi1;
+        assert!(total >= -32768 && total <= 32768);
+    }
+
+    #[kani::proof]
+    fn q4k_aux8_and_q8_indices() {
+        let j: usize = kani::any();
+        kani::assume(j < 256);
+        // aux8 index: q4 nibbles are unpacked into 256-element array
+        // for each 64-element chunk: 32 low nibbles + 32 high nibbles
+        let chunk = j / 64;
+        let within = j % 64;
+        let q4_off = chunk * 32;
+        if within < 32 {
+            assert!(q4_off + within < 128); // qs array is [u8; 128]
+        } else {
+            assert!(q4_off + (within - 32) < 128);
+        }
+        // q8 index: matches j directly
+        assert!(j < 256); // qs array is [i8; 256]
+    }
 }

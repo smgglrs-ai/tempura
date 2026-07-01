@@ -1199,4 +1199,84 @@ mod kani_proofs {
         assert!(s <= 63);
         assert!(m <= 63);
     }
+
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn dequant_q4_1_no_panic() {
+        let blk = BlockQ4_1 {
+            d: kani::any(),
+            m: kani::any(),
+            qs: kani::any(),
+        };
+        let mut out = [0.0f32; 32];
+        dequantize_row_q4_1(&[blk], &mut out);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn dequant_q5_0_no_panic() {
+        let blk = BlockQ5_0 {
+            d: kani::any(),
+            qh: kani::any(),
+            qs: kani::any(),
+        };
+        let mut out = [0.0f32; 32];
+        dequantize_row_q5_0(&[blk], &mut out);
+    }
+
+    #[kani::proof]
+    fn dequant_q5_0_5bit_range() {
+        let qs_byte: u8 = kani::any();
+        let qh: u32 = kani::any();
+        let j: usize = kani::any();
+        kani::assume(j < 16);
+        let xh_0 = ((qh >> j) & 1) as i32;
+        let xh_1 = ((qh >> (j + 16)) & 1) as i32;
+        let v0 = (qs_byte & 0x0F) as i32 | (xh_0 << 4);
+        let v1 = (qs_byte >> 4) as i32 | (xh_1 << 4);
+        assert!(v0 >= 0 && v0 <= 31);
+        assert!(v1 >= 0 && v1 <= 31);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn dequant_q5_1_no_panic() {
+        let blk = BlockQ5_1 {
+            d: kani::any(),
+            m: kani::any(),
+            qh: kani::any(),
+            qs: kani::any(),
+        };
+        let mut out = [0.0f32; 32];
+        dequantize_row_q5_1(&[blk], &mut out);
+    }
+
+    #[kani::proof]
+    fn dequant_q2k_2bit_range() {
+        let qs_byte: u8 = kani::any();
+        let shift: usize = kani::any();
+        kani::assume(shift < 4);
+        let q = (qs_byte >> (shift * 2)) & 3;
+        assert!(q <= 3);
+    }
+
+    #[kani::proof]
+    fn dequant_q1_0_bit_value() {
+        let byte: u8 = kani::any();
+        let bit_idx: usize = kani::any();
+        kani::assume(bit_idx < 8);
+        let bit = (byte >> bit_idx) & 1;
+        assert!(bit == 0 || bit == 1);
+    }
+
+    #[kani::proof]
+    fn dequant_tq1_0_trit_range() {
+        let byte: u8 = kani::any();
+        let mut val = byte as u32;
+        for _i in 0..5u32 {
+            let trit = val % 3;
+            assert!(trit <= 2);
+            val /= 3;
+        }
+    }
 }

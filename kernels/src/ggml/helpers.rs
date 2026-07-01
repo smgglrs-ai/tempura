@@ -87,6 +87,58 @@ pub fn nearest_int(val: f32) -> i32 {
     bits - magic.to_bits() as i32
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn f16_to_f32_no_panic() {
+        let bits: u16 = kani::any();
+        let _ = f16_to_f32(bits);
+    }
+
+    #[kani::proof]
+    fn f16_to_f32_finite_for_normal() {
+        let bits: u16 = kani::any();
+        let exp = (bits >> 10) & 0x1f;
+        kani::assume(exp > 0 && exp < 31);
+        let result = f16_to_f32(bits);
+        assert!(result.is_finite());
+    }
+
+    #[kani::proof]
+    fn f32_to_f16_no_panic() {
+        let val: f32 = kani::any();
+        kani::assume(val.is_finite());
+        let _ = f32_to_f16(val);
+    }
+
+    #[kani::proof]
+    fn get_scale_min_k4_no_oob() {
+        let j: usize = kani::any();
+        kani::assume(j < 8);
+        let scales: [u8; 12] = kani::any();
+        let (s, m) = get_scale_min_k4(j, &scales);
+        assert!(s <= 63);
+        assert!(m <= 63);
+    }
+
+    #[kani::proof]
+    fn nearest_int_no_panic() {
+        let val: f32 = kani::any();
+        kani::assume(val.is_finite());
+        kani::assume(val.abs() < 4194303.0);
+        kani::assume(val <= 4194303.0);
+        let _ = nearest_int(val);
+    }
+
+    #[kani::proof]
+    fn bf16_to_f32_no_panic() {
+        let bits: u16 = kani::any();
+        let _ = bf16_to_f32(bits);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

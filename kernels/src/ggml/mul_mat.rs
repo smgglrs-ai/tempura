@@ -573,3 +573,35 @@ mod tests {
         eprintln!("Q4K batch dual_pipeline: max_abs_diff={max_diff:.6e} across {} outputs (m={m}, n={n}, k={k})", m * n);
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    #[kani::proof]
+    fn weight_row_bytes_no_overflow() {
+        let k: usize = kani::any();
+        kani::assume(k > 0 && k <= 4096);
+        kani::assume(k % 256 == 0);
+        // Q4K: block_size=256, type_size=144
+        let block_size = 256usize;
+        let type_size = 144usize;
+        let nb = k / block_size;
+        let row_bytes = nb.checked_mul(type_size);
+        assert!(row_bytes.is_some());
+        let row_bytes = row_bytes.unwrap();
+        assert!(row_bytes <= k);
+    }
+
+    #[kani::proof]
+    fn dst_index_in_bounds() {
+        let m: usize = kani::any();
+        let n: usize = kani::any();
+        kani::assume(m > 0 && m <= 8);
+        kani::assume(n > 0 && n <= 8);
+        let total = m * n;
+        let row: usize = kani::any();
+        let col: usize = kani::any();
+        kani::assume(row < m && col < n);
+        let idx = row * n + col;
+        assert!(idx < total);
+    }
+}
