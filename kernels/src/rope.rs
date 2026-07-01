@@ -183,8 +183,8 @@ pub enum RoPEMode {
 
 /// Unified RoPE matching ggml's algorithm for both Normal and NeoX modes.
 ///
-/// Supports partial n_dims: only the first `n_dims` dimensions of each head
-/// are rotated; the rest are copied unchanged (passthrough).
+/// Supports partial n_dims, per-dimension freq_factors (LLaMA 3.1),
+/// linear frequency scaling, and YaRN context extension.
 ///
 /// Uses multiplicative theta accumulation: theta_scale = freq_base^(-2/n_dims),
 /// theta starts at `position`, then theta *= theta_scale each step.
@@ -192,8 +192,40 @@ pub enum RoPEMode {
 pub struct CpuRoPEUnified {
     pub mode: RoPEMode,
     /// Number of dimensions to rotate (must be even, <= head_dim).
-    /// When equal to head_dim, all dimensions are rotated (no passthrough).
     pub n_dims: usize,
+    /// Per-dimension frequency factors (one per dimension pair).
+    /// When set, each dimension's theta is divided by freq_factors[i].
+    /// Used by LLaMA 3.1 for extended context.
+    pub freq_factors: Option<Vec<f32>>,
+    /// Global frequency scale (default 1.0). Simple linear scaling.
+    pub freq_scale: f32,
+    /// YaRN extrapolation factor (0.0 = disabled).
+    pub ext_factor: f32,
+    /// YaRN attention scaling factor (default 1.0).
+    pub attn_factor: f32,
+    /// YaRN fast beta (default 32.0).
+    pub beta_fast: f32,
+    /// YaRN slow beta (default 1.0).
+    pub beta_slow: f32,
+    /// Original context length before extension.
+    pub original_max_position: usize,
+}
+
+#[cfg(feature = "cpu")]
+impl CpuRoPEUnified {
+    pub fn new(mode: RoPEMode, n_dims: usize) -> Self {
+        Self {
+            mode,
+            n_dims,
+            freq_factors: None,
+            freq_scale: 1.0,
+            ext_factor: 0.0,
+            attn_factor: 1.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            original_max_position: 4096,
+        }
+    }
 }
 
 #[cfg(feature = "cpu")]
@@ -217,19 +249,52 @@ impl RoPE for CpuRoPEUnified {
         debug_assert!(n_dims % 2 == 0);
 
         let theta_scale: f32 = freq_base.powf(-2.0 / n_dims as f32);
+        let half_n = n_dims / 2;
+
+        // YaRN correction dimensions (precomputed, independent of position)
+        let corr_dims = if self.ext_factor != 0.0 {
+            yarn_corr_dims(
+                n_dims,
+                self.original_max_position,
+                freq_base,
+                self.beta_fast,
+                self.beta_slow,
+            )
+        } else {
+            [0.0, 0.0]
+        };
 
         for s in 0..seq_len {
             let p = positions[s] as f32;
 
-            // Build cos/sin cache with multiplicative theta accumulation
-            // ggml: theta = p; for i0 in (0..n_dims).step_by(2) { cos[i0]=cos(theta); sin[i0]=sin(theta); theta *= theta_scale; }
             let mut theta: f32 = p;
-            let half_n = n_dims / 2;
             let mut cos_cache = vec![0.0f32; half_n];
             let mut sin_cache = vec![0.0f32; half_n];
             for i in 0..half_n {
-                cos_cache[i] = theta.cos();
-                sin_cache[i] = theta.sin();
+                let ff = self
+                    .freq_factors
+                    .as_ref()
+                    .map_or(1.0, |ff| ff[i]);
+                let theta_extrap = theta / ff;
+
+                let (cos_val, sin_val) = if self.ext_factor != 0.0 {
+                    rope_yarn(
+                        theta_extrap,
+                        self.freq_scale,
+                        &corr_dims,
+                        i * 2,
+                        self.ext_factor,
+                        self.attn_factor,
+                    )
+                } else if self.freq_scale != 1.0 {
+                    let scaled = self.freq_scale * theta_extrap;
+                    (scaled.cos(), scaled.sin())
+                } else {
+                    (theta_extrap.cos(), theta_extrap.sin())
+                };
+
+                cos_cache[i] = cos_val;
+                sin_cache[i] = sin_val;
                 theta *= theta_scale;
             }
 
@@ -238,10 +303,6 @@ impl RoPE for CpuRoPEUnified {
 
                 match self.mode {
                     RoPEMode::Normal => {
-                        // Adjacent pairs: (x[i0], x[i0+1]) for i0=0,2,4,...
-                        // ggml rotate_pairs with scale=1, n_offset=1:
-                        //   ic = i0/1 = i0, so src = src_data + i0
-                        //   pairs: (src[0], src[1]) = (x[i0], x[i0+1])
                         for i in 0..half_n {
                             let i0 = i * 2;
                             let cos_val = cos_cache[i];
@@ -253,10 +314,6 @@ impl RoPE for CpuRoPEUnified {
                         }
                     }
                     RoPEMode::NeoX => {
-                        // Split-half pairs: (x[i], x[i + n_dims/2])
-                        // ggml rotate_pairs with scale=2, n_offset=n_dims/2:
-                        //   ic = i0/2, so src = src_data + i0/2
-                        //   pairs: (src[0], src[n_dims/2]) = (x[i0/2], x[i0/2 + n_dims/2])
                         for i in 0..half_n {
                             let cos_val = cos_cache[i];
                             let sin_val = sin_cache[i];
@@ -267,12 +324,54 @@ impl RoPE for CpuRoPEUnified {
                         }
                     }
                 }
-                // Passthrough: dimensions n_dims..head_dim are left unchanged (already in x)
             }
         }
 
         Ok(())
     }
+}
+
+/// YaRN ramp function: linear interpolation between low and high correction dims.
+/// Returns 1.0 when i0/2 < low, 0.0 when i0/2 > high, linear ramp between.
+fn yarn_ramp(low: f32, high: f32, i0: i64) -> f32 {
+    let y = (i0 as f32 / 2.0 - low) / (high - low).max(0.001);
+    1.0 - y.clamp(0.0, 1.0)
+}
+
+/// YaRN: interpolate between scaled and extrapolated theta, apply magnitude correction.
+/// Matches ggml rope_yarn().
+fn rope_yarn(
+    theta_extrap: f32,
+    freq_scale: f32,
+    corr_dims: &[f32; 2],
+    i0: usize,
+    ext_factor: f32,
+    mscale: f32,
+) -> (f32, f32) {
+    let theta_interp = freq_scale * theta_extrap;
+    let ramp_mix = yarn_ramp(corr_dims[0], corr_dims[1], i0 as i64) * ext_factor;
+    let theta = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix;
+    let mscale = mscale * (1.0 + 0.1 * (1.0 / freq_scale).ln());
+    (theta.cos() * mscale, theta.sin() * mscale)
+}
+
+/// Compute YaRN correction dimensions from model parameters.
+/// Matches ggml ggml_rope_yarn_corr_dims().
+fn yarn_corr_dim(n_dims: usize, n_ctx_orig: usize, n_rot: f32, base: f32) -> f32 {
+    n_dims as f32 * (n_ctx_orig as f32 / (n_rot * 2.0 * std::f32::consts::PI)).ln()
+        / (2.0 * base.ln())
+}
+
+fn yarn_corr_dims(
+    n_dims: usize,
+    n_ctx_orig: usize,
+    freq_base: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> [f32; 2] {
+    let start = yarn_corr_dim(n_dims, n_ctx_orig, beta_fast, freq_base).floor();
+    let end = yarn_corr_dim(n_dims, n_ctx_orig, beta_slow, freq_base).ceil();
+    [start.max(0.0), end.min(n_dims as f32 - 1.0)]
 }
 
 #[cfg(feature = "cuda")]
@@ -572,7 +671,7 @@ mod tests {
     #[test]
     fn test_unified_normal_matches_ggml() {
         let ggml = CpuRoPEGgml;
-        let unified = CpuRoPEUnified { mode: RoPEMode::Normal, n_dims: 16 };
+        let unified = CpuRoPEUnified::new(RoPEMode::Normal, 16);
         let head_dim = 16;
         let seq_len = 4;
         let num_heads = 4;
@@ -601,7 +700,7 @@ mod tests {
     #[test]
     fn test_unified_neox_matches_cpurope() {
         let neox = CpuRoPE;
-        let unified = CpuRoPEUnified { mode: RoPEMode::NeoX, n_dims: 16 };
+        let unified = CpuRoPEUnified::new(RoPEMode::NeoX, 16);
         let head_dim = 16;
         let seq_len = 4;
         let num_heads = 4;
@@ -631,7 +730,7 @@ mod tests {
     fn test_unified_partial_n_dims_passthrough() {
         let head_dim = 8;
         let n_dims = 4; // only rotate first 4 of 8 dims
-        let unified = CpuRoPEUnified { mode: RoPEMode::NeoX, n_dims };
+        let unified = CpuRoPEUnified::new(RoPEMode::NeoX, n_dims);
 
         let original = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let mut x = original.clone();
@@ -657,7 +756,7 @@ mod tests {
     fn test_unified_partial_n_dims_normal_passthrough() {
         let head_dim = 8;
         let n_dims = 4;
-        let unified = CpuRoPEUnified { mode: RoPEMode::Normal, n_dims };
+        let unified = CpuRoPEUnified::new(RoPEMode::Normal, n_dims);
 
         let original = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let mut x = original.clone();
@@ -675,7 +774,7 @@ mod tests {
     #[test]
     fn test_unified_position_zero_identity() {
         for mode in [RoPEMode::Normal, RoPEMode::NeoX] {
-            let unified = CpuRoPEUnified { mode, n_dims: 8 };
+            let unified = CpuRoPEUnified::new(mode, 8);
             let head_dim = 8;
             let original = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
             let mut x = original.clone();
@@ -693,7 +792,7 @@ mod tests {
 
     #[test]
     fn test_unified_position_zero_identity_with_passthrough() {
-        let unified = CpuRoPEUnified { mode: RoPEMode::NeoX, n_dims: 4 };
+        let unified = CpuRoPEUnified::new(RoPEMode::NeoX, 4);
         let head_dim = 8;
         let original = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let mut x = original.clone();
@@ -706,6 +805,150 @@ mod tests {
                 "Position-zero+passthrough identity failed at {i}: got {a}, expected {b}"
             );
         }
+    }
+
+    #[test]
+    fn test_unified_freq_factors_none_regression() {
+        // freq_factors=None should produce identical results to the basic constructor
+        let base = CpuRoPEUnified::new(RoPEMode::Normal, 16);
+        let mut with_none = CpuRoPEUnified::new(RoPEMode::Normal, 16);
+        with_none.freq_factors = None;
+
+        let head_dim = 16;
+        let seq_len = 4;
+        let num_heads = 2;
+        let freq_base = 10000.0f32;
+        let n = seq_len * num_heads * head_dim;
+
+        let x_orig: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 + 0.5).collect();
+        let positions: Vec<u32> = (0..seq_len as u32).collect();
+
+        let mut x_base = x_orig.clone();
+        base.forward(&mut x_base, 1, seq_len, num_heads, head_dim, &positions, freq_base).unwrap();
+
+        let mut x_none = x_orig.clone();
+        with_none.forward(&mut x_none, 1, seq_len, num_heads, head_dim, &positions, freq_base).unwrap();
+
+        for i in 0..n {
+            assert_eq!(x_base[i], x_none[i], "freq_factors=None diverged at {i}");
+        }
+    }
+
+    #[test]
+    fn test_unified_freq_factors_all_ones_is_identity() {
+        // freq_factors all 1.0 should produce same result as no freq_factors
+        let base = CpuRoPEUnified::new(RoPEMode::NeoX, 8);
+        let mut with_ones = CpuRoPEUnified::new(RoPEMode::NeoX, 8);
+        with_ones.freq_factors = Some(vec![1.0; 4]); // 8/2 = 4 pairs
+
+        let head_dim = 8;
+        let x_orig: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let positions = vec![5u32];
+
+        let mut x_base = x_orig.clone();
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+
+        let mut x_ones = x_orig.clone();
+        with_ones.forward(&mut x_ones, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+
+        for i in 0..head_dim {
+            assert!(
+                (x_base[i] - x_ones[i]).abs() < 1e-6,
+                "freq_factors=[1.0] diverged at {i}: base={}, ones={}",
+                x_base[i], x_ones[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_unified_freq_factors_changes_output() {
+        let mut rope = CpuRoPEUnified::new(RoPEMode::Normal, 8);
+        rope.freq_factors = Some(vec![2.0, 0.5, 1.0, 3.0]); // 4 pairs
+
+        let head_dim = 8;
+        let x_orig: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let positions = vec![3u32];
+
+        let mut x_ff = x_orig.clone();
+        rope.forward(&mut x_ff, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+
+        let base = CpuRoPEUnified::new(RoPEMode::Normal, 8);
+        let mut x_base = x_orig.clone();
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+
+        let any_diff = (0..head_dim).any(|i| (x_ff[i] - x_base[i]).abs() > 1e-6);
+        assert!(any_diff, "freq_factors should change the output");
+    }
+
+    #[test]
+    fn test_unified_freq_scale() {
+        let mut rope = CpuRoPEUnified::new(RoPEMode::Normal, 8);
+        rope.freq_scale = 0.5;
+
+        let head_dim = 8;
+        let x_orig: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let positions = vec![4u32];
+
+        let mut x_scaled = x_orig.clone();
+        rope.forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+
+        let base = CpuRoPEUnified::new(RoPEMode::Normal, 8);
+        let mut x_base = x_orig.clone();
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+
+        let any_diff = (0..head_dim).any(|i| (x_scaled[i] - x_base[i]).abs() > 1e-6);
+        assert!(any_diff, "freq_scale=0.5 should change the output");
+    }
+
+    #[test]
+    fn test_unified_yarn_ext_factor_changes_output() {
+        let mut rope = CpuRoPEUnified::new(RoPEMode::Normal, 16);
+        rope.ext_factor = 1.0;
+        rope.freq_scale = 0.25; // 4x context extension
+        rope.original_max_position = 4096;
+
+        let head_dim = 16;
+        let x_orig: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let positions = vec![100u32];
+
+        let mut x_yarn = x_orig.clone();
+        rope.forward(&mut x_yarn, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+
+        let base = CpuRoPEUnified::new(RoPEMode::Normal, 16);
+        let mut x_base = x_orig.clone();
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+
+        let any_diff = (0..head_dim).any(|i| (x_yarn[i] - x_base[i]).abs() > 1e-6);
+        assert!(any_diff, "YaRN with ext_factor=1 should change output");
+    }
+
+    #[test]
+    fn test_unified_yarn_preserves_l2_direction() {
+        // YaRN with attn_factor applies magnitude scaling, so L2 norm will change,
+        // but the output should still be finite and non-zero
+        let mut rope = CpuRoPEUnified::new(RoPEMode::NeoX, 8);
+        rope.ext_factor = 1.0;
+        rope.freq_scale = 0.5;
+        rope.original_max_position = 2048;
+
+        let head_dim = 8;
+        let x_orig: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let positions = vec![50u32];
+
+        let mut x = x_orig.clone();
+        rope.forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+
+        let l2: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(l2.is_finite(), "YaRN output should be finite");
+        assert!(l2 > 0.0, "YaRN output should be non-zero");
+    }
+
+    #[test]
+    fn test_yarn_corr_dims_basic() {
+        let dims = super::yarn_corr_dims(128, 4096, 10000.0, 32.0, 1.0);
+        assert!(dims[0] >= 0.0);
+        assert!(dims[1] >= dims[0]);
+        assert!(dims[1] <= 127.0);
     }
 
     mod prop_tests {

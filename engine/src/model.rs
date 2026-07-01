@@ -489,12 +489,16 @@ where
                 None
             };
 
+        let rope_mode = match cfg.rope_type {
+            crate::config::RopeType::Norm => tempura_kernels::rope::RoPEMode::Normal,
+            crate::config::RopeType::Neox => tempura_kernels::rope::RoPEMode::NeoX,
+        };
         let det_rope: Option<Box<dyn tempura_kernels::RoPE>> =
-            if cfg.rope_type == crate::config::RopeType::Norm {
-                Some(Box::new(tempura_kernels::rope::CpuRoPEGgml))
-            } else if std::env::var("TEMPURA_DETERMINISTIC").is_ok() {
-                Some(Box::new(tempura_kernels::rope::CpuRoPETable::new(
-                    cfg.max_seq_len, head_dim, cfg.rope_theta,
+            if cfg.rope_type == crate::config::RopeType::Norm
+                || std::env::var("TEMPURA_DETERMINISTIC").is_ok()
+            {
+                Some(Box::new(tempura_kernels::rope::CpuRoPEUnified::new(
+                    rope_mode, head_dim,
                 )))
             } else {
                 None
