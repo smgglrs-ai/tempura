@@ -172,6 +172,109 @@ pub fn build_cos_sin_table(max_pos: usize, head_dim: usize, theta: f32) -> Vec<f
     table
 }
 
+/// Rotation mode for RoPE — determines how dimension pairs are formed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoPEMode {
+    /// Adjacent pairs: (x[0],x[1]), (x[2],x[3]), ...
+    Normal,
+    /// Split-half pairs: (x[0],x[n/2]), (x[1],x[n/2+1]), ...
+    NeoX,
+}
+
+/// Unified RoPE matching ggml's algorithm for both Normal and NeoX modes.
+///
+/// Supports partial n_dims: only the first `n_dims` dimensions of each head
+/// are rotated; the rest are copied unchanged (passthrough).
+///
+/// Uses multiplicative theta accumulation: theta_scale = freq_base^(-2/n_dims),
+/// theta starts at `position`, then theta *= theta_scale each step.
+#[cfg(feature = "cpu")]
+pub struct CpuRoPEUnified {
+    pub mode: RoPEMode,
+    /// Number of dimensions to rotate (must be even, <= head_dim).
+    /// When equal to head_dim, all dimensions are rotated (no passthrough).
+    pub n_dims: usize,
+}
+
+#[cfg(feature = "cpu")]
+impl RoPE for CpuRoPEUnified {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Tested
+    }
+
+    fn forward(
+        &self,
+        x: &mut [f32],
+        _batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        positions: &[u32],
+        freq_base: f32,
+    ) -> Result<()> {
+        let n_dims = self.n_dims;
+        debug_assert!(n_dims <= head_dim);
+        debug_assert!(n_dims % 2 == 0);
+
+        let theta_scale: f32 = freq_base.powf(-2.0 / n_dims as f32);
+
+        for s in 0..seq_len {
+            let p = positions[s] as f32;
+
+            // Build cos/sin cache with multiplicative theta accumulation
+            // ggml: theta = p; for i0 in (0..n_dims).step_by(2) { cos[i0]=cos(theta); sin[i0]=sin(theta); theta *= theta_scale; }
+            let mut theta: f32 = p;
+            let half_n = n_dims / 2;
+            let mut cos_cache = vec![0.0f32; half_n];
+            let mut sin_cache = vec![0.0f32; half_n];
+            for i in 0..half_n {
+                cos_cache[i] = theta.cos();
+                sin_cache[i] = theta.sin();
+                theta *= theta_scale;
+            }
+
+            for h in 0..num_heads {
+                let offset = (s * num_heads + h) * head_dim;
+
+                match self.mode {
+                    RoPEMode::Normal => {
+                        // Adjacent pairs: (x[i0], x[i0+1]) for i0=0,2,4,...
+                        // ggml rotate_pairs with scale=1, n_offset=1:
+                        //   ic = i0/1 = i0, so src = src_data + i0
+                        //   pairs: (src[0], src[1]) = (x[i0], x[i0+1])
+                        for i in 0..half_n {
+                            let i0 = i * 2;
+                            let cos_val = cos_cache[i];
+                            let sin_val = sin_cache[i];
+                            let x0 = x[offset + i0];
+                            let x1 = x[offset + i0 + 1];
+                            x[offset + i0] = x0 * cos_val - x1 * sin_val;
+                            x[offset + i0 + 1] = x0 * sin_val + x1 * cos_val;
+                        }
+                    }
+                    RoPEMode::NeoX => {
+                        // Split-half pairs: (x[i], x[i + n_dims/2])
+                        // ggml rotate_pairs with scale=2, n_offset=n_dims/2:
+                        //   ic = i0/2, so src = src_data + i0/2
+                        //   pairs: (src[0], src[n_dims/2]) = (x[i0/2], x[i0/2 + n_dims/2])
+                        for i in 0..half_n {
+                            let cos_val = cos_cache[i];
+                            let sin_val = sin_cache[i];
+                            let x0 = x[offset + i];
+                            let x1 = x[offset + i + half_n];
+                            x[offset + i] = x0 * cos_val - x1 * sin_val;
+                            x[offset + i + half_n] = x0 * sin_val + x1 * cos_val;
+                        }
+                    }
+                }
+                // Passthrough: dimensions n_dims..head_dim are left unchanged (already in x)
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub struct CudaRoPE {
     gpu: crate::gpu::GpuContext,
@@ -463,6 +566,145 @@ mod tests {
         // at position 0, cos=1 sin=0, so output should equal input
         for (a, b) in x.iter().zip(original.iter()) {
             assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_unified_normal_matches_ggml() {
+        let ggml = CpuRoPEGgml;
+        let unified = CpuRoPEUnified { mode: RoPEMode::Normal, n_dims: 16 };
+        let head_dim = 16;
+        let seq_len = 4;
+        let num_heads = 4;
+        let freq_base = 10000.0f32;
+        let n = seq_len * num_heads * head_dim;
+
+        let x_orig: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 + 0.5).collect();
+        let positions: Vec<u32> = (0..seq_len as u32).collect();
+
+        let mut x_ggml = x_orig.clone();
+        ggml.forward(&mut x_ggml, 1, seq_len, num_heads, head_dim, &positions, freq_base).unwrap();
+
+        let mut x_unified = x_orig.clone();
+        unified.forward(&mut x_unified, 1, seq_len, num_heads, head_dim, &positions, freq_base).unwrap();
+
+        for i in 0..n {
+            let diff = (x_ggml[i] - x_unified[i]).abs();
+            assert!(
+                diff < 1e-5,
+                "Normal mode: unified vs ggml mismatch at {i}: ggml={}, unified={}, diff={diff}",
+                x_ggml[i], x_unified[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_unified_neox_matches_cpurope() {
+        let neox = CpuRoPE;
+        let unified = CpuRoPEUnified { mode: RoPEMode::NeoX, n_dims: 16 };
+        let head_dim = 16;
+        let seq_len = 4;
+        let num_heads = 4;
+        let freq_base = 10000.0f32;
+        let n = seq_len * num_heads * head_dim;
+
+        let x_orig: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 + 0.5).collect();
+        let positions: Vec<u32> = (0..seq_len as u32).collect();
+
+        let mut x_neox = x_orig.clone();
+        neox.forward(&mut x_neox, 1, seq_len, num_heads, head_dim, &positions, freq_base).unwrap();
+
+        let mut x_unified = x_orig.clone();
+        unified.forward(&mut x_unified, 1, seq_len, num_heads, head_dim, &positions, freq_base).unwrap();
+
+        for i in 0..n {
+            let diff = (x_neox[i] - x_unified[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "NeoX mode: unified vs CpuRoPE mismatch at {i}: neox={}, unified={}, diff={diff}",
+                x_neox[i], x_unified[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_unified_partial_n_dims_passthrough() {
+        let head_dim = 8;
+        let n_dims = 4; // only rotate first 4 of 8 dims
+        let unified = CpuRoPEUnified { mode: RoPEMode::NeoX, n_dims };
+
+        let original = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut x = original.clone();
+        let positions = vec![3u32]; // non-zero position to actually rotate
+
+        unified.forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+
+        // Dimensions n_dims..head_dim should be unchanged
+        for i in n_dims..head_dim {
+            assert_eq!(
+                x[i], original[i],
+                "Passthrough dimension {i} was modified: expected {}, got {}",
+                original[i], x[i]
+            );
+        }
+
+        // Rotated dimensions should differ (position != 0)
+        let rotated_changed = (0..n_dims).any(|i| (x[i] - original[i]).abs() > 1e-6);
+        assert!(rotated_changed, "Rotated dimensions should change at non-zero position");
+    }
+
+    #[test]
+    fn test_unified_partial_n_dims_normal_passthrough() {
+        let head_dim = 8;
+        let n_dims = 4;
+        let unified = CpuRoPEUnified { mode: RoPEMode::Normal, n_dims };
+
+        let original = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut x = original.clone();
+        let positions = vec![5u32];
+
+        unified.forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+
+        for i in n_dims..head_dim {
+            assert_eq!(x[i], original[i], "Passthrough dim {i} modified");
+        }
+        let rotated_changed = (0..n_dims).any(|i| (x[i] - original[i]).abs() > 1e-6);
+        assert!(rotated_changed, "Rotated dimensions should change at non-zero position");
+    }
+
+    #[test]
+    fn test_unified_position_zero_identity() {
+        for mode in [RoPEMode::Normal, RoPEMode::NeoX] {
+            let unified = CpuRoPEUnified { mode, n_dims: 8 };
+            let head_dim = 8;
+            let original = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+            let mut x = original.clone();
+
+            unified.forward(&mut x, 1, 1, 1, head_dim, &[0], 10000.0).unwrap();
+
+            for (i, (a, b)) in x.iter().zip(original.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "Position-zero identity failed for {mode:?} at {i}: got {a}, expected {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_unified_position_zero_identity_with_passthrough() {
+        let unified = CpuRoPEUnified { mode: RoPEMode::NeoX, n_dims: 4 };
+        let head_dim = 8;
+        let original = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut x = original.clone();
+
+        unified.forward(&mut x, 1, 1, 1, head_dim, &[0], 10000.0).unwrap();
+
+        for (i, (a, b)) in x.iter().zip(original.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "Position-zero+passthrough identity failed at {i}: got {a}, expected {b}"
+            );
         }
     }
 
