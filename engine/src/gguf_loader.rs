@@ -460,7 +460,12 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
     let hidden_act = if is_bitnet {
         crate::config::HiddenAct::SquaredRelu
     } else {
-        crate::config::HiddenAct::SiluGate
+        match arch {
+            "gpt2" | "gptj" | "gptneox" | "starcoder" | "refact" => crate::config::HiddenAct::Gelu,
+            "gemma" | "gemma2" | "gemma3" => crate::config::HiddenAct::GeGLU,
+            "falcon" | "mpt" => crate::config::HiddenAct::Gelu,
+            _ => crate::config::HiddenAct::SiluGate,
+        }
     };
 
     // BitNet GGUF converter (convert-hf-to-gguf-bitnet.py) does NOT permute Q/K
@@ -470,8 +475,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
     // layout determines which RoPE to use.
     let rope_type = crate::config::RopeType::Neox;
 
-    let n_experts = get_usize("expert_count").unwrap_or(0);
-    let n_experts_used = get_usize("expert_used_count").unwrap_or(0);
+    let architecture = crate::config::Architecture::from_gguf_name(arch);
 
     Ok(ModelConfig {
         hidden_size,
@@ -490,8 +494,9 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         sliding_window: None,
         hidden_act,
         rope_type,
-        n_experts,
-        n_experts_used,
+        architecture,
+        n_experts: get_usize("expert_count").unwrap_or(0),
+        n_experts_used: get_usize("expert_used_count").unwrap_or(0),
     })
 }
 
@@ -1231,5 +1236,100 @@ mod tests {
         tempura_kernels::ggml::dequantize::dequantize_row(&block, &mut result, tempura_kernels::ggml::GgmlType::Q5_1, 32);
         assert_eq!(result.len(), 32);
         assert!((result[0] - 7.5).abs() < 1e-3, "got {}", result[0]);
+    }
+
+    fn string_metadata_bytes(s: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+        buf
+    }
+
+    #[test]
+    fn test_gguf_architecture_detection_gpt2() {
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let tensor_bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let arch_bytes = string_metadata_bytes("gpt2");
+        let hs = u32_metadata_bytes(64);
+        let is = u32_metadata_bytes(128);
+        let hc = u32_metadata_bytes(4);
+        let hckv = u32_metadata_bytes(4);
+        let bc = u32_metadata_bytes(2);
+
+        let metadata: Vec<(&str, u32, &[u8])> = vec![
+            ("general.architecture", 8, &arch_bytes),
+            ("gpt2.embedding_length", 4, &hs),
+            ("gpt2.feed_forward_length", 4, &is),
+            ("gpt2.attention.head_count", 4, &hc),
+            ("gpt2.attention.head_count_kv", 4, &hckv),
+            ("gpt2.block_count", 4, &bc),
+        ];
+
+        let tensor_infos = vec![("token_embd.weight", [4u64].as_slice(), 0u32, 0u64)];
+
+        let data = build_minimal_gguf(&metadata, &tensor_infos, &tensor_bytes);
+        let loader = GgufLoader::from_bytes(&data).unwrap();
+
+        assert_eq!(loader.config.architecture, crate::config::Architecture::Gpt2);
+        assert_eq!(loader.config.hidden_act, crate::config::HiddenAct::Gelu);
+    }
+
+    #[test]
+    fn test_gguf_architecture_detection_gemma() {
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let tensor_bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let arch_bytes = string_metadata_bytes("gemma");
+        let hs = u32_metadata_bytes(64);
+        let is = u32_metadata_bytes(128);
+        let hc = u32_metadata_bytes(4);
+        let hckv = u32_metadata_bytes(4);
+        let bc = u32_metadata_bytes(2);
+
+        let metadata: Vec<(&str, u32, &[u8])> = vec![
+            ("general.architecture", 8, &arch_bytes),
+            ("gemma.embedding_length", 4, &hs),
+            ("gemma.feed_forward_length", 4, &is),
+            ("gemma.attention.head_count", 4, &hc),
+            ("gemma.attention.head_count_kv", 4, &hckv),
+            ("gemma.block_count", 4, &bc),
+        ];
+
+        let tensor_infos = vec![("token_embd.weight", [4u64].as_slice(), 0u32, 0u64)];
+
+        let data = build_minimal_gguf(&metadata, &tensor_infos, &tensor_bytes);
+        let loader = GgufLoader::from_bytes(&data).unwrap();
+
+        assert_eq!(loader.config.architecture, crate::config::Architecture::Gemma);
+        assert_eq!(loader.config.hidden_act, crate::config::HiddenAct::GeGLU);
+    }
+
+    #[test]
+    fn test_gguf_architecture_default_llama() {
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let tensor_bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let hs = u32_metadata_bytes(64);
+        let is = u32_metadata_bytes(128);
+        let hc = u32_metadata_bytes(4);
+        let hckv = u32_metadata_bytes(4);
+        let bc = u32_metadata_bytes(2);
+
+        let metadata: Vec<(&str, u32, &[u8])> = vec![
+            ("llama.embedding_length", 4, &hs),
+            ("llama.feed_forward_length", 4, &is),
+            ("llama.attention.head_count", 4, &hc),
+            ("llama.attention.head_count_kv", 4, &hckv),
+            ("llama.block_count", 4, &bc),
+        ];
+
+        let tensor_infos = vec![("token_embd.weight", [4u64].as_slice(), 0u32, 0u64)];
+
+        let data = build_minimal_gguf(&metadata, &tensor_infos, &tensor_bytes);
+        let loader = GgufLoader::from_bytes(&data).unwrap();
+
+        assert_eq!(loader.config.architecture, crate::config::Architecture::Llama);
+        assert_eq!(loader.config.hidden_act, crate::config::HiddenAct::SiluGate);
     }
 }

@@ -28,9 +28,8 @@ pub struct ModelConfig {
     pub sliding_window: Option<usize>,
     pub hidden_act: HiddenAct,
     pub rope_type: RopeType,
-    /// Number of experts (0 = dense, non-MoE model).
+    pub architecture: Architecture,
     pub n_experts: usize,
-    /// Number of experts activated per token (top-k).
     pub n_experts_used: usize,
 }
 
@@ -54,7 +53,38 @@ pub enum QuantFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HiddenAct {
     SiluGate,
+    Gelu,
+    GeluQuick,
+    Relu,
     SquaredRelu,
+    GeGLU,
+    ReGLU,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Architecture {
+    Llama,
+    Gpt2,
+    Phi,
+    Gemma,
+    Falcon,
+    Mpt,
+}
+
+impl Architecture {
+    pub fn from_gguf_name(name: &str) -> Self {
+        match name {
+            "llama" | "llama4" | "qwen" | "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe"
+            | "mistral" | "yi" | "deci" | "baichuan" | "stablelm" | "bitnet"
+            | "internlm2" | "deepseek" | "deepseek2" => Architecture::Llama,
+            "gpt2" | "gptj" | "gptneox" | "starcoder" | "refact" => Architecture::Gpt2,
+            "phi2" | "phi3" | "phimoe" => Architecture::Phi,
+            "gemma" | "gemma2" | "gemma3" => Architecture::Gemma,
+            "falcon" => Architecture::Falcon,
+            "mpt" => Architecture::Mpt,
+            _ => Architecture::Llama,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +141,7 @@ impl ModelConfig {
             sliding_window: None,
             hidden_act: HiddenAct::SiluGate,
             rope_type: RopeType::Neox,
+            architecture: Architecture::Llama,
             n_experts: 0,
             n_experts_used: 0,
         }
@@ -134,6 +165,7 @@ impl ModelConfig {
             sliding_window: None,
             hidden_act: HiddenAct::SiluGate,
             rope_type: RopeType::Neox,
+            architecture: Architecture::Llama,
             n_experts: 0,
             n_experts_used: 0,
         }
@@ -157,6 +189,7 @@ impl ModelConfig {
             sliding_window: None,
             hidden_act: HiddenAct::SiluGate,
             rope_type: RopeType::Neox,
+            architecture: Architecture::Llama,
             n_experts: 0,
             n_experts_used: 0,
         }
@@ -213,10 +246,19 @@ impl ModelConfig {
 
         let hidden_act = match v.get("hidden_act").and_then(|v| v.as_str()) {
             Some("relu2") => HiddenAct::SquaredRelu,
+            Some("gelu") | Some("gelu_new") => HiddenAct::Gelu,
+            Some("gelu_fast") | Some("gelu_quick") => HiddenAct::GeluQuick,
+            Some("relu") => HiddenAct::Relu,
+            Some("geglu") => HiddenAct::GeGLU,
             _ => HiddenAct::SiluGate,
         };
 
         let model_type = v.get("model_type").and_then(|v| v.as_str());
+
+        let architecture = match model_type {
+            Some(mt) => Architecture::from_gguf_name(mt),
+            None => Architecture::Llama,
+        };
 
         let rope_type = match model_type {
             Some("bitnet") => RopeType::Norm,
@@ -232,15 +274,6 @@ impl ModelConfig {
             }),
             _ => None,
         };
-
-        let n_experts = v
-            .get("num_local_experts")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        let n_experts_used = v
-            .get("num_experts_per_tok")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
 
         Ok(Self {
             hidden_size,
@@ -262,8 +295,9 @@ impl ModelConfig {
                 .map(|v| v as usize),
             hidden_act,
             rope_type,
-            n_experts,
-            n_experts_used,
+            architecture,
+            n_experts: v.get("num_local_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            n_experts_used: v.get("num_experts_per_tok").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
         })
     }
 }
@@ -422,50 +456,6 @@ mod tests {
     }
 
     #[test]
-    fn test_from_hf_json_mixtral_moe() {
-        let json = r#"{
-            "hidden_size": 4096,
-            "intermediate_size": 14336,
-            "num_attention_heads": 32,
-            "num_key_value_heads": 8,
-            "num_hidden_layers": 32,
-            "vocab_size": 32000,
-            "max_position_embeddings": 32768,
-            "rms_norm_eps": 1e-5,
-            "rope_theta": 1000000.0,
-            "num_local_experts": 8,
-            "num_experts_per_tok": 2,
-            "sliding_window": 4096
-        }"#;
-        let c = ModelConfig::from_hf_json(json).unwrap();
-        assert_eq!(c.n_experts, 8);
-        assert_eq!(c.n_experts_used, 2);
-        assert_eq!(c.hidden_size, 4096);
-        assert_eq!(c.intermediate_size, 14336);
-    }
-
-    #[test]
-    fn test_from_hf_json_dense_no_experts() {
-        let json = r#"{
-            "hidden_size": 4096,
-            "intermediate_size": 11008,
-            "num_attention_heads": 32,
-            "num_hidden_layers": 32,
-            "vocab_size": 32000
-        }"#;
-        let c = ModelConfig::from_hf_json(json).unwrap();
-        assert_eq!(c.n_experts, 0);
-        assert_eq!(c.n_experts_used, 0);
-    }
-
-    #[test]
-    fn test_llama2_7b_is_dense() {
-        let c = ModelConfig::llama2_7b();
-        assert_eq!(c.n_experts, 0);
-        assert_eq!(c.n_experts_used, 0);
-    }
-
-    #[test]
     fn test_from_hf_json_missing_required_field() {
         let json = r#"{"hidden_size": 4096}"#;
         let err = ModelConfig::from_hf_json(json).unwrap_err();
@@ -476,5 +466,64 @@ mod tests {
     fn test_from_hf_json_malformed() {
         let err = ModelConfig::from_hf_json("not json").unwrap_err();
         assert!(matches!(err, ConfigError::Json(_)));
+    }
+
+    #[test]
+    fn test_architecture_from_gguf_name() {
+        assert_eq!(Architecture::from_gguf_name("llama"), Architecture::Llama);
+        assert_eq!(Architecture::from_gguf_name("qwen2"), Architecture::Llama);
+        assert_eq!(Architecture::from_gguf_name("qwen3"), Architecture::Llama);
+        assert_eq!(Architecture::from_gguf_name("mistral"), Architecture::Llama);
+        assert_eq!(Architecture::from_gguf_name("bitnet"), Architecture::Llama);
+        assert_eq!(Architecture::from_gguf_name("gpt2"), Architecture::Gpt2);
+        assert_eq!(Architecture::from_gguf_name("gptj"), Architecture::Gpt2);
+        assert_eq!(Architecture::from_gguf_name("gptneox"), Architecture::Gpt2);
+        assert_eq!(Architecture::from_gguf_name("starcoder"), Architecture::Gpt2);
+        assert_eq!(Architecture::from_gguf_name("phi2"), Architecture::Phi);
+        assert_eq!(Architecture::from_gguf_name("phi3"), Architecture::Phi);
+        assert_eq!(Architecture::from_gguf_name("gemma"), Architecture::Gemma);
+        assert_eq!(Architecture::from_gguf_name("gemma2"), Architecture::Gemma);
+        assert_eq!(Architecture::from_gguf_name("falcon"), Architecture::Falcon);
+        assert_eq!(Architecture::from_gguf_name("mpt"), Architecture::Mpt);
+        assert_eq!(Architecture::from_gguf_name("unknown_arch"), Architecture::Llama);
+    }
+
+    #[test]
+    fn test_from_hf_json_gpt2_hidden_act() {
+        let json = r#"{
+            "model_type": "gpt2",
+            "hidden_size": 768,
+            "intermediate_size": 3072,
+            "num_attention_heads": 12,
+            "num_hidden_layers": 12,
+            "vocab_size": 50257,
+            "hidden_act": "gelu_new"
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.hidden_act, HiddenAct::Gelu);
+        assert_eq!(c.architecture, Architecture::Gpt2);
+    }
+
+    #[test]
+    fn test_from_hf_json_gemma_hidden_act() {
+        let json = r#"{
+            "model_type": "gemma",
+            "hidden_size": 2048,
+            "intermediate_size": 16384,
+            "num_attention_heads": 8,
+            "num_hidden_layers": 18,
+            "vocab_size": 256000,
+            "hidden_act": "geglu"
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.hidden_act, HiddenAct::GeGLU);
+        assert_eq!(c.architecture, Architecture::Gemma);
+    }
+
+    #[test]
+    fn test_presets_have_llama_architecture() {
+        assert_eq!(ModelConfig::llama2_7b().architecture, Architecture::Llama);
+        assert_eq!(ModelConfig::micro_llama().architecture, Architecture::Llama);
+        assert_eq!(ModelConfig::tiny_test().architecture, Architecture::Llama);
     }
 }

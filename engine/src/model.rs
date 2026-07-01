@@ -403,6 +403,58 @@ where
                         gate[i] = relu * relu * up[i];
                     }
                 }
+                crate::config::HiddenAct::Gelu => {
+                    self.pipeline
+                        .matmul_bt(&normed2, up_w, &mut gate, seq_len, inter, h)
+                        .unwrap();
+                    for i in 0..gate.len() {
+                        gate[i] = tempura_kernels::activations::gelu(gate[i]);
+                    }
+                }
+                crate::config::HiddenAct::GeluQuick => {
+                    self.pipeline
+                        .matmul_bt(&normed2, up_w, &mut gate, seq_len, inter, h)
+                        .unwrap();
+                    for i in 0..gate.len() {
+                        gate[i] = tempura_kernels::activations::gelu_quick(gate[i]);
+                    }
+                }
+                crate::config::HiddenAct::Relu => {
+                    self.pipeline
+                        .matmul_bt(&normed2, up_w, &mut gate, seq_len, inter, h)
+                        .unwrap();
+                    for i in 0..gate.len() {
+                        gate[i] = tempura_kernels::activations::relu(gate[i]);
+                    }
+                }
+                crate::config::HiddenAct::GeGLU => {
+                    let gate_w = weights
+                        .get(&format!("{prefix}.mlp.gate_proj.weight"))
+                        .unwrap();
+                    self.pipeline
+                        .matmul_bt(&normed2, gate_w, &mut gate, seq_len, inter, h)
+                        .unwrap();
+                    self.pipeline
+                        .matmul_bt(&normed2, up_w, &mut up, seq_len, inter, h)
+                        .unwrap();
+                    for i in 0..gate.len() {
+                        gate[i] = tempura_kernels::activations::geglu(gate[i], up[i]);
+                    }
+                }
+                crate::config::HiddenAct::ReGLU => {
+                    let gate_w = weights
+                        .get(&format!("{prefix}.mlp.gate_proj.weight"))
+                        .unwrap();
+                    self.pipeline
+                        .matmul_bt(&normed2, gate_w, &mut gate, seq_len, inter, h)
+                        .unwrap();
+                    self.pipeline
+                        .matmul_bt(&normed2, up_w, &mut up, seq_len, inter, h)
+                        .unwrap();
+                    for i in 0..gate.len() {
+                        gate[i] = tempura_kernels::activations::reglu(gate[i], up[i]);
+                    }
+                }
             }
 
             let mut down_out = vec![0.0f32; seq_len * h];
@@ -927,6 +979,94 @@ where
                         let last = &gate[(seq_len-1)*inter..seq_len*inter];
                         let norm: f32 = last.iter().map(|x| x*x).sum::<f32>().sqrt();
                         eprintln!("L0 FFN after relu²*up[0..8]: {:?} norm={norm:.4}", &last[..8.min(inter)]);
+                    }
+                }
+                crate::config::HiddenAct::Gelu => {
+                    qmm(
+                        normed2_preq.as_ref(),
+                        &normed2,
+                        &up_w_name,
+                        &mut gate[..seq_len * inter],
+                        seq_len,
+                        inter,
+                        h,
+                    );
+                    for i in 0..seq_len * inter {
+                        gate[i] = tempura_kernels::activations::gelu(gate[i]);
+                    }
+                }
+                crate::config::HiddenAct::GeluQuick => {
+                    qmm(
+                        normed2_preq.as_ref(),
+                        &normed2,
+                        &up_w_name,
+                        &mut gate[..seq_len * inter],
+                        seq_len,
+                        inter,
+                        h,
+                    );
+                    for i in 0..seq_len * inter {
+                        gate[i] = tempura_kernels::activations::gelu_quick(gate[i]);
+                    }
+                }
+                crate::config::HiddenAct::Relu => {
+                    qmm(
+                        normed2_preq.as_ref(),
+                        &normed2,
+                        &up_w_name,
+                        &mut gate[..seq_len * inter],
+                        seq_len,
+                        inter,
+                        h,
+                    );
+                    for i in 0..seq_len * inter {
+                        gate[i] = tempura_kernels::activations::relu(gate[i]);
+                    }
+                }
+                crate::config::HiddenAct::GeGLU => {
+                    qmm(
+                        normed2_preq.as_ref(),
+                        &normed2,
+                        &gate_w_name,
+                        &mut gate[..seq_len * inter],
+                        seq_len,
+                        inter,
+                        h,
+                    );
+                    qmm(
+                        normed2_preq.as_ref(),
+                        &normed2,
+                        &up_w_name,
+                        &mut up[..seq_len * inter],
+                        seq_len,
+                        inter,
+                        h,
+                    );
+                    for i in 0..seq_len * inter {
+                        gate[i] = tempura_kernels::activations::geglu(gate[i], up[i]);
+                    }
+                }
+                crate::config::HiddenAct::ReGLU => {
+                    qmm(
+                        normed2_preq.as_ref(),
+                        &normed2,
+                        &gate_w_name,
+                        &mut gate[..seq_len * inter],
+                        seq_len,
+                        inter,
+                        h,
+                    );
+                    qmm(
+                        normed2_preq.as_ref(),
+                        &normed2,
+                        &up_w_name,
+                        &mut up[..seq_len * inter],
+                        seq_len,
+                        inter,
+                        h,
+                    );
+                    for i in 0..seq_len * inter {
+                        gate[i] = tempura_kernels::activations::reglu(gate[i], up[i]);
                     }
                 }
             }

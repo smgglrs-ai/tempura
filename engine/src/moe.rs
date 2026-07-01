@@ -156,6 +156,31 @@ fn expert_ffn_combine(
                     gate_buf[i] = x * x * up_buf[i];
                 }
             }
+            HiddenAct::Gelu => {
+                for i in 0..intermediate_size {
+                    gate_buf[i] = tempura_kernels::activations::gelu(gate_buf[i]) * up_buf[i];
+                }
+            }
+            HiddenAct::GeluQuick => {
+                for i in 0..intermediate_size {
+                    gate_buf[i] = tempura_kernels::activations::gelu_quick(gate_buf[i]) * up_buf[i];
+                }
+            }
+            HiddenAct::Relu => {
+                for i in 0..intermediate_size {
+                    gate_buf[i] = tempura_kernels::activations::relu(gate_buf[i]) * up_buf[i];
+                }
+            }
+            HiddenAct::GeGLU => {
+                for i in 0..intermediate_size {
+                    gate_buf[i] = tempura_kernels::activations::geglu(gate_buf[i], up_buf[i]);
+                }
+            }
+            HiddenAct::ReGLU => {
+                for i in 0..intermediate_size {
+                    gate_buf[i] = tempura_kernels::activations::reglu(gate_buf[i], up_buf[i]);
+                }
+            }
         }
 
         // down_proj: [hidden_size, intermediate_size] x [intermediate_size] -> [hidden_size]
