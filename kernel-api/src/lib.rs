@@ -236,6 +236,10 @@ pub struct SamplingParams {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
+    pub min_p: f32,
+    pub typical_p: f32,
+    pub repeat_penalty: f32,
+    pub penalty_last_n: usize,
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
 }
@@ -246,6 +250,10 @@ impl Default for SamplingParams {
             temperature: 1.0,
             top_k: 50,
             top_p: 1.0,
+            min_p: 0.0,
+            typical_p: 1.0,
+            repeat_penalty: 1.0,
+            penalty_last_n: 64,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
         }

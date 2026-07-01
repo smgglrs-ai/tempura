@@ -24,6 +24,7 @@ pub mod quantized;
 pub mod rmsnorm;
 pub mod rope;
 pub mod sampler_advanced;
+pub mod sampler_chain;
 pub mod sampling;
 pub mod turboquant;
 pub mod verification_manifest;

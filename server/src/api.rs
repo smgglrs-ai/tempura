@@ -368,6 +368,7 @@ async fn chat_completions(
         top_p: req.top_p.unwrap_or(1.0),
         presence_penalty: req.presence_penalty.unwrap_or(0.0),
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
+        ..SamplingParams::default()
     };
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -690,6 +691,7 @@ async fn completions(
         top_p: 1.0,
         presence_penalty: req.presence_penalty.unwrap_or(0.0),
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
+        ..SamplingParams::default()
     };
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());

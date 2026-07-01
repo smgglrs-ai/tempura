@@ -1,9 +1,39 @@
+use crate::sampler_chain::{MinPSampler, RepetitionPenalizer, TypicalSampler, LogitProcessor};
 use crate::Result;
 pub use crate::{Sampler, SamplingParams};
 use rand::RngCore;
 
 #[cfg(feature = "cpu")]
 pub struct CpuSampler;
+
+#[cfg(feature = "cpu")]
+impl CpuSampler {
+    fn apply_pre_softmax_filters(logits: &mut Vec<f32>, params: &SamplingParams, prior_tokens: &[u32]) {
+        if params.repeat_penalty != 1.0 {
+            let mut pen = RepetitionPenalizer {
+                penalty: params.repeat_penalty,
+                last_n: params.penalty_last_n,
+            };
+            pen.apply(logits, prior_tokens);
+        }
+
+        if params.min_p > 0.0 {
+            let mut sampler = MinPSampler {
+                min_p: params.min_p,
+                min_keep: 1,
+            };
+            sampler.apply(logits, prior_tokens);
+        }
+
+        if params.typical_p < 1.0 {
+            let mut sampler = TypicalSampler {
+                typical_p: params.typical_p,
+                min_keep: 1,
+            };
+            sampler.apply(logits, prior_tokens);
+        }
+    }
+}
 
 #[cfg(feature = "cpu")]
 impl Sampler for CpuSampler {
@@ -15,11 +45,14 @@ impl Sampler for CpuSampler {
         let vocab_size = logits.len();
 
         // temperature scaling
-        let scaled: Vec<f32> = if params.temperature != 1.0 && params.temperature > 0.0 {
+        let mut scaled: Vec<f32> = if params.temperature != 1.0 && params.temperature > 0.0 {
             logits.iter().map(|l| l / params.temperature).collect()
         } else {
             logits.to_vec()
         };
+
+        // apply pre-softmax logit processors
+        Self::apply_pre_softmax_filters(&mut scaled, params, &[]);
 
         // top-k: find threshold
         let mut indexed: Vec<(usize, f32)> = scaled.iter().copied().enumerate().collect();
@@ -34,13 +67,18 @@ impl Sampler for CpuSampler {
         let mut sum = 0.0f32;
 
         for &(idx, val) in &indexed[..k] {
+            if val == f32::NEG_INFINITY {
+                continue;
+            }
             let p = (val - max_val).exp();
             probs[idx] = p;
             sum += p;
         }
 
-        for p in &mut probs {
-            *p /= sum;
+        if sum > 0.0 {
+            for p in &mut probs {
+                *p /= sum;
+            }
         }
 
         // top-p (nucleus) filtering
