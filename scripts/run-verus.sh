@@ -228,6 +228,7 @@ MODULES=(
     kv_rollback
     mma_fragments
     sampling_chain
+    activations_moe
 )
 
 TOTAL_VERIFIED=0

@@ -363,5 +363,40 @@ mod tests {
                 assert!(*w >= 0.0);
             }
         }
+
+        #[kani::proof]
+        #[kani::unwind(10)]
+        fn router_weights_sum_to_one() {
+            let n_experts: usize = kani::any();
+            let n_used: usize = kani::any();
+            kani::assume(n_experts >= 1 && n_experts <= 4);
+            kani::assume(n_used >= 1 && n_used <= n_experts);
+
+            let router = MoeRouter::new(n_experts, n_used);
+
+            let mut logits = [0.0f32; 4];
+            for i in 0..n_experts {
+                logits[i] = kani::any();
+                kani::assume(logits[i].is_finite());
+                kani::assume(logits[i] >= -10.0 && logits[i] <= 10.0);
+            }
+
+            let results = router.route(&logits[..n_experts], 1).unwrap();
+            let sum: f32 = results[0].expert_weights.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-4, "weights sum = {sum}, expected ~1.0");
+        }
+
+        #[kani::proof]
+        #[kani::unwind(6)]
+        fn softmax_no_panic() {
+            let mut arr = [0.0f32; 4];
+            for i in 0..4 {
+                arr[i] = kani::any();
+                kani::assume(arr[i].is_finite());
+                kani::assume(arr[i] >= -100.0 && arr[i] <= 100.0);
+            }
+            let result = softmax(&arr);
+            assert_eq!(result.len(), 4);
+        }
     }
 }

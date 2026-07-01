@@ -64,7 +64,15 @@ mod kani_proofs {
     use super::*;
 
     #[kani::proof]
-    fn gelu_finite_for_finite_input() {
+    fn gelu_no_panic() {
+        let x: f32 = kani::any();
+        kani::assume(x.is_finite());
+        kani::assume(x >= -100.0 && x <= 100.0);
+        let _y = gelu(x);
+    }
+
+    #[kani::proof]
+    fn gelu_finite_output() {
         let x: f32 = kani::any();
         kani::assume(x.is_finite());
         kani::assume(x >= -100.0 && x <= 100.0);
@@ -95,6 +103,26 @@ mod kani_proofs {
         kani::assume(x.is_finite());
         let y = squared_relu(x);
         assert!(y >= 0.0);
+    }
+
+    #[kani::proof]
+    fn geglu_no_panic() {
+        let gate: f32 = kani::any();
+        let up: f32 = kani::any();
+        kani::assume(gate.is_finite());
+        kani::assume(up.is_finite());
+        kani::assume(gate >= -100.0 && gate <= 100.0);
+        kani::assume(up >= -100.0 && up <= 100.0);
+        let _y = geglu(gate, up);
+    }
+
+    #[kani::proof]
+    fn reglu_no_panic() {
+        let gate: f32 = kani::any();
+        let up: f32 = kani::any();
+        kani::assume(gate.is_finite());
+        kani::assume(up.is_finite());
+        let _y = reglu(gate, up);
     }
 }
 

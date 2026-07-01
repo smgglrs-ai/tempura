@@ -89,5 +89,6 @@ pub mod quantized_forward;
 pub mod rope_frequency;
 pub mod tensor_parallel;
 pub mod trace_diff;
+pub mod activations_moe;
 pub mod sampling_chain;
 pub mod weight_shapes;
