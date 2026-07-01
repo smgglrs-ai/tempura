@@ -169,6 +169,63 @@ mod tests {
     }
 
     #[test]
+    fn f16_f32_roundtrip_error_bounded() {
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..10000 {
+            let x: f32 = rng.random_range(-65504.0f32..=65504.0f32);
+            let h = f32_to_f16(x);
+            let back = f16_to_f32(h);
+            if x.abs() > 1e-4 {
+                let rel = ((back - x) / x).abs();
+                assert!(rel < 0.001, "f16 roundtrip: x={x}, back={back}, rel_err={rel}");
+            }
+        }
+    }
+
+    #[test]
+    fn f16_preserves_sign() {
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..10000 {
+            let x: f32 = rng.random_range(-65504.0f32..=65504.0f32);
+            if x == 0.0 {
+                continue;
+            }
+            let h = f32_to_f16(x);
+            let back = f16_to_f32(h);
+            if back != 0.0 {
+                assert_eq!(
+                    x.is_sign_positive(),
+                    back.is_sign_positive(),
+                    "sign mismatch: x={x}, back={back}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f16_monotonic() {
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..10000 {
+            let a: f32 = rng.random_range(-65504.0f32..65504.0f32);
+            let b: f32 = rng.random_range(a..=65504.0f32);
+            if a >= b {
+                continue;
+            }
+            let ha = f32_to_f16(a);
+            let hb = f32_to_f16(b);
+            let fa = f16_to_f32(ha);
+            let fb = f16_to_f32(hb);
+            assert!(fa <= fb, "monotonicity: a={a} -> f16 -> {fa}, b={b} -> f16 -> {fb}");
+        }
+    }
+
+    #[test]
     fn nearest_int_rounds_correctly() {
         assert_eq!(nearest_int(0.5), 0);
         assert_eq!(nearest_int(1.5), 2);

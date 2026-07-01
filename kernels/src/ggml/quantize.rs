@@ -201,6 +201,61 @@ mod tests {
     }
 
     #[test]
+    fn q8_0_dequant_roundtrip_bounded() {
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let src: Vec<f32> = (0..256).map(|_| rng.random_range(-1.0f32..=1.0f32)).collect();
+        let nb = src.len() / 32;
+        let mut blocks = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; nb];
+        quantize_row_q8_0(&src, &mut blocks);
+        let mut reconstructed = vec![0.0f32; 256];
+        for (i, blk) in blocks.iter().enumerate() {
+            let d = f16_to_f32(blk.d);
+            for j in 0..32 {
+                reconstructed[i * 32 + j] = d * blk.qs[j] as f32;
+            }
+        }
+        let mut sum_sq_err = 0.0f64;
+        let mut sum_sq_ref = 0.0f64;
+        for i in 0..256 {
+            let err = (reconstructed[i] - src[i]) as f64;
+            sum_sq_err += err * err;
+            sum_sq_ref += (src[i] as f64) * (src[i] as f64);
+        }
+        let rel_l2 = (sum_sq_err / sum_sq_ref).sqrt();
+        assert!(rel_l2 < 0.02, "Q8_0 roundtrip L2 error: {rel_l2}");
+    }
+
+    #[test]
+    fn q8_k_dequant_roundtrip_bounded() {
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let src: Vec<f32> = (0..256).map(|_| rng.random_range(-1.0f32..=1.0f32)).collect();
+        let mut blocks = vec![BlockQ8K {
+            d: 0.0,
+            qs: [0i8; 256],
+            bsums: [0i16; 16],
+        }];
+        quantize_row_q8_k(&src, &mut blocks);
+        let mut reconstructed = vec![0.0f32; 256];
+        let d = blocks[0].d;
+        for j in 0..256 {
+            reconstructed[j] = d * blocks[0].qs[j] as f32;
+        }
+        let mut sum_sq_err = 0.0f64;
+        let mut sum_sq_ref = 0.0f64;
+        for i in 0..256 {
+            let err = (reconstructed[i] - src[i]) as f64;
+            sum_sq_err += err * err;
+            sum_sq_ref += (src[i] as f64) * (src[i] as f64);
+        }
+        let rel_l2 = (sum_sq_err / sum_sq_ref).sqrt();
+        assert!(rel_l2 < 0.01, "Q8_K roundtrip L2 error: {rel_l2}");
+    }
+
+    #[test]
     fn quantized_row_size_correct() {
         assert_eq!(quantized_row_size(256, super::super::GgmlType::Q8K), 292);
         assert_eq!(quantized_row_size(32, super::super::GgmlType::Q8_0), 34);

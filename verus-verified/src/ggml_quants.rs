@@ -514,6 +514,102 @@ proof fn q8k_bsums_partition(k: nat, j: nat)
         requires j < k / 16, k % 16 == 0;
 }
 
+// ============================================================================
+// 15. IQ grid lookup index bounds
+// ============================================================================
+
+// IQ2XXS: any u8 value indexes into a 256-entry grid
+proof fn iq2xxs_grid_index_in_bounds(value: u8)
+    ensures (value as nat) < 256,
+{
+}
+
+// IQ2XS: (q2 & 511) indexes into a 512-entry grid
+proof fn iq2xs_grid_index_from_q2(q2: u16)
+    ensures (q2 & 511u16) as nat < 512,
+{
+    assert(q2 & 511u16 < 512u16) by (bit_vector);
+}
+
+// IQ2XS signs: (q2 >> 9) indexes into a 128-entry table
+proof fn iq2xs_signs_index_in_bounds(q2: u16)
+    ensures (q2 >> 9u16) as nat < 128,
+{
+    assert(q2 >> 9u16 <= 127u16) by (bit_vector);
+}
+
+// IQ2S: (qs | (qh_2bits << 8)) indexes into a 1024-entry grid
+proof fn iq2s_grid_index_in_bounds(qs: u8, qh_2bits: u8)
+    requires qh_2bits <= 3,
+    ensures ({
+        let idx: nat = (qs as nat) | ((qh_2bits as nat) << 8);
+        idx < 1024
+    }),
+{
+    // qs <= 255, qh_2bits <= 3, so (qh_2bits << 8) <= 768
+    // 255 | 768 = 1023 < 1024
+    assert(forall |a: u8, b: u8| b <= 3 ==>
+        ((a as u16) | ((b as u16) << 8u16)) < 1024u16) by (bit_vector);
+}
+
+// IQ3: (qs | (bit << 8)) indexes into a 512-entry grid
+proof fn iq3_grid_index_in_bounds(qs: u8, qh_bit: u8)
+    requires qh_bit <= 1,
+    ensures ({
+        let idx: nat = (qs as nat) | ((qh_bit as nat) << 8);
+        idx < 512
+    }),
+{
+    assert(forall |a: u8, b: u8| b <= 1 ==>
+        ((a as u16) | ((b as u16) << 8u16)) < 512u16) by (bit_vector);
+}
+
+// IQ1S: (qs | (qh_3bits << 8)) indexes into a 2048-entry grid
+proof fn iq1s_grid_index_in_bounds(qs: u8, qh_3bits: u8)
+    requires qh_3bits <= 7,
+    ensures ({
+        let idx: nat = (qs as nat) | ((qh_3bits as nat) << 8);
+        idx < 2048
+    }),
+{
+    // qs <= 255, qh_3bits <= 7, (7 << 8) = 1792, 255 | 1792 = 2047 < 2048
+    assert(forall |a: u8, b: u8| b <= 7 ==>
+        ((a as u16) | ((b as u16) << 8u16)) < 2048u16) by (bit_vector);
+}
+
+// KSIGNS: ((val >> (7*l)) & 127) indexes into a 128-entry table
+proof fn ksigns_7bit_mask_in_bounds(val: u32, l: u32)
+    requires l < 4,
+    ensures ({
+        let shift: u32 = 7 * l;
+        let masked: u32 = (val >> shift) & 127u32;
+        masked as nat < 128
+    }),
+{
+    assert(forall |v: u32, s: u32| s < 28 ==> ((v >> s) & 127u32) < 128u32) by (bit_vector);
+}
+
+// KMASK_IQ2XS: j < 8 means index is safe (table has 8 entries)
+proof fn kmask_iq2xs_index_in_bounds(j: nat)
+    requires j < 8,
+    ensures j < 8,
+{
+}
+
+// KVALUES_IQ4NL: (nibble & 0xF) indexes into a 16-entry table
+proof fn kvalues_iq4nl_index_in_bounds(nibble: u8)
+    ensures (nibble & 0x0Fu8) as nat < 16,
+{
+    assert(nibble & 0x0Fu8 < 16u8) by (bit_vector);
+}
+
+// IQ4XS scales: ib/2 < 4 for ib in [0,4)
+proof fn iq4xs_scales_index(ib: nat)
+    requires ib < 4,
+    ensures ib / 2 < 4,
+{
+}
+
 fn main() {}
 
 } // verus!
