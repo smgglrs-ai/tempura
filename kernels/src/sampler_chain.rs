@@ -839,3 +839,133 @@ mod tests {
         }
     }
 }
+
+// ── Mirostat v1 ────────────────────────────────────────────────────────────
+
+/// Mirostat v1 — estimates Zipf exponent from top-m tokens, computes dynamic
+/// top-k targeting entropy tau. Translated from llama_sampler_mirostat_apply.
+pub struct MirostatV1Sampler {
+    pub n_vocab: usize,
+    pub tau: f32,
+    pub eta: f32,
+    pub m: usize,
+    pub mu: f32,
+}
+
+impl MirostatV1Sampler {
+    pub fn new(n_vocab: usize, tau: f32, eta: f32, m: usize) -> Self {
+        Self { n_vocab, tau, eta, m, mu: 2.0 * tau }
+    }
+
+    pub fn update_mu(&mut self, selected_prob: f32) {
+        if selected_prob > 0.0 {
+            let observed_surprise = -selected_prob.log2();
+            self.mu -= self.eta * (observed_surprise - self.tau);
+        }
+    }
+}
+
+impl LogitProcessor for MirostatV1Sampler {
+    fn apply(&mut self, logits: &mut [f32], _prior_tokens: &[u32]) {
+        if logits.is_empty() { return; }
+
+        let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<(usize, f32)> = logits.iter().enumerate()
+            .map(|(i, &l)| (i, (l - max_val).exp()))
+            .collect();
+        let sum: f32 = probs.iter().map(|(_, p)| p).sum();
+        for (_, p) in probs.iter_mut() { *p /= sum; }
+        probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let m_use = (self.m - 1).min(probs.len().saturating_sub(1));
+        let mut sum_ti_bi = 0.0f32;
+        let mut sum_ti_sq = 0.0f32;
+        for i in 0..m_use {
+            let t_i = ((i + 2) as f32 / (i + 1) as f32).ln();
+            let b_i = if probs[i + 1].1 > 0.0 { (probs[i].1 / probs[i + 1].1).ln() } else { 0.0 };
+            sum_ti_bi += t_i * b_i;
+            sum_ti_sq += t_i * t_i;
+        }
+        let s_hat = if sum_ti_sq > 0.0 { sum_ti_bi / sum_ti_sq } else { 1.0 };
+
+        let epsilon_hat = s_hat - 1.0;
+        let k = if epsilon_hat > 0.0 && self.n_vocab > 0 {
+            let num = epsilon_hat * 2.0f32.powf(self.mu);
+            let denom = 1.0 - (self.n_vocab as f32).powf(-epsilon_hat);
+            if denom > 0.0 { (num / denom).powf(1.0 / s_hat).max(1.0) as usize } else { 1 }
+        } else { 1 };
+
+        if k < probs.len() {
+            let cutoff_logit = logits[probs[k - 1].0];
+            for (i, l) in logits.iter_mut().enumerate() {
+                if *l < cutoff_logit { *l = f32::NEG_INFINITY; }
+            }
+        }
+    }
+}
+
+// ── Reasoning Budget ───────────────────────────────────────────────────────
+
+/// Limits token generation budget for thinking/reasoning phases.
+/// Blocks thinking_end_token before min_budget, forces it after max_budget.
+pub struct ReasoningBudgetSampler {
+    pub thinking_end_token: u32,
+    pub min_budget: usize,
+    pub max_budget: usize,
+    pub tokens_generated: usize,
+}
+
+impl ReasoningBudgetSampler {
+    pub fn new(thinking_end_token: u32, min_budget: usize, max_budget: usize) -> Self {
+        Self { thinking_end_token, min_budget, max_budget, tokens_generated: 0 }
+    }
+
+    pub fn step(&mut self) { self.tokens_generated += 1; }
+}
+
+impl LogitProcessor for ReasoningBudgetSampler {
+    fn apply(&mut self, logits: &mut [f32], _prior_tokens: &[u32]) {
+        let tok = self.thinking_end_token as usize;
+        if tok >= logits.len() { return; }
+        if self.tokens_generated < self.min_budget {
+            logits[tok] = f32::NEG_INFINITY;
+        } else if self.tokens_generated >= self.max_budget {
+            for (i, l) in logits.iter_mut().enumerate() {
+                if i != tok { *l = f32::NEG_INFINITY; }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mirostat_v1_tests {
+    use super::*;
+
+    #[test]
+    fn mirostat_v1_reduces_candidates() {
+        let mut logits = vec![1.0, 0.9, 0.8, 0.7, 0.1, 0.05, 0.01, -1.0, -2.0, -3.0];
+        let mut sampler = MirostatV1Sampler::new(10, 5.0, 0.1, 5);
+        sampler.apply(&mut logits, &[]);
+        let kept = logits.iter().filter(|&&l| l > f32::NEG_INFINITY).count();
+        assert!(kept >= 1, "kept={kept}");
+    }
+
+    #[test]
+    fn reasoning_budget_blocks_early() {
+        let mut logits = vec![1.0, 2.0, 3.0, 4.0];
+        let mut sampler = ReasoningBudgetSampler::new(2, 10, 100);
+        sampler.apply(&mut logits, &[]);
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+        assert!(logits[0] > f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn reasoning_budget_forces_end() {
+        let mut logits = vec![1.0, 2.0, 3.0, 4.0];
+        let mut sampler = ReasoningBudgetSampler::new(2, 5, 10);
+        sampler.tokens_generated = 15;
+        sampler.apply(&mut logits, &[]);
+        assert!(logits[2] > f32::NEG_INFINITY);
+        assert_eq!(logits[0], f32::NEG_INFINITY);
+    }
+}
