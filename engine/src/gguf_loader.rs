@@ -462,6 +462,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
     } else {
         match arch {
             "gpt2" | "gptj" | "gptneox" | "starcoder" | "refact" => crate::config::HiddenAct::Gelu,
+            "phi2" | "phi3" | "phimoe" => crate::config::HiddenAct::Gelu,
             "gemma" | "gemma2" | "gemma3" => crate::config::HiddenAct::GeGLU,
             "falcon" | "mpt" => crate::config::HiddenAct::Gelu,
             _ => crate::config::HiddenAct::SiluGate,
@@ -497,7 +498,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         architecture,
         n_experts: get_usize("expert_count").unwrap_or(0),
         n_experts_used: get_usize("expert_used_count").unwrap_or(0),
-        use_layernorm: matches!(architecture, crate::config::Architecture::Falcon | crate::config::Architecture::Mpt),
+        use_layernorm: matches!(architecture, crate::config::Architecture::Falcon | crate::config::Architecture::Mpt | crate::config::Architecture::Phi),
         use_alibi: matches!(architecture, crate::config::Architecture::Mpt),
         alibi_max_bias: if matches!(architecture, crate::config::Architecture::Mpt) {
             metadata
@@ -507,13 +508,18 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         } else {
             0.0
         },
-        parallel_attn_ffn: metadata
+        parallel_attn_ffn: matches!(architecture, crate::config::Architecture::Phi) || metadata
             .get(&format!("{arch}.attention.use_parallel_residual"))
             .and_then(|v| match v {
                 GgufValue::Bool(b) => Some(*b),
                 _ => None,
             })
             .unwrap_or(false),
+        rmsnorm_offset: matches!(architecture, crate::config::Architecture::Gemma),
+        attn_logit_softcapping: metadata
+            .get(&format!("{arch}.attention.logit_softcapping"))
+            .and_then(|v| v.as_f32()),
+        embedding_scale: matches!(architecture, crate::config::Architecture::Gemma),
     })
 }
 
@@ -1320,6 +1326,70 @@ mod tests {
 
         assert_eq!(loader.config.architecture, crate::config::Architecture::Gemma);
         assert_eq!(loader.config.hidden_act, crate::config::HiddenAct::GeGLU);
+    }
+
+    #[test]
+    fn test_gguf_architecture_detection_phi() {
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let tensor_bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let arch_bytes = string_metadata_bytes("phi3");
+        let hs = u32_metadata_bytes(64);
+        let is = u32_metadata_bytes(128);
+        let hc = u32_metadata_bytes(4);
+        let hckv = u32_metadata_bytes(4);
+        let bc = u32_metadata_bytes(2);
+
+        let metadata: Vec<(&str, u32, &[u8])> = vec![
+            ("general.architecture", 8, &arch_bytes),
+            ("phi3.embedding_length", 4, &hs),
+            ("phi3.feed_forward_length", 4, &is),
+            ("phi3.attention.head_count", 4, &hc),
+            ("phi3.attention.head_count_kv", 4, &hckv),
+            ("phi3.block_count", 4, &bc),
+        ];
+
+        let tensor_infos = vec![("token_embd.weight", [4u64].as_slice(), 0u32, 0u64)];
+
+        let data = build_minimal_gguf(&metadata, &tensor_infos, &tensor_bytes);
+        let loader = GgufLoader::from_bytes(&data).unwrap();
+
+        assert_eq!(loader.config.architecture, crate::config::Architecture::Phi);
+        assert_eq!(loader.config.hidden_act, crate::config::HiddenAct::Gelu);
+        assert!(loader.config.parallel_attn_ffn);
+        assert!(loader.config.use_layernorm);
+    }
+
+    #[test]
+    fn test_gguf_gemma_has_rmsnorm_offset() {
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let tensor_bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let arch_bytes = string_metadata_bytes("gemma2");
+        let hs = u32_metadata_bytes(64);
+        let is = u32_metadata_bytes(128);
+        let hc = u32_metadata_bytes(4);
+        let hckv = u32_metadata_bytes(4);
+        let bc = u32_metadata_bytes(2);
+
+        let metadata: Vec<(&str, u32, &[u8])> = vec![
+            ("general.architecture", 8, &arch_bytes),
+            ("gemma2.embedding_length", 4, &hs),
+            ("gemma2.feed_forward_length", 4, &is),
+            ("gemma2.attention.head_count", 4, &hc),
+            ("gemma2.attention.head_count_kv", 4, &hckv),
+            ("gemma2.block_count", 4, &bc),
+        ];
+
+        let tensor_infos = vec![("token_embd.weight", [4u64].as_slice(), 0u32, 0u64)];
+
+        let data = build_minimal_gguf(&metadata, &tensor_infos, &tensor_bytes);
+        let loader = GgufLoader::from_bytes(&data).unwrap();
+
+        assert_eq!(loader.config.architecture, crate::config::Architecture::Gemma);
+        assert!(loader.config.rmsnorm_offset);
+        assert!(loader.config.embedding_scale);
+        assert!(!loader.config.parallel_attn_ffn);
     }
 
     #[test]

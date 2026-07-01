@@ -174,11 +174,20 @@ where
         let head_dim = cfg.head_dim;
         let inter = cfg.intermediate_size;
 
+        let mut norm_weight_buf = if cfg.rmsnorm_offset { vec![0.0f32; h] } else { Vec::new() };
+
         let embed = weights.get("model.embed_tokens.weight").unwrap();
         let mut hidden = vec![0.0f32; seq_len * h];
         for (t, &tok) in token_ids.iter().enumerate() {
             let src = &embed[tok as usize * h..(tok as usize + 1) * h];
             hidden[t * h..(t + 1) * h].copy_from_slice(src);
+        }
+
+        if cfg.embedding_scale {
+            let scale = (h as f32).sqrt();
+            for v in &mut hidden {
+                *v *= scale;
+            }
         }
 
         let positions: Vec<u32> = (session.position..session.position + seq_len)
@@ -202,16 +211,23 @@ where
             let input_ln_w = weights
                 .get(&format!("{prefix}.input_layernorm.weight"))
                 .unwrap();
-            self.pipeline
-                .rmsnorm(
-                    &mut normed,
-                    input_ln_w,
-                    h,
-                    cfg.layer_norm_eps,
-                    session.trace_level,
-                    &mut Some(&mut snapshot),
-                )
-                .unwrap();
+            if cfg.use_layernorm {
+                let bias = weights.get(&format!("{prefix}.input_layernorm.bias"));
+                tempura_kernels::layernorm::CpuLayerNorm
+                    .forward(&mut normed, input_ln_w, bias, h, cfg.layer_norm_eps)
+                    .unwrap();
+            } else if cfg.rmsnorm_offset {
+                for i in 0..h {
+                    norm_weight_buf[i] = 1.0 + input_ln_w[i];
+                }
+                self.pipeline
+                    .rmsnorm(&mut normed, &norm_weight_buf, h, cfg.layer_norm_eps, session.trace_level, &mut Some(&mut snapshot))
+                    .unwrap();
+            } else {
+                self.pipeline
+                    .rmsnorm(&mut normed, input_ln_w, h, cfg.layer_norm_eps, session.trace_level, &mut Some(&mut snapshot))
+                    .unwrap();
+            }
 
             let q_w = weights
                 .get(&format!("{prefix}.self_attn.q_proj.weight"))
@@ -342,25 +358,40 @@ where
                 .matmul_bt(&attn_out, o_w, &mut o_proj, seq_len, h, q_dim)
                 .unwrap();
 
-            for i in 0..hidden.len() {
-                hidden[i] += o_proj[i];
+            if !cfg.parallel_attn_ffn {
+                for i in 0..hidden.len() {
+                    hidden[i] += o_proj[i];
+                }
             }
 
             // --- FFN block ---
-            let mut normed2 = hidden.clone();
-            let post_ln_w = weights
-                .get(&format!("{prefix}.post_attention_layernorm.weight"))
-                .unwrap();
-            self.pipeline
-                .rmsnorm(
-                    &mut normed2,
-                    post_ln_w,
-                    h,
-                    cfg.layer_norm_eps,
-                    TraceLevel::Off,
-                    &mut None,
-                )
-                .unwrap();
+            let ffn_normed;
+            if cfg.parallel_attn_ffn {
+                ffn_normed = normed.clone();
+            } else {
+                let mut normed2 = hidden.clone();
+                let post_ln_w = weights
+                    .get(&format!("{prefix}.post_attention_layernorm.weight"))
+                    .unwrap();
+                if cfg.use_layernorm {
+                    let bias = weights.get(&format!("{prefix}.post_attention_layernorm.bias"));
+                    tempura_kernels::layernorm::CpuLayerNorm
+                        .forward(&mut normed2, post_ln_w, bias, h, cfg.layer_norm_eps)
+                        .unwrap();
+                } else if cfg.rmsnorm_offset {
+                    for i in 0..h {
+                        norm_weight_buf[i] = 1.0 + post_ln_w[i];
+                    }
+                    self.pipeline
+                        .rmsnorm(&mut normed2, &norm_weight_buf, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None)
+                        .unwrap();
+                } else {
+                    self.pipeline
+                        .rmsnorm(&mut normed2, post_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None)
+                        .unwrap();
+                }
+                ffn_normed = normed2;
+            }
 
             let up_w = weights
                 .get(&format!("{prefix}.mlp.up_proj.weight"))
@@ -378,10 +409,10 @@ where
                         .get(&format!("{prefix}.mlp.gate_proj.weight"))
                         .unwrap();
                     self.pipeline
-                        .matmul_bt(&normed2, gate_w, &mut gate, seq_len, inter, h)
+                        .matmul_bt(&ffn_normed, gate_w, &mut gate, seq_len, inter, h)
                         .unwrap();
                     self.pipeline
-                        .matmul_bt(&normed2, up_w, &mut up, seq_len, inter, h)
+                        .matmul_bt(&ffn_normed, up_w, &mut up, seq_len, inter, h)
                         .unwrap();
                     for i in 0..gate.len() {
                         let silu = gate[i] / (1.0 + (-gate[i]).exp());
@@ -393,10 +424,10 @@ where
                         .get(&format!("{prefix}.mlp.gate_proj.weight"))
                         .unwrap();
                     self.pipeline
-                        .matmul_bt(&normed2, gate_w, &mut gate, seq_len, inter, h)
+                        .matmul_bt(&ffn_normed, gate_w, &mut gate, seq_len, inter, h)
                         .unwrap();
                     self.pipeline
-                        .matmul_bt(&normed2, up_w, &mut up, seq_len, inter, h)
+                        .matmul_bt(&ffn_normed, up_w, &mut up, seq_len, inter, h)
                         .unwrap();
                     for i in 0..gate.len() {
                         let relu = gate[i].max(0.0);
@@ -405,7 +436,7 @@ where
                 }
                 crate::config::HiddenAct::Gelu => {
                     self.pipeline
-                        .matmul_bt(&normed2, up_w, &mut gate, seq_len, inter, h)
+                        .matmul_bt(&ffn_normed, up_w, &mut gate, seq_len, inter, h)
                         .unwrap();
                     for i in 0..gate.len() {
                         gate[i] = tempura_kernels::activations::gelu(gate[i]);
@@ -413,7 +444,7 @@ where
                 }
                 crate::config::HiddenAct::GeluQuick => {
                     self.pipeline
-                        .matmul_bt(&normed2, up_w, &mut gate, seq_len, inter, h)
+                        .matmul_bt(&ffn_normed, up_w, &mut gate, seq_len, inter, h)
                         .unwrap();
                     for i in 0..gate.len() {
                         gate[i] = tempura_kernels::activations::gelu_quick(gate[i]);
@@ -421,7 +452,7 @@ where
                 }
                 crate::config::HiddenAct::Relu => {
                     self.pipeline
-                        .matmul_bt(&normed2, up_w, &mut gate, seq_len, inter, h)
+                        .matmul_bt(&ffn_normed, up_w, &mut gate, seq_len, inter, h)
                         .unwrap();
                     for i in 0..gate.len() {
                         gate[i] = tempura_kernels::activations::relu(gate[i]);
@@ -432,10 +463,10 @@ where
                         .get(&format!("{prefix}.mlp.gate_proj.weight"))
                         .unwrap();
                     self.pipeline
-                        .matmul_bt(&normed2, gate_w, &mut gate, seq_len, inter, h)
+                        .matmul_bt(&ffn_normed, gate_w, &mut gate, seq_len, inter, h)
                         .unwrap();
                     self.pipeline
-                        .matmul_bt(&normed2, up_w, &mut up, seq_len, inter, h)
+                        .matmul_bt(&ffn_normed, up_w, &mut up, seq_len, inter, h)
                         .unwrap();
                     for i in 0..gate.len() {
                         gate[i] = tempura_kernels::activations::geglu(gate[i], up[i]);
@@ -446,10 +477,10 @@ where
                         .get(&format!("{prefix}.mlp.gate_proj.weight"))
                         .unwrap();
                     self.pipeline
-                        .matmul_bt(&normed2, gate_w, &mut gate, seq_len, inter, h)
+                        .matmul_bt(&ffn_normed, gate_w, &mut gate, seq_len, inter, h)
                         .unwrap();
                     self.pipeline
-                        .matmul_bt(&normed2, up_w, &mut up, seq_len, inter, h)
+                        .matmul_bt(&ffn_normed, up_w, &mut up, seq_len, inter, h)
                         .unwrap();
                     for i in 0..gate.len() {
                         gate[i] = tempura_kernels::activations::reglu(gate[i], up[i]);
@@ -462,13 +493,19 @@ where
                 .matmul_bt(&gate, down_w, &mut down_out, seq_len, h, inter)
                 .unwrap();
 
-            for i in 0..hidden.len() {
-                hidden[i] += down_out[i];
+            if cfg.parallel_attn_ffn {
+                for i in 0..hidden.len() {
+                    hidden[i] += o_proj[i] + down_out[i];
+                }
+            } else {
+                for i in 0..hidden.len() {
+                    hidden[i] += down_out[i];
+                }
             }
 
             if std::env::var("TEMPURA_DEBUG").is_ok() && layer == 0 && seq_len > 1 {
                 let h_before_ffn = hidden[0..h].iter().map(|x| x * x).sum::<f32>().sqrt();
-                let n2_norm = normed2[0..h].iter().map(|x| x * x).sum::<f32>().sqrt();
+                let n2_norm = ffn_normed[0..h].iter().map(|x| x * x).sum::<f32>().sqrt();
                 let gate_tok0 = gate[0..inter.min(4)].to_vec();
                 let up_tok0 = up[0..inter.min(4)].to_vec();
                 let gate_n = gate[0..inter].iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -494,16 +531,30 @@ where
 
         // final norm
         let final_norm_w = weights.get("model.norm.weight").unwrap();
-        self.pipeline
-            .rmsnorm(
-                &mut hidden,
-                final_norm_w,
-                h,
-                cfg.layer_norm_eps,
-                TraceLevel::Off,
-                &mut None,
-            )
-            .unwrap();
+        if cfg.use_layernorm {
+            let bias = weights.get("model.norm.bias");
+            tempura_kernels::layernorm::CpuLayerNorm
+                .forward(&mut hidden, final_norm_w, bias, h, cfg.layer_norm_eps)
+                .unwrap();
+        } else if cfg.rmsnorm_offset {
+            for i in 0..h {
+                norm_weight_buf[i] = 1.0 + final_norm_w[i];
+            }
+            self.pipeline
+                .rmsnorm(&mut hidden, &norm_weight_buf, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None)
+                .unwrap();
+        } else {
+            self.pipeline
+                .rmsnorm(
+                    &mut hidden,
+                    final_norm_w,
+                    h,
+                    cfg.layer_norm_eps,
+                    TraceLevel::Off,
+                    &mut None,
+                )
+                .unwrap();
+        }
 
         // lm_head: project last token to vocab
         let lm_head_w = weights.get("lm_head.weight").unwrap();
@@ -571,6 +622,12 @@ where
             None
         };
 
+        let mut norm_weight_buf = if cfg.rmsnorm_offset {
+            vec![0.0f32; h]
+        } else {
+            Vec::new()
+        };
+
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
         let inter = cfg.intermediate_size;
@@ -592,6 +649,13 @@ where
         for (t, &tok) in token_ids.iter().enumerate() {
             let src = &embed[tok as usize * h..(tok as usize + 1) * h];
             hidden[t * h..(t + 1) * h].copy_from_slice(src);
+        }
+
+        if cfg.embedding_scale {
+            let scale = (h as f32).sqrt();
+            for v in &mut hidden {
+                *v *= scale;
+            }
         }
 
         if std::env::var("TEMPURA_DEBUG").is_ok() {
@@ -689,6 +753,17 @@ where
             if let Some(ref ln) = layernorm {
                 let input_ln_b = qweights.get_f32(&format!("model.layers.{layer}.input_layernorm.bias"));
                 ln.forward(&mut normed, input_ln_w, input_ln_b, h, cfg.layer_norm_eps).unwrap();
+            } else if cfg.rmsnorm_offset {
+                for i in 0..h {
+                    norm_weight_buf[i] = 1.0 + input_ln_w[i];
+                }
+                if let Some(ref drn) = det_rmsnorm {
+                    drn.forward(&mut normed, &norm_weight_buf, h, cfg.layer_norm_eps).unwrap();
+                } else {
+                    self.pipeline
+                        .rmsnorm(&mut normed, &norm_weight_buf, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None)
+                        .unwrap();
+                }
             } else if let Some(ref drn) = det_rmsnorm {
                 drn.forward(&mut normed, input_ln_w, h, cfg.layer_norm_eps).unwrap();
             } else {
@@ -781,6 +856,24 @@ where
                 kv_dim,
                 h,
             );
+
+            if cfg.use_layernorm {
+                let prefix = format!("model.layers.{layer}");
+                if let Some(qb) = qweights.get_f32(&format!("{prefix}.self_attn.q_proj.bias")) {
+                    for t in 0..seq_len {
+                        for i in 0..q_dim {
+                            q[t * q_dim + i] += qb[i];
+                        }
+                    }
+                }
+                if let Some(kb) = qweights.get_f32(&format!("{prefix}.self_attn.k_proj.bias")) {
+                    for t in 0..seq_len {
+                        for i in 0..kv_dim {
+                            k[t * kv_dim + i] += kb[i];
+                        }
+                    }
+                }
+            }
 
             if cfg.use_qk_norm {
                 let q_norm_w = qweights.get_f32(q_norm_name).unwrap();
@@ -876,8 +969,10 @@ where
                 h,
                 q_dim,
             );
-            for i in 0..seq_len * h {
-                hidden[i] += o_proj[i];
+            if !cfg.parallel_attn_ffn {
+                for i in 0..seq_len * h {
+                    hidden[i] += o_proj[i];
+                }
             }
 
             if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer == 0 {
@@ -887,19 +982,43 @@ where
             }
 
             // FFN block
-            normed2.copy_from_slice(&hidden);
-            let post_ln_w = qweights.get_f32(post_ln_name).unwrap();
-            if let Some(ref ln) = layernorm {
-                let post_ln_b = qweights.get_f32(&format!("model.layers.{layer}.post_attention_layernorm.bias"));
-                ln.forward(&mut normed2, post_ln_w, post_ln_b, h, cfg.layer_norm_eps).unwrap();
-            } else if let Some(ref drn) = det_rmsnorm {
-                drn.forward(&mut normed2, post_ln_w, h, cfg.layer_norm_eps).unwrap();
+            let (ffn_input, ffn_preq) = if cfg.parallel_attn_ffn {
+                let preq = if seq_len == 1 {
+                    Some(PreQuantizedActivations::from_f32(&normed[..h]))
+                } else {
+                    None
+                };
+                (&normed as &[f32], preq)
             } else {
-                self.pipeline.rmsnorm(&mut normed2, post_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
-            }
-            if det_rmsnorm.is_some() && layernorm.is_none() {
-                tempura_kernels::portable_math::q8_snap(&mut normed2[..seq_len * h]);
-            }
+                normed2.copy_from_slice(&hidden);
+                let post_ln_w = qweights.get_f32(post_ln_name).unwrap();
+                if let Some(ref ln) = layernorm {
+                    let post_ln_b = qweights.get_f32(&format!("model.layers.{layer}.post_attention_layernorm.bias"));
+                    ln.forward(&mut normed2, post_ln_w, post_ln_b, h, cfg.layer_norm_eps).unwrap();
+                } else if cfg.rmsnorm_offset {
+                    for i in 0..h {
+                        norm_weight_buf[i] = 1.0 + post_ln_w[i];
+                    }
+                    if let Some(ref drn) = det_rmsnorm {
+                        drn.forward(&mut normed2, &norm_weight_buf, h, cfg.layer_norm_eps).unwrap();
+                    } else {
+                        self.pipeline.rmsnorm(&mut normed2, &norm_weight_buf, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+                    }
+                } else if let Some(ref drn) = det_rmsnorm {
+                    drn.forward(&mut normed2, post_ln_w, h, cfg.layer_norm_eps).unwrap();
+                } else {
+                    self.pipeline.rmsnorm(&mut normed2, post_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+                }
+                if det_rmsnorm.is_some() && layernorm.is_none() {
+                    tempura_kernels::portable_math::q8_snap(&mut normed2[..seq_len * h]);
+                }
+                let preq = if seq_len == 1 {
+                    Some(PreQuantizedActivations::from_f32(&normed2[..h]))
+                } else {
+                    None
+                };
+                (&normed2 as &[f32], preq)
+            };
 
             if cfg.n_experts > 0 {
                 let arch_name = match cfg.architecture {
@@ -916,7 +1035,7 @@ where
                     let router = tempura_kernels::moe::MoeRouter::new(cfg.n_experts, cfg.n_experts_used);
                     down_out.fill(0.0);
                     crate::moe::moe_ffn(
-                        &normed2[..seq_len * h],
+                        &ffn_input[..seq_len * h],
                         &mut down_out[..seq_len * h],
                         &router,
                         qweights,
@@ -934,15 +1053,10 @@ where
                 } else {
                     eprintln!("[warn] MoE router weight not found for layer {layer}, falling back to dense FFN");
                     // Fall through to dense FFN below
-                    let normed2_preq_moe = if seq_len == 1 {
-                        Some(PreQuantizedActivations::from_f32(&normed2[..h]))
-                    } else {
-                        None
-                    };
                     gate.fill(0.0);
                     up.fill(0.0);
-                    qmm(normed2_preq_moe.as_ref(), &normed2, &gate_w_name, &mut gate[..seq_len * inter], seq_len, inter, h);
-                    qmm(normed2_preq_moe.as_ref(), &normed2, &up_w_name, &mut up[..seq_len * inter], seq_len, inter, h);
+                    qmm(ffn_preq.as_ref(), ffn_input, &gate_w_name, &mut gate[..seq_len * inter], seq_len, inter, h);
+                    qmm(ffn_preq.as_ref(), ffn_input, &up_w_name, &mut up[..seq_len * inter], seq_len, inter, h);
                     for i in 0..seq_len * inter {
                         gate[i] = tempura_kernels::portable_math::portable_silu(gate[i]) * up[i];
                     }
@@ -959,12 +1073,6 @@ where
                 }
             } else {
             // Dense FFN path
-            let normed2_preq = if seq_len == 1 {
-                Some(PreQuantizedActivations::from_f32(&normed2[..h]))
-            } else {
-                None
-            };
-
             gate.fill(0.0);
             up.fill(0.0);
             // Fuse gate+up into single dispatch when both are Q4K and decode
@@ -972,7 +1080,7 @@ where
                 crate::config::HiddenAct::SiluGate => {
                     if seq_len == 1 {
                         if let (Some(pq), Some(gw), Some(uw)) = (
-                            normed2_preq.as_ref(),
+                            ffn_preq.as_ref(),
                             qweights.get_q4k(&gate_w_name),
                             qweights.get_q4k(&up_w_name),
                         ) {
@@ -987,8 +1095,8 @@ where
                             );
                         } else {
                             qmm(
-                                normed2_preq.as_ref(),
-                                &normed2,
+                                ffn_preq.as_ref(),
+                                ffn_input,
                                 &gate_w_name,
                                 &mut gate[..inter],
                                 1,
@@ -996,8 +1104,8 @@ where
                                 h,
                             );
                             qmm(
-                                normed2_preq.as_ref(),
-                                &normed2,
+                                ffn_preq.as_ref(),
+                                ffn_input,
                                 &up_w_name,
                                 &mut up[..inter],
                                 1,
@@ -1007,8 +1115,8 @@ where
                         }
                     } else {
                         qmm(
-                            normed2_preq.as_ref(),
-                            &normed2,
+                            ffn_preq.as_ref(),
+                            ffn_input,
                             &gate_w_name,
                             &mut gate[..seq_len * inter],
                             seq_len,
@@ -1016,8 +1124,8 @@ where
                             h,
                         );
                         qmm(
-                            normed2_preq.as_ref(),
-                            &normed2,
+                            ffn_preq.as_ref(),
+                            ffn_input,
                             &up_w_name,
                             &mut up[..seq_len * inter],
                             seq_len,
@@ -1034,8 +1142,8 @@ where
                 }
                 crate::config::HiddenAct::SquaredRelu => {
                     qmm(
-                        normed2_preq.as_ref(),
-                        &normed2,
+                        ffn_preq.as_ref(),
+                        ffn_input,
                         &gate_w_name,
                         &mut gate[..seq_len * inter],
                         seq_len,
@@ -1043,8 +1151,8 @@ where
                         h,
                     );
                     qmm(
-                        normed2_preq.as_ref(),
-                        &normed2,
+                        ffn_preq.as_ref(),
+                        ffn_input,
                         &up_w_name,
                         &mut up[..seq_len * inter],
                         seq_len,
@@ -1071,8 +1179,8 @@ where
                 }
                 crate::config::HiddenAct::Gelu => {
                     qmm(
-                        normed2_preq.as_ref(),
-                        &normed2,
+                        ffn_preq.as_ref(),
+                        ffn_input,
                         &up_w_name,
                         &mut gate[..seq_len * inter],
                         seq_len,
@@ -1085,8 +1193,8 @@ where
                 }
                 crate::config::HiddenAct::GeluQuick => {
                     qmm(
-                        normed2_preq.as_ref(),
-                        &normed2,
+                        ffn_preq.as_ref(),
+                        ffn_input,
                         &up_w_name,
                         &mut gate[..seq_len * inter],
                         seq_len,
@@ -1099,8 +1207,8 @@ where
                 }
                 crate::config::HiddenAct::Relu => {
                     qmm(
-                        normed2_preq.as_ref(),
-                        &normed2,
+                        ffn_preq.as_ref(),
+                        ffn_input,
                         &up_w_name,
                         &mut gate[..seq_len * inter],
                         seq_len,
@@ -1113,8 +1221,8 @@ where
                 }
                 crate::config::HiddenAct::GeGLU => {
                     qmm(
-                        normed2_preq.as_ref(),
-                        &normed2,
+                        ffn_preq.as_ref(),
+                        ffn_input,
                         &gate_w_name,
                         &mut gate[..seq_len * inter],
                         seq_len,
@@ -1122,8 +1230,8 @@ where
                         h,
                     );
                     qmm(
-                        normed2_preq.as_ref(),
-                        &normed2,
+                        ffn_preq.as_ref(),
+                        ffn_input,
                         &up_w_name,
                         &mut up[..seq_len * inter],
                         seq_len,
@@ -1136,8 +1244,8 @@ where
                 }
                 crate::config::HiddenAct::ReGLU => {
                     qmm(
-                        normed2_preq.as_ref(),
-                        &normed2,
+                        ffn_preq.as_ref(),
+                        ffn_input,
                         &gate_w_name,
                         &mut gate[..seq_len * inter],
                         seq_len,
@@ -1145,8 +1253,8 @@ where
                         h,
                     );
                     qmm(
-                        normed2_preq.as_ref(),
-                        &normed2,
+                        ffn_preq.as_ref(),
+                        ffn_input,
                         &up_w_name,
                         &mut up[..seq_len * inter],
                         seq_len,
@@ -1180,8 +1288,14 @@ where
                 h,
                 inter,
             );
-            for i in 0..seq_len * h {
-                hidden[i] += down_out[i];
+            if cfg.parallel_attn_ffn {
+                for i in 0..seq_len * h {
+                    hidden[i] += o_proj[i] + down_out[i];
+                }
+            } else {
+                for i in 0..seq_len * h {
+                    hidden[i] += down_out[i];
+                }
             }
             } // end dense FFN else block
 
@@ -1200,6 +1314,15 @@ where
         if let Some(ref ln) = layernorm {
             let final_norm_b = qweights.get_f32("model.norm.bias");
             ln.forward(&mut final_normed, final_norm_w, final_norm_b, h, cfg.layer_norm_eps).unwrap();
+        } else if cfg.rmsnorm_offset {
+            for i in 0..h {
+                norm_weight_buf[i] = 1.0 + final_norm_w[i];
+            }
+            if let Some(ref drn) = det_rmsnorm {
+                drn.forward(&mut final_normed, &norm_weight_buf, h, cfg.layer_norm_eps).unwrap();
+            } else {
+                self.pipeline.rmsnorm(&mut final_normed, &norm_weight_buf, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+            }
         } else if let Some(ref drn) = det_rmsnorm {
             drn.forward(&mut final_normed, final_norm_w, h, cfg.layer_norm_eps).unwrap();
         } else {

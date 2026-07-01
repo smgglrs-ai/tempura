@@ -35,6 +35,9 @@ pub struct ModelConfig {
     pub use_alibi: bool,
     pub alibi_max_bias: f32,
     pub parallel_attn_ffn: bool,
+    pub rmsnorm_offset: bool,
+    pub attn_logit_softcapping: Option<f32>,
+    pub embedding_scale: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +155,9 @@ impl ModelConfig {
             use_alibi: false,
             alibi_max_bias: 0.0,
             parallel_attn_ffn: false,
+            rmsnorm_offset: false,
+            attn_logit_softcapping: None,
+            embedding_scale: false,
         }
     }
 
@@ -180,6 +186,9 @@ impl ModelConfig {
             use_alibi: false,
             alibi_max_bias: 0.0,
             parallel_attn_ffn: false,
+            rmsnorm_offset: false,
+            attn_logit_softcapping: None,
+            embedding_scale: false,
         }
     }
 
@@ -208,6 +217,71 @@ impl ModelConfig {
             use_alibi: false,
             alibi_max_bias: 0.0,
             parallel_attn_ffn: false,
+            rmsnorm_offset: false,
+            attn_logit_softcapping: None,
+            embedding_scale: false,
+        }
+    }
+
+    pub fn tiny_gemma() -> Self {
+        Self {
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_attention_heads: 4,
+            num_kv_heads: 4,
+            num_layers: 2,
+            vocab_size: 256,
+            max_seq_len: 128,
+            head_dim: 16,
+            rope_theta: 10000.0,
+            layer_norm_eps: 1e-6,
+            tensor_parallel_size: 1,
+            quantization: None,
+            use_qk_norm: false,
+            sliding_window: None,
+            hidden_act: HiddenAct::GeGLU,
+            rope_type: RopeType::Neox,
+            architecture: Architecture::Gemma,
+            n_experts: 0,
+            n_experts_used: 0,
+            use_layernorm: false,
+            use_alibi: false,
+            alibi_max_bias: 0.0,
+            parallel_attn_ffn: false,
+            rmsnorm_offset: true,
+            attn_logit_softcapping: None,
+            embedding_scale: true,
+        }
+    }
+
+    pub fn tiny_phi() -> Self {
+        Self {
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_attention_heads: 4,
+            num_kv_heads: 4,
+            num_layers: 2,
+            vocab_size: 256,
+            max_seq_len: 128,
+            head_dim: 16,
+            rope_theta: 10000.0,
+            layer_norm_eps: 1e-5,
+            tensor_parallel_size: 1,
+            quantization: None,
+            use_qk_norm: false,
+            sliding_window: None,
+            hidden_act: HiddenAct::Gelu,
+            rope_type: RopeType::Neox,
+            architecture: Architecture::Phi,
+            n_experts: 0,
+            n_experts_used: 0,
+            use_layernorm: true,
+            use_alibi: false,
+            alibi_max_bias: 0.0,
+            parallel_attn_ffn: true,
+            rmsnorm_offset: false,
+            attn_logit_softcapping: None,
+            embedding_scale: false,
         }
     }
 
@@ -314,14 +388,20 @@ impl ModelConfig {
             architecture,
             n_experts: v.get("num_local_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
             n_experts_used: v.get("num_experts_per_tok").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            use_layernorm: matches!(architecture, Architecture::Falcon | Architecture::Mpt),
+            use_layernorm: matches!(architecture, Architecture::Falcon | Architecture::Mpt | Architecture::Phi),
             use_alibi: matches!(architecture, Architecture::Mpt),
             alibi_max_bias: if matches!(architecture, Architecture::Mpt) {
                 v.get("attn_config").and_then(|c| c.get("alibi_bias_max")).and_then(|v| v.as_f64()).unwrap_or(8.0) as f32
             } else {
                 0.0
             },
-            parallel_attn_ffn: v.get("parallel_attn").and_then(|v| v.as_bool()).unwrap_or(false),
+            parallel_attn_ffn: matches!(architecture, Architecture::Phi) || v.get("parallel_attn").and_then(|v| v.as_bool()).unwrap_or(false),
+            rmsnorm_offset: matches!(architecture, Architecture::Gemma),
+            attn_logit_softcapping: v
+                .get("attn_logit_softcapping")
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32),
+            embedding_scale: matches!(architecture, Architecture::Gemma),
         })
     }
 }
@@ -542,6 +622,64 @@ mod tests {
         let c = ModelConfig::from_hf_json(json).unwrap();
         assert_eq!(c.hidden_act, HiddenAct::GeGLU);
         assert_eq!(c.architecture, Architecture::Gemma);
+    }
+
+    #[test]
+    fn test_tiny_gemma_preset() {
+        let c = ModelConfig::tiny_gemma();
+        assert_eq!(c.architecture, Architecture::Gemma);
+        assert_eq!(c.hidden_act, HiddenAct::GeGLU);
+        assert!(!c.use_layernorm);
+        assert!(c.rmsnorm_offset);
+        assert!(c.embedding_scale);
+        assert!(!c.parallel_attn_ffn);
+        assert!(c.attn_logit_softcapping.is_none());
+    }
+
+    #[test]
+    fn test_tiny_phi_preset() {
+        let c = ModelConfig::tiny_phi();
+        assert_eq!(c.architecture, Architecture::Phi);
+        assert_eq!(c.hidden_act, HiddenAct::Gelu);
+        assert!(c.use_layernorm);
+        assert!(!c.rmsnorm_offset);
+        assert!(c.parallel_attn_ffn);
+    }
+
+    #[test]
+    fn test_from_hf_json_gemma_arch_fields() {
+        let json = r#"{
+            "model_type": "gemma",
+            "hidden_size": 2048,
+            "intermediate_size": 16384,
+            "num_attention_heads": 8,
+            "num_hidden_layers": 18,
+            "vocab_size": 256000,
+            "hidden_act": "geglu"
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert!(c.rmsnorm_offset, "Gemma must have rmsnorm_offset");
+        assert!(c.embedding_scale, "Gemma must have embedding_scale");
+        assert!(!c.parallel_attn_ffn, "Gemma must NOT have parallel_attn_ffn");
+        assert!(!c.use_layernorm);
+    }
+
+    #[test]
+    fn test_from_hf_json_gemma2_softcapping() {
+        let json = r#"{
+            "model_type": "gemma2",
+            "hidden_size": 2304,
+            "intermediate_size": 9216,
+            "num_attention_heads": 8,
+            "num_hidden_layers": 26,
+            "vocab_size": 256000,
+            "hidden_act": "geglu",
+            "attn_logit_softcapping": 50.0
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.architecture, Architecture::Gemma);
+        assert!(c.rmsnorm_offset);
+        assert_eq!(c.attn_logit_softcapping, Some(50.0));
     }
 
     #[test]
