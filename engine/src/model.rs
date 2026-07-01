@@ -1103,17 +1103,23 @@ where
         let mut up = vec![0.0f32; inter];
         let mut down_out = vec![0.0f32; h];
 
+        // Pre-allocated i8 quantization buffers (avoid 120 Vec allocs per token)
+        let max_k = h.max(inter).max(q_dim);
+        let mut preq_buf = vec![0i8; max_k];
+
         let pool = tempura_kernels::thread_pool::global_pool();
 
         macro_rules! par_gemv {
-            ($preq:expr, $w:expr, $out:expr, $n:expr, $k:expr) => {{
-                let pq = $preq;
+            ($q8:expr, $scale:expr, $sum:expr, $w:expr, $out:expr, $n:expr, $k:expr) => {{
                 let ws = i2s_weight_scale($w, $n, $k);
                 let w_data = $w;
                 let out_a = $out.as_mut_ptr() as usize;
+                let q8_ref: &[i8] = $q8;
+                let sc: f32 = $scale;
+                let sm: i32 = $sum;
                 let chunk = ($n + 7) / 8;
                 pool.parallel_chunks($n, chunk, &|start, end| {
-                    i2s_gemv_cols(&pq.i2s_q8, pq.i2s_scale, pq.i2s_sum, w_data, ws, out_a, start, end, $k);
+                    i2s_gemv_cols(q8_ref, sc, sm, w_data, ws, out_a, start, end, $k);
                 });
             }};
         }
@@ -1132,13 +1138,13 @@ where
             { use tempura_kernels::RMSNorm; rmsnorm.forward(&mut normed, w, h, cfg.layer_norm_eps).unwrap(); }
             tempura_kernels::portable_math::q8_snap(&mut normed);
 
-            let npq = PreQuantizedActivations::i2s_only(&normed);
+            let (pq_scale, pq_sum) = tempura_kernels::quantized::i2s_quantize_into(&normed, &mut preq_buf[..h]);
             if let (Some(qw), Some(kw), Some(vw)) = (
                 qweights.get_i2s(q_w_name), qweights.get_i2s(k_w_name), qweights.get_i2s(v_w_name),
             ) {
-                par_gemv!(&npq, qw, q, q_dim, h);
-                par_gemv!(&npq, kw, k_buf, kv_dim, h);
-                par_gemv!(&npq, vw, v_buf, kv_dim, h);
+                par_gemv!(&preq_buf[..h], pq_scale, pq_sum, qw, q, q_dim, h);
+                par_gemv!(&preq_buf[..h], pq_scale, pq_sum, kw, k_buf, kv_dim, h);
+                par_gemv!(&preq_buf[..h], pq_scale, pq_sum, vw, v_buf, kv_dim, h);
             }
 
             { use tempura_kernels::RoPE;
@@ -1160,9 +1166,9 @@ where
                 rmsnorm.forward(&mut attn_out, w, q_dim, cfg.layer_norm_eps).unwrap();
             }
 
-            let apq = PreQuantizedActivations::i2s_only(&attn_out);
+            let (ap_scale, ap_sum) = tempura_kernels::quantized::i2s_quantize_into(&attn_out, &mut preq_buf[..q_dim]);
             if let Some(ow) = qweights.get_i2s(o_w_name) {
-                par_gemv!(&apq, ow, o_proj, h, q_dim);
+                par_gemv!(&preq_buf[..q_dim], ap_scale, ap_sum, ow, o_proj, h, q_dim);
             }
 
             for i in 0..h { hidden[i] += o_proj[i]; }
@@ -1172,10 +1178,10 @@ where
             { use tempura_kernels::RMSNorm; rmsnorm.forward(&mut normed2, w, h, cfg.layer_norm_eps).unwrap(); }
             tempura_kernels::portable_math::q8_snap(&mut normed2);
 
-            let n2pq = PreQuantizedActivations::i2s_only(&normed2);
+            let (n2_scale, n2_sum) = tempura_kernels::quantized::i2s_quantize_into(&normed2, &mut preq_buf[..h]);
             if let (Some(gw), Some(uw)) = (qweights.get_i2s(gate_w_name), qweights.get_i2s(up_w_name)) {
-                par_gemv!(&n2pq, gw, gate, inter, h);
-                par_gemv!(&n2pq, uw, up, inter, h);
+                par_gemv!(&preq_buf[..h], n2_scale, n2_sum, gw, gate, inter, h);
+                par_gemv!(&preq_buf[..h], n2_scale, n2_sum, uw, up, inter, h);
             }
 
             for i in 0..inter { let relu = gate[i].max(0.0); gate[i] = relu * relu * up[i]; }
@@ -1185,9 +1191,9 @@ where
                 rmsnorm.forward(&mut gate, w, inter, cfg.layer_norm_eps).unwrap();
             }
 
-            let gpq = PreQuantizedActivations::i2s_only(&gate);
+            let (gp_scale, gp_sum) = tempura_kernels::quantized::i2s_quantize_into(&gate, &mut preq_buf[..inter]);
             if let Some(dw) = qweights.get_i2s(down_w_name) {
-                par_gemv!(&gpq, dw, down_out, h, inter);
+                par_gemv!(&preq_buf[..inter], gp_scale, gp_sum, dw, down_out, h, inter);
             }
 
             for i in 0..h { hidden[i] += down_out[i]; }

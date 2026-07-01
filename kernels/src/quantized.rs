@@ -1185,6 +1185,17 @@ unsafe fn vec_dot_i2_i8_s_avx512(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
     result
 }
 
+/// Quantize f32 activations to i8 in-place (no allocation). Returns (scale, sum).
+#[cfg(target_arch = "x86_64")]
+pub fn i2s_quantize_into(a: &[f32], dst: &mut [i8]) -> (f32, i32) {
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        let (scale, sum, q8) = unsafe { quantize_row_i8_s_avx2(a) };
+        dst[..a.len()].copy_from_slice(&q8);
+        return (scale, sum);
+    }
+    quantize_row_i8_s(a, dst)
+}
+
 /// Single-threaded I2S GEMV on column range [col_start, col_end).
 /// Called by layer-level threading — each thread processes its own column slice.
 /// Uses raw addresses to satisfy Sync bounds in parallel closures.
