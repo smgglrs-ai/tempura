@@ -5,7 +5,7 @@ use crate::trace::{LayerSnapshot, SamplingSnapshot, TimingInfo, TraceLevel};
 use crate::weights::ModelWeights;
 use serde::Serialize;
 use std::time::Instant;
-use tempura_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
+use tempura_kernels::{Attention, LayerNorm, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
 
 fn apply_head_rmsnorm(
     x: &mut [f32],
@@ -556,6 +556,21 @@ where
                 None
             };
 
+        let alibi_attn: Option<tempura_kernels::attention::CpuAttentionAlibi> = if cfg.use_alibi {
+            Some(tempura_kernels::attention::CpuAttentionAlibi::new(
+                n_heads,
+                cfg.alibi_max_bias,
+            ))
+        } else {
+            None
+        };
+
+        let layernorm: Option<tempura_kernels::layernorm::CpuLayerNorm> = if cfg.use_layernorm {
+            Some(tempura_kernels::layernorm::CpuLayerNorm)
+        } else {
+            None
+        };
+
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
         let inter = cfg.intermediate_size;
@@ -671,22 +686,24 @@ where
 
             normed.copy_from_slice(&hidden);
             let input_ln_w = qweights.get_f32(input_ln_name).unwrap();
-            if let Some(ref drn) = det_rmsnorm {
-                use tempura_kernels::RMSNorm;
+            if let Some(ref ln) = layernorm {
+                let input_ln_b = qweights.get_f32(&format!("model.layers.{layer}.input_layernorm.bias"));
+                ln.forward(&mut normed, input_ln_w, input_ln_b, h, cfg.layer_norm_eps).unwrap();
+            } else if let Some(ref drn) = det_rmsnorm {
                 drn.forward(&mut normed, input_ln_w, h, cfg.layer_norm_eps).unwrap();
             } else {
-            self.pipeline
-                .rmsnorm(
-                    &mut normed,
-                    input_ln_w,
-                    h,
-                    cfg.layer_norm_eps,
-                    TraceLevel::Off,
-                    &mut None,
-                )
-                .unwrap();
+                self.pipeline
+                    .rmsnorm(
+                        &mut normed,
+                        input_ln_w,
+                        h,
+                        cfg.layer_norm_eps,
+                        TraceLevel::Off,
+                        &mut None,
+                    )
+                    .unwrap();
             }
-            if det_rmsnorm.is_some() {
+            if det_rmsnorm.is_some() && layernorm.is_none() {
                 tempura_kernels::portable_math::q8_snap(&mut normed[..seq_len * h]);
             }
 
@@ -785,13 +802,14 @@ where
                 }
             }
 
-            if let Some(ref rope_table) = det_rope {
-                use tempura_kernels::RoPE;
-                rope_table.forward(&mut q, 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
-                rope_table.forward(&mut k, 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
-            } else {
-                self.pipeline.rope(&mut q, 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
-                self.pipeline.rope(&mut k, 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+            if !cfg.use_alibi {
+                if let Some(ref rope_table) = det_rope {
+                    rope_table.forward(&mut q, 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                    rope_table.forward(&mut k, 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                } else {
+                    self.pipeline.rope(&mut q, 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                    self.pipeline.rope(&mut k, 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                }
             }
 
             session.cache.append_kv(
@@ -805,7 +823,17 @@ where
             let v_cache = session.cache.v_data(layer, kv_len);
 
             attn_out.fill(0.0);
-            if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
+            if let Some(ref alibi) = alibi_attn {
+                alibi
+                    .forward(
+                        &q, &k_cache, &v_cache,
+                        &mut attn_out[..seq_len * q_dim],
+                        1, seq_len, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        1.0 / (head_dim as f32).sqrt(),
+                    )
+                    .unwrap();
+            } else if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
                 tempura_kernels::attention::CpuAttentionGgml
                     .forward(
                         &q, &k_cache, &v_cache,
@@ -861,16 +889,76 @@ where
             // FFN block
             normed2.copy_from_slice(&hidden);
             let post_ln_w = qweights.get_f32(post_ln_name).unwrap();
-            if let Some(ref drn) = det_rmsnorm {
-                use tempura_kernels::RMSNorm;
+            if let Some(ref ln) = layernorm {
+                let post_ln_b = qweights.get_f32(&format!("model.layers.{layer}.post_attention_layernorm.bias"));
+                ln.forward(&mut normed2, post_ln_w, post_ln_b, h, cfg.layer_norm_eps).unwrap();
+            } else if let Some(ref drn) = det_rmsnorm {
                 drn.forward(&mut normed2, post_ln_w, h, cfg.layer_norm_eps).unwrap();
             } else {
                 self.pipeline.rmsnorm(&mut normed2, post_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
             }
-            if det_rmsnorm.is_some() {
+            if det_rmsnorm.is_some() && layernorm.is_none() {
                 tempura_kernels::portable_math::q8_snap(&mut normed2[..seq_len * h]);
             }
 
+            if cfg.n_experts > 0 {
+                let arch_name = match cfg.architecture {
+                    crate::config::Architecture::Llama => "mixtral",
+                    _ => "mixtral",
+                };
+                let weight_prefix = crate::moe::moe_weight_prefix(arch_name);
+                let router_name = crate::moe::moe_router_weight_name(arch_name, layer);
+                let has_router = qweights.get_f32(&router_name).is_some()
+                    || qweights.get_q4k(&router_name).is_some()
+                    || qweights.get_q6k(&router_name).is_some()
+                    || qweights.get_typed(&router_name).is_some();
+                if has_router {
+                    let router = tempura_kernels::moe::MoeRouter::new(cfg.n_experts, cfg.n_experts_used);
+                    down_out.fill(0.0);
+                    crate::moe::moe_ffn(
+                        &normed2[..seq_len * h],
+                        &mut down_out[..seq_len * h],
+                        &router,
+                        qweights,
+                        layer,
+                        h,
+                        inter,
+                        cfg.hidden_act,
+                        seq_len,
+                        weight_prefix,
+                        &router_name,
+                    );
+                    for i in 0..seq_len * h {
+                        hidden[i] += down_out[i];
+                    }
+                } else {
+                    eprintln!("[warn] MoE router weight not found for layer {layer}, falling back to dense FFN");
+                    // Fall through to dense FFN below
+                    let normed2_preq_moe = if seq_len == 1 {
+                        Some(PreQuantizedActivations::from_f32(&normed2[..h]))
+                    } else {
+                        None
+                    };
+                    gate.fill(0.0);
+                    up.fill(0.0);
+                    qmm(normed2_preq_moe.as_ref(), &normed2, &gate_w_name, &mut gate[..seq_len * inter], seq_len, inter, h);
+                    qmm(normed2_preq_moe.as_ref(), &normed2, &up_w_name, &mut up[..seq_len * inter], seq_len, inter, h);
+                    for i in 0..seq_len * inter {
+                        gate[i] = tempura_kernels::portable_math::portable_silu(gate[i]) * up[i];
+                    }
+                    down_out.fill(0.0);
+                    let gate_preq_moe = if seq_len == 1 {
+                        Some(PreQuantizedActivations::from_f32(&gate[..inter]))
+                    } else {
+                        None
+                    };
+                    qmm(gate_preq_moe.as_ref(), &gate[..seq_len * inter], &down_w_name, &mut down_out[..seq_len * h], seq_len, h, inter);
+                    for i in 0..seq_len * h {
+                        hidden[i] += down_out[i];
+                    }
+                }
+            } else {
+            // Dense FFN path
             let normed2_preq = if seq_len == 1 {
                 Some(PreQuantizedActivations::from_f32(&normed2[..h]))
             } else {
@@ -1095,6 +1183,7 @@ where
             for i in 0..seq_len * h {
                 hidden[i] += down_out[i];
             }
+            } // end dense FFN else block
 
             if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer < 3 {
                 let last = &hidden[(seq_len - 1) * h..seq_len * h];
@@ -1108,13 +1197,15 @@ where
 
         let mut final_normed = hidden.clone();
         let final_norm_w = qweights.get_f32("model.norm.weight").unwrap();
-        if let Some(ref drn) = det_rmsnorm {
-            use tempura_kernels::RMSNorm;
+        if let Some(ref ln) = layernorm {
+            let final_norm_b = qweights.get_f32("model.norm.bias");
+            ln.forward(&mut final_normed, final_norm_w, final_norm_b, h, cfg.layer_norm_eps).unwrap();
+        } else if let Some(ref drn) = det_rmsnorm {
             drn.forward(&mut final_normed, final_norm_w, h, cfg.layer_norm_eps).unwrap();
         } else {
             self.pipeline.rmsnorm(&mut final_normed, final_norm_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
         }
-        if det_rmsnorm.is_some() {
+        if det_rmsnorm.is_some() && layernorm.is_none() {
             tempura_kernels::portable_math::q8_snap(&mut final_normed[..seq_len * h]);
         }
 
@@ -3748,5 +3839,164 @@ mod tests {
             tokens_contiguous, tokens_paged,
             "paged generate must produce identical tokens"
         );
+    }
+
+    #[test]
+    fn test_falcon_uses_layernorm() {
+        // Falcon config should use LayerNorm (mean-centering), producing different
+        // output from RMSNorm (no mean-centering) given the same weights.
+        let mut falcon_cfg = ModelConfig::tiny_test();
+        falcon_cfg.architecture = crate::config::Architecture::Falcon;
+        falcon_cfg.use_layernorm = true;
+        falcon_cfg.hidden_act = crate::config::HiddenAct::Gelu;
+
+        let llama_cfg = ModelConfig::tiny_test();
+
+        let loader = RandomWeightLoader::from_config(&llama_cfg, 42);
+
+        fn make_qw(loader: &RandomWeightLoader) -> crate::weights::QuantizedWeights {
+            let mut qw = crate::weights::QuantizedWeights::empty();
+            for (name, data) in &loader.tensors {
+                qw.insert_f32(name.clone(), data.clone());
+            }
+            qw
+        }
+        let qw = make_qw(&loader);
+
+        let pipeline1 = KernelPipeline::cpu_verified();
+        let model_falcon = TransformerModel::new(falcon_cfg.clone(), pipeline1);
+
+        let pipeline2 = KernelPipeline::cpu_verified();
+        let model_llama = TransformerModel::new(llama_cfg.clone(), pipeline2);
+
+        let mut s1 = InferenceSession::new(&falcon_cfg, TraceLevel::Off, 42);
+        let mut s2 = InferenceSession::new(&llama_cfg, TraceLevel::Off, 42);
+
+        let logits_falcon = model_falcon.forward_quantized(&mut s1, &[1, 2, 3], &qw);
+        let logits_llama = model_llama.forward_quantized(&mut s2, &[1, 2, 3], &qw);
+
+        // With different norm types and activations, outputs must differ
+        let max_diff: f32 = logits_falcon
+            .iter()
+            .zip(&logits_llama)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            max_diff > 0.001,
+            "Falcon (LayerNorm+GELU) should produce different output from LLaMA (RMSNorm+SiLU), max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn test_mpt_skips_rope_with_alibi() {
+        // MPT uses ALiBi instead of RoPE. Verify via forward_quantized that
+        // use_alibi=true produces different output from the same config without ALiBi.
+        let mut mpt_cfg = ModelConfig::tiny_test();
+        mpt_cfg.architecture = crate::config::Architecture::Mpt;
+        mpt_cfg.use_alibi = true;
+        mpt_cfg.alibi_max_bias = 8.0;
+        mpt_cfg.use_layernorm = true;
+        mpt_cfg.hidden_act = crate::config::HiddenAct::Gelu;
+
+        let mut base_cfg = ModelConfig::tiny_test();
+        base_cfg.hidden_act = crate::config::HiddenAct::Gelu;
+
+        let loader = RandomWeightLoader::from_config(&base_cfg, 42);
+
+        // Build quantized weights from f32
+        fn make_qw(loader: &RandomWeightLoader) -> crate::weights::QuantizedWeights {
+            let mut qw = crate::weights::QuantizedWeights::empty();
+            for (name, data) in &loader.tensors {
+                qw.insert_f32(name.clone(), data.clone());
+            }
+            qw
+        }
+        let qw = make_qw(&loader);
+
+        let pipeline1 = KernelPipeline::cpu_verified();
+        let model_mpt = TransformerModel::new(mpt_cfg.clone(), pipeline1);
+        let pipeline2 = KernelPipeline::cpu_verified();
+        let model_base = TransformerModel::new(base_cfg.clone(), pipeline2);
+
+        let mut s1 = InferenceSession::new(&mpt_cfg, TraceLevel::Off, 42);
+        let mut s2 = InferenceSession::new(&base_cfg, TraceLevel::Off, 42);
+
+        let logits_mpt = model_mpt.forward_quantized(&mut s1, &[1, 2, 3], &qw);
+        let logits_base = model_base.forward_quantized(&mut s2, &[1, 2, 3], &qw);
+
+        // ALiBi (no RoPE, LayerNorm) vs RoPE (RMSNorm) should produce different results
+        let max_diff: f32 = logits_mpt
+            .iter()
+            .zip(&logits_base)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            max_diff > 0.001,
+            "MPT (ALiBi, no RoPE) should differ from base (RoPE), max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn test_moe_dispatch_triggers_with_experts() {
+        // When n_experts > 0 but no expert weights exist, forward_quantized
+        // should fall back to dense FFN with a warning (no panic).
+        let mut moe_cfg = ModelConfig::tiny_test();
+        moe_cfg.n_experts = 8;
+        moe_cfg.n_experts_used = 2;
+
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(moe_cfg.clone(), pipeline);
+        let loader = RandomWeightLoader::from_config(&moe_cfg, 42);
+        model.load_weights(&loader).unwrap();
+
+        // Build quantized weights from the f32 weights (no expert weights present)
+        let mut qw = crate::weights::QuantizedWeights::empty();
+        for (name, data) in &loader.tensors {
+            qw.insert_f32(name.clone(), data.clone());
+        }
+        model.quantized_weights = Some(qw);
+
+        let mut session = InferenceSession::new(&moe_cfg, TraceLevel::Off, 42);
+        // Should not panic — falls back to dense FFN
+        let logits = model.forward(&mut session, &[1, 2, 3]);
+        assert_eq!(logits.len(), moe_cfg.vocab_size);
+        assert!(!logits.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_falcon_config_from_hf_json() {
+        let json = r#"{
+            "model_type": "falcon",
+            "hidden_size": 4544,
+            "intermediate_size": 18176,
+            "num_attention_heads": 71,
+            "num_hidden_layers": 32,
+            "vocab_size": 65024,
+            "hidden_act": "gelu",
+            "parallel_attn": true
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.architecture, crate::config::Architecture::Falcon);
+        assert!(c.use_layernorm);
+        assert!(!c.use_alibi);
+        assert!(c.parallel_attn_ffn);
+        assert_eq!(c.hidden_act, crate::config::HiddenAct::Gelu);
+    }
+
+    #[test]
+    fn test_mpt_config_from_hf_json() {
+        let json = r#"{
+            "model_type": "mpt",
+            "hidden_size": 4096,
+            "intermediate_size": 16384,
+            "num_attention_heads": 32,
+            "num_hidden_layers": 32,
+            "vocab_size": 50432
+        }"#;
+        let c = ModelConfig::from_hf_json(json).unwrap();
+        assert_eq!(c.architecture, crate::config::Architecture::Mpt);
+        assert!(c.use_layernorm);
+        assert!(c.use_alibi);
+        assert!(c.alibi_max_bias > 0.0);
     }
 }

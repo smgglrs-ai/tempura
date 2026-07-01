@@ -31,6 +31,10 @@ pub struct ModelConfig {
     pub architecture: Architecture,
     pub n_experts: usize,
     pub n_experts_used: usize,
+    pub use_layernorm: bool,
+    pub use_alibi: bool,
+    pub alibi_max_bias: f32,
+    pub parallel_attn_ffn: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +148,10 @@ impl ModelConfig {
             architecture: Architecture::Llama,
             n_experts: 0,
             n_experts_used: 0,
+            use_layernorm: false,
+            use_alibi: false,
+            alibi_max_bias: 0.0,
+            parallel_attn_ffn: false,
         }
     }
 
@@ -168,6 +176,10 @@ impl ModelConfig {
             architecture: Architecture::Llama,
             n_experts: 0,
             n_experts_used: 0,
+            use_layernorm: false,
+            use_alibi: false,
+            alibi_max_bias: 0.0,
+            parallel_attn_ffn: false,
         }
     }
 
@@ -192,6 +204,10 @@ impl ModelConfig {
             architecture: Architecture::Llama,
             n_experts: 0,
             n_experts_used: 0,
+            use_layernorm: false,
+            use_alibi: false,
+            alibi_max_bias: 0.0,
+            parallel_attn_ffn: false,
         }
     }
 
@@ -298,6 +314,14 @@ impl ModelConfig {
             architecture,
             n_experts: v.get("num_local_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
             n_experts_used: v.get("num_experts_per_tok").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            use_layernorm: matches!(architecture, Architecture::Falcon | Architecture::Mpt),
+            use_alibi: matches!(architecture, Architecture::Mpt),
+            alibi_max_bias: if matches!(architecture, Architecture::Mpt) {
+                v.get("attn_config").and_then(|c| c.get("alibi_bias_max")).and_then(|v| v.as_f64()).unwrap_or(8.0) as f32
+            } else {
+                0.0
+            },
+            parallel_attn_ffn: v.get("parallel_attn").and_then(|v| v.as_bool()).unwrap_or(false),
         })
     }
 }

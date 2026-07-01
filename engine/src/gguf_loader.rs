@@ -497,6 +497,23 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         architecture,
         n_experts: get_usize("expert_count").unwrap_or(0),
         n_experts_used: get_usize("expert_used_count").unwrap_or(0),
+        use_layernorm: matches!(architecture, crate::config::Architecture::Falcon | crate::config::Architecture::Mpt),
+        use_alibi: matches!(architecture, crate::config::Architecture::Mpt),
+        alibi_max_bias: if matches!(architecture, crate::config::Architecture::Mpt) {
+            metadata
+                .get(&format!("{arch}.attention.alibi_bias_max"))
+                .and_then(|v| v.as_f32())
+                .unwrap_or(8.0)
+        } else {
+            0.0
+        },
+        parallel_attn_ffn: metadata
+            .get(&format!("{arch}.attention.use_parallel_residual"))
+            .and_then(|v| match v {
+                GgufValue::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(false),
     })
 }
 
