@@ -1336,4 +1336,47 @@ mod kani_proofs {
         // q8 index: matches j directly
         assert!(j < 256); // qs array is [i8; 256]
     }
+
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn vec_dot_q4_0_q8_0_no_panic() {
+        let x = BlockQ4_0 {
+            d: kani::any(),
+            qs: kani::any(),
+        };
+        let y = BlockQ8_0 {
+            d: kani::any(),
+            qs: kani::any(),
+        };
+        let _ = vec_dot_q4_0_q8_0(32, &[x], &[y]);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn vec_dot_q8_0_q8_0_no_panic() {
+        let x = BlockQ8_0 {
+            d: kani::any(),
+            qs: kani::any(),
+        };
+        let y = BlockQ8_0 {
+            d: kani::any(),
+            qs: kani::any(),
+        };
+        let _ = vec_dot_q8_0_q8_0(32, &[x], &[y]);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn vec_dot_tq2_0_q8_k_no_panic() {
+        let x = BlockTQ2_0 {
+            qs: kani::any(),
+            d: kani::any(),
+        };
+        let y = BlockQ8K {
+            d: kani::any(),
+            qs: kani::any(),
+            bsums: kani::any(),
+        };
+        let _ = vec_dot_tq2_0_q8_k(256, &[x], &[y]);
+    }
 }

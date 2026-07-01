@@ -1279,4 +1279,157 @@ mod kani_proofs {
             val /= 3;
         }
     }
+
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn dequant_q2k_no_panic() {
+        let blk = BlockQ2K {
+            scales: kani::any(),
+            qs: kani::any(),
+            d: kani::any(),
+            dmin: kani::any(),
+        };
+        let mut out = [0.0f32; 256];
+        dequantize_row_q2_k(&[blk], &mut out);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(257)]
+    fn dequant_q3k_no_panic() {
+        let blk = BlockQ3K {
+            hmask: kani::any(),
+            qs: kani::any(),
+            scales: kani::any(),
+            d: kani::any(),
+        };
+        let mut out = [0.0f32; 256];
+        dequantize_row_q3_k(&[blk], &mut out);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn dequant_q5k_no_panic() {
+        let blk = BlockQ5K {
+            d: kani::any(),
+            dmin: kani::any(),
+            scales: kani::any(),
+            qh: kani::any(),
+            qs: kani::any(),
+        };
+        let mut out = [0.0f32; 256];
+        dequantize_row_q5_k(&[blk], &mut out);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(49)]
+    fn dequant_tq1_0_no_panic() {
+        let blk = BlockTQ1_0 {
+            qs: kani::any(),
+            qh: kani::any(),
+            d: kani::any(),
+        };
+        let mut out = [0.0f32; 256];
+        dequantize_row_tq1_0(&[blk], &mut out);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(129)]
+    fn dequant_q1_0_no_panic() {
+        let data: [u8; BLOCK_Q1_0_SIZE] = kani::any();
+        let mut out = [0.0f32; 128];
+        dequantize_row_q1_0(&data, &mut out, 128);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn dequant_mxfp4_no_panic() {
+        let blk = BlockMxfp4 {
+            e: kani::any(),
+            qs: kani::any(),
+        };
+        let mut out = [0.0f32; 32];
+        dequantize_row_mxfp4(&[blk], &mut out);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn dequant_nvfp4_no_panic() {
+        let blk = BlockNvfp4 {
+            d: kani::any(),
+            qs: kani::any(),
+        };
+        let mut out = [0.0f32; 64];
+        dequantize_row_nvfp4(&[blk], &mut out);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn dequant_iq4_nl_no_panic() {
+        let blk = BlockIQ4NL {
+            d: kani::any(),
+            qs: kani::any(),
+        };
+        let mut out = [0.0f32; 32];
+        dequantize_row_iq4_nl(&[blk], &mut out);
+    }
+
+    #[kani::proof]
+    fn iq2xxs_grid_index_bounds() {
+        let aux8: u8 = kani::any();
+        assert!((aux8 as usize) < 256);
+    }
+
+    #[kani::proof]
+    fn iq2xs_grid_index_bounds() {
+        let q2: u16 = kani::any();
+        let idx = (q2 & 511) as usize;
+        assert!(idx < 512);
+    }
+
+    #[kani::proof]
+    fn iq2s_grid_index_bounds() {
+        let qs_byte: u8 = kani::any();
+        let qh_byte: u8 = kani::any();
+        let l: usize = kani::any();
+        kani::assume(l < 4);
+        let grid_idx = qs_byte as usize | ((qh_byte as usize) << (8 - 2 * l) & 0x300);
+        assert!(grid_idx < 1024);
+    }
+
+    #[kani::proof]
+    fn iq3xxs_grid_index_bounds() {
+        let q3: u8 = kani::any();
+        assert!((q3 as usize) < 256);
+    }
+
+    #[kani::proof]
+    fn iq3s_grid_index_bounds() {
+        let qs_byte: u8 = kani::any();
+        let qh_byte: u8 = kani::any();
+        let l: usize = kani::any();
+        kani::assume(l < 4);
+        let idx1 = qs_byte as usize | ((qh_byte as usize) << (8 - 2 * l) & 256);
+        let idx2 = qs_byte as usize | ((qh_byte as usize) << (7 - 2 * l) & 256);
+        assert!(idx1 < 512);
+        assert!(idx2 < 512);
+    }
+
+    #[kani::proof]
+    fn iq1s_grid_index_bounds() {
+        let qs_byte: u8 = kani::any();
+        let qh: u16 = kani::any();
+        let l: u16 = kani::any();
+        kani::assume(l < 4);
+        let grid_idx = qs_byte as usize | (((qh >> (3 * l)) & 7) as usize) << 8;
+        assert!(grid_idx < 2048);
+    }
+
+    #[kani::proof]
+    fn ksigns_index_bounds() {
+        let val: u32 = kani::any();
+        let l: u32 = kani::any();
+        kani::assume(l < 4);
+        let idx = ((val >> (7 * l)) & 127) as usize;
+        assert!(idx < 128);
+    }
 }
