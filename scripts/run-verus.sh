@@ -227,6 +227,7 @@ MODULES=(
     gpu_elementwise
     kv_rollback
     mma_fragments
+    sampling_chain
 )
 
 TOTAL_VERIFIED=0
