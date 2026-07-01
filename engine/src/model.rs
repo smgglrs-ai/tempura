@@ -1103,173 +1103,95 @@ where
         let mut up = vec![0.0f32; inter];
         let mut down_out = vec![0.0f32; h];
 
-        // Raw addresses for all mutable buffers — safe because barriers
-        // guarantee thread 0 is the only writer to sequential-op buffers,
-        // and matmul threads write to disjoint column ranges.
-        let hidden_addr = hidden.as_mut_ptr() as usize;
-        let normed_addr = normed.as_mut_ptr() as usize;
-        let q_addr = q.as_mut_ptr() as usize;
-        let k_addr = k_buf.as_mut_ptr() as usize;
-        let v_addr = v_buf.as_mut_ptr() as usize;
-        let attn_addr = attn_out.as_mut_ptr() as usize;
-        let o_addr = o_proj.as_mut_ptr() as usize;
-        let normed2_addr = normed2.as_mut_ptr() as usize;
-        let gate_addr = gate.as_mut_ptr() as usize;
-        let up_addr = up.as_mut_ptr() as usize;
-        let down_addr = down_out.as_mut_ptr() as usize;
-        let session_ptr = session as *mut InferenceSession as usize;
+        let pool = tempura_kernels::thread_pool::global_pool();
 
-        macro_rules! slice {
-            ($addr:expr, $len:expr) => { unsafe { std::slice::from_raw_parts($addr as *const f32, $len) } };
-        }
-        macro_rules! slice_mut {
-            ($addr:expr, $len:expr) => { unsafe { std::slice::from_raw_parts_mut($addr as *mut f32, $len) } };
+        macro_rules! par_gemv {
+            ($preq:expr, $w:expr, $out:expr, $n:expr, $k:expr) => {{
+                let pq = $preq;
+                let ws = i2s_weight_scale($w, $n, $k);
+                let w_data = $w;
+                let out_a = $out.as_mut_ptr() as usize;
+                let chunk = ($n + 7) / 8;
+                pool.parallel_chunks($n, chunk, &|start, end| {
+                    i2s_gemv_cols(&pq.i2s_q8, pq.i2s_scale, pq.i2s_sum, w_data, ws, out_a, start, end, $k);
+                });
+            }};
         }
 
-        tempura_kernels::thread_pool::parallel_compute(n_threads, |params| {
-            for layer in 0..cfg.num_layers {
-                let (
-                    ref input_ln_name, ref post_ln_name,
-                    ref q_w_name, ref k_w_name, ref v_w_name,
-                    ref o_w_name, ref _q_norm, ref _k_norm,
-                    ref gate_w_name, ref up_w_name, ref down_w_name,
-                    ref attn_sub_norm_name, ref ffn_sub_norm_name,
-                ) = layer_names[layer];
+        for layer in 0..cfg.num_layers {
+            let (
+                ref input_ln_name, ref post_ln_name,
+                ref q_w_name, ref k_w_name, ref v_w_name,
+                ref o_w_name, ref _q_norm, ref _k_norm,
+                ref gate_w_name, ref up_w_name, ref down_w_name,
+                ref attn_sub_norm_name, ref ffn_sub_norm_name,
+            ) = layer_names[layer];
 
-                // RMSNorm + preq (thread 0)
-                if params.ith == 0 {
-                    let hid = slice!(hidden_addr, h);
-                    let nm = slice_mut!(normed_addr, h);
-                    nm.copy_from_slice(hid);
-                    let w = qweights.get_f32(input_ln_name).unwrap();
-                    use tempura_kernels::RMSNorm;
-                    rmsnorm.forward(nm, w, h, cfg.layer_norm_eps).unwrap();
-                    tempura_kernels::portable_math::q8_snap(nm);
-                }
-                params.barrier.wait();
+            normed.copy_from_slice(&hidden);
+            let w = qweights.get_f32(input_ln_name).unwrap();
+            { use tempura_kernels::RMSNorm; rmsnorm.forward(&mut normed, w, h, cfg.layer_norm_eps).unwrap(); }
+            tempura_kernels::portable_math::q8_snap(&mut normed);
 
-                // q/k/v (all threads, column-sliced — each thread zeroes+writes its own range)
-                let nm = slice!(normed_addr, h);
-                let npq = PreQuantizedActivations::i2s_only(nm);
-                if let (Some(qw), Some(kw), Some(vw)) = (
-                    qweights.get_i2s(q_w_name),
-                    qweights.get_i2s(k_w_name),
-                    qweights.get_i2s(v_w_name),
-                ) {
-                    let qws = i2s_weight_scale(qw, q_dim, h);
-                    let kws = i2s_weight_scale(kw, kv_dim, h);
-                    let vws = i2s_weight_scale(vw, kv_dim, h);
-                    let cols_q = (q_dim + params.nth - 1) / params.nth;
-                    let cols_kv = (kv_dim + params.nth - 1) / params.nth;
-                    let qs = params.ith * cols_q;
-                    let ks = params.ith * cols_kv;
-                    i2s_gemv_cols(&npq.i2s_q8, npq.i2s_scale, npq.i2s_sum, qw, qws, q_addr, qs, (qs+cols_q).min(q_dim), h);
-                    i2s_gemv_cols(&npq.i2s_q8, npq.i2s_scale, npq.i2s_sum, kw, kws, k_addr, ks, (ks+cols_kv).min(kv_dim), h);
-                    i2s_gemv_cols(&npq.i2s_q8, npq.i2s_scale, npq.i2s_sum, vw, vws, v_addr, ks, (ks+cols_kv).min(kv_dim), h);
-                }
-                params.barrier.wait();
-
-                // RoPE + attention + sub_norm (thread 0)
-                if params.ith == 0 {
-                    let qm = slice_mut!(q_addr, q_dim);
-                    let km = slice_mut!(k_addr, kv_dim);
-                    let vm = slice!(v_addr, kv_dim);
-                    let am = slice_mut!(attn_addr, q_dim);
-                    use tempura_kernels::RoPE;
-                    rope.forward(qm, 1, 1, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
-                    rope.forward(km, 1, 1, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
-                    let sess = unsafe { &mut *(session_ptr as *mut InferenceSession) };
-                    sess.cache.append_kv(layer, km, vm, 1);
-                    let kv_len = sess.cache.seq_len + 1;
-                    let kc = sess.cache.k_data(layer, kv_len);
-                    let vc = sess.cache.v_data(layer, kv_len);
-                    tempura_kernels::attention::CpuAttentionGgml
-                        .forward(qm, &kc, &vc, am, 1, 1, kv_len,
-                            n_heads, n_kv_heads, head_dim, 1.0 / (head_dim as f32).sqrt())
-                        .unwrap();
-                    if let Some(w) = qweights.get_f32(attn_sub_norm_name) {
-                        use tempura_kernels::RMSNorm as _;
-                        rmsnorm.forward(am, w, q_dim, cfg.layer_norm_eps).unwrap();
-                    }
-                }
-                params.barrier.wait();
-
-                // o_proj (all threads)
-                let am = slice!(attn_addr, q_dim);
-                let apq = PreQuantizedActivations::i2s_only(am);
-                if let Some(ow) = qweights.get_i2s(o_w_name) {
-                    let ows = i2s_weight_scale(ow, h, q_dim);
-                    let cols = (h + params.nth - 1) / params.nth;
-                    let s = params.ith * cols;
-                    i2s_gemv_cols(&apq.i2s_q8, apq.i2s_scale, apq.i2s_sum, ow, ows, o_addr, s, (s+cols).min(h), q_dim);
-                }
-                params.barrier.wait();
-
-                // residual + FFN norm (thread 0)
-                if params.ith == 0 {
-                    let hid = slice_mut!(hidden_addr, h);
-                    let op = slice!(o_addr, h);
-                    for i in 0..h { hid[i] += op[i]; }
-                    let nm2 = slice_mut!(normed2_addr, h);
-                    nm2.copy_from_slice(hid);
-                    let w = qweights.get_f32(post_ln_name).unwrap();
-                    use tempura_kernels::RMSNorm;
-                    rmsnorm.forward(nm2, w, h, cfg.layer_norm_eps).unwrap();
-                    tempura_kernels::portable_math::q8_snap(nm2);
-                }
-                params.barrier.wait();
-
-                // gate/up (all threads)
-                let nm2 = slice!(normed2_addr, h);
-                let n2pq = PreQuantizedActivations::i2s_only(nm2);
-                if let (Some(gw), Some(uw)) = (
-                    qweights.get_i2s(gate_w_name),
-                    qweights.get_i2s(up_w_name),
-                ) {
-                    let gws = i2s_weight_scale(gw, inter, h);
-                    let uws = i2s_weight_scale(uw, inter, h);
-                    let cols = (inter + params.nth - 1) / params.nth;
-                    let s = params.ith * cols;
-                    i2s_gemv_cols(&n2pq.i2s_q8, n2pq.i2s_scale, n2pq.i2s_sum, gw, gws, gate_addr, s, (s+cols).min(inter), h);
-                    i2s_gemv_cols(&n2pq.i2s_q8, n2pq.i2s_scale, n2pq.i2s_sum, uw, uws, up_addr, s, (s+cols).min(inter), h);
-                }
-                params.barrier.wait();
-
-                // SquaredReLU + sub_norm (thread 0)
-                if params.ith == 0 {
-                    let gm = slice_mut!(gate_addr, inter);
-                    let um = slice!(up_addr, inter);
-                    for i in 0..inter {
-                        let relu = gm[i].max(0.0);
-                        gm[i] = relu * relu * um[i];
-                    }
-                    if let Some(w) = qweights.get_f32(ffn_sub_norm_name) {
-                        use tempura_kernels::RMSNorm as _;
-                        rmsnorm.forward(gm, w, inter, cfg.layer_norm_eps).unwrap();
-                    }
-                }
-                params.barrier.wait();
-
-                // down_proj (all threads)
-                let gm = slice!(gate_addr, inter);
-                let gpq = PreQuantizedActivations::i2s_only(gm);
-                if let Some(dw) = qweights.get_i2s(down_w_name) {
-                    let dws = i2s_weight_scale(dw, h, inter);
-                    let cols = (h + params.nth - 1) / params.nth;
-                    let s = params.ith * cols;
-                    i2s_gemv_cols(&gpq.i2s_q8, gpq.i2s_scale, gpq.i2s_sum, dw, dws, down_addr, s, (s+cols).min(h), inter);
-                }
-                params.barrier.wait();
-
-                // residual (thread 0)
-                if params.ith == 0 {
-                    let hid = slice_mut!(hidden_addr, h);
-                    let dm = slice!(down_addr, h);
-                    for i in 0..h { hid[i] += dm[i]; }
-                }
-                params.barrier.wait();
+            let npq = PreQuantizedActivations::i2s_only(&normed);
+            if let (Some(qw), Some(kw), Some(vw)) = (
+                qweights.get_i2s(q_w_name), qweights.get_i2s(k_w_name), qweights.get_i2s(v_w_name),
+            ) {
+                par_gemv!(&npq, qw, q, q_dim, h);
+                par_gemv!(&npq, kw, k_buf, kv_dim, h);
+                par_gemv!(&npq, vw, v_buf, kv_dim, h);
             }
-        });
+
+            { use tempura_kernels::RoPE;
+              rope.forward(&mut q, 1, 1, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+              rope.forward(&mut k_buf, 1, 1, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+            }
+
+            session.cache.append_kv(layer, &k_buf, &v_buf, 1);
+            let kv_len = session.cache.seq_len + 1;
+            let kc = session.cache.k_data(layer, kv_len);
+            let vc = session.cache.v_data(layer, kv_len);
+            tempura_kernels::attention::CpuAttentionGgml
+                .forward(&q, &kc, &vc, &mut attn_out, 1, 1, kv_len,
+                    n_heads, n_kv_heads, head_dim, 1.0 / (head_dim as f32).sqrt())
+                .unwrap();
+
+            if let Some(w) = qweights.get_f32(attn_sub_norm_name) {
+                use tempura_kernels::RMSNorm as _;
+                rmsnorm.forward(&mut attn_out, w, q_dim, cfg.layer_norm_eps).unwrap();
+            }
+
+            let apq = PreQuantizedActivations::i2s_only(&attn_out);
+            if let Some(ow) = qweights.get_i2s(o_w_name) {
+                par_gemv!(&apq, ow, o_proj, h, q_dim);
+            }
+
+            for i in 0..h { hidden[i] += o_proj[i]; }
+
+            normed2.copy_from_slice(&hidden);
+            let w = qweights.get_f32(post_ln_name).unwrap();
+            { use tempura_kernels::RMSNorm; rmsnorm.forward(&mut normed2, w, h, cfg.layer_norm_eps).unwrap(); }
+            tempura_kernels::portable_math::q8_snap(&mut normed2);
+
+            let n2pq = PreQuantizedActivations::i2s_only(&normed2);
+            if let (Some(gw), Some(uw)) = (qweights.get_i2s(gate_w_name), qweights.get_i2s(up_w_name)) {
+                par_gemv!(&n2pq, gw, gate, inter, h);
+                par_gemv!(&n2pq, uw, up, inter, h);
+            }
+
+            for i in 0..inter { let relu = gate[i].max(0.0); gate[i] = relu * relu * up[i]; }
+
+            if let Some(w) = qweights.get_f32(ffn_sub_norm_name) {
+                use tempura_kernels::RMSNorm as _;
+                rmsnorm.forward(&mut gate, w, inter, cfg.layer_norm_eps).unwrap();
+            }
+
+            let gpq = PreQuantizedActivations::i2s_only(&gate);
+            if let Some(dw) = qweights.get_i2s(down_w_name) {
+                par_gemv!(&gpq, dw, down_out, h, inter);
+            }
+
+            for i in 0..h { hidden[i] += down_out[i]; }
+        }
 
         session.cache.advance(1);
         session.position += 1;
