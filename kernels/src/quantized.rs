@@ -2674,25 +2674,29 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         ]);
 
         #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-        {
-            for j in 0..n {
-                let w_packed = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
-                let raw = unsafe { vec_dot_i2_i8_s_avx512(w_packed, preq_q8, k) };
-                output[j] = (raw - preq_sum) as f32 / preq_scale * w_scale;
-            }
-            return Ok(());
-        }
-
-        #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2") {
-            for j in 0..n {
-                let w_packed = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
-                let raw = unsafe { vec_dot_i2_i8_s_avx2(w_packed, preq_q8, k) };
-                output[j] = (raw - preq_sum) as f32 / preq_scale * w_scale;
-            }
+            let out_addr = output.as_mut_ptr() as usize;
+            let b_addr = b_quantized.as_ptr() as usize;
+            let a_addr = preq_q8.as_ptr() as usize;
+            let has_avx512 = is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vnni");
+
+            let chunk_size = (n + 7) / 8;
+            crate::thread_pool::global_pool().parallel_chunks(n, chunk_size, &|start, end| {
+                for j in start..end {
+                    let w = unsafe {
+                        std::slice::from_raw_parts((b_addr + j * row_packed_bytes) as *const u8, row_packed_bytes)
+                    };
+                    let aq = unsafe { std::slice::from_raw_parts(a_addr as *const i8, k) };
+                    let raw = if has_avx512 {
+                        unsafe { vec_dot_i2_i8_s_avx512(w, aq, k) }
+                    } else {
+                        unsafe { vec_dot_i2_i8_s_avx2(w, aq, k) }
+                    };
+                    unsafe { *(out_addr as *mut f32).add(j) = (raw - preq_sum) as f32 / preq_scale * w_scale; }
+                }
+            });
             return Ok(());
         }
 
