@@ -1,3 +1,21 @@
+- timestamp: "2026-07-02T12:30:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-refinement"
+  summary: >
+    BitNet pure translation audit + fix session. Diagnosed and fixed forward_bitnet_decode
+    "correctness bug" — root cause was forward_quantized using CpuRMSNorm (f32) for
+    attn_sub_norm/ffn_sub_norm while forward_bitnet_decode correctly used CpuRMSNormGgml
+    (f64, matching ggml.c). Error compounded across layers (0.66 max_diff over 3 layers).
+    Fixed forward_quantized to use det_rmsnorm for sub-norms. Re-enabled forward_bitnet_decode
+    dispatch. Cleaned up duplicate buffer declarations and n_threads computation. Added
+    comparison test (test_bitnet_decode_matches_quantized). Line-by-line kernel audit via
+    3 parallel agents: i2s_quantize_into matches ggml-quants.c, vec_dot_i2_i8_s_avx2 matches
+    ggml-bitnet-mad.cpp, tl2.rs matches bitnet-lut-kernels-tl2.h — zero divergences across
+    all three. TL2 wiring deferred: model uses I2S format (ggml-model-i2_s.gguf), not TL2.
+    In bitnet.cpp these are separate compile-time paths with different GGUF formats. 326 tests
+    passing (171 engine + 111 kernels + 44 other).
+
 - timestamp: "2026-06-30T21:15:00Z"
   actor: claude
   action: session-work

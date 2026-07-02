@@ -159,12 +159,11 @@ where
 
     pub fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
         if let Some(qw) = &self.quantized_weights {
-            // TODO: forward_bitnet_decode has a correctness bug — disabled until fixed
-            // if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu
-            //     && token_ids.len() == 1
-            // {
-            //     return self.forward_bitnet_decode(session, token_ids[0], qw);
-            // }
+            if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu
+                && token_ids.len() == 1
+            {
+                return self.forward_bitnet_decode(session, token_ids[0], qw);
+            }
             return self.forward_quantized(session, token_ids, qw);
         }
         let weights = match &self.weights {
@@ -780,9 +779,14 @@ where
             }
 
             if let Some(sub_norm_w) = qweights.get_f32(attn_sub_norm_name) {
-                self.pipeline
-                    .rmsnorm(&mut attn_out[..seq_len * q_dim], sub_norm_w, q_dim, cfg.layer_norm_eps, TraceLevel::Off, &mut None)
-                    .unwrap();
+                if let Some(ref drn) = det_rmsnorm {
+                    use tempura_kernels::RMSNorm;
+                    drn.forward(&mut attn_out[..seq_len * q_dim], sub_norm_w, q_dim, cfg.layer_norm_eps).unwrap();
+                } else {
+                    self.pipeline
+                        .rmsnorm(&mut attn_out[..seq_len * q_dim], sub_norm_w, q_dim, cfg.layer_norm_eps, TraceLevel::Off, &mut None)
+                        .unwrap();
+                }
             }
 
             o_proj.fill(0.0);
@@ -942,9 +946,14 @@ where
             }
 
             if let Some(sub_norm_w) = qweights.get_f32(ffn_sub_norm_name) {
-                self.pipeline
-                    .rmsnorm(&mut gate[..seq_len * inter], sub_norm_w, inter, cfg.layer_norm_eps, TraceLevel::Off, &mut None)
-                    .unwrap();
+                if let Some(ref drn) = det_rmsnorm {
+                    use tempura_kernels::RMSNorm;
+                    drn.forward(&mut gate[..seq_len * inter], sub_norm_w, inter, cfg.layer_norm_eps).unwrap();
+                } else {
+                    self.pipeline
+                        .rmsnorm(&mut gate[..seq_len * inter], sub_norm_w, inter, cfg.layer_norm_eps, TraceLevel::Off, &mut None)
+                        .unwrap();
+                }
             }
 
             down_out.fill(0.0);
@@ -1067,10 +1076,6 @@ where
 
         let positions = [session.position as u32];
 
-        let n_threads = std::thread::available_parallelism()
-            .map(|p| p.get().min(8))
-            .unwrap_or(1);
-
         let layer_names: Vec<_> = (0..cfg.num_layers)
             .map(|l| {
                 let p = format!("model.layers.{l}");
@@ -1092,17 +1097,6 @@ where
             })
             .collect();
 
-        let mut normed = vec![0.0f32; h];
-        let mut q = vec![0.0f32; q_dim];
-        let mut k_buf = vec![0.0f32; kv_dim];
-        let mut v_buf = vec![0.0f32; kv_dim];
-        let mut attn_out = vec![0.0f32; q_dim];
-        let mut o_proj = vec![0.0f32; h];
-        let mut normed2 = vec![0.0f32; h];
-        let mut gate = vec![0.0f32; inter];
-        let mut up = vec![0.0f32; inter];
-        let mut down_out = vec![0.0f32; h];
-
         let max_k = h.max(inter).max(q_dim);
         let mut preq_buf = vec![0i8; max_k];
         let mut normed = vec![0.0f32; h];
@@ -1116,8 +1110,6 @@ where
         let mut up = vec![0.0f32; inter];
         let mut down_out = vec![0.0f32; h];
 
-        // Raw pointers — safe: thread 0 writes sequential ops, all threads
-        // write disjoint matmul column ranges, barriers synchronize.
         let hp = hidden.as_mut_ptr() as usize;
         let np = normed.as_mut_ptr() as usize;
         let qp = q.as_mut_ptr() as usize;
@@ -3994,6 +3986,113 @@ mod tests {
         assert!(
             !logits.iter().all(|&v| v == 0.0),
             "logits should not all be zero"
+        );
+    }
+
+    #[test]
+    fn test_bitnet_decode_matches_quantized() {
+        let h = 512;
+        let heads = 8;
+        let kv_heads = 4;
+        let head_dim = h / heads;
+        let inter = 1408;
+        let vocab = 64;
+        let layers = 3;
+
+        let config = ModelConfig {
+            hidden_size: h,
+            num_attention_heads: heads,
+            num_kv_heads: kv_heads,
+            head_dim,
+            intermediate_size: inter,
+            num_layers: layers,
+            vocab_size: vocab,
+            max_seq_len: 64,
+            rope_theta: 10000.0,
+            layer_norm_eps: 1e-5,
+            hidden_act: crate::config::HiddenAct::SquaredRelu,
+            rope_type: crate::config::RopeType::Norm,
+            quantization: Some(crate::config::QuantConfig {
+                format: crate::config::QuantFormat::Tq2,
+                bits: 2,
+                group_size: 256,
+                symmetric: true,
+            }),
+            tensor_parallel_size: 1,
+            use_qk_norm: false,
+            sliding_window: None,
+        };
+
+        let q_dim = heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
+
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let build_qw = || {
+            let mut i2s = HashMap::new();
+            let mut f32_tensors = HashMap::new();
+            let mut rng = StdRng::seed_from_u64(42);
+            let rand_vec = |rng: &mut StdRng, size: usize| -> Vec<f32> {
+                (0..size).map(|_| rng.random_range(-0.1..0.1)).collect()
+            };
+            f32_tensors.insert("model.embed_tokens.weight".into(), rand_vec(&mut rng, vocab * h));
+            f32_tensors.insert("model.norm.weight".into(), vec![1.0; h]);
+            for l in 0..layers {
+                let p = format!("model.layers.{l}");
+                f32_tensors.insert(format!("{p}.input_layernorm.weight"), vec![1.0; h]);
+                f32_tensors.insert(format!("{p}.post_attention_layernorm.weight"), vec![1.0; h]);
+                f32_tensors.insert(format!("{p}.self_attn.attn_sub_norm.weight"), vec![1.0; q_dim]);
+                f32_tensors.insert(format!("{p}.mlp.ffn_sub_norm.weight"), vec![1.0; inter]);
+                let base = l as u64 * 10;
+                i2s.insert(format!("{p}.self_attn.q_proj.weight"), make_i2s_tensor(q_dim, h, base + 1));
+                i2s.insert(format!("{p}.self_attn.k_proj.weight"), make_i2s_tensor(kv_dim, h, base + 2));
+                i2s.insert(format!("{p}.self_attn.v_proj.weight"), make_i2s_tensor(kv_dim, h, base + 3));
+                i2s.insert(format!("{p}.self_attn.o_proj.weight"), make_i2s_tensor(h, q_dim, base + 4));
+                i2s.insert(format!("{p}.mlp.gate_proj.weight"), make_i2s_tensor(inter, h, base + 5));
+                i2s.insert(format!("{p}.mlp.up_proj.weight"), make_i2s_tensor(inter, h, base + 6));
+                i2s.insert(format!("{p}.mlp.down_proj.weight"), make_i2s_tensor(h, inter, base + 7));
+            }
+            i2s.insert("lm_head.weight".into(), make_i2s_tensor(vocab, h, 100));
+            crate::weights::QuantizedWeights::new_with_ternary(
+                HashMap::new(), HashMap::new(), HashMap::new(), i2s, f32_tensors,
+            )
+        };
+
+        let qw = build_qw();
+
+        // Run forward_quantized on single token
+        let pipeline1 = KernelPipeline::cpu_verified();
+        let model1 = TransformerModel::new(config.clone(), pipeline1);
+        let mut session1 = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let logits_quantized = model1.forward_quantized(&mut session1, &[5], &qw);
+
+        // Run forward_bitnet_decode on same token (fresh session = same initial state)
+        let pipeline2 = KernelPipeline::cpu_verified();
+        let model2 = TransformerModel::new(config.clone(), pipeline2);
+        let mut session2 = InferenceSession::new(&config, TraceLevel::Off, 42);
+        let logits_decode = model2.forward_bitnet_decode(&mut session2, 5, &qw);
+
+        assert_eq!(logits_quantized.len(), logits_decode.len());
+
+        let max_diff = logits_quantized.iter().zip(logits_decode.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        let l2_q: f32 = logits_quantized.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let l2_d: f32 = logits_decode.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+        eprintln!("forward_quantized logits[0..8]: {:?}", &logits_quantized[..8.min(vocab)]);
+        eprintln!("forward_bitnet_decode logits[0..8]: {:?}", &logits_decode[..8.min(vocab)]);
+        eprintln!("max_diff={max_diff:.6} l2_q={l2_q:.4} l2_d={l2_d:.4}");
+
+        assert!(
+            max_diff < 0.01,
+            "forward_quantized and forward_bitnet_decode diverge: max_diff={max_diff:.6}\n\
+             quantized[0..8]: {:?}\n\
+             decode[0..8]: {:?}",
+            &logits_quantized[..8.min(vocab)],
+            &logits_decode[..8.min(vocab)]
         );
     }
 }
