@@ -428,10 +428,10 @@ impl Tl2Config {
             (3200, 3200) => 320,
             (8640, 3200) => 320,
             // BitNet-b1.58-2B-4T (h=2560, inter=6912, kv_dim=640)
-            (640, 2560) => 128,
-            (2560, 2560) => 128,
-            (2560, 6912) => 128,
-            (6912, 2560) => 128,
+            (640, 2560) => 320,
+            (2560, 2560) => 320,
+            (2560, 6912) => 320,
+            (6912, 2560) => 256,
             _ => {
                 // Auto-select: largest factor of m that is 32..=320
                 let mut best = 0;
@@ -447,9 +447,14 @@ impl Tl2Config {
     }
 }
 
-/// Run a full TL2 GEMV: preprocess activations + tiled GEMM.
-/// `a_data` and `sign_data` are sub-regions of the TL2 weight tensor.
-/// Thread 0 only — TL2 handles its own tiling internally.
+/// Run a full TL2 GEMV for batch_size=1 (decode).
+/// Direct translation of ggml.c:12757-13055 (GGML_BITNET_X86_TL2 bs=1 path).
+///
+/// Weight data layout (from ggml_bitnet_transform_tensor):
+///   [0 .. three_k*m/6)                         = three-part weight nibbles (a)
+///   [three_k*m/6 .. three_k*m/6 + three_k*m/24) = sign bits
+///   [three_k*m/6 + three_k*m/24 ..)             = two-part weight nibbles
+///   scale at qweights + k*m/4 (or separate _scale tensor)
 #[cfg(target_arch = "x86_64")]
 pub fn tl2_forward(
     activations: &[f32],
@@ -466,44 +471,91 @@ pub fn tl2_forward(
 
     let n_tile_num = m / cfg.bm;
     let three_k = cfg.three_k;
+    let two_k = cfg.two_k;
 
-    // Sign data starts after the three-part weight indices
-    let sign_offset = three_k * m / 6;
-    if sign_offset > weight_data.len() { return false; }
+    // C: w_size = three_k * ne01 / (2 * 3)
+    let w_size = three_k * m / 6;
+    let w_tile_size = w_size / n_tile_num;
+    // C: c_tile_size = ne01 / n_tile_num  (= bm)
+    let c_tile_size = m / n_tile_num;
+    // C: sign_size = three_k * ne01 / 24
+    let sign_size = three_k * m / 24;
+    let sign_tile_size = sign_size / n_tile_num;
+    // C: sign = qweights + three_k * ne01 / 3 / 2
+    let sign_base = three_k * m / 3 / 2;
 
+    // Preprocessor: quantize activations + build LUTs
+    // C: three_qlut size = three_k / 3 * 16 * 2 * ne11 (ne11=1 for decode)
+    let three_lut_bytes = three_k / 3 * 32; // 16 entries * 2 bytes * 1 batch
+    let two_lut_bytes = if two_k > 0 { two_k / 2 * 32 } else { 0 };
     let mut lut_scale = 0.0f32;
-    let three_lut_size = three_k / 3 * 32;
-    let two_lut_size = if cfg.two_k > 0 { cfg.two_k / 2 * 32 } else { 0 };
-    let mut three_qlut = vec![0i8; three_lut_size];
-    let mut two_qlut = vec![0i8; two_lut_size.max(1)];
+    let mut three_qlut = vec![0i8; three_lut_bytes];
+    let mut two_qlut = vec![0i8; two_lut_bytes.max(1)];
 
     unsafe {
         preprocessor(&cfg, activations, &mut lut_scale, &mut three_qlut, &mut two_qlut, 1);
     }
 
-    for tile in 0..n_tile_num {
-        let w_tile_size = three_k * m / 6 / n_tile_num;
-        let sign_tile_size = three_k * m / 24 / n_tile_num;
-        let c_tile_size = m / n_tile_num;
+    // Per-tile dispatch: three-part accumulates i32, two-part adds + rescales
+    // C: line 13027-13055 (bs=1 path)
+    let two_a_base = if two_k > 0 {
+        // C: two_A = qweights + three_k * ne01 / 3 / 2 + three_k * ne01 / 3 / 8
+        three_k * m / 3 / 2 + three_k * m / 3 / 8
+    } else { 0 };
+    let two_w_size = m * two_k / 4;
+    let two_w_tile_size = if n_tile_num > 0 { two_w_size / n_tile_num } else { 0 };
 
-        let w_off = tile * w_tile_size;
-        let sign_off = sign_offset + tile * sign_tile_size;
-        let out_off = tile * c_tile_size;
+    for i_tile in 0..n_tile_num {
+        let w_offset = i_tile * w_tile_size;
+        let s_offset = sign_base + i_tile * sign_tile_size;
+        let dst_offset = i_tile * c_tile_size;
 
-        let tile_out = &mut output[out_off..out_off + cfg.bm];
+        // Three-part: accumulate i32 cbits (no rescale)
+        let mut cbits = vec![0i32; cfg.bm];
         unsafe {
-            qgemm_lut(
+            qgemm_three(
                 &cfg,
-                &weight_data[w_off..],
-                &weight_data[sign_off..],
+                &weight_data[w_offset..],
+                &weight_data[s_offset..],
                 &three_qlut,
-                w_scale,
-                lut_scale,
-                tile_out,
+                &mut cbits,
                 1,
             );
         }
+
+        // Two-part: add to cbits + rescale to f32
+        if two_k > 0 {
+            let two_w_offset = two_a_base + i_tile * two_w_tile_size;
+            let two_cfg = Tl2Config { three_k: 0, two_k, ..cfg };
+            unsafe {
+                qgemm_two_and_rescale(
+                    &two_cfg,
+                    &weight_data[two_w_offset..],
+                    &two_qlut,
+                    w_scale,
+                    lut_scale,
+                    &mut cbits,
+                    &mut output[dst_offset..dst_offset + cfg.bm],
+                    1,
+                );
+            }
+        } else {
+            // No two-part: just rescale three-part
+            unsafe {
+                qgemm_two_and_rescale(
+                    &cfg,
+                    &[],
+                    &[],
+                    w_scale,
+                    lut_scale,
+                    &mut cbits,
+                    &mut output[dst_offset..dst_offset + cfg.bm],
+                    1,
+                );
+            }
+        }
     }
+
     true
 }
 
@@ -538,9 +590,87 @@ pub unsafe fn preprocessor(
     }
 }
 
-/// Run tiled GEMM: three_tbl_impl over BK blocks, then two_tbl_impl for remainder.
-/// `a` = repacked weights, `sign` = sign bits, `lut` = activation LUT.
-/// Output written to `c` as i32, caller rescales by `1/lut_scale * w_scale`.
+/// Three-part GEMM: accumulates i32 results into cbits. NO rescale.
+/// Translated from three_qgemm_lut_MxK (bitnet-lut-kernels-tl2.h:478-492).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn qgemm_three(
+    cfg: &Tl2Config,
+    a: &[u8],
+    sign: &[u8],
+    lut: &[i8],
+    cbits: &mut [i32],
+    batch_size: usize,
+) {
+    let n_three_blocks = cfg.three_k / cfg.bk;
+    for k_outer in 0..n_three_blocks {
+        let lut_off = k_outer * cfg.bk / 3 * 32;
+        let a_off = k_outer * cfg.bk / 3 / 2 * cfg.bm;
+        let sign_off = k_outer * cfg.bk / 3 / 8 * cfg.bm;
+        three_tbl_impl(
+            cbits,
+            &lut[lut_off..],
+            &a[a_off..],
+            &sign[sign_off..],
+            cfg.bm,
+            cfg.bk,
+            cfg.three_k,
+            batch_size,
+        );
+    }
+}
+
+/// Two-part GEMM: adds i32 results to existing cbits, then rescales to f32.
+/// Translated from two_qgemm_lut_MxK (bitnet-lut-kernels-tl2.h:496-511).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn qgemm_two_and_rescale(
+    cfg: &Tl2Config,
+    a: &[u8],
+    lut: &[i8],
+    w_scale: f32,
+    lut_scale: f32,
+    cbits: &mut [i32],
+    output: &mut [f32],
+    batch_size: usize,
+) {
+    // Two-valued accumulation
+    if cfg.two_k > 0 {
+        let two_k_blocks = cfg.two_k / BK2;
+        let mut two_cbits = vec![0i32; batch_size * cfg.bm];
+        for k_outer in 0..two_k_blocks {
+            let lut_off = k_outer * BK2 / 2 * 32;
+            let a_off = k_outer * BK2 / 2 / 2 * cfg.bm;
+            two_tbl_impl(
+                &mut two_cbits,
+                &lut[lut_off..],
+                &a[a_off..],
+                cfg.bm,
+                cfg.two_k,
+                batch_size,
+            );
+        }
+        // C: ((int32_t*)C)[i] += CBits_two[i]; ((float*)C)[i] = (float)(C[i]) / lut_scale * w_scale
+        for bs in 0..batch_size {
+            for i in 0..cfg.bm {
+                let combined = cbits[i + bs * cfg.bm] + two_cbits[i + bs * cfg.bm];
+                output[i] = combined as f32 / lut_scale * w_scale;
+            }
+        }
+    } else {
+        // No two-part: just rescale three-part cbits
+        // C: ((int32_t*)C)[i] = CBits[i]  (already in cbits)
+        // Then two_qgemm rescales: but if two_k==0, the loop runs 0 times,
+        // and the rescale still happens
+        for bs in 0..batch_size {
+            for i in 0..cfg.bm {
+                output[i] = cbits[i + bs * cfg.bm] as f32 / lut_scale * w_scale;
+            }
+        }
+    }
+}
+
+/// Combined qgemm_lut for backward compatibility (single-tile use).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn qgemm_lut(
@@ -554,48 +684,8 @@ pub unsafe fn qgemm_lut(
     batch_size: usize,
 ) {
     let mut cbits = vec![0i32; batch_size * cfg.bm];
-
-    // Three-valued part
-    let n_three_blocks = cfg.three_k / cfg.bk;
-    for k_outer in 0..n_three_blocks {
-        let lut_off = k_outer * cfg.bk / 3 * 32;
-        let a_off = k_outer * cfg.bk / 3 / 2 * cfg.bm;
-        let sign_off = k_outer * cfg.bk / 3 / 8 * cfg.bm;
-        three_tbl_impl(
-            &mut cbits,
-            &lut[lut_off..],
-            &a[a_off..],
-            &sign[sign_off..],
-            cfg.bm,
-            cfg.bk,
-            cfg.three_k,
-            batch_size,
-        );
-    }
-
-    // Two-valued remainder
-    if cfg.two_k > 0 {
-        let two_k_blocks = cfg.two_k / BK2;
-        for k_outer in 0..two_k_blocks {
-            let lut_off = k_outer * BK2 / 2 * 32;
-            let a_off = k_outer * BK2 / 2 / 2 * cfg.bm;
-            two_tbl_impl(
-                &mut cbits,
-                &lut[lut_off..],
-                &a[a_off..],
-                cfg.bm,
-                cfg.two_k,
-                batch_size,
-            );
-        }
-    }
-
-    // Rescale and write output
-    for bs in 0..batch_size {
-        for i in 0..cfg.bm {
-            output[i] = cbits[i + bs * cfg.bm] as f32 / lut_scale * w_scale;
-        }
-    }
+    qgemm_three(cfg, a, sign, lut, &mut cbits, batch_size);
+    qgemm_two_and_rescale(cfg, &[], lut, w_scale, lut_scale, &mut cbits, output, batch_size);
 }
 
 #[cfg(test)]
@@ -628,5 +718,81 @@ mod tests {
         let mut qlut = vec![0i8; 256];
         unsafe { two_lut_ctor(&mut qlut, &b, scale, 16) };
         assert!(qlut.iter().any(|&v| v != 0), "LUT should have non-zero entries");
+    }
+
+    #[test]
+    fn test_tl2_forward_2tile_256x96() {
+        let home = std::env::var("HOME").unwrap();
+        let data = match std::fs::read(format!("{home}/.cache/tempura/models/test_tl2_256x96.bin")) {
+            Ok(d) => d,
+            Err(_) => { eprintln!("skip: test data not found"); return; }
+        };
+        assert_eq!(data.len(), 5120);
+        let act_bytes = std::fs::read(format!("{home}/.cache/tempura/models/test_tl2_256x96_act.bin")).unwrap();
+        let act: Vec<f32> = act_bytes.chunks(4).map(|c| f32::from_ne_bytes([c[0],c[1],c[2],c[3]])).collect();
+        let ref_bytes = std::fs::read(format!("{home}/.cache/tempura/models/test_tl2_256x96_ref.bin")).unwrap();
+        let y_ref: Vec<f32> = ref_bytes.chunks(4).map(|c| f32::from_ne_bytes([c[0],c[1],c[2],c[3]])).collect();
+
+        let mut output = vec![0.0f32; 256];
+        let ok = tl2_forward(&act, &data, 1.0, &mut output, 256, 96);
+        assert!(ok, "tl2_forward should succeed for 256x96");
+
+        eprintln!("tile0 out[0..4]: {:?}", &output[..4]);
+        eprintln!("tile0 ref[0..4]: {:?}", &y_ref[..4]);
+        eprintln!("tile1 out[128..132]: {:?}", &output[128..132]);
+        eprintln!("tile1 ref[128..132]: {:?}", &y_ref[128..132]);
+
+        let max_err = output.iter().zip(y_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("max_err={max_err:.6}");
+        assert!(max_err < 1.0, "max_err={max_err:.6} — output doesn't match reference");
+    }
+
+    #[test]
+    fn test_tl2_forward_identity_128x96() {
+        // Load TL2-packed 128x96 identity matrix generated by bitnet.cpp converter
+        let home = std::env::var("HOME").unwrap();
+        let path = format!("{home}/.cache/tempura/models/test_tl2_128x96.bin");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skip: {path} not found (run Python converter first)");
+                return;
+            }
+        };
+        assert_eq!(data.len(), 2560, "expected 2048 weight + 512 sign bytes");
+
+        // Activation: [1.0, 2.0, 3.0, ..., 96.0] padded to 96
+        let mut act = vec![0.0f32; 96];
+        for i in 0..96 { act[i] = (i + 1) as f32; }
+
+        let mut output = vec![0.0f32; 128];
+        let w_scale = 1.0f32;
+
+        let ok = tl2_forward(&act, &data, w_scale, &mut output, 128, 96);
+        assert!(ok, "tl2_forward should succeed for 128x96");
+
+        // Identity matrix: output[i] should be act[i] for i < 96, 0 for i >= 96
+        // (with quantization error from 127-scale rounding)
+        eprintln!("output[0..8]: {:?}", &output[..8]);
+        eprintln!("output[93..100]: {:?}", &output[93..100]);
+
+        for i in 0..96 {
+            let expected = act[i];
+            let err = (output[i] - expected).abs();
+            assert!(
+                err < expected.abs() * 0.1 + 0.5,
+                "output[{i}]={:.4} expected {expected:.4} err={err:.4}",
+                output[i]
+            );
+        }
+        for i in 96..128 {
+            assert!(
+                output[i].abs() < 0.5,
+                "output[{i}]={:.4} should be ~0",
+                output[i]
+            );
+        }
     }
 }

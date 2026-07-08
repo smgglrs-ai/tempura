@@ -1203,15 +1203,19 @@ impl GgufLoader {
                         if dims.len() >= 2 {
                             let k = dims[0] as usize;
                             let m = dims[1] as usize;
-                            // ggml_bitnet_transform_tensor: scale at qweights + k*m/4
-                            let scale_offset = k * m / 4;
-                            let scale = if scale_offset + 4 <= raw.len() {
+                            // ggml.c:3488-3491: TL2 tensor nbytes includes +32 for scale
+                            // Scale is a f32 at the end of the padded data, same position
+                            // as ggml_bitnet_transform_tensor reads: qweights + k*m/4
+                            // But TL2 packed data < k*m/4, so scale is at actual data
+                            // end minus 32 (the trailing alignment block)
+                            let mut nbytes = (k.wrapping_sub(256)) * m / 3 * 5 / 8 + 256 * m / 2 * 4 / 8;
+                            if nbytes % 32 != 0 { nbytes = 32 - nbytes % 32 + nbytes; }
+                            let scale = if nbytes + 4 <= raw.len() {
                                 f32::from_ne_bytes([
-                                    raw[scale_offset], raw[scale_offset + 1],
-                                    raw[scale_offset + 2], raw[scale_offset + 3],
+                                    raw[nbytes], raw[nbytes + 1],
+                                    raw[nbytes + 2], raw[nbytes + 3],
                                 ])
                             } else {
-                                // Scale stored as separate _scale tensor
                                 self.tensors.get(&format!("{name}_scale"))
                                     .and_then(|v| v.first().copied())
                                     .unwrap_or(1.0)

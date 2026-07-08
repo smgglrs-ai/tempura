@@ -1175,7 +1175,6 @@ where
                 params.barrier.wait();
                 let ps = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
                 let pm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
-                // TL2 path: thread 0 does full GEMV via tiled LUT kernel
                 let mut used_tl2 = false;
                 if params.ith == 0 {
                     if let (Some(qt), Some(kt), Some(vt)) = (qweights.get_tl2(qn), qweights.get_tl2(kn), qweights.get_tl2(vn)) {
