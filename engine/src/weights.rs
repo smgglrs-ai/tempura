@@ -236,12 +236,21 @@ pub fn transpose_i2s_weights(data: &[u8], n: usize, k: usize) -> Vec<u8> {
 }
 
 #[derive(Debug)]
+pub struct Tl2Tensor {
+    pub data: Vec<u8>,
+    pub m: usize,
+    pub k: usize,
+    pub scale: f32,
+}
+
+#[derive(Debug)]
 pub struct QuantizedWeights {
     q4k_tensors: HashMap<String, Vec<u8>>,
     q6k_tensors: HashMap<String, Vec<u8>>,
     tq2_tensors: HashMap<String, Vec<u8>>,
     i2s_tensors: HashMap<String, Vec<u8>>,
     i2s_lut_tensors: HashMap<String, Vec<u8>>,
+    tl2_tensors: HashMap<String, Tl2Tensor>,
     f32_tensors: HashMap<String, Vec<f32>>,
 }
 
@@ -257,6 +266,7 @@ impl QuantizedWeights {
             tq2_tensors: HashMap::new(),
             i2s_tensors: HashMap::new(),
             i2s_lut_tensors: HashMap::new(),
+            tl2_tensors: HashMap::new(),
             f32_tensors,
         }
     }
@@ -273,6 +283,7 @@ impl QuantizedWeights {
             q6k_tensors,
             tq2_tensors,
             i2s_lut_tensors: HashMap::new(),
+            tl2_tensors: HashMap::new(),
             i2s_tensors,
             f32_tensors,
         }
@@ -296,6 +307,14 @@ impl QuantizedWeights {
 
     pub fn get_i2s_lut(&self, name: &str) -> Option<&[u8]> {
         self.i2s_lut_tensors.get(name).map(|v| v.as_slice())
+    }
+
+    pub fn get_tl2(&self, name: &str) -> Option<&Tl2Tensor> {
+        self.tl2_tensors.get(name)
+    }
+
+    pub fn add_tl2_tensor(&mut self, name: String, data: Vec<u8>, m: usize, k: usize, scale: f32) {
+        self.tl2_tensors.insert(name, Tl2Tensor { data, m, k, scale });
     }
 
     pub fn get_f32(&self, name: &str) -> Option<&[f32]> {

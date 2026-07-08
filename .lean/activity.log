@@ -1,3 +1,18 @@
+- timestamp: "2026-07-02T13:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-refinement"
+  summary: >
+    Added native TL2 GGUF support: GGML_TYPE_TL2 (dtype 39) and TL1 (dtype 38)
+    detection in GGUF loader, Tl2Tensor struct with dimension metadata + extracted
+    scale, runtime dispatch in both forward_bitnet_decode and forward_quantized
+    (TL2 → I2S fallback). Added Tl2Config::for_dims() with auto BM selection and
+    tl2_forward() top-level dispatch. Patched bitnet.cpp converter to handle
+    BitNetForCausalLM architecture, converted model to TL2 format. TL2 GGUF loads
+    and dispatches to TL2 kernel but produces wrong output — converter tiling
+    parameters (bmm/by) need alignment with kernel expectations. I2S path unchanged
+    and verified: coherent output, ~19 tok/s, 326 tests passing.
+
 - timestamp: "2026-07-02T12:30:00Z"
   actor: claude
   action: session-work

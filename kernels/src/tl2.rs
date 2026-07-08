@@ -415,6 +415,96 @@ impl Tl2Config {
         let two_k = k - three_k;
         Self { m, k, bm, bk, three_k, two_k }
     }
+
+    pub fn for_dims(m: usize, k: usize) -> Option<Self> {
+        // bitnet.cpp preset dimension configs (BBK=96 for all x86 TL2)
+        // BM must evenly divide m; BK=96 is universal
+        let bk = 96usize;
+        // Use BM from kernel_config.ini presets, or compute: largest power-of-2
+        // factor of m that is <= 320 and >= 32
+        let bm = match (m, k) {
+            // bitnet_b1_58-3B presets
+            (3200, 8640) => 160,
+            (3200, 3200) => 320,
+            (8640, 3200) => 320,
+            // BitNet-b1.58-2B-4T (h=2560, inter=6912, kv_dim=640)
+            (640, 2560) => 128,
+            (2560, 2560) => 128,
+            (2560, 6912) => 128,
+            (6912, 2560) => 128,
+            _ => {
+                // Auto-select: largest factor of m that is 32..=320
+                let mut best = 0;
+                for candidate in [320, 256, 160, 128, 64, 32] {
+                    if m % candidate == 0 { best = candidate; break; }
+                }
+                if best == 0 { return None; }
+                best
+            }
+        };
+        if m % bm != 0 { return None; }
+        Some(Self::new(m, k, bm, bk))
+    }
+}
+
+/// Run a full TL2 GEMV: preprocess activations + tiled GEMM.
+/// `a_data` and `sign_data` are sub-regions of the TL2 weight tensor.
+/// Thread 0 only — TL2 handles its own tiling internally.
+#[cfg(target_arch = "x86_64")]
+pub fn tl2_forward(
+    activations: &[f32],
+    weight_data: &[u8],
+    w_scale: f32,
+    output: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    let cfg = match Tl2Config::for_dims(m, k) {
+        Some(c) => c,
+        None => return false,
+    };
+
+    let n_tile_num = m / cfg.bm;
+    let three_k = cfg.three_k;
+
+    // Sign data starts after the three-part weight indices
+    let sign_offset = three_k * m / 6;
+    if sign_offset > weight_data.len() { return false; }
+
+    let mut lut_scale = 0.0f32;
+    let three_lut_size = three_k / 3 * 32;
+    let two_lut_size = if cfg.two_k > 0 { cfg.two_k / 2 * 32 } else { 0 };
+    let mut three_qlut = vec![0i8; three_lut_size];
+    let mut two_qlut = vec![0i8; two_lut_size.max(1)];
+
+    unsafe {
+        preprocessor(&cfg, activations, &mut lut_scale, &mut three_qlut, &mut two_qlut, 1);
+    }
+
+    for tile in 0..n_tile_num {
+        let w_tile_size = three_k * m / 6 / n_tile_num;
+        let sign_tile_size = three_k * m / 24 / n_tile_num;
+        let c_tile_size = m / n_tile_num;
+
+        let w_off = tile * w_tile_size;
+        let sign_off = sign_offset + tile * sign_tile_size;
+        let out_off = tile * c_tile_size;
+
+        let tile_out = &mut output[out_off..out_off + cfg.bm];
+        unsafe {
+            qgemm_lut(
+                &cfg,
+                &weight_data[w_off..],
+                &weight_data[sign_off..],
+                &three_qlut,
+                w_scale,
+                lut_scale,
+                tile_out,
+                1,
+            );
+        }
+    }
+    true
 }
 
 /// Preprocess activations: per-tensor quantize + build three/two LUTs.

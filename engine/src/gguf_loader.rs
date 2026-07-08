@@ -43,6 +43,8 @@ pub enum GgmlType {
     BF16 = 30,
     TQ1_0 = 36,  // upstream llama.cpp: base-3 ternary; bitnet.cpp: I2_S (2-bit ternary, no scale)
     TQ2_0 = 37,
+    TL1 = 38,    // bitnet.cpp: ARM TL1 LUT format
+    TL2 = 39,    // bitnet.cpp: x86 TL2 LUT format (tiled nibble+sign)
 }
 
 impl GgmlType {
@@ -63,6 +65,8 @@ impl GgmlType {
             30 => Ok(GgmlType::BF16),
             36 => Ok(GgmlType::TQ1_0),
             37 => Ok(GgmlType::TQ2_0),
+            38 => Ok(GgmlType::TL1),
+            39 => Ok(GgmlType::TL2),
             _ => Err(LoadError::GgufParse(format!("unsupported GGML type: {v}"))),
         }
     }
@@ -659,6 +663,18 @@ fn tensor_data_size(dtype: GgmlType, num_elements: u64, dims: &[u64]) -> u64 {
             num_elements / 4 + 4
         }
         GgmlType::TQ2_0 => (num_elements / 256) * 66,
+        GgmlType::TL1 => {
+            // Same as I2_S: 2-bit packed + 32-byte alignment
+            num_elements / 4 + 32
+        }
+        GgmlType::TL2 => {
+            // bitnet.cpp ggml.c:3488 — size depends on dims, not just element count
+            let k = dims[0];
+            let m = if dims.len() > 1 { dims[1] } else { 1 };
+            let mut nbytes = (k - 256) * m / 3 * 5 / 8 + 256 * m / 2 * 4 / 8;
+            if nbytes % 32 != 0 { nbytes = 32 - nbytes % 32 + nbytes; }
+            nbytes + 32
+        }
     }
 }
 
@@ -971,7 +987,8 @@ impl GgufLoader {
             let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
 
             let keep_raw = (info.dtype == GgmlType::Q4K || info.dtype == GgmlType::Q6K
-                || info.dtype == GgmlType::TQ2_0 || info.dtype == GgmlType::TQ1_0)
+                || info.dtype == GgmlType::TQ2_0 || info.dtype == GgmlType::TQ1_0
+                || info.dtype == GgmlType::TL1 || info.dtype == GgmlType::TL2)
                 && !mapped_name.contains("embed_tokens")
                 && !mapped_name.contains("norm.weight");
 
@@ -991,7 +1008,11 @@ impl GgufLoader {
                     GgmlType::Q5K => dequant_q5k(tensor_data, ne),
                     GgmlType::Q6K => dequant_q6k(tensor_data, ne),
                     GgmlType::TQ2_0 => dequant_tq2(tensor_data, ne),
-                    GgmlType::TQ1_0 => dequant_tq1(tensor_data, ne),
+                    GgmlType::TQ1_0 | GgmlType::TL1 => dequant_tq1(tensor_data, ne),
+                    GgmlType::TL2 => {
+                        // TL2 embed/norm should not appear — fall back to zeros
+                        vec![0.0f32; ne]
+                    }
                 };
                 tensors.insert(mapped_name.clone(), floats);
             } else {
@@ -1115,7 +1136,8 @@ impl GgufLoader {
                 GgmlType::Q5K => dequant_q5k(tensor_data, ne),
                 GgmlType::Q6K => dequant_q6k(tensor_data, ne),
                 GgmlType::TQ2_0 => dequant_tq2(tensor_data, ne),
-                GgmlType::TQ1_0 => dequant_tq1(tensor_data, ne),
+                GgmlType::TQ1_0 | GgmlType::TL1 => dequant_tq1(tensor_data, ne),
+                GgmlType::TL2 => vec![0.0f32; ne],
             };
 
             let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
@@ -1164,13 +1186,42 @@ impl GgufLoader {
                 match dtype {
                     GgmlType::Q6K => { q6k_tensors.insert(name.clone(), raw.clone()); }
                     GgmlType::TQ2_0 => { tq2_tensors.insert(name.clone(), raw.clone()); }
-                    GgmlType::TQ1_0 => { i2s_tensors.insert(name.clone(), raw.clone()); }
+                    GgmlType::TQ1_0 | GgmlType::TL1 => { i2s_tensors.insert(name.clone(), raw.clone()); }
+                    GgmlType::TL2 => { /* handled below with dimension metadata */ }
                     _ => { q4k_tensors.insert(name.clone(), raw.clone()); }
                 };
             }
         }
 
         let mut qw = crate::weights::QuantizedWeights::new_with_ternary(q4k_tensors, q6k_tensors, tq2_tensors, i2s_tensors, f32_tensors);
+
+        // Build TL2 tensors with dimension metadata and extracted scale
+        for (name, dtype) in &self.tensor_dtypes {
+            if *dtype == GgmlType::TL2 {
+                if let Some(raw) = self.raw_tensors.get(name) {
+                    if let Some(dims) = self.raw_tensor_dims.get(name) {
+                        if dims.len() >= 2 {
+                            let k = dims[0] as usize;
+                            let m = dims[1] as usize;
+                            // ggml_bitnet_transform_tensor: scale at qweights + k*m/4
+                            let scale_offset = k * m / 4;
+                            let scale = if scale_offset + 4 <= raw.len() {
+                                f32::from_ne_bytes([
+                                    raw[scale_offset], raw[scale_offset + 1],
+                                    raw[scale_offset + 2], raw[scale_offset + 3],
+                                ])
+                            } else {
+                                // Scale stored as separate _scale tensor
+                                self.tensors.get(&format!("{name}_scale"))
+                                    .and_then(|v| v.first().copied())
+                                    .unwrap_or(1.0)
+                            };
+                            qw.add_tl2_tensor(name.clone(), raw.clone(), m, k, scale);
+                        }
+                    }
+                }
+            }
+        }
 
         // Build LUT-format (transposed) I2S tensors for the shuffle-based kernel
         let mut i2s_shapes = std::collections::HashMap::new();

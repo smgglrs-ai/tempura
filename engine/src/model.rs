@@ -484,6 +484,7 @@ where
 
         let q4k = tempura_kernels::quantized::CpuMatMulQ4KOpt;
         use tempura_kernels::quantized::{MatMulQ, PreQuantizedActivations};
+        use tempura_kernels::tl2::tl2_forward;
 
         let det_rmsnorm: Option<Box<dyn tempura_kernels::RMSNorm>> =
             if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu
@@ -563,7 +564,17 @@ where
                     }
                 }
             }
-            if let Some(w) = qweights.get_i2s(name) {
+            if let Some(tl2t) = qweights.get_tl2(name) {
+                // TL2 GEMV per row — tl2_forward handles single-token decode
+                for row in 0..m {
+                    let a_row = &a_f32[row * k..(row + 1) * k];
+                    let out_row = &mut out[row * n..(row + 1) * n];
+                    if !tl2_forward(a_row, &tl2t.data, tl2t.scale, out_row, n, k) {
+                        // Unsupported dimensions — zero output as safety fallback
+                        out_row.fill(0.0);
+                    }
+                }
+            } else if let Some(w) = qweights.get_i2s(name) {
                 if m == 1 {
                     if let Some(pq) = preq {
                         q4k.forward_i2s_preq(&pq.i2s_q8, pq.i2s_scale, pq.i2s_sum, w, out, n, k)
@@ -1005,7 +1016,9 @@ where
         let last_hidden = &final_normed[(seq_len - 1) * h..seq_len * h];
         let mut logits = vec![0.0f32; cfg.vocab_size];
         let lm_head_name = "lm_head.weight";
-        if let Some(w) = qweights.get_i2s(lm_head_name) {
+        if let Some(tl2t) = qweights.get_tl2(lm_head_name) {
+            tl2_forward(last_hidden, &tl2t.data, tl2t.scale, &mut logits, cfg.vocab_size, h);
+        } else if let Some(w) = qweights.get_i2s(lm_head_name) {
             q4k.forward_b_transposed_i2s(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
                 .unwrap();
         } else if let Some(w) = qweights.get_tq2(lm_head_name) {
@@ -1057,6 +1070,7 @@ where
         qweights: &crate::weights::QuantizedWeights,
     ) -> Vec<f32> {
         use tempura_kernels::quantized::{PreQuantizedActivations, i2s_gemv_cols, i2s_weight_scale};
+        use tempura_kernels::tl2::tl2_forward;
 
         let cfg = &self.config;
         let h = cfg.hidden_size;
@@ -1161,12 +1175,24 @@ where
                 params.barrier.wait();
                 let ps = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
                 let pm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
-                if let (Some(qw),Some(kw),Some(vw)) = (qweights.get_i2s(qn),qweights.get_i2s(kn),qweights.get_i2s(vn)) {
-                    let (qs,qe) = ((params.ith*q_dim)/params.nth, ((params.ith+1)*q_dim)/params.nth);
-                    let (ks,ke) = ((params.ith*kv_dim)/params.nth, ((params.ith+1)*kv_dim)/params.nth);
-                    i2s_gemv_cols(is!(pp,h), ps, pm, qw, i2s_weight_scale(qw,q_dim,h), qp, qs, qe, h);
-                    i2s_gemv_cols(is!(pp,h), ps, pm, kw, i2s_weight_scale(kw,kv_dim,h), kp, ks, ke, h);
-                    i2s_gemv_cols(is!(pp,h), ps, pm, vw, i2s_weight_scale(vw,kv_dim,h), vp, ks, ke, h);
+                // TL2 path: thread 0 does full GEMV via tiled LUT kernel
+                let mut used_tl2 = false;
+                if params.ith == 0 {
+                    if let (Some(qt), Some(kt), Some(vt)) = (qweights.get_tl2(qn), qweights.get_tl2(kn), qweights.get_tl2(vn)) {
+                        used_tl2 = tl2_forward(fs!(np,h), &qt.data, qt.scale, fsm!(qp,q_dim), q_dim, h)
+                            && tl2_forward(fs!(np,h), &kt.data, kt.scale, fsm!(kp,kv_dim), kv_dim, h)
+                            && tl2_forward(fs!(np,h), &vt.data, vt.scale, fsm!(vp,kv_dim), kv_dim, h);
+                    }
+                }
+                // I2S fallback: all threads do column-parallel GEMV
+                if !used_tl2 {
+                    if let (Some(qw),Some(kw),Some(vw)) = (qweights.get_i2s(qn),qweights.get_i2s(kn),qweights.get_i2s(vn)) {
+                        let (qs,qe) = ((params.ith*q_dim)/params.nth, ((params.ith+1)*q_dim)/params.nth);
+                        let (ks,ke) = ((params.ith*kv_dim)/params.nth, ((params.ith+1)*kv_dim)/params.nth);
+                        i2s_gemv_cols(is!(pp,h), ps, pm, qw, i2s_weight_scale(qw,q_dim,h), qp, qs, qe, h);
+                        i2s_gemv_cols(is!(pp,h), ps, pm, kw, i2s_weight_scale(kw,kv_dim,h), kp, ks, ke, h);
+                        i2s_gemv_cols(is!(pp,h), ps, pm, vw, i2s_weight_scale(vw,kv_dim,h), vp, ks, ke, h);
+                    }
                 }
                 params.barrier.wait();
 
@@ -1195,9 +1221,17 @@ where
                 params.barrier.wait();
                 let as2 = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
                 let am2 = shared_sum.load(std::sync::atomic::Ordering::Acquire);
-                if let Some(ow) = qweights.get_i2s(on) {
-                    let (s,e) = ((params.ith*h)/params.nth, ((params.ith+1)*h)/params.nth);
-                    i2s_gemv_cols(is!(pp,q_dim), as2, am2, ow, i2s_weight_scale(ow,h,q_dim), op, s, e, q_dim);
+                let mut used_tl2 = false;
+                if params.ith == 0 {
+                    if let Some(ot) = qweights.get_tl2(on) {
+                        used_tl2 = tl2_forward(fs!(ap,q_dim), &ot.data, ot.scale, fsm!(op,h), h, q_dim);
+                    }
+                }
+                if !used_tl2 {
+                    if let Some(ow) = qweights.get_i2s(on) {
+                        let (s,e) = ((params.ith*h)/params.nth, ((params.ith+1)*h)/params.nth);
+                        i2s_gemv_cols(is!(pp,q_dim), as2, am2, ow, i2s_weight_scale(ow,h,q_dim), op, s, e, q_dim);
+                    }
                 }
                 params.barrier.wait();
 
@@ -1218,10 +1252,19 @@ where
                 params.barrier.wait();
                 let ns = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
                 let nm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
-                if let (Some(gw),Some(uw)) = (qweights.get_i2s(gn), qweights.get_i2s(un)) {
-                    let (s,e) = ((params.ith*inter)/params.nth, ((params.ith+1)*inter)/params.nth);
-                    i2s_gemv_cols(is!(pp,h), ns, nm, gw, i2s_weight_scale(gw,inter,h), gp, s, e, h);
-                    i2s_gemv_cols(is!(pp,h), ns, nm, uw, i2s_weight_scale(uw,inter,h), upp, s, e, h);
+                let mut used_tl2 = false;
+                if params.ith == 0 {
+                    if let (Some(gt), Some(ut)) = (qweights.get_tl2(gn), qweights.get_tl2(un)) {
+                        used_tl2 = tl2_forward(fs!(n2p,h), &gt.data, gt.scale, fsm!(gp,inter), inter, h)
+                            && tl2_forward(fs!(n2p,h), &ut.data, ut.scale, fsm!(upp,inter), inter, h);
+                    }
+                }
+                if !used_tl2 {
+                    if let (Some(gw),Some(uw)) = (qweights.get_i2s(gn), qweights.get_i2s(un)) {
+                        let (s,e) = ((params.ith*inter)/params.nth, ((params.ith+1)*inter)/params.nth);
+                        i2s_gemv_cols(is!(pp,h), ns, nm, gw, i2s_weight_scale(gw,inter,h), gp, s, e, h);
+                        i2s_gemv_cols(is!(pp,h), ns, nm, uw, i2s_weight_scale(uw,inter,h), upp, s, e, h);
+                    }
                 }
                 params.barrier.wait();
 
@@ -1242,9 +1285,17 @@ where
                 params.barrier.wait();
                 let gs = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
                 let gm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
-                if let Some(dw) = qweights.get_i2s(dn) {
-                    let (s,e) = ((params.ith*h)/params.nth, ((params.ith+1)*h)/params.nth);
-                    i2s_gemv_cols(is!(pp,inter), gs, gm, dw, i2s_weight_scale(dw,h,inter), dp, s, e, inter);
+                let mut used_tl2 = false;
+                if params.ith == 0 {
+                    if let Some(dt) = qweights.get_tl2(dn) {
+                        used_tl2 = tl2_forward(fs!(gp,inter), &dt.data, dt.scale, fsm!(dp,h), h, inter);
+                    }
+                }
+                if !used_tl2 {
+                    if let Some(dw) = qweights.get_i2s(dn) {
+                        let (s,e) = ((params.ith*h)/params.nth, ((params.ith+1)*h)/params.nth);
+                        i2s_gemv_cols(is!(pp,inter), gs, gm, dw, i2s_weight_scale(dw,h,inter), dp, s, e, inter);
+                    }
                 }
                 params.barrier.wait();
 
@@ -1264,7 +1315,9 @@ where
         tempura_kernels::portable_math::q8_snap(final_normed);
 
         let mut logits = vec![0.0f32; cfg.vocab_size];
-        if let Some(w) = qweights.get_i2s("lm_head.weight") {
+        if let Some(tl2t) = qweights.get_tl2("lm_head.weight") {
+            tl2_forward(final_normed, &tl2t.data, tl2t.scale, &mut logits, cfg.vocab_size, h);
+        } else if let Some(w) = qweights.get_i2s("lm_head.weight") {
             let preq = PreQuantizedActivations::i2s_only(final_normed);
             let q4k = tempura_kernels::quantized::CpuMatMulQ4KOpt;
             use tempura_kernels::quantized::MatMulQ;
