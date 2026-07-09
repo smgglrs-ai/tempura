@@ -762,7 +762,7 @@ pub fn tl2_gemv_tiles_cfg(
 
         let mut cbits = vec![0i32; cfg.bm];
         unsafe {
-            qgemm_three(&cfg, &weight_data[w_offset..], &weight_data[s_offset..], &lut.three_qlut, &mut cbits, 1);
+            qgemm_three(cfg, &weight_data[w_offset..], &weight_data[s_offset..], &lut.three_qlut, &mut cbits, 1);
         }
 
         let out_slice = unsafe {
@@ -777,7 +777,7 @@ pub fn tl2_gemv_tiles_cfg(
             }
         } else {
             unsafe {
-                qgemm_two_and_rescale(&cfg, &[], &[], w_scale, lut.lut_scale, &mut cbits, out_slice, 1);
+                qgemm_two_and_rescale(cfg, &[], &[], w_scale, lut.lut_scale, &mut cbits, out_slice, 1);
             }
         }
     }
