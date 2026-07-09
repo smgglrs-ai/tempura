@@ -1070,7 +1070,7 @@ where
         qweights: &crate::weights::QuantizedWeights,
     ) -> Vec<f32> {
         use tempura_kernels::quantized::{PreQuantizedActivations, i2s_gemv_cols, i2s_weight_scale};
-        use tempura_kernels::tl2::tl2_forward;
+        use tempura_kernels::tl2::{tl2_forward, tl2_preprocess, tl2_gemv_tiles};
 
         let cfg = &self.config;
         let h = cfg.hidden_size;
@@ -1146,6 +1146,7 @@ where
         // Shared scale/sum for activation quantization — thread 0 writes, all read
         let shared_scale = std::sync::atomic::AtomicU32::new(0);
         let shared_sum = std::sync::atomic::AtomicI32::new(0);
+        let shared_tl2_lut = std::sync::atomic::AtomicU64::new(0);
 
         tempura_kernels::thread_pool::parallel_compute(n_threads, |params| {
             macro_rules! fs  { ($a:expr,$n:expr) => { unsafe { std::slice::from_raw_parts($a as *const f32, $n) } } }
@@ -1171,19 +1172,33 @@ where
                     let (s, m) = tempura_kernels::quantized::i2s_quantize_into(fs!(np,h), ism!(pp,h));
                     shared_scale.store(s.to_bits(), std::sync::atomic::Ordering::Release);
                     shared_sum.store(m, std::sync::atomic::Ordering::Release);
+                    // Build TL2 LUT once for all projections sharing this activation
+                    if let Some(lut) = tl2_preprocess(fs!(np,h), h) {
+                        let ptr = Box::into_raw(Box::new(lut)) as u64;
+                        shared_tl2_lut.store(ptr, std::sync::atomic::Ordering::Release);
+                    } else {
+                        shared_tl2_lut.store(0, std::sync::atomic::Ordering::Release);
+                    }
                 }
                 params.barrier.wait();
                 let ps = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
                 let pm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
+                let tl2_lut_ptr = shared_tl2_lut.load(std::sync::atomic::Ordering::Acquire);
                 let mut used_tl2 = false;
-                if params.ith == 0 {
+                if tl2_lut_ptr != 0 {
+                    let lut = unsafe { &*(tl2_lut_ptr as *const tempura_kernels::tl2::Tl2Lut) };
                     if let (Some(qt), Some(kt), Some(vt)) = (qweights.get_tl2(qn), qweights.get_tl2(kn), qweights.get_tl2(vn)) {
-                        used_tl2 = tl2_forward(fs!(np,h), &qt.data, qt.scale, fsm!(qp,q_dim), q_dim, h)
-                            && tl2_forward(fs!(np,h), &kt.data, kt.scale, fsm!(kp,kv_dim), kv_dim, h)
-                            && tl2_forward(fs!(np,h), &vt.data, vt.scale, fsm!(vp,kv_dim), kv_dim, h);
+                        let q_tiles = q_dim / tempura_kernels::tl2::Tl2Config::for_dims(q_dim, h).map(|c| c.bm).unwrap_or(q_dim);
+                        let kv_tiles = kv_dim / tempura_kernels::tl2::Tl2Config::for_dims(kv_dim, h).map(|c| c.bm).unwrap_or(kv_dim);
+                        let qt_s = params.ith * q_tiles / params.nth;
+                        let qt_e = (params.ith + 1) * q_tiles / params.nth;
+                        let kvt_s = params.ith * kv_tiles / params.nth;
+                        let kvt_e = (params.ith + 1) * kv_tiles / params.nth;
+                        used_tl2 = tl2_gemv_tiles(lut, &qt.data, qt.scale, qp, q_dim, h, qt_s, qt_e)
+                            && tl2_gemv_tiles(lut, &kt.data, kt.scale, kp, kv_dim, h, kvt_s, kvt_e)
+                            && tl2_gemv_tiles(lut, &vt.data, vt.scale, vp, kv_dim, h, kvt_s, kvt_e);
                     }
                 }
-                // I2S fallback: all threads do column-parallel GEMV
                 if !used_tl2 {
                     if let (Some(qw),Some(kw),Some(vw)) = (qweights.get_i2s(qn),qweights.get_i2s(kn),qweights.get_i2s(vn)) {
                         let (qs,qe) = ((params.ith*q_dim)/params.nth, ((params.ith+1)*q_dim)/params.nth);
@@ -1194,6 +1209,10 @@ where
                     }
                 }
                 params.barrier.wait();
+                if params.ith == 0 && tl2_lut_ptr != 0 {
+                    unsafe { drop(Box::from_raw(tl2_lut_ptr as *mut tempura_kernels::tl2::Tl2Lut)); }
+                    shared_tl2_lut.store(0, std::sync::atomic::Ordering::Release);
+                }
 
                 if params.ith == 0 {
                     use tempura_kernels::RoPE;
@@ -1216,14 +1235,24 @@ where
                     let (s, m) = tempura_kernels::quantized::i2s_quantize_into(fs!(ap,q_dim), ism!(pp,q_dim));
                     shared_scale.store(s.to_bits(), std::sync::atomic::Ordering::Release);
                     shared_sum.store(m, std::sync::atomic::Ordering::Release);
+                    if let Some(lut) = tl2_preprocess(fs!(ap,q_dim), q_dim) {
+                        shared_tl2_lut.store(Box::into_raw(Box::new(lut)) as u64, std::sync::atomic::Ordering::Release);
+                    } else {
+                        shared_tl2_lut.store(0, std::sync::atomic::Ordering::Release);
+                    }
                 }
                 params.barrier.wait();
                 let as2 = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
                 let am2 = shared_sum.load(std::sync::atomic::Ordering::Acquire);
+                let tl2_lut_ptr = shared_tl2_lut.load(std::sync::atomic::Ordering::Acquire);
                 let mut used_tl2 = false;
-                if params.ith == 0 {
+                if tl2_lut_ptr != 0 {
+                    let lut = unsafe { &*(tl2_lut_ptr as *const tempura_kernels::tl2::Tl2Lut) };
                     if let Some(ot) = qweights.get_tl2(on) {
-                        used_tl2 = tl2_forward(fs!(ap,q_dim), &ot.data, ot.scale, fsm!(op,h), h, q_dim);
+                        let o_tiles = h / tempura_kernels::tl2::Tl2Config::for_dims(h, q_dim).map(|c| c.bm).unwrap_or(h);
+                        let ot_s = params.ith * o_tiles / params.nth;
+                        let ot_e = (params.ith + 1) * o_tiles / params.nth;
+                        used_tl2 = tl2_gemv_tiles(lut, &ot.data, ot.scale, op, h, q_dim, ot_s, ot_e);
                     }
                 }
                 if !used_tl2 {
@@ -1233,6 +1262,10 @@ where
                     }
                 }
                 params.barrier.wait();
+                if params.ith == 0 && tl2_lut_ptr != 0 {
+                    unsafe { drop(Box::from_raw(tl2_lut_ptr as *mut tempura_kernels::tl2::Tl2Lut)); }
+                    shared_tl2_lut.store(0, std::sync::atomic::Ordering::Release);
+                }
 
                 if params.ith == 0 {
                     { let hid = fsm!(hp,h); let oo = fs!(op,h); for i in 0..h { hid[i] += oo[i]; } }
@@ -1247,15 +1280,25 @@ where
                     let (s, m) = tempura_kernels::quantized::i2s_quantize_into(fs!(n2p,h), ism!(pp,h));
                     shared_scale.store(s.to_bits(), std::sync::atomic::Ordering::Release);
                     shared_sum.store(m, std::sync::atomic::Ordering::Release);
+                    if let Some(lut) = tl2_preprocess(fs!(n2p,h), h) {
+                        shared_tl2_lut.store(Box::into_raw(Box::new(lut)) as u64, std::sync::atomic::Ordering::Release);
+                    } else {
+                        shared_tl2_lut.store(0, std::sync::atomic::Ordering::Release);
+                    }
                 }
                 params.barrier.wait();
                 let ns = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
                 let nm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
+                let tl2_lut_ptr = shared_tl2_lut.load(std::sync::atomic::Ordering::Acquire);
                 let mut used_tl2 = false;
-                if params.ith == 0 {
+                if tl2_lut_ptr != 0 {
+                    let lut = unsafe { &*(tl2_lut_ptr as *const tempura_kernels::tl2::Tl2Lut) };
                     if let (Some(gt), Some(ut)) = (qweights.get_tl2(gn), qweights.get_tl2(un)) {
-                        used_tl2 = tl2_forward(fs!(n2p,h), &gt.data, gt.scale, fsm!(gp,inter), inter, h)
-                            && tl2_forward(fs!(n2p,h), &ut.data, ut.scale, fsm!(upp,inter), inter, h);
+                        let g_tiles = inter / tempura_kernels::tl2::Tl2Config::for_dims(inter, h).map(|c| c.bm).unwrap_or(inter);
+                        let gt_s = params.ith * g_tiles / params.nth;
+                        let gt_e = (params.ith + 1) * g_tiles / params.nth;
+                        used_tl2 = tl2_gemv_tiles(lut, &gt.data, gt.scale, gp, inter, h, gt_s, gt_e)
+                            && tl2_gemv_tiles(lut, &ut.data, ut.scale, upp, inter, h, gt_s, gt_e);
                     }
                 }
                 if !used_tl2 {
@@ -1266,6 +1309,10 @@ where
                     }
                 }
                 params.barrier.wait();
+                if params.ith == 0 && tl2_lut_ptr != 0 {
+                    unsafe { drop(Box::from_raw(tl2_lut_ptr as *mut tempura_kernels::tl2::Tl2Lut)); }
+                    shared_tl2_lut.store(0, std::sync::atomic::Ordering::Release);
+                }
 
                 if params.ith == 0 {
                     { let gm = fsm!(gp,inter); let um = fs!(upp,inter);
@@ -1280,14 +1327,24 @@ where
                     let (s, m) = tempura_kernels::quantized::i2s_quantize_into(fs!(gp,inter), ism!(pp,inter));
                     shared_scale.store(s.to_bits(), std::sync::atomic::Ordering::Release);
                     shared_sum.store(m, std::sync::atomic::Ordering::Release);
+                    if let Some(lut) = tl2_preprocess(fs!(gp,inter), inter) {
+                        shared_tl2_lut.store(Box::into_raw(Box::new(lut)) as u64, std::sync::atomic::Ordering::Release);
+                    } else {
+                        shared_tl2_lut.store(0, std::sync::atomic::Ordering::Release);
+                    }
                 }
                 params.barrier.wait();
                 let gs = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
                 let gm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
+                let tl2_lut_ptr = shared_tl2_lut.load(std::sync::atomic::Ordering::Acquire);
                 let mut used_tl2 = false;
-                if params.ith == 0 {
+                if tl2_lut_ptr != 0 {
+                    let lut = unsafe { &*(tl2_lut_ptr as *const tempura_kernels::tl2::Tl2Lut) };
                     if let Some(dt) = qweights.get_tl2(dn) {
-                        used_tl2 = tl2_forward(fs!(gp,inter), &dt.data, dt.scale, fsm!(dp,h), h, inter);
+                        let d_tiles = h / tempura_kernels::tl2::Tl2Config::for_dims(h, inter).map(|c| c.bm).unwrap_or(h);
+                        let dt_s = params.ith * d_tiles / params.nth;
+                        let dt_e = (params.ith + 1) * d_tiles / params.nth;
+                        used_tl2 = tl2_gemv_tiles(lut, &dt.data, dt.scale, dp, h, inter, dt_s, dt_e);
                     }
                 }
                 if !used_tl2 {
@@ -1297,6 +1354,10 @@ where
                     }
                 }
                 params.barrier.wait();
+                if params.ith == 0 && tl2_lut_ptr != 0 {
+                    unsafe { drop(Box::from_raw(tl2_lut_ptr as *mut tempura_kernels::tl2::Tl2Lut)); }
+                    shared_tl2_lut.store(0, std::sync::atomic::Ordering::Release);
+                }
 
                 if params.ith == 0 {
                     let hid = fsm!(hp,h); let dd = fs!(dp,h);

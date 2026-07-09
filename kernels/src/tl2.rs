@@ -671,14 +671,176 @@ pub fn repack_i2s_to_tl2(i2s: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, f32
     Some((result, scale))
 }
 
+/// Pre-built activation LUT, reusable across multiple weight tensors with the same k.
+/// Translated from the workspace layout in ggml.c:12769-12777.
+pub struct Tl2Lut {
+    pub three_qlut: Vec<i8>,
+    pub two_qlut: Vec<i8>,
+    pub lut_scale: f32,
+    pub three_k: usize,
+    pub two_k: usize,
+}
+
+/// Build activation LUT once. Call this on thread 0 before the barrier.
+/// The returned Tl2Lut is then shared read-only across all tl2_gemv calls
+/// for weight tensors with the same reduction dimension k.
+#[cfg(target_arch = "x86_64")]
+pub fn tl2_preprocess(activations: &[f32], k: usize) -> Option<Tl2Lut> {
+    let cfg = Tl2Config::for_dims(128, k)?; // m doesn't matter for LUT, just need three_k/two_k
+    let three_k = cfg.three_k;
+    let two_k = cfg.two_k;
+
+    let three_lut_bytes = three_k / 3 * 32;
+    let two_lut_bytes = if two_k > 0 { two_k / 2 * 32 } else { 0 };
+    let mut lut_scale = 0.0f32;
+    let mut three_qlut = vec![0i8; three_lut_bytes];
+    let mut two_qlut = vec![0i8; two_lut_bytes.max(1)];
+
+    unsafe {
+        preprocessor(&cfg, activations, &mut lut_scale, &mut three_qlut, &mut two_qlut, 1);
+    }
+
+    Some(Tl2Lut { three_qlut, two_qlut, lut_scale, three_k, two_k })
+}
+
+/// Run TL2 GEMV tiles [tile_start, tile_end) using a pre-built LUT.
+/// Called from within parallel_compute — each thread processes its own tile range.
+#[cfg(target_arch = "x86_64")]
+pub fn tl2_gemv_tiles(
+    lut: &Tl2Lut,
+    weight_data: &[u8],
+    w_scale: f32,
+    output_addr: usize,
+    m: usize,
+    k: usize,
+    tile_start: usize,
+    tile_end: usize,
+) -> bool {
+    let cfg = match Tl2Config::for_dims(m, k) {
+        Some(c) => c,
+        None => return false,
+    };
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+
+    let n_tile_num = m / cfg.bm;
+    let three_k = cfg.three_k;
+    let two_k = cfg.two_k;
+
+    let w_tile_size = three_k * m / 6 / n_tile_num;
+    let c_tile_size = cfg.bm;
+    let sign_tile_size = three_k * m / 24 / n_tile_num;
+    let sign_base = three_k * m / 3 / 2;
+
+    let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
+    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
+    let two_lut_bytes = if two_k > 0 { two_k / 2 * 32 } else { 0 };
+
+    for i_tile in tile_start..tile_end {
+        let w_offset = i_tile * w_tile_size;
+        let s_offset = sign_base + i_tile * sign_tile_size;
+        let dst_offset = i_tile * c_tile_size;
+
+        let mut cbits = vec![0i32; cfg.bm];
+        unsafe {
+            qgemm_three(&cfg, &weight_data[w_offset..], &weight_data[s_offset..], &lut.three_qlut, &mut cbits, 1);
+        }
+
+        let out_slice = unsafe {
+            std::slice::from_raw_parts_mut((output_addr as *mut f32).add(dst_offset), cfg.bm)
+        };
+
+        if two_k > 0 {
+            let two_w_offset = two_a_base + i_tile * two_w_tile_size;
+            let two_cfg = Tl2Config { three_k: 0, two_k, ..cfg };
+            unsafe {
+                qgemm_two_and_rescale(&two_cfg, &weight_data[two_w_offset..], &lut.two_qlut, w_scale, lut.lut_scale, &mut cbits, out_slice, 1);
+            }
+        } else {
+            unsafe {
+                qgemm_two_and_rescale(&cfg, &[], &[], w_scale, lut.lut_scale, &mut cbits, out_slice, 1);
+            }
+        }
+    }
+    true
+}
+
+/// Run TL2 GEMV using a pre-built LUT. Tiles distributed across thread pool.
+#[cfg(target_arch = "x86_64")]
+pub fn tl2_gemv(
+    lut: &Tl2Lut,
+    weight_data: &[u8],
+    w_scale: f32,
+    output: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    let cfg = match Tl2Config::for_dims(m, k) {
+        Some(c) => c,
+        None => return false,
+    };
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+
+    let n_tile_num = m / cfg.bm;
+    let three_k = cfg.three_k;
+    let two_k = cfg.two_k;
+
+    let w_tile_size = three_k * m / 6 / n_tile_num;
+    let c_tile_size = cfg.bm;
+    let sign_tile_size = three_k * m / 24 / n_tile_num;
+    let sign_base = three_k * m / 3 / 2;
+
+    let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
+    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
+
+    let three_lut_bytes = three_k / 3 * 32;
+    let two_lut_bytes = if two_k > 0 { two_k / 2 * 32 } else { 0 };
+
+    let out_ptr = output.as_mut_ptr() as usize;
+    let wd_ptr = weight_data.as_ptr() as usize;
+    let wd_len = weight_data.len();
+    let tql_ptr = lut.three_qlut.as_ptr() as usize;
+    let twql_ptr = lut.two_qlut.as_ptr() as usize;
+    let lut_scale = lut.lut_scale;
+
+    crate::thread_pool::global_pool().parallel_chunks(n_tile_num, 1, &|tile_start, tile_end| {
+        for i_tile in tile_start..tile_end {
+            let w_offset = i_tile * w_tile_size;
+            let s_offset = sign_base + i_tile * sign_tile_size;
+            let dst_offset = i_tile * c_tile_size;
+
+            let wd = unsafe { std::slice::from_raw_parts(wd_ptr as *const u8, wd_len) };
+            let tql = unsafe { std::slice::from_raw_parts(tql_ptr as *const i8, three_lut_bytes) };
+
+            let mut cbits = vec![0i32; cfg.bm];
+            unsafe {
+                qgemm_three(&cfg, &wd[w_offset..], &wd[s_offset..], tql, &mut cbits, 1);
+            }
+
+            let out_slice = unsafe {
+                std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(dst_offset), cfg.bm)
+            };
+
+            if two_k > 0 {
+                let two_w_offset = two_a_base + i_tile * two_w_tile_size;
+                let two_cfg = Tl2Config { three_k: 0, two_k, ..cfg };
+                let twql = unsafe { std::slice::from_raw_parts(twql_ptr as *const i8, two_lut_bytes.max(1)) };
+                unsafe {
+                    qgemm_two_and_rescale(&two_cfg, &wd[two_w_offset..], twql, w_scale, lut_scale, &mut cbits, out_slice, 1);
+                }
+            } else {
+                unsafe {
+                    qgemm_two_and_rescale(&cfg, &[], &[], w_scale, lut_scale, &mut cbits, out_slice, 1);
+                }
+            }
+        }
+    });
+
+    true
+}
+
 /// Run a full TL2 GEMV for batch_size=1 (decode).
-/// Direct translation of ggml.c:12757-13055 (GGML_BITNET_X86_TL2 bs=1 path).
-///
-/// Weight data layout (from ggml_bitnet_transform_tensor):
-///   [0 .. three_k*m/6)                         = three-part weight nibbles (a)
-///   [three_k*m/6 .. three_k*m/6 + three_k*m/24) = sign bits
-///   [three_k*m/6 + three_k*m/24 ..)             = two-part weight nibbles
-///   scale at qweights + k*m/4 (or separate _scale tensor)
+/// Convenience wrapper that builds LUT internally — use tl2_preprocess + tl2_gemv
+/// to share the LUT across multiple weight tensors.
 #[cfg(target_arch = "x86_64")]
 pub fn tl2_forward(
     activations: &[f32],
