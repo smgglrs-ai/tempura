@@ -319,6 +319,88 @@ pub unsafe fn three_tbl_impl(
     }
 }
 
+/// Const-specialized three_tbl_impl for BK=96 (kk=32). All loop bounds are
+/// compile-time constants, enabling full unrolling.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn three_tbl_impl_bk96(
+    c: &mut [i32],
+    lut: &[i8],
+    a: &[u8],
+    sign: &[u8],
+    bm: usize,
+    k3: usize,
+    batch_size: usize,
+) {
+    let vec_mask = _mm256_set1_epi8(0x0f);
+    const KK: usize = 32; // bk=96, kk=bk/3=32
+
+    for i in (0..bm).step_by(32) {
+        let zero = _mm256_setzero_si256();
+        let mut vec_as: [__m256i; 16] = [zero; 16]; // KK/2 = 16
+        let mut vec_signs: [__m256i; 4] = [zero; 4]; // KK/8 = 4
+
+        // Fully unrolled loads — compiler knows these are exactly 16 + 4
+        for ai in 0..16 {
+            vec_as[ai] = _mm256_loadu_si256(a.as_ptr().add(i * 16 + ai * 32) as *const __m256i);
+        }
+        for s in 0..4 {
+            vec_signs[s] = _mm256_loadu_si256(sign.as_ptr().add(i * 4 + s * 32) as *const __m256i);
+        }
+
+        for bs in 0..batch_size {
+            let mut vec_c0 = zero;
+            let mut vec_c1 = zero;
+
+            macro_rules! sub {
+                ($kg:expr, $j:literal, $shl0:literal, $shl1:literal, $shl2:literal, $shl3:literal) => {{
+                    let vec_a = vec_as[$kg * 4 + $j];
+                    let lut_off = $kg * 256 + $j * 64 + k3 / 3 * 32 * bs;
+                    let vec_sign = vec_signs[$kg];
+                    let k1 = _mm_loadu_si128(lut.as_ptr().add(lut_off) as *const __m128i);
+                    let k2 = _mm_loadu_si128(lut.as_ptr().add(lut_off + 16) as *const __m128i);
+                    let k3v = _mm_loadu_si128(lut.as_ptr().add(lut_off + 32) as *const __m128i);
+                    let k4 = _mm_loadu_si128(lut.as_ptr().add(lut_off + 48) as *const __m128i);
+                    let slh = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, $shl0), 15);
+                    let sll = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, $shl1), 15);
+                    let v_top = _mm256_and_si256(_mm256_srli_epi16(vec_a, 4), vec_mask);
+                    let vtf = _mm256_shuffle_epi8(_mm256_set_m128i(k1, k1), v_top);
+                    let vts = _mm256_shuffle_epi8(_mm256_set_m128i(k2, k2), v_top);
+                    let srh = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, $shl2), 15);
+                    let srl = _mm256_srai_epi16(_mm256_slli_epi16(vec_sign, $shl3), 15);
+                    let v_bot = _mm256_and_si256(vec_a, vec_mask);
+                    let vbf = _mm256_shuffle_epi8(_mm256_set_m128i(k3v, k3v), v_bot);
+                    let vbs = _mm256_shuffle_epi8(_mm256_set_m128i(k4, k4), v_bot);
+                    vec_c0 = _mm256_add_epi16(vec_c0, _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vtf, vts), slh), slh));
+                    vec_c0 = _mm256_add_epi16(vec_c0, _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vbf, vbs), srh), srh));
+                    vec_c1 = _mm256_add_epi16(vec_c1, _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vtf, vts), sll), sll));
+                    vec_c1 = _mm256_add_epi16(vec_c1, _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vbf, vbs), srl), srl));
+                }};
+            }
+
+            // Fully unrolled: kg=0..4 (KK/8=4), each with j=0..3
+            sub!(0, 0, 0, 1, 2, 3); sub!(0, 1, 4, 5, 6, 7); sub!(0, 2, 8, 9, 10, 11); sub!(0, 3, 12, 13, 14, 15);
+            sub!(1, 0, 0, 1, 2, 3); sub!(1, 1, 4, 5, 6, 7); sub!(1, 2, 8, 9, 10, 11); sub!(1, 3, 12, 13, 14, 15);
+            sub!(2, 0, 0, 1, 2, 3); sub!(2, 1, 4, 5, 6, 7); sub!(2, 2, 8, 9, 10, 11); sub!(2, 3, 12, 13, 14, 15);
+            sub!(3, 0, 0, 1, 2, 3); sub!(3, 1, 4, 5, 6, 7); sub!(3, 2, 8, 9, 10, 11); sub!(3, 3, 12, 13, 14, 15);
+
+            let off = i + bm * bs;
+            let mut gc0 = _mm256_loadu_si256(c.as_ptr().add(off) as *const __m256i);
+            let mut gc1 = _mm256_loadu_si256(c.as_ptr().add(off + 8) as *const __m256i);
+            let mut gc2 = _mm256_loadu_si256(c.as_ptr().add(off + 16) as *const __m256i);
+            let mut gc3 = _mm256_loadu_si256(c.as_ptr().add(off + 24) as *const __m256i);
+            gc0 = _mm256_add_epi32(gc0, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c0)));
+            gc1 = _mm256_add_epi32(gc1, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)));
+            gc2 = _mm256_add_epi32(gc2, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c1)));
+            gc3 = _mm256_add_epi32(gc3, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)));
+            _mm256_storeu_si256(c.as_mut_ptr().add(off) as *mut __m256i, gc0);
+            _mm256_storeu_si256(c.as_mut_ptr().add(off + 8) as *mut __m256i, gc1);
+            _mm256_storeu_si256(c.as_mut_ptr().add(off + 16) as *mut __m256i, gc2);
+            _mm256_storeu_si256(c.as_mut_ptr().add(off + 24) as *mut __m256i, gc3);
+        }
+    }
+}
+
 // ── two_tbl_impl ───────────────────────────────────────────────────────────
 
 const BK2: usize = 32;
@@ -432,7 +514,7 @@ impl Tl2Config {
             (8640, 3200) => 320,
             // BitNet-b1.58-2B-4T (h=2560, inter=6912, kv_dim=640)
             // BM chosen for thread utilization: m/BM >= n_threads (8)
-            (640, 2560) => 64,   // 640/64=10 tiles
+            (640, 2560) => 320,  // 640/320=2 tiles (matches bitnet.cpp)
             (2560, 2560) => 320, // 2560/320=8 tiles
             (2560, 6912) => 320, // 2560/320=8 tiles
             (6912, 2560) => 256, // 6912/256=27 tiles
@@ -765,7 +847,8 @@ pub fn tl2_gemv_tiles(
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn tl2_gemv_tiles_cfg(
+#[target_feature(enable = "avx2")]
+unsafe fn tl2_gemv_tiles_cfg_avx2(
     lut: &Tl2Lut,
     weight_data: &[u8],
     w_scale: f32,
@@ -788,36 +871,45 @@ pub fn tl2_gemv_tiles_cfg(
 
     let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
     let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
-    let two_lut_bytes = if two_k > 0 { two_k / 2 * 32 } else { 0 };
 
-    let mut cbits = vec![0i32; cfg.bm];
+    let mut cbits_arr = [0i32; 1024];
+    assert!(cfg.bm <= 1024);
+    let cbits = &mut cbits_arr[..cfg.bm];
     for i_tile in tile_start..tile_end {
         let w_offset = i_tile * w_tile_size;
         let s_offset = sign_base + i_tile * sign_tile_size;
         let dst_offset = i_tile * c_tile_size;
 
         for b in cbits.iter_mut() { *b = 0; }
-        unsafe {
-            qgemm_three(cfg, &weight_data[w_offset..], &weight_data[s_offset..], &lut.three_qlut, &mut cbits, 1);
-        }
+        qgemm_three(cfg, &weight_data[w_offset..], &weight_data[s_offset..], &lut.three_qlut, cbits, 1);
 
-        let out_slice = unsafe {
-            std::slice::from_raw_parts_mut((output_addr as *mut f32).add(dst_offset), cfg.bm)
-        };
+        let out_slice = std::slice::from_raw_parts_mut((output_addr as *mut f32).add(dst_offset), cfg.bm);
 
         if two_k > 0 {
             let two_w_offset = two_a_base + i_tile * two_w_tile_size;
             let two_cfg = Tl2Config { three_k: 0, two_k, ..*cfg };
-            unsafe {
-                qgemm_two_and_rescale(&two_cfg, &weight_data[two_w_offset..], &lut.two_qlut, w_scale, lut.lut_scale, &mut cbits, out_slice, 1);
-            }
+            qgemm_two_and_rescale(&two_cfg, &weight_data[two_w_offset..], &lut.two_qlut, w_scale, lut.lut_scale, cbits, out_slice, 1);
         } else {
-            unsafe {
-                qgemm_two_and_rescale(cfg, &[], &[], w_scale, lut.lut_scale, &mut cbits, out_slice, 1);
-            }
+            qgemm_two_and_rescale(cfg, &[], &[], w_scale, lut.lut_scale, cbits, out_slice, 1);
         }
     }
     true
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn tl2_gemv_tiles_cfg(
+    lut: &Tl2Lut,
+    weight_data: &[u8],
+    w_scale: f32,
+    output_addr: usize,
+    cfg: &Tl2Config,
+    tile_start: usize,
+    tile_end: usize,
+) -> bool {
+    if is_x86_feature_detected!("avx2") {
+        return unsafe { tl2_gemv_tiles_cfg_avx2(lut, weight_data, w_scale, output_addr, cfg, tile_start, tile_end) };
+    }
+    false
 }
 
 /// Run TL2 GEMV using a pre-built LUT. Tiles distributed across thread pool.
@@ -1043,7 +1135,6 @@ pub unsafe fn preprocessor(
 }
 
 /// Three-part GEMM: accumulates i32 results into cbits. NO rescale.
-/// Translated from three_qgemm_lut_MxK (bitnet-lut-kernels-tl2.h:478-492).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn qgemm_three(
@@ -1055,20 +1146,33 @@ pub unsafe fn qgemm_three(
     batch_size: usize,
 ) {
     let n_three_blocks = cfg.three_k / cfg.bk;
+    let use_bk96 = cfg.bk == 96;
     for k_outer in 0..n_three_blocks {
         let lut_off = k_outer * cfg.bk / 3 * 32;
         let a_off = k_outer * cfg.bk / 3 / 2 * cfg.bm;
         let sign_off = k_outer * cfg.bk / 3 / 8 * cfg.bm;
-        three_tbl_impl(
-            cbits,
-            &lut[lut_off..],
-            &a[a_off..],
-            &sign[sign_off..],
-            cfg.bm,
-            cfg.bk,
-            cfg.three_k,
-            batch_size,
-        );
+        if use_bk96 {
+            three_tbl_impl_bk96(
+                cbits,
+                &lut[lut_off..],
+                &a[a_off..],
+                &sign[sign_off..],
+                cfg.bm,
+                cfg.three_k,
+                batch_size,
+            );
+        } else {
+            three_tbl_impl(
+                cbits,
+                &lut[lut_off..],
+                &a[a_off..],
+                &sign[sign_off..],
+                cfg.bm,
+                cfg.bk,
+                cfg.three_k,
+                batch_size,
+            );
+        }
     }
 }
 
