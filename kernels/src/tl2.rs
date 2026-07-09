@@ -399,6 +399,7 @@ pub unsafe fn two_tbl_impl(
 // ── Top-level GEMM dispatch ────────────────────────────────────────────────
 
 /// TL2 tile configuration for a specific (m, k) weight shape.
+#[derive(Clone, Copy)]
 pub struct Tl2Config {
     pub m: usize,
     pub k: usize,
@@ -428,10 +429,11 @@ impl Tl2Config {
             (3200, 3200) => 320,
             (8640, 3200) => 320,
             // BitNet-b1.58-2B-4T (h=2560, inter=6912, kv_dim=640)
-            (640, 2560) => 320,
-            (2560, 2560) => 320,
-            (2560, 6912) => 320,
-            (6912, 2560) => 256,
+            // BM chosen for thread utilization: m/BM >= n_threads (8)
+            (640, 2560) => 64,   // 640/64=10 tiles
+            (2560, 2560) => 320, // 2560/320=8 tiles
+            (2560, 6912) => 320, // 2560/320=8 tiles
+            (6912, 2560) => 256, // 6912/256=27 tiles
             _ => {
                 // Auto-select: largest factor of m that is 32..=320
                 let mut best = 0;
@@ -472,6 +474,10 @@ fn i2s_extract_trit(i2s: &[u8], row: usize, col: usize, k: usize) -> i8 {
 /// Output: (tl2_data, scale) — nibble indices + sign bits in tiled layout.
 pub fn repack_i2s_to_tl2(i2s: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, f32)> {
     let cfg = Tl2Config::for_dims(m, k)?;
+    repack_i2s_to_tl2_with_config(i2s, m, k, &cfg)
+}
+
+pub fn repack_i2s_to_tl2_with_config(i2s: &[u8], m: usize, k: usize, cfg: &Tl2Config) -> Option<(Vec<u8>, f32)> {
     let big_bm = cfg.bm;   // BM in the Python — tile height
     let big_by = cfg.bk;   // BY/BK in the Python — reduction tile
     let bmm: usize = 32;   // bmm in the Python — inner tile
@@ -720,6 +726,20 @@ pub fn tl2_gemv_tiles(
         Some(c) => c,
         None => return false,
     };
+    tl2_gemv_tiles_cfg(lut, weight_data, w_scale, output_addr, &cfg, tile_start, tile_end)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn tl2_gemv_tiles_cfg(
+    lut: &Tl2Lut,
+    weight_data: &[u8],
+    w_scale: f32,
+    output_addr: usize,
+    cfg: &Tl2Config,
+    tile_start: usize,
+    tile_end: usize,
+) -> bool {
+    let m = cfg.m;
     if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
 
     let n_tile_num = m / cfg.bm;
@@ -751,7 +771,7 @@ pub fn tl2_gemv_tiles(
 
         if two_k > 0 {
             let two_w_offset = two_a_base + i_tile * two_w_tile_size;
-            let two_cfg = Tl2Config { three_k: 0, two_k, ..cfg };
+            let two_cfg = Tl2Config { three_k: 0, two_k, ..*cfg };
             unsafe {
                 qgemm_two_and_rescale(&two_cfg, &weight_data[two_w_offset..], &lut.two_qlut, w_scale, lut.lut_scale, &mut cbits, out_slice, 1);
             }
@@ -1227,6 +1247,52 @@ mod tests {
             max_err < mad_norm * 0.05 + 1.0,
             "TL2 should match MAD: max_err={max_err:.6} mad_norm={mad_norm:.4}"
         );
+    }
+
+    #[test]
+    fn bench_tl2_bm_tuning() {
+        let shapes = [(2560, 2560), (2560, 6912), (6912, 2560), (640, 2560)];
+        for (m, k) in shapes {
+            let packed_bytes = m * k / 4;
+            let mut i2s = vec![0u8; packed_bytes + 4];
+            let mut rng = 42u64;
+            let row_bytes = k / 4;
+            for r in 0..m {
+                for c in 0..k {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let trit = ((rng >> 33) % 3) as u8;
+                    let group = c / 128;
+                    let within = c % 128;
+                    let gi = within / 32;
+                    let gp = within % 32;
+                    i2s[r * row_bytes + group * 32 + gp] |= trit << (6 - 2 * gi);
+                }
+            }
+            i2s[packed_bytes..packed_bytes + 4].copy_from_slice(&1.0f32.to_ne_bytes());
+
+            let act: Vec<f32> = (0..k).map(|i| (i as f32 - k as f32 / 2.0) * 0.001).collect();
+
+            let candidates: Vec<usize> = [32, 64, 128, 160, 256, 320, 640]
+                .iter().copied().filter(|&bm| m % bm == 0).collect();
+
+            for &bm in &candidates {
+                let cfg = Tl2Config::new(m, k, bm, 96);
+                let (tl2_data, scale) = repack_i2s_to_tl2_with_config(&i2s, m, k, &cfg).unwrap();
+                let lut = tl2_preprocess(&act, k).unwrap();
+                let mut output = vec![0.0f32; m];
+                let n_tiles = m / bm;
+
+                let iters = 20;
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    tl2_gemv_tiles_cfg(&lut, &tl2_data, scale, output.as_mut_ptr() as usize, &cfg, 0, n_tiles);
+                }
+                let elapsed = start.elapsed();
+                let us_per = elapsed.as_micros() as f64 / iters as f64;
+                eprintln!("({m},{k}) BM={bm:>3}: {us_per:.0}µs/iter");
+            }
+            eprintln!();
+        }
     }
 
     #[test]
