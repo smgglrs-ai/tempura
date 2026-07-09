@@ -298,6 +298,71 @@ fn flash_attention(
     Ok(())
 }
 
+/// Decode-only attention for a range of heads [head_start, head_end).
+/// Pre-allocated scores buffer avoids per-head allocation.
+/// seq_len MUST be 1 (decode). For parallelize-across-heads from the decode loop.
+#[cfg(feature = "cpu")]
+pub fn attention_decode_heads(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    output: &mut [f32],
+    scores: &mut [f32],
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    head_start: usize,
+    head_end: usize,
+) {
+    let heads_per_group = num_heads / num_kv_heads;
+
+    for h in head_start..head_end {
+        let kv_h = h / heads_per_group;
+        let q_offset = h * head_dim;
+        let q_vec = &q[q_offset..q_offset + head_dim];
+
+        let scores = &mut scores[..kv_len];
+        for kv_s in 0..kv_len {
+            let k_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+            let k_vec = &k[k_offset..k_offset + head_dim];
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                dot += q_vec[d] * k_vec[d];
+            }
+            scores[kv_s] = dot * scale;
+        }
+
+        let mut max_score = f32::NEG_INFINITY;
+        for &s in scores.iter() {
+            if s > max_score { max_score = s; }
+        }
+
+        let mut sum: f64 = 0.0;
+        for s in scores.iter_mut() {
+            let val = crate::portable_math::ggml_exp(*s - max_score);
+            sum += val as f64;
+            *s = val;
+        }
+
+        let inv_sum = (1.0 / sum) as f32;
+        for s in scores.iter_mut() {
+            *s *= inv_sum;
+        }
+
+        let o_offset = h * head_dim;
+        for d in 0..head_dim {
+            let mut val = 0.0f32;
+            for (kv_s, &score) in scores.iter().enumerate() {
+                let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim + d;
+                val += score * v[v_offset];
+            }
+            output[o_offset + d] = val;
+        }
+    }
+}
+
 // ── Concrete CPU attention structs ─────────────────────────────────────────
 
 #[cfg(feature = "cpu")]

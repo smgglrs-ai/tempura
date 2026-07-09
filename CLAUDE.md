@@ -161,7 +161,7 @@ Three-crate workspace + standalone verification crate:
 - [x] GGUF loader: detect `model_type: "bitnet"`, route to BitLinear layers
 - [ ] TQ2_0 cuda-oxide GPU kernel (dp4a path, shared-memory tile unpack)
 - [x] TQ1_0 CPU-only decode (I2S format via bitnet.cpp translation)
-- [x] Validation against microsoft/bitnet-b1.58-2B-4T-gguf (coherent output, ~20.5 tok/s CPU AVX2)
+- [x] Validation against microsoft/bitnet-b1.58-2B-4T-gguf (coherent output, ~22.0 tok/s CPU AVX2)
 - [x] AVX2/AVX512 maddubs with i16 batched accumulation (bitnet.cpp pattern)
 - [x] Pre-quantized activation sharing across q/k/v and gate/up projections
 - [x] Layer-level rayon::join parallelism for independent projections
@@ -174,6 +174,7 @@ Three-crate workspace + standalone verification crate:
 - [x] Fused serial ops: RMSNorm+q8snap, residual+RMSNorm+q8snap (12→8 barriers/layer)
 - [x] SIMD fused kernels: squared ReLU (AVX2), residual add (AVX2)
 - [x] Zero-alloc i2s_quantize_into AVX2/AVX512 path (no Vec+memcpy per call)
+- [x] Parallel attention across heads in decode (all threads, pre-allocated scores)
 
 ## Build & Test
 

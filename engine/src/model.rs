@@ -1153,6 +1153,23 @@ where
         let shared_sum = std::sync::atomic::AtomicI32::new(0);
         let shared_lut_ok = std::sync::atomic::AtomicBool::new(false);
         let barrier = tempura_kernels::thread_pool::SpinBarrier::new(n_threads);
+        let shared_kvl = std::sync::atomic::AtomicUsize::new(0);
+        let max_seq = cfg.max_seq_len;
+        let mut attn_scores_bufs: Vec<Vec<f32>> = (0..n_threads).map(|_| vec![0.0f32; max_seq]).collect();
+        let attn_scores_ptrs: Vec<usize> = attn_scores_bufs.iter_mut().map(|b| b.as_mut_ptr() as usize).collect();
+
+        let do_profile = std::env::var("TEMPURA_PROFILE").is_ok();
+        let prof_serial1 = std::sync::atomic::AtomicU64::new(0);
+        let prof_qkv_mm = std::sync::atomic::AtomicU64::new(0);
+        let prof_serial2 = std::sync::atomic::AtomicU64::new(0);
+        let prof_rope = std::sync::atomic::AtomicU64::new(0);
+        let prof_attn = std::sync::atomic::AtomicU64::new(0);
+        let prof_lut_prep = std::sync::atomic::AtomicU64::new(0);
+        let prof_o_mm = std::sync::atomic::AtomicU64::new(0);
+        let prof_serial3 = std::sync::atomic::AtomicU64::new(0);
+        let prof_gu_mm = std::sync::atomic::AtomicU64::new(0);
+        let prof_serial4 = std::sync::atomic::AtomicU64::new(0);
+        let prof_dn_mm = std::sync::atomic::AtomicU64::new(0);
 
         pool.run_indexed(&|ith, nth| {
             macro_rules! fs  { ($a:expr,$n:expr) => { unsafe { std::slice::from_raw_parts($a as *const f32, $n) } } }
@@ -1166,6 +1183,7 @@ where
                      ref asn, ref fsn) = layer_names[layer];
 
                 // ── Fused: copy + RMSNorm + q8_snap + i2s_quantize + TL2 preprocess ──
+                let _t0 = if do_profile && ith == 0 { Instant::now() } else { Instant::now() };
                 if ith == 0 {
                     fsm!(np,h).copy_from_slice(fs!(hp,h));
                     let w = qweights.get_f32(iln).unwrap();
@@ -1179,9 +1197,11 @@ where
                     } else {
                         shared_lut_ok.store(false, std::sync::atomic::Ordering::Release);
                     }
+                    if do_profile { prof_serial1.fetch_add(_t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 }
                 barrier.wait(); // B1: quant + LUT ready → QKV matmul
 
+                let _t1 = Instant::now();
                 let ps = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
                 let pm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
                 let lut_ok = shared_lut_ok.load(std::sync::atomic::Ordering::Acquire);
@@ -1209,35 +1229,64 @@ where
                         i2s_gemv_cols(is!(pp,h), ps, pm, vw, i2s_weight_scale(vw,kv_dim,h), vp, ks, ke, h);
                     }
                 }
+                if do_profile && ith == 0 {
+                    prof_qkv_mm.fetch_add(_t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 barrier.wait(); // B2: QKV done
 
-                // ── Fused: RoPE + Attention + attn_sub_norm + i2s_quantize + TL2 preprocess ──
+                // ── Thread 0: RoPE + KV cache append ──
                 if ith == 0 {
+                    let _tr = Instant::now();
                     use tempura_kernels::RoPE;
                     rope.forward(fsm!(qp,q_dim), 1, 1, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
                     rope.forward(fsm!(kp,kv_dim), 1, 1, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                    if do_profile { prof_rope.fetch_add(_tr.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                     let sess = unsafe { &mut *(sp as *mut InferenceSession) };
                     sess.cache.append_kv(layer, fs!(kp,kv_dim), fs!(vp,kv_dim), 1);
-                    let kvl = sess.cache.seq_len + 1;
-                    tempura_kernels::attention::CpuAttentionGgml
-                        .forward(fs!(qp,q_dim), &sess.cache.k_data(layer,kvl), &sess.cache.v_data(layer,kvl),
-                            fsm!(ap,q_dim), 1, 1, kvl, n_heads, n_kv_heads, head_dim,
-                            1.0 / (head_dim as f32).sqrt()).unwrap();
+                    shared_kvl.store(sess.cache.seq_len + 1, std::sync::atomic::Ordering::Release);
+                }
+                barrier.wait(); // B2.5: RoPE done, KV cache ready
+
+                // ── All threads: parallel attention across heads ──
+                let _ta = Instant::now();
+                {
+                    let kvl = shared_kvl.load(std::sync::atomic::Ordering::Acquire);
+                    let sess = unsafe { &*(sp as *const InferenceSession) };
+                    let hs = ith * n_heads / nth;
+                    let he = (ith + 1) * n_heads / nth;
+                    let scores_buf = unsafe { std::slice::from_raw_parts_mut(attn_scores_ptrs[ith] as *mut f32, kvl) };
+                    tempura_kernels::attention::attention_decode_heads(
+                        fs!(qp,q_dim), &sess.cache.k_data(layer,kvl), &sess.cache.v_data(layer,kvl),
+                        fsm!(ap,q_dim), scores_buf, kvl, n_heads, n_kv_heads, head_dim,
+                        1.0 / (head_dim as f32).sqrt(), hs, he);
+                }
+                if do_profile && ith == 0 { prof_attn.fetch_add(_ta.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+                barrier.wait(); // B3: attention done
+
+                // ── Thread 0: attn_sub_norm + i2s_quantize + TL2 preprocess ──
+                let _t2 = Instant::now();
+                if ith == 0 {
                     if let Some(w) = qweights.get_f32(asn) {
                         use tempura_kernels::RMSNorm as _; rmsnorm.forward(fsm!(ap,q_dim), w, q_dim, cfg.layer_norm_eps).unwrap();
                     }
                     let (s, m) = tempura_kernels::quantized::i2s_quantize_into(fs!(ap,q_dim), ism!(pp,q_dim));
                     shared_scale.store(s.to_bits(), std::sync::atomic::Ordering::Release);
                     shared_sum.store(m, std::sync::atomic::Ordering::Release);
+                    let _tl = Instant::now();
                     if lut_qdim_ptr != 0 {
                         let lut = unsafe { &mut *(lut_qdim_ptr as *mut Tl2Lut) };
                         shared_lut_ok.store(tl2_preprocess_into(fs!(ap,q_dim), q_dim, lut), std::sync::atomic::Ordering::Release);
                     } else {
                         shared_lut_ok.store(false, std::sync::atomic::Ordering::Release);
                     }
+                    if do_profile {
+                        prof_lut_prep.fetch_add(_tl.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                        prof_serial2.fetch_add(_t2.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
-                barrier.wait(); // B3: attn quant ready → O matmul
+                barrier.wait(); // B3.5: attn quant ready → O matmul
 
+                let _t3 = Instant::now();
                 let as2 = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
                 let am2 = shared_sum.load(std::sync::atomic::Ordering::Acquire);
                 let lut_ok = shared_lut_ok.load(std::sync::atomic::Ordering::Acquire);
@@ -1257,9 +1306,11 @@ where
                         i2s_gemv_cols(is!(pp,q_dim), as2, am2, ow, i2s_weight_scale(ow,h,q_dim), op, s, e, q_dim);
                     }
                 }
+                if do_profile && ith == 0 { prof_o_mm.fetch_add(_t3.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 barrier.wait(); // B4: O matmul done
 
                 // ── Fused: residual + RMSNorm + q8_snap + i2s_quantize + TL2 preprocess ──
+                let _t4 = if do_profile { Instant::now() } else { Instant::now() };
                 if ith == 0 {
                     let w = qweights.get_f32(pln).unwrap();
                     fused_residual_rmsnorm_q8snap(fsm!(hp,h), fs!(op,h), fsm!(n2p,h), w, h, cfg.layer_norm_eps);
@@ -1272,9 +1323,11 @@ where
                     } else {
                         shared_lut_ok.store(false, std::sync::atomic::Ordering::Release);
                     }
+                    if do_profile { prof_serial3.fetch_add(_t4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 }
                 barrier.wait(); // B5: FFN quant ready → gate/up matmul
 
+                let _t5 = Instant::now();
                 let ns = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
                 let nm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
                 let lut_ok = shared_lut_ok.load(std::sync::atomic::Ordering::Acquire);
@@ -1296,9 +1349,11 @@ where
                         i2s_gemv_cols(is!(pp,h), ns, nm, uw, i2s_weight_scale(uw,inter,h), upp, s, e, h);
                     }
                 }
+                if do_profile && ith == 0 { prof_gu_mm.fetch_add(_t5.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 barrier.wait(); // B6: gate/up done
 
                 // ── Fused: sqrelu + sub_norm + i2s_quantize + TL2 preprocess ──
+                let _t6 = if do_profile { Instant::now() } else { Instant::now() };
                 if ith == 0 {
                     fused_sqrelu_mul(fsm!(gp,inter), fs!(upp,inter), inter);
                     if let Some(w) = qweights.get_f32(fsn) {
@@ -1313,9 +1368,11 @@ where
                     } else {
                         shared_lut_ok.store(false, std::sync::atomic::Ordering::Release);
                     }
+                    if do_profile { prof_serial4.fetch_add(_t6.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 }
                 barrier.wait(); // B7: down quant ready → down matmul
 
+                let _t7 = Instant::now();
                 let gs = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
                 let gm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
                 let lut_ok = shared_lut_ok.load(std::sync::atomic::Ordering::Acquire);
@@ -1335,6 +1392,7 @@ where
                         i2s_gemv_cols(is!(pp,inter), gs, gm, dw, i2s_weight_scale(dw,h,inter), dp, s, e, inter);
                     }
                 }
+                if do_profile && ith == 0 { prof_dn_mm.fetch_add(_t7.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 barrier.wait(); // B8: down matmul done
 
                 if ith == 0 {
@@ -1342,6 +1400,24 @@ where
                 }
             }
         });
+
+        if do_profile && session.position % 10 == 0 {
+            let nl = cfg.num_layers as f64;
+            let s1 = prof_serial1.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let qkv = prof_qkv_mm.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let s2 = prof_serial2.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let omm = prof_o_mm.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let s3 = prof_serial3.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let gu = prof_gu_mm.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let s4 = prof_serial4.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let dn = prof_dn_mm.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let total = s1+qkv+s2+omm+s3+gu+s4+dn;
+            let rp = prof_rope.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let at = prof_attn.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let lp = prof_lut_prep.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            eprintln!("[PROFILE] pos={} per-layer avg (μs): s1={:.0} qkv={:.0} s2={:.0}[rope={:.0} attn={:.0} lut={:.0}] o={:.0} s3={:.0} gu={:.0} s4={:.0} dn={:.0} total={:.0}",
+                session.position, s1, qkv, s2, rp, at, lp, omm, s3, gu, s4, dn, total);
+        }
 
         session.cache.advance(1);
         session.position += 1;
