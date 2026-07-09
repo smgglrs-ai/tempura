@@ -447,6 +447,230 @@ impl Tl2Config {
     }
 }
 
+// ── I2S → TL2 weight repacking ────────────────────────────────────────────
+//
+// Translated from preprocess_three_weights_tl2 / preprocess_two_weights_tl2
+// in convert-hf-to-gguf-bitnet.py. Converts I2S packed bytes (2-bit ternary,
+// 4 values per byte, 128-element groups) to TL2 tiled format (base-3 nibble
+// indices + sign bits, tiled by BM×BK).
+
+fn i2s_extract_trit(i2s: &[u8], row: usize, col: usize, k: usize) -> i8 {
+    let row_bytes = k / 4;
+    let group = col / 128;
+    let within = col % 128;
+    let group_idx = within / 32;
+    let group_pos = within % 32;
+    let byte = i2s[row * row_bytes + group * 32 + group_pos];
+    let bits = (byte >> (6 - 2 * group_idx)) & 0x03;
+    bits as i8 - 1 // {0,1,2} → {-1,0,+1}
+}
+
+/// Repack I2S weight data into TL2 format for a single (m, k) weight tensor.
+/// Direct translation of preprocess_weights_tl2 / preprocess_three_weights_tl2 /
+/// preprocess_two_weights_tl2 from convert-hf-to-gguf-bitnet.py.
+/// Input: I2S packed bytes (2-bit ternary, 4 per byte, 128-element groups).
+/// Output: (tl2_data, scale) — nibble indices + sign bits in tiled layout.
+pub fn repack_i2s_to_tl2(i2s: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, f32)> {
+    let cfg = Tl2Config::for_dims(m, k)?;
+    let big_bm = cfg.bm;   // BM in the Python — tile height
+    let big_by = cfg.bk;   // BY/BK in the Python — reduction tile
+    let bmm: usize = 32;   // bmm in the Python — inner tile
+    let by: usize = 192 / bmm; // by in the Python = 6
+    let three_k = cfg.three_k;
+    let two_k = cfg.two_k;
+
+    let scale_off = k * m / 4;
+    let scale = if scale_off + 4 <= i2s.len() {
+        f32::from_ne_bytes([i2s[scale_off], i2s[scale_off+1], i2s[scale_off+2], i2s[scale_off+3]])
+    } else {
+        1.0
+    };
+
+    // Step 1: Decode all ternary values from I2S into a flat (m, k) i8 array
+    let mut ternary = vec![0i8; m * k];
+    for r in 0..m {
+        for c in 0..k {
+            ternary[r * k + c] = i2s_extract_trit(i2s, r, c, k);
+        }
+    }
+
+    let mut final_weight: Vec<Vec<u8>> = Vec::new();
+
+    // ── Three-part: translated from preprocess_three_weights_tl2 ──
+
+    // Python line 550-556: group into triplets, compute base-3 index
+    let three_n = m * three_k / 3;
+    let mut weight = vec![0i32; three_n];
+    for i in 0..three_n {
+        let flat_idx = i * 3;
+        let r = flat_idx / three_k;
+        let c = flat_idx % three_k;
+        let w0 = ternary[r * k + c] as i32;
+        let w1 = ternary[r * k + c + 1] as i32;
+        let w2 = ternary[r * k + c + 2] as i32;
+        weight[i] = w0 * 9 + w1 * 3 + w2;
+    }
+
+    // Python line 557-558: sign extraction
+    let mut sign_weight = vec![0u8; three_n];
+    let mut abs_weight = vec![0u8; three_n];
+    for i in 0..three_n {
+        let s = if weight[i] < 0 { 1u8 } else if weight[i] > 0 { 0u8 } else { 0u8 };
+        // Python: sign(w) + 2, then where > 1, set 0. So negative → 1, zero/positive → 0
+        sign_weight[i] = s;
+        abs_weight[i] = weight[i].unsigned_abs() as u8;
+    }
+
+    // Now abs_weight is shape (M, three_k/3) and sign_weight is same shape.
+    // Python lines 564-576: reshape-transpose-pack chain for abs_weight
+    // Instead of matching each numpy op, compute the final flat index directly.
+    //
+    // The chain is:
+    //   (M, K3) → (M/BM, BM, K3) .T(0,2,1) → (M/BM, K3, BM)
+    //   → (M/BM, K3/BY3, BY3, BM) .T(0,1,3,2) → (M/BM, K3/BY3, BM, BY3)
+    //     where K3 = three_k/3, BY3 = big_by/3
+    //   → (M/BM, K3/BY3, BM/bmm, bmm, BY3) .T(0,1,2,4,3) → (M/BM, K3/BY3, BM/bmm, BY3, bmm)
+    //   → (M/BM, K3/BY3, BM/bmm, BY3/(by/3), by/3, bmm) .T(0,1,2,3,5,4)
+    //     → (M/BM, K3/BY3, BM/bmm, BY3/(by/3), bmm, by/3)
+    //   Then pack pairs: w0 << 4 | w1
+    //   Reshape to (total_chunks, bmm//8, 8), swap rows [0,2,1,3], flatten to (total_chunks, bmm)
+
+    let k3 = three_k / 3;
+    let by3 = big_by / 3;
+    let by_inner = by / 3; // = 2
+    let n_bm_tiles = m / big_bm;
+    let n_by_tiles = k3 / by3;
+    let n_bmm_groups = big_bm / bmm;
+    let n_by_groups = by3 / by_inner;
+
+    // Build packed nibble array: shape (n_bm_tiles, n_by_tiles, n_bmm_groups, n_by_groups, bmm, by_inner)
+    // where by_inner=2 and we pack [0]<<4 | [1]
+    let total_chunks = n_bm_tiles * n_by_tiles * n_bmm_groups * n_by_groups;
+    let mut nibbles = vec![0u8; total_chunks * bmm];
+
+    for t0 in 0..n_bm_tiles {
+        for t1 in 0..n_by_tiles {
+            for t2 in 0..n_bmm_groups {
+                for t3 in 0..n_by_groups {
+                    let chunk_idx = ((t0 * n_by_tiles + t1) * n_bmm_groups + t2) * n_by_groups + t3;
+                    for br in 0..bmm {
+                        let row = t0 * big_bm + t2 * bmm + br;
+                        let col0 = t1 * by3 + t3 * by_inner;
+                        let v0 = abs_weight[row * k3 + col0];
+                        let v1 = if by_inner > 1 { abs_weight[row * k3 + col0 + 1] } else { 0 };
+                        nibbles[chunk_idx * bmm + br] = (v0 << 4) | (v1 & 0x0f);
+                    }
+                }
+            }
+        }
+    }
+
+    // Byte reorder: reshape (total_chunks, bmm//8, 8), swap rows [0,2,1,3]
+    for chunk in 0..total_chunks {
+        let base = chunk * bmm;
+        // bmm=32, bmm//8=4, 4 rows of 8 bytes each
+        // swap row 1 (bytes 8..15) ↔ row 2 (bytes 16..23)
+        for i in 0..8 {
+            nibbles.swap(base + 8 + i, base + 16 + i);
+        }
+    }
+
+    // Append nibble chunks to final_weight
+    for chunk in 0..total_chunks {
+        final_weight.push(nibbles[chunk * bmm..(chunk + 1) * bmm].to_vec());
+    }
+
+    // ── Sign packing (Python lines 581-595) ──
+    // After the same tiling as abs_weight, 16 sign bits pack into u16 words.
+    // Traced mapping: for half-row hr in [0, bmm/2), bit i maps to:
+    //   even i: sign_weight[t2*bmm + hr,        t1*by3 + sg*8 + i/2]
+    //   odd i:  sign_weight[t2*bmm + bmm/2 + hr, t1*by3 + sg*8 + i/2]
+    let sign_groups_per_by = by3 / 8; // by3=32, 32/8 = 4
+
+    for t0 in 0..n_bm_tiles {
+        for t1 in 0..n_by_tiles {
+            for t2 in 0..n_bmm_groups {
+                for sg in 0..sign_groups_per_by {
+                    let mut packed = vec![0u8; bmm];
+                    for hr in 0..(bmm / 2) {
+                        let row_lo = t0 * big_bm + t2 * bmm + hr;
+                        let row_hi = row_lo + bmm / 2;
+                        let col_base = t1 * by3 + sg * 8;
+                        let mut word: u16 = 0;
+                        for c in 0..8 {
+                            let col = col_base + c;
+                            if col < k3 {
+                                let s_lo = sign_weight[row_lo * k3 + col] as u16;
+                                let s_hi = sign_weight[row_hi * k3 + col] as u16;
+                                word |= s_lo << (15 - c * 2);
+                                word |= s_hi << (14 - c * 2);
+                            }
+                        }
+                        packed[hr * 2] = word as u8;
+                        packed[hr * 2 + 1] = (word >> 8) as u8;
+                    }
+                    final_weight.push(packed);
+                }
+            }
+        }
+    }
+
+    // ── Two-part weights (Python lines 523-547) ──
+    if two_k > 0 {
+        let two_n = m * two_k / 2;
+        let mut two_weight = vec![0u8; two_n];
+        for i in 0..two_n {
+            let flat_idx = i * 2;
+            let r = flat_idx / two_k;
+            let c_base = three_k + flat_idx % two_k;
+            let w0 = ternary[r * k + c_base] as i32;
+            let w1 = ternary[r * k + c_base + 1] as i32;
+            two_weight[i] = (w0 * 3 + w1 + 4) as u8;
+        }
+
+        let two_by_tile: usize = 32;
+        let two_by_inner: usize = 4;
+        let k2 = two_k / 2;
+        let n_two_by_tiles = k2 / (two_by_tile / 2);
+        let n_two_by_groups = (two_by_tile / 2) / (two_by_inner / 2);
+        let two_pairs = two_by_inner / 2;
+
+        let total_two_chunks = n_bm_tiles * n_two_by_tiles.max(1) * n_bmm_groups * n_two_by_groups.max(1);
+        let mut two_nibbles = vec![0u8; total_two_chunks * bmm];
+
+        for t0 in 0..n_bm_tiles {
+            for t1 in 0..n_two_by_tiles.max(1) {
+                for t2 in 0..n_bmm_groups {
+                    for t3 in 0..n_two_by_groups.max(1) {
+                        let chunk_idx = ((t0 * n_two_by_tiles.max(1) + t1) * n_bmm_groups + t2) * n_two_by_groups.max(1) + t3;
+                        for br in 0..bmm {
+                            let row = t0 * big_bm + t2 * bmm + br;
+                            let col0 = t1 * (two_by_tile / 2) + t3 * two_pairs;
+                            let v0 = if col0 < k2 { two_weight[row * k2 + col0] } else { 0 };
+                            let v1 = if two_pairs > 1 && col0 + 1 < k2 { two_weight[row * k2 + col0 + 1] } else { 0 };
+                            two_nibbles[chunk_idx * bmm + br] = (v0 << 4) | (v1 & 0x0f);
+                        }
+                    }
+                }
+            }
+        }
+
+        for chunk in 0..total_two_chunks {
+            let base = chunk * bmm;
+            for i in 0..8 {
+                two_nibbles.swap(base + 8 + i, base + 16 + i);
+            }
+        }
+
+        for chunk in 0..total_two_chunks {
+            final_weight.push(two_nibbles[chunk * bmm..(chunk + 1) * bmm].to_vec());
+        }
+    }
+
+    let result: Vec<u8> = final_weight.into_iter().flatten().collect();
+    Some((result, scale))
+}
+
 /// Run a full TL2 GEMV for batch_size=1 (decode).
 /// Direct translation of ggml.c:12757-13055 (GGML_BITNET_X86_TL2 bs=1 path).
 ///
@@ -718,6 +942,119 @@ mod tests {
         let mut qlut = vec![0i8; 256];
         unsafe { two_lut_ctor(&mut qlut, &b, scale, 16) };
         assert!(qlut.iter().any(|&v| v != 0), "LUT should have non-zero entries");
+    }
+
+    #[test]
+    fn test_repack_i2s_to_tl2_matches_mad() {
+        use crate::quantized::{i2s_gemv_cols, i2s_weight_scale};
+
+        // Create I2S weights: 128x128 with known ternary pattern
+        let m = 128usize;
+        let k = 128usize;
+        let packed_bytes = m * k / 4;
+        let mut i2s = vec![0u8; packed_bytes + 4]; // +4 for scale
+
+        // Fill with a pattern: diagonal = +1, rest = 0
+        // I2S packing: byte at row*row_bytes + group*32 + pos
+        // value at group_idx within byte: bits (6-2*group_idx)
+        let row_bytes = k / 4;
+        for r in 0..m {
+            for c in 0..k {
+                let trit: u8 = if r == c { 2 } else { 1 }; // 2=+1, 1=0
+                let group = c / 128;
+                let within = c % 128;
+                let group_idx = within / 32;
+                let group_pos = within % 32;
+                let byte_off = r * row_bytes + group * 32 + group_pos;
+                i2s[byte_off] |= trit << (6 - 2 * group_idx);
+            }
+        }
+        // Scale = 1.0
+        i2s[packed_bytes..packed_bytes + 4].copy_from_slice(&1.0f32.to_ne_bytes());
+
+        // Activation
+        let act: Vec<f32> = (1..=k).map(|i| i as f32 * 0.1).collect();
+
+        // MAD reference output
+        let mut q8 = vec![0i8; k];
+        let (scale, sum) = crate::quantized::i2s_quantize_into(&act, &mut q8);
+        let w_scale = i2s_weight_scale(&i2s, m, k);
+        let mut mad_out = vec![0.0f32; m];
+        let out_addr = mad_out.as_mut_ptr() as usize;
+        i2s_gemv_cols(&q8, scale, sum, &i2s, w_scale, out_addr, 0, m, k);
+
+        // TL2 repack + forward
+        let (tl2_data, tl2_scale) = repack_i2s_to_tl2(&i2s, m, k).expect("repack should succeed");
+        let mut tl2_out = vec![0.0f32; m];
+        let ok = tl2_forward(&act, &tl2_data, tl2_scale, &mut tl2_out, m, k);
+        assert!(ok, "tl2_forward should succeed");
+
+        eprintln!("MAD[0..8]: {:?}", &mad_out[..8]);
+        eprintln!("TL2[0..8]: {:?}", &tl2_out[..8]);
+
+        let max_err = mad_out.iter().zip(tl2_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let mad_norm: f32 = mad_out.iter().map(|x| x * x).sum::<f32>().sqrt();
+        eprintln!("max_err={max_err:.6} mad_norm={mad_norm:.4}");
+
+        assert!(
+            max_err < mad_norm * 0.05 + 1.0,
+            "TL2 output should match MAD within 5% + 1.0: max_err={max_err:.6}"
+        );
+    }
+
+    #[test]
+    fn test_repack_i2s_to_tl2_random_weights() {
+        use crate::quantized::{i2s_gemv_cols, i2s_weight_scale};
+
+        let m = 256usize;
+        let k = 384usize; // multiple tiles + multiple reduction blocks
+        let packed_bytes = m * k / 4;
+        let mut i2s = vec![0u8; packed_bytes + 4];
+
+        // Random ternary weights including negatives
+        let mut rng_state = 42u64;
+        let row_bytes = k / 4;
+        for r in 0..m {
+            for c in 0..k {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let trit: u8 = ((rng_state >> 33) % 3) as u8; // 0,1,2 = -1,0,+1
+                let group = c / 128;
+                let within = c % 128;
+                let group_idx = within / 32;
+                let group_pos = within % 32;
+                let byte_off = r * row_bytes + group * 32 + group_pos;
+                i2s[byte_off] |= trit << (6 - 2 * group_idx);
+            }
+        }
+        i2s[packed_bytes..packed_bytes + 4].copy_from_slice(&1.0f32.to_ne_bytes());
+
+        let act: Vec<f32> = (1..=k).map(|i| (i as f32 - k as f32 / 2.0) * 0.01).collect();
+
+        let mut q8 = vec![0i8; k];
+        let (scale, sum) = crate::quantized::i2s_quantize_into(&act, &mut q8);
+        let w_scale = i2s_weight_scale(&i2s, m, k);
+        let mut mad_out = vec![0.0f32; m];
+        i2s_gemv_cols(&q8, scale, sum, &i2s, w_scale, mad_out.as_mut_ptr() as usize, 0, m, k);
+
+        let (tl2_data, tl2_scale) = repack_i2s_to_tl2(&i2s, m, k).expect("repack should succeed");
+        let mut tl2_out = vec![0.0f32; m];
+        let ok = tl2_forward(&act, &tl2_data, tl2_scale, &mut tl2_out, m, k);
+        assert!(ok, "tl2_forward should succeed");
+
+        let max_err = mad_out.iter().zip(tl2_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let mad_norm: f32 = mad_out.iter().map(|x| x * x).sum::<f32>().sqrt();
+        eprintln!("MAD[0..4]: {:?}", &mad_out[..4]);
+        eprintln!("TL2[0..4]: {:?}", &tl2_out[..4]);
+        eprintln!("max_err={max_err:.6} mad_norm={mad_norm:.4}");
+
+        assert!(
+            max_err < mad_norm * 0.05 + 1.0,
+            "TL2 should match MAD: max_err={max_err:.6} mad_norm={mad_norm:.4}"
+        );
     }
 
     #[test]

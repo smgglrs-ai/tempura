@@ -329,6 +329,19 @@ impl QuantizedWeights {
             }
         }
     }
+
+    pub fn build_tl2_from_i2s(&mut self, tensor_shapes: &HashMap<String, (usize, usize)>) {
+        let names: Vec<String> = self.i2s_tensors.keys().cloned().collect();
+        for name in names {
+            if let Some(&(n, k)) = tensor_shapes.get(&name) {
+                if let Some(data) = self.i2s_tensors.get(&name) {
+                    if let Some((tl2_data, scale)) = tempura_kernels::tl2::repack_i2s_to_tl2(data, n, k) {
+                        self.tl2_tensors.insert(name.clone(), Tl2Tensor { data: tl2_data, m: n, k, scale });
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]

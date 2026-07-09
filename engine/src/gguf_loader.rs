@@ -1240,6 +1240,7 @@ impl GgufLoader {
         }
         if !i2s_shapes.is_empty() {
             qw.build_i2s_lut_tensors(&i2s_shapes);
+            qw.build_tl2_from_i2s(&i2s_shapes);
         }
 
         qw
