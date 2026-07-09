@@ -825,6 +825,72 @@ pub fn i2s_dequant_block(block: &[u8], output: &mut [f32; I2S_BLOCK_SIZE]) {
     }
 }
 
+/// AVX2 per-tensor INT8 activation quantization — zero-allocation, writes directly into dst.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn quantize_row_i8_s_avx2_into(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
+    use std::arch::x86_64::*;
+
+    let k = x.len();
+    let mut vmax = _mm256_setzero_ps();
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let chunks = k / 8;
+    for i in 0..chunks {
+        let v = _mm256_loadu_ps(x.as_ptr().add(i * 8));
+        vmax = _mm256_max_ps(vmax, _mm256_andnot_ps(sign_mask, v));
+    }
+    let hi = _mm256_extractf128_ps(vmax, 1);
+    let lo = _mm256_castps256_ps128(vmax);
+    let max128 = _mm_max_ps(lo, hi);
+    let max64 = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
+    let max32 = _mm_max_ss(max64, _mm_shuffle_ps(max64, max64, 1));
+    let mut max_abs = _mm_cvtss_f32(max32);
+    for i in chunks * 8..k {
+        let av = x[i].abs();
+        if av > max_abs { max_abs = av; }
+    }
+    if max_abs < 0.00001 { max_abs = 0.00001; }
+
+    let s: f32 = 127.0 / max_abs;
+    let s_vec = _mm256_set1_ps(s);
+    let mut sum_acc = _mm256_setzero_si256();
+
+    for i in 0..chunks {
+        let v = _mm256_loadu_ps(x.as_ptr().add(i * 8));
+        let scaled = _mm256_mul_ps(v, s_vec);
+        let rounded = _mm256_cvtps_epi32(_mm256_round_ps(
+            scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+        ));
+        let clamped = _mm256_max_epi32(
+            _mm256_set1_epi32(-128),
+            _mm256_min_epi32(_mm256_set1_epi32(127), rounded),
+        );
+        let lo128 = _mm256_castsi256_si128(clamped);
+        let hi128 = _mm256_extracti128_si256(clamped, 1);
+        let packed16 = _mm_packs_epi32(lo128, hi128);
+        let packed8 = _mm_packs_epi16(packed16, packed16);
+        *(dst.as_mut_ptr().add(i * 8) as *mut i64) = _mm_cvtsi128_si64(packed8);
+        sum_acc = _mm256_add_epi32(sum_acc, clamped);
+    }
+
+    let sum_hi = _mm256_extracti128_si256(sum_acc, 1);
+    let sum_lo = _mm256_castsi256_si128(sum_acc);
+    let s128 = _mm_add_epi32(sum_lo, sum_hi);
+    let s64 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
+    let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
+    let mut sum = _mm_cvtsi128_si32(s32);
+
+    for i in chunks * 8..k {
+        let mut q = nearest_int(x[i] * s);
+        if q > 127 { q = 127; }
+        if q < -128 { q = -128; }
+        sum += q;
+        dst[i] = q as i8;
+    }
+
+    (s, sum)
+}
+
 /// AVX2 per-tensor INT8 activation quantization for I2S ternary matmul.
 /// Returns (scale, sum, quantized_i8_vec).
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
@@ -994,6 +1060,63 @@ unsafe fn hsum_i32_512(v: std::arch::x86_64::__m512i) -> i32 {
     let lo = _mm512_castsi512_si256(v);
     let sum256 = _mm256_add_epi32(lo, hi);
     hsum_i32(sum256)
+}
+
+/// AVX512 per-tensor INT8 activation quantization — zero-allocation, writes directly into dst.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn quantize_row_i8_s_avx512_into(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
+    use std::arch::x86_64::*;
+
+    let k = x.len();
+    let mut vmax = _mm512_setzero_ps();
+    let chunks16 = k / 16;
+    for i in 0..chunks16 {
+        let v = _mm512_loadu_ps(x.as_ptr().add(i * 16));
+        vmax = _mm512_max_ps(vmax, _mm512_abs_ps(v));
+    }
+    let mut max_abs = _mm512_reduce_max_ps(vmax);
+    for i in chunks16 * 16..k {
+        let av = x[i].abs();
+        if av > max_abs { max_abs = av; }
+    }
+    if max_abs < 0.00001 { max_abs = 0.00001; }
+
+    let s: f32 = 127.0 / max_abs;
+    let s_vec = _mm512_set1_ps(s);
+    let min_val = _mm512_set1_epi32(-128);
+    let max_val = _mm512_set1_epi32(127);
+    let mut sum_acc = _mm512_setzero_si512();
+
+    for i in 0..chunks16 {
+        let v = _mm512_loadu_ps(x.as_ptr().add(i * 16));
+        let scaled = _mm512_mul_ps(v, s_vec);
+        let rounded = _mm512_cvtps_epi32(_mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT));
+        let clamped = _mm512_max_epi32(min_val, _mm512_min_epi32(max_val, rounded));
+        sum_acc = _mm512_add_epi32(sum_acc, clamped);
+
+        let lo256 = _mm512_castsi512_si256(clamped);
+        let hi256 = _mm512_extracti64x4_epi64(clamped, 1);
+        let lo128_a = _mm256_castsi256_si128(lo256);
+        let lo128_b = _mm256_extracti128_si256(lo256, 1);
+        let hi128_a = _mm256_castsi256_si128(hi256);
+        let hi128_b = _mm256_extracti128_si256(hi256, 1);
+        let p16_lo = _mm_packs_epi32(lo128_a, lo128_b);
+        let p16_hi = _mm_packs_epi32(hi128_a, hi128_b);
+        let p8 = _mm_packs_epi16(p16_lo, p16_hi);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i * 16) as *mut __m128i, p8);
+    }
+
+    let mut sum = _mm512_reduce_add_epi32(sum_acc);
+    for i in chunks16 * 16..k {
+        let mut q = nearest_int(x[i] * s);
+        if q > 127 { q = 127; }
+        if q < -128 { q = -128; }
+        sum += q;
+        dst[i] = q as i8;
+    }
+
+    (s, sum)
 }
 
 /// AVX512 VNNI per-tensor INT8 activation quantization for I2S ternary matmul.
@@ -1188,10 +1311,11 @@ unsafe fn vec_dot_i2_i8_s_avx512(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
 /// Quantize f32 activations to i8 in-place (no allocation). Returns (scale, sum).
 #[cfg(target_arch = "x86_64")]
 pub fn i2s_quantize_into(a: &[f32], dst: &mut [i8]) -> (f32, i32) {
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        return unsafe { quantize_row_i8_s_avx512_into(a, dst) };
+    }
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        let (scale, sum, q8) = unsafe { quantize_row_i8_s_avx2(a) };
-        dst[..a.len()].copy_from_slice(&q8);
-        return (scale, sum);
+        return unsafe { quantize_row_i8_s_avx2_into(a, dst) };
     }
     quantize_row_i8_s(a, dst)
 }

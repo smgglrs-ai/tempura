@@ -687,6 +687,39 @@ pub struct Tl2Lut {
     pub two_k: usize,
 }
 
+impl Tl2Lut {
+    /// Pre-allocate LUT buffers for a given reduction dimension. Reuse across layers.
+    #[cfg(target_arch = "x86_64")]
+    pub fn new_for_k(k: usize) -> Option<Self> {
+        let cfg = Tl2Config::for_dims(128, k)?;
+        let three_lut_bytes = cfg.three_k / 3 * 32;
+        let two_lut_bytes = if cfg.two_k > 0 { cfg.two_k / 2 * 32 } else { 0 };
+        Some(Self {
+            three_qlut: vec![0i8; three_lut_bytes],
+            two_qlut: vec![0i8; two_lut_bytes.max(1)],
+            lut_scale: 0.0,
+            three_k: cfg.three_k,
+            two_k: cfg.two_k,
+        })
+    }
+}
+
+/// Rebuild activation LUT into pre-allocated buffers. Returns false if k doesn't match.
+#[cfg(target_arch = "x86_64")]
+pub fn tl2_preprocess_into(activations: &[f32], k: usize, lut: &mut Tl2Lut) -> bool {
+    let cfg = match Tl2Config::for_dims(128, k) {
+        Some(c) => c,
+        None => return false,
+    };
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+    for b in lut.three_qlut.iter_mut() { *b = 0; }
+    for b in lut.two_qlut.iter_mut() { *b = 0; }
+    unsafe {
+        preprocessor(&cfg, activations, &mut lut.lut_scale, &mut lut.three_qlut, &mut lut.two_qlut, 1);
+    }
+    true
+}
+
 /// Build activation LUT once. Call this on thread 0 before the barrier.
 /// The returned Tl2Lut is then shared read-only across all tl2_gemv calls
 /// for weight tensors with the same reduction dimension k.
@@ -755,12 +788,13 @@ pub fn tl2_gemv_tiles_cfg(
     let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
     let two_lut_bytes = if two_k > 0 { two_k / 2 * 32 } else { 0 };
 
+    let mut cbits = vec![0i32; cfg.bm];
     for i_tile in tile_start..tile_end {
         let w_offset = i_tile * w_tile_size;
         let s_offset = sign_base + i_tile * sign_tile_size;
         let dst_offset = i_tile * c_tile_size;
 
-        let mut cbits = vec![0i32; cfg.bm];
+        for b in cbits.iter_mut() { *b = 0; }
         unsafe {
             qgemm_three(cfg, &weight_data[w_offset..], &weight_data[s_offset..], &lut.three_qlut, &mut cbits, 1);
         }

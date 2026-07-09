@@ -97,6 +97,25 @@ impl PersistentPool {
     }
 
     #[inline]
+    pub fn thread_count(&self) -> usize {
+        self.shared.n_workers + 1
+    }
+
+    /// Dispatch an indexed computation: each of N threads calls f(ith, nth).
+    /// Uses the persistent pool — no thread spawn/join overhead.
+    #[inline]
+    pub fn run_indexed<F: Fn(usize, usize) + Sync>(&self, f: &F) {
+        let nth = self.shared.n_workers + 1;
+        if nth <= 1 {
+            f(0, 1);
+            return;
+        }
+        self.parallel_chunks(nth, 1, &|start, _end| {
+            f(start, nth);
+        });
+    }
+
+    #[inline]
     pub fn parallel_chunks<F: Fn(usize, usize) + Sync>(&self, total: usize, chunk_size: usize, f: &F) {
         let n_chunks = (total + chunk_size - 1) / chunk_size;
         if n_chunks <= 1 || self.shared.n_workers == 0 {
@@ -267,5 +286,38 @@ mod tests {
         let count = AtomicUsize::new(0);
         global_pool().parallel_chunks(100, 10, &|_, _| { count.fetch_add(1, Ordering::Relaxed); });
         assert_eq!(count.load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn test_run_indexed() {
+        let pool = PersistentPool::new(4);
+        let nth = pool.thread_count();
+        assert_eq!(nth, 4);
+        let seen = (0..nth).map(|_| std::sync::atomic::AtomicBool::new(false)).collect::<Vec<_>>();
+        pool.run_indexed(&|ith, n| {
+            assert_eq!(n, nth);
+            assert!(ith < n);
+            seen[ith].store(true, Ordering::Relaxed);
+        });
+        for i in 0..nth {
+            assert!(seen[i].load(Ordering::Relaxed), "thread {i} not executed");
+        }
+    }
+
+    #[test]
+    fn test_run_indexed_with_barrier() {
+        let pool = PersistentPool::new(4);
+        let nth = pool.thread_count();
+        let barrier = SpinBarrier::new(nth);
+        let phase1 = AtomicUsize::new(0);
+        let phase2 = AtomicUsize::new(0);
+        pool.run_indexed(&|_ith, _n| {
+            phase1.fetch_add(1, Ordering::Relaxed);
+            barrier.wait();
+            assert_eq!(phase1.load(Ordering::Relaxed), nth);
+            phase2.fetch_add(1, Ordering::Relaxed);
+            barrier.wait();
+            assert_eq!(phase2.load(Ordering::Relaxed), nth);
+        });
     }
 }

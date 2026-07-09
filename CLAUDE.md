@@ -134,7 +134,7 @@ Three-crate workspace + standalone verification crate:
 - [x] Prometheus metrics (TTFT, ITL, queue depth, KV usage), OpenTelemetry export
 - [x] HuggingFace config.json auto-loading, Dockerfile
 - [x] Inference traces, deterministic replay, DualPipeline comparison, batch-invariant verification
-- [x] 315 passing tests
+- [x] 337 passing tests
 
 ## What's Next
 
@@ -161,7 +161,7 @@ Three-crate workspace + standalone verification crate:
 - [x] GGUF loader: detect `model_type: "bitnet"`, route to BitLinear layers
 - [ ] TQ2_0 cuda-oxide GPU kernel (dp4a path, shared-memory tile unpack)
 - [x] TQ1_0 CPU-only decode (I2S format via bitnet.cpp translation)
-- [x] Validation against microsoft/bitnet-b1.58-2B-4T-gguf (coherent output, ~17 tok/s CPU AVX2)
+- [x] Validation against microsoft/bitnet-b1.58-2B-4T-gguf (coherent output, ~20.5 tok/s CPU AVX2)
 - [x] AVX2/AVX512 maddubs with i16 batched accumulation (bitnet.cpp pattern)
 - [x] Pre-quantized activation sharing across q/k/v and gate/up projections
 - [x] Layer-level rayon::join parallelism for independent projections
@@ -169,12 +169,17 @@ Three-crate workspace + standalone verification crate:
 - [x] Persistent thread pool (condvar + per-worker generation tracking)
 - [x] forward_bitnet_decode: dedicated decode path with pre-allocated buffers
 - [x] i2s_quantize_into: zero-allocation activation quantization
+- [x] Persistent thread model for decode (run_indexed, no thread spawn per token)
+- [x] Pre-allocated TL2 LUT buffers (zero heap allocs in layer loop)
+- [x] Fused serial ops: RMSNorm+q8snap, residual+RMSNorm+q8snap (12→8 barriers/layer)
+- [x] SIMD fused kernels: squared ReLU (AVX2), residual add (AVX2)
+- [x] Zero-alloc i2s_quantize_into AVX2/AVX512 path (no Vec+memcpy per call)
 
 ## Build & Test
 
 ```sh
 cargo build              # build all crates
-cargo test               # run all tests (148 currently)
+cargo test               # run all tests (337 currently)
 cargo run -- --help      # see CLI options
 cargo run -- --port 8080 # start server (stub responses)
 ```
