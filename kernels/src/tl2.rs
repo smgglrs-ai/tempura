@@ -236,9 +236,11 @@ pub unsafe fn three_tbl_impl(
     let vec_mask = _mm256_set1_epi8(0x0f);
     let kk = bk / 3;
 
+    debug_assert!(kk <= 64);
     for i in (0..bm).step_by(32) {
-        let mut vec_as = vec![_mm256_setzero_si256(); kk / 2];
-        let mut vec_signs = vec![_mm256_setzero_si256(); kk / 8];
+        let zero = _mm256_setzero_si256();
+        let mut vec_as = [zero; 32];
+        let mut vec_signs = [zero; 8];
 
         for ai in 0..kk / 2 {
             vec_as[ai] = _mm256_loadu_si256(
@@ -335,7 +337,7 @@ pub unsafe fn two_tbl_impl(
     let kk = BK2 / 2;
 
     for i in (0..bm).step_by(32) {
-        let mut vec_as = vec![_mm256_setzero_si256(); kk / 2];
+        let mut vec_as = [_mm256_setzero_si256(); 8];
         for ai in 0..kk / 2 {
             vec_as[ai] = _mm256_loadu_si256(
                 a.as_ptr().add(i * kk / 2 + ai * 32) as *const __m256i,
@@ -1087,12 +1089,14 @@ pub unsafe fn qgemm_two_and_rescale(
     // Two-valued accumulation
     if cfg.two_k > 0 {
         let two_k_blocks = cfg.two_k / BK2;
-        let mut two_cbits = vec![0i32; batch_size * cfg.bm];
+        debug_assert!(batch_size * cfg.bm <= 1024);
+        let mut two_cbits_arr = [0i32; 1024];
+        let two_cbits = &mut two_cbits_arr[..batch_size * cfg.bm];
         for k_outer in 0..two_k_blocks {
             let lut_off = k_outer * BK2 / 2 * 32;
             let a_off = k_outer * BK2 / 2 / 2 * cfg.bm;
             two_tbl_impl(
-                &mut two_cbits,
+                two_cbits,
                 &lut[lut_off..],
                 &a[a_off..],
                 cfg.bm,
