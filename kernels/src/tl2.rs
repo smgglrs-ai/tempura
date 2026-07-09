@@ -720,65 +720,75 @@ pub fn tl2_forward(
         preprocessor(&cfg, activations, &mut lut_scale, &mut three_qlut, &mut two_qlut, 1);
     }
 
-    // Per-tile dispatch: three-part accumulates i32, two-part adds + rescales
-    // C: line 13027-13055 (bs=1 path)
+    // C: ggml.c:12816-12818 — distribute tiles across threads
     let two_a_base = if two_k > 0 {
-        // C: two_A = qweights + three_k * ne01 / 3 / 2 + three_k * ne01 / 3 / 8
         three_k * m / 3 / 2 + three_k * m / 3 / 8
     } else { 0 };
     let two_w_size = m * two_k / 4;
     let two_w_tile_size = if n_tile_num > 0 { two_w_size / n_tile_num } else { 0 };
 
-    for i_tile in 0..n_tile_num {
-        let w_offset = i_tile * w_tile_size;
-        let s_offset = sign_base + i_tile * sign_tile_size;
-        let dst_offset = i_tile * c_tile_size;
+    let out_ptr = output.as_mut_ptr() as usize;
+    let wd_ptr = weight_data.as_ptr() as usize;
+    let tql_ptr = three_qlut.as_ptr() as usize;
+    let twql_ptr = two_qlut.as_ptr() as usize;
 
-        // Three-part: accumulate i32 cbits (no rescale)
-        let mut cbits = vec![0i32; cfg.bm];
-        unsafe {
-            qgemm_three(
-                &cfg,
-                &weight_data[w_offset..],
-                &weight_data[s_offset..],
-                &three_qlut,
-                &mut cbits,
-                1,
-            );
-        }
+    crate::thread_pool::global_pool().parallel_chunks(n_tile_num, 1, &|tile_start, tile_end| {
+        for i_tile in tile_start..tile_end {
+            let w_offset = i_tile * w_tile_size;
+            let s_offset = sign_base + i_tile * sign_tile_size;
+            let dst_offset = i_tile * c_tile_size;
 
-        // Two-part: add to cbits + rescale to f32
-        if two_k > 0 {
-            let two_w_offset = two_a_base + i_tile * two_w_tile_size;
-            let two_cfg = Tl2Config { three_k: 0, two_k, ..cfg };
+            let wd = unsafe { std::slice::from_raw_parts(wd_ptr as *const u8, weight_data.len()) };
+            let tql = unsafe { std::slice::from_raw_parts(tql_ptr as *const i8, three_lut_bytes) };
+
+            let mut cbits = vec![0i32; cfg.bm];
             unsafe {
-                qgemm_two_and_rescale(
-                    &two_cfg,
-                    &weight_data[two_w_offset..],
-                    &two_qlut,
-                    w_scale,
-                    lut_scale,
-                    &mut cbits,
-                    &mut output[dst_offset..dst_offset + cfg.bm],
-                    1,
-                );
-            }
-        } else {
-            // No two-part: just rescale three-part
-            unsafe {
-                qgemm_two_and_rescale(
+                qgemm_three(
                     &cfg,
-                    &[],
-                    &[],
-                    w_scale,
-                    lut_scale,
+                    &wd[w_offset..],
+                    &wd[s_offset..],
+                    tql,
                     &mut cbits,
-                    &mut output[dst_offset..dst_offset + cfg.bm],
                     1,
                 );
             }
+
+            let out_slice = unsafe {
+                std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(dst_offset), cfg.bm)
+            };
+
+            if two_k > 0 {
+                let two_w_offset = two_a_base + i_tile * two_w_tile_size;
+                let two_cfg = Tl2Config { three_k: 0, two_k, ..cfg };
+                let twql = unsafe { std::slice::from_raw_parts(twql_ptr as *const i8, two_lut_bytes.max(1)) };
+                unsafe {
+                    qgemm_two_and_rescale(
+                        &two_cfg,
+                        &wd[two_w_offset..],
+                        twql,
+                        w_scale,
+                        lut_scale,
+                        &mut cbits,
+                        out_slice,
+                        1,
+                    );
+                }
+            } else {
+                unsafe {
+                    qgemm_two_and_rescale(
+                        &cfg,
+                        &[],
+                        &[],
+                        w_scale,
+                        lut_scale,
+                        &mut cbits,
+                        out_slice,
+                        1,
+                    );
+                }
+            }
         }
-    }
+    });
 
     true
 }
