@@ -1154,6 +1154,7 @@ where
         let shared_lut_ok = std::sync::atomic::AtomicBool::new(false);
         let barrier = tempura_kernels::thread_pool::SpinBarrier::new(n_threads);
         let shared_kvl = std::sync::atomic::AtomicUsize::new(0);
+        let tile_counter = std::sync::atomic::AtomicUsize::new(0);
         let max_seq = cfg.max_seq_len;
         let mut attn_scores_bufs: Vec<Vec<f32>> = (0..n_threads).map(|_| vec![0.0f32; max_seq]).collect();
         let attn_scores_ptrs: Vec<usize> = attn_scores_bufs.iter_mut().map(|b| b.as_mut_ptr() as usize).collect();
@@ -1197,6 +1198,7 @@ where
                     } else {
                         shared_lut_ok.store(false, std::sync::atomic::Ordering::Release);
                     }
+                    tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
                     if do_profile { prof_serial1.fetch_add(_t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 }
                 barrier.wait(); // B1: quant + LUT ready → QKV matmul
@@ -1211,13 +1213,21 @@ where
                     if let (Some(qt), Some(kt), Some(vt)) = (qweights.get_tl2(qn), qweights.get_tl2(kn), qweights.get_tl2(vn)) {
                         let q_tiles = q_dim / tempura_kernels::tl2::Tl2Config::for_dims(q_dim, h).map(|c| c.bm).unwrap_or(q_dim);
                         let kv_tiles = kv_dim / tempura_kernels::tl2::Tl2Config::for_dims(kv_dim, h).map(|c| c.bm).unwrap_or(kv_dim);
-                        let qt_s = ith * q_tiles / nth;
-                        let qt_e = (ith + 1) * q_tiles / nth;
-                        let kvt_s = ith * kv_tiles / nth;
-                        let kvt_e = (ith + 1) * kv_tiles / nth;
-                        used_tl2 = tl2_gemv_tiles(lut, &qt.data, qt.scale, qp, q_dim, h, qt_s, qt_e)
-                            && tl2_gemv_tiles(lut, &kt.data, kt.scale, kp, kv_dim, h, kvt_s, kvt_e)
-                            && tl2_gemv_tiles(lut, &vt.data, vt.scale, vp, kv_dim, h, kvt_s, kvt_e);
+                        let total = q_tiles + 2 * kv_tiles;
+                        loop {
+                            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if t >= total { break; }
+                            if t < q_tiles {
+                                tl2_gemv_tiles(lut, &qt.data, qt.scale, qp, q_dim, h, t, t + 1);
+                            } else if t < q_tiles + kv_tiles {
+                                let kt_idx = t - q_tiles;
+                                tl2_gemv_tiles(lut, &kt.data, kt.scale, kp, kv_dim, h, kt_idx, kt_idx + 1);
+                            } else {
+                                let vt_idx = t - q_tiles - kv_tiles;
+                                tl2_gemv_tiles(lut, &vt.data, vt.scale, vp, kv_dim, h, vt_idx, vt_idx + 1);
+                            }
+                        }
+                        used_tl2 = true;
                     }
                 }
                 if !used_tl2 {
@@ -1279,6 +1289,7 @@ where
                     } else {
                         shared_lut_ok.store(false, std::sync::atomic::Ordering::Release);
                     }
+                    tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
                     if do_profile {
                         prof_lut_prep.fetch_add(_tl.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                         prof_serial2.fetch_add(_t2.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1295,9 +1306,12 @@ where
                     let lut = unsafe { &*(lut_qdim_ptr as *const Tl2Lut) };
                     if let Some(ot) = qweights.get_tl2(on) {
                         let o_tiles = h / tempura_kernels::tl2::Tl2Config::for_dims(h, q_dim).map(|c| c.bm).unwrap_or(h);
-                        let ot_s = ith * o_tiles / nth;
-                        let ot_e = (ith + 1) * o_tiles / nth;
-                        used_tl2 = tl2_gemv_tiles(lut, &ot.data, ot.scale, op, h, q_dim, ot_s, ot_e);
+                        loop {
+                            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if t >= o_tiles { break; }
+                            tl2_gemv_tiles(lut, &ot.data, ot.scale, op, h, q_dim, t, t + 1);
+                        }
+                        used_tl2 = true;
                     }
                 }
                 if !used_tl2 {
@@ -1323,6 +1337,7 @@ where
                     } else {
                         shared_lut_ok.store(false, std::sync::atomic::Ordering::Release);
                     }
+                    tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
                     if do_profile { prof_serial3.fetch_add(_t4.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 }
                 barrier.wait(); // B5: FFN quant ready → gate/up matmul
@@ -1336,10 +1351,13 @@ where
                     let lut = unsafe { &*(lut_h_ptr as *const Tl2Lut) };
                     if let (Some(gt), Some(ut)) = (qweights.get_tl2(gn), qweights.get_tl2(un)) {
                         let g_tiles = inter / tempura_kernels::tl2::Tl2Config::for_dims(inter, h).map(|c| c.bm).unwrap_or(inter);
-                        let gt_s = ith * g_tiles / nth;
-                        let gt_e = (ith + 1) * g_tiles / nth;
-                        used_tl2 = tl2_gemv_tiles(lut, &gt.data, gt.scale, gp, inter, h, gt_s, gt_e)
-                            && tl2_gemv_tiles(lut, &ut.data, ut.scale, upp, inter, h, gt_s, gt_e);
+                        loop {
+                            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if t >= g_tiles { break; }
+                            tl2_gemv_tiles(lut, &gt.data, gt.scale, gp, inter, h, t, t + 1);
+                            tl2_gemv_tiles(lut, &ut.data, ut.scale, upp, inter, h, t, t + 1);
+                        }
+                        used_tl2 = true;
                     }
                 }
                 if !used_tl2 {
@@ -1368,6 +1386,7 @@ where
                     } else {
                         shared_lut_ok.store(false, std::sync::atomic::Ordering::Release);
                     }
+                    tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
                     if do_profile { prof_serial4.fetch_add(_t6.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 }
                 barrier.wait(); // B7: down quant ready → down matmul
@@ -1381,9 +1400,12 @@ where
                     let lut = unsafe { &*(lut_inter_ptr as *const Tl2Lut) };
                     if let Some(dt) = qweights.get_tl2(dn) {
                         let d_tiles = h / tempura_kernels::tl2::Tl2Config::for_dims(h, inter).map(|c| c.bm).unwrap_or(h);
-                        let dt_s = ith * d_tiles / nth;
-                        let dt_e = (ith + 1) * d_tiles / nth;
-                        used_tl2 = tl2_gemv_tiles(lut, &dt.data, dt.scale, dp, h, inter, dt_s, dt_e);
+                        loop {
+                            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if t >= d_tiles { break; }
+                            tl2_gemv_tiles(lut, &dt.data, dt.scale, dp, h, inter, t, t + 1);
+                        }
+                        used_tl2 = true;
                     }
                 }
                 if !used_tl2 {
