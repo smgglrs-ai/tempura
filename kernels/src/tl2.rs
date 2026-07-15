@@ -333,7 +333,7 @@ unsafe fn three_tbl_impl_bk96(
     batch_size: usize,
 ) {
     let vec_mask = _mm256_set1_epi8(0x0f);
-    const KK: usize = 32; // bk=96, kk=bk/3=32
+    const _KK: usize = 32; // bk=96, kk=bk/3=32
 
     for i in (0..bm).step_by(32) {
         let zero = _mm256_setzero_si256();
@@ -1255,7 +1255,6 @@ pub fn tl2_gemv_direct_scalar(
         }
     };
     let three_k = cfg.three_k;
-    let two_k = cfg.two_k;
 
     let scale = per_tensor_quant_scalar(activations);
     let mut a_q = vec![0i32; k];

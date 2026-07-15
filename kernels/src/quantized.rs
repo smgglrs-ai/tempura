@@ -543,10 +543,10 @@ unsafe fn q6k_dot_q8_avx2(block: &[u8], a_q8: &[i8], a_scale: f32, a_group_sums:
         let p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(q6_2, aq_2), ones_16);
         let p3 = _mm256_madd_epi16(_mm256_maddubs_epi16(q6_3, aq_3), ones_16);
 
-        let idot_0 = hsum_i32(p0);
-        let idot_1 = hsum_i32(p1);
-        let idot_2 = hsum_i32(p2);
-        let idot_3 = hsum_i32(p3);
+        let _idot_0 = hsum_i32(p0);
+        let _idot_1 = hsum_i32(p1);
+        let _idot_2 = hsum_i32(p2);
+        let _idot_3 = hsum_i32(p3);
 
         // Scales: Q6_K has 16 scales (i8), 1 per 16 elements
         // For the 32-element groups, each uses 2 consecutive scales
@@ -1769,7 +1769,7 @@ impl MatMulQ for CpuMatMulQ4K {
         }
 
         let packed_bytes = n * k / 4;
-        let row_packed_bytes = k / 4;
+        let _row_packed_bytes = k / 4;
         let w_scale = f32::from_ne_bytes([
             b_transposed[packed_bytes],
             b_transposed[packed_bytes + 1],
@@ -4477,6 +4477,46 @@ mod kani_proofs {
 
 // ── F16 GEMV (lm_head) ────────────────────────────────────────────────────────
 
+/// F16×F16 dot product matching llama.cpp's ggml_vec_dot_f16 AVX-512 path exactly.
+/// Both inputs are raw F16 bytes. Uses 4 × __m512 accumulators, 64 elements/iter,
+/// tree reduction, _mm512_reduce_add_ps — same structure as GGML_F32Cx16_REDUCE.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,f16c,fma")]
+pub unsafe fn f16_dot_ggml(x_f16: &[u8], y_f16: &[u8], k: usize) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mut sum = [_mm512_setzero_ps(); 4];
+    let x_ptr = x_f16.as_ptr() as *const __m256i;
+    let y_ptr = y_f16.as_ptr() as *const __m256i;
+
+    let k64 = k & !63;
+    let mut i = 0usize;
+    while i < k64 {
+        for j in 0..4usize {
+            let ax = _mm512_cvtph_ps(_mm256_loadu_si256(x_ptr.add((i + j * 16) / 16)));
+            let ay = _mm512_cvtph_ps(_mm256_loadu_si256(y_ptr.add((i + j * 16) / 16)));
+            sum[j] = _mm512_fmadd_ps(ax, ay, sum[j]);
+        }
+        i += 64;
+    }
+
+    // Tree reduction matching GGML_F32Cx16_REDUCE: offset=2, offset=1
+    sum[0] = _mm512_add_ps(sum[0], sum[2]);
+    sum[1] = _mm512_add_ps(sum[1], sum[3]);
+    sum[0] = _mm512_add_ps(sum[0], sum[1]);
+    let mut result = _mm512_reduce_add_ps(sum[0]);
+
+    // Scalar tail
+    while i < k {
+        let xv = half::f16::from_bits(u16::from_le_bytes([x_f16[i * 2], x_f16[i * 2 + 1]])).to_f32();
+        let yv = half::f16::from_bits(u16::from_le_bytes([y_f16[i * 2], y_f16[i * 2 + 1]])).to_f32();
+        result += xv * yv;
+        i += 1;
+    }
+
+    result
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
 pub unsafe fn f16_dot_avx2(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
@@ -4615,6 +4655,67 @@ unsafe fn f16_gemv_avx512(a_ptr: usize, b_ptr: usize, out_ptr: usize, k: usize, 
         let val = f16_dot_avx512(a_slice, b_row, k);
         *(out_ptr as *mut f32).add(j) = val;
     }
+}
+
+/// F16×F16 scalar ref matching ggml_vec_dot_f16 AVX-512 accumulation order:
+/// 4 independent accumulators × 16 lanes, 64 elements per iteration,
+/// tree reduction (offset=2, offset=1), then horizontal sum.
+pub fn f16_dot_ggml_scalar(x_f16: &[u8], y_f16: &[u8], k: usize) -> f32 {
+    let mut acc = [0.0f32; 64]; // 4 accumulators × 16 lanes
+    let k64 = k & !63;
+    let mut i = 0usize;
+
+    while i < k64 {
+        for j in 0..4 {
+            for lane in 0..16 {
+                let idx = i + j * 16 + lane;
+                let xv = half::f16::from_bits(
+                    u16::from_le_bytes([x_f16[idx * 2], x_f16[idx * 2 + 1]])
+                ).to_f32();
+                let yv = half::f16::from_bits(
+                    u16::from_le_bytes([y_f16[idx * 2], y_f16[idx * 2 + 1]])
+                ).to_f32();
+                acc[j * 16 + lane] = xv.mul_add(yv, acc[j * 16 + lane]);
+            }
+        }
+        i += 64;
+    }
+
+    // Tree reduction: offset=2, offset=1
+    for lane in 0..16 {
+        acc[lane] += acc[32 + lane];
+        acc[16 + lane] += acc[48 + lane];
+    }
+    for lane in 0..16 {
+        acc[lane] += acc[16 + lane];
+    }
+
+    // Horizontal sum matching _mm512_reduce_add_ps exactly:
+    // extractf32x8 + add → 8 lanes
+    let mut h = [0.0f32; 8];
+    for i in 0..8 { h[i] = acc[i] + acc[i + 8]; }
+    // extractf128 + add → 4 lanes
+    let mut q = [0.0f32; 4];
+    for i in 0..4 { q[i] = h[i] + h[i + 4]; }
+    // movehdup + add → pairs
+    let p0 = q[1] + q[0];
+    let p1 = q[3] + q[2];
+    // movehl + add_ss
+    let mut s = p0 + p1;
+
+    // Scalar tail
+    while i < k {
+        let xv = half::f16::from_bits(
+            u16::from_le_bytes([x_f16[i * 2], x_f16[i * 2 + 1]])
+        ).to_f32();
+        let yv = half::f16::from_bits(
+            u16::from_le_bytes([y_f16[i * 2], y_f16[i * 2 + 1]])
+        ).to_f32();
+        s += xv * yv;
+        i += 1;
+    }
+
+    s
 }
 
 pub fn f16_dot_scalar(a: &[f32], b_f16: &[u8], k: usize) -> f32 {

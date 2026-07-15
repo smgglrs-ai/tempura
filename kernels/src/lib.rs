@@ -21,6 +21,7 @@ pub mod layernorm;
 pub mod matmul;
 #[cfg(any(feature = "npu-intel", feature = "npu-qualcomm"))]
 pub mod npu;
+#[allow(dead_code)]
 pub mod quantized;
 pub mod rmsnorm;
 pub mod rope;

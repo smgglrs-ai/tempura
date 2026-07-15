@@ -478,12 +478,14 @@ where
         logits
     }
 
+    #[allow(unused_imports)]
     pub fn forward_quantized(
         &self,
         session: &mut InferenceSession,
         token_ids: &[u32],
         qweights: &crate::weights::QuantizedWeights,
     ) -> Vec<f32> {
+        use tempura_kernels::{RMSNorm, RoPE};
         let cfg = &self.config;
         let h = cfg.hidden_size;
         let n_heads = cfg.num_attention_heads;
@@ -551,7 +553,7 @@ where
             .collect();
 
         let fwd_start = std::time::Instant::now();
-        let qmm_nanos = std::sync::atomic::AtomicU64::new(0);
+        let _qmm_nanos = std::sync::atomic::AtomicU64::new(0);
 
         let qmm = |preq: Option<&PreQuantizedActivations>,
                    a_f32: &[f32],
@@ -650,7 +652,6 @@ where
             normed.copy_from_slice(&hidden);
             let input_ln_w = qweights.get_f32(input_ln_name).unwrap();
             if let Some(ref drn) = det_rmsnorm {
-                use tempura_kernels::RMSNorm;
                 drn.forward(&mut normed, input_ln_w, h, cfg.layer_norm_eps).unwrap();
             } else {
             self.pipeline
@@ -757,7 +758,6 @@ where
             }
 
             if let Some(ref rope_table) = det_rope {
-                use tempura_kernels::RoPE;
                 rope_table.forward(&mut q, 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
                 rope_table.forward(&mut k, 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
             } else {
@@ -800,7 +800,6 @@ where
 
             if let Some(sub_norm_w) = qweights.get_f32(attn_sub_norm_name) {
                 if let Some(ref drn) = det_rmsnorm {
-                    use tempura_kernels::RMSNorm;
                     drn.forward(&mut attn_out[..seq_len * q_dim], sub_norm_w, q_dim, cfg.layer_norm_eps).unwrap();
                 } else {
                     self.pipeline
@@ -842,7 +841,6 @@ where
             normed2.copy_from_slice(&hidden);
             let post_ln_w = qweights.get_f32(post_ln_name).unwrap();
             if let Some(ref drn) = det_rmsnorm {
-                use tempura_kernels::RMSNorm;
                 drn.forward(&mut normed2, post_ln_w, h, cfg.layer_norm_eps).unwrap();
             } else {
                 self.pipeline.rmsnorm(&mut normed2, post_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
@@ -967,7 +965,6 @@ where
 
             if let Some(sub_norm_w) = qweights.get_f32(ffn_sub_norm_name) {
                 if let Some(ref drn) = det_rmsnorm {
-                    use tempura_kernels::RMSNorm;
                     drn.forward(&mut gate[..seq_len * inter], sub_norm_w, inter, cfg.layer_norm_eps).unwrap();
                 } else {
                     self.pipeline
@@ -1012,7 +1009,6 @@ where
         let mut final_normed = hidden.clone();
         let final_norm_w = qweights.get_f32("model.norm.weight").unwrap();
         if let Some(ref drn) = det_rmsnorm {
-            use tempura_kernels::RMSNorm;
             drn.forward(&mut final_normed, final_norm_w, h, cfg.layer_norm_eps).unwrap();
         } else {
             self.pipeline.rmsnorm(&mut final_normed, final_norm_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
@@ -1081,7 +1077,7 @@ where
         qweights: &crate::weights::QuantizedWeights,
     ) -> Vec<f32> {
         use tempura_kernels::quantized::{PreQuantizedActivations, i2s_gemv_cols, i2s_weight_scale};
-        use tempura_kernels::tl2::{tl2_forward, tl2_preprocess_into, tl2_gemv_tiles, tl2_gemv_tiles_cfg, Tl2Lut};
+        use tempura_kernels::tl2::{tl2_forward, tl2_preprocess_into, tl2_gemv_tiles, Tl2Lut};
         use tempura_kernels::fused::{fused_rmsnorm_q8snap, fused_residual_rmsnorm_q8snap, fused_sqrelu_mul, residual_add};
 
         let cfg = &self.config;
