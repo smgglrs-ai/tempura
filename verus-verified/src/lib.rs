@@ -89,3 +89,5 @@ pub mod rope_frequency;
 pub mod tensor_parallel;
 pub mod trace_diff;
 pub mod weight_shapes;
+pub mod tl2_lut;
+pub mod f16_gemv;

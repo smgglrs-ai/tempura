@@ -903,6 +903,7 @@ pub struct GgufLoader {
     raw_tensors: HashMap<String, Vec<u8>>,
     raw_tensor_dims: HashMap<String, Vec<u64>>,
     tensor_dtypes: HashMap<String, GgmlType>,
+    f16_raw_tensors: HashMap<String, Vec<u8>>,
     pub config: ModelConfig,
     pub metadata: HashMap<String, GgufValue>,
 }
@@ -969,6 +970,7 @@ impl GgufLoader {
         let mut raw_tensors = HashMap::new();
         let mut raw_tensor_dims: HashMap<String, Vec<u64>> = HashMap::new();
         let mut tensor_dtypes = HashMap::new();
+        let mut f16_raw_tensors: HashMap<String, Vec<u8>> = HashMap::new();
 
         for info in &tensor_infos {
             let num_elements: u64 = info.dims.iter().product();
@@ -991,6 +993,10 @@ impl GgufLoader {
                 || info.dtype == GgmlType::TL1 || info.dtype == GgmlType::TL2)
                 && !mapped_name.contains("embed_tokens")
                 && !mapped_name.contains("norm.weight");
+
+            if info.dtype == GgmlType::F16 {
+                f16_raw_tensors.insert(mapped_name.clone(), tensor_data.to_vec());
+            }
 
             if !keep_raw {
                 let floats = match info.dtype {
@@ -1036,7 +1042,10 @@ impl GgufLoader {
         config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
 
         if !tensors.contains_key("lm_head.weight") && !raw_tensors.contains_key("lm_head.weight") {
-            if let Some(embed) = tensors.get("model.embed_tokens.weight") {
+            if let Some(f16_raw) = f16_raw_tensors.get("model.embed_tokens.weight") {
+                f16_raw_tensors.insert("lm_head.weight".into(), f16_raw.clone());
+                tensor_dtypes.insert("lm_head.weight".into(), GgmlType::F16);
+            } else if let Some(embed) = tensors.get("model.embed_tokens.weight") {
                 tensors.insert("lm_head.weight".into(), embed.clone());
                 tensor_dtypes.insert("lm_head.weight".into(), GgmlType::F32);
             }
@@ -1047,6 +1056,7 @@ impl GgufLoader {
             raw_tensors,
             raw_tensor_dims,
             tensor_dtypes,
+            f16_raw_tensors,
             config,
             metadata,
         })
@@ -1165,6 +1175,7 @@ impl GgufLoader {
             raw_tensors,
             raw_tensor_dims: HashMap::new(),
             tensor_dtypes,
+            f16_raw_tensors: HashMap::new(),
             config,
             metadata,
         })
@@ -1194,6 +1205,10 @@ impl GgufLoader {
         }
 
         let mut qw = crate::weights::QuantizedWeights::new_with_ternary(q4k_tensors, q6k_tensors, tq2_tensors, i2s_tensors, f32_tensors);
+
+        for (name, data) in &self.f16_raw_tensors {
+            qw.insert_f16(name.clone(), data.clone());
+        }
 
         // Build TL2 tensors with dimension metadata and extracted scale
         for (name, dtype) in &self.tensor_dtypes {

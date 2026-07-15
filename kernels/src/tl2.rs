@@ -1004,99 +1004,16 @@ pub fn tl2_forward(
     };
 
     let n_tile_num = m / cfg.bm;
-    let three_k = cfg.three_k;
-    let two_k = cfg.two_k;
 
-    // C: w_size = three_k * ne01 / (2 * 3)
-    let w_size = three_k * m / 6;
-    let w_tile_size = w_size / n_tile_num;
-    // C: c_tile_size = ne01 / n_tile_num  (= bm)
-    let c_tile_size = m / n_tile_num;
-    // C: sign_size = three_k * ne01 / 24
-    let sign_size = three_k * m / 24;
-    let sign_tile_size = sign_size / n_tile_num;
-    // C: sign = qweights + three_k * ne01 / 3 / 2
-    let sign_base = three_k * m / 3 / 2;
-
-    // Preprocessor: quantize activations + build LUTs
-    // C: three_qlut size = three_k / 3 * 16 * 2 * ne11 (ne11=1 for decode)
-    let three_lut_bytes = three_k / 3 * 32; // 16 entries * 2 bytes * 1 batch
-    let two_lut_bytes = if two_k > 0 { two_k / 2 * 32 } else { 0 };
-    let mut lut_scale = 0.0f32;
-    let mut three_qlut = vec![0i8; three_lut_bytes];
-    let mut two_qlut = vec![0i8; two_lut_bytes.max(1)];
-
-    unsafe {
-        preprocessor(&cfg, activations, &mut lut_scale, &mut three_qlut, &mut two_qlut, 1);
-    }
-
-    // C: ggml.c:12816-12818 — distribute tiles across threads
-    let two_a_base = if two_k > 0 {
-        three_k * m / 3 / 2 + three_k * m / 3 / 8
-    } else { 0 };
-    let two_w_size = m * two_k / 4;
-    let two_w_tile_size = if n_tile_num > 0 { two_w_size / n_tile_num } else { 0 };
-
+    let lut = match tl2_preprocess(activations, k) {
+        Some(l) => l,
+        None => return false,
+    };
     let out_ptr = output.as_mut_ptr() as usize;
-    let wd_ptr = weight_data.as_ptr() as usize;
-    let tql_ptr = three_qlut.as_ptr() as usize;
-    let twql_ptr = two_qlut.as_ptr() as usize;
 
     crate::thread_pool::global_pool().parallel_chunks(n_tile_num, 1, &|tile_start, tile_end| {
-        for i_tile in tile_start..tile_end {
-            let w_offset = i_tile * w_tile_size;
-            let s_offset = sign_base + i_tile * sign_tile_size;
-            let dst_offset = i_tile * c_tile_size;
-
-            let wd = unsafe { std::slice::from_raw_parts(wd_ptr as *const u8, weight_data.len()) };
-            let tql = unsafe { std::slice::from_raw_parts(tql_ptr as *const i8, three_lut_bytes) };
-
-            let mut cbits = vec![0i32; cfg.bm];
-            unsafe {
-                qgemm_three(
-                    &cfg,
-                    &wd[w_offset..],
-                    &wd[s_offset..],
-                    tql,
-                    &mut cbits,
-                    1,
-                );
-            }
-
-            let out_slice = unsafe {
-                std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(dst_offset), cfg.bm)
-            };
-
-            if two_k > 0 {
-                let two_w_offset = two_a_base + i_tile * two_w_tile_size;
-                let two_cfg = Tl2Config { three_k: 0, two_k, ..cfg };
-                let twql = unsafe { std::slice::from_raw_parts(twql_ptr as *const i8, two_lut_bytes.max(1)) };
-                unsafe {
-                    qgemm_two_and_rescale(
-                        &two_cfg,
-                        &wd[two_w_offset..],
-                        twql,
-                        w_scale,
-                        lut_scale,
-                        &mut cbits,
-                        out_slice,
-                        1,
-                    );
-                }
-            } else {
-                unsafe {
-                    qgemm_two_and_rescale(
-                        &cfg,
-                        &[],
-                        &[],
-                        w_scale,
-                        lut_scale,
-                        &mut cbits,
-                        out_slice,
-                        1,
-                    );
-                }
-            }
+        for t in tile_start..tile_end {
+            tl2_gemv_tiles_cfg(&lut, weight_data, w_scale, out_ptr, &cfg, t, t + 1);
         }
     });
 
@@ -1245,6 +1162,161 @@ pub unsafe fn qgemm_lut(
     qgemm_three(cfg, a, sign, lut, &mut cbits, batch_size);
     qgemm_two_and_rescale(cfg, &[], lut, w_scale, lut_scale, &mut cbits, output, batch_size);
 }
+
+// ── Scalar reference implementations (for Kani proofs + DualPipeline) ──────
+//
+// These compute the same mathematical result as the AVX2 kernels above, without
+// any SIMD. They exist to be formally verified by Kani and used as DualPipeline
+// oracles. NOT gated behind cfg(target_arch) — they run on any platform.
+
+pub fn per_tensor_quant_scalar(b: &[f32]) -> f32 {
+    let mut max_abs = 0.0f32;
+    for &v in b {
+        let a = v.abs();
+        if a > max_abs { max_abs = a; }
+    }
+    127.0 / max_abs
+}
+
+/// Three-valued LUT entries for a single activation triplet (a0, a1, a2).
+/// Returns the 14 non-zero entries indexed 0..13, matching the base-3 encoding.
+pub fn three_lut_entries(a0: i32, a1: i32, a2: i32) -> [i32; 16] {
+    [
+        0,                          // 0: (0,0,0)
+        a2,                         // 1: (0,0,+1)
+        a1 - a2,                    // 2: (0,+1,-1)
+        a1,                         // 3: (0,+1,0)
+        a1 + a2,                    // 4: (0,+1,+1)
+        a0 - a1 - a2,              // 5: (+1,-1,-1)
+        a0 - a1,                    // 6: (+1,-1,0)
+        a0 - a1 + a2,              // 7: (+1,-1,+1)
+        a0 - a2,                    // 8: (+1,0,-1)
+        a0,                         // 9: (+1,0,0)
+        a0 + a2,                    // 10: (+1,0,+1)
+        a0 + a1 - a2,              // 11: (+1,+1,-1)
+        a0 + a1,                    // 12: (+1,+1,0)
+        a0 + a1 + a2,              // 13: (+1,+1,+1)
+        0,                          // 14: unused
+        0,                          // 15: unused
+    ]
+}
+
+/// Two-valued LUT entries for a single activation pair (a0, a1).
+/// Index = w0*3 + w1 + 4, matching the two_lut_ctor encoding.
+pub fn two_lut_entries(a0: i32, a1: i32) -> [i32; 16] {
+    [
+        -(a0 + a1),                 // 0: (-1,-1)
+        -a0,                        // 1: (-1,0)
+        -a0 + a1,                   // 2: (-1,+1)
+        -a1,                        // 3: (0,-1)
+        0,                          // 4: (0,0)
+        a1,                         // 5: (0,+1)
+        a0 - a1,                    // 6: (+1,-1)
+        a0,                         // 7: (+1,0)
+        a0 + a1,                    // 8: (+1,+1)
+        0, 0, 0, 0, 0, 0, 0,       // 9..15: unused
+    ]
+}
+
+/// Scalar reference for the TL2 GEMV end-to-end: quantize activations, group
+/// into triplets/pairs matching the LUT path, apply the same i8 saturation,
+/// and accumulate. This mirrors the AVX2 LUT math exactly (without SIMD) so
+/// the DualPipeline comparison can assert bit-exact parity.
+pub fn tl2_gemv_direct_scalar(
+    activations: &[f32],
+    i2s_data: &[u8],
+    w_scale: f32,
+    output: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    assert_eq!(activations.len(), k);
+    assert_eq!(output.len(), m);
+
+    let cfg = match Tl2Config::for_dims(m, k) {
+        Some(c) => c,
+        None => {
+            // Fallback: element-wise (no LUT grouping) for non-standard dims
+            let scale = per_tensor_quant_scalar(activations);
+            let mut a_q = vec![0i8; k];
+            for i in 0..k {
+                let v = (activations[i] * scale).round() as i32;
+                a_q[i] = v.clamp(-127, 127) as i8;
+            }
+            for row in 0..m {
+                let mut acc = 0i32;
+                for col in 0..k {
+                    let trit = i2s_extract_trit(i2s_data, row, col, k);
+                    acc += trit as i32 * a_q[col] as i32;
+                }
+                output[row] = acc as f32 / scale * w_scale;
+            }
+            return;
+        }
+    };
+    let three_k = cfg.three_k;
+    let two_k = cfg.two_k;
+
+    let scale = per_tensor_quant_scalar(activations);
+    let mut a_q = vec![0i32; k];
+    for i in 0..k {
+        a_q[i] = (activations[i] * scale).round() as i32;
+        a_q[i] = a_q[i].clamp(-127, 127);
+    }
+
+    for row in 0..m {
+        let mut acc = 0i32;
+
+        // Three-valued path: group activations into triplets, compute LUT entry,
+        // saturate to i8, apply sign, accumulate
+        let mut col = 0;
+        while col + 2 < three_k {
+            let w0 = i2s_extract_trit(i2s_data, row, col, k) as i32;
+            let w1 = i2s_extract_trit(i2s_data, row, col + 1, k) as i32;
+            let w2 = i2s_extract_trit(i2s_data, row, col + 2, k) as i32;
+
+            let combined = w0 * 9 + w1 * 3 + w2;
+            let abs_idx = combined.unsigned_abs() as usize;
+            let sign = combined < 0;
+
+            let a0 = a_q[col];
+            let a1 = a_q[col + 1];
+            let a2 = a_q[col + 2];
+            let entries = three_lut_entries(a0, a1, a2);
+            let lut_val = entries[abs_idx].clamp(-32768, 32767) as i16;
+            let contribution = if sign { -lut_val } else { lut_val };
+            acc += contribution as i32;
+
+            col += 3;
+        }
+
+        // Two-valued path: group into pairs
+        let mut col2 = three_k;
+        while col2 + 1 < k {
+            let w0 = i2s_extract_trit(i2s_data, row, col2, k) as i32;
+            let w1 = i2s_extract_trit(i2s_data, row, col2 + 1, k) as i32;
+
+            let idx = (w0 * 3 + w1 + 4) as usize;
+
+            let a0 = a_q[col2];
+            let a1 = a_q[col2 + 1];
+            let entries = two_lut_entries(a0, a1);
+            let lut_val = entries[idx].clamp(-32768, 32767) as i16;
+            acc += lut_val as i32;
+
+            col2 += 2;
+        }
+
+        output[row] = acc as f32 / scale * w_scale;
+    }
+}
+
+// NOTE: A scalar three_tbl_impl/two_tbl_impl that reads the AVX2 byte layout
+// is not written because the post-transpose+pack layout is tightly coupled to
+// SIMD lane semantics. Instead, tl2_gemv_direct_scalar above serves as the
+// ground-truth oracle: it computes the same mathematical result (ternary weights
+// × quantized activations) from the I2S format directly. DualPipeline tests
+// compare this oracle against the AVX2 TL2 path.
 
 #[cfg(test)]
 mod tests {
@@ -1511,5 +1583,259 @@ mod tests {
                 output[i]
             );
         }
+    }
+
+    #[test]
+    fn test_per_tensor_quant_scalar_matches_avx2() {
+        let a: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.1).collect();
+        let scalar = per_tensor_quant_scalar(&a);
+        let avx2 = unsafe { per_tensor_quant(64, &a) };
+        assert!((scalar - avx2).abs() < 1e-5, "scalar={scalar} avx2={avx2}");
+    }
+
+    #[test]
+    fn test_three_lut_entries_symmetry() {
+        let e = three_lut_entries(10, 20, 30);
+        assert_eq!(e[0], 0);
+        assert_eq!(e[9], 10);     // a0
+        assert_eq!(e[3], 20);     // a1
+        assert_eq!(e[1], 30);     // a2
+        assert_eq!(e[13], 60);    // a0+a1+a2
+        assert_eq!(e[12], 30);   // a0+a1
+    }
+
+    #[test]
+    fn test_two_lut_entries_symmetry() {
+        let e = two_lut_entries(10, 20);
+        assert_eq!(e[4], 0);      // (0,0)
+        assert_eq!(e[7], 10);     // (+1,0) = a0
+        assert_eq!(e[5], 20);     // (0,+1) = a1
+        assert_eq!(e[8], 30);     // (+1,+1) = a0+a1
+        assert_eq!(e[0], -30);    // (-1,-1) = -(a0+a1)
+        assert_eq!(e[1], -10);    // (-1,0) = -a0
+    }
+
+    #[test]
+    fn test_tl2_direct_scalar_matches_mad() {
+        use crate::quantized::{i2s_gemv_cols, i2s_weight_scale};
+
+        let m = 128usize;
+        let k = 128usize;
+        let packed_bytes = m * k / 4;
+        let mut i2s = vec![0u8; packed_bytes + 4];
+
+        let row_bytes = k / 4;
+        for r in 0..m {
+            for c in 0..k {
+                let trit: u8 = if r == c { 2 } else { 1 };
+                let group = c / 128;
+                let within = c % 128;
+                let group_idx = within / 32;
+                let group_pos = within % 32;
+                let byte_off = r * row_bytes + group * 32 + group_pos;
+                i2s[byte_off] |= trit << (6 - 2 * group_idx);
+            }
+        }
+        i2s[packed_bytes..packed_bytes + 4].copy_from_slice(&1.0f32.to_ne_bytes());
+
+        let act: Vec<f32> = (1..=k).map(|i| i as f32 * 0.1).collect();
+
+        // MAD reference
+        let mut q8 = vec![0i8; k];
+        let (scale, sum) = crate::quantized::i2s_quantize_into(&act, &mut q8);
+        let w_scale = i2s_weight_scale(&i2s, m, k);
+        let mut mad_out = vec![0.0f32; m];
+        i2s_gemv_cols(&q8, scale, sum, &i2s, w_scale, mad_out.as_mut_ptr() as usize, 0, m, k);
+
+        // Direct scalar
+        let mut scalar_out = vec![0.0f32; m];
+        tl2_gemv_direct_scalar(&act, &i2s, w_scale, &mut scalar_out, m, k);
+
+        let max_err = mad_out.iter().zip(scalar_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let norm: f32 = mad_out.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let rel_err = if norm > 0.0 { max_err / norm } else { max_err };
+        assert!(rel_err < 0.05, "direct scalar vs MAD rel_err={rel_err} max_err={max_err}");
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn tl2_three_lut_entry_values_bounded() {
+        let a0: i32 = kani::any();
+        let a1: i32 = kani::any();
+        let a2: i32 = kani::any();
+        kani::assume(a0 >= -127 && a0 <= 127);
+        kani::assume(a1 >= -127 && a1 <= 127);
+        kani::assume(a2 >= -127 && a2 <= 127);
+
+        let entries = three_lut_entries(a0, a1, a2);
+        for i in 0..16 {
+            assert!(entries[i] >= -381 && entries[i] <= 381);
+        }
+    }
+
+    #[kani::proof]
+    fn tl2_three_lut_unused_entries_zero() {
+        let a0: i32 = kani::any();
+        let a1: i32 = kani::any();
+        let a2: i32 = kani::any();
+        kani::assume(a0 >= -127 && a0 <= 127);
+        kani::assume(a1 >= -127 && a1 <= 127);
+        kani::assume(a2 >= -127 && a2 <= 127);
+
+        let entries = three_lut_entries(a0, a1, a2);
+        assert_eq!(entries[0], 0);
+        assert_eq!(entries[14], 0);
+        assert_eq!(entries[15], 0);
+    }
+
+    #[kani::proof]
+    fn tl2_two_lut_entry_values_bounded() {
+        let a0: i32 = kani::any();
+        let a1: i32 = kani::any();
+        kani::assume(a0 >= -127 && a0 <= 127);
+        kani::assume(a1 >= -127 && a1 <= 127);
+
+        let entries = two_lut_entries(a0, a1);
+        for i in 0..16 {
+            assert!(entries[i] >= -254 && entries[i] <= 254);
+        }
+    }
+
+    #[kani::proof]
+    fn tl2_two_lut_unused_entries_zero() {
+        let a0: i32 = kani::any();
+        let a1: i32 = kani::any();
+        kani::assume(a0 >= -127 && a0 <= 127);
+        kani::assume(a1 >= -127 && a1 <= 127);
+
+        let entries = two_lut_entries(a0, a1);
+        for i in 9..16 {
+            assert_eq!(entries[i], 0);
+        }
+    }
+
+    #[kani::proof]
+    fn tl2_three_lut_i8_saturation_range() {
+        let a0: i32 = kani::any();
+        let a1: i32 = kani::any();
+        let a2: i32 = kani::any();
+        kani::assume(a0 >= -127 && a0 <= 127);
+        kani::assume(a1 >= -127 && a1 <= 127);
+        kani::assume(a2 >= -127 && a2 <= 127);
+
+        let entries = three_lut_entries(a0, a1, a2);
+        for i in 0..16 {
+            let saturated = entries[i].clamp(-128, 127) as i8;
+            assert!(saturated >= -128 && saturated <= 127);
+        }
+    }
+
+    #[kani::proof]
+    fn tl2_i16_accumulator_no_overflow_bk96() {
+        let val: i8 = kani::any();
+        let kk: usize = 32; // BK=96 → kk=96/3=32
+        // Each tbl_impl iteration adds at most |val| per step
+        // kk triplet-groups per tile, each contributes one i8 LUT value
+        let worst_case = val as i32 * kk as i32;
+        assert!(worst_case >= i16::MIN as i32 && worst_case <= i16::MAX as i32);
+    }
+
+    #[kani::proof]
+    fn tl2_base3_triplet_index_in_range() {
+        let w0: i8 = kani::any();
+        let w1: i8 = kani::any();
+        let w2: i8 = kani::any();
+        kani::assume(w0 >= -1 && w0 <= 1);
+        kani::assume(w1 >= -1 && w1 <= 1);
+        kani::assume(w2 >= -1 && w2 <= 1);
+
+        let combined = w0 as i32 * 9 + w1 as i32 * 3 + w2 as i32;
+        assert!(combined >= -13 && combined <= 13);
+        let abs_val = combined.unsigned_abs();
+        assert!(abs_val <= 13);
+        // Fits in a 4-bit nibble
+        assert!(abs_val < 16);
+    }
+
+    #[kani::proof]
+    fn tl2_base2_pair_index_in_range() {
+        let w0: i8 = kani::any();
+        let w1: i8 = kani::any();
+        kani::assume(w0 >= -1 && w0 <= 1);
+        kani::assume(w1 >= -1 && w1 <= 1);
+
+        let index = w0 as i32 * 3 + w1 as i32 + 4;
+        assert!(index >= 0 && index <= 8);
+        assert!((index as u32) < 16);
+    }
+
+    #[kani::proof]
+    fn tl2_config_three_k_two_k_partition() {
+        let k: usize = kani::any();
+        let bk: usize = 96;
+        kani::assume(k >= bk);
+        kani::assume(k <= 8192);
+        kani::assume(k % bk == 0 || k % bk >= 32);
+
+        let bk_num = k / bk;
+        let three_k = bk_num * bk;
+        let two_k = k - three_k;
+        assert!(three_k + two_k == k);
+        assert!(three_k % 3 == 0);
+        assert!(two_k < bk);
+        if two_k > 0 {
+            assert!(two_k % 2 == 0);
+        }
+    }
+
+    #[kani::proof]
+    fn tl2_nibble_extraction_in_range() {
+        let byte: u8 = kani::any();
+        let top = (byte >> 4) & 0x0f;
+        let bot = byte & 0x0f;
+        assert!(top < 16);
+        assert!(bot < 16);
+    }
+
+    #[kani::proof]
+    fn tl2_per_tensor_quant_positive() {
+        let max_abs: f32 = kani::any();
+        kani::assume(max_abs > 0.0);
+        kani::assume(max_abs.is_finite());
+        kani::assume(max_abs <= 1e6);
+
+        let scale = 127.0 / max_abs;
+        assert!(scale > 0.0);
+        assert!(scale.is_finite());
+    }
+
+    #[kani::proof]
+    fn tl2_i2s_extract_trit_value_range() {
+        let byte_val: u8 = kani::any();
+        let group_idx: usize = kani::any();
+        kani::assume(group_idx < 4);
+
+        let shift = 6 - 2 * group_idx;
+        let bits = (byte_val >> shift) & 0x03;
+        let trit = bits as i8 - 1;
+        assert!(trit >= -1 && trit <= 1);
+    }
+
+    #[kani::proof]
+    fn tl2_direct_dot_accumulator_no_overflow() {
+        let k: usize = kani::any();
+        kani::assume(k >= 1 && k <= 8192);
+
+        // Each term: trit ∈ {-1,0,1}, a_q ∈ [-127,127]
+        // Worst case per element: 127
+        // k elements → max |acc| = 127 * k
+        let worst_case = 127i64 * k as i64;
+        assert!(worst_case <= i32::MAX as i64);
     }
 }

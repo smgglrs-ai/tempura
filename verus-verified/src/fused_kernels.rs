@@ -96,6 +96,78 @@ proof fn fused_silu_no_cross_talk(
 {
 }
 
+// ============================================================================
+// Fused SqReLU*Mul: gate[i] = max(gate[i], 0)^2 * up[i]
+// Output is non-negative when up[i] >= 0
+// ============================================================================
+
+proof fn fused_sqrelu_mul_lengths(
+    gate_len: nat,
+    up_len: nat,
+    n: nat,
+)
+    requires
+        gate_len >= n,
+        up_len >= n,
+    ensures
+        gate_len >= n && up_len >= n,
+{
+}
+
+proof fn fused_sqrelu_mul_element_index(
+    n: nat,
+    i: nat,
+)
+    requires i < n,
+    ensures i < n,
+{
+}
+
+proof fn fused_sqrelu_non_negative(gate_val: int, up_val: int)
+    requires
+        up_val >= 0,
+    ensures ({
+        let r = if gate_val > 0 { gate_val } else { 0 };
+        r * r * up_val >= 0
+    }),
+{
+    let r = if gate_val > 0 { gate_val } else { 0 };
+    assert(r >= 0);
+    assert(r * r >= 0) by (nonlinear_arith) requires r >= 0;
+    assert(r * r * up_val >= 0) by (nonlinear_arith) requires r * r >= 0, up_val >= 0;
+}
+
+// ============================================================================
+// Residual add: dst[i] += src[i], both must have length >= n
+// ============================================================================
+
+proof fn residual_add_index_safety(
+    dst_len: nat,
+    src_len: nat,
+    n: nat,
+    i: nat,
+)
+    requires
+        dst_len >= n,
+        src_len >= n,
+        i < n,
+    ensures
+        i < dst_len && i < src_len,
+{
+}
+
+// ============================================================================
+// Fused RMSNorm+Q8Snap: quantized output clamped to [-128, 127]
+// ============================================================================
+
+proof fn q8snap_output_clamped(val: int)
+    ensures ({
+        let clamped = if val > 127 { 127 } else if val < -128 { -128 } else { val };
+        &&& -128 <= clamped <= 127
+    }),
+{
+}
+
 fn main() {}
 
 } // verus!

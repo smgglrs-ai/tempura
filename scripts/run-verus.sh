@@ -227,6 +227,8 @@ MODULES=(
     gpu_elementwise
     kv_rollback
     mma_fragments
+    tl2_lut
+    f16_gemv
 )
 
 TOTAL_VERIFIED=0

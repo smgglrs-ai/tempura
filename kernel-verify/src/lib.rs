@@ -2,6 +2,7 @@ use rand::{Rng, SeedableRng};
 use serde::Serialize;
 use tempura_kernel_api::{Attention, MatMul, RMSNorm, RoPE};
 
+pub mod bitnet;
 pub mod composition;
 pub mod test_generators;
 

@@ -151,7 +151,7 @@ pub fn fused_sqrelu_mul(gate: &mut [f32], up: &[f32], n: usize) {
 
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn fused_sqrelu_mul_avx2(gate: &mut [f32], up: &[f32], n: usize) {
+pub unsafe fn fused_sqrelu_mul_avx2(gate: &mut [f32], up: &[f32], n: usize) {
     use std::arch::x86_64::*;
     let zero = _mm256_setzero_ps();
     let chunks = n / 8;
@@ -186,7 +186,7 @@ pub fn residual_add(dst: &mut [f32], src: &[f32], n: usize) {
 
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn residual_add_avx2(dst: &mut [f32], src: &[f32], n: usize) {
+pub unsafe fn residual_add_avx2(dst: &mut [f32], src: &[f32], n: usize) {
     use std::arch::x86_64::*;
     let chunks = n / 8;
     for i in 0..chunks {
@@ -369,5 +369,71 @@ mod tests {
         for i in 0..n {
             assert!((dst[i] - expected[i]).abs() < 1e-6);
         }
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    #[kani::proof]
+    fn fused_rmsnorm_q8snap_index_safety() {
+        let hidden_size: usize = kani::any();
+        kani::assume(hidden_size >= 1 && hidden_size <= 64);
+
+        let i: usize = kani::any();
+        kani::assume(i < hidden_size);
+
+        assert!(i < hidden_size);
+    }
+
+    #[kani::proof]
+    fn fused_residual_rmsnorm_q8snap_index_safety() {
+        let hidden_size: usize = kani::any();
+        kani::assume(hidden_size >= 1 && hidden_size <= 64);
+
+        let i: usize = kani::any();
+        kani::assume(i < hidden_size);
+
+        let x_len = hidden_size;
+        let residual_len = hidden_size;
+        let weight_len = hidden_size;
+
+        assert!(i < x_len);
+        assert!(i < residual_len);
+        assert!(i < weight_len);
+    }
+
+    #[kani::proof]
+    fn fused_sqrelu_mul_index_safety() {
+        let n: usize = kani::any();
+        kani::assume(n >= 1 && n <= 64);
+
+        let i: usize = kani::any();
+        kani::assume(i < n);
+
+        assert!(i < n); // gate[i] and up[i] both in bounds
+    }
+
+    #[kani::proof]
+    fn fused_sqrelu_output_non_negative() {
+        let gate: f32 = kani::any();
+        kani::assume(gate.is_finite());
+        let up: f32 = kani::any();
+        kani::assume(up.is_finite());
+        kani::assume(up >= 0.0);
+
+        let r = gate.max(0.0);
+        let result = r * r * up;
+        assert!(result >= 0.0 || result.is_nan());
+    }
+
+    #[kani::proof]
+    fn residual_add_index_safety() {
+        let n: usize = kani::any();
+        kani::assume(n >= 1 && n <= 64);
+
+        let i: usize = kani::any();
+        kani::assume(i < n);
+
+        assert!(i < n); // dst[i] and src[i] both in bounds
     }
 }

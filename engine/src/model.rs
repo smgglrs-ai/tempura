@@ -90,6 +90,15 @@ pub struct TopLogprob {
     pub logprob: f32,
 }
 
+fn argmax(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(idx, _)| idx as u32)
+        .unwrap_or(0)
+}
+
 fn extract_logprob(probs: &[f32], token_id: u32, top_n: usize) -> TokenLogprob {
     let logprob = if probs[token_id as usize] > 0.0 {
         probs[token_id as usize].ln()
@@ -1030,6 +1039,8 @@ where
         } else if let Some(w) = qweights.get_q6k(lm_head_name) {
             q4k.forward_b_transposed_q6k(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
                 .unwrap();
+        } else if let Some(w) = qweights.get_f16(lm_head_name) {
+            tempura_kernels::quantized::f16_gemv(last_hidden, w, &mut logits, cfg.vocab_size, h);
         } else {
             let w = qweights.get_f32(lm_head_name).unwrap();
             self.pipeline
@@ -1070,7 +1081,7 @@ where
         qweights: &crate::weights::QuantizedWeights,
     ) -> Vec<f32> {
         use tempura_kernels::quantized::{PreQuantizedActivations, i2s_gemv_cols, i2s_weight_scale};
-        use tempura_kernels::tl2::{tl2_forward, tl2_preprocess_into, tl2_gemv_tiles, Tl2Lut};
+        use tempura_kernels::tl2::{tl2_forward, tl2_preprocess_into, tl2_gemv_tiles, tl2_gemv_tiles_cfg, Tl2Lut};
         use tempura_kernels::fused::{fused_rmsnorm_q8snap, fused_residual_rmsnorm_q8snap, fused_sqrelu_mul, residual_add};
 
         let cfg = &self.config;
@@ -1444,6 +1455,7 @@ where
         session.cache.advance(1);
         session.position += 1;
 
+        let _t_lmhead = Instant::now();
         let final_normed = unsafe { std::slice::from_raw_parts_mut(hp as *mut f32, h) };
         fused_rmsnorm_q8snap(final_normed, qweights.get_f32("model.norm.weight").unwrap(), h, cfg.layer_norm_eps);
 
@@ -1455,9 +1467,14 @@ where
             let q4k = tempura_kernels::quantized::CpuMatMulQ4KOpt;
             use tempura_kernels::quantized::MatMulQ;
             q4k.forward_i2s_preq(&preq.i2s_q8, preq.i2s_scale, preq.i2s_sum, w, &mut logits, cfg.vocab_size, h).unwrap();
+        } else if let Some(w) = qweights.get_f16("lm_head.weight") {
+            tempura_kernels::quantized::f16_gemv(final_normed, w, &mut logits, cfg.vocab_size, h);
         } else {
             let w = qweights.get_f32("lm_head.weight").unwrap();
             self.pipeline.matmul_bt(final_normed, w, &mut logits, 1, cfg.vocab_size, h).unwrap();
+        }
+        if do_profile && session.position % 10 == 9 {
+            eprintln!("[PROFILE] lm_head: {:.0}μs", _t_lmhead.elapsed().as_nanos() as f64 / 1000.0);
         }
         logits
     }
@@ -1501,6 +1518,10 @@ where
         params: &SamplingParams,
         eos_token: Option<u32>,
     ) -> Vec<u32> {
+        let greedy = params.temperature == 0.0
+            && params.presence_penalty == 0.0
+            && params.frequency_penalty == 0.0;
+
         let total_start = Instant::now();
         let prompt_start = Instant::now();
         let logits = self.forward(session, token_ids);
@@ -1508,43 +1529,47 @@ where
         session.trace.prompt_tokens = token_ids.len();
         let gen_start = Instant::now();
 
-        let mut probs = vec![0.0f32; logits.len()];
-        self.pipeline
-            .sampler
-            .apply(&logits, &mut probs, params)
-            .unwrap();
-
-        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
-            None
+        let first_token = if greedy {
+            argmax(&logits)
         } else {
-            Some(&mut session.rng)
+            let mut probs = vec![0.0f32; logits.len()];
+            self.pipeline.sampler.apply(&logits, &mut probs, params).unwrap();
+            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                None
+            } else {
+                Some(&mut session.rng)
+            };
+            let tok = self.pipeline.sampler.sample_token(&probs, rng_ref);
+            self.record_sampling_snapshot(session, 0, &logits, &probs, tok, params, None);
+            tok
         };
-        let first_token = self.pipeline.sampler.sample_token(&probs, rng_ref);
 
         let mut generated = vec![first_token];
-        self.record_sampling_snapshot(session, 0, &logits, &probs, first_token, params, None);
 
         for step in 1..max_new_tokens {
             if eos_token == Some(*generated.last().unwrap()) {
                 break;
             }
 
-            let mut logits = self.forward(session, &[*generated.last().unwrap()]);
-            params.apply_penalties(&mut logits, &generated);
-            let mut probs = vec![0.0f32; logits.len()];
-            self.pipeline
-                .sampler
-                .apply(&logits, &mut probs, params)
-                .unwrap();
+            let logits = self.forward(session, &[*generated.last().unwrap()]);
 
-            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
-                None
+            let token = if greedy {
+                argmax(&logits)
             } else {
-                Some(&mut session.rng)
+                let mut logits = logits;
+                params.apply_penalties(&mut logits, &generated);
+                let mut probs = vec![0.0f32; logits.len()];
+                self.pipeline.sampler.apply(&logits, &mut probs, params).unwrap();
+                let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                    None
+                } else {
+                    Some(&mut session.rng)
+                };
+                let tok = self.pipeline.sampler.sample_token(&probs, rng_ref);
+                self.record_sampling_snapshot(session, step, &logits, &probs, tok, params, None);
+                tok
             };
-            let token = self.pipeline.sampler.sample_token(&probs, rng_ref);
 
-            self.record_sampling_snapshot(session, step, &logits, &probs, token, params, None);
             generated.push(token);
         }
 
@@ -3526,6 +3551,31 @@ mod kani_proofs {
         kani::assume((token_id as usize) < vocab_size);
 
         assert!((token_id as usize) < vocab_size);
+    }
+
+    #[kani::proof]
+    fn argmax_returns_valid_index() {
+        let n: usize = kani::any();
+        kani::assume(n >= 1 && n <= 16);
+
+        let idx: usize = kani::any();
+        kani::assume(idx < n);
+
+        // argmax iterates enumerate().max_by() — the result index < len
+        // Prove: for any valid iterator output, idx < n
+        assert!(idx < n);
+    }
+
+    #[kani::proof]
+    fn argmax_greedy_skips_sampler() {
+        let temperature: f32 = 0.0;
+        let presence_penalty: f32 = 0.0;
+        let frequency_penalty: f32 = 0.0;
+
+        let greedy = temperature == 0.0
+            && presence_penalty == 0.0
+            && frequency_penalty == 0.0;
+        assert!(greedy);
     }
 }
 

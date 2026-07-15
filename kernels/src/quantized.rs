@@ -743,7 +743,7 @@ fn nearest_int(fval: f32) -> i32 {
 
 /// Translated from ggml-quants.c:3503-3522.
 /// Quantizes f32 activations to i8 per-tensor, returns (scale, sum).
-fn quantize_row_i8_s(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
+pub fn quantize_row_i8_s(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
     // C: double min = 0.00001; double max = min;
     let mut max: f64 = 0.00001;
     // C: for (int i = 0; i < n; ++i) max = MAX(max, (double)fabs((double)x[i]));
@@ -782,7 +782,7 @@ fn quantize_row_i8_s(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
 ///   bits[3:2] → element 64+b    (group_idx=2)
 ///   bits[1:0] → element 96+b    (group_idx=3)
 /// Values {0,1,2} represent ternary {-1,0,+1}.
-fn vec_dot_i2_i8_s(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
+pub fn vec_dot_i2_i8_s(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
     // C: const int nb = n / QK_I2_S;  // QK_I2_S = 128
     let nb = k / 128;
     let mut accu: i32 = 0;
@@ -828,7 +828,7 @@ pub fn i2s_dequant_block(block: &[u8], output: &mut [f32; I2S_BLOCK_SIZE]) {
 /// AVX2 per-tensor INT8 activation quantization — zero-allocation, writes directly into dst.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn quantize_row_i8_s_avx2_into(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
+pub unsafe fn quantize_row_i8_s_avx2_into(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
     use std::arch::x86_64::*;
 
     let k = x.len();
@@ -975,7 +975,7 @@ unsafe fn quantize_row_i8_s_avx2(x: &[f32]) -> (f32, i32, Vec<i8>) {
 /// Processes 128 elements per group using _mm256_maddubs_epi16.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn vec_dot_i2_i8_s_avx2(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
+pub unsafe fn vec_dot_i2_i8_s_avx2(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
     use std::arch::x86_64::*;
 
     let nb = k / 128;
@@ -4418,6 +4418,339 @@ mod kani_proofs {
         let out_idx = i * n + j;
         assert!(out_idx < m * n);
     }
+
+    #[kani::proof]
+    fn f16_dot_scalar_index_bounds() {
+        let k: usize = kani::any();
+        kani::assume(k >= 1 && k <= 64);
+
+        let i: usize = kani::any();
+        kani::assume(i < k);
+
+        let byte_idx_lo = i * 2;
+        let byte_idx_hi = i * 2 + 1;
+        let b_len = k * 2;
+
+        assert!(byte_idx_lo < b_len);
+        assert!(byte_idx_hi < b_len);
+    }
+
+    #[kani::proof]
+    fn f16_gemv_row_index_bounds() {
+        let n: usize = kani::any();
+        let k: usize = kani::any();
+        kani::assume(n >= 1 && n <= 16);
+        kani::assume(k >= 1 && k <= 64);
+
+        let j: usize = kani::any();
+        kani::assume(j < n);
+
+        let row_bytes = k * 2;
+        let b_start = j * row_bytes;
+        let b_end = b_start + row_bytes;
+        assert!(b_end <= n * k * 2);
+        assert!(j < n);
+    }
+
+    #[kani::proof]
+    fn i2s_gemv_cols_index_bounds() {
+        let n: usize = kani::any();
+        let k: usize = kani::any();
+        kani::assume(n >= 1 && n <= 8);
+        kani::assume(k == 128 || k == 256);
+
+        let col_start: usize = kani::any();
+        let col_end: usize = kani::any();
+        kani::assume(col_start <= col_end);
+        kani::assume(col_end <= n);
+
+        let row_packed_bytes = k / 4;
+
+        let col: usize = kani::any();
+        kani::assume(col >= col_start && col < col_end);
+
+        let w_offset = col * row_packed_bytes;
+        assert!(w_offset + row_packed_bytes <= n * row_packed_bytes);
+        assert!(col < n);
+    }
+}
+
+// ── F16 GEMV (lm_head) ────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c,fma")]
+pub unsafe fn f16_dot_avx2(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+
+    let a_ptr = a.as_ptr();
+    let b_ptr = b_f16.as_ptr() as *const __m128i;
+
+    let k32 = k & !31;
+    let mut i = 0usize;
+    while i < k32 {
+        let b0 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(i / 8)));
+        let a0 = _mm256_loadu_ps(a_ptr.add(i));
+        acc0 = _mm256_fmadd_ps(a0, b0, acc0);
+
+        let b1 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(i / 8 + 1)));
+        let a1 = _mm256_loadu_ps(a_ptr.add(i + 8));
+        acc1 = _mm256_fmadd_ps(a1, b1, acc1);
+
+        let b2 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(i / 8 + 2)));
+        let a2 = _mm256_loadu_ps(a_ptr.add(i + 16));
+        acc2 = _mm256_fmadd_ps(a2, b2, acc2);
+
+        let b3 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(i / 8 + 3)));
+        let a3 = _mm256_loadu_ps(a_ptr.add(i + 24));
+        acc3 = _mm256_fmadd_ps(a3, b3, acc3);
+
+        i += 32;
+    }
+
+    acc0 = _mm256_add_ps(acc0, acc1);
+    acc2 = _mm256_add_ps(acc2, acc3);
+    acc0 = _mm256_add_ps(acc0, acc2);
+
+    // Handle remaining 8-element chunks
+    while i + 8 <= k {
+        let b0 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(i / 8)));
+        let a0 = _mm256_loadu_ps(a_ptr.add(i));
+        acc0 = _mm256_fmadd_ps(a0, b0, acc0);
+        i += 8;
+    }
+
+    // Horizontal sum
+    let hi = _mm256_extractf128_ps(acc0, 1);
+    let lo = _mm256_castps256_ps128(acc0);
+    let sum128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let sums2 = _mm_add_ss(sums, shuf2);
+    let mut result = _mm_cvtss_f32(sums2);
+
+    // Scalar tail
+    while i < k {
+        let b_val = half::f16::from_bits(
+            u16::from_le_bytes([b_f16[i * 2], b_f16[i * 2 + 1]])
+        ).to_f32();
+        result += a[i] * b_val;
+        i += 1;
+    }
+
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,f16c,fma")]
+pub unsafe fn f16_dot_avx512(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut acc2 = _mm512_setzero_ps();
+    let mut acc3 = _mm512_setzero_ps();
+
+    let a_ptr = a.as_ptr();
+    let b_ptr = b_f16.as_ptr() as *const __m256i;
+
+    let k64 = k & !63;
+    let mut i = 0usize;
+    while i < k64 {
+        let b0 = _mm512_cvtph_ps(_mm256_loadu_si256(b_ptr.add(i / 16)));
+        let a0 = _mm512_loadu_ps(a_ptr.add(i));
+        acc0 = _mm512_fmadd_ps(a0, b0, acc0);
+
+        let b1 = _mm512_cvtph_ps(_mm256_loadu_si256(b_ptr.add(i / 16 + 1)));
+        let a1 = _mm512_loadu_ps(a_ptr.add(i + 16));
+        acc1 = _mm512_fmadd_ps(a1, b1, acc1);
+
+        let b2 = _mm512_cvtph_ps(_mm256_loadu_si256(b_ptr.add(i / 16 + 2)));
+        let a2 = _mm512_loadu_ps(a_ptr.add(i + 32));
+        acc2 = _mm512_fmadd_ps(a2, b2, acc2);
+
+        let b3 = _mm512_cvtph_ps(_mm256_loadu_si256(b_ptr.add(i / 16 + 3)));
+        let a3 = _mm512_loadu_ps(a_ptr.add(i + 48));
+        acc3 = _mm512_fmadd_ps(a3, b3, acc3);
+
+        i += 64;
+    }
+
+    acc0 = _mm512_add_ps(acc0, acc1);
+    acc2 = _mm512_add_ps(acc2, acc3);
+    acc0 = _mm512_add_ps(acc0, acc2);
+
+    while i + 16 <= k {
+        let b0 = _mm512_cvtph_ps(_mm256_loadu_si256(b_ptr.add(i / 16)));
+        let a0 = _mm512_loadu_ps(a_ptr.add(i));
+        acc0 = _mm512_fmadd_ps(a0, b0, acc0);
+        i += 16;
+    }
+
+    let mut result = _mm512_reduce_add_ps(acc0);
+
+    while i < k {
+        let b_val = half::f16::from_bits(
+            u16::from_le_bytes([b_f16[i * 2], b_f16[i * 2 + 1]])
+        ).to_f32();
+        result += a[i] * b_val;
+        i += 1;
+    }
+
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,f16c,fma")]
+unsafe fn f16_gemv_avx512(a_ptr: usize, b_ptr: usize, out_ptr: usize, k: usize, row_start: usize, row_end: usize) {
+    let row_bytes = k * 2;
+    let a_slice = std::slice::from_raw_parts(a_ptr as *const f32, k);
+    for j in row_start..row_end {
+        let b_row = std::slice::from_raw_parts((b_ptr as *const u8).add(j * row_bytes), row_bytes);
+        let val = f16_dot_avx512(a_slice, b_row, k);
+        *(out_ptr as *mut f32).add(j) = val;
+    }
+}
+
+pub fn f16_dot_scalar(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
+    // Match the AVX2 accumulation order exactly for bit-exact parity:
+    // 4 independent accumulators over groups of 8, reduced in the same order.
+    let mut acc = [0.0f32; 32]; // 4 accumulators × 8 lanes
+    let k32 = k & !31;
+    let mut i = 0usize;
+
+    while i < k32 {
+        for lane in 0..8 {
+            let b_val = half::f16::from_bits(
+                u16::from_le_bytes([b_f16[(i + lane) * 2], b_f16[(i + lane) * 2 + 1]])
+            ).to_f32();
+            acc[lane] = a[i + lane].mul_add(b_val, acc[lane]);
+        }
+        for lane in 0..8 {
+            let b_val = half::f16::from_bits(
+                u16::from_le_bytes([b_f16[(i + 8 + lane) * 2], b_f16[(i + 8 + lane) * 2 + 1]])
+            ).to_f32();
+            acc[8 + lane] = a[i + 8 + lane].mul_add(b_val, acc[8 + lane]);
+        }
+        for lane in 0..8 {
+            let b_val = half::f16::from_bits(
+                u16::from_le_bytes([b_f16[(i + 16 + lane) * 2], b_f16[(i + 16 + lane) * 2 + 1]])
+            ).to_f32();
+            acc[16 + lane] = a[i + 16 + lane].mul_add(b_val, acc[16 + lane]);
+        }
+        for lane in 0..8 {
+            let b_val = half::f16::from_bits(
+                u16::from_le_bytes([b_f16[(i + 24 + lane) * 2], b_f16[(i + 24 + lane) * 2 + 1]])
+            ).to_f32();
+            acc[24 + lane] = a[i + 24 + lane].mul_add(b_val, acc[24 + lane]);
+        }
+        i += 32;
+    }
+
+    // Reduce: acc0 += acc1; acc2 += acc3; acc0 += acc2 (matches AVX2 reduction)
+    for lane in 0..8 {
+        acc[lane] += acc[8 + lane];
+        acc[16 + lane] += acc[24 + lane];
+        acc[lane] += acc[16 + lane];
+    }
+
+    // Remaining 8-element chunks into acc0
+    while i + 8 <= k {
+        for lane in 0..8 {
+            let b_val = half::f16::from_bits(
+                u16::from_le_bytes([b_f16[(i + lane) * 2], b_f16[(i + lane) * 2 + 1]])
+            ).to_f32();
+            acc[lane] = a[i + lane].mul_add(b_val, acc[lane]);
+        }
+        i += 8;
+    }
+
+    // Horizontal sum matching AVX2: hi+lo, then pairwise
+    // Lane order after _mm256_extractf128_ps(1) + castps256_ps128:
+    // sum128 = [acc[0]+acc[4], acc[1]+acc[5], acc[2]+acc[6], acc[3]+acc[7]]
+    let mut s = [0.0f32; 4];
+    for j in 0..4 {
+        s[j] = acc[j] + acc[j + 4];
+    }
+    // movehdup: [s1,s1,s3,s3] + [s0,s1,s2,s3] = [s0+s1, _, s2+s3, _]
+    let p0 = s[0] + s[1];
+    let p1 = s[2] + s[3];
+    // movehl + add_ss
+    let mut result = p0 + p1;
+
+    // Scalar tail (same as AVX2)
+    while i < k {
+        let b_val = half::f16::from_bits(
+            u16::from_le_bytes([b_f16[i * 2], b_f16[i * 2 + 1]])
+        ).to_f32();
+        result += a[i] * b_val;
+        i += 1;
+    }
+
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn f16_gemv_avx2(a_ptr: usize, b_ptr: usize, out_ptr: usize, k: usize, row_start: usize, row_end: usize) {
+    let row_bytes = k * 2;
+    let a_slice = std::slice::from_raw_parts(a_ptr as *const f32, k);
+    for j in row_start..row_end {
+        let b_row = std::slice::from_raw_parts((b_ptr as *const u8).add(j * row_bytes), row_bytes);
+        let val = f16_dot_avx2(a_slice, b_row, k);
+        *(out_ptr as *mut f32).add(j) = val;
+    }
+}
+
+/// F16 GEMV: output[j] = dot(a[0..k], b_f16[j*k*2..(j+1)*k*2]) for j in 0..n
+/// `b_f16` is raw F16 bytes in row-major layout (n rows × k cols, 2 bytes per element).
+pub fn f16_gemv(a: &[f32], b_f16: &[u8], output: &mut [f32], n: usize, k: usize) {
+    assert_eq!(a.len(), k);
+    assert_eq!(b_f16.len(), n * k * 2);
+    assert_eq!(output.len(), n);
+
+    let a_ptr = a.as_ptr() as usize;
+    let b_ptr = b_f16.as_ptr() as usize;
+    let out_ptr = output.as_mut_ptr() as usize;
+
+    #[cfg(target_arch = "x86_64")]
+    let use_avx512 = is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("f16c")
+        && is_x86_feature_detected!("fma");
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = !use_avx512
+        && is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("f16c")
+        && is_x86_feature_detected!("fma");
+
+    crate::thread_pool::global_pool().parallel_chunks(n, 1, &|row_start, row_end| {
+        #[cfg(target_arch = "x86_64")]
+        if use_avx512 {
+            unsafe { f16_gemv_avx512(a_ptr, b_ptr, out_ptr, k, row_start, row_end) };
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if use_avx2 {
+            unsafe { f16_gemv_avx2(a_ptr, b_ptr, out_ptr, k, row_start, row_end) };
+            return;
+        }
+        let row_bytes = k * 2;
+        let a_slice = unsafe { std::slice::from_raw_parts(a_ptr as *const f32, k) };
+        for j in row_start..row_end {
+            let b_row = unsafe {
+                std::slice::from_raw_parts((b_ptr as *const u8).add(j * row_bytes), row_bytes)
+            };
+            unsafe {
+                *(out_ptr as *mut f32).add(j) = f16_dot_scalar(a_slice, b_row, k);
+            }
+        }
+    });
 }
 
 #[cfg(test)]

@@ -251,6 +251,7 @@ pub struct QuantizedWeights {
     i2s_tensors: HashMap<String, Vec<u8>>,
     i2s_lut_tensors: HashMap<String, Vec<u8>>,
     tl2_tensors: HashMap<String, Tl2Tensor>,
+    f16_tensors: HashMap<String, Vec<u8>>,
     f32_tensors: HashMap<String, Vec<f32>>,
 }
 
@@ -267,6 +268,7 @@ impl QuantizedWeights {
             i2s_tensors: HashMap::new(),
             i2s_lut_tensors: HashMap::new(),
             tl2_tensors: HashMap::new(),
+            f16_tensors: HashMap::new(),
             f32_tensors,
         }
     }
@@ -284,6 +286,7 @@ impl QuantizedWeights {
             tq2_tensors,
             i2s_lut_tensors: HashMap::new(),
             tl2_tensors: HashMap::new(),
+            f16_tensors: HashMap::new(),
             i2s_tensors,
             f32_tensors,
         }
@@ -315,6 +318,14 @@ impl QuantizedWeights {
 
     pub fn add_tl2_tensor(&mut self, name: String, data: Vec<u8>, m: usize, k: usize, scale: f32) {
         self.tl2_tensors.insert(name, Tl2Tensor { data, m, k, scale });
+    }
+
+    pub fn get_f16(&self, name: &str) -> Option<&[u8]> {
+        self.f16_tensors.get(name).map(|v| v.as_slice())
+    }
+
+    pub fn insert_f16(&mut self, name: String, data: Vec<u8>) {
+        self.f16_tensors.insert(name, data);
     }
 
     pub fn get_f32(&self, name: &str) -> Option<&[f32]> {
