@@ -94,6 +94,81 @@ fn naive_attention(
     Ok(())
 }
 
+/// Optimized multi-token attention: parallel over heads, pre-allocated scores,
+/// SIMD dot products. Matches ggml semantics (f64 softmax sum, ggml_exp).
+fn optimized_attention_ggml(
+    q: &[f32], k: &[f32], v: &[f32], output: &mut [f32],
+    _batch: usize, seq_len: usize, kv_len: usize,
+    num_heads: usize, num_kv_heads: usize, head_dim: usize,
+    scale: f32, window: Option<usize>,
+) -> Result<()> {
+    let heads_per_group = num_heads / num_kv_heads;
+    let out_ptr = output.as_mut_ptr() as usize;
+    let q_ptr = q.as_ptr() as usize;
+    let k_ptr = k.as_ptr() as usize;
+    let v_ptr = v.as_ptr() as usize;
+
+    crate::thread_pool::global_pool().parallel_chunks(num_heads * seq_len, 1, &|start, end| {
+        let q_sl = unsafe { std::slice::from_raw_parts(q_ptr as *const f32, q.len()) };
+        let k_sl = unsafe { std::slice::from_raw_parts(k_ptr as *const f32, k.len()) };
+        let v_sl = unsafe { std::slice::from_raw_parts(v_ptr as *const f32, v.len()) };
+
+        let mut scores = vec![0.0f32; kv_len];
+
+        for idx in start..end {
+            let h = idx / seq_len;
+            let s = idx % seq_len;
+            let kv_h = h / heads_per_group;
+
+            let q_offset = (s * num_heads + h) * head_dim;
+            let q_vec = &q_sl[q_offset..q_offset + head_dim];
+
+            let cache_offset = kv_len - seq_len;
+            let causal_limit = cache_offset + s;
+            let window_start = match window {
+                Some(w) if causal_limit >= w => causal_limit - w + 1,
+                _ => 0,
+            };
+
+            for (kv_s, score) in scores.iter_mut().enumerate() {
+                if kv_s > causal_limit || kv_s < window_start {
+                    *score = f32::NEG_INFINITY;
+                    continue;
+                }
+                let k_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+                *score = dot_f32(q_vec, &k_sl[k_offset..k_offset + head_dim]) * scale;
+            }
+
+            let mut max_score = f32::NEG_INFINITY;
+            for &sc in &scores[..kv_len] { if sc > max_score { max_score = sc; } }
+
+            let mut sum: f64 = 0.0;
+            for sc in &mut scores[..kv_len] {
+                let val = crate::portable_math::ggml_exp(*sc - max_score);
+                sum += val as f64;
+                *sc = val;
+            }
+            let inv_sum = (1.0 / sum) as f32;
+            for sc in &mut scores[..kv_len] { *sc *= inv_sum; }
+
+            let o_offset = (s * num_heads + h) * head_dim;
+            let out_sl = unsafe {
+                std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(o_offset), head_dim)
+            };
+            for d in 0..head_dim {
+                let mut val = 0.0f32;
+                for (kv_s, &score) in scores[..kv_len].iter().enumerate() {
+                    let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim + d;
+                    val += score * v_sl[v_offset];
+                }
+                out_sl[d] = val;
+            }
+        }
+    });
+
+    Ok(())
+}
+
 /// GGML-compatible naive attention: f64 softmax sum, standard expf.
 /// Translated from ggml.c:14576 (softmax) + ggml.c:16660 (mul_mat for QKV).
 #[cfg(feature = "cpu")]
@@ -380,6 +455,10 @@ impl Attention for CpuAttentionGgml {
         batch: usize, seq_len: usize, kv_len: usize,
         num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
     ) -> Result<()> {
+        if seq_len > 1 && batch == 1 {
+            return optimized_attention_ggml(q, k, v, output, batch, seq_len, kv_len,
+                                           num_heads, num_kv_heads, head_dim, scale, None);
+        }
         naive_attention_ggml(q, k, v, output, batch, seq_len, kv_len,
                             num_heads, num_kv_heads, head_dim, scale, None)
     }
