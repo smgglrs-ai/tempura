@@ -674,9 +674,7 @@ where
                 None
             };
 
-            q.fill(0.0);
-            k.fill(0.0);
-            v.fill(0.0);
+            // QMM/TL2 overwrites output entirely — no zero-fill needed
             if seq_len == 1 {
                 if let (Some(pq), Some(qw), Some(kw), Some(vw)) = (
                     normed_preq.as_ref(),
@@ -795,7 +793,6 @@ where
                 }
             }
 
-            o_proj.fill(0.0);
             let attn_preq = if seq_len == 1 {
                 if cfg.hidden_act == crate::config::HiddenAct::SquaredRelu {
                     Some(PreQuantizedActivations::i2s_only(&attn_out[..q_dim]))
@@ -814,9 +811,7 @@ where
                 h,
                 q_dim,
             );
-            for i in 0..seq_len * h {
-                hidden[i] += o_proj[i];
-            }
+            tempura_kernels::fused::residual_add(&mut hidden[..seq_len * h], &o_proj[..seq_len * h], seq_len * h);
 
             if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer == 0 {
                 let last = &hidden[(seq_len - 1) * h..seq_len * h];
@@ -846,8 +841,6 @@ where
                 None
             };
 
-            gate.fill(0.0);
-            up.fill(0.0);
             // Fuse gate+up into single dispatch when both are Q4K and decode
             match self.config.hidden_act {
                 crate::config::HiddenAct::SiluGate => {
@@ -951,10 +944,7 @@ where
                         eprintln!("L0 FFN gate[0..8]: {:?} norm={gn:.4}", &last_g[..8.min(inter)]);
                         eprintln!("L0 FFN up[0..8]: {:?} norm={un:.4}", &last_u[..8.min(inter)]);
                     }
-                    for i in 0..seq_len * inter {
-                        let relu = gate[i].max(0.0);
-                        gate[i] = relu * relu * up[i];
-                    }
+                    tempura_kernels::fused::fused_sqrelu_mul(&mut gate[..seq_len * inter], &up[..seq_len * inter], seq_len * inter);
                     if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer == 0 {
                         let last = &gate[(seq_len-1)*inter..seq_len*inter];
                         let norm: f32 = last.iter().map(|x| x*x).sum::<f32>().sqrt();
@@ -973,7 +963,6 @@ where
                 }
             }
 
-            down_out.fill(0.0);
             let gate_preq = if seq_len == 1 {
                 if cfg.hidden_act == crate::config::HiddenAct::SquaredRelu {
                     Some(PreQuantizedActivations::i2s_only(&gate[..inter]))
@@ -992,9 +981,7 @@ where
                 h,
                 inter,
             );
-            for i in 0..seq_len * h {
-                hidden[i] += down_out[i];
-            }
+            tempura_kernels::fused::residual_add(&mut hidden[..seq_len * h], &down_out[..seq_len * h], seq_len * h);
 
             if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer < 3 {
                 let last = &hidden[(seq_len - 1) * h..seq_len * h];
