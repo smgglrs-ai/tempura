@@ -700,36 +700,28 @@ where
                     qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..kv_dim], 1, kv_dim, h);
                 }
             } else {
-                qmm(
-                    normed_preq.as_ref(),
-                    &normed,
-                    &q_w_name,
-                    &mut q[..seq_len * q_dim],
-                    seq_len,
-                    q_dim,
-                    h,
-                );
-                qmm(
-                    normed_preq.as_ref(),
-                    &normed,
-                    &k_w_name,
-                    &mut k[..seq_len * kv_dim],
-                    seq_len,
-                    kv_dim,
-                    h,
-                );
-            }
-            // v_proj: already done in I2S parallel path for decode, else do it here
-            if seq_len > 1 || qweights.get_i2s(&v_w_name).is_none() {
-                qmm(
-                    normed_preq.as_ref(),
-                    &normed,
-                    &v_w_name,
-                    &mut v[..seq_len * kv_dim],
-                    seq_len,
-                    kv_dim,
-                    h,
-                );
+                // Pre-build batched LUT once for QKV (all share the same normed input with k=h)
+                let qkv_lut = if seq_len > 1 {
+                    tempura_kernels::tl2::tl2_preprocess_batched(&normed, h, seq_len)
+                } else { None };
+                if let (Some(ref lut), Some(tl2q), Some(tl2k)) = (
+                    &qkv_lut,
+                    qweights.get_tl2(&q_w_name),
+                    qweights.get_tl2(&k_w_name),
+                ) {
+                    use tempura_kernels::tl2::tl2_gemm_with_lut;
+                    tl2_gemm_with_lut(lut, &tl2q.data, tl2q.scale, &mut q[..seq_len * q_dim], q_dim, h);
+                    tl2_gemm_with_lut(lut, &tl2k.data, tl2k.scale, &mut k[..seq_len * kv_dim], kv_dim, h);
+                } else {
+                    qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q[..seq_len * q_dim], seq_len, q_dim, h);
+                    qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..seq_len * kv_dim], seq_len, kv_dim, h);
+                }
+                if let (Some(ref lut), Some(tl2v)) = (&qkv_lut, qweights.get_tl2(&v_w_name)) {
+                    use tempura_kernels::tl2::tl2_gemm_with_lut;
+                    tl2_gemm_with_lut(lut, &tl2v.data, tl2v.scale, &mut v[..seq_len * kv_dim], kv_dim, h);
+                } else if seq_len > 1 || qweights.get_i2s(&v_w_name).is_none() {
+                    qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..seq_len * kv_dim], seq_len, kv_dim, h);
+                }
             }
 
             if cfg.use_qk_norm {
@@ -935,8 +927,21 @@ where
                             qmm(normed2_preq.as_ref(), &normed2, &up_w_name, &mut up[..inter], 1, inter, h);
                         }
                     } else {
-                        qmm(normed2_preq.as_ref(), &normed2, &gate_w_name, &mut gate[..seq_len * inter], seq_len, inter, h);
-                        qmm(normed2_preq.as_ref(), &normed2, &up_w_name, &mut up[..seq_len * inter], seq_len, inter, h);
+                        let gu_lut = if seq_len > 1 {
+                            tempura_kernels::tl2::tl2_preprocess_batched(&normed2, h, seq_len)
+                        } else { None };
+                        if let (Some(ref lut), Some(tl2g), Some(tl2u)) = (
+                            &gu_lut,
+                            qweights.get_tl2(&gate_w_name),
+                            qweights.get_tl2(&up_w_name),
+                        ) {
+                            use tempura_kernels::tl2::tl2_gemm_with_lut;
+                            tl2_gemm_with_lut(lut, &tl2g.data, tl2g.scale, &mut gate[..seq_len * inter], inter, h);
+                            tl2_gemm_with_lut(lut, &tl2u.data, tl2u.scale, &mut up[..seq_len * inter], inter, h);
+                        } else {
+                            qmm(normed2_preq.as_ref(), &normed2, &gate_w_name, &mut gate[..seq_len * inter], seq_len, inter, h);
+                            qmm(normed2_preq.as_ref(), &normed2, &up_w_name, &mut up[..seq_len * inter], seq_len, inter, h);
+                        }
                     }
                     if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer == 0 {
                         let last_g = &gate[(seq_len-1)*inter..seq_len*inter];

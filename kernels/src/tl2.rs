@@ -1020,6 +1020,123 @@ pub fn tl2_forward(
     true
 }
 
+/// Build batched LUT from activations. Reusable across weight tensors with the same k.
+#[cfg(target_arch = "x86_64")]
+pub fn tl2_preprocess_batched(activations: &[f32], k: usize, batch_size: usize) -> Option<BatchedTl2Lut> {
+    let cfg = Tl2Config::for_dims(128, k)?;
+    let three_k = cfg.three_k;
+    let two_k = cfg.two_k;
+    let three_lut_bytes = three_k / 3 * 32;
+    let two_lut_bytes = if two_k > 0 { two_k / 2 * 32 } else { 0 };
+
+    let mut lut = BatchedTl2Lut {
+        three_qlut: vec![0i8; three_lut_bytes * batch_size],
+        two_qlut: vec![0i8; (two_lut_bytes * batch_size).max(1)],
+        lut_scales: vec![0.0f32; batch_size],
+        three_k,
+        two_k,
+        batch_size,
+    };
+
+    unsafe {
+        preprocessor_batched(&cfg, activations, &mut lut.lut_scales, &mut lut.three_qlut, &mut lut.two_qlut, batch_size);
+    }
+    Some(lut)
+}
+
+pub struct BatchedTl2Lut {
+    pub three_qlut: Vec<i8>,
+    pub two_qlut: Vec<i8>,
+    pub lut_scales: Vec<f32>,
+    pub three_k: usize,
+    pub two_k: usize,
+    pub batch_size: usize,
+}
+
+/// GEMM dispatch using a pre-built batched LUT. Reuse the LUT across
+/// weight tensors that share the same activation input and reduction dimension.
+#[cfg(target_arch = "x86_64")]
+pub fn tl2_gemm_with_lut(
+    lut: &BatchedTl2Lut,
+    weight_data: &[u8],
+    w_scale: f32,
+    output: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    if !is_x86_feature_detected!("avx2") { return false; }
+    let cfg = match Tl2Config::for_dims(m, k) {
+        Some(c) => c,
+        None => return false,
+    };
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+    let batch_size = lut.batch_size;
+    let three_k = cfg.three_k;
+    let two_k = cfg.two_k;
+    let n_tile_num = m / cfg.bm;
+
+    let w_tile_size = three_k * m / 6 / n_tile_num;
+    let c_tile_size = cfg.bm;
+    let sign_tile_size = three_k * m / 24 / n_tile_num;
+    let sign_base = three_k * m / 3 / 2;
+    let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
+    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
+
+    let out_ptr = output.as_mut_ptr() as usize;
+    let wd_ptr = weight_data.as_ptr() as usize;
+    let wd_len = weight_data.len();
+    let tql_ptr = lut.three_qlut.as_ptr() as usize;
+    let tql_len = lut.three_qlut.len();
+    let twql_ptr = lut.two_qlut.as_ptr() as usize;
+    let twql_len = lut.two_qlut.len();
+    let ls_ptr = lut.lut_scales.as_ptr() as usize;
+
+    crate::thread_pool::global_pool().parallel_chunks(n_tile_num, 1, &|tile_start, tile_end| {
+        unsafe {
+            let wd = std::slice::from_raw_parts(wd_ptr as *const u8, wd_len);
+            let tql = std::slice::from_raw_parts(tql_ptr as *const i8, tql_len);
+            let twql = std::slice::from_raw_parts(twql_ptr as *const i8, twql_len);
+            let ls = std::slice::from_raw_parts(ls_ptr as *const f32, batch_size);
+
+            let mut cbits = vec![0i32; batch_size * cfg.bm];
+
+            for i_tile in tile_start..tile_end {
+                let w_offset = i_tile * w_tile_size;
+                let s_offset = sign_base + i_tile * sign_tile_size;
+
+                cbits.iter_mut().for_each(|b| *b = 0);
+                qgemm_three(&cfg, &wd[w_offset..], &wd[s_offset..], tql, &mut cbits, batch_size);
+
+                let dst_base = i_tile * c_tile_size;
+                if two_k > 0 {
+                    let two_w_offset = two_a_base + i_tile * two_w_tile_size;
+                    let mut two_cbits = vec![0i32; batch_size * cfg.bm];
+                    let n_two_blocks = two_k / BK2;
+                    for k_outer in 0..n_two_blocks {
+                        let lut_off = k_outer * BK2 / 2 * 32;
+                        let a_off = k_outer * BK2 / 2 / 2 * cfg.bm;
+                        two_tbl_impl(&mut two_cbits, &twql[lut_off..], &wd[two_w_offset + a_off..], cfg.bm, two_k, batch_size);
+                    }
+                    for bs in 0..batch_size {
+                        let dst = std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(bs * m + dst_base), cfg.bm);
+                        for i in 0..cfg.bm {
+                            dst[i] = (cbits[i + bs * cfg.bm] + two_cbits[i + bs * cfg.bm]) as f32 / ls[bs] * w_scale;
+                        }
+                    }
+                } else {
+                    for bs in 0..batch_size {
+                        let dst = std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(bs * m + dst_base), cfg.bm);
+                        for i in 0..cfg.bm {
+                            dst[i] = cbits[i + bs * cfg.bm] as f32 / ls[bs] * w_scale;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    true
+}
+
 /// Batched TL2 forward: processes `batch_size` activation vectors at once.
 /// Activations layout: `[batch_size * k]` contiguous (row-major).
 /// Output layout: `[batch_size * m]` where output[bs*m + row] is batch element bs, row row.
@@ -1066,20 +1183,21 @@ pub fn tl2_forward_batched(
     let twql_len = two_qlut.len();
     let ls_ptr = lut_scales.as_ptr() as usize;
 
+    if !is_x86_feature_detected!("avx2") { return false; }
+
+    let w_tile_size = three_k * m / 6 / n_tile_num;
+    let c_tile_size = cfg.bm;
+    let sign_tile_size = three_k * m / 24 / n_tile_num;
+    let sign_base = three_k * m / 3 / 2;
+    let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
+    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
+
     crate::thread_pool::global_pool().parallel_chunks(n_tile_num, 1, &|tile_start, tile_end| {
-        if !is_x86_feature_detected!("avx2") { return; }
         unsafe {
             let wd = std::slice::from_raw_parts(wd_ptr as *const u8, wd_len);
             let tql = std::slice::from_raw_parts(tql_ptr as *const i8, tql_len);
             let twql = std::slice::from_raw_parts(twql_ptr as *const i8, twql_len);
             let ls = std::slice::from_raw_parts(ls_ptr as *const f32, batch_size);
-
-            let w_tile_size = three_k * m / 6 / n_tile_num;
-            let c_tile_size = cfg.bm;
-            let sign_tile_size = three_k * m / 24 / n_tile_num;
-            let sign_base = three_k * m / 3 / 2;
-            let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
-            let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
 
             let mut cbits = vec![0i32; batch_size * cfg.bm];
 
@@ -1090,25 +1208,42 @@ pub fn tl2_forward_batched(
                 cbits.iter_mut().for_each(|b| *b = 0);
                 qgemm_three(&cfg, &wd[w_offset..], &wd[s_offset..], tql, &mut cbits, batch_size);
 
-                // Output: for batch_size>1, we write output[bs * m + tile_row]
-                // But qgemm output layout is cbits[row + bs * bm]
-                // We need to scatter: output[bs * m + (i_tile * bm + row)] = result[row + bs * bm]
-                let mut tile_out = vec![0.0f32; batch_size * cfg.bm];
+                // Rescale and write directly to output (scattered layout)
+                let dst_base = i_tile * c_tile_size;
                 if two_k > 0 {
                     let two_w_offset = two_a_base + i_tile * two_w_tile_size;
-                    let two_cfg = Tl2Config { three_k: 0, two_k, ..cfg };
-                    qgemm_two_and_rescale_batched(&two_cfg, &wd[two_w_offset..], twql, w_scale, ls, &mut cbits, &mut tile_out, batch_size);
+                    let mut two_cbits = vec![0i32; batch_size * cfg.bm];
+                    let n_two_blocks = two_k / BK2;
+                    for k_outer in 0..n_two_blocks {
+                        let lut_off = k_outer * BK2 / 2 * 32;
+                        let a_off = k_outer * BK2 / 2 / 2 * cfg.bm;
+                        two_tbl_impl(
+                            &mut two_cbits,
+                            &twql[lut_off..],
+                            &wd[two_w_offset + a_off..],
+                            cfg.bm,
+                            two_k,
+                            batch_size,
+                        );
+                    }
+                    for bs in 0..batch_size {
+                        let dst = std::slice::from_raw_parts_mut(
+                            (out_ptr as *mut f32).add(bs * m + dst_base), cfg.bm
+                        );
+                        for i in 0..cfg.bm {
+                            let combined = cbits[i + bs * cfg.bm] + two_cbits[i + bs * cfg.bm];
+                            dst[i] = combined as f32 / ls[bs] * w_scale;
+                        }
+                    }
                 } else {
-                    qgemm_two_and_rescale_batched(&cfg, &[], &[], w_scale, ls, &mut cbits, &mut tile_out, batch_size);
-                }
-
-                // Scatter tile results to output: tile_out[row + bs * bm] → output[bs * m + i_tile * bm + row]
-                let dst_base = i_tile * c_tile_size;
-                for bs in 0..batch_size {
-                    let src_off = bs * cfg.bm;
-                    let dst_off = bs * m + dst_base;
-                    let dst = std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(dst_off), cfg.bm);
-                    dst.copy_from_slice(&tile_out[src_off..src_off + cfg.bm]);
+                    for bs in 0..batch_size {
+                        let dst = std::slice::from_raw_parts_mut(
+                            (out_ptr as *mut f32).add(bs * m + dst_base), cfg.bm
+                        );
+                        for i in 0..cfg.bm {
+                            dst[i] = cbits[i + bs * cfg.bm] as f32 / ls[bs] * w_scale;
+                        }
+                    }
                 }
             }
         }
