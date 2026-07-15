@@ -576,14 +576,9 @@ where
                 }
             }
             if let Some(tl2t) = qweights.get_tl2(name) {
-                // TL2 GEMV per row — tl2_forward handles single-token decode
-                for row in 0..m {
-                    let a_row = &a_f32[row * k..(row + 1) * k];
-                    let out_row = &mut out[row * n..(row + 1) * n];
-                    if !tl2_forward(a_row, &tl2t.data, tl2t.scale, out_row, n, k) {
-                        // Unsupported dimensions — zero output as safety fallback
-                        out_row.fill(0.0);
-                    }
+                use tempura_kernels::tl2::tl2_forward_batched;
+                if !tl2_forward_batched(a_f32, &tl2t.data, tl2t.scale, out, n, k, m) {
+                    out.fill(0.0);
                 }
             } else if let Some(w) = qweights.get_i2s(name) {
                 if m == 1 {
@@ -1036,7 +1031,7 @@ where
             q4k.forward_b_transposed_q6k(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
                 .unwrap();
         } else if let Some(w) = qweights.get_f16(lm_head_name) {
-            tempura_kernels::quantized::f16_gemv(last_hidden, w, &mut logits, cfg.vocab_size, h);
+            tempura_kernels::f16_gemv::f16_gemv(last_hidden, w, &mut logits, cfg.vocab_size, h);
         } else {
             let w = qweights.get_f32(lm_head_name).unwrap();
             self.pipeline
@@ -1464,7 +1459,7 @@ where
             use tempura_kernels::quantized::MatMulQ;
             q4k.forward_i2s_preq(&preq.i2s_q8, preq.i2s_scale, preq.i2s_sum, w, &mut logits, cfg.vocab_size, h).unwrap();
         } else if let Some(w) = qweights.get_f16("lm_head.weight") {
-            tempura_kernels::quantized::f16_gemv(final_normed, w, &mut logits, cfg.vocab_size, h);
+            tempura_kernels::f16_gemv::f16_gemv(final_normed, w, &mut logits, cfg.vocab_size, h);
         } else {
             let w = qweights.get_f32("lm_head.weight").unwrap();
             self.pipeline.matmul_bt(final_normed, w, &mut logits, 1, cfg.vocab_size, h).unwrap();

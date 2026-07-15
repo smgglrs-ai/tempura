@@ -168,7 +168,7 @@ pub fn compare_tl2_vs_direct(m: usize, k: usize, epsilon: f32) -> KernelTestResu
 // ── 4. F16 dot product: scalar vs AVX2 ────────────────────────────────────────
 
 pub fn compare_f16_dot(k: usize, epsilon: f32) -> KernelTestResult {
-    use tempura_kernels::quantized::{f16_dot_scalar, f16_dot_avx2};
+    use tempura_kernels::f16_gemv::{f16_dot_scalar, f16_dot_avx2};
 
     let a = random_f32(k, 400);
     let b = random_f16_bytes(k, 401);
