@@ -1564,6 +1564,7 @@ where
         let pool = tempura_kernels::thread_pool::global_pool();
         let n_threads = pool.thread_count();
         let barrier = tempura_kernels::thread_pool::SpinBarrier::new(n_threads);
+        let tile_counter = std::sync::atomic::AtomicUsize::new(0);
         let shared_kvl = std::sync::atomic::AtomicUsize::new(0);
         let max_seq = cfg.max_seq_len;
 
@@ -1614,9 +1615,10 @@ where
                     }
                 }
                 if do_profile && ith == 0 { prof_norm.fetch_add(_t_norm.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+                tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
                 barrier.wait(); // B1
 
-                // ── All threads: QKV GEMM (static tile assignment) ──
+                // ── All threads: QKV GEMM (work-stealing — 12 tiles / 8 threads) ──
                 let _t1 = Instant::now();
                 if lut_h_ptr != 0 {
                     let lut = unsafe { &*(lut_h_ptr as *const BatchedTl2Lut) };
@@ -1626,9 +1628,9 @@ where
                         let q_tiles = q_cfg.map(|c| q_dim / c.bm).unwrap_or(0);
                         let kv_tiles = kv_cfg.map(|c| kv_dim / c.bm).unwrap_or(0);
                         let total = q_tiles + 2 * kv_tiles;
-                        let ts = ith * total / nth;
-                        let te = (ith + 1) * total / nth;
-                        for t in ts..te {
+                        loop {
+                            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if t >= total { break; }
                             unsafe {
                                 if t < q_tiles {
                                     tempura_kernels::tl2::tl2_gemm_tiles_batched(
