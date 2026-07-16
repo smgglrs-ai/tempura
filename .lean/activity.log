@@ -1463,3 +1463,16 @@
     overhead. Attempted per-chunk zeroing — regressed due to sub-slice
     overhead. Kept BS=16+8+1 approach. Final: pp42 909 tok/s (+106% vs
     bitnet.cpp 441), pp122 625 (+20%), pp242 401 (-30%), tg128 33 (-4%).
+- timestamp: "2026-07-17T05:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-adaptive-chunking"
+  summary: >
+    Increased primary chunk size from BS=16 to BS=32 (40KB cbits fits
+    48KB L1d). Halves weight-reload count for longer prompts. Results:
+    pp42 42ms (990 tok/s, +124% vs bitnet.cpp), pp122 170ms (718, +38%),
+    pp242 597ms (405, -29%), pp482 2200ms (219, -54%). Short/medium
+    prompts decisively faster than bitnet.cpp through L1-resident cbits.
+    Long-prompt gap from chunk weight-reloading overhead. Decode 38 tok/s.
+    Next: AVX-512 for non-LUT ops (RMSNorm, RoPE, attention) — this CPU
+    has full AVX-512 and bitnet.cpp uses it (6927 zmm instrs in ggml.so).
