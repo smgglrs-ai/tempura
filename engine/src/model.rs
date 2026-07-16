@@ -1579,7 +1579,11 @@ where
         let prof_layer = std::sync::atomic::AtomicU64::new(0);
         let prof_norm = std::sync::atomic::AtomicU64::new(0);
         let prof_qkv = std::sync::atomic::AtomicU64::new(0);
+        let prof_rope = std::sync::atomic::AtomicU64::new(0);
         let prof_attn = std::sync::atomic::AtomicU64::new(0);
+        let prof_oproj = std::sync::atomic::AtomicU64::new(0);
+        let prof_gu = std::sync::atomic::AtomicU64::new(0);
+        let prof_down = std::sync::atomic::AtomicU64::new(0);
 
         pool.run_indexed(&|ith, nth| {
             macro_rules! fs  { ($a:expr,$n:expr) => { unsafe { std::slice::from_raw_parts($a as *const f32, $n) } } }
@@ -1654,24 +1658,43 @@ where
                 }
                 barrier.wait(); // B2
 
-                // ── Serial: RoPE + KV cache append ──
-                if ith == 0 {
+                // ── All threads: parallel RoPE on token ranges ──
+                let _t_rope = Instant::now();
+                {
                     use tempura_kernels::RoPE;
-                    if cfg.use_qk_norm {
-                        let q_norm_w = qweights.get_f32(&layer_names[layer].6).unwrap();
-                        let k_norm_w = qweights.get_f32(&layer_names[layer].7).unwrap();
-                        apply_head_rmsnorm(fsm!(qp, seq_len * q_dim), q_norm_w, seq_len, n_heads, head_dim, cfg.layer_norm_eps);
-                        tempura_kernels::portable_math::q8_snap(fsm!(qp, seq_len * q_dim));
-                        apply_head_rmsnorm(fsm!(kp, seq_len * kv_dim), k_norm_w, seq_len, n_kv_heads, head_dim, cfg.layer_norm_eps);
-                        tempura_kernels::portable_math::q8_snap(fsm!(kp, seq_len * kv_dim));
+                    let tlen = t_end - t_start;
+                    if tlen > 0 {
+                        if cfg.use_qk_norm {
+                            let q_norm_w = qweights.get_f32(&layer_names[layer].6).unwrap();
+                            let k_norm_w = qweights.get_f32(&layer_names[layer].7).unwrap();
+                            let qs = t_start * q_dim;
+                            let qe = t_end * q_dim;
+                            apply_head_rmsnorm(&mut fsm!(qp, seq_len * q_dim)[qs..qe], q_norm_w, tlen, n_heads, head_dim, cfg.layer_norm_eps);
+                            tempura_kernels::portable_math::q8_snap(&mut fsm!(qp, seq_len * q_dim)[qs..qe]);
+                            let ks = t_start * kv_dim;
+                            let ke = t_end * kv_dim;
+                            apply_head_rmsnorm(&mut fsm!(kp, seq_len * kv_dim)[ks..ke], k_norm_w, tlen, n_kv_heads, head_dim, cfg.layer_norm_eps);
+                            tempura_kernels::portable_math::q8_snap(&mut fsm!(kp, seq_len * kv_dim)[ks..ke]);
+                        }
+                        rope.forward(
+                            &mut fsm!(qp, seq_len * q_dim)[t_start * q_dim..t_end * q_dim],
+                            1, tlen, n_heads, head_dim, &positions[t_start..t_end], cfg.rope_theta,
+                        ).unwrap();
+                        rope.forward(
+                            &mut fsm!(kp, seq_len * kv_dim)[t_start * kv_dim..t_end * kv_dim],
+                            1, tlen, n_kv_heads, head_dim, &positions[t_start..t_end], cfg.rope_theta,
+                        ).unwrap();
                     }
-                    rope.forward(fsm!(qp, seq_len * q_dim), 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
-                    rope.forward(fsm!(kp, seq_len * kv_dim), 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                }
+                if do_profile && ith == 0 { prof_rope.fetch_add(_t_rope.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+                barrier.wait(); // B2a: RoPE done
+                // ── Thread 0: KV cache append ──
+                if ith == 0 {
                     let sess = unsafe { &mut *(sp as *mut InferenceSession) };
                     sess.cache.append_kv(layer, fs!(kp, seq_len * kv_dim), fs!(vp, seq_len * kv_dim), seq_len);
                     shared_kvl.store(sess.cache.seq_len + seq_len, std::sync::atomic::Ordering::Release);
                 }
-                barrier.wait(); // B2.5
+                barrier.wait(); // B2.5: KV cache ready
 
                 // ── All threads: prefill attention via work-stealing ──
                 let _ta = Instant::now();
@@ -1715,6 +1738,7 @@ where
                 barrier.wait(); // B3.5
 
                 // ── All threads: O-proj GEMM ──
+                let _t_oproj = Instant::now();
                 if lut_qdim_ptr != 0 {
                     let lut = unsafe { &*(lut_qdim_ptr as *const BatchedTl2Lut) };
                     if let Some(ot) = qweights.get_tl2(on) {
@@ -1730,6 +1754,7 @@ where
                         }
                     }
                 }
+                if do_profile && ith == 0 { prof_oproj.fetch_add(_t_oproj.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 barrier.wait(); // B4
 
                 // ── All threads: residual + RMSNorm + q8_snap + LUT for FFN (parallel) ──
@@ -1755,6 +1780,7 @@ where
                 barrier.wait(); // B5
 
                 // ── All threads: gate+up GEMM (interleaved work-stealing) ──
+                let _t_gu = Instant::now();
                 if lut_h_ptr != 0 {
                     let lut = unsafe { &*(lut_h_ptr as *const BatchedTl2Lut) };
                     if let (Some(gt), Some(ut)) = (qweights.get_tl2(gn), qweights.get_tl2(un)) {
@@ -1778,6 +1804,7 @@ where
                         }
                     }
                 }
+                if do_profile && ith == 0 { prof_gu.fetch_add(_t_gu.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 barrier.wait(); // B6
 
                 // ── All threads: sqrelu_mul + ffn_sub_norm + LUT for down-proj (parallel) ──
@@ -1803,6 +1830,7 @@ where
                 barrier.wait(); // B7
 
                 // ── All threads: down-proj GEMM ──
+                let _t_down = Instant::now();
                 if lut_inter_ptr != 0 {
                     let lut = unsafe { &*(lut_inter_ptr as *const BatchedTl2Lut) };
                     if let Some(dt) = qweights.get_tl2(dn) {
@@ -1818,6 +1846,7 @@ where
                         }
                     }
                 }
+                if do_profile && ith == 0 { prof_down.fetch_add(_t_down.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 barrier.wait(); // B8
 
                 {
@@ -1837,8 +1866,13 @@ where
             let n = prof_norm.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
             let q = prof_qkv.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
             let a = prof_attn.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let r = prof_rope.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let o = prof_oproj.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let g = prof_gu.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let d = prof_down.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
             let l = prof_layer.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
-            eprintln!("[PROFILE] prefill per-layer avg (μs): norm={n:.0} qkv={q:.0} attn={a:.0} layer={l:.0} other={:.0}", l - n - q - a);
+            let profiled = n + q + r + a + o + g + d;
+            eprintln!("[PROFILE] per-layer (μs): norm={n:.0} qkv={q:.0} rope={r:.0} attn={a:.0} oproj={o:.0} gu={g:.0} down={d:.0} layer={l:.0} other={:.0}", l - profiled);
         }
 
         session.cache.advance(seq_len);
