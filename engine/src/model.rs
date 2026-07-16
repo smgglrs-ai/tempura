@@ -1576,8 +1576,9 @@ where
         let attn_scores_ptrs: Vec<usize> = attn_scores_bufs.iter_mut().map(|b| b.as_mut_ptr() as usize).collect();
 
         let do_profile = std::env::var("TEMPURA_PROFILE").is_ok();
-        let prof_serial = std::sync::atomic::AtomicU64::new(0);
-        let prof_gemm = std::sync::atomic::AtomicU64::new(0);
+        let prof_layer = std::sync::atomic::AtomicU64::new(0);
+        let prof_norm = std::sync::atomic::AtomicU64::new(0);
+        let prof_qkv = std::sync::atomic::AtomicU64::new(0);
         let prof_attn = std::sync::atomic::AtomicU64::new(0);
 
         pool.run_indexed(&|ith, nth| {
@@ -1592,9 +1593,11 @@ where
                      ref _qnm, ref _knm, ref gn, ref un, ref dn,
                      ref asn, ref fsn) = layer_names[layer];
 
-                // ── All threads: copy + RMSNorm + q8_snap + LUT build (per-token parallel) ──
                 let t_start = ith * seq_len / nth;
                 let t_end = (ith + 1) * seq_len / nth;
+                let _t_layer = Instant::now();
+                // ── All threads: copy + RMSNorm + q8_snap + LUT build (per-token parallel) ──
+                let _t_norm = Instant::now();
                 {
                     let n = fsm!(np, seq_len * h);
                     let hh = fs!(hp, seq_len * h);
@@ -1610,6 +1613,7 @@ where
                 if ith == 0 {
                     tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
                 }
+                if do_profile && ith == 0 { prof_norm.fetch_add(_t_norm.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 barrier.wait(); // B1
 
                 // ── All threads: QKV GEMM via work-stealing ──
@@ -1646,7 +1650,7 @@ where
                     }
                 }
                 if do_profile && ith == 0 {
-                    prof_gemm.fetch_add(_t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    prof_qkv.fetch_add(_t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 barrier.wait(); // B2
 
@@ -1750,21 +1754,26 @@ where
                 }
                 barrier.wait(); // B5
 
-                // ── All threads: gate+up GEMM ──
+                // ── All threads: gate+up GEMM (interleaved work-stealing) ──
                 if lut_h_ptr != 0 {
                     let lut = unsafe { &*(lut_h_ptr as *const BatchedTl2Lut) };
                     if let (Some(gt), Some(ut)) = (qweights.get_tl2(gn), qweights.get_tl2(un)) {
                         let g_tiles = Tl2Config::for_dims(inter, h).map(|c| inter / c.bm).unwrap_or(0);
+                        let total = 2 * g_tiles;
                         loop {
                             let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if t >= g_tiles { break; }
+                            if t >= total { break; }
                             unsafe {
-                                tempura_kernels::tl2::tl2_gemm_tiles_batched(
-                                    lut, &gt.data, gt.scale, gp, inter, h, seq_len, t, t + 1, my_cbits, my_two_cbits,
-                                );
-                                tempura_kernels::tl2::tl2_gemm_tiles_batched(
-                                    lut, &ut.data, ut.scale, upp, inter, h, seq_len, t, t + 1, my_cbits, my_two_cbits,
-                                );
+                                if t < g_tiles {
+                                    tempura_kernels::tl2::tl2_gemm_tiles_batched(
+                                        lut, &gt.data, gt.scale, gp, inter, h, seq_len, t, t + 1, my_cbits, my_two_cbits,
+                                    );
+                                } else {
+                                    let ut_idx = t - g_tiles;
+                                    tempura_kernels::tl2::tl2_gemm_tiles_batched(
+                                        lut, &ut.data, ut.scale, upp, inter, h, seq_len, ut_idx, ut_idx + 1, my_cbits, my_two_cbits,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1816,15 +1825,20 @@ where
                     let he = t_end * h;
                     residual_add(&mut fsm!(hp, seq_len * h)[hs..he], &fs!(dp, seq_len * h)[hs..he], he - hs);
                 }
+                barrier.wait(); // B_end: ensure all threads done before next layer
+                if do_profile && ith == 0 {
+                    prof_layer.fetch_add(_t_layer.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         });
 
         if do_profile {
             let nl = cfg.num_layers as f64;
-            let s = prof_serial.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
-            let g = prof_gemm.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let n = prof_norm.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let q = prof_qkv.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
             let a = prof_attn.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
-            eprintln!("[PROFILE] prefill per-layer avg (μs): serial={s:.0} gemm={g:.0} attn={a:.0} total={:.0}", s + g + a);
+            let l = prof_layer.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            eprintln!("[PROFILE] prefill per-layer avg (μs): norm={n:.0} qkv={q:.0} attn={a:.0} layer={l:.0} other={:.0}", l - n - q - a);
         }
 
         session.cache.advance(seq_len);
