@@ -1402,3 +1402,18 @@
     wait (~670μs/layer from 10 barriers). pp42: 116ms (362 tok/s,
     bitnet.cpp 521, gap -31%, was -57% at session start). Decode: 42.4
     tok/s (bitnet.cpp 43.7, -3%). 348 tests, zero warnings.
+- timestamp: "2026-07-16T23:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-prefill-larger-prompts"
+  summary: >
+    Larger prompt benchmarks reveal widening gap: pp42 -33%, pp92 -45%,
+    pp182 -56%, pp362 -64%. Root cause identified by reading bitnet.cpp
+    source: compile-time template batch size specialization ({1,8,32,128,
+    256,512}) enables full loop unrolling in C++. Our runtime batch_size
+    prevents compiler optimization. Attempted hierarchical batch decomposition
+    (32+8+1 chunks matching bitnet.cpp's pattern) — slower due to repeated
+    weight loading without template-level optimization. Reverted to full-batch.
+    Also discovered bitnet.cpp's kernel output loop appears to overwrite
+    batch elements in the three-part rescale, but verified output is correct
+    via llama-cli comparison. Next: const-generic inner kernel specialization.
