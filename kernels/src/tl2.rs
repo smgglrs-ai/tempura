@@ -1287,6 +1287,11 @@ pub unsafe fn tl2_gemm_tiles_batched(
         if use_bk96 {
             let mut done = 0usize;
             let mut rem = batch_size;
+            while rem >= 16 {
+                three_tbl_impl_bk96(&mut cbits[done * bm..], &lut.three_qlut[done * three_lut_stride..],
+                    &weight_data[w_offset..], &weight_data[s_offset..], bm, three_k, 16);
+                done += 16; rem -= 16;
+            }
             while rem >= 8 {
                 three_tbl_impl_bk96(&mut cbits[done * bm..], &lut.three_qlut[done * three_lut_stride..],
                     &weight_data[w_offset..], &weight_data[s_offset..], bm, three_k, 8);
@@ -1306,6 +1311,15 @@ pub unsafe fn tl2_gemm_tiles_batched(
             // Chunked two-part GEMM
             let mut done = 0usize;
             let mut rem = batch_size;
+            while rem >= 16 {
+                for k_outer in 0..n_two_blocks {
+                    let lut_off = k_outer * BK2 / 2 * 32;
+                    let a_off = k_outer * BK2 / 2 / 2 * bm;
+                    two_tbl_impl(&mut two_cbits[done * bm..], &lut.two_qlut[done * two_lut_stride + lut_off..],
+                        &weight_data[two_w_offset + a_off..], bm, two_k, 16);
+                }
+                done += 16; rem -= 16;
+            }
             while rem >= 8 {
                 for k_outer in 0..n_two_blocks {
                     let lut_off = k_outer * BK2 / 2 * 32;
