@@ -1564,7 +1564,6 @@ where
         let pool = tempura_kernels::thread_pool::global_pool();
         let n_threads = pool.thread_count();
         let barrier = tempura_kernels::thread_pool::SpinBarrier::new(n_threads);
-        let tile_counter = std::sync::atomic::AtomicUsize::new(0);
         let shared_kvl = std::sync::atomic::AtomicUsize::new(0);
         let max_seq = cfg.max_seq_len;
 
@@ -1614,13 +1613,10 @@ where
                         tempura_kernels::tl2::tl2_preprocess_token_range(np, h, lut_h_ptr, t_start, t_end);
                     }
                 }
-                if ith == 0 {
-                    tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
-                }
                 if do_profile && ith == 0 { prof_norm.fetch_add(_t_norm.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 barrier.wait(); // B1
 
-                // ── All threads: QKV GEMM via work-stealing ──
+                // ── All threads: QKV GEMM (static tile assignment) ──
                 let _t1 = Instant::now();
                 if lut_h_ptr != 0 {
                     let lut = unsafe { &*(lut_h_ptr as *const BatchedTl2Lut) };
@@ -1630,9 +1626,9 @@ where
                         let q_tiles = q_cfg.map(|c| q_dim / c.bm).unwrap_or(0);
                         let kv_tiles = kv_cfg.map(|c| kv_dim / c.bm).unwrap_or(0);
                         let total = q_tiles + 2 * kv_tiles;
-                        loop {
-                            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if t >= total { break; }
+                        let ts = ith * total / nth;
+                        let te = (ith + 1) * total / nth;
+                        for t in ts..te {
                             unsafe {
                                 if t < q_tiles {
                                     tempura_kernels::tl2::tl2_gemm_tiles_batched(
@@ -1746,20 +1742,17 @@ where
                     tempura_kernels::tl2::tl2_preprocess_token_range(ap, q_dim, lut_qdim_ptr, t_start, t_end);
                 }
                 if do_profile && ith == 0 { prof_attn.fetch_add(_ta.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
-                if ith == 0 {
-                    tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
-                }
                 barrier.wait(); // B3 (attention + sub_norm + LUT done)
 
-                // ── All threads: O-proj GEMM ──
+                // ── All threads: O-proj GEMM (static) ──
                 let _t_oproj = Instant::now();
                 if lut_qdim_ptr != 0 {
                     let lut = unsafe { &*(lut_qdim_ptr as *const BatchedTl2Lut) };
                     if let Some(ot) = qweights.get_tl2(on) {
                         let o_tiles = Tl2Config::for_dims(h, q_dim).map(|c| h / c.bm).unwrap_or(0);
-                        loop {
-                            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if t >= o_tiles { break; }
+                        let ts = ith * o_tiles / nth;
+                        let te = (ith + 1) * o_tiles / nth;
+                        for t in ts..te {
                             unsafe {
                                 tempura_kernels::tl2::tl2_gemm_tiles_batched(
                                     lut, &ot.data, ot.scale, op, h, q_dim, seq_len, t, t + 1, my_cbits, my_two_cbits,
@@ -1788,21 +1781,18 @@ where
                         tempura_kernels::tl2::tl2_preprocess_token_range(n2p, h, lut_h_ptr, t_start, t_end);
                     }
                 }
-                if ith == 0 {
-                    tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
-                }
                 barrier.wait(); // B5
 
-                // ── All threads: gate+up GEMM (interleaved work-stealing) ──
+                // ── All threads: gate+up GEMM (static tile assignment) ──
                 let _t_gu = Instant::now();
                 if lut_h_ptr != 0 {
                     let lut = unsafe { &*(lut_h_ptr as *const BatchedTl2Lut) };
                     if let (Some(gt), Some(ut)) = (qweights.get_tl2(gn), qweights.get_tl2(un)) {
                         let g_tiles = Tl2Config::for_dims(inter, h).map(|c| inter / c.bm).unwrap_or(0);
                         let total = 2 * g_tiles;
-                        loop {
-                            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if t >= total { break; }
+                        let ts = ith * total / nth;
+                        let te = (ith + 1) * total / nth;
+                        for t in ts..te {
                             unsafe {
                                 if t < g_tiles {
                                     tempura_kernels::tl2::tl2_gemm_tiles_batched(
@@ -1838,20 +1828,17 @@ where
                         tempura_kernels::tl2::tl2_preprocess_token_range(gp, inter, lut_inter_ptr, t_start, t_end);
                     }
                 }
-                if ith == 0 {
-                    tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
-                }
                 barrier.wait(); // B7
 
-                // ── All threads: down-proj GEMM ──
+                // ── All threads: down-proj GEMM (static) ──
                 let _t_down = Instant::now();
                 if lut_inter_ptr != 0 {
                     let lut = unsafe { &*(lut_inter_ptr as *const BatchedTl2Lut) };
                     if let Some(dt) = qweights.get_tl2(dn) {
                         let d_tiles = Tl2Config::for_dims(h, inter).map(|c| h / c.bm).unwrap_or(0);
-                        loop {
-                            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if t >= d_tiles { break; }
+                        let ts = ith * d_tiles / nth;
+                        let te = (ith + 1) * d_tiles / nth;
+                        for t in ts..te {
                             unsafe {
                                 tempura_kernels::tl2::tl2_gemm_tiles_batched(
                                     lut, &dt.data, dt.scale, dp, h, inter, seq_len, t, t + 1, my_cbits, my_two_cbits,
