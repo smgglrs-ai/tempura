@@ -1270,23 +1270,59 @@ pub unsafe fn tl2_gemm_tiles_batched(
 
     let bm = cfg.bm;
     let bs_bm = batch_size * bm;
+    let three_lut_stride = three_k / 3 * 32;
+    let two_lut_stride = if two_k > 0 { two_k / 2 * 32 } else { 0 };
+    let n_two_blocks = if two_k > 0 { two_k / BK2 } else { 0 };
+    let use_bk96 = cfg.bk == 96;
 
     for i_tile in tile_start..tile_end {
         let w_offset = i_tile * w_tile_size;
         let s_offset = sign_base + i_tile * sign_tile_size;
         let dst_base = i_tile * c_tile_size;
+        let two_w_offset = if two_k > 0 { two_a_base + i_tile * two_w_tile_size } else { 0 };
 
         for b in cbits[..bs_bm].iter_mut() { *b = 0; }
-        qgemm_three(&cfg, &weight_data[w_offset..], &weight_data[s_offset..], &lut.three_qlut, cbits, batch_size);
+
+        // Chunked three-part GEMM: BS=8 is fully unrolled by LLVM, BS=1 for remainder
+        if use_bk96 {
+            let mut done = 0usize;
+            let mut rem = batch_size;
+            while rem >= 8 {
+                three_tbl_impl_bk96(&mut cbits[done * bm..], &lut.three_qlut[done * three_lut_stride..],
+                    &weight_data[w_offset..], &weight_data[s_offset..], bm, three_k, 8);
+                done += 8; rem -= 8;
+            }
+            while rem >= 1 {
+                three_tbl_impl_bk96(&mut cbits[done * bm..], &lut.three_qlut[done * three_lut_stride..],
+                    &weight_data[w_offset..], &weight_data[s_offset..], bm, three_k, 1);
+                done += 1; rem -= 1;
+            }
+        } else {
+            qgemm_three(&cfg, &weight_data[w_offset..], &weight_data[s_offset..], &lut.three_qlut, cbits, batch_size);
+        }
 
         if two_k > 0 {
-            let two_w_offset = two_a_base + i_tile * two_w_tile_size;
             for b in two_cbits[..bs_bm].iter_mut() { *b = 0; }
-            let n_two_blocks = two_k / BK2;
-            for k_outer in 0..n_two_blocks {
-                let lut_off = k_outer * BK2 / 2 * 32;
-                let a_off = k_outer * BK2 / 2 / 2 * bm;
-                two_tbl_impl(&mut two_cbits[..bs_bm], &lut.two_qlut[lut_off..], &weight_data[two_w_offset + a_off..], bm, two_k, batch_size);
+            // Chunked two-part GEMM
+            let mut done = 0usize;
+            let mut rem = batch_size;
+            while rem >= 8 {
+                for k_outer in 0..n_two_blocks {
+                    let lut_off = k_outer * BK2 / 2 * 32;
+                    let a_off = k_outer * BK2 / 2 / 2 * bm;
+                    two_tbl_impl(&mut two_cbits[done * bm..], &lut.two_qlut[done * two_lut_stride + lut_off..],
+                        &weight_data[two_w_offset + a_off..], bm, two_k, 8);
+                }
+                done += 8; rem -= 8;
+            }
+            while rem >= 1 {
+                for k_outer in 0..n_two_blocks {
+                    let lut_off = k_outer * BK2 / 2 * 32;
+                    let a_off = k_outer * BK2 / 2 / 2 * bm;
+                    two_tbl_impl(&mut two_cbits[done * bm..], &lut.two_qlut[done * two_lut_stride + lut_off..],
+                        &weight_data[two_w_offset + a_off..], bm, two_k, 1);
+                }
+                done += 1; rem -= 1;
             }
             for bs in 0..batch_size {
                 let dst = std::slice::from_raw_parts_mut((output_addr as *mut f32).add(bs * m + dst_base), bm);
