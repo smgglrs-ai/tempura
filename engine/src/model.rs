@@ -1696,33 +1696,28 @@ where
                 }
                 barrier.wait(); // B2.5: KV cache ready
 
-                // ── All threads: prefill attention via work-stealing ──
+                // ── All threads: attention + sub_norm + LUT (fused, token-parallel) ──
                 let _ta = Instant::now();
                 {
                     let kvl = shared_kvl.load(std::sync::atomic::Ordering::Acquire);
                     let sess = unsafe { &*(sp as *const InferenceSession) };
-                    let total_items = n_heads * seq_len;
-                    let items_per_thread = (total_items + nth - 1) / nth;
-                    let item_start = ith * items_per_thread;
-                    let item_end = ((ith + 1) * items_per_thread).min(total_items);
                     let scores_buf = unsafe { std::slice::from_raw_parts_mut(attn_scores_ptrs[ith] as *mut f32, kvl) };
-                    tempura_kernels::attention::attention_prefill_items(
-                        fs!(qp, seq_len * q_dim),
-                        &sess.cache.k_data(layer, kvl),
-                        &sess.cache.v_data(layer, kvl),
-                        ap,
-                        scores_buf,
-                        seq_len, kvl,
-                        n_heads, n_kv_heads, head_dim,
-                        1.0 / (head_dim as f32).sqrt(),
-                        item_start, item_end,
-                    );
+                    for head in 0..n_heads {
+                        tempura_kernels::attention::attention_prefill_items(
+                            fs!(qp, seq_len * q_dim),
+                            &sess.cache.k_data(layer, kvl),
+                            &sess.cache.v_data(layer, kvl),
+                            ap,
+                            scores_buf,
+                            seq_len, kvl,
+                            n_heads, n_kv_heads, head_dim,
+                            1.0 / (head_dim as f32).sqrt(),
+                            head * seq_len + t_start,
+                            head * seq_len + t_end,
+                        );
+                    }
                 }
-                if do_profile && ith == 0 { prof_attn.fetch_add(_ta.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
-                barrier.wait(); // B3
-
-                // ── Serial: attn_sub_norm + batched LUT for O-proj ──
-                // ── All threads: attn_sub_norm + LUT build (parallel per token) ──
+                // sub_norm + LUT on our tokens (all heads computed above, no barrier needed)
                 if let Some(w) = qweights.get_f32(asn) {
                     use tempura_kernels::RMSNorm as _;
                     for t in t_start..t_end {
@@ -1732,10 +1727,11 @@ where
                 if lut_qdim_ptr != 0 {
                     tempura_kernels::tl2::tl2_preprocess_token_range(ap, q_dim, lut_qdim_ptr, t_start, t_end);
                 }
+                if do_profile && ith == 0 { prof_attn.fetch_add(_ta.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 if ith == 0 {
                     tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
                 }
-                barrier.wait(); // B3.5
+                barrier.wait(); // B3 (attention + sub_norm + LUT done)
 
                 // ── All threads: O-proj GEMM ──
                 let _t_oproj = Instant::now();
