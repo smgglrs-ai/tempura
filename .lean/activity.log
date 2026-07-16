@@ -1362,3 +1362,15 @@
     158us avg per kernel. Single matmul benchmark was 179 tok/s — gap is in
     inter-kernel overhead or implicit serialization, not kernel speed itself.
     307 tests passing. Coherent output verified on Qwen3-8B Q4K via chat completions.
+- timestamp: "2026-07-16T12:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-prefill-optimization"
+  summary: >
+    Persistent-thread prefill: forward_bitnet_prefill with SpinBarrier,
+    work-stealing GEMM, parallel per-token serial work (RMSNorm/q8snap/LUT/
+    sqrelu_mul/sub_norms/residual_add). New kernels: BatchedTl2Lut::new_for,
+    tl2_preprocess_token_range, tl2_gemm_tiles_batched, attention_prefill_items.
+    pp42: 178ms→130ms (332 tok/s, +43%), gap to bitnet.cpp -34% (was -57%).
+    tg128: 42.4 tok/s (bitnet.cpp 43.4, -2%). 348 tests passing, zero warnings.
+    Also uses ggml-compatible CpuRoPEGgml for prefill (matching decode path).

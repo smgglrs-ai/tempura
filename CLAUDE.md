@@ -134,7 +134,7 @@ Three-crate workspace + standalone verification crate:
 - [x] Prometheus metrics (TTFT, ITL, queue depth, KV usage), OpenTelemetry export
 - [x] HuggingFace config.json auto-loading, Dockerfile
 - [x] Inference traces, deterministic replay, DualPipeline comparison, batch-invariant verification
-- [x] 337 passing tests
+- [x] 348 passing tests
 
 ## What's Next
 
@@ -180,6 +180,10 @@ Three-crate workspace + standalone verification crate:
 - [x] target_feature(enable="avx2") on tl2_gemv_tiles_cfg (enables inlining)
 - [x] BM=320 for (640,2560) K/V projections (matches bitnet.cpp)
 - [x] Work-stealing tile dispatch for all TL2 matmuls (atomic counter)
+- [x] forward_bitnet_prefill: persistent-thread prefill with parallel serial work
+- [x] Batched TL2 GEMM tiles (tl2_gemm_tiles_batched, zero-alloc per-thread)
+- [x] Parallel per-token LUT preprocessing (tl2_preprocess_token_range)
+- [x] attention_prefill_items: inline multi-token attention for persistent threads
 
 ## Build & Test
 
