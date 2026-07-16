@@ -1417,3 +1417,18 @@
     Also discovered bitnet.cpp's kernel output loop appears to overwrite
     batch elements in the three-part rescale, but verified output is correct
     via llama-cli comparison. Next: const-generic inner kernel specialization.
+- timestamp: "2026-07-16T24:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-const-generic-experiment"
+  summary: >
+    Implemented const-generic batch specialization for three_tbl_impl_bk96
+    and two_tbl_impl (Rust equivalent of bitnet.cpp's C++ templates).
+    Result: no improvement — Rust compiler already generates good loop code
+    for runtime batch_size. The dispatch wrapper actually HURT decode perf
+    (42→33 tok/s). Reverted. Also tested hierarchical batch decomposition
+    (32+8+1 chunks) — slower due to repeated weight loading overhead without
+    compiler-level unrolling benefit. The remaining gap to bitnet.cpp at
+    larger prompts is likely from C++ compiler's more aggressive SIMD
+    scheduling and #pragma unroll behavior, not from loop bound knowledge.
+    Current state: pp42 355 tok/s (-31%), decode 42 tok/s (-3%).
