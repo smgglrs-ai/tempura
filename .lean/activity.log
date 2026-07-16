@@ -1448,3 +1448,18 @@
     pp482 2213ms (218 tok/s, bitnet.cpp 496, -56%). Gap at long
     prompts is from chunk overhead (weight reloading per chunk) —
     bitnet.cpp uses BS=256 template with #pragma unroll. 348 tests.
+- timestamp: "2026-07-17T04:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-cache-analysis"
+  summary: >
+    Deep analysis of bitnet.cpp vs tempura TL2 kernel: both use identical
+    runtime batch loops (no unrolling for BS>10 in either compiler).
+    bitnet.cpp uses -march=native → AVX-512 for non-LUT ops (6927 zmm instrs
+    in libggml.so), but LUT kernel is pure AVX2. Template function sizes
+    identical (1434 bytes) for BS=32/128/256/512 — confirms no unrolling.
+    Our BS=16+8+1 chunking keeps cbits in L1 (48KB per core on this Zen 5),
+    giving 2× advantage at pp42 but losing at pp256+ from weight reload
+    overhead. Attempted per-chunk zeroing — regressed due to sub-slice
+    overhead. Kept BS=16+8+1 approach. Final: pp42 909 tok/s (+106% vs
+    bitnet.cpp 441), pp122 625 (+20%), pp242 401 (-30%), tg128 33 (-4%).
