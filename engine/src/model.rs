@@ -1686,15 +1686,33 @@ where
                         ).unwrap();
                     }
                 }
-                if do_profile && ith == 0 { prof_rope.fetch_add(_t_rope.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
-                barrier.wait(); // B2a: RoPE done
-                // ── Thread 0: KV cache append ──
-                if ith == 0 {
-                    let sess = unsafe { &mut *(sp as *mut InferenceSession) };
-                    sess.cache.append_kv(layer, fs!(kp, seq_len * kv_dim), fs!(vp, seq_len * kv_dim), seq_len);
-                    shared_kvl.store(sess.cache.seq_len + seq_len, std::sync::atomic::Ordering::Release);
+                // ── All threads: parallel KV cache copy ──
+                {
+                    let sess = unsafe { &*(sp as *const InferenceSession) };
+                    let stride = n_kv_heads * head_dim;
+                    let dst_base = sess.cache.seq_len * stride;
+                    let cache_k_ptr = sess.cache.k[layer].as_ptr() as usize;
+                    let cache_v_ptr = sess.cache.v[layer].as_ptr() as usize;
+                    let ks = t_start * stride;
+                    let ke = t_end * stride;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            (kp as *const f32).add(ks),
+                            (cache_k_ptr as *mut f32).add(dst_base + ks),
+                            ke - ks,
+                        );
+                        std::ptr::copy_nonoverlapping(
+                            (vp as *const f32).add(ks),
+                            (cache_v_ptr as *mut f32).add(dst_base + ks),
+                            ke - ks,
+                        );
+                    }
                 }
-                barrier.wait(); // B2.5: KV cache ready
+                if do_profile && ith == 0 { prof_rope.fetch_add(_t_rope.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+                if ith == 0 {
+                    shared_kvl.store(unsafe { &*(sp as *const InferenceSession) }.cache.seq_len + seq_len, std::sync::atomic::Ordering::Release);
+                }
+                barrier.wait(); // B2.5: RoPE + KV cache ready
 
                 // ── All threads: attention + sub_norm + LUT (fused, token-parallel) ──
                 let _ta = Instant::now();
