@@ -1053,6 +1053,23 @@ pub struct BatchedTl2Lut {
     pub batch_size: usize,
 }
 
+impl BatchedTl2Lut {
+    #[cfg(target_arch = "x86_64")]
+    pub fn new_for(k: usize, batch_size: usize) -> Option<Self> {
+        let cfg = Tl2Config::for_dims(128, k)?;
+        let three_lut_bytes = cfg.three_k / 3 * 32;
+        let two_lut_bytes = if cfg.two_k > 0 { cfg.two_k / 2 * 32 } else { 0 };
+        Some(BatchedTl2Lut {
+            three_qlut: vec![0i8; three_lut_bytes * batch_size],
+            two_qlut: vec![0i8; (two_lut_bytes * batch_size).max(1)],
+            lut_scales: vec![0.0f32; batch_size],
+            three_k: cfg.three_k,
+            two_k: cfg.two_k,
+            batch_size,
+        })
+    }
+}
+
 /// GEMM dispatch using a pre-built batched LUT. Reuse the LUT across
 /// weight tensors that share the same activation input and reduction dimension.
 #[cfg(target_arch = "x86_64")]
@@ -1134,6 +1151,158 @@ pub fn tl2_gemm_with_lut(
             }
         }
     });
+    true
+}
+
+/// Fill tokens [t_start..t_end) within a `BatchedTl2Lut`. Each token writes to
+/// its own LUT offset, so multiple threads can process disjoint ranges concurrently.
+/// `activations` layout: `[batch_size * k]` — only elements `[t_start*k .. t_end*k]` are read.
+/// `lut_addr` is the `BatchedTl2Lut` pointer as usize (for Send in closures).
+#[cfg(target_arch = "x86_64")]
+pub fn tl2_preprocess_token_range(
+    activations_addr: usize,
+    k: usize,
+    lut_addr: usize,
+    t_start: usize,
+    t_end: usize,
+) -> bool {
+    let cfg = match Tl2Config::for_dims(128, k) {
+        Some(c) => c,
+        None => return false,
+    };
+    let lut = unsafe { &mut *(lut_addr as *mut BatchedTl2Lut) };
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+
+    let three_stride = cfg.three_k / 3 * 32;
+    let two_stride = if cfg.two_k > 0 { cfg.two_k / 2 * 32 } else { 0 };
+
+    for bs in t_start..t_end {
+        let act = unsafe { std::slice::from_raw_parts((activations_addr as *const f32).add(bs * k), k) };
+        let three_off = bs * three_stride;
+        for b in lut.three_qlut[three_off..three_off + three_stride].iter_mut() { *b = 0; }
+        if two_stride > 0 {
+            let two_off = bs * two_stride;
+            for b in lut.two_qlut[two_off..two_off + two_stride].iter_mut() { *b = 0; }
+        }
+        unsafe {
+            lut.lut_scales[bs] = per_tensor_quant(cfg.two_k + cfg.three_k, act);
+            three_lut_ctor(
+                &mut lut.three_qlut[three_off..],
+                act,
+                lut.lut_scales[bs],
+                cfg.three_k,
+            );
+            if cfg.two_k > 0 {
+                let two_off = bs * two_stride;
+                two_lut_ctor(
+                    &mut lut.two_qlut[two_off..],
+                    &act[cfg.three_k..],
+                    lut.lut_scales[bs],
+                    cfg.two_k,
+                );
+            }
+        }
+    }
+    true
+}
+
+/// Fill an existing `BatchedTl2Lut` without allocating. Returns false if
+/// the LUT dimensions don't match k.
+#[cfg(target_arch = "x86_64")]
+pub fn tl2_preprocess_batched_into(
+    activations: &[f32],
+    k: usize,
+    batch_size: usize,
+    lut: &mut BatchedTl2Lut,
+) -> bool {
+    let cfg = match Tl2Config::for_dims(128, k) {
+        Some(c) => c,
+        None => return false,
+    };
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+    if batch_size > lut.batch_size { return false; }
+    for b in lut.three_qlut[..cfg.three_k / 3 * 32 * batch_size].iter_mut() { *b = 0; }
+    if cfg.two_k > 0 {
+        for b in lut.two_qlut[..cfg.two_k / 2 * 32 * batch_size].iter_mut() { *b = 0; }
+    }
+    unsafe {
+        preprocessor_batched(
+            &cfg, activations, &mut lut.lut_scales[..batch_size],
+            &mut lut.three_qlut, &mut lut.two_qlut, batch_size,
+        );
+    }
+    true
+}
+
+/// Process TL2 GEMM tiles [tile_start, tile_end) using a pre-built batched LUT.
+/// No thread pool dispatch — called from within a persistent thread model.
+/// `cbits` and `two_cbits` must be pre-allocated to at least `batch_size * bm` elements.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn tl2_gemm_tiles_batched(
+    lut: &BatchedTl2Lut,
+    weight_data: &[u8],
+    w_scale: f32,
+    output_addr: usize,
+    m: usize,
+    k: usize,
+    batch_size: usize,
+    tile_start: usize,
+    tile_end: usize,
+    cbits: &mut [i32],
+    two_cbits: &mut [i32],
+) -> bool {
+    let cfg = match Tl2Config::for_dims(m, k) {
+        Some(c) => c,
+        None => return false,
+    };
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+    let n_tile_num = m / cfg.bm;
+    let three_k = cfg.three_k;
+    let two_k = cfg.two_k;
+
+    let w_tile_size = three_k * m / 6 / n_tile_num;
+    let c_tile_size = cfg.bm;
+    let sign_tile_size = three_k * m / 24 / n_tile_num;
+    let sign_base = three_k * m / 3 / 2;
+    let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
+    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
+
+    let bm = cfg.bm;
+    let bs_bm = batch_size * bm;
+
+    for i_tile in tile_start..tile_end {
+        let w_offset = i_tile * w_tile_size;
+        let s_offset = sign_base + i_tile * sign_tile_size;
+        let dst_base = i_tile * c_tile_size;
+
+        for b in cbits[..bs_bm].iter_mut() { *b = 0; }
+        qgemm_three(&cfg, &weight_data[w_offset..], &weight_data[s_offset..], &lut.three_qlut, cbits, batch_size);
+
+        if two_k > 0 {
+            let two_w_offset = two_a_base + i_tile * two_w_tile_size;
+            for b in two_cbits[..bs_bm].iter_mut() { *b = 0; }
+            let n_two_blocks = two_k / BK2;
+            for k_outer in 0..n_two_blocks {
+                let lut_off = k_outer * BK2 / 2 * 32;
+                let a_off = k_outer * BK2 / 2 / 2 * bm;
+                two_tbl_impl(&mut two_cbits[..bs_bm], &lut.two_qlut[lut_off..], &weight_data[two_w_offset + a_off..], bm, two_k, batch_size);
+            }
+            for bs in 0..batch_size {
+                let dst = std::slice::from_raw_parts_mut((output_addr as *mut f32).add(bs * m + dst_base), bm);
+                for i in 0..bm {
+                    dst[i] = (cbits[i + bs * bm] + two_cbits[i + bs * bm]) as f32 / lut.lut_scales[bs] * w_scale;
+                }
+            }
+        } else {
+            for bs in 0..batch_size {
+                let dst = std::slice::from_raw_parts_mut((output_addr as *mut f32).add(bs * m + dst_base), bm);
+                for i in 0..bm {
+                    dst[i] = cbits[i + bs * bm] as f32 / lut.lut_scales[bs] * w_scale;
+                }
+            }
+        }
+    }
     true
 }
 

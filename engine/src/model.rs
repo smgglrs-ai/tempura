@@ -168,10 +168,11 @@ where
 
     pub fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
         if let Some(qw) = &self.quantized_weights {
-            if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu
-                && token_ids.len() == 1
-            {
-                return self.forward_bitnet_decode(session, token_ids[0], qw);
+            if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
+                if token_ids.len() == 1 {
+                    return self.forward_bitnet_decode(session, token_ids[0], qw);
+                }
+                return self.forward_bitnet_prefill(session, token_ids, qw);
             }
             return self.forward_quantized(session, token_ids, qw);
         }
@@ -664,6 +665,7 @@ where
                 tempura_kernels::portable_math::q8_snap(&mut normed[..seq_len * h]);
             }
 
+
             let normed_preq = if seq_len == 1 {
                 if cfg.hidden_act == crate::config::HiddenAct::SquaredRelu {
                     Some(PreQuantizedActivations::i2s_only(&normed[..h]))
@@ -722,6 +724,7 @@ where
                 }
             }
 
+
             if cfg.use_qk_norm {
                 let q_norm_w = qweights.get_f32(q_norm_name).unwrap();
                 let k_norm_w = qweights.get_f32(k_norm_name).unwrap();
@@ -741,6 +744,7 @@ where
                     tempura_kernels::portable_math::q8_snap(&mut k[..seq_len * kv_dim]);
                 }
             }
+
 
             if let Some(ref rope_table) = det_rope {
                 rope_table.forward(&mut q, 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
@@ -782,6 +786,7 @@ where
                     )
                     .unwrap();
             }
+
 
             if let Some(sub_norm_w) = qweights.get_f32(attn_sub_norm_name) {
                 if let Some(ref drn) = det_rmsnorm {
@@ -982,6 +987,7 @@ where
                 inter,
             );
             tempura_kernels::fused::residual_add(&mut hidden[..seq_len * h], &down_out[..seq_len * h], seq_len * h);
+
 
             if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer < 3 {
                 let last = &hidden[(seq_len - 1) * h..seq_len * h];
@@ -1459,6 +1465,389 @@ where
         if do_profile && session.position % 10 == 9 {
             eprintln!("[PROFILE] lm_head: {:.0}μs", _t_lmhead.elapsed().as_nanos() as f64 / 1000.0);
         }
+        logits
+    }
+
+    fn forward_bitnet_prefill(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        qweights: &crate::weights::QuantizedWeights,
+    ) -> Vec<f32> {
+        use tempura_kernels::tl2::{tl2_forward, BatchedTl2Lut, Tl2Config};
+        use tempura_kernels::fused::{fused_rmsnorm_q8snap, fused_residual_rmsnorm_q8snap, fused_sqrelu_mul, residual_add};
+        use std::time::Instant;
+
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+        let n_heads = cfg.num_attention_heads;
+        let n_kv_heads = cfg.num_kv_heads;
+        let head_dim = cfg.head_dim;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let inter = cfg.intermediate_size;
+        let seq_len = token_ids.len();
+
+        let has_tl2 = qweights.get_tl2("model.layers.0.self_attn.q_proj.weight").is_some();
+        if !has_tl2 {
+            return self.forward_quantized(session, token_ids, qweights);
+        }
+
+        let rmsnorm = tempura_kernels::rmsnorm::CpuRMSNormGgml;
+        let rope = tempura_kernels::rope::CpuRoPEGgml;
+
+        let mut hidden = vec![0.0f32; seq_len * h];
+        let embed = qweights.get_f32("model.embed_tokens.weight").unwrap();
+        for (t, &tok) in token_ids.iter().enumerate() {
+            hidden[t * h..(t + 1) * h].copy_from_slice(&embed[tok as usize * h..(tok as usize + 1) * h]);
+        }
+
+        let positions: Vec<u32> = (session.position..session.position + seq_len)
+            .map(|p| p as u32)
+            .collect();
+
+        let layer_names: Vec<_> = (0..cfg.num_layers)
+            .map(|l| {
+                let p = format!("model.layers.{l}");
+                (
+                    format!("{p}.input_layernorm.weight"),
+                    format!("{p}.post_attention_layernorm.weight"),
+                    format!("{p}.self_attn.q_proj.weight"),
+                    format!("{p}.self_attn.k_proj.weight"),
+                    format!("{p}.self_attn.v_proj.weight"),
+                    format!("{p}.self_attn.o_proj.weight"),
+                    format!("{p}.self_attn.q_norm.weight"),
+                    format!("{p}.self_attn.k_norm.weight"),
+                    format!("{p}.mlp.gate_proj.weight"),
+                    format!("{p}.mlp.up_proj.weight"),
+                    format!("{p}.mlp.down_proj.weight"),
+                    format!("{p}.self_attn.attn_sub_norm.weight"),
+                    format!("{p}.mlp.ffn_sub_norm.weight"),
+                )
+            })
+            .collect();
+
+        let mut normed = vec![0.0f32; seq_len * h];
+        let mut q = vec![0.0f32; seq_len * q_dim];
+        let mut k_buf = vec![0.0f32; seq_len * kv_dim];
+        let mut v_buf = vec![0.0f32; seq_len * kv_dim];
+        let mut attn_out = vec![0.0f32; seq_len * q_dim];
+        let mut o_proj = vec![0.0f32; seq_len * h];
+        let mut normed2 = vec![0.0f32; seq_len * h];
+        let mut gate = vec![0.0f32; seq_len * inter];
+        let mut up = vec![0.0f32; seq_len * inter];
+        let mut down_out = vec![0.0f32; seq_len * h];
+
+        let hp = hidden.as_mut_ptr() as usize;
+        let np = normed.as_mut_ptr() as usize;
+        let qp = q.as_mut_ptr() as usize;
+        let kp = k_buf.as_mut_ptr() as usize;
+        let vp = v_buf.as_mut_ptr() as usize;
+        let ap = attn_out.as_mut_ptr() as usize;
+        let op = o_proj.as_mut_ptr() as usize;
+        let n2p = normed2.as_mut_ptr() as usize;
+        let gp = gate.as_mut_ptr() as usize;
+        let upp = up.as_mut_ptr() as usize;
+        let dp = down_out.as_mut_ptr() as usize;
+        let sp = session as *mut InferenceSession as usize;
+
+        let mut lut_h = BatchedTl2Lut::new_for(h, seq_len);
+        let mut lut_qdim = if q_dim != h { BatchedTl2Lut::new_for(q_dim, seq_len) } else { None };
+        let mut lut_inter = BatchedTl2Lut::new_for(inter, seq_len);
+        let lut_h_ptr = lut_h.as_mut().map(|l| l as *mut BatchedTl2Lut as usize).unwrap_or(0);
+        let lut_qdim_ptr = lut_qdim.as_mut().map(|l| l as *mut BatchedTl2Lut as usize).unwrap_or(lut_h_ptr);
+        let lut_inter_ptr = lut_inter.as_mut().map(|l| l as *mut BatchedTl2Lut as usize).unwrap_or(0);
+
+        let max_bm = 320usize;
+        let cbits_size = seq_len * max_bm;
+
+        let pool = tempura_kernels::thread_pool::global_pool();
+        let n_threads = pool.thread_count();
+        let barrier = tempura_kernels::thread_pool::SpinBarrier::new(n_threads);
+        let tile_counter = std::sync::atomic::AtomicUsize::new(0);
+        let shared_kvl = std::sync::atomic::AtomicUsize::new(0);
+        let max_seq = cfg.max_seq_len;
+
+        let mut per_thread_cbits: Vec<Vec<i32>> = (0..n_threads).map(|_| vec![0i32; cbits_size]).collect();
+        let mut per_thread_two_cbits: Vec<Vec<i32>> = (0..n_threads).map(|_| vec![0i32; cbits_size]).collect();
+        let cbits_ptrs: Vec<usize> = per_thread_cbits.iter_mut().map(|b| b.as_mut_ptr() as usize).collect();
+        let two_cbits_ptrs: Vec<usize> = per_thread_two_cbits.iter_mut().map(|b| b.as_mut_ptr() as usize).collect();
+        let mut attn_scores_bufs: Vec<Vec<f32>> = (0..n_threads).map(|_| vec![0.0f32; max_seq]).collect();
+        let attn_scores_ptrs: Vec<usize> = attn_scores_bufs.iter_mut().map(|b| b.as_mut_ptr() as usize).collect();
+
+        let do_profile = std::env::var("TEMPURA_PROFILE").is_ok();
+        let prof_serial = std::sync::atomic::AtomicU64::new(0);
+        let prof_gemm = std::sync::atomic::AtomicU64::new(0);
+        let prof_attn = std::sync::atomic::AtomicU64::new(0);
+
+        pool.run_indexed(&|ith, nth| {
+            macro_rules! fs  { ($a:expr,$n:expr) => { unsafe { std::slice::from_raw_parts($a as *const f32, $n) } } }
+            macro_rules! fsm { ($a:expr,$n:expr) => { unsafe { std::slice::from_raw_parts_mut($a as *mut f32, $n) } } }
+
+            let my_cbits = unsafe { std::slice::from_raw_parts_mut(cbits_ptrs[ith] as *mut i32, cbits_size) };
+            let my_two_cbits = unsafe { std::slice::from_raw_parts_mut(two_cbits_ptrs[ith] as *mut i32, cbits_size) };
+
+            for layer in 0..cfg.num_layers {
+                let (ref iln, ref pln, ref qn, ref kn, ref vn, ref on,
+                     ref _qnm, ref _knm, ref gn, ref un, ref dn,
+                     ref asn, ref fsn) = layer_names[layer];
+
+                // ── All threads: copy + RMSNorm + q8_snap + LUT build (per-token parallel) ──
+                let t_start = ith * seq_len / nth;
+                let t_end = (ith + 1) * seq_len / nth;
+                {
+                    let n = fsm!(np, seq_len * h);
+                    let hh = fs!(hp, seq_len * h);
+                    let w = qweights.get_f32(iln).unwrap();
+                    for t in t_start..t_end {
+                        n[t * h..(t + 1) * h].copy_from_slice(&hh[t * h..(t + 1) * h]);
+                        fused_rmsnorm_q8snap(&mut n[t * h..(t + 1) * h], w, h, cfg.layer_norm_eps);
+                    }
+                    if lut_h_ptr != 0 {
+                        tempura_kernels::tl2::tl2_preprocess_token_range(np, h, lut_h_ptr, t_start, t_end);
+                    }
+                }
+                if ith == 0 {
+                    tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                barrier.wait(); // B1
+
+                // ── All threads: QKV GEMM via work-stealing ──
+                let _t1 = Instant::now();
+                if lut_h_ptr != 0 {
+                    let lut = unsafe { &*(lut_h_ptr as *const BatchedTl2Lut) };
+                    if let (Some(qt), Some(kt), Some(vt)) = (qweights.get_tl2(qn), qweights.get_tl2(kn), qweights.get_tl2(vn)) {
+                        let q_cfg = Tl2Config::for_dims(q_dim, h);
+                        let kv_cfg = Tl2Config::for_dims(kv_dim, h);
+                        let q_tiles = q_cfg.map(|c| q_dim / c.bm).unwrap_or(0);
+                        let kv_tiles = kv_cfg.map(|c| kv_dim / c.bm).unwrap_or(0);
+                        let total = q_tiles + 2 * kv_tiles;
+                        loop {
+                            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if t >= total { break; }
+                            unsafe {
+                                if t < q_tiles {
+                                    tempura_kernels::tl2::tl2_gemm_tiles_batched(
+                                        lut, &qt.data, qt.scale, qp, q_dim, h, seq_len, t, t + 1, my_cbits, my_two_cbits,
+                                    );
+                                } else if t < q_tiles + kv_tiles {
+                                    let kt_idx = t - q_tiles;
+                                    tempura_kernels::tl2::tl2_gemm_tiles_batched(
+                                        lut, &kt.data, kt.scale, kp, kv_dim, h, seq_len, kt_idx, kt_idx + 1, my_cbits, my_two_cbits,
+                                    );
+                                } else {
+                                    let vt_idx = t - q_tiles - kv_tiles;
+                                    tempura_kernels::tl2::tl2_gemm_tiles_batched(
+                                        lut, &vt.data, vt.scale, vp, kv_dim, h, seq_len, vt_idx, vt_idx + 1, my_cbits, my_two_cbits,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if do_profile && ith == 0 {
+                    prof_gemm.fetch_add(_t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                barrier.wait(); // B2
+
+                // ── Serial: RoPE + KV cache append ──
+                if ith == 0 {
+                    use tempura_kernels::RoPE;
+                    if cfg.use_qk_norm {
+                        let q_norm_w = qweights.get_f32(&layer_names[layer].6).unwrap();
+                        let k_norm_w = qweights.get_f32(&layer_names[layer].7).unwrap();
+                        apply_head_rmsnorm(fsm!(qp, seq_len * q_dim), q_norm_w, seq_len, n_heads, head_dim, cfg.layer_norm_eps);
+                        tempura_kernels::portable_math::q8_snap(fsm!(qp, seq_len * q_dim));
+                        apply_head_rmsnorm(fsm!(kp, seq_len * kv_dim), k_norm_w, seq_len, n_kv_heads, head_dim, cfg.layer_norm_eps);
+                        tempura_kernels::portable_math::q8_snap(fsm!(kp, seq_len * kv_dim));
+                    }
+                    rope.forward(fsm!(qp, seq_len * q_dim), 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                    rope.forward(fsm!(kp, seq_len * kv_dim), 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                    let sess = unsafe { &mut *(sp as *mut InferenceSession) };
+                    sess.cache.append_kv(layer, fs!(kp, seq_len * kv_dim), fs!(vp, seq_len * kv_dim), seq_len);
+                    shared_kvl.store(sess.cache.seq_len + seq_len, std::sync::atomic::Ordering::Release);
+                }
+                barrier.wait(); // B2.5
+
+                // ── All threads: prefill attention via work-stealing ──
+                let _ta = Instant::now();
+                {
+                    let kvl = shared_kvl.load(std::sync::atomic::Ordering::Acquire);
+                    let sess = unsafe { &*(sp as *const InferenceSession) };
+                    let total_items = n_heads * seq_len;
+                    let items_per_thread = (total_items + nth - 1) / nth;
+                    let item_start = ith * items_per_thread;
+                    let item_end = ((ith + 1) * items_per_thread).min(total_items);
+                    let scores_buf = unsafe { std::slice::from_raw_parts_mut(attn_scores_ptrs[ith] as *mut f32, kvl) };
+                    tempura_kernels::attention::attention_prefill_items(
+                        fs!(qp, seq_len * q_dim),
+                        &sess.cache.k_data(layer, kvl),
+                        &sess.cache.v_data(layer, kvl),
+                        ap,
+                        scores_buf,
+                        seq_len, kvl,
+                        n_heads, n_kv_heads, head_dim,
+                        1.0 / (head_dim as f32).sqrt(),
+                        item_start, item_end,
+                    );
+                }
+                if do_profile && ith == 0 { prof_attn.fetch_add(_ta.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+                barrier.wait(); // B3
+
+                // ── Serial: attn_sub_norm + batched LUT for O-proj ──
+                // ── All threads: attn_sub_norm + LUT build (parallel per token) ──
+                if let Some(w) = qweights.get_f32(asn) {
+                    use tempura_kernels::RMSNorm as _;
+                    for t in t_start..t_end {
+                        rmsnorm.forward(&mut fsm!(ap, seq_len * q_dim)[t * q_dim..(t + 1) * q_dim], w, q_dim, cfg.layer_norm_eps).unwrap();
+                    }
+                }
+                if lut_qdim_ptr != 0 {
+                    tempura_kernels::tl2::tl2_preprocess_token_range(ap, q_dim, lut_qdim_ptr, t_start, t_end);
+                }
+                if ith == 0 {
+                    tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                barrier.wait(); // B3.5
+
+                // ── All threads: O-proj GEMM ──
+                if lut_qdim_ptr != 0 {
+                    let lut = unsafe { &*(lut_qdim_ptr as *const BatchedTl2Lut) };
+                    if let Some(ot) = qweights.get_tl2(on) {
+                        let o_tiles = Tl2Config::for_dims(h, q_dim).map(|c| h / c.bm).unwrap_or(0);
+                        loop {
+                            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if t >= o_tiles { break; }
+                            unsafe {
+                                tempura_kernels::tl2::tl2_gemm_tiles_batched(
+                                    lut, &ot.data, ot.scale, op, h, q_dim, seq_len, t, t + 1, my_cbits, my_two_cbits,
+                                );
+                            }
+                        }
+                    }
+                }
+                barrier.wait(); // B4
+
+                // ── All threads: residual + RMSNorm + q8_snap + LUT for FFN (parallel) ──
+                {
+                    let h_buf = fsm!(hp, seq_len * h);
+                    let o_buf = fs!(op, seq_len * h);
+                    let n2 = fsm!(n2p, seq_len * h);
+                    let w = qweights.get_f32(pln).unwrap();
+                    for t in t_start..t_end {
+                        let hs = t * h;
+                        let he = (t + 1) * h;
+                        fused_residual_rmsnorm_q8snap(
+                            &mut h_buf[hs..he], &o_buf[hs..he], &mut n2[hs..he], w, h, cfg.layer_norm_eps,
+                        );
+                    }
+                    if lut_h_ptr != 0 {
+                        tempura_kernels::tl2::tl2_preprocess_token_range(n2p, h, lut_h_ptr, t_start, t_end);
+                    }
+                }
+                if ith == 0 {
+                    tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                barrier.wait(); // B5
+
+                // ── All threads: gate+up GEMM ──
+                if lut_h_ptr != 0 {
+                    let lut = unsafe { &*(lut_h_ptr as *const BatchedTl2Lut) };
+                    if let (Some(gt), Some(ut)) = (qweights.get_tl2(gn), qweights.get_tl2(un)) {
+                        let g_tiles = Tl2Config::for_dims(inter, h).map(|c| inter / c.bm).unwrap_or(0);
+                        loop {
+                            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if t >= g_tiles { break; }
+                            unsafe {
+                                tempura_kernels::tl2::tl2_gemm_tiles_batched(
+                                    lut, &gt.data, gt.scale, gp, inter, h, seq_len, t, t + 1, my_cbits, my_two_cbits,
+                                );
+                                tempura_kernels::tl2::tl2_gemm_tiles_batched(
+                                    lut, &ut.data, ut.scale, upp, inter, h, seq_len, t, t + 1, my_cbits, my_two_cbits,
+                                );
+                            }
+                        }
+                    }
+                }
+                barrier.wait(); // B6
+
+                // ── All threads: sqrelu_mul + ffn_sub_norm + LUT for down-proj (parallel) ──
+                {
+                    let g = fsm!(gp, seq_len * inter);
+                    let u = fs!(upp, seq_len * inter);
+                    let gs = t_start * inter;
+                    let ge = t_end * inter;
+                    fused_sqrelu_mul(&mut g[gs..ge], &u[gs..ge], ge - gs);
+                    if let Some(w) = qweights.get_f32(fsn) {
+                        use tempura_kernels::RMSNorm as _;
+                        for t in t_start..t_end {
+                            rmsnorm.forward(&mut g[t * inter..(t + 1) * inter], w, inter, cfg.layer_norm_eps).unwrap();
+                        }
+                    }
+                    if lut_inter_ptr != 0 {
+                        tempura_kernels::tl2::tl2_preprocess_token_range(gp, inter, lut_inter_ptr, t_start, t_end);
+                    }
+                }
+                if ith == 0 {
+                    tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                barrier.wait(); // B7
+
+                // ── All threads: down-proj GEMM ──
+                if lut_inter_ptr != 0 {
+                    let lut = unsafe { &*(lut_inter_ptr as *const BatchedTl2Lut) };
+                    if let Some(dt) = qweights.get_tl2(dn) {
+                        let d_tiles = Tl2Config::for_dims(h, inter).map(|c| h / c.bm).unwrap_or(0);
+                        loop {
+                            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if t >= d_tiles { break; }
+                            unsafe {
+                                tempura_kernels::tl2::tl2_gemm_tiles_batched(
+                                    lut, &dt.data, dt.scale, dp, h, inter, seq_len, t, t + 1, my_cbits, my_two_cbits,
+                                );
+                            }
+                        }
+                    }
+                }
+                barrier.wait(); // B8
+
+                {
+                    let hs = t_start * h;
+                    let he = t_end * h;
+                    residual_add(&mut fsm!(hp, seq_len * h)[hs..he], &fs!(dp, seq_len * h)[hs..he], he - hs);
+                }
+            }
+        });
+
+        if do_profile {
+            let nl = cfg.num_layers as f64;
+            let s = prof_serial.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let g = prof_gemm.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            let a = prof_attn.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
+            eprintln!("[PROFILE] prefill per-layer avg (μs): serial={s:.0} gemm={g:.0} attn={a:.0} total={:.0}", s + g + a);
+        }
+
+        session.cache.advance(seq_len);
+        session.position += seq_len;
+
+        let last_hidden = unsafe { std::slice::from_raw_parts_mut((hp as *mut f32).add((seq_len - 1) * h), h) };
+        fused_rmsnorm_q8snap(last_hidden, qweights.get_f32("model.norm.weight").unwrap(), h, cfg.layer_norm_eps);
+
+        let mut logits = vec![0.0f32; cfg.vocab_size];
+        if let Some(tl2t) = qweights.get_tl2("lm_head.weight") {
+            tl2_forward(last_hidden, &tl2t.data, tl2t.scale, &mut logits, cfg.vocab_size, h);
+        } else if let Some(w) = qweights.get_i2s("lm_head.weight") {
+            let preq = tempura_kernels::quantized::PreQuantizedActivations::i2s_only(last_hidden);
+            let q4k = tempura_kernels::quantized::CpuMatMulQ4KOpt;
+            use tempura_kernels::quantized::MatMulQ;
+            q4k.forward_i2s_preq(&preq.i2s_q8, preq.i2s_scale, preq.i2s_sum, w, &mut logits, cfg.vocab_size, h).unwrap();
+        } else if let Some(w) = qweights.get_f16("lm_head.weight") {
+            tempura_kernels::f16_gemv::f16_gemv(last_hidden, w, &mut logits, cfg.vocab_size, h);
+        } else {
+            let w = qweights.get_f32("lm_head.weight").unwrap();
+            self.pipeline.matmul_bt(last_hidden, w, &mut logits, 1, cfg.vocab_size, h).unwrap();
+        }
+
         logits
     }
 
