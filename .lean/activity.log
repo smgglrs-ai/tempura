@@ -1374,3 +1374,17 @@
     pp42: 178ms→130ms (332 tok/s, +43%), gap to bitnet.cpp -34% (was -57%).
     tg128: 42.4 tok/s (bitnet.cpp 43.4, -2%). 348 tests passing, zero warnings.
     Also uses ggml-compatible CpuRoPEGgml for prefill (matching decode path).
+- timestamp: "2026-07-16T16:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-prefill-optimization-2"
+  summary: >
+    Second prefill optimization pass: parallel RoPE across threads,
+    parallel KV cache copy, fused attention+sub_norm+LUT (eliminate B3
+    barrier), token-parallel attention distribution (better cache locality),
+    interleaved gate+up work-stealing. Comprehensive per-phase profiling
+    reveals gate+up GEMM (34%) and down-proj (19%) dominate layer time;
+    GEMM kernel compute is near AVX2 hardware limits. Barrier count reduced
+    from 12 to 10 per layer. pp42: 125ms (335 tok/s, gap -29% vs bitnet.cpp
+    473). Decode: 42 tok/s (bitnet.cpp 44, -5%). 348 tests, zero warnings.
+    Remaining gap is structural: 10 barriers/layer vs ggml graph-level threading.

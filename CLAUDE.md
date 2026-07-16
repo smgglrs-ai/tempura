@@ -161,7 +161,7 @@ Three-crate workspace + standalone verification crate:
 - [x] GGUF loader: detect `model_type: "bitnet"`, route to BitLinear layers
 - [ ] TQ2_0 cuda-oxide GPU kernel (dp4a path, shared-memory tile unpack)
 - [x] TQ1_0 CPU-only decode (I2S format via bitnet.cpp translation)
-- [x] Validation against microsoft/bitnet-b1.58-2B-4T-gguf (~23.1 tok/s CPU, bitnet.cpp ref: 27.9)
+- [x] Validation against microsoft/bitnet-b1.58-2B-4T-gguf (decode: ~42 tok/s, prefill pp42: 335 tok/s)
 - [x] AVX2/AVX512 maddubs with i16 batched accumulation (bitnet.cpp pattern)
 - [x] Pre-quantized activation sharing across q/k/v and gate/up projections
 - [x] Layer-level rayon::join parallelism for independent projections
@@ -184,6 +184,11 @@ Three-crate workspace + standalone verification crate:
 - [x] Batched TL2 GEMM tiles (tl2_gemm_tiles_batched, zero-alloc per-thread)
 - [x] Parallel per-token LUT preprocessing (tl2_preprocess_token_range)
 - [x] attention_prefill_items: inline multi-token attention for persistent threads
+- [x] Parallel per-token RMSNorm/q8snap/sqrelu/sub_norms/residual_add
+- [x] Parallel RoPE + parallel KV cache copy (token-range distribution)
+- [x] Fused attention + sub_norm + LUT (eliminate B3 barrier)
+- [x] Token-parallel attention (all heads per token range, better cache locality)
+- [x] Interleaved gate+up work-stealing (54 tiles vs 27 doubled)
 
 ## Build & Test
 
