@@ -1432,3 +1432,19 @@
     larger prompts is likely from C++ compiler's more aggressive SIMD
     scheduling and #pragma unroll behavior, not from loop bound knowledge.
     Current state: pp42 355 tok/s (-31%), decode 42 tok/s (-3%).
+- timestamp: "2026-07-17T02:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-llvm-unrolling"
+  summary: >
+    Discovered LLVM fully unrolls batch loops when BS literal ≤10 (verified
+    via assembly analysis: BS=8 → 32 vpshufb, 0 inner loops; BS=32 → 8
+    vpshufb, inner loop with 2× partial unroll). Implemented BS=16+8+1
+    hierarchical chunking in tl2_gemm_tiles_batched — each call to
+    three_tbl_impl_bk96 with literal batch_size gets cache-friendly
+    working set (8×320×4=10KB cbits fits L1). Result: pp42 41ms
+    (1012 tok/s, 2.2× faster than bitnet.cpp 465!). Longer prompts
+    still gap: pp242 581ms (417 tok/s, bitnet.cpp 604, -31%),
+    pp482 2213ms (218 tok/s, bitnet.cpp 496, -56%). Gap at long
+    prompts is from chunk overhead (weight reloading per chunk) —
+    bitnet.cpp uses BS=256 template with #pragma unroll. 348 tests.
