@@ -1290,15 +1290,26 @@ pub unsafe fn tl2_gemm_tiles_batched(
             }
             for bs in 0..batch_size {
                 let dst = std::slice::from_raw_parts_mut((output_addr as *mut f32).add(bs * m + dst_base), bm);
-                for i in 0..bm {
-                    dst[i] = (cbits[i + bs * bm] + two_cbits[i + bs * bm]) as f32 / lut.lut_scales[bs] * w_scale;
+                let scale = _mm256_set1_ps(w_scale / lut.lut_scales[bs]);
+                let cb = &cbits[bs * bm..];
+                let tc = &two_cbits[bs * bm..];
+                for i in (0..bm).step_by(8) {
+                    let c = _mm256_loadu_si256(cb[i..].as_ptr() as *const __m256i);
+                    let t = _mm256_loadu_si256(tc[i..].as_ptr() as *const __m256i);
+                    let sum = _mm256_add_epi32(c, t);
+                    let f = _mm256_cvtepi32_ps(sum);
+                    _mm256_storeu_ps(dst[i..].as_mut_ptr(), _mm256_mul_ps(f, scale));
                 }
             }
         } else {
             for bs in 0..batch_size {
                 let dst = std::slice::from_raw_parts_mut((output_addr as *mut f32).add(bs * m + dst_base), bm);
-                for i in 0..bm {
-                    dst[i] = cbits[i + bs * bm] as f32 / lut.lut_scales[bs] * w_scale;
+                let scale = _mm256_set1_ps(w_scale / lut.lut_scales[bs]);
+                let cb = &cbits[bs * bm..];
+                for i in (0..bm).step_by(8) {
+                    let c = _mm256_loadu_si256(cb[i..].as_ptr() as *const __m256i);
+                    let f = _mm256_cvtepi32_ps(c);
+                    _mm256_storeu_ps(dst[i..].as_mut_ptr(), _mm256_mul_ps(f, scale));
                 }
             }
         }
