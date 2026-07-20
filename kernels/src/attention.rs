@@ -438,24 +438,43 @@ pub fn attention_decode_heads(
     }
 }
 
-#[inline(always)]
-fn f16_to_f32(bits: u16) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("f16c") {
-            return unsafe {
-                use std::arch::x86_64::*;
-                let h = _mm_set1_epi16(bits as i16);
-                _mm_cvtss_f32(_mm_cvtph_ps(h))
-            };
-        }
+/// SIMD f16→f32 dot product: q[f32] · k[f16], head_dim elements.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn dot_f32_f16(q: &[f32], k_f16: *const u16, head_dim: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut acc = _mm256_setzero_ps();
+    let mut d = 0;
+    while d + 8 <= head_dim {
+        let h = _mm_loadu_si128(k_f16.add(d) as *const __m128i);
+        let kv = _mm256_cvtph_ps(h);
+        let qv = _mm256_loadu_ps(q.as_ptr().add(d));
+        acc = _mm256_fmadd_ps(qv, kv, acc);
+        d += 8;
     }
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let frac = (bits & 0x3ff) as u32;
-    if exp == 0 { f32::from_bits(sign << 31) }
-    else if exp == 31 { f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13)) }
-    else { f32::from_bits((sign << 31) | ((exp + 112) << 23) | (frac << 13)) }
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let sum128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+}
+
+/// SIMD weighted sum: output[d] += score * v_f16[offset+d] for head_dim elements.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn weighted_add_f16(output: &mut [f32], v_f16: *const u16, score: f32, head_dim: usize) {
+    use std::arch::x86_64::*;
+    let sv = _mm256_set1_ps(score);
+    let mut d = 0;
+    while d + 8 <= head_dim {
+        let h = _mm_loadu_si128(v_f16.add(d) as *const __m128i);
+        let vv = _mm256_cvtph_ps(h);
+        let ov = _mm256_loadu_ps(output.as_ptr().add(d));
+        _mm256_storeu_ps(output.as_mut_ptr().add(d), _mm256_fmadd_ps(sv, vv, ov));
+        d += 8;
+    }
 }
 
 pub fn attention_decode_heads_f16kv(
@@ -482,11 +501,7 @@ pub fn attention_decode_heads_f16kv(
         let scores = &mut scores[..kv_len];
         for kv_s in 0..kv_len {
             let k_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
-            let mut dot = 0.0f32;
-            for d in 0..head_dim {
-                dot += q_vec[d] * f16_to_f32(k_f16[k_offset + d]);
-            }
-            scores[kv_s] = dot * scale;
+            scores[kv_s] = unsafe { dot_f32_f16(q_vec, k_f16.as_ptr().add(k_offset), head_dim) } * scale;
         }
 
         let mut max_score = f32::NEG_INFINITY;
@@ -507,13 +522,11 @@ pub fn attention_decode_heads_f16kv(
         }
 
         let o_offset = h * head_dim;
-        for d in 0..head_dim {
-            let mut val = 0.0f32;
-            for (kv_s, &score) in scores.iter().enumerate() {
-                let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim + d;
-                val += score * f16_to_f32(v_f16[v_offset]);
-            }
-            output[o_offset + d] = val;
+        let out_slice = &mut output[o_offset..o_offset + head_dim];
+        for d in out_slice.iter_mut() { *d = 0.0; }
+        for (kv_s, &score) in scores.iter().enumerate() {
+            let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+            unsafe { weighted_add_f16(out_slice, v_f16.as_ptr().add(v_offset), score, head_dim) };
         }
     }
 }
