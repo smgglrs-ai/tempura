@@ -1011,7 +1011,8 @@ impl GgufLoader {
 
             let skip_f32 = info.dtype == GgmlType::F16;
 
-            if keep_raw && (info.dtype == GgmlType::TQ1_0 || info.dtype == GgmlType::TL1) {
+            let use_mmap = keep_raw && (info.dtype == GgmlType::TQ1_0 || info.dtype == GgmlType::TL1);
+            if use_mmap {
                 mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, info.dtype));
             }
 
@@ -1038,7 +1039,7 @@ impl GgufLoader {
                     }
                 };
                 tensors.insert(mapped_name.clone(), floats);
-            } else {
+            } else if !use_mmap {
                 raw_tensors.insert(mapped_name.clone(), tensor_data.to_vec());
                 raw_tensor_dims.insert(mapped_name.clone(), info.dims.clone());
             }
