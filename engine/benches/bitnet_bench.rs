@@ -24,7 +24,6 @@ fn main() {
     let config = gguf.config.clone();
     let tokenizer = tempura_engine::tokenizer::Tokenizer::from_gguf_metadata(&gguf.metadata).ok();
     let qweights = gguf.to_quantized_weights();
-    drop(gguf);
     let pipeline = KernelPipeline::cpu_verified();
     let mut model = TransformerModel::new(config.clone(), pipeline);
     model.quantized_weights = Some(qweights);

@@ -247,7 +247,6 @@ pub struct Tl2Tensor {
     pub scale: f32,
 }
 
-#[derive(Debug)]
 pub struct QuantizedWeights {
     q4k_tensors: HashMap<String, Vec<u8>>,
     q6k_tensors: HashMap<String, Vec<u8>>,
@@ -256,6 +255,9 @@ pub struct QuantizedWeights {
     tl2_tensors: HashMap<String, Tl2Tensor>,
     f16_tensors: HashMap<String, Vec<u8>>,
     f32_tensors: HashMap<String, Vec<f32>>,
+    mmap: Option<memmap2::Mmap>,
+    mmap_i2s: HashMap<String, (usize, usize)>,
+    mmap_f16: HashMap<String, (usize, usize)>,
 }
 
 impl QuantizedWeights {
@@ -272,6 +274,9 @@ impl QuantizedWeights {
             tl2_tensors: HashMap::new(),
             f16_tensors: HashMap::new(),
             f32_tensors,
+            mmap: None,
+            mmap_i2s: HashMap::new(),
+            mmap_f16: HashMap::new(),
         }
     }
 
@@ -290,6 +295,9 @@ impl QuantizedWeights {
             f16_tensors: HashMap::new(),
             i2s_tensors,
             f32_tensors,
+            mmap: None,
+            mmap_i2s: HashMap::new(),
+            mmap_f16: HashMap::new(),
         }
     }
 
@@ -307,6 +315,8 @@ impl QuantizedWeights {
 
     pub fn get_i2s(&self, name: &str) -> Option<&[u8]> {
         self.i2s_tensors.get(name).map(|v| v.as_slice())
+            .or_else(|| self.mmap_i2s.get(name).and_then(|&(off, len)|
+                self.mmap.as_ref().map(|m| &m[off..off+len])))
     }
 
 
@@ -320,10 +330,24 @@ impl QuantizedWeights {
 
     pub fn get_f16(&self, name: &str) -> Option<&[u8]> {
         self.f16_tensors.get(name).map(|v| v.as_slice())
+            .or_else(|| self.mmap_f16.get(name).and_then(|&(off, len)|
+                self.mmap.as_ref().map(|m| &m[off..off+len])))
     }
 
     pub fn insert_f16(&mut self, name: String, data: Vec<u8>) {
         self.f16_tensors.insert(name, data);
+    }
+
+    pub fn set_mmap(&mut self, mmap: memmap2::Mmap) {
+        self.mmap = Some(mmap);
+    }
+
+    pub fn register_mmap_i2s(&mut self, name: String, offset: usize, len: usize) {
+        self.mmap_i2s.insert(name, (offset, len));
+    }
+
+    pub fn register_mmap_f16(&mut self, name: String, offset: usize, len: usize) {
+        self.mmap_f16.insert(name, (offset, len));
     }
 
     pub fn get_f32(&self, name: &str) -> Option<&[f32]> {

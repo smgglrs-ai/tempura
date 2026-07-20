@@ -291,6 +291,7 @@ async fn run_server(args: ServeArgs) {
         let model_p = model_path.unwrap();
         let gguf = tempura_engine::gguf_loader::GgufLoader::from_file_quantized(model_p).unwrap();
         let mut config = gguf.config.clone();
+        let metadata = gguf.metadata.clone();
         tracing::info!("Loaded GGUF model from {}", model_p.display());
 
         let tokenizer = if let Some(path) = args.tokenizer.as_ref() {
@@ -298,7 +299,7 @@ async fn run_server(args: ServeArgs) {
             tracing::info!("Loaded tokenizer from {}", path);
             Some(Arc::new(tok))
         } else {
-            match Tokenizer::from_gguf_metadata(&gguf.metadata) {
+            match Tokenizer::from_gguf_metadata(&metadata) {
                 Ok(tok) => {
                     tracing::info!("Extracted tokenizer from GGUF metadata");
                     Some(Arc::new(tok))
@@ -311,7 +312,6 @@ async fn run_server(args: ServeArgs) {
         };
 
         let qweights = gguf.to_quantized_weights();
-        drop(gguf);
         config.max_seq_len = config.max_seq_len.min(args.max_seq_len);
         tracing::info!("Using max_seq_len={}", config.max_seq_len);
 

@@ -897,15 +897,22 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
     })
 }
 
-#[derive(Debug)]
 pub struct GgufLoader {
+    mmap: Option<memmap2::Mmap>,
     tensors: HashMap<String, Vec<f32>>,
     raw_tensors: HashMap<String, Vec<u8>>,
     raw_tensor_dims: HashMap<String, Vec<u64>>,
     tensor_dtypes: HashMap<String, GgmlType>,
     f16_raw_tensors: HashMap<String, Vec<u8>>,
+    mmap_ranges: HashMap<String, (usize, usize, GgmlType)>,
     pub config: ModelConfig,
     pub metadata: HashMap<String, GgufValue>,
+}
+
+impl std::fmt::Debug for GgufLoader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GgufLoader").field("config", &self.config).finish_non_exhaustive()
+    }
 }
 
 impl GgufLoader {
@@ -915,8 +922,11 @@ impl GgufLoader {
     }
 
     pub fn from_file_quantized(path: &Path) -> Result<Self, LoadError> {
-        let data = std::fs::read(path)?;
-        Self::from_bytes_quantized(&data)
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let mut loader = Self::from_bytes_quantized(&mmap)?;
+        loader.mmap = Some(mmap);
+        Ok(loader)
     }
 
     fn from_bytes_quantized(data: &[u8]) -> Result<Self, LoadError> {
@@ -971,6 +981,7 @@ impl GgufLoader {
         let mut raw_tensor_dims: HashMap<String, Vec<u64>> = HashMap::new();
         let mut tensor_dtypes = HashMap::new();
         let mut f16_raw_tensors: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut mmap_ranges: HashMap<String, (usize, usize, GgmlType)> = HashMap::new();
 
         for info in &tensor_infos {
             let num_elements: u64 = info.dims.iter().product();
@@ -995,10 +1006,14 @@ impl GgufLoader {
                 && !mapped_name.contains("norm.weight");
 
             if info.dtype == GgmlType::F16 {
-                f16_raw_tensors.insert(mapped_name.clone(), tensor_data.to_vec());
+                mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, GgmlType::F16));
             }
 
             let skip_f32 = info.dtype == GgmlType::F16;
+
+            if keep_raw && (info.dtype == GgmlType::TQ1_0 || info.dtype == GgmlType::TL1) {
+                mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, info.dtype));
+            }
 
             if !keep_raw && !skip_f32 {
                 let floats = match info.dtype {
@@ -1047,8 +1062,12 @@ impl GgufLoader {
         config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
 
         if !tensors.contains_key("lm_head.weight") && !raw_tensors.contains_key("lm_head.weight")
-            && !f16_raw_tensors.contains_key("lm_head.weight") {
-            if let Some(f16_raw) = f16_raw_tensors.get("model.embed_tokens.weight") {
+            && !f16_raw_tensors.contains_key("lm_head.weight")
+            && !mmap_ranges.contains_key("lm_head.weight") {
+            if let Some(&(off, len, dtype)) = mmap_ranges.get("model.embed_tokens.weight") {
+                mmap_ranges.insert("lm_head.weight".into(), (off, len, dtype));
+                tensor_dtypes.insert("lm_head.weight".into(), GgmlType::F16);
+            } else if let Some(f16_raw) = f16_raw_tensors.get("model.embed_tokens.weight") {
                 f16_raw_tensors.insert("lm_head.weight".into(), f16_raw.clone());
                 tensor_dtypes.insert("lm_head.weight".into(), GgmlType::F16);
             } else if let Some(embed) = tensors.get("model.embed_tokens.weight") {
@@ -1058,11 +1077,13 @@ impl GgufLoader {
         }
 
         Ok(Self {
+            mmap: None,
             tensors,
             raw_tensors,
             raw_tensor_dims,
             tensor_dtypes,
             f16_raw_tensors,
+            mmap_ranges,
             config,
             metadata,
         })
@@ -1177,11 +1198,13 @@ impl GgufLoader {
         config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
 
         Ok(Self {
+            mmap: None,
             tensors,
             raw_tensors,
             raw_tensor_dims: HashMap::new(),
             tensor_dtypes,
             f16_raw_tensors: HashMap::new(),
+            mmap_ranges: HashMap::new(),
             config,
             metadata,
         })
@@ -1189,7 +1212,7 @@ impl GgufLoader {
 }
 
 impl GgufLoader {
-    pub fn to_quantized_weights(&self) -> crate::weights::QuantizedWeights {
+    pub fn to_quantized_weights(self) -> crate::weights::QuantizedWeights {
         let mut q4k_tensors = HashMap::new();
         let mut q6k_tensors = HashMap::new();
         let mut tq2_tensors = HashMap::new();
@@ -1203,7 +1226,11 @@ impl GgufLoader {
                 match dtype {
                     GgmlType::Q6K => { q6k_tensors.insert(name.clone(), raw.clone()); }
                     GgmlType::TQ2_0 => { tq2_tensors.insert(name.clone(), raw.clone()); }
-                    GgmlType::TQ1_0 | GgmlType::TL1 => { i2s_tensors.insert(name.clone(), raw.clone()); }
+                    GgmlType::TQ1_0 | GgmlType::TL1 => {
+                        if !self.mmap_ranges.contains_key(name) {
+                            i2s_tensors.insert(name.clone(), raw.clone());
+                        }
+                    }
                     GgmlType::TL2 => { /* handled below with dimension metadata */ }
                     _ => { q4k_tensors.insert(name.clone(), raw.clone()); }
                 };
@@ -1212,8 +1239,19 @@ impl GgufLoader {
 
         let mut qw = crate::weights::QuantizedWeights::new_with_ternary(q4k_tensors, q6k_tensors, tq2_tensors, i2s_tensors, f32_tensors);
 
-        for (name, data) in &self.f16_raw_tensors {
-            qw.insert_f16(name.clone(), data.clone());
+        if let Some(mmap) = self.mmap {
+            for (name, &(off, len, dtype)) in &self.mmap_ranges {
+                match dtype {
+                    GgmlType::TQ1_0 | GgmlType::TL1 => { qw.register_mmap_i2s(name.clone(), off, len); }
+                    GgmlType::F16 => { qw.register_mmap_f16(name.clone(), off, len); }
+                    _ => {}
+                }
+            }
+            qw.set_mmap(mmap);
+        } else {
+            for (name, data) in &self.f16_raw_tensors {
+                qw.insert_f16(name.clone(), data.clone());
+            }
         }
 
         // Build TL2 tensors with dimension metadata and extracted scale
