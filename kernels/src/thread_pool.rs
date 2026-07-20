@@ -47,6 +47,7 @@ struct CacheLine(AtomicUsize);
 
 struct Shared {
     gen: Mutex<usize>,
+    gen_atomic: AtomicUsize,
     wake: Condvar,
     chunk_counter: AtomicUsize,
     n_chunks: AtomicUsize,
@@ -72,6 +73,7 @@ impl PersistentPool {
 
         let shared = Arc::new(Shared {
             gen: Mutex::new(0),
+            gen_atomic: AtomicUsize::new(0),
             wake: Condvar::new(),
             chunk_counter: AtomicUsize::new(0),
             n_chunks: AtomicUsize::new(0),
@@ -134,11 +136,8 @@ impl PersistentPool {
         sh.n_chunks.store(n_chunks, Ordering::Relaxed);
         sh.chunk_counter.store(0, Ordering::Relaxed);
 
-        let gen = {
-            let mut g = sh.gen.lock().unwrap();
-            *g += 1;
-            *g
-        };
+        let gen = sh.gen_atomic.fetch_add(1, Ordering::AcqRel) + 1;
+        { let mut g = sh.gen.lock().unwrap(); *g = gen; }
         sh.wake.notify_all();
 
         steal_chunks(sh);
@@ -159,6 +158,7 @@ impl PersistentPool {
 impl Drop for PersistentPool {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
+        self.shared.gen_atomic.fetch_add(1, Ordering::Release);
         { let mut g = self.shared.gen.lock().unwrap(); *g += 1; }
         self.shared.wake.notify_all();
         for t in self._threads.drain(..) { let _ = t.join(); }

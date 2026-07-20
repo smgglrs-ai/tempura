@@ -1051,6 +1051,41 @@ pub unsafe fn vec_dot_i2_i8_s_avx2(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
     hsum_i32(acc)
 }
 
+/// AVX-VNNI I2S ternary dot product using _mm256_dpbusd_epi32.
+/// Fuses maddubs+madd into a single instruction with direct i32 accumulation.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,avxvnni")]
+pub unsafe fn vec_dot_i2_i8_s_avx_vnni(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
+    use std::arch::x86_64::*;
+
+    let nb = k / 128;
+    let mask_2bit = _mm256_set1_epi8(0x03);
+    let mut acc = _mm256_setzero_si256();
+
+    for i in 0..nb {
+        let px = i * 32;
+        let py = i * 128;
+
+        let w_raw = _mm256_loadu_si256(packed.as_ptr().add(px) as *const __m256i);
+        let w0 = _mm256_and_si256(w_raw, mask_2bit);
+        let w1 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 2), mask_2bit);
+        let w2 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 4), mask_2bit);
+        let w3 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 6), mask_2bit);
+
+        let a3 = _mm256_loadu_si256(a_q.as_ptr().add(py) as *const __m256i);
+        let a2 = _mm256_loadu_si256(a_q.as_ptr().add(py + 32) as *const __m256i);
+        let a1 = _mm256_loadu_si256(a_q.as_ptr().add(py + 64) as *const __m256i);
+        let a0 = _mm256_loadu_si256(a_q.as_ptr().add(py + 96) as *const __m256i);
+
+        acc = _mm256_dpbusd_epi32(acc, w0, a0);
+        acc = _mm256_dpbusd_epi32(acc, w1, a1);
+        acc = _mm256_dpbusd_epi32(acc, w2, a2);
+        acc = _mm256_dpbusd_epi32(acc, w3, a3);
+    }
+
+    hsum_i32(acc)
+}
+
 /// Horizontal sum of 16 i32 lanes in a __m512i.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f")]
@@ -1336,13 +1371,16 @@ pub fn i2s_gemv_cols(
     k: usize,
 ) {
     let row_packed_bytes = k / 4;
+    let has_avx_vnni = is_x86_feature_detected!("avxvnni");
     let has_avx512 = is_x86_feature_detected!("avx512f")
         && is_x86_feature_detected!("avx512bw")
         && is_x86_feature_detected!("avx512vnni");
 
     for j in col_start..col_end {
         let w = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
-        let raw = if has_avx512 {
+        let raw = if has_avx_vnni {
+            unsafe { vec_dot_i2_i8_s_avx_vnni(w, preq_q8, k) }
+        } else if has_avx512 {
             unsafe { vec_dot_i2_i8_s_avx512(w, preq_q8, k) }
         } else {
             unsafe { vec_dot_i2_i8_s_avx2(w, preq_q8, k) }
@@ -2796,6 +2834,22 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         ]);
 
         #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avxvnni") {
+            let mut q_buf = vec![0i8; k];
+            for i in 0..m {
+                let a_row = &a[i * k..(i + 1) * k];
+                let (act_scale, act_sum) = i2s_quantize_into(a_row, &mut q_buf);
+                let out_row = &mut output[i * n..(i + 1) * n];
+                for j in 0..n {
+                    let w_packed = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
+                    let raw = unsafe { vec_dot_i2_i8_s_avx_vnni(w_packed, &q_buf, k) };
+                    out_row[j] = (raw - act_sum) as f32 / act_scale * w_scale;
+                }
+            }
+            return Ok(());
+        }
+
+        #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx512f")
             && is_x86_feature_detected!("avx512bw")
             && is_x86_feature_detected!("avx512vnni")
@@ -2856,6 +2910,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             let out_addr = output.as_mut_ptr() as usize;
             let b_addr = b_quantized.as_ptr() as usize;
             let a_addr = preq_q8.as_ptr() as usize;
+            let has_avx_vnni = is_x86_feature_detected!("avxvnni");
             let has_avx512 = is_x86_feature_detected!("avx512f")
                 && is_x86_feature_detected!("avx512bw")
                 && is_x86_feature_detected!("avx512vnni");
@@ -2867,7 +2922,9 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                         std::slice::from_raw_parts((b_addr + j * row_packed_bytes) as *const u8, row_packed_bytes)
                     };
                     let aq = unsafe { std::slice::from_raw_parts(a_addr as *const i8, k) };
-                    let raw = if has_avx512 {
+                    let raw = if has_avx_vnni {
+                        unsafe { vec_dot_i2_i8_s_avx_vnni(w, aq, k) }
+                    } else if has_avx512 {
                         unsafe { vec_dot_i2_i8_s_avx512(w, aq, k) }
                     } else {
                         unsafe { vec_dot_i2_i8_s_avx2(w, aq, k) }

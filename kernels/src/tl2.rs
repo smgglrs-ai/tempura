@@ -1283,15 +1283,15 @@ pub unsafe fn tl2_gemm_tiles_batched(
 
         for b in cbits[..bs_bm].iter_mut() { *b = 0; }
 
-        // Chunked three-part GEMM: chunk at BS=32 (40KB cbits, fits L1=48KB)
+        // Chunked three-part GEMM: chunk at BS=24 (30KB cbits at BM=320, fits L1>=32KB)
         // with 8+1 fallback for remainder
         if use_bk96 {
             let mut done = 0usize;
             let mut rem = batch_size;
-            while rem >= 32 {
+            while rem >= 24 {
                 three_tbl_impl_bk96(&mut cbits[done * bm..], &lut.three_qlut[done * three_lut_stride..],
-                    &weight_data[w_offset..], &weight_data[s_offset..], bm, three_k, 32);
-                done += 32; rem -= 32;
+                    &weight_data[w_offset..], &weight_data[s_offset..], bm, three_k, 24);
+                done += 24; rem -= 24;
             }
             while rem >= 8 {
                 three_tbl_impl_bk96(&mut cbits[done * bm..], &lut.three_qlut[done * three_lut_stride..],
@@ -1309,17 +1309,17 @@ pub unsafe fn tl2_gemm_tiles_batched(
 
         if two_k > 0 {
             for b in two_cbits[..bs_bm].iter_mut() { *b = 0; }
-            // Chunked two-part GEMM (same BS=32+8+1 tiers)
+            // Chunked two-part GEMM (same BS=24+8+1 tiers)
             let mut done = 0usize;
             let mut rem = batch_size;
-            while rem >= 32 {
+            while rem >= 24 {
                 for k_outer in 0..n_two_blocks {
                     let lut_off = k_outer * BK2 / 2 * 32;
                     let a_off = k_outer * BK2 / 2 / 2 * bm;
                     two_tbl_impl(&mut two_cbits[done * bm..], &lut.two_qlut[done * two_lut_stride + lut_off..],
-                        &weight_data[two_w_offset + a_off..], bm, two_k, 32);
+                        &weight_data[two_w_offset + a_off..], bm, two_k, 24);
                 }
-                done += 32; rem -= 32;
+                done += 24; rem -= 24;
             }
             while rem >= 8 {
                 for k_outer in 0..n_two_blocks {
