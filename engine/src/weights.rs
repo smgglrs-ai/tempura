@@ -3,6 +3,23 @@ use std::collections::HashMap;
 use crate::config::ModelConfig;
 use crate::loader::{LoadError, WeightLoader};
 
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+    if exp == 0 {
+        if frac == 0 { return f32::from_bits(sign << 31); }
+        let mut e = 1u32;
+        let mut f = frac;
+        while f & 0x400 == 0 { f <<= 1; e += 1; }
+        f32::from_bits((sign << 31) | ((127 - 15 + 1 - e) << 23) | ((f & 0x3ff) << 13))
+    } else if exp == 31 {
+        f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13))
+    } else {
+        f32::from_bits((sign << 31) | ((exp + 112) << 23) | (frac << 13))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WeightsError {
     #[error("missing required tensor: {0}")]
@@ -330,6 +347,21 @@ impl QuantizedWeights {
 
     pub fn get_f32(&self, name: &str) -> Option<&[f32]> {
         self.f32_tensors.get(name).map(|v| v.as_slice())
+    }
+
+    pub fn embed_token(&self, token_id: u32, hidden_size: usize, output: &mut [f32]) {
+        let off = token_id as usize * hidden_size;
+        if let Some(f32_data) = self.get_f32("model.embed_tokens.weight") {
+            output.copy_from_slice(&f32_data[off..off + hidden_size]);
+        } else if let Some(f16_data) = self.get_f16("model.embed_tokens.weight") {
+            let byte_off = off * 2;
+            for i in 0..hidden_size {
+                let bits = u16::from_le_bytes([f16_data[byte_off + i * 2], f16_data[byte_off + i * 2 + 1]]);
+                output[i] = f16_bits_to_f32(bits);
+            }
+        } else {
+            panic!("no embedding weights found");
+        }
     }
 
     pub fn build_i2s_lut_tensors(&mut self, tensor_shapes: &HashMap<String, (usize, usize)>) {

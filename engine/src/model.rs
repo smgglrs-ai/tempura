@@ -535,10 +535,8 @@ where
         let mut up = vec![0.0f32; seq_len * inter];
         let mut down_out = vec![0.0f32; seq_len * h];
 
-        let embed = qweights.get_f32("model.embed_tokens.weight").unwrap();
         for (t, &tok) in token_ids.iter().enumerate() {
-            let src = &embed[tok as usize * h..(tok as usize + 1) * h];
-            hidden[t * h..(t + 1) * h].copy_from_slice(src);
+            qweights.embed_token(tok, h, &mut hidden[t * h..(t + 1) * h]);
         }
 
         if std::env::var("TEMPURA_DEBUG").is_ok() {
@@ -1086,8 +1084,7 @@ where
         let rope = tempura_kernels::rope::CpuRoPEGgml;
 
         let mut hidden = vec![0.0f32; h];
-        let embed = qweights.get_f32("model.embed_tokens.weight").unwrap();
-        hidden.copy_from_slice(&embed[token_id as usize * h..(token_id as usize + 1) * h]);
+        qweights.embed_token(token_id, h, &mut hidden);
 
         let positions = [session.position as u32];
 
@@ -1530,7 +1527,6 @@ where
         let rope = tempura_kernels::rope::CpuRoPEGgml;
 
         let mut hidden = vec![0.0f32; h];
-        let embed = qweights.get_f32("model.embed_tokens.weight").unwrap();
 
         let layer_names: Vec<_> = (0..cfg.num_layers)
             .map(|l| {
@@ -1605,8 +1601,14 @@ where
         let mut attn_scores_bufs: Vec<Vec<f32>> = (0..n_threads).map(|_| vec![0.0f32; max_seq]).collect();
         let attn_scores_ptrs: Vec<usize> = attn_scores_bufs.iter_mut().map(|b| b.as_mut_ptr() as usize).collect();
 
-        // Embed first token before entering the thread pool
-        hidden.copy_from_slice(&embed[first_token as usize * h..(first_token as usize + 1) * h]);
+        qweights.embed_token(first_token, h, &mut hidden);
+
+        let embed_f32_ptr = qweights.get_f32("model.embed_tokens.weight")
+            .map(|d| d.as_ptr() as usize).unwrap_or(0);
+        let embed_f16_ptr = if embed_f32_ptr == 0 {
+            qweights.get_f16("model.embed_tokens.weight")
+                .map(|d| d.as_ptr() as usize).unwrap_or(0)
+        } else { 0 };
 
         pool.run_indexed(&|ith, nth| {
             macro_rules! fs  { ($a:expr,$n:expr) => { unsafe { std::slice::from_raw_parts($a as *const f32, $n) } } }
@@ -1908,7 +1910,21 @@ where
                     if eos_token == Some(token) || gen.len() >= max_tokens {
                         shared_stop.store(true, std::sync::atomic::Ordering::Release);
                     } else {
-                        fsm!(hp,h).copy_from_slice(&embed[token as usize * h..(token as usize + 1) * h]);
+                        unsafe {
+                            let dst = fsm!(hp,h);
+                            let off = token as usize * h;
+                            if embed_f32_ptr != 0 {
+                                let src = std::slice::from_raw_parts((embed_f32_ptr as *const f32).add(off), h);
+                                dst.copy_from_slice(src);
+                            } else {
+                                let f16_src = std::slice::from_raw_parts((embed_f16_ptr as *const u8).add(off * 2), h * 2);
+                                for i in 0..h {
+                                    let bits = u16::from_le_bytes([f16_src[i*2], f16_src[i*2+1]]);
+                                    let exp = (bits >> 10) & 0x1f;
+                                    dst[i] = f32::from_bits(((bits as u32 >> 15) << 31) | if exp == 0 { 0 } else { ((exp as u32 + 112) << 23) | ((bits as u32 & 0x3ff) << 13) });
+                                }
+                            }
+                        }
                     }
                 } else {
                     std::thread::yield_now();
@@ -1949,9 +1965,8 @@ where
         let rope = tempura_kernels::rope::CpuRoPEGgml;
 
         let mut hidden = vec![0.0f32; seq_len * h];
-        let embed = qweights.get_f32("model.embed_tokens.weight").unwrap();
         for (t, &tok) in token_ids.iter().enumerate() {
-            hidden[t * h..(t + 1) * h].copy_from_slice(&embed[tok as usize * h..(tok as usize + 1) * h]);
+            qweights.embed_token(tok, h, &mut hidden[t * h..(t + 1) * h]);
         }
 
         let positions: Vec<u32> = (session.position..session.position + seq_len)

@@ -998,7 +998,9 @@ impl GgufLoader {
                 f16_raw_tensors.insert(mapped_name.clone(), tensor_data.to_vec());
             }
 
-            if !keep_raw {
+            let skip_f32 = info.dtype == GgmlType::F16;
+
+            if !keep_raw && !skip_f32 {
                 let floats = match info.dtype {
                     GgmlType::F32 => dequant_f32(tensor_data, ne),
                     GgmlType::F16 => dequant_f16(tensor_data, ne),
@@ -1031,7 +1033,10 @@ impl GgufLoader {
         let vocab_size_from_embed = tensors.get("model.embed_tokens.weight").map(|t| {
             let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
             t.len().checked_div(hidden).unwrap_or(0)
-        });
+        }).or_else(|| f16_raw_tensors.get("model.embed_tokens.weight").map(|t| {
+            let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
+            (t.len() / 2).checked_div(hidden).unwrap_or(0)
+        }));
 
         let mut config = extract_config(&metadata)?;
         if let Some(vs) = vocab_size_from_embed {
@@ -1041,7 +1046,8 @@ impl GgufLoader {
         }
         config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
 
-        if !tensors.contains_key("lm_head.weight") && !raw_tensors.contains_key("lm_head.weight") {
+        if !tensors.contains_key("lm_head.weight") && !raw_tensors.contains_key("lm_head.weight")
+            && !f16_raw_tensors.contains_key("lm_head.weight") {
             if let Some(f16_raw) = f16_raw_tensors.get("model.embed_tokens.weight") {
                 f16_raw_tensors.insert("lm_head.weight".into(), f16_raw.clone());
                 tensor_dtypes.insert("lm_head.weight".into(), GgmlType::F16);
