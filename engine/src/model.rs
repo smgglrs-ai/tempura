@@ -1584,9 +1584,10 @@ where
         let sp = session as *mut InferenceSession as usize;
         let gen_ptr = &mut generated as *mut Vec<u32> as usize;
 
-        let mut lut_h = Tl2Lut::new_for_k(h);
-        let mut lut_qdim = if q_dim != h { Tl2Lut::new_for_k(q_dim) } else { None };
-        let mut lut_inter = Tl2Lut::new_for_k(inter);
+        let force_i2s = std::env::var("TEMPURA_FORCE_I2S").is_ok();
+        let mut lut_h = if force_i2s { None } else { Tl2Lut::new_for_k(h) };
+        let mut lut_qdim = if force_i2s || q_dim == h { None } else { Tl2Lut::new_for_k(q_dim) };
+        let mut lut_inter = if force_i2s { None } else { Tl2Lut::new_for_k(inter) };
         let lut_h_ptr = lut_h.as_mut().map(|l| l as *mut Tl2Lut as usize).unwrap_or(0);
         let lut_qdim_ptr = lut_qdim.as_mut().map(|l| l as *mut Tl2Lut as usize).unwrap_or(lut_h_ptr);
         let lut_inter_ptr = lut_inter.as_mut().map(|l| l as *mut Tl2Lut as usize).unwrap_or(0);
@@ -1613,8 +1614,14 @@ where
             macro_rules! is  { ($a:expr,$n:expr) => { unsafe { std::slice::from_raw_parts($a as *const i8, $n) } } }
             macro_rules! ism { ($a:expr,$n:expr) => { unsafe { std::slice::from_raw_parts_mut($a as *mut i8, $n) } } }
 
+            let do_profile = std::env::var("TEMPURA_PROFILE").is_ok();
+            let mut _tok_start = Instant::now();
+            let mut _layer_us = 0u64;
+            let mut _lmhead_us = 0u64;
+
             for _token_step in 0..max_tokens {
                 if shared_stop.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                if ith == 0 { _tok_start = Instant::now(); }
 
                 let session = unsafe { &*(sp as *const InferenceSession) };
                 let positions = [session.position as u32];
@@ -1833,6 +1840,7 @@ where
                 }
 
                 // ── lm_head ──
+                if ith == 0 { _layer_us = _tok_start.elapsed().as_micros() as u64; }
                 barrier.wait();
                 if ith == 0 {
                     fused_rmsnorm_q8snap(fsm!(hp,h), qweights.get_f32("model.norm.weight").unwrap(), h, cfg.layer_norm_eps);
@@ -1886,10 +1894,16 @@ where
                 // Non-zero threads yield here to reduce thermal pressure while
                 // thread 0 does argmax + embedding (~100-200μs).
                 if ith == 0 {
+                    _lmhead_us = _tok_start.elapsed().as_micros() as u64 - _layer_us;
                     let logits_slice = fs!(logits_ptr, vocab_size);
                     let token = argmax(logits_slice);
                     let gen = unsafe { &mut *(gen_ptr as *mut Vec<u32>) };
                     gen.push(token);
+
+                    if do_profile && _token_step % 10 == 9 {
+                        let total = _tok_start.elapsed().as_micros() as u64;
+                        eprintln!("[PROFILE] step={} layers={_layer_us}μs lm_head={_lmhead_us}μs total={total}μs", _token_step);
+                    }
 
                     if eos_token == Some(token) || gen.len() >= max_tokens {
                         shared_stop.store(true, std::sync::atomic::Ordering::Release);
