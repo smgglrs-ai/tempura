@@ -1394,45 +1394,57 @@ pub fn i2s_gemv_cols(
     }
 }
 
-/// I2S GEMV inner kernel: compute one dot product of `count` 128-element blocks.
-/// Uses inline asm to guarantee the 32-iteration loop is fully unrolled.
+/// One iteration of the I2S dot product inner loop.
+#[cfg(target_arch = "x86_64")]
+macro_rules! i2s_dot_iter {
+    ($acc:ident, $w_base:expr, $a_base:expr, $g:expr, $mask:expr) => {{
+        use std::arch::x86_64::*;
+        let xq8 = _mm256_loadu_si256(($w_base).add($g * 32) as *const __m256i);
+        let xq0 = _mm256_and_si256(_mm256_srli_epi16(xq8, 6), $mask);
+        let xq1 = _mm256_and_si256(_mm256_srli_epi16(xq8, 4), $mask);
+        let xq2 = _mm256_and_si256(_mm256_srli_epi16(xq8, 2), $mask);
+        let xq3 = _mm256_and_si256(xq8, $mask);
+        let p = ($a_base).add($g * 128);
+        let d0 = _mm256_maddubs_epi16(xq0, _mm256_loadu_si256(p as *const __m256i));
+        let d1 = _mm256_maddubs_epi16(xq1, _mm256_loadu_si256(p.add(32) as *const __m256i));
+        let d2 = _mm256_maddubs_epi16(xq2, _mm256_loadu_si256(p.add(64) as *const __m256i));
+        let d3 = _mm256_maddubs_epi16(xq3, _mm256_loadu_si256(p.add(96) as *const __m256i));
+        $acc = _mm256_add_epi16($acc, _mm256_add_epi16(d0, d1));
+        $acc = _mm256_add_epi16($acc, _mm256_add_epi16(d2, d3));
+    }};
+}
+
+/// I2S GEMV inner kernel: dot product of 32 × 128-element blocks.
+/// Macro-unrolled — no loop, 32 stamped-out iterations.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn i2s_dot_block32(
-    w_ptr: *const u8,  // packed weights, 32 bytes per block
-    a_ptr: *const i8,  // i8 activations, 128 bytes per block
+    w_ptr: *const u8,
+    a_ptr: *const i8,
     mask: std::arch::x86_64::__m256i,
     ones: std::arch::x86_64::__m256i,
 ) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::*;
-    let mut accu16 = _mm256_setzero_si256();
-    let mut px = w_ptr;
-    let mut py = a_ptr;
-    // Process 32 blocks of 128 elements each (= 4096 elements)
-    for _ in 0..32 {
-        let xq8 = _mm256_loadu_si256(px as *const __m256i);
-        let xq0 = _mm256_and_si256(_mm256_srli_epi16(xq8, 6), mask);
-        let xq1 = _mm256_and_si256(_mm256_srli_epi16(xq8, 4), mask);
-        let xq2 = _mm256_and_si256(_mm256_srli_epi16(xq8, 2), mask);
-        let xq3 = _mm256_and_si256(xq8, mask);
-
-        let y0 = _mm256_loadu_si256(py as *const __m256i);
-        let y1 = _mm256_loadu_si256(py.add(32) as *const __m256i);
-        let y2 = _mm256_loadu_si256(py.add(64) as *const __m256i);
-        let y3 = _mm256_loadu_si256(py.add(96) as *const __m256i);
-
-        let d0 = _mm256_maddubs_epi16(xq0, y0);
-        let d1 = _mm256_maddubs_epi16(xq1, y1);
-        let d2 = _mm256_maddubs_epi16(xq2, y2);
-        let d3 = _mm256_maddubs_epi16(xq3, y3);
-
-        accu16 = _mm256_add_epi16(accu16, _mm256_add_epi16(d0, d1));
-        accu16 = _mm256_add_epi16(accu16, _mm256_add_epi16(d2, d3));
-
-        px = px.add(32);
-        py = py.add(128);
-    }
-    _mm256_madd_epi16(accu16, ones)
+    let mut acc = _mm256_setzero_si256();
+    let w = w_ptr;
+    let a = a_ptr;
+    i2s_dot_iter!(acc, w, a, 0, mask);  i2s_dot_iter!(acc, w, a, 1, mask);
+    i2s_dot_iter!(acc, w, a, 2, mask);  i2s_dot_iter!(acc, w, a, 3, mask);
+    i2s_dot_iter!(acc, w, a, 4, mask);  i2s_dot_iter!(acc, w, a, 5, mask);
+    i2s_dot_iter!(acc, w, a, 6, mask);  i2s_dot_iter!(acc, w, a, 7, mask);
+    i2s_dot_iter!(acc, w, a, 8, mask);  i2s_dot_iter!(acc, w, a, 9, mask);
+    i2s_dot_iter!(acc, w, a, 10, mask); i2s_dot_iter!(acc, w, a, 11, mask);
+    i2s_dot_iter!(acc, w, a, 12, mask); i2s_dot_iter!(acc, w, a, 13, mask);
+    i2s_dot_iter!(acc, w, a, 14, mask); i2s_dot_iter!(acc, w, a, 15, mask);
+    i2s_dot_iter!(acc, w, a, 16, mask); i2s_dot_iter!(acc, w, a, 17, mask);
+    i2s_dot_iter!(acc, w, a, 18, mask); i2s_dot_iter!(acc, w, a, 19, mask);
+    i2s_dot_iter!(acc, w, a, 20, mask); i2s_dot_iter!(acc, w, a, 21, mask);
+    i2s_dot_iter!(acc, w, a, 22, mask); i2s_dot_iter!(acc, w, a, 23, mask);
+    i2s_dot_iter!(acc, w, a, 24, mask); i2s_dot_iter!(acc, w, a, 25, mask);
+    i2s_dot_iter!(acc, w, a, 26, mask); i2s_dot_iter!(acc, w, a, 27, mask);
+    i2s_dot_iter!(acc, w, a, 28, mask); i2s_dot_iter!(acc, w, a, 29, mask);
+    i2s_dot_iter!(acc, w, a, 30, mask); i2s_dot_iter!(acc, w, a, 31, mask);
+    _mm256_madd_epi16(acc, ones)
 }
 
 /// Sequential-row I2S GEMV — one row at a time, activation in L1 cache.
