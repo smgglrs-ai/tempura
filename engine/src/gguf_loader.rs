@@ -1039,7 +1039,7 @@ impl GgufLoader {
                     }
                 };
                 tensors.insert(mapped_name.clone(), floats);
-            } else if !use_mmap {
+            } else if !use_mmap && !skip_f32 {
                 raw_tensors.insert(mapped_name.clone(), tensor_data.to_vec());
                 raw_tensor_dims.insert(mapped_name.clone(), info.dims.clone());
             }
