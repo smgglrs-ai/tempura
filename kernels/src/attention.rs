@@ -438,6 +438,86 @@ pub fn attention_decode_heads(
     }
 }
 
+#[inline(always)]
+fn f16_to_f32(bits: u16) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("f16c") {
+            return unsafe {
+                use std::arch::x86_64::*;
+                let h = _mm_set1_epi16(bits as i16);
+                _mm_cvtss_f32(_mm_cvtph_ps(h))
+            };
+        }
+    }
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+    if exp == 0 { f32::from_bits(sign << 31) }
+    else if exp == 31 { f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13)) }
+    else { f32::from_bits((sign << 31) | ((exp + 112) << 23) | (frac << 13)) }
+}
+
+pub fn attention_decode_heads_f16kv(
+    q: &[f32],
+    k_f16: &[u16],
+    v_f16: &[u16],
+    output: &mut [f32],
+    scores: &mut [f32],
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    head_start: usize,
+    head_end: usize,
+) {
+    let heads_per_group = num_heads / num_kv_heads;
+
+    for h in head_start..head_end {
+        let kv_h = h / heads_per_group;
+        let q_offset = h * head_dim;
+        let q_vec = &q[q_offset..q_offset + head_dim];
+
+        let scores = &mut scores[..kv_len];
+        for kv_s in 0..kv_len {
+            let k_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                dot += q_vec[d] * f16_to_f32(k_f16[k_offset + d]);
+            }
+            scores[kv_s] = dot * scale;
+        }
+
+        let mut max_score = f32::NEG_INFINITY;
+        for &s in scores.iter() {
+            if s > max_score { max_score = s; }
+        }
+
+        let mut sum: f64 = 0.0;
+        for s in scores.iter_mut() {
+            let val = crate::portable_math::ggml_exp(*s - max_score);
+            sum += val as f64;
+            *s = val;
+        }
+
+        let inv_sum = (1.0 / sum) as f32;
+        for s in scores.iter_mut() {
+            *s *= inv_sum;
+        }
+
+        let o_offset = h * head_dim;
+        for d in 0..head_dim {
+            let mut val = 0.0f32;
+            for (kv_s, &score) in scores.iter().enumerate() {
+                let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim + d;
+                val += score * f16_to_f32(v_f16[v_offset]);
+            }
+            output[o_offset + d] = val;
+        }
+    }
+}
+
 /// Process a range of (head, position) work items for prefill attention.
 /// `item_start..item_end` indexes into `num_heads * seq_len` items where
 /// item = head * seq_len + position. Uses pre-allocated `scores` buffer.

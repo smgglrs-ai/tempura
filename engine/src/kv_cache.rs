@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
+#[cfg(target_arch = "x86_64")]
+use std::arch::is_x86_feature_detected;
 
 use crate::config::ModelConfig;
 use tempura_kernels::turboquant::{CompressedKV, KvCacheCompressor};
@@ -9,6 +11,9 @@ use tempura_kernels::turboquant::{CompressedKV, KvCacheCompressor};
 pub struct KvCache {
     pub k: Vec<Vec<f32>>,
     pub v: Vec<Vec<f32>>,
+    k_f16: Vec<Vec<u16>>,
+    v_f16: Vec<Vec<u16>>,
+    pub use_f16: bool,
     pub seq_len: usize,
     num_layers: usize,
     num_kv_heads: usize,
@@ -20,19 +25,70 @@ pub struct KvCache {
     compressed: bool,
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c")]
+unsafe fn f32_slice_to_f16(src: &[f32], dst: &mut [u16]) {
+    use std::arch::x86_64::*;
+    let n = src.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        let v = _mm256_loadu_ps(src.as_ptr().add(i));
+        let h = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, h);
+        i += 8;
+    }
+    while i < n {
+        let v = _mm_set_ss(src[i]);
+        let h = _mm_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+        dst[i] = _mm_extract_epi16(h, 0) as u16;
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c")]
+unsafe fn f16_slice_to_f32(src: &[u16], dst: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let n = src.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        let h = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
+        let v = _mm256_cvtph_ps(h);
+        _mm256_storeu_ps(dst.as_mut_ptr().add(i), v);
+        i += 8;
+    }
+    while i < n {
+        let h = _mm_set1_epi16(src[i] as i16);
+        let v = _mm_cvtph_ps(h);
+        dst[i] = _mm_cvtss_f32(v);
+        i += 1;
+    }
+}
+
 impl KvCache {
     pub fn new(config: &ModelConfig) -> Self {
         let layer_size = config.max_seq_len * config.num_kv_heads * config.head_dim;
+        let use_f16 = config.hidden_act == crate::config::HiddenAct::SquaredRelu
+            && is_x86_feature_detected!("f16c");
         let k: Vec<Vec<f32>> = (0..config.num_layers)
-            .map(|_| vec![0.0; layer_size])
+            .map(|_| if use_f16 { Vec::new() } else { vec![0.0; layer_size] })
             .collect();
         let v: Vec<Vec<f32>> = (0..config.num_layers)
-            .map(|_| vec![0.0; layer_size])
+            .map(|_| if use_f16 { Vec::new() } else { vec![0.0; layer_size] })
+            .collect();
+        let k_f16: Vec<Vec<u16>> = (0..config.num_layers)
+            .map(|_| if use_f16 { vec![0u16; layer_size] } else { Vec::new() })
+            .collect();
+        let v_f16: Vec<Vec<u16>> = (0..config.num_layers)
+            .map(|_| if use_f16 { vec![0u16; layer_size] } else { Vec::new() })
             .collect();
 
         Self {
             k,
             v,
+            k_f16,
+            v_f16,
+            use_f16,
             seq_len: 0,
             num_layers: config.num_layers,
             num_kv_heads: config.num_kv_heads,
@@ -56,6 +112,9 @@ impl KvCache {
         Self {
             k,
             v,
+            k_f16: Vec::new(),
+            v_f16: Vec::new(),
+            use_f16: false,
             seq_len: 0,
             num_layers: config.num_layers,
             num_kv_heads: config.num_kv_heads,
@@ -93,6 +152,13 @@ impl KvCache {
                 Some(compressor.compress(&combined_k, self.head_dim).unwrap());
             self.v_compressed[layer] =
                 Some(compressor.compress(&combined_v, self.head_dim).unwrap());
+        } else if self.use_f16 {
+            let dst_offset = self.seq_len * stride;
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                f32_slice_to_f16(&new_k[..src_len], &mut self.k_f16[layer][dst_offset..dst_offset + src_len]);
+                f32_slice_to_f16(&new_v[..src_len], &mut self.v_f16[layer][dst_offset..dst_offset + src_len]);
+            }
         } else {
             let dst_offset = self.seq_len * stride;
             self.k[layer][dst_offset..dst_offset + src_len].copy_from_slice(&new_k[..src_len]);
@@ -115,6 +181,16 @@ impl KvCache {
                 *c = None;
             }
         }
+    }
+
+    pub fn k_data_f16(&self, layer: usize, total_len: usize) -> &[u16] {
+        let len = total_len * self.num_kv_heads * self.head_dim;
+        &self.k_f16[layer][..len]
+    }
+
+    pub fn v_data_f16(&self, layer: usize, total_len: usize) -> &[u16] {
+        let len = total_len * self.num_kv_heads * self.head_dim;
+        &self.v_f16[layer][..len]
     }
 
     pub fn k_slice(&self, layer: usize) -> &[f32] {
@@ -144,6 +220,12 @@ impl KvCache {
                 }
                 None => Cow::Owned(vec![0.0f32; num_tokens * self.num_kv_heads * self.head_dim]),
             }
+        } else if self.use_f16 {
+            let len = num_tokens * self.num_kv_heads * self.head_dim;
+            let mut out = vec![0.0f32; len];
+            #[cfg(target_arch = "x86_64")]
+            unsafe { f16_slice_to_f32(&self.k_f16[layer][..len], &mut out); }
+            Cow::Owned(out)
         } else {
             let len = num_tokens * self.num_kv_heads * self.head_dim;
             Cow::Borrowed(&self.k[layer][..len])
@@ -159,6 +241,12 @@ impl KvCache {
                 }
                 None => Cow::Owned(vec![0.0f32; num_tokens * self.num_kv_heads * self.head_dim]),
             }
+        } else if self.use_f16 {
+            let len = num_tokens * self.num_kv_heads * self.head_dim;
+            let mut out = vec![0.0f32; len];
+            #[cfg(target_arch = "x86_64")]
+            unsafe { f16_slice_to_f32(&self.v_f16[layer][..len], &mut out); }
+            Cow::Owned(out)
         } else {
             let len = num_tokens * self.num_kv_heads * self.head_dim;
             Cow::Borrowed(&self.v[layer][..len])

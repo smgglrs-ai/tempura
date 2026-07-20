@@ -1703,11 +1703,19 @@ where
                         let hs = ith * n_heads / nth;
                         let he = (ith + 1) * n_heads / nth;
                         let scores_buf = unsafe { std::slice::from_raw_parts_mut(attn_scores_ptrs[ith] as *mut f32, kvl) };
-                        tempura_kernels::attention::attention_decode_heads(
-                            fs!(qp,q_dim), &sess.cache.k_data(layer,kvl), &sess.cache.v_data(layer,kvl),
-                            fsm!(ap,q_dim), scores_buf, kvl, n_heads, n_kv_heads, head_dim,
-                            1.0 / (head_dim as f32).sqrt(), hs, he,
-                        );
+                        if sess.cache.use_f16 {
+                            tempura_kernels::attention::attention_decode_heads_f16kv(
+                                fs!(qp,q_dim), sess.cache.k_data_f16(layer,kvl), sess.cache.v_data_f16(layer,kvl),
+                                fsm!(ap,q_dim), scores_buf, kvl, n_heads, n_kv_heads, head_dim,
+                                1.0 / (head_dim as f32).sqrt(), hs, he,
+                            );
+                        } else {
+                            tempura_kernels::attention::attention_decode_heads(
+                                fs!(qp,q_dim), &sess.cache.k_data(layer,kvl), &sess.cache.v_data(layer,kvl),
+                                fsm!(ap,q_dim), scores_buf, kvl, n_heads, n_kv_heads, head_dim,
+                                1.0 / (head_dim as f32).sqrt(), hs, he,
+                            );
+                        }
                     }
                     barrier.wait();
 
