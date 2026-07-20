@@ -1394,8 +1394,49 @@ pub fn i2s_gemv_cols(
     }
 }
 
-/// Multi-row I2S GEMV: processes 16 weight rows at a time, sharing activation loads.
-/// Translated from bitnet.cpp's ggml_vec_dot_i2_i8_s (blck_0=16).
+/// I2S GEMV inner kernel: compute one dot product of `count` 128-element blocks.
+/// Uses inline asm to guarantee the 32-iteration loop is fully unrolled.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn i2s_dot_block32(
+    w_ptr: *const u8,  // packed weights, 32 bytes per block
+    a_ptr: *const i8,  // i8 activations, 128 bytes per block
+    mask: std::arch::x86_64::__m256i,
+    ones: std::arch::x86_64::__m256i,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    let mut accu16 = _mm256_setzero_si256();
+    let mut px = w_ptr;
+    let mut py = a_ptr;
+    // Process 32 blocks of 128 elements each (= 4096 elements)
+    for _ in 0..32 {
+        let xq8 = _mm256_loadu_si256(px as *const __m256i);
+        let xq0 = _mm256_and_si256(_mm256_srli_epi16(xq8, 6), mask);
+        let xq1 = _mm256_and_si256(_mm256_srli_epi16(xq8, 4), mask);
+        let xq2 = _mm256_and_si256(_mm256_srli_epi16(xq8, 2), mask);
+        let xq3 = _mm256_and_si256(xq8, mask);
+
+        let y0 = _mm256_loadu_si256(py as *const __m256i);
+        let y1 = _mm256_loadu_si256(py.add(32) as *const __m256i);
+        let y2 = _mm256_loadu_si256(py.add(64) as *const __m256i);
+        let y3 = _mm256_loadu_si256(py.add(96) as *const __m256i);
+
+        let d0 = _mm256_maddubs_epi16(xq0, y0);
+        let d1 = _mm256_maddubs_epi16(xq1, y1);
+        let d2 = _mm256_maddubs_epi16(xq2, y2);
+        let d3 = _mm256_maddubs_epi16(xq3, y3);
+
+        accu16 = _mm256_add_epi16(accu16, _mm256_add_epi16(d0, d1));
+        accu16 = _mm256_add_epi16(accu16, _mm256_add_epi16(d2, d3));
+
+        px = px.add(32);
+        py = py.add(128);
+    }
+    _mm256_madd_epi16(accu16, ones)
+}
+
+/// Sequential-row I2S GEMV — one row at a time, activation in L1 cache.
+/// Inner 32-block kernel is #[inline(always)] to force unrolling.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn i2s_gemv_cols_multi_row(
@@ -1410,98 +1451,53 @@ unsafe fn i2s_gemv_cols_multi_row(
     k: usize,
 ) {
     use std::arch::x86_64::*;
-    const BLK: usize = 8;
     let row_packed_bytes = k / 4;
     let nb = k / 128;
-    let mask_2bit = _mm256_set1_epi8(0x03);
-    let ones_16 = _mm256_set1_epi16(1);
+    let mask = _mm256_set1_epi8(0x03);
+    let ones = _mm256_set1_epi16(1);
     let group32_num = nb / 32;
-    let remainder = nb % 32;
+    let la_num = nb % 32;
     let scale = w_scale / preq_scale;
 
-    let mut j = col_start;
-    while j + BLK <= col_end {
-        let mut acc = [_mm256_setzero_si256(); BLK];
+    for row in col_start..col_end {
+        let x_row = b_quantized.as_ptr().add(row * row_packed_bytes);
+        let y = preq_q8.as_ptr();
+        let mut acc = _mm256_setzero_si256();
 
-        for batch in 0..group32_num {
-            let mut accu16 = [_mm256_setzero_si256(); BLK];
-            let base = batch * 32;
-
-            for g in base..base + 32 {
-                let py = g * 128;
-                let a0 = _mm256_loadu_si256(preq_q8.as_ptr().add(py + 96) as *const __m256i);
-                let a1 = _mm256_loadu_si256(preq_q8.as_ptr().add(py + 64) as *const __m256i);
-                let a2 = _mm256_loadu_si256(preq_q8.as_ptr().add(py + 32) as *const __m256i);
-                let a3 = _mm256_loadu_si256(preq_q8.as_ptr().add(py) as *const __m256i);
-
-                for r in 0..BLK {
-                    let px = (j + r) * row_packed_bytes + g * 32;
-                    let w_raw = _mm256_loadu_si256(b_quantized.as_ptr().add(px) as *const __m256i);
-                    let w0 = _mm256_and_si256(w_raw, mask_2bit);
-                    let w1 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 2), mask_2bit);
-                    let w2 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 4), mask_2bit);
-                    let w3 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 6), mask_2bit);
-
-                    let p0 = _mm256_maddubs_epi16(w0, a0);
-                    let p1 = _mm256_maddubs_epi16(w1, a1);
-                    let p2 = _mm256_maddubs_epi16(w2, a2);
-                    let p3 = _mm256_maddubs_epi16(w3, a3);
-
-                    accu16[r] = _mm256_add_epi16(accu16[r], _mm256_add_epi16(p0, p1));
-                    accu16[r] = _mm256_add_epi16(accu16[r], _mm256_add_epi16(p2, p3));
-                }
-            }
-
-            for r in 0..BLK {
-                acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(accu16[r], ones_16));
-            }
+        for i in 0..group32_num {
+            acc = _mm256_add_epi32(acc, i2s_dot_block32(
+                x_row.add(i * 1024), y.add(i * 4096) as *const i8, mask, ones));
         }
 
-        if remainder > 0 {
-            let mut accu16 = [_mm256_setzero_si256(); BLK];
-            let base = group32_num * 32;
-            for g in base..base + remainder {
-                let py = g * 128;
-                let a0 = _mm256_loadu_si256(preq_q8.as_ptr().add(py + 96) as *const __m256i);
-                let a1 = _mm256_loadu_si256(preq_q8.as_ptr().add(py + 64) as *const __m256i);
-                let a2 = _mm256_loadu_si256(preq_q8.as_ptr().add(py + 32) as *const __m256i);
-                let a3 = _mm256_loadu_si256(preq_q8.as_ptr().add(py) as *const __m256i);
+        if la_num > 0 {
+            let px_base = x_row.add(group32_num * 1024);
+            let py_base = y.add(group32_num * 4096);
+            let mut accu16 = _mm256_setzero_si256();
+            for g in 0..la_num {
+                let xq8 = _mm256_loadu_si256(px_base.add(g * 32) as *const __m256i);
+                let xq0 = _mm256_and_si256(_mm256_srli_epi16(xq8, 6), mask);
+                let xq1 = _mm256_and_si256(_mm256_srli_epi16(xq8, 4), mask);
+                let xq2 = _mm256_and_si256(_mm256_srli_epi16(xq8, 2), mask);
+                let xq3 = _mm256_and_si256(xq8, mask);
 
-                for r in 0..BLK {
-                    let px = (j + r) * row_packed_bytes + g * 32;
-                    let w_raw = _mm256_loadu_si256(b_quantized.as_ptr().add(px) as *const __m256i);
-                    let w0 = _mm256_and_si256(w_raw, mask_2bit);
-                    let w1 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 2), mask_2bit);
-                    let w2 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 4), mask_2bit);
-                    let w3 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 6), mask_2bit);
+                let py = py_base.add(g * 128);
+                let y0 = _mm256_loadu_si256(py as *const __m256i);
+                let y1 = _mm256_loadu_si256(py.add(32) as *const __m256i);
+                let y2 = _mm256_loadu_si256(py.add(64) as *const __m256i);
+                let y3 = _mm256_loadu_si256(py.add(96) as *const __m256i);
 
-                    let p0 = _mm256_maddubs_epi16(w0, a0);
-                    let p1 = _mm256_maddubs_epi16(w1, a1);
-                    let p2 = _mm256_maddubs_epi16(w2, a2);
-                    let p3 = _mm256_maddubs_epi16(w3, a3);
+                let d0 = _mm256_maddubs_epi16(xq0, y0);
+                let d1 = _mm256_maddubs_epi16(xq1, y1);
+                let d2 = _mm256_maddubs_epi16(xq2, y2);
+                let d3 = _mm256_maddubs_epi16(xq3, y3);
 
-                    accu16[r] = _mm256_add_epi16(accu16[r], _mm256_add_epi16(p0, p1));
-                    accu16[r] = _mm256_add_epi16(accu16[r], _mm256_add_epi16(p2, p3));
-                }
+                accu16 = _mm256_add_epi16(accu16, _mm256_add_epi16(d0, d1));
+                accu16 = _mm256_add_epi16(accu16, _mm256_add_epi16(d2, d3));
             }
-            for r in 0..BLK {
-                acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(accu16[r], ones_16));
-            }
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(accu16, ones));
         }
 
-        for r in 0..BLK {
-            let raw = hsum_i32(acc[r]);
-            *(output_addr as *mut f32).add(j + r) = (raw - preq_sum) as f32 * scale;
-        }
-        j += BLK;
-    }
-
-    // Remaining rows (< 16)
-    while j < col_end {
-        let w = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
-        let raw = vec_dot_i2_i8_s_avx2(w, preq_q8, k);
-        *(output_addr as *mut f32).add(j) = (raw - preq_sum) as f32 * scale;
-        j += 1;
+        *(output_addr as *mut f32).add(row) = (hsum_i32(acc) - preq_sum) as f32 * scale;
     }
 }
 
