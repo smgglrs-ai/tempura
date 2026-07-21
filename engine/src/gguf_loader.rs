@@ -1026,6 +1026,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         deltanet_head_dim: None,
         ssm_a: None,
         dt_bias: None,
+        rope_dim: get_usize("rope.dimension_count"),
     })
 }
 
@@ -1195,7 +1196,8 @@ impl GgufLoader {
                 config.vocab_size = vs;
             }
         }
-        config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
+        config.use_qk_norm = (0..config.num_layers).any(|l|
+            tensors.contains_key(&format!("model.layers.{l}.self_attn.q_norm.weight")));
 
         {
             let all_names: Vec<String> = tensors.keys()
@@ -1346,7 +1348,8 @@ impl GgufLoader {
             }
         }
 
-        config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
+        config.use_qk_norm = (0..config.num_layers).any(|l|
+            tensors.contains_key(&format!("model.layers.{l}.self_attn.q_norm.weight")));
 
         detect_and_apply_hybrid_layers(
             &mut config,

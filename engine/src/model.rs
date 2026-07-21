@@ -1110,8 +1110,11 @@ where
                     qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..kv_dim], 1, kv_dim, h);
                 } else if has_q_gate {
                     qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q_gate_buf[..actual_q_cols], 1, actual_q_cols, h);
-                    // Split: first q_dim is Q, rest is gate
-                    q[..q_dim].copy_from_slice(&q_gate_buf[..q_dim]);
+                    // Interleaved layout: [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]
+                    for hh in 0..n_heads {
+                        let src = hh * head_dim * 2;
+                        q[hh * head_dim..(hh + 1) * head_dim].copy_from_slice(&q_gate_buf[src..src + head_dim]);
+                    }
                     qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..kv_dim], 1, kv_dim, h);
                     qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..kv_dim], 1, kv_dim, h);
                 } else {
@@ -1136,7 +1139,11 @@ where
                     q_gate_buf.resize(seq_len * actual_q_cols, 0.0);
                     qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q_gate_buf[..seq_len * actual_q_cols], seq_len, actual_q_cols, h);
                     for t in 0..seq_len {
-                        q[t * q_dim..(t + 1) * q_dim].copy_from_slice(&q_gate_buf[t * actual_q_cols..t * actual_q_cols + q_dim]);
+                        for hh in 0..n_heads {
+                            let src = t * actual_q_cols + hh * head_dim * 2;
+                            q[t * q_dim + hh * head_dim..t * q_dim + (hh + 1) * head_dim]
+                                .copy_from_slice(&q_gate_buf[src..src + head_dim]);
+                        }
                     }
                     qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..seq_len * kv_dim], seq_len, kv_dim, h);
                 } else {
@@ -1173,7 +1180,44 @@ where
             }
 
 
-            if let Some(ref rope_table) = det_rope {
+            let rope_hd = cfg.rope_dim.unwrap_or(head_dim);
+            if rope_hd < head_dim {
+                // Partial RoPE: only rotate first rope_hd dims per head
+                // Extract, apply RoPE, write back
+                let mut q_rope = vec![0.0f32; seq_len * n_heads * rope_hd];
+                let mut k_rope = vec![0.0f32; seq_len * n_kv_heads * rope_hd];
+                for t in 0..seq_len {
+                    for h in 0..n_heads {
+                        let src = t * q_dim + h * head_dim;
+                        let dst = t * n_heads * rope_hd + h * rope_hd;
+                        q_rope[dst..dst + rope_hd].copy_from_slice(&q[src..src + rope_hd]);
+                    }
+                    for h in 0..n_kv_heads {
+                        let src = t * kv_dim + h * head_dim;
+                        let dst = t * n_kv_heads * rope_hd + h * rope_hd;
+                        k_rope[dst..dst + rope_hd].copy_from_slice(&k[src..src + rope_hd]);
+                    }
+                }
+                if let Some(ref rope_table) = det_rope {
+                    rope_table.forward(&mut q_rope, 1, seq_len, n_heads, rope_hd, &positions, cfg.rope_theta).unwrap();
+                    rope_table.forward(&mut k_rope, 1, seq_len, n_kv_heads, rope_hd, &positions, cfg.rope_theta).unwrap();
+                } else {
+                    self.pipeline.rope(&mut q_rope, 1, seq_len, n_heads, rope_hd, &positions, cfg.rope_theta).unwrap();
+                    self.pipeline.rope(&mut k_rope, 1, seq_len, n_kv_heads, rope_hd, &positions, cfg.rope_theta).unwrap();
+                }
+                for t in 0..seq_len {
+                    for h in 0..n_heads {
+                        let dst = t * q_dim + h * head_dim;
+                        let src = t * n_heads * rope_hd + h * rope_hd;
+                        q[dst..dst + rope_hd].copy_from_slice(&q_rope[src..src + rope_hd]);
+                    }
+                    for h in 0..n_kv_heads {
+                        let dst = t * kv_dim + h * head_dim;
+                        let src = t * n_kv_heads * rope_hd + h * rope_hd;
+                        k[dst..dst + rope_hd].copy_from_slice(&k_rope[src..src + rope_hd]);
+                    }
+                }
+            } else if let Some(ref rope_table) = det_rope {
                 rope_table.forward(&mut q, 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
                 rope_table.forward(&mut k, 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
             } else {
@@ -1217,12 +1261,15 @@ where
 
 
             // Qwen3.5 softmax layers: sigmoid gate on attention output
+            // Gate is interleaved: q_gate_buf[h*2*hd + hd .. h*2*hd + 2*hd] per head
             if has_q_gate && !q_gate_buf.is_empty() {
                 for t in 0..seq_len {
-                    for i in 0..q_dim {
-                        let gate_val = q_gate_buf[t * actual_q_cols + q_dim + i];
-                        let sig = 1.0 / (1.0 + (-gate_val).exp());
-                        attn_out[t * q_dim + i] *= sig;
+                    for hh in 0..n_heads {
+                        for d in 0..head_dim {
+                            let gate_val = q_gate_buf[t * actual_q_cols + hh * head_dim * 2 + head_dim + d];
+                            let sig = 1.0 / (1.0 + (-gate_val).exp());
+                            attn_out[t * q_dim + hh * head_dim + d] *= sig;
+                        }
                     }
                 }
             }
@@ -5535,6 +5582,7 @@ mod tests {
             deltanet_head_dim: None,
             ssm_a: None,
             dt_bias: None,
+            rope_dim: None,
         };
 
         let q_dim = heads * head_dim;
@@ -5639,6 +5687,7 @@ mod tests {
             deltanet_head_dim: None,
             ssm_a: None,
             dt_bias: None,
+            rope_dim: None,
         };
 
         let q_dim = heads * head_dim;
