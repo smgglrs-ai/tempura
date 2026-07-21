@@ -894,6 +894,11 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         sliding_window: None,
         hidden_act,
         rope_type,
+        layer_kinds: None,
+        deltanet_num_heads: None,
+        deltanet_head_dim: None,
+        ssm_a: None,
+        dt_bias: None,
     })
 }
 

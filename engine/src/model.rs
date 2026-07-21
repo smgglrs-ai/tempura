@@ -5082,6 +5082,11 @@ mod tests {
             tensor_parallel_size: 1,
             use_qk_norm: false,
             sliding_window: None,
+            layer_kinds: None,
+            deltanet_num_heads: None,
+            deltanet_head_dim: None,
+            ssm_a: None,
+            dt_bias: None,
         };
 
         let q_dim = heads * head_dim;
@@ -5181,6 +5186,11 @@ mod tests {
             tensor_parallel_size: 1,
             use_qk_norm: false,
             sliding_window: None,
+            layer_kinds: None,
+            deltanet_num_heads: None,
+            deltanet_head_dim: None,
+            ssm_a: None,
+            dt_bias: None,
         };
 
         let q_dim = heads * head_dim;

@@ -580,3 +580,16 @@ pub trait VerifiedPrefixCache {
         self.num_entries() <= self.max_entries()
     }
 }
+
+pub trait VerifiedDeltaNetState {
+    fn num_layers(&self) -> usize;
+    fn num_heads(&self) -> usize;
+    fn head_dim(&self) -> usize;
+    fn state_size(&self) -> usize;
+
+    fn well_formed(&self) -> bool {
+        self.num_heads() >= 1
+            && self.head_dim() >= 1
+            && self.state_size() == self.num_heads() * self.head_dim() * self.head_dim()
+    }
+}

@@ -2,12 +2,14 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::config::ModelConfig;
+use crate::deltanet_state::DeltaNetState;
 use crate::kv_cache::{KvCache, PagedKvCache};
 use crate::trace::{InferenceTrace, TraceLevel};
 
 pub struct InferenceSession {
     pub cache: KvCache,
     pub paged_cache: Option<PagedKvCache>,
+    pub deltanet_state: Option<DeltaNetState>,
     pub trace: InferenceTrace,
     pub trace_level: TraceLevel,
     pub position: usize,
@@ -17,9 +19,15 @@ pub struct InferenceSession {
 
 impl InferenceSession {
     pub fn new(config: &ModelConfig, trace_level: TraceLevel, seed: u64) -> Self {
+        let deltanet_state = if config.num_deltanet_layers() > 0 {
+            Some(DeltaNetState::new(config))
+        } else {
+            None
+        };
         Self {
             cache: KvCache::new(config),
             paged_cache: None,
+            deltanet_state,
             trace: InferenceTrace::new(String::new(), trace_level, String::new(), seed),
             trace_level,
             position: 0,
@@ -35,9 +43,15 @@ impl InferenceSession {
         trace_level: TraceLevel,
         seed: u64,
     ) -> Self {
+        let deltanet_state = if config.num_deltanet_layers() > 0 {
+            Some(DeltaNetState::new(config))
+        } else {
+            None
+        };
         Self {
             cache: KvCache::new(config),
             paged_cache: Some(PagedKvCache::new(config, total_pages, block_size)),
+            deltanet_state,
             trace: InferenceTrace::new(String::new(), trace_level, String::new(), seed),
             trace_level,
             position: 0,
@@ -50,6 +64,7 @@ impl InferenceSession {
         Self {
             cache,
             paged_cache: None,
+            deltanet_state: None,
             trace: InferenceTrace::new(String::new(), trace_level, String::new(), seed),
             trace_level,
             position: 0,
@@ -70,6 +85,9 @@ impl InferenceSession {
         self.cache.reset();
         if let Some(ref mut paged) = self.paged_cache {
             paged.reset();
+        }
+        if let Some(ref mut dn) = self.deltanet_state {
+            dn.reset();
         }
         self.position = 0;
         self.rng = StdRng::seed_from_u64(self.seed);
@@ -108,6 +126,7 @@ impl InferenceSession {
         Self {
             cache,
             paged_cache: None,
+            deltanet_state: None,
             trace: InferenceTrace::new(String::new(), trace_level, String::new(), transfer.seed),
             trace_level,
             position: transfer.position,

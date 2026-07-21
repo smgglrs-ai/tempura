@@ -28,6 +28,11 @@ pub struct ModelConfig {
     pub sliding_window: Option<usize>,
     pub hidden_act: HiddenAct,
     pub rope_type: RopeType,
+    pub layer_kinds: Option<Vec<LayerKind>>,
+    pub deltanet_num_heads: Option<usize>,
+    pub deltanet_head_dim: Option<usize>,
+    pub ssm_a: Option<f32>,
+    pub dt_bias: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +62,12 @@ pub enum HiddenAct {
 pub enum RopeType {
     Neox,
     Norm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKind {
+    Attention,
+    DeltaNet,
 }
 
 impl QuantConfig {
@@ -107,6 +118,11 @@ impl ModelConfig {
             sliding_window: None,
             hidden_act: HiddenAct::SiluGate,
             rope_type: RopeType::Neox,
+            layer_kinds: None,
+            deltanet_num_heads: None,
+            deltanet_head_dim: None,
+            ssm_a: None,
+            dt_bias: None,
         }
     }
 
@@ -128,6 +144,11 @@ impl ModelConfig {
             sliding_window: None,
             hidden_act: HiddenAct::SiluGate,
             rope_type: RopeType::Neox,
+            layer_kinds: None,
+            deltanet_num_heads: None,
+            deltanet_head_dim: None,
+            ssm_a: None,
+            dt_bias: None,
         }
     }
 
@@ -149,6 +170,11 @@ impl ModelConfig {
             sliding_window: None,
             hidden_act: HiddenAct::SiluGate,
             rope_type: RopeType::Neox,
+            layer_kinds: None,
+            deltanet_num_heads: None,
+            deltanet_head_dim: None,
+            ssm_a: None,
+            dt_bias: None,
         }
     }
 
@@ -243,7 +269,46 @@ impl ModelConfig {
                 .map(|v| v as usize),
             hidden_act,
             rope_type,
+            layer_kinds: None,
+            deltanet_num_heads: None,
+            deltanet_head_dim: None,
+            ssm_a: None,
+            dt_bias: None,
         })
+    }
+
+    pub fn cache_layer_map(&self) -> Vec<Option<usize>> {
+        match &self.layer_kinds {
+            None => (0..self.num_layers).map(|i| Some(i)).collect(),
+            Some(kinds) => {
+                let mut cache_idx = 0;
+                kinds
+                    .iter()
+                    .map(|k| match k {
+                        LayerKind::Attention => {
+                            let idx = cache_idx;
+                            cache_idx += 1;
+                            Some(idx)
+                        }
+                        LayerKind::DeltaNet => None,
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    pub fn num_attention_layers(&self) -> usize {
+        match &self.layer_kinds {
+            None => self.num_layers,
+            Some(kinds) => kinds.iter().filter(|k| **k == LayerKind::Attention).count(),
+        }
+    }
+
+    pub fn num_deltanet_layers(&self) -> usize {
+        match &self.layer_kinds {
+            None => 0,
+            Some(kinds) => kinds.iter().filter(|k| **k == LayerKind::DeltaNet).count(),
+        }
     }
 }
 
