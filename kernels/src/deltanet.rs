@@ -34,9 +34,9 @@ impl CpuDeltaNet {
             let s_off = h * d2;
             let qkv_off = h * head_dim;
 
-            // 1. Decay
+            // 1. Decay — gate should already be negative, so decay < 1
             let gate = softplus(alpha[h]) * ssm_a;
-            let decay = gate.exp();
+            let decay = gate.exp().min(1.0);
             for i in 0..d2 {
                 state[s_off + i] *= decay;
             }

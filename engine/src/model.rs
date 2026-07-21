@@ -856,6 +856,9 @@ where
             ) = layer_names[layer];
 
             if layer_kind == crate::config::LayerKind::DeltaNet {
+                deltanet_layer_idx += 1;
+                // TEMPORARY: skip DeltaNet attention, only run FFN
+                // (testing if softmax layers + FFN produce coherent output)
                 let prefix = format!("model.layers.{layer}");
                 let dn_heads = cfg.deltanet_num_heads.unwrap_or(n_kv_heads);
                 let dn_head_dim = cfg.deltanet_head_dim.unwrap_or(head_dim);
@@ -941,33 +944,77 @@ where
                     qmm(None, &normed, &beta_name, &mut beta, seq_len, dn_heads, h);
                 }
 
+                // Apply dt_bias to alpha, then compute gate = softplus(alpha+dt_bias) * (-exp(A_log))
+                let a_log = qweights.get_f32(&format!("{prefix}.ssm.A_log"));
+                let dt_bias_w = qweights.get_f32(&format!("{prefix}.ssm.dt_proj.bias"));
+                for t in 0..seq_len {
+                    for h in 0..dn_heads {
+                        let idx = t * dn_heads + h;
+                        let dt_b = dt_bias_w.and_then(|b| b.get(h)).copied().unwrap_or(0.0);
+                        let a_val = a_log.and_then(|a| a.get(h)).copied().unwrap_or(0.0);
+                        // alpha becomes the pre-computed gate input for the kernel
+                        // kernel does: gate = softplus(alpha) * ssm_a
+                        // we want: gate = softplus(alpha_raw + dt_bias) * (-exp(A_log))
+                        // so pass alpha = alpha_raw + dt_bias, ssm_a = -exp(A_log)
+                        alpha[idx] += dt_b;
+                    }
+                }
+                let per_head_ssm_a: Vec<f32> = (0..dn_heads).map(|h| {
+                    let a_val = a_log.and_then(|a| a.get(h)).copied().unwrap_or(0.0);
+                    -a_val.exp()
+                }).collect();
+
+                // Conv1d on concatenated Q+K+V
+                let conv_dim = 2 * key_dim + dn_dim;
                 if let Some(conv_w) = qweights.get_f32(&format!("{prefix}.ssm.conv1d.weight")) {
-                    let kernel_size = conv_w.len() / (2 * dn_dim);
+                    let kernel_size = conv_w.len() / conv_dim;
                     let conv_bias = qweights.get_f32(&format!("{prefix}.ssm.conv1d.bias"));
-                    for ch in 0..dn_dim {
+                    let mut conv_input = vec![0.0f32; seq_len * conv_dim];
+                    for t in 0..seq_len {
+                        let n_k_h = key_dim / dn_head_dim;
+                        for vh in 0..dn_heads {
+                            let kh = vh * n_k_h / dn_heads;
+                            for d in 0..dn_head_dim {
+                                conv_input[t * conv_dim + kh * dn_head_dim + d] = q_dn[t * dn_dim + vh * dn_head_dim + d];
+                                conv_input[t * conv_dim + key_dim + kh * dn_head_dim + d] = k_dn[t * dn_dim + vh * dn_head_dim + d];
+                            }
+                        }
+                        conv_input[t * conv_dim + 2 * key_dim..t * conv_dim + 2 * key_dim + dn_dim]
+                            .copy_from_slice(&v_dn[t * dn_dim..(t + 1) * dn_dim]);
+                    }
+                    let mut conv_out = vec![0.0f32; seq_len * conv_dim];
+                    for ch in 0..conv_dim {
                         for t in 0..seq_len {
-                            let mut sq = 0.0f32;
-                            let mut sk = 0.0f32;
+                            let mut s = 0.0f32;
                             for ki in 0..kernel_size {
                                 let src_t = t as isize - ki as isize;
                                 if src_t >= 0 {
-                                    sq += q_dn[src_t as usize * dn_dim + ch] * conv_w[ch * kernel_size + ki];
-                                    sk += k_dn[src_t as usize * dn_dim + ch] * conv_w[(dn_dim + ch) * kernel_size + ki];
+                                    s += conv_input[src_t as usize * conv_dim + ch] * conv_w[ch * kernel_size + ki];
                                 }
                             }
                             if let Some(bias) = conv_bias {
-                                sq += bias[ch];
-                                sk += bias[dn_dim + ch];
+                                if ch < bias.len() { s += bias[ch]; }
                             }
-                            q_dn[t * dn_dim + ch] = sq;
-                            k_dn[t * dn_dim + ch] = sk;
+                            conv_out[t * conv_dim + ch] = s;
                         }
+                    }
+                    // SiLU on entire conv output
+                    for x in conv_out.iter_mut() { *x = *x / (1.0 + (-*x).exp()); }
+                    // Split back to Q, K, V and expand K heads
+                    for t in 0..seq_len {
+                        let src = &conv_out[t * conv_dim..];
+                        for vh in 0..dn_heads {
+                            let kh = vh * (key_dim / dn_head_dim) / dn_heads;
+                            q_dn[t * dn_dim + vh * dn_head_dim..t * dn_dim + (vh + 1) * dn_head_dim]
+                                .copy_from_slice(&src[kh * dn_head_dim..(kh + 1) * dn_head_dim]);
+                            k_dn[t * dn_dim + vh * dn_head_dim..t * dn_dim + (vh + 1) * dn_head_dim]
+                                .copy_from_slice(&src[key_dim + kh * dn_head_dim..key_dim + (kh + 1) * dn_head_dim]);
+                        }
+                        v_dn[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[2 * key_dim..2 * key_dim + dn_dim]);
                     }
                 }
 
-                for x in q_dn.iter_mut() { *x = *x / (1.0 + (-*x).exp()); }
-                for x in k_dn.iter_mut() { *x = *x / (1.0 + (-*x).exp()); }
-
+                // L2 normalize Q and K per head
                 for t in 0..seq_len {
                     for hd in 0..dn_heads {
                         let off = t * dn_dim + hd * dn_head_dim;
@@ -982,10 +1029,30 @@ where
                 let state = dn_state.state_mut(deltanet_layer_idx);
                 let mut dn_out = vec![0.0f32; seq_len * dn_dim];
                 let dk = tempura_kernels::deltanet::CpuDeltaNet;
+                // Pre-bake per-head ssm_a into alpha: the kernel computes
+                // gate = softplus(alpha) * ssm_a, but we need per-head ssm_a.
+                // Multiply alpha by per_head_ssm_a[h] before passing, then use ssm_a=1.0
+                // This works because softplus is applied to alpha first, then multiplied.
+                // Actually: we need gate = softplus(alpha+dt_bias) * (-exp(A_log_h))
+                // We already added dt_bias to alpha above. Now pre-multiply:
+                // Set alpha[h] such that softplus(alpha[h]) * 1.0 = softplus(old_alpha[h]) * per_head_ssm_a[h]
+                // → alpha[h] = softplus_inv(softplus(old_alpha[h]) * per_head_ssm_a[h])
+                // Use ln(exp(x)-1) for softplus_inv, but avoid numerical issues
+                for t in 0..seq_len {
+                    for h in 0..dn_heads {
+                        let idx = t * dn_heads + h;
+                        let sp = (1.0f32 + alpha[idx].exp()).ln(); // softplus(alpha+dt_bias)
+                        let gate = sp * per_head_ssm_a[h]; // this is the true gate value (negative)
+                        // We want decay = exp(gate). The kernel computes exp(softplus(alpha)*ssm_a).
+                        // Set alpha so softplus(alpha)*1.0 = gate → alpha = softplus_inv(gate)
+                        // softplus_inv(x) = ln(exp(x) - 1). For x < -15, softplus_inv ≈ x.
+                        alpha[idx] = if gate > 15.0 { gate } else { (gate.exp() - 1.0).max(1e-30).ln() };
+                    }
+                }
                 if seq_len == 1 {
-                    dk.forward_recurrent(&q_dn, &k_dn, &v_dn, &alpha, &beta, state, &mut dn_out, dn_heads, dn_head_dim, ssm_a_val).unwrap();
+                    dk.forward_recurrent(&q_dn, &k_dn, &v_dn, &alpha, &beta, state, &mut dn_out, dn_heads, dn_head_dim, 1.0).unwrap();
                 } else {
-                    dk.forward_chunk(&q_dn, &k_dn, &v_dn, &alpha, &beta, state, &mut dn_out, seq_len, dn_heads, dn_head_dim, ssm_a_val).unwrap();
+                    dk.forward_chunk(&q_dn, &k_dn, &v_dn, &alpha, &beta, state, &mut dn_out, seq_len, dn_heads, dn_head_dim, 1.0).unwrap();
                 }
 
                 if let Some(norm_w) = qweights.get_f32(&format!("{prefix}.ssm.norm.weight")) {
