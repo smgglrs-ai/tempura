@@ -243,11 +243,13 @@ where
                 let mut q = vec![0.0f32; seq_len * dn_dim];
                 let mut k = vec![0.0f32; seq_len * dn_dim];
                 let mut v = vec![0.0f32; seq_len * dn_dim];
+                let mut z_gate = vec![0.0f32; seq_len * dn_dim];
                 let mut alpha = vec![0.0f32; seq_len * dn_heads];
                 let mut beta = vec![0.0f32; seq_len * dn_heads];
 
+                // in_proj: hidden → [Q, K, V, Z] where Z is output gating
                 if let Some(in_w) = weights.get(&format!("{prefix}.ssm.in_proj.weight")) {
-                    let in_cols = 3 * dn_dim + 2 * dn_heads;
+                    let in_cols = 4 * dn_dim;
                     let mut in_proj = vec![0.0f32; seq_len * in_cols];
                     self.pipeline
                         .matmul_bt(&normed, in_w, &mut in_proj, seq_len, in_cols, h)
@@ -258,10 +260,7 @@ where
                         q[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[..dn_dim]);
                         k[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[dn_dim..2 * dn_dim]);
                         v[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[2 * dn_dim..3 * dn_dim]);
-                        alpha[t * dn_heads..(t + 1) * dn_heads]
-                            .copy_from_slice(&src[3 * dn_dim..3 * dn_dim + dn_heads]);
-                        beta[t * dn_heads..(t + 1) * dn_heads]
-                            .copy_from_slice(&src[3 * dn_dim + dn_heads..]);
+                        z_gate[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[3 * dn_dim..4 * dn_dim]);
                     }
                 } else {
                     let q_w = weights.get(&format!("{prefix}.self_attn.q_proj.weight")).unwrap();
@@ -272,7 +271,55 @@ where
                     self.pipeline.matmul_bt(&normed, v_w, &mut v, seq_len, dn_dim, h).unwrap();
                 }
 
-                // L2 normalize Q and K per head for training stability
+                // beta_alpha projection (Qwen3.6 combined, or separate Qwen3.5)
+                if let Some(ba_w) = weights.get(&format!("{prefix}.ssm.beta_alpha.weight")) {
+                    let ba_cols = 2 * dn_heads;
+                    let mut ba_proj = vec![0.0f32; seq_len * ba_cols];
+                    self.pipeline
+                        .matmul_bt(&normed, ba_w, &mut ba_proj, seq_len, ba_cols, h)
+                        .unwrap();
+                    for t in 0..seq_len {
+                        let src = &ba_proj[t * ba_cols..];
+                        beta[t * dn_heads..(t + 1) * dn_heads].copy_from_slice(&src[..dn_heads]);
+                        alpha[t * dn_heads..(t + 1) * dn_heads].copy_from_slice(&src[dn_heads..]);
+                    }
+                }
+
+                // Short causal conv1d on Q and K (kernel_size typically 4)
+                if let Some(conv_w) = weights.get(&format!("{prefix}.ssm.conv1d.weight")) {
+                    let kernel_size = conv_w.len() / (2 * dn_dim);
+                    let conv_bias = weights.get(&format!("{prefix}.ssm.conv1d.bias"));
+                    // conv_w layout: [2*dn_dim, kernel_size] (depthwise, Q and K channels)
+                    for ch in 0..dn_dim {
+                        for t in 0..seq_len {
+                            let mut sum_q = 0.0f32;
+                            let mut sum_k = 0.0f32;
+                            for ki in 0..kernel_size {
+                                let src_t = t as isize - ki as isize;
+                                if src_t >= 0 {
+                                    sum_q += q[src_t as usize * dn_dim + ch] * conv_w[ch * kernel_size + ki];
+                                    sum_k += k[src_t as usize * dn_dim + ch] * conv_w[(dn_dim + ch) * kernel_size + ki];
+                                }
+                            }
+                            if let Some(bias) = conv_bias {
+                                sum_q += bias[ch];
+                                sum_k += bias[dn_dim + ch];
+                            }
+                            q[t * dn_dim + ch] = sum_q;
+                            k[t * dn_dim + ch] = sum_k;
+                        }
+                    }
+                }
+
+                // SiLU activation on Q and K
+                for x in q.iter_mut() {
+                    *x = *x / (1.0 + (-*x).exp());
+                }
+                for x in k.iter_mut() {
+                    *x = *x / (1.0 + (-*x).exp());
+                }
+
+                // L2 normalize Q and K per head
                 for t in 0..seq_len {
                     for hd in 0..dn_heads {
                         let off = t * dn_dim + hd * dn_head_dim;
@@ -286,7 +333,23 @@ where
                     }
                 }
 
-                if let Some(ref bias) = cfg.dt_bias {
+                // dt_proj for alpha gate refinement
+                if let Some(dt_w) = weights.get(&format!("{prefix}.ssm.dt_proj.weight")) {
+                    let mut dt_proj = vec![0.0f32; seq_len * dn_heads];
+                    self.pipeline
+                        .matmul_bt(&normed, dt_w, &mut dt_proj, seq_len, dn_heads, h)
+                        .unwrap();
+                    if let Some(dt_b) = weights.get(&format!("{prefix}.ssm.dt_proj.bias")) {
+                        for t in 0..seq_len {
+                            for hd in 0..dn_heads {
+                                dt_proj[t * dn_heads + hd] += dt_b[hd];
+                            }
+                        }
+                    }
+                    for i in 0..alpha.len() {
+                        alpha[i] += dt_proj[i];
+                    }
+                } else if let Some(ref bias) = cfg.dt_bias {
                     for t in 0..seq_len {
                         for hd in 0..dn_heads {
                             alpha[t * dn_heads + hd] += bias[hd];
@@ -294,6 +357,7 @@ where
                     }
                 }
 
+                // Delta rule recurrence
                 let dn_state = session.deltanet_state.as_mut().unwrap();
                 let state = dn_state.state_mut(deltanet_layer_idx);
                 let mut dn_out = vec![0.0f32; seq_len * dn_dim];
@@ -309,6 +373,22 @@ where
                         .unwrap();
                 }
 
+                // ssm_norm (RMSNorm on recurrence output)
+                if let Some(norm_w) = weights.get(&format!("{prefix}.ssm.norm.weight")) {
+                    self.pipeline
+                        .rmsnorm(&mut dn_out, norm_w, dn_dim, cfg.layer_norm_eps, TraceLevel::Off, &mut None)
+                        .unwrap();
+                }
+
+                // Output gating: dn_out *= silu(z_gate)
+                if weights.get(&format!("{prefix}.ssm.in_proj.weight")).is_some() {
+                    for i in 0..dn_out.len() {
+                        let z_silu = z_gate[i] / (1.0 + (-z_gate[i]).exp());
+                        dn_out[i] *= z_silu;
+                    }
+                }
+
+                // Output projection
                 let mut o_proj = vec![0.0f32; seq_len * h];
                 if let Some(out_w) = weights.get(&format!("{prefix}.ssm.out_proj.weight")) {
                     self.pipeline
@@ -5447,9 +5527,13 @@ mod tests {
             if config.layer_kinds.as_ref().unwrap()[i] == LayerKind::DeltaNet {
                 let dn_dim = config.num_kv_heads * config.head_dim;
                 let dn_heads = config.num_kv_heads;
-                let in_cols = 3 * dn_dim + 2 * dn_heads;
-                loader_tensors.insert(format!("{prefix}.ssm.in_proj.weight"), rand_vec(in_cols * h));
+                let kernel_size = 4;
+                loader_tensors.insert(format!("{prefix}.ssm.in_proj.weight"), rand_vec(4 * dn_dim * h));
                 loader_tensors.insert(format!("{prefix}.ssm.out_proj.weight"), rand_vec(h * dn_dim));
+                loader_tensors.insert(format!("{prefix}.ssm.beta_alpha.weight"), rand_vec(2 * dn_heads * h));
+                loader_tensors.insert(format!("{prefix}.ssm.conv1d.weight"), rand_vec(2 * dn_dim * kernel_size));
+                loader_tensors.insert(format!("{prefix}.ssm.conv1d.bias"), rand_vec(2 * dn_dim));
+                loader_tensors.insert(format!("{prefix}.ssm.norm.weight"), vec![1.0; dn_dim]);
             }
         }
 
