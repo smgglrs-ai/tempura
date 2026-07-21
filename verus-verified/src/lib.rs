@@ -70,6 +70,8 @@ pub mod gpu_quantized_gemm;
 pub mod bitnet_forward;
 pub mod i2s_bitnet;
 pub mod i2s_vec_dot;
+pub mod i2s_multi_row;
+pub mod f16_kv_cache;
 pub mod kv_rollback;
 pub mod tq2_block;
 pub mod layer_graph;
