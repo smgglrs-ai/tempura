@@ -796,6 +796,9 @@ where
             } else if let Some(w) = qweights.get_q6k(name) {
                 q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k)
                     .unwrap();
+            } else if let Some(w) = qweights.get_q2(name) {
+                let dequant = crate::gguf_loader::dequant_q2_0_pub(w, n * k);
+                self.pipeline.matmul_bt(a_f32, &dequant, out, m, n, k).unwrap();
             } else {
                 let w = qweights.get_f32(name).unwrap();
                 self.pipeline.matmul_bt(a_f32, w, out, m, n, k).unwrap();
@@ -954,7 +957,12 @@ where
                 }
 
                 if let Some(norm_w) = qweights.get_f32(&format!("{prefix}.ssm.norm.weight")) {
-                    self.pipeline.rmsnorm(&mut dn_out, norm_w, dn_dim, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+                    for t in 0..seq_len {
+                        for head in 0..dn_heads {
+                            let off = t * dn_dim + head * dn_head_dim;
+                            self.pipeline.rmsnorm(&mut dn_out[off..off + dn_head_dim], norm_w, dn_head_dim, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+                        }
+                    }
                 }
 
                 if qweights.get_f32(&format!("{prefix}.ssm.in_proj.weight")).is_some() {
@@ -1365,6 +1373,9 @@ where
                 .unwrap();
         } else if let Some(w) = qweights.get_f16(lm_head_name) {
             tempura_kernels::f16_gemv::f16_gemv(last_hidden, w, &mut logits, cfg.vocab_size, h);
+        } else if let Some(w) = qweights.get_q2(lm_head_name) {
+            let dequant = crate::gguf_loader::dequant_q2_0_pub(w, cfg.vocab_size * h);
+            self.pipeline.matmul_bt(last_hidden, &dequant, &mut logits, 1, cfg.vocab_size, h).unwrap();
         } else {
             let w = qweights.get_f32(lm_head_name).unwrap();
             self.pipeline

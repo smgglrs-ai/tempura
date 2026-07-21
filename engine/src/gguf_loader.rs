@@ -45,7 +45,7 @@ pub enum GgmlType {
     TQ2_0 = 37,
     TL1 = 38,    // bitnet.cpp: ARM TL1 LUT format
     TL2 = 39,    // bitnet.cpp: x86 TL2 LUT format (tiled nibble+sign)
-    Q2_0 = 142,  // PrismML: 2-bit ternary, group size 128, f16 scale
+    Q2_0 = 42,   // PrismML: 2-bit ternary, group size 128, f16 scale
 }
 
 impl GgmlType {
@@ -68,7 +68,7 @@ impl GgmlType {
             37 => Ok(GgmlType::TQ2_0),
             38 => Ok(GgmlType::TL1),
             39 => Ok(GgmlType::TL2),
-            142 => Ok(GgmlType::Q2_0),
+            42 => Ok(GgmlType::Q2_0),
             _ => Err(LoadError::GgufParse(format!("unsupported GGML type: {v}"))),
         }
     }
@@ -616,6 +616,10 @@ fn dequant_q5k(data: &[u8], num_elements: usize) -> Vec<f32> {
     output
 }
 
+pub fn dequant_q2_0_pub(data: &[u8], num_elements: usize) -> Vec<f32> {
+    dequant_q2_0(data, num_elements)
+}
+
 fn dequant_q2_0(data: &[u8], num_elements: usize) -> Vec<f32> {
     let group_size = 128;
     let block_bytes = 34; // 32 bytes packed + 2 bytes f16 scale
@@ -735,6 +739,7 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "ffn_down.weight" => "mlp.down_proj.weight",
             "ffn_sub_norm.weight" => "mlp.ffn_sub_norm.weight",
             "attn_sub_norm.weight" => "self_attn.attn_sub_norm.weight",
+            "post_attention_norm.weight" => "post_attention_layernorm.weight",
             "attn_qkv.weight" => "ssm.qkv_proj.weight",
             "attn_gate.weight" => "ssm.gate_proj.weight",
             "ssm_in.weight" => "ssm.in_proj.weight",
@@ -862,17 +867,25 @@ fn detect_and_apply_hybrid_layers(
         }
         config.layer_kinds = Some(kinds);
     } else {
-        // Fallback: scan tensor names for ssm_alpha (DeltaNet marker)
-        let has_ssm = tensor_names.iter().any(|n| n.contains("ssm_alpha") || n.contains("ssm.alpha"));
+        // Fallback: scan tensor names for DeltaNet markers (ssm_alpha, ssm_ba, ssm_beta_alpha)
+        let has_ssm = tensor_names.iter().any(|n|
+            n.contains("ssm_alpha") || n.contains("ssm.alpha")
+            || n.contains("ssm_ba") || n.contains("ssm.beta_alpha")
+            || n.contains("ssm_beta_alpha"));
         if !has_ssm {
             return;
         }
 
         let mut kinds = Vec::with_capacity(config.num_layers);
         for layer in 0..config.num_layers {
-            let ssm_key = format!("blk.{layer}.ssm_alpha.weight");
-            let ssm_key_hf = format!("model.layers.{layer}.ssm.alpha.weight");
-            let has_ssm_layer = tensor_names.iter().any(|n| *n == ssm_key || *n == ssm_key_hf);
+            let markers = [
+                format!("blk.{layer}.ssm_alpha.weight"),
+                format!("blk.{layer}.ssm_ba.weight"),
+                format!("blk.{layer}.ssm_beta_alpha.weight"),
+                format!("model.layers.{layer}.ssm.alpha.weight"),
+                format!("model.layers.{layer}.ssm.beta_alpha.weight"),
+            ];
+            let has_ssm_layer = tensor_names.iter().any(|n| markers.iter().any(|m| n == m));
 
             if has_ssm_layer {
                 kinds.push(LayerKind::DeltaNet);
