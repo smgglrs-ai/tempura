@@ -25,6 +25,7 @@ use vstd::prelude::*;
 // Indexing arithmetic proofs (mirror Kani harnesses)
 pub mod attention;
 pub mod disaggregated;
+pub mod ggml_quants;
 pub mod gguf;
 pub mod kv_cache;
 pub mod layernorm;
@@ -88,6 +89,7 @@ pub mod quantized_forward;
 pub mod rope_frequency;
 pub mod tensor_parallel;
 pub mod trace_diff;
+pub mod activations_moe;
+pub mod deltanet;
+pub mod sampling_chain;
 pub mod weight_shapes;
-pub mod tl2_lut;
-pub mod f16_gemv;

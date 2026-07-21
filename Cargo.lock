@@ -656,6 +656,7 @@ dependencies = [
  "half",
  "libnvvm-sys",
  "nvjitlink-sys",
+ "sha2",
  "thiserror 2.0.18",
 ]
 

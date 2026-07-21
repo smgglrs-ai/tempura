@@ -140,18 +140,18 @@ impl KvCache {
             let new_k_data = &new_k[..src_len];
             let new_v_data = &new_v[..src_len];
 
-            let existing_k = self.k_data_for_len(layer, self.seq_len);
-            let existing_v = self.v_data_for_len(layer, self.seq_len);
-
-            let mut combined_k = existing_k.into_owned();
-            combined_k.extend_from_slice(new_k_data);
-            let mut combined_v = existing_v.into_owned();
-            combined_v.extend_from_slice(new_v_data);
-
-            self.k_compressed[layer] =
-                Some(compressor.compress(&combined_k, self.head_dim).unwrap());
-            self.v_compressed[layer] =
-                Some(compressor.compress(&combined_v, self.head_dim).unwrap());
+            if let Some(ref mut existing) = self.k_compressed[layer] {
+                compressor.compress_append(existing, new_k_data).unwrap();
+            } else {
+                self.k_compressed[layer] =
+                    Some(compressor.compress(new_k_data, self.head_dim).unwrap());
+            }
+            if let Some(ref mut existing) = self.v_compressed[layer] {
+                compressor.compress_append(existing, new_v_data).unwrap();
+            } else {
+                self.v_compressed[layer] =
+                    Some(compressor.compress(new_v_data, self.head_dim).unwrap());
+            }
         } else if self.use_f16 {
             let dst_offset = self.seq_len * stride;
             #[cfg(target_arch = "x86_64")]

@@ -330,6 +330,13 @@ impl CompressedKV {
 pub trait KvCacheCompressor: Send + Sync {
     fn compress(&self, data: &[f32], head_dim: usize) -> Result<CompressedKV>;
     fn decompress(&self, compressed: &CompressedKV) -> Result<Vec<f32>>;
+
+    fn compress_append(&self, existing: &mut CompressedKV, new_data: &[f32]) -> Result<()> {
+        let mut all_data = self.decompress(existing)?;
+        all_data.extend_from_slice(new_data);
+        *existing = self.compress(&all_data, existing.head_dim)?;
+        Ok(())
+    }
 }
 
 // ── MatMulQ (quantized) ─────────────────────────────────────────────────────
@@ -462,6 +469,45 @@ pub trait GuidedDecoder: Send {
 
     fn forced_tokens(&self) -> Option<Vec<u32>> {
         None
+    }
+}
+
+// ── DeltaNet (Gated Delta Rule) ────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+pub trait DeltaNet: Send + Sync {
+    fn forward_recurrent(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        alpha: &[f32],
+        beta: &[f32],
+        state: &mut [f32],
+        output: &mut [f32],
+        num_heads: usize,
+        head_dim: usize,
+        ssm_a: f32,
+    ) -> Result<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_chunk(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        alpha: &[f32],
+        beta: &[f32],
+        state: &mut [f32],
+        output: &mut [f32],
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        ssm_a: f32,
+    ) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
     }
 }
 
