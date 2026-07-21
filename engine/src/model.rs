@@ -825,15 +825,12 @@ where
             .collect();
 
         let cache_layer_map_q = cfg.cache_layer_map();
+        let mut deltanet_layer_idx = 0usize;
 
         for layer in 0..cfg.num_layers {
             let layer_kind = cfg.layer_kinds.as_ref()
                 .map(|kinds| kinds[layer])
                 .unwrap_or(crate::config::LayerKind::Attention);
-
-            if layer_kind == crate::config::LayerKind::DeltaNet {
-                continue;
-            }
 
             let (
                 ref input_ln_name,
@@ -850,6 +847,135 @@ where
                 ref attn_sub_norm_name,
                 ref ffn_sub_norm_name,
             ) = layer_names[layer];
+
+            if layer_kind == crate::config::LayerKind::DeltaNet {
+                let prefix = format!("model.layers.{layer}");
+                let dn_heads = cfg.deltanet_num_heads.unwrap_or(n_kv_heads);
+                let dn_head_dim = cfg.deltanet_head_dim.unwrap_or(head_dim);
+                let dn_dim = dn_heads * dn_head_dim;
+                let ssm_a_val = cfg.ssm_a.unwrap_or(-1.0);
+
+                normed.copy_from_slice(&hidden);
+                let input_ln_w = qweights.get_f32(input_ln_name).unwrap();
+                if let Some(ref drn) = det_rmsnorm {
+                    drn.forward(&mut normed, input_ln_w, h, cfg.layer_norm_eps).unwrap();
+                } else {
+                    self.pipeline.rmsnorm(&mut normed, input_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+                }
+
+                let mm = tempura_kernels::matmul::CpuMatMul;
+                let mut q_dn = vec![0.0f32; seq_len * dn_dim];
+                let mut k_dn = vec![0.0f32; seq_len * dn_dim];
+                let mut v_dn = vec![0.0f32; seq_len * dn_dim];
+                let mut z_gate = vec![0.0f32; seq_len * dn_dim];
+                let mut alpha = vec![0.0f32; seq_len * dn_heads];
+                let mut beta = vec![0.0f32; seq_len * dn_heads];
+
+                // SSM weights are kept at f32/f16 in quantized GGUFs
+                if let Some(in_w) = qweights.get_f32(&format!("{prefix}.ssm.in_proj.weight")) {
+                    let in_cols = 4 * dn_dim;
+                    let mut in_proj = vec![0.0f32; seq_len * in_cols];
+                    mm.forward_b_transposed(&normed, in_w, &mut in_proj, seq_len, in_cols, h).unwrap();
+                    for t in 0..seq_len {
+                        let src = &in_proj[t * in_cols..];
+                        q_dn[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[..dn_dim]);
+                        k_dn[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[dn_dim..2 * dn_dim]);
+                        v_dn[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[2 * dn_dim..3 * dn_dim]);
+                        z_gate[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[3 * dn_dim..4 * dn_dim]);
+                    }
+                } else {
+                    if let Some(w) = qweights.get_f32(q_w_name) {
+                        mm.forward_b_transposed(&normed, w, &mut q_dn, seq_len, dn_dim, h).unwrap();
+                    }
+                    if let Some(w) = qweights.get_f32(k_w_name) {
+                        mm.forward_b_transposed(&normed, w, &mut k_dn, seq_len, dn_dim, h).unwrap();
+                    }
+                    if let Some(w) = qweights.get_f32(v_w_name) {
+                        mm.forward_b_transposed(&normed, w, &mut v_dn, seq_len, dn_dim, h).unwrap();
+                    }
+                }
+
+                if let Some(ba_w) = qweights.get_f32(&format!("{prefix}.ssm.beta_alpha.weight")) {
+                    let ba_cols = 2 * dn_heads;
+                    let mut ba_proj = vec![0.0f32; seq_len * ba_cols];
+                    mm.forward_b_transposed(&normed, ba_w, &mut ba_proj, seq_len, ba_cols, h).unwrap();
+                    for t in 0..seq_len {
+                        let src = &ba_proj[t * ba_cols..];
+                        beta[t * dn_heads..(t + 1) * dn_heads].copy_from_slice(&src[..dn_heads]);
+                        alpha[t * dn_heads..(t + 1) * dn_heads].copy_from_slice(&src[dn_heads..]);
+                    }
+                }
+
+                if let Some(conv_w) = qweights.get_f32(&format!("{prefix}.ssm.conv1d.weight")) {
+                    let kernel_size = conv_w.len() / (2 * dn_dim);
+                    let conv_bias = qweights.get_f32(&format!("{prefix}.ssm.conv1d.bias"));
+                    for ch in 0..dn_dim {
+                        for t in 0..seq_len {
+                            let mut sq = 0.0f32;
+                            let mut sk = 0.0f32;
+                            for ki in 0..kernel_size {
+                                let src_t = t as isize - ki as isize;
+                                if src_t >= 0 {
+                                    sq += q_dn[src_t as usize * dn_dim + ch] * conv_w[ch * kernel_size + ki];
+                                    sk += k_dn[src_t as usize * dn_dim + ch] * conv_w[(dn_dim + ch) * kernel_size + ki];
+                                }
+                            }
+                            if let Some(bias) = conv_bias {
+                                sq += bias[ch];
+                                sk += bias[dn_dim + ch];
+                            }
+                            q_dn[t * dn_dim + ch] = sq;
+                            k_dn[t * dn_dim + ch] = sk;
+                        }
+                    }
+                }
+
+                for x in q_dn.iter_mut() { *x = *x / (1.0 + (-*x).exp()); }
+                for x in k_dn.iter_mut() { *x = *x / (1.0 + (-*x).exp()); }
+
+                for t in 0..seq_len {
+                    for hd in 0..dn_heads {
+                        let off = t * dn_dim + hd * dn_head_dim;
+                        let norm: f32 = q_dn[off..off + dn_head_dim].iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                        q_dn[off..off + dn_head_dim].iter_mut().for_each(|x| *x /= norm);
+                        let norm: f32 = k_dn[off..off + dn_head_dim].iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                        k_dn[off..off + dn_head_dim].iter_mut().for_each(|x| *x /= norm);
+                    }
+                }
+
+                let dn_state = session.deltanet_state.as_mut().unwrap();
+                let state = dn_state.state_mut(deltanet_layer_idx);
+                let mut dn_out = vec![0.0f32; seq_len * dn_dim];
+                let dk = tempura_kernels::deltanet::CpuDeltaNet;
+                if seq_len == 1 {
+                    dk.forward_recurrent(&q_dn, &k_dn, &v_dn, &alpha, &beta, state, &mut dn_out, dn_heads, dn_head_dim, ssm_a_val).unwrap();
+                } else {
+                    dk.forward_chunk(&q_dn, &k_dn, &v_dn, &alpha, &beta, state, &mut dn_out, seq_len, dn_heads, dn_head_dim, ssm_a_val).unwrap();
+                }
+
+                if let Some(norm_w) = qweights.get_f32(&format!("{prefix}.ssm.norm.weight")) {
+                    self.pipeline.rmsnorm(&mut dn_out, norm_w, dn_dim, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+                }
+
+                if qweights.get_f32(&format!("{prefix}.ssm.in_proj.weight")).is_some() {
+                    for i in 0..dn_out.len() {
+                        let z_silu = z_gate[i] / (1.0 + (-z_gate[i]).exp());
+                        dn_out[i] *= z_silu;
+                    }
+                }
+
+                let mut o_proj_dn = vec![0.0f32; seq_len * h];
+                if let Some(out_w) = qweights.get_f32(&format!("{prefix}.ssm.out_proj.weight")) {
+                    mm.forward_b_transposed(&dn_out, out_w, &mut o_proj_dn, seq_len, h, dn_dim).unwrap();
+                } else if let Some(o_w) = qweights.get_f32(o_w_name) {
+                    mm.forward_b_transposed(&dn_out, o_w, &mut o_proj_dn, seq_len, h, dn_dim).unwrap();
+                }
+
+                for i in 0..hidden.len() { hidden[i] += o_proj_dn[i]; }
+                deltanet_layer_idx += 1;
+
+                // Fall through to FFN below
+            } else {
 
             normed.copy_from_slice(&hidden);
             let input_ln_w = qweights.get_f32(input_ln_name).unwrap();
@@ -1030,6 +1156,8 @@ where
                 let norm: f32 = last.iter().map(|x| x * x).sum::<f32>().sqrt();
                 eprintln!("L0 post-attn hidden[last][0..8]: {:?} norm={norm:.4}", &last[..8.min(h)]);
             }
+
+            } // end Attention block in forward_quantized
 
             // FFN block
             normed2.copy_from_slice(&hidden);

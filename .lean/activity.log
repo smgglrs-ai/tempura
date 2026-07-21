@@ -1476,3 +1476,17 @@
     Long-prompt gap from chunk weight-reloading overhead. Decode 38 tok/s.
     Next: AVX-512 for non-LUT ops (RMSNorm, RoPE, attention) — this CPU
     has full AVX-512 and bitnet.cpp uses it (6927 zmm instrs in ggml.so).
+
+- timestamp: "2026-07-21T11:00:00+02:00"
+  actor: claude
+  action: implementation
+  summary: >
+    Hybrid KV cache + Gated DeltaNet implementation on hybrid-kv-deltanet
+    branch (7 commits off bitnet-refinement). TurboQuant: group_size 2→32,
+    incremental compress_append, Kani+Verus proofs. DeltaNet: kernel trait,
+    CpuDeltaNet (gated delta rule), Kani+Verus proofs. Hybrid infra:
+    LayerKind enum, DeltaNetState, cache_layer_map, GGUF SSM detection.
+    Full Qwen3.6 DeltaNet pipeline: in_proj→conv1d→SiLU→L2norm→beta_alpha→
+    recurrence→ssm_norm→Z-gating→out_proj. 310 tests pass. Qwen3.6-27B
+    IQ2_M GGUF downloading for validation. Motivated by PrismML Bonsai 27B
+    (ternary 27B on phones, KV cache is the memory bottleneck).
