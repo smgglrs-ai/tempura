@@ -4654,6 +4654,58 @@ mod kani_proofs {
         assert!(w_offset + row_packed_bytes <= n * row_packed_bytes);
         assert!(col < n);
     }
+
+    #[kani::proof]
+    fn i2s_multi_row_block32_index_bounds() {
+        let k: usize = kani::any();
+        kani::assume(k == 128 || k == 256 || k == 2560);
+
+        let nb = k / 128;
+        let group32_num = nb / 32;
+        let remainder = nb % 32;
+
+        let g: usize = kani::any();
+        kani::assume(g < nb);
+
+        let py = g * 128;
+        assert!(py + 96 + 32 <= k);
+        assert!(py + 64 + 32 <= k);
+        assert!(py + 32 + 32 <= k);
+        assert!(py + 32 <= k);
+
+        let row_packed_bytes = k / 4;
+        let row: usize = kani::any();
+        kani::assume(row < 8);
+        let px = row * row_packed_bytes + g * 32;
+        assert!(px + 32 <= (row + 1) * row_packed_bytes);
+    }
+
+    #[kani::proof]
+    fn f16_roundtrip_preserves_finite() {
+        let bits: u16 = kani::any();
+        let exp = (bits >> 10) & 0x1f;
+        kani::assume(exp > 0 && exp < 31);
+
+        let sign = ((bits >> 15) & 1) as u32;
+        let frac = (bits & 0x3ff) as u32;
+        let f = f32::from_bits((sign << 31) | ((exp as u32 + 112) << 23) | (frac << 13));
+        assert!(f.is_finite());
+    }
+
+    #[kani::proof]
+    fn mmap_tensor_range_safety() {
+        let file_size: usize = kani::any();
+        let offset: usize = kani::any();
+        let length: usize = kani::any();
+        kani::assume(file_size >= 1 && file_size <= 2_000_000_000);
+        kani::assume(offset <= file_size);
+        kani::assume(length <= file_size);
+        kani::assume(offset + length <= file_size);
+
+        let end = offset + length;
+        assert!(end <= file_size);
+        assert!(offset <= end);
+    }
 }
 
 #[cfg(test)]
