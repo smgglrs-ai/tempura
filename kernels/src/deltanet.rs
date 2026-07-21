@@ -34,14 +34,18 @@ impl CpuDeltaNet {
             let s_off = h * d2;
             let qkv_off = h * head_dim;
 
-            // 1. Decay — gate should already be negative, so decay < 1
-            let gate = softplus(alpha[h]) * ssm_a;
-            let decay = gate.exp().min(1.0);
+            // alpha and beta are PRE-COMPUTED:
+            // alpha[h] = gate value (negative scalar, e.g. softplus(raw+dt_bias)*(-exp(A_log)))
+            // beta[h] = sigmoid(beta_raw) in [0,1]
+            // When called from old API: alpha = raw, ssm_a = scalar → gate = softplus(alpha)*ssm_a
+            let gate = if ssm_a == 1.0 { alpha[h] } else { softplus(alpha[h]) * ssm_a };
+            let decay = gate.exp();
             for i in 0..d2 {
                 state[s_off + i] *= decay;
             }
 
-            // 2. Retrieve: retrieved = S^T @ k  (S is row-major [head_dim x head_dim])
+            let beta_val = if ssm_a == 1.0 { beta[h] } else { sigmoid(beta[h]) };
+
             let mut retrieved = vec![0.0f32; head_dim];
             for row in 0..head_dim {
                 for col in 0..head_dim {
@@ -49,21 +53,17 @@ impl CpuDeltaNet {
                 }
             }
 
-            // 3. Delta
-            let beta_gate = sigmoid(beta[h]);
             let mut delta = vec![0.0f32; head_dim];
             for i in 0..head_dim {
-                delta[i] = beta_gate * (v[qkv_off + i] - retrieved[i]);
+                delta[i] = beta_val * (v[qkv_off + i] - retrieved[i]);
             }
 
-            // 4. Write: S += outer(k, delta)
             for row in 0..head_dim {
                 for col in 0..head_dim {
                     state[s_off + row * head_dim + col] += k[qkv_off + row] * delta[col];
                 }
             }
 
-            // 5. Read: output = S @ q
             for row in 0..head_dim {
                 let mut sum = 0.0f32;
                 for col in 0..head_dim {
