@@ -5,7 +5,7 @@ use crate::trace::{LayerSnapshot, SamplingSnapshot, TimingInfo, TraceLevel};
 use crate::weights::ModelWeights;
 use serde::Serialize;
 use std::time::Instant;
-use tempura_kernels::{Attention, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
+use tempura_kernels::{Attention, DeltaNet, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
 
 fn apply_head_rmsnorm(
     x: &mut [f32],
@@ -220,6 +220,110 @@ where
                 .unwrap_or(crate::config::LayerKind::Attention);
 
             if layer_kind == crate::config::LayerKind::DeltaNet {
+                let dn_heads = cfg.deltanet_num_heads.unwrap_or(n_kv_heads);
+                let dn_head_dim = cfg.deltanet_head_dim.unwrap_or(head_dim);
+                let dn_dim = dn_heads * dn_head_dim;
+                let ssm_a = cfg.ssm_a.unwrap_or(-1.0);
+
+                let mut normed = hidden.clone();
+                let input_ln_w = weights
+                    .get(&format!("{prefix}.input_layernorm.weight"))
+                    .unwrap();
+                self.pipeline
+                    .rmsnorm(
+                        &mut normed,
+                        input_ln_w,
+                        h,
+                        cfg.layer_norm_eps,
+                        session.trace_level,
+                        &mut Some(&mut snapshot),
+                    )
+                    .unwrap();
+
+                let mut q = vec![0.0f32; seq_len * dn_dim];
+                let mut k = vec![0.0f32; seq_len * dn_dim];
+                let mut v = vec![0.0f32; seq_len * dn_dim];
+                let mut alpha = vec![0.0f32; seq_len * dn_heads];
+                let mut beta = vec![0.0f32; seq_len * dn_heads];
+
+                if let Some(in_w) = weights.get(&format!("{prefix}.ssm.in_proj.weight")) {
+                    let in_cols = 3 * dn_dim + 2 * dn_heads;
+                    let mut in_proj = vec![0.0f32; seq_len * in_cols];
+                    self.pipeline
+                        .matmul_bt(&normed, in_w, &mut in_proj, seq_len, in_cols, h)
+                        .unwrap();
+
+                    for t in 0..seq_len {
+                        let src = &in_proj[t * in_cols..];
+                        q[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[..dn_dim]);
+                        k[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[dn_dim..2 * dn_dim]);
+                        v[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[2 * dn_dim..3 * dn_dim]);
+                        alpha[t * dn_heads..(t + 1) * dn_heads]
+                            .copy_from_slice(&src[3 * dn_dim..3 * dn_dim + dn_heads]);
+                        beta[t * dn_heads..(t + 1) * dn_heads]
+                            .copy_from_slice(&src[3 * dn_dim + dn_heads..]);
+                    }
+                } else {
+                    let q_w = weights.get(&format!("{prefix}.self_attn.q_proj.weight")).unwrap();
+                    let k_w = weights.get(&format!("{prefix}.self_attn.k_proj.weight")).unwrap();
+                    let v_w = weights.get(&format!("{prefix}.self_attn.v_proj.weight")).unwrap();
+                    self.pipeline.matmul_bt(&normed, q_w, &mut q, seq_len, dn_dim, h).unwrap();
+                    self.pipeline.matmul_bt(&normed, k_w, &mut k, seq_len, dn_dim, h).unwrap();
+                    self.pipeline.matmul_bt(&normed, v_w, &mut v, seq_len, dn_dim, h).unwrap();
+                }
+
+                // L2 normalize Q and K per head for training stability
+                for t in 0..seq_len {
+                    for hd in 0..dn_heads {
+                        let off = t * dn_dim + hd * dn_head_dim;
+                        let slice = &mut q[off..off + dn_head_dim];
+                        let norm: f32 = slice.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                        slice.iter_mut().for_each(|x| *x /= norm);
+
+                        let slice = &mut k[off..off + dn_head_dim];
+                        let norm: f32 = slice.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                        slice.iter_mut().for_each(|x| *x /= norm);
+                    }
+                }
+
+                if let Some(ref bias) = cfg.dt_bias {
+                    for t in 0..seq_len {
+                        for hd in 0..dn_heads {
+                            alpha[t * dn_heads + hd] += bias[hd];
+                        }
+                    }
+                }
+
+                let dn_state = session.deltanet_state.as_mut().unwrap();
+                let state = dn_state.state_mut(deltanet_layer_idx);
+                let mut dn_out = vec![0.0f32; seq_len * dn_dim];
+
+                let deltanet_kernel = tempura_kernels::deltanet::CpuDeltaNet;
+                if seq_len == 1 {
+                    deltanet_kernel
+                        .forward_recurrent(&q, &k, &v, &alpha, &beta, state, &mut dn_out, dn_heads, dn_head_dim, ssm_a)
+                        .unwrap();
+                } else {
+                    deltanet_kernel
+                        .forward_chunk(&q, &k, &v, &alpha, &beta, state, &mut dn_out, seq_len, dn_heads, dn_head_dim, ssm_a)
+                        .unwrap();
+                }
+
+                let mut o_proj = vec![0.0f32; seq_len * h];
+                if let Some(out_w) = weights.get(&format!("{prefix}.ssm.out_proj.weight")) {
+                    self.pipeline
+                        .matmul_bt(&dn_out, out_w, &mut o_proj, seq_len, h, dn_dim)
+                        .unwrap();
+                } else if let Some(o_w) = weights.get(&format!("{prefix}.self_attn.o_proj.weight")) {
+                    self.pipeline
+                        .matmul_bt(&dn_out, o_w, &mut o_proj, seq_len, h, dn_dim)
+                        .unwrap();
+                }
+
+                for i in 0..hidden.len() {
+                    hidden[i] += o_proj[i];
+                }
+
                 deltanet_layer_idx += 1;
             } else {
 
@@ -5292,5 +5396,72 @@ mod tests {
             &logits_quantized[..8.min(vocab)],
             &logits_decode[..8.min(vocab)]
         );
+    }
+
+    #[test]
+    fn test_hybrid_forward_with_deltanet() {
+        use crate::config::LayerKind;
+
+        let mut config = ModelConfig::tiny_test();
+        config.num_layers = 4;
+        config.layer_kinds = Some(vec![
+            LayerKind::DeltaNet,
+            LayerKind::DeltaNet,
+            LayerKind::DeltaNet,
+            LayerKind::Attention,
+        ]);
+
+        let pipeline = KernelPipeline::cpu_verified();
+        let mut model = TransformerModel::new(config.clone(), pipeline);
+
+        let h = config.hidden_size;
+        let kv_dim = config.num_kv_heads * config.head_dim;
+        let q_dim = config.num_attention_heads * config.head_dim;
+        let inter = config.intermediate_size;
+
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut rand_vec = |size: usize| -> Vec<f32> {
+            (0..size).map(|_| rng.random_range(-0.1..0.1)).collect()
+        };
+
+        let mut loader_tensors: HashMap<String, Vec<f32>> = HashMap::new();
+        loader_tensors.insert("model.embed_tokens.weight".into(), rand_vec(config.vocab_size * h));
+        loader_tensors.insert("model.norm.weight".into(), vec![1.0; h]);
+        loader_tensors.insert("lm_head.weight".into(), rand_vec(config.vocab_size * h));
+
+        for i in 0..config.num_layers {
+            let prefix = format!("model.layers.{i}");
+            loader_tensors.insert(format!("{prefix}.input_layernorm.weight"), vec![1.0; h]);
+            loader_tensors.insert(format!("{prefix}.post_attention_layernorm.weight"), vec![1.0; h]);
+            loader_tensors.insert(format!("{prefix}.mlp.gate_proj.weight"), rand_vec(inter * h));
+            loader_tensors.insert(format!("{prefix}.mlp.up_proj.weight"), rand_vec(inter * h));
+            loader_tensors.insert(format!("{prefix}.mlp.down_proj.weight"), rand_vec(h * inter));
+
+            loader_tensors.insert(format!("{prefix}.self_attn.q_proj.weight"), rand_vec(q_dim * h));
+            loader_tensors.insert(format!("{prefix}.self_attn.k_proj.weight"), rand_vec(kv_dim * h));
+            loader_tensors.insert(format!("{prefix}.self_attn.v_proj.weight"), rand_vec(kv_dim * h));
+            loader_tensors.insert(format!("{prefix}.self_attn.o_proj.weight"), rand_vec(h * q_dim));
+
+            if config.layer_kinds.as_ref().unwrap()[i] == LayerKind::DeltaNet {
+                let dn_dim = config.num_kv_heads * config.head_dim;
+                let dn_heads = config.num_kv_heads;
+                let in_cols = 3 * dn_dim + 2 * dn_heads;
+                loader_tensors.insert(format!("{prefix}.ssm.in_proj.weight"), rand_vec(in_cols * h));
+                loader_tensors.insert(format!("{prefix}.ssm.out_proj.weight"), rand_vec(h * dn_dim));
+            }
+        }
+
+        let loader = RandomWeightLoader { tensors: loader_tensors };
+        model.load_weights(&loader).unwrap();
+
+        let mut session = InferenceSession::new(&config, TraceLevel::Off, 42);
+        assert!(session.deltanet_state.is_some());
+        assert_eq!(session.cache.k.len(), 1);
+
+        let logits = model.forward(&mut session, &[1, 2, 3]);
+        assert_eq!(logits.len(), config.vocab_size);
+        assert!(logits.iter().any(|x| *x != 0.0), "logits should be non-zero");
     }
 }
