@@ -697,6 +697,8 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "attn_k.weight" => "self_attn.k_proj.weight",
             "attn_v.weight" => "self_attn.v_proj.weight",
             "attn_output.weight" => "self_attn.o_proj.weight",
+            "attn_qkv.weight" => "ssm.qkv_proj.weight",
+            "attn_gate.weight" => "ssm.gate_proj.weight",
             "attn_q_norm.weight" => "self_attn.q_norm.weight",
             "attn_k_norm.weight" => "self_attn.k_norm.weight",
             "ffn_gate.weight" => "mlp.gate_proj.weight",
@@ -805,45 +807,63 @@ fn detect_and_apply_hybrid_layers(
 ) {
     use crate::config::LayerKind;
 
-    let has_ssm = tensor_names.iter().any(|n| n.contains("ssm_in") || n.contains("ssm.in_proj"));
-    if !has_ssm {
-        return;
-    }
-
-    let mut kinds = Vec::with_capacity(config.num_layers);
-    for layer in 0..config.num_layers {
-        let attn_key = format!("blk.{layer}.attn_q.weight");
-        let attn_key_hf = format!("model.layers.{layer}.self_attn.q_proj.weight");
-        let ssm_key = format!("blk.{layer}.ssm_in.weight");
-        let ssm_key_hf = format!("model.layers.{layer}.ssm.in_proj.weight");
-
-        let has_attn = tensor_names.iter().any(|n| *n == attn_key || *n == attn_key_hf);
-        let has_ssm_layer = tensor_names.iter().any(|n| *n == ssm_key || *n == ssm_key_hf);
-
-        if has_ssm_layer && !has_attn {
-            kinds.push(LayerKind::DeltaNet);
-        } else {
-            kinds.push(LayerKind::Attention);
-        }
-    }
-
-    if kinds.iter().all(|k| *k == LayerKind::Attention) {
-        return;
-    }
-
     let arch = metadata
         .get("general.architecture")
         .and_then(|v| v.as_str())
         .unwrap_or("llama");
 
+    // Primary detection: full_attention_interval metadata (Qwen3.5/3.6)
+    let interval = metadata
+        .get(&format!("{arch}.full_attention_interval"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| metadata.get("full_attention_interval").and_then(|v| v.as_u64()));
+
+    if let Some(interval) = interval {
+        let interval = interval as usize;
+        let mut kinds = Vec::with_capacity(config.num_layers);
+        for layer in 0..config.num_layers {
+            if (layer + 1) % interval == 0 {
+                kinds.push(LayerKind::Attention);
+            } else {
+                kinds.push(LayerKind::DeltaNet);
+            }
+        }
+        config.layer_kinds = Some(kinds);
+    } else {
+        // Fallback: scan tensor names for ssm_alpha (DeltaNet marker)
+        let has_ssm = tensor_names.iter().any(|n| n.contains("ssm_alpha") || n.contains("ssm.alpha"));
+        if !has_ssm {
+            return;
+        }
+
+        let mut kinds = Vec::with_capacity(config.num_layers);
+        for layer in 0..config.num_layers {
+            let ssm_key = format!("blk.{layer}.ssm_alpha.weight");
+            let ssm_key_hf = format!("model.layers.{layer}.ssm.alpha.weight");
+            let has_ssm_layer = tensor_names.iter().any(|n| *n == ssm_key || *n == ssm_key_hf);
+
+            if has_ssm_layer {
+                kinds.push(LayerKind::DeltaNet);
+            } else {
+                kinds.push(LayerKind::Attention);
+            }
+        }
+
+        if kinds.iter().all(|k| *k == LayerKind::Attention) {
+            return;
+        }
+        config.layer_kinds = Some(kinds);
+    }
+
+    // SSM dimensions from metadata
     config.deltanet_num_heads = metadata
-        .get(&format!("{arch}.ssm.head_count"))
+        .get(&format!("{arch}.ssm.time_step_rank"))
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .or(Some(config.num_kv_heads));
 
     config.deltanet_head_dim = metadata
-        .get(&format!("{arch}.ssm.head_dim"))
+        .get(&format!("{arch}.ssm.state_size"))
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .or(Some(config.head_dim));
@@ -852,8 +872,6 @@ fn detect_and_apply_hybrid_layers(
         .get(&format!("{arch}.ssm.time_step_a"))
         .and_then(|v| v.as_f32())
         .or_else(|| metadata.get("ssm.time_step_a").and_then(|v| v.as_f32()));
-
-    config.layer_kinds = Some(kinds);
 }
 
 pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConfig, LoadError> {
