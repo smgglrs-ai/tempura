@@ -621,26 +621,20 @@ pub fn dequant_q2_0_pub(data: &[u8], num_elements: usize) -> Vec<f32> {
 }
 
 fn dequant_q2_0(data: &[u8], num_elements: usize) -> Vec<f32> {
-    let group_size = 128;
-    let block_bytes = 34; // 32 bytes packed + 2 bytes f16 scale
-    let num_blocks = num_elements / group_size;
+    // PrismML Q2_0: QK=128, 34 bytes per block (2-byte f16 scale + 32 bytes packed)
+    // Encoding: (q - 1) * scale → 00=-1, 01=0, 10=+1, 11=+2
+    const QK: usize = 128;
+    const BLOCK_BYTES: usize = 34;
+    let num_blocks = num_elements / QK;
     let mut output = vec![0.0f32; num_elements];
     for blk in 0..num_blocks {
-        let block = &data[blk * block_bytes..(blk + 1) * block_bytes];
-        let scale_bits = u16::from_le_bytes([block[32], block[33]]);
-        let scale = f16_to_f32(scale_bits);
-        for i in 0..group_size {
-            let byte_idx = i / 4;
+        let block = &data[blk * BLOCK_BYTES..(blk + 1) * BLOCK_BYTES];
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for i in 0..QK {
+            let byte_idx = 2 + i / 4;
             let bit_shift = (i % 4) * 2;
-            let val = (block[byte_idx] >> bit_shift) & 0x03;
-            // 2-bit ternary: 0 → 0, 1 → +1, 2 → -1 (or 1 → -1, 2 → +1)
-            let f = match val {
-                0 => 0.0,
-                1 => 1.0,
-                2 => -1.0,
-                _ => 0.0,
-            };
-            output[blk * group_size + i] = f * scale;
+            let q = ((block[byte_idx] >> bit_shift) & 0x03) as i32;
+            output[blk * QK + i] = (q - 1) as f32 * scale;
         }
     }
     output
@@ -695,7 +689,7 @@ fn tensor_data_size(dtype: GgmlType, num_elements: u64, dims: &[u64]) -> u64 {
             num_elements / 4 + 4
         }
         GgmlType::TQ2_0 => (num_elements / 256) * 66,
-        GgmlType::Q2_0 => (num_elements / 128) * 34, // 2-bit packed (32 bytes) + f16 scale (2 bytes) per 128 elements
+        GgmlType::Q2_0 => (num_elements / 128) * 34, // QK=128: 2-byte f16 scale + 32 bytes packed
         GgmlType::TL1 => {
             // Same as I2_S: 2-bit packed + 32-byte alignment
             num_elements / 4 + 32
@@ -975,7 +969,8 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         .and_then(|v| v.as_f32())
         .unwrap_or(1e-5);
 
-    let head_dim = hidden_size / num_attention_heads;
+    let head_dim = get_usize("attention.key_length")
+        .unwrap_or(hidden_size / num_attention_heads);
 
     let is_bitnet = arch.contains("bitnet");
 

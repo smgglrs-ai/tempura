@@ -693,7 +693,7 @@ where
         let seq_len = token_ids.len();
 
         let q4k = tempura_kernels::quantized::CpuMatMulQ4KOpt;
-        use tempura_kernels::quantized::{MatMulQ, PreQuantizedActivations};
+        use tempura_kernels::quantized::{MatMulQ, PreQuantizedActivations, Q2_0_BLOCK_BYTES, Q2_0_BLOCK_SIZE};
         use tempura_kernels::tl2::tl2_forward;
 
         let det_rmsnorm: Option<Box<dyn tempura_kernels::RMSNorm>> =
@@ -796,9 +796,13 @@ where
             } else if let Some(w) = qweights.get_q6k(name) {
                 q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k)
                     .unwrap();
-            } else if let Some(w) = qweights.get_q2(name) {
-                let dequant = crate::gguf_loader::dequant_q2_0_pub(w, n * k);
-                self.pipeline.matmul_bt(a_f32, &dequant, out, m, n, k).unwrap();
+            } else if let Some(_w) = qweights.get_q2(name) {
+                for row in 0..m {
+                    tempura_kernels::quantized::q2_0_gemv(
+                        _w, &a_f32[row * k..(row + 1) * k],
+                        &mut out[row * n..(row + 1) * n], n, k,
+                    );
+                }
             } else {
                 let w = qweights.get_f32(name).unwrap();
                 self.pipeline.matmul_bt(a_f32, w, out, m, n, k).unwrap();
@@ -857,6 +861,9 @@ where
                 let dn_head_dim = cfg.deltanet_head_dim.unwrap_or(head_dim);
                 let dn_dim = dn_heads * dn_head_dim;
                 let ssm_a_val = cfg.ssm_a.unwrap_or(-1.0);
+                if layer == 0 {
+                    eprintln!("[deltanet] layer 0: dn_heads={dn_heads} dn_head_dim={dn_head_dim} dn_dim={dn_dim} ssm_a={ssm_a_val} cfg.deltanet_num_heads={:?} cfg.deltanet_head_dim={:?}", cfg.deltanet_num_heads, cfg.deltanet_head_dim);
+                }
 
                 normed.copy_from_slice(&hidden);
                 let input_ln_w = qweights.get_f32(input_ln_name).unwrap();
@@ -874,11 +881,24 @@ where
                 let mut alpha = vec![0.0f32; seq_len * dn_heads];
                 let mut beta = vec![0.0f32; seq_len * dn_heads];
 
-                // SSM weights are kept at f32/f16 in quantized GGUFs
-                if let Some(in_w) = qweights.get_f32(&format!("{prefix}.ssm.in_proj.weight")) {
+                let qkv_name = format!("{prefix}.ssm.qkv_proj.weight");
+                let gate_name = format!("{prefix}.ssm.gate_proj.weight");
+                let in_proj_name = format!("{prefix}.ssm.in_proj.weight");
+                let ba_name = format!("{prefix}.ssm.beta_alpha.weight");
+                let alpha_name = format!("{prefix}.ssm.alpha.weight");
+                let beta_name = format!("{prefix}.ssm.beta.weight");
+
+                let has_in_proj = qweights.get_f32(&in_proj_name).is_some() || qweights.get_q2(&in_proj_name).is_some();
+                let has_qkv = qweights.get_f32(&qkv_name).is_some() || qweights.get_q2(&qkv_name).is_some();
+                // Derive key_dim from QKV weight shape: qkv_cols = 2*key_dim + dn_dim
+                let qkv_bytes = qweights.get_q2(&qkv_name).map(|w| w.len()).unwrap_or(0);
+                let qkv_elements = if qkv_bytes > 0 { qkv_bytes / Q2_0_BLOCK_BYTES * Q2_0_BLOCK_SIZE / h } else { 0 };
+                let key_dim = if qkv_elements > dn_dim { (qkv_elements - dn_dim) / 2 } else { dn_dim };
+
+                if has_in_proj {
                     let in_cols = 4 * dn_dim;
                     let mut in_proj = vec![0.0f32; seq_len * in_cols];
-                    mm.forward_b_transposed(&normed, in_w, &mut in_proj, seq_len, in_cols, h).unwrap();
+                    qmm(None, &normed, &in_proj_name, &mut in_proj, seq_len, in_cols, h);
                     for t in 0..seq_len {
                         let src = &in_proj[t * in_cols..];
                         q_dn[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[..dn_dim]);
@@ -886,27 +906,40 @@ where
                         v_dn[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[2 * dn_dim..3 * dn_dim]);
                         z_gate[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[3 * dn_dim..4 * dn_dim]);
                     }
-                } else {
-                    if let Some(w) = qweights.get_f32(q_w_name) {
-                        mm.forward_b_transposed(&normed, w, &mut q_dn, seq_len, dn_dim, h).unwrap();
-                    }
-                    if let Some(w) = qweights.get_f32(k_w_name) {
-                        mm.forward_b_transposed(&normed, w, &mut k_dn, seq_len, dn_dim, h).unwrap();
-                    }
-                    if let Some(w) = qweights.get_f32(v_w_name) {
-                        mm.forward_b_transposed(&normed, w, &mut v_dn, seq_len, dn_dim, h).unwrap();
+                } else if has_qkv {
+                    let qkv_cols = 2 * key_dim + dn_dim;
+                    let mut qkv_buf = vec![0.0f32; seq_len * qkv_cols];
+                    qmm(None, &normed, &qkv_name, &mut qkv_buf, seq_len, qkv_cols, h);
+                    qmm(None, &normed, &gate_name, &mut z_gate, seq_len, dn_dim, h);
+                    for t in 0..seq_len {
+                        let src = &qkv_buf[t * qkv_cols..];
+                        // Q and K have key_dim, V has dn_dim; expand Q/K to dn_dim by repeating heads
+                        for vh in 0..dn_heads {
+                            let n_k_heads = key_dim / dn_head_dim;
+                            let kh = vh * n_k_heads / dn_heads;
+                            let q_src = &src[kh * dn_head_dim..(kh + 1) * dn_head_dim];
+                            let k_src = &src[key_dim + kh * dn_head_dim..key_dim + (kh + 1) * dn_head_dim];
+                            q_dn[t * dn_dim + vh * dn_head_dim..t * dn_dim + (vh + 1) * dn_head_dim].copy_from_slice(q_src);
+                            k_dn[t * dn_dim + vh * dn_head_dim..t * dn_dim + (vh + 1) * dn_head_dim].copy_from_slice(k_src);
+                        }
+                        v_dn[t * dn_dim..(t + 1) * dn_dim].copy_from_slice(&src[2 * key_dim..2 * key_dim + dn_dim]);
                     }
                 }
 
-                if let Some(ba_w) = qweights.get_f32(&format!("{prefix}.ssm.beta_alpha.weight")) {
+                let has_ba = qweights.get_f32(&ba_name).is_some() || qweights.get_q2(&ba_name).is_some();
+                let has_separate = qweights.get_f32(&alpha_name).is_some() || qweights.get_q2(&alpha_name).is_some();
+                if has_ba {
                     let ba_cols = 2 * dn_heads;
                     let mut ba_proj = vec![0.0f32; seq_len * ba_cols];
-                    mm.forward_b_transposed(&normed, ba_w, &mut ba_proj, seq_len, ba_cols, h).unwrap();
+                    qmm(None, &normed, &ba_name, &mut ba_proj, seq_len, ba_cols, h);
                     for t in 0..seq_len {
                         let src = &ba_proj[t * ba_cols..];
                         beta[t * dn_heads..(t + 1) * dn_heads].copy_from_slice(&src[..dn_heads]);
                         alpha[t * dn_heads..(t + 1) * dn_heads].copy_from_slice(&src[dn_heads..]);
                     }
+                } else if has_separate {
+                    qmm(None, &normed, &alpha_name, &mut alpha, seq_len, dn_heads, h);
+                    qmm(None, &normed, &beta_name, &mut beta, seq_len, dn_heads, h);
                 }
 
                 if let Some(conv_w) = qweights.get_f32(&format!("{prefix}.ssm.conv1d.weight")) {
@@ -965,19 +998,16 @@ where
                     }
                 }
 
-                if qweights.get_f32(&format!("{prefix}.ssm.in_proj.weight")).is_some() {
+                if has_in_proj || has_qkv {
                     for i in 0..dn_out.len() {
                         let z_silu = z_gate[i] / (1.0 + (-z_gate[i]).exp());
                         dn_out[i] *= z_silu;
                     }
                 }
 
+                let out_proj_name = format!("{prefix}.ssm.out_proj.weight");
                 let mut o_proj_dn = vec![0.0f32; seq_len * h];
-                if let Some(out_w) = qweights.get_f32(&format!("{prefix}.ssm.out_proj.weight")) {
-                    mm.forward_b_transposed(&dn_out, out_w, &mut o_proj_dn, seq_len, h, dn_dim).unwrap();
-                } else if let Some(o_w) = qweights.get_f32(o_w_name) {
-                    mm.forward_b_transposed(&dn_out, o_w, &mut o_proj_dn, seq_len, h, dn_dim).unwrap();
-                }
+                qmm(None, &dn_out, &out_proj_name, &mut o_proj_dn, seq_len, h, dn_dim);
 
                 for i in 0..hidden.len() { hidden[i] += o_proj_dn[i]; }
                 deltanet_layer_idx += 1;
@@ -1374,8 +1404,7 @@ where
         } else if let Some(w) = qweights.get_f16(lm_head_name) {
             tempura_kernels::f16_gemv::f16_gemv(last_hidden, w, &mut logits, cfg.vocab_size, h);
         } else if let Some(w) = qweights.get_q2(lm_head_name) {
-            let dequant = crate::gguf_loader::dequant_q2_0_pub(w, cfg.vocab_size * h);
-            self.pipeline.matmul_bt(last_hidden, &dequant, &mut logits, 1, cfg.vocab_size, h).unwrap();
+            tempura_kernels::quantized::q2_0_gemv(w, last_hidden, &mut logits, cfg.vocab_size, h);
         } else {
             let w = qweights.get_f32(lm_head_name).unwrap();
             self.pipeline

@@ -1097,6 +1097,75 @@ unsafe fn hsum_i32_512(v: std::arch::x86_64::__m512i) -> i32 {
     hsum_i32(sum256)
 }
 
+// ── Q2_0 (PrismML ternary, QK=128, per-block f16 scale) ──────────────────────
+
+pub const Q2_0_BLOCK_SIZE: usize = 128;
+pub const Q2_0_BLOCK_BYTES: usize = 34; // 2-byte f16 scale + 32 bytes packed
+
+pub fn q2_0_gemv_row(packed: &[u8], a_q: &[i8], a_scale: f32, k: usize) -> f32 {
+    let nb = k / Q2_0_BLOCK_SIZE;
+    let mut result = 0.0f32;
+    for blk in 0..nb {
+        let block = &packed[blk * Q2_0_BLOCK_BYTES..];
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qs = &block[2..34];
+        let a_off = blk * Q2_0_BLOCK_SIZE;
+        let mut isum: i32 = 0;
+        let mut asum: i32 = 0;
+        for j in 0..32 {
+            let byte = qs[j];
+            let w0 = (byte & 0x03) as i32;
+            let w1 = ((byte >> 2) & 0x03) as i32;
+            let w2 = ((byte >> 4) & 0x03) as i32;
+            let w3 = ((byte >> 6) & 0x03) as i32;
+            let a0 = a_q[a_off + j * 4] as i32;
+            let a1 = a_q[a_off + j * 4 + 1] as i32;
+            let a2 = a_q[a_off + j * 4 + 2] as i32;
+            let a3 = a_q[a_off + j * 4 + 3] as i32;
+            isum += w0 * a0 + w1 * a1 + w2 * a2 + w3 * a3;
+            asum += a0 + a1 + a2 + a3;
+        }
+        result += (isum - asum) as f32 * scale / a_scale;
+    }
+    result
+}
+
+pub fn q2_0_gemv(
+    packed: &[u8],
+    a_f32: &[f32],
+    output: &mut [f32],
+    n: usize,
+    k: usize,
+) {
+    let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    let expected = n * row_bytes;
+    if packed.len() < expected {
+        eprintln!("[q2_0_gemv] packed len {} < expected {} (n={n} k={k} row_bytes={row_bytes})", packed.len(), expected);
+        for i in 0..n.min(output.len()) { output[i] = 0.0; }
+        return;
+    }
+    if output.len() < n {
+        eprintln!("[q2_0_gemv] output len {} < n={n}", output.len());
+        return;
+    }
+    if a_f32.len() < k {
+        eprintln!("[q2_0_gemv] a_f32 len {} < k={k}", a_f32.len());
+        for i in 0..n.min(output.len()) { output[i] = 0.0; }
+        return;
+    }
+    let mut a_q = vec![0i8; k];
+    let (a_scale, _a_sum) = i2s_quantize_into(a_f32, &mut a_q);
+    if a_scale.abs() < 1e-30 {
+        output[..n].fill(0.0);
+        return;
+    }
+
+    for j in 0..n {
+        let w = &packed[j * row_bytes..(j + 1) * row_bytes];
+        output[j] = q2_0_gemv_row(w, &a_q, a_scale, k);
+    }
+}
+
 /// AVX512 per-tensor INT8 activation quantization — zero-allocation, writes directly into dst.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx512bw")]
