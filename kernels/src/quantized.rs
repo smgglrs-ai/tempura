@@ -1513,6 +1513,67 @@ unsafe fn i2s_gemv_cols_multi_row(
     }
 }
 
+/// I2S GEMV with f16 output — writes u16 (f16 bits) via F16C cvtps_ph.
+#[cfg(target_arch = "x86_64")]
+pub fn i2s_gemv_cols_f16(
+    preq_q8: &[i8],
+    preq_scale: f32,
+    preq_sum: i32,
+    b_quantized: &[u8],
+    w_scale: f32,
+    output_f16_addr: usize,
+    col_start: usize,
+    col_end: usize,
+    k: usize,
+) {
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
+        unsafe { i2s_gemv_cols_f16_inner(preq_q8, preq_scale, preq_sum, b_quantized, w_scale, output_f16_addr, col_start, col_end, k) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn i2s_gemv_cols_f16_inner(
+    preq_q8: &[i8], preq_scale: f32, preq_sum: i32,
+    b_quantized: &[u8], w_scale: f32, output_f16_addr: usize,
+    col_start: usize, col_end: usize, k: usize,
+) {
+    use std::arch::x86_64::*;
+    let row_packed_bytes = k / 4;
+    let nb = k / 128;
+    let mask = _mm256_set1_epi8(0x03);
+    let ones = _mm256_set1_epi16(1);
+    let group32_num = nb / 32;
+    let la_num = nb % 32;
+    let scale = w_scale / preq_scale;
+    let y = preq_q8.as_ptr();
+    let x = b_quantized.as_ptr();
+
+    for row in col_start..col_end {
+        let x_row = x.add(row * row_packed_bytes);
+        let mut acc = _mm256_setzero_si256();
+
+        for i in 0..group32_num {
+            acc = _mm256_add_epi32(acc, i2s_dot_block32(
+                x_row.add(i * 1024), y.add(i * 4096) as *const i8, mask, ones));
+        }
+
+        if la_num > 0 {
+            let px_base = x_row.add(group32_num * 1024);
+            let py_base = y.add(group32_num * 4096);
+            let mut accu16 = _mm256_setzero_si256();
+            for g in 0..la_num {
+                i2s_dot_iter!(accu16, px_base, py_base, g, mask);
+            }
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(accu16, ones));
+        }
+
+        let val = (hsum_i32(acc) - preq_sum) as f32 * scale;
+        let h = _mm_cvtps_ph(_mm_set_ss(val), _MM_FROUND_TO_NEAREST_INT);
+        *(output_f16_addr as *mut u16).add(row) = _mm_extract_epi16(h, 0) as u16;
+    }
+}
+
 /// Extract the per-tensor f32 scale from I2S weight data.
 #[inline]
 pub fn i2s_weight_scale(b_quantized: &[u8], n: usize, k: usize) -> f32 {

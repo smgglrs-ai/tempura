@@ -1582,6 +1582,7 @@ where
         let gen_ptr = &mut generated as *mut Vec<u32> as usize;
 
         let force_i2s = std::env::var("TEMPURA_FORCE_I2S").is_ok();
+        let f16_pipe = std::env::var("TEMPURA_F16_PIPE").is_ok();
         let mut lut_h = if force_i2s { None } else { Tl2Lut::new_for_k(h) };
         let mut lut_qdim = if force_i2s || q_dim == h { None } else { Tl2Lut::new_for_k(q_dim) };
         let mut lut_inter = if force_i2s { None } else { Tl2Lut::new_for_k(inter) };
@@ -1686,8 +1687,17 @@ where
                             let (qs,qe) = ((ith*q_dim)/nth, ((ith+1)*q_dim)/nth);
                             let (ks,ke) = ((ith*kv_dim)/nth, ((ith+1)*kv_dim)/nth);
                             i2s_gemv_cols(is!(pp,h), ps, pm, qw, i2s_weight_scale(qw,q_dim,h), qp, qs, qe, h);
-                            i2s_gemv_cols(is!(pp,h), ps, pm, kw, i2s_weight_scale(kw,kv_dim,h), kp, ks, ke, h);
-                            i2s_gemv_cols(is!(pp,h), ps, pm, vw, i2s_weight_scale(vw,kv_dim,h), vp, ks, ke, h);
+                            if f16_pipe {
+                                let sess = unsafe { &*(sp as *const InferenceSession) };
+                                let kv_dst = sess.cache.seq_len * kv_dim;
+                                let k_f16_ptr = unsafe { sess.cache.k_f16[layer].as_ptr().add(kv_dst) as usize };
+                                let v_f16_ptr = unsafe { sess.cache.v_f16[layer].as_ptr().add(kv_dst) as usize };
+                                tempura_kernels::quantized::i2s_gemv_cols_f16(is!(pp,h), ps, pm, kw, i2s_weight_scale(kw,kv_dim,h), k_f16_ptr, ks, ke, h);
+                                tempura_kernels::quantized::i2s_gemv_cols_f16(is!(pp,h), ps, pm, vw, i2s_weight_scale(vw,kv_dim,h), v_f16_ptr, ks, ke, h);
+                            } else {
+                                i2s_gemv_cols(is!(pp,h), ps, pm, kw, i2s_weight_scale(kw,kv_dim,h), kp, ks, ke, h);
+                                i2s_gemv_cols(is!(pp,h), ps, pm, vw, i2s_weight_scale(vw,kv_dim,h), vp, ks, ke, h);
+                            }
                         }
                     }
                     barrier.wait();
@@ -1695,16 +1705,27 @@ where
                     if ith == 0 {
                         use tempura_kernels::RoPE;
                         rope.forward(fsm!(qp,q_dim), 1, 1, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
-                        rope.forward(fsm!(kp,kv_dim), 1, 1, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
                         let sess = unsafe { &mut *(sp as *mut InferenceSession) };
                         if sess.cache.use_f16 {
                             let stride = kv_dim;
                             let dst = sess.cache.seq_len * stride;
-                            crate::kv_cache::append_f32_as_f16(
-                                &mut sess.cache.k_f16[layer][dst..dst + stride], fs!(kp, kv_dim));
-                            crate::kv_cache::append_f32_as_f16(
-                                &mut sess.cache.v_f16[layer][dst..dst + stride], fs!(vp, kv_dim));
+                            if f16_pipe {
+                                // K+V already written to KV cache f16 by i2s_gemv_cols_f16
+                                // Just apply RoPE in-place on f16 K
+                                tempura_kernels::rope::rope_forward_f16(
+                                    &mut sess.cache.k_f16[layer][dst..dst + stride],
+                                    1, n_kv_heads, head_dim, &positions, cfg.rope_theta);
+                            } else {
+                                // Fused f32 RoPE → f16 write
+                                tempura_kernels::rope::rope_f32_to_f16(
+                                    fs!(kp,kv_dim), &mut sess.cache.k_f16[layer][dst..dst + stride],
+                                    1, n_kv_heads, head_dim, &positions, cfg.rope_theta);
+                                // V: direct f32→f16
+                                crate::kv_cache::append_f32_as_f16(
+                                    &mut sess.cache.v_f16[layer][dst..dst + stride], fs!(vp, kv_dim));
+                            }
                         } else {
+                            rope.forward(fsm!(kp,kv_dim), 1, 1, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
                             sess.cache.append_kv(layer, fs!(kp,kv_dim), fs!(vp,kv_dim), 1);
                         }
                         shared_kvl.store(sess.cache.seq_len + 1, std::sync::atomic::Ordering::Release);
