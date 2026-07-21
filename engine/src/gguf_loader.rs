@@ -706,8 +706,15 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "attn_sub_norm.weight" => "self_attn.attn_sub_norm.weight",
             "ssm_in.weight" => "ssm.in_proj.weight",
             "ssm_out.weight" => "ssm.out_proj.weight",
-            "ssm_dt.bias" => "ssm.dt.bias",
-            "ssm_a" => "ssm.A",
+            "ssm_conv1d.weight" => "ssm.conv1d.weight",
+            "ssm_conv1d.bias" => "ssm.conv1d.bias",
+            "ssm_dt.weight" => "ssm.dt_proj.weight",
+            "ssm_dt.bias" => "ssm.dt_proj.bias",
+            "ssm_a" => "ssm.A_log",
+            "ssm_norm.weight" => "ssm.norm.weight",
+            "ssm_beta_alpha.weight" => "ssm.beta_alpha.weight",
+            "ssm_alpha.weight" => "ssm.alpha.weight",
+            "ssm_beta.weight" => "ssm.beta.weight",
             _ => return None,
         };
         return Some(format!("model.layers.{n}.{hf_suffix}"));
