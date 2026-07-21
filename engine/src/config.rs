@@ -28,6 +28,12 @@ pub struct ModelConfig {
     pub sliding_window: Option<usize>,
     pub hidden_act: HiddenAct,
     pub rope_type: RopeType,
+    pub recurrent_layers: Vec<bool>,
+    pub ssm_d_conv: usize,
+    pub ssm_d_state: usize,
+    pub ssm_d_inner: usize,
+    pub ssm_dt_rank: usize,
+    pub ssm_n_group: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +113,12 @@ impl ModelConfig {
             sliding_window: None,
             hidden_act: HiddenAct::SiluGate,
             rope_type: RopeType::Neox,
+            recurrent_layers: Vec::new(),
+            ssm_d_conv: 0,
+            ssm_d_state: 0,
+            ssm_d_inner: 0,
+            ssm_dt_rank: 0,
+            ssm_n_group: 0,
         }
     }
 
@@ -128,6 +140,12 @@ impl ModelConfig {
             sliding_window: None,
             hidden_act: HiddenAct::SiluGate,
             rope_type: RopeType::Neox,
+            recurrent_layers: Vec::new(),
+            ssm_d_conv: 0,
+            ssm_d_state: 0,
+            ssm_d_inner: 0,
+            ssm_dt_rank: 0,
+            ssm_n_group: 0,
         }
     }
 
@@ -149,6 +167,12 @@ impl ModelConfig {
             sliding_window: None,
             hidden_act: HiddenAct::SiluGate,
             rope_type: RopeType::Neox,
+            recurrent_layers: Vec::new(),
+            ssm_d_conv: 0,
+            ssm_d_state: 0,
+            ssm_d_inner: 0,
+            ssm_dt_rank: 0,
+            ssm_n_group: 0,
         }
     }
 
@@ -243,6 +267,12 @@ impl ModelConfig {
                 .map(|v| v as usize),
             hidden_act,
             rope_type,
+            recurrent_layers: Vec::new(),
+            ssm_d_conv: 0,
+            ssm_d_state: 0,
+            ssm_d_inner: 0,
+            ssm_dt_rank: 0,
+            ssm_n_group: 0,
         })
     }
 }

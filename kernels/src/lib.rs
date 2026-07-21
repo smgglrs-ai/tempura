@@ -12,6 +12,7 @@ pub mod thread_pool;
 pub mod tl2;
 pub mod allreduce;
 pub mod attention;
+pub mod deltanet;
 pub mod dispatch;
 pub mod fused;
 #[cfg(feature = "cuda")]

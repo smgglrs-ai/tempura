@@ -45,6 +45,7 @@ pub enum GgmlType {
     TQ2_0 = 37,
     TL1 = 38,    // bitnet.cpp: ARM TL1 LUT format
     TL2 = 39,    // bitnet.cpp: x86 TL2 LUT format (tiled nibble+sign)
+    Q2_0 = 142,  // PrismML: 2-bit ternary, group size 128, f16 scale
 }
 
 impl GgmlType {
@@ -67,6 +68,7 @@ impl GgmlType {
             37 => Ok(GgmlType::TQ2_0),
             38 => Ok(GgmlType::TL1),
             39 => Ok(GgmlType::TL2),
+            142 => Ok(GgmlType::Q2_0),
             _ => Err(LoadError::GgufParse(format!("unsupported GGML type: {v}"))),
         }
     }
@@ -614,6 +616,32 @@ fn dequant_q5k(data: &[u8], num_elements: usize) -> Vec<f32> {
     output
 }
 
+fn dequant_q2_0(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let group_size = 128;
+    let block_bytes = 34; // 32 bytes packed + 2 bytes f16 scale
+    let num_blocks = num_elements / group_size;
+    let mut output = vec![0.0f32; num_elements];
+    for blk in 0..num_blocks {
+        let block = &data[blk * block_bytes..(blk + 1) * block_bytes];
+        let scale_bits = u16::from_le_bytes([block[32], block[33]]);
+        let scale = f16_to_f32(scale_bits);
+        for i in 0..group_size {
+            let byte_idx = i / 4;
+            let bit_shift = (i % 4) * 2;
+            let val = (block[byte_idx] >> bit_shift) & 0x03;
+            // 2-bit ternary: 0 → 0, 1 → +1, 2 → -1 (or 1 → -1, 2 → +1)
+            let f = match val {
+                0 => 0.0,
+                1 => 1.0,
+                2 => -1.0,
+                _ => 0.0,
+            };
+            output[blk * group_size + i] = f * scale;
+        }
+    }
+    output
+}
+
 fn dequant_tq2(data: &[u8], num_elements: usize) -> Vec<f32> {
     use tempura_kernels::TQ2_BLOCK_SIZE;
     let block_bytes = 66;
@@ -663,6 +691,7 @@ fn tensor_data_size(dtype: GgmlType, num_elements: u64, dims: &[u64]) -> u64 {
             num_elements / 4 + 4
         }
         GgmlType::TQ2_0 => (num_elements / 256) * 66,
+        GgmlType::Q2_0 => (num_elements / 128) * 34, // 2-bit packed (32 bytes) + f16 scale (2 bytes) per 128 elements
         GgmlType::TL1 => {
             // Same as I2_S: 2-bit packed + 32-byte alignment
             num_elements / 4 + 32
@@ -704,6 +733,19 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "ffn_down.weight" => "mlp.down_proj.weight",
             "ffn_sub_norm.weight" => "mlp.ffn_sub_norm.weight",
             "attn_sub_norm.weight" => "self_attn.attn_sub_norm.weight",
+            // DeltaNet / hybrid attention (Qwen3.5/Qwen3Next)
+            "attn_qkv.weight" => "ssm.qkv_proj.weight",
+            "attn_gate.weight" => "ssm.gate_proj.weight",
+            "ssm_in.weight" => "ssm.in_proj.weight",
+            "ssm_conv1d.weight" => "ssm.conv1d.weight",
+            "ssm_conv1d.bias" => "ssm.conv1d.bias",
+            "ssm_dt.bias" => "ssm.dt.bias",
+            "ssm_a" => "ssm.a",
+            "ssm_beta.weight" => "ssm.beta.weight",
+            "ssm_alpha.weight" => "ssm.alpha.weight",
+            "ssm_ba.weight" => "ssm.ba.weight",
+            "ssm_norm.weight" => "ssm.norm.weight",
+            "ssm_out.weight" => "ssm.out.weight",
             _ => return None,
         };
         return Some(format!("model.layers.{n}.{hf_suffix}"));
@@ -877,6 +919,21 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
     // layout determines which RoPE to use.
     let rope_type = crate::config::RopeType::Neox;
 
+    let is_hybrid = arch == "qwen35" || arch == "qwen3next" || arch == "qwen35moe";
+
+    let ssm_d_conv = get_usize("ssm.conv_kernel").unwrap_or(0);
+    let ssm_d_state = get_usize("ssm.state_size").unwrap_or(0);
+    let ssm_d_inner = get_usize("ssm.inner_size").unwrap_or(0);
+    let ssm_dt_rank = get_usize("ssm.time_step_rank").unwrap_or(0);
+    let ssm_n_group = get_usize("ssm.group_count").unwrap_or(0);
+
+    let recurrent_layers = if is_hybrid {
+        let full_attn_interval = get_usize("full_attention_interval").unwrap_or(4);
+        (0..num_layers).map(|i| (i + 1) % full_attn_interval != 0).collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(ModelConfig {
         hidden_size,
         intermediate_size,
@@ -894,6 +951,12 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         sliding_window: None,
         hidden_act,
         rope_type,
+        recurrent_layers,
+        ssm_d_conv,
+        ssm_d_state,
+        ssm_d_inner,
+        ssm_dt_rank,
+        ssm_n_group,
     })
 }
 
@@ -1001,7 +1064,8 @@ impl GgufLoader {
 
             let keep_raw = (info.dtype == GgmlType::Q4K || info.dtype == GgmlType::Q6K
                 || info.dtype == GgmlType::TQ2_0 || info.dtype == GgmlType::TQ1_0
-                || info.dtype == GgmlType::TL1 || info.dtype == GgmlType::TL2)
+                || info.dtype == GgmlType::TL1 || info.dtype == GgmlType::TL2
+                || info.dtype == GgmlType::Q2_0)
                 && !mapped_name.contains("embed_tokens")
                 && !mapped_name.contains("norm.weight");
 
@@ -1011,7 +1075,8 @@ impl GgufLoader {
 
             let skip_f32 = info.dtype == GgmlType::F16;
 
-            let use_mmap = keep_raw && (info.dtype == GgmlType::TQ1_0 || info.dtype == GgmlType::TL1);
+            let use_mmap = keep_raw && matches!(info.dtype,
+                GgmlType::TQ1_0 | GgmlType::TL1 | GgmlType::Q4K | GgmlType::Q6K | GgmlType::Q2_0);
             if use_mmap {
                 mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, info.dtype));
             }
@@ -1032,6 +1097,7 @@ impl GgufLoader {
                     GgmlType::Q5K => dequant_q5k(tensor_data, ne),
                     GgmlType::Q6K => dequant_q6k(tensor_data, ne),
                     GgmlType::TQ2_0 => dequant_tq2(tensor_data, ne),
+                    GgmlType::Q2_0 => dequant_q2_0(tensor_data, ne),
                     GgmlType::TQ1_0 | GgmlType::TL1 => dequant_tq1(tensor_data, ne),
                     GgmlType::TL2 => {
                         // TL2 embed/norm should not appear — fall back to zeros
@@ -1174,6 +1240,7 @@ impl GgufLoader {
                 GgmlType::Q5K => dequant_q5k(tensor_data, ne),
                 GgmlType::Q6K => dequant_q6k(tensor_data, ne),
                 GgmlType::TQ2_0 => dequant_tq2(tensor_data, ne),
+                GgmlType::Q2_0 => dequant_q2_0(tensor_data, ne),
                 GgmlType::TQ1_0 | GgmlType::TL1 => dequant_tq1(tensor_data, ne),
                 GgmlType::TL2 => vec![0.0f32; ne],
             };
@@ -1245,6 +1312,9 @@ impl GgufLoader {
                 match dtype {
                     GgmlType::TQ1_0 | GgmlType::TL1 => { qw.register_mmap_i2s(name.clone(), off, len); }
                     GgmlType::F16 => { qw.register_mmap_f16(name.clone(), off, len); }
+                    GgmlType::Q4K => { qw.register_mmap_q4k(name.clone(), off, len); }
+                    GgmlType::Q6K => { qw.register_mmap_q6k(name.clone(), off, len); }
+                    GgmlType::Q2_0 => { qw.register_mmap_q2(name.clone(), off, len); }
                     _ => {}
                 }
             }

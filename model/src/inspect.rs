@@ -37,14 +37,18 @@ pub fn inspect(path: &Path) -> Result<ModelInfo, ModelError> {
 }
 
 fn is_gguf_magic(path: &Path) -> bool {
-    fs::read(path)
-        .ok()
-        .map(|data| data.len() >= 4 && &data[..4] == b"GGUF")
+    let mut buf = [0u8; 4];
+    fs::File::open(path)
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut buf)
+        })
+        .map(|_| &buf == b"GGUF")
         .unwrap_or(false)
 }
 
 fn inspect_gguf(path: &Path) -> Result<ModelInfo, ModelError> {
-    let loader = tempura_engine::gguf_loader::GgufLoader::from_file(path)
+    let loader = tempura_engine::gguf_loader::GgufLoader::from_file_quantized(path)
         .map_err(|e| ModelError::Format(e.to_string()))?;
 
     let config = &loader.config;

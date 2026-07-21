@@ -1324,6 +1324,94 @@ mod kani_proofs {
     }
 }
 
+pub struct DeltaNetState {
+    gdn_states: Vec<Vec<f32>>,
+    conv_states: Vec<Vec<f32>>,
+    layer_map: Vec<Option<usize>>,
+    head_v_dim: usize,
+    num_v_heads: usize,
+    conv_dim: usize,
+    conv_kernel: usize,
+}
+
+impl DeltaNetState {
+    pub fn new(config: &ModelConfig) -> Self {
+        if config.recurrent_layers.is_empty() {
+            return Self {
+                gdn_states: Vec::new(),
+                conv_states: Vec::new(),
+                layer_map: Vec::new(),
+                head_v_dim: 0,
+                num_v_heads: 0,
+                conv_dim: 0,
+                conv_kernel: 0,
+            };
+        }
+
+        let num_v_heads = config.ssm_dt_rank;
+        let head_v_dim = if num_v_heads > 0 { config.ssm_d_inner / num_v_heads } else { 0 };
+        let num_k_heads = config.ssm_n_group;
+        let conv_dim = 2 * config.ssm_d_state * num_k_heads + config.ssm_d_inner;
+        let conv_kernel = config.ssm_d_conv;
+
+        let num_recurrent = config.recurrent_layers.iter().filter(|&&r| r).count();
+
+        let mut layer_map = vec![None; config.num_layers];
+        let mut idx = 0;
+        for (i, &is_recr) in config.recurrent_layers.iter().enumerate() {
+            if is_recr {
+                layer_map[i] = Some(idx);
+                idx += 1;
+            }
+        }
+
+        let state_size = head_v_dim * head_v_dim * num_v_heads;
+        let conv_state_size = (conv_kernel.saturating_sub(1)) * conv_dim;
+
+        Self {
+            gdn_states: vec![vec![0.0f32; state_size]; num_recurrent],
+            conv_states: vec![vec![0.0f32; conv_state_size]; num_recurrent],
+            layer_map,
+            head_v_dim,
+            num_v_heads,
+            conv_dim,
+            conv_kernel,
+        }
+    }
+
+    pub fn is_recurrent(&self, layer: usize) -> bool {
+        self.layer_map.get(layer).is_some_and(|v| v.is_some())
+    }
+
+    pub fn gdn_state(&self, layer: usize) -> Option<&[f32]> {
+        self.layer_map.get(layer)?.map(|idx| self.gdn_states[idx].as_slice())
+    }
+
+    pub fn gdn_state_mut(&mut self, layer: usize) -> Option<&mut [f32]> {
+        let idx = (*self.layer_map.get(layer)?)?;
+        Some(self.gdn_states[idx].as_mut_slice())
+    }
+
+    pub fn conv_state(&self, layer: usize) -> Option<&[f32]> {
+        self.layer_map.get(layer)?.map(|idx| self.conv_states[idx].as_slice())
+    }
+
+    pub fn conv_state_mut(&mut self, layer: usize) -> Option<&mut [f32]> {
+        let idx = (*self.layer_map.get(layer)?)?;
+        Some(self.conv_states[idx].as_mut_slice())
+    }
+
+    pub fn head_v_dim(&self) -> usize { self.head_v_dim }
+    pub fn num_v_heads(&self) -> usize { self.num_v_heads }
+    pub fn conv_dim(&self) -> usize { self.conv_dim }
+    pub fn conv_kernel(&self) -> usize { self.conv_kernel }
+
+    pub fn reset(&mut self) {
+        for s in &mut self.gdn_states { s.fill(0.0); }
+        for s in &mut self.conv_states { s.fill(0.0); }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

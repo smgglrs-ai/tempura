@@ -626,6 +626,28 @@ where
             })
             .collect();
 
+        let ssm_names: Vec<_> = (0..cfg.num_layers)
+            .map(|l| {
+                let p = format!("model.layers.{l}");
+                (
+                    format!("{p}.ssm.qkv_proj.weight"),
+                    format!("{p}.ssm.gate_proj.weight"),
+                    format!("{p}.ssm.in_proj.weight"),
+                    format!("{p}.ssm.conv1d.weight"),
+                    format!("{p}.ssm.dt.bias"),
+                    format!("{p}.ssm.a"),
+                    format!("{p}.ssm.beta.weight"),
+                    format!("{p}.ssm.alpha.weight"),
+                    format!("{p}.ssm.ba.weight"),
+                    format!("{p}.ssm.norm.weight"),
+                    format!("{p}.ssm.out.weight"),
+                )
+            })
+            .collect();
+
+        let mut deltanet_state = crate::kv_cache::DeltaNetState::new(cfg);
+        let is_hybrid = !cfg.recurrent_layers.is_empty();
+
         for layer in 0..cfg.num_layers {
             let (
                 ref input_ln_name,
@@ -663,6 +685,131 @@ where
                 tempura_kernels::portable_math::q8_snap(&mut normed[..seq_len * h]);
             }
 
+            if is_hybrid && deltanet_state.is_recurrent(layer) && seq_len == 1 {
+                let (
+                    ref qkv_name, ref gate_name, ref in_proj_name,
+                    ref conv1d_name, ref dt_bias_name, ref a_name,
+                    ref beta_name, ref alpha_name, ref ba_name,
+                    ref ssm_norm_name, ref ssm_out_name,
+                ) = ssm_names[layer];
+
+                let sv = deltanet_state.head_v_dim();
+                let nv = deltanet_state.num_v_heads();
+                let nk = cfg.ssm_n_group;
+                let sk = cfg.ssm_d_state;
+                let value_dim = sv * nv;
+                let key_dim = sk * nk;
+
+                let mut qkv_buf = vec![0.0f32; key_dim * 2 + value_dim];
+                let mut z_buf = vec![0.0f32; value_dim];
+
+                if let Some(qkv_w) = qweights.get_q2(qkv_name)
+                    .or_else(|| qweights.get_q4k(qkv_name)) {
+                    q4k.forward_b_transposed_q4k(&normed[..h], qkv_w, &mut qkv_buf, 1, key_dim * 2 + value_dim, h).unwrap();
+                } else if qweights.get_f32(in_proj_name).is_some() {
+                    let w = qweights.get_f32(in_proj_name).unwrap();
+                    let out_dim = key_dim * 2 + value_dim * 2;
+                    let mut combined = vec![0.0f32; out_dim];
+                    self.pipeline.matmul_bt(&normed[..h], w, &mut combined, 1, out_dim, h).unwrap();
+                    qkv_buf.copy_from_slice(&combined[..key_dim * 2 + value_dim]);
+                    z_buf.copy_from_slice(&combined[key_dim * 2 + value_dim..]);
+                } else {
+                    // Skip layer if weights not found
+                    continue;
+                }
+
+                if qweights.get_f32(gate_name).is_some() || qweights.get_q2(gate_name).is_some() || qweights.get_q4k(gate_name).is_some() {
+                    if let Some(w) = qweights.get_f32(gate_name) {
+                        self.pipeline.matmul_bt(&normed[..h], w, &mut z_buf, 1, value_dim, h).unwrap();
+                    } else if let Some(w) = qweights.get_q2(gate_name).or_else(|| qweights.get_q4k(gate_name)) {
+                        q4k.forward_b_transposed_q4k(&normed[..h], w, &mut z_buf, 1, value_dim, h).unwrap();
+                    }
+                }
+
+                let mut ba_buf = vec![0.0f32; nv * 2];
+                if let Some(w) = qweights.get_f32(ba_name) {
+                    self.pipeline.matmul_bt(&normed[..h], w, &mut ba_buf, 1, nv * 2, h).unwrap();
+                } else if let Some(w) = qweights.get_f32(beta_name) {
+                    let bw = w;
+                    self.pipeline.matmul_bt(&normed[..h], bw, &mut ba_buf[..nv], 1, nv, h).unwrap();
+                    if let Some(aw) = qweights.get_f32(alpha_name) {
+                        self.pipeline.matmul_bt(&normed[..h], aw, &mut ba_buf[nv..], 1, nv, h).unwrap();
+                    }
+                }
+
+                let mut beta_vec = vec![0.0f32; nv];
+                let mut gate_vec = vec![0.0f32; nv];
+                let dt_bias = qweights.get_f32(dt_bias_name).unwrap_or(&[]);
+                let a_log = qweights.get_f32(a_name).unwrap_or(&[]);
+                for i in 0..nv {
+                    beta_vec[i] = tempura_kernels::deltanet::sigmoid(ba_buf[i]);
+                    let alpha_raw = ba_buf[nv + i];
+                    let dt_b = if i < dt_bias.len() { dt_bias[i] } else { 0.0 };
+                    let a_val = if i < a_log.len() { a_log[i] } else { 0.0 };
+                    gate_vec[i] = -a_val.exp() * tempura_kernels::deltanet::softplus(alpha_raw + dt_b);
+                }
+
+                // Conv1d
+                let conv_dim = deltanet_state.conv_dim();
+                let conv_kernel = deltanet_state.conv_kernel();
+                let mut conv_out = vec![0.0f32; conv_dim];
+                if let Some(conv_w) = qweights.get_f32(conv1d_name) {
+                    if let Some(cs) = deltanet_state.conv_state_mut(layer) {
+                        tempura_kernels::deltanet::conv1d_step(cs, &qkv_buf, conv_w, &mut conv_out, conv_dim, conv_kernel);
+                    }
+                } else {
+                    conv_out[..qkv_buf.len().min(conv_dim)].copy_from_slice(&qkv_buf[..qkv_buf.len().min(conv_dim)]);
+                }
+
+                // SiLU activation on conv output
+                for v in conv_out.iter_mut() {
+                    *v = tempura_kernels::deltanet::silu(*v);
+                }
+
+                // Split Q, K, V from conv output
+                let mut q_lin = vec![0.0f32; key_dim];
+                let mut k_lin = vec![0.0f32; key_dim];
+                let mut v_lin = vec![0.0f32; value_dim];
+                q_lin.copy_from_slice(&conv_out[..key_dim]);
+                k_lin.copy_from_slice(&conv_out[key_dim..key_dim * 2]);
+                v_lin.copy_from_slice(&conv_out[key_dim * 2..key_dim * 2 + value_dim]);
+
+                // L2 normalize Q and K per head
+                for kh in 0..nk {
+                    tempura_kernels::deltanet::l2_normalize(&mut q_lin[kh * sk..(kh + 1) * sk], cfg.layer_norm_eps);
+                    tempura_kernels::deltanet::l2_normalize(&mut k_lin[kh * sk..(kh + 1) * sk], cfg.layer_norm_eps);
+                }
+
+                // GDN state update
+                let mut gdn_out = vec![0.0f32; value_dim];
+                if let Some(state) = deltanet_state.gdn_state_mut(layer) {
+                    tempura_kernels::deltanet::gated_delta_net_decode(
+                        &q_lin, &k_lin, &v_lin, &gate_vec, &beta_vec,
+                        state, &mut gdn_out, sv, nv, nk,
+                    );
+                }
+
+                // Gated norm: RMSNorm(gdn_out) * SiLU(z)
+                let ssm_norm_default = vec![1.0f32; sv];
+                let ssm_norm_w = qweights.get_f32(ssm_norm_name).unwrap_or(&ssm_norm_default);
+                let mut normed_out = vec![0.0f32; value_dim];
+                tempura_kernels::deltanet::gated_rmsnorm_silu(
+                    &gdn_out, &z_buf, ssm_norm_w, cfg.layer_norm_eps,
+                    &mut normed_out, sv, nv,
+                );
+
+                // Output projection
+                o_proj.fill(0.0);
+                if let Some(w) = qweights.get_f32(ssm_out_name) {
+                    self.pipeline.matmul_bt(&normed_out, w, &mut o_proj[..h], 1, h, value_dim).unwrap();
+                } else if let Some(w) = qweights.get_q2(ssm_out_name).or_else(|| qweights.get_q4k(ssm_out_name)) {
+                    q4k.forward_b_transposed_q4k(&normed_out, w, &mut o_proj[..h], 1, h, value_dim).unwrap();
+                }
+
+                tempura_kernels::fused::residual_add(&mut hidden[..h], &o_proj[..h], h);
+
+                // Skip standard attention — fall through to FFN
+            } else {
 
             let normed_preq = if seq_len == 1 {
                 if cfg.hidden_act == crate::config::HiddenAct::SquaredRelu {
@@ -821,6 +968,8 @@ where
                 let norm: f32 = last.iter().map(|x| x * x).sum::<f32>().sqrt();
                 eprintln!("L0 post-attn hidden[last][0..8]: {:?} norm={norm:.4}", &last[..8.min(h)]);
             }
+
+            } // end else (standard attention)
 
             // FFN block
             normed2.copy_from_slice(&hidden);
@@ -5179,6 +5328,12 @@ mod tests {
             tensor_parallel_size: 1,
             use_qk_norm: false,
             sliding_window: None,
+            recurrent_layers: Vec::new(),
+            ssm_d_conv: 0,
+            ssm_d_state: 0,
+            ssm_d_inner: 0,
+            ssm_dt_rank: 0,
+            ssm_n_group: 0,
         };
 
         let q_dim = heads * head_dim;
@@ -5278,6 +5433,12 @@ mod tests {
             tensor_parallel_size: 1,
             use_qk_norm: false,
             sliding_window: None,
+            recurrent_layers: Vec::new(),
+            ssm_d_conv: 0,
+            ssm_d_state: 0,
+            ssm_d_inner: 0,
+            ssm_dt_rank: 0,
+            ssm_n_group: 0,
         };
 
         let q_dim = heads * head_dim;

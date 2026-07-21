@@ -258,6 +258,9 @@ pub struct QuantizedWeights {
     mmap: Option<memmap2::Mmap>,
     mmap_i2s: HashMap<String, (usize, usize)>,
     mmap_f16: HashMap<String, (usize, usize)>,
+    mmap_q4k: HashMap<String, (usize, usize)>,
+    mmap_q6k: HashMap<String, (usize, usize)>,
+    mmap_q2: HashMap<String, (usize, usize)>,
 }
 
 impl QuantizedWeights {
@@ -277,6 +280,9 @@ impl QuantizedWeights {
             mmap: None,
             mmap_i2s: HashMap::new(),
             mmap_f16: HashMap::new(),
+            mmap_q4k: HashMap::new(),
+            mmap_q6k: HashMap::new(),
+            mmap_q2: HashMap::new(),
         }
     }
 
@@ -298,15 +304,27 @@ impl QuantizedWeights {
             mmap: None,
             mmap_i2s: HashMap::new(),
             mmap_f16: HashMap::new(),
+            mmap_q4k: HashMap::new(),
+            mmap_q6k: HashMap::new(),
+            mmap_q2: HashMap::new(),
         }
     }
 
     pub fn get_q4k(&self, name: &str) -> Option<&[u8]> {
         self.q4k_tensors.get(name).map(|v| v.as_slice())
+            .or_else(|| self.mmap_q4k.get(name).and_then(|&(off, len)|
+                self.mmap.as_ref().map(|m| &m[off..off+len])))
     }
 
     pub fn get_q6k(&self, name: &str) -> Option<&[u8]> {
         self.q6k_tensors.get(name).map(|v| v.as_slice())
+            .or_else(|| self.mmap_q6k.get(name).and_then(|&(off, len)|
+                self.mmap.as_ref().map(|m| &m[off..off+len])))
+    }
+
+    pub fn get_q2(&self, name: &str) -> Option<&[u8]> {
+        self.mmap_q2.get(name).and_then(|&(off, len)|
+            self.mmap.as_ref().map(|m| &m[off..off+len]))
     }
 
     pub fn get_tq2(&self, name: &str) -> Option<&[u8]> {
@@ -348,6 +366,18 @@ impl QuantizedWeights {
 
     pub fn register_mmap_f16(&mut self, name: String, offset: usize, len: usize) {
         self.mmap_f16.insert(name, (offset, len));
+    }
+
+    pub fn register_mmap_q4k(&mut self, name: String, offset: usize, len: usize) {
+        self.mmap_q4k.insert(name, (offset, len));
+    }
+
+    pub fn register_mmap_q6k(&mut self, name: String, offset: usize, len: usize) {
+        self.mmap_q6k.insert(name, (offset, len));
+    }
+
+    pub fn register_mmap_q2(&mut self, name: String, offset: usize, len: usize) {
+        self.mmap_q2.insert(name, (offset, len));
     }
 
     pub fn get_f32(&self, name: &str) -> Option<&[f32]> {
