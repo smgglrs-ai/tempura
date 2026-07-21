@@ -862,7 +862,6 @@ where
                 let dn_dim = dn_heads * dn_head_dim;
                 let ssm_a_val = cfg.ssm_a.unwrap_or(-1.0);
                 if layer == 0 {
-                    eprintln!("[deltanet] layer 0: dn_heads={dn_heads} dn_head_dim={dn_head_dim} dn_dim={dn_dim} ssm_a={ssm_a_val} cfg.deltanet_num_heads={:?} cfg.deltanet_head_dim={:?}", cfg.deltanet_num_heads, cfg.deltanet_head_dim);
                 }
 
                 normed.copy_from_slice(&hidden);
