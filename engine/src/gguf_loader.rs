@@ -704,6 +704,10 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "ffn_down.weight" => "mlp.down_proj.weight",
             "ffn_sub_norm.weight" => "mlp.ffn_sub_norm.weight",
             "attn_sub_norm.weight" => "self_attn.attn_sub_norm.weight",
+            "ssm_in.weight" => "ssm.in_proj.weight",
+            "ssm_out.weight" => "ssm.out_proj.weight",
+            "ssm_dt.bias" => "ssm.dt.bias",
+            "ssm_a" => "ssm.A",
             _ => return None,
         };
         return Some(format!("model.layers.{n}.{hf_suffix}"));
@@ -785,6 +789,64 @@ fn get_usize_from_meta(metadata: &HashMap<String, GgufValue>, suffix: &str) -> O
         }
     }
     None
+}
+
+fn detect_and_apply_hybrid_layers(
+    config: &mut ModelConfig,
+    tensor_names: &[&str],
+    metadata: &HashMap<String, GgufValue>,
+) {
+    use crate::config::LayerKind;
+
+    let has_ssm = tensor_names.iter().any(|n| n.contains("ssm_in") || n.contains("ssm.in_proj"));
+    if !has_ssm {
+        return;
+    }
+
+    let mut kinds = Vec::with_capacity(config.num_layers);
+    for layer in 0..config.num_layers {
+        let attn_key = format!("blk.{layer}.attn_q.weight");
+        let attn_key_hf = format!("model.layers.{layer}.self_attn.q_proj.weight");
+        let ssm_key = format!("blk.{layer}.ssm_in.weight");
+        let ssm_key_hf = format!("model.layers.{layer}.ssm.in_proj.weight");
+
+        let has_attn = tensor_names.iter().any(|n| *n == attn_key || *n == attn_key_hf);
+        let has_ssm_layer = tensor_names.iter().any(|n| *n == ssm_key || *n == ssm_key_hf);
+
+        if has_ssm_layer && !has_attn {
+            kinds.push(LayerKind::DeltaNet);
+        } else {
+            kinds.push(LayerKind::Attention);
+        }
+    }
+
+    if kinds.iter().all(|k| *k == LayerKind::Attention) {
+        return;
+    }
+
+    let arch = metadata
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+        .unwrap_or("llama");
+
+    config.deltanet_num_heads = metadata
+        .get(&format!("{arch}.ssm.head_count"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .or(Some(config.num_kv_heads));
+
+    config.deltanet_head_dim = metadata
+        .get(&format!("{arch}.ssm.head_dim"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .or(Some(config.head_dim));
+
+    config.ssm_a = metadata
+        .get(&format!("{arch}.ssm.time_step_a"))
+        .and_then(|v| v.as_f32())
+        .or_else(|| metadata.get("ssm.time_step_a").and_then(|v| v.as_f32()));
+
+    config.layer_kinds = Some(kinds);
 }
 
 pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConfig, LoadError> {
@@ -1067,6 +1129,20 @@ impl GgufLoader {
         }
         config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
 
+        {
+            let all_names: Vec<String> = tensors.keys()
+                .chain(raw_tensors.keys())
+                .chain(f16_raw_tensors.keys())
+                .chain(mmap_ranges.keys())
+                .cloned()
+                .collect();
+            detect_and_apply_hybrid_layers(
+                &mut config,
+                &all_names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                &metadata,
+            );
+        }
+
         if !tensors.contains_key("lm_head.weight") && !raw_tensors.contains_key("lm_head.weight")
             && !f16_raw_tensors.contains_key("lm_head.weight")
             && !mmap_ranges.contains_key("lm_head.weight") {
@@ -1202,6 +1278,12 @@ impl GgufLoader {
         }
 
         config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
+
+        detect_and_apply_hybrid_layers(
+            &mut config,
+            &tensors.keys().map(|s| s.as_str()).collect::<Vec<_>>(),
+            &metadata,
+        );
 
         Ok(Self {
             mmap: None,

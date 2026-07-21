@@ -67,19 +67,20 @@ unsafe fn f16_slice_to_f32(src: &[u16], dst: &mut [f32]) {
 
 impl KvCache {
     pub fn new(config: &ModelConfig) -> Self {
+        let num_cache_layers = config.num_attention_layers();
         let layer_size = config.max_seq_len * config.num_kv_heads * config.head_dim;
         let use_f16 = config.hidden_act == crate::config::HiddenAct::SquaredRelu
             && is_x86_feature_detected!("f16c");
-        let k: Vec<Vec<f32>> = (0..config.num_layers)
+        let k: Vec<Vec<f32>> = (0..num_cache_layers)
             .map(|_| if use_f16 { Vec::new() } else { vec![0.0; layer_size] })
             .collect();
-        let v: Vec<Vec<f32>> = (0..config.num_layers)
+        let v: Vec<Vec<f32>> = (0..num_cache_layers)
             .map(|_| if use_f16 { Vec::new() } else { vec![0.0; layer_size] })
             .collect();
-        let k_f16: Vec<Vec<u16>> = (0..config.num_layers)
+        let k_f16: Vec<Vec<u16>> = (0..num_cache_layers)
             .map(|_| if use_f16 { vec![0u16; layer_size] } else { Vec::new() })
             .collect();
-        let v_f16: Vec<Vec<u16>> = (0..config.num_layers)
+        let v_f16: Vec<Vec<u16>> = (0..num_cache_layers)
             .map(|_| if use_f16 { vec![0u16; layer_size] } else { Vec::new() })
             .collect();
 
@@ -90,7 +91,7 @@ impl KvCache {
             v_f16,
             use_f16,
             seq_len: 0,
-            num_layers: config.num_layers,
+            num_layers: num_cache_layers,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
             max_seq_len: config.max_seq_len,
@@ -102,12 +103,13 @@ impl KvCache {
     }
 
     pub fn new_compressed(config: &ModelConfig, compressor: Box<dyn KvCacheCompressor>) -> Self {
-        let k: Vec<Vec<f32>> = (0..config.num_layers).map(|_| Vec::new()).collect();
-        let v: Vec<Vec<f32>> = (0..config.num_layers).map(|_| Vec::new()).collect();
+        let num_cache_layers = config.num_attention_layers();
+        let k: Vec<Vec<f32>> = (0..num_cache_layers).map(|_| Vec::new()).collect();
+        let v: Vec<Vec<f32>> = (0..num_cache_layers).map(|_| Vec::new()).collect();
         let k_compressed: Vec<Option<CompressedKV>> =
-            (0..config.num_layers).map(|_| None).collect();
+            (0..num_cache_layers).map(|_| None).collect();
         let v_compressed: Vec<Option<CompressedKV>> =
-            (0..config.num_layers).map(|_| None).collect();
+            (0..num_cache_layers).map(|_| None).collect();
 
         Self {
             k,
@@ -116,7 +118,7 @@ impl KvCache {
             v_f16: Vec::new(),
             use_f16: false,
             seq_len: 0,
-            num_layers: config.num_layers,
+            num_layers: num_cache_layers,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
             max_seq_len: config.max_seq_len,
@@ -814,15 +816,16 @@ pub struct PagedKvCache {
 
 impl PagedKvCache {
     pub fn new(config: &crate::config::ModelConfig, total_pages: usize, block_size: usize) -> Self {
+        let num_cache_layers = config.num_attention_layers();
         let page_stride = block_size * config.num_kv_heads * config.head_dim;
-        let k_pages = (0..config.num_layers)
+        let k_pages = (0..num_cache_layers)
             .map(|_| vec![0.0f32; total_pages * page_stride])
             .collect();
-        let v_pages = (0..config.num_layers)
+        let v_pages = (0..num_cache_layers)
             .map(|_| vec![0.0f32; total_pages * page_stride])
             .collect();
         let max_blocks = (config.max_seq_len + block_size - 1) / block_size;
-        let block_tables = (0..config.num_layers)
+        let block_tables = (0..num_cache_layers)
             .map(|_| BlockTable::new(max_blocks))
             .collect();
 
@@ -832,7 +835,7 @@ impl PagedKvCache {
             block_tables,
             allocator: PageAllocator::new(total_pages),
             seq_len: 0,
-            num_layers: config.num_layers,
+            num_layers: num_cache_layers,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
             block_size,

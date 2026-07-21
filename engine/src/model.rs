@@ -200,6 +200,9 @@ where
             .map(|p| p as u32)
             .collect();
 
+        let cache_layer_map = cfg.cache_layer_map();
+        let mut deltanet_layer_idx = 0usize;
+
         for layer in 0..cfg.num_layers {
             let layer_start = Instant::now();
             let prefix = format!("model.layers.{layer}");
@@ -211,6 +214,14 @@ where
                 attention_scores: None,
                 duration: None,
             };
+
+            let layer_kind = cfg.layer_kinds.as_ref()
+                .map(|kinds| kinds[layer])
+                .unwrap_or(crate::config::LayerKind::Attention);
+
+            if layer_kind == crate::config::LayerKind::DeltaNet {
+                deltanet_layer_idx += 1;
+            } else {
 
             // --- attention block ---
             let mut normed = hidden.clone();
@@ -310,11 +321,12 @@ where
                 .unwrap();
 
             let mut attn_out = vec![0.0f32; seq_len * q_dim];
+            let cl = cache_layer_map[layer].unwrap();
             if let Some(ref mut paged) = session.paged_cache {
-                paged.append_kv(layer, &k, &v, seq_len);
+                paged.append_kv(cl, &k, &v, seq_len);
                 let kv_len = paged.seq_len + seq_len;
-                let k_cont = paged.k_contiguous(layer, kv_len);
-                let v_cont = paged.v_contiguous(layer, kv_len);
+                let k_cont = paged.k_contiguous(cl, kv_len);
+                let v_cont = paged.v_contiguous(cl, kv_len);
                 self.pipeline
                     .attention(
                         &q,
@@ -331,10 +343,10 @@ where
                     )
                     .unwrap();
             } else {
-                session.cache.append_kv(layer, &k, &v, seq_len);
+                session.cache.append_kv(cl, &k, &v, seq_len);
                 let kv_len = session.cache.seq_len + seq_len;
-                let k_cache = session.cache.k_data(layer, kv_len);
-                let v_cache = session.cache.v_data(layer, kv_len);
+                let k_cache = session.cache.k_data(cl, kv_len);
+                let v_cache = session.cache.v_data(cl, kv_len);
                 self.pipeline
                     .attention(
                         &q,
@@ -360,6 +372,8 @@ where
             for i in 0..hidden.len() {
                 hidden[i] += o_proj[i];
             }
+
+            } // end Attention block
 
             // --- FFN block ---
             let mut normed2 = hidden.clone();
@@ -626,7 +640,17 @@ where
             })
             .collect();
 
+        let cache_layer_map_q = cfg.cache_layer_map();
+
         for layer in 0..cfg.num_layers {
+            let layer_kind = cfg.layer_kinds.as_ref()
+                .map(|kinds| kinds[layer])
+                .unwrap_or(crate::config::LayerKind::Attention);
+
+            if layer_kind == crate::config::LayerKind::DeltaNet {
+                continue;
+            }
+
             let (
                 ref input_ln_name,
                 ref post_ln_name,
@@ -752,15 +776,16 @@ where
                 self.pipeline.rope(&mut k, 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
             }
 
+            let cl_q = cache_layer_map_q[layer].unwrap();
             session.cache.append_kv(
-                layer,
+                cl_q,
                 &k[..seq_len * kv_dim],
                 &v[..seq_len * kv_dim],
                 seq_len,
             );
             let kv_len = session.cache.seq_len + seq_len;
-            let k_cache = session.cache.k_data(layer, kv_len);
-            let v_cache = session.cache.v_data(layer, kv_len);
+            let k_cache = session.cache.k_data(cl_q, kv_len);
+            let v_cache = session.cache.v_data(cl_q, kv_len);
 
             attn_out.fill(0.0);
             if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
@@ -1067,6 +1092,7 @@ where
         token_id: u32,
         qweights: &crate::weights::QuantizedWeights,
     ) -> Vec<f32> {
+        debug_assert!(self.config.layer_kinds.is_none(), "DeltaNet layers not supported in BitNet decode path");
         use tempura_kernels::quantized::{PreQuantizedActivations, i2s_gemv_cols, i2s_weight_scale};
         use tempura_kernels::tl2::{tl2_preprocess_into, tl2_gemv_tiles, Tl2Lut};
         use tempura_kernels::fused::{fused_rmsnorm_q8snap, fused_residual_rmsnorm_q8snap, fused_sqrelu_mul, residual_add};
@@ -1509,6 +1535,7 @@ where
         eos_token: Option<u32>,
         qweights: &crate::weights::QuantizedWeights,
     ) -> Vec<u32> {
+        debug_assert!(self.config.layer_kinds.is_none(), "DeltaNet layers not supported in BitNet decode path");
         use tempura_kernels::quantized::{i2s_gemv_cols, i2s_weight_scale};
         use tempura_kernels::tl2::{tl2_preprocess_into, tl2_gemv_tiles, Tl2Lut};
         use tempura_kernels::fused::{fused_rmsnorm_q8snap, fused_residual_rmsnorm_q8snap, fused_sqrelu_mul, residual_add};
@@ -1950,6 +1977,7 @@ where
         token_ids: &[u32],
         qweights: &crate::weights::QuantizedWeights,
     ) -> Vec<f32> {
+        debug_assert!(self.config.layer_kinds.is_none(), "DeltaNet layers not supported in BitNet prefill path");
         use tempura_kernels::tl2::{tl2_forward, BatchedTl2Lut, Tl2Config};
         use tempura_kernels::fused::{fused_rmsnorm_q8snap, fused_residual_rmsnorm_q8snap, fused_sqrelu_mul, residual_add};
         use std::time::Instant;
