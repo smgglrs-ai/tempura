@@ -26,7 +26,14 @@ impl CpuPolarQuant {
     pub fn default_3bit() -> Self {
         Self {
             bits: 3,
-            group_size: 2,
+            group_size: 32,
+        }
+    }
+
+    pub fn default_2bit() -> Self {
+        Self {
+            bits: 2,
+            group_size: 32,
         }
     }
 }
@@ -90,6 +97,54 @@ impl KvCacheCompressor for CpuPolarQuant {
             group_size: self.group_size,
             bits: self.bits,
         })
+    }
+
+    fn compress_append(&self, existing: &mut CompressedKV, new_data: &[f32]) -> Result<()> {
+        let head_dim = existing.head_dim;
+        if head_dim == 0 {
+            return Err(crate::KernelError::InvalidConfig(
+                "head_dim must be > 0".into(),
+            ));
+        }
+        if !new_data.len().is_multiple_of(head_dim) {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: 0,
+                got: new_data.len() % head_dim,
+            });
+        }
+
+        let num_new_vectors = new_data.len() / head_dim;
+        let groups_per_vec = head_dim.div_ceil(self.group_size);
+        let levels = (1u32 << self.bits) - 1;
+
+        for vi in 0..num_new_vectors {
+            let vec_start = vi * head_dim;
+
+            for gi in 0..groups_per_vec {
+                let g_start = vec_start + gi * self.group_size;
+                let g_end = (g_start + self.group_size).min(vec_start + head_dim);
+                let group = &new_data[g_start..g_end];
+
+                let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                existing.mins.push(min_val);
+                existing.maxs.push(max_val);
+
+                let range = max_val - min_val;
+                for &val in group {
+                    if range < 1e-30 {
+                        existing.quantized.push(0);
+                    } else {
+                        let normalized = (val - min_val) / range;
+                        let q = (normalized * levels as f32).round().min(levels as f32) as u8;
+                        existing.quantized.push(q);
+                    }
+                }
+            }
+        }
+
+        existing.num_vectors += num_new_vectors;
+        Ok(())
     }
 
     fn decompress(&self, compressed: &CompressedKV) -> Result<Vec<f32>> {
@@ -240,6 +295,50 @@ mod kani_proofs {
         let output_pos = vi * head_dim + g_start;
         assert!(output_pos + g_len <= total_elements);
     }
+
+    #[kani::proof]
+    fn compress_append_indices_in_bounds() {
+        let head_dim: usize = kani::any();
+        let num_existing: usize = kani::any();
+        let num_new: usize = kani::any();
+        let group_size: usize = kani::any();
+
+        kani::assume(head_dim >= 1 && head_dim <= 8);
+        kani::assume(num_existing >= 1 && num_existing <= 4);
+        kani::assume(num_new >= 1 && num_new <= 4);
+        kani::assume(group_size >= 1 && group_size <= 8);
+
+        let groups_per_vec = (head_dim + group_size - 1) / group_size;
+        let existing_groups = num_existing * groups_per_vec;
+        let existing_elements = num_existing * head_dim;
+        let new_data_len = num_new * head_dim;
+        let total_groups_after = (num_existing + num_new) * groups_per_vec;
+        let total_elements_after = (num_existing + num_new) * head_dim;
+
+        let vi: usize = kani::any();
+        let gi: usize = kani::any();
+        kani::assume(vi < num_new);
+        kani::assume(gi < groups_per_vec);
+
+        let vec_start = vi * head_dim;
+        let g_start = vec_start + gi * group_size;
+        let g_end_candidate = g_start + group_size;
+        let g_end = if g_end_candidate < vec_start + head_dim {
+            g_end_candidate
+        } else {
+            vec_start + head_dim
+        };
+
+        assert!(g_start < new_data_len);
+        assert!(g_end <= new_data_len);
+
+        let new_group_idx = existing_groups + vi * groups_per_vec + gi;
+        assert!(new_group_idx < total_groups_after);
+
+        let new_element_offset = existing_elements + g_start;
+        let g_len = g_end - g_start;
+        assert!(new_element_offset + g_len <= total_elements_after);
+    }
 }
 
 #[cfg(test)]
@@ -302,8 +401,8 @@ mod tests {
         }
         let mean_err = total_err / num_vectors as f32;
         assert!(
-            mean_err < 0.05,
-            "mean relative error {mean_err} >= 5% across {num_vectors} vectors"
+            mean_err < 0.15,
+            "mean relative error {mean_err} >= 15% across {num_vectors} vectors"
         );
     }
 
@@ -367,7 +466,7 @@ mod tests {
             );
         }
         let mean_err = total_err / 3.0;
-        assert!(mean_err < 0.05, "mean error {mean_err} >= 5%");
+        assert!(mean_err < 0.10, "mean error {mean_err} >= 10%");
     }
 
     #[test]
@@ -458,7 +557,46 @@ mod tests {
                 let error: f32 = values.iter().zip(decompressed.iter())
                     .map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
                 let relative = error / norm;
-                prop_assert!(relative < 0.15, "round-trip error {:.4} >= 15%", relative);
+                prop_assert!(relative < 0.25, "round-trip error {:.4} >= 25%", relative);
+            }
+
+            #[test]
+            fn prop_compress_append_equivalent(
+                num_first in 1usize..=4,
+                num_second in 1usize..=4,
+                head_dim in prop::sample::select(vec![4usize, 8, 16, 32, 64]),
+            ) {
+                use rand::rngs::StdRng;
+                use rand::{Rng, SeedableRng};
+
+                let mut rng = StdRng::seed_from_u64(
+                    (num_first * 1000 + num_second * 100 + head_dim) as u64,
+                );
+                let data1: Vec<f32> = (0..num_first * head_dim)
+                    .map(|_| rng.random_range(-1.0..1.0))
+                    .collect();
+                let data2: Vec<f32> = (0..num_second * head_dim)
+                    .map(|_| rng.random_range(-1.0..1.0))
+                    .collect();
+
+                let compressor = CpuPolarQuant::default_3bit();
+
+                let mut combined = data1.clone();
+                combined.extend_from_slice(&data2);
+                let full_compressed = compressor.compress(&combined, head_dim).unwrap();
+                let full_decompressed = compressor.decompress(&full_compressed).unwrap();
+
+                let mut incremental = compressor.compress(&data1, head_dim).unwrap();
+                compressor.compress_append(&mut incremental, &data2).unwrap();
+                let inc_decompressed = compressor.decompress(&incremental).unwrap();
+
+                prop_assert_eq!(full_decompressed.len(), inc_decompressed.len());
+                for (i, (a, b)) in full_decompressed.iter().zip(&inc_decompressed).enumerate() {
+                    prop_assert!(
+                        (a - b).abs() < 1e-6,
+                        "mismatch at {}: full={} inc={}", i, a, b,
+                    );
+                }
             }
         }
     }
@@ -490,8 +628,8 @@ mod tests {
         }
         let mean_err = total_err / num_vectors as f32;
         assert!(
-            mean_err < 0.05,
-            "mean error {mean_err} >= 5% across {num_vectors} vectors"
+            mean_err < 0.15,
+            "mean error {mean_err} >= 15% across {num_vectors} vectors"
         );
     }
 }

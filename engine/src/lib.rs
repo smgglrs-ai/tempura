@@ -1,6 +1,7 @@
 pub mod architecture;
 pub mod batch_invariant;
 pub mod config;
+pub mod deltanet_state;
 pub mod disaggregated;
 pub mod dual_pipeline;
 pub mod gguf_loader;

@@ -330,6 +330,13 @@ impl CompressedKV {
 pub trait KvCacheCompressor: Send + Sync {
     fn compress(&self, data: &[f32], head_dim: usize) -> Result<CompressedKV>;
     fn decompress(&self, compressed: &CompressedKV) -> Result<Vec<f32>>;
+
+    fn compress_append(&self, existing: &mut CompressedKV, new_data: &[f32]) -> Result<()> {
+        let mut all_data = self.decompress(existing)?;
+        all_data.extend_from_slice(new_data);
+        *existing = self.compress(&all_data, existing.head_dim)?;
+        Ok(())
+    }
 }
 
 // ── MatMulQ (quantized) ─────────────────────────────────────────────────────
@@ -465,6 +472,45 @@ pub trait GuidedDecoder: Send {
     }
 }
 
+// ── DeltaNet (Gated Delta Rule) ────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+pub trait DeltaNet: Send + Sync {
+    fn forward_recurrent(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        alpha: &[f32],
+        beta: &[f32],
+        state: &mut [f32],
+        output: &mut [f32],
+        num_heads: usize,
+        head_dim: usize,
+        ssm_a: f32,
+    ) -> Result<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_chunk(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        alpha: &[f32],
+        beta: &[f32],
+        state: &mut [f32],
+        output: &mut [f32],
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        ssm_a: f32,
+    ) -> Result<()>;
+
+    fn verification_tier(&self) -> VerificationTier {
+        VerificationTier::Compiled
+    }
+}
+
 // ── Verification contracts ─────────────────────────────────────────────────
 //
 // Shared trait contracts for struct invariants. Both the real implementation
@@ -532,5 +578,18 @@ pub trait VerifiedPrefixCache {
 
     fn well_formed(&self) -> bool {
         self.num_entries() <= self.max_entries()
+    }
+}
+
+pub trait VerifiedDeltaNetState {
+    fn num_layers(&self) -> usize;
+    fn num_heads(&self) -> usize;
+    fn head_dim(&self) -> usize;
+    fn state_size(&self) -> usize;
+
+    fn well_formed(&self) -> bool {
+        self.num_heads() >= 1
+            && self.head_dim() >= 1
+            && self.state_size() == self.num_heads() * self.head_dim() * self.head_dim()
     }
 }

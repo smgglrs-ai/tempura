@@ -726,6 +726,8 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "attn_k.weight" => "self_attn.k_proj.weight",
             "attn_v.weight" => "self_attn.v_proj.weight",
             "attn_output.weight" => "self_attn.o_proj.weight",
+            "attn_qkv.weight" => "ssm.qkv_proj.weight",
+            "attn_gate.weight" => "ssm.gate_proj.weight",
             "attn_q_norm.weight" => "self_attn.q_norm.weight",
             "attn_k_norm.weight" => "self_attn.k_norm.weight",
             "ffn_gate.weight" => "mlp.gate_proj.weight",
@@ -733,19 +735,20 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "ffn_down.weight" => "mlp.down_proj.weight",
             "ffn_sub_norm.weight" => "mlp.ffn_sub_norm.weight",
             "attn_sub_norm.weight" => "self_attn.attn_sub_norm.weight",
-            // DeltaNet / hybrid attention (Qwen3.5/Qwen3Next)
             "attn_qkv.weight" => "ssm.qkv_proj.weight",
             "attn_gate.weight" => "ssm.gate_proj.weight",
             "ssm_in.weight" => "ssm.in_proj.weight",
+            "ssm_out.weight" => "ssm.out_proj.weight",
             "ssm_conv1d.weight" => "ssm.conv1d.weight",
             "ssm_conv1d.bias" => "ssm.conv1d.bias",
-            "ssm_dt.bias" => "ssm.dt.bias",
-            "ssm_a" => "ssm.a",
-            "ssm_beta.weight" => "ssm.beta.weight",
-            "ssm_alpha.weight" => "ssm.alpha.weight",
-            "ssm_ba.weight" => "ssm.ba.weight",
+            "ssm_dt.weight" => "ssm.dt_proj.weight",
+            "ssm_dt.bias" => "ssm.dt_proj.bias",
+            "ssm_a" => "ssm.A_log",
             "ssm_norm.weight" => "ssm.norm.weight",
-            "ssm_out.weight" => "ssm.out.weight",
+            "ssm_beta_alpha.weight" => "ssm.beta_alpha.weight",
+            "ssm_ba.weight" => "ssm.beta_alpha.weight",
+            "ssm_alpha.weight" => "ssm.alpha.weight",
+            "ssm_beta.weight" => "ssm.beta.weight",
             _ => return None,
         };
         return Some(format!("model.layers.{n}.{hf_suffix}"));
@@ -827,6 +830,80 @@ fn get_usize_from_meta(metadata: &HashMap<String, GgufValue>, suffix: &str) -> O
         }
     }
     None
+}
+
+fn detect_and_apply_hybrid_layers(
+    config: &mut ModelConfig,
+    tensor_names: &[&str],
+    metadata: &HashMap<String, GgufValue>,
+) {
+    use crate::config::LayerKind;
+
+    let arch = metadata
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+        .unwrap_or("llama");
+
+    // Primary detection: full_attention_interval metadata (Qwen3.5/3.6)
+    let interval = metadata
+        .get(&format!("{arch}.full_attention_interval"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| metadata.get("full_attention_interval").and_then(|v| v.as_u64()));
+
+    if let Some(interval) = interval {
+        let interval = interval as usize;
+        let mut kinds = Vec::with_capacity(config.num_layers);
+        for layer in 0..config.num_layers {
+            if (layer + 1) % interval == 0 {
+                kinds.push(LayerKind::Attention);
+            } else {
+                kinds.push(LayerKind::DeltaNet);
+            }
+        }
+        config.layer_kinds = Some(kinds);
+    } else {
+        // Fallback: scan tensor names for ssm_alpha (DeltaNet marker)
+        let has_ssm = tensor_names.iter().any(|n| n.contains("ssm_alpha") || n.contains("ssm.alpha"));
+        if !has_ssm {
+            return;
+        }
+
+        let mut kinds = Vec::with_capacity(config.num_layers);
+        for layer in 0..config.num_layers {
+            let ssm_key = format!("blk.{layer}.ssm_alpha.weight");
+            let ssm_key_hf = format!("model.layers.{layer}.ssm.alpha.weight");
+            let has_ssm_layer = tensor_names.iter().any(|n| *n == ssm_key || *n == ssm_key_hf);
+
+            if has_ssm_layer {
+                kinds.push(LayerKind::DeltaNet);
+            } else {
+                kinds.push(LayerKind::Attention);
+            }
+        }
+
+        if kinds.iter().all(|k| *k == LayerKind::Attention) {
+            return;
+        }
+        config.layer_kinds = Some(kinds);
+    }
+
+    // SSM dimensions from metadata
+    config.deltanet_num_heads = metadata
+        .get(&format!("{arch}.ssm.time_step_rank"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .or(Some(config.num_kv_heads));
+
+    config.deltanet_head_dim = metadata
+        .get(&format!("{arch}.ssm.state_size"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .or(Some(config.head_dim));
+
+    config.ssm_a = metadata
+        .get(&format!("{arch}.ssm.time_step_a"))
+        .and_then(|v| v.as_f32())
+        .or_else(|| metadata.get("ssm.time_step_a").and_then(|v| v.as_f32()));
 }
 
 pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConfig, LoadError> {
@@ -919,21 +996,6 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
     // layout determines which RoPE to use.
     let rope_type = crate::config::RopeType::Neox;
 
-    let is_hybrid = arch == "qwen35" || arch == "qwen3next" || arch == "qwen35moe";
-
-    let ssm_d_conv = get_usize("ssm.conv_kernel").unwrap_or(0);
-    let ssm_d_state = get_usize("ssm.state_size").unwrap_or(0);
-    let ssm_d_inner = get_usize("ssm.inner_size").unwrap_or(0);
-    let ssm_dt_rank = get_usize("ssm.time_step_rank").unwrap_or(0);
-    let ssm_n_group = get_usize("ssm.group_count").unwrap_or(0);
-
-    let recurrent_layers = if is_hybrid {
-        let full_attn_interval = get_usize("full_attention_interval").unwrap_or(4);
-        (0..num_layers).map(|i| (i + 1) % full_attn_interval != 0).collect()
-    } else {
-        Vec::new()
-    };
-
     Ok(ModelConfig {
         hidden_size,
         intermediate_size,
@@ -951,12 +1013,11 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         sliding_window: None,
         hidden_act,
         rope_type,
-        recurrent_layers,
-        ssm_d_conv,
-        ssm_d_state,
-        ssm_d_inner,
-        ssm_dt_rank,
-        ssm_n_group,
+        layer_kinds: None,
+        deltanet_num_heads: None,
+        deltanet_head_dim: None,
+        ssm_a: None,
+        dt_bias: None,
     })
 }
 
@@ -1128,6 +1189,20 @@ impl GgufLoader {
         }
         config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
 
+        {
+            let all_names: Vec<String> = tensors.keys()
+                .chain(raw_tensors.keys())
+                .chain(f16_raw_tensors.keys())
+                .chain(mmap_ranges.keys())
+                .cloned()
+                .collect();
+            detect_and_apply_hybrid_layers(
+                &mut config,
+                &all_names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                &metadata,
+            );
+        }
+
         if !tensors.contains_key("lm_head.weight") && !raw_tensors.contains_key("lm_head.weight")
             && !f16_raw_tensors.contains_key("lm_head.weight")
             && !mmap_ranges.contains_key("lm_head.weight") {
@@ -1264,6 +1339,12 @@ impl GgufLoader {
         }
 
         config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
+
+        detect_and_apply_hybrid_layers(
+            &mut config,
+            &tensors.keys().map(|s| s.as_str()).collect::<Vec<_>>(),
+            &metadata,
+        );
 
         Ok(Self {
             mmap: None,

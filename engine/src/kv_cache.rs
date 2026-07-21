@@ -84,19 +84,20 @@ pub fn append_f32_as_f16(dst: &mut [u16], src: &[f32]) {
 
 impl KvCache {
     pub fn new(config: &ModelConfig) -> Self {
+        let num_cache_layers = config.num_attention_layers();
         let layer_size = config.max_seq_len * config.num_kv_heads * config.head_dim;
         let use_f16 = config.hidden_act == crate::config::HiddenAct::SquaredRelu
             && is_x86_feature_detected!("f16c");
-        let k: Vec<Vec<f32>> = (0..config.num_layers)
+        let k: Vec<Vec<f32>> = (0..num_cache_layers)
             .map(|_| if use_f16 { Vec::new() } else { vec![0.0; layer_size] })
             .collect();
-        let v: Vec<Vec<f32>> = (0..config.num_layers)
+        let v: Vec<Vec<f32>> = (0..num_cache_layers)
             .map(|_| if use_f16 { Vec::new() } else { vec![0.0; layer_size] })
             .collect();
-        let k_f16: Vec<Vec<u16>> = (0..config.num_layers)
+        let k_f16: Vec<Vec<u16>> = (0..num_cache_layers)
             .map(|_| if use_f16 { vec![0u16; layer_size] } else { Vec::new() })
             .collect();
-        let v_f16: Vec<Vec<u16>> = (0..config.num_layers)
+        let v_f16: Vec<Vec<u16>> = (0..num_cache_layers)
             .map(|_| if use_f16 { vec![0u16; layer_size] } else { Vec::new() })
             .collect();
 
@@ -107,7 +108,7 @@ impl KvCache {
             v_f16,
             use_f16,
             seq_len: 0,
-            num_layers: config.num_layers,
+            num_layers: num_cache_layers,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
             max_seq_len: config.max_seq_len,
@@ -119,12 +120,13 @@ impl KvCache {
     }
 
     pub fn new_compressed(config: &ModelConfig, compressor: Box<dyn KvCacheCompressor>) -> Self {
-        let k: Vec<Vec<f32>> = (0..config.num_layers).map(|_| Vec::new()).collect();
-        let v: Vec<Vec<f32>> = (0..config.num_layers).map(|_| Vec::new()).collect();
+        let num_cache_layers = config.num_attention_layers();
+        let k: Vec<Vec<f32>> = (0..num_cache_layers).map(|_| Vec::new()).collect();
+        let v: Vec<Vec<f32>> = (0..num_cache_layers).map(|_| Vec::new()).collect();
         let k_compressed: Vec<Option<CompressedKV>> =
-            (0..config.num_layers).map(|_| None).collect();
+            (0..num_cache_layers).map(|_| None).collect();
         let v_compressed: Vec<Option<CompressedKV>> =
-            (0..config.num_layers).map(|_| None).collect();
+            (0..num_cache_layers).map(|_| None).collect();
 
         Self {
             k,
@@ -133,7 +135,7 @@ impl KvCache {
             v_f16: Vec::new(),
             use_f16: false,
             seq_len: 0,
-            num_layers: config.num_layers,
+            num_layers: num_cache_layers,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
             max_seq_len: config.max_seq_len,
@@ -157,18 +159,18 @@ impl KvCache {
             let new_k_data = &new_k[..src_len];
             let new_v_data = &new_v[..src_len];
 
-            let existing_k = self.k_data_for_len(layer, self.seq_len);
-            let existing_v = self.v_data_for_len(layer, self.seq_len);
-
-            let mut combined_k = existing_k.into_owned();
-            combined_k.extend_from_slice(new_k_data);
-            let mut combined_v = existing_v.into_owned();
-            combined_v.extend_from_slice(new_v_data);
-
-            self.k_compressed[layer] =
-                Some(compressor.compress(&combined_k, self.head_dim).unwrap());
-            self.v_compressed[layer] =
-                Some(compressor.compress(&combined_v, self.head_dim).unwrap());
+            if let Some(ref mut existing) = self.k_compressed[layer] {
+                compressor.compress_append(existing, new_k_data).unwrap();
+            } else {
+                self.k_compressed[layer] =
+                    Some(compressor.compress(new_k_data, self.head_dim).unwrap());
+            }
+            if let Some(ref mut existing) = self.v_compressed[layer] {
+                compressor.compress_append(existing, new_v_data).unwrap();
+            } else {
+                self.v_compressed[layer] =
+                    Some(compressor.compress(new_v_data, self.head_dim).unwrap());
+            }
         } else if self.use_f16 {
             let dst_offset = self.seq_len * stride;
             #[cfg(target_arch = "x86_64")]
@@ -831,15 +833,16 @@ pub struct PagedKvCache {
 
 impl PagedKvCache {
     pub fn new(config: &crate::config::ModelConfig, total_pages: usize, block_size: usize) -> Self {
+        let num_cache_layers = config.num_attention_layers();
         let page_stride = block_size * config.num_kv_heads * config.head_dim;
-        let k_pages = (0..config.num_layers)
+        let k_pages = (0..num_cache_layers)
             .map(|_| vec![0.0f32; total_pages * page_stride])
             .collect();
-        let v_pages = (0..config.num_layers)
+        let v_pages = (0..num_cache_layers)
             .map(|_| vec![0.0f32; total_pages * page_stride])
             .collect();
         let max_blocks = (config.max_seq_len + block_size - 1) / block_size;
-        let block_tables = (0..config.num_layers)
+        let block_tables = (0..num_cache_layers)
             .map(|_| BlockTable::new(max_blocks))
             .collect();
 
@@ -849,7 +852,7 @@ impl PagedKvCache {
             block_tables,
             allocator: PageAllocator::new(total_pages),
             seq_len: 0,
-            num_layers: config.num_layers,
+            num_layers: num_cache_layers,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
             block_size,
@@ -1321,94 +1324,6 @@ mod kani_proofs {
 
         let remaining = max_seq_len - seq_len;
         assert_eq!(seq_len + remaining, max_seq_len);
-    }
-}
-
-pub struct DeltaNetState {
-    gdn_states: Vec<Vec<f32>>,
-    conv_states: Vec<Vec<f32>>,
-    layer_map: Vec<Option<usize>>,
-    head_v_dim: usize,
-    num_v_heads: usize,
-    conv_dim: usize,
-    conv_kernel: usize,
-}
-
-impl DeltaNetState {
-    pub fn new(config: &ModelConfig) -> Self {
-        if config.recurrent_layers.is_empty() {
-            return Self {
-                gdn_states: Vec::new(),
-                conv_states: Vec::new(),
-                layer_map: Vec::new(),
-                head_v_dim: 0,
-                num_v_heads: 0,
-                conv_dim: 0,
-                conv_kernel: 0,
-            };
-        }
-
-        let num_v_heads = config.ssm_dt_rank;
-        let head_v_dim = if num_v_heads > 0 { config.ssm_d_inner / num_v_heads } else { 0 };
-        let num_k_heads = config.ssm_n_group;
-        let conv_dim = 2 * config.ssm_d_state * num_k_heads + config.ssm_d_inner;
-        let conv_kernel = config.ssm_d_conv;
-
-        let num_recurrent = config.recurrent_layers.iter().filter(|&&r| r).count();
-
-        let mut layer_map = vec![None; config.num_layers];
-        let mut idx = 0;
-        for (i, &is_recr) in config.recurrent_layers.iter().enumerate() {
-            if is_recr {
-                layer_map[i] = Some(idx);
-                idx += 1;
-            }
-        }
-
-        let state_size = head_v_dim * head_v_dim * num_v_heads;
-        let conv_state_size = (conv_kernel.saturating_sub(1)) * conv_dim;
-
-        Self {
-            gdn_states: vec![vec![0.0f32; state_size]; num_recurrent],
-            conv_states: vec![vec![0.0f32; conv_state_size]; num_recurrent],
-            layer_map,
-            head_v_dim,
-            num_v_heads,
-            conv_dim,
-            conv_kernel,
-        }
-    }
-
-    pub fn is_recurrent(&self, layer: usize) -> bool {
-        self.layer_map.get(layer).is_some_and(|v| v.is_some())
-    }
-
-    pub fn gdn_state(&self, layer: usize) -> Option<&[f32]> {
-        self.layer_map.get(layer)?.map(|idx| self.gdn_states[idx].as_slice())
-    }
-
-    pub fn gdn_state_mut(&mut self, layer: usize) -> Option<&mut [f32]> {
-        let idx = (*self.layer_map.get(layer)?)?;
-        Some(self.gdn_states[idx].as_mut_slice())
-    }
-
-    pub fn conv_state(&self, layer: usize) -> Option<&[f32]> {
-        self.layer_map.get(layer)?.map(|idx| self.conv_states[idx].as_slice())
-    }
-
-    pub fn conv_state_mut(&mut self, layer: usize) -> Option<&mut [f32]> {
-        let idx = (*self.layer_map.get(layer)?)?;
-        Some(self.conv_states[idx].as_mut_slice())
-    }
-
-    pub fn head_v_dim(&self) -> usize { self.head_v_dim }
-    pub fn num_v_heads(&self) -> usize { self.num_v_heads }
-    pub fn conv_dim(&self) -> usize { self.conv_dim }
-    pub fn conv_kernel(&self) -> usize { self.conv_kernel }
-
-    pub fn reset(&mut self) {
-        for s in &mut self.gdn_states { s.fill(0.0); }
-        for s in &mut self.conv_states { s.fill(0.0); }
     }
 }
 
@@ -2066,5 +1981,32 @@ mod tests {
             .probe_with_salt(&[1, 2, 3], Some("tenant-c"))
             .is_none());
         assert!(table.probe_with_salt(&[1, 2, 3], None).is_none());
+    }
+
+    #[test]
+    fn test_hybrid_kv_cache_sizing() {
+        use crate::config::LayerKind;
+        let mut cfg = ModelConfig::tiny_test();
+        cfg.num_layers = 4;
+        cfg.layer_kinds = Some(vec![
+            LayerKind::DeltaNet,
+            LayerKind::DeltaNet,
+            LayerKind::DeltaNet,
+            LayerKind::Attention,
+        ]);
+
+        let cache = KvCache::new(&cfg);
+        assert_eq!(cache.k.len(), 1);
+
+        let stride = cfg.num_kv_heads * cfg.head_dim;
+        let k = vec![1.0f32; stride];
+        let v = vec![2.0f32; stride];
+        let mut cache = cache;
+        cache.append_kv(0, &k, &v, 1);
+        cache.advance(1);
+        assert_eq!(cache.seq_len, 1);
+        let k_out = cache.k_data(0, 1);
+        assert_eq!(k_out.len(), stride);
+        assert_eq!(k_out[0], 1.0);
     }
 }
