@@ -2221,21 +2221,32 @@ where
                     let sess = unsafe { &*(sp as *const InferenceSession) };
                     let stride = n_kv_heads * head_dim;
                     let dst_base = sess.cache.seq_len * stride;
-                    let cache_k_ptr = sess.cache.k[layer].as_ptr() as usize;
-                    let cache_v_ptr = sess.cache.v[layer].as_ptr() as usize;
                     let ks = t_start * stride;
                     let ke = t_end * stride;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            (kp as *const f32).add(ks),
-                            (cache_k_ptr as *mut f32).add(dst_base + ks),
-                            ke - ks,
+                    if sess.cache.use_f16 {
+                        crate::kv_cache::append_f32_as_f16(
+                            unsafe { &mut *std::ptr::slice_from_raw_parts_mut(
+                                sess.cache.k_f16[layer].as_ptr().add(dst_base + ks) as *mut u16, ke - ks) },
+                            unsafe { std::slice::from_raw_parts((kp as *const f32).add(ks), ke - ks) },
                         );
-                        std::ptr::copy_nonoverlapping(
-                            (vp as *const f32).add(ks),
-                            (cache_v_ptr as *mut f32).add(dst_base + ks),
-                            ke - ks,
+                        crate::kv_cache::append_f32_as_f16(
+                            unsafe { &mut *std::ptr::slice_from_raw_parts_mut(
+                                sess.cache.v_f16[layer].as_ptr().add(dst_base + ks) as *mut u16, ke - ks) },
+                            unsafe { std::slice::from_raw_parts((vp as *const f32).add(ks), ke - ks) },
                         );
+                    } else {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                (kp as *const f32).add(ks),
+                                (sess.cache.k[layer].as_ptr().add(dst_base + ks)) as *mut f32,
+                                ke - ks,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                (vp as *const f32).add(ks),
+                                (sess.cache.v[layer].as_ptr().add(dst_base + ks)) as *mut f32,
+                                ke - ks,
+                            );
+                        }
                     }
                 }
                 if do_profile && ith == 0 { prof_rope.fetch_add(_t_rope.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
@@ -2250,11 +2261,13 @@ where
                     let kvl = shared_kvl.load(std::sync::atomic::Ordering::Acquire);
                     let sess = unsafe { &*(sp as *const InferenceSession) };
                     let scores_buf = unsafe { std::slice::from_raw_parts_mut(attn_scores_ptrs[ith] as *mut f32, kvl) };
+                    let k_data = sess.cache.k_data(layer, kvl);
+                    let v_data = sess.cache.v_data(layer, kvl);
                     for head in 0..n_heads {
                         tempura_kernels::attention::attention_prefill_items(
                             fs!(qp, seq_len * q_dim),
-                            &sess.cache.k_data(layer, kvl),
-                            &sess.cache.v_data(layer, kvl),
+                            &k_data,
+                            &v_data,
                             ap,
                             scores_buf,
                             seq_len, kvl,
