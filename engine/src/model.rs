@@ -1508,6 +1508,7 @@ where
         max_tokens: usize,
         eos_token: Option<u32>,
         qweights: &crate::weights::QuantizedWeights,
+        params: Option<&SamplingParams>,
     ) -> Vec<u32> {
         use tempura_kernels::quantized::{i2s_gemv_cols, i2s_weight_scale};
         use tempura_kernels::tl2::{tl2_preprocess_into, tl2_gemv_tiles, Tl2Lut};
@@ -1602,6 +1603,10 @@ where
         let attn_scores_ptrs: Vec<usize> = attn_scores_bufs.iter_mut().map(|b| b.as_mut_ptr() as usize).collect();
 
         qweights.embed_token(first_token, h, &mut hidden);
+
+        let params_ptr = params.map(|p| p as *const SamplingParams as usize).unwrap_or(0);
+        let mut probs_buf = if params.is_some() { vec![0.0f32; vocab_size] } else { Vec::new() };
+        let probs_ptr = probs_buf.as_mut_ptr() as usize;
 
         let embed_f32_ptr = qweights.get_f32("model.embed_tokens.weight")
             .map(|d| d.as_ptr() as usize).unwrap_or(0);
@@ -1906,7 +1911,29 @@ where
                 if ith == 0 {
                     _lmhead_us = _tok_start.elapsed().as_micros() as u64 - _layer_us;
                     let logits_slice = fs!(logits_ptr, vocab_size);
-                    let token = argmax(logits_slice);
+                    let token = if params_ptr == 0 {
+                        argmax(logits_slice)
+                    } else {
+                        let p = unsafe { &*(params_ptr as *const SamplingParams) };
+                        let sess = unsafe { &mut *(sp as *mut InferenceSession) };
+                        let gen = unsafe { &*(gen_ptr as *const Vec<u32>) };
+                        let mut logits_owned;
+                        let logits_ref = if p.presence_penalty != 0.0 || p.frequency_penalty != 0.0 {
+                            logits_owned = logits_slice.to_vec();
+                            p.apply_penalties(&mut logits_owned, gen);
+                            &logits_owned[..]
+                        } else {
+                            logits_slice
+                        };
+                        let probs = unsafe { std::slice::from_raw_parts_mut(probs_ptr as *mut f32, vocab_size) };
+                        self.pipeline.sampler.apply(logits_ref, probs, p).unwrap();
+                        let rng_ref: Option<&mut dyn rand::RngCore> = if p.temperature == 0.0 {
+                            None
+                        } else {
+                            Some(&mut sess.rng)
+                        };
+                        self.pipeline.sampler.sample_token(probs, rng_ref)
+                    };
                     let gen = unsafe { &mut *(gen_ptr as *mut Vec<u32>) };
                     gen.push(token);
 
@@ -2427,29 +2454,39 @@ where
         session.trace.prompt_tokens = token_ids.len();
         let gen_start = Instant::now();
 
-        // Fast path: greedy BitNet decode in a single thread dispatch
-        if greedy {
-            if let Some(qw) = &self.quantized_weights {
-                if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu && max_new_tokens > 1 {
-                    let first_token = argmax(&logits);
-                    let remaining = max_new_tokens - 1;
-                    let mut generated = vec![first_token];
-                    generated.extend(self.generate_bitnet_decode(
-                        session, first_token, remaining, eos_token, qw,
-                    ));
-                    let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
-                    let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
-                    session.trace.generated_tokens = generated.len();
-                    session.trace.timing = Some(TimingInfo {
-                        total_ms,
-                        prompt_ms,
-                        generation_ms,
-                        tokens_per_second: if generation_ms > 0.0 {
-                            generated.len() as f64 / (generation_ms / 1000.0)
-                        } else { 0.0 },
-                    });
-                    return generated;
-                }
+        // Fast path: BitNet decode in a single thread dispatch (greedy or sampled)
+        if let Some(qw) = &self.quantized_weights {
+            if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu && max_new_tokens > 1 {
+                let first_token = if greedy {
+                    argmax(&logits)
+                } else {
+                    let mut probs = vec![0.0f32; logits.len()];
+                    self.pipeline.sampler.apply(&logits, &mut probs, params).unwrap();
+                    let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                        None
+                    } else {
+                        Some(&mut session.rng)
+                    };
+                    self.pipeline.sampler.sample_token(&probs, rng_ref)
+                };
+                let remaining = max_new_tokens - 1;
+                let sp = if greedy { None } else { Some(params) };
+                let mut generated = vec![first_token];
+                generated.extend(self.generate_bitnet_decode(
+                    session, first_token, remaining, eos_token, qw, sp,
+                ));
+                let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+                let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+                session.trace.generated_tokens = generated.len();
+                session.trace.timing = Some(TimingInfo {
+                    total_ms,
+                    prompt_ms,
+                    generation_ms,
+                    tokens_per_second: if generation_ms > 0.0 {
+                        generated.len() as f64 / (generation_ms / 1000.0)
+                    } else { 0.0 },
+                });
+                return generated;
             }
         }
 
