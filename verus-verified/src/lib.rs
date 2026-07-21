@@ -91,5 +91,6 @@ pub mod tensor_parallel;
 pub mod trace_diff;
 pub mod activations_moe;
 pub mod deltanet;
+pub mod hybrid_dispatch;
 pub mod sampling_chain;
 pub mod weight_shapes;

@@ -1965,4 +1965,31 @@ mod tests {
             .is_none());
         assert!(table.probe_with_salt(&[1, 2, 3], None).is_none());
     }
+
+    #[test]
+    fn test_hybrid_kv_cache_sizing() {
+        use crate::config::LayerKind;
+        let mut cfg = ModelConfig::tiny_test();
+        cfg.num_layers = 4;
+        cfg.layer_kinds = Some(vec![
+            LayerKind::DeltaNet,
+            LayerKind::DeltaNet,
+            LayerKind::DeltaNet,
+            LayerKind::Attention,
+        ]);
+
+        let cache = KvCache::new(&cfg);
+        assert_eq!(cache.k.len(), 1);
+
+        let stride = cfg.num_kv_heads * cfg.head_dim;
+        let k = vec![1.0f32; stride];
+        let v = vec![2.0f32; stride];
+        let mut cache = cache;
+        cache.append_kv(0, &k, &v, 1);
+        cache.advance(1);
+        assert_eq!(cache.seq_len, 1);
+        let k_out = cache.k_data(0, 1);
+        assert_eq!(k_out.len(), stride);
+        assert_eq!(k_out[0], 1.0);
+    }
 }

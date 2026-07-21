@@ -477,4 +477,52 @@ mod tests {
         let err = ModelConfig::from_hf_json("not json").unwrap_err();
         assert!(matches!(err, ConfigError::Json(_)));
     }
+
+    #[test]
+    fn test_cache_layer_map_all_attention() {
+        let cfg = ModelConfig::tiny_test();
+        let map = cfg.cache_layer_map();
+        assert_eq!(map, vec![Some(0), Some(1)]);
+        assert_eq!(cfg.num_attention_layers(), 2);
+        assert_eq!(cfg.num_deltanet_layers(), 0);
+    }
+
+    #[test]
+    fn test_cache_layer_map_hybrid() {
+        let mut cfg = ModelConfig::tiny_test();
+        cfg.num_layers = 4;
+        cfg.layer_kinds = Some(vec![
+            LayerKind::DeltaNet,
+            LayerKind::DeltaNet,
+            LayerKind::DeltaNet,
+            LayerKind::Attention,
+        ]);
+        let map = cfg.cache_layer_map();
+        assert_eq!(map, vec![None, None, None, Some(0)]);
+        assert_eq!(cfg.num_attention_layers(), 1);
+        assert_eq!(cfg.num_deltanet_layers(), 3);
+    }
+
+    #[test]
+    fn test_cache_layer_map_interleaved() {
+        let mut cfg = ModelConfig::tiny_test();
+        cfg.num_layers = 8;
+        cfg.layer_kinds = Some(vec![
+            LayerKind::DeltaNet,
+            LayerKind::DeltaNet,
+            LayerKind::DeltaNet,
+            LayerKind::Attention,
+            LayerKind::DeltaNet,
+            LayerKind::DeltaNet,
+            LayerKind::DeltaNet,
+            LayerKind::Attention,
+        ]);
+        let map = cfg.cache_layer_map();
+        assert_eq!(
+            map,
+            vec![None, None, None, Some(0), None, None, None, Some(1)]
+        );
+        assert_eq!(cfg.num_attention_layers(), 2);
+        assert_eq!(cfg.num_deltanet_layers(), 6);
+    }
 }
