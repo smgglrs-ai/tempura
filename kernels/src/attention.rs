@@ -601,6 +601,68 @@ pub fn attention_prefill_items(
     }
 }
 
+pub fn attention_prefill_items_f16kv(
+    q: &[f32],
+    k_f16: &[u16],
+    v_f16: &[u16],
+    output_addr: usize,
+    scores: &mut [f32],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    item_start: usize,
+    item_end: usize,
+) {
+    let heads_per_group = num_heads / num_kv_heads;
+
+    for idx in item_start..item_end {
+        let h = idx / seq_len;
+        let s = idx % seq_len;
+        let kv_h = h / heads_per_group;
+
+        let q_offset = (s * num_heads + h) * head_dim;
+        let q_vec = &q[q_offset..q_offset + head_dim];
+
+        let cache_offset = kv_len - seq_len;
+        let causal_limit = cache_offset + s;
+
+        let scores = &mut scores[..kv_len];
+        for (kv_s, score) in scores.iter_mut().enumerate() {
+            if kv_s > causal_limit {
+                *score = f32::NEG_INFINITY;
+                continue;
+            }
+            let k_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+            *score = unsafe { dot_f32_f16(q_vec, k_f16.as_ptr().add(k_offset), head_dim) } * scale;
+        }
+
+        let mut max_score = f32::NEG_INFINITY;
+        for &sc in &scores[..kv_len] { if sc > max_score { max_score = sc; } }
+
+        let mut sum: f64 = 0.0;
+        for sc in &mut scores[..kv_len] {
+            let val = crate::portable_math::ggml_exp(*sc - max_score);
+            sum += val as f64;
+            *sc = val;
+        }
+        let inv_sum = (1.0 / sum) as f32;
+        for sc in &mut scores[..kv_len] { *sc *= inv_sum; }
+
+        let o_offset = (s * num_heads + h) * head_dim;
+        let out_sl = unsafe {
+            std::slice::from_raw_parts_mut((output_addr as *mut f32).add(o_offset), head_dim)
+        };
+        for d in out_sl.iter_mut() { *d = 0.0; }
+        for (kv_s, &score) in scores[..kv_len].iter().enumerate() {
+            let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+            unsafe { weighted_add_f16(out_sl, v_f16.as_ptr().add(v_offset), score, head_dim) };
+        }
+    }
+}
+
 // ── Concrete CPU attention structs ─────────────────────────────────────────
 
 #[cfg(feature = "cpu")]

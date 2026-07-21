@@ -2261,21 +2261,38 @@ where
                     let kvl = shared_kvl.load(std::sync::atomic::Ordering::Acquire);
                     let sess = unsafe { &*(sp as *const InferenceSession) };
                     let scores_buf = unsafe { std::slice::from_raw_parts_mut(attn_scores_ptrs[ith] as *mut f32, kvl) };
-                    let k_data = sess.cache.k_data(layer, kvl);
-                    let v_data = sess.cache.v_data(layer, kvl);
-                    for head in 0..n_heads {
-                        tempura_kernels::attention::attention_prefill_items(
-                            fs!(qp, seq_len * q_dim),
-                            &k_data,
-                            &v_data,
-                            ap,
-                            scores_buf,
-                            seq_len, kvl,
-                            n_heads, n_kv_heads, head_dim,
-                            1.0 / (head_dim as f32).sqrt(),
-                            head * seq_len + t_start,
-                            head * seq_len + t_end,
-                        );
+                    if sess.cache.use_f16 {
+                        for head in 0..n_heads {
+                            tempura_kernels::attention::attention_prefill_items_f16kv(
+                                fs!(qp, seq_len * q_dim),
+                                sess.cache.k_data_f16(layer, kvl),
+                                sess.cache.v_data_f16(layer, kvl),
+                                ap,
+                                scores_buf,
+                                seq_len, kvl,
+                                n_heads, n_kv_heads, head_dim,
+                                1.0 / (head_dim as f32).sqrt(),
+                                head * seq_len + t_start,
+                                head * seq_len + t_end,
+                            );
+                        }
+                    } else {
+                        let k_data = sess.cache.k_data(layer, kvl);
+                        let v_data = sess.cache.v_data(layer, kvl);
+                        for head in 0..n_heads {
+                            tempura_kernels::attention::attention_prefill_items(
+                                fs!(qp, seq_len * q_dim),
+                                &k_data,
+                                &v_data,
+                                ap,
+                                scores_buf,
+                                seq_len, kvl,
+                                n_heads, n_kv_heads, head_dim,
+                                1.0 / (head_dim as f32).sqrt(),
+                                head * seq_len + t_start,
+                                head * seq_len + t_end,
+                            );
+                        }
                     }
                 }
                 // sub_norm + LUT on our tokens (all heads computed above, no barrier needed)

@@ -229,6 +229,8 @@ MODULES=(
     mma_fragments
     tl2_lut
     f16_gemv
+    i2s_multi_row
+    f16_kv_cache
 )
 
 TOTAL_VERIFIED=0
