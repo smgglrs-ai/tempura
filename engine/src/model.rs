@@ -1697,7 +1697,16 @@ where
                         rope.forward(fsm!(qp,q_dim), 1, 1, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
                         rope.forward(fsm!(kp,kv_dim), 1, 1, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
                         let sess = unsafe { &mut *(sp as *mut InferenceSession) };
-                        sess.cache.append_kv(layer, fs!(kp,kv_dim), fs!(vp,kv_dim), 1);
+                        if sess.cache.use_f16 {
+                            let stride = kv_dim;
+                            let dst = sess.cache.seq_len * stride;
+                            crate::kv_cache::append_f32_as_f16(
+                                &mut sess.cache.k_f16[layer][dst..dst + stride], fs!(kp, kv_dim));
+                            crate::kv_cache::append_f32_as_f16(
+                                &mut sess.cache.v_f16[layer][dst..dst + stride], fs!(vp, kv_dim));
+                        } else {
+                            sess.cache.append_kv(layer, fs!(kp,kv_dim), fs!(vp,kv_dim), 1);
+                        }
                         shared_kvl.store(sess.cache.seq_len + 1, std::sync::atomic::Ordering::Release);
                     }
                     barrier.wait();
