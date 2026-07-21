@@ -12,6 +12,31 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+fn detect_l1d_bytes() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index0/size") {
+            let s = s.trim().trim_end_matches('K');
+            if let Ok(kb) = s.parse::<usize>() {
+                return kb * 1024;
+            }
+        }
+    }
+    48 * 1024
+}
+
+fn gemm_chunk_size() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        let l1d = detect_l1d_bytes();
+        // cbits = BS * BM_max * 4 bytes. Use 75% of L1d as budget
+        // (sysfs may over-report effective capacity on hybrid architectures).
+        let bs = (l1d * 3 / 4) / (320 * 4);
+        // Round down to multiple of 8 for SIMD alignment, clamp to [8, 64]
+        (bs / 8 * 8).clamp(8, 64)
+    })
+}
+
 // ── AVX2 helpers (translated from bitnet.cpp) ──────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
@@ -1283,15 +1308,15 @@ pub unsafe fn tl2_gemm_tiles_batched(
 
         for b in cbits[..bs_bm].iter_mut() { *b = 0; }
 
-        // Chunked three-part GEMM: chunk at BS=24 (30KB cbits at BM=320, fits L1>=32KB)
-        // with 8+1 fallback for remainder
+        // Chunked three-part GEMM: chunk size from L1d cache detection
         if use_bk96 {
+            let chunk = gemm_chunk_size();
             let mut done = 0usize;
             let mut rem = batch_size;
-            while rem >= 24 {
+            while rem >= chunk {
                 three_tbl_impl_bk96(&mut cbits[done * bm..], &lut.three_qlut[done * three_lut_stride..],
-                    &weight_data[w_offset..], &weight_data[s_offset..], bm, three_k, 24);
-                done += 24; rem -= 24;
+                    &weight_data[w_offset..], &weight_data[s_offset..], bm, three_k, chunk);
+                done += chunk; rem -= chunk;
             }
             while rem >= 8 {
                 three_tbl_impl_bk96(&mut cbits[done * bm..], &lut.three_qlut[done * three_lut_stride..],
@@ -1309,17 +1334,17 @@ pub unsafe fn tl2_gemm_tiles_batched(
 
         if two_k > 0 {
             for b in two_cbits[..bs_bm].iter_mut() { *b = 0; }
-            // Chunked two-part GEMM (same BS=24+8+1 tiers)
+            let chunk = gemm_chunk_size();
             let mut done = 0usize;
             let mut rem = batch_size;
-            while rem >= 24 {
+            while rem >= chunk {
                 for k_outer in 0..n_two_blocks {
                     let lut_off = k_outer * BK2 / 2 * 32;
                     let a_off = k_outer * BK2 / 2 / 2 * bm;
                     two_tbl_impl(&mut two_cbits[done * bm..], &lut.two_qlut[done * two_lut_stride + lut_off..],
-                        &weight_data[two_w_offset + a_off..], bm, two_k, 24);
+                        &weight_data[two_w_offset + a_off..], bm, two_k, chunk);
                 }
-                done += 24; rem -= 24;
+                done += chunk; rem -= chunk;
             }
             while rem >= 8 {
                 for k_outer in 0..n_two_blocks {
