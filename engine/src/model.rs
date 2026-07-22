@@ -1076,6 +1076,16 @@ where
             }
 
 
+            if layer == 3 && std::env::var("TEMPURA_TRACE_L3").is_ok() {
+                let has_q = qweights.get_q2(q_w_name).is_some();
+                let has_k = qweights.get_q2(k_w_name).is_some();
+                let has_v = qweights.get_q2(v_w_name).is_some();
+                let has_o = qweights.get_q2(o_w_name).is_some();
+                let q_len = qweights.get_q2(q_w_name).map(|w| w.len()).unwrap_or(0);
+                let k_len = qweights.get_q2(k_w_name).map(|w| w.len()).unwrap_or(0);
+                eprintln!("[L3-pre] q_w={q_w_name} has_q={has_q}(len={q_len}) has_k={has_k}(len={k_len}) has_v={has_v} has_o={has_o}");
+                eprintln!("[L3-pre] hidden norm={:.4} hidden[0..4]={:?}", hidden.iter().map(|x|x*x).sum::<f32>().sqrt(), &hidden[..4]);
+            }
             // Detect Q+gate fused projection (Qwen3.5 softmax layers)
             let q_weight_cols = qweights.get_q2(q_w_name)
                 .map(|w| w.len() / ((h / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES))
