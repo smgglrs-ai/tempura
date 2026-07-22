@@ -394,6 +394,13 @@ impl QuantizedWeights {
                 let bits = u16::from_le_bytes([f16_data[byte_off + i * 2], f16_data[byte_off + i * 2 + 1]]);
                 output[i] = f16_bits_to_f32(bits);
             }
+        } else if let Some(q4k_data) = self.get_q4k("model.embed_tokens.weight") {
+            let row_bytes = (hidden_size / 256) * 144;
+            let row_off = token_id as usize * row_bytes;
+            if row_off + row_bytes <= q4k_data.len() {
+                let row = &q4k_data[row_off..row_off + row_bytes];
+                crate::gguf_loader::dequant_q4k_row(row, output, hidden_size);
+            }
         } else if let Some(q2_data) = self.get_q2("model.embed_tokens.weight") {
             let row_bytes = (hidden_size / 128) * 34;
             let row_off = token_id as usize * row_bytes;

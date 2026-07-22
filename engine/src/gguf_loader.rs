@@ -552,6 +552,11 @@ fn unpack_q4k_scales(packed: &[u8]) -> ([f32; 8], [f32; 8]) {
     (sc_f, m_f)
 }
 
+pub fn dequant_q4k_row(data: &[u8], output: &mut [f32], num_elements: usize) {
+    let v = dequant_q4k(data, num_elements);
+    output[..num_elements].copy_from_slice(&v);
+}
+
 fn dequant_q4k(data: &[u8], num_elements: usize) -> Vec<f32> {
     let num_blocks = num_elements / 256;
     let block_size = 144;
@@ -1136,7 +1141,6 @@ impl GgufLoader {
                 || info.dtype == GgmlType::TQ2_0 || info.dtype == GgmlType::TQ1_0
                 || info.dtype == GgmlType::TL1 || info.dtype == GgmlType::TL2
                 || info.dtype == GgmlType::Q2_0)
-                && !mapped_name.contains("embed_tokens")
                 && !mapped_name.contains("norm.weight");
 
             if info.dtype == GgmlType::F16 {
