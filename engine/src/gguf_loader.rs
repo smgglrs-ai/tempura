@@ -1192,7 +1192,13 @@ impl GgufLoader {
         }).or_else(|| f16_raw_tensors.get("model.embed_tokens.weight").map(|t| {
             let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
             (t.len() / 2).checked_div(hidden).unwrap_or(0)
-        }));
+        })).or_else(|| {
+            let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
+            mmap_ranges.get("model.embed_tokens.weight").map(|&(_, len, dtype)| {
+                let row_bytes = tensor_data_size(dtype, hidden as u64, &[hidden as u64]) as usize;
+                if row_bytes > 0 { len / row_bytes } else { 0 }
+            })
+        });
 
         let mut config = extract_config(&metadata)?;
         if let Some(vs) = vocab_size_from_embed {
