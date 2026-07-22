@@ -855,12 +855,12 @@ where
                 ref ffn_sub_norm_name,
             ) = layer_names[layer];
 
-            if layer <= 3 || layer == cfg.num_layers - 1 {
-                let hn: f32 = hidden.iter().map(|x| x*x).sum::<f32>().sqrt();
-                let first4: Vec<f32> = hidden[..4.min(hidden.len())].to_vec();
-            }
+            let skip_dn = std::env::var("TEMPURA_SKIP_DELTANET").is_ok();
 
-            if layer_kind == crate::config::LayerKind::DeltaNet {
+            if layer_kind == crate::config::LayerKind::DeltaNet && skip_dn {
+                deltanet_layer_idx += 1;
+                // Skip DeltaNet attention, fall through to FFN
+            } else if layer_kind == crate::config::LayerKind::DeltaNet {
                 let prefix = format!("model.layers.{layer}");
                 let dn_heads = cfg.deltanet_num_heads.unwrap_or(n_kv_heads);
                 let dn_head_dim = cfg.deltanet_head_dim.unwrap_or(head_dim);
@@ -1119,13 +1119,20 @@ where
                     qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..kv_dim], 1, kv_dim, h);
                 } else if has_q_gate {
                     qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q_gate_buf[..actual_q_cols], 1, actual_q_cols, h);
-                    // Interleaved layout: [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]
                     for hh in 0..n_heads {
                         let src = hh * head_dim * 2;
                         q[hh * head_dim..(hh + 1) * head_dim].copy_from_slice(&q_gate_buf[src..src + head_dim]);
                     }
                     qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..kv_dim], 1, kv_dim, h);
                     qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..kv_dim], 1, kv_dim, h);
+                    if layer == 3 && std::env::var("TEMPURA_TRACE_L3").is_ok() {
+                        let qn: f32 = q[..q_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                        let kn: f32 = k[..kv_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                        let vn: f32 = v[..kv_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                        eprintln!("[L3] post-proj Q norm={qn:.4} K norm={kn:.4} V norm={vn:.4} q[0..4]={:?} k[0..4]={:?}", &q[..4], &k[..4]);
+                        eprintln!("[L3] gate_buf[0..4]={:?} gate_buf[256..260]={:?}", &q_gate_buf[..4], &q_gate_buf[256..260]);
+                        eprintln!("[L3] has_q_gate={has_q_gate} actual_q_cols={actual_q_cols} q_dim={q_dim} head_dim={head_dim} n_heads={n_heads}");
+                    }
                 } else {
                     qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q[..q_dim], 1, q_dim, h);
                     qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..kv_dim], 1, kv_dim, h);
@@ -1168,7 +1175,7 @@ where
             }
 
 
-            if cfg.use_qk_norm {
+            if cfg.use_qk_norm && qweights.get_f32(q_norm_name).is_some() {
                 let q_norm_w = qweights.get_f32(q_norm_name).unwrap();
                 let k_norm_w = qweights.get_f32(k_norm_name).unwrap();
                 apply_head_rmsnorm(&mut q, q_norm_w, seq_len, n_heads, head_dim, cfg.layer_norm_eps);
@@ -1268,6 +1275,11 @@ where
                     .unwrap();
             }
 
+
+            if layer == 3 && std::env::var("TEMPURA_TRACE_L3").is_ok() {
+                let an: f32 = attn_out[..q_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                eprintln!("[L3] post-attn norm={an:.4} attn_out[0..4]={:?}", &attn_out[..4]);
+            }
 
             // Qwen3.5 softmax layers: sigmoid gate on attention output
             // Gate is interleaved: q_gate_buf[h*2*hd + hd .. h*2*hd + 2*hd] per head
