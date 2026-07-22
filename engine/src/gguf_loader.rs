@@ -1136,7 +1136,6 @@ impl GgufLoader {
                 || info.dtype == GgmlType::TQ2_0 || info.dtype == GgmlType::TQ1_0
                 || info.dtype == GgmlType::TL1 || info.dtype == GgmlType::TL2
                 || info.dtype == GgmlType::Q2_0)
-                && !mapped_name.contains("embed_tokens")
                 && !mapped_name.contains("norm.weight");
 
             if info.dtype == GgmlType::F16 {
@@ -1218,7 +1217,7 @@ impl GgufLoader {
             && !mmap_ranges.contains_key("lm_head.weight") {
             if let Some(&(off, len, dtype)) = mmap_ranges.get("model.embed_tokens.weight") {
                 mmap_ranges.insert("lm_head.weight".into(), (off, len, dtype));
-                tensor_dtypes.insert("lm_head.weight".into(), GgmlType::F16);
+                tensor_dtypes.insert("lm_head.weight".into(), dtype);
             } else if let Some(f16_raw) = f16_raw_tensors.get("model.embed_tokens.weight") {
                 f16_raw_tensors.insert("lm_head.weight".into(), f16_raw.clone());
                 tensor_dtypes.insert("lm_head.weight".into(), GgmlType::F16);

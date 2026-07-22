@@ -394,6 +394,20 @@ impl QuantizedWeights {
                 let bits = u16::from_le_bytes([f16_data[byte_off + i * 2], f16_data[byte_off + i * 2 + 1]]);
                 output[i] = f16_bits_to_f32(bits);
             }
+        } else if let Some(q2_data) = self.get_q2("model.embed_tokens.weight") {
+            let row_bytes = (hidden_size / 128) * 34;
+            let row_off = token_id as usize * row_bytes;
+            let row = &q2_data[row_off..row_off + row_bytes];
+            for blk in 0..hidden_size / 128 {
+                let block = &row[blk * 34..(blk + 1) * 34];
+                let scale = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                for i in 0..128 {
+                    let byte_idx = 2 + i / 4;
+                    let shift = (i % 4) * 2;
+                    let q = ((block[byte_idx] >> shift) & 3) as i32;
+                    output[blk * 128 + i] = (q - 1) as f32 * scale;
+                }
+            }
         } else {
             panic!("no embedding weights found");
         }
