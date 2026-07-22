@@ -1146,6 +1146,130 @@ fn q2_0_dot_q8(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
     sumf
 }
 
+/// AVX2 Q2_0 dot product: per-32-element activation quantization with SIMD.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q2_0_dot_q8_avx2(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
+    use std::arch::x86_64::*;
+
+    let nb = k / Q2_0_BLOCK_SIZE;
+    let mask_2bit = _mm256_set1_epi8(0x03);
+    let ones_8 = _mm256_set1_epi8(1);
+    let ones_16 = _mm256_set1_epi16(1);
+    let mut sumf = 0.0f32;
+
+    for i in 0..nb {
+        let block = &w_packed[i * Q2_0_BLOCK_BYTES..];
+        let d0 = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qs_ptr = block.as_ptr().add(2);
+        let a_off = i * Q2_0_BLOCK_SIZE;
+        let mut sumi = 0.0f32;
+
+        for sub in 0..4 {
+            let sub_a = &a_f32[a_off + sub * 32..a_off + (sub + 1) * 32];
+
+            // Quantize 32 f32 activations to i8 (q8_0 style)
+            let a_v0 = _mm256_loadu_ps(sub_a.as_ptr());
+            let a_v1 = _mm256_loadu_ps(sub_a.as_ptr().add(8));
+            let a_v2 = _mm256_loadu_ps(sub_a.as_ptr().add(16));
+            let a_v3 = _mm256_loadu_ps(sub_a.as_ptr().add(24));
+
+            // Find max abs value across all 32 elements
+            let abs_mask = _mm256_set1_ps(f32::from_bits(0x7FFF_FFFF));
+            let abs0 = _mm256_and_ps(a_v0, abs_mask);
+            let abs1 = _mm256_and_ps(a_v1, abs_mask);
+            let abs2 = _mm256_and_ps(a_v2, abs_mask);
+            let abs3 = _mm256_and_ps(a_v3, abs_mask);
+            let max01 = _mm256_max_ps(abs0, abs1);
+            let max23 = _mm256_max_ps(abs2, abs3);
+            let max_all = _mm256_max_ps(max01, max23);
+            // Horizontal max
+            let hi = _mm256_extractf128_ps(max_all, 1);
+            let lo = _mm256_castps256_ps128(max_all);
+            let m = _mm_max_ps(lo, hi);
+            let m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+            let m = _mm_max_ss(m, _mm_movehdup_ps(m));
+            let amax = _mm_cvtss_f32(m);
+
+            let d1 = amax / 127.0;
+            if d1 == 0.0 { continue; }
+            let id1 = _mm256_set1_ps(127.0 / amax);
+
+            // Quantize to i8: round(x * id1), pack to i8
+            let q0 = _mm256_cvtps_epi32(_mm256_mul_ps(a_v0, id1));
+            let q1 = _mm256_cvtps_epi32(_mm256_mul_ps(a_v1, id1));
+            let q2 = _mm256_cvtps_epi32(_mm256_mul_ps(a_v2, id1));
+            let q3 = _mm256_cvtps_epi32(_mm256_mul_ps(a_v3, id1));
+            let q01 = _mm256_packs_epi32(q0, q1); // i16
+            let q23 = _mm256_packs_epi32(q2, q3);
+            let q_i8 = _mm256_packs_epi16(q01, q23); // i8
+            // Fix lane ordering: packs interleaves 128-bit lanes
+            let q_i8 = _mm256_permutevar8x32_epi32(q_i8,
+                _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+
+            // Unpack 8 bytes of Q2_0 weights to 32 u8 values {0,1,2,3}
+            let w_raw = _mm_loadl_epi64(qs_ptr.add(sub * 8) as *const __m128i);
+            let w_raw = _mm256_castsi128_si256(w_raw);
+            // Broadcast each byte to 4 lanes, then shift+mask
+            // Actually: use the same unpack as full 32-byte, but on 8 bytes repeated
+            // Simpler: just broadcast the 8 bytes to fill 32 lanes, then shift
+            let w_8 = _mm256_broadcastsi128_si256(_mm_loadl_epi64(qs_ptr.add(sub * 8) as *const __m128i));
+            // We have 8 bytes in the low 64 bits of each 128-bit lane
+            // Need to unpack: byte[j] bits 0-1 → element 4j, bits 2-3 → 4j+1, etc.
+            // Use shuffle to replicate each byte 4 times, then shift+mask
+            let shuffle = _mm256_setr_epi8(
+                0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3,
+                4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7);
+            let w_rep = _mm256_shuffle_epi8(w_8, shuffle);
+            // Shift each replicated byte by 0,2,4,6 bits
+            let shift_mask = _mm256_setr_epi8(
+                0,2,4,6, 0,2,4,6, 0,2,4,6, 0,2,4,6,
+                0,2,4,6, 0,2,4,6, 0,2,4,6, 0,2,4,6);
+            let w_shifted = _mm256_srlv_epi32(
+                w_rep,
+                _mm256_cvtepu8_epi32(_mm256_castsi256_si128(shift_mask)));
+            // That won't work for per-byte shifts. Use variable approach:
+            // Actually srlv works on 32-bit lanes. We need per-byte variable shifts.
+            // Simpler: unpack with mask at each shift level
+            let w0 = _mm256_and_si256(w_rep, mask_2bit);
+            let w1 = _mm256_and_si256(_mm256_srli_epi16(w_rep, 2), mask_2bit);
+            let w2 = _mm256_and_si256(_mm256_srli_epi16(w_rep, 4), mask_2bit);
+            let w3 = _mm256_and_si256(_mm256_srli_epi16(w_rep, 6), mask_2bit);
+            // Now w0 has bits 0-1 of each byte, but replicated 4 times per byte
+            // We need: position 4j → byte j bits 0-1, position 4j+1 → bits 2-3, etc.
+            // Use blend: take bit-0 from w0, bit-2 from w1, bit-4 from w2, bit-6 from w3
+            // at positions 0,1,2,3 within each 4-byte group
+            // blend_epi8 selects per byte. Create mask: pos%4==0 from w0, pos%4==1 from w1, etc.
+            let blend_1 = _mm256_setr_epi8(
+                0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1,
+                0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1);
+            let blend_2 = _mm256_setr_epi8(
+                0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1,
+                0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1);
+            let w_01 = _mm256_blendv_epi8(w0, w1, blend_1);
+            let w_23 = _mm256_blendv_epi8(w2, w3, blend_1);
+            let w_all = _mm256_blendv_epi8(w_01, w_23, blend_2);
+
+            // w_all[i] is the Q2_0 weight value {0,1,2,3} for element i
+            // maddubs: unsigned × signed. w_all is unsigned, q_i8 is signed.
+            // result = sum(w_all[i] * q_i8[i]) for pairs → i16
+            let prod = _mm256_maddubs_epi16(w_all, q_i8);
+            // sum(w * a) in i16, widen to i32
+            let sum32 = _mm256_madd_epi16(prod, ones_16);
+            let dot_wa = hsum_i32(sum32);
+
+            // sum(a) = sum(q_i8) — for the (q-1) correction
+            let asum16 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, q_i8), ones_16);
+            let sum_a = hsum_i32(asum16);
+
+            // (sum(w*a) - sum(a)) * d1 = sum((w-1)*a) * d1
+            sumi += (dot_wa - sum_a) as f32 * d1;
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
 pub fn q2_0_gemv(
     packed: &[u8],
     a_f32: &[f32],
@@ -1154,6 +1278,14 @@ pub fn q2_0_gemv(
     k: usize,
 ) {
     let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        for j in 0..n {
+            let w = &packed[j * row_bytes..(j + 1) * row_bytes];
+            output[j] = unsafe { q2_0_dot_q8_avx2(w, a_f32, k) };
+        }
+        return;
+    }
     for j in 0..n {
         let w = &packed[j * row_bytes..(j + 1) * row_bytes];
         output[j] = q2_0_dot_q8(w, a_f32, k);
