@@ -858,7 +858,6 @@ where
             if layer <= 3 || layer == cfg.num_layers - 1 {
                 let hn: f32 = hidden.iter().map(|x| x*x).sum::<f32>().sqrt();
                 let first4: Vec<f32> = hidden[..4.min(hidden.len())].to_vec();
-                eprintln!("[trace] layer={layer} kind={layer_kind:?} hidden_norm={hn:.4} first4={first4:?}");
             }
 
             if layer_kind == crate::config::LayerKind::DeltaNet {
@@ -914,6 +913,8 @@ where
                     let qkv_cols = 2 * key_dim + dn_dim;
                     let mut qkv_buf = vec![0.0f32; seq_len * qkv_cols];
                     qmm(None, &normed, &qkv_name, &mut qkv_buf, seq_len, qkv_cols, h);
+                    if layer == 0 {
+                    }
                     qmm(None, &normed, &gate_name, &mut z_gate, seq_len, dn_dim, h);
                     // Store raw QKV in q_dn/k_dn/v_dn temporarily at key_dim width (no repeat yet)
                     for t in 0..seq_len {
@@ -1033,6 +1034,10 @@ where
                     }
                 }
 
+                if layer == 0 {
+                    let dn_norm: f32 = dn_out.iter().map(|x|x*x).sum::<f32>().sqrt();
+                    let z_norm: f32 = z_gate.iter().map(|x|x*x).sum::<f32>().sqrt();
+                }
                 if has_in_proj || has_qkv {
                     for i in 0..dn_out.len() {
                         let z_silu = z_gate[i] / (1.0 + (-z_gate[i]).exp());
