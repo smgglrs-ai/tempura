@@ -1102,32 +1102,48 @@ unsafe fn hsum_i32_512(v: std::arch::x86_64::__m512i) -> i32 {
 pub const Q2_0_BLOCK_SIZE: usize = 128;
 pub const Q2_0_BLOCK_BYTES: usize = 34; // 2-byte f16 scale + 32 bytes packed
 
-pub fn q2_0_gemv_row(packed: &[u8], a_q: &[i8], a_scale: f32, k: usize) -> f32 {
-    let nb = k / Q2_0_BLOCK_SIZE;
-    let mut result = 0.0f32;
-    for blk in 0..nb {
-        let block = &packed[blk * Q2_0_BLOCK_BYTES..];
-        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+/// Q2_0 × q8_0 dot product matching ggml's vec_dot_q2_0_q8_0.
+/// Activations are quantized per 32-element block (q8_0 format) for precision.
+fn q2_0_dot_q8(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
+    let nb = k / Q2_0_BLOCK_SIZE; // number of Q2_0 blocks (128 elements each)
+    let mut sumf = 0.0f32;
+
+    for i in 0..nb {
+        let block = &w_packed[i * Q2_0_BLOCK_BYTES..];
+        let d0 = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         let qs = &block[2..34];
-        let a_off = blk * Q2_0_BLOCK_SIZE;
-        let mut isum: i32 = 0;
-        let mut asum: i32 = 0;
-        for j in 0..32 {
-            let byte = qs[j];
-            let w0 = (byte & 0x03) as i32;
-            let w1 = ((byte >> 2) & 0x03) as i32;
-            let w2 = ((byte >> 4) & 0x03) as i32;
-            let w3 = ((byte >> 6) & 0x03) as i32;
-            let a0 = a_q[a_off + j * 4] as i32;
-            let a1 = a_q[a_off + j * 4 + 1] as i32;
-            let a2 = a_q[a_off + j * 4 + 2] as i32;
-            let a3 = a_q[a_off + j * 4 + 3] as i32;
-            isum += w0 * a0 + w1 * a1 + w2 * a2 + w3 * a3;
-            asum += a0 + a1 + a2 + a3;
+        let a_off = i * Q2_0_BLOCK_SIZE;
+        let mut sumi = 0.0f32;
+
+        // Each Q2_0 block (128 elements) maps to 4 q8_0 sub-blocks (32 elements each)
+        for sub in 0..4 {
+            let sub_off = a_off + sub * 32;
+            let sub_a = &a_f32[sub_off..sub_off + 32];
+
+            // Quantize this 32-element sub-block to q8_0
+            let amax: f32 = sub_a.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let d1 = amax / 127.0;
+            let id1 = if d1 != 0.0 { 127.0 / amax } else { 0.0 };
+
+            let sub_qs = &qs[sub * 8..(sub + 1) * 8];
+            let mut sumi_block: i32 = 0;
+            for b in 0..8 {
+                let byte = sub_qs[b];
+                let w0 = ((byte >> 0) & 3) as i32 - 1;
+                let w1 = ((byte >> 2) & 3) as i32 - 1;
+                let w2 = ((byte >> 4) & 3) as i32 - 1;
+                let w3 = ((byte >> 6) & 3) as i32 - 1;
+                let a0 = (sub_a[b * 4 + 0] * id1).round() as i32;
+                let a1 = (sub_a[b * 4 + 1] * id1).round() as i32;
+                let a2 = (sub_a[b * 4 + 2] * id1).round() as i32;
+                let a3 = (sub_a[b * 4 + 3] * id1).round() as i32;
+                sumi_block += w0 * a0 + w1 * a1 + w2 * a2 + w3 * a3;
+            }
+            sumi += d1 * sumi_block as f32;
         }
-        result += (isum - asum) as f32 * scale / a_scale;
+        sumf += d0 * sumi;
     }
-    result
+    sumf
 }
 
 pub fn q2_0_gemv(
@@ -1138,31 +1154,9 @@ pub fn q2_0_gemv(
     k: usize,
 ) {
     let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
-    let expected = n * row_bytes;
-    if packed.len() < expected {
-        eprintln!("[q2_0_gemv] packed len {} < expected {} (n={n} k={k} row_bytes={row_bytes})", packed.len(), expected);
-        for i in 0..n.min(output.len()) { output[i] = 0.0; }
-        return;
-    }
-    if output.len() < n {
-        eprintln!("[q2_0_gemv] output len {} < n={n}", output.len());
-        return;
-    }
-    if a_f32.len() < k {
-        eprintln!("[q2_0_gemv] a_f32 len {} < k={k}", a_f32.len());
-        for i in 0..n.min(output.len()) { output[i] = 0.0; }
-        return;
-    }
-    let mut a_q = vec![0i8; k];
-    let (a_scale, _a_sum) = i2s_quantize_into(a_f32, &mut a_q);
-    if a_scale.abs() < 1e-30 {
-        output[..n].fill(0.0);
-        return;
-    }
-
     for j in 0..n {
         let w = &packed[j * row_bytes..(j + 1) * row_bytes];
-        output[j] = q2_0_gemv_row(w, &a_q, a_scale, k);
+        output[j] = q2_0_dot_q8(w, a_f32, k);
     }
 }
 

@@ -855,14 +855,18 @@ where
                 ref ffn_sub_norm_name,
             ) = layer_names[layer];
 
+            if layer <= 3 || layer == cfg.num_layers - 1 {
+                let hn: f32 = hidden.iter().map(|x| x*x).sum::<f32>().sqrt();
+                let first4: Vec<f32> = hidden[..4.min(hidden.len())].to_vec();
+                eprintln!("[trace] layer={layer} kind={layer_kind:?} hidden_norm={hn:.4} first4={first4:?}");
+            }
+
             if layer_kind == crate::config::LayerKind::DeltaNet {
                 let prefix = format!("model.layers.{layer}");
                 let dn_heads = cfg.deltanet_num_heads.unwrap_or(n_kv_heads);
                 let dn_head_dim = cfg.deltanet_head_dim.unwrap_or(head_dim);
                 let dn_dim = dn_heads * dn_head_dim;
                 let ssm_a_val = cfg.ssm_a.unwrap_or(-1.0);
-                if layer == 0 {
-                }
 
                 normed.copy_from_slice(&hidden);
                 let input_ln_w = qweights.get_f32(input_ln_name).unwrap();
