@@ -1023,12 +1023,17 @@ where
                         conv_input[t*conv_dim+2*key_dim..t*conv_dim+conv_dim].copy_from_slice(&v_dn[t*dn_dim..(t+1)*dn_dim]);
                     }
                     let mut conv_out = vec![0.0f32; seq_len * conv_dim];
+                    // Conv1d: current token is at the END of the kernel window (position kernel_size-1).
+                    // For fresh state (first token), only weight[kernel_size-1] contributes.
+                    // conv_w layout: [channel, kernel_pos] where kernel_pos 0..kernel_size
+                    // In llama.cpp ssm_conv: sumf += s[i0] * c[i0 + ch*d_conv]
+                    // where i0=0..d_conv, and the input has the current token at position d_conv-1.
                     for ch in 0..conv_dim {
                         for t in 0..seq_len {
                             let mut s = 0.0f32;
                             for ki in 0..kernel_size {
-                                let src_t = t as isize - ki as isize;
-                                if src_t >= 0 {
+                                let src_t = t as isize - (kernel_size as isize - 1 - ki as isize);
+                                if src_t >= 0 && (src_t as usize) < seq_len {
                                     s += conv_input[src_t as usize * conv_dim + ch] * conv_w[ch * kernel_size + ki];
                                 }
                             }
