@@ -855,6 +855,11 @@ where
                 ref ffn_sub_norm_name,
             ) = layer_names[layer];
 
+            if layer == 0 && std::env::var("TEMPURA_TRACE_EMBED").is_ok() {
+                let en: f32 = hidden.iter().map(|x|x*x).sum::<f32>().sqrt();
+                eprintln!("[embed] hidden norm={en:.4} first8={:?}", &hidden[..8.min(h)]);
+            }
+
             let skip_dn = std::env::var("TEMPURA_SKIP_DELTANET").is_ok();
 
             if layer_kind == crate::config::LayerKind::DeltaNet && skip_dn {
@@ -1076,6 +1081,8 @@ where
             }
 
 
+            let no_qgate = std::env::var("TEMPURA_NO_QGATE").is_ok();
+            let no_qknorm = std::env::var("TEMPURA_NO_QKNORM").is_ok();
             // Detect Q+gate fused projection (Qwen3.5 softmax layers)
             let q_weight_cols = qweights.get_q2(q_w_name)
                 .map(|w| w.len() / ((h / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES))
@@ -1084,7 +1091,7 @@ where
                     if row_bytes > 0 { w.len() / row_bytes } else { q_dim }
                 }))
                 .unwrap_or(q_dim);
-            let has_q_gate = q_weight_cols > q_dim;
+            let has_q_gate = q_weight_cols > q_dim && !no_qgate;
             let actual_q_cols = if has_q_gate { q_weight_cols } else { q_dim };
 
             let normed_preq = if seq_len == 1 {
@@ -1172,7 +1179,7 @@ where
             }
 
 
-            if cfg.use_qk_norm && qweights.get_f32(q_norm_name).is_some() {
+            if cfg.use_qk_norm && !no_qknorm && qweights.get_f32(q_norm_name).is_some() {
                 let q_norm_w = qweights.get_f32(q_norm_name).unwrap();
                 let k_norm_w = qweights.get_f32(k_norm_name).unwrap();
                 apply_head_rmsnorm(&mut q, q_norm_w, seq_len, n_heads, head_dim, cfg.layer_norm_eps);
