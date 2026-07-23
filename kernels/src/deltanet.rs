@@ -397,3 +397,37 @@ mod tests {
         }
     }
 }
+
+#[cfg(kani)]
+mod kani_conv1d {
+    #[kani::proof]
+    fn conv1d_index_bounds() {
+        let seq_len: usize = kani::any();
+        let conv_dim: usize = kani::any();
+        let kernel_size: usize = kani::any();
+        kani::assume(seq_len >= 1 && seq_len <= 4);
+        kani::assume(conv_dim >= 1 && conv_dim <= 8);
+        kani::assume(kernel_size >= 1 && kernel_size <= 4);
+
+        let conv_input_len = seq_len * conv_dim;
+        let conv_w_len = conv_dim * kernel_size;
+        let conv_out_len = seq_len * conv_dim;
+
+        let ch: usize = kani::any();
+        let t: usize = kani::any();
+        let ki: usize = kani::any();
+        kani::assume(ch < conv_dim);
+        kani::assume(t < seq_len);
+        kani::assume(ki < kernel_size);
+
+        let src_t = t as isize - (kernel_size as isize - 1 - ki as isize);
+        if src_t >= 0 && (src_t as usize) < seq_len {
+            let input_idx = src_t as usize * conv_dim + ch;
+            assert!(input_idx < conv_input_len);
+        }
+        let w_idx = ch * kernel_size + ki;
+        assert!(w_idx < conv_w_len);
+        let out_idx = t * conv_dim + ch;
+        assert!(out_idx < conv_out_len);
+    }
+}

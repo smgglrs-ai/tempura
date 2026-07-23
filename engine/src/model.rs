@@ -1103,6 +1103,17 @@ where
                 let mut o_proj_dn = vec![0.0f32; seq_len * h];
                 qmm(None, &dn_out, &out_proj_name, &mut o_proj_dn, seq_len, h, dn_dim);
 
+                if layer == 0 && std::env::var("TEMPURA_TRACE_DN").is_ok() {
+                    let on: f32 = o_proj_dn.iter().map(|x|x*x).sum::<f32>().sqrt();
+                    let dn_n: f32 = dn_out.iter().map(|x|x*x).sum::<f32>().sqrt();
+                    eprintln!("[DN-L0] dn_out norm={dn_n:.4} o_proj norm={on:.4}");
+                    eprintln!("[DN-L0] dn_out[0:4]={:?} o_proj[0:4]={:?}", &dn_out[..4], &o_proj_dn[..4]);
+                    eprintln!("[DN-L0] alpha[0:4]={:?} beta[0:4]={:?}", &alpha[..4.min(dn_heads)], &beta[..4.min(dn_heads)]);
+                    let qn: f32 = q_dn.iter().map(|x|x*x).sum::<f32>().sqrt();
+                    let kn: f32 = k_dn.iter().map(|x|x*x).sum::<f32>().sqrt();
+                    let vn: f32 = v_dn.iter().map(|x|x*x).sum::<f32>().sqrt();
+                    eprintln!("[DN-L0] q norm={qn:.4} k norm={kn:.4} v norm={vn:.4}");
+                }
                 for i in 0..hidden.len() { hidden[i] += o_proj_dn[i]; }
                 deltanet_layer_idx += 1;
 
