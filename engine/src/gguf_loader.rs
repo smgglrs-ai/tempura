@@ -1036,7 +1036,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         deltanet_head_dim: None,
         ssm_a: None,
         dt_bias: None,
-        rope_dim: get_usize("rope.dimension_count"),
+        rope_dim: if std::env::var("TEMPURA_FULL_ROPE").is_ok() { None } else { get_usize("rope.dimension_count") },
     })
 }
 

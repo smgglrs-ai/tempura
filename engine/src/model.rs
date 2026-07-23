@@ -860,6 +860,39 @@ where
                 eprintln!("[embed] hidden norm={en:.4} first8={:?}", &hidden[..8.min(h)]);
             }
 
+            if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && (layer <= 3 || layer == cfg.num_layers - 1) {
+                let hn: f32 = hidden.iter().map(|x|x*x).sum::<f32>().sqrt();
+                eprintln!("[pre-L{layer}] kind={layer_kind:?} hidden_norm={hn:.6} first4={:?}", &hidden[..4.min(h)]);
+            }
+            if layer == 3 && std::env::var("TEMPURA_DUMP_L3").is_ok() {
+                use std::io::Write;
+                let path = "/tmp/tempura_l3_hidden.bin";
+                let mut f = std::fs::File::create(path).unwrap();
+                for &v in &hidden[..h] { f.write_all(&v.to_le_bytes()).unwrap(); }
+                eprintln!("[dump] wrote {h} f32 values to {path}");
+                // Also dump after Q projection
+                let mut normed_l3 = hidden[..h].to_vec();
+                let ln_w = qweights.get_f32(&layer_names[3].0).unwrap();
+                self.pipeline.rmsnorm(&mut normed_l3, ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+                eprintln!("[L3-norm] norm={:.6} first4={:?}", normed_l3.iter().map(|x|x*x).sum::<f32>().sqrt(), &normed_l3[..4]);
+                let q_name = &layer_names[3].2; // q_proj.weight
+                let mut q_test = vec![0.0f32; 4096];
+                // Print first bytes of Q weight for comparison with Python
+                if let Some(qw) = qweights.get_q4k(q_name) {
+                    eprintln!("[L3-Q] Q4K weight first16: {:02x?}", &qw[..16]);
+                } else if let Some(qw) = qweights.get_q6k(q_name) {
+                    eprintln!("[L3-Q] Q6K weight first16: {:02x?}", &qw[..16]);
+                } else if let Some(qw) = qweights.get_f32(q_name) {
+                    eprintln!("[L3-Q] f32 weight first4: {:?}", &qw[..4]);
+                } else {
+                    eprintln!("[L3-Q] weight NOT FOUND for {q_name}");
+                }
+                qmm(None, &normed_l3, q_name, &mut q_test, 1, 4096, h);
+                eprintln!("[L3-Q] full_norm={:.4} first8={:?}", q_test.iter().map(|x|x*x).sum::<f32>().sqrt(), &q_test[..8]);
+                // Extracted Q (interleaved)
+                eprintln!("[L3-Q] Q_h0[0:4]={:?} Q_h1[0:2]={:?}", &q_test[..4], &q_test[512..514]);
+            }
+
             let skip_dn = std::env::var("TEMPURA_SKIP_DELTANET").is_ok();
 
             if layer_kind == crate::config::LayerKind::DeltaNet && skip_dn {
