@@ -858,6 +858,13 @@ where
             if layer == 0 && std::env::var("TEMPURA_TRACE_EMBED").is_ok() {
                 let en: f32 = hidden.iter().map(|x|x*x).sum::<f32>().sqrt();
                 eprintln!("[embed] hidden norm={en:.4} first8={:?}", &hidden[..8.min(h)]);
+                // Dump first Q5K tensor values
+                let qkv_name = format!("model.layers.0.ssm.qkv_proj.weight");
+                if let Some(w) = qweights.get_f32(&qkv_name) {
+                    eprintln!("[Q5K-check] {qkv_name}: len={} first8={:?}", w.len(), &w[..8]);
+                } else {
+                    eprintln!("[Q5K-check] {qkv_name}: NOT FOUND in f32");
+                }
             }
 
             if layer == 0 && std::env::var("TEMPURA_TRACE_TOKENS").is_ok() {

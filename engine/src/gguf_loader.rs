@@ -596,31 +596,36 @@ fn dequant_q4k(data: &[u8], num_elements: usize) -> Vec<f32> {
 fn dequant_q5k(data: &[u8], num_elements: usize) -> Vec<f32> {
     let num_blocks = num_elements / 256;
     let block_size = 176;
-    let mut output = Vec::with_capacity(num_elements);
+    let mut output = vec![0.0f32; num_elements];
 
     for b in 0..num_blocks {
         let bs = b * block_size;
         let d = f16_to_f32(u16::from_le_bytes([data[bs], data[bs + 1]]));
         let dmin = f16_to_f32(u16::from_le_bytes([data[bs + 2], data[bs + 3]]));
         let packed_scales = &data[bs + 4..bs + 16];
-        let qh = &data[bs + 16..bs + 48];
-        let qs = &data[bs + 48..bs + 176];
+        let qh = &data[bs + 16..bs + 48]; // 32 bytes = 256 high bits
+        let qs = &data[bs + 48..bs + 176]; // 128 bytes = 256 nibbles (split layout)
 
         let (sc, m) = unpack_q4k_scales(packed_scales);
+        let out = &mut output[b * 256..(b + 1) * 256];
 
-        for j in 0..8 {
-            for i in 0..32 {
-                let elem = j * 32 + i;
-                let byte_idx = elem / 2;
-                let low4 = if elem % 2 == 0 {
-                    qs[byte_idx] & 0x0F
-                } else {
-                    qs[byte_idx] >> 4
-                };
-                let high1 = (qh[elem / 8] >> (elem % 8)) & 1;
-                let q = (low4 | (high1 << 4)) as f32;
-                output.push(d * sc[j] * q - dmin * m[j]);
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        for j in 0..4 {
+            let q_off = j * 32;
+            let d1 = d * sc[2 * j];
+            let m1 = dmin * m[2 * j];
+            let d2 = d * sc[2 * j + 1];
+            let m2 = dmin * m[2 * j + 1];
+
+            for l in 0..32 {
+                let hb1 = if qh[l] & u1 != 0 { 16 } else { 0 };
+                let hb2 = if qh[l] & u2 != 0 { 16 } else { 0 };
+                out[j * 64 + l] = d1 * ((qs[q_off + l] & 0x0F) + hb1) as f32 - m1;
+                out[j * 64 + l + 32] = d2 * ((qs[q_off + l] >> 4) + hb2) as f32 - m2;
             }
+            u1 <<= 2;
+            u2 <<= 2;
         }
     }
     output
