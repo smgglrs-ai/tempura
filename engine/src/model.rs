@@ -1566,6 +1566,12 @@ where
                 let norm: f32 = last.iter().map(|x| x * x).sum::<f32>().sqrt();
                 eprintln!("L{layer} hidden[last][0..8]: {:?} norm={norm:.4}", &last[..8.min(h)]);
             }
+            if std::env::var("TEMPURA_DUMP_LAYERS").is_ok() {
+                use std::io::Write;
+                let path = format!("/tmp/tempura_layer_{layer}.bin");
+                let mut f = std::fs::File::create(&path).unwrap();
+                for &v in &hidden[..h] { f.write_all(&v.to_le_bytes()).unwrap(); }
+            }
         }
 
         session.cache.advance(seq_len);
@@ -1582,6 +1588,12 @@ where
             tempura_kernels::portable_math::q8_snap(&mut final_normed[..seq_len * h]);
         }
 
+        if std::env::var("TEMPURA_DUMP_LAYERS").is_ok() {
+            use std::io::Write;
+            let path = "/tmp/tempura_final_normed.bin";
+            let mut f = std::fs::File::create(path).unwrap();
+            for &v in &final_normed[..h] { f.write_all(&v.to_le_bytes()).unwrap(); }
+        }
         // lm_head
         let last_hidden = &final_normed[(seq_len - 1) * h..seq_len * h];
         let mut logits = vec![0.0f32; cfg.vocab_size];
@@ -5918,3 +5930,4 @@ mod tests {
         assert!(logits.iter().any(|x| *x != 0.0), "logits should be non-zero");
     }
 }
+// TEMPORARY: dump all layer hidden states
