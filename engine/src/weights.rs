@@ -394,12 +394,20 @@ impl QuantizedWeights {
                 let bits = u16::from_le_bytes([f16_data[byte_off + i * 2], f16_data[byte_off + i * 2 + 1]]);
                 output[i] = f16_bits_to_f32(bits);
             }
-        } else if let Some(q4k_data) = self.get_q4k("model.embed_tokens.weight") {
-            let row_bytes = (hidden_size / 256) * 144;
+        } else if let Some(qk_data) = self.get_q4k("model.embed_tokens.weight")
+            .or_else(|| self.get_q6k("model.embed_tokens.weight")) {
+            let is_q6k = self.get_q4k("model.embed_tokens.weight").is_none();
+            let block_size = 256;
+            let block_bytes = if is_q6k { 210 } else { 144 };
+            let row_bytes = (hidden_size / block_size) * block_bytes;
             let row_off = token_id as usize * row_bytes;
-            if row_off + row_bytes <= q4k_data.len() {
-                let row = &q4k_data[row_off..row_off + row_bytes];
-                crate::gguf_loader::dequant_q4k_row(row, output, hidden_size);
+            if row_off + row_bytes <= qk_data.len() {
+                let row = &qk_data[row_off..row_off + row_bytes];
+                if is_q6k {
+                    crate::gguf_loader::dequant_q6k_row(row, output, hidden_size);
+                } else {
+                    crate::gguf_loader::dequant_q4k_row(row, output, hidden_size);
+                }
             }
         } else if let Some(q2_data) = self.get_q2("model.embed_tokens.weight") {
             let row_bytes = (hidden_size / 128) * 34;

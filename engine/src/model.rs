@@ -1076,16 +1076,6 @@ where
             }
 
 
-            if layer == 3 && std::env::var("TEMPURA_TRACE_L3").is_ok() {
-                let has_q = qweights.get_q2(q_w_name).is_some();
-                let has_k = qweights.get_q2(k_w_name).is_some();
-                let has_v = qweights.get_q2(v_w_name).is_some();
-                let has_o = qweights.get_q2(o_w_name).is_some();
-                let q_len = qweights.get_q2(q_w_name).map(|w| w.len()).unwrap_or(0);
-                let k_len = qweights.get_q2(k_w_name).map(|w| w.len()).unwrap_or(0);
-                eprintln!("[L3-pre] q_w={q_w_name} has_q={has_q}(len={q_len}) has_k={has_k}(len={k_len}) has_v={has_v} has_o={has_o}");
-                eprintln!("[L3-pre] hidden norm={:.4} hidden[0..4]={:?}", hidden.iter().map(|x|x*x).sum::<f32>().sqrt(), &hidden[..4]);
-            }
             // Detect Q+gate fused projection (Qwen3.5 softmax layers)
             let q_weight_cols = qweights.get_q2(q_w_name)
                 .map(|w| w.len() / ((h / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES))
@@ -1139,9 +1129,6 @@ where
                         let qn: f32 = q[..q_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
                         let kn: f32 = k[..kv_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
                         let vn: f32 = v[..kv_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
-                        eprintln!("[L3] post-proj Q norm={qn:.4} K norm={kn:.4} V norm={vn:.4} q[0..4]={:?} k[0..4]={:?}", &q[..4], &k[..4]);
-                        eprintln!("[L3] gate_buf[0..4]={:?} gate_buf[256..260]={:?}", &q_gate_buf[..4], &q_gate_buf[256..260]);
-                        eprintln!("[L3] has_q_gate={has_q_gate} actual_q_cols={actual_q_cols} q_dim={q_dim} head_dim={head_dim} n_heads={n_heads}");
                     }
                 } else {
                     qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q[..q_dim], 1, q_dim, h);
@@ -1288,7 +1275,6 @@ where
 
             if layer == 3 && std::env::var("TEMPURA_TRACE_L3").is_ok() {
                 let an: f32 = attn_out[..q_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
-                eprintln!("[L3] post-attn norm={an:.4} attn_out[0..4]={:?}", &attn_out[..4]);
             }
 
             // Qwen3.5 softmax layers: sigmoid gate on attention output

@@ -557,6 +557,11 @@ pub fn dequant_q4k_row(data: &[u8], output: &mut [f32], num_elements: usize) {
     output[..num_elements].copy_from_slice(&v);
 }
 
+pub fn dequant_q6k_row(data: &[u8], output: &mut [f32], num_elements: usize) {
+    let v = dequant_q6k(data, num_elements);
+    output[..num_elements].copy_from_slice(&v);
+}
+
 fn dequant_q4k(data: &[u8], num_elements: usize) -> Vec<f32> {
     let num_blocks = num_elements / 256;
     let block_size = 144;
