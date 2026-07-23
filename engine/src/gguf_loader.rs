@@ -1147,11 +1147,15 @@ impl GgufLoader {
             let ne = num_elements as usize;
             let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
 
-            let keep_raw = (info.dtype == GgmlType::Q4K || info.dtype == GgmlType::Q6K
+            let keep_raw = if std::env::var("TEMPURA_F32_ALL").is_ok() {
+                false
+            } else {
+                (info.dtype == GgmlType::Q4K || info.dtype == GgmlType::Q6K
                 || info.dtype == GgmlType::TQ2_0 || info.dtype == GgmlType::TQ1_0
                 || info.dtype == GgmlType::TL1 || info.dtype == GgmlType::TL2
                 || info.dtype == GgmlType::Q2_0)
-                && !mapped_name.contains("norm.weight");
+                && !mapped_name.contains("norm.weight")
+            };
 
             if info.dtype == GgmlType::F16 {
                 mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, GgmlType::F16));

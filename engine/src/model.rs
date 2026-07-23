@@ -1150,6 +1150,7 @@ where
                     let row_bytes = (h / 256) * 144; // Q4K block
                     if row_bytes > 0 { w.len() / row_bytes } else { q_dim }
                 }))
+                .or_else(|| qweights.get_f32(q_w_name).map(|w| w.len() / h))
                 .unwrap_or(q_dim);
             let has_q_gate = q_weight_cols > q_dim && !no_qgate;
             let actual_q_cols = if has_q_gate { q_weight_cols } else { q_dim };
