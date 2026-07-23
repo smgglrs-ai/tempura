@@ -810,6 +810,24 @@ impl GgufValue {
         }
     }
 
+    pub fn as_u32_array(&self) -> Option<Vec<u32>> {
+        match self {
+            GgufValue::Array(arr) => {
+                let mut result = Vec::with_capacity(arr.len());
+                for v in arr {
+                    match v {
+                        GgufValue::U32(x) => result.push(*x),
+                        GgufValue::I32(x) => result.push(*x as u32),
+                        GgufValue::U64(x) => result.push(*x as u32),
+                        _ => return None,
+                    }
+                }
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
     pub fn as_f32_array(&self) -> Option<Vec<f32>> {
         match self {
             GgufValue::Array(arr) => {

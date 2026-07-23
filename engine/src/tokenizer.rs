@@ -48,6 +48,16 @@ const CHATML_TEMPLATE: &str = "\
 {%- endfor %}\
 {%- if add_generation_prompt %}\
 <|im_start|>assistant\n\
+{%- if enable_thinking %}<think>\n{% endif %}\
+{% endif %}";
+
+const CHATML_TEMPLATE_PLAIN: &str = "\
+{%- for message in messages %}\
+<|im_start|>{{ message.role }}\n\
+{{ message.content }}<|im_end|>\n\
+{%- endfor %}\
+{%- if add_generation_prompt %}\
+<|im_start|>assistant\n\
 {% endif %}";
 
 #[derive(Debug, Clone)]
@@ -102,6 +112,7 @@ impl ChatTemplate {
             add_generation_prompt => add_generation_prompt,
             bos_token => self.bos_token,
             eos_token => self.eos_token,
+            enable_thinking => true,
         })
         .map_err(|e| TokenizerError::Template(e.to_string()))
     }
@@ -186,6 +197,28 @@ impl Tokenizer {
 
         let mut inner = tokenizers::Tokenizer::new(bpe);
 
+        // Register special tokens (type != 1) so they're matched as whole strings
+        // before the BPE pre-tokenizer splits them
+        let token_types = metadata
+            .get("tokenizer.ggml.token_type")
+            .and_then(|v| v.as_u32_array());
+        if let Some(ref types) = token_types {
+            let mut special_tokens = Vec::new();
+            for (id, &tt) in types.iter().enumerate() {
+                if tt != 1 && id < tokens.len() {
+                    let tok_str = tokens[id].to_string();
+                    if !tok_str.is_empty() {
+                        let mut at = tokenizers::AddedToken::from(tok_str, true);
+                        at = at.normalized(false);
+                        special_tokens.push(at);
+                    }
+                }
+            }
+            if !special_tokens.is_empty() {
+                inner.add_special_tokens(&special_tokens);
+            }
+        }
+
         let model_type = metadata
             .get("tokenizer.ggml.model")
             .and_then(|v| match v {
@@ -231,7 +264,42 @@ impl Tokenizer {
             })
             .unwrap_or(false);
 
-        let chat_template = ChatTemplate::new(CHATML_TEMPLATE.to_string(), bos_token, eos_token);
+        let gguf_template = metadata
+            .get("tokenizer.chat_template")
+            .and_then(|v| match v {
+                GgufValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
+        // Detect thinking model: has <think> as a special token
+        let is_thinking = token_types.as_ref().map_or(false, |types| {
+            tokens.iter().enumerate().any(|(id, tok)| {
+                *tok == "<think>" && id < types.len() && types[id as usize] != 1
+            })
+        });
+
+        // Try GGUF template; if it fails to render, fall back to ChatML
+        let template_str = if let Some(ref gt) = gguf_template {
+            let mut test_env = minijinja::Environment::new();
+            let works = test_env.add_template("t", gt).is_ok() && {
+                let tmpl = test_env.get_template("t").unwrap();
+                let test_msgs: Vec<minijinja::Value> = vec![minijinja::context! { role => "user", content => "hi" }.into()];
+                tmpl.render(minijinja::context! {
+                    messages => test_msgs,
+                    add_generation_prompt => true,
+                    bos_token => "",
+                    eos_token => "",
+                    enable_thinking => true,
+                }).is_ok()
+            };
+            if works { gt.clone() }
+            else if is_thinking { CHATML_TEMPLATE.to_string() }
+            else { CHATML_TEMPLATE_PLAIN.to_string() }
+        } else if is_thinking {
+            CHATML_TEMPLATE.to_string()
+        } else {
+            CHATML_TEMPLATE_PLAIN.to_string()
+        };
+        let chat_template = ChatTemplate::new(template_str, bos_token, eos_token);
 
         Ok(Self {
             inner,

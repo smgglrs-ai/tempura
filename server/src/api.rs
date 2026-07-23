@@ -337,7 +337,8 @@ async fn chat_completions(
 
     let prompt = tokenizer
         .apply_chat_template(&chat_messages, true)
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|e| {
+            eprintln!("[chat] template render error: {e}, using fallback");
             req.messages
                 .iter()
                 .map(|m| format!("{}: {}", m.role, m.content_str()))
