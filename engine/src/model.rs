@@ -860,6 +860,10 @@ where
                 eprintln!("[embed] hidden norm={en:.4} first8={:?}", &hidden[..8.min(h)]);
             }
 
+            if layer == 0 && std::env::var("TEMPURA_TRACE_TOKENS").is_ok() {
+                let toks: Vec<u32> = (0..seq_len).map(|i| session.position as u32 + i as u32).collect();
+                eprintln!("[tokens] seq_len={seq_len} position={} token_range={}..{}", session.position, session.position, session.position + seq_len);
+            }
             if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && (layer <= 3 || layer == cfg.num_layers - 1) {
                 let hn: f32 = hidden.iter().map(|x|x*x).sum::<f32>().sqrt();
                 eprintln!("[pre-L{layer}] kind={layer_kind:?} hidden_norm={hn:.6} first4={:?}", &hidden[..4.min(h)]);
