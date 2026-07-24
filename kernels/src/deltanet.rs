@@ -64,12 +64,13 @@ impl CpuDeltaNet {
                 }
             }
 
+            let scale = 1.0 / (head_dim as f32).sqrt();
             for row in 0..head_dim {
                 let mut sum = 0.0f32;
                 for col in 0..head_dim {
                     sum += state[s_off + row * head_dim + col] * q[qkv_off + col];
                 }
-                output[qkv_off + row] = sum;
+                output[qkv_off + row] = sum * scale;
             }
         }
     }
