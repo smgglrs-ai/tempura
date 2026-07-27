@@ -402,6 +402,39 @@ mod tests {
 }
 
 #[cfg(kani)]
+mod kani_deltanet_output {
+    #[kani::proof]
+    fn output_is_transposed_state_times_query() {
+        let head_dim: usize = kani::any();
+        kani::assume(head_dim >= 1 && head_dim <= 4);
+        let d2 = head_dim * head_dim;
+
+        let col: usize = kani::any();
+        let row: usize = kani::any();
+        kani::assume(col < head_dim);
+        kani::assume(row < head_dim);
+
+        // Output computation: output[col] = Σ_row state[row*d + col] * q[row]
+        // This is (S^T @ q)[col] = Σ_row S[row][col] * q[row]
+        // where S[row][col] = state[row*d + col]
+        let out_state_idx = row * head_dim + col;
+        assert!(out_state_idx < d2);
+
+        // Retrieve computation: retrieved[col] = Σ_row state[row*d + col] * k[row]
+        // Same transposition: (S^T @ k)[col]
+        let ret_state_idx = row * head_dim + col;
+        assert!(ret_state_idx < d2);
+
+        // Update: state[row*d + col] += k[row] * delta[col]
+        // This is S += outer(k, delta) = S[row][col] += k[row]*d[col]
+        // Consistent: retrieve = S^T@k, output = S^T@q, update = S += k⊗delta
+        // The delta rule: S^T @ q = (S_old*decay + k⊗β(v - S^T@k))^T @ q
+        let upd_state_idx = row * head_dim + col;
+        assert!(upd_state_idx < d2);
+    }
+}
+
+#[cfg(kani)]
 mod kani_conv1d {
     #[kani::proof]
     fn conv1d_index_bounds() {

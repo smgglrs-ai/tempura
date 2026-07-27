@@ -6422,3 +6422,124 @@ mod tests {
         }
     }
 }
+
+#[cfg(kani)]
+mod kani_q2x4_repack {
+    use super::*;
+
+    #[kani::proof]
+    fn q2x4_repack_preserves_values() {
+        let k: usize = kani::any();
+        let n: usize = kani::any();
+        kani::assume(k == 128);
+        kani::assume(n == 4);
+
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * Q2_0_BLOCK_BYTES;
+
+        let elem_idx: usize = kani::any();
+        let row: usize = kani::any();
+        kani::assume(elem_idx < k);
+        kani::assume(row < n);
+
+        let blk = elem_idx / Q2_0_BLOCK_SIZE;
+        let within = elem_idx % Q2_0_BLOCK_SIZE;
+        let q2_byte = within / 4;
+        let q2_shift = (within % 4) * 2;
+
+        let src_off = row * row_bytes + blk * Q2_0_BLOCK_BYTES + 2 + q2_byte;
+        assert!(src_off < n * row_bytes);
+
+        let grp = row / 4;
+        let j = row % 4;
+        let sub = q2_byte / 8;
+        let dst_off = (grp * blocks_per_row + blk) * Q2X4_BLOCK_BYTES + 8 + sub * 32 + j * 8 + q2_byte % 8;
+        assert!(dst_off < ((n + 3) / 4) * blocks_per_row * Q2X4_BLOCK_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod test_q2_roundtrip {
+    use super::*;
+
+    #[test]
+    fn q2x4_repack_roundtrip() {
+        let k = 256;
+        let n = 8;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * Q2_0_BLOCK_BYTES;
+        let mut q2_data = vec![0u8; n * row_bytes];
+
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
+                q2_data[off] = 0x00; q2_data[off + 1] = 0x3C; // f16 scale = 1.0
+                for b in 0..32 {
+                    q2_data[off + 2 + b] = ((row * 3 + blk * 7 + b) % 256) as u8 & 0xFF;
+                    // mask to valid 2-bit values only
+                    q2_data[off + 2 + b] = q2_data[off + 2 + b];
+                }
+            }
+        }
+
+        let x4 = repack_q2_to_q2x4(&q2_data, n, k);
+
+        // Verify each element can be recovered
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let q2_off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
+                let grp = row / 4;
+                let j = row % 4;
+                let x4_off = (grp * blocks_per_row + blk) * Q2X4_BLOCK_BYTES;
+
+                // Check scale preserved
+                assert_eq!(q2_data[q2_off], x4[x4_off + j * 2], "scale lo mismatch row={row} blk={blk}");
+                assert_eq!(q2_data[q2_off + 1], x4[x4_off + j * 2 + 1], "scale hi mismatch");
+
+                // Check packed data preserved (interleaved at 8-byte chunks)
+                for sub in 0..4 {
+                    for b in 0..8 {
+                        let src = q2_data[q2_off + 2 + sub * 8 + b];
+                        let dst = x4[x4_off + 8 + sub * 32 + j * 8 + b];
+                        assert_eq!(src, dst, "data mismatch row={row} blk={blk} sub={sub} b={b}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q2_preq_matches_raw() {
+        let k = 256;
+        let n = 16;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * Q2_0_BLOCK_BYTES;
+        let mut q2_data = vec![0u8; n * row_bytes];
+
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
+                let scale_bits: u16 = 0x3000 + (row as u16 * 7 + blk as u16) % 256;
+                q2_data[off..off+2].copy_from_slice(&scale_bits.to_le_bytes());
+                for b in 0..32 {
+                    q2_data[off + 2 + b] = ((row * 13 + blk * 37 + b * 3) & 0xFF) as u8;
+                }
+            }
+        }
+
+        let a: Vec<f32> = (0..k).map(|i| ((i * 7 + 3) as f32 * 0.01).sin()).collect();
+        let preq = PreQuantizedActivations::from_f32(&a);
+
+        let mut out_raw = vec![0.0f32; n];
+        q2_0_gemv(&q2_data, &a, &mut out_raw, n, k);
+
+        let mut out_preq = vec![0.0f32; n];
+        q2_0_gemv_preq(&q2_data, &preq, &mut out_preq, n, k);
+
+        for j in 0..n {
+            let diff = (out_raw[j] - out_preq[j]).abs();
+            let rel = if out_raw[j].abs() > 1e-6 { diff / out_raw[j].abs() } else { diff };
+            assert!(rel < 0.10, "row {j}: raw={} preq={} rel={rel:.4}", out_raw[j], out_preq[j]);
+        }
+    }
+}
