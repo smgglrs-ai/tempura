@@ -1030,12 +1030,14 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         crate::config::HiddenAct::SiluGate
     };
 
-    // BitNet GGUF converter (convert-hf-to-gguf-bitnet.py) does NOT permute Q/K
-    // weights, so they remain in HuggingFace layout (split-half = NeoX RoPE).
-    // LLaMA GGUF converter permutes Q/K for adjacent-pair (Norm) RoPE.
-    // The GGUF metadata says ROPE_TYPE_NORM for both, but the actual weight
-    // layout determines which RoPE to use.
-    let rope_type = crate::config::RopeType::Neox;
+    // Qwen3.5/3.6 use IMROPE (interleaved multi-rope) = adjacent-pair (Norm) RoPE.
+    // Standard GGUF converter permutes Q/K weights for adjacent-pair pairing.
+    // BitNet/ternary GGUF converter does NOT permute → needs NeoX (split-half) RoPE.
+    let rope_type = if (arch == "qwen35" || arch == "qwen35moe") && !is_bitnet {
+        crate::config::RopeType::Norm
+    } else {
+        crate::config::RopeType::Neox
+    };
 
     Ok(ModelConfig {
         hidden_size,
@@ -1213,6 +1215,8 @@ impl GgufLoader {
                 tensors.insert(mapped_name.clone(), floats);
             } else if !use_mmap && !skip_f32 {
                 raw_tensors.insert(mapped_name.clone(), tensor_data.to_vec());
+            }
+            if keep_raw || use_mmap {
                 raw_tensor_dims.insert(mapped_name.clone(), info.dims.clone());
             }
             tensor_dtypes.insert(mapped_name.clone(), info.dtype);
@@ -1240,6 +1244,17 @@ impl GgufLoader {
         }
         config.use_qk_norm = (0..config.num_layers).any(|l|
             tensors.contains_key(&format!("model.layers.{l}.self_attn.q_norm.weight")));
+
+        // Detect ternary/BitNet attention weights: if Q uses Q2_0/TQ2_0,
+        // the converter did NOT permute Q/K → need NeoX RoPE even for qwen35.
+        let has_ternary_attn = tensor_dtypes.iter().any(|(name, dtype)| {
+            name.contains("self_attn.q_proj") && matches!(dtype, GgmlType::Q2_0 | GgmlType::TQ2_0)
+        }) || mmap_ranges.iter().any(|(name, &(_, _, dtype))| {
+            name.contains("self_attn.q_proj") && matches!(dtype, GgmlType::Q2_0 | GgmlType::TQ2_0)
+        });
+        if has_ternary_attn && config.rope_type == crate::config::RopeType::Norm {
+            config.rope_type = crate::config::RopeType::Neox;
+        }
 
         {
             let all_names: Vec<String> = tensors.keys()
@@ -1509,6 +1524,34 @@ impl GgufLoader {
         }
 
         qw
+    }
+
+    pub fn raw_tensor_dims_count(&self) -> usize { self.raw_tensor_dims.len() }
+    pub fn mmap_ranges_count(&self) -> usize { self.mmap_ranges.len() }
+
+    pub fn q2_tensor_shapes(&self) -> HashMap<String, (usize, usize)> {
+        let mut shapes = HashMap::new();
+        let mut q2_count = 0usize;
+        for (name, &(_, _, dtype)) in &self.mmap_ranges {
+            if dtype == GgmlType::Q2_0 {
+                q2_count += 1;
+                if let Some(dims) = self.raw_tensor_dims.get(name) {
+                    if dims.len() >= 2 {
+                        shapes.insert(name.clone(), (dims[1] as usize, dims[0] as usize));
+                    }
+                }
+            }
+        }
+        if q2_count > 0 && shapes.is_empty() {
+            eprintln!("[Q2_0] {} Q2_0 in mmap_ranges but 0 matches in raw_tensor_dims ({} entries)", q2_count, self.raw_tensor_dims.len());
+            if let Some(first_q2) = self.mmap_ranges.iter().find(|(_, &(_, _, d))| d == GgmlType::Q2_0) {
+                eprintln!("[Q2_0] Example mmap key: {:?}", first_q2.0);
+            }
+            if let Some(first_dim) = self.raw_tensor_dims.keys().next() {
+                eprintln!("[Q2_0] Example raw_dim key: {:?}", first_dim);
+            }
+        }
+        shapes
     }
 
     pub fn tensor_dtype(&self, name: &str) -> Option<GgmlType> {

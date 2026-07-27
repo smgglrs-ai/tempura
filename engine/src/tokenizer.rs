@@ -48,7 +48,7 @@ const CHATML_TEMPLATE: &str = "\
 {%- endfor %}\
 {%- if add_generation_prompt %}\
 <|im_start|>assistant\n\
-{%- if enable_thinking %}<think>\n{% endif %}\
+{% if enable_thinking %}<think>\n{% endif %}\
 {% endif %}";
 
 const CHATML_TEMPLATE_PLAIN: &str = "\
@@ -419,7 +419,7 @@ mod tests {
         assert!(result.contains("<|im_start|>system"));
         assert!(result.contains("You are helpful.<|im_end|>"));
         assert!(result.contains("<|im_start|>assistant\nHello!<|im_end|>"));
-        assert!(result.ends_with("<|im_start|>assistant\n"));
+        assert!(result.ends_with("<|im_start|>assistant\n<think>\n"));
     }
 
     #[test]

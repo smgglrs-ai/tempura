@@ -203,7 +203,9 @@ static POOL: std::sync::OnceLock<PersistentPool> = std::sync::OnceLock::new();
 
 pub fn global_pool() -> &'static PersistentPool {
     POOL.get_or_init(|| {
-        let n = thread::available_parallelism().map(|p| p.get().min(8)).unwrap_or(1);
+        let n = std::env::var("TEMPURA_THREADS")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| thread::available_parallelism().map(|p| p.get()).unwrap_or(1));
         PersistentPool::new(n)
     })
 }

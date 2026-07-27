@@ -65,12 +65,12 @@ impl CpuDeltaNet {
             }
 
             let scale = 1.0 / (head_dim as f32).sqrt();
-            for row in 0..head_dim {
+            for col in 0..head_dim {
                 let mut sum = 0.0f32;
-                for col in 0..head_dim {
-                    sum += state[s_off + row * head_dim + col] * q[qkv_off + col];
+                for row in 0..head_dim {
+                    sum += state[s_off + row * head_dim + col] * q[qkv_off + row];
                 }
-                output[qkv_off + row] = sum * scale;
+                output[qkv_off + col] = sum * scale;
             }
         }
     }
@@ -248,12 +248,13 @@ mod tests {
         // With state=0:
         //   gate = softplus(-100) * (-1) ~ 0, decay = exp(0) = 1
         //   state stays 0 after decay
-        //   retrieved = S^T @ k = [0,0]^T @ [0,1] = [0,0]
+        //   retrieved = S^T @ k = 0
         //   delta = 0.5 * ([3,4] - [0,0]) = [1.5, 2.0]
         //   S += outer([0,1], [1.5,2.0]) = [[0,0],[1.5,2.0]]
-        //   output = S @ q = [[0,0],[1.5,2.0]] @ [1,0] = [0, 1.5]
-        assert!((output[0] - 0.0).abs() < 1e-4, "output[0]={}", output[0]);
-        assert!((output[1] - 1.5).abs() < 1e-4, "output[1]={}", output[1]);
+        //   output = S^T @ q * scale = [[0,1.5],[0,2.0]] @ [1,0] / sqrt(2) = [0, 0]
+        //   q=[1,0] is orthogonal to k=[0,1], so retrieval returns 0
+        assert!((output[0]).abs() < 1e-4, "output[0]={}", output[0]);
+        assert!((output[1]).abs() < 1e-4, "output[1]={}", output[1]);
 
         // Verify state
         assert!((state[0] - 0.0).abs() < 1e-4); // [0][0]
@@ -371,22 +372,23 @@ mod tests {
                 ).unwrap();
 
                 // With S=0 initially, decay=1:
-                //   retrieved = 0^T @ k = 0
+                //   retrieved = S^T @ k = 0
                 //   delta = 0.5 * (v - 0) = 0.5 * v
                 //   S = outer(k, 0.5*v)
-                //   output = S @ q = k * (0.5*v . q)   where . is dot product per head
+                //   output = S^T @ q * scale = 0.5*v * (k . q) * scale
+                let scale = 1.0 / (head_dim as f32).sqrt();
                 for h in 0..num_heads {
                     let off = h * head_dim;
                     let k_h = &k[off..off + head_dim];
                     let v_h = &v[off..off + head_dim];
                     let q_h = &q[off..off + head_dim];
 
-                    let half_v_dot_q: f32 = v_h.iter().zip(q_h)
-                        .map(|(vi, qi)| 0.5 * vi * qi)
+                    let k_dot_q: f32 = k_h.iter().zip(q_h)
+                        .map(|(ki, qi)| ki * qi)
                         .sum();
 
                     for d in 0..head_dim {
-                        let expected = k_h[d] * half_v_dot_q;
+                        let expected = 0.5 * v_h[d] * k_dot_q * scale;
                         prop_assert!(
                             (output[off + d] - expected).abs() < 1e-4,
                             "head {h} dim {d}: output={} expected={}",

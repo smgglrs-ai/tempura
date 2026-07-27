@@ -777,6 +777,13 @@ where
                 if !tl2_forward_batched(a_f32, &tl2t.data, tl2t.scale, out, n, k, m) {
                     out.fill(0.0);
                 }
+                if let Some(corr) = qweights.get_q2_row_corrections(name) {
+                    for row in 0..m {
+                        for j in 0..n.min(corr.len()) {
+                            out[row * n + j] *= corr[j];
+                        }
+                    }
+                }
             } else if let Some(w) = qweights.get_i2s(name) {
                 if m == 1 {
                     if let Some(pq) = preq {
@@ -796,7 +803,43 @@ where
             } else if let Some(w) = qweights.get_q6k(name) {
                 q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k)
                     .unwrap();
+            } else if let Some((x4_data, x4_n, x4_k)) = qweights.get_q2x4(name) {
+                if m == 1 {
+                    if let Some(pq) = preq {
+                        tempura_kernels::quantized::q2x4_gemv_preq(x4_data, pq, out, n, k);
+                        return;
+                    }
+                }
+                if let Some(_w) = qweights.get_q2(name) {
+                    for row in 0..m {
+                        tempura_kernels::quantized::q2_0_gemv(
+                            _w, &a_f32[row * k..(row + 1) * k],
+                            &mut out[row * n..(row + 1) * n], n, k,
+                        );
+                    }
+                }
+            } else if let Some((i2s_data, blk_scales, _n, _k)) = qweights.get_q2_i2s(name) {
+                if m == 1 {
+                    if let Some(pq) = preq {
+                        tempura_kernels::quantized::q2_0_gemv_i2s(i2s_data, blk_scales, pq, out, n, k);
+                        return;
+                    }
+                }
+                if let Some(_w) = qweights.get_q2(name) {
+                    for row in 0..m {
+                        tempura_kernels::quantized::q2_0_gemv(
+                            _w, &a_f32[row * k..(row + 1) * k],
+                            &mut out[row * n..(row + 1) * n], n, k,
+                        );
+                    }
+                }
             } else if let Some(_w) = qweights.get_q2(name) {
+                if m == 1 {
+                    if let Some(pq) = preq {
+                        tempura_kernels::quantized::q2_0_gemv_preq(_w, pq, out, n, k);
+                        return;
+                    }
+                }
                 for row in 0..m {
                     tempura_kernels::quantized::q2_0_gemv(
                         _w, &a_f32[row * k..(row + 1) * k],
@@ -1013,21 +1056,13 @@ where
                 if let Some(conv_w) = qweights.get_f32(&format!("{prefix}.ssm.conv1d.weight")) {
                     let kernel_size = conv_w.len() / conv_dim;
                     let conv_bias = qweights.get_f32(&format!("{prefix}.ssm.conv1d.bias"));
-                    // Build conv input: concat Q(key_dim), K(key_dim), V(dn_dim) per token
-                    // Q/K from qkv_buf are already at key_dim width (before GQA repeat)
                     let mut conv_input = vec![0.0f32; seq_len * conv_dim];
                     for t in 0..seq_len {
-                        // Q heads: use first key_dim from q_dn (which has dn_dim but first key_dim is the unrepeated Q)
                         conv_input[t*conv_dim..t*conv_dim+key_dim].copy_from_slice(&q_dn[t*dn_dim..t*dn_dim+key_dim]);
                         conv_input[t*conv_dim+key_dim..t*conv_dim+2*key_dim].copy_from_slice(&k_dn[t*dn_dim..t*dn_dim+key_dim]);
                         conv_input[t*conv_dim+2*key_dim..t*conv_dim+conv_dim].copy_from_slice(&v_dn[t*dn_dim..(t+1)*dn_dim]);
                     }
                     let mut conv_out = vec![0.0f32; seq_len * conv_dim];
-                    // Conv1d: current token is at the END of the kernel window (position kernel_size-1).
-                    // For fresh state (first token), only weight[kernel_size-1] contributes.
-                    // conv_w layout: [channel, kernel_pos] where kernel_pos 0..kernel_size
-                    // In llama.cpp ssm_conv: sumf += s[i0] * c[i0 + ch*d_conv]
-                    // where i0=0..d_conv, and the input has the current token at position d_conv-1.
                     for ch in 0..conv_dim {
                         for t in 0..seq_len {
                             let mut s = 0.0f32;
@@ -1088,10 +1123,6 @@ where
                     }
                 }
 
-                if layer == 0 {
-                    let dn_norm: f32 = dn_out.iter().map(|x|x*x).sum::<f32>().sqrt();
-                    let z_norm: f32 = z_gate.iter().map(|x|x*x).sum::<f32>().sqrt();
-                }
                 if has_in_proj || has_qkv {
                     for i in 0..dn_out.len() {
                         let z_silu = z_gate[i] / (1.0 + (-z_gate[i]).exp());
@@ -1103,17 +1134,6 @@ where
                 let mut o_proj_dn = vec![0.0f32; seq_len * h];
                 qmm(None, &dn_out, &out_proj_name, &mut o_proj_dn, seq_len, h, dn_dim);
 
-                if layer == 0 && std::env::var("TEMPURA_TRACE_DN").is_ok() {
-                    let on: f32 = o_proj_dn.iter().map(|x|x*x).sum::<f32>().sqrt();
-                    let dn_n: f32 = dn_out.iter().map(|x|x*x).sum::<f32>().sqrt();
-                    eprintln!("[DN-L0] dn_out norm={dn_n:.4} o_proj norm={on:.4}");
-                    eprintln!("[DN-L0] dn_out[0:4]={:?} o_proj[0:4]={:?}", &dn_out[..4], &o_proj_dn[..4]);
-                    eprintln!("[DN-L0] alpha[0:4]={:?} beta[0:4]={:?}", &alpha[..4.min(dn_heads)], &beta[..4.min(dn_heads)]);
-                    let qn: f32 = q_dn.iter().map(|x|x*x).sum::<f32>().sqrt();
-                    let kn: f32 = k_dn.iter().map(|x|x*x).sum::<f32>().sqrt();
-                    let vn: f32 = v_dn.iter().map(|x|x*x).sum::<f32>().sqrt();
-                    eprintln!("[DN-L0] q norm={qn:.4} k norm={kn:.4} v norm={vn:.4}");
-                }
                 for i in 0..hidden.len() { hidden[i] += o_proj_dn[i]; }
                 deltanet_layer_idx += 1;
 
@@ -1169,7 +1189,17 @@ where
 
             // QMM/TL2 overwrites output entirely — no zero-fill needed
             if seq_len == 1 {
-                if let (Some(pq), Some(qw), Some(kw), Some(vw)) = (
+                if has_q_gate {
+                    // Q+gate fused projection (Qwen3.5 attention layers):
+                    // must use q_gate_buf to capture both Q and gate values
+                    qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q_gate_buf[..actual_q_cols], 1, actual_q_cols, h);
+                    for hh in 0..n_heads {
+                        let src = hh * head_dim * 2;
+                        q[hh * head_dim..(hh + 1) * head_dim].copy_from_slice(&q_gate_buf[src..src + head_dim]);
+                    }
+                    qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..kv_dim], 1, kv_dim, h);
+                    qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..kv_dim], 1, kv_dim, h);
+                } else if let (Some(pq), Some(qw), Some(kw), Some(vw)) = (
                     normed_preq.as_ref(),
                     qweights.get_i2s(&q_w_name),
                     qweights.get_i2s(&k_w_name),
@@ -1185,19 +1215,6 @@ where
                 ) {
                     q4k.fused_q4k_preq_2(pq, qw, &mut q[..q_dim], q_dim, kw, &mut k[..kv_dim], kv_dim);
                     qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..kv_dim], 1, kv_dim, h);
-                } else if has_q_gate {
-                    qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q_gate_buf[..actual_q_cols], 1, actual_q_cols, h);
-                    for hh in 0..n_heads {
-                        let src = hh * head_dim * 2;
-                        q[hh * head_dim..(hh + 1) * head_dim].copy_from_slice(&q_gate_buf[src..src + head_dim]);
-                    }
-                    qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..kv_dim], 1, kv_dim, h);
-                    qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..kv_dim], 1, kv_dim, h);
-                    if layer == 3 && std::env::var("TEMPURA_TRACE_L3").is_ok() {
-                        let qn: f32 = q[..q_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
-                        let kn: f32 = k[..kv_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
-                        let vn: f32 = v[..kv_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
-                    }
                 } else {
                     qmm(normed_preq.as_ref(), &normed, &q_w_name, &mut q[..q_dim], 1, q_dim, h);
                     qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..kv_dim], 1, kv_dim, h);
@@ -1340,10 +1357,6 @@ where
                     .unwrap();
             }
 
-
-            if layer == 3 && std::env::var("TEMPURA_TRACE_L3").is_ok() {
-                let an: f32 = attn_out[..q_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
-            }
 
             // Qwen3.5 softmax layers: sigmoid gate on attention output
             // Gate is interleaved: q_gate_buf[h*2*hd + hd .. h*2*hd + 2*hd] per head
