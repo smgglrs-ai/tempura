@@ -348,7 +348,7 @@ pub unsafe fn three_tbl_impl(
 /// compile-time constants, enabling full unrolling.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn three_tbl_impl_bk96(
+pub unsafe fn three_tbl_impl_bk96(
     c: &mut [i32],
     lut: &[i8],
     a: &[u8],
@@ -1004,6 +1004,141 @@ pub fn tl2_gemv(
                 unsafe {
                     qgemm_two_and_rescale(&cfg, &[], &[], w_scale, lut_scale, &mut cbits, out_slice, 1);
                 }
+            }
+        }
+    });
+
+    true
+}
+
+/// TL2 GEMV with per-Q2_0-block weight scale corrections.
+/// Each bk=96 chunk's contribution is scaled by the correction factor for
+/// the Q2_0 block it falls into, then accumulated in f32.
+#[cfg(target_arch = "x86_64")]
+pub fn tl2_gemv_block_scaled(
+    lut: &Tl2Lut,
+    weight_data: &[u8],
+    w_scale: f32,
+    block_corrections: &[f32],
+    q2_block_size: usize,
+    output: &mut [f32],
+    m: usize,
+    k: usize,
+) -> bool {
+    let cfg = match Tl2Config::for_dims(m, k) {
+        Some(c) => c,
+        None => return false,
+    };
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+
+    let n_tile_num = m / cfg.bm;
+    let three_k = cfg.three_k;
+    let two_k = cfg.two_k;
+    let n_three_blocks = three_k / cfg.bk;
+    let blocks_per_row = k / q2_block_size;
+
+    let w_tile_size = three_k * m / 6 / n_tile_num;
+    let c_tile_size = cfg.bm;
+    let sign_tile_size = three_k * m / 24 / n_tile_num;
+    let sign_base = three_k * m / 3 / 2;
+
+    let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
+    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
+
+    let three_lut_bytes = three_k / 3 * 32;
+    let two_lut_bytes = if two_k > 0 { two_k / 2 * 32 } else { 0 };
+
+    let out_ptr = output.as_mut_ptr() as usize;
+    let wd_ptr = weight_data.as_ptr() as usize;
+    let wd_len = weight_data.len();
+    let tql_ptr = lut.three_qlut.as_ptr() as usize;
+    let twql_ptr = lut.two_qlut.as_ptr() as usize;
+    let lut_scale = lut.lut_scale;
+    let use_bk96 = cfg.bk == 96;
+
+    let bk_per_tile = cfg.bk;
+    let w_blk_size_three = three_k * cfg.bm / 6 / n_tile_num / n_three_blocks;
+    let s_blk_size_three = three_k * cfg.bm / 24 / n_tile_num / n_three_blocks;
+
+    crate::thread_pool::global_pool().run_indexed(&|ith, nth| {
+        let tile_start = ith * n_tile_num / nth;
+        let tile_end = (ith + 1) * n_tile_num / nth;
+        for i_tile in tile_start..tile_end {
+            let w_base = i_tile * w_tile_size;
+            let s_base = sign_base + i_tile * sign_tile_size;
+            let dst_offset = i_tile * c_tile_size;
+            let row_start = i_tile * cfg.bm;
+
+            let wd = unsafe { std::slice::from_raw_parts(wd_ptr as *const u8, wd_len) };
+            let tql = unsafe { std::slice::from_raw_parts(tql_ptr as *const i8, three_lut_bytes) };
+
+            let mut cbits_f32 = vec![0.0f32; cfg.bm];
+
+            for k_blk in 0..n_three_blocks {
+                let lut_off = k_blk * bk_per_tile / 3 * 32;
+                let a_off = w_base + k_blk * w_blk_size_three;
+                let sign_off = s_base + k_blk * s_blk_size_three;
+
+                let mut blk_cbits = vec![0i32; cfg.bm];
+                if use_bk96 {
+                    unsafe { three_tbl_impl_bk96(
+                        &mut blk_cbits, &tql[lut_off..], &wd[a_off..], &wd[sign_off..],
+                        cfg.bm, cfg.three_k, 1,
+                    )};
+                } else {
+                    unsafe { three_tbl_impl(
+                        &mut blk_cbits, &tql[lut_off..], &wd[a_off..], &wd[sign_off..],
+                        cfg.bm, cfg.bk, cfg.three_k, 1,
+                    )};
+                }
+
+                let k_start = k_blk * bk_per_tile;
+                let k_end = k_start + bk_per_tile;
+                let q2_start = k_start / q2_block_size;
+                let q2_end = (k_end - 1) / q2_block_size;
+
+                for r in 0..cfg.bm {
+                    let row = row_start + r;
+                    let corr = if q2_start == q2_end {
+                        let idx = row * blocks_per_row + q2_start;
+                        if idx < block_corrections.len() { block_corrections[idx] } else { 1.0 }
+                    } else {
+                        let frac0 = (q2_block_size - k_start % q2_block_size) as f32 / bk_per_tile as f32;
+                        let idx0 = row * blocks_per_row + q2_start;
+                        let idx1 = row * blocks_per_row + q2_end;
+                        let c0 = if idx0 < block_corrections.len() { block_corrections[idx0] } else { 1.0 };
+                        let c1 = if idx1 < block_corrections.len() { block_corrections[idx1] } else { 1.0 };
+                        c0 * frac0 + c1 * (1.0 - frac0)
+                    };
+                    cbits_f32[r] += blk_cbits[r] as f32 * corr;
+                }
+            }
+
+            let out_slice = unsafe {
+                std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(dst_offset), cfg.bm)
+            };
+
+            if two_k > 0 {
+                let two_w_offset = two_a_base + i_tile * two_w_tile_size;
+                let two_cfg = Tl2Config { three_k: 0, two_k, ..cfg };
+                let twql = unsafe { std::slice::from_raw_parts(twql_ptr as *const i8, two_lut_bytes.max(1)) };
+                let mut two_cbits = vec![0i32; cfg.bm];
+                unsafe { two_tbl_impl(
+                    &mut two_cbits, &twql[0..], &wd[two_w_offset..],
+                    cfg.bm, cfg.two_k, 1,
+                )};
+                let last_q2 = (three_k) / q2_block_size;
+                for r in 0..cfg.bm {
+                    let row = row_start + r;
+                    let corr_idx = row * blocks_per_row + last_q2.min(blocks_per_row - 1);
+                    let corr = if corr_idx < block_corrections.len() { block_corrections[corr_idx] } else { 1.0 };
+                    cbits_f32[r] += two_cbits[r] as f32 * corr;
+                }
+            }
+
+            let scale = w_scale / lut_scale;
+            for r in 0..cfg.bm {
+                out_slice[r] = cbits_f32[r] * scale;
             }
         }
     });

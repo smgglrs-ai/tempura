@@ -773,14 +773,16 @@ where
                 }
             }
             if let Some(tl2t) = qweights.get_tl2(name) {
-                use tempura_kernels::tl2::tl2_forward_batched;
-                if !tl2_forward_batched(a_f32, &tl2t.data, tl2t.scale, out, n, k, m) {
-                    out.fill(0.0);
-                }
-                if let Some(corr) = qweights.get_q2_row_corrections(name) {
-                    for row in 0..m {
-                        for j in 0..n.min(corr.len()) {
-                            out[row * n + j] *= corr[j];
+                {
+                    use tempura_kernels::tl2::tl2_forward_batched;
+                    if !tl2_forward_batched(a_f32, &tl2t.data, tl2t.scale, out, n, k, m) {
+                        out.fill(0.0);
+                    }
+                    if let Some(corr) = qweights.get_q2_row_corrections(name) {
+                        for row in 0..m {
+                            for j in 0..n.min(corr.len()) {
+                                out[row * n + j] *= corr[j];
+                            }
                         }
                     }
                 }

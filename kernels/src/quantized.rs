@@ -1125,15 +1125,21 @@ pub fn q2_to_i2s_approx(q2_data: &[u8], n_rows: usize, k: usize) -> (Vec<u8>, f3
     let avg_scale = (scale_sum / (n_rows * blocks_per_row) as f64) as f32;
 
     for row in 0..n_rows {
+        let row_avg = row_scales[row];
         for blk in 0..blocks_per_row {
             let q2_off = row * row_bytes_q2 + blk * Q2_0_BLOCK_BYTES;
+            let blk_scale = f16_to_f32(u16::from_le_bytes([q2_data[q2_off], q2_data[q2_off + 1]]));
             let q2_packed = &q2_data[q2_off + 2..q2_off + Q2_0_BLOCK_BYTES];
             let i2s_base = row * row_bytes_i2s + blk * 32;
+            let ratio = if row_avg != 0.0 { blk_scale / row_avg } else { 1.0 };
 
             for elem in 0..Q2_0_BLOCK_SIZE {
                 let q2_byte = elem / 4;
                 let q2_shift = (elem % 4) * 2;
-                let val = (q2_packed[q2_byte] >> q2_shift) & 0x03;
+                let raw = (q2_packed[q2_byte] >> q2_shift) & 0x03;
+                let trit = raw as i32 - 1;
+                let scaled = trit as f32 * ratio;
+                let val = if scaled > 0.5 { 2u8 } else if scaled < -0.5 { 0u8 } else { 1u8 };
                 let group_idx = elem / 32;
                 let pos = elem % 32;
                 let i2s_shift = 6 - 2 * group_idx;
@@ -1144,7 +1150,7 @@ pub fn q2_to_i2s_approx(q2_data: &[u8], n_rows: usize, k: usize) -> (Vec<u8>, f3
     let scale_off = n_rows * row_bytes_i2s;
     i2s[scale_off..scale_off + 4].copy_from_slice(&avg_scale.to_ne_bytes());
 
-    // Store correction factors: row_scale / avg_scale
+    // Per-row correction: row_scale / avg_scale
     let corrections: Vec<f32> = row_scales.iter().map(|&rs| if avg_scale != 0.0 { rs / avg_scale } else { 1.0 }).collect();
     (i2s, avg_scale, corrections)
 }
