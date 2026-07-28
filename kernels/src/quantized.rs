@@ -1133,17 +1133,38 @@ pub fn q2_to_i2s_approx(q2_data: &[u8], n_rows: usize, k: usize) -> (Vec<u8>, f3
             let i2s_base = row * row_bytes_i2s + blk * 32;
             let ratio = if row_avg != 0.0 { blk_scale / row_avg } else { 1.0 };
 
-            for elem in 0..Q2_0_BLOCK_SIZE {
-                let q2_byte = elem / 4;
-                let q2_shift = (elem % 4) * 2;
-                let raw = (q2_packed[q2_byte] >> q2_shift) & 0x03;
-                let trit = raw as i32 - 1;
-                let scaled = trit as f32 * ratio;
-                let val = if scaled > 0.5 { 2u8 } else if scaled < -0.5 { 0u8 } else { 1u8 };
-                let group_idx = elem / 32;
-                let pos = elem % 32;
-                let i2s_shift = 6 - 2 * group_idx;
-                i2s[i2s_base + pos] |= val << i2s_shift;
+            if (ratio - 1.0).abs() < 0.499 {
+                // Fast path: ratio close to 1.0, trits don't change.
+                // Transcode Q2_0 byte ordering → I2S byte ordering in bulk.
+                // Q2_0: byte j has elements 4j+0 (bits 0-1), 4j+1 (bits 2-3), 4j+2 (bits 4-5), 4j+3 (bits 6-7)
+                // I2S:  byte j has element j (bits 6-7), j+32 (bits 4-5), j+64 (bits 2-3), j+96 (bits 0-1)
+                for j in 0..32 {
+                    let b = q2_packed[j];
+                    let e0 = b & 0x03;        // element 4j   → I2S byte (4j % 32), shift 6 - 2*(4j/32)
+                    let e1 = (b >> 2) & 0x03;  // element 4j+1
+                    let e2 = (b >> 4) & 0x03;  // element 4j+2
+                    let e3 = (b >> 6) & 0x03;  // element 4j+3
+                    let elems = [4*j, 4*j+1, 4*j+2, 4*j+3];
+                    let vals = [e0, e1, e2, e3];
+                    for (ei, &elem) in elems.iter().enumerate() {
+                        let gi = elem / 32;
+                        let pos = elem % 32;
+                        i2s[i2s_base + pos] |= vals[ei] << (6 - 2 * gi);
+                    }
+                }
+            } else {
+                for elem in 0..Q2_0_BLOCK_SIZE {
+                    let q2_byte = elem / 4;
+                    let q2_shift = (elem % 4) * 2;
+                    let raw = (q2_packed[q2_byte] >> q2_shift) & 0x03;
+                    let trit = raw as i32 - 1;
+                    let scaled = trit as f32 * ratio;
+                    let val = if scaled > 0.5 { 2u8 } else if scaled < -0.5 { 0u8 } else { 1u8 };
+                    let group_idx = elem / 32;
+                    let pos = elem % 32;
+                    let i2s_shift = 6 - 2 * group_idx;
+                    i2s[i2s_base + pos] |= val << i2s_shift;
+                }
             }
         }
     }
@@ -1782,6 +1803,36 @@ pub fn q2_0_gemv_i2s(
             }
         });
         return;
+    }
+}
+
+pub fn q2_0_gemv_preq_range(
+    packed: &[u8],
+    q8: &[i8], scales: &[f32], asum: &[i32],
+    output: &mut [f32],
+    row_start: usize, row_end: usize,
+    k: usize,
+) {
+    let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    const TILE: usize = 8;
+    let n = row_end - row_start;
+    let n_tiles = n / TILE;
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        for t in 0..n_tiles {
+            let base = row_start + t * TILE;
+            let rows: [&[u8]; 8] = std::array::from_fn(|r| &packed[(base + r) * row_bytes..(base + r + 1) * row_bytes]);
+            unsafe { q2_0_dot_nrows_preq_avx2(&rows, q8, scales, asum, k, &mut output[t * TILE..t * TILE + TILE]) };
+        }
+        for j in n_tiles * TILE..n {
+            let row = row_start + j;
+            output[j] = unsafe { q2_0_dot_1row_preq_avx2(&packed[row * row_bytes..(row + 1) * row_bytes], q8, scales, k) };
+        }
+        return;
+    }
+    for j in 0..n {
+        let row = row_start + j;
+        output[j] = q2_0_dot_q8(&packed[row * row_bytes..(row + 1) * row_bytes], &[], k);
     }
 }
 

@@ -7,6 +7,29 @@ use serde::Serialize;
 use std::time::Instant;
 use tempura_kernels::{Attention, DeltaNet, MatMul, RMSNorm, RoPE, Sampler, SamplingParams};
 
+fn q2_preq_into(a: &[f32], q8: &mut [i8], scales: &mut [f32], asum: &mut [i32], k: usize) {
+    let n32 = k / 32;
+    for blk in 0..n32 {
+        let base = blk * 32;
+        let mut amax = 0.0f32;
+        for i in 0..32 { amax = amax.max(a[base + i].abs()); }
+        let d = amax / 127.0;
+        scales[blk] = d;
+        let mut s = 0i32;
+        if d > 0.0 {
+            let id = 127.0 / amax;
+            for i in 0..32 {
+                let v = (a[base + i] * id).round() as i8;
+                q8[base + i] = v;
+                s += v as i32;
+            }
+        } else {
+            for i in 0..32 { q8[base + i] = 0; }
+        }
+        asum[blk] = s;
+    }
+}
+
 fn apply_head_rmsnorm(
     x: &mut [f32],
     weight: &[f32],
@@ -1660,6 +1683,460 @@ where
             let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let min = logits.iter().cloned().fold(f32::INFINITY, f32::min);
             eprintln!("STATS: mean={:.6} min={:.6} max={:.6}", sum / logits.len() as f32, min, max);
+        }
+
+        logits
+    }
+
+    fn forward_q2_decode(
+        &self,
+        session: &mut InferenceSession,
+        token_id: u32,
+        qweights: &crate::weights::QuantizedWeights,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+        let n_heads = cfg.num_attention_heads;
+        let n_kv_heads = cfg.num_kv_heads;
+        let head_dim = cfg.head_dim;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let inter = cfg.intermediate_size;
+        let dn_heads = cfg.deltanet_num_heads.unwrap_or(n_kv_heads);
+        let dn_head_dim = cfg.deltanet_head_dim.unwrap_or(head_dim);
+        let dn_dim = dn_heads * dn_head_dim;
+
+        let mut hidden = vec![0.0f32; h];
+        qweights.embed_token(token_id, h, &mut hidden);
+
+        let mut normed = vec![0.0f32; h];
+        let mut q = vec![0.0f32; q_dim.max(dn_dim)];
+        let mut k_buf = vec![0.0f32; kv_dim.max(dn_dim)];
+        let mut v_buf = vec![0.0f32; kv_dim.max(dn_dim)];
+        let mut attn_out = vec![0.0f32; q_dim];
+        let mut o_proj = vec![0.0f32; h];
+        let mut normed2 = vec![0.0f32; h];
+        let mut gate_buf = vec![0.0f32; inter];
+        let mut up_buf = vec![0.0f32; inter];
+        let mut down_out = vec![0.0f32; h];
+        let mut q_gate = vec![0.0f32; q_dim * 2];
+        let mut z_gate = vec![0.0f32; dn_dim];
+        let mut alpha_buf = vec![0.0f32; dn_heads];
+        let mut beta_buf = vec![0.0f32; dn_heads];
+        let mut logits = vec![0.0f32; cfg.vocab_size];
+        let mut preq_q8 = vec![0i8; h.max(q_dim).max(inter)];
+        let mut preq_scales = vec![0.0f32; (h.max(q_dim).max(inter) + 31) / 32];
+        let mut preq_asum = vec![0i32; (h.max(q_dim).max(inter) + 31) / 32];
+
+        let positions = vec![session.position as u32];
+        let cache_layer_map = cfg.cache_layer_map();
+        let mut deltanet_layer_idx = 0usize;
+
+        let pool = tempura_kernels::thread_pool::global_pool();
+        let n_threads = pool.thread_count();
+        let barrier = tempura_kernels::thread_pool::SpinBarrier::new(n_threads);
+
+        macro_rules! ptr { ($v:expr) => { $v.as_mut_ptr() as usize } }
+        let hp = ptr!(hidden); let np = ptr!(normed); let qp = ptr!(q);
+        let kp = ptr!(k_buf); let vp = ptr!(v_buf); let ap = ptr!(attn_out);
+        let op = ptr!(o_proj); let n2p = ptr!(normed2);
+        let gp = ptr!(gate_buf); let up = ptr!(up_buf); let dp = ptr!(down_out);
+        let qgp = ptr!(q_gate); let zgp = ptr!(z_gate);
+        let abp = ptr!(alpha_buf); let bbp = ptr!(beta_buf);
+        let lp = ptr!(logits);
+        let pq8p = ptr!(preq_q8); let psp = ptr!(preq_scales); let pap = ptr!(preq_asum);
+
+        macro_rules! fs  { ($a:expr,$n:expr) => { unsafe { std::slice::from_raw_parts($a as *const f32, $n) } } }
+        macro_rules! fsm { ($a:expr,$n:expr) => { unsafe { std::slice::from_raw_parts_mut($a as *mut f32, $n) } } }
+        macro_rules! is  { ($a:expr,$n:expr) => { unsafe { std::slice::from_raw_parts($a as *const i8, $n) } } }
+        macro_rules! ism { ($a:expr,$n:expr) => { unsafe { std::slice::from_raw_parts_mut($a as *mut i8, $n) } } }
+        macro_rules! i32s { ($a:expr,$n:expr) => { unsafe { std::slice::from_raw_parts($a as *const i32, $n) } } }
+
+        let fwd_start = std::time::Instant::now();
+        let sess_ptr = session as *mut InferenceSession as usize;
+
+        pool.run_indexed(&|ith, nth| {
+            let mut dn_idx = 0usize;
+
+            for layer in 0..cfg.num_layers {
+                let layer_kind = cfg.layer_kinds.as_ref()
+                    .map(|k| k[layer]).unwrap_or(crate::config::LayerKind::Attention);
+                let prefix = format!("model.layers.{layer}");
+                let input_ln = format!("{prefix}.input_layernorm.weight");
+                let post_ln = format!("{prefix}.post_attention_layernorm.weight");
+
+                // ── B0: Thread 0 — RMSNorm + pre-quantize ──
+                if ith == 0 {
+                    let hidden_s = fsm!(hp, h);
+                    let normed_s = fsm!(np, h);
+                    normed_s.copy_from_slice(hidden_s);
+                    let ln_w = qweights.get_f32(&input_ln).unwrap();
+                    self.pipeline.rmsnorm(normed_s, ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+                    q2_preq_into(fs!(np, h), ism!(pq8p, h), fsm!(psp, h/32), unsafe { std::slice::from_raw_parts_mut(pap as *mut i32, h/32) }, h);
+                }
+                barrier.wait();
+
+                if layer_kind == crate::config::LayerKind::DeltaNet {
+                    // ── B1: all threads — QKV + gate GEMV ──
+                    {
+                        let qkv_name = format!("{prefix}.ssm.qkv_proj.weight");
+                        let gate_name = format!("{prefix}.ssm.gate_proj.weight");
+                        let q8 = is!(pq8p, h);
+                        let sc = fs!(psp, h/32);
+                        let asum = i32s!(pap, h/32);
+                        let qkv_cols = qweights.get_q2(&qkv_name).map(|w| w.len() / ((h / 128) * 34)).unwrap_or(dn_dim);
+                        // Use q_gate buffer for QKV (large enough: q_dim*2 >= qkv_cols for most models)
+                        if let Some(w) = qweights.get_q2(&qkv_name) {
+                            let (s, e) = ((ith * qkv_cols) / nth, ((ith + 1) * qkv_cols) / nth);
+                            tempura_kernels::quantized::q2_0_gemv_preq_range(w, q8, sc, asum, &mut fsm!(qgp, qkv_cols)[s..e], s, e, h);
+                        }
+                        if let Some(w) = qweights.get_q2(&gate_name) {
+                            let (s, e) = ((ith * dn_dim) / nth, ((ith + 1) * dn_dim) / nth);
+                            tempura_kernels::quantized::q2_0_gemv_preq_range(w, q8, sc, asum, &mut fsm!(zgp, dn_dim)[s..e], s, e, h);
+                        }
+                        // Alpha/Beta (tiny, only on thread 0)
+                        if ith == 0 {
+                            let alpha_name = format!("{prefix}.ssm.alpha.weight");
+                            let beta_name = format!("{prefix}.ssm.beta.weight");
+                            if let Some(w) = qweights.get_q2(&alpha_name) {
+                                tempura_kernels::quantized::q2_0_gemv_preq_range(w, q8, sc, asum, fsm!(abp, dn_heads), 0, dn_heads, h);
+                            }
+                            if let Some(w) = qweights.get_q2(&beta_name) {
+                                tempura_kernels::quantized::q2_0_gemv_preq_range(w, q8, sc, asum, fsm!(bbp, dn_heads), 0, dn_heads, h);
+                            }
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── B2: thread 0 — conv1d + GDN + norm + z_gate + preq for O proj ──
+                    if ith == 0 {
+                        let qkv_name = format!("{prefix}.ssm.qkv_proj.weight");
+                        let qkv_cols = qweights.get_q2(&qkv_name).map(|w| w.len() / ((h / 128) * 34)).unwrap_or(dn_dim);
+                        let key_dim = if qkv_cols > dn_dim { (qkv_cols - dn_dim) / 2 } else { dn_dim };
+                        let n_k_heads = key_dim / dn_head_dim;
+                        let conv_dim = 2 * key_dim + dn_dim;
+
+                        let q_s = fsm!(qp, dn_dim);
+                        let k_s = fsm!(kp, dn_dim);
+                        let v_s = fsm!(vp, dn_dim);
+                        let z_s = fsm!(zgp, dn_dim);
+                        let al_s = fsm!(abp, dn_heads);
+                        let be_s = fsm!(bbp, dn_heads);
+                        let qkv_buf = fs!(qgp, qkv_cols);
+
+                        // Split QKV from qkv_buf
+                        q_s[..key_dim].copy_from_slice(&qkv_buf[..key_dim]);
+                        k_s[..key_dim].copy_from_slice(&qkv_buf[key_dim..2*key_dim]);
+                        v_s[..dn_dim].copy_from_slice(&qkv_buf[2*key_dim..2*key_dim+dn_dim]);
+
+                        // Gate/beta pre-compute
+                        let ssm_a_w = qweights.get_f32(&format!("{prefix}.ssm.A_log"));
+                        let dt_bias = qweights.get_f32(&format!("{prefix}.ssm.dt_proj.bias"));
+                        for hd in 0..dn_heads {
+                            be_s[hd] = 1.0 / (1.0 + (-be_s[hd]).exp());
+                            let dt_b = dt_bias.and_then(|b| b.get(hd)).copied().unwrap_or(0.0);
+                            let ssm_a = ssm_a_w.and_then(|a| a.get(hd)).copied().unwrap_or(-1.0);
+                            al_s[hd] = (1.0f32 + (al_s[hd] + dt_b).exp()).ln() * ssm_a;
+                        }
+
+                        // Conv1d (single-token: only last kernel position)
+                        if let Some(conv_w) = qweights.get_f32(&format!("{prefix}.ssm.conv1d.weight")) {
+                            let kernel_size = conv_w.len() / conv_dim;
+                            let conv_bias = qweights.get_f32(&format!("{prefix}.ssm.conv1d.bias"));
+                            let mut conv_in = vec![0.0f32; conv_dim];
+                            conv_in[..key_dim].copy_from_slice(&q_s[..key_dim]);
+                            conv_in[key_dim..2*key_dim].copy_from_slice(&k_s[..key_dim]);
+                            conv_in[2*key_dim..conv_dim].copy_from_slice(&v_s[..dn_dim]);
+                            for ch in 0..conv_dim {
+                                let mut s = conv_in[ch] * conv_w[ch * kernel_size + kernel_size - 1];
+                                if let Some(bias) = conv_bias { if ch < bias.len() { s += bias[ch]; } }
+                                conv_in[ch] = s / (1.0 + (-s).exp());
+                            }
+                            for vh in 0..dn_heads {
+                                let kh = vh * n_k_heads / dn_heads;
+                                q_s[vh*dn_head_dim..(vh+1)*dn_head_dim].copy_from_slice(&conv_in[kh*dn_head_dim..kh*dn_head_dim+dn_head_dim]);
+                                k_s[vh*dn_head_dim..(vh+1)*dn_head_dim].copy_from_slice(&conv_in[key_dim+kh*dn_head_dim..key_dim+kh*dn_head_dim+dn_head_dim]);
+                            }
+                            v_s[..dn_dim].copy_from_slice(&conv_in[2*key_dim..2*key_dim+dn_dim]);
+                        }
+
+                        // L2 norm Q/K
+                        for hd in 0..dn_heads {
+                            let off = hd * dn_head_dim;
+                            let qn: f32 = q_s[off..off+dn_head_dim].iter().map(|x| x*x).sum::<f32>().sqrt().max(cfg.layer_norm_eps);
+                            q_s[off..off+dn_head_dim].iter_mut().for_each(|x| *x /= qn);
+                            let kn: f32 = k_s[off..off+dn_head_dim].iter().map(|x| x*x).sum::<f32>().sqrt().max(cfg.layer_norm_eps);
+                            k_s[off..off+dn_head_dim].iter_mut().for_each(|x| *x /= kn);
+                        }
+
+                        // GDN
+                        let dn_state = unsafe { &mut *(sess_ptr as *mut InferenceSession) }.deltanet_state.as_mut().unwrap();
+                        let state = dn_state.state_mut(dn_idx);
+                        let mut dn_out = vec![0.0f32; dn_dim];
+                        tempura_kernels::deltanet::CpuDeltaNet.forward_recurrent(
+                            q_s, k_s, v_s, al_s, be_s, state, &mut dn_out,
+                            dn_heads, dn_head_dim, 1.0,
+                        ).unwrap();
+
+                        // Per-head norm + z_gate
+                        if let Some(norm_w) = qweights.get_f32(&format!("{prefix}.ssm.norm.weight")) {
+                            for head in 0..dn_heads {
+                                let off = head * dn_head_dim;
+                                self.pipeline.rmsnorm(&mut dn_out[off..off+dn_head_dim], norm_w, dn_head_dim, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+                            }
+                        }
+                        for i in 0..dn_dim {
+                            let zs = z_s[i] / (1.0 + (-z_s[i]).exp());
+                            dn_out[i] *= zs;
+                        }
+
+                        // Preq for O proj
+                        q2_preq_into(&dn_out, ism!(pq8p, dn_dim), fsm!(psp, dn_dim/32), unsafe { std::slice::from_raw_parts_mut(pap as *mut i32, dn_dim/32) }, dn_dim);
+                        dn_idx += 1;
+                    }
+                    barrier.wait();
+
+                    // ── B3: all threads — O proj GEMV ──
+                    {
+                        let out_proj_name = format!("{prefix}.ssm.out_proj.weight");
+                        if let Some(w) = qweights.get_q2(&out_proj_name) {
+                            let (s, e) = ((ith * h) / nth, ((ith + 1) * h) / nth);
+                            tempura_kernels::quantized::q2_0_gemv_preq_range(w, is!(pq8p, dn_dim), fs!(psp, dn_dim/32), i32s!(pap, dn_dim/32), &mut fsm!(op, h)[s..e], s, e, dn_dim);
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── B4: thread 0 — residual ──
+                    if ith == 0 {
+                        let hidden_s = fsm!(hp, h);
+                        let o_s = fs!(op, h);
+                        for i in 0..h { hidden_s[i] += o_s[i]; }
+                    }
+                    barrier.wait();
+
+                } else {
+                    // ── Attention: QKV parallel, rest serial on thread 0 ──
+                    // B1: all threads GEMV: Q+gate, K, V
+                    {
+                        let q8 = is!(pq8p, h);
+                        let sc = fs!(psp, h/32);
+                        let asum = i32s!(pap, h/32);
+                        let q_w_name = format!("{prefix}.self_attn.q_proj.weight");
+                        let k_w_name = format!("{prefix}.self_attn.k_proj.weight");
+                        let v_w_name = format!("{prefix}.self_attn.v_proj.weight");
+
+                        let q_cols = qweights.get_q2(&q_w_name).map(|w| w.len() / ((h / 128) * 34)).unwrap_or(q_dim);
+                        let has_q_gate = q_cols > q_dim;
+                        let actual_q_cols = if has_q_gate { q_cols } else { q_dim };
+
+                        if has_q_gate {
+                            if let Some(w) = qweights.get_q2(&q_w_name) {
+                                let (s, e) = ((ith * actual_q_cols) / nth, ((ith + 1) * actual_q_cols) / nth);
+                                let out = fsm!(qgp, actual_q_cols);
+                                tempura_kernels::quantized::q2_0_gemv_preq_range(w, q8, sc, asum, &mut out[s..e], s, e, h);
+                            }
+                        } else {
+                            if let Some(w) = qweights.get_q2(&q_w_name) {
+                                let (s, e) = ((ith * q_dim) / nth, ((ith + 1) * q_dim) / nth);
+                                let out = fsm!(qp, q_dim);
+                                tempura_kernels::quantized::q2_0_gemv_preq_range(w, q8, sc, asum, &mut out[s..e], s, e, h);
+                            }
+                        }
+                        if let Some(w) = qweights.get_q2(&k_w_name) {
+                            let (s, e) = ((ith * kv_dim) / nth, ((ith + 1) * kv_dim) / nth);
+                            let out = fsm!(kp, kv_dim);
+                            tempura_kernels::quantized::q2_0_gemv_preq_range(w, q8, sc, asum, &mut out[s..e], s, e, h);
+                        }
+                        if let Some(w) = qweights.get_q2(&v_w_name) {
+                            let (s, e) = ((ith * kv_dim) / nth, ((ith + 1) * kv_dim) / nth);
+                            let out = fsm!(vp, kv_dim);
+                            tempura_kernels::quantized::q2_0_gemv_preq_range(w, q8, sc, asum, &mut out[s..e], s, e, h);
+                        }
+                    }
+                    barrier.wait();
+
+                    // B2: Thread 0 — Q extraction, QK norm, RoPE, KV cache, attention, gate
+                    if ith == 0 {
+                        let q_w_name = format!("{prefix}.self_attn.q_proj.weight");
+                        let q_cols = qweights.get_q2(&q_w_name).map(|w| w.len() / ((h / 128) * 34)).unwrap_or(q_dim);
+                        let has_q_gate = q_cols > q_dim;
+
+                        if has_q_gate {
+                            let qg = fs!(qgp, q_cols);
+                            let q_s = fsm!(qp, q_dim);
+                            for hh in 0..n_heads {
+                                let src = hh * head_dim * 2;
+                                q_s[hh*head_dim..(hh+1)*head_dim].copy_from_slice(&qg[src..src+head_dim]);
+                            }
+                        }
+
+                        // QK norm
+                        if cfg.use_qk_norm {
+                            let qn = format!("{prefix}.self_attn.q_norm.weight");
+                            let kn = format!("{prefix}.self_attn.k_norm.weight");
+                            if let Some(qnw) = qweights.get_f32(&qn) {
+                                crate::model::apply_head_rmsnorm(fsm!(qp, q_dim), qnw, 1, n_heads, head_dim, cfg.layer_norm_eps);
+                            }
+                            if let Some(knw) = qweights.get_f32(&kn) {
+                                crate::model::apply_head_rmsnorm(fsm!(kp, kv_dim), knw, 1, n_kv_heads, head_dim, cfg.layer_norm_eps);
+                            }
+                        }
+
+                        // RoPE
+                        let rope_hd = cfg.rope_dim.unwrap_or(head_dim);
+                        if rope_hd < head_dim {
+                            let mut q_rope = vec![0.0f32; n_heads * rope_hd];
+                            let mut k_rope = vec![0.0f32; n_kv_heads * rope_hd];
+                            let q_s = fsm!(qp, q_dim);
+                            let k_s = fsm!(kp, kv_dim);
+                            for hh in 0..n_heads { q_rope[hh*rope_hd..(hh+1)*rope_hd].copy_from_slice(&q_s[hh*head_dim..hh*head_dim+rope_hd]); }
+                            for hh in 0..n_kv_heads { k_rope[hh*rope_hd..(hh+1)*rope_hd].copy_from_slice(&k_s[hh*head_dim..hh*head_dim+rope_hd]); }
+                            self.pipeline.rope(&mut q_rope, 1, 1, n_heads, rope_hd, &positions, cfg.rope_theta).unwrap();
+                            self.pipeline.rope(&mut k_rope, 1, 1, n_kv_heads, rope_hd, &positions, cfg.rope_theta).unwrap();
+                            for hh in 0..n_heads { q_s[hh*head_dim..hh*head_dim+rope_hd].copy_from_slice(&q_rope[hh*rope_hd..(hh+1)*rope_hd]); }
+                            for hh in 0..n_kv_heads { k_s[hh*head_dim..hh*head_dim+rope_hd].copy_from_slice(&k_rope[hh*rope_hd..(hh+1)*rope_hd]); }
+                        } else {
+                            self.pipeline.rope(fsm!(qp, q_dim), 1, 1, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                            self.pipeline.rope(fsm!(kp, kv_dim), 1, 1, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                        }
+
+                        // KV cache
+                        let sess = unsafe { &mut *(sess_ptr as *mut InferenceSession) };
+                        let cl = cache_layer_map[layer].unwrap();
+                        sess.cache.append_kv(cl, fs!(kp, kv_dim), fs!(vp, kv_dim), 1);
+                        let kv_len = sess.cache.seq_len + 1;
+                        let k_cache = sess.cache.k_data(cl, kv_len);
+                        let v_cache = sess.cache.v_data(cl, kv_len);
+
+                        // Attention
+                        let attn_s = fsm!(ap, q_dim);
+                        attn_s.fill(0.0);
+                        tempura_kernels::attention::CpuAttentionGgml.forward(
+                            fs!(qp, q_dim), &k_cache, &v_cache, attn_s,
+                            1, 1, kv_len, n_heads, n_kv_heads, head_dim,
+                            1.0 / (head_dim as f32).sqrt(),
+                        ).unwrap();
+
+                        // Sigmoid gate
+                        if has_q_gate {
+                            let qg = fs!(qgp, q_cols);
+                            for hh in 0..n_heads {
+                                for d in 0..head_dim {
+                                    let gv = qg[hh * head_dim * 2 + head_dim + d];
+                                    attn_s[hh * head_dim + d] *= 1.0 / (1.0 + (-gv).exp());
+                                }
+                            }
+                        }
+
+                        // O proj preq
+                        q2_preq_into(fs!(ap, q_dim), ism!(pq8p, q_dim), fsm!(psp, q_dim/32), unsafe { std::slice::from_raw_parts_mut(pap as *mut i32, q_dim/32) }, q_dim);
+                    }
+                    barrier.wait();
+
+                    // B3: all threads GEMV: O proj
+                    {
+                        let o_w_name = format!("{prefix}.self_attn.o_proj.weight");
+                        if let Some(w) = qweights.get_q2(&o_w_name) {
+                            let (s, e) = ((ith * h) / nth, ((ith + 1) * h) / nth);
+                            let out = fsm!(op, h);
+                            tempura_kernels::quantized::q2_0_gemv_preq_range(w, is!(pq8p, q_dim), fs!(psp, q_dim/32), i32s!(pap, q_dim/32), &mut out[s..e], s, e, q_dim);
+                        }
+                    }
+                    barrier.wait();
+
+                    // B4: Thread 0 — residual
+                    if ith == 0 {
+                        let hidden_s = fsm!(hp, h);
+                        let o_s = fs!(op, h);
+                        for i in 0..h { hidden_s[i] += o_s[i]; }
+                    }
+                    barrier.wait();
+                }
+
+                // ── FFN (shared by DeltaNet and Attention) ──
+                // B5: Thread 0 — post-attention RMSNorm + preq
+                if ith == 0 {
+                    let hidden_s = fs!(hp, h);
+                    let n2 = fsm!(n2p, h);
+                    n2.copy_from_slice(hidden_s);
+                    let pln_w = qweights.get_f32(&post_ln).unwrap();
+                    self.pipeline.rmsnorm(n2, pln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+                    q2_preq_into(fs!(n2p, h), ism!(pq8p, h), fsm!(psp, h/32), unsafe { std::slice::from_raw_parts_mut(pap as *mut i32, h/32) }, h);
+                }
+                barrier.wait();
+
+                // B6: all threads GEMV: gate + up
+                {
+                    let gate_name = format!("{prefix}.mlp.gate_proj.weight");
+                    let up_name = format!("{prefix}.mlp.up_proj.weight");
+                    let q8 = is!(pq8p, h);
+                    let sc = fs!(psp, h/32);
+                    let asum = i32s!(pap, h/32);
+                    if let Some(w) = qweights.get_q2(&gate_name) {
+                        let (s, e) = ((ith * inter) / nth, ((ith + 1) * inter) / nth);
+                        tempura_kernels::quantized::q2_0_gemv_preq_range(w, q8, sc, asum, &mut fsm!(gp, inter)[s..e], s, e, h);
+                    }
+                    if let Some(w) = qweights.get_q2(&up_name) {
+                        let (s, e) = ((ith * inter) / nth, ((ith + 1) * inter) / nth);
+                        tempura_kernels::quantized::q2_0_gemv_preq_range(w, q8, sc, asum, &mut fsm!(up, inter)[s..e], s, e, h);
+                    }
+                }
+                barrier.wait();
+
+                // B7: Thread 0 — SiLU*gate + preq
+                if ith == 0 {
+                    let g = fsm!(gp, inter);
+                    let u = fs!(up, inter);
+                    for i in 0..inter {
+                        g[i] = (g[i] / (1.0 + (-g[i]).exp())) * u[i];
+                    }
+                    q2_preq_into(fs!(gp, inter), ism!(pq8p, inter), fsm!(psp, inter/32), unsafe { std::slice::from_raw_parts_mut(pap as *mut i32, inter/32) }, inter);
+                }
+                barrier.wait();
+
+                // B8: all threads GEMV: down proj
+                {
+                    let down_name = format!("{prefix}.mlp.down_proj.weight");
+                    if let Some(w) = qweights.get_q2(&down_name) {
+                        let q8 = is!(pq8p, inter);
+                        let sc = fs!(psp, inter/32);
+                        let asum = i32s!(pap, inter/32);
+                        let (s, e) = ((ith * h) / nth, ((ith + 1) * h) / nth);
+                        tempura_kernels::quantized::q2_0_gemv_preq_range(w, q8, sc, asum, &mut fsm!(dp, h)[s..e], s, e, inter);
+                    }
+                }
+                barrier.wait();
+
+                // B9: Thread 0 — residual
+                if ith == 0 {
+                    let hidden_s = fsm!(hp, h);
+                    let d_s = fs!(dp, h);
+                    for i in 0..h { hidden_s[i] += d_s[i]; }
+                }
+                barrier.wait();
+            }
+
+            // ── Final: lm_head ──
+            if ith == 0 {
+                let hidden_s = fsm!(hp, h);
+                let final_norm_w = qweights.get_f32("model.norm.weight").unwrap();
+                self.pipeline.rmsnorm(hidden_s, final_norm_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
+                q2_preq_into(fs!(hp, h), ism!(pq8p, h), fsm!(psp, h/32), unsafe { std::slice::from_raw_parts_mut(pap as *mut i32, h/32) }, h);
+            }
+            barrier.wait();
+
+            if let Some(w) = qweights.get_q2("lm_head.weight") {
+                let (s, e) = ((ith * cfg.vocab_size) / nth, ((ith + 1) * cfg.vocab_size) / nth);
+                tempura_kernels::quantized::q2_0_gemv_preq_range(w, is!(pq8p, h), fs!(psp, h/32), i32s!(pap, h/32), &mut fsm!(lp, cfg.vocab_size)[s..e], s, e, h);
+            }
+            barrier.wait();
+        });
+
+        session.cache.advance(1);
+        session.position += 1;
+
+        if std::env::var("TEMPURA_PROFILE").is_ok() {
+            eprintln!("[PROFILE] forward_q2_decode: {:.2}ms", fwd_start.elapsed().as_secs_f64() * 1000.0);
         }
 
         logits
