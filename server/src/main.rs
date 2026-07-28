@@ -311,14 +311,7 @@ async fn run_server(args: ServeArgs) {
             }
         };
 
-        let q2_shapes = gguf.q2_tensor_shapes();
-        let mut qweights = gguf.to_quantized_weights();
-        if !q2_shapes.is_empty() && std::env::var("TEMPURA_NO_TL2").is_err() {
-            eprintln!("[Q2_0] Repacking {} tensors to TL2 (LUT)...", q2_shapes.len());
-            let t0 = std::time::Instant::now();
-            qweights.build_q2_tl2(&q2_shapes);
-            eprintln!("[Q2_0] TL2 repack done in {:.1}s", t0.elapsed().as_secs_f64());
-        }
+        let qweights = gguf.to_quantized_weights();
         config.max_seq_len = config.max_seq_len.min(args.max_seq_len);
         tracing::info!("Using max_seq_len={}", config.max_seq_len);
 
