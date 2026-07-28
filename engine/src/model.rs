@@ -193,6 +193,7 @@ where
         if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
             return true;
         }
+        if std::env::var("TEMPURA_NO_PERSISTENT").is_ok() { return false; }
         qw.has_q2_tiled()
     }
 
@@ -655,6 +656,12 @@ where
 
             for i in 0..hidden.len() {
                 hidden[i] += down_out[i];
+            }
+
+            if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && seq_len == 1 && (layer <= 4 || layer == cfg.num_layers - 1) {
+                let hn: f32 = hidden[..h].iter().map(|x|x*x).sum::<f32>().sqrt();
+                let kind = if layer_kind == crate::config::LayerKind::DeltaNet { "DN" } else { "ATN" };
+                eprintln!("[FQ-TRACE] L{layer}({kind}) hidden_norm={hn:.4}");
             }
 
             if std::env::var("TEMPURA_DEBUG").is_ok() && layer == 0 && seq_len > 1 {
@@ -1631,6 +1638,11 @@ where
             );
             tempura_kernels::fused::residual_add(&mut hidden[..seq_len * h], &down_out[..seq_len * h], seq_len * h);
 
+            if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && seq_len == 1 && (layer <= 4 || layer == cfg.num_layers - 1) {
+                let hn: f32 = hidden[..h].iter().map(|x|x*x).sum::<f32>().sqrt();
+                let kind = if layer_kind == crate::config::LayerKind::DeltaNet { "DN" } else { "ATN" };
+                eprintln!("[FQ-TRACE] L{layer}({kind}) hidden_norm={hn:.4}");
+            }
 
             if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer < 3 {
                 let last = &hidden[(seq_len - 1) * h..seq_len * h];
@@ -2943,6 +2955,13 @@ where
         let attn_scores_ptrs: Vec<usize> = attn_scores_bufs.iter_mut().map(|b| b.as_mut_ptr() as usize).collect();
 
         if has_deltanet {
+            if let Some(ref ds) = session.deltanet_state {
+                let s0 = ds.state(0);
+                let s_norm: f32 = s0.iter().map(|x|x*x).sum::<f32>().sqrt();
+                eprintln!("[DN] deltanet_state[0] norm={s_norm:.4} (should be >0 if prefill ran)");
+            } else {
+                eprintln!("[DN] deltanet_state is None!");
+            }
             eprintln!("[DN] h={h} dn_dim={dn_dim} dn_heads={dn_heads} dn_head_dim={dn_head_dim}");
             eprintln!("[DN] qkv_cols_max={qkv_cols_max} conv_dim_max={conv_dim_max}");
             eprintln!("[DN] q.len={} k.len={} v.len={} attn_out.len={}", q.len(), k_buf.len(), v_buf.len(), attn_out.len());
@@ -3012,7 +3031,9 @@ where
                     if is_deltanet {
                     // ── DeltaNet attention block ──
                     if ith == 0 && layer == 0 && _token_step == 0 {
-                        eprintln!("[DN-L0] entering DeltaNet path");
+                        let has_tiled_qkv = qweights.get_q2_tiled(&dn_names[0].as_ref().unwrap().qkv_proj).is_some();
+                        let has_raw_q2 = qweights.get_q2(&dn_names[0].as_ref().unwrap().qkv_proj).is_some();
+                        eprintln!("[DN-L0] tiled_qkv={has_tiled_qkv} raw_q2={has_raw_q2} q2lut_ok={}", shared_q2lut_ok.load(std::sync::atomic::Ordering::Relaxed));
                     }
                     let dn = dn_names[layer].as_ref().unwrap();
                     let dg = dn_geom[layer].as_ref().unwrap();
@@ -3100,6 +3121,19 @@ where
                         k_s[..dg.key_dim].copy_from_slice(&qkv_buf[dg.key_dim..2*dg.key_dim]);
                         v_s[..dn_dim].copy_from_slice(&qkv_buf[2*dg.key_dim..2*dg.key_dim+dn_dim]);
 
+                        if layer == 0 && _token_step == 0 {
+                            let qkv_norm: f32 = qkv_buf.iter().map(|x|x*x).sum::<f32>().sqrt();
+                            let z_norm: f32 = z_s.iter().map(|x|x*x).sum::<f32>().sqrt();
+                            eprintln!("[DN-DBG L0] qkv_norm={qkv_norm:.4} z_norm={z_norm:.4} alpha[0..4]={:?} beta[0..4]={:?}", &al_s[..4.min(dn_heads)], &be_s[..4.min(dn_heads)]);
+                            // Compare against scalar Q2 GEMV
+                            if let Some(w) = qweights.get_q2(&dn.qkv_proj) {
+                                let mut ref_out = vec![0.0f32; dg.qkv_cols];
+                                tempura_kernels::quantized::q2_0_gemv(w, fs!(np, h), &mut ref_out, dg.qkv_cols, h);
+                                let ref_norm: f32 = ref_out.iter().map(|x|x*x).sum::<f32>().sqrt();
+                                let diff: f32 = qkv_buf.iter().zip(ref_out.iter()).map(|(a,b)| (a-b)*(a-b)).sum::<f32>().sqrt();
+                                eprintln!("[DN-DBG L0] scalar_qkv_norm={ref_norm:.4} diff_norm={diff:.4} nrmse={:.4}", diff / ref_norm);
+                            }
+                        }
                         let ssm_a_w = qweights.get_f32(&dn.a_log);
                         let dt_bias = qweights.get_f32(&dn.dt_bias);
                         for hd in 0..dn_heads {
@@ -3140,13 +3174,16 @@ where
                         let sess_m = unsafe { &mut *(sp as *mut InferenceSession) };
                         let dn_state = sess_m.deltanet_state.as_mut().unwrap();
                         let state = dn_state.state_mut(dn_idx);
-                        let dn_out = fsm!(ap, dn_dim);
-                        dn_out.fill(0.0);
+                        let dn_out = fsm!(gp, dn_dim);
                         tempura_kernels::deltanet::CpuDeltaNet.forward_recurrent(
                             q_s, k_s, v_s, al_s, be_s, state, dn_out,
                             dn_heads, dn_head_dim, 1.0,
                         ).unwrap();
 
+                        if layer == 0 && _token_step == 0 {
+                            let dn_norm: f32 = dn_out.iter().map(|x|x*x).sum::<f32>().sqrt();
+                            eprintln!("[DN-DBG L0] dn_out_norm={dn_norm:.4} dn_out[0..4]={:?}", &dn_out[..4]);
+                        }
                         if let Some(norm_w) = qweights.get_f32(&dn.norm) {
                             for head in 0..dn_heads {
                                 let off = head * dn_head_dim;
@@ -3216,8 +3253,8 @@ where
                                 i2s_gemv_cols(is!(pp,dn_dim), ps, pm, ow, i2s_weight_scale(ow,h,dn_dim), op, s, e, dn_dim);
                             } else if ith == 0 {
                                 if let Some(w) = qweights.get_q2(&dn.out_proj) {
-                                    let dn_out = fs!(ap, dn_dim);
-                                    tempura_kernels::quantized::q2_0_gemv(w, dn_out, fsm!(op, h), h, dn_dim);
+                                    let dn_out_s = fs!(gp, dn_dim);
+                                    tempura_kernels::quantized::q2_0_gemv(w, dn_out_s, fsm!(op, h), h, dn_dim);
                                 }
                             }
                         }
@@ -3310,8 +3347,22 @@ where
                             }
                         }
                         use tempura_kernels::RoPE;
-                        rope.forward(fsm!(qp,q_dim), 1, 1, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
-                        rope.forward(fsm!(kp,kv_dim), 1, 1, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                        let rope_hd = cfg.rope_dim.unwrap_or(head_dim);
+                        if rope_hd < head_dim {
+                            let mut q_rope = vec![0.0f32; n_heads * rope_hd];
+                            let mut k_rope = vec![0.0f32; n_kv_heads * rope_hd];
+                            let qs = fsm!(qp, q_dim);
+                            let ks = fsm!(kp, kv_dim);
+                            for hh in 0..n_heads { q_rope[hh*rope_hd..(hh+1)*rope_hd].copy_from_slice(&qs[hh*head_dim..hh*head_dim+rope_hd]); }
+                            for hh in 0..n_kv_heads { k_rope[hh*rope_hd..(hh+1)*rope_hd].copy_from_slice(&ks[hh*head_dim..hh*head_dim+rope_hd]); }
+                            rope.forward(&mut q_rope, 1, 1, n_heads, rope_hd, &positions, cfg.rope_theta).unwrap();
+                            rope.forward(&mut k_rope, 1, 1, n_kv_heads, rope_hd, &positions, cfg.rope_theta).unwrap();
+                            for hh in 0..n_heads { qs[hh*head_dim..hh*head_dim+rope_hd].copy_from_slice(&q_rope[hh*rope_hd..(hh+1)*rope_hd]); }
+                            for hh in 0..n_kv_heads { ks[hh*head_dim..hh*head_dim+rope_hd].copy_from_slice(&k_rope[hh*rope_hd..(hh+1)*rope_hd]); }
+                        } else {
+                            rope.forward(fsm!(qp,q_dim), 1, 1, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                            rope.forward(fsm!(kp,kv_dim), 1, 1, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
+                        }
                         let sess = unsafe { &mut *(sp as *mut InferenceSession) };
                         let cl = cache_layer_map[layer].unwrap();
                         sess.cache.append_kv(cl, fs!(kp,kv_dim), fs!(vp,kv_dim), 1);
@@ -3558,6 +3609,11 @@ where
 
                     if ith == 0 {
                         residual_add(fsm!(hp,h), fs!(dp,h), h);
+                    }
+                    if ith == 0 && _token_step == 0 && (layer <= 3 || layer == cfg.num_layers - 1) {
+                        let hn: f32 = fs!(hp,h).iter().map(|x|x*x).sum::<f32>().sqrt();
+                        let kind = if is_deltanet { "DN" } else { "ATN" };
+                        eprintln!("[TRACE] L{layer}({kind}) hidden_norm={hn:.4}");
                     }
                 }
 
