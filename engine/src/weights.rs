@@ -457,16 +457,19 @@ impl QuantizedWeights {
     pub fn build_q2_tl2(&mut self, tensor_shapes: &HashMap<String, (usize, usize)>) {
         use rayon::prelude::*;
         let names: Vec<String> = self.mmap_q2.keys().cloned().collect();
-        let results: Vec<_> = names.par_iter().filter_map(|name| {
-            let &(n, k) = tensor_shapes.get(name)?;
-            let q2_data = self.get_q2(name)?;
-            let (i2s_data, _avg_scale, corrections) = tempura_kernels::quantized::q2_to_i2s_approx(q2_data, n, k);
-            let (tl2_data, scale) = tempura_kernels::tl2::repack_i2s_to_tl2(&i2s_data, n, k)?;
-            Some((name.clone(), tl2_data, scale, n, k, corrections))
-        }).collect();
-        for (name, tl2_data, scale, n, k, corrections) in results {
-            self.tl2_tensors.insert(name.clone(), Tl2Tensor { data: tl2_data, m: n, k, scale });
-            self.q2_row_corrections.insert(name, corrections);
+        // Process in batches of 4 to limit peak memory (~400MB scratch per tensor)
+        for batch in names.chunks(4) {
+            let results: Vec<_> = batch.par_iter().filter_map(|name| {
+                let &(n, k) = tensor_shapes.get(name)?;
+                let q2_data = self.get_q2(name)?;
+                let (i2s_data, _avg_scale, corrections) = tempura_kernels::quantized::q2_to_i2s_approx(q2_data, n, k);
+                let (tl2_data, scale) = tempura_kernels::tl2::repack_i2s_to_tl2(&i2s_data, n, k)?;
+                Some((name.clone(), tl2_data, scale, n, k, corrections))
+            }).collect();
+            for (name, tl2_data, scale, n, k, corrections) in results {
+                self.tl2_tensors.insert(name.clone(), Tl2Tensor { data: tl2_data, m: n, k, scale });
+                self.q2_row_corrections.insert(name, corrections);
+            }
         }
     }
 
