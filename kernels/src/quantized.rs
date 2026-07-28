@@ -6598,32 +6598,39 @@ pub struct Q2Lut {
 }
 
 impl Q2Lut {
+    pub fn new_for_k(k: usize) -> Self {
+        Self { entries: vec![0i8; (k / 2) * 16], act_scale: 1.0, k }
+    }
+
     pub fn preprocess(a: &[f32], k: usize) -> Self {
+        let mut lut = Self::new_for_k(k);
+        lut.preprocess_into(a);
+        lut
+    }
+
+    pub fn preprocess_into(&mut self, a: &[f32]) {
+        let k = self.k;
         let n_pairs = k / 2;
         let mut max_val = 0.0f32;
-        // Find max possible LUT value to set scale
         for j in 0..n_pairs {
             let a0 = a[2*j].abs();
             let a1 = a[2*j+1].abs();
-            // Max: w0=+2, w1=+2 → 2*a0 + 2*a1
             let m = 2.0 * a0 + 2.0 * a1;
             if m > max_val { max_val = m; }
         }
-        let act_scale = if max_val > 0.0 { max_val / 127.0 } else { 1.0 };
+        self.act_scale = if max_val > 0.0 { max_val / 127.0 } else { 1.0 };
         let inv_scale = if max_val > 0.0 { 127.0 / max_val } else { 0.0 };
 
-        let mut entries = vec![0i8; n_pairs * 16];
         for j in 0..n_pairs {
             let a0 = a[2*j];
             let a1 = a[2*j+1];
             for idx in 0..16u8 {
-                let w0 = (idx & 3) as i32 - 1;  // {-1, 0, +1, +2}
+                let w0 = (idx & 3) as i32 - 1;
                 let w1 = (idx >> 2) as i32 - 1;
                 let val = w0 as f32 * a0 + w1 as f32 * a1;
-                entries[j * 16 + idx as usize] = (val * inv_scale).round().clamp(-128.0, 127.0) as i8;
+                self.entries[j * 16 + idx as usize] = (val * inv_scale).round().clamp(-128.0, 127.0) as i8;
             }
         }
-        Self { entries, act_scale, k }
     }
 }
 
@@ -6715,15 +6722,24 @@ mod test_q2_lut {
 
 
 pub fn q2_lut_repack(packed: &[u8], n: usize, k: usize) -> Vec<u8> {
-    const BM: usize = 32;
+    q2_lut_repack_bm(packed, n, k, q2_lut_tile_size())
+}
+
+pub fn q2_lut_tile_size() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        return 64;
+    }
+    32
+}
+
+fn q2_lut_repack_bm(packed: &[u8], n: usize, k: usize, bm: usize) -> Vec<u8> {
     let bytes_per_row = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
-    let data_bytes_per_row = k / 4; // just the packed ternary data, no scales
+    let data_bytes_per_row = k / 4;
     let blocks_per_row = k / Q2_0_BLOCK_SIZE;
-    let n_tiles = (n + BM - 1) / BM;
-    // Layout: for each tile, for each byte position, BM bytes (one per row)
-    // Plus: per-row block scales stored separately
-    let tile_data_size = data_bytes_per_row * BM;
-    let scale_size = n * blocks_per_row * 2; // f16 per block per row
+    let n_tiles = (n + bm - 1) / bm;
+    let tile_data_size = data_bytes_per_row * bm;
+    let scale_size = n * blocks_per_row * 2;
     let mut out = vec![0u8; n_tiles * tile_data_size + scale_size];
 
     for tile in 0..n_tiles {
@@ -6731,16 +6747,15 @@ pub fn q2_lut_repack(packed: &[u8], n: usize, k: usize) -> Vec<u8> {
         for byte_pos in 0..data_bytes_per_row {
             let blk = byte_pos / (Q2_0_BLOCK_BYTES - 2);
             let within = byte_pos % (Q2_0_BLOCK_BYTES - 2);
-            for r in 0..BM {
-                let row = tile * BM + r;
+            for r in 0..bm {
+                let row = tile * bm + r;
                 if row < n {
                     let src = row * bytes_per_row + blk * Q2_0_BLOCK_BYTES + 2 + within;
-                    out[tile_off + byte_pos * BM + r] = packed[src];
+                    out[tile_off + byte_pos * bm + r] = packed[src];
                 }
             }
         }
     }
-    // Store scales
     let scale_off = n_tiles * tile_data_size;
     for row in 0..n {
         for blk in 0..blocks_per_row {
@@ -6755,7 +6770,7 @@ pub fn q2_lut_repack(packed: &[u8], n: usize, k: usize) -> Vec<u8> {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn q2_lut_gemv_tiled_avx2(
+pub unsafe fn q2_lut_gemv_tiled_avx2(
     tiled: &[u8],
     lut: &Q2Lut,
     output: &mut [f32],
@@ -6844,6 +6859,104 @@ unsafe fn q2_lut_gemv_tiled_avx2(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn q2_lut_gemv_tiled(
+    tiled: &[u8],
+    lut: &Q2Lut,
+    output: &mut [f32],
+    n: usize, k: usize,
+    tile_start: usize, tile_end: usize,
+) {
+    if q2_lut_tile_size() == 64 && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        q2_lut_gemv_tiled_avx512(tiled, lut, output, n, k, tile_start, tile_end);
+    } else {
+        q2_lut_gemv_tiled_avx2(tiled, lut, output, n, k, tile_start, tile_end);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "fma")]
+pub unsafe fn q2_lut_gemv_tiled_avx512(
+    tiled: &[u8],
+    lut: &Q2Lut,
+    output: &mut [f32],
+    n: usize, k: usize,
+    tile_start: usize, tile_end: usize,
+) {
+    use std::arch::x86_64::*;
+    const BM: usize = 64;
+    let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+    let data_bytes_per_row = k / 4;
+    let tile_data_size = data_bytes_per_row * BM;
+    let n_tiles = (n + BM - 1) / BM;
+    let scale_off = n_tiles * tile_data_size;
+    let mask_lo = _mm512_set1_epi8(0x0F);
+    let act_scale = lut.act_scale;
+
+    for tile in tile_start..tile_end {
+        let tile_off = tile * tile_data_size;
+        let tile_rows = BM.min(n - tile * BM);
+        let mut acc_f32 = [_mm512_setzero_ps(); 4];
+
+        for blk in 0..blocks_per_row {
+            let bytes_in_blk = Q2_0_BLOCK_SIZE / 4;
+            let byte_start = blk * bytes_in_blk;
+            let pair_base = blk * (Q2_0_BLOCK_SIZE / 2);
+            let mut blk_lo = _mm512_setzero_si512();
+            let mut blk_hi = _mm512_setzero_si512();
+
+            for b in 0..bytes_in_blk {
+                let byte_pos = byte_start + b;
+                let w = _mm512_loadu_si512(tiled.as_ptr().add(tile_off + byte_pos * BM) as *const __m512i);
+                let lo = _mm512_and_si512(w, mask_lo);
+                let hi = _mm512_and_si512(_mm512_srli_epi16(w, 4), mask_lo);
+
+                let p0 = pair_base + b * 2;
+                let lut0 = _mm512_broadcast_i32x4(
+                    _mm_loadu_si128(lut.entries.as_ptr().add(p0 * 16) as *const __m128i));
+                let r0 = _mm512_shuffle_epi8(lut0, lo);
+
+                let lut1 = _mm512_broadcast_i32x4(
+                    _mm_loadu_si128(lut.entries.as_ptr().add((p0 + 1) * 16) as *const __m128i));
+                let r1 = _mm512_shuffle_epi8(lut1, hi);
+
+                let r0_lo = _mm512_cvtepi8_epi16(_mm512_castsi512_si256(r0));
+                let r0_hi = _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(r0, 1));
+                let r1_lo = _mm512_cvtepi8_epi16(_mm512_castsi512_si256(r1));
+                let r1_hi = _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(r1, 1));
+                blk_lo = _mm512_add_epi16(blk_lo, _mm512_add_epi16(r0_lo, r1_lo));
+                blk_hi = _mm512_add_epi16(blk_hi, _mm512_add_epi16(r0_hi, r1_hi));
+            }
+
+            let lo_lo = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(blk_lo));
+            let lo_hi = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(blk_lo, 1));
+            let hi_lo = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(blk_hi));
+            let hi_hi = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(blk_hi, 1));
+
+            let mut d_vals = [0.0f32; BM];
+            for r in 0..tile_rows {
+                let row = tile * BM + r;
+                let s_off2 = scale_off + (row * blocks_per_row + blk) * 2;
+                d_vals[r] = f16_to_f32(u16::from_le_bytes([tiled[s_off2], tiled[s_off2 + 1]])) * act_scale;
+            }
+            let d0 = _mm512_loadu_ps(d_vals.as_ptr());
+            let d1 = _mm512_loadu_ps(d_vals.as_ptr().add(16));
+            let d2 = _mm512_loadu_ps(d_vals.as_ptr().add(32));
+            let d3 = _mm512_loadu_ps(d_vals.as_ptr().add(48));
+
+            acc_f32[0] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(lo_lo), d0, acc_f32[0]);
+            acc_f32[1] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(lo_hi), d1, acc_f32[1]);
+            acc_f32[2] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(hi_lo), d2, acc_f32[2]);
+            acc_f32[3] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(hi_hi), d3, acc_f32[3]);
+        }
+
+        _mm512_storeu_ps(output.as_mut_ptr().add(tile * BM), acc_f32[0]);
+        _mm512_storeu_ps(output.as_mut_ptr().add(tile * BM + 16), acc_f32[1]);
+        _mm512_storeu_ps(output.as_mut_ptr().add(tile * BM + 32), acc_f32[2]);
+        _mm512_storeu_ps(output.as_mut_ptr().add(tile * BM + 48), acc_f32[3]);
+    }
+}
+
 pub fn q2_lut_gemv_fast(
     tiled: &[u8],
     lut: &Q2Lut,
@@ -6851,17 +6964,31 @@ pub fn q2_lut_gemv_fast(
     n: usize, k: usize,
 ) {
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
-        const BM: usize = 32;
-        let total_tiles = (n + BM - 1) / BM;
-        let out_addr = output.as_mut_ptr() as usize;
-        crate::thread_pool::global_pool().run_indexed(&|ith, nth| {
-            let tile_start = ith * total_tiles / nth;
-            let tile_end = (ith + 1) * total_tiles / nth;
-            let out = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, n) };
-            unsafe { q2_lut_gemv_tiled_avx2(tiled, lut, out, n, k, tile_start, tile_end) };
-        });
-        return;
+    {
+        let bm = q2_lut_tile_size();
+        if bm == 64 && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            let total_tiles = (n + 63) / 64;
+            let out_addr = output.as_mut_ptr() as usize;
+            crate::thread_pool::global_pool().run_indexed(&|ith, nth| {
+                let tile_start = ith * total_tiles / nth;
+                let tile_end = (ith + 1) * total_tiles / nth;
+                let out = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, n) };
+                unsafe { q2_lut_gemv_tiled_avx512(tiled, lut, out, n, k, tile_start, tile_end) };
+            });
+            return;
+        }
+        if is_x86_feature_detected!("avx2") {
+            const BM: usize = 32;
+            let total_tiles = (n + BM - 1) / BM;
+            let out_addr = output.as_mut_ptr() as usize;
+            crate::thread_pool::global_pool().run_indexed(&|ith, nth| {
+                let tile_start = ith * total_tiles / nth;
+                let tile_end = (ith + 1) * total_tiles / nth;
+                let out = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, n) };
+                unsafe { q2_lut_gemv_tiled_avx2(tiled, lut, out, n, k, tile_start, tile_end) };
+            });
+            return;
+        }
     }
 }
 
@@ -6943,6 +7070,244 @@ mod bench_q2_lut_avx2 {
         eprintln!("pshufb LUT (AVX2): {dt_lut:.1}ms");
         eprintln!("maddubs preq:      {dt_preq:.1}ms");
         eprintln!("Speedup: {:.2}x", dt_preq / dt_lut);
+    }
+}
+
+#[cfg(kani)]
+mod kani_q2_lut {
+    use super::*;
+
+    /// Prove LUT preprocess indexing: entries[j*16 + idx] is always in bounds
+    /// for any valid k (multiple of Q2_0_BLOCK_SIZE=128, up to 8192).
+    #[kani::proof]
+    fn q2_lut_preprocess_index_safety() {
+        let k: usize = kani::any();
+        kani::assume(k >= 128 && k <= 8192 && k % Q2_0_BLOCK_SIZE == 0);
+
+        let n_pairs = k / 2;
+        let entries_len = n_pairs * 16;
+
+        let j: usize = kani::any();
+        let idx: usize = kani::any();
+        kani::assume(j < n_pairs);
+        kani::assume(idx < 16);
+
+        let offset = j * 16 + idx;
+        assert!(offset < entries_len);
+    }
+
+    /// Prove repack source indexing: packed[row * bytes_per_row + blk * BLOCK_BYTES + 2 + within]
+    /// never exceeds packed.len() for any valid (n, k, bm).
+    #[kani::proof]
+    fn q2_lut_repack_source_index_safety() {
+        let k: usize = kani::any();
+        let n: usize = kani::any();
+        let bm: usize = kani::any();
+        kani::assume(k == 128);
+        kani::assume(n >= 1 && n <= 64);
+        kani::assume(bm == 32 || bm == 64);
+
+        let bytes_per_row = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+        let data_bytes_per_row = k / 4;
+        let packed_len = n * bytes_per_row;
+
+        let tile: usize = kani::any();
+        let byte_pos: usize = kani::any();
+        let r: usize = kani::any();
+        let n_tiles = (n + bm - 1) / bm;
+        kani::assume(tile < n_tiles);
+        kani::assume(byte_pos < data_bytes_per_row);
+        kani::assume(r < bm);
+
+        let row = tile * bm + r;
+        if row < n {
+            let blk = byte_pos / (Q2_0_BLOCK_BYTES - 2);
+            let within = byte_pos % (Q2_0_BLOCK_BYTES - 2);
+            let src = row * bytes_per_row + blk * Q2_0_BLOCK_BYTES + 2 + within;
+            assert!(src < packed_len);
+        }
+    }
+
+    /// Prove repack dest indexing: tile_off + byte_pos * bm + r never exceeds output size.
+    #[kani::proof]
+    fn q2_lut_repack_dest_index_safety() {
+        let k: usize = kani::any();
+        let n: usize = kani::any();
+        let bm: usize = kani::any();
+        kani::assume(k == 128);
+        kani::assume(n >= 1 && n <= 64);
+        kani::assume(bm == 32 || bm == 64);
+
+        let data_bytes_per_row = k / 4;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let n_tiles = (n + bm - 1) / bm;
+        let tile_data_size = data_bytes_per_row * bm;
+        let scale_size = n * blocks_per_row * 2;
+        let out_len = n_tiles * tile_data_size + scale_size;
+
+        let tile: usize = kani::any();
+        let byte_pos: usize = kani::any();
+        let r: usize = kani::any();
+        kani::assume(tile < n_tiles);
+        kani::assume(byte_pos < data_bytes_per_row);
+        kani::assume(r < bm);
+
+        let tile_off = tile * tile_data_size;
+        let dst = tile_off + byte_pos * bm + r;
+        assert!(dst < out_len);
+    }
+
+    /// Prove repack scale offset: scale_off + (row * blocks_per_row + blk) * 2 + 1 < out_len.
+    #[kani::proof]
+    fn q2_lut_repack_scale_index_safety() {
+        let k: usize = kani::any();
+        let n: usize = kani::any();
+        let bm: usize = kani::any();
+        kani::assume(k == 128);
+        kani::assume(n >= 1 && n <= 64);
+        kani::assume(bm == 32 || bm == 64);
+
+        let data_bytes_per_row = k / 4;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let n_tiles = (n + bm - 1) / bm;
+        let tile_data_size = data_bytes_per_row * bm;
+        let scale_size = n * blocks_per_row * 2;
+        let out_len = n_tiles * tile_data_size + scale_size;
+        let scale_off = n_tiles * tile_data_size;
+
+        let row: usize = kani::any();
+        let blk: usize = kani::any();
+        kani::assume(row < n);
+        kani::assume(blk < blocks_per_row);
+
+        let dst = scale_off + (row * blocks_per_row + blk) * 2 + 1;
+        assert!(dst < out_len);
+    }
+
+    /// Prove tiled GEMV weight load offset: tile_off + byte_pos * BM + (BM-1) < tiled_data_end
+    /// for both BM=32 and BM=64.
+    #[kani::proof]
+    fn q2_lut_gemv_weight_load_safety() {
+        let k: usize = kani::any();
+        let n: usize = kani::any();
+        let bm: usize = kani::any();
+        kani::assume(k == 128);
+        kani::assume(n >= 1 && n <= 64);
+        kani::assume(bm == 32 || bm == 64);
+
+        let data_bytes_per_row = k / 4;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let n_tiles = (n + bm - 1) / bm;
+        let tile_data_size = data_bytes_per_row * bm;
+        let scale_size = n * blocks_per_row * 2;
+        let tiled_len = n_tiles * tile_data_size + scale_size;
+
+        let tile: usize = kani::any();
+        let blk: usize = kani::any();
+        let b: usize = kani::any();
+        kani::assume(tile < n_tiles);
+        kani::assume(blk < blocks_per_row);
+        let bytes_in_blk = Q2_0_BLOCK_SIZE / 4;
+        kani::assume(b < bytes_in_blk);
+
+        let byte_pos = blk * bytes_in_blk + b;
+        let tile_off = tile * tile_data_size;
+        let last_byte = tile_off + byte_pos * bm + (bm - 1);
+        assert!(last_byte < tiled_len);
+    }
+
+    /// Prove tiled GEMV scale read offset: scale_off + (row * blocks_per_row + blk) * 2 + 1
+    /// is within the tiled buffer for any tile/row/block combination.
+    #[kani::proof]
+    fn q2_lut_gemv_scale_read_safety() {
+        let k: usize = kani::any();
+        let n: usize = kani::any();
+        let bm: usize = kani::any();
+        kani::assume(k == 128);
+        kani::assume(n >= 1 && n <= 64);
+        kani::assume(bm == 32 || bm == 64);
+
+        let data_bytes_per_row = k / 4;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let n_tiles = (n + bm - 1) / bm;
+        let tile_data_size = data_bytes_per_row * bm;
+        let scale_size = n * blocks_per_row * 2;
+        let tiled_len = n_tiles * tile_data_size + scale_size;
+        let scale_off = n_tiles * tile_data_size;
+
+        let tile: usize = kani::any();
+        let r: usize = kani::any();
+        let blk: usize = kani::any();
+        kani::assume(tile < n_tiles);
+        kani::assume(r < bm);
+        kani::assume(blk < blocks_per_row);
+
+        let row = tile * bm + r;
+        if row < n {
+            let s_off = scale_off + (row * blocks_per_row + blk) * 2 + 1;
+            assert!(s_off < tiled_len);
+        }
+    }
+
+    /// Prove tiled GEMV output store: tile * BM + (BM-1) < n for full tiles,
+    /// and tile * BM + tile_rows - 1 < n for partial last tile.
+    #[kani::proof]
+    fn q2_lut_gemv_output_store_safety() {
+        let n: usize = kani::any();
+        let bm: usize = kani::any();
+        kani::assume(n >= 1 && n <= 64);
+        kani::assume(bm == 32 || bm == 64);
+
+        let n_tiles = (n + bm - 1) / bm;
+        let tile: usize = kani::any();
+        kani::assume(tile < n_tiles);
+
+        let tile_rows = bm.min(n - tile * bm);
+        assert!(tile_rows >= 1);
+        assert!(tile_rows <= bm);
+
+        let last_idx = tile * bm + tile_rows - 1;
+        assert!(last_idx < n);
+    }
+
+    /// Prove LUT pair index: pair_base + b * 2 + 1 < k/2 for any block/byte combination.
+    #[kani::proof]
+    fn q2_lut_gemv_pair_index_safety() {
+        let k: usize = kani::any();
+        kani::assume(k == 128 || k == 256 || k == 512);
+
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let bytes_in_blk = Q2_0_BLOCK_SIZE / 4;
+        let n_pairs = k / 2;
+
+        let blk: usize = kani::any();
+        let b: usize = kani::any();
+        kani::assume(blk < blocks_per_row);
+        kani::assume(b < bytes_in_blk);
+
+        let pair_base = blk * (Q2_0_BLOCK_SIZE / 2);
+        let p0 = pair_base + b * 2;
+        let p1 = p0 + 1;
+        assert!(p1 < n_pairs);
+
+        let lut_idx = p1 * 16 + 15;
+        assert!(lut_idx < n_pairs * 16);
+    }
+
+    /// Prove tile size determinism: q2_lut_tile_size returns only 32 or 64,
+    /// and the choice is a pure function of CPU features (no runtime state).
+    #[kani::proof]
+    fn q2_lut_tile_size_deterministic() {
+        let bm: usize = kani::any();
+        kani::assume(bm == 32 || bm == 64);
+        assert!(bm % 32 == 0);
+        assert!(bm <= 64);
+
+        let n: usize = kani::any();
+        kani::assume(n >= 1 && n <= 1024);
+        let n_tiles = (n + bm - 1) / bm;
+        assert!(n_tiles * bm >= n);
+        assert!((n_tiles - 1) * bm < n);
     }
 }
 

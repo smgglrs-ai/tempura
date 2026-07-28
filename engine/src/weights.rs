@@ -263,6 +263,7 @@ pub struct QuantizedWeights {
     mmap_q2: HashMap<String, (usize, usize)>,
     q2_i2s: HashMap<String, (Vec<u8>, Vec<f32>, usize, usize)>,
     q2x4: HashMap<String, (Vec<u8>, usize, usize)>,
+    q2_tiled: HashMap<String, (Vec<u8>, usize, usize)>,
     q2_row_corrections: HashMap<String, Vec<f32>>,
 }
 
@@ -288,6 +289,7 @@ impl QuantizedWeights {
             mmap_q2: HashMap::new(),
             q2_i2s: HashMap::new(),
             q2x4: HashMap::new(),
+            q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
         }
     }
@@ -315,6 +317,7 @@ impl QuantizedWeights {
             mmap_q2: HashMap::new(),
             q2_i2s: HashMap::new(),
             q2x4: HashMap::new(),
+            q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
         }
     }
@@ -450,6 +453,14 @@ impl QuantizedWeights {
         self.q2x4.get(name).map(|(d, n, k)| (d.as_slice(), *n, *k))
     }
 
+    pub fn get_q2_tiled(&self, name: &str) -> Option<(&[u8], usize, usize)> {
+        self.q2_tiled.get(name).map(|(d, n, k)| (d.as_slice(), *n, *k))
+    }
+
+    pub fn has_q2_tiled(&self) -> bool {
+        !self.q2_tiled.is_empty()
+    }
+
     pub fn get_q2_row_corrections(&self, name: &str) -> Option<&[f32]> {
         self.q2_row_corrections.get(name).map(|v| v.as_slice())
     }
@@ -496,6 +507,20 @@ impl QuantizedWeights {
                     self.q2_i2s.insert(name, (i2s_data, scales, n, k));
                 }
             }
+        }
+    }
+
+    pub fn build_q2_lut_tiled(&mut self, tensor_shapes: &HashMap<String, (usize, usize)>) {
+        use rayon::prelude::*;
+        let names: Vec<String> = self.mmap_q2.keys().cloned().collect();
+        let results: Vec<_> = names.par_iter().filter_map(|name| {
+            let &(n, k) = tensor_shapes.get(name)?;
+            let q2_data = self.get_q2(name)?;
+            let tiled = tempura_kernels::quantized::q2_lut_repack(q2_data, n, k);
+            Some((name.clone(), tiled, n, k))
+        }).collect();
+        for (name, tiled, n, k) in results {
+            self.q2_tiled.insert(name, (tiled, n, k));
         }
     }
 

@@ -1430,6 +1430,7 @@ impl GgufLoader {
 
 impl GgufLoader {
     pub fn to_quantized_weights(self) -> crate::weights::QuantizedWeights {
+        let q2_shapes = self.q2_tensor_shapes();
         let mut q4k_tensors = HashMap::new();
         let mut q6k_tensors = HashMap::new();
         let mut tq2_tensors = HashMap::new();
@@ -1521,6 +1522,12 @@ impl GgufLoader {
             if std::env::var("TEMPURA_NO_TL2").is_err() {
                 qw.build_tl2_from_i2s(&i2s_shapes);
             }
+        }
+
+        if !q2_shapes.is_empty() {
+            let t = std::time::Instant::now();
+            qw.build_q2_lut_tiled(&q2_shapes);
+            eprintln!("[Q2_0] LUT tiled repack: {} tensors in {:.1}s", q2_shapes.len(), t.elapsed().as_secs_f64());
         }
 
         qw
