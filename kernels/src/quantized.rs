@@ -6584,3 +6584,365 @@ mod test_q2_roundtrip {
     }
 }
 
+
+// ── Q2_0 base-4 LUT GEMV ─────────────────────────────────────────────────────
+//
+// Groups pairs of Q2_0 values into 4-bit indices (4²=16 entries per pair).
+// LUT precomputed from activation: lut[pair][idx] = (w0-1)*a[2j] + (w1-1)*a[2j+1]
+// Lookup via pshufb: one instruction handles 16-entry table for 32 rows.
+
+pub struct Q2Lut {
+    pub entries: Vec<i8>,   // k/2 * 16 i8 entries
+    pub act_scale: f32,     // quantization scale for i8 LUT values
+    pub k: usize,
+}
+
+impl Q2Lut {
+    pub fn preprocess(a: &[f32], k: usize) -> Self {
+        let n_pairs = k / 2;
+        let mut max_val = 0.0f32;
+        // Find max possible LUT value to set scale
+        for j in 0..n_pairs {
+            let a0 = a[2*j].abs();
+            let a1 = a[2*j+1].abs();
+            // Max: w0=+2, w1=+2 → 2*a0 + 2*a1
+            let m = 2.0 * a0 + 2.0 * a1;
+            if m > max_val { max_val = m; }
+        }
+        let act_scale = if max_val > 0.0 { max_val / 127.0 } else { 1.0 };
+        let inv_scale = if max_val > 0.0 { 127.0 / max_val } else { 0.0 };
+
+        let mut entries = vec![0i8; n_pairs * 16];
+        for j in 0..n_pairs {
+            let a0 = a[2*j];
+            let a1 = a[2*j+1];
+            for idx in 0..16u8 {
+                let w0 = (idx & 3) as i32 - 1;  // {-1, 0, +1, +2}
+                let w1 = (idx >> 2) as i32 - 1;
+                let val = w0 as f32 * a0 + w1 as f32 * a1;
+                entries[j * 16 + idx as usize] = (val * inv_scale).round().clamp(-128.0, 127.0) as i8;
+            }
+        }
+        Self { entries, act_scale, k }
+    }
+}
+
+pub fn q2_lut_gemv(
+    packed: &[u8],
+    lut: &Q2Lut,
+    w_scales: &[f32],  // per-block Q2_0 f16 scales (blocks_per_row per row)
+    output: &mut [f32],
+    n: usize, k: usize,
+) {
+    let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+    let pairs_per_block = Q2_0_BLOCK_SIZE / 2; // 64
+    let bytes_per_block = Q2_0_BLOCK_SIZE / 4; // 32
+    let scale = lut.act_scale;
+
+    for row in 0..n {
+        let w_row = &packed[row * row_bytes..];
+        let mut sum = 0.0f32;
+
+        for blk in 0..blocks_per_row {
+            let blk_off = blk * Q2_0_BLOCK_BYTES;
+            let d = f16_to_f32(u16::from_le_bytes([w_row[blk_off], w_row[blk_off + 1]]));
+            let qs = &w_row[blk_off + 2..blk_off + Q2_0_BLOCK_BYTES];
+            let mut blk_sum = 0i32;
+
+            let pair_base = blk * pairs_per_block;
+            for b in 0..bytes_per_block {
+                let byte = qs[b];
+                let lo = (byte & 0x0F) as usize;
+                let hi = ((byte >> 4) & 0x0F) as usize;
+                let pair0 = pair_base + b * 2;
+                let pair1 = pair0 + 1;
+                blk_sum += lut.entries[pair0 * 16 + lo] as i32;
+                blk_sum += lut.entries[pair1 * 16 + hi] as i32;
+            }
+            sum += d * blk_sum as f32 * scale;
+        }
+        output[row] = sum;
+    }
+}
+
+#[cfg(test)]
+mod test_q2_lut {
+    use super::*;
+
+    #[test]
+    fn q2_lut_matches_exact() {
+        let k = 5120usize;
+        let n = 32usize;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * Q2_0_BLOCK_BYTES;
+        let mut q2_data = vec![0u8; n * row_bytes];
+
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
+                let scale = 0.008 * (1.0 + 0.06 * ((row * 7 + blk * 13) % 20) as f32 / 10.0 - 0.06);
+                q2_data[off..off+2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+                for b in 0..32 { q2_data[off + 2 + b] = ((row * 37 + blk * 53 + b * 97) & 0xFF) as u8; }
+            }
+        }
+
+        let a: Vec<f32> = (0..k).map(|i| ((i * 7 + 3) as f32 * 0.01).sin()).collect();
+
+        // Exact
+        let mut out_exact = vec![0.0f32; n];
+        q2_0_gemv(&q2_data, &a, &mut out_exact, n, k);
+
+        // LUT
+        let lut = Q2Lut::preprocess(&a, k);
+        let mut out_lut = vec![0.0f32; n];
+        q2_lut_gemv(&q2_data, &lut, &[], &mut out_lut, n, k);
+
+        let mut sum_sq_err = 0.0f64;
+        let mut sum_sq_ref = 0.0f64;
+        for j in 0..n {
+            sum_sq_err += ((out_exact[j] - out_lut[j]) as f64).powi(2);
+            sum_sq_ref += (out_exact[j] as f64).powi(2);
+        }
+        let nrmse = (sum_sq_err / sum_sq_ref).sqrt();
+        eprintln!("Q2_0 LUT NRMSE: {nrmse:.6}");
+        eprintln!("exact[0..4]: {:?}", &out_exact[..4]);
+        eprintln!("lut[0..4]:   {:?}", &out_lut[..4]);
+        assert!(nrmse < 0.05, "Q2_0 LUT NRMSE too high: {nrmse}");
+    }
+}
+
+
+
+pub fn q2_lut_repack(packed: &[u8], n: usize, k: usize) -> Vec<u8> {
+    const BM: usize = 32;
+    let bytes_per_row = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    let data_bytes_per_row = k / 4; // just the packed ternary data, no scales
+    let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+    let n_tiles = (n + BM - 1) / BM;
+    // Layout: for each tile, for each byte position, BM bytes (one per row)
+    // Plus: per-row block scales stored separately
+    let tile_data_size = data_bytes_per_row * BM;
+    let scale_size = n * blocks_per_row * 2; // f16 per block per row
+    let mut out = vec![0u8; n_tiles * tile_data_size + scale_size];
+
+    for tile in 0..n_tiles {
+        let tile_off = tile * tile_data_size;
+        for byte_pos in 0..data_bytes_per_row {
+            let blk = byte_pos / (Q2_0_BLOCK_BYTES - 2);
+            let within = byte_pos % (Q2_0_BLOCK_BYTES - 2);
+            for r in 0..BM {
+                let row = tile * BM + r;
+                if row < n {
+                    let src = row * bytes_per_row + blk * Q2_0_BLOCK_BYTES + 2 + within;
+                    out[tile_off + byte_pos * BM + r] = packed[src];
+                }
+            }
+        }
+    }
+    // Store scales
+    let scale_off = n_tiles * tile_data_size;
+    for row in 0..n {
+        for blk in 0..blocks_per_row {
+            let src = row * bytes_per_row + blk * Q2_0_BLOCK_BYTES;
+            let dst = scale_off + (row * blocks_per_row + blk) * 2;
+            out[dst] = packed[src];
+            out[dst + 1] = packed[src + 1];
+        }
+    }
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn q2_lut_gemv_tiled_avx2(
+    tiled: &[u8],
+    lut: &Q2Lut,
+    output: &mut [f32],
+    n: usize, k: usize,
+    tile_start: usize, tile_end: usize,
+) {
+    use std::arch::x86_64::*;
+    const BM: usize = 32;
+    let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+    let data_bytes_per_row = k / 4;
+    let tile_data_size = data_bytes_per_row * BM;
+    let n_tiles = (n + BM - 1) / BM;
+    let scale_off = n_tiles * tile_data_size;
+    let mask_lo = _mm256_set1_epi8(0x0F);
+    let act_scale = lut.act_scale;
+
+    for tile in tile_start..tile_end {
+        let tile_off = tile * tile_data_size;
+        let tile_rows = BM.min(n - tile * BM);
+        // 4 × __m256 f32 accumulators: rows 0..7, 8..15, 16..23, 24..31
+        let mut acc_f32 = [_mm256_setzero_ps(); 4];
+
+        for blk in 0..blocks_per_row {
+            let bytes_in_blk = Q2_0_BLOCK_SIZE / 4;
+            let byte_start = blk * bytes_in_blk;
+            let pair_base = blk * (Q2_0_BLOCK_SIZE / 2);
+            // i16 accumulators: rows 0..15 and 16..31
+            let mut blk_lo = _mm256_setzero_si256();
+            let mut blk_hi = _mm256_setzero_si256();
+
+            for b in 0..bytes_in_blk {
+                let byte_pos = byte_start + b;
+                let w = _mm256_loadu_si256(tiled.as_ptr().add(tile_off + byte_pos * BM) as *const __m256i);
+                let lo = _mm256_and_si256(w, mask_lo);
+                let hi = _mm256_and_si256(_mm256_srli_epi16(w, 4), mask_lo);
+
+                let p0 = pair_base + b * 2;
+                let lut0 = _mm256_broadcastsi128_si256(
+                    _mm_loadu_si128(lut.entries.as_ptr().add(p0 * 16) as *const __m128i));
+                let r0 = _mm256_shuffle_epi8(lut0, lo);
+
+                let lut1 = _mm256_broadcastsi128_si256(
+                    _mm_loadu_si128(lut.entries.as_ptr().add((p0 + 1) * 16) as *const __m128i));
+                let r1 = _mm256_shuffle_epi8(lut1, hi);
+
+                // Widen r0+r1 to i16 and accumulate separately for rows 0..15 and 16..31
+                let r0_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(r0));
+                let r0_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(r0, 1));
+                let r1_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(r1));
+                let r1_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(r1, 1));
+                blk_lo = _mm256_add_epi16(blk_lo, _mm256_add_epi16(r0_lo, r1_lo));
+                blk_hi = _mm256_add_epi16(blk_hi, _mm256_add_epi16(r0_hi, r1_hi));
+            }
+
+            // Convert i16 accumulators to f32 and apply per-block scales
+            // blk_lo has 16 i16 values for rows 0..15
+            // blk_hi has 16 i16 values for rows 16..31
+            // Split each into 2 × 8 i32 → 2 × 8 f32
+            let lo_lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(blk_lo));
+            let lo_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(blk_lo, 1));
+            let hi_lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(blk_hi));
+            let hi_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(blk_hi, 1));
+
+            // Load 32 block scales and multiply
+            let mut d_vals = [0.0f32; BM];
+            for r in 0..tile_rows {
+                let row = tile * BM + r;
+                let s_off2 = scale_off + (row * blocks_per_row + blk) * 2;
+                d_vals[r] = f16_to_f32(u16::from_le_bytes([tiled[s_off2], tiled[s_off2 + 1]])) * act_scale;
+            }
+            let d0 = _mm256_loadu_ps(d_vals.as_ptr());
+            let d1 = _mm256_loadu_ps(d_vals.as_ptr().add(8));
+            let d2 = _mm256_loadu_ps(d_vals.as_ptr().add(16));
+            let d3 = _mm256_loadu_ps(d_vals.as_ptr().add(24));
+
+            acc_f32[0] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(lo_lo), d0, acc_f32[0]);
+            acc_f32[1] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(lo_hi), d1, acc_f32[1]);
+            acc_f32[2] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(hi_lo), d2, acc_f32[2]);
+            acc_f32[3] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(hi_hi), d3, acc_f32[3]);
+        }
+
+        _mm256_storeu_ps(output.as_mut_ptr().add(tile * BM), acc_f32[0]);
+        _mm256_storeu_ps(output.as_mut_ptr().add(tile * BM + 8), acc_f32[1]);
+        _mm256_storeu_ps(output.as_mut_ptr().add(tile * BM + 16), acc_f32[2]);
+        _mm256_storeu_ps(output.as_mut_ptr().add(tile * BM + 24), acc_f32[3]);
+    }
+}
+
+pub fn q2_lut_gemv_fast(
+    tiled: &[u8],
+    lut: &Q2Lut,
+    output: &mut [f32],
+    n: usize, k: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        const BM: usize = 32;
+        let total_tiles = (n + BM - 1) / BM;
+        let out_addr = output.as_mut_ptr() as usize;
+        crate::thread_pool::global_pool().run_indexed(&|ith, nth| {
+            let tile_start = ith * total_tiles / nth;
+            let tile_end = (ith + 1) * total_tiles / nth;
+            let out = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, n) };
+            unsafe { q2_lut_gemv_tiled_avx2(tiled, lut, out, n, k, tile_start, tile_end) };
+        });
+        return;
+    }
+}
+
+#[cfg(test)]
+mod test_q2_lut_tiled {
+    use super::*;
+
+    #[test]
+    fn tiled_lut_matches_scalar() {
+        let k = 5120usize;
+        let n = 64usize;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * Q2_0_BLOCK_BYTES;
+        let mut q2_data = vec![0u8; n * row_bytes];
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
+                let scale = 0.008 * (1.0 + 0.06 * ((row * 7 + blk * 13) % 20) as f32 / 10.0 - 0.06);
+                q2_data[off..off+2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+                for b in 0..32 { q2_data[off + 2 + b] = ((row * 37 + blk * 53 + b * 97) & 0xFF) as u8; }
+            }
+        }
+
+        let a: Vec<f32> = (0..k).map(|i| ((i * 7 + 3) as f32 * 0.01).sin()).collect();
+        let lut = Q2Lut::preprocess(&a, k);
+
+        let mut out_scalar = vec![0.0f32; n];
+        q2_lut_gemv(&q2_data, &lut, &[], &mut out_scalar, n, k);
+
+        let tiled = q2_lut_repack(&q2_data, n, k);
+        let mut out_tiled = vec![0.0f32; n];
+        q2_lut_gemv_fast(&tiled, &lut, &mut out_tiled, n, k);
+
+        let mut max_diff = 0.0f32;
+        for j in 0..n {
+            let d = (out_scalar[j] - out_tiled[j]).abs();
+            if d > max_diff { max_diff = d; }
+        }
+        eprintln!("scalar[0..4]: {:?}", &out_scalar[..4]);
+        eprintln!("tiled[0..4]:  {:?}", &out_tiled[..4]);
+        eprintln!("max_diff: {max_diff:.8}");
+        assert!(max_diff < 1e-4, "tiled vs scalar mismatch: {max_diff}");
+    }
+}
+
+
+#[cfg(test)]
+mod bench_q2_lut_avx2 {
+    use super::*;
+    #[test]
+    fn bench_pshufb_vs_maddubs() {
+        let k = 5120usize;
+        let n = 17408usize;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * Q2_0_BLOCK_BYTES;
+        let mut q2_data = vec![0x55u8; n * row_bytes];
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
+                q2_data[off..off+2].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+            }
+        }
+        let a: Vec<f32> = (0..k).map(|i| (i as f32 * 0.001).sin()).collect();
+        let preq = PreQuantizedActivations::from_f32(&a);
+        let lut = Q2Lut::preprocess(&a, k);
+        let tiled = q2_lut_repack(&q2_data, n, k);
+        let mut output = vec![0.0f32; n];
+
+        q2_lut_gemv_fast(&tiled, &lut, &mut output, n, k);
+        let iters = 5;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { q2_lut_gemv_fast(&tiled, &lut, &mut output, n, k); }
+        let dt_lut = t0.elapsed().as_millis() as f64 / iters as f64;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { q2_0_gemv_preq(&q2_data, &preq, &mut output, n, k); }
+        let dt_preq = t0.elapsed().as_millis() as f64 / iters as f64;
+
+        eprintln!("pshufb LUT (AVX2): {dt_lut:.1}ms");
+        eprintln!("maddubs preq:      {dt_preq:.1}ms");
+        eprintln!("Speedup: {:.2}x", dt_preq / dt_lut);
+    }
+}
+
