@@ -1342,6 +1342,12 @@ where
             }
 
 
+            if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && seq_len == 1 && layer == 3 {
+                let qn: f32 = q[..q_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                let kn: f32 = k[..kv_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                let vn: f32 = v[..kv_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                eprintln!("[FQ-ATN L3] pre-rope q_norm={qn:.4} k_norm={kn:.4} v_norm={vn:.4}");
+            }
             let rope_hd = cfg.rope_dim.unwrap_or(head_dim);
             if rope_hd < head_dim {
                 // Partial RoPE: only rotate first rope_hd dims per head
@@ -1464,6 +1470,11 @@ where
                 h,
                 q_dim,
             );
+            if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && seq_len == 1 && layer == 3 {
+                let on: f32 = o_proj[..h].iter().map(|x|x*x).sum::<f32>().sqrt();
+                let an: f32 = attn_out[..q_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                eprintln!("[FQ-ATN L3] attn_out_norm={an:.4} o_proj_norm={on:.4}");
+            }
             tempura_kernels::fused::residual_add(&mut hidden[..seq_len * h], &o_proj[..seq_len * h], seq_len * h);
 
             if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer == 0 {
@@ -2876,10 +2887,23 @@ where
         let qkv_cols_max = dn_geom.iter().filter_map(|g| g.as_ref()).map(|g| g.qkv_cols).max().unwrap_or(0);
         let conv_dim_max = dn_geom.iter().filter_map(|g| g.as_ref()).map(|g| g.conv_dim).max().unwrap_or(0);
 
+        let first_attn = layer_kind_vec.iter().position(|k| *k == crate::config::LayerKind::Attention);
+        let q_weight_cols = first_attn.and_then(|l| {
+            let qn = &layer_names[l].2;
+            let row_bytes = (h / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+            qweights.get_q2(qn).map(|w| w.len() / row_bytes)
+                .or_else(|| qweights.get_q2_tiled(qn).map(|(_,n,_)| n))
+                .or_else(|| qweights.get_tl2(qn).map(|t| t.m))
+        }).unwrap_or(q_dim);
+        let has_q_gate = q_weight_cols > q_dim;
+        let actual_q_cols = if has_q_gate { q_weight_cols } else { q_dim };
+
         let max_k = h.max(inter).max(q_dim).max(dn_dim);
         let mut preq_buf = vec![0i8; max_k];
         let mut normed = vec![0.0f32; h];
-        let mut q = vec![0.0f32; q_dim.max(qkv_cols_max)];
+        let mut q = vec![0.0f32; actual_q_cols.max(qkv_cols_max)];
+        let mut q_gate_buf = vec![0.0f32; if has_q_gate { q_dim } else { 0 }];
+        let qgbp = q_gate_buf.as_mut_ptr() as usize;
         let mut k_buf = vec![0.0f32; kv_dim.max(dn_dim)];
         let mut v_buf = vec![0.0f32; kv_dim.max(dn_dim)];
         let mut attn_out = vec![0.0f32; q_dim.max(dn_dim)];
@@ -3285,7 +3309,8 @@ where
                         if let (Some((qt,_,_)), Some((kt,_,_)), Some((vt,_,_))) =
                             (qweights.get_q2_tiled(qn), qweights.get_q2_tiled(kn), qweights.get_q2_tiled(vn))
                         {
-                            let q_tiles = (q_dim + q2_bm - 1) / q2_bm;
+                            let q_out_cols = actual_q_cols;
+                            let q_tiles = (q_out_cols + q2_bm - 1) / q2_bm;
                             let kv_tiles = (kv_dim + q2_bm - 1) / q2_bm;
                             let total = q_tiles + 2 * kv_tiles;
                             loop {
@@ -3293,7 +3318,7 @@ where
                                 if t >= total { break; }
                                 unsafe {
                                     if t < q_tiles {
-                                        tempura_kernels::quantized::q2_lut_gemv_tiled(qt, q2l, fsm!(qp,q_dim), q_dim, h, t, t + 1);
+                                        tempura_kernels::quantized::q2_lut_gemv_tiled(qt, q2l, fsm!(qp,q_out_cols), q_out_cols, h, t, t + 1);
                                     } else if t < q_tiles + kv_tiles {
                                         let kt_idx = t - q_tiles;
                                         tempura_kernels::quantized::q2_lut_gemv_tiled(kt, q2l, fsm!(kp,kv_dim), kv_dim, h, kt_idx, kt_idx + 1);
@@ -3309,14 +3334,15 @@ where
                     if !used_lut && lut_ok && lut_h_ptr != 0 {
                         let lut = unsafe { &*(lut_h_ptr as *const Tl2Lut) };
                         if let (Some(qt), Some(kt), Some(vt)) = (qweights.get_tl2(qn), qweights.get_tl2(kn), qweights.get_tl2(vn)) {
-                            let q_tiles = q_dim / tempura_kernels::tl2::Tl2Config::for_dims(q_dim, h).map(|c| c.bm).unwrap_or(q_dim);
-                            let kv_tiles = kv_dim / tempura_kernels::tl2::Tl2Config::for_dims(kv_dim, h).map(|c| c.bm).unwrap_or(kv_dim);
+                            let q_out_cols = actual_q_cols;
+                            let q_tiles = q_out_cols / Tl2Config::for_dims(q_out_cols, h).map(|c| c.bm).unwrap_or(q_out_cols);
+                            let kv_tiles = kv_dim / Tl2Config::for_dims(kv_dim, h).map(|c| c.bm).unwrap_or(kv_dim);
                             let total = q_tiles + 2 * kv_tiles;
                             loop {
                                 let t = tile_counter2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if t >= total { break; }
                                 if t < q_tiles {
-                                    tl2_gemv_tiles(lut, &qt.data, qt.scale, qp, q_dim, h, t, t + 1);
+                                    tl2_gemv_tiles(lut, &qt.data, qt.scale, qp, q_out_cols, h, t, t + 1);
                                 } else if t < q_tiles + kv_tiles {
                                     let kt_idx = t - q_tiles;
                                     tl2_gemv_tiles(lut, &kt.data, kt.scale, kp, kv_dim, h, kt_idx, kt_idx + 1);
@@ -3340,6 +3366,22 @@ where
                     barrier.wait();
 
                     if ith == 0 {
+                        if has_q_gate {
+                            let raw = fsm!(qp, actual_q_cols);
+                            let gate_out = fsm!(qgbp, q_dim);
+                            for hh in 0..n_heads {
+                                let src = hh * head_dim * 2;
+                                let q_dst = hh * head_dim;
+                                gate_out[q_dst..q_dst+head_dim].copy_from_slice(&raw[src+head_dim..src+2*head_dim]);
+                            }
+                            for hh in (0..n_heads).rev() {
+                                let src = hh * head_dim * 2;
+                                let dst = hh * head_dim;
+                                if src != dst {
+                                    raw.copy_within(src..src+head_dim, dst);
+                                }
+                            }
+                        }
                         if cfg.use_qk_norm {
                             if let (Some(qnw), Some(knw)) = (qweights.get_f32(_qnm), qweights.get_f32(_knm)) {
                                 apply_head_rmsnorm(fsm!(qp,q_dim), qnw, 1, n_heads, head_dim, cfg.layer_norm_eps);
@@ -3348,6 +3390,12 @@ where
                         }
                         use tempura_kernels::RoPE;
                         let rope_hd = cfg.rope_dim.unwrap_or(head_dim);
+                        if layer == 3 && _token_step == 0 {
+                            let qn: f32 = fsm!(qp,q_dim).iter().map(|x|x*x).sum::<f32>().sqrt();
+                            let kn: f32 = fsm!(kp,kv_dim).iter().map(|x|x*x).sum::<f32>().sqrt();
+                            let vn: f32 = fsm!(vp,kv_dim).iter().map(|x|x*x).sum::<f32>().sqrt();
+                            eprintln!("[ATN-DBG L3] pre-rope q_norm={qn:.4} k_norm={kn:.4} v_norm={vn:.4} rope_hd={rope_hd}");
+                        }
                         if rope_hd < head_dim {
                             let mut q_rope = vec![0.0f32; n_heads * rope_hd];
                             let mut k_rope = vec![0.0f32; n_kv_heads * rope_hd];
@@ -3394,6 +3442,14 @@ where
                     barrier.wait();
 
                     if ith == 0 {
+                        if has_q_gate {
+                            let attn = fsm!(ap, q_dim);
+                            let gate_vals = fs!(qgbp, q_dim);
+                            for i in 0..q_dim {
+                                let sig = 1.0 / (1.0 + (-gate_vals[i]).exp());
+                                attn[i] *= sig;
+                            }
+                        }
                         if let Some(asn_w) = qweights.get_f32(asn) {
                             use tempura_kernels::RMSNorm as _;
                             rmsnorm.forward(fsm!(ap,q_dim), asn_w, q_dim, cfg.layer_norm_eps).unwrap();
@@ -3457,6 +3513,12 @@ where
                     barrier.wait();
 
                     } // end if is_deltanet { ... } else { ... }
+
+                    if ith == 0 && layer == 3 && _token_step == 0 {
+                        let on: f32 = fs!(op, h).iter().map(|x|x*x).sum::<f32>().sqrt();
+                        let hn: f32 = fs!(hp, h).iter().map(|x|x*x).sum::<f32>().sqrt();
+                        eprintln!("[ATN-DBG L3] o_proj_norm={on:.4} hidden_before_ffn={hn:.4}");
+                    }
 
                     // ── Shared FFN block ──
                     if ith == 0 {
