@@ -346,9 +346,15 @@ async fn chat_completions(
                 .join("\n")
         });
 
+    if std::env::var("TEMPURA_TRACE_PROMPT").is_ok() {
+        eprintln!("[PROMPT] {}", prompt.replace('\n', "\\n"));
+    }
     let token_ids = tokenizer
         .encode(&prompt)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if std::env::var("TEMPURA_TRACE_PROMPT").is_ok() {
+        eprintln!("[TOKEN_IDS] len={} ids={:?}", token_ids.len(), &token_ids);
+    }
 
     if req.n < 1 || req.n > 128 {
         return Err((

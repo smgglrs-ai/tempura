@@ -3790,6 +3790,9 @@ where
                         eprintln!("[PROFILE] step={} layers={_layer_us}μs lm_head={_lmhead_us}μs total={total}μs", _token_step);
                     }
 
+                    if std::env::var("TEMPURA_TRACE_TOKENS").is_ok() {
+                        eprintln!("[TOK] step={} token={token} eos={:?}", gen.len()-1, eos_token);
+                    }
                     if eos_token == Some(token) || gen.len() >= max_tokens {
                         shared_stop.store(true, std::sync::atomic::Ordering::Release);
                     } else {
