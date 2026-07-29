@@ -1025,6 +1025,11 @@ where
                 } else {
                     self.pipeline.rmsnorm(&mut normed, input_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
                 }
+                if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && seq_len == 1 && layer == 0 {
+                    let nn: f32 = normed[..h].iter().map(|x|x*x).sum::<f32>().sqrt();
+                    let hh: f32 = hidden[..h].iter().map(|x|x*x).sum::<f32>().sqrt();
+                    eprintln!("[FQ-L0] hidden_norm={hh:.6} normed_norm={nn:.6} normed[0..4]={:?}", &normed[..4]);
+                }
 
                 let mm = tempura_kernels::matmul::CpuMatMul;
                 let mut q_dn = vec![0.0f32; seq_len * dn_dim];
@@ -2832,7 +2837,7 @@ where
             .map(|l| cfg.layer_kinds.as_ref().map(|k| k[l]).unwrap_or(crate::config::LayerKind::Attention))
             .collect();
 
-        let rmsnorm = tempura_kernels::rmsnorm::CpuRMSNormGgml;
+        let rmsnorm = tempura_kernels::rmsnorm::CpuRMSNorm;
         let rope = tempura_kernels::rope::CpuRoPEGgml;
 
         let mut hidden = vec![0.0f32; h];
@@ -3040,6 +3045,11 @@ where
                         let w = qweights.get_f32(iln).unwrap();
                         use tempura_kernels::RMSNorm as _;
                         rmsnorm.forward(fsm!(np,h), w, h, cfg.layer_norm_eps).unwrap();
+                        if layer == 0 && _token_step == 0 {
+                            let nn: f32 = fs!(np,h).iter().map(|x|x*x).sum::<f32>().sqrt();
+                            let hh: f32 = fs!(hp,h).iter().map(|x|x*x).sum::<f32>().sqrt();
+                            eprintln!("[GBD-L0] hidden_norm={hh:.6} normed_norm={nn:.6} normed[0..4]={:?}", &fs!(np,h)[..4]);
+                        }
                         let (s, m) = tempura_kernels::quantized::i2s_quantize_into(fs!(np,h), ism!(pp,h));
                         shared_scale.store(s.to_bits(), std::sync::atomic::Ordering::Release);
                         shared_sum.store(m, std::sync::atomic::Ordering::Release);
