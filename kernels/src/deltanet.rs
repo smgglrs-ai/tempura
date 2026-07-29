@@ -16,6 +16,9 @@ pub struct CpuDeltaNet;
 
 #[cfg(feature = "cpu")]
 impl CpuDeltaNet {
+    // State layout: column-major (transposed), matching PrismML llama.cpp.
+    // state[s_off + j * head_dim + i] = S[i][j]
+    // "Row j of the transposed matrix" = column j of S, stored contiguously.
     fn recurrent_step(
         q: &[f32],
         k: &[f32],
@@ -34,10 +37,6 @@ impl CpuDeltaNet {
             let s_off = h * d2;
             let qkv_off = h * head_dim;
 
-            // alpha and beta are PRE-COMPUTED:
-            // alpha[h] = gate value (negative scalar, e.g. softplus(raw+dt_bias)*(-exp(A_log)))
-            // beta[h] = sigmoid(beta_raw) in [0,1]
-            // When called from old API: alpha = raw, ssm_a = scalar → gate = softplus(alpha)*ssm_a
             let gate = if ssm_a == 1.0 { alpha[h] } else { softplus(alpha[h]) * ssm_a };
             let decay = gate.exp();
             for i in 0..d2 {
@@ -46,31 +45,31 @@ impl CpuDeltaNet {
 
             let beta_val = if ssm_a == 1.0 { beta[h] } else { sigmoid(beta[h]) };
 
-            let mut retrieved = vec![0.0f32; head_dim];
-            for row in 0..head_dim {
-                for col in 0..head_dim {
-                    retrieved[col] += state[s_off + row * head_dim + col] * k[qkv_off + row];
-                }
-            }
-
             let mut delta = vec![0.0f32; head_dim];
-            for i in 0..head_dim {
-                delta[i] = beta_val * (v[qkv_off + i] - retrieved[i]);
+            for j in 0..head_dim {
+                let mut sum = 0.0f32;
+                let row = &state[s_off + j * head_dim..s_off + (j + 1) * head_dim];
+                for i in 0..head_dim {
+                    sum += row[i] * k[qkv_off + i];
+                }
+                delta[j] = beta_val * (v[qkv_off + j] - sum);
             }
 
-            for row in 0..head_dim {
-                for col in 0..head_dim {
-                    state[s_off + row * head_dim + col] += k[qkv_off + row] * delta[col];
+            for j in 0..head_dim {
+                let row = &mut state[s_off + j * head_dim..s_off + (j + 1) * head_dim];
+                for i in 0..head_dim {
+                    row[i] += k[qkv_off + i] * delta[j];
                 }
             }
 
             let scale = 1.0 / (head_dim as f32).sqrt();
-            for col in 0..head_dim {
+            for j in 0..head_dim {
                 let mut sum = 0.0f32;
-                for row in 0..head_dim {
-                    sum += state[s_off + row * head_dim + col] * q[qkv_off + row];
+                let row = &state[s_off + j * head_dim..s_off + (j + 1) * head_dim];
+                for i in 0..head_dim {
+                    sum += row[i] * q[qkv_off + i];
                 }
-                output[qkv_off + col] = sum * scale;
+                output[qkv_off + j] = sum * scale;
             }
         }
     }
@@ -256,11 +255,11 @@ mod tests {
         assert!((output[0]).abs() < 1e-4, "output[0]={}", output[0]);
         assert!((output[1]).abs() < 1e-4, "output[1]={}", output[1]);
 
-        // Verify state
-        assert!((state[0] - 0.0).abs() < 1e-4); // [0][0]
-        assert!((state[1] - 0.0).abs() < 1e-4); // [0][1]
-        assert!((state[2] - 1.5).abs() < 1e-4); // [1][0]
-        assert!((state[3] - 2.0).abs() < 1e-4); // [1][1]
+        // Verify state (column-major: state[j*d+i] = S[i][j])
+        assert!((state[0] - 0.0).abs() < 1e-4); // S[0][0]
+        assert!((state[1] - 1.5).abs() < 1e-4); // S[1][0]
+        assert!((state[2] - 0.0).abs() < 1e-4); // S[0][1]
+        assert!((state[3] - 2.0).abs() < 1e-4); // S[1][1]
     }
 
     #[test]
