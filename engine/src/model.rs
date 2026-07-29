@@ -193,7 +193,8 @@ where
         if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
             return true;
         }
-        false // Disable persistent-thread until precision matches forward_quantized
+        if std::env::var("TEMPURA_NO_PERSISTENT").is_ok() { return false; }
+        qw.has_q2_tiled()
     }
 
     pub fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
@@ -3101,39 +3102,21 @@ where
                     let dn = dn_names[layer].as_ref().unwrap();
                     let dg = dn_geom[layer].as_ref().unwrap();
 
-                    // B2: QKV+gate+alpha+beta GEMV (Q8_0-based, row-partitioned)
-                    {
+                    // B2: QKV+gate+alpha+beta GEMV (Q8_0-based, single-threaded)
+                    if ith == 0 {
                         let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
-                        let total_rows = dg.qkv_cols + dn_dim + 2 * dn_heads;
-                        let row_bytes = (h / tempura_kernels::quantized::Q2_0_BLOCK_SIZE) * tempura_kernels::quantized::Q2_0_BLOCK_BYTES;
                         let h_q8_bytes = (h / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
-                        let rs = ith * total_rows / nth;
-                        let re = (ith + 1) * total_rows / nth;
-                        for r in rs..re {
-                            if r < dg.qkv_cols {
-                                if let Some(w) = qweights.get_q2(&dn.qkv_proj) {
-                                    let wr = &w[r * row_bytes..(r + 1) * row_bytes];
-                                    fsm!(qp, dg.qkv_cols)[r] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
-                                }
-                            } else if r < dg.qkv_cols + dn_dim {
-                                let gr = r - dg.qkv_cols;
-                                if let Some(w) = qweights.get_q2(&dn.gate_proj) {
-                                    let wr = &w[gr * row_bytes..(gr + 1) * row_bytes];
-                                    fsm!(zgp, dn_dim)[gr] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
-                                }
-                            } else if r < dg.qkv_cols + dn_dim + dn_heads {
-                                let ar = r - dg.qkv_cols - dn_dim;
-                                if let Some(w) = qweights.get_q2(&dn.alpha) {
-                                    let wr = &w[ar * row_bytes..(ar + 1) * row_bytes];
-                                    fsm!(abp, dn_heads)[ar] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
-                                }
-                            } else {
-                                let br = r - dg.qkv_cols - dn_dim - dn_heads;
-                                if let Some(w) = qweights.get_q2(&dn.beta) {
-                                    let wr = &w[br * row_bytes..(br + 1) * row_bytes];
-                                    fsm!(bbp, dn_heads)[br] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
-                                }
-                            }
+                        if let Some(w) = qweights.get_q2(&dn.qkv_proj) {
+                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(qp, dg.qkv_cols), dg.qkv_cols, h);
+                        }
+                        if let Some(w) = qweights.get_q2(&dn.gate_proj) {
+                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(zgp, dn_dim), dn_dim, h);
+                        }
+                        if let Some(w) = qweights.get_q2(&dn.alpha) {
+                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(abp, dn_heads), dn_heads, h);
+                        }
+                        if let Some(w) = qweights.get_q2(&dn.beta) {
+                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(bbp, dn_heads), dn_heads, h);
                         }
                     }
                     barrier.wait();
@@ -3266,17 +3249,11 @@ where
                     barrier.wait();
 
                     // B3: O-proj GEMV (dn_dim → h, Q8_0-based row-partitioned)
-                    {
+                    if ith == 0 {
                         let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
-                        let row_bytes = (dn_dim / tempura_kernels::quantized::Q2_0_BLOCK_SIZE) * tempura_kernels::quantized::Q2_0_BLOCK_BYTES;
                         let dn_q8_bytes = (dn_dim / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
                         if let Some(w) = qweights.get_q2(&dn.out_proj) {
-                            let rs = ith * h / nth;
-                            let re = (ith + 1) * h / nth;
-                            for r in rs..re {
-                                let wr = &w[r * row_bytes..(r + 1) * row_bytes];
-                                fsm!(op, h)[r] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..dn_q8_bytes], dn_dim);
-                            }
+                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..dn_q8_bytes], fsm!(op, h), h, dn_dim);
                         }
                     }
                     barrier.wait();
@@ -3290,36 +3267,20 @@ where
                     barrier.wait();
 
                     } else {
-                    // ── Attention block: Q8_0-based QKV GEMV ──
-                    {
+                    // ── Attention block: Q8_0-based QKV GEMV (single-threaded, matching qmm) ──
+                    if ith == 0 {
                         let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
-                        let row_bytes = (h / tempura_kernels::quantized::Q2_0_BLOCK_SIZE) * tempura_kernels::quantized::Q2_0_BLOCK_BYTES;
                         let h_q8_bytes = (h / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
-                        let total_rows = actual_q_cols + 2 * kv_dim;
-                        let rs = ith * total_rows / nth;
-                        let re = (ith + 1) * total_rows / nth;
-                        for r in rs..re {
-                            if r < actual_q_cols {
-                                if let Some(w) = qweights.get_q2(qn) {
-                                    let wr = &w[r * row_bytes..(r + 1) * row_bytes];
-                                    fsm!(qp, actual_q_cols)[r] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
-                                }
-                            } else if r < actual_q_cols + kv_dim {
-                                let kr = r - actual_q_cols;
-                                if let Some(w) = qweights.get_q2(kn) {
-                                    let wr = &w[kr * row_bytes..(kr + 1) * row_bytes];
-                                    fsm!(kp, kv_dim)[kr] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
-                                }
-                            } else {
-                                let vr = r - actual_q_cols - kv_dim;
-                                if let Some(w) = qweights.get_q2(vn) {
-                                    let wr = &w[vr * row_bytes..(vr + 1) * row_bytes];
-                                    fsm!(vp, kv_dim)[vr] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
-                                }
-                            }
+                        if let Some(w) = qweights.get_q2(qn) {
+                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(qp, actual_q_cols), actual_q_cols, h);
+                        }
+                        if let Some(w) = qweights.get_q2(kn) {
+                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(kp, kv_dim), kv_dim, h);
+                        }
+                        if let Some(w) = qweights.get_q2(vn) {
+                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(vp, kv_dim), kv_dim, h);
                         }
                     }
-                    // (TL2/I2S QKV paths removed — Q8_0-based GEMV above handles all Q2_0 weights)
                     barrier.wait();
 
                     if ith == 0 {
@@ -3424,17 +3385,11 @@ where
                     }
                     barrier.wait();
 
-                    {
+                    if ith == 0 {
                         let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
-                        let row_bytes = (q_dim / tempura_kernels::quantized::Q2_0_BLOCK_SIZE) * tempura_kernels::quantized::Q2_0_BLOCK_BYTES;
                         let qd_q8_bytes = (q_dim / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
                         if let Some(w) = qweights.get_q2(on) {
-                            let rs = ith * h / nth;
-                            let re = (ith + 1) * h / nth;
-                            for r in rs..re {
-                                let wr = &w[r * row_bytes..(r + 1) * row_bytes];
-                                fsm!(op, h)[r] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..qd_q8_bytes], q_dim);
-                            }
+                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..qd_q8_bytes], fsm!(op, h), h, q_dim);
                         }
                     }
                     barrier.wait();
@@ -3462,27 +3417,15 @@ where
                     }
                     barrier.wait();
 
-                    // B6: gate+up GEMV (Q8_0-based row-partitioned)
-                    {
+                    // B6: gate+up GEMV (Q8_0-based, single-threaded)
+                    if ith == 0 {
                         let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
-                        let row_bytes = (h / tempura_kernels::quantized::Q2_0_BLOCK_SIZE) * tempura_kernels::quantized::Q2_0_BLOCK_BYTES;
                         let h_q8_bytes = (h / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
-                        let total = 2 * inter;
-                        let rs = ith * total / nth;
-                        let re = (ith + 1) * total / nth;
-                        for r in rs..re {
-                            if r < inter {
-                                if let Some(w) = qweights.get_q2(gn) {
-                                    let wr = &w[r * row_bytes..(r + 1) * row_bytes];
-                                    fsm!(gp, inter)[r] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
-                                }
-                            } else {
-                                let ur = r - inter;
-                                if let Some(w) = qweights.get_q2(un) {
-                                    let wr = &w[ur * row_bytes..(ur + 1) * row_bytes];
-                                    fsm!(upp, inter)[ur] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
-                                }
-                            }
+                        if let Some(w) = qweights.get_q2(gn) {
+                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(gp, inter), inter, h);
+                        }
+                        if let Some(w) = qweights.get_q2(un) {
+                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(upp, inter), inter, h);
                         }
                     }
                     barrier.wait();
@@ -3508,18 +3451,12 @@ where
                     }
                     barrier.wait();
 
-                    // B8: down-proj GEMV (Q8_0-based row-partitioned)
-                    {
+                    // B8: down-proj GEMV (Q8_0-based, single-threaded)
+                    if ith == 0 {
                         let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
-                        let row_bytes = (inter / tempura_kernels::quantized::Q2_0_BLOCK_SIZE) * tempura_kernels::quantized::Q2_0_BLOCK_BYTES;
                         let inter_q8_bytes = (inter / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
                         if let Some(w) = qweights.get_q2(dn) {
-                            let rs = ith * h / nth;
-                            let re = (ith + 1) * h / nth;
-                            for r in rs..re {
-                                let wr = &w[r * row_bytes..(r + 1) * row_bytes];
-                                fsm!(dp, h)[r] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..inter_q8_bytes], inter);
-                            }
+                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..inter_q8_bytes], fsm!(dp, h), h, inter);
                         }
                     }
                     barrier.wait();
