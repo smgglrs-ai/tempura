@@ -128,6 +128,7 @@ pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
     chat_template: ChatTemplate,
     bos_token_id: Option<u32>,
+    eos_token_id: Option<u32>,
     add_bos: bool,
 }
 
@@ -151,6 +152,7 @@ impl Tokenizer {
             inner,
             chat_template,
             bos_token_id: None,
+            eos_token_id: None,
             add_bos: false,
         })
     }
@@ -255,6 +257,9 @@ impl Tokenizer {
         let bos_token_id = metadata
             .get("tokenizer.ggml.bos_token_id")
             .and_then(|v| v.as_u32());
+        let eos_token_id = metadata
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(|v| v.as_u32());
 
         let add_bos = metadata
             .get("tokenizer.ggml.add_bos_token")
@@ -305,6 +310,7 @@ impl Tokenizer {
             inner,
             chat_template,
             bos_token_id,
+            eos_token_id,
             add_bos,
         })
     }
@@ -351,6 +357,10 @@ impl Tokenizer {
         self.inner
             .decode(ids, true)
             .map_err(|e| TokenizerError::Decode(e.to_string()))
+    }
+
+    pub fn eos_token_id(&self) -> Option<u32> {
+        self.eos_token_id
     }
 
     pub fn vocab_size(&self) -> usize {
