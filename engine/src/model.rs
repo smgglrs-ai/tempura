@@ -1114,11 +1114,12 @@ where
                     }
                 }
 
-                // Conv1d on concatenated QKV (qwen35.cpp lines 459-507)
+                // Conv1d on concatenated QKV with state (PrismML conv state management)
                 let n_k_heads = key_dim / dn_head_dim;
                 let conv_dim = 2 * key_dim + dn_dim;
                 if let Some(conv_w) = qweights.get_f32(&format!("{prefix}.ssm.conv1d.weight")) {
                     let kernel_size = conv_w.len() / conv_dim;
+                    let history = kernel_size - 1;
                     let conv_bias = qweights.get_f32(&format!("{prefix}.ssm.conv1d.bias"));
                     let mut conv_input = vec![0.0f32; seq_len * conv_dim];
                     for t in 0..seq_len {
@@ -1126,20 +1127,28 @@ where
                         conv_input[t*conv_dim+key_dim..t*conv_dim+2*key_dim].copy_from_slice(&k_dn[t*dn_dim..t*dn_dim+key_dim]);
                         conv_input[t*conv_dim+2*key_dim..t*conv_dim+conv_dim].copy_from_slice(&v_dn[t*dn_dim..(t+1)*dn_dim]);
                     }
+                    let dn_state = session.deltanet_state.as_ref().unwrap();
+                    let cs = dn_state.conv_state(deltanet_layer_idx);
+                    let has_cs = cs.len() == history * conv_dim;
                     let mut conv_out = vec![0.0f32; seq_len * conv_dim];
                     for ch in 0..conv_dim {
                         for t in 0..seq_len {
                             let mut s = 0.0f32;
                             for ki in 0..kernel_size {
                                 let src_t = t as isize - (kernel_size as isize - 1 - ki as isize);
-                                if src_t >= 0 && (src_t as usize) < seq_len {
+                                if src_t >= 0 {
                                     s += conv_input[src_t as usize * conv_dim + ch] * conv_w[ch * kernel_size + ki];
+                                } else if has_cs {
+                                    let hist_t = (history as isize + src_t) as usize;
+                                    s += cs[hist_t * conv_dim + ch] * conv_w[ch * kernel_size + ki];
                                 }
                             }
                             if let Some(bias) = conv_bias { if ch < bias.len() { s += bias[ch]; } }
                             conv_out[t * conv_dim + ch] = s;
                         }
                     }
+                    let dn_state = session.deltanet_state.as_mut().unwrap();
+                    dn_state.update_conv_state(deltanet_layer_idx, conv_dim, kernel_size, &conv_input, seq_len);
                     // SiLU on entire conv output
                     for x in conv_out.iter_mut() { *x = *x / (1.0 + (-*x).exp()); }
                     // Split Q(key_dim), K(key_dim), V(dn_dim) and GQA-repeat Q/K to dn_dim
@@ -3169,16 +3178,40 @@ where
 
                         if let Some(conv_w) = qweights.get_f32(&dn.conv_w) {
                             let kernel_size = conv_w.len() / dg.conv_dim;
+                            let history = kernel_size - 1;
                             let conv_bias = qweights.get_f32(&dn.conv_b);
                             let cv = fsm!(cvp, dg.conv_dim);
                             cv[..dg.key_dim].copy_from_slice(&q_s[..dg.key_dim]);
                             cv[dg.key_dim..2*dg.key_dim].copy_from_slice(&k_s[..dg.key_dim]);
                             cv[2*dg.key_dim..dg.conv_dim].copy_from_slice(&v_s[..dn_dim]);
+                            let sess_r = unsafe { &*(sp as *const InferenceSession) };
+                            let cs = sess_r.deltanet_state.as_ref().unwrap().conv_state(dn_idx);
+                            let has_cs = cs.len() == history * dg.conv_dim;
                             for ch in 0..dg.conv_dim {
-                                let mut s = cv[ch] * conv_w[ch * kernel_size + kernel_size - 1];
+                                let mut s = 0.0f32;
+                                for ki in 0..kernel_size {
+                                    let src_t = 0isize - (kernel_size as isize - 1 - ki as isize);
+                                    if src_t == 0 {
+                                        s += cv[ch] * conv_w[ch * kernel_size + ki];
+                                    } else if has_cs {
+                                        let hist_t = (history as isize + src_t) as usize;
+                                        s += cs[hist_t * dg.conv_dim + ch] * conv_w[ch * kernel_size + ki];
+                                    }
+                                }
                                 if let Some(bias) = conv_bias { if ch < bias.len() { s += bias[ch]; } }
                                 cv[ch] = s / (1.0 + (-s).exp());
                             }
+                            {
+                                let sess_m = unsafe { &mut *(sp as *mut InferenceSession) };
+                                let dn_st = sess_m.deltanet_state.as_mut().unwrap();
+                                let current = fsm!(cvp, dg.conv_dim);
+                                let mut token_data = vec![0.0f32; dg.conv_dim];
+                                token_data[..dg.key_dim].copy_from_slice(&q_s[..dg.key_dim]);
+                                token_data[dg.key_dim..2*dg.key_dim].copy_from_slice(&k_s[..dg.key_dim]);
+                                token_data[2*dg.key_dim..dg.conv_dim].copy_from_slice(&v_s[..dn_dim]);
+                                dn_st.update_conv_state(dn_idx, dg.conv_dim, kernel_size, &token_data, 1);
+                            }
+                            let cv = fsm!(cvp, dg.conv_dim);
                             for vh in 0..dn_heads {
                                 let kh = vh * dg.n_k_heads / dn_heads;
                                 q_s[vh*dn_head_dim..(vh+1)*dn_head_dim].copy_from_slice(&cv[kh*dn_head_dim..kh*dn_head_dim+dn_head_dim]);
