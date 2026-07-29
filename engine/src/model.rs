@@ -1069,9 +1069,12 @@ where
                     let qkv_cols = 2 * key_dim + dn_dim;
                     let mut qkv_buf = vec![0.0f32; seq_len * qkv_cols];
                     qmm(None, &normed, &qkv_name, &mut qkv_buf, seq_len, qkv_cols, h);
-                    if layer == 0 {
-                    }
                     qmm(None, &normed, &gate_name, &mut z_gate, seq_len, dn_dim, h);
+                    if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && seq_len == 1 && layer == 0 {
+                        let qn: f32 = qkv_buf.iter().map(|x|x*x).sum::<f32>().sqrt();
+                        let zn: f32 = z_gate[..dn_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                        eprintln!("[FQ-L0-B2] qkv_norm={qn:.6} gate_norm={zn:.6} qkv[0..4]={:?}", &qkv_buf[..4]);
+                    }
                     // Store raw QKV in q_dn/k_dn/v_dn temporarily at key_dim width (no repeat yet)
                     for t in 0..seq_len {
                         let src = &qkv_buf[t * qkv_cols..];
@@ -2838,7 +2841,7 @@ where
             .collect();
 
         let rmsnorm = tempura_kernels::rmsnorm::CpuRMSNorm;
-        let rope = tempura_kernels::rope::CpuRoPEGgml;
+        let rope = tempura_kernels::rope::CpuRoPE;
 
         let mut hidden = vec![0.0f32; h];
 
@@ -3125,6 +3128,11 @@ where
 
                     // B2.5: serial DeltaNet work (T0): split QKV, conv1d, recurrence, norm, z_gate, LUT prep
                     if ith == 0 {
+                        if layer == 0 && _token_step == 0 {
+                            let qn: f32 = fsm!(qp, dg.qkv_cols).iter().map(|x|x*x).sum::<f32>().sqrt();
+                            let zn: f32 = fsm!(zgp, dn_dim).iter().map(|x|x*x).sum::<f32>().sqrt();
+                            eprintln!("[GBD-L0-B2] qkv_norm={qn:.6} gate_norm={zn:.6} qkv[0..4]={:?}", &fsm!(qp, dg.qkv_cols)[..4]);
+                        }
                         let q_s = fsm!(kp, dn_dim);
                         let k_s = fsm!(vp, dn_dim);
                         let v_s = fsm!(ap, dn_dim);
