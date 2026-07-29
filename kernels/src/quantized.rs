@@ -1329,6 +1329,62 @@ pub fn repack_q2_to_i2s_layout(q2_data: &[u8], n_rows: usize, k: usize) -> (Vec<
     (i2s_data, scales)
 }
 
+pub const Q8_0_BLOCK_SIZE: usize = 32;
+pub const Q8_0_BLOCK_BYTES: usize = 2 + Q8_0_BLOCK_SIZE; // f16 scale + 32 i8 quants
+
+pub fn quantize_row_q8_0(x: &[f32], out: &mut [u8]) {
+    let nb = x.len() / Q8_0_BLOCK_SIZE;
+    debug_assert!(out.len() >= nb * Q8_0_BLOCK_BYTES);
+    for i in 0..nb {
+        let src = &x[i * Q8_0_BLOCK_SIZE..(i + 1) * Q8_0_BLOCK_SIZE];
+        let mut amax = 0.0f32;
+        for &v in src { let a = v.abs(); if a > amax { amax = a; } }
+        let d = amax / 127.0;
+        let d_f16 = half::f16::from_f32(d);
+        let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+        let off = i * Q8_0_BLOCK_BYTES;
+        out[off..off + 2].copy_from_slice(&d_f16.to_le_bytes());
+        for j in 0..Q8_0_BLOCK_SIZE {
+            out[off + 2 + j] = (src[j] * id).round().clamp(-128.0, 127.0) as i8 as u8;
+        }
+    }
+}
+
+pub fn q2_0_dot_q8_preq(w_packed: &[u8], q8_act: &[u8], k: usize) -> f32 {
+    let nb = k / Q2_0_BLOCK_SIZE;
+    let mut sumf = 0.0f32;
+    for i in 0..nb {
+        let block = &w_packed[i * Q2_0_BLOCK_BYTES..];
+        let d0 = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qs = &block[2..Q2_0_BLOCK_BYTES];
+        let mut sumi = 0.0f32;
+        for sub in 0..4 {
+            let q8_off = (i * 4 + sub) * Q8_0_BLOCK_BYTES;
+            let d1 = f16_to_f32(u16::from_le_bytes([q8_act[q8_off], q8_act[q8_off + 1]]));
+            let qy = &q8_act[q8_off + 2..q8_off + Q8_0_BLOCK_BYTES];
+            let mut sumi_block: i32 = 0;
+            for b in 0..8 {
+                let byte = qs[sub * 8 + b];
+                sumi_block += (((byte >> 0) & 3) as i32 - 1) * qy[b * 4 + 0] as i8 as i32;
+                sumi_block += (((byte >> 2) & 3) as i32 - 1) * qy[b * 4 + 1] as i8 as i32;
+                sumi_block += (((byte >> 4) & 3) as i32 - 1) * qy[b * 4 + 2] as i8 as i32;
+                sumi_block += (((byte >> 6) & 3) as i32 - 1) * qy[b * 4 + 3] as i8 as i32;
+            }
+            sumi += d1 * sumi_block as f32;
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+pub fn q2_0_gemv_q8(packed_w: &[u8], q8_act: &[u8], output: &mut [f32], n: usize, k: usize) {
+    let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    for j in 0..n {
+        let w = &packed_w[j * row_bytes..(j + 1) * row_bytes];
+        output[j] = q2_0_dot_q8_preq(w, q8_act, k);
+    }
+}
+
 /// Q2_0 × q8_0 dot product matching ggml's vec_dot_q2_0_q8_0.
 /// Activations are quantized per 32-element block (q8_0 format) for precision.
 fn q2_0_dot_q8(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {

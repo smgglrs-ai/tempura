@@ -843,16 +843,14 @@ where
                 q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k)
                     .unwrap();
             } else if let Some((tiled, _tn, _tk)) = qweights.get_q2_tiled(name) {
-                if m == 1 {
-                    let lut = tempura_kernels::quantized::Q2Lut::preprocess(a_f32, k);
-                    tempura_kernels::quantized::q2_lut_gemv_fast(tiled, &lut, out, n, k);
-                    return;
-                }
                 if let Some(_w) = qweights.get_q2(name) {
                     for row in 0..m {
-                        tempura_kernels::quantized::q2_0_gemv(
-                            _w, &a_f32[row * k..(row + 1) * k],
-                            &mut out[row * n..(row + 1) * n], n, k,
+                        let act = &a_f32[row * k..(row + 1) * k];
+                        let nb = k / tempura_kernels::quantized::Q8_0_BLOCK_SIZE;
+                        let mut q8_buf = vec![0u8; nb * tempura_kernels::quantized::Q8_0_BLOCK_BYTES];
+                        tempura_kernels::quantized::quantize_row_q8_0(act, &mut q8_buf);
+                        tempura_kernels::quantized::q2_0_gemv_q8(
+                            _w, &q8_buf, &mut out[row * n..(row + 1) * n], n, k,
                         );
                     }
                 }
@@ -887,16 +885,13 @@ where
                     }
                 }
             } else if let Some(_w) = qweights.get_q2(name) {
-                if m == 1 {
-                    if let Some(pq) = preq {
-                        tempura_kernels::quantized::q2_0_gemv_preq(_w, pq, out, n, k);
-                        return;
-                    }
-                }
                 for row in 0..m {
-                    tempura_kernels::quantized::q2_0_gemv(
-                        _w, &a_f32[row * k..(row + 1) * k],
-                        &mut out[row * n..(row + 1) * n], n, k,
+                    let act = &a_f32[row * k..(row + 1) * k];
+                    let nb = k / tempura_kernels::quantized::Q8_0_BLOCK_SIZE;
+                    let mut q8_buf = vec![0u8; nb * tempura_kernels::quantized::Q8_0_BLOCK_BYTES];
+                    tempura_kernels::quantized::quantize_row_q8_0(act, &mut q8_buf);
+                    tempura_kernels::quantized::q2_0_gemv_q8(
+                        _w, &q8_buf, &mut out[row * n..(row + 1) * n], n, k,
                     );
                 }
             } else {
