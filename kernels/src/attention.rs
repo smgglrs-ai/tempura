@@ -409,21 +409,14 @@ pub fn attention_decode_heads(
             scores[kv_s] = dot * scale;
         }
 
-        let mut max_score = f32::NEG_INFINITY;
-        for &s in scores.iter() {
-            if s > max_score { max_score = s; }
-        }
-
-        let mut sum: f64 = 0.0;
+        let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
         for s in scores.iter_mut() {
-            let val = crate::portable_math::ggml_exp(*s - max_score);
-            sum += val as f64;
-            *s = val;
+            *s = crate::portable_math::portable_exp(*s - max_score);
+            sum += *s;
         }
-
-        let inv_sum = (1.0 / sum) as f32;
         for s in scores.iter_mut() {
-            *s *= inv_sum;
+            *s /= sum;
         }
 
         let o_offset = h * head_dim;
