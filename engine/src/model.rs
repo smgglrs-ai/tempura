@@ -193,8 +193,7 @@ where
         if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
             return true;
         }
-        if std::env::var("TEMPURA_NO_PERSISTENT").is_ok() { return false; }
-        qw.has_q2_tiled()
+        false // Disable persistent-thread until precision matches forward_quantized
     }
 
     pub fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
@@ -849,6 +848,9 @@ where
                         let nb = k / tempura_kernels::quantized::Q8_0_BLOCK_SIZE;
                         let mut q8_buf = vec![0u8; nb * tempura_kernels::quantized::Q8_0_BLOCK_BYTES];
                         tempura_kernels::quantized::quantize_row_q8_0(act, &mut q8_buf);
+                        if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && name.contains("layers.3.self_attn.q") {
+                            eprintln!("[FQ-QMM-L3-Q] n={n} k={k} q8[0..8]={:?}", &q8_buf[..8]);
+                        }
                         tempura_kernels::quantized::q2_0_gemv_q8(
                             _w, &q8_buf, &mut out[row * n..(row + 1) * n], n, k,
                         );
@@ -1025,10 +1027,10 @@ where
                 } else {
                     self.pipeline.rmsnorm(&mut normed, input_ln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None).unwrap();
                 }
-                if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && seq_len == 1 && layer == 0 {
+                if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && seq_len == 1 && (layer == 0 || layer == 3) {
                     let nn: f32 = normed[..h].iter().map(|x|x*x).sum::<f32>().sqrt();
                     let hh: f32 = hidden[..h].iter().map(|x|x*x).sum::<f32>().sqrt();
-                    eprintln!("[FQ-L0] hidden_norm={hh:.6} normed_norm={nn:.6} normed[0..4]={:?}", &normed[..4]);
+                    eprintln!("[FQ-L{layer}] hidden_norm={hh:.6} normed_norm={nn:.6} normed[0..4]={:?}", &normed[..4]);
                 }
 
                 let mm = tempura_kernels::matmul::CpuMatMul;
@@ -1232,6 +1234,11 @@ where
                 )
                 .unwrap();
             }
+            if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && seq_len == 1 && layer == 3 {
+                let nn: f32 = normed[..h].iter().map(|x|x*x).sum::<f32>().sqrt();
+                let hh: f32 = hidden[..h].iter().map(|x|x*x).sum::<f32>().sqrt();
+                eprintln!("[FQ-L3-ATN] hidden_norm={hh:.6} normed_norm={nn:.6} normed[0..4]={:?}", &normed[..4]);
+            }
             if det_rmsnorm.is_some() {
                 tempura_kernels::portable_math::q8_snap(&mut normed[..seq_len * h]);
             }
@@ -1416,6 +1423,11 @@ where
             let k_cache = session.cache.k_data(cl_q, kv_len);
             let v_cache = session.cache.v_data(cl_q, kv_len);
 
+            if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && seq_len == 1 && layer == 3 {
+                let qn: f32 = q[..q_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                let kn: f32 = k[..kv_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                eprintln!("[FQ-L3-pre-attn] q_norm={qn:.6} k_norm={kn:.6} q[0..4]={:?} kvl={kv_len}", &q[..4]);
+            }
             attn_out.fill(0.0);
             if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
                 tempura_kernels::attention::CpuAttentionGgml
@@ -3048,10 +3060,10 @@ where
                         let w = qweights.get_f32(iln).unwrap();
                         use tempura_kernels::RMSNorm as _;
                         rmsnorm.forward(fsm!(np,h), w, h, cfg.layer_norm_eps).unwrap();
-                        if layer == 0 && _token_step == 0 {
+                        if (layer == 0 || layer == 3) && _token_step == 0 {
                             let nn: f32 = fs!(np,h).iter().map(|x|x*x).sum::<f32>().sqrt();
                             let hh: f32 = fs!(hp,h).iter().map(|x|x*x).sum::<f32>().sqrt();
-                            eprintln!("[GBD-L0] hidden_norm={hh:.6} normed_norm={nn:.6} normed[0..4]={:?}", &fs!(np,h)[..4]);
+                            eprintln!("[GBD-L{layer}] hidden_norm={hh:.6} normed_norm={nn:.6} normed[0..4]={:?}", &fs!(np,h)[..4]);
                         }
                         let (s, m) = tempura_kernels::quantized::i2s_quantize_into(fs!(np,h), ism!(pp,h));
                         shared_scale.store(s.to_bits(), std::sync::atomic::Ordering::Release);
@@ -3363,25 +3375,26 @@ where
                     }
                     barrier.wait();
 
-                    {
+                    if ith == 0 {
                         let kvl = shared_kvl.load(std::sync::atomic::Ordering::Acquire);
                         let sess = unsafe { &*(sp as *const InferenceSession) };
                         let cl = cache_layer_map[layer].unwrap();
-                        let hs = ith * n_heads / nth;
-                        let he = (ith + 1) * n_heads / nth;
-                        let scores_buf = unsafe { std::slice::from_raw_parts_mut(attn_scores_ptrs[ith] as *mut f32, kvl) };
-                        if sess.cache.use_f16 {
-                            tempura_kernels::attention::attention_decode_heads_f16kv(
-                                fs!(qp,q_dim), sess.cache.k_data_f16(cl,kvl), sess.cache.v_data_f16(cl,kvl),
-                                fsm!(ap,q_dim), scores_buf, kvl, n_heads, n_kv_heads, head_dim,
-                                1.0 / (head_dim as f32).sqrt(), hs, he,
-                            );
-                        } else {
-                            tempura_kernels::attention::attention_decode_heads(
-                                fs!(qp,q_dim), &sess.cache.k_data(cl,kvl), &sess.cache.v_data(cl,kvl),
-                                fsm!(ap,q_dim), scores_buf, kvl, n_heads, n_kv_heads, head_dim,
-                                1.0 / (head_dim as f32).sqrt(), hs, he,
-                            );
+                        if layer == 3 && _token_step == 0 {
+                            let qn: f32 = fs!(qp,actual_q_cols).iter().map(|x|x*x).sum::<f32>().sqrt();
+                            let kn: f32 = fs!(kp,kv_dim).iter().map(|x|x*x).sum::<f32>().sqrt();
+                            let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
+                            eprintln!("[GBD-L3-pre-gate] q_raw_norm={qn:.6} k_norm={kn:.6} q8[0..8]={:?}", &q8[..8]);
+                        }
+                        use tempura_kernels::Attention as _;
+                        tempura_kernels::attention::CpuAttention.forward(
+                            fs!(qp,q_dim), &sess.cache.k_data(cl,kvl), &sess.cache.v_data(cl,kvl),
+                            fsm!(ap,q_dim), 1, 1, kvl,
+                            n_heads, n_kv_heads, head_dim,
+                            1.0 / (head_dim as f32).sqrt(),
+                        ).unwrap();
+                        if layer == 3 && _token_step == 0 {
+                            let an: f32 = fs!(ap,q_dim).iter().map(|x|x*x).sum::<f32>().sqrt();
+                            eprintln!("[GBD-L3-attn-out] norm={an:.6} out[0..4]={:?}", &fs!(ap,q_dim)[..4]);
                         }
                     }
                     barrier.wait();
