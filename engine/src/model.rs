@@ -2904,6 +2904,10 @@ where
 
         let max_k = h.max(inter).max(q_dim).max(dn_dim);
         let mut preq_buf = vec![0i8; max_k];
+        let q8_nb = max_k / tempura_kernels::quantized::Q8_0_BLOCK_SIZE;
+        let mut q8_act_buf = vec![0u8; q8_nb * tempura_kernels::quantized::Q8_0_BLOCK_BYTES];
+        let q8p = q8_act_buf.as_mut_ptr() as usize;
+        let q8_act_len = q8_act_buf.len();
         let mut normed = vec![0.0f32; h];
         let mut q = vec![0.0f32; actual_q_cols.max(qkv_cols_max)];
         let mut q_gate_buf = vec![0.0f32; if has_q_gate { q_dim } else { 0 }];
@@ -3034,7 +3038,8 @@ where
                     if ith == 0 {
                         fsm!(np,h).copy_from_slice(fs!(hp,h));
                         let w = qweights.get_f32(iln).unwrap();
-                        fused_rmsnorm_q8snap(fsm!(np,h), w, h, cfg.layer_norm_eps);
+                        use tempura_kernels::RMSNorm as _;
+                        rmsnorm.forward(fsm!(np,h), w, h, cfg.layer_norm_eps).unwrap();
                         let (s, m) = tempura_kernels::quantized::i2s_quantize_into(fs!(np,h), ism!(pp,h));
                         shared_scale.store(s.to_bits(), std::sync::atomic::Ordering::Release);
                         shared_sum.store(m, std::sync::atomic::Ordering::Release);
@@ -3051,6 +3056,11 @@ where
                         } else {
                             shared_q2lut_ok.store(false, std::sync::atomic::Ordering::Release);
                         }
+                        {
+                            let q8 = unsafe { std::slice::from_raw_parts_mut(q8p as *mut u8, q8_act_len) };
+                            let h_nb = h / tempura_kernels::quantized::Q8_0_BLOCK_SIZE;
+                            tempura_kernels::quantized::quantize_row_q8_0(fs!(np,h), &mut q8[..h_nb * tempura_kernels::quantized::Q8_0_BLOCK_BYTES]);
+                        }
                         tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
                         tile_counter2.store(0, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -3066,70 +3076,38 @@ where
                     let dn = dn_names[layer].as_ref().unwrap();
                     let dg = dn_geom[layer].as_ref().unwrap();
 
-                    // B2: QKV+gate GEMV (Q2 LUT / TL2 work-stealing) + alpha/beta (T0)
+                    // B2: QKV+gate+alpha+beta GEMV (Q8_0-based, row-partitioned)
                     {
-                        let q2lut_ok = shared_q2lut_ok.load(std::sync::atomic::Ordering::Acquire);
-                        let lut_ok = shared_lut_ok.load(std::sync::atomic::Ordering::Acquire);
-                        let mut used = false;
-                        if q2lut_ok && q2lut_h_ptr != 0 {
-                            let q2l = unsafe { &*(q2lut_h_ptr as *const tempura_kernels::quantized::Q2Lut) };
-                            if let (Some((qt,_,_)), Some((gt,_,_))) = (qweights.get_q2_tiled(&dn.qkv_proj), qweights.get_q2_tiled(&dn.gate_proj)) {
-                                let qkv_tiles = (dg.qkv_cols + q2_bm - 1) / q2_bm;
-                                let g_tiles = (dn_dim + q2_bm - 1) / q2_bm;
-                                let total = qkv_tiles + g_tiles;
-                                loop {
-                                    let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if t >= total { break; }
-                                    unsafe {
-                                        if t < qkv_tiles {
-                                            tempura_kernels::quantized::q2_lut_gemv_tiled(qt, q2l, fsm!(qp, dg.qkv_cols), dg.qkv_cols, h, t, t + 1);
-                                        } else {
-                                            tempura_kernels::quantized::q2_lut_gemv_tiled(gt, q2l, fsm!(zgp, dn_dim), dn_dim, h, t - qkv_tiles, t - qkv_tiles + 1);
-                                        }
-                                    }
-                                }
-                                used = true;
-                            }
-                        }
-                        if !used && lut_ok && lut_h_ptr != 0 {
-                            let lut = unsafe { &*(lut_h_ptr as *const Tl2Lut) };
-                            if let (Some(qt), Some(gt)) = (qweights.get_tl2(&dn.qkv_proj), qweights.get_tl2(&dn.gate_proj)) {
-                                let qkv_tiles = qt.m / Tl2Config::for_dims(qt.m, h).map(|c| c.bm).unwrap_or(qt.m);
-                                let g_tiles = gt.m / Tl2Config::for_dims(gt.m, h).map(|c| c.bm).unwrap_or(gt.m);
-                                let total = qkv_tiles + g_tiles;
-                                loop {
-                                    let t = tile_counter2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if t >= total { break; }
-                                    if t < qkv_tiles {
-                                        tl2_gemv_tiles(lut, &qt.data, qt.scale, qp, qt.m, h, t, t + 1);
-                                    } else {
-                                        tl2_gemv_tiles(lut, &gt.data, gt.scale, zgp, gt.m, h, t - qkv_tiles, t - qkv_tiles + 1);
-                                    }
-                                }
-                                used = true;
-                            }
-                        }
-                        if !used {
-                            if ith == 0 {
+                        let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
+                        let total_rows = dg.qkv_cols + dn_dim + 2 * dn_heads;
+                        let row_bytes = (h / tempura_kernels::quantized::Q2_0_BLOCK_SIZE) * tempura_kernels::quantized::Q2_0_BLOCK_BYTES;
+                        let h_q8_bytes = (h / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
+                        let rs = ith * total_rows / nth;
+                        let re = (ith + 1) * total_rows / nth;
+                        for r in rs..re {
+                            if r < dg.qkv_cols {
                                 if let Some(w) = qweights.get_q2(&dn.qkv_proj) {
-                                    tempura_kernels::quantized::q2_0_gemv(w, fs!(np, h), fsm!(qp, dg.qkv_cols), dg.qkv_cols, h);
+                                    let wr = &w[r * row_bytes..(r + 1) * row_bytes];
+                                    fsm!(qp, dg.qkv_cols)[r] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
                                 }
+                            } else if r < dg.qkv_cols + dn_dim {
+                                let gr = r - dg.qkv_cols;
                                 if let Some(w) = qweights.get_q2(&dn.gate_proj) {
-                                    tempura_kernels::quantized::q2_0_gemv(w, fs!(np, h), fsm!(zgp, dn_dim), dn_dim, h);
+                                    let wr = &w[gr * row_bytes..(gr + 1) * row_bytes];
+                                    fsm!(zgp, dn_dim)[gr] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
                                 }
-                            }
-                        }
-                        if ith == 0 {
-                            let ps = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
-                            let pm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
-                            if let Some(w) = qweights.get_q2(&dn.alpha) {
-                                let preq_q8 = is!(pp, h);
-                                let mut ab = fsm!(abp, dn_heads);
-                                tempura_kernels::quantized::q2_0_gemv(w, fs!(np, h), &mut ab, dn_heads, h);
-                            }
-                            if let Some(w) = qweights.get_q2(&dn.beta) {
-                                let mut bb = fsm!(bbp, dn_heads);
-                                tempura_kernels::quantized::q2_0_gemv(w, fs!(np, h), &mut bb, dn_heads, h);
+                            } else if r < dg.qkv_cols + dn_dim + dn_heads {
+                                let ar = r - dg.qkv_cols - dn_dim;
+                                if let Some(w) = qweights.get_q2(&dn.alpha) {
+                                    let wr = &w[ar * row_bytes..(ar + 1) * row_bytes];
+                                    fsm!(abp, dn_heads)[ar] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
+                                }
+                            } else {
+                                let br = r - dg.qkv_cols - dn_dim - dn_heads;
+                                if let Some(w) = qweights.get_q2(&dn.beta) {
+                                    let wr = &w[br * row_bytes..(br + 1) * row_bytes];
+                                    fsm!(bbp, dn_heads)[br] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
+                                }
                             }
                         }
                     }
@@ -3247,67 +3225,27 @@ where
                             dn_out[i] *= zs;
                         }
 
-                        if q2lut_dn_ptr != 0 {
-                            let q2l = unsafe { &mut *(q2lut_dn_ptr as *mut tempura_kernels::quantized::Q2Lut) };
-                            q2l.preprocess_into(dn_out);
-                            shared_q2lut_ok.store(true, std::sync::atomic::Ordering::Release);
-                        } else {
-                            shared_q2lut_ok.store(false, std::sync::atomic::Ordering::Release);
-                        }
-                        if lut_dn_ptr != 0 {
-                            let lut = unsafe { &mut *(lut_dn_ptr as *mut Tl2Lut) };
-                            shared_lut_ok.store(tl2_preprocess_into(dn_out, dn_dim, lut), std::sync::atomic::Ordering::Release);
-                        } else {
-                            shared_lut_ok.store(false, std::sync::atomic::Ordering::Release);
+                        {
+                            let q8 = unsafe { std::slice::from_raw_parts_mut(q8p as *mut u8, q8_act_len) };
+                            let dn_nb = dn_dim / tempura_kernels::quantized::Q8_0_BLOCK_SIZE;
+                            tempura_kernels::quantized::quantize_row_q8_0(dn_out, &mut q8[..dn_nb * tempura_kernels::quantized::Q8_0_BLOCK_BYTES]);
                         }
                         tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
-                        tile_counter2.store(0, std::sync::atomic::Ordering::Relaxed);
                         dn_idx += 1;
                     }
                     barrier.wait();
 
-                    // B3: O-proj GEMV (dn_dim → h)
+                    // B3: O-proj GEMV (dn_dim → h, Q8_0-based row-partitioned)
                     {
-                        let q2lut_ok = shared_q2lut_ok.load(std::sync::atomic::Ordering::Acquire);
-                        let mut used = false;
-                        if q2lut_ok && q2lut_dn_ptr != 0 {
-                            let q2l = unsafe { &*(q2lut_dn_ptr as *const tempura_kernels::quantized::Q2Lut) };
-                            if let Some((ot,_,_)) = qweights.get_q2_tiled(&dn.out_proj) {
-                                let o_tiles = (h + q2_bm - 1) / q2_bm;
-                                loop {
-                                    let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if t >= o_tiles { break; }
-                                    unsafe { tempura_kernels::quantized::q2_lut_gemv_tiled(ot, q2l, fsm!(op, h), h, dn_dim, t, t + 1); }
-                                }
-                                used = true;
-                            }
-                        }
-                        if !used {
-                            let lut_ok = shared_lut_ok.load(std::sync::atomic::Ordering::Acquire);
-                            if lut_ok && lut_dn_ptr != 0 {
-                                let lut = unsafe { &*(lut_dn_ptr as *const Tl2Lut) };
-                                if let Some(ot) = qweights.get_tl2(&dn.out_proj) {
-                                    let o_tiles = ot.m / Tl2Config::for_dims(ot.m, dn_dim).map(|c| c.bm).unwrap_or(ot.m);
-                                    loop {
-                                        let t = tile_counter2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        if t >= o_tiles { break; }
-                                        tl2_gemv_tiles(lut, &ot.data, ot.scale, op, ot.m, dn_dim, t, t + 1);
-                                    }
-                                    used = true;
-                                }
-                            }
-                        }
-                        if !used {
-                            if let Some(ow) = qweights.get_i2s(&dn.out_proj) {
-                                let ps = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
-                                let pm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
-                                let (s,e) = ((ith*h)/nth, ((ith+1)*h)/nth);
-                                i2s_gemv_cols(is!(pp,dn_dim), ps, pm, ow, i2s_weight_scale(ow,h,dn_dim), op, s, e, dn_dim);
-                            } else if ith == 0 {
-                                if let Some(w) = qweights.get_q2(&dn.out_proj) {
-                                    let dn_out_s = fs!(gp, dn_dim);
-                                    tempura_kernels::quantized::q2_0_gemv(w, dn_out_s, fsm!(op, h), h, dn_dim);
-                                }
+                        let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
+                        let row_bytes = (dn_dim / tempura_kernels::quantized::Q2_0_BLOCK_SIZE) * tempura_kernels::quantized::Q2_0_BLOCK_BYTES;
+                        let dn_q8_bytes = (dn_dim / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
+                        if let Some(w) = qweights.get_q2(&dn.out_proj) {
+                            let rs = ith * h / nth;
+                            let re = (ith + 1) * h / nth;
+                            for r in rs..re {
+                                let wr = &w[r * row_bytes..(r + 1) * row_bytes];
+                                fsm!(op, h)[r] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..dn_q8_bytes], dn_dim);
                             }
                         }
                     }
@@ -3322,75 +3260,36 @@ where
                     barrier.wait();
 
                     } else {
-                    // ── Attention block (existing code) ──
-                    if ith == 0 && _token_step == 0 {
-                        eprintln!("[ATN-L{layer}] entering attention path, q2_tiled(qn)={}", qweights.get_q2_tiled(qn).is_some());
-                    }
-
-                    let ps = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
-                    let pm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
-                    let lut_ok = shared_lut_ok.load(std::sync::atomic::Ordering::Acquire);
-                    let q2lut_ok = shared_q2lut_ok.load(std::sync::atomic::Ordering::Acquire);
-                    let mut used_lut = false;
-                    if q2lut_ok && q2lut_h_ptr != 0 {
-                        let q2l = unsafe { &*(q2lut_h_ptr as *const tempura_kernels::quantized::Q2Lut) };
-                        if let (Some((qt,_,_)), Some((kt,_,_)), Some((vt,_,_))) =
-                            (qweights.get_q2_tiled(qn), qweights.get_q2_tiled(kn), qweights.get_q2_tiled(vn))
-                        {
-                            let q_out_cols = actual_q_cols;
-                            let q_tiles = (q_out_cols + q2_bm - 1) / q2_bm;
-                            let kv_tiles = (kv_dim + q2_bm - 1) / q2_bm;
-                            let total = q_tiles + 2 * kv_tiles;
-                            loop {
-                                let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if t >= total { break; }
-                                unsafe {
-                                    if t < q_tiles {
-                                        tempura_kernels::quantized::q2_lut_gemv_tiled(qt, q2l, fsm!(qp,q_out_cols), q_out_cols, h, t, t + 1);
-                                    } else if t < q_tiles + kv_tiles {
-                                        let kt_idx = t - q_tiles;
-                                        tempura_kernels::quantized::q2_lut_gemv_tiled(kt, q2l, fsm!(kp,kv_dim), kv_dim, h, kt_idx, kt_idx + 1);
-                                    } else {
-                                        let vt_idx = t - q_tiles - kv_tiles;
-                                        tempura_kernels::quantized::q2_lut_gemv_tiled(vt, q2l, fsm!(vp,kv_dim), kv_dim, h, vt_idx, vt_idx + 1);
-                                    }
+                    // ── Attention block: Q8_0-based QKV GEMV ──
+                    {
+                        let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
+                        let row_bytes = (h / tempura_kernels::quantized::Q2_0_BLOCK_SIZE) * tempura_kernels::quantized::Q2_0_BLOCK_BYTES;
+                        let h_q8_bytes = (h / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
+                        let total_rows = actual_q_cols + 2 * kv_dim;
+                        let rs = ith * total_rows / nth;
+                        let re = (ith + 1) * total_rows / nth;
+                        for r in rs..re {
+                            if r < actual_q_cols {
+                                if let Some(w) = qweights.get_q2(qn) {
+                                    let wr = &w[r * row_bytes..(r + 1) * row_bytes];
+                                    fsm!(qp, actual_q_cols)[r] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
+                                }
+                            } else if r < actual_q_cols + kv_dim {
+                                let kr = r - actual_q_cols;
+                                if let Some(w) = qweights.get_q2(kn) {
+                                    let wr = &w[kr * row_bytes..(kr + 1) * row_bytes];
+                                    fsm!(kp, kv_dim)[kr] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
+                                }
+                            } else {
+                                let vr = r - actual_q_cols - kv_dim;
+                                if let Some(w) = qweights.get_q2(vn) {
+                                    let wr = &w[vr * row_bytes..(vr + 1) * row_bytes];
+                                    fsm!(vp, kv_dim)[vr] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
                                 }
                             }
-                            used_lut = true;
                         }
                     }
-                    if !used_lut && lut_ok && lut_h_ptr != 0 {
-                        let lut = unsafe { &*(lut_h_ptr as *const Tl2Lut) };
-                        if let (Some(qt), Some(kt), Some(vt)) = (qweights.get_tl2(qn), qweights.get_tl2(kn), qweights.get_tl2(vn)) {
-                            let q_out_cols = actual_q_cols;
-                            let q_tiles = q_out_cols / Tl2Config::for_dims(q_out_cols, h).map(|c| c.bm).unwrap_or(q_out_cols);
-                            let kv_tiles = kv_dim / Tl2Config::for_dims(kv_dim, h).map(|c| c.bm).unwrap_or(kv_dim);
-                            let total = q_tiles + 2 * kv_tiles;
-                            loop {
-                                let t = tile_counter2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if t >= total { break; }
-                                if t < q_tiles {
-                                    tl2_gemv_tiles(lut, &qt.data, qt.scale, qp, q_out_cols, h, t, t + 1);
-                                } else if t < q_tiles + kv_tiles {
-                                    let kt_idx = t - q_tiles;
-                                    tl2_gemv_tiles(lut, &kt.data, kt.scale, kp, kv_dim, h, kt_idx, kt_idx + 1);
-                                } else {
-                                    let vt_idx = t - q_tiles - kv_tiles;
-                                    tl2_gemv_tiles(lut, &vt.data, vt.scale, vp, kv_dim, h, vt_idx, vt_idx + 1);
-                                }
-                            }
-                            used_lut = true;
-                        }
-                    }
-                    if !used_lut {
-                        if let (Some(qw),Some(kw),Some(vw)) = (qweights.get_i2s(qn),qweights.get_i2s(kn),qweights.get_i2s(vn)) {
-                            let (qs,qe) = ((ith*q_dim)/nth, ((ith+1)*q_dim)/nth);
-                            let (ks,ke) = ((ith*kv_dim)/nth, ((ith+1)*kv_dim)/nth);
-                            i2s_gemv_cols(is!(pp,h), ps, pm, qw, i2s_weight_scale(qw,q_dim,h), qp, qs, qe, h);
-                            i2s_gemv_cols(is!(pp,h), ps, pm, kw, i2s_weight_scale(kw,kv_dim,h), kp, ks, ke, h);
-                            i2s_gemv_cols(is!(pp,h), ps, pm, vw, i2s_weight_scale(vw,kv_dim,h), vp, ks, ke, h);
-                        }
-                    }
+                    // (TL2/I2S QKV paths removed — Q8_0-based GEMV above handles all Q2_0 weights)
                     barrier.wait();
 
                     if ith == 0 {
@@ -3485,57 +3384,26 @@ where
                         let (s2, m2) = tempura_kernels::quantized::i2s_quantize_into(fs!(ap,q_dim), ism!(pp,q_dim));
                         shared_scale.store(s2.to_bits(), std::sync::atomic::Ordering::Release);
                         shared_sum.store(m2, std::sync::atomic::Ordering::Release);
-                        if lut_qdim_ptr != 0 {
-                            let lut = unsafe { &mut *(lut_qdim_ptr as *mut Tl2Lut) };
-                            shared_lut_ok.store(tl2_preprocess_into(fs!(ap,q_dim), q_dim, lut), std::sync::atomic::Ordering::Release);
-                        }
-                        if q2lut_qdim_ptr != 0 {
-                            let q2l = unsafe { &mut *(q2lut_qdim_ptr as *mut tempura_kernels::quantized::Q2Lut) };
-                            q2l.preprocess_into(fs!(ap,q_dim));
-                            shared_q2lut_ok.store(true, std::sync::atomic::Ordering::Release);
-                        } else {
-                            shared_q2lut_ok.store(false, std::sync::atomic::Ordering::Release);
+                        {
+                            let q8 = unsafe { std::slice::from_raw_parts_mut(q8p as *mut u8, q8_act_len) };
+                            let qd_nb = q_dim / tempura_kernels::quantized::Q8_0_BLOCK_SIZE;
+                            tempura_kernels::quantized::quantize_row_q8_0(fs!(ap,q_dim), &mut q8[..qd_nb * tempura_kernels::quantized::Q8_0_BLOCK_BYTES]);
                         }
                         tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
-                        tile_counter2.store(0, std::sync::atomic::Ordering::Relaxed);
                     }
                     barrier.wait();
 
-                    let mut used_lut = false;
-                    let q2lut_ok = shared_q2lut_ok.load(std::sync::atomic::Ordering::Acquire);
-                    if q2lut_ok && q2lut_qdim_ptr != 0 {
-                        let q2l = unsafe { &*(q2lut_qdim_ptr as *const tempura_kernels::quantized::Q2Lut) };
-                        if let Some((ot,_,_)) = qweights.get_q2_tiled(on) {
-                            let o_tiles = (h + q2_bm - 1) / q2_bm;
-                            loop {
-                                let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if t >= o_tiles { break; }
-                                unsafe { tempura_kernels::quantized::q2_lut_gemv_tiled(ot, q2l, fsm!(op,h), h, q_dim, t, t + 1); }
+                    {
+                        let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
+                        let row_bytes = (q_dim / tempura_kernels::quantized::Q2_0_BLOCK_SIZE) * tempura_kernels::quantized::Q2_0_BLOCK_BYTES;
+                        let qd_q8_bytes = (q_dim / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
+                        if let Some(w) = qweights.get_q2(on) {
+                            let rs = ith * h / nth;
+                            let re = (ith + 1) * h / nth;
+                            for r in rs..re {
+                                let wr = &w[r * row_bytes..(r + 1) * row_bytes];
+                                fsm!(op, h)[r] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..qd_q8_bytes], q_dim);
                             }
-                            used_lut = true;
-                        }
-                    }
-                    if !used_lut {
-                        let lut_ok = shared_lut_ok.load(std::sync::atomic::Ordering::Acquire);
-                        if lut_ok && lut_qdim_ptr != 0 {
-                            let lut = unsafe { &*(lut_qdim_ptr as *const Tl2Lut) };
-                            if let Some(ot) = qweights.get_tl2(on) {
-                                let o_tiles = h / tempura_kernels::tl2::Tl2Config::for_dims(h, q_dim).map(|c| c.bm).unwrap_or(h);
-                                loop {
-                                    let t = tile_counter2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if t >= o_tiles { break; }
-                                    tl2_gemv_tiles(lut, &ot.data, ot.scale, op, h, q_dim, t, t + 1);
-                                }
-                                used_lut = true;
-                            }
-                        }
-                    }
-                    if !used_lut {
-                        if let Some(ow) = qweights.get_i2s(on) {
-                            let as2 = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
-                            let am2 = shared_sum.load(std::sync::atomic::Ordering::Acquire);
-                            let (s,e) = ((ith*h)/nth, ((ith+1)*h)/nth);
-                            i2s_gemv_cols(is!(pp,q_dim), as2, am2, ow, i2s_weight_scale(ow,h,q_dim), op, s, e, q_dim);
                         }
                     }
                     barrier.wait();
@@ -3550,78 +3418,40 @@ where
 
                     // ── Shared FFN block ──
                     if ith == 0 {
-                        fused_residual_rmsnorm_q8snap(fsm!(hp,h), fs!(op,h), fsm!(n2p,h), qweights.get_f32(pln).unwrap(), h, cfg.layer_norm_eps);
-                        let (ns, nm) = tempura_kernels::quantized::i2s_quantize_into(fs!(n2p,h), ism!(pp,h));
-                        shared_scale.store(ns.to_bits(), std::sync::atomic::Ordering::Release);
-                        shared_sum.store(nm, std::sync::atomic::Ordering::Release);
-                        if lut_h_ptr != 0 {
-                            let lut = unsafe { &mut *(lut_h_ptr as *mut Tl2Lut) };
-                            shared_lut_ok.store(tl2_preprocess_into(fs!(n2p,h), h, lut), std::sync::atomic::Ordering::Release);
+                        let hid = fsm!(hp,h);
+                        let res = fs!(op,h);
+                        let nrm = fsm!(n2p,h);
+                        for i in 0..h { hid[i] += res[i]; nrm[i] = hid[i]; }
+                        rmsnorm.forward(nrm, qweights.get_f32(pln).unwrap(), h, cfg.layer_norm_eps).unwrap();
+                        {
+                            let q8 = unsafe { std::slice::from_raw_parts_mut(q8p as *mut u8, q8_act_len) };
+                            let h_nb = h / tempura_kernels::quantized::Q8_0_BLOCK_SIZE;
+                            tempura_kernels::quantized::quantize_row_q8_0(fs!(n2p,h), &mut q8[..h_nb * tempura_kernels::quantized::Q8_0_BLOCK_BYTES]);
                         }
-                        if q2lut_h_ptr != 0 {
-                            let q2l = unsafe { &mut *(q2lut_h_ptr as *mut tempura_kernels::quantized::Q2Lut) };
-                            q2l.preprocess_into(fs!(n2p,h));
-                            shared_q2lut_ok.store(true, std::sync::atomic::Ordering::Release);
-                        } else {
-                            shared_q2lut_ok.store(false, std::sync::atomic::Ordering::Release);
-                        }
-                        tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
-                        tile_counter2.store(0, std::sync::atomic::Ordering::Relaxed);
                     }
                     barrier.wait();
 
-                    let mut used_lut = false;
-                    let q2lut_ok = shared_q2lut_ok.load(std::sync::atomic::Ordering::Acquire);
-                    if q2lut_ok && q2lut_h_ptr != 0 {
-                        let q2l = unsafe { &*(q2lut_h_ptr as *const tempura_kernels::quantized::Q2Lut) };
-                        if let (Some((gt,_,_)), Some((ut,_,_))) = (qweights.get_q2_tiled(gn), qweights.get_q2_tiled(un)) {
-                            let gu_tiles_each = (inter + q2_bm - 1) / q2_bm;
-                            let total = 2 * gu_tiles_each;
-                            loop {
-                                let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if t >= total { break; }
-                                unsafe {
-                                    if t % 2 == 0 {
-                                        let gt_idx = t / 2;
-                                        tempura_kernels::quantized::q2_lut_gemv_tiled(gt, q2l, fsm!(gp,inter), inter, h, gt_idx, gt_idx + 1);
-                                    } else {
-                                        let ut_idx = t / 2;
-                                        tempura_kernels::quantized::q2_lut_gemv_tiled(ut, q2l, fsm!(upp,inter), inter, h, ut_idx, ut_idx + 1);
-                                    }
+                    // B6: gate+up GEMV (Q8_0-based row-partitioned)
+                    {
+                        let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
+                        let row_bytes = (h / tempura_kernels::quantized::Q2_0_BLOCK_SIZE) * tempura_kernels::quantized::Q2_0_BLOCK_BYTES;
+                        let h_q8_bytes = (h / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
+                        let total = 2 * inter;
+                        let rs = ith * total / nth;
+                        let re = (ith + 1) * total / nth;
+                        for r in rs..re {
+                            if r < inter {
+                                if let Some(w) = qweights.get_q2(gn) {
+                                    let wr = &w[r * row_bytes..(r + 1) * row_bytes];
+                                    fsm!(gp, inter)[r] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
+                                }
+                            } else {
+                                let ur = r - inter;
+                                if let Some(w) = qweights.get_q2(un) {
+                                    let wr = &w[ur * row_bytes..(ur + 1) * row_bytes];
+                                    fsm!(upp, inter)[ur] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..h_q8_bytes], h);
                                 }
                             }
-                            used_lut = true;
-                        }
-                    }
-                    if !used_lut {
-                        let lut_ok = shared_lut_ok.load(std::sync::atomic::Ordering::Acquire);
-                        if lut_ok && lut_h_ptr != 0 {
-                            let lut = unsafe { &*(lut_h_ptr as *const Tl2Lut) };
-                            if let (Some(gt), Some(ut)) = (qweights.get_tl2(gn), qweights.get_tl2(un)) {
-                                let gu_tiles_each = inter / tempura_kernels::tl2::Tl2Config::for_dims(inter, h).map(|c| c.bm).unwrap_or(inter);
-                                let total = 2 * gu_tiles_each;
-                                loop {
-                                    let t = tile_counter2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if t >= total { break; }
-                                    if t % 2 == 0 {
-                                        let gt_idx = t / 2;
-                                        tl2_gemv_tiles(lut, &gt.data, gt.scale, gp, inter, h, gt_idx, gt_idx + 1);
-                                    } else {
-                                        let ut_idx = t / 2;
-                                        tl2_gemv_tiles(lut, &ut.data, ut.scale, upp, inter, h, ut_idx, ut_idx + 1);
-                                    }
-                                }
-                                used_lut = true;
-                            }
-                        }
-                    }
-                    if !used_lut {
-                        if let (Some(gw), Some(uw)) = (qweights.get_i2s(gn), qweights.get_i2s(un)) {
-                            let ns = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
-                            let nm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
-                            let (s,e) = ((ith*inter)/nth, ((ith+1)*inter)/nth);
-                            i2s_gemv_cols(is!(pp,h), ns, nm, gw, i2s_weight_scale(gw,inter,h), gp, s, e, h);
-                            i2s_gemv_cols(is!(pp,h), ns, nm, uw, i2s_weight_scale(uw,inter,h), upp, s, e, h);
                         }
                     }
                     barrier.wait();
@@ -3637,62 +3467,28 @@ where
                             }
                         }
                         if let Some(fsn_w) = qweights.get_f32(fsn) {
-                            fused_rmsnorm_q8snap(fsm!(gp,inter), fsn_w, inter, cfg.layer_norm_eps);
+                            rmsnorm.forward(fsm!(gp,inter), fsn_w, inter, cfg.layer_norm_eps).unwrap();
                         }
-                        let (gs, gm) = tempura_kernels::quantized::i2s_quantize_into(fs!(gp,inter), ism!(pp,inter));
-                        shared_scale.store(gs.to_bits(), std::sync::atomic::Ordering::Release);
-                        shared_sum.store(gm, std::sync::atomic::Ordering::Release);
-                        if lut_inter_ptr != 0 {
-                            let lut = unsafe { &mut *(lut_inter_ptr as *mut Tl2Lut) };
-                            shared_lut_ok.store(tl2_preprocess_into(fs!(gp,inter), inter, lut), std::sync::atomic::Ordering::Release);
+                        {
+                            let q8 = unsafe { std::slice::from_raw_parts_mut(q8p as *mut u8, q8_act_len) };
+                            let inter_nb = inter / tempura_kernels::quantized::Q8_0_BLOCK_SIZE;
+                            tempura_kernels::quantized::quantize_row_q8_0(fs!(gp,inter), &mut q8[..inter_nb * tempura_kernels::quantized::Q8_0_BLOCK_BYTES]);
                         }
-                        if q2lut_inter_ptr != 0 {
-                            let q2l = unsafe { &mut *(q2lut_inter_ptr as *mut tempura_kernels::quantized::Q2Lut) };
-                            q2l.preprocess_into(fs!(gp,inter));
-                            shared_q2lut_ok.store(true, std::sync::atomic::Ordering::Release);
-                        } else {
-                            shared_q2lut_ok.store(false, std::sync::atomic::Ordering::Release);
-                        }
-                        tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
-                        tile_counter2.store(0, std::sync::atomic::Ordering::Relaxed);
                     }
                     barrier.wait();
 
-                    let mut used_lut = false;
-                    let q2lut_ok = shared_q2lut_ok.load(std::sync::atomic::Ordering::Acquire);
-                    if q2lut_ok && q2lut_inter_ptr != 0 {
-                        let q2l = unsafe { &*(q2lut_inter_ptr as *const tempura_kernels::quantized::Q2Lut) };
-                        if let Some((dt,_,_)) = qweights.get_q2_tiled(dn) {
-                            let d_tiles = (h + q2_bm - 1) / q2_bm;
-                            loop {
-                                let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if t >= d_tiles { break; }
-                                unsafe { tempura_kernels::quantized::q2_lut_gemv_tiled(dt, q2l, fsm!(dp,h), h, inter, t, t + 1); }
+                    // B8: down-proj GEMV (Q8_0-based row-partitioned)
+                    {
+                        let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
+                        let row_bytes = (inter / tempura_kernels::quantized::Q2_0_BLOCK_SIZE) * tempura_kernels::quantized::Q2_0_BLOCK_BYTES;
+                        let inter_q8_bytes = (inter / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
+                        if let Some(w) = qweights.get_q2(dn) {
+                            let rs = ith * h / nth;
+                            let re = (ith + 1) * h / nth;
+                            for r in rs..re {
+                                let wr = &w[r * row_bytes..(r + 1) * row_bytes];
+                                fsm!(dp, h)[r] = tempura_kernels::quantized::q2_0_dot_q8_preq(wr, &q8[..inter_q8_bytes], inter);
                             }
-                            used_lut = true;
-                        }
-                    }
-                    if !used_lut {
-                        let lut_ok = shared_lut_ok.load(std::sync::atomic::Ordering::Acquire);
-                        if lut_ok && lut_inter_ptr != 0 {
-                            let lut = unsafe { &*(lut_inter_ptr as *const Tl2Lut) };
-                            if let Some(dt) = qweights.get_tl2(dn) {
-                                let d_tiles = h / tempura_kernels::tl2::Tl2Config::for_dims(h, inter).map(|c| c.bm).unwrap_or(h);
-                                loop {
-                                    let t = tile_counter2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if t >= d_tiles { break; }
-                                    tl2_gemv_tiles(lut, &dt.data, dt.scale, dp, h, inter, t, t + 1);
-                                }
-                                used_lut = true;
-                            }
-                        }
-                    }
-                    if !used_lut {
-                        if let Some(dw) = qweights.get_i2s(dn) {
-                            let gs = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
-                            let gm = shared_sum.load(std::sync::atomic::Ordering::Acquire);
-                            let (s,e) = ((ith*h)/nth, ((ith+1)*h)/nth);
-                            i2s_gemv_cols(is!(pp,inter), gs, gm, dw, i2s_weight_scale(dw,h,inter), dp, s, e, inter);
                         }
                     }
                     barrier.wait();
