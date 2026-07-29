@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use minijinja::{context, Environment};
 use serde::Deserialize;
 
 use crate::gguf_loader::GgufValue;
@@ -60,27 +59,34 @@ const CHATML_TEMPLATE_PLAIN: &str = "\
 <|im_start|>assistant\n\
 {% endif %}";
 
-#[derive(Debug, Clone)]
 pub struct ChatTemplate {
-    template_source: String,
-    bos_token: String,
-    eos_token: String,
+    inner: hf_chat_template::ChatTemplate,
+}
+
+impl std::fmt::Debug for ChatTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatTemplate").finish()
+    }
 }
 
 impl ChatTemplate {
     pub fn new(template: String, bos_token: String, eos_token: String) -> Self {
-        Self {
-            template_source: template,
-            bos_token,
-            eos_token,
-        }
+        let mut cfg = hf_chat_template::TokenizerConfig::default();
+        cfg.bos_token = Some(hf_chat_template::TokenField::Str(bos_token));
+        cfg.eos_token = Some(hf_chat_template::TokenField::Str(eos_token));
+        let inner = hf_chat_template::ChatTemplate::builder(&template)
+            .special_tokens_from(&cfg)
+            .build()
+            .unwrap_or_else(|e| {
+                eprintln!("[chat-template] GGUF template failed: {e}, falling back to ChatML");
+                hf_chat_template::ChatTemplate::from_str(CHATML_TEMPLATE).unwrap()
+            });
+        Self { inner }
     }
 
     pub fn chatml() -> Self {
         Self {
-            template_source: CHATML_TEMPLATE.to_string(),
-            bos_token: String::new(),
-            eos_token: String::new(),
+            inner: hf_chat_template::ChatTemplate::from_str(CHATML_TEMPLATE).unwrap(),
         }
     }
 
@@ -89,32 +95,19 @@ impl ChatTemplate {
         messages: &[ChatMessageInput],
         add_generation_prompt: bool,
     ) -> Result<String, TokenizerError> {
-        let mut env = Environment::new();
-        env.add_template("chat", &self.template_source)
-            .map_err(|e| TokenizerError::Template(e.to_string()))?;
-
-        let messages_val: Vec<minijinja::Value> = messages
+        let msgs: Vec<hf_chat_template::Message> = messages
             .iter()
-            .map(|m| {
-                context! {
-                    role => m.role,
-                    content => m.content,
-                }
-            })
+            .map(|m| hf_chat_template::Message::new(&m.role, &m.content))
             .collect();
-
-        let tmpl = env
-            .get_template("chat")
-            .map_err(|e| TokenizerError::Template(e.to_string()))?;
-
-        tmpl.render(context! {
-            messages => messages_val,
-            add_generation_prompt => add_generation_prompt,
-            bos_token => self.bos_token,
-            eos_token => self.eos_token,
-            enable_thinking => true,
-        })
-        .map_err(|e| TokenizerError::Template(e.to_string()))
+        let mut input = hf_chat_template::RenderInput {
+            messages: msgs,
+            add_generation_prompt,
+            ..Default::default()
+        };
+        input.extra.insert("enable_thinking".into(), serde_json::Value::Bool(true));
+        self.inner
+            .render(&input)
+            .map_err(|e| TokenizerError::Template(e.to_string()))
     }
 }
 
@@ -282,28 +275,8 @@ impl Tokenizer {
             })
         });
 
-        // Try GGUF template; if it fails to render, fall back to ChatML
-        let template_str = if let Some(ref gt) = gguf_template {
-            let mut test_env = minijinja::Environment::new();
-            let works = test_env.add_template("t", gt).is_ok() && {
-                let tmpl = test_env.get_template("t").unwrap();
-                let test_msgs: Vec<minijinja::Value> = vec![minijinja::context! { role => "user", content => "hi" }.into()];
-                tmpl.render(minijinja::context! {
-                    messages => test_msgs,
-                    add_generation_prompt => true,
-                    bos_token => "",
-                    eos_token => "",
-                    enable_thinking => true,
-                }).is_ok()
-            };
-            if works { gt.clone() }
-            else if is_thinking { CHATML_TEMPLATE.to_string() }
-            else { CHATML_TEMPLATE_PLAIN.to_string() }
-        } else if is_thinking {
-            CHATML_TEMPLATE.to_string()
-        } else {
-            CHATML_TEMPLATE_PLAIN.to_string()
-        };
+        let template_str = gguf_template
+            .unwrap_or_else(|| if is_thinking { CHATML_TEMPLATE.to_string() } else { CHATML_TEMPLATE_PLAIN.to_string() });
         let chat_template = ChatTemplate::new(template_str, bos_token, eos_token);
 
         Ok(Self {
