@@ -193,7 +193,8 @@ where
         if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
             return true;
         }
-        qw.has_q2_tiled() && self.config.layer_kinds.is_none()
+        if std::env::var("TEMPURA_NO_PERSISTENT").is_ok() { return false; }
+        qw.has_q2_tiled()
     }
 
     pub fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
@@ -1282,6 +1283,11 @@ where
                     }
                     qmm(normed_preq.as_ref(), &normed, &k_w_name, &mut k[..kv_dim], 1, kv_dim, h);
                     qmm(normed_preq.as_ref(), &normed, &v_w_name, &mut v[..kv_dim], 1, kv_dim, h);
+                    if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && seq_len == 1 && layer == 3 {
+                        let qn: f32 = q[..q_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                        let gn: f32 = q_gate_buf[head_dim..2*head_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                        eprintln!("[FQ-L3-QSPLIT] q_norm={qn:.6} gate_h0_norm={gn:.6} q[0..4]={:?} gate_h0[0..4]={:?}", &q[..4], &q_gate_buf[head_dim..head_dim+4]);
+                    }
                 } else if let (Some(pq), Some(qw), Some(kw), Some(vw)) = (
                     normed_preq.as_ref(),
                     qweights.get_i2s(&q_w_name),
@@ -3298,6 +3304,12 @@ where
                                     raw.copy_within(src..src+head_dim, dst);
                                 }
                             }
+                        }
+                        if layer == 3 && _token_step == 0 {
+                            let qn: f32 = fsm!(qp,q_dim).iter().map(|x|x*x).sum::<f32>().sqrt();
+                            let gn: f32 = fs!(qgbp, q_dim)[0..head_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
+                            let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
+                            eprintln!("[GBD-L3-QSPLIT] q_norm={qn:.6} gate_h0_norm={gn:.6} q8[0..8]={:?} q[0..4]={:?}", &q8[..8], &fsm!(qp,q_dim)[..4]);
                         }
                         if cfg.use_qk_norm {
                             if let (Some(qnw), Some(knw)) = (qweights.get_f32(_qnm), qweights.get_f32(_knm)) {
