@@ -193,8 +193,7 @@ where
         if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
             return true;
         }
-        if std::env::var("TEMPURA_NO_PERSISTENT").is_ok() { return false; }
-        qw.has_q2_tiled()
+        qw.has_q2_tiled() && self.config.layer_kinds.is_none()
     }
 
     pub fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
