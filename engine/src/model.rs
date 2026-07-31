@@ -55,6 +55,143 @@ fn apply_head_rmsnorm(
     }
 }
 
+/// Shared single-token attention layer processing (post-GEMV).
+/// Covers: Q-gate extraction, qk_norm, partial RoPE, KV cache append,
+/// attention, sigmoid gating, and attention sub-norm.
+/// Used by both `forward_quantized` and `generate_bitnet_decode` to
+/// eliminate code divergence.
+#[allow(clippy::too_many_arguments)]
+fn attention_layer_decode(
+    q_raw: &mut [f32],
+    k: &mut [f32],
+    v: &[f32],
+    attn_out: &mut [f32],
+    q_gate_buf: &mut [f32],
+    session: &mut InferenceSession,
+    cache_layer: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    _actual_q_cols: usize,
+    has_q_gate: bool,
+    rope_dim: usize,
+    rope_theta: f32,
+    positions: &[u32],
+    q_norm_w: Option<&[f32]>,
+    k_norm_w: Option<&[f32]>,
+    sub_norm_w: Option<&[f32]>,
+    eps: f32,
+    use_ggml_compat: bool,
+) {
+    use tempura_kernels::RoPE as _;
+
+    if has_q_gate {
+        assert!(q_gate_buf.len() >= q_dim);
+        for hh in 0..n_heads {
+            let src = hh * head_dim * 2;
+            q_gate_buf[hh * head_dim..(hh + 1) * head_dim]
+                .copy_from_slice(&q_raw[src + head_dim..src + 2 * head_dim]);
+        }
+        for hh in 0..n_heads {
+            let src = hh * head_dim * 2;
+            let dst = hh * head_dim;
+            if src != dst {
+                q_raw.copy_within(src..src + head_dim, dst);
+            }
+        }
+    }
+    let q = &mut q_raw[..q_dim];
+
+    if let (Some(qnw), Some(knw)) = (q_norm_w, k_norm_w) {
+        apply_head_rmsnorm(q, qnw, 1, n_heads, head_dim, eps);
+        if use_ggml_compat {
+            tempura_kernels::portable_math::q8_snap(q);
+        }
+        apply_head_rmsnorm(k, knw, 1, n_kv_heads, head_dim, eps);
+        if use_ggml_compat {
+            tempura_kernels::portable_math::q8_snap(k);
+        }
+    }
+
+    let rope = tempura_kernels::rope::CpuRoPE;
+    if rope_dim < head_dim {
+        let mut q_rope = vec![0.0f32; n_heads * rope_dim];
+        let mut k_rope = vec![0.0f32; n_kv_heads * rope_dim];
+        for hh in 0..n_heads {
+            q_rope[hh * rope_dim..(hh + 1) * rope_dim]
+                .copy_from_slice(&q[hh * head_dim..hh * head_dim + rope_dim]);
+        }
+        for hh in 0..n_kv_heads {
+            k_rope[hh * rope_dim..(hh + 1) * rope_dim]
+                .copy_from_slice(&k[hh * head_dim..hh * head_dim + rope_dim]);
+        }
+        rope.forward(&mut q_rope, 1, 1, n_heads, rope_dim, positions, rope_theta).unwrap();
+        rope.forward(&mut k_rope, 1, 1, n_kv_heads, rope_dim, positions, rope_theta).unwrap();
+        for hh in 0..n_heads {
+            q[hh * head_dim..hh * head_dim + rope_dim]
+                .copy_from_slice(&q_rope[hh * rope_dim..(hh + 1) * rope_dim]);
+        }
+        for hh in 0..n_kv_heads {
+            k[hh * head_dim..hh * head_dim + rope_dim]
+                .copy_from_slice(&k_rope[hh * rope_dim..(hh + 1) * rope_dim]);
+        }
+    } else {
+        rope.forward(q, 1, 1, n_heads, head_dim, positions, rope_theta).unwrap();
+        rope.forward(k, 1, 1, n_kv_heads, head_dim, positions, rope_theta).unwrap();
+    }
+
+    session.cache.append_kv(cache_layer, &k[..kv_dim], v, 1);
+    let kv_len = session.cache.seq_len + 1;
+    let k_cache = session.cache.k_data(cache_layer, kv_len);
+    let v_cache = session.cache.v_data(cache_layer, kv_len);
+
+    if use_ggml_compat {
+        tempura_kernels::attention::CpuAttentionGgml
+            .forward(
+                q, &k_cache, &v_cache,
+                &mut attn_out[..q_dim],
+                1, 1, kv_len,
+                n_heads, n_kv_heads, head_dim,
+                1.0 / (head_dim as f32).sqrt(),
+            )
+            .unwrap();
+    } else {
+        use tempura_kernels::Attention as _;
+        tempura_kernels::attention::CpuAttention
+            .forward(
+                q, &k_cache, &v_cache,
+                &mut attn_out[..q_dim],
+                1, 1, kv_len,
+                n_heads, n_kv_heads, head_dim,
+                1.0 / (head_dim as f32).sqrt(),
+            )
+            .unwrap();
+    }
+
+    if has_q_gate {
+        for i in 0..q_dim {
+            let sig = 1.0 / (1.0 + (-q_gate_buf[i]).exp());
+            attn_out[i] *= sig;
+        }
+    }
+
+    if let Some(snw) = sub_norm_w {
+        if use_ggml_compat {
+            use tempura_kernels::RMSNorm as _;
+            tempura_kernels::rmsnorm::CpuRMSNormGgml
+                .forward(&mut attn_out[..q_dim], snw, q_dim, eps)
+                .unwrap();
+        } else {
+            use tempura_kernels::RMSNorm as _;
+            tempura_kernels::rmsnorm::CpuRMSNorm
+                .forward(&mut attn_out[..q_dim], snw, q_dim, eps)
+                .unwrap();
+        }
+    }
+}
+
 pub trait InferenceModel: Send + Sync {
     fn config(&self) -> &ModelConfig;
     fn has_weights(&self) -> bool;
@@ -193,7 +330,7 @@ where
         if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
             return true;
         }
-        qw.has_q2_tiled() && self.config.layer_kinds.is_none()
+        qw.has_q2_tiled()
     }
 
     pub fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
@@ -3271,136 +3408,47 @@ where
                     barrier.wait();
 
                     } else {
-                    // ── Attention block: Q8_0-based QKV GEMV (single-threaded, matching qmm) ──
-                    if ith == 0 {
+                    // ── Attention block: QKV GEMV (row-partitioned) ──
+                    {
                         let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
                         let h_q8_bytes = (h / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
-                        if let Some(w) = qweights.get_q2(qn) {
-                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(qp, actual_q_cols), actual_q_cols, h);
-                        }
-                        if let Some(w) = qweights.get_q2(kn) {
-                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(kp, kv_dim), kv_dim, h);
-                        }
-                        if let Some(w) = qweights.get_q2(vn) {
-                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(vp, kv_dim), kv_dim, h);
-                        }
+                        if let Some(w) = qweights.get_q2(qn) { let (rs, re) = ((ith*actual_q_cols)/nth, ((ith+1)*actual_q_cols)/nth);
+                            unsafe { tempura_kernels::quantized::q2_0_gemv_q8_rows(w, &q8[..h_q8_bytes], qp, actual_q_cols, h, rs, re); } }
+                        if let Some(w) = qweights.get_q2(kn) { let (rs, re) = ((ith*kv_dim)/nth, ((ith+1)*kv_dim)/nth);
+                            unsafe { tempura_kernels::quantized::q2_0_gemv_q8_rows(w, &q8[..h_q8_bytes], kp, kv_dim, h, rs, re); } }
+                        if let Some(w) = qweights.get_q2(vn) { let (rs, re) = ((ith*kv_dim)/nth, ((ith+1)*kv_dim)/nth);
+                            unsafe { tempura_kernels::quantized::q2_0_gemv_q8_rows(w, &q8[..h_q8_bytes], vp, kv_dim, h, rs, re); } }
                     }
                     barrier.wait();
 
                     if ith == 0 {
-                        if has_q_gate {
-                            let raw = fsm!(qp, actual_q_cols);
-                            let gate_out = fsm!(qgbp, q_dim);
-                            for hh in 0..n_heads {
-                                let src = hh * head_dim * 2;
-                                let q_dst = hh * head_dim;
-                                gate_out[q_dst..q_dst+head_dim].copy_from_slice(&raw[src+head_dim..src+2*head_dim]);
-                            }
-                            for hh in (0..n_heads).rev() {
-                                let src = hh * head_dim * 2;
-                                let dst = hh * head_dim;
-                                if src != dst {
-                                    raw.copy_within(src..src+head_dim, dst);
-                                }
-                            }
-                        }
-                        if layer == 3 && _token_step == 0 {
-                            let qn: f32 = fsm!(qp,q_dim).iter().map(|x|x*x).sum::<f32>().sqrt();
-                            let gn: f32 = fs!(qgbp, q_dim)[0..head_dim].iter().map(|x|x*x).sum::<f32>().sqrt();
-                            let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
-                            eprintln!("[GBD-L3-QSPLIT] q_norm={qn:.6} gate_h0_norm={gn:.6} q8[0..8]={:?} q[0..4]={:?}", &q8[..8], &fsm!(qp,q_dim)[..4]);
-                        }
-                        if cfg.use_qk_norm {
-                            if let (Some(qnw), Some(knw)) = (qweights.get_f32(_qnm), qweights.get_f32(_knm)) {
-                                apply_head_rmsnorm(fsm!(qp,q_dim), qnw, 1, n_heads, head_dim, cfg.layer_norm_eps);
-                                apply_head_rmsnorm(fsm!(kp,kv_dim), knw, 1, n_kv_heads, head_dim, cfg.layer_norm_eps);
-                            }
-                        }
-                        use tempura_kernels::RoPE;
-                        let rope_hd = cfg.rope_dim.unwrap_or(head_dim);
-                        if layer == 3 && _token_step == 0 {
-                            let qn: f32 = fsm!(qp,q_dim).iter().map(|x|x*x).sum::<f32>().sqrt();
-                            let kn: f32 = fsm!(kp,kv_dim).iter().map(|x|x*x).sum::<f32>().sqrt();
-                            let vn: f32 = fsm!(vp,kv_dim).iter().map(|x|x*x).sum::<f32>().sqrt();
-                            eprintln!("[ATN-DBG L3] pre-rope q_norm={qn:.4} k_norm={kn:.4} v_norm={vn:.4} rope_hd={rope_hd}");
-                        }
-                        if rope_hd < head_dim {
-                            let mut q_rope = vec![0.0f32; n_heads * rope_hd];
-                            let mut k_rope = vec![0.0f32; n_kv_heads * rope_hd];
-                            let qs = fsm!(qp, q_dim);
-                            let ks = fsm!(kp, kv_dim);
-                            for hh in 0..n_heads { q_rope[hh*rope_hd..(hh+1)*rope_hd].copy_from_slice(&qs[hh*head_dim..hh*head_dim+rope_hd]); }
-                            for hh in 0..n_kv_heads { k_rope[hh*rope_hd..(hh+1)*rope_hd].copy_from_slice(&ks[hh*head_dim..hh*head_dim+rope_hd]); }
-                            rope.forward(&mut q_rope, 1, 1, n_heads, rope_hd, &positions, cfg.rope_theta).unwrap();
-                            rope.forward(&mut k_rope, 1, 1, n_kv_heads, rope_hd, &positions, cfg.rope_theta).unwrap();
-                            for hh in 0..n_heads { qs[hh*head_dim..hh*head_dim+rope_hd].copy_from_slice(&q_rope[hh*rope_hd..(hh+1)*rope_hd]); }
-                            for hh in 0..n_kv_heads { ks[hh*head_dim..hh*head_dim+rope_hd].copy_from_slice(&k_rope[hh*rope_hd..(hh+1)*rope_hd]); }
-                        } else {
-                            rope.forward(fsm!(qp,q_dim), 1, 1, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
-                            rope.forward(fsm!(kp,kv_dim), 1, 1, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
-                        }
                         let sess = unsafe { &mut *(sp as *mut InferenceSession) };
                         let cl = cache_layer_map[layer].unwrap();
-                        sess.cache.append_kv(cl, fs!(kp,kv_dim), fs!(vp,kv_dim), 1);
-                        shared_kvl.store(sess.cache.seq_len + 1, std::sync::atomic::Ordering::Release);
-                    }
-                    barrier.wait();
-
-                    if ith == 0 {
-                        let kvl = shared_kvl.load(std::sync::atomic::Ordering::Acquire);
-                        let sess = unsafe { &*(sp as *const InferenceSession) };
-                        let cl = cache_layer_map[layer].unwrap();
-                        if layer == 3 && _token_step == 0 {
-                            let qn: f32 = fs!(qp,actual_q_cols).iter().map(|x|x*x).sum::<f32>().sqrt();
-                            let kn: f32 = fs!(kp,kv_dim).iter().map(|x|x*x).sum::<f32>().sqrt();
-                            let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
-                            eprintln!("[GBD-L3-pre-gate] q_raw_norm={qn:.6} k_norm={kn:.6} q8[0..8]={:?}", &q8[..8]);
-                        }
-                        use tempura_kernels::Attention as _;
-                        tempura_kernels::attention::CpuAttention.forward(
-                            fs!(qp,q_dim), &sess.cache.k_data(cl,kvl), &sess.cache.v_data(cl,kvl),
-                            fsm!(ap,q_dim), 1, 1, kvl,
-                            n_heads, n_kv_heads, head_dim,
-                            1.0 / (head_dim as f32).sqrt(),
-                        ).unwrap();
-                        if layer == 3 && _token_step == 0 {
-                            let an: f32 = fs!(ap,q_dim).iter().map(|x|x*x).sum::<f32>().sqrt();
-                            eprintln!("[GBD-L3-attn-out] norm={an:.6} out[0..4]={:?}", &fs!(ap,q_dim)[..4]);
-                        }
-                    }
-                    barrier.wait();
-
-                    if ith == 0 {
-                        if has_q_gate {
-                            let attn = fsm!(ap, q_dim);
-                            let gate_vals = fs!(qgbp, q_dim);
-                            for i in 0..q_dim {
-                                let sig = 1.0 / (1.0 + (-gate_vals[i]).exp());
-                                attn[i] *= sig;
-                            }
-                        }
-                        if let Some(asn_w) = qweights.get_f32(asn) {
-                            use tempura_kernels::RMSNorm as _;
-                            rmsnorm.forward(fsm!(ap,q_dim), asn_w, q_dim, cfg.layer_norm_eps).unwrap();
-                        }
-                        let (s2, m2) = tempura_kernels::quantized::i2s_quantize_into(fs!(ap,q_dim), ism!(pp,q_dim));
-                        shared_scale.store(s2.to_bits(), std::sync::atomic::Ordering::Release);
-                        shared_sum.store(m2, std::sync::atomic::Ordering::Release);
+                        let rope_hd = cfg.rope_dim.unwrap_or(head_dim);
+                        let qnw = if cfg.use_qk_norm { qweights.get_f32(_qnm) } else { None };
+                        let knw = if cfg.use_qk_norm { qweights.get_f32(_knm) } else { None };
+                        let ggml_compat = cfg.hidden_act == crate::config::HiddenAct::SquaredRelu;
+                        attention_layer_decode(
+                            fsm!(qp, actual_q_cols), fsm!(kp, kv_dim), fs!(vp, kv_dim),
+                            fsm!(ap, q_dim), fsm!(qgbp, if has_q_gate { q_dim } else { 0 }),
+                            sess, cl, n_heads, n_kv_heads, head_dim, q_dim, kv_dim, actual_q_cols,
+                            has_q_gate, rope_hd, cfg.rope_theta, &positions,
+                            qnw, knw, qweights.get_f32(asn), cfg.layer_norm_eps, ggml_compat,
+                        );
                         {
                             let q8 = unsafe { std::slice::from_raw_parts_mut(q8p as *mut u8, q8_act_len) };
                             let qd_nb = q_dim / tempura_kernels::quantized::Q8_0_BLOCK_SIZE;
                             tempura_kernels::quantized::quantize_row_q8_0(fs!(ap,q_dim), &mut q8[..qd_nb * tempura_kernels::quantized::Q8_0_BLOCK_BYTES]);
                         }
-                        tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
                     }
                     barrier.wait();
 
-                    if ith == 0 {
+                    // O-proj GEMV (row-partitioned)
+                    {
                         let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
                         let qd_q8_bytes = (q_dim / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
-                        if let Some(w) = qweights.get_q2(on) {
-                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..qd_q8_bytes], fsm!(op, h), h, q_dim);
-                        }
+                        if let Some(w) = qweights.get_q2(on) { let (rs, re) = ((ith*h)/nth, ((ith+1)*h)/nth);
+                            unsafe { tempura_kernels::quantized::q2_0_gemv_q8_rows(w, &q8[..qd_q8_bytes], op, h, q_dim, rs, re); } }
                     }
                     barrier.wait();
 
@@ -3427,16 +3475,14 @@ where
                     }
                     barrier.wait();
 
-                    // B6: gate+up GEMV (Q8_0-based, single-threaded)
-                    if ith == 0 {
+                    // B6: gate+up GEMV (row-partitioned)
+                    {
                         let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
                         let h_q8_bytes = (h / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
-                        if let Some(w) = qweights.get_q2(gn) {
-                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(gp, inter), inter, h);
-                        }
-                        if let Some(w) = qweights.get_q2(un) {
-                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..h_q8_bytes], fsm!(upp, inter), inter, h);
-                        }
+                        if let Some(w) = qweights.get_q2(gn) { let (rs, re) = ((ith*inter)/nth, ((ith+1)*inter)/nth);
+                            unsafe { tempura_kernels::quantized::q2_0_gemv_q8_rows(w, &q8[..h_q8_bytes], gp, inter, h, rs, re); } }
+                        if let Some(w) = qweights.get_q2(un) { let (rs, re) = ((ith*inter)/nth, ((ith+1)*inter)/nth);
+                            unsafe { tempura_kernels::quantized::q2_0_gemv_q8_rows(w, &q8[..h_q8_bytes], upp, inter, h, rs, re); } }
                     }
                     barrier.wait();
 
@@ -3461,13 +3507,12 @@ where
                     }
                     barrier.wait();
 
-                    // B8: down-proj GEMV (Q8_0-based, single-threaded)
-                    if ith == 0 {
+                    // B8: down-proj GEMV (row-partitioned)
+                    {
                         let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
                         let inter_q8_bytes = (inter / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
-                        if let Some(w) = qweights.get_q2(dn) {
-                            tempura_kernels::quantized::q2_0_gemv_q8(w, &q8[..inter_q8_bytes], fsm!(dp, h), h, inter);
-                        }
+                        if let Some(w) = qweights.get_q2(dn) { let (rs, re) = ((ith*h)/nth, ((ith+1)*h)/nth);
+                            unsafe { tempura_kernels::quantized::q2_0_gemv_q8_rows(w, &q8[..inter_q8_bytes], dp, h, inter, rs, re); } }
                     }
                     barrier.wait();
 

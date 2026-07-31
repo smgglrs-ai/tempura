@@ -231,6 +231,9 @@ MODULES=(
     f16_gemv
     i2s_multi_row
     f16_kv_cache
+    q2_gemv_rows
+    attention_decode
+    q2_lut_tiles
 )
 
 TOTAL_VERIFIED=0
