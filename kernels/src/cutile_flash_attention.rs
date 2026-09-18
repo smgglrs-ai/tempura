@@ -246,6 +246,86 @@ fn scatter_output_head(
     }
 }
 
+impl CutileFlashAttention {
+    /// Q, K, V already on device. Output stays on device.
+    ///
+    /// Q: [seq_len, n_heads, head_dim] on device (heads interleaved)
+    /// K: [kv_len, n_kv_heads, head_dim] on device
+    /// V: [kv_len, n_kv_heads, head_dim] on device
+    /// Returns [seq_len, n_heads * head_dim] on device.
+    ///
+    /// Flash attention over dynamic activations still requires per-head host
+    /// gather today (cuTile cannot slice interleaved head rows device-side).
+    /// The return type lets callers chain device operations without a separate
+    /// download round-trip; the primary zero-copy benefit is in
+    /// `CutileMatMul::forward_bt_device_to_device` for static weight matrices.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_device(
+        &self,
+        q: &Arc<Tensor<f32>>,
+        k: &Arc<Tensor<f32>>,
+        v: &Arc<Tensor<f32>>,
+        seq_len: usize,
+        kv_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<Arc<Tensor<f32>>> {
+        if n_heads % n_kv_heads != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "n_heads ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
+            )));
+        }
+
+        let stream = &self.stream;
+
+        // Download activations from device (they were uploaded by the caller's
+        // projection path and are already on device, but the kernel needs
+        // per-head contiguous slices which require a host-side gather).
+        let q_host: Vec<f32> = q
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let k_host: Vec<f32> = k
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let v_host: Vec<f32> = v
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        // Run kernel via the existing host-based forward (handles gather/scatter
+        // and per-head dispatch internally).
+        let mut output_host = vec![0.0f32; seq_len * n_heads * head_dim];
+        self.forward(
+            &q_host,
+            &k_host,
+            &v_host,
+            &mut output_host,
+            1,
+            seq_len,
+            kv_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            scale,
+        )?;
+
+        // Upload result back to device so the caller avoids a redundant download.
+        let out_tensor: Arc<Tensor<f32>> =
+            api::copy_host_vec_to_device(&Arc::new(output_host))
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .reshape(&[seq_len, n_heads * head_dim])
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into();
+
+        Ok(out_tensor)
+    }
+}
+
 impl Attention for CutileFlashAttention {
     fn verification_tier(&self) -> VerificationTier {
         VerificationTier::Tested

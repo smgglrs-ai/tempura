@@ -9,38 +9,52 @@ use crate::{KernelError, RMSNorm, Result, VerificationTier};
 pub mod kernels {
     use cutile::core::*;
 
-    /// RMSNorm forward: out[i] = x[i] * weight[i] / sqrt(mean(x²) + eps)
+    /// RMSNorm pass 1: compute sum(x²) per token row into a 1-element tile.
     ///
-    /// One kernel instance per row (token). H = hidden_size.
-    /// Single pass: reduce to sum-of-squares, compute scale, apply.
-    /// Epsilon is hardcoded to 1e-6 — sufficient for all standard LLM norms.
+    /// One program instance per token. H = hidden_size.
+    /// Avoids all f32 scalar arithmetic in the JIT — sum is stored as a tile
+    /// element; the CPU computes scale = 1/sqrt(mean+eps) between the two passes.
     #[cutile::entry()]
-    pub fn rmsnorm_forward<const H: i32>(
+    pub fn rmsnorm_sum_sq<const H: i32>(
+        sum_out: &mut Tensor<f32, { [1] }>,
+        x: &Tensor<f32, { [-1] }>,
+    ) {
+        let pid = program_id(0);
+        let tile_x: Tile<f32, { [H] }> = x.partition(shape![H]).load([pid]);
+        let sq: Tile<f32, { [H] }> = tile_x * tile_x;
+        let sum: Tile<f32, { [] }> = reduce_sum(sq, 0i32);
+        sum_out.store(sum.reshape(shape![1]));
+    }
+
+    /// RMSNorm pass 2: apply CPU-precomputed per-token scale and weight.
+    ///
+    /// One program instance per token. H = hidden_size.
+    /// `scale` carries one float per token: 1/sqrt(mean(x²)+eps).
+    /// Broadcasting is done via tile_to_scalar + broadcast_scalar, keeping
+    /// all operations within cuTile tile ops — no f32 scalar arithmetic.
+    #[cutile::entry()]
+    pub fn rmsnorm_apply<const H: i32>(
         out: &mut Tensor<f32, { [H] }>,
         x: &Tensor<f32, { [-1] }>,
         weight: &Tensor<f32, { [-1] }>,
+        scale: &Tensor<f32, { [-1] }>,
     ) {
         let pid = program_id(0);
         let tile_x: Tile<f32, { [H] }> = x.partition(shape![H]).load([pid]);
         let tile_w: Tile<f32, { [H] }> = weight.partition(shape![H]).load([0i32]);
-
-        let tile_sq: Tile<f32, { [H] }> = tile_x * tile_x;
-        let sum_sq_0d: Tile<f32, { [] }> = reduce_sum(tile_sq, 0i32);
-        let sum_sq: f32 = tile_to_scalar(sum_sq_0d);
-        let rms_scale: f32 = 1.0f32 / (sum_sq / H as f32 + 1e-6f32).sqrt();
-
-        let scale_tile: Tile<f32, { [H] }> = broadcast_scalar(rms_scale, shape![H]);
-        let result: Tile<f32, { [H] }> = tile_x * scale_tile * tile_w;
-
-        out.store(result);
+        let tile_s: Tile<f32, { [1] }> = scale.partition(shape![1]).load([pid]);
+        let s_broad: Tile<f32, { [H] }> =
+            broadcast_scalar(tile_to_scalar(reduce_sum(tile_s, 0i32)), shape![H]);
+        out.store(tile_x * s_broad * tile_w);
     }
 }
 
 /// GPU-accelerated RMSNorm using NVIDIA cuTile Rust (`cutile-rs`).
 ///
-/// Single-pass kernel: each program instance handles one token row,
-/// reducing to sum-of-squares and applying the inverse RMS scale in a
-/// single tile-level pass without a temporary intermediate buffer.
+/// Two-pass approach: pass 1 computes sum(x²) per token on GPU, pass 2 applies
+/// the scale (computed on CPU from the downloaded sums) and weight on GPU.
+/// All f32 scalar arithmetic (division, sqrt) runs on CPU between the two passes,
+/// avoiding the cuTile JIT's restriction on f32 scalar arithmetic in kernels.
 pub struct CutileRmsNorm {
     device: Arc<Device>,
     stream: Arc<Stream>,
@@ -94,12 +108,7 @@ impl RMSNorm for CutileRmsNorm {
 
         let stream = &self.stream;
 
-        // Partition output into one tile of H elements per token row.
-        let out_t = api::zeros::<f32>(&[num_tokens * hidden_size])
-            .sync_on(stream)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-            .partition([hidden_size]);
-
+        // Upload x and weight once — shared across both passes.
         let x_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(x.to_vec()))
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
@@ -110,23 +119,52 @@ impl RMSNorm for CutileRmsNorm {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .into();
 
-        match kernels::rmsnorm_forward(out_t, x_t, w_t)
+        // Pass 1: compute sum(x²) per token — one element per token in sum_t.
+        let sum_t = api::zeros::<f32>(&[num_tokens])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1]);
+
+        let (sum_t, x_t) = kernels::rmsnorm_sum_sq(sum_t, x_t)
             .generics(vec![hidden_size.to_string()])
             .sync_on(stream)
-        {
-            Ok((out_t, _x, _w)) => {
-                let host: Vec<f32> = out_t
-                    .unpartition()
-                    .to_host_vec()
-                    .sync_on(stream)
-                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-                x.copy_from_slice(&host);
-            }
-            Err(_) => {
-                // cuTile JIT does not yet support f32 scalar arithmetic; fall back to CPU.
-                crate::rmsnorm::CpuRMSNorm.forward(x, weight, hidden_size, eps)?;
-            }
-        }
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let sum_sq_vec: Vec<f32> = sum_t
+            .unpartition()
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        // CPU: scale[i] = 1 / sqrt(mean(x²) + eps) — no JIT constraint here.
+        let scale_vec: Vec<f32> = sum_sq_vec
+            .iter()
+            .map(|&s| 1.0f32 / (s / hidden_size as f32 + eps).sqrt())
+            .collect();
+
+        // Pass 2: apply scale and weight.
+        let scale_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(scale_vec))
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+
+        let out_t = api::zeros::<f32>(&[num_tokens * hidden_size])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([hidden_size]);
+
+        let (out_t, _x, _w, _s) = kernels::rmsnorm_apply(out_t, x_t, w_t, scale_t)
+            .generics(vec![hidden_size.to_string()])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let host: Vec<f32> = out_t
+            .unpartition()
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        x.copy_from_slice(&host);
         Ok(())
     }
 }

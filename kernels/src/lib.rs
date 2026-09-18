@@ -32,6 +32,8 @@ pub mod cutile_quantized_gemm;
 pub mod cutile_matmul_host;
 #[cfg(feature = "cutile")]
 pub mod cutile_rmsnorm;
+#[cfg(feature = "cutile")]
+pub mod cutile_device_weights;
 pub mod guided;
 pub mod layernorm;
 pub mod matmul;

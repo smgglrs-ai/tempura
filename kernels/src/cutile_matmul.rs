@@ -90,9 +90,15 @@ impl CutileMatMul {
     }
 }
 
-const BM: usize = 16;
-const BN: usize = 16;
-const BK: usize = 8;
+const BM: usize = 64;
+const BN: usize = 64;
+const BK: usize = 16;
+
+// Decode/GEMV path (m == 1): wide N tiles amortise memory latency better than
+// a square BM×BN block when there is only one output row.
+const BM_GEMV: usize = 1;
+const BN_GEMV: usize = 64;
+const BK_GEMV: usize = 16;
 
 impl MatMul for CutileMatMul {
     fn verification_tier(&self) -> VerificationTier {
@@ -127,7 +133,7 @@ impl MatMul for CutileMatMul {
             });
         }
 
-        // Pad K to multiple of BK (8) if necessary
+        // Pad K to multiple of BK if necessary
         let k_pad = k.div_ceil(BK) * BK;
         let (a_vec, b_vec) = if k_pad == k {
             (Arc::new(a.to_vec()), Arc::new(b.to_vec()))
@@ -216,7 +222,11 @@ impl MatMul for CutileMatMul {
             });
         }
 
-        // Pad K to multiple of BK (8) if necessary
+        if m == 1 {
+            return self.forward_gemv(a, b, output, n, k);
+        }
+
+        // Pad K to multiple of BK if necessary
         let k_pad = k.div_ceil(BK) * BK;
         let (a_vec, b_vec) = if k_pad == k {
             (Arc::new(a.to_vec()), Arc::new(b.to_vec()))
@@ -273,5 +283,303 @@ impl MatMul for CutileMatMul {
 
         output.copy_from_slice(&host);
         Ok(())
+    }
+}
+
+impl CutileMatMul {
+    /// GEMM with B pre-uploaded to the GPU: z = a @ b^T.
+    ///
+    /// Shapes: z[M, N] = a[M, K_raw] @ b[N, K_pad]^T.
+    /// `a` is supplied from the host each call; `b_device` is resident on the GPU.
+    /// `k_raw` is the logical K size; `k_pad` is the padded K the tensor was uploaded with
+    /// (must be a multiple of BK = 8 and match the tensor's actual column count).
+    pub fn forward_bt_device_b(
+        &self,
+        a: &[f32],
+        b_device: &Arc<Tensor<f32>>,
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k_raw: usize,
+        k_pad: usize,
+    ) -> Result<()> {
+        if a.len() != m * k_raw {
+            return Err(KernelError::DimensionMismatch {
+                expected: m * k_raw,
+                got: a.len(),
+            });
+        }
+        if output.len() != m * n {
+            return Err(KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
+        }
+
+        // Pad A to k_pad if necessary so the kernel sees [M, K_pad].
+        let a_vec: Arc<Vec<f32>> = if k_pad == k_raw {
+            Arc::new(a.to_vec())
+        } else {
+            let mut padded = vec![0.0f32; m * k_pad];
+            for r in 0..m {
+                padded[r * k_pad..r * k_pad + k_raw]
+                    .copy_from_slice(&a[r * k_raw..(r + 1) * k_raw]);
+            }
+            Arc::new(padded)
+        };
+
+        let stream = &self.stream;
+
+        let z = api::zeros::<f32>(&[m, n])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([BM, BN]);
+
+        let x: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&a_vec)
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .reshape(&[m, k_pad])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+
+        // Clone the Arc so b_device keeps its reference after the kernel takes ownership.
+        let y = Arc::clone(b_device);
+
+        let generics = vec![
+            BM.to_string(),
+            BN.to_string(),
+            BK.to_string(),
+            k_pad.to_string(),
+        ];
+
+        let (z, _x, _y) = kernels::cutile_gemm_b_transposed(z, x, y)
+            .generics(generics)
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let host: Vec<f32> = z
+            .unpartition()
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        output.copy_from_slice(&host);
+        Ok(())
+    }
+}
+
+impl CutileMatMul {
+    /// Both A and B are already on device — no host-to-device upload needed.
+    ///
+    /// A: [M, K] on device, B: [N, K] on device (B-transposed layout).
+    /// Writes [M, N] result to `output` on the host.
+    pub fn forward_bt_device(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        b: &Arc<Tensor<f32>>,
+        output: &mut Vec<f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let k_pad = k.div_ceil(BK) * BK;
+        let stream = &self.stream;
+
+        let z = api::zeros::<f32>(&[m, n])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([BM, BN]);
+
+        let generics = vec![
+            BM.to_string(),
+            BN.to_string(),
+            BK.to_string(),
+            k_pad.to_string(),
+        ];
+
+        let (z, _a, _b) = kernels::cutile_gemm_b_transposed(z, Arc::clone(a), Arc::clone(b))
+            .generics(generics)
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let host: Vec<f32> = z
+            .unpartition()
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        *output = host;
+        Ok(())
+    }
+
+    /// A on host, B already on device — only A is uploaded.
+    ///
+    /// A: [M, K] on host, B: [N, K] on device (B-transposed layout).
+    /// Writes [M, N] result to `output` on the host.
+    pub fn forward_bt_a_host_b_device(
+        &self,
+        a: &[f32],
+        b: &Arc<Tensor<f32>>,
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if a.len() != m * k {
+            return Err(KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+        }
+        if output.len() != m * n {
+            return Err(KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+        }
+
+        let k_pad = k.div_ceil(BK) * BK;
+        let stream = &self.stream;
+
+        let a_vec = if k_pad == k {
+            Arc::new(a.to_vec())
+        } else {
+            let mut padded = vec![0.0f32; m * k_pad];
+            for r in 0..m {
+                padded[r * k_pad..r * k_pad + k].copy_from_slice(&a[r * k..(r + 1) * k]);
+            }
+            Arc::new(padded)
+        };
+
+        let x: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&a_vec)
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .reshape(&[m, k_pad])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+
+        let z = api::zeros::<f32>(&[m, n])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([BM, BN]);
+
+        let generics = vec![
+            BM.to_string(),
+            BN.to_string(),
+            BK.to_string(),
+            k_pad.to_string(),
+        ];
+
+        let (z, _x, _b) = kernels::cutile_gemm_b_transposed(z, x, Arc::clone(b))
+            .generics(generics)
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let host: Vec<f32> = z
+            .unpartition()
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        output.copy_from_slice(&host);
+        Ok(())
+    }
+
+    /// GEMV path for `forward_b_transposed` when m == 1.
+    ///
+    /// Uses smaller BM_GEMV×BN_GEMV tiles that better amortise memory latency
+    /// for a single-row output on Blackwell hardware.
+    fn forward_gemv(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        output: &mut [f32],
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let m = 1usize;
+        let k_pad = k.div_ceil(BK_GEMV) * BK_GEMV;
+        let (a_vec, b_vec) = if k_pad == k {
+            (Arc::new(a.to_vec()), Arc::new(b.to_vec()))
+        } else {
+            let mut a_padded = vec![0.0f32; k_pad];
+            a_padded[..k].copy_from_slice(a);
+            let mut b_padded = vec![0.0f32; n * k_pad];
+            for r in 0..n {
+                b_padded[r * k_pad..r * k_pad + k].copy_from_slice(&b[r * k..(r + 1) * k]);
+            }
+            (Arc::new(a_padded), Arc::new(b_padded))
+        };
+
+        let stream = &self.stream;
+
+        let z = api::zeros::<f32>(&[m, n])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([BM_GEMV, BN_GEMV]);
+
+        let x: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&a_vec)
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .reshape(&[m, k_pad])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+
+        let y: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&b_vec)
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .reshape(&[n, k_pad])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+
+        let generics = vec![
+            BM_GEMV.to_string(),
+            BN_GEMV.to_string(),
+            BK_GEMV.to_string(),
+            k_pad.to_string(),
+        ];
+
+        let (z, _x, _y) = kernels::cutile_gemm_b_transposed(z, x, y)
+            .generics(generics)
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let host: Vec<f32> = z
+            .unpartition()
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        output.copy_from_slice(&host);
+        Ok(())
+    }
+
+    /// Full device-to-device: A and B on device, output stays on device.
+    ///
+    /// A: [M, K] on device, B: [N, K] on device (B-transposed layout).
+    /// Returns [M, N] tensor on device — no host round-trip.
+    pub fn forward_bt_device_to_device(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        b: &Arc<Tensor<f32>>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let k_pad = k.div_ceil(BK) * BK;
+        let stream = &self.stream;
+
+        let z = api::zeros::<f32>(&[m, n])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([BM, BN]);
+
+        let generics = vec![
+            BM.to_string(),
+            BN.to_string(),
+            BK.to_string(),
+            k_pad.to_string(),
+        ];
+
+        let (z, _a, _b) = kernels::cutile_gemm_b_transposed(z, Arc::clone(a), Arc::clone(b))
+            .generics(generics)
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        Ok(Arc::new(z.unpartition()))
     }
 }

@@ -3425,6 +3425,8 @@ name = "tempura-engine"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "cuda-core",
+ "cutile",
  "memmap2",
  "minijinja",
  "proptest",

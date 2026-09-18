@@ -11,7 +11,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 [features]
 default = []
 cuda = ["tempura-kernels/cuda"]
-cutile = ["tempura-kernels/cutile"]
+cutile = ["tempura-kernels/cutile", "dep:cutile", "dep:cuda-core"]
 edge-metrics = []
 
 [dependencies]
@@ -27,6 +27,8 @@ memmap2 = "0.9"
 sha2 = "0.10"
 rand = "0.9"
 rayon = "1"
+cutile = { version = "0.3.1", optional = true }
+cuda-core = { version = "0.3.1", optional = true }
 minijinja = "2"
 vstd = { workspace = true }
 

@@ -1897,7 +1897,12 @@ where
 ///
 /// Uses cutile kernels (flash attention, RMSNorm, RoPE, GEMM) compiled at
 /// runtime via the cuTile JIT — no `cargo oxide build` required. Quantized
-/// weight projections use CPU dequant + cutile GEMM (GPU dequant is a TODO).
+/// Inference wrapper that uses cuTile GPU kernels for all projection GEMMs.
+///
+/// On the first [`load_weights`] call, all weight matrices are dequantized once on the
+/// CPU and uploaded to the GPU as f32 tensors.  Subsequent [`forward`] calls use
+/// [`CutileGpuModel::forward`], which pays only O(h) activation transfers per layer
+/// rather than uploading the full weight matrices on every token.
 #[cfg(feature = "cutile")]
 pub struct CutileInferenceWrapper {
     pub model: TransformerModel<
@@ -1907,6 +1912,8 @@ pub struct CutileInferenceWrapper {
         tempura_kernels::cutile_matmul::CutileMatMul,
         tempura_kernels::sampling::CpuSampler,
     >,
+    /// Pre-uploaded GPU weights.  `None` until [`load_weights`] is called.
+    gpu_model: Option<crate::cutile_gpu_forward::CutileGpuModel>,
 }
 
 #[cfg(feature = "cutile")]
@@ -1920,7 +1927,7 @@ impl CutileInferenceWrapper {
             weights: None,
             quantized_weights: None,
         };
-        Self { model }
+        Self { model, gpu_model: None }
     }
 }
 
@@ -1933,9 +1940,16 @@ impl InferenceModel for CutileInferenceWrapper {
         self.model.weights.is_some() || self.model.quantized_weights.is_some()
     }
     fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
+        // Fast path: all-GPU projection GEMMs with pre-uploaded weights.
+        if let (Some(gm), Some(qw)) = (&self.gpu_model, &self.model.quantized_weights) {
+            let logits = gm.forward(session, token_ids, qw);
+            session.cache.advance(token_ids.len());
+            session.position += token_ids.len();
+            return logits;
+        }
+        // Fallback: CPU forward (no quantized weights or GPU model not ready).
         let logits = self.model.forward(session, token_ids);
-        session.position += token_ids.len();
-        session.cache.advance(token_ids.len());
+        // model.forward already advances session; avoid double-advance here.
         logits
     }
     fn generate(
@@ -2007,7 +2021,30 @@ impl InferenceModel for CutileInferenceWrapper {
         &mut self,
         loader: &dyn crate::loader::WeightLoader,
     ) -> Result<(), crate::weights::WeightsError> {
-        self.model.load_weights(loader)
+        self.model.load_weights(loader)?;
+        // After loading, dequantize and upload all projection weights to the GPU.
+        if let Some(qw) = &self.model.quantized_weights {
+            match crate::cutile_gpu_forward::CutileGpuModel::from_quantized(qw, &self.model.config) {
+                Ok(gm) => {
+                    self.gpu_model = Some(gm);
+                    eprintln!("[cutile] GPU model ready: {} layers, projection weights pre-uploaded", self.model.config.num_layers);
+                }
+                Err(e) => {
+                    eprintln!("[cutile] GPU weight upload failed ({e}), falling back to CPU forward");
+                }
+            }
+        } else if let Some(mw) = &self.model.weights {
+            match crate::cutile_gpu_forward::CutileGpuModel::from_f32(mw, &self.model.config) {
+                Ok(gm) => {
+                    self.gpu_model = Some(gm);
+                    eprintln!("[cutile] GPU model ready: {} layers, f32 weights pre-uploaded", self.model.config.num_layers);
+                }
+                Err(e) => {
+                    eprintln!("[cutile] GPU weight upload failed ({e}), falling back to CPU forward");
+                }
+            }
+        }
+        Ok(())
     }
 }
 

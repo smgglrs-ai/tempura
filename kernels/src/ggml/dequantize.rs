@@ -862,6 +862,108 @@ fn cast_blocks_aligned<T: Copy>(data: &[u8], num_elements: usize, block_elems: u
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const T, nb) }
 }
 
+/// Dequantize a raw byte buffer of ggml-quantized weights to f32.
+///
+/// `n_elements` must be divisible by the dtype's block size.
+/// Panics on unsupported dtypes (F16, BF16, iX scalar types, Q8_1, Q8K).
+pub fn dequantize_to_f32(
+    dtype: super::GgmlType,
+    bytes: &[u8],
+    n_elements: usize,
+) -> Vec<f32> {
+    use super::blocks::*;
+    use super::GgmlType;
+
+    let mut out = vec![0.0f32; n_elements];
+    match dtype {
+        GgmlType::F32 => {
+            assert_eq!(bytes.len(), n_elements * 4, "F32 byte length mismatch");
+            let floats = unsafe {
+                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_elements)
+            };
+            out.copy_from_slice(floats);
+        }
+        GgmlType::Q4_0 => {
+            let blocks = cast_blocks_aligned::<BlockQ4_0>(bytes, n_elements, 32);
+            dequantize_row_q4_0(blocks, &mut out);
+        }
+        GgmlType::Q4_1 => {
+            let blocks = cast_blocks_aligned::<BlockQ4_1>(bytes, n_elements, 32);
+            dequantize_row_q4_1(blocks, &mut out);
+        }
+        GgmlType::Q5_0 => {
+            let blocks = cast_blocks_aligned::<BlockQ5_0>(bytes, n_elements, 32);
+            dequantize_row_q5_0(blocks, &mut out);
+        }
+        GgmlType::Q5_1 => {
+            let blocks = cast_blocks_aligned::<BlockQ5_1>(bytes, n_elements, 32);
+            dequantize_row_q5_1(blocks, &mut out);
+        }
+        GgmlType::Q8_0 => {
+            let blocks = cast_blocks_aligned::<BlockQ8_0>(bytes, n_elements, 32);
+            dequantize_row_q8_0(blocks, &mut out);
+        }
+        GgmlType::Q2K => {
+            let blocks = cast_blocks_aligned::<BlockQ2K>(bytes, n_elements, 256);
+            dequantize_row_q2_k(blocks, &mut out);
+        }
+        GgmlType::Q3K => {
+            let blocks = cast_blocks_aligned::<BlockQ3K>(bytes, n_elements, 256);
+            dequantize_row_q3_k(blocks, &mut out);
+        }
+        GgmlType::Q4K => {
+            let blocks = cast_blocks_aligned::<BlockQ4K>(bytes, n_elements, 256);
+            dequantize_row_q4_k(blocks, &mut out);
+        }
+        GgmlType::Q5K => {
+            let blocks = cast_blocks_aligned::<BlockQ5K>(bytes, n_elements, 256);
+            dequantize_row_q5_k(blocks, &mut out);
+        }
+        GgmlType::Q6K => {
+            let blocks = cast_blocks_aligned::<BlockQ6K>(bytes, n_elements, 256);
+            dequantize_row_q6_k(blocks, &mut out);
+        }
+        GgmlType::TQ2_0 => {
+            let blocks = cast_blocks_aligned::<BlockTQ2_0>(bytes, n_elements, 256);
+            dequantize_row_tq2_0(blocks, &mut out);
+        }
+        GgmlType::TQ1_0 => {
+            let blocks = cast_blocks_aligned::<BlockTQ1_0>(bytes, n_elements, 256);
+            dequantize_row_tq1_0(blocks, &mut out);
+        }
+        GgmlType::IQ2XXS => {
+            let blocks = cast_blocks_aligned::<BlockIQ2XXS>(bytes, n_elements, 256);
+            dequantize_row_iq2_xxs(blocks, &mut out);
+        }
+        GgmlType::IQ2XS => {
+            let blocks = cast_blocks_aligned::<BlockIQ2XS>(bytes, n_elements, 256);
+            dequantize_row_iq2_xs(blocks, &mut out);
+        }
+        GgmlType::IQ2S => {
+            let blocks = cast_blocks_aligned::<BlockIQ2S>(bytes, n_elements, 256);
+            dequantize_row_iq2_s(blocks, &mut out);
+        }
+        GgmlType::IQ3XXS => {
+            let blocks = cast_blocks_aligned::<BlockIQ3XXS>(bytes, n_elements, 256);
+            dequantize_row_iq3_xxs(blocks, &mut out);
+        }
+        GgmlType::IQ3S => {
+            let blocks = cast_blocks_aligned::<BlockIQ3S>(bytes, n_elements, 256);
+            dequantize_row_iq3_s(blocks, &mut out);
+        }
+        GgmlType::MXFP4 => {
+            let blocks = cast_blocks_aligned::<BlockMxfp4>(bytes, n_elements, 32);
+            dequantize_row_mxfp4(blocks, &mut out);
+        }
+        GgmlType::NVFP4 => {
+            let blocks = cast_blocks_aligned::<BlockNvfp4>(bytes, n_elements, 64);
+            dequantize_row_nvfp4(blocks, &mut out);
+        }
+        other => panic!("dequantize_to_f32: unsupported dtype {:?}", other),
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
