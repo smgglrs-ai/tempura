@@ -94,6 +94,13 @@ const BM: usize = 64;
 const BN: usize = 64;
 const BK: usize = 16;
 
+/// Round up to the next power-of-2 ≥ x. Required: cuTile JIT on sm_120
+/// rejects non-power-of-2 K const generics in MMA-accumulation loops.
+fn next_pow2(x: usize) -> usize {
+    if x <= 1 { return 1; }
+    1usize << (usize::BITS - (x - 1).leading_zeros()) as usize
+}
+
 // Decode/GEMV path (m == 1): wide N tiles amortise memory latency better than
 // a square BM×BN block when there is only one output row.
 const BM_GEMV: usize = 1;
@@ -134,7 +141,7 @@ impl MatMul for CutileMatMul {
         }
 
         // Pad K to multiple of BK if necessary
-        let k_pad = k.div_ceil(BK) * BK;
+        let k_pad = next_pow2(k.div_ceil(BK) * BK);
         let (a_vec, b_vec) = if k_pad == k {
             (Arc::new(a.to_vec()), Arc::new(b.to_vec()))
         } else {
@@ -227,7 +234,7 @@ impl MatMul for CutileMatMul {
         }
 
         // Pad K to multiple of BK if necessary
-        let k_pad = k.div_ceil(BK) * BK;
+        let k_pad = next_pow2(k.div_ceil(BK) * BK);
         let (a_vec, b_vec) = if k_pad == k {
             (Arc::new(a.to_vec()), Arc::new(b.to_vec()))
         } else {
@@ -382,7 +389,7 @@ impl CutileMatMul {
         n: usize,
         k: usize,
     ) -> Result<()> {
-        let k_pad = k.div_ceil(BK) * BK;
+        let k_pad = next_pow2(k.div_ceil(BK) * BK);
         let stream = &self.stream;
 
         let z = api::zeros::<f32>(&[m, n])
@@ -432,7 +439,7 @@ impl CutileMatMul {
             return Err(KernelError::DimensionMismatch { expected: m * n, got: output.len() });
         }
 
-        let k_pad = k.div_ceil(BK) * BK;
+        let k_pad = next_pow2(k.div_ceil(BK) * BK);
         let stream = &self.stream;
 
         let a_vec = if k_pad == k {
@@ -492,7 +499,7 @@ impl CutileMatMul {
         k: usize,
     ) -> Result<()> {
         let m = 1usize;
-        let k_pad = k.div_ceil(BK_GEMV) * BK_GEMV;
+        let k_pad = next_pow2(k.div_ceil(BK_GEMV) * BK_GEMV);
         let (a_vec, b_vec) = if k_pad == k {
             (Arc::new(a.to_vec()), Arc::new(b.to_vec()))
         } else {
@@ -560,7 +567,7 @@ impl CutileMatMul {
         n: usize,
         k: usize,
     ) -> Result<Arc<Tensor<f32>>> {
-        let k_pad = k.div_ceil(BK) * BK;
+        let k_pad = next_pow2(k.div_ceil(BK) * BK);
         let stream = &self.stream;
 
         let z = api::zeros::<f32>(&[m, n])

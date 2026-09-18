@@ -17,6 +17,10 @@ path = "src/bench_e2e.rs"
 name = "bench-attn"
 path = "src/bench_attn.rs"
 
+[[bin]]
+name = "bench-real-model"
+path = "src/bench_real_model.rs"
+
 [dependencies]
 tempura-kernels = { path = "../../kernels", features = ["cutile"] }
 tempura-engine = { path = "../../engine", features = ["cutile"] }

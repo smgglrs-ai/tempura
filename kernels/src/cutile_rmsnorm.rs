@@ -1,4 +1,10 @@
 use std::sync::Arc;
+
+fn next_pow2(x: usize) -> usize {
+    if x <= 1 { return 1; }
+    1usize << (usize::BITS - (x - 1).leading_zeros()) as usize
+}
+
 use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
 use cutile::tensor::{IntoPartition, Tensor};
@@ -106,15 +112,39 @@ impl RMSNorm for CutileRmsNorm {
             return Ok(());
         }
 
+        // cuTile JIT on sm_120 requires tile/reduction dims to be power-of-2.
+        // Pad hidden_size to next power-of-2; padded elements are zero so they
+        // don't affect sum(x²) or the weighted output.
+        let h_pad = next_pow2(hidden_size);
+
         let stream = &self.stream;
 
-        // Upload x and weight once — shared across both passes.
-        let x_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(x.to_vec()))
+        // Upload x (zero-padded to h_pad per token) and weight (zero-padded).
+        let x_padded: Vec<f32> = if h_pad == hidden_size {
+            x.to_vec()
+        } else {
+            let mut v = vec![0.0f32; num_tokens * h_pad];
+            for t in 0..num_tokens {
+                v[t * h_pad..t * h_pad + hidden_size].copy_from_slice(
+                    &x[t * hidden_size..(t + 1) * hidden_size],
+                );
+            }
+            v
+        };
+        let w_padded: Vec<f32> = if h_pad == hidden_size {
+            weight.to_vec()
+        } else {
+            let mut v = vec![0.0f32; h_pad];
+            v[..hidden_size].copy_from_slice(weight);
+            v
+        };
+
+        let x_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(x_padded))
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .into();
 
-        let w_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(weight.to_vec()))
+        let w_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(w_padded))
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .into();
@@ -126,7 +156,7 @@ impl RMSNorm for CutileRmsNorm {
             .partition([1]);
 
         let (sum_t, x_t) = kernels::rmsnorm_sum_sq(sum_t, x_t)
-            .generics(vec![hidden_size.to_string()])
+            .generics(vec![h_pad.to_string()])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
@@ -148,13 +178,13 @@ impl RMSNorm for CutileRmsNorm {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .into();
 
-        let out_t = api::zeros::<f32>(&[num_tokens * hidden_size])
+        let out_t = api::zeros::<f32>(&[num_tokens * h_pad])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-            .partition([hidden_size]);
+            .partition([h_pad]);
 
         let (out_t, _x, _w, _s) = kernels::rmsnorm_apply(out_t, x_t, w_t, scale_t)
-            .generics(vec![hidden_size.to_string()])
+            .generics(vec![h_pad.to_string()])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
@@ -164,7 +194,15 @@ impl RMSNorm for CutileRmsNorm {
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-        x.copy_from_slice(&host);
+        // Trim padded output back to hidden_size per token.
+        if h_pad == hidden_size {
+            x.copy_from_slice(&host);
+        } else {
+            for t in 0..num_tokens {
+                x[t * hidden_size..(t + 1) * hidden_size]
+                    .copy_from_slice(&host[t * h_pad..t * h_pad + hidden_size]);
+            }
+        }
         Ok(())
     }
 }

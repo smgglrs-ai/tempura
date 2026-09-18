@@ -1914,6 +1914,9 @@ pub struct CutileInferenceWrapper {
     >,
     /// Pre-uploaded GPU weights.  `None` until [`load_weights`] is called.
     gpu_model: Option<crate::cutile_gpu_forward::CutileGpuModel>,
+    /// GPU-resident KV cache.  Created alongside `gpu_model` at weight-load time.
+    /// Wrapped in a Mutex so it can be mutated from `&self` forward calls.
+    gpu_kv_cache: Option<std::sync::Mutex<crate::cutile_kv_cache::CutileKvCache>>,
 }
 
 #[cfg(feature = "cutile")]
@@ -1927,7 +1930,7 @@ impl CutileInferenceWrapper {
             weights: None,
             quantized_weights: None,
         };
-        Self { model, gpu_model: None }
+        Self { model, gpu_model: None, gpu_kv_cache: None::<std::sync::Mutex<_>> }
     }
 }
 
@@ -1940,17 +1943,22 @@ impl InferenceModel for CutileInferenceWrapper {
         self.model.weights.is_some() || self.model.quantized_weights.is_some()
     }
     fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
-        // Fast path: all-GPU projection GEMMs with pre-uploaded weights.
-        if let (Some(gm), Some(qw)) = (&self.gpu_model, &self.model.quantized_weights) {
-            let logits = gm.forward(session, token_ids, qw);
+        // Fast path: device-to-device projections + GPU KV cache.
+        if let (Some(gm), Some(qw), Some(kv_mutex)) = (
+            &self.gpu_model,
+            &self.model.quantized_weights,
+            &self.gpu_kv_cache,
+        ) {
+            let mut kv = kv_mutex.lock().expect("GPU KV cache mutex poisoned");
+            let logits = gm.forward(session.position, token_ids, qw, &mut kv);
+            kv.advance(token_ids.len());
+            drop(kv);
             session.cache.advance(token_ids.len());
             session.position += token_ids.len();
             return logits;
         }
-        // Fallback: CPU forward (no quantized weights or GPU model not ready).
-        let logits = self.model.forward(session, token_ids);
-        // model.forward already advances session; avoid double-advance here.
-        logits
+        // Fallback: CPU forward (GPU model or KV cache not ready).
+        self.model.forward(session, token_ids)
     }
     fn generate(
         &self,
@@ -2022,22 +2030,41 @@ impl InferenceModel for CutileInferenceWrapper {
         loader: &dyn crate::loader::WeightLoader,
     ) -> Result<(), crate::weights::WeightsError> {
         self.model.load_weights(loader)?;
-        // After loading, dequantize and upload all projection weights to the GPU.
-        if let Some(qw) = &self.model.quantized_weights {
-            match crate::cutile_gpu_forward::CutileGpuModel::from_quantized(qw, &self.model.config) {
-                Ok(gm) => {
-                    self.gpu_model = Some(gm);
-                    eprintln!("[cutile] GPU model ready: {} layers, projection weights pre-uploaded", self.model.config.num_layers);
-                }
-                Err(e) => {
-                    eprintln!("[cutile] GPU weight upload failed ({e}), falling back to CPU forward");
-                }
-            }
+        // After loading, dequantize and upload all projection weights to the GPU,
+        // then create the GPU KV cache backed by the same CUDA stream.
+        let gpu_model_result = if let Some(qw) = &self.model.quantized_weights {
+            Some(crate::cutile_gpu_forward::CutileGpuModel::from_quantized(qw, &self.model.config))
         } else if let Some(mw) = &self.model.weights {
-            match crate::cutile_gpu_forward::CutileGpuModel::from_f32(mw, &self.model.config) {
+            Some(crate::cutile_gpu_forward::CutileGpuModel::from_f32(mw, &self.model.config))
+        } else {
+            None
+        };
+
+        if let Some(result) = gpu_model_result {
+            match result {
                 Ok(gm) => {
+                    // Share the matmul stream with the KV cache so uploads are
+                    // ordered on the same CUDA stream as the GEMM kernels.
+                    let stream = gm.stream();
+                    match crate::cutile_kv_cache::CutileKvCache::new(&self.model.config, stream) {
+                        Ok(kv) => {
+                            self.gpu_kv_cache = Some(std::sync::Mutex::new(kv));
+                            eprintln!(
+                                "[cutile] GPU KV cache allocated ({} layers × {} tokens × {} kv_dim)",
+                                self.model.config.num_layers,
+                                self.model.config.max_seq_len,
+                                self.model.config.num_kv_heads * self.model.config.head_dim,
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("[cutile] GPU KV cache creation failed ({e}); GPU forward disabled");
+                        }
+                    }
                     self.gpu_model = Some(gm);
-                    eprintln!("[cutile] GPU model ready: {} layers, f32 weights pre-uploaded", self.model.config.num_layers);
+                    eprintln!(
+                        "[cutile] GPU model ready (weights uploaded, kernels compiled): {} layers",
+                        self.model.config.num_layers
+                    );
                 }
                 Err(e) => {
                     eprintln!("[cutile] GPU weight upload failed ({e}), falling back to CPU forward");

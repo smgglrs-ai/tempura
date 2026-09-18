@@ -6,7 +6,7 @@ use tempura_engine::session::InferenceSession;
 use tempura_engine::trace::TraceLevel;
 use tempura_engine::model::InferenceModel;
 
-const WARMUP: usize = 5;
+const WARMUP: usize = 30;
 const ITERS: usize = 50;
 
 struct RandomWeightLoader {
@@ -75,7 +75,8 @@ fn main() {
         config.head_dim,
         config.vocab_size,
     );
-    println!("  Warmup: {WARMUP}, Iters: {ITERS}\n");
+    println!("  Warmup: {WARMUP}, Iters: {ITERS}");
+    println!("  Note: first ~15 iters include JIT compilation — stable numbers start around iter 15\n");
 
     let loader = RandomWeightLoader::new(&config);
     let mut wrapper = CutileInferenceWrapper::new(config.clone());
@@ -115,17 +116,21 @@ fn main() {
     println!();
 
     // --- Decode benchmark: single-token autoregressive steps ---
+    // Use fresh sessions for each warmup/measure pass so position never overflows
+    // the tiny_test KV cache (max_seq_len=128). GPU kernels remain JIT-compiled
+    // after the first warmup session, so later measurements are kernel-stable.
     println!("─── Decode (single token, autoregressive) ───");
-    let mut session = InferenceSession::new(&config, TraceLevel::Off, 0);
-    wrapper.forward(&mut session, &prompt);
-
     let decode_token = [42u32];
     for _ in 0..WARMUP {
+        let mut session = InferenceSession::new(&config, TraceLevel::Off, 0);
+        wrapper.forward(&mut session, &prompt);
         wrapper.forward(&mut session, &decode_token);
     }
 
     let mut decode_times = Vec::with_capacity(ITERS);
     for _ in 0..ITERS {
+        let mut session = InferenceSession::new(&config, TraceLevel::Off, 0);
+        wrapper.forward(&mut session, &prompt);
         let start = Instant::now();
         wrapper.forward(&mut session, &decode_token);
         decode_times.push(start.elapsed().as_micros() as f64);
