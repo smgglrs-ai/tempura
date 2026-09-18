@@ -34,6 +34,8 @@ pub mod kernels {
     /// GEMM with B transposed: z = x @ y^T
     /// Shapes: z: [M, N], x: [M, K], y: [N, K]
     /// Tile dimensions: BM, BN, BK; K must be divisible by BK.
+    /// GEMM with B transposed: z = x @ y^T
+    /// Accumulator starts at 0 in registers — caller need NOT pre-zero z.
     #[cutile::entry()]
     pub fn cutile_gemm_b_transposed<const BM: i32, const BN: i32, const BK: i32, const K: i32>(
         z: &mut Tensor<f32, { [BM, BN] }>,
@@ -44,7 +46,8 @@ pub mod kernels {
         let part_y = y.partition(shape![BN, BK]);
         let pid_m = program_id(0);
         let pid_n = program_id(1);
-        let mut tile_z = load_tile_mut(z);
+        // Zero accumulator in registers — no memory load, no pre-zero of z required.
+        let mut tile_z: Tile<f32, { [BM, BN] }> = broadcast_scalar(0.0f32, shape![BM, BN]);
         for i in 0i32..(K / BK) {
             let tile_x = part_x.load([pid_m, i]);
             let tile_y = part_y.load([pid_n, i]);
@@ -553,6 +556,46 @@ impl CutileMatMul {
 
         output.copy_from_slice(&host);
         Ok(())
+    }
+
+    /// Device-to-device GEMM reusing a caller-supplied pre-allocated output buffer.
+    ///
+    /// `out` must contain exactly m×n elements (typically pre-allocated as a 1-D
+    /// tensor via `api::zeros::<f32>(&[n])`). It is zeroed in-place then reshaped
+    /// to `[m, n]` — no new device allocation is made. Returns the filled tensor
+    /// as an `Arc` so the caller can store a clone in a scratch pool and later
+    /// reclaim the underlying `Tensor<f32>` via `Arc::try_unwrap` once its
+    /// reference count drops to one.
+    pub fn forward_bt_d2d_into(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        b: &Arc<Tensor<f32>>,
+        out: Tensor<f32>,
+        m: usize,
+        n: usize,
+        k_pad: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let stream = &self.stream;
+
+        // Kernel initializes accumulator to 0 in registers — no fill needed.
+        let z = out
+            .reshape(&[m, n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([BM, BN]);
+
+        let generics = vec![
+            BM.to_string(),
+            BN.to_string(),
+            BK.to_string(),
+            k_pad.to_string(),
+        ];
+
+        let (z, _a, _b) = kernels::cutile_gemm_b_transposed(z, Arc::clone(a), Arc::clone(b))
+            .generics(generics)
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        Ok(Arc::new(z.unpartition()))
     }
 
     /// Full device-to-device: A and B on device, output stays on device.
