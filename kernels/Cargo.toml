@@ -11,7 +11,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 [features]
 default = ["cpu"]
 cpu = []
-cuda = ["dep:cuda-device", "dep:cuda-host", "dep:cuda-core"]
+cuda = ["cutile"]
 cutile = ["dep:cutile", "dep:cuda-core"]
 npu-intel = []
 npu-qualcomm = []

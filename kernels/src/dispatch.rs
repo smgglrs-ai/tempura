@@ -1,4 +1,4 @@
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 use crate::gpu::GpuContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,7 +12,7 @@ pub enum GpuArch {
 }
 
 impl GpuArch {
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", not(feature = "cutile")))]
     pub fn detect(ctx: &GpuContext) -> Self {
         let (major, minor) = ctx.context().compute_capability().unwrap_or((0, 0));
         Self::from_sm(major, minor)
@@ -99,13 +99,13 @@ impl Q4KKernelConfig {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 pub struct GpuKernelDispatcher {
     pub arch: GpuArch,
     pub q4k: crate::quantized::CudaMatMulQ4K,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl GpuKernelDispatcher {
     pub fn new() -> crate::Result<Self> {
         let q4k = crate::quantized::CudaMatMulQ4K::new()?;
@@ -144,14 +144,14 @@ impl GpuKernelDispatcher {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 pub struct CachedDispatch {
     q4k: crate::quantized::CudaMatMulQ4K,
     nwarps: Vec<u8>,
     index: std::collections::HashMap<String, usize>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl CachedDispatch {
     pub fn new(arch: GpuArch, projections: &[(&str, usize, usize)]) -> crate::Result<Self> {
         let q4k = crate::quantized::CudaMatMulQ4K::new()?;

@@ -14,7 +14,7 @@ pub mod allreduce;
 pub mod attention;
 pub mod dispatch;
 pub mod fused;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 pub mod gpu;
 #[cfg(feature = "cutile")]
 pub mod cutile_elementwise;

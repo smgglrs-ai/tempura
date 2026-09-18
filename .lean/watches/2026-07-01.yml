@@ -1,0 +1,117 @@
+date: "2026-07-01"
+mode: reactive
+method: deep-research (4 parallel workflows, 427 agents, 18.7M tokens)
+sources:
+  - url: "https://arxiv.org/abs/2602.06036"
+    title: "DFlash — Block-Diffusion Speculative Decoding (ICML 2026)"
+    impact: HIGH
+    relationship: complements
+
+  - url: "https://developer.nvidia.com/blog/boost-inference-performance-up-to-15x-on-nvidia-blackwell-using-dflash-speculative-decoding/"
+    title: "NVIDIA dFlash Blog"
+    impact: HIGH
+    relationship: complements
+
+  - url: "https://github.com/deepseek-ai/DeepSpec"
+    title: "DeepSpec — DSpark + DFlash + EAGLE-3 framework"
+    impact: HIGH
+    relationship: complements
+
+  - url: "https://github.com/z-lab/dflash"
+    title: "DFlash Reference Implementation"
+    impact: HIGH
+    relationship: complements
+
+  - url: "https://github.com/llm-d/llm-d"
+    title: "llm-d — Kubernetes-native disaggregated inference"
+    impact: MEDIUM
+    relationship: complements
+
+  - url: "https://developers.redhat.com/articles/2026/06/15/llamacpp-vs-vllm-choosing-right-local-llm-inference-engine"
+    title: "llama.cpp vs vLLM (Red Hat)"
+    impact: MEDIUM
+    relationship: validates
+
+  - url: "https://www.freecodecamp.org/news/how-to-build-a-production-architecture-for-small-language-model-fleets/"
+    title: "SLM Fleet Architecture"
+    impact: LOW
+    relationship: validates
+
+  - url: "https://www.fool.com/investing/2026/06/30/deepseeks-dspark-just-made-nvidias-most-important/"
+    title: "DSpark Impact Analysis (corrected)"
+    impact: MEDIUM
+    relationship: watch
+
+findings:
+  - source: "https://arxiv.org/abs/2602.06036"
+    title: "DFlash block-diffusion speculative decoding"
+    action: plan
+    detail: |
+      Implement DFlash-style block-diffusion drafting in tempura engine.
+      Key technical details (verified 3-0):
+      - Generates 16 masked tokens in single parallel forward pass
+      - Target hidden-state features injected into KV projections at
+        EVERY draft layer (not just first like EAGLE-3)
+      - Acceptance length scales with drafter depth (monotonic)
+      - Honest speedup: 3-6x single-stream (NVIDIA's 15x is cherry-picked
+        for gpt-oss-120b on 8x DGX B300 at specific interactivity target)
+      - 22 HF checkpoints (z-lab/), 4 backends (Transformers, SGLang,
+        vLLM v0.20.1+, MLX)
+      - Excels on structured/tool-call output (8-12 token acceptance)
+      - INCOMPATIBLE with KV cache quantization (locked to bf16) —
+        tempura could differentiate by combining both
+      - Component architecture (draft model, not standalone engine) fits
+        tempura's modular design
+      Reference: arxiv.org/abs/2602.06036 (ICML 2026)
+
+  - source: "https://github.com/deepseek-ai/DeepSpec"
+    title: "DSpark is GPU-based, not ASIC"
+    action: dismiss
+    detail: |
+      Initial analysis incorrectly claimed DSpark targets custom ASICs.
+      Deep research verified DSpark runs on standard NVIDIA GPUs.
+      Claims 1.6-1.85x per-user speedup (not 60-85% as Motley Fool
+      article implied). Both DSpark and DFlash are in DeepSpec (MIT).
+      DSpark does NOT target DeepSeek's own MLA models — only Qwen3
+      and Gemma 4. Corrected threat assessment: LOW, not HIGH.
+
+  - source: "https://github.com/llm-d/llm-d"
+    title: "llm-d is orchestration, not inference"
+    action: watch
+    detail: |
+      CNCF sandbox project (Red Hat, Google, IBM, CoreWeave, NVIDIA).
+      Kubernetes-native orchestration ABOVE model servers (vLLM, SGLang).
+      Not a competitor — tempura could register as a model server
+      backend for llm-d orchestration. Monitor for Rust model server
+      interface requirements.
+
+  - source: "https://developers.redhat.com/articles/2026/06/15/llamacpp-vs-vllm-choosing-right-local-llm-inference-engine"
+    title: "Red Hat validates tempura design space"
+    action: dismiss
+    detail: "vLLM 44x more tokens/sec than llama.cpp at scale. Rust-native is differentiated from both."
+
+  - source: "DFlash limitation"
+    title: "DFlash + KV quantization gap"
+    action: investigate
+    questions:
+      - "Can tempura combine block-diffusion drafting with quantized KV cache?"
+      - "DFlash is locked to bf16 — no one has solved this yet"
+      - "Potential unique differentiator if tempura cracks it"
+    detail: "DFlash incompatible with KV cache quantization — formal verification could prove correctness of combined approach"
+
+  - source: "https://github.com/deepseek-ai/DeepSpec"
+    title: "DeepSpec V4 drafters"
+    action: watch
+    detail: "DeepSeek-V4 DFlash drafters listed as 'coming soon' — would bring MLA-based models to speculative decoding"
+
+follow_ups_resolved:
+  - from_watch: "2026-06-19"
+    title: "KV cache compression (TurboQuant/OSCAR/EpiCache)"
+    resolution: "No new developments this cycle. DFlash incompatibility with KV quantization creates differentiation opportunity."
+
+summary: |
+  11 inference-related sources analyzed. 1 plan item (DFlash implementation).
+  Key correction: DSpark is GPU-based (not ASIC), 1.6-1.85x (not 60-85%).
+  DFlash honest range is 3-6x (not 15x). llm-d is orchestration above
+  model servers, not a competitor. DFlash+KV quantization gap is a unique
+  differentiation opportunity for tempura's formally-verified approach.

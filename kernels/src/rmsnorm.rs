@@ -1,7 +1,7 @@
 pub use crate::RMSNorm;
 use crate::Result;
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 use cuda_core::DeviceBuffer;
 
 #[cfg(feature = "cpu")]
@@ -135,7 +135,7 @@ impl RMSNorm for CpuRMSNormDet {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 pub struct CudaRMSNorm {
     gpu: crate::gpu::GpuContext,
     module: crate::gpu::rmsnorm_kernel::kernels::LoadedModule,
@@ -143,12 +143,12 @@ pub struct CudaRMSNorm {
     pub deterministic: bool,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Send for CudaRMSNorm {}
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Sync for CudaRMSNorm {}
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl CudaRMSNorm {
     pub fn gpu(&self) -> &crate::gpu::GpuContext {
         &self.gpu
@@ -169,7 +169,7 @@ impl CudaRMSNorm {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl CudaRMSNorm {
     pub fn forward_device(
         &self,
@@ -248,7 +248,7 @@ impl CudaRMSNorm {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl RMSNorm for CudaRMSNorm {
     fn forward(&self, x: &mut [f32], weight: &[f32], hidden_size: usize, eps: f32) -> Result<()> {
         use cuda_core::LaunchConfig;
@@ -485,3 +485,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(feature = "cuda")]
+pub type CudaRMSNorm = crate::cutile_rmsnorm::CutileRmsNorm;

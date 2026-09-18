@@ -31,7 +31,7 @@ tracing-opentelemetry = { version = "0.28", optional = true }
 
 [features]
 default = []
-cuda = ["tempura-engine/cuda"]
+cuda = ["tempura-engine/cutile", "cutile"]
 cutile = ["tempura-engine/cutile"]
 otlp = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 

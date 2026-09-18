@@ -110,14 +110,6 @@ pub type CpuModel = TransformerModel<
     tempura_kernels::sampling::CpuSampler,
 >;
 
-#[cfg(feature = "cuda")]
-pub type CudaModel = TransformerModel<
-    tempura_kernels::attention::CudaAttention,
-    tempura_kernels::rmsnorm::CudaRMSNorm,
-    tempura_kernels::rope::CudaRoPE,
-    tempura_kernels::matmul::CudaMatMul,
-    tempura_kernels::sampling::CpuSampler,
->;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -215,21 +207,14 @@ async fn main() {
 async fn run_server(args: ServeArgs) {
     init_tracing(&args.otlp_endpoint);
 
-    if args.device == "cuda" && !cfg!(feature = "cuda") {
-        eprintln!("Error: --device cuda requires building with --features cuda");
+    let use_gpu = (args.device == "cuda" || args.device == "cutile") && cfg!(feature = "cutile");
+    if (args.device == "cuda" || args.device == "cutile") && !cfg!(feature = "cutile") {
+        eprintln!("Error: --device {} requires building with --features cutile (or cuda)", args.device);
         std::process::exit(1);
     }
-    if args.device == "cutile" && !cfg!(feature = "cutile") {
-        eprintln!("Error: --device cutile requires building with --features cutile");
-        std::process::exit(1);
-    }
-    let use_cuda = args.device == "cuda" && cfg!(feature = "cuda");
-    let use_cutile = args.device == "cutile" && cfg!(feature = "cutile");
     tracing::info!(
         "Using {} kernels",
-        if use_cuda {
-            "CUDA GPU (cuda-oxide)"
-        } else if use_cutile {
+        if use_gpu {
             "CUDA GPU (cuTile)"
         } else {
             "CPU reference"
@@ -260,41 +245,12 @@ async fn run_server(args: ServeArgs) {
                        loader: &dyn tempura_engine::loader::WeightLoader|
      -> Arc<dyn tempura_engine::InferenceModel> {
         #[cfg(feature = "cutile")]
-        if use_cutile {
+        if use_gpu {
             use tempura_engine::InferenceModel;
             let mut wrapper = tempura_engine::CutileInferenceWrapper::new(config.clone());
             wrapper.load_weights(loader).unwrap();
             tracing::info!("cuTile GPU inference ready");
             return Arc::new(wrapper);
-        }
-        #[cfg(feature = "cuda")]
-        if use_cuda {
-            let pipeline = KernelPipeline::cuda();
-            let mut model = TransformerModel::new(config.clone(), pipeline);
-            model.load_weights(loader).unwrap();
-
-            let ctx = model.pipeline.matmul.gpu().context().clone();
-            let gpu_weights = tempura_engine::GpuWeights::upload_from_with_concat(
-                model.weights.as_ref().unwrap(),
-                config,
-                &ctx,
-            )
-            .expect("GPU weight upload failed");
-            ctx.bind_to_thread().unwrap();
-            let stream = ctx.default_stream();
-            let gpu_cache = tempura_engine::GpuKvCache::new(config, &stream)
-                .expect("GPU KV cache allocation failed");
-
-            let scratchpad = tempura_engine::GpuScratchpad::new(config, &stream)
-                .expect("GPU scratchpad allocation failed");
-
-            tracing::info!("Uploaded weights and KV cache to GPU");
-            return Arc::new(tempura_engine::GpuInferenceWrapper {
-                model,
-                gpu_weights,
-                gpu_cache: std::sync::Mutex::new(gpu_cache),
-                scratchpad: std::sync::Mutex::new(scratchpad),
-            });
         }
         let pipeline = KernelPipeline::cpu_verified();
         let mut model = TransformerModel::new(config.clone(), pipeline);
@@ -332,89 +288,12 @@ async fn run_server(args: ServeArgs) {
 
         #[allow(unused_mut)]
         let mut model: Arc<dyn tempura_engine::InferenceModel> = {
-            #[cfg(feature = "cuda")]
-            if use_cuda {
-                let q4k_matmul = tempura_kernels::quantized::CudaMatMulQ4K::new().unwrap();
-                let ctx = q4k_matmul.gpu().context().clone();
-                ctx.bind_to_thread().unwrap();
-
-                let attention =
-                    tempura_kernels::attention::CudaAttention::with_context(ctx.clone()).unwrap();
-                let mut rmsnorm =
-                    tempura_kernels::rmsnorm::CudaRMSNorm::with_context(ctx.clone()).unwrap();
-                let mut rope =
-                    tempura_kernels::rope::CudaRoPE::with_context(ctx.clone()).unwrap();
-                let matmul =
-                    tempura_kernels::matmul::CudaMatMul::with_context(ctx.clone()).unwrap();
-                eprintln!("[gpu] uploading quantized weights...");
-                let gpu_weights =
-                    tempura_engine::GpuWeights::upload_from_quantized(&qweights, &ctx)
-                        .expect("GPU quantized weight upload failed");
-                eprintln!("[gpu] weights uploaded: {} q + {} f32", gpu_weights.quantized_count(), gpu_weights.f32_count());
-
-                ctx.bind_to_thread().unwrap();
-                let stream_ref = ctx.default_stream();
-                eprintln!("[gpu] allocating KV cache (max_seq_len={})...", config.max_seq_len);
-                let gpu_cache = tempura_engine::GpuKvCache::new(&config, &stream_ref)
-                    .expect("GPU KV cache allocation failed");
-                eprintln!("[gpu] KV cache allocated, allocating scratchpad...");
-                let scratchpad = tempura_engine::GpuScratchpad::new(&config, &stream_ref)
-                    .expect("GPU scratchpad allocation failed");
-                eprintln!("[gpu] scratchpad allocated");
-
-                let embed = qweights
-                    .get_f32("model.embed_tokens.weight")
-                    .unwrap()
-                    .to_vec();
-                tracing::info!(
-                    "Uploaded quantized weights to GPU ({} Q4K + {} Q6K + {} f32 tensors)",
-                    gpu_weights.quantized_count(),
-                    0, // Q6K counted in quantized_count
-                    gpu_weights.f32_count(),
-                );
-
-                let attn_mode: tempura_kernels::AttentionMode = args.attn_mode.parse()
-                    .unwrap_or_else(|e| { eprintln!("invalid --attn-mode: {e}"); std::process::exit(1); });
-                if attn_mode == tempura_kernels::AttentionMode::NaiveF32
-                    || std::env::var("TEMPURA_DETERMINISTIC").is_ok()
-                {
-                    rmsnorm.deterministic = true;
-                    rope.deterministic = true;
-                    let table = tempura_kernels::rope::build_cos_sin_table(
-                        config.max_seq_len, config.head_dim, config.rope_theta,
-                    );
-                    rope.upload_cos_sin_table(&table).expect("upload RoPE table");
-                    eprintln!("[gpu] deterministic RMSNorm + RoPE table enabled");
-                }
-                eprintln!("[gpu] attention mode: {attn_mode}");
-                let cpu_model = if std::env::var("TEMPURA_CPU_OPS").is_ok() {
-                    eprintln!("[gpu] CPU_OPS: using CPU forward path for bit-identical output");
-                    eprintln!("[gpu] CPU_OPS: reloading weights for CPU model...");
-                    let gguf2 = tempura_engine::gguf_loader::GgufLoader::from_file_quantized(model_p).unwrap();
-                    let qw2 = gguf2.to_quantized_weights();
-                    drop(gguf2);
-                    let pipeline = KernelPipeline::cpu_verified();
-                    let mut model = TransformerModel::new(config.clone(), pipeline);
-                    model.quantized_weights = Some(qw2);
-                    Some(std::sync::Mutex::new(model))
-                } else {
-                    None
-                };
-                Arc::new(tempura_engine::GpuQuantizedInferenceWrapper {
-                    config: config.clone(),
-                    attention,
-                    rmsnorm,
-                    rope,
-                    matmul,
-                    q4k_matmul,
-                    sampler: tempura_kernels::sampling::CpuSampler,
-                    gpu_weights,
-                    gpu_cache: std::sync::Mutex::new(gpu_cache),
-                    scratchpad: std::sync::Mutex::new(scratchpad),
-                    embed_host: embed,
-                    attn_mode,
-                    cpu_model,
-                })
+            #[cfg(feature = "cutile")]
+            if use_gpu {
+                let mut wrapper = tempura_engine::CutileInferenceWrapper::new(config.clone());
+                wrapper.model.quantized_weights = Some(qweights);
+                tracing::info!("cuTile GPU quantized inference ready");
+                Arc::new(wrapper)
             } else {
                 let pipeline = KernelPipeline::cpu_verified();
                 let mut model = TransformerModel::new(config.clone(), pipeline);
@@ -423,7 +302,7 @@ async fn run_server(args: ServeArgs) {
                 Arc::new(model)
             }
 
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "cutile"))]
             {
                 let pipeline = KernelPipeline::cpu_verified();
                 let mut model = TransformerModel::new(config.clone(), pipeline);

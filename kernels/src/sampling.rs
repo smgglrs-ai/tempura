@@ -146,10 +146,10 @@ impl Sampler for CpuSampler {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 pub struct CudaSampler;
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl Sampler for CudaSampler {
     fn apply(&self, _logits: &[f32], _output: &mut [f32], _params: &SamplingParams) -> Result<()> {
         todo!("CudaSampler: requires cargo oxide build")
@@ -432,3 +432,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(feature = "cuda")]
+pub type CudaSampler = CpuSampler;

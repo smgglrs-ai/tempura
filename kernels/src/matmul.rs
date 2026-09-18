@@ -1,7 +1,7 @@
 pub use crate::MatMul;
 use crate::Result;
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 use cuda_core::DeviceBuffer;
 
 #[cfg(feature = "cpu")]
@@ -133,19 +133,19 @@ impl MatMul for CpuMatMul {
 #[cfg(feature = "cutile")]
 pub use crate::cutile_matmul::CutileMatMul;
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 pub struct CudaMatMul {
     gpu: crate::gpu::GpuContext,
     module: crate::gpu::matmul_kernel::kernels::LoadedModule,
     mma_module: Option<crate::gpu::matmul_mma_kernel::kernels::LoadedModule>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Send for CudaMatMul {}
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Sync for CudaMatMul {}
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl CudaMatMul {
     pub fn new() -> Result<Self> {
         let gpu = crate::gpu::GpuContext::new(0)?;
@@ -176,7 +176,7 @@ impl CudaMatMul {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl CudaMatMul {
     fn launch_gemm(
         &self,
@@ -225,7 +225,7 @@ impl CudaMatMul {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl CudaMatMul {
     pub fn forward_device(
         &self,
@@ -295,7 +295,7 @@ impl CudaMatMul {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl MatMul for CudaMatMul {
     fn forward(
         &self,
@@ -491,3 +491,6 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+#[cfg(feature = "cuda")]
+pub type CudaMatMul = crate::cutile_matmul::CutileMatMul;

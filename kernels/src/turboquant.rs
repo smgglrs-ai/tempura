@@ -127,7 +127,7 @@ impl KvCacheCompressor for CpuPolarQuant {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 pub struct CudaPolarQuant {
     #[allow(dead_code)]
     gpu: crate::gpu::GpuContext,
@@ -135,12 +135,12 @@ pub struct CudaPolarQuant {
     group_size: usize,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Send for CudaPolarQuant {}
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Sync for CudaPolarQuant {}
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl CudaPolarQuant {
     pub fn new(bits: u8, group_size: usize) -> Result<Self> {
         if bits == 0 || bits > 8 {
@@ -156,7 +156,7 @@ impl CudaPolarQuant {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl KvCacheCompressor for CudaPolarQuant {
     fn compress(&self, _data: &[f32], _head_dim: usize) -> Result<CompressedKV> {
         todo!("CudaPolarQuant compress: GPU kernel not yet implemented")

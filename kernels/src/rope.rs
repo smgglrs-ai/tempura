@@ -1,7 +1,7 @@
 use crate::Result;
 pub use crate::RoPE;
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 use cuda_core::DeviceBuffer;
 
 #[cfg(feature = "cpu")]
@@ -374,7 +374,7 @@ fn yarn_corr_dims(
     [start.max(0.0), end.min(n_dims as f32 - 1.0)]
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 pub struct CudaRoPE {
     gpu: crate::gpu::GpuContext,
     module: crate::gpu::rope_kernel::kernels::LoadedModule,
@@ -382,12 +382,12 @@ pub struct CudaRoPE {
     pub deterministic: bool,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Send for CudaRoPE {}
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Sync for CudaRoPE {}
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl CudaRoPE {
     pub fn new() -> Result<Self> {
         let gpu = crate::gpu::GpuContext::new(0)?;
@@ -412,7 +412,7 @@ impl CudaRoPE {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl CudaRoPE {
     pub fn forward_device(
         &self,
@@ -466,7 +466,7 @@ impl CudaRoPE {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl RoPE for CudaRoPE {
     fn forward(
         &self,
@@ -643,7 +643,7 @@ mod kani_proofs {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", not(feature = "cutile")))]
     #[test]
     fn test_cuda_rope_matches_cpu() {
         let cpu = CpuRoPE;
@@ -681,7 +681,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", not(feature = "cutile")))]
     #[test]
     fn test_cuda_rope_position_zero_identity() {
         let gpu = CudaRoPE::new().unwrap();
@@ -1036,3 +1036,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(feature = "cuda")]
+pub type CudaRoPE = crate::cutile_rope::CutileRoPE;

@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel-api", "kernels", "kernel-verify", "engine", "model", "server", "tools/trace-cli"]
+members = ["kernel-api", "kernels", "kernel-verify", "engine", "model", "server", "tools/trace-cli", "tools/bench-gpu"]
 resolver = "2"
 
 [workspace.package]

@@ -1067,52 +1067,6 @@ impl Fp8PagedKvCache {
     }
 }
 
-#[cfg(feature = "cuda")]
-pub struct GpuKvCache {
-    pub k: Vec<cuda_core::DeviceBuffer<f32>>,
-    pub v: Vec<cuda_core::DeviceBuffer<f32>>,
-    pub seq_len: usize,
-    num_layers: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    pub max_seq_len: usize,
-}
-
-#[cfg(feature = "cuda")]
-impl GpuKvCache {
-    pub fn new(
-        config: &ModelConfig,
-        stream: &cuda_core::CudaStream,
-    ) -> Result<Self, crate::loader::LoadError> {
-        let layer_size = config.max_seq_len * config.num_kv_heads * config.head_dim;
-        let k: Vec<_> = (0..config.num_layers)
-            .map(|_| cuda_core::DeviceBuffer::zeroed(stream, layer_size))
-            .collect::<Result<_, _>>()
-            .map_err(|e| crate::loader::LoadError::GgufParse(e.to_string()))?;
-        let v: Vec<_> = (0..config.num_layers)
-            .map(|_| cuda_core::DeviceBuffer::zeroed(stream, layer_size))
-            .collect::<Result<_, _>>()
-            .map_err(|e| crate::loader::LoadError::GgufParse(e.to_string()))?;
-        Ok(Self {
-            k,
-            v,
-            seq_len: 0,
-            num_layers: config.num_layers,
-            num_kv_heads: config.num_kv_heads,
-            head_dim: config.head_dim,
-            max_seq_len: config.max_seq_len,
-        })
-    }
-
-    pub fn advance(&mut self, num_tokens: usize) {
-        self.seq_len += num_tokens;
-    }
-
-    pub fn reset(&mut self) {
-        self.seq_len = 0;
-    }
-}
-
 #[cfg(kani)]
 mod kani_proofs {
     // Prove KvCache indexing arithmetic is safe without constructing

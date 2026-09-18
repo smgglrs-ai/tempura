@@ -1,11 +1,10 @@
-use tempura_engine::config::ModelConfig;
-use tempura_engine::gpu_scratchpad::GpuScratchpad;
-use tempura_engine::kv_cache::GpuKvCache;
-use tempura_engine::loader::WeightLoader;
-use tempura_engine::pipeline::KernelPipeline;
-use tempura_engine::weights::GpuWeights;
-use tempura_engine::TransformerModel;
 use std::time::Instant;
+use tempura_engine::config::ModelConfig;
+use tempura_engine::loader::WeightLoader;
+use tempura_engine::model::CutileInferenceWrapper;
+use tempura_engine::session::InferenceSession;
+use tempura_engine::trace::TraceLevel;
+use tempura_engine::model::InferenceModel;
 
 const WARMUP: usize = 5;
 const ITERS: usize = 50;
@@ -63,7 +62,7 @@ impl WeightLoader for RandomWeightLoader {
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════╗");
-    println!("║  tempura-serve End-to-End GPU Benchmark                ║");
+    println!("║  tempura cuTile End-to-End Benchmark                   ║");
     println!("╚══════════════════════════════════════════════════════╝\n");
 
     let config = ModelConfig::tiny_test();
@@ -79,98 +78,71 @@ fn main() {
     println!("  Warmup: {WARMUP}, Iters: {ITERS}\n");
 
     let loader = RandomWeightLoader::new(&config);
-    let pipeline = KernelPipeline::cuda();
-    let mut model = TransformerModel::new(config.clone(), pipeline);
-    model.load_weights(&loader).unwrap();
-
-    let ctx = model.pipeline.matmul.gpu().context().clone();
-    let gpu_weights =
-        GpuWeights::upload_from_with_concat(model.weights.as_ref().unwrap(), &config, &ctx)
-            .expect("GPU weight upload");
-    ctx.bind_to_thread().unwrap();
-    let stream = ctx.default_stream();
-    let mut gpu_cache = GpuKvCache::new(&config, &stream).expect("GPU KV cache");
-    let mut scratch = GpuScratchpad::new(&config, &stream).expect("GPU scratchpad");
+    let mut wrapper = CutileInferenceWrapper::new(config.clone());
+    wrapper.model.load_weights(&loader).unwrap();
 
     // --- Prefill benchmark ---
     println!("─── Prefill (seq_len=64) ───");
     let prompt: Vec<u32> = (0..64).map(|i| (i % config.vocab_size) as u32).collect();
 
     for _ in 0..WARMUP {
-        gpu_cache.reset();
-        model.forward_gpu(&gpu_weights, &mut gpu_cache, &mut scratch, &prompt, 0);
+        let mut session = InferenceSession::new(&config, TraceLevel::Off, 0);
+        wrapper.forward(&mut session, &prompt);
     }
 
     let mut prefill_times = Vec::with_capacity(ITERS);
     for _ in 0..ITERS {
-        gpu_cache.reset();
+        let mut session = InferenceSession::new(&config, TraceLevel::Off, 0);
         let start = Instant::now();
-        model.forward_gpu(&gpu_weights, &mut gpu_cache, &mut scratch, &prompt, 0);
-        stream.synchronize().unwrap();
+        wrapper.forward(&mut session, &prompt);
         prefill_times.push(start.elapsed().as_micros() as f64);
     }
 
     let avg_prefill = prefill_times.iter().sum::<f64>() / ITERS as f64;
     let min_prefill = prefill_times.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_prefill = prefill_times.iter().cloned().fold(0.0, f64::max);
-    let ttft_ms = avg_prefill / 1000.0;
 
-    println!("  TTFT (avg):  {:.2} ms", ttft_ms);
+    println!("  TTFT (avg):      {:.2} ms", avg_prefill / 1000.0);
     println!(
-        "  TTFT (min/max): {:.2} / {:.2} ms",
+        "  TTFT (min/max):  {:.2} / {:.2} ms",
         min_prefill / 1000.0,
         max_prefill / 1000.0
     );
     println!(
-        "  Prefill tok/s:  {:.0}",
+        "  Prefill tok/s:   {:.0}",
         prompt.len() as f64 / (avg_prefill / 1e6)
     );
     println!();
 
-    // --- Decode benchmark ---
-    println!("─── Decode (single token, position varies) ───");
-    gpu_cache.reset();
-    model.forward_gpu(&gpu_weights, &mut gpu_cache, &mut scratch, &prompt, 0);
+    // --- Decode benchmark: single-token autoregressive steps ---
+    println!("─── Decode (single token, autoregressive) ───");
+    let mut session = InferenceSession::new(&config, TraceLevel::Off, 0);
+    wrapper.forward(&mut session, &prompt);
 
     let decode_token = [42u32];
-    for i in 0..WARMUP {
-        model.forward_gpu(
-            &gpu_weights,
-            &mut gpu_cache,
-            &mut scratch,
-            &decode_token,
-            prompt.len() + i,
-        );
+    for _ in 0..WARMUP {
+        wrapper.forward(&mut session, &decode_token);
     }
 
     let mut decode_times = Vec::with_capacity(ITERS);
-    for i in 0..ITERS {
-        let pos = prompt.len() + WARMUP + i;
+    for _ in 0..ITERS {
         let start = Instant::now();
-        model.forward_gpu(
-            &gpu_weights,
-            &mut gpu_cache,
-            &mut scratch,
-            &decode_token,
-            pos,
-        );
-        stream.synchronize().unwrap();
+        wrapper.forward(&mut session, &decode_token);
         decode_times.push(start.elapsed().as_micros() as f64);
     }
 
     let avg_decode = decode_times.iter().sum::<f64>() / ITERS as f64;
     let min_decode = decode_times.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_decode = decode_times.iter().cloned().fold(0.0, f64::max);
-    let itl_ms = avg_decode / 1000.0;
     let tok_per_s = 1e6 / avg_decode;
 
-    println!("  ITL (avg):   {:.2} ms", itl_ms);
+    println!("  ITL (avg):       {:.2} ms", avg_decode / 1000.0);
     println!(
-        "  ITL (min/max): {:.2} / {:.2} ms",
+        "  ITL (min/max):   {:.2} / {:.2} ms",
         min_decode / 1000.0,
         max_decode / 1000.0
     );
-    println!("  Decode tok/s: {:.0}", tok_per_s);
+    println!("  Decode tok/s:    {:.0}", tok_per_s);
     println!();
 
     println!("Done.");

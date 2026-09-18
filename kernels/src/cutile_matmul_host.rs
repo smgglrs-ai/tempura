@@ -69,7 +69,7 @@ impl MatMul for CutileMatMulHost {
 /// methods round-trip through host memory. They are intended for correctness /
 /// integration; performance-critical paths should use the host-slice `MatMul`
 /// trait directly.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl CutileMatMulHost {
     pub fn forward_device(
         &self,

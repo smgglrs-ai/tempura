@@ -2150,18 +2150,18 @@ impl ActivationQ8 {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 pub struct CudaMatMulQ4K {
     gpu: crate::gpu::GpuContext,
     module: crate::gpu::quantized_gemm_kernel::kernels::LoadedModule,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Send for CudaMatMulQ4K {}
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Sync for CudaMatMulQ4K {}
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl CudaMatMulQ4K {
     pub fn new() -> crate::Result<Self> {
         let gpu = crate::gpu::GpuContext::new(0)?;
@@ -2710,7 +2710,7 @@ impl CudaMatMulQ4K {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl MatMulQ for CudaMatMulQ4K {
     fn forward_b_transposed_q4k(
         &self,
@@ -3839,3 +3839,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(feature = "cuda")]
+pub type CudaMatMulQ4K = crate::cutile_quantized_gemm::CutileQuantizedGemm;

@@ -1,0 +1,22 @@
+[package]
+name = "tempura-bench-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPU kernel benchmarks using cuTile — plain cargo build, no cargo oxide required"
+
+[[bin]]
+name = "bench-kernels"
+path = "src/bench_kernels.rs"
+
+[[bin]]
+name = "bench-e2e"
+path = "src/bench_e2e.rs"
+
+[[bin]]
+name = "bench-attn"
+path = "src/bench_attn.rs"
+
+[dependencies]
+tempura-kernels = { path = "../../kernels", features = ["cutile"] }
+tempura-engine = { path = "../../engine", features = ["cutile"] }

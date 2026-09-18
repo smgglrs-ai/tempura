@@ -15,18 +15,18 @@ impl AllReduce for CpuAllReduce {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 pub struct CudaAllReduce {
     #[allow(dead_code)]
     gpu: crate::gpu::GpuContext,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Send for CudaAllReduce {}
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Sync for CudaAllReduce {}
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl CudaAllReduce {
     pub fn new() -> Result<Self> {
         Ok(Self {
@@ -35,7 +35,7 @@ impl CudaAllReduce {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl AllReduce for CudaAllReduce {
     fn sum_in_place(&self, _data: &mut [f32]) -> Result<()> {
         todo!("CudaAllReduce: NCCL-backed all-reduce not yet implemented")

@@ -3413,11 +3413,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tempura-bench-gpu"
+version = "0.1.0"
+dependencies = [
+ "tempura-engine",
+ "tempura-kernels",
+]
+
+[[package]]
 name = "tempura-engine"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "cuda-core",
  "memmap2",
  "minijinja",
  "proptest",

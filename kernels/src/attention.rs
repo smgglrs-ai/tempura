@@ -1,7 +1,7 @@
 pub use crate::Attention;
 use crate::Result;
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 use cuda_core::DeviceBuffer;
 
 // ── Dot product strategies ─────────────────────────────────────────────────
@@ -803,7 +803,7 @@ impl Attention for CpuAttention {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 pub struct CudaAttention {
     gpu: crate::gpu::GpuContext,
     module: crate::gpu::attention_kernel::kernels::LoadedModule,
@@ -811,12 +811,12 @@ pub struct CudaAttention {
     decode_module: Option<crate::gpu::flash_decode_kernel::kernels::LoadedModule>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Send for CudaAttention {}
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 unsafe impl Sync for CudaAttention {}
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl CudaAttention {
     pub fn gpu(&self) -> &crate::gpu::GpuContext {
         &self.gpu
@@ -859,7 +859,7 @@ impl CudaAttention {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 #[allow(clippy::too_many_arguments)]
 impl CudaAttention {
     pub fn forward_device(
@@ -1160,7 +1160,7 @@ impl CudaAttention {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cutile")))]
 impl Attention for CudaAttention {
     fn forward(
         &self,
@@ -1996,3 +1996,6 @@ mod tests {
             "tanh(x/cap)*cap should approximate x for small x: got {result_small}, expected ~{small_val}");
     }
 }
+
+#[cfg(feature = "cuda")]
+pub type CudaAttention = crate::cutile_flash_attention::CutileFlashAttention;
