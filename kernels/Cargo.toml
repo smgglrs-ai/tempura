@@ -12,6 +12,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 default = ["cpu"]
 cpu = []
 cuda = ["dep:cuda-device", "dep:cuda-host", "dep:cuda-core"]
+cutile = ["dep:cutile", "dep:cuda-core"]
 npu-intel = []
 npu-qualcomm = []
 
@@ -26,7 +27,8 @@ half = "2"
 rayon = "1"
 cuda-device = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-device", optional = true }
 cuda-host = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-host", optional = true }
-cuda-core = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-core", optional = true }
+cuda-core = { version = "0.3.1", optional = true }
+cutile = { version = "0.3.1", optional = true }
 
 [dev-dependencies]
 approx = "0.5"

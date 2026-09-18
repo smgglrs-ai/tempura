@@ -56,7 +56,7 @@ impl Sampler for CpuSampler {
 
         // top-k: find threshold
         let mut indexed: Vec<(usize, f32)> = scaled.iter().copied().enumerate().collect();
-        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let k = params.top_k.min(vocab_size);
         let _top_k_threshold = indexed[k - 1].1;
@@ -89,7 +89,7 @@ impl Sampler for CpuSampler {
                 .enumerate()
                 .filter(|(_, p)| *p > 0.0)
                 .collect();
-            sorted_probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            sorted_probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
             let mut cumsum = 0.0f32;
             let mut cutoff_idx = sorted_probs.len();
@@ -128,7 +128,7 @@ impl Sampler for CpuSampler {
             None => probs
                 .iter()
                 .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(idx, _)| idx as u32)
                 .unwrap_or(0),
             Some(rng) => {
@@ -235,7 +235,7 @@ mod tests {
         let argmax = output
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap()
             .0;
         assert_eq!(argmax, 1);
@@ -425,7 +425,7 @@ mod tests {
                 sampler.apply(&logits, &mut output, &params).unwrap();
                 let token = sampler.sample_token(&output, None);
                 let expected = logits.iter().enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(i, _)| i as u32).unwrap();
                 prop_assert_eq!(token, expected);
             }

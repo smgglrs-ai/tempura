@@ -31,7 +31,7 @@ cuda = []
 [dependencies]
 tempura-kernels = { path = "../kernels", features = ["cpu", "cuda"] }
 tempura-engine = { path = "../engine", features = ["cuda"] }
-cuda-core = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-core" }
+cuda-core = "0.3.1"
 cuda-device = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-device" }
 cuda-host = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-host" }
 half = "2"

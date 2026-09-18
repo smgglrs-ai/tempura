@@ -186,6 +186,41 @@ impl Tokenizer {
 
         let mut inner = tokenizers::Tokenizer::new(bpe);
 
+        // Add special tokens (type 3 = control/special in GGUF)
+        let token_types = metadata
+            .get("tokenizer.ggml.token_type")
+            .and_then(|v| match v {
+                GgufValue::Array(arr) => {
+                    let mut types = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        match item {
+                            GgufValue::I32(v) => types.push(*v as u32),
+                            GgufValue::U32(v) => types.push(*v),
+                            _ => types.push(0),
+                        }
+                    }
+                    Some(types)
+                }
+                _ => None,
+            });
+
+        if let Some(ref ttypes) = token_types {
+            let special: Vec<tokenizers::AddedToken> = ttypes
+                .iter()
+                .enumerate()
+                .filter(|(_, &t)| t == 3) // type 3 = control/special
+                .filter_map(|(id, _)| {
+                    tokens.get(id).map(|s| {
+                        tokenizers::AddedToken::from(s.to_string(), true)
+                            .single_word(false)
+                    })
+                })
+                .collect();
+            if !special.is_empty() {
+                inner.add_special_tokens(&special);
+            }
+        }
+
         let model_type = metadata
             .get("tokenizer.ggml.model")
             .and_then(|v| match v {

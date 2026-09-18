@@ -130,6 +130,9 @@ impl MatMul for CpuMatMul {
     }
 }
 
+#[cfg(feature = "cutile")]
+pub use crate::cutile_matmul::CutileMatMul;
+
 #[cfg(feature = "cuda")]
 pub struct CudaMatMul {
     gpu: crate::gpu::GpuContext,

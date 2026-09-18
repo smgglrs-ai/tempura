@@ -16,6 +16,8 @@ pub mod dispatch;
 pub mod fused;
 #[cfg(feature = "cuda")]
 pub mod gpu;
+#[cfg(feature = "cutile")]
+pub mod cutile_matmul;
 pub mod guided;
 pub mod layernorm;
 pub mod matmul;

@@ -685,35 +685,48 @@ where
                    m: usize,
                    n: usize,
                    k: usize| {
-            if m == 1 {
-                if let Some(pq) = preq {
-                    if let Some(w) = qweights.get_q4k(name) {
-                        q4k.forward_q4k_preq(pq, a_f32, w, out, n).unwrap();
-                        return;
-                    }
-                    if let Some(w) = qweights.get_q6k(name) {
-                        q4k.forward_q6k_preq(pq, a_f32, w, out, n).unwrap();
-                        return;
+            // Check typed_tensors FIRST — routes all formats through ggml::mul_mat_q
+            if let Some((dtype, w)) = qweights.get_typed(name) {
+                use tempura_kernels::ggml::GgmlType;
+                // Use optimized pre-quantized path for Q4K/Q6K decode
+                if m == 1 {
+                    if let Some(pq) = preq {
+                        if dtype == GgmlType::Q4K {
+                            q4k.forward_q4k_preq(pq, a_f32, w, out, n).unwrap();
+                            return;
+                        }
+                        if dtype == GgmlType::Q6K {
+                            q4k.forward_q6k_preq(pq, a_f32, w, out, n).unwrap();
+                            return;
+                        }
                     }
                 }
+                // Optimized legacy path for formats with dedicated kernels
+                match dtype {
+                    GgmlType::Q4K => {
+                        q4k.forward_b_transposed_q4k(a_f32, w, out, m, n, k).unwrap();
+                    }
+                    GgmlType::Q6K => {
+                        q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k).unwrap();
+                    }
+                    GgmlType::TQ2_0 => {
+                        q4k.forward_b_transposed_tq2(a_f32, w, out, m, n, k).unwrap();
+                    }
+                    GgmlType::TQ1_0 => {
+                        q4k.forward_b_transposed_i2s(a_f32, w, out, m, n, k).unwrap();
+                    }
+                    _ => {
+                        // All other quantized formats go through ggml registry
+                        tempura_kernels::ggml::mul_mat::mul_mat_q(dtype, w, a_f32, out, m, n, k);
+                    }
+                }
+                return;
             }
-            if let Some(w) = qweights.get_i2s(name) {
-                q4k.forward_b_transposed_i2s(a_f32, w, out, m, n, k)
-                    .unwrap();
-            } else if let Some(w) = qweights.get_tq2(name) {
-                q4k.forward_b_transposed_tq2(a_f32, w, out, m, n, k)
-                    .unwrap();
-            } else if let Some(w) = qweights.get_q4k(name) {
-                q4k.forward_b_transposed_q4k(a_f32, w, out, m, n, k)
-                    .unwrap();
-            } else if let Some(w) = qweights.get_q6k(name) {
-                q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k)
-                    .unwrap();
-            } else if let Some((dtype, w)) = qweights.get_typed(name) {
-                tempura_kernels::ggml::mul_mat::mul_mat_q(dtype, w, a_f32, out, m, n, k);
-            } else {
-                let w = qweights.get_f32(name).unwrap();
+            // f32 fallback
+            if let Some(w) = qweights.get_f32(name) {
                 self.pipeline.matmul_bt(a_f32, w, out, m, n, k).unwrap();
+            } else {
+                panic!("weight tensor not found: {name}");
             }
         };
 
@@ -884,22 +897,25 @@ where
             }
 
             if cfg.use_qk_norm {
-                let q_norm_w = qweights.get_f32(q_norm_name).unwrap();
-                let k_norm_w = qweights.get_f32(k_norm_name).unwrap();
-                apply_head_rmsnorm(&mut q, q_norm_w, seq_len, n_heads, head_dim, cfg.layer_norm_eps);
-                if det_rmsnorm.is_some() {
-                    tempura_kernels::portable_math::q8_snap(&mut q[..seq_len * q_dim]);
-                }
-                apply_head_rmsnorm(
-                    &mut k,
-                    k_norm_w,
-                    seq_len,
-                    n_kv_heads,
-                    head_dim,
-                    cfg.layer_norm_eps,
-                );
-                if det_rmsnorm.is_some() {
-                    tempura_kernels::portable_math::q8_snap(&mut k[..seq_len * kv_dim]);
+                if let (Some(q_norm_w), Some(k_norm_w)) = (
+                    qweights.get_f32(q_norm_name),
+                    qweights.get_f32(k_norm_name),
+                ) {
+                    apply_head_rmsnorm(&mut q, q_norm_w, seq_len, n_heads, head_dim, cfg.layer_norm_eps);
+                    if det_rmsnorm.is_some() {
+                        tempura_kernels::portable_math::q8_snap(&mut q[..seq_len * q_dim]);
+                    }
+                    apply_head_rmsnorm(
+                        &mut k,
+                        k_norm_w,
+                        seq_len,
+                        n_kv_heads,
+                        head_dim,
+                        cfg.layer_norm_eps,
+                    );
+                    if det_rmsnorm.is_some() {
+                        tempura_kernels::portable_math::q8_snap(&mut k[..seq_len * kv_dim]);
+                    }
                 }
             }
 

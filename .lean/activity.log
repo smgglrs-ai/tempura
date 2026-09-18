@@ -1307,3 +1307,26 @@
     9 files in kernels/src/ggml/. Every ggml quantization format now has vec_dot +
     dequantize implementations: 22 vec_dot functions, 25 dequantize functions,
     16 Kani harnesses. 340 workspace tests passing.
+
+- timestamp: "2026-07-01T16:35:00Z"
+  actor: claude
+  action: tech-watch
+  summary: "11 inference sources via deep-research. Key finding: DFlash block-diffusion (3-6x honest speedup, ICML 2026) is best candidate for tempura speculative decoding. DSpark corrected — GPU-based not ASIC, 1.6-1.85x not 60-85%. DFlash+KV quantization gap is differentiation opportunity. llm-d (CNCF) orchestrates above model servers — complementary, not competitive."
+- timestamp: "2026-09-18T00:00:00Z"
+  actor: claude
+  action: session-work
+  item: "cutile-refactor"
+  summary: >
+    Completed Antigravity session's cutile/cuda-oxide refactor (conversation b9809535).
+    (1) Switched cuda-core from non-existent local path to crates.io "0.3.1" in all
+    Cargo.toml files; cuda-oxide workspace itself uses the same published version.
+    (2) Added cutile = "0.3.1" dep + `cutile` feature flag to kernels. (3) New
+    kernels/src/cutile_matmul.rs — GPU GEMM via NVIDIA cuTile Rust API, implementing
+    MatMul trait with forward() and forward_b_transposed(). (4) 3 integration tests
+    (identity, cpu-reference match, transposed) all pass. (5) engine/src/model.rs:
+    unified dispatch — check typed_tensors first, route all quantized formats through
+    ggml::mul_mat_q, panic on missing weight instead of silent wrong path. (6)
+    engine/src/gguf_loader.rs: keep_raw for ALL quantized formats (not just Q4K/Q6K/TQ2/TQ1).
+    (7) engine/src/tokenizer.rs: register type-3 special tokens from tokenizer.ggml.token_type.
+    (8) sampling.rs: NaN-safe unwrap_or(Ordering::Equal) in 4 comparators. (9) Deleted
+    stale tests-gpu/oxide_tests_gpu.ptx. All 473 workspace tests passing.

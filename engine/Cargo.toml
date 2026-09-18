@@ -28,7 +28,7 @@ rand = "0.9"
 rayon = "1"
 minijinja = "2"
 vstd = { workspace = true }
-cuda-core = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-core", optional = true }
+cuda-core = { version = "0.3.1", optional = true }
 
 [package.metadata.verus]
 verify = true
