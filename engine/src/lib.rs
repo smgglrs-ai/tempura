@@ -36,6 +36,8 @@ pub use kv_cache::{
 pub use model::GpuInferenceWrapper;
 #[cfg(feature = "cuda")]
 pub use model::GpuQuantizedInferenceWrapper;
+#[cfg(feature = "cutile")]
+pub use model::CutileInferenceWrapper;
 pub use model::{InferenceModel, TokenLogprob, TopLogprob, TransformerModel};
 pub use session::InferenceSession;
 pub use tokenizer::{ChatMessageInput, ChatTemplate};

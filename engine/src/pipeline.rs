@@ -39,6 +39,42 @@ impl
     }
 }
 
+#[cfg(feature = "cutile")]
+impl
+    KernelPipeline<
+        tempura_kernels::cutile_flash_attention::CutileFlashAttention,
+        tempura_kernels::cutile_rmsnorm::CutileRmsNorm,
+        tempura_kernels::cutile_rope::CutileRoPE,
+        tempura_kernels::cutile_matmul::CutileMatMul,
+        tempura_kernels::sampling::CpuSampler,
+        tempura_kernels::allreduce::CpuAllReduce,
+    >
+{
+    pub fn cutile() -> KernelPipeline<
+        tempura_kernels::cutile_flash_attention::CutileFlashAttention,
+        tempura_kernels::cutile_rmsnorm::CutileRmsNorm,
+        tempura_kernels::cutile_rope::CutileRoPE,
+        tempura_kernels::cutile_matmul::CutileMatMul,
+        tempura_kernels::sampling::CpuSampler,
+    > {
+        use tempura_kernels::allreduce::CpuAllReduce;
+        use tempura_kernels::cutile_flash_attention::CutileFlashAttention;
+        use tempura_kernels::cutile_matmul::CutileMatMul;
+        use tempura_kernels::cutile_rmsnorm::CutileRmsNorm;
+        use tempura_kernels::cutile_rope::CutileRoPE;
+        use tempura_kernels::sampling::CpuSampler;
+
+        KernelPipeline {
+            attention: CutileFlashAttention::new().expect("Failed to initialize CutileFlashAttention"),
+            rmsnorm: CutileRmsNorm::new().expect("Failed to initialize CutileRmsNorm"),
+            rope: CutileRoPE::new().expect("Failed to initialize CutileRoPE"),
+            matmul: CutileMatMul::new().expect("Failed to initialize CutileMatMul"),
+            sampler: CpuSampler,
+            allreduce: CpuAllReduce,
+        }
+    }
+}
+
 #[cfg(feature = "cuda")]
 impl
     KernelPipeline<

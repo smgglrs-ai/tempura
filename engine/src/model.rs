@@ -2588,6 +2588,126 @@ impl InferenceModel for GpuInferenceWrapper {
     }
 }
 
+/// CPU-KV-cache + cutile-GPU-kernel inference wrapper.
+///
+/// Uses cutile kernels (flash attention, RMSNorm, RoPE, GEMM) compiled at
+/// runtime via the cuTile JIT — no `cargo oxide build` required. Quantized
+/// weight projections use CPU dequant + cutile GEMM (GPU dequant is a TODO).
+#[cfg(feature = "cutile")]
+pub struct CutileInferenceWrapper {
+    pub model: TransformerModel<
+        tempura_kernels::cutile_flash_attention::CutileFlashAttention,
+        tempura_kernels::cutile_rmsnorm::CutileRmsNorm,
+        tempura_kernels::cutile_rope::CutileRoPE,
+        tempura_kernels::cutile_matmul::CutileMatMul,
+        tempura_kernels::sampling::CpuSampler,
+    >,
+}
+
+#[cfg(feature = "cutile")]
+impl CutileInferenceWrapper {
+    pub fn new(config: ModelConfig) -> Self {
+        use crate::pipeline::KernelPipeline;
+        let pipeline = KernelPipeline::cutile();
+        let model = TransformerModel {
+            config,
+            pipeline,
+            weights: None,
+            quantized_weights: None,
+            #[cfg(feature = "cuda")]
+            gpu_weights: None,
+        };
+        Self { model }
+    }
+}
+
+#[cfg(feature = "cutile")]
+impl InferenceModel for CutileInferenceWrapper {
+    fn config(&self) -> &ModelConfig {
+        &self.model.config
+    }
+    fn has_weights(&self) -> bool {
+        self.model.weights.is_some() || self.model.quantized_weights.is_some()
+    }
+    fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32> {
+        let logits = self.model.forward(session, token_ids);
+        session.position += token_ids.len();
+        session.cache.advance(token_ids.len());
+        logits
+    }
+    fn generate(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+    ) -> Vec<u32> {
+        self.model
+            .generate(session, token_ids, max_new_tokens, params, eos_token)
+    }
+    fn generate_with_logprobs(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        top_n: usize,
+    ) -> (Vec<u32>, Vec<TokenLogprob>) {
+        self.model.generate_with_logprobs(
+            session,
+            token_ids,
+            max_new_tokens,
+            params,
+            eos_token,
+            top_n,
+        )
+    }
+    fn generate_with_callback(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Vec<u32> {
+        self.model.generate_with_callback(
+            session,
+            token_ids,
+            max_new_tokens,
+            params,
+            eos_token,
+            on_token,
+        )
+    }
+    fn generate_guided(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        max_new_tokens: usize,
+        params: &SamplingParams,
+        eos_token: Option<u32>,
+        decoder: &mut dyn tempura_kernels::GuidedDecoder,
+    ) -> Vec<u32> {
+        self.model.generate_guided(
+            session,
+            token_ids,
+            max_new_tokens,
+            params,
+            eos_token,
+            decoder,
+        )
+    }
+    fn load_weights(
+        &mut self,
+        loader: &dyn crate::loader::WeightLoader,
+    ) -> Result<(), crate::weights::WeightsError> {
+        self.model.load_weights(loader)
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub struct GpuQuantizedInferenceWrapper {
     pub config: ModelConfig,

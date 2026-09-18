@@ -219,11 +219,18 @@ async fn run_server(args: ServeArgs) {
         eprintln!("Error: --device cuda requires building with --features cuda");
         std::process::exit(1);
     }
+    if args.device == "cutile" && !cfg!(feature = "cutile") {
+        eprintln!("Error: --device cutile requires building with --features cutile");
+        std::process::exit(1);
+    }
     let use_cuda = args.device == "cuda" && cfg!(feature = "cuda");
+    let use_cutile = args.device == "cutile" && cfg!(feature = "cutile");
     tracing::info!(
         "Using {} kernels",
         if use_cuda {
-            "CUDA GPU"
+            "CUDA GPU (cuda-oxide)"
+        } else if use_cutile {
+            "CUDA GPU (cuTile)"
         } else {
             "CPU reference"
         }
@@ -252,6 +259,14 @@ async fn run_server(args: ServeArgs) {
     let build_model = |config: &ModelConfig,
                        loader: &dyn tempura_engine::loader::WeightLoader|
      -> Arc<dyn tempura_engine::InferenceModel> {
+        #[cfg(feature = "cutile")]
+        if use_cutile {
+            use tempura_engine::InferenceModel;
+            let mut wrapper = tempura_engine::CutileInferenceWrapper::new(config.clone());
+            wrapper.load_weights(loader).unwrap();
+            tracing::info!("cuTile GPU inference ready");
+            return Arc::new(wrapper);
+        }
         #[cfg(feature = "cuda")]
         if use_cuda {
             let pipeline = KernelPipeline::cuda();
