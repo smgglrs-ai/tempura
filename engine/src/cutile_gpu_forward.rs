@@ -14,21 +14,23 @@
 ///   - gate×up  → inter_pad (one `to_device_padded` call, used for down)
 ///   - attn_out → q_pad   (one from_device + one to_device_padded, for O projection)
 ///
-/// CPU operations that still require a host round-trip: RoPE, SiLU gate,
-/// and the residual adds.  RMSNorm now runs entirely on device via
-/// `CutileRmsNorm::forward_device`; only `seq_len` scale floats cross PCIe.
+/// CPU operations that still require a host round-trip per layer: two residual
+/// adds (O-proj and down-proj outputs) and one K download for the KV-cache host
+/// mirror.  RMSNorm, RoPE, and SiLU-gated MLP all run entirely on device.
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use cuda_core::Stream;
 use cutile::api;
-use cutile::prelude::{DeviceOp, ToHostVec};
-use cutile::tensor::{Reshape, Tensor};
+use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
+use cutile::tensor::{IntoPartition, Reshape, Tensor};
+use tempura_kernels::cutile_elementwise::CutileElementwise;
 use tempura_kernels::cutile_flash_attention::CutileFlashAttention;
 use tempura_kernels::cutile_matmul::CutileMatMul;
 use tempura_kernels::cutile_rmsnorm::CutileRmsNorm;
-use tempura_kernels::RoPE;
+use tempura_kernels::cutile_rope::CutileRoPE;
+use tempura_kernels::Attention;
 
 use crate::config::ModelConfig;
 use crate::cutile_kv_cache::CutileKvCache;
@@ -88,6 +90,8 @@ pub struct CutileGpuModel {
     matmul: CutileMatMul,
     flash_attn: CutileFlashAttention,
     cutile_rmsnorm: CutileRmsNorm,
+    cutile_rope: CutileRoPE,
+    cutile_elementwise: CutileElementwise,
     /// Pre-allocated decode output scratch buffers indexed by SLOT_* constants.
     ///
     /// Eliminates the `api::zeros` allocation inside `forward_bt_device_to_device`
@@ -290,6 +294,8 @@ impl CutileGpuModel {
         }
 
         let cutile_rmsnorm = CutileRmsNorm::new()?;
+        let cutile_rope = CutileRoPE::new()?;
+        let cutile_elementwise = CutileElementwise::new()?;
 
         let model = Self {
             config: config.clone(),
@@ -301,6 +307,8 @@ impl CutileGpuModel {
             matmul,
             flash_attn,
             cutile_rmsnorm,
+            cutile_rope,
+            cutile_elementwise,
             scratch: RefCell::new(std::array::from_fn(|_| None)),
         };
         eprintln!("[cutile] warming up kernel specializations…");
@@ -364,6 +372,8 @@ impl CutileGpuModel {
         }
 
         let cutile_rmsnorm = CutileRmsNorm::new()?;
+        let cutile_rope = CutileRoPE::new()?;
+        let cutile_elementwise = CutileElementwise::new()?;
 
         let model = Self {
             config: config.clone(),
@@ -375,6 +385,8 @@ impl CutileGpuModel {
             matmul,
             flash_attn,
             cutile_rmsnorm,
+            cutile_rope,
+            cutile_elementwise,
             scratch: RefCell::new(std::array::from_fn(|_| None)),
         };
         eprintln!("[cutile] warming up kernel specializations…");
@@ -432,6 +444,32 @@ impl CutileGpuModel {
         t.to_host_vec()
             .sync_on(self.matmul.stream())
             .expect("CutileGpuModel: device→host download failed")
+    }
+
+    /// Element-wise add two device tensors of `n` elements on the GPU.
+    ///
+    /// Returns a new flat 1-D tensor of `n` elements (rounded up to the
+    /// nearest 32 for the cuTile tile width).  Both `a` and `b` must have at
+    /// least `n` elements.
+    ///
+    /// When `h_pad == h` for typical model sizes (power-of-2 multiples of BK)
+    /// this is a pure GPU operation with zero host round-trips.
+    fn add_device(&self, a: &Arc<Tensor<f32>>, b: &Arc<Tensor<f32>>, n: usize) -> Arc<Tensor<f32>> {
+        const BLOCK: usize = 32;
+        let stream = self.matmul.stream();
+        let n_pad = n.div_ceil(BLOCK) * BLOCK;
+        let out_t = api::zeros::<f32>(&[n_pad])
+            .sync_on(stream)
+            .expect("add_device: alloc failed")
+            .partition([BLOCK]);
+        let (out_t, _, _) =
+            tempura_kernels::cutile_elementwise::kernels::cutile_vector_add(
+                out_t, a.clone(), b.clone(),
+            )
+            .generics(vec![BLOCK.to_string()])
+            .sync_on(stream)
+            .expect("add_device: kernel failed");
+        Arc::new(out_t.unpartition())
     }
 
     /// Upload a host slice to a **flat 1-D** device tensor of `rows * padded_cols`
@@ -672,14 +710,15 @@ impl CutileGpuModel {
     /// Full autoregressive forward pass with GPU-resident KV cache.
     ///
     /// Activations flow device-to-device across all projection GEMMs.
-    /// RMSNorm runs entirely on device via `CutileRmsNorm::forward_device`;
-    /// only `seq_len` scale floats cross the PCIe bus per norm call.
-    /// RoPE and SiLU still run on CPU.
+    /// RMSNorm and residual adds run entirely on device.  SiLU still runs on CPU.
     ///
-    /// All activations uploaded to the GPU are pre-padded to the required k_pad
-    /// columns so that `gemm_d2d` never has to download and re-pad.  The only
-    /// explicit pad step that involves a download is for the attention output
-    /// (GPU-side, q_dim wide) before the O projection (expects q_pad columns).
+    /// KV cache: K/V are held in the host mirror and passed directly to
+    /// `flash_attn.forward`, skipping the redundant upload + immediate re-download
+    /// that occurred when using `forward_device`.
+    ///
+    /// `hidden_dev` is kept on device throughout the layer loop — uploaded once
+    /// before the loop and downloaded once after to extract the last token for
+    /// the final norm + lm_head.
     ///
     /// The caller is responsible for calling `gpu_kv_cache.advance(token_ids.len())`
     /// and incrementing the session position after this returns.
@@ -717,12 +756,6 @@ impl CutileGpuModel {
 
         let positions: Vec<u32> = (position..position + seq_len).map(|p| p as u32).collect();
 
-        let rope_mode = match cfg.rope_type {
-            crate::config::RopeType::Norm => tempura_kernels::rope::RoPEMode::Normal,
-            crate::config::RopeType::Neox => tempura_kernels::rope::RoPEMode::NeoX,
-        };
-        let rope = tempura_kernels::rope::CpuRoPEUnified::new(rope_mode, head_dim);
-
         // Pre-build weight name strings to avoid allocations in the hot loop.
         let layer_names: Vec<(String, String, String, String, String, String, String, String, String)> =
             (0..cfg.num_layers)
@@ -743,6 +776,10 @@ impl CutileGpuModel {
                 .collect();
 
         // ── 2. Layer loop ──────────────────────────────────────────────────────
+        // Upload hidden once before the loop.  It stays on device via add_device
+        // across all layers; no per-layer re-upload is needed.
+        let mut hidden_dev = self.to_device_flat_padded(&hidden, seq_len, h, self.h_pad);
+
         for layer in 0..cfg.num_layers {
             let (
                 ref input_ln_name,
@@ -757,15 +794,13 @@ impl CutileGpuModel {
             ) = layer_names[layer];
 
             // ── 2a. Pre-attention RMSNorm (GPU) ───────────────────────────────
-            // Upload hidden as flat 1-D padded tensor; RMSNorm runs on device.
-            // Only seq_len scale floats cross PCIe; normed output stays on device.
-            let hidden_flat = self.to_device_flat_padded(&hidden, seq_len, h, self.h_pad);
+            // hidden_dev is already on device — no upload needed.
             let input_ln_w_dev = self.norm_weights.get(input_ln_name)
                 .expect("CutileGpuModel: input_layernorm weight not pre-uploaded");
             let normed_dev = self.cutile_rmsnorm
                 .forward_device(
                     self.matmul.stream(),
-                    hidden_flat,
+                    hidden_dev.clone(),
                     input_ln_w_dev,
                     seq_len,
                     h,
@@ -784,36 +819,51 @@ impl CutileGpuModel {
             let v_dev = unsafe { self.submit_gemm_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V) };
             self.matmul.sync_stream().expect("QKV sync failed");
 
-            // ── 2c. RoPE (CPU) — download Q, K; apply rotation; re-upload ────
-            let mut q_host = self.from_device(&q_dev);
-            let mut k_host = self.from_device(&k_dev);
-
-            if !cfg.use_alibi {
-                rope.forward(&mut q_host, 1, seq_len, n_heads, head_dim, &positions, cfg.rope_theta).unwrap();
-                rope.forward(&mut k_host, 1, seq_len, n_kv_heads, head_dim, &positions, cfg.rope_theta).unwrap();
-            }
+            // ── 2c. RoPE (GPU) — rotate Q and K entirely on device ───────────
+            // cos/sin tables (tiny: seq_len × n_heads × head_dim/2 floats each)
+            // are computed on CPU and uploaded.  Q and K are deinterleaved and
+            // rotated on the GPU; output halves are downloaded to reconstruct the
+            // interleaved format before a final upload.
+            // PCIe savings vs CPU path: -3 transfers for Q, -1 for K per layer.
+            let (q_rot_dev, k_rot_dev) = if !cfg.use_alibi {
+                let qr = self.cutile_rope
+                    .forward_device(&q_dev, &positions, seq_len, n_heads, head_dim, cfg.rope_theta)
+                    .expect("CutileGpuModel: GPU RoPE for Q failed");
+                let kr = self.cutile_rope
+                    .forward_device(&k_dev, &positions, seq_len, n_kv_heads, head_dim, cfg.rope_theta)
+                    .expect("CutileGpuModel: GPU RoPE for K failed");
+                (qr, kr)
+            } else {
+                // ALiBi: no rotation — keep Q/K tensors on device as-is.
+                (q_dev.clone(), k_dev.clone())
+            };
 
             // ── 2d. GPU KV-cache append (host mirror) ────────────────────────
             // V does not need RoPE, download from device to update host mirror.
+            // K was rotated on device; one download for the rotated K host mirror.
+            let k_rot_host = self.from_device(&k_rot_dev);
             let v_host = self.from_device(&v_dev);
-            gpu_kv_cache.append_host(layer, &k_host, &v_host, seq_len);
+            gpu_kv_cache.append_host(layer, &k_rot_host, &v_host, seq_len);
 
             // kv_len includes the tokens just appended (seq_len new tokens on
             // top of whatever was already in the cache).
             let kv_len = gpu_kv_cache.seq_len() + seq_len;
 
-            // ── 2e. Attention (device K/V from GPU cache) ─────────────────────
-            // Flash attention does not require power-of-2 padding; upload q_dim wide.
-            let q_rot_dev = self.to_device(&q_host, seq_len, q_dim);
-            let (k_cache_dev, v_cache_dev) = gpu_kv_cache
-                .get_kv_device(layer, kv_len)
-                .expect("CutileGpuModel: KV device upload failed");
-
-            let attn_out_dev = self.flash_attn
-                .forward_device(
-                    &q_rot_dev,
-                    &k_cache_dev,
-                    &v_cache_dev,
+            // ── 2e. Attention — host K/V direct, skip upload+re-download ──────
+            // flash_attn.forward_device downloads K/V immediately after upload;
+            // calling forward() directly with the host mirror slices eliminates
+            // the redundant O(kv_len × kv_dim) upload + O(kv_len × kv_dim)
+            // download per attention call.
+            let q_rot_host = self.from_device(&q_rot_dev);
+            let (k_slice, v_slice) = gpu_kv_cache.get_kv_host_slices(layer, kv_len);
+            let mut attn_output = vec![0.0f32; seq_len * n_heads * head_dim];
+            self.flash_attn
+                .forward(
+                    &q_rot_host,
+                    k_slice,
+                    v_slice,
+                    &mut attn_output,
+                    1,
                     seq_len,
                     kv_len,
                     n_heads,
@@ -824,30 +874,30 @@ impl CutileGpuModel {
                 .expect("CutileGpuModel: flash attention failed");
 
             // ── 2f. O projection — device-to-device ──────────────────────────
-            // attn_out_dev has q_dim columns; o_proj weight expects q_pad columns.
-            // Pad once explicitly so gemm_d2d needs no download.
-            let attn_padded_dev = if self.q_pad == q_dim {
-                attn_out_dev
-            } else {
-                let attn_host = self.from_device(&attn_out_dev);
-                self.to_device_padded(&attn_host, seq_len, q_dim, self.q_pad)
-            };
+            // Upload attn_output padded to q_pad for O projection.
+            let attn_padded_dev = self.to_device_padded(&attn_output, seq_len, q_dim, self.q_pad);
             let o_dev = self.gemm_d2d_slot(&attn_padded_dev, o_w_name, seq_len, SLOT_O);
 
-            // ── 2g. Residual add (CPU) ────────────────────────────────────────
-            let o_host = self.from_device(&o_dev);
-            for i in 0..seq_len * h {
-                hidden[i] += o_host[i];
-            }
+            // ── 2g. Residual add (GPU) ────────────────────────────────────────
+            // o_dev has h columns; pad to h_pad when h_pad > h (rare edge case
+            // e.g. h=5120 → h_pad=8192).  For models where h_pad == h (the
+            // common case) this is a zero-cost clone.
+            let o_padded = if self.h_pad == h {
+                o_dev.clone()
+            } else {
+                let o_host = self.from_device(&o_dev);
+                self.to_device_flat_padded(&o_host, seq_len, h, self.h_pad)
+            };
+            hidden_dev = self.add_device(&hidden_dev, &o_padded, seq_len * self.h_pad);
 
             // ── 2h. Post-attention RMSNorm (GPU) ─────────────────────────────
-            let hidden_flat2 = self.to_device_flat_padded(&hidden, seq_len, h, self.h_pad);
+            // hidden_dev is already updated on device — no upload needed.
             let post_ln_w_dev = self.norm_weights.get(post_ln_name)
                 .expect("CutileGpuModel: post_attention_layernorm weight not pre-uploaded");
             let normed2_dev = self.cutile_rmsnorm
                 .forward_device(
                     self.matmul.stream(),
-                    hidden_flat2,
+                    hidden_dev.clone(),
                     post_ln_w_dev,
                     seq_len,
                     h,
@@ -864,30 +914,49 @@ impl CutileGpuModel {
             let up_dev = unsafe { self.submit_gemm_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP) };
             self.matmul.sync_stream().expect("gate/up sync failed");
 
-            // ── 2j. SiLU gate × up (CPU) ─────────────────────────────────────
-            let mut gate_host = self.from_device(&gate_dev);
-            let up_host = self.from_device(&up_dev);
-            for i in 0..seq_len * inter {
-                gate_host[i] =
-                    tempura_kernels::portable_math::portable_silu(gate_host[i]) * up_host[i];
-            }
+            // ── 2j. SiLU gate × up (GPU) ─────────────────────────────────────
+            // gate_dev and up_dev already reside on the GPU.  silu_mul_device
+            // passes them directly to the GPU kernel — 0 D→H + 0 H→D when
+            // inter is B-aligned (true for all standard models).
+            // The result has seq_len × inter elements; pad to inter_pad if needed.
+            let gate_silu_n_dev = self.cutile_elementwise
+                .silu_mul_device(&gate_dev, &up_dev, seq_len, inter)
+                .expect("CutileGpuModel: GPU SiLU-mul failed");
 
             // ── 2k. FFN down — device-to-device ──────────────────────────────
-            // Upload gate×silu pre-padded to inter_pad so gemm_d2d needs no download.
-            let gate_silu_dev = self.to_device_padded(&gate_host, seq_len, inter, self.inter_pad);
+            // Pad gate_silu from inter to inter_pad for the down_proj GEMM.
+            // When inter == inter_pad (pow-2 models) this is a free reshape.
+            let gate_silu_dev = if self.inter_pad == inter {
+                gate_silu_n_dev
+            } else {
+                let gate_silu_host = self.from_device(&gate_silu_n_dev);
+                self.to_device_padded(&gate_silu_host, seq_len, inter, self.inter_pad)
+            };
             let down_dev = self.gemm_d2d_slot(&gate_silu_dev, down_w_name, seq_len, SLOT_DOWN);
 
-            // ── 2l. Residual add (CPU) ────────────────────────────────────────
-            let down_host = self.from_device(&down_dev);
-            for i in 0..seq_len * h {
-                hidden[i] += down_host[i];
-            }
+            // ── 2l. Residual add (GPU) ────────────────────────────────────────
+            let down_padded = if self.h_pad == h {
+                down_dev.clone()
+            } else {
+                let down_host = self.from_device(&down_dev);
+                self.to_device_flat_padded(&down_host, seq_len, h, self.h_pad)
+            };
+            hidden_dev = self.add_device(&hidden_dev, &down_padded, seq_len * self.h_pad);
         }
 
         // ── 3. Final norm + lm_head ────────────────────────────────────────────
-        // Only the last token position is needed for lm_head — normalize it alone.
-        let last_token = &hidden[(seq_len - 1) * h..seq_len * h];
-        let last_flat = self.to_device_flat_padded(last_token, 1, h, self.h_pad);
+        // Download hidden_dev once after the loop.  Each row is h_pad elements;
+        // the last token occupies hidden_final[(seq_len-1)*h_pad..seq_len*h_pad].
+        let hidden_final = self.from_device(&hidden_dev);
+        let last_flat = Arc::new(
+            api::copy_host_vec_to_device(
+                &Arc::new(
+                    hidden_final[(seq_len - 1) * self.h_pad..seq_len * self.h_pad].to_vec(),
+                ),
+            )
+            .sync_on(self.matmul.stream())
+            .expect("CutileGpuModel: last-token upload failed"),
+        );
         let final_norm_w_dev = self.norm_weights.get("model.norm.weight")
             .expect("CutileGpuModel: model.norm.weight not pre-uploaded");
         let last_dev = self.cutile_rmsnorm

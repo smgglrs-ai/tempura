@@ -93,6 +93,17 @@ impl CutileKvCache {
         self.seq_len = 0;
     }
 
+    /// Return host slices for the live K/V prefix (first `kv_len` tokens) for
+    /// `layer`, directly from the host mirror.
+    ///
+    /// These slices can be passed to `CutileFlashAttention::forward` without
+    /// any device upload.  Avoids the upload + immediate re-download cycle that
+    /// occurs when calling `get_kv_device` followed by `forward_device`.
+    pub fn get_kv_host_slices(&self, layer: usize, kv_len: usize) -> (&[f32], &[f32]) {
+        let len = kv_len * self.kv_dim;
+        (&self.k_host[layer][..len], &self.v_host[layer][..len])
+    }
+
     /// Upload the live K/V prefix (first `kv_len` tokens) for `layer` to
     /// device and return the resulting device tensors.
     ///
