@@ -193,6 +193,68 @@ impl CutileElementwise {
         Ok(())
     }
 
+    /// SiLU-gated projection operating entirely on device tensors.
+    ///
+    /// `gate` and `up` must already reside on the GPU (`seq_len × inter` elements
+    /// each, flat 1-D).  The result is computed on the GPU and returned as a
+    /// device tensor of `seq_len × inter` elements — no host round-trip for the
+    /// gate or up inputs.
+    ///
+    /// When `inter` is already a multiple of `B` (true for all standard models,
+    /// e.g. 11008 = 344 × 32) the inputs are used directly; otherwise a small
+    /// host-side zero-padding pass is inserted.
+    ///
+    /// PCIe transfers: 0 D→H + 0 H→D for the standard (B-aligned) path.
+    /// Compare to the CPU path: 2 D→H (gate + up) + 1 H→D (silu result) = 3 transfers.
+    pub fn silu_mul_device(
+        &self,
+        gate: &Arc<Tensor<f32>>,
+        up: &Arc<Tensor<f32>>,
+        seq_len: usize,
+        inter: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let n = seq_len * inter;
+        let n_pad = n.div_ceil(B) * B;
+        let stream = &self.stream;
+
+        let out_t = api::zeros::<f32>(&[n_pad])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([B]);
+
+        let (gate_t, up_t): (Arc<Tensor<f32>>, Arc<Tensor<f32>>) = if n_pad == n {
+            // Already B-aligned: pass device tensors directly — 0 PCIe transfers.
+            (gate.clone(), up.clone())
+        } else {
+            // Rare: inter not a multiple of B.  Download, pad, upload.
+            let gate_host = gate
+                .to_host_vec()
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            let up_host = up
+                .to_host_vec()
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            let (gv, uv) = pad_pair(&gate_host, &up_host, n, n_pad);
+            let gt = api::copy_host_vec_to_device(&gv)
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into();
+            let ut = api::copy_host_vec_to_device(&uv)
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into();
+            (gt, ut)
+        };
+
+        let (out_t, _g, _u) = kernels::cutile_silu_mul(out_t, gate_t, up_t)
+            .generics(vec![B.to_string()])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        Ok(Arc::new(out_t.unpartition()))
+    }
+
     /// Q8 round-trip quantisation: snaps each element to the nearest
     /// int8-representable value within its 32-element block.
     pub fn q8_snap(&self, data: &mut [f32]) -> Result<()> {

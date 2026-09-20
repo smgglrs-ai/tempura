@@ -41,6 +41,25 @@ pub mod kernels {
         out_first.store(tile_x0 * tile_cos - tile_x1 * tile_sin);
         out_second.store(tile_x0 * tile_sin + tile_x1 * tile_cos);
     }
+
+    /// Deinterleave kernel: split interleaved [num_sh × head_dim] into two half-tensors.
+    ///
+    /// `x` is a flat [num_sh * head_dim] tensor in interleaved layout:
+    ///   x[sh * head_dim .. sh * head_dim + half_dim]       = first  half of head sh
+    ///   x[sh * head_dim + half_dim .. (sh+1) * head_dim]   = second half of head sh
+    ///
+    /// With HALF_DIM-element tiles, head sh occupies tiles 2*sh and 2*sh+1.
+    /// Each program (pid = sh) loads both tiles using the indexed load API.
+    #[cutile::entry()]
+    pub fn cutile_deinterleave<const HALF_DIM: i32>(
+        first: &mut Tensor<f32, { [HALF_DIM] }>,
+        second: &mut Tensor<f32, { [HALF_DIM] }>,
+        x: &Tensor<f32, { [-1] }>,
+    ) {
+        let pid = program_id(0);
+        first.store(x.partition(shape![HALF_DIM]).load([2 * pid]));
+        second.store(x.partition(shape![HALF_DIM]).load([2 * pid + 1]));
+    }
 }
 
 /// GPU-accelerated Rotary Position Embeddings using NVIDIA cuTile Rust (`cutile-rs`).
@@ -186,6 +205,133 @@ impl RoPE for CutileRoPE {
 }
 
 impl CutileRoPE {
+    /// Apply RoPE entirely on device: deinterleave x on the GPU, rotate, and
+    /// return a rotated device tensor — no download of `x_dev` required.
+    ///
+    /// The only host-to-device transfers are the cos/sin tables, which are
+    /// `seq_len × n_heads × head_dim/2` floats — tiny even for large batches.
+    /// The rotation itself runs on the GPU via the existing split-half kernel.
+    /// Output halves are downloaded and reconstructed on the CPU before a
+    /// final upload; this intermediate step will be eliminated once cutile
+    /// supports indexed device-side stores.
+    ///
+    /// PCIe transfers per call: 2 H→D (cos/sin) + 2 D→H (output halves) + 1 H→D (result)
+    /// vs. the host-side path: 1 D→H (download x) + 4 H→D + 2 D→H + 1 H→D = 8 transfers.
+    pub fn forward_device(
+        &self,
+        x_dev: &Arc<Tensor<f32>>,
+        positions: &[u32],
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        theta: f32,
+    ) -> Result<Arc<Tensor<f32>>> {
+        if head_dim % 2 != 0 {
+            return Err(KernelError::InvalidConfig(
+                format!("head_dim must be even, got {head_dim}"),
+            ));
+        }
+        let half = head_dim / 2;
+        let num_sh = seq_len * n_heads;
+
+        // ── 1. Compute cos/sin tables on CPU — tiny: num_sh * half floats each ──
+        let mut cos_exp = vec![0.0f32; num_sh * half];
+        let mut sin_exp = vec![0.0f32; num_sh * half];
+        for s in 0..seq_len {
+            let pos = positions[s] as f32;
+            for h in 0..n_heads {
+                let sh = s * n_heads + h;
+                for d in 0..half {
+                    let freq = pos / theta.powf(2.0 * d as f32 / head_dim as f32);
+                    cos_exp[sh * half + d] = freq.cos();
+                    sin_exp[sh * half + d] = freq.sin();
+                }
+            }
+        }
+
+        let stream = &self.stream;
+
+        let upload_vec = |v: Vec<f32>| -> Result<Arc<Tensor<f32>>> {
+            Ok(api::copy_host_vec_to_device(&Arc::new(v))
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into())
+        };
+
+        // ── 2. Upload cos/sin to device (2 H→D, tiny) ─────────────────────────
+        let cos_t = upload_vec(cos_exp)?;
+        let sin_t = upload_vec(sin_exp)?;
+
+        // ── 3. Deinterleave x on device: x_dev → x_first_dev, x_second_dev ───
+        // Each of the two output tensors has num_sh tiles of HALF_DIM = num_sh * half elements.
+        let x_first_t = api::zeros::<f32>(&[num_sh * half])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([half]);
+
+        let x_second_t = api::zeros::<f32>(&[num_sh * half])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([half]);
+
+        let generics = vec![half.to_string()];
+        let (x_first_dev, x_second_dev, _x) = kernels::cutile_deinterleave(
+            x_first_t, x_second_t, x_dev.clone(),
+        )
+        .generics(generics.clone())
+        .sync_on(stream)
+        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let x_first_dev: Arc<Tensor<f32>> = x_first_dev.unpartition().into();
+        let x_second_dev: Arc<Tensor<f32>> = x_second_dev.unpartition().into();
+
+        // ── 4. Run GPU RoPE kernel on already-on-device split halves ──────────
+        let out_first_t = api::zeros::<f32>(&[num_sh * half])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([half]);
+
+        let out_second_t = api::zeros::<f32>(&[num_sh * half])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([half]);
+
+        let (out_f, out_s, _xf, _xs, _c, _s) = kernels::cutile_rope_kernel(
+            out_first_t, out_second_t,
+            x_first_dev, x_second_dev,
+            cos_t, sin_t,
+        )
+        .generics(generics)
+        .sync_on(stream)
+        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        // ── 5. Download output halves and reconstruct interleaved on CPU ───────
+        // (2 D→H + 1 H→D — will be replaced by an on-device interleave kernel
+        //  once cutile gains indexed device-side store support)
+        let host_first: Vec<f32> = out_f
+            .unpartition()
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let host_second: Vec<f32> = out_s
+            .unpartition()
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let mut result = vec![0.0f32; num_sh * head_dim];
+        for sh in 0..num_sh {
+            let base = sh * head_dim;
+            result[base..base + half].copy_from_slice(&host_first[sh * half..(sh + 1) * half]);
+            result[base + half..base + head_dim]
+                .copy_from_slice(&host_second[sh * half..(sh + 1) * half]);
+        }
+
+        // ── 6. Upload interleaved result to device and return ─────────────────
+        upload_vec(result)
+    }
+
     /// Shared rotation apply: splits `x` into halves, runs the GPU kernel,
     /// and reconstructs `x` in-place.
     fn apply_rotation(
