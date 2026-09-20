@@ -14,8 +14,9 @@
 ///   - gate×up  → inter_pad (one `to_device_padded` call, used for down)
 ///   - attn_out → q_pad   (one from_device + one to_device_padded, for O projection)
 ///
-/// CPU operations that still require a host round-trip: RMSNorm, RoPE, SiLU gate,
-/// and the residual adds.
+/// CPU operations that still require a host round-trip: RoPE, SiLU gate,
+/// and the residual adds.  RMSNorm now runs entirely on device via
+/// `CutileRmsNorm::forward_device`; only `seq_len` scale floats cross PCIe.
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,7 +27,8 @@ use cutile::prelude::{DeviceOp, ToHostVec};
 use cutile::tensor::{Reshape, Tensor};
 use tempura_kernels::cutile_flash_attention::CutileFlashAttention;
 use tempura_kernels::cutile_matmul::CutileMatMul;
-use tempura_kernels::{RMSNorm, RoPE};
+use tempura_kernels::cutile_rmsnorm::CutileRmsNorm;
+use tempura_kernels::RoPE;
 
 use crate::config::ModelConfig;
 use crate::cutile_kv_cache::CutileKvCache;
@@ -80,8 +82,12 @@ pub struct CutileGpuModel {
     /// next_pow2(intermediate_size.div_ceil(BK) * BK) — padded column count for FFN activations.
     inter_pad: usize,
     device_weights: HashMap<String, DeviceWeight>,
+    /// Pre-uploaded RMSNorm weight vectors (1-D, `[h_pad]` elements) keyed by
+    /// their HuggingFace tensor name (e.g. `model.layers.0.input_layernorm.weight`).
+    norm_weights: HashMap<String, Arc<Tensor<f32>>>,
     matmul: CutileMatMul,
     flash_attn: CutileFlashAttention,
+    cutile_rmsnorm: CutileRmsNorm,
     /// Pre-allocated decode output scratch buffers indexed by SLOT_* constants.
     ///
     /// Eliminates the `api::zeros` allocation inside `forward_bt_device_to_device`
@@ -168,6 +174,31 @@ impl CutileGpuModel {
         Ok(())
     }
 
+    /// Upload a norm weight vector from a host slice to a 1-D device tensor of
+    /// `h_pad` elements, zero-padding from `h` to `h_pad` if necessary.
+    fn upload_norm_weight(
+        stream: &Arc<Stream>,
+        norm_weights: &mut HashMap<String, Arc<Tensor<f32>>>,
+        name: &str,
+        data: &[f32],
+        h: usize,
+        h_pad: usize,
+    ) -> Result<(), tempura_kernels::KernelError> {
+        let padded: Vec<f32> = if h_pad == h {
+            data.to_vec()
+        } else {
+            let mut v = vec![0.0f32; h_pad];
+            v[..h].copy_from_slice(data);
+            v
+        };
+        let tensor: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(padded))
+            .sync_on(stream)
+            .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+            .into();
+        norm_weights.insert(name.to_string(), tensor);
+        Ok(())
+    }
+
     /// Pre-compile all cuTile GEMM kernel specializations by firing a dummy `m=1`
     /// device-to-device call for each distinct matrix shape used by this model.
     ///
@@ -201,8 +232,8 @@ impl CutileGpuModel {
     /// Dequantize all projection weights from `qw` and upload them to the GPU.
     ///
     /// Calling this once at model-load time eliminates repeated host→device weight
-    /// transfers during inference.  Non-projection tensors (RMSNorm weights, biases)
-    /// stay on the CPU because they are used by CPU kernels only.
+    /// transfers during inference.  RMSNorm weights are also pre-uploaded as 1-D
+    /// device tensors so that `forward_device` never copies them per-token.
     pub fn from_quantized(
         qw: &QuantizedWeights,
         config: &ModelConfig,
@@ -210,6 +241,7 @@ impl CutileGpuModel {
         let matmul = CutileMatMul::new()?;
         let flash_attn = CutileFlashAttention::new()?;
         let mut dw: HashMap<String, DeviceWeight> = HashMap::new();
+        let mut nw: HashMap<String, Arc<Tensor<f32>>> = HashMap::new();
 
         let h = config.hidden_size;
         let n_heads = config.num_attention_heads;
@@ -242,7 +274,22 @@ impl CutileGpuModel {
             Self::maybe_upload(&matmul, &mut dw, qw, &format!("{p}.mlp.gate_proj.weight"), inter, h)?;
             Self::maybe_upload(&matmul, &mut dw, qw, &format!("{p}.mlp.up_proj.weight"), inter, h)?;
             Self::maybe_upload(&matmul, &mut dw, qw, &format!("{p}.mlp.down_proj.weight"), h, inter)?;
+
+            // RMSNorm weights — pre-upload so forward_device never copies them per token.
+            if let Some(w) = qw.get_f32(&format!("{p}.input_layernorm.weight")) {
+                Self::upload_norm_weight(matmul.stream(), &mut nw, &format!("{p}.input_layernorm.weight"), w, h, h_pad)?;
+            }
+            if let Some(w) = qw.get_f32(&format!("{p}.post_attention_layernorm.weight")) {
+                Self::upload_norm_weight(matmul.stream(), &mut nw, &format!("{p}.post_attention_layernorm.weight"), w, h, h_pad)?;
+            }
         }
+
+        // Final norm weight.
+        if let Some(w) = qw.get_f32("model.norm.weight") {
+            Self::upload_norm_weight(matmul.stream(), &mut nw, "model.norm.weight", w, h, h_pad)?;
+        }
+
+        let cutile_rmsnorm = CutileRmsNorm::new()?;
 
         let model = Self {
             config: config.clone(),
@@ -250,8 +297,10 @@ impl CutileGpuModel {
             q_pad,
             inter_pad,
             device_weights: dw,
+            norm_weights: nw,
             matmul,
             flash_attn,
+            cutile_rmsnorm,
             scratch: RefCell::new(std::array::from_fn(|_| None)),
         };
         eprintln!("[cutile] warming up kernel specializations…");
@@ -269,6 +318,7 @@ impl CutileGpuModel {
         let matmul = CutileMatMul::new()?;
         let flash_attn = CutileFlashAttention::new()?;
         let mut dw: HashMap<String, DeviceWeight> = HashMap::new();
+        let mut nw: HashMap<String, Arc<Tensor<f32>>> = HashMap::new();
 
         let h = config.hidden_size;
         let n_heads = config.num_attention_heads;
@@ -300,7 +350,20 @@ impl CutileGpuModel {
             try_upload(&format!("{p}.mlp.gate_proj.weight"), inter, h)?;
             try_upload(&format!("{p}.mlp.up_proj.weight"), inter, h)?;
             try_upload(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
+
+            if let Some(w) = mw.get(&format!("{p}.input_layernorm.weight")) {
+                Self::upload_norm_weight(matmul.stream(), &mut nw, &format!("{p}.input_layernorm.weight"), w, h, h_pad)?;
+            }
+            if let Some(w) = mw.get(&format!("{p}.post_attention_layernorm.weight")) {
+                Self::upload_norm_weight(matmul.stream(), &mut nw, &format!("{p}.post_attention_layernorm.weight"), w, h, h_pad)?;
+            }
         }
+
+        if let Some(w) = mw.get("model.norm.weight") {
+            Self::upload_norm_weight(matmul.stream(), &mut nw, "model.norm.weight", w, h, h_pad)?;
+        }
+
+        let cutile_rmsnorm = CutileRmsNorm::new()?;
 
         let model = Self {
             config: config.clone(),
@@ -308,8 +371,10 @@ impl CutileGpuModel {
             q_pad,
             inter_pad,
             device_weights: dw,
+            norm_weights: nw,
             matmul,
             flash_attn,
+            cutile_rmsnorm,
             scratch: RefCell::new(std::array::from_fn(|_| None)),
         };
         eprintln!("[cutile] warming up kernel specializations…");
@@ -369,6 +434,36 @@ impl CutileGpuModel {
             .expect("CutileGpuModel: device→host download failed")
     }
 
+    /// Upload a host slice to a **flat 1-D** device tensor of `rows * padded_cols`
+    /// elements, zero-padding each row from `real_cols` to `padded_cols` on the CPU.
+    ///
+    /// Unlike `to_device_padded` this returns a 1-D tensor rather than `[rows, cols]`,
+    /// which is the shape expected by the cuTile RMSNorm kernel partitioning.
+    fn to_device_flat_padded(
+        &self,
+        data: &[f32],
+        rows: usize,
+        real_cols: usize,
+        padded_cols: usize,
+    ) -> Arc<Tensor<f32>> {
+        let stream = self.matmul.stream();
+        let v: Arc<Vec<f32>> = if padded_cols == real_cols {
+            Arc::new(data.to_vec())
+        } else {
+            let mut v = vec![0.0f32; rows * padded_cols];
+            for row in 0..rows {
+                v[row * padded_cols..row * padded_cols + real_cols]
+                    .copy_from_slice(&data[row * real_cols..(row + 1) * real_cols]);
+            }
+            Arc::new(v)
+        };
+        Arc::new(
+            api::copy_host_vec_to_device(&v)
+                .sync_on(stream)
+                .expect("CutileGpuModel: host→device upload (flat) failed"),
+        )
+    }
+
     /// Device-to-device GEMM: `output[m, n] = a[m, k_pad] @ b[n, k_pad]^T`.
     ///
     /// The caller MUST ensure `a` has exactly `dw.k_pad` columns.  No download
@@ -426,13 +521,86 @@ impl CutileGpuModel {
         pool[SLOT_LOGITS] = alloc(vocab);
     }
 
-    /// Device-to-device GEMM reusing a pre-allocated scratch buffer for the
-    /// decode path (m == 1).
+    /// Non-blocking variant of `gemm_d2d_slot`.
     ///
-    /// When m == 1 and the pool slot holds a uniquely-owned `Arc<Tensor<f32>>`,
-    /// reclaims the tensor, zeroes it in-place via `forward_bt_d2d_into`, and
-    /// stores the result back so the next layer can reuse it.  Falls back to a
-    /// fresh allocation for prefill (m > 1) or if the Arc is shared.
+    /// Enqueues the GEMM kernel without waiting for it to finish. The caller
+    /// MUST call `self.matmul.sync_stream()` before reading the result on the CPU.
+    ///
+    /// For the pooled decode path (m == 1) the pre-allocated scratch buffer is
+    /// reclaimed exactly as in `gemm_d2d_slot`. Prefill (m > 1) or a pool miss
+    /// falls back to the synchronous `forward_bt_device_to_device` path.
+    ///
+    /// # Safety
+    ///
+    /// The returned tensor's device memory is being written asynchronously. Do
+    /// not read it on the CPU until the stream has been synced.
+    unsafe fn submit_gemm_d2d_slot(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        weight_name: &str,
+        m: usize,
+        slot: usize,
+    ) -> Arc<Tensor<f32>> {
+        let dw = match self.device_weights.get(weight_name) {
+            Some(d) => d,
+            None => {
+                let stream = self.matmul.stream();
+                return Arc::new(
+                    api::zeros::<f32>(&[m, 1])
+                        .sync_on(stream)
+                        .expect("zeros failed"),
+                );
+            }
+        };
+
+        if m == 1 {
+            let maybe_tensor = {
+                let mut pool = self.scratch.borrow_mut();
+                match pool[slot].take() {
+                    Some(arc) => match Arc::try_unwrap(arc) {
+                        Ok(tensor) => Some(tensor),
+                        Err(arc_back) => {
+                            pool[slot] = Some(arc_back);
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            };
+
+            if let Some(tensor) = maybe_tensor {
+                // SAFETY: caller will sync_stream before any CPU read.
+                if let Ok(result) = unsafe {
+                    self.matmul
+                        .submit_bt_d2d_into(a, &dw.tensor, tensor, m, dw.n, dw.k_pad)
+                } {
+                    self.scratch.borrow_mut()[slot] = Some(result.clone());
+                    return result;
+                }
+            }
+        }
+
+        // Prefill (m > 1) or pool miss: fall back to the synchronous path.
+        self.matmul
+            .forward_bt_device_to_device(a, &dw.tensor, m, dw.n, dw.k_pad)
+            .expect("submit_gemm_d2d_slot fallback failed")
+    }
+
+    /// Device-to-device GEMM/GEMV reusing a pre-allocated scratch buffer.
+    ///
+    /// For m == 1 (decode): uses `forward_gemv_d2d_into` / `forward_gemv_device_to_device`
+    /// which dispatch through `cutile_gemv` — a split-K kernel that avoids the
+    /// ~500× MMA slowdown caused by hardware refusing BM=1 tiles.  Each block
+    /// handles N_BLOCK_GEMV=64 output neurons via element-wise multiply +
+    /// reduce_sum over [64×64] weight tiles, fully utilising warp-level vector
+    /// lanes (~target: ~1 TFLOPS vs. ~1.8 GFLOPS scalar fallback).
+    ///
+    /// For m > 1 (prefill): uses `forward_bt_d2d_into` / `forward_bt_device_to_device`
+    /// with the square BM×BN GEMM as before — MMA is efficient for M >= 16.
+    ///
+    /// When the pool slot holds a uniquely-owned `Arc<Tensor<f32>>`, reclaims
+    /// the tensor and reuses the device allocation.  Falls back to a fresh
+    /// allocation if the Arc is shared or the slot is empty.
     fn gemm_d2d_slot(
         &self,
         a: &Arc<Tensor<f32>>,
@@ -452,40 +620,51 @@ impl CutileGpuModel {
             }
         };
 
-        // Pooled path: decode only.  Try to reclaim the pre-allocated scratch
-        // if the previous layer's caller has dropped its reference.
-        if m == 1 {
-            let maybe_tensor = {
-                let mut pool = self.scratch.borrow_mut();
-                match pool[slot].take() {
-                    Some(arc) => match Arc::try_unwrap(arc) {
-                        Ok(tensor) => Some(tensor),
-                        Err(arc_back) => {
-                            // Caller still holds a reference — return the Arc
-                            // to the pool and fall through to allocation.
-                            pool[slot] = Some(arc_back);
-                            None
-                        }
-                    },
-                    None => None,
-                }
-            };
+        // Pooled path: try to reclaim the pre-allocated scratch tensor.
+        let maybe_tensor = {
+            let mut pool = self.scratch.borrow_mut();
+            match pool[slot].take() {
+                Some(arc) => match Arc::try_unwrap(arc) {
+                    Ok(tensor) => Some(tensor),
+                    Err(arc_back) => {
+                        pool[slot] = Some(arc_back);
+                        None
+                    }
+                },
+                None => None,
+            }
+        };
 
+        if m == 1 {
+            // Decode: use GEMV kernel (split-K element-wise multiply + reduce_sum).
             if let Some(tensor) = maybe_tensor {
                 if let Ok(result) =
                     self.matmul
-                        .forward_bt_d2d_into(a, &dw.tensor, tensor, m, dw.n, dw.k_pad)
+                        .forward_gemv_d2d_into(a, &dw.tensor, tensor, dw.n, dw.k_pad)
                 {
                     self.scratch.borrow_mut()[slot] = Some(result.clone());
                     return result;
                 }
             }
+            // Pool miss or GEMV failure — fresh allocation.
+            return self.matmul
+                .forward_gemv_device_to_device(a, &dw.tensor, dw.n, dw.k_pad)
+                .expect("CutileGpuModel::gemm_d2d_slot GEMV failed");
         }
 
-        // Fallback: prefill (m > 1) or pool miss.
+        // Prefill (m > 1): use square tiled GEMM.
+        if let Some(tensor) = maybe_tensor {
+            if let Ok(result) =
+                self.matmul
+                    .forward_bt_d2d_into(a, &dw.tensor, tensor, m, dw.n, dw.k_pad)
+            {
+                self.scratch.borrow_mut()[slot] = Some(result.clone());
+                return result;
+            }
+        }
         self.matmul
             .forward_bt_device_to_device(a, &dw.tensor, m, dw.n, dw.k_pad)
-            .expect("CutileGpuModel::gemm_d2d_slot failed")
+            .expect("CutileGpuModel::gemm_d2d_slot GEMM failed")
     }
 
     // ── inference ─────────────────────────────────────────────────────────────
@@ -493,9 +672,9 @@ impl CutileGpuModel {
     /// Full autoregressive forward pass with GPU-resident KV cache.
     ///
     /// Activations flow device-to-device across all projection GEMMs.
-    /// RMSNorm and RoPE still run on CPU; each requires one host↔device
-    /// round-trip per layer, but they are cheap relative to the projection
-    /// GEMMs and the attention kernel.
+    /// RMSNorm runs entirely on device via `CutileRmsNorm::forward_device`;
+    /// only `seq_len` scale floats cross the PCIe bus per norm call.
+    /// RoPE and SiLU still run on CPU.
     ///
     /// All activations uploaded to the GPU are pre-padded to the required k_pad
     /// columns so that `gemm_d2d` never has to download and re-pad.  The only
@@ -543,11 +722,6 @@ impl CutileGpuModel {
             crate::config::RopeType::Neox => tempura_kernels::rope::RoPEMode::NeoX,
         };
         let rope = tempura_kernels::rope::CpuRoPEUnified::new(rope_mode, head_dim);
-        let rmsnorm = tempura_kernels::rmsnorm::CpuRMSNormGgml;
-
-        // CPU scratchpads reused across layers.
-        let mut normed = vec![0.0f32; seq_len * h];
-        let mut normed2 = vec![0.0f32; seq_len * h];
 
         // Pre-build weight name strings to avoid allocations in the hot loop.
         let layer_names: Vec<(String, String, String, String, String, String, String, String, String)> =
@@ -582,18 +756,33 @@ impl CutileGpuModel {
                 ref down_w_name,
             ) = layer_names[layer];
 
-            // ── 2a. Pre-attention RMSNorm (CPU) ───────────────────────────────
-            normed.copy_from_slice(&hidden);
-            let input_ln_w = qweights.get_f32(input_ln_name).unwrap();
-            rmsnorm.forward(&mut normed, input_ln_w, h, cfg.layer_norm_eps).unwrap();
+            // ── 2a. Pre-attention RMSNorm (GPU) ───────────────────────────────
+            // Upload hidden as flat 1-D padded tensor; RMSNorm runs on device.
+            // Only seq_len scale floats cross PCIe; normed output stays on device.
+            let hidden_flat = self.to_device_flat_padded(&hidden, seq_len, h, self.h_pad);
+            let input_ln_w_dev = self.norm_weights.get(input_ln_name)
+                .expect("CutileGpuModel: input_layernorm weight not pre-uploaded");
+            let normed_dev = self.cutile_rmsnorm
+                .forward_device(
+                    self.matmul.stream(),
+                    hidden_flat,
+                    input_ln_w_dev,
+                    seq_len,
+                    h,
+                    self.h_pad,
+                    cfg.layer_norm_eps,
+                )
+                .expect("CutileGpuModel: pre-attention RMSNorm failed");
 
             // ── 2b. QKV projections — device-to-device ───────────────────────
-            // Upload normed pre-padded to h_pad so gemm_d2d needs no round-trip.
-            // All three Q/K/V GEMMs reuse the same device tensor.
-            let normed_dev = self.to_device_padded(&normed[..seq_len * h], seq_len, h, self.h_pad);
-            let q_dev = self.gemm_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q);
-            let k_dev = self.gemm_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K);
-            let v_dev = self.gemm_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V);
+            // normed_dev is already [seq_len, h_pad] — directly usable by gemm_d2d.
+            // Submit all three without syncing between them — the stream
+            // executes them in order. One sync replaces three.
+            // SAFETY: sync_stream() is called immediately below before any CPU read.
+            let q_dev = unsafe { self.submit_gemm_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q) };
+            let k_dev = unsafe { self.submit_gemm_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K) };
+            let v_dev = unsafe { self.submit_gemm_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V) };
+            self.matmul.sync_stream().expect("QKV sync failed");
 
             // ── 2c. RoPE (CPU) — download Q, K; apply rotation; re-upload ────
             let mut q_host = self.from_device(&q_dev);
@@ -651,16 +840,29 @@ impl CutileGpuModel {
                 hidden[i] += o_host[i];
             }
 
-            // ── 2h. Post-attention RMSNorm (CPU) ─────────────────────────────
-            normed2.copy_from_slice(&hidden);
-            let post_ln_w = qweights.get_f32(post_ln_name).unwrap();
-            rmsnorm.forward(&mut normed2, post_ln_w, h, cfg.layer_norm_eps).unwrap();
+            // ── 2h. Post-attention RMSNorm (GPU) ─────────────────────────────
+            let hidden_flat2 = self.to_device_flat_padded(&hidden, seq_len, h, self.h_pad);
+            let post_ln_w_dev = self.norm_weights.get(post_ln_name)
+                .expect("CutileGpuModel: post_attention_layernorm weight not pre-uploaded");
+            let normed2_dev = self.cutile_rmsnorm
+                .forward_device(
+                    self.matmul.stream(),
+                    hidden_flat2,
+                    post_ln_w_dev,
+                    seq_len,
+                    h,
+                    self.h_pad,
+                    cfg.layer_norm_eps,
+                )
+                .expect("CutileGpuModel: post-attention RMSNorm failed");
 
             // ── 2i. FFN gate + up — device-to-device ─────────────────────────
-            // Upload normed2 pre-padded to h_pad; reused for both gate and up.
-            let normed2_dev = self.to_device_padded(&normed2[..seq_len * h], seq_len, h, self.h_pad);
-            let gate_dev = self.gemm_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE);
-            let up_dev = self.gemm_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
+            // normed2_dev is already [seq_len, h_pad] — directly usable by gemm_d2d.
+            // Submit both without an intermediate sync — single sync covers both.
+            // SAFETY: sync_stream() is called immediately below before any CPU read.
+            let gate_dev = unsafe { self.submit_gemm_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE) };
+            let up_dev = unsafe { self.submit_gemm_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP) };
+            self.matmul.sync_stream().expect("gate/up sync failed");
 
             // ── 2j. SiLU gate × up (CPU) ─────────────────────────────────────
             let mut gate_host = self.from_device(&gate_dev);
@@ -683,16 +885,23 @@ impl CutileGpuModel {
         }
 
         // ── 3. Final norm + lm_head ────────────────────────────────────────────
-        let mut final_normed = hidden;
-        let final_norm_w = qweights
-            .get_f32("model.norm.weight")
-            .expect("model.norm.weight not found");
-        rmsnorm.forward(&mut final_normed, final_norm_w, h, cfg.layer_norm_eps).unwrap();
+        // Only the last token position is needed for lm_head — normalize it alone.
+        let last_token = &hidden[(seq_len - 1) * h..seq_len * h];
+        let last_flat = self.to_device_flat_padded(last_token, 1, h, self.h_pad);
+        let final_norm_w_dev = self.norm_weights.get("model.norm.weight")
+            .expect("CutileGpuModel: model.norm.weight not pre-uploaded");
+        let last_dev = self.cutile_rmsnorm
+            .forward_device(
+                self.matmul.stream(),
+                last_flat,
+                final_norm_w_dev,
+                1,
+                h,
+                self.h_pad,
+                cfg.layer_norm_eps,
+            )
+            .expect("CutileGpuModel: final RMSNorm failed");
 
-        // lm_head — device-to-device on the last token position.
-        // Pre-pad to h_pad so gemm_d2d needs no download.
-        let last_hidden = &final_normed[(seq_len - 1) * h..seq_len * h];
-        let last_dev = self.to_device_padded(last_hidden, 1, h, self.h_pad);
         let logits_dev = self.gemm_d2d_slot(&last_dev, "lm_head.weight", 1, SLOT_LOGITS);
         self.from_device(&logits_dev)
     }

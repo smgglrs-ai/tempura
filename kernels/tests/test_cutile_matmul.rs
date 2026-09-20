@@ -123,3 +123,54 @@ fn test_cutile_b_transposed() {
         }
     }
 }
+
+/// Exercises the dedicated `cutile_gemv` split-K kernel through `forward_b_transposed`
+/// with m=1. This is the decode hot path that the new kernel replaces.
+///
+/// The kernel uses element-wise multiply + reduce_sum over [N_BLOCK=64, BK=64]
+/// tiles instead of MMA with BM=1 (which forces scalar FMA fallback on hardware).
+#[test]
+fn test_cutile_gemv_m1() {
+    let cutile_mm = CutileMatMul::new().expect("Failed to initialize CutileMatMul");
+    let cpu_mm = CpuMatMul;
+
+    // m=1 decode-realistic shapes: LLaMA-7B style dimensions.
+    // N_BLOCK=64 and BK=64 must divide into n and k_pad respectively.
+    let shapes = vec![
+        (1, 64, 64),     // minimal: exactly one N_BLOCK, one BK chunk
+        (1, 128, 64),    // two N_BLOCK tiles, one BK chunk
+        (1, 256, 128),   // larger N, two BK chunks
+        (1, 2560, 4096), // LLaMA-7B q_proj: n=2560, k=4096
+        (1, 64, 37),     // non-power-of-2 K (tests k_pad rounding)
+        (1, 192, 97),    // non-divisible N and K
+    ];
+
+    for (m, n, k) in shapes {
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 19) as f32 - 9.0) * 0.05)
+            .collect();
+        let b: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
+            .collect();
+
+        let mut cpu_out = vec![0.0f32; m * n];
+        let mut gpu_out = vec![0.0f32; m * n];
+
+        cpu_mm
+            .forward_b_transposed(&a, &b, &mut cpu_out, m, n, k)
+            .unwrap();
+        cutile_mm
+            .forward_b_transposed(&a, &b, &mut gpu_out, m, n, k)
+            .unwrap();
+
+        for i in 0..(m * n) {
+            let diff = (gpu_out[i] - cpu_out[i]).abs();
+            assert!(
+                diff < 1e-2,
+                "GEMV shape ({m}, {n}, {k}) mismatch at {i}: gpu={}, cpu={}, diff={diff}",
+                gpu_out[i],
+                cpu_out[i]
+            );
+        }
+    }
+}

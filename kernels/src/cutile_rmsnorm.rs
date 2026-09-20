@@ -7,7 +7,7 @@ fn next_pow2(x: usize) -> usize {
 
 use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
-use cutile::tensor::{IntoPartition, Tensor};
+use cutile::tensor::{IntoPartition, Reshape, Tensor};
 use cuda_core::{Device, Stream};
 use crate::{KernelError, RMSNorm, Result, VerificationTier};
 
@@ -91,6 +91,78 @@ impl CutileRmsNorm {
 
     pub fn stream(&self) -> &Arc<Stream> {
         &self.stream
+    }
+
+    /// RMSNorm entirely on device.
+    ///
+    /// `x_dev` is a flat 1-D device tensor of `seq_len * h_pad` elements (any
+    /// shape is accepted; data is treated as row-major `[seq_len, h_pad]`).
+    /// `weight_dev` is a pre-uploaded 1-D tensor of `h_pad` elements.
+    ///
+    /// Pass 1 computes `sum(x²)` per token on device.  Only `seq_len` f32 sums
+    /// cross the PCIe bus (D→H).  The CPU computes `scale[t] = 1/sqrt(mean+eps)`
+    /// and uploads `seq_len` f32 scales (H→D).  Pass 2 applies scale and weight
+    /// entirely on device.
+    ///
+    /// Returns a `[seq_len, h_pad]` device tensor ready for projection GEMMs.
+    pub fn forward_device(
+        &self,
+        stream: &Arc<Stream>,
+        x_dev: Arc<Tensor<f32>>,
+        weight_dev: &Arc<Tensor<f32>>,
+        seq_len: usize,
+        hidden_size: usize,
+        h_pad: usize,
+        eps: f32,
+    ) -> Result<Arc<Tensor<f32>>> {
+        // Pass 1: sum(x²) per token — one scalar per token on device.
+        let sum_t = api::zeros::<f32>(&[seq_len])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1]);
+
+        let (sum_t, x_t) = kernels::rmsnorm_sum_sq(sum_t, x_dev)
+            .generics(vec![h_pad.to_string()])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        // Download seq_len floats — negligible PCIe traffic.
+        let sum_sq_vec: Vec<f32> = sum_t
+            .unpartition()
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        // CPU: scale[t] = 1/sqrt(mean(x²) + eps).
+        let scale_vec: Vec<f32> = sum_sq_vec
+            .iter()
+            .map(|&s| 1.0f32 / (s / hidden_size as f32 + eps).sqrt())
+            .collect();
+
+        let scale_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(scale_vec))
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+
+        // Pass 2: apply scale and weight on device.
+        let out_t = api::zeros::<f32>(&[seq_len * h_pad])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([h_pad]);
+
+        let (out_t, _x, _w, _s) =
+            kernels::rmsnorm_apply(out_t, x_t, weight_dev.clone(), scale_t)
+                .generics(vec![h_pad.to_string()])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        // Reshape flat output to [seq_len, h_pad] for direct use by projection GEMMs.
+        let out_2d: Arc<Tensor<f32>> = out_t
+            .unpartition()
+            .reshape(&[seq_len, h_pad])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+        Ok(out_2d)
     }
 }
 
