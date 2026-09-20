@@ -1330,3 +1330,18 @@
     (7) engine/src/tokenizer.rs: register type-3 special tokens from tokenizer.ggml.token_type.
     (8) sampling.rs: NaN-safe unwrap_or(Ordering::Equal) in 4 comparators. (9) Deleted
     stale tests-gpu/oxide_tests_gpu.ptx. All 473 workspace tests passing.
+- timestamp: "2026-09-20T00:00:00Z"
+  actor: claude
+  action: session-work
+  item: "cutile-perf-optimization"
+  summary: >
+    Full cargo-oxide → cuTile migration complete (6d4c9ad, e023645). GPU performance
+    optimization: 61× prefill speedup via persistent device weights + fused forward pass
+    (984a97b). Kernel improvements: register-zero accumulation, 64×64×16 tile sizes,
+    coalesced GEMV (1 program/output element for HBM-efficient decode), async GEMM dispatch
+    (90 fewer syncs/token), 2-pass GPU RMSNorm (no CPU fallback), GPU RoPE, GPU SiLU,
+    GPU residual adds, batched flash attention (600→30 syncs). Toy model (h=64, 2L):
+    714 tok/s decode, 36k tok/s prefill. Real model (bitnet-2b h=2560, 30L): 0.29 tok/s
+    decode (llama.cpp ref 209 tok/s). Gap: non-pow2 padding (60% waste h=2560→4096),
+    per-kernel sync (~10µs driver overhead × 3000 ops/token), no fused kernels.
+    Next: true async pipeline (single sync/token), single-pass GPU RMSNorm, fused attention.
