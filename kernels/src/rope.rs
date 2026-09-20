@@ -1,5 +1,7 @@
 use crate::Result;
 pub use crate::RoPE;
+#[cfg(target_arch = "x86_64")]
+use std::arch::is_x86_feature_detected;
 
 #[cfg(all(feature = "cuda", not(feature = "cutile")))]
 use cuda_core::DeviceBuffer;
@@ -104,6 +106,157 @@ impl RoPE for CpuRoPEGgml {
 
         Ok(())
     }
+}
+
+/// f16-native RoPE: reads f16 input, applies rotation with f32 sin/cos,
+/// writes f16 output. For research into full f16 inference pipelines.
+/// Enable with TEMPURA_F16_PIPE=1.
+#[cfg(feature = "cpu")]
+pub fn rope_forward_f16(
+    x_f16: &mut [u16],
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    positions: &[u32],
+    freq_base: f32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("f16c") {
+        unsafe { rope_forward_f16_f16c(x_f16, seq_len, num_heads, head_dim, positions, freq_base); }
+        return;
+    }
+    rope_forward_f16_scalar(x_f16, seq_len, num_heads, head_dim, positions, freq_base);
+}
+
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "f16c")]
+unsafe fn rope_forward_f16_f16c(
+    x_f16: &mut [u16], seq_len: usize, num_heads: usize,
+    head_dim: usize, positions: &[u32], freq_base: f32,
+) {
+    use std::arch::x86_64::*;
+    let theta_scale: f32 = freq_base.powf(-2.0 / head_dim as f32);
+    for s in 0..seq_len {
+        let p = positions[s] as f32;
+        let mut theta: f32 = p;
+        for i0 in (0..head_dim).step_by(2) {
+            let cos_theta = theta.cos();
+            let sin_theta = theta.sin();
+            for h in 0..num_heads {
+                let offset = (s * num_heads + h) * head_dim;
+                let h0 = _mm_set1_epi16(x_f16[offset + i0] as i16);
+                let h1 = _mm_set1_epi16(x_f16[offset + i0 + 1] as i16);
+                let x0 = _mm_cvtss_f32(_mm_cvtph_ps(h0));
+                let x1 = _mm_cvtss_f32(_mm_cvtph_ps(h1));
+                let r0 = x0 * cos_theta - x1 * sin_theta;
+                let r1 = x0 * sin_theta + x1 * cos_theta;
+                x_f16[offset + i0] = _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(r0), _MM_FROUND_TO_NEAREST_INT), 0) as u16;
+                x_f16[offset + i0 + 1] = _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(r1), _MM_FROUND_TO_NEAREST_INT), 0) as u16;
+            }
+            theta *= theta_scale;
+        }
+    }
+}
+
+#[cfg(feature = "cpu")]
+fn rope_forward_f16_scalar(
+    x_f16: &mut [u16], seq_len: usize, num_heads: usize,
+    head_dim: usize, positions: &[u32], freq_base: f32,
+) {
+    let theta_scale: f32 = freq_base.powf(-2.0 / head_dim as f32);
+    for s in 0..seq_len {
+        let p = positions[s] as f32;
+        let mut theta: f32 = p;
+        for i0 in (0..head_dim).step_by(2) {
+            let cos_theta = theta.cos();
+            let sin_theta = theta.sin();
+            for h in 0..num_heads {
+                let offset = (s * num_heads + h) * head_dim;
+                let x0 = f16_to_f32_hw(x_f16[offset + i0]);
+                let x1 = f16_to_f32_hw(x_f16[offset + i0 + 1]);
+                x_f16[offset + i0] = f32_to_f16_hw(x0 * cos_theta - x1 * sin_theta);
+                x_f16[offset + i0 + 1] = f32_to_f16_hw(x0 * sin_theta + x1 * cos_theta);
+            }
+            theta *= theta_scale;
+        }
+    }
+}
+
+/// Fused f32→RoPE→f16: reads f32, applies rotation, writes f16.
+#[cfg(feature = "cpu")]
+pub fn rope_f32_to_f16(
+    x: &[f32],
+    out_f16: &mut [u16],
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    positions: &[u32],
+    freq_base: f32,
+) {
+    let theta_scale: f32 = freq_base.powf(-2.0 / head_dim as f32);
+
+    for s in 0..seq_len {
+        let p = positions[s] as f32;
+        let mut theta: f32 = p;
+
+        for i0 in (0..head_dim).step_by(2) {
+            let cos_theta = theta.cos();
+            let sin_theta = theta.sin();
+
+            for h in 0..num_heads {
+                let offset = (s * num_heads + h) * head_dim;
+                let x0 = x[offset + i0];
+                let x1 = x[offset + i0 + 1];
+                out_f16[offset + i0] = f32_to_f16_hw(x0 * cos_theta - x1 * sin_theta);
+                out_f16[offset + i0 + 1] = f32_to_f16_hw(x0 * sin_theta + x1 * cos_theta);
+            }
+
+            theta *= theta_scale;
+        }
+    }
+}
+
+#[cfg(feature = "cpu")]
+#[inline(always)]
+fn f16_to_f32_hw(bits: u16) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("f16c") {
+            return unsafe {
+                use std::arch::x86_64::*;
+                let h = _mm_set1_epi16(bits as i16);
+                _mm_cvtss_f32(_mm_cvtph_ps(h))
+            };
+        }
+    }
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+    if exp == 0 { f32::from_bits(sign << 31) }
+    else if exp == 31 { f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13)) }
+    else { f32::from_bits((sign << 31) | ((exp + 112) << 23) | (frac << 13)) }
+}
+
+#[cfg(feature = "cpu")]
+#[inline(always)]
+fn f32_to_f16_hw(v: f32) -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("f16c") {
+            return unsafe {
+                use std::arch::x86_64::*;
+                let xv = _mm_set_ss(v);
+                _mm_extract_epi16(_mm_cvtps_ph(xv, _MM_FROUND_TO_NEAREST_INT), 0) as u16
+            };
+        }
+    }
+    let bits = v.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let frac = (bits >> 13) & 0x3ff;
+    if exp <= 0 { sign as u16 }
+    else if exp >= 31 { (sign | 0x7c00) as u16 }
+    else { (sign | ((exp as u32) << 10) | frac) as u16 }
 }
 
 #[cfg(feature = "cpu")]

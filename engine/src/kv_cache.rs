@@ -11,8 +11,8 @@ use tempura_kernels::turboquant::{CompressedKV, KvCacheCompressor};
 pub struct KvCache {
     pub k: Vec<Vec<f32>>,
     pub v: Vec<Vec<f32>>,
-    k_f16: Vec<Vec<u16>>,
-    v_f16: Vec<Vec<u16>>,
+    pub k_f16: Vec<Vec<u16>>,
+    pub v_f16: Vec<Vec<u16>>,
     pub use_f16: bool,
     pub seq_len: usize,
     num_layers: usize,
@@ -62,6 +62,23 @@ unsafe fn f16_slice_to_f32(src: &[u16], dst: &mut [f32]) {
         let v = _mm_cvtph_ps(h);
         dst[i] = _mm_cvtss_f32(v);
         i += 1;
+    }
+}
+
+pub fn append_f32_as_f16(dst: &mut [u16], src: &[f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("f16c") {
+        unsafe { f32_slice_to_f16(src, dst); }
+        return;
+    }
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        let bits = s.to_bits();
+        let sign = (bits >> 16) & 0x8000;
+        let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+        let frac = (bits >> 13) & 0x3ff;
+        *d = if exp <= 0 { sign as u16 }
+             else if exp >= 31 { (sign | 0x7c00) as u16 }
+             else { (sign | ((exp as u32) << 10) | frac) as u16 };
     }
 }
 

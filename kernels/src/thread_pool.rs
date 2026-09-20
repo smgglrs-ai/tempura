@@ -40,6 +40,55 @@ impl SpinBarrier {
     }
 }
 
+// ── TaskPhase (producer-consumer phase counter) ───────────────────────────
+
+pub struct TaskPhase {
+    ready: std::sync::atomic::AtomicU32,
+    tiles_done: std::sync::atomic::AtomicU32,
+    nth: u32,
+}
+
+impl TaskPhase {
+    pub fn new(nth: usize) -> Self {
+        Self {
+            ready: std::sync::atomic::AtomicU32::new(0),
+            tiles_done: std::sync::atomic::AtomicU32::new(0),
+            nth: nth as u32,
+        }
+    }
+
+    #[inline]
+    pub fn signal_ready(&self) {
+        self.ready.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn wait_ready(&self, phase: u32) {
+        while self.ready.load(Ordering::Acquire) < phase {
+            std::hint::spin_loop();
+        }
+    }
+
+    #[inline]
+    pub fn signal_tiles_done(&self) {
+        self.tiles_done.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn wait_all_done(&self) {
+        while self.tiles_done.load(Ordering::Acquire) < self.nth {
+            std::hint::spin_loop();
+        }
+        self.tiles_done.store(0, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn reset(&self) {
+        self.ready.store(0, Ordering::Relaxed);
+        self.tiles_done.store(0, Ordering::Relaxed);
+    }
+}
+
 // ── PersistentPool ─────────────────────────────────────────────────────────
 
 #[repr(align(64))]
@@ -203,7 +252,9 @@ static POOL: std::sync::OnceLock<PersistentPool> = std::sync::OnceLock::new();
 
 pub fn global_pool() -> &'static PersistentPool {
     POOL.get_or_init(|| {
-        let n = thread::available_parallelism().map(|p| p.get().min(8)).unwrap_or(1);
+        let n = std::env::var("TEMPURA_THREADS")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| thread::available_parallelism().map(|p| p.get()).unwrap_or(1));
         PersistentPool::new(n)
     })
 }

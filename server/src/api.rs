@@ -387,7 +387,8 @@ async fn chat_completions(
 
     let prompt = tokenizer
         .apply_chat_template(&chat_messages, true)
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|e| {
+            eprintln!("[chat] template render error: {e}, using fallback");
             req.messages
                 .iter()
                 .map(|m| format!("{}: {}", m.role, m.content_str()))
@@ -395,9 +396,15 @@ async fn chat_completions(
                 .join("\n")
         });
 
+    if std::env::var("TEMPURA_TRACE_PROMPT").is_ok() {
+        eprintln!("[PROMPT] {}", prompt.replace('\n', "\\n"));
+    }
     let token_ids = tokenizer
         .encode(&prompt)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if std::env::var("TEMPURA_TRACE_PROMPT").is_ok() {
+        eprintln!("[TOKEN_IDS] len={} ids={:?}", token_ids.len(), &token_ids);
+    }
 
     if req.n < 1 || req.n > 128 {
         return Err((
@@ -560,6 +567,7 @@ async fn chat_completions(
         let want_logprobs = req.logprobs.unwrap_or(false);
         let top_n = req.top_logprobs.unwrap_or(0).min(20) as usize;
         let stop_sequences: Vec<String> = req.stop.map(|s| s.into_vec()).unwrap_or_default();
+        let eos_token = tokenizer.eos_token_id();
         let prompt_tokens = token_ids.len() as u32;
 
         let mut choices = Vec::new();
@@ -586,7 +594,7 @@ async fn chat_completions(
                         &token_ids,
                         req.max_tokens as usize,
                         &params,
-                        None,
+                        eos_token,
                         top_n.max(1),
                     )
                 } else if let Some(ref mut decoder) = guided_decoder {
@@ -595,7 +603,7 @@ async fn chat_completions(
                         &token_ids,
                         req.max_tokens as usize,
                         &params,
-                        None,
+                        eos_token,
                         decoder.as_mut(),
                     );
                     (tokens, Vec::new())
@@ -615,7 +623,7 @@ async fn chat_completions(
                         &token_ids,
                         req.max_tokens as usize,
                         &params,
-                        None,
+                        eos_token,
                     );
                     (tokens, Vec::new())
                 };
@@ -623,7 +631,12 @@ async fn chat_completions(
                 let full_text = tokenizer
                     .decode(&generated)
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-                let (text, finish_reason) = check_stop_sequences(&full_text, &stop_sequences);
+                let (text, mut finish_reason) = check_stop_sequences(&full_text, &stop_sequences);
+                if finish_reason == "length" && (generated.len() as u32) < req.max_tokens {
+                    if eos_token.map_or(false, |e| generated.last() == Some(&e)) {
+                        finish_reason = "stop";
+                    }
+                }
                 total_completion_tokens += generated.len() as u32;
 
                 let logprobs_response = if want_logprobs {
@@ -790,13 +803,14 @@ async fn completions(
     let top_n = req.logprobs.unwrap_or(0).min(20) as usize;
     let seed = req.seed.unwrap_or(42);
 
+    let eos_token = tokenizer.eos_token_id();
     let (generated, token_logprobs) = if want_logprobs {
         state.model.generate_with_logprobs(
             &mut InferenceSession::new(state.model.config(), TraceLevel::Off, seed),
             &token_ids,
             req.max_tokens as usize,
             &params,
-            None,
+            eos_token,
             top_n.max(1),
         )
     } else {
@@ -805,7 +819,7 @@ async fn completions(
             &token_ids,
             req.max_tokens as usize,
             &params,
-            None,
+            eos_token,
         );
         (tokens, Vec::new())
     };

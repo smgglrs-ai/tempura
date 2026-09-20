@@ -29,8 +29,9 @@ rand = "0.9"
 rayon = "1"
 cutile = { version = "0.3.1", optional = true }
 cuda-core = { version = "0.3.1", optional = true }
-minijinja = "2"
+minijinja = { version = "2", features = ["json"] }
 vstd = { workspace = true }
+hf-chat-template = "0.2.1"
 
 [package.metadata.verus]
 verify = true

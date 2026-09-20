@@ -191,6 +191,17 @@ Three-crate workspace + standalone verification crate:
 - [x] Interleaved gate+up work-stealing (54 tiles vs 27 doubled)
 - [x] Hybrid tile dispatch (work-stealing for QKV, static for O/gate+up/down)
 - [x] SIMD vectorized rescale in tl2_gemm_tiles_batched
+- [x] generate_bitnet_decode: multi-token persistent-thread decode loop (one run_indexed for all tokens)
+- [x] AVX-VNNI I2S dot product (_mm256_dpbusd_epi32) for non-AVX-512 CPUs
+- [x] Multi-row I2S GEMV with macro-unrolled 32-iteration inner loop
+- [x] mmap GGUF loading with zero-copy I2S/F16 tensor access
+- [x] f16 embedding lookup (no f32 dequant copy)
+- [x] f16 KV cache with F16C SIMD conversion (vcvtps2ph/vcvtph_ps)
+- [x] SIMD f16 KV attention kernel (dot_f32_f16, weighted_add_f16)
+- [x] Lock-free gen_atomic thread dispatch counter
+- [x] Prefill L1 cache tiling BS=24 (fits 40KB L1d)
+- [x] TEMPURA_FORCE_I2S / TEMPURA_NO_TL2 runtime kernel selection
+- [x] Parity with bitnet.cpp: 36 tok/s decode, 1.24GB memory (Lunar Lake laptop)
 
 ## Build & Test
 

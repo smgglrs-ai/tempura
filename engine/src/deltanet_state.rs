@@ -2,9 +2,11 @@ use crate::config::ModelConfig;
 
 pub struct DeltaNetState {
     states: Vec<Vec<f32>>,
+    conv_states: Vec<Vec<f32>>,
     num_deltanet_layers: usize,
     num_heads: usize,
     head_dim: usize,
+    conv_len: usize,
 }
 
 impl DeltaNetState {
@@ -26,12 +28,17 @@ impl DeltaNetState {
         let states = (0..num_deltanet_layers)
             .map(|_| vec![0.0f32; state_size])
             .collect();
+        let conv_states = (0..num_deltanet_layers)
+            .map(|_| Vec::new())
+            .collect();
 
         Self {
             states,
+            conv_states,
             num_deltanet_layers,
             num_heads,
             head_dim,
+            conv_len: 0,
         }
     }
 
@@ -44,9 +51,34 @@ impl DeltaNetState {
         &self.states[deltanet_layer_idx]
     }
 
+    pub fn conv_state(&self, deltanet_layer_idx: usize) -> &[f32] {
+        &self.conv_states[deltanet_layer_idx]
+    }
+
+    pub fn update_conv_state(&mut self, deltanet_layer_idx: usize, conv_dim: usize, kernel_size: usize, new_tokens: &[f32], seq_len: usize) {
+        let history = kernel_size - 1;
+        let needed = history * conv_dim;
+        let buf = &mut self.conv_states[deltanet_layer_idx];
+        if buf.len() != needed {
+            buf.resize(needed, 0.0);
+            self.conv_len = history;
+        }
+        if seq_len >= history {
+            let start = (seq_len - history) * conv_dim;
+            buf.copy_from_slice(&new_tokens[start..start + needed]);
+        } else {
+            let keep = (history - seq_len) * conv_dim;
+            buf.copy_within(needed - keep..needed, 0);
+            buf[keep..].copy_from_slice(&new_tokens[..seq_len * conv_dim]);
+        }
+    }
+
     pub fn reset(&mut self) {
         for s in &mut self.states {
             s.fill(0.0);
+        }
+        for c in &mut self.conv_states {
+            c.fill(0.0);
         }
     }
 
@@ -64,11 +96,14 @@ impl DeltaNetState {
 
     pub fn from_transfer(transfer: DeltaNetStateTransfer) -> Self {
         let num_deltanet_layers = transfer.states.len();
+        let conv_states = (0..num_deltanet_layers).map(|_| Vec::new()).collect();
         Self {
             states: transfer.states,
+            conv_states,
             num_deltanet_layers,
             num_heads: transfer.num_heads,
             head_dim: transfer.head_dim,
+            conv_len: 0,
         }
     }
 }

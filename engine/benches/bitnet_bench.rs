@@ -9,7 +9,7 @@ use tempura_kernels::SamplingParams;
 
 fn main() {
     let model_path = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("Usage: bitnet_bench <path-to-gguf> [max_tokens] [prompt]");
+        eprintln!("Usage: bitnet_bench <path-to-gguf> [max_tokens] [prompt] [temperature]");
         std::process::exit(1);
     });
     let max_tokens: usize = std::env::args()
@@ -17,6 +17,10 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(128);
     let prompt_text = std::env::args().nth(3);
+    let temperature: f32 = std::env::args()
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
 
     eprintln!("Loading model from {model_path}...");
     let load_start = Instant::now();
@@ -49,11 +53,14 @@ fn main() {
     eprintln!("Prompt: {} tokens {:?}", prompt_ids.len(), &prompt_ids);
 
     let params = SamplingParams {
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
+        temperature,
+        top_k: if temperature == 0.0 { 1 } else { 40 },
+        top_p: 0.95,
         ..SamplingParams::default()
     };
+    if temperature > 0.0 {
+        eprintln!("Sampling: temperature={temperature}, top_k={}, top_p={}", params.top_k, params.top_p);
+    }
 
     // Dump top-5 logits for first 3 generated tokens
     if prompt_text.is_some() {

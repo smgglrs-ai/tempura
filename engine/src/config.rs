@@ -43,6 +43,7 @@ pub struct ModelConfig {
     pub deltanet_head_dim: Option<usize>,
     pub ssm_a: Option<f32>,
     pub dt_bias: Option<Vec<f32>>,
+    pub rope_dim: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +175,7 @@ impl ModelConfig {
             deltanet_head_dim: None,
             ssm_a: None,
             dt_bias: None,
+            rope_dim: None,
         }
     }
 
@@ -210,6 +212,7 @@ impl ModelConfig {
             deltanet_head_dim: None,
             ssm_a: None,
             dt_bias: None,
+            rope_dim: None,
         }
     }
 
@@ -246,6 +249,7 @@ impl ModelConfig {
             deltanet_head_dim: None,
             ssm_a: None,
             dt_bias: None,
+            rope_dim: None,
         }
     }
 
@@ -282,6 +286,7 @@ impl ModelConfig {
             deltanet_head_dim: None,
             ssm_a: None,
             dt_bias: None,
+            rope_dim: None,
         }
     }
 
@@ -318,6 +323,7 @@ impl ModelConfig {
             deltanet_head_dim: None,
             ssm_a: None,
             dt_bias: None,
+            rope_dim: None,
         }
     }
 
@@ -443,6 +449,7 @@ impl ModelConfig {
             deltanet_head_dim: None,
             ssm_a: None,
             dt_bias: None,
+            rope_dim: None,
         })
     }
 

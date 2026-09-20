@@ -45,6 +45,7 @@ pub enum GgmlType {
     TQ2_0 = 37,
     TL1 = 38,    // bitnet.cpp: ARM TL1 LUT format
     I2S = 39,    // bitnet.cpp: x86 TL2/I2_S LUT format (2-bit ternary)
+    Q2_0 = 42,   // PrismML: 2-bit ternary, group size 128, f16 scale
 }
 
 impl GgmlType {
@@ -67,6 +68,7 @@ impl GgmlType {
             37 => Ok(GgmlType::TQ2_0),
             38 => Ok(GgmlType::TL1),
             39 => Ok(GgmlType::I2S),
+            42 => Ok(GgmlType::Q2_0),
             _ => Err(LoadError::GgufParse(format!("unsupported GGML type: {v}"))),
         }
     }
@@ -251,7 +253,439 @@ fn read_metadata_value(
 
 // dequantize functions removed — now using tempura_kernels::ggml::dequantize::dequantize_row
 
-// Old dequant functions removed — now using tempura_kernels::ggml::dequantize::dequantize_row
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+
+    if exp == 0 {
+        if frac == 0 {
+            return f32::from_bits(sign << 31);
+        }
+        let scale = f32::from_bits((127 - 14) << 23);
+        let mantissa = frac as f32 / 1024.0;
+        return if sign == 0 { scale * mantissa } else { -scale * mantissa };
+    } else if exp == 31 {
+        if frac == 0 {
+            f32::from_bits((sign << 31) | (0xff << 23))
+        } else {
+            f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13))
+        }
+    } else {
+        let f32_exp = exp + 127 - 15;
+        f32::from_bits((sign << 31) | (f32_exp << 23) | (frac << 13))
+    }
+}
+
+fn dequant_f32(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(num_elements);
+    for i in 0..num_elements {
+        let start = i * 4;
+        let v = f32::from_le_bytes([
+            data[start],
+            data[start + 1],
+            data[start + 2],
+            data[start + 3],
+        ]);
+        out.push(v);
+    }
+    out
+}
+
+fn dequant_f16(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(num_elements);
+    for i in 0..num_elements {
+        let start = i * 2;
+        let bits = u16::from_le_bytes([data[start], data[start + 1]]);
+        out.push(f16_to_f32(bits));
+    }
+    out
+}
+
+fn dequant_bf16(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(num_elements);
+    for i in 0..num_elements {
+        let start = i * 2;
+        let bits = u16::from_le_bytes([data[start], data[start + 1]]);
+        out.push(bf16_to_f32(bits));
+    }
+    out
+}
+
+fn dequant_q4_0(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 32;
+    let block_size = 18;
+    let mut out = Vec::with_capacity(num_elements);
+    for b in 0..num_blocks {
+        let block_start = b * block_size;
+        let scale_bits = u16::from_le_bytes([data[block_start], data[block_start + 1]]);
+        let scale = f16_to_f32(scale_bits);
+        for i in 0..16 {
+            let byte = data[block_start + 2 + i];
+            let lo = (byte & 0x0F) as i32 - 8;
+            let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+            out.push(lo as f32 * scale);
+            out.push(hi as f32 * scale);
+        }
+    }
+    out
+}
+
+fn dequant_q4_1(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 32;
+    let block_size = 20;
+    let mut out = Vec::with_capacity(num_elements);
+    for b in 0..num_blocks {
+        let block_start = b * block_size;
+        let scale_bits = u16::from_le_bytes([data[block_start], data[block_start + 1]]);
+        let scale = f16_to_f32(scale_bits);
+        let min_bits = u16::from_le_bytes([data[block_start + 2], data[block_start + 3]]);
+        let min = f16_to_f32(min_bits);
+        for i in 0..16 {
+            let byte = data[block_start + 4 + i];
+            let lo = (byte & 0x0F) as f32;
+            let hi = ((byte >> 4) & 0x0F) as f32;
+            out.push(lo * scale + min);
+            out.push(hi * scale + min);
+        }
+    }
+    out
+}
+
+fn dequant_q8_0(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 32;
+    let block_size = 34;
+    let mut out = Vec::with_capacity(num_elements);
+    for b in 0..num_blocks {
+        let block_start = b * block_size;
+        let scale_bits = u16::from_le_bytes([data[block_start], data[block_start + 1]]);
+        let scale = f16_to_f32(scale_bits);
+        for i in 0..32 {
+            let q = data[block_start + 2 + i] as i8;
+            out.push(q as f32 * scale);
+        }
+    }
+    out
+}
+
+fn dequant_q5_0(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 32;
+    let block_size = 22; // 2 bytes scale + 4 bytes high-bits + 16 bytes low nibbles
+    let mut output = Vec::with_capacity(num_elements);
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let scale = f16_to_f32(u16::from_le_bytes([data[bs], data[bs + 1]]));
+        let high_bits =
+            u32::from_le_bytes([data[bs + 2], data[bs + 3], data[bs + 4], data[bs + 5]]);
+
+        for j in 0..32 {
+            let byte_idx = bs + 6 + j / 2;
+            let nibble = if j % 2 == 0 {
+                data[byte_idx] & 0x0F
+            } else {
+                data[byte_idx] >> 4
+            };
+            let high = ((high_bits >> j) & 1) as u8;
+            let q = (nibble | (high << 4)) as i32 - 16;
+            output.push(q as f32 * scale);
+        }
+    }
+    output
+}
+
+fn dequant_q6k(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 256;
+    let block_size = 210;
+    let mut output = vec![0.0f32; num_elements];
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let ql = &data[bs..bs + 128];
+        let qh = &data[bs + 128..bs + 192];
+        let scales = &data[bs + 192..bs + 208];
+        let d = f16_to_f32(u16::from_le_bytes([data[bs + 208], data[bs + 209]]));
+        let out = &mut output[b * 256..(b + 1) * 256];
+
+        for half in 0..2 {
+            let ql_off = half * 64;
+            let qh_off = half * 32;
+            let y_off = half * 128;
+
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+                let q2 =
+                    ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 =
+                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+
+                let sc0 = scales[half * 8 + is] as i8 as f32;
+                let sc1 = scales[half * 8 + is + 2] as i8 as f32;
+                let sc2 = scales[half * 8 + is + 4] as i8 as f32;
+                let sc3 = scales[half * 8 + is + 6] as i8 as f32;
+
+                out[y_off + l] = d * sc0 * q1 as f32;
+                out[y_off + l + 32] = d * sc1 * q2 as f32;
+                out[y_off + l + 64] = d * sc2 * q3 as f32;
+                out[y_off + l + 96] = d * sc3 * q4 as f32;
+            }
+        }
+    }
+    output
+}
+
+fn dequant_q5_1(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 32;
+    let block_size = 24; // 2 bytes scale + 2 bytes min + 4 bytes high-bits + 16 bytes low nibbles
+    let mut output = Vec::with_capacity(num_elements);
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let scale = f16_to_f32(u16::from_le_bytes([data[bs], data[bs + 1]]));
+        let min = f16_to_f32(u16::from_le_bytes([data[bs + 2], data[bs + 3]]));
+        let high_bits =
+            u32::from_le_bytes([data[bs + 4], data[bs + 5], data[bs + 6], data[bs + 7]]);
+
+        for j in 0..32 {
+            let byte_idx = bs + 8 + j / 2;
+            let nibble = if j % 2 == 0 {
+                data[byte_idx] & 0x0F
+            } else {
+                data[byte_idx] >> 4
+            };
+            let high = ((high_bits >> j) & 1) as u8;
+            let q = (nibble | (high << 4)) as f32;
+            output.push(q * scale + min);
+        }
+    }
+    output
+}
+
+fn dequant_q2k(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 256;
+    let block_size = 84;
+    let mut output = Vec::with_capacity(num_elements);
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let scales = &data[bs..bs + 16];
+        let qs = &data[bs + 16..bs + 80];
+        let d = f16_to_f32(u16::from_le_bytes([data[bs + 80], data[bs + 81]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([data[bs + 82], data[bs + 83]]));
+
+        for (j, &scale_byte) in scales.iter().enumerate() {
+            let sc = (scale_byte & 0xF) as f32;
+            let m = (scale_byte >> 4) as f32;
+
+            for i in 0..16 {
+                let elem = j * 16 + i;
+                let byte_idx = elem / 4;
+                let shift = (elem % 4) * 2;
+                let q = ((qs[byte_idx] >> shift) & 3) as f32;
+                output.push(d * sc * q - dmin * m);
+            }
+        }
+    }
+    output
+}
+
+fn dequant_q3k(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 256;
+    let block_size = 110;
+    let mut output = Vec::with_capacity(num_elements);
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let hmask = &data[bs..bs + 32];
+        let qs = &data[bs + 32..bs + 96];
+        let packed_scales = &data[bs + 96..bs + 108];
+        let d = f16_to_f32(u16::from_le_bytes([data[bs + 108], data[bs + 109]]));
+
+        // Unpack 6-bit scales from 12 bytes into 16 scale values
+        // The 12 bytes encode 16 6-bit values:
+        //   scales[0..3]: low 6 bits from packed_scales[0..3] (mask 0x3F)
+        //   scales[4..7]: low 6 bits from packed_scales[4..7] (mask 0x3F)
+        //   scales[8..11]: combine packed_scales[0..3] >> 6 (2 bits) with packed_scales[8..11] low 4 bits
+        //   scales[12..15]: combine packed_scales[4..7] >> 6 (2 bits) with packed_scales[8..11] high 4 bits
+        let mut sc = [0i32; 16];
+        for i in 0..4 {
+            sc[i] = (packed_scales[i] & 0x3F) as i32;
+            sc[i + 4] = (packed_scales[i + 4] & 0x3F) as i32;
+            sc[i + 8] =
+                (((packed_scales[i] >> 6) | ((packed_scales[i + 8] & 0x0F) << 2)) & 0x3F) as i32;
+            sc[i + 12] =
+                (((packed_scales[i + 4] >> 6) | ((packed_scales[i + 8] >> 4) << 2)) & 0x3F) as i32;
+        }
+        // Convert to signed: subtract 32
+        for s in sc.iter_mut() {
+            *s -= 32;
+        }
+
+        for j in 0..256 {
+            let low2 = (qs[j / 4] >> (2 * (j % 4))) & 3;
+            let high1 = (hmask[j / 8] >> (j % 8)) & 1;
+            let q = ((low2 | (high1 << 2)) as i32) - 4;
+            let scale_idx = j / 16;
+            output.push(d * sc[scale_idx] as f32 * q as f32);
+        }
+    }
+    output
+}
+
+fn unpack_q4k_scales(packed: &[u8]) -> ([f32; 8], [f32; 8]) {
+    let mut sc = [0u8; 8];
+    let mut m = [0u8; 8];
+
+    for i in 0..4 {
+        sc[i] = packed[i] & 0x3F;
+        sc[i + 4] = ((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F;
+        m[i] = packed[i + 4] & 0x3F;
+        m[i + 4] = ((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F;
+    }
+
+    let sc_f: [f32; 8] = std::array::from_fn(|i| sc[i] as f32);
+    let m_f: [f32; 8] = std::array::from_fn(|i| m[i] as f32);
+    (sc_f, m_f)
+}
+
+pub fn dequant_q4k_row(data: &[u8], output: &mut [f32], num_elements: usize) {
+    let v = dequant_q4k(data, num_elements);
+    output[..num_elements].copy_from_slice(&v);
+}
+
+pub fn dequant_q6k_row(data: &[u8], output: &mut [f32], num_elements: usize) {
+    let v = dequant_q6k(data, num_elements);
+    output[..num_elements].copy_from_slice(&v);
+}
+
+fn dequant_q4k(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 256;
+    let block_size = 144;
+    let mut output = vec![0.0f32; num_elements];
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let d = f16_to_f32(u16::from_le_bytes([data[bs], data[bs + 1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([data[bs + 2], data[bs + 3]]));
+        let packed_scales = &data[bs + 4..bs + 16];
+        let qs = &data[bs + 16..bs + 144];
+
+        let (sc, m) = unpack_q4k_scales(packed_scales);
+        let out = &mut output[b * 256..(b + 1) * 256];
+
+        for j in 0..4 {
+            let q_off = j * 32;
+            let d1 = d * sc[2 * j];
+            let m1 = dmin * m[2 * j];
+            let d2 = d * sc[2 * j + 1];
+            let m2 = dmin * m[2 * j + 1];
+
+            for l in 0..32 {
+                out[j * 64 + l] = d1 * (qs[q_off + l] & 0x0F) as f32 - m1;
+                out[j * 64 + l + 32] = d2 * (qs[q_off + l] >> 4) as f32 - m2;
+            }
+        }
+    }
+    output
+}
+
+fn dequant_q5k(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let num_blocks = num_elements / 256;
+    let block_size = 176;
+    let mut output = vec![0.0f32; num_elements];
+
+    for b in 0..num_blocks {
+        let bs = b * block_size;
+        let d = f16_to_f32(u16::from_le_bytes([data[bs], data[bs + 1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([data[bs + 2], data[bs + 3]]));
+        let packed_scales = &data[bs + 4..bs + 16];
+        let qh = &data[bs + 16..bs + 48]; // 32 bytes = 256 high bits
+        let qs = &data[bs + 48..bs + 176]; // 128 bytes = 256 nibbles (split layout)
+
+        let (sc, m) = unpack_q4k_scales(packed_scales);
+        let out = &mut output[b * 256..(b + 1) * 256];
+
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        for j in 0..4 {
+            let q_off = j * 32;
+            let d1 = d * sc[2 * j];
+            let m1 = dmin * m[2 * j];
+            let d2 = d * sc[2 * j + 1];
+            let m2 = dmin * m[2 * j + 1];
+
+            for l in 0..32 {
+                let hb1 = if qh[l] & u1 != 0 { 16 } else { 0 };
+                let hb2 = if qh[l] & u2 != 0 { 16 } else { 0 };
+                out[j * 64 + l] = d1 * ((qs[q_off + l] & 0x0F) + hb1) as f32 - m1;
+                out[j * 64 + l + 32] = d2 * ((qs[q_off + l] >> 4) + hb2) as f32 - m2;
+            }
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    output
+}
+
+pub fn dequant_q2_0_pub(data: &[u8], num_elements: usize) -> Vec<f32> {
+    dequant_q2_0(data, num_elements)
+}
+
+fn dequant_q2_0(data: &[u8], num_elements: usize) -> Vec<f32> {
+    // PrismML Q2_0: QK=128, 34 bytes per block (2-byte f16 scale + 32 bytes packed)
+    // Encoding: (q - 1) * scale → 00=-1, 01=0, 10=+1, 11=+2
+    const QK: usize = 128;
+    const BLOCK_BYTES: usize = 34;
+    let num_blocks = num_elements / QK;
+    let mut output = vec![0.0f32; num_elements];
+    for blk in 0..num_blocks {
+        let block = &data[blk * BLOCK_BYTES..(blk + 1) * BLOCK_BYTES];
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for i in 0..QK {
+            let byte_idx = 2 + i / 4;
+            let bit_shift = (i % 4) * 2;
+            let q = ((block[byte_idx] >> bit_shift) & 0x03) as i32;
+            output[blk * QK + i] = (q - 1) as f32 * scale;
+        }
+    }
+    output
+}
+
+fn dequant_tq2(data: &[u8], num_elements: usize) -> Vec<f32> {
+    use tempura_kernels::TQ2_BLOCK_SIZE;
+    let block_bytes = 66;
+    let num_blocks = num_elements / TQ2_BLOCK_SIZE;
+    let mut output = vec![0.0f32; num_elements];
+    for blk in 0..num_blocks {
+        let block = &data[blk * block_bytes..(blk + 1) * block_bytes];
+        let mut buf = [0.0f32; 256];
+        tempura_kernels::quantized::tq2_dequant_block(block, &mut buf);
+        output[blk * TQ2_BLOCK_SIZE..(blk + 1) * TQ2_BLOCK_SIZE].copy_from_slice(&buf);
+    }
+    output
+}
+
+fn dequant_tq1(data: &[u8], num_elements: usize) -> Vec<f32> {
+    let packed_bytes = num_elements / 4;
+    let mut output = vec![0.0f32; num_elements];
+    for i in 0..packed_bytes {
+        let byte = data[i];
+        for shift in (0..8).step_by(2) {
+            let idx = i * 4 + (3 - shift / 2);
+            if idx < num_elements {
+                let bits = (byte >> shift) & 0x03;
+                output[idx] = bits as f32 - 1.0;
+            }
+        }
+    }
+    output
+}
 
 fn tensor_data_size(dtype: GgmlType, num_elements: u64, dims: &[u64]) -> u64 {
     match dtype {
@@ -272,6 +706,7 @@ fn tensor_data_size(dtype: GgmlType, num_elements: u64, dims: &[u64]) -> u64 {
             num_elements / 4 + 4
         }
         GgmlType::TQ2_0 => (num_elements / 256) * 66,
+        GgmlType::Q2_0 => (num_elements / 128) * 34, // QK=128: 2-byte f16 scale + 32 bytes packed
         GgmlType::TL1 => {
             // ARM TL1 LUT format: 2-bit packed + 32-byte alignment
             num_elements / 4 + 32
@@ -309,6 +744,9 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "ffn_down.weight" => "mlp.down_proj.weight",
             "ffn_sub_norm.weight" => "mlp.ffn_sub_norm.weight",
             "attn_sub_norm.weight" => "self_attn.attn_sub_norm.weight",
+            "post_attention_norm.weight" => "post_attention_layernorm.weight",
+            "attn_qkv.weight" => "ssm.qkv_proj.weight",
+            "attn_gate.weight" => "ssm.gate_proj.weight",
             "ssm_in.weight" => "ssm.in_proj.weight",
             "ssm_out.weight" => "ssm.out_proj.weight",
             "ssm_conv1d.weight" => "ssm.conv1d.weight",
@@ -318,6 +756,7 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "ssm_a" => "ssm.A_log",
             "ssm_norm.weight" => "ssm.norm.weight",
             "ssm_beta_alpha.weight" => "ssm.beta_alpha.weight",
+            "ssm_ba.weight" => "ssm.beta_alpha.weight",
             "ssm_alpha.weight" => "ssm.alpha.weight",
             "ssm_beta.weight" => "ssm.beta.weight",
             _ => return None,
@@ -360,6 +799,24 @@ impl GgufValue {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     result.push(v.as_str()?);
+                }
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_u32_array(&self) -> Option<Vec<u32>> {
+        match self {
+            GgufValue::Array(arr) => {
+                let mut result = Vec::with_capacity(arr.len());
+                for v in arr {
+                    match v {
+                        GgufValue::U32(x) => result.push(*x),
+                        GgufValue::I32(x) => result.push(*x as u32),
+                        GgufValue::U64(x) => result.push(*x as u32),
+                        _ => return None,
+                    }
                 }
                 Some(result)
             }
@@ -433,17 +890,25 @@ fn detect_and_apply_hybrid_layers(
         }
         config.layer_kinds = Some(kinds);
     } else {
-        // Fallback: scan tensor names for ssm_alpha (DeltaNet marker)
-        let has_ssm = tensor_names.iter().any(|n| n.contains("ssm_alpha") || n.contains("ssm.alpha"));
+        // Fallback: scan tensor names for DeltaNet markers (ssm_alpha, ssm_ba, ssm_beta_alpha)
+        let has_ssm = tensor_names.iter().any(|n|
+            n.contains("ssm_alpha") || n.contains("ssm.alpha")
+            || n.contains("ssm_ba") || n.contains("ssm.beta_alpha")
+            || n.contains("ssm_beta_alpha"));
         if !has_ssm {
             return;
         }
 
         let mut kinds = Vec::with_capacity(config.num_layers);
         for layer in 0..config.num_layers {
-            let ssm_key = format!("blk.{layer}.ssm_alpha.weight");
-            let ssm_key_hf = format!("model.layers.{layer}.ssm.alpha.weight");
-            let has_ssm_layer = tensor_names.iter().any(|n| *n == ssm_key || *n == ssm_key_hf);
+            let markers = [
+                format!("blk.{layer}.ssm_alpha.weight"),
+                format!("blk.{layer}.ssm_ba.weight"),
+                format!("blk.{layer}.ssm_beta_alpha.weight"),
+                format!("model.layers.{layer}.ssm.alpha.weight"),
+                format!("model.layers.{layer}.ssm.beta_alpha.weight"),
+            ];
+            let has_ssm_layer = tensor_names.iter().any(|n| markers.iter().any(|m| n == m));
 
             if has_ssm_layer {
                 kinds.push(LayerKind::DeltaNet);
@@ -533,7 +998,8 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         .and_then(|v| v.as_f32())
         .unwrap_or(1e-5);
 
-    let head_dim = hidden_size / num_attention_heads;
+    let head_dim = get_usize("attention.key_length")
+        .unwrap_or(hidden_size / num_attention_heads);
 
     let is_bitnet = arch.contains("bitnet");
 
@@ -566,12 +1032,14 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         }
     };
 
-    // BitNet GGUF converter (convert-hf-to-gguf-bitnet.py) does NOT permute Q/K
-    // weights, so they remain in HuggingFace layout (split-half = NeoX RoPE).
-    // LLaMA GGUF converter permutes Q/K for adjacent-pair (Norm) RoPE.
-    // The GGUF metadata says ROPE_TYPE_NORM for both, but the actual weight
-    // layout determines which RoPE to use.
-    let rope_type = crate::config::RopeType::Neox;
+    // Qwen3.5/3.6 use IMROPE (interleaved multi-rope) = adjacent-pair (Norm) RoPE.
+    // Standard GGUF converter permutes Q/K weights for adjacent-pair pairing.
+    // BitNet/ternary GGUF converter does NOT permute → needs NeoX (split-half) RoPE.
+    let rope_type = if (arch == "qwen35" || arch == "qwen35moe") && !is_bitnet {
+        crate::config::RopeType::Norm
+    } else {
+        crate::config::RopeType::Neox
+    };
 
     let architecture = crate::config::Architecture::from_gguf_name(arch);
 
@@ -622,6 +1090,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         deltanet_head_dim: None,
         ssm_a: None,
         dt_bias: None,
+        rope_dim: if std::env::var("TEMPURA_FULL_ROPE").is_ok() { None } else { get_usize("rope.dimension_count") },
     })
 }
 
@@ -646,6 +1115,8 @@ fn convert_ggml_type(dtype: GgmlType) -> tempura_kernels::ggml::GgmlType {
         GgmlType::TL1 => GT::TQ1_0,
         // Map I2_S/TL2 (bitnet.cpp type 39) to TQ1_0 dequant — same 2-bit ternary encoding
         GgmlType::I2S => GT::TQ1_0,
+        // Q2_0 (PrismML 2-bit ternary) — map to Q2K as closest available type for fallback
+        GgmlType::Q2_0 => GT::Q2K,
     }
 }
 
@@ -770,10 +1241,14 @@ impl GgufLoader {
             // I2S (bitnet.cpp type 39) has no matching GPU quantized kernel yet — dequantize to f32.
             // TL1 (type 38, ARM LUT format) also dequantized via TQ1_0 path.
             let force_dequant = matches!(info.dtype, GgmlType::I2S | GgmlType::TL1);
-            let keep_raw = is_quantized
-                && !force_dequant
-                && !mapped_name.contains("embed_tokens")
-                && !mapped_name.contains("norm.weight");
+            let keep_raw = if std::env::var("TEMPURA_F32_ALL").is_ok() {
+                false
+            } else {
+                is_quantized
+                    && !force_dequant
+                    && !mapped_name.contains("embed_tokens")
+                    && !mapped_name.contains("norm.weight")
+            };
 
             if info.dtype == GgmlType::F16 {
                 mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, GgmlType::F16));
@@ -781,33 +1256,40 @@ impl GgufLoader {
 
             let skip_f32 = info.dtype == GgmlType::F16;
 
-            let use_mmap = keep_raw && info.dtype == GgmlType::TQ1_0;
+            let use_mmap = keep_raw && matches!(info.dtype,
+                GgmlType::TQ1_0 | GgmlType::TL1 | GgmlType::Q4K | GgmlType::Q6K | GgmlType::Q2_0);
             if use_mmap {
                 mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, info.dtype));
             }
 
             if !keep_raw && !skip_f32 {
-                let ggml_type = convert_ggml_type(info.dtype);
-                // For I2S/TL1: safe decode — use zeros if data is too short for TQ1_0.
-                let floats = if matches!(info.dtype, GgmlType::I2S | GgmlType::TL1) {
-                    let nb = ne / 256;
-                    if ne % 256 == 0 && tensor_data.len() >= nb * 54 {
-                        let mut buf = vec![0.0f32; ne];
-                        tempura_kernels::ggml::dequantize::dequantize_row(
-                            tensor_data, &mut buf, ggml_type, ne,
-                        );
-                        buf
-                    } else {
-                        vec![0.0f32; ne] // timing placeholder
+                let floats = match info.dtype {
+                    GgmlType::F32 => dequant_f32(tensor_data, ne),
+                    GgmlType::F16 => dequant_f16(tensor_data, ne),
+                    GgmlType::BF16 => dequant_bf16(tensor_data, ne),
+                    GgmlType::Q4_0 => dequant_q4_0(tensor_data, ne),
+                    GgmlType::Q4_1 => dequant_q4_1(tensor_data, ne),
+                    GgmlType::Q5_0 => dequant_q5_0(tensor_data, ne),
+                    GgmlType::Q5_1 => dequant_q5_1(tensor_data, ne),
+                    GgmlType::Q8_0 => dequant_q8_0(tensor_data, ne),
+                    GgmlType::Q2K => dequant_q2k(tensor_data, ne),
+                    GgmlType::Q3K => dequant_q3k(tensor_data, ne),
+                    GgmlType::Q4K => dequant_q4k(tensor_data, ne),
+                    GgmlType::Q5K => dequant_q5k(tensor_data, ne),
+                    GgmlType::Q6K => dequant_q6k(tensor_data, ne),
+                    GgmlType::TQ2_0 => dequant_tq2(tensor_data, ne),
+                    GgmlType::Q2_0 => dequant_q2_0(tensor_data, ne),
+                    GgmlType::TQ1_0 | GgmlType::TL1 => dequant_tq1(tensor_data, ne),
+                    GgmlType::I2S => {
+                        // I2S/TL2 embed/norm should not appear — fall back to zeros
+                        vec![0.0f32; ne]
                     }
-                } else {
-                    let mut buf = vec![0.0f32; ne];
-                    tempura_kernels::ggml::dequantize::dequantize_row(tensor_data, &mut buf, ggml_type, ne);
-                    buf
                 };
                 tensors.insert(mapped_name.clone(), floats);
             } else if !use_mmap && !skip_f32 {
                 raw_tensors.insert(mapped_name.clone(), tensor_data.to_vec());
+            }
+            if keep_raw || use_mmap {
                 raw_tensor_dims.insert(mapped_name.clone(), info.dims.clone());
             }
             tensor_dtypes.insert(mapped_name.clone(), info.dtype);
@@ -819,7 +1301,13 @@ impl GgufLoader {
         }).or_else(|| f16_raw_tensors.get("model.embed_tokens.weight").map(|t| {
             let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
             (t.len() / 2).checked_div(hidden).unwrap_or(0)
-        }));
+        })).or_else(|| {
+            let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
+            mmap_ranges.get("model.embed_tokens.weight").map(|&(_, len, dtype)| {
+                let row_bytes = tensor_data_size(dtype, hidden as u64, &[hidden as u64]) as usize;
+                if row_bytes > 0 { len / row_bytes } else { 0 }
+            })
+        });
 
         let mut config = extract_config(&metadata)?;
         if let Some(vs) = vocab_size_from_embed {
@@ -827,7 +1315,19 @@ impl GgufLoader {
                 config.vocab_size = vs;
             }
         }
-        config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
+        config.use_qk_norm = (0..config.num_layers).any(|l|
+            tensors.contains_key(&format!("model.layers.{l}.self_attn.q_norm.weight")));
+
+        // Detect ternary/BitNet attention weights: if Q uses Q2_0/TQ2_0,
+        // the converter did NOT permute Q/K → need NeoX RoPE even for qwen35.
+        let has_ternary_attn = tensor_dtypes.iter().any(|(name, dtype)| {
+            name.contains("self_attn.q_proj") && matches!(dtype, GgmlType::Q2_0 | GgmlType::TQ2_0)
+        }) || mmap_ranges.iter().any(|(name, &(_, _, dtype))| {
+            name.contains("self_attn.q_proj") && matches!(dtype, GgmlType::Q2_0 | GgmlType::TQ2_0)
+        });
+        if has_ternary_attn && config.rope_type == crate::config::RopeType::Norm {
+            config.rope_type = crate::config::RopeType::Neox;
+        }
 
         {
             let all_names: Vec<String> = tensors.keys()
@@ -848,7 +1348,7 @@ impl GgufLoader {
             && !mmap_ranges.contains_key("lm_head.weight") {
             if let Some(&(off, len, dtype)) = mmap_ranges.get("model.embed_tokens.weight") {
                 mmap_ranges.insert("lm_head.weight".into(), (off, len, dtype));
-                tensor_dtypes.insert("lm_head.weight".into(), GgmlType::F16);
+                tensor_dtypes.insert("lm_head.weight".into(), dtype);
             } else if let Some(f16_raw) = f16_raw_tensors.get("model.embed_tokens.weight") {
                 f16_raw_tensors.insert("lm_head.weight".into(), f16_raw.clone());
                 tensor_dtypes.insert("lm_head.weight".into(), GgmlType::F16);
@@ -964,24 +1464,24 @@ impl GgufLoader {
             let tensor_data = &data[abs_offset..abs_offset + byte_size];
             let ne = num_elements as usize;
 
-            let ggml_type = convert_ggml_type(info.dtype);
-            // For I2S/TL1 (bitnet.cpp types 38-39): attempt TQ1_0 decode if we have enough bytes.
-            let floats = if matches!(info.dtype, GgmlType::I2S | GgmlType::TL1) {
-                let tq1_0_block_size = 54usize;
-                let nb = ne / 256;
-                if tensor_data.len() >= nb * tq1_0_block_size && ne % 256 == 0 {
-                    let mut buf = vec![0.0f32; ne];
-                    tempura_kernels::ggml::dequantize::dequantize_row(
-                        tensor_data, &mut buf, ggml_type, ne,
-                    );
-                    buf
-                } else {
-                    vec![0.0f32; ne]
-                }
-            } else {
-                let mut buf = vec![0.0f32; ne];
-                tempura_kernels::ggml::dequantize::dequantize_row(tensor_data, &mut buf, ggml_type, ne);
-                buf
+            let floats = match info.dtype {
+                GgmlType::F32 => dequant_f32(tensor_data, ne),
+                GgmlType::F16 => dequant_f16(tensor_data, ne),
+                GgmlType::BF16 => dequant_bf16(tensor_data, ne),
+                GgmlType::Q4_0 => dequant_q4_0(tensor_data, ne),
+                GgmlType::Q4_1 => dequant_q4_1(tensor_data, ne),
+                GgmlType::Q5_0 => dequant_q5_0(tensor_data, ne),
+                GgmlType::Q5_1 => dequant_q5_1(tensor_data, ne),
+                GgmlType::Q8_0 => dequant_q8_0(tensor_data, ne),
+                GgmlType::Q2K => dequant_q2k(tensor_data, ne),
+                GgmlType::Q3K => dequant_q3k(tensor_data, ne),
+                GgmlType::Q4K => dequant_q4k(tensor_data, ne),
+                GgmlType::Q5K => dequant_q5k(tensor_data, ne),
+                GgmlType::Q6K => dequant_q6k(tensor_data, ne),
+                GgmlType::TQ2_0 => dequant_tq2(tensor_data, ne),
+                GgmlType::Q2_0 => dequant_q2_0(tensor_data, ne),
+                GgmlType::TQ1_0 | GgmlType::TL1 => dequant_tq1(tensor_data, ne),
+                GgmlType::I2S => vec![0.0f32; ne],
             };
 
             let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
@@ -1002,7 +1502,8 @@ impl GgufLoader {
             }
         }
 
-        config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
+        config.use_qk_norm = (0..config.num_layers).any(|l|
+            tensors.contains_key(&format!("model.layers.{l}.self_attn.q_norm.weight")));
 
         detect_and_apply_hybrid_layers(
             &mut config,
@@ -1025,7 +1526,8 @@ impl GgufLoader {
 }
 
 impl GgufLoader {
-    pub fn to_quantized_weights(&self) -> crate::weights::QuantizedWeights {
+    pub fn to_quantized_weights(self) -> crate::weights::QuantizedWeights {
+        let q2_shapes = self.q2_tensor_shapes();
         let mut typed_tensors = HashMap::new();
         let mut f32_tensors = HashMap::new();
 
@@ -1059,6 +1561,24 @@ impl GgufLoader {
 
         let mut qw = crate::weights::QuantizedWeights::new_typed(typed_tensors, f32_tensors);
 
+        if let Some(mmap) = self.mmap {
+            for (name, &(off, len, dtype)) in &self.mmap_ranges {
+                match dtype {
+                    GgmlType::TQ1_0 | GgmlType::TL1 => { qw.register_mmap_i2s(name.clone(), off, len); }
+                    GgmlType::F16 => { qw.register_mmap_f16(name.clone(), off, len); }
+                    GgmlType::Q4K => { qw.register_mmap_q4k(name.clone(), off, len); }
+                    GgmlType::Q6K => { qw.register_mmap_q6k(name.clone(), off, len); }
+                    GgmlType::Q2_0 => { qw.register_mmap_q2(name.clone(), off, len); }
+                    _ => {}
+                }
+            }
+            qw.set_mmap(mmap);
+        } else {
+            for (name, data) in &self.f16_raw_tensors {
+                qw.insert_f16(name.clone(), data.clone());
+            }
+        }
+
         // Build LUT-format (transposed) I2S/TQ1_0 tensors for the shuffle-based kernel
         let mut i2s_shapes = std::collections::HashMap::new();
         for (name, dtype) in &self.tensor_dtypes {
@@ -1076,7 +1596,41 @@ impl GgufLoader {
             }
         }
 
+        if !q2_shapes.is_empty() {
+            let t = std::time::Instant::now();
+            qw.build_q2_lut_tiled(&q2_shapes);
+            eprintln!("[Q2_0] LUT tiled repack: {} tensors in {:.1}s", q2_shapes.len(), t.elapsed().as_secs_f64());
+        }
+
         qw
+    }
+
+    pub fn raw_tensor_dims_count(&self) -> usize { self.raw_tensor_dims.len() }
+    pub fn mmap_ranges_count(&self) -> usize { self.mmap_ranges.len() }
+
+    pub fn q2_tensor_shapes(&self) -> HashMap<String, (usize, usize)> {
+        let mut shapes = HashMap::new();
+        let mut q2_count = 0usize;
+        for (name, &(_, _, dtype)) in &self.mmap_ranges {
+            if dtype == GgmlType::Q2_0 {
+                q2_count += 1;
+                if let Some(dims) = self.raw_tensor_dims.get(name) {
+                    if dims.len() >= 2 {
+                        shapes.insert(name.clone(), (dims[1] as usize, dims[0] as usize));
+                    }
+                }
+            }
+        }
+        if q2_count > 0 && shapes.is_empty() {
+            eprintln!("[Q2_0] {} Q2_0 in mmap_ranges but 0 matches in raw_tensor_dims ({} entries)", q2_count, self.raw_tensor_dims.len());
+            if let Some(first_q2) = self.mmap_ranges.iter().find(|(_, &(_, _, d))| d == GgmlType::Q2_0) {
+                eprintln!("[Q2_0] Example mmap key: {:?}", first_q2.0);
+            }
+            if let Some(first_dim) = self.raw_tensor_dims.keys().next() {
+                eprintln!("[Q2_0] Example raw_dim key: {:?}", first_dim);
+            }
+        }
+        shapes
     }
 
     pub fn tensor_dtype(&self, name: &str) -> Option<GgmlType> {

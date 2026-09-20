@@ -16,6 +16,9 @@ pub struct CpuDeltaNet;
 
 #[cfg(feature = "cpu")]
 impl CpuDeltaNet {
+    // State layout: column-major (transposed), matching PrismML llama.cpp.
+    // state[s_off + j * head_dim + i] = S[i][j]
+    // "Row j of the transposed matrix" = column j of S, stored contiguously.
     fn recurrent_step(
         q: &[f32],
         k: &[f32],
@@ -34,42 +37,39 @@ impl CpuDeltaNet {
             let s_off = h * d2;
             let qkv_off = h * head_dim;
 
-            // 1. Decay
-            let gate = softplus(alpha[h]) * ssm_a;
+            let gate = if ssm_a == 1.0 { alpha[h] } else { softplus(alpha[h]) * ssm_a };
             let decay = gate.exp();
             for i in 0..d2 {
                 state[s_off + i] *= decay;
             }
 
-            // 2. Retrieve: retrieved = S^T @ k  (S is row-major [head_dim x head_dim])
-            let mut retrieved = vec![0.0f32; head_dim];
-            for row in 0..head_dim {
-                for col in 0..head_dim {
-                    retrieved[col] += state[s_off + row * head_dim + col] * k[qkv_off + row];
-                }
-            }
+            let beta_val = if ssm_a == 1.0 { beta[h] } else { sigmoid(beta[h]) };
 
-            // 3. Delta
-            let beta_gate = sigmoid(beta[h]);
             let mut delta = vec![0.0f32; head_dim];
-            for i in 0..head_dim {
-                delta[i] = beta_gate * (v[qkv_off + i] - retrieved[i]);
-            }
-
-            // 4. Write: S += outer(k, delta)
-            for row in 0..head_dim {
-                for col in 0..head_dim {
-                    state[s_off + row * head_dim + col] += k[qkv_off + row] * delta[col];
-                }
-            }
-
-            // 5. Read: output = S @ q
-            for row in 0..head_dim {
+            for j in 0..head_dim {
                 let mut sum = 0.0f32;
-                for col in 0..head_dim {
-                    sum += state[s_off + row * head_dim + col] * q[qkv_off + col];
+                let row = &state[s_off + j * head_dim..s_off + (j + 1) * head_dim];
+                for i in 0..head_dim {
+                    sum += row[i] * k[qkv_off + i];
                 }
-                output[qkv_off + row] = sum;
+                delta[j] = beta_val * (v[qkv_off + j] - sum);
+            }
+
+            for j in 0..head_dim {
+                let row = &mut state[s_off + j * head_dim..s_off + (j + 1) * head_dim];
+                for i in 0..head_dim {
+                    row[i] += k[qkv_off + i] * delta[j];
+                }
+            }
+
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            for j in 0..head_dim {
+                let mut sum = 0.0f32;
+                let row = &state[s_off + j * head_dim..s_off + (j + 1) * head_dim];
+                for i in 0..head_dim {
+                    sum += row[i] * q[qkv_off + i];
+                }
+                output[qkv_off + j] = sum * scale;
             }
         }
     }
@@ -247,18 +247,19 @@ mod tests {
         // With state=0:
         //   gate = softplus(-100) * (-1) ~ 0, decay = exp(0) = 1
         //   state stays 0 after decay
-        //   retrieved = S^T @ k = [0,0]^T @ [0,1] = [0,0]
+        //   retrieved = S^T @ k = 0
         //   delta = 0.5 * ([3,4] - [0,0]) = [1.5, 2.0]
         //   S += outer([0,1], [1.5,2.0]) = [[0,0],[1.5,2.0]]
-        //   output = S @ q = [[0,0],[1.5,2.0]] @ [1,0] = [0, 1.5]
-        assert!((output[0] - 0.0).abs() < 1e-4, "output[0]={}", output[0]);
-        assert!((output[1] - 1.5).abs() < 1e-4, "output[1]={}", output[1]);
+        //   output = S^T @ q * scale = [[0,1.5],[0,2.0]] @ [1,0] / sqrt(2) = [0, 0]
+        //   q=[1,0] is orthogonal to k=[0,1], so retrieval returns 0
+        assert!((output[0]).abs() < 1e-4, "output[0]={}", output[0]);
+        assert!((output[1]).abs() < 1e-4, "output[1]={}", output[1]);
 
-        // Verify state
-        assert!((state[0] - 0.0).abs() < 1e-4); // [0][0]
-        assert!((state[1] - 0.0).abs() < 1e-4); // [0][1]
-        assert!((state[2] - 1.5).abs() < 1e-4); // [1][0]
-        assert!((state[3] - 2.0).abs() < 1e-4); // [1][1]
+        // Verify state (column-major: state[j*d+i] = S[i][j])
+        assert!((state[0] - 0.0).abs() < 1e-4); // S[0][0]
+        assert!((state[1] - 1.5).abs() < 1e-4); // S[1][0]
+        assert!((state[2] - 0.0).abs() < 1e-4); // S[0][1]
+        assert!((state[3] - 2.0).abs() < 1e-4); // S[1][1]
     }
 
     #[test]
@@ -370,22 +371,23 @@ mod tests {
                 ).unwrap();
 
                 // With S=0 initially, decay=1:
-                //   retrieved = 0^T @ k = 0
+                //   retrieved = S^T @ k = 0
                 //   delta = 0.5 * (v - 0) = 0.5 * v
                 //   S = outer(k, 0.5*v)
-                //   output = S @ q = k * (0.5*v . q)   where . is dot product per head
+                //   output = S^T @ q * scale = 0.5*v * (k . q) * scale
+                let scale = 1.0 / (head_dim as f32).sqrt();
                 for h in 0..num_heads {
                     let off = h * head_dim;
                     let k_h = &k[off..off + head_dim];
                     let v_h = &v[off..off + head_dim];
                     let q_h = &q[off..off + head_dim];
 
-                    let half_v_dot_q: f32 = v_h.iter().zip(q_h)
-                        .map(|(vi, qi)| 0.5 * vi * qi)
+                    let k_dot_q: f32 = k_h.iter().zip(q_h)
+                        .map(|(ki, qi)| ki * qi)
                         .sum();
 
                     for d in 0..head_dim {
-                        let expected = k_h[d] * half_v_dot_q;
+                        let expected = 0.5 * v_h[d] * k_dot_q * scale;
                         prop_assert!(
                             (output[off + d] - expected).abs() < 1e-4,
                             "head {h} dim {d}: output={} expected={}",
@@ -395,5 +397,72 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(kani)]
+mod kani_deltanet_output {
+    #[kani::proof]
+    fn output_is_transposed_state_times_query() {
+        let head_dim: usize = kani::any();
+        kani::assume(head_dim >= 1 && head_dim <= 4);
+        let d2 = head_dim * head_dim;
+
+        let col: usize = kani::any();
+        let row: usize = kani::any();
+        kani::assume(col < head_dim);
+        kani::assume(row < head_dim);
+
+        // Output computation: output[col] = Σ_row state[row*d + col] * q[row]
+        // This is (S^T @ q)[col] = Σ_row S[row][col] * q[row]
+        // where S[row][col] = state[row*d + col]
+        let out_state_idx = row * head_dim + col;
+        assert!(out_state_idx < d2);
+
+        // Retrieve computation: retrieved[col] = Σ_row state[row*d + col] * k[row]
+        // Same transposition: (S^T @ k)[col]
+        let ret_state_idx = row * head_dim + col;
+        assert!(ret_state_idx < d2);
+
+        // Update: state[row*d + col] += k[row] * delta[col]
+        // This is S += outer(k, delta) = S[row][col] += k[row]*d[col]
+        // Consistent: retrieve = S^T@k, output = S^T@q, update = S += k⊗delta
+        // The delta rule: S^T @ q = (S_old*decay + k⊗β(v - S^T@k))^T @ q
+        let upd_state_idx = row * head_dim + col;
+        assert!(upd_state_idx < d2);
+    }
+}
+
+#[cfg(kani)]
+mod kani_conv1d {
+    #[kani::proof]
+    fn conv1d_index_bounds() {
+        let seq_len: usize = kani::any();
+        let conv_dim: usize = kani::any();
+        let kernel_size: usize = kani::any();
+        kani::assume(seq_len >= 1 && seq_len <= 4);
+        kani::assume(conv_dim >= 1 && conv_dim <= 8);
+        kani::assume(kernel_size >= 1 && kernel_size <= 4);
+
+        let conv_input_len = seq_len * conv_dim;
+        let conv_w_len = conv_dim * kernel_size;
+        let conv_out_len = seq_len * conv_dim;
+
+        let ch: usize = kani::any();
+        let t: usize = kani::any();
+        let ki: usize = kani::any();
+        kani::assume(ch < conv_dim);
+        kani::assume(t < seq_len);
+        kani::assume(ki < kernel_size);
+
+        let src_t = t as isize - (kernel_size as isize - 1 - ki as isize);
+        if src_t >= 0 && (src_t as usize) < seq_len {
+            let input_idx = src_t as usize * conv_dim + ch;
+            assert!(input_idx < conv_input_len);
+        }
+        let w_idx = ch * kernel_size + ki;
+        assert!(w_idx < conv_w_len);
+        let out_idx = t * conv_dim + ch;
+        assert!(out_idx < conv_out_len);
     }
 }

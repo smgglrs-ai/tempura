@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use minijinja::{context, Environment};
 use serde::Deserialize;
 
 use crate::gguf_loader::GgufValue;
@@ -48,29 +47,46 @@ const CHATML_TEMPLATE: &str = "\
 {%- endfor %}\
 {%- if add_generation_prompt %}\
 <|im_start|>assistant\n\
+{% if enable_thinking %}<think>\n{% endif %}\
 {% endif %}";
 
-#[derive(Debug, Clone)]
+const CHATML_TEMPLATE_PLAIN: &str = "\
+{%- for message in messages %}\
+<|im_start|>{{ message.role }}\n\
+{{ message.content }}<|im_end|>\n\
+{%- endfor %}\
+{%- if add_generation_prompt %}\
+<|im_start|>assistant\n\
+{% endif %}";
+
 pub struct ChatTemplate {
-    template_source: String,
-    bos_token: String,
-    eos_token: String,
+    inner: hf_chat_template::ChatTemplate,
+}
+
+impl std::fmt::Debug for ChatTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatTemplate").finish()
+    }
 }
 
 impl ChatTemplate {
     pub fn new(template: String, bos_token: String, eos_token: String) -> Self {
-        Self {
-            template_source: template,
-            bos_token,
-            eos_token,
-        }
+        let mut cfg = hf_chat_template::TokenizerConfig::default();
+        cfg.bos_token = Some(hf_chat_template::TokenField::Str(bos_token));
+        cfg.eos_token = Some(hf_chat_template::TokenField::Str(eos_token));
+        let inner = hf_chat_template::ChatTemplate::builder(&template)
+            .special_tokens_from(&cfg)
+            .build()
+            .unwrap_or_else(|e| {
+                eprintln!("[chat-template] GGUF template failed: {e}, falling back to ChatML");
+                hf_chat_template::ChatTemplate::from_str(CHATML_TEMPLATE).unwrap()
+            });
+        Self { inner }
     }
 
     pub fn chatml() -> Self {
         Self {
-            template_source: CHATML_TEMPLATE.to_string(),
-            bos_token: String::new(),
-            eos_token: String::new(),
+            inner: hf_chat_template::ChatTemplate::from_str(CHATML_TEMPLATE).unwrap(),
         }
     }
 
@@ -79,31 +95,19 @@ impl ChatTemplate {
         messages: &[ChatMessageInput],
         add_generation_prompt: bool,
     ) -> Result<String, TokenizerError> {
-        let mut env = Environment::new();
-        env.add_template("chat", &self.template_source)
-            .map_err(|e| TokenizerError::Template(e.to_string()))?;
-
-        let messages_val: Vec<minijinja::Value> = messages
+        let msgs: Vec<hf_chat_template::Message> = messages
             .iter()
-            .map(|m| {
-                context! {
-                    role => m.role,
-                    content => m.content,
-                }
-            })
+            .map(|m| hf_chat_template::Message::new(&m.role, &m.content))
             .collect();
-
-        let tmpl = env
-            .get_template("chat")
-            .map_err(|e| TokenizerError::Template(e.to_string()))?;
-
-        tmpl.render(context! {
-            messages => messages_val,
-            add_generation_prompt => add_generation_prompt,
-            bos_token => self.bos_token,
-            eos_token => self.eos_token,
-        })
-        .map_err(|e| TokenizerError::Template(e.to_string()))
+        let mut input = hf_chat_template::RenderInput {
+            messages: msgs,
+            add_generation_prompt,
+            ..Default::default()
+        };
+        input.extra.insert("enable_thinking".into(), serde_json::Value::Bool(true));
+        self.inner
+            .render(&input)
+            .map_err(|e| TokenizerError::Template(e.to_string()))
     }
 }
 
@@ -117,6 +121,7 @@ pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
     chat_template: ChatTemplate,
     bos_token_id: Option<u32>,
+    eos_token_id: Option<u32>,
     add_bos: bool,
 }
 
@@ -140,6 +145,7 @@ impl Tokenizer {
             inner,
             chat_template,
             bos_token_id: None,
+            eos_token_id: None,
             add_bos: false,
         })
     }
@@ -186,38 +192,25 @@ impl Tokenizer {
 
         let mut inner = tokenizers::Tokenizer::new(bpe);
 
-        // Add special tokens (type 3 = control/special in GGUF)
+        // Register special tokens (type != 1) so they're matched as whole strings
+        // before the BPE pre-tokenizer splits them
         let token_types = metadata
             .get("tokenizer.ggml.token_type")
-            .and_then(|v| match v {
-                GgufValue::Array(arr) => {
-                    let mut types = Vec::with_capacity(arr.len());
-                    for item in arr {
-                        match item {
-                            GgufValue::I32(v) => types.push(*v as u32),
-                            GgufValue::U32(v) => types.push(*v),
-                            _ => types.push(0),
-                        }
+            .and_then(|v| v.as_u32_array());
+        if let Some(ref types) = token_types {
+            let mut special_tokens = Vec::new();
+            for (id, &tt) in types.iter().enumerate() {
+                if tt != 1 && id < tokens.len() {
+                    let tok_str = tokens[id].to_string();
+                    if !tok_str.is_empty() {
+                        let mut at = tokenizers::AddedToken::from(tok_str, true);
+                        at = at.normalized(false);
+                        special_tokens.push(at);
                     }
-                    Some(types)
                 }
-                _ => None,
-            });
-
-        if let Some(ref ttypes) = token_types {
-            let special: Vec<tokenizers::AddedToken> = ttypes
-                .iter()
-                .enumerate()
-                .filter(|(_, &t)| t == 3) // type 3 = control/special
-                .filter_map(|(id, _)| {
-                    tokens.get(id).map(|s| {
-                        tokenizers::AddedToken::from(s.to_string(), true)
-                            .single_word(false)
-                    })
-                })
-                .collect();
-            if !special.is_empty() {
-                inner.add_special_tokens(&special);
+            }
+            if !special_tokens.is_empty() {
+                inner.add_special_tokens(&special_tokens);
             }
         }
 
@@ -257,6 +250,9 @@ impl Tokenizer {
         let bos_token_id = metadata
             .get("tokenizer.ggml.bos_token_id")
             .and_then(|v| v.as_u32());
+        let eos_token_id = metadata
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(|v| v.as_u32());
 
         let add_bos = metadata
             .get("tokenizer.ggml.add_bos_token")
@@ -266,12 +262,28 @@ impl Tokenizer {
             })
             .unwrap_or(false);
 
-        let chat_template = ChatTemplate::new(CHATML_TEMPLATE.to_string(), bos_token, eos_token);
+        let gguf_template = metadata
+            .get("tokenizer.chat_template")
+            .and_then(|v| match v {
+                GgufValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
+        // Detect thinking model: has <think> as a special token
+        let is_thinking = token_types.as_ref().map_or(false, |types| {
+            tokens.iter().enumerate().any(|(id, tok)| {
+                *tok == "<think>" && id < types.len() && types[id as usize] != 1
+            })
+        });
+
+        let template_str = gguf_template
+            .unwrap_or_else(|| if is_thinking { CHATML_TEMPLATE.to_string() } else { CHATML_TEMPLATE_PLAIN.to_string() });
+        let chat_template = ChatTemplate::new(template_str, bos_token, eos_token);
 
         Ok(Self {
             inner,
             chat_template,
             bos_token_id,
+            eos_token_id,
             add_bos,
         })
     }
@@ -318,6 +330,10 @@ impl Tokenizer {
         self.inner
             .decode(ids, true)
             .map_err(|e| TokenizerError::Decode(e.to_string()))
+    }
+
+    pub fn eos_token_id(&self) -> Option<u32> {
+        self.eos_token_id
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -386,7 +402,7 @@ mod tests {
         assert!(result.contains("<|im_start|>system"));
         assert!(result.contains("You are helpful.<|im_end|>"));
         assert!(result.contains("<|im_start|>assistant\nHello!<|im_end|>"));
-        assert!(result.ends_with("<|im_start|>assistant\n"));
+        assert!(result.ends_with("<|im_start|>assistant\n<think>\n"));
     }
 
     #[test]

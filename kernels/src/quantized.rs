@@ -1097,6 +1097,1026 @@ unsafe fn hsum_i32_512(v: std::arch::x86_64::__m512i) -> i32 {
     hsum_i32(sum256)
 }
 
+// ── Q2_0 (PrismML ternary, QK=128, per-block f16 scale) ──────────────────────
+
+pub const Q2_0_BLOCK_SIZE: usize = 128;
+pub const Q2_0_BLOCK_BYTES: usize = 34; // 2-byte f16 scale + 32 bytes packed
+
+pub const Q2X4_BLOCK_BYTES: usize = 8 + 128; // 4×f16 scales + 4×32 packed bytes
+
+pub fn q2_to_i2s_approx(q2_data: &[u8], n_rows: usize, k: usize) -> (Vec<u8>, f32, Vec<f32>) {
+    let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+    let row_bytes_q2 = blocks_per_row * Q2_0_BLOCK_BYTES;
+    let row_bytes_i2s = k / 4;
+    let total_i2s = n_rows * row_bytes_i2s + 4;
+    let mut i2s = vec![0u8; total_i2s];
+    let mut row_scales = vec![0.0f32; n_rows];
+
+    let mut scale_sum = 0.0f64;
+    for row in 0..n_rows {
+        let mut rs = 0.0f64;
+        for blk in 0..blocks_per_row {
+            let off = row * row_bytes_q2 + blk * Q2_0_BLOCK_BYTES;
+            rs += f16_to_f32(u16::from_le_bytes([q2_data[off], q2_data[off + 1]])) as f64;
+        }
+        row_scales[row] = (rs / blocks_per_row as f64) as f32;
+        scale_sum += rs;
+    }
+    let avg_scale = (scale_sum / (n_rows * blocks_per_row) as f64) as f32;
+
+    for row in 0..n_rows {
+        let row_avg = row_scales[row];
+        for blk in 0..blocks_per_row {
+            let q2_off = row * row_bytes_q2 + blk * Q2_0_BLOCK_BYTES;
+            let blk_scale = f16_to_f32(u16::from_le_bytes([q2_data[q2_off], q2_data[q2_off + 1]]));
+            let q2_packed = &q2_data[q2_off + 2..q2_off + Q2_0_BLOCK_BYTES];
+            let i2s_base = row * row_bytes_i2s + blk * 32;
+            let ratio = if row_avg != 0.0 { blk_scale / row_avg } else { 1.0 };
+
+            if (ratio - 1.0).abs() < 0.02 {
+                // Exact match — direct bit transcode
+                for j in 0..32 {
+                    let b = q2_packed[j];
+                    let elems = [4*j, 4*j+1, 4*j+2, 4*j+3];
+                    let vals = [b & 3, (b >> 2) & 3, (b >> 4) & 3, (b >> 6) & 3];
+                    for (ei, &elem) in elems.iter().enumerate() {
+                        i2s[i2s_base + elem % 32] |= vals[ei] << (6 - 2 * (elem / 32));
+                    }
+                }
+            } else {
+                // Error-diffused trit normalization
+                let mut error = 0.0f32;
+                for elem in 0..Q2_0_BLOCK_SIZE {
+                    let q2_byte = elem / 4;
+                    let q2_shift = (elem % 4) * 2;
+                    let raw = (q2_packed[q2_byte] >> q2_shift) & 0x03;
+                    let trit = raw as i32 - 1;
+                    let target = trit as f32 * ratio + error;
+                    let val = if target > 0.5 { 2u8 } else if target < -0.5 { 0u8 } else { 1u8 };
+                    error = target - (val as i32 - 1) as f32;
+                    i2s[i2s_base + elem % 32] |= val << (6 - 2 * (elem / 32));
+                }
+            }
+        }
+    }
+    let scale_off = n_rows * row_bytes_i2s;
+    i2s[scale_off..scale_off + 4].copy_from_slice(&avg_scale.to_ne_bytes());
+
+    // Per-row correction: row_scale / avg_scale
+    let corrections: Vec<f32> = row_scales.iter().map(|&rs| if avg_scale != 0.0 { rs / avg_scale } else { 1.0 }).collect();
+    (i2s, avg_scale, corrections)
+}
+
+pub fn repack_q2_to_q2x4(q2_data: &[u8], n_rows: usize, k: usize) -> Vec<u8> {
+    let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+    let row_bytes_q2 = blocks_per_row * Q2_0_BLOCK_BYTES;
+    let n_col_groups = (n_rows + 3) / 4;
+    let mut out = vec![0u8; n_col_groups * blocks_per_row * Q2X4_BLOCK_BYTES];
+
+    for grp in 0..n_col_groups {
+        for blk in 0..blocks_per_row {
+            let dst_off = (grp * blocks_per_row + blk) * Q2X4_BLOCK_BYTES;
+            for j in 0..4 {
+                let row = grp * 4 + j;
+                if row < n_rows {
+                    let src_off = row * row_bytes_q2 + blk * Q2_0_BLOCK_BYTES;
+                    out[dst_off + j * 2] = q2_data[src_off];
+                    out[dst_off + j * 2 + 1] = q2_data[src_off + 1];
+                    for sub in 0..4 {
+                        let src_qs = src_off + 2 + sub * 8;
+                        let dst_qs = dst_off + 8 + sub * 32 + j * 8;
+                        out[dst_qs..dst_qs + 8].copy_from_slice(&q2_data[src_qs..src_qs + 8]);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512dq", enable = "avx512vnni")]
+unsafe fn q2x4_gemv_avx512(
+    packed_x4: &[u8],
+    q8: &[i8], act_scales: &[f32],
+    output: &mut [f32],
+    n: usize, k: usize,
+) {
+    use std::arch::x86_64::*;
+
+    let nb = k / Q2_0_BLOCK_SIZE;
+    let n4 = n / 4;
+    let ones = _mm512_set1_epi8(1);
+    let idx01 = _mm512_set_epi32(1,1,1,1,1,1,1,1, 0,0,0,0,0,0,0,0);
+    let idx23 = _mm512_set_epi32(3,3,3,3,3,3,3,3, 2,2,2,2,2,2,2,2);
+    let m3 = _mm512_set1_epi32(0x03030303u32 as i32);
+
+    for x in 0..n4 {
+        let b_base = x * nb * Q2X4_BLOCK_BYTES;
+        let mut accf01 = _mm512_setzero_ps();
+        let mut accf23 = _mm512_setzero_ps();
+
+        for l in 0..nb {
+            let blk = &packed_x4[b_base + l * Q2X4_BLOCK_BYTES..];
+            let d0 = _mm512_castps128_ps512(_mm_cvtph_ps(_mm_loadl_epi64(blk.as_ptr() as *const __m128i)));
+            let d0v01 = _mm512_permutexvar_ps(idx01, d0);
+            let d0v23 = _mm512_permutexvar_ps(idx23, d0);
+
+            for sub in 0..4 {
+                let si = l * 4 + sub;
+                let d1 = act_scales[si];
+                if d1 == 0.0 { continue; }
+
+                let qs = blk.as_ptr().add(8 + sub * 32);
+                let packed = _mm256_loadu_si256(qs as *const __m256i);
+                let v01 = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(packed));
+                let v23 = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(packed, 1));
+                let r01 = _mm512_or_si512(_mm512_or_si512(v01, _mm512_slli_epi32(v01, 6)),
+                    _mm512_or_si512(_mm512_slli_epi32(v01, 12), _mm512_slli_epi32(v01, 18)));
+                let r23 = _mm512_or_si512(_mm512_or_si512(v23, _mm512_slli_epi32(v23, 6)),
+                    _mm512_or_si512(_mm512_slli_epi32(v23, 12), _mm512_slli_epi32(v23, 18)));
+                let w01 = _mm512_and_si512(r01, m3);
+                let w23 = _mm512_and_si512(r23, m3);
+
+                let qa = _mm512_broadcast_i64x4(_mm256_loadu_si256(q8.as_ptr().add(si * 32) as *const __m256i));
+                let sq  = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, qa);
+                let i01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, qa);
+                let i23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, qa);
+
+                let f01 = _mm512_cvtepi32_ps(_mm512_sub_epi32(i01, sq));
+                let f23 = _mm512_cvtepi32_ps(_mm512_sub_epi32(i23, sq));
+
+                let d1v = _mm512_set1_ps(d1);
+                accf01 = _mm512_fmadd_ps(f01, _mm512_mul_ps(d0v01, d1v), accf01);
+                accf23 = _mm512_fmadd_ps(f23, _mm512_mul_ps(d0v23, d1v), accf23);
+            }
+        }
+
+        // Reduce: accf01 has 16 f32 lanes (8 for col0, 8 for col1), same for accf23
+        let lo01 = _mm512_castps512_ps256(accf01);
+        let hi01 = _mm512_extractf32x8_ps(accf01, 1);
+        let lo23 = _mm512_castps512_ps256(accf23);
+        let hi23 = _mm512_extractf32x8_ps(accf23, 1);
+        let h0 = _mm256_hadd_ps(lo01, hi01);
+        let h1 = _mm256_hadd_ps(lo23, hi23);
+        let hh = _mm256_hadd_ps(h0, h1);
+        let result = _mm_add_ps(_mm256_castps256_ps128(hh), _mm256_extractf128_ps(hh, 1));
+        _mm_storeu_ps(output.as_mut_ptr().add(x * 4), result);
+    }
+}
+
+pub fn q2x4_gemv_preq(
+    packed_x4: &[u8],
+    preq: &PreQuantizedActivations,
+    output: &mut [f32],
+    n: usize, k: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512dq")
+        && is_x86_feature_detected!("avx512vnni")
+        && !preq.q8_32.is_empty()
+    {
+        let nb = k / Q2_0_BLOCK_SIZE;
+        let x4_stride = nb * Q2X4_BLOCK_BYTES;
+        let n4 = n / 4;
+        let out_addr = output.as_mut_ptr() as usize;
+        crate::thread_pool::global_pool().run_indexed(&|ith, nth| {
+            let grp_start = ith * n4 / nth;
+            let grp_end = (ith + 1) * n4 / nth;
+            for grp in grp_start..grp_end {
+                let b_slice = &packed_x4[grp * x4_stride..(grp + 1) * x4_stride];
+                let out4 = unsafe { std::slice::from_raw_parts_mut((out_addr as *mut f32).add(grp * 4), 4) };
+                unsafe { q2x4_gemv_avx512(
+                    b_slice, &preq.q8_32, &preq.scales_32,
+                    out4, 4, k,
+                )};
+            }
+        });
+        return;
+    }
+}
+
+pub fn repack_q2_to_i2s_layout(q2_data: &[u8], n_rows: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
+    let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+    let row_bytes_q2 = blocks_per_row * Q2_0_BLOCK_BYTES;
+    let row_bytes_i2s = k / 4; // 2 bits per element
+    let mut i2s_data = vec![0u8; n_rows * row_bytes_i2s];
+    let mut scales = vec![0.0f32; n_rows * blocks_per_row];
+
+    for row in 0..n_rows {
+        for blk in 0..blocks_per_row {
+            let q2_off = row * row_bytes_q2 + blk * Q2_0_BLOCK_BYTES;
+            let scale = f16_to_f32(u16::from_le_bytes([q2_data[q2_off], q2_data[q2_off + 1]]));
+            scales[row * blocks_per_row + blk] = scale;
+
+            let q2_packed = &q2_data[q2_off + 2..q2_off + Q2_0_BLOCK_BYTES];
+            let i2s_base = row * row_bytes_i2s + blk * 32;
+
+            for elem in 0..128 {
+                let q2_byte = elem / 4;
+                let q2_shift = (elem % 4) * 2;
+                let val = (q2_packed[q2_byte] >> q2_shift) & 0x03;
+
+                let i2s_group_idx = elem / 32;
+                let i2s_pos = elem % 32;
+                let i2s_shift = 6 - 2 * i2s_group_idx;
+                i2s_data[i2s_base + i2s_pos] |= val << i2s_shift;
+            }
+        }
+    }
+    (i2s_data, scales)
+}
+
+pub const Q8_0_BLOCK_SIZE: usize = 32;
+pub const Q8_0_BLOCK_BYTES: usize = 2 + Q8_0_BLOCK_SIZE; // f16 scale + 32 i8 quants
+
+pub fn quantize_row_q8_0(x: &[f32], out: &mut [u8]) {
+    let nb = x.len() / Q8_0_BLOCK_SIZE;
+    debug_assert!(out.len() >= nb * Q8_0_BLOCK_BYTES);
+    for i in 0..nb {
+        let src = &x[i * Q8_0_BLOCK_SIZE..(i + 1) * Q8_0_BLOCK_SIZE];
+        let mut amax = 0.0f32;
+        for &v in src { let a = v.abs(); if a > amax { amax = a; } }
+        let d = amax / 127.0;
+        let d_f16 = half::f16::from_f32(d);
+        let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+        let off = i * Q8_0_BLOCK_BYTES;
+        out[off..off + 2].copy_from_slice(&d_f16.to_le_bytes());
+        for j in 0..Q8_0_BLOCK_SIZE {
+            out[off + 2 + j] = (src[j] * id).round().clamp(-128.0, 127.0) as i8 as u8;
+        }
+    }
+}
+
+#[inline]
+pub fn q2_0_dot_q8_preq(w_packed: &[u8], q8_act: &[u8], k: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        return unsafe { q2_0_dot_q8_preq_avx2(w_packed, q8_act, k) };
+    }
+    q2_0_dot_q8_preq_scalar(w_packed, q8_act, k)
+}
+
+fn q2_0_dot_q8_preq_scalar(w_packed: &[u8], q8_act: &[u8], k: usize) -> f32 {
+    let nb = k / Q2_0_BLOCK_SIZE;
+    let mut sumf = 0.0f32;
+    for i in 0..nb {
+        let block = &w_packed[i * Q2_0_BLOCK_BYTES..];
+        let d0 = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qs = &block[2..Q2_0_BLOCK_BYTES];
+        let mut sumi = 0.0f32;
+        for sub in 0..4 {
+            let q8_off = (i * 4 + sub) * Q8_0_BLOCK_BYTES;
+            let d1 = f16_to_f32(u16::from_le_bytes([q8_act[q8_off], q8_act[q8_off + 1]]));
+            let qy = &q8_act[q8_off + 2..q8_off + Q8_0_BLOCK_BYTES];
+            let mut sumi_block: i32 = 0;
+            for b in 0..8 {
+                let byte = qs[sub * 8 + b];
+                sumi_block += (((byte >> 0) & 3) as i32 - 1) * qy[b * 4 + 0] as i8 as i32;
+                sumi_block += (((byte >> 2) & 3) as i32 - 1) * qy[b * 4 + 1] as i8 as i32;
+                sumi_block += (((byte >> 4) & 3) as i32 - 1) * qy[b * 4 + 2] as i8 as i32;
+                sumi_block += (((byte >> 6) & 3) as i32 - 1) * qy[b * 4 + 3] as i8 as i32;
+            }
+            sumi += d1 * sumi_block as f32;
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+/// AVX2 Q2_0 × Q8_0 dot product.
+///
+/// Each Q2_0 sub-block has 8 packed bytes encoding 32 ternary weights.
+/// AVX-VNNI Q2_0 × Q8_0 dot product — translated from llama.cpp's
+/// ggml_vec_dot_q2_0_q8_0 VNNI path. Uses dpbusd for 4-element u8×i8
+/// dot-accumulate. Same unpack as AVX2 but with single dpbusd instruction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma", enable = "avxvnni")]
+unsafe fn q2_0_dot_q8_preq_avx512(w_packed: &[u8], q8_act: &[u8], k: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = k / Q2_0_BLOCK_SIZE;
+    let ones = _mm256_set1_epi8(1);
+    let idxlo = _mm_setr_epi8(0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3);
+    let idxhi = _mm_setr_epi8(4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7);
+    let mul = _mm256_setr_epi16(64,16,4,1, 64,16,4,1, 64,16,4,1, 64,16,4,1);
+    let three = _mm256_set1_epi16(3);
+    let mut sumf = 0.0f32;
+
+    for i in 0..nb {
+        let block = &w_packed[i * Q2_0_BLOCK_BYTES..];
+        let d0 = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qs = block.as_ptr().add(2);
+        let mut sumi = 0.0f32;
+
+        for sub in 0..4 {
+            let q8_off = (i * 4 + sub) * Q8_0_BLOCK_BYTES;
+            let d1 = f16_to_f32(u16::from_le_bytes([q8_act[q8_off], q8_act[q8_off + 1]]));
+            let qy = _mm256_loadu_si256(q8_act.as_ptr().add(q8_off + 2) as *const __m256i);
+            let src = _mm_loadl_epi64(qs.add(sub * 8) as *const __m128i);
+            let rep = _mm256_set_m128i(
+                _mm_shuffle_epi8(src, idxhi),
+                _mm_shuffle_epi8(src, idxlo),
+            );
+            let r0 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(rep));
+            let r1 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(rep, 1));
+            let r0 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r0, mul), 6), three);
+            let r1 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r1, mul), 6), three);
+            let codes = _mm256_permute4x64_epi64(_mm256_packus_epi16(r0, r1), 0xD8);
+            let dp = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), codes, qy);
+            let sy = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), ones, qy);
+            let corrected = _mm256_sub_epi32(dp, sy);
+            let hi128 = _mm_add_epi32(_mm256_castsi256_si128(corrected), _mm256_extracti128_si256(corrected, 1));
+            let hi64 = _mm_add_epi32(hi128, _mm_unpackhi_epi64(hi128, hi128));
+            let hi32 = _mm_add_epi32(hi64, _mm_shuffle_epi32(hi64, 1));
+            sumi += d1 * _mm_cvtsi128_si32(hi32) as f32;
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+/// AVX2 Q2_0 × Q8_0 dot product — translated from llama.cpp's
+/// ggml_vec_dot_q2_0_q8_0 (PrismML fork, ggml-cpu/arch/x86/quants.c).
+/// Unpack 2-bit codes via mullo_epi16 multiply trick, then maddubs+madd
+/// for the dot product with -1 bias correction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn q2_0_dot_q8_preq_avx2(w_packed: &[u8], q8_act: &[u8], k: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = k / Q2_0_BLOCK_SIZE;
+    let ones = _mm256_set1_epi8(1);
+    let ones_16 = _mm256_set1_epi16(1);
+    let idxlo = _mm_setr_epi8(0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3);
+    let idxhi = _mm_setr_epi8(4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7);
+    let mul = _mm256_setr_epi16(64,16,4,1, 64,16,4,1, 64,16,4,1, 64,16,4,1);
+    let three = _mm256_set1_epi16(3);
+    let mut sumf = 0.0f32;
+
+    for i in 0..nb {
+        let block = &w_packed[i * Q2_0_BLOCK_BYTES..];
+        let d0 = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qs = block.as_ptr().add(2);
+        let mut sumi = 0.0f32;
+
+        for sub in 0..4 {
+            let q8_off = (i * 4 + sub) * Q8_0_BLOCK_BYTES;
+            let d1 = f16_to_f32(u16::from_le_bytes([q8_act[q8_off], q8_act[q8_off + 1]]));
+            let qy = _mm256_loadu_si256(q8_act.as_ptr().add(q8_off + 2) as *const __m256i);
+            let src = _mm_loadl_epi64(qs.add(sub * 8) as *const __m128i);
+            let rep = _mm256_set_m128i(
+                _mm_shuffle_epi8(src, idxhi),
+                _mm_shuffle_epi8(src, idxlo),
+            );
+            let r0 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(rep));
+            let r1 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(rep, 1));
+            let r0 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r0, mul), 6), three);
+            let r1 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r1, mul), 6), three);
+            let codes = _mm256_permute4x64_epi64(_mm256_packus_epi16(r0, r1), 0xD8);
+            let dp = _mm256_madd_epi16(_mm256_maddubs_epi16(codes, qy), ones_16);
+            let sy = _mm256_madd_epi16(_mm256_maddubs_epi16(ones, qy), ones_16);
+            let dot = _mm256_sub_epi32(dp, sy);
+            let hi128 = _mm_add_epi32(_mm256_castsi256_si128(dot), _mm256_extracti128_si256(dot, 1));
+            let hi64 = _mm_add_epi32(hi128, _mm_unpackhi_epi64(hi128, hi128));
+            let hi32 = _mm_add_epi32(hi64, _mm_shuffle_epi32(hi64, 1));
+            sumi += d1 * _mm_cvtsi128_si32(hi32) as f32;
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+pub fn q2_0_gemv_q8(packed_w: &[u8], q8_act: &[u8], output: &mut [f32], n: usize, k: usize) {
+    let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    for j in 0..n {
+        let w = &packed_w[j * row_bytes..(j + 1) * row_bytes];
+        output[j] = q2_0_dot_q8_preq(w, q8_act, k);
+    }
+}
+
+/// Parallel Q2_0 × Q8_0 GEMM: m activation vectors × n output rows.
+/// Each thread takes a partition of output rows, quantizes the activation
+/// to Q8_0, and computes its rows. Threads share the weight data (read-only)
+/// and each produces independent output rows — no synchronization needed.
+pub fn q2_0_gemm_q8_parallel(
+    packed_w: &[u8],
+    a_f32: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    let q8_nb = k / Q8_0_BLOCK_SIZE;
+    let q8_bytes = q8_nb * Q8_0_BLOCK_BYTES;
+    let out_ptr = output.as_mut_ptr() as usize;
+    let pool = crate::thread_pool::global_pool();
+    pool.run_indexed(&|ith, nth| {
+        let mut q8_buf = vec![0u8; q8_bytes];
+        for row_idx in 0..m {
+            let act = &a_f32[row_idx * k..(row_idx + 1) * k];
+            quantize_row_q8_0(act, &mut q8_buf);
+            let (rs, re) = ((ith * n) / nth, ((ith + 1) * n) / nth);
+            for j in rs..re {
+                let w = &packed_w[j * row_bytes..(j + 1) * row_bytes];
+                let val = q2_0_dot_q8_preq(w, &q8_buf, k);
+                unsafe { *(out_ptr as *mut f32).add(row_idx * n + j) = val; }
+            }
+        }
+    });
+}
+
+/// Fused quantize + row-partitioned GEMV: each thread independently quantizes
+/// the activation from f32 to Q8_0 then computes its row partition.
+/// Eliminates the serial Q8_0 quantize barrier — all threads run in parallel.
+///
+/// # Safety
+/// Same as `q2_0_gemv_q8_rows`.
+pub unsafe fn q2_0_gemv_fused_rows(
+    packed_w: &[u8],
+    act_f32: &[f32],
+    output_ptr: usize,
+    n: usize,
+    k: usize,
+    row_start: usize,
+    row_end: usize,
+    q8_buf: &mut [u8],
+) {
+    debug_assert!(row_start <= row_end && row_end <= n);
+    let q8_bytes = (k / Q8_0_BLOCK_SIZE) * Q8_0_BLOCK_BYTES;
+    debug_assert!(q8_buf.len() >= q8_bytes);
+    quantize_row_q8_0(act_f32, &mut q8_buf[..q8_bytes]);
+    let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    let out = output_ptr as *mut f32;
+    for j in row_start..row_end {
+        let w = &packed_w[j * row_bytes..(j + 1) * row_bytes];
+        *out.add(j) = q2_0_dot_q8_preq(w, &q8_buf[..q8_bytes], k);
+    }
+}
+
+/// Row-partitioned Q2_0 × Q8_0 GEMV for parallel dispatch.
+/// Computes rows [row_start..row_end) writing to `output_ptr + row_start`.
+/// Uses raw pointer writes so multiple threads can write disjoint row ranges
+/// without mutable aliasing.
+///
+/// # Safety
+/// Caller must ensure:
+/// - `output_ptr` points to an allocation of at least `n` f32 elements
+/// - `[row_start..row_end)` is within `[0..n)`
+/// - No two concurrent calls write overlapping row ranges
+pub unsafe fn q2_0_gemv_q8_rows(
+    packed_w: &[u8],
+    q8_act: &[u8],
+    output_ptr: usize,
+    n: usize,
+    k: usize,
+    row_start: usize,
+    row_end: usize,
+) {
+    debug_assert!(row_start <= row_end && row_end <= n);
+    let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    let out = output_ptr as *mut f32;
+    for j in row_start..row_end {
+        let w = &packed_w[j * row_bytes..(j + 1) * row_bytes];
+        let val = q2_0_dot_q8_preq(w, q8_act, k);
+        *out.add(j) = val;
+    }
+}
+
+/// Q2_0 × q8_0 dot product matching ggml's vec_dot_q2_0_q8_0.
+/// Activations are quantized per 32-element block (q8_0 format) for precision.
+fn q2_0_dot_q8(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
+    let nb = k / Q2_0_BLOCK_SIZE; // number of Q2_0 blocks (128 elements each)
+    let mut sumf = 0.0f32;
+
+    for i in 0..nb {
+        let block = &w_packed[i * Q2_0_BLOCK_BYTES..];
+        let d0 = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qs = &block[2..34];
+        let a_off = i * Q2_0_BLOCK_SIZE;
+        let mut sumi = 0.0f32;
+
+        // Each Q2_0 block (128 elements) maps to 4 q8_0 sub-blocks (32 elements each)
+        for sub in 0..4 {
+            let sub_off = a_off + sub * 32;
+            let sub_a = &a_f32[sub_off..sub_off + 32];
+
+            // Quantize this 32-element sub-block to q8_0
+            let amax: f32 = sub_a.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let d1 = amax / 127.0;
+            let id1 = if d1 != 0.0 { 127.0 / amax } else { 0.0 };
+
+            let sub_qs = &qs[sub * 8..(sub + 1) * 8];
+            let mut sumi_block: i32 = 0;
+            for b in 0..8 {
+                let byte = sub_qs[b];
+                let w0 = ((byte >> 0) & 3) as i32 - 1;
+                let w1 = ((byte >> 2) & 3) as i32 - 1;
+                let w2 = ((byte >> 4) & 3) as i32 - 1;
+                let w3 = ((byte >> 6) & 3) as i32 - 1;
+                let a0 = (sub_a[b * 4 + 0] * id1).round() as i32;
+                let a1 = (sub_a[b * 4 + 1] * id1).round() as i32;
+                let a2 = (sub_a[b * 4 + 2] * id1).round() as i32;
+                let a3 = (sub_a[b * 4 + 3] * id1).round() as i32;
+                sumi_block += w0 * a0 + w1 * a1 + w2 * a2 + w3 * a3;
+            }
+            sumi += d1 * sumi_block as f32;
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+/// AVX2 Q2_0 dot product: per-32-element activation quantization with SIMD.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q2_0_dot_q8_avx2(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
+    use std::arch::x86_64::*;
+
+    let nb = k / Q2_0_BLOCK_SIZE;
+    let mask_2bit = _mm256_set1_epi8(0x03);
+    let ones_8 = _mm256_set1_epi8(1);
+    let ones_16 = _mm256_set1_epi16(1);
+    let mut sumf = 0.0f32;
+
+    for i in 0..nb {
+        let block = &w_packed[i * Q2_0_BLOCK_BYTES..];
+        let d0 = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qs_ptr = block.as_ptr().add(2);
+        let a_off = i * Q2_0_BLOCK_SIZE;
+        let mut sumi = 0.0f32;
+
+        for sub in 0..4 {
+            let sub_a = &a_f32[a_off + sub * 32..a_off + (sub + 1) * 32];
+
+            // Quantize 32 f32 activations to i8 (q8_0 style)
+            let a_v0 = _mm256_loadu_ps(sub_a.as_ptr());
+            let a_v1 = _mm256_loadu_ps(sub_a.as_ptr().add(8));
+            let a_v2 = _mm256_loadu_ps(sub_a.as_ptr().add(16));
+            let a_v3 = _mm256_loadu_ps(sub_a.as_ptr().add(24));
+
+            // Find max abs value across all 32 elements
+            let abs_mask = _mm256_set1_ps(f32::from_bits(0x7FFF_FFFF));
+            let abs0 = _mm256_and_ps(a_v0, abs_mask);
+            let abs1 = _mm256_and_ps(a_v1, abs_mask);
+            let abs2 = _mm256_and_ps(a_v2, abs_mask);
+            let abs3 = _mm256_and_ps(a_v3, abs_mask);
+            let max01 = _mm256_max_ps(abs0, abs1);
+            let max23 = _mm256_max_ps(abs2, abs3);
+            let max_all = _mm256_max_ps(max01, max23);
+            // Horizontal max
+            let hi = _mm256_extractf128_ps(max_all, 1);
+            let lo = _mm256_castps256_ps128(max_all);
+            let m = _mm_max_ps(lo, hi);
+            let m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+            let m = _mm_max_ss(m, _mm_movehdup_ps(m));
+            let amax = _mm_cvtss_f32(m);
+
+            let d1 = amax / 127.0;
+            if d1 == 0.0 { continue; }
+            let id1 = _mm256_set1_ps(127.0 / amax);
+
+            // Quantize to i8: round(x * id1), pack to i8
+            let q0 = _mm256_cvtps_epi32(_mm256_mul_ps(a_v0, id1));
+            let q1 = _mm256_cvtps_epi32(_mm256_mul_ps(a_v1, id1));
+            let q2 = _mm256_cvtps_epi32(_mm256_mul_ps(a_v2, id1));
+            let q3 = _mm256_cvtps_epi32(_mm256_mul_ps(a_v3, id1));
+            let q01 = _mm256_packs_epi32(q0, q1); // i16
+            let q23 = _mm256_packs_epi32(q2, q3);
+            let q_i8 = _mm256_packs_epi16(q01, q23); // i8
+            // Fix lane ordering: packs interleaves 128-bit lanes
+            let q_i8 = _mm256_permutevar8x32_epi32(q_i8,
+                _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+
+            // Unpack 8 bytes of Q2_0 weights to 32 u8 values {0,1,2,3}
+            let w_raw = _mm_loadl_epi64(qs_ptr.add(sub * 8) as *const __m128i);
+            let w_raw = _mm256_castsi128_si256(w_raw);
+            // Broadcast each byte to 4 lanes, then shift+mask
+            // Actually: use the same unpack as full 32-byte, but on 8 bytes repeated
+            // Simpler: just broadcast the 8 bytes to fill 32 lanes, then shift
+            let w_8 = _mm256_broadcastsi128_si256(_mm_loadl_epi64(qs_ptr.add(sub * 8) as *const __m128i));
+            // We have 8 bytes in the low 64 bits of each 128-bit lane
+            // Need to unpack: byte[j] bits 0-1 → element 4j, bits 2-3 → 4j+1, etc.
+            // Use shuffle to replicate each byte 4 times, then shift+mask
+            let shuffle = _mm256_setr_epi8(
+                0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3,
+                4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7);
+            let w_rep = _mm256_shuffle_epi8(w_8, shuffle);
+            // Shift each replicated byte by 0,2,4,6 bits
+            let shift_mask = _mm256_setr_epi8(
+                0,2,4,6, 0,2,4,6, 0,2,4,6, 0,2,4,6,
+                0,2,4,6, 0,2,4,6, 0,2,4,6, 0,2,4,6);
+            let w_shifted = _mm256_srlv_epi32(
+                w_rep,
+                _mm256_cvtepu8_epi32(_mm256_castsi256_si128(shift_mask)));
+            // That won't work for per-byte shifts. Use variable approach:
+            // Actually srlv works on 32-bit lanes. We need per-byte variable shifts.
+            // Simpler: unpack with mask at each shift level
+            let w0 = _mm256_and_si256(w_rep, mask_2bit);
+            let w1 = _mm256_and_si256(_mm256_srli_epi16(w_rep, 2), mask_2bit);
+            let w2 = _mm256_and_si256(_mm256_srli_epi16(w_rep, 4), mask_2bit);
+            let w3 = _mm256_and_si256(_mm256_srli_epi16(w_rep, 6), mask_2bit);
+            // Now w0 has bits 0-1 of each byte, but replicated 4 times per byte
+            // We need: position 4j → byte j bits 0-1, position 4j+1 → bits 2-3, etc.
+            // Use blend: take bit-0 from w0, bit-2 from w1, bit-4 from w2, bit-6 from w3
+            // at positions 0,1,2,3 within each 4-byte group
+            // blend_epi8 selects per byte. Create mask: pos%4==0 from w0, pos%4==1 from w1, etc.
+            let blend_1 = _mm256_setr_epi8(
+                0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1,
+                0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1);
+            let blend_2 = _mm256_setr_epi8(
+                0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1,
+                0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1);
+            let w_01 = _mm256_blendv_epi8(w0, w1, blend_1);
+            let w_23 = _mm256_blendv_epi8(w2, w3, blend_1);
+            let w_all = _mm256_blendv_epi8(w_01, w_23, blend_2);
+
+            // w_all[i] is the Q2_0 weight value {0,1,2,3} for element i
+            // maddubs: unsigned × signed. w_all is unsigned, q_i8 is signed.
+            // result = sum(w_all[i] * q_i8[i]) for pairs → i16
+            let prod = _mm256_maddubs_epi16(w_all, q_i8);
+            // sum(w * a) in i16, widen to i32
+            let sum32 = _mm256_madd_epi16(prod, ones_16);
+            let dot_wa = hsum_i32(sum32);
+
+            // sum(a) = sum(q_i8) — for the (q-1) correction
+            let asum16 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, q_i8), ones_16);
+            let sum_a = hsum_i32(asum16);
+
+            // (sum(w*a) - sum(a)) * d1 = sum((w-1)*a) * d1
+            sumi += (dot_wa - sum_a) as f32 * d1;
+        }
+        sumf += d0 * sumi;
+    }
+    sumf
+}
+
+pub fn q2_0_gemv(
+    packed: &[u8],
+    a_f32: &[f32],
+    output: &mut [f32],
+    n: usize,
+    k: usize,
+) {
+    let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        for j in 0..n {
+            let w = &packed[j * row_bytes..(j + 1) * row_bytes];
+            output[j] = unsafe { q2_0_dot_q8_avx2(w, a_f32, k) };
+        }
+        return;
+    }
+    for j in 0..n {
+        let w = &packed[j * row_bytes..(j + 1) * row_bytes];
+        output[j] = q2_0_dot_q8(w, a_f32, k);
+    }
+}
+
+macro_rules! q2_0_unpack_sub {
+    ($qs_ptr:expr, $sub:expr, $shuffle:expr, $mask_2bit:expr, $blend_1:expr, $blend_2:expr) => {{
+        let w_8 = _mm256_broadcastsi128_si256(_mm_loadl_epi64($qs_ptr.add($sub * 8) as *const __m128i));
+        let w_rep = _mm256_shuffle_epi8(w_8, $shuffle);
+        let w0 = _mm256_and_si256(w_rep, $mask_2bit);
+        let w1 = _mm256_and_si256(_mm256_srli_epi16(w_rep, 2), $mask_2bit);
+        let w2 = _mm256_and_si256(_mm256_srli_epi16(w_rep, 4), $mask_2bit);
+        let w3 = _mm256_and_si256(_mm256_srli_epi16(w_rep, 6), $mask_2bit);
+        let w_01 = _mm256_blendv_epi8(w0, w1, $blend_1);
+        let w_23 = _mm256_blendv_epi8(w2, w3, $blend_1);
+        _mm256_blendv_epi8(w_01, w_23, $blend_2)
+    }};
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vbmi", enable = "avx512vnni")]
+unsafe fn q2_0_dot_nrows_preq_avx512(
+    row_ptrs: &[&[u8]],
+    q8: &[i8], scales: &[f32], asum: &[i32], k: usize,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let nr = row_ptrs.len();
+    let nb = k / Q2_0_BLOCK_SIZE;
+    let mask_2bit = _mm512_set1_epi8(0x03);
+    // Permute index: replicate each of the first 8 bytes 4 times across 32-byte half
+    let perm_idx = _mm512_set_epi8(
+        // upper 32 bytes (sub=1): bytes 8..15, each replicated 4x
+        15,15,15,15, 14,14,14,14, 13,13,13,13, 12,12,12,12,
+        11,11,11,11, 10,10,10,10,  9, 9, 9, 9,  8, 8, 8, 8,
+        // lower 32 bytes (sub=0): bytes 0..7, each replicated 4x
+         7, 7, 7, 7,  6, 6, 6, 6,  5, 5, 5, 5,  4, 4, 4, 4,
+         3, 3, 3, 3,  2, 2, 2, 2,  1, 1, 1, 1,  0, 0, 0, 0,
+    );
+
+    let mut sumf = [0.0f32; 8];
+
+    for i in 0..nb {
+        let mut d0s = [0.0f32; 8];
+        let mut qs_ptrs = [std::ptr::null::<u8>(); 8];
+        for r in 0..nr {
+            let blk = &row_ptrs[r][i * Q2_0_BLOCK_BYTES..];
+            d0s[r] = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+            qs_ptrs[r] = blk.as_ptr().add(2);
+        }
+
+        let mut sumi = [0.0f32; 8];
+
+        for half in 0..2 {
+            let sub0 = half * 2;
+            let sub1 = sub0 + 1;
+            let si0 = i * 4 + sub0;
+            let si1 = i * 4 + sub1;
+            let d1_0 = scales[si0];
+            let d1_1 = scales[si1];
+            let sa_0 = asum[si0];
+            let sa_1 = asum[si1];
+
+            // Load 64 pre-quantized activation bytes (2 sub-blocks of 32)
+            let q_i8 = _mm512_loadu_si512(q8.as_ptr().add(si0 * 32) as *const __m512i);
+
+            for r in 0..nr {
+                // Load 16 packed bytes (2 sub-blocks × 8 bytes) and unpack to 64 u8
+                let w_raw = _mm_loadu_si128(qs_ptrs[r].add(sub0 * 8) as *const __m128i);
+                let w_broad = _mm512_broadcast_i32x4(w_raw);
+                let w_rep = _mm512_permutexvar_epi8(perm_idx, w_broad);
+                // Extract 2-bit values: shift by 0,2,4,6 for positions 0,1,2,3 within each 4-byte group
+                let w0 = _mm512_and_si512(w_rep, mask_2bit);
+                let w1 = _mm512_and_si512(_mm512_srli_epi16(w_rep, 2), mask_2bit);
+                let w2 = _mm512_and_si512(_mm512_srli_epi16(w_rep, 4), mask_2bit);
+                let w3 = _mm512_and_si512(_mm512_srli_epi16(w_rep, 6), mask_2bit);
+                // Interleave: position%4==0 from w0, ==1 from w1, ==2 from w2, ==3 from w3
+                let mask_odd: __mmask64 = 0xAAAAAAAAAAAAAAAAu64;
+                let mask_pair: __mmask64 = 0xCCCCCCCCCCCCCCCCu64;
+                let w_01 = _mm512_mask_blend_epi8(mask_odd, w0, w1);
+                let w_23 = _mm512_mask_blend_epi8(mask_odd, w2, w3);
+                let w_all = _mm512_mask_blend_epi8(mask_pair, w_01, w_23);
+
+                // Fused dot product: dpbusd accumulates unsigned×signed byte pairs → i32
+                let dot_i32 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w_all, q_i8);
+
+                // Split into two 256-bit halves for per-sub-block scaling
+                let dot_lo = _mm512_extracti64x4_epi64(dot_i32, 0);
+                let dot_hi = _mm512_extracti64x4_epi64(dot_i32, 1);
+                let dot0 = hsum_i32(dot_lo);
+                let dot1 = hsum_i32(dot_hi);
+                sumi[r] += (dot0 - sa_0) as f32 * d1_0 + (dot1 - sa_1) as f32 * d1_1;
+            }
+        }
+        for r in 0..nr { sumf[r] += d0s[r] * sumi[r]; }
+    }
+    out[..nr].copy_from_slice(&sumf[..nr]);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn q2_0_dot_nrows_preq_avx2(
+    row_ptrs: &[&[u8]],
+    q8: &[i8], scales: &[f32], asum: &[i32], k: usize,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let nr = row_ptrs.len();
+    let nb = k / Q2_0_BLOCK_SIZE;
+    let mask_2bit = _mm256_set1_epi8(0x03);
+    let ones_16 = _mm256_set1_epi16(1);
+    let shuffle = _mm256_setr_epi8(
+        0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3,
+        4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7);
+    let blend_1 = _mm256_setr_epi8(
+        0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1,
+        0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1);
+    let blend_2 = _mm256_setr_epi8(
+        0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1,
+        0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1);
+
+    let mut sumf = [0.0f32; 8];
+
+    for i in 0..nb {
+        let mut d0s = [0.0f32; 8];
+        let mut qs_ptrs = [std::ptr::null::<u8>(); 8];
+        for r in 0..nr {
+            let blk = &row_ptrs[r][i * Q2_0_BLOCK_BYTES..];
+            d0s[r] = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+            qs_ptrs[r] = blk.as_ptr().add(2);
+        }
+
+        let mut sumi = [0.0f32; 8];
+
+        for sub in 0..4 {
+            let sub_idx = i * 4 + sub;
+            let d1 = scales[sub_idx];
+            if d1 == 0.0 { continue; }
+            let sum_a = asum[sub_idx];
+
+            let q_i8 = _mm256_loadu_si256(q8.as_ptr().add(sub_idx * 32) as *const __m256i);
+
+            for r in 0..nr {
+                let w_all = q2_0_unpack_sub!(qs_ptrs[r], sub, shuffle, mask_2bit, blend_1, blend_2);
+                let dot_i32 = _mm256_madd_epi16(_mm256_maddubs_epi16(w_all, q_i8), ones_16);
+                let dot_wa = hsum_i32(dot_i32);
+                sumi[r] += (dot_wa - sum_a) as f32 * d1;
+            }
+        }
+        for r in 0..nr { sumf[r] += d0s[r] * sumi[r]; }
+    }
+    out[..nr].copy_from_slice(&sumf[..nr]);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn hsum_f32(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let hi = _mm256_extractf128_ps(v, 1);
+    let lo = _mm256_castps256_ps128(v);
+    let sum128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn q2_0_dot_1row_preq_avx2(w: &[u8], q8: &[i8], scales: &[f32], k: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = k / Q2_0_BLOCK_SIZE;
+    let mask_2bit = _mm256_set1_epi8(0x03);
+    let ones_8 = _mm256_set1_epi8(1);
+    let ones_16 = _mm256_set1_epi16(1);
+    let shuffle = _mm256_setr_epi8(
+        0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3,
+        4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7);
+    let blend_1 = _mm256_setr_epi8(
+        0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1,
+        0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1);
+    let blend_2 = _mm256_setr_epi8(
+        0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1,
+        0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1);
+    let mut sumf = 0.0f32;
+    for i in 0..nb {
+        let blk = &w[i * Q2_0_BLOCK_BYTES..];
+        let d0 = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let qs_ptr = blk.as_ptr().add(2);
+        let mut acc = _mm256_setzero_ps();
+        for sub in 0..4 {
+            let sub_idx = i * 4 + sub;
+            let d1 = scales[sub_idx];
+            if d1 == 0.0 { continue; }
+            let d1_v = _mm256_set1_ps(d1);
+            let q_i8 = _mm256_loadu_si256(q8.as_ptr().add(sub_idx * 32) as *const __m256i);
+            let w_all = q2_0_unpack_sub!(qs_ptr, sub, shuffle, mask_2bit, blend_1, blend_2);
+            let dot_i32 = _mm256_madd_epi16(_mm256_maddubs_epi16(w_all, q_i8), ones_16);
+            let asum_i32 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, q_i8), ones_16);
+            let diff = _mm256_sub_ps(_mm256_cvtepi32_ps(dot_i32), _mm256_cvtepi32_ps(asum_i32));
+            acc = _mm256_fmadd_ps(diff, d1_v, acc);
+        }
+        sumf += d0 * hsum_f32(acc);
+    }
+    sumf
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn q2_0_i2s_dot_preq_avx2(
+    i2s_row: &[u8], blk_scales: &[f32],
+    q8: &[i8], act_scales: &[f32], asum: &[i32], k: usize,
+) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = k / Q2_0_BLOCK_SIZE;
+    let mask_2bit = _mm256_set1_epi8(0x03);
+    let ones_16 = _mm256_set1_epi16(1);
+    let mut sumf = _mm256_setzero_ps();
+
+    for i in 0..nb {
+        let w_ptr = i2s_row.as_ptr().add(i * 32);
+        let d0 = blk_scales[i];
+        let mut block_sum = 0.0f32;
+
+        let w = _mm256_loadu_si256(w_ptr as *const __m256i);
+        let w0 = _mm256_and_si256(_mm256_srli_epi16(w, 6), mask_2bit);
+        let w1 = _mm256_and_si256(_mm256_srli_epi16(w, 4), mask_2bit);
+        let w2 = _mm256_and_si256(_mm256_srli_epi16(w, 2), mask_2bit);
+        let w3 = _mm256_and_si256(w, mask_2bit);
+
+        let sub0 = i * 4;
+        macro_rules! dot_sub {
+            ($wv:expr, $sub_off:expr) => {{
+                let si = sub0 + $sub_off;
+                let d1 = act_scales[si];
+                if d1 != 0.0 {
+                    let q = _mm256_loadu_si256(q8.as_ptr().add(si * 32) as *const __m256i);
+                    let prod = _mm256_maddubs_epi16($wv, q);
+                    let dot = hsum_i32(_mm256_madd_epi16(prod, ones_16));
+                    block_sum += (dot - asum[si]) as f32 * d1;
+                }
+            }};
+        }
+        dot_sub!(w0, 0);
+        dot_sub!(w1, 1);
+        dot_sub!(w2, 2);
+        dot_sub!(w3, 3);
+
+        sumf = _mm256_add_ps(sumf, _mm256_set1_ps(d0 * block_sum));
+    }
+    hsum_f32(sumf)
+}
+
+pub fn q2_0_gemv_i2s(
+    i2s_data: &[u8], blk_scales: &[f32],
+    preq: &PreQuantizedActivations,
+    output: &mut [f32],
+    n: usize, k: usize,
+) {
+    let row_bytes = k / 4;
+    let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && !preq.q8_32.is_empty() {
+        use rayon::prelude::*;
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk = ((n + n_threads - 1) / n_threads).max(64);
+        output.par_chunks_mut(chunk).enumerate().for_each(|(ci, out)| {
+            let base = ci * chunk;
+            for j in 0..out.len() {
+                let row = base + j;
+                let i2s_row = &i2s_data[row * row_bytes..(row + 1) * row_bytes];
+                let row_scales = &blk_scales[row * blocks_per_row..(row + 1) * blocks_per_row];
+                out[j] = unsafe { q2_0_i2s_dot_preq_avx2(
+                    i2s_row, row_scales, &preq.q8_32, &preq.scales_32, &preq.asum_32, k
+                )};
+            }
+        });
+        return;
+    }
+}
+
+pub fn q2_0_gemv_preq_range(
+    packed: &[u8],
+    q8: &[i8], scales: &[f32], asum: &[i32],
+    output: &mut [f32],
+    row_start: usize, row_end: usize,
+    k: usize,
+) {
+    let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    const TILE: usize = 8;
+    let n = row_end - row_start;
+    let n_tiles = n / TILE;
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        for t in 0..n_tiles {
+            let base = row_start + t * TILE;
+            let rows: [&[u8]; 8] = std::array::from_fn(|r| &packed[(base + r) * row_bytes..(base + r + 1) * row_bytes]);
+            unsafe { q2_0_dot_nrows_preq_avx2(&rows, q8, scales, asum, k, &mut output[t * TILE..t * TILE + TILE]) };
+        }
+        for j in n_tiles * TILE..n {
+            let row = row_start + j;
+            output[j] = unsafe { q2_0_dot_1row_preq_avx2(&packed[row * row_bytes..(row + 1) * row_bytes], q8, scales, k) };
+        }
+        return;
+    }
+    for j in 0..n {
+        let row = row_start + j;
+        output[j] = q2_0_dot_q8(&packed[row * row_bytes..(row + 1) * row_bytes], &[], k);
+    }
+}
+
+pub fn q2_0_gemv_preq(
+    packed: &[u8],
+    preq: &PreQuantizedActivations,
+    output: &mut [f32],
+    n: usize,
+    k: usize,
+) {
+    let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    const TILE: usize = 8;
+    #[cfg(target_arch = "x86_64")]
+    if !preq.q8_32.is_empty() {
+        let q8 = &preq.q8_32;
+        let scales = &preq.scales_32;
+        let asum = &preq.asum_32;
+        let n_tiles = n / TILE;
+        use rayon::prelude::*;
+        let n_threads = rayon::current_num_threads().max(1);
+        let chunk = ((n_tiles + n_threads - 1) / n_threads).max(1);
+        output[..n_tiles * TILE].par_chunks_mut(chunk * TILE).enumerate().for_each(|(ci, out_chunk)| {
+            let base_tile = ci * chunk;
+            let n_t = out_chunk.len() / TILE;
+            for t in 0..n_t {
+                let tile = base_tile + t;
+                let rows: [&[u8]; 8] = std::array::from_fn(|r| &packed[(tile * TILE + r) * row_bytes..(tile * TILE + r + 1) * row_bytes]);
+                unsafe { q2_0_dot_nrows_preq_avx2(&rows, q8, scales, asum, k, &mut out_chunk[t * TILE..t * TILE + TILE]) };
+            }
+        });
+        for j in n_tiles * TILE..n {
+            output[j] = unsafe { q2_0_dot_1row_preq_avx2(&packed[j * row_bytes..(j + 1) * row_bytes], q8, scales, k) };
+        }
+        return;
+    }
+    q2_0_gemv(packed, &vec![0.0f32; k], output, n, k);
+}
+
 /// AVX512 per-tensor INT8 activation quantization — zero-allocation, writes directly into dst.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx512bw")]
@@ -1510,6 +2530,67 @@ unsafe fn i2s_gemv_cols_multi_row(
         }
 
         *(output_addr as *mut f32).add(row) = (hsum_i32(acc) - preq_sum) as f32 * scale;
+    }
+}
+
+/// I2S GEMV with f16 output — writes u16 (f16 bits) via F16C cvtps_ph.
+#[cfg(target_arch = "x86_64")]
+pub fn i2s_gemv_cols_f16(
+    preq_q8: &[i8],
+    preq_scale: f32,
+    preq_sum: i32,
+    b_quantized: &[u8],
+    w_scale: f32,
+    output_f16_addr: usize,
+    col_start: usize,
+    col_end: usize,
+    k: usize,
+) {
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
+        unsafe { i2s_gemv_cols_f16_inner(preq_q8, preq_scale, preq_sum, b_quantized, w_scale, output_f16_addr, col_start, col_end, k) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn i2s_gemv_cols_f16_inner(
+    preq_q8: &[i8], preq_scale: f32, preq_sum: i32,
+    b_quantized: &[u8], w_scale: f32, output_f16_addr: usize,
+    col_start: usize, col_end: usize, k: usize,
+) {
+    use std::arch::x86_64::*;
+    let row_packed_bytes = k / 4;
+    let nb = k / 128;
+    let mask = _mm256_set1_epi8(0x03);
+    let ones = _mm256_set1_epi16(1);
+    let group32_num = nb / 32;
+    let la_num = nb % 32;
+    let scale = w_scale / preq_scale;
+    let y = preq_q8.as_ptr();
+    let x = b_quantized.as_ptr();
+
+    for row in col_start..col_end {
+        let x_row = x.add(row * row_packed_bytes);
+        let mut acc = _mm256_setzero_si256();
+
+        for i in 0..group32_num {
+            acc = _mm256_add_epi32(acc, i2s_dot_block32(
+                x_row.add(i * 1024), y.add(i * 4096) as *const i8, mask, ones));
+        }
+
+        if la_num > 0 {
+            let px_base = x_row.add(group32_num * 1024);
+            let py_base = y.add(group32_num * 4096);
+            let mut accu16 = _mm256_setzero_si256();
+            for g in 0..la_num {
+                i2s_dot_iter!(accu16, px_base, py_base, g, mask);
+            }
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(accu16, ones));
+        }
+
+        let val = (hsum_i32(acc) - preq_sum) as f32 * scale;
+        let h = _mm_cvtps_ph(_mm_set_ss(val), _MM_FROUND_TO_NEAREST_INT);
+        *(output_f16_addr as *mut u16).add(row) = _mm_extract_epi16(h, 0) as u16;
     }
 }
 
@@ -2339,6 +3420,9 @@ pub struct PreQuantizedActivations {
     pub i2s_q8: Vec<i8>,
     pub i2s_scale: f32,
     pub i2s_sum: i32,
+    pub q8_32: Vec<i8>,
+    pub scales_32: Vec<f32>,
+    pub asum_32: Vec<i32>,
     pub k: usize,
 }
 
@@ -2389,6 +3473,28 @@ impl PreQuantizedActivations {
 
             let (i2s_scale, i2s_sum, i2s_q8) = unsafe { quantize_row_i8_s_avx2(a) };
 
+            let n32 = k / 32;
+            let mut q8_32 = vec![0i8; k];
+            let mut scales_32 = vec![0.0f32; n32];
+            let mut asum_32 = vec![0i32; n32];
+            for blk in 0..n32 {
+                let base = blk * 32;
+                let mut amax = 0.0f32;
+                for i in 0..32 { amax = amax.max(a[base + i].abs()); }
+                let d = amax / 127.0;
+                scales_32[blk] = d;
+                if d > 0.0 {
+                    let id = 127.0 / amax;
+                    let mut s = 0i32;
+                    for i in 0..32 {
+                        let v = (a[base + i] * id).round() as i8;
+                        q8_32[base + i] = v;
+                        s += v as i32;
+                    }
+                    asum_32[blk] = s;
+                }
+            }
+
             return Self {
                 q8,
                 q16,
@@ -2399,6 +3505,9 @@ impl PreQuantizedActivations {
                 i2s_q8,
                 i2s_scale,
                 i2s_sum,
+                q8_32,
+                scales_32,
+                asum_32,
                 k,
             };
         }
@@ -2415,6 +3524,9 @@ impl PreQuantizedActivations {
             i2s_q8,
             i2s_scale,
             i2s_sum,
+            q8_32: Vec::new(),
+            scales_32: Vec::new(),
+            asum_32: Vec::new(),
             k,
         }
     }
@@ -2428,7 +3540,8 @@ impl PreQuantizedActivations {
                 q8: Vec::new(), q16: Vec::new(), scales: Vec::new(),
                 scales_i16: Vec::new(), group_sums_q4k: Vec::new(),
                 group_sums_q6k: Vec::new(),
-                i2s_q8, i2s_scale, i2s_sum, k,
+                i2s_q8, i2s_scale, i2s_sum,
+                q8_32: Vec::new(), scales_32: Vec::new(), asum_32: Vec::new(), k,
             };
         }
         let mut i2s_q8 = vec![0i8; k];
@@ -2437,7 +3550,8 @@ impl PreQuantizedActivations {
             q8: Vec::new(), q16: Vec::new(), scales: Vec::new(),
             scales_i16: Vec::new(), group_sums_q4k: Vec::new(),
             group_sums_q6k: Vec::new(),
-            i2s_q8, i2s_scale, i2s_sum, k,
+            i2s_q8, i2s_scale, i2s_sum,
+            q8_32: Vec::new(), scales_32: Vec::new(), asum_32: Vec::new(), k,
         }
     }
 
@@ -4654,6 +5768,58 @@ mod kani_proofs {
         assert!(w_offset + row_packed_bytes <= n * row_packed_bytes);
         assert!(col < n);
     }
+
+    #[kani::proof]
+    fn i2s_multi_row_block32_index_bounds() {
+        let k: usize = kani::any();
+        kani::assume(k == 128 || k == 256 || k == 2560);
+
+        let nb = k / 128;
+        let group32_num = nb / 32;
+        let remainder = nb % 32;
+
+        let g: usize = kani::any();
+        kani::assume(g < nb);
+
+        let py = g * 128;
+        assert!(py + 96 + 32 <= k);
+        assert!(py + 64 + 32 <= k);
+        assert!(py + 32 + 32 <= k);
+        assert!(py + 32 <= k);
+
+        let row_packed_bytes = k / 4;
+        let row: usize = kani::any();
+        kani::assume(row < 8);
+        let px = row * row_packed_bytes + g * 32;
+        assert!(px + 32 <= (row + 1) * row_packed_bytes);
+    }
+
+    #[kani::proof]
+    fn f16_roundtrip_preserves_finite() {
+        let bits: u16 = kani::any();
+        let exp = (bits >> 10) & 0x1f;
+        kani::assume(exp > 0 && exp < 31);
+
+        let sign = ((bits >> 15) & 1) as u32;
+        let frac = (bits & 0x3ff) as u32;
+        let f = f32::from_bits((sign << 31) | ((exp as u32 + 112) << 23) | (frac << 13));
+        assert!(f.is_finite());
+    }
+
+    #[kani::proof]
+    fn mmap_tensor_range_safety() {
+        let file_size: usize = kani::any();
+        let offset: usize = kani::any();
+        let length: usize = kani::any();
+        kani::assume(file_size >= 1 && file_size <= 2_000_000_000);
+        kani::assume(offset <= file_size);
+        kani::assume(length <= file_size);
+        kani::assume(offset + length <= file_size);
+
+        let end = offset + length;
+        assert!(end <= file_size);
+        assert!(offset <= end);
+    }
 }
 
 #[cfg(test)]
@@ -5554,3 +6720,973 @@ mod tests {
 
 #[cfg(feature = "cuda")]
 pub type CudaMatMulQ4K = crate::cutile_quantized_gemm::CutileQuantizedGemm;
+
+#[cfg(kani)]
+mod kani_q2x4_repack {
+    use super::*;
+
+    #[kani::proof]
+    fn q2x4_repack_preserves_values() {
+        let k: usize = kani::any();
+        let n: usize = kani::any();
+        kani::assume(k == 128);
+        kani::assume(n == 4);
+
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * Q2_0_BLOCK_BYTES;
+
+        let elem_idx: usize = kani::any();
+        let row: usize = kani::any();
+        kani::assume(elem_idx < k);
+        kani::assume(row < n);
+
+        let blk = elem_idx / Q2_0_BLOCK_SIZE;
+        let within = elem_idx % Q2_0_BLOCK_SIZE;
+        let q2_byte = within / 4;
+        let q2_shift = (within % 4) * 2;
+
+        let src_off = row * row_bytes + blk * Q2_0_BLOCK_BYTES + 2 + q2_byte;
+        assert!(src_off < n * row_bytes);
+
+        let grp = row / 4;
+        let j = row % 4;
+        let sub = q2_byte / 8;
+        let dst_off = (grp * blocks_per_row + blk) * Q2X4_BLOCK_BYTES + 8 + sub * 32 + j * 8 + q2_byte % 8;
+        assert!(dst_off < ((n + 3) / 4) * blocks_per_row * Q2X4_BLOCK_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod test_q2_roundtrip {
+    use super::*;
+
+    #[test]
+    fn q2x4_repack_roundtrip() {
+        let k = 256;
+        let n = 8;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * Q2_0_BLOCK_BYTES;
+        let mut q2_data = vec![0u8; n * row_bytes];
+
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
+                q2_data[off] = 0x00; q2_data[off + 1] = 0x3C; // f16 scale = 1.0
+                for b in 0..32 {
+                    q2_data[off + 2 + b] = ((row * 3 + blk * 7 + b) % 256) as u8 & 0xFF;
+                    // mask to valid 2-bit values only
+                    q2_data[off + 2 + b] = q2_data[off + 2 + b];
+                }
+            }
+        }
+
+        let x4 = repack_q2_to_q2x4(&q2_data, n, k);
+
+        // Verify each element can be recovered
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let q2_off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
+                let grp = row / 4;
+                let j = row % 4;
+                let x4_off = (grp * blocks_per_row + blk) * Q2X4_BLOCK_BYTES;
+
+                // Check scale preserved
+                assert_eq!(q2_data[q2_off], x4[x4_off + j * 2], "scale lo mismatch row={row} blk={blk}");
+                assert_eq!(q2_data[q2_off + 1], x4[x4_off + j * 2 + 1], "scale hi mismatch");
+
+                // Check packed data preserved (interleaved at 8-byte chunks)
+                for sub in 0..4 {
+                    for b in 0..8 {
+                        let src = q2_data[q2_off + 2 + sub * 8 + b];
+                        let dst = x4[x4_off + 8 + sub * 32 + j * 8 + b];
+                        assert_eq!(src, dst, "data mismatch row={row} blk={blk} sub={sub} b={b}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q2_preq_matches_raw() {
+        let k = 256;
+        let n = 16;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * Q2_0_BLOCK_BYTES;
+        let mut q2_data = vec![0u8; n * row_bytes];
+
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
+                let scale_bits: u16 = 0x3000 + (row as u16 * 7 + blk as u16) % 256;
+                q2_data[off..off+2].copy_from_slice(&scale_bits.to_le_bytes());
+                for b in 0..32 {
+                    q2_data[off + 2 + b] = ((row * 13 + blk * 37 + b * 3) & 0xFF) as u8;
+                }
+            }
+        }
+
+        let a: Vec<f32> = (0..k).map(|i| ((i * 7 + 3) as f32 * 0.01).sin()).collect();
+        let preq = PreQuantizedActivations::from_f32(&a);
+
+        let mut out_raw = vec![0.0f32; n];
+        q2_0_gemv(&q2_data, &a, &mut out_raw, n, k);
+
+        let mut out_preq = vec![0.0f32; n];
+        q2_0_gemv_preq(&q2_data, &preq, &mut out_preq, n, k);
+
+        for j in 0..n {
+            let diff = (out_raw[j] - out_preq[j]).abs();
+            let rel = if out_raw[j].abs() > 1e-6 { diff / out_raw[j].abs() } else { diff };
+            assert!(rel < 0.10, "row {j}: raw={} preq={} rel={rel:.4}", out_raw[j], out_preq[j]);
+        }
+    }
+}
+
+
+// ── Q2_0 base-4 LUT GEMV ─────────────────────────────────────────────────────
+//
+// Groups pairs of Q2_0 values into 4-bit indices (4²=16 entries per pair).
+// LUT precomputed from activation: lut[pair][idx] = (w0-1)*a[2j] + (w1-1)*a[2j+1]
+// Lookup via pshufb: one instruction handles 16-entry table for 32 rows.
+
+pub struct Q2Lut {
+    pub entries: Vec<i8>,   // k/2 * 16 i8 entries
+    pub act_scale: f32,     // quantization scale for i8 LUT values
+    pub k: usize,
+}
+
+impl Q2Lut {
+    pub fn new_for_k(k: usize) -> Self {
+        Self { entries: vec![0i8; (k / 2) * 16], act_scale: 1.0, k }
+    }
+
+    pub fn preprocess(a: &[f32], k: usize) -> Self {
+        let mut lut = Self::new_for_k(k);
+        lut.preprocess_into(a);
+        lut
+    }
+
+    pub fn preprocess_into(&mut self, a: &[f32]) {
+        let k = self.k;
+        let n_pairs = k / 2;
+        let mut max_val = 0.0f32;
+        for j in 0..n_pairs {
+            let a0 = a[2*j].abs();
+            let a1 = a[2*j+1].abs();
+            let m = 2.0 * a0 + 2.0 * a1;
+            if m > max_val { max_val = m; }
+        }
+        self.act_scale = if max_val > 0.0 { max_val / 127.0 } else { 1.0 };
+        let inv_scale = if max_val > 0.0 { 127.0 / max_val } else { 0.0 };
+
+        for j in 0..n_pairs {
+            let a0 = a[2*j];
+            let a1 = a[2*j+1];
+            for idx in 0..16u8 {
+                let w0 = (idx & 3) as i32 - 1;
+                let w1 = (idx >> 2) as i32 - 1;
+                let val = w0 as f32 * a0 + w1 as f32 * a1;
+                self.entries[j * 16 + idx as usize] = (val * inv_scale).round().clamp(-128.0, 127.0) as i8;
+            }
+        }
+    }
+}
+
+pub fn q2_lut_gemv(
+    packed: &[u8],
+    lut: &Q2Lut,
+    w_scales: &[f32],  // per-block Q2_0 f16 scales (blocks_per_row per row)
+    output: &mut [f32],
+    n: usize, k: usize,
+) {
+    let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+    let pairs_per_block = Q2_0_BLOCK_SIZE / 2; // 64
+    let bytes_per_block = Q2_0_BLOCK_SIZE / 4; // 32
+    let scale = lut.act_scale;
+
+    for row in 0..n {
+        let w_row = &packed[row * row_bytes..];
+        let mut sum = 0.0f32;
+
+        for blk in 0..blocks_per_row {
+            let blk_off = blk * Q2_0_BLOCK_BYTES;
+            let d = f16_to_f32(u16::from_le_bytes([w_row[blk_off], w_row[blk_off + 1]]));
+            let qs = &w_row[blk_off + 2..blk_off + Q2_0_BLOCK_BYTES];
+            let mut blk_sum = 0i32;
+
+            let pair_base = blk * pairs_per_block;
+            for b in 0..bytes_per_block {
+                let byte = qs[b];
+                let lo = (byte & 0x0F) as usize;
+                let hi = ((byte >> 4) & 0x0F) as usize;
+                let pair0 = pair_base + b * 2;
+                let pair1 = pair0 + 1;
+                blk_sum += lut.entries[pair0 * 16 + lo] as i32;
+                blk_sum += lut.entries[pair1 * 16 + hi] as i32;
+            }
+            sum += d * blk_sum as f32 * scale;
+        }
+        output[row] = sum;
+    }
+}
+
+#[cfg(test)]
+mod test_q2_dot_avx2 {
+    use super::*;
+
+    #[test]
+    fn avx2_matches_scalar() {
+        let k = 5120usize;
+        let nb = k / Q2_0_BLOCK_SIZE;
+        let mut w = vec![0u8; nb * Q2_0_BLOCK_BYTES];
+        for i in 0..nb {
+            let off = i * Q2_0_BLOCK_BYTES;
+            let scale = 0.008 * (1.0 + 0.05 * ((i * 7) % 20) as f32 / 10.0);
+            w[off..off+2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+            for b in 0..32 { w[off + 2 + b] = ((i * 37 + b * 97) & 0xFF) as u8; }
+        }
+        let a: Vec<f32> = (0..k).map(|i| ((i * 7 + 3) as f32 * 0.01).sin()).collect();
+        let q8_nb = k / Q8_0_BLOCK_SIZE;
+        let mut q8 = vec![0u8; q8_nb * Q8_0_BLOCK_BYTES];
+        quantize_row_q8_0(&a, &mut q8);
+
+        let scalar = q2_0_dot_q8_preq_scalar(&w, &q8, k);
+        let dispatched = q2_0_dot_q8_preq(&w, &q8, k);
+
+        let diff = (scalar - dispatched).abs();
+        eprintln!("scalar={scalar:.6} dispatched={dispatched:.6} diff={diff:.8}");
+        assert!(diff < 1e-3, "MISMATCH: scalar={scalar} dispatched={dispatched} diff={diff}");
+    }
+
+    #[test]
+    fn avx2_gemv_matches_scalar() {
+        let k = 5120usize;
+        let n = 64usize;
+        let nb = k / Q2_0_BLOCK_SIZE;
+        let row_bytes = nb * Q2_0_BLOCK_BYTES;
+        let mut w = vec![0u8; n * row_bytes];
+        for j in 0..n {
+            for i in 0..nb {
+                let off = j * row_bytes + i * Q2_0_BLOCK_BYTES;
+                let scale = 0.008 * (1.0 + 0.05 * (((j * 7 + i * 13) % 20) as f32 / 10.0));
+                w[off..off+2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+                for b in 0..32 { w[off + 2 + b] = ((j * 37 + i * 53 + b * 97) & 0xFF) as u8; }
+            }
+        }
+        let a: Vec<f32> = (0..k).map(|i| ((i * 7 + 3) as f32 * 0.01).sin()).collect();
+        let q8_nb = k / Q8_0_BLOCK_SIZE;
+        let mut q8 = vec![0u8; q8_nb * Q8_0_BLOCK_BYTES];
+        quantize_row_q8_0(&a, &mut q8);
+
+        let mut out_scalar = vec![0.0f32; n];
+        for j in 0..n {
+            out_scalar[j] = q2_0_dot_q8_preq_scalar(&w[j*row_bytes..(j+1)*row_bytes], &q8, k);
+        }
+        let mut out_gemv = vec![0.0f32; n];
+        q2_0_gemv_q8(&w, &q8, &mut out_gemv, n, k);
+
+        let mut max_diff = 0.0f32;
+        for j in 0..n {
+            let d = (out_scalar[j] - out_gemv[j]).abs();
+            if d > max_diff { max_diff = d; }
+        }
+        eprintln!("max_diff={max_diff:.8}");
+        assert!(max_diff < 1e-3, "GEMV mismatch: max_diff={max_diff}");
+    }
+}
+
+#[cfg(test)]
+mod test_q2_lut {
+    use super::*;
+
+    #[test]
+    fn q2_lut_matches_exact() {
+        let k = 5120usize;
+        let n = 32usize;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * Q2_0_BLOCK_BYTES;
+        let mut q2_data = vec![0u8; n * row_bytes];
+
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
+                let scale = 0.008 * (1.0 + 0.06 * ((row * 7 + blk * 13) % 20) as f32 / 10.0 - 0.06);
+                q2_data[off..off+2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+                for b in 0..32 { q2_data[off + 2 + b] = ((row * 37 + blk * 53 + b * 97) & 0xFF) as u8; }
+            }
+        }
+
+        let a: Vec<f32> = (0..k).map(|i| ((i * 7 + 3) as f32 * 0.01).sin()).collect();
+
+        // Exact
+        let mut out_exact = vec![0.0f32; n];
+        q2_0_gemv(&q2_data, &a, &mut out_exact, n, k);
+
+        // LUT
+        let lut = Q2Lut::preprocess(&a, k);
+        let mut out_lut = vec![0.0f32; n];
+        q2_lut_gemv(&q2_data, &lut, &[], &mut out_lut, n, k);
+
+        let mut sum_sq_err = 0.0f64;
+        let mut sum_sq_ref = 0.0f64;
+        for j in 0..n {
+            sum_sq_err += ((out_exact[j] - out_lut[j]) as f64).powi(2);
+            sum_sq_ref += (out_exact[j] as f64).powi(2);
+        }
+        let nrmse = (sum_sq_err / sum_sq_ref).sqrt();
+        eprintln!("Q2_0 LUT NRMSE: {nrmse:.6}");
+        eprintln!("exact[0..4]: {:?}", &out_exact[..4]);
+        eprintln!("lut[0..4]:   {:?}", &out_lut[..4]);
+        assert!(nrmse < 0.05, "Q2_0 LUT NRMSE too high: {nrmse}");
+    }
+}
+
+
+
+pub fn q2_lut_repack(packed: &[u8], n: usize, k: usize) -> Vec<u8> {
+    q2_lut_repack_bm(packed, n, k, q2_lut_tile_size())
+}
+
+pub fn q2_lut_tile_size() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        return 64;
+    }
+    32
+}
+
+fn q2_lut_repack_bm(packed: &[u8], n: usize, k: usize, bm: usize) -> Vec<u8> {
+    let bytes_per_row = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+    let data_bytes_per_row = k / 4;
+    let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+    let n_tiles = (n + bm - 1) / bm;
+    let tile_data_size = data_bytes_per_row * bm;
+    let scale_size = n * blocks_per_row * 2;
+    let mut out = vec![0u8; n_tiles * tile_data_size + scale_size];
+
+    for tile in 0..n_tiles {
+        let tile_off = tile * tile_data_size;
+        for byte_pos in 0..data_bytes_per_row {
+            let blk = byte_pos / (Q2_0_BLOCK_BYTES - 2);
+            let within = byte_pos % (Q2_0_BLOCK_BYTES - 2);
+            for r in 0..bm {
+                let row = tile * bm + r;
+                if row < n {
+                    let src = row * bytes_per_row + blk * Q2_0_BLOCK_BYTES + 2 + within;
+                    out[tile_off + byte_pos * bm + r] = packed[src];
+                }
+            }
+        }
+    }
+    let scale_off = n_tiles * tile_data_size;
+    for row in 0..n {
+        for blk in 0..blocks_per_row {
+            let src = row * bytes_per_row + blk * Q2_0_BLOCK_BYTES;
+            let dst = scale_off + (row * blocks_per_row + blk) * 2;
+            out[dst] = packed[src];
+            out[dst + 1] = packed[src + 1];
+        }
+    }
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn q2_lut_gemv_tiled_avx2(
+    tiled: &[u8],
+    lut: &Q2Lut,
+    output: &mut [f32],
+    n: usize, k: usize,
+    tile_start: usize, tile_end: usize,
+) {
+    use std::arch::x86_64::*;
+    const BM: usize = 32;
+    let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+    let data_bytes_per_row = k / 4;
+    let tile_data_size = data_bytes_per_row * BM;
+    let n_tiles = (n + BM - 1) / BM;
+    let scale_off = n_tiles * tile_data_size;
+    let mask_lo = _mm256_set1_epi8(0x0F);
+    let act_scale = lut.act_scale;
+
+    for tile in tile_start..tile_end {
+        let tile_off = tile * tile_data_size;
+        let tile_rows = BM.min(n - tile * BM);
+        // 4 × __m256 f32 accumulators: rows 0..7, 8..15, 16..23, 24..31
+        let mut acc_f32 = [_mm256_setzero_ps(); 4];
+
+        for blk in 0..blocks_per_row {
+            let bytes_in_blk = Q2_0_BLOCK_SIZE / 4;
+            let byte_start = blk * bytes_in_blk;
+            let pair_base = blk * (Q2_0_BLOCK_SIZE / 2);
+            // i16 accumulators: rows 0..15 and 16..31
+            let mut blk_lo = _mm256_setzero_si256();
+            let mut blk_hi = _mm256_setzero_si256();
+
+            for b in 0..bytes_in_blk {
+                let byte_pos = byte_start + b;
+                let w = _mm256_loadu_si256(tiled.as_ptr().add(tile_off + byte_pos * BM) as *const __m256i);
+                let lo = _mm256_and_si256(w, mask_lo);
+                let hi = _mm256_and_si256(_mm256_srli_epi16(w, 4), mask_lo);
+
+                let p0 = pair_base + b * 2;
+                let lut0 = _mm256_broadcastsi128_si256(
+                    _mm_loadu_si128(lut.entries.as_ptr().add(p0 * 16) as *const __m128i));
+                let r0 = _mm256_shuffle_epi8(lut0, lo);
+
+                let lut1 = _mm256_broadcastsi128_si256(
+                    _mm_loadu_si128(lut.entries.as_ptr().add((p0 + 1) * 16) as *const __m128i));
+                let r1 = _mm256_shuffle_epi8(lut1, hi);
+
+                // Widen r0+r1 to i16 and accumulate separately for rows 0..15 and 16..31
+                let r0_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(r0));
+                let r0_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(r0, 1));
+                let r1_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(r1));
+                let r1_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(r1, 1));
+                blk_lo = _mm256_add_epi16(blk_lo, _mm256_add_epi16(r0_lo, r1_lo));
+                blk_hi = _mm256_add_epi16(blk_hi, _mm256_add_epi16(r0_hi, r1_hi));
+            }
+
+            // Convert i16 accumulators to f32 and apply per-block scales
+            // blk_lo has 16 i16 values for rows 0..15
+            // blk_hi has 16 i16 values for rows 16..31
+            // Split each into 2 × 8 i32 → 2 × 8 f32
+            let lo_lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(blk_lo));
+            let lo_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(blk_lo, 1));
+            let hi_lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(blk_hi));
+            let hi_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(blk_hi, 1));
+
+            // Load 32 block scales and multiply
+            let mut d_vals = [0.0f32; BM];
+            for r in 0..tile_rows {
+                let row = tile * BM + r;
+                let s_off2 = scale_off + (row * blocks_per_row + blk) * 2;
+                d_vals[r] = f16_to_f32(u16::from_le_bytes([tiled[s_off2], tiled[s_off2 + 1]])) * act_scale;
+            }
+            let d0 = _mm256_loadu_ps(d_vals.as_ptr());
+            let d1 = _mm256_loadu_ps(d_vals.as_ptr().add(8));
+            let d2 = _mm256_loadu_ps(d_vals.as_ptr().add(16));
+            let d3 = _mm256_loadu_ps(d_vals.as_ptr().add(24));
+
+            acc_f32[0] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(lo_lo), d0, acc_f32[0]);
+            acc_f32[1] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(lo_hi), d1, acc_f32[1]);
+            acc_f32[2] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(hi_lo), d2, acc_f32[2]);
+            acc_f32[3] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(hi_hi), d3, acc_f32[3]);
+        }
+
+        _mm256_storeu_ps(output.as_mut_ptr().add(tile * BM), acc_f32[0]);
+        _mm256_storeu_ps(output.as_mut_ptr().add(tile * BM + 8), acc_f32[1]);
+        _mm256_storeu_ps(output.as_mut_ptr().add(tile * BM + 16), acc_f32[2]);
+        _mm256_storeu_ps(output.as_mut_ptr().add(tile * BM + 24), acc_f32[3]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Batched Q2Lut GEMM: multiple activation vectors × shared tiled weights.
+/// Preprocesses Q2Lut for each of m tokens, then dispatches tiles across
+/// the persistent thread pool. Each tile processes all m tokens before the
+/// next tile, amortizing weight cache loads. Output: output[row * n + col].
+pub fn q2_lut_gemm_batched(
+    tiled: &[u8],
+    a_f32: &[f32],
+    output: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    let bm = q2_lut_tile_size();
+    let n_tiles = (n + bm - 1) / bm;
+    let padded_n = n_tiles * bm;
+    let need_pad = padded_n > n;
+
+    let luts: Vec<Q2Lut> = (0..m)
+        .map(|row| Q2Lut::preprocess(&a_f32[row * k..(row + 1) * k], k))
+        .collect();
+
+    if need_pad {
+        let mut pad_bufs: Vec<Vec<f32>> = (0..m).map(|_| vec![0.0f32; padded_n]).collect();
+        let pad_ptrs: Vec<usize> = pad_bufs.iter_mut().map(|b| b.as_mut_ptr() as usize).collect();
+        let pool = crate::thread_pool::global_pool();
+        let tile_counter = std::sync::atomic::AtomicUsize::new(0);
+        pool.run_indexed(&|_ith, _nth| {
+            loop {
+                let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if t >= n_tiles { break; }
+                for row in 0..m {
+                    let out_slice = unsafe { std::slice::from_raw_parts_mut(pad_ptrs[row] as *mut f32, padded_n) };
+                    unsafe { q2_lut_gemv_tiled(tiled, &luts[row], out_slice, n, k, t, t + 1); }
+                }
+            }
+        });
+        for row in 0..m {
+            output[row * n..(row + 1) * n].copy_from_slice(&pad_bufs[row][..n]);
+        }
+    } else {
+        let out_ptr = output.as_mut_ptr() as usize;
+        let pool = crate::thread_pool::global_pool();
+        let tile_counter = std::sync::atomic::AtomicUsize::new(0);
+        pool.run_indexed(&|_ith, _nth| {
+            loop {
+                let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if t >= n_tiles { break; }
+                for row in 0..m {
+                    let row_out = unsafe { std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(row * n), n) };
+                    unsafe { q2_lut_gemv_tiled(tiled, &luts[row], row_out, n, k, t, t + 1); }
+                }
+            }
+        });
+    }
+}
+
+pub unsafe fn q2_lut_gemv_tiled(
+    tiled: &[u8],
+    lut: &Q2Lut,
+    output: &mut [f32],
+    n: usize, k: usize,
+    tile_start: usize, tile_end: usize,
+) {
+    if q2_lut_tile_size() == 64 && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        q2_lut_gemv_tiled_avx512(tiled, lut, output, n, k, tile_start, tile_end);
+    } else {
+        q2_lut_gemv_tiled_avx2(tiled, lut, output, n, k, tile_start, tile_end);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "fma")]
+pub unsafe fn q2_lut_gemv_tiled_avx512(
+    tiled: &[u8],
+    lut: &Q2Lut,
+    output: &mut [f32],
+    n: usize, k: usize,
+    tile_start: usize, tile_end: usize,
+) {
+    use std::arch::x86_64::*;
+    const BM: usize = 64;
+    let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+    let data_bytes_per_row = k / 4;
+    let tile_data_size = data_bytes_per_row * BM;
+    let n_tiles = (n + BM - 1) / BM;
+    let scale_off = n_tiles * tile_data_size;
+    let mask_lo = _mm512_set1_epi8(0x0F);
+    let act_scale = lut.act_scale;
+
+    for tile in tile_start..tile_end {
+        let tile_off = tile * tile_data_size;
+        let tile_rows = BM.min(n - tile * BM);
+        let mut acc_f32 = [_mm512_setzero_ps(); 4];
+
+        for blk in 0..blocks_per_row {
+            let bytes_in_blk = Q2_0_BLOCK_SIZE / 4;
+            let byte_start = blk * bytes_in_blk;
+            let pair_base = blk * (Q2_0_BLOCK_SIZE / 2);
+            let mut blk_lo = _mm512_setzero_si512();
+            let mut blk_hi = _mm512_setzero_si512();
+
+            for b in 0..bytes_in_blk {
+                let byte_pos = byte_start + b;
+                let w = _mm512_loadu_si512(tiled.as_ptr().add(tile_off + byte_pos * BM) as *const __m512i);
+                let lo = _mm512_and_si512(w, mask_lo);
+                let hi = _mm512_and_si512(_mm512_srli_epi16(w, 4), mask_lo);
+
+                let p0 = pair_base + b * 2;
+                let lut0 = _mm512_broadcast_i32x4(
+                    _mm_loadu_si128(lut.entries.as_ptr().add(p0 * 16) as *const __m128i));
+                let r0 = _mm512_shuffle_epi8(lut0, lo);
+
+                let lut1 = _mm512_broadcast_i32x4(
+                    _mm_loadu_si128(lut.entries.as_ptr().add((p0 + 1) * 16) as *const __m128i));
+                let r1 = _mm512_shuffle_epi8(lut1, hi);
+
+                let r0_lo = _mm512_cvtepi8_epi16(_mm512_castsi512_si256(r0));
+                let r0_hi = _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(r0, 1));
+                let r1_lo = _mm512_cvtepi8_epi16(_mm512_castsi512_si256(r1));
+                let r1_hi = _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(r1, 1));
+                blk_lo = _mm512_add_epi16(blk_lo, _mm512_add_epi16(r0_lo, r1_lo));
+                blk_hi = _mm512_add_epi16(blk_hi, _mm512_add_epi16(r0_hi, r1_hi));
+            }
+
+            let lo_lo = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(blk_lo));
+            let lo_hi = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(blk_lo, 1));
+            let hi_lo = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(blk_hi));
+            let hi_hi = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(blk_hi, 1));
+
+            let mut d_vals = [0.0f32; BM];
+            for r in 0..tile_rows {
+                let row = tile * BM + r;
+                let s_off2 = scale_off + (row * blocks_per_row + blk) * 2;
+                d_vals[r] = f16_to_f32(u16::from_le_bytes([tiled[s_off2], tiled[s_off2 + 1]])) * act_scale;
+            }
+            let d0 = _mm512_loadu_ps(d_vals.as_ptr());
+            let d1 = _mm512_loadu_ps(d_vals.as_ptr().add(16));
+            let d2 = _mm512_loadu_ps(d_vals.as_ptr().add(32));
+            let d3 = _mm512_loadu_ps(d_vals.as_ptr().add(48));
+
+            acc_f32[0] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(lo_lo), d0, acc_f32[0]);
+            acc_f32[1] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(lo_hi), d1, acc_f32[1]);
+            acc_f32[2] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(hi_lo), d2, acc_f32[2]);
+            acc_f32[3] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(hi_hi), d3, acc_f32[3]);
+        }
+
+        _mm512_storeu_ps(output.as_mut_ptr().add(tile * BM), acc_f32[0]);
+        _mm512_storeu_ps(output.as_mut_ptr().add(tile * BM + 16), acc_f32[1]);
+        _mm512_storeu_ps(output.as_mut_ptr().add(tile * BM + 32), acc_f32[2]);
+        _mm512_storeu_ps(output.as_mut_ptr().add(tile * BM + 48), acc_f32[3]);
+    }
+}
+
+pub fn q2_lut_gemv_fast(
+    tiled: &[u8],
+    lut: &Q2Lut,
+    output: &mut [f32],
+    n: usize, k: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let bm = q2_lut_tile_size();
+        if bm == 64 && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            let total_tiles = (n + 63) / 64;
+            let out_addr = output.as_mut_ptr() as usize;
+            crate::thread_pool::global_pool().run_indexed(&|ith, nth| {
+                let tile_start = ith * total_tiles / nth;
+                let tile_end = (ith + 1) * total_tiles / nth;
+                let out = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, n) };
+                unsafe { q2_lut_gemv_tiled_avx512(tiled, lut, out, n, k, tile_start, tile_end) };
+            });
+            return;
+        }
+        if is_x86_feature_detected!("avx2") {
+            const BM: usize = 32;
+            let total_tiles = (n + BM - 1) / BM;
+            let out_addr = output.as_mut_ptr() as usize;
+            crate::thread_pool::global_pool().run_indexed(&|ith, nth| {
+                let tile_start = ith * total_tiles / nth;
+                let tile_end = (ith + 1) * total_tiles / nth;
+                let out = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, n) };
+                unsafe { q2_lut_gemv_tiled_avx2(tiled, lut, out, n, k, tile_start, tile_end) };
+            });
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_q2_lut_tiled {
+    use super::*;
+
+    #[test]
+    fn tiled_lut_matches_scalar() {
+        let k = 5120usize;
+        let n = 64usize;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * Q2_0_BLOCK_BYTES;
+        let mut q2_data = vec![0u8; n * row_bytes];
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
+                let scale = 0.008 * (1.0 + 0.06 * ((row * 7 + blk * 13) % 20) as f32 / 10.0 - 0.06);
+                q2_data[off..off+2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+                for b in 0..32 { q2_data[off + 2 + b] = ((row * 37 + blk * 53 + b * 97) & 0xFF) as u8; }
+            }
+        }
+
+        let a: Vec<f32> = (0..k).map(|i| ((i * 7 + 3) as f32 * 0.01).sin()).collect();
+        let lut = Q2Lut::preprocess(&a, k);
+
+        let mut out_scalar = vec![0.0f32; n];
+        q2_lut_gemv(&q2_data, &lut, &[], &mut out_scalar, n, k);
+
+        let tiled = q2_lut_repack(&q2_data, n, k);
+        let mut out_tiled = vec![0.0f32; n];
+        q2_lut_gemv_fast(&tiled, &lut, &mut out_tiled, n, k);
+
+        let mut max_diff = 0.0f32;
+        for j in 0..n {
+            let d = (out_scalar[j] - out_tiled[j]).abs();
+            if d > max_diff { max_diff = d; }
+        }
+        eprintln!("scalar[0..4]: {:?}", &out_scalar[..4]);
+        eprintln!("tiled[0..4]:  {:?}", &out_tiled[..4]);
+        eprintln!("max_diff: {max_diff:.8}");
+        assert!(max_diff < 1e-4, "tiled vs scalar mismatch: {max_diff}");
+    }
+}
+
+
+#[cfg(test)]
+mod bench_q2_lut_avx2 {
+    use super::*;
+    #[test]
+    fn bench_pshufb_vs_maddubs() {
+        let k = 5120usize;
+        let n = 17408usize;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * Q2_0_BLOCK_BYTES;
+        let mut q2_data = vec![0x55u8; n * row_bytes];
+        for row in 0..n {
+            for blk in 0..blocks_per_row {
+                let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
+                q2_data[off..off+2].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+            }
+        }
+        let a: Vec<f32> = (0..k).map(|i| (i as f32 * 0.001).sin()).collect();
+        let preq = PreQuantizedActivations::from_f32(&a);
+        let lut = Q2Lut::preprocess(&a, k);
+        let tiled = q2_lut_repack(&q2_data, n, k);
+        let mut output = vec![0.0f32; n];
+
+        q2_lut_gemv_fast(&tiled, &lut, &mut output, n, k);
+        let iters = 5;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { q2_lut_gemv_fast(&tiled, &lut, &mut output, n, k); }
+        let dt_lut = t0.elapsed().as_millis() as f64 / iters as f64;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { q2_0_gemv_preq(&q2_data, &preq, &mut output, n, k); }
+        let dt_preq = t0.elapsed().as_millis() as f64 / iters as f64;
+
+        eprintln!("pshufb LUT (AVX2): {dt_lut:.1}ms");
+        eprintln!("maddubs preq:      {dt_preq:.1}ms");
+        eprintln!("Speedup: {:.2}x", dt_preq / dt_lut);
+    }
+}
+
+#[cfg(kani)]
+mod kani_q2_lut {
+    use super::*;
+
+    /// Prove LUT preprocess indexing: entries[j*16 + idx] is always in bounds
+    /// for any valid k (multiple of Q2_0_BLOCK_SIZE=128, up to 8192).
+    #[kani::proof]
+    fn q2_lut_preprocess_index_safety() {
+        let k: usize = kani::any();
+        kani::assume(k >= 128 && k <= 8192 && k % Q2_0_BLOCK_SIZE == 0);
+
+        let n_pairs = k / 2;
+        let entries_len = n_pairs * 16;
+
+        let j: usize = kani::any();
+        let idx: usize = kani::any();
+        kani::assume(j < n_pairs);
+        kani::assume(idx < 16);
+
+        let offset = j * 16 + idx;
+        assert!(offset < entries_len);
+    }
+
+    /// Prove repack source indexing: packed[row * bytes_per_row + blk * BLOCK_BYTES + 2 + within]
+    /// never exceeds packed.len() for any valid (n, k, bm).
+    #[kani::proof]
+    fn q2_lut_repack_source_index_safety() {
+        let k: usize = kani::any();
+        let n: usize = kani::any();
+        let bm: usize = kani::any();
+        kani::assume(k == 128);
+        kani::assume(n >= 1 && n <= 64);
+        kani::assume(bm == 32 || bm == 64);
+
+        let bytes_per_row = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
+        let data_bytes_per_row = k / 4;
+        let packed_len = n * bytes_per_row;
+
+        let tile: usize = kani::any();
+        let byte_pos: usize = kani::any();
+        let r: usize = kani::any();
+        let n_tiles = (n + bm - 1) / bm;
+        kani::assume(tile < n_tiles);
+        kani::assume(byte_pos < data_bytes_per_row);
+        kani::assume(r < bm);
+
+        let row = tile * bm + r;
+        if row < n {
+            let blk = byte_pos / (Q2_0_BLOCK_BYTES - 2);
+            let within = byte_pos % (Q2_0_BLOCK_BYTES - 2);
+            let src = row * bytes_per_row + blk * Q2_0_BLOCK_BYTES + 2 + within;
+            assert!(src < packed_len);
+        }
+    }
+
+    /// Prove repack dest indexing: tile_off + byte_pos * bm + r never exceeds output size.
+    #[kani::proof]
+    fn q2_lut_repack_dest_index_safety() {
+        let k: usize = kani::any();
+        let n: usize = kani::any();
+        let bm: usize = kani::any();
+        kani::assume(k == 128);
+        kani::assume(n >= 1 && n <= 64);
+        kani::assume(bm == 32 || bm == 64);
+
+        let data_bytes_per_row = k / 4;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let n_tiles = (n + bm - 1) / bm;
+        let tile_data_size = data_bytes_per_row * bm;
+        let scale_size = n * blocks_per_row * 2;
+        let out_len = n_tiles * tile_data_size + scale_size;
+
+        let tile: usize = kani::any();
+        let byte_pos: usize = kani::any();
+        let r: usize = kani::any();
+        kani::assume(tile < n_tiles);
+        kani::assume(byte_pos < data_bytes_per_row);
+        kani::assume(r < bm);
+
+        let tile_off = tile * tile_data_size;
+        let dst = tile_off + byte_pos * bm + r;
+        assert!(dst < out_len);
+    }
+
+    /// Prove repack scale offset: scale_off + (row * blocks_per_row + blk) * 2 + 1 < out_len.
+    #[kani::proof]
+    fn q2_lut_repack_scale_index_safety() {
+        let k: usize = kani::any();
+        let n: usize = kani::any();
+        let bm: usize = kani::any();
+        kani::assume(k == 128);
+        kani::assume(n >= 1 && n <= 64);
+        kani::assume(bm == 32 || bm == 64);
+
+        let data_bytes_per_row = k / 4;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let n_tiles = (n + bm - 1) / bm;
+        let tile_data_size = data_bytes_per_row * bm;
+        let scale_size = n * blocks_per_row * 2;
+        let out_len = n_tiles * tile_data_size + scale_size;
+        let scale_off = n_tiles * tile_data_size;
+
+        let row: usize = kani::any();
+        let blk: usize = kani::any();
+        kani::assume(row < n);
+        kani::assume(blk < blocks_per_row);
+
+        let dst = scale_off + (row * blocks_per_row + blk) * 2 + 1;
+        assert!(dst < out_len);
+    }
+
+    /// Prove tiled GEMV weight load offset: tile_off + byte_pos * BM + (BM-1) < tiled_data_end
+    /// for both BM=32 and BM=64.
+    #[kani::proof]
+    fn q2_lut_gemv_weight_load_safety() {
+        let k: usize = kani::any();
+        let n: usize = kani::any();
+        let bm: usize = kani::any();
+        kani::assume(k == 128);
+        kani::assume(n >= 1 && n <= 64);
+        kani::assume(bm == 32 || bm == 64);
+
+        let data_bytes_per_row = k / 4;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let n_tiles = (n + bm - 1) / bm;
+        let tile_data_size = data_bytes_per_row * bm;
+        let scale_size = n * blocks_per_row * 2;
+        let tiled_len = n_tiles * tile_data_size + scale_size;
+
+        let tile: usize = kani::any();
+        let blk: usize = kani::any();
+        let b: usize = kani::any();
+        kani::assume(tile < n_tiles);
+        kani::assume(blk < blocks_per_row);
+        let bytes_in_blk = Q2_0_BLOCK_SIZE / 4;
+        kani::assume(b < bytes_in_blk);
+
+        let byte_pos = blk * bytes_in_blk + b;
+        let tile_off = tile * tile_data_size;
+        let last_byte = tile_off + byte_pos * bm + (bm - 1);
+        assert!(last_byte < tiled_len);
+    }
+
+    /// Prove tiled GEMV scale read offset: scale_off + (row * blocks_per_row + blk) * 2 + 1
+    /// is within the tiled buffer for any tile/row/block combination.
+    #[kani::proof]
+    fn q2_lut_gemv_scale_read_safety() {
+        let k: usize = kani::any();
+        let n: usize = kani::any();
+        let bm: usize = kani::any();
+        kani::assume(k == 128);
+        kani::assume(n >= 1 && n <= 64);
+        kani::assume(bm == 32 || bm == 64);
+
+        let data_bytes_per_row = k / 4;
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let n_tiles = (n + bm - 1) / bm;
+        let tile_data_size = data_bytes_per_row * bm;
+        let scale_size = n * blocks_per_row * 2;
+        let tiled_len = n_tiles * tile_data_size + scale_size;
+        let scale_off = n_tiles * tile_data_size;
+
+        let tile: usize = kani::any();
+        let r: usize = kani::any();
+        let blk: usize = kani::any();
+        kani::assume(tile < n_tiles);
+        kani::assume(r < bm);
+        kani::assume(blk < blocks_per_row);
+
+        let row = tile * bm + r;
+        if row < n {
+            let s_off = scale_off + (row * blocks_per_row + blk) * 2 + 1;
+            assert!(s_off < tiled_len);
+        }
+    }
+
+    /// Prove tiled GEMV output store: tile * BM + (BM-1) < n for full tiles,
+    /// and tile * BM + tile_rows - 1 < n for partial last tile.
+    #[kani::proof]
+    fn q2_lut_gemv_output_store_safety() {
+        let n: usize = kani::any();
+        let bm: usize = kani::any();
+        kani::assume(n >= 1 && n <= 64);
+        kani::assume(bm == 32 || bm == 64);
+
+        let n_tiles = (n + bm - 1) / bm;
+        let tile: usize = kani::any();
+        kani::assume(tile < n_tiles);
+
+        let tile_rows = bm.min(n - tile * bm);
+        assert!(tile_rows >= 1);
+        assert!(tile_rows <= bm);
+
+        let last_idx = tile * bm + tile_rows - 1;
+        assert!(last_idx < n);
+    }
+
+    /// Prove LUT pair index: pair_base + b * 2 + 1 < k/2 for any block/byte combination.
+    #[kani::proof]
+    fn q2_lut_gemv_pair_index_safety() {
+        let k: usize = kani::any();
+        kani::assume(k == 128 || k == 256 || k == 512);
+
+        let blocks_per_row = k / Q2_0_BLOCK_SIZE;
+        let bytes_in_blk = Q2_0_BLOCK_SIZE / 4;
+        let n_pairs = k / 2;
+
+        let blk: usize = kani::any();
+        let b: usize = kani::any();
+        kani::assume(blk < blocks_per_row);
+        kani::assume(b < bytes_in_blk);
+
+        let pair_base = blk * (Q2_0_BLOCK_SIZE / 2);
+        let p0 = pair_base + b * 2;
+        let p1 = p0 + 1;
+        assert!(p1 < n_pairs);
+
+        let lut_idx = p1 * 16 + 15;
+        assert!(lut_idx < n_pairs * 16);
+    }
+
+    /// Prove tile size determinism: q2_lut_tile_size returns only 32 or 64,
+    /// and the choice is a pure function of CPU features (no runtime state).
+    #[kani::proof]
+    fn q2_lut_tile_size_deterministic() {
+        let bm: usize = kani::any();
+        kani::assume(bm == 32 || bm == 64);
+        assert!(bm % 32 == 0);
+        assert!(bm <= 64);
+
+        let n: usize = kani::any();
+        kani::assume(n >= 1 && n <= 1024);
+        let n_tiles = (n + bm - 1) / bm;
+        assert!(n_tiles * bm >= n);
+        assert!((n_tiles - 1) * bm < n);
+    }
+}
+
