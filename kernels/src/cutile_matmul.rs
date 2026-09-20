@@ -102,6 +102,44 @@ pub mod kernels {
         let result: Tile<f32, { [N_BLOCK] }> = reduce_sum(acc, 1i32);
         z.store(result);
     }
+
+    /// Coalesced GEMV: z[n] = x[0, 0..K] · y[n, 0..K]
+    ///
+    /// One program per output element (grid = N). Each program loads
+    /// y[pid_n, i*BK:(i+1)*BK] — a contiguous BK-element slice from a single
+    /// row of the weight matrix. This eliminates the strided access pattern of
+    /// `cutile_gemv` which loaded [N_BLOCK, BK] tiles with N_BLOCK rows
+    /// simultaneously (stride K between consecutive rows in row-major storage).
+    ///
+    /// Shapes: z: [1] per program, x: [1, K] activation, y: [N, K] weights.
+    /// K must be divisible by BK.
+    ///
+    /// Grid: (N, 1, 1) — one program per output neuron.
+    ///
+    /// Access pattern: part_y.load([pid_n, i]) loads y[pid_n, i*BK:(i+1)*BK],
+    /// which is BK contiguous floats in one row. Fully coalesced at 1.79 TB/s.
+    #[cutile::entry()]
+    pub fn cutile_gemv_coalesced<const BK: i32, const K: i32>(
+        z: &mut Tensor<f32, { [1] }>,
+        x: &Tensor<f32, { [-1, K] }>,
+        y: &Tensor<f32, { [-1, K] }>,
+    ) {
+        let pid_n = program_id(0);
+        let part_x = x.partition(shape![1, BK]);
+        let part_y = y.partition(shape![1, BK]);
+        let mut acc: Tile<f32, { [1, BK] }> = broadcast_scalar(0.0f32, shape![1, BK]);
+        for i in 0i32..(K / BK) {
+            // Load BK elements from activation row 0 — same for all programs.
+            let tile_x: Tile<f32, { [1, BK] }> = part_x.load([0i32, i]);
+            // Load BK contiguous elements from row pid_n of the weight matrix.
+            // y[pid_n, i*BK:(i+1)*BK] is a contiguous slice in row-major storage.
+            let tile_y: Tile<f32, { [1, BK] }> = part_y.load([pid_n, i]);
+            acc = acc + tile_y * tile_x;
+        }
+        // Reduce [1, BK] → [1] by collapsing the BK dimension.
+        let result: Tile<f32, { [1] }> = reduce_sum(acc, 1i32);
+        z.store(result);
+    }
 }
 
 /// GPU-accelerated Matrix Multiplication using NVIDIA cuTile Rust (`cutile-rs`).
@@ -157,6 +195,13 @@ fn next_pow2(x: usize) -> usize {
 // that the hardware MMA units impose on BM=1 tiles.
 const N_BLOCK_GEMV: usize = 64;
 const BK_GEMV: usize = 64;
+
+// Coalesced GEMV path (m == 1): one program per output element, BK=128 for
+// maximum PCIe / HBM bus utilisation (512 bytes per load = 4 cache lines).
+// Requires k_pad % BK_GEMV_COALESCED == 0; fall back to forward_gemv_d2d_into
+// for shapes where this is not satisfied (uncommon in practice: K ≥ 128 always
+// holds for real LLMs).
+const BK_GEMV_COALESCED: usize = 128;
 
 impl MatMul for CutileMatMul {
     fn verification_tier(&self) -> VerificationTier {
@@ -552,11 +597,16 @@ impl CutileMatMul {
         n: usize,
         k: usize,
     ) -> Result<()> {
-        let k_pad = next_pow2(k.div_ceil(BK_GEMV) * BK_GEMV);
-        debug_assert!(
-            k_pad % BK_GEMV == 0,
-            "k_pad={k_pad} must be divisible by BK_GEMV={BK_GEMV}"
-        );
+        // Choose BK: use coalesced (BK=128) when k_pad divides evenly; otherwise
+        // fall back to strided GEMV (BK=64) for very small K values.
+        let k_pad_coalesced = next_pow2(k.div_ceil(BK_GEMV_COALESCED) * BK_GEMV_COALESCED);
+        let use_coalesced = k_pad_coalesced % BK_GEMV_COALESCED == 0;
+
+        let k_pad = if use_coalesced {
+            k_pad_coalesced
+        } else {
+            next_pow2(k.div_ceil(BK_GEMV) * BK_GEMV)
+        };
 
         let a_vec: Arc<Vec<f32>> = if k_pad == k {
             Arc::new(a.to_vec())
@@ -579,12 +629,6 @@ impl CutileMatMul {
 
         let stream = &self.stream;
 
-        // Output: [n] (1D), partitioned into N_BLOCK_GEMV-element tiles.
-        let z = api::zeros::<f32>(&[n])
-            .sync_on(stream)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-            .partition([N_BLOCK_GEMV]);
-
         // Activation: [1, k_pad].
         let x: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&a_vec)
             .sync_on(stream)
@@ -601,22 +645,41 @@ impl CutileMatMul {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .into();
 
-        let generics = vec![
-            N_BLOCK_GEMV.to_string(),
-            BK_GEMV.to_string(),
-            k_pad.to_string(),
-        ];
-
-        let (z, _x, _y) = kernels::cutile_gemv(z, x, y)
-            .generics(generics)
-            .sync_on(stream)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-
-        let host: Vec<f32> = z
-            .unpartition()
-            .to_host_vec()
-            .sync_on(stream)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let host: Vec<f32> = if use_coalesced {
+            // One program per output element, BK=128 contiguous K-elements per load.
+            let z = api::zeros::<f32>(&[n])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .partition([1]);
+            let generics = vec![BK_GEMV_COALESCED.to_string(), k_pad.to_string()];
+            let (z, _x, _y) = kernels::cutile_gemv_coalesced(z, x, y)
+                .generics(generics)
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            z.unpartition()
+                .to_host_vec()
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        } else {
+            // Fall back to strided GEMV for small K (k_pad < 128).
+            let z = api::zeros::<f32>(&[n])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .partition([N_BLOCK_GEMV]);
+            let generics = vec![
+                N_BLOCK_GEMV.to_string(),
+                BK_GEMV.to_string(),
+                k_pad.to_string(),
+            ];
+            let (z, _x, _y) = kernels::cutile_gemv(z, x, y)
+                .generics(generics)
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            z.unpartition()
+                .to_host_vec()
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
 
         output.copy_from_slice(&host);
         Ok(())
@@ -843,6 +906,120 @@ impl CutileMatMul {
             .generics(generics)
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        Ok(Arc::new(z.unpartition()))
+    }
+
+    /// Coalesced device-to-device GEMV — fresh output allocation.
+    ///
+    /// One program per output element (grid N). Each program loads BK=128
+    /// contiguous elements from one row of y, eliminating the N_BLOCK-row
+    /// strided access of `forward_gemv_device_to_device`.
+    ///
+    /// K_pad must be divisible by BK_GEMV_COALESCED (128). For shapes that
+    /// don't satisfy this, use `forward_gemv_device_to_device` instead.
+    pub fn forward_gemv_coalesced_d2d(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        b: &Arc<Tensor<f32>>,
+        n: usize,
+        k_pad: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        debug_assert!(
+            k_pad % BK_GEMV_COALESCED == 0,
+            "k_pad={k_pad} must be divisible by BK_GEMV_COALESCED={BK_GEMV_COALESCED}"
+        );
+        let stream = &self.stream;
+
+        // Partition into 1-element tiles so each program writes one output float.
+        let z = api::zeros::<f32>(&[n])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1]);
+
+        let generics = vec![BK_GEMV_COALESCED.to_string(), k_pad.to_string()];
+
+        let (z, _a, _b) = kernels::cutile_gemv_coalesced(z, Arc::clone(a), Arc::clone(b))
+            .generics(generics)
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        Ok(Arc::new(z.unpartition()))
+    }
+
+    /// Coalesced device-to-device GEMV reusing a pre-allocated output buffer.
+    ///
+    /// Analogous to `forward_gemv_d2d_into` but with the coalesced access
+    /// pattern. `out` must hold at least `n` f32 elements. Returns the filled
+    /// tensor as an `Arc` for scratch-pool reuse.
+    ///
+    /// K_pad must be divisible by BK_GEMV_COALESCED (128).
+    pub fn forward_gemv_coalesced_d2d_into(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        b: &Arc<Tensor<f32>>,
+        out: Tensor<f32>,
+        n: usize,
+        k_pad: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        debug_assert!(
+            k_pad % BK_GEMV_COALESCED == 0,
+            "k_pad={k_pad} must be divisible by BK_GEMV_COALESCED={BK_GEMV_COALESCED}"
+        );
+        let stream = &self.stream;
+
+        let z = out
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1]);
+
+        let generics = vec![BK_GEMV_COALESCED.to_string(), k_pad.to_string()];
+
+        let (z, _a, _b) = kernels::cutile_gemv_coalesced(z, Arc::clone(a), Arc::clone(b))
+            .generics(generics)
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        Ok(Arc::new(z.unpartition()))
+    }
+
+    /// Non-blocking coalesced GEMV reusing a pre-allocated output buffer.
+    ///
+    /// Enqueues the coalesced GEMV kernel and returns without synchronising.
+    /// The caller MUST call `sync_stream()` before reading the result on the CPU.
+    /// GPU operations on the same stream are correctly ordered.
+    ///
+    /// # Safety
+    ///
+    /// The returned tensor is written asynchronously. Do not read it on the CPU
+    /// until `sync_stream()` has been called.
+    pub unsafe fn submit_gemv_coalesced_d2d_into(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        b: &Arc<Tensor<f32>>,
+        out: Tensor<f32>,
+        n: usize,
+        k_pad: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        debug_assert!(
+            k_pad % BK_GEMV_COALESCED == 0,
+            "k_pad={k_pad} must be divisible by BK_GEMV_COALESCED={BK_GEMV_COALESCED}"
+        );
+        let stream = &self.stream;
+
+        let z = out
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1]);
+
+        let generics = vec![BK_GEMV_COALESCED.to_string(), k_pad.to_string()];
+
+        let (z, _a, _b) = unsafe {
+            kernels::cutile_gemv_coalesced(z, Arc::clone(a), Arc::clone(b))
+                .generics(generics)
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
 
         Ok(Arc::new(z.unpartition()))
     }

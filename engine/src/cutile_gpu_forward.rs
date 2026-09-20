@@ -216,19 +216,21 @@ impl CutileGpuModel {
         let dummy_q = self.to_device(&vec![0.0f32; self.q_pad], 1, self.q_pad);
         let dummy_inter = self.to_device(&vec![0.0f32; self.inter_pad], 1, self.inter_pad);
 
-        // Q/K/V projection shape: [1, h_pad] @ [q_dim/kv_dim, h_pad]^T
-        let _ = self.gemm_d2d(&dummy_h, "model.layers.0.self_attn.q_proj.weight", 1);
-        let _ = self.gemm_d2d(&dummy_h, "model.layers.0.self_attn.k_proj.weight", 1);
-        let _ = self.gemm_d2d(&dummy_h, "model.layers.0.self_attn.v_proj.weight", 1);
-        // O projection shape: [1, q_pad] @ [h, q_pad]^T
-        let _ = self.gemm_d2d(&dummy_q, "model.layers.0.self_attn.o_proj.weight", 1);
-        // Gate/up projection shape: [1, h_pad] @ [inter, h_pad]^T
-        let _ = self.gemm_d2d(&dummy_h, "model.layers.0.mlp.gate_proj.weight", 1);
-        let _ = self.gemm_d2d(&dummy_h, "model.layers.0.mlp.up_proj.weight", 1);
-        // Down projection shape: [1, inter_pad] @ [h, inter_pad]^T
-        let _ = self.gemm_d2d(&dummy_inter, "model.layers.0.mlp.down_proj.weight", 1);
-        // lm_head shape: [1, h_pad] @ [vocab, h_pad]^T
-        let _ = self.gemm_d2d(&dummy_h, "lm_head.weight", 1);
+        // Use gemm_d2d_slot for m=1 so the coalesced GEMV path gets compiled.
+        // gemm_d2d uses the tiled GEMM and would not trigger cutile_gemv_coalesced.
+        let _ = self.gemm_d2d_slot(&dummy_h, "model.layers.0.self_attn.q_proj.weight", 1, SLOT_Q);
+        let _ = self.gemm_d2d_slot(&dummy_h, "model.layers.0.self_attn.k_proj.weight", 1, SLOT_K);
+        let _ = self.gemm_d2d_slot(&dummy_h, "model.layers.0.self_attn.v_proj.weight", 1, SLOT_V);
+        let _ = self.gemm_d2d_slot(&dummy_q, "model.layers.0.self_attn.o_proj.weight", 1, SLOT_O);
+        let _ = self.gemm_d2d_slot(&dummy_h, "model.layers.0.mlp.gate_proj.weight", 1, SLOT_GATE);
+        let _ = self.gemm_d2d_slot(&dummy_h, "model.layers.0.mlp.up_proj.weight", 1, SLOT_UP);
+        let _ = self.gemm_d2d_slot(&dummy_inter, "model.layers.0.mlp.down_proj.weight", 1, SLOT_DOWN);
+        let _ = self.gemm_d2d_slot(&dummy_h, "lm_head.weight", 1, SLOT_LOGITS);
+
+        // Also warm up the m>1 prefill path (tiled GEMM) for a representative batch.
+        let dummy_h_128 = self.to_device(&vec![0.0f32; 128 * self.h_pad], 128, self.h_pad);
+        let _ = self.gemm_d2d(&dummy_h_128, "model.layers.0.self_attn.q_proj.weight", 128);
+        let _ = self.gemm_d2d(&dummy_h_128, "model.layers.0.mlp.gate_proj.weight", 128);
     }
 
     // ── constructors ──────────────────────────────────────────────────────────
@@ -606,8 +608,19 @@ impl CutileGpuModel {
                 }
             };
 
-            if let Some(tensor) = maybe_tensor {
-                // SAFETY: caller will sync_stream before any CPU read.
+            if dw.k_pad % 128 == 0 {
+                if let Some(tensor) = maybe_tensor {
+                    // SAFETY: caller will sync_stream before any CPU read.
+                    if let Ok(result) = unsafe {
+                        self.matmul
+                            .submit_gemv_coalesced_d2d_into(a, &dw.tensor, tensor, dw.n, dw.k_pad)
+                    } {
+                        self.scratch.borrow_mut()[slot] = Some(result.clone());
+                        return result;
+                    }
+                }
+            } else if let Some(tensor) = maybe_tensor {
+                // k_pad not divisible by 128 — use strided GEMV (async).
                 if let Ok(result) = unsafe {
                     self.matmul
                         .submit_bt_d2d_into(a, &dw.tensor, tensor, m, dw.n, dw.k_pad)
@@ -674,7 +687,25 @@ impl CutileGpuModel {
         };
 
         if m == 1 {
-            // Decode: use GEMV kernel (split-K element-wise multiply + reduce_sum).
+            // Decode: use coalesced GEMV kernel — one program per output element,
+            // loading BK=128 contiguous elements per iteration from one row of the
+            // weight matrix. Falls back to the strided GEMV when k_pad is not
+            // divisible by 128 (only for very small K values, uncommon in practice).
+            let use_coalesced = dw.k_pad % 128 == 0;
+            if use_coalesced {
+                if let Some(tensor) = maybe_tensor {
+                    if let Ok(result) = self.matmul.forward_gemv_coalesced_d2d_into(
+                        a, &dw.tensor, tensor, dw.n, dw.k_pad,
+                    ) {
+                        self.scratch.borrow_mut()[slot] = Some(result.clone());
+                        return result;
+                    }
+                }
+                return self.matmul
+                    .forward_gemv_coalesced_d2d(a, &dw.tensor, dw.n, dw.k_pad)
+                    .expect("CutileGpuModel::gemm_d2d_slot coalesced GEMV failed");
+            }
+            // k_pad not divisible by 128 — fall back to strided GEMV.
             if let Some(tensor) = maybe_tensor {
                 if let Ok(result) =
                     self.matmul
@@ -684,7 +715,6 @@ impl CutileGpuModel {
                     return result;
                 }
             }
-            // Pool miss or GEMV failure — fresh allocation.
             return self.matmul
                 .forward_gemv_device_to_device(a, &dw.tensor, dw.n, dw.k_pad)
                 .expect("CutileGpuModel::gemm_d2d_slot GEMV failed");

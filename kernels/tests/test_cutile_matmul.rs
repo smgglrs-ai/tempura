@@ -174,3 +174,82 @@ fn test_cutile_gemv_m1() {
         }
     }
 }
+
+/// Exercises the coalesced GEMV kernel (`cutile_gemv_coalesced`) through the
+/// `forward_gemv_coalesced_d2d` / `forward_gemv_coalesced_d2d_into` host API.
+///
+/// The coalesced kernel launches one program per output element.  Each program
+/// loads BK=128 contiguous floats from one row of the weight matrix, giving
+/// fully coalesced HBM access instead of the N_BLOCK-row strided pattern used
+/// by the previous `cutile_gemv`.
+#[test]
+fn test_cutile_gemv_coalesced_m1() {
+    use std::time::Instant;
+
+    let cutile_mm = CutileMatMul::new().expect("Failed to initialize CutileMatMul");
+    let cpu_mm = CpuMatMul;
+
+    // Shapes where k_pad is divisible by BK_GEMV_COALESCED=128.
+    let shapes = vec![
+        (1, 128, 128),   // minimal: one program per output, one BK iteration
+        (1, 256, 128),   // two outputs
+        (1, 512, 256),   // wider N and K
+        (1, 2560, 4096), // LLaMA-7B q_proj: n=2560, k=4096
+        (1, 4096, 4096), // square decode step (hidden_dim × hidden_dim)
+    ];
+
+    for (m, n, k) in &shapes {
+        let (m, n, k) = (*m, *n, *k);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.05).collect();
+        let b: Vec<f32> = (0..n * k).map(|i| ((i % 23) as f32 - 11.0) * 0.05).collect();
+
+        let mut cpu_out = vec![0.0f32; m * n];
+        let mut gpu_out = vec![0.0f32; m * n];
+
+        cpu_mm.forward_b_transposed(&a, &b, &mut cpu_out, m, n, k).unwrap();
+        cutile_mm.forward_b_transposed(&a, &b, &mut gpu_out, m, n, k).unwrap();
+
+        for i in 0..(m * n) {
+            let diff = (gpu_out[i] - cpu_out[i]).abs();
+            assert!(
+                diff < 1e-2,
+                "coalesced GEMV shape ({m}, {n}, {k}) mismatch at {i}: gpu={}, cpu={}, diff={diff}",
+                gpu_out[i],
+                cpu_out[i]
+            );
+        }
+    }
+
+    // Timing measurement for the decode-critical shape (1, 2560, 4096).
+    // Routes through forward_b_transposed → forward_gemv → cutile_gemv_coalesced.
+    // Includes host-to-device transfer; use the d2d methods in engine benchmarks
+    // for kernel-only timing without the upload overhead.
+    {
+        let (m, n, k) = (1usize, 2560usize, 4096usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.01).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|i| (i % 11) as f32 * 0.01).collect();
+        let mut out = vec![0.0f32; m * n];
+
+        // Warm-up: one call to trigger JIT compilation.
+        cutile_mm.forward_b_transposed(&a_data, &b_data, &mut out, m, n, k).expect("warmup");
+
+        // Timed run: 20 iterations.
+        const ITERS: u32 = 20;
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            cutile_mm.forward_b_transposed(&a_data, &b_data, &mut out, m, n, k)
+                .expect("timed gemv");
+        }
+        let elapsed = t0.elapsed();
+        let per_call_us = elapsed.as_micros() as f64 / ITERS as f64;
+        // Weight bytes only (activation is tiny compared to weight matrix).
+        let weight_bytes = (n * k * std::mem::size_of::<f32>()) as f64;
+        let bandwidth_tbs = weight_bytes / (per_call_us * 1e-6) / 1e12;
+
+        println!(
+            "cutile_gemv_coalesced shape ({m}, {n}, {k}): {per_call_us:.1}µs/call \
+             (includes H2D transfer), weight-only bandwidth {bandwidth_tbs:.3} TB/s \
+             (RTX 5090 peak 1.79 TB/s)"
+        );
+    }
+}
