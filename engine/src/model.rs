@@ -6117,8 +6117,10 @@ mod tests {
         assert!(c.use_layernorm);
         assert!(c.use_alibi);
         assert!(c.alibi_max_bias > 0.0);
-        // I2S format: n*k/4 packed bytes + 4-byte f32 scale
-        // 2-bit values: 0=-1, 1=0, 2=+1
+    }
+
+    /// Helper: create a packed I2S (ternary 2-bit) weight tensor [n, k] with a given seed.
+    fn make_i2s_tensor(n: usize, k: usize, seed: u64) -> Vec<u8> {
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
         let packed_bytes = n * k / 4;
@@ -6127,7 +6129,7 @@ mod tests {
             .map(|_| {
                 let mut byte = 0u8;
                 for shift in (0..8).step_by(2) {
-                    let trit: u8 = rng.random_range(0..3); // {0,1,2} → {-1,0,+1}
+                    let trit: u8 = rng.random_range(0..3);
                     byte |= trit << shift;
                 }
                 byte
@@ -6175,6 +6177,16 @@ mod tests {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            architecture: crate::config::Architecture::Llama,
+            n_experts: 0,
+            n_experts_used: 0,
+            use_layernorm: false,
+            use_alibi: false,
+            alibi_max_bias: 0.0,
+            parallel_attn_ffn: false,
+            rmsnorm_offset: false,
+            attn_logit_softcapping: None,
+            embedding_scale: false,
         };
 
         let q_dim = heads * head_dim;
@@ -6280,6 +6292,16 @@ mod tests {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            architecture: crate::config::Architecture::Llama,
+            n_experts: 0,
+            n_experts_used: 0,
+            use_layernorm: false,
+            use_alibi: false,
+            alibi_max_bias: 0.0,
+            parallel_attn_ffn: false,
+            rmsnorm_offset: false,
+            attn_logit_softcapping: None,
+            embedding_scale: false,
         };
 
         let q_dim = heads * head_dim;
