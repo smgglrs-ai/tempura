@@ -888,7 +888,7 @@ impl CutileGpuModel {
             let (k_slice, v_slice) = gpu_kv_cache.get_kv_host_slices(layer, kv_len);
             let mut attn_output = vec![0.0f32; seq_len * n_heads * head_dim];
             self.flash_attn
-                .forward(
+                .forward_batched(
                     &q_rot_host,
                     k_slice,
                     v_slice,

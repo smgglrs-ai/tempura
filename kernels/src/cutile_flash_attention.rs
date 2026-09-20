@@ -326,6 +326,213 @@ impl CutileFlashAttention {
     }
 }
 
+impl CutileFlashAttention {
+    /// Batched flash attention: phases all GPU operations across heads to minimise
+    /// CPU-GPU synchronisation bubbles.
+    ///
+    /// Instead of syncing five times per head (upload Q + upload K + upload V +
+    /// kernel + download), this method:
+    ///   1. Gathers all per-head host buffers on the CPU (no CUDA cost).
+    ///   2. Uploads Q/K/V for all heads with `sync_on` (tensor handles required
+    ///      before kernel dispatch; H2D copies are fast).
+    ///   3. Allocates all output tensors with `sync_on`.
+    ///   4. Submits all N head kernels with `async_on` — NO sync between heads.
+    ///   5. A single `stream.synchronize()` covers all N kernels.
+    ///   6. Downloads and scatters all outputs.
+    ///
+    /// Reduces per-layer attention kernel syncs from N (one per head) to 1.
+    /// For 20 heads × 30 layers = 600 kernel syncs down to 30.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batched(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        output: &mut [f32],
+        batch: usize,
+        seq_len: usize,
+        kv_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<()> {
+        let expected_q = batch * seq_len * n_heads * head_dim;
+        let expected_kv = batch * kv_len * n_kv_heads * head_dim;
+        let expected_out = batch * seq_len * n_heads * head_dim;
+
+        if q.len() != expected_q {
+            return Err(KernelError::DimensionMismatch { expected: expected_q, got: q.len() });
+        }
+        if k.len() != expected_kv {
+            return Err(KernelError::DimensionMismatch { expected: expected_kv, got: k.len() });
+        }
+        if v.len() != expected_kv {
+            return Err(KernelError::DimensionMismatch { expected: expected_kv, got: v.len() });
+        }
+        if output.len() != expected_out {
+            return Err(KernelError::DimensionMismatch {
+                expected: expected_out,
+                got: output.len(),
+            });
+        }
+        if n_heads % n_kv_heads != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "n_heads ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
+            )));
+        }
+
+        let seq_len_pad = seq_len.div_ceil(BR) * BR;
+        let kv_len_pad = kv_len.div_ceil(BC) * BC;
+        let head_dim_pad = head_dim;
+        let heads_per_group = n_heads / n_kv_heads;
+        let cache_offset = (kv_len as i32) - (seq_len as i32);
+        let stream = &self.stream;
+
+        let generics = vec![
+            BR.to_string(),
+            BC.to_string(),
+            head_dim_pad.to_string(),
+            kv_len_pad.to_string(),
+        ];
+
+        for batch_idx in 0..batch {
+            // ── Phase 1: host-side gather (pure CPU, zero CUDA cost) ──────────
+            let q_bufs: Vec<Vec<f32>> = (0..n_heads)
+                .map(|h| {
+                    gather_q_head(
+                        q, batch_idx, h, seq_len, n_heads, head_dim, seq_len_pad, head_dim_pad,
+                    )
+                })
+                .collect();
+            let k_bufs: Vec<Vec<f32>> = (0..n_kv_heads)
+                .map(|h| {
+                    gather_kv_head(
+                        k, batch_idx, h, kv_len, n_kv_heads, head_dim, kv_len_pad, head_dim_pad,
+                    )
+                })
+                .collect();
+            let v_bufs: Vec<Vec<f32>> = (0..n_kv_heads)
+                .map(|h| {
+                    gather_kv_head(
+                        v, batch_idx, h, kv_len, n_kv_heads, head_dim, kv_len_pad, head_dim_pad,
+                    )
+                })
+                .collect();
+
+            // ── Phase 2: upload all Q head tensors ────────────────────────────
+            // sync_on is required here to obtain the Arc<Tensor<f32>> handle for
+            // each head before launching the corresponding kernel.  H2D copies
+            // are fast (PCIe bandwidth, not compute-bound).
+            let mut q_devs: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_heads);
+            for buf in &q_bufs {
+                let dev: Arc<Tensor<f32>> =
+                    api::copy_host_vec_to_device(&Arc::new(buf.clone()))
+                        .sync_on(stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .reshape(&[seq_len_pad, head_dim_pad])
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .into();
+                q_devs.push(dev);
+            }
+
+            // ── Phase 3: upload all K kv-head tensors ─────────────────────────
+            let mut k_devs: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_kv_heads);
+            for buf in &k_bufs {
+                let dev: Arc<Tensor<f32>> =
+                    api::copy_host_vec_to_device(&Arc::new(buf.clone()))
+                        .sync_on(stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .reshape(&[kv_len_pad, head_dim_pad])
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .into();
+                k_devs.push(dev);
+            }
+
+            // ── Phase 4: upload all V kv-head tensors ─────────────────────────
+            let mut v_devs: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_kv_heads);
+            for buf in &v_bufs {
+                let dev: Arc<Tensor<f32>> =
+                    api::copy_host_vec_to_device(&Arc::new(buf.clone()))
+                        .sync_on(stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .reshape(&[kv_len_pad, head_dim_pad])
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .into();
+                v_devs.push(dev);
+            }
+
+            // ── Phase 5: allocate output tensors for all heads ─────────────────
+            // ── Phase 6: submit all head kernels — NO sync between heads ────────
+            // All N kernel launches go onto the stream without blocking the CPU.
+            // The GPU executes them serially (single stream); the CPU immediately
+            // proceeds to the next head's launch.
+            //
+            // SAFETY: stream.synchronize() in Phase 7 ensures all GPU writes
+            // complete before any CPU read of out_parts in Phase 8.
+            let mut out_parts = Vec::with_capacity(n_heads);
+            for head in 0..n_heads {
+                let kv_head = head / heads_per_group;
+
+                let out_part = api::zeros::<f32>(&[seq_len_pad, head_dim_pad])
+                    .sync_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .partition([BR, head_dim_pad]);
+
+                let (out_part, ..) = unsafe {
+                    kernels::cutile_flash_attn_head(
+                        out_part,
+                        q_devs[head].clone(),
+                        k_devs[kv_head].clone(),
+                        v_devs[kv_head].clone(),
+                        scale,
+                        cache_offset,
+                        seq_len as i32,
+                        kv_len as i32,
+                    )
+                    .generics(generics.clone())
+                    .async_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                };
+
+                out_parts.push(out_part);
+            }
+
+            // ── Phase 7: single synchronisation for all N head kernels ─────────
+            // SAFETY: all async_on calls above queued on this stream; synchronize
+            // ensures all GPU writes to out_parts are visible before CPU reads.
+            unsafe {
+                stream
+                    .synchronize()
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            }
+
+            // ── Phase 8: download and scatter all head outputs ─────────────────
+            // Stream is idle; sync_on here is a fast D2H copy with no GPU wait.
+            for (head, out_part) in out_parts.into_iter().enumerate() {
+                let host_result: Vec<f32> = out_part
+                    .unpartition()
+                    .to_host_vec()
+                    .sync_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+                scatter_output_head(
+                    &host_result,
+                    output,
+                    batch_idx,
+                    head,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    head_dim_pad,
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl Attention for CutileFlashAttention {
     fn verification_tier(&self) -> VerificationTier {
         VerificationTier::Tested
