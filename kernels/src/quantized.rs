@@ -543,10 +543,10 @@ unsafe fn q6k_dot_q8_avx2(block: &[u8], a_q8: &[i8], a_scale: f32, a_group_sums:
         let p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(q6_2, aq_2), ones_16);
         let p3 = _mm256_madd_epi16(_mm256_maddubs_epi16(q6_3, aq_3), ones_16);
 
-        let idot_0 = hsum_i32(p0);
-        let idot_1 = hsum_i32(p1);
-        let idot_2 = hsum_i32(p2);
-        let idot_3 = hsum_i32(p3);
+        let _idot_0 = hsum_i32(p0);
+        let _idot_1 = hsum_i32(p1);
+        let _idot_2 = hsum_i32(p2);
+        let _idot_3 = hsum_i32(p3);
 
         // Scales: Q6_K has 16 scales (i8), 1 per 16 elements
         // For the 32-element groups, each uses 2 consecutive scales
@@ -743,7 +743,7 @@ fn nearest_int(fval: f32) -> i32 {
 
 /// Translated from ggml-quants.c:3503-3522.
 /// Quantizes f32 activations to i8 per-tensor, returns (scale, sum).
-fn quantize_row_i8_s(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
+pub fn quantize_row_i8_s(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
     // C: double min = 0.00001; double max = min;
     let mut max: f64 = 0.00001;
     // C: for (int i = 0; i < n; ++i) max = MAX(max, (double)fabs((double)x[i]));
@@ -782,7 +782,7 @@ fn quantize_row_i8_s(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
 ///   bits[3:2] → element 64+b    (group_idx=2)
 ///   bits[1:0] → element 96+b    (group_idx=3)
 /// Values {0,1,2} represent ternary {-1,0,+1}.
-fn vec_dot_i2_i8_s(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
+pub fn vec_dot_i2_i8_s(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
     // C: const int nb = n / QK_I2_S;  // QK_I2_S = 128
     let nb = k / 128;
     let mut accu: i32 = 0;
@@ -823,6 +823,861 @@ pub fn i2s_dequant_block(block: &[u8], output: &mut [f32; I2S_BLOCK_SIZE]) {
             output[g * 128 + 96 + b] = (byte & 0x03) as f32 - 1.0;
         }
     }
+}
+
+/// AVX2 per-tensor INT8 activation quantization — zero-allocation, writes directly into dst.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn quantize_row_i8_s_avx2_into(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
+    use std::arch::x86_64::*;
+
+    let k = x.len();
+    let mut vmax = _mm256_setzero_ps();
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let chunks = k / 8;
+    for i in 0..chunks {
+        let v = _mm256_loadu_ps(x.as_ptr().add(i * 8));
+        vmax = _mm256_max_ps(vmax, _mm256_andnot_ps(sign_mask, v));
+    }
+    let hi = _mm256_extractf128_ps(vmax, 1);
+    let lo = _mm256_castps256_ps128(vmax);
+    let max128 = _mm_max_ps(lo, hi);
+    let max64 = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
+    let max32 = _mm_max_ss(max64, _mm_shuffle_ps(max64, max64, 1));
+    let mut max_abs = _mm_cvtss_f32(max32);
+    for i in chunks * 8..k {
+        let av = x[i].abs();
+        if av > max_abs { max_abs = av; }
+    }
+    if max_abs < 0.00001 { max_abs = 0.00001; }
+
+    let s: f32 = 127.0 / max_abs;
+    let s_vec = _mm256_set1_ps(s);
+    let mut sum_acc = _mm256_setzero_si256();
+
+    for i in 0..chunks {
+        let v = _mm256_loadu_ps(x.as_ptr().add(i * 8));
+        let scaled = _mm256_mul_ps(v, s_vec);
+        let rounded = _mm256_cvtps_epi32(_mm256_round_ps(
+            scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+        ));
+        let clamped = _mm256_max_epi32(
+            _mm256_set1_epi32(-128),
+            _mm256_min_epi32(_mm256_set1_epi32(127), rounded),
+        );
+        let lo128 = _mm256_castsi256_si128(clamped);
+        let hi128 = _mm256_extracti128_si256(clamped, 1);
+        let packed16 = _mm_packs_epi32(lo128, hi128);
+        let packed8 = _mm_packs_epi16(packed16, packed16);
+        *(dst.as_mut_ptr().add(i * 8) as *mut i64) = _mm_cvtsi128_si64(packed8);
+        sum_acc = _mm256_add_epi32(sum_acc, clamped);
+    }
+
+    let sum_hi = _mm256_extracti128_si256(sum_acc, 1);
+    let sum_lo = _mm256_castsi256_si128(sum_acc);
+    let s128 = _mm_add_epi32(sum_lo, sum_hi);
+    let s64 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
+    let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
+    let mut sum = _mm_cvtsi128_si32(s32);
+
+    for i in chunks * 8..k {
+        let mut q = nearest_int(x[i] * s);
+        if q > 127 { q = 127; }
+        if q < -128 { q = -128; }
+        sum += q;
+        dst[i] = q as i8;
+    }
+
+    (s, sum)
+}
+
+/// AVX2 per-tensor INT8 activation quantization for I2S ternary matmul.
+/// Returns (scale, sum, quantized_i8_vec).
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn quantize_row_i8_s_avx2(x: &[f32]) -> (f32, i32, Vec<i8>) {
+    use std::arch::x86_64::*;
+
+    let k = x.len();
+    let mut dst = vec![0i8; k];
+
+    // Find max abs using AVX2
+    let mut vmax = _mm256_setzero_ps();
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let chunks = k / 8;
+    for i in 0..chunks {
+        let v = _mm256_loadu_ps(x.as_ptr().add(i * 8));
+        vmax = _mm256_max_ps(vmax, _mm256_andnot_ps(sign_mask, v));
+    }
+    let hi = _mm256_extractf128_ps(vmax, 1);
+    let lo = _mm256_castps256_ps128(vmax);
+    let max128 = _mm_max_ps(lo, hi);
+    let max64 = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
+    let max32 = _mm_max_ss(max64, _mm_shuffle_ps(max64, max64, 1));
+    let mut max_abs = _mm_cvtss_f32(max32);
+    // Handle tail elements
+    for i in chunks * 8..k {
+        let av = x[i].abs();
+        if av > max_abs { max_abs = av; }
+    }
+    if max_abs < 0.00001 { max_abs = 0.00001; }
+
+    let s: f32 = 127.0 / max_abs;
+    let s_vec = _mm256_set1_ps(s);
+
+    let mut sum_acc = _mm256_setzero_si256();
+
+    for i in 0..chunks {
+        let v = _mm256_loadu_ps(x.as_ptr().add(i * 8));
+        let scaled = _mm256_mul_ps(v, s_vec);
+        let rounded = _mm256_cvtps_epi32(_mm256_round_ps(
+            scaled,
+            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+        ));
+        // Clamp to [-128, 127]
+        let clamped = _mm256_max_epi32(
+            _mm256_set1_epi32(-128),
+            _mm256_min_epi32(_mm256_set1_epi32(127), rounded),
+        );
+        // Pack i32 → i16 → i8 (8 values)
+        let lo128 = _mm256_castsi256_si128(clamped);
+        let hi128 = _mm256_extracti128_si256(clamped, 1);
+        let packed16 = _mm_packs_epi32(lo128, hi128);
+        let packed8 = _mm_packs_epi16(packed16, packed16);
+        let ptr = dst.as_mut_ptr().add(i * 8) as *mut i64;
+        *ptr = _mm_cvtsi128_si64(packed8);
+
+        // Accumulate sum: extend i32 → add
+        sum_acc = _mm256_add_epi32(sum_acc, clamped);
+    }
+
+    // Horizontal sum of sum_acc
+    let sum_hi = _mm256_extracti128_si256(sum_acc, 1);
+    let sum_lo = _mm256_castsi256_si128(sum_acc);
+    let s128 = _mm_add_epi32(sum_lo, sum_hi);
+    let s64 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
+    let s32 = _mm_add_epi32(s64, _mm_srli_si128(s64, 4));
+    let mut sum = _mm_cvtsi128_si32(s32);
+
+    // Handle tail
+    for i in chunks * 8..k {
+        let mut q = nearest_int(x[i] * s);
+        if q > 127 { q = 127; }
+        if q < -128 { q = -128; }
+        sum += q;
+        dst[i] = q as i8;
+    }
+
+    (s, sum, dst)
+}
+
+/// AVX2 I2S ternary dot product: 2-bit packed weights × i8 activations.
+/// Processes 128 elements per group using _mm256_maddubs_epi16.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+pub unsafe fn vec_dot_i2_i8_s_avx2(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
+    use std::arch::x86_64::*;
+
+    let nb = k / 128;
+    let ones_16 = _mm256_set1_epi16(1);
+    let mask_2bit = _mm256_set1_epi8(0x03);
+    let mut acc = _mm256_setzero_si256();
+
+    // Batch 32 groups in i16 before widening to i32 (bitnet.cpp pattern).
+    // Each maddubs result is max ±254 as i16. 32 such values sum to max ±8128, fits i16.
+    let group32_num = nb / 32;
+
+    for batch in 0..group32_num {
+        let mut accu16 = _mm256_setzero_si256();
+        let base = batch * 32;
+
+        for i in base..base + 32 {
+            let px = i * 32;
+            let py = i * 128;
+
+            let w_raw = _mm256_loadu_si256(packed.as_ptr().add(px) as *const __m256i);
+            let w0 = _mm256_and_si256(w_raw, mask_2bit);
+            let w1 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 2), mask_2bit);
+            let w2 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 4), mask_2bit);
+            let w3 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 6), mask_2bit);
+
+            let a3 = _mm256_loadu_si256(a_q.as_ptr().add(py) as *const __m256i);
+            let a2 = _mm256_loadu_si256(a_q.as_ptr().add(py + 32) as *const __m256i);
+            let a1 = _mm256_loadu_si256(a_q.as_ptr().add(py + 64) as *const __m256i);
+            let a0 = _mm256_loadu_si256(a_q.as_ptr().add(py + 96) as *const __m256i);
+
+            let p0 = _mm256_maddubs_epi16(w0, a0);
+            let p1 = _mm256_maddubs_epi16(w1, a1);
+            let p2 = _mm256_maddubs_epi16(w2, a2);
+            let p3 = _mm256_maddubs_epi16(w3, a3);
+
+            accu16 = _mm256_add_epi16(accu16, _mm256_add_epi16(p0, p1));
+            accu16 = _mm256_add_epi16(accu16, _mm256_add_epi16(p2, p3));
+        }
+
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(accu16, ones_16));
+    }
+
+    // Remaining groups (< 32)
+    let remaining_start = group32_num * 32;
+    if remaining_start < nb {
+        let mut accu16 = _mm256_setzero_si256();
+        for i in remaining_start..nb {
+            let px = i * 32;
+            let py = i * 128;
+
+            let w_raw = _mm256_loadu_si256(packed.as_ptr().add(px) as *const __m256i);
+            let w0 = _mm256_and_si256(w_raw, mask_2bit);
+            let w1 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 2), mask_2bit);
+            let w2 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 4), mask_2bit);
+            let w3 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 6), mask_2bit);
+
+            let a3 = _mm256_loadu_si256(a_q.as_ptr().add(py) as *const __m256i);
+            let a2 = _mm256_loadu_si256(a_q.as_ptr().add(py + 32) as *const __m256i);
+            let a1 = _mm256_loadu_si256(a_q.as_ptr().add(py + 64) as *const __m256i);
+            let a0 = _mm256_loadu_si256(a_q.as_ptr().add(py + 96) as *const __m256i);
+
+            let p0 = _mm256_maddubs_epi16(w0, a0);
+            let p1 = _mm256_maddubs_epi16(w1, a1);
+            let p2 = _mm256_maddubs_epi16(w2, a2);
+            let p3 = _mm256_maddubs_epi16(w3, a3);
+
+            accu16 = _mm256_add_epi16(accu16, _mm256_add_epi16(p0, p1));
+            accu16 = _mm256_add_epi16(accu16, _mm256_add_epi16(p2, p3));
+        }
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(accu16, ones_16));
+    }
+
+    hsum_i32(acc)
+}
+
+/// AVX-VNNI I2S ternary dot product using _mm256_dpbusd_epi32.
+/// Fuses maddubs+madd into a single instruction with direct i32 accumulation.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,avxvnni")]
+pub unsafe fn vec_dot_i2_i8_s_avx_vnni(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
+    use std::arch::x86_64::*;
+
+    let nb = k / 128;
+    let mask_2bit = _mm256_set1_epi8(0x03);
+    let mut acc = _mm256_setzero_si256();
+
+    for i in 0..nb {
+        let px = i * 32;
+        let py = i * 128;
+
+        let w_raw = _mm256_loadu_si256(packed.as_ptr().add(px) as *const __m256i);
+        let w0 = _mm256_and_si256(w_raw, mask_2bit);
+        let w1 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 2), mask_2bit);
+        let w2 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 4), mask_2bit);
+        let w3 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 6), mask_2bit);
+
+        let a3 = _mm256_loadu_si256(a_q.as_ptr().add(py) as *const __m256i);
+        let a2 = _mm256_loadu_si256(a_q.as_ptr().add(py + 32) as *const __m256i);
+        let a1 = _mm256_loadu_si256(a_q.as_ptr().add(py + 64) as *const __m256i);
+        let a0 = _mm256_loadu_si256(a_q.as_ptr().add(py + 96) as *const __m256i);
+
+        acc = _mm256_dpbusd_epi32(acc, w0, a0);
+        acc = _mm256_dpbusd_epi32(acc, w1, a1);
+        acc = _mm256_dpbusd_epi32(acc, w2, a2);
+        acc = _mm256_dpbusd_epi32(acc, w3, a3);
+    }
+
+    hsum_i32(acc)
+}
+
+/// Horizontal sum of 16 i32 lanes in a __m512i.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn hsum_i32_512(v: std::arch::x86_64::__m512i) -> i32 {
+    use std::arch::x86_64::*;
+    let hi = _mm512_extracti64x4_epi64(v, 1);
+    let lo = _mm512_castsi512_si256(v);
+    let sum256 = _mm256_add_epi32(lo, hi);
+    hsum_i32(sum256)
+}
+
+/// AVX512 per-tensor INT8 activation quantization — zero-allocation, writes directly into dst.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn quantize_row_i8_s_avx512_into(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
+    use std::arch::x86_64::*;
+
+    let k = x.len();
+    let mut vmax = _mm512_setzero_ps();
+    let chunks16 = k / 16;
+    for i in 0..chunks16 {
+        let v = _mm512_loadu_ps(x.as_ptr().add(i * 16));
+        vmax = _mm512_max_ps(vmax, _mm512_abs_ps(v));
+    }
+    let mut max_abs = _mm512_reduce_max_ps(vmax);
+    for i in chunks16 * 16..k {
+        let av = x[i].abs();
+        if av > max_abs { max_abs = av; }
+    }
+    if max_abs < 0.00001 { max_abs = 0.00001; }
+
+    let s: f32 = 127.0 / max_abs;
+    let s_vec = _mm512_set1_ps(s);
+    let min_val = _mm512_set1_epi32(-128);
+    let max_val = _mm512_set1_epi32(127);
+    let mut sum_acc = _mm512_setzero_si512();
+
+    for i in 0..chunks16 {
+        let v = _mm512_loadu_ps(x.as_ptr().add(i * 16));
+        let scaled = _mm512_mul_ps(v, s_vec);
+        let rounded = _mm512_cvtps_epi32(_mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT));
+        let clamped = _mm512_max_epi32(min_val, _mm512_min_epi32(max_val, rounded));
+        sum_acc = _mm512_add_epi32(sum_acc, clamped);
+
+        let lo256 = _mm512_castsi512_si256(clamped);
+        let hi256 = _mm512_extracti64x4_epi64(clamped, 1);
+        let lo128_a = _mm256_castsi256_si128(lo256);
+        let lo128_b = _mm256_extracti128_si256(lo256, 1);
+        let hi128_a = _mm256_castsi256_si128(hi256);
+        let hi128_b = _mm256_extracti128_si256(hi256, 1);
+        let p16_lo = _mm_packs_epi32(lo128_a, lo128_b);
+        let p16_hi = _mm_packs_epi32(hi128_a, hi128_b);
+        let p8 = _mm_packs_epi16(p16_lo, p16_hi);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i * 16) as *mut __m128i, p8);
+    }
+
+    let mut sum = _mm512_reduce_add_epi32(sum_acc);
+    for i in chunks16 * 16..k {
+        let mut q = nearest_int(x[i] * s);
+        if q > 127 { q = 127; }
+        if q < -128 { q = -128; }
+        sum += q;
+        dst[i] = q as i8;
+    }
+
+    (s, sum)
+}
+
+/// AVX512 VNNI per-tensor INT8 activation quantization for I2S ternary matmul.
+/// Returns (scale, sum, quantized_i8_vec).
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn quantize_row_i8_s_avx512(x: &[f32]) -> (f32, i32, Vec<i8>) {
+    use std::arch::x86_64::*;
+
+    let k = x.len();
+    let mut dst = vec![0i8; k];
+
+    // Find max abs using AVX-512
+    let mut vmax = _mm512_setzero_ps();
+    let chunks16 = k / 16;
+    for i in 0..chunks16 {
+        let v = _mm512_loadu_ps(x.as_ptr().add(i * 16));
+        vmax = _mm512_max_ps(vmax, _mm512_abs_ps(v));
+    }
+    let mut max_abs = _mm512_reduce_max_ps(vmax);
+    for i in chunks16 * 16..k {
+        let av = x[i].abs();
+        if av > max_abs { max_abs = av; }
+    }
+    if max_abs < 0.00001 { max_abs = 0.00001; }
+
+    let s: f32 = 127.0 / max_abs;
+    let s_vec = _mm512_set1_ps(s);
+    let min_val = _mm512_set1_epi32(-128);
+    let max_val = _mm512_set1_epi32(127);
+
+    let mut sum_acc = _mm512_setzero_si512();
+
+    for i in 0..chunks16 {
+        let v = _mm512_loadu_ps(x.as_ptr().add(i * 16));
+        let scaled = _mm512_mul_ps(v, s_vec);
+        let rounded = _mm512_cvtps_epi32(_mm512_roundscale_ps(scaled, _MM_FROUND_TO_NEAREST_INT));
+        let clamped = _mm512_max_epi32(min_val, _mm512_min_epi32(max_val, rounded));
+        sum_acc = _mm512_add_epi32(sum_acc, clamped);
+
+        // Pack i32 → i8: extract two 256-bit halves, pack each
+        let lo256 = _mm512_castsi512_si256(clamped);
+        let hi256 = _mm512_extracti64x4_epi64(clamped, 1);
+        let lo128_a = _mm256_castsi256_si128(lo256);
+        let lo128_b = _mm256_extracti128_si256(lo256, 1);
+        let hi128_a = _mm256_castsi256_si128(hi256);
+        let hi128_b = _mm256_extracti128_si256(hi256, 1);
+        let p16_lo = _mm_packs_epi32(lo128_a, lo128_b);
+        let p16_hi = _mm_packs_epi32(hi128_a, hi128_b);
+        let p8 = _mm_packs_epi16(p16_lo, p16_hi);
+        _mm_storeu_si128(dst.as_mut_ptr().add(i * 16) as *mut __m128i, p8);
+    }
+
+    let mut sum = _mm512_reduce_add_epi32(sum_acc);
+    for i in chunks16 * 16..k {
+        let mut q = nearest_int(x[i] * s);
+        if q > 127 { q = 127; }
+        if q < -128 { q = -128; }
+        sum += q;
+        dst[i] = q as i8;
+    }
+
+    (s, sum, dst)
+}
+
+/// AVX512 VNNI I2S ternary dot product using _mm512_dpbusd_epi32.
+/// Uses 512-bit maddubs (processes 64 u8×i8 pairs per instruction) — 2x throughput over AVX2.
+#[cfg(all(feature = "cpu", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn vec_dot_i2_i8_s_avx512(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
+    use std::arch::x86_64::*;
+
+    let nb = k / 128;
+    let mask_2bit = _mm512_set1_epi8(0x03);
+    let ones_16 = _mm512_set1_epi16(1);
+    let mut acc = _mm512_setzero_si512();
+
+    // Batch groups: accumulate in i16 across pairs, widen to i32 every 16 pairs (32 groups)
+    let pairs = nb / 2;
+    let batch16 = pairs / 16;
+
+    for batch in 0..batch16 {
+        let mut accu16 = _mm512_setzero_si512();
+        let base = batch * 16;
+
+        for i in base..base + 16 {
+            let px = i * 64;
+            let py = i * 256;
+
+            let w_raw = _mm512_loadu_si512(packed.as_ptr().add(px) as *const __m512i);
+            let w0 = _mm512_and_si512(w_raw, mask_2bit);
+            let w1 = _mm512_and_si512(_mm512_srli_epi16(w_raw, 2), mask_2bit);
+            let w2 = _mm512_and_si512(_mm512_srli_epi16(w_raw, 4), mask_2bit);
+            let w3 = _mm512_and_si512(_mm512_srli_epi16(w_raw, 6), mask_2bit);
+
+            let a3_lo = _mm256_loadu_si256(a_q.as_ptr().add(py) as *const __m256i);
+            let a3_hi = _mm256_loadu_si256(a_q.as_ptr().add(py + 128) as *const __m256i);
+            let a3 = _mm512_inserti64x4(_mm512_castsi256_si512(a3_lo), a3_hi, 1);
+            let a2_lo = _mm256_loadu_si256(a_q.as_ptr().add(py + 32) as *const __m256i);
+            let a2_hi = _mm256_loadu_si256(a_q.as_ptr().add(py + 160) as *const __m256i);
+            let a2 = _mm512_inserti64x4(_mm512_castsi256_si512(a2_lo), a2_hi, 1);
+            let a1_lo = _mm256_loadu_si256(a_q.as_ptr().add(py + 64) as *const __m256i);
+            let a1_hi = _mm256_loadu_si256(a_q.as_ptr().add(py + 192) as *const __m256i);
+            let a1 = _mm512_inserti64x4(_mm512_castsi256_si512(a1_lo), a1_hi, 1);
+            let a0_lo = _mm256_loadu_si256(a_q.as_ptr().add(py + 96) as *const __m256i);
+            let a0_hi = _mm256_loadu_si256(a_q.as_ptr().add(py + 224) as *const __m256i);
+            let a0 = _mm512_inserti64x4(_mm512_castsi256_si512(a0_lo), a0_hi, 1);
+
+            let p0 = _mm512_maddubs_epi16(w0, a0);
+            let p1 = _mm512_maddubs_epi16(w1, a1);
+            let p2 = _mm512_maddubs_epi16(w2, a2);
+            let p3 = _mm512_maddubs_epi16(w3, a3);
+
+            accu16 = _mm512_add_epi16(accu16, _mm512_add_epi16(p0, p1));
+            accu16 = _mm512_add_epi16(accu16, _mm512_add_epi16(p2, p3));
+        }
+
+        acc = _mm512_add_epi32(acc, _mm512_madd_epi16(accu16, ones_16));
+    }
+
+    // Remaining pairs
+    let remaining_start = batch16 * 16;
+    if remaining_start < pairs {
+        let mut accu16 = _mm512_setzero_si512();
+        for i in remaining_start..pairs {
+            let px = i * 64;
+            let py = i * 256;
+
+            let w_raw = _mm512_loadu_si512(packed.as_ptr().add(px) as *const __m512i);
+            let w0 = _mm512_and_si512(w_raw, mask_2bit);
+            let w1 = _mm512_and_si512(_mm512_srli_epi16(w_raw, 2), mask_2bit);
+            let w2 = _mm512_and_si512(_mm512_srli_epi16(w_raw, 4), mask_2bit);
+            let w3 = _mm512_and_si512(_mm512_srli_epi16(w_raw, 6), mask_2bit);
+
+            let a3_lo = _mm256_loadu_si256(a_q.as_ptr().add(py) as *const __m256i);
+            let a3_hi = _mm256_loadu_si256(a_q.as_ptr().add(py + 128) as *const __m256i);
+            let a3 = _mm512_inserti64x4(_mm512_castsi256_si512(a3_lo), a3_hi, 1);
+            let a2_lo = _mm256_loadu_si256(a_q.as_ptr().add(py + 32) as *const __m256i);
+            let a2_hi = _mm256_loadu_si256(a_q.as_ptr().add(py + 160) as *const __m256i);
+            let a2 = _mm512_inserti64x4(_mm512_castsi256_si512(a2_lo), a2_hi, 1);
+            let a1_lo = _mm256_loadu_si256(a_q.as_ptr().add(py + 64) as *const __m256i);
+            let a1_hi = _mm256_loadu_si256(a_q.as_ptr().add(py + 192) as *const __m256i);
+            let a1 = _mm512_inserti64x4(_mm512_castsi256_si512(a1_lo), a1_hi, 1);
+            let a0_lo = _mm256_loadu_si256(a_q.as_ptr().add(py + 96) as *const __m256i);
+            let a0_hi = _mm256_loadu_si256(a_q.as_ptr().add(py + 224) as *const __m256i);
+            let a0 = _mm512_inserti64x4(_mm512_castsi256_si512(a0_lo), a0_hi, 1);
+
+            let p0 = _mm512_maddubs_epi16(w0, a0);
+            let p1 = _mm512_maddubs_epi16(w1, a1);
+            let p2 = _mm512_maddubs_epi16(w2, a2);
+            let p3 = _mm512_maddubs_epi16(w3, a3);
+
+            accu16 = _mm512_add_epi16(accu16, _mm512_add_epi16(p0, p1));
+            accu16 = _mm512_add_epi16(accu16, _mm512_add_epi16(p2, p3));
+        }
+        acc = _mm512_add_epi32(acc, _mm512_madd_epi16(accu16, ones_16));
+    }
+
+    let mut result = _mm512_reduce_add_epi32(acc);
+
+    // Handle remaining odd group with AVX2
+    if pairs * 2 < nb {
+        let i = pairs * 2;
+        let px = i * 32;
+        let py = i * 128;
+        let mask_2bit_256 = _mm256_set1_epi8(0x03);
+        let ones_16_256 = _mm256_set1_epi16(1);
+
+        let w_raw = _mm256_loadu_si256(packed.as_ptr().add(px) as *const __m256i);
+        let w0 = _mm256_and_si256(w_raw, mask_2bit_256);
+        let w1 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 2), mask_2bit_256);
+        let w2 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 4), mask_2bit_256);
+        let w3 = _mm256_and_si256(_mm256_srli_epi16(w_raw, 6), mask_2bit_256);
+
+        let a3 = _mm256_loadu_si256(a_q.as_ptr().add(py) as *const __m256i);
+        let a2 = _mm256_loadu_si256(a_q.as_ptr().add(py + 32) as *const __m256i);
+        let a1 = _mm256_loadu_si256(a_q.as_ptr().add(py + 64) as *const __m256i);
+        let a0 = _mm256_loadu_si256(a_q.as_ptr().add(py + 96) as *const __m256i);
+
+        let p0 = _mm256_maddubs_epi16(w0, a0);
+        let p1 = _mm256_maddubs_epi16(w1, a1);
+        let p2 = _mm256_maddubs_epi16(w2, a2);
+        let p3 = _mm256_maddubs_epi16(w3, a3);
+
+        let accu16 = _mm256_add_epi16(_mm256_add_epi16(p0, p1), _mm256_add_epi16(p2, p3));
+        result += hsum_i32(_mm256_madd_epi16(accu16, ones_16_256));
+    }
+
+    result
+}
+
+/// Quantize f32 activations to i8 in-place (no allocation). Returns (scale, sum).
+#[cfg(target_arch = "x86_64")]
+pub fn i2s_quantize_into(a: &[f32], dst: &mut [i8]) -> (f32, i32) {
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        return unsafe { quantize_row_i8_s_avx512_into(a, dst) };
+    }
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return unsafe { quantize_row_i8_s_avx2_into(a, dst) };
+    }
+    quantize_row_i8_s(a, dst)
+}
+
+/// Single-threaded I2S GEMV on column range [col_start, col_end).
+/// Called by layer-level threading — each thread processes its own column slice.
+/// Uses raw addresses to satisfy Sync bounds in parallel closures.
+#[cfg(target_arch = "x86_64")]
+pub fn i2s_gemv_cols(
+    preq_q8: &[i8],
+    preq_scale: f32,
+    preq_sum: i32,
+    b_quantized: &[u8],
+    w_scale: f32,
+    output_addr: usize,
+    col_start: usize,
+    col_end: usize,
+    k: usize,
+) {
+    let row_packed_bytes = k / 4;
+    if is_x86_feature_detected!("avx2") {
+        unsafe { i2s_gemv_cols_multi_row(preq_q8, preq_scale, preq_sum, b_quantized, w_scale, output_addr, col_start, col_end, k) };
+        return;
+    }
+
+    let has_avx_vnni = is_x86_feature_detected!("avxvnni");
+    let has_avx512 = is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512vnni");
+
+    for j in col_start..col_end {
+        let w = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
+        let raw = if has_avx_vnni {
+            unsafe { vec_dot_i2_i8_s_avx_vnni(w, preq_q8, k) }
+        } else if has_avx512 {
+            unsafe { vec_dot_i2_i8_s_avx512(w, preq_q8, k) }
+        } else {
+            unsafe { vec_dot_i2_i8_s_avx2(w, preq_q8, k) }
+        };
+        unsafe { *(output_addr as *mut f32).add(j) = (raw - preq_sum) as f32 / preq_scale * w_scale; }
+    }
+}
+
+/// One iteration of the I2S dot product inner loop.
+#[cfg(target_arch = "x86_64")]
+macro_rules! i2s_dot_iter {
+    ($acc:ident, $w_base:expr, $a_base:expr, $g:expr, $mask:expr) => {{
+        use std::arch::x86_64::*;
+        let xq8 = _mm256_loadu_si256(($w_base).add($g * 32) as *const __m256i);
+        let xq0 = _mm256_and_si256(_mm256_srli_epi16(xq8, 6), $mask);
+        let xq1 = _mm256_and_si256(_mm256_srli_epi16(xq8, 4), $mask);
+        let xq2 = _mm256_and_si256(_mm256_srli_epi16(xq8, 2), $mask);
+        let xq3 = _mm256_and_si256(xq8, $mask);
+        let p = ($a_base).add($g * 128);
+        let d0 = _mm256_maddubs_epi16(xq0, _mm256_loadu_si256(p as *const __m256i));
+        let d1 = _mm256_maddubs_epi16(xq1, _mm256_loadu_si256(p.add(32) as *const __m256i));
+        let d2 = _mm256_maddubs_epi16(xq2, _mm256_loadu_si256(p.add(64) as *const __m256i));
+        let d3 = _mm256_maddubs_epi16(xq3, _mm256_loadu_si256(p.add(96) as *const __m256i));
+        $acc = _mm256_add_epi16($acc, _mm256_add_epi16(d0, d1));
+        $acc = _mm256_add_epi16($acc, _mm256_add_epi16(d2, d3));
+    }};
+}
+
+/// I2S GEMV inner kernel: dot product of 32 × 128-element blocks.
+/// Macro-unrolled — no loop, 32 stamped-out iterations.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn i2s_dot_block32(
+    w_ptr: *const u8,
+    a_ptr: *const i8,
+    mask: std::arch::x86_64::__m256i,
+    ones: std::arch::x86_64::__m256i,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    let mut acc = _mm256_setzero_si256();
+    let w = w_ptr;
+    let a = a_ptr;
+    i2s_dot_iter!(acc, w, a, 0, mask);  i2s_dot_iter!(acc, w, a, 1, mask);
+    i2s_dot_iter!(acc, w, a, 2, mask);  i2s_dot_iter!(acc, w, a, 3, mask);
+    i2s_dot_iter!(acc, w, a, 4, mask);  i2s_dot_iter!(acc, w, a, 5, mask);
+    i2s_dot_iter!(acc, w, a, 6, mask);  i2s_dot_iter!(acc, w, a, 7, mask);
+    i2s_dot_iter!(acc, w, a, 8, mask);  i2s_dot_iter!(acc, w, a, 9, mask);
+    i2s_dot_iter!(acc, w, a, 10, mask); i2s_dot_iter!(acc, w, a, 11, mask);
+    i2s_dot_iter!(acc, w, a, 12, mask); i2s_dot_iter!(acc, w, a, 13, mask);
+    i2s_dot_iter!(acc, w, a, 14, mask); i2s_dot_iter!(acc, w, a, 15, mask);
+    i2s_dot_iter!(acc, w, a, 16, mask); i2s_dot_iter!(acc, w, a, 17, mask);
+    i2s_dot_iter!(acc, w, a, 18, mask); i2s_dot_iter!(acc, w, a, 19, mask);
+    i2s_dot_iter!(acc, w, a, 20, mask); i2s_dot_iter!(acc, w, a, 21, mask);
+    i2s_dot_iter!(acc, w, a, 22, mask); i2s_dot_iter!(acc, w, a, 23, mask);
+    i2s_dot_iter!(acc, w, a, 24, mask); i2s_dot_iter!(acc, w, a, 25, mask);
+    i2s_dot_iter!(acc, w, a, 26, mask); i2s_dot_iter!(acc, w, a, 27, mask);
+    i2s_dot_iter!(acc, w, a, 28, mask); i2s_dot_iter!(acc, w, a, 29, mask);
+    i2s_dot_iter!(acc, w, a, 30, mask); i2s_dot_iter!(acc, w, a, 31, mask);
+    _mm256_madd_epi16(acc, ones)
+}
+
+/// Sequential-row I2S GEMV — one row at a time, activation in L1 cache.
+/// Inner 32-block kernel is #[inline(always)] to force unrolling.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn i2s_gemv_cols_multi_row(
+    preq_q8: &[i8],
+    preq_scale: f32,
+    preq_sum: i32,
+    b_quantized: &[u8],
+    w_scale: f32,
+    output_addr: usize,
+    col_start: usize,
+    col_end: usize,
+    k: usize,
+) {
+    use std::arch::x86_64::*;
+    let row_packed_bytes = k / 4;
+    let nb = k / 128;
+    let mask = _mm256_set1_epi8(0x03);
+    let ones = _mm256_set1_epi16(1);
+    let group32_num = nb / 32;
+    let la_num = nb % 32;
+    let scale = w_scale / preq_scale;
+
+    for row in col_start..col_end {
+        let x_row = b_quantized.as_ptr().add(row * row_packed_bytes);
+        let y = preq_q8.as_ptr();
+        let mut acc = _mm256_setzero_si256();
+
+        for i in 0..group32_num {
+            acc = _mm256_add_epi32(acc, i2s_dot_block32(
+                x_row.add(i * 1024), y.add(i * 4096) as *const i8, mask, ones));
+        }
+
+        if la_num > 0 {
+            let px_base = x_row.add(group32_num * 1024);
+            let py_base = y.add(group32_num * 4096);
+            let mut accu16 = _mm256_setzero_si256();
+            for g in 0..la_num {
+                let xq8 = _mm256_loadu_si256(px_base.add(g * 32) as *const __m256i);
+                let xq0 = _mm256_and_si256(_mm256_srli_epi16(xq8, 6), mask);
+                let xq1 = _mm256_and_si256(_mm256_srli_epi16(xq8, 4), mask);
+                let xq2 = _mm256_and_si256(_mm256_srli_epi16(xq8, 2), mask);
+                let xq3 = _mm256_and_si256(xq8, mask);
+
+                let py = py_base.add(g * 128);
+                let y0 = _mm256_loadu_si256(py as *const __m256i);
+                let y1 = _mm256_loadu_si256(py.add(32) as *const __m256i);
+                let y2 = _mm256_loadu_si256(py.add(64) as *const __m256i);
+                let y3 = _mm256_loadu_si256(py.add(96) as *const __m256i);
+
+                let d0 = _mm256_maddubs_epi16(xq0, y0);
+                let d1 = _mm256_maddubs_epi16(xq1, y1);
+                let d2 = _mm256_maddubs_epi16(xq2, y2);
+                let d3 = _mm256_maddubs_epi16(xq3, y3);
+
+                accu16 = _mm256_add_epi16(accu16, _mm256_add_epi16(d0, d1));
+                accu16 = _mm256_add_epi16(accu16, _mm256_add_epi16(d2, d3));
+            }
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(accu16, ones));
+        }
+
+        *(output_addr as *mut f32).add(row) = (hsum_i32(acc) - preq_sum) as f32 * scale;
+    }
+}
+
+/// Extract the per-tensor f32 scale from I2S weight data.
+#[inline]
+pub fn i2s_weight_scale(b_quantized: &[u8], n: usize, k: usize) -> f32 {
+    let packed_bytes = n * k / 4;
+    f32::from_ne_bytes([
+        b_quantized[packed_bytes],
+        b_quantized[packed_bytes + 1],
+        b_quantized[packed_bytes + 2],
+        b_quantized[packed_bytes + 3],
+    ])
+}
+
+// ── LUT-based I2S ternary dot product (bitnet.cpp TL2 translation) ─────────
+//
+// Instead of maddubs(weight_u8, activation_i8), precompute ALL possible
+// partial sums from activation pairs, then use weight nibbles as table indices.
+// Activations quantized to [-63, 63] so pair sums fit in i8 → single shuffle per nibble.
+
+#[inline]
+fn decode_ternary(w: u8) -> i8 {
+    (w as i8) - 1
+}
+
+/// Quantize f32 activations to i8 with scale = 63/max_abs (half precision vs standard 127).
+/// Pair sums stay in i8 range: max |a0 + a1| = 126 < 128.
+fn quantize_row_i8_s_lut(x: &[f32], dst: &mut [i8]) -> f32 {
+    let mut max: f64 = 0.00001;
+    for &v in x {
+        let av = (v as f64).abs();
+        if av > max { max = av; }
+    }
+    let s: f32 = (63.0f64 / max) as f32;
+    for (i, &v) in x.iter().enumerate() {
+        let mut q = nearest_int(v * s);
+        if q > 63 { q = 63; }
+        if q < -63 { q = -63; }
+        dst[i] = q as i8;
+    }
+    s
+}
+
+/// Build a 16-entry i8 LUT for a pair of activations (scaled to [-63,63]).
+/// Index = (w_high_2bit << 2) | w_low_2bit. Max |entry| = 126, fits i8.
+pub fn i2s_build_pair_lut_i8(a_low: i8, a_high: i8) -> [i8; 16] {
+    let mut lut = [0i8; 16];
+    for w_high in 0u8..3 {
+        for w_low in 0u8..3 {
+            let idx = ((w_high as usize) << 2) | (w_low as usize);
+            let val = decode_ternary(w_high) as i16 * a_high as i16
+                    + decode_ternary(w_low) as i16 * a_low as i16;
+            lut[idx] = val as i8;
+        }
+    }
+    lut
+}
+
+/// Build all i8 pair LUTs for a quantized activation row.
+/// Layout: 64 LUTs per 128-element group, 16 bytes each, contiguous.
+fn i2s_build_all_pair_luts_i8(a_q: &[i8], k: usize) -> Vec<i8> {
+    let nb = k / 128;
+    let mut luts = vec![0i8; nb * 64 * 16];
+
+    for g in 0..nb {
+        let base = g * 128;
+        for b in 0..32 {
+            let upper_lut = i2s_build_pair_lut_i8(a_q[base + 32 + b], a_q[base + b]);
+            let off = g * 64 * 16 + b * 16;
+            luts[off..off + 16].copy_from_slice(&upper_lut);
+
+            let lower_lut = i2s_build_pair_lut_i8(a_q[base + 96 + b], a_q[base + 64 + b]);
+            let off2 = g * 64 * 16 + (32 + b) * 16;
+            luts[off2..off2 + 16].copy_from_slice(&lower_lut);
+        }
+    }
+    luts
+}
+
+/// Build all pair LUTs with pre-split lo/hi bytes for AVX2 shuffle.
+/// Layout per pair: 16 lo-bytes then 16 hi-bytes = 32 bytes.
+/// Total: 64 pairs per group × 32 bytes = 2048 bytes per group.
+/// Uses full 127-scale precision (i16 entries, no range reduction).
+fn i2s_build_all_pair_luts_split(a_q: &[i8], k: usize) -> Vec<u8> {
+    let nb = k / 128;
+    let mut luts = vec![0u8; nb * 64 * 32]; // 64 pairs × 32 bytes per group
+
+    for g in 0..nb {
+        let base = g * 128;
+        for b in 0..32 {
+            // Upper nibble pair
+            let a_high = a_q[base + b];
+            let a_low = a_q[base + 32 + b];
+            let off = g * 64 * 32 + b * 32;
+            for w_high in 0u8..3 {
+                for w_low in 0u8..3 {
+                    let idx = ((w_high as usize) << 2) | (w_low as usize);
+                    let val = decode_ternary(w_high) as i16 * a_high as i16
+                            + decode_ternary(w_low) as i16 * a_low as i16;
+                    luts[off + idx] = val as u8;           // lo byte
+                    luts[off + 16 + idx] = (val >> 8) as u8; // hi byte
+                }
+            }
+
+            // Lower nibble pair
+            let a_high2 = a_q[base + 64 + b];
+            let a_low2 = a_q[base + 96 + b];
+            let off2 = g * 64 * 32 + (32 + b) * 32;
+            for w_high in 0u8..3 {
+                for w_low in 0u8..3 {
+                    let idx = ((w_high as usize) << 2) | (w_low as usize);
+                    let val = decode_ternary(w_high) as i16 * a_high2 as i16
+                            + decode_ternary(w_low) as i16 * a_low2 as i16;
+                    luts[off2 + idx] = val as u8;
+                    luts[off2 + 16 + idx] = (val >> 8) as u8;
+                }
+            }
+        }
+    }
+    luts
+}
+
+// Keep i16 versions for the scalar correctness test
+pub fn i2s_build_pair_lut(a_low: i8, a_high: i8) -> [i16; 16] {
+    let mut lut = [0i16; 16];
+    for w_high in 0u8..3 {
+        for w_low in 0u8..3 {
+            let idx = ((w_high as usize) << 2) | (w_low as usize);
+            lut[idx] = decode_ternary(w_high) as i16 * a_high as i16
+                     + decode_ternary(w_low) as i16 * a_low as i16;
+        }
+    }
+    lut
+}
+
+fn i2s_build_all_pair_luts(a_q: &[i8], k: usize) -> Vec<i16> {
+    let nb = k / 128;
+    let mut luts = vec![0i16; nb * 64 * 16];
+    for g in 0..nb {
+        let base = g * 128;
+        for b in 0..32 {
+            let upper_lut = i2s_build_pair_lut(a_q[base + 32 + b], a_q[base + b]);
+            let off = g * 64 * 16 + b * 16;
+            luts[off..off + 16].copy_from_slice(&upper_lut);
+            let lower_lut = i2s_build_pair_lut(a_q[base + 96 + b], a_q[base + 64 + b]);
+            let off2 = g * 64 * 16 + (32 + b) * 16;
+            luts[off2..off2 + 16].copy_from_slice(&lower_lut);
+        }
+    }
+    luts
+}
+
+#[allow(dead_code)]
+fn vec_dot_i2_i8_s_lut_scalar(packed: &[u8], pair_luts: &[i16], k: usize) -> i32 {
+    let nb = k / 128;
+    let mut acc: i32 = 0;
+    for g in 0..nb {
+        let lut_base = g * 64 * 16;
+        for b in 0..32 {
+            let byte = packed[g * 32 + b];
+            let upper_nibble = (byte >> 4) as usize;
+            let lower_nibble = (byte & 0x0F) as usize;
+            acc += pair_luts[lut_base + b * 16 + upper_nibble] as i32;
+            acc += pair_luts[lut_base + (32 + b) * 16 + lower_nibble] as i32;
+        }
+    }
+    acc
 }
 
 #[cfg(feature = "cpu")]
@@ -1027,6 +1882,84 @@ impl MatMulQ for CpuMatMulQ4K {
                 let raw = vec_dot_i2_i8_s(w_packed, &a_q, k);
                 // C: tmp = (tmp - act_sums[i1]) / (act_scales[i1]) * (*scale);
                 output[i * n + j] = (raw - act_sum) as f32 / act_scale * w_scale;
+            }
+        }
+        Ok(())
+    }
+
+    fn forward_i2s_preq(
+        &self,
+        preq_q8: &[i8],
+        preq_scale: f32,
+        preq_sum: i32,
+        b_quantized: &[u8],
+        output: &mut [f32],
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let packed_bytes = n * k / 4;
+        let row_packed_bytes = k / 4;
+        let w_scale = f32::from_ne_bytes([
+            b_quantized[packed_bytes],
+            b_quantized[packed_bytes + 1],
+            b_quantized[packed_bytes + 2],
+            b_quantized[packed_bytes + 3],
+        ]);
+
+        for j in 0..n {
+            let w_packed = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
+            let raw = vec_dot_i2_i8_s(w_packed, preq_q8, k);
+            output[j] = (raw - preq_sum) as f32 / preq_scale * w_scale;
+        }
+        Ok(())
+    }
+
+    fn forward_i2s_lut(
+        &self,
+        a: &[f32],
+        b_transposed: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if a.len() != m * k {
+            return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+        }
+        if output.len() != m * n {
+            return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+        }
+
+        let packed_bytes = n * k / 4;
+        let _row_packed_bytes = k / 4;
+        let w_scale = f32::from_ne_bytes([
+            b_transposed[packed_bytes],
+            b_transposed[packed_bytes + 1],
+            b_transposed[packed_bytes + 2],
+            b_transposed[packed_bytes + 3],
+        ]);
+
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+            let mut a_q = vec![0i8; k];
+            let (act_scale, _act_sum) = quantize_row_i8_s(a_row, &mut a_q);
+            let pair_luts = i2s_build_all_pair_luts(&a_q, k);
+
+            // Transposed layout: byte position b has n values contiguous at offset b*n
+            for j in 0..n {
+                let mut acc: i32 = 0;
+                for g in 0..(k / 128) {
+                    let lut_base = g * 64 * 16;
+                    for b in 0..32 {
+                        let byte_pos = g * 32 + b;
+                        let byte = b_transposed[byte_pos * n + j];
+                        let upper_nibble = (byte >> 4) as usize;
+                        let lower_nibble = (byte & 0x0F) as usize;
+                        acc += pair_luts[lut_base + b * 16 + upper_nibble] as i32;
+                        acc += pair_luts[lut_base + (32 + b) * 16 + lower_nibble] as i32;
+                    }
+                }
+                output[i * n + j] = acc as f32 / act_scale * w_scale;
             }
         }
         Ok(())
@@ -1403,6 +2336,9 @@ pub struct PreQuantizedActivations {
     pub scales_i16: Vec<f32>,
     pub group_sums_q4k: Vec<f32>,
     pub group_sums_q6k: Vec<f32>,
+    pub i2s_q8: Vec<i8>,
+    pub i2s_scale: f32,
+    pub i2s_sum: i32,
     pub k: usize,
 }
 
@@ -1451,6 +2387,8 @@ impl PreQuantizedActivations {
                 }
             }
 
+            let (i2s_scale, i2s_sum, i2s_q8) = unsafe { quantize_row_i8_s_avx2(a) };
+
             return Self {
                 q8,
                 q16,
@@ -1458,10 +2396,15 @@ impl PreQuantizedActivations {
                 scales_i16,
                 group_sums_q4k,
                 group_sums_q6k,
+                i2s_q8,
+                i2s_scale,
+                i2s_sum,
                 k,
             };
         }
 
+        let mut i2s_q8 = vec![0i8; k];
+        let (i2s_scale, i2s_sum) = quantize_row_i8_s(a, &mut i2s_q8);
         Self {
             q8: Vec::new(),
             q16: Vec::new(),
@@ -1469,7 +2412,32 @@ impl PreQuantizedActivations {
             scales_i16: Vec::new(),
             group_sums_q4k: Vec::new(),
             group_sums_q6k: Vec::new(),
+            i2s_q8,
+            i2s_scale,
+            i2s_sum,
             k,
+        }
+    }
+
+    pub fn i2s_only(a: &[f32]) -> Self {
+        let k = a.len();
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            let (i2s_scale, i2s_sum, i2s_q8) = unsafe { quantize_row_i8_s_avx2(a) };
+            return Self {
+                q8: Vec::new(), q16: Vec::new(), scales: Vec::new(),
+                scales_i16: Vec::new(), group_sums_q4k: Vec::new(),
+                group_sums_q6k: Vec::new(),
+                i2s_q8, i2s_scale, i2s_sum, k,
+            };
+        }
+        let mut i2s_q8 = vec![0i8; k];
+        let (i2s_scale, i2s_sum) = quantize_row_i8_s(a, &mut i2s_q8);
+        Self {
+            q8: Vec::new(), q16: Vec::new(), scales: Vec::new(),
+            scales_i16: Vec::new(), group_sums_q4k: Vec::new(),
+            group_sums_q6k: Vec::new(),
+            i2s_q8, i2s_scale, i2s_sum, k,
         }
     }
 
@@ -1973,8 +2941,303 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         n: usize,
         k: usize,
     ) -> Result<()> {
+        if a.len() != m * k {
+            return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+        }
+        if output.len() != m * n {
+            return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+        }
+
+        let packed_bytes = n * k / 4;
+        let row_packed_bytes = k / 4;
+        let w_scale = f32::from_ne_bytes([
+            b_quantized[packed_bytes],
+            b_quantized[packed_bytes + 1],
+            b_quantized[packed_bytes + 2],
+            b_quantized[packed_bytes + 3],
+        ]);
+
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avxvnni") {
+            let mut q_buf = vec![0i8; k];
+            for i in 0..m {
+                let a_row = &a[i * k..(i + 1) * k];
+                let (act_scale, act_sum) = i2s_quantize_into(a_row, &mut q_buf);
+                let out_row = &mut output[i * n..(i + 1) * n];
+                for j in 0..n {
+                    let w_packed = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
+                    let raw = unsafe { vec_dot_i2_i8_s_avx_vnni(w_packed, &q_buf, k) };
+                    out_row[j] = (raw - act_sum) as f32 / act_scale * w_scale;
+                }
+            }
+            return Ok(());
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni")
+        {
+            for i in 0..m {
+                let a_row = &a[i * k..(i + 1) * k];
+                let (act_scale, act_sum, a_q) = unsafe { quantize_row_i8_s_avx512(a_row) };
+                let out_row = &mut output[i * n..(i + 1) * n];
+                for j in 0..n {
+                    let w_packed = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
+                    let raw = unsafe { vec_dot_i2_i8_s_avx512(w_packed, &a_q, k) };
+                    out_row[j] = (raw - act_sum) as f32 / act_scale * w_scale;
+                }
+            }
+            return Ok(());
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            for i in 0..m {
+                let a_row = &a[i * k..(i + 1) * k];
+                let (act_scale, act_sum, a_q) = unsafe { quantize_row_i8_s_avx2(a_row) };
+                let out_row = &mut output[i * n..(i + 1) * n];
+                for j in 0..n {
+                    let w_packed = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
+                    let raw = unsafe { vec_dot_i2_i8_s_avx2(w_packed, &a_q, k) };
+                    out_row[j] = (raw - act_sum) as f32 / act_scale * w_scale;
+                }
+            }
+            return Ok(());
+        }
+
         let cpu = CpuMatMulQ4K;
         cpu.forward_b_transposed_i2s(a, b_quantized, output, m, n, k)
+    }
+
+    fn forward_i2s_preq(
+        &self,
+        preq_q8: &[i8],
+        preq_scale: f32,
+        preq_sum: i32,
+        b_quantized: &[u8],
+        output: &mut [f32],
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let packed_bytes = n * k / 4;
+        let row_packed_bytes = k / 4;
+        let w_scale = f32::from_ne_bytes([
+            b_quantized[packed_bytes],
+            b_quantized[packed_bytes + 1],
+            b_quantized[packed_bytes + 2],
+            b_quantized[packed_bytes + 3],
+        ]);
+
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") {
+            let out_addr = output.as_mut_ptr() as usize;
+            let b_addr = b_quantized.as_ptr() as usize;
+            let a_addr = preq_q8.as_ptr() as usize;
+            let has_avx_vnni = is_x86_feature_detected!("avxvnni");
+            let has_avx512 = is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vnni");
+
+            let chunk_size = (n + 7) / 8;
+            crate::thread_pool::global_pool().parallel_chunks(n, chunk_size, &|start, end| {
+                for j in start..end {
+                    let w = unsafe {
+                        std::slice::from_raw_parts((b_addr + j * row_packed_bytes) as *const u8, row_packed_bytes)
+                    };
+                    let aq = unsafe { std::slice::from_raw_parts(a_addr as *const i8, k) };
+                    let raw = if has_avx_vnni {
+                        unsafe { vec_dot_i2_i8_s_avx_vnni(w, aq, k) }
+                    } else if has_avx512 {
+                        unsafe { vec_dot_i2_i8_s_avx512(w, aq, k) }
+                    } else {
+                        unsafe { vec_dot_i2_i8_s_avx2(w, aq, k) }
+                    };
+                    unsafe { *(out_addr as *mut f32).add(j) = (raw - preq_sum) as f32 / preq_scale * w_scale; }
+                }
+            });
+            return Ok(());
+        }
+
+        let cpu = CpuMatMulQ4K;
+        cpu.forward_i2s_preq(preq_q8, preq_scale, preq_sum, b_quantized, output, n, k)
+    }
+
+    fn forward_i2s_lut(
+        &self,
+        a: &[f32],
+        b_transposed: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        if a.len() != m * k {
+            return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+        }
+        if output.len() != m * n {
+            return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+        }
+
+        let packed_bytes = n * k / 4;
+        let w_scale = f32::from_ne_bytes([
+            b_transposed[packed_bytes],
+            b_transposed[packed_bytes + 1],
+            b_transposed[packed_bytes + 2],
+            b_transposed[packed_bytes + 3],
+        ]);
+
+        let num_groups = k / 128;
+
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+
+            // Full-precision i16 LUT with pre-split lo/hi bytes (bitnet.cpp TL2 pattern)
+            let mut a_q = vec![0i8; k];
+            let (act_scale, _) = quantize_row_i8_s(a_row, &mut a_q);
+            let split_luts = i2s_build_all_pair_luts_split(&a_q, k);
+
+            let out_row = &mut output[i * n..(i + 1) * n];
+
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && n >= 32 {
+                let n_chunks = n / 32;
+
+                let chunk_results: Vec<[i32; 32]> = (0..n_chunks)
+                    .into_par_iter()
+                    .map(|chunk_idx| {
+                        let j_start = chunk_idx * 32;
+                        let mut accs = [0i32; 32];
+
+                        unsafe {
+                            use std::arch::x86_64::*;
+                            let nibble_mask = _mm256_set1_epi8(0x0F);
+                            let mut acc0 = _mm256_setzero_si256();
+                            let mut acc1 = _mm256_setzero_si256();
+                            let mut acc2 = _mm256_setzero_si256();
+                            let mut acc3 = _mm256_setzero_si256();
+
+                            for g in 0..num_groups {
+                                let lut_base = g * 64 * 32;
+                                let mut vec_c0 = _mm256_setzero_si256();
+                                let mut vec_c1 = _mm256_setzero_si256();
+
+                                for b in 0..32 {
+                                    let byte_pos = g * 32 + b;
+                                    let w = _mm256_loadu_si256(
+                                        b_transposed.as_ptr().add(byte_pos * n + j_start) as *const __m256i
+                                    );
+                                    let upper = _mm256_and_si256(_mm256_srli_epi16(w, 4), nibble_mask);
+                                    let lower = _mm256_and_si256(w, nibble_mask);
+
+                                    // 4 LUT loads: lo/hi bytes for upper and lower nibble pairs
+                                    let u_off = lut_base + b * 32;
+                                    let tbl_u_lo = _mm256_broadcastsi128_si256(
+                                        _mm_loadu_si128(split_luts.as_ptr().add(u_off) as *const __m128i));
+                                    let tbl_u_hi = _mm256_broadcastsi128_si256(
+                                        _mm_loadu_si128(split_luts.as_ptr().add(u_off + 16) as *const __m128i));
+                                    let l_off = lut_base + (32 + b) * 32;
+                                    let tbl_l_lo = _mm256_broadcastsi128_si256(
+                                        _mm_loadu_si128(split_luts.as_ptr().add(l_off) as *const __m128i));
+                                    let tbl_l_hi = _mm256_broadcastsi128_si256(
+                                        _mm_loadu_si128(split_luts.as_ptr().add(l_off + 16) as *const __m128i));
+
+                                    // 4 shuffles: lo/hi byte lookups
+                                    let u_lo_r = _mm256_shuffle_epi8(tbl_u_lo, upper);
+                                    let u_hi_r = _mm256_shuffle_epi8(tbl_u_hi, upper);
+                                    let l_lo_r = _mm256_shuffle_epi8(tbl_l_lo, lower);
+                                    let l_hi_r = _mm256_shuffle_epi8(tbl_l_hi, lower);
+
+                                    // Reconstruct i16: unpack(lo_bytes, hi_bytes) → i16
+                                    // unpacklo: bytes 0-7 per lane → cols [0-7 | 16-23]
+                                    // unpackhi: bytes 8-15 per lane → cols [8-15 | 24-31]
+                                    let u_i16_c0 = _mm256_unpacklo_epi8(u_lo_r, u_hi_r);
+                                    let u_i16_c1 = _mm256_unpackhi_epi8(u_lo_r, u_hi_r);
+                                    let l_i16_c0 = _mm256_unpacklo_epi8(l_lo_r, l_hi_r);
+                                    let l_i16_c1 = _mm256_unpackhi_epi8(l_lo_r, l_hi_r);
+
+                                    // Accumulate in i16 (32 byte positions × max ±254 per position → max ±8128, fits i16)
+                                    vec_c0 = _mm256_add_epi16(vec_c0, _mm256_add_epi16(u_i16_c0, l_i16_c0));
+                                    vec_c1 = _mm256_add_epi16(vec_c1, _mm256_add_epi16(u_i16_c1, l_i16_c1));
+                                }
+
+                                // Widen i16 → i32 once per group
+                                acc0 = _mm256_add_epi32(acc0,
+                                    _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c0)));
+                                acc1 = _mm256_add_epi32(acc1,
+                                    _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)));
+                                acc2 = _mm256_add_epi32(acc2,
+                                    _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c1)));
+                                acc3 = _mm256_add_epi32(acc3,
+                                    _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)));
+                            }
+
+                            // acc0=[0-7], acc2=[8-15], acc1=[16-23], acc3=[24-31]
+                            _mm256_storeu_si256(accs[0..8].as_mut_ptr() as *mut __m256i, acc0);
+                            _mm256_storeu_si256(accs[8..16].as_mut_ptr() as *mut __m256i, acc2);
+                            _mm256_storeu_si256(accs[16..24].as_mut_ptr() as *mut __m256i, acc1);
+                            _mm256_storeu_si256(accs[24..32].as_mut_ptr() as *mut __m256i, acc3);
+                        }
+
+                        accs
+                    })
+                    .collect();
+
+                for (chunk_idx, accs) in chunk_results.iter().enumerate() {
+                    let j_start = chunk_idx * 32;
+                    for (local, &acc) in accs.iter().enumerate() {
+                        out_row[j_start + local] = acc as f32 / act_scale * w_scale;
+                    }
+                }
+
+                // Scalar tail
+                for j in n_chunks * 32..n {
+                    let mut acc: i32 = 0;
+                    for g in 0..num_groups {
+                        let lut_base = g * 64 * 32;
+                        for b in 0..32 {
+                            let byte_pos = g * 32 + b;
+                            let byte = b_transposed[byte_pos * n + j];
+                            let u_idx = (byte >> 4) as usize;
+                            let l_idx = (byte & 0x0F) as usize;
+                            let u_off = lut_base + b * 32;
+                            let l_off = lut_base + (32 + b) * 32;
+                            let u_val = split_luts[u_off + u_idx] as i8 as i16
+                                      | (split_luts[u_off + 16 + u_idx] as i8 as i16) << 8;
+                            let l_val = split_luts[l_off + l_idx] as i8 as i16
+                                      | (split_luts[l_off + 16 + l_idx] as i8 as i16) << 8;
+                            acc += u_val as i32 + l_val as i32;
+                        }
+                    }
+                    out_row[j] = acc as f32 / act_scale * w_scale;
+                }
+
+                continue;
+            }
+
+            // Scalar fallback
+            for j in 0..n {
+                let mut acc: i32 = 0;
+                for g in 0..num_groups {
+                    let lut_base = g * 64 * 32;
+                    for b in 0..32 {
+                        let byte_pos = g * 32 + b;
+                        let byte = b_transposed[byte_pos * n + j];
+                        let u_idx = (byte >> 4) as usize;
+                        let l_idx = (byte & 0x0F) as usize;
+                        let u_off = lut_base + b * 32;
+                        let l_off = lut_base + (32 + b) * 32;
+                        let u_val = split_luts[u_off + u_idx] as i8 as i16
+                                  | (split_luts[u_off + 16 + u_idx] as i8 as i16) << 8;
+                        let l_val = split_luts[l_off + l_idx] as i8 as i16
+                                  | (split_luts[l_off + 16 + l_idx] as i8 as i16) << 8;
+                        acc += u_val as i32 + l_val as i32;
+                    }
+                }
+                out_row[j] = acc as f32 / act_scale * w_scale;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2815,6 +4078,33 @@ impl MatMulQ for CudaMatMulQ4K {
         let cpu = CpuMatMulQ4K;
         cpu.forward_b_transposed_i2s(a, b_quantized, output, m, n, k)
     }
+
+    fn forward_i2s_preq(
+        &self,
+        preq_q8: &[i8],
+        preq_scale: f32,
+        preq_sum: i32,
+        b_quantized: &[u8],
+        output: &mut [f32],
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        let cpu = CpuMatMulQ4K;
+        cpu.forward_i2s_preq(preq_q8, preq_scale, preq_sum, b_quantized, output, n, k)
+    }
+
+    fn forward_i2s_lut(
+        &self,
+        a: &[f32],
+        b_transposed: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> crate::Result<()> {
+        let cpu = CpuMatMulQ4K;
+        cpu.forward_i2s_lut(a, b_transposed, output, m, n, k)
+    }
 }
 
 #[cfg(kani)]
@@ -3242,6 +4532,127 @@ mod kani_proofs {
 
         let out_idx = i * n + j;
         assert!(out_idx < m * n);
+    }
+
+    #[kani::proof]
+    fn i2s_block_access_in_bounds() {
+        let idx: usize = kani::any();
+        kani::assume(idx < I2S_BLOCK_SIZE);
+
+        let group = idx / 128;
+        assert!(group < 2);
+        let within = idx % 128;
+        let byte_idx = group * 32 + within % 32;
+        assert!(byte_idx < I2S_BLOCK_BYTES);
+    }
+
+    #[kani::proof]
+    fn i2s_decode_value_in_range() {
+        let byte_val: u8 = kani::any();
+        let shift: u32 = kani::any();
+        kani::assume(shift < 4);
+        let bits = (byte_val >> (shift * 2)) & 0x03;
+        let trit = bits as i8 - 1;
+        assert!(trit >= -1);
+        assert!(trit <= 1);
+    }
+
+    #[kani::proof]
+    fn i2s_quantize_i8_range() {
+        let val: f32 = kani::any();
+        kani::assume(val.is_finite());
+        kani::assume(val.abs() <= 1e6);
+
+        let max: f64 = 0.00001f64.max((val as f64).abs());
+        let s: f32 = (127.0f64 / max) as f32;
+        let mut q: i32 = nearest_int(val * s);
+        if q > 127 { q = 127; }
+        if q < -128 { q = -128; }
+        assert!(q >= -128 && q <= 127);
+    }
+
+    #[kani::proof]
+    fn i2s_matmul_index_safety() {
+        let m: usize = kani::any();
+        let n: usize = kani::any();
+        let k: usize = kani::any();
+
+        kani::assume(m >= 1 && m <= 4);
+        kani::assume(n >= 1 && n <= 4);
+        kani::assume(k == 128 || k == 256);
+
+        let row_packed_bytes = k / 4;
+        let packed_bytes = n * k / 4;
+
+        let i: usize = kani::any();
+        let j: usize = kani::any();
+
+        kani::assume(i < m);
+        kani::assume(j < n);
+
+        let a_offset = i * k;
+        assert!(a_offset + k <= m * k);
+
+        let w_offset = j * row_packed_bytes;
+        assert!(w_offset + row_packed_bytes <= packed_bytes);
+
+        let out_idx = i * n + j;
+        assert!(out_idx < m * n);
+    }
+
+    #[kani::proof]
+    fn f16_dot_scalar_index_bounds() {
+        let k: usize = kani::any();
+        kani::assume(k >= 1 && k <= 64);
+
+        let i: usize = kani::any();
+        kani::assume(i < k);
+
+        let byte_idx_lo = i * 2;
+        let byte_idx_hi = i * 2 + 1;
+        let b_len = k * 2;
+
+        assert!(byte_idx_lo < b_len);
+        assert!(byte_idx_hi < b_len);
+    }
+
+    #[kani::proof]
+    fn f16_gemv_row_index_bounds() {
+        let n: usize = kani::any();
+        let k: usize = kani::any();
+        kani::assume(n >= 1 && n <= 16);
+        kani::assume(k >= 1 && k <= 64);
+
+        let j: usize = kani::any();
+        kani::assume(j < n);
+
+        let row_bytes = k * 2;
+        let b_start = j * row_bytes;
+        let b_end = b_start + row_bytes;
+        assert!(b_end <= n * k * 2);
+        assert!(j < n);
+    }
+
+    #[kani::proof]
+    fn i2s_gemv_cols_index_bounds() {
+        let n: usize = kani::any();
+        let k: usize = kani::any();
+        kani::assume(n >= 1 && n <= 8);
+        kani::assume(k == 128 || k == 256);
+
+        let col_start: usize = kani::any();
+        let col_end: usize = kani::any();
+        kani::assume(col_start <= col_end);
+        kani::assume(col_end <= n);
+
+        let row_packed_bytes = k / 4;
+
+        let col: usize = kani::any();
+        kani::assume(col >= col_start && col < col_end);
+
+        let w_offset = col * row_packed_bytes;
+        assert!(w_offset + row_packed_bytes <= n * row_packed_bytes);
+        assert!(col < n);
     }
 }
 
@@ -3836,6 +5247,307 @@ mod tests {
                 (result - exp).abs() < 1e-6,
                 "squared_relu({x}) = {result}, expected {exp}"
             );
+        }
+    }
+
+    #[test]
+    fn test_i2s_dequant_block_manual() {
+        let mut block = [0u8; I2S_BLOCK_BYTES];
+        // Group 0, byte 0: bits [7:6]=2(+1), [5:4]=1(0), [3:2]=0(-1), [1:0]=2(+1)
+        block[0] = 0b10_01_00_10;
+        let mut output = [0.0f32; I2S_BLOCK_SIZE];
+        i2s_dequant_block(&block, &mut output);
+        // Byte 0 in group 0: element 0 from [7:6], element 32 from [5:4], element 64 from [3:2], element 96 from [1:0]
+        assert_eq!(output[0], 1.0, "element 0 should be +1");
+        assert_eq!(output[32], 0.0, "element 32 should be 0");
+        assert_eq!(output[64], -1.0, "element 64 should be -1");
+        assert_eq!(output[96], 1.0, "element 96 should be +1");
+    }
+
+    #[test]
+    fn test_i2s_quantize_row_i8_s() {
+        let x = [1.0f32, -1.0, 0.5, -0.5, 0.0, 0.25, -0.25, 0.125];
+        let mut dst = [0i8; 8];
+        let (scale, sum) = quantize_row_i8_s(&x, &mut dst);
+        assert!(scale > 0.0, "scale must be positive");
+        for &q in &dst {
+            assert!(q >= -128, "i8 range violated: {q}");
+        }
+        assert_eq!(dst[0], 127, "max positive maps to 127");
+        assert_eq!(dst[1], -127, "max negative maps to -127");
+        let expected_sum: i32 = dst.iter().map(|&v| v as i32).sum();
+        assert_eq!(sum, expected_sum, "sum must match");
+    }
+
+    #[test]
+    fn test_i2s_vec_dot_manual() {
+        // 128-element group: construct packed weights for a known pattern
+        let k = 128;
+        let mut packed = vec![0u8; k / 4]; // 32 bytes
+        // Byte 0: bits [7:6]=2(+1), [5:4]=1(0), [3:2]=0(-1), [1:0]=2(+1)
+        packed[0] = 0b10_01_00_10;
+
+        let mut a_q = vec![0i8; k];
+        a_q[0] = 10; // element 0: w=+1 → value 2
+        a_q[32] = 20; // element 32: w=0 → value 1
+        a_q[64] = 30; // element 64: w=-1 → value 0
+        a_q[96] = 40; // element 96: w=+1 → value 2
+
+        let dot = vec_dot_i2_i8_s(&packed, &a_q, k);
+        // w values: 2,1,0,2 → unsigned dot: 2*10 + 1*20 + 0*30 + 2*40 = 20 + 20 + 0 + 80 = 120
+        assert_eq!(dot, 120, "i2s vec_dot expected 120, got {dot}");
+    }
+
+    #[test]
+    fn test_i2s_matmul_identity_like() {
+        let k = 256; // I2S_BLOCK_SIZE
+        let n = 2;
+        let m = 1;
+
+        // Row 0: element 0 = +1, rest = 0
+        // Row 1: element 1 = +1, rest = 0
+        let row_packed = k / 4; // 64 bytes per row
+        let total_packed = n * row_packed;
+        let mut b_quantized = vec![0u8; total_packed + 4]; // +4 for per-tensor f32 scale
+
+        // Encode +1 at element 0 for row 0: byte 0 bits [7:6] = 2
+        b_quantized[0] = 0b10_000000;
+        // Encode +1 at element 1 for row 1: byte 1 bits [7:6] = 2
+        b_quantized[row_packed + 1] = 0b10_000000;
+
+        // Per-tensor scale = 1.0
+        let scale_bytes = 1.0f32.to_ne_bytes();
+        b_quantized[total_packed..total_packed + 4].copy_from_slice(&scale_bytes);
+
+        // But weight values are {0,1,2} → ternary {-1,0,+1}
+        // So w=2 means +1, w=1 means 0, w=0 means -1
+        // All zero bytes → w=0 → ternary -1. That's a problem for "identity".
+        // The rescaling formula is: (raw - act_sum) / act_scale * w_scale
+        //
+        // For a cleaner test: use all w=1 (ternary 0) except the identity positions.
+        // w=1 → byte pattern where each 2-bit field is 01.
+        // 0b01_01_01_01 = 0x55
+        b_quantized.iter_mut().take(total_packed).for_each(|b| *b = 0x55);
+        // Now override: element 0 in row 0 = +1 (w=2 at byte 0 bits [7:6])
+        b_quantized[0] = 0b10_01_01_01; // elem 0=+1, rest=0
+        // Element 1 in row 1 = +1 (byte 1, bits [7:6])
+        b_quantized[row_packed + 1] = 0b10_01_01_01;
+
+        let mut a = vec![0.0f32; k];
+        a[0] = 10.0;
+        a[1] = 20.0;
+
+        let mut output = vec![0.0f32; n];
+        let matmul = CpuMatMulQ4K;
+        matmul
+            .forward_b_transposed_i2s(&a, &b_quantized, &mut output, m, n, k)
+            .unwrap();
+
+        // Row 0 has w=+1 at elem 0, w=0 everywhere else → dot product picks up a[0]=10.0
+        // Row 1 has w=+1 at elem 1, w=0 everywhere else → dot product picks up a[1]=20.0
+        // After INT8 quantization + rescaling, values won't be exact but should be close
+        assert!(
+            (output[0] - 10.0).abs() < 1.0,
+            "row 0: expected ~10.0, got {}",
+            output[0]
+        );
+        assert!(
+            (output[1] - 20.0).abs() < 1.0,
+            "row 1: expected ~20.0, got {}",
+            output[1]
+        );
+    }
+
+    #[test]
+    fn test_i2s_avx2_matches_scalar() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let k = 256;
+        let n = 4;
+        let m = 1;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Random I2S tensor: n rows of k/4 packed bytes + 4-byte scale
+        let row_packed = k / 4;
+        let total_packed = n * row_packed;
+        let mut b = vec![0u8; total_packed + 4];
+        for byte in b[..total_packed].iter_mut() {
+            *byte = rng.random();
+        }
+        b[total_packed..total_packed + 4].copy_from_slice(&0.5f32.to_ne_bytes());
+
+        // Random activations
+        let a: Vec<f32> = (0..m * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+
+        // Scalar path
+        let mut out_scalar = vec![0.0f32; m * n];
+        let scalar = CpuMatMulQ4K;
+        scalar
+            .forward_b_transposed_i2s(&a, &b, &mut out_scalar, m, n, k)
+            .unwrap();
+
+        // Optimized path (AVX2 + rayon on x86_64)
+        let mut out_opt = vec![0.0f32; m * n];
+        let opt = CpuMatMulQ4KOpt;
+        opt.forward_b_transposed_i2s(&a, &b, &mut out_opt, m, n, k)
+            .unwrap();
+
+        for j in 0..n {
+            assert!(
+                (out_scalar[j] - out_opt[j]).abs() < 1e-4,
+                "mismatch at j={j}: scalar={}, opt={}",
+                out_scalar[j],
+                out_opt[j]
+            );
+        }
+    }
+
+    #[test]
+    fn test_i2s_lut_transposed_matches_maddubs() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let k = 256;
+        let n = 64;
+        let mut rng = StdRng::seed_from_u64(88);
+
+        let row_packed = k / 4;
+        let total_packed = n * row_packed;
+        let mut b = vec![0u8; total_packed + 4];
+        for byte in b[..total_packed].iter_mut() {
+            let mut val = 0u8;
+            for shift in (0..8).step_by(2) {
+                val |= rng.random_range(0u8..3) << shift;
+            }
+            *byte = val;
+        }
+        b[total_packed..total_packed + 4].copy_from_slice(&0.5f32.to_ne_bytes());
+
+        // Transpose weights
+        let mut b_transposed = vec![0u8; total_packed + 4];
+        for j in 0..n {
+            for bp in 0..row_packed {
+                b_transposed[bp * n + j] = b[j * row_packed + bp];
+            }
+        }
+        b_transposed[total_packed..total_packed + 4].copy_from_slice(&0.5f32.to_ne_bytes());
+
+        let a: Vec<f32> = (0..k).map(|_| rng.random_range(-1.0..1.0)).collect();
+
+        // maddubs path
+        let mut out_mad = vec![0.0f32; n];
+        let mad = CpuMatMulQ4K;
+        mad.forward_b_transposed_i2s(&a, &b, &mut out_mad, 1, n, k).unwrap();
+
+        // LUT path with transposed weights (scalar CpuMatMulQ4K)
+        let mut out_lut_scalar = vec![0.0f32; n];
+        mad.forward_i2s_lut(&a, &b_transposed, &mut out_lut_scalar, 1, n, k).unwrap();
+
+        // LUT path with transposed weights (optimized CpuMatMulQ4KOpt)
+        let mut out_lut_opt = vec![0.0f32; n];
+        let opt = CpuMatMulQ4KOpt;
+        opt.forward_i2s_lut(&a, &b_transposed, &mut out_lut_opt, 1, n, k).unwrap();
+
+        for j in 0..n {
+            // Scalar LUT uses i16 (full precision), should match maddubs closely
+            assert!(
+                (out_mad[j] - out_lut_scalar[j]).abs() < 0.01,
+                "scalar LUT mismatch at j={j}: mad={}, lut={}",
+                out_mad[j], out_lut_scalar[j]
+            );
+            // Opt LUT uses i8 (63-scale, ~2% quantization difference expected)
+            let tol = out_mad[j].abs() * 0.05 + 0.05;
+            assert!(
+                (out_mad[j] - out_lut_opt[j]).abs() < tol,
+                "opt LUT mismatch at j={j}: mad={}, lut_opt={}, tol={}",
+                out_mad[j], out_lut_opt[j], tol
+            );
+        }
+    }
+
+    #[test]
+    fn test_i2s_lut_matches_maddubs() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let k = 256;
+        let n = 4;
+        let mut rng = StdRng::seed_from_u64(77);
+
+        let row_packed = k / 4;
+        let total_packed = n * row_packed;
+        let mut b = vec![0u8; total_packed + 4];
+        for byte in b[..total_packed].iter_mut() {
+            let mut val = 0u8;
+            for shift in (0..8).step_by(2) {
+                val |= rng.random_range(0u8..3) << shift;
+            }
+            *byte = val;
+        }
+        b[total_packed..total_packed + 4].copy_from_slice(&0.5f32.to_ne_bytes());
+
+        let a: Vec<f32> = (0..k).map(|_| rng.random_range(-1.0..1.0)).collect();
+
+        // maddubs path
+        let mut out_mad = vec![0.0f32; n];
+        let mad = CpuMatMulQ4K;
+        mad.forward_b_transposed_i2s(&a, &b, &mut out_mad, 1, n, k).unwrap();
+
+        // LUT path
+        let mut a_q = vec![0i8; k];
+        let (act_scale, _act_sum) = quantize_row_i8_s(&a, &mut a_q);
+        let pair_luts = i2s_build_all_pair_luts(&a_q, k);
+        let w_scale = f32::from_ne_bytes([
+            b[total_packed], b[total_packed + 1], b[total_packed + 2], b[total_packed + 3],
+        ]);
+
+        let mut out_lut = vec![0.0f32; n];
+        for j in 0..n {
+            let w_packed = &b[j * row_packed..(j + 1) * row_packed];
+            let raw = vec_dot_i2_i8_s_lut_scalar(w_packed, &pair_luts, k);
+            out_lut[j] = raw as f32 / act_scale * w_scale;
+        }
+
+        for j in 0..n {
+            assert!(
+                (out_mad[j] - out_lut[j]).abs() < 0.01,
+                "LUT mismatch at j={j}: maddubs={}, lut={}",
+                out_mad[j], out_lut[j]
+            );
+        }
+    }
+
+    #[test]
+    fn bench_i2s_vnni_vs_tl2() {
+        let shapes = [(2560, 2560), (2560, 6912), (6912, 2560), (640, 2560)];
+        for (n, k) in shapes {
+            let packed_bytes = n * k / 4;
+            let mut i2s = vec![0u8; packed_bytes + 4];
+            let mut rng = 42u64;
+            for b in &mut i2s[..packed_bytes] {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *b = (rng >> 32) as u8;
+            }
+            i2s[packed_bytes..packed_bytes + 4].copy_from_slice(&1.0f32.to_ne_bytes());
+            let act: Vec<f32> = (0..k).map(|i| (i as f32 - k as f32 / 2.0) * 0.001).collect();
+            let mut output = vec![0.0f32; n];
+
+            let mut q8 = vec![0i8; k];
+            let iters = 20;
+
+            // I2S AVX-VNNI GEMV
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                let (s, sum) = i2s_quantize_into(&act, &mut q8);
+                for j in 0..n {
+                    let w = &i2s[j * k / 4..(j + 1) * k / 4];
+                    let raw = unsafe { vec_dot_i2_i8_s_avx_vnni(w, &q8, k) };
+                    output[j] = (raw - sum) as f32 / s;
+                }
+            }
+            let i2s_us = start.elapsed().as_micros() as f64 / iters as f64;
+            eprintln!("({n},{k}) I2S-VNNI: {i2s_us:.0}μs/iter");
         }
     }
 }

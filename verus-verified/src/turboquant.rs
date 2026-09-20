@@ -137,6 +137,81 @@ proof fn decompress_indices_in_bounds(
         by (nonlinear_arith);
 }
 
+// ============================================================================
+// Proof: compress_append indexing stays in bounds (unbounded)
+// ============================================================================
+
+proof fn compress_append_indices_in_bounds(
+    head_dim: nat,
+    num_existing: nat,
+    num_new: nat,
+    group_size: nat,
+    vi: nat,
+    gi: nat,
+)
+    requires
+        head_dim >= 1,
+        num_existing >= 1,
+        num_new >= 1,
+        group_size >= 1,
+        vi < num_new,
+        gi < ((head_dim + group_size - 1) as nat) / group_size,
+    ensures ({
+        let groups_per_vec = ((head_dim + group_size - 1) as nat) / group_size;
+        let existing_groups = num_existing * groups_per_vec;
+        let new_data_len = num_new * head_dim;
+        let total_groups_after = (num_existing + num_new) * groups_per_vec;
+        let total_elements_after = (num_existing + num_new) * head_dim;
+        let existing_elements = num_existing * head_dim;
+        let vec_start = vi * head_dim;
+        let g_start = vec_start + gi * group_size;
+        let g_end_candidate = g_start + group_size;
+        let g_end = if g_end_candidate < vec_start + head_dim {
+            g_end_candidate
+        } else {
+            vec_start + head_dim
+        };
+        let g_len = g_end - g_start;
+        let new_group_idx = existing_groups + vi * groups_per_vec + gi;
+        let new_element_offset = existing_elements + g_start;
+        &&& g_start < new_data_len
+        &&& g_end <= new_data_len
+        &&& new_group_idx < total_groups_after
+        &&& new_element_offset + g_len <= total_elements_after
+    }),
+{
+    let groups_per_vec = ((head_dim + group_size - 1) as nat) / group_size;
+
+    // gi*gs < hd
+    assert(gi * group_size < head_dim)
+        by (nonlinear_arith)
+        requires gi < ((head_dim + group_size - 1) as nat) / group_size, group_size >= 1, head_dim >= 1;
+
+    // g_start = vi*hd + gi*gs < vi*hd + hd = (vi+1)*hd <= num_new*hd = new_data_len
+    assert((vi + 1) * head_dim <= num_new * head_dim)
+        by (nonlinear_arith) requires vi < num_new;
+    assert(vi * head_dim + head_dim == (vi + 1) * head_dim)
+        by (nonlinear_arith);
+
+    // new_group_idx = existing_groups + vi*gpv + gi
+    // vi*gpv + gi < vi*gpv + gpv = (vi+1)*gpv <= num_new*gpv
+    // so new_group_idx < existing_groups + num_new*gpv = (num_existing+num_new)*gpv
+    assert((vi + 1) * groups_per_vec <= num_new * groups_per_vec)
+        by (nonlinear_arith) requires vi < num_new;
+    assert(vi * groups_per_vec + groups_per_vec == (vi + 1) * groups_per_vec)
+        by (nonlinear_arith);
+    assert(num_existing * groups_per_vec + num_new * groups_per_vec
+        == (num_existing + num_new) * groups_per_vec)
+        by (nonlinear_arith);
+
+    // new_element_offset + g_len = num_existing*hd + g_end
+    // g_end <= vi*hd + hd <= num_new*hd
+    // so new_element_offset + g_len <= num_existing*hd + num_new*hd = (num_existing+num_new)*hd
+    assert(num_existing * head_dim + num_new * head_dim
+        == (num_existing + num_new) * head_dim)
+        by (nonlinear_arith);
+}
+
 fn main() {}
 
 } // verus!

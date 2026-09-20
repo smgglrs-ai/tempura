@@ -134,7 +134,7 @@ Three-crate workspace + standalone verification crate:
 - [x] Prometheus metrics (TTFT, ITL, queue depth, KV usage), OpenTelemetry export
 - [x] HuggingFace config.json auto-loading, Dockerfile
 - [x] Inference traces, deterministic replay, DualPipeline comparison, batch-invariant verification
-- [x] 148 passing tests
+- [x] 348 passing tests
 
 ## What's Next
 
@@ -155,19 +155,48 @@ Three-crate workspace + standalone verification crate:
 - [ ] Disaggregated prefill/decode serving
 
 ### Phase 12: BitNet Ternary Model Support
-- [ ] TQ2_0 block struct + decode in kernel-api
-- [ ] BitLinear CPU kernel (per-tensor INT8 activation quant, integer add/sub)
-- [ ] Squared ReLU activation function
-- [ ] GGUF loader: detect `model_type: "bitnet"`, route to BitLinear layers
+- [x] TQ2_0 block struct + decode in kernel-api
+- [x] BitLinear CPU kernel (per-tensor INT8 activation quant, integer add/sub)
+- [x] Squared ReLU activation function
+- [x] GGUF loader: detect `model_type: "bitnet"`, route to BitLinear layers
 - [ ] TQ2_0 cuda-oxide GPU kernel (dp4a path, shared-memory tile unpack)
-- [ ] TQ1_0 CPU-only decode
-- [ ] Validation against microsoft/bitnet-b1.58-2B-4T-gguf
+- [x] TQ1_0 CPU-only decode (I2S format via bitnet.cpp translation)
+- [x] Validation against microsoft/bitnet-b1.58-2B-4T-gguf (decode: ~42 tok/s, prefill pp42: 362 tok/s)
+- [x] AVX2/AVX512 maddubs with i16 batched accumulation (bitnet.cpp pattern)
+- [x] Pre-quantized activation sharing across q/k/v and gate/up projections
+- [x] Layer-level rayon::join parallelism for independent projections
+- [x] LUT-based dot product infrastructure (scalar + AVX2 shuffle, verified correct)
+- [x] Persistent thread pool (condvar + per-worker generation tracking)
+- [x] forward_bitnet_decode: dedicated decode path with pre-allocated buffers
+- [x] i2s_quantize_into: zero-allocation activation quantization
+- [x] Persistent thread model for decode (run_indexed, no thread spawn per token)
+- [x] Pre-allocated TL2 LUT buffers (zero heap allocs in layer loop)
+- [x] Fused serial ops: RMSNorm+q8snap, residual+RMSNorm+q8snap (12→8 barriers/layer)
+- [x] SIMD fused kernels: squared ReLU (AVX2), residual add (AVX2)
+- [x] Zero-alloc i2s_quantize_into AVX2/AVX512 path (no Vec+memcpy per call)
+- [x] Parallel attention across heads in decode (all threads, pre-allocated scores)
+- [x] target-cpu=native via .cargo/config.toml (enables full AVX2/AVX512 codegen)
+- [x] Const-specialized three_tbl_impl_bk96 (fully unrolled inner loops)
+- [x] target_feature(enable="avx2") on tl2_gemv_tiles_cfg (enables inlining)
+- [x] BM=320 for (640,2560) K/V projections (matches bitnet.cpp)
+- [x] Work-stealing tile dispatch for all TL2 matmuls (atomic counter)
+- [x] forward_bitnet_prefill: persistent-thread prefill with parallel serial work
+- [x] Batched TL2 GEMM tiles (tl2_gemm_tiles_batched, zero-alloc per-thread)
+- [x] Parallel per-token LUT preprocessing (tl2_preprocess_token_range)
+- [x] attention_prefill_items: inline multi-token attention for persistent threads
+- [x] Parallel per-token RMSNorm/q8snap/sqrelu/sub_norms/residual_add
+- [x] Parallel RoPE + parallel KV cache copy (token-range distribution)
+- [x] Fused attention + sub_norm + LUT (eliminate B3 barrier)
+- [x] Token-parallel attention (all heads per token range, better cache locality)
+- [x] Interleaved gate+up work-stealing (54 tiles vs 27 doubled)
+- [x] Hybrid tile dispatch (work-stealing for QKV, static for O/gate+up/down)
+- [x] SIMD vectorized rescale in tl2_gemm_tiles_batched
 
 ## Build & Test
 
 ```sh
 cargo build              # build all crates
-cargo test               # run all tests (148 currently)
+cargo test               # run all tests (337 currently)
 cargo run -- --help      # see CLI options
 cargo run -- --port 8080 # start server (stub responses)
 ```
@@ -222,8 +251,8 @@ deliverable, not a follow-up task. When adding or modifying code:
 ### Running Verification
 
 ```sh
-cargo test                           # unit + property tests (307+ tests)
-cargo kani --package tempura-kernels  # Kani: bounded model checking (57 harnesses)
+cargo test                           # unit + property tests (315 tests)
+cargo kani --package tempura-kernels  # Kani: bounded model checking (61 harnesses)
 ./scripts/run-verus.sh               # Verus: deductive unbounded proofs (828 verification conditions)
 ```
 
@@ -240,8 +269,8 @@ cargo kani --package tempura-kernels  # Kani: bounded model checking (57 harness
 
 ### Coverage Summary
 
-**Kani:** 57 bounded harnesses across kernels/ and engine/ — indexing arithmetic
-for attention, RMSNorm, RoPE, matmul, sampling, turboquant, quantized (Q4K/Q6K/TQ2),
+**Kani:** 61 bounded harnesses across kernels/ and engine/ — indexing arithmetic
+for attention, RMSNorm, RoPE, matmul, sampling, turboquant, quantized (Q4K/Q6K/TQ2/I2S),
 KV cache, model, speculative, disaggregated, weights, GGUF.
 
 **Verus:** 62 modules, 828 verification conditions — 56 of 57 Kani harnesses
@@ -269,7 +298,7 @@ Verus requires a pre-built binary at `~/.local/verus/verus-x86-linux/verus`
 The `verus-verified/` crate is standalone (own toolchain, own workspace) — do NOT
 add it to the main workspace.
 
-Verus covers 56 of 57 Kani harnesses unboundedly. The 6 excluded from Verus:
+Verus covers 60 of 61 Kani harnesses unboundedly. The 6 excluded from Verus:
 - 2 restated as integer proofs: `q4k_monotonicity_within_group`, `q4k_accumulator_no_overflow`
 - 3 covered by proptest (f32/f64): `head_dim_scale_never_zero_division`,
   `int8_dequant_bounded_error`, `q4k_dequant_value_bounded`

@@ -5,6 +5,7 @@ pub mod config;
 pub mod cutile_gpu_forward;
 #[cfg(feature = "cutile")]
 pub mod cutile_kv_cache;
+pub mod deltanet_state;
 pub mod disaggregated;
 pub mod dual_pipeline;
 pub mod gguf_loader;

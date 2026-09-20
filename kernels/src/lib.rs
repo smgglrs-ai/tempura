@@ -1,5 +1,5 @@
 pub use tempura_kernel_api::{
-    AllReduce, Attention, AttentionMode, CompressedKV, Dequantize, GuidedDecoder, KernelError, KvCacheCompressor,
+    AllReduce, Attention, AttentionMode, CompressedKV, DeltaNet, Dequantize, GuidedDecoder, KernelError, KvCacheCompressor,
     LayerNorm, MatMul, MatMulQ, QuantDtype, QuantizedTensor, RMSNorm, Result, RoPE, Sampler,
     SamplingParams, VerificationTier, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE,
     Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, Q6K_GROUPS, Q6K_GROUP_SIZE,
@@ -10,7 +10,10 @@ pub use tempura_kernel_api::{
 pub mod activations;
 pub mod ggml;
 pub mod portable_math;
+pub mod thread_pool;
+pub mod tl2;
 pub mod allreduce;
+pub mod deltanet;
 pub mod attention;
 pub mod dispatch;
 pub mod fused;
@@ -40,6 +43,8 @@ pub mod matmul;
 pub mod moe;
 #[cfg(any(feature = "npu-intel", feature = "npu-qualcomm"))]
 pub mod npu;
+pub mod f16_gemv;
+#[allow(dead_code)]
 pub mod quantized;
 pub mod rmsnorm;
 pub mod rope;

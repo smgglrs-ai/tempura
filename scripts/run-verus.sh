@@ -229,6 +229,8 @@ MODULES=(
     mma_fragments
     sampling_chain
     activations_moe
+    tl2_lut
+    f16_gemv
 )
 
 TOTAL_VERIFIED=0

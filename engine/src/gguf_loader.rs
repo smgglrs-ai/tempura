@@ -43,7 +43,8 @@ pub enum GgmlType {
     BF16 = 30,
     TQ1_0 = 36,  // upstream llama.cpp: base-3 ternary; bitnet.cpp: I2_S (2-bit ternary, no scale)
     TQ2_0 = 37,
-    I2S = 39,    // bitnet.cpp proprietary: GGML_TYPE_I2_S = 39 (2-bit ternary, same block layout as TQ2_0)
+    TL1 = 38,    // bitnet.cpp: ARM TL1 LUT format
+    I2S = 39,    // bitnet.cpp: x86 TL2/I2_S LUT format (2-bit ternary)
 }
 
 impl GgmlType {
@@ -64,6 +65,7 @@ impl GgmlType {
             30 => Ok(GgmlType::BF16),
             36 => Ok(GgmlType::TQ1_0),
             37 => Ok(GgmlType::TQ2_0),
+            38 => Ok(GgmlType::TL1),
             39 => Ok(GgmlType::I2S),
             _ => Err(LoadError::GgufParse(format!("unsupported GGML type: {v}"))),
         }
@@ -270,7 +272,11 @@ fn tensor_data_size(dtype: GgmlType, num_elements: u64, dims: &[u64]) -> u64 {
             num_elements / 4 + 4
         }
         GgmlType::TQ2_0 => (num_elements / 256) * 66,
-        // bitnet.cpp I2_S: 2-bit packed (ne/4 bytes) + one f32 scale per tensor
+        GgmlType::TL1 => {
+            // ARM TL1 LUT format: 2-bit packed + 32-byte alignment
+            num_elements / 4 + 32
+        }
+        // bitnet.cpp I2_S/TL2: 2-bit packed (ne/4 bytes) + one f32 scale per tensor
         GgmlType::I2S => num_elements / 4 + 4,
     }
 }
@@ -294,6 +300,8 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "attn_k.weight" => "self_attn.k_proj.weight",
             "attn_v.weight" => "self_attn.v_proj.weight",
             "attn_output.weight" => "self_attn.o_proj.weight",
+            "attn_qkv.weight" => "ssm.qkv_proj.weight",
+            "attn_gate.weight" => "ssm.gate_proj.weight",
             "attn_q_norm.weight" => "self_attn.q_norm.weight",
             "attn_k_norm.weight" => "self_attn.k_norm.weight",
             "ffn_gate.weight" => "mlp.gate_proj.weight",
@@ -301,6 +309,17 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "ffn_down.weight" => "mlp.down_proj.weight",
             "ffn_sub_norm.weight" => "mlp.ffn_sub_norm.weight",
             "attn_sub_norm.weight" => "self_attn.attn_sub_norm.weight",
+            "ssm_in.weight" => "ssm.in_proj.weight",
+            "ssm_out.weight" => "ssm.out_proj.weight",
+            "ssm_conv1d.weight" => "ssm.conv1d.weight",
+            "ssm_conv1d.bias" => "ssm.conv1d.bias",
+            "ssm_dt.weight" => "ssm.dt_proj.weight",
+            "ssm_dt.bias" => "ssm.dt_proj.bias",
+            "ssm_a" => "ssm.A_log",
+            "ssm_norm.weight" => "ssm.norm.weight",
+            "ssm_beta_alpha.weight" => "ssm.beta_alpha.weight",
+            "ssm_alpha.weight" => "ssm.alpha.weight",
+            "ssm_beta.weight" => "ssm.beta.weight",
             _ => return None,
         };
         return Some(format!("model.layers.{n}.{hf_suffix}"));
@@ -382,6 +401,80 @@ fn get_usize_from_meta(metadata: &HashMap<String, GgufValue>, suffix: &str) -> O
         }
     }
     None
+}
+
+fn detect_and_apply_hybrid_layers(
+    config: &mut ModelConfig,
+    tensor_names: &[&str],
+    metadata: &HashMap<String, GgufValue>,
+) {
+    use crate::config::LayerKind;
+
+    let arch = metadata
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+        .unwrap_or("llama");
+
+    // Primary detection: full_attention_interval metadata (Qwen3.5/3.6)
+    let interval = metadata
+        .get(&format!("{arch}.full_attention_interval"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| metadata.get("full_attention_interval").and_then(|v| v.as_u64()));
+
+    if let Some(interval) = interval {
+        let interval = interval as usize;
+        let mut kinds = Vec::with_capacity(config.num_layers);
+        for layer in 0..config.num_layers {
+            if (layer + 1) % interval == 0 {
+                kinds.push(LayerKind::Attention);
+            } else {
+                kinds.push(LayerKind::DeltaNet);
+            }
+        }
+        config.layer_kinds = Some(kinds);
+    } else {
+        // Fallback: scan tensor names for ssm_alpha (DeltaNet marker)
+        let has_ssm = tensor_names.iter().any(|n| n.contains("ssm_alpha") || n.contains("ssm.alpha"));
+        if !has_ssm {
+            return;
+        }
+
+        let mut kinds = Vec::with_capacity(config.num_layers);
+        for layer in 0..config.num_layers {
+            let ssm_key = format!("blk.{layer}.ssm_alpha.weight");
+            let ssm_key_hf = format!("model.layers.{layer}.ssm.alpha.weight");
+            let has_ssm_layer = tensor_names.iter().any(|n| *n == ssm_key || *n == ssm_key_hf);
+
+            if has_ssm_layer {
+                kinds.push(LayerKind::DeltaNet);
+            } else {
+                kinds.push(LayerKind::Attention);
+            }
+        }
+
+        if kinds.iter().all(|k| *k == LayerKind::Attention) {
+            return;
+        }
+        config.layer_kinds = Some(kinds);
+    }
+
+    // SSM dimensions from metadata
+    config.deltanet_num_heads = metadata
+        .get(&format!("{arch}.ssm.time_step_rank"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .or(Some(config.num_kv_heads));
+
+    config.deltanet_head_dim = metadata
+        .get(&format!("{arch}.ssm.state_size"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .or(Some(config.head_dim));
+
+    config.ssm_a = metadata
+        .get(&format!("{arch}.ssm.time_step_a"))
+        .and_then(|v| v.as_f32())
+        .or_else(|| metadata.get("ssm.time_step_a").and_then(|v| v.as_f32()));
 }
 
 pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConfig, LoadError> {
@@ -524,6 +617,11 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
             .get(&format!("{arch}.attention.logit_softcapping"))
             .and_then(|v| v.as_f32()),
         embedding_scale: matches!(architecture, crate::config::Architecture::Gemma),
+        layer_kinds: None,
+        deltanet_num_heads: None,
+        deltanet_head_dim: None,
+        ssm_a: None,
+        dt_bias: None,
     })
 }
 
@@ -545,18 +643,28 @@ fn convert_ggml_type(dtype: GgmlType) -> tempura_kernels::ggml::GgmlType {
         GgmlType::BF16 => GT::BF16,
         GgmlType::TQ1_0 => GT::TQ1_0,
         GgmlType::TQ2_0 => GT::TQ2_0,
-        // Map I2_S (bitnet.cpp type 39) to TQ1_0 dequant — same 2-bit ternary encoding
+        GgmlType::TL1 => GT::TQ1_0,
+        // Map I2_S/TL2 (bitnet.cpp type 39) to TQ1_0 dequant — same 2-bit ternary encoding
         GgmlType::I2S => GT::TQ1_0,
     }
 }
 
-#[derive(Debug)]
 pub struct GgufLoader {
+    mmap: Option<memmap2::Mmap>,
     tensors: HashMap<String, Vec<f32>>,
     raw_tensors: HashMap<String, Vec<u8>>,
+    raw_tensor_dims: HashMap<String, Vec<u64>>,
     tensor_dtypes: HashMap<String, GgmlType>,
+    f16_raw_tensors: HashMap<String, Vec<u8>>,
+    mmap_ranges: HashMap<String, (usize, usize, GgmlType)>,
     pub config: ModelConfig,
     pub metadata: HashMap<String, GgufValue>,
+}
+
+impl std::fmt::Debug for GgufLoader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GgufLoader").field("config", &self.config).finish_non_exhaustive()
+    }
 }
 
 impl GgufLoader {
@@ -566,8 +674,11 @@ impl GgufLoader {
     }
 
     pub fn from_file_quantized(path: &Path) -> Result<Self, LoadError> {
-        let data = std::fs::read(path)?;
-        Self::from_bytes_quantized(&data)
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let mut loader = Self::from_bytes_quantized(&mmap)?;
+        loader.mmap = Some(mmap);
+        Ok(loader)
     }
 
     fn from_bytes_quantized(data: &[u8]) -> Result<Self, LoadError> {
@@ -634,7 +745,10 @@ impl GgufLoader {
 
         let mut tensors = HashMap::new();
         let mut raw_tensors = HashMap::new();
+        let mut raw_tensor_dims: HashMap<String, Vec<u64>> = HashMap::new();
         let mut tensor_dtypes = HashMap::new();
+        let mut f16_raw_tensors: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut mmap_ranges: HashMap<String, (usize, usize, GgmlType)> = HashMap::new();
 
         for (i, info) in tensor_infos.iter().enumerate() {
             let num_elements: u64 = info.dims.iter().product();
@@ -654,16 +768,28 @@ impl GgufLoader {
 
             let is_quantized = !matches!(info.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
             // I2S (bitnet.cpp type 39) has no matching GPU quantized kernel yet — dequantize to f32.
-            let force_dequant = matches!(info.dtype, GgmlType::I2S);
+            // TL1 (type 38, ARM LUT format) also dequantized via TQ1_0 path.
+            let force_dequant = matches!(info.dtype, GgmlType::I2S | GgmlType::TL1);
             let keep_raw = is_quantized
                 && !force_dequant
                 && !mapped_name.contains("embed_tokens")
                 && !mapped_name.contains("norm.weight");
 
-            if !keep_raw {
+            if info.dtype == GgmlType::F16 {
+                mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, GgmlType::F16));
+            }
+
+            let skip_f32 = info.dtype == GgmlType::F16;
+
+            let use_mmap = keep_raw && info.dtype == GgmlType::TQ1_0;
+            if use_mmap {
+                mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, info.dtype));
+            }
+
+            if !keep_raw && !skip_f32 {
                 let ggml_type = convert_ggml_type(info.dtype);
-                // For I2S: safe decode — use zeros if data is too short for TQ1_0.
-                let floats = if info.dtype == GgmlType::I2S {
+                // For I2S/TL1: safe decode — use zeros if data is too short for TQ1_0.
+                let floats = if matches!(info.dtype, GgmlType::I2S | GgmlType::TL1) {
                     let nb = ne / 256;
                     if ne % 256 == 0 && tensor_data.len() >= nb * 54 {
                         let mut buf = vec![0.0f32; ne];
@@ -680,8 +806,9 @@ impl GgufLoader {
                     buf
                 };
                 tensors.insert(mapped_name.clone(), floats);
-            } else {
+            } else if !use_mmap && !skip_f32 {
                 raw_tensors.insert(mapped_name.clone(), tensor_data.to_vec());
+                raw_tensor_dims.insert(mapped_name.clone(), info.dims.clone());
             }
             tensor_dtypes.insert(mapped_name.clone(), info.dtype);
         }
@@ -689,7 +816,10 @@ impl GgufLoader {
         let vocab_size_from_embed = tensors.get("model.embed_tokens.weight").map(|t| {
             let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
             t.len().checked_div(hidden).unwrap_or(0)
-        });
+        }).or_else(|| f16_raw_tensors.get("model.embed_tokens.weight").map(|t| {
+            let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
+            (t.len() / 2).checked_div(hidden).unwrap_or(0)
+        }));
 
         let mut config = extract_config(&metadata)?;
         if let Some(vs) = vocab_size_from_embed {
@@ -699,17 +829,43 @@ impl GgufLoader {
         }
         config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
 
-        if !tensors.contains_key("lm_head.weight") && !raw_tensors.contains_key("lm_head.weight") {
-            if let Some(embed) = tensors.get("model.embed_tokens.weight") {
+        {
+            let all_names: Vec<String> = tensors.keys()
+                .chain(raw_tensors.keys())
+                .chain(f16_raw_tensors.keys())
+                .chain(mmap_ranges.keys())
+                .cloned()
+                .collect();
+            detect_and_apply_hybrid_layers(
+                &mut config,
+                &all_names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                &metadata,
+            );
+        }
+
+        if !tensors.contains_key("lm_head.weight") && !raw_tensors.contains_key("lm_head.weight")
+            && !f16_raw_tensors.contains_key("lm_head.weight")
+            && !mmap_ranges.contains_key("lm_head.weight") {
+            if let Some(&(off, len, dtype)) = mmap_ranges.get("model.embed_tokens.weight") {
+                mmap_ranges.insert("lm_head.weight".into(), (off, len, dtype));
+                tensor_dtypes.insert("lm_head.weight".into(), GgmlType::F16);
+            } else if let Some(f16_raw) = f16_raw_tensors.get("model.embed_tokens.weight") {
+                f16_raw_tensors.insert("lm_head.weight".into(), f16_raw.clone());
+                tensor_dtypes.insert("lm_head.weight".into(), GgmlType::F16);
+            } else if let Some(embed) = tensors.get("model.embed_tokens.weight") {
                 tensors.insert("lm_head.weight".into(), embed.clone());
                 tensor_dtypes.insert("lm_head.weight".into(), GgmlType::F32);
             }
         }
 
         Ok(Self {
+            mmap: None,
             tensors,
             raw_tensors,
+            raw_tensor_dims,
             tensor_dtypes,
+            f16_raw_tensors,
+            mmap_ranges,
             config,
             metadata,
         })
@@ -809,10 +965,8 @@ impl GgufLoader {
             let ne = num_elements as usize;
 
             let ggml_type = convert_ggml_type(info.dtype);
-            // For I2S (bitnet.cpp proprietary type 39): the block layout differs from TQ1_0.
-            // Attempt TQ1_0 decode only if we have enough bytes; otherwise store zeros so that
-            // GPU timing benchmarks still run (output is numerically wrong but structurally valid).
-            let floats = if info.dtype == GgmlType::I2S {
+            // For I2S/TL1 (bitnet.cpp types 38-39): attempt TQ1_0 decode if we have enough bytes.
+            let floats = if matches!(info.dtype, GgmlType::I2S | GgmlType::TL1) {
                 let tq1_0_block_size = 54usize;
                 let nb = ne / 256;
                 if tensor_data.len() >= nb * tq1_0_block_size && ne % 256 == 0 {
@@ -822,7 +976,6 @@ impl GgufLoader {
                     );
                     buf
                 } else {
-                    // Insufficient data for TQ1_0 decode — use zeros (timing placeholder).
                     vec![0.0f32; ne]
                 }
             } else {
@@ -851,10 +1004,20 @@ impl GgufLoader {
 
         config.use_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
 
+        detect_and_apply_hybrid_layers(
+            &mut config,
+            &tensors.keys().map(|s| s.as_str()).collect::<Vec<_>>(),
+            &metadata,
+        );
+
         Ok(Self {
+            mmap: None,
             tensors,
             raw_tensors,
+            raw_tensor_dims: HashMap::new(),
             tensor_dtypes,
+            f16_raw_tensors: HashMap::new(),
+            mmap_ranges: HashMap::new(),
             config,
             metadata,
         })
@@ -870,16 +1033,50 @@ impl GgufLoader {
             if let Some(f32_data) = self.tensors.get(name) {
                 f32_tensors.insert(name.clone(), f32_data.clone());
             } else if let Some(raw) = self.raw_tensors.get(name) {
-                let ggml_type = self.to_ggml_type(*dtype);
-                typed_tensors.insert(name.clone(), (ggml_type, raw.clone()));
+                if !self.mmap_ranges.contains_key(name) {
+                    let ggml_type = convert_ggml_type(*dtype);
+                    typed_tensors.insert(name.clone(), (ggml_type, raw.clone()));
+                }
             }
         }
 
-        crate::weights::QuantizedWeights::new_typed(typed_tensors, f32_tensors)
-    }
+        for (name, data) in &self.f16_raw_tensors {
+            f32_tensors.entry(name.clone()).or_insert_with(|| {
+                let count = data.len() / 2;
+                (0..count).map(|i| {
+                    let bits = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+                    {
+                        let sign = ((bits >> 15) & 1) as u32;
+                        let exp = ((bits >> 10) & 0x1f) as u32;
+                        let frac = (bits & 0x3ff) as u32;
+                        if exp == 0 { f32::from_bits(sign << 31) }
+                        else if exp == 31 { f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13)) }
+                        else { f32::from_bits((sign << 31) | ((exp + 112) << 23) | (frac << 13)) }
+                    }
+                }).collect()
+            });
+        }
 
-    fn to_ggml_type(&self, dtype: GgmlType) -> tempura_kernels::ggml::GgmlType {
-        convert_ggml_type(dtype)
+        let mut qw = crate::weights::QuantizedWeights::new_typed(typed_tensors, f32_tensors);
+
+        // Build LUT-format (transposed) I2S/TQ1_0 tensors for the shuffle-based kernel
+        let mut i2s_shapes = std::collections::HashMap::new();
+        for (name, dtype) in &self.tensor_dtypes {
+            if matches!(dtype, GgmlType::TQ1_0 | GgmlType::I2S | GgmlType::TL1) {
+                if let Some(info) = self.raw_tensor_dims.get(name) {
+                    if info.len() >= 2 {
+                        i2s_shapes.insert(name.clone(), (info[1] as usize, info[0] as usize));
+                    }
+                }
+            }
+        }
+        if !i2s_shapes.is_empty() {
+            if std::env::var("TEMPURA_NO_TL2").is_err() {
+                qw.build_tl2_from_i2s(&i2s_shapes);
+            }
+        }
+
+        qw
     }
 
     pub fn tensor_dtype(&self, name: &str) -> Option<GgmlType> {

@@ -486,6 +486,37 @@ impl MatMulQ for CutileQuantizedGemm {
         let b_f32 = dequant_weights_i2s(b_quantized, n, k);
         cutile_gemm_bt(&self.stream, a, &b_f32, output, m, n, k)
     }
+
+    fn forward_i2s_preq(
+        &self,
+        preq_q8: &[i8],
+        preq_scale: f32,
+        preq_sum: i32,
+        b_quantized: &[u8],
+        output: &mut [f32],
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        // Fall back to CPU I2S preq path for now
+        let a_f32: Vec<f32> = preq_q8.iter().map(|&x| x as f32 * preq_scale).collect();
+        let _ = preq_sum;
+        let b_f32 = dequant_weights_i2s(b_quantized, n, k);
+        cutile_gemm_bt(&self.stream, &a_f32, &b_f32, output, 1, n, k)
+    }
+
+    fn forward_i2s_lut(
+        &self,
+        a: &[f32],
+        b_transposed: &[u8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        // Fall back to dequant + GEMM for now
+        let b_f32 = dequant_weights_i2s(b_transposed, n, k);
+        cutile_gemm_bt(&self.stream, a, &b_f32, output, m, n, k)
+    }
 }
 
 #[cfg(test)]

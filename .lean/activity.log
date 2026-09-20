@@ -1,3 +1,90 @@
+- timestamp: "2026-07-02T13:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-refinement"
+  summary: >
+    Added native TL2 GGUF support: GGML_TYPE_TL2 (dtype 39) and TL1 (dtype 38)
+    detection in GGUF loader, Tl2Tensor struct with dimension metadata + extracted
+    scale, runtime dispatch in both forward_bitnet_decode and forward_quantized
+    (TL2 → I2S fallback). Added Tl2Config::for_dims() with auto BM selection and
+    tl2_forward() top-level dispatch. Patched bitnet.cpp converter to handle
+    BitNetForCausalLM architecture, converted model to TL2 format. TL2 GGUF loads
+    and dispatches to TL2 kernel but produces wrong output — converter tiling
+    parameters (bmm/by) need alignment with kernel expectations. I2S path unchanged
+    and verified: coherent output, ~19 tok/s, 326 tests passing.
+
+- timestamp: "2026-07-02T12:30:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-refinement"
+  summary: >
+    BitNet pure translation audit + fix session. Diagnosed and fixed forward_bitnet_decode
+    "correctness bug" — root cause was forward_quantized using CpuRMSNorm (f32) for
+    attn_sub_norm/ffn_sub_norm while forward_bitnet_decode correctly used CpuRMSNormGgml
+    (f64, matching ggml.c). Error compounded across layers (0.66 max_diff over 3 layers).
+    Fixed forward_quantized to use det_rmsnorm for sub-norms. Re-enabled forward_bitnet_decode
+    dispatch. Cleaned up duplicate buffer declarations and n_threads computation. Added
+    comparison test (test_bitnet_decode_matches_quantized). Line-by-line kernel audit via
+    3 parallel agents: i2s_quantize_into matches ggml-quants.c, vec_dot_i2_i8_s_avx2 matches
+    ggml-bitnet-mad.cpp, tl2.rs matches bitnet-lut-kernels-tl2.h — zero divergences across
+    all three. TL2 wiring deferred: model uses I2S format (ggml-model-i2_s.gguf), not TL2.
+    In bitnet.cpp these are separate compile-time paths with different GGUF formats. 326 tests
+    passing (171 engine + 111 kernels + 44 other).
+
+- timestamp: "2026-06-30T21:15:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-refinement"
+  summary: >
+    BitNet refinement complete. Added 4 I2S unit tests, 4 I2S Kani harnesses,
+    1 BitNet e2e forward pass test (314 tests, 61 Kani harnesses).
+    Validated against microsoft/bitnet-b1.58-2B-4T-gguf (ggml-model-i2_s.gguf):
+    loaded 1.2GB I2S model, extracted tokenizer from GGUF metadata,
+    tested 4 prompts — all produce coherent, factually correct output
+    ("2+2=4", transformer definition, haiku, prime numbers).
+    CPU inference ~1.5 tok/s (scalar). Added AVX2 vec_dot_i2_i8_s_avx2
+    (maddubs), AVX2 quantize_row_i8_s_avx2, and rayon-parallel matmul
+    in CpuMatMulQ4KOpt::forward_b_transposed_i2s. Result: ~17 tok/s
+    (11x speedup). Added test_i2s_avx2_matches_scalar correctness test.
+    315 tests passing. Phase 12: 6/7 items done, only TQ2 GPU kernel remaining.
+
+    Validated against bitnet.cpp on same hardware: bitnet.cpp 42.7 tok/s (8 threads),
+    tempura 17 tok/s (maddubs+AVX2+rayon). Gap is algorithmic: bitnet.cpp uses
+    LUT-based dot product (precompute activation pair sums, use weight nibbles as
+    shuffle indices). Translated the LUT approach to Rust:
+    - i2s_build_pair_lut: 16-entry i16 LUT per activation pair
+    - vec_dot_i2_i8_s_lut_scalar: scalar LUT-based dot product
+    - transpose_i2s_weights: column-major weight layout for cache-friendly access
+    - forward_i2s_lut: trait method + impls on CpuMatMulQ4K/Q4KOpt
+    - Wired into GGUF loader (auto-transpose at load time) and model forward pass
+    LUT correctness verified (matches maddubs to <0.01). 317 tests passing.
+    Implemented three AVX2 LUT variants:
+    (a) i8 LUT (63-scale) + cmpgt sign-extend per position: 10.2 tok/s
+    (b) i16 pre-split lo/hi byte LUT (127-scale) + 4 shuffles per position: 6.7 tok/s
+    (c) Scalar LUT fallback: ~8 tok/s
+    All three are slower than maddubs (17 tok/s) due to per-position LUT load
+    overhead — each byte position loads 32-64 bytes of LUT tables from memory.
+    bitnet.cpp's speed (42.7 tok/s) comes from BM=160 tiled layout where weights
+    are pre-loaded in registers and shared across many output rows. Our transposed
+    layout processes 32 columns at once but thrashes L1 with per-position LUT loads.
+    Reverted production path to maddubs; LUT infrastructure (trait, tests, transpose)
+    retained for future tiled kernel implementation. 317 tests, all passing.
+
+    Translated bitnet.cpp's threading model to Rust:
+    - TL2 kernel (tl2.rs): per_tensor_quant, three/two_lut_ctor, three/two_tbl_impl,
+      preprocessor, qgemm_lut — direct translation of codegen_tl2.py output
+    - SpinBarrier from ggml_barrier (atomic counter spin)
+    - PersistentPool: condvar-based, per-worker generation tracking, ~2μs wake
+    - forward_bitnet_decode: dedicated BitNet decode path with persistent pool
+      per-matmul, pre-allocated i8 quantization buffers (zero Vec allocs per token)
+    - i2s_quantize_into: write quantized i8 into pre-allocated buffer
+    - i2s_gemv_cols: public column-range GEMV for thread-level slicing
+    - Wired into GpuQuantizedInferenceWrapper::forward() server dispatch
+    - Microbenchmark: dot product at 42.8 tok/s (matches bitnet.cpp exactly)
+    - End-to-end: 19.0 tok/s (bitnet.cpp: 42.7 with 8 threads, 27.3 single-threaded)
+    - Gap is condvar wake cost per matmul (~2μs × 210 = 0.4ms) plus DRAM bandwidth
+    - 325 tests passing, correct output verified
+
 - timestamp: "2026-06-14T22:56:08+02:00"
   actor: "Fabien Dupont"
   action: commit
@@ -1312,6 +1399,134 @@
   actor: claude
   action: tech-watch
   summary: "11 inference sources via deep-research. Key finding: DFlash block-diffusion (3-6x honest speedup, ICML 2026) is best candidate for tempura speculative decoding. DSpark corrected — GPU-based not ASIC, 1.6-1.85x not 60-85%. DFlash+KV quantization gap is differentiation opportunity. llm-d (CNCF) orchestrates above model servers — complementary, not competitive."
+- timestamp: "2026-07-16T12:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-prefill-optimization"
+  summary: >
+    Persistent-thread prefill: forward_bitnet_prefill with SpinBarrier,
+    work-stealing GEMM, parallel per-token serial work (RMSNorm/q8snap/LUT/
+    sqrelu_mul/sub_norms/residual_add). New kernels: BatchedTl2Lut::new_for,
+    tl2_preprocess_token_range, tl2_gemm_tiles_batched, attention_prefill_items.
+    pp42: 178ms→130ms (332 tok/s, +43%), gap to bitnet.cpp -34% (was -57%).
+    tg128: 42.4 tok/s (bitnet.cpp 43.4, -2%). 348 tests passing, zero warnings.
+    Also uses ggml-compatible CpuRoPEGgml for prefill (matching decode path).
+- timestamp: "2026-07-16T16:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-prefill-optimization-2"
+  summary: >
+    Second prefill optimization pass: parallel RoPE across threads,
+    parallel KV cache copy, fused attention+sub_norm+LUT (eliminate B3
+    barrier), token-parallel attention distribution (better cache locality),
+    interleaved gate+up work-stealing. Comprehensive per-phase profiling
+    reveals gate+up GEMM (34%) and down-proj (19%) dominate layer time;
+    GEMM kernel compute is near AVX2 hardware limits. Barrier count reduced
+    from 12 to 10 per layer. pp42: 125ms (335 tok/s, gap -29% vs bitnet.cpp
+    473). Decode: 42 tok/s (bitnet.cpp 44, -5%). 348 tests, zero warnings.
+    Remaining gap is structural: 10 barriers/layer vs ggml graph-level threading.
+- timestamp: "2026-07-16T20:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-graph-executor"
+  summary: >
+    Graph-level executor: static tile assignment for O-proj/gate+up/down
+    GEMMs (eliminates atomic tile counter contention + improves cache
+    locality), hybrid work-stealing for QKV (12 tiles / 8 threads needs
+    dynamic balancing). SIMD vectorized rescale. Per-phase profiling
+    confirms gate+up GEMM (34%) and down-proj (19%) dominate; kernel
+    compute at ~85% AVX2 throughput. Remaining gap is structural barrier
+    wait (~670μs/layer from 10 barriers). pp42: 116ms (362 tok/s,
+    bitnet.cpp 521, gap -31%, was -57% at session start). Decode: 42.4
+    tok/s (bitnet.cpp 43.7, -3%). 348 tests, zero warnings.
+- timestamp: "2026-07-16T23:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-prefill-larger-prompts"
+  summary: >
+    Larger prompt benchmarks reveal widening gap: pp42 -33%, pp92 -45%,
+    pp182 -56%, pp362 -64%. Root cause identified by reading bitnet.cpp
+    source: compile-time template batch size specialization ({1,8,32,128,
+    256,512}) enables full loop unrolling in C++. Our runtime batch_size
+    prevents compiler optimization. Attempted hierarchical batch decomposition
+    (32+8+1 chunks matching bitnet.cpp's pattern) — slower due to repeated
+    weight loading without template-level optimization. Reverted to full-batch.
+    Also discovered bitnet.cpp's kernel output loop appears to overwrite
+    batch elements in the three-part rescale, but verified output is correct
+    via llama-cli comparison. Next: const-generic inner kernel specialization.
+- timestamp: "2026-07-16T24:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-const-generic-experiment"
+  summary: >
+    Implemented const-generic batch specialization for three_tbl_impl_bk96
+    and two_tbl_impl (Rust equivalent of bitnet.cpp's C++ templates).
+    Result: no improvement — Rust compiler already generates good loop code
+    for runtime batch_size. The dispatch wrapper actually HURT decode perf
+    (42→33 tok/s). Reverted. Also tested hierarchical batch decomposition
+    (32+8+1 chunks) — slower due to repeated weight loading overhead without
+    compiler-level unrolling benefit. The remaining gap to bitnet.cpp at
+    larger prompts is likely from C++ compiler's more aggressive SIMD
+    scheduling and #pragma unroll behavior, not from loop bound knowledge.
+    Current state: pp42 355 tok/s (-31%), decode 42 tok/s (-3%).
+- timestamp: "2026-07-17T02:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-llvm-unrolling"
+  summary: >
+    Discovered LLVM fully unrolls batch loops when BS literal ≤10 (verified
+    via assembly analysis: BS=8 → 32 vpshufb, 0 inner loops; BS=32 → 8
+    vpshufb, inner loop with 2× partial unroll). Implemented BS=16+8+1
+    hierarchical chunking in tl2_gemm_tiles_batched — each call to
+    three_tbl_impl_bk96 with literal batch_size gets cache-friendly
+    working set (8×320×4=10KB cbits fits L1). Result: pp42 41ms
+    (1012 tok/s, 2.2× faster than bitnet.cpp 465!). Longer prompts
+    still gap: pp242 581ms (417 tok/s, bitnet.cpp 604, -31%),
+    pp482 2213ms (218 tok/s, bitnet.cpp 496, -56%). Gap at long
+    prompts is from chunk overhead (weight reloading per chunk) —
+    bitnet.cpp uses BS=256 template with #pragma unroll. 348 tests.
+- timestamp: "2026-07-17T04:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-cache-analysis"
+  summary: >
+    Deep analysis of bitnet.cpp vs tempura TL2 kernel: both use identical
+    runtime batch loops (no unrolling for BS>10 in either compiler).
+    bitnet.cpp uses -march=native → AVX-512 for non-LUT ops (6927 zmm instrs
+    in libggml.so), but LUT kernel is pure AVX2. Template function sizes
+    identical (1434 bytes) for BS=32/128/256/512 — confirms no unrolling.
+    Our BS=16+8+1 chunking keeps cbits in L1 (48KB per core on this Zen 5),
+    giving 2× advantage at pp42 but losing at pp256+ from weight reload
+    overhead. Attempted per-chunk zeroing — regressed due to sub-slice
+    overhead. Kept BS=16+8+1 approach. Final: pp42 909 tok/s (+106% vs
+    bitnet.cpp 441), pp122 625 (+20%), pp242 401 (-30%), tg128 33 (-4%).
+- timestamp: "2026-07-17T05:00:00Z"
+  actor: claude
+  action: session-work
+  item: "bitnet-adaptive-chunking"
+  summary: >
+    Increased primary chunk size from BS=16 to BS=32 (40KB cbits fits
+    48KB L1d). Halves weight-reload count for longer prompts. Results:
+    pp42 42ms (990 tok/s, +124% vs bitnet.cpp), pp122 170ms (718, +38%),
+    pp242 597ms (405, -29%), pp482 2200ms (219, -54%). Short/medium
+    prompts decisively faster than bitnet.cpp through L1-resident cbits.
+    Long-prompt gap from chunk weight-reloading overhead. Decode 38 tok/s.
+    Next: AVX-512 for non-LUT ops (RMSNorm, RoPE, attention) — this CPU
+    has full AVX-512 and bitnet.cpp uses it (6927 zmm instrs in ggml.so).
+
+- timestamp: "2026-07-21T11:00:00+02:00"
+  actor: claude
+  action: implementation
+  summary: >
+    Hybrid KV cache + Gated DeltaNet implementation on hybrid-kv-deltanet
+    branch (7 commits off bitnet-refinement). TurboQuant: group_size 2→32,
+    incremental compress_append, Kani+Verus proofs. DeltaNet: kernel trait,
+    CpuDeltaNet (gated delta rule), Kani+Verus proofs. Hybrid infra:
+    LayerKind enum, DeltaNetState, cache_layer_map, GGUF SSM detection.
+    Full Qwen3.6 DeltaNet pipeline: in_proj→conv1d→SiLU→L2norm→beta_alpha→
+    recurrence→ssm_norm→Z-gating→out_proj. 310 tests pass. Qwen3.6-27B
+    IQ2_M GGUF downloading for validation. Motivated by PrismML Bonsai 27B
+    (ternary 27B on phones, KV cache is the memory bottleneck).
 - timestamp: "2026-09-18T00:00:00Z"
   actor: claude
   action: session-work

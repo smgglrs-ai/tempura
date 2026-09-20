@@ -3,6 +3,23 @@ use std::collections::HashMap;
 use crate::config::ModelConfig;
 use crate::loader::{LoadError, WeightLoader};
 
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+    if exp == 0 {
+        if frac == 0 { return f32::from_bits(sign << 31); }
+        let mut e = 1u32;
+        let mut f = frac;
+        while f & 0x400 == 0 { f <<= 1; e += 1; }
+        f32::from_bits((sign << 31) | ((127 - 15 + 1 - e) << 23) | ((f & 0x3ff) << 13))
+    } else if exp == 31 {
+        f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13))
+    } else {
+        f32::from_bits((sign << 31) | ((exp + 112) << 23) | (frac << 13))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WeightsError {
     #[error("missing required tensor: {0}")]
@@ -216,14 +233,32 @@ impl ModelWeights {
     }
 }
 
+/// Transpose I2S weights from row-major to column-major by byte position.
+///
+/// Original: row j has bytes [0..k/4). Row j byte b at offset j*(k/4)+b.
+/// Transposed: byte position b has n rows contiguous. Position b row j at offset b*n+j.
+/// The per-tensor f32 scale is preserved at the end.
+
 #[derive(Debug)]
+pub struct Tl2Tensor {
+    pub data: Vec<u8>,
+    pub m: usize,
+    pub k: usize,
+    pub scale: f32,
+}
+
 pub struct QuantizedWeights {
     q4k_tensors: HashMap<String, Vec<u8>>,
     q6k_tensors: HashMap<String, Vec<u8>>,
     tq2_tensors: HashMap<String, Vec<u8>>,
     i2s_tensors: HashMap<String, Vec<u8>>,
+    tl2_tensors: HashMap<String, Tl2Tensor>,
+    f16_tensors: HashMap<String, Vec<u8>>,
     f32_tensors: HashMap<String, Vec<f32>>,
     typed_tensors: HashMap<String, (tempura_kernels::ggml::GgmlType, Vec<u8>)>,
+    mmap: Option<memmap2::Mmap>,
+    mmap_i2s: HashMap<String, (usize, usize)>,
+    mmap_f16: HashMap<String, (usize, usize)>,
 }
 
 impl QuantizedWeights {
@@ -237,8 +272,13 @@ impl QuantizedWeights {
             q6k_tensors,
             tq2_tensors: HashMap::new(),
             i2s_tensors: HashMap::new(),
+            tl2_tensors: HashMap::new(),
+            f16_tensors: HashMap::new(),
             f32_tensors,
             typed_tensors: HashMap::new(),
+            mmap: None,
+            mmap_i2s: HashMap::new(),
+            mmap_f16: HashMap::new(),
         }
     }
 
@@ -253,9 +293,14 @@ impl QuantizedWeights {
             q4k_tensors,
             q6k_tensors,
             tq2_tensors,
+            tl2_tensors: HashMap::new(),
+            f16_tensors: HashMap::new(),
             i2s_tensors,
             f32_tensors,
             typed_tensors: HashMap::new(),
+            mmap: None,
+            mmap_i2s: HashMap::new(),
+            mmap_f16: HashMap::new(),
         }
     }
 
@@ -283,6 +328,11 @@ impl QuantizedWeights {
             i2s_tensors,
             f32_tensors,
             typed_tensors,
+            tl2_tensors: HashMap::new(),
+            f16_tensors: HashMap::new(),
+            mmap: None,
+            mmap_i2s: HashMap::new(),
+            mmap_f16: HashMap::new(),
         }
     }
 
@@ -292,8 +342,13 @@ impl QuantizedWeights {
             q6k_tensors: HashMap::new(),
             tq2_tensors: HashMap::new(),
             i2s_tensors: HashMap::new(),
+            tl2_tensors: HashMap::new(),
+            f16_tensors: HashMap::new(),
             f32_tensors: HashMap::new(),
             typed_tensors: HashMap::new(),
+            mmap: None,
+            mmap_i2s: HashMap::new(),
+            mmap_f16: HashMap::new(),
         }
     }
 
@@ -315,10 +370,73 @@ impl QuantizedWeights {
 
     pub fn get_i2s(&self, name: &str) -> Option<&[u8]> {
         self.i2s_tensors.get(name).map(|v| v.as_slice())
+            .or_else(|| self.mmap_i2s.get(name).and_then(|&(off, len)|
+                self.mmap.as_ref().map(|m| &m[off..off+len])))
+    }
+
+
+    pub fn get_tl2(&self, name: &str) -> Option<&Tl2Tensor> {
+        self.tl2_tensors.get(name)
+    }
+
+    pub fn add_tl2_tensor(&mut self, name: String, data: Vec<u8>, m: usize, k: usize, scale: f32) {
+        self.tl2_tensors.insert(name, Tl2Tensor { data, m, k, scale });
+    }
+
+    pub fn get_f16(&self, name: &str) -> Option<&[u8]> {
+        self.f16_tensors.get(name).map(|v| v.as_slice())
+            .or_else(|| self.mmap_f16.get(name).and_then(|&(off, len)|
+                self.mmap.as_ref().map(|m| &m[off..off+len])))
+    }
+
+    pub fn insert_f16(&mut self, name: String, data: Vec<u8>) {
+        self.f16_tensors.insert(name, data);
+    }
+
+    pub fn set_mmap(&mut self, mmap: memmap2::Mmap) {
+        self.mmap = Some(mmap);
+    }
+
+    pub fn register_mmap_i2s(&mut self, name: String, offset: usize, len: usize) {
+        self.mmap_i2s.insert(name, (offset, len));
+    }
+
+    pub fn register_mmap_f16(&mut self, name: String, offset: usize, len: usize) {
+        self.mmap_f16.insert(name, (offset, len));
     }
 
     pub fn get_f32(&self, name: &str) -> Option<&[f32]> {
         self.f32_tensors.get(name).map(|v| v.as_slice())
+    }
+
+    pub fn embed_token(&self, token_id: u32, hidden_size: usize, output: &mut [f32]) {
+        let off = token_id as usize * hidden_size;
+        if let Some(f32_data) = self.get_f32("model.embed_tokens.weight") {
+            output.copy_from_slice(&f32_data[off..off + hidden_size]);
+        } else if let Some(f16_data) = self.get_f16("model.embed_tokens.weight") {
+            let byte_off = off * 2;
+            for i in 0..hidden_size {
+                let bits = u16::from_le_bytes([f16_data[byte_off + i * 2], f16_data[byte_off + i * 2 + 1]]);
+                output[i] = f16_bits_to_f32(bits);
+            }
+        } else {
+            panic!("no embedding weights found");
+        }
+    }
+
+    pub fn build_tl2_from_i2s(&mut self, tensor_shapes: &HashMap<String, (usize, usize)>) {
+        let names: Vec<String> = self.i2s_tensors.keys()
+            .chain(self.mmap_i2s.keys())
+            .cloned().collect();
+        for name in names {
+            if let Some(&(n, k)) = tensor_shapes.get(&name) {
+                if let Some(data) = self.get_i2s(&name) {
+                    if let Some((tl2_data, scale)) = tempura_kernels::tl2::repack_i2s_to_tl2(data, n, k) {
+                        self.tl2_tensors.insert(name.clone(), Tl2Tensor { data: tl2_data, m: n, k, scale });
+                    }
+                }
+            }
+        }
     }
 
     pub fn get_typed(&self, name: &str) -> Option<(tempura_kernels::ggml::GgmlType, &[u8])> {

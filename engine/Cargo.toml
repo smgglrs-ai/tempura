@@ -39,6 +39,10 @@ verify = true
 name = "inference_bench"
 harness = false
 
+[[bench]]
+name = "bitnet_bench"
+harness = false
+
 [dev-dependencies]
 tempfile = "3"
 bytemuck = "1"

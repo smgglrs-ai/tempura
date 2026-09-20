@@ -3459,6 +3459,7 @@ dependencies = [
 name = "tempura-kernel-verify"
 version = "0.1.0"
 dependencies = [
+ "half",
  "rand 0.9.4",
  "serde",
  "serde_json",
