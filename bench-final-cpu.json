@@ -1,0 +1,35 @@
+{
+  "timestamp": "2026-09-21",
+  "note": "Final CPU benchmark after all optimizations. Fixed tg measurement (bytes_stream).",
+  "model": "qwen3-8b Q4_K_M",
+  "hardware": "AMD Ryzen 9 9950X3D, 32 threads, AVX512VNNI, DDR5",
+  "paths": {
+    "rayon_prefetch": {
+      "build": "cargo build --release",
+      "pp128": 51.4, "tg32": 3.8
+    },
+    "openmp_ktiled": {
+      "build": "cargo build --release --features openmp",
+      "env": "GOMP_SPINCOUNT=0",
+      "pp128": 49.4, "tg32": 3.8
+    },
+    "llamacpp_cpu": {
+      "build": "cmake -DGGML_NATIVE=ON -fopenmp",
+      "pp128": 204.0, "tg32": 9.7
+    }
+  },
+  "gaps": {
+    "pp128": "4x — dequant-on-the-fly GEMM exhausted; need quantized GEMM kernel",
+    "tg32": "2.6x — memory bandwidth; Q4K row loads ~3GB/token at 100GB/s DDR5"
+  },
+  "optimizations_applied": [
+    "Q8_K activation pairing (correct llama.cpp format)",
+    "Rayon parallel GEMV over output neurons",
+    "OpenMP persistent threads for m>1 prefill",
+    "K-tiled GEMM (j_tile, k_block, i) loop order",
+    "Software prefetch _mm_prefetch T1 for weight rows",
+    "AVX512VNNI _mm256_dpbusd_epi32 in Q4K/Q6K dot",
+    "Dedicated engine OS thread + private Rayon pool",
+    "TEMPURA_CCD_CORES pinning (neutral on single-socket)"
+  ]
+}
