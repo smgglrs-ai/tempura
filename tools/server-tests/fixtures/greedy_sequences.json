@@ -1,0 +1,4 @@
+{
+  "_note": "Run 'python tools/server-tests/generate_fixtures.py http://localhost:8080 --greedy' to populate.",
+  "sequences": []
+}
