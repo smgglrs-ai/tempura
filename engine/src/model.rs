@@ -1448,14 +1448,29 @@ where
                 }
                 return;
             }
-            // F16 mmap tensors — dequantize on the fly
+            // F16 mmap tensors — parallel GEMV for m=1, materialise for m>1
             if let Some(f16_bytes) = qweights.get_f16(name) {
-                let n_elems = f16_bytes.len() / 2;
-                let f32_data: Vec<f32> = (0..n_elems).map(|i| {
-                    let bits = u16::from_le_bytes([f16_bytes[i*2], f16_bytes[i*2+1]]);
-                    tempura_kernels::ggml::helpers::f16_to_f32(bits)
-                }).collect();
-                self.pipeline.matmul_bt(a_f32, &f32_data, out, m, n, k).unwrap();
+                if m == 1 {
+                    use rayon::prelude::*;
+                    let row_f16_bytes = k * 2;
+                    out[..n].par_iter_mut().enumerate().for_each(|(j, out_val)| {
+                        let base = j * row_f16_bytes;
+                        let mut dot = 0.0f32;
+                        for i in 0..k {
+                            let off = base + i * 2;
+                            let bits = u16::from_le_bytes([f16_bytes[off], f16_bytes[off + 1]]);
+                            dot += tempura_kernels::ggml::helpers::f16_to_f32(bits) * a_f32[i];
+                        }
+                        *out_val = dot;
+                    });
+                } else {
+                    let n_elems = f16_bytes.len() / 2;
+                    let f32_data: Vec<f32> = (0..n_elems).map(|i| {
+                        let bits = u16::from_le_bytes([f16_bytes[i*2], f16_bytes[i*2+1]]);
+                        tempura_kernels::ggml::helpers::f16_to_f32(bits)
+                    }).collect();
+                    self.pipeline.matmul_bt(a_f32, &f32_data, out, m, n, k).unwrap();
+                }
                 return;
             }
             // mmap Q4K/Q6K tensors (stored separately from typed_tensors)
@@ -2144,6 +2159,20 @@ where
                             h,
                         )
                         .unwrap();
+                    } else if let (Some(pq), Some(qw), Some(kw), Some(vf16)) = (
+                        normed_preq.as_ref(),
+                        qweights.get_q4k(q_w_name),
+                        qweights.get_q4k(k_w_name),
+                        qweights.get_f16(v_w_name),
+                    ) {
+                        // Q+K (Q4K) + V (F16) in a single Rayon region — eliminates 1 barrier
+                        q4k.fused_q4k_2_f16_1_preq(
+                            pq,
+                            qw, &mut q[..q_dim], q_dim,
+                            kw, &mut k[..kv_dim], kv_dim,
+                            vf16, &mut v[..kv_dim], kv_dim,
+                            h, &normed[..h],
+                        );
                     } else if let (Some(pq), Some(qw), Some(kw)) = (
                         normed_preq.as_ref(),
                         qweights.get_q4k(q_w_name),
