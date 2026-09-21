@@ -13,6 +13,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::batch::InferenceRequest;
+use crate::engine_task::{EngineEvent, EngineRequest};
 use crate::sse::{ChatCompletionChunk, ChunkChoice, ChunkDelta};
 use crate::AppState;
 
@@ -451,77 +452,90 @@ async fn chat_completions(
     let timeout = resolve_timeout(&state, req.timeout_secs);
 
     if req.stream {
-        let model = state.model.clone();
+        let engine_tx = state.engine_tx.clone();
         let tokenizer = tokenizer.clone();
         let scheduler = state.scheduler.clone();
         let rid = request_id.clone();
         let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
         let prompt_tokens = token_ids.len() as u32;
         let base_seed = req.seed.unwrap_or(42);
+        let eos_token = tokenizer.eos_token_id();
+        let model_name = req.model.clone();
+        let max_new_tokens = req.max_tokens as usize;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
+        let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<EngineEvent>(64);
 
         metrics::counter!("tempura_request_count", "endpoint" => "chat_completions").increment(1);
 
-        tokio::task::spawn_blocking(move || {
+        engine_tx
+            .send(EngineRequest {
+                id: rid.clone(),
+                token_ids,
+                max_new_tokens,
+                params,
+                eos_token,
+                seed: base_seed,
+                response_tx: resp_tx,
+            })
+            .await
+            .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+
+        tokio::spawn(async move {
             let stream_start = std::time::Instant::now();
-            let mut session = InferenceSession::new(model.config(), TraceLevel::Off, base_seed);
+            let deadline = stream_start + timeout;
             let id_clone = rid.clone();
-            let model_name = req.model.clone();
-            let deadline = std::time::Instant::now() + timeout;
             let mut token_count = 0u64;
             let mut last_token_time = stream_start;
             let mut first_token_recorded = false;
 
-            let mut on_token = |token: u32| -> bool {
+            loop {
                 let now = std::time::Instant::now();
                 if now >= deadline {
                     metrics::counter!("tempura_request_timeout", "endpoint" => "chat_completions")
                         .increment(1);
-                    return false;
+                    break;
                 }
 
-                if !first_token_recorded {
-                    metrics::histogram!("tempura_time_to_first_token_seconds")
-                        .record(now.duration_since(stream_start).as_secs_f64());
-                    first_token_recorded = true;
-                } else {
-                    metrics::histogram!("tempura_inter_token_latency_seconds")
-                        .record(now.duration_since(last_token_time).as_secs_f64());
+                match tokio::time::timeout(deadline - now, resp_rx.recv()).await {
+                    Ok(Some(EngineEvent::Token(token))) => {
+                        let now2 = std::time::Instant::now();
+                        if !first_token_recorded {
+                            metrics::histogram!("tempura_time_to_first_token_seconds")
+                                .record(now2.duration_since(stream_start).as_secs_f64());
+                            first_token_recorded = true;
+                        } else {
+                            metrics::histogram!("tempura_inter_token_latency_seconds")
+                                .record(now2.duration_since(last_token_time).as_secs_f64());
+                        }
+                        last_token_time = now2;
+                        token_count += 1;
+
+                        let text = tokenizer.decode(&[token]).unwrap_or_default();
+                        let chunk = ChatCompletionChunk {
+                            id: id_clone.clone(),
+                            object: "chat.completion.chunk".to_string(),
+                            created: 0,
+                            model: model_name.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    role: None,
+                                    content: Some(text),
+                                    tool_calls: None,
+                                },
+                                finish_reason: None,
+                            }],
+                            usage: None,
+                        };
+                        let data = serde_json::to_string(&chunk).unwrap();
+                        if tx.send(Ok(Event::default().data(data))).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(EngineEvent::Done)) | Ok(None) | Err(_) => break,
                 }
-                last_token_time = now;
-                token_count += 1;
-
-                let text = tokenizer.decode(&[token]).unwrap_or_default();
-                let chunk = ChatCompletionChunk {
-                    id: id_clone.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created: 0,
-                    model: model_name.clone(),
-                    choices: vec![ChunkChoice {
-                        index: 0,
-                        delta: ChunkDelta {
-                            role: None,
-                            content: Some(text),
-                            tool_calls: None,
-                        },
-                        finish_reason: None,
-                    }],
-                    usage: None,
-                };
-                let data = serde_json::to_string(&chunk).unwrap();
-                let event = Event::default().data(data);
-                tx.blocking_send(Ok(event)).is_ok()
-            };
-
-            model.generate_with_callback(
-                &mut session,
-                &token_ids,
-                params.top_k.min(256),
-                &params,
-                None,
-                &mut on_token,
-            );
+            }
 
             metrics::counter!("tempura_tokens_generated").increment(token_count);
             metrics::histogram!("tempura_request_duration_seconds", "endpoint" => "chat_completions")
@@ -541,18 +555,14 @@ async fn chat_completions(
                     }),
                 };
                 let data = serde_json::to_string(&usage_chunk).unwrap();
-                let _ = tx.blocking_send(Ok(Event::default().data(data)));
+                let _ = tx.send(Ok(Event::default().data(data))).await;
             }
 
-            let done = Event::default().data("[DONE]");
-            let _ = tx.blocking_send(Ok(done));
+            let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
 
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                let mut sched = scheduler.lock().await;
-                sched.complete_sequence(&rid);
-                record_scheduler_gauges(&sched);
-            });
+            let mut sched = scheduler.lock().await;
+            sched.complete_sequence(&rid);
+            record_scheduler_gauges(&sched);
         });
 
         let stream = ReceiverStream::new(rx);
@@ -1475,6 +1485,8 @@ mod tests {
                 .handle()
         });
 
+        let (engine_tx, _engine_rx) =
+            tokio::sync::mpsc::channel::<crate::engine_task::EngineRequest>(4);
         AppState {
             model: std::sync::Arc::new(model),
             tokenizer: if with_tokenizer { None } else { None },
@@ -1487,6 +1499,7 @@ mod tests {
             )),
             metrics_handle,
             request_timeout: std::time::Duration::from_secs(300),
+            engine_tx: std::sync::Arc::new(engine_tx),
         }
     }
 
@@ -1572,6 +1585,8 @@ mod tests {
                 .handle()
         });
 
+        let (engine_tx2, _engine_rx2) =
+            tokio::sync::mpsc::channel::<crate::engine_task::EngineRequest>(4);
         let state = AppState {
             model: std::sync::Arc::new(model),
             tokenizer: None,
@@ -1582,6 +1597,7 @@ mod tests {
             )),
             metrics_handle,
             request_timeout: std::time::Duration::from_secs(300),
+            engine_tx: std::sync::Arc::new(engine_tx2),
         };
 
         // First request acquires the only slot

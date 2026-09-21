@@ -243,6 +243,12 @@ pub trait InferenceModel: Send + Sync {
         let _ = chain;
         self.generate(session, token_ids, max_new_tokens, params, eos_token)
     }
+    fn sample_from_logits(
+        &self,
+        logits: &[f32],
+        params: &SamplingParams,
+        session: &mut InferenceSession,
+    ) -> u32;
     fn load_weights(
         &mut self,
         loader: &dyn crate::loader::WeightLoader,
@@ -5138,6 +5144,14 @@ impl InferenceModel for CutileInferenceWrapper {
             decoder,
         )
     }
+    fn sample_from_logits(
+        &self,
+        logits: &[f32],
+        params: &SamplingParams,
+        session: &mut InferenceSession,
+    ) -> u32 {
+        self.model.sample_from_logits(logits, params, session)
+    }
     fn load_weights(
         &mut self,
         loader: &dyn crate::loader::WeightLoader,
@@ -5272,6 +5286,21 @@ where
         chain: &mut tempura_kernels::sampler_chain::SamplerChain,
     ) -> Vec<u32> {
         self.generate_with_sampler_chain(session, token_ids, max_new_tokens, params, eos_token, chain)
+    }
+    fn sample_from_logits(
+        &self,
+        logits: &[f32],
+        params: &SamplingParams,
+        session: &mut InferenceSession,
+    ) -> u32 {
+        let mut probs = vec![0.0f32; logits.len()];
+        self.pipeline.sampler.apply(logits, &mut probs, params).unwrap();
+        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+            None
+        } else {
+            Some(&mut session.rng)
+        };
+        self.pipeline.sampler.sample_token(&probs, rng_ref)
     }
     fn load_weights(
         &mut self,
