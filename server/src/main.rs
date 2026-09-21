@@ -216,8 +216,14 @@ async fn main() {
 
 async fn run_server(args: ServeArgs) {
     #[cfg(feature = "openmp")]
-    if std::env::var("OMP_WAIT_POLICY").is_err() {
-        std::env::set_var("OMP_WAIT_POLICY", "passive");
+    {
+        if std::env::var("OMP_WAIT_POLICY").is_err() {
+            std::env::set_var("OMP_WAIT_POLICY", "passive");
+        }
+        // Prevent OpenMP idle threads from spinning during Rayon decode steps.
+        if std::env::var("GOMP_SPINCOUNT").is_err() {
+            std::env::set_var("GOMP_SPINCOUNT", "0");
+        }
     }
     init_tracing(&args.otlp_endpoint);
 

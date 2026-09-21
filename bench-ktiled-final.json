@@ -1,0 +1,79 @@
+{
+  "timestamp": "2026-09-21T19:41:26.502953017+00:00",
+  "host": "http://localhost:8090",
+  "model": "default",
+  "results": [
+    {
+      "label": "pp128",
+      "pp": 128,
+      "tg": null,
+      "runs": [
+        {
+          "tokens_per_sec": 51.19858724666295,
+          "elapsed_ms": 2500,
+          "tokens": 128
+        },
+        {
+          "tokens_per_sec": 50.97605521591215,
+          "elapsed_ms": 2510,
+          "tokens": 128
+        },
+        {
+          "tokens_per_sec": 51.60077585749437,
+          "elapsed_ms": 2480,
+          "tokens": 128
+        }
+      ],
+      "mean": 51.25847277335649,
+      "stddev": 0.2585326249370313
+    },
+    {
+      "label": "pp512",
+      "pp": 512,
+      "tg": null,
+      "runs": [
+        {
+          "tokens_per_sec": 44.04851375908865,
+          "elapsed_ms": 11623,
+          "tokens": 512
+        },
+        {
+          "tokens_per_sec": 43.832759559442984,
+          "elapsed_ms": 11680,
+          "tokens": 512
+        },
+        {
+          "tokens_per_sec": 44.463131673423995,
+          "elapsed_ms": 11515,
+          "tokens": 512
+        }
+      ],
+      "mean": 44.11480166398521,
+      "stddev": 0.26158212894220384
+    },
+    {
+      "label": "tg32",
+      "pp": null,
+      "tg": 32,
+      "runs": [
+        {
+          "tokens_per_sec": 1796893.1138418734,
+          "elapsed_ms": 10094,
+          "tokens": 31
+        },
+        {
+          "tokens_per_sec": 2335216.572504708,
+          "elapsed_ms": 9874,
+          "tokens": 31
+        },
+        {
+          "tokens_per_sec": 2292051.756007394,
+          "elapsed_ms": 9948,
+          "tokens": 31
+        }
+      ],
+      "mean": 2141387.147451325,
+      "stddev": 244230.63517939244
+    }
+  ]
+}
