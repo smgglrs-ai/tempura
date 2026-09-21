@@ -1,0 +1,23 @@
+[package]
+name = "tempura-integration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tempura-integration"
+path = "src/main.rs"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
+
+[dev-dependencies]
+# integration tests are in src/lib.rs or tests/ dir, run via `cargo test`
+
+[lints]
+workspace = true
