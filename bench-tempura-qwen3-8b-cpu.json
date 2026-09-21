@@ -1,0 +1,31 @@
+{
+  "timestamp": "2026-09-21T12:00:29.141544638+00:00",
+  "host": "http://localhost:8080",
+  "model": "default",
+  "results": [
+    {
+      "label": "pp128",
+      "pp": 128,
+      "tg": null,
+      "runs": [],
+      "mean": 0.0,
+      "stddev": 0.0
+    },
+    {
+      "label": "pp512",
+      "pp": 512,
+      "tg": null,
+      "runs": [],
+      "mean": 0.0,
+      "stddev": 0.0
+    },
+    {
+      "label": "tg32",
+      "pp": null,
+      "tg": 32,
+      "runs": [],
+      "mean": 0.0,
+      "stddev": 0.0
+    }
+  ]
+}

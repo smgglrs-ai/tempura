@@ -1,0 +1,127 @@
+{
+  "timestamp": "2026-09-21T10:58:13.896389119+00:00",
+  "host": "http://localhost:8080",
+  "model": "default",
+  "results": [
+    {
+      "label": "pp128",
+      "pp": 128,
+      "tg": null,
+      "runs": [
+        {
+          "tokens_per_sec": 194.67859150099886,
+          "elapsed_ms": 657,
+          "tokens": 128
+        },
+        {
+          "tokens_per_sec": 212.43962955335053,
+          "elapsed_ms": 602,
+          "tokens": 128
+        },
+        {
+          "tokens_per_sec": 212.70980361437762,
+          "elapsed_ms": 601,
+          "tokens": 128
+        }
+      ],
+      "mean": 206.60934155624236,
+      "stddev": 8.437035267846642
+    },
+    {
+      "label": "pp512",
+      "pp": 512,
+      "tg": null,
+      "runs": [
+        {
+          "tokens_per_sec": 474.33384212431747,
+          "elapsed_ms": 1079,
+          "tokens": 512
+        },
+        {
+          "tokens_per_sec": 457.79358169839827,
+          "elapsed_ms": 1118,
+          "tokens": 512
+        },
+        {
+          "tokens_per_sec": 474.7308360535565,
+          "elapsed_ms": 1078,
+          "tokens": 512
+        }
+      ],
+      "mean": 468.9527532920908,
+      "stddev": 7.892390176115559
+    },
+    {
+      "label": "pp1024",
+      "pp": 1024,
+      "tg": null,
+      "runs": [
+        {
+          "tokens_per_sec": 563.2638587444783,
+          "elapsed_ms": 1817,
+          "tokens": 1024
+        },
+        {
+          "tokens_per_sec": 549.5353324839482,
+          "elapsed_ms": 1863,
+          "tokens": 1024
+        },
+        {
+          "tokens_per_sec": 549.3262457000865,
+          "elapsed_ms": 1864,
+          "tokens": 1024
+        }
+      ],
+      "mean": 554.0418123095043,
+      "stddev": 6.5215302221389955
+    },
+    {
+      "label": "tg32",
+      "pp": null,
+      "tg": 32,
+      "runs": [
+        {
+          "tokens_per_sec": 2324567.7756792097,
+          "elapsed_ms": 26763,
+          "tokens": 32
+        },
+        {
+          "tokens_per_sec": 2367564.368156259,
+          "elapsed_ms": 31023,
+          "tokens": 32
+        },
+        {
+          "tokens_per_sec": 1437427.0056598687,
+          "elapsed_ms": 27104,
+          "tokens": 32
+        }
+      ],
+      "mean": 2043186.3831651125,
+      "stddev": 428696.08062730153
+    },
+    {
+      "label": "tg128",
+      "pp": null,
+      "tg": 128,
+      "runs": [
+        {
+          "tokens_per_sec": 1947864.1973429916,
+          "elapsed_ms": 113375,
+          "tokens": 128
+        },
+        {
+          "tokens_per_sec": 2490466.1841388433,
+          "elapsed_ms": 125114,
+          "tokens": 128
+        },
+        {
+          "tokens_per_sec": 1298898.9801613477,
+          "elapsed_ms": 111256,
+          "tokens": 128
+        }
+      ],
+      "mean": 1912409.787214394,
+      "stddev": 487100.8532099978
+    }
+  ]
+}

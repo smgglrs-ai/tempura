@@ -1448,6 +1448,38 @@ where
                 }
                 return;
             }
+            // F16 mmap tensors — dequantize on the fly
+            if let Some(f16_bytes) = qweights.get_f16(name) {
+                let n_elems = f16_bytes.len() / 2;
+                let f32_data: Vec<f32> = (0..n_elems).map(|i| {
+                    let bits = u16::from_le_bytes([f16_bytes[i*2], f16_bytes[i*2+1]]);
+                    tempura_kernels::ggml::helpers::f16_to_f32(bits)
+                }).collect();
+                self.pipeline.matmul_bt(a_f32, &f32_data, out, m, n, k).unwrap();
+                return;
+            }
+            // mmap Q4K/Q6K tensors (stored separately from typed_tensors)
+            if let Some(w) = qweights.get_q4k(name) {
+                use tempura_kernels::ggml::GgmlType;
+                if m == 1 {
+                    if let Some(pq) = preq {
+                        q4k.forward_q4k_preq(pq, a_f32, w, out, n).unwrap();
+                        return;
+                    }
+                }
+                q4k.forward_b_transposed_q4k(a_f32, w, out, m, n, k).unwrap();
+                return;
+            }
+            if let Some(w) = qweights.get_q6k(name) {
+                if m == 1 {
+                    if let Some(pq) = preq {
+                        q4k.forward_q6k_preq(pq, a_f32, w, out, n).unwrap();
+                        return;
+                    }
+                }
+                q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k).unwrap();
+                return;
+            }
             // f32 fallback
             if let Some(w) = qweights.get_f32(name) {
                 self.pipeline.matmul_bt(a_f32, w, out, m, n, k).unwrap();

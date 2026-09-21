@@ -1,0 +1,15 @@
+{
+  "timestamp": "2026-09-21",
+  "tool": "llama-bench",
+  "build": "335b21fc-1318",
+  "model": "qwen3 8B Q4_K_M",
+  "backend": "CUDA RTX 5090",
+  "ngl": 99,
+  "results": [
+    {"label": "pp128",  "tokens_per_sec": 7406.06,  "stddev": 1789.92},
+    {"label": "pp512",  "tokens_per_sec": 12358.41, "stddev": 1584.35},
+    {"label": "pp1024", "tokens_per_sec": 12496.21, "stddev": 1155.78},
+    {"label": "tg32",   "tokens_per_sec": 209.17,   "stddev": 7.10},
+    {"label": "tg128",  "tokens_per_sec": 213.44,   "stddev": 0.55}
+  ]
+}

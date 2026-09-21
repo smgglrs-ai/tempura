@@ -1792,18 +1792,20 @@ impl GgufLoader {
         let mut f32_tensors = HashMap::new();
 
         for (name, dtype) in &self.tensor_dtypes {
+            let key = map_gguf_name(name).unwrap_or_else(|| name.clone());
             if let Some(f32_data) = self.tensors.get(name) {
-                f32_tensors.insert(name.clone(), f32_data.clone());
+                f32_tensors.insert(key, f32_data.clone());
             } else if let Some(raw) = self.raw_tensors.get(name) {
                 if !self.mmap_ranges.contains_key(name) {
                     let ggml_type = convert_ggml_type(*dtype);
-                    typed_tensors.insert(name.clone(), (ggml_type, raw.clone()));
+                    typed_tensors.insert(key, (ggml_type, raw.clone()));
                 }
             }
         }
 
         for (name, data) in &self.f16_raw_tensors {
-            f32_tensors.entry(name.clone()).or_insert_with(|| {
+            let key = map_gguf_name(name).unwrap_or_else(|| name.clone());
+            f32_tensors.entry(key).or_insert_with(|| {
                 let count = data.len() / 2;
                 (0..count)
                     .map(|i| {
@@ -1829,21 +1831,22 @@ impl GgufLoader {
 
         if let Some(mmap) = self.mmap {
             for (name, &(off, len, dtype)) in &self.mmap_ranges {
+                let key = map_gguf_name(name).unwrap_or_else(|| name.clone());
                 match dtype {
                     GgmlType::TQ1_0 | GgmlType::TL1 => {
-                        qw.register_mmap_i2s(name.clone(), off, len);
+                        qw.register_mmap_i2s(key, off, len);
                     }
                     GgmlType::F16 => {
-                        qw.register_mmap_f16(name.clone(), off, len);
+                        qw.register_mmap_f16(key, off, len);
                     }
                     GgmlType::Q4K => {
-                        qw.register_mmap_q4k(name.clone(), off, len);
+                        qw.register_mmap_q4k(key, off, len);
                     }
                     GgmlType::Q6K => {
-                        qw.register_mmap_q6k(name.clone(), off, len);
+                        qw.register_mmap_q6k(key, off, len);
                     }
                     GgmlType::Q2_0 => {
-                        qw.register_mmap_q2(name.clone(), off, len);
+                        qw.register_mmap_q2(key, off, len);
                     }
                     _ => {}
                 }
@@ -1851,7 +1854,8 @@ impl GgufLoader {
             qw.set_mmap(mmap);
         } else {
             for (name, data) in &self.f16_raw_tensors {
-                qw.insert_f16(name.clone(), data.clone());
+                let key = map_gguf_name(name).unwrap_or_else(|| name.clone());
+                qw.insert_f16(key, data.clone());
             }
         }
 

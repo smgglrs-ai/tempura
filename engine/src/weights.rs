@@ -499,6 +499,26 @@ impl QuantizedWeights {
         self.f32_tensors.get(name).map(|v| v.as_slice())
     }
 
+    pub fn typed_tensor_names(&self) -> Vec<String> {
+        self.typed_tensors.keys().cloned().collect()
+    }
+
+    pub fn mmap_q4k_names(&self) -> Vec<String> {
+        self.mmap_q4k.keys().cloned().collect()
+    }
+
+    pub fn mmap_q6k_names(&self) -> Vec<String> {
+        self.mmap_q6k.keys().cloned().collect()
+    }
+
+    pub fn f32_tensor_names(&self) -> Vec<String> {
+        self.f32_tensors.keys().cloned().collect()
+    }
+
+    pub fn mmap_f16_names(&self) -> Vec<String> {
+        self.mmap_f16.keys().cloned().collect()
+    }
+
     pub fn embed_token(&self, token_id: u32, hidden_size: usize, output: &mut [f32]) {
         let off = token_id as usize * hidden_size;
         if let Some(f32_data) = self.get_f32("model.embed_tokens.weight") {
