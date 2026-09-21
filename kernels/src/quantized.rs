@@ -3992,13 +3992,15 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         }
 
         use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
-        // These assert that the raw byte layout matches the typed struct layout.
-        // Catches any accidental BlockQ4K struct size drift from GGUF spec.
         const _: () = assert!(std::mem::size_of::<BlockQ4K>() == 144);
         const _: () = assert!(std::mem::size_of::<BlockQ8K>() == 292);
 
+        thread_local! {
+            static Q8K_BUF_Q4K: std::cell::UnsafeCell<Vec<BlockQ8K>> =
+                const { std::cell::UnsafeCell::new(Vec::new()) };
+        }
+
         if std::env::var("TEMPURA_DETERMINISTIC").is_ok() {
-            // Deterministic reference path — matches GPU accumulation order for comparison
             output[..m * n].par_chunks_mut(n).enumerate().for_each(
                 |(i, row_out)| {
                     let a_row = &a[i * k..(i + 1) * k];
@@ -4019,24 +4021,34 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             return Ok(());
         }
 
-        // llama.cpp translation: quantize activations to Q8_K (256-element blocks with bsums),
-        // then use vec_dot_q4_K_q8_K — the correct pairing for Q4_K weights.
+        // llama.cpp translation: Q8_K activations × Q4_K weights via vec_dot_q4_K_q8_K.
+        // Thread-local buffer avoids one Vec allocation per input row per Rayon worker.
         output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
             let a_row = &a[i * k..(i + 1) * k];
-            // SAFETY: BlockQ8K is a POD struct; zeroed is a valid initial state before
-            // quantize_row_q8_k* overwrites every field.
-            let mut a_q8k: Vec<BlockQ8K> =
-                (0..blocks_per_row).map(|_| unsafe { std::mem::zeroed() }).collect();
-            #[cfg(target_arch = "x86_64")]
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                unsafe {
-                    crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, &mut a_q8k)
-                };
-            } else {
-                crate::ggml::quantize::quantize_row_q8_k(a_row, &mut a_q8k);
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            crate::ggml::quantize::quantize_row_q8_k(a_row, &mut a_q8k);
+            let a_q8k: &[BlockQ8K] = Q8K_BUF_Q4K.with(|cell| {
+                // SAFETY: each Rayon worker thread has its own copy of the thread_local.
+                // The borrow is scoped to this closure and does not escape.
+                let buf = unsafe { &mut *cell.get() };
+                if buf.len() < blocks_per_row {
+                    buf.resize_with(blocks_per_row, || unsafe { std::mem::zeroed() });
+                }
+                #[cfg(target_arch = "x86_64")]
+                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                    unsafe {
+                        crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(
+                            a_row,
+                            &mut buf[..blocks_per_row],
+                        )
+                    };
+                } else {
+                    crate::ggml::quantize::quantize_row_q8_k(a_row, &mut buf[..blocks_per_row]);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                crate::ggml::quantize::quantize_row_q8_k(a_row, &mut buf[..blocks_per_row]);
+                // SAFETY: we hold the only mutable reference (thread_local, single-threaded
+                // access within this closure); returning a shared slice to immutable data.
+                unsafe { std::slice::from_raw_parts(buf.as_ptr(), blocks_per_row) }
+            });
 
             let j_chunk = (n / rayon::current_num_threads()).max(64);
             row_out.par_chunks_mut(j_chunk).enumerate().for_each(|(ci, jchunk)| {
@@ -4044,7 +4056,6 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 for (local, out_val) in jchunk.iter_mut().enumerate() {
                     let j = j_start + local;
                     let row_start = j * blocks_per_row * Q4K_BLOCK_BYTES;
-                    // SAFETY: b_quantized is Q4_K data aligned to BlockQ4K layout
                     let weight_blocks: &[BlockQ4K] = unsafe {
                         std::slice::from_raw_parts(
                             b_quantized.as_ptr().add(row_start) as *const BlockQ4K,
@@ -4054,7 +4065,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                     *out_val = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(
                         k,
                         weight_blocks,
-                        &a_q8k,
+                        a_q8k,
                     );
                 }
             });
@@ -4101,23 +4112,34 @@ impl MatMulQ for CpuMatMulQ4KOpt {
 
         use crate::ggml::blocks::{BlockQ6K, BlockQ8K};
 
-        // llama.cpp translation: Q6_K weights × Q8_K activations via vec_dot_q6_K_q8_K
+        thread_local! {
+            static Q8K_BUF_Q6K: std::cell::UnsafeCell<Vec<BlockQ8K>> =
+                const { std::cell::UnsafeCell::new(Vec::new()) };
+        }
+
+        // llama.cpp translation: Q8_K activations × Q6_K weights via vec_dot_q6_K_q8_K.
         output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
             let a_row = &a[i * k..(i + 1) * k];
-            // SAFETY: BlockQ8K is a POD struct; zeroed is a valid initial state before
-            // quantize_row_q8_k* overwrites every field.
-            let mut a_q8k: Vec<BlockQ8K> =
-                (0..blocks_per_row).map(|_| unsafe { std::mem::zeroed() }).collect();
-            #[cfg(target_arch = "x86_64")]
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                unsafe {
-                    crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, &mut a_q8k)
-                };
-            } else {
-                crate::ggml::quantize::quantize_row_q8_k(a_row, &mut a_q8k);
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            crate::ggml::quantize::quantize_row_q8_k(a_row, &mut a_q8k);
+            let a_q8k: &[BlockQ8K] = Q8K_BUF_Q6K.with(|cell| {
+                let buf = unsafe { &mut *cell.get() };
+                if buf.len() < blocks_per_row {
+                    buf.resize_with(blocks_per_row, || unsafe { std::mem::zeroed() });
+                }
+                #[cfg(target_arch = "x86_64")]
+                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                    unsafe {
+                        crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(
+                            a_row,
+                            &mut buf[..blocks_per_row],
+                        )
+                    };
+                } else {
+                    crate::ggml::quantize::quantize_row_q8_k(a_row, &mut buf[..blocks_per_row]);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                crate::ggml::quantize::quantize_row_q8_k(a_row, &mut buf[..blocks_per_row]);
+                unsafe { std::slice::from_raw_parts(buf.as_ptr(), blocks_per_row) }
+            });
 
             let j_chunk = (n / rayon::current_num_threads()).max(64);
             row_out.par_chunks_mut(j_chunk).enumerate().for_each(|(ci, jchunk)| {
@@ -4125,7 +4147,6 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 for (local, out_val) in jchunk.iter_mut().enumerate() {
                     let j = j_start + local;
                     let row_start = j * blocks_per_row * Q6K_BLOCK_BYTES;
-                    // SAFETY: b_quantized is Q6_K data aligned to BlockQ6K layout
                     let weight_blocks: &[BlockQ6K] = unsafe {
                         std::slice::from_raw_parts(
                             b_quantized.as_ptr().add(row_start) as *const BlockQ6K,
@@ -4135,7 +4156,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                     *out_val = crate::ggml::vec_dot_avx2::vec_dot_q6_k_q8_k_dispatch(
                         k,
                         weight_blocks,
-                        &a_q8k,
+                        a_q8k,
                     );
                 }
             });
