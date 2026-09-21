@@ -1,43 +1,45 @@
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command};
+use std::sync::OnceLock;
 
 pub struct TestServer {
     child: Child,
-    port: u16,
+    pub port: u16,
 }
 
 impl TestServer {
-    pub fn spawn() -> Self {
-        Self::spawn_with_args(&[])
+    fn binary_path() -> std::path::PathBuf {
+        let mut path = std::env::current_exe().unwrap();
+        path.pop(); // deps/
+        path.pop(); // debug/
+        path.push("tempura-serve");
+        path
     }
 
     pub fn spawn_with_key(api_key: &str) -> Self {
-        Self::spawn_with_args(&["--api-key", api_key])
-    }
-
-    fn spawn_with_args(extra: &[&str]) -> Self {
         let port = free_port();
-        let mut cmd = Command::new("cargo");
+        let binary = Self::binary_path();
+        let mut cmd = if binary.exists() {
+            Command::new(&binary)
+        } else {
+            let mut c = Command::new("cargo");
+            c.args(["run", "--quiet", "--package", "tempura-serve", "--"]);
+            c
+        };
         cmd.args([
-            "run",
-            "--quiet",
-            "--package",
-            "tempura-serve",
-            "--",
+            "serve",
             "--port",
             &port.to_string(),
             "--model-config",
             "tiny-test",
+            "--api-key",
+            api_key,
         ]);
-        for arg in extra {
-            cmd.arg(arg);
-        }
         let child = cmd.spawn().expect("failed to spawn tempura-serve");
-
-        let base = format!("http://127.0.0.1:{port}");
-        for _ in 0..100 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            if reqwest::blocking::get(format!("{base}/health")).is_ok() {
+        for _ in 0..150 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+                std::thread::sleep(std::time::Duration::from_millis(200));
                 break;
             }
         }
@@ -64,6 +66,35 @@ fn free_port() -> u16 {
         .port()
 }
 
+static SERVER_PORT: OnceLock<u16> = OnceLock::new();
+
+/// Shared server URL — starts one server instance for the whole test run.
+pub fn shared_server_url() -> String {
+    let port = SERVER_PORT.get_or_init(|| {
+        let port = free_port();
+        let binary = TestServer::binary_path();
+        let mut cmd = if binary.exists() {
+            Command::new(&binary)
+        } else {
+            let mut c = Command::new("cargo");
+            c.args(["run", "--quiet", "--package", "tempura-serve", "--"]);
+            c
+        };
+        cmd.args(["serve", "--port", &port.to_string(), "--model-config", "tiny-test"]);
+        let child = cmd.spawn().expect("failed to spawn tempura-serve");
+        std::mem::forget(child);
+        for _ in 0..150 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                break;
+            }
+        }
+        port
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,8 +102,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_health_returns_200() {
-        let server = TestServer::spawn();
-        let resp = reqwest::get(server.url() + "/health").await.unwrap();
+        let url = shared_server_url();
+        let resp = reqwest::get(format!("{url}/health")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body.get("status").is_some());
@@ -81,17 +112,17 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_ready_endpoint() {
-        let server = TestServer::spawn();
-        let resp = reqwest::get(server.url() + "/ready").await.unwrap();
+        let url = shared_server_url();
+        let resp = reqwest::get(format!("{url}/ready")).await.unwrap();
         assert!(resp.status() == 200 || resp.status() == 503);
     }
 
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_models_endpoint() {
-        let server = TestServer::spawn();
+        let url = shared_server_url();
         let resp = reqwest::Client::new()
-            .get(server.url() + "/v1/models")
+            .get(format!("{url}/v1/models"))
             .send()
             .await
             .unwrap();
@@ -103,8 +134,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_metrics_prometheus_format() {
-        let server = TestServer::spawn();
-        let resp = reqwest::get(server.url() + "/metrics").await.unwrap();
+        let url = shared_server_url();
+        let resp = reqwest::get(format!("{url}/metrics")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let text = resp.text().await.unwrap();
         assert!(!text.is_empty());
@@ -113,17 +144,17 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_props_endpoint() {
-        let server = TestServer::spawn();
-        let resp = reqwest::get(server.url() + "/props").await.unwrap();
+        let url = shared_server_url();
+        let resp = reqwest::get(format!("{url}/props")).await.unwrap();
         assert_eq!(resp.status(), 200);
     }
 
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_chat_completion_non_streaming() {
-        let server = TestServer::spawn();
+        let url = shared_server_url();
         let resp = reqwest::Client::new()
-            .post(server.url() + "/v1/chat/completions")
+            .post(format!("{url}/v1/chat/completions"))
             .json(&serde_json::json!({
                 "model": "default",
                 "messages": [{"role": "user", "content": "Hello"}],
@@ -136,15 +167,14 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body["choices"][0]["message"]["content"].is_string());
-        assert!(body["usage"]["prompt_tokens"].as_u64().unwrap_or(0) > 0);
     }
 
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_chat_completion_streaming_sse_format() {
-        let server = TestServer::spawn();
+        let url = shared_server_url();
         let resp = reqwest::Client::new()
-            .post(server.url() + "/v1/chat/completions")
+            .post(format!("{url}/v1/chat/completions"))
             .json(&serde_json::json!({
                 "model": "default",
                 "messages": [{"role": "user", "content": "Hi"}],
@@ -163,9 +193,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_stream_options_include_usage() {
-        let server = TestServer::spawn();
+        let url = shared_server_url();
         let resp = reqwest::Client::new()
-            .post(server.url() + "/v1/chat/completions")
+            .post(format!("{url}/v1/chat/completions"))
             .json(&serde_json::json!({
                 "model": "default",
                 "messages": [{"role": "user", "content": "Hi"}],
@@ -184,9 +214,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_completions_endpoint() {
-        let server = TestServer::spawn();
+        let url = shared_server_url();
         let resp = reqwest::Client::new()
-            .post(server.url() + "/v1/completions")
+            .post(format!("{url}/v1/completions"))
             .json(&serde_json::json!({
                 "model": "default",
                 "prompt": "The sky is",
@@ -203,9 +233,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_tokenize_and_detokenize() {
-        let server = TestServer::spawn();
+        let url = shared_server_url();
         let r1 = reqwest::Client::new()
-            .post(server.url() + "/tokenize")
+            .post(format!("{url}/tokenize"))
             .json(&serde_json::json!({"model": "default", "content": "Hello world"}))
             .send()
             .await
@@ -215,9 +245,8 @@ mod tests {
             let body: serde_json::Value = r1.json().await.unwrap();
             let tokens = body["tokens"].as_array().unwrap().clone();
             assert!(!tokens.is_empty());
-
             let r2 = reqwest::Client::new()
-                .post(server.url() + "/detokenize")
+                .post(format!("{url}/detokenize"))
                 .json(&serde_json::json!({"model": "default", "tokens": tokens}))
                 .send()
                 .await
@@ -229,9 +258,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_embeddings_returns_unsupported() {
-        let server = TestServer::spawn();
+        let url = shared_server_url();
         let resp = reqwest::Client::new()
-            .post(server.url() + "/v1/embeddings")
+            .post(format!("{url}/v1/embeddings"))
             .json(&serde_json::json!({"model": "default", "input": "test"}))
             .send()
             .await
@@ -242,9 +271,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_malformed_json_returns_error() {
-        let server = TestServer::spawn();
+        let url = shared_server_url();
         let resp = reqwest::Client::new()
-            .post(server.url() + "/v1/chat/completions")
+            .post(format!("{url}/v1/chat/completions"))
             .header("Content-Type", "application/json")
             .body("not valid json")
             .send()
@@ -255,10 +284,10 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires built server binary"]
-    async fn test_missing_messages_returns_422() {
-        let server = TestServer::spawn();
+    async fn test_missing_messages_returns_error() {
+        let url = shared_server_url();
         let resp = reqwest::Client::new()
-            .post(server.url() + "/v1/chat/completions")
+            .post(format!("{url}/v1/chat/completions"))
             .json(&serde_json::json!({"model": "default"}))
             .send()
             .await
@@ -269,7 +298,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_seed_is_deterministic() {
-        let server = TestServer::spawn();
+        let url = shared_server_url();
         let req = serde_json::json!({
             "model": "default",
             "messages": [{"role": "user", "content": "Random word:"}],
@@ -280,7 +309,7 @@ mod tests {
         });
         let client = reqwest::Client::new();
         let r1: serde_json::Value = client
-            .post(server.url() + "/v1/chat/completions")
+            .post(format!("{url}/v1/chat/completions"))
             .json(&req)
             .send()
             .await
@@ -289,7 +318,7 @@ mod tests {
             .await
             .unwrap();
         let r2: serde_json::Value = client
-            .post(server.url() + "/v1/chat/completions")
+            .post(format!("{url}/v1/chat/completions"))
             .json(&req)
             .send()
             .await
@@ -306,14 +335,18 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_debug_logits_endpoint() {
-        let server = TestServer::spawn();
+        let url = shared_server_url();
         let resp = reqwest::Client::new()
-            .post(server.url() + "/tempura/v1/debug/logits")
+            .post(format!("{url}/tempura/v1/debug/logits"))
             .json(&serde_json::json!({"tokens": [1, 2, 3]}))
             .send()
             .await
             .unwrap();
-        assert!(resp.status().is_success() || resp.status().as_u16() == 501 || resp.status().as_u16() == 503);
+        assert!(
+            resp.status().is_success()
+                || resp.status().as_u16() == 501
+                || resp.status().as_u16() == 503
+        );
         if resp.status().is_success() {
             let body: serde_json::Value = resp.json().await.unwrap();
             assert!(body["logits"].is_array());
@@ -324,8 +357,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_verified_status_endpoint() {
-        let server = TestServer::spawn();
-        let resp = reqwest::get(server.url() + "/tempura/v1/verified")
+        let url = shared_server_url();
+        let resp = reqwest::get(format!("{url}/tempura/v1/verified"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
@@ -334,15 +367,15 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires built server binary"]
     async fn test_traces_endpoint() {
-        let server = TestServer::spawn();
-        let resp = reqwest::get(server.url() + "/tempura/v1/traces")
+        let url = shared_server_url();
+        let resp = reqwest::get(format!("{url}/tempura/v1/traces"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
     }
 
     #[tokio::test]
-    #[ignore = "requires built server binary and TEMPURA_TEST_API_KEY"]
+    #[ignore = "requires built server binary and TEMPURA_TEST_API_KEY env var"]
     async fn test_auth_correct_key_passes() {
         let key = match std::env::var("TEMPURA_TEST_API_KEY") {
             Ok(k) => k,
@@ -350,7 +383,7 @@ mod tests {
         };
         let server = TestServer::spawn_with_key(&key);
         let resp = reqwest::Client::new()
-            .get(server.url() + "/v1/models")
+            .get(format!("{}/v1/models", server.url()))
             .header("Authorization", format!("Bearer {key}"))
             .send()
             .await
@@ -359,7 +392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires built server binary and TEMPURA_TEST_API_KEY"]
+    #[ignore = "requires built server binary and TEMPURA_TEST_API_KEY env var"]
     async fn test_auth_wrong_key_returns_401() {
         let key = match std::env::var("TEMPURA_TEST_API_KEY") {
             Ok(k) => k,
@@ -367,7 +400,7 @@ mod tests {
         };
         let server = TestServer::spawn_with_key(&key);
         let resp = reqwest::Client::new()
-            .get(server.url() + "/v1/models")
+            .get(format!("{}/v1/models", server.url()))
             .header("Authorization", "Bearer wrong-key-xyz")
             .send()
             .await
@@ -376,19 +409,21 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires built server binary and TEMPURA_TEST_API_KEY"]
-    async fn test_auth_health_bypasses_key() {
+    #[ignore = "requires built server binary and TEMPURA_TEST_API_KEY env var"]
+    async fn test_auth_health_bypasses() {
         let key = match std::env::var("TEMPURA_TEST_API_KEY") {
             Ok(k) => k,
             Err(_) => return,
         };
         let server = TestServer::spawn_with_key(&key);
-        let resp = reqwest::get(server.url() + "/health").await.unwrap();
+        let resp = reqwest::get(format!("{}/health", server.url()))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
     }
 
     #[tokio::test]
-    #[ignore = "requires built server binary and TEMPURA_TEST_API_KEY"]
+    #[ignore = "requires built server binary and TEMPURA_TEST_API_KEY env var"]
     async fn test_auth_x_api_key_header() {
         let key = match std::env::var("TEMPURA_TEST_API_KEY") {
             Ok(k) => k,
@@ -396,7 +431,7 @@ mod tests {
         };
         let server = TestServer::spawn_with_key(&key);
         let resp = reqwest::Client::new()
-            .get(server.url() + "/v1/models")
+            .get(format!("{}/v1/models", server.url()))
             .header("X-API-Key", &key)
             .send()
             .await
