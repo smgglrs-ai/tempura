@@ -52,6 +52,10 @@ pub fn router() -> Router<AppState> {
         .route("/health/inference", get(health_inference))
         .route("/ready", get(readiness))
         .route("/v1/responses", post(responses))
+        .route("/tokenize", post(tokenize))
+        .route("/detokenize", post(detokenize))
+        .route("/v1/embeddings", post(embeddings))
+        .route("/props", get(props))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1456,6 +1460,118 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct TokenizeRequest {
+    #[serde(default)]
+    model: Option<String>,
+    content: String,
+    #[serde(default)]
+    with_pieces: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TokenizeResponse {
+    tokens: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pieces: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DetokenizeRequest {
+    #[serde(default)]
+    model: Option<String>,
+    tokens: Vec<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct DetokenizeResponse {
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingsRequest {
+    model: String,
+    input: serde_json::Value,
+    #[serde(default)]
+    encoding_format: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PropsResponse {
+    total_slots: usize,
+    model_path: String,
+    build_info: PropsBuildInfo,
+}
+
+#[derive(Debug, Serialize)]
+struct PropsBuildInfo {
+    version: String,
+}
+
+async fn tokenize(
+    State(state): State<AppState>,
+    Json(req): Json<TokenizeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tokenizer = state.tokenizer.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "No tokenizer loaded".into(),
+    ))?;
+    let tokens = tokenizer
+        .encode(&req.content)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let pieces = if req.with_pieces {
+        Some(
+            tokens
+                .iter()
+                .map(|&id| tokenizer.decode(&[id]).unwrap_or_default())
+                .collect(),
+        )
+    } else {
+        None
+    };
+    Ok(Json(TokenizeResponse { tokens, pieces }))
+}
+
+async fn detokenize(
+    State(state): State<AppState>,
+    Json(req): Json<DetokenizeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let tokenizer = state.tokenizer.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "No tokenizer loaded".into(),
+    ))?;
+    let content = tokenizer
+        .decode(&req.tokens)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(DetokenizeResponse { content }))
+}
+
+async fn embeddings(
+    State(_state): State<AppState>,
+    Json(_req): Json<EmbeddingsRequest>,
+) -> impl IntoResponse {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": {
+                "message": "Model does not support embeddings. Load an embedding model (e.g., BERT, E5, BGE).",
+                "type": "invalid_request_error",
+                "code": "model_not_supported"
+            }
+        })),
+    )
+}
+
+async fn props(State(state): State<AppState>) -> impl IntoResponse {
+    Json(PropsResponse {
+        total_slots: 1,
+        model_path: state.model_id.clone(),
+        build_info: PropsBuildInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1487,6 +1603,7 @@ mod tests {
             )),
             metrics_handle,
             request_timeout: std::time::Duration::from_secs(300),
+            api_key: None,
         }
     }
 
@@ -1582,6 +1699,7 @@ mod tests {
             )),
             metrics_handle,
             request_timeout: std::time::Duration::from_secs(300),
+            api_key: None,
         };
 
         // First request acquires the only slot
@@ -1732,5 +1850,152 @@ mod tests {
             &Some(0.05), &Some(0.9), &Some(1.1), &Some(64),
         );
         assert_eq!(chain.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_auth_disabled_passes_all_requests() {
+        let state = test_state(false);
+        let app = router()
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::auth_middleware,
+            ))
+            .with_state(state);
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_enabled_correct_key_passes() {
+        let mut state = test_state(false);
+        state.api_key = Some("secret".to_string());
+        let app = router()
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::auth_middleware,
+            ))
+            .with_state(state);
+        let req = Request::builder()
+            .uri("/v1/models")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_enabled_wrong_key_returns_401() {
+        let mut state = test_state(false);
+        state.api_key = Some("secret".to_string());
+        let app = router()
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::auth_middleware,
+            ))
+            .with_state(state);
+        let req = Request::builder()
+            .uri("/v1/models")
+            .header("authorization", "Bearer wrongkey")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_enabled_no_key_returns_401() {
+        let mut state = test_state(false);
+        state.api_key = Some("secret".to_string());
+        let app = router()
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::auth_middleware,
+            ))
+            .with_state(state);
+        let req = Request::builder()
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_enabled_x_api_key_header_passes() {
+        let mut state = test_state(false);
+        state.api_key = Some("secret".to_string());
+        let app = router()
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::auth_middleware,
+            ))
+            .with_state(state);
+        let req = Request::builder()
+            .uri("/v1/models")
+            .header("x-api-key", "secret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_health_bypasses_auth() {
+        let mut state = test_state(false);
+        state.api_key = Some("secret".to_string());
+        let app = router()
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::auth_middleware,
+            ))
+            .with_state(state);
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_props_endpoint() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .uri("/props")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["model_path"].is_string());
+        assert!(v["total_slots"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_returns_error_for_non_embedding_model() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let body = serde_json::json!({
+            "model": "test",
+            "input": "hello world"
+        });
+        let req = Request::builder()
+            .uri("/v1/embeddings")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], "model_not_supported");
     }
 }

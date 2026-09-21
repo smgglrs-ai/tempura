@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports)]
 mod api;
+mod auth;
 mod batch;
 pub mod replay;
 mod sse;
@@ -100,6 +101,9 @@ struct ServeArgs {
         help = "Attention mode: auto, naive-f32, naive-f16, flash-f32, flash-f16"
     )]
     attn_mode: String,
+
+    #[arg(long, help = "API key required on all non-health requests (overrides TEMPURA_API_KEY env var)")]
+    api_key: Option<String>,
 }
 
 pub type CpuModel = TransformerModel<
@@ -120,6 +124,7 @@ pub struct AppState {
     pub trace_store: Arc<Mutex<trace_store::TraceStore>>,
     pub metrics_handle: PrometheusHandle,
     pub request_timeout: std::time::Duration,
+    pub api_key: Option<String>,
 }
 
 #[tokio::main]
@@ -198,6 +203,7 @@ async fn main() {
                 otlp_endpoint: None,
                 device: "cpu".into(),
                 attn_mode: "auto".into(),
+                api_key: None,
             })
             .await;
         }
@@ -206,6 +212,14 @@ async fn main() {
 
 async fn run_server(args: ServeArgs) {
     init_tracing(&args.otlp_endpoint);
+
+    let api_key = args
+        .api_key
+        .clone()
+        .or_else(|| std::env::var("TEMPURA_API_KEY").ok());
+    if api_key.is_some() {
+        tracing::info!("API key authentication enabled");
+    }
 
     let use_gpu = (args.device == "cuda" || args.device == "cutile") && cfg!(feature = "cutile");
     if (args.device == "cuda" || args.device == "cutile") && !cfg!(feature = "cutile") {
@@ -326,9 +340,14 @@ async fn run_server(args: ServeArgs) {
             trace_store: Arc::new(Mutex::new(traces)),
             metrics_handle,
             request_timeout: std::time::Duration::from_secs(args.request_timeout_secs),
+            api_key: api_key.clone(),
         };
 
         let app = api::router()
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth::auth_middleware,
+            ))
             .layer(CorsLayer::permissive())
             .with_state(state);
 
@@ -424,9 +443,14 @@ async fn run_server(args: ServeArgs) {
         trace_store: Arc::new(Mutex::new(traces)),
         metrics_handle,
         request_timeout: std::time::Duration::from_secs(args.request_timeout_secs),
+        api_key,
     };
 
     let app = api::router()
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::auth_middleware,
+        ))
         .layer(CorsLayer::permissive())
         .with_state(state);
 

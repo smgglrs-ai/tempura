@@ -35,16 +35,29 @@ pub enum GgmlType {
     Q5_0 = 6,
     Q5_1 = 7,
     Q8_0 = 8,
+    Q8_1 = 9,
     Q2K = 10,
     Q3K = 11,
     Q4K = 12,
     Q5K = 13,
     Q6K = 14,
+    Q8K = 15,
+    IQ2XXS = 16,
+    IQ2XS = 17,
+    IQ3XXS = 18,
+    IQ1S = 19,
+    IQ4NL = 20,
+    IQ3S = 21,
+    IQ2S = 22,
+    IQ4XS = 23,
+    IQ1M = 29,
     BF16 = 30,
-    TQ1_0 = 36,  // upstream llama.cpp: base-3 ternary; bitnet.cpp: I2_S (2-bit ternary, no scale)
-    TQ2_0 = 37,
+    TQ1_0 = 34,
+    TQ2_0 = 35,
     TL1 = 38,    // bitnet.cpp: ARM TL1 LUT format
-    I2S = 39,    // bitnet.cpp: x86 TL2/I2_S LUT format (2-bit ternary)
+    I2S = 39,    // bitnet.cpp: x86 TL2/I2_S LUT format; NOTE: upstream GGUF uses 39 for MXFP4
+    NVFP4 = 40,
+    Q1_0 = 41,
     Q2_0 = 42,   // PrismML: 2-bit ternary, group size 128, f16 scale
 }
 
@@ -58,16 +71,29 @@ impl GgmlType {
             6 => Ok(GgmlType::Q5_0),
             7 => Ok(GgmlType::Q5_1),
             8 => Ok(GgmlType::Q8_0),
+            9 => Ok(GgmlType::Q8_1),
             10 => Ok(GgmlType::Q2K),
             11 => Ok(GgmlType::Q3K),
             12 => Ok(GgmlType::Q4K),
             13 => Ok(GgmlType::Q5K),
             14 => Ok(GgmlType::Q6K),
+            15 => Ok(GgmlType::Q8K),
+            16 => Ok(GgmlType::IQ2XXS),
+            17 => Ok(GgmlType::IQ2XS),
+            18 => Ok(GgmlType::IQ3XXS),
+            19 => Ok(GgmlType::IQ1S),
+            20 => Ok(GgmlType::IQ4NL),
+            21 => Ok(GgmlType::IQ3S),
+            22 => Ok(GgmlType::IQ2S),
+            23 => Ok(GgmlType::IQ4XS),
+            29 => Ok(GgmlType::IQ1M),
             30 => Ok(GgmlType::BF16),
-            36 => Ok(GgmlType::TQ1_0),
-            37 => Ok(GgmlType::TQ2_0),
+            34 => Ok(GgmlType::TQ1_0),
+            35 => Ok(GgmlType::TQ2_0),
             38 => Ok(GgmlType::TL1),
             39 => Ok(GgmlType::I2S),
+            40 => Ok(GgmlType::NVFP4),
+            41 => Ok(GgmlType::Q1_0),
             42 => Ok(GgmlType::Q2_0),
             _ => Err(LoadError::GgufParse(format!("unsupported GGML type: {v}"))),
         }
@@ -701,6 +727,10 @@ fn tensor_data_size(dtype: GgmlType, num_elements: u64, dims: &[u64]) -> u64 {
         GgmlType::Q4K => (num_elements / 256) * 144,
         GgmlType::Q5K => (num_elements / 256) * 176,
         GgmlType::Q6K => (num_elements / 256) * 210,
+        // IQ4_NL: block_iq4_nl = 2 (f16 d) + 16 (qs[16]) = 18 bytes per 32 elements
+        GgmlType::IQ4NL => (num_elements / 32) * 18,
+        // IQ4_XS: block_iq4_xs = 2 (f16 d) + 2 (scales_h) + 4 (scales_l[4]) + 128 (qs[128]) = 136 bytes per 256
+        GgmlType::IQ4XS => (num_elements / 256) * 136,
         GgmlType::TQ1_0 => {
             // I2_S in bitnet.cpp: 2-bit packed (ne/4) + one f32 scale per tensor
             num_elements / 4 + 4
@@ -713,6 +743,17 @@ fn tensor_data_size(dtype: GgmlType, num_elements: u64, dims: &[u64]) -> u64 {
         }
         // bitnet.cpp I2_S/TL2: 2-bit packed (ne/4 bytes) + one f32 scale per tensor
         GgmlType::I2S => num_elements / 4 + 4,
+        GgmlType::Q8_1 => (num_elements / 32) * 36,
+        GgmlType::Q8K => (num_elements / 256) * 292,
+        GgmlType::IQ2XXS => (num_elements / 256) * 66,
+        GgmlType::IQ2XS => (num_elements / 256) * 74,
+        GgmlType::IQ3XXS => (num_elements / 256) * 98,
+        GgmlType::IQ1S => (num_elements / 256) * 50,
+        GgmlType::IQ3S => (num_elements / 256) * 110,
+        GgmlType::IQ2S => (num_elements / 256) * 82,
+        GgmlType::IQ1M => (num_elements / 256) * 56,
+        GgmlType::NVFP4 => (num_elements / 64) * 36,
+        GgmlType::Q1_0 => (num_elements / 32) * 18,
     }
 }
 
@@ -1091,6 +1132,58 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         ssm_a: None,
         dt_bias: None,
         rope_dim: if std::env::var("TEMPURA_FULL_ROPE").is_ok() { None } else { get_usize("rope.dimension_count") },
+        rope_scaling: {
+            let scaling_type_str = metadata
+                .get(&format!("{arch}.rope.scaling.type"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()));
+            scaling_type_str.and_then(|s| {
+                let st = match s.as_str() {
+                    "linear" => crate::config::RopeScalingType::Linear,
+                    "ntk" => crate::config::RopeScalingType::NTK,
+                    "yarn" => crate::config::RopeScalingType::YaRN,
+                    "llama3" | "longrope" => crate::config::RopeScalingType::LLaMA3,
+                    _ => return None,
+                };
+                let factor = metadata
+                    .get(&format!("{arch}.rope.scaling.factor"))
+                    .and_then(|v| v.as_f32())
+                    .unwrap_or(1.0);
+                let original_context_length = metadata
+                    .get(&format!("{arch}.rope.scaling.original_context_length"))
+                    .and_then(|v| v.as_u32())
+                    .unwrap_or(0);
+                let yarn_beta_fast = metadata
+                    .get(&format!("{arch}.rope.scaling.yarn_beta_fast"))
+                    .and_then(|v| v.as_f32())
+                    .unwrap_or(32.0);
+                let yarn_beta_slow = metadata
+                    .get(&format!("{arch}.rope.scaling.yarn_beta_slow"))
+                    .and_then(|v| v.as_f32())
+                    .unwrap_or(1.0);
+                let yarn_attn_factor = metadata
+                    .get(&format!("{arch}.rope.scaling.yarn_attn_factor"))
+                    .and_then(|v| v.as_f32())
+                    .unwrap_or(1.0);
+                let low_freq_factor = metadata
+                    .get(&format!("{arch}.rope.scaling.low_freq_factor"))
+                    .and_then(|v| v.as_f32())
+                    .unwrap_or(1.0);
+                let high_freq_factor = metadata
+                    .get(&format!("{arch}.rope.scaling.high_freq_factor"))
+                    .and_then(|v| v.as_f32())
+                    .unwrap_or(4.0);
+                Some(crate::config::RopeScalingConfig {
+                    scaling_type: st,
+                    factor,
+                    original_context_length,
+                    yarn_beta_fast,
+                    yarn_beta_slow,
+                    yarn_attn_factor,
+                    low_freq_factor,
+                    high_freq_factor,
+                })
+            })
+        },
     })
 }
 
@@ -1104,18 +1197,29 @@ fn convert_ggml_type(dtype: GgmlType) -> tempura_kernels::ggml::GgmlType {
         GgmlType::Q5_0 => GT::Q5_0,
         GgmlType::Q5_1 => GT::Q5_1,
         GgmlType::Q8_0 => GT::Q8_0,
+        GgmlType::Q8_1 => GT::Q8_1,
         GgmlType::Q2K => GT::Q2K,
         GgmlType::Q3K => GT::Q3K,
         GgmlType::Q4K => GT::Q4K,
         GgmlType::Q5K => GT::Q5K,
         GgmlType::Q6K => GT::Q6K,
+        GgmlType::Q8K => GT::Q8K,
+        GgmlType::IQ2XXS => GT::IQ2XXS,
+        GgmlType::IQ2XS => GT::IQ2XS,
+        GgmlType::IQ3XXS => GT::IQ3XXS,
+        GgmlType::IQ1S => GT::IQ1S,
+        GgmlType::IQ4NL => GT::IQ4NL,
+        GgmlType::IQ3S => GT::IQ3S,
+        GgmlType::IQ2S => GT::IQ2S,
+        GgmlType::IQ4XS => GT::IQ4XS,
+        GgmlType::IQ1M => GT::IQ1M,
         GgmlType::BF16 => GT::BF16,
         GgmlType::TQ1_0 => GT::TQ1_0,
         GgmlType::TQ2_0 => GT::TQ2_0,
         GgmlType::TL1 => GT::TQ1_0,
-        // Map I2_S/TL2 (bitnet.cpp type 39) to TQ1_0 dequant — same 2-bit ternary encoding
         GgmlType::I2S => GT::TQ1_0,
-        // Q2_0 (PrismML 2-bit ternary) — map to Q2K as closest available type for fallback
+        GgmlType::NVFP4 => GT::NVFP4,
+        GgmlType::Q1_0 => GT::Q1_0,
         GgmlType::Q2_0 => GT::Q2K,
     }
 }
@@ -1138,10 +1242,101 @@ impl std::fmt::Debug for GgufLoader {
     }
 }
 
+/// Detect split GGUF shards (pattern: `prefix-NNNNN-of-MMMMM.gguf`) and return all shard paths
+/// in order. Returns a single-element vec for non-split files.
+fn find_split_shards(path: &Path) -> Result<Vec<std::path::PathBuf>, LoadError> {
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let stem = match filename.strip_suffix(".gguf") {
+        Some(s) => s,
+        None => return Ok(vec![path.to_path_buf()]),
+    };
+    // Look for `-NNNNN-of-MMMMM` suffix
+    let of_idx = match stem.rfind("-of-") {
+        Some(i) => i,
+        None => return Ok(vec![path.to_path_buf()]),
+    };
+    let total_str = &stem[of_idx + 4..];
+    let total: usize = match total_str.parse() {
+        Ok(n) if n > 0 => n,
+        _ => return Ok(vec![path.to_path_buf()]),
+    };
+    let before_of = &stem[..of_idx];
+    let dash_idx = match before_of.rfind('-') {
+        Some(i) => i,
+        None => return Ok(vec![path.to_path_buf()]),
+    };
+    if before_of[dash_idx + 1..].parse::<usize>().is_err() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let prefix = &before_of[..dash_idx];
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut shards = Vec::with_capacity(total);
+    for i in 1..=total {
+        let name = format!("{prefix}-{i:05}-of-{total:05}.gguf");
+        let shard = dir.join(&name);
+        if !shard.exists() {
+            return Err(LoadError::GgufParse(format!(
+                "missing GGUF shard: {}",
+                shard.display()
+            )));
+        }
+        shards.push(shard);
+    }
+    Ok(shards)
+}
+
 impl GgufLoader {
     pub fn from_file(path: &Path) -> Result<Self, LoadError> {
         let data = std::fs::read(path)?;
         Self::from_bytes(&data)
+    }
+
+    /// Load a GGUF model, transparently handling split multi-file shards.
+    /// Accepts any shard path (e.g. `model-00001-of-00004.gguf`) and loads all shards.
+    pub fn from_path(path: &Path) -> Result<Self, LoadError> {
+        let shards = find_split_shards(path)?;
+        if shards.len() <= 1 {
+            return Self::from_file(path);
+        }
+        let data0 = std::fs::read(&shards[0])?;
+        let mut loader = Self::from_bytes(&data0)?;
+        for shard_path in &shards[1..] {
+            let data = std::fs::read(shard_path)?;
+            let shard = Self::from_bytes(&data)?;
+            loader.tensors.extend(shard.tensors);
+            loader.raw_tensors.extend(shard.raw_tensors);
+            loader.tensor_dtypes.extend(shard.tensor_dtypes);
+            loader.raw_tensor_dims.extend(shard.raw_tensor_dims);
+            loader.f16_raw_tensors.extend(shard.f16_raw_tensors);
+            loader.mmap_ranges.extend(shard.mmap_ranges);
+        }
+        Ok(loader)
+    }
+
+    /// Load a quantized GGUF model, transparently handling split multi-file shards.
+    pub fn from_path_quantized(path: &Path) -> Result<Self, LoadError> {
+        let shards = find_split_shards(path)?;
+        if shards.len() <= 1 {
+            return Self::from_file_quantized(path);
+        }
+        // Quantized path uses mmap; for multi-shard we fall back to from_bytes_quantized
+        // which loads without mmap so we can merge shards.
+        let data0 = std::fs::read(&shards[0])?;
+        let mut loader = Self::from_bytes_quantized(&data0)?;
+        for shard_path in &shards[1..] {
+            let data = std::fs::read(shard_path)?;
+            let shard = Self::from_bytes_quantized(&data)?;
+            loader.tensors.extend(shard.tensors);
+            loader.raw_tensors.extend(shard.raw_tensors);
+            loader.tensor_dtypes.extend(shard.tensor_dtypes);
+            loader.raw_tensor_dims.extend(shard.raw_tensor_dims);
+            loader.f16_raw_tensors.extend(shard.f16_raw_tensors);
+            loader.mmap_ranges.extend(shard.mmap_ranges);
+        }
+        Ok(loader)
     }
 
     pub fn from_file_quantized(path: &Path) -> Result<Self, LoadError> {
@@ -1284,6 +1479,20 @@ impl GgufLoader {
                         // I2S/TL2 embed/norm should not appear — fall back to zeros
                         vec![0.0f32; ne]
                     }
+                    // Types with no dequant kernel yet
+                    GgmlType::Q8_1
+                    | GgmlType::Q8K
+                    | GgmlType::IQ2XXS
+                    | GgmlType::IQ2XS
+                    | GgmlType::IQ3XXS
+                    | GgmlType::IQ1S
+                    | GgmlType::IQ4NL
+                    | GgmlType::IQ3S
+                    | GgmlType::IQ2S
+                    | GgmlType::IQ4XS
+                    | GgmlType::IQ1M
+                    | GgmlType::NVFP4
+                    | GgmlType::Q1_0 => vec![0.0f32; ne],
                 };
                 tensors.insert(mapped_name.clone(), floats);
             } else if !use_mmap && !skip_f32 {
@@ -1482,6 +1691,20 @@ impl GgufLoader {
                 GgmlType::Q2_0 => dequant_q2_0(tensor_data, ne),
                 GgmlType::TQ1_0 | GgmlType::TL1 => dequant_tq1(tensor_data, ne),
                 GgmlType::I2S => vec![0.0f32; ne],
+                // Types with no dequant kernel yet — load raw bytes, return zeros for f32 path
+                GgmlType::Q8_1
+                | GgmlType::Q8K
+                | GgmlType::IQ2XXS
+                | GgmlType::IQ2XS
+                | GgmlType::IQ3XXS
+                | GgmlType::IQ1S
+                | GgmlType::IQ4NL
+                | GgmlType::IQ3S
+                | GgmlType::IQ2S
+                | GgmlType::IQ4XS
+                | GgmlType::IQ1M
+                | GgmlType::NVFP4
+                | GgmlType::Q1_0 => vec![0.0f32; ne],
             };
 
             let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
