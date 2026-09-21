@@ -15,6 +15,7 @@ pub struct KvCache {
     pub v_f16: Vec<Vec<u16>>,
     pub use_f16: bool,
     pub seq_len: usize,
+    pub position_offset: i64,
     num_layers: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -108,6 +109,7 @@ impl KvCache {
             v_f16,
             use_f16,
             seq_len: 0,
+            position_offset: 0,
             num_layers: num_cache_layers,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
@@ -135,6 +137,7 @@ impl KvCache {
             v_f16: Vec::new(),
             use_f16: false,
             seq_len: 0,
+            position_offset: 0,
             num_layers: num_cache_layers,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
@@ -192,6 +195,7 @@ impl KvCache {
 
     pub fn reset(&mut self) {
         self.seq_len = 0;
+        self.position_offset = 0;
         if self.compressed {
             for c in &mut self.k_compressed {
                 *c = None;
@@ -200,6 +204,40 @@ impl KvCache {
                 *c = None;
             }
         }
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.seq_len >= self.max_seq_len
+    }
+
+    /// Discard the oldest `keep_from` tokens, keeping tokens `[keep_from..seq_len]`.
+    /// Slides KV data left so the kept entries start at slot 0.
+    /// Updates `position_offset` so callers know how many tokens were discarded total.
+    /// No-op for compressed caches (compressor handles memory separately).
+    pub fn shift(&mut self, keep_from: usize) {
+        if self.compressed { return; }
+        debug_assert!(keep_from <= self.seq_len);
+        let n_keep = self.seq_len - keep_from;
+        let stride = self.num_kv_heads * self.head_dim;
+
+        if self.use_f16 {
+            for layer in 0..self.num_layers {
+                self.k_f16[layer].copy_within(keep_from * stride..(keep_from + n_keep) * stride, 0);
+                self.k_f16[layer][n_keep * stride..self.seq_len * stride].fill(0);
+                self.v_f16[layer].copy_within(keep_from * stride..(keep_from + n_keep) * stride, 0);
+                self.v_f16[layer][n_keep * stride..self.seq_len * stride].fill(0);
+            }
+        } else {
+            for layer in 0..self.num_layers {
+                self.k[layer].copy_within(keep_from * stride..(keep_from + n_keep) * stride, 0);
+                self.k[layer][n_keep * stride..self.seq_len * stride].fill(0.0);
+                self.v[layer].copy_within(keep_from * stride..(keep_from + n_keep) * stride, 0);
+                self.v[layer][n_keep * stride..self.seq_len * stride].fill(0.0);
+            }
+        }
+
+        self.position_offset += keep_from as i64;
+        self.seq_len = n_keep;
     }
 
     pub fn k_data_f16(&self, layer: usize, total_len: usize) -> &[u16] {
@@ -1284,6 +1322,74 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_kv_cache_shift_preserves_data() {
+        let config = ModelConfig::tiny_test();
+        let mut cache = KvCache::new(&config);
+        let stride = config.num_kv_heads * config.head_dim;
+
+        for i in 0..4 {
+            let k: Vec<f32> = (0..stride).map(|d| (i * 10 + d) as f32).collect();
+            let v: Vec<f32> = (0..stride).map(|d| (i * 10 + d) as f32 * 2.0).collect();
+            cache.append_kv(0, &k, &v, 1);
+            cache.advance(1);
+        }
+        assert_eq!(cache.seq_len, 4);
+
+        // shift: keep_from=2 means discard tokens 0,1 and keep tokens 2,3
+        cache.shift(2);
+
+        assert_eq!(cache.seq_len, 2);
+        assert_eq!(cache.position_offset, 2);
+
+        // After shift, slot 0 should contain what was slot 2 (k = 20+d)
+        let k_slice = cache.k_slice(0);
+        assert_eq!(k_slice[0], 20.0);
+        // slot 1 should contain what was slot 3 (k = 30+d)
+        assert_eq!(k_slice[stride], 30.0);
+    }
+
+    #[test]
+    fn test_kv_cache_position_offset_increments() {
+        let config = ModelConfig::tiny_test();
+        let mut cache = KvCache::new(&config);
+        let stride = config.num_kv_heads * config.head_dim;
+        let k = vec![1.0f32; stride];
+        let v = vec![2.0f32; stride];
+
+        for _ in 0..4 {
+            cache.append_kv(0, &k, &v, 1);
+            cache.advance(1);
+        }
+
+        cache.shift(2); // discard 2
+        assert_eq!(cache.position_offset, 2);
+
+        for _ in 0..2 {
+            cache.append_kv(0, &k, &v, 1);
+            cache.advance(1);
+        }
+        cache.shift(2); // discard 2 more
+        assert_eq!(cache.position_offset, 4);
+    }
+
+    #[test]
+    fn test_kv_cache_is_full() {
+        let config = ModelConfig::tiny_test();
+        let mut cache = KvCache::new(&config);
+        assert!(!cache.is_full());
+
+        let stride = config.num_kv_heads * config.head_dim;
+        let k = vec![0.0f32; stride * config.max_seq_len];
+        let v = vec![0.0f32; stride * config.max_seq_len];
+        cache.append_kv(0, &k, &v, config.max_seq_len);
+        cache.advance(config.max_seq_len);
+        assert!(cache.is_full());
+
+        cache.shift(config.max_seq_len / 2);
+        assert!(!cache.is_full());
+    }
 
     #[test]
     fn test_kv_cache_append_and_read() {

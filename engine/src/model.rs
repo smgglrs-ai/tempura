@@ -84,6 +84,7 @@ fn attention_layer_decode(
     sub_norm_w: Option<&[f32]>,
     eps: f32,
     use_ggml_compat: bool,
+    sliding_window: Option<usize>,
 ) {
     use tempura_kernels::RoPE as _;
 
@@ -147,27 +148,27 @@ fn attention_layer_decode(
     let k_cache = session.cache.k_data(cache_layer, kv_len);
     let v_cache = session.cache.v_data(cache_layer, kv_len);
 
+    let scale = 1.0 / (head_dim as f32).sqrt();
     if use_ggml_compat {
-        tempura_kernels::attention::CpuAttentionGgml
-            .forward(
-                q, &k_cache, &v_cache,
-                &mut attn_out[..q_dim],
-                1, 1, kv_len,
-                n_heads, n_kv_heads, head_dim,
-                1.0 / (head_dim as f32).sqrt(),
-            )
-            .unwrap();
+        use tempura_kernels::Attention as _;
+        match sliding_window {
+            Some(w) => tempura_kernels::attention::CpuAttentionGgml
+                .forward_windowed(q, &k_cache, &v_cache, &mut attn_out[..q_dim], 1, 1, kv_len, n_heads, n_kv_heads, head_dim, scale, w)
+                .unwrap(),
+            None => tempura_kernels::attention::CpuAttentionGgml
+                .forward(q, &k_cache, &v_cache, &mut attn_out[..q_dim], 1, 1, kv_len, n_heads, n_kv_heads, head_dim, scale)
+                .unwrap(),
+        }
     } else {
         use tempura_kernels::Attention as _;
-        tempura_kernels::attention::CpuAttention
-            .forward(
-                q, &k_cache, &v_cache,
-                &mut attn_out[..q_dim],
-                1, 1, kv_len,
-                n_heads, n_kv_heads, head_dim,
-                1.0 / (head_dim as f32).sqrt(),
-            )
-            .unwrap();
+        match sliding_window {
+            Some(w) => tempura_kernels::attention::CpuAttention
+                .forward_windowed(q, &k_cache, &v_cache, &mut attn_out[..q_dim], 1, 1, kv_len, n_heads, n_kv_heads, head_dim, scale, w)
+                .unwrap(),
+            None => tempura_kernels::attention::CpuAttention
+                .forward(q, &k_cache, &v_cache, &mut attn_out[..q_dim], 1, 1, kv_len, n_heads, n_kv_heads, head_dim, scale)
+                .unwrap(),
+        }
     }
 
     if has_q_gate {
@@ -3588,7 +3589,17 @@ where
 
             for _token_step in 0..max_tokens {
                 if shared_stop.load(std::sync::atomic::Ordering::Relaxed) { break; }
-                if ith == 0 { _tok_start = Instant::now(); }
+                if ith == 0 {
+                    _tok_start = Instant::now();
+                    // Rolling context window: shift to make room when cache is about to fill.
+                    // Keeps the most recent half; KV data already has RoPE encoded at absolute
+                    // positions so relative attention scores remain correct after the shift.
+                    let sess = unsafe { &mut *(sp as *mut InferenceSession) };
+                    if sess.cache.seq_len + 1 >= sess.cache.max_seq_len() {
+                        let keep_from = sess.cache.max_seq_len() / 2;
+                        sess.cache.shift(keep_from);
+                    }
+                }
 
                 let session = unsafe { &*(sp as *const InferenceSession) };
                 let positions = [session.position as u32];
@@ -3837,6 +3848,7 @@ where
                             sess, cl, n_heads, n_kv_heads, head_dim, q_dim, kv_dim, actual_q_cols,
                             has_q_gate, rope_hd, cfg.rope_theta, &positions,
                             qnw, knw, qweights.get_f32(asn), cfg.layer_norm_eps, ggml_compat,
+                            cfg.sliding_window,
                         );
                         {
                             let q8 = unsafe { std::slice::from_raw_parts_mut(q8p as *mut u8, q8_act_len) };
