@@ -584,10 +584,69 @@ pub fn vec_dot_q4_k_q8_k_dispatch(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f
     super::vec_dot::vec_dot_q4_k_q8_k(n, x, y)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+pub unsafe fn vec_dot_q6_k_q8_k_vnni(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -> f32 {
+    let nb = n / 256;
+    let mut sum = 0.0f32;
+
+    for i in 0..nb {
+        let d = f16_to_f32(x[i].d) * y[i].d;
+        let ql = &x[i].ql;
+        let qh = &x[i].qh;
+        let sc = &x[i].scales;
+        let q8 = &y[i].qs;
+
+        let mut aux8 = [0i8; 256];
+        let mut a_idx = 0usize;
+        let mut ql_off = 0usize;
+        let mut qh_off = 0usize;
+        for _half in 0..2 {
+            for l in 0..32 {
+                aux8[a_idx + l] = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
+                aux8[a_idx + 32 + l] =
+                    ((ql[ql_off + 32 + l] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
+                aux8[a_idx + 64 + l] =
+                    ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
+                aux8[a_idx + 96 + l] =
+                    ((ql[ql_off + 32 + l] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
+            }
+            a_idx += 128;
+            ql_off += 64;
+            qh_off += 32;
+        }
+
+        // Use dpbusd (unsigned×signed) via abs+sign trick on 16-element scale groups.
+        // Each group has 16 signed i8 values. abs+sign: |a|×sign(a)*b = a*b.
+        let mut sumi = 0i32;
+        for j in 0..16 {
+            let scale = sc[j] as i32;
+            let base = j * 16;
+            let a_lo = _mm_loadu_si128(aux8[base..].as_ptr() as *const __m128i);
+            let b_lo = _mm_loadu_si128(q8[base..].as_ptr() as *const __m128i);
+            let abs_a = _mm_sign_epi8(a_lo, a_lo);
+            let signed_b = _mm_sign_epi8(b_lo, a_lo);
+            // Zero-extend 128-bit → 256-bit; upper 16 bytes are zero → contribute 0
+            let abs_a_256 = _mm256_set_m128i(_mm_setzero_si128(), abs_a);
+            let signed_b_256 = _mm256_set_m128i(_mm_setzero_si128(), signed_b);
+            let dot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), abs_a_256, signed_b_256);
+            sumi += hsum_i32_8(dot) * scale;
+        }
+
+        sum += d * sumi as f32;
+    }
+    sum
+}
+
 pub fn vec_dot_q6_k_q8_k_dispatch(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        return unsafe { vec_dot_q6_k_q8_k_avx2(n, x, y) };
+    {
+        if is_x86_feature_detected!("avxvnni") {
+            return unsafe { vec_dot_q6_k_q8_k_vnni(n, x, y) };
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { vec_dot_q6_k_q8_k_avx2(n, x, y) };
+        }
     }
     super::vec_dot::vec_dot_q6_k_q8_k(n, x, y)
 }
