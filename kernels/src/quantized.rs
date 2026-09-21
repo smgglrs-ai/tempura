@@ -4090,6 +4090,24 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         // llama.cpp translation: Q8_K activations × Q4_K weights via vec_dot_q4_K_q8_K.
         // Thread-local buffer avoids one Vec allocation per input row per Rayon worker.
         #[cfg(feature = "openmp")]
+        if m == 1 {
+            use crate::ggml::blocks::BlockQ8K;
+            let a_row = &a[0..k];
+            let mut q8k_buf = vec![unsafe { std::mem::zeroed::<BlockQ8K>() }; blocks_per_row];
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                unsafe {
+                    crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, &mut q8k_buf)
+                };
+            } else {
+                crate::ggml::quantize::quantize_row_q8_k(a_row, &mut q8k_buf);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            crate::ggml::quantize::quantize_row_q8_k(a_row, &mut q8k_buf);
+            crate::openmp_gemv::openmp::gemv_q4k(b_quantized, &q8k_buf, output, n, blocks_per_row);
+            return Ok(());
+        }
+        #[cfg(feature = "openmp")]
         if m > 1 {
             // K-tiled GEMM: pre-quantize all m rows to Q8K, then run OpenMP-parallel
             // (j_tile, kb, i) loop so each weight block is loaded once and reused for all m rows.
@@ -4267,6 +4285,24 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         }
 
         // llama.cpp translation: Q8_K activations × Q6_K weights via vec_dot_q6_K_q8_K.
+        #[cfg(feature = "openmp")]
+        if m == 1 {
+            use crate::ggml::blocks::BlockQ8K;
+            let a_row = &a[0..k];
+            let mut q8k_buf = vec![unsafe { std::mem::zeroed::<BlockQ8K>() }; blocks_per_row];
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                unsafe {
+                    crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, &mut q8k_buf)
+                };
+            } else {
+                crate::ggml::quantize::quantize_row_q8_k(a_row, &mut q8k_buf);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            crate::ggml::quantize::quantize_row_q8_k(a_row, &mut q8k_buf);
+            crate::openmp_gemv::openmp::gemv_q6k(b_quantized, &q8k_buf, output, n, blocks_per_row);
+            return Ok(());
+        }
         #[cfg(feature = "openmp")]
         if m > 1 {
             use crate::ggml::blocks::BlockQ8K;
