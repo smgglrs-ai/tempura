@@ -6187,6 +6187,7 @@ mod tests {
             rmsnorm_offset: false,
             attn_logit_softcapping: None,
             embedding_scale: false,
+            rope_scaling: None,
         };
 
         let q_dim = heads * head_dim;
@@ -6302,6 +6303,7 @@ mod tests {
             rmsnorm_offset: false,
             attn_logit_softcapping: None,
             embedding_scale: false,
+            rope_scaling: None,
         };
 
         let q_dim = heads * head_dim;
