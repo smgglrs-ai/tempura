@@ -343,9 +343,13 @@ async fn run_server(args: ServeArgs) {
         let (engine_tx, engine_rx) =
             tokio::sync::mpsc::channel::<engine_task::EngineRequest>(args.max_batch_size * 4);
         let engine_model = model.clone();
-        tokio::task::spawn_blocking(move || {
-            engine_task::EngineTask::new(engine_model, engine_rx).run();
-        });
+        std::thread::Builder::new()
+            .name("tempura-engine".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                engine_task::EngineTask::new(engine_model, engine_rx).run();
+            })
+            .expect("failed to spawn engine thread");
 
         let state = AppState {
             model,
@@ -455,9 +459,13 @@ async fn run_server(args: ServeArgs) {
     let (engine_tx, engine_rx) =
         tokio::sync::mpsc::channel::<engine_task::EngineRequest>(args.max_batch_size * 4);
     let engine_model = model.clone();
-    tokio::task::spawn_blocking(move || {
-        engine_task::EngineTask::new(engine_model, engine_rx).run();
-    });
+    std::thread::Builder::new()
+        .name("tempura-engine".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            engine_task::EngineTask::new(engine_model, engine_rx).run();
+        })
+        .expect("failed to spawn engine thread");
 
     let state = AppState {
         model,

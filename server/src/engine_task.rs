@@ -71,11 +71,20 @@ impl ActiveSession {
 pub struct EngineTask {
     model: Arc<dyn InferenceModel>,
     rx: mpsc::Receiver<EngineRequest>,
+    thread_pool: rayon::ThreadPool,
 }
 
 impl EngineTask {
     pub fn new(model: Arc<dyn InferenceModel>, rx: mpsc::Receiver<EngineRequest>) -> Self {
-        Self { model, rx }
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .thread_name(|i| format!("tempura-compute-{i}"))
+            .build()
+            .expect("failed to build rayon thread pool");
+        Self { model, rx, thread_pool }
     }
 
     pub fn run(mut self) {
@@ -144,7 +153,8 @@ impl EngineTask {
 
             for id in &ids {
                 let entry = sessions.get_mut(id).unwrap();
-                if entry.step(self.model.as_ref()) {
+                let done = self.thread_pool.install(|| entry.step(self.model.as_ref()));
+                if done {
                     completed.push(id.clone());
                 }
             }
