@@ -497,6 +497,135 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
     hsum_f32_8(acc) - mins_total
 }
 
+/// Compute dot products of Q8K activation against TWO Q4K weight rows simultaneously.
+/// Shares Q8K loads (activation) across both rows, reducing memory traffic by ~30%.
+/// Returns (dot(x0, y), dot(x1, y)).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+pub unsafe fn vec_dot_q4_k_q8_k_vnni_pair(
+    n: usize,
+    x0: &[BlockQ4K],
+    x1: &[BlockQ4K],
+    y: &[BlockQ8K],
+) -> (f32, f32) {
+    use super::helpers::get_scale_min_k4;
+    let nb = n / 256;
+    let mask_lo = _mm256_set1_epi8(0x0F);
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut mins_total0 = 0.0f32;
+    let mut mins_total1 = 0.0f32;
+
+    for i in 0..nb {
+        let d_y = y[i].d;
+
+        // Row 0 scales
+        let d0 = f16_to_f32(x0[i].d) * d_y;
+        let dmin0 = f16_to_f32(x0[i].dmin) * d_y;
+        let mut sc0 = [0u8; 8];
+        let mut mi0 = [0u8; 8];
+        for j in 0..8 {
+            let (s, m) = get_scale_min_k4(j, &x0[i].scales);
+            sc0[j] = s;
+            mi0[j] = m;
+        }
+
+        // Row 1 scales
+        let d1 = f16_to_f32(x1[i].d) * d_y;
+        let dmin1 = f16_to_f32(x1[i].dmin) * d_y;
+        let mut sc1 = [0u8; 8];
+        let mut mi1 = [0u8; 8];
+        for j in 0..8 {
+            let (s, m) = get_scale_min_k4(j, &x1[i].scales);
+            sc1[j] = s;
+            mi1[j] = m;
+        }
+
+        // Shared mins from Q8K bsums
+        let mut sumi_mins0 = 0i32;
+        let mut sumi_mins1 = 0i32;
+        for j in 0..16 {
+            sumi_mins0 += y[i].bsums[j] as i32 * mi0[j / 2] as i32;
+            sumi_mins1 += y[i].bsums[j] as i32 * mi1[j / 2] as i32;
+        }
+        mins_total0 += dmin0 * sumi_mins0 as f32;
+        mins_total1 += dmin1 * sumi_mins1 as f32;
+
+        let q8 = &y[i].qs;
+        let mut sumi0 = _mm256_setzero_si256();
+        let mut sumi1 = _mm256_setzero_si256();
+
+        for j in 0..4 {
+            // Load Q8K activation ONCE per pair (shared)
+            let q8_lo = _mm256_loadu_si256(q8[j * 64..].as_ptr() as *const __m256i);
+            let q8_hi = _mm256_loadu_si256(q8[j * 64 + 32..].as_ptr() as *const __m256i);
+
+            // Row 0 nibbles
+            let q4_0 = &x0[i].qs;
+            let q4_chunk0 = _mm256_loadu_si256(q4_0[j * 32..].as_ptr() as *const __m256i);
+            let q4_lo0 = _mm256_and_si256(q4_chunk0, mask_lo);
+            let q4_hi0 = _mm256_and_si256(_mm256_srli_epi16(q4_chunk0, 4), mask_lo);
+
+            let sc_lo0 = sc0[2 * j] as i32;
+            let sc_hi0 = sc0[2 * j + 1] as i32;
+            let dot_lo0 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_lo0, q8_lo);
+            let dot_hi0 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_hi0, q8_hi);
+            sumi0 = _mm256_add_epi32(
+                sumi0,
+                _mm256_add_epi32(
+                    _mm256_mullo_epi32(dot_lo0, _mm256_set1_epi32(sc_lo0)),
+                    _mm256_mullo_epi32(dot_hi0, _mm256_set1_epi32(sc_hi0)),
+                ),
+            );
+
+            // Row 1 nibbles
+            let q4_1 = &x1[i].qs;
+            let q4_chunk1 = _mm256_loadu_si256(q4_1[j * 32..].as_ptr() as *const __m256i);
+            let q4_lo1 = _mm256_and_si256(q4_chunk1, mask_lo);
+            let q4_hi1 = _mm256_and_si256(_mm256_srli_epi16(q4_chunk1, 4), mask_lo);
+
+            let sc_lo1 = sc1[2 * j] as i32;
+            let sc_hi1 = sc1[2 * j + 1] as i32;
+            let dot_lo1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_lo1, q8_lo);
+            let dot_hi1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_hi1, q8_hi);
+            sumi1 = _mm256_add_epi32(
+                sumi1,
+                _mm256_add_epi32(
+                    _mm256_mullo_epi32(dot_lo1, _mm256_set1_epi32(sc_lo1)),
+                    _mm256_mullo_epi32(dot_hi1, _mm256_set1_epi32(sc_hi1)),
+                ),
+            );
+        }
+
+        acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), _mm256_cvtepi32_ps(sumi0), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(sumi1), acc1);
+    }
+
+    (hsum_f32_8(acc0) - mins_total0, hsum_f32_8(acc1) - mins_total1)
+}
+
+/// Dispatch pair dot product — uses VNNI when available, falls back to two scalar calls.
+pub fn vec_dot_q4_k_q8_k_dispatch_pair(
+    n: usize,
+    x0: &[BlockQ4K],
+    x1: &[BlockQ4K],
+    y: &[BlockQ8K],
+) -> (f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avxvnni") {
+        return unsafe { vec_dot_q4_k_q8_k_vnni_pair(n, x0, x1, y) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512vnni") {
+        return unsafe { vec_dot_q4_k_q8_k_vnni_pair(n, x0, x1, y) };
+    }
+    (
+        vec_dot_q4_k_q8_k_dispatch(n, x0, y),
+        vec_dot_q4_k_q8_k_dispatch(n, x1, y),
+    )
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni")]
 pub unsafe fn vec_dot_q4_0_q8_0_vnni(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {

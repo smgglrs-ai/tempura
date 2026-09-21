@@ -4095,32 +4095,60 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 let j_chunk = (n / rayon::current_num_threads()).max(64);
                 row_out.par_chunks_mut(j_chunk).enumerate().for_each(|(ci, jchunk)| {
                     let j_start = ci * j_chunk;
-                    for (local, out_val) in jchunk.iter_mut().enumerate() {
+                    let chunk_len = jchunk.len();
+                    let mut local = 0usize;
+
+                    // Process pairs of output neurons — share Q8K activation loads
+                    while local + 1 < chunk_len {
                         let j = j_start + local;
                         #[cfg(target_arch = "x86_64")]
                         {
-                            let pf_j = j_start + local + PREFETCH_DIST;
-                            if pf_j < n {
+                            let pf_j = j + PREFETCH_DIST;
+                            if pf_j + 1 < n {
                                 unsafe {
                                     use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
                                     _mm_prefetch(
                                         b_quantized.as_ptr().add(pf_j * row_bytes_q4k) as *const i8,
                                         _MM_HINT_T1,
                                     );
+                                    _mm_prefetch(
+                                        b_quantized.as_ptr().add((pf_j + 1) * row_bytes_q4k) as *const i8,
+                                        _MM_HINT_T1,
+                                    );
                                 }
                             }
                         }
-                        let row_start = j * row_bytes_q4k;
-                        let weight_blocks: &[BlockQ4K] = unsafe {
+                        let w0: &[BlockQ4K] = unsafe {
                             std::slice::from_raw_parts(
-                                b_quantized.as_ptr().add(row_start) as *const BlockQ4K,
+                                b_quantized.as_ptr().add(j * row_bytes_q4k) as *const BlockQ4K,
                                 blocks_per_row,
                             )
                         };
-                        *out_val = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(
-                            k,
-                            weight_blocks,
-                            a_q8k,
+                        let w1: &[BlockQ4K] = unsafe {
+                            std::slice::from_raw_parts(
+                                b_quantized.as_ptr().add((j + 1) * row_bytes_q4k) as *const BlockQ4K,
+                                blocks_per_row,
+                            )
+                        };
+                        let (r0, r1) = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch_pair(
+                            k, w0, w1, a_q8k,
+                        );
+                        jchunk[local] = r0;
+                        jchunk[local + 1] = r1;
+                        local += 2;
+                    }
+
+                    // Scalar tail for odd chunk lengths
+                    if local < chunk_len {
+                        let j = j_start + local;
+                        let weight_blocks: &[BlockQ4K] = unsafe {
+                            std::slice::from_raw_parts(
+                                b_quantized.as_ptr().add(j * row_bytes_q4k) as *const BlockQ4K,
+                                blocks_per_row,
+                            )
+                        };
+                        jchunk[local] = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(
+                            k, weight_blocks, a_q8k,
                         );
                     }
                 });
