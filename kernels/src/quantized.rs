@@ -3991,156 +3991,74 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             });
         }
 
-        if m == 1 {
-            let a_row = &a[0..k];
+        use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+        // These assert that the raw byte layout matches the typed struct layout.
+        // Catches any accidental BlockQ4K struct size drift from GGUF spec.
+        const _: () = assert!(std::mem::size_of::<BlockQ4K>() == 144);
+        const _: () = assert!(std::mem::size_of::<BlockQ8K>() == 292);
 
-            #[cfg(target_arch = "x86_64")]
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                let (a_q8, a_scales, a_group_sums) = unsafe { quantize_row_q8_avx2(a_row) };
-
-                #[cfg(target_arch = "x86_64")]
-                let use_vnni = is_x86_feature_detected!("avxvnni");
-                #[cfg(not(target_arch = "x86_64"))]
-                let use_vnni = false;
-
-                let chunk_size = (n / rayon::current_num_threads()).max(64);
-                output[..n].par_chunks_mut(chunk_size).enumerate().for_each(
-                    |(chunk_idx, chunk)| {
-                        let j_start = chunk_idx * chunk_size;
-                        for (local, out) in chunk.iter_mut().enumerate() {
-                            let j = j_start + local;
-                            let mut sum = 0.0f32;
-                            for blk in 0..blocks_per_row {
-                                let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                                let block =
-                                    &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                                let aq_slice =
-                                    &a_q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                                let a_sc = a_scales[blk];
-                                let a_gsums =
-                                    &a_group_sums[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
-                                sum += if use_vnni {
-                                    unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
-                                } else {
-                                    unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
-                                };
-                            }
-                            *out = sum;
-                        }
-                    },
-                );
-                return Ok(());
-            }
-
-            let chunk_size = (n / rayon::current_num_threads()).max(64);
-            output[..n]
-                .par_chunks_mut(chunk_size)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk)| {
-                    let j_start = chunk_idx * chunk_size;
-                    for (local, out) in chunk.iter_mut().enumerate() {
-                        let j = j_start + local;
-                        let mut sum = 0.0f32;
-                        for blk in 0..blocks_per_row {
-                            let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                            let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                            let a_slice = &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                            sum += q4k_dot_block(block, a_slice);
-                        }
-                        *out = sum;
-                    }
-                });
-        } else if std::env::var("TEMPURA_DETERMINISTIC").is_ok() {
-            // Deterministic batched: per-element q4k_dot_block, matches GPU accumulation order
-            let blocks_per_row = k / Q4K_BLOCK_SIZE;
-            output[..m * n]
-                .par_chunks_mut(n)
-                .enumerate()
-                .for_each(|(i, row_out)| {
+        if std::env::var("TEMPURA_DETERMINISTIC").is_ok() {
+            // Deterministic reference path — matches GPU accumulation order for comparison
+            output[..m * n].par_chunks_mut(n).enumerate().for_each(
+                |(i, row_out)| {
                     let a_row = &a[i * k..(i + 1) * k];
                     for j in 0..n {
                         let mut sum = 0.0f32;
                         for blk in 0..blocks_per_row {
                             let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                            let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                            let a_slice = &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                            let block =
+                                &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                            let a_slice =
+                                &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
                             sum += q4k_dot_block(block, a_slice);
                         }
                         row_out[j] = sum;
                     }
-                });
-        } else {
+                },
+            );
+            return Ok(());
+        }
+
+        // llama.cpp translation: quantize activations to Q8_K (256-element blocks with bsums),
+        // then use vec_dot_q4_K_q8_K — the correct pairing for Q4_K weights.
+        output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
+            let a_row = &a[i * k..(i + 1) * k];
+            // SAFETY: BlockQ8K is a POD struct; zeroed is a valid initial state before
+            // quantize_row_q8_k* overwrites every field.
+            let mut a_q8k: Vec<BlockQ8K> =
+                (0..blocks_per_row).map(|_| unsafe { std::mem::zeroed() }).collect();
             #[cfg(target_arch = "x86_64")]
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                let use_vnni = is_x86_feature_detected!("avxvnni");
-                output[..m * n]
-                    .par_chunks_mut(n)
-                    .enumerate()
-                    .for_each(|(i, row_out)| {
-                        let a_row = &a[i * k..(i + 1) * k];
-                        let (a_q8, a_scales, a_group_sums) =
-                            unsafe { quantize_row_q8_avx2(a_row) };
-                        let j_chunk = (n / rayon::current_num_threads()).max(64);
-                        row_out.par_chunks_mut(j_chunk).enumerate().for_each(
-                            |(ci, jchunk)| {
-                                let j_start = ci * j_chunk;
-                                for (local, out_val) in jchunk.iter_mut().enumerate() {
-                                    let j = j_start + local;
-                                    let mut sum = 0.0f32;
-                                    for blk in 0..blocks_per_row {
-                                        let block_offset =
-                                            (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                                        let block = &b_quantized
-                                            [block_offset..block_offset + Q4K_BLOCK_BYTES];
-                                        let aq_slice = &a_q8
-                                            [blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                                        let a_sc = a_scales[blk];
-                                        let a_gsums = &a_group_sums
-                                            [blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
-                                        sum += if use_vnni {
-                                            unsafe {
-                                                q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums)
-                                            }
-                                        } else {
-                                            unsafe {
-                                                q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums)
-                                            }
-                                        };
-                                    }
-                                    *out_val = sum;
-                                }
-                            },
-                        );
-                    });
-                return Ok(());
+                unsafe {
+                    crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, &mut a_q8k)
+                };
+            } else {
+                crate::ggml::quantize::quantize_row_q8_k(a_row, &mut a_q8k);
             }
-            output[..m * n]
-                .par_chunks_mut(n)
-                .enumerate()
-                .for_each(|(i, row_out)| {
-                    let a_row = &a[i * k..(i + 1) * k];
-                    let j_chunk = (n / rayon::current_num_threads()).max(64);
-                    row_out.par_chunks_mut(j_chunk).enumerate().for_each(
-                        |(ci, jchunk)| {
-                            let j_start = ci * j_chunk;
-                            for (local, out_val) in jchunk.iter_mut().enumerate() {
-                                let j = j_start + local;
-                                let mut sum = 0.0f32;
-                                for blk in 0..blocks_per_row {
-                                    let block_offset =
-                                        (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                                    let block = &b_quantized
-                                        [block_offset..block_offset + Q4K_BLOCK_BYTES];
-                                    let a_slice = &a_row
-                                        [blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                                    sum += q4k_dot_block(block, a_slice);
-                                }
-                                *out_val = sum;
-                            }
-                        },
+            #[cfg(not(target_arch = "x86_64"))]
+            crate::ggml::quantize::quantize_row_q8_k(a_row, &mut a_q8k);
+
+            let j_chunk = (n / rayon::current_num_threads()).max(64);
+            row_out.par_chunks_mut(j_chunk).enumerate().for_each(|(ci, jchunk)| {
+                let j_start = ci * j_chunk;
+                for (local, out_val) in jchunk.iter_mut().enumerate() {
+                    let j = j_start + local;
+                    let row_start = j * blocks_per_row * Q4K_BLOCK_BYTES;
+                    // SAFETY: b_quantized is Q4_K data aligned to BlockQ4K layout
+                    let weight_blocks: &[BlockQ4K] = unsafe {
+                        std::slice::from_raw_parts(
+                            b_quantized.as_ptr().add(row_start) as *const BlockQ4K,
+                            blocks_per_row,
+                        )
+                    };
+                    *out_val = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(
+                        k,
+                        weight_blocks,
+                        &a_q8k,
                     );
-                });
-        }
+                }
+            });
+        });
 
         Ok(())
     }
@@ -4181,112 +4099,47 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             });
         }
 
-        if m == 1 {
-            let a_row = &a[0..k];
+        use crate::ggml::blocks::{BlockQ6K, BlockQ8K};
 
+        // llama.cpp translation: Q6_K weights × Q8_K activations via vec_dot_q6_K_q8_K
+        output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
+            let a_row = &a[i * k..(i + 1) * k];
+            // SAFETY: BlockQ8K is a POD struct; zeroed is a valid initial state before
+            // quantize_row_q8_k* overwrites every field.
+            let mut a_q8k: Vec<BlockQ8K> =
+                (0..blocks_per_row).map(|_| unsafe { std::mem::zeroed() }).collect();
             #[cfg(target_arch = "x86_64")]
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                let chunk_size = (n / rayon::current_num_threads()).max(64);
-                output[..n]
-                    .par_chunks_mut(chunk_size)
-                    .enumerate()
-                    .for_each(|(ci, chunk)| {
-                        let j_start = ci * chunk_size;
-                        for (local, out) in chunk.iter_mut().enumerate() {
-                            let j = j_start + local;
-                            let mut sum = 0.0f32;
-                            for blk in 0..blocks_per_row {
-                                let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
-                                let block =
-                                    &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
-                                let a_slice =
-                                    &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                                sum += unsafe { q6k_dot_block_avx2_i16(block, a_slice) };
-                            }
-                            *out = sum;
-                        }
-                    });
-                return Ok(());
+                unsafe {
+                    crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, &mut a_q8k)
+                };
+            } else {
+                crate::ggml::quantize::quantize_row_q8_k(a_row, &mut a_q8k);
             }
+            #[cfg(not(target_arch = "x86_64"))]
+            crate::ggml::quantize::quantize_row_q8_k(a_row, &mut a_q8k);
 
-            let chunk_size = (n / rayon::current_num_threads()).max(64);
-            output[..n]
-                .par_chunks_mut(chunk_size)
-                .enumerate()
-                .for_each(|(ci, chunk)| {
-                    let j_start = ci * chunk_size;
-                    for (local, out) in chunk.iter_mut().enumerate() {
-                        let j = j_start + local;
-                        let mut sum = 0.0f32;
-                        for blk in 0..blocks_per_row {
-                            let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
-                            let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
-                            let a_slice = &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                            sum += q6k_dot_block(block, a_slice);
-                        }
-                        *out = sum;
-                    }
-                });
-        } else {
-            #[cfg(target_arch = "x86_64")]
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                output[..m * n]
-                    .par_chunks_mut(n)
-                    .enumerate()
-                    .for_each(|(i, row_out)| {
-                        let a_row = &a[i * k..(i + 1) * k];
-                        let j_chunk = (n / rayon::current_num_threads()).max(64);
-                        row_out.par_chunks_mut(j_chunk).enumerate().for_each(
-                            |(ci, jchunk)| {
-                                let j_start = ci * j_chunk;
-                                for (local, out_val) in jchunk.iter_mut().enumerate() {
-                                    let j = j_start + local;
-                                    let mut sum = 0.0f32;
-                                    for blk in 0..blocks_per_row {
-                                        let block_offset =
-                                            (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
-                                        let block = &b_quantized
-                                            [block_offset..block_offset + Q6K_BLOCK_BYTES];
-                                        let a_slice = &a_row[blk * Q6K_BLOCK_SIZE
-                                            ..(blk + 1) * Q6K_BLOCK_SIZE];
-                                        sum += unsafe {
-                                            q6k_dot_block_avx2_i16(block, a_slice)
-                                        };
-                                    }
-                                    *out_val = sum;
-                                }
-                            },
-                        );
-                    });
-                return Ok(());
-            }
-            output[..m * n]
-                .par_chunks_mut(n)
-                .enumerate()
-                .for_each(|(i, row_out)| {
-                    let a_row = &a[i * k..(i + 1) * k];
-                    let j_chunk = (n / rayon::current_num_threads()).max(64);
-                    row_out.par_chunks_mut(j_chunk).enumerate().for_each(
-                        |(ci, jchunk)| {
-                            let j_start = ci * j_chunk;
-                            for (local, out_val) in jchunk.iter_mut().enumerate() {
-                                let j = j_start + local;
-                                let mut sum = 0.0f32;
-                                for blk in 0..blocks_per_row {
-                                    let block_offset =
-                                        (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
-                                    let block = &b_quantized
-                                        [block_offset..block_offset + Q6K_BLOCK_BYTES];
-                                    let a_slice = &a_row
-                                        [blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                                    sum += q6k_dot_block(block, a_slice);
-                                }
-                                *out_val = sum;
-                            }
-                        },
+            let j_chunk = (n / rayon::current_num_threads()).max(64);
+            row_out.par_chunks_mut(j_chunk).enumerate().for_each(|(ci, jchunk)| {
+                let j_start = ci * j_chunk;
+                for (local, out_val) in jchunk.iter_mut().enumerate() {
+                    let j = j_start + local;
+                    let row_start = j * blocks_per_row * Q6K_BLOCK_BYTES;
+                    // SAFETY: b_quantized is Q6_K data aligned to BlockQ6K layout
+                    let weight_blocks: &[BlockQ6K] = unsafe {
+                        std::slice::from_raw_parts(
+                            b_quantized.as_ptr().add(row_start) as *const BlockQ6K,
+                            blocks_per_row,
+                        )
+                    };
+                    *out_val = crate::ggml::vec_dot_avx2::vec_dot_q6_k_q8_k_dispatch(
+                        k,
+                        weight_blocks,
+                        &a_q8k,
                     );
-                });
-        }
+                }
+            });
+        });
         Ok(())
     }
 
