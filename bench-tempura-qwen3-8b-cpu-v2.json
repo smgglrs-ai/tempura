@@ -1,0 +1,20 @@
+{
+  "timestamp": "2026-09-21",
+  "tool": "manual-timing",
+  "model": "qwen3-8b Q4_K_M",
+  "backend": "CPU AVX2 (CpuMatMulQ4KOpt)",
+  "results": [
+    {"label": "tg32", "tokens_per_sec": 1.68, "note": "32 tok / 19s, m=1 AVX2 GEMV, sequential outer loop"},
+    {"label": "pp (m>1)", "tokens_per_sec": "~3.9 tok/s measured earlier — f32 materialization path"}
+  ],
+  "gap_analysis": {
+    "prefill_root_cause": "Dequantizes entire Q4K weight matrix to f32 (64MB/matmul), then calls gemm::gemm",
+    "decode_root_cause": "Sequential outer loop over output neurons; quantize_row_q8_avx2 allocates Vec per call",
+    "vs_llamacpp_cpu_tg32": "3x gap (llama.cpp: 5.1 tok/s — parallelized GEMV with OpenMP)"
+  },
+  "next_steps": [
+    "Parallelize GEMV outer loop with Rayon (decode, low effort)",
+    "Pre-allocate Q8 activation buffer via thread-local (decode, low effort)",
+    "Implement tiled Q4K*Q8K matmul without f32 materialization (prefill, medium effort)"
+  ]
+}
