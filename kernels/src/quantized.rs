@@ -4024,7 +4024,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         // llama.cpp translation: Q8_K activations × Q4_K weights via vec_dot_q4_K_q8_K.
         // Thread-local buffer avoids one Vec allocation per input row per Rayon worker.
         #[cfg(feature = "openmp")]
-        {
+        if m > 1 {
             for i in 0..m {
                 let a_row = &a[i * k..(i + 1) * k];
                 let row_out = &mut output[i * n..(i + 1) * n];
@@ -4058,11 +4058,9 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             }
             return Ok(());
         }
-        #[cfg(not(feature = "openmp"))]
-        {
-            output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
-                let a_row = &a[i * k..(i + 1) * k];
-                let a_q8k: &[BlockQ8K] = Q8K_BUF_Q4K.with(|cell| {
+        output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
+            let a_row = &a[i * k..(i + 1) * k];
+            let a_q8k: &[BlockQ8K] = Q8K_BUF_Q4K.with(|cell| {
                     let buf = unsafe { &mut *cell.get() };
                     if buf.len() < blocks_per_row {
                         buf.resize_with(blocks_per_row, || unsafe { std::mem::zeroed() });
@@ -4109,7 +4107,6 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                     }
                 });
             });
-        }
 
         Ok(())
     }
@@ -4159,7 +4156,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
 
         // llama.cpp translation: Q8_K activations × Q6_K weights via vec_dot_q6_K_q8_K.
         #[cfg(feature = "openmp")]
-        {
+        if m > 1 {
             for i in 0..m {
                 let a_row = &a[i * k..(i + 1) * k];
                 let row_out = &mut output[i * n..(i + 1) * n];
@@ -4193,11 +4190,9 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             }
             return Ok(());
         }
-        #[cfg(not(feature = "openmp"))]
-        {
-            output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
-                let a_row = &a[i * k..(i + 1) * k];
-                let a_q8k: &[BlockQ8K] = Q8K_BUF_Q6K.with(|cell| {
+        output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
+            let a_row = &a[i * k..(i + 1) * k];
+            let a_q8k: &[BlockQ8K] = Q8K_BUF_Q6K.with(|cell| {
                     let buf = unsafe { &mut *cell.get() };
                     if buf.len() < blocks_per_row {
                         buf.resize_with(blocks_per_row, || unsafe { std::mem::zeroed() });
@@ -4244,7 +4239,6 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                     }
                 });
             });
-        }
         Ok(())
     }
 

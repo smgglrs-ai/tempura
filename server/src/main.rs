@@ -215,6 +215,10 @@ async fn main() {
 }
 
 async fn run_server(args: ServeArgs) {
+    #[cfg(feature = "openmp")]
+    if std::env::var("OMP_WAIT_POLICY").is_err() {
+        std::env::set_var("OMP_WAIT_POLICY", "passive");
+    }
     init_tracing(&args.otlp_endpoint);
 
     let api_key = args
