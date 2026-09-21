@@ -1325,6 +1325,52 @@ mod tests {
     }
 
     #[test]
+    fn ggml_crossval_iq4nl_dequantize() {
+        let Some(iq4nl_data) = load_test_vector("iq4nl_quantized.bin") else {
+            eprintln!("SKIP: test vectors not generated (run tests-ggml/run_crossval.sh)");
+            return;
+        };
+        let ggml_deq = load_f32_vector("iq4nl_dequantized.bin").unwrap();
+        let k = ggml_deq.len();
+        let mut our_deq = vec![0.0f32; k];
+        dequantize_row(&iq4nl_data, &mut our_deq, super::super::GgmlType::IQ4NL, k);
+
+        let mut max_diff = 0.0f32;
+        for i in 0..k {
+            let diff = (our_deq[i] - ggml_deq[i]).abs();
+            max_diff = max_diff.max(diff);
+        }
+        eprintln!("IQ4_NL dequant cross-val: max_abs_diff={max_diff:.6e} across {k} elements");
+        assert!(
+            max_diff < 1e-4,
+            "IQ4_NL dequant mismatch: max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn ggml_crossval_iq4xs_dequantize() {
+        let Some(iq4xs_data) = load_test_vector("iq4xs_quantized.bin") else {
+            eprintln!("SKIP: test vectors not generated (run tests-ggml/run_crossval.sh)");
+            return;
+        };
+        let ggml_deq = load_f32_vector("iq4xs_dequantized.bin").unwrap();
+        let k = ggml_deq.len();
+        let mut our_deq = vec![0.0f32; k];
+        dequantize_row(&iq4xs_data, &mut our_deq, super::super::GgmlType::IQ4XS, k);
+
+        let mut max_diff = 0.0f32;
+        for i in 0..k {
+            let diff = (our_deq[i] - ggml_deq[i]).abs();
+            max_diff = max_diff.max(diff);
+        }
+        eprintln!("IQ4_XS dequant cross-val: max_abs_diff={max_diff:.6e} across {k} elements");
+        assert!(
+            max_diff < 1e-4,
+            "IQ4_XS dequant mismatch: max_diff={max_diff}"
+        );
+    }
+
+    #[test]
     fn dequant_row_dispatch_q4k() {
         let blk = BlockQ4K {
             d: f32_to_f16(0.0),

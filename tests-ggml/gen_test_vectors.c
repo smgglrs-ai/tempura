@@ -16,6 +16,10 @@ void dequantize_row_q4_0(const void *x, float *y, int64_t k);
 void dequantize_row_q4_K(const void *x, float *y, int64_t k);
 void dequantize_row_q6_K(const void *x, float *y, int64_t k);
 void dequantize_row_q8_0(const void *x, float *y, int64_t k);
+void quantize_row_iq4_nl(const float *x, void *y, int64_t k);
+void quantize_row_iq4_xs(const float *x, void *y, int64_t k);
+void dequantize_row_iq4_nl(const void *x, float *y, int64_t k);
+void dequantize_row_iq4_xs(const void *x, float *y, int64_t k);
 
 static void write_file(const char *name, const void *data, size_t len) {
     FILE *f = fopen(name, "wb");
@@ -120,6 +124,79 @@ int main() {
         printf("  Q6_K written\n");
 
         free(q6k_data); free(q8k_data);
+    }
+
+    // ── IQ4_NL ─────────────────────────────────────────────────────────
+    // Non-linear 4-bit lookup table quantization, 32 elements per block.
+    // Block layout: { ggml_half d; uint8_t qs[16]; } = 18 bytes.
+    {
+        const int k = 256;
+        float src[256];
+        gen_activations(src, k, 13);
+
+        // 256/32 = 8 blocks, 8 * 18 = 144 bytes
+        const size_t iq4nl_bytes = 144;
+        void *iq4nl_data = calloc(1, iq4nl_bytes);
+        quantize_row_iq4_nl(src, iq4nl_data, k);
+
+        float deq[256];
+        dequantize_row_iq4_nl(iq4nl_data, deq, k);
+
+        write_file("iq4nl_src.bin", src, k * sizeof(float));
+        write_file("iq4nl_quantized.bin", iq4nl_data, iq4nl_bytes);
+        write_file("iq4nl_dequantized.bin", deq, k * sizeof(float));
+        printf("  IQ4_NL written\n");
+
+        free(iq4nl_data);
+    }
+
+    // ── IQ4_XS ─────────────────────────────────────────────────────────
+    // Cross-scale 4-bit quantization, 256 elements per block.
+    // Block layout: { ggml_half d; uint16_t scales_h; uint8_t scales_l[4]; uint8_t qs[128]; }
+    // = 2 + 2 + 4 + 128 = 136 bytes.
+    {
+        const int k = 256;
+        float src[256];
+        gen_activations(src, k, 77);
+
+        // 256/256 = 1 block, 136 bytes
+        const size_t iq4xs_bytes = 136;
+        void *iq4xs_data = calloc(1, iq4xs_bytes);
+        quantize_row_iq4_xs(src, iq4xs_data, k);
+
+        float deq[256];
+        dequantize_row_iq4_xs(iq4xs_data, deq, k);
+
+        write_file("iq4xs_src.bin", src, k * sizeof(float));
+        write_file("iq4xs_quantized.bin", iq4xs_data, iq4xs_bytes);
+        write_file("iq4xs_dequantized.bin", deq, k * sizeof(float));
+        printf("  IQ4_XS written\n");
+
+        free(iq4xs_data);
+    }
+
+    // ── RoPE reference values ───────────────────────────────────────────
+    // Standard NeoX-style RoPE: freq = pos / base^(2i/d), rotates pairs (x[i], x[i+d/2]).
+    // These cos/sin values are the ground truth the Rust kernel must match.
+    {
+        const int n_pos = 8, head_dim = 64;
+        const float base = 10000.0f;
+        // cos and sin for each (pos, dim_pair) — head_dim values per position
+        float rope_cos[8 * 64], rope_sin[8 * 64];
+        const int half_dim = head_dim / 2;
+        for (int pos = 0; pos < n_pos; pos++) {
+            for (int i = 0; i < half_dim; i++) {
+                float theta = (float)pos / powf(base, 2.0f * (float)i / (float)head_dim);
+                float c = cosf(theta), s = sinf(theta);
+                rope_cos[pos * head_dim + i]            = c;
+                rope_cos[pos * head_dim + i + half_dim] = c;
+                rope_sin[pos * head_dim + i]            = s;
+                rope_sin[pos * head_dim + i + half_dim] = s;
+            }
+        }
+        write_file("rope_cos_ref.bin", rope_cos, sizeof(rope_cos));
+        write_file("rope_sin_ref.bin", rope_sin, sizeof(rope_sin));
+        printf("  RoPE reference (n_pos=%d, head_dim=%d, base=%.0f)\n", n_pos, head_dim, base);
     }
 
     printf("Done.\n");
