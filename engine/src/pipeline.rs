@@ -37,6 +37,13 @@ impl
             allreduce: CpuAllReduce,
         }
     }
+
+    /// Production CPU pipeline — same kernels as cpu_verified() today; diverges as
+    /// ARM NEON/SVE and other native backends are added. Quantized matmul dispatch
+    /// (Q4K, Q6K) uses AVX2/VNNI via CpuMatMulQ4KOpt, wired in forward_quantized.
+    pub fn cpu_native() -> Self {
+        Self::cpu_verified()
+    }
 }
 
 #[cfg(feature = "cutile")]

@@ -273,7 +273,7 @@ async fn run_server(args: ServeArgs) {
             tracing::info!("cuTile GPU inference ready");
             return Arc::new(wrapper);
         }
-        let pipeline = KernelPipeline::cpu_verified();
+        let pipeline = KernelPipeline::cpu_native();
         let mut model = TransformerModel::new(config.clone(), pipeline);
         model.load_weights(loader).unwrap();
         Arc::new(model)
@@ -316,7 +316,7 @@ async fn run_server(args: ServeArgs) {
                 tracing::info!("cuTile GPU quantized inference ready");
                 Arc::new(wrapper)
             } else {
-                let pipeline = KernelPipeline::cpu_verified();
+                let pipeline = KernelPipeline::cpu_native();
                 let mut model = TransformerModel::new(config.clone(), pipeline);
                 model.quantized_weights = Some(qweights);
                 tracing::info!("Using CPU quantized weights");
@@ -325,7 +325,7 @@ async fn run_server(args: ServeArgs) {
 
             #[cfg(not(feature = "cutile"))]
             {
-                let pipeline = KernelPipeline::cpu_verified();
+                let pipeline = KernelPipeline::cpu_native();
                 let mut model = TransformerModel::new(config.clone(), pipeline);
                 model.quantized_weights = Some(qweights);
                 tracing::info!("Using CPU quantized weights");
@@ -420,7 +420,7 @@ async fn run_server(args: ServeArgs) {
             build_model(&config, &loader)
         }
     } else {
-        let pipeline = KernelPipeline::cpu_verified();
+        let pipeline = KernelPipeline::cpu_native();
         Arc::new(TransformerModel::new(config.clone(), pipeline))
     };
 
