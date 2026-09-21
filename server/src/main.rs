@@ -2,6 +2,7 @@
 mod api;
 mod auth;
 mod batch;
+pub mod engine_task;
 pub mod replay;
 mod sse;
 mod trace_store;
@@ -125,6 +126,7 @@ pub struct AppState {
     pub metrics_handle: PrometheusHandle,
     pub request_timeout: std::time::Duration,
     pub api_key: Option<String>,
+    pub engine_tx: Arc<tokio::sync::mpsc::Sender<engine_task::EngineRequest>>,
 }
 
 #[tokio::main]
@@ -332,6 +334,14 @@ async fn run_server(args: ServeArgs) {
         let scheduler =
             batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len, args.max_batch_size);
         let traces = trace_store::TraceStore::new(args.max_traces);
+
+        let (engine_tx, engine_rx) =
+            tokio::sync::mpsc::channel::<engine_task::EngineRequest>(args.max_batch_size * 4);
+        let engine_model = model.clone();
+        tokio::task::spawn_blocking(move || {
+            engine_task::EngineTask::new(engine_model, engine_rx).run();
+        });
+
         let state = AppState {
             model,
             tokenizer,
@@ -341,6 +351,7 @@ async fn run_server(args: ServeArgs) {
             metrics_handle,
             request_timeout: std::time::Duration::from_secs(args.request_timeout_secs),
             api_key: api_key.clone(),
+            engine_tx: Arc::new(engine_tx),
         };
 
         let app = api::router()
@@ -435,6 +446,14 @@ async fn run_server(args: ServeArgs) {
     let scheduler =
         batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len, args.max_batch_size);
     let traces = trace_store::TraceStore::new(args.max_traces);
+
+    let (engine_tx, engine_rx) =
+        tokio::sync::mpsc::channel::<engine_task::EngineRequest>(args.max_batch_size * 4);
+    let engine_model = model.clone();
+    tokio::task::spawn_blocking(move || {
+        engine_task::EngineTask::new(engine_model, engine_rx).run();
+    });
+
     let state = AppState {
         model,
         tokenizer,
@@ -444,6 +463,7 @@ async fn run_server(args: ServeArgs) {
         metrics_handle,
         request_timeout: std::time::Duration::from_secs(args.request_timeout_secs),
         api_key,
+        engine_tx: Arc::new(engine_tx),
     };
 
     let app = api::router()
