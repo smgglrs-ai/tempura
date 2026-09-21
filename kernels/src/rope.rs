@@ -677,6 +677,138 @@ impl RoPE for CudaRoPE {
     }
 }
 
+/// RoPE with precomputed scaled inverse frequencies for linear, NTK, YaRN, and LLaMA3 scaling.
+/// The `forward` theta parameter is ignored; inv_freq is computed at construction time.
+#[cfg(feature = "cpu")]
+pub struct CpuRoPEScaled {
+    inv_freq: Vec<f32>,
+    mode: RoPEMode,
+    attn_factor: f32,
+}
+
+#[cfg(feature = "cpu")]
+impl CpuRoPEScaled {
+    pub fn new_linear(factor: f32, head_dim: usize, theta: f32) -> Self {
+        let half = head_dim / 2;
+        let inv_freq = (0..half)
+            .map(|d| 1.0 / (theta.powf(2.0 * d as f32 / head_dim as f32) * factor))
+            .collect();
+        Self { inv_freq, mode: RoPEMode::NeoX, attn_factor: 1.0 }
+    }
+
+    pub fn new_ntk(factor: f32, head_dim: usize, theta: f32) -> Self {
+        let half = head_dim / 2;
+        let scaled_theta = theta * factor.powf(head_dim as f32 / (head_dim as f32 - 2.0));
+        let inv_freq = (0..half)
+            .map(|d| 1.0 / scaled_theta.powf(2.0 * d as f32 / head_dim as f32))
+            .collect();
+        Self { inv_freq, mode: RoPEMode::NeoX, attn_factor: 1.0 }
+    }
+
+    pub fn new_yarn(
+        factor: f32,
+        original_ctx: u32,
+        beta_fast: f32,
+        beta_slow: f32,
+        attn_factor: f32,
+        head_dim: usize,
+        theta: f32,
+    ) -> Self {
+        let half = head_dim / 2;
+        let low = yarn_corr_dim(head_dim, original_ctx as usize, beta_fast, theta).floor();
+        let high = yarn_corr_dim(head_dim, original_ctx as usize, beta_slow, theta).ceil();
+        let inv_freq = (0..half).map(|d| {
+            let base_inv = 1.0 / theta.powf(2.0 * d as f32 / head_dim as f32);
+            // ramp=1 → extrapolate (keep base freq), ramp=0 → interpolate (divide by factor)
+            let ramp = yarn_ramp(low, high, (d * 2) as i64);
+            base_inv / factor * (1.0 - ramp) + base_inv * ramp
+        }).collect();
+        Self { inv_freq, mode: RoPEMode::NeoX, attn_factor }
+    }
+
+    /// LLaMA 3.1+ long-context scaling (used for 128K context window).
+    pub fn new_llama3(
+        factor: f32,
+        original_ctx: u32,
+        low_freq_factor: f32,
+        high_freq_factor: f32,
+        head_dim: usize,
+        theta: f32,
+    ) -> Self {
+        let half = head_dim / 2;
+        let orig = original_ctx as f32;
+        let low_freq_wavelen = orig / low_freq_factor;
+        let high_freq_wavelen = orig / high_freq_factor;
+        let inv_freq = (0..half).map(|d| {
+            let freq = 1.0 / theta.powf(2.0 * d as f32 / head_dim as f32);
+            let wavelen = 2.0 * std::f32::consts::PI / freq;
+            if wavelen < high_freq_wavelen {
+                freq
+            } else if wavelen > low_freq_wavelen {
+                freq / factor
+            } else {
+                let smooth = (orig / wavelen - low_freq_factor)
+                    / (high_freq_factor - low_freq_factor);
+                freq / factor * (1.0 - smooth) + freq * smooth
+            }
+        }).collect();
+        Self { inv_freq, mode: RoPEMode::NeoX, attn_factor: 1.0 }
+    }
+}
+
+#[cfg(feature = "cpu")]
+impl RoPE for CpuRoPEScaled {
+    fn verification_tier(&self) -> crate::VerificationTier {
+        crate::VerificationTier::Tested
+    }
+
+    fn forward(
+        &self,
+        x: &mut [f32],
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        positions: &[u32],
+        _theta: f32,
+    ) -> Result<()> {
+        let half_dim = self.inv_freq.len();
+        for b in 0..batch {
+            for s in 0..seq_len {
+                let pos = positions[b * seq_len + s] as f32;
+                for h in 0..num_heads {
+                    let offset = ((b * seq_len + s) * num_heads + h) * head_dim;
+                    match self.mode {
+                        RoPEMode::NeoX => {
+                            for d in 0..half_dim {
+                                let angle = pos * self.inv_freq[d] * self.attn_factor;
+                                let cos_val = angle.cos();
+                                let sin_val = angle.sin();
+                                let x0 = x[offset + d];
+                                let x1 = x[offset + d + half_dim];
+                                x[offset + d] = x0 * cos_val - x1 * sin_val;
+                                x[offset + d + half_dim] = x0 * sin_val + x1 * cos_val;
+                            }
+                        }
+                        RoPEMode::Normal => {
+                            for d in 0..half_dim {
+                                let angle = pos * self.inv_freq[d] * self.attn_factor;
+                                let cos_val = angle.cos();
+                                let sin_val = angle.sin();
+                                let x0 = x[offset + d * 2];
+                                let x1 = x[offset + d * 2 + 1];
+                                x[offset + d * 2] = x0 * cos_val - x1 * sin_val;
+                                x[offset + d * 2 + 1] = x0 * sin_val + x1 * cos_val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(kani)]
 mod kani_proofs {
     #[kani::proof]
@@ -1152,6 +1284,83 @@ mod tests {
         assert!(dims[0] >= 0.0);
         assert!(dims[1] >= dims[0]);
         assert!(dims[1] <= 127.0);
+    }
+
+    #[test]
+    fn test_scaled_linear_factor1_matches_base() {
+        let base = CpuRoPE;
+        let scaled = CpuRoPEScaled::new_linear(1.0, 8, 10000.0);
+        let head_dim = 8;
+        let positions = vec![5u32];
+        let orig: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+
+        let mut x_base = orig.clone();
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+
+        let mut x_scaled = orig.clone();
+        scaled.forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+
+        for i in 0..head_dim {
+            assert!((x_base[i] - x_scaled[i]).abs() < 1e-5,
+                "linear factor=1 diverged at {i}: base={}, scaled={}", x_base[i], x_scaled[i]);
+        }
+    }
+
+    #[test]
+    fn test_scaled_linear_changes_output() {
+        let head_dim = 8;
+        let orig: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let positions = vec![100u32];
+
+        let mut x_base = orig.clone();
+        CpuRoPEScaled::new_linear(1.0, head_dim, 10000.0)
+            .forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+
+        let mut x_scaled = orig.clone();
+        CpuRoPEScaled::new_linear(4.0, head_dim, 10000.0)
+            .forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+
+        let any_diff = (0..head_dim).any(|i| (x_base[i] - x_scaled[i]).abs() > 1e-5);
+        assert!(any_diff, "factor=4 should change output vs factor=1");
+    }
+
+    #[test]
+    fn test_scaled_llama3_high_freq_unchanged() {
+        // High-frequency dimensions (small wavelen) should be unscaled in LLaMA3
+        let head_dim = 128;
+        let orig: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.01).collect();
+        let positions = vec![10u32];
+
+        let base = CpuRoPEScaled::new_linear(1.0, head_dim, 500000.0);
+        let llama3 = CpuRoPEScaled::new_llama3(8.0, 8192, 1.0, 4.0, head_dim, 500000.0);
+
+        let mut x_base = orig.clone();
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+
+        let mut x_llama3 = orig.clone();
+        llama3.forward(&mut x_llama3, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+
+        // First dimension (highest freq) should match unscaled
+        assert!((x_base[0] - x_llama3[0]).abs() < 1e-4,
+            "High-freq dim 0 should be unscaled: base={}, llama3={}", x_base[0], x_llama3[0]);
+    }
+
+    #[test]
+    fn test_scaled_ntk_changes_output() {
+        let head_dim = 8;
+        let orig: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let positions = vec![50u32];
+
+        let mut x_base = orig.clone();
+        CpuRoPEScaled::new_linear(1.0, head_dim, 10000.0)
+            .forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+
+        let mut x_ntk = orig.clone();
+        CpuRoPEScaled::new_ntk(4.0, head_dim, 10000.0)
+            .forward(&mut x_ntk, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+
+        let any_diff = (0..head_dim).any(|i| (x_base[i] - x_ntk[i]).abs() > 1e-5);
+        assert!(any_diff, "NTK should differ from unscaled RoPE");
     }
 
     mod prop_tests {

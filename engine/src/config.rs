@@ -44,6 +44,7 @@ pub struct ModelConfig {
     pub ssm_a: Option<f32>,
     pub dt_bias: Option<Vec<f32>>,
     pub rope_dim: Option<usize>,
+    pub rope_scaling: Option<RopeScalingConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +105,26 @@ impl Architecture {
 pub enum RopeType {
     Neox,
     Norm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeScalingType {
+    Linear,
+    NTK,
+    YaRN,
+    LLaMA3,
+}
+
+#[derive(Debug, Clone)]
+pub struct RopeScalingConfig {
+    pub scaling_type: RopeScalingType,
+    pub factor: f32,
+    pub original_context_length: u32,
+    pub yarn_beta_fast: f32,
+    pub yarn_beta_slow: f32,
+    pub yarn_attn_factor: f32,
+    pub low_freq_factor: f32,
+    pub high_freq_factor: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +197,7 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            rope_scaling: None,
         }
     }
 
@@ -213,6 +235,7 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            rope_scaling: None,
         }
     }
 
@@ -250,6 +273,7 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            rope_scaling: None,
         }
     }
 
@@ -287,6 +311,7 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            rope_scaling: None,
         }
     }
 
@@ -324,6 +349,7 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            rope_scaling: None,
         }
     }
 
@@ -407,6 +433,31 @@ impl ModelConfig {
             _ => None,
         };
 
+        let rope_scaling = v.get("rope_scaling").and_then(|rs| {
+            let scaling_type = match rs.get("type").and_then(|t| t.as_str())? {
+                "linear" => RopeScalingType::Linear,
+                "ntk" | "dynamic" => RopeScalingType::NTK,
+                "yarn" => RopeScalingType::YaRN,
+                "llama3" => RopeScalingType::LLaMA3,
+                _ => return None,
+            };
+            let factor = rs.get("factor").and_then(|f| f.as_f64()).unwrap_or(1.0) as f32;
+            let original_context_length = rs
+                .get("original_max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(max_seq_len as u64) as u32;
+            Some(RopeScalingConfig {
+                scaling_type,
+                factor,
+                original_context_length,
+                yarn_beta_fast: rs.get("beta_fast").and_then(|v| v.as_f64()).unwrap_or(32.0) as f32,
+                yarn_beta_slow: rs.get("beta_slow").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                yarn_attn_factor: rs.get("attn_factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                low_freq_factor: rs.get("low_freq_factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                high_freq_factor: rs.get("high_freq_factor").and_then(|v| v.as_f64()).unwrap_or(4.0) as f32,
+            })
+        });
+
         Ok(Self {
             hidden_size,
             intermediate_size,
@@ -450,6 +501,7 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            rope_scaling,
         })
     }
 
