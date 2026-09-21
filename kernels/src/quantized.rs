@@ -4087,12 +4087,27 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                     unsafe { std::slice::from_raw_parts(buf.as_ptr(), blocks_per_row) }
                 });
 
+                const PREFETCH_DIST: usize = 8;
+                let row_bytes_q4k = blocks_per_row * Q4K_BLOCK_BYTES;
                 let j_chunk = (n / rayon::current_num_threads()).max(64);
                 row_out.par_chunks_mut(j_chunk).enumerate().for_each(|(ci, jchunk)| {
                     let j_start = ci * j_chunk;
                     for (local, out_val) in jchunk.iter_mut().enumerate() {
                         let j = j_start + local;
-                        let row_start = j * blocks_per_row * Q4K_BLOCK_BYTES;
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            let pf_j = j_start + local + PREFETCH_DIST;
+                            if pf_j < n {
+                                unsafe {
+                                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
+                                    _mm_prefetch(
+                                        b_quantized.as_ptr().add(pf_j * row_bytes_q4k) as *const i8,
+                                        _MM_HINT_T1,
+                                    );
+                                }
+                            }
+                        }
+                        let row_start = j * row_bytes_q4k;
                         let weight_blocks: &[BlockQ4K] = unsafe {
                             std::slice::from_raw_parts(
                                 b_quantized.as_ptr().add(row_start) as *const BlockQ4K,
@@ -4219,12 +4234,27 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                     unsafe { std::slice::from_raw_parts(buf.as_ptr(), blocks_per_row) }
                 });
 
+                const PREFETCH_DIST_Q6K: usize = 8;
+                let row_bytes_q6k = blocks_per_row * Q6K_BLOCK_BYTES;
                 let j_chunk = (n / rayon::current_num_threads()).max(64);
                 row_out.par_chunks_mut(j_chunk).enumerate().for_each(|(ci, jchunk)| {
                     let j_start = ci * j_chunk;
                     for (local, out_val) in jchunk.iter_mut().enumerate() {
                         let j = j_start + local;
-                        let row_start = j * blocks_per_row * Q6K_BLOCK_BYTES;
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            let pf_j = j_start + local + PREFETCH_DIST_Q6K;
+                            if pf_j < n {
+                                unsafe {
+                                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
+                                    _mm_prefetch(
+                                        b_quantized.as_ptr().add(pf_j * row_bytes_q6k) as *const i8,
+                                        _MM_HINT_T1,
+                                    );
+                                }
+                            }
+                        }
+                        let row_start = j * row_bytes_q6k;
                         let weight_blocks: &[BlockQ6K] = unsafe {
                             std::slice::from_raw_parts(
                                 b_quantized.as_ptr().add(row_start) as *const BlockQ6K,
