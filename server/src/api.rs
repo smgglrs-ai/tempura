@@ -48,6 +48,7 @@ pub fn router() -> Router<AppState> {
         .route("/tempura/v1/schema", get(schema_list))
         .route("/tempura/v1/schema/{trait_name}", get(schema_get))
         .route("/tempura/v1/replay", post(replay))
+        .route("/tempura/v1/debug/logits", post(debug_logits))
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health))
         .route("/health/inference", get(health_inference))
@@ -1014,6 +1015,38 @@ async fn compare_pipelines(
         "token_match": true,
         "note": "self-comparison (same pipeline)"
     })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DebugLogitsRequest {
+    pub tokens: Vec<u32>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+async fn debug_logits(
+    State(state): State<AppState>,
+    Json(req): Json<DebugLogitsRequest>,
+) -> impl IntoResponse {
+    if !state.model.has_weights() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": {"message": "No model weights loaded", "code": "no_model"}})),
+        )
+            .into_response();
+    }
+
+    let config = state.model.config().clone();
+    let mut session = InferenceSession::new(&config, TraceLevel::Off, 0);
+    let logits = state.model.forward(&mut session, &req.tokens);
+    let vocab_size = logits.len();
+
+    Json(serde_json::json!({
+        "logits": logits,
+        "vocab_size": vocab_size,
+        "tokens": req.tokens,
+    }))
+    .into_response()
 }
 
 async fn verification_status() -> impl IntoResponse {
@@ -2058,5 +2091,38 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["error"]["code"], "model_not_supported");
+    }
+
+    #[tokio::test]
+    async fn test_debug_logits_no_weights_returns_503() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let body = serde_json::json!({"tokens": [1, 2, 3]});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tempura/v1/debug/logits")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // No weights loaded in test state → 503
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], "no_model");
+    }
+
+    #[tokio::test]
+    async fn test_debug_logits_bad_request_returns_422() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tempura/v1/debug/logits")
+            .header("content-type", "application/json")
+            .body(Body::from(b"not json".to_vec()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(resp.status().is_client_error());
     }
 }
