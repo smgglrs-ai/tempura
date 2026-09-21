@@ -16,8 +16,8 @@ void dequantize_row_q4_0(const void *x, float *y, int64_t k);
 void dequantize_row_q4_K(const void *x, float *y, int64_t k);
 void dequantize_row_q6_K(const void *x, float *y, int64_t k);
 void dequantize_row_q8_0(const void *x, float *y, int64_t k);
-void quantize_row_iq4_nl(const float *x, void *y, int64_t k);
-void quantize_row_iq4_xs(const float *x, void *y, int64_t k);
+void quantize_row_iq4_nl_ref(const float *x, void *y, int64_t k);
+void quantize_row_iq4_xs_ref(const float *x, void *y, int64_t k);
 void dequantize_row_iq4_nl(const void *x, float *y, int64_t k);
 void dequantize_row_iq4_xs(const void *x, float *y, int64_t k);
 
@@ -137,7 +137,7 @@ int main() {
         // 256/32 = 8 blocks, 8 * 18 = 144 bytes
         const size_t iq4nl_bytes = 144;
         void *iq4nl_data = calloc(1, iq4nl_bytes);
-        quantize_row_iq4_nl(src, iq4nl_data, k);
+        quantize_row_iq4_nl_ref(src, iq4nl_data, k);
 
         float deq[256];
         dequantize_row_iq4_nl(iq4nl_data, deq, k);
@@ -162,7 +162,7 @@ int main() {
         // 256/256 = 1 block, 136 bytes
         const size_t iq4xs_bytes = 136;
         void *iq4xs_data = calloc(1, iq4xs_bytes);
-        quantize_row_iq4_xs(src, iq4xs_data, k);
+        quantize_row_iq4_xs_ref(src, iq4xs_data, k);
 
         float deq[256];
         dequantize_row_iq4_xs(iq4xs_data, deq, k);

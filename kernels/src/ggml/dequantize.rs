@@ -780,33 +780,24 @@ pub fn dequantize_row_iq1_m(blocks: &[BlockIQ1M], output: &mut [f32]) {
 
 pub fn dequantize_row_iq4_xs(blocks: &[BlockIQ4XS], output: &mut [f32]) {
     use super::iq_tables::KVALUES_IQ4NL;
-    const QK: usize = 256;
-    assert_eq!(output.len(), blocks.len() * QK);
-    for (i, blk) in blocks.iter().enumerate() {
+    const QK_K: usize = 256;
+    assert_eq!(output.len(), blocks.len() * QK_K);
+    for (blk_i, blk) in blocks.iter().enumerate() {
         let d = f16_to_f32(blk.d);
-        let y = &mut output[i * QK..][..QK];
+        let y = &mut output[blk_i * QK_K..][..QK_K];
         let qs = &blk.qs;
-        let mut h = blk.scales_h;
-        let mut y_idx = 0usize;
-        let mut qs_idx = 0usize;
-        for ib in (0..QK / 32).step_by(2) {
-            let ls1 = ((blk.scales_l[ib / 2] & 0xF) | ((h << 4) as u8 & 0x30)) as i32 - 32;
-            let ls2 = ((blk.scales_l[ib / 2] >> 4) | ((h << 2) as u8 & 0x30)) as i32 - 32;
-            h >>= 4;
-            let dl1 = d * ls1 as f32;
-            let dl2 = d * ls2 as f32;
+        let mut y_off = 0usize;
+        let mut qs_off = 0usize;
+        for ib in 0..QK_K / 32 {
+            let ls = ((blk.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) as i32
+                | (((blk.scales_h >> (2 * ib)) & 3) as i32) << 4;
+            let dl = d * (ls - 32) as f32;
             for j in 0..16 {
-                y[y_idx] = dl1 * KVALUES_IQ4NL[(qs[qs_idx + j] & 0xF) as usize] as f32;
-                y[y_idx + 1] = dl1 * KVALUES_IQ4NL[(qs[qs_idx + j] >> 4) as usize] as f32;
-                y_idx += 2;
+                y[y_off + j] = dl * KVALUES_IQ4NL[(qs[qs_off + j] & 0xF) as usize] as f32;
+                y[y_off + j + 16] = dl * KVALUES_IQ4NL[(qs[qs_off + j] >> 4) as usize] as f32;
             }
-            qs_idx += 16;
-            for j in 0..16 {
-                y[y_idx] = dl2 * KVALUES_IQ4NL[(qs[qs_idx + j] & 0xF) as usize] as f32;
-                y[y_idx + 1] = dl2 * KVALUES_IQ4NL[(qs[qs_idx + j] >> 4) as usize] as f32;
-                y_idx += 2;
-            }
-            qs_idx += 16;
+            y_off += 32;
+            qs_off += 16;
         }
     }
 }
@@ -819,8 +810,8 @@ pub fn dequantize_row_iq4_nl(blocks: &[BlockIQ4NL], output: &mut [f32]) {
         let d = f16_to_f32(blk.d);
         let y = &mut output[i * QK..][..QK];
         for j in 0..QK / 2 {
-            y[j * 2] = d * KVALUES_IQ4NL[(blk.qs[j] & 0xF) as usize] as f32;
-            y[j * 2 + 1] = d * KVALUES_IQ4NL[(blk.qs[j] >> 4) as usize] as f32;
+            y[j] = d * KVALUES_IQ4NL[(blk.qs[j] & 0xF) as usize] as f32;
+            y[j + QK / 2] = d * KVALUES_IQ4NL[(blk.qs[j] >> 4) as usize] as f32;
         }
     }
 }
