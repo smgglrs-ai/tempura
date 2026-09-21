@@ -166,17 +166,28 @@ async fn bench_tg(client: &Client, host: &str, model: &str, tg: usize, runs: usi
                 let mut last_token: Option<Instant> = None;
                 let mut token_count = 0usize;
 
-                let bytes = r.bytes().await.unwrap_or_default();
-                for line in String::from_utf8_lossy(&bytes).lines() {
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        if data == "[DONE]" { break; }
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                            let content = v["choices"][0]["delta"]["content"].as_str().unwrap_or("");
-                            if !content.is_empty() {
-                                let now = Instant::now();
-                                if first_token.is_none() { first_token = Some(now); }
-                                last_token = Some(now);
-                                token_count += 1;
+                // Stream chunks as they arrive — r.bytes() buffers everything,
+                // collapsing first/last timestamps to near-zero.
+                use futures_util::StreamExt;
+                let mut stream = r.bytes_stream();
+                let mut buf = String::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.unwrap_or_default();
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                    // Process complete lines from buffer
+                    while let Some(nl) = buf.find('\n') {
+                        let line = buf[..nl].trim().to_string();
+                        buf = buf[nl + 1..].to_string();
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            if data == "[DONE]" { break; }
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                                let content = v["choices"][0]["delta"]["content"].as_str().unwrap_or("");
+                                if !content.is_empty() {
+                                    let now = Instant::now();
+                                    if first_token.is_none() { first_token = Some(now); }
+                                    last_token = Some(now);
+                                    token_count += 1;
+                                }
                             }
                         }
                     }
