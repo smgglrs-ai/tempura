@@ -3629,6 +3629,7 @@ name = "tempura-kernels"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "cc",
  "cuda-core",
  "cuda-device",
  "cuda-host",
@@ -3669,6 +3670,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "rayon",
  "serde",
  "serde_json",
  "tempura-engine",

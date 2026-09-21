@@ -10,6 +10,7 @@ default = []
 cuda = ["tempura-kernels/cuda"]
 cutile = ["tempura-kernels/cutile", "dep:cutile", "dep:cuda-core"]
 edge-metrics = []
+openmp = ["tempura-kernels/openmp"]
 
 [dependencies]
 tempura-kernel-api = { path = "../kernel-api" }

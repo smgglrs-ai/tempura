@@ -32,6 +32,7 @@ default = []
 cuda = ["tempura-engine/cutile", "cutile"]
 cutile = ["tempura-engine/cutile"]
 otlp = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
+openmp = ["tempura-engine/openmp"]
 
 [dev-dependencies]
 tower = "0.5"

@@ -12,6 +12,10 @@ cuda = ["cutile"]
 cutile = ["dep:cutile", "dep:cuda-core"]
 npu-intel = []
 npu-qualcomm = []
+openmp = []
+
+[build-dependencies]
+cc = "1"
 
 [dependencies]
 tempura-kernel-api = { path = "../kernel-api" }

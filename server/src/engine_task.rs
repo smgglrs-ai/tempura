@@ -88,7 +88,6 @@ impl EngineTask {
     }
 
     pub fn run(mut self) {
-        let rt = tokio::runtime::Handle::current();
         let mut sessions: HashMap<String, ActiveSession> = HashMap::new();
 
         loop {
@@ -124,7 +123,7 @@ impl EngineTask {
             }
 
             if sessions.is_empty() {
-                match rt.block_on(self.rx.recv()) {
+                match self.rx.blocking_recv() {
                     Some(req) => {
                         let session =
                             InferenceSession::new(self.model.config(), TraceLevel::Off, req.seed);

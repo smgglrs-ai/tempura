@@ -1,0 +1,55 @@
+{
+  "timestamp": "2026-09-21T18:56:21.343612906+00:00",
+  "host": "http://localhost:8091",
+  "model": "default",
+  "results": [
+    {
+      "label": "pp128",
+      "pp": 128,
+      "tg": null,
+      "runs": [
+        {
+          "tokens_per_sec": 10.835839105253612,
+          "elapsed_ms": 11812,
+          "tokens": 128
+        },
+        {
+          "tokens_per_sec": 40.343912590616746,
+          "elapsed_ms": 3172,
+          "tokens": 128
+        },
+        {
+          "tokens_per_sec": 39.401876122055384,
+          "elapsed_ms": 3248,
+          "tokens": 128
+        }
+      ],
+      "mean": 30.193875939308583,
+      "stddev": 13.693600712948525
+    },
+    {
+      "label": "tg32",
+      "pp": null,
+      "tg": 32,
+      "runs": [
+        {
+          "tokens_per_sec": 2331703.6479879655,
+          "elapsed_ms": 10805,
+          "tokens": 31
+        },
+        {
+          "tokens_per_sec": 2326454.033771107,
+          "elapsed_ms": 10549,
+          "tokens": 31
+        },
+        {
+          "tokens_per_sec": 2345819.1449110857,
+          "elapsed_ms": 10734,
+          "tokens": 31
+        }
+      ],
+      "mean": 2334658.9422233864,
+      "stddev": 8177.293985150376
+    }
+  ]
+}

@@ -28,6 +28,8 @@ pub mod cutile_rmsnorm;
 #[cfg(feature = "cutile")]
 pub mod cutile_rope;
 pub mod deltanet;
+#[cfg(feature = "openmp")]
+pub mod openmp_gemv;
 pub mod dispatch;
 pub mod f16_gemv;
 pub mod fused;
