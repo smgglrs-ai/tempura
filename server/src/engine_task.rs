@@ -68,6 +68,36 @@ impl ActiveSession {
     }
 }
 
+/// Parse TEMPURA_CCD_CORES env var.
+/// "0-15"  → (16, Some(0..=15))   pin to CCD0
+/// "16-31" → (16, Some(16..=31))  pin to CCD1
+/// "0-31"  → (32, Some(0..=31))   pin all, no migration
+/// unset   → (available, None)    no pinning (default)
+fn parse_ccd_cores_env() -> (usize, Option<Vec<usize>>) {
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    match std::env::var("TEMPURA_CCD_CORES")
+        .ok()
+        .as_deref()
+    {
+        Some(s) => {
+            let parts: Vec<&str> = s.splitn(2, '-').collect();
+            if parts.len() == 2 {
+                if let (Ok(start), Ok(end)) =
+                    (parts[0].parse::<usize>(), parts[1].parse::<usize>())
+                {
+                    let cores: Vec<usize> = (start..=end).collect();
+                    let n = cores.len();
+                    return (n, Some(cores));
+                }
+            }
+            (available, None)
+        }
+        None => (available, None),
+    }
+}
+
 pub struct EngineTask {
     model: Arc<dyn InferenceModel>,
     rx: mpsc::Receiver<EngineRequest>,
@@ -76,12 +106,16 @@ pub struct EngineTask {
 
 impl EngineTask {
     pub fn new(model: Arc<dyn InferenceModel>, rx: mpsc::Receiver<EngineRequest>) -> Self {
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8);
+        let (num_threads, ccd_cores) = parse_ccd_cores_env();
         let thread_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(|i| format!("tempura-compute-{i}"))
+            .start_handler(move |thread_idx| {
+                if let Some(ref cores) = ccd_cores {
+                    let core_id = cores[thread_idx % cores.len()];
+                    let _ = core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+                }
+            })
             .build()
             .expect("failed to build rayon thread pool");
         Self { model, rx, thread_pool }

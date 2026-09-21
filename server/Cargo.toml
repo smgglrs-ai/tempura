@@ -19,6 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 rayon = "1"
+core_affinity = "0.8"
 tokio-stream = "0.1"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
