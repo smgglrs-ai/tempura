@@ -37,13 +37,21 @@ impl CpuDeltaNet {
             let s_off = h * d2;
             let qkv_off = h * head_dim;
 
-            let gate = if ssm_a == 1.0 { alpha[h] } else { softplus(alpha[h]) * ssm_a };
+            let gate = if ssm_a == 1.0 {
+                alpha[h]
+            } else {
+                softplus(alpha[h]) * ssm_a
+            };
             let decay = gate.exp();
             for i in 0..d2 {
                 state[s_off + i] *= decay;
             }
 
-            let beta_val = if ssm_a == 1.0 { beta[h] } else { sigmoid(beta[h]) };
+            let beta_val = if ssm_a == 1.0 {
+                beta[h]
+            } else {
+                sigmoid(beta[h])
+            };
 
             let mut delta = vec![0.0f32; head_dim];
             for j in 0..head_dim {
@@ -121,7 +129,9 @@ impl DeltaNet for CpuDeltaNet {
             });
         }
 
-        Self::recurrent_step(q, k, v, alpha, beta, state, output, num_heads, head_dim, ssm_a);
+        Self::recurrent_step(
+            q, k, v, alpha, beta, state, output, num_heads, head_dim, ssm_a,
+        );
         Ok(())
     }
 
@@ -239,8 +249,16 @@ mod tests {
         let mut output = vec![0.0; num_heads * head_dim];
 
         dn.forward_recurrent(
-            &q, &k, &v, &alpha, &beta, &mut state, &mut output,
-            num_heads, head_dim, ssm_a,
+            &q,
+            &k,
+            &v,
+            &alpha,
+            &beta,
+            &mut state,
+            &mut output,
+            num_heads,
+            head_dim,
+            ssm_a,
         )
         .unwrap();
 
@@ -292,8 +310,17 @@ mod tests {
         let mut state_chunk = vec![0.0f32; num_heads * d2];
         let mut output_chunk = vec![0.0f32; seq_len * vec_len];
         dn.forward_chunk(
-            &q, &k, &v, &alpha, &beta, &mut state_chunk, &mut output_chunk,
-            seq_len, num_heads, head_dim, ssm_a,
+            &q,
+            &k,
+            &v,
+            &alpha,
+            &beta,
+            &mut state_chunk,
+            &mut output_chunk,
+            seq_len,
+            num_heads,
+            head_dim,
+            ssm_a,
         )
         .unwrap();
 

@@ -1,8 +1,8 @@
 use crate::Result;
 pub use crate::{
-    Dequantize, MatMulQ, QuantDtype, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE,
-    Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, Q6K_GROUPS, Q6K_GROUP_SIZE, TQ2_BLOCK_BYTES, TQ2_BLOCK_SIZE,
-    I2S_BLOCK_BYTES, I2S_BLOCK_SIZE,
+    Dequantize, MatMulQ, QuantDtype, I2S_BLOCK_BYTES, I2S_BLOCK_SIZE, Q4K_BLOCK_BYTES,
+    Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE, Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, Q6K_GROUPS,
+    Q6K_GROUP_SIZE, TQ2_BLOCK_BYTES, TQ2_BLOCK_SIZE,
 };
 use rayon::prelude::*;
 
@@ -82,7 +82,7 @@ pub fn q4k_unpack_scales(packed: &[u8]) -> ([f32; Q4K_GROUPS], [f32; Q4K_GROUPS]
 
 pub fn q4k_nibble(qs: &[u8], idx: usize) -> u8 {
     let byte_idx = idx / 2;
-    if idx % 2 == 0 {
+    if idx.is_multiple_of(2) {
         qs[byte_idx] & 0x0F
     } else {
         qs[byte_idx] >> 4
@@ -157,7 +157,7 @@ pub fn q6k_dot_block(block: &[u8], a: &[f32]) -> f32 {
 
         for l in 0..32 {
             let is = l / 16;
-            let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+            let q1 = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
             let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
             let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
             let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
@@ -599,7 +599,7 @@ unsafe fn q6k_dot_q8_avx2(block: &[u8], a_q8: &[i8], a_scale: f32, a_group_sums:
         let gs = |g: usize| -> f32 { a_group_sums[y_off / Q6K_GROUP_SIZE + g] };
 
         // Group 0: elements y_off+0..y_off+31 → 2 sub-groups of 16
-        result += d * sc(half * 8 + 0) * (a_scale * lo_0 as f32 - 32.0 * gs(0));
+        result += d * sc(half * 8) * (a_scale * lo_0 as f32 - 32.0 * gs(0));
         result += d * sc(half * 8 + 1) * (a_scale * hi_0 as f32 - 32.0 * gs(1));
         // Group 1: elements y_off+32..y_off+63
         result += d * sc(half * 8 + 2) * (a_scale * lo_1 as f32 - 32.0 * gs(2));
@@ -678,7 +678,7 @@ pub fn tq2_encode_block(values: &[f32; TQ2_BLOCK_SIZE]) -> [u8; TQ2_BLOCK_BYTES]
         let mut packed = 0u8;
         for shift in (0..8).step_by(2) {
             let v = values[idx];
-            let q = (v * id).round().max(-1.0).min(1.0) as i8;
+            let q = (v * id).round().clamp(-1.0, 1.0) as i8;
             let encoded = (q + 1) as u8;
             packed |= encoded << shift;
             idx += 1;
@@ -760,10 +760,7 @@ pub fn quantize_row_i8_s(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
     // C: for (int i = 0; i < n; ++i) {
     for (i, &v) in x.iter().enumerate() {
         // C: int v = nearest_int(x[i] * s);
-        let mut q: i32 = nearest_int(v * s);
-        // C: if (v > 127) v = 127; if (v < -128) v = -128;
-        if q > 127 { q = 127; }
-        if q < -128 { q = -128; }
+        let q: i32 = nearest_int(v * s).clamp(-128, 127);
         // C: sum += v;
         sum += q;
         // C: dst[i] = (int8_t)(v);
@@ -817,7 +814,7 @@ pub fn i2s_dequant_block(block: &[u8], output: &mut [f32; I2S_BLOCK_SIZE]) {
     for g in 0..(I2S_BLOCK_SIZE / 128) {
         for b in 0..32 {
             let byte = block[g * 32 + b];
-            output[g * 128 + b]      = ((byte >> 6) & 0x03) as f32 - 1.0;
+            output[g * 128 + b] = ((byte >> 6) & 0x03) as f32 - 1.0;
             output[g * 128 + 32 + b] = ((byte >> 4) & 0x03) as f32 - 1.0;
             output[g * 128 + 64 + b] = ((byte >> 2) & 0x03) as f32 - 1.0;
             output[g * 128 + 96 + b] = (byte & 0x03) as f32 - 1.0;
@@ -847,9 +844,13 @@ pub unsafe fn quantize_row_i8_s_avx2_into(x: &[f32], dst: &mut [i8]) -> (f32, i3
     let mut max_abs = _mm_cvtss_f32(max32);
     for i in chunks * 8..k {
         let av = x[i].abs();
-        if av > max_abs { max_abs = av; }
+        if av > max_abs {
+            max_abs = av;
+        }
     }
-    if max_abs < 0.00001 { max_abs = 0.00001; }
+    if max_abs < 0.00001 {
+        max_abs = 0.00001;
+    }
 
     let s: f32 = 127.0 / max_abs;
     let s_vec = _mm256_set1_ps(s);
@@ -859,7 +860,8 @@ pub unsafe fn quantize_row_i8_s_avx2_into(x: &[f32], dst: &mut [i8]) -> (f32, i3
         let v = _mm256_loadu_ps(x.as_ptr().add(i * 8));
         let scaled = _mm256_mul_ps(v, s_vec);
         let rounded = _mm256_cvtps_epi32(_mm256_round_ps(
-            scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+            scaled,
+            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
         ));
         let clamped = _mm256_max_epi32(
             _mm256_set1_epi32(-128),
@@ -881,9 +883,7 @@ pub unsafe fn quantize_row_i8_s_avx2_into(x: &[f32], dst: &mut [i8]) -> (f32, i3
     let mut sum = _mm_cvtsi128_si32(s32);
 
     for i in chunks * 8..k {
-        let mut q = nearest_int(x[i] * s);
-        if q > 127 { q = 127; }
-        if q < -128 { q = -128; }
+        let q = nearest_int(x[i] * s).clamp(-128, 127);
         sum += q;
         dst[i] = q as i8;
     }
@@ -918,9 +918,13 @@ unsafe fn quantize_row_i8_s_avx2(x: &[f32]) -> (f32, i32, Vec<i8>) {
     // Handle tail elements
     for i in chunks * 8..k {
         let av = x[i].abs();
-        if av > max_abs { max_abs = av; }
+        if av > max_abs {
+            max_abs = av;
+        }
     }
-    if max_abs < 0.00001 { max_abs = 0.00001; }
+    if max_abs < 0.00001 {
+        max_abs = 0.00001;
+    }
 
     let s: f32 = 127.0 / max_abs;
     let s_vec = _mm256_set1_ps(s);
@@ -961,9 +965,7 @@ unsafe fn quantize_row_i8_s_avx2(x: &[f32]) -> (f32, i32, Vec<i8>) {
 
     // Handle tail
     for i in chunks * 8..k {
-        let mut q = nearest_int(x[i] * s);
-        if q > 127 { q = 127; }
-        if q < -128 { q = -128; }
+        let q = nearest_int(x[i] * s).clamp(-128, 127);
         sum += q;
         dst[i] = q as i8;
     }
@@ -1131,13 +1133,17 @@ pub fn q2_to_i2s_approx(q2_data: &[u8], n_rows: usize, k: usize) -> (Vec<u8>, f3
             let blk_scale = f16_to_f32(u16::from_le_bytes([q2_data[q2_off], q2_data[q2_off + 1]]));
             let q2_packed = &q2_data[q2_off + 2..q2_off + Q2_0_BLOCK_BYTES];
             let i2s_base = row * row_bytes_i2s + blk * 32;
-            let ratio = if row_avg != 0.0 { blk_scale / row_avg } else { 1.0 };
+            let ratio = if row_avg != 0.0 {
+                blk_scale / row_avg
+            } else {
+                1.0
+            };
 
             if (ratio - 1.0).abs() < 0.02 {
                 // Exact match — direct bit transcode
                 for j in 0..32 {
                     let b = q2_packed[j];
-                    let elems = [4*j, 4*j+1, 4*j+2, 4*j+3];
+                    let elems = [4 * j, 4 * j + 1, 4 * j + 2, 4 * j + 3];
                     let vals = [b & 3, (b >> 2) & 3, (b >> 4) & 3, (b >> 6) & 3];
                     for (ei, &elem) in elems.iter().enumerate() {
                         i2s[i2s_base + elem % 32] |= vals[ei] << (6 - 2 * (elem / 32));
@@ -1152,7 +1158,13 @@ pub fn q2_to_i2s_approx(q2_data: &[u8], n_rows: usize, k: usize) -> (Vec<u8>, f3
                     let raw = (q2_packed[q2_byte] >> q2_shift) & 0x03;
                     let trit = raw as i32 - 1;
                     let target = trit as f32 * ratio + error;
-                    let val = if target > 0.5 { 2u8 } else if target < -0.5 { 0u8 } else { 1u8 };
+                    let val = if target > 0.5 {
+                        2u8
+                    } else if target < -0.5 {
+                        0u8
+                    } else {
+                        1u8
+                    };
                     error = target - (val as i32 - 1) as f32;
                     i2s[i2s_base + elem % 32] |= val << (6 - 2 * (elem / 32));
                 }
@@ -1163,14 +1175,23 @@ pub fn q2_to_i2s_approx(q2_data: &[u8], n_rows: usize, k: usize) -> (Vec<u8>, f3
     i2s[scale_off..scale_off + 4].copy_from_slice(&avg_scale.to_ne_bytes());
 
     // Per-row correction: row_scale / avg_scale
-    let corrections: Vec<f32> = row_scales.iter().map(|&rs| if avg_scale != 0.0 { rs / avg_scale } else { 1.0 }).collect();
+    let corrections: Vec<f32> = row_scales
+        .iter()
+        .map(|&rs| {
+            if avg_scale != 0.0 {
+                rs / avg_scale
+            } else {
+                1.0
+            }
+        })
+        .collect();
     (i2s, avg_scale, corrections)
 }
 
 pub fn repack_q2_to_q2x4(q2_data: &[u8], n_rows: usize, k: usize) -> Vec<u8> {
     let blocks_per_row = k / Q2_0_BLOCK_SIZE;
     let row_bytes_q2 = blocks_per_row * Q2_0_BLOCK_BYTES;
-    let n_col_groups = (n_rows + 3) / 4;
+    let n_col_groups = n_rows.div_ceil(4);
     let mut out = vec![0u8; n_col_groups * blocks_per_row * Q2X4_BLOCK_BYTES];
 
     for grp in 0..n_col_groups {
@@ -1195,20 +1216,27 @@ pub fn repack_q2_to_q2x4(q2_data: &[u8], n_rows: usize, k: usize) -> Vec<u8> {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512dq", enable = "avx512vnni")]
+#[target_feature(
+    enable = "avx512f",
+    enable = "avx512bw",
+    enable = "avx512dq",
+    enable = "avx512vnni"
+)]
 unsafe fn q2x4_gemv_avx512(
     packed_x4: &[u8],
-    q8: &[i8], act_scales: &[f32],
+    q8: &[i8],
+    act_scales: &[f32],
     output: &mut [f32],
-    n: usize, k: usize,
+    n: usize,
+    k: usize,
 ) {
     use std::arch::x86_64::*;
 
     let nb = k / Q2_0_BLOCK_SIZE;
     let n4 = n / 4;
     let ones = _mm512_set1_epi8(1);
-    let idx01 = _mm512_set_epi32(1,1,1,1,1,1,1,1, 0,0,0,0,0,0,0,0);
-    let idx23 = _mm512_set_epi32(3,3,3,3,3,3,3,3, 2,2,2,2,2,2,2,2);
+    let idx01 = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+    let idx23 = _mm512_set_epi32(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2);
     let m3 = _mm512_set1_epi32(0x03030303u32 as i32);
 
     for x in 0..n4 {
@@ -1218,28 +1246,38 @@ unsafe fn q2x4_gemv_avx512(
 
         for l in 0..nb {
             let blk = &packed_x4[b_base + l * Q2X4_BLOCK_BYTES..];
-            let d0 = _mm512_castps128_ps512(_mm_cvtph_ps(_mm_loadl_epi64(blk.as_ptr() as *const __m128i)));
+            let d0 = _mm512_castps128_ps512(_mm_cvtph_ps(_mm_loadl_epi64(
+                blk.as_ptr() as *const __m128i
+            )));
             let d0v01 = _mm512_permutexvar_ps(idx01, d0);
             let d0v23 = _mm512_permutexvar_ps(idx23, d0);
 
             for sub in 0..4 {
                 let si = l * 4 + sub;
                 let d1 = act_scales[si];
-                if d1 == 0.0 { continue; }
+                if d1 == 0.0 {
+                    continue;
+                }
 
                 let qs = blk.as_ptr().add(8 + sub * 32);
                 let packed = _mm256_loadu_si256(qs as *const __m256i);
                 let v01 = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(packed));
                 let v23 = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(packed, 1));
-                let r01 = _mm512_or_si512(_mm512_or_si512(v01, _mm512_slli_epi32(v01, 6)),
-                    _mm512_or_si512(_mm512_slli_epi32(v01, 12), _mm512_slli_epi32(v01, 18)));
-                let r23 = _mm512_or_si512(_mm512_or_si512(v23, _mm512_slli_epi32(v23, 6)),
-                    _mm512_or_si512(_mm512_slli_epi32(v23, 12), _mm512_slli_epi32(v23, 18)));
+                let r01 = _mm512_or_si512(
+                    _mm512_or_si512(v01, _mm512_slli_epi32(v01, 6)),
+                    _mm512_or_si512(_mm512_slli_epi32(v01, 12), _mm512_slli_epi32(v01, 18)),
+                );
+                let r23 = _mm512_or_si512(
+                    _mm512_or_si512(v23, _mm512_slli_epi32(v23, 6)),
+                    _mm512_or_si512(_mm512_slli_epi32(v23, 12), _mm512_slli_epi32(v23, 18)),
+                );
                 let w01 = _mm512_and_si512(r01, m3);
                 let w23 = _mm512_and_si512(r23, m3);
 
-                let qa = _mm512_broadcast_i64x4(_mm256_loadu_si256(q8.as_ptr().add(si * 32) as *const __m256i));
-                let sq  = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, qa);
+                let qa = _mm512_broadcast_i64x4(_mm256_loadu_si256(
+                    q8.as_ptr().add(si * 32) as *const __m256i
+                ));
+                let sq = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, qa);
                 let i01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, qa);
                 let i23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, qa);
 
@@ -1269,7 +1307,8 @@ pub fn q2x4_gemv_preq(
     packed_x4: &[u8],
     preq: &PreQuantizedActivations,
     output: &mut [f32],
-    n: usize, k: usize,
+    n: usize,
+    k: usize,
 ) {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx512f")
@@ -1287,14 +1326,12 @@ pub fn q2x4_gemv_preq(
             let grp_end = (ith + 1) * n4 / nth;
             for grp in grp_start..grp_end {
                 let b_slice = &packed_x4[grp * x4_stride..(grp + 1) * x4_stride];
-                let out4 = unsafe { std::slice::from_raw_parts_mut((out_addr as *mut f32).add(grp * 4), 4) };
-                unsafe { q2x4_gemv_avx512(
-                    b_slice, &preq.q8_32, &preq.scales_32,
-                    out4, 4, k,
-                )};
+                let out4 = unsafe {
+                    std::slice::from_raw_parts_mut((out_addr as *mut f32).add(grp * 4), 4)
+                };
+                unsafe { q2x4_gemv_avx512(b_slice, &preq.q8_32, &preq.scales_32, out4, 4, k) };
             }
         });
-        return;
     }
 }
 
@@ -1338,7 +1375,12 @@ pub fn quantize_row_q8_0(x: &[f32], out: &mut [u8]) {
     for i in 0..nb {
         let src = &x[i * Q8_0_BLOCK_SIZE..(i + 1) * Q8_0_BLOCK_SIZE];
         let mut amax = 0.0f32;
-        for &v in src { let a = v.abs(); if a > amax { amax = a; } }
+        for &v in src {
+            let a = v.abs();
+            if a > amax {
+                amax = a;
+            }
+        }
         let d = amax / 127.0;
         let d_f16 = half::f16::from_f32(d);
         let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
@@ -1374,7 +1416,7 @@ fn q2_0_dot_q8_preq_scalar(w_packed: &[u8], q8_act: &[u8], k: usize) -> f32 {
             let mut sumi_block: i32 = 0;
             for b in 0..8 {
                 let byte = qs[sub * 8 + b];
-                sumi_block += (((byte >> 0) & 3) as i32 - 1) * qy[b * 4 + 0] as i8 as i32;
+                sumi_block += ((byte & 3) as i32 - 1) * qy[b * 4] as i8 as i32;
                 sumi_block += (((byte >> 2) & 3) as i32 - 1) * qy[b * 4 + 1] as i8 as i32;
                 sumi_block += (((byte >> 4) & 3) as i32 - 1) * qy[b * 4 + 2] as i8 as i32;
                 sumi_block += (((byte >> 6) & 3) as i32 - 1) * qy[b * 4 + 3] as i8 as i32;
@@ -1398,9 +1440,9 @@ unsafe fn q2_0_dot_q8_preq_avx512(w_packed: &[u8], q8_act: &[u8], k: usize) -> f
     use std::arch::x86_64::*;
     let nb = k / Q2_0_BLOCK_SIZE;
     let ones = _mm256_set1_epi8(1);
-    let idxlo = _mm_setr_epi8(0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3);
-    let idxhi = _mm_setr_epi8(4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7);
-    let mul = _mm256_setr_epi16(64,16,4,1, 64,16,4,1, 64,16,4,1, 64,16,4,1);
+    let idxlo = _mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+    let idxhi = _mm_setr_epi8(4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+    let mul = _mm256_setr_epi16(64, 16, 4, 1, 64, 16, 4, 1, 64, 16, 4, 1, 64, 16, 4, 1);
     let three = _mm256_set1_epi16(3);
     let mut sumf = 0.0f32;
 
@@ -1415,10 +1457,7 @@ unsafe fn q2_0_dot_q8_preq_avx512(w_packed: &[u8], q8_act: &[u8], k: usize) -> f
             let d1 = f16_to_f32(u16::from_le_bytes([q8_act[q8_off], q8_act[q8_off + 1]]));
             let qy = _mm256_loadu_si256(q8_act.as_ptr().add(q8_off + 2) as *const __m256i);
             let src = _mm_loadl_epi64(qs.add(sub * 8) as *const __m128i);
-            let rep = _mm256_set_m128i(
-                _mm_shuffle_epi8(src, idxhi),
-                _mm_shuffle_epi8(src, idxlo),
-            );
+            let rep = _mm256_set_m128i(_mm_shuffle_epi8(src, idxhi), _mm_shuffle_epi8(src, idxlo));
             let r0 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(rep));
             let r1 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(rep, 1));
             let r0 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r0, mul), 6), three);
@@ -1427,7 +1466,10 @@ unsafe fn q2_0_dot_q8_preq_avx512(w_packed: &[u8], q8_act: &[u8], k: usize) -> f
             let dp = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), codes, qy);
             let sy = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), ones, qy);
             let corrected = _mm256_sub_epi32(dp, sy);
-            let hi128 = _mm_add_epi32(_mm256_castsi256_si128(corrected), _mm256_extracti128_si256(corrected, 1));
+            let hi128 = _mm_add_epi32(
+                _mm256_castsi256_si128(corrected),
+                _mm256_extracti128_si256(corrected, 1),
+            );
             let hi64 = _mm_add_epi32(hi128, _mm_unpackhi_epi64(hi128, hi128));
             let hi32 = _mm_add_epi32(hi64, _mm_shuffle_epi32(hi64, 1));
             sumi += d1 * _mm_cvtsi128_si32(hi32) as f32;
@@ -1448,9 +1490,9 @@ unsafe fn q2_0_dot_q8_preq_avx2(w_packed: &[u8], q8_act: &[u8], k: usize) -> f32
     let nb = k / Q2_0_BLOCK_SIZE;
     let ones = _mm256_set1_epi8(1);
     let ones_16 = _mm256_set1_epi16(1);
-    let idxlo = _mm_setr_epi8(0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3);
-    let idxhi = _mm_setr_epi8(4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7);
-    let mul = _mm256_setr_epi16(64,16,4,1, 64,16,4,1, 64,16,4,1, 64,16,4,1);
+    let idxlo = _mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+    let idxhi = _mm_setr_epi8(4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+    let mul = _mm256_setr_epi16(64, 16, 4, 1, 64, 16, 4, 1, 64, 16, 4, 1, 64, 16, 4, 1);
     let three = _mm256_set1_epi16(3);
     let mut sumf = 0.0f32;
 
@@ -1465,10 +1507,7 @@ unsafe fn q2_0_dot_q8_preq_avx2(w_packed: &[u8], q8_act: &[u8], k: usize) -> f32
             let d1 = f16_to_f32(u16::from_le_bytes([q8_act[q8_off], q8_act[q8_off + 1]]));
             let qy = _mm256_loadu_si256(q8_act.as_ptr().add(q8_off + 2) as *const __m256i);
             let src = _mm_loadl_epi64(qs.add(sub * 8) as *const __m128i);
-            let rep = _mm256_set_m128i(
-                _mm_shuffle_epi8(src, idxhi),
-                _mm_shuffle_epi8(src, idxlo),
-            );
+            let rep = _mm256_set_m128i(_mm_shuffle_epi8(src, idxhi), _mm_shuffle_epi8(src, idxlo));
             let r0 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(rep));
             let r1 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(rep, 1));
             let r0 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r0, mul), 6), three);
@@ -1477,7 +1516,10 @@ unsafe fn q2_0_dot_q8_preq_avx2(w_packed: &[u8], q8_act: &[u8], k: usize) -> f32
             let dp = _mm256_madd_epi16(_mm256_maddubs_epi16(codes, qy), ones_16);
             let sy = _mm256_madd_epi16(_mm256_maddubs_epi16(ones, qy), ones_16);
             let dot = _mm256_sub_epi32(dp, sy);
-            let hi128 = _mm_add_epi32(_mm256_castsi256_si128(dot), _mm256_extracti128_si256(dot, 1));
+            let hi128 = _mm_add_epi32(
+                _mm256_castsi256_si128(dot),
+                _mm256_extracti128_si256(dot, 1),
+            );
             let hi64 = _mm_add_epi32(hi128, _mm_unpackhi_epi64(hi128, hi128));
             let hi32 = _mm_add_epi32(hi64, _mm_shuffle_epi32(hi64, 1));
             sumi += d1 * _mm_cvtsi128_si32(hi32) as f32;
@@ -1521,7 +1563,9 @@ pub fn q2_0_gemm_q8_parallel(
             for j in rs..re {
                 let w = &packed_w[j * row_bytes..(j + 1) * row_bytes];
                 let val = q2_0_dot_q8_preq(w, &q8_buf, k);
-                unsafe { *(out_ptr as *mut f32).add(row_idx * n + j) = val; }
+                unsafe {
+                    *(out_ptr as *mut f32).add(row_idx * n + j) = val;
+                }
             }
         }
     });
@@ -1611,11 +1655,11 @@ fn q2_0_dot_q8(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
             let mut sumi_block: i32 = 0;
             for b in 0..8 {
                 let byte = sub_qs[b];
-                let w0 = ((byte >> 0) & 3) as i32 - 1;
+                let w0 = (byte & 3) as i32 - 1;
                 let w1 = ((byte >> 2) & 3) as i32 - 1;
                 let w2 = ((byte >> 4) & 3) as i32 - 1;
                 let w3 = ((byte >> 6) & 3) as i32 - 1;
-                let a0 = (sub_a[b * 4 + 0] * id1).round() as i32;
+                let a0 = (sub_a[b * 4] * id1).round() as i32;
                 let a1 = (sub_a[b * 4 + 1] * id1).round() as i32;
                 let a2 = (sub_a[b * 4 + 2] * id1).round() as i32;
                 let a3 = (sub_a[b * 4 + 3] * id1).round() as i32;
@@ -1674,7 +1718,9 @@ unsafe fn q2_0_dot_q8_avx2(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
             let amax = _mm_cvtss_f32(m);
 
             let d1 = amax / 127.0;
-            if d1 == 0.0 { continue; }
+            if d1 == 0.0 {
+                continue;
+            }
             let id1 = _mm256_set1_ps(127.0 / amax);
 
             // Quantize to i8: round(x * id1), pack to i8
@@ -1685,31 +1731,34 @@ unsafe fn q2_0_dot_q8_avx2(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
             let q01 = _mm256_packs_epi32(q0, q1); // i16
             let q23 = _mm256_packs_epi32(q2, q3);
             let q_i8 = _mm256_packs_epi16(q01, q23); // i8
-            // Fix lane ordering: packs interleaves 128-bit lanes
-            let q_i8 = _mm256_permutevar8x32_epi32(q_i8,
-                _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+                                                     // Fix lane ordering: packs interleaves 128-bit lanes
+            let q_i8 = _mm256_permutevar8x32_epi32(q_i8, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
 
             // Unpack 8 bytes of Q2_0 weights to 32 u8 values {0,1,2,3}
             let w_raw = _mm_loadl_epi64(qs_ptr.add(sub * 8) as *const __m128i);
-            let w_raw = _mm256_castsi128_si256(w_raw);
+            let _w_raw = _mm256_castsi128_si256(w_raw);
             // Broadcast each byte to 4 lanes, then shift+mask
             // Actually: use the same unpack as full 32-byte, but on 8 bytes repeated
             // Simpler: just broadcast the 8 bytes to fill 32 lanes, then shift
-            let w_8 = _mm256_broadcastsi128_si256(_mm_loadl_epi64(qs_ptr.add(sub * 8) as *const __m128i));
+            let w_8 =
+                _mm256_broadcastsi128_si256(_mm_loadl_epi64(qs_ptr.add(sub * 8) as *const __m128i));
             // We have 8 bytes in the low 64 bits of each 128-bit lane
             // Need to unpack: byte[j] bits 0-1 → element 4j, bits 2-3 → 4j+1, etc.
             // Use shuffle to replicate each byte 4 times, then shift+mask
             let shuffle = _mm256_setr_epi8(
-                0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3,
-                4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7);
+                0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6,
+                7, 7, 7, 7,
+            );
             let w_rep = _mm256_shuffle_epi8(w_8, shuffle);
             // Shift each replicated byte by 0,2,4,6 bits
             let shift_mask = _mm256_setr_epi8(
-                0,2,4,6, 0,2,4,6, 0,2,4,6, 0,2,4,6,
-                0,2,4,6, 0,2,4,6, 0,2,4,6, 0,2,4,6);
-            let w_shifted = _mm256_srlv_epi32(
+                0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6,
+                0, 2, 4, 6,
+            );
+            let _w_shifted = _mm256_srlv_epi32(
                 w_rep,
-                _mm256_cvtepu8_epi32(_mm256_castsi256_si128(shift_mask)));
+                _mm256_cvtepu8_epi32(_mm256_castsi256_si128(shift_mask)),
+            );
             // That won't work for per-byte shifts. Use variable approach:
             // Actually srlv works on 32-bit lanes. We need per-byte variable shifts.
             // Simpler: unpack with mask at each shift level
@@ -1723,11 +1772,13 @@ unsafe fn q2_0_dot_q8_avx2(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
             // at positions 0,1,2,3 within each 4-byte group
             // blend_epi8 selects per byte. Create mask: pos%4==0 from w0, pos%4==1 from w1, etc.
             let blend_1 = _mm256_setr_epi8(
-                0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1,
-                0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1);
+                0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1,
+                0, -1, 0, -1, 0, -1, 0, -1,
+            );
             let blend_2 = _mm256_setr_epi8(
-                0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1,
-                0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1);
+                0, 0, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1,
+                0, 0, -1, -1, 0, 0, -1, -1,
+            );
             let w_01 = _mm256_blendv_epi8(w0, w1, blend_1);
             let w_23 = _mm256_blendv_epi8(w2, w3, blend_1);
             let w_all = _mm256_blendv_epi8(w_01, w_23, blend_2);
@@ -1752,13 +1803,7 @@ unsafe fn q2_0_dot_q8_avx2(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
     sumf
 }
 
-pub fn q2_0_gemv(
-    packed: &[u8],
-    a_f32: &[f32],
-    output: &mut [f32],
-    n: usize,
-    k: usize,
-) {
+pub fn q2_0_gemv(packed: &[u8], a_f32: &[f32], output: &mut [f32], n: usize, k: usize) {
     let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") {
@@ -1776,7 +1821,8 @@ pub fn q2_0_gemv(
 
 macro_rules! q2_0_unpack_sub {
     ($qs_ptr:expr, $sub:expr, $shuffle:expr, $mask_2bit:expr, $blend_1:expr, $blend_2:expr) => {{
-        let w_8 = _mm256_broadcastsi128_si256(_mm_loadl_epi64($qs_ptr.add($sub * 8) as *const __m128i));
+        let w_8 =
+            _mm256_broadcastsi128_si256(_mm_loadl_epi64($qs_ptr.add($sub * 8) as *const __m128i));
         let w_rep = _mm256_shuffle_epi8(w_8, $shuffle);
         let w0 = _mm256_and_si256(w_rep, $mask_2bit);
         let w1 = _mm256_and_si256(_mm256_srli_epi16(w_rep, 2), $mask_2bit);
@@ -1789,10 +1835,18 @@ macro_rules! q2_0_unpack_sub {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vbmi", enable = "avx512vnni")]
+#[target_feature(
+    enable = "avx512f",
+    enable = "avx512bw",
+    enable = "avx512vbmi",
+    enable = "avx512vnni"
+)]
 unsafe fn q2_0_dot_nrows_preq_avx512(
     row_ptrs: &[&[u8]],
-    q8: &[i8], scales: &[f32], asum: &[i32], k: usize,
+    q8: &[i8],
+    scales: &[f32],
+    asum: &[i32],
+    k: usize,
     out: &mut [f32],
 ) {
     use std::arch::x86_64::*;
@@ -1803,11 +1857,11 @@ unsafe fn q2_0_dot_nrows_preq_avx512(
     // Permute index: replicate each of the first 8 bytes 4 times across 32-byte half
     let perm_idx = _mm512_set_epi8(
         // upper 32 bytes (sub=1): bytes 8..15, each replicated 4x
-        15,15,15,15, 14,14,14,14, 13,13,13,13, 12,12,12,12,
-        11,11,11,11, 10,10,10,10,  9, 9, 9, 9,  8, 8, 8, 8,
+        15, 15, 15, 15, 14, 14, 14, 14, 13, 13, 13, 13, 12, 12, 12, 12, 11, 11, 11, 11, 10, 10, 10,
+        10, 9, 9, 9, 9, 8, 8, 8, 8,
         // lower 32 bytes (sub=0): bytes 0..7, each replicated 4x
-         7, 7, 7, 7,  6, 6, 6, 6,  5, 5, 5, 5,  4, 4, 4, 4,
-         3, 3, 3, 3,  2, 2, 2, 2,  1, 1, 1, 1,  0, 0, 0, 0,
+        7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0,
+        0,
     );
 
     let mut sumf = [0.0f32; 8];
@@ -1864,7 +1918,9 @@ unsafe fn q2_0_dot_nrows_preq_avx512(
                 sumi[r] += (dot0 - sa_0) as f32 * d1_0 + (dot1 - sa_1) as f32 * d1_1;
             }
         }
-        for r in 0..nr { sumf[r] += d0s[r] * sumi[r]; }
+        for r in 0..nr {
+            sumf[r] += d0s[r] * sumi[r];
+        }
     }
     out[..nr].copy_from_slice(&sumf[..nr]);
 }
@@ -1873,7 +1929,10 @@ unsafe fn q2_0_dot_nrows_preq_avx512(
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn q2_0_dot_nrows_preq_avx2(
     row_ptrs: &[&[u8]],
-    q8: &[i8], scales: &[f32], asum: &[i32], k: usize,
+    q8: &[i8],
+    scales: &[f32],
+    asum: &[i32],
+    k: usize,
     out: &mut [f32],
 ) {
     use std::arch::x86_64::*;
@@ -1883,14 +1942,17 @@ unsafe fn q2_0_dot_nrows_preq_avx2(
     let mask_2bit = _mm256_set1_epi8(0x03);
     let ones_16 = _mm256_set1_epi16(1);
     let shuffle = _mm256_setr_epi8(
-        0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3,
-        4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7);
+        0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7,
+        7, 7,
+    );
     let blend_1 = _mm256_setr_epi8(
-        0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1,
-        0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1);
+        0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1,
+        0, -1, 0, -1, 0, -1,
+    );
     let blend_2 = _mm256_setr_epi8(
-        0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1,
-        0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1);
+        0, 0, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1, 0, 0,
+        -1, -1, 0, 0, -1, -1,
+    );
 
     let mut sumf = [0.0f32; 8];
 
@@ -1908,7 +1970,9 @@ unsafe fn q2_0_dot_nrows_preq_avx2(
         for sub in 0..4 {
             let sub_idx = i * 4 + sub;
             let d1 = scales[sub_idx];
-            if d1 == 0.0 { continue; }
+            if d1 == 0.0 {
+                continue;
+            }
             let sum_a = asum[sub_idx];
 
             let q_i8 = _mm256_loadu_si256(q8.as_ptr().add(sub_idx * 32) as *const __m256i);
@@ -1920,7 +1984,9 @@ unsafe fn q2_0_dot_nrows_preq_avx2(
                 sumi[r] += (dot_wa - sum_a) as f32 * d1;
             }
         }
-        for r in 0..nr { sumf[r] += d0s[r] * sumi[r]; }
+        for r in 0..nr {
+            sumf[r] += d0s[r] * sumi[r];
+        }
     }
     out[..nr].copy_from_slice(&sumf[..nr]);
 }
@@ -1947,14 +2013,17 @@ unsafe fn q2_0_dot_1row_preq_avx2(w: &[u8], q8: &[i8], scales: &[f32], k: usize)
     let ones_8 = _mm256_set1_epi8(1);
     let ones_16 = _mm256_set1_epi16(1);
     let shuffle = _mm256_setr_epi8(
-        0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3,
-        4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7);
+        0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7,
+        7, 7,
+    );
     let blend_1 = _mm256_setr_epi8(
-        0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1,
-        0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1, 0,-1,0,-1);
+        0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1,
+        0, -1, 0, -1, 0, -1,
+    );
     let blend_2 = _mm256_setr_epi8(
-        0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1,
-        0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1, 0,0,-1,-1);
+        0, 0, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1, 0, 0, -1, -1, 0, 0,
+        -1, -1, 0, 0, -1, -1,
+    );
     let mut sumf = 0.0f32;
     for i in 0..nb {
         let blk = &w[i * Q2_0_BLOCK_BYTES..];
@@ -1964,7 +2033,9 @@ unsafe fn q2_0_dot_1row_preq_avx2(w: &[u8], q8: &[i8], scales: &[f32], k: usize)
         for sub in 0..4 {
             let sub_idx = i * 4 + sub;
             let d1 = scales[sub_idx];
-            if d1 == 0.0 { continue; }
+            if d1 == 0.0 {
+                continue;
+            }
             let d1_v = _mm256_set1_ps(d1);
             let q_i8 = _mm256_loadu_si256(q8.as_ptr().add(sub_idx * 32) as *const __m256i);
             let w_all = q2_0_unpack_sub!(qs_ptr, sub, shuffle, mask_2bit, blend_1, blend_2);
@@ -1981,8 +2052,12 @@ unsafe fn q2_0_dot_1row_preq_avx2(w: &[u8], q8: &[i8], scales: &[f32], k: usize)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn q2_0_i2s_dot_preq_avx2(
-    i2s_row: &[u8], blk_scales: &[f32],
-    q8: &[i8], act_scales: &[f32], asum: &[i32], k: usize,
+    i2s_row: &[u8],
+    blk_scales: &[f32],
+    q8: &[i8],
+    act_scales: &[f32],
+    asum: &[i32],
+    k: usize,
 ) -> f32 {
     use std::arch::x86_64::*;
     let nb = k / Q2_0_BLOCK_SIZE;
@@ -2025,10 +2100,12 @@ unsafe fn q2_0_i2s_dot_preq_avx2(
 }
 
 pub fn q2_0_gemv_i2s(
-    i2s_data: &[u8], blk_scales: &[f32],
+    i2s_data: &[u8],
+    blk_scales: &[f32],
     preq: &PreQuantizedActivations,
     output: &mut [f32],
-    n: usize, k: usize,
+    n: usize,
+    k: usize,
 ) {
     let row_bytes = k / 4;
     let blocks_per_row = k / Q2_0_BLOCK_SIZE;
@@ -2036,27 +2113,39 @@ pub fn q2_0_gemv_i2s(
     if is_x86_feature_detected!("avx2") && !preq.q8_32.is_empty() {
         use rayon::prelude::*;
         let n_threads = rayon::current_num_threads().max(1);
-        let chunk = ((n + n_threads - 1) / n_threads).max(64);
-        output.par_chunks_mut(chunk).enumerate().for_each(|(ci, out)| {
-            let base = ci * chunk;
-            for j in 0..out.len() {
-                let row = base + j;
-                let i2s_row = &i2s_data[row * row_bytes..(row + 1) * row_bytes];
-                let row_scales = &blk_scales[row * blocks_per_row..(row + 1) * blocks_per_row];
-                out[j] = unsafe { q2_0_i2s_dot_preq_avx2(
-                    i2s_row, row_scales, &preq.q8_32, &preq.scales_32, &preq.asum_32, k
-                )};
-            }
-        });
-        return;
+        let chunk = n.div_ceil(n_threads).max(64);
+        output
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(ci, out)| {
+                let base = ci * chunk;
+                for j in 0..out.len() {
+                    let row = base + j;
+                    let i2s_row = &i2s_data[row * row_bytes..(row + 1) * row_bytes];
+                    let row_scales = &blk_scales[row * blocks_per_row..(row + 1) * blocks_per_row];
+                    out[j] = unsafe {
+                        q2_0_i2s_dot_preq_avx2(
+                            i2s_row,
+                            row_scales,
+                            &preq.q8_32,
+                            &preq.scales_32,
+                            &preq.asum_32,
+                            k,
+                        )
+                    };
+                }
+            });
     }
 }
 
 pub fn q2_0_gemv_preq_range(
     packed: &[u8],
-    q8: &[i8], scales: &[f32], asum: &[i32],
+    q8: &[i8],
+    scales: &[f32],
+    asum: &[i32],
     output: &mut [f32],
-    row_start: usize, row_end: usize,
+    row_start: usize,
+    row_end: usize,
     k: usize,
 ) {
     let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
@@ -2067,12 +2156,30 @@ pub fn q2_0_gemv_preq_range(
     if is_x86_feature_detected!("avx2") {
         for t in 0..n_tiles {
             let base = row_start + t * TILE;
-            let rows: [&[u8]; 8] = std::array::from_fn(|r| &packed[(base + r) * row_bytes..(base + r + 1) * row_bytes]);
-            unsafe { q2_0_dot_nrows_preq_avx2(&rows, q8, scales, asum, k, &mut output[t * TILE..t * TILE + TILE]) };
+            let rows: [&[u8]; 8] = std::array::from_fn(|r| {
+                &packed[(base + r) * row_bytes..(base + r + 1) * row_bytes]
+            });
+            unsafe {
+                q2_0_dot_nrows_preq_avx2(
+                    &rows,
+                    q8,
+                    scales,
+                    asum,
+                    k,
+                    &mut output[t * TILE..t * TILE + TILE],
+                )
+            };
         }
         for j in n_tiles * TILE..n {
             let row = row_start + j;
-            output[j] = unsafe { q2_0_dot_1row_preq_avx2(&packed[row * row_bytes..(row + 1) * row_bytes], q8, scales, k) };
+            output[j] = unsafe {
+                q2_0_dot_1row_preq_avx2(
+                    &packed[row * row_bytes..(row + 1) * row_bytes],
+                    q8,
+                    scales,
+                    k,
+                )
+            };
         }
         return;
     }
@@ -2099,18 +2206,34 @@ pub fn q2_0_gemv_preq(
         let n_tiles = n / TILE;
         use rayon::prelude::*;
         let n_threads = rayon::current_num_threads().max(1);
-        let chunk = ((n_tiles + n_threads - 1) / n_threads).max(1);
-        output[..n_tiles * TILE].par_chunks_mut(chunk * TILE).enumerate().for_each(|(ci, out_chunk)| {
-            let base_tile = ci * chunk;
-            let n_t = out_chunk.len() / TILE;
-            for t in 0..n_t {
-                let tile = base_tile + t;
-                let rows: [&[u8]; 8] = std::array::from_fn(|r| &packed[(tile * TILE + r) * row_bytes..(tile * TILE + r + 1) * row_bytes]);
-                unsafe { q2_0_dot_nrows_preq_avx2(&rows, q8, scales, asum, k, &mut out_chunk[t * TILE..t * TILE + TILE]) };
-            }
-        });
+        let chunk = n_tiles.div_ceil(n_threads).max(1);
+        output[..n_tiles * TILE]
+            .par_chunks_mut(chunk * TILE)
+            .enumerate()
+            .for_each(|(ci, out_chunk)| {
+                let base_tile = ci * chunk;
+                let n_t = out_chunk.len() / TILE;
+                for t in 0..n_t {
+                    let tile = base_tile + t;
+                    let rows: [&[u8]; 8] = std::array::from_fn(|r| {
+                        &packed[(tile * TILE + r) * row_bytes..(tile * TILE + r + 1) * row_bytes]
+                    });
+                    unsafe {
+                        q2_0_dot_nrows_preq_avx2(
+                            &rows,
+                            q8,
+                            scales,
+                            asum,
+                            k,
+                            &mut out_chunk[t * TILE..t * TILE + TILE],
+                        )
+                    };
+                }
+            });
         for j in n_tiles * TILE..n {
-            output[j] = unsafe { q2_0_dot_1row_preq_avx2(&packed[j * row_bytes..(j + 1) * row_bytes], q8, scales, k) };
+            output[j] = unsafe {
+                q2_0_dot_1row_preq_avx2(&packed[j * row_bytes..(j + 1) * row_bytes], q8, scales, k)
+            };
         }
         return;
     }
@@ -2133,9 +2256,13 @@ unsafe fn quantize_row_i8_s_avx512_into(x: &[f32], dst: &mut [i8]) -> (f32, i32)
     let mut max_abs = _mm512_reduce_max_ps(vmax);
     for i in chunks16 * 16..k {
         let av = x[i].abs();
-        if av > max_abs { max_abs = av; }
+        if av > max_abs {
+            max_abs = av;
+        }
     }
-    if max_abs < 0.00001 { max_abs = 0.00001; }
+    if max_abs < 0.00001 {
+        max_abs = 0.00001;
+    }
 
     let s: f32 = 127.0 / max_abs;
     let s_vec = _mm512_set1_ps(s);
@@ -2164,9 +2291,7 @@ unsafe fn quantize_row_i8_s_avx512_into(x: &[f32], dst: &mut [i8]) -> (f32, i32)
 
     let mut sum = _mm512_reduce_add_epi32(sum_acc);
     for i in chunks16 * 16..k {
-        let mut q = nearest_int(x[i] * s);
-        if q > 127 { q = 127; }
-        if q < -128 { q = -128; }
+        let q = nearest_int(x[i] * s).clamp(-128, 127);
         sum += q;
         dst[i] = q as i8;
     }
@@ -2194,9 +2319,13 @@ unsafe fn quantize_row_i8_s_avx512(x: &[f32]) -> (f32, i32, Vec<i8>) {
     let mut max_abs = _mm512_reduce_max_ps(vmax);
     for i in chunks16 * 16..k {
         let av = x[i].abs();
-        if av > max_abs { max_abs = av; }
+        if av > max_abs {
+            max_abs = av;
+        }
     }
-    if max_abs < 0.00001 { max_abs = 0.00001; }
+    if max_abs < 0.00001 {
+        max_abs = 0.00001;
+    }
 
     let s: f32 = 127.0 / max_abs;
     let s_vec = _mm512_set1_ps(s);
@@ -2227,9 +2356,7 @@ unsafe fn quantize_row_i8_s_avx512(x: &[f32]) -> (f32, i32, Vec<i8>) {
 
     let mut sum = _mm512_reduce_add_epi32(sum_acc);
     for i in chunks16 * 16..k {
-        let mut q = nearest_int(x[i] * s);
-        if q > 127 { q = 127; }
-        if q < -128 { q = -128; }
+        let q = nearest_int(x[i] * s).clamp(-128, 127);
         sum += q;
         dst[i] = q as i8;
     }
@@ -2392,7 +2519,19 @@ pub fn i2s_gemv_cols(
 ) {
     let row_packed_bytes = k / 4;
     if is_x86_feature_detected!("avx2") {
-        unsafe { i2s_gemv_cols_multi_row(preq_q8, preq_scale, preq_sum, b_quantized, w_scale, output_addr, col_start, col_end, k) };
+        unsafe {
+            i2s_gemv_cols_multi_row(
+                preq_q8,
+                preq_scale,
+                preq_sum,
+                b_quantized,
+                w_scale,
+                output_addr,
+                col_start,
+                col_end,
+                k,
+            )
+        };
         return;
     }
 
@@ -2410,7 +2549,9 @@ pub fn i2s_gemv_cols(
         } else {
             unsafe { vec_dot_i2_i8_s_avx2(w, preq_q8, k) }
         };
-        unsafe { *(output_addr as *mut f32).add(j) = (raw - preq_sum) as f32 / preq_scale * w_scale; }
+        unsafe {
+            *(output_addr as *mut f32).add(j) = (raw - preq_sum) as f32 / preq_scale * w_scale;
+        }
     }
 }
 
@@ -2448,22 +2589,38 @@ unsafe fn i2s_dot_block32(
     let mut acc = _mm256_setzero_si256();
     let w = w_ptr;
     let a = a_ptr;
-    i2s_dot_iter!(acc, w, a, 0, mask);  i2s_dot_iter!(acc, w, a, 1, mask);
-    i2s_dot_iter!(acc, w, a, 2, mask);  i2s_dot_iter!(acc, w, a, 3, mask);
-    i2s_dot_iter!(acc, w, a, 4, mask);  i2s_dot_iter!(acc, w, a, 5, mask);
-    i2s_dot_iter!(acc, w, a, 6, mask);  i2s_dot_iter!(acc, w, a, 7, mask);
-    i2s_dot_iter!(acc, w, a, 8, mask);  i2s_dot_iter!(acc, w, a, 9, mask);
-    i2s_dot_iter!(acc, w, a, 10, mask); i2s_dot_iter!(acc, w, a, 11, mask);
-    i2s_dot_iter!(acc, w, a, 12, mask); i2s_dot_iter!(acc, w, a, 13, mask);
-    i2s_dot_iter!(acc, w, a, 14, mask); i2s_dot_iter!(acc, w, a, 15, mask);
-    i2s_dot_iter!(acc, w, a, 16, mask); i2s_dot_iter!(acc, w, a, 17, mask);
-    i2s_dot_iter!(acc, w, a, 18, mask); i2s_dot_iter!(acc, w, a, 19, mask);
-    i2s_dot_iter!(acc, w, a, 20, mask); i2s_dot_iter!(acc, w, a, 21, mask);
-    i2s_dot_iter!(acc, w, a, 22, mask); i2s_dot_iter!(acc, w, a, 23, mask);
-    i2s_dot_iter!(acc, w, a, 24, mask); i2s_dot_iter!(acc, w, a, 25, mask);
-    i2s_dot_iter!(acc, w, a, 26, mask); i2s_dot_iter!(acc, w, a, 27, mask);
-    i2s_dot_iter!(acc, w, a, 28, mask); i2s_dot_iter!(acc, w, a, 29, mask);
-    i2s_dot_iter!(acc, w, a, 30, mask); i2s_dot_iter!(acc, w, a, 31, mask);
+    i2s_dot_iter!(acc, w, a, 0, mask);
+    i2s_dot_iter!(acc, w, a, 1, mask);
+    i2s_dot_iter!(acc, w, a, 2, mask);
+    i2s_dot_iter!(acc, w, a, 3, mask);
+    i2s_dot_iter!(acc, w, a, 4, mask);
+    i2s_dot_iter!(acc, w, a, 5, mask);
+    i2s_dot_iter!(acc, w, a, 6, mask);
+    i2s_dot_iter!(acc, w, a, 7, mask);
+    i2s_dot_iter!(acc, w, a, 8, mask);
+    i2s_dot_iter!(acc, w, a, 9, mask);
+    i2s_dot_iter!(acc, w, a, 10, mask);
+    i2s_dot_iter!(acc, w, a, 11, mask);
+    i2s_dot_iter!(acc, w, a, 12, mask);
+    i2s_dot_iter!(acc, w, a, 13, mask);
+    i2s_dot_iter!(acc, w, a, 14, mask);
+    i2s_dot_iter!(acc, w, a, 15, mask);
+    i2s_dot_iter!(acc, w, a, 16, mask);
+    i2s_dot_iter!(acc, w, a, 17, mask);
+    i2s_dot_iter!(acc, w, a, 18, mask);
+    i2s_dot_iter!(acc, w, a, 19, mask);
+    i2s_dot_iter!(acc, w, a, 20, mask);
+    i2s_dot_iter!(acc, w, a, 21, mask);
+    i2s_dot_iter!(acc, w, a, 22, mask);
+    i2s_dot_iter!(acc, w, a, 23, mask);
+    i2s_dot_iter!(acc, w, a, 24, mask);
+    i2s_dot_iter!(acc, w, a, 25, mask);
+    i2s_dot_iter!(acc, w, a, 26, mask);
+    i2s_dot_iter!(acc, w, a, 27, mask);
+    i2s_dot_iter!(acc, w, a, 28, mask);
+    i2s_dot_iter!(acc, w, a, 29, mask);
+    i2s_dot_iter!(acc, w, a, 30, mask);
+    i2s_dot_iter!(acc, w, a, 31, mask);
     _mm256_madd_epi16(acc, ones)
 }
 
@@ -2497,8 +2654,10 @@ unsafe fn i2s_gemv_cols_multi_row(
         let mut acc = _mm256_setzero_si256();
 
         for i in 0..group32_num {
-            acc = _mm256_add_epi32(acc, i2s_dot_block32(
-                x_row.add(i * 1024), y.add(i * 4096) as *const i8, mask, ones));
+            acc = _mm256_add_epi32(
+                acc,
+                i2s_dot_block32(x_row.add(i * 1024), y.add(i * 4096), mask, ones),
+            );
         }
 
         if la_num > 0 {
@@ -2547,16 +2706,34 @@ pub fn i2s_gemv_cols_f16(
     k: usize,
 ) {
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
-        unsafe { i2s_gemv_cols_f16_inner(preq_q8, preq_scale, preq_sum, b_quantized, w_scale, output_f16_addr, col_start, col_end, k) };
+        unsafe {
+            i2s_gemv_cols_f16_inner(
+                preq_q8,
+                preq_scale,
+                preq_sum,
+                b_quantized,
+                w_scale,
+                output_f16_addr,
+                col_start,
+                col_end,
+                k,
+            )
+        };
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c")]
 unsafe fn i2s_gemv_cols_f16_inner(
-    preq_q8: &[i8], preq_scale: f32, preq_sum: i32,
-    b_quantized: &[u8], w_scale: f32, output_f16_addr: usize,
-    col_start: usize, col_end: usize, k: usize,
+    preq_q8: &[i8],
+    preq_scale: f32,
+    preq_sum: i32,
+    b_quantized: &[u8],
+    w_scale: f32,
+    output_f16_addr: usize,
+    col_start: usize,
+    col_end: usize,
+    k: usize,
 ) {
     use std::arch::x86_64::*;
     let row_packed_bytes = k / 4;
@@ -2574,8 +2751,10 @@ unsafe fn i2s_gemv_cols_f16_inner(
         let mut acc = _mm256_setzero_si256();
 
         for i in 0..group32_num {
-            acc = _mm256_add_epi32(acc, i2s_dot_block32(
-                x_row.add(i * 1024), y.add(i * 4096) as *const i8, mask, ones));
+            acc = _mm256_add_epi32(
+                acc,
+                i2s_dot_block32(x_row.add(i * 1024), y.add(i * 4096), mask, ones),
+            );
         }
 
         if la_num > 0 {
@@ -2623,13 +2802,13 @@ fn quantize_row_i8_s_lut(x: &[f32], dst: &mut [i8]) -> f32 {
     let mut max: f64 = 0.00001;
     for &v in x {
         let av = (v as f64).abs();
-        if av > max { max = av; }
+        if av > max {
+            max = av;
+        }
     }
     let s: f32 = (63.0f64 / max) as f32;
     for (i, &v) in x.iter().enumerate() {
-        let mut q = nearest_int(v * s);
-        if q > 63 { q = 63; }
-        if q < -63 { q = -63; }
+        let q = nearest_int(v * s).clamp(-63, 63);
         dst[i] = q as i8;
     }
     s
@@ -2643,7 +2822,7 @@ pub fn i2s_build_pair_lut_i8(a_low: i8, a_high: i8) -> [i8; 16] {
         for w_low in 0u8..3 {
             let idx = ((w_high as usize) << 2) | (w_low as usize);
             let val = decode_ternary(w_high) as i16 * a_high as i16
-                    + decode_ternary(w_low) as i16 * a_low as i16;
+                + decode_ternary(w_low) as i16 * a_low as i16;
             lut[idx] = val as i8;
         }
     }
@@ -2690,8 +2869,8 @@ fn i2s_build_all_pair_luts_split(a_q: &[i8], k: usize) -> Vec<u8> {
                 for w_low in 0u8..3 {
                     let idx = ((w_high as usize) << 2) | (w_low as usize);
                     let val = decode_ternary(w_high) as i16 * a_high as i16
-                            + decode_ternary(w_low) as i16 * a_low as i16;
-                    luts[off + idx] = val as u8;           // lo byte
+                        + decode_ternary(w_low) as i16 * a_low as i16;
+                    luts[off + idx] = val as u8; // lo byte
                     luts[off + 16 + idx] = (val >> 8) as u8; // hi byte
                 }
             }
@@ -2704,7 +2883,7 @@ fn i2s_build_all_pair_luts_split(a_q: &[i8], k: usize) -> Vec<u8> {
                 for w_low in 0u8..3 {
                     let idx = ((w_high as usize) << 2) | (w_low as usize);
                     let val = decode_ternary(w_high) as i16 * a_high2 as i16
-                            + decode_ternary(w_low) as i16 * a_low2 as i16;
+                        + decode_ternary(w_low) as i16 * a_low2 as i16;
                     luts[off2 + idx] = val as u8;
                     luts[off2 + 16 + idx] = (val >> 8) as u8;
                 }
@@ -2721,7 +2900,7 @@ pub fn i2s_build_pair_lut(a_low: i8, a_high: i8) -> [i16; 16] {
         for w_low in 0u8..3 {
             let idx = ((w_high as usize) << 2) | (w_low as usize);
             lut[idx] = decode_ternary(w_high) as i16 * a_high as i16
-                     + decode_ternary(w_low) as i16 * a_low as i16;
+                + decode_ternary(w_low) as i16 * a_low as i16;
         }
     }
     lut
@@ -2787,7 +2966,7 @@ impl MatMulQ for CpuMatMulQ4K {
                 got: output.len(),
             });
         }
-        if k % Q4K_BLOCK_SIZE != 0 {
+        if !k.is_multiple_of(Q4K_BLOCK_SIZE) {
             return Err(crate::KernelError::InvalidConfig(format!(
                 "k={k} must be divisible by Q4K block size {Q4K_BLOCK_SIZE}"
             )));
@@ -2840,7 +3019,7 @@ impl MatMulQ for CpuMatMulQ4K {
                 got: output.len(),
             });
         }
-        if k % Q6K_BLOCK_SIZE != 0 {
+        if !k.is_multiple_of(Q6K_BLOCK_SIZE) {
             return Err(crate::KernelError::InvalidConfig(format!(
                 "k={k} not divisible by {Q6K_BLOCK_SIZE}"
             )));
@@ -2892,7 +3071,7 @@ impl MatMulQ for CpuMatMulQ4K {
                 got: output.len(),
             });
         }
-        if k % TQ2_BLOCK_SIZE != 0 {
+        if !k.is_multiple_of(TQ2_BLOCK_SIZE) {
             return Err(crate::KernelError::InvalidConfig(format!(
                 "k={k} must be divisible by TQ2 block size {TQ2_BLOCK_SIZE}"
             )));
@@ -2934,10 +3113,16 @@ impl MatMulQ for CpuMatMulQ4K {
         k: usize,
     ) -> Result<()> {
         if a.len() != m * k {
-            return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
         }
         if output.len() != m * n {
-            return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
         }
 
         // C: const float * scale = (float *)((uint8_t*)(src0->data) + (ne00 * ne01 / 4));
@@ -3005,10 +3190,16 @@ impl MatMulQ for CpuMatMulQ4K {
         k: usize,
     ) -> Result<()> {
         if a.len() != m * k {
-            return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
         }
         if output.len() != m * n {
-            return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
         }
 
         let packed_bytes = n * k / 4;
@@ -3117,7 +3308,12 @@ unsafe fn quantize_row_q8_avx2(a: &[f32]) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
 /// Integer-domain Q4_K dot product with pre-quantized Q8 activations.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-pub unsafe fn q4k_dot_q8_avx2(block: &[u8], a_q8: &[i8], a_scale: f32, a_group_sums: &[f32]) -> f32 {
+pub unsafe fn q4k_dot_q8_avx2(
+    block: &[u8],
+    a_q8: &[i8],
+    a_scale: f32,
+    a_group_sums: &[f32],
+) -> f32 {
     use std::arch::x86_64::*;
 
     let d = q4k_block_d(block);
@@ -3480,7 +3676,9 @@ impl PreQuantizedActivations {
             for blk in 0..n32 {
                 let base = blk * 32;
                 let mut amax = 0.0f32;
-                for i in 0..32 { amax = amax.max(a[base + i].abs()); }
+                for i in 0..32 {
+                    amax = amax.max(a[base + i].abs());
+                }
                 let d = amax / 127.0;
                 scales_32[blk] = d;
                 if d > 0.0 {
@@ -3537,21 +3735,37 @@ impl PreQuantizedActivations {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             let (i2s_scale, i2s_sum, i2s_q8) = unsafe { quantize_row_i8_s_avx2(a) };
             return Self {
-                q8: Vec::new(), q16: Vec::new(), scales: Vec::new(),
-                scales_i16: Vec::new(), group_sums_q4k: Vec::new(),
+                q8: Vec::new(),
+                q16: Vec::new(),
+                scales: Vec::new(),
+                scales_i16: Vec::new(),
+                group_sums_q4k: Vec::new(),
                 group_sums_q6k: Vec::new(),
-                i2s_q8, i2s_scale, i2s_sum,
-                q8_32: Vec::new(), scales_32: Vec::new(), asum_32: Vec::new(), k,
+                i2s_q8,
+                i2s_scale,
+                i2s_sum,
+                q8_32: Vec::new(),
+                scales_32: Vec::new(),
+                asum_32: Vec::new(),
+                k,
             };
         }
         let mut i2s_q8 = vec![0i8; k];
         let (i2s_scale, i2s_sum) = quantize_row_i8_s(a, &mut i2s_q8);
         Self {
-            q8: Vec::new(), q16: Vec::new(), scales: Vec::new(),
-            scales_i16: Vec::new(), group_sums_q4k: Vec::new(),
+            q8: Vec::new(),
+            q16: Vec::new(),
+            scales: Vec::new(),
+            scales_i16: Vec::new(),
+            group_sums_q4k: Vec::new(),
             group_sums_q6k: Vec::new(),
-            i2s_q8, i2s_scale, i2s_sum,
-            q8_32: Vec::new(), scales_32: Vec::new(), asum_32: Vec::new(), k,
+            i2s_q8,
+            i2s_scale,
+            i2s_sum,
+            q8_32: Vec::new(),
+            scales_32: Vec::new(),
+            asum_32: Vec::new(),
+            k,
         }
     }
 
@@ -3762,7 +3976,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 got: output.len(),
             });
         }
-        if k % Q4K_BLOCK_SIZE != 0 {
+        if !k.is_multiple_of(Q4K_BLOCK_SIZE) {
             return Err(crate::KernelError::InvalidConfig(format!(
                 "k={k} must be divisible by Q4K block size {Q4K_BLOCK_SIZE}"
             )));
@@ -3839,19 +4053,22 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         } else if std::env::var("TEMPURA_DETERMINISTIC").is_ok() {
             // Deterministic batched: per-element q4k_dot_block, matches GPU accumulation order
             let blocks_per_row = k / Q4K_BLOCK_SIZE;
-            output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
-                let a_row = &a[i * k..(i + 1) * k];
-                for j in 0..n {
-                    let mut sum = 0.0f32;
-                    for blk in 0..blocks_per_row {
-                        let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                        let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                        let a_slice = &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                        sum += q4k_dot_block(block, a_slice);
+            output[..m * n]
+                .par_chunks_mut(n)
+                .enumerate()
+                .for_each(|(i, row_out)| {
+                    let a_row = &a[i * k..(i + 1) * k];
+                    for j in 0..n {
+                        let mut sum = 0.0f32;
+                        for blk in 0..blocks_per_row {
+                            let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                            let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                            let a_slice = &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                            sum += q4k_dot_block(block, a_slice);
+                        }
+                        row_out[j] = sum;
                     }
-                    row_out[j] = sum;
-                }
-            });
+                });
         } else {
             // Fast batched path: dequant full row, use gemm for SIMD matmul
             let mut b_f32 = vec![0.0f32; n * k];
@@ -3907,7 +4124,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 got: output.len(),
             });
         }
-        if k % Q6K_BLOCK_SIZE != 0 {
+        if !k.is_multiple_of(Q6K_BLOCK_SIZE) {
             return Err(crate::KernelError::InvalidConfig(format!(
                 "k={k} not divisible by {Q6K_BLOCK_SIZE}"
             )));
@@ -4007,7 +4224,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 got: output.len(),
             });
         }
-        if k % TQ2_BLOCK_SIZE != 0 {
+        if !k.is_multiple_of(TQ2_BLOCK_SIZE) {
             return Err(crate::KernelError::InvalidConfig(format!(
                 "k={k} not divisible by {TQ2_BLOCK_SIZE}"
             )));
@@ -4056,10 +4273,16 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         k: usize,
     ) -> Result<()> {
         if a.len() != m * k {
-            return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
         }
         if output.len() != m * n {
-            return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
         }
 
         let packed_bytes = n * k / 4;
@@ -4153,11 +4376,14 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 && is_x86_feature_detected!("avx512bw")
                 && is_x86_feature_detected!("avx512vnni");
 
-            let chunk_size = (n + 7) / 8;
+            let chunk_size = n.div_ceil(8);
             crate::thread_pool::global_pool().parallel_chunks(n, chunk_size, &|start, end| {
                 for j in start..end {
                     let w = unsafe {
-                        std::slice::from_raw_parts((b_addr + j * row_packed_bytes) as *const u8, row_packed_bytes)
+                        std::slice::from_raw_parts(
+                            (b_addr + j * row_packed_bytes) as *const u8,
+                            row_packed_bytes,
+                        )
                     };
                     let aq = unsafe { std::slice::from_raw_parts(a_addr as *const i8, k) };
                     let raw = if has_avx_vnni {
@@ -4167,7 +4393,10 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                     } else {
                         unsafe { vec_dot_i2_i8_s_avx2(w, aq, k) }
                     };
-                    unsafe { *(out_addr as *mut f32).add(j) = (raw - preq_sum) as f32 / preq_scale * w_scale; }
+                    unsafe {
+                        *(out_addr as *mut f32).add(j) =
+                            (raw - preq_sum) as f32 / preq_scale * w_scale;
+                    }
                 }
             });
             return Ok(());
@@ -4187,10 +4416,16 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         k: usize,
     ) -> Result<()> {
         if a.len() != m * k {
-            return Err(crate::KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
         }
         if output.len() != m * n {
-            return Err(crate::KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
         }
 
         let packed_bytes = n * k / 4;
@@ -4239,22 +4474,28 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                                 for b in 0..32 {
                                     let byte_pos = g * 32 + b;
                                     let w = _mm256_loadu_si256(
-                                        b_transposed.as_ptr().add(byte_pos * n + j_start) as *const __m256i
+                                        b_transposed.as_ptr().add(byte_pos * n + j_start)
+                                            as *const __m256i,
                                     );
-                                    let upper = _mm256_and_si256(_mm256_srli_epi16(w, 4), nibble_mask);
+                                    let upper =
+                                        _mm256_and_si256(_mm256_srli_epi16(w, 4), nibble_mask);
                                     let lower = _mm256_and_si256(w, nibble_mask);
 
                                     // 4 LUT loads: lo/hi bytes for upper and lower nibble pairs
                                     let u_off = lut_base + b * 32;
-                                    let tbl_u_lo = _mm256_broadcastsi128_si256(
-                                        _mm_loadu_si128(split_luts.as_ptr().add(u_off) as *const __m128i));
-                                    let tbl_u_hi = _mm256_broadcastsi128_si256(
-                                        _mm_loadu_si128(split_luts.as_ptr().add(u_off + 16) as *const __m128i));
+                                    let tbl_u_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                                        split_luts.as_ptr().add(u_off) as *const __m128i,
+                                    ));
+                                    let tbl_u_hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                                        split_luts.as_ptr().add(u_off + 16) as *const __m128i,
+                                    ));
                                     let l_off = lut_base + (32 + b) * 32;
-                                    let tbl_l_lo = _mm256_broadcastsi128_si256(
-                                        _mm_loadu_si128(split_luts.as_ptr().add(l_off) as *const __m128i));
-                                    let tbl_l_hi = _mm256_broadcastsi128_si256(
-                                        _mm_loadu_si128(split_luts.as_ptr().add(l_off + 16) as *const __m128i));
+                                    let tbl_l_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                                        split_luts.as_ptr().add(l_off) as *const __m128i,
+                                    ));
+                                    let tbl_l_hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                                        split_luts.as_ptr().add(l_off + 16) as *const __m128i,
+                                    ));
 
                                     // 4 shuffles: lo/hi byte lookups
                                     let u_lo_r = _mm256_shuffle_epi8(tbl_u_lo, upper);
@@ -4271,19 +4512,33 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                                     let l_i16_c1 = _mm256_unpackhi_epi8(l_lo_r, l_hi_r);
 
                                     // Accumulate in i16 (32 byte positions × max ±254 per position → max ±8128, fits i16)
-                                    vec_c0 = _mm256_add_epi16(vec_c0, _mm256_add_epi16(u_i16_c0, l_i16_c0));
-                                    vec_c1 = _mm256_add_epi16(vec_c1, _mm256_add_epi16(u_i16_c1, l_i16_c1));
+                                    vec_c0 = _mm256_add_epi16(
+                                        vec_c0,
+                                        _mm256_add_epi16(u_i16_c0, l_i16_c0),
+                                    );
+                                    vec_c1 = _mm256_add_epi16(
+                                        vec_c1,
+                                        _mm256_add_epi16(u_i16_c1, l_i16_c1),
+                                    );
                                 }
 
                                 // Widen i16 → i32 once per group
-                                acc0 = _mm256_add_epi32(acc0,
-                                    _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c0)));
-                                acc1 = _mm256_add_epi32(acc1,
-                                    _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)));
-                                acc2 = _mm256_add_epi32(acc2,
-                                    _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c1)));
-                                acc3 = _mm256_add_epi32(acc3,
-                                    _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)));
+                                acc0 = _mm256_add_epi32(
+                                    acc0,
+                                    _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c0)),
+                                );
+                                acc1 = _mm256_add_epi32(
+                                    acc1,
+                                    _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)),
+                                );
+                                acc2 = _mm256_add_epi32(
+                                    acc2,
+                                    _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c1)),
+                                );
+                                acc3 = _mm256_add_epi32(
+                                    acc3,
+                                    _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)),
+                                );
                             }
 
                             // acc0=[0-7], acc2=[8-15], acc1=[16-23], acc3=[24-31]
@@ -4317,9 +4572,9 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                             let u_off = lut_base + b * 32;
                             let l_off = lut_base + (32 + b) * 32;
                             let u_val = split_luts[u_off + u_idx] as i8 as i16
-                                      | (split_luts[u_off + 16 + u_idx] as i8 as i16) << 8;
+                                | (split_luts[u_off + 16 + u_idx] as i8 as i16) << 8;
                             let l_val = split_luts[l_off + l_idx] as i8 as i16
-                                      | (split_luts[l_off + 16 + l_idx] as i8 as i16) << 8;
+                                | (split_luts[l_off + 16 + l_idx] as i8 as i16) << 8;
                             acc += u_val as i32 + l_val as i32;
                         }
                     }
@@ -4342,9 +4597,9 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                         let u_off = lut_base + b * 32;
                         let l_off = lut_base + (32 + b) * 32;
                         let u_val = split_luts[u_off + u_idx] as i8 as i16
-                                  | (split_luts[u_off + 16 + u_idx] as i8 as i16) << 8;
+                            | (split_luts[u_off + 16 + u_idx] as i8 as i16) << 8;
                         let l_val = split_luts[l_off + l_idx] as i8 as i16
-                                  | (split_luts[l_off + 16 + l_idx] as i8 as i16) << 8;
+                            | (split_luts[l_off + 16 + l_idx] as i8 as i16) << 8;
                         acc += u_val as i32 + l_val as i32;
                     }
                 }
@@ -4487,7 +4742,7 @@ pub struct ActivationQ8 {
 
 impl ActivationQ8 {
     pub fn from_f32(a: &[f32]) -> Self {
-        let num_blocks = (a.len() + 31) / 32;
+        let num_blocks = a.len().div_ceil(32);
         let mut data = Vec::with_capacity(num_blocks * 10);
 
         for blk in 0..num_blocks {
@@ -4505,8 +4760,7 @@ impl ActivationQ8 {
             let mut sum = 0.0f32;
             let mut qs = [0i8; 32];
             for i in 0..(end - start) {
-                let v = (a[start + i] * id).round();
-                let v = v.max(-128.0).min(127.0) as i8;
+                let v = (a[start + i] * id).round().clamp(-128.0, 127.0) as i8;
                 qs[i] = v;
                 sum += v as f32;
             }
@@ -5679,9 +5933,7 @@ mod kani_proofs {
 
         let max: f64 = 0.00001f64.max((val as f64).abs());
         let s: f32 = (127.0f64 / max) as f32;
-        let mut q: i32 = nearest_int(val * s);
-        if q > 127 { q = 127; }
-        if q < -128 { q = -128; }
+        let q: i32 = nearest_int(val * s).clamp(-128, 127);
         assert!(q >= -128 && q <= 127);
     }
 
@@ -5905,7 +6157,7 @@ mod tests {
         }
         // sc[4..8] and m[4..8] need high bits set in bytes 8..11
         for i in 0..4 {
-            block[4 + 8 + i] = (1 >> 2) & 0x0F; // sc[i+4] low part = 0, needs packed[i]>>6 too
+            block[4 + 8 + i] = 0; // sc[i+4] = 0 (can't encode 1 via the high-bits path)
         }
         // For scale=1: sc[i+4] = ((packed[i]>>6) | ((packed[i+8] & 0x0F) << 2)) & 0x3F
         // We need ((packed[i]>>6) | ((packed[i+8] & 0x0F) << 2)) & 0x3F == 1
@@ -6356,10 +6608,7 @@ mod tests {
         let dot = tq2_dot_block(&block, &a);
         // Expected: 1*2 + (-1)*3 + 0*5 + 1*7 = 2 - 3 + 0 + 7 = 6
         // Scale d = max(|values|) = 1.0, so d≈1.0 (fp16 roundtrip)
-        assert!(
-            (dot - 6.0).abs() < 0.1,
-            "tq2 dot expected ~6.0, got {dot}"
-        );
+        assert!((dot - 6.0).abs() < 0.1, "tq2 dot expected ~6.0, got {dot}");
     }
 
     #[test]
@@ -6450,7 +6699,7 @@ mod tests {
         // 128-element group: construct packed weights for a known pattern
         let k = 128;
         let mut packed = vec![0u8; k / 4]; // 32 bytes
-        // Byte 0: bits [7:6]=2(+1), [5:4]=1(0), [3:2]=0(-1), [1:0]=2(+1)
+                                           // Byte 0: bits [7:6]=2(+1), [5:4]=1(0), [3:2]=0(-1), [1:0]=2(+1)
         packed[0] = 0b10_01_00_10;
 
         let mut a_q = vec![0i8; k];
@@ -6493,10 +6742,13 @@ mod tests {
         // For a cleaner test: use all w=1 (ternary 0) except the identity positions.
         // w=1 → byte pattern where each 2-bit field is 01.
         // 0b01_01_01_01 = 0x55
-        b_quantized.iter_mut().take(total_packed).for_each(|b| *b = 0x55);
+        b_quantized
+            .iter_mut()
+            .take(total_packed)
+            .for_each(|b| *b = 0x55);
         // Now override: element 0 in row 0 = +1 (w=2 at byte 0 bits [7:6])
         b_quantized[0] = 0b10_01_01_01; // elem 0=+1, rest=0
-        // Element 1 in row 1 = +1 (byte 1, bits [7:6])
+                                        // Element 1 in row 1 = +1 (byte 1, bits [7:6])
         b_quantized[row_packed + 1] = 0b10_01_01_01;
 
         let mut a = vec![0.0f32; k];
@@ -6604,30 +6856,36 @@ mod tests {
         // maddubs path
         let mut out_mad = vec![0.0f32; n];
         let mad = CpuMatMulQ4K;
-        mad.forward_b_transposed_i2s(&a, &b, &mut out_mad, 1, n, k).unwrap();
+        mad.forward_b_transposed_i2s(&a, &b, &mut out_mad, 1, n, k)
+            .unwrap();
 
         // LUT path with transposed weights (scalar CpuMatMulQ4K)
         let mut out_lut_scalar = vec![0.0f32; n];
-        mad.forward_i2s_lut(&a, &b_transposed, &mut out_lut_scalar, 1, n, k).unwrap();
+        mad.forward_i2s_lut(&a, &b_transposed, &mut out_lut_scalar, 1, n, k)
+            .unwrap();
 
         // LUT path with transposed weights (optimized CpuMatMulQ4KOpt)
         let mut out_lut_opt = vec![0.0f32; n];
         let opt = CpuMatMulQ4KOpt;
-        opt.forward_i2s_lut(&a, &b_transposed, &mut out_lut_opt, 1, n, k).unwrap();
+        opt.forward_i2s_lut(&a, &b_transposed, &mut out_lut_opt, 1, n, k)
+            .unwrap();
 
         for j in 0..n {
             // Scalar LUT uses i16 (full precision), should match maddubs closely
             assert!(
                 (out_mad[j] - out_lut_scalar[j]).abs() < 0.01,
                 "scalar LUT mismatch at j={j}: mad={}, lut={}",
-                out_mad[j], out_lut_scalar[j]
+                out_mad[j],
+                out_lut_scalar[j]
             );
             // Opt LUT uses i8 (63-scale, ~2% quantization difference expected)
             let tol = out_mad[j].abs() * 0.05 + 0.05;
             assert!(
                 (out_mad[j] - out_lut_opt[j]).abs() < tol,
                 "opt LUT mismatch at j={j}: mad={}, lut_opt={}, tol={}",
-                out_mad[j], out_lut_opt[j], tol
+                out_mad[j],
+                out_lut_opt[j],
+                tol
             );
         }
     }
@@ -6658,14 +6916,18 @@ mod tests {
         // maddubs path
         let mut out_mad = vec![0.0f32; n];
         let mad = CpuMatMulQ4K;
-        mad.forward_b_transposed_i2s(&a, &b, &mut out_mad, 1, n, k).unwrap();
+        mad.forward_b_transposed_i2s(&a, &b, &mut out_mad, 1, n, k)
+            .unwrap();
 
         // LUT path
         let mut a_q = vec![0i8; k];
         let (act_scale, _act_sum) = quantize_row_i8_s(&a, &mut a_q);
         let pair_luts = i2s_build_all_pair_luts(&a_q, k);
         let w_scale = f32::from_ne_bytes([
-            b[total_packed], b[total_packed + 1], b[total_packed + 2], b[total_packed + 3],
+            b[total_packed],
+            b[total_packed + 1],
+            b[total_packed + 2],
+            b[total_packed + 3],
         ]);
 
         let mut out_lut = vec![0.0f32; n];
@@ -6679,7 +6941,8 @@ mod tests {
             assert!(
                 (out_mad[j] - out_lut[j]).abs() < 0.01,
                 "LUT mismatch at j={j}: maddubs={}, lut={}",
-                out_mad[j], out_lut[j]
+                out_mad[j],
+                out_lut[j]
             );
         }
     }
@@ -6696,7 +6959,9 @@ mod tests {
                 *b = (rng >> 32) as u8;
             }
             i2s[packed_bytes..packed_bytes + 4].copy_from_slice(&1.0f32.to_ne_bytes());
-            let act: Vec<f32> = (0..k).map(|i| (i as f32 - k as f32 / 2.0) * 0.001).collect();
+            let act: Vec<f32> = (0..k)
+                .map(|i| (i as f32 - k as f32 / 2.0) * 0.001)
+                .collect();
             let mut output = vec![0.0f32; n];
 
             let mut q8 = vec![0i8; k];
@@ -6751,7 +7016,8 @@ mod kani_q2x4_repack {
         let grp = row / 4;
         let j = row % 4;
         let sub = q2_byte / 8;
-        let dst_off = (grp * blocks_per_row + blk) * Q2X4_BLOCK_BYTES + 8 + sub * 32 + j * 8 + q2_byte % 8;
+        let dst_off =
+            (grp * blocks_per_row + blk) * Q2X4_BLOCK_BYTES + 8 + sub * 32 + j * 8 + q2_byte % 8;
         assert!(dst_off < ((n + 3) / 4) * blocks_per_row * Q2X4_BLOCK_BYTES);
     }
 }
@@ -6771,11 +7037,10 @@ mod test_q2_roundtrip {
         for row in 0..n {
             for blk in 0..blocks_per_row {
                 let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
-                q2_data[off] = 0x00; q2_data[off + 1] = 0x3C; // f16 scale = 1.0
+                q2_data[off] = 0x00;
+                q2_data[off + 1] = 0x3C; // f16 scale = 1.0
                 for b in 0..32 {
-                    q2_data[off + 2 + b] = ((row * 3 + blk * 7 + b) % 256) as u8 & 0xFF;
-                    // mask to valid 2-bit values only
-                    q2_data[off + 2 + b] = q2_data[off + 2 + b];
+                    q2_data[off + 2 + b] = (((row * 3 + blk * 7 + b) % 256) as u8) & 0x03;
                 }
             }
         }
@@ -6791,15 +7056,26 @@ mod test_q2_roundtrip {
                 let x4_off = (grp * blocks_per_row + blk) * Q2X4_BLOCK_BYTES;
 
                 // Check scale preserved
-                assert_eq!(q2_data[q2_off], x4[x4_off + j * 2], "scale lo mismatch row={row} blk={blk}");
-                assert_eq!(q2_data[q2_off + 1], x4[x4_off + j * 2 + 1], "scale hi mismatch");
+                assert_eq!(
+                    q2_data[q2_off],
+                    x4[x4_off + j * 2],
+                    "scale lo mismatch row={row} blk={blk}"
+                );
+                assert_eq!(
+                    q2_data[q2_off + 1],
+                    x4[x4_off + j * 2 + 1],
+                    "scale hi mismatch"
+                );
 
                 // Check packed data preserved (interleaved at 8-byte chunks)
                 for sub in 0..4 {
                     for b in 0..8 {
                         let src = q2_data[q2_off + 2 + sub * 8 + b];
                         let dst = x4[x4_off + 8 + sub * 32 + j * 8 + b];
-                        assert_eq!(src, dst, "data mismatch row={row} blk={blk} sub={sub} b={b}");
+                        assert_eq!(
+                            src, dst,
+                            "data mismatch row={row} blk={blk} sub={sub} b={b}"
+                        );
                     }
                 }
             }
@@ -6818,7 +7094,7 @@ mod test_q2_roundtrip {
             for blk in 0..blocks_per_row {
                 let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
                 let scale_bits: u16 = 0x3000 + (row as u16 * 7 + blk as u16) % 256;
-                q2_data[off..off+2].copy_from_slice(&scale_bits.to_le_bytes());
+                q2_data[off..off + 2].copy_from_slice(&scale_bits.to_le_bytes());
                 for b in 0..32 {
                     q2_data[off + 2 + b] = ((row * 13 + blk * 37 + b * 3) & 0xFF) as u8;
                 }
@@ -6836,12 +7112,20 @@ mod test_q2_roundtrip {
 
         for j in 0..n {
             let diff = (out_raw[j] - out_preq[j]).abs();
-            let rel = if out_raw[j].abs() > 1e-6 { diff / out_raw[j].abs() } else { diff };
-            assert!(rel < 0.10, "row {j}: raw={} preq={} rel={rel:.4}", out_raw[j], out_preq[j]);
+            let rel = if out_raw[j].abs() > 1e-6 {
+                diff / out_raw[j].abs()
+            } else {
+                diff
+            };
+            assert!(
+                rel < 0.10,
+                "row {j}: raw={} preq={} rel={rel:.4}",
+                out_raw[j],
+                out_preq[j]
+            );
         }
     }
 }
-
 
 // ── Q2_0 base-4 LUT GEMV ─────────────────────────────────────────────────────
 //
@@ -6850,14 +7134,18 @@ mod test_q2_roundtrip {
 // Lookup via pshufb: one instruction handles 16-entry table for 32 rows.
 
 pub struct Q2Lut {
-    pub entries: Vec<i8>,   // k/2 * 16 i8 entries
-    pub act_scale: f32,     // quantization scale for i8 LUT values
+    pub entries: Vec<i8>, // k/2 * 16 i8 entries
+    pub act_scale: f32,   // quantization scale for i8 LUT values
     pub k: usize,
 }
 
 impl Q2Lut {
     pub fn new_for_k(k: usize) -> Self {
-        Self { entries: vec![0i8; (k / 2) * 16], act_scale: 1.0, k }
+        Self {
+            entries: vec![0i8; (k / 2) * 16],
+            act_scale: 1.0,
+            k,
+        }
     }
 
     pub fn preprocess(a: &[f32], k: usize) -> Self {
@@ -6871,22 +7159,25 @@ impl Q2Lut {
         let n_pairs = k / 2;
         let mut max_val = 0.0f32;
         for j in 0..n_pairs {
-            let a0 = a[2*j].abs();
-            let a1 = a[2*j+1].abs();
+            let a0 = a[2 * j].abs();
+            let a1 = a[2 * j + 1].abs();
             let m = 2.0 * a0 + 2.0 * a1;
-            if m > max_val { max_val = m; }
+            if m > max_val {
+                max_val = m;
+            }
         }
         self.act_scale = if max_val > 0.0 { max_val / 127.0 } else { 1.0 };
         let inv_scale = if max_val > 0.0 { 127.0 / max_val } else { 0.0 };
 
         for j in 0..n_pairs {
-            let a0 = a[2*j];
-            let a1 = a[2*j+1];
+            let a0 = a[2 * j];
+            let a1 = a[2 * j + 1];
             for idx in 0..16u8 {
                 let w0 = (idx & 3) as i32 - 1;
                 let w1 = (idx >> 2) as i32 - 1;
                 let val = w0 as f32 * a0 + w1 as f32 * a1;
-                self.entries[j * 16 + idx as usize] = (val * inv_scale).round().clamp(-128.0, 127.0) as i8;
+                self.entries[j * 16 + idx as usize] =
+                    (val * inv_scale).round().clamp(-128.0, 127.0) as i8;
             }
         }
     }
@@ -6895,9 +7186,10 @@ impl Q2Lut {
 pub fn q2_lut_gemv(
     packed: &[u8],
     lut: &Q2Lut,
-    w_scales: &[f32],  // per-block Q2_0 f16 scales (blocks_per_row per row)
+    _w_scales: &[f32], // per-block Q2_0 f16 scales (blocks_per_row per row)
     output: &mut [f32],
-    n: usize, k: usize,
+    n: usize,
+    k: usize,
 ) {
     let row_bytes = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
     let blocks_per_row = k / Q2_0_BLOCK_SIZE;
@@ -6943,8 +7235,10 @@ mod test_q2_dot_avx2 {
         for i in 0..nb {
             let off = i * Q2_0_BLOCK_BYTES;
             let scale = 0.008 * (1.0 + 0.05 * ((i * 7) % 20) as f32 / 10.0);
-            w[off..off+2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
-            for b in 0..32 { w[off + 2 + b] = ((i * 37 + b * 97) & 0xFF) as u8; }
+            w[off..off + 2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+            for b in 0..32 {
+                w[off + 2 + b] = ((i * 37 + b * 97) & 0xFF) as u8;
+            }
         }
         let a: Vec<f32> = (0..k).map(|i| ((i * 7 + 3) as f32 * 0.01).sin()).collect();
         let q8_nb = k / Q8_0_BLOCK_SIZE;
@@ -6956,7 +7250,10 @@ mod test_q2_dot_avx2 {
 
         let diff = (scalar - dispatched).abs();
         eprintln!("scalar={scalar:.6} dispatched={dispatched:.6} diff={diff:.8}");
-        assert!(diff < 1e-3, "MISMATCH: scalar={scalar} dispatched={dispatched} diff={diff}");
+        assert!(
+            diff < 1e-3,
+            "MISMATCH: scalar={scalar} dispatched={dispatched} diff={diff}"
+        );
     }
 
     #[test]
@@ -6970,8 +7267,10 @@ mod test_q2_dot_avx2 {
             for i in 0..nb {
                 let off = j * row_bytes + i * Q2_0_BLOCK_BYTES;
                 let scale = 0.008 * (1.0 + 0.05 * (((j * 7 + i * 13) % 20) as f32 / 10.0));
-                w[off..off+2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
-                for b in 0..32 { w[off + 2 + b] = ((j * 37 + i * 53 + b * 97) & 0xFF) as u8; }
+                w[off..off + 2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+                for b in 0..32 {
+                    w[off + 2 + b] = ((j * 37 + i * 53 + b * 97) & 0xFF) as u8;
+                }
             }
         }
         let a: Vec<f32> = (0..k).map(|i| ((i * 7 + 3) as f32 * 0.01).sin()).collect();
@@ -6981,7 +7280,7 @@ mod test_q2_dot_avx2 {
 
         let mut out_scalar = vec![0.0f32; n];
         for j in 0..n {
-            out_scalar[j] = q2_0_dot_q8_preq_scalar(&w[j*row_bytes..(j+1)*row_bytes], &q8, k);
+            out_scalar[j] = q2_0_dot_q8_preq_scalar(&w[j * row_bytes..(j + 1) * row_bytes], &q8, k);
         }
         let mut out_gemv = vec![0.0f32; n];
         q2_0_gemv_q8(&w, &q8, &mut out_gemv, n, k);
@@ -6989,7 +7288,9 @@ mod test_q2_dot_avx2 {
         let mut max_diff = 0.0f32;
         for j in 0..n {
             let d = (out_scalar[j] - out_gemv[j]).abs();
-            if d > max_diff { max_diff = d; }
+            if d > max_diff {
+                max_diff = d;
+            }
         }
         eprintln!("max_diff={max_diff:.8}");
         assert!(max_diff < 1e-3, "GEMV mismatch: max_diff={max_diff}");
@@ -7012,8 +7313,10 @@ mod test_q2_lut {
             for blk in 0..blocks_per_row {
                 let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
                 let scale = 0.008 * (1.0 + 0.06 * ((row * 7 + blk * 13) % 20) as f32 / 10.0 - 0.06);
-                q2_data[off..off+2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
-                for b in 0..32 { q2_data[off + 2 + b] = ((row * 37 + blk * 53 + b * 97) & 0xFF) as u8; }
+                q2_data[off..off + 2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+                for b in 0..32 {
+                    q2_data[off + 2 + b] = ((row * 37 + blk * 53 + b * 97) & 0xFF) as u8;
+                }
             }
         }
 
@@ -7042,8 +7345,6 @@ mod test_q2_lut {
     }
 }
 
-
-
 pub fn q2_lut_repack(packed: &[u8], n: usize, k: usize) -> Vec<u8> {
     q2_lut_repack_bm(packed, n, k, q2_lut_tile_size())
 }
@@ -7060,7 +7361,7 @@ fn q2_lut_repack_bm(packed: &[u8], n: usize, k: usize, bm: usize) -> Vec<u8> {
     let bytes_per_row = (k / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES;
     let data_bytes_per_row = k / 4;
     let blocks_per_row = k / Q2_0_BLOCK_SIZE;
-    let n_tiles = (n + bm - 1) / bm;
+    let n_tiles = n.div_ceil(bm);
     let tile_data_size = data_bytes_per_row * bm;
     let scale_size = n * blocks_per_row * 2;
     let mut out = vec![0u8; n_tiles * tile_data_size + scale_size];
@@ -7097,15 +7398,17 @@ pub unsafe fn q2_lut_gemv_tiled_avx2(
     tiled: &[u8],
     lut: &Q2Lut,
     output: &mut [f32],
-    n: usize, k: usize,
-    tile_start: usize, tile_end: usize,
+    n: usize,
+    k: usize,
+    tile_start: usize,
+    tile_end: usize,
 ) {
     use std::arch::x86_64::*;
     const BM: usize = 32;
     let blocks_per_row = k / Q2_0_BLOCK_SIZE;
     let data_bytes_per_row = k / 4;
     let tile_data_size = data_bytes_per_row * BM;
-    let n_tiles = (n + BM - 1) / BM;
+    let n_tiles = n.div_ceil(BM);
     let scale_off = n_tiles * tile_data_size;
     let mask_lo = _mm256_set1_epi8(0x0F);
     let act_scale = lut.act_scale;
@@ -7126,17 +7429,21 @@ pub unsafe fn q2_lut_gemv_tiled_avx2(
 
             for b in 0..bytes_in_blk {
                 let byte_pos = byte_start + b;
-                let w = _mm256_loadu_si256(tiled.as_ptr().add(tile_off + byte_pos * BM) as *const __m256i);
+                let w = _mm256_loadu_si256(
+                    tiled.as_ptr().add(tile_off + byte_pos * BM) as *const __m256i
+                );
                 let lo = _mm256_and_si256(w, mask_lo);
                 let hi = _mm256_and_si256(_mm256_srli_epi16(w, 4), mask_lo);
 
                 let p0 = pair_base + b * 2;
-                let lut0 = _mm256_broadcastsi128_si256(
-                    _mm_loadu_si128(lut.entries.as_ptr().add(p0 * 16) as *const __m128i));
+                let lut0 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    lut.entries.as_ptr().add(p0 * 16) as *const __m128i,
+                ));
                 let r0 = _mm256_shuffle_epi8(lut0, lo);
 
-                let lut1 = _mm256_broadcastsi128_si256(
-                    _mm_loadu_si128(lut.entries.as_ptr().add((p0 + 1) * 16) as *const __m128i));
+                let lut1 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    lut.entries.as_ptr().add((p0 + 1) * 16) as *const __m128i,
+                ));
                 let r1 = _mm256_shuffle_epi8(lut1, hi);
 
                 // Widen r0+r1 to i16 and accumulate separately for rows 0..15 and 16..31
@@ -7162,7 +7469,8 @@ pub unsafe fn q2_lut_gemv_tiled_avx2(
             for r in 0..tile_rows {
                 let row = tile * BM + r;
                 let s_off2 = scale_off + (row * blocks_per_row + blk) * 2;
-                d_vals[r] = f16_to_f32(u16::from_le_bytes([tiled[s_off2], tiled[s_off2 + 1]])) * act_scale;
+                d_vals[r] =
+                    f16_to_f32(u16::from_le_bytes([tiled[s_off2], tiled[s_off2 + 1]])) * act_scale;
             }
             let d0 = _mm256_loadu_ps(d_vals.as_ptr());
             let d1 = _mm256_loadu_ps(d_vals.as_ptr().add(8));
@@ -7196,7 +7504,7 @@ pub fn q2_lut_gemm_batched(
     k: usize,
 ) {
     let bm = q2_lut_tile_size();
-    let n_tiles = (n + bm - 1) / bm;
+    let n_tiles = n.div_ceil(bm);
     let padded_n = n_tiles * bm;
     let need_pad = padded_n > n;
 
@@ -7206,16 +7514,22 @@ pub fn q2_lut_gemm_batched(
 
     if need_pad {
         let mut pad_bufs: Vec<Vec<f32>> = (0..m).map(|_| vec![0.0f32; padded_n]).collect();
-        let pad_ptrs: Vec<usize> = pad_bufs.iter_mut().map(|b| b.as_mut_ptr() as usize).collect();
+        let pad_ptrs: Vec<usize> = pad_bufs
+            .iter_mut()
+            .map(|b| b.as_mut_ptr() as usize)
+            .collect();
         let pool = crate::thread_pool::global_pool();
         let tile_counter = std::sync::atomic::AtomicUsize::new(0);
-        pool.run_indexed(&|_ith, _nth| {
-            loop {
-                let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if t >= n_tiles { break; }
-                for row in 0..m {
-                    let out_slice = unsafe { std::slice::from_raw_parts_mut(pad_ptrs[row] as *mut f32, padded_n) };
-                    unsafe { q2_lut_gemv_tiled(tiled, &luts[row], out_slice, n, k, t, t + 1); }
+        pool.run_indexed(&|_ith, _nth| loop {
+            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if t >= n_tiles {
+                break;
+            }
+            for row in 0..m {
+                let out_slice =
+                    unsafe { std::slice::from_raw_parts_mut(pad_ptrs[row] as *mut f32, padded_n) };
+                unsafe {
+                    q2_lut_gemv_tiled(tiled, &luts[row], out_slice, n, k, t, t + 1);
                 }
             }
         });
@@ -7226,13 +7540,17 @@ pub fn q2_lut_gemm_batched(
         let out_ptr = output.as_mut_ptr() as usize;
         let pool = crate::thread_pool::global_pool();
         let tile_counter = std::sync::atomic::AtomicUsize::new(0);
-        pool.run_indexed(&|_ith, _nth| {
-            loop {
-                let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if t >= n_tiles { break; }
-                for row in 0..m {
-                    let row_out = unsafe { std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(row * n), n) };
-                    unsafe { q2_lut_gemv_tiled(tiled, &luts[row], row_out, n, k, t, t + 1); }
+        pool.run_indexed(&|_ith, _nth| loop {
+            let t = tile_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if t >= n_tiles {
+                break;
+            }
+            for row in 0..m {
+                let row_out = unsafe {
+                    std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(row * n), n)
+                };
+                unsafe {
+                    q2_lut_gemv_tiled(tiled, &luts[row], row_out, n, k, t, t + 1);
                 }
             }
         });
@@ -7243,10 +7561,15 @@ pub unsafe fn q2_lut_gemv_tiled(
     tiled: &[u8],
     lut: &Q2Lut,
     output: &mut [f32],
-    n: usize, k: usize,
-    tile_start: usize, tile_end: usize,
+    n: usize,
+    k: usize,
+    tile_start: usize,
+    tile_end: usize,
 ) {
-    if q2_lut_tile_size() == 64 && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+    if q2_lut_tile_size() == 64
+        && is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512bw")
+    {
         q2_lut_gemv_tiled_avx512(tiled, lut, output, n, k, tile_start, tile_end);
     } else {
         q2_lut_gemv_tiled_avx2(tiled, lut, output, n, k, tile_start, tile_end);
@@ -7259,15 +7582,17 @@ pub unsafe fn q2_lut_gemv_tiled_avx512(
     tiled: &[u8],
     lut: &Q2Lut,
     output: &mut [f32],
-    n: usize, k: usize,
-    tile_start: usize, tile_end: usize,
+    n: usize,
+    k: usize,
+    tile_start: usize,
+    tile_end: usize,
 ) {
     use std::arch::x86_64::*;
     const BM: usize = 64;
     let blocks_per_row = k / Q2_0_BLOCK_SIZE;
     let data_bytes_per_row = k / 4;
     let tile_data_size = data_bytes_per_row * BM;
-    let n_tiles = (n + BM - 1) / BM;
+    let n_tiles = n.div_ceil(BM);
     let scale_off = n_tiles * tile_data_size;
     let mask_lo = _mm512_set1_epi8(0x0F);
     let act_scale = lut.act_scale;
@@ -7286,17 +7611,21 @@ pub unsafe fn q2_lut_gemv_tiled_avx512(
 
             for b in 0..bytes_in_blk {
                 let byte_pos = byte_start + b;
-                let w = _mm512_loadu_si512(tiled.as_ptr().add(tile_off + byte_pos * BM) as *const __m512i);
+                let w = _mm512_loadu_si512(
+                    tiled.as_ptr().add(tile_off + byte_pos * BM) as *const __m512i
+                );
                 let lo = _mm512_and_si512(w, mask_lo);
                 let hi = _mm512_and_si512(_mm512_srli_epi16(w, 4), mask_lo);
 
                 let p0 = pair_base + b * 2;
-                let lut0 = _mm512_broadcast_i32x4(
-                    _mm_loadu_si128(lut.entries.as_ptr().add(p0 * 16) as *const __m128i));
+                let lut0 = _mm512_broadcast_i32x4(_mm_loadu_si128(
+                    lut.entries.as_ptr().add(p0 * 16) as *const __m128i,
+                ));
                 let r0 = _mm512_shuffle_epi8(lut0, lo);
 
-                let lut1 = _mm512_broadcast_i32x4(
-                    _mm_loadu_si128(lut.entries.as_ptr().add((p0 + 1) * 16) as *const __m128i));
+                let lut1 = _mm512_broadcast_i32x4(_mm_loadu_si128(
+                    lut.entries.as_ptr().add((p0 + 1) * 16) as *const __m128i,
+                ));
                 let r1 = _mm512_shuffle_epi8(lut1, hi);
 
                 let r0_lo = _mm512_cvtepi8_epi16(_mm512_castsi512_si256(r0));
@@ -7316,7 +7645,8 @@ pub unsafe fn q2_lut_gemv_tiled_avx512(
             for r in 0..tile_rows {
                 let row = tile * BM + r;
                 let s_off2 = scale_off + (row * blocks_per_row + blk) * 2;
-                d_vals[r] = f16_to_f32(u16::from_le_bytes([tiled[s_off2], tiled[s_off2 + 1]])) * act_scale;
+                d_vals[r] =
+                    f16_to_f32(u16::from_le_bytes([tiled[s_off2], tiled[s_off2 + 1]])) * act_scale;
             }
             let d0 = _mm512_loadu_ps(d_vals.as_ptr());
             let d1 = _mm512_loadu_ps(d_vals.as_ptr().add(16));
@@ -7336,17 +7666,12 @@ pub unsafe fn q2_lut_gemv_tiled_avx512(
     }
 }
 
-pub fn q2_lut_gemv_fast(
-    tiled: &[u8],
-    lut: &Q2Lut,
-    output: &mut [f32],
-    n: usize, k: usize,
-) {
+pub fn q2_lut_gemv_fast(tiled: &[u8], lut: &Q2Lut, output: &mut [f32], n: usize, k: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         let bm = q2_lut_tile_size();
         if bm == 64 && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
-            let total_tiles = (n + 63) / 64;
+            let total_tiles = n.div_ceil(64);
             let out_addr = output.as_mut_ptr() as usize;
             crate::thread_pool::global_pool().run_indexed(&|ith, nth| {
                 let tile_start = ith * total_tiles / nth;
@@ -7358,7 +7683,7 @@ pub fn q2_lut_gemv_fast(
         }
         if is_x86_feature_detected!("avx2") {
             const BM: usize = 32;
-            let total_tiles = (n + BM - 1) / BM;
+            let total_tiles = n.div_ceil(BM);
             let out_addr = output.as_mut_ptr() as usize;
             crate::thread_pool::global_pool().run_indexed(&|ith, nth| {
                 let tile_start = ith * total_tiles / nth;
@@ -7366,7 +7691,6 @@ pub fn q2_lut_gemv_fast(
                 let out = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, n) };
                 unsafe { q2_lut_gemv_tiled_avx2(tiled, lut, out, n, k, tile_start, tile_end) };
             });
-            return;
         }
     }
 }
@@ -7386,8 +7710,10 @@ mod test_q2_lut_tiled {
             for blk in 0..blocks_per_row {
                 let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
                 let scale = 0.008 * (1.0 + 0.06 * ((row * 7 + blk * 13) % 20) as f32 / 10.0 - 0.06);
-                q2_data[off..off+2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
-                for b in 0..32 { q2_data[off + 2 + b] = ((row * 37 + blk * 53 + b * 97) & 0xFF) as u8; }
+                q2_data[off..off + 2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+                for b in 0..32 {
+                    q2_data[off + 2 + b] = ((row * 37 + blk * 53 + b * 97) & 0xFF) as u8;
+                }
             }
         }
 
@@ -7404,7 +7730,9 @@ mod test_q2_lut_tiled {
         let mut max_diff = 0.0f32;
         for j in 0..n {
             let d = (out_scalar[j] - out_tiled[j]).abs();
-            if d > max_diff { max_diff = d; }
+            if d > max_diff {
+                max_diff = d;
+            }
         }
         eprintln!("scalar[0..4]: {:?}", &out_scalar[..4]);
         eprintln!("tiled[0..4]:  {:?}", &out_tiled[..4]);
@@ -7412,7 +7740,6 @@ mod test_q2_lut_tiled {
         assert!(max_diff < 1e-4, "tiled vs scalar mismatch: {max_diff}");
     }
 }
-
 
 #[cfg(test)]
 mod bench_q2_lut_avx2 {
@@ -7427,7 +7754,7 @@ mod bench_q2_lut_avx2 {
         for row in 0..n {
             for blk in 0..blocks_per_row {
                 let off = row * row_bytes + blk * Q2_0_BLOCK_BYTES;
-                q2_data[off..off+2].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+                q2_data[off..off + 2].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
             }
         }
         let a: Vec<f32> = (0..k).map(|i| (i as f32 * 0.001).sin()).collect();
@@ -7439,11 +7766,15 @@ mod bench_q2_lut_avx2 {
         q2_lut_gemv_fast(&tiled, &lut, &mut output, n, k);
         let iters = 5;
         let t0 = std::time::Instant::now();
-        for _ in 0..iters { q2_lut_gemv_fast(&tiled, &lut, &mut output, n, k); }
+        for _ in 0..iters {
+            q2_lut_gemv_fast(&tiled, &lut, &mut output, n, k);
+        }
         let dt_lut = t0.elapsed().as_millis() as f64 / iters as f64;
 
         let t0 = std::time::Instant::now();
-        for _ in 0..iters { q2_0_gemv_preq(&q2_data, &preq, &mut output, n, k); }
+        for _ in 0..iters {
+            q2_0_gemv_preq(&q2_data, &preq, &mut output, n, k);
+        }
         let dt_preq = t0.elapsed().as_millis() as f64 / iters as f64;
 
         eprintln!("pshufb LUT (AVX2): {dt_lut:.1}ms");
@@ -7689,4 +8020,3 @@ mod kani_q2_lut {
         assert!((n_tiles - 1) * bm < n);
     }
 }
-

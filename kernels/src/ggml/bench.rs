@@ -4,8 +4,8 @@
 mod bench_tests {
     use super::super::blocks::*;
     use super::super::helpers::f32_to_f16;
-    use super::super::quantize::quantize_row_q8_k;
     use super::super::mul_mat::{mul_mat_q, mul_mat_q_scalar};
+
     use super::super::GgmlType;
     use std::time::Instant;
 
@@ -31,7 +31,7 @@ mod bench_tests {
     }
 
     fn make_activations(m: usize, k: usize) -> Vec<f32> {
-        (0..m * k).map(|i| ((i as f32 * 0.01).sin() * 0.1)).collect()
+        (0..m * k).map(|i| (i as f32 * 0.01).sin() * 0.1).collect()
     }
 
     #[test]
@@ -70,12 +70,14 @@ mod bench_tests {
         eprintln!("  Speedup: {speedup:.2}x");
 
         // also benchmark CpuMatMulQ4KOpt for comparison
-        use crate::quantized::{CpuMatMulQ4KOpt, PreQuantizedActivations};
+        use crate::quantized::CpuMatMulQ4KOpt;
         use tempura_kernel_api::MatMulQ;
         let q4k_opt = CpuMatMulQ4KOpt;
         let start = Instant::now();
         for _ in 0..iters {
-            q4k_opt.forward_b_transposed_q4k(&activations, &weights, &mut out, m, n, k).unwrap();
+            q4k_opt
+                .forward_b_transposed_q4k(&activations, &weights, &mut out, m, n, k)
+                .unwrap();
         }
         let old_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
         let old_speedup = old_ms / avx2_ms;
@@ -84,26 +86,43 @@ mod bench_tests {
 
         // mul_mat_q_preq (amortized quantization)
         {
-            let preq = super::super::mul_mat::PreQuantizedQ8::from_f32(&activations, k, GgmlType::Q4K);
+            let preq =
+                super::super::mul_mat::PreQuantizedQ8::from_f32(&activations, k, GgmlType::Q4K);
             let start = Instant::now();
             for _ in 0..iters {
                 super::super::mul_mat::mul_mat_q_preq(GgmlType::Q4K, &weights, &preq, &mut out, n);
             }
             let preq_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-            eprintln!("  mul_mat_q_preq: {preq_ms:.2} ms ({:.2}x vs old)", old_ms / preq_ms);
+            eprintln!(
+                "  mul_mat_q_preq: {preq_ms:.2} ms ({:.2}x vs old)",
+                old_ms / preq_ms
+            );
         }
 
         // Per-block microbenchmark: ggml shuffle vs old hsum approach
         if is_x86_feature_detected!("avx2") {
             let one_blk = unsafe { &*(weights.as_ptr() as *const BlockQ4K) };
-            let mut q8k_blk = BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] };
-            super::super::quantize::quantize_row_q8_k(&activations[..256], std::slice::from_mut(&mut q8k_blk));
+            let mut q8k_blk = BlockQ8K {
+                d: 0.0,
+                qs: [0i8; 256],
+                bsums: [0i16; 16],
+            };
+            super::super::quantize::quantize_row_q8_k(
+                &activations[..256],
+                std::slice::from_mut(&mut q8k_blk),
+            );
 
             let micro_iters = 1_000_000;
             let start = Instant::now();
             let mut s = 0.0f32;
             for _ in 0..micro_iters {
-                s += unsafe { super::super::vec_dot_avx2::vec_dot_q4_k_q8_k_avx2(256, std::slice::from_ref(one_blk), std::slice::from_ref(&q8k_blk)) };
+                s += unsafe {
+                    super::super::vec_dot_avx2::vec_dot_q4_k_q8_k_avx2(
+                        256,
+                        std::slice::from_ref(one_blk),
+                        std::slice::from_ref(&q8k_blk),
+                    )
+                };
             }
             let ns = start.elapsed().as_nanos() as f64 / micro_iters as f64;
             eprintln!("  ggml AVX2 per-block: {ns:.1} ns (dummy={s:.3})");
@@ -113,12 +132,15 @@ mod bench_tests {
             let a_q8 = &q8k_blk.qs[..];
             let a_scale = q8k_blk.d;
             let mut a_gsums = [0.0f32; 8];
-            for g in 0..8 { a_gsums[g] = activations[g * 32..g * 32 + 32].iter().sum(); }
+            for g in 0..8 {
+                a_gsums[g] = activations[g * 32..g * 32 + 32].iter().sum();
+            }
             let start = Instant::now();
             let mut s2 = 0.0f32;
             for iter in 0..micro_iters {
                 let a_sc = a_scale + (iter as f32 * 1e-20);
-                s2 += unsafe { crate::quantized::q4k_dot_q8_avx2(block_bytes, a_q8, a_sc, &a_gsums) };
+                s2 +=
+                    unsafe { crate::quantized::q4k_dot_q8_avx2(block_bytes, a_q8, a_sc, &a_gsums) };
             }
             let ns2 = start.elapsed().as_nanos() as f64 / micro_iters as f64;
             eprintln!("  old AVX2 per-block: {ns2:.1} ns (dummy={s2:.3})");
@@ -127,20 +149,34 @@ mod bench_tests {
 
         // Pure VNNI (skip dispatch overhead)
         if is_x86_feature_detected!("avxvnni") {
-            let x = unsafe { std::slice::from_raw_parts(weights.as_ptr() as *const BlockQ4K, n * (k / 256)) };
-            let mut q8k_blocks = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }; k / 256];
+            let x = unsafe {
+                std::slice::from_raw_parts(weights.as_ptr() as *const BlockQ4K, n * (k / 256))
+            };
+            let mut q8k_blocks = vec![
+                BlockQ8K {
+                    d: 0.0,
+                    qs: [0i8; 256],
+                    bsums: [0i16; 16]
+                };
+                k / 256
+            ];
             super::super::quantize::quantize_row_q8_k(&activations, &mut q8k_blocks);
             let start = Instant::now();
             for _ in 0..iters {
                 let mut s = 0.0f32;
                 for row in 0..n {
                     let rx = &x[row * (k / 256)..(row + 1) * (k / 256)];
-                    s += unsafe { super::super::vec_dot_avx2::vec_dot_q4_k_q8_k_vnni(k, rx, &q8k_blocks) };
+                    s += unsafe {
+                        super::super::vec_dot_avx2::vec_dot_q4_k_q8_k_vnni(k, rx, &q8k_blocks)
+                    };
                 }
                 out[0] = s;
             }
             let vnni_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-            eprintln!("  Pure VNNI vec_dot: {vnni_ms:.2} ms ({:.2}x vs old)", old_ms / vnni_ms);
+            eprintln!(
+                "  Pure VNNI vec_dot: {vnni_ms:.2} ms ({:.2}x vs old)",
+                old_ms / vnni_ms
+            );
 
             // Pure AVX2 dequant approach
             let start = Instant::now();
@@ -148,12 +184,17 @@ mod bench_tests {
                 let mut s = 0.0f32;
                 for row in 0..n {
                     let rx = &x[row * (k / 256)..(row + 1) * (k / 256)];
-                    s += unsafe { super::super::vec_dot_avx2::vec_dot_q4_k_q8_k_avx2(k, rx, &q8k_blocks) };
+                    s += unsafe {
+                        super::super::vec_dot_avx2::vec_dot_q4_k_q8_k_avx2(k, rx, &q8k_blocks)
+                    };
                 }
                 out[0] = s;
             }
             let avx2_pure_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-            eprintln!("  Pure AVX2 vec_dot: {avx2_pure_ms:.2} ms ({:.2}x vs old)", old_ms / avx2_pure_ms);
+            eprintln!(
+                "  Pure AVX2 vec_dot: {avx2_pure_ms:.2} ms ({:.2}x vs old)",
+                old_ms / avx2_pure_ms
+            );
         }
     }
 

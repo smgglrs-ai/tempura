@@ -200,16 +200,13 @@ impl std::fmt::Display for ModelInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     #[ignore]
     fn inspect_tinyllama_dir() {
-        let path = PathBuf::from(
-            dirs::home_dir()
-                .unwrap()
-                .join(".local/share/navra/models/tinyllama-1.1b"),
-        );
+        let path = dirs::home_dir()
+            .unwrap()
+            .join(".local/share/navra/models/tinyllama-1.1b");
         if !path.exists() {
             eprintln!("Skipping: TinyLlama not found at {}", path.display());
             return;

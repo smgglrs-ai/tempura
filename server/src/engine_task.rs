@@ -50,9 +50,7 @@ impl ActiveSession {
                 let token = model.sample_from_logits(&logits, &self.params, &mut self.session);
                 self.generated.push(token);
                 let _ = self.response_tx.try_send(EngineEvent::Token(token));
-                if self.generated.len() >= self.max_new_tokens
-                    || self.eos_token == Some(token)
-                {
+                if self.generated.len() >= self.max_new_tokens || self.eos_token == Some(token) {
                     return true;
                 }
             }
@@ -89,11 +87,8 @@ impl EngineTask {
             loop {
                 match self.rx.try_recv() {
                     Ok(req) => {
-                        let session = InferenceSession::new(
-                            self.model.config(),
-                            TraceLevel::Off,
-                            req.seed,
-                        );
+                        let session =
+                            InferenceSession::new(self.model.config(), TraceLevel::Off, req.seed);
                         sessions.insert(
                             req.id.clone(),
                             ActiveSession {
@@ -122,11 +117,8 @@ impl EngineTask {
             if sessions.is_empty() {
                 match rt.block_on(self.rx.recv()) {
                     Some(req) => {
-                        let session = InferenceSession::new(
-                            self.model.config(),
-                            TraceLevel::Off,
-                            req.seed,
-                        );
+                        let session =
+                            InferenceSession::new(self.model.config(), TraceLevel::Off, req.seed);
                         sessions.insert(
                             req.id.clone(),
                             ActiveSession {

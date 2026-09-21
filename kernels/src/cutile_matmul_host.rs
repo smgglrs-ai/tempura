@@ -1,5 +1,5 @@
 use crate::cutile_matmul::CutileMatMul;
-use crate::{KernelError, MatMul, Result, VerificationTier};
+use crate::{MatMul, Result, VerificationTier};
 
 /// Host-side adapter over [`CutileMatMul`] that mirrors the calling conventions
 /// of [`crate::matmul::CudaMatMul`].
@@ -88,7 +88,8 @@ impl CutileMatMulHost {
             .to_host_vec(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         let mut out_host = vec![0.0f32; m * n];
-        self.inner.forward(&a_host, &b_host, &mut out_host, m, n, k)?;
+        self.inner
+            .forward(&a_host, &b_host, &mut out_host, m, n, k)?;
         output
             .copy_from_host(stream, &out_host)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;

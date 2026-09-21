@@ -59,7 +59,10 @@ fn main() {
         ..SamplingParams::default()
     };
     if temperature > 0.0 {
-        eprintln!("Sampling: temperature={temperature}, top_k={}, top_p={}", params.top_k, params.top_p);
+        eprintln!(
+            "Sampling: temperature={temperature}, top_k={}, top_p={}",
+            params.top_k, params.top_p
+        );
     }
 
     // Dump top-5 logits for first 3 generated tokens
@@ -69,19 +72,40 @@ fn main() {
         let logits0 = model.forward(&mut session, &prompt_ids);
         let mut top: Vec<(usize, f32)> = logits0.iter().copied().enumerate().collect();
         top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        eprintln!("  pos={}: top5={:?}", prompt_ids.len() - 1, &top[..5].iter().map(|(i,v)| format!("{}({:.4})", i, v)).collect::<Vec<_>>());
+        eprintln!(
+            "  pos={}: top5={:?}",
+            prompt_ids.len() - 1,
+            &top[..5]
+                .iter()
+                .map(|(i, v)| format!("{}({:.4})", i, v))
+                .collect::<Vec<_>>()
+        );
         let tok0 = top[0].0 as u32;
 
         let logits1 = model.forward(&mut session, &[tok0]);
         let mut top1: Vec<(usize, f32)> = logits1.iter().copied().enumerate().collect();
         top1.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        eprintln!("  pos={}: top5={:?}", prompt_ids.len(), &top1[..5].iter().map(|(i,v)| format!("{}({:.4})", i, v)).collect::<Vec<_>>());
+        eprintln!(
+            "  pos={}: top5={:?}",
+            prompt_ids.len(),
+            &top1[..5]
+                .iter()
+                .map(|(i, v)| format!("{}({:.4})", i, v))
+                .collect::<Vec<_>>()
+        );
         let tok1 = top1[0].0 as u32;
 
         let logits2 = model.forward(&mut session, &[tok1]);
         let mut top2: Vec<(usize, f32)> = logits2.iter().copied().enumerate().collect();
         top2.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        eprintln!("  pos={}: top5={:?}", prompt_ids.len() + 1, &top2[..5].iter().map(|(i,v)| format!("{}({:.4})", i, v)).collect::<Vec<_>>());
+        eprintln!(
+            "  pos={}: top5={:?}",
+            prompt_ids.len() + 1,
+            &top2[..5]
+                .iter()
+                .map(|(i, v)| format!("{}({:.4})", i, v))
+                .collect::<Vec<_>>()
+        );
         eprintln!();
     }
 
@@ -119,7 +143,9 @@ fn main() {
 
     eprintln!("Output token IDs: {:?}", &tokens);
     if let Some(ref tok) = tokenizer {
-        let decoded = tok.decode(&tokens).unwrap_or_else(|_| "(decode error)".into());
+        let decoded = tok
+            .decode(&tokens)
+            .unwrap_or_else(|_| "(decode error)".into());
         eprintln!();
         eprintln!("=== Output ===");
         eprintln!("{decoded}");

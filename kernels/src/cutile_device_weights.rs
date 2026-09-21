@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use cuda_core::{Device, Stream};
 use cutile::api;
 use cutile::prelude::DeviceOp;
 use cutile::tensor::{Reshape, Tensor};
-use cuda_core::{Device, Stream};
 
 use crate::{KernelError, Result};
 
@@ -24,8 +24,7 @@ unsafe impl Sync for CutileDeviceWeights {}
 impl CutileDeviceWeights {
     /// Initialize a weight cache for the given CUDA device ordinal.
     pub fn new(ordinal: usize) -> Result<Self> {
-        let device = Device::new(ordinal)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let device = Device::new(ordinal).map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         let stream = device
             .new_stream()
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;

@@ -2,9 +2,9 @@ use std::time::Instant;
 use tempura_engine::config::ModelConfig;
 use tempura_engine::loader::WeightLoader;
 use tempura_engine::model::CutileInferenceWrapper;
+use tempura_engine::model::InferenceModel;
 use tempura_engine::session::InferenceSession;
 use tempura_engine::trace::TraceLevel;
-use tempura_engine::model::InferenceModel;
 
 const WARMUP: usize = 30;
 const ITERS: usize = 50;
@@ -23,7 +23,9 @@ impl RandomWeightLoader {
         let kv_dim = config.num_kv_heads * config.head_dim;
 
         let gen = |size: usize| -> Vec<f32> {
-            (0..size).map(|i| ((i as f32) * 0.0001).sin() * 0.01).collect()
+            (0..size)
+                .map(|i| ((i as f32) * 0.0001).sin() * 0.01)
+                .collect()
         };
 
         tensors.insert("model.embed_tokens.weight".into(), gen(v * h));
@@ -76,7 +78,9 @@ fn main() {
         config.vocab_size,
     );
     println!("  Warmup: {WARMUP}, Iters: {ITERS}");
-    println!("  Note: first ~15 iters include JIT compilation — stable numbers start around iter 15\n");
+    println!(
+        "  Note: first ~15 iters include JIT compilation — stable numbers start around iter 15\n"
+    );
 
     let loader = RandomWeightLoader::new(&config);
     let mut wrapper = CutileInferenceWrapper::new(config.clone());

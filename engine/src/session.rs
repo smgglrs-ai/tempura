@@ -137,9 +137,15 @@ impl InferenceSession {
 }
 
 impl tempura_kernel_api::VerifiedSession for InferenceSession {
-    fn position(&self) -> usize { self.position }
-    fn cache_seq_len(&self) -> usize { self.cache.seq_len }
-    fn max_seq_len(&self) -> usize { self.cache.max_seq_len() }
+    fn position(&self) -> usize {
+        self.position
+    }
+    fn cache_seq_len(&self) -> usize {
+        self.cache.seq_len
+    }
+    fn max_seq_len(&self) -> usize {
+        self.cache.max_seq_len()
+    }
 }
 
 use vstd::prelude::*;

@@ -88,7 +88,14 @@ impl GgmlType {
     pub fn is_quantized(self) -> bool {
         !matches!(
             self,
-            Self::F32 | Self::F16 | Self::BF16 | Self::F64 | Self::I8 | Self::I16 | Self::I32 | Self::I64
+            Self::F32
+                | Self::F16
+                | Self::BF16
+                | Self::F64
+                | Self::I8
+                | Self::I16
+                | Self::I32
+                | Self::I64
         )
     }
 
@@ -199,7 +206,13 @@ impl GgmlType {
             Self::F32 => Self::F32,
             Self::F16 => Self::F16,
             Self::BF16 => Self::BF16,
-            Self::Q4_0 | Self::Q5_0 | Self::Q8_0 | Self::Q1_0 | Self::MXFP4 | Self::NVFP4 | Self::IQ4NL => Self::Q8_0,
+            Self::Q4_0
+            | Self::Q5_0
+            | Self::Q8_0
+            | Self::Q1_0
+            | Self::MXFP4
+            | Self::NVFP4
+            | Self::IQ4NL => Self::Q8_0,
             Self::Q4_1 | Self::Q5_1 => Self::Q8_1,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => Self::Q8K,
             Self::TQ1_0 | Self::TQ2_0 => Self::Q8K,

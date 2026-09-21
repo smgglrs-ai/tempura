@@ -12,11 +12,11 @@ pub mod gguf_loader;
 pub mod kv_cache;
 pub mod loader;
 pub mod lora;
-pub mod multi_token;
-pub mod prefix_cache;
 pub mod model;
 pub mod moe;
+pub mod multi_token;
 pub mod pipeline;
+pub mod prefix_cache;
 pub mod schema;
 pub mod session;
 pub mod speculative;
@@ -27,12 +27,12 @@ pub mod trace_diff;
 pub mod weights;
 
 pub use config::{ConfigError, ModelConfig, QuantConfig, QuantFormat};
+#[cfg(feature = "cutile")]
+pub use cutile_gpu_forward::CutileGpuModel;
 pub use kv_cache::{
     BlockTable, Fp8PagedKvCache, KvCache, KvCachePool, PageAllocator, PagedKvCache, PoolError,
     PrefixCacheTable, PrefixMatch, SharedPrefixCache, DEFAULT_BLOCK_SIZE,
 };
-#[cfg(feature = "cutile")]
-pub use cutile_gpu_forward::CutileGpuModel;
 #[cfg(feature = "cutile")]
 pub use model::CutileInferenceWrapper;
 pub use model::{InferenceModel, TokenLogprob, TopLogprob, TransformerModel};

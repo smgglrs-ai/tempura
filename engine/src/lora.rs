@@ -75,10 +75,7 @@ impl LoraRegistry {
 
     pub fn register(&self, adapter: LoraAdapter) {
         let id = adapter.id.clone();
-        self.adapters
-            .write()
-            .unwrap()
-            .insert(id, Arc::new(adapter));
+        self.adapters.write().unwrap().insert(id, Arc::new(adapter));
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<LoraAdapter>> {
@@ -140,7 +137,10 @@ mod tests {
         let input = vec![1.0f32; 4];
         let mut output = vec![0.0f32; 4];
         adapter.apply_to_output("proj", &input, &mut output, 1, 4, 4);
-        assert!(output.iter().any(|&v| v != 0.0), "LoRA should modify output");
+        assert!(
+            output.iter().any(|&v| v != 0.0),
+            "LoRA should modify output"
+        );
     }
 
     #[test]

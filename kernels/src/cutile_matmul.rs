@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use crate::{KernelError, MatMul, Result, VerificationTier};
+use cuda_core::{Device, Stream};
 use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
 use cutile::tensor::{IntoPartition, Reshape, Tensor};
-use cuda_core::{Device, Stream};
-use crate::{KernelError, MatMul, Result, VerificationTier};
+use std::sync::Arc;
 
 #[cutile::module]
 pub mod kernels {
@@ -161,8 +161,7 @@ impl CutileMatMul {
 
     /// Initialize with a specific CUDA device ordinal.
     pub fn with_device(ordinal: usize) -> Result<Self> {
-        let device = Device::new(ordinal)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let device = Device::new(ordinal).map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         let stream = device
             .new_stream()
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
@@ -185,7 +184,9 @@ const BK: usize = 16;
 /// Round up to the next power-of-2 ≥ x. Required: cuTile JIT on sm_120
 /// rejects non-power-of-2 K const generics in MMA-accumulation loops.
 fn next_pow2(x: usize) -> usize {
-    if x <= 1 { return 1; }
+    if x <= 1 {
+        return 1;
+    }
     1usize << (usize::BITS - (x - 1).leading_zeros()) as usize
 }
 
@@ -529,10 +530,16 @@ impl CutileMatMul {
         k: usize,
     ) -> Result<()> {
         if a.len() != m * k {
-            return Err(KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
         }
         if output.len() != m * n {
-            return Err(KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
         }
 
         let k_pad = next_pow2(k.div_ceil(BK) * BK);
@@ -600,7 +607,7 @@ impl CutileMatMul {
         // Choose BK: use coalesced (BK=128) when k_pad divides evenly; otherwise
         // fall back to strided GEMV (BK=64) for very small K values.
         let k_pad_coalesced = next_pow2(k.div_ceil(BK_GEMV_COALESCED) * BK_GEMV_COALESCED);
-        let use_coalesced = k_pad_coalesced % BK_GEMV_COALESCED == 0;
+        let use_coalesced = k_pad_coalesced.is_multiple_of(BK_GEMV_COALESCED);
 
         let k_pad = if use_coalesced {
             k_pad_coalesced
@@ -842,7 +849,7 @@ impl CutileMatMul {
         k_pad: usize,
     ) -> Result<Arc<Tensor<f32>>> {
         debug_assert!(
-            k_pad % BK_GEMV == 0,
+            k_pad.is_multiple_of(BK_GEMV),
             "k_pad={k_pad} must be divisible by BK_GEMV={BK_GEMV}"
         );
         let stream = &self.stream;
@@ -884,7 +891,7 @@ impl CutileMatMul {
         k_pad: usize,
     ) -> Result<Arc<Tensor<f32>>> {
         debug_assert!(
-            k_pad % BK_GEMV == 0,
+            k_pad.is_multiple_of(BK_GEMV),
             "k_pad={k_pad} must be divisible by BK_GEMV={BK_GEMV}"
         );
         let stream = &self.stream;
@@ -926,7 +933,7 @@ impl CutileMatMul {
         k_pad: usize,
     ) -> Result<Arc<Tensor<f32>>> {
         debug_assert!(
-            k_pad % BK_GEMV_COALESCED == 0,
+            k_pad.is_multiple_of(BK_GEMV_COALESCED),
             "k_pad={k_pad} must be divisible by BK_GEMV_COALESCED={BK_GEMV_COALESCED}"
         );
         let stream = &self.stream;
@@ -963,7 +970,7 @@ impl CutileMatMul {
         k_pad: usize,
     ) -> Result<Arc<Tensor<f32>>> {
         debug_assert!(
-            k_pad % BK_GEMV_COALESCED == 0,
+            k_pad.is_multiple_of(BK_GEMV_COALESCED),
             "k_pad={k_pad} must be divisible by BK_GEMV_COALESCED={BK_GEMV_COALESCED}"
         );
         let stream = &self.stream;
@@ -1002,7 +1009,7 @@ impl CutileMatMul {
         k_pad: usize,
     ) -> Result<Arc<Tensor<f32>>> {
         debug_assert!(
-            k_pad % BK_GEMV_COALESCED == 0,
+            k_pad.is_multiple_of(BK_GEMV_COALESCED),
             "k_pad={k_pad} must be divisible by BK_GEMV_COALESCED={BK_GEMV_COALESCED}"
         );
         let stream = &self.stream;

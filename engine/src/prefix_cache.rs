@@ -89,8 +89,7 @@ impl RadixTree {
         for &token in token_ids {
             if let Some(&child_idx) = self.nodes[node_idx].children.get(&token) {
                 node_idx = child_idx;
-                self.nodes[node_idx].ref_count =
-                    self.nodes[node_idx].ref_count.saturating_sub(1);
+                self.nodes[node_idx].ref_count = self.nodes[node_idx].ref_count.saturating_sub(1);
             } else {
                 break;
             }
@@ -116,7 +115,7 @@ impl RadixTree {
             .min_by_key(|&&idx| self.nodes[idx].last_used)
         {
             let freed = self.nodes[oldest].page_ids.clone();
-            for (_, node) in self.nodes.iter_mut().enumerate() {
+            for node in self.nodes.iter_mut() {
                 node.children.retain(|_, &mut child| child != oldest);
             }
             return freed;

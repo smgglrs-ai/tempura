@@ -1,15 +1,12 @@
-use std::sync::Arc;
+use crate::{
+    KernelError, MatMulQ, Result, VerificationTier, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE, Q4K_GROUPS,
+    Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, TQ2_BLOCK_BYTES, TQ2_BLOCK_SIZE,
+};
+use cuda_core::{Device, Stream};
 use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
 use cutile::tensor::{IntoPartition, Reshape, Tensor};
-use cuda_core::{Device, Stream};
-use crate::{
-    KernelError, MatMulQ, Result, VerificationTier,
-    Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE, Q4K_GROUPS,
-    Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE,
-    TQ2_BLOCK_BYTES, TQ2_BLOCK_SIZE,
-    I2S_BLOCK_BYTES, I2S_BLOCK_SIZE,
-};
+use std::sync::Arc;
 
 // Tile constants matching cutile_matmul.rs
 const BM: usize = 16;
@@ -72,15 +69,23 @@ fn q4k_unpack_scales(packed: &[u8]) -> ([f32; Q4K_GROUPS], [f32; Q4K_GROUPS]) {
     let mut m = [0u8; Q4K_GROUPS];
     let mut i = 0;
     while i < 4 {
-        sc[i]     = packed[i] & 0x3F;
+        sc[i] = packed[i] & 0x3F;
         sc[i + 4] = ((packed[i + 8] & 0x0F) | ((packed[i] >> 6) << 4)) & 0x3F;
-        m[i]      = packed[i + 4] & 0x3F;
-        m[i + 4]  = ((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F;
+        m[i] = packed[i + 4] & 0x3F;
+        m[i + 4] = ((packed[i + 8] >> 4) | ((packed[i + 4] >> 6) << 4)) & 0x3F;
         i += 1;
     }
     let to_f32 = |a: [u8; Q4K_GROUPS]| {
-        [a[0] as f32, a[1] as f32, a[2] as f32, a[3] as f32,
-         a[4] as f32, a[5] as f32, a[6] as f32, a[7] as f32]
+        [
+            a[0] as f32,
+            a[1] as f32,
+            a[2] as f32,
+            a[3] as f32,
+            a[4] as f32,
+            a[5] as f32,
+            a[6] as f32,
+            a[7] as f32,
+        ]
     };
     (to_f32(sc), to_f32(m))
 }
@@ -90,7 +95,7 @@ fn q4k_unpack_scales(packed: &[u8]) -> ([f32; Q4K_GROUPS], [f32; Q4K_GROUPS]) {
 fn dequant_q4k_block(block: &[u8], out: &mut [f32]) {
     debug_assert_eq!(block.len(), Q4K_BLOCK_BYTES);
     debug_assert_eq!(out.len(), Q4K_BLOCK_SIZE);
-    let d    = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
     let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
     let packed_scales = &block[4..16];
     let qs = &block[16..144];
@@ -105,7 +110,7 @@ fn dequant_q4k_block(block: &[u8], out: &mut [f32]) {
         let m2 = dmin * m[2 * j + 1];
         let mut l = 0;
         while l < 32 {
-            out[j * 64 + l]      = d1 * (qs[q_off + l] & 0x0F) as f32 - m1;
+            out[j * 64 + l] = d1 * (qs[q_off + l] & 0x0F) as f32 - m1;
             out[j * 64 + l + 32] = d2 * (qs[q_off + l] >> 4) as f32 - m2;
             l += 1;
         }
@@ -118,29 +123,29 @@ fn dequant_q4k_block(block: &[u8], out: &mut [f32]) {
 fn dequant_q6k_block(block: &[u8], out: &mut [f32]) {
     debug_assert_eq!(block.len(), Q6K_BLOCK_BYTES);
     debug_assert_eq!(out.len(), Q6K_BLOCK_SIZE);
-    let ql     = &block[0..128];
-    let qh     = &block[128..192];
+    let ql = &block[0..128];
+    let qh = &block[128..192];
     let scales = &block[192..208];
-    let d      = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+    let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
 
     for half in 0..2 {
         let ql_off = half * 64;
         let qh_off = half * 32;
-        let y_off  = half * 128;
+        let y_off = half * 128;
         for l in 0..32 {
-            let q1 = ((ql[ql_off + l] & 0xF)      | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
-            let q2 = ((ql[ql_off + l + 32] & 0xF)  | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
-            let q3 = ((ql[ql_off + l] >> 4)         | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
-            let q4 = ((ql[ql_off + l + 32] >> 4)    | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+            let q1 = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
+            let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+            let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+            let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
             let is = l / 16;
-            let sc0 = scales[half * 8 + is]     as i8 as f32;
+            let sc0 = scales[half * 8 + is] as i8 as f32;
             let sc1 = scales[half * 8 + is + 2] as i8 as f32;
             let sc2 = scales[half * 8 + is + 4] as i8 as f32;
             let sc3 = scales[half * 8 + is + 6] as i8 as f32;
-            out[y_off + l]       = d * sc0 * q1 as f32;
-            out[y_off + l + 32]  = d * sc1 * q2 as f32;
-            out[y_off + l + 64]  = d * sc2 * q3 as f32;
-            out[y_off + l + 96]  = d * sc3 * q4 as f32;
+            out[y_off + l] = d * sc0 * q1 as f32;
+            out[y_off + l + 32] = d * sc1 * q2 as f32;
+            out[y_off + l + 64] = d * sc2 * q3 as f32;
+            out[y_off + l + 96] = d * sc3 * q4 as f32;
         }
     }
 }
@@ -150,7 +155,7 @@ fn dequant_q6k_block(block: &[u8], out: &mut [f32]) {
 fn dequant_tq2_block(block: &[u8], out: &mut [f32]) {
     debug_assert_eq!(block.len(), TQ2_BLOCK_BYTES);
     debug_assert_eq!(out.len(), TQ2_BLOCK_SIZE);
-    let d  = f16_to_f32(u16::from_le_bytes([block[64], block[65]]));
+    let d = f16_to_f32(u16::from_le_bytes([block[64], block[65]]));
     let qs = &block[0..64];
     let mut idx = 0;
     for &byte in qs {
@@ -337,8 +342,7 @@ impl CutileQuantizedGemm {
     }
 
     pub fn with_device(ordinal: usize) -> Result<Self> {
-        let device = Device::new(ordinal)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let device = Device::new(ordinal).map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         let stream = device
             .new_stream()
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
@@ -369,12 +373,18 @@ impl MatMulQ for CutileQuantizedGemm {
         k: usize,
     ) -> Result<()> {
         if a.len() != m * k {
-            return Err(KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
         }
         if output.len() != m * n {
-            return Err(KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
         }
-        if k % Q4K_BLOCK_SIZE != 0 {
+        if !k.is_multiple_of(Q4K_BLOCK_SIZE) {
             return Err(KernelError::InvalidConfig(format!(
                 "k={k} must be divisible by Q4K block size {Q4K_BLOCK_SIZE}"
             )));
@@ -403,12 +413,18 @@ impl MatMulQ for CutileQuantizedGemm {
         k: usize,
     ) -> Result<()> {
         if a.len() != m * k {
-            return Err(KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
         }
         if output.len() != m * n {
-            return Err(KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
         }
-        if k % Q6K_BLOCK_SIZE != 0 {
+        if !k.is_multiple_of(Q6K_BLOCK_SIZE) {
             return Err(KernelError::InvalidConfig(format!(
                 "k={k} must be divisible by Q6K block size {Q6K_BLOCK_SIZE}"
             )));
@@ -437,12 +453,18 @@ impl MatMulQ for CutileQuantizedGemm {
         k: usize,
     ) -> Result<()> {
         if a.len() != m * k {
-            return Err(KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
         }
         if output.len() != m * n {
-            return Err(KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
         }
-        if k % TQ2_BLOCK_SIZE != 0 {
+        if !k.is_multiple_of(TQ2_BLOCK_SIZE) {
             return Err(KernelError::InvalidConfig(format!(
                 "k={k} must be divisible by TQ2 block size {TQ2_BLOCK_SIZE}"
             )));
@@ -471,12 +493,18 @@ impl MatMulQ for CutileQuantizedGemm {
         k: usize,
     ) -> Result<()> {
         if a.len() != m * k {
-            return Err(KernelError::DimensionMismatch { expected: m * k, got: a.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: m * k,
+                got: a.len(),
+            });
         }
         if output.len() != m * n {
-            return Err(KernelError::DimensionMismatch { expected: m * n, got: output.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: m * n,
+                got: output.len(),
+            });
         }
-        if k % 4 != 0 {
+        if !k.is_multiple_of(4) {
             return Err(KernelError::InvalidConfig(format!(
                 "k={k} must be divisible by 4 for I2S format"
             )));
@@ -524,36 +552,18 @@ mod tests {
     use super::*;
     use crate::quantized::{q4k_dot_block, q6k_dot_block, tq2_dot_block};
 
-    fn make_q4k_block(d: f32, dmin: f32) -> Vec<u8> {
-        let mut block = vec![0u8; Q4K_BLOCK_BYTES];
-        // Encode d and dmin as f16
-        let d_bits = f32_to_f16_bits(d);
-        let dmin_bits = f32_to_f16_bits(dmin);
-        block[0] = d_bits as u8;
-        block[1] = (d_bits >> 8) as u8;
-        block[2] = dmin_bits as u8;
-        block[3] = (dmin_bits >> 8) as u8;
-        // scales[0..8] = 1, mins[0..8] = 0 (encoded in 12 packed bytes)
-        // For simplicity: set sc[i]=1, m[i]=0 → packed bytes = [1,1,1,1,0,0,0,0,0,0,0,0]
-        block[4] = 1;
-        block[5] = 1;
-        block[6] = 1;
-        block[7] = 1;
-        // qs: all 0x88 → low nibble=8, high nibble=8
-        for i in 16..144 {
-            block[i] = 0x88;
-        }
-        block
-    }
-
     fn f32_to_f16_bits(val: f32) -> u16 {
         // Simple f32→f16 for test values that fit in normal f16 range
         let bits = val.to_bits();
         let sign = (bits >> 31) as u16;
         let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
         let frac = ((bits >> 13) & 0x3FF) as u16;
-        if exp <= 0 { return sign << 15; }
-        if exp >= 31 { return (sign << 15) | (31 << 10); }
+        if exp <= 0 {
+            return sign << 15;
+        }
+        if exp >= 31 {
+            return (sign << 15) | (31 << 10);
+        }
         (sign << 15) | ((exp as u16) << 10) | frac
     }
 
@@ -566,7 +576,10 @@ mod tests {
         block[1] = (d_bits >> 8) as u8;
         // dmin = 0
         // scales: sc[0..4]=1, packed in bytes [4..16]
-        block[4] = 1; block[5] = 1; block[6] = 1; block[7] = 1;
+        block[4] = 1;
+        block[5] = 1;
+        block[6] = 1;
+        block[7] = 1;
         // qs: all nibbles = 7
         for i in 16..144 {
             block[i] = 0x77;
@@ -578,8 +591,10 @@ mod tests {
         dequant_q4k_block(&block, &mut dequanted);
         let got_dot: f32 = dequanted.iter().sum();
 
-        assert!((got_dot - expected_dot).abs() < 1e-3,
-            "dequant dot={got_dot} vs q4k_dot_block={expected_dot}");
+        assert!(
+            (got_dot - expected_dot).abs() < 1e-3,
+            "dequant dot={got_dot} vs q4k_dot_block={expected_dot}"
+        );
     }
 
     #[test]
@@ -590,9 +605,13 @@ mod tests {
         block[208] = d_bits as u8;
         block[209] = (d_bits >> 8) as u8;
         // scales: all 1 (i8 value 1 → all groups have sc=1)
-        for i in 192..208 { block[i] = 1u8; }
+        for i in 192..208 {
+            block[i] = 1u8;
+        }
         // ql: all 0x11 → low nibbles=1, meaning q1=(1|0<<4)-32=-31
-        for i in 0..128 { block[i] = 0x11; }
+        for i in 0..128 {
+            block[i] = 0x11;
+        }
         // qh: 0 → high bits=0
         let a = vec![1.0f32; Q6K_BLOCK_SIZE];
         let expected_dot = q6k_dot_block(&block, &a);
@@ -601,8 +620,10 @@ mod tests {
         dequant_q6k_block(&block, &mut dequanted);
         let got_dot: f32 = dequanted.iter().sum();
 
-        assert!((got_dot - expected_dot).abs() < 1e-2,
-            "dequant dot={got_dot} vs q6k_dot_block={expected_dot}");
+        assert!(
+            (got_dot - expected_dot).abs() < 1e-2,
+            "dequant dot={got_dot} vs q6k_dot_block={expected_dot}"
+        );
     }
 
     #[test]
@@ -612,7 +633,9 @@ mod tests {
         block[64] = d_bits as u8;
         block[65] = (d_bits >> 8) as u8;
         // qs: 0b10101010 → each pair = 0b10 = 2 → trit = 2-1 = 1
-        for i in 0..64 { block[i] = 0xAA; }
+        for i in 0..64 {
+            block[i] = 0xAA;
+        }
         let a = vec![1.0f32; TQ2_BLOCK_SIZE];
         let expected_dot = tq2_dot_block(&block, &a);
 
@@ -620,7 +643,9 @@ mod tests {
         dequant_tq2_block(&block, &mut dequanted);
         let got_dot: f32 = dequanted.iter().sum();
 
-        assert!((got_dot - expected_dot).abs() < 1e-3,
-            "dequant dot={got_dot} vs tq2_dot_block={expected_dot}");
+        assert!(
+            (got_dot - expected_dot).abs() < 1e-3,
+            "dequant dot={got_dot} vs tq2_dot_block={expected_dot}"
+        );
     }
 }

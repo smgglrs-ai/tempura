@@ -89,8 +89,8 @@ impl Architecture {
     pub fn from_gguf_name(name: &str) -> Self {
         match name {
             "llama" | "llama4" | "qwen" | "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe"
-            | "mistral" | "yi" | "deci" | "baichuan" | "stablelm" | "bitnet"
-            | "internlm2" | "deepseek" | "deepseek2" => Architecture::Llama,
+            | "mistral" | "yi" | "deci" | "baichuan" | "stablelm" | "bitnet" | "internlm2"
+            | "deepseek" | "deepseek2" => Architecture::Llama,
             "gpt2" | "gptj" | "gptneox" | "starcoder" | "refact" => Architecture::Gpt2,
             "phi2" | "phi3" | "phimoe" => Architecture::Phi,
             "gemma" | "gemma2" | "gemma3" => Architecture::Gemma,
@@ -452,9 +452,18 @@ impl ModelConfig {
                 original_context_length,
                 yarn_beta_fast: rs.get("beta_fast").and_then(|v| v.as_f64()).unwrap_or(32.0) as f32,
                 yarn_beta_slow: rs.get("beta_slow").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
-                yarn_attn_factor: rs.get("attn_factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
-                low_freq_factor: rs.get("low_freq_factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
-                high_freq_factor: rs.get("high_freq_factor").and_then(|v| v.as_f64()).unwrap_or(4.0) as f32,
+                yarn_attn_factor: rs
+                    .get("attn_factor")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0) as f32,
+                low_freq_factor: rs
+                    .get("low_freq_factor")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0) as f32,
+                high_freq_factor: rs
+                    .get("high_freq_factor")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(4.0) as f32,
             })
         });
 
@@ -479,16 +488,31 @@ impl ModelConfig {
             hidden_act,
             rope_type,
             architecture,
-            n_experts: v.get("num_local_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            n_experts_used: v.get("num_experts_per_tok").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            use_layernorm: matches!(architecture, Architecture::Falcon | Architecture::Mpt | Architecture::Phi),
+            n_experts: v
+                .get("num_local_experts")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize,
+            n_experts_used: v
+                .get("num_experts_per_tok")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize,
+            use_layernorm: matches!(
+                architecture,
+                Architecture::Falcon | Architecture::Mpt | Architecture::Phi
+            ),
             use_alibi: matches!(architecture, Architecture::Mpt),
             alibi_max_bias: if matches!(architecture, Architecture::Mpt) {
-                v.get("attn_config").and_then(|c| c.get("alibi_bias_max")).and_then(|v| v.as_f64()).unwrap_or(8.0) as f32
+                v.get("attn_config")
+                    .and_then(|c| c.get("alibi_bias_max"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(8.0) as f32
             } else {
                 0.0
             },
-            parallel_attn_ffn: matches!(architecture, Architecture::Phi) || v.get("parallel_attn").and_then(|v| v.as_bool()).unwrap_or(false),
+            parallel_attn_ffn: matches!(architecture, Architecture::Phi)
+                || v.get("parallel_attn")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             rmsnorm_offset: matches!(architecture, Architecture::Gemma),
             attn_logit_softcapping: v
                 .get("attn_logit_softcapping")
@@ -507,7 +531,7 @@ impl ModelConfig {
 
     pub fn cache_layer_map(&self) -> Vec<Option<usize>> {
         match &self.layer_kinds {
-            None => (0..self.num_layers).map(|i| Some(i)).collect(),
+            None => (0..self.num_layers).map(Some).collect(),
             Some(kinds) => {
                 let mut cache_idx = 0;
                 kinds
@@ -716,14 +740,20 @@ mod tests {
         assert_eq!(Architecture::from_gguf_name("gpt2"), Architecture::Gpt2);
         assert_eq!(Architecture::from_gguf_name("gptj"), Architecture::Gpt2);
         assert_eq!(Architecture::from_gguf_name("gptneox"), Architecture::Gpt2);
-        assert_eq!(Architecture::from_gguf_name("starcoder"), Architecture::Gpt2);
+        assert_eq!(
+            Architecture::from_gguf_name("starcoder"),
+            Architecture::Gpt2
+        );
         assert_eq!(Architecture::from_gguf_name("phi2"), Architecture::Phi);
         assert_eq!(Architecture::from_gguf_name("phi3"), Architecture::Phi);
         assert_eq!(Architecture::from_gguf_name("gemma"), Architecture::Gemma);
         assert_eq!(Architecture::from_gguf_name("gemma2"), Architecture::Gemma);
         assert_eq!(Architecture::from_gguf_name("falcon"), Architecture::Falcon);
         assert_eq!(Architecture::from_gguf_name("mpt"), Architecture::Mpt);
-        assert_eq!(Architecture::from_gguf_name("unknown_arch"), Architecture::Llama);
+        assert_eq!(
+            Architecture::from_gguf_name("unknown_arch"),
+            Architecture::Llama
+        );
     }
 
     #[test]
@@ -794,7 +824,10 @@ mod tests {
         let c = ModelConfig::from_hf_json(json).unwrap();
         assert!(c.rmsnorm_offset, "Gemma must have rmsnorm_offset");
         assert!(c.embedding_scale, "Gemma must have embedding_scale");
-        assert!(!c.parallel_attn_ffn, "Gemma must NOT have parallel_attn_ffn");
+        assert!(
+            !c.parallel_attn_ffn,
+            "Gemma must NOT have parallel_attn_ffn"
+        );
         assert!(!c.use_layernorm);
     }
 

@@ -23,8 +23,12 @@ fn test_cutile_identity() {
     let mut cpu_out = vec![0.0f32; n * n];
     let mut gpu_out = vec![0.0f32; n * n];
 
-    cpu_mm.forward(&identity, &b, &mut cpu_out, n, n, n).unwrap();
-    cutile_mm.forward(&identity, &b, &mut gpu_out, n, n, n).unwrap();
+    cpu_mm
+        .forward(&identity, &b, &mut cpu_out, n, n, n)
+        .unwrap();
+    cutile_mm
+        .forward(&identity, &b, &mut gpu_out, n, n, n)
+        .unwrap();
 
     for i in 0..(n * n) {
         let diff = (gpu_out[i] - cpu_out[i]).abs();
@@ -94,9 +98,7 @@ fn test_cutile_b_transposed() {
     ];
 
     for (m, n, k) in shapes {
-        let a: Vec<f32> = (0..m * k)
-            .map(|i| ((i % 19) as f32 - 9.0) * 0.05)
-            .collect();
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.05).collect();
         // B has shape [N, K] for transposed forward
         let b: Vec<f32> = (0..n * k)
             .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
@@ -146,9 +148,7 @@ fn test_cutile_gemv_m1() {
     ];
 
     for (m, n, k) in shapes {
-        let a: Vec<f32> = (0..m * k)
-            .map(|i| ((i % 19) as f32 - 9.0) * 0.05)
-            .collect();
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.05).collect();
         let b: Vec<f32> = (0..n * k)
             .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
             .collect();
@@ -201,13 +201,19 @@ fn test_cutile_gemv_coalesced_m1() {
     for (m, n, k) in &shapes {
         let (m, n, k) = (*m, *n, *k);
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.05).collect();
-        let b: Vec<f32> = (0..n * k).map(|i| ((i % 23) as f32 - 11.0) * 0.05).collect();
+        let b: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
+            .collect();
 
         let mut cpu_out = vec![0.0f32; m * n];
         let mut gpu_out = vec![0.0f32; m * n];
 
-        cpu_mm.forward_b_transposed(&a, &b, &mut cpu_out, m, n, k).unwrap();
-        cutile_mm.forward_b_transposed(&a, &b, &mut gpu_out, m, n, k).unwrap();
+        cpu_mm
+            .forward_b_transposed(&a, &b, &mut cpu_out, m, n, k)
+            .unwrap();
+        cutile_mm
+            .forward_b_transposed(&a, &b, &mut gpu_out, m, n, k)
+            .unwrap();
 
         for i in 0..(m * n) {
             let diff = (gpu_out[i] - cpu_out[i]).abs();
@@ -231,13 +237,16 @@ fn test_cutile_gemv_coalesced_m1() {
         let mut out = vec![0.0f32; m * n];
 
         // Warm-up: one call to trigger JIT compilation.
-        cutile_mm.forward_b_transposed(&a_data, &b_data, &mut out, m, n, k).expect("warmup");
+        cutile_mm
+            .forward_b_transposed(&a_data, &b_data, &mut out, m, n, k)
+            .expect("warmup");
 
         // Timed run: 20 iterations.
         const ITERS: u32 = 20;
         let t0 = Instant::now();
         for _ in 0..ITERS {
-            cutile_mm.forward_b_transposed(&a_data, &b_data, &mut out, m, n, k)
+            cutile_mm
+                .forward_b_transposed(&a_data, &b_data, &mut out, m, n, k)
                 .expect("timed gemv");
         }
         let elapsed = t0.elapsed();

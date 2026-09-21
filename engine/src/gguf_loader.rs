@@ -54,11 +54,11 @@ pub enum GgmlType {
     BF16 = 30,
     TQ1_0 = 34,
     TQ2_0 = 35,
-    TL1 = 38,    // bitnet.cpp: ARM TL1 LUT format
-    I2S = 39,    // bitnet.cpp: x86 TL2/I2_S LUT format; NOTE: upstream GGUF uses 39 for MXFP4
+    TL1 = 38, // bitnet.cpp: ARM TL1 LUT format
+    I2S = 39, // bitnet.cpp: x86 TL2/I2_S LUT format; NOTE: upstream GGUF uses 39 for MXFP4
     NVFP4 = 40,
     Q1_0 = 41,
-    Q2_0 = 42,   // PrismML: 2-bit ternary, group size 128, f16 scale
+    Q2_0 = 42, // PrismML: 2-bit ternary, group size 128, f16 scale
 }
 
 impl GgmlType {
@@ -294,7 +294,11 @@ fn f16_to_f32(bits: u16) -> f32 {
         }
         let scale = f32::from_bits((127 - 14) << 23);
         let mantissa = frac as f32 / 1024.0;
-        return if sign == 0 { scale * mantissa } else { -scale * mantissa };
+        if sign == 0 {
+            scale * mantissa
+        } else {
+            -scale * mantissa
+        }
     } else if exp == 31 {
         if frac == 0 {
             f32::from_bits((sign << 31) | (0xff << 23))
@@ -444,7 +448,7 @@ fn dequant_q6k(data: &[u8], num_elements: usize) -> Vec<f32> {
 
             for l in 0..32 {
                 let is = l / 16;
-                let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+                let q1 = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
                 let q2 =
                     ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
                 let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
@@ -713,7 +717,7 @@ fn dequant_tq1(data: &[u8], num_elements: usize) -> Vec<f32> {
     output
 }
 
-fn tensor_data_size(dtype: GgmlType, num_elements: u64, dims: &[u64]) -> u64 {
+fn tensor_data_size(dtype: GgmlType, num_elements: u64, _dims: &[u64]) -> u64 {
     match dtype {
         GgmlType::F32 => num_elements * 4,
         GgmlType::F16 | GgmlType::BF16 => num_elements * 2,
@@ -786,8 +790,6 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "ffn_sub_norm.weight" => "mlp.ffn_sub_norm.weight",
             "attn_sub_norm.weight" => "self_attn.attn_sub_norm.weight",
             "post_attention_norm.weight" => "post_attention_layernorm.weight",
-            "attn_qkv.weight" => "ssm.qkv_proj.weight",
-            "attn_gate.weight" => "ssm.gate_proj.weight",
             "ssm_in.weight" => "ssm.in_proj.weight",
             "ssm_out.weight" => "ssm.out_proj.weight",
             "ssm_conv1d.weight" => "ssm.conv1d.weight",
@@ -917,7 +919,11 @@ fn detect_and_apply_hybrid_layers(
     let interval = metadata
         .get(&format!("{arch}.full_attention_interval"))
         .and_then(|v| v.as_u64())
-        .or_else(|| metadata.get("full_attention_interval").and_then(|v| v.as_u64()));
+        .or_else(|| {
+            metadata
+                .get("full_attention_interval")
+                .and_then(|v| v.as_u64())
+        });
 
     if let Some(interval) = interval {
         let interval = interval as usize;
@@ -932,10 +938,13 @@ fn detect_and_apply_hybrid_layers(
         config.layer_kinds = Some(kinds);
     } else {
         // Fallback: scan tensor names for DeltaNet markers (ssm_alpha, ssm_ba, ssm_beta_alpha)
-        let has_ssm = tensor_names.iter().any(|n|
-            n.contains("ssm_alpha") || n.contains("ssm.alpha")
-            || n.contains("ssm_ba") || n.contains("ssm.beta_alpha")
-            || n.contains("ssm_beta_alpha"));
+        let has_ssm = tensor_names.iter().any(|n| {
+            n.contains("ssm_alpha")
+                || n.contains("ssm.alpha")
+                || n.contains("ssm_ba")
+                || n.contains("ssm.beta_alpha")
+                || n.contains("ssm_beta_alpha")
+        });
         if !has_ssm {
             return;
         }
@@ -1039,8 +1048,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         .and_then(|v| v.as_f32())
         .unwrap_or(1e-5);
 
-    let head_dim = get_usize("attention.key_length")
-        .unwrap_or(hidden_size / num_attention_heads);
+    let head_dim = get_usize("attention.key_length").unwrap_or(hidden_size / num_attention_heads);
 
     let is_bitnet = arch.contains("bitnet");
 
@@ -1104,7 +1112,12 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         architecture,
         n_experts: get_usize("expert_count").unwrap_or(0),
         n_experts_used: get_usize("expert_used_count").unwrap_or(0),
-        use_layernorm: matches!(architecture, crate::config::Architecture::Falcon | crate::config::Architecture::Mpt | crate::config::Architecture::Phi),
+        use_layernorm: matches!(
+            architecture,
+            crate::config::Architecture::Falcon
+                | crate::config::Architecture::Mpt
+                | crate::config::Architecture::Phi
+        ),
         use_alibi: matches!(architecture, crate::config::Architecture::Mpt),
         alibi_max_bias: if matches!(architecture, crate::config::Architecture::Mpt) {
             metadata
@@ -1114,13 +1127,14 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         } else {
             0.0
         },
-        parallel_attn_ffn: matches!(architecture, crate::config::Architecture::Phi) || metadata
-            .get(&format!("{arch}.attention.use_parallel_residual"))
-            .and_then(|v| match v {
-                GgufValue::Bool(b) => Some(*b),
-                _ => None,
-            })
-            .unwrap_or(false),
+        parallel_attn_ffn: matches!(architecture, crate::config::Architecture::Phi)
+            || metadata
+                .get(&format!("{arch}.attention.use_parallel_residual"))
+                .and_then(|v| match v {
+                    GgufValue::Bool(b) => Some(*b),
+                    _ => None,
+                })
+                .unwrap_or(false),
         rmsnorm_offset: matches!(architecture, crate::config::Architecture::Gemma),
         attn_logit_softcapping: metadata
             .get(&format!("{arch}.attention.logit_softcapping"))
@@ -1131,7 +1145,11 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         deltanet_head_dim: None,
         ssm_a: None,
         dt_bias: None,
-        rope_dim: if std::env::var("TEMPURA_FULL_ROPE").is_ok() { None } else { get_usize("rope.dimension_count") },
+        rope_dim: if std::env::var("TEMPURA_FULL_ROPE").is_ok() {
+            None
+        } else {
+            get_usize("rope.dimension_count")
+        },
         rope_scaling: {
             let scaling_type_str = metadata
                 .get(&format!("{arch}.rope.scaling.type"))
@@ -1238,17 +1256,16 @@ pub struct GgufLoader {
 
 impl std::fmt::Debug for GgufLoader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GgufLoader").field("config", &self.config).finish_non_exhaustive()
+        f.debug_struct("GgufLoader")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
     }
 }
 
 /// Detect split GGUF shards (pattern: `prefix-NNNNN-of-MMMMM.gguf`) and return all shard paths
 /// in order. Returns a single-element vec for non-split files.
 fn find_split_shards(path: &Path) -> Result<Vec<std::path::PathBuf>, LoadError> {
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let stem = match filename.strip_suffix(".gguf") {
         Some(s) => s,
         None => return Ok(vec![path.to_path_buf()]),
@@ -1432,7 +1449,8 @@ impl GgufLoader {
             let ne = num_elements as usize;
             let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
 
-            let is_quantized = !matches!(info.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
+            let is_quantized =
+                !matches!(info.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
             // I2S (bitnet.cpp type 39) has no matching GPU quantized kernel yet — dequantize to f32.
             // TL1 (type 38, ARM LUT format) also dequantized via TQ1_0 path.
             let force_dequant = matches!(info.dtype, GgmlType::I2S | GgmlType::TL1);
@@ -1451,8 +1469,15 @@ impl GgufLoader {
 
             let skip_f32 = info.dtype == GgmlType::F16;
 
-            let use_mmap = keep_raw && matches!(info.dtype,
-                GgmlType::TQ1_0 | GgmlType::TL1 | GgmlType::Q4K | GgmlType::Q6K | GgmlType::Q2_0);
+            let use_mmap = keep_raw
+                && matches!(
+                    info.dtype,
+                    GgmlType::TQ1_0
+                        | GgmlType::TL1
+                        | GgmlType::Q4K
+                        | GgmlType::Q6K
+                        | GgmlType::Q2_0
+                );
             if use_mmap {
                 mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, info.dtype));
             }
@@ -1504,19 +1529,28 @@ impl GgufLoader {
             tensor_dtypes.insert(mapped_name.clone(), info.dtype);
         }
 
-        let vocab_size_from_embed = tensors.get("model.embed_tokens.weight").map(|t| {
-            let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
-            t.len().checked_div(hidden).unwrap_or(0)
-        }).or_else(|| f16_raw_tensors.get("model.embed_tokens.weight").map(|t| {
-            let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
-            (t.len() / 2).checked_div(hidden).unwrap_or(0)
-        })).or_else(|| {
-            let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
-            mmap_ranges.get("model.embed_tokens.weight").map(|&(_, len, dtype)| {
-                let row_bytes = tensor_data_size(dtype, hidden as u64, &[hidden as u64]) as usize;
-                if row_bytes > 0 { len / row_bytes } else { 0 }
+        let vocab_size_from_embed = tensors
+            .get("model.embed_tokens.weight")
+            .map(|t| {
+                let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
+                t.len().checked_div(hidden).unwrap_or(0)
             })
-        });
+            .or_else(|| {
+                f16_raw_tensors.get("model.embed_tokens.weight").map(|t| {
+                    let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
+                    (t.len() / 2).checked_div(hidden).unwrap_or(0)
+                })
+            })
+            .or_else(|| {
+                let hidden = get_usize_from_meta(&metadata, "embedding_length").unwrap_or(1);
+                mmap_ranges
+                    .get("model.embed_tokens.weight")
+                    .map(|&(_, len, dtype)| {
+                        let row_bytes =
+                            tensor_data_size(dtype, hidden as u64, &[hidden as u64]) as usize;
+                        len.checked_div(row_bytes).unwrap_or(0)
+                    })
+            });
 
         let mut config = extract_config(&metadata)?;
         if let Some(vs) = vocab_size_from_embed {
@@ -1524,8 +1558,8 @@ impl GgufLoader {
                 config.vocab_size = vs;
             }
         }
-        config.use_qk_norm = (0..config.num_layers).any(|l|
-            tensors.contains_key(&format!("model.layers.{l}.self_attn.q_norm.weight")));
+        config.use_qk_norm = (0..config.num_layers)
+            .any(|l| tensors.contains_key(&format!("model.layers.{l}.self_attn.q_norm.weight")));
 
         // Detect ternary/BitNet attention weights: if Q uses Q2_0/TQ2_0,
         // the converter did NOT permute Q/K → need NeoX RoPE even for qwen35.
@@ -1539,7 +1573,8 @@ impl GgufLoader {
         }
 
         {
-            let all_names: Vec<String> = tensors.keys()
+            let all_names: Vec<String> = tensors
+                .keys()
                 .chain(raw_tensors.keys())
                 .chain(f16_raw_tensors.keys())
                 .chain(mmap_ranges.keys())
@@ -1552,9 +1587,11 @@ impl GgufLoader {
             );
         }
 
-        if !tensors.contains_key("lm_head.weight") && !raw_tensors.contains_key("lm_head.weight")
+        if !tensors.contains_key("lm_head.weight")
+            && !raw_tensors.contains_key("lm_head.weight")
             && !f16_raw_tensors.contains_key("lm_head.weight")
-            && !mmap_ranges.contains_key("lm_head.weight") {
+            && !mmap_ranges.contains_key("lm_head.weight")
+        {
             if let Some(&(off, len, dtype)) = mmap_ranges.get("model.embed_tokens.weight") {
                 mmap_ranges.insert("lm_head.weight".into(), (off, len, dtype));
                 tensor_dtypes.insert("lm_head.weight".into(), dtype);
@@ -1725,8 +1762,8 @@ impl GgufLoader {
             }
         }
 
-        config.use_qk_norm = (0..config.num_layers).any(|l|
-            tensors.contains_key(&format!("model.layers.{l}.self_attn.q_norm.weight")));
+        config.use_qk_norm = (0..config.num_layers)
+            .any(|l| tensors.contains_key(&format!("model.layers.{l}.self_attn.q_norm.weight")));
 
         detect_and_apply_hybrid_layers(
             &mut config,
@@ -1768,17 +1805,23 @@ impl GgufLoader {
         for (name, data) in &self.f16_raw_tensors {
             f32_tensors.entry(name.clone()).or_insert_with(|| {
                 let count = data.len() / 2;
-                (0..count).map(|i| {
-                    let bits = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
-                    {
-                        let sign = ((bits >> 15) & 1) as u32;
-                        let exp = ((bits >> 10) & 0x1f) as u32;
-                        let frac = (bits & 0x3ff) as u32;
-                        if exp == 0 { f32::from_bits(sign << 31) }
-                        else if exp == 31 { f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13)) }
-                        else { f32::from_bits((sign << 31) | ((exp + 112) << 23) | (frac << 13)) }
-                    }
-                }).collect()
+                (0..count)
+                    .map(|i| {
+                        let bits = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+                        {
+                            let sign = ((bits >> 15) & 1) as u32;
+                            let exp = ((bits >> 10) & 0x1f) as u32;
+                            let frac = (bits & 0x3ff) as u32;
+                            if exp == 0 {
+                                f32::from_bits(sign << 31)
+                            } else if exp == 31 {
+                                f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13))
+                            } else {
+                                f32::from_bits((sign << 31) | ((exp + 112) << 23) | (frac << 13))
+                            }
+                        }
+                    })
+                    .collect()
             });
         }
 
@@ -1787,11 +1830,21 @@ impl GgufLoader {
         if let Some(mmap) = self.mmap {
             for (name, &(off, len, dtype)) in &self.mmap_ranges {
                 match dtype {
-                    GgmlType::TQ1_0 | GgmlType::TL1 => { qw.register_mmap_i2s(name.clone(), off, len); }
-                    GgmlType::F16 => { qw.register_mmap_f16(name.clone(), off, len); }
-                    GgmlType::Q4K => { qw.register_mmap_q4k(name.clone(), off, len); }
-                    GgmlType::Q6K => { qw.register_mmap_q6k(name.clone(), off, len); }
-                    GgmlType::Q2_0 => { qw.register_mmap_q2(name.clone(), off, len); }
+                    GgmlType::TQ1_0 | GgmlType::TL1 => {
+                        qw.register_mmap_i2s(name.clone(), off, len);
+                    }
+                    GgmlType::F16 => {
+                        qw.register_mmap_f16(name.clone(), off, len);
+                    }
+                    GgmlType::Q4K => {
+                        qw.register_mmap_q4k(name.clone(), off, len);
+                    }
+                    GgmlType::Q6K => {
+                        qw.register_mmap_q6k(name.clone(), off, len);
+                    }
+                    GgmlType::Q2_0 => {
+                        qw.register_mmap_q2(name.clone(), off, len);
+                    }
                     _ => {}
                 }
             }
@@ -1813,23 +1866,29 @@ impl GgufLoader {
                 }
             }
         }
-        if !i2s_shapes.is_empty() {
-            if std::env::var("TEMPURA_NO_TL2").is_err() {
-                qw.build_tl2_from_i2s(&i2s_shapes);
-            }
+        if !i2s_shapes.is_empty() && std::env::var("TEMPURA_NO_TL2").is_err() {
+            qw.build_tl2_from_i2s(&i2s_shapes);
         }
 
         if !q2_shapes.is_empty() {
             let t = std::time::Instant::now();
             qw.build_q2_lut_tiled(&q2_shapes);
-            eprintln!("[Q2_0] LUT tiled repack: {} tensors in {:.1}s", q2_shapes.len(), t.elapsed().as_secs_f64());
+            eprintln!(
+                "[Q2_0] LUT tiled repack: {} tensors in {:.1}s",
+                q2_shapes.len(),
+                t.elapsed().as_secs_f64()
+            );
         }
 
         qw
     }
 
-    pub fn raw_tensor_dims_count(&self) -> usize { self.raw_tensor_dims.len() }
-    pub fn mmap_ranges_count(&self) -> usize { self.mmap_ranges.len() }
+    pub fn raw_tensor_dims_count(&self) -> usize {
+        self.raw_tensor_dims.len()
+    }
+    pub fn mmap_ranges_count(&self) -> usize {
+        self.mmap_ranges.len()
+    }
 
     pub fn q2_tensor_shapes(&self) -> HashMap<String, (usize, usize)> {
         let mut shapes = HashMap::new();
@@ -1845,8 +1904,16 @@ impl GgufLoader {
             }
         }
         if q2_count > 0 && shapes.is_empty() {
-            eprintln!("[Q2_0] {} Q2_0 in mmap_ranges but 0 matches in raw_tensor_dims ({} entries)", q2_count, self.raw_tensor_dims.len());
-            if let Some(first_q2) = self.mmap_ranges.iter().find(|(_, &(_, _, d))| d == GgmlType::Q2_0) {
+            eprintln!(
+                "[Q2_0] {} Q2_0 in mmap_ranges but 0 matches in raw_tensor_dims ({} entries)",
+                q2_count,
+                self.raw_tensor_dims.len()
+            );
+            if let Some(first_q2) = self
+                .mmap_ranges
+                .iter()
+                .find(|(_, &(_, _, d))| d == GgmlType::Q2_0)
+            {
                 eprintln!("[Q2_0] Example mmap key: {:?}", first_q2.0);
             }
             if let Some(first_dim) = self.raw_tensor_dims.keys().next() {
@@ -2061,7 +2128,12 @@ mod tests {
         assert_eq!(block.len(), 34);
 
         let mut result = vec![0.0f32; 32];
-        tempura_kernels::ggml::dequantize::dequantize_row(&block, &mut result, tempura_kernels::ggml::GgmlType::Q8_0, 32);
+        tempura_kernels::ggml::dequantize::dequantize_row(
+            &block,
+            &mut result,
+            tempura_kernels::ggml::GgmlType::Q8_0,
+            32,
+        );
         assert_eq!(result.len(), 32);
         for i in 0..32 {
             assert!(
@@ -2077,13 +2149,16 @@ mod tests {
         let scale_bytes = 0x3C00u16.to_le_bytes();
         let mut block = Vec::new();
         block.extend_from_slice(&scale_bytes);
-        for _ in 0..16 {
-            block.push(0x00);
-        }
+        block.extend_from_slice(&[0x00; 16]);
         assert_eq!(block.len(), 18);
 
         let mut result = vec![0.0f32; 32];
-        tempura_kernels::ggml::dequantize::dequantize_row(&block, &mut result, tempura_kernels::ggml::GgmlType::Q4_0, 32);
+        tempura_kernels::ggml::dequantize::dequantize_row(
+            &block,
+            &mut result,
+            tempura_kernels::ggml::GgmlType::Q4_0,
+            32,
+        );
         assert_eq!(result.len(), 32);
         for i in 0..32 {
             assert!(
@@ -2154,7 +2229,7 @@ mod tests {
         }
 
         let pad = (GGUF_ALIGNMENT - (buf.len() % GGUF_ALIGNMENT)) % GGUF_ALIGNMENT;
-        buf.extend(std::iter::repeat(0u8).take(pad));
+        buf.extend(std::iter::repeat_n(0u8, pad));
 
         buf.extend_from_slice(tensor_data);
         buf
@@ -2218,7 +2293,12 @@ mod tests {
     fn test_dequant_q2k_zeros() {
         let block = vec![0u8; 84];
         let mut result = vec![0.0f32; 256];
-        tempura_kernels::ggml::dequantize::dequantize_row(&block, &mut result, tempura_kernels::ggml::GgmlType::Q2K, 256);
+        tempura_kernels::ggml::dequantize::dequantize_row(
+            &block,
+            &mut result,
+            tempura_kernels::ggml::GgmlType::Q2K,
+            256,
+        );
         assert_eq!(result.len(), 256);
         for v in &result {
             assert_eq!(*v, 0.0);
@@ -2235,7 +2315,12 @@ mod tests {
         block[16] = 0x01; // qs: first element q=1
 
         let mut result = vec![0.0f32; 256];
-        tempura_kernels::ggml::dequantize::dequantize_row(&block, &mut result, tempura_kernels::ggml::GgmlType::Q2K, 256);
+        tempura_kernels::ggml::dequantize::dequantize_row(
+            &block,
+            &mut result,
+            tempura_kernels::ggml::GgmlType::Q2K,
+            256,
+        );
         assert_eq!(result.len(), 256);
         assert!((result[0] - 2.0).abs() < 1e-3, "got {}", result[0]);
         assert!((result[1] - 0.0).abs() < 1e-3, "got {}", result[1]);
@@ -2245,7 +2330,12 @@ mod tests {
     fn test_dequant_q3k_zeros() {
         let block = vec![0u8; 110];
         let mut result = vec![0.0f32; 256];
-        tempura_kernels::ggml::dequantize::dequantize_row(&block, &mut result, tempura_kernels::ggml::GgmlType::Q3K, 256);
+        tempura_kernels::ggml::dequantize::dequantize_row(
+            &block,
+            &mut result,
+            tempura_kernels::ggml::GgmlType::Q3K,
+            256,
+        );
         assert_eq!(result.len(), 256);
         for v in &result {
             assert_eq!(*v, 0.0);
@@ -2259,7 +2349,12 @@ mod tests {
     fn test_dequant_q4k_zeros() {
         let block = vec![0u8; 144];
         let mut result = vec![0.0f32; 256];
-        tempura_kernels::ggml::dequantize::dequantize_row(&block, &mut result, tempura_kernels::ggml::GgmlType::Q4K, 256);
+        tempura_kernels::ggml::dequantize::dequantize_row(
+            &block,
+            &mut result,
+            tempura_kernels::ggml::GgmlType::Q4K,
+            256,
+        );
         assert_eq!(result.len(), 256);
         for v in &result {
             assert_eq!(*v, 0.0);
@@ -2276,7 +2371,12 @@ mod tests {
         block[16] = 0x52; // qs[0]: low nibble=2, high nibble=5
 
         let mut result = vec![0.0f32; 256];
-        tempura_kernels::ggml::dequantize::dequantize_row(&block, &mut result, tempura_kernels::ggml::GgmlType::Q4K, 256);
+        tempura_kernels::ggml::dequantize::dequantize_row(
+            &block,
+            &mut result,
+            tempura_kernels::ggml::GgmlType::Q4K,
+            256,
+        );
         assert_eq!(result.len(), 256);
         // ggml Q4_K layout: low nibbles → elements 0..31, high nibbles → elements 32..63
         // result[0] = d * sc[0] * (qs[0] & 0xF) = 1.0 * 3 * 2 = 6.0
@@ -2293,7 +2393,12 @@ mod tests {
     fn test_dequant_q5_1_zeros() {
         let block = vec![0u8; 24];
         let mut result = vec![0.0f32; 32];
-        tempura_kernels::ggml::dequantize::dequantize_row(&block, &mut result, tempura_kernels::ggml::GgmlType::Q5_1, 32);
+        tempura_kernels::ggml::dequantize::dequantize_row(
+            &block,
+            &mut result,
+            tempura_kernels::ggml::GgmlType::Q5_1,
+            32,
+        );
         assert_eq!(result.len(), 32);
         for v in &result {
             assert_eq!(*v, 0.0);
@@ -2312,7 +2417,12 @@ mod tests {
         block[8] = 0x07; // low nibble = 7, high bit = 0 → q = 7
 
         let mut result = vec![0.0f32; 32];
-        tempura_kernels::ggml::dequantize::dequantize_row(&block, &mut result, tempura_kernels::ggml::GgmlType::Q5_1, 32);
+        tempura_kernels::ggml::dequantize::dequantize_row(
+            &block,
+            &mut result,
+            tempura_kernels::ggml::GgmlType::Q5_1,
+            32,
+        );
         assert_eq!(result.len(), 32);
         assert!((result[0] - 7.5).abs() < 1e-3, "got {}", result[0]);
     }
@@ -2350,7 +2460,10 @@ mod tests {
         let data = build_minimal_gguf(&metadata, &tensor_infos, &tensor_bytes);
         let loader = GgufLoader::from_bytes(&data).unwrap();
 
-        assert_eq!(loader.config.architecture, crate::config::Architecture::Gpt2);
+        assert_eq!(
+            loader.config.architecture,
+            crate::config::Architecture::Gpt2
+        );
         assert_eq!(loader.config.hidden_act, crate::config::HiddenAct::Gelu);
     }
 
@@ -2380,7 +2493,10 @@ mod tests {
         let data = build_minimal_gguf(&metadata, &tensor_infos, &tensor_bytes);
         let loader = GgufLoader::from_bytes(&data).unwrap();
 
-        assert_eq!(loader.config.architecture, crate::config::Architecture::Gemma);
+        assert_eq!(
+            loader.config.architecture,
+            crate::config::Architecture::Gemma
+        );
         assert_eq!(loader.config.hidden_act, crate::config::HiddenAct::GeGLU);
     }
 
@@ -2442,7 +2558,10 @@ mod tests {
         let data = build_minimal_gguf(&metadata, &tensor_infos, &tensor_bytes);
         let loader = GgufLoader::from_bytes(&data).unwrap();
 
-        assert_eq!(loader.config.architecture, crate::config::Architecture::Gemma);
+        assert_eq!(
+            loader.config.architecture,
+            crate::config::Architecture::Gemma
+        );
         assert!(loader.config.rmsnorm_offset);
         assert!(loader.config.embedding_scale);
         assert!(!loader.config.parallel_attn_ffn);
@@ -2472,7 +2591,10 @@ mod tests {
         let data = build_minimal_gguf(&metadata, &tensor_infos, &tensor_bytes);
         let loader = GgufLoader::from_bytes(&data).unwrap();
 
-        assert_eq!(loader.config.architecture, crate::config::Architecture::Llama);
+        assert_eq!(
+            loader.config.architecture,
+            crate::config::Architecture::Llama
+        );
         assert_eq!(loader.config.hidden_act, crate::config::HiddenAct::SiluGate);
     }
 }

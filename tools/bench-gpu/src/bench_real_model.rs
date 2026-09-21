@@ -54,8 +54,8 @@ fn main() {
     // --- Load GGUF ---
     println!("Loading GGUF (quantized path)…");
     let t0 = Instant::now();
-    let loader = GgufLoader::from_file_quantized(Path::new(&model_path))
-        .expect("failed to open GGUF file");
+    let loader =
+        GgufLoader::from_file_quantized(Path::new(&model_path)).expect("failed to open GGUF file");
     let config = loader.config.clone();
     println!("  Parsed in {:.2}s", t0.elapsed().as_secs_f64());
     println!(
@@ -86,7 +86,10 @@ fn main() {
     let probe_result = try_forward(&wrapper, &mut probe_session, &probe_tokens);
     if probe_result.is_none() {
         println!("  WARNING: forward pass failed (likely cuTile JIT requires power-of-2 tile");
-        println!("  dimensions but h={} is not power-of-2).", config.hidden_size);
+        println!(
+            "  dimensions but h={} is not power-of-2).",
+            config.hidden_size
+        );
         println!("  Timing data unavailable for this model shape.");
         println!("\n─── Weight Load Timing ───");
         println!("  Parse time:  {parse_elapsed:.2}s");
@@ -162,7 +165,13 @@ fn main() {
     println!("  llama.cpp ref:   209 tok/s decode (RTX 5090)");
 
     println!("\n─── Summary ───");
-    println!("  Prefill:  {pp_tok_s:.0} tok/s  (target: 7335 tok/s, gap: {:.1}×)", 7335.0 / pp_tok_s.max(1.0));
-    println!("  Decode:   {decode_tok_s:.0} tok/s  (target: 209 tok/s,  gap: {:.1}×)", 209.0 / decode_tok_s.max(1.0));
+    println!(
+        "  Prefill:  {pp_tok_s:.0} tok/s  (target: 7335 tok/s, gap: {:.1}×)",
+        7335.0 / pp_tok_s.max(1.0)
+    );
+    println!(
+        "  Decode:   {decode_tok_s:.0} tok/s  (target: 209 tok/s,  gap: {:.1}×)",
+        209.0 / decode_tok_s.max(1.0)
+    );
     println!("\nDone.");
 }

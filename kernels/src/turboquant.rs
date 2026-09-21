@@ -410,6 +410,7 @@ mod tests {
     fn test_constant_vector() {
         let pq = CpuPolarQuant::default_3bit();
         let head_dim = 8;
+        #[allow(clippy::approx_constant)]
         let data = vec![3.14; head_dim];
 
         let compressed = pq.compress(&data, head_dim).unwrap();

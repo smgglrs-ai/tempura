@@ -49,11 +49,7 @@ impl MoeRouter {
     /// from the router linear projection.
     ///
     /// Returns one `MoeRoutingResult` per token.
-    pub fn route(
-        &self,
-        router_logits: &[f32],
-        num_tokens: usize,
-    ) -> Result<Vec<MoeRoutingResult>> {
+    pub fn route(&self, router_logits: &[f32], num_tokens: usize) -> Result<Vec<MoeRoutingResult>> {
         if router_logits.len() != num_tokens * self.n_experts {
             return Err(crate::KernelError::DimensionMismatch {
                 expected: num_tokens * self.n_experts,
@@ -88,9 +84,7 @@ impl MoeRouter {
         let probs = match self.gating {
             GatingFunc::Softmax => softmax(logits),
             GatingFunc::Sigmoid => sigmoid_vec(logits),
-            GatingFunc::SoftmaxOnSelected => {
-                logits.to_vec()
-            }
+            GatingFunc::SoftmaxOnSelected => logits.to_vec(),
         };
 
         // Select top-k experts by probability/score
@@ -202,7 +196,10 @@ mod tests {
         let results = router.route(&logits, 1).unwrap();
         let r = &results[0];
         let sum: f32 = r.expert_weights.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "weights should sum to 1, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "weights should sum to 1, got {sum}"
+        );
     }
 
     #[test]
@@ -383,7 +380,10 @@ mod tests {
 
             let results = router.route(&logits[..n_experts], 1).unwrap();
             let sum: f32 = results[0].expert_weights.iter().sum();
-            assert!((sum - 1.0).abs() < 1e-4, "weights sum = {sum}, expected ~1.0");
+            assert!(
+                (sum - 1.0).abs() < 1e-4,
+                "weights sum = {sum}, expected ~1.0"
+            );
         }
 
         #[kani::proof]

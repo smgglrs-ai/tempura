@@ -21,7 +21,11 @@ pub fn gelu_quick(x: f32) -> f32 {
 /// ReLU activation: max(0, x)
 #[inline(always)]
 pub fn relu(x: f32) -> f32 {
-    if x > 0.0 { x } else { 0.0 }
+    if x > 0.0 {
+        x
+    } else {
+        0.0
+    }
 }
 
 /// Squared ReLU: relu(x)^2
@@ -134,9 +138,17 @@ mod tests {
     fn test_gelu_known_values() {
         assert!((gelu(0.0) - 0.0).abs() < 1e-6);
         // gelu(1.0) ≈ 0.8412
-        assert!((gelu(1.0) - 0.8412).abs() < 1e-3, "gelu(1.0) = {}", gelu(1.0));
+        assert!(
+            (gelu(1.0) - 0.8412).abs() < 1e-3,
+            "gelu(1.0) = {}",
+            gelu(1.0)
+        );
         // gelu(-1.0) ≈ -0.1588
-        assert!((gelu(-1.0) - (-0.1588)).abs() < 1e-3, "gelu(-1.0) = {}", gelu(-1.0));
+        assert!(
+            (gelu(-1.0) - (-0.1588)).abs() < 1e-3,
+            "gelu(-1.0) = {}",
+            gelu(-1.0)
+        );
         // large positive → ~x
         assert!((gelu(10.0) - 10.0).abs() < 1e-3);
         // large negative → ~0
@@ -148,10 +160,14 @@ mod tests {
         // Compare against the standard formula: 0.5*x*(1+tanh(sqrt(2/pi)*x*(1+0.044715*x*x)))
         let test_vals = [0.0f32, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0];
         for &x in &test_vals {
-            let reference = 0.5 * x * (1.0 + (SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x)).tanh());
+            let reference =
+                0.5 * x * (1.0 + (SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x)).tanh());
             let ours = gelu(x);
             let err = (ours - reference).abs();
-            assert!(err < 1e-5, "gelu({x}): ours={ours}, ref={reference}, err={err}");
+            assert!(
+                err < 1e-5,
+                "gelu({x}): ours={ours}, ref={reference}, err={err}"
+            );
         }
     }
 
@@ -161,7 +177,11 @@ mod tests {
         // gelu_quick(x) = x * sigmoid(1.702 * x)
         let x = 1.0f32;
         let reference = x * (1.0 / (1.0 + (-1.702f32 * x).exp()));
-        assert!((gelu_quick(x) - reference).abs() < 1e-4, "gelu_quick(1.0) = {}", gelu_quick(x));
+        assert!(
+            (gelu_quick(x) - reference).abs() < 1e-4,
+            "gelu_quick(1.0) = {}",
+            gelu_quick(x)
+        );
     }
 
     #[test]
@@ -171,7 +191,10 @@ mod tests {
             let reference = x * (1.0 / (1.0 + (GELU_QUICK_COEF * x).exp()));
             let ours = gelu_quick(x);
             let err = (ours - reference).abs();
-            assert!(err < 1e-4, "gelu_quick({x}): ours={ours}, ref={reference}, err={err}");
+            assert!(
+                err < 1e-4,
+                "gelu_quick({x}): ours={ours}, ref={reference}, err={err}"
+            );
         }
     }
 
@@ -223,7 +246,10 @@ mod tests {
             let reference = x.tanh();
             let ours = portable_tanh(x);
             let err = (ours - reference).abs();
-            assert!(err < 1e-5, "tanh({x}): ours={ours}, ref={reference}, err={err}");
+            assert!(
+                err < 1e-5,
+                "tanh({x}): ours={ours}, ref={reference}, err={err}"
+            );
         }
     }
 

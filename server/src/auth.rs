@@ -25,11 +25,7 @@ pub async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(str::trim)
-        .or_else(|| {
-            req.headers()
-                .get("x-api-key")
-                .and_then(|v| v.to_str().ok())
-        });
+        .or_else(|| req.headers().get("x-api-key").and_then(|v| v.to_str().ok()));
 
     if provided == Some(expected_key.as_str()) {
         Ok(next.run(req).await)

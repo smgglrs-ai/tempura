@@ -436,9 +436,19 @@ async fn chat_completions(
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
     };
 
-    let mut sampler_chain = build_sampler_chain(&req.mirostat, &req.mirostat_tau, &req.mirostat_eta,
-        &req.logit_bias, &req.dry_multiplier, &req.dry_base, &req.dry_allowed_length,
-        &req.min_p, &req.typical_p, &req.repeat_penalty, &req.penalty_last_n);
+    let mut sampler_chain = build_sampler_chain(
+        &req.mirostat,
+        &req.mirostat_tau,
+        &req.mirostat_eta,
+        &req.logit_bias,
+        &req.dry_multiplier,
+        &req.dry_base,
+        &req.dry_allowed_length,
+        &req.min_p,
+        &req.typical_p,
+        &req.repeat_penalty,
+        &req.penalty_last_n,
+    );
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
 
@@ -646,10 +656,11 @@ async fn chat_completions(
                     .decode(&generated)
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
                 let (text, mut finish_reason) = check_stop_sequences(&full_text, &stop_sequences);
-                if finish_reason == "length" && (generated.len() as u32) < req.max_tokens {
-                    if eos_token.map_or(false, |e| generated.last() == Some(&e)) {
-                        finish_reason = "stop";
-                    }
+                if finish_reason == "length"
+                    && (generated.len() as u32) < req.max_tokens
+                    && eos_token.is_some_and(|e| generated.last() == Some(&e))
+                {
+                    finish_reason = "stop";
                 }
                 total_completion_tokens += generated.len() as u32;
 
@@ -791,9 +802,19 @@ async fn completions(
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
     };
 
-    let _sampler_chain = build_sampler_chain(&req.mirostat, &req.mirostat_tau, &req.mirostat_eta,
-        &req.logit_bias, &req.dry_multiplier, &req.dry_base, &req.dry_allowed_length,
-        &req.min_p, &req.typical_p, &req.repeat_penalty, &req.penalty_last_n);
+    let _sampler_chain = build_sampler_chain(
+        &req.mirostat,
+        &req.mirostat_tau,
+        &req.mirostat_eta,
+        &req.logit_bias,
+        &req.dry_multiplier,
+        &req.dry_base,
+        &req.dry_allowed_length,
+        &req.min_p,
+        &req.typical_p,
+        &req.repeat_penalty,
+        &req.penalty_last_n,
+    );
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
 
@@ -1359,8 +1380,8 @@ fn build_sampler_chain(
     repeat_penalty: &Option<f32>,
     penalty_last_n: &Option<usize>,
 ) -> tempura_kernels::sampler_chain::SamplerChain {
-    use tempura_kernels::sampler_chain::*;
     use tempura_kernels::sampler_advanced::*;
+    use tempura_kernels::sampler_chain::*;
 
     let mut chain = SamplerChain::new();
 
@@ -1589,7 +1610,7 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    fn test_state(with_tokenizer: bool) -> AppState {
+    fn test_state(_with_tokenizer: bool) -> AppState {
         let config = tempura_engine::ModelConfig::tiny_test();
         let pipeline = tempura_engine::pipeline::KernelPipeline::cpu_verified();
         let model = tempura_engine::TransformerModel::new(config, pipeline);
@@ -1605,7 +1626,7 @@ mod tests {
             tokio::sync::mpsc::channel::<crate::engine_task::EngineRequest>(4);
         AppState {
             model: std::sync::Arc::new(model),
-            tokenizer: if with_tokenizer { None } else { None },
+            tokenizer: None, // tests don't load a real tokenizer
             model_id: "test".to_string(),
             scheduler: std::sync::Arc::new(tokio::sync::Mutex::new(
                 crate::batch::BatchScheduler::new(1, 128, 1),
@@ -1830,8 +1851,7 @@ mod tests {
     #[test]
     fn test_build_sampler_chain_empty_when_defaults() {
         let chain = build_sampler_chain(
-            &None, &None, &None, &None, &None, &None, &None,
-            &None, &None, &None, &None,
+            &None, &None, &None, &None, &None, &None, &None, &None, &None, &None, &None,
         );
         assert!(chain.is_empty());
     }
@@ -1839,8 +1859,17 @@ mod tests {
     #[test]
     fn test_build_sampler_chain_with_min_p() {
         let chain = build_sampler_chain(
-            &None, &None, &None, &None, &None, &None, &None,
-            &Some(0.05), &None, &None, &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &Some(0.05),
+            &None,
+            &None,
+            &None,
         );
         assert_eq!(chain.len(), 1);
     }
@@ -1848,8 +1877,17 @@ mod tests {
     #[test]
     fn test_build_sampler_chain_with_mirostat_v2() {
         let chain = build_sampler_chain(
-            &Some(2), &Some(5.0), &Some(0.1), &None, &None, &None, &None,
-            &None, &None, &None, &None,
+            &Some(2),
+            &Some(5.0),
+            &Some(0.1),
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
         );
         assert_eq!(chain.len(), 1);
     }
@@ -1860,10 +1898,17 @@ mod tests {
         biases.insert("42".to_string(), 1.5f32);
 
         let chain = build_sampler_chain(
-            &Some(2), &Some(5.0), &Some(0.1),
+            &Some(2),
+            &Some(5.0),
+            &Some(0.1),
             &Some(biases),
-            &Some(0.8), &Some(1.75), &Some(2),
-            &Some(0.05), &Some(0.9), &Some(1.1), &Some(64),
+            &Some(0.8),
+            &Some(1.75),
+            &Some(2),
+            &Some(0.05),
+            &Some(0.9),
+            &Some(1.1),
+            &Some(64),
         );
         assert_eq!(chain.len(), 6);
     }

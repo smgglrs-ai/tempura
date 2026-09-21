@@ -120,9 +120,24 @@ pub fn vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
         // unpack scales/mins from 12 bytes using ggml's bitmask approach
         let mut utmp = [0u32; 4];
         let scale_bytes: &[u8; 12] = &x[i].scales;
-        utmp[0] = u32::from_le_bytes([scale_bytes[0], scale_bytes[1], scale_bytes[2], scale_bytes[3]]);
-        utmp[1] = u32::from_le_bytes([scale_bytes[4], scale_bytes[5], scale_bytes[6], scale_bytes[7]]);
-        utmp[2] = u32::from_le_bytes([scale_bytes[8], scale_bytes[9], scale_bytes[10], scale_bytes[11]]);
+        utmp[0] = u32::from_le_bytes([
+            scale_bytes[0],
+            scale_bytes[1],
+            scale_bytes[2],
+            scale_bytes[3],
+        ]);
+        utmp[1] = u32::from_le_bytes([
+            scale_bytes[4],
+            scale_bytes[5],
+            scale_bytes[6],
+            scale_bytes[7],
+        ]);
+        utmp[2] = u32::from_le_bytes([
+            scale_bytes[8],
+            scale_bytes[9],
+            scale_bytes[10],
+            scale_bytes[11],
+        ]);
 
         utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
         let uaux = utmp[1] & KMASK1;
@@ -130,12 +145,18 @@ pub fn vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
         utmp[2] = uaux;
         utmp[0] &= KMASK1;
 
-        let scales = utmp[0].to_le_bytes()
-            .iter().chain(utmp[1].to_le_bytes().iter())
-            .copied().collect::<Vec<u8>>();
-        let mins = utmp[2].to_le_bytes()
-            .iter().chain(utmp[3].to_le_bytes().iter())
-            .copied().collect::<Vec<u8>>();
+        let scales = utmp[0]
+            .to_le_bytes()
+            .iter()
+            .chain(utmp[1].to_le_bytes().iter())
+            .copied()
+            .collect::<Vec<u8>>();
+        let mins = utmp[2]
+            .to_le_bytes()
+            .iter()
+            .chain(utmp[3].to_le_bytes().iter())
+            .copied()
+            .collect::<Vec<u8>>();
 
         // unpack Q4 nibbles to aux8
         let mut aux8 = [0i8; QK];
@@ -165,10 +186,8 @@ pub fn vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
         let mut aux32 = [0i32; 8];
         let mut a_idx = 0usize;
         let mut q8_idx = 0usize;
-        let mut is = 0usize;
-        for _j in 0..QK / 32 {
+        for (is, _j) in (0..QK / 32).enumerate() {
             let scale = scales[is] as i32;
-            is += 1;
             for l in 0..8 {
                 aux32[l] += scale * (q8[q8_idx + l] as i32 * aux8[a_idx + l] as i32);
             }
@@ -225,10 +244,16 @@ pub fn vec_dot_q6_k_q8_k(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -> f32 {
             let mut qh_off = 0usize;
             for _j in 0..QK / 128 {
                 for l in 0..32 {
-                    aux8[a_idx + l] = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i8 - 32;
-                    aux8[a_idx + 32 + l] = ((ql[ql_off + 32 + l] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
-                    aux8[a_idx + 64 + l] = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
-                    aux8[a_idx + 96 + l] = ((ql[ql_off + 32 + l] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
+                    aux8[a_idx + l] =
+                        ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
+                    aux8[a_idx + 32 + l] =
+                        ((ql[ql_off + 32 + l] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8
+                            - 32;
+                    aux8[a_idx + 64 + l] =
+                        ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
+                    aux8[a_idx + 96 + l] =
+                        ((ql[ql_off + 32 + l] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8
+                            - 32;
                 }
                 a_idx += 128;
                 ql_off += 64;
@@ -239,10 +264,8 @@ pub fn vec_dot_q6_k_q8_k(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -> f32 {
         let mut aux32 = [0i32; 8];
         let mut a_idx = 0usize;
         let mut q8_idx = 0usize;
-        let mut is = 0usize;
-        for _j in 0..QK / 16 {
+        for (is, _j) in (0..QK / 16).enumerate() {
             let scale = sc[is] as i32;
-            is += 1;
             for l in 0..8 {
                 aux32[l] += scale * (q8[q8_idx + l] as i32 * aux8[a_idx + l] as i32);
             }
@@ -286,7 +309,7 @@ pub fn vec_dot_q2_k_q8_k(n: usize, x: &[BlockQ2K], y: &[BlockQ8K]) -> f32 {
         let mut q_idx = 0usize;
         for j in 0..QK / 16 {
             let sc = (x[i].scales[j] & 0xF) as i32;
-            for l in 0..16 {
+            for _l in 0..16 {
                 let byte_idx = q_idx / 4;
                 let shift = (q_idx % 4) * 2;
                 let q = ((x[i].qs[byte_idx] >> shift) & 3) as i32;
@@ -375,8 +398,18 @@ pub fn vec_dot_q5_k_q8_k(n: usize, x: &[BlockQ5K], y: &[BlockQ8K]) -> f32 {
         utmp[2] = uaux;
         utmp[0] &= KMASK1;
 
-        let scales_bytes: Vec<u8> = utmp[0].to_le_bytes().iter().chain(utmp[1].to_le_bytes().iter()).copied().collect();
-        let mins_bytes: Vec<u8> = utmp[2].to_le_bytes().iter().chain(utmp[3].to_le_bytes().iter()).copied().collect();
+        let scales_bytes: Vec<u8> = utmp[0]
+            .to_le_bytes()
+            .iter()
+            .chain(utmp[1].to_le_bytes().iter())
+            .copied()
+            .collect();
+        let mins_bytes: Vec<u8> = utmp[2]
+            .to_le_bytes()
+            .iter()
+            .chain(utmp[3].to_le_bytes().iter())
+            .copied()
+            .collect();
 
         let mut summs = 0i32;
         for j in 0..QK / 16 {
@@ -403,7 +436,11 @@ pub fn vec_dot_q5_k_q8_k(n: usize, x: &[BlockQ5K], y: &[BlockQ8K]) -> f32 {
                 let hbit_idx = byte_idx;
                 let hbit_byte = hbit_idx / 8;
                 let hbit_shift = hbit_idx % 8;
-                let hbit = if hbit_byte < qh.len() { ((qh[hbit_byte] >> hbit_shift) & 1) as i32 } else { 0 };
+                let hbit = if hbit_byte < qh.len() {
+                    ((qh[hbit_byte] >> hbit_shift) & 1) as i32
+                } else {
+                    0
+                };
                 let q = q_lo | (hbit << 4);
                 isum += sc0 * q * y[i].qs[q8_off + l] as i32;
             }
@@ -413,7 +450,11 @@ pub fn vec_dot_q5_k_q8_k(n: usize, x: &[BlockQ5K], y: &[BlockQ8K]) -> f32 {
                 let hbit_idx = byte_idx + 128; // high nibbles correspond to positions 128..255
                 let hbit_byte = hbit_idx / 8;
                 let hbit_shift = hbit_idx % 8;
-                let hbit = if hbit_byte < qh.len() { ((qh[hbit_byte] >> hbit_shift) & 1) as i32 } else { 0 };
+                let hbit = if hbit_byte < qh.len() {
+                    ((qh[hbit_byte] >> hbit_shift) & 1) as i32
+                } else {
+                    0
+                };
                 let q = q_hi | (hbit << 4);
                 isum += sc1 * q * y[i].qs[q8_off + 32 + l] as i32;
             }
@@ -459,7 +500,9 @@ pub fn vec_dot_tq1_0_q8_k(n: usize, x: &[BlockTQ1_0], y: &[BlockQ8K]) -> f32 {
         for j in 0..48 {
             let mut byte = x[i].qs[j] as u32;
             for _b in 0..5 {
-                if idx >= QK { break; }
+                if idx >= QK {
+                    break;
+                }
                 let trit = (byte % 3) as i32 - 1;
                 byte /= 3;
                 isum += trit * y[i].qs[idx] as i32;
@@ -469,7 +512,9 @@ pub fn vec_dot_tq1_0_q8_k(n: usize, x: &[BlockTQ1_0], y: &[BlockQ8K]) -> f32 {
         for j in 0..4 {
             let mut byte = x[i].qh[j] as u32;
             for _b in 0..4 {
-                if idx >= QK { break; }
+                if idx >= QK {
+                    break;
+                }
                 let trit = (byte % 3) as i32 - 1;
                 byte /= 3;
                 isum += trit * y[i].qs[idx] as i32;
@@ -495,7 +540,8 @@ pub fn vec_dot_iq4_nl_q8_0(n: usize, x: &[BlockIQ4NL], y: &[BlockQ8_0]) -> f32 {
         let mut sumi2 = 0i32;
         for j in 0..QK / 2 {
             sumi1 += y[ib].qs[j] as i32 * KVALUES_IQ4NL[(x[ib].qs[j] & 0xF) as usize] as i32;
-            sumi2 += y[ib].qs[j + QK / 2] as i32 * KVALUES_IQ4NL[(x[ib].qs[j] >> 4) as usize] as i32;
+            sumi2 +=
+                y[ib].qs[j + QK / 2] as i32 * KVALUES_IQ4NL[(x[ib].qs[j] >> 4) as usize] as i32;
         }
         sumf += d * (sumi1 + sumi2) as f32;
     }
@@ -511,13 +557,18 @@ pub fn vec_dot_mxfp4_q8_0(n: usize, x: &[BlockMxfp4], y: &[BlockQ8_0]) -> f32 {
     for ib in 0..nb {
         // E8M0 shared exponent → scale
         let e8m0 = x[ib].e;
-        let scale = if e8m0 == 0 { 0.0f32 } else { f32::from_bits((e8m0 as u32) << 23) };
+        let scale = if e8m0 == 0 {
+            0.0f32
+        } else {
+            f32::from_bits((e8m0 as u32) << 23)
+        };
         let d = f16_to_f32(y[ib].d) * scale * 0.5; // kvalues are doubled (int representation)
         let mut sumi1 = 0i32;
         let mut sumi2 = 0i32;
         for j in 0..QK / 2 {
             sumi1 += y[ib].qs[j] as i32 * KVALUES_MXFP4[(x[ib].qs[j] & 0xF) as usize] as i32;
-            sumi2 += y[ib].qs[j + QK / 2] as i32 * KVALUES_MXFP4[(x[ib].qs[j] >> 4) as usize] as i32;
+            sumi2 +=
+                y[ib].qs[j + QK / 2] as i32 * KVALUES_MXFP4[(x[ib].qs[j] >> 4) as usize] as i32;
         }
         sumf += d * (sumi1 + sumi2) as f32;
     }
@@ -542,8 +593,10 @@ pub fn vec_dot_nvfp4_q8_0(n: usize, x: &[BlockNvfp4], y: &[BlockQ8_0]) -> f32 {
             let mut sumi_hi = 0i32;
             for j in 0..SUB / 2 {
                 let qv = x[ib].qs[s_idx * (SUB / 2) + j];
-                sumi_lo += y[2 * ib + q8_block].qs[q8_off + j] as i32 * KVALUES_MXFP4[(qv & 0xF) as usize] as i32;
-                sumi_hi += y[2 * ib + q8_block].qs[q8_off + j + SUB / 2] as i32 * KVALUES_MXFP4[(qv >> 4) as usize] as i32;
+                sumi_lo += y[2 * ib + q8_block].qs[q8_off + j] as i32
+                    * KVALUES_MXFP4[(qv & 0xF) as usize] as i32;
+                sumi_hi += y[2 * ib + q8_block].qs[q8_off + j + SUB / 2] as i32
+                    * KVALUES_MXFP4[(qv >> 4) as usize] as i32;
             }
             sumf += dy * d_sub * (sumi_lo + sumi_hi) as f32;
         }
@@ -615,7 +668,11 @@ pub fn vec_dot_iq2_xxs_q8_k(n: usize, x: &[BlockIQ2XXS], y: &[BlockQ8K]) -> f32 
                 let grid = grid_u64_bytes(&IQ2XXS_GRID, aux8[l] as usize);
                 let sign_bits = KSIGNS_IQ2XS[((aux32_1 >> (7 * l as u32)) & 127) as usize];
                 for j in 0..8 {
-                    let sign = if sign_bits & KMASK_IQ2XS[j] != 0 { -1i32 } else { 1 };
+                    let sign = if sign_bits & KMASK_IQ2XS[j] != 0 {
+                        -1i32
+                    } else {
+                        1
+                    };
                     sumi += grid[j] as i32 * q8[q8_idx + j] as i32 * sign;
                 }
                 q8_idx += 8;
@@ -648,7 +705,11 @@ pub fn vec_dot_iq2_xs_q8_k(n: usize, x: &[BlockIQ2XS], y: &[BlockQ8K]) -> f32 {
                 let grid = grid_u64_bytes(&IQ2XS_GRID, (q2[ib32 * 4 + l] & 511) as usize);
                 let sign_bits = KSIGNS_IQ2XS[(q2[ib32 * 4 + l] >> 9) as usize];
                 for j in 0..8 {
-                    let sign = if sign_bits & KMASK_IQ2XS[j] != 0 { -1i32 } else { 1 };
+                    let sign = if sign_bits & KMASK_IQ2XS[j] != 0 {
+                        -1i32
+                    } else {
+                        1
+                    };
                     sumi += grid[j] as i32 * q8[q8_idx + j] as i32 * sign;
                 }
                 q8_idx += 8;
@@ -659,7 +720,11 @@ pub fn vec_dot_iq2_xs_q8_k(n: usize, x: &[BlockIQ2XS], y: &[BlockQ8K]) -> f32 {
                 let grid = grid_u64_bytes(&IQ2XS_GRID, (q2[ib32 * 4 + l] & 511) as usize);
                 let sign_bits = KSIGNS_IQ2XS[(q2[ib32 * 4 + l] >> 9) as usize];
                 for j in 0..8 {
-                    let sign = if sign_bits & KMASK_IQ2XS[j] != 0 { -1i32 } else { 1 };
+                    let sign = if sign_bits & KMASK_IQ2XS[j] != 0 {
+                        -1i32
+                    } else {
+                        1
+                    };
                     sumi += grid[j] as i32 * q8[q8_idx + j] as i32 * sign;
                 }
                 q8_idx += 8;
@@ -694,19 +759,29 @@ pub fn vec_dot_iq2_s_q8_k(n: usize, x: &[BlockIQ2S], y: &[BlockQ8K]) -> f32 {
             let mut sumi1 = 0i32;
             let mut sumi2 = 0i32;
             for l in 0..2usize {
-                let grid_idx = qs[qs_idx + l] as usize | ((qh[ib32] as usize) << (8 - 2 * l) & 0x300);
+                let grid_idx =
+                    qs[qs_idx + l] as usize | ((qh[ib32] as usize) << (8 - 2 * l) & 0x300);
                 let grid = grid_u64_bytes(&IQ2S_GRID, grid_idx);
                 for j in 0..8 {
-                    let sign = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 { -1i32 } else { 1 };
+                    let sign = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 {
+                        -1i32
+                    } else {
+                        1
+                    };
                     sumi1 += q8[q8_idx + j] as i32 * grid[j] as i32 * sign;
                 }
                 q8_idx += 8;
             }
             for l in 2..4usize {
-                let grid_idx = qs[qs_idx + l] as usize | ((qh[ib32] as usize) << (8 - 2 * l) & 0x300);
+                let grid_idx =
+                    qs[qs_idx + l] as usize | ((qh[ib32] as usize) << (8 - 2 * l) & 0x300);
                 let grid = grid_u64_bytes(&IQ2S_GRID, grid_idx);
                 for j in 0..8 {
-                    let sign = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 { -1i32 } else { 1 };
+                    let sign = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 {
+                        -1i32
+                    } else {
+                        1
+                    };
                     sumi2 += q8[q8_idx + j] as i32 * grid[j] as i32 * sign;
                 }
                 q8_idx += 8;
@@ -736,7 +811,12 @@ pub fn vec_dot_iq3_xxs_q8_k(n: usize, x: &[BlockIQ3XXS], y: &[BlockQ8K]) -> f32 
         let mut q3_idx = 0usize;
         let mut gas_idx = 0usize;
         for _ib32 in 0..QK / 32 {
-            let aux32 = u32::from_le_bytes([gas[gas_idx], gas[gas_idx + 1], gas[gas_idx + 2], gas[gas_idx + 3]]);
+            let aux32 = u32::from_le_bytes([
+                gas[gas_idx],
+                gas[gas_idx + 1],
+                gas[gas_idx + 2],
+                gas[gas_idx + 3],
+            ]);
             gas_idx += 4;
             let ls = (2 * (aux32 >> 28) + 1) as i32;
             let mut sumi = 0i32;
@@ -745,8 +825,16 @@ pub fn vec_dot_iq3_xxs_q8_k(n: usize, x: &[BlockIQ3XXS], y: &[BlockQ8K]) -> f32 
                 let grid2 = grid_u32_bytes(&IQ3XXS_GRID, q3[q3_idx + 2 * l + 1] as usize);
                 let sign_bits = KSIGNS_IQ2XS[((aux32 >> (7 * l as u32)) & 127) as usize];
                 for j in 0..4 {
-                    let sign1 = if sign_bits & KMASK_IQ2XS[j] != 0 { -1i32 } else { 1 };
-                    let sign2 = if sign_bits & KMASK_IQ2XS[j + 4] != 0 { -1i32 } else { 1 };
+                    let sign1 = if sign_bits & KMASK_IQ2XS[j] != 0 {
+                        -1i32
+                    } else {
+                        1
+                    };
+                    let sign2 = if sign_bits & KMASK_IQ2XS[j + 4] != 0 {
+                        -1i32
+                    } else {
+                        1
+                    };
                     sumi += grid1[j] as i32 * q8[q8_idx + j] as i32 * sign1;
                     sumi += grid2[j] as i32 * q8[q8_idx + j + 4] as i32 * sign2;
                 }
@@ -782,12 +870,21 @@ pub fn vec_dot_iq3_s_q8_k(n: usize, x: &[BlockIQ3S], y: &[BlockQ8K]) -> f32 {
             let mut sumi = 0i32;
             for l in 0..4 {
                 let idx1 = qs[qs_idx + 2 * l] as usize | ((qh[ib32] as usize) << (8 - 2 * l) & 256);
-                let idx2 = qs[qs_idx + 2 * l + 1] as usize | ((qh[ib32] as usize) << (7 - 2 * l) & 256);
+                let idx2 =
+                    qs[qs_idx + 2 * l + 1] as usize | ((qh[ib32] as usize) << (7 - 2 * l) & 256);
                 let grid1 = grid_u32_bytes(&IQ3S_GRID, idx1);
                 let grid2 = grid_u32_bytes(&IQ3S_GRID, idx2);
                 for j in 0..4 {
-                    let sign1 = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 { -1i32 } else { 1 };
-                    let sign2 = if signs[signs_idx + l] & KMASK_IQ2XS[j + 4] != 0 { -1i32 } else { 1 };
+                    let sign1 = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 {
+                        -1i32
+                    } else {
+                        1
+                    };
+                    let sign2 = if signs[signs_idx + l] & KMASK_IQ2XS[j + 4] != 0 {
+                        -1i32
+                    } else {
+                        1
+                    };
                     sumi += grid1[j] as i32 * q8[q8_idx + j] as i32 * sign1;
                     sumi += grid2[j] as i32 * q8[q8_idx + j + 4] as i32 * sign2;
                 }
@@ -798,13 +895,23 @@ pub fn vec_dot_iq3_s_q8_k(n: usize, x: &[BlockIQ3S], y: &[BlockQ8K]) -> f32 {
             bsum += sumi * ls1;
             sumi = 0;
             for l in 0..4 {
-                let idx1 = qs[qs_idx + 2 * l] as usize | ((qh[ib32 + 1] as usize) << (8 - 2 * l) & 256);
-                let idx2 = qs[qs_idx + 2 * l + 1] as usize | ((qh[ib32 + 1] as usize) << (7 - 2 * l) & 256);
+                let idx1 =
+                    qs[qs_idx + 2 * l] as usize | ((qh[ib32 + 1] as usize) << (8 - 2 * l) & 256);
+                let idx2 = qs[qs_idx + 2 * l + 1] as usize
+                    | ((qh[ib32 + 1] as usize) << (7 - 2 * l) & 256);
                 let grid1 = grid_u32_bytes(&IQ3S_GRID, idx1);
                 let grid2 = grid_u32_bytes(&IQ3S_GRID, idx2);
                 for j in 0..4 {
-                    let sign1 = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 { -1i32 } else { 1 };
-                    let sign2 = if signs[signs_idx + l] & KMASK_IQ2XS[j + 4] != 0 { -1i32 } else { 1 };
+                    let sign1 = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 {
+                        -1i32
+                    } else {
+                        1
+                    };
+                    let sign2 = if signs[signs_idx + l] & KMASK_IQ2XS[j + 4] != 0 {
+                        -1i32
+                    } else {
+                        1
+                    };
                     sumi += grid1[j] as i32 * q8[q8_idx + j] as i32 * sign1;
                     sumi += grid2[j] as i32 * q8[q8_idx + j + 4] as i32 * sign2;
                 }
@@ -838,7 +945,8 @@ pub fn vec_dot_iq1_s_q8_k(n: usize, x: &[BlockIQ1S], y: &[BlockQ8K]) -> f32 {
             let delta: i32 = if qh[ib] & 0x8000 != 0 { -1 } else { 1 };
             let mut lsum = 0i32;
             for l in 0..4 {
-                let grid_idx = qs[qs_idx + l] as usize | (((qh[ib] >> (3 * l as u16)) & 7) as usize) << 8;
+                let grid_idx =
+                    qs[qs_idx + l] as usize | (((qh[ib] >> (3 * l as u16)) & 7) as usize) << 8;
                 let grid = grid_u64_bytes(&IQ1S_GRID, grid_idx);
                 for j in 0..8 {
                     lsum += q8[q8_idx + j] as i32 * grid[j] as i8 as i32;
@@ -873,8 +981,10 @@ pub fn vec_dot_iq1_m_q8_k(n: usize, x: &[BlockIQ1M], y: &[BlockQ8K]) -> f32 {
             sc[4] as u16 | ((sc[5] as u16) << 8),
             sc[6] as u16 | ((sc[7] as u16) << 8),
         ];
-        let scale_bits = (sc16[0] >> 12) | ((sc16[1] >> 8) & 0x00F0)
-            | ((sc16[2] >> 4) & 0x0F00) | (sc16[3] & 0xF000);
+        let scale_bits = (sc16[0] >> 12)
+            | ((sc16[1] >> 8) & 0x00F0)
+            | ((sc16[2] >> 4) & 0x0F00)
+            | (sc16[3] & 0xF000);
         let scale_d = f16_to_f32(scale_bits);
 
         let mut sumi1 = 0i32;
@@ -941,8 +1051,10 @@ pub fn vec_dot_iq4_xs_q8_k(n: usize, x: &[BlockIQ4XS], y: &[BlockQ8K]) -> f32 {
             let mut sumi1 = 0i32;
             let mut sumi2 = 0i32;
             for j in 0..16 {
-                sumi1 += q8[q8_idx + j] as i32 * KVALUES_IQ4NL[(qs[qs_idx + j] & 0xF) as usize] as i32;
-                sumi2 += q8[q8_idx + j + 16] as i32 * KVALUES_IQ4NL[(qs[qs_idx + j] >> 4) as usize] as i32;
+                sumi1 +=
+                    q8[q8_idx + j] as i32 * KVALUES_IQ4NL[(qs[qs_idx + j] & 0xF) as usize] as i32;
+                sumi2 += q8[q8_idx + j + 16] as i32
+                    * KVALUES_IQ4NL[(qs[qs_idx + j] >> 4) as usize] as i32;
             }
             sumf += d1 * (sumi1 + sumi2) as f32;
             qs_idx += 16;
@@ -950,8 +1062,10 @@ pub fn vec_dot_iq4_xs_q8_k(n: usize, x: &[BlockIQ4XS], y: &[BlockQ8K]) -> f32 {
             sumi1 = 0;
             sumi2 = 0;
             for j in 0..16 {
-                sumi1 += q8[q8_idx + j] as i32 * KVALUES_IQ4NL[(qs[qs_idx + j] & 0xF) as usize] as i32;
-                sumi2 += q8[q8_idx + j + 16] as i32 * KVALUES_IQ4NL[(qs[qs_idx + j] >> 4) as usize] as i32;
+                sumi1 +=
+                    q8[q8_idx + j] as i32 * KVALUES_IQ4NL[(qs[qs_idx + j] & 0xF) as usize] as i32;
+                sumi2 += q8[q8_idx + j + 16] as i32
+                    * KVALUES_IQ4NL[(qs[qs_idx + j] >> 4) as usize] as i32;
             }
             sumf += d2 * (sumi1 + sumi2) as f32;
             qs_idx += 16;
@@ -1017,12 +1131,14 @@ pub fn vec_dot(n: usize, result: &mut f32, vx: &[u8], vy: &[u8], weight_type: su
             *result = vec_dot_q5_k_q8_k(n, x, y);
         }
         TQ2_0 => {
-            let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockTQ2_0, n / 256) };
+            let x =
+                unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockTQ2_0, n / 256) };
             let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256) };
             *result = vec_dot_tq2_0_q8_k(n, x, y);
         }
         TQ1_0 => {
-            let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockTQ1_0, n / 256) };
+            let x =
+                unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockTQ1_0, n / 256) };
             let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256) };
             *result = vec_dot_tq1_0_q8_k(n, x, y);
         }
@@ -1032,17 +1148,20 @@ pub fn vec_dot(n: usize, result: &mut f32, vx: &[u8], vy: &[u8], weight_type: su
             *result = vec_dot_iq4_nl_q8_0(n, x, y);
         }
         IQ4XS => {
-            let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockIQ4XS, n / 256) };
+            let x =
+                unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockIQ4XS, n / 256) };
             let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256) };
             *result = vec_dot_iq4_xs_q8_k(n, x, y);
         }
         IQ2XXS => {
-            let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockIQ2XXS, n / 256) };
+            let x =
+                unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockIQ2XXS, n / 256) };
             let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256) };
             *result = vec_dot_iq2_xxs_q8_k(n, x, y);
         }
         IQ2XS => {
-            let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockIQ2XS, n / 256) };
+            let x =
+                unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockIQ2XS, n / 256) };
             let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256) };
             *result = vec_dot_iq2_xs_q8_k(n, x, y);
         }
@@ -1052,7 +1171,8 @@ pub fn vec_dot(n: usize, result: &mut f32, vx: &[u8], vy: &[u8], weight_type: su
             *result = vec_dot_iq2_s_q8_k(n, x, y);
         }
         IQ3XXS => {
-            let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockIQ3XXS, n / 256) };
+            let x =
+                unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockIQ3XXS, n / 256) };
             let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256) };
             *result = vec_dot_iq3_xxs_q8_k(n, x, y);
         }
@@ -1092,10 +1212,10 @@ pub fn vec_dot(n: usize, result: &mut f32, vx: &[u8], vy: &[u8], weight_type: su
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::dequantize::{dequantize_row_q4_0, dequantize_row_q4_k, dequantize_row_q6_k};
     use super::super::helpers::f32_to_f16;
     use super::super::quantize::{quantize_row_q8_0, quantize_row_q8_k};
-    use super::super::dequantize::{dequantize_row_q4_k, dequantize_row_q6_k, dequantize_row_q4_0};
+    use super::*;
 
     fn f32_dot(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b).map(|(x, y)| x * y).sum()
@@ -1115,7 +1235,10 @@ mod tests {
             }
             s as f32 * d * d
         };
-        assert!((dot - expected).abs() < 0.001, "dot={dot}, expected={expected}");
+        assert!(
+            (dot - expected).abs() < 0.001,
+            "dot={dot}, expected={expected}"
+        );
     }
 
     #[test]
@@ -1140,7 +1263,10 @@ mod tests {
         } else {
             (q_dot - ref_dot).abs()
         };
-        assert!(rel_err < 0.05, "q_dot={q_dot}, ref_dot={ref_dot}, rel_err={rel_err}");
+        assert!(
+            rel_err < 0.05,
+            "q_dot={q_dot}, ref_dot={ref_dot}, rel_err={rel_err}"
+        );
     }
 
     #[test]
@@ -1150,7 +1276,7 @@ mod tests {
             d: f32_to_f16(1.0),
             dmin: f32_to_f16(0.0),
             scales: [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0], // scale=1 for first 4 groups, min=0
-            qs: [0x11; 128], // all nibbles = 1
+            qs: [0x11; 128],                              // all nibbles = 1
         };
         let mut w_f32 = [0.0f32; 256];
         dequantize_row_q4_k(&[w], &mut w_f32);
@@ -1174,7 +1300,10 @@ mod tests {
         } else {
             (q_dot - ref_dot).abs()
         };
-        assert!(rel_err < 0.1, "q_dot={q_dot}, ref_dot={ref_dot}, rel_err={rel_err}");
+        assert!(
+            rel_err < 0.1,
+            "q_dot={q_dot}, ref_dot={ref_dot}, rel_err={rel_err}"
+        );
     }
 
     #[test]
@@ -1207,7 +1336,10 @@ mod tests {
         } else {
             (q_dot - ref_dot).abs()
         };
-        assert!(rel_err < 0.1, "q_dot={q_dot}, ref_dot={ref_dot}, rel_err={rel_err}");
+        assert!(
+            rel_err < 0.1,
+            "q_dot={q_dot}, ref_dot={ref_dot}, rel_err={rel_err}"
+        );
     }
 
     #[test]
@@ -1265,11 +1397,19 @@ mod kani_proofs {
         utmp[0] &= KMASK1;
 
         // each byte in utmp[0..2] (scales) should be <= 63
-        for byte in utmp[0].to_le_bytes() { assert!(byte <= 63); }
-        for byte in utmp[2].to_le_bytes() { assert!(byte <= 63); }
+        for byte in utmp[0].to_le_bytes() {
+            assert!(byte <= 63);
+        }
+        for byte in utmp[2].to_le_bytes() {
+            assert!(byte <= 63);
+        }
         // each byte in utmp[1], utmp[3] (mins) should be <= 63
-        for byte in utmp[1].to_le_bytes() { assert!(byte <= 63); }
-        for byte in utmp[3].to_le_bytes() { assert!(byte <= 63); }
+        for byte in utmp[1].to_le_bytes() {
+            assert!(byte <= 63);
+        }
+        for byte in utmp[3].to_le_bytes() {
+            assert!(byte <= 63);
+        }
     }
 
     #[kani::proof]
@@ -1308,9 +1448,9 @@ mod kani_proofs {
         let mut sumi0 = 0i32;
         let mut sumi1 = 0i32;
         for j in 0..16 {
-            let v0 = (qs[j] & 0x0F) as i32 - 8;  // [-8, 7]
-            let v1 = (qs[j] >> 4) as i32 - 8;     // [-8, 7]
-            // max product: 8 * 128 = 1024, 16 terms: 16384
+            let v0 = (qs[j] & 0x0F) as i32 - 8; // [-8, 7]
+            let v1 = (qs[j] >> 4) as i32 - 8; // [-8, 7]
+                                              // max product: 8 * 128 = 1024, 16 terms: 16384
             sumi0 += v0 * y_qs[j] as i32;
             sumi1 += v1 * y_qs[j + 16] as i32;
         }

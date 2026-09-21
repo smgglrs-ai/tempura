@@ -267,6 +267,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn setup() -> (
         ModelConfig,
         Arc<

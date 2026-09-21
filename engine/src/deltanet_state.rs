@@ -28,9 +28,7 @@ impl DeltaNetState {
         let states = (0..num_deltanet_layers)
             .map(|_| vec![0.0f32; state_size])
             .collect();
-        let conv_states = (0..num_deltanet_layers)
-            .map(|_| Vec::new())
-            .collect();
+        let conv_states = (0..num_deltanet_layers).map(|_| Vec::new()).collect();
 
         Self {
             states,
@@ -55,7 +53,14 @@ impl DeltaNetState {
         &self.conv_states[deltanet_layer_idx]
     }
 
-    pub fn update_conv_state(&mut self, deltanet_layer_idx: usize, conv_dim: usize, kernel_size: usize, new_tokens: &[f32], seq_len: usize) {
+    pub fn update_conv_state(
+        &mut self,
+        deltanet_layer_idx: usize,
+        conv_dim: usize,
+        kernel_size: usize,
+        new_tokens: &[f32],
+        seq_len: usize,
+    ) {
         let history = kernel_size - 1;
         let needed = history * conv_dim;
         let buf = &mut self.conv_states[deltanet_layer_idx];
@@ -125,7 +130,10 @@ impl tempura_kernel_api::VerifiedDeltaNetState for DeltaNetState {
         self.states.len() == self.num_deltanet_layers
             && self.num_heads >= 1
             && self.head_dim >= 1
-            && self.states.iter().all(|s| s.len() == self.num_heads * self.head_dim * self.head_dim)
+            && self
+                .states
+                .iter()
+                .all(|s| s.len() == self.num_heads * self.head_dim * self.head_dim)
     }
 }
 
@@ -158,7 +166,9 @@ mod tests {
         let cfg = hybrid_test_config();
         let state = DeltaNetState::new(&cfg);
         assert_eq!(state.num_deltanet_layers(), 3);
-        assert!(tempura_kernel_api::VerifiedDeltaNetState::well_formed(&state));
+        assert!(tempura_kernel_api::VerifiedDeltaNetState::well_formed(
+            &state
+        ));
     }
 
     #[test]
@@ -174,12 +184,16 @@ mod tests {
     fn test_deltanet_state_transfer_roundtrip() {
         let cfg = hybrid_test_config();
         let mut state = DeltaNetState::new(&cfg);
-        state.state_mut(1)[0] = 3.14;
+        #[allow(clippy::approx_constant)]
+        let sentinel = 3.14f32;
+        state.state_mut(1)[0] = sentinel;
 
         let transfer = state.to_transfer();
         let restored = DeltaNetState::from_transfer(transfer);
-        assert_eq!(restored.state(1)[0], 3.14);
+        assert_eq!(restored.state(1)[0], sentinel);
         assert_eq!(restored.num_deltanet_layers(), 3);
-        assert!(tempura_kernel_api::VerifiedDeltaNetState::well_formed(&restored));
+        assert!(tempura_kernel_api::VerifiedDeltaNetState::well_formed(
+            &restored
+        ));
     }
 }

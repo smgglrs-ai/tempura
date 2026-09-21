@@ -11,10 +11,10 @@
 /// `get_kv_device` will also disappear).
 use std::sync::Arc;
 
+use cuda_core::Stream;
 use cutile::api;
 use cutile::prelude::DeviceOp;
 use cutile::tensor::Tensor;
-use cuda_core::Stream;
 use tempura_kernels::KernelError;
 
 use crate::config::ModelConfig;
@@ -43,8 +43,12 @@ impl CutileKvCache {
     pub fn new(config: &ModelConfig, stream: Arc<Stream>) -> Result<Self, KernelError> {
         let kv_dim = config.num_kv_heads * config.head_dim;
         let layer_size = config.max_seq_len * kv_dim;
-        let k_host = (0..config.num_layers).map(|_| vec![0.0f32; layer_size]).collect();
-        let v_host = (0..config.num_layers).map(|_| vec![0.0f32; layer_size]).collect();
+        let k_host = (0..config.num_layers)
+            .map(|_| vec![0.0f32; layer_size])
+            .collect();
+        let v_host = (0..config.num_layers)
+            .map(|_| vec![0.0f32; layer_size])
+            .collect();
         Ok(Self {
             k_host,
             v_host,
@@ -109,6 +113,7 @@ impl CutileKvCache {
     ///
     /// The returned tensors are flat 1-D tensors of length `kv_len * kv_dim`
     /// on the GPU — ready to pass to `CutileFlashAttention::forward_device`.
+    #[allow(clippy::type_complexity)]
     pub fn get_kv_device(
         &self,
         layer: usize,

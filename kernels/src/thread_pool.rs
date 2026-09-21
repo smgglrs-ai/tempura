@@ -2,7 +2,7 @@
 //! Workers sleep via Condvar when idle (zero CPU). Per-worker generation tracking
 //! prevents the stale-signal race that caused deadlocks in spin-wait variants.
 
-use std::sync::atomic::{AtomicUsize, Ordering, fence};
+use std::sync::atomic::{fence, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -25,7 +25,9 @@ impl SpinBarrier {
 
     #[inline]
     pub fn wait(&self) {
-        if self.n_threads <= 1 { return; }
+        if self.n_threads <= 1 {
+            return;
+        }
         let n_passed = self.n_barrier_passed.load(Ordering::Relaxed);
         let n = self.n_barrier.fetch_add(1, Ordering::SeqCst);
         if n == self.n_threads - 1 {
@@ -118,7 +120,9 @@ impl PersistentPool {
     pub fn new(n_threads: usize) -> Self {
         let n_workers = n_threads.saturating_sub(1);
         let mut wdg = Vec::with_capacity(n_workers);
-        for _ in 0..n_workers { wdg.push(CacheLine(AtomicUsize::new(0))); }
+        for _ in 0..n_workers {
+            wdg.push(CacheLine(AtomicUsize::new(0)));
+        }
 
         let shared = Arc::new(Shared {
             gen: Mutex::new(0),
@@ -138,13 +142,18 @@ impl PersistentPool {
         let mut threads = Vec::with_capacity(n_workers);
         for i in 0..n_workers {
             let sh = Arc::clone(&shared);
-            threads.push(thread::Builder::new()
-                .name(format!("pool-{i}"))
-                .spawn(move || worker_loop(&sh, i))
-                .unwrap());
+            threads.push(
+                thread::Builder::new()
+                    .name(format!("pool-{i}"))
+                    .spawn(move || worker_loop(&sh, i))
+                    .unwrap(),
+            );
         }
 
-        Self { shared, _threads: threads }
+        Self {
+            shared,
+            _threads: threads,
+        }
     }
 
     #[inline]
@@ -167,8 +176,13 @@ impl PersistentPool {
     }
 
     #[inline]
-    pub fn parallel_chunks<F: Fn(usize, usize) + Sync>(&self, total: usize, chunk_size: usize, f: &F) {
-        let n_chunks = (total + chunk_size - 1) / chunk_size;
+    pub fn parallel_chunks<F: Fn(usize, usize) + Sync>(
+        &self,
+        total: usize,
+        chunk_size: usize,
+        f: &F,
+    ) {
+        let n_chunks = total.div_ceil(chunk_size);
         if n_chunks <= 1 || self.shared.n_workers == 0 {
             f(0, total);
             return;
@@ -186,7 +200,10 @@ impl PersistentPool {
         sh.chunk_counter.store(0, Ordering::Relaxed);
 
         let gen = sh.gen_atomic.fetch_add(1, Ordering::AcqRel) + 1;
-        { let mut g = sh.gen.lock().unwrap(); *g = gen; }
+        {
+            let mut g = sh.gen.lock().unwrap();
+            *g = gen;
+        }
         sh.wake.notify_all();
 
         steal_chunks(sh);
@@ -208,9 +225,14 @@ impl Drop for PersistentPool {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
         self.shared.gen_atomic.fetch_add(1, Ordering::Release);
-        { let mut g = self.shared.gen.lock().unwrap(); *g += 1; }
+        {
+            let mut g = self.shared.gen.lock().unwrap();
+            *g += 1;
+        }
         self.shared.wake.notify_all();
-        for t in self._threads.drain(..) { let _ = t.join(); }
+        for t in self._threads.drain(..) {
+            let _ = t.join();
+        }
     }
 }
 
@@ -224,7 +246,9 @@ fn steal_chunks(sh: &Shared) {
     let f: &dyn Fn(usize, usize) = unsafe { std::mem::transmute([data, vtable]) };
     loop {
         let c = sh.chunk_counter.fetch_add(1, Ordering::Relaxed);
-        if c >= n_chunks { break; }
+        if c >= n_chunks {
+            break;
+        }
         let start = c * chunk_size;
         let end = (start + chunk_size).min(total);
         f(start, end);
@@ -237,12 +261,16 @@ fn worker_loop(sh: &Shared, id: usize) {
         {
             let mut g = sh.gen.lock().unwrap();
             while *g == my_gen {
-                if sh.stop.load(Ordering::Relaxed) { return; }
+                if sh.stop.load(Ordering::Relaxed) {
+                    return;
+                }
                 g = sh.wake.wait(g).unwrap();
             }
             my_gen = *g;
         }
-        if sh.stop.load(Ordering::Relaxed) { return; }
+        if sh.stop.load(Ordering::Relaxed) {
+            return;
+        }
         steal_chunks(sh);
         sh.worker_done_gen[id].0.store(my_gen, Ordering::Release);
     }
@@ -253,8 +281,13 @@ static POOL: std::sync::OnceLock<PersistentPool> = std::sync::OnceLock::new();
 pub fn global_pool() -> &'static PersistentPool {
     POOL.get_or_init(|| {
         let n = std::env::var("TEMPURA_THREADS")
-            .ok().and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| thread::available_parallelism().map(|p| p.get()).unwrap_or(1));
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(1)
+            });
         PersistentPool::new(n)
     })
 }
@@ -272,19 +305,36 @@ pub fn parallel_compute<F: Fn(&ComputeParams) + Sync + Send>(n_threads: usize, f
     if n_threads <= 1 {
         let barrier = SpinBarrier::new(1);
         let chunk = AtomicUsize::new(0);
-        f(&ComputeParams { ith: 0, nth: 1, barrier: &barrier, current_chunk: &chunk });
+        f(&ComputeParams {
+            ith: 0,
+            nth: 1,
+            barrier: &barrier,
+            current_chunk: &chunk,
+        });
         return;
     }
     let barrier = SpinBarrier::new(n_threads);
     let current_chunk = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for t in 1..n_threads {
-            let br = &barrier; let cc = &current_chunk; let fr = &f;
+            let br = &barrier;
+            let cc = &current_chunk;
+            let fr = &f;
             s.spawn(move || {
-                fr(&ComputeParams { ith: t, nth: n_threads, barrier: br, current_chunk: cc });
+                fr(&ComputeParams {
+                    ith: t,
+                    nth: n_threads,
+                    barrier: br,
+                    current_chunk: cc,
+                });
             });
         }
-        f(&ComputeParams { ith: 0, nth: n_threads, barrier: &barrier, current_chunk: &current_chunk });
+        f(&ComputeParams {
+            ith: 0,
+            nth: n_threads,
+            barrier: &barrier,
+            current_chunk: &current_chunk,
+        });
     });
 }
 
@@ -297,8 +347,14 @@ mod tests {
         let b = SpinBarrier::new(4);
         let count = AtomicUsize::new(0);
         std::thread::scope(|s| {
-            for _ in 0..3 { s.spawn(|| { count.fetch_add(1, Ordering::Relaxed); b.wait(); }); }
-            count.fetch_add(1, Ordering::Relaxed); b.wait();
+            for _ in 0..3 {
+                s.spawn(|| {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    b.wait();
+                });
+            }
+            count.fetch_add(1, Ordering::Relaxed);
+            b.wait();
             assert_eq!(count.load(Ordering::Relaxed), 4);
         });
     }
@@ -309,9 +365,15 @@ mod tests {
         let data: Vec<i64> = (0..10000).collect();
         let total = AtomicUsize::new(0);
         pool.parallel_chunks(data.len(), 500, &|start, end| {
-            total.fetch_add(data[start..end].iter().sum::<i64>() as usize, Ordering::Relaxed);
+            total.fetch_add(
+                data[start..end].iter().sum::<i64>() as usize,
+                Ordering::Relaxed,
+            );
         });
-        assert_eq!(total.load(Ordering::Relaxed), (0i64..10000).sum::<i64>() as usize);
+        assert_eq!(
+            total.load(Ordering::Relaxed),
+            (0i64..10000).sum::<i64>() as usize
+        );
     }
 
     #[test]
@@ -319,7 +381,9 @@ mod tests {
         let pool = PersistentPool::new(4);
         for _ in 0..200 {
             let count = AtomicUsize::new(0);
-            pool.parallel_chunks(64, 8, &|_, _| { count.fetch_add(1, Ordering::Relaxed); });
+            pool.parallel_chunks(64, 8, &|_, _| {
+                count.fetch_add(1, Ordering::Relaxed);
+            });
             assert_eq!(count.load(Ordering::Relaxed), 8);
         }
     }
@@ -328,14 +392,18 @@ mod tests {
     fn test_pool_single() {
         let pool = PersistentPool::new(8);
         let r = AtomicUsize::new(0);
-        pool.parallel_chunks(1, 1, &|_, _| { r.store(42, Ordering::Relaxed); });
+        pool.parallel_chunks(1, 1, &|_, _| {
+            r.store(42, Ordering::Relaxed);
+        });
         assert_eq!(r.load(Ordering::Relaxed), 42);
     }
 
     #[test]
     fn test_global_pool() {
         let count = AtomicUsize::new(0);
-        global_pool().parallel_chunks(100, 10, &|_, _| { count.fetch_add(1, Ordering::Relaxed); });
+        global_pool().parallel_chunks(100, 10, &|_, _| {
+            count.fetch_add(1, Ordering::Relaxed);
+        });
         assert_eq!(count.load(Ordering::Relaxed), 10);
     }
 
@@ -344,7 +412,9 @@ mod tests {
         let pool = PersistentPool::new(4);
         let nth = pool.thread_count();
         assert_eq!(nth, 4);
-        let seen = (0..nth).map(|_| std::sync::atomic::AtomicBool::new(false)).collect::<Vec<_>>();
+        let seen = (0..nth)
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
+            .collect::<Vec<_>>();
         pool.run_indexed(&|ith, n| {
             assert_eq!(n, nth);
             assert!(ith < n);

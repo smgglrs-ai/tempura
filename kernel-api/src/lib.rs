@@ -26,20 +26,15 @@ pub enum VerificationTier {
 
 // ── AttentionMode ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AttentionMode {
+    #[default]
     Auto,
     NaiveF32,
     NaiveF16,
     FlashF32,
     FlashF16,
-}
-
-impl Default for AttentionMode {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl std::fmt::Display for AttentionMode {
@@ -533,9 +528,15 @@ pub trait VerifiedKvCache {
     fn max_seq_len(&self) -> usize;
     fn num_kv_heads(&self) -> usize;
     fn head_dim(&self) -> usize;
-    fn stride(&self) -> usize { self.num_kv_heads() * self.head_dim() }
-    fn layer_size(&self) -> usize { self.max_seq_len() * self.stride() }
-    fn remaining_capacity(&self) -> usize { self.max_seq_len() - self.seq_len() }
+    fn stride(&self) -> usize {
+        self.num_kv_heads() * self.head_dim()
+    }
+    fn layer_size(&self) -> usize {
+        self.max_seq_len() * self.stride()
+    }
+    fn remaining_capacity(&self) -> usize {
+        self.max_seq_len() - self.seq_len()
+    }
 
     fn well_formed(&self) -> bool {
         self.seq_len() <= self.max_seq_len()
@@ -548,7 +549,9 @@ pub trait VerifiedKvCache {
 pub trait VerifiedPageAllocator {
     fn available(&self) -> usize;
     fn total(&self) -> usize;
-    fn in_use(&self) -> usize { self.total() - self.available() }
+    fn in_use(&self) -> usize {
+        self.total() - self.available()
+    }
 
     fn well_formed(&self) -> bool {
         self.available() <= self.total()
@@ -574,8 +577,7 @@ pub trait VerifiedSession {
     fn max_seq_len(&self) -> usize;
 
     fn consistent(&self) -> bool {
-        self.position() == self.cache_seq_len()
-            && self.position() <= self.max_seq_len()
+        self.position() == self.cache_seq_len() && self.position() <= self.max_seq_len()
     }
 }
 

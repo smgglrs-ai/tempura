@@ -57,8 +57,10 @@ pub unsafe fn vec_dot_q4_0_q8_0_avx2(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0])
         let hi = _mm256_sub_epi16(hi, off);
 
         // load q8
-        let by_lo = _mm256_cvtepi8_epi16(_mm_loadu_si128(y[ib].qs[..16].as_ptr() as *const __m128i));
-        let by_hi = _mm256_cvtepi8_epi16(_mm_loadu_si128(y[ib].qs[16..].as_ptr() as *const __m128i));
+        let by_lo =
+            _mm256_cvtepi8_epi16(_mm_loadu_si128(y[ib].qs[..16].as_ptr() as *const __m128i));
+        let by_hi =
+            _mm256_cvtepi8_epi16(_mm_loadu_si128(y[ib].qs[16..].as_ptr() as *const __m128i));
 
         // multiply and horizontal add: i16×i16 → i32
         let dot_lo = _mm256_madd_epi16(lo, by_lo);
@@ -109,14 +111,38 @@ pub unsafe fn vec_dot_q8_0_q8_0_avx2(n: usize, x: &[BlockQ8_0], y: &[BlockQ8_0])
 // value to all 16 positions in the __m256i where that scale's Q4 values live.
 #[cfg(target_arch = "x86_64")]
 static K_SHUFFLE_Q4K: [[u8; 32]; 8] = [
-    [ 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
-    [ 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3],
-    [ 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5],
-    [ 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7],
-    [ 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9],
-    [10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11],
-    [12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13],
-    [14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15],
+    [
+        0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+        0, 1,
+    ],
+    [
+        2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+        2, 3,
+    ],
+    [
+        4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5,
+        4, 5,
+    ],
+    [
+        6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7,
+        6, 7,
+    ],
+    [
+        8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9,
+        8, 9,
+    ],
+    [
+        10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10,
+        11, 10, 11, 10, 11, 10, 11, 10, 11,
+    ],
+    [
+        12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12,
+        13, 12, 13, 12, 13, 12, 13, 12, 13,
+    ],
+    [
+        14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14,
+        15, 14, 15, 14, 15, 14, 15, 14, 15,
+    ],
 ];
 
 #[cfg(target_arch = "x86_64")]
@@ -147,7 +173,10 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx2(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
 
         // mins_and_scales: 8 scales (i16) in low 128 bits, 8 mins (i16) in high 128 bits
         let mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(
-            utmp[3] as i32, utmp[2] as i32, utmp[1] as i32, utmp[0] as i32,
+            utmp[3] as i32,
+            utmp[2] as i32,
+            utmp[1] as i32,
+            utmp[0] as i32,
         ));
 
         // mins accumulation: hadd bsums pairs, madd with mins, fmadd into acc_m
@@ -228,10 +257,13 @@ pub unsafe fn vec_dot_q6_k_q8_k_avx2(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -
         let mut qh_off = 0usize;
         for _half in 0..2 {
             for l in 0..32 {
-                aux8[a_idx + l] = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i8 - 32;
-                aux8[a_idx + 32 + l] = ((ql[ql_off + 32 + l] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
-                aux8[a_idx + 64 + l] = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
-                aux8[a_idx + 96 + l] = ((ql[ql_off + 32 + l] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
+                aux8[a_idx + l] = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
+                aux8[a_idx + 32 + l] =
+                    ((ql[ql_off + 32 + l] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i8 - 32;
+                aux8[a_idx + 64 + l] =
+                    ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
+                aux8[a_idx + 96 + l] =
+                    ((ql[ql_off + 32 + l] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i8 - 32;
             }
             a_idx += 128;
             ql_off += 64;
@@ -478,7 +510,10 @@ pub unsafe fn vec_dot_q4_0_q8_0_vnni(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0])
         // expand 16 bytes of nibbles to 32 bytes
         let raw = _mm_loadu_si128(x[ib].qs.as_ptr() as *const __m128i);
         let lo = _mm256_and_si256(_mm256_cvtepu8_epi16(raw), _mm256_set1_epi16(0x0F));
-        let hi = _mm256_and_si256(_mm256_cvtepu8_epi16(_mm_srli_epi16(raw, 4)), _mm256_set1_epi16(0x0F));
+        let hi = _mm256_and_si256(
+            _mm256_cvtepu8_epi16(_mm_srli_epi16(raw, 4)),
+            _mm256_set1_epi16(0x0F),
+        );
 
         // pack back to bytes, subtract offset
         let packed = _mm256_packs_epi16(lo, hi);
@@ -533,7 +568,10 @@ pub fn vec_dot_q8_0_q8_0_dispatch(n: usize, x: &[BlockQ8_0], y: &[BlockQ8_0]) ->
 pub fn vec_dot_q4_k_q8_k_dispatch(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni")
+        {
             return unsafe { vec_dot_q4_k_q8_k_avx512(n, x, y) };
         }
         if is_x86_feature_detected!("avxvnni") {
@@ -556,14 +594,16 @@ pub fn vec_dot_q6_k_q8_k_dispatch(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -> f
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::helpers::f32_to_f16;
     use super::super::quantize::{quantize_row_q8_0, quantize_row_q8_k};
     use super::super::vec_dot;
+    use super::*;
 
     #[test]
     fn avx2_q4_0_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") { return; }
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
 
         let w = BlockQ4_0 {
             d: f32_to_f16(0.5),
@@ -582,7 +622,9 @@ mod tests {
 
     #[test]
     fn avx2_q8_0_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") { return; }
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
 
         let src: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) / 16.0).collect();
         let mut blocks = vec![BlockQ8_0 { d: 0, qs: [0; 32] }];
@@ -597,7 +639,9 @@ mod tests {
 
     #[test]
     fn avx2_q4k_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") { return; }
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
 
         let w = BlockQ4K {
             d: f32_to_f16(1.0),
@@ -606,13 +650,21 @@ mod tests {
             qs: [0x21; 128],
         };
         let act: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
-        let mut act_q8k = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        let mut act_q8k = vec![BlockQ8K {
+            d: 0.0,
+            qs: [0i8; 256],
+            bsums: [0i16; 16],
+        }];
         quantize_row_q8_k(&act, &mut act_q8k);
 
         let scalar = vec_dot::vec_dot_q4_k_q8_k(256, &[w], &act_q8k);
         let avx2 = unsafe { vec_dot_q4_k_q8_k_avx2(256, &[w], &act_q8k) };
 
-        let rel = if scalar.abs() > 0.01 { ((scalar - avx2) / scalar).abs() } else { (scalar - avx2).abs() };
+        let rel = if scalar.abs() > 0.01 {
+            ((scalar - avx2) / scalar).abs()
+        } else {
+            (scalar - avx2).abs()
+        };
         assert!(rel < 0.05, "scalar={scalar}, avx2={avx2}, rel_err={rel}");
     }
 
@@ -636,7 +688,11 @@ mod tests {
         dequantize_row_q4_k(&[blk], &mut w_f32);
 
         let act: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
-        let mut act_q8k = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        let mut act_q8k = vec![BlockQ8K {
+            d: 0.0,
+            qs: [0i8; 256],
+            bsums: [0i16; 16],
+        }];
         quantize_row_q8_k(&act, &mut act_q8k);
 
         // reconstruct f32 activations from Q8K
@@ -649,13 +705,19 @@ mod tests {
         let scalar_dot = vec_dot::vec_dot_q4_k_q8_k(256, &[blk], &act_q8k);
 
         eprintln!("ref_dot (dequant)={ref_dot}, scalar_dot={scalar_dot}");
-        let rel = if ref_dot.abs() > 0.01 { ((scalar_dot - ref_dot) / ref_dot).abs() } else { (scalar_dot - ref_dot).abs() };
+        let rel = if ref_dot.abs() > 0.01 {
+            ((scalar_dot - ref_dot) / ref_dot).abs()
+        } else {
+            (scalar_dot - ref_dot).abs()
+        };
         eprintln!("rel_err between scalar and dequant: {rel}");
     }
 
     #[test]
     fn avx2_q4k_multiblock_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") { return; }
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
 
         // Test per-block first to isolate the bug
         for b in 0..4u8 {
@@ -670,40 +732,68 @@ mod tests {
                 }),
             };
             let act: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
-            let mut act_q8k = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+            let mut act_q8k = vec![BlockQ8K {
+                d: 0.0,
+                qs: [0i8; 256],
+                bsums: [0i16; 16],
+            }];
             super::super::quantize::quantize_row_q8_k(&act, &mut act_q8k);
 
             let scalar = super::super::vec_dot::vec_dot_q4_k_q8_k(256, &[blk], &act_q8k);
             let avx2 = unsafe { vec_dot_q4_k_q8_k_avx2(256, &[blk], &act_q8k) };
-            let rel = if scalar.abs() > 0.01 { ((scalar - avx2) / scalar).abs() } else { (scalar - avx2).abs() };
-            assert!(rel < 0.001, "block {b}: scalar={scalar}, avx2={avx2}, rel_err={rel}");
+            let rel = if scalar.abs() > 0.01 {
+                ((scalar - avx2) / scalar).abs()
+            } else {
+                (scalar - avx2).abs()
+            };
+            assert!(
+                rel < 0.001,
+                "block {b}: scalar={scalar}, avx2={avx2}, rel_err={rel}"
+            );
         }
 
         // Now multi-block
-        let blocks: Vec<BlockQ4K> = (0..4).map(|b| BlockQ4K {
-            d: f32_to_f16(0.1 + 0.02 * b as f32),
-            dmin: f32_to_f16(0.01 * b as f32),
-            scales: std::array::from_fn(|i| ((b as u8 + i as u8 * 3) & 63)),
-            qs: std::array::from_fn(|i| {
-                let lo = (b as u8).wrapping_add(i as u8) & 0x0F;
-                let hi = (b as u8).wrapping_add(i as u8).wrapping_mul(5) & 0x0F;
-                lo | (hi << 4)
-            }),
-        }).collect();
+        let blocks: Vec<BlockQ4K> = (0..4)
+            .map(|b| BlockQ4K {
+                d: f32_to_f16(0.1 + 0.02 * b as f32),
+                dmin: f32_to_f16(0.01 * b as f32),
+                scales: std::array::from_fn(|i| (b as u8 + i as u8 * 3) & 63),
+                qs: std::array::from_fn(|i| {
+                    let lo = (b as u8).wrapping_add(i as u8) & 0x0F;
+                    let hi = (b as u8).wrapping_add(i as u8).wrapping_mul(5) & 0x0F;
+                    lo | (hi << 4)
+                }),
+            })
+            .collect();
         let act: Vec<f32> = (0..1024).map(|i| (i as f32 - 512.0) / 512.0).collect();
-        let mut act_q8k: Vec<BlockQ8K> = (0..4).map(|_| BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }).collect();
+        let mut act_q8k: Vec<BlockQ8K> = (0..4)
+            .map(|_| BlockQ8K {
+                d: 0.0,
+                qs: [0i8; 256],
+                bsums: [0i16; 16],
+            })
+            .collect();
         super::super::quantize::quantize_row_q8_k(&act, &mut act_q8k);
 
         let scalar = super::super::vec_dot::vec_dot_q4_k_q8_k(1024, &blocks, &act_q8k);
         let avx2 = unsafe { vec_dot_q4_k_q8_k_avx2(1024, &blocks, &act_q8k) };
 
-        let rel = if scalar.abs() > 0.01 { ((scalar - avx2) / scalar).abs() } else { (scalar - avx2).abs() };
-        assert!(rel < 0.001, "multiblock: scalar={scalar}, avx2={avx2}, rel_err={rel}");
+        let rel = if scalar.abs() > 0.01 {
+            ((scalar - avx2) / scalar).abs()
+        } else {
+            (scalar - avx2).abs()
+        };
+        assert!(
+            rel < 0.001,
+            "multiblock: scalar={scalar}, avx2={avx2}, rel_err={rel}"
+        );
     }
 
     #[test]
     fn avx2_q6k_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") { return; }
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
 
         let w = BlockQ6K {
             ql: [0x11; 128],
@@ -712,19 +802,29 @@ mod tests {
             d: f32_to_f16(0.5),
         };
         let act: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
-        let mut act_q8k = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        let mut act_q8k = vec![BlockQ8K {
+            d: 0.0,
+            qs: [0i8; 256],
+            bsums: [0i16; 16],
+        }];
         quantize_row_q8_k(&act, &mut act_q8k);
 
         let scalar = vec_dot::vec_dot_q6_k_q8_k(256, &[w], &act_q8k);
         let avx2 = unsafe { vec_dot_q6_k_q8_k_avx2(256, &[w], &act_q8k) };
 
-        let rel = if scalar.abs() > 0.01 { ((scalar - avx2) / scalar).abs() } else { (scalar - avx2).abs() };
+        let rel = if scalar.abs() > 0.01 {
+            ((scalar - avx2) / scalar).abs()
+        } else {
+            (scalar - avx2).abs()
+        };
         assert!(rel < 0.05, "scalar={scalar}, avx2={avx2}, rel_err={rel}");
     }
 
     #[test]
     fn avx2_quantize_q8_0_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") { return; }
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
 
         let src: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) / 16.0).collect();
 
@@ -732,29 +832,53 @@ mod tests {
         quantize_row_q8_0(&src, &mut scalar_out);
 
         let mut avx2_out = vec![BlockQ8_0 { d: 0, qs: [0; 32] }];
-        unsafe { quantize_row_q8_0_avx2(&src, &mut avx2_out); }
+        unsafe {
+            quantize_row_q8_0_avx2(&src, &mut avx2_out);
+        }
 
         assert_eq!(scalar_out[0].d, avx2_out[0].d, "d mismatch");
         for j in 0..32 {
             let diff = (scalar_out[0].qs[j] as i32 - avx2_out[0].qs[j] as i32).abs();
-            assert!(diff <= 1, "qs[{j}]: scalar={}, avx2={}", scalar_out[0].qs[j], avx2_out[0].qs[j]);
+            assert!(
+                diff <= 1,
+                "qs[{j}]: scalar={}, avx2={}",
+                scalar_out[0].qs[j],
+                avx2_out[0].qs[j]
+            );
         }
     }
 
     #[test]
     fn avx2_quantize_q8_k_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") { return; }
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
 
         let src: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
 
-        let mut scalar_out = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        let mut scalar_out = vec![BlockQ8K {
+            d: 0.0,
+            qs: [0i8; 256],
+            bsums: [0i16; 16],
+        }];
         quantize_row_q8_k(&src, &mut scalar_out);
 
-        let mut avx2_out = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
-        unsafe { quantize_row_q8_k_avx2(&src, &mut avx2_out); }
+        let mut avx2_out = vec![BlockQ8K {
+            d: 0.0,
+            qs: [0i8; 256],
+            bsums: [0i16; 16],
+        }];
+        unsafe {
+            quantize_row_q8_k_avx2(&src, &mut avx2_out);
+        }
 
         let d_diff = (scalar_out[0].d - avx2_out[0].d).abs();
-        assert!(d_diff < 1e-6, "d mismatch: scalar={}, avx2={}", scalar_out[0].d, avx2_out[0].d);
+        assert!(
+            d_diff < 1e-6,
+            "d mismatch: scalar={}, avx2={}",
+            scalar_out[0].d,
+            avx2_out[0].d
+        );
 
         let mut max_qs_diff = 0i32;
         for j in 0..256 {
@@ -779,6 +903,9 @@ mod tests {
         let scalar_result = vec_dot::vec_dot_q8_0_q8_0(32, &blocks, &blocks);
 
         let diff = (dispatch_result - scalar_result).abs();
-        assert!(diff < 0.01, "dispatch={dispatch_result}, scalar={scalar_result}");
+        assert!(
+            diff < 0.01,
+            "dispatch={dispatch_result}, scalar={scalar_result}"
+        );
     }
 }

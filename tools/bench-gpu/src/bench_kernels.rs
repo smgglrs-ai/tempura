@@ -28,7 +28,8 @@ fn bench_matmul(gpu: &CutileMatMul, cpu: &CpuMatMul, m: usize, n: usize, k: usiz
     let mut c_cpu = vec![0.0f32; m * n];
     let cpu_start = Instant::now();
     for _ in 0..ITERS.min(10) {
-        cpu.forward_b_transposed(&a, &b, &mut c_cpu, m, n, k).unwrap();
+        cpu.forward_b_transposed(&a, &b, &mut c_cpu, m, n, k)
+            .unwrap();
     }
     let cpu_us = cpu_start.elapsed().as_micros() as f64 / ITERS.min(10) as f64;
 
@@ -101,19 +102,43 @@ fn bench_attention(
     let scale = 1.0 / (head_dim as f32).sqrt();
 
     for _ in 0..WARMUP {
-        gpu.forward(&q, &k, &v, &mut out, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale)
-            .unwrap();
+        gpu.forward(
+            &q,
+            &k,
+            &v,
+            &mut out,
+            batch,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .unwrap();
     }
 
     let start = Instant::now();
     for _ in 0..ITERS {
-        gpu.forward(&q, &k, &v, &mut out, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale)
-            .unwrap();
+        gpu.forward(
+            &q,
+            &k,
+            &v,
+            &mut out,
+            batch,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .unwrap();
     }
     let gpu_us = start.elapsed().as_micros() as f64 / ITERS as f64;
 
-    let flops = 4.0 * batch as f64 * seq_len as f64 * kv_len as f64
-        * num_heads as f64 * head_dim as f64;
+    let flops =
+        4.0 * batch as f64 * seq_len as f64 * kv_len as f64 * num_heads as f64 * head_dim as f64;
     let gpu_gflops = flops / (gpu_us * 1e3);
 
     println!(
@@ -123,7 +148,10 @@ fn bench_attention(
 }
 
 fn make_synthetic_q4k(n: usize, k: usize) -> Vec<u8> {
-    assert!(k % Q4K_BLOCK_SIZE == 0, "k must be divisible by Q4K_BLOCK_SIZE");
+    assert!(
+        k.is_multiple_of(Q4K_BLOCK_SIZE),
+        "k must be divisible by Q4K_BLOCK_SIZE"
+    );
     let blocks_per_row = k / Q4K_BLOCK_SIZE;
     let total_bytes = n * blocks_per_row * Q4K_BLOCK_BYTES;
     // Fill with a recognizable pattern; values don't need to be exact Q4K encoding
@@ -132,17 +160,21 @@ fn make_synthetic_q4k(n: usize, k: usize) -> Vec<u8> {
 }
 
 fn bench_q4k_gemv(gpu: &CutileQuantizedGemm, label: &str, m: usize, n: usize, k: usize) {
-    let a: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32 - 48.0) * 0.001).collect();
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 97) as f32 - 48.0) * 0.001)
+        .collect();
     let b_q4k = make_synthetic_q4k(n, k);
     let mut out = vec![0.0f32; m * n];
 
     for _ in 0..WARMUP {
-        gpu.forward_b_transposed_q4k(&a, &b_q4k, &mut out, m, n, k).unwrap();
+        gpu.forward_b_transposed_q4k(&a, &b_q4k, &mut out, m, n, k)
+            .unwrap();
     }
 
     let start = Instant::now();
     for _ in 0..ITERS {
-        gpu.forward_b_transposed_q4k(&a, &b_q4k, &mut out, m, n, k).unwrap();
+        gpu.forward_b_transposed_q4k(&a, &b_q4k, &mut out, m, n, k)
+            .unwrap();
     }
     let us = start.elapsed().as_micros() as f64 / ITERS as f64;
 
@@ -184,15 +216,15 @@ fn main() {
     println!();
 
     println!("─── Flash Attention (GQA, 32 heads / 8 kv heads, d=128) ───");
-    bench_attention(&gpu_attention, "decode s=1 kv=128",  1,   128,  32, 8, 128);
-    bench_attention(&gpu_attention, "decode s=1 kv=512",  1,   512,  32, 8, 128);
-    bench_attention(&gpu_attention, "decode s=1 kv=2048", 1,  2048,  32, 8, 128);
+    bench_attention(&gpu_attention, "decode s=1 kv=128", 1, 128, 32, 8, 128);
+    bench_attention(&gpu_attention, "decode s=1 kv=512", 1, 512, 32, 8, 128);
+    bench_attention(&gpu_attention, "decode s=1 kv=2048", 1, 2048, 32, 8, 128);
     bench_attention(&gpu_attention, "prefill s=128 kv=128", 128, 128, 32, 8, 128);
     bench_attention(&gpu_attention, "prefill s=512 kv=512", 512, 512, 32, 8, 128);
     println!();
 
     println!("─── Q4K Quantized GEMV (dequant-then-GEMM path) ───");
-    bench_q4k_gemv(&gpu_q4k, "h=4096 n=4096",  1, 4096,  4096);
+    bench_q4k_gemv(&gpu_q4k, "h=4096 n=4096", 1, 4096, 4096);
     bench_q4k_gemv(&gpu_q4k, "h=4096 n=11008", 1, 11008, 4096);
     bench_q4k_gemv(&gpu_q4k, "h=4096 n=32000", 1, 32000, 4096);
     println!();

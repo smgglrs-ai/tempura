@@ -65,7 +65,8 @@ impl
         use tempura_kernels::sampling::CpuSampler;
 
         KernelPipeline {
-            attention: CutileFlashAttention::new().expect("Failed to initialize CutileFlashAttention"),
+            attention: CutileFlashAttention::new()
+                .expect("Failed to initialize CutileFlashAttention"),
             rmsnorm: CutileRmsNorm::new().expect("Failed to initialize CutileRmsNorm"),
             rope: CutileRoPE::new().expect("Failed to initialize CutileRoPE"),
             matmul: CutileMatMul::new().expect("Failed to initialize CutileMatMul"),

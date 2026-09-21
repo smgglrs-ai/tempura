@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use cuda_core::{Device, Stream};
 use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
 use cutile::tensor::{IntoPartition, Reshape, Tensor};
-use cuda_core::{Device, Stream};
 
 use crate::{Attention, KernelError, Result, VerificationTier};
 
@@ -158,8 +158,7 @@ impl CutileFlashAttention {
 
     /// Initialize with a specific CUDA device ordinal.
     pub fn with_device(ordinal: usize) -> Result<Self> {
-        let device = Device::new(ordinal)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let device = Device::new(ordinal).map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         let stream = device
             .new_stream()
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
@@ -216,9 +215,8 @@ fn gather_kv_head(
     let mut buf = vec![0.0f32; kv_len_pad * head_dim_pad];
     for i in 0..kv_len {
         for d in 0..head_dim {
-            let src = (batch_idx * kv_len + i) * num_kv_heads * head_dim
-                + kv_head_idx * head_dim
-                + d;
+            let src =
+                (batch_idx * kv_len + i) * num_kv_heads * head_dim + kv_head_idx * head_dim + d;
             buf[i * head_dim_pad + d] = kv[src];
         }
     }
@@ -272,7 +270,7 @@ impl CutileFlashAttention {
         head_dim: usize,
         scale: f32,
     ) -> Result<Arc<Tensor<f32>>> {
-        if n_heads % n_kv_heads != 0 {
+        if !n_heads.is_multiple_of(n_kv_heads) {
             return Err(KernelError::InvalidConfig(format!(
                 "n_heads ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
             )));
@@ -314,13 +312,12 @@ impl CutileFlashAttention {
         )?;
 
         // Upload result back to device so the caller avoids a redundant download.
-        let out_tensor: Arc<Tensor<f32>> =
-            api::copy_host_vec_to_device(&Arc::new(output_host))
-                .sync_on(stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                .reshape(&[seq_len, n_heads * head_dim])
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                .into();
+        let out_tensor: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(output_host))
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .reshape(&[seq_len, n_heads * head_dim])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
 
         Ok(out_tensor)
     }
@@ -362,13 +359,22 @@ impl CutileFlashAttention {
         let expected_out = batch * seq_len * n_heads * head_dim;
 
         if q.len() != expected_q {
-            return Err(KernelError::DimensionMismatch { expected: expected_q, got: q.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: expected_q,
+                got: q.len(),
+            });
         }
         if k.len() != expected_kv {
-            return Err(KernelError::DimensionMismatch { expected: expected_kv, got: k.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: expected_kv,
+                got: k.len(),
+            });
         }
         if v.len() != expected_kv {
-            return Err(KernelError::DimensionMismatch { expected: expected_kv, got: v.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: expected_kv,
+                got: v.len(),
+            });
         }
         if output.len() != expected_out {
             return Err(KernelError::DimensionMismatch {
@@ -376,7 +382,7 @@ impl CutileFlashAttention {
                 got: output.len(),
             });
         }
-        if n_heads % n_kv_heads != 0 {
+        if !n_heads.is_multiple_of(n_kv_heads) {
             return Err(KernelError::InvalidConfig(format!(
                 "n_heads ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
             )));
@@ -401,21 +407,42 @@ impl CutileFlashAttention {
             let q_bufs: Vec<Vec<f32>> = (0..n_heads)
                 .map(|h| {
                     gather_q_head(
-                        q, batch_idx, h, seq_len, n_heads, head_dim, seq_len_pad, head_dim_pad,
+                        q,
+                        batch_idx,
+                        h,
+                        seq_len,
+                        n_heads,
+                        head_dim,
+                        seq_len_pad,
+                        head_dim_pad,
                     )
                 })
                 .collect();
             let k_bufs: Vec<Vec<f32>> = (0..n_kv_heads)
                 .map(|h| {
                     gather_kv_head(
-                        k, batch_idx, h, kv_len, n_kv_heads, head_dim, kv_len_pad, head_dim_pad,
+                        k,
+                        batch_idx,
+                        h,
+                        kv_len,
+                        n_kv_heads,
+                        head_dim,
+                        kv_len_pad,
+                        head_dim_pad,
                     )
                 })
                 .collect();
             let v_bufs: Vec<Vec<f32>> = (0..n_kv_heads)
                 .map(|h| {
                     gather_kv_head(
-                        v, batch_idx, h, kv_len, n_kv_heads, head_dim, kv_len_pad, head_dim_pad,
+                        v,
+                        batch_idx,
+                        h,
+                        kv_len,
+                        n_kv_heads,
+                        head_dim,
+                        kv_len_pad,
+                        head_dim_pad,
                     )
                 })
                 .collect();
@@ -426,39 +453,36 @@ impl CutileFlashAttention {
             // are fast (PCIe bandwidth, not compute-bound).
             let mut q_devs: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_heads);
             for buf in &q_bufs {
-                let dev: Arc<Tensor<f32>> =
-                    api::copy_host_vec_to_device(&Arc::new(buf.clone()))
-                        .sync_on(stream)
-                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                        .reshape(&[seq_len_pad, head_dim_pad])
-                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                        .into();
+                let dev: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(buf.clone()))
+                    .sync_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .reshape(&[seq_len_pad, head_dim_pad])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .into();
                 q_devs.push(dev);
             }
 
             // ── Phase 3: upload all K kv-head tensors ─────────────────────────
             let mut k_devs: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_kv_heads);
             for buf in &k_bufs {
-                let dev: Arc<Tensor<f32>> =
-                    api::copy_host_vec_to_device(&Arc::new(buf.clone()))
-                        .sync_on(stream)
-                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                        .reshape(&[kv_len_pad, head_dim_pad])
-                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                        .into();
+                let dev: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(buf.clone()))
+                    .sync_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .reshape(&[kv_len_pad, head_dim_pad])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .into();
                 k_devs.push(dev);
             }
 
             // ── Phase 4: upload all V kv-head tensors ─────────────────────────
             let mut v_devs: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_kv_heads);
             for buf in &v_bufs {
-                let dev: Arc<Tensor<f32>> =
-                    api::copy_host_vec_to_device(&Arc::new(buf.clone()))
-                        .sync_on(stream)
-                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                        .reshape(&[kv_len_pad, head_dim_pad])
-                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                        .into();
+                let dev: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(buf.clone()))
+                    .sync_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .reshape(&[kv_len_pad, head_dim_pad])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .into();
                 v_devs.push(dev);
             }
 
@@ -559,13 +583,22 @@ impl Attention for CutileFlashAttention {
         let expected_out = batch * seq_len * num_heads * head_dim;
 
         if q.len() != expected_q {
-            return Err(KernelError::DimensionMismatch { expected: expected_q, got: q.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: expected_q,
+                got: q.len(),
+            });
         }
         if k.len() != expected_kv {
-            return Err(KernelError::DimensionMismatch { expected: expected_kv, got: k.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: expected_kv,
+                got: k.len(),
+            });
         }
         if v.len() != expected_kv {
-            return Err(KernelError::DimensionMismatch { expected: expected_kv, got: v.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: expected_kv,
+                got: v.len(),
+            });
         }
         if output.len() != expected_out {
             return Err(KernelError::DimensionMismatch {
@@ -573,7 +606,7 @@ impl Attention for CutileFlashAttention {
                 got: output.len(),
             });
         }
-        if num_heads % num_kv_heads != 0 {
+        if !num_heads.is_multiple_of(num_kv_heads) {
             return Err(KernelError::InvalidConfig(format!(
                 "num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
             )));
@@ -707,7 +740,14 @@ mod tests {
     use super::*;
     use crate::attention::CpuAttention;
 
-    fn run_flash_attn_vs_cpu(batch: usize, seq: usize, kv: usize, nh: usize, nkv: usize, hd: usize) {
+    fn run_flash_attn_vs_cpu(
+        batch: usize,
+        seq: usize,
+        kv: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+    ) {
         let scale = 1.0 / (hd as f32).sqrt();
         let n = batch * seq * nh * hd;
         let nkv_total = batch * kv * nkv * hd;

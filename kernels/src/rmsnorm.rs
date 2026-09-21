@@ -158,14 +158,24 @@ impl CudaRMSNorm {
         let gpu = crate::gpu::GpuContext::new(0)?;
         let module = crate::gpu::rmsnorm_kernel::kernels::load(gpu.context())
             .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
-        Ok(Self { gpu, module, ss_cache: std::sync::Mutex::new(None), deterministic: false })
+        Ok(Self {
+            gpu,
+            module,
+            ss_cache: std::sync::Mutex::new(None),
+            deterministic: false,
+        })
     }
 
     pub fn with_context(ctx: std::sync::Arc<cuda_core::CudaContext>) -> Result<Self> {
         let gpu = crate::gpu::GpuContext::from_context(ctx);
         let module = crate::gpu::rmsnorm_kernel::kernels::load(gpu.context())
             .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
-        Ok(Self { gpu, module, ss_cache: std::sync::Mutex::new(None), deterministic: false })
+        Ok(Self {
+            gpu,
+            module,
+            ss_cache: std::sync::Mutex::new(None),
+            deterministic: false,
+        })
     }
 }
 
@@ -208,8 +218,13 @@ impl CudaRMSNorm {
                 .rmsnorm_apply(
                     &stream,
                     LaunchConfig::for_num_elems((num_tokens * hidden_size) as u32),
-                    x, weight, ss_dev, output,
-                    hidden_size as u32, 1, eps,
+                    x,
+                    weight,
+                    ss_dev,
+                    output,
+                    hidden_size as u32,
+                    1,
+                    eps,
                 )
                 .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
         } else {
@@ -238,8 +253,13 @@ impl CudaRMSNorm {
                 .rmsnorm_apply(
                     &stream,
                     LaunchConfig::for_num_elems((num_tokens * hidden_size) as u32),
-                    x, weight, ss_dev, output,
-                    hidden_size as u32, warp_size, eps,
+                    x,
+                    weight,
+                    ss_dev,
+                    output,
+                    hidden_size as u32,
+                    warp_size,
+                    eps,
                 )
                 .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
         }

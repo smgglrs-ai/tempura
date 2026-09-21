@@ -336,7 +336,7 @@ mod tests {
         scheduler.submit(make_request("r3", vec![3]));
         let admitted = scheduler.admit_new_requests();
 
-        assert!(admitted.len() >= 1, "r3 should be admitted via preemption");
+        assert!(!admitted.is_empty(), "r3 should be admitted via preemption");
         assert_eq!(
             scheduler.preempted_count(),
             1,

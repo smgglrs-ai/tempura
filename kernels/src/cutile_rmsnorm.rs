@@ -1,15 +1,17 @@
 use std::sync::Arc;
 
 fn next_pow2(x: usize) -> usize {
-    if x <= 1 { return 1; }
+    if x <= 1 {
+        return 1;
+    }
     1usize << (usize::BITS - (x - 1).leading_zeros()) as usize
 }
 
+use crate::{KernelError, RMSNorm, Result, VerificationTier};
+use cuda_core::{Device, Stream};
 use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
 use cutile::tensor::{IntoPartition, Reshape, Tensor};
-use cuda_core::{Device, Stream};
-use crate::{KernelError, RMSNorm, Result, VerificationTier};
 
 #[cutile::module]
 pub mod kernels {
@@ -77,8 +79,7 @@ impl CutileRmsNorm {
 
     /// Initialise with a specific CUDA device ordinal.
     pub fn with_device(ordinal: usize) -> Result<Self> {
-        let device = Device::new(ordinal)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let device = Device::new(ordinal).map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         let stream = device
             .new_stream()
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
@@ -150,11 +151,10 @@ impl CutileRmsNorm {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .partition([h_pad]);
 
-        let (out_t, _x, _w, _s) =
-            kernels::rmsnorm_apply(out_t, x_t, weight_dev.clone(), scale_t)
-                .generics(vec![h_pad.to_string()])
-                .sync_on(stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let (out_t, _x, _w, _s) = kernels::rmsnorm_apply(out_t, x_t, weight_dev.clone(), scale_t)
+            .generics(vec![h_pad.to_string()])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
         // Reshape flat output to [seq_len, h_pad] for direct use by projection GEMMs.
         let out_2d: Arc<Tensor<f32>> = out_t
@@ -197,9 +197,8 @@ impl RMSNorm for CutileRmsNorm {
         } else {
             let mut v = vec![0.0f32; num_tokens * h_pad];
             for t in 0..num_tokens {
-                v[t * h_pad..t * h_pad + hidden_size].copy_from_slice(
-                    &x[t * hidden_size..(t + 1) * hidden_size],
-                );
+                v[t * h_pad..t * h_pad + hidden_size]
+                    .copy_from_slice(&x[t * hidden_size..(t + 1) * hidden_size]);
             }
             v
         };

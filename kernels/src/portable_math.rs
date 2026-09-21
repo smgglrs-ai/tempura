@@ -3,14 +3,14 @@
 /// No FMA dependency: all operations are explicit add/multiply.
 #[inline(always)]
 pub fn portable_exp(x: f32) -> f32 {
-    const LN2_HI: f32 = 0.693145752;
-    const LN2_LO: f32 = 1.428606820e-6;
-    const LOG2E: f32 = 1.442695041;
+    const LN2_HI: f32 = 0.693_145_75;
+    const LN2_LO: f32 = 1.428_606_8e-6;
+    const LOG2E: f32 = std::f32::consts::LOG2_E;
     const P1: f32 = 1.0;
     const P2: f32 = 0.5;
-    const P3: f32 = 0.166666672;
+    const P3: f32 = 0.166_666_67;
     const P4: f32 = 0.041666653;
-    const P5: f32 = 0.008333360;
+    const P5: f32 = 0.008_333_36;
     const P6: f32 = 0.001388888;
 
     if x > 88.7 {
@@ -79,7 +79,10 @@ pub fn ggml_exp(x: f32) -> f32 {
     const P3: f32 = f32::from_bits(0x3d2b9f17); // 0x1.573e2ep-5
     const P4: f32 = f32::from_bits(0x3c072010); // 0x1.0e4020p-7
 
-    let j: f32 = P4.mul_add(b, P3).mul_add(u, P2.mul_add(b, P1)).mul_add(u, P0 * b);
+    let j: f32 = P4
+        .mul_add(b, P3)
+        .mul_add(u, P2.mul_add(b, P1))
+        .mul_add(u, P0 * b);
 
     if !overflow {
         // C: return fmadd(j, k, k)
@@ -118,7 +121,7 @@ pub fn portable_silu(x: f32) -> f32 {
 /// Snaps each 32-element block to a 255-level grid, absorbing sub-ULP differences.
 pub fn q8_snap(x: &mut [f32]) {
     const BLOCK: usize = 32;
-    let n_blocks = (x.len() + BLOCK - 1) / BLOCK;
+    let n_blocks = x.len().div_ceil(BLOCK);
     for blk in 0..n_blocks {
         let start = blk * BLOCK;
         let end = (start + BLOCK).min(x.len());
@@ -126,14 +129,16 @@ pub fn q8_snap(x: &mut [f32]) {
         let mut amax = 0.0f32;
         for i in start..end {
             let a = x[i].abs();
-            if a > amax { amax = a; }
+            if a > amax {
+                amax = a;
+            }
         }
 
         let scale = amax / 127.0;
         let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
 
         for i in start..end {
-            let q = (x[i] * inv).round().max(-128.0).min(127.0) as i8;
+            let q = (x[i] * inv).round().clamp(-128.0, 127.0) as i8;
             x[i] = q as f32 * scale;
         }
     }
@@ -145,7 +150,9 @@ mod tests {
 
     #[test]
     fn test_portable_exp_accuracy() {
-        let test_vals: [f32; 11] = [0.0, 1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 10.0, -10.0, 80.0, -80.0];
+        let test_vals: [f32; 11] = [
+            0.0, 1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 10.0, -10.0, 80.0, -80.0,
+        ];
         for &x in &test_vals {
             let reference = x.exp();
             let portable = portable_exp(x);
@@ -154,7 +161,10 @@ mod tests {
             } else {
                 (portable - reference).abs()
             };
-            assert!(rel_err < 1e-6, "exp({x}): portable={portable}, ref={reference}, rel_err={rel_err}");
+            assert!(
+                rel_err < 1e-6,
+                "exp({x}): portable={portable}, ref={reference}, rel_err={rel_err}"
+            );
         }
     }
 

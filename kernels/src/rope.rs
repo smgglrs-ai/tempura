@@ -122,7 +122,9 @@ pub fn rope_forward_f16(
 ) {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("f16c") {
-        unsafe { rope_forward_f16_f16c(x_f16, seq_len, num_heads, head_dim, positions, freq_base); }
+        unsafe {
+            rope_forward_f16_f16c(x_f16, seq_len, num_heads, head_dim, positions, freq_base);
+        }
         return;
     }
     rope_forward_f16_scalar(x_f16, seq_len, num_heads, head_dim, positions, freq_base);
@@ -131,8 +133,12 @@ pub fn rope_forward_f16(
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "f16c")]
 unsafe fn rope_forward_f16_f16c(
-    x_f16: &mut [u16], seq_len: usize, num_heads: usize,
-    head_dim: usize, positions: &[u32], freq_base: f32,
+    x_f16: &mut [u16],
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    positions: &[u32],
+    freq_base: f32,
 ) {
     use std::arch::x86_64::*;
     let theta_scale: f32 = freq_base.powf(-2.0 / head_dim as f32);
@@ -150,8 +156,12 @@ unsafe fn rope_forward_f16_f16c(
                 let x1 = _mm_cvtss_f32(_mm_cvtph_ps(h1));
                 let r0 = x0 * cos_theta - x1 * sin_theta;
                 let r1 = x0 * sin_theta + x1 * cos_theta;
-                x_f16[offset + i0] = _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(r0), _MM_FROUND_TO_NEAREST_INT), 0) as u16;
-                x_f16[offset + i0 + 1] = _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(r1), _MM_FROUND_TO_NEAREST_INT), 0) as u16;
+                x_f16[offset + i0] =
+                    _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(r0), _MM_FROUND_TO_NEAREST_INT), 0)
+                        as u16;
+                x_f16[offset + i0 + 1] =
+                    _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(r1), _MM_FROUND_TO_NEAREST_INT), 0)
+                        as u16;
             }
             theta *= theta_scale;
         }
@@ -160,8 +170,12 @@ unsafe fn rope_forward_f16_f16c(
 
 #[cfg(feature = "cpu")]
 fn rope_forward_f16_scalar(
-    x_f16: &mut [u16], seq_len: usize, num_heads: usize,
-    head_dim: usize, positions: &[u32], freq_base: f32,
+    x_f16: &mut [u16],
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    positions: &[u32],
+    freq_base: f32,
 ) {
     let theta_scale: f32 = freq_base.powf(-2.0 / head_dim as f32);
     for s in 0..seq_len {
@@ -232,9 +246,13 @@ fn f16_to_f32_hw(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1f) as u32;
     let frac = (bits & 0x3ff) as u32;
-    if exp == 0 { f32::from_bits(sign << 31) }
-    else if exp == 31 { f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13)) }
-    else { f32::from_bits((sign << 31) | ((exp + 112) << 23) | (frac << 13)) }
+    if exp == 0 {
+        f32::from_bits(sign << 31)
+    } else if exp == 31 {
+        f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13))
+    } else {
+        f32::from_bits((sign << 31) | ((exp + 112) << 23) | (frac << 13))
+    }
 }
 
 #[cfg(feature = "cpu")]
@@ -254,9 +272,13 @@ fn f32_to_f16_hw(v: f32) -> u16 {
     let sign = (bits >> 16) & 0x8000;
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let frac = (bits >> 13) & 0x3ff;
-    if exp <= 0 { sign as u16 }
-    else if exp >= 31 { (sign | 0x7c00) as u16 }
-    else { (sign | ((exp as u32) << 10) | frac) as u16 }
+    if exp <= 0 {
+        sign as u16
+    } else if exp >= 31 {
+        (sign | 0x7c00) as u16
+    } else {
+        (sign | ((exp as u32) << 10) | frac) as u16
+    }
 }
 
 #[cfg(feature = "cpu")]
@@ -268,7 +290,10 @@ pub struct CpuRoPETable {
 #[cfg(feature = "cpu")]
 impl CpuRoPETable {
     pub fn new(max_pos: usize, head_dim: usize, theta: f32) -> Self {
-        Self { table: build_cos_sin_table(max_pos, head_dim, theta), head_dim }
+        Self {
+            table: build_cos_sin_table(max_pos, head_dim, theta),
+            head_dim,
+        }
     }
 }
 
@@ -399,7 +424,7 @@ impl RoPE for CpuRoPEUnified {
     ) -> Result<()> {
         let n_dims = self.n_dims;
         debug_assert!(n_dims <= head_dim);
-        debug_assert!(n_dims % 2 == 0);
+        debug_assert!(n_dims.is_multiple_of(2));
 
         let theta_scale: f32 = freq_base.powf(-2.0 / n_dims as f32);
         let half_n = n_dims / 2;
@@ -424,10 +449,7 @@ impl RoPE for CpuRoPEUnified {
             let mut cos_cache = vec![0.0f32; half_n];
             let mut sin_cache = vec![0.0f32; half_n];
             for i in 0..half_n {
-                let ff = self
-                    .freq_factors
-                    .as_ref()
-                    .map_or(1.0, |ff| ff[i]);
+                let ff = self.freq_factors.as_ref().map_or(1.0, |ff| ff[i]);
                 let theta_extrap = theta / ff;
 
                 let (cos_val, sin_val) = if self.ext_factor != 0.0 {
@@ -546,14 +568,24 @@ impl CudaRoPE {
         let gpu = crate::gpu::GpuContext::new(0)?;
         let module = crate::gpu::rope_kernel::kernels::load(gpu.context())
             .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
-        Ok(Self { gpu, module, cos_sin_table_dev: std::sync::Mutex::new(None), deterministic: false })
+        Ok(Self {
+            gpu,
+            module,
+            cos_sin_table_dev: std::sync::Mutex::new(None),
+            deterministic: false,
+        })
     }
 
     pub fn with_context(ctx: std::sync::Arc<cuda_core::CudaContext>) -> Result<Self> {
         let gpu = crate::gpu::GpuContext::from_context(ctx);
         let module = crate::gpu::rope_kernel::kernels::load(gpu.context())
             .map_err(|e| crate::KernelError::InvalidConfig(e.to_string()))?;
-        Ok(Self { gpu, module, cos_sin_table_dev: std::sync::Mutex::new(None), deterministic: false })
+        Ok(Self {
+            gpu,
+            module,
+            cos_sin_table_dev: std::sync::Mutex::new(None),
+            deterministic: false,
+        })
     }
 
     pub fn upload_cos_sin_table(&self, table: &[f32]) -> crate::Result<()> {
@@ -693,7 +725,11 @@ impl CpuRoPEScaled {
         let inv_freq = (0..half)
             .map(|d| 1.0 / (theta.powf(2.0 * d as f32 / head_dim as f32) * factor))
             .collect();
-        Self { inv_freq, mode: RoPEMode::NeoX, attn_factor: 1.0 }
+        Self {
+            inv_freq,
+            mode: RoPEMode::NeoX,
+            attn_factor: 1.0,
+        }
     }
 
     pub fn new_ntk(factor: f32, head_dim: usize, theta: f32) -> Self {
@@ -702,7 +738,11 @@ impl CpuRoPEScaled {
         let inv_freq = (0..half)
             .map(|d| 1.0 / scaled_theta.powf(2.0 * d as f32 / head_dim as f32))
             .collect();
-        Self { inv_freq, mode: RoPEMode::NeoX, attn_factor: 1.0 }
+        Self {
+            inv_freq,
+            mode: RoPEMode::NeoX,
+            attn_factor: 1.0,
+        }
     }
 
     pub fn new_yarn(
@@ -717,13 +757,19 @@ impl CpuRoPEScaled {
         let half = head_dim / 2;
         let low = yarn_corr_dim(head_dim, original_ctx as usize, beta_fast, theta).floor();
         let high = yarn_corr_dim(head_dim, original_ctx as usize, beta_slow, theta).ceil();
-        let inv_freq = (0..half).map(|d| {
-            let base_inv = 1.0 / theta.powf(2.0 * d as f32 / head_dim as f32);
-            // ramp=1 → extrapolate (keep base freq), ramp=0 → interpolate (divide by factor)
-            let ramp = yarn_ramp(low, high, (d * 2) as i64);
-            base_inv / factor * (1.0 - ramp) + base_inv * ramp
-        }).collect();
-        Self { inv_freq, mode: RoPEMode::NeoX, attn_factor }
+        let inv_freq = (0..half)
+            .map(|d| {
+                let base_inv = 1.0 / theta.powf(2.0 * d as f32 / head_dim as f32);
+                // ramp=1 → extrapolate (keep base freq), ramp=0 → interpolate (divide by factor)
+                let ramp = yarn_ramp(low, high, (d * 2) as i64);
+                base_inv / factor * (1.0 - ramp) + base_inv * ramp
+            })
+            .collect();
+        Self {
+            inv_freq,
+            mode: RoPEMode::NeoX,
+            attn_factor,
+        }
     }
 
     /// LLaMA 3.1+ long-context scaling (used for 128K context window).
@@ -739,20 +785,26 @@ impl CpuRoPEScaled {
         let orig = original_ctx as f32;
         let low_freq_wavelen = orig / low_freq_factor;
         let high_freq_wavelen = orig / high_freq_factor;
-        let inv_freq = (0..half).map(|d| {
-            let freq = 1.0 / theta.powf(2.0 * d as f32 / head_dim as f32);
-            let wavelen = 2.0 * std::f32::consts::PI / freq;
-            if wavelen < high_freq_wavelen {
-                freq
-            } else if wavelen > low_freq_wavelen {
-                freq / factor
-            } else {
-                let smooth = (orig / wavelen - low_freq_factor)
-                    / (high_freq_factor - low_freq_factor);
-                freq / factor * (1.0 - smooth) + freq * smooth
-            }
-        }).collect();
-        Self { inv_freq, mode: RoPEMode::NeoX, attn_factor: 1.0 }
+        let inv_freq = (0..half)
+            .map(|d| {
+                let freq = 1.0 / theta.powf(2.0 * d as f32 / head_dim as f32);
+                let wavelen = 2.0 * std::f32::consts::PI / freq;
+                if wavelen < high_freq_wavelen {
+                    freq
+                } else if wavelen > low_freq_wavelen {
+                    freq / factor
+                } else {
+                    let smooth =
+                        (orig / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor);
+                    freq / factor * (1.0 - smooth) + freq * smooth
+                }
+            })
+            .collect();
+        Self {
+            inv_freq,
+            mode: RoPEMode::NeoX,
+            attn_factor: 1.0,
+        }
     }
 }
 
@@ -864,7 +916,15 @@ mod kani_proofs {
         let positions = [pos];
 
         let rope = super::CpuRoPEUnified::new(super::RoPEMode::Normal, n_dims);
-        let _ = rope.forward(&mut x[..n], 1, seq_len, num_heads, head_dim, &positions, 10000.0);
+        let _ = rope.forward(
+            &mut x[..n],
+            1,
+            seq_len,
+            num_heads,
+            head_dim,
+            &positions,
+            10000.0,
+        );
     }
 
     #[kani::proof]
@@ -1017,17 +1077,37 @@ mod tests {
         let positions: Vec<u32> = (0..seq_len as u32).collect();
 
         let mut x_ggml = x_orig.clone();
-        ggml.forward(&mut x_ggml, 1, seq_len, num_heads, head_dim, &positions, freq_base).unwrap();
+        ggml.forward(
+            &mut x_ggml,
+            1,
+            seq_len,
+            num_heads,
+            head_dim,
+            &positions,
+            freq_base,
+        )
+        .unwrap();
 
         let mut x_unified = x_orig.clone();
-        unified.forward(&mut x_unified, 1, seq_len, num_heads, head_dim, &positions, freq_base).unwrap();
+        unified
+            .forward(
+                &mut x_unified,
+                1,
+                seq_len,
+                num_heads,
+                head_dim,
+                &positions,
+                freq_base,
+            )
+            .unwrap();
 
         for i in 0..n {
             let diff = (x_ggml[i] - x_unified[i]).abs();
             assert!(
                 diff < 1e-5,
                 "Normal mode: unified vs ggml mismatch at {i}: ggml={}, unified={}, diff={diff}",
-                x_ggml[i], x_unified[i]
+                x_ggml[i],
+                x_unified[i]
             );
         }
     }
@@ -1046,17 +1126,37 @@ mod tests {
         let positions: Vec<u32> = (0..seq_len as u32).collect();
 
         let mut x_neox = x_orig.clone();
-        neox.forward(&mut x_neox, 1, seq_len, num_heads, head_dim, &positions, freq_base).unwrap();
+        neox.forward(
+            &mut x_neox,
+            1,
+            seq_len,
+            num_heads,
+            head_dim,
+            &positions,
+            freq_base,
+        )
+        .unwrap();
 
         let mut x_unified = x_orig.clone();
-        unified.forward(&mut x_unified, 1, seq_len, num_heads, head_dim, &positions, freq_base).unwrap();
+        unified
+            .forward(
+                &mut x_unified,
+                1,
+                seq_len,
+                num_heads,
+                head_dim,
+                &positions,
+                freq_base,
+            )
+            .unwrap();
 
         for i in 0..n {
             let diff = (x_neox[i] - x_unified[i]).abs();
             assert!(
                 diff < 1e-4,
                 "NeoX mode: unified vs CpuRoPE mismatch at {i}: neox={}, unified={}, diff={diff}",
-                x_neox[i], x_unified[i]
+                x_neox[i],
+                x_unified[i]
             );
         }
     }
@@ -1071,7 +1171,9 @@ mod tests {
         let mut x = original.clone();
         let positions = vec![3u32]; // non-zero position to actually rotate
 
-        unified.forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+        unified
+            .forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0)
+            .unwrap();
 
         // Dimensions n_dims..head_dim should be unchanged
         for i in n_dims..head_dim {
@@ -1084,7 +1186,10 @@ mod tests {
 
         // Rotated dimensions should differ (position != 0)
         let rotated_changed = (0..n_dims).any(|i| (x[i] - original[i]).abs() > 1e-6);
-        assert!(rotated_changed, "Rotated dimensions should change at non-zero position");
+        assert!(
+            rotated_changed,
+            "Rotated dimensions should change at non-zero position"
+        );
     }
 
     #[test]
@@ -1097,13 +1202,18 @@ mod tests {
         let mut x = original.clone();
         let positions = vec![5u32];
 
-        unified.forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+        unified
+            .forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0)
+            .unwrap();
 
         for i in n_dims..head_dim {
             assert_eq!(x[i], original[i], "Passthrough dim {i} modified");
         }
         let rotated_changed = (0..n_dims).any(|i| (x[i] - original[i]).abs() > 1e-6);
-        assert!(rotated_changed, "Rotated dimensions should change at non-zero position");
+        assert!(
+            rotated_changed,
+            "Rotated dimensions should change at non-zero position"
+        );
     }
 
     #[test]
@@ -1114,7 +1224,9 @@ mod tests {
             let original = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
             let mut x = original.clone();
 
-            unified.forward(&mut x, 1, 1, 1, head_dim, &[0], 10000.0).unwrap();
+            unified
+                .forward(&mut x, 1, 1, 1, head_dim, &[0], 10000.0)
+                .unwrap();
 
             for (i, (a, b)) in x.iter().zip(original.iter()).enumerate() {
                 assert!(
@@ -1132,7 +1244,9 @@ mod tests {
         let original = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let mut x = original.clone();
 
-        unified.forward(&mut x, 1, 1, 1, head_dim, &[0], 10000.0).unwrap();
+        unified
+            .forward(&mut x, 1, 1, 1, head_dim, &[0], 10000.0)
+            .unwrap();
 
         for (i, (a, b)) in x.iter().zip(original.iter()).enumerate() {
             assert!(
@@ -1159,10 +1273,29 @@ mod tests {
         let positions: Vec<u32> = (0..seq_len as u32).collect();
 
         let mut x_base = x_orig.clone();
-        base.forward(&mut x_base, 1, seq_len, num_heads, head_dim, &positions, freq_base).unwrap();
+        base.forward(
+            &mut x_base,
+            1,
+            seq_len,
+            num_heads,
+            head_dim,
+            &positions,
+            freq_base,
+        )
+        .unwrap();
 
         let mut x_none = x_orig.clone();
-        with_none.forward(&mut x_none, 1, seq_len, num_heads, head_dim, &positions, freq_base).unwrap();
+        with_none
+            .forward(
+                &mut x_none,
+                1,
+                seq_len,
+                num_heads,
+                head_dim,
+                &positions,
+                freq_base,
+            )
+            .unwrap();
 
         for i in 0..n {
             assert_eq!(x_base[i], x_none[i], "freq_factors=None diverged at {i}");
@@ -1181,16 +1314,20 @@ mod tests {
         let positions = vec![5u32];
 
         let mut x_base = x_orig.clone();
-        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0)
+            .unwrap();
 
         let mut x_ones = x_orig.clone();
-        with_ones.forward(&mut x_ones, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+        with_ones
+            .forward(&mut x_ones, 1, 1, 1, head_dim, &positions, 10000.0)
+            .unwrap();
 
         for i in 0..head_dim {
             assert!(
                 (x_base[i] - x_ones[i]).abs() < 1e-6,
                 "freq_factors=[1.0] diverged at {i}: base={}, ones={}",
-                x_base[i], x_ones[i]
+                x_base[i],
+                x_ones[i]
             );
         }
     }
@@ -1205,11 +1342,13 @@ mod tests {
         let positions = vec![3u32];
 
         let mut x_ff = x_orig.clone();
-        rope.forward(&mut x_ff, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+        rope.forward(&mut x_ff, 1, 1, 1, head_dim, &positions, 10000.0)
+            .unwrap();
 
         let base = CpuRoPEUnified::new(RoPEMode::Normal, 8);
         let mut x_base = x_orig.clone();
-        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0)
+            .unwrap();
 
         let any_diff = (0..head_dim).any(|i| (x_ff[i] - x_base[i]).abs() > 1e-6);
         assert!(any_diff, "freq_factors should change the output");
@@ -1225,11 +1364,13 @@ mod tests {
         let positions = vec![4u32];
 
         let mut x_scaled = x_orig.clone();
-        rope.forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+        rope.forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 10000.0)
+            .unwrap();
 
         let base = CpuRoPEUnified::new(RoPEMode::Normal, 8);
         let mut x_base = x_orig.clone();
-        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0)
+            .unwrap();
 
         let any_diff = (0..head_dim).any(|i| (x_scaled[i] - x_base[i]).abs() > 1e-6);
         assert!(any_diff, "freq_scale=0.5 should change the output");
@@ -1247,11 +1388,13 @@ mod tests {
         let positions = vec![100u32];
 
         let mut x_yarn = x_orig.clone();
-        rope.forward(&mut x_yarn, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+        rope.forward(&mut x_yarn, 1, 1, 1, head_dim, &positions, 10000.0)
+            .unwrap();
 
         let base = CpuRoPEUnified::new(RoPEMode::Normal, 16);
         let mut x_base = x_orig.clone();
-        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0)
+            .unwrap();
 
         let any_diff = (0..head_dim).any(|i| (x_yarn[i] - x_base[i]).abs() > 1e-6);
         assert!(any_diff, "YaRN with ext_factor=1 should change output");
@@ -1271,7 +1414,8 @@ mod tests {
         let positions = vec![50u32];
 
         let mut x = x_orig.clone();
-        rope.forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+        rope.forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0)
+            .unwrap();
 
         let l2: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!(l2.is_finite(), "YaRN output should be finite");
@@ -1295,14 +1439,21 @@ mod tests {
         let orig: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
 
         let mut x_base = orig.clone();
-        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0).unwrap();
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0)
+            .unwrap();
 
         let mut x_scaled = orig.clone();
-        scaled.forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+        scaled
+            .forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 0.0)
+            .unwrap();
 
         for i in 0..head_dim {
-            assert!((x_base[i] - x_scaled[i]).abs() < 1e-5,
-                "linear factor=1 diverged at {i}: base={}, scaled={}", x_base[i], x_scaled[i]);
+            assert!(
+                (x_base[i] - x_scaled[i]).abs() < 1e-5,
+                "linear factor=1 diverged at {i}: base={}, scaled={}",
+                x_base[i],
+                x_scaled[i]
+            );
         }
     }
 
@@ -1314,11 +1465,13 @@ mod tests {
 
         let mut x_base = orig.clone();
         CpuRoPEScaled::new_linear(1.0, head_dim, 10000.0)
-            .forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+            .forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0)
+            .unwrap();
 
         let mut x_scaled = orig.clone();
         CpuRoPEScaled::new_linear(4.0, head_dim, 10000.0)
-            .forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+            .forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 0.0)
+            .unwrap();
 
         let any_diff = (0..head_dim).any(|i| (x_base[i] - x_scaled[i]).abs() > 1e-5);
         assert!(any_diff, "factor=4 should change output vs factor=1");
@@ -1335,14 +1488,21 @@ mod tests {
         let llama3 = CpuRoPEScaled::new_llama3(8.0, 8192, 1.0, 4.0, head_dim, 500000.0);
 
         let mut x_base = orig.clone();
-        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0)
+            .unwrap();
 
         let mut x_llama3 = orig.clone();
-        llama3.forward(&mut x_llama3, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+        llama3
+            .forward(&mut x_llama3, 1, 1, 1, head_dim, &positions, 0.0)
+            .unwrap();
 
         // First dimension (highest freq) should match unscaled
-        assert!((x_base[0] - x_llama3[0]).abs() < 1e-4,
-            "High-freq dim 0 should be unscaled: base={}, llama3={}", x_base[0], x_llama3[0]);
+        assert!(
+            (x_base[0] - x_llama3[0]).abs() < 1e-4,
+            "High-freq dim 0 should be unscaled: base={}, llama3={}",
+            x_base[0],
+            x_llama3[0]
+        );
     }
 
     #[test]
@@ -1353,11 +1513,13 @@ mod tests {
 
         let mut x_base = orig.clone();
         CpuRoPEScaled::new_linear(1.0, head_dim, 10000.0)
-            .forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+            .forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0)
+            .unwrap();
 
         let mut x_ntk = orig.clone();
         CpuRoPEScaled::new_ntk(4.0, head_dim, 10000.0)
-            .forward(&mut x_ntk, 1, 1, 1, head_dim, &positions, 0.0).unwrap();
+            .forward(&mut x_ntk, 1, 1, 1, head_dim, &positions, 0.0)
+            .unwrap();
 
         let any_diff = (0..head_dim).any(|i| (x_base[i] - x_ntk[i]).abs() > 1e-5);
         assert!(any_diff, "NTK should differ from unscaled RoPE");

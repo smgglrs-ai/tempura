@@ -30,7 +30,6 @@ pub fn moe_ffn(
     router_weight_name: &str,
 ) {
     let q4k = tempura_kernels::quantized::CpuMatMulQ4KOpt;
-    use tempura_kernels::quantized::MatMulQ;
 
     // Step 1: Compute router logits — input [num_tokens, hidden_size] x router [n_experts, hidden_size]^T
     let n_experts = router.n_experts;
@@ -97,22 +96,17 @@ fn expert_ffn_combine(
     up_buf: &mut [f32],
     down_buf: &mut [f32],
 ) {
-    use tempura_kernels::quantized::MatMulQ;
-
     for (&expert_idx, &expert_weight) in routing
         .expert_indices
         .iter()
         .zip(routing.expert_weights.iter())
     {
-        let gate_name = format!(
-            "model.layers.{layer}.{weight_prefix}.experts.{expert_idx}.gate_proj.weight"
-        );
-        let up_name = format!(
-            "model.layers.{layer}.{weight_prefix}.experts.{expert_idx}.up_proj.weight"
-        );
-        let down_name = format!(
-            "model.layers.{layer}.{weight_prefix}.experts.{expert_idx}.down_proj.weight"
-        );
+        let gate_name =
+            format!("model.layers.{layer}.{weight_prefix}.experts.{expert_idx}.gate_proj.weight");
+        let up_name =
+            format!("model.layers.{layer}.{weight_prefix}.experts.{expert_idx}.up_proj.weight");
+        let down_name =
+            format!("model.layers.{layer}.{weight_prefix}.experts.{expert_idx}.down_proj.weight");
 
         gate_buf[..intermediate_size].fill(0.0);
         up_buf[..intermediate_size].fill(0.0);
@@ -411,7 +405,10 @@ mod tests {
 
         // With weight=1.0, output should equal exactly what the single expert produces
         let norm: f32 = output.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(norm > 0.0, "single-expert MoE should produce non-zero output");
+        assert!(
+            norm > 0.0,
+            "single-expert MoE should produce non-zero output"
+        );
     }
 
     #[test]

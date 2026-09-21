@@ -166,13 +166,7 @@ impl EdgeMetrics {
             _ => None,
         };
 
-        let tokens_per_watt = joules_per_token.map(|jpt| {
-            if jpt > 0.0 {
-                1.0 / jpt
-            } else {
-                0.0
-            }
-        });
+        let tokens_per_watt = joules_per_token.map(|jpt| if jpt > 0.0 { 1.0 / jpt } else { 0.0 });
 
         let memory_peak = Self::current_rss_bytes();
 

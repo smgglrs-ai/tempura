@@ -1,5 +1,5 @@
 use super::blocks::*;
-use super::helpers::{f16_to_f32, bf16_to_f32, get_scale_min_k4};
+use super::helpers::{bf16_to_f32, f16_to_f32, get_scale_min_k4};
 
 // ── Basic quants (QK = 32) ─────────────────────────────────────────────────
 
@@ -61,8 +61,8 @@ pub fn dequantize_row_q5_1(blocks: &[BlockQ5_1], output: &mut [f32]) {
         let qh = u32::from_le_bytes(blk.qh);
         let y = &mut output[i * QK..][..QK];
         for j in 0..QK / 2 {
-            let xh_0 = ((qh >> j) & 1) as u32;
-            let xh_1 = ((qh >> (j + 16)) & 1) as u32;
+            let xh_0 = (qh >> j) & 1;
+            let xh_1 = (qh >> (j + 16)) & 1;
             let v0 = (blk.qs[j] & 0x0F) as u32 | (xh_0 << 4);
             let v1 = (blk.qs[j] >> 4) as u32 | (xh_1 << 4);
             y[j] = d * v0 as f32 + m;
@@ -151,10 +151,14 @@ pub fn dequantize_row_q3_k(blocks: &[BlockQ3K], output: &mut [f32]) {
         // apply 2-bit corrections from aux[8..12]
         for j in 0..4 {
             let a = aux[j + 8];
-            scales[j] = (scales[j] as i32 + ((a & 3) as i32) * 16 - if (a & 3) >= 2 { 32 } else { 0 }) as i8;
-            scales[j + 4] = (scales[j + 4] as i32 + (((a >> 2) & 3) as i32) * 16 - if ((a >> 2) & 3) >= 2 { 32 } else { 0 }) as i8;
-            scales[j + 8] = (scales[j + 8] as i32 + (((a >> 4) & 3) as i32) * 16 - if ((a >> 4) & 3) >= 2 { 32 } else { 0 }) as i8;
-            scales[j + 12] = (scales[j + 12] as i32 + (((a >> 6) & 3) as i32) * 16 - if ((a >> 6) & 3) >= 2 { 32 } else { 0 }) as i8;
+            scales[j] = (scales[j] as i32 + ((a & 3) as i32) * 16
+                - if (a & 3) >= 2 { 32 } else { 0 }) as i8;
+            scales[j + 4] = (scales[j + 4] as i32 + (((a >> 2) & 3) as i32) * 16
+                - if ((a >> 2) & 3) >= 2 { 32 } else { 0 }) as i8;
+            scales[j + 8] = (scales[j + 8] as i32 + (((a >> 4) & 3) as i32) * 16
+                - if ((a >> 4) & 3) >= 2 { 32 } else { 0 }) as i8;
+            scales[j + 12] = (scales[j + 12] as i32 + (((a >> 6) & 3) as i32) * 16
+                - if ((a >> 6) & 3) >= 2 { 32 } else { 0 }) as i8;
         }
 
         for j in 0..QK {
@@ -223,11 +227,11 @@ pub fn dequantize_row_q5_k(blocks: &[BlockQ5K], output: &mut [f32]) {
             let d2 = d * sc1 as f32;
             let m2 = dmin * m1v as f32;
             for l in 0..32 {
-                let hbit = ((qh[qh_offset + l] >> (is % 4)) & 1) as u8;
+                let hbit = (qh[qh_offset + l] >> (is % 4)) & 1;
                 y[y_offset + l] = d1 * ((ql[ql_offset + l] & 0xF) | (hbit << 4)) as f32 - m1;
             }
             for l in 0..32 {
-                let hbit = ((qh[qh_offset + l] >> ((is + 1) % 4)) & 1) as u8;
+                let hbit = (qh[qh_offset + l] >> ((is + 1) % 4)) & 1;
                 y[y_offset + 32 + l] = d2 * ((ql[ql_offset + l] >> 4) | (hbit << 4)) as f32 - m2;
             }
             ql_offset += 32;
@@ -258,10 +262,12 @@ pub fn dequantize_row_q6_k(blocks: &[BlockQ6K], output: &mut [f32]) {
         for _n in 0..QK / 128 {
             for l in 0..32 {
                 let is = l / 16;
-                let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
-                let q2 = ((ql[ql_off + 32 + l] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q1 = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
+                let q2 =
+                    ((ql[ql_off + 32 + l] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
                 let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
-                let q4 = ((ql[ql_off + 32 + l] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+                let q4 =
+                    ((ql[ql_off + 32 + l] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
                 y[y_off + l] = d * sc[sc_off + is] as f32 * q1 as f32;
                 y[y_off + 32 + l] = d * sc[sc_off + is + 2] as f32 * q2 as f32;
                 y[y_off + 64 + l] = d * sc[sc_off + is + 4] as f32 * q3 as f32;
@@ -337,7 +343,15 @@ pub fn dequantize_row_mxfp4(blocks: &[BlockMxfp4], output: &mut [f32]) {
     assert_eq!(output.len(), blocks.len() * QK);
     for (i, blk) in blocks.iter().enumerate() {
         let shared_exp = blk.e as i32;
-        let scale = if shared_exp == 0 { 0.0 } else { f32::from_bits(((shared_exp as u32) << 23).wrapping_sub(127 << 23).wrapping_add(127 << 23)) };
+        let scale = if shared_exp == 0 {
+            0.0
+        } else {
+            f32::from_bits(
+                ((shared_exp as u32) << 23)
+                    .wrapping_sub(127 << 23)
+                    .wrapping_add(127 << 23),
+            )
+        };
         let y = &mut output[i * QK..][..QK];
         for j in 0..QK / 2 {
             let nibble_lo = blk.qs[j] & 0x0F;
@@ -363,7 +377,11 @@ fn mxfp4_to_f32(nibble: u8) -> f32 {
         (3, 1) => 6.0,
         _ => unreachable!(),
     };
-    if sign == 1 { -val } else { val }
+    if sign == 1 {
+        -val
+    } else {
+        val
+    }
 }
 
 pub fn dequantize_row_nvfp4(blocks: &[BlockNvfp4], output: &mut [f32]) {
@@ -386,7 +404,9 @@ pub fn dequantize_row_nvfp4(blocks: &[BlockNvfp4], output: &mut [f32]) {
     }
 }
 
-pub(crate) fn ue4m3_to_f32_pub(byte: u8) -> f32 { ue4m3_to_f32(byte) }
+pub(crate) fn ue4m3_to_f32_pub(byte: u8) -> f32 {
+    ue4m3_to_f32(byte)
+}
 
 fn ue4m3_to_f32(byte: u8) -> f32 {
     let exp = (byte >> 3) as i32;
@@ -400,8 +420,8 @@ fn ue4m3_to_f32(byte: u8) -> f32 {
 
 fn e2m1_to_f32(nibble: u8) -> f32 {
     let sign = (nibble >> 3) & 1;
-    let val = mxfp4_to_f32(nibble & 0x07 | (sign << 3));
-    val // sign already handled in mxfp4_to_f32
+
+    mxfp4_to_f32(nibble & 0x07 | (sign << 3)) // sign already handled in mxfp4_to_f32
 }
 
 // ── IQ quants ──────────────────────────────────────────────────────────────
@@ -429,7 +449,11 @@ pub fn dequantize_row_iq2_xxs(blocks: &[BlockIQ2XXS], output: &mut [f32]) {
                 let grid = IQ2XXS_GRID[aux8[l] as usize].to_le_bytes();
                 let sign_bits = KSIGNS_IQ2XS[((aux32_1 >> (7 * l as u32)) & 127) as usize];
                 for j in 0..8 {
-                    let sign: f32 = if sign_bits & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    let sign: f32 = if sign_bits & KMASK_IQ2XS[j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     y[y_idx] = db * grid[j] as f32 * sign;
                     y_idx += 1;
                 }
@@ -457,7 +481,11 @@ pub fn dequantize_row_iq2_xs(blocks: &[BlockIQ2XS], output: &mut [f32]) {
                 let grid = IQ2XS_GRID[(q2[ib32 * 4 + l] & 511) as usize].to_le_bytes();
                 let sign_bits = KSIGNS_IQ2XS[(q2[ib32 * 4 + l] >> 9) as usize];
                 for j in 0..8 {
-                    let sign: f32 = if sign_bits & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    let sign: f32 = if sign_bits & KMASK_IQ2XS[j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     y[y_idx] = db1 * grid[j] as f32 * sign;
                     y_idx += 1;
                 }
@@ -466,7 +494,11 @@ pub fn dequantize_row_iq2_xs(blocks: &[BlockIQ2XS], output: &mut [f32]) {
                 let grid = IQ2XS_GRID[(q2[ib32 * 4 + l] & 511) as usize].to_le_bytes();
                 let sign_bits = KSIGNS_IQ2XS[(q2[ib32 * 4 + l] >> 9) as usize];
                 for j in 0..8 {
-                    let sign: f32 = if sign_bits & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    let sign: f32 = if sign_bits & KMASK_IQ2XS[j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     y[y_idx] = db2 * grid[j] as f32 * sign;
                     y_idx += 1;
                 }
@@ -492,19 +524,29 @@ pub fn dequantize_row_iq2_s(blocks: &[BlockIQ2S], output: &mut [f32]) {
             let db1 = d * (0.5 + (blk.scales[ib32] & 0xF) as f32) * 0.25;
             let db2 = d * (0.5 + (blk.scales[ib32] >> 4) as f32) * 0.25;
             for l in 0..2usize {
-                let grid_idx = qs[qs_idx + l] as usize | ((qh[ib32] as usize) << (8 - 2 * l) & 0x300);
+                let grid_idx =
+                    qs[qs_idx + l] as usize | ((qh[ib32] as usize) << (8 - 2 * l) & 0x300);
                 let grid = IQ2S_GRID[grid_idx].to_le_bytes();
                 for j in 0..8 {
-                    let sign: f32 = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    let sign: f32 = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     y[y_idx] = db1 * grid[j] as f32 * sign;
                     y_idx += 1;
                 }
             }
             for l in 2..4usize {
-                let grid_idx = qs[qs_idx + l] as usize | ((qh[ib32] as usize) << (8 - 2 * l) & 0x300);
+                let grid_idx =
+                    qs[qs_idx + l] as usize | ((qh[ib32] as usize) << (8 - 2 * l) & 0x300);
                 let grid = IQ2S_GRID[grid_idx].to_le_bytes();
                 for j in 0..8 {
-                    let sign: f32 = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    let sign: f32 = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     y[y_idx] = db2 * grid[j] as f32 * sign;
                     y_idx += 1;
                 }
@@ -528,7 +570,12 @@ pub fn dequantize_row_iq3_xxs(blocks: &[BlockIQ3XXS], output: &mut [f32]) {
         let mut q3_idx = 0usize;
         let mut gas_idx = 0usize;
         for _ib32 in 0..QK / 32 {
-            let aux32 = u32::from_le_bytes([gas[gas_idx], gas[gas_idx + 1], gas[gas_idx + 2], gas[gas_idx + 3]]);
+            let aux32 = u32::from_le_bytes([
+                gas[gas_idx],
+                gas[gas_idx + 1],
+                gas[gas_idx + 2],
+                gas[gas_idx + 3],
+            ]);
             gas_idx += 4;
             let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
             for l in 0..4 {
@@ -536,12 +583,20 @@ pub fn dequantize_row_iq3_xxs(blocks: &[BlockIQ3XXS], output: &mut [f32]) {
                 let grid2 = IQ3XXS_GRID[q3[q3_idx + 2 * l + 1] as usize].to_le_bytes();
                 let sign_bits = KSIGNS_IQ2XS[((aux32 >> (7 * l as u32)) & 127) as usize];
                 for j in 0..4 {
-                    let sign1: f32 = if sign_bits & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    let sign1: f32 = if sign_bits & KMASK_IQ2XS[j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     y[y_idx] = db * grid1[j] as f32 * sign1;
                     y_idx += 1;
                 }
                 for j in 0..4 {
-                    let sign2: f32 = if sign_bits & KMASK_IQ2XS[j + 4] != 0 { -1.0 } else { 1.0 };
+                    let sign2: f32 = if sign_bits & KMASK_IQ2XS[j + 4] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     y[y_idx] = db * grid2[j] as f32 * sign2;
                     y_idx += 1;
                 }
@@ -569,16 +624,25 @@ pub fn dequantize_row_iq3_s(blocks: &[BlockIQ3S], output: &mut [f32]) {
             let db2 = d * (1 + 2 * (blk.scales[ib32 / 2] >> 4)) as f32;
             for l in 0..4 {
                 let idx1 = qs[qs_idx + 2 * l] as usize | ((qh[ib32] as usize) << (8 - 2 * l) & 256);
-                let idx2 = qs[qs_idx + 2 * l + 1] as usize | ((qh[ib32] as usize) << (7 - 2 * l) & 256);
+                let idx2 =
+                    qs[qs_idx + 2 * l + 1] as usize | ((qh[ib32] as usize) << (7 - 2 * l) & 256);
                 let grid1 = IQ3S_GRID[idx1].to_le_bytes();
                 let grid2 = IQ3S_GRID[idx2].to_le_bytes();
                 for j in 0..4 {
-                    let sign1: f32 = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    let sign1: f32 = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     y[y_idx] = db1 * grid1[j] as f32 * sign1;
                     y_idx += 1;
                 }
                 for j in 0..4 {
-                    let sign2: f32 = if signs[signs_idx + l] & KMASK_IQ2XS[j + 4] != 0 { -1.0 } else { 1.0 };
+                    let sign2: f32 = if signs[signs_idx + l] & KMASK_IQ2XS[j + 4] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     y[y_idx] = db2 * grid2[j] as f32 * sign2;
                     y_idx += 1;
                 }
@@ -586,17 +650,27 @@ pub fn dequantize_row_iq3_s(blocks: &[BlockIQ3S], output: &mut [f32]) {
             qs_idx += 8;
             signs_idx += 4;
             for l in 0..4 {
-                let idx1 = qs[qs_idx + 2 * l] as usize | ((qh[ib32 + 1] as usize) << (8 - 2 * l) & 256);
-                let idx2 = qs[qs_idx + 2 * l + 1] as usize | ((qh[ib32 + 1] as usize) << (7 - 2 * l) & 256);
+                let idx1 =
+                    qs[qs_idx + 2 * l] as usize | ((qh[ib32 + 1] as usize) << (8 - 2 * l) & 256);
+                let idx2 = qs[qs_idx + 2 * l + 1] as usize
+                    | ((qh[ib32 + 1] as usize) << (7 - 2 * l) & 256);
                 let grid1 = IQ3S_GRID[idx1].to_le_bytes();
                 let grid2 = IQ3S_GRID[idx2].to_le_bytes();
                 for j in 0..4 {
-                    let sign1: f32 = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    let sign1: f32 = if signs[signs_idx + l] & KMASK_IQ2XS[j] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     y[y_idx] = db1 * grid1[j] as f32 * sign1;
                     y_idx += 1;
                 }
                 for j in 0..4 {
-                    let sign2: f32 = if signs[signs_idx + l] & KMASK_IQ2XS[j + 4] != 0 { -1.0 } else { 1.0 };
+                    let sign2: f32 = if signs[signs_idx + l] & KMASK_IQ2XS[j + 4] != 0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
                     y[y_idx] = db2 * grid2[j] as f32 * sign2;
                     y_idx += 1;
                 }
@@ -620,9 +694,14 @@ pub fn dequantize_row_iq1_s(blocks: &[BlockIQ1S], output: &mut [f32]) {
         let mut qs_idx = 0usize;
         for ib in 0..QK / 32 {
             let dl = d * (2 * ((qh[ib] >> 12) & 7) + 1) as f32;
-            let delta = if qh[ib] & 0x8000 != 0 { -IQ1S_DELTA * dl } else { IQ1S_DELTA * dl };
+            let delta = if qh[ib] & 0x8000 != 0 {
+                -IQ1S_DELTA * dl
+            } else {
+                IQ1S_DELTA * dl
+            };
             for l in 0..4 {
-                let grid_idx = qs[qs_idx + l] as usize | (((qh[ib] >> (3 * l as u16)) & 7) as usize) << 8;
+                let grid_idx =
+                    qs[qs_idx + l] as usize | (((qh[ib] >> (3 * l as u16)) & 7) as usize) << 8;
                 let grid = IQ1S_GRID[grid_idx].to_le_bytes();
                 for j in 0..8 {
                     y[y_idx] = dl * grid[j] as i8 as f32 + delta;
@@ -649,7 +728,10 @@ pub fn dequantize_row_iq1_m(blocks: &[BlockIQ1M], output: &mut [f32]) {
             sc[4] as u16 | ((sc[5] as u16) << 8),
             sc[6] as u16 | ((sc[7] as u16) << 8),
         ];
-        let scale_bits = (sc16[0] >> 12) | ((sc16[1] >> 8) & 0x00F0) | ((sc16[2] >> 4) & 0x0F00) | (sc16[3] & 0xF000);
+        let scale_bits = (sc16[0] >> 12)
+            | ((sc16[1] >> 8) & 0x00F0)
+            | ((sc16[2] >> 4) & 0x0F00)
+            | (sc16[3] & 0xF000);
         let d = f16_to_f32(scale_bits);
         let mut y_idx = 0usize;
         let mut qs_idx = 0usize;
@@ -658,13 +740,30 @@ pub fn dequantize_row_iq1_m(blocks: &[BlockIQ1M], output: &mut [f32]) {
             let ls1 = (2 * ((sc16[ib / 2] >> (6 * (ib % 2))) & 0x7) + 1) as f32;
             let ls2 = (2 * ((sc16[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1) as f32;
             let delta = [
-                if qh[qh_idx] & 0x08 != 0 { -IQ1M_DELTA } else { IQ1M_DELTA },
-                if qh[qh_idx] & 0x80 != 0 { -IQ1M_DELTA } else { IQ1M_DELTA },
-                if qh[qh_idx + 1] & 0x08 != 0 { -IQ1M_DELTA } else { IQ1M_DELTA },
-                if qh[qh_idx + 1] & 0x80 != 0 { -IQ1M_DELTA } else { IQ1M_DELTA },
+                if qh[qh_idx] & 0x08 != 0 {
+                    -IQ1M_DELTA
+                } else {
+                    IQ1M_DELTA
+                },
+                if qh[qh_idx] & 0x80 != 0 {
+                    -IQ1M_DELTA
+                } else {
+                    IQ1M_DELTA
+                },
+                if qh[qh_idx + 1] & 0x08 != 0 {
+                    -IQ1M_DELTA
+                } else {
+                    IQ1M_DELTA
+                },
+                if qh[qh_idx + 1] & 0x80 != 0 {
+                    -IQ1M_DELTA
+                } else {
+                    IQ1M_DELTA
+                },
             ];
             for l in 0..4usize {
-                let grid_idx = qs[qs_idx + l] as usize | (((qh[qh_idx + l / 2] as u16) << (8 - 4 * (l % 2) as u16)) & 0x700) as usize;
+                let grid_idx = qs[qs_idx + l] as usize
+                    | (((qh[qh_idx + l / 2] as u16) << (8 - 4 * (l % 2) as u16)) & 0x700) as usize;
                 let grid = IQ1S_GRID[grid_idx].to_le_bytes();
                 let dl = d * if l < 2 { ls1 } else { ls2 };
                 let dd = dl * delta[l];
@@ -728,13 +827,23 @@ pub fn dequantize_row_iq4_nl(blocks: &[BlockIQ4NL], output: &mut [f32]) {
 
 // ── Raw-byte interface for type-erased dispatch ────────────────────────────
 
-pub fn dequantize_row(data: &[u8], output: &mut [f32], ggml_type: super::GgmlType, num_elements: usize) {
+pub fn dequantize_row(
+    data: &[u8],
+    output: &mut [f32],
+    ggml_type: super::GgmlType,
+    num_elements: usize,
+) {
     use super::GgmlType::*;
     match ggml_type {
         F32 => {
             assert!(data.len() >= num_elements * 4);
             for i in 0..num_elements {
-                let bytes = [data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]];
+                let bytes = [
+                    data[i * 4],
+                    data[i * 4 + 1],
+                    data[i * 4 + 2],
+                    data[i * 4 + 3],
+                ];
                 output[i] = f32::from_le_bytes(bytes);
             }
         }
@@ -866,11 +975,7 @@ fn cast_blocks_aligned<T: Copy>(data: &[u8], num_elements: usize, block_elems: u
 ///
 /// `n_elements` must be divisible by the dtype's block size.
 /// Panics on unsupported dtypes (F16, BF16, iX scalar types, Q8_1, Q8K).
-pub fn dequantize_to_f32(
-    dtype: super::GgmlType,
-    bytes: &[u8],
-    n_elements: usize,
-) -> Vec<f32> {
+pub fn dequantize_to_f32(dtype: super::GgmlType, bytes: &[u8], n_elements: usize) -> Vec<f32> {
     use super::blocks::*;
     use super::GgmlType;
 
@@ -878,9 +983,8 @@ pub fn dequantize_to_f32(
     match dtype {
         GgmlType::F32 => {
             assert_eq!(bytes.len(), n_elements * 4, "F32 byte length mismatch");
-            let floats = unsafe {
-                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_elements)
-            };
+            let floats =
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_elements) };
             out.copy_from_slice(floats);
         }
         GgmlType::Q4_0 => {
@@ -966,8 +1070,8 @@ pub fn dequantize_to_f32(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::helpers::f32_to_f16;
+    use super::*;
 
     #[test]
     fn dequant_q4_0_zero_block() {
@@ -1045,7 +1149,9 @@ mod tests {
 
     fn load_test_vector(name: &str) -> Option<Vec<u8>> {
         let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-        let workspace = std::path::Path::new(&manifest).parent().unwrap_or(std::path::Path::new("."));
+        let workspace = std::path::Path::new(&manifest)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
         let path = workspace.join("tests-ggml").join(name);
         std::fs::read(&path).ok()
     }
@@ -1055,7 +1161,12 @@ mod tests {
         let n = data.len() / 4;
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            out.push(f32::from_le_bytes([data[i*4], data[i*4+1], data[i*4+2], data[i*4+3]]));
+            out.push(f32::from_le_bytes([
+                data[i * 4],
+                data[i * 4 + 1],
+                data[i * 4 + 2],
+                data[i * 4 + 3],
+            ]));
         }
         Some(out)
     }
@@ -1077,7 +1188,10 @@ mod tests {
             max_diff = max_diff.max(diff);
         }
         eprintln!("Q4_0 dequant cross-val: max_abs_diff={max_diff:.6e} across {k} elements");
-        assert!(max_diff < 1e-5, "Q4_0 dequant mismatch: max_diff={max_diff}");
+        assert!(
+            max_diff < 1e-5,
+            "Q4_0 dequant mismatch: max_diff={max_diff}"
+        );
     }
 
     #[test]
@@ -1097,7 +1211,10 @@ mod tests {
             max_diff = max_diff.max(diff);
         }
         eprintln!("Q4_K dequant cross-val: max_abs_diff={max_diff:.6e} across {k} elements");
-        assert!(max_diff < 1e-5, "Q4_K dequant mismatch: max_diff={max_diff}");
+        assert!(
+            max_diff < 1e-5,
+            "Q4_K dequant mismatch: max_diff={max_diff}"
+        );
     }
 
     #[test]
@@ -1117,7 +1234,10 @@ mod tests {
             max_diff = max_diff.max(diff);
         }
         eprintln!("Q6_K dequant cross-val: max_abs_diff={max_diff:.6e} across {k} elements");
-        assert!(max_diff < 1e-5, "Q6_K dequant mismatch: max_diff={max_diff}");
+        assert!(
+            max_diff < 1e-5,
+            "Q6_K dequant mismatch: max_diff={max_diff}"
+        );
     }
 
     #[test]
@@ -1130,7 +1250,11 @@ mod tests {
         let k = src_data.len();
         let nb = k / 32;
         let mut our_q8 = vec![0u8; nb * 34];
-        super::super::quantize::quantize_activations(&src_data, &mut our_q8, super::super::GgmlType::Q8_0);
+        super::super::quantize::quantize_activations(
+            &src_data,
+            &mut our_q8,
+            super::super::GgmlType::Q8_0,
+        );
 
         let mut max_diff = 0u8;
         let mut diff_count = 0usize;
@@ -1143,18 +1267,27 @@ mod tests {
                 if off >= 2 {
                     let j = off - 2;
                     let sv = src_data[blk * 32 + j];
-                    let blk_src = &src_data[blk*32..(blk+1)*32];
+                    let blk_src = &src_data[blk * 32..(blk + 1) * 32];
                     let amax: f32 = blk_src.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
                     let d = amax / 127.0;
                     let scaled = sv / d;
-                    eprintln!("  DIFF blk {blk} qs[{j}]: ggml={} ours={} src={sv:.8} scaled={scaled:.8}", ggml_q8[i] as i8, our_q8[i] as i8);
+                    eprintln!(
+                        "  DIFF blk {blk} qs[{j}]: ggml={} ours={} src={sv:.8} scaled={scaled:.8}",
+                        ggml_q8[i] as i8, our_q8[i] as i8
+                    );
                 } else {
-                    eprintln!("  DIFF blk {blk} d_byte[{off}]: ggml=0x{:02x} ours=0x{:02x}", ggml_q8[i], our_q8[i]);
+                    eprintln!(
+                        "  DIFF blk {blk} d_byte[{off}]: ggml=0x{:02x} ours=0x{:02x}",
+                        ggml_q8[i], our_q8[i]
+                    );
                 }
             }
             max_diff = max_diff.max(diff);
         }
-        eprintln!("Q8_0 quantize cross-val: max_byte_diff={max_diff}, {diff_count} diffs across {} bytes", our_q8.len());
+        eprintln!(
+            "Q8_0 quantize cross-val: max_byte_diff={max_diff}, {diff_count} diffs across {} bytes",
+            our_q8.len()
+        );
         assert!(max_diff <= 1, "Q8_0 quantize mismatch: max_diff={max_diff}");
     }
 
@@ -1168,7 +1301,11 @@ mod tests {
         let k = src_data.len();
         let nb = k / 256;
         let mut our_q8k = vec![0u8; nb * 292];
-        super::super::quantize::quantize_activations(&src_data, &mut our_q8k, super::super::GgmlType::Q8K);
+        super::super::quantize::quantize_activations(
+            &src_data,
+            &mut our_q8k,
+            super::super::GgmlType::Q8K,
+        );
 
         // Compare d (f32) at offset 0
         let ggml_d = f32::from_le_bytes([ggml_q8k[0], ggml_q8k[1], ggml_q8k[2], ggml_q8k[3]]);

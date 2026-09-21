@@ -364,7 +364,11 @@ mod kani_proofs {
             *l = kani::any();
             kani::assume(l.is_finite() && *l > -50.0 && *l < 50.0);
         }
-        let mut sampler = AdaptivePSampler { target, decay, current_p };
+        let mut sampler = AdaptivePSampler {
+            target,
+            decay,
+            current_p,
+        };
         sampler.apply(&mut logits, &[]);
     }
 
@@ -378,7 +382,9 @@ mod kani_proofs {
         }
         let blocked: u32 = kani::any();
         kani::assume(blocked < 8);
-        let mut sampler = InfillSampler { blocked_tokens: vec![blocked] };
+        let mut sampler = InfillSampler {
+            blocked_tokens: vec![blocked],
+        };
         sampler.apply(&mut logits, &[]);
         assert!(logits[blocked as usize] == f32::NEG_INFINITY);
     }
@@ -550,6 +556,9 @@ mod tests {
         let original = logits.clone();
         sampler.apply(&mut logits, &[]);
 
-        assert_eq!(logits, original, "Out-of-range token should not crash or modify logits");
+        assert_eq!(
+            logits, original,
+            "Out-of-range token should not crash or modify logits"
+        );
     }
 }

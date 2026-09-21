@@ -28,7 +28,7 @@ struct Cli {
 #[derive(clap::Subcommand, Debug)]
 enum Command {
     /// Start the inference server (default)
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Download a model from HuggingFace
     Pull {
         /// HuggingFace repo ID (e.g. TinyLlama/TinyLlama-1.1B-Chat-v1.0)
@@ -103,7 +103,10 @@ struct ServeArgs {
     )]
     attn_mode: String,
 
-    #[arg(long, help = "API key required on all non-health requests (overrides TEMPURA_API_KEY env var)")]
+    #[arg(
+        long,
+        help = "API key required on all non-health requests (overrides TEMPURA_API_KEY env var)"
+    )]
     api_key: Option<String>,
 }
 
@@ -114,7 +117,6 @@ pub type CpuModel = TransformerModel<
     tempura_kernels::matmul::CpuMatMul,
     tempura_kernels::sampling::CpuSampler,
 >;
-
 
 #[derive(Clone)]
 pub struct AppState {
@@ -188,7 +190,7 @@ async fn main() {
             return;
         }
         Some(Command::Serve(args)) => {
-            run_server(args).await;
+            run_server(*args).await;
         }
         None => {
             run_server(ServeArgs {
@@ -225,7 +227,10 @@ async fn run_server(args: ServeArgs) {
 
     let use_gpu = (args.device == "cuda" || args.device == "cutile") && cfg!(feature = "cutile");
     if (args.device == "cuda" || args.device == "cutile") && !cfg!(feature = "cutile") {
-        eprintln!("Error: --device {} requires building with --features cutile (or cuda)", args.device);
+        eprintln!(
+            "Error: --device {} requires building with --features cutile (or cuda)",
+            args.device
+        );
         std::process::exit(1);
     }
     tracing::info!(

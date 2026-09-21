@@ -1,4 +1,4 @@
-use crate::sampler_chain::{MinPSampler, RepetitionPenalizer, TypicalSampler, LogitProcessor};
+use crate::sampler_chain::{LogitProcessor, MinPSampler, RepetitionPenalizer, TypicalSampler};
 use crate::Result;
 pub use crate::{Sampler, SamplingParams};
 use rand::RngCore;
@@ -8,7 +8,11 @@ pub struct CpuSampler;
 
 #[cfg(feature = "cpu")]
 impl CpuSampler {
-    fn apply_pre_softmax_filters(logits: &mut Vec<f32>, params: &SamplingParams, prior_tokens: &[u32]) {
+    fn apply_pre_softmax_filters(
+        logits: &mut [f32],
+        params: &SamplingParams,
+        prior_tokens: &[u32],
+    ) {
         if params.repeat_penalty != 1.0 {
             let mut pen = RepetitionPenalizer {
                 penalty: params.repeat_penalty,
@@ -89,7 +93,9 @@ impl Sampler for CpuSampler {
                 .enumerate()
                 .filter(|(_, p)| *p > 0.0)
                 .collect();
-            sorted_probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            sorted_probs.sort_unstable_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
 
             let mut cumsum = 0.0f32;
             let mut cutoff_idx = sorted_probs.len();

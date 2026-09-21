@@ -1,5 +1,5 @@
-use super::GgmlType;
 use super::quantize::{quantize_activations, quantized_row_size};
+use super::GgmlType;
 
 fn vec_dot_best(n: usize, result: &mut f32, vx: &[u8], vy: &[u8], weight_type: GgmlType) {
     use super::blocks::*;
@@ -10,26 +10,42 @@ fn vec_dot_best(n: usize, result: &mut f32, vx: &[u8], vy: &[u8], weight_type: G
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             match weight_type {
                 GgmlType::Q4_0 => {
-                    let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ4_0, n / 32) };
-                    let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8_0, n / 32) };
+                    let x = unsafe {
+                        std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ4_0, n / 32)
+                    };
+                    let y = unsafe {
+                        std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8_0, n / 32)
+                    };
                     *result = unsafe { super::vec_dot_avx2::vec_dot_q4_0_q8_0_avx2(n, x, y) };
                     return;
                 }
                 GgmlType::Q8_0 => {
-                    let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ8_0, n / 32) };
-                    let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8_0, n / 32) };
+                    let x = unsafe {
+                        std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ8_0, n / 32)
+                    };
+                    let y = unsafe {
+                        std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8_0, n / 32)
+                    };
                     *result = unsafe { super::vec_dot_avx2::vec_dot_q8_0_q8_0_avx2(n, x, y) };
                     return;
                 }
                 GgmlType::Q4K => {
-                    let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ4K, n / 256) };
-                    let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256) };
+                    let x = unsafe {
+                        std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ4K, n / 256)
+                    };
+                    let y = unsafe {
+                        std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256)
+                    };
                     *result = unsafe { super::vec_dot_avx2::vec_dot_q4_k_q8_k_avx2(n, x, y) };
                     return;
                 }
                 GgmlType::Q6K => {
-                    let x = unsafe { std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ6K, n / 256) };
-                    let y = unsafe { std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256) };
+                    let x = unsafe {
+                        std::slice::from_raw_parts(vx.as_ptr() as *const BlockQ6K, n / 256)
+                    };
+                    let y = unsafe {
+                        std::slice::from_raw_parts(vy.as_ptr() as *const BlockQ8K, n / 256)
+                    };
                     *result = unsafe { super::vec_dot_avx2::vec_dot_q6_k_q8_k_avx2(n, x, y) };
                     return;
                 }
@@ -53,21 +69,6 @@ fn vec_dot_best(n: usize, result: &mut f32, vx: &[u8], vy: &[u8], weight_type: G
 /// Algorithm:
 /// 1. Quantize each src1 row to vec_dot_type (Q8_0 or Q8_K)
 /// 2. For each (src1_row, weight_row), call vec_dot → one output element
-type VecDotFnPtr = fn(usize, &mut f32, &[u8], &[u8], GgmlType);
-
-fn resolve_vec_dot(weight_type: GgmlType) -> VecDotFnPtr {
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        match weight_type {
-            GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q6K => {
-                return vec_dot_best;
-            }
-            _ => {}
-        }
-    }
-    super::vec_dot::vec_dot
-}
-
 pub fn mul_mat_q(
     src0_type: GgmlType,
     src0: &[u8],
@@ -99,12 +100,10 @@ pub fn mul_mat_q(
     if m == 1 {
         // Decode path: parallelize over output columns (not rows — there's only 1)
         let act_row = &act_quantized[..act_row_bytes];
-        dst.par_iter_mut()
-            .enumerate()
-            .for_each(|(col, out)| {
-                let weight_row = &src0[col * weight_row_bytes..(col + 1) * weight_row_bytes];
-                vec_dot_best(k, out, weight_row, act_row, src0_type);
-            });
+        dst.par_iter_mut().enumerate().for_each(|(col, out)| {
+            let weight_row = &src0[col * weight_row_bytes..(col + 1) * weight_row_bytes];
+            vec_dot_best(k, out, weight_row, act_row, src0_type);
+        });
     } else {
         // Batch path: parallelize over rows
         dst.par_chunks_mut(n)
@@ -138,7 +137,12 @@ impl PreQuantizedQ8 {
             let dst_row = &mut data[row * act_row_bytes..(row + 1) * act_row_bytes];
             quantize_activations(src_row, dst_row, vdt);
         }
-        Self { data, vec_dot_type: vdt, k, m }
+        Self {
+            data,
+            vec_dot_type: vdt,
+            k,
+            m,
+        }
     }
 
     pub fn row_bytes(&self) -> usize {
@@ -211,10 +215,10 @@ pub fn mul_mat_q_scalar(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::blocks::*;
-    use super::super::helpers::f32_to_f16;
     use super::super::dequantize::dequantize_row_q4_k;
+    use super::super::helpers::f32_to_f16;
+    use super::*;
 
     fn naive_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
         for i in 0..m {
@@ -256,7 +260,10 @@ mod tests {
         for row_idx in 0..n {
             let blk_bytes = &weights[row_idx * BLOCK_Q4K_SIZE..(row_idx + 1) * BLOCK_Q4K_SIZE];
             let blk = unsafe { &*(blk_bytes.as_ptr() as *const BlockQ4K) };
-            dequantize_row_q4_k(std::slice::from_ref(blk), &mut w_f32[row_idx * k..(row_idx + 1) * k]);
+            dequantize_row_q4_k(
+                std::slice::from_ref(blk),
+                &mut w_f32[row_idx * k..(row_idx + 1) * k],
+            );
         }
 
         let m = 1;
@@ -279,7 +286,8 @@ mod tests {
             assert!(
                 rel_err < 0.15,
                 "col {j}: q_out={}, ref_out={}, rel_err={rel_err}",
-                q_out[j], ref_out[j]
+                q_out[j],
+                ref_out[j]
             );
         }
     }
@@ -326,8 +334,11 @@ mod tests {
 
         for j in 0..m * n {
             assert_eq!(
-                out1[j].to_bits(), out2[j].to_bits(),
-                "Q4K determinism failure at [{j}]: run1={} run2={}", out1[j], out2[j]
+                out1[j].to_bits(),
+                out2[j].to_bits(),
+                "Q4K determinism failure at [{j}]: run1={} run2={}",
+                out1[j],
+                out2[j]
             );
         }
     }
@@ -348,8 +359,11 @@ mod tests {
 
         for j in 0..m * n {
             assert_eq!(
-                out1[j].to_bits(), out2[j].to_bits(),
-                "Q6K determinism failure at [{j}]: run1={} run2={}", out1[j], out2[j]
+                out1[j].to_bits(),
+                out2[j].to_bits(),
+                "Q6K determinism failure at [{j}]: run1={} run2={}",
+                out1[j],
+                out2[j]
             );
         }
     }
@@ -369,12 +383,18 @@ mod tests {
                     d: f32_to_f16(0.1 + 0.01 * s as f32),
                     dmin: f32_to_f16(0.005 * s as f32),
                     scales: [
-                        (s.wrapping_mul(3)) & 63, (s.wrapping_mul(7)) & 63,
-                        (s.wrapping_mul(11)) & 63, (s.wrapping_mul(13)) & 63,
-                        (s.wrapping_mul(17)) & 63, (s.wrapping_mul(19)) & 63,
-                        (s.wrapping_mul(23)) & 63, (s.wrapping_mul(29)) & 63,
-                        s & 0x0F, s.wrapping_add(1) & 0x0F,
-                        s.wrapping_add(2) & 0x0F, s.wrapping_add(3) & 0x0F,
+                        (s.wrapping_mul(3)) & 63,
+                        (s.wrapping_mul(7)) & 63,
+                        (s.wrapping_mul(11)) & 63,
+                        (s.wrapping_mul(13)) & 63,
+                        (s.wrapping_mul(17)) & 63,
+                        (s.wrapping_mul(19)) & 63,
+                        (s.wrapping_mul(23)) & 63,
+                        (s.wrapping_mul(29)) & 63,
+                        s & 0x0F,
+                        s.wrapping_add(1) & 0x0F,
+                        s.wrapping_add(2) & 0x0F,
+                        s.wrapping_add(3) & 0x0F,
                     ],
                     qs: std::array::from_fn(|i| {
                         let lo = (s.wrapping_add(i as u8)) & 0x0F;
@@ -445,10 +465,12 @@ mod tests {
     }
 
     fn make_activations(m: usize, k: usize) -> Vec<f32> {
-        (0..m * k).map(|i| {
-            let phase = i as f32 * 0.1;
-            (phase.sin() * 0.5 + 0.1) / (1.0 + (i % k) as f32 * 0.001)
-        }).collect()
+        (0..m * k)
+            .map(|i| {
+                let phase = i as f32 * 0.1;
+                (phase.sin() * 0.5 + 0.1) / (1.0 + (i % k) as f32 * 0.001)
+            })
+            .collect()
     }
 
     #[test]
@@ -462,8 +484,24 @@ mod tests {
         let mut out_avx2 = vec![0.0f32; m * n];
         let mut out_scalar = vec![0.0f32; m * n];
 
-        mul_mat_q(GgmlType::Q4K, &weights, &activations, &mut out_avx2, m, n, k);
-        mul_mat_q_scalar(GgmlType::Q4K, &weights, &activations, &mut out_scalar, m, n, k);
+        mul_mat_q(
+            GgmlType::Q4K,
+            &weights,
+            &activations,
+            &mut out_avx2,
+            m,
+            n,
+            k,
+        );
+        mul_mat_q_scalar(
+            GgmlType::Q4K,
+            &weights,
+            &activations,
+            &mut out_scalar,
+            m,
+            n,
+            k,
+        );
 
         let mut max_diff = 0.0f32;
         for j in 0..m * n {
@@ -477,7 +515,8 @@ mod tests {
             assert!(
                 rel < 0.001,
                 "Q4K dual_pipeline mismatch at [{j}]: scalar={}, avx2={}, rel_err={rel}",
-                out_scalar[j], out_avx2[j]
+                out_scalar[j],
+                out_avx2[j]
             );
         }
         eprintln!("Q4K dual_pipeline: max_abs_diff={max_diff:.6e} across {n} outputs (k={k})");
@@ -494,8 +533,24 @@ mod tests {
         let mut out_avx2 = vec![0.0f32; m * n];
         let mut out_scalar = vec![0.0f32; m * n];
 
-        mul_mat_q(GgmlType::Q6K, &weights, &activations, &mut out_avx2, m, n, k);
-        mul_mat_q_scalar(GgmlType::Q6K, &weights, &activations, &mut out_scalar, m, n, k);
+        mul_mat_q(
+            GgmlType::Q6K,
+            &weights,
+            &activations,
+            &mut out_avx2,
+            m,
+            n,
+            k,
+        );
+        mul_mat_q_scalar(
+            GgmlType::Q6K,
+            &weights,
+            &activations,
+            &mut out_scalar,
+            m,
+            n,
+            k,
+        );
 
         let mut max_diff = 0.0f32;
         for j in 0..m * n {
@@ -509,7 +564,8 @@ mod tests {
             assert!(
                 rel < 0.001,
                 "Q6K dual_pipeline mismatch at [{j}]: scalar={}, avx2={}, rel_err={rel}",
-                out_scalar[j], out_avx2[j]
+                out_scalar[j],
+                out_avx2[j]
             );
         }
         eprintln!("Q6K dual_pipeline: max_abs_diff={max_diff:.6e} across {n} outputs (k={k})");
@@ -526,8 +582,24 @@ mod tests {
         let mut out_avx2 = vec![0.0f32; m * n];
         let mut out_scalar = vec![0.0f32; m * n];
 
-        mul_mat_q(GgmlType::Q4_0, &weights, &activations, &mut out_avx2, m, n, k);
-        mul_mat_q_scalar(GgmlType::Q4_0, &weights, &activations, &mut out_scalar, m, n, k);
+        mul_mat_q(
+            GgmlType::Q4_0,
+            &weights,
+            &activations,
+            &mut out_avx2,
+            m,
+            n,
+            k,
+        );
+        mul_mat_q_scalar(
+            GgmlType::Q4_0,
+            &weights,
+            &activations,
+            &mut out_scalar,
+            m,
+            n,
+            k,
+        );
 
         let mut max_diff = 0.0f32;
         for j in 0..m * n {
@@ -541,10 +613,14 @@ mod tests {
             assert!(
                 rel < 0.001,
                 "Q4_0 dual_pipeline mismatch at [{j}]: scalar={}, avx2={}, rel_err={rel}",
-                out_scalar[j], out_avx2[j]
+                out_scalar[j],
+                out_avx2[j]
             );
         }
-        eprintln!("Q4_0 dual_pipeline: max_abs_diff={max_diff:.6e} across {} outputs (k={k})", m * n);
+        eprintln!(
+            "Q4_0 dual_pipeline: max_abs_diff={max_diff:.6e} across {} outputs (k={k})",
+            m * n
+        );
     }
 
     #[test]
@@ -558,8 +634,24 @@ mod tests {
         let mut out_avx2 = vec![0.0f32; m * n];
         let mut out_scalar = vec![0.0f32; m * n];
 
-        mul_mat_q(GgmlType::Q4K, &weights, &activations, &mut out_avx2, m, n, k);
-        mul_mat_q_scalar(GgmlType::Q4K, &weights, &activations, &mut out_scalar, m, n, k);
+        mul_mat_q(
+            GgmlType::Q4K,
+            &weights,
+            &activations,
+            &mut out_avx2,
+            m,
+            n,
+            k,
+        );
+        mul_mat_q_scalar(
+            GgmlType::Q4K,
+            &weights,
+            &activations,
+            &mut out_scalar,
+            m,
+            n,
+            k,
+        );
 
         let mut max_diff = 0.0f32;
         for j in 0..m * n {

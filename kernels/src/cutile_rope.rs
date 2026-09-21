@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use crate::{KernelError, Result, RoPE, VerificationTier};
+use cuda_core::{Device, Stream};
 use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
 use cutile::tensor::{IntoPartition, Tensor};
-use cuda_core::{Device, Stream};
-use crate::{KernelError, Result, RoPE, VerificationTier};
+use std::sync::Arc;
 
 #[cutile::module]
 pub mod kernels {
@@ -83,8 +83,7 @@ impl CutileRoPE {
 
     /// Initialise with a specific CUDA device ordinal.
     pub fn with_device(ordinal: usize) -> Result<Self> {
-        let device = Device::new(ordinal)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let device = Device::new(ordinal).map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         let stream = device
             .new_stream()
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
@@ -114,10 +113,10 @@ impl CutileRoPE {
         positions: &[u32],
         cos_sin_table: &[f32],
     ) -> Result<()> {
-        if head_dim % 2 != 0 {
-            return Err(KernelError::InvalidConfig(
-                format!("head_dim must be even, got {head_dim}"),
-            ));
+        if !head_dim.is_multiple_of(2) {
+            return Err(KernelError::InvalidConfig(format!(
+                "head_dim must be even, got {head_dim}"
+            )));
         }
         let half = head_dim / 2;
         let num_sh = batch * seq_len * num_heads;
@@ -169,10 +168,10 @@ impl RoPE for CutileRoPE {
         positions: &[u32],
         theta: f32,
     ) -> Result<()> {
-        if head_dim % 2 != 0 {
-            return Err(KernelError::InvalidConfig(
-                format!("head_dim must be even, got {head_dim}"),
-            ));
+        if !head_dim.is_multiple_of(2) {
+            return Err(KernelError::InvalidConfig(format!(
+                "head_dim must be even, got {head_dim}"
+            )));
         }
         let half = head_dim / 2;
         let num_sh = batch * seq_len * num_heads;
@@ -226,10 +225,10 @@ impl CutileRoPE {
         head_dim: usize,
         theta: f32,
     ) -> Result<Arc<Tensor<f32>>> {
-        if head_dim % 2 != 0 {
-            return Err(KernelError::InvalidConfig(
-                format!("head_dim must be even, got {head_dim}"),
-            ));
+        if !head_dim.is_multiple_of(2) {
+            return Err(KernelError::InvalidConfig(format!(
+                "head_dim must be even, got {head_dim}"
+            )));
         }
         let half = head_dim / 2;
         let num_sh = seq_len * n_heads;
@@ -275,12 +274,11 @@ impl CutileRoPE {
             .partition([half]);
 
         let generics = vec![half.to_string()];
-        let (x_first_dev, x_second_dev, _x) = kernels::cutile_deinterleave(
-            x_first_t, x_second_t, x_dev.clone(),
-        )
-        .generics(generics.clone())
-        .sync_on(stream)
-        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let (x_first_dev, x_second_dev, _x) =
+            kernels::cutile_deinterleave(x_first_t, x_second_t, x_dev.clone())
+                .generics(generics.clone())
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
         let x_first_dev: Arc<Tensor<f32>> = x_first_dev.unpartition().into();
         let x_second_dev: Arc<Tensor<f32>> = x_second_dev.unpartition().into();
@@ -297,9 +295,12 @@ impl CutileRoPE {
             .partition([half]);
 
         let (out_f, out_s, _xf, _xs, _c, _s) = kernels::cutile_rope_kernel(
-            out_first_t, out_second_t,
-            x_first_dev, x_second_dev,
-            cos_t, sin_t,
+            out_first_t,
+            out_second_t,
+            x_first_dev,
+            x_second_dev,
+            cos_t,
+            sin_t,
         )
         .generics(generics)
         .sync_on(stream)
@@ -349,8 +350,7 @@ impl CutileRoPE {
         for sh in 0..num_sh {
             let base = sh * head_dim;
             x_first[sh * half..(sh + 1) * half].copy_from_slice(&x[base..base + half]);
-            x_second[sh * half..(sh + 1) * half]
-                .copy_from_slice(&x[base + half..base + head_dim]);
+            x_second[sh * half..(sh + 1) * half].copy_from_slice(&x[base + half..base + head_dim]);
         }
 
         let stream = &self.stream;
@@ -380,11 +380,17 @@ impl CutileRoPE {
 
         let generics = vec![half.to_string()];
 
-        let (out_f, out_s, _xf, _xs, _c, _s) =
-            kernels::cutile_rope_kernel(out_first_t, out_second_t, x_first_t, x_second_t, cos_t, sin_t)
-                .generics(generics)
-                .sync_on(stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let (out_f, out_s, _xf, _xs, _c, _s) = kernels::cutile_rope_kernel(
+            out_first_t,
+            out_second_t,
+            x_first_t,
+            x_second_t,
+            cos_t,
+            sin_t,
+        )
+        .generics(generics)
+        .sync_on(stream)
+        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
         let host_first: Vec<f32> = out_f
             .unpartition()

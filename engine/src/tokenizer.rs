@@ -71,9 +71,11 @@ impl std::fmt::Debug for ChatTemplate {
 
 impl ChatTemplate {
     pub fn new(template: String, bos_token: String, eos_token: String) -> Self {
-        let mut cfg = hf_chat_template::TokenizerConfig::default();
-        cfg.bos_token = Some(hf_chat_template::TokenField::Str(bos_token));
-        cfg.eos_token = Some(hf_chat_template::TokenField::Str(eos_token));
+        let cfg = hf_chat_template::TokenizerConfig {
+            bos_token: Some(hf_chat_template::TokenField::Str(bos_token)),
+            eos_token: Some(hf_chat_template::TokenField::Str(eos_token)),
+            ..Default::default()
+        };
         let inner = hf_chat_template::ChatTemplate::builder(&template)
             .special_tokens_from(&cfg)
             .build()
@@ -104,7 +106,9 @@ impl ChatTemplate {
             add_generation_prompt,
             ..Default::default()
         };
-        input.extra.insert("enable_thinking".into(), serde_json::Value::Bool(true));
+        input
+            .extra
+            .insert("enable_thinking".into(), serde_json::Value::Bool(true));
         self.inner
             .render(&input)
             .map_err(|e| TokenizerError::Template(e.to_string()))
@@ -228,9 +232,7 @@ impl Tokenizer {
             inner.with_pre_tokenizer(Some(
                 tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, true, false),
             ));
-            inner.with_decoder(Some(
-                tokenizers::decoders::byte_level::ByteLevel::default(),
-            ));
+            inner.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
         }
 
         let bos_token = metadata
@@ -269,14 +271,20 @@ impl Tokenizer {
                 _ => None,
             });
         // Detect thinking model: has <think> as a special token
-        let is_thinking = token_types.as_ref().map_or(false, |types| {
-            tokens.iter().enumerate().any(|(id, tok)| {
-                *tok == "<think>" && id < types.len() && types[id as usize] != 1
-            })
+        let is_thinking = token_types.as_ref().is_some_and(|types| {
+            tokens
+                .iter()
+                .enumerate()
+                .any(|(id, tok)| *tok == "<think>" && id < types.len() && types[id] != 1)
         });
 
-        let template_str = gguf_template
-            .unwrap_or_else(|| if is_thinking { CHATML_TEMPLATE.to_string() } else { CHATML_TEMPLATE_PLAIN.to_string() });
+        let template_str = gguf_template.unwrap_or_else(|| {
+            if is_thinking {
+                CHATML_TEMPLATE.to_string()
+            } else {
+                CHATML_TEMPLATE_PLAIN.to_string()
+            }
+        });
         let chat_template = ChatTemplate::new(template_str, bos_token, eos_token);
 
         Ok(Self {

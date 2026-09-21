@@ -1,9 +1,9 @@
+#[cfg(target_arch = "x86_64")]
+use std::arch::is_x86_feature_detected;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
-#[cfg(target_arch = "x86_64")]
-use std::arch::is_x86_feature_detected;
 
 use crate::config::ModelConfig;
 use tempura_kernels::turboquant::{CompressedKV, KvCacheCompressor};
@@ -69,7 +69,9 @@ unsafe fn f16_slice_to_f32(src: &[u16], dst: &mut [f32]) {
 pub fn append_f32_as_f16(dst: &mut [u16], src: &[f32]) {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("f16c") {
-        unsafe { f32_slice_to_f16(src, dst); }
+        unsafe {
+            f32_slice_to_f16(src, dst);
+        }
         return;
     }
     for (d, &s) in dst.iter_mut().zip(src.iter()) {
@@ -77,9 +79,13 @@ pub fn append_f32_as_f16(dst: &mut [u16], src: &[f32]) {
         let sign = (bits >> 16) & 0x8000;
         let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
         let frac = (bits >> 13) & 0x3ff;
-        *d = if exp <= 0 { sign as u16 }
-             else if exp >= 31 { (sign | 0x7c00) as u16 }
-             else { (sign | ((exp as u32) << 10) | frac) as u16 };
+        *d = if exp <= 0 {
+            sign as u16
+        } else if exp >= 31 {
+            (sign | 0x7c00) as u16
+        } else {
+            (sign | ((exp as u32) << 10) | frac) as u16
+        };
     }
 }
 
@@ -90,16 +96,40 @@ impl KvCache {
         let use_f16 = config.hidden_act == crate::config::HiddenAct::SquaredRelu
             && is_x86_feature_detected!("f16c");
         let k: Vec<Vec<f32>> = (0..num_cache_layers)
-            .map(|_| if use_f16 { Vec::new() } else { vec![0.0; layer_size] })
+            .map(|_| {
+                if use_f16 {
+                    Vec::new()
+                } else {
+                    vec![0.0; layer_size]
+                }
+            })
             .collect();
         let v: Vec<Vec<f32>> = (0..num_cache_layers)
-            .map(|_| if use_f16 { Vec::new() } else { vec![0.0; layer_size] })
+            .map(|_| {
+                if use_f16 {
+                    Vec::new()
+                } else {
+                    vec![0.0; layer_size]
+                }
+            })
             .collect();
         let k_f16: Vec<Vec<u16>> = (0..num_cache_layers)
-            .map(|_| if use_f16 { vec![0u16; layer_size] } else { Vec::new() })
+            .map(|_| {
+                if use_f16 {
+                    vec![0u16; layer_size]
+                } else {
+                    Vec::new()
+                }
+            })
             .collect();
         let v_f16: Vec<Vec<u16>> = (0..num_cache_layers)
-            .map(|_| if use_f16 { vec![0u16; layer_size] } else { Vec::new() })
+            .map(|_| {
+                if use_f16 {
+                    vec![0u16; layer_size]
+                } else {
+                    Vec::new()
+                }
+            })
             .collect();
 
         Self {
@@ -125,10 +155,8 @@ impl KvCache {
         let num_cache_layers = config.num_attention_layers();
         let k: Vec<Vec<f32>> = (0..num_cache_layers).map(|_| Vec::new()).collect();
         let v: Vec<Vec<f32>> = (0..num_cache_layers).map(|_| Vec::new()).collect();
-        let k_compressed: Vec<Option<CompressedKV>> =
-            (0..num_cache_layers).map(|_| None).collect();
-        let v_compressed: Vec<Option<CompressedKV>> =
-            (0..num_cache_layers).map(|_| None).collect();
+        let k_compressed: Vec<Option<CompressedKV>> = (0..num_cache_layers).map(|_| None).collect();
+        let v_compressed: Vec<Option<CompressedKV>> = (0..num_cache_layers).map(|_| None).collect();
 
         Self {
             k,
@@ -178,8 +206,14 @@ impl KvCache {
             let dst_offset = self.seq_len * stride;
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                f32_slice_to_f16(&new_k[..src_len], &mut self.k_f16[layer][dst_offset..dst_offset + src_len]);
-                f32_slice_to_f16(&new_v[..src_len], &mut self.v_f16[layer][dst_offset..dst_offset + src_len]);
+                f32_slice_to_f16(
+                    &new_k[..src_len],
+                    &mut self.k_f16[layer][dst_offset..dst_offset + src_len],
+                );
+                f32_slice_to_f16(
+                    &new_v[..src_len],
+                    &mut self.v_f16[layer][dst_offset..dst_offset + src_len],
+                );
             }
         } else {
             let dst_offset = self.seq_len * stride;
@@ -215,7 +249,9 @@ impl KvCache {
     /// Updates `position_offset` so callers know how many tokens were discarded total.
     /// No-op for compressed caches (compressor handles memory separately).
     pub fn shift(&mut self, keep_from: usize) {
-        if self.compressed { return; }
+        if self.compressed {
+            return;
+        }
         debug_assert!(keep_from <= self.seq_len);
         let n_keep = self.seq_len - keep_from;
         let stride = self.num_kv_heads * self.head_dim;
@@ -281,7 +317,9 @@ impl KvCache {
             let len = num_tokens * self.num_kv_heads * self.head_dim;
             let mut out = vec![0.0f32; len];
             #[cfg(target_arch = "x86_64")]
-            unsafe { f16_slice_to_f32(&self.k_f16[layer][..len], &mut out); }
+            unsafe {
+                f16_slice_to_f32(&self.k_f16[layer][..len], &mut out);
+            }
             Cow::Owned(out)
         } else {
             let len = num_tokens * self.num_kv_heads * self.head_dim;
@@ -302,7 +340,9 @@ impl KvCache {
             let len = num_tokens * self.num_kv_heads * self.head_dim;
             let mut out = vec![0.0f32; len];
             #[cfg(target_arch = "x86_64")]
-            unsafe { f16_slice_to_f32(&self.v_f16[layer][..len], &mut out); }
+            unsafe {
+                f16_slice_to_f32(&self.v_f16[layer][..len], &mut out);
+            }
             Cow::Owned(out)
         } else {
             let len = num_tokens * self.num_kv_heads * self.head_dim;
@@ -388,10 +428,18 @@ impl KvCache {
 }
 
 impl tempura_kernel_api::VerifiedKvCache for KvCache {
-    fn seq_len(&self) -> usize { self.seq_len }
-    fn max_seq_len(&self) -> usize { self.max_seq_len }
-    fn num_kv_heads(&self) -> usize { self.num_kv_heads }
-    fn head_dim(&self) -> usize { self.head_dim }
+    fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+    fn num_kv_heads(&self) -> usize {
+        self.num_kv_heads
+    }
+    fn head_dim(&self) -> usize {
+        self.head_dim
+    }
 }
 
 // Verus deductive proofs for KvCache struct invariants.
@@ -671,9 +719,15 @@ impl PrefixCacheTable {
 }
 
 impl tempura_kernel_api::VerifiedPrefixCache for PrefixCacheTable {
-    fn num_entries(&self) -> usize { self.entries.len() }
-    fn max_entries(&self) -> usize { self.max_entries }
-    fn tick(&self) -> u64 { self.tick }
+    fn num_entries(&self) -> usize {
+        self.entries.len()
+    }
+    fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+    fn tick(&self) -> u64 {
+        self.tick
+    }
 }
 
 pub struct PrefixMatch {
@@ -737,8 +791,12 @@ impl PageAllocator {
 }
 
 impl tempura_kernel_api::VerifiedPageAllocator for PageAllocator {
-    fn available(&self) -> usize { self.free_pages.len() }
-    fn total(&self) -> usize { self.total_pages }
+    fn available(&self) -> usize {
+        self.free_pages.len()
+    }
+    fn total(&self) -> usize {
+        self.total_pages
+    }
 }
 
 verus! {
@@ -831,8 +889,12 @@ impl BlockTable {
 }
 
 impl tempura_kernel_api::VerifiedBlockTable for BlockTable {
-    fn num_blocks(&self) -> usize { self.num_blocks }
-    fn max_blocks(&self) -> usize { self.table.len() }
+    fn num_blocks(&self) -> usize {
+        self.num_blocks
+    }
+    fn max_blocks(&self) -> usize {
+        self.table.len()
+    }
 }
 
 verus! {
@@ -879,7 +941,7 @@ impl PagedKvCache {
         let v_pages = (0..num_cache_layers)
             .map(|_| vec![0.0f32; total_pages * page_stride])
             .collect();
-        let max_blocks = (config.max_seq_len + block_size - 1) / block_size;
+        let max_blocks = config.max_seq_len.div_ceil(block_size);
         let block_tables = (0..num_cache_layers)
             .map(|_| BlockTable::new(max_blocks))
             .collect();
@@ -907,7 +969,7 @@ impl PagedKvCache {
     }
 
     fn ensure_blocks_for(&mut self, layer: usize, needed_tokens: usize) {
-        let needed_blocks = (needed_tokens + self.block_size - 1) / self.block_size;
+        let needed_blocks = needed_tokens.div_ceil(self.block_size);
         let bt = &mut self.block_tables[layer];
         let current_blocks = bt.num_blocks();
         for _ in current_blocks..needed_blocks {
@@ -1001,7 +1063,7 @@ impl PagedKvCache {
         if self.seq_len == 0 {
             return 0.0;
         }
-        let needed_blocks = (self.seq_len + self.block_size - 1) / self.block_size;
+        let needed_blocks = self.seq_len.div_ceil(self.block_size);
         let allocated_tokens = needed_blocks * self.block_size;
         let wasted = allocated_tokens - self.seq_len;
         wasted as f64 / allocated_tokens as f64
@@ -1102,7 +1164,7 @@ impl Fp8PagedKvCache {
         let v_pages = (0..config.num_layers)
             .map(|_| vec![0u8; total_pages * page_stride])
             .collect();
-        let max_blocks = (config.max_seq_len + block_size - 1) / block_size;
+        let max_blocks = config.max_seq_len.div_ceil(block_size);
         let block_tables = (0..config.num_layers)
             .map(|_| BlockTable::new(max_blocks))
             .collect();
@@ -1122,7 +1184,7 @@ impl Fp8PagedKvCache {
     }
 
     fn ensure_blocks_for(&mut self, layer: usize, needed_tokens: usize) {
-        let needed_blocks = (needed_tokens + self.block_size - 1) / self.block_size;
+        let needed_blocks = needed_tokens.div_ceil(self.block_size);
         let bt = &mut self.block_tables[layer];
         let current_blocks = bt.num_blocks();
         for _ in current_blocks..needed_blocks {

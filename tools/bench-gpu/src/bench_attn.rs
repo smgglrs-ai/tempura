@@ -39,33 +39,118 @@ fn run_attn(
     let mut out = vec![0.0f32; n];
 
     for _ in 0..warmup {
-        attn.forward(q, k, v, &mut out, cfg.batch, cfg.seq_len, cfg.kv_len,
-                     cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, scale)
-            .unwrap();
+        attn.forward(
+            q,
+            k,
+            v,
+            &mut out,
+            cfg.batch,
+            cfg.seq_len,
+            cfg.kv_len,
+            cfg.num_heads,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            scale,
+        )
+        .unwrap();
     }
 
     let t0 = Instant::now();
     for _ in 0..iters {
-        attn.forward(q, k, v, &mut out, cfg.batch, cfg.seq_len, cfg.kv_len,
-                     cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, scale)
-            .unwrap();
+        attn.forward(
+            q,
+            k,
+            v,
+            &mut out,
+            cfg.batch,
+            cfg.seq_len,
+            cfg.kv_len,
+            cfg.num_heads,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            scale,
+        )
+        .unwrap();
     }
     let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
     (out, us)
 }
 
 fn max_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 fn main() {
     let configs = vec![
-        ("decode kv=64",   Config { batch: 1, seq_len: 1,   kv_len: 64,   num_heads: 32, num_kv_heads: 8, head_dim: 128 }),
-        ("decode kv=256",  Config { batch: 1, seq_len: 1,   kv_len: 256,  num_heads: 32, num_kv_heads: 8, head_dim: 128 }),
-        ("decode kv=1024", Config { batch: 1, seq_len: 1,   kv_len: 1024, num_heads: 32, num_kv_heads: 8, head_dim: 128 }),
-        ("prefill s=16",   Config { batch: 1, seq_len: 16,  kv_len: 16,   num_heads: 32, num_kv_heads: 8, head_dim: 128 }),
-        ("prefill s=64",   Config { batch: 1, seq_len: 64,  kv_len: 64,   num_heads: 32, num_kv_heads: 8, head_dim: 128 }),
-        ("prefill s=128",  Config { batch: 1, seq_len: 128, kv_len: 128,  num_heads: 32, num_kv_heads: 8, head_dim: 128 }),
+        (
+            "decode kv=64",
+            Config {
+                batch: 1,
+                seq_len: 1,
+                kv_len: 64,
+                num_heads: 32,
+                num_kv_heads: 8,
+                head_dim: 128,
+            },
+        ),
+        (
+            "decode kv=256",
+            Config {
+                batch: 1,
+                seq_len: 1,
+                kv_len: 256,
+                num_heads: 32,
+                num_kv_heads: 8,
+                head_dim: 128,
+            },
+        ),
+        (
+            "decode kv=1024",
+            Config {
+                batch: 1,
+                seq_len: 1,
+                kv_len: 1024,
+                num_heads: 32,
+                num_kv_heads: 8,
+                head_dim: 128,
+            },
+        ),
+        (
+            "prefill s=16",
+            Config {
+                batch: 1,
+                seq_len: 16,
+                kv_len: 16,
+                num_heads: 32,
+                num_kv_heads: 8,
+                head_dim: 128,
+            },
+        ),
+        (
+            "prefill s=64",
+            Config {
+                batch: 1,
+                seq_len: 64,
+                kv_len: 64,
+                num_heads: 32,
+                num_kv_heads: 8,
+                head_dim: 128,
+            },
+        ),
+        (
+            "prefill s=128",
+            Config {
+                batch: 1,
+                seq_len: 128,
+                kv_len: 128,
+                num_heads: 32,
+                num_kv_heads: 8,
+                head_dim: 128,
+            },
+        ),
     ];
 
     let cutile_attn = CutileFlashAttention::new().expect("Failed to init CutileFlashAttention");
@@ -85,14 +170,18 @@ fn main() {
         let (ref_out, ref_us) = run_attn(&CpuAttention, cfg, &q, &k, &v, scale, warmup, iters);
         println!("{:<28} {:>12} {:>10.1}", "CPU  f32  naive", "ref", ref_us);
 
-        let (flash_out, flash_us) = run_attn(&CpuFlashAttention, cfg, &q, &k, &v, scale, warmup, iters);
+        let (flash_out, flash_us) =
+            run_attn(&CpuFlashAttention, cfg, &q, &k, &v, scale, warmup, iters);
         let d = max_diff(&ref_out, &flash_out);
         println!("{:<28} {:>12.6} {:>10.1}", "CPU  f32  flash", d, flash_us);
 
         let (cutile_out, cutile_us) = run_attn(&cutile_attn, cfg, &q, &k, &v, scale, warmup, iters);
         let d = max_diff(&ref_out, &cutile_out);
         let speedup = ref_us / cutile_us;
-        println!("{:<28} {:>12.6} {:>10.1}  ({:.1}× vs CPU naive)", "GPU  cutile flash", d, cutile_us, speedup);
+        println!(
+            "{:<28} {:>12.6} {:>10.1}  ({:.1}× vs CPU naive)",
+            "GPU  cutile flash", d, cutile_us, speedup
+        );
         println!();
     }
 
@@ -114,12 +203,20 @@ fn main() {
             let pos: Vec<u32> = (0..seq_len as u32).collect();
 
             let mut x_cpu = x.clone();
-            cpu_rope.forward(&mut x_cpu, 1, seq_len, nh, hd, &pos, theta).unwrap();
+            cpu_rope
+                .forward(&mut x_cpu, 1, seq_len, nh, hd, &pos, theta)
+                .unwrap();
 
             let mut x_gpu = x.clone();
-            gpu_rope.forward(&mut x_gpu, 1, seq_len, nh, hd, &pos, theta).unwrap();
+            gpu_rope
+                .forward(&mut x_gpu, 1, seq_len, nh, hd, &pos, theta)
+                .unwrap();
 
-            let md: f32 = x_cpu.iter().zip(&x_gpu).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            let md: f32 = x_cpu
+                .iter()
+                .zip(&x_gpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
             let nd = x_cpu.iter().zip(&x_gpu).filter(|(a, b)| a != b).count();
             println!(
                 "  RoPE {label} (hd={hd}, theta={theta:.0}): max_diff={md:.10}  diff_elems={nd}/{n}"

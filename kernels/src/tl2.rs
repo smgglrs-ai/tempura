@@ -79,8 +79,14 @@ unsafe fn transpose_8_8(v: &mut [__m256i; 8]) {
     let (r2, r3) = mm256_merge_si128(x1, x5);
     let (r4, r5) = mm256_merge_si128(x2, x6);
     let (r6, r7) = mm256_merge_si128(x3, x7);
-    v[0] = r0; v[1] = r1; v[2] = r2; v[3] = r3;
-    v[4] = r4; v[5] = r5; v[6] = r6; v[7] = r7;
+    v[0] = r0;
+    v[1] = r1;
+    v[2] = r2;
+    v[3] = r3;
+    v[4] = r4;
+    v[5] = r5;
+    v[6] = r6;
+    v[7] = r7;
 }
 
 // ── per_tensor_quant ───────────────────────────────────────────────────────
@@ -110,10 +116,9 @@ pub unsafe fn three_lut_ctor(qlut: &mut [i8], b: &[f32], scale: f32, act_k: usiz
     let vec_bi = _mm256_set_epi32(84, 72, 60, 48, 36, 24, 12, 0);
     let scale_vec = _mm256_set1_ps(scale);
     let shuffle_mask = _mm256_set_epi8(
-        0x0f, 0x0d, 0x0b, 0x09, 0x07, 0x05, 0x03, 0x01,
-        0x0e, 0x0c, 0x0a, 0x08, 0x06, 0x04, 0x02, 0x00,
-        0x0f, 0x0d, 0x0b, 0x09, 0x07, 0x05, 0x03, 0x01,
-        0x0e, 0x0c, 0x0a, 0x08, 0x06, 0x04, 0x02, 0x00,
+        0x0f, 0x0d, 0x0b, 0x09, 0x07, 0x05, 0x03, 0x01, 0x0e, 0x0c, 0x0a, 0x08, 0x06, 0x04, 0x02,
+        0x00, 0x0f, 0x0d, 0x0b, 0x09, 0x07, 0x05, 0x03, 0x01, 0x0e, 0x0c, 0x0a, 0x08, 0x06, 0x04,
+        0x02, 0x00,
     );
     const ROUND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
 
@@ -151,10 +156,22 @@ pub unsafe fn three_lut_ctor(qlut: &mut [i8], b: &[f32], scale: f32, act_k: usiz
         let mut hi = [ix[8], ix[9], ix[10], ix[11], ix[12], ix[13], ix[14], ix[15]];
         transpose_8_8(&mut lo);
         transpose_8_8(&mut hi);
-        ix[0] = lo[0]; ix[1] = lo[1]; ix[2] = lo[2]; ix[3] = lo[3];
-        ix[4] = lo[4]; ix[5] = lo[5]; ix[6] = lo[6]; ix[7] = lo[7];
-        ix[8] = hi[0]; ix[9] = hi[1]; ix[10] = hi[2]; ix[11] = hi[3];
-        ix[12] = hi[4]; ix[13] = hi[5]; ix[14] = hi[6]; ix[15] = hi[7];
+        ix[0] = lo[0];
+        ix[1] = lo[1];
+        ix[2] = lo[2];
+        ix[3] = lo[3];
+        ix[4] = lo[4];
+        ix[5] = lo[5];
+        ix[6] = lo[6];
+        ix[7] = lo[7];
+        ix[8] = hi[0];
+        ix[9] = hi[1];
+        ix[10] = hi[2];
+        ix[11] = hi[3];
+        ix[12] = hi[4];
+        ix[13] = hi[5];
+        ix[14] = hi[6];
+        ix[15] = hi[7];
 
         for g in 0..8 {
             ix[g] = _mm256_packs_epi32(ix[g], ix[g + 8]);
@@ -180,10 +197,9 @@ pub unsafe fn two_lut_ctor(qlut: &mut [i8], b: &[f32], scale: f32, act_k: usize)
     let vec_bi = _mm256_set_epi32(56, 48, 40, 32, 24, 16, 8, 0);
     let scale_vec = _mm256_set1_ps(scale);
     let shuffle_mask = _mm256_set_epi8(
-        0x0f, 0x0d, 0x0b, 0x09, 0x07, 0x05, 0x03, 0x01,
-        0x0e, 0x0c, 0x0a, 0x08, 0x06, 0x04, 0x02, 0x00,
-        0x0f, 0x0d, 0x0b, 0x09, 0x07, 0x05, 0x03, 0x01,
-        0x0e, 0x0c, 0x0a, 0x08, 0x06, 0x04, 0x02, 0x00,
+        0x0f, 0x0d, 0x0b, 0x09, 0x07, 0x05, 0x03, 0x01, 0x0e, 0x0c, 0x0a, 0x08, 0x06, 0x04, 0x02,
+        0x00, 0x0f, 0x0d, 0x0b, 0x09, 0x07, 0x05, 0x03, 0x01, 0x0e, 0x0c, 0x0a, 0x08, 0x06, 0x04,
+        0x02, 0x00,
     );
     const ROUND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
 
@@ -196,8 +212,13 @@ pub unsafe fn two_lut_ctor(qlut: &mut [i8], b: &[f32], scale: f32, act_k: usize)
 
         let zero = _mm256_setzero_si256();
         let mut lut = [zero; 16];
-        lut[15] = zero; lut[14] = zero; lut[13] = zero;
-        lut[12] = zero; lut[11] = zero; lut[10] = zero; lut[9] = zero;
+        lut[15] = zero;
+        lut[14] = zero;
+        lut[13] = zero;
+        lut[12] = zero;
+        lut[11] = zero;
+        lut[10] = zero;
+        lut[9] = zero;
         lut[8] = _mm256_add_epi32(b0, b1);
         lut[7] = b0;
         lut[6] = _mm256_sub_epi32(b0, b1);
@@ -214,10 +235,22 @@ pub unsafe fn two_lut_ctor(qlut: &mut [i8], b: &[f32], scale: f32, act_k: usize)
         let mut hi = [ix[8], ix[9], ix[10], ix[11], ix[12], ix[13], ix[14], ix[15]];
         transpose_8_8(&mut lo);
         transpose_8_8(&mut hi);
-        ix[0] = lo[0]; ix[1] = lo[1]; ix[2] = lo[2]; ix[3] = lo[3];
-        ix[4] = lo[4]; ix[5] = lo[5]; ix[6] = lo[6]; ix[7] = lo[7];
-        ix[8] = hi[0]; ix[9] = hi[1]; ix[10] = hi[2]; ix[11] = hi[3];
-        ix[12] = hi[4]; ix[13] = hi[5]; ix[14] = hi[6]; ix[15] = hi[7];
+        ix[0] = lo[0];
+        ix[1] = lo[1];
+        ix[2] = lo[2];
+        ix[3] = lo[3];
+        ix[4] = lo[4];
+        ix[5] = lo[5];
+        ix[6] = lo[6];
+        ix[7] = lo[7];
+        ix[8] = hi[0];
+        ix[9] = hi[1];
+        ix[10] = hi[2];
+        ix[11] = hi[3];
+        ix[12] = hi[4];
+        ix[13] = hi[5];
+        ix[14] = hi[6];
+        ix[15] = hi[7];
 
         for g in 0..8 {
             ix[g] = _mm256_packs_epi32(ix[g], ix[g + 8]);
@@ -268,14 +301,11 @@ pub unsafe fn three_tbl_impl(
         let mut vec_signs = [zero; 8];
 
         for ai in 0..kk / 2 {
-            vec_as[ai] = _mm256_loadu_si256(
-                a.as_ptr().add(i * kk / 2 + ai * 32) as *const __m256i,
-            );
+            vec_as[ai] = _mm256_loadu_si256(a.as_ptr().add(i * kk / 2 + ai * 32) as *const __m256i);
         }
         for s in 0..kk / 8 {
-            vec_signs[s] = _mm256_loadu_si256(
-                sign.as_ptr().add(i * kk / 8 + s * 32) as *const __m256i,
-            );
+            vec_signs[s] =
+                _mm256_loadu_si256(sign.as_ptr().add(i * kk / 8 + s * 32) as *const __m256i);
         }
 
         for bs in 0..batch_size {
@@ -305,10 +335,22 @@ pub unsafe fn three_tbl_impl(
                     let vbf = _mm256_shuffle_epi8(_mm256_set_m128i(k3v, k3v), v_bot);
                     let vbs = _mm256_shuffle_epi8(_mm256_set_m128i(k4, k4), v_bot);
 
-                    let vtlo = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vtf, vts), sll), sll);
-                    let vthi = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vtf, vts), slh), slh);
-                    let vblo = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vbf, vbs), srl), srl);
-                    let vbhi = _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vbf, vbs), srh), srh);
+                    let vtlo = _mm256_xor_si256(
+                        _mm256_add_epi16(_mm256_unpackhi_epi8(vtf, vts), sll),
+                        sll,
+                    );
+                    let vthi = _mm256_xor_si256(
+                        _mm256_add_epi16(_mm256_unpacklo_epi8(vtf, vts), slh),
+                        slh,
+                    );
+                    let vblo = _mm256_xor_si256(
+                        _mm256_add_epi16(_mm256_unpackhi_epi8(vbf, vbs), srl),
+                        srl,
+                    );
+                    let vbhi = _mm256_xor_si256(
+                        _mm256_add_epi16(_mm256_unpacklo_epi8(vbf, vbs), srh),
+                        srh,
+                    );
 
                     vec_c0 = _mm256_add_epi16(vec_c0, vthi);
                     vec_c0 = _mm256_add_epi16(vec_c0, vbhi);
@@ -332,9 +374,15 @@ pub unsafe fn three_tbl_impl(
             let mut gc3 = _mm256_loadu_si256(c.as_ptr().add(off + 24) as *const __m256i);
 
             gc0 = _mm256_add_epi32(gc0, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c0)));
-            gc1 = _mm256_add_epi32(gc1, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)));
+            gc1 = _mm256_add_epi32(
+                gc1,
+                _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)),
+            );
             gc2 = _mm256_add_epi32(gc2, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c1)));
-            gc3 = _mm256_add_epi32(gc3, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)));
+            gc3 = _mm256_add_epi32(
+                gc3,
+                _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)),
+            );
 
             _mm256_storeu_si256(c.as_mut_ptr().add(off) as *mut __m256i, gc0);
             _mm256_storeu_si256(c.as_mut_ptr().add(off + 8) as *mut __m256i, gc1);
@@ -396,18 +444,54 @@ pub unsafe fn three_tbl_impl_bk96(
                     let v_bot = _mm256_and_si256(vec_a, vec_mask);
                     let vbf = _mm256_shuffle_epi8(_mm256_set_m128i(k3v, k3v), v_bot);
                     let vbs = _mm256_shuffle_epi8(_mm256_set_m128i(k4, k4), v_bot);
-                    vec_c0 = _mm256_add_epi16(vec_c0, _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vtf, vts), slh), slh));
-                    vec_c0 = _mm256_add_epi16(vec_c0, _mm256_xor_si256(_mm256_add_epi16(_mm256_unpacklo_epi8(vbf, vbs), srh), srh));
-                    vec_c1 = _mm256_add_epi16(vec_c1, _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vtf, vts), sll), sll));
-                    vec_c1 = _mm256_add_epi16(vec_c1, _mm256_xor_si256(_mm256_add_epi16(_mm256_unpackhi_epi8(vbf, vbs), srl), srl));
+                    vec_c0 = _mm256_add_epi16(
+                        vec_c0,
+                        _mm256_xor_si256(
+                            _mm256_add_epi16(_mm256_unpacklo_epi8(vtf, vts), slh),
+                            slh,
+                        ),
+                    );
+                    vec_c0 = _mm256_add_epi16(
+                        vec_c0,
+                        _mm256_xor_si256(
+                            _mm256_add_epi16(_mm256_unpacklo_epi8(vbf, vbs), srh),
+                            srh,
+                        ),
+                    );
+                    vec_c1 = _mm256_add_epi16(
+                        vec_c1,
+                        _mm256_xor_si256(
+                            _mm256_add_epi16(_mm256_unpackhi_epi8(vtf, vts), sll),
+                            sll,
+                        ),
+                    );
+                    vec_c1 = _mm256_add_epi16(
+                        vec_c1,
+                        _mm256_xor_si256(
+                            _mm256_add_epi16(_mm256_unpackhi_epi8(vbf, vbs), srl),
+                            srl,
+                        ),
+                    );
                 }};
             }
 
             // Fully unrolled: kg=0..4 (KK/8=4), each with j=0..3
-            sub!(0, 0, 0, 1, 2, 3); sub!(0, 1, 4, 5, 6, 7); sub!(0, 2, 8, 9, 10, 11); sub!(0, 3, 12, 13, 14, 15);
-            sub!(1, 0, 0, 1, 2, 3); sub!(1, 1, 4, 5, 6, 7); sub!(1, 2, 8, 9, 10, 11); sub!(1, 3, 12, 13, 14, 15);
-            sub!(2, 0, 0, 1, 2, 3); sub!(2, 1, 4, 5, 6, 7); sub!(2, 2, 8, 9, 10, 11); sub!(2, 3, 12, 13, 14, 15);
-            sub!(3, 0, 0, 1, 2, 3); sub!(3, 1, 4, 5, 6, 7); sub!(3, 2, 8, 9, 10, 11); sub!(3, 3, 12, 13, 14, 15);
+            sub!(0, 0, 0, 1, 2, 3);
+            sub!(0, 1, 4, 5, 6, 7);
+            sub!(0, 2, 8, 9, 10, 11);
+            sub!(0, 3, 12, 13, 14, 15);
+            sub!(1, 0, 0, 1, 2, 3);
+            sub!(1, 1, 4, 5, 6, 7);
+            sub!(1, 2, 8, 9, 10, 11);
+            sub!(1, 3, 12, 13, 14, 15);
+            sub!(2, 0, 0, 1, 2, 3);
+            sub!(2, 1, 4, 5, 6, 7);
+            sub!(2, 2, 8, 9, 10, 11);
+            sub!(2, 3, 12, 13, 14, 15);
+            sub!(3, 0, 0, 1, 2, 3);
+            sub!(3, 1, 4, 5, 6, 7);
+            sub!(3, 2, 8, 9, 10, 11);
+            sub!(3, 3, 12, 13, 14, 15);
 
             let off = i + bm * bs;
             let mut gc0 = _mm256_loadu_si256(c.as_ptr().add(off) as *const __m256i);
@@ -415,9 +499,15 @@ pub unsafe fn three_tbl_impl_bk96(
             let mut gc2 = _mm256_loadu_si256(c.as_ptr().add(off + 16) as *const __m256i);
             let mut gc3 = _mm256_loadu_si256(c.as_ptr().add(off + 24) as *const __m256i);
             gc0 = _mm256_add_epi32(gc0, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c0)));
-            gc1 = _mm256_add_epi32(gc1, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)));
+            gc1 = _mm256_add_epi32(
+                gc1,
+                _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)),
+            );
             gc2 = _mm256_add_epi32(gc2, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c1)));
-            gc3 = _mm256_add_epi32(gc3, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)));
+            gc3 = _mm256_add_epi32(
+                gc3,
+                _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)),
+            );
             _mm256_storeu_si256(c.as_mut_ptr().add(off) as *mut __m256i, gc0);
             _mm256_storeu_si256(c.as_mut_ptr().add(off + 8) as *mut __m256i, gc1);
             _mm256_storeu_si256(c.as_mut_ptr().add(off + 16) as *mut __m256i, gc2);
@@ -446,9 +536,7 @@ pub unsafe fn two_tbl_impl(
     for i in (0..bm).step_by(32) {
         let mut vec_as = [_mm256_setzero_si256(); 8];
         for ai in 0..kk / 2 {
-            vec_as[ai] = _mm256_loadu_si256(
-                a.as_ptr().add(i * kk / 2 + ai * 32) as *const __m256i,
-            );
+            vec_as[ai] = _mm256_loadu_si256(a.as_ptr().add(i * kk / 2 + ai * 32) as *const __m256i);
         }
 
         for bs in 0..batch_size {
@@ -493,9 +581,15 @@ pub unsafe fn two_tbl_impl(
             let mut gc3 = _mm256_loadu_si256(c.as_ptr().add(off + 24) as *const __m256i);
 
             gc0 = _mm256_add_epi32(gc0, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c0)));
-            gc1 = _mm256_add_epi32(gc1, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)));
+            gc1 = _mm256_add_epi32(
+                gc1,
+                _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c0, 1)),
+            );
             gc2 = _mm256_add_epi32(gc2, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c1)));
-            gc3 = _mm256_add_epi32(gc3, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)));
+            gc3 = _mm256_add_epi32(
+                gc3,
+                _mm256_cvtepi16_epi32(_mm256_extracti128_si256(vec_c1, 1)),
+            );
 
             _mm256_storeu_si256(c.as_mut_ptr().add(off) as *mut __m256i, gc0);
             _mm256_storeu_si256(c.as_mut_ptr().add(off + 8) as *mut __m256i, gc1);
@@ -523,7 +617,14 @@ impl Tl2Config {
         let bk_num = k / bk;
         let three_k = bk_num * bk;
         let two_k = k - three_k;
-        Self { m, k, bm, bk, three_k, two_k }
+        Self {
+            m,
+            k,
+            bm,
+            bk,
+            three_k,
+            two_k,
+        }
     }
 
     pub fn for_dims(m: usize, k: usize) -> Option<Self> {
@@ -547,13 +648,20 @@ impl Tl2Config {
                 // Auto-select: largest factor of m that is 32..=320
                 let mut best = 0;
                 for candidate in [320, 256, 160, 128, 64, 32] {
-                    if m % candidate == 0 { best = candidate; break; }
+                    if m.is_multiple_of(candidate) {
+                        best = candidate;
+                        break;
+                    }
                 }
-                if best == 0 { return None; }
+                if best == 0 {
+                    return None;
+                }
                 best
             }
         };
-        if m % bm != 0 { return None; }
+        if !m.is_multiple_of(bm) {
+            return None;
+        }
         Some(Self::new(m, k, bm, bk))
     }
 }
@@ -586,17 +694,27 @@ pub fn repack_i2s_to_tl2(i2s: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, f32
     repack_i2s_to_tl2_with_config(i2s, m, k, &cfg)
 }
 
-pub fn repack_i2s_to_tl2_with_config(i2s: &[u8], m: usize, k: usize, cfg: &Tl2Config) -> Option<(Vec<u8>, f32)> {
-    let big_bm = cfg.bm;   // BM in the Python — tile height
-    let big_by = cfg.bk;   // BY/BK in the Python — reduction tile
-    let bmm: usize = 32;   // bmm in the Python — inner tile
+pub fn repack_i2s_to_tl2_with_config(
+    i2s: &[u8],
+    m: usize,
+    k: usize,
+    cfg: &Tl2Config,
+) -> Option<(Vec<u8>, f32)> {
+    let big_bm = cfg.bm; // BM in the Python — tile height
+    let big_by = cfg.bk; // BY/BK in the Python — reduction tile
+    let bmm: usize = 32; // bmm in the Python — inner tile
     let by: usize = 192 / bmm; // by in the Python = 6
     let three_k = cfg.three_k;
     let two_k = cfg.two_k;
 
     let scale_off = k * m / 4;
     let scale = if scale_off + 4 <= i2s.len() {
-        f32::from_ne_bytes([i2s[scale_off], i2s[scale_off+1], i2s[scale_off+2], i2s[scale_off+3]])
+        f32::from_ne_bytes([
+            i2s[scale_off],
+            i2s[scale_off + 1],
+            i2s[scale_off + 2],
+            i2s[scale_off + 3],
+        ])
     } else {
         1.0
     };
@@ -605,19 +723,22 @@ pub fn repack_i2s_to_tl2_with_config(i2s: &[u8], m: usize, k: usize, cfg: &Tl2Co
     let row_bytes = k / 4;
     let mut ternary = vec![0i8; m * k];
     use rayon::prelude::*;
-    ternary.par_chunks_mut(k).enumerate().for_each(|(r, row_out)| {
-        let row_base = r * row_bytes;
-        for grp in 0..k / 128 {
-            let blk = &i2s[row_base + grp * 32..row_base + grp * 32 + 32];
-            for j in 0..32 {
-                let b = blk[j];
-                row_out[grp * 128 + j]      = ((b >> 6) & 3) as i8 - 1;
-                row_out[grp * 128 + 32 + j]  = ((b >> 4) & 3) as i8 - 1;
-                row_out[grp * 128 + 64 + j]  = ((b >> 2) & 3) as i8 - 1;
-                row_out[grp * 128 + 96 + j]  = (b & 3) as i8 - 1;
+    ternary
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(r, row_out)| {
+            let row_base = r * row_bytes;
+            for grp in 0..k / 128 {
+                let blk = &i2s[row_base + grp * 32..row_base + grp * 32 + 32];
+                for j in 0..32 {
+                    let b = blk[j];
+                    row_out[grp * 128 + j] = ((b >> 6) & 3) as i8 - 1;
+                    row_out[grp * 128 + 32 + j] = ((b >> 4) & 3) as i8 - 1;
+                    row_out[grp * 128 + 64 + j] = ((b >> 2) & 3) as i8 - 1;
+                    row_out[grp * 128 + 96 + j] = (b & 3) as i8 - 1;
+                }
             }
-        }
-    });
+        });
 
     let mut final_weight: Vec<Vec<u8>> = Vec::new();
 
@@ -640,7 +761,7 @@ pub fn repack_i2s_to_tl2_with_config(i2s: &[u8], m: usize, k: usize, cfg: &Tl2Co
     let mut sign_weight = vec![0u8; three_n];
     let mut abs_weight = vec![0u8; three_n];
     for i in 0..three_n {
-        let s = if weight[i] < 0 { 1u8 } else if weight[i] > 0 { 0u8 } else { 0u8 };
+        let s = if weight[i] < 0 { 1u8 } else { 0u8 };
         // Python: sign(w) + 2, then where > 1, set 0. So negative → 1, zero/positive → 0
         sign_weight[i] = s;
         abs_weight[i] = weight[i].unsigned_abs() as u8;
@@ -682,7 +803,11 @@ pub fn repack_i2s_to_tl2_with_config(i2s: &[u8], m: usize, k: usize, cfg: &Tl2Co
                         let row = t0 * big_bm + t2 * bmm + br;
                         let col0 = t1 * by3 + t3 * by_inner;
                         let v0 = abs_weight[row * k3 + col0];
-                        let v1 = if by_inner > 1 { abs_weight[row * k3 + col0 + 1] } else { 0 };
+                        let v1 = if by_inner > 1 {
+                            abs_weight[row * k3 + col0 + 1]
+                        } else {
+                            0
+                        };
                         nibbles[chunk_idx * bmm + br] = (v0 << 4) | (v1 & 0x0f);
                     }
                 }
@@ -760,19 +885,30 @@ pub fn repack_i2s_to_tl2_with_config(i2s: &[u8], m: usize, k: usize, cfg: &Tl2Co
         let n_two_by_groups = (two_by_tile / 2) / (two_by_inner / 2);
         let two_pairs = two_by_inner / 2;
 
-        let total_two_chunks = n_bm_tiles * n_two_by_tiles.max(1) * n_bmm_groups * n_two_by_groups.max(1);
+        let total_two_chunks =
+            n_bm_tiles * n_two_by_tiles.max(1) * n_bmm_groups * n_two_by_groups.max(1);
         let mut two_nibbles = vec![0u8; total_two_chunks * bmm];
 
         for t0 in 0..n_bm_tiles {
             for t1 in 0..n_two_by_tiles.max(1) {
                 for t2 in 0..n_bmm_groups {
                     for t3 in 0..n_two_by_groups.max(1) {
-                        let chunk_idx = ((t0 * n_two_by_tiles.max(1) + t1) * n_bmm_groups + t2) * n_two_by_groups.max(1) + t3;
+                        let chunk_idx = ((t0 * n_two_by_tiles.max(1) + t1) * n_bmm_groups + t2)
+                            * n_two_by_groups.max(1)
+                            + t3;
                         for br in 0..bmm {
                             let row = t0 * big_bm + t2 * bmm + br;
                             let col0 = t1 * (two_by_tile / 2) + t3 * two_pairs;
-                            let v0 = if col0 < k2 { two_weight[row * k2 + col0] } else { 0 };
-                            let v1 = if two_pairs > 1 && col0 + 1 < k2 { two_weight[row * k2 + col0 + 1] } else { 0 };
+                            let v0 = if col0 < k2 {
+                                two_weight[row * k2 + col0]
+                            } else {
+                                0
+                            };
+                            let v1 = if two_pairs > 1 && col0 + 1 < k2 {
+                                two_weight[row * k2 + col0 + 1]
+                            } else {
+                                0
+                            };
                             two_nibbles[chunk_idx * bmm + br] = (v0 << 4) | (v1 & 0x0f);
                         }
                     }
@@ -830,11 +966,24 @@ pub fn tl2_preprocess_into(activations: &[f32], k: usize, lut: &mut Tl2Lut) -> b
         Some(c) => c,
         None => return false,
     };
-    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
-    for b in lut.three_qlut.iter_mut() { *b = 0; }
-    for b in lut.two_qlut.iter_mut() { *b = 0; }
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k {
+        return false;
+    }
+    for b in lut.three_qlut.iter_mut() {
+        *b = 0;
+    }
+    for b in lut.two_qlut.iter_mut() {
+        *b = 0;
+    }
     unsafe {
-        preprocessor(&cfg, activations, &mut lut.lut_scale, &mut lut.three_qlut, &mut lut.two_qlut, 1);
+        preprocessor(
+            &cfg,
+            activations,
+            &mut lut.lut_scale,
+            &mut lut.three_qlut,
+            &mut lut.two_qlut,
+            1,
+        );
     }
     true
 }
@@ -855,10 +1004,23 @@ pub fn tl2_preprocess(activations: &[f32], k: usize) -> Option<Tl2Lut> {
     let mut two_qlut = vec![0i8; two_lut_bytes.max(1)];
 
     unsafe {
-        preprocessor(&cfg, activations, &mut lut_scale, &mut three_qlut, &mut two_qlut, 1);
+        preprocessor(
+            &cfg,
+            activations,
+            &mut lut_scale,
+            &mut three_qlut,
+            &mut two_qlut,
+            1,
+        );
     }
 
-    Some(Tl2Lut { three_qlut, two_qlut, lut_scale, three_k, two_k })
+    Some(Tl2Lut {
+        three_qlut,
+        two_qlut,
+        lut_scale,
+        three_k,
+        two_k,
+    })
 }
 
 /// Run TL2 GEMV tiles [tile_start, tile_end) using a pre-built LUT.
@@ -878,7 +1040,15 @@ pub fn tl2_gemv_tiles(
         Some(c) => c,
         None => return false,
     };
-    tl2_gemv_tiles_cfg(lut, weight_data, w_scale, output_addr, &cfg, tile_start, tile_end)
+    tl2_gemv_tiles_cfg(
+        lut,
+        weight_data,
+        w_scale,
+        output_addr,
+        &cfg,
+        tile_start,
+        tile_end,
+    )
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -893,7 +1063,9 @@ unsafe fn tl2_gemv_tiles_cfg_avx2(
     tile_end: usize,
 ) -> bool {
     let m = cfg.m;
-    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k {
+        return false;
+    }
 
     let n_tile_num = m / cfg.bm;
     let three_k = cfg.three_k;
@@ -904,8 +1076,16 @@ unsafe fn tl2_gemv_tiles_cfg_avx2(
     let sign_tile_size = three_k * m / 24 / n_tile_num;
     let sign_base = three_k * m / 3 / 2;
 
-    let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
-    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
+    let two_a_base = if two_k > 0 {
+        three_k * m / 3 / 2 + three_k * m / 3 / 8
+    } else {
+        0
+    };
+    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 {
+        m * two_k / 4 / n_tile_num
+    } else {
+        0
+    };
 
     let mut cbits_arr = [0i32; 1024];
     assert!(cfg.bm <= 1024);
@@ -915,15 +1095,38 @@ unsafe fn tl2_gemv_tiles_cfg_avx2(
         let s_offset = sign_base + i_tile * sign_tile_size;
         let dst_offset = i_tile * c_tile_size;
 
-        for b in cbits.iter_mut() { *b = 0; }
-        qgemm_three(cfg, &weight_data[w_offset..], &weight_data[s_offset..], &lut.three_qlut, cbits, 1);
+        for b in cbits.iter_mut() {
+            *b = 0;
+        }
+        qgemm_three(
+            cfg,
+            &weight_data[w_offset..],
+            &weight_data[s_offset..],
+            &lut.three_qlut,
+            cbits,
+            1,
+        );
 
-        let out_slice = std::slice::from_raw_parts_mut((output_addr as *mut f32).add(dst_offset), cfg.bm);
+        let out_slice =
+            std::slice::from_raw_parts_mut((output_addr as *mut f32).add(dst_offset), cfg.bm);
 
         if two_k > 0 {
             let two_w_offset = two_a_base + i_tile * two_w_tile_size;
-            let two_cfg = Tl2Config { three_k: 0, two_k, ..*cfg };
-            qgemm_two_and_rescale(&two_cfg, &weight_data[two_w_offset..], &lut.two_qlut, w_scale, lut.lut_scale, cbits, out_slice, 1);
+            let two_cfg = Tl2Config {
+                three_k: 0,
+                two_k,
+                ..*cfg
+            };
+            qgemm_two_and_rescale(
+                &two_cfg,
+                &weight_data[two_w_offset..],
+                &lut.two_qlut,
+                w_scale,
+                lut.lut_scale,
+                cbits,
+                out_slice,
+                1,
+            );
         } else {
             qgemm_two_and_rescale(cfg, &[], &[], w_scale, lut.lut_scale, cbits, out_slice, 1);
         }
@@ -942,7 +1145,17 @@ pub fn tl2_gemv_tiles_cfg(
     tile_end: usize,
 ) -> bool {
     if is_x86_feature_detected!("avx2") {
-        return unsafe { tl2_gemv_tiles_cfg_avx2(lut, weight_data, w_scale, output_addr, cfg, tile_start, tile_end) };
+        return unsafe {
+            tl2_gemv_tiles_cfg_avx2(
+                lut,
+                weight_data,
+                w_scale,
+                output_addr,
+                cfg,
+                tile_start,
+                tile_end,
+            )
+        };
     }
     false
 }
@@ -961,7 +1174,9 @@ pub fn tl2_gemv(
         Some(c) => c,
         None => return false,
     };
-    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k {
+        return false;
+    }
 
     let n_tile_num = m / cfg.bm;
     let three_k = cfg.three_k;
@@ -972,8 +1187,16 @@ pub fn tl2_gemv(
     let sign_tile_size = three_k * m / 24 / n_tile_num;
     let sign_base = three_k * m / 3 / 2;
 
-    let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
-    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
+    let two_a_base = if two_k > 0 {
+        three_k * m / 3 / 2 + three_k * m / 3 / 8
+    } else {
+        0
+    };
+    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 {
+        m * two_k / 4 / n_tile_num
+    } else {
+        0
+    };
 
     let three_lut_bytes = three_k / 3 * 32;
     let two_lut_bytes = if two_k > 0 { two_k / 2 * 32 } else { 0 };
@@ -1005,14 +1228,38 @@ pub fn tl2_gemv(
 
             if two_k > 0 {
                 let two_w_offset = two_a_base + i_tile * two_w_tile_size;
-                let two_cfg = Tl2Config { three_k: 0, two_k, ..cfg };
-                let twql = unsafe { std::slice::from_raw_parts(twql_ptr as *const i8, two_lut_bytes.max(1)) };
+                let two_cfg = Tl2Config {
+                    three_k: 0,
+                    two_k,
+                    ..cfg
+                };
+                let twql = unsafe {
+                    std::slice::from_raw_parts(twql_ptr as *const i8, two_lut_bytes.max(1))
+                };
                 unsafe {
-                    qgemm_two_and_rescale(&two_cfg, &wd[two_w_offset..], twql, w_scale, lut_scale, &mut cbits, out_slice, 1);
+                    qgemm_two_and_rescale(
+                        &two_cfg,
+                        &wd[two_w_offset..],
+                        twql,
+                        w_scale,
+                        lut_scale,
+                        &mut cbits,
+                        out_slice,
+                        1,
+                    );
                 }
             } else {
                 unsafe {
-                    qgemm_two_and_rescale(&cfg, &[], &[], w_scale, lut_scale, &mut cbits, out_slice, 1);
+                    qgemm_two_and_rescale(
+                        &cfg,
+                        &[],
+                        &[],
+                        w_scale,
+                        lut_scale,
+                        &mut cbits,
+                        out_slice,
+                        1,
+                    );
                 }
             }
         }
@@ -1039,7 +1286,9 @@ pub fn tl2_gemv_block_scaled(
         Some(c) => c,
         None => return false,
     };
-    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k {
+        return false;
+    }
 
     let n_tile_num = m / cfg.bm;
     let three_k = cfg.three_k;
@@ -1052,8 +1301,16 @@ pub fn tl2_gemv_block_scaled(
     let sign_tile_size = three_k * m / 24 / n_tile_num;
     let sign_base = three_k * m / 3 / 2;
 
-    let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
-    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
+    let two_a_base = if two_k > 0 {
+        three_k * m / 3 / 2 + three_k * m / 3 / 8
+    } else {
+        0
+    };
+    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 {
+        m * two_k / 4 / n_tile_num
+    } else {
+        0
+    };
 
     let three_lut_bytes = three_k / 3 * 32;
     let two_lut_bytes = if two_k > 0 { two_k / 2 * 32 } else { 0 };
@@ -1091,15 +1348,30 @@ pub fn tl2_gemv_block_scaled(
 
                 let mut blk_cbits = vec![0i32; cfg.bm];
                 if use_bk96 {
-                    unsafe { three_tbl_impl_bk96(
-                        &mut blk_cbits, &tql[lut_off..], &wd[a_off..], &wd[sign_off..],
-                        cfg.bm, cfg.three_k, 1,
-                    )};
+                    unsafe {
+                        three_tbl_impl_bk96(
+                            &mut blk_cbits,
+                            &tql[lut_off..],
+                            &wd[a_off..],
+                            &wd[sign_off..],
+                            cfg.bm,
+                            cfg.three_k,
+                            1,
+                        )
+                    };
                 } else {
-                    unsafe { three_tbl_impl(
-                        &mut blk_cbits, &tql[lut_off..], &wd[a_off..], &wd[sign_off..],
-                        cfg.bm, cfg.bk, cfg.three_k, 1,
-                    )};
+                    unsafe {
+                        three_tbl_impl(
+                            &mut blk_cbits,
+                            &tql[lut_off..],
+                            &wd[a_off..],
+                            &wd[sign_off..],
+                            cfg.bm,
+                            cfg.bk,
+                            cfg.three_k,
+                            1,
+                        )
+                    };
                 }
 
                 let k_start = k_blk * bk_per_tile;
@@ -1111,13 +1383,26 @@ pub fn tl2_gemv_block_scaled(
                     let row = row_start + r;
                     let corr = if q2_start == q2_end {
                         let idx = row * blocks_per_row + q2_start;
-                        if idx < block_corrections.len() { block_corrections[idx] } else { 1.0 }
+                        if idx < block_corrections.len() {
+                            block_corrections[idx]
+                        } else {
+                            1.0
+                        }
                     } else {
-                        let frac0 = (q2_block_size - k_start % q2_block_size) as f32 / bk_per_tile as f32;
+                        let frac0 =
+                            (q2_block_size - k_start % q2_block_size) as f32 / bk_per_tile as f32;
                         let idx0 = row * blocks_per_row + q2_start;
                         let idx1 = row * blocks_per_row + q2_end;
-                        let c0 = if idx0 < block_corrections.len() { block_corrections[idx0] } else { 1.0 };
-                        let c1 = if idx1 < block_corrections.len() { block_corrections[idx1] } else { 1.0 };
+                        let c0 = if idx0 < block_corrections.len() {
+                            block_corrections[idx0]
+                        } else {
+                            1.0
+                        };
+                        let c1 = if idx1 < block_corrections.len() {
+                            block_corrections[idx1]
+                        } else {
+                            1.0
+                        };
                         c0 * frac0 + c1 * (1.0 - frac0)
                     };
                     cbits_f32[r] += blk_cbits[r] as f32 * corr;
@@ -1130,18 +1415,34 @@ pub fn tl2_gemv_block_scaled(
 
             if two_k > 0 {
                 let two_w_offset = two_a_base + i_tile * two_w_tile_size;
-                let two_cfg = Tl2Config { three_k: 0, two_k, ..cfg };
-                let twql = unsafe { std::slice::from_raw_parts(twql_ptr as *const i8, two_lut_bytes.max(1)) };
+                let _two_cfg = Tl2Config {
+                    three_k: 0,
+                    two_k,
+                    ..cfg
+                };
+                let twql = unsafe {
+                    std::slice::from_raw_parts(twql_ptr as *const i8, two_lut_bytes.max(1))
+                };
                 let mut two_cbits = vec![0i32; cfg.bm];
-                unsafe { two_tbl_impl(
-                    &mut two_cbits, &twql[0..], &wd[two_w_offset..],
-                    cfg.bm, cfg.two_k, 1,
-                )};
+                unsafe {
+                    two_tbl_impl(
+                        &mut two_cbits,
+                        &twql[0..],
+                        &wd[two_w_offset..],
+                        cfg.bm,
+                        cfg.two_k,
+                        1,
+                    )
+                };
                 let last_q2 = (three_k) / q2_block_size;
                 for r in 0..cfg.bm {
                     let row = row_start + r;
                     let corr_idx = row * blocks_per_row + last_q2.min(blocks_per_row - 1);
-                    let corr = if corr_idx < block_corrections.len() { block_corrections[corr_idx] } else { 1.0 };
+                    let corr = if corr_idx < block_corrections.len() {
+                        block_corrections[corr_idx]
+                    } else {
+                        1.0
+                    };
                     cbits_f32[r] += two_cbits[r] as f32 * corr;
                 }
             }
@@ -1192,7 +1493,11 @@ pub fn tl2_forward(
 
 /// Build batched LUT from activations. Reusable across weight tensors with the same k.
 #[cfg(target_arch = "x86_64")]
-pub fn tl2_preprocess_batched(activations: &[f32], k: usize, batch_size: usize) -> Option<BatchedTl2Lut> {
+pub fn tl2_preprocess_batched(
+    activations: &[f32],
+    k: usize,
+    batch_size: usize,
+) -> Option<BatchedTl2Lut> {
     let cfg = Tl2Config::for_dims(128, k)?;
     let three_k = cfg.three_k;
     let two_k = cfg.two_k;
@@ -1209,7 +1514,14 @@ pub fn tl2_preprocess_batched(activations: &[f32], k: usize, batch_size: usize) 
     };
 
     unsafe {
-        preprocessor_batched(&cfg, activations, &mut lut.lut_scales, &mut lut.three_qlut, &mut lut.two_qlut, batch_size);
+        preprocessor_batched(
+            &cfg,
+            activations,
+            &mut lut.lut_scales,
+            &mut lut.three_qlut,
+            &mut lut.two_qlut,
+            batch_size,
+        );
     }
     Some(lut)
 }
@@ -1251,12 +1563,16 @@ pub fn tl2_gemm_with_lut(
     m: usize,
     k: usize,
 ) -> bool {
-    if !is_x86_feature_detected!("avx2") { return false; }
+    if !is_x86_feature_detected!("avx2") {
+        return false;
+    }
     let cfg = match Tl2Config::for_dims(m, k) {
         Some(c) => c,
         None => return false,
     };
-    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k {
+        return false;
+    }
     let batch_size = lut.batch_size;
     let three_k = cfg.three_k;
     let two_k = cfg.two_k;
@@ -1266,8 +1582,16 @@ pub fn tl2_gemm_with_lut(
     let c_tile_size = cfg.bm;
     let sign_tile_size = three_k * m / 24 / n_tile_num;
     let sign_base = three_k * m / 3 / 2;
-    let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
-    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
+    let two_a_base = if two_k > 0 {
+        three_k * m / 3 / 2 + three_k * m / 3 / 8
+    } else {
+        0
+    };
+    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 {
+        m * two_k / 4 / n_tile_num
+    } else {
+        0
+    };
 
     let out_ptr = output.as_mut_ptr() as usize;
     let wd_ptr = weight_data.as_ptr() as usize;
@@ -1278,8 +1602,10 @@ pub fn tl2_gemm_with_lut(
     let twql_len = lut.two_qlut.len();
     let ls_ptr = lut.lut_scales.as_ptr() as usize;
 
-    crate::thread_pool::global_pool().parallel_chunks(n_tile_num, 1, &|tile_start, tile_end| {
-        unsafe {
+    crate::thread_pool::global_pool().parallel_chunks(
+        n_tile_num,
+        1,
+        &|tile_start, tile_end| unsafe {
             let wd = std::slice::from_raw_parts(wd_ptr as *const u8, wd_len);
             let tql = std::slice::from_raw_parts(tql_ptr as *const i8, tql_len);
             let twql = std::slice::from_raw_parts(twql_ptr as *const i8, twql_len);
@@ -1292,7 +1618,14 @@ pub fn tl2_gemm_with_lut(
                 let s_offset = sign_base + i_tile * sign_tile_size;
 
                 cbits.iter_mut().for_each(|b| *b = 0);
-                qgemm_three(&cfg, &wd[w_offset..], &wd[s_offset..], tql, &mut cbits, batch_size);
+                qgemm_three(
+                    &cfg,
+                    &wd[w_offset..],
+                    &wd[s_offset..],
+                    tql,
+                    &mut cbits,
+                    batch_size,
+                );
 
                 let dst_base = i_tile * c_tile_size;
                 if two_k > 0 {
@@ -1302,25 +1635,40 @@ pub fn tl2_gemm_with_lut(
                     for k_outer in 0..n_two_blocks {
                         let lut_off = k_outer * BK2 / 2 * 32;
                         let a_off = k_outer * BK2 / 2 / 2 * cfg.bm;
-                        two_tbl_impl(&mut two_cbits, &twql[lut_off..], &wd[two_w_offset + a_off..], cfg.bm, two_k, batch_size);
+                        two_tbl_impl(
+                            &mut two_cbits,
+                            &twql[lut_off..],
+                            &wd[two_w_offset + a_off..],
+                            cfg.bm,
+                            two_k,
+                            batch_size,
+                        );
                     }
                     for bs in 0..batch_size {
-                        let dst = std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(bs * m + dst_base), cfg.bm);
+                        let dst = std::slice::from_raw_parts_mut(
+                            (out_ptr as *mut f32).add(bs * m + dst_base),
+                            cfg.bm,
+                        );
                         for i in 0..cfg.bm {
-                            dst[i] = (cbits[i + bs * cfg.bm] + two_cbits[i + bs * cfg.bm]) as f32 / ls[bs] * w_scale;
+                            dst[i] = (cbits[i + bs * cfg.bm] + two_cbits[i + bs * cfg.bm]) as f32
+                                / ls[bs]
+                                * w_scale;
                         }
                     }
                 } else {
                     for bs in 0..batch_size {
-                        let dst = std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(bs * m + dst_base), cfg.bm);
+                        let dst = std::slice::from_raw_parts_mut(
+                            (out_ptr as *mut f32).add(bs * m + dst_base),
+                            cfg.bm,
+                        );
                         for i in 0..cfg.bm {
                             dst[i] = cbits[i + bs * cfg.bm] as f32 / ls[bs] * w_scale;
                         }
                     }
                 }
             }
-        }
-    });
+        },
+    );
     true
 }
 
@@ -1341,18 +1689,25 @@ pub fn tl2_preprocess_token_range(
         None => return false,
     };
     let lut = unsafe { &mut *(lut_addr as *mut BatchedTl2Lut) };
-    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k {
+        return false;
+    }
 
     let three_stride = cfg.three_k / 3 * 32;
     let two_stride = if cfg.two_k > 0 { cfg.two_k / 2 * 32 } else { 0 };
 
     for bs in t_start..t_end {
-        let act = unsafe { std::slice::from_raw_parts((activations_addr as *const f32).add(bs * k), k) };
+        let act =
+            unsafe { std::slice::from_raw_parts((activations_addr as *const f32).add(bs * k), k) };
         let three_off = bs * three_stride;
-        for b in lut.three_qlut[three_off..three_off + three_stride].iter_mut() { *b = 0; }
+        for b in lut.three_qlut[three_off..three_off + three_stride].iter_mut() {
+            *b = 0;
+        }
         if two_stride > 0 {
             let two_off = bs * two_stride;
-            for b in lut.two_qlut[two_off..two_off + two_stride].iter_mut() { *b = 0; }
+            for b in lut.two_qlut[two_off..two_off + two_stride].iter_mut() {
+                *b = 0;
+            }
         }
         unsafe {
             lut.lut_scales[bs] = per_tensor_quant(cfg.two_k + cfg.three_k, act);
@@ -1389,16 +1744,28 @@ pub fn tl2_preprocess_batched_into(
         Some(c) => c,
         None => return false,
     };
-    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
-    if batch_size > lut.batch_size { return false; }
-    for b in lut.three_qlut[..cfg.three_k / 3 * 32 * batch_size].iter_mut() { *b = 0; }
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k {
+        return false;
+    }
+    if batch_size > lut.batch_size {
+        return false;
+    }
+    for b in lut.three_qlut[..cfg.three_k / 3 * 32 * batch_size].iter_mut() {
+        *b = 0;
+    }
     if cfg.two_k > 0 {
-        for b in lut.two_qlut[..cfg.two_k / 2 * 32 * batch_size].iter_mut() { *b = 0; }
+        for b in lut.two_qlut[..cfg.two_k / 2 * 32 * batch_size].iter_mut() {
+            *b = 0;
+        }
     }
     unsafe {
         preprocessor_batched(
-            &cfg, activations, &mut lut.lut_scales[..batch_size],
-            &mut lut.three_qlut, &mut lut.two_qlut, batch_size,
+            &cfg,
+            activations,
+            &mut lut.lut_scales[..batch_size],
+            &mut lut.three_qlut,
+            &mut lut.two_qlut,
+            batch_size,
         );
     }
     true
@@ -1426,7 +1793,9 @@ pub unsafe fn tl2_gemm_tiles_batched(
         Some(c) => c,
         None => return false,
     };
-    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k { return false; }
+    if cfg.three_k != lut.three_k || cfg.two_k != lut.two_k {
+        return false;
+    }
     let n_tile_num = m / cfg.bm;
     let three_k = cfg.three_k;
     let two_k = cfg.two_k;
@@ -1435,8 +1804,16 @@ pub unsafe fn tl2_gemm_tiles_batched(
     let c_tile_size = cfg.bm;
     let sign_tile_size = three_k * m / 24 / n_tile_num;
     let sign_base = three_k * m / 3 / 2;
-    let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
-    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
+    let two_a_base = if two_k > 0 {
+        three_k * m / 3 / 2 + three_k * m / 3 / 8
+    } else {
+        0
+    };
+    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 {
+        m * two_k / 4 / n_tile_num
+    } else {
+        0
+    };
 
     let bm = cfg.bm;
     let bs_bm = batch_size * bm;
@@ -1449,9 +1826,15 @@ pub unsafe fn tl2_gemm_tiles_batched(
         let w_offset = i_tile * w_tile_size;
         let s_offset = sign_base + i_tile * sign_tile_size;
         let dst_base = i_tile * c_tile_size;
-        let two_w_offset = if two_k > 0 { two_a_base + i_tile * two_w_tile_size } else { 0 };
+        let two_w_offset = if two_k > 0 {
+            two_a_base + i_tile * two_w_tile_size
+        } else {
+            0
+        };
 
-        for b in cbits[..bs_bm].iter_mut() { *b = 0; }
+        for b in cbits[..bs_bm].iter_mut() {
+            *b = 0;
+        }
 
         // Chunked three-part GEMM: chunk size from L1d cache detection
         if use_bk96 {
@@ -1459,26 +1842,59 @@ pub unsafe fn tl2_gemm_tiles_batched(
             let mut done = 0usize;
             let mut rem = batch_size;
             while rem >= chunk {
-                three_tbl_impl_bk96(&mut cbits[done * bm..], &lut.three_qlut[done * three_lut_stride..],
-                    &weight_data[w_offset..], &weight_data[s_offset..], bm, three_k, chunk);
-                done += chunk; rem -= chunk;
+                three_tbl_impl_bk96(
+                    &mut cbits[done * bm..],
+                    &lut.three_qlut[done * three_lut_stride..],
+                    &weight_data[w_offset..],
+                    &weight_data[s_offset..],
+                    bm,
+                    three_k,
+                    chunk,
+                );
+                done += chunk;
+                rem -= chunk;
             }
             while rem >= 8 {
-                three_tbl_impl_bk96(&mut cbits[done * bm..], &lut.three_qlut[done * three_lut_stride..],
-                    &weight_data[w_offset..], &weight_data[s_offset..], bm, three_k, 8);
-                done += 8; rem -= 8;
+                three_tbl_impl_bk96(
+                    &mut cbits[done * bm..],
+                    &lut.three_qlut[done * three_lut_stride..],
+                    &weight_data[w_offset..],
+                    &weight_data[s_offset..],
+                    bm,
+                    three_k,
+                    8,
+                );
+                done += 8;
+                rem -= 8;
             }
             while rem >= 1 {
-                three_tbl_impl_bk96(&mut cbits[done * bm..], &lut.three_qlut[done * three_lut_stride..],
-                    &weight_data[w_offset..], &weight_data[s_offset..], bm, three_k, 1);
-                done += 1; rem -= 1;
+                three_tbl_impl_bk96(
+                    &mut cbits[done * bm..],
+                    &lut.three_qlut[done * three_lut_stride..],
+                    &weight_data[w_offset..],
+                    &weight_data[s_offset..],
+                    bm,
+                    three_k,
+                    1,
+                );
+                done += 1;
+                rem -= 1;
             }
         } else {
-            qgemm_three(&cfg, &weight_data[w_offset..], &weight_data[s_offset..], &lut.three_qlut, cbits, batch_size);
+            qgemm_three(
+                &cfg,
+                &weight_data[w_offset..],
+                &weight_data[s_offset..],
+                &lut.three_qlut,
+                cbits,
+                batch_size,
+            );
         }
 
         if two_k > 0 {
-            for b in two_cbits[..bs_bm].iter_mut() { *b = 0; }
+            for b in two_cbits[..bs_bm].iter_mut() {
+                *b = 0;
+            }
             let chunk = gemm_chunk_size();
             let mut done = 0usize;
             let mut rem = batch_size;
@@ -1486,31 +1902,55 @@ pub unsafe fn tl2_gemm_tiles_batched(
                 for k_outer in 0..n_two_blocks {
                     let lut_off = k_outer * BK2 / 2 * 32;
                     let a_off = k_outer * BK2 / 2 / 2 * bm;
-                    two_tbl_impl(&mut two_cbits[done * bm..], &lut.two_qlut[done * two_lut_stride + lut_off..],
-                        &weight_data[two_w_offset + a_off..], bm, two_k, chunk);
+                    two_tbl_impl(
+                        &mut two_cbits[done * bm..],
+                        &lut.two_qlut[done * two_lut_stride + lut_off..],
+                        &weight_data[two_w_offset + a_off..],
+                        bm,
+                        two_k,
+                        chunk,
+                    );
                 }
-                done += chunk; rem -= chunk;
+                done += chunk;
+                rem -= chunk;
             }
             while rem >= 8 {
                 for k_outer in 0..n_two_blocks {
                     let lut_off = k_outer * BK2 / 2 * 32;
                     let a_off = k_outer * BK2 / 2 / 2 * bm;
-                    two_tbl_impl(&mut two_cbits[done * bm..], &lut.two_qlut[done * two_lut_stride + lut_off..],
-                        &weight_data[two_w_offset + a_off..], bm, two_k, 8);
+                    two_tbl_impl(
+                        &mut two_cbits[done * bm..],
+                        &lut.two_qlut[done * two_lut_stride + lut_off..],
+                        &weight_data[two_w_offset + a_off..],
+                        bm,
+                        two_k,
+                        8,
+                    );
                 }
-                done += 8; rem -= 8;
+                done += 8;
+                rem -= 8;
             }
             while rem >= 1 {
                 for k_outer in 0..n_two_blocks {
                     let lut_off = k_outer * BK2 / 2 * 32;
                     let a_off = k_outer * BK2 / 2 / 2 * bm;
-                    two_tbl_impl(&mut two_cbits[done * bm..], &lut.two_qlut[done * two_lut_stride + lut_off..],
-                        &weight_data[two_w_offset + a_off..], bm, two_k, 1);
+                    two_tbl_impl(
+                        &mut two_cbits[done * bm..],
+                        &lut.two_qlut[done * two_lut_stride + lut_off..],
+                        &weight_data[two_w_offset + a_off..],
+                        bm,
+                        two_k,
+                        1,
+                    );
                 }
-                done += 1; rem -= 1;
+                done += 1;
+                rem -= 1;
             }
             for bs in 0..batch_size {
-                let dst = std::slice::from_raw_parts_mut((output_addr as *mut f32).add(bs * m + dst_base), bm);
+                let dst = std::slice::from_raw_parts_mut(
+                    (output_addr as *mut f32).add(bs * m + dst_base),
+                    bm,
+                );
                 let scale = _mm256_set1_ps(w_scale / lut.lut_scales[bs]);
                 let cb = &cbits[bs * bm..];
                 let tc = &two_cbits[bs * bm..];
@@ -1524,7 +1964,10 @@ pub unsafe fn tl2_gemm_tiles_batched(
             }
         } else {
             for bs in 0..batch_size {
-                let dst = std::slice::from_raw_parts_mut((output_addr as *mut f32).add(bs * m + dst_base), bm);
+                let dst = std::slice::from_raw_parts_mut(
+                    (output_addr as *mut f32).add(bs * m + dst_base),
+                    bm,
+                );
                 let scale = _mm256_set1_ps(w_scale / lut.lut_scales[bs]);
                 let cb = &cbits[bs * bm..];
                 for i in (0..bm).step_by(8) {
@@ -1551,7 +1994,9 @@ pub fn tl2_forward_batched(
     k: usize,
     batch_size: usize,
 ) -> bool {
-    if batch_size == 0 { return true; }
+    if batch_size == 0 {
+        return true;
+    }
     if batch_size == 1 {
         return tl2_forward(activations, weight_data, w_scale, output, m, k);
     }
@@ -1571,7 +2016,14 @@ pub fn tl2_forward_batched(
     let mut lut_scales = vec![0.0f32; batch_size];
 
     unsafe {
-        preprocessor_batched(&cfg, activations, &mut lut_scales, &mut three_qlut, &mut two_qlut, batch_size);
+        preprocessor_batched(
+            &cfg,
+            activations,
+            &mut lut_scales,
+            &mut three_qlut,
+            &mut two_qlut,
+            batch_size,
+        );
     }
 
     let n_tile_num = m / cfg.bm;
@@ -1584,14 +2036,24 @@ pub fn tl2_forward_batched(
     let twql_len = two_qlut.len();
     let ls_ptr = lut_scales.as_ptr() as usize;
 
-    if !is_x86_feature_detected!("avx2") { return false; }
+    if !is_x86_feature_detected!("avx2") {
+        return false;
+    }
 
     let w_tile_size = three_k * m / 6 / n_tile_num;
     let c_tile_size = cfg.bm;
     let sign_tile_size = three_k * m / 24 / n_tile_num;
     let sign_base = three_k * m / 3 / 2;
-    let two_a_base = if two_k > 0 { three_k * m / 3 / 2 + three_k * m / 3 / 8 } else { 0 };
-    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 { m * two_k / 4 / n_tile_num } else { 0 };
+    let two_a_base = if two_k > 0 {
+        three_k * m / 3 / 2 + three_k * m / 3 / 8
+    } else {
+        0
+    };
+    let two_w_tile_size = if two_k > 0 && n_tile_num > 0 {
+        m * two_k / 4 / n_tile_num
+    } else {
+        0
+    };
 
     crate::thread_pool::global_pool().parallel_chunks(n_tile_num, 1, &|tile_start, tile_end| {
         unsafe {
@@ -1607,7 +2069,14 @@ pub fn tl2_forward_batched(
                 let s_offset = sign_base + i_tile * sign_tile_size;
 
                 cbits.iter_mut().for_each(|b| *b = 0);
-                qgemm_three(&cfg, &wd[w_offset..], &wd[s_offset..], tql, &mut cbits, batch_size);
+                qgemm_three(
+                    &cfg,
+                    &wd[w_offset..],
+                    &wd[s_offset..],
+                    tql,
+                    &mut cbits,
+                    batch_size,
+                );
 
                 // Rescale and write directly to output (scattered layout)
                 let dst_base = i_tile * c_tile_size;
@@ -1629,7 +2098,8 @@ pub fn tl2_forward_batched(
                     }
                     for bs in 0..batch_size {
                         let dst = std::slice::from_raw_parts_mut(
-                            (out_ptr as *mut f32).add(bs * m + dst_base), cfg.bm
+                            (out_ptr as *mut f32).add(bs * m + dst_base),
+                            cfg.bm,
                         );
                         for i in 0..cfg.bm {
                             let combined = cbits[i + bs * cfg.bm] + two_cbits[i + bs * cfg.bm];
@@ -1639,7 +2109,8 @@ pub fn tl2_forward_batched(
                 } else {
                     for bs in 0..batch_size {
                         let dst = std::slice::from_raw_parts_mut(
-                            (out_ptr as *mut f32).add(bs * m + dst_base), cfg.bm
+                            (out_ptr as *mut f32).add(bs * m + dst_base),
+                            cfg.bm,
                         );
                         for i in 0..cfg.bm {
                             dst[i] = cbits[i + bs * cfg.bm] as f32 / ls[bs] * w_scale;
@@ -1867,7 +2338,16 @@ pub unsafe fn qgemm_lut(
 ) {
     let mut cbits = vec![0i32; batch_size * cfg.bm];
     qgemm_three(cfg, a, sign, lut, &mut cbits, batch_size);
-    qgemm_two_and_rescale(cfg, &[], lut, w_scale, lut_scale, &mut cbits, output, batch_size);
+    qgemm_two_and_rescale(
+        cfg,
+        &[],
+        lut,
+        w_scale,
+        lut_scale,
+        &mut cbits,
+        output,
+        batch_size,
+    );
 }
 
 // ── Scalar reference implementations (for Kani proofs + DualPipeline) ──────
@@ -1880,7 +2360,9 @@ pub fn per_tensor_quant_scalar(b: &[f32]) -> f32 {
     let mut max_abs = 0.0f32;
     for &v in b {
         let a = v.abs();
-        if a > max_abs { max_abs = a; }
+        if a > max_abs {
+            max_abs = a;
+        }
     }
     127.0 / max_abs
 }
@@ -1889,22 +2371,22 @@ pub fn per_tensor_quant_scalar(b: &[f32]) -> f32 {
 /// Returns the 14 non-zero entries indexed 0..13, matching the base-3 encoding.
 pub fn three_lut_entries(a0: i32, a1: i32, a2: i32) -> [i32; 16] {
     [
-        0,                          // 0: (0,0,0)
-        a2,                         // 1: (0,0,+1)
-        a1 - a2,                    // 2: (0,+1,-1)
-        a1,                         // 3: (0,+1,0)
-        a1 + a2,                    // 4: (0,+1,+1)
-        a0 - a1 - a2,              // 5: (+1,-1,-1)
-        a0 - a1,                    // 6: (+1,-1,0)
-        a0 - a1 + a2,              // 7: (+1,-1,+1)
-        a0 - a2,                    // 8: (+1,0,-1)
-        a0,                         // 9: (+1,0,0)
-        a0 + a2,                    // 10: (+1,0,+1)
-        a0 + a1 - a2,              // 11: (+1,+1,-1)
-        a0 + a1,                    // 12: (+1,+1,0)
-        a0 + a1 + a2,              // 13: (+1,+1,+1)
-        0,                          // 14: unused
-        0,                          // 15: unused
+        0,            // 0: (0,0,0)
+        a2,           // 1: (0,0,+1)
+        a1 - a2,      // 2: (0,+1,-1)
+        a1,           // 3: (0,+1,0)
+        a1 + a2,      // 4: (0,+1,+1)
+        a0 - a1 - a2, // 5: (+1,-1,-1)
+        a0 - a1,      // 6: (+1,-1,0)
+        a0 - a1 + a2, // 7: (+1,-1,+1)
+        a0 - a2,      // 8: (+1,0,-1)
+        a0,           // 9: (+1,0,0)
+        a0 + a2,      // 10: (+1,0,+1)
+        a0 + a1 - a2, // 11: (+1,+1,-1)
+        a0 + a1,      // 12: (+1,+1,0)
+        a0 + a1 + a2, // 13: (+1,+1,+1)
+        0,            // 14: unused
+        0,            // 15: unused
     ]
 }
 
@@ -1912,16 +2394,22 @@ pub fn three_lut_entries(a0: i32, a1: i32, a2: i32) -> [i32; 16] {
 /// Index = w0*3 + w1 + 4, matching the two_lut_ctor encoding.
 pub fn two_lut_entries(a0: i32, a1: i32) -> [i32; 16] {
     [
-        -(a0 + a1),                 // 0: (-1,-1)
-        -a0,                        // 1: (-1,0)
-        -a0 + a1,                   // 2: (-1,+1)
-        -a1,                        // 3: (0,-1)
-        0,                          // 4: (0,0)
-        a1,                         // 5: (0,+1)
-        a0 - a1,                    // 6: (+1,-1)
-        a0,                         // 7: (+1,0)
-        a0 + a1,                    // 8: (+1,+1)
-        0, 0, 0, 0, 0, 0, 0,       // 9..15: unused
+        -(a0 + a1), // 0: (-1,-1)
+        -a0,        // 1: (-1,0)
+        -a0 + a1,   // 2: (-1,+1)
+        -a1,        // 3: (0,-1)
+        0,          // 4: (0,0)
+        a1,         // 5: (0,+1)
+        a0 - a1,    // 6: (+1,-1)
+        a0,         // 7: (+1,0)
+        a0 + a1,    // 8: (+1,+1)
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0, // 9..15: unused
     ]
 }
 
@@ -2044,7 +2532,10 @@ mod tests {
         let mut qlut = vec![0i8; 256];
         unsafe { three_lut_ctor(&mut qlut, &b, scale, 24) };
         // Just verify it doesn't crash and produces non-zero output
-        assert!(qlut.iter().any(|&v| v != 0), "LUT should have non-zero entries");
+        assert!(
+            qlut.iter().any(|&v| v != 0),
+            "LUT should have non-zero entries"
+        );
     }
 
     #[test]
@@ -2053,7 +2544,10 @@ mod tests {
         let scale = 127.0 / 0.8;
         let mut qlut = vec![0i8; 256];
         unsafe { two_lut_ctor(&mut qlut, &b, scale, 16) };
-        assert!(qlut.iter().any(|&v| v != 0), "LUT should have non-zero entries");
+        assert!(
+            qlut.iter().any(|&v| v != 0),
+            "LUT should have non-zero entries"
+        );
     }
 
     #[test]
@@ -2104,7 +2598,9 @@ mod tests {
         eprintln!("MAD[0..8]: {:?}", &mad_out[..8]);
         eprintln!("TL2[0..8]: {:?}", &tl2_out[..8]);
 
-        let max_err = mad_out.iter().zip(tl2_out.iter())
+        let max_err = mad_out
+            .iter()
+            .zip(tl2_out.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         let mad_norm: f32 = mad_out.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -2142,20 +2638,34 @@ mod tests {
         }
         i2s[packed_bytes..packed_bytes + 4].copy_from_slice(&1.0f32.to_ne_bytes());
 
-        let act: Vec<f32> = (1..=k).map(|i| (i as f32 - k as f32 / 2.0) * 0.01).collect();
+        let act: Vec<f32> = (1..=k)
+            .map(|i| (i as f32 - k as f32 / 2.0) * 0.01)
+            .collect();
 
         let mut q8 = vec![0i8; k];
         let (scale, sum) = crate::quantized::i2s_quantize_into(&act, &mut q8);
         let w_scale = i2s_weight_scale(&i2s, m, k);
         let mut mad_out = vec![0.0f32; m];
-        i2s_gemv_cols(&q8, scale, sum, &i2s, w_scale, mad_out.as_mut_ptr() as usize, 0, m, k);
+        i2s_gemv_cols(
+            &q8,
+            scale,
+            sum,
+            &i2s,
+            w_scale,
+            mad_out.as_mut_ptr() as usize,
+            0,
+            m,
+            k,
+        );
 
         let (tl2_data, tl2_scale) = repack_i2s_to_tl2(&i2s, m, k).expect("repack should succeed");
         let mut tl2_out = vec![0.0f32; m];
         let ok = tl2_forward(&act, &tl2_data, tl2_scale, &mut tl2_out, m, k);
         assert!(ok, "tl2_forward should succeed");
 
-        let max_err = mad_out.iter().zip(tl2_out.iter())
+        let max_err = mad_out
+            .iter()
+            .zip(tl2_out.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         let mad_norm: f32 = mad_out.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -2190,10 +2700,15 @@ mod tests {
             }
             i2s[packed_bytes..packed_bytes + 4].copy_from_slice(&1.0f32.to_ne_bytes());
 
-            let act: Vec<f32> = (0..k).map(|i| (i as f32 - k as f32 / 2.0) * 0.001).collect();
+            let act: Vec<f32> = (0..k)
+                .map(|i| (i as f32 - k as f32 / 2.0) * 0.001)
+                .collect();
 
             let candidates: Vec<usize> = [32, 64, 128, 160, 256, 320, 640]
-                .iter().copied().filter(|&bm| m % bm == 0).collect();
+                .iter()
+                .copied()
+                .filter(|&bm| m % bm == 0)
+                .collect();
 
             for &bm in &candidates {
                 let cfg = Tl2Config::new(m, k, bm, 96);
@@ -2205,7 +2720,15 @@ mod tests {
                 let iters = 20;
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
-                    tl2_gemv_tiles_cfg(&lut, &tl2_data, scale, output.as_mut_ptr() as usize, &cfg, 0, n_tiles);
+                    tl2_gemv_tiles_cfg(
+                        &lut,
+                        &tl2_data,
+                        scale,
+                        output.as_mut_ptr() as usize,
+                        &cfg,
+                        0,
+                        n_tiles,
+                    );
                 }
                 let elapsed = start.elapsed();
                 let us_per = elapsed.as_micros() as f64 / iters as f64;
@@ -2218,15 +2741,31 @@ mod tests {
     #[test]
     fn test_tl2_forward_2tile_256x96() {
         let home = std::env::var("HOME").unwrap();
-        let data = match std::fs::read(format!("{home}/.cache/tempura/models/test_tl2_256x96.bin")) {
+        let data = match std::fs::read(format!("{home}/.cache/tempura/models/test_tl2_256x96.bin"))
+        {
             Ok(d) => d,
-            Err(_) => { eprintln!("skip: test data not found"); return; }
+            Err(_) => {
+                eprintln!("skip: test data not found");
+                return;
+            }
         };
         assert_eq!(data.len(), 5120);
-        let act_bytes = std::fs::read(format!("{home}/.cache/tempura/models/test_tl2_256x96_act.bin")).unwrap();
-        let act: Vec<f32> = act_bytes.chunks(4).map(|c| f32::from_ne_bytes([c[0],c[1],c[2],c[3]])).collect();
-        let ref_bytes = std::fs::read(format!("{home}/.cache/tempura/models/test_tl2_256x96_ref.bin")).unwrap();
-        let y_ref: Vec<f32> = ref_bytes.chunks(4).map(|c| f32::from_ne_bytes([c[0],c[1],c[2],c[3]])).collect();
+        let act_bytes = std::fs::read(format!(
+            "{home}/.cache/tempura/models/test_tl2_256x96_act.bin"
+        ))
+        .unwrap();
+        let act: Vec<f32> = act_bytes
+            .chunks(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let ref_bytes = std::fs::read(format!(
+            "{home}/.cache/tempura/models/test_tl2_256x96_ref.bin"
+        ))
+        .unwrap();
+        let y_ref: Vec<f32> = ref_bytes
+            .chunks(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
         let mut output = vec![0.0f32; 256];
         let ok = tl2_forward(&act, &data, 1.0, &mut output, 256, 96);
@@ -2237,11 +2776,16 @@ mod tests {
         eprintln!("tile1 out[128..132]: {:?}", &output[128..132]);
         eprintln!("tile1 ref[128..132]: {:?}", &y_ref[128..132]);
 
-        let max_err = output.iter().zip(y_ref.iter())
+        let max_err = output
+            .iter()
+            .zip(y_ref.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         eprintln!("max_err={max_err:.6}");
-        assert!(max_err < 1.0, "max_err={max_err:.6} — output doesn't match reference");
+        assert!(
+            max_err < 1.0,
+            "max_err={max_err:.6} — output doesn't match reference"
+        );
     }
 
     #[test]
@@ -2260,7 +2804,9 @@ mod tests {
 
         // Activation: [1.0, 2.0, 3.0, ..., 96.0] padded to 96
         let mut act = vec![0.0f32; 96];
-        for i in 0..96 { act[i] = (i + 1) as f32; }
+        for i in 0..96 {
+            act[i] = (i + 1) as f32;
+        }
 
         let mut output = vec![0.0f32; 128];
         let w_scale = 1.0f32;
@@ -2303,22 +2849,22 @@ mod tests {
     fn test_three_lut_entries_symmetry() {
         let e = three_lut_entries(10, 20, 30);
         assert_eq!(e[0], 0);
-        assert_eq!(e[9], 10);     // a0
-        assert_eq!(e[3], 20);     // a1
-        assert_eq!(e[1], 30);     // a2
-        assert_eq!(e[13], 60);    // a0+a1+a2
-        assert_eq!(e[12], 30);   // a0+a1
+        assert_eq!(e[9], 10); // a0
+        assert_eq!(e[3], 20); // a1
+        assert_eq!(e[1], 30); // a2
+        assert_eq!(e[13], 60); // a0+a1+a2
+        assert_eq!(e[12], 30); // a0+a1
     }
 
     #[test]
     fn test_two_lut_entries_symmetry() {
         let e = two_lut_entries(10, 20);
-        assert_eq!(e[4], 0);      // (0,0)
-        assert_eq!(e[7], 10);     // (+1,0) = a0
-        assert_eq!(e[5], 20);     // (0,+1) = a1
-        assert_eq!(e[8], 30);     // (+1,+1) = a0+a1
-        assert_eq!(e[0], -30);    // (-1,-1) = -(a0+a1)
-        assert_eq!(e[1], -10);    // (-1,0) = -a0
+        assert_eq!(e[4], 0); // (0,0)
+        assert_eq!(e[7], 10); // (+1,0) = a0
+        assert_eq!(e[5], 20); // (0,+1) = a1
+        assert_eq!(e[8], 30); // (+1,+1) = a0+a1
+        assert_eq!(e[0], -30); // (-1,-1) = -(a0+a1)
+        assert_eq!(e[1], -10); // (-1,0) = -a0
     }
 
     #[test]
@@ -2351,18 +2897,33 @@ mod tests {
         let (scale, sum) = crate::quantized::i2s_quantize_into(&act, &mut q8);
         let w_scale = i2s_weight_scale(&i2s, m, k);
         let mut mad_out = vec![0.0f32; m];
-        i2s_gemv_cols(&q8, scale, sum, &i2s, w_scale, mad_out.as_mut_ptr() as usize, 0, m, k);
+        i2s_gemv_cols(
+            &q8,
+            scale,
+            sum,
+            &i2s,
+            w_scale,
+            mad_out.as_mut_ptr() as usize,
+            0,
+            m,
+            k,
+        );
 
         // Direct scalar
         let mut scalar_out = vec![0.0f32; m];
         tl2_gemv_direct_scalar(&act, &i2s, w_scale, &mut scalar_out, m, k);
 
-        let max_err = mad_out.iter().zip(scalar_out.iter())
+        let max_err = mad_out
+            .iter()
+            .zip(scalar_out.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         let norm: f32 = mad_out.iter().map(|x| x * x).sum::<f32>().sqrt();
         let rel_err = if norm > 0.0 { max_err / norm } else { max_err };
-        assert!(rel_err < 0.05, "direct scalar vs MAD rel_err={rel_err} max_err={max_err}");
+        assert!(
+            rel_err < 0.05,
+            "direct scalar vs MAD rel_err={rel_err} max_err={max_err}"
+        );
     }
 }
 
@@ -2446,8 +3007,8 @@ mod kani_proofs {
     fn tl2_i16_accumulator_no_overflow_bk96() {
         let val: i8 = kani::any();
         let kk: usize = 32; // BK=96 → kk=96/3=32
-        // Each tbl_impl iteration adds at most |val| per step
-        // kk triplet-groups per tile, each contributes one i8 LUT value
+                            // Each tbl_impl iteration adds at most |val| per step
+                            // kk triplet-groups per tile, each contributes one i8 LUT value
         let worst_case = val as i32 * kk as i32;
         assert!(worst_case >= i16::MIN as i32 && worst_case <= i16::MAX as i32);
     }

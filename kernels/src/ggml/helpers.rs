@@ -148,8 +148,15 @@ mod tests {
         for &v in &[0.0f32, 1.0, -1.0, 0.5, 65504.0, 6.1e-5] {
             let h = f32_to_f16(v);
             let back = f16_to_f32(h);
-            let rel = if v.abs() > 0.0 { ((back - v) / v).abs() } else { (back - v).abs() };
-            assert!(rel < 0.002, "f16 roundtrip failed for {v}: got {back}, rel_err={rel}");
+            let rel = if v.abs() > 0.0 {
+                ((back - v) / v).abs()
+            } else {
+                (back - v).abs()
+            };
+            assert!(
+                rel < 0.002,
+                "f16 roundtrip failed for {v}: got {back}, rel_err={rel}"
+            );
         }
     }
 
@@ -179,7 +186,10 @@ mod tests {
             let back = f16_to_f32(h);
             if x.abs() > 1e-4 {
                 let rel = ((back - x) / x).abs();
-                assert!(rel < 0.001, "f16 roundtrip: x={x}, back={back}, rel_err={rel}");
+                assert!(
+                    rel < 0.001,
+                    "f16 roundtrip: x={x}, back={back}, rel_err={rel}"
+                );
             }
         }
     }
@@ -221,7 +231,10 @@ mod tests {
             let hb = f32_to_f16(b);
             let fa = f16_to_f32(ha);
             let fb = f16_to_f32(hb);
-            assert!(fa <= fb, "monotonicity: a={a} -> f16 -> {fa}, b={b} -> f16 -> {fb}");
+            assert!(
+                fa <= fb,
+                "monotonicity: a={a} -> f16 -> {fa}, b={b} -> f16 -> {fb}"
+            );
         }
     }
 

@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use crate::{Attention, KernelError, Result, VerificationTier};
+use cuda_core::{Device, Stream};
 use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
 use cutile::tensor::{IntoPartition, Reshape, Tensor};
-use cuda_core::{Device, Stream};
-use crate::{Attention, KernelError, Result, VerificationTier};
+use std::sync::Arc;
 
 #[cutile::module]
 pub mod kernels {
@@ -26,12 +26,7 @@ pub mod kernels {
             sm_120 = (num_cta_in_cga = 1, max_divisibility = 16,),
         )
     )]
-    pub fn attention_fwd<
-        const BM: i32,
-        const BN: i32,
-        const D: i32,
-        const CAUSAL: i32,
-    >(
+    pub fn attention_fwd<const BM: i32, const BN: i32, const D: i32, const CAUSAL: i32>(
         out: &mut Tensor<f32, { [1, BM, D] }>,
         q: &Tensor<f32, { [-1, -1, -1, -1] }>,
         k: &Tensor<f32, { [-1, -1, -1, -1] }>,
@@ -92,9 +87,8 @@ pub mod kernels {
         let mask_drop: Tile<f32, { [BM, BN] }> = constant(f32::NEG_INFINITY, shape![BM, BN]);
 
         for j in 0i32..tc {
-            let k_tile: Tile<f32, { [BN, D] }> = k_part
-                .load([0i32, 0i32, j, 0i32])
-                .reshape(shape![BN, D]);
+            let k_tile: Tile<f32, { [BN, D] }> =
+                k_part.load([0i32, 0i32, j, 0i32]).reshape(shape![BN, D]);
             let k_tile_t: Tile<f32, { [D, BN] }> = k_tile.transpose();
 
             // QK^T for this tile: [BM, BN]
@@ -122,7 +116,8 @@ pub mod kernels {
             let m_ij: Tile<f32, { [BM, 1] }> = max_tile(m_i, qk_max_2d);
 
             // exp2(score - new_max): probabilities for this tile
-            let p: Tile<f32, { [BM, BN] }> = exp2(qk - m_ij.broadcast(shape![BM, BN]), ftz::Disabled);
+            let p: Tile<f32, { [BM, BN] }> =
+                exp2(qk - m_ij.broadcast(shape![BM, BN]), ftz::Disabled);
 
             // Correction: rescale previous sum and accumulator for new max
             let alpha: Tile<f32, { [BM, 1] }> = exp2(m_i - m_ij, ftz::Disabled);
@@ -133,17 +128,14 @@ pub mod kernels {
             acc = acc * alpha.broadcast(shape![BM, D]);
 
             // Accumulate weighted values
-            let v_tile: Tile<f32, { [BN, D] }> = v_part
-                .load([0i32, 0i32, j, 0i32])
-                .reshape(shape![BN, D]);
+            let v_tile: Tile<f32, { [BN, D] }> =
+                v_part.load([0i32, 0i32, j, 0i32]).reshape(shape![BN, D]);
             acc = mma(p, v_tile, acc);
             m_i = m_ij;
         }
 
         // Normalize and write output tile
-        out.store(
-            true_div(acc, l_i.broadcast(shape![BM, D])).reshape(shape![1, BM, D]),
-        );
+        out.store(true_div(acc, l_i.broadcast(shape![BM, D])).reshape(shape![1, BM, D]));
     }
 }
 
@@ -168,8 +160,7 @@ impl CutileAttention {
 
     /// Initialize with a specific CUDA device ordinal.
     pub fn with_device(ordinal: usize) -> Result<Self> {
-        let device = Device::new(ordinal)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let device = Device::new(ordinal).map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         let stream = device
             .new_stream()
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
@@ -229,7 +220,7 @@ impl Attention for CutileAttention {
                 got: output.len(),
             });
         }
-        if num_heads % num_kv_heads != 0 {
+        if !num_heads.is_multiple_of(num_kv_heads) {
             return Err(KernelError::InvalidConfig(format!(
                 "num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
             )));
@@ -344,15 +335,33 @@ mod tests {
     use crate::attention::CpuAttention;
 
     fn reference_attention(
-        q: &[f32], k: &[f32], v: &[f32],
-        batch: usize, seq_len: usize, kv_len: usize,
-        num_heads: usize, num_kv_heads: usize, head_dim: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        batch: usize,
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
         scale: f32,
     ) -> Vec<f32> {
         let mut out = vec![0.0f32; batch * seq_len * num_heads * head_dim];
         let cpu = CpuAttention;
-        cpu.forward(q, k, v, &mut out, batch, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale)
-            .expect("cpu attention");
+        cpu.forward(
+            q,
+            k,
+            v,
+            &mut out,
+            batch,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .expect("cpu attention");
         out
     }
 
@@ -371,13 +380,34 @@ mod tests {
         let k: Vec<f32> = (0..nkv).map(|i| (i as f32) * 0.01).collect();
         let v: Vec<f32> = (0..nkv).map(|i| (i as f32) * 0.005).collect();
 
-        let expected = reference_attention(&q, &k, &v, batch, seq_len, kv_len,
-                                          num_heads, num_kv_heads, head_dim, scale);
+        let expected = reference_attention(
+            &q,
+            &k,
+            &v,
+            batch,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        );
 
         let mut got = vec![0.0f32; n];
-        gpu.forward(&q, &k, &v, &mut got, batch, seq_len, kv_len,
-                    num_heads, num_kv_heads, head_dim, scale)
-           .expect("cutile attention");
+        gpu.forward(
+            &q,
+            &k,
+            &v,
+            &mut got,
+            batch,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .expect("cutile attention");
 
         for (i, (e, g)) in expected.iter().zip(got.iter()).enumerate() {
             assert!(
@@ -402,13 +432,34 @@ mod tests {
         let k: Vec<f32> = (0..nkv).map(|i| (i as f32) * 0.01).collect();
         let v: Vec<f32> = (0..nkv).map(|i| (i as f32) * 0.005).collect();
 
-        let expected = reference_attention(&q, &k, &v, batch, seq_len, kv_len,
-                                          num_heads, num_kv_heads, head_dim, scale);
+        let expected = reference_attention(
+            &q,
+            &k,
+            &v,
+            batch,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        );
 
         let mut got = vec![0.0f32; n];
-        gpu.forward(&q, &k, &v, &mut got, batch, seq_len, kv_len,
-                    num_heads, num_kv_heads, head_dim, scale)
-           .expect("cutile attention GQA");
+        gpu.forward(
+            &q,
+            &k,
+            &v,
+            &mut got,
+            batch,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .expect("cutile attention GQA");
 
         for (i, (e, g)) in expected.iter().zip(got.iter()).enumerate() {
             assert!(

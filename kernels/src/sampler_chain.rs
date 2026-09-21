@@ -57,10 +57,7 @@ impl LogitProcessor for MinPSampler {
             return;
         }
 
-        let max_logit = logits
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let threshold = max_logit + self.min_p.ln();
 
         let mut keep_count = 0usize;
@@ -100,10 +97,7 @@ impl LogitProcessor for TypicalSampler {
         }
 
         // softmax
-        let max_val = logits
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut probs: Vec<f32> = logits.iter().map(|l| (l - max_val).exp()).collect();
         let sum: f32 = probs.iter().sum();
         for p in &mut probs {
@@ -184,10 +178,7 @@ impl LogitProcessor for MirostatV2Sampler {
         }
 
         // softmax to get probabilities
-        let max_val = logits
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let probs: Vec<f32> = {
             let exps: Vec<f32> = logits.iter().map(|l| (l - max_val).exp()).collect();
             let sum: f32 = exps.iter().sum();
@@ -242,7 +233,7 @@ impl LogitProcessor for RepetitionPenalizer {
             seen.entry(tok).or_insert(true);
         }
 
-        for (&tok, _) in &seen {
+        for &tok in seen.keys() {
             let idx = tok as usize;
             if idx < logits.len() {
                 if logits[idx] <= 0.0 {
@@ -383,7 +374,10 @@ mod kani_proofs {
             *l = kani::any();
             kani::assume(l.is_finite() && *l > -50.0 && *l < 50.0);
         }
-        let mut sampler = TypicalSampler { typical_p, min_keep: 1 };
+        let mut sampler = TypicalSampler {
+            typical_p,
+            min_keep: 1,
+        };
         sampler.apply(&mut logits, &[]);
     }
 
@@ -417,7 +411,10 @@ mod kani_proofs {
         for &t in &prior_tokens {
             kani::assume(t < 8);
         }
-        let mut penalizer = RepetitionPenalizer { penalty, last_n: 64 };
+        let mut penalizer = RepetitionPenalizer {
+            penalty,
+            last_n: 64,
+        };
         penalizer.apply(&mut logits, &prior_tokens);
     }
 
@@ -435,7 +432,10 @@ mod kani_proofs {
         let token_idx: u32 = kani::any();
         kani::assume(token_idx < 8);
         let prior_tokens = [token_idx];
-        let mut penalizer = RepetitionPenalizer { penalty, last_n: 64 };
+        let mut penalizer = RepetitionPenalizer {
+            penalty,
+            last_n: 64,
+        };
         penalizer.apply(&mut logits, &prior_tokens);
         // Positive logit of repeated token is divided by penalty (> 1), so it decreases
         assert!(logits[token_idx as usize] <= original[token_idx as usize]);
@@ -454,7 +454,9 @@ mod kani_proofs {
         let target_idx: u32 = kani::any();
         kani::assume(target_idx < 8);
         let original_val = logits[target_idx as usize];
-        let mut biaser = LogitBiaser { biases: vec![(target_idx, bias)] };
+        let mut biaser = LogitBiaser {
+            biases: vec![(target_idx, bias)],
+        };
         biaser.apply(&mut logits, &[]);
         let expected = original_val + bias;
         assert!(logits[target_idx as usize] == expected);
@@ -470,7 +472,10 @@ mod kani_proofs {
             *l = kani::any();
             kani::assume(l.is_finite() && *l > -100.0 && *l < 100.0);
         }
-        let mut sampler = TopNSigmaSampler { n_sigma, min_keep: 1 };
+        let mut sampler = TopNSigmaSampler {
+            n_sigma,
+            min_keep: 1,
+        };
         sampler.apply(&mut logits, &[]);
     }
 }
@@ -478,13 +483,6 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn softmax(logits: &[f32]) -> Vec<f32> {
-        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
-        let sum: f32 = exps.iter().sum();
-        exps.iter().map(|e| e / sum).collect()
-    }
 
     #[test]
     fn test_min_p_filters_low_probability_tokens() {
@@ -854,7 +852,13 @@ pub struct MirostatV1Sampler {
 
 impl MirostatV1Sampler {
     pub fn new(n_vocab: usize, tau: f32, eta: f32, m: usize) -> Self {
-        Self { n_vocab, tau, eta, m, mu: 2.0 * tau }
+        Self {
+            n_vocab,
+            tau,
+            eta,
+            m,
+            mu: 2.0 * tau,
+        }
     }
 
     pub fn update_mu(&mut self, selected_prob: f32) {
@@ -867,14 +871,20 @@ impl MirostatV1Sampler {
 
 impl LogitProcessor for MirostatV1Sampler {
     fn apply(&mut self, logits: &mut [f32], _prior_tokens: &[u32]) {
-        if logits.is_empty() { return; }
+        if logits.is_empty() {
+            return;
+        }
 
         let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut probs: Vec<(usize, f32)> = logits.iter().enumerate()
+        let mut probs: Vec<(usize, f32)> = logits
+            .iter()
+            .enumerate()
             .map(|(i, &l)| (i, (l - max_val).exp()))
             .collect();
         let sum: f32 = probs.iter().map(|(_, p)| p).sum();
-        for (_, p) in probs.iter_mut() { *p /= sum; }
+        for (_, p) in probs.iter_mut() {
+            *p /= sum;
+        }
         probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let m_use = (self.m - 1).min(probs.len().saturating_sub(1));
@@ -882,23 +892,39 @@ impl LogitProcessor for MirostatV1Sampler {
         let mut sum_ti_sq = 0.0f32;
         for i in 0..m_use {
             let t_i = ((i + 2) as f32 / (i + 1) as f32).ln();
-            let b_i = if probs[i + 1].1 > 0.0 { (probs[i].1 / probs[i + 1].1).ln() } else { 0.0 };
+            let b_i = if probs[i + 1].1 > 0.0 {
+                (probs[i].1 / probs[i + 1].1).ln()
+            } else {
+                0.0
+            };
             sum_ti_bi += t_i * b_i;
             sum_ti_sq += t_i * t_i;
         }
-        let s_hat = if sum_ti_sq > 0.0 { sum_ti_bi / sum_ti_sq } else { 1.0 };
+        let s_hat = if sum_ti_sq > 0.0 {
+            sum_ti_bi / sum_ti_sq
+        } else {
+            1.0
+        };
 
         let epsilon_hat = s_hat - 1.0;
         let k = if epsilon_hat > 0.0 && self.n_vocab > 0 {
             let num = epsilon_hat * 2.0f32.powf(self.mu);
             let denom = 1.0 - (self.n_vocab as f32).powf(-epsilon_hat);
-            if denom > 0.0 { (num / denom).powf(1.0 / s_hat).max(1.0) as usize } else { 1 }
-        } else { 1 };
+            if denom > 0.0 {
+                (num / denom).powf(1.0 / s_hat).max(1.0) as usize
+            } else {
+                1
+            }
+        } else {
+            1
+        };
 
         if k < probs.len() {
             let cutoff_logit = logits[probs[k - 1].0];
-            for (i, l) in logits.iter_mut().enumerate() {
-                if *l < cutoff_logit { *l = f32::NEG_INFINITY; }
+            for l in logits.iter_mut() {
+                if *l < cutoff_logit {
+                    *l = f32::NEG_INFINITY;
+                }
             }
         }
     }
@@ -917,21 +943,32 @@ pub struct ReasoningBudgetSampler {
 
 impl ReasoningBudgetSampler {
     pub fn new(thinking_end_token: u32, min_budget: usize, max_budget: usize) -> Self {
-        Self { thinking_end_token, min_budget, max_budget, tokens_generated: 0 }
+        Self {
+            thinking_end_token,
+            min_budget,
+            max_budget,
+            tokens_generated: 0,
+        }
     }
 
-    pub fn step(&mut self) { self.tokens_generated += 1; }
+    pub fn step(&mut self) {
+        self.tokens_generated += 1;
+    }
 }
 
 impl LogitProcessor for ReasoningBudgetSampler {
     fn apply(&mut self, logits: &mut [f32], _prior_tokens: &[u32]) {
         let tok = self.thinking_end_token as usize;
-        if tok >= logits.len() { return; }
+        if tok >= logits.len() {
+            return;
+        }
         if self.tokens_generated < self.min_budget {
             logits[tok] = f32::NEG_INFINITY;
         } else if self.tokens_generated >= self.max_budget {
             for (i, l) in logits.iter_mut().enumerate() {
-                if i != tok { *l = f32::NEG_INFINITY; }
+                if i != tok {
+                    *l = f32::NEG_INFINITY;
+                }
             }
         }
     }

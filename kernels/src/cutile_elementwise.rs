@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use crate::{KernelError, Result};
+use cuda_core::{Device, Stream};
 use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
 use cutile::tensor::{IntoPartition, Tensor};
-use cuda_core::{Device, Stream};
-use crate::{KernelError, Result};
+use std::sync::Arc;
 
 #[cutile::module]
 pub mod kernels {
@@ -97,8 +97,7 @@ impl CutileElementwise {
 
     /// Initialise with a specific CUDA device ordinal.
     pub fn with_device(ordinal: usize) -> Result<Self> {
-        let device = Device::new(ordinal)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let device = Device::new(ordinal).map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         let stream = device
             .new_stream()
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
@@ -117,7 +116,10 @@ impl CutileElementwise {
     pub fn vector_add(&self, a: &[f32], b: &[f32], output: &mut [f32]) -> Result<()> {
         let n = a.len();
         if b.len() != n || output.len() != n {
-            return Err(KernelError::DimensionMismatch { expected: n, got: b.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: n,
+                got: b.len(),
+            });
         }
         let n_pad = n.div_ceil(B) * B;
         let (a_vec, b_vec) = pad_pair(a, b, n, n_pad);
@@ -157,7 +159,10 @@ impl CutileElementwise {
     pub fn silu_mul(&self, gate: &[f32], up: &[f32], output: &mut [f32]) -> Result<()> {
         let n = gate.len();
         if up.len() != n || output.len() != n {
-            return Err(KernelError::DimensionMismatch { expected: n, got: up.len() });
+            return Err(KernelError::DimensionMismatch {
+                expected: n,
+                got: up.len(),
+            });
         }
         let n_pad = n.div_ceil(B) * B;
         let (gate_vec, up_vec) = pad_pair(gate, up, n, n_pad);

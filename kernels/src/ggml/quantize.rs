@@ -86,9 +86,8 @@ pub fn quantize_activations(src: &[f32], dst: &mut [u8], ggml_type: super::GgmlT
             let nb = src.len() / 32;
             assert_eq!(src.len() % 32, 0);
             assert!(dst.len() >= nb * BLOCK_Q8_0_SIZE);
-            let blocks = unsafe {
-                std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut BlockQ8_0, nb)
-            };
+            let blocks =
+                unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut BlockQ8_0, nb) };
             #[cfg(target_arch = "x86_64")]
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                 unsafe { super::vec_dot_avx2::quantize_row_q8_0_avx2(src, blocks) };
@@ -100,18 +99,16 @@ pub fn quantize_activations(src: &[f32], dst: &mut [u8], ggml_type: super::GgmlT
             let nb = src.len() / 32;
             assert_eq!(src.len() % 32, 0);
             assert!(dst.len() >= nb * BLOCK_Q8_1_SIZE);
-            let blocks = unsafe {
-                std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut BlockQ8_1, nb)
-            };
+            let blocks =
+                unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut BlockQ8_1, nb) };
             quantize_row_q8_1(src, blocks);
         }
         Q8K => {
             let nb = src.len() / 256;
             assert_eq!(src.len() % 256, 0);
             assert!(dst.len() >= nb * BLOCK_Q8K_SIZE);
-            let blocks = unsafe {
-                std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut BlockQ8K, nb)
-            };
+            let blocks =
+                unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut BlockQ8K, nb) };
             #[cfg(target_arch = "x86_64")]
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                 unsafe { super::vec_dot_avx2::quantize_row_q8_k_avx2(src, blocks) };
@@ -132,8 +129,8 @@ pub fn quantized_row_size(k: usize, ggml_type: super::GgmlType) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::helpers::f16_to_f32;
+    use super::*;
 
     #[test]
     fn q8_0_roundtrip() {
@@ -144,14 +141,21 @@ mod tests {
         assert!(d > 0.0);
         for (j, &v) in src.iter().enumerate() {
             let reconstructed = d * blocks[0].qs[j] as f32;
-            assert!((reconstructed - v).abs() < 0.02, "j={j}: {reconstructed} vs {v}");
+            assert!(
+                (reconstructed - v).abs() < 0.02,
+                "j={j}: {reconstructed} vs {v}"
+            );
         }
     }
 
     #[test]
     fn q8_1_sum_field() {
         let src = [1.0f32; 32];
-        let mut blocks = vec![BlockQ8_1 { d: 0, s: 0, qs: [0; 32] }];
+        let mut blocks = vec![BlockQ8_1 {
+            d: 0,
+            s: 0,
+            qs: [0; 32],
+        }];
         quantize_row_q8_1(&src, &mut blocks);
         let d = f16_to_f32(blocks[0].d);
         let s = f16_to_f32(blocks[0].s);
@@ -205,7 +209,9 @@ mod tests {
         use rand::Rng;
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let src: Vec<f32> = (0..256).map(|_| rng.random_range(-1.0f32..=1.0f32)).collect();
+        let src: Vec<f32> = (0..256)
+            .map(|_| rng.random_range(-1.0f32..=1.0f32))
+            .collect();
         let nb = src.len() / 32;
         let mut blocks = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; nb];
         quantize_row_q8_0(&src, &mut blocks);
@@ -232,7 +238,9 @@ mod tests {
         use rand::Rng;
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let src: Vec<f32> = (0..256).map(|_| rng.random_range(-1.0f32..=1.0f32)).collect();
+        let src: Vec<f32> = (0..256)
+            .map(|_| rng.random_range(-1.0f32..=1.0f32))
+            .collect();
         let mut blocks = vec![BlockQ8K {
             d: 0.0,
             qs: [0i8; 256],

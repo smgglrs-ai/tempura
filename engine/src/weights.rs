@@ -8,10 +8,15 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
     let exp = ((bits >> 10) & 0x1f) as u32;
     let frac = (bits & 0x3ff) as u32;
     if exp == 0 {
-        if frac == 0 { return f32::from_bits(sign << 31); }
+        if frac == 0 {
+            return f32::from_bits(sign << 31);
+        }
         let mut e = 1u32;
         let mut f = frac;
-        while f & 0x400 == 0 { f <<= 1; e += 1; }
+        while f & 0x400 == 0 {
+            f <<= 1;
+            e += 1;
+        }
         f32::from_bits((sign << 31) | ((127 - 15 + 1 - e) << 23) | ((f & 0x3ff) << 13))
     } else if exp == 31 {
         f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13))
@@ -336,10 +341,18 @@ impl QuantizedWeights {
         let mut i2s_tensors = HashMap::new();
         for (name, (dtype, data)) in &typed_tensors {
             match dtype {
-                GgmlType::Q6K => { q6k_tensors.insert(name.clone(), data.clone()); }
-                GgmlType::TQ2_0 => { tq2_tensors.insert(name.clone(), data.clone()); }
-                GgmlType::TQ1_0 => { i2s_tensors.insert(name.clone(), data.clone()); }
-                _ => { q4k_tensors.insert(name.clone(), data.clone()); }
+                GgmlType::Q6K => {
+                    q6k_tensors.insert(name.clone(), data.clone());
+                }
+                GgmlType::TQ2_0 => {
+                    tq2_tensors.insert(name.clone(), data.clone());
+                }
+                GgmlType::TQ1_0 => {
+                    i2s_tensors.insert(name.clone(), data.clone());
+                }
+                _ => {
+                    q4k_tensors.insert(name.clone(), data.clone());
+                }
             }
         }
         Self {
@@ -392,20 +405,31 @@ impl QuantizedWeights {
     }
 
     pub fn get_q4k(&self, name: &str) -> Option<&[u8]> {
-        self.q4k_tensors.get(name).map(|v| v.as_slice())
-            .or_else(|| self.mmap_q4k.get(name).and_then(|&(off, len)|
-                self.mmap.as_ref().map(|m| &m[off..off+len])))
+        self.q4k_tensors
+            .get(name)
+            .map(|v| v.as_slice())
+            .or_else(|| {
+                self.mmap_q4k
+                    .get(name)
+                    .and_then(|&(off, len)| self.mmap.as_ref().map(|m| &m[off..off + len]))
+            })
     }
 
     pub fn get_q6k(&self, name: &str) -> Option<&[u8]> {
-        self.q6k_tensors.get(name).map(|v| v.as_slice())
-            .or_else(|| self.mmap_q6k.get(name).and_then(|&(off, len)|
-                self.mmap.as_ref().map(|m| &m[off..off+len])))
+        self.q6k_tensors
+            .get(name)
+            .map(|v| v.as_slice())
+            .or_else(|| {
+                self.mmap_q6k
+                    .get(name)
+                    .and_then(|&(off, len)| self.mmap.as_ref().map(|m| &m[off..off + len]))
+            })
     }
 
     pub fn get_q2(&self, name: &str) -> Option<&[u8]> {
-        self.mmap_q2.get(name).and_then(|&(off, len)|
-            self.mmap.as_ref().map(|m| &m[off..off+len]))
+        self.mmap_q2
+            .get(name)
+            .and_then(|&(off, len)| self.mmap.as_ref().map(|m| &m[off..off + len]))
     }
 
     pub fn get_tq2(&self, name: &str) -> Option<&[u8]> {
@@ -413,24 +437,34 @@ impl QuantizedWeights {
     }
 
     pub fn get_i2s(&self, name: &str) -> Option<&[u8]> {
-        self.i2s_tensors.get(name).map(|v| v.as_slice())
-            .or_else(|| self.mmap_i2s.get(name).and_then(|&(off, len)|
-                self.mmap.as_ref().map(|m| &m[off..off+len])))
+        self.i2s_tensors
+            .get(name)
+            .map(|v| v.as_slice())
+            .or_else(|| {
+                self.mmap_i2s
+                    .get(name)
+                    .and_then(|&(off, len)| self.mmap.as_ref().map(|m| &m[off..off + len]))
+            })
     }
-
 
     pub fn get_tl2(&self, name: &str) -> Option<&Tl2Tensor> {
         self.tl2_tensors.get(name)
     }
 
     pub fn add_tl2_tensor(&mut self, name: String, data: Vec<u8>, m: usize, k: usize, scale: f32) {
-        self.tl2_tensors.insert(name, Tl2Tensor { data, m, k, scale });
+        self.tl2_tensors
+            .insert(name, Tl2Tensor { data, m, k, scale });
     }
 
     pub fn get_f16(&self, name: &str) -> Option<&[u8]> {
-        self.f16_tensors.get(name).map(|v| v.as_slice())
-            .or_else(|| self.mmap_f16.get(name).and_then(|&(off, len)|
-                self.mmap.as_ref().map(|m| &m[off..off+len])))
+        self.f16_tensors
+            .get(name)
+            .map(|v| v.as_slice())
+            .or_else(|| {
+                self.mmap_f16
+                    .get(name)
+                    .and_then(|&(off, len)| self.mmap.as_ref().map(|m| &m[off..off + len]))
+            })
     }
 
     pub fn insert_f16(&mut self, name: String, data: Vec<u8>) {
@@ -472,11 +506,16 @@ impl QuantizedWeights {
         } else if let Some(f16_data) = self.get_f16("model.embed_tokens.weight") {
             let byte_off = off * 2;
             for i in 0..hidden_size {
-                let bits = u16::from_le_bytes([f16_data[byte_off + i * 2], f16_data[byte_off + i * 2 + 1]]);
+                let bits = u16::from_le_bytes([
+                    f16_data[byte_off + i * 2],
+                    f16_data[byte_off + i * 2 + 1],
+                ]);
                 output[i] = f16_bits_to_f32(bits);
             }
-        } else if let Some(qk_data) = self.get_q4k("model.embed_tokens.weight")
-            .or_else(|| self.get_q6k("model.embed_tokens.weight")) {
+        } else if let Some(qk_data) = self
+            .get_q4k("model.embed_tokens.weight")
+            .or_else(|| self.get_q6k("model.embed_tokens.weight"))
+        {
             let is_q6k = self.get_q4k("model.embed_tokens.weight").is_none();
             let block_size = 256;
             let block_bytes = if is_q6k { 210 } else { 144 };
@@ -509,13 +548,14 @@ impl QuantizedWeights {
         }
     }
 
-
     pub fn mmap_q2_names(&self) -> Vec<String> {
         self.mmap_q2.keys().cloned().collect()
     }
 
     pub fn get_q2_i2s(&self, name: &str) -> Option<(&[u8], &[f32], usize, usize)> {
-        self.q2_i2s.get(name).map(|(d, s, n, k)| (d.as_slice(), s.as_slice(), *n, *k))
+        self.q2_i2s
+            .get(name)
+            .map(|(d, s, n, k)| (d.as_slice(), s.as_slice(), *n, *k))
     }
 
     pub fn get_q2x4(&self, name: &str) -> Option<(&[u8], usize, usize)> {
@@ -523,7 +563,9 @@ impl QuantizedWeights {
     }
 
     pub fn get_q2_tiled(&self, name: &str) -> Option<(&[u8], usize, usize)> {
-        self.q2_tiled.get(name).map(|(d, n, k)| (d.as_slice(), *n, *k))
+        self.q2_tiled
+            .get(name)
+            .map(|(d, n, k)| (d.as_slice(), *n, *k))
     }
 
     pub fn has_q2_tiled(&self) -> bool {
@@ -539,15 +581,28 @@ impl QuantizedWeights {
         let names: Vec<String> = self.mmap_q2.keys().cloned().collect();
         // Process in batches of 4 to limit peak memory (~400MB scratch per tensor)
         for batch in names.chunks(4) {
-            let results: Vec<_> = batch.par_iter().filter_map(|name| {
-                let &(n, k) = tensor_shapes.get(name)?;
-                let q2_data = self.get_q2(name)?;
-                let (i2s_data, _avg_scale, corrections) = tempura_kernels::quantized::q2_to_i2s_approx(q2_data, n, k);
-                let (tl2_data, scale) = tempura_kernels::tl2::repack_i2s_to_tl2(&i2s_data, n, k)?;
-                Some((name.clone(), tl2_data, scale, n, k, corrections))
-            }).collect();
+            let results: Vec<_> = batch
+                .par_iter()
+                .filter_map(|name| {
+                    let &(n, k) = tensor_shapes.get(name)?;
+                    let q2_data = self.get_q2(name)?;
+                    let (i2s_data, _avg_scale, corrections) =
+                        tempura_kernels::quantized::q2_to_i2s_approx(q2_data, n, k);
+                    let (tl2_data, scale) =
+                        tempura_kernels::tl2::repack_i2s_to_tl2(&i2s_data, n, k)?;
+                    Some((name.clone(), tl2_data, scale, n, k, corrections))
+                })
+                .collect();
             for (name, tl2_data, scale, n, k, corrections) in results {
-                self.tl2_tensors.insert(name.clone(), Tl2Tensor { data: tl2_data, m: n, k, scale });
+                self.tl2_tensors.insert(
+                    name.clone(),
+                    Tl2Tensor {
+                        data: tl2_data,
+                        m: n,
+                        k,
+                        scale,
+                    },
+                );
                 self.q2_row_corrections.insert(name, corrections);
             }
         }
@@ -572,7 +627,8 @@ impl QuantizedWeights {
         for name in names {
             if let Some(&(n, k)) = tensor_shapes.get(&name) {
                 if let Some(q2_data) = self.get_q2(&name) {
-                    let (i2s_data, scales) = tempura_kernels::quantized::repack_q2_to_i2s_layout(q2_data, n, k);
+                    let (i2s_data, scales) =
+                        tempura_kernels::quantized::repack_q2_to_i2s_layout(q2_data, n, k);
                     self.q2_i2s.insert(name, (i2s_data, scales, n, k));
                 }
             }
@@ -582,26 +638,42 @@ impl QuantizedWeights {
     pub fn build_q2_lut_tiled(&mut self, tensor_shapes: &HashMap<String, (usize, usize)>) {
         use rayon::prelude::*;
         let names: Vec<String> = self.mmap_q2.keys().cloned().collect();
-        let results: Vec<_> = names.par_iter().filter_map(|name| {
-            let &(n, k) = tensor_shapes.get(name)?;
-            let q2_data = self.get_q2(name)?;
-            let tiled = tempura_kernels::quantized::q2_lut_repack(q2_data, n, k);
-            Some((name.clone(), tiled, n, k))
-        }).collect();
+        let results: Vec<_> = names
+            .par_iter()
+            .filter_map(|name| {
+                let &(n, k) = tensor_shapes.get(name)?;
+                let q2_data = self.get_q2(name)?;
+                let tiled = tempura_kernels::quantized::q2_lut_repack(q2_data, n, k);
+                Some((name.clone(), tiled, n, k))
+            })
+            .collect();
         for (name, tiled, n, k) in results {
             self.q2_tiled.insert(name, (tiled, n, k));
         }
     }
 
     pub fn build_tl2_from_i2s(&mut self, tensor_shapes: &HashMap<String, (usize, usize)>) {
-        let names: Vec<String> = self.i2s_tensors.keys()
+        let names: Vec<String> = self
+            .i2s_tensors
+            .keys()
             .chain(self.mmap_i2s.keys())
-            .cloned().collect();
+            .cloned()
+            .collect();
         for name in names {
             if let Some(&(n, k)) = tensor_shapes.get(&name) {
                 if let Some(data) = self.get_i2s(&name) {
-                    if let Some((tl2_data, scale)) = tempura_kernels::tl2::repack_i2s_to_tl2(data, n, k) {
-                        self.tl2_tensors.insert(name.clone(), Tl2Tensor { data: tl2_data, m: n, k, scale });
+                    if let Some((tl2_data, scale)) =
+                        tempura_kernels::tl2::repack_i2s_to_tl2(data, n, k)
+                    {
+                        self.tl2_tensors.insert(
+                            name.clone(),
+                            Tl2Tensor {
+                                data: tl2_data,
+                                m: n,
+                                k,
+                                scale,
+                            },
+                        );
                     }
                 }
             }

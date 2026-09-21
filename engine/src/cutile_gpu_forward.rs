@@ -30,7 +30,6 @@ use tempura_kernels::cutile_flash_attention::CutileFlashAttention;
 use tempura_kernels::cutile_matmul::CutileMatMul;
 use tempura_kernels::cutile_rmsnorm::CutileRmsNorm;
 use tempura_kernels::cutile_rope::CutileRoPE;
-use tempura_kernels::Attention;
 
 use crate::config::ModelConfig;
 use crate::cutile_kv_cache::CutileKvCache;
@@ -47,14 +46,16 @@ struct DeviceWeight {
     tensor: Arc<Tensor<f32>>,
     /// Number of output rows (the "N" in z[M,N] = a[M,K] @ b[N,K]^T).
     n: usize,
-    /// Logical K dimension (number of input features, unpadded).
+    #[allow(dead_code)]
     k_raw: usize,
     /// Padded K actually stored on the GPU (multiple of BK, power-of-2).
     k_pad: usize,
 }
 
 fn next_pow2(x: usize) -> usize {
-    if x <= 1 { return 1; }
+    if x <= 1 {
+        return 1;
+    }
     1usize << (usize::BITS - (x - 1).leading_zeros()) as usize
 }
 
@@ -141,7 +142,12 @@ impl CutileGpuModel {
 
         device_weights.insert(
             name.to_string(),
-            DeviceWeight { tensor, n, k_raw, k_pad },
+            DeviceWeight {
+                tensor,
+                n,
+                k_raw,
+                k_pad,
+            },
         );
         Ok(())
     }
@@ -155,9 +161,7 @@ impl CutileGpuModel {
         }
         if let Some((dtype, bytes)) = qw.get_typed(name) {
             return Some(tempura_kernels::ggml::dequantize::dequantize_to_f32(
-                dtype,
-                bytes,
-                n_elements,
+                dtype, bytes, n_elements,
             ));
         }
         None
@@ -218,13 +222,43 @@ impl CutileGpuModel {
 
         // Use gemm_d2d_slot for m=1 so the coalesced GEMV path gets compiled.
         // gemm_d2d uses the tiled GEMM and would not trigger cutile_gemv_coalesced.
-        let _ = self.gemm_d2d_slot(&dummy_h, "model.layers.0.self_attn.q_proj.weight", 1, SLOT_Q);
-        let _ = self.gemm_d2d_slot(&dummy_h, "model.layers.0.self_attn.k_proj.weight", 1, SLOT_K);
-        let _ = self.gemm_d2d_slot(&dummy_h, "model.layers.0.self_attn.v_proj.weight", 1, SLOT_V);
-        let _ = self.gemm_d2d_slot(&dummy_q, "model.layers.0.self_attn.o_proj.weight", 1, SLOT_O);
-        let _ = self.gemm_d2d_slot(&dummy_h, "model.layers.0.mlp.gate_proj.weight", 1, SLOT_GATE);
+        let _ = self.gemm_d2d_slot(
+            &dummy_h,
+            "model.layers.0.self_attn.q_proj.weight",
+            1,
+            SLOT_Q,
+        );
+        let _ = self.gemm_d2d_slot(
+            &dummy_h,
+            "model.layers.0.self_attn.k_proj.weight",
+            1,
+            SLOT_K,
+        );
+        let _ = self.gemm_d2d_slot(
+            &dummy_h,
+            "model.layers.0.self_attn.v_proj.weight",
+            1,
+            SLOT_V,
+        );
+        let _ = self.gemm_d2d_slot(
+            &dummy_q,
+            "model.layers.0.self_attn.o_proj.weight",
+            1,
+            SLOT_O,
+        );
+        let _ = self.gemm_d2d_slot(
+            &dummy_h,
+            "model.layers.0.mlp.gate_proj.weight",
+            1,
+            SLOT_GATE,
+        );
         let _ = self.gemm_d2d_slot(&dummy_h, "model.layers.0.mlp.up_proj.weight", 1, SLOT_UP);
-        let _ = self.gemm_d2d_slot(&dummy_inter, "model.layers.0.mlp.down_proj.weight", 1, SLOT_DOWN);
+        let _ = self.gemm_d2d_slot(
+            &dummy_inter,
+            "model.layers.0.mlp.down_proj.weight",
+            1,
+            SLOT_DOWN,
+        );
         let _ = self.gemm_d2d_slot(&dummy_h, "lm_head.weight", 1, SLOT_LOGITS);
 
         // Also warm up the m>1 prefill path (tiled GEMM) for a representative batch.
@@ -269,24 +303,87 @@ impl CutileGpuModel {
             let p = format!("model.layers.{layer}");
 
             // Q / K / V projections: [q_dim/kv_dim, h]
-            Self::maybe_upload(&matmul, &mut dw, qw, &format!("{p}.self_attn.q_proj.weight"), q_dim, h)?;
-            Self::maybe_upload(&matmul, &mut dw, qw, &format!("{p}.self_attn.k_proj.weight"), kv_dim, h)?;
-            Self::maybe_upload(&matmul, &mut dw, qw, &format!("{p}.self_attn.v_proj.weight"), kv_dim, h)?;
+            Self::maybe_upload(
+                &matmul,
+                &mut dw,
+                qw,
+                &format!("{p}.self_attn.q_proj.weight"),
+                q_dim,
+                h,
+            )?;
+            Self::maybe_upload(
+                &matmul,
+                &mut dw,
+                qw,
+                &format!("{p}.self_attn.k_proj.weight"),
+                kv_dim,
+                h,
+            )?;
+            Self::maybe_upload(
+                &matmul,
+                &mut dw,
+                qw,
+                &format!("{p}.self_attn.v_proj.weight"),
+                kv_dim,
+                h,
+            )?;
 
             // O projection: [h, q_dim]
-            Self::maybe_upload(&matmul, &mut dw, qw, &format!("{p}.self_attn.o_proj.weight"), h, q_dim)?;
+            Self::maybe_upload(
+                &matmul,
+                &mut dw,
+                qw,
+                &format!("{p}.self_attn.o_proj.weight"),
+                h,
+                q_dim,
+            )?;
 
             // FFN projections: gate/up [inter, h], down [h, inter]
-            Self::maybe_upload(&matmul, &mut dw, qw, &format!("{p}.mlp.gate_proj.weight"), inter, h)?;
-            Self::maybe_upload(&matmul, &mut dw, qw, &format!("{p}.mlp.up_proj.weight"), inter, h)?;
-            Self::maybe_upload(&matmul, &mut dw, qw, &format!("{p}.mlp.down_proj.weight"), h, inter)?;
+            Self::maybe_upload(
+                &matmul,
+                &mut dw,
+                qw,
+                &format!("{p}.mlp.gate_proj.weight"),
+                inter,
+                h,
+            )?;
+            Self::maybe_upload(
+                &matmul,
+                &mut dw,
+                qw,
+                &format!("{p}.mlp.up_proj.weight"),
+                inter,
+                h,
+            )?;
+            Self::maybe_upload(
+                &matmul,
+                &mut dw,
+                qw,
+                &format!("{p}.mlp.down_proj.weight"),
+                h,
+                inter,
+            )?;
 
             // RMSNorm weights — pre-upload so forward_device never copies them per token.
             if let Some(w) = qw.get_f32(&format!("{p}.input_layernorm.weight")) {
-                Self::upload_norm_weight(matmul.stream(), &mut nw, &format!("{p}.input_layernorm.weight"), w, h, h_pad)?;
+                Self::upload_norm_weight(
+                    matmul.stream(),
+                    &mut nw,
+                    &format!("{p}.input_layernorm.weight"),
+                    w,
+                    h,
+                    h_pad,
+                )?;
             }
             if let Some(w) = qw.get_f32(&format!("{p}.post_attention_layernorm.weight")) {
-                Self::upload_norm_weight(matmul.stream(), &mut nw, &format!("{p}.post_attention_layernorm.weight"), w, h, h_pad)?;
+                Self::upload_norm_weight(
+                    matmul.stream(),
+                    &mut nw,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    w,
+                    h,
+                    h_pad,
+                )?;
             }
         }
 
@@ -362,10 +459,24 @@ impl CutileGpuModel {
             try_upload(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
 
             if let Some(w) = mw.get(&format!("{p}.input_layernorm.weight")) {
-                Self::upload_norm_weight(matmul.stream(), &mut nw, &format!("{p}.input_layernorm.weight"), w, h, h_pad)?;
+                Self::upload_norm_weight(
+                    matmul.stream(),
+                    &mut nw,
+                    &format!("{p}.input_layernorm.weight"),
+                    w,
+                    h,
+                    h_pad,
+                )?;
             }
             if let Some(w) = mw.get(&format!("{p}.post_attention_layernorm.weight")) {
-                Self::upload_norm_weight(matmul.stream(), &mut nw, &format!("{p}.post_attention_layernorm.weight"), w, h, h_pad)?;
+                Self::upload_norm_weight(
+                    matmul.stream(),
+                    &mut nw,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    w,
+                    h,
+                    h_pad,
+                )?;
             }
         }
 
@@ -441,8 +552,7 @@ impl CutileGpuModel {
         self.to_device(&padded, rows, padded_cols)
     }
 
-    /// Download a device tensor to a host Vec<f32>.
-    fn from_device(&self, t: &Arc<Tensor<f32>>) -> Vec<f32> {
+    fn download_device_tensor(&self, t: &Arc<Tensor<f32>>) -> Vec<f32> {
         t.to_host_vec()
             .sync_on(self.matmul.stream())
             .expect("CutileGpuModel: device→host download failed")
@@ -464,13 +574,14 @@ impl CutileGpuModel {
             .sync_on(stream)
             .expect("add_device: alloc failed")
             .partition([BLOCK]);
-        let (out_t, _, _) =
-            tempura_kernels::cutile_elementwise::kernels::cutile_vector_add(
-                out_t, a.clone(), b.clone(),
-            )
-            .generics(vec![BLOCK.to_string()])
-            .sync_on(stream)
-            .expect("add_device: kernel failed");
+        let (out_t, _, _) = tempura_kernels::cutile_elementwise::kernels::cutile_vector_add(
+            out_t,
+            a.clone(),
+            b.clone(),
+        )
+        .generics(vec![BLOCK.to_string()])
+        .sync_on(stream)
+        .expect("add_device: kernel failed");
         Arc::new(out_t.unpartition())
     }
 
@@ -694,37 +805,40 @@ impl CutileGpuModel {
             let use_coalesced = dw.k_pad % 128 == 0;
             if use_coalesced {
                 if let Some(tensor) = maybe_tensor {
-                    if let Ok(result) = self.matmul.forward_gemv_coalesced_d2d_into(
-                        a, &dw.tensor, tensor, dw.n, dw.k_pad,
-                    ) {
+                    if let Ok(result) = self
+                        .matmul
+                        .forward_gemv_coalesced_d2d_into(a, &dw.tensor, tensor, dw.n, dw.k_pad)
+                    {
                         self.scratch.borrow_mut()[slot] = Some(result.clone());
                         return result;
                     }
                 }
-                return self.matmul
+                return self
+                    .matmul
                     .forward_gemv_coalesced_d2d(a, &dw.tensor, dw.n, dw.k_pad)
                     .expect("CutileGpuModel::gemm_d2d_slot coalesced GEMV failed");
             }
             // k_pad not divisible by 128 — fall back to strided GEMV.
             if let Some(tensor) = maybe_tensor {
-                if let Ok(result) =
-                    self.matmul
-                        .forward_gemv_d2d_into(a, &dw.tensor, tensor, dw.n, dw.k_pad)
+                if let Ok(result) = self
+                    .matmul
+                    .forward_gemv_d2d_into(a, &dw.tensor, tensor, dw.n, dw.k_pad)
                 {
                     self.scratch.borrow_mut()[slot] = Some(result.clone());
                     return result;
                 }
             }
-            return self.matmul
+            return self
+                .matmul
                 .forward_gemv_device_to_device(a, &dw.tensor, dw.n, dw.k_pad)
                 .expect("CutileGpuModel::gemm_d2d_slot GEMV failed");
         }
 
         // Prefill (m > 1): use square tiled GEMM.
         if let Some(tensor) = maybe_tensor {
-            if let Ok(result) =
-                self.matmul
-                    .forward_bt_d2d_into(a, &dw.tensor, tensor, m, dw.n, dw.k_pad)
+            if let Ok(result) = self
+                .matmul
+                .forward_bt_d2d_into(a, &dw.tensor, tensor, m, dw.n, dw.k_pad)
             {
                 self.scratch.borrow_mut()[slot] = Some(result.clone());
                 return result;
@@ -787,23 +901,33 @@ impl CutileGpuModel {
         let positions: Vec<u32> = (position..position + seq_len).map(|p| p as u32).collect();
 
         // Pre-build weight name strings to avoid allocations in the hot loop.
-        let layer_names: Vec<(String, String, String, String, String, String, String, String, String)> =
-            (0..cfg.num_layers)
-                .map(|l| {
-                    let p = format!("model.layers.{l}");
-                    (
-                        format!("{p}.input_layernorm.weight"),
-                        format!("{p}.post_attention_layernorm.weight"),
-                        format!("{p}.self_attn.q_proj.weight"),
-                        format!("{p}.self_attn.k_proj.weight"),
-                        format!("{p}.self_attn.v_proj.weight"),
-                        format!("{p}.self_attn.o_proj.weight"),
-                        format!("{p}.mlp.gate_proj.weight"),
-                        format!("{p}.mlp.up_proj.weight"),
-                        format!("{p}.mlp.down_proj.weight"),
-                    )
-                })
-                .collect();
+        #[allow(clippy::type_complexity)]
+        let layer_names: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )> = (0..cfg.num_layers)
+            .map(|l| {
+                let p = format!("model.layers.{l}");
+                (
+                    format!("{p}.input_layernorm.weight"),
+                    format!("{p}.post_attention_layernorm.weight"),
+                    format!("{p}.self_attn.q_proj.weight"),
+                    format!("{p}.self_attn.k_proj.weight"),
+                    format!("{p}.self_attn.v_proj.weight"),
+                    format!("{p}.self_attn.o_proj.weight"),
+                    format!("{p}.mlp.gate_proj.weight"),
+                    format!("{p}.mlp.up_proj.weight"),
+                    format!("{p}.mlp.down_proj.weight"),
+                )
+            })
+            .collect();
 
         // ── 2. Layer loop ──────────────────────────────────────────────────────
         // Upload hidden once before the loop.  It stays on device via add_device
@@ -825,9 +949,12 @@ impl CutileGpuModel {
 
             // ── 2a. Pre-attention RMSNorm (GPU) ───────────────────────────────
             // hidden_dev is already on device — no upload needed.
-            let input_ln_w_dev = self.norm_weights.get(input_ln_name)
+            let input_ln_w_dev = self
+                .norm_weights
+                .get(input_ln_name)
                 .expect("CutileGpuModel: input_layernorm weight not pre-uploaded");
-            let normed_dev = self.cutile_rmsnorm
+            let normed_dev = self
+                .cutile_rmsnorm
                 .forward_device(
                     self.matmul.stream(),
                     hidden_dev.clone(),
@@ -844,9 +971,12 @@ impl CutileGpuModel {
             // Submit all three without syncing between them — the stream
             // executes them in order. One sync replaces three.
             // SAFETY: sync_stream() is called immediately below before any CPU read.
-            let q_dev = unsafe { self.submit_gemm_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q) };
-            let k_dev = unsafe { self.submit_gemm_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K) };
-            let v_dev = unsafe { self.submit_gemm_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V) };
+            let q_dev =
+                unsafe { self.submit_gemm_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q) };
+            let k_dev =
+                unsafe { self.submit_gemm_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K) };
+            let v_dev =
+                unsafe { self.submit_gemm_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V) };
             self.matmul.sync_stream().expect("QKV sync failed");
 
             // ── 2c. RoPE (GPU) — rotate Q and K entirely on device ───────────
@@ -856,11 +986,27 @@ impl CutileGpuModel {
             // interleaved format before a final upload.
             // PCIe savings vs CPU path: -3 transfers for Q, -1 for K per layer.
             let (q_rot_dev, k_rot_dev) = if !cfg.use_alibi {
-                let qr = self.cutile_rope
-                    .forward_device(&q_dev, &positions, seq_len, n_heads, head_dim, cfg.rope_theta)
+                let qr = self
+                    .cutile_rope
+                    .forward_device(
+                        &q_dev,
+                        &positions,
+                        seq_len,
+                        n_heads,
+                        head_dim,
+                        cfg.rope_theta,
+                    )
                     .expect("CutileGpuModel: GPU RoPE for Q failed");
-                let kr = self.cutile_rope
-                    .forward_device(&k_dev, &positions, seq_len, n_kv_heads, head_dim, cfg.rope_theta)
+                let kr = self
+                    .cutile_rope
+                    .forward_device(
+                        &k_dev,
+                        &positions,
+                        seq_len,
+                        n_kv_heads,
+                        head_dim,
+                        cfg.rope_theta,
+                    )
                     .expect("CutileGpuModel: GPU RoPE for K failed");
                 (qr, kr)
             } else {
@@ -871,8 +1017,8 @@ impl CutileGpuModel {
             // ── 2d. GPU KV-cache append (host mirror) ────────────────────────
             // V does not need RoPE, download from device to update host mirror.
             // K was rotated on device; one download for the rotated K host mirror.
-            let k_rot_host = self.from_device(&k_rot_dev);
-            let v_host = self.from_device(&v_dev);
+            let k_rot_host = self.download_device_tensor(&k_rot_dev);
+            let v_host = self.download_device_tensor(&v_dev);
             gpu_kv_cache.append_host(layer, &k_rot_host, &v_host, seq_len);
 
             // kv_len includes the tokens just appended (seq_len new tokens on
@@ -884,7 +1030,7 @@ impl CutileGpuModel {
             // calling forward() directly with the host mirror slices eliminates
             // the redundant O(kv_len × kv_dim) upload + O(kv_len × kv_dim)
             // download per attention call.
-            let q_rot_host = self.from_device(&q_rot_dev);
+            let q_rot_host = self.download_device_tensor(&q_rot_dev);
             let (k_slice, v_slice) = gpu_kv_cache.get_kv_host_slices(layer, kv_len);
             let mut attn_output = vec![0.0f32; seq_len * n_heads * head_dim];
             self.flash_attn
@@ -915,16 +1061,19 @@ impl CutileGpuModel {
             let o_padded = if self.h_pad == h {
                 o_dev.clone()
             } else {
-                let o_host = self.from_device(&o_dev);
+                let o_host = self.download_device_tensor(&o_dev);
                 self.to_device_flat_padded(&o_host, seq_len, h, self.h_pad)
             };
             hidden_dev = self.add_device(&hidden_dev, &o_padded, seq_len * self.h_pad);
 
             // ── 2h. Post-attention RMSNorm (GPU) ─────────────────────────────
             // hidden_dev is already updated on device — no upload needed.
-            let post_ln_w_dev = self.norm_weights.get(post_ln_name)
+            let post_ln_w_dev = self
+                .norm_weights
+                .get(post_ln_name)
                 .expect("CutileGpuModel: post_attention_layernorm weight not pre-uploaded");
-            let normed2_dev = self.cutile_rmsnorm
+            let normed2_dev = self
+                .cutile_rmsnorm
                 .forward_device(
                     self.matmul.stream(),
                     hidden_dev.clone(),
@@ -940,8 +1089,10 @@ impl CutileGpuModel {
             // normed2_dev is already [seq_len, h_pad] — directly usable by gemm_d2d.
             // Submit both without an intermediate sync — single sync covers both.
             // SAFETY: sync_stream() is called immediately below before any CPU read.
-            let gate_dev = unsafe { self.submit_gemm_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE) };
-            let up_dev = unsafe { self.submit_gemm_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP) };
+            let gate_dev =
+                unsafe { self.submit_gemm_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE) };
+            let up_dev =
+                unsafe { self.submit_gemm_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP) };
             self.matmul.sync_stream().expect("gate/up sync failed");
 
             // ── 2j. SiLU gate × up (GPU) ─────────────────────────────────────
@@ -949,7 +1100,8 @@ impl CutileGpuModel {
             // passes them directly to the GPU kernel — 0 D→H + 0 H→D when
             // inter is B-aligned (true for all standard models).
             // The result has seq_len × inter elements; pad to inter_pad if needed.
-            let gate_silu_n_dev = self.cutile_elementwise
+            let gate_silu_n_dev = self
+                .cutile_elementwise
                 .silu_mul_device(&gate_dev, &up_dev, seq_len, inter)
                 .expect("CutileGpuModel: GPU SiLU-mul failed");
 
@@ -959,7 +1111,7 @@ impl CutileGpuModel {
             let gate_silu_dev = if self.inter_pad == inter {
                 gate_silu_n_dev
             } else {
-                let gate_silu_host = self.from_device(&gate_silu_n_dev);
+                let gate_silu_host = self.download_device_tensor(&gate_silu_n_dev);
                 self.to_device_padded(&gate_silu_host, seq_len, inter, self.inter_pad)
             };
             let down_dev = self.gemm_d2d_slot(&gate_silu_dev, down_w_name, seq_len, SLOT_DOWN);
@@ -968,7 +1120,7 @@ impl CutileGpuModel {
             let down_padded = if self.h_pad == h {
                 down_dev.clone()
             } else {
-                let down_host = self.from_device(&down_dev);
+                let down_host = self.download_device_tensor(&down_dev);
                 self.to_device_flat_padded(&down_host, seq_len, h, self.h_pad)
             };
             hidden_dev = self.add_device(&hidden_dev, &down_padded, seq_len * self.h_pad);
@@ -977,19 +1129,20 @@ impl CutileGpuModel {
         // ── 3. Final norm + lm_head ────────────────────────────────────────────
         // Download hidden_dev once after the loop.  Each row is h_pad elements;
         // the last token occupies hidden_final[(seq_len-1)*h_pad..seq_len*h_pad].
-        let hidden_final = self.from_device(&hidden_dev);
+        let hidden_final = self.download_device_tensor(&hidden_dev);
         let last_flat = Arc::new(
-            api::copy_host_vec_to_device(
-                &Arc::new(
-                    hidden_final[(seq_len - 1) * self.h_pad..seq_len * self.h_pad].to_vec(),
-                ),
-            )
+            api::copy_host_vec_to_device(&Arc::new(
+                hidden_final[(seq_len - 1) * self.h_pad..seq_len * self.h_pad].to_vec(),
+            ))
             .sync_on(self.matmul.stream())
             .expect("CutileGpuModel: last-token upload failed"),
         );
-        let final_norm_w_dev = self.norm_weights.get("model.norm.weight")
+        let final_norm_w_dev = self
+            .norm_weights
+            .get("model.norm.weight")
             .expect("CutileGpuModel: model.norm.weight not pre-uploaded");
-        let last_dev = self.cutile_rmsnorm
+        let last_dev = self
+            .cutile_rmsnorm
             .forward_device(
                 self.matmul.stream(),
                 last_flat,
@@ -1002,6 +1155,6 @@ impl CutileGpuModel {
             .expect("CutileGpuModel: final RMSNorm failed");
 
         let logits_dev = self.gemm_d2d_slot(&last_dev, "lm_head.weight", 1, SLOT_LOGITS);
-        self.from_device(&logits_dev)
+        self.download_device_tensor(&logits_dev)
     }
 }

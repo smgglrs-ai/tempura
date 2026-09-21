@@ -29,8 +29,10 @@ pub unsafe fn f16_dot_ggml(x_f16: &[u8], y_f16: &[u8], k: usize) -> f32 {
     let mut result = _mm512_reduce_add_ps(sum[0]);
 
     while i < k {
-        let xv = half::f16::from_bits(u16::from_le_bytes([x_f16[i * 2], x_f16[i * 2 + 1]])).to_f32();
-        let yv = half::f16::from_bits(u16::from_le_bytes([y_f16[i * 2], y_f16[i * 2 + 1]])).to_f32();
+        let xv =
+            half::f16::from_bits(u16::from_le_bytes([x_f16[i * 2], x_f16[i * 2 + 1]])).to_f32();
+        let yv =
+            half::f16::from_bits(u16::from_le_bytes([y_f16[i * 2], y_f16[i * 2 + 1]])).to_f32();
         result += xv * yv;
         i += 1;
     }
@@ -94,9 +96,8 @@ pub unsafe fn f16_dot_avx2(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
     let mut result = _mm_cvtss_f32(sums2);
 
     while i < k {
-        let b_val = half::f16::from_bits(
-            u16::from_le_bytes([b_f16[i * 2], b_f16[i * 2 + 1]])
-        ).to_f32();
+        let b_val =
+            half::f16::from_bits(u16::from_le_bytes([b_f16[i * 2], b_f16[i * 2 + 1]])).to_f32();
         result += a[i] * b_val;
         i += 1;
     }
@@ -114,12 +115,12 @@ pub fn f16_dot_ggml_scalar(x_f16: &[u8], y_f16: &[u8], k: usize) -> f32 {
         for j in 0..4 {
             for lane in 0..16 {
                 let idx = i + j * 16 + lane;
-                let xv = half::f16::from_bits(
-                    u16::from_le_bytes([x_f16[idx * 2], x_f16[idx * 2 + 1]])
-                ).to_f32();
-                let yv = half::f16::from_bits(
-                    u16::from_le_bytes([y_f16[idx * 2], y_f16[idx * 2 + 1]])
-                ).to_f32();
+                let xv =
+                    half::f16::from_bits(u16::from_le_bytes([x_f16[idx * 2], x_f16[idx * 2 + 1]]))
+                        .to_f32();
+                let yv =
+                    half::f16::from_bits(u16::from_le_bytes([y_f16[idx * 2], y_f16[idx * 2 + 1]]))
+                        .to_f32();
                 acc[j * 16 + lane] = xv.mul_add(yv, acc[j * 16 + lane]);
             }
         }
@@ -135,16 +136,22 @@ pub fn f16_dot_ggml_scalar(x_f16: &[u8], y_f16: &[u8], k: usize) -> f32 {
     }
 
     let mut h = [0.0f32; 8];
-    for i in 0..8 { h[i] = acc[i] + acc[i + 8]; }
+    for i in 0..8 {
+        h[i] = acc[i] + acc[i + 8];
+    }
     let mut q = [0.0f32; 4];
-    for i in 0..4 { q[i] = h[i] + h[i + 4]; }
+    for i in 0..4 {
+        q[i] = h[i] + h[i + 4];
+    }
     let p0 = q[1] + q[0];
     let p1 = q[3] + q[2];
     let mut s = p0 + p1;
 
     while i < k {
-        let xv = half::f16::from_bits(u16::from_le_bytes([x_f16[i * 2], x_f16[i * 2 + 1]])).to_f32();
-        let yv = half::f16::from_bits(u16::from_le_bytes([y_f16[i * 2], y_f16[i * 2 + 1]])).to_f32();
+        let xv =
+            half::f16::from_bits(u16::from_le_bytes([x_f16[i * 2], x_f16[i * 2 + 1]])).to_f32();
+        let yv =
+            half::f16::from_bits(u16::from_le_bytes([y_f16[i * 2], y_f16[i * 2 + 1]])).to_f32();
         s += xv * yv;
         i += 1;
     }
@@ -159,27 +166,35 @@ pub fn f16_dot_scalar(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
 
     while i < k32 {
         for lane in 0..8 {
-            let b_val = half::f16::from_bits(
-                u16::from_le_bytes([b_f16[(i + lane) * 2], b_f16[(i + lane) * 2 + 1]])
-            ).to_f32();
+            let b_val = half::f16::from_bits(u16::from_le_bytes([
+                b_f16[(i + lane) * 2],
+                b_f16[(i + lane) * 2 + 1],
+            ]))
+            .to_f32();
             acc[lane] = a[i + lane].mul_add(b_val, acc[lane]);
         }
         for lane in 0..8 {
-            let b_val = half::f16::from_bits(
-                u16::from_le_bytes([b_f16[(i + 8 + lane) * 2], b_f16[(i + 8 + lane) * 2 + 1]])
-            ).to_f32();
+            let b_val = half::f16::from_bits(u16::from_le_bytes([
+                b_f16[(i + 8 + lane) * 2],
+                b_f16[(i + 8 + lane) * 2 + 1],
+            ]))
+            .to_f32();
             acc[8 + lane] = a[i + 8 + lane].mul_add(b_val, acc[8 + lane]);
         }
         for lane in 0..8 {
-            let b_val = half::f16::from_bits(
-                u16::from_le_bytes([b_f16[(i + 16 + lane) * 2], b_f16[(i + 16 + lane) * 2 + 1]])
-            ).to_f32();
+            let b_val = half::f16::from_bits(u16::from_le_bytes([
+                b_f16[(i + 16 + lane) * 2],
+                b_f16[(i + 16 + lane) * 2 + 1],
+            ]))
+            .to_f32();
             acc[16 + lane] = a[i + 16 + lane].mul_add(b_val, acc[16 + lane]);
         }
         for lane in 0..8 {
-            let b_val = half::f16::from_bits(
-                u16::from_le_bytes([b_f16[(i + 24 + lane) * 2], b_f16[(i + 24 + lane) * 2 + 1]])
-            ).to_f32();
+            let b_val = half::f16::from_bits(u16::from_le_bytes([
+                b_f16[(i + 24 + lane) * 2],
+                b_f16[(i + 24 + lane) * 2 + 1],
+            ]))
+            .to_f32();
             acc[24 + lane] = a[i + 24 + lane].mul_add(b_val, acc[24 + lane]);
         }
         i += 32;
@@ -193,24 +208,27 @@ pub fn f16_dot_scalar(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
 
     while i + 8 <= k {
         for lane in 0..8 {
-            let b_val = half::f16::from_bits(
-                u16::from_le_bytes([b_f16[(i + lane) * 2], b_f16[(i + lane) * 2 + 1]])
-            ).to_f32();
+            let b_val = half::f16::from_bits(u16::from_le_bytes([
+                b_f16[(i + lane) * 2],
+                b_f16[(i + lane) * 2 + 1],
+            ]))
+            .to_f32();
             acc[lane] = a[i + lane].mul_add(b_val, acc[lane]);
         }
         i += 8;
     }
 
     let mut s = [0.0f32; 4];
-    for j in 0..4 { s[j] = acc[j] + acc[j + 4]; }
+    for j in 0..4 {
+        s[j] = acc[j] + acc[j + 4];
+    }
     let p0 = s[0] + s[1];
     let p1 = s[2] + s[3];
     let mut result = p0 + p1;
 
     while i < k {
-        let b_val = half::f16::from_bits(
-            u16::from_le_bytes([b_f16[i * 2], b_f16[i * 2 + 1]])
-        ).to_f32();
+        let b_val =
+            half::f16::from_bits(u16::from_le_bytes([b_f16[i * 2], b_f16[i * 2 + 1]])).to_f32();
         result += a[i] * b_val;
         i += 1;
     }
@@ -220,7 +238,14 @@ pub fn f16_dot_scalar(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
-unsafe fn f16_gemv_avx2(a_ptr: usize, b_ptr: usize, out_ptr: usize, k: usize, row_start: usize, row_end: usize) {
+unsafe fn f16_gemv_avx2(
+    a_ptr: usize,
+    b_ptr: usize,
+    out_ptr: usize,
+    k: usize,
+    row_start: usize,
+    row_end: usize,
+) {
     let row_bytes = k * 2;
     let a_slice = std::slice::from_raw_parts(a_ptr as *const f32, k);
     for j in row_start..row_end {

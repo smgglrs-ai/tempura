@@ -139,7 +139,9 @@ pub fn fused_sqrelu_mul(gate: &mut [f32], up: &[f32], n: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            unsafe { fused_sqrelu_mul_avx2(gate, up, n); }
+            unsafe {
+                fused_sqrelu_mul_avx2(gate, up, n);
+            }
             return;
         }
     }
@@ -175,7 +177,9 @@ pub fn residual_add(dst: &mut [f32], src: &[f32], n: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            unsafe { residual_add_avx2(dst, src, n); }
+            unsafe {
+                residual_add_avx2(dst, src, n);
+            }
             return;
         }
     }
@@ -245,7 +249,7 @@ mod tests {
         let gate = vec![1.0f32, -1.0, 0.5, 2.0, -0.5, 3.0, 0.0, -2.0];
         let up = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
 
-        let mut expected = vec![0.0f32; 8];
+        let mut expected = [0.0f32; 8];
         for i in 0..8 {
             let silu = gate[i] / (1.0 + (-gate[i]).exp());
             expected[i] = silu * up[i];
@@ -304,14 +308,21 @@ mod tests {
 
         let mut seq = input.clone();
         use crate::RMSNorm;
-        crate::rmsnorm::CpuRMSNormGgml.forward(&mut seq, &weight, h, eps).unwrap();
+        crate::rmsnorm::CpuRMSNormGgml
+            .forward(&mut seq, &weight, h, eps)
+            .unwrap();
         crate::portable_math::q8_snap(&mut seq);
 
         let mut fused = input.clone();
         fused_rmsnorm_q8snap(&mut fused, &weight, h, eps);
 
         for i in 0..h {
-            assert!((seq[i] - fused[i]).abs() < 1e-5, "mismatch at {i}: seq={}, fused={}", seq[i], fused[i]);
+            assert!(
+                (seq[i] - fused[i]).abs() < 1e-5,
+                "mismatch at {i}: seq={}, fused={}",
+                seq[i],
+                fused[i]
+            );
         }
     }
 
@@ -324,15 +335,26 @@ mod tests {
         let residual: Vec<f32> = (0..h).map(|i| (h - i) as f32 * 0.05).collect();
 
         let mut hidden_seq = hidden_orig.clone();
-        for i in 0..h { hidden_seq[i] += residual[i]; }
+        for i in 0..h {
+            hidden_seq[i] += residual[i];
+        }
         let mut normed_seq = hidden_seq.clone();
         use crate::RMSNorm;
-        crate::rmsnorm::CpuRMSNormGgml.forward(&mut normed_seq, &weight, h, eps).unwrap();
+        crate::rmsnorm::CpuRMSNormGgml
+            .forward(&mut normed_seq, &weight, h, eps)
+            .unwrap();
         crate::portable_math::q8_snap(&mut normed_seq);
 
         let mut hidden_fused = hidden_orig.clone();
         let mut normed_fused = vec![0.0f32; h];
-        fused_residual_rmsnorm_q8snap(&mut hidden_fused, &residual, &mut normed_fused, &weight, h, eps);
+        fused_residual_rmsnorm_q8snap(
+            &mut hidden_fused,
+            &residual,
+            &mut normed_fused,
+            &weight,
+            h,
+            eps,
+        );
 
         for i in 0..h {
             assert!((hidden_seq[i] - hidden_fused[i]).abs() < 1e-5);
@@ -355,7 +377,12 @@ mod tests {
         fused_sqrelu_mul(&mut gate, &up, n);
 
         for i in 0..n {
-            assert!((gate[i] - expected[i]).abs() < 1e-5, "mismatch at {i}: got={}, exp={}", gate[i], expected[i]);
+            assert!(
+                (gate[i] - expected[i]).abs() < 1e-5,
+                "mismatch at {i}: got={}, exp={}",
+                gate[i],
+                expected[i]
+            );
         }
     }
 

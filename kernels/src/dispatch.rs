@@ -24,7 +24,7 @@ impl GpuArch {
             7 => GpuArch::Turing,
             8 => GpuArch::Ampere,
             9 => GpuArch::Hopper,
-            10 | 11 | 12 => GpuArch::Blackwell,
+            10..=12 => GpuArch::Blackwell,
             _ => GpuArch::Unknown,
         }
     }
@@ -66,12 +66,7 @@ impl Q4KKernelConfig {
     }
 
     fn ampere_hopper(n: usize, blocks_per_row: usize) -> Self {
-        if n >= 32768 {
-            Self {
-                variant: QuantKernelVariant::CoopMultiWarp,
-                n_warps_per_col: 4,
-            }
-        } else if blocks_per_row >= 16 {
+        if n >= 32768 || blocks_per_row >= 16 {
             Self {
                 variant: QuantKernelVariant::CoopMultiWarp,
                 n_warps_per_col: 4,

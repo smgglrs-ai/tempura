@@ -13,3 +13,11 @@ vstd = { version = "0.0.0-2026-06-14-0213", default-features = false }
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(verus_keep_ghost)', 'cfg(verus_keep_ghost_body)'] }
+
+[workspace.lints.clippy]
+# Kernel functions have many parameters by necessity (SIMD, block layout, strides)
+too_many_arguments = "allow"
+# Unsafe kernel functions; safety is enforced by invariants at the call site
+missing_safety_doc = "allow"
+# Index loops are idiomatic in SIMD/numerical kernels for clarity and performance
+needless_range_loop = "allow"

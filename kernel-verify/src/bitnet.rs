@@ -1,12 +1,19 @@
-use rand::{Rng, SeedableRng};
 use crate::KernelTestResult;
+use rand::{Rng, SeedableRng};
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt()
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f32>()
+        .sqrt()
 }
 
 fn random_f32(len: usize, seed: u64) -> Vec<f32> {
@@ -98,13 +105,20 @@ pub fn compare_i2s_quant(k: usize) -> KernelTestResult {
     let detail = if pass {
         "exact match".into()
     } else {
-        let mismatches: Vec<_> = dst_scalar.iter().zip(dst_avx2.iter())
+        let mismatches: Vec<_> = dst_scalar
+            .iter()
+            .zip(dst_avx2.iter())
             .enumerate()
             .filter(|(_, (a, b))| a != b)
             .take(5)
             .map(|(i, (a, b))| format!("[{i}]: scalar={a} avx2={b}"))
             .collect();
-        format!("scale_diff={:.1e} sum_diff={} val_mismatches={}", (scale_s - scale_a).abs(), (sum_s - sum_a).abs(), mismatches.join(", "))
+        format!(
+            "scale_diff={:.1e} sum_diff={} val_mismatches={}",
+            (scale_s - scale_a).abs(),
+            (sum_s - sum_a).abs(),
+            mismatches.join(", ")
+        )
     };
 
     KernelTestResult {
@@ -119,8 +133,8 @@ pub fn compare_i2s_quant(k: usize) -> KernelTestResult {
 // ── 3. TL2 end-to-end: AVX2 LUT vs scalar direct oracle ──────────────────────
 
 pub fn compare_tl2_vs_direct(m: usize, k: usize, epsilon: f32) -> KernelTestResult {
-    use tempura_kernels::tl2::{tl2_forward, tl2_gemv_direct_scalar, repack_i2s_to_tl2};
     use tempura_kernels::quantized::i2s_weight_scale;
+    use tempura_kernels::tl2::{repack_i2s_to_tl2, tl2_forward, tl2_gemv_direct_scalar};
 
     let i2s = random_i2s_weights(m, k, 300);
     let act = random_f32(k, 301);
@@ -168,7 +182,7 @@ pub fn compare_tl2_vs_direct(m: usize, k: usize, epsilon: f32) -> KernelTestResu
 // ── 4. F16 dot product: scalar vs AVX2 ────────────────────────────────────────
 
 pub fn compare_f16_dot(k: usize, epsilon: f32) -> KernelTestResult {
-    use tempura_kernels::f16_gemv::{f16_dot_scalar, f16_dot_avx2};
+    use tempura_kernels::f16_gemv::{f16_dot_avx2, f16_dot_scalar};
 
     let a = random_f32(k, 400);
     let b = random_f16_bytes(k, 401);
@@ -245,7 +259,11 @@ pub fn compare_fused_sqrelu(n: usize) -> KernelTestResult {
         pass,
         max_abs_diff: mad,
         l2_distance: l2,
-        detail: if pass { "exact match".into() } else { format!("mad={mad:.2e}") },
+        detail: if pass {
+            "exact match".into()
+        } else {
+            format!("mad={mad:.2e}")
+        },
     }
 }
 
@@ -276,7 +294,11 @@ pub fn compare_fused_residual_add(n: usize) -> KernelTestResult {
         pass,
         max_abs_diff: mad,
         l2_distance: l2,
-        detail: if pass { "exact match".into() } else { format!("mad={mad:.2e}") },
+        detail: if pass {
+            "exact match".into()
+        } else {
+            format!("mad={mad:.2e}")
+        },
     }
 }
 
@@ -304,7 +326,11 @@ mod tests {
     fn test_tl2_vs_direct_scalar() {
         for (m, k) in [(128, 128), (256, 384), (128, 256), (256, 256)] {
             let r = compare_tl2_vs_direct(m, k, 0.0);
-            assert!(r.pass, "{}: max_abs_diff={:.2e} {}", r.test_name, r.max_abs_diff, r.detail);
+            assert!(
+                r.pass,
+                "{}: max_abs_diff={:.2e} {}",
+                r.test_name, r.max_abs_diff, r.detail
+            );
         }
     }
 
@@ -312,7 +338,11 @@ mod tests {
     fn test_f16_dot_bit_exact() {
         for k in [8, 16, 32, 64, 128, 256, 512, 2560] {
             let r = compare_f16_dot(k, 0.0);
-            assert_eq!(r.max_abs_diff, 0.0, "{}: not bit-exact, diff={:.2e}", r.test_name, r.max_abs_diff);
+            assert_eq!(
+                r.max_abs_diff, 0.0,
+                "{}: not bit-exact, diff={:.2e}",
+                r.test_name, r.max_abs_diff
+            );
         }
     }
 
@@ -320,7 +350,11 @@ mod tests {
     fn test_per_tensor_quant_bit_exact() {
         for k in [8, 16, 32, 64, 128, 256, 2560] {
             let r = compare_per_tensor_quant(k);
-            assert_eq!(r.max_abs_diff, 0.0, "{}: not bit-exact, diff={:.2e}", r.test_name, r.max_abs_diff);
+            assert_eq!(
+                r.max_abs_diff, 0.0,
+                "{}: not bit-exact, diff={:.2e}",
+                r.test_name, r.max_abs_diff
+            );
         }
     }
 
@@ -328,7 +362,11 @@ mod tests {
     fn test_fused_sqrelu_bit_exact() {
         for n in [1, 7, 8, 15, 16, 31, 32, 63, 64, 128, 2560] {
             let r = compare_fused_sqrelu(n);
-            assert_eq!(r.max_abs_diff, 0.0, "{}: not bit-exact, diff={:.2e}", r.test_name, r.max_abs_diff);
+            assert_eq!(
+                r.max_abs_diff, 0.0,
+                "{}: not bit-exact, diff={:.2e}",
+                r.test_name, r.max_abs_diff
+            );
         }
     }
 
@@ -336,7 +374,11 @@ mod tests {
     fn test_fused_residual_add_bit_exact() {
         for n in [1, 7, 8, 15, 16, 31, 32, 63, 64, 128, 2560] {
             let r = compare_fused_residual_add(n);
-            assert_eq!(r.max_abs_diff, 0.0, "{}: not bit-exact, diff={:.2e}", r.test_name, r.max_abs_diff);
+            assert_eq!(
+                r.max_abs_diff, 0.0,
+                "{}: not bit-exact, diff={:.2e}",
+                r.test_name, r.max_abs_diff
+            );
         }
     }
 }

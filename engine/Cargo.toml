@@ -5,9 +5,6 @@ edition.workspace = true
 license.workspace = true
 description = "Inference engine for tempura-serve: model loading, KV-cache, forward pass"
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
-
 [features]
 default = []
 cuda = ["tempura-kernels/cuda"]
@@ -48,3 +45,6 @@ harness = false
 tempfile = "3"
 bytemuck = "1"
 proptest = "1"
+
+[lints]
+workspace = true
