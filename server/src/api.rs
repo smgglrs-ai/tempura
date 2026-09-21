@@ -2221,7 +2221,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["object"], "list");
         assert!(v["data"].is_array());
-        assert!(v["data"].as_array().unwrap().len() >= 1);
+        assert!(!v["data"].as_array().unwrap().is_empty());
         assert_eq!(v["data"][0]["id"], "test");
     }
 

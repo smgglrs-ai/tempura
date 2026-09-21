@@ -317,7 +317,7 @@ mod tests {
         if resp.status().is_success() {
             let body: serde_json::Value = resp.json().await.unwrap();
             assert!(body["logits"].is_array());
-            assert!(body["logits"].as_array().unwrap().len() > 0);
+            assert!(!body["logits"].as_array().unwrap().is_empty());
         }
     }
 
