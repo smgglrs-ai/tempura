@@ -4080,25 +4080,37 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                         let a_row = &a[i * k..(i + 1) * k];
                         let (a_q8, a_scales, a_group_sums) =
                             unsafe { quantize_row_q8_avx2(a_row) };
-                        for j in 0..n {
-                            let mut sum = 0.0f32;
-                            for blk in 0..blocks_per_row {
-                                let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                                let block =
-                                    &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                                let aq_slice =
-                                    &a_q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                                let a_sc = a_scales[blk];
-                                let a_gsums =
-                                    &a_group_sums[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
-                                sum += if use_vnni {
-                                    unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
-                                } else {
-                                    unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
-                                };
-                            }
-                            row_out[j] = sum;
-                        }
+                        let j_chunk = (n / rayon::current_num_threads()).max(64);
+                        row_out.par_chunks_mut(j_chunk).enumerate().for_each(
+                            |(ci, jchunk)| {
+                                let j_start = ci * j_chunk;
+                                for (local, out_val) in jchunk.iter_mut().enumerate() {
+                                    let j = j_start + local;
+                                    let mut sum = 0.0f32;
+                                    for blk in 0..blocks_per_row {
+                                        let block_offset =
+                                            (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                                        let block = &b_quantized
+                                            [block_offset..block_offset + Q4K_BLOCK_BYTES];
+                                        let aq_slice = &a_q8
+                                            [blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                                        let a_sc = a_scales[blk];
+                                        let a_gsums = &a_group_sums
+                                            [blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
+                                        sum += if use_vnni {
+                                            unsafe {
+                                                q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums)
+                                            }
+                                        } else {
+                                            unsafe {
+                                                q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums)
+                                            }
+                                        };
+                                    }
+                                    *out_val = sum;
+                                }
+                            },
+                        );
                     });
                 return Ok(());
             }
@@ -4107,17 +4119,26 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 .enumerate()
                 .for_each(|(i, row_out)| {
                     let a_row = &a[i * k..(i + 1) * k];
-                    for j in 0..n {
-                        let mut sum = 0.0f32;
-                        for blk in 0..blocks_per_row {
-                            let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                            let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                            let a_slice =
-                                &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                            sum += q4k_dot_block(block, a_slice);
-                        }
-                        row_out[j] = sum;
-                    }
+                    let j_chunk = (n / rayon::current_num_threads()).max(64);
+                    row_out.par_chunks_mut(j_chunk).enumerate().for_each(
+                        |(ci, jchunk)| {
+                            let j_start = ci * j_chunk;
+                            for (local, out_val) in jchunk.iter_mut().enumerate() {
+                                let j = j_start + local;
+                                let mut sum = 0.0f32;
+                                for blk in 0..blocks_per_row {
+                                    let block_offset =
+                                        (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                                    let block = &b_quantized
+                                        [block_offset..block_offset + Q4K_BLOCK_BYTES];
+                                    let a_slice = &a_row
+                                        [blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                                    sum += q4k_dot_block(block, a_slice);
+                                }
+                                *out_val = sum;
+                            }
+                        },
+                    );
                 });
         }
 
@@ -4214,18 +4235,28 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                     .enumerate()
                     .for_each(|(i, row_out)| {
                         let a_row = &a[i * k..(i + 1) * k];
-                        for j in 0..n {
-                            let mut sum = 0.0f32;
-                            for blk in 0..blocks_per_row {
-                                let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
-                                let block =
-                                    &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
-                                let a_slice =
-                                    &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                                sum += unsafe { q6k_dot_block_avx2_i16(block, a_slice) };
-                            }
-                            row_out[j] = sum;
-                        }
+                        let j_chunk = (n / rayon::current_num_threads()).max(64);
+                        row_out.par_chunks_mut(j_chunk).enumerate().for_each(
+                            |(ci, jchunk)| {
+                                let j_start = ci * j_chunk;
+                                for (local, out_val) in jchunk.iter_mut().enumerate() {
+                                    let j = j_start + local;
+                                    let mut sum = 0.0f32;
+                                    for blk in 0..blocks_per_row {
+                                        let block_offset =
+                                            (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                                        let block = &b_quantized
+                                            [block_offset..block_offset + Q6K_BLOCK_BYTES];
+                                        let a_slice = &a_row[blk * Q6K_BLOCK_SIZE
+                                            ..(blk + 1) * Q6K_BLOCK_SIZE];
+                                        sum += unsafe {
+                                            q6k_dot_block_avx2_i16(block, a_slice)
+                                        };
+                                    }
+                                    *out_val = sum;
+                                }
+                            },
+                        );
                     });
                 return Ok(());
             }
@@ -4234,17 +4265,26 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 .enumerate()
                 .for_each(|(i, row_out)| {
                     let a_row = &a[i * k..(i + 1) * k];
-                    for j in 0..n {
-                        let mut sum = 0.0f32;
-                        for blk in 0..blocks_per_row {
-                            let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
-                            let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
-                            let a_slice =
-                                &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                            sum += q6k_dot_block(block, a_slice);
-                        }
-                        row_out[j] = sum;
-                    }
+                    let j_chunk = (n / rayon::current_num_threads()).max(64);
+                    row_out.par_chunks_mut(j_chunk).enumerate().for_each(
+                        |(ci, jchunk)| {
+                            let j_start = ci * j_chunk;
+                            for (local, out_val) in jchunk.iter_mut().enumerate() {
+                                let j = j_start + local;
+                                let mut sum = 0.0f32;
+                                for blk in 0..blocks_per_row {
+                                    let block_offset =
+                                        (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                                    let block = &b_quantized
+                                        [block_offset..block_offset + Q6K_BLOCK_BYTES];
+                                    let a_slice = &a_row
+                                        [blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
+                                    sum += q6k_dot_block(block, a_slice);
+                                }
+                                *out_val = sum;
+                            }
+                        },
+                    );
                 });
         }
         Ok(())
