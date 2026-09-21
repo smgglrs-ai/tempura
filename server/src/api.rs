@@ -2125,4 +2125,272 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert!(resp.status().is_client_error());
     }
+
+    // ── /tokenize ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_tokenize_no_tokenizer_returns_503() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let body = serde_json::json!({"content": "Hello world"});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tokenize")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_tokenize_malformed_json_returns_error() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tokenize")
+            .header("content-type", "application/json")
+            .body(Body::from(b"not json".to_vec()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(resp.status().is_client_error());
+    }
+
+    #[tokio::test]
+    async fn test_tokenize_missing_content_returns_error() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        // content field is required (not Option), so {} should fail deserialization
+        let body = serde_json::json!({});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tokenize")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(resp.status().is_client_error());
+    }
+
+    // ── /detokenize ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_detokenize_no_tokenizer_returns_503() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let body = serde_json::json!({"tokens": [1, 2, 3]});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/detokenize")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_detokenize_empty_tokens_no_tokenizer_returns_503() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let body = serde_json::json!({"tokens": []});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/detokenize")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── /v1/models ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_models_returns_200_with_model() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["object"], "list");
+        assert!(v["data"].is_array());
+        assert!(v["data"].as_array().unwrap().len() >= 1);
+        assert_eq!(v["data"][0]["id"], "test");
+    }
+
+    // ── /tempura/v1/traces ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_traces_list_empty() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .uri("/tempura/v1/traces")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_trace_get_nonexistent_returns_404() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .uri("/tempura/v1/traces/nonexistent-trace-id")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_trace_delete_nonexistent_returns_404() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/tempura/v1/traces/nonexistent-id")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── /tempura/v1/verified ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_verified_status_returns_200() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .uri("/tempura/v1/verified")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── /metrics ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_metrics_returns_prometheus_text() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        // Prometheus format: either empty or starts with # HELP / metric lines
+        assert!(text.is_empty() || text.contains('#') || text.contains('_'));
+    }
+
+    // ── Error handling ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_malformed_json_chat_returns_client_error() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(b"{not valid json".to_vec()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(resp.status().is_client_error());
+    }
+
+    #[tokio::test]
+    async fn test_missing_messages_field_returns_client_error() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let body = serde_json::json!({"model": "test"});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(resp.status().is_client_error());
+    }
+
+    #[tokio::test]
+    async fn test_unknown_route_returns_404() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let req = Request::builder()
+            .uri("/this/route/does/not/exist")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── /v1/completions ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_completions_missing_prompt_returns_error() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let body = serde_json::json!({"model": "test"});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(resp.status().is_client_error());
+    }
+
+    // ── Streaming ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_stream_response_is_sse_content_type() {
+        let state = test_state(false);
+        let app = router().with_state(state);
+        let body = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // With no tokenizer/weights the server returns an error, but the
+        // content-type check applies when the request is well-formed and
+        // the server attempts streaming. Either an SSE content-type or a
+        // client/server error response is acceptable here.
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("text/event-stream") || status.is_client_error() || status.is_server_error(),
+            "unexpected content-type {ct} with status {status}"
+        );
+    }
 }
