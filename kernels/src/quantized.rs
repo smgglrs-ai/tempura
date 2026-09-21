@@ -4025,37 +4025,40 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         // Thread-local buffer avoids one Vec allocation per input row per Rayon worker.
         #[cfg(feature = "openmp")]
         if m > 1 {
+            // K-tiled GEMM: pre-quantize all m rows to Q8K, then run OpenMP-parallel
+            // (j_tile, kb, i) loop so each weight block is loaded once and reused for all m rows.
+            use crate::ggml::blocks::BlockQ8K;
+            let q8k_blk_bytes = std::mem::size_of::<BlockQ8K>();
+            let mut q8k_all = vec![0u8; m * blocks_per_row * q8k_blk_bytes];
             for i in 0..m {
                 let a_row = &a[i * k..(i + 1) * k];
-                let row_out = &mut output[i * n..(i + 1) * n];
-                let mut q8k_buf = vec![unsafe { std::mem::zeroed::<BlockQ8K>() }; blocks_per_row];
+                let dst_bytes =
+                    &mut q8k_all[i * blocks_per_row * q8k_blk_bytes..][..blocks_per_row * q8k_blk_bytes];
+                let dst_blocks: &mut [BlockQ8K] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        dst_bytes.as_mut_ptr() as *mut BlockQ8K,
+                        blocks_per_row,
+                    )
+                };
                 #[cfg(target_arch = "x86_64")]
                 if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                     unsafe {
-                        crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(
-                            a_row,
-                            &mut q8k_buf[..blocks_per_row],
-                        )
+                        crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, dst_blocks)
                     };
                 } else {
-                    crate::ggml::quantize::quantize_row_q8_k(
-                        a_row,
-                        &mut q8k_buf[..blocks_per_row],
-                    );
+                    crate::ggml::quantize::quantize_row_q8_k(a_row, dst_blocks);
                 }
                 #[cfg(not(target_arch = "x86_64"))]
-                crate::ggml::quantize::quantize_row_q8_k(
-                    a_row,
-                    &mut q8k_buf[..blocks_per_row],
-                );
-                crate::openmp_gemv::openmp::gemv_q4k(
-                    b_quantized,
-                    &q8k_buf,
-                    row_out,
-                    n,
-                    blocks_per_row,
-                );
+                crate::ggml::quantize::quantize_row_q8_k(a_row, dst_blocks);
             }
+            crate::openmp_gemv::openmp::gemm_tiled_q4k(
+                b_quantized,
+                &q8k_all,
+                output,
+                m,
+                n,
+                blocks_per_row,
+            );
             return Ok(());
         }
         output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
@@ -4157,37 +4160,38 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         // llama.cpp translation: Q8_K activations × Q6_K weights via vec_dot_q6_K_q8_K.
         #[cfg(feature = "openmp")]
         if m > 1 {
+            use crate::ggml::blocks::BlockQ8K;
+            let q8k_blk_bytes = std::mem::size_of::<BlockQ8K>();
+            let mut q8k_all = vec![0u8; m * blocks_per_row * q8k_blk_bytes];
             for i in 0..m {
                 let a_row = &a[i * k..(i + 1) * k];
-                let row_out = &mut output[i * n..(i + 1) * n];
-                let mut q8k_buf = vec![unsafe { std::mem::zeroed::<BlockQ8K>() }; blocks_per_row];
+                let dst_bytes =
+                    &mut q8k_all[i * blocks_per_row * q8k_blk_bytes..][..blocks_per_row * q8k_blk_bytes];
+                let dst_blocks: &mut [BlockQ8K] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        dst_bytes.as_mut_ptr() as *mut BlockQ8K,
+                        blocks_per_row,
+                    )
+                };
                 #[cfg(target_arch = "x86_64")]
                 if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                     unsafe {
-                        crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(
-                            a_row,
-                            &mut q8k_buf[..blocks_per_row],
-                        )
+                        crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, dst_blocks)
                     };
                 } else {
-                    crate::ggml::quantize::quantize_row_q8_k(
-                        a_row,
-                        &mut q8k_buf[..blocks_per_row],
-                    );
+                    crate::ggml::quantize::quantize_row_q8_k(a_row, dst_blocks);
                 }
                 #[cfg(not(target_arch = "x86_64"))]
-                crate::ggml::quantize::quantize_row_q8_k(
-                    a_row,
-                    &mut q8k_buf[..blocks_per_row],
-                );
-                crate::openmp_gemv::openmp::gemv_q6k(
-                    b_quantized,
-                    &q8k_buf,
-                    row_out,
-                    n,
-                    blocks_per_row,
-                );
+                crate::ggml::quantize::quantize_row_q8_k(a_row, dst_blocks);
             }
+            crate::openmp_gemv::openmp::gemm_tiled_q6k(
+                b_quantized,
+                &q8k_all,
+                output,
+                m,
+                n,
+                blocks_per_row,
+            );
             return Ok(());
         }
         output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
