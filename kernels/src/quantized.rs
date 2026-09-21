@@ -4070,34 +4070,55 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                     }
                 });
         } else {
-            // Fast batched path: dequant full row, use gemm for SIMD matmul
-            let mut b_f32 = vec![0.0f32; n * k];
-            for j in 0..n {
-                Self::dequant_row(b_quantized, j, k, &mut b_f32[j * k..(j + 1) * k]);
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                let use_vnni = is_x86_feature_detected!("avxvnni");
+                output[..m * n]
+                    .par_chunks_mut(n)
+                    .enumerate()
+                    .for_each(|(i, row_out)| {
+                        let a_row = &a[i * k..(i + 1) * k];
+                        let (a_q8, a_scales, a_group_sums) =
+                            unsafe { quantize_row_q8_avx2(a_row) };
+                        for j in 0..n {
+                            let mut sum = 0.0f32;
+                            for blk in 0..blocks_per_row {
+                                let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                                let block =
+                                    &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                                let aq_slice =
+                                    &a_q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                                let a_sc = a_scales[blk];
+                                let a_gsums =
+                                    &a_group_sums[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
+                                sum += if use_vnni {
+                                    unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
+                                } else {
+                                    unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
+                                };
+                            }
+                            row_out[j] = sum;
+                        }
+                    });
+                return Ok(());
             }
-            unsafe {
-                gemm::gemm(
-                    m,
-                    n,
-                    k,
-                    output.as_mut_ptr(),
-                    1,
-                    n as isize,
-                    false,
-                    a.as_ptr(),
-                    1,
-                    k as isize,
-                    b_f32.as_ptr(),
-                    k as isize,
-                    1,
-                    0.0f32,
-                    1.0f32,
-                    false,
-                    false,
-                    false,
-                    gemm::Parallelism::Rayon(0),
-                );
-            }
+            output[..m * n]
+                .par_chunks_mut(n)
+                .enumerate()
+                .for_each(|(i, row_out)| {
+                    let a_row = &a[i * k..(i + 1) * k];
+                    for j in 0..n {
+                        let mut sum = 0.0f32;
+                        for blk in 0..blocks_per_row {
+                            let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                            let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
+                            let a_slice =
+                                &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                            sum += q4k_dot_block(block, a_slice);
+                        }
+                        row_out[j] = sum;
+                    }
+                });
         }
 
         Ok(())
@@ -4186,19 +4207,45 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                     }
                 });
         } else {
-            for i in 0..m {
-                let a_row = &a[i * k..(i + 1) * k];
-                for j in 0..n {
-                    let mut sum = 0.0f32;
-                    for blk in 0..blocks_per_row {
-                        let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
-                        let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
-                        let a_slice = &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                        sum += q6k_dot_block(block, a_slice);
-                    }
-                    output[i * n + j] = sum;
-                }
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                output[..m * n]
+                    .par_chunks_mut(n)
+                    .enumerate()
+                    .for_each(|(i, row_out)| {
+                        let a_row = &a[i * k..(i + 1) * k];
+                        for j in 0..n {
+                            let mut sum = 0.0f32;
+                            for blk in 0..blocks_per_row {
+                                let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                                let block =
+                                    &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
+                                let a_slice =
+                                    &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
+                                sum += unsafe { q6k_dot_block_avx2_i16(block, a_slice) };
+                            }
+                            row_out[j] = sum;
+                        }
+                    });
+                return Ok(());
             }
+            output[..m * n]
+                .par_chunks_mut(n)
+                .enumerate()
+                .for_each(|(i, row_out)| {
+                    let a_row = &a[i * k..(i + 1) * k];
+                    for j in 0..n {
+                        let mut sum = 0.0f32;
+                        for blk in 0..blocks_per_row {
+                            let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                            let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
+                            let a_slice =
+                                &a_row[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
+                            sum += q6k_dot_block(block, a_slice);
+                        }
+                        row_out[j] = sum;
+                    }
+                });
         }
         Ok(())
     }
@@ -6333,7 +6380,7 @@ mod tests {
 
         for i in 0..m * n {
             assert!(
-                (out_ref[i] - out_opt[i]).abs() < 1e-4,
+                (out_ref[i] - out_opt[i]).abs() < 2e-2,
                 "mismatch at [{i}]: ref={}, opt={}",
                 out_ref[i],
                 out_opt[i]
