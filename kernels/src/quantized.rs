@@ -174,10 +174,10 @@ impl crate::inference_pool::KernelJob for Q6kMnJob {
     }
 }
 
-// Cache-tiled m×n job structs: parallelize over j (weight rows), K-tiled.
-// Each thread owns a range of j-values and iterates over ALL m activations per weight tile.
-// Weight tile w[j][blk_base..blk_base+BK] (~576B for Q4K, ~840B for Q6K) stays in L1d
-// while the inner i-loop runs — eliminating the m×n separate weight reloads of Q4kMnJob.
+// Prefill GEMM job structs: parallelize over j (weight rows).
+// Each thread owns a contiguous range of j-values and for each j iterates over ALL m
+// activations, reusing the weight row in L1d across the inner i-loop.
+// Zero heap allocation: results written directly to out[i*n+j].
 struct Q4kMnTiledJob {
     bq_ptr:        *const u8,
     q8k_ptr:       *const u8,
@@ -185,6 +185,7 @@ struct Q4kMnTiledJob {
     m:             usize,
     n:             usize,
     bpr:           usize,
+    k:             usize,
     bq_row_bytes:  usize,   // bpr * Q4K_BLOCK_BYTES
     q8k_row_bytes: usize,   // bpr * size_of::<BlockQ8K>()
 }
@@ -193,38 +194,22 @@ impl crate::inference_pool::KernelJob for Q4kMnTiledJob {
     #[inline(always)]
     fn exec_range(&self, start: usize, end: usize) {
         use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
-        const BK: usize = 4; // 4 × 144 B = 576-byte weight tile — fits L1d
-        let out_cols = end - start;
-        let mut acc = vec![0.0f32; self.m * out_cols];
-        let mut blk_base = 0usize;
-        while blk_base < self.bpr {
-            let blk_end = (blk_base + BK).min(self.bpr);
-            let tile_n = (blk_end - blk_base) * Q4K_BLOCK_SIZE;
-            for (joff, j) in (start..end).enumerate() {
-                // Load weight tile once; stays in L1d across the i-loop.
-                let w = unsafe {
+        for j in start..end {
+            let w = unsafe {
+                std::slice::from_raw_parts(
+                    self.bq_ptr.add(j * self.bq_row_bytes) as *const BlockQ4K,
+                    self.bpr,
+                )
+            };
+            for i in 0..self.m {
+                let a = unsafe {
                     std::slice::from_raw_parts(
-                        (self.bq_ptr.add(j * self.bq_row_bytes) as *const BlockQ4K).add(blk_base),
-                        blk_end - blk_base,
+                        self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K,
+                        self.bpr,
                     )
                 };
-                for i in 0..self.m {
-                    let a = unsafe {
-                        std::slice::from_raw_parts(
-                            (self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K)
-                                .add(blk_base),
-                            blk_end - blk_base,
-                        )
-                    };
-                    acc[i * out_cols + joff] +=
-                        crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(tile_n, w, a);
-                }
-            }
-            blk_base = blk_end;
-        }
-        for (joff, j) in (start..end).enumerate() {
-            for i in 0..self.m {
-                unsafe { *self.out_ptr.add(i * self.n + j) = acc[i * out_cols + joff]; }
+                let val = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(self.k, w, a);
+                unsafe { *self.out_ptr.add(i * self.n + j) = val; }
             }
         }
     }
@@ -237,6 +222,7 @@ struct Q6kMnTiledJob {
     m:             usize,
     n:             usize,
     bpr:           usize,
+    k:             usize,
     bq_row_bytes:  usize,   // bpr * Q6K_BLOCK_BYTES
     q8k_row_bytes: usize,   // bpr * size_of::<BlockQ8K>()
 }
@@ -245,38 +231,22 @@ impl crate::inference_pool::KernelJob for Q6kMnTiledJob {
     #[inline(always)]
     fn exec_range(&self, start: usize, end: usize) {
         use crate::ggml::blocks::{BlockQ6K, BlockQ8K};
-        const BK: usize = 4; // 4 × 210 B = 840-byte weight tile — fits L1d
-        let out_cols = end - start;
-        let mut acc = vec![0.0f32; self.m * out_cols];
-        let mut blk_base = 0usize;
-        while blk_base < self.bpr {
-            let blk_end = (blk_base + BK).min(self.bpr);
-            let tile_n = (blk_end - blk_base) * Q6K_BLOCK_SIZE;
-            for (joff, j) in (start..end).enumerate() {
-                // Load weight tile once; stays in L1d across the i-loop.
-                let w = unsafe {
+        for j in start..end {
+            let w = unsafe {
+                std::slice::from_raw_parts(
+                    self.bq_ptr.add(j * self.bq_row_bytes) as *const BlockQ6K,
+                    self.bpr,
+                )
+            };
+            for i in 0..self.m {
+                let a = unsafe {
                     std::slice::from_raw_parts(
-                        (self.bq_ptr.add(j * self.bq_row_bytes) as *const BlockQ6K).add(blk_base),
-                        blk_end - blk_base,
+                        self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K,
+                        self.bpr,
                     )
                 };
-                for i in 0..self.m {
-                    let a = unsafe {
-                        std::slice::from_raw_parts(
-                            (self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K)
-                                .add(blk_base),
-                            blk_end - blk_base,
-                        )
-                    };
-                    acc[i * out_cols + joff] +=
-                        crate::ggml::vec_dot_avx2::vec_dot_q6_k_q8_k_dispatch(tile_n, w, a);
-                }
-            }
-            blk_base = blk_end;
-        }
-        for (joff, j) in (start..end).enumerate() {
-            for i in 0..self.m {
-                unsafe { *self.out_ptr.add(i * self.n + j) = acc[i * out_cols + joff]; }
+                let val = crate::ggml::vec_dot_avx2::vec_dot_q6_k_q8_k_dispatch(self.k, w, a);
+                unsafe { *self.out_ptr.add(i * self.n + j) = val; }
             }
         }
     }
@@ -4458,6 +4428,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             m,
             n,
             bpr: blocks_per_row,
+            k,
             bq_row_bytes: blocks_per_row * Q4K_BLOCK_BYTES,
             q8k_row_bytes: blocks_per_row * std::mem::size_of::<BlockQ8K>(),
         };
@@ -4585,6 +4556,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             m,
             n,
             bpr: blocks_per_row,
+            k,
             bq_row_bytes: blocks_per_row * Q6K_BLOCK_BYTES,
             q8k_row_bytes: blocks_per_row * std::mem::size_of::<BlockQ8K>(),
         };
