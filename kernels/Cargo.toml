@@ -19,6 +19,7 @@ cc = "1"
 
 [dependencies]
 tempura-kernel-api = { path = "../kernel-api" }
+staticpar = { path = "../crates/staticpar" }
 thiserror = "2"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
