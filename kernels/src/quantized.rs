@@ -83,6 +83,97 @@ impl Q6kGemvJob {
     }
 }
 
+// m×n job structs: parallelize over idx = i*n + j with static dispatch pointer.
+struct Q4kMnJob {
+    bq_ptr:    *const u8,
+    q8k_ptr:   *const u8,
+    out_ptr:   *mut f32,
+    n:         usize,
+    bpr:       usize,
+    k:         usize,
+    row_bytes: usize,
+}
+unsafe impl Sync for Q4kMnJob {}
+impl crate::inference_pool::KernelJob for Q4kMnJob {
+    #[inline(always)]
+    fn exec_range(&self, start: usize, end: usize) {
+        use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+        const PREFETCH_DIST: usize = 8;
+        let q8k_stride = self.bpr * std::mem::size_of::<BlockQ8K>();
+        for idx in start..end {
+            let i = idx / self.n;
+            let j = idx % self.n;
+            let a_q8k = unsafe {
+                std::slice::from_raw_parts(
+                    self.q8k_ptr.add(i * q8k_stride) as *const BlockQ8K,
+                    self.bpr,
+                )
+            };
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let pf_j = j + PREFETCH_DIST;
+                if pf_j < self.n {
+                    use std::arch::x86_64::{_MM_HINT_T1, _mm_prefetch};
+                    _mm_prefetch(self.bq_ptr.add(pf_j * self.row_bytes) as *const i8, _MM_HINT_T1);
+                }
+            }
+            let w = unsafe {
+                std::slice::from_raw_parts(
+                    self.bq_ptr.add(j * self.row_bytes) as *const BlockQ4K,
+                    self.bpr,
+                )
+            };
+            let val = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(self.k, w, a_q8k);
+            unsafe { *self.out_ptr.add(i * self.n + j) = val; }
+        }
+    }
+}
+
+struct Q6kMnJob {
+    bq_ptr:    *const u8,
+    q8k_ptr:   *const u8,
+    out_ptr:   *mut f32,
+    n:         usize,
+    bpr:       usize,
+    k:         usize,
+    row_bytes: usize,
+}
+unsafe impl Sync for Q6kMnJob {}
+impl crate::inference_pool::KernelJob for Q6kMnJob {
+    #[inline(always)]
+    fn exec_range(&self, start: usize, end: usize) {
+        use crate::ggml::blocks::{BlockQ6K, BlockQ8K};
+        const PREFETCH_DIST: usize = 8;
+        let q8k_stride = self.bpr * std::mem::size_of::<BlockQ8K>();
+        for idx in start..end {
+            let i = idx / self.n;
+            let j = idx % self.n;
+            let a_q8k = unsafe {
+                std::slice::from_raw_parts(
+                    self.q8k_ptr.add(i * q8k_stride) as *const BlockQ8K,
+                    self.bpr,
+                )
+            };
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let pf_j = j + PREFETCH_DIST;
+                if pf_j < self.n {
+                    use std::arch::x86_64::{_MM_HINT_T1, _mm_prefetch};
+                    _mm_prefetch(self.bq_ptr.add(pf_j * self.row_bytes) as *const i8, _MM_HINT_T1);
+                }
+            }
+            let w = unsafe {
+                std::slice::from_raw_parts(
+                    self.bq_ptr.add(j * self.row_bytes) as *const BlockQ6K,
+                    self.bpr,
+                )
+            };
+            let val = crate::ggml::vec_dot_avx2::vec_dot_q6_k_q8_k_dispatch(self.k, w, a_q8k);
+            unsafe { *self.out_ptr.add(i * self.n + j) = val; }
+        }
+    }
+}
+
 pub use crate::{
     Dequantize, MatMulQ, QuantDtype, I2S_BLOCK_BYTES, I2S_BLOCK_SIZE, Q4K_BLOCK_BYTES,
     Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE, Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, Q6K_GROUPS,
@@ -4199,30 +4290,16 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             #[cfg(not(target_arch = "x86_64"))]
             crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
         }
-        let out_ptr = output.as_mut_ptr();
-        let bq_ptr = b_quantized.as_ptr();
-        let q8k_ptr = q8k_all.as_ptr();
-        let row_bytes_q4k = blocks_per_row * Q4K_BLOCK_BYTES;
-        const PREFETCH_DIST: usize = 8;
-        crate::inference_pool::par_run(m * n, |start, end| {
-            for idx in start..end {
-                let i = idx / n; let j = idx % n;
-                let a_q8k = unsafe { std::slice::from_raw_parts(q8k_ptr.add(i * blocks_per_row), blocks_per_row) };
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    let pf_j = j + PREFETCH_DIST;
-                    if pf_j < n {
-                        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
-                        _mm_prefetch(bq_ptr.add(pf_j * row_bytes_q4k) as *const i8, _MM_HINT_T1);
-                    }
-                }
-                let w: &[BlockQ4K] = unsafe {
-                    std::slice::from_raw_parts(bq_ptr.add(j * row_bytes_q4k) as *const BlockQ4K, blocks_per_row)
-                };
-                let val = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(k, w, a_q8k);
-                unsafe { *out_ptr.add(i * n + j) = val; }
-            }
-        });
+        let job = Q4kMnJob {
+            bq_ptr: b_quantized.as_ptr(),
+            q8k_ptr: q8k_all.as_ptr() as *const u8,
+            out_ptr: output.as_mut_ptr(),
+            n,
+            bpr: blocks_per_row,
+            k,
+            row_bytes: blocks_per_row * Q4K_BLOCK_BYTES,
+        };
+        crate::inference_pool::par_run_job(m * n, &job);
 
         Ok(())
     }
@@ -4263,7 +4340,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             });
         }
 
-        use crate::ggml::blocks::{BlockQ6K, BlockQ8K};
+        use crate::ggml::blocks::BlockQ8K;
 
         thread_local! {
             static Q8K_BUF_Q6K: std::cell::UnsafeCell<Vec<BlockQ8K>> =
@@ -4339,30 +4416,16 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             #[cfg(not(target_arch = "x86_64"))]
             crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
         }
-        let out_ptr = output.as_mut_ptr();
-        let bq_ptr = b_quantized.as_ptr();
-        let q8k_ptr = q8k_all.as_ptr();
-        let row_bytes_q6k = blocks_per_row * Q6K_BLOCK_BYTES;
-        const PREFETCH_DIST_Q6K: usize = 8;
-        crate::inference_pool::par_run(m * n, |start, end| {
-            for idx in start..end {
-                let i = idx / n; let j = idx % n;
-                let a_q8k = unsafe { std::slice::from_raw_parts(q8k_ptr.add(i * blocks_per_row), blocks_per_row) };
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    let pf_j = j + PREFETCH_DIST_Q6K;
-                    if pf_j < n {
-                        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
-                        _mm_prefetch(bq_ptr.add(pf_j * row_bytes_q6k) as *const i8, _MM_HINT_T1);
-                    }
-                }
-                let w: &[BlockQ6K] = unsafe {
-                    std::slice::from_raw_parts(bq_ptr.add(j * row_bytes_q6k) as *const BlockQ6K, blocks_per_row)
-                };
-                let val = crate::ggml::vec_dot_avx2::vec_dot_q6_k_q8_k_dispatch(k, w, a_q8k);
-                unsafe { *out_ptr.add(i * n + j) = val; }
-            }
-        });
+        let job = Q6kMnJob {
+            bq_ptr: b_quantized.as_ptr(),
+            q8k_ptr: q8k_all.as_ptr() as *const u8,
+            out_ptr: output.as_mut_ptr(),
+            n,
+            bpr: blocks_per_row,
+            k,
+            row_bytes: blocks_per_row * Q6K_BLOCK_BYTES,
+        };
+        crate::inference_pool::par_run_job(m * n, &job);
         Ok(())
     }
 
