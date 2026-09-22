@@ -1,48 +1,51 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 struct Inner {
-    gen:      AtomicU64,
-    fn_ptr:   AtomicU64,
-    ctx:      AtomicU64,
-    done:     AtomicUsize,
-    shutdown: AtomicBool,
+    // Condvar-based wake: workers park until gen changes.
+    // Zero memory-bus pressure when idle — no polling.
+    mutex:     Mutex<u64>,
+    condvar:   Condvar,
+    done:      AtomicUsize,
+    shutdown:  AtomicBool,
     // Per-worker pre-assigned ranges, packed as (start << 32) | end.
-    // Written by caller before gen.fetch_add(Release); read by worker
-    // after gen.load(Acquire) — the gen fence provides the happens-before.
-    // AtomicU64 used for shared access without UnsafeCell; store/load use
-    // Relaxed since gen Release/Acquire is the synchronization point.
-    ranges:   Box<[AtomicU64]>,
+    // Written before Mutex release (which is the Release fence);
+    // read after Condvar wake (which implies the Acquire).
+    ranges:  Box<[u64]>,
+    fn_ptr:  AtomicU64,
+    ctx:     AtomicU64,
 }
 
-/// Static-partition spin-wait thread pool.
+/// Static-partition thread pool with Condvar park/wake.
 ///
-/// Pre-spawned threads spin between `run()` calls. Work is divided into
-/// statically pre-assigned contiguous ranges — thread i processes its
-/// range without any atomic counter in the hot path. Zero fetch_add
-/// during computation; no crossbeam epoch GC.
+/// Pre-spawned threads park between `run()` calls via `std::sync::Condvar`.
+/// Work is divided into statically pre-assigned contiguous ranges — thread i
+/// processes its range with zero per-item atomics. On wake, each thread reads
+/// its own range slot (no cache-line sharing during computation).
+///
+/// vs spinning: eliminates idle memory-bus pressure from polling a shared atomic.
+/// vs Rayon: no crossbeam epoch GC overhead between calls.
 ///
 /// Designed for repeated short embarrassingly-parallel workloads where
 /// thread count equals core count (GEMV, matrix rows, etc.).
 pub struct StaticPool {
-    inner:     Arc<Inner>,
+    inner:    Arc<Inner>,
     n_workers: usize,
-    _threads:  Vec<JoinHandle<()>>,
+    _threads: Vec<JoinHandle<()>>,
 }
 
 impl StaticPool {
-    pub fn new(n_workers: usize, spin_budget: u64) -> Self {
-        let ranges: Box<[AtomicU64]> = (0..n_workers)
-            .map(|_| AtomicU64::new(0))
-            .collect();
+    pub fn new(n_workers: usize) -> Self {
+        let ranges: Box<[u64]> = vec![0u64; n_workers].into_boxed_slice();
         let inner = Arc::new(Inner {
-            gen:      AtomicU64::new(0),
-            fn_ptr:   AtomicU64::new(0),
-            ctx:      AtomicU64::new(0),
+            mutex:    Mutex::new(0u64),
+            condvar:  Condvar::new(),
             done:     AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             ranges,
+            fn_ptr:   AtomicU64::new(0),
+            ctx:      AtomicU64::new(0),
         });
 
         let mut threads = Vec::with_capacity(n_workers);
@@ -51,7 +54,7 @@ impl StaticPool {
             threads.push(
                 std::thread::Builder::new()
                     .name(format!("staticpar-worker-{worker_idx}"))
-                    .spawn(move || worker_loop(worker_idx, ic, spin_budget))
+                    .spawn(move || worker_loop(worker_idx, ic))
                     .expect("failed to spawn staticpar worker"),
             );
         }
@@ -83,7 +86,7 @@ impl StaticPool {
     ///
     /// # Safety
     /// - `func` must be callable concurrently with non-overlapping ranges.
-    /// - `ctx` must remain valid and the data must be accessible from any thread.
+    /// - `ctx` must remain valid and accessible from any thread.
     /// - Writes via `ctx` must target non-overlapping regions per `(start, end)`.
     pub unsafe fn run_raw(
         &self,
@@ -93,41 +96,51 @@ impl StaticPool {
     ) {
         if n == 0 { return; }
         let inner = &self.inner;
-        let total  = self.n_workers + 1; // +1 = calling thread
+        let total = self.n_workers + 1; // +1 = calling thread
 
-        // Static partition: ceil(n/total) items per thread.
         let base = n / total;
         let rem  = n % total;
 
-        // Pre-compute and store each worker's range BEFORE gen increment.
-        // gen.fetch_add(Release) below provides the Release fence that
-        // makes these stores visible to workers after gen.load(Acquire).
+        // Pre-compute worker ranges.
+        // Safety: ranges is exclusively owned by run_raw (no concurrent run_raw
+        // is possible — callers must not call concurrently), and the mutex
+        // lock below provides the Release fence.
         for k in 0..self.n_workers {
             let start = k * base + k.min(rem);
             let end   = start + base + usize::from(k < rem);
-            inner.ranges[k].store((start as u64) << 32 | end as u64, Ordering::Relaxed);
+            unsafe { *inner.ranges.as_ptr().cast_mut().add(k) = (start as u64) << 32 | end as u64; }
         }
 
-        // Calling thread's partition (last slice, index = n_workers).
+        // Calling thread's partition (last slice).
         let caller_start = self.n_workers * base + self.n_workers.min(rem);
         let caller_end   = n;
 
-        // Publish fn/ctx (Relaxed — workers read after Acquire on gen).
         inner.fn_ptr.store(func as *const () as usize as u64, Ordering::Relaxed);
         inner.ctx.store(ctx as usize as u64, Ordering::Relaxed);
         inner.done.store(0, Ordering::Relaxed);
 
-        // Release fence: makes all stores above visible to workers.
-        inner.gen.fetch_add(1, Ordering::Release);
+        // Wake workers: increment gen under the mutex, then notify_all.
+        // The mutex lock provides the Release fence for the stores above.
+        {
+            let mut gen = inner.mutex.lock().unwrap();
+            *gen += 1;
+            inner.condvar.notify_all();
+        }
 
-        // Calling thread does its partition concurrently with workers.
+        // Calling thread does its partition while workers run.
         if caller_start < caller_end {
             unsafe { func(caller_start, caller_end, ctx) };
         }
 
-        // Spin-wait for workers.
+        // Wait for workers. Brief spin first (workers wake fast), then yield.
+        let mut spins = 0usize;
         while inner.done.load(Ordering::Acquire) < self.n_workers {
-            std::hint::spin_loop();
+            if spins < 2_000 {
+                spins += 1;
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
         }
     }
 }
@@ -135,40 +148,39 @@ impl StaticPool {
 impl Drop for StaticPool {
     fn drop(&mut self) {
         self.inner.shutdown.store(true, Ordering::Relaxed);
-        self.inner.gen.fetch_add(1, Ordering::Release);
+        let mut gen = self.inner.mutex.lock().unwrap();
+        *gen += 1;
+        self.inner.condvar.notify_all();
+        // _threads drops here, joining all worker threads.
     }
 }
 
-fn worker_loop(worker_idx: usize, inner: Arc<Inner>, spin_budget: u64) {
+fn worker_loop(worker_idx: usize, inner: Arc<Inner>) {
     let mut last_gen = 0u64;
     loop {
-        // Spin until gen changes (new job) or shutdown.
-        let mut spins = 0u64;
-        loop {
-            let g = inner.gen.load(Ordering::Acquire);
-            if g != last_gen { last_gen = g; break; }
-            if inner.shutdown.load(Ordering::Relaxed) { return; }
-            if spins < spin_budget {
-                std::hint::spin_loop();
-                spins += 1;
-            } else {
-                std::thread::yield_now();
-                spins = 0;
-            }
-        }
-
+        // Park until gen changes or shutdown.
+        let current_gen = {
+            let guard = inner.mutex.lock().unwrap();
+            // wait_while parks atomically — no busy-polling, zero memory bus pressure.
+            let guard = inner.condvar
+                .wait_while(guard, |gen| !inner.shutdown.load(Ordering::Relaxed) && *gen == last_gen)
+                .unwrap();
+            *guard
+        };
         if inner.shutdown.load(Ordering::Relaxed) { return; }
+        last_gen = current_gen;
 
-        // Read our pre-assigned range — no atomic counter, no cache-line sharing.
-        let packed = inner.ranges[worker_idx].load(Ordering::Relaxed);
+        // Read our pre-assigned range. The mutex unlock above (from Condvar::wait_while)
+        // provides the Acquire barrier, ensuring we see the range written before notify_all.
+        let packed = unsafe { *inner.ranges.as_ptr().add(worker_idx) };
         let start = (packed >> 32) as usize;
         let end   = (packed & 0xFFFF_FFFF) as usize;
 
         if start < end {
             let fn_raw  = inner.fn_ptr.load(Ordering::Relaxed);
             let ctx_raw = inner.ctx.load(Ordering::Relaxed);
-            type Fn = unsafe fn(usize, usize, *const ());
-            let f: Fn = unsafe { std::mem::transmute(fn_raw as usize) };
+            type WorkFn = unsafe fn(usize, usize, *const ());
+            let f: WorkFn = unsafe { std::mem::transmute(fn_raw as usize) };
             unsafe { f(start, end, ctx_raw as *const ()) };
         }
 
@@ -184,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_sum_is_correct() {
-        let pool = StaticPool::new(4, 10_000);
+        let pool = StaticPool::new(4);
         let n = 1024usize;
         let sums: Arc<Vec<AtomicI64>> = Arc::new((0..n).map(|i| AtomicI64::new(i as i64)).collect());
         let sums2 = Arc::clone(&sums);
@@ -200,7 +212,7 @@ mod tests {
 
     #[test]
     fn test_no_overlap() {
-        let pool = StaticPool::new(8, 10_000);
+        let pool = StaticPool::new(8);
         let n = 256usize;
         let counts: Arc<Vec<AtomicI64>> = Arc::new((0..n).map(|_| AtomicI64::new(0)).collect());
         let c2 = Arc::clone(&counts);
@@ -217,13 +229,13 @@ mod tests {
 
     #[test]
     fn test_empty_n() {
-        let pool = StaticPool::new(4, 10_000);
+        let pool = StaticPool::new(4);
         pool.run(0, &|_, _| panic!("should not be called"));
     }
 
     #[test]
     fn test_n_less_than_threads() {
-        let pool = StaticPool::new(8, 10_000);
+        let pool = StaticPool::new(8);
         let n = 3usize;
         let counts: Arc<Vec<AtomicI64>> = Arc::new((0..n).map(|_| AtomicI64::new(0)).collect());
         let c2 = Arc::clone(&counts);
@@ -235,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_repeated_calls() {
-        let pool = StaticPool::new(4, 10_000);
+        let pool = StaticPool::new(4);
         for round in 0..50u64 {
             let sum = std::sync::atomic::AtomicU64::new(0);
             pool.run(100, &|start, end| {

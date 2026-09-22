@@ -8,11 +8,7 @@ pub fn get() -> &'static StaticPool {
         let n = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8);
-        let spin = std::env::var("TEMPURA_POOL_SPIN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(50_000u64);
-        StaticPool::new(n.saturating_sub(1).max(1), spin)
+        StaticPool::new(n.saturating_sub(1).max(1))
     })
 }
 
