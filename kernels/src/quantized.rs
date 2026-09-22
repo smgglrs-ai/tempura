@@ -174,6 +174,100 @@ impl crate::inference_pool::KernelJob for Q6kMnJob {
     }
 }
 
+// Fused gate+up job: two Q4K projections sharing one pre-quantized activation dispatch.
+struct FusedQ4kPreq2Job {
+    b1_ptr:        *const u8,
+    b2_ptr:        *const u8,
+    out1_ptr:      *mut f32,
+    out2_ptr:      *mut f32,
+    n1:            usize,
+    blocks_per_row: usize,
+    q8_ptr:        *const i8,
+    scales_ptr:    *const f32,
+    gsums_ptr:     *const f32,
+}
+unsafe impl Sync for FusedQ4kPreq2Job {}
+impl crate::inference_pool::KernelJob for FusedQ4kPreq2Job {
+    #[inline(always)]
+    fn exec_range(&self, start: usize, end: usize) {
+        const USE_VNNI: bool = cfg!(any(target_feature = "avxvnni", target_feature = "avx512vnni"));
+        for idx in start..end {
+            let (b_ptr, j, o_ptr) = if idx < self.n1 {
+                (self.b1_ptr, idx, unsafe { self.out1_ptr.add(idx) })
+            } else {
+                (self.b2_ptr, idx - self.n1, unsafe { self.out2_ptr.add(idx - self.n1) })
+            };
+            let mut sum = 0.0f32;
+            for blk in 0..self.blocks_per_row {
+                let off = (j * self.blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                let block = unsafe { std::slice::from_raw_parts(b_ptr.add(off), Q4K_BLOCK_BYTES) };
+                let aq = unsafe { std::slice::from_raw_parts(self.q8_ptr.add(blk * Q4K_BLOCK_SIZE), Q4K_BLOCK_SIZE) };
+                let a_sc = unsafe { *self.scales_ptr.add(blk) };
+                let a_gs = unsafe { std::slice::from_raw_parts(self.gsums_ptr.add(blk * Q4K_GROUPS), Q4K_GROUPS) };
+                sum += if USE_VNNI { unsafe { q4k_dot_q8_vnni(block, aq, a_sc, a_gs) } }
+                       else { unsafe { q4k_dot_q8_avx2(block, aq, a_sc, a_gs) } };
+            }
+            unsafe { *o_ptr = sum; }
+        }
+    }
+}
+
+// Fused QKV job: two Q4K projections + one F16 projection, one dispatch.
+struct FusedQ4k2F161PreqJob {
+    b1_ptr:         *const u8,
+    b2_ptr:         *const u8,
+    out1_ptr:       *mut f32,
+    out2_ptr:       *mut f32,
+    out3_ptr:       *mut f32,
+    n1:             usize,
+    n2:             usize,
+    blocks_per_row: usize,
+    q8_ptr:         *const i8,
+    scales_ptr:     *const f32,
+    gsums_ptr:      *const f32,
+    f16_ptr:        *const u8,
+    a_f32_ptr:      *const f32,
+    k:              usize,
+    row_f16_bytes:  usize,
+}
+unsafe impl Sync for FusedQ4k2F161PreqJob {}
+impl crate::inference_pool::KernelJob for FusedQ4k2F161PreqJob {
+    #[inline(always)]
+    fn exec_range(&self, start: usize, end: usize) {
+        const USE_VNNI: bool = cfg!(any(target_feature = "avxvnni", target_feature = "avx512vnni"));
+        for idx in start..end {
+            if idx < self.n1 + self.n2 {
+                let (b_ptr, j, o_ptr) = if idx < self.n1 {
+                    (self.b1_ptr, idx, unsafe { self.out1_ptr.add(idx) })
+                } else {
+                    (self.b2_ptr, idx - self.n1, unsafe { self.out2_ptr.add(idx - self.n1) })
+                };
+                let mut sum = 0.0f32;
+                for blk in 0..self.blocks_per_row {
+                    let off = (j * self.blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                    let block = unsafe { std::slice::from_raw_parts(b_ptr.add(off), Q4K_BLOCK_BYTES) };
+                    let aq = unsafe { std::slice::from_raw_parts(self.q8_ptr.add(blk * Q4K_BLOCK_SIZE), Q4K_BLOCK_SIZE) };
+                    let a_sc = unsafe { *self.scales_ptr.add(blk) };
+                    let a_gs = unsafe { std::slice::from_raw_parts(self.gsums_ptr.add(blk * Q4K_GROUPS), Q4K_GROUPS) };
+                    sum += if USE_VNNI { unsafe { q4k_dot_q8_vnni(block, aq, a_sc, a_gs) } }
+                           else { unsafe { q4k_dot_q8_avx2(block, aq, a_sc, a_gs) } };
+                }
+                unsafe { *o_ptr = sum; }
+            } else {
+                let j = idx - self.n1 - self.n2;
+                let base = j * self.row_f16_bytes;
+                let mut dot = 0.0f32;
+                for i in 0..self.k {
+                    let off = base + i * 2;
+                    let b = unsafe { [*self.f16_ptr.add(off), *self.f16_ptr.add(off + 1)] };
+                    dot += crate::ggml::helpers::f16_to_f32(u16::from_le_bytes(b)) * unsafe { *self.a_f32_ptr.add(i) };
+                }
+                unsafe { *self.out3_ptr.add(j) = dot; }
+            }
+        }
+    }
+}
+
 pub use crate::{
     Dequantize, MatMulQ, QuantDtype, I2S_BLOCK_BYTES, I2S_BLOCK_SIZE, Q4K_BLOCK_BYTES,
     Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE, Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, Q6K_GROUPS,
@@ -3953,36 +4047,18 @@ impl CpuMatMulQ4KOpt {
         let k = preq.k;
         let blocks_per_row = k / Q4K_BLOCK_SIZE;
         let total = n1 + n2;
-
-        const USE_VNNI: bool = cfg!(any(target_feature = "avxvnni", target_feature = "avx512vnni"));
-
-        let b1_ptr = b1.as_ptr(); let b2_ptr = b2.as_ptr();
-        let out1_ptr = out1.as_mut_ptr(); let out2_ptr = out2.as_mut_ptr();
-        let q8_ptr = preq.q8.as_ptr(); let scales_ptr = preq.scales.as_ptr();
-        let gsums_ptr = preq.group_sums_q4k.as_ptr();
-        crate::inference_pool::par_run(total, |start, end| {
-            for idx in start..end {
-                let (b_ptr, j, o_ptr) = if idx < n1 {
-                    (b1_ptr, idx, unsafe { out1_ptr.add(idx) })
-                } else {
-                    (b2_ptr, idx - n1, unsafe { out2_ptr.add(idx - n1) })
-                };
-                let mut sum = 0.0f32;
-                for blk in 0..blocks_per_row {
-                    let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                    let block = unsafe { std::slice::from_raw_parts(b_ptr.add(block_offset), Q4K_BLOCK_BYTES) };
-                    let aq_slice = unsafe { std::slice::from_raw_parts(q8_ptr.add(blk * Q4K_BLOCK_SIZE), Q4K_BLOCK_SIZE) };
-                    let a_sc = unsafe { *scales_ptr.add(blk) };
-                    let a_gsums = unsafe { std::slice::from_raw_parts(gsums_ptr.add(blk * Q4K_GROUPS), Q4K_GROUPS) };
-                    sum += if USE_VNNI {
-                        unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
-                    } else {
-                        unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
-                    };
-                }
-                unsafe { *o_ptr = sum; }
-            }
-        });
+        let job = FusedQ4kPreq2Job {
+            b1_ptr: b1.as_ptr(),
+            b2_ptr: b2.as_ptr(),
+            out1_ptr: out1.as_mut_ptr(),
+            out2_ptr: out2.as_mut_ptr(),
+            n1,
+            blocks_per_row,
+            q8_ptr: preq.q8.as_ptr(),
+            scales_ptr: preq.scales.as_ptr(),
+            gsums_ptr: preq.group_sums_q4k.as_ptr(),
+        };
+        crate::inference_pool::par_run_job(total, &job);
     }
 
     /// Fuse two Q4K projections + one F16 projection into a single Rayon parallel region.
@@ -4004,47 +4080,24 @@ impl CpuMatMulQ4KOpt {
     ) {
         let blocks_per_row = k / Q4K_BLOCK_SIZE;
         let total = n1 + n2 + n3;
-
-        const USE_VNNI: bool = cfg!(any(target_feature = "avxvnni", target_feature = "avx512vnni"));
-
-        let row_f16_bytes = k * 2;
-        let b1_ptr = b1.as_ptr(); let b2_ptr = b2.as_ptr();
-        let out1_ptr = out1.as_mut_ptr(); let out2_ptr = out2.as_mut_ptr(); let out3_ptr = out3.as_mut_ptr();
-        let q8_ptr = preq.q8.as_ptr(); let scales_ptr = preq.scales.as_ptr();
-        let gsums_ptr = preq.group_sums_q4k.as_ptr();
-        let f16_ptr = f16_bytes.as_ptr(); let a_f32_ptr = a_f32.as_ptr();
-        crate::inference_pool::par_run(total, |start, end| {
-            for idx in start..end {
-                if idx < n1 + n2 {
-                    let (b_ptr, j, o_ptr) = if idx < n1 {
-                        (b1_ptr, idx, unsafe { out1_ptr.add(idx) })
-                    } else {
-                        (b2_ptr, idx - n1, unsafe { out2_ptr.add(idx - n1) })
-                    };
-                    let mut sum = 0.0f32;
-                    for blk in 0..blocks_per_row {
-                        let off = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                        let block = unsafe { std::slice::from_raw_parts(b_ptr.add(off), Q4K_BLOCK_BYTES) };
-                        let aq = unsafe { std::slice::from_raw_parts(q8_ptr.add(blk * Q4K_BLOCK_SIZE), Q4K_BLOCK_SIZE) };
-                        let a_sc = unsafe { *scales_ptr.add(blk) };
-                        let a_gs = unsafe { std::slice::from_raw_parts(gsums_ptr.add(blk * Q4K_GROUPS), Q4K_GROUPS) };
-                        sum += if USE_VNNI { unsafe { q4k_dot_q8_vnni(block, aq, a_sc, a_gs) } }
-                               else { unsafe { q4k_dot_q8_avx2(block, aq, a_sc, a_gs) } };
-                    }
-                    unsafe { *o_ptr = sum; }
-                } else {
-                    let j = idx - n1 - n2;
-                    let base = j * row_f16_bytes;
-                    let mut dot = 0.0f32;
-                    for i in 0..k {
-                        let off = base + i * 2;
-                        let b = unsafe { [*f16_ptr.add(off), *f16_ptr.add(off + 1)] };
-                        dot += crate::ggml::helpers::f16_to_f32(u16::from_le_bytes(b)) * unsafe { *a_f32_ptr.add(i) };
-                    }
-                    unsafe { *out3_ptr.add(j) = dot; }
-                }
-            }
-        });
+        let job = FusedQ4k2F161PreqJob {
+            b1_ptr: b1.as_ptr(),
+            b2_ptr: b2.as_ptr(),
+            out1_ptr: out1.as_mut_ptr(),
+            out2_ptr: out2.as_mut_ptr(),
+            out3_ptr: out3.as_mut_ptr(),
+            n1,
+            n2,
+            blocks_per_row,
+            q8_ptr: preq.q8.as_ptr(),
+            scales_ptr: preq.scales.as_ptr(),
+            gsums_ptr: preq.group_sums_q4k.as_ptr(),
+            f16_ptr: f16_bytes.as_ptr(),
+            a_f32_ptr: a_f32.as_ptr(),
+            k,
+            row_f16_bytes: k * 2,
+        };
+        crate::inference_pool::par_run_job(total, &job);
     }
 
     pub fn forward_q4k_preq(
