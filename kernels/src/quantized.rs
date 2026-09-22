@@ -1,4 +1,88 @@
 use crate::Result;
+
+// Job structs for StaticPool dispatch. Raw pointers are non-overlapping across
+// partitions (enforced by caller). Sync impl is sound under this invariant.
+//
+// Use METHODS (not field access) in closures so Rust 2021 disjoint capture
+// grabs &Self (Sync) rather than individual raw-pointer fields (not Sync).
+struct Q4kGemvJob {
+    b_ptr:    *const u8,
+    out_ptr:  *mut f32,
+    q8k_ptr:  *const u8,
+    row_bytes: usize,
+    bpr:      usize,
+    k:        usize,
+    n:        usize,
+}
+unsafe impl Sync for Q4kGemvJob {}
+impl Q4kGemvJob {
+    #[inline(always)]
+    fn exec(&self, start: usize, end: usize) {
+        use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+        let q8k = unsafe { std::slice::from_raw_parts(self.q8k_ptr as *const BlockQ8K, self.bpr) };
+        let mut local = start;
+        while local + 1 < end {
+            let j = local;
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
+                let pf = j + 8;
+                if pf + 1 < self.n {
+                    _mm_prefetch(self.b_ptr.add(pf * self.row_bytes) as *const i8, _MM_HINT_T1);
+                    _mm_prefetch(self.b_ptr.add((pf+1) * self.row_bytes) as *const i8, _MM_HINT_T1);
+                }
+            }
+            let w0 = unsafe { std::slice::from_raw_parts(
+                self.b_ptr.add(j * self.row_bytes) as *const BlockQ4K, self.bpr) };
+            let w1 = unsafe { std::slice::from_raw_parts(
+                self.b_ptr.add((j+1) * self.row_bytes) as *const BlockQ4K, self.bpr) };
+            let (r0, r1) = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch_pair(
+                self.k, w0, w1, q8k);
+            unsafe { *self.out_ptr.add(j) = r0; *self.out_ptr.add(j+1) = r1; }
+            local += 2;
+        }
+        if local < end {
+            let j = local;
+            let w = unsafe { std::slice::from_raw_parts(
+                self.b_ptr.add(j * self.row_bytes) as *const BlockQ4K, self.bpr) };
+            let r = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(self.k, w, q8k);
+            unsafe { *self.out_ptr.add(j) = r; }
+        }
+    }
+}
+
+struct Q6kGemvJob {
+    b_ptr:    *const u8,
+    out_ptr:  *mut f32,
+    q8k_ptr:  *const u8,
+    row_bytes: usize,
+    bpr:      usize,
+    k:        usize,
+    n:        usize,
+}
+unsafe impl Sync for Q6kGemvJob {}
+impl Q6kGemvJob {
+    #[inline(always)]
+    fn exec(&self, start: usize, end: usize) {
+        use crate::ggml::blocks::{BlockQ6K, BlockQ8K};
+        let q8k = unsafe { std::slice::from_raw_parts(self.q8k_ptr as *const BlockQ8K, self.bpr) };
+        for j in start..end {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let pf = j + 8;
+                if pf < self.n {
+                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
+                    _mm_prefetch(self.b_ptr.add(pf * self.row_bytes) as *const i8, _MM_HINT_T1);
+                }
+            }
+            let w = unsafe { std::slice::from_raw_parts(
+                self.b_ptr.add(j * self.row_bytes) as *const BlockQ6K, self.bpr) };
+            let r = crate::ggml::vec_dot_avx2::vec_dot_q6_k_q8_k_dispatch(self.k, w, q8k);
+            unsafe { *self.out_ptr.add(j) = r; }
+        }
+    }
+}
+
 pub use crate::{
     Dequantize, MatMulQ, QuantDtype, I2S_BLOCK_BYTES, I2S_BLOCK_SIZE, Q4K_BLOCK_BYTES,
     Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE, Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, Q6K_GROUPS,
@@ -4275,7 +4359,8 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 const { std::cell::UnsafeCell::new(Vec::new()) };
         }
 
-        // llama.cpp translation: Q8_K activations × Q6_K weights via vec_dot_q6_K_q8_K.
+        // llama.cpp translation:
+// llama.cpp translation: Q8_K activations × Q6_K weights via vec_dot_q6_K_q8_K.
         #[cfg(feature = "openmp")]
         if m == 1 {
             use crate::ggml::blocks::BlockQ8K;
