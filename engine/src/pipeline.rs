@@ -186,6 +186,50 @@ where
         Ok(())
     }
 
+    /// Fused RMSNorm + elementwise multiply, source → output.
+    /// Reads from `x`, writes to `out` without an intermediate copy.
+    pub fn rmsnorm_into(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        out: &mut [f32],
+        hidden_size: usize,
+        eps: f32,
+        trace_level: TraceLevel,
+        snapshot: &mut Option<&mut LayerSnapshot>,
+    ) -> tempura_kernels::Result<()> {
+        if trace_level >= TraceLevel::Summary {
+            if let Some(ref mut snap) = snapshot {
+                let mean = x.iter().sum::<f32>() / x.len() as f32;
+                let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / x.len() as f32;
+                let max_abs = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                snap.pre_norm = Some(NormStats {
+                    mean,
+                    variance: var,
+                    max_abs,
+                });
+            }
+        }
+
+        self.rmsnorm.forward_into(x, weight, out, hidden_size, eps)?;
+
+        if trace_level >= TraceLevel::Summary {
+            if let Some(ref mut snap) = snapshot {
+                let mean = out.iter().sum::<f32>() / out.len() as f32;
+                let var =
+                    out.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / out.len() as f32;
+                let max_abs = out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                snap.post_norm = Some(NormStats {
+                    mean,
+                    variance: var,
+                    max_abs,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn matmul(
         &self,
         a: &[f32],
