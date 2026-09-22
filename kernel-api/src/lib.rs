@@ -200,6 +200,22 @@ pub trait MatMul: Send + Sync {
 pub trait RMSNorm: Send + Sync {
     fn forward(&self, x: &mut [f32], weight: &[f32], hidden_size: usize, eps: f32) -> Result<()>;
 
+    /// Fused RMSNorm + elementwise multiply, source → output.
+    /// Reads from `x` (unchanged), writes normalized*weight to `out`.
+    /// Eliminates the copy_from_slice that in-place callers need before forward().
+    /// Default: copy then forward in-place.
+    fn forward_into(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        out: &mut [f32],
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<()> {
+        out.copy_from_slice(x);
+        self.forward(out, weight, hidden_size, eps)
+    }
+
     fn verification_tier(&self) -> VerificationTier {
         VerificationTier::Compiled
     }

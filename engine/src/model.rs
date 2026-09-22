@@ -758,16 +758,17 @@ where
                 deltanet_layer_idx += 1;
             } else {
                 // --- attention block ---
-                normed = hidden.clone();
                 let input_ln_w = weights
                     .get(&format!("{prefix}.input_layernorm.weight"))
                     .unwrap();
                 if cfg.use_layernorm {
+                    normed = hidden.clone();
                     let bias = weights.get(&format!("{prefix}.input_layernorm.bias"));
                     tempura_kernels::layernorm::CpuLayerNorm
                         .forward(&mut normed, input_ln_w, bias, h, cfg.layer_norm_eps)
                         .unwrap();
                 } else if cfg.rmsnorm_offset {
+                    normed = hidden.clone();
                     for i in 0..h {
                         norm_weight_buf[i] = 1.0 + input_ln_w[i];
                     }
@@ -782,10 +783,14 @@ where
                         )
                         .unwrap();
                 } else {
+                    if normed.len() != hidden.len() {
+                        normed.resize(hidden.len(), 0.0);
+                    }
                     self.pipeline
-                        .rmsnorm(
-                            &mut normed,
+                        .rmsnorm_into(
+                            &hidden,
                             input_ln_w,
+                            &mut normed,
                             h,
                             cfg.layer_norm_eps,
                             session.trace_level,
@@ -973,16 +978,18 @@ where
             if cfg.parallel_attn_ffn {
                 ffn_normed = normed.clone();
             } else {
-                let mut normed2 = hidden.clone();
                 let post_ln_w = weights
                     .get(&format!("{prefix}.post_attention_layernorm.weight"))
                     .unwrap();
+                let mut normed2;
                 if cfg.use_layernorm {
+                    normed2 = hidden.clone();
                     let bias = weights.get(&format!("{prefix}.post_attention_layernorm.bias"));
                     tempura_kernels::layernorm::CpuLayerNorm
                         .forward(&mut normed2, post_ln_w, bias, h, cfg.layer_norm_eps)
                         .unwrap();
                 } else if cfg.rmsnorm_offset {
+                    normed2 = hidden.clone();
                     for i in 0..h {
                         norm_weight_buf[i] = 1.0 + post_ln_w[i];
                     }
@@ -997,10 +1004,12 @@ where
                         )
                         .unwrap();
                 } else {
+                    normed2 = vec![0.0f32; hidden.len()];
                     self.pipeline
-                        .rmsnorm(
-                            &mut normed2,
+                        .rmsnorm_into(
+                            &hidden,
                             post_ln_w,
+                            &mut normed2,
                             h,
                             cfg.layer_norm_eps,
                             TraceLevel::Off,
@@ -2018,14 +2027,15 @@ where
 
                 // Fall through to FFN below
             } else {
-                normed.copy_from_slice(&hidden);
                 let input_ln_w = qweights.get_f32(input_ln_name).unwrap();
                 if let Some(ref ln) = layernorm {
+                    normed.copy_from_slice(&hidden);
                     let input_ln_b =
                         qweights.get_f32(&format!("model.layers.{layer}.input_layernorm.bias"));
                     ln.forward(&mut normed, input_ln_w, input_ln_b, h, cfg.layer_norm_eps)
                         .unwrap();
                 } else if cfg.rmsnorm_offset {
+                    normed.copy_from_slice(&hidden);
                     for i in 0..h {
                         norm_weight_buf[i] = 1.0 + input_ln_w[i];
                     }
@@ -2045,13 +2055,14 @@ where
                             .unwrap();
                     }
                 } else if let Some(ref drn) = det_rmsnorm {
-                    drn.forward(&mut normed, input_ln_w, h, cfg.layer_norm_eps)
+                    drn.forward_into(&hidden, input_ln_w, &mut normed, h, cfg.layer_norm_eps)
                         .unwrap();
                 } else {
                     self.pipeline
-                        .rmsnorm(
-                            &mut normed,
+                        .rmsnorm_into(
+                            &hidden,
                             input_ln_w,
+                            &mut normed,
                             h,
                             cfg.layer_norm_eps,
                             TraceLevel::Off,
@@ -2706,15 +2717,16 @@ where
                 };
                 (&normed as &[f32], preq)
             } else {
-                normed2.copy_from_slice(&hidden);
                 let post_ln_w = qweights.get_f32(post_ln_name).unwrap();
                 if let Some(ref ln) = layernorm {
+                    normed2.copy_from_slice(&hidden);
                     let post_ln_b = qweights.get_f32(&format!(
                         "model.layers.{layer}.post_attention_layernorm.bias"
                     ));
                     ln.forward(&mut normed2, post_ln_w, post_ln_b, h, cfg.layer_norm_eps)
                         .unwrap();
                 } else if cfg.rmsnorm_offset {
+                    normed2.copy_from_slice(&hidden);
                     for i in 0..h {
                         norm_weight_buf[i] = 1.0 + post_ln_w[i];
                     }
@@ -2734,13 +2746,14 @@ where
                             .unwrap();
                     }
                 } else if let Some(ref drn) = det_rmsnorm {
-                    drn.forward(&mut normed2, post_ln_w, h, cfg.layer_norm_eps)
+                    drn.forward_into(&hidden, post_ln_w, &mut normed2, h, cfg.layer_norm_eps)
                         .unwrap();
                 } else {
                     self.pipeline
-                        .rmsnorm(
-                            &mut normed2,
+                        .rmsnorm_into(
+                            &hidden,
                             post_ln_w,
+                            &mut normed2,
                             h,
                             cfg.layer_norm_eps,
                             TraceLevel::Off,
@@ -3417,14 +3430,12 @@ where
 
                 // ── B0: Thread 0 — RMSNorm + LUT prep ──
                 if ith == 0 {
-                    let hidden_s = fsm!(hp, h);
-                    let normed_s = fsm!(np, h);
-                    normed_s.copy_from_slice(hidden_s);
                     let ln_w = qweights.get_f32(&input_ln).unwrap();
                     self.pipeline
-                        .rmsnorm(
-                            normed_s,
+                        .rmsnorm_into(
+                            fs!(hp, h),
                             ln_w,
+                            fsm!(np, h),
                             h,
                             cfg.layer_norm_eps,
                             TraceLevel::Off,
@@ -4081,12 +4092,17 @@ where
                 // ── FFN (shared by DeltaNet and Attention) ──
                 // B5: Thread 0 — post-attention RMSNorm + LUT
                 if ith == 0 {
-                    let hidden_s = fs!(hp, h);
-                    let n2 = fsm!(n2p, h);
-                    n2.copy_from_slice(hidden_s);
                     let pln_w = qweights.get_f32(&post_ln).unwrap();
                     self.pipeline
-                        .rmsnorm(n2, pln_w, h, cfg.layer_norm_eps, TraceLevel::Off, &mut None)
+                        .rmsnorm_into(
+                            fs!(hp, h),
+                            pln_w,
+                            fsm!(n2p, h),
+                            h,
+                            cfg.layer_norm_eps,
+                            TraceLevel::Off,
+                            &mut None,
+                        )
                         .unwrap();
                     if lut_h_ptr != 0 {
                         let lut = unsafe { &mut *(lut_h_ptr as *mut Tl2Lut) };

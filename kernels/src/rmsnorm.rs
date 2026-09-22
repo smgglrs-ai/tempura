@@ -37,6 +37,36 @@ impl RMSNorm for CpuRMSNorm {
 
         Ok(())
     }
+
+    fn forward_into(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        out: &mut [f32],
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<()> {
+        if weight.len() != hidden_size {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: hidden_size,
+                got: weight.len(),
+            });
+        }
+        debug_assert_eq!(x.len(), out.len());
+        let num_tokens = x.len() / hidden_size;
+        for t in 0..num_tokens {
+            let start = t * hidden_size;
+            let row = &x[start..start + hidden_size];
+            let rms: f32 =
+                (row.iter().map(|v| v * v).sum::<f32>() / hidden_size as f32 + eps).sqrt();
+            let inv_rms = 1.0 / rms;
+            let out_row = &mut out[start..start + hidden_size];
+            for i in 0..hidden_size {
+                out_row[i] = row[i] * inv_rms * weight[i];
+            }
+        }
+        Ok(())
+    }
 }
 
 /// GGML-compatible RMSNorm: f64 accumulation matching ggml_compute_forward_rms_norm_f32.
@@ -85,6 +115,39 @@ impl RMSNorm for CpuRMSNormGgml {
 
         Ok(())
     }
+
+    fn forward_into(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        out: &mut [f32],
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<()> {
+        if weight.len() != hidden_size {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: hidden_size,
+                got: weight.len(),
+            });
+        }
+        debug_assert_eq!(x.len(), out.len());
+        let num_tokens = x.len() / hidden_size;
+        for t in 0..num_tokens {
+            let start = t * hidden_size;
+            let row = &x[start..start + hidden_size];
+            let mut sum: f64 = 0.0;
+            for i in 0..hidden_size {
+                sum += (row[i] * row[i]) as f64;
+            }
+            let mean: f32 = (sum / hidden_size as f64) as f32;
+            let scale: f32 = 1.0f32 / (mean + eps).sqrt();
+            let out_row = &mut out[start..start + hidden_size];
+            for i in 0..hidden_size {
+                out_row[i] = row[i] * scale * weight[i];
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Deterministic CPU RMSNorm: sequential accumulation matching GPU kernel order.
@@ -131,6 +194,45 @@ impl RMSNorm for CpuRMSNormDet {
             t += 1;
         }
 
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn forward_into(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        out: &mut [f32],
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<()> {
+        if weight.len() != hidden_size {
+            return Err(crate::KernelError::DimensionMismatch {
+                expected: hidden_size,
+                got: weight.len(),
+            });
+        }
+        debug_assert_eq!(x.len(), out.len());
+        let num_tokens = x.len() / hidden_size;
+        let mut t = 0;
+        while t < num_tokens {
+            let start = t * hidden_size;
+            let mut sum_sq = 0.0f32;
+            let mut i = 0;
+            while i < hidden_size {
+                let v = x[start + i];
+                sum_sq += v * v;
+                i += 1;
+            }
+            let rms = (sum_sq / hidden_size as f32 + eps).sqrt();
+            let inv_rms = 1.0 / rms;
+            i = 0;
+            while i < hidden_size {
+                out[start + i] = x[start + i] * inv_rms * weight[i];
+                i += 1;
+            }
+            t += 1;
+        }
         Ok(())
     }
 }
@@ -485,6 +587,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_forward_into_matches_forward() {
+        let rn = CpuRMSNorm;
+        let hidden = 4;
+        let x = vec![1.0f32, 2.0, 3.0, 4.0];
+        let weight = vec![0.5f32, 1.0, 2.0, 0.25];
+        let eps = 1e-6f32;
+
+        let mut inplace = x.clone();
+        rn.forward(&mut inplace, &weight, hidden, eps).unwrap();
+
+        let mut fused = vec![0.0f32; hidden];
+        rn.forward_into(&x, &weight, &mut fused, hidden, eps).unwrap();
+
+        for i in 0..hidden {
+            assert_relative_eq!(fused[i], inplace[i], epsilon = 1e-6);
+        }
+        // source must not be modified
+        assert_eq!(x, vec![1.0f32, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_forward_into_ggml_matches_forward() {
+        let rn = CpuRMSNormGgml;
+        let hidden = 8;
+        let x: Vec<f32> = (1..=8).map(|i| i as f32 * 0.5).collect();
+        let weight = vec![1.0f32; hidden];
+        let eps = 1e-5f32;
+
+        let mut inplace = x.clone();
+        rn.forward(&mut inplace, &weight, hidden, eps).unwrap();
+
+        let mut fused = vec![0.0f32; hidden];
+        rn.forward_into(&x, &weight, &mut fused, hidden, eps).unwrap();
+
+        for i in 0..hidden {
+            assert_relative_eq!(fused[i], inplace[i], epsilon = 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_forward_into_multi_token() {
+        let rn = CpuRMSNorm;
+        let hidden = 4;
+        let x = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let weight = vec![1.0f32; hidden];
+        let eps = 1e-6f32;
+
+        let mut inplace = x.clone();
+        rn.forward(&mut inplace, &weight, hidden, eps).unwrap();
+
+        let mut fused = vec![0.0f32; x.len()];
+        rn.forward_into(&x, &weight, &mut fused, hidden, eps).unwrap();
+
+        for i in 0..x.len() {
+            assert_relative_eq!(fused[i], inplace[i], epsilon = 1e-6);
+        }
+    }
+
     mod prop_tests {
         use super::*;
         use proptest::prelude::*;
@@ -501,6 +662,30 @@ mod tests {
                 rn.forward(&mut x, &weight, h, 1e-6).unwrap();
                 let rms = (x.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
                 prop_assert!((rms - 1.0).abs() < 1e-3, "rms={rms}");
+            }
+
+            #[test]
+            fn prop_forward_into_matches_forward(
+                input in prop::collection::vec(0.1f32..10.0f32, 4..32),
+                weights in prop::collection::vec(0.1f32..2.0f32, 4..32),
+            ) {
+                let rn = CpuRMSNorm;
+                let h = input.len().min(weights.len());
+                let x = &input[..h];
+                let w = &weights[..h];
+
+                let mut inplace = x.to_vec();
+                rn.forward(&mut inplace, w, h, 1e-6).unwrap();
+
+                let mut fused = vec![0.0f32; h];
+                rn.forward_into(x, w, &mut fused, h, 1e-6).unwrap();
+
+                for i in 0..h {
+                    prop_assert!(
+                        (fused[i] - inplace[i]).abs() < 1e-5,
+                        "mismatch at {i}: fused={} inplace={}", fused[i], inplace[i]
+                    );
+                }
             }
         }
     }
