@@ -204,14 +204,14 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx2(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
         let mut sumi = _mm256_setzero_si256();
 
         for j in 0..4 {
-            // broadcast scale for low nibble group (scale 2j) and high nibble group (scale 2j+1)
+            // Safety: j < 4 → 2*j+1 < 8 == K_SHUFFLE_Q4K.len()
             let scale_l = _mm256_shuffle_epi8(
                 scales,
-                _mm256_loadu_si256(K_SHUFFLE_Q4K[2 * j].as_ptr() as *const __m256i),
+                _mm256_loadu_si256(K_SHUFFLE_Q4K.get_unchecked(2 * j).as_ptr() as *const __m256i),
             );
             let scale_h = _mm256_shuffle_epi8(
                 scales,
-                _mm256_loadu_si256(K_SHUFFLE_Q4K[2 * j + 1].as_ptr() as *const __m256i),
+                _mm256_loadu_si256(K_SHUFFLE_Q4K.get_unchecked(2 * j + 1).as_ptr() as *const __m256i),
             );
 
             // load 32 Q4 bytes, extract low/high nibbles
@@ -638,20 +638,15 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni_pair(
 
 /// Dispatch pair dot product — uses VNNI when available, falls back to two scalar calls.
 #[inline(always)]
+#[allow(unreachable_code)]
 pub fn vec_dot_q4_k_q8_k_dispatch_pair(
     n: usize,
     x0: &[BlockQ4K],
     x1: &[BlockQ4K],
     y: &[BlockQ8K],
 ) -> (f32, f32) {
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avxvnni") {
-        return unsafe { vec_dot_q4_k_q8_k_vnni_pair(n, x0, x1, y) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx512vnni") {
-        return unsafe { vec_dot_q4_k_q8_k_vnni_pair(n, x0, x1, y) };
-    }
+    #[cfg(any(target_feature = "avxvnni", target_feature = "avx512vnni"))]
+    { return unsafe { vec_dot_q4_k_q8_k_vnni_pair(n, x0, x1, y) }; }
     (
         vec_dot_q4_k_q8_k_dispatch(n, x0, y),
         vec_dot_q4_k_q8_k_dispatch(n, x1, y),
@@ -710,39 +705,35 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K])
 
 // ── Runtime dispatch ───────────────────────────────────────────────────────
 
+#[allow(unreachable_code)]
 pub fn vec_dot_q4_0_q8_0_dispatch(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        return unsafe { vec_dot_q4_0_q8_0_avx2(n, x, y) };
-    }
+    #[cfg(all(target_feature = "avx2", target_feature = "fma"))]
+    { return unsafe { vec_dot_q4_0_q8_0_avx2(n, x, y) }; }
     super::vec_dot::vec_dot_q4_0_q8_0(n, x, y)
 }
 
+#[allow(unreachable_code)]
 pub fn vec_dot_q8_0_q8_0_dispatch(n: usize, x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        return unsafe { vec_dot_q8_0_q8_0_avx2(n, x, y) };
-    }
+    #[cfg(all(target_feature = "avx2", target_feature = "fma"))]
+    { return unsafe { vec_dot_q8_0_q8_0_avx2(n, x, y) }; }
     super::vec_dot::vec_dot_q8_0_q8_0(n, x, y)
 }
 
+#[allow(unreachable_code)]
 #[inline(always)]
 pub fn vec_dot_q4_k_q8_k_dispatch(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-        {
-            return unsafe { vec_dot_q4_k_q8_k_avx512(n, x, y) };
-        }
-        if is_x86_feature_detected!("avxvnni") {
-            return unsafe { vec_dot_q4_k_q8_k_vnni(n, x, y) };
-        }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { vec_dot_q4_k_q8_k_avx2(n, x, y) };
-        }
-    }
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vnni"))]
+    { return unsafe { vec_dot_q4_k_q8_k_avx512(n, x, y) }; }
+    #[cfg(all(
+        not(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vnni")),
+        any(target_feature = "avxvnni", target_feature = "avx512vnni")
+    ))]
+    { return unsafe { vec_dot_q4_k_q8_k_vnni(n, x, y) }; }
+    #[cfg(all(
+        not(any(target_feature = "avxvnni", target_feature = "avx512vnni")),
+        all(target_feature = "avx2", target_feature = "fma")
+    ))]
+    { return unsafe { vec_dot_q4_k_q8_k_avx2(n, x, y) }; }
     super::vec_dot::vec_dot_q4_k_q8_k(n, x, y)
 }
 
@@ -806,16 +797,15 @@ pub unsafe fn vec_dot_q6_k_q8_k_vnni(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -
 }
 
 #[inline(always)]
+#[allow(unreachable_code)]
 pub fn vec_dot_q6_k_q8_k_dispatch(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avxvnni") {
-            return unsafe { vec_dot_q6_k_q8_k_vnni(n, x, y) };
-        }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { vec_dot_q6_k_q8_k_avx2(n, x, y) };
-        }
-    }
+    #[cfg(any(target_feature = "avxvnni", target_feature = "avx512vnni"))]
+    { return unsafe { vec_dot_q6_k_q8_k_vnni(n, x, y) }; }
+    #[cfg(all(
+        not(any(target_feature = "avxvnni", target_feature = "avx512vnni")),
+        all(target_feature = "avx2", target_feature = "fma")
+    ))]
+    { return unsafe { vec_dot_q6_k_q8_k_avx2(n, x, y) }; }
     super::vec_dot::vec_dot_q6_k_q8_k(n, x, y)
 }
 

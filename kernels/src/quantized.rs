@@ -3792,10 +3792,7 @@ impl CpuMatMulQ4KOpt {
         let blocks_per_row = k / Q4K_BLOCK_SIZE;
         let total = n1 + n2;
 
-        #[cfg(target_arch = "x86_64")]
-        let use_vnni = is_x86_feature_detected!("avxvnni");
-        #[cfg(not(target_arch = "x86_64"))]
-        let use_vnni = false;
+        const USE_VNNI: bool = cfg!(any(target_feature = "avxvnni", target_feature = "avx512vnni"));
 
         let chunk_size = (total / rayon::current_num_threads()).max(64);
 
@@ -3819,7 +3816,7 @@ impl CpuMatMulQ4KOpt {
                     let aq_slice = &preq.q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
                     let a_sc = preq.scales[blk];
                     let a_gsums = &preq.group_sums_q4k[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
-                    sum += if use_vnni {
+                    sum += if USE_VNNI {
                         unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
                     } else {
                         unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
@@ -3851,10 +3848,7 @@ impl CpuMatMulQ4KOpt {
         let blocks_per_row = k / Q4K_BLOCK_SIZE;
         let total = n1 + n2 + n3;
 
-        #[cfg(target_arch = "x86_64")]
-        let use_vnni = is_x86_feature_detected!("avxvnni");
-        #[cfg(not(target_arch = "x86_64"))]
-        let use_vnni = false;
+        const USE_VNNI: bool = cfg!(any(target_feature = "avxvnni", target_feature = "avx512vnni"));
 
         let chunk_size = (total / rayon::current_num_threads()).max(64);
         let row_f16_bytes = k * 2;
@@ -3876,7 +3870,7 @@ impl CpuMatMulQ4KOpt {
                         let aq_slice = &preq.q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
                         let a_sc = preq.scales[blk];
                         let a_gsums = &preq.group_sums_q4k[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
-                        sum += if use_vnni {
+                        sum += if USE_VNNI {
                             unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
                         } else {
                             unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
@@ -3909,10 +3903,7 @@ impl CpuMatMulQ4KOpt {
         let blocks_per_row = k / Q4K_BLOCK_SIZE;
 
         if preq.is_quantized() {
-            #[cfg(target_arch = "x86_64")]
-            let use_vnni = is_x86_feature_detected!("avxvnni");
-            #[cfg(not(target_arch = "x86_64"))]
-            let use_vnni = false;
+            const USE_VNNI: bool = cfg!(any(target_feature = "avxvnni", target_feature = "avx512vnni"));
 
             let chunk_size = (n / rayon::current_num_threads()).max(64);
             output[..n]
@@ -3931,7 +3922,7 @@ impl CpuMatMulQ4KOpt {
                             let a_sc = preq.scales[blk];
                             let a_gsums =
                                 &preq.group_sums_q4k[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
-                            sum += if use_vnni {
+                            sum += if USE_VNNI {
                                 unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
                             } else {
                                 unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
