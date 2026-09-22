@@ -1,3 +1,34 @@
+// Worker struct for parallel F16 GEMV via inference_pool.
+// Rust 2021 captures individual fields in closures; wrapping pointers in a struct
+// forces capture of the whole struct (which implements Sync) rather than raw ptrs.
+struct F16GemvWorker {
+    f16_ptr: *const u8,
+    a_ptr: *const f32,
+    out_ptr: *mut f32,
+    k: usize,
+    row_f16_bytes: usize,
+}
+unsafe impl Sync for F16GemvWorker {}
+
+impl F16GemvWorker {
+    unsafe fn run_range(&self, start: usize, end: usize) {
+        for j in start..end {
+            let base = j * self.row_f16_bytes;
+            let mut dot = 0.0f32;
+            for i in 0..self.k {
+                let off = base + i * 2;
+                let bits = u16::from_le_bytes([
+                    *self.f16_ptr.add(off),
+                    *self.f16_ptr.add(off + 1),
+                ]);
+                dot += tempura_kernels::ggml::helpers::f16_to_f32(bits)
+                    * *self.a_ptr.add(i);
+            }
+            *self.out_ptr.add(j) = dot;
+        }
+    }
+}
+
 use crate::config::ModelConfig;
 use crate::pipeline::KernelPipeline;
 use crate::session::InferenceSession;
@@ -1451,18 +1482,17 @@ where
             // F16 mmap tensors — parallel GEMV for m=1, materialise for m>1
             if let Some(f16_bytes) = qweights.get_f16(name) {
                 if m == 1 {
-                    use rayon::prelude::*;
-                    let row_f16_bytes = k * 2;
-                    out[..n].par_iter_mut().enumerate().for_each(|(j, out_val)| {
-                        let base = j * row_f16_bytes;
-                        let mut dot = 0.0f32;
-                        for i in 0..k {
-                            let off = base + i * 2;
-                            let bits = u16::from_le_bytes([f16_bytes[off], f16_bytes[off + 1]]);
-                            dot += tempura_kernels::ggml::helpers::f16_to_f32(bits) * a_f32[i];
-                        }
-                        *out_val = dot;
-                    });
+                    let worker = F16GemvWorker {
+                        f16_ptr: f16_bytes.as_ptr(),
+                        a_ptr: a_f32.as_ptr(),
+                        out_ptr: out.as_mut_ptr(),
+                        k,
+                        row_f16_bytes: k * 2,
+                    };
+                    let gemv = |start: usize, end: usize| {
+                        unsafe { worker.run_range(start, end) };
+                    };
+                    tempura_kernels::inference_pool::get().run(n, &gemv);
                 } else {
                     let n_elems = f16_bytes.len() / 2;
                     let f32_data: Vec<f32> = (0..n_elems).map(|i| {

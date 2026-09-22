@@ -32,6 +32,7 @@ pub mod deltanet;
 pub mod openmp_gemv;
 pub mod dispatch;
 pub mod f16_gemv;
+pub mod inference_pool;
 pub mod fused;
 pub mod ggml;
 #[cfg(all(feature = "cuda", not(feature = "cutile")))]
