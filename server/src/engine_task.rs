@@ -101,24 +101,14 @@ fn parse_ccd_cores_env() -> (usize, Option<Vec<usize>>) {
 pub struct EngineTask {
     model: Arc<dyn InferenceModel>,
     rx: mpsc::Receiver<EngineRequest>,
-    thread_pool: rayon::ThreadPool,
 }
 
 impl EngineTask {
     pub fn new(model: Arc<dyn InferenceModel>, rx: mpsc::Receiver<EngineRequest>) -> Self {
-        let (num_threads, ccd_cores) = parse_ccd_cores_env();
-        let thread_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .thread_name(|i| format!("tempura-compute-{i}"))
-            .start_handler(move |thread_idx| {
-                if let Some(ref cores) = ccd_cores {
-                    let core_id = cores[thread_idx % cores.len()];
-                    let _ = core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
-                }
-            })
-            .build()
-            .expect("failed to build rayon thread pool");
-        Self { model, rx, thread_pool }
+        // inference_pool (staticpar) is initialized lazily on first GEMV call;
+        // CCD pinning is handled via TEMPURA_CCD_CORES env var read by parse_ccd_cores_env
+        // which is kept for future use but no longer wires a Rayon pool here.
+        Self { model, rx }
     }
 
     pub fn run(mut self) {
@@ -186,7 +176,7 @@ impl EngineTask {
 
             for id in &ids {
                 let entry = sessions.get_mut(id).unwrap();
-                let done = self.thread_pool.install(|| entry.step(self.model.as_ref()));
+                let done = entry.step(self.model.as_ref());
                 if done {
                     completed.push(id.clone());
                 }

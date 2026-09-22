@@ -3704,7 +3704,6 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "rayon",
  "serde",
  "serde_json",
  "tempura-engine",

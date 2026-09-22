@@ -74,9 +74,9 @@ impl StaticPool {
         }
 
         let total_threads = self.n_workers + 1; // +1 for calling thread
-        let chunk = ((n + total_threads - 1) / total_threads).max(1);
+        let chunk = n.div_ceil(total_threads).max(1);
 
-        self.inner.fn_ptr.store(trampoline::<F> as usize as u64, Ordering::Relaxed);
+        self.inner.fn_ptr.store(trampoline::<F> as *const () as usize as u64, Ordering::Relaxed);
         self.inner.ctx.store(f as *const F as usize as u64, Ordering::Relaxed);
         self.inner.n.store(n, Ordering::Relaxed);
         self.inner.chunk.store(chunk, Ordering::Relaxed);
