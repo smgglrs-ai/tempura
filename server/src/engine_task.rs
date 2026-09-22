@@ -176,7 +176,11 @@ impl EngineTask {
 
             for id in &ids {
                 let entry = sessions.get_mut(id).unwrap();
-                let done = entry.step(self.model.as_ref());
+                // Wake workers once for this token's entire forward pass;
+                // all ~210 matmul dispatches within step() use spinning barriers.
+                let done = tempura_kernels::inference_pool::with_session(|| {
+                    entry.step(self.model.as_ref())
+                });
                 if done {
                     completed.push(id.clone());
                 }
