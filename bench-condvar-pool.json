@@ -1,0 +1,13 @@
+{
+  "timestamp": "2026-09-22",
+  "pool": "StaticPool with std::sync::Condvar (staticpar crate)",
+  "model": "qwen3-8b Q4_K_M",
+  "hardware": "AMD Ryzen 9 9950X3D",
+  "results": {
+    "tg32": 7.2, "pp128": 66.5,
+    "instructions_32tok": "462B",
+    "IPC": 1.4, "cpus_active": 13.2
+  },
+  "vs_rayon": {"tg32": "+9%", "pp128": "-9%", "instructions": "-11%"},
+  "vs_llamacpp": {"tg32": "1.35x gap", "pp128": "3.1x gap"}
+}
