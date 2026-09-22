@@ -722,14 +722,14 @@ pub fn repack_i2s_to_tl2_with_config(
     // Step 1: Decode all ternary values from I2S into a flat (m, k) i8 array
     let row_bytes = k / 4;
     let mut ternary = vec![0i8; m * k];
-    use rayon::prelude::*;
-    ternary
-        .par_chunks_mut(k)
-        .enumerate()
-        .for_each(|(r, row_out)| {
+    let tern_ptr = ternary.as_mut_ptr();
+    let i2s_ptr = i2s.as_ptr();
+    crate::inference_pool::par_run(m, |rs, re| {
+        for r in rs..re {
             let row_base = r * row_bytes;
+            let row_out = unsafe { std::slice::from_raw_parts_mut(tern_ptr.add(r * k), k) };
             for grp in 0..k / 128 {
-                let blk = &i2s[row_base + grp * 32..row_base + grp * 32 + 32];
+                let blk = unsafe { std::slice::from_raw_parts(i2s_ptr.add(row_base + grp * 32), 32) };
                 for j in 0..32 {
                     let b = blk[j];
                     row_out[grp * 128 + j] = ((b >> 6) & 3) as i8 - 1;
@@ -738,7 +738,8 @@ pub fn repack_i2s_to_tl2_with_config(
                     row_out[grp * 128 + 96 + j] = (b & 3) as i8 - 1;
                 }
             }
-        });
+        }
+    });
 
     let mut final_weight: Vec<Vec<u8>> = Vec::new();
 

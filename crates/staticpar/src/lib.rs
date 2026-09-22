@@ -25,6 +25,7 @@ pub struct StaticPool {
     inner:       Arc<Inner>,
     n_workers:   usize,
     _threads:    Vec<JoinHandle<()>>,
+    call_lock:   std::sync::Mutex<()>,
 }
 
 impl StaticPool {
@@ -51,7 +52,7 @@ impl StaticPool {
             );
         }
 
-        Self { inner, n_workers, _threads: threads }
+        Self { inner, n_workers, _threads: threads, call_lock: std::sync::Mutex::new(()) }
     }
 
     pub fn n_threads(&self) -> usize {
@@ -66,6 +67,7 @@ impl StaticPool {
     /// threads complete before this function returns.
     pub fn run<F: Fn(usize, usize) + Sync>(&self, n: usize, f: &F) {
         if n == 0 { return; }
+        let _lock = self.call_lock.lock().unwrap();
 
         unsafe fn trampoline<F: Fn(usize, usize)>(
             start: usize, end: usize, ctx: *const (),
@@ -94,6 +96,41 @@ impl StaticPool {
         }
 
         // Spin-wait for all workers
+        while self.inner.done.load(Ordering::Acquire) < self.n_workers {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Run `func(start, end, ctx)` for each partition of `0..n` using a raw function pointer.
+    /// Avoids the `Sync` bound — use when closures capture raw pointers.
+    ///
+    /// # Safety
+    /// - `func` must be safe to call concurrently from multiple threads with non-overlapping ranges.
+    /// - `ctx` must remain valid and the data it points to must be safe to access from any thread.
+    /// - Writes through `ctx` must go to non-overlapping memory regions per `(start, end)`.
+    pub unsafe fn run_raw(
+        &self,
+        n: usize,
+        func: unsafe fn(usize, usize, *const ()),
+        ctx: *const (),
+    ) {
+        if n == 0 { return; }
+        let _lock = self.call_lock.lock().unwrap();
+        let total_threads = self.n_workers + 1;
+        let chunk = n.div_ceil(total_threads).max(1);
+        self.inner.fn_ptr.store(func as *const () as usize as u64, Ordering::Relaxed);
+        self.inner.ctx.store(ctx as usize as u64, Ordering::Relaxed);
+        self.inner.n.store(n, Ordering::Relaxed);
+        self.inner.chunk.store(chunk, Ordering::Relaxed);
+        self.inner.work_ctr.store(0, Ordering::Relaxed);
+        self.inner.done.store(0, Ordering::Release);
+        self.inner.gen.fetch_add(1, Ordering::Release);
+        loop {
+            let start = self.inner.work_ctr.fetch_add(chunk, Ordering::Relaxed);
+            if start >= n { break; }
+            let end = (start + chunk).min(n);
+            unsafe { func(start, end, ctx) };
+        }
         while self.inner.done.load(Ordering::Acquire) < self.n_workers {
             std::hint::spin_loop();
         }

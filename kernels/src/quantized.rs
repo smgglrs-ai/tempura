@@ -88,7 +88,6 @@ pub use crate::{
     Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE, Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, Q6K_GROUPS,
     Q6K_GROUP_SIZE, TQ2_BLOCK_BYTES, TQ2_BLOCK_SIZE,
 };
-use rayon::prelude::*;
 
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
@@ -2195,30 +2194,27 @@ pub fn q2_0_gemv_i2s(
     let blocks_per_row = k / Q2_0_BLOCK_SIZE;
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") && !preq.q8_32.is_empty() {
-        use rayon::prelude::*;
-        let n_threads = rayon::current_num_threads().max(1);
-        let chunk = n.div_ceil(n_threads).max(64);
-        output
-            .par_chunks_mut(chunk)
-            .enumerate()
-            .for_each(|(ci, out)| {
-                let base = ci * chunk;
-                for j in 0..out.len() {
-                    let row = base + j;
-                    let i2s_row = &i2s_data[row * row_bytes..(row + 1) * row_bytes];
-                    let row_scales = &blk_scales[row * blocks_per_row..(row + 1) * blocks_per_row];
-                    out[j] = unsafe {
-                        q2_0_i2s_dot_preq_avx2(
-                            i2s_row,
-                            row_scales,
-                            &preq.q8_32,
-                            &preq.scales_32,
-                            &preq.asum_32,
-                            k,
-                        )
-                    };
+        let out_ptr = output.as_mut_ptr();
+        let i2s_ptr = i2s_data.as_ptr();
+        let scales_ptr = blk_scales.as_ptr();
+        let q8_32_ptr = preq.q8_32.as_ptr();
+        let scales_32_ptr = preq.scales_32.as_ptr();
+        let asum_32_ptr = preq.asum_32.as_ptr();
+        let q8_32_len = preq.q8_32.len();
+        let scales_32_len = preq.scales_32.len();
+        let asum_32_len = preq.asum_32.len();
+        crate::inference_pool::par_run(n, |start, end| {
+            for row in start..end {
+                let i2s_row = unsafe { std::slice::from_raw_parts(i2s_ptr.add(row * row_bytes), row_bytes) };
+                let row_scales = unsafe { std::slice::from_raw_parts(scales_ptr.add(row * blocks_per_row), blocks_per_row) };
+                let q8_32 = unsafe { std::slice::from_raw_parts(q8_32_ptr, q8_32_len) };
+                let scales_32 = unsafe { std::slice::from_raw_parts(scales_32_ptr, scales_32_len) };
+                let asum_32 = unsafe { std::slice::from_raw_parts(asum_32_ptr, asum_32_len) };
+                unsafe {
+                    *out_ptr.add(row) = q2_0_i2s_dot_preq_avx2(i2s_row, row_scales, q8_32, scales_32, asum_32, k);
                 }
-            });
+            }
+        });
     }
 }
 
@@ -2288,32 +2284,23 @@ pub fn q2_0_gemv_preq(
         let scales = &preq.scales_32;
         let asum = &preq.asum_32;
         let n_tiles = n / TILE;
-        use rayon::prelude::*;
-        let n_threads = rayon::current_num_threads().max(1);
-        let chunk = n_tiles.div_ceil(n_threads).max(1);
-        output[..n_tiles * TILE]
-            .par_chunks_mut(chunk * TILE)
-            .enumerate()
-            .for_each(|(ci, out_chunk)| {
-                let base_tile = ci * chunk;
-                let n_t = out_chunk.len() / TILE;
-                for t in 0..n_t {
-                    let tile = base_tile + t;
-                    let rows: [&[u8]; 8] = std::array::from_fn(|r| {
-                        &packed[(tile * TILE + r) * row_bytes..(tile * TILE + r + 1) * row_bytes]
-                    });
-                    unsafe {
-                        q2_0_dot_nrows_preq_avx2(
-                            &rows,
-                            q8,
-                            scales,
-                            asum,
-                            k,
-                            &mut out_chunk[t * TILE..t * TILE + TILE],
-                        )
-                    };
-                }
-            });
+        let out_ptr = output.as_mut_ptr();
+        let packed_ptr = packed.as_ptr();
+        let q8_ptr = q8.as_ptr(); let q8_len = q8.len();
+        let sc_ptr = scales.as_ptr(); let sc_len = scales.len();
+        let as_ptr = asum.as_ptr(); let as_len = asum.len();
+        crate::inference_pool::par_run(n_tiles, |start, end| {
+            for tile in start..end {
+                let rows: [&[u8]; 8] = std::array::from_fn(|r| unsafe {
+                    std::slice::from_raw_parts(packed_ptr.add((tile * TILE + r) * row_bytes), row_bytes)
+                });
+                let q8s = unsafe { std::slice::from_raw_parts(q8_ptr, q8_len) };
+                let scs = unsafe { std::slice::from_raw_parts(sc_ptr, sc_len) };
+                let ass = unsafe { std::slice::from_raw_parts(as_ptr, as_len) };
+                let out_tile = unsafe { std::slice::from_raw_parts_mut(out_ptr.add(tile * TILE), TILE) };
+                unsafe { q2_0_dot_nrows_preq_avx2(&rows, q8s, scs, ass, k, out_tile) };
+            }
+        });
         for j in n_tiles * TILE..n {
             output[j] = unsafe {
                 q2_0_dot_1row_preq_avx2(&packed[j * row_bytes..(j + 1) * row_bytes], q8, scales, k)
@@ -3878,38 +3865,33 @@ impl CpuMatMulQ4KOpt {
 
         const USE_VNNI: bool = cfg!(any(target_feature = "avxvnni", target_feature = "avx512vnni"));
 
-        let chunk_size = (total / rayon::current_num_threads()).max(64);
-
-        // Conceptually: outputs 0..n1 come from b1, outputs n1..n1+n2 come from b2.
-        // Each thread processes a range spanning potentially both outputs.
-        (0..total)
-            .into_par_iter()
-            .with_min_len(chunk_size)
-            .for_each(|idx| {
-                let (b_quantized, j, out_ptr) = if idx < n1 {
-                    (b1, idx, unsafe { out1.as_ptr().add(idx) as *mut f32 })
+        let b1_ptr = b1.as_ptr(); let b2_ptr = b2.as_ptr();
+        let out1_ptr = out1.as_mut_ptr(); let out2_ptr = out2.as_mut_ptr();
+        let q8_ptr = preq.q8.as_ptr(); let scales_ptr = preq.scales.as_ptr();
+        let gsums_ptr = preq.group_sums_q4k.as_ptr();
+        crate::inference_pool::par_run(total, |start, end| {
+            for idx in start..end {
+                let (b_ptr, j, o_ptr) = if idx < n1 {
+                    (b1_ptr, idx, unsafe { out1_ptr.add(idx) })
                 } else {
-                    (b2, idx - n1, unsafe {
-                        out2.as_ptr().add(idx - n1) as *mut f32
-                    })
+                    (b2_ptr, idx - n1, unsafe { out2_ptr.add(idx - n1) })
                 };
                 let mut sum = 0.0f32;
                 for blk in 0..blocks_per_row {
                     let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                    let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                    let aq_slice = &preq.q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                    let a_sc = preq.scales[blk];
-                    let a_gsums = &preq.group_sums_q4k[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
+                    let block = unsafe { std::slice::from_raw_parts(b_ptr.add(block_offset), Q4K_BLOCK_BYTES) };
+                    let aq_slice = unsafe { std::slice::from_raw_parts(q8_ptr.add(blk * Q4K_BLOCK_SIZE), Q4K_BLOCK_SIZE) };
+                    let a_sc = unsafe { *scales_ptr.add(blk) };
+                    let a_gsums = unsafe { std::slice::from_raw_parts(gsums_ptr.add(blk * Q4K_GROUPS), Q4K_GROUPS) };
                     sum += if USE_VNNI {
                         unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
                     } else {
                         unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
                     };
                 }
-                unsafe {
-                    *out_ptr = sum;
-                }
-            });
+                unsafe { *o_ptr = sum; }
+            }
+        });
     }
 
     /// Fuse two Q4K projections + one F16 projection into a single Rayon parallel region.
@@ -3934,45 +3916,44 @@ impl CpuMatMulQ4KOpt {
 
         const USE_VNNI: bool = cfg!(any(target_feature = "avxvnni", target_feature = "avx512vnni"));
 
-        let chunk_size = (total / rayon::current_num_threads()).max(64);
         let row_f16_bytes = k * 2;
-
-        (0..total)
-            .into_par_iter()
-            .with_min_len(chunk_size)
-            .for_each(|idx| {
+        let b1_ptr = b1.as_ptr(); let b2_ptr = b2.as_ptr();
+        let out1_ptr = out1.as_mut_ptr(); let out2_ptr = out2.as_mut_ptr(); let out3_ptr = out3.as_mut_ptr();
+        let q8_ptr = preq.q8.as_ptr(); let scales_ptr = preq.scales.as_ptr();
+        let gsums_ptr = preq.group_sums_q4k.as_ptr();
+        let f16_ptr = f16_bytes.as_ptr(); let a_f32_ptr = a_f32.as_ptr();
+        crate::inference_pool::par_run(total, |start, end| {
+            for idx in start..end {
                 if idx < n1 + n2 {
-                    let (b_quantized, j, out_ptr) = if idx < n1 {
-                        (b1, idx, unsafe { out1.as_ptr().add(idx) as *mut f32 })
+                    let (b_ptr, j, o_ptr) = if idx < n1 {
+                        (b1_ptr, idx, unsafe { out1_ptr.add(idx) })
                     } else {
-                        (b2, idx - n1, unsafe { out2.as_ptr().add(idx - n1) as *mut f32 })
+                        (b2_ptr, idx - n1, unsafe { out2_ptr.add(idx - n1) })
                     };
                     let mut sum = 0.0f32;
                     for blk in 0..blocks_per_row {
-                        let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                        let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                        let aq_slice = &preq.q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                        let a_sc = preq.scales[blk];
-                        let a_gsums = &preq.group_sums_q4k[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
-                        sum += if USE_VNNI {
-                            unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
-                        } else {
-                            unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
-                        };
+                        let off = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                        let block = unsafe { std::slice::from_raw_parts(b_ptr.add(off), Q4K_BLOCK_BYTES) };
+                        let aq = unsafe { std::slice::from_raw_parts(q8_ptr.add(blk * Q4K_BLOCK_SIZE), Q4K_BLOCK_SIZE) };
+                        let a_sc = unsafe { *scales_ptr.add(blk) };
+                        let a_gs = unsafe { std::slice::from_raw_parts(gsums_ptr.add(blk * Q4K_GROUPS), Q4K_GROUPS) };
+                        sum += if USE_VNNI { unsafe { q4k_dot_q8_vnni(block, aq, a_sc, a_gs) } }
+                               else { unsafe { q4k_dot_q8_avx2(block, aq, a_sc, a_gs) } };
                     }
-                    unsafe { *(out_ptr) = sum; }
+                    unsafe { *o_ptr = sum; }
                 } else {
                     let j = idx - n1 - n2;
                     let base = j * row_f16_bytes;
                     let mut dot = 0.0f32;
                     for i in 0..k {
                         let off = base + i * 2;
-                        let bits = u16::from_le_bytes([f16_bytes[off], f16_bytes[off + 1]]);
-                        dot += crate::ggml::helpers::f16_to_f32(bits) * a_f32[i];
+                        let b = unsafe { [*f16_ptr.add(off), *f16_ptr.add(off + 1)] };
+                        dot += crate::ggml::helpers::f16_to_f32(u16::from_le_bytes(b)) * unsafe { *a_f32_ptr.add(i) };
                     }
-                    unsafe { *(out3.as_ptr().add(j) as *mut f32) = dot; }
+                    unsafe { *out3_ptr.add(j) = dot; }
                 }
-            });
+            }
+        });
     }
 
     pub fn forward_q4k_preq(
@@ -3989,51 +3970,41 @@ impl CpuMatMulQ4KOpt {
         if preq.is_quantized() {
             const USE_VNNI: bool = cfg!(any(target_feature = "avxvnni", target_feature = "avx512vnni"));
 
-            let chunk_size = (n / rayon::current_num_threads()).max(64);
-            output[..n]
-                .par_chunks_mut(chunk_size)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk)| {
-                    let j_start = chunk_idx * chunk_size;
-                    for (local, out) in chunk.iter_mut().enumerate() {
-                        let j = j_start + local;
-                        let mut sum = 0.0f32;
-                        for blk in 0..blocks_per_row {
-                            let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                            let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                            let aq_slice =
-                                &preq.q8[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                            let a_sc = preq.scales[blk];
-                            let a_gsums =
-                                &preq.group_sums_q4k[blk * Q4K_GROUPS..(blk + 1) * Q4K_GROUPS];
-                            sum += if USE_VNNI {
-                                unsafe { q4k_dot_q8_vnni(block, aq_slice, a_sc, a_gsums) }
-                            } else {
-                                unsafe { q4k_dot_q8_avx2(block, aq_slice, a_sc, a_gsums) }
-                            };
-                        }
-                        *out = sum;
+            let out_ptr = output.as_mut_ptr();
+            let bq_ptr = b_quantized.as_ptr();
+            let q8_ptr = preq.q8.as_ptr(); let sc_ptr = preq.scales.as_ptr();
+            let gs_ptr = preq.group_sums_q4k.as_ptr();
+            crate::inference_pool::par_run(n, |start, end| {
+                for j in start..end {
+                    let mut sum = 0.0f32;
+                    for blk in 0..blocks_per_row {
+                        let bo = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                        let block = unsafe { std::slice::from_raw_parts(bq_ptr.add(bo), Q4K_BLOCK_BYTES) };
+                        let aq = unsafe { std::slice::from_raw_parts(q8_ptr.add(blk * Q4K_BLOCK_SIZE), Q4K_BLOCK_SIZE) };
+                        let a_sc = unsafe { *sc_ptr.add(blk) };
+                        let a_gs = unsafe { std::slice::from_raw_parts(gs_ptr.add(blk * Q4K_GROUPS), Q4K_GROUPS) };
+                        sum += if USE_VNNI { unsafe { q4k_dot_q8_vnni(block, aq, a_sc, a_gs) } }
+                               else { unsafe { q4k_dot_q8_avx2(block, aq, a_sc, a_gs) } };
                     }
-                });
+                    unsafe { *out_ptr.add(j) = sum; }
+                }
+            });
         } else {
-            let chunk_size = (n / rayon::current_num_threads()).max(64);
-            output[..n]
-                .par_chunks_mut(chunk_size)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk)| {
-                    let j_start = chunk_idx * chunk_size;
-                    for (local, out) in chunk.iter_mut().enumerate() {
-                        let j = j_start + local;
-                        let mut sum = 0.0f32;
-                        for blk in 0..blocks_per_row {
-                            let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                            let block = &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                            let a_slice = &a_f32[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                            sum += q4k_dot_block(block, a_slice);
-                        }
-                        *out = sum;
+            let out_ptr = output.as_mut_ptr();
+            let bq_ptr = b_quantized.as_ptr();
+            let af_ptr = a_f32.as_ptr();
+            crate::inference_pool::par_run(n, |start, end| {
+                for j in start..end {
+                    let mut sum = 0.0f32;
+                    for blk in 0..blocks_per_row {
+                        let bo = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                        let block = unsafe { std::slice::from_raw_parts(bq_ptr.add(bo), Q4K_BLOCK_BYTES) };
+                        let a_slice = unsafe { std::slice::from_raw_parts(af_ptr.add(blk * Q4K_BLOCK_SIZE), Q4K_BLOCK_SIZE) };
+                        sum += q4k_dot_block(block, a_slice);
                     }
-                });
+                    unsafe { *out_ptr.add(j) = sum; }
+                }
+            });
         }
         Ok(())
     }
@@ -4051,45 +4022,39 @@ impl CpuMatMulQ4KOpt {
 
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            let chunk_size = (n / rayon::current_num_threads()).max(64);
-            output[..n]
-                .par_chunks_mut(chunk_size)
-                .enumerate()
-                .for_each(|(ci, chunk)| {
-                    let j_start = ci * chunk_size;
-                    for (local, out) in chunk.iter_mut().enumerate() {
-                        let j = j_start + local;
-                        let mut sum = 0.0f32;
-                        for blk in 0..blocks_per_row {
-                            let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
-                            let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
-                            let a_slice = &a_f32[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                            sum += unsafe { q6k_dot_block_avx2(block, a_slice) };
-                        }
-                        *out = sum;
+            let out_ptr = output.as_mut_ptr();
+            let bq_ptr = b_quantized.as_ptr();
+            let af_ptr = a_f32.as_ptr();
+            crate::inference_pool::par_run(n, |start, end| {
+                for j in start..end {
+                    let mut sum = 0.0f32;
+                    for blk in 0..blocks_per_row {
+                        let bo = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                        let block = unsafe { std::slice::from_raw_parts(bq_ptr.add(bo), Q6K_BLOCK_BYTES) };
+                        let a_sl = unsafe { std::slice::from_raw_parts(af_ptr.add(blk * Q6K_BLOCK_SIZE), Q6K_BLOCK_SIZE) };
+                        sum += unsafe { q6k_dot_block_avx2(block, a_sl) };
                     }
-                });
+                    unsafe { *out_ptr.add(j) = sum; }
+                }
+            });
             return Ok(());
         }
 
-        let chunk_size = (n / rayon::current_num_threads()).max(64);
-        output[..n]
-            .par_chunks_mut(chunk_size)
-            .enumerate()
-            .for_each(|(ci, chunk)| {
-                let j_start = ci * chunk_size;
-                for (local, out) in chunk.iter_mut().enumerate() {
-                    let j = j_start + local;
-                    let mut sum = 0.0f32;
-                    for blk in 0..blocks_per_row {
-                        let block_offset = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
-                        let block = &b_quantized[block_offset..block_offset + Q6K_BLOCK_BYTES];
-                        let a_slice = &a_f32[blk * Q6K_BLOCK_SIZE..(blk + 1) * Q6K_BLOCK_SIZE];
-                        sum += q6k_dot_block(block, a_slice);
-                    }
-                    *out = sum;
+        let out_ptr = output.as_mut_ptr();
+        let bq_ptr = b_quantized.as_ptr();
+        let af_ptr = a_f32.as_ptr();
+        crate::inference_pool::par_run(n, |start, end| {
+            for j in start..end {
+                let mut sum = 0.0f32;
+                for blk in 0..blocks_per_row {
+                    let bo = (j * blocks_per_row + blk) * Q6K_BLOCK_BYTES;
+                    let block = unsafe { std::slice::from_raw_parts(bq_ptr.add(bo), Q6K_BLOCK_BYTES) };
+                    let a_sl = unsafe { std::slice::from_raw_parts(af_ptr.add(blk * Q6K_BLOCK_SIZE), Q6K_BLOCK_SIZE) };
+                    sum += q6k_dot_block(block, a_sl);
                 }
-            });
+                unsafe { *out_ptr.add(j) = sum; }
+            }
+        });
         Ok(())
     }
 }
@@ -4142,23 +4107,23 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         }
 
         if std::env::var("TEMPURA_DETERMINISTIC").is_ok() {
-            output[..m * n].par_chunks_mut(n).enumerate().for_each(
-                |(i, row_out)| {
-                    let a_row = &a[i * k..(i + 1) * k];
-                    for j in 0..n {
-                        let mut sum = 0.0f32;
-                        for blk in 0..blocks_per_row {
-                            let block_offset = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                            let block =
-                                &b_quantized[block_offset..block_offset + Q4K_BLOCK_BYTES];
-                            let a_slice =
-                                &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
-                            sum += q4k_dot_block(block, a_slice);
-                        }
-                        row_out[j] = sum;
+            let out_ptr = output.as_mut_ptr();
+            let bq_ptr = b_quantized.as_ptr();
+            let a_ptr = a.as_ptr();
+            crate::inference_pool::par_run(m * n, |start, end| {
+                for idx in start..end {
+                    let i = idx / n; let j = idx % n;
+                    let a_row = unsafe { std::slice::from_raw_parts(a_ptr.add(i * k), k) };
+                    let mut sum = 0.0f32;
+                    for blk in 0..blocks_per_row {
+                        let bo = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                        let block = unsafe { std::slice::from_raw_parts(bq_ptr.add(bo), Q4K_BLOCK_BYTES) };
+                        let a_slice = &a_row[blk * Q4K_BLOCK_SIZE..(blk + 1) * Q4K_BLOCK_SIZE];
+                        sum += q4k_dot_block(block, a_slice);
                     }
-                },
-            );
+                    unsafe { *out_ptr.add(i * n + j) = sum; }
+                }
+            });
             return Ok(());
         }
 
@@ -4220,98 +4185,44 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             );
             return Ok(());
         }
-        output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
+        // Pre-quantize all m input rows sequentially, then parallel over output neurons.
+        let mut q8k_all: Vec<BlockQ8K> = vec![unsafe { std::mem::zeroed() }; m * blocks_per_row];
+        for i in 0..m {
             let a_row = &a[i * k..(i + 1) * k];
-            let a_q8k: &[BlockQ8K] = Q8K_BUF_Q4K.with(|cell| {
-                    let buf = unsafe { &mut *cell.get() };
-                    if buf.len() < blocks_per_row {
-                        buf.resize_with(blocks_per_row, || unsafe { std::mem::zeroed() });
+            let dst = &mut q8k_all[i * blocks_per_row..(i + 1) * blocks_per_row];
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                unsafe { crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, dst) };
+            } else {
+                crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
+        }
+        let out_ptr = output.as_mut_ptr();
+        let bq_ptr = b_quantized.as_ptr();
+        let q8k_ptr = q8k_all.as_ptr();
+        let row_bytes_q4k = blocks_per_row * Q4K_BLOCK_BYTES;
+        const PREFETCH_DIST: usize = 8;
+        crate::inference_pool::par_run(m * n, |start, end| {
+            for idx in start..end {
+                let i = idx / n; let j = idx % n;
+                let a_q8k = unsafe { std::slice::from_raw_parts(q8k_ptr.add(i * blocks_per_row), blocks_per_row) };
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    let pf_j = j + PREFETCH_DIST;
+                    if pf_j < n {
+                        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
+                        _mm_prefetch(bq_ptr.add(pf_j * row_bytes_q4k) as *const i8, _MM_HINT_T1);
                     }
-                    #[cfg(target_arch = "x86_64")]
-                    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                        unsafe {
-                            crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(
-                                a_row,
-                                &mut buf[..blocks_per_row],
-                            )
-                        };
-                    } else {
-                        crate::ggml::quantize::quantize_row_q8_k(
-                            a_row,
-                            &mut buf[..blocks_per_row],
-                        );
-                    }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    crate::ggml::quantize::quantize_row_q8_k(
-                        a_row,
-                        &mut buf[..blocks_per_row],
-                    );
-                    unsafe { std::slice::from_raw_parts(buf.as_ptr(), blocks_per_row) }
-                });
-
-                const PREFETCH_DIST: usize = 8;
-                let row_bytes_q4k = blocks_per_row * Q4K_BLOCK_BYTES;
-                let j_chunk = (n / rayon::current_num_threads()).max(64);
-                row_out.par_chunks_mut(j_chunk).enumerate().for_each(|(ci, jchunk)| {
-                    let j_start = ci * j_chunk;
-                    let chunk_len = jchunk.len();
-                    let mut local = 0usize;
-
-                    // Process pairs of output neurons — share Q8K activation loads
-                    while local + 1 < chunk_len {
-                        let j = j_start + local;
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            let pf_j = j + PREFETCH_DIST;
-                            if pf_j + 1 < n {
-                                unsafe {
-                                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
-                                    _mm_prefetch(
-                                        b_quantized.as_ptr().add(pf_j * row_bytes_q4k) as *const i8,
-                                        _MM_HINT_T1,
-                                    );
-                                    _mm_prefetch(
-                                        b_quantized.as_ptr().add((pf_j + 1) * row_bytes_q4k) as *const i8,
-                                        _MM_HINT_T1,
-                                    );
-                                }
-                            }
-                        }
-                        let w0: &[BlockQ4K] = unsafe {
-                            std::slice::from_raw_parts(
-                                b_quantized.as_ptr().add(j * row_bytes_q4k) as *const BlockQ4K,
-                                blocks_per_row,
-                            )
-                        };
-                        let w1: &[BlockQ4K] = unsafe {
-                            std::slice::from_raw_parts(
-                                b_quantized.as_ptr().add((j + 1) * row_bytes_q4k) as *const BlockQ4K,
-                                blocks_per_row,
-                            )
-                        };
-                        let (r0, r1) = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch_pair(
-                            k, w0, w1, a_q8k,
-                        );
-                        jchunk[local] = r0;
-                        jchunk[local + 1] = r1;
-                        local += 2;
-                    }
-
-                    // Scalar tail for odd chunk lengths
-                    if local < chunk_len {
-                        let j = j_start + local;
-                        let weight_blocks: &[BlockQ4K] = unsafe {
-                            std::slice::from_raw_parts(
-                                b_quantized.as_ptr().add(j * row_bytes_q4k) as *const BlockQ4K,
-                                blocks_per_row,
-                            )
-                        };
-                        jchunk[local] = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(
-                            k, weight_blocks, a_q8k,
-                        );
-                    }
-                });
-            });
+                }
+                let w: &[BlockQ4K] = unsafe {
+                    std::slice::from_raw_parts(bq_ptr.add(j * row_bytes_q4k) as *const BlockQ4K, blocks_per_row)
+                };
+                let val = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(k, w, a_q8k);
+                unsafe { *out_ptr.add(i * n + j) = val; }
+            }
+        });
 
         Ok(())
     }
@@ -4415,70 +4326,43 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             );
             return Ok(());
         }
-        output[..m * n].par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
+        let mut q8k_all: Vec<BlockQ8K> = vec![unsafe { std::mem::zeroed() }; m * blocks_per_row];
+        for i in 0..m {
             let a_row = &a[i * k..(i + 1) * k];
-            let a_q8k: &[BlockQ8K] = Q8K_BUF_Q6K.with(|cell| {
-                    let buf = unsafe { &mut *cell.get() };
-                    if buf.len() < blocks_per_row {
-                        buf.resize_with(blocks_per_row, || unsafe { std::mem::zeroed() });
+            let dst = &mut q8k_all[i * blocks_per_row..(i + 1) * blocks_per_row];
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                unsafe { crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, dst) };
+            } else {
+                crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
+        }
+        let out_ptr = output.as_mut_ptr();
+        let bq_ptr = b_quantized.as_ptr();
+        let q8k_ptr = q8k_all.as_ptr();
+        let row_bytes_q6k = blocks_per_row * Q6K_BLOCK_BYTES;
+        const PREFETCH_DIST_Q6K: usize = 8;
+        crate::inference_pool::par_run(m * n, |start, end| {
+            for idx in start..end {
+                let i = idx / n; let j = idx % n;
+                let a_q8k = unsafe { std::slice::from_raw_parts(q8k_ptr.add(i * blocks_per_row), blocks_per_row) };
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    let pf_j = j + PREFETCH_DIST_Q6K;
+                    if pf_j < n {
+                        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
+                        _mm_prefetch(bq_ptr.add(pf_j * row_bytes_q6k) as *const i8, _MM_HINT_T1);
                     }
-                    #[cfg(target_arch = "x86_64")]
-                    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                        unsafe {
-                            crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(
-                                a_row,
-                                &mut buf[..blocks_per_row],
-                            )
-                        };
-                    } else {
-                        crate::ggml::quantize::quantize_row_q8_k(
-                            a_row,
-                            &mut buf[..blocks_per_row],
-                        );
-                    }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    crate::ggml::quantize::quantize_row_q8_k(
-                        a_row,
-                        &mut buf[..blocks_per_row],
-                    );
-                    unsafe { std::slice::from_raw_parts(buf.as_ptr(), blocks_per_row) }
-                });
-
-                const PREFETCH_DIST_Q6K: usize = 8;
-                let row_bytes_q6k = blocks_per_row * Q6K_BLOCK_BYTES;
-                let j_chunk = (n / rayon::current_num_threads()).max(64);
-                row_out.par_chunks_mut(j_chunk).enumerate().for_each(|(ci, jchunk)| {
-                    let j_start = ci * j_chunk;
-                    for (local, out_val) in jchunk.iter_mut().enumerate() {
-                        let j = j_start + local;
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            let pf_j = j_start + local + PREFETCH_DIST_Q6K;
-                            if pf_j < n {
-                                unsafe {
-                                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
-                                    _mm_prefetch(
-                                        b_quantized.as_ptr().add(pf_j * row_bytes_q6k) as *const i8,
-                                        _MM_HINT_T1,
-                                    );
-                                }
-                            }
-                        }
-                        let row_start = j * row_bytes_q6k;
-                        let weight_blocks: &[BlockQ6K] = unsafe {
-                            std::slice::from_raw_parts(
-                                b_quantized.as_ptr().add(row_start) as *const BlockQ6K,
-                                blocks_per_row,
-                            )
-                        };
-                        *out_val = crate::ggml::vec_dot_avx2::vec_dot_q6_k_q8_k_dispatch(
-                            k,
-                            weight_blocks,
-                            a_q8k,
-                        );
-                    }
-                });
-            });
+                }
+                let w: &[BlockQ6K] = unsafe {
+                    std::slice::from_raw_parts(bq_ptr.add(j * row_bytes_q6k) as *const BlockQ6K, blocks_per_row)
+                };
+                let val = crate::ggml::vec_dot_avx2::vec_dot_q6_k_q8_k_dispatch(k, w, a_q8k);
+                unsafe { *out_ptr.add(i * n + j) = val; }
+            }
+        });
         Ok(())
     }
 
@@ -4518,27 +4402,23 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             });
         }
 
-        let chunk_size = (n / rayon::current_num_threads()).max(64);
-        for i in 0..m {
-            let a_row = &a[i * k..(i + 1) * k];
-            output[i * n..(i + 1) * n]
-                .par_chunks_mut(chunk_size)
-                .enumerate()
-                .for_each(|(ci, chunk)| {
-                    let j_start = ci * chunk_size;
-                    for (local, out) in chunk.iter_mut().enumerate() {
-                        let j = j_start + local;
-                        let mut sum = 0.0f32;
-                        for blk in 0..blocks_per_row {
-                            let block_offset = (j * blocks_per_row + blk) * TQ2_BLOCK_BYTES;
-                            let block = &b_quantized[block_offset..block_offset + TQ2_BLOCK_BYTES];
-                            let a_slice = &a_row[blk * TQ2_BLOCK_SIZE..(blk + 1) * TQ2_BLOCK_SIZE];
-                            sum += tq2_dot_block(block, a_slice);
-                        }
-                        *out = sum;
-                    }
-                });
-        }
+        let out_ptr = output.as_mut_ptr();
+        let bq_ptr = b_quantized.as_ptr();
+        let a_ptr = a.as_ptr();
+        crate::inference_pool::par_run(m * n, |start, end| {
+            for idx in start..end {
+                let i = idx / n; let j = idx % n;
+                let a_row = unsafe { std::slice::from_raw_parts(a_ptr.add(i * k), k) };
+                let mut sum = 0.0f32;
+                for blk in 0..blocks_per_row {
+                    let bo = (j * blocks_per_row + blk) * TQ2_BLOCK_BYTES;
+                    let block = unsafe { std::slice::from_raw_parts(bq_ptr.add(bo), TQ2_BLOCK_BYTES) };
+                    let a_sl = &a_row[blk * TQ2_BLOCK_SIZE..(blk + 1) * TQ2_BLOCK_SIZE];
+                    sum += tq2_dot_block(block, a_sl);
+                }
+                unsafe { *out_ptr.add(i * n + j) = sum; }
+            }
+        });
         Ok(())
     }
 
@@ -4732,7 +4612,6 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 let n_chunks = n / 32;
 
                 let chunk_results: Vec<[i32; 32]> = (0..n_chunks)
-                    .into_par_iter()
                     .map(|chunk_idx| {
                         let j_start = chunk_idx * 32;
                         let mut accs = [0i32; 32];

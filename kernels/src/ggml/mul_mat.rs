@@ -94,27 +94,26 @@ pub fn mul_mat_q(
         quantize_activations(src_row, dst_row, vdt);
     }
 
-    // For Q4K with AVX2, call the optimized path directly to avoid per-call dispatch
-    use rayon::prelude::*;
-
+    let dst_ptr = dst.as_mut_ptr();
+    let src0_ptr = src0.as_ptr();
+    let act_ptr = act_quantized.as_ptr();
     if m == 1 {
-        // Decode path: parallelize over output columns (not rows — there's only 1)
         let act_row = &act_quantized[..act_row_bytes];
-        dst.par_iter_mut().enumerate().for_each(|(col, out)| {
-            let weight_row = &src0[col * weight_row_bytes..(col + 1) * weight_row_bytes];
-            vec_dot_best(k, out, weight_row, act_row, src0_type);
+        crate::inference_pool::par_run(n, |start, end| {
+            for col in start..end {
+                let weight_row = unsafe { std::slice::from_raw_parts(src0_ptr.add(col * weight_row_bytes), weight_row_bytes) };
+                vec_dot_best(k, unsafe { &mut *dst_ptr.add(col) }, weight_row, act_row, src0_type);
+            }
         });
     } else {
-        // Batch path: parallelize over rows
-        dst.par_chunks_mut(n)
-            .enumerate()
-            .for_each(|(row, dst_row)| {
-                let act_row = &act_quantized[row * act_row_bytes..(row + 1) * act_row_bytes];
-                for col in 0..n {
-                    let weight_row = &src0[col * weight_row_bytes..(col + 1) * weight_row_bytes];
-                    vec_dot_best(k, &mut dst_row[col], weight_row, act_row, src0_type);
-                }
-            });
+        crate::inference_pool::par_run(m * n, |start, end| {
+            for idx in start..end {
+                let row = idx / n; let col = idx % n;
+                let act_row = unsafe { std::slice::from_raw_parts(act_ptr.add(row * act_row_bytes), act_row_bytes) };
+                let weight_row = unsafe { std::slice::from_raw_parts(src0_ptr.add(col * weight_row_bytes), weight_row_bytes) };
+                vec_dot_best(k, unsafe { &mut *dst_ptr.add(row * n + col) }, weight_row, act_row, src0_type);
+            }
+        });
     }
 }
 
@@ -167,16 +166,17 @@ pub fn mul_mat_q_preq(
     assert_eq!(src0.len(), n * weight_row_bytes, "src0 size mismatch");
     assert_eq!(dst.len(), m * n, "dst size mismatch");
 
-    use rayon::prelude::*;
-    dst.par_chunks_mut(n)
-        .enumerate()
-        .for_each(|(row, dst_row)| {
-            let act_row = &preq.data[row * act_row_bytes..(row + 1) * act_row_bytes];
-            for col in 0..n {
-                let weight_row = &src0[col * weight_row_bytes..(col + 1) * weight_row_bytes];
-                vec_dot_best(k, &mut dst_row[col], weight_row, act_row, src0_type);
-            }
-        });
+    let dst_ptr = dst.as_mut_ptr();
+    let src0_ptr = src0.as_ptr();
+    let data_ptr = preq.data.as_ptr();
+    crate::inference_pool::par_run(m * n, |start, end| {
+        for idx in start..end {
+            let row = idx / n; let col = idx % n;
+            let act_row = unsafe { std::slice::from_raw_parts(data_ptr.add(row * act_row_bytes), act_row_bytes) };
+            let weight_row = unsafe { std::slice::from_raw_parts(src0_ptr.add(col * weight_row_bytes), weight_row_bytes) };
+            vec_dot_best(k, unsafe { &mut *dst_ptr.add(row * n + col) }, weight_row, act_row, src0_type);
+        }
+    });
 }
 
 /// Scalar-only mul_mat (no AVX2). Used for DualPipeline validation.

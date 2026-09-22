@@ -3670,7 +3670,6 @@ dependencies = [
  "half",
  "proptest",
  "rand 0.9.5",
- "rayon",
  "serde",
  "serde_json",
  "staticpar",
