@@ -194,21 +194,41 @@ impl crate::inference_pool::KernelJob for Q4kMnTiledJob {
     #[inline(always)]
     fn exec_range(&self, start: usize, end: usize) {
         use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
-        for j in start..end {
-            let w = unsafe {
+        use crate::ggml::vec_dot_avx2::{vec_dot_q4_k_q8_k_dispatch, vec_dot_q4_k_q8_k_dispatch_pair};
+        let mut j = start;
+        while j + 1 < end {
+            let w0 = unsafe {
                 std::slice::from_raw_parts(
-                    self.bq_ptr.add(j * self.bq_row_bytes) as *const BlockQ4K,
-                    self.bpr,
-                )
+                    self.bq_ptr.add(j * self.bq_row_bytes) as *const BlockQ4K, self.bpr)
+            };
+            let w1 = unsafe {
+                std::slice::from_raw_parts(
+                    self.bq_ptr.add((j + 1) * self.bq_row_bytes) as *const BlockQ4K, self.bpr)
             };
             for i in 0..self.m {
                 let a = unsafe {
                     std::slice::from_raw_parts(
-                        self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K,
-                        self.bpr,
-                    )
+                        self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K, self.bpr)
                 };
-                let val = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(self.k, w, a);
+                let (v0, v1) = vec_dot_q4_k_q8_k_dispatch_pair(self.k, w0, w1, a);
+                unsafe {
+                    *self.out_ptr.add(i * self.n + j) = v0;
+                    *self.out_ptr.add(i * self.n + j + 1) = v1;
+                }
+            }
+            j += 2;
+        }
+        if j < end {
+            let w = unsafe {
+                std::slice::from_raw_parts(
+                    self.bq_ptr.add(j * self.bq_row_bytes) as *const BlockQ4K, self.bpr)
+            };
+            for i in 0..self.m {
+                let a = unsafe {
+                    std::slice::from_raw_parts(
+                        self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K, self.bpr)
+                };
+                let val = vec_dot_q4_k_q8_k_dispatch(self.k, w, a);
                 unsafe { *self.out_ptr.add(i * self.n + j) = val; }
             }
         }
