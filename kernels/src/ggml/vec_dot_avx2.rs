@@ -884,18 +884,140 @@ pub unsafe fn vec_dot_q4_0_q8_0_vnni(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0])
     hsum_f32_8(acc)
 }
 
-// ── AVX-512 VNNI variant ───────────────────────────────────────────────────
-// Uses 256-bit VNNI dpbusd (same as AVX-VNNI) but with the proven Q4K dequant
-// layout. AVX-512 width is used for activation quantization, not the vec_dot
-// inner loop — the per-group scaling makes 512-bit lanes hard to fill correctly.
-// For Q4K, the VNNI variant IS the fastest path since dpbusd replaces
-// maddubs+madd, and the 256-bit width matches the 32-element scale groups.
+// ── True 512-bit VNNI variant ─────────────────────────────────────────────
+// Processes Q4K sub-block pairs using 512-bit dpbusd: one call handles 64 Q8K
+// bytes instead of 32, halving dpbusd instruction count per block (4 × 512-bit
+// vs 8 × 256-bit). Q8K bytes are non-contiguous within a pair (lo and hi halves
+// interleaved), so 4 × 256-bit loads build the 512-bit Q8K operands via
+// vinserti64x4 before each pair of dpbusd calls.
+//
+// Scale groups: each 512-bit dpbusd covers two sub-blocks with independent
+// scales; lower/upper 256-bit halves of the result are extracted and scaled
+// separately, then folded into the 256-bit sumi accumulator.
+//
+// avx512dq is required for vextracti64x4 / vinserti64x4 (present on every
+// Intel/AMD avx512f CPU in practice; isolated in target_feature + dispatch).
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx512dq")]
 #[inline]
 pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
-    vec_dot_q4_k_q8_k_vnni(n, x, y)
+    let nb = n / 256;
+    let mask_lo = _mm512_set1_epi8(0x0F_i8);
+    let zero512 = _mm512_setzero_si512();
+
+    let mut acc = _mm256_setzero_ps();
+    let mut mins_total = 0.0f32;
+
+    let x_ptr = x.as_ptr();
+    let y_ptr = y.as_ptr();
+
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    for i in 0..nb {
+        let xi = &*x_ptr.add(i);
+        let yi = &*y_ptr.add(i);
+
+        let d = f16_to_f32(xi.d) * yi.d;
+        let dmin = f16_to_f32(xi.dmin) * yi.d;
+
+        // Scale/min extraction — identical to 256-bit VNNI kernel.
+        let mut utmp = [0u32; 4];
+        std::ptr::copy_nonoverlapping(xi.scales.as_ptr(), utmp.as_mut_ptr() as *mut u8, 12);
+        utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
+        let uaux = utmp[1] & KMASK1;
+        utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= KMASK1;
+
+        // Mins accumulation — identical to 256-bit VNNI kernel.
+        let q8sums = _mm256_loadu_si256(yi.bsums.as_ptr() as *const __m256i);
+        let q8s = _mm_hadd_epi16(
+            _mm256_castsi256_si128(q8sums),
+            _mm256_extracti128_si256(q8sums, 1),
+        );
+        let mins_128 = _mm_set_epi32(0, 0, utmp[3] as i32, utmp[2] as i32);
+        let mins_i16 = _mm_cvtepu8_epi16(mins_128);
+        let prod = _mm_madd_epi16(mins_i16, q8s);
+        mins_total += dmin * hsum_i32_4(prod) as f32;
+
+        // Unpack 8 group scales from utmp[0..1].
+        // utmp[0] = [sc0, sc1, sc2, sc3] as LE bytes → j=0 lo/hi, j=1 lo/hi scales.
+        // utmp[1] = [sc4, sc5, sc6, sc7]             → j=2 lo/hi, j=3 lo/hi scales.
+        let sc0 = (utmp[0] & 0xFF) as i32;
+        let sc1 = ((utmp[0] >> 8) & 0xFF) as i32;
+        let sc2 = ((utmp[0] >> 16) & 0xFF) as i32;
+        let sc3 = ((utmp[0] >> 24) & 0xFF) as i32;
+        let sc4 = (utmp[1] & 0xFF) as i32;
+        let sc5 = ((utmp[1] >> 8) & 0xFF) as i32;
+        let sc6 = ((utmp[1] >> 16) & 0xFF) as i32;
+        let sc7 = ((utmp[1] >> 24) & 0xFF) as i32;
+
+        let q4 = xi.qs.as_ptr();
+        let q8 = yi.qs.as_ptr();
+
+        // ── Sub-block pair j=0,1 ─────────────────────────────────────────────
+        // Load 64 packed nibble bytes (xi.qs[0..63]): bytes 0..31 = j=0 nibbles,
+        // bytes 32..63 = j=1 nibbles. Extract lo/hi nibbles into 512-bit regs.
+        let q4_512_01 = _mm512_loadu_si512(q4 as *const __m512i);
+        let q4_lo01 = _mm512_and_si512(q4_512_01, mask_lo);
+        let q4_hi01 = _mm512_and_si512(_mm512_srli_epi16(q4_512_01, 4), mask_lo);
+
+        // Q8K sub-block j=0: lo = yi.qs[0..31], hi = yi.qs[32..63].
+        // Q8K sub-block j=1: lo = yi.qs[64..95], hi = yi.qs[96..127].
+        // Build [j0_lo | j1_lo] and [j0_hi | j1_hi] for aligned 512-bit dpbusd.
+        let j0_lo = _mm256_loadu_si256(q8.add(0)  as *const __m256i);
+        let j0_hi = _mm256_loadu_si256(q8.add(32) as *const __m256i);
+        let j1_lo = _mm256_loadu_si256(q8.add(64) as *const __m256i);
+        let j1_hi = _mm256_loadu_si256(q8.add(96) as *const __m256i);
+        let q8_lo01 = _mm512_inserti64x4(_mm512_castsi256_si512(j0_lo), j1_lo, 1);
+        let q8_hi01 = _mm512_inserti64x4(_mm512_castsi256_si512(j0_hi), j1_hi, 1);
+
+        // 512-bit dpbusd: lower 256 bits → j=0 products, upper 256 bits → j=1.
+        let dot_lo01 = _mm512_dpbusd_epi32(zero512, q4_lo01, q8_lo01);
+        let dot_hi01 = _mm512_dpbusd_epi32(zero512, q4_hi01, q8_hi01);
+
+        // Extract halves and scale each by its group scale.
+        let lo0 = _mm512_castsi512_si256(dot_lo01);
+        let lo1 = _mm512_extracti64x4_epi64(dot_lo01, 1);
+        let hi0 = _mm512_castsi512_si256(dot_hi01);
+        let hi1 = _mm512_extracti64x4_epi64(dot_hi01, 1);
+        let mut sumi = _mm256_setzero_si256();
+        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo0, _mm256_set1_epi32(sc0)));
+        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi0, _mm256_set1_epi32(sc1)));
+        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo1, _mm256_set1_epi32(sc2)));
+        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi1, _mm256_set1_epi32(sc3)));
+
+        // ── Sub-block pair j=2,3 ─────────────────────────────────────────────
+        let q4_512_23 = _mm512_loadu_si512(q4.add(64) as *const __m512i);
+        let q4_lo23 = _mm512_and_si512(q4_512_23, mask_lo);
+        let q4_hi23 = _mm512_and_si512(_mm512_srli_epi16(q4_512_23, 4), mask_lo);
+
+        let j2_lo = _mm256_loadu_si256(q8.add(128) as *const __m256i);
+        let j2_hi = _mm256_loadu_si256(q8.add(160) as *const __m256i);
+        let j3_lo = _mm256_loadu_si256(q8.add(192) as *const __m256i);
+        let j3_hi = _mm256_loadu_si256(q8.add(224) as *const __m256i);
+        let q8_lo23 = _mm512_inserti64x4(_mm512_castsi256_si512(j2_lo), j3_lo, 1);
+        let q8_hi23 = _mm512_inserti64x4(_mm512_castsi256_si512(j2_hi), j3_hi, 1);
+
+        let dot_lo23 = _mm512_dpbusd_epi32(zero512, q4_lo23, q8_lo23);
+        let dot_hi23 = _mm512_dpbusd_epi32(zero512, q4_hi23, q8_hi23);
+
+        let lo2 = _mm512_castsi512_si256(dot_lo23);
+        let lo3 = _mm512_extracti64x4_epi64(dot_lo23, 1);
+        let hi2 = _mm512_castsi512_si256(dot_hi23);
+        let hi3 = _mm512_extracti64x4_epi64(dot_hi23, 1);
+        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo2, _mm256_set1_epi32(sc4)));
+        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi2, _mm256_set1_epi32(sc5)));
+        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo3, _mm256_set1_epi32(sc6)));
+        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi3, _mm256_set1_epi32(sc7)));
+
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+
+    hsum_f32_8(acc) - mins_total
 }
 
 // ── Runtime dispatch ───────────────────────────────────────────────────────
@@ -917,10 +1039,20 @@ pub fn vec_dot_q8_0_q8_0_dispatch(n: usize, x: &[BlockQ8_0], y: &[BlockQ8_0]) ->
 #[allow(unreachable_code)]
 #[inline(always)]
 pub fn vec_dot_q4_k_q8_k_dispatch(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
-    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vnni"))]
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vnni",
+        target_feature = "avx512dq"
+    ))]
     { return unsafe { vec_dot_q4_k_q8_k_avx512(n, x, y) }; }
     #[cfg(all(
-        not(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vnni")),
+        not(all(
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vnni",
+            target_feature = "avx512dq"
+        )),
         any(target_feature = "avxvnni", target_feature = "avx512vnni")
     ))]
     { return unsafe { vec_dot_q4_k_q8_k_vnni(n, x, y) }; }
@@ -1455,5 +1587,124 @@ mod tests {
             diff < 0.01,
             "dispatch={dispatch_result}, scalar={scalar_result}"
         );
+    }
+
+    // ── AVX-512 real 512-bit kernel correctness ───────────────────────────────
+
+    #[test]
+    fn avx512_q4k_matches_vnni_single_block() {
+        if !is_x86_feature_detected!("avx512f")
+            || !is_x86_feature_detected!("avx512bw")
+            || !is_x86_feature_detected!("avx512vnni")
+            || !is_x86_feature_detected!("avx512dq")
+        {
+            return;
+        }
+
+        for b in 0..8u8 {
+            let blk = BlockQ4K {
+                d: f32_to_f16(0.1 + 0.02 * b as f32),
+                dmin: f32_to_f16(0.01 * b as f32),
+                scales: std::array::from_fn(|i| (b.wrapping_add(i as u8 * 3)) & 63),
+                qs: std::array::from_fn(|i| {
+                    let lo = b.wrapping_add(i as u8) & 0x0F;
+                    let hi = b.wrapping_add(i as u8).wrapping_mul(7) & 0x0F;
+                    lo | (hi << 4)
+                }),
+            };
+            let act: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
+            let mut act_q8k = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+            super::super::quantize::quantize_row_q8_k(&act, &mut act_q8k);
+
+            let vnni = unsafe { vec_dot_q4_k_q8_k_vnni(256, &[blk], &act_q8k) };
+            let avx512 = unsafe { vec_dot_q4_k_q8_k_avx512(256, &[blk], &act_q8k) };
+
+            let rel = if vnni.abs() > 0.01 {
+                ((vnni - avx512) / vnni).abs()
+            } else {
+                (vnni - avx512).abs()
+            };
+            assert!(
+                rel < 1e-4,
+                "block {b}: vnni={vnni}, avx512={avx512}, rel_err={rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn avx512_q4k_matches_vnni_multiblock() {
+        if !is_x86_feature_detected!("avx512f")
+            || !is_x86_feature_detected!("avx512bw")
+            || !is_x86_feature_detected!("avx512vnni")
+            || !is_x86_feature_detected!("avx512dq")
+        {
+            return;
+        }
+
+        let blocks: Vec<BlockQ4K> = (0..8)
+            .map(|b| BlockQ4K {
+                d: f32_to_f16(0.05 + 0.03 * b as f32),
+                dmin: f32_to_f16(0.02 * b as f32),
+                scales: std::array::from_fn(|i| {
+                    (b as u8).wrapping_add(i as u8).wrapping_mul(11) & 63
+                }),
+                qs: std::array::from_fn(|i| {
+                    let lo = (b as u8).wrapping_add(i as u8).wrapping_mul(3) & 0x0F;
+                    let hi = (b as u8).wrapping_add(i as u8).wrapping_mul(13) & 0x0F;
+                    lo | (hi << 4)
+                }),
+            })
+            .collect();
+        let act: Vec<f32> = (0..2048).map(|i| (i as f32 - 1024.0) / 1024.0).collect();
+        let mut act_q8k: Vec<BlockQ8K> = (0..8)
+            .map(|_| BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] })
+            .collect();
+        super::super::quantize::quantize_row_q8_k(&act, &mut act_q8k);
+
+        let vnni = unsafe { vec_dot_q4_k_q8_k_vnni(2048, &blocks, &act_q8k) };
+        let avx512 = unsafe { vec_dot_q4_k_q8_k_avx512(2048, &blocks, &act_q8k) };
+
+        let rel = if vnni.abs() > 0.01 {
+            ((vnni - avx512) / vnni).abs()
+        } else {
+            (vnni - avx512).abs()
+        };
+        assert!(
+            rel < 1e-4,
+            "multiblock: vnni={vnni}, avx512={avx512}, rel_err={rel}"
+        );
+    }
+
+    #[test]
+    fn avx512_q4k_dispatch_selects_512bit() {
+        // Verify that when avx512 features are available the dispatch reaches the
+        // 512-bit kernel (same result as vnni, which is already validated above).
+        if !is_x86_feature_detected!("avx512f")
+            || !is_x86_feature_detected!("avx512bw")
+            || !is_x86_feature_detected!("avx512vnni")
+            || !is_x86_feature_detected!("avx512dq")
+        {
+            return;
+        }
+
+        let blk = BlockQ4K {
+            d: f32_to_f16(0.25),
+            dmin: f32_to_f16(0.05),
+            scales: std::array::from_fn(|i| (i as u8 * 5 + 3) & 63),
+            qs: std::array::from_fn(|i| {
+                let lo = (i as u8).wrapping_mul(3) & 0x0F;
+                let hi = (i as u8).wrapping_mul(7) & 0x0F;
+                lo | (hi << 4)
+            }),
+        };
+        let act: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
+        let mut act_q8k = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        super::super::quantize::quantize_row_q8_k(&act, &mut act_q8k);
+
+        let dispatch = vec_dot_q4_k_q8_k_dispatch(256, &[blk], &act_q8k);
+        let avx512 = unsafe { vec_dot_q4_k_q8_k_avx512(256, &[blk], &act_q8k) };
+
+        let diff = (dispatch - avx512).abs();
+        assert!(diff < 1e-5, "dispatch={dispatch}, avx512={avx512}, diff={diff}");
     }
 }
