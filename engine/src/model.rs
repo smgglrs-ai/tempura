@@ -17,12 +17,8 @@ impl F16GemvWorker {
             let mut dot = 0.0f32;
             for i in 0..self.k {
                 let off = base + i * 2;
-                let bits = u16::from_le_bytes([
-                    *self.f16_ptr.add(off),
-                    *self.f16_ptr.add(off + 1),
-                ]);
-                dot += tempura_kernels::ggml::helpers::f16_to_f32(bits)
-                    * *self.a_ptr.add(i);
+                let bits = u16::from_le_bytes([*self.f16_ptr.add(off), *self.f16_ptr.add(off + 1)]);
+                dot += tempura_kernels::ggml::helpers::f16_to_f32(bits) * *self.a_ptr.add(i);
             }
             *self.out_ptr.add(j) = dot;
         }
@@ -1504,11 +1500,15 @@ where
                     tempura_kernels::inference_pool::get().run(n, &gemv);
                 } else {
                     let n_elems = f16_bytes.len() / 2;
-                    let f32_data: Vec<f32> = (0..n_elems).map(|i| {
-                        let bits = u16::from_le_bytes([f16_bytes[i*2], f16_bytes[i*2+1]]);
-                        tempura_kernels::ggml::helpers::f16_to_f32(bits)
-                    }).collect();
-                    self.pipeline.matmul_bt(a_f32, &f32_data, out, m, n, k).unwrap();
+                    let f32_data: Vec<f32> = (0..n_elems)
+                        .map(|i| {
+                            let bits = u16::from_le_bytes([f16_bytes[i * 2], f16_bytes[i * 2 + 1]]);
+                            tempura_kernels::ggml::helpers::f16_to_f32(bits)
+                        })
+                        .collect();
+                    self.pipeline
+                        .matmul_bt(a_f32, &f32_data, out, m, n, k)
+                        .unwrap();
                 }
                 return;
             }
@@ -1521,7 +1521,8 @@ where
                         return;
                     }
                 }
-                q4k.forward_b_transposed_q4k(a_f32, w, out, m, n, k).unwrap();
+                q4k.forward_b_transposed_q4k(a_f32, w, out, m, n, k)
+                    .unwrap();
                 return;
             }
             if let Some(w) = qweights.get_q6k(name) {
@@ -1531,7 +1532,8 @@ where
                         return;
                     }
                 }
-                q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k).unwrap();
+                q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k)
+                    .unwrap();
                 return;
             }
             // f32 fallback
@@ -2209,10 +2211,17 @@ where
                         // Q+K (Q4K) + V (F16) in a single Rayon region — eliminates 1 barrier
                         q4k.fused_q4k_2_f16_1_preq(
                             pq,
-                            qw, &mut q[..q_dim], q_dim,
-                            kw, &mut k[..kv_dim], kv_dim,
-                            vf16, &mut v[..kv_dim], kv_dim,
-                            h, &normed[..h],
+                            qw,
+                            &mut q[..q_dim],
+                            q_dim,
+                            kw,
+                            &mut k[..kv_dim],
+                            kv_dim,
+                            vf16,
+                            &mut v[..kv_dim],
+                            kv_dim,
+                            h,
+                            &normed[..h],
                         );
                     } else if let (Some(pq), Some(qw), Some(kw)) = (
                         normed_preq.as_ref(),

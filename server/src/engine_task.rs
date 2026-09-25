@@ -77,15 +77,11 @@ fn parse_ccd_cores_env() -> (usize, Option<Vec<usize>>) {
     let available = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    match std::env::var("TEMPURA_CCD_CORES")
-        .ok()
-        .as_deref()
-    {
+    match std::env::var("TEMPURA_CCD_CORES").ok().as_deref() {
         Some(s) => {
             let parts: Vec<&str> = s.splitn(2, '-').collect();
             if parts.len() == 2 {
-                if let (Ok(start), Ok(end)) =
-                    (parts[0].parse::<usize>(), parts[1].parse::<usize>())
+                if let (Ok(start), Ok(end)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>())
                 {
                     let cores: Vec<usize> = (start..=end).collect();
                     let n = cores.len();

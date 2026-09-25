@@ -80,7 +80,13 @@ pub fn shared_server_url() -> String {
             c.args(["run", "--quiet", "--package", "tempura-serve", "--"]);
             c
         };
-        cmd.args(["serve", "--port", &port.to_string(), "--model-config", "tiny-test"]);
+        cmd.args([
+            "serve",
+            "--port",
+            &port.to_string(),
+            "--model-config",
+            "tiny-test",
+        ]);
         let child = cmd.spawn().expect("failed to spawn tempura-serve");
         std::mem::forget(child);
         for _ in 0..150 {
@@ -249,7 +255,11 @@ mod tests {
             .await
             .unwrap();
         // 200 with tokenizer, 4xx without tokenizer, 5xx if server error — all valid for stub
-        assert!(r1.status().is_success() || r1.status().is_client_error() || r1.status().is_server_error());
+        assert!(
+            r1.status().is_success()
+                || r1.status().is_client_error()
+                || r1.status().is_server_error()
+        );
         if r1.status().is_success() {
             let body: serde_json::Value = r1.json().await.unwrap();
             let tokens = body["tokens"].as_array().unwrap().clone();
@@ -317,8 +327,15 @@ mod tests {
             "stream": false
         });
         let client = reqwest::Client::new();
-        let r1 = client.post(format!("{url}/v1/chat/completions")).json(&req).send().await.unwrap();
-        if r1.status() == 503 { return; } // no model loaded
+        let r1 = client
+            .post(format!("{url}/v1/chat/completions"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        if r1.status() == 503 {
+            return;
+        } // no model loaded
         let r1: serde_json::Value = r1.json().await.unwrap();
         let r2: serde_json::Value = client
             .post(format!("{url}/v1/chat/completions"))

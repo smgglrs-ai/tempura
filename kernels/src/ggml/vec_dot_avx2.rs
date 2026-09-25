@@ -221,7 +221,9 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx2(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
             );
             let scale_h = _mm256_shuffle_epi8(
                 scales,
-                _mm256_loadu_si256(K_SHUFFLE_Q4K.get_unchecked(2 * j + 1).as_ptr() as *const __m256i),
+                _mm256_loadu_si256(
+                    K_SHUFFLE_Q4K.get_unchecked(2 * j + 1).as_ptr() as *const __m256i
+                ),
             );
 
             // load 32 Q4 bytes, extract low/high nibbles
@@ -497,7 +499,10 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
         // SIMD mins accumulation: sum_{j=0..15} bsums[j] * mn[j/2]
         // hadd pairs bsums 16→8, madd dot with 8 mins → 4 i32, then hsum.
         let q8sums = _mm256_loadu_si256(yi.bsums.as_ptr() as *const __m256i);
-        let q8s = _mm_hadd_epi16(_mm256_castsi256_si128(q8sums), _mm256_extracti128_si256(q8sums, 1));
+        let q8s = _mm_hadd_epi16(
+            _mm256_castsi256_si128(q8sums),
+            _mm256_extracti128_si256(q8sums, 1),
+        );
         let mins_128 = _mm_set_epi32(0, 0, utmp[3] as i32, utmp[2] as i32);
         let mins_i16 = _mm_cvtepu8_epi16(mins_128);
         let prod = _mm_madd_epi16(mins_i16, q8s);
@@ -590,7 +595,10 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni_pair(
 
         // Shared bsums hadd — computed ONCE for both rows.
         let q8sums = _mm256_loadu_si256(yi.bsums.as_ptr() as *const __m256i);
-        let q8s = _mm_hadd_epi16(_mm256_castsi256_si128(q8sums), _mm256_extracti128_si256(q8sums, 1));
+        let q8s = _mm_hadd_epi16(
+            _mm256_castsi256_si128(q8sums),
+            _mm256_extracti128_si256(q8sums, 1),
+        );
 
         let d0 = f16_to_f32(x0i.d) * d_y;
         let dmin0 = f16_to_f32(x0i.dmin) * d_y;
@@ -657,7 +665,10 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni_pair(
         acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(sumi1), acc1);
     }
 
-    (hsum_f32_8(acc0) - mins_total0, hsum_f32_8(acc1) - mins_total1)
+    (
+        hsum_f32_8(acc0) - mins_total0,
+        hsum_f32_8(acc1) - mins_total1,
+    )
 }
 
 /// Dispatch pair dot product — uses VNNI when available, falls back to two scalar calls.
@@ -670,7 +681,9 @@ pub fn vec_dot_q4_k_q8_k_dispatch_pair(
     y: &[BlockQ8K],
 ) -> (f32, f32) {
     #[cfg(any(target_feature = "avxvnni", target_feature = "avx512vnni"))]
-    { return unsafe { vec_dot_q4_k_q8_k_vnni_pair(n, x0, x1, y) }; }
+    {
+        return unsafe { vec_dot_q4_k_q8_k_vnni_pair(n, x0, x1, y) };
+    }
     (
         vec_dot_q4_k_q8_k_dispatch(n, x0, y),
         vec_dot_q4_k_q8_k_dispatch(n, x1, y),
@@ -840,7 +853,9 @@ pub fn vec_dot_q4k_q8k_dispatch_4x2(
     a3: &[BlockQ8K],
 ) -> [[f32; 2]; 4] {
     #[cfg(any(target_feature = "avxvnni", target_feature = "avx512vnni"))]
-    { return unsafe { vec_dot_q4k_q8k_4x2_vnni(n, w0, w1, a0, a1, a2, a3) }; }
+    {
+        return unsafe { vec_dot_q4k_q8k_4x2_vnni(n, w0, w1, a0, a1, a2, a3) };
+    }
     let p0 = vec_dot_q4_k_q8_k_dispatch_pair(n, w0, w1, a0);
     let p1 = vec_dot_q4_k_q8_k_dispatch_pair(n, w0, w1, a1);
     let p2 = vec_dot_q4_k_q8_k_dispatch_pair(n, w0, w1, a2);
@@ -968,7 +983,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K])
         // Q8K sub-block j=0: lo = yi.qs[0..31], hi = yi.qs[32..63].
         // Q8K sub-block j=1: lo = yi.qs[64..95], hi = yi.qs[96..127].
         // Build [j0_lo | j1_lo] and [j0_hi | j1_hi] for aligned 512-bit dpbusd.
-        let j0_lo = _mm256_loadu_si256(q8.add(0)  as *const __m256i);
+        let j0_lo = _mm256_loadu_si256(q8.add(0) as *const __m256i);
         let j0_hi = _mm256_loadu_si256(q8.add(32) as *const __m256i);
         let j1_lo = _mm256_loadu_si256(q8.add(64) as *const __m256i);
         let j1_hi = _mm256_loadu_si256(q8.add(96) as *const __m256i);
@@ -1025,14 +1040,18 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K])
 #[allow(unreachable_code)]
 pub fn vec_dot_q4_0_q8_0_dispatch(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
     #[cfg(all(target_feature = "avx2", target_feature = "fma"))]
-    { return unsafe { vec_dot_q4_0_q8_0_avx2(n, x, y) }; }
+    {
+        return unsafe { vec_dot_q4_0_q8_0_avx2(n, x, y) };
+    }
     super::vec_dot::vec_dot_q4_0_q8_0(n, x, y)
 }
 
 #[allow(unreachable_code)]
 pub fn vec_dot_q8_0_q8_0_dispatch(n: usize, x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
     #[cfg(all(target_feature = "avx2", target_feature = "fma"))]
-    { return unsafe { vec_dot_q8_0_q8_0_avx2(n, x, y) }; }
+    {
+        return unsafe { vec_dot_q8_0_q8_0_avx2(n, x, y) };
+    }
     super::vec_dot::vec_dot_q8_0_q8_0(n, x, y)
 }
 
@@ -1045,7 +1064,9 @@ pub fn vec_dot_q4_k_q8_k_dispatch(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f
         target_feature = "avx512vnni",
         target_feature = "avx512dq"
     ))]
-    { return unsafe { vec_dot_q4_k_q8_k_avx512(n, x, y) }; }
+    {
+        return unsafe { vec_dot_q4_k_q8_k_avx512(n, x, y) };
+    }
     #[cfg(all(
         not(all(
             target_feature = "avx512f",
@@ -1055,12 +1076,16 @@ pub fn vec_dot_q4_k_q8_k_dispatch(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f
         )),
         any(target_feature = "avxvnni", target_feature = "avx512vnni")
     ))]
-    { return unsafe { vec_dot_q4_k_q8_k_vnni(n, x, y) }; }
+    {
+        return unsafe { vec_dot_q4_k_q8_k_vnni(n, x, y) };
+    }
     #[cfg(all(
         not(any(target_feature = "avxvnni", target_feature = "avx512vnni")),
         all(target_feature = "avx2", target_feature = "fma")
     ))]
-    { return unsafe { vec_dot_q4_k_q8_k_avx2(n, x, y) }; }
+    {
+        return unsafe { vec_dot_q4_k_q8_k_avx2(n, x, y) };
+    }
     super::vec_dot::vec_dot_q4_k_q8_k(n, x, y)
 }
 
@@ -1074,7 +1099,7 @@ pub unsafe fn vec_dot_q6_k_q8_k_vnni(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -
     // AVX2 masks for vectorized 6-bit dequant.
     let mask_lo4 = _mm256_set1_epi8(0x0F);
     let mask_hi2 = _mm256_set1_epi8(0x03);
-    let bias      = _mm256_set1_epi8(-32i8);
+    let bias = _mm256_set1_epi8(-32i8);
 
     let x_ptr = x.as_ptr();
     let y_ptr = y.as_ptr();
@@ -1083,7 +1108,7 @@ pub unsafe fn vec_dot_q6_k_q8_k_vnni(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -
         // Safety: nb = n/256, x.len() == nb, y.len() == nb
         let xi = &*x_ptr.add(i);
         let yi = &*y_ptr.add(i);
-        let d  = f16_to_f32(xi.d) * yi.d;
+        let d = f16_to_f32(xi.d) * yi.d;
         let ql = xi.ql.as_ptr();
         let qh = xi.qh.as_ptr();
         let sc = xi.scales.as_ptr();
@@ -1099,36 +1124,43 @@ pub unsafe fn vec_dot_q6_k_q8_k_vnni(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -
             let qh_off = half * 32;
             let a_base = half * 4;
 
-            let qll = _mm256_loadu_si256(ql.add(ql_off)      as *const __m256i);
+            let qll = _mm256_loadu_si256(ql.add(ql_off) as *const __m256i);
             let qlh = _mm256_loadu_si256(ql.add(ql_off + 32) as *const __m256i);
-            let qhv = _mm256_loadu_si256(qh.add(qh_off)      as *const __m256i);
+            let qhv = _mm256_loadu_si256(qh.add(qh_off) as *const __m256i);
 
-            let h0 = _mm256_slli_epi16(_mm256_and_si256(qhv,                                    mask_hi2), 4);
+            let h0 = _mm256_slli_epi16(_mm256_and_si256(qhv, mask_hi2), 4);
             let h1 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 2), mask_hi2), 4);
             let h2 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 4), mask_hi2), 4);
             let h3 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 6), mask_hi2), 4);
 
-            a[a_base]     = _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(qll,                         mask_lo4), h0), bias);
-            a[a_base + 1] = _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(qlh,                         mask_lo4), h1), bias);
-            a[a_base + 2] = _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qll, 4), mask_lo4), h2), bias);
-            a[a_base + 3] = _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qlh, 4), mask_lo4), h3), bias);
+            a[a_base] = _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(qll, mask_lo4), h0), bias);
+            a[a_base + 1] =
+                _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(qlh, mask_lo4), h1), bias);
+            a[a_base + 2] = _mm256_add_epi8(
+                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qll, 4), mask_lo4), h2),
+                bias,
+            );
+            a[a_base + 3] = _mm256_add_epi8(
+                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qlh, 4), mask_lo4), h3),
+                bias,
+            );
         }
 
         // 8-iteration full 256-bit VNNI: each pass covers 32 elements (2 scale groups of 16).
         // Lower 128 bits of dot → group j*2, upper 128 bits → group j*2+1.
         let mut sumi = 0i32;
         for j in 0..8usize {
-            let sc0 = *sc.add(j * 2)     as i32;
+            let sc0 = *sc.add(j * 2) as i32;
             let sc1 = *sc.add(j * 2 + 1) as i32;
-            let ax  = a[j];
+            let ax = a[j];
             let q8v = _mm256_loadu_si256(q8.add(j * 32) as *const __m256i);
 
-            let abs_ax    = _mm256_sign_epi8(ax, ax);
+            let abs_ax = _mm256_sign_epi8(ax, ax);
             let signed_q8 = _mm256_sign_epi8(q8v, ax);
             let dot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), abs_ax, signed_q8);
 
-            sumi += hsum_i32_4(_mm256_castsi256_si128(dot))        * sc0
-                  + hsum_i32_4(_mm256_extracti128_si256(dot, 1))   * sc1;
+            sumi += hsum_i32_4(_mm256_castsi256_si128(dot)) * sc0
+                + hsum_i32_4(_mm256_extracti128_si256(dot, 1)) * sc1;
         }
 
         sum += d * sumi as f32;
@@ -1151,17 +1183,17 @@ pub unsafe fn vec_dot_q6_k_q8_k_vnni_pair(
 
     let mask_lo4 = _mm256_set1_epi8(0x0F);
     let mask_hi2 = _mm256_set1_epi8(0x03);
-    let bias      = _mm256_set1_epi8(-32i8);
+    let bias = _mm256_set1_epi8(-32i8);
 
     let x0_ptr = x0.as_ptr();
     let x1_ptr = x1.as_ptr();
-    let y_ptr  = y.as_ptr();
+    let y_ptr = y.as_ptr();
 
     for i in 0..nb {
         // Safety: nb = n/256, all slices have len == nb
         let xi0 = &*x0_ptr.add(i);
         let xi1 = &*x1_ptr.add(i);
-        let yi  = &*y_ptr.add(i);
+        let yi = &*y_ptr.add(i);
 
         let d0 = f16_to_f32(xi0.d) * yi.d;
         let d1 = f16_to_f32(xi1.d) * yi.d;
@@ -1177,34 +1209,56 @@ pub unsafe fn vec_dot_q6_k_q8_k_vnni_pair(
             let a_base = half * 4;
 
             {
-                let qll = _mm256_loadu_si256(xi0.ql.as_ptr().add(ql_off)      as *const __m256i);
+                let qll = _mm256_loadu_si256(xi0.ql.as_ptr().add(ql_off) as *const __m256i);
                 let qlh = _mm256_loadu_si256(xi0.ql.as_ptr().add(ql_off + 32) as *const __m256i);
-                let qhv = _mm256_loadu_si256(xi0.qh.as_ptr().add(qh_off)      as *const __m256i);
+                let qhv = _mm256_loadu_si256(xi0.qh.as_ptr().add(qh_off) as *const __m256i);
 
-                let h0 = _mm256_slli_epi16(_mm256_and_si256(qhv,                                    mask_hi2), 4);
-                let h1 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 2), mask_hi2), 4);
-                let h2 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 4), mask_hi2), 4);
-                let h3 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 6), mask_hi2), 4);
+                let h0 = _mm256_slli_epi16(_mm256_and_si256(qhv, mask_hi2), 4);
+                let h1 =
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 2), mask_hi2), 4);
+                let h2 =
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 4), mask_hi2), 4);
+                let h3 =
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 6), mask_hi2), 4);
 
-                a0[a_base]     = _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(qll,                         mask_lo4), h0), bias);
-                a0[a_base + 1] = _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(qlh,                         mask_lo4), h1), bias);
-                a0[a_base + 2] = _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qll, 4), mask_lo4), h2), bias);
-                a0[a_base + 3] = _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qlh, 4), mask_lo4), h3), bias);
+                a0[a_base] =
+                    _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(qll, mask_lo4), h0), bias);
+                a0[a_base + 1] =
+                    _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(qlh, mask_lo4), h1), bias);
+                a0[a_base + 2] = _mm256_add_epi8(
+                    _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qll, 4), mask_lo4), h2),
+                    bias,
+                );
+                a0[a_base + 3] = _mm256_add_epi8(
+                    _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qlh, 4), mask_lo4), h3),
+                    bias,
+                );
             }
             {
-                let qll = _mm256_loadu_si256(xi1.ql.as_ptr().add(ql_off)      as *const __m256i);
+                let qll = _mm256_loadu_si256(xi1.ql.as_ptr().add(ql_off) as *const __m256i);
                 let qlh = _mm256_loadu_si256(xi1.ql.as_ptr().add(ql_off + 32) as *const __m256i);
-                let qhv = _mm256_loadu_si256(xi1.qh.as_ptr().add(qh_off)      as *const __m256i);
+                let qhv = _mm256_loadu_si256(xi1.qh.as_ptr().add(qh_off) as *const __m256i);
 
-                let h0 = _mm256_slli_epi16(_mm256_and_si256(qhv,                                    mask_hi2), 4);
-                let h1 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 2), mask_hi2), 4);
-                let h2 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 4), mask_hi2), 4);
-                let h3 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 6), mask_hi2), 4);
+                let h0 = _mm256_slli_epi16(_mm256_and_si256(qhv, mask_hi2), 4);
+                let h1 =
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 2), mask_hi2), 4);
+                let h2 =
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 4), mask_hi2), 4);
+                let h3 =
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 6), mask_hi2), 4);
 
-                a1[a_base]     = _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(qll,                         mask_lo4), h0), bias);
-                a1[a_base + 1] = _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(qlh,                         mask_lo4), h1), bias);
-                a1[a_base + 2] = _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qll, 4), mask_lo4), h2), bias);
-                a1[a_base + 3] = _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qlh, 4), mask_lo4), h3), bias);
+                a1[a_base] =
+                    _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(qll, mask_lo4), h0), bias);
+                a1[a_base + 1] =
+                    _mm256_add_epi8(_mm256_or_si256(_mm256_and_si256(qlh, mask_lo4), h1), bias);
+                a1[a_base + 2] = _mm256_add_epi8(
+                    _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qll, 4), mask_lo4), h2),
+                    bias,
+                );
+                a1[a_base + 3] = _mm256_add_epi8(
+                    _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qlh, 4), mask_lo4), h3),
+                    bias,
+                );
             }
         }
 
@@ -1214,26 +1268,26 @@ pub unsafe fn vec_dot_q6_k_q8_k_vnni_pair(
         let mut sumi1 = 0i32;
 
         for j in 0..8usize {
-            let sc0_lo = *sc0.add(j * 2)     as i32;
+            let sc0_lo = *sc0.add(j * 2) as i32;
             let sc0_hi = *sc0.add(j * 2 + 1) as i32;
-            let sc1_lo = *sc1.add(j * 2)     as i32;
+            let sc1_lo = *sc1.add(j * 2) as i32;
             let sc1_hi = *sc1.add(j * 2 + 1) as i32;
 
             // Load Q8K once per j-pair, shared across both weight rows.
             let q8v = _mm256_loadu_si256(q8.add(j * 32) as *const __m256i);
 
             let abs0 = _mm256_sign_epi8(a0[j], a0[j]);
-            let sq0  = _mm256_sign_epi8(q8v, a0[j]);
+            let sq0 = _mm256_sign_epi8(q8v, a0[j]);
             let dot0 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), abs0, sq0);
 
             let abs1 = _mm256_sign_epi8(a1[j], a1[j]);
-            let sq1  = _mm256_sign_epi8(q8v, a1[j]);
+            let sq1 = _mm256_sign_epi8(q8v, a1[j]);
             let dot1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), abs1, sq1);
 
-            sumi0 += hsum_i32_4(_mm256_castsi256_si128(dot0))       * sc0_lo
-                   + hsum_i32_4(_mm256_extracti128_si256(dot0, 1))  * sc0_hi;
-            sumi1 += hsum_i32_4(_mm256_castsi256_si128(dot1))       * sc1_lo
-                   + hsum_i32_4(_mm256_extracti128_si256(dot1, 1))  * sc1_hi;
+            sumi0 += hsum_i32_4(_mm256_castsi256_si128(dot0)) * sc0_lo
+                + hsum_i32_4(_mm256_extracti128_si256(dot0, 1)) * sc0_hi;
+            sumi1 += hsum_i32_4(_mm256_castsi256_si128(dot1)) * sc1_lo
+                + hsum_i32_4(_mm256_extracti128_si256(dot1, 1)) * sc1_hi;
         }
 
         sum0 += d0 * sumi0 as f32;
@@ -1247,12 +1301,16 @@ pub unsafe fn vec_dot_q6_k_q8_k_vnni_pair(
 #[allow(unreachable_code)]
 pub fn vec_dot_q6_k_q8_k_dispatch(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -> f32 {
     #[cfg(any(target_feature = "avxvnni", target_feature = "avx512vnni"))]
-    { return unsafe { vec_dot_q6_k_q8_k_vnni(n, x, y) }; }
+    {
+        return unsafe { vec_dot_q6_k_q8_k_vnni(n, x, y) };
+    }
     #[cfg(all(
         not(any(target_feature = "avxvnni", target_feature = "avx512vnni")),
         all(target_feature = "avx2", target_feature = "fma")
     ))]
-    { return unsafe { vec_dot_q6_k_q8_k_avx2(n, x, y) }; }
+    {
+        return unsafe { vec_dot_q6_k_q8_k_avx2(n, x, y) };
+    }
     super::vec_dot::vec_dot_q6_k_q8_k(n, x, y)
 }
 
@@ -1265,7 +1323,9 @@ pub fn vec_dot_q6_k_q8_k_dispatch_pair(
     y: &[BlockQ8K],
 ) -> (f32, f32) {
     #[cfg(any(target_feature = "avxvnni", target_feature = "avx512vnni"))]
-    { return unsafe { vec_dot_q6_k_q8_k_vnni_pair(n, x0, x1, y) }; }
+    {
+        return unsafe { vec_dot_q6_k_q8_k_vnni_pair(n, x0, x1, y) };
+    }
     (
         vec_dot_q6_k_q8_k_dispatch(n, x0, y),
         vec_dot_q6_k_q8_k_dispatch(n, x1, y),
@@ -1613,7 +1673,11 @@ mod tests {
                 }),
             };
             let act: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
-            let mut act_q8k = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+            let mut act_q8k = vec![BlockQ8K {
+                d: 0.0,
+                qs: [0i8; 256],
+                bsums: [0i16; 16],
+            }];
             super::super::quantize::quantize_row_q8_k(&act, &mut act_q8k);
 
             let vnni = unsafe { vec_dot_q4_k_q8_k_vnni(256, &[blk], &act_q8k) };
@@ -1657,7 +1721,11 @@ mod tests {
             .collect();
         let act: Vec<f32> = (0..2048).map(|i| (i as f32 - 1024.0) / 1024.0).collect();
         let mut act_q8k: Vec<BlockQ8K> = (0..8)
-            .map(|_| BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] })
+            .map(|_| BlockQ8K {
+                d: 0.0,
+                qs: [0i8; 256],
+                bsums: [0i16; 16],
+            })
             .collect();
         super::super::quantize::quantize_row_q8_k(&act, &mut act_q8k);
 
@@ -1698,13 +1766,20 @@ mod tests {
             }),
         };
         let act: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
-        let mut act_q8k = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+        let mut act_q8k = vec![BlockQ8K {
+            d: 0.0,
+            qs: [0i8; 256],
+            bsums: [0i16; 16],
+        }];
         super::super::quantize::quantize_row_q8_k(&act, &mut act_q8k);
 
         let dispatch = vec_dot_q4_k_q8_k_dispatch(256, &[blk], &act_q8k);
         let avx512 = unsafe { vec_dot_q4_k_q8_k_avx512(256, &[blk], &act_q8k) };
 
         let diff = (dispatch - avx512).abs();
-        assert!(diff < 1e-5, "dispatch={dispatch}, avx512={avx512}, diff={diff}");
+        assert!(
+            diff < 1e-5,
+            "dispatch={dispatch}, avx512={avx512}, diff={diff}"
+        );
     }
 }

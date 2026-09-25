@@ -58,10 +58,8 @@ pub mod openmp {
         blocks_per_row: usize,
     ) -> f32 {
         let k = blocks_per_row * 256;
-        let x: &[BlockQ4K] = std::slice::from_raw_parts(
-            weight_row as *const BlockQ4K,
-            blocks_per_row,
-        );
+        let x: &[BlockQ4K] =
+            std::slice::from_raw_parts(weight_row as *const BlockQ4K, blocks_per_row);
         let y: &[BlockQ8K] = std::slice::from_raw_parts(q8k, blocks_per_row);
         crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(k, x, y)
     }
@@ -72,10 +70,8 @@ pub mod openmp {
         blocks_per_row: usize,
     ) -> f32 {
         let k = blocks_per_row * 256;
-        let x: &[BlockQ6K] = std::slice::from_raw_parts(
-            weight_row as *const BlockQ6K,
-            blocks_per_row,
-        );
+        let x: &[BlockQ6K] =
+            std::slice::from_raw_parts(weight_row as *const BlockQ6K, blocks_per_row);
         let y: &[BlockQ8K] = std::slice::from_raw_parts(q8k, blocks_per_row);
         crate::ggml::vec_dot_avx2::vec_dot_q6_k_q8_k_dispatch(k, x, y)
     }

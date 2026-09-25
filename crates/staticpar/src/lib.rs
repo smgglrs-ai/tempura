@@ -5,16 +5,16 @@ use std::thread::JoinHandle;
 struct Inner {
     // Condvar-based wake: workers park until gen changes.
     // Zero memory-bus pressure when idle — no polling.
-    mutex:     Mutex<u64>,
-    condvar:   Condvar,
-    done:      AtomicUsize,
-    shutdown:  AtomicBool,
+    mutex: Mutex<u64>,
+    condvar: Condvar,
+    done: AtomicUsize,
+    shutdown: AtomicBool,
     // Per-worker pre-assigned ranges, packed as (start << 32) | end.
     // Written before Mutex release (which is the Release fence);
     // read after Condvar wake (which implies the Acquire).
-    ranges:  Box<[u64]>,
-    fn_ptr:  AtomicU64,
-    ctx:     AtomicU64,
+    ranges: Box<[u64]>,
+    fn_ptr: AtomicU64,
+    ctx: AtomicU64,
 }
 
 /// Static-partition thread pool with Condvar park/wake.
@@ -30,7 +30,7 @@ struct Inner {
 /// Designed for repeated short embarrassingly-parallel workloads where
 /// thread count equals core count (GEMV, matrix rows, etc.).
 pub struct StaticPool {
-    inner:    Arc<Inner>,
+    inner: Arc<Inner>,
     n_workers: usize,
     _threads: Vec<JoinHandle<()>>,
 }
@@ -39,13 +39,13 @@ impl StaticPool {
     pub fn new(n_workers: usize) -> Self {
         let ranges: Box<[u64]> = vec![0u64; n_workers].into_boxed_slice();
         let inner = Arc::new(Inner {
-            mutex:    Mutex::new(0u64),
-            condvar:  Condvar::new(),
-            done:     AtomicUsize::new(0),
+            mutex: Mutex::new(0u64),
+            condvar: Condvar::new(),
+            done: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             ranges,
-            fn_ptr:   AtomicU64::new(0),
-            ctx:      AtomicU64::new(0),
+            fn_ptr: AtomicU64::new(0),
+            ctx: AtomicU64::new(0),
         });
 
         let mut threads = Vec::with_capacity(n_workers);
@@ -59,7 +59,11 @@ impl StaticPool {
             );
         }
 
-        Self { inner, n_workers, _threads: threads }
+        Self {
+            inner,
+            n_workers,
+            _threads: threads,
+        }
     }
 
     /// Number of worker threads (excluding the calling thread).
@@ -71,11 +75,11 @@ impl StaticPool {
     /// The calling thread participates (handles one partition).
     /// Blocks until all worker threads complete their partitions.
     pub fn run<F: Fn(usize, usize) + Sync>(&self, n: usize, f: &F) {
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
 
-        unsafe fn trampoline<F: Fn(usize, usize)>(
-            start: usize, end: usize, ctx: *const (),
-        ) {
+        unsafe fn trampoline<F: Fn(usize, usize)>(start: usize, end: usize, ctx: *const ()) {
             (*{ ctx as *const F })(start, end)
         }
 
@@ -94,12 +98,14 @@ impl StaticPool {
         func: unsafe fn(usize, usize, *const ()),
         ctx: *const (),
     ) {
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
         let inner = &self.inner;
         let total = self.n_workers + 1; // +1 = calling thread
 
         let base = n / total;
-        let rem  = n % total;
+        let rem = n % total;
 
         // Pre-compute worker ranges.
         // Safety: ranges is exclusively owned by run_raw (no concurrent run_raw
@@ -107,15 +113,19 @@ impl StaticPool {
         // lock below provides the Release fence.
         for k in 0..self.n_workers {
             let start = k * base + k.min(rem);
-            let end   = start + base + usize::from(k < rem);
-            unsafe { *inner.ranges.as_ptr().cast_mut().add(k) = (start as u64) << 32 | end as u64; }
+            let end = start + base + usize::from(k < rem);
+            unsafe {
+                *inner.ranges.as_ptr().cast_mut().add(k) = (start as u64) << 32 | end as u64;
+            }
         }
 
         // Calling thread's partition (last slice).
         let caller_start = self.n_workers * base + self.n_workers.min(rem);
-        let caller_end   = n;
+        let caller_end = n;
 
-        inner.fn_ptr.store(func as *const () as usize as u64, Ordering::Relaxed);
+        inner
+            .fn_ptr
+            .store(func as *const () as usize as u64, Ordering::Relaxed);
         inner.ctx.store(ctx as usize as u64, Ordering::Relaxed);
         inner.done.store(0, Ordering::Relaxed);
 
@@ -162,22 +172,27 @@ fn worker_loop(worker_idx: usize, inner: Arc<Inner>) {
         let current_gen = {
             let guard = inner.mutex.lock().unwrap();
             // wait_while parks atomically — no busy-polling, zero memory bus pressure.
-            let guard = inner.condvar
-                .wait_while(guard, |gen| !inner.shutdown.load(Ordering::Relaxed) && *gen == last_gen)
+            let guard = inner
+                .condvar
+                .wait_while(guard, |gen| {
+                    !inner.shutdown.load(Ordering::Relaxed) && *gen == last_gen
+                })
                 .unwrap();
             *guard
         };
-        if inner.shutdown.load(Ordering::Relaxed) { return; }
+        if inner.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
         last_gen = current_gen;
 
         // Read our pre-assigned range. The mutex unlock above (from Condvar::wait_while)
         // provides the Acquire barrier, ensuring we see the range written before notify_all.
         let packed = unsafe { *inner.ranges.as_ptr().add(worker_idx) };
         let start = (packed >> 32) as usize;
-        let end   = (packed & 0xFFFF_FFFF) as usize;
+        let end = (packed & 0xFFFF_FFFF) as usize;
 
         if start < end {
-            let fn_raw  = inner.fn_ptr.load(Ordering::Relaxed);
+            let fn_raw = inner.fn_ptr.load(Ordering::Relaxed);
             let ctx_raw = inner.ctx.load(Ordering::Relaxed);
             type WorkFn = unsafe fn(usize, usize, *const ());
             let f: WorkFn = unsafe { std::mem::transmute(fn_raw as usize) };
@@ -198,7 +213,8 @@ mod tests {
     fn test_sum_is_correct() {
         let pool = StaticPool::new(4);
         let n = 1024usize;
-        let sums: Arc<Vec<AtomicI64>> = Arc::new((0..n).map(|i| AtomicI64::new(i as i64)).collect());
+        let sums: Arc<Vec<AtomicI64>> =
+            Arc::new((0..n).map(|i| AtomicI64::new(i as i64)).collect());
         let sums2 = Arc::clone(&sums);
         pool.run(n, &|start, end| {
             for i in start..end {
@@ -222,8 +238,12 @@ mod tests {
             }
         });
         for (i, c) in counts.iter().enumerate() {
-            assert_eq!(c.load(Ordering::Relaxed), 1,
-                "item {i} processed {} times", c.load(Ordering::Relaxed));
+            assert_eq!(
+                c.load(Ordering::Relaxed),
+                1,
+                "item {i} processed {} times",
+                c.load(Ordering::Relaxed)
+            );
         }
     }
 
@@ -240,7 +260,9 @@ mod tests {
         let counts: Arc<Vec<AtomicI64>> = Arc::new((0..n).map(|_| AtomicI64::new(0)).collect());
         let c2 = Arc::clone(&counts);
         pool.run(n, &|start, end| {
-            for i in start..end { c2[i].fetch_add(1, Ordering::Relaxed); }
+            for i in start..end {
+                c2[i].fetch_add(1, Ordering::Relaxed);
+            }
         });
         assert!(counts.iter().all(|v| v.load(Ordering::Relaxed) == 1));
     }

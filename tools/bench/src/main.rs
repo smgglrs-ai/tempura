@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
-#[command(name = "tempura-bench", about = "Throughput benchmark for tempura server")]
+#[command(
+    name = "tempura-bench",
+    about = "Throughput benchmark for tempura server"
+)]
 struct Args {
     #[arg(long, default_value = "http://localhost:8080")]
     host: String,
@@ -82,7 +85,9 @@ struct Message {
 }
 
 fn synthetic_prompt(target_tokens: usize, seed: u64) -> String {
-    let words = ["hello", "world", "foo", "bar", "baz", "qux", "the", "quick", "brown", "fox"];
+    let words = [
+        "hello", "world", "foo", "bar", "baz", "qux", "the", "quick", "brown", "fox",
+    ];
     let chars_needed = (target_tokens as f64 / 0.75) as usize;
     let mut s = String::with_capacity(chars_needed + 32);
     let mut idx = seed as usize % words.len();
@@ -101,11 +106,22 @@ fn stats(values: &[f64]) -> (f64, f64) {
     (mean, variance.sqrt())
 }
 
-async fn bench_pp(client: &Client, host: &str, model: &str, pp: usize, runs: usize, warmup: usize, seed: u64) -> BenchResult {
+async fn bench_pp(
+    client: &Client,
+    host: &str,
+    model: &str,
+    pp: usize,
+    runs: usize,
+    warmup: usize,
+    seed: u64,
+) -> BenchResult {
     let prompt = synthetic_prompt(pp, seed);
     let req = ChatRequest {
         model: model.to_string(),
-        messages: vec![Message { role: "user".into(), content: prompt }],
+        messages: vec![Message {
+            role: "user".into(),
+            content: prompt,
+        }],
         max_tokens: 1,
         temperature: 0.0,
         stream: false,
@@ -125,8 +141,15 @@ async fn bench_pp(client: &Client, host: &str, model: &str, pp: usize, runs: usi
                 if i >= warmup {
                     let elapsed_ms = elapsed.as_millis() as u64;
                     let tokens_per_sec = pp as f64 / elapsed.as_secs_f64();
-                    eprintln!("  pp={pp} run {}/{runs}: {tokens_per_sec:.1} tok/s", i - warmup + 1);
-                    all_runs.push(RunResult { tokens_per_sec, elapsed_ms, tokens: pp });
+                    eprintln!(
+                        "  pp={pp} run {}/{runs}: {tokens_per_sec:.1} tok/s",
+                        i - warmup + 1
+                    );
+                    all_runs.push(RunResult {
+                        tokens_per_sec,
+                        elapsed_ms,
+                        tokens: pp,
+                    });
                 }
             }
             Ok(r) => {
@@ -139,11 +162,30 @@ async fn bench_pp(client: &Client, host: &str, model: &str, pp: usize, runs: usi
     }
 
     let tps: Vec<f64> = all_runs.iter().map(|r| r.tokens_per_sec).collect();
-    let (mean, stddev) = if tps.is_empty() { (0.0, 0.0) } else { stats(&tps) };
-    BenchResult { label: format!("pp{pp}"), pp: Some(pp), tg: None, runs: all_runs, mean, stddev }
+    let (mean, stddev) = if tps.is_empty() {
+        (0.0, 0.0)
+    } else {
+        stats(&tps)
+    };
+    BenchResult {
+        label: format!("pp{pp}"),
+        pp: Some(pp),
+        tg: None,
+        runs: all_runs,
+        mean,
+        stddev,
+    }
 }
 
-async fn bench_tg(client: &Client, host: &str, model: &str, tg: usize, runs: usize, warmup: usize, seed: u64) -> BenchResult {
+async fn bench_tg(
+    client: &Client,
+    host: &str,
+    model: &str,
+    tg: usize,
+    runs: usize,
+    warmup: usize,
+    seed: u64,
+) -> BenchResult {
     let req = serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": "Explain quantum computing in simple terms."}],
@@ -179,12 +221,17 @@ async fn bench_tg(client: &Client, host: &str, model: &str, tg: usize, runs: usi
                         let line = buf[..nl].trim().to_string();
                         buf = buf[nl + 1..].to_string();
                         if let Some(data) = line.strip_prefix("data: ") {
-                            if data == "[DONE]" { break; }
+                            if data == "[DONE]" {
+                                break;
+                            }
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                                let content = v["choices"][0]["delta"]["content"].as_str().unwrap_or("");
+                                let content =
+                                    v["choices"][0]["delta"]["content"].as_str().unwrap_or("");
                                 if !content.is_empty() {
                                     let now = Instant::now();
-                                    if first_token.is_none() { first_token = Some(now); }
+                                    if first_token.is_none() {
+                                        first_token = Some(now);
+                                    }
                                     last_token = Some(now);
                                     token_count += 1;
                                 }
@@ -199,7 +246,11 @@ async fn bench_tg(client: &Client, host: &str, model: &str, tg: usize, runs: usi
                         let tokens_per_sec = token_count as f64 / gen_secs;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
                         eprintln!("  tg={tg} run {}/{runs}: {tokens_per_sec:.1} tok/s ({token_count} tokens)", i - warmup + 1);
-                        all_runs.push(RunResult { tokens_per_sec, elapsed_ms, tokens: token_count });
+                        all_runs.push(RunResult {
+                            tokens_per_sec,
+                            elapsed_ms,
+                            tokens: token_count,
+                        });
                     } else {
                         eprintln!("  tg={tg} run {i}: no tokens generated");
                     }
@@ -215,12 +266,25 @@ async fn bench_tg(client: &Client, host: &str, model: &str, tg: usize, runs: usi
     }
 
     let tps: Vec<f64> = all_runs.iter().map(|r| r.tokens_per_sec).collect();
-    let (mean, stddev) = if tps.is_empty() { (0.0, 0.0) } else { stats(&tps) };
-    BenchResult { label: format!("tg{tg}"), pp: None, tg: Some(tg), runs: all_runs, mean, stddev }
+    let (mean, stddev) = if tps.is_empty() {
+        (0.0, 0.0)
+    } else {
+        stats(&tps)
+    };
+    BenchResult {
+        label: format!("tg{tg}"),
+        pp: None,
+        tg: Some(tg),
+        runs: all_runs,
+        mean,
+        stddev,
+    }
 }
 
 fn format_table(results: &[BenchResult], model: &str) -> String {
-    if results.is_empty() { return String::new(); }
+    if results.is_empty() {
+        return String::new();
+    }
     let mut header = format!("| {:<20} |", "model");
     let mut sep = format!("| {:<20} |", "-".repeat(20));
     let mut row = format!("| {:<20} |", model);
@@ -247,7 +311,11 @@ struct Regression {
     pct: f64,
 }
 
-fn compare_to_baseline(current: &BenchOutput, baseline: &BenchOutput, threshold: f64) -> Vec<Regression> {
+fn compare_to_baseline(
+    current: &BenchOutput,
+    baseline: &BenchOutput,
+    threshold: f64,
+) -> Vec<Regression> {
     let mut regressions = Vec::new();
     for cr in &current.results {
         if let Some(br) = baseline.results.iter().find(|r| r.label == cr.label) {
@@ -293,13 +361,31 @@ async fn main() {
 
     for &pp in &args.pp {
         eprintln!("Benchmarking pp={pp}...");
-        let r = bench_pp(&client, &args.host, &args.model, pp, args.runs, args.warmup, args.seed).await;
+        let r = bench_pp(
+            &client,
+            &args.host,
+            &args.model,
+            pp,
+            args.runs,
+            args.warmup,
+            args.seed,
+        )
+        .await;
         results.push(r);
     }
 
     for &tg in &args.tg {
         eprintln!("Benchmarking tg={tg}...");
-        let r = bench_tg(&client, &args.host, &args.model, tg, args.runs, args.warmup, args.seed).await;
+        let r = bench_tg(
+            &client,
+            &args.host,
+            &args.model,
+            tg,
+            args.runs,
+            args.warmup,
+            args.seed,
+        )
+        .await;
         results.push(r);
     }
 
@@ -323,14 +409,17 @@ async fn main() {
     }
 
     if let Some(baseline_path) = &args.compare {
-        let baseline_json = std::fs::read_to_string(baseline_path)
-            .expect("failed to read baseline file");
-        let baseline: BenchOutput = serde_json::from_str(&baseline_json)
-            .expect("failed to parse baseline JSON");
+        let baseline_json =
+            std::fs::read_to_string(baseline_path).expect("failed to read baseline file");
+        let baseline: BenchOutput =
+            serde_json::from_str(&baseline_json).expect("failed to parse baseline JSON");
 
         let regressions = compare_to_baseline(&output, &baseline, args.threshold);
         if regressions.is_empty() {
-            eprintln!("No regressions detected (threshold: {:.1}%)", args.threshold);
+            eprintln!(
+                "No regressions detected (threshold: {:.1}%)",
+                args.threshold
+            );
         } else {
             eprintln!("REGRESSIONS DETECTED:");
             for r in &regressions {

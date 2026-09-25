@@ -101,17 +101,42 @@ pub fn mul_mat_q(
         let act_row = &act_quantized[..act_row_bytes];
         crate::inference_pool::par_run(n, |start, end| {
             for col in start..end {
-                let weight_row = unsafe { std::slice::from_raw_parts(src0_ptr.add(col * weight_row_bytes), weight_row_bytes) };
-                vec_dot_best(k, unsafe { &mut *dst_ptr.add(col) }, weight_row, act_row, src0_type);
+                let weight_row = unsafe {
+                    std::slice::from_raw_parts(
+                        src0_ptr.add(col * weight_row_bytes),
+                        weight_row_bytes,
+                    )
+                };
+                vec_dot_best(
+                    k,
+                    unsafe { &mut *dst_ptr.add(col) },
+                    weight_row,
+                    act_row,
+                    src0_type,
+                );
             }
         });
     } else {
         crate::inference_pool::par_run(m * n, |start, end| {
             for idx in start..end {
-                let row = idx / n; let col = idx % n;
-                let act_row = unsafe { std::slice::from_raw_parts(act_ptr.add(row * act_row_bytes), act_row_bytes) };
-                let weight_row = unsafe { std::slice::from_raw_parts(src0_ptr.add(col * weight_row_bytes), weight_row_bytes) };
-                vec_dot_best(k, unsafe { &mut *dst_ptr.add(row * n + col) }, weight_row, act_row, src0_type);
+                let row = idx / n;
+                let col = idx % n;
+                let act_row = unsafe {
+                    std::slice::from_raw_parts(act_ptr.add(row * act_row_bytes), act_row_bytes)
+                };
+                let weight_row = unsafe {
+                    std::slice::from_raw_parts(
+                        src0_ptr.add(col * weight_row_bytes),
+                        weight_row_bytes,
+                    )
+                };
+                vec_dot_best(
+                    k,
+                    unsafe { &mut *dst_ptr.add(row * n + col) },
+                    weight_row,
+                    act_row,
+                    src0_type,
+                );
             }
         });
     }
@@ -171,10 +196,21 @@ pub fn mul_mat_q_preq(
     let data_ptr = preq.data.as_ptr();
     crate::inference_pool::par_run(m * n, |start, end| {
         for idx in start..end {
-            let row = idx / n; let col = idx % n;
-            let act_row = unsafe { std::slice::from_raw_parts(data_ptr.add(row * act_row_bytes), act_row_bytes) };
-            let weight_row = unsafe { std::slice::from_raw_parts(src0_ptr.add(col * weight_row_bytes), weight_row_bytes) };
-            vec_dot_best(k, unsafe { &mut *dst_ptr.add(row * n + col) }, weight_row, act_row, src0_type);
+            let row = idx / n;
+            let col = idx % n;
+            let act_row = unsafe {
+                std::slice::from_raw_parts(data_ptr.add(row * act_row_bytes), act_row_bytes)
+            };
+            let weight_row = unsafe {
+                std::slice::from_raw_parts(src0_ptr.add(col * weight_row_bytes), weight_row_bytes)
+            };
+            vec_dot_best(
+                k,
+                unsafe { &mut *dst_ptr.add(row * n + col) },
+                weight_row,
+                act_row,
+                src0_type,
+            );
         }
     });
 }

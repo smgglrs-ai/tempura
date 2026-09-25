@@ -729,7 +729,8 @@ pub fn repack_i2s_to_tl2_with_config(
             let row_base = r * row_bytes;
             let row_out = unsafe { std::slice::from_raw_parts_mut(tern_ptr.add(r * k), k) };
             for grp in 0..k / 128 {
-                let blk = unsafe { std::slice::from_raw_parts(i2s_ptr.add(row_base + grp * 32), 32) };
+                let blk =
+                    unsafe { std::slice::from_raw_parts(i2s_ptr.add(row_base + grp * 32), 32) };
                 for j in 0..32 {
                     let b = blk[j];
                     row_out[grp * 128 + j] = ((b >> 6) & 3) as i8 - 1;

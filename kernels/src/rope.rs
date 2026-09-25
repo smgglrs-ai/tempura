@@ -1619,16 +1619,8 @@ mod tests {
 
         let positions: Vec<u32> = (0..n_pos as u32).collect();
         let rope = CpuRoPE;
-        rope.forward(
-            &mut input,
-            1,
-            n_pos,
-            1,
-            head_dim,
-            &positions,
-            10000.0,
-        )
-        .unwrap();
+        rope.forward(&mut input, 1, n_pos, 1, head_dim, &positions, 10000.0)
+            .unwrap();
 
         let mut max_diff = 0.0f32;
         for pos in 0..n_pos {
@@ -1643,7 +1635,10 @@ mod tests {
         }
 
         eprintln!("RoPE apply crossval: max_diff={max_diff:.6e} across {n_pos} positions");
-        assert!(max_diff < 1e-5, "CpuRoPE::forward vs C reference: {max_diff}");
+        assert!(
+            max_diff < 1e-5,
+            "CpuRoPE::forward vs C reference: {max_diff}"
+        );
     }
 
     mod prop_tests {

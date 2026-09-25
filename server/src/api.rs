@@ -2389,7 +2389,9 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert!(
-            ct.contains("text/event-stream") || status.is_client_error() || status.is_server_error(),
+            ct.contains("text/event-stream")
+                || status.is_client_error()
+                || status.is_server_error(),
             "unexpected content-type {ct} with status {status}"
         );
     }

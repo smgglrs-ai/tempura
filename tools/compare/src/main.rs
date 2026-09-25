@@ -24,7 +24,10 @@ enum Mode {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "tempura-compare", about = "Compare outputs of two inference servers")]
+#[command(
+    name = "tempura-compare",
+    about = "Compare outputs of two inference servers"
+)]
 struct Args {
     #[arg(long)]
     server_a: String,
@@ -108,11 +111,7 @@ struct LogitsResponse {
 }
 
 async fn check_server(client: &Client, url: &str, label: &str) -> bool {
-    match client
-        .get(format!("{url}/health"))
-        .send()
-        .await
-    {
+    match client.get(format!("{url}/health")).send().await {
         Ok(r) if r.status().is_success() => true,
         Ok(r) => {
             eprintln!("  {label}: /health returned {}", r.status());
@@ -201,7 +200,11 @@ async fn compare_generate(client: &Client, args: &Args, prompt: &str) -> PromptR
 async fn compare_tokenize(client: &Client, args: &Args, prompt: &str) -> PromptResult {
     let body = serde_json::json!({"model": args.model, "content": prompt});
 
-    async fn fetch(client: &Client, url: &str, body: &serde_json::Value) -> Result<Vec<u32>, String> {
+    async fn fetch(
+        client: &Client,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<Vec<u32>, String> {
         let resp = client
             .post(format!("{url}/tokenize"))
             .json(body)
@@ -259,7 +262,12 @@ async fn compare_tokenize(client: &Client, args: &Args, prompt: &str) -> PromptR
     }
 }
 
-async fn compare_logits(client: &Client, args: &Args, prompt: &str, tolerance: f64) -> PromptResult {
+async fn compare_logits(
+    client: &Client,
+    args: &Args,
+    prompt: &str,
+    tolerance: f64,
+) -> PromptResult {
     let body_tok = serde_json::json!({"model": args.model, "content": prompt});
 
     let tokens_resp = client
@@ -298,7 +306,11 @@ async fn compare_logits(client: &Client, args: &Args, prompt: &str, tolerance: f
 
     let logits_body = serde_json::json!({"model": args.model, "tokens": tokens});
 
-    async fn fetch_logits(client: &Client, url: &str, body: &serde_json::Value) -> Result<Vec<f32>, String> {
+    async fn fetch_logits(
+        client: &Client,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<Vec<f32>, String> {
         let resp = client
             .post(format!("{url}/tempura/v1/debug/logits"))
             .json(body)
@@ -306,7 +318,10 @@ async fn compare_logits(client: &Client, args: &Args, prompt: &str, tolerance: f
             .await
             .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
-            return Err(format!("HTTP {} (endpoint may not be supported)", resp.status()));
+            return Err(format!(
+                "HTTP {} (endpoint may not be supported)",
+                resp.status()
+            ));
         }
         let lr: LogitsResponse = resp.json().await.map_err(|e| e.to_string())?;
         Ok(lr.logits)
@@ -411,7 +426,10 @@ async fn main() {
         vec![text.clone()]
     } else if let Some(ref path) = args.prompt_file {
         std::fs::read_to_string(path)
-            .unwrap_or_else(|e| { eprintln!("Cannot read {}: {e}", path.display()); std::process::exit(2); })
+            .unwrap_or_else(|e| {
+                eprintln!("Cannot read {}: {e}", path.display());
+                std::process::exit(2);
+            })
             .lines()
             .filter(|l| !l.trim().is_empty())
             .map(String::from)
@@ -422,13 +440,13 @@ async fn main() {
         BUILTIN_PROMPTS.iter().map(|s| s.to_string()).collect()
     };
 
-    println!(
-        "tempura-compare: {} vs {}",
-        args.label_a, args.label_b
-    );
+    println!("tempura-compare: {} vs {}", args.label_a, args.label_b);
     println!("{}", "=".repeat(50));
     println!("Prompts: {}", prompts.len());
-    println!("Mode: {:?}, tokens: {}, temperature: {}", args.mode, args.tokens, args.temperature);
+    println!(
+        "Mode: {:?}, tokens: {}, temperature: {}",
+        args.mode, args.tokens, args.temperature
+    );
     println!();
 
     let mut results: Vec<PromptResult> = Vec::new();
@@ -448,8 +466,11 @@ async fn main() {
                 diverged = true;
             }
             Status::Error => {
-                println!("!  [{i}] {:?} — error: {}", &prompt[..prompt.len().min(50)],
-                    result.error.as_deref().unwrap_or("unknown"));
+                println!(
+                    "!  [{i}] {:?} — error: {}",
+                    &prompt[..prompt.len().min(50)],
+                    result.error.as_deref().unwrap_or("unknown")
+                );
                 diverged = true;
             }
         }
@@ -461,7 +482,10 @@ async fn main() {
         }
     }
 
-    let matches = results.iter().filter(|r| matches!(r.status, Status::Match)).count();
+    let matches = results
+        .iter()
+        .filter(|r| matches!(r.status, Status::Match))
+        .count();
     let total = results.len();
 
     println!();

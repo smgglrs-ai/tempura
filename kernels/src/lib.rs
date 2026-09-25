@@ -28,21 +28,21 @@ pub mod cutile_rmsnorm;
 #[cfg(feature = "cutile")]
 pub mod cutile_rope;
 pub mod deltanet;
-#[cfg(feature = "openmp")]
-pub mod openmp_gemv;
 pub mod dispatch;
 pub mod f16_gemv;
-pub mod inference_pool;
 pub mod fused;
 pub mod ggml;
 #[cfg(all(feature = "cuda", not(feature = "cutile")))]
 pub mod gpu;
 pub mod guided;
+pub mod inference_pool;
 pub mod layernorm;
 pub mod matmul;
 pub mod moe;
 #[cfg(any(feature = "npu-intel", feature = "npu-qualcomm"))]
 pub mod npu;
+#[cfg(feature = "openmp")]
+pub mod openmp_gemv;
 pub mod portable_math;
 #[allow(dead_code)]
 pub mod quantized;

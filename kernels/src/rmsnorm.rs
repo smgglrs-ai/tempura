@@ -599,7 +599,8 @@ mod tests {
         rn.forward(&mut inplace, &weight, hidden, eps).unwrap();
 
         let mut fused = vec![0.0f32; hidden];
-        rn.forward_into(&x, &weight, &mut fused, hidden, eps).unwrap();
+        rn.forward_into(&x, &weight, &mut fused, hidden, eps)
+            .unwrap();
 
         for i in 0..hidden {
             assert_relative_eq!(fused[i], inplace[i], epsilon = 1e-6);
@@ -620,7 +621,8 @@ mod tests {
         rn.forward(&mut inplace, &weight, hidden, eps).unwrap();
 
         let mut fused = vec![0.0f32; hidden];
-        rn.forward_into(&x, &weight, &mut fused, hidden, eps).unwrap();
+        rn.forward_into(&x, &weight, &mut fused, hidden, eps)
+            .unwrap();
 
         for i in 0..hidden {
             assert_relative_eq!(fused[i], inplace[i], epsilon = 1e-6);
@@ -639,7 +641,8 @@ mod tests {
         rn.forward(&mut inplace, &weight, hidden, eps).unwrap();
 
         let mut fused = vec![0.0f32; x.len()];
-        rn.forward_into(&x, &weight, &mut fused, hidden, eps).unwrap();
+        rn.forward_into(&x, &weight, &mut fused, hidden, eps)
+            .unwrap();
 
         for i in 0..x.len() {
             assert_relative_eq!(fused[i], inplace[i], epsilon = 1e-6);

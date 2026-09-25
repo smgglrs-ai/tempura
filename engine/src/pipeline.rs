@@ -211,7 +211,8 @@ where
             }
         }
 
-        self.rmsnorm.forward_into(x, weight, out, hidden_size, eps)?;
+        self.rmsnorm
+            .forward_into(x, weight, out, hidden_size, eps)?;
 
         if trace_level >= TraceLevel::Summary {
             if let Some(ref mut snap) = snapshot {

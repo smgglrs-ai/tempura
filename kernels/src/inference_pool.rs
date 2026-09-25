@@ -1,5 +1,5 @@
-use std::sync::OnceLock;
 use staticpar::StaticPool;
+use std::sync::OnceLock;
 
 static POOL: OnceLock<StaticPool> = OnceLock::new();
 
