@@ -235,6 +235,104 @@ impl crate::inference_pool::KernelJob for Q4kMnTiledJob {
     }
 }
 
+// Block micro-tile GEMM job: processes 4 activation rows × 2 weight rows per tile,
+// achieving 4× better activation reuse than Q4kMnTiledJob.
+struct Q4kMnBlockJob {
+    bq_ptr:        *const u8,
+    q8k_ptr:       *const u8,
+    out_ptr:       *mut f32,
+    m:             usize,
+    n:             usize,
+    bpr:           usize,
+    k:             usize,
+    bq_row_bytes:  usize,
+    q8k_row_bytes: usize,
+}
+unsafe impl Sync for Q4kMnBlockJob {}
+impl crate::inference_pool::KernelJob for Q4kMnBlockJob {
+    #[inline(always)]
+    fn exec_range(&self, start: usize, end: usize) {
+        use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+        use crate::ggml::vec_dot_avx2::{
+            vec_dot_q4_k_q8_k_dispatch,
+            vec_dot_q4_k_q8_k_dispatch_pair,
+            vec_dot_q4k_q8k_dispatch_4x2,
+        };
+        let mut j = start;
+        while j + 1 < end {
+            let w0 = unsafe {
+                std::slice::from_raw_parts(
+                    self.bq_ptr.add(j * self.bq_row_bytes) as *const BlockQ4K, self.bpr)
+            };
+            let w1 = unsafe {
+                std::slice::from_raw_parts(
+                    self.bq_ptr.add((j + 1) * self.bq_row_bytes) as *const BlockQ4K, self.bpr)
+            };
+            let mut i = 0;
+            // BM=4 tile: process 4 activation rows simultaneously
+            while i + 3 < self.m {
+                let a0 = unsafe {
+                    std::slice::from_raw_parts(
+                        self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K, self.bpr)
+                };
+                let a1 = unsafe {
+                    std::slice::from_raw_parts(
+                        self.q8k_ptr.add((i + 1) * self.q8k_row_bytes) as *const BlockQ8K, self.bpr)
+                };
+                let a2 = unsafe {
+                    std::slice::from_raw_parts(
+                        self.q8k_ptr.add((i + 2) * self.q8k_row_bytes) as *const BlockQ8K, self.bpr)
+                };
+                let a3 = unsafe {
+                    std::slice::from_raw_parts(
+                        self.q8k_ptr.add((i + 3) * self.q8k_row_bytes) as *const BlockQ8K, self.bpr)
+                };
+                let r = vec_dot_q4k_q8k_dispatch_4x2(self.k, w0, w1, a0, a1, a2, a3);
+                unsafe {
+                    *self.out_ptr.add(i * self.n + j)           = r[0][0];
+                    *self.out_ptr.add(i * self.n + j + 1)       = r[0][1];
+                    *self.out_ptr.add((i + 1) * self.n + j)     = r[1][0];
+                    *self.out_ptr.add((i + 1) * self.n + j + 1) = r[1][1];
+                    *self.out_ptr.add((i + 2) * self.n + j)     = r[2][0];
+                    *self.out_ptr.add((i + 2) * self.n + j + 1) = r[2][1];
+                    *self.out_ptr.add((i + 3) * self.n + j)     = r[3][0];
+                    *self.out_ptr.add((i + 3) * self.n + j + 1) = r[3][1];
+                }
+                i += 4;
+            }
+            // Remainder activation rows (0, 1, 2, or 3 left)
+            while i < self.m {
+                let a = unsafe {
+                    std::slice::from_raw_parts(
+                        self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K, self.bpr)
+                };
+                let (v0, v1) = vec_dot_q4_k_q8_k_dispatch_pair(self.k, w0, w1, a);
+                unsafe {
+                    *self.out_ptr.add(i * self.n + j)     = v0;
+                    *self.out_ptr.add(i * self.n + j + 1) = v1;
+                }
+                i += 1;
+            }
+            j += 2;
+        }
+        // Remainder weight row (odd n)
+        if j < end {
+            let w = unsafe {
+                std::slice::from_raw_parts(
+                    self.bq_ptr.add(j * self.bq_row_bytes) as *const BlockQ4K, self.bpr)
+            };
+            for i in 0..self.m {
+                let a = unsafe {
+                    std::slice::from_raw_parts(
+                        self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K, self.bpr)
+                };
+                let val = vec_dot_q4_k_q8_k_dispatch(self.k, w, a);
+                unsafe { *self.out_ptr.add(i * self.n + j) = val; }
+            }
+        }
+    }
+}
+
 struct Q6kMnTiledJob {
     bq_ptr:        *const u8,
     q8k_ptr:       *const u8,
@@ -4441,7 +4539,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             #[cfg(not(target_arch = "x86_64"))]
             crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
         }
-        let job = Q4kMnTiledJob {
+        let job = Q4kMnBlockJob {
             bq_ptr: b_quantized.as_ptr(),
             q8k_ptr: q8k_all.as_ptr() as *const u8,
             out_ptr: output.as_mut_ptr(),
