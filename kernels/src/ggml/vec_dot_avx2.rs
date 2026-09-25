@@ -6,6 +6,16 @@ use super::helpers::f16_to_f32;
 
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
+unsafe fn hsum_i32_4(v: __m128i) -> i32 {
+    let hi = _mm_unpackhi_epi64(v, v);
+    let sum2 = _mm_add_epi32(v, hi);
+    let hi32 = _mm_shuffle_epi32(sum2, 0b00_00_00_01);
+    let sum1 = _mm_add_epi32(sum2, hi32);
+    _mm_cvtsi128_si32(sum1)
+}
+
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
 unsafe fn hsum_i32_8(v: __m256i) -> i32 {
     let hi128 = _mm256_extracti128_si256(v, 1);
     let lo128 = _mm256_castsi256_si128(v);
@@ -452,7 +462,6 @@ pub unsafe fn quantize_row_q8_k_avx2(src: &[f32], dst: &mut [BlockQ8K]) {
 #[target_feature(enable = "avx2,avxvnni")]
 #[inline]
 pub unsafe fn vec_dot_q4_k_q8_k_vnni(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
-    use super::helpers::get_scale_min_k4;
     let nb = n / 256;
     let mask_lo = _mm256_set1_epi8(0x0F);
 
@@ -462,6 +471,11 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
     let x_ptr = x.as_ptr();
     let y_ptr = y.as_ptr();
 
+    // Scale/min bitmask constants — same as AVX2 path.
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
     for i in 0..nb {
         // Safety: nb = n/256, x.len() == nb, y.len() == nb (caller invariant)
         let xi = &*x_ptr.add(i);
@@ -470,30 +484,35 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
         let d = f16_to_f32(xi.d) * yi.d;
         let dmin = f16_to_f32(xi.dmin) * yi.d;
 
-        let mut sc = [0u8; 8];
-        let mut mi = [0u8; 8];
-        for j in 0..8 {
-            let (s, m) = get_scale_min_k4(j, &xi.scales);
-            *sc.get_unchecked_mut(j) = s;
-            *mi.get_unchecked_mut(j) = m;
-        }
+        // Vectorized scale/min extraction (replaces 8× get_scale_min_k4 scalar calls).
+        // After the bit ops: utmp[0]=sc[0..3], utmp[1]=sc[4..7], utmp[2]=mn[0..3], utmp[3]=mn[4..7]
+        let mut utmp = [0u32; 4];
+        std::ptr::copy_nonoverlapping(xi.scales.as_ptr(), utmp.as_mut_ptr() as *mut u8, 12);
+        utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
+        let uaux = utmp[1] & KMASK1;
+        utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= KMASK1;
 
-        let mut sumi_mins = 0i32;
-        let bsums_ptr = yi.bsums.as_ptr();
-        let mi_ptr = mi.as_ptr();
-        for j in 0..16 {
-            sumi_mins += *bsums_ptr.add(j) as i32 * *mi_ptr.add(j >> 1) as i32;
-        }
-        mins_total += dmin * sumi_mins as f32;
+        // SIMD mins accumulation: sum_{j=0..15} bsums[j] * mn[j/2]
+        // hadd pairs bsums 16→8, madd dot with 8 mins → 4 i32, then hsum.
+        let q8sums = _mm256_loadu_si256(yi.bsums.as_ptr() as *const __m256i);
+        let q8s = _mm_hadd_epi16(_mm256_castsi256_si128(q8sums), _mm256_extracti128_si256(q8sums, 1));
+        let mins_128 = _mm_set_epi32(0, 0, utmp[3] as i32, utmp[2] as i32);
+        let mins_i16 = _mm_cvtepu8_epi16(mins_128);
+        let prod = _mm_madd_epi16(mins_i16, q8s);
+        mins_total += dmin * hsum_i32_4(prod) as f32;
 
         let q4 = xi.qs.as_ptr();
         let q8 = yi.qs.as_ptr();
-        let sc_ptr = sc.as_ptr();
 
+        // For j in 0..4: sc_lo = sc[2*j] = byte 2*j of [utmp[0], utmp[1]]
+        //                 sc_hi = sc[2*j+1] = byte 2*j+1
+        // j/2 selects utmp[0] or utmp[1]; 16*(j%2) shifts to the right word.
         let mut sumi = _mm256_setzero_si256();
         for j in 0..4 {
-            let sc_lo = *sc_ptr.add(2 * j) as i32;
-            let sc_hi = *sc_ptr.add(2 * j + 1) as i32;
+            let sc_lo = ((utmp[j / 2] >> (16 * (j % 2))) & 0xFF) as i32;
+            let sc_hi = ((utmp[j / 2] >> (16 * (j % 2) + 8)) & 0xFF) as i32;
 
             let q4_chunk = _mm256_loadu_si256(q4.add(j * 32) as *const __m256i);
             let q4_lo = _mm256_and_si256(q4_chunk, mask_lo);
@@ -515,7 +534,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
 }
 
 /// Compute dot products of Q8K activation against TWO Q4K weight rows simultaneously.
-/// Shares Q8K loads (activation) across both rows, reducing memory traffic by ~30%.
+/// Shares Q8K loads (activation) and bsums hadd across both rows.
 /// Returns (dot(x0, y), dot(x1, y)).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni")]
@@ -526,7 +545,6 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni_pair(
     x1: &[BlockQ4K],
     y: &[BlockQ8K],
 ) -> (f32, f32) {
-    use super::helpers::get_scale_min_k4;
     let nb = n / 256;
     let mask_lo = _mm256_set1_epi8(0x0F);
 
@@ -539,6 +557,11 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni_pair(
     let x1_ptr = x1.as_ptr();
     let y_ptr = y.as_ptr();
 
+    // Scale/min bitmask constants — same as AVX2 path.
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
     for i in 0..nb {
         // Safety: nb = n/256, all slices have len == nb
         let x0i = &*x0_ptr.add(i);
@@ -546,50 +569,55 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni_pair(
         let yi = &*y_ptr.add(i);
         let d_y = yi.d;
 
-        // Row 0 scales
+        // Vectorized scale/min extraction for row 0.
+        // After bit ops: utmp0[0]=sc[0..3], utmp0[1]=sc[4..7], utmp0[2]=mn[0..3], utmp0[3]=mn[4..7]
+        let mut utmp0 = [0u32; 4];
+        std::ptr::copy_nonoverlapping(x0i.scales.as_ptr(), utmp0.as_mut_ptr() as *mut u8, 12);
+        utmp0[3] = ((utmp0[2] >> 4) & KMASK2) | (((utmp0[1] >> 6) & KMASK3) << 4);
+        let uaux0 = utmp0[1] & KMASK1;
+        utmp0[1] = (utmp0[2] & KMASK2) | (((utmp0[0] >> 6) & KMASK3) << 4);
+        utmp0[2] = uaux0;
+        utmp0[0] &= KMASK1;
+
+        // Vectorized scale/min extraction for row 1.
+        let mut utmp1 = [0u32; 4];
+        std::ptr::copy_nonoverlapping(x1i.scales.as_ptr(), utmp1.as_mut_ptr() as *mut u8, 12);
+        utmp1[3] = ((utmp1[2] >> 4) & KMASK2) | (((utmp1[1] >> 6) & KMASK3) << 4);
+        let uaux1 = utmp1[1] & KMASK1;
+        utmp1[1] = (utmp1[2] & KMASK2) | (((utmp1[0] >> 6) & KMASK3) << 4);
+        utmp1[2] = uaux1;
+        utmp1[0] &= KMASK1;
+
+        // Shared bsums hadd — computed ONCE for both rows.
+        let q8sums = _mm256_loadu_si256(yi.bsums.as_ptr() as *const __m256i);
+        let q8s = _mm_hadd_epi16(_mm256_castsi256_si128(q8sums), _mm256_extracti128_si256(q8sums, 1));
+
         let d0 = f16_to_f32(x0i.d) * d_y;
         let dmin0 = f16_to_f32(x0i.dmin) * d_y;
-        let mut sc0 = [0u8; 8];
-        let mut mi0 = [0u8; 8];
-        for j in 0..8 {
-            let (s, m) = get_scale_min_k4(j, &x0i.scales);
-            *sc0.get_unchecked_mut(j) = s;
-            *mi0.get_unchecked_mut(j) = m;
-        }
+        let mins0_128 = _mm_set_epi32(0, 0, utmp0[3] as i32, utmp0[2] as i32);
+        let mins0_i16 = _mm_cvtepu8_epi16(mins0_128);
+        let prod0 = _mm_madd_epi16(mins0_i16, q8s);
+        mins_total0 += dmin0 * hsum_i32_4(prod0) as f32;
 
-        // Row 1 scales
         let d1 = f16_to_f32(x1i.d) * d_y;
         let dmin1 = f16_to_f32(x1i.dmin) * d_y;
-        let mut sc1 = [0u8; 8];
-        let mut mi1 = [0u8; 8];
-        for j in 0..8 {
-            let (s, m) = get_scale_min_k4(j, &x1i.scales);
-            *sc1.get_unchecked_mut(j) = s;
-            *mi1.get_unchecked_mut(j) = m;
-        }
-
-        // Shared mins from Q8K bsums
-        let mut sumi_mins0 = 0i32;
-        let mut sumi_mins1 = 0i32;
-        let bsums_ptr = yi.bsums.as_ptr();
-        let mi0_ptr = mi0.as_ptr();
-        let mi1_ptr = mi1.as_ptr();
-        for j in 0..16 {
-            let bs = *bsums_ptr.add(j) as i32;
-            let half = j >> 1;
-            sumi_mins0 += bs * *mi0_ptr.add(half) as i32;
-            sumi_mins1 += bs * *mi1_ptr.add(half) as i32;
-        }
-        mins_total0 += dmin0 * sumi_mins0 as f32;
-        mins_total1 += dmin1 * sumi_mins1 as f32;
+        let mins1_128 = _mm_set_epi32(0, 0, utmp1[3] as i32, utmp1[2] as i32);
+        let mins1_i16 = _mm_cvtepu8_epi16(mins1_128);
+        let prod1 = _mm_madd_epi16(mins1_i16, q8s);
+        mins_total1 += dmin1 * hsum_i32_4(prod1) as f32;
 
         let q8 = yi.qs.as_ptr();
-        let sc0_ptr = sc0.as_ptr();
-        let sc1_ptr = sc1.as_ptr();
         let mut sumi0 = _mm256_setzero_si256();
         let mut sumi1 = _mm256_setzero_si256();
 
+        // For j in 0..4: sc_lo = sc[2*j] = byte (j/2)*word + low of [utmp0/1]
+        // j/2 selects utmp word (0 or 1); 16*(j%2) shifts to lower or upper pair.
         for j in 0..4 {
+            let sc_lo0 = ((utmp0[j / 2] >> (16 * (j % 2))) & 0xFF) as i32;
+            let sc_hi0 = ((utmp0[j / 2] >> (16 * (j % 2) + 8)) & 0xFF) as i32;
+            let sc_lo1 = ((utmp1[j / 2] >> (16 * (j % 2))) & 0xFF) as i32;
+            let sc_hi1 = ((utmp1[j / 2] >> (16 * (j % 2) + 8)) & 0xFF) as i32;
+
             // Load Q8K activation ONCE per pair (shared)
             let q8_lo = _mm256_loadu_si256(q8.add(j * 64) as *const __m256i);
             let q8_hi = _mm256_loadu_si256(q8.add(j * 64 + 32) as *const __m256i);
@@ -599,8 +627,6 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni_pair(
             let q4_lo0 = _mm256_and_si256(q4_chunk0, mask_lo);
             let q4_hi0 = _mm256_and_si256(_mm256_srli_epi16(q4_chunk0, 4), mask_lo);
 
-            let sc_lo0 = *sc0_ptr.add(2 * j) as i32;
-            let sc_hi0 = *sc0_ptr.add(2 * j + 1) as i32;
             let dot_lo0 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_lo0, q8_lo);
             let dot_hi0 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_hi0, q8_hi);
             sumi0 = _mm256_add_epi32(
@@ -616,8 +642,6 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni_pair(
             let q4_lo1 = _mm256_and_si256(q4_chunk1, mask_lo);
             let q4_hi1 = _mm256_and_si256(_mm256_srli_epi16(q4_chunk1, 4), mask_lo);
 
-            let sc_lo1 = *sc1_ptr.add(2 * j) as i32;
-            let sc_hi1 = *sc1_ptr.add(2 * j + 1) as i32;
             let dot_lo1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_lo1, q8_lo);
             let dot_hi1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_hi1, q8_hi);
             sumi1 = _mm256_add_epi32(
