@@ -1,16 +1,35 @@
 //! Direct translation of llama.cpp arch/x86/repack.cpp and ggml-cpu/repack.cpp
-//! AVX2 GEMV/GEMM kernels for Q4_K × Q8_K.
+//! AVX2 GEMV/GEMM kernels for Q4_K × Q8_K, and scalar GEMV/GEMM for Q2_K/Q5_K/Q6_K.
 //!
 //! Sources:
 //! - ggml_gemv_q4_K_8x8_q8_K:     arch/x86/repack.cpp lines 1464-1685
 //! - ggml_gemm_q4_K_8x8_q8_K AVX2: arch/x86/repack.cpp lines 2817-3493
 //! - make_block_q4_Kx8:            ggml-cpu/repack.cpp  lines 3177-3252
 //! - repack_q4_K_to_q4_K_8_bl:    ggml-cpu/repack.cpp  lines 3572-3599
+//! - ggml_gemv_q2_K_8x8_q8_K:     ggml-cpu/repack.cpp  lines 1029-1103 (scalar generic)
+//! - make_block_q2_Kx8:            ggml-cpu/repack.cpp  lines 3306-3346
+//! - repack_q2_K_to_q2_K_8_bl:    ggml-cpu/repack.cpp  lines 3633-3659
+//! - ggml_gemv_q5_K_8x8_q8_K:     ggml-cpu/repack.cpp  lines 551-643  (blocklen=8, ncols=8)
+//! - ggml_gemm_q5_K_8x4_q8_K:     ggml-cpu/repack.cpp  lines 647-750  (blocklen=4, ncols=8)
+//! - make_block_q5_Kx8:            ggml-cpu/repack.cpp  lines 3348-3431
+//! - repack_q5_K_to_q5_K_8_bl:    ggml-cpu/repack.cpp  lines 3729-3759
+//! - ggml_gemv_q6_K_8x8_q8_K:     ggml-cpu/repack.cpp  lines 357-443  (blocklen=8, ncols=8)
+//! - ggml_gemm_q6_K_8x4_q8_K:     ggml-cpu/repack.cpp  lines 447-548  (blocklen=4, ncols=8)
+//! - make_block_q6_Kx8:            ggml-cpu/repack.cpp  lines 3433-3477
+//! - repack_q6_K_to_q6_K_8_bl:    ggml-cpu/repack.cpp  lines 3761-3788
 
-use super::blocks::{BlockQ4K, BlockQ4Kx8, BlockQ8K, BlockQ8Kx4};
+use super::blocks::{
+    BlockQ2K, BlockQ2Kx8,
+    BlockQ4K, BlockQ4Kx8,
+    BlockQ5K, BlockQ5Kx8,
+    BlockQ6K, BlockQ6Kx8,
+    BlockQ8K, BlockQ8Kx4,
+};
 
 // QK_K = 256
 const QK_K: usize = 256;
+// K_SCALE_SIZE: bytes per sub-block scale encoding in Q4_K/Q5_K
+const K_SCALE_SIZE: usize = 12;
 
 // ── repacking ────────────────────────────────────────────────────────────────
 
@@ -789,6 +808,861 @@ unsafe fn add4_maddubs(
     )
 }
 
+// ── f16→f32 scalar helper (for non-AVX2 code paths) ──────────────────────────
+
+/// Software IEEE-754 f16 → f32 conversion.
+#[inline(always)]
+fn f16_to_f32(v: u16) -> f32 {
+    let s = (v as u32 & 0x8000) << 16;
+    let e = (v as u32 >> 10) & 0x1f;
+    let m = (v as u32) & 0x3ff;
+    let bits = if e == 0 {
+        if m == 0 {
+            s
+        } else {
+            // subnormal: normalize
+            let mut exp = 127u32 - 14;
+            let mut man = m;
+            while man & 0x400 == 0 {
+                man <<= 1;
+                exp -= 1;
+            }
+            s | (exp << 23) | ((man & 0x3ff) << 13)
+        }
+    } else if e == 31 {
+        s | 0x7f80_0000 | (m << 13) // inf or nan
+    } else {
+        s | ((e + 112) << 23) | (m << 13) // normal
+    };
+    f32::from_bits(bits)
+}
+
+// ── Q2K repacking ─────────────────────────────────────────────────────────────
+
+/// Direct translation of make_block_q2_Kx8 (ggml-cpu/repack.cpp line 3306).
+/// Interleaves 8 Q2_K blocks into the packed BlockQ2Kx8 format.
+pub fn make_block_q2_kx8(in_blocks: &[BlockQ2K; 8], blck_size_interleave: usize) -> BlockQ2Kx8 {
+    let mut out = BlockQ2Kx8 {
+        d: [0u16; 8],
+        dmin: [0u16; 8],
+        scales: [0u8; 128],
+        qs: [0u8; 512],
+    };
+
+    // Copy super-block scales (d) and mins (dmin)
+    for i in 0..8 {
+        out.d[i] = in_blocks[i].d;
+        out.dmin[i] = in_blocks[i].dmin;
+    }
+
+    // Interleave 2-bit quants: QK_K/4=64 bytes per source block
+    let end = 8 * 64 / blck_size_interleave;
+    for i in 0..end {
+        let src_id = i % 8;
+        let src_offset = (i / 8) * blck_size_interleave;
+        let dst_offset = i * blck_size_interleave;
+        out.qs[dst_offset..dst_offset + blck_size_interleave]
+            .copy_from_slice(&in_blocks[src_id].qs[src_offset..src_offset + blck_size_interleave]);
+    }
+
+    // Repack scales and mins.
+    // Q2_K has 16 scale+min pairs packed in 16 bytes (4 bits each).
+    // Output layout: every 16 bytes contains the scale/min bytes for 2 consecutive
+    // sub-blocks interleaved across the 8 source blocks.
+    for i in 0..128 {
+        let src1 = (i % 16) / 2;       // which source block (0..8)
+        let src2 = ((i / 16) * 2) + (i % 2);  // which scale byte index (0..15)
+        out.scales[i] = in_blocks[src1].scales[src2];
+    }
+
+    out
+}
+
+/// Direct translation of repack_q2_K_to_q2_K_8_bl (ggml-cpu/repack.cpp line 3633).
+/// Repacks a full weight matrix (nrow × nblocks Q2_K blocks) into BlockQ2Kx8 format.
+pub fn repack_q2_k_to_q2_k_8_bl(
+    src: &[BlockQ2K],
+    nrow: usize,
+    nblocks: usize,
+    dst: &mut Vec<BlockQ2Kx8>,
+) -> Result<(), &'static str> {
+    const NROWS_INTERLEAVED: usize = 8;
+    const INTERLEAVE_BLOCK: usize = 8;
+
+    if nrow % NROWS_INTERLEAVED != 0 {
+        return Err("nrow must be a multiple of 8");
+    }
+
+    dst.clear();
+    dst.reserve(nrow / NROWS_INTERLEAVED * nblocks);
+
+    let mut b = 0usize;
+    while b < nrow {
+        for x in 0..nblocks {
+            let mut tmp = [BlockQ2K {
+                scales: [0u8; 16],
+                qs: [0u8; 64],
+                d: 0,
+                dmin: 0,
+            }; 8];
+            for i in 0..NROWS_INTERLEAVED {
+                tmp[i] = src[x + (b + i) * nblocks];
+            }
+            dst.push(make_block_q2_kx8(&tmp, INTERLEAVE_BLOCK));
+        }
+        b += NROWS_INTERLEAVED;
+    }
+    Ok(())
+}
+
+// ── Q5K repacking ─────────────────────────────────────────────────────────────
+
+/// Direct translation of make_block_q5_Kx8 (ggml-cpu/repack.cpp line 3348).
+/// Interleaves 8 Q5_K blocks into the packed BlockQ5Kx8 format.
+pub fn make_block_q5_kx8(in_blocks: &[BlockQ5K; 8], blck_size_interleave: usize) -> BlockQ5Kx8 {
+    let mut out = BlockQ5Kx8 {
+        d: [0u16; 8],
+        dmin: [0u16; 8],
+        scales: [0u8; 96],
+        qh: [0u8; 256],
+        qs: [0u8; 1024],
+    };
+
+    for i in 0..8 {
+        out.d[i] = in_blocks[i].d;
+        out.dmin[i] = in_blocks[i].dmin;
+    }
+
+    // Interleave low nibbles (QK_K/2=128 bytes per source block)
+    let end = QK_K * 4 / blck_size_interleave;
+    for i in 0..end {
+        let src_id = i % 8;
+        let src_offset = (i / 8) * blck_size_interleave;
+        let dst_offset = i * blck_size_interleave;
+        out.qs[dst_offset..dst_offset + blck_size_interleave]
+            .copy_from_slice(&in_blocks[src_id].qs[src_offset..src_offset + blck_size_interleave]);
+    }
+
+    // Interleave high bits (QK_K/8=32 bytes per source block)
+    for i in 0..(end / 4) {
+        let src_id = i % 8;
+        let src_offset = (i / 8) * blck_size_interleave;
+        let dst_offset = i * blck_size_interleave;
+        out.qh[dst_offset..dst_offset + blck_size_interleave]
+            .copy_from_slice(&in_blocks[src_id].qh[src_offset..src_offset + blck_size_interleave]);
+    }
+
+    // Repack scales: identical layout to Q4K
+    let mut s = [0u8; 8];
+    let mut m = [0u8; 8];
+
+    for i in 0..4 {
+        for j in 0..8 {
+            s[j] = in_blocks[j].scales[i] & 63;
+            m[j] = in_blocks[j].scales[i + 4] & 63;
+        }
+        out.scales[i * 12]      = (s[0] & 63) | ((s[4] & 48) << 2);
+        out.scales[i * 12 + 1]  = (s[1] & 63) | ((s[5] & 48) << 2);
+        out.scales[i * 12 + 2]  = (s[2] & 63) | ((s[6] & 48) << 2);
+        out.scales[i * 12 + 3]  = (s[3] & 63) | ((s[7] & 48) << 2);
+        out.scales[i * 12 + 4]  = (m[0] & 63) | ((m[4] & 48) << 2);
+        out.scales[i * 12 + 5]  = (m[1] & 63) | ((m[5] & 48) << 2);
+        out.scales[i * 12 + 6]  = (m[2] & 63) | ((m[6] & 48) << 2);
+        out.scales[i * 12 + 7]  = (m[3] & 63) | ((m[7] & 48) << 2);
+        out.scales[i * 12 + 8]  = (s[4] & 15) | ((m[4] & 15) << 4);
+        out.scales[i * 12 + 9]  = (s[5] & 15) | ((m[5] & 15) << 4);
+        out.scales[i * 12 + 10] = (s[6] & 15) | ((m[6] & 15) << 4);
+        out.scales[i * 12 + 11] = (s[7] & 15) | ((m[7] & 15) << 4);
+    }
+
+    for i in 0..4 {
+        for j in 0..8 {
+            s[j] = ((in_blocks[j].scales[i] & 192) >> 2) | (in_blocks[j].scales[i + 8] & 15);
+            m[j] = ((in_blocks[j].scales[i + 4] & 192) >> 2) | ((in_blocks[j].scales[i + 8] & 240) >> 4);
+        }
+        out.scales[i * 12 + 48] = (s[0] & 63) | ((s[4] & 48) << 2);
+        out.scales[i * 12 + 49] = (s[1] & 63) | ((s[5] & 48) << 2);
+        out.scales[i * 12 + 50] = (s[2] & 63) | ((s[6] & 48) << 2);
+        out.scales[i * 12 + 51] = (s[3] & 63) | ((s[7] & 48) << 2);
+        out.scales[i * 12 + 52] = (m[0] & 63) | ((m[4] & 48) << 2);
+        out.scales[i * 12 + 53] = (m[1] & 63) | ((m[5] & 48) << 2);
+        out.scales[i * 12 + 54] = (m[2] & 63) | ((m[6] & 48) << 2);
+        out.scales[i * 12 + 55] = (m[3] & 63) | ((m[7] & 48) << 2);
+        out.scales[i * 12 + 56] = (s[4] & 15) | ((m[4] & 15) << 4);
+        out.scales[i * 12 + 57] = (s[5] & 15) | ((m[5] & 15) << 4);
+        out.scales[i * 12 + 58] = (s[6] & 15) | ((m[6] & 15) << 4);
+        out.scales[i * 12 + 59] = (s[7] & 15) | ((m[7] & 15) << 4);
+    }
+
+    out
+}
+
+/// Direct translation of repack_q5_K_to_q5_K_8_bl (ggml-cpu/repack.cpp line 3729).
+pub fn repack_q5_k_to_q5_k_8_bl(
+    src: &[BlockQ5K],
+    nrow: usize,
+    nblocks: usize,
+    interleave_block: usize,
+    dst: &mut Vec<BlockQ5Kx8>,
+) -> Result<(), &'static str> {
+    assert!(interleave_block == 4 || interleave_block == 8);
+    const NROWS_INTERLEAVED: usize = 8;
+
+    if nrow % NROWS_INTERLEAVED != 0 {
+        return Err("nrow must be a multiple of 8");
+    }
+
+    dst.clear();
+    dst.reserve(nrow / NROWS_INTERLEAVED * nblocks);
+
+    let mut b = 0usize;
+    while b < nrow {
+        for x in 0..nblocks {
+            let mut tmp = [BlockQ5K {
+                d: 0,
+                dmin: 0,
+                scales: [0u8; 12],
+                qh: [0u8; 32],
+                qs: [0u8; 128],
+            }; 8];
+            for i in 0..NROWS_INTERLEAVED {
+                tmp[i] = src[x + (b + i) * nblocks];
+            }
+            dst.push(make_block_q5_kx8(&tmp, interleave_block));
+        }
+        b += NROWS_INTERLEAVED;
+    }
+    Ok(())
+}
+
+// ── Q6K repacking ─────────────────────────────────────────────────────────────
+
+/// Direct translation of make_block_q6_Kx8 (ggml-cpu/repack.cpp line 3433).
+/// Interleaves 8 Q6_K blocks into the packed BlockQ6Kx8 format.
+pub fn make_block_q6_kx8(in_blocks: &[BlockQ6K; 8], blck_size_interleave: usize) -> BlockQ6Kx8 {
+    const N_BLOCKS: usize = 8;
+    let mut out = BlockQ6Kx8 {
+        d: [0u16; 8],
+        scales: [0i8; 128],
+        ql: [0u8; 1024],
+        qh: [0u8; 512],
+    };
+
+    for i in 0..N_BLOCKS {
+        out.d[i] = in_blocks[i].d;
+    }
+
+    // Interleave lower 4-bit quants (QK_K/2=128 bytes per block)
+    let end_ls = QK_K * 4 / blck_size_interleave;
+    for i in 0..end_ls {
+        let src_id = i % N_BLOCKS;
+        let src_offset = (i / N_BLOCKS) * blck_size_interleave;
+        let dst_offset = i * blck_size_interleave;
+        out.ql[dst_offset..dst_offset + blck_size_interleave]
+            .copy_from_slice(&in_blocks[src_id].ql[src_offset..src_offset + blck_size_interleave]);
+    }
+
+    // Interleave upper 2-bit quants (QK_K/4=64 bytes per block)
+    let end_hs = end_ls / 2;
+    for i in 0..end_hs {
+        let src_id = i % N_BLOCKS;
+        let src_offset = (i / N_BLOCKS) * blck_size_interleave;
+        let dst_offset = i * blck_size_interleave;
+        out.qh[dst_offset..dst_offset + blck_size_interleave]
+            .copy_from_slice(&in_blocks[src_id].qh[src_offset..src_offset + blck_size_interleave]);
+    }
+
+    // Repack i8 scales: layout = [sub_block * N_BLOCKS + block_idx]
+    // Q6_K has QK_K/16=16 scales, one per 16-element group.
+    const N_SCALES: usize = QK_K / 16; // 16
+    for i in 0..N_BLOCKS {
+        for j in 0..N_SCALES {
+            out.scales[j * N_BLOCKS + i] = in_blocks[i].scales[j];
+        }
+    }
+
+    out
+}
+
+/// Direct translation of repack_q6_K_to_q6_K_8_bl (ggml-cpu/repack.cpp line 3761).
+pub fn repack_q6_k_to_q6_k_8_bl(
+    src: &[BlockQ6K],
+    nrow: usize,
+    nblocks: usize,
+    interleave_block: usize,
+    dst: &mut Vec<BlockQ6Kx8>,
+) -> Result<(), &'static str> {
+    assert!(interleave_block == 4 || interleave_block == 8);
+    const NROWS_INTERLEAVED: usize = 8;
+
+    if nrow % NROWS_INTERLEAVED != 0 {
+        return Err("nrow must be a multiple of 8");
+    }
+
+    dst.clear();
+    dst.reserve(nrow / NROWS_INTERLEAVED * nblocks);
+
+    let mut b = 0usize;
+    while b < nrow {
+        for x in 0..nblocks {
+            let mut tmp = [BlockQ6K {
+                ql: [0u8; 128],
+                qh: [0u8; 64],
+                scales: [0i8; 16],
+                d: 0,
+            }; 8];
+            for i in 0..NROWS_INTERLEAVED {
+                tmp[i] = src[x + (b + i) * nblocks];
+            }
+            dst.push(make_block_q6_kx8(&tmp, interleave_block));
+        }
+        b += NROWS_INTERLEAVED;
+    }
+    Ok(())
+}
+
+// ── Q2K scalar GEMV ───────────────────────────────────────────────────────────
+
+/// Direct translation of ggml_gemv_q2_K_8x8_q8_K_generic (ggml-cpu/repack.cpp line 1029).
+/// Scalar GEMV: Q2_K packed weights × Q8_K activations → f32 output.
+/// blocklen=8, ncols_interleaved=8.
+///
+/// - vx: packed weights as BlockQ2Kx8 slice (nc/8 × nb blocks)
+/// - vy: activation as BlockQ8K slice (nb blocks, single row)
+/// - s:  output, nc floats
+/// - n:  token dimension (multiple of QK_K=256)
+/// - nc: number of weight columns (multiple of 8)
+pub unsafe fn ggml_gemv_q2_k_8x8_q8_k(
+    n: usize,
+    s: *mut f32,
+    vx: *const u8,
+    vy: *const u8,
+    _nr: usize,
+    nc: usize,
+) {
+    const BLOCKLEN: usize = 8;
+    const NCOLS: usize = 8;
+
+    let nb = n / QK_K;
+    let b_ptr_start = vx as *const BlockQ2Kx8;
+    let a_ptr = vy as *const BlockQ8K;
+
+    for x in 0..(nc / NCOLS) {
+        let b_ptr = b_ptr_start.add(x * nb);
+        let mut sumf = [0f32; NCOLS];
+        let mut sum_minf = [0f32; NCOLS];
+
+        for l in 0..nb {
+            let a = &*a_ptr.add(l);
+            let b = &*b_ptr.add(l);
+
+            // k < QK_K / (4 * BLOCKLEN) = 256 / 32 = 8
+            for k in 0..(QK_K / (4 * BLOCKLEN)) {
+                let scales_0 = &b.scales[(k / 4) * 64..];
+                let scales_1 = &b.scales[(k / 4) * 64 + 16..];
+                let scales_2 = &b.scales[(k / 4) * 64 + 32..];
+                let scales_3 = &b.scales[(k / 4) * 64 + 48..];
+
+                for j in 0..NCOLS {
+                    let mut sumi1 = 0i32;
+                    let mut sumi2 = 0i32;
+                    let mut sumi3 = 0i32;
+                    let mut sumi4 = 0i32;
+                    let mut sumi = 0i32;
+                    let offset = ((k / 2) % 2) + j * 2;
+
+                    for i in 0..BLOCKLEN {
+                        let qs_byte = b.qs[k * NCOLS * BLOCKLEN + j * BLOCKLEN + i];
+                        let v0 = (qs_byte & 3) as i32;
+                        let v1 = ((qs_byte >> 2) & 3) as i32;
+                        let v2 = ((qs_byte >> 4) & 3) as i32;
+                        let v3 = (qs_byte >> 6) as i32;
+
+                        let q8_base = (k >> 2) * 128 + (k % 4) * BLOCKLEN + i;
+                        sumi1 = v0 * (a.qs[q8_base] as i32);
+                        sumi2 = v1 * (a.qs[q8_base + 32] as i32);
+                        sumi3 = v2 * (a.qs[q8_base + 64] as i32);
+                        sumi4 = v3 * (a.qs[q8_base + 96] as i32);
+
+                        sumi1 *= (scales_0[offset] & 0xF) as i32;
+                        sumi2 *= (scales_1[offset] & 0xF) as i32;
+                        sumi3 *= (scales_2[offset] & 0xF) as i32;
+                        sumi4 *= (scales_3[offset] & 0xF) as i32;
+                        sumi += sumi1 + sumi2 + sumi3 + sumi4;
+                    }
+                    sumf[j] += sumi as f32 * f16_to_f32(b.d[j]) * a.d;
+                }
+            }
+
+            // Min contribution
+            for sb in 0..8usize {
+                let mins = &b.scales[sb * 16..];
+                for j in 0..NCOLS {
+                    let m0 = (mins[j * 2] >> 4) as i32;
+                    let m1 = (mins[j * 2 + 1] >> 4) as i32;
+                    sum_minf[j] += (m0 * a.bsums[sb * 2] as i32 + m1 * a.bsums[sb * 2 + 1] as i32) as f32
+                        * f16_to_f32(b.dmin[j])
+                        * a.d;
+                }
+            }
+        }
+
+        for j in 0..NCOLS {
+            *s.add(x * NCOLS + j) = sumf[j] - sum_minf[j];
+        }
+    }
+}
+
+// ── Q5K scalar GEMV ───────────────────────────────────────────────────────────
+
+/// Direct translation of ggml_gemv_q5_K_NxM_q8_K_generic_impl<8,8>
+/// (ggml-cpu/repack.cpp lines 551-643). blocklen=8, ncols_interleaved=8.
+///
+/// - vx: packed weights as BlockQ5Kx8 (nc/8 × nb)
+/// - vy: activation as BlockQ8K (nb blocks, single row)
+/// - s:  output, nc floats
+/// - n:  token dimension (multiple of QK_K=256)
+pub unsafe fn ggml_gemv_q5_k_8x8_q8_k(
+    n: usize,
+    s: *mut f32,
+    vx: *const u8,
+    vy: *const u8,
+    _nr: usize,
+    nc: usize,
+) {
+    const BLOCKLEN: usize = 8;
+    const NCOLS: usize = 8;
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    let nb = n / QK_K;
+    let b_ptr_start = vx as *const BlockQ5Kx8;
+    let a_ptr = vy as *const BlockQ8K;
+
+    // utmp[32]: decoded scale+min u32 words; reinterpreted as bytes for indexing
+    let mut utmp = [0u32; 32];
+
+    for x in 0..(nc / NCOLS) {
+        let b_ptr = b_ptr_start.add(x * nb);
+        let mut sumf    = [0f32; NCOLS];
+        let mut sum_minf = [0f32; NCOLS];
+
+        for l in 0..nb {
+            let a = &*a_ptr.add(l);
+            let b = &*b_ptr.add(l);
+
+            // Decode scales for each of the 8 sub-block groups
+            for sb in 0..8usize {
+                let src = &b.scales[sb * K_SCALE_SIZE..];
+                let u0 = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                let u1 = u32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+                let u2 = u32::from_le_bytes([src[8], src[9], src[10], src[11]]);
+                utmp[sb * 4 + 0] = u0;
+                utmp[sb * 4 + 1] = u1;
+                utmp[sb * 4 + 2] = u2;
+                let u3 = ((u2 >> 4) & KMASK2) | (((u1 >> 6) & KMASK3) << 4);
+                let uaux = u1 & KMASK1;
+                utmp[sb * 4 + 1] = (u2 & KMASK2) | (((u0 >> 6) & KMASK3) << 4);
+                utmp[sb * 4 + 2] = uaux;
+                utmp[sb * 4 + 0] &= KMASK1;
+                utmp[sb * 4 + 3] = u3;
+            }
+
+            // utmp as byte slice (little-endian, 128 bytes)
+            let utmp_bytes: &[u8; 128] =
+                &*(utmp.as_ptr() as *const [u8; 128]);
+
+            // k < QK_K / (2 * BLOCKLEN) = 16
+            for k in 0..(QK_K / (2 * BLOCKLEN)) {
+                let sb_idx = k / (32 / BLOCKLEN); // = k / 4
+                let scale_stride = 32usize;
+                let scales_0 = &utmp_bytes[sb_idx * scale_stride..];
+                let scales_1 = &utmp_bytes[sb_idx * scale_stride + 16..];
+                let qh_shift = sb_idx * 2;
+
+                for j in 0..NCOLS {
+                    let mut sumi1 = 0i32;
+                    let mut sumi2 = 0i32;
+                    let mut sumi  = 0i32;
+
+                    for i in 0..BLOCKLEN {
+                        let b_qs_offset = k * NCOLS * BLOCKLEN + j * BLOCKLEN + i;
+
+                        let qh_idx   = (k * BLOCKLEN + i) % 32;
+                        let qh_chunk = qh_idx / BLOCKLEN;
+                        let qh_pos   = qh_idx % BLOCKLEN;
+                        let b_qh_offset = qh_chunk * (BLOCKLEN * NCOLS) + j * BLOCKLEN + qh_pos;
+
+                        let qh_val = b.qh[b_qh_offset];
+                        let h0 = (qh_val >> qh_shift) & 1;
+                        let h1 = (qh_val >> (qh_shift + 1)) & 1;
+
+                        let qs = b.qs[b_qs_offset];
+                        let v0 = ((qs & 0xF) | (h0 << 4)) as i8 as i32;
+                        let v1 = ((qs >> 4) | (h1 << 4)) as i8 as i32;
+
+                        let q8_offset = sb_idx * 64 + (k % (32 / BLOCKLEN)) * BLOCKLEN + i;
+                        sumi1 = v0 * a.qs[q8_offset] as i32;
+                        sumi2 = v1 * a.qs[q8_offset + 32] as i32;
+                        sumi1 *= scales_0[j] as i32;
+                        sumi2 *= scales_1[j] as i32;
+                        sumi += sumi1 + sumi2;
+                    }
+                    sumf[j] += sumi as f32 * f16_to_f32(b.d[j]) * a.d;
+                }
+            }
+
+            // Min contribution: mins at utmp_bytes[8 + sb*16..]
+            for sb in 0..8usize {
+                let mins = &utmp_bytes[8 + sb * 16..];
+                for j in 0..NCOLS {
+                    sum_minf[j] += mins[j] as f32
+                        * (a.bsums[sb * 2] as i32 + a.bsums[sb * 2 + 1] as i32) as f32
+                        * f16_to_f32(b.dmin[j])
+                        * a.d;
+                }
+            }
+        }
+
+        for j in 0..NCOLS {
+            *s.add(x * NCOLS + j) = sumf[j] - sum_minf[j];
+        }
+    }
+}
+
+// ── Q5K scalar GEMM ───────────────────────────────────────────────────────────
+
+/// Direct translation of ggml_gemm_q5_K_NxM_q8_K_generic_impl<4,8>
+/// (ggml-cpu/repack.cpp lines 647-750). blocklen=4, ncols_interleaved=8.
+///
+/// - vx: packed weights as BlockQ5Kx8 (nc/8 × nb)
+/// - vy: packed activations as BlockQ8Kx4 (nr/4 × nb)
+/// - s:  output, nr × nc floats (row-major, stride bs)
+/// - bs: output row stride in f32 elements
+pub unsafe fn ggml_gemm_q5_k_8x4_q8_k(
+    n: usize,
+    s: *mut f32,
+    bs: usize,
+    vx: *const u8,
+    vy: *const u8,
+    nr: usize,
+    nc: usize,
+) {
+    const BLOCKLEN: usize = 4;
+    const NCOLS: usize = 8;
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    let nb = n / QK_K;
+    let b_ptr_start = vx as *const BlockQ5Kx8;
+    let a_ptr_start = vy as *const BlockQ8Kx4;
+
+    let mut utmp = [0u32; 32];
+
+    for y in 0..(nr / 4) {
+        let a_ptr = a_ptr_start.add(y * nb);
+        for x in 0..(nc / NCOLS) {
+            let b_ptr = b_ptr_start.add(x * nb);
+            let mut sumf     = [[0f32; NCOLS]; 4];
+            let mut sum_minf = [[0f32; NCOLS]; 4];
+
+            for l in 0..nb {
+                let a = &*a_ptr.add(l);
+                let b = &*b_ptr.add(l);
+
+                // Decode scales (identical to GEMV)
+                for sb in 0..8usize {
+                    let src = &b.scales[sb * K_SCALE_SIZE..];
+                    let u0 = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                    let u1 = u32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+                    let u2 = u32::from_le_bytes([src[8], src[9], src[10], src[11]]);
+                    utmp[sb * 4 + 0] = u0;
+                    utmp[sb * 4 + 1] = u1;
+                    utmp[sb * 4 + 2] = u2;
+                    let u3 = ((u2 >> 4) & KMASK2) | (((u1 >> 6) & KMASK3) << 4);
+                    let uaux = u1 & KMASK1;
+                    utmp[sb * 4 + 1] = (u2 & KMASK2) | (((u0 >> 6) & KMASK3) << 4);
+                    utmp[sb * 4 + 2] = uaux;
+                    utmp[sb * 4 + 0] &= KMASK1;
+                    utmp[sb * 4 + 3] = u3;
+                }
+
+                let utmp_bytes: &[u8; 128] =
+                    &*(utmp.as_ptr() as *const [u8; 128]);
+
+                // k < QK_K / (2 * BLOCKLEN) = 32
+                for k in 0..(QK_K / (2 * BLOCKLEN)) {
+                    let sb_idx = k / (32 / BLOCKLEN); // = k / 8
+                    let scale_stride = 32usize;
+                    let scales_0 = &utmp_bytes[sb_idx * scale_stride..];
+                    let scales_1 = &utmp_bytes[sb_idx * scale_stride + 16..];
+                    let qh_shift = sb_idx * 2;
+
+                    for m in 0..4usize {
+                        for j in 0..NCOLS {
+                            let mut sumi1 = 0i32;
+                            let mut sumi2 = 0i32;
+                            let mut sumi  = 0i32;
+
+                            for i in 0..BLOCKLEN {
+                                let b_qs_offset = k * NCOLS * BLOCKLEN + j * BLOCKLEN + i;
+
+                                let qh_idx   = (k * BLOCKLEN + i) % 32;
+                                let qh_chunk = qh_idx / BLOCKLEN;
+                                let qh_pos   = qh_idx % BLOCKLEN;
+                                let b_qh_offset = qh_chunk * (BLOCKLEN * NCOLS) + j * BLOCKLEN + qh_pos;
+
+                                let qh_val = b.qh[b_qh_offset];
+                                let h0 = (qh_val >> qh_shift) & 1;
+                                let h1 = (qh_val >> (qh_shift + 1)) & 1;
+
+                                let qs = b.qs[b_qs_offset];
+                                let v0 = ((qs & 0xF) | (h0 << 4)) as i8 as i32;
+                                let v1 = ((qs >> 4) | (h1 << 4)) as i8 as i32;
+
+                                // q8 offset for 4-row packed format
+                                let q8_offset = sb_idx * 256
+                                    + (k % (32 / BLOCKLEN)) * 4 * BLOCKLEN
+                                    + m * BLOCKLEN
+                                    + i;
+                                sumi1 = v0 * a.qs[q8_offset] as i32;
+                                sumi2 = v1 * a.qs[q8_offset + 128] as i32;
+                                sumi1 *= scales_0[j] as i32;
+                                sumi2 *= scales_1[j] as i32;
+                                sumi += sumi1 + sumi2;
+                            }
+                            sumf[m][j] += sumi as f32 * f16_to_f32(b.d[j]) * a.d[m];
+                        }
+                    }
+                }
+
+                // Min contribution
+                for sb in 0..8usize {
+                    let mins = &utmp_bytes[8 + sb * 16..];
+                    for m in 0..4usize {
+                        let bsums_offset =
+                            (sb * 8) + (m * 4) - ((sb % 2) * 6);
+                        let bsums = &a.bsums[bsums_offset..];
+                        for j in 0..NCOLS {
+                            sum_minf[m][j] += mins[j] as f32
+                                * (bsums[0] as i32 + bsums[1] as i32) as f32
+                                * f16_to_f32(b.dmin[j])
+                                * a.d[m];
+                        }
+                    }
+                }
+            }
+
+            for m in 0..4usize {
+                for j in 0..NCOLS {
+                    *s.add((y * 4 + m) * bs + x * NCOLS + j) = sumf[m][j] - sum_minf[m][j];
+                }
+            }
+        }
+    }
+}
+
+// ── Q6K scalar GEMV ───────────────────────────────────────────────────────────
+
+/// Direct translation of ggml_gemv_q6_K_NxM_q8_K_generic_impl<8,8>
+/// (ggml-cpu/repack.cpp lines 357-443). blocklen=8, ncols_interleaved=8.
+///
+/// - vx: packed weights as BlockQ6Kx8 (nc/8 × nb)
+/// - vy: activation as BlockQ8K (nb blocks, single row)
+/// - s:  output, nc floats
+pub unsafe fn ggml_gemv_q6_k_8x8_q8_k(
+    n: usize,
+    s: *mut f32,
+    vx: *const u8,
+    vy: *const u8,
+    _nr: usize,
+    nc: usize,
+) {
+    const BLOCKLEN: usize = 8;
+    const NCOLS: usize = 8;
+    const BLOCKS_PER_HALF: usize = 64 / BLOCKLEN; // 8
+
+    let nb = n / QK_K;
+    let b_ptr_start = vx as *const BlockQ6Kx8;
+    let a_ptr = vy as *const BlockQ8K;
+
+    for x in 0..(nc / NCOLS) {
+        let b_ptr = b_ptr_start.add(x * nb);
+        let mut sumf = [0f32; NCOLS];
+
+        for l in 0..nb {
+            let a = &*a_ptr.add(l);
+            let b = &*b_ptr.add(l);
+
+            // k < QK_K / (2 * BLOCKLEN) = 16
+            for k in 0..(QK_K / (2 * BLOCKLEN)) {
+                let base_l = (k / BLOCKS_PER_HALF) * 128 + (k % BLOCKS_PER_HALF) * BLOCKLEN;
+                let base_h = base_l + 64;
+
+                let scale_idx_l = base_l / 16;
+                let scale_idx_h = base_h / 16;
+
+                let qh_shift_l = ((base_l % 128) / 32) * 2;
+                let qh_shift_h = ((base_h % 128) / 32) * 2;
+
+                let qh_half_l = (base_l / 128) * 32;
+                let qh_half_h = (base_h / 128) * 32;
+
+                for j in 0..NCOLS {
+                    let scale_l = b.scales[scale_idx_l * NCOLS + j];
+                    let scale_h = b.scales[scale_idx_h * NCOLS + j];
+
+                    let mut sumi_l = 0i32;
+                    let mut sumi_h = 0i32;
+
+                    for i in 0..BLOCKLEN {
+                        let ql_pos = k * NCOLS * BLOCKLEN + j * BLOCKLEN + i;
+                        let l_4  = (b.ql[ql_pos] & 0xF) as i32;
+                        let hi_4 = ((b.ql[ql_pos] >> 4) & 0xF) as i32;
+
+                        // Low half high-bit index
+                        let qh_idx_l   = qh_half_l + ((base_l + i) % 32);
+                        let qh_chunk_l = qh_idx_l / BLOCKLEN;
+                        let qh_pos_l   = qh_idx_l % BLOCKLEN;
+                        let qh_offset_l = qh_chunk_l * (BLOCKLEN * NCOLS) + j * BLOCKLEN + qh_pos_l;
+                        let hi_2_l = ((b.qh[qh_offset_l] >> qh_shift_l) & 0x3) as i32;
+
+                        // High half high-bit index
+                        let qh_idx_h   = qh_half_h + ((base_h + i) % 32);
+                        let qh_chunk_h = qh_idx_h / BLOCKLEN;
+                        let qh_pos_h   = qh_idx_h % BLOCKLEN;
+                        let qh_offset_h = qh_chunk_h * (BLOCKLEN * NCOLS) + j * BLOCKLEN + qh_pos_h;
+                        let hi_2_h = ((b.qh[qh_offset_h] >> qh_shift_h) & 0x3) as i32;
+
+                        let q_l = ((hi_2_l << 4) | l_4) - 32;
+                        let q_h = ((hi_2_h << 4) | hi_4) - 32;
+
+                        sumi_l += q_l * a.qs[base_l + i] as i32;
+                        sumi_h += q_h * a.qs[base_h + i] as i32;
+                    }
+
+                    sumf[j] += (sumi_l * scale_l as i32 + sumi_h * scale_h as i32) as f32
+                        * f16_to_f32(b.d[j])
+                        * a.d;
+                }
+            }
+        }
+
+        for j in 0..NCOLS {
+            *s.add(x * NCOLS + j) = sumf[j];
+        }
+    }
+}
+
+// ── Q6K scalar GEMM ───────────────────────────────────────────────────────────
+
+/// Direct translation of ggml_gemm_q6_K_NxM_q8_K_generic_impl<4,8>
+/// (ggml-cpu/repack.cpp lines 447-548). blocklen=4, ncols_interleaved=8.
+///
+/// - vx: packed weights as BlockQ6Kx8 (nc/8 × nb)
+/// - vy: packed activations as BlockQ8Kx4 (nr/4 × nb)
+/// - s:  output, nr × nc floats (row-major, stride bs)
+/// - bs: output row stride in f32 elements
+pub unsafe fn ggml_gemm_q6_k_8x4_q8_k(
+    n: usize,
+    s: *mut f32,
+    bs: usize,
+    vx: *const u8,
+    vy: *const u8,
+    nr: usize,
+    nc: usize,
+) {
+    const BLOCKLEN: usize = 4;
+    const NCOLS: usize = 8;
+    const BLOCKS_PER_HALF: usize = 64 / BLOCKLEN; // 16
+    const Q8_HALF_STRIDE: usize = 512;
+    const Q8_LOW_HIGH_STEP: usize = 256;
+
+    let nb = n / QK_K;
+    let b_ptr_start = vx as *const BlockQ6Kx8;
+    let a_ptr_start = vy as *const BlockQ8Kx4;
+
+    for y in 0..(nr / 4) {
+        let a_ptr = a_ptr_start.add(y * nb);
+        for x in 0..(nc / NCOLS) {
+            let b_ptr = b_ptr_start.add(x * nb);
+            let mut sumf = [[0f32; NCOLS]; 4];
+
+            for l in 0..nb {
+                let a = &*a_ptr.add(l);
+                let b = &*b_ptr.add(l);
+
+                // k < QK_K / (2 * BLOCKLEN) = 32
+                for k in 0..(QK_K / (2 * BLOCKLEN)) {
+                    let base_l = (k / BLOCKS_PER_HALF) * 128 + (k % BLOCKS_PER_HALF) * BLOCKLEN;
+                    let base_h = base_l + 64;
+
+                    let scale_idx_l = base_l / 16;
+                    let scale_idx_h = base_h / 16;
+
+                    let qh_shift_l = ((base_l % 128) / 32) * 2;
+                    let qh_shift_h = ((base_h % 128) / 32) * 2;
+
+                    let qh_half_l = (base_l / 128) * 32;
+                    let qh_half_h = (base_h / 128) * 32;
+
+                    let q8_base = (k / BLOCKS_PER_HALF) * Q8_HALF_STRIDE
+                        + (k % BLOCKS_PER_HALF) * (BLOCKLEN * 4);
+
+                    for m in 0..4usize {
+                        for j in 0..NCOLS {
+                            let scale_l = b.scales[scale_idx_l * NCOLS + j];
+                            let scale_h = b.scales[scale_idx_h * NCOLS + j];
+
+                            let mut sumi_l = 0i32;
+                            let mut sumi_h = 0i32;
+
+                            for i in 0..BLOCKLEN {
+                                let ql_pos = k * NCOLS * BLOCKLEN + j * BLOCKLEN + i;
+                                let l_4  = (b.ql[ql_pos] & 0xF) as i32;
+                                let hi_4 = ((b.ql[ql_pos] >> 4) & 0xF) as i32;
+
+                                let qh_idx_l   = qh_half_l + ((base_l + i) % 32);
+                                let qh_chunk_l = qh_idx_l / BLOCKLEN;
+                                let qh_pos_l   = qh_idx_l % BLOCKLEN;
+                                let qh_offset_l = qh_chunk_l * (BLOCKLEN * NCOLS) + j * BLOCKLEN + qh_pos_l;
+                                let hi_2_l = ((b.qh[qh_offset_l] >> qh_shift_l) & 0x3) as i32;
+
+                                let qh_idx_h   = qh_half_h + ((base_h + i) % 32);
+                                let qh_chunk_h = qh_idx_h / BLOCKLEN;
+                                let qh_pos_h   = qh_idx_h % BLOCKLEN;
+                                let qh_offset_h = qh_chunk_h * (BLOCKLEN * NCOLS) + j * BLOCKLEN + qh_pos_h;
+                                let hi_2_h = ((b.qh[qh_offset_h] >> qh_shift_h) & 0x3) as i32;
+
+                                let q_l = ((hi_2_l << 4) | l_4) - 32;
+                                let q_h = ((hi_2_h << 4) | hi_4) - 32;
+
+                                let q8_l = a.qs[q8_base + m * BLOCKLEN + i] as i32;
+                                let q8_h = a.qs[q8_base + m * BLOCKLEN + i + Q8_LOW_HIGH_STEP] as i32;
+
+                                sumi_l += q_l * q8_l;
+                                sumi_h += q_h * q8_h;
+                            }
+
+                            sumf[m][j] += (sumi_l * scale_l as i32 + sumi_h * scale_h as i32) as f32
+                                * f16_to_f32(b.d[j])
+                                * a.d[m];
+                        }
+                    }
+                }
+            }
+
+            for m in 0..4usize {
+                for j in 0..NCOLS {
+                    *s.add((y * 4 + m) * bs + x * NCOLS + j) = sumf[m][j];
+                }
+            }
+        }
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -931,6 +1805,170 @@ mod tests {
         for &v in &output {
             assert!((v - first).abs() < 1e-4 * first.abs().max(1.0),
                 "outputs differ: {:.6} vs {:.6}", first, v);
+        }
+    }
+
+    // ── Q2K ─────────────────────────────────────────────────────────────────
+
+    fn zero_block_q2k() -> BlockQ2K {
+        BlockQ2K { scales: [0u8; 16], qs: [0u8; 64], d: 0, dmin: 0 }
+    }
+
+    #[test]
+    fn test_make_block_q2_kx8_zero() {
+        let blocks = [zero_block_q2k(); 8];
+        let packed = make_block_q2_kx8(&blocks, 8);
+        assert!(packed.d.iter().all(|&v| v == 0));
+        assert!(packed.dmin.iter().all(|&v| v == 0));
+        assert!(packed.qs.iter().all(|&v| v == 0));
+        assert!(packed.scales.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn test_gemv_q2k_zero_weights_zero_output() {
+        let n = 256usize;
+        let nc = 8usize;
+
+        // Zero-weight packed block
+        let b = BlockQ2Kx8 {
+            d: [0u16; 8],
+            dmin: [0u16; 8],
+            scales: [0u8; 128],
+            qs: [0u8; 512],
+        };
+        let a = zero_block_q8k();
+
+        let mut output = vec![0f32; nc];
+        unsafe {
+            ggml_gemv_q2_k_8x8_q8_k(
+                n,
+                output.as_mut_ptr(),
+                &b as *const BlockQ2Kx8 as *const u8,
+                &a as *const BlockQ8K as *const u8,
+                1,
+                nc,
+            );
+        }
+        for &v in &output {
+            assert_eq!(v, 0.0f32, "expected zero output for zero weights");
+        }
+    }
+
+    // ── Q5K ─────────────────────────────────────────────────────────────────
+
+    fn zero_block_q5k() -> BlockQ5K {
+        BlockQ5K { d: 0, dmin: 0, scales: [0u8; 12], qh: [0u8; 32], qs: [0u8; 128] }
+    }
+
+    #[test]
+    fn test_make_block_q5_kx8_zero() {
+        let blocks = [zero_block_q5k(); 8];
+        let packed = make_block_q5_kx8(&blocks, 8);
+        assert!(packed.d.iter().all(|&v| v == 0));
+        assert!(packed.dmin.iter().all(|&v| v == 0));
+        assert!(packed.qs.iter().all(|&v| v == 0));
+        assert!(packed.qh.iter().all(|&v| v == 0));
+        assert!(packed.scales.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn test_gemv_q5k_zero_weights_zero_output() {
+        let n = 256usize;
+        let nc = 8usize;
+
+        let b = BlockQ5Kx8 {
+            d: [0u16; 8],
+            dmin: [0u16; 8],
+            scales: [0u8; 96],
+            qh: [0u8; 256],
+            qs: [0u8; 1024],
+        };
+        let a = zero_block_q8k();
+
+        let mut output = vec![0f32; nc];
+        unsafe {
+            ggml_gemv_q5_k_8x8_q8_k(
+                n,
+                output.as_mut_ptr(),
+                &b as *const BlockQ5Kx8 as *const u8,
+                &a as *const BlockQ8K as *const u8,
+                1,
+                nc,
+            );
+        }
+        for &v in &output {
+            assert_eq!(v, 0.0f32, "expected zero output for zero weights");
+        }
+    }
+
+    // ── Q6K ─────────────────────────────────────────────────────────────────
+
+    fn zero_block_q6k() -> BlockQ6K {
+        BlockQ6K { ql: [0u8; 128], qh: [0u8; 64], scales: [0i8; 16], d: 0 }
+    }
+
+    #[test]
+    fn test_make_block_q6_kx8_zero() {
+        let blocks = [zero_block_q6k(); 8];
+        let packed = make_block_q6_kx8(&blocks, 8);
+        assert!(packed.d.iter().all(|&v| v == 0));
+        assert!(packed.scales.iter().all(|&v| v == 0));
+        assert!(packed.ql.iter().all(|&v| v == 0));
+        assert!(packed.qh.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn test_gemv_q6k_zero_weights_zero_output() {
+        let n = 256usize;
+        let nc = 8usize;
+
+        let b = BlockQ6Kx8 {
+            d: [0u16; 8],
+            scales: [0i8; 128],
+            ql: [0u8; 1024],
+            qh: [0u8; 512],
+        };
+        let a = zero_block_q8k();
+
+        let mut output = vec![0f32; nc];
+        unsafe {
+            ggml_gemv_q6_k_8x8_q8_k(
+                n,
+                output.as_mut_ptr(),
+                &b as *const BlockQ6Kx8 as *const u8,
+                &a as *const BlockQ8K as *const u8,
+                1,
+                nc,
+            );
+        }
+        for &v in &output {
+            assert_eq!(v, 0.0f32, "expected zero output for zero weights");
+        }
+    }
+
+    #[test]
+    fn test_f16_to_f32_normal() {
+        // f16 1.0 = 0x3C00
+        let v = f16_to_f32(0x3C00u16);
+        assert!((v - 1.0f32).abs() < 1e-6, "f16 1.0 should decode to f32 1.0, got {}", v);
+    }
+
+    #[test]
+    fn test_make_block_q6_kx8_scales_interleaving() {
+        let mut blocks = [zero_block_q6k(); 8];
+        for (i, b) in blocks.iter_mut().enumerate() {
+            b.scales.fill(i as i8 + 1);
+        }
+        let packed = make_block_q6_kx8(&blocks, 8);
+        // scales[sub_block * 8 + block_idx]
+        for block_idx in 0..8usize {
+            for sub_block in 0..16usize {
+                assert_eq!(
+                    packed.scales[sub_block * 8 + block_idx],
+                    (block_idx as i8) + 1,
+                    "scale mismatch at sub_block={sub_block} block={block_idx}"
+                );
+            }
         }
     }
 }

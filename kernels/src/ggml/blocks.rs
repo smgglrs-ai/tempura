@@ -173,6 +173,56 @@ impl std::fmt::Debug for BlockQ8K {
 
 // BlockQ8Kx4 defined above (line ~155)
 
+/// 8 Q2K blocks interleaved for 8-wide SIMD GEMV (matches llama.cpp block_q2_Kx8).
+///
+/// Layout (672 bytes total):
+/// - d[8]:       f16 super-block scales
+/// - dmin[8]:    f16 super-block mins
+/// - scales[128]: interleaved scale+min bytes; 16-byte groups per sub-block pair
+/// - qs[512]:    8×64 2-bit quants interleaved in 8-byte chunks
+#[repr(C)]
+pub struct BlockQ2Kx8 {
+    pub d: [u16; 8],
+    pub dmin: [u16; 8],
+    pub scales: [u8; 128],
+    pub qs: [u8; 512],
+}
+pub const BLOCK_Q2KX8_SIZE: usize = 672;
+
+/// 8 Q5K blocks interleaved for 8-wide SIMD GEMV (matches llama.cpp block_q5_Kx8).
+///
+/// Layout (1408 bytes total):
+/// - d[8]:      f16 super-block scales
+/// - dmin[8]:   f16 super-block mins
+/// - scales[96]: 8 × K_SCALE_SIZE(12) scale bytes, one per sub-block pair across 8 rows
+/// - qh[256]:   8×32 high-bit bytes interleaved in blck_size_interleave chunks
+/// - qs[1024]:  8×128 nibble bytes interleaved in blck_size_interleave chunks
+#[repr(C)]
+pub struct BlockQ5Kx8 {
+    pub d: [u16; 8],
+    pub dmin: [u16; 8],
+    pub scales: [u8; 96],
+    pub qh: [u8; 256],
+    pub qs: [u8; 1024],
+}
+pub const BLOCK_Q5KX8_SIZE: usize = 1408;
+
+/// 8 Q6K blocks interleaved for 8-wide SIMD GEMV (matches llama.cpp block_q6_Kx8).
+///
+/// Layout (1680 bytes total):
+/// - d[8]:       f16 super-block scales
+/// - scales[128]: i8 per-16-element scales: scale[sub_block * 8 + row]
+/// - ql[1024]:   lower 4 bits of 6-bit quants, 8-row interleaved
+/// - qh[512]:    upper 2 bits of 6-bit quants, 8-row interleaved
+#[repr(C)]
+pub struct BlockQ6Kx8 {
+    pub d: [u16; 8],
+    pub scales: [i8; 128],
+    pub ql: [u8; 1024],
+    pub qh: [u8; 512],
+}
+pub const BLOCK_Q6KX8_SIZE: usize = 1680;
+
 // ── Ternary quants (QK_K = 256) ────────────────────────────────────────────
 
 #[repr(C)]
@@ -320,6 +370,9 @@ assert_block_size!(BlockQ4K, BLOCK_Q4K_SIZE);
 assert_block_size!(BlockQ5K, BLOCK_Q5K_SIZE);
 assert_block_size!(BlockQ6K, BLOCK_Q6K_SIZE);
 assert_block_size!(BlockQ8K, BLOCK_Q8K_SIZE);
+assert_block_size!(BlockQ2Kx8, BLOCK_Q2KX8_SIZE);
+assert_block_size!(BlockQ5Kx8, BLOCK_Q5KX8_SIZE);
+assert_block_size!(BlockQ6Kx8, BLOCK_Q6KX8_SIZE);
 assert_block_size!(BlockTQ1_0, BLOCK_TQ1_0_SIZE);
 assert_block_size!(BlockTQ2_0, BLOCK_TQ2_0_SIZE);
 assert_block_size!(BlockMxfp4, BLOCK_MXFP4_SIZE);
