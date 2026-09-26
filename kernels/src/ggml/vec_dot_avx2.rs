@@ -2011,6 +2011,116 @@ pub fn gemv_q4k_8x8_scalar(
     results
 }
 
+/// Scalar 4-activation × 8-weight-row GEMM for Q4Kx8 weights and Q8Kx4 activations.
+///
+/// Translates `ggml_gemm_q4_K_8x8_q8_K_generic` (blocklen=8) from llama.cpp exactly.
+///
+/// - `packed_w`: `(nc/8) * nb` entries, weight rows pre-packed via `repack_q4k_to_q4kx8`
+/// - `packed_a`: `(nr/4) * nb` entries, activations pre-packed via `quantize_mat_q8k_4x8`
+/// - `output`:   `nr × nc` f32 matrix, row-major
+/// - `nr`:       activation rows, must be a multiple of 4
+/// - `nc`:       weight rows, must be a multiple of 8
+/// - `nb`:       K-blocks per row (k / 256)
+pub fn gemm_q4k_8x8_scalar(
+    nb: usize,
+    packed_w: &[BlockQ4Kx8],
+    packed_a: &[BlockQ8Kx4],
+    output: &mut [f32],
+    nr: usize,
+    nc: usize,
+) {
+    assert_eq!(nr % 4, 0);
+    assert_eq!(nc % 8, 0);
+    assert!(packed_w.len() >= (nc / 8) * nb);
+    assert!(packed_a.len() >= (nr / 4) * nb);
+    assert_eq!(output.len(), nr * nc);
+
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    for act_grp in 0..nr / 4 {
+        let a_base = act_grp * nb;
+        for w_grp in 0..nc / 8 {
+            let b_base = w_grp * nb;
+            let mut sumf = [[0.0f32; 8]; 4];
+            let mut sum_minf = [[0.0f32; 8]; 4];
+
+            for l in 0..nb {
+                let b = &packed_w[b_base + l];
+                let a = &packed_a[a_base + l];
+
+                // Decode 8 sub-block scale groups (each 12 bytes) into utmp[32].
+                // After decode, each group sb occupies utmp[sb*4..sb*4+4]:
+                //   [s0..s3][s4..s7][m0..m3][m4..m7] (6-bit values in each byte).
+                let mut utmp = [0u32; 32];
+                for sb in 0..8usize {
+                    let src = &b.scales[sb * 12..];
+                    let u0 = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                    let u1 = u32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+                    let u2 = u32::from_le_bytes([src[8], src[9], src[10], src[11]]);
+                    utmp[sb * 4 + 3] = ((u2 >> 4) & KMASK2) | (((u1 >> 6) & KMASK3) << 4);
+                    let uaux0 = u1 & KMASK1;
+                    utmp[sb * 4 + 1] = (u2 & KMASK2) | (((u0 >> 6) & KMASK3) << 4);
+                    utmp[sb * 4 + 2] = uaux0;
+                    utmp[sb * 4 + 0] = u0 & KMASK1;
+                }
+
+                // Materialise as bytes (little-endian, consistent with C memcpy view).
+                let mut utmp_bytes = [0u8; 128];
+                for (i, &w) in utmp.iter().enumerate() {
+                    utmp_bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                }
+
+                // k-loop: QK_K / (2 * blocklen) = 256 / 16 = 16 iterations.
+                // Each iteration processes blocklen=8 consecutive weight elements (lower + upper nibble).
+                for k in 0..16usize {
+                    let scales_base = (k / 4) * 32;
+                    for m in 0..4usize {
+                        for j in 0..8usize {
+                            let mut sumi = 0i32;
+                            for i in 0..8usize {
+                                let byte_val = b.qs[k * 64 + j * 8 + i];
+                                let v0 = (byte_val & 0xF) as i32;
+                                let v1 = (byte_val >> 4) as i32;
+                                let a_off = (k >> 2) * 256 + (k % 4) * 32 + m * 8 + i;
+                                let act0 = a.qs[a_off] as i32;
+                                let act1 = a.qs[a_off + 128] as i32;
+                                let sc0 = utmp_bytes[scales_base + j] as i32;
+                                let sc1 = utmp_bytes[scales_base + 16 + j] as i32;
+                                sumi += v0 * act0 * sc0 + v1 * act1 * sc1;
+                            }
+                            sumf[m][j] += sumi as f32 * f16_to_f32(b.d[j]) * a.d[m];
+                        }
+                    }
+                }
+
+                // Mins correction: for each of 8 Q4K sub-blocks, subtract the min
+                // contribution weighted by the sum of 32 activation elements per row.
+                for sb in 0..8usize {
+                    let mins_base = 8 + sb * 16;
+                    for m in 0..4usize {
+                        let bsum_off = sb * 8 + m * 4 - (sb % 2) * 6;
+                        let bsum =
+                            (a.bsums[bsum_off] as i32 + a.bsums[bsum_off + 1] as i32) as f32;
+                        for j in 0..8usize {
+                            let min = utmp_bytes[mins_base + j] as f32;
+                            sum_minf[m][j] += min * bsum * f16_to_f32(b.dmin[j]) * a.d[m];
+                        }
+                    }
+                }
+            }
+
+            for m in 0..4usize {
+                for j in 0..8usize {
+                    output[(act_grp * 4 + m) * nc + w_grp * 8 + j] =
+                        sumf[m][j] - sum_minf[m][j];
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::helpers::f32_to_f16;
@@ -2774,6 +2884,118 @@ mod tests {
                 avx2_result[r],
                 scalar_result[r]
             );
+        }
+    }
+
+    // ── gemm_q4k_8x8 tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn gemm_q4k_8x8_scalar_output_size() {
+        use crate::ggml::repack::{quantize_mat_q8k_4x8, repack_q4k_to_q4kx8};
+        let k = 256usize;
+        let nr = 4usize;
+        let nc = 8usize;
+        let nb = k / 256;
+
+        let src_blocks: Vec<super::super::blocks::BlockQ4K> = (0..nc * nb)
+            .map(|r| {
+                let d = 0.5 + (r as f32) * 0.1;
+                let mut b = super::super::blocks::BlockQ4K {
+                    d: f32_to_f16(d),
+                    dmin: f32_to_f16(0.0),
+                    scales: [0u8; 12],
+                    qs: [0x44u8; 128],
+                };
+                b.scales[0] = 1; b.scales[1] = 1; b.scales[2] = 1; b.scales[3] = 1;
+                b.scales[8] = 1; b.scales[9] = 1; b.scales[10] = 1; b.scales[11] = 1;
+                b
+            })
+            .collect();
+
+        let a_flat: Vec<f32> = (0..nr * k)
+            .map(|i| ((i as f32) * 0.001 - 0.1).clamp(-0.5, 0.5))
+            .collect();
+
+        let packed_w = repack_q4k_to_q4kx8(&src_blocks, nc, nb);
+        let packed_a = quantize_mat_q8k_4x8(&a_flat, nr, k);
+        let mut output = vec![0.0f32; nr * nc];
+
+        super::gemm_q4k_8x8_scalar(nb, &packed_w, &packed_a, &mut output, nr, nc);
+
+        assert_eq!(output.len(), nr * nc);
+        let all_finite = output.iter().all(|x| x.is_finite());
+        assert!(all_finite, "output contains non-finite values");
+    }
+
+    #[test]
+    fn gemm_q4k_8x8_scalar_matches_per_row_dot() {
+        use crate::ggml::repack::{quantize_mat_q8k_4x8, repack_q4k_to_q4kx8};
+        use crate::quantized::{q4k_dot_block, Q4K_BLOCK_BYTES};
+
+        let k = 256usize;
+        let nr = 4usize;
+        let nc = 8usize;
+        let nb = 1;
+
+        let src_blocks: Vec<super::super::blocks::BlockQ4K> = (0..nc * nb)
+            .map(|r| {
+                use super::super::blocks::BlockQ4K;
+                let d = 0.1 + (r as f32) * 0.05;
+                let dmin = 0.02f32;
+                let mut b = BlockQ4K {
+                    d: f32_to_f16(d),
+                    dmin: f32_to_f16(dmin),
+                    scales: [0u8; 12],
+                    qs: [0u8; 128],
+                };
+                for q in b.qs.iter_mut() {
+                    *q = ((r * 3 + 7) % 16) as u8 | (((r * 5 + 3) % 16) as u8) << 4;
+                }
+                b.scales[0] = 8; b.scales[1] = 8; b.scales[2] = 8; b.scales[3] = 8;
+                b.scales[4] = 4; b.scales[5] = 4; b.scales[6] = 4; b.scales[7] = 4;
+                b.scales[8] = 8; b.scales[9] = 8; b.scales[10] = 8; b.scales[11] = 8;
+                b
+            })
+            .collect();
+
+        let a_flat: Vec<f32> = (0..nr * k)
+            .map(|i| (i as f32 - (nr * k / 2) as f32) / (nr * k) as f32)
+            .collect();
+
+        // Reference: per-row scalar dot product
+        let b_bytes: Vec<u8> = unsafe {
+            std::slice::from_raw_parts(
+                src_blocks.as_ptr() as *const u8,
+                src_blocks.len() * Q4K_BLOCK_BYTES,
+            )
+            .to_vec()
+        };
+        let mut ref_out = vec![0.0f32; nr * nc];
+        for m in 0..nr {
+            let a_row = &a_flat[m * k..(m + 1) * k];
+            for j in 0..nc {
+                let blk_bytes = &b_bytes[j * Q4K_BLOCK_BYTES..(j + 1) * Q4K_BLOCK_BYTES];
+                ref_out[m * nc + j] = q4k_dot_block(blk_bytes, a_row);
+            }
+        }
+
+        // GEMM path
+        let packed_w = repack_q4k_to_q4kx8(&src_blocks, nc, nb);
+        let packed_a = quantize_mat_q8k_4x8(&a_flat, nr, k);
+        let mut got_out = vec![0.0f32; nr * nc];
+        super::gemm_q4k_8x8_scalar(nb, &packed_w, &packed_a, &mut got_out, nr, nc);
+
+        // Allow generous tolerance due to quantization in both paths
+        for m in 0..nr {
+            for j in 0..nc {
+                let r = ref_out[m * nc + j];
+                let g = got_out[m * nc + j];
+                let rel = if r.abs() > 0.001 { ((g - r) / r).abs() } else { (g - r).abs() };
+                assert!(
+                    rel < 0.15,
+                    "({m},{j}): ref={r:.4}, got={g:.4}, rel={rel:.4}"
+                );
+            }
         }
     }
 }

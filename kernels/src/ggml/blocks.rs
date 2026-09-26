@@ -145,6 +145,22 @@ pub struct BlockQ8K {
 }
 pub const BLOCK_Q8K_SIZE: usize = 292;
 
+/// 4 Q8K activation rows interleaved for 4×8 GEMM with Q4Kx8 weights.
+///
+/// Layout (1168 bytes total, matches llama.cpp block_q8_Kx4):
+/// - d[4]:       f32 scales, one per activation row
+/// - qs[1024]:   4×256 int8 quants interleaved with blck_size_interleave=8:
+///               groups of 32 bytes: 8 from row 0, 8 from row 1, 8 from row 2, 8 from row 3
+/// - bsums[64]:  per-16-element sums, index = row*4 + 16*(elem/64) + (elem/16)%4
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BlockQ8Kx4 {
+    pub d: [f32; 4],
+    pub qs: [i8; 1024],
+    pub bsums: [i16; 64],
+}
+pub const BLOCK_Q8KX4_SIZE: usize = 1168;
+
 impl std::fmt::Debug for BlockQ8K {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockQ8K")

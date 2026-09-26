@@ -4934,6 +4934,53 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             return Ok(());
         }
 
+        // m>1 prefill fast path: repack activations into Q8Kx4 and run 4×8 GEMM.
+        // Requires m divisible by 4 and n divisible by 8.
+        if m % 4 == 0 && n % 8 == 0 {
+            use crate::ggml::blocks::{BlockQ4K, BlockQ4Kx8};
+            use crate::ggml::repack::{quantize_mat_q8k_4x8, repack_q4k_to_q4kx8};
+
+            thread_local! {
+                static Q4KX8_GEMM_CACHE: std::cell::RefCell<(usize, usize, usize, Vec<BlockQ4Kx8>)> =
+                    const { std::cell::RefCell::new((0, 0, 0, Vec::new())) };
+            }
+
+            let src_ptr = b_quantized.as_ptr() as usize;
+            let packed_ready = Q4KX8_GEMM_CACHE.with(|c| {
+                let cache = c.borrow();
+                cache.0 == src_ptr && cache.1 == n && cache.2 == blocks_per_row
+            });
+            if !packed_ready {
+                let src_q4k = unsafe {
+                    std::slice::from_raw_parts(
+                        b_quantized.as_ptr() as *const BlockQ4K,
+                        n * blocks_per_row,
+                    )
+                };
+                let repacked = repack_q4k_to_q4kx8(src_q4k, n, blocks_per_row);
+                Q4KX8_GEMM_CACHE.with(|c| {
+                    *c.borrow_mut() = (src_ptr, n, blocks_per_row, repacked);
+                });
+            }
+
+            let packed_a = quantize_mat_q8k_4x8(a, m, k);
+
+            Q4KX8_GEMM_CACHE.with(|c| {
+                let cache = c.borrow();
+                let packed_w = &cache.3;
+                crate::ggml::vec_dot_avx2::gemm_q4k_8x8_scalar(
+                    blocks_per_row,
+                    packed_w,
+                    &packed_a,
+                    output,
+                    m,
+                    n,
+                );
+            });
+
+            return Ok(());
+        }
+
         let job = Q4kMnBlockJob {
             bq_ptr: b_quantized.as_ptr(),
             q8k_ptr: q8k_all.as_ptr() as *const u8,
