@@ -4791,8 +4791,9 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         }
 
         // m=1 decode fast path: repack weights into BlockQ4Kx8 and run 8-wide GEMV.
-        // This computes all 8 rows simultaneously, sharing activation loads and amortising
-        // scale extraction 4× vs the pair kernel. n must be divisible by 8.
+        // Uses maddubs (AVX2, no VNNI). Only beneficial when VNNI is NOT available;
+        // on VNNI CPUs the pair kernel's dpbusd is faster, so fall through to Q4kGemvJob.
+        #[cfg(not(any(target_feature = "avxvnni", target_feature = "avx512vnni")))]
         if m == 1 && n % 8 == 0 {
             use crate::ggml::blocks::{BlockQ4K, BlockQ4Kx8};
             use crate::ggml::repack::repack_q4k_to_q4kx8;
