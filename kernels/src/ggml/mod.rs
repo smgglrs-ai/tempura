@@ -7,6 +7,7 @@ pub mod mul_mat;
 pub mod quantize;
 pub mod repack;
 pub mod types;
+pub mod quants_llama;
 pub mod vec_dot;
 pub mod vec_dot_avx2;
 
