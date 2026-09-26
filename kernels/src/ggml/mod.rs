@@ -1,5 +1,6 @@
 mod bench;
 pub mod blocks;
+pub mod cpu_llama;
 pub mod dequantize;
 pub mod helpers;
 pub mod iq_tables;
