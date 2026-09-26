@@ -3,11 +3,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 struct Inner {
-    // gen_atomic: lock-free shadow of mutex-protected gen for spinning workers.
-    // Stored with Release after ranges/fn_ptr/ctx are written (inside mutex);
-    // read with Acquire in spin phase — establishes happens-before for all prior stores.
-    gen_atomic: AtomicU64,
-    // Condvar-based wake: workers park here after spin budget is exhausted.
+    // Condvar-based wake: workers park until gen changes.
     // Zero memory-bus pressure when idle — no polling.
     mutex: Mutex<u64>,
     condvar: Condvar,
@@ -19,25 +15,16 @@ struct Inner {
     ranges: Box<[u64]>,
     fn_ptr: AtomicU64,
     ctx: AtomicU64,
-    // Spin budget: iterations with spin_loop() before parking on condvar.
-    // Default 4_000_000 (~1ms at 4GHz). Set TEMPURA_POOL_SPIN=0 to disable.
-    spin_budget: usize,
 }
 
-/// Static-partition thread pool with spin-before-sleep wake discipline.
+/// Static-partition thread pool with Condvar park/wake.
 ///
-/// Pre-spawned threads first spin with `std::hint::spin_loop()` for `spin_budget`
-/// iterations reading a lock-free generation counter. If the generation changes
-/// during spinning (next matmul arrived), they proceed with zero condvar latency.
-/// If the budget is exhausted without a generation change, they fall back to
-/// `std::sync::Condvar` parking — no idle CPU burn on non-inference workloads.
-///
+/// Pre-spawned threads park between `run()` calls via `std::sync::Condvar`.
 /// Work is divided into statically pre-assigned contiguous ranges — thread i
 /// processes its range with zero per-item atomics. On wake, each thread reads
 /// its own range slot (no cache-line sharing during computation).
 ///
-/// vs pure condvar: eliminates ~20μs wake latency × ~100 dispatches/token.
-/// vs tight spinning: condvar fallback prevents DRAM-bandwidth starvation when idle.
+/// vs spinning: eliminates idle memory-bus pressure from polling a shared atomic.
 /// vs Rayon: no crossbeam epoch GC overhead between calls.
 ///
 /// Designed for repeated short embarrassingly-parallel workloads where
@@ -50,14 +37,8 @@ pub struct StaticPool {
 
 impl StaticPool {
     pub fn new(n_workers: usize) -> Self {
-        let spin_budget = std::env::var("TEMPURA_POOL_SPIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4_000_000usize);
-
         let ranges: Box<[u64]> = vec![0u64; n_workers].into_boxed_slice();
         let inner = Arc::new(Inner {
-            gen_atomic: AtomicU64::new(0),
             mutex: Mutex::new(0u64),
             condvar: Condvar::new(),
             done: AtomicUsize::new(0),
@@ -65,7 +46,6 @@ impl StaticPool {
             ranges,
             fn_ptr: AtomicU64::new(0),
             ctx: AtomicU64::new(0),
-            spin_budget,
         });
 
         let mut threads = Vec::with_capacity(n_workers);
@@ -149,13 +129,11 @@ impl StaticPool {
         inner.ctx.store(ctx as usize as u64, Ordering::Relaxed);
         inner.done.store(0, Ordering::Relaxed);
 
-        // Wake workers: increment gen under the mutex, then store gen_atomic
-        // with Release (establishes happens-before for all stores above),
-        // then notify_all for workers that already fell back to condvar sleep.
+        // Wake workers: increment gen under the mutex, then notify_all.
+        // The mutex lock provides the Release fence for the stores above.
         {
             let mut gen = inner.mutex.lock().unwrap();
             *gen += 1;
-            inner.gen_atomic.store(*gen, Ordering::Release);
             inner.condvar.notify_all();
         }
 
@@ -182,64 +160,18 @@ impl Drop for StaticPool {
         self.inner.shutdown.store(true, Ordering::Relaxed);
         let mut gen = self.inner.mutex.lock().unwrap();
         *gen += 1;
-        // Store gen_atomic so workers in spin phase see the gen change and check shutdown.
-        self.inner.gen_atomic.store(*gen, Ordering::Release);
         self.inner.condvar.notify_all();
         // _threads drops here, joining all worker threads.
     }
 }
 
-#[inline(always)]
-fn do_work(inner: &Inner, worker_idx: usize) {
-    // The Acquire load of gen_atomic (in spin phase) or condvar wake (in park phase)
-    // establishes happens-before with the Release store of gen_atomic in run_raw,
-    // which in turn sees all prior writes to ranges, fn_ptr, ctx.
-    let packed = unsafe { *inner.ranges.as_ptr().add(worker_idx) };
-    let start = (packed >> 32) as usize;
-    let end = (packed & 0xFFFF_FFFF) as usize;
-
-    if start < end {
-        let fn_raw = inner.fn_ptr.load(Ordering::Relaxed);
-        let ctx_raw = inner.ctx.load(Ordering::Relaxed);
-        type WorkFn = unsafe fn(usize, usize, *const ());
-        let f: WorkFn = unsafe { std::mem::transmute(fn_raw as usize) };
-        unsafe { f(start, end, ctx_raw as *const ()) };
-    }
-
-    inner.done.fetch_add(1, Ordering::Release);
-}
-
 fn worker_loop(worker_idx: usize, inner: Arc<Inner>) {
     let mut last_gen = 0u64;
     loop {
-        // Phase 1: spin-before-sleep — busy-wait with _mm_pause() for spin_budget
-        // iterations. For decode at ~7 tok/s, consecutive matmuls arrive every ~1ms;
-        // with a 1ms spin budget workers are awake when the next dispatch arrives,
-        // eliminating condvar wake latency (~20μs × ~100 dispatches/token).
-        let spin_budget = inner.spin_budget;
-        let mut spun = 0usize;
-        while spun < spin_budget {
-            let g = inner.gen_atomic.load(Ordering::Acquire);
-            if g != last_gen {
-                if inner.shutdown.load(Ordering::Relaxed) {
-                    return;
-                }
-                last_gen = g;
-                do_work(&inner, worker_idx);
-                break;
-            }
-            std::hint::spin_loop();
-            spun += 1;
-        }
-        if spun < spin_budget {
-            // Work was found during spin phase; loop back to spin for next dispatch.
-            continue;
-        }
-
-        // Phase 2: spin budget exhausted — park on condvar until gen changes.
-        // This prevents idle CPU burn on non-inference workloads.
+        // Park until gen changes or shutdown.
         let current_gen = {
             let guard = inner.mutex.lock().unwrap();
+            // wait_while parks atomically — no busy-polling, zero memory bus pressure.
             let guard = inner
                 .condvar
                 .wait_while(guard, |gen| {
@@ -252,7 +184,22 @@ fn worker_loop(worker_idx: usize, inner: Arc<Inner>) {
             return;
         }
         last_gen = current_gen;
-        do_work(&inner, worker_idx);
+
+        // Read our pre-assigned range. The mutex unlock above (from Condvar::wait_while)
+        // provides the Acquire barrier, ensuring we see the range written before notify_all.
+        let packed = unsafe { *inner.ranges.as_ptr().add(worker_idx) };
+        let start = (packed >> 32) as usize;
+        let end = (packed & 0xFFFF_FFFF) as usize;
+
+        if start < end {
+            let fn_raw = inner.fn_ptr.load(Ordering::Relaxed);
+            let ctx_raw = inner.ctx.load(Ordering::Relaxed);
+            type WorkFn = unsafe fn(usize, usize, *const ());
+            let f: WorkFn = unsafe { std::mem::transmute(fn_raw as usize) };
+            unsafe { f(start, end, ctx_raw as *const ()) };
+        }
+
+        inner.done.fetch_add(1, Ordering::Release);
     }
 }
 
