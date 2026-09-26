@@ -100,12 +100,10 @@ pub const BLOCK_Q4K_SIZE: usize = 144;
 /// 8 Q4K blocks interleaved for 8-wide SIMD GEMV (matches llama.cpp block_q4_Kx8).
 ///
 /// Layout (1152 bytes total):
-/// - d[8]:       f16 super-block scales, one per weight row
-/// - dmin[8]:    f16 super-block mins, one per weight row
-/// - scales[96]: 8×12 scale bytes interleaved by sub-block pair (24 bytes per sb pair)
-/// - qs[1024]:   8×128 nibble bytes interleaved in 8-byte chunks
-///               [B0[0:8], B1[0:8], ..., B7[0:8], B0[8:16], ..., B7[24:32],
-///                B0[32:40], ..., B7[56:64], ...] (one complete 256-byte sb, then next)
+/// - `d[8]`:       f16 super-block scales, one per weight row
+/// - `dmin[8]`:    f16 super-block mins, one per weight row
+/// - `scales[96]`: 8×12 scale bytes interleaved by sub-block pair (24 bytes per sb pair)
+/// - `qs[1024]`:   8×128 nibble bytes interleaved in 8-byte chunks
 #[repr(C)]
 pub struct BlockQ4Kx8 {
     pub d: [u16; 8],

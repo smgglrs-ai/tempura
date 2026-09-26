@@ -1702,7 +1702,7 @@ pub unsafe fn gemv_q4k_8x8_avx2(
 
             // Load activation bytes for this sb (64 bytes total, split into 4 × 16-byte chunks
             // broadcast to 256 bits each so every row sees the same activation data).
-            let q8_base = y.qs.as_ptr().add(sb * 64) as *const i8;
+            let q8_base = y.qs.as_ptr().add(sb * 64);
             let lhs_00 = {
                 let v = _mm256_castsi128_si256(_mm_loadu_si128(q8_base as *const __m128i));
                 _mm256_permute2f128_si256(v, v, 0) // broadcast lo128 to both halves
@@ -2156,8 +2156,8 @@ pub fn gemv_q4k_8x8_vnni_dispatch(
     act: &[BlockQ8K],
 ) -> [f32; 8] {
     #[cfg(target_arch = "x86_64")]
-    if (is_x86_feature_detected!("avxvnni") || is_x86_feature_detected!("avx512vnni"))
-        && is_x86_feature_detected!("f16c")
+    #[allow(clippy::nonminimal_bool)]
+    if (is_x86_feature_detected!("avxvnni") || is_x86_feature_detected!("avx512vnni")) && is_x86_feature_detected!("f16c")
     {
         return unsafe { gemv_q4k_8x8_vnni(nb, packed, act) };
     }

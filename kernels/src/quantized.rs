@@ -4937,8 +4937,9 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         // m=1 decode fast path for VNNI: dpbusd-based 8-wide GEMV using BlockQ4Kx8V.
         // ONE dpbusd call processes all 8 weight rows simultaneously (4-byte-per-row layout).
         #[cfg(target_arch = "x86_64")]
+        #[allow(clippy::nonminimal_bool)]
         if m == 1
-            && n % 8 == 0
+            && n.is_multiple_of(8)
             && (is_x86_feature_detected!("avxvnni") || is_x86_feature_detected!("avx512vnni"))
             && is_x86_feature_detected!("f16c")
         {
