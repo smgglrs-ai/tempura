@@ -695,7 +695,7 @@ impl<'a, A: Q0BlockAvx, B: Q0BlockAvx> TinyBlasQ0Avx<'a, A, B> {
 
 /// Compute `BLOCK_SIZE<M>(m)`: divide n into at most M-sized blocks, rounding up.
 /// C++ lines 474-478.
-fn block_size(m: i64, cap: i64) -> i64 {
+pub(super) fn block_size(m: i64, cap: i64) -> i64 {
     let nb = (m + cap - 1) / cap;
     if m % nb == 0 { m / nb } else { m / nb + 1 }
 }
@@ -931,13 +931,21 @@ pub unsafe fn llamafile_sgemm(
                 return false;
             }
 
-            // ── F16/BF16 paths ───────────────────────────────────────────────
-            // C++ lines 3893-3955 (BF16) and 3957-4040 (F16).
-            // TODO: translate tinyBLAS for F16/BF16. Requires f16 load intrinsics
-            // (_mm256_cvtph_ps / _mm512_cvtph_ps) and separate handling for
-            // BF16 (AVX-512BF16 _mm512_dpbf16_ps or AVX2 shift trick).
-            GgmlType::F16 | GgmlType::BF16 => {
-                return false; // TODO: tinyBLAS F16/BF16
+            // ── F16 × F16 ────────────────────────────────────────────────────
+            // C++ lines 3957-4039: tinyBLAS<8,__m256,__m256,fp16,fp16,float>
+            // (AVX2+F16C) and tinyBLAS<16,__m512,__m512,fp16,fp16,float>
+            // (AVX-512). Implemented in sgemm_llama2.
+            GgmlType::F16 => {
+                return super::sgemm_llama2::llamafile_sgemm_f16(
+                    m, n, k, a, lda, b, ldb, c, ldc, ith, nth, b_type,
+                );
+            }
+
+            // ── BF16 paths ───────────────────────────────────────────────────
+            // C++ lines 3893-3955: requires AVX-512BF16 _mm512_dpbf16_ps or
+            // the 16-bit left-shift F32 widening trick. Not yet translated.
+            GgmlType::BF16 => {
+                return false; // TODO: tinyBLAS BF16
             }
 
             // ── Q8_0 × Q8_0 ──────────────────────────────────────────────────
