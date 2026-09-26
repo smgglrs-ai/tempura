@@ -169,57 +169,6 @@ impl crate::inference_pool::KernelJob for Q4kGemvX8Job {
     }
 }
 
-// VNNI variant: uses BlockQ4Kx8V (4-byte-per-row layout) and dpbusd-based kernel.
-struct Q4kGemvX8VJob {
-    packed_ptr: *const u8, // &[BlockQ4Kx8V], n/8 groups × bpr entries
-    q8k_ptr: *const u8,   // single activation row, bpr BlockQ8K entries
-    out_ptr: *mut f32,     // n output floats
-    n: usize,              // total output neurons (must be divisible by 8)
-    bpr: usize,            // Q4Kx8V blocks per row group
-}
-unsafe impl Sync for Q4kGemvX8VJob {}
-impl crate::inference_pool::KernelJob for Q4kGemvX8VJob {
-    #[inline(always)]
-    fn exec_range(&self, start: usize, end: usize) {
-        use crate::ggml::blocks::{BlockQ4Kx8V, BlockQ8K};
-        let q8k = unsafe {
-            std::slice::from_raw_parts(self.q8k_ptr as *const BlockQ8K, self.bpr)
-        };
-        let packed_stride = self.bpr;
-        #[allow(unused_variables)]
-        let n_groups = self.n / 8;
-        for grp in start..end {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                let pf_grp = grp + 4;
-                if pf_grp < n_groups {
-                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
-                    let pf_ptr = self.packed_ptr.add(
-                        pf_grp * packed_stride * std::mem::size_of::<BlockQ4Kx8V>(),
-                    );
-                    _mm_prefetch(pf_ptr as *const i8, _MM_HINT_T1);
-                }
-            }
-            let packed = unsafe {
-                std::slice::from_raw_parts(
-                    self.packed_ptr.add(
-                        grp * packed_stride * std::mem::size_of::<BlockQ4Kx8V>(),
-                    ) as *const BlockQ4Kx8V,
-                    self.bpr,
-                )
-            };
-            let results =
-                crate::ggml::vec_dot_avx2::gemv_q4k_8x8_vnni_dispatch(self.bpr, packed, q8k);
-            let out_base = grp * 8;
-            unsafe {
-                for r in 0..8 {
-                    *self.out_ptr.add(out_base + r) = results[r];
-                }
-            }
-        }
-    }
-}
-
 // m×n job structs: parallelize over idx = i*n + j with static dispatch pointer.
 struct Q4kMnJob {
     bq_ptr: *const u8,
@@ -4932,56 +4881,6 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             }
             #[cfg(not(target_arch = "x86_64"))]
             crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
-        }
-
-        // m=1 decode fast path for VNNI: dpbusd-based 8-wide GEMV using BlockQ4Kx8V.
-        // ONE dpbusd call processes all 8 weight rows simultaneously (4-byte-per-row layout).
-        #[cfg(target_arch = "x86_64")]
-        if m == 1
-            && n % 8 == 0
-            && (is_x86_feature_detected!("avxvnni") || is_x86_feature_detected!("avx512vnni"))
-            && is_x86_feature_detected!("f16c")
-        {
-            use crate::ggml::blocks::{BlockQ4K, BlockQ4Kx8V};
-            use crate::ggml::repack::repack_q4k_to_q4kx8v;
-
-            thread_local! {
-                static Q4KX8V_CACHE: std::cell::RefCell<(usize, usize, usize, Vec<BlockQ4Kx8V>)> =
-                    const { std::cell::RefCell::new((0, 0, 0, Vec::new())) };
-            }
-
-            let src_ptr = b_quantized.as_ptr() as usize;
-            let packed_ready = Q4KX8V_CACHE.with(|c| {
-                let cache = c.borrow();
-                cache.0 == src_ptr && cache.1 == n && cache.2 == blocks_per_row
-            });
-
-            if !packed_ready {
-                let src_q4k = unsafe {
-                    std::slice::from_raw_parts(
-                        b_quantized.as_ptr() as *const BlockQ4K,
-                        n * blocks_per_row,
-                    )
-                };
-                let repacked = repack_q4k_to_q4kx8v(src_q4k, n, blocks_per_row);
-                Q4KX8V_CACHE.with(|c| {
-                    *c.borrow_mut() = (src_ptr, n, blocks_per_row, repacked);
-                });
-            }
-
-            Q4KX8V_CACHE.with(|c| {
-                let cache = c.borrow();
-                let packed = &cache.3;
-                let job = Q4kGemvX8VJob {
-                    packed_ptr: packed.as_ptr() as *const u8,
-                    q8k_ptr: q8k_all.as_ptr() as *const u8,
-                    out_ptr: output.as_mut_ptr(),
-                    n,
-                    bpr: blocks_per_row,
-                };
-                crate::inference_pool::par_run_job(n / 8, &job);
-            });
-            return Ok(());
         }
 
         // m=1 decode fast path: repack weights into BlockQ4Kx8 and run 8-wide GEMV.
