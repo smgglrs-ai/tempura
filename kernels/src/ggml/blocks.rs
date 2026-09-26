@@ -171,17 +171,7 @@ impl std::fmt::Debug for BlockQ8K {
     }
 }
 
-/// 4 Q8K blocks interleaved for 4-wide SIMD GEMM (matches llama.cpp block_q8_Kx4).
-///
-/// Layout: d[4] f32 + qs[1024] i8 (QK_K*4 = 256*4) + bsums[64] i16 (QK_K/4).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct BlockQ8Kx4 {
-    pub d: [f32; 4],
-    pub qs: [i8; 1024],  // QK_K * 4
-    pub bsums: [i16; 64], // QK_K / 4
-}
-pub const BLOCK_Q8KX4_SIZE: usize = 4 * 4 + 1024 + 64 * 2; // 1164
+// BlockQ8Kx4 defined above (line ~155)
 
 // ── Ternary quants (QK_K = 256) ────────────────────────────────────────────
 
