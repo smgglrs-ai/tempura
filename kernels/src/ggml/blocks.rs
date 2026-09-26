@@ -6,6 +6,14 @@
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+pub struct BlockQ2_0 {
+    pub d: u16,       // f16 scale
+    pub qs: [u8; 16], // 2-bit quantized (QK2_0=64 values, 4 per byte = 16 bytes)
+}
+pub const BLOCK_Q2_0_SIZE: usize = 18;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct BlockQ1_0 {
     pub d: u16,       // f16 scale
     pub qs: [u8; 16], // 1-bit packed (QK=128, 128/8=16 bytes)
@@ -307,6 +315,7 @@ macro_rules! assert_block_size {
     };
 }
 
+assert_block_size!(BlockQ2_0, BLOCK_Q2_0_SIZE);
 assert_block_size!(BlockQ1_0, BLOCK_Q1_0_SIZE);
 assert_block_size!(BlockQ4_0, BLOCK_Q4_0_SIZE);
 assert_block_size!(BlockQ4_1, BLOCK_Q4_1_SIZE);

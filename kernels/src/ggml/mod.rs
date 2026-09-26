@@ -12,6 +12,7 @@ pub mod mul_mat_llama;
 pub mod ops_llama;
 pub mod quantize;
 pub mod quants_llama;
+pub mod quants_llama_generic;
 pub mod repack;
 pub mod repack_llama;
 pub mod repack_llama2;
