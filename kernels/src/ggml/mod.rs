@@ -1,8 +1,8 @@
 
 mod bench;
 pub mod binary_ops_llama;
-pub mod cpu_feats_llama;
 pub mod blocks;
+pub mod cpu_feats_llama;
 pub mod cpu_llama;
 pub mod dequantize;
 pub mod helpers;
@@ -11,6 +11,7 @@ pub mod iq_tables;
 pub mod mul_mat;
 pub mod mul_mat_llama;
 pub mod ops_llama;
+pub mod ops_llama2;
 pub mod ops_llama3;
 pub mod quantize;
 pub mod quants_llama;
