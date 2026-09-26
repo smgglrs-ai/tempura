@@ -863,6 +863,191 @@ pub fn vec_dot_q4k_q8k_dispatch_4x2(
     [[p0.0, p0.1], [p1.0, p1.1], [p2.0, p2.1], [p3.0, p3.1]]
 }
 
+/// 8 activation rows × 4 weight rows = 32 simultaneous Q4K×Q8K dot products.
+/// Returns `results[act_row][weight_row]` for act_row in 0..8, weight_row in 0..4.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+pub unsafe fn vec_dot_q4k_q8k_8x4_vnni(
+    n: usize,
+    w0: &[BlockQ4K],
+    w1: &[BlockQ4K],
+    w2: &[BlockQ4K],
+    w3: &[BlockQ4K],
+    a0: &[BlockQ8K],
+    a1: &[BlockQ8K],
+    a2: &[BlockQ8K],
+    a3: &[BlockQ8K],
+    a4: &[BlockQ8K],
+    a5: &[BlockQ8K],
+    a6: &[BlockQ8K],
+    a7: &[BlockQ8K],
+) -> [[f32; 4]; 8] {
+    use super::helpers::get_scale_min_k4;
+    let nb = n / 256;
+    let mask_lo = _mm256_set1_epi8(0x0F);
+    let zero_si = _mm256_setzero_si256();
+    let zero_ps = _mm256_setzero_ps();
+
+    let mut acc = [[zero_ps; 4]; 8];
+    let mut mins_total = [[0.0f32; 4]; 8];
+
+    let w_ptrs = [w0.as_ptr(), w1.as_ptr(), w2.as_ptr(), w3.as_ptr()];
+    let a_ptrs = [
+        a0.as_ptr(),
+        a1.as_ptr(),
+        a2.as_ptr(),
+        a3.as_ptr(),
+        a4.as_ptr(),
+        a5.as_ptr(),
+        a6.as_ptr(),
+        a7.as_ptr(),
+    ];
+
+    for i in 0..nb {
+        let wi = [
+            &*w_ptrs[0].add(i),
+            &*w_ptrs[1].add(i),
+            &*w_ptrs[2].add(i),
+            &*w_ptrs[3].add(i),
+        ];
+
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut sc = [[0u8; 8]; 4];
+        let mut mi = [[0u8; 8]; 4];
+
+        for w in 0..4 {
+            d[w] = f16_to_f32(wi[w].d);
+            dmin[w] = f16_to_f32(wi[w].dmin);
+            for jj in 0..8 {
+                let (s, m) = get_scale_min_k4(jj, &wi[w].scales);
+                sc[w][jj] = s;
+                mi[w][jj] = m;
+            }
+        }
+
+        let mut q8_ptrs = [std::ptr::null::<i8>(); 8];
+        let mut d_ys = [0.0f32; 8];
+        for r in 0..8 {
+            q8_ptrs[r] = (*a_ptrs[r].add(i)).qs.as_ptr();
+            d_ys[r] = (*a_ptrs[r].add(i)).d;
+        }
+
+        // 32 integer accumulators: sumi[act_row][weight_row]
+        let mut sumi = [[zero_si; 4]; 8];
+
+        for j in 0..4 {
+            // Load Q4K nibbles for all 4 weight rows (shared across all 8 activation rows)
+            let mut q4_lo = [zero_si; 4];
+            let mut q4_hi = [zero_si; 4];
+            let mut sc_lo = [0i32; 4];
+            let mut sc_hi = [0i32; 4];
+            for w in 0..4 {
+                let q4_chunk =
+                    _mm256_loadu_si256(wi[w].qs.as_ptr().add(j * 32) as *const __m256i);
+                q4_lo[w] = _mm256_and_si256(q4_chunk, mask_lo);
+                q4_hi[w] = _mm256_and_si256(_mm256_srli_epi16(q4_chunk, 4), mask_lo);
+                sc_lo[w] = sc[w][2 * j] as i32;
+                sc_hi[w] = sc[w][2 * j + 1] as i32;
+            }
+
+            // Each activation load is reused against all 4 weight rows
+            for r in 0..8 {
+                let q8_lo =
+                    _mm256_loadu_si256(q8_ptrs[r].add(j * 64) as *const __m256i);
+                let q8_hi =
+                    _mm256_loadu_si256(q8_ptrs[r].add(j * 64 + 32) as *const __m256i);
+
+                for w in 0..4 {
+                    let dot_lo = _mm256_dpbusd_epi32(zero_si, q4_lo[w], q8_lo);
+                    let dot_hi = _mm256_dpbusd_epi32(zero_si, q4_hi[w], q8_hi);
+                    sumi[r][w] = _mm256_add_epi32(
+                        sumi[r][w],
+                        _mm256_add_epi32(
+                            _mm256_mullo_epi32(dot_lo, _mm256_set1_epi32(sc_lo[w])),
+                            _mm256_mullo_epi32(dot_hi, _mm256_set1_epi32(sc_hi[w])),
+                        ),
+                    );
+                }
+            }
+        }
+
+        for r in 0..8 {
+            let d_y = d_ys[r];
+            for w in 0..4 {
+                acc[r][w] = _mm256_fmadd_ps(
+                    _mm256_set1_ps(d[w] * d_y),
+                    _mm256_cvtepi32_ps(sumi[r][w]),
+                    acc[r][w],
+                );
+            }
+
+            // bsums hadd computed once per activation row, reused across all 4 weight rows
+            let bsums = &(*a_ptrs[r].add(i)).bsums;
+            let mut smins = [0i32; 4];
+            for jj in 0..16 {
+                let bs = bsums[jj] as i32;
+                for w in 0..4 {
+                    smins[w] += bs * mi[w][jj >> 1] as i32;
+                }
+            }
+            for w in 0..4 {
+                mins_total[r][w] += dmin[w] * d_y * smins[w] as f32;
+            }
+        }
+    }
+
+    let mut result = [[0.0f32; 4]; 8];
+    for r in 0..8 {
+        for w in 0..4 {
+            result[r][w] = hsum_f32_8(acc[r][w]) - mins_total[r][w];
+        }
+    }
+    result
+}
+
+/// Dispatch 8×4 block kernel. Uses VNNI when available, falls back to four 4×2 calls.
+/// Returns `results[r][w] = dot(a_r, w_w)` for r in 0..8, w in 0..4.
+#[inline(always)]
+#[allow(unreachable_code)]
+pub fn vec_dot_q4k_q8k_dispatch_8x4(
+    n: usize,
+    w0: &[BlockQ4K],
+    w1: &[BlockQ4K],
+    w2: &[BlockQ4K],
+    w3: &[BlockQ4K],
+    a0: &[BlockQ8K],
+    a1: &[BlockQ8K],
+    a2: &[BlockQ8K],
+    a3: &[BlockQ8K],
+    a4: &[BlockQ8K],
+    a5: &[BlockQ8K],
+    a6: &[BlockQ8K],
+    a7: &[BlockQ8K],
+) -> [[f32; 4]; 8] {
+    #[cfg(any(target_feature = "avxvnni", target_feature = "avx512vnni"))]
+    {
+        return unsafe {
+            vec_dot_q4k_q8k_8x4_vnni(n, w0, w1, w2, w3, a0, a1, a2, a3, a4, a5, a6, a7)
+        };
+    }
+    // Fallback: combine four 4×2 calls
+    let r03_w01 = vec_dot_q4k_q8k_dispatch_4x2(n, w0, w1, a0, a1, a2, a3);
+    let r47_w01 = vec_dot_q4k_q8k_dispatch_4x2(n, w0, w1, a4, a5, a6, a7);
+    let r03_w23 = vec_dot_q4k_q8k_dispatch_4x2(n, w2, w3, a0, a1, a2, a3);
+    let r47_w23 = vec_dot_q4k_q8k_dispatch_4x2(n, w2, w3, a4, a5, a6, a7);
+    [
+        [r03_w01[0][0], r03_w01[0][1], r03_w23[0][0], r03_w23[0][1]],
+        [r03_w01[1][0], r03_w01[1][1], r03_w23[1][0], r03_w23[1][1]],
+        [r03_w01[2][0], r03_w01[2][1], r03_w23[2][0], r03_w23[2][1]],
+        [r03_w01[3][0], r03_w01[3][1], r03_w23[3][0], r03_w23[3][1]],
+        [r47_w01[0][0], r47_w01[0][1], r47_w23[0][0], r47_w23[0][1]],
+        [r47_w01[1][0], r47_w01[1][1], r47_w23[1][0], r47_w23[1][1]],
+        [r47_w01[2][0], r47_w01[2][1], r47_w23[2][0], r47_w23[2][1]],
+        [r47_w01[3][0], r47_w01[3][1], r47_w23[3][0], r47_w23[3][1]],
+    ]
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni")]
 pub unsafe fn vec_dot_q4_0_q8_0_vnni(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
