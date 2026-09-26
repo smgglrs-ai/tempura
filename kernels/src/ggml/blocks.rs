@@ -115,6 +115,37 @@ pub struct BlockQ4Kx8 {
 }
 pub const BLOCK_Q4KX8_SIZE: usize = 1152;
 
+/// 8 Q4K blocks interleaved for 4-byte-stride dpbusd GEMM.
+///
+/// Layout (1152 bytes total, same size as BlockQ4Kx8):
+/// - d[8], dmin[8], scales[96]: same as BlockQ4Kx8
+/// - qs[1024]: 64 chunks × 16 bytes: for chunk c, row r:
+///   qs[c*16 + r*2 .. +2] = src[r].qs[c*2 .. +2]
+///   (covers 4 nibble elements per row per chunk, interleaved by row)
+#[repr(C)]
+pub struct BlockQ4Kx8V {
+    pub d: [u16; 8],
+    pub dmin: [u16; 8],
+    pub scales: [u8; 96],
+    pub qs: [u8; 1024],
+}
+pub const BLOCK_Q4KX8V_SIZE: usize = 1152;
+
+/// 4 Q8K activation rows interleaved with 4-byte stride for 4×8 dpbusd GEMM.
+///
+/// Layout:
+/// - d[4]:     f32 scale per activation row
+/// - qs[1024]: 64 chunks × 16 bytes: for chunk c (elements c*4..c*4+3), row r (0..4):
+///             qs[c*16 + r*4 .. +4] = src[r].qs[c*4 .. +4]
+/// - bsums[64]: row r: bsums[r*16..r*16+16] = src[r].bsums[0..16]
+#[repr(C)]
+pub struct BlockQ8Kx4 {
+    pub d: [f32; 4],
+    pub qs: [i8; 1024],
+    pub bsums: [i16; 64],
+}
+pub const BLOCK_Q8KX4_SIZE: usize = 16 + 1024 + 128; // 1168
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ5K {
