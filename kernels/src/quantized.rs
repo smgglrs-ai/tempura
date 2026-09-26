@@ -365,9 +365,104 @@ impl crate::inference_pool::KernelJob for Q4kMnBlockJob {
         use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
         use crate::ggml::vec_dot_avx2::{
             vec_dot_q4_k_q8_k_dispatch, vec_dot_q4_k_q8_k_dispatch_pair,
-            vec_dot_q4k_q8k_dispatch_4x2,
+            vec_dot_q4k_q8k_dispatch_4x2, vec_dot_q4k_q8k_dispatch_4x4,
         };
         let mut j = start;
+        // BN=4 tile: process 4 weight rows simultaneously with 4×4 dispatch.
+        while j + 3 < end {
+            let w0 = unsafe {
+                std::slice::from_raw_parts(
+                    self.bq_ptr.add(j * self.bq_row_bytes) as *const BlockQ4K,
+                    self.bpr,
+                )
+            };
+            let w1 = unsafe {
+                std::slice::from_raw_parts(
+                    self.bq_ptr.add((j + 1) * self.bq_row_bytes) as *const BlockQ4K,
+                    self.bpr,
+                )
+            };
+            let w2 = unsafe {
+                std::slice::from_raw_parts(
+                    self.bq_ptr.add((j + 2) * self.bq_row_bytes) as *const BlockQ4K,
+                    self.bpr,
+                )
+            };
+            let w3 = unsafe {
+                std::slice::from_raw_parts(
+                    self.bq_ptr.add((j + 3) * self.bq_row_bytes) as *const BlockQ4K,
+                    self.bpr,
+                )
+            };
+            let mut i = 0;
+            // BM=4 tile: process 4 activation rows simultaneously.
+            while i + 3 < self.m {
+                let a0 = unsafe {
+                    std::slice::from_raw_parts(
+                        self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K,
+                        self.bpr,
+                    )
+                };
+                let a1 = unsafe {
+                    std::slice::from_raw_parts(
+                        self.q8k_ptr.add((i + 1) * self.q8k_row_bytes) as *const BlockQ8K,
+                        self.bpr,
+                    )
+                };
+                let a2 = unsafe {
+                    std::slice::from_raw_parts(
+                        self.q8k_ptr.add((i + 2) * self.q8k_row_bytes) as *const BlockQ8K,
+                        self.bpr,
+                    )
+                };
+                let a3 = unsafe {
+                    std::slice::from_raw_parts(
+                        self.q8k_ptr.add((i + 3) * self.q8k_row_bytes) as *const BlockQ8K,
+                        self.bpr,
+                    )
+                };
+                let r = vec_dot_q4k_q8k_dispatch_4x4(self.k, w0, w1, w2, w3, a0, a1, a2, a3);
+                unsafe {
+                    *self.out_ptr.add(i * self.n + j) = r[0][0];
+                    *self.out_ptr.add(i * self.n + j + 1) = r[0][1];
+                    *self.out_ptr.add(i * self.n + j + 2) = r[0][2];
+                    *self.out_ptr.add(i * self.n + j + 3) = r[0][3];
+                    *self.out_ptr.add((i + 1) * self.n + j) = r[1][0];
+                    *self.out_ptr.add((i + 1) * self.n + j + 1) = r[1][1];
+                    *self.out_ptr.add((i + 1) * self.n + j + 2) = r[1][2];
+                    *self.out_ptr.add((i + 1) * self.n + j + 3) = r[1][3];
+                    *self.out_ptr.add((i + 2) * self.n + j) = r[2][0];
+                    *self.out_ptr.add((i + 2) * self.n + j + 1) = r[2][1];
+                    *self.out_ptr.add((i + 2) * self.n + j + 2) = r[2][2];
+                    *self.out_ptr.add((i + 2) * self.n + j + 3) = r[2][3];
+                    *self.out_ptr.add((i + 3) * self.n + j) = r[3][0];
+                    *self.out_ptr.add((i + 3) * self.n + j + 1) = r[3][1];
+                    *self.out_ptr.add((i + 3) * self.n + j + 2) = r[3][2];
+                    *self.out_ptr.add((i + 3) * self.n + j + 3) = r[3][3];
+                }
+                i += 4;
+            }
+            // Remainder activation rows (0, 1, 2, or 3 left).
+            while i < self.m {
+                let a = unsafe {
+                    std::slice::from_raw_parts(
+                        self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K,
+                        self.bpr,
+                    )
+                };
+                let (v0, v1) = vec_dot_q4_k_q8_k_dispatch_pair(self.k, w0, w1, a);
+                let (v2, v3) = vec_dot_q4_k_q8_k_dispatch_pair(self.k, w2, w3, a);
+                unsafe {
+                    *self.out_ptr.add(i * self.n + j) = v0;
+                    *self.out_ptr.add(i * self.n + j + 1) = v1;
+                    *self.out_ptr.add(i * self.n + j + 2) = v2;
+                    *self.out_ptr.add(i * self.n + j + 3) = v3;
+                }
+                i += 1;
+            }
+            j += 4;
+        }
+        // Remainder: BN=2 tile for up to 2 more weight rows.
         while j + 1 < end {
             let w0 = unsafe {
                 std::slice::from_raw_parts(
@@ -382,7 +477,6 @@ impl crate::inference_pool::KernelJob for Q4kMnBlockJob {
                 )
             };
             let mut i = 0;
-            // BM=4 tile: process 4 activation rows simultaneously
             while i + 3 < self.m {
                 let a0 = unsafe {
                     std::slice::from_raw_parts(
@@ -421,7 +515,6 @@ impl crate::inference_pool::KernelJob for Q4kMnBlockJob {
                 }
                 i += 4;
             }
-            // Remainder activation rows (0, 1, 2, or 3 left)
             while i < self.m {
                 let a = unsafe {
                     std::slice::from_raw_parts(
@@ -438,7 +531,7 @@ impl crate::inference_pool::KernelJob for Q4kMnBlockJob {
             }
             j += 2;
         }
-        // Remainder weight row (odd n)
+        // Remainder weight row (odd n).
         if j < end {
             let w = unsafe {
                 std::slice::from_raw_parts(
