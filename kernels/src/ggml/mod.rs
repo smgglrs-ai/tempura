@@ -8,6 +8,7 @@ pub mod mul_mat_llama;
 pub mod quantize;
 pub mod repack;
 pub mod repack_llama;
+pub mod repack_llama2;
 pub mod types;
 pub mod quants_llama;
 pub mod vec_dot;
