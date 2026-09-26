@@ -1,25 +1,26 @@
+
 mod bench;
 pub mod binary_ops_llama;
 pub mod blocks;
 pub mod cpu_llama;
 pub mod dequantize;
 pub mod helpers;
+pub mod iqp_llama;
 pub mod iq_tables;
 pub mod mul_mat;
 pub mod mul_mat_llama;
 pub mod ops_llama;
 pub mod quantize;
+pub mod quants_llama;
 pub mod repack;
 pub mod repack_llama;
+pub mod sgemm_llama;
 pub mod simd_gemm_llama;
 pub mod simd_mappings_llama;
 pub mod types;
-pub mod quants_llama;
 pub mod unary_ops_llama;
 pub mod vec_dot;
 pub mod vec_dot_avx2;
 pub mod vec_llama;
-
 pub use blocks::*;
 pub use types::*;
-pub mod sgemm_llama;
