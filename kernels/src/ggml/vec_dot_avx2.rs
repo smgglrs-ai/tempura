@@ -1910,6 +1910,260 @@ pub fn gemv_q4k_8x8_dispatch(
     gemv_q4k_8x8_scalar(nb, packed, act)
 }
 
+/// VNNI dpbusd-based 8×8 Q4K GEMV for `BlockQ4Kx8V` (4-byte-per-row layout).
+///
+/// ONE `_mm256_dpbusd_epi32` processes all 8 weight rows simultaneously: weight bytes
+/// [row0[4b], row1[4b], ..., row7[4b]] × 4 broadcast activation bytes → 8 i32 lane
+/// partial sums. 64 dpbusd calls per block (2 per chunk × 8 chunks × 4 sub-blocks)
+/// vs 96 ops for the maddubs path.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avxvnni,f16c")]
+pub unsafe fn gemv_q4k_8x8_vnni(
+    nb: usize,
+    packed: &[super::blocks::BlockQ4Kx8V],
+    act: &[BlockQ8K],
+) -> [f32; 8] {
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+    let mut acc = _mm256_setzero_ps();
+    let mut mins_total = _mm256_setzero_ps();
+
+    for i in 0..nb {
+        let p = &packed[i];
+        let y = &act[i];
+
+        // Per-row float scales: d[r] * y.d and dmin[r] * y.d.
+        let row_d = _mm256_mul_ps(
+            _mm256_cvtph_ps(_mm_loadu_si128(p.d.as_ptr() as *const __m128i)),
+            _mm256_set1_ps(y.d),
+        );
+        let row_dmin = _mm256_mul_ps(
+            _mm256_cvtph_ps(_mm_loadu_si128(p.dmin.as_ptr() as *const __m128i)),
+            _mm256_set1_ps(y.d),
+        );
+
+        let mut iacc_main = _mm256_setzero_si256();
+        let mut iacc_min = _mm256_setzero_si256();
+
+        let qs_ptr = p.qs.as_ptr();
+        let q8_ptr = y.qs.as_ptr() as *const u8;
+
+        for sb in 0..4usize {
+            // Decode packed 6-bit scales/mins for this sub-block pair.
+            let mut utmp_0 = [0u32; 4];
+            let mut utmp_1 = [0u32; 4];
+            std::ptr::copy_nonoverlapping(
+                p.scales.as_ptr().add(24 * sb),
+                utmp_0.as_mut_ptr() as *mut u8,
+                12,
+            );
+            std::ptr::copy_nonoverlapping(
+                p.scales.as_ptr().add(12 + 24 * sb),
+                utmp_1.as_mut_ptr() as *mut u8,
+                12,
+            );
+
+            utmp_0[3] = ((utmp_0[2] >> 4) & KMASK2) | (((utmp_0[1] >> 6) & KMASK3) << 4);
+            let uaux_0 = utmp_0[1] & KMASK1;
+            utmp_0[1] = (utmp_0[2] & KMASK2) | (((utmp_0[0] >> 6) & KMASK3) << 4);
+            utmp_0[2] = uaux_0;
+            utmp_0[0] &= KMASK1;
+
+            utmp_1[3] = ((utmp_1[2] >> 4) & KMASK2) | (((utmp_1[1] >> 6) & KMASK3) << 4);
+            let uaux_1 = utmp_1[1] & KMASK1;
+            utmp_1[1] = (utmp_1[2] & KMASK2) | (((utmp_1[0] >> 6) & KMASK3) << 4);
+            utmp_1[2] = uaux_1;
+            utmp_1[0] &= KMASK1;
+
+            // Build per-row scale vectors (8 i32 lanes, one per row).
+            // Lane k = scale for row k. set_epi32(e7,..,e0) places e0 in lane 0.
+            macro_rules! lane8 {
+                ($hi:expr, $lo:expr) => {
+                    _mm256_set_epi32(
+                        (($hi >> 24) & 0xFF) as i32,
+                        (($hi >> 16) & 0xFF) as i32,
+                        (($hi >> 8) & 0xFF) as i32,
+                        ($hi & 0xFF) as i32,
+                        (($lo >> 24) & 0xFF) as i32,
+                        (($lo >> 16) & 0xFF) as i32,
+                        (($lo >> 8) & 0xFF) as i32,
+                        ($lo & 0xFF) as i32,
+                    )
+                };
+            }
+            let sc_lo_vec = lane8!(utmp_0[1], utmp_0[0]); // sc for lo nibble group, rows 0-7
+            let sc_hi_vec = lane8!(utmp_1[1], utmp_1[0]); // sc for hi nibble group, rows 0-7
+            let mn_lo_vec = lane8!(utmp_0[3], utmp_0[2]); // min for lo group
+            let mn_hi_vec = lane8!(utmp_1[3], utmp_1[2]); // min for hi group
+
+            // Activation bsums for min correction: bsums[j] = sum of qs[j*16..j*16+16].
+            // lo group for this sb: acts q8_base..q8_base+32 → bsums[4*sb]+bsums[4*sb+1]
+            // hi group: acts q8_base+32..q8_base+64 → bsums[4*sb+2]+bsums[4*sb+3]
+            let bs_lo = y.bsums[4 * sb] as i32 + y.bsums[4 * sb + 1] as i32;
+            let bs_hi = y.bsums[4 * sb + 2] as i32 + y.bsums[4 * sb + 3] as i32;
+            iacc_min = _mm256_add_epi32(
+                iacc_min,
+                _mm256_add_epi32(
+                    _mm256_mullo_epi32(mn_lo_vec, _mm256_set1_epi32(bs_lo)),
+                    _mm256_mullo_epi32(mn_hi_vec, _mm256_set1_epi32(bs_hi)),
+                ),
+            );
+
+            // 8 dpbusd calls for lo group, 8 for hi group.
+            // qs chunk layout: dst[sb*256 + chunk*32 .. +32] = [row0[4b], .., row7[4b]].
+            // After AND mask_lo: 8 rows × 4 lo-nibble u8 = 32 bytes for dpbusd A.
+            // Activation: 4 bytes broadcast (same for all 8 rows) = dpbusd B.
+            let mut sumi_lo = _mm256_setzero_si256();
+            let mut sumi_hi = _mm256_setzero_si256();
+
+            let q8_base = sb * 64;
+            let qs_base = sb * 256;
+
+            for chunk in 0..8usize {
+                let w = _mm256_loadu_si256(qs_ptr.add(qs_base + chunk * 32) as *const __m256i);
+                let w_lo = _mm256_and_si256(w, mask_lo);
+                let w_hi = _mm256_and_si256(_mm256_srli_epi16(w, 4), mask_lo);
+
+                // Broadcast 4 consecutive Q8K bytes (i8) to fill 256 bits.
+                let a_lo = _mm256_set1_epi32(
+                    *(q8_ptr.add(q8_base + chunk * 4) as *const i32),
+                );
+                let a_hi = _mm256_set1_epi32(
+                    *(q8_ptr.add(q8_base + 32 + chunk * 4) as *const i32),
+                );
+
+                sumi_lo = _mm256_dpbusd_epi32(sumi_lo, w_lo, a_lo);
+                sumi_hi = _mm256_dpbusd_epi32(sumi_hi, w_hi, a_hi);
+            }
+
+            // Apply per-row scales and fold into main accumulator.
+            iacc_main = _mm256_add_epi32(
+                iacc_main,
+                _mm256_add_epi32(
+                    _mm256_mullo_epi32(sumi_lo, sc_lo_vec),
+                    _mm256_mullo_epi32(sumi_hi, sc_hi_vec),
+                ),
+            );
+        }
+
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_main), row_d, acc);
+        mins_total = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_min), row_dmin, mins_total);
+    }
+
+    let result_vec = _mm256_sub_ps(acc, mins_total);
+    let mut result = [0.0f32; 8];
+    _mm256_storeu_ps(result.as_mut_ptr(), result_vec);
+    result
+}
+
+/// Scalar fallback for `gemv_q4k_8x8_vnni`: mirrors the VNNI kernel logic without
+/// SIMD. Deinterleaves Q4Kx8V qs, decodes scales via utmp, and accumulates per-row.
+pub fn gemv_q4k_8x8v_scalar(
+    nb: usize,
+    packed: &[super::blocks::BlockQ4Kx8V],
+    act: &[BlockQ8K],
+) -> [f32; 8] {
+    use super::helpers::f16_to_f32;
+
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    let mut results = [0.0f32; 8];
+    let mut row_qs = [[0u8; 128]; 8];
+
+    for b in 0..nb {
+        let p = &packed[b];
+        let y = &act[b];
+
+        // Deinterleave qs: src[sb*256 + chunk*32 + r*4..+4] → row_qs[r][sb*32 + chunk*4..+4].
+        for r in 0..8usize {
+            for sb in 0..4usize {
+                for chunk in 0..8usize {
+                    let src_base = sb * 256 + chunk * 32 + r * 4;
+                    let dst_base = sb * 32 + chunk * 4;
+                    row_qs[r][dst_base..dst_base + 4]
+                        .copy_from_slice(&p.qs[src_base..src_base + 4]);
+                }
+            }
+        }
+
+        for r in 0..8usize {
+            let d = f16_to_f32(p.d[r]) * y.d;
+            let dmin = f16_to_f32(p.dmin[r]) * y.d;
+            let mut sumi = 0i32;
+            let mut mins_sum = 0i32;
+
+            let bsums: [i32; 8] = std::array::from_fn(|k| {
+                y.bsums[2 * k] as i32 + y.bsums[2 * k + 1] as i32
+            });
+
+            for sb in 0..4usize {
+                let mut utmp_0 = [0u32; 4];
+                let mut utmp_1 = [0u32; 4];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        p.scales.as_ptr().add(24 * sb),
+                        utmp_0.as_mut_ptr() as *mut u8,
+                        12,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        p.scales.as_ptr().add(12 + 24 * sb),
+                        utmp_1.as_mut_ptr() as *mut u8,
+                        12,
+                    );
+                }
+                utmp_0[3] = ((utmp_0[2] >> 4) & KMASK2) | (((utmp_0[1] >> 6) & KMASK3) << 4);
+                let uaux_0 = utmp_0[1] & KMASK1;
+                utmp_0[1] = (utmp_0[2] & KMASK2) | (((utmp_0[0] >> 6) & KMASK3) << 4);
+                utmp_0[2] = uaux_0;
+                utmp_0[0] &= KMASK1;
+                utmp_1[3] = ((utmp_1[2] >> 4) & KMASK2) | (((utmp_1[1] >> 6) & KMASK3) << 4);
+                let uaux_1 = utmp_1[1] & KMASK1;
+                utmp_1[1] = (utmp_1[2] & KMASK2) | (((utmp_1[0] >> 6) & KMASK3) << 4);
+                utmp_1[2] = uaux_1;
+                utmp_1[0] &= KMASK1;
+
+                let sc_lo = ((utmp_0[r / 4] >> (8 * (r % 4))) & 0xFF) as i32;
+                let sc_hi = ((utmp_1[r / 4] >> (8 * (r % 4))) & 0xFF) as i32;
+                let mn_lo = ((utmp_0[2 + r / 4] >> (8 * (r % 4))) & 0xFF) as i32;
+                let mn_hi = ((utmp_1[2 + r / 4] >> (8 * (r % 4))) & 0xFF) as i32;
+
+                mins_sum += mn_lo * bsums[2 * sb] + mn_hi * bsums[2 * sb + 1];
+
+                let qs_base = sb * 32;
+                let q8_base = sb * 64;
+                for k in 0..32usize {
+                    let nibble = row_qs[r][qs_base + k];
+                    sumi += sc_lo * (nibble & 0x0F) as i32 * y.qs[q8_base + k] as i32;
+                    sumi += sc_hi * (nibble >> 4) as i32 * y.qs[q8_base + 32 + k] as i32;
+                }
+            }
+
+            results[r] += d * sumi as f32 - dmin * mins_sum as f32;
+        }
+    }
+    results
+}
+
+#[allow(unreachable_code)]
+pub fn gemv_q4k_8x8_vnni_dispatch(
+    nb: usize,
+    packed: &[super::blocks::BlockQ4Kx8V],
+    act: &[BlockQ8K],
+) -> [f32; 8] {
+    #[cfg(target_arch = "x86_64")]
+    if (is_x86_feature_detected!("avxvnni") || is_x86_feature_detected!("avx512vnni"))
+        && is_x86_feature_detected!("f16c")
+    {
+        return unsafe { gemv_q4k_8x8_vnni(nb, packed, act) };
+    }
+    gemv_q4k_8x8v_scalar(nb, packed, act)
+}
+
 /// Scalar fallback for `gemv_q4k_8x8`. Deinterleaves packed data and calls the
 /// standard single-row dot product 8 times. Correct but not optimised.
 pub fn gemv_q4k_8x8_scalar(
@@ -2773,6 +3027,98 @@ mod tests {
                 "row={r}: avx2={}, scalar={}, rel_err={rel}",
                 avx2_result[r],
                 scalar_result[r]
+            );
+        }
+    }
+
+    #[test]
+    fn gemv_q4k_8x8v_scalar_matches_q4kx8_scalar() {
+        use super::super::repack::{repack_q4k_to_q4kx8, repack_q4k_to_q4kx8v};
+        use super::super::quantize::quantize_row_q8_k;
+        let n_rows = 8usize;
+        let bpr = 2usize;
+        let k = bpr * 256;
+
+        let src_blocks: Vec<BlockQ4K> = (0..n_rows * bpr)
+            .map(|i| BlockQ4K {
+                d: f32_to_f16(0.1 + 0.02 * i as f32),
+                dmin: f32_to_f16(0.01 + 0.005 * i as f32),
+                scales: std::array::from_fn(|j| ((i * 7 + j * 3) & 63) as u8),
+                qs: std::array::from_fn(|j| {
+                    let lo = ((i + j) as u8) & 0x0F;
+                    let hi = ((i * 5 + j * 3) as u8) & 0x0F;
+                    lo | (hi << 4)
+                }),
+            })
+            .collect();
+
+        let act_float: Vec<f32> = (0..k).map(|j| (j as f32 - 128.0) / 256.0).collect();
+        let mut act_q8k = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }; bpr];
+        quantize_row_q8_k(&act_float, &mut act_q8k);
+
+        let packed_x8 = repack_q4k_to_q4kx8(&src_blocks, n_rows, bpr);
+        let packed_x8v = repack_q4k_to_q4kx8v(&src_blocks, n_rows, bpr);
+
+        let ref_result = gemv_q4k_8x8_scalar(bpr, &packed_x8, &act_q8k);
+        let vnni_scalar = gemv_q4k_8x8v_scalar(bpr, &packed_x8v, &act_q8k);
+
+        for r in 0..n_rows {
+            let rel = if ref_result[r].abs() > 1e-3 {
+                ((vnni_scalar[r] - ref_result[r]) / ref_result[r]).abs()
+            } else {
+                (vnni_scalar[r] - ref_result[r]).abs()
+            };
+            assert!(
+                rel < 1e-4,
+                "row={r}: ref={}, vnni_scalar={}, rel_err={rel}",
+                ref_result[r],
+                vnni_scalar[r]
+            );
+        }
+    }
+
+    #[test]
+    fn gemv_q4k_8x8_vnni_matches_scalar() {
+        use super::super::repack::{repack_q4k_to_q4kx8, repack_q4k_to_q4kx8v};
+        use super::super::quantize::quantize_row_q8_k;
+        let n_rows = 8usize;
+        let bpr = 2usize;
+        let k = bpr * 256;
+
+        let src_blocks: Vec<BlockQ4K> = (0..n_rows * bpr)
+            .map(|i| BlockQ4K {
+                d: f32_to_f16(0.15 + 0.03 * i as f32),
+                dmin: f32_to_f16(0.02),
+                scales: std::array::from_fn(|j| ((i * 11 + j * 5) & 63) as u8),
+                qs: std::array::from_fn(|j| {
+                    let lo = ((i * 3 + j) as u8) & 0x0F;
+                    let hi = ((i * 7 + j * 2) as u8) & 0x0F;
+                    lo | (hi << 4)
+                }),
+            })
+            .collect();
+
+        let act_float: Vec<f32> = (0..k).map(|j| ((j as f32 % 64.0) - 32.0) / 64.0).collect();
+        let mut act_q8k = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }; bpr];
+        quantize_row_q8_k(&act_float, &mut act_q8k);
+
+        let packed_x8 = repack_q4k_to_q4kx8(&src_blocks, n_rows, bpr);
+        let packed_x8v = repack_q4k_to_q4kx8v(&src_blocks, n_rows, bpr);
+
+        let ref_result = gemv_q4k_8x8_scalar(bpr, &packed_x8, &act_q8k);
+        let dispatch_result = gemv_q4k_8x8_vnni_dispatch(bpr, &packed_x8v, &act_q8k);
+
+        for r in 0..n_rows {
+            let rel = if ref_result[r].abs() > 1e-3 {
+                ((dispatch_result[r] - ref_result[r]) / ref_result[r]).abs()
+            } else {
+                (dispatch_result[r] - ref_result[r]).abs()
+            };
+            assert!(
+                rel < 1e-4,
+                "row={r}: ref={}, vnni={}, rel_err={rel}",
+                ref_result[r],
+                dispatch_result[r]
             );
         }
     }
