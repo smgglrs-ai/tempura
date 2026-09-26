@@ -12,6 +12,7 @@ pub mod types;
 pub mod quants_llama;
 pub mod vec_dot;
 pub mod vec_dot_avx2;
+pub mod vec_llama;
 
 pub use blocks::*;
 pub use types::*;
