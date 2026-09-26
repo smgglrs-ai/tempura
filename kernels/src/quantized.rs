@@ -606,102 +606,6 @@ impl crate::inference_pool::KernelJob for Q4kMnBlockJob {
     }
 }
 
-// 4-activation × 8-weight-row GEMM job using pre-quantized BlockQ8K activations.
-// Parallelizes over weight groups (n/8), each processing all m/4 activation groups.
-struct Q4kGemmX8X4Job {
-    bq_ptr: *const u8,    // BlockQ4K rows, n × bpr blocks
-    q8k_ptr: *const u8,   // BlockQ8K rows, m × bpr blocks
-    out_ptr: *mut f32,    // m × n output
-    m: usize,
-    n: usize,
-    bpr: usize,           // blocks per row = k / Q4K_BLOCK_SIZE
-    k: usize,
-    bq_row_bytes: usize,  // bpr * Q4K_BLOCK_BYTES
-    q8k_row_bytes: usize, // bpr * size_of::<BlockQ8K>()
-}
-unsafe impl Sync for Q4kGemmX8X4Job {}
-impl crate::inference_pool::KernelJob for Q4kGemmX8X4Job {
-    #[inline(always)]
-    fn exec_range(&self, start: usize, end: usize) {
-        use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
-        use crate::ggml::vec_dot_avx2::gemm_q4k_4a8w_dispatch;
-
-        // Each unit is one weight group of 8 rows.
-        let mut wg = start; // weight group index (each covers 8 weight rows)
-        while wg + 1 <= end {
-            let j0 = wg * 8;
-            // Collect 8 weight row slices (may have fewer if n not divisible by 8)
-            let n_w = usize::min(8, self.n.saturating_sub(j0));
-            if n_w < 8 {
-                // Remainder: fall back to per-row dot products
-                for j in j0..j0 + n_w {
-                    let w = unsafe {
-                        std::slice::from_raw_parts(
-                            self.bq_ptr.add(j * self.bq_row_bytes) as *const BlockQ4K,
-                            self.bpr,
-                        )
-                    };
-                    for i in 0..self.m {
-                        let a = unsafe {
-                            std::slice::from_raw_parts(
-                                self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K,
-                                self.bpr,
-                            )
-                        };
-                        let val = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(self.k, w, a);
-                        unsafe { *self.out_ptr.add(i * self.n + j) = val; }
-                    }
-                }
-                wg += 1;
-                continue;
-            }
-
-            // Full 8-weight-row group.
-            let ws: [&[BlockQ4K]; 8] = std::array::from_fn(|r| unsafe {
-                std::slice::from_raw_parts(
-                    self.bq_ptr.add((j0 + r) * self.bq_row_bytes) as *const BlockQ4K,
-                    self.bpr,
-                )
-            });
-
-            // Process 4 activation rows at a time.
-            let mut i = 0;
-            while i + 3 < self.m {
-                let as_: [&[BlockQ8K]; 4] = std::array::from_fn(|r| unsafe {
-                    std::slice::from_raw_parts(
-                        self.q8k_ptr.add((i + r) * self.q8k_row_bytes) as *const BlockQ8K,
-                        self.bpr,
-                    )
-                });
-                let results = gemm_q4k_4a8w_dispatch(self.k, ws, as_);
-                unsafe {
-                    for ar in 0..4 {
-                        for wr in 0..8 {
-                            *self.out_ptr.add((i + ar) * self.n + j0 + wr) = results[ar][wr];
-                        }
-                    }
-                }
-                i += 4;
-            }
-            // Remainder activation rows (0..3 left)
-            while i < self.m {
-                let a = unsafe {
-                    std::slice::from_raw_parts(
-                        self.q8k_ptr.add(i * self.q8k_row_bytes) as *const BlockQ8K,
-                        self.bpr,
-                    )
-                };
-                for wr in 0..8 {
-                    let val = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(self.k, ws[wr], a);
-                    unsafe { *self.out_ptr.add(i * self.n + j0 + wr) = val; }
-                }
-                i += 1;
-            }
-            wg += 1;
-        }
-    }
-}
-
 struct Q6kMnTiledJob {
     bq_ptr: *const u8,
     q8k_ptr: *const u8,
@@ -5129,26 +5033,6 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 // Dispatch over n/8 groups; each group handles 8 weight rows.
                 crate::inference_pool::par_run_job(n / 8, &job);
             });
-            return Ok(());
-        }
-
-        // 4×8 GEMM path: for m >= 4 and n >= 8, use Q4kGemmX8X4Job which processes
-        // 8 weight rows × 4 activation rows per tile, calling gemm_q4k_4a8w_dispatch.
-        // This widens the tile from 4×4 to 4×8 and eliminates per-output Q8K quantization.
-        if m >= 4 && n >= 8 {
-            let n_groups = (n + 7) / 8; // ceil(n/8) weight groups
-            let job = Q4kGemmX8X4Job {
-                bq_ptr: b_quantized.as_ptr(),
-                q8k_ptr: q8k_all.as_ptr() as *const u8,
-                out_ptr: output.as_mut_ptr(),
-                m,
-                n,
-                bpr: blocks_per_row,
-                k,
-                bq_row_bytes: blocks_per_row * Q4K_BLOCK_BYTES,
-                q8k_row_bytes: blocks_per_row * std::mem::size_of::<BlockQ8K>(),
-            };
-            crate::inference_pool::par_run_job(n_groups, &job);
             return Ok(());
         }
 

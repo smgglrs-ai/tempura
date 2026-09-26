@@ -115,30 +115,20 @@ pub const BLOCK_Q4KX8_SIZE: usize = 1152;
 
 /// 8 Q4K blocks interleaved with 4-byte-per-row stride — optimized for dpbusd VNNI.
 ///
-/// qs layout: 64 chunks × 16 bytes: for chunk c, row r:
-/// `qs[c*16 + r*2 .. +2]` = `src[r].qs[c*2 .. +2]` (4 nibble elements per row per chunk).
-/// ONE dpbusd call processes all 8 rows simultaneously.
+/// qs layout (1024 bytes): 4 sub-blocks × 8 chunks × 32 bytes per chunk.
+/// Each 32-byte chunk: [row0[4b], row1[4b], ..., row7[4b]] where each row's 4 bytes
+/// are consecutive packed nibble bytes from that sub-block (lo nibble = group_a element,
+/// hi nibble = group_b element, same as Q4K format). ONE dpbusd call processes all 8
+/// rows simultaneously: lane k = partial dot product for row k.
 #[repr(C)]
 pub struct BlockQ4Kx8V {
-    pub d: [u16; 8],
-    pub dmin: [u16; 8],
-    pub scales: [u8; 96],
-    pub qs: [u8; 1024],
+    pub d: [u16; 8],      // f16 scales, one per row
+    pub dmin: [u16; 8],   // f16 mins, one per row
+    pub scales: [u8; 96], // 8×12 scale bytes (same interleaved format as BlockQ4Kx8)
+    pub qs: [u8; 1024],   // 4-byte-per-row interleaved nibble bytes, sub-block major
 }
 pub const BLOCK_Q4KX8V_SIZE: usize = 1152;
 
-/// 4 Q8K activation rows interleaved with 4-byte stride for 4×8 dpbusd GEMM.
-///
-/// - `d[4]`: f32 scale per activation row
-/// - `qs[1024]`: 64 chunks × 16 bytes; chunk c row r: `qs[c*16+r*4..+4]` = `src[r].qs[c*4..+4]`
-/// - `bsums[64]`: row r at `bsums[r*16..r*16+16]`
-#[repr(C)]
-pub struct BlockQ8Kx4 {
-    pub d: [f32; 4],
-    pub qs: [i8; 1024],
-    pub bsums: [i16; 64],
-}
-pub const BLOCK_Q8KX4_SIZE: usize = 16 + 1024 + 128; // 1168
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ5K {

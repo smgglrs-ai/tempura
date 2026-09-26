@@ -1,4 +1,4 @@
-use super::blocks::{BlockQ4K, BlockQ4Kx8, BlockQ4Kx8V, BlockQ8K, BlockQ8Kx4};
+use super::blocks::{BlockQ4K, BlockQ4Kx8, BlockQ4Kx8V};
 
 /// Repack `n_rows` Q4K blocks (from a weight matrix with `bpr` blocks per row)
 /// into `BlockQ4Kx8` groups. `n_rows` must be divisible by 8.
@@ -109,13 +109,24 @@ pub fn repack_q4k_to_q4kx8(src: &[BlockQ4K], n_rows: usize, bpr: usize) -> Vec<B
     out
 }
 
-/// Repack `n_rows` Q4K blocks into `BlockQ4Kx8V` groups using 4-byte (2-nibble) interleave.
-/// `n_rows` must be divisible by 8. The scales/mins use the same packing as `repack_q4k_to_q4kx8`.
+/// Repack `n_rows` Q4K blocks into `BlockQ4Kx8V` groups for VNNI dpbusd kernels.
+/// `n_rows` must be divisible by 8.
 ///
-/// qs layout: 64 chunks × 16 bytes; chunk c, row r: qs[c*16 + r*2 .. +2] = src[r].qs[c*2 .. +2]
+/// qs layout: 4 sub-blocks, each with 8 chunks of 32 bytes. Each 32-byte chunk
+/// is [row0[4b], row1[4b], ..., row7[4b]] — 4 consecutive packed nibble bytes from
+/// that row's sub-block. Enables ONE `_mm256_dpbusd_epi32` call to produce 8 partial
+/// sums (one per row) simultaneously.
+///
+/// d, dmin, scales format: identical to `BlockQ4Kx8` (same 6-bit packed encoding).
 pub fn repack_q4k_to_q4kx8v(src: &[BlockQ4K], n_rows: usize, bpr: usize) -> Vec<BlockQ4Kx8V> {
     assert_eq!(n_rows % 8, 0, "n_rows={n_rows} must be divisible by 8");
-    assert_eq!(src.len(), n_rows * bpr);
+    assert_eq!(
+        src.len(),
+        n_rows * bpr,
+        "src.len()={} != n_rows*bpr={}",
+        src.len(),
+        n_rows * bpr
+    );
 
     let n_groups = n_rows / 8;
     let mut out: Vec<BlockQ4Kx8V> = Vec::with_capacity(n_groups * bpr);
@@ -128,6 +139,7 @@ pub fn repack_q4k_to_q4kx8v(src: &[BlockQ4K], n_rows: usize, bpr: usize) -> Vec<
                 scales: [0u8; 96],
                 qs: [0u8; 1024],
             };
+
             let rows: [&BlockQ4K; 8] = std::array::from_fn(|r| &src[(grp * 8 + r) * bpr + blk]);
 
             for r in 0..8 {
@@ -135,15 +147,7 @@ pub fn repack_q4k_to_q4kx8v(src: &[BlockQ4K], n_rows: usize, bpr: usize) -> Vec<
                 dst.dmin[r] = rows[r].dmin;
             }
 
-            // 64 chunks of 2 nibble-bytes per row (= 4 elements per row).
-            for c in 0..64usize {
-                for r in 0..8 {
-                    dst.qs[c * 16 + r * 2..c * 16 + r * 2 + 2]
-                        .copy_from_slice(&rows[r].qs[c * 2..c * 2 + 2]);
-                }
-            }
-
-            // Scales: same packing as repack_q4k_to_q4kx8 (4 sub-block pairs × 24 bytes).
+            // Scales: identical packing to BlockQ4Kx8.
             let mut s = [0u8; 8];
             let mut m = [0u8; 8];
             for i in 0..4usize {
@@ -184,38 +188,25 @@ pub fn repack_q4k_to_q4kx8v(src: &[BlockQ4K], n_rows: usize, bpr: usize) -> Vec<
                 dst.scales[i * 12 + 59] = (s[7] & 15) | ((m[7] & 15) << 4);
             }
 
+            // qs: 4-byte-per-row interleaved, sub-block-major.
+            // For sub-block sb (0..4): Q4K source bytes sb*32..(sb+1)*32 per row.
+            // 8 chunks of 4 source bytes per row → chunk c at dst[sb*256 + c*32 + r*4..+4].
+            for sb in 0..4usize {
+                for chunk in 0..8usize {
+                    let dst_base = sb * 256 + chunk * 32;
+                    let src_base = sb * 32 + chunk * 4;
+                    for r in 0..8 {
+                        dst.qs[dst_base + r * 4..dst_base + r * 4 + 4]
+                            .copy_from_slice(&rows[r].qs[src_base..src_base + 4]);
+                    }
+                }
+            }
+
             out.push(dst);
         }
     }
-    out
-}
 
-/// Pack 4 Q8K blocks (one per activation row) into one `BlockQ8Kx4`.
-///
-/// The 4 source blocks must all have `bpr` blocks-per-row, and this function
-/// packs one bpr-position at a time. Call with `src[r] = &q8k_all[r * bpr + blk]`.
-pub fn repack_q8k_to_q8kx4(src: [&BlockQ8K; 4]) -> BlockQ8Kx4 {
-    let mut dst = BlockQ8Kx4 {
-        d: [0.0f32; 4],
-        qs: [0i8; 1024],
-        bsums: [0i16; 64],
-    };
-    for r in 0..4 {
-        dst.d[r] = src[r].d;
-    }
-    // Interleave qs: 64 chunks × 4 rows × 4 bytes
-    for c in 0..64usize {
-        for r in 0..4 {
-            let dst_off = c * 16 + r * 4;
-            let src_off = c * 4;
-            dst.qs[dst_off..dst_off + 4].copy_from_slice(&src[r].qs[src_off..src_off + 4]);
-        }
-    }
-    // bsums: row r at bsums[r*16..r*16+16]
-    for r in 0..4 {
-        dst.bsums[r * 16..r * 16 + 16].copy_from_slice(&src[r].bsums[..16]);
-    }
-    dst
+    out
 }
 
 #[cfg(test)]
@@ -337,7 +328,29 @@ mod tests {
     }
 
     #[test]
-    fn repack_q4kx8v_qs_interleave_correct() {
+    fn repack_q4kx8v_size_and_d() {
+        assert_eq!(
+            std::mem::size_of::<BlockQ4Kx8V>(),
+            crate::ggml::blocks::BLOCK_Q4KX8V_SIZE
+        );
+        let bpr = 2usize;
+        let n_rows = 8usize;
+        let src: Vec<BlockQ4K> = (0..n_rows * bpr)
+            .map(|i| make_test_q4k((i as f32) * 0.02 + 0.1, 0.05, (i as u8) | 0x11, 5))
+            .collect();
+        let packed = repack_q4k_to_q4kx8v(&src, n_rows, bpr);
+        assert_eq!(packed.len(), bpr);
+        for blk in 0..bpr {
+            let p = &packed[blk];
+            for r in 0..8 {
+                assert_eq!(p.d[r], src[r * bpr + blk].d);
+                assert_eq!(p.dmin[r], src[r * bpr + blk].dmin);
+            }
+        }
+    }
+
+    #[test]
+    fn repack_q4kx8v_qs_layout() {
         let bpr = 1usize;
         let n_rows = 8usize;
         let src: Vec<BlockQ4K> = (0..n_rows)
@@ -354,73 +367,36 @@ mod tests {
                 b
             })
             .collect();
-
         let packed = repack_q4k_to_q4kx8v(&src, n_rows, bpr);
         let p = &packed[0];
-
-        // Verify: chunk c, row r → qs[c*16 + r*2 .. +2] = src[r].qs[c*2 .. +2]
-        for c in 0..64usize {
-            for r in 0..8 {
-                assert_eq!(
-                    p.qs[c * 16 + r * 2],
-                    src[r].qs[c * 2],
-                    "v4: chunk={c} row={r} byte 0"
-                );
-                assert_eq!(
-                    p.qs[c * 16 + r * 2 + 1],
-                    src[r].qs[c * 2 + 1],
-                    "v4: chunk={c} row={r} byte 1"
-                );
+        // For sb=0..4, chunk=0..8, row=0..8: dst[sb*256 + chunk*32 + r*4..+4] = src_r.qs[sb*32 + chunk*4..+4]
+        for sb in 0..4usize {
+            for chunk in 0..8usize {
+                let dst_base = sb * 256 + chunk * 32;
+                let src_base = sb * 32 + chunk * 4;
+                for r in 0..8usize {
+                    for k in 0..4usize {
+                        assert_eq!(
+                            p.qs[dst_base + r * 4 + k],
+                            src[r].qs[src_base + k],
+                            "qs mismatch sb={sb} chunk={chunk} r={r} k={k}"
+                        );
+                    }
+                }
             }
         }
     }
 
     #[test]
-    fn repack_q8k_to_q8kx4_roundtrip() {
-        use crate::ggml::blocks::BlockQ8K;
-        let mut src_blocks: [BlockQ8K; 4] = unsafe { std::mem::zeroed() };
-        for r in 0..4usize {
-            src_blocks[r].d = (r as f32 + 1.0) * 0.1;
-            for k in 0..256usize {
-                src_blocks[r].qs[k] = ((r * 256 + k) & 0x7F) as i8;
-            }
-            for i in 0..16usize {
-                src_blocks[r].bsums[i] = (r * 16 + i) as i16;
-            }
-        }
-        let refs = [
-            &src_blocks[0],
-            &src_blocks[1],
-            &src_blocks[2],
-            &src_blocks[3],
-        ];
-        let packed = repack_q8k_to_q8kx4(refs);
-
-        // Verify d
-        for r in 0..4 {
-            assert!((packed.d[r] - src_blocks[r].d).abs() < 1e-9);
-        }
-        // Verify qs interleave: chunk c, row r → packed.qs[c*16+r*4..+4] = src[r].qs[c*4..+4]
-        for c in 0..64usize {
-            for r in 0..4 {
-                for k in 0..4 {
-                    assert_eq!(
-                        packed.qs[c * 16 + r * 4 + k],
-                        src_blocks[r].qs[c * 4 + k],
-                        "q8kx4 qs mismatch c={c} r={r} k={k}"
-                    );
-                }
-            }
-        }
-        // Verify bsums: row r at packed.bsums[r*16..r*16+16]
-        for r in 0..4 {
-            for i in 0..16 {
-                assert_eq!(
-                    packed.bsums[r * 16 + i],
-                    src_blocks[r].bsums[i],
-                    "bsums mismatch r={r} i={i}"
-                );
-            }
-        }
+    fn repack_q4kx8v_scales_match_q4kx8() {
+        let bpr = 1usize;
+        let n_rows = 8usize;
+        let src: Vec<BlockQ4K> = (0..n_rows)
+            .map(|i| make_test_q4k(1.0 + i as f32 * 0.1, 0.5, 0x55, (i as u8 * 7) & 63))
+            .collect();
+        let v = repack_q4k_to_q4kx8v(&src, n_rows, bpr);
+        let x8 = repack_q4k_to_q4kx8(&src, n_rows, bpr);
+        // Scales should be identical between the two formats.
+        assert_eq!(v[0].scales, x8[0].scales, "scales differ between Q4Kx8V and Q4Kx8");
     }
 }
