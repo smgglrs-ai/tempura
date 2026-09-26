@@ -21,3 +21,4 @@ pub mod vec_dot_avx2;
 
 pub use blocks::*;
 pub use types::*;
+pub mod sgemm_llama;
