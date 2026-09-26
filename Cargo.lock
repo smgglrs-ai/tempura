@@ -3668,6 +3668,7 @@ dependencies = [
  "cutile",
  "gemm",
  "half",
+ "libm",
  "proptest",
  "rand 0.9.5",
  "serde",
