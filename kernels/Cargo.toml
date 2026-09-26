@@ -26,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 gemm = "0.18"
 half = "2"
+libm = "0.2"
 cuda-device = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-device", optional = true }
 cuda-host = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/crates/cuda-host", optional = true }
 cuda-core = { version = "0.3.1", optional = true }
