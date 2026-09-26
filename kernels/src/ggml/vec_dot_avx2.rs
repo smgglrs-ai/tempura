@@ -706,9 +706,12 @@ pub unsafe fn vec_dot_q4k_q8k_4x2_vnni(
     a2: &[BlockQ8K],
     a3: &[BlockQ8K],
 ) -> [[f32; 2]; 4] {
-    use super::helpers::get_scale_min_k4;
     let nb = n / 256;
     let mask_lo = _mm256_set1_epi8(0x0F);
+
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
 
     let mut acc = [[_mm256_setzero_ps(), _mm256_setzero_ps()]; 4];
     let mut mins_total = [[0.0f32; 2]; 4];
@@ -721,66 +724,72 @@ pub unsafe fn vec_dot_q4k_q8k_4x2_vnni(
         let w0i = &*w0_ptr.add(i);
         let w1i = &*w1_ptr.add(i);
 
-        // Weight row 0 scales and mins
+        // Vectorized scale/min extraction — replaces 2×8 get_scale_min_k4 scalar calls.
         let d0 = f16_to_f32(w0i.d);
         let dmin0 = f16_to_f32(w0i.dmin);
-        let mut sc0 = [0u8; 8];
-        let mut mi0 = [0u8; 8];
-        for jj in 0..8 {
-            let (s, m) = get_scale_min_k4(jj, &w0i.scales);
-            sc0[jj] = s;
-            mi0[jj] = m;
-        }
+        let mut utmp0 = [0u32; 4];
+        std::ptr::copy_nonoverlapping(w0i.scales.as_ptr(), utmp0.as_mut_ptr() as *mut u8, 12);
+        utmp0[3] = ((utmp0[2] >> 4) & KMASK2) | (((utmp0[1] >> 6) & KMASK3) << 4);
+        let uaux0 = utmp0[1] & KMASK1;
+        utmp0[1] = (utmp0[2] & KMASK2) | (((utmp0[0] >> 6) & KMASK3) << 4);
+        utmp0[2] = uaux0;
+        utmp0[0] &= KMASK1;
 
-        // Weight row 1 scales and mins
         let d1 = f16_to_f32(w1i.d);
         let dmin1 = f16_to_f32(w1i.dmin);
-        let mut sc1 = [0u8; 8];
-        let mut mi1 = [0u8; 8];
-        for jj in 0..8 {
-            let (s, m) = get_scale_min_k4(jj, &w1i.scales);
-            sc1[jj] = s;
-            mi1[jj] = m;
+        let mut utmp1 = [0u32; 4];
+        std::ptr::copy_nonoverlapping(w1i.scales.as_ptr(), utmp1.as_mut_ptr() as *mut u8, 12);
+        utmp1[3] = ((utmp1[2] >> 4) & KMASK2) | (((utmp1[1] >> 6) & KMASK3) << 4);
+        let uaux1 = utmp1[1] & KMASK1;
+        utmp1[1] = (utmp1[2] & KMASK2) | (((utmp1[0] >> 6) & KMASK3) << 4);
+        utmp1[2] = uaux1;
+        utmp1[0] &= KMASK1;
+
+        // Precompute bsums hadd for each activation (used for mins correction).
+        // hadd computed ONCE per activation, reused for both weight rows.
+        let q8sums: [__m128i; 4] = std::array::from_fn(|r| {
+            let bsums_v = _mm256_loadu_si256((*a_ptrs[r].add(i)).bsums.as_ptr() as *const __m256i);
+            _mm_hadd_epi16(
+                _mm256_castsi256_si128(bsums_v),
+                _mm256_extracti128_si256(bsums_v, 1),
+            )
+        });
+        let d_ys: [f32; 4] = std::array::from_fn(|r| (*a_ptrs[r].add(i)).d);
+        let q8_ptrs: [*const i8; 4] =
+            std::array::from_fn(|r| (*a_ptrs[r].add(i)).qs.as_ptr());
+
+        // SIMD mins correction for each activation × weight row pair.
+        for r in 0..4 {
+            let d_y = d_ys[r];
+            let mins0_128 = _mm_set_epi32(0, 0, utmp0[3] as i32, utmp0[2] as i32);
+            let prod0 = _mm_madd_epi16(_mm_cvtepu8_epi16(mins0_128), q8sums[r]);
+            mins_total[r][0] += dmin0 * d_y * hsum_i32_4(prod0) as f32;
+
+            let mins1_128 = _mm_set_epi32(0, 0, utmp1[3] as i32, utmp1[2] as i32);
+            let prod1 = _mm_madd_epi16(_mm_cvtepu8_epi16(mins1_128), q8sums[r]);
+            mins_total[r][1] += dmin1 * d_y * hsum_i32_4(prod1) as f32;
         }
 
-        // Pre-cache Q8K activation byte pointers for this block (avoids repeated struct access)
-        let q8_ptrs: [*const i8; 4] = [
-            (*a_ptrs[0].add(i)).qs.as_ptr(),
-            (*a_ptrs[1].add(i)).qs.as_ptr(),
-            (*a_ptrs[2].add(i)).qs.as_ptr(),
-            (*a_ptrs[3].add(i)).qs.as_ptr(),
-        ];
-        let d_ys: [f32; 4] = [
-            (*a_ptrs[0].add(i)).d,
-            (*a_ptrs[1].add(i)).d,
-            (*a_ptrs[2].add(i)).d,
-            (*a_ptrs[3].add(i)).d,
-        ];
-
-        // Per-block integer accumulators: sumi[act_row][weight_row]
         let mut sumi = [[_mm256_setzero_si256(), _mm256_setzero_si256()]; 4];
 
-        // 4 sub-blocks of 64 Q8K bytes each (4×64 = 256 elements per Q4K block)
         for j in 0..4 {
-            // Load Q4K nibbles for both weight rows — shared across all 4 activation rows
+            // Q4K nibbles for w0 and w1 — loaded ONCE, reused across all 4 activation rows.
             let q4_chunk0 = _mm256_loadu_si256(w0i.qs.as_ptr().add(j * 32) as *const __m256i);
             let q4_lo0 = _mm256_and_si256(q4_chunk0, mask_lo);
             let q4_hi0 = _mm256_and_si256(_mm256_srli_epi16(q4_chunk0, 4), mask_lo);
-            let sc_lo0 = sc0[2 * j] as i32;
-            let sc_hi0 = sc0[2 * j + 1] as i32;
+            let sc_lo0 = ((utmp0[j / 2] >> (16 * (j % 2))) & 0xFF) as i32;
+            let sc_hi0 = ((utmp0[j / 2] >> (16 * (j % 2) + 8)) & 0xFF) as i32;
 
             let q4_chunk1 = _mm256_loadu_si256(w1i.qs.as_ptr().add(j * 32) as *const __m256i);
             let q4_lo1 = _mm256_and_si256(q4_chunk1, mask_lo);
             let q4_hi1 = _mm256_and_si256(_mm256_srli_epi16(q4_chunk1, 4), mask_lo);
-            let sc_lo1 = sc1[2 * j] as i32;
-            let sc_hi1 = sc1[2 * j + 1] as i32;
+            let sc_lo1 = ((utmp1[j / 2] >> (16 * (j % 2))) & 0xFF) as i32;
+            let sc_hi1 = ((utmp1[j / 2] >> (16 * (j % 2) + 8)) & 0xFF) as i32;
 
-            // For each activation row: load Q8K bytes and accumulate against both weight rows
             for r in 0..4 {
                 let q8_lo = _mm256_loadu_si256(q8_ptrs[r].add(j * 64) as *const __m256i);
                 let q8_hi = _mm256_loadu_si256(q8_ptrs[r].add(j * 64 + 32) as *const __m256i);
 
-                // Weight row 0 × activation row r
                 let dot_lo0 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_lo0, q8_lo);
                 let dot_hi0 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_hi0, q8_hi);
                 sumi[r][0] = _mm256_add_epi32(
@@ -791,7 +800,6 @@ pub unsafe fn vec_dot_q4k_q8k_4x2_vnni(
                     ),
                 );
 
-                // Weight row 1 × activation row r
                 let dot_lo1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_lo1, q8_lo);
                 let dot_hi1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4_hi1, q8_hi);
                 sumi[r][1] = _mm256_add_epi32(
@@ -804,7 +812,6 @@ pub unsafe fn vec_dot_q4k_q8k_4x2_vnni(
             }
         }
 
-        // Accumulate block sumi into float accumulators and compute mins contributions
         for r in 0..4 {
             let d_y = d_ys[r];
             acc[r][0] = _mm256_fmadd_ps(
@@ -817,17 +824,6 @@ pub unsafe fn vec_dot_q4k_q8k_4x2_vnni(
                 _mm256_cvtepi32_ps(sumi[r][1]),
                 acc[r][1],
             );
-
-            let bsums = &(*a_ptrs[r].add(i)).bsums;
-            let mut smins0 = 0i32;
-            let mut smins1 = 0i32;
-            for jj in 0..16 {
-                let bs = bsums[jj] as i32;
-                smins0 += bs * mi0[jj >> 1] as i32;
-                smins1 += bs * mi1[jj >> 1] as i32;
-            }
-            mins_total[r][0] += dmin0 * d_y * smins0 as f32;
-            mins_total[r][1] += dmin1 * d_y * smins1 as f32;
         }
     }
 
