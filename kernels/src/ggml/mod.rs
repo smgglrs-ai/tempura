@@ -1,4 +1,5 @@
 mod bench;
+pub mod binary_ops_llama;
 pub mod blocks;
 pub mod dequantize;
 pub mod helpers;
@@ -10,6 +11,7 @@ pub mod repack;
 pub mod repack_llama;
 pub mod types;
 pub mod quants_llama;
+pub mod unary_ops_llama;
 pub mod vec_dot;
 pub mod vec_dot_avx2;
 
