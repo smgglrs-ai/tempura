@@ -9,6 +9,7 @@ pub mod quantize;
 pub mod repack;
 pub mod repack_llama;
 pub mod types;
+pub mod quants_llama;
 pub mod vec_dot;
 pub mod vec_dot_avx2;
 
