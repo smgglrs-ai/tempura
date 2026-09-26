@@ -254,6 +254,156 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx2(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
     hsum_f32_8(acc) + _mm_cvtss_f32(acc_m)
 }
 
+/// Compute dot products of Q8K activation against TWO Q4K weight rows simultaneously.
+/// Uses maddubs+shuffle scale approach (same as vec_dot_q4_k_q8_k_avx2) for 4× fewer
+/// scale instructions than dpbusd+mullo. Shared Q8K loads across both weight rows.
+/// Returns (dot(x0, y), dot(x1, y)).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+pub unsafe fn vec_dot_q4_k_q8_k_maddubs_pair(
+    n: usize,
+    x0: &[BlockQ4K],
+    x1: &[BlockQ4K],
+    y: &[BlockQ8K],
+) -> (f32, f32) {
+    let nb = n / 256;
+    let m4 = _mm256_set1_epi8(0x0F);
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc_m0 = _mm_setzero_ps();
+    let mut acc_m1 = _mm_setzero_ps();
+
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    let x0_ptr = x0.as_ptr();
+    let x1_ptr = x1.as_ptr();
+    let y_ptr = y.as_ptr();
+
+    for i in 0..nb {
+        let x0i = &*x0_ptr.add(i);
+        let x1i = &*x1_ptr.add(i);
+        let yi = &*y_ptr.add(i);
+
+        let d0 = yi.d * f16_to_f32(x0i.d);
+        let dmin0 = -(yi.d * f16_to_f32(x0i.dmin));
+        let d1 = yi.d * f16_to_f32(x1i.d);
+        let dmin1 = -(yi.d * f16_to_f32(x1i.dmin));
+
+        // Scale/min extraction for row 0
+        let mut utmp0 = [0u32; 4];
+        std::ptr::copy_nonoverlapping(x0i.scales.as_ptr(), utmp0.as_mut_ptr() as *mut u8, 12);
+        utmp0[3] = ((utmp0[2] >> 4) & KMASK2) | (((utmp0[1] >> 6) & KMASK3) << 4);
+        let uaux0 = utmp0[1] & KMASK1;
+        utmp0[1] = (utmp0[2] & KMASK2) | (((utmp0[0] >> 6) & KMASK3) << 4);
+        utmp0[2] = uaux0;
+        utmp0[0] &= KMASK1;
+
+        // Scale/min extraction for row 1
+        let mut utmp1 = [0u32; 4];
+        std::ptr::copy_nonoverlapping(x1i.scales.as_ptr(), utmp1.as_mut_ptr() as *mut u8, 12);
+        utmp1[3] = ((utmp1[2] >> 4) & KMASK2) | (((utmp1[1] >> 6) & KMASK3) << 4);
+        let uaux1 = utmp1[1] & KMASK1;
+        utmp1[1] = (utmp1[2] & KMASK2) | (((utmp1[0] >> 6) & KMASK3) << 4);
+        utmp1[2] = uaux1;
+        utmp1[0] &= KMASK1;
+
+        // mins_and_scales vectors: low 128 = 8 scales (i16), high 128 = 8 mins (i16)
+        let mas0 = _mm256_cvtepu8_epi16(_mm_set_epi32(
+            utmp0[3] as i32,
+            utmp0[2] as i32,
+            utmp0[1] as i32,
+            utmp0[0] as i32,
+        ));
+        let mas1 = _mm256_cvtepu8_epi16(_mm_set_epi32(
+            utmp1[3] as i32,
+            utmp1[2] as i32,
+            utmp1[1] as i32,
+            utmp1[0] as i32,
+        ));
+
+        // Shared bsums hadd — computed ONCE for both rows
+        let q8sums = _mm256_loadu_si256(yi.bsums.as_ptr() as *const __m256i);
+        let q8s = _mm_hadd_epi16(
+            _mm256_castsi256_si128(q8sums),
+            _mm256_extracti128_si256(q8sums, 1),
+        );
+
+        // Mins accumulation for row 0 and row 1
+        let prod0 = _mm_madd_epi16(_mm256_extracti128_si256(mas0, 1), q8s);
+        acc_m0 = _mm_fmadd_ps(_mm_set1_ps(dmin0), _mm_cvtepi32_ps(prod0), acc_m0);
+        let prod1 = _mm_madd_epi16(_mm256_extracti128_si256(mas1, 1), q8s);
+        acc_m1 = _mm_fmadd_ps(_mm_set1_ps(dmin1), _mm_cvtepi32_ps(prod1), acc_m1);
+
+        // Duplicate scales (low 128 bits) into both halves for vpshufb broadcast
+        let sc0_128 = _mm256_castsi256_si128(mas0);
+        let scales0 = _mm256_set_m128i(sc0_128, sc0_128);
+        let sc1_128 = _mm256_castsi256_si128(mas1);
+        let scales1 = _mm256_set_m128i(sc1_128, sc1_128);
+
+        let q8 = yi.qs.as_ptr();
+        let mut sumi0 = _mm256_setzero_si256();
+        let mut sumi1 = _mm256_setzero_si256();
+
+        for j in 0..4usize {
+            // Safety: j < 4 → 2*j+1 < 8 == K_SHUFFLE_Q4K.len()
+            let shuf_l = _mm256_loadu_si256(
+                K_SHUFFLE_Q4K.get_unchecked(2 * j).as_ptr() as *const __m256i,
+            );
+            let shuf_h = _mm256_loadu_si256(
+                K_SHUFFLE_Q4K.get_unchecked(2 * j + 1).as_ptr() as *const __m256i,
+            );
+
+            // Shuffle-based scale broadcast — 1 vpshufb covers all 16 i16 lanes at once
+            let scale_l0 = _mm256_shuffle_epi8(scales0, shuf_l);
+            let scale_h0 = _mm256_shuffle_epi8(scales0, shuf_h);
+            let scale_l1 = _mm256_shuffle_epi8(scales1, shuf_l);
+            let scale_h1 = _mm256_shuffle_epi8(scales1, shuf_h);
+
+            // Q8 activation loaded ONCE, shared across both weight rows
+            let q8l = _mm256_loadu_si256(q8.add(j * 64) as *const __m256i);
+            let q8h = _mm256_loadu_si256(q8.add(j * 64 + 32) as *const __m256i);
+
+            // Row 0 nibbles → maddubs → madd (scale fused with i16→i32 reduction)
+            let q4bits0 = _mm256_loadu_si256(x0i.qs.as_ptr().add(j * 32) as *const __m256i);
+            let q4l0 = _mm256_and_si256(q4bits0, m4);
+            let q4h0 = _mm256_and_si256(_mm256_srli_epi16(q4bits0, 4), m4);
+            let mut p16l0 = _mm256_maddubs_epi16(q4l0, q8l);
+            p16l0 = _mm256_madd_epi16(scale_l0, p16l0);
+            let mut p16h0 = _mm256_maddubs_epi16(q4h0, q8h);
+            p16h0 = _mm256_madd_epi16(scale_h0, p16h0);
+            sumi0 = _mm256_add_epi32(sumi0, _mm256_add_epi32(p16l0, p16h0));
+
+            // Row 1 nibbles → maddubs → madd
+            let q4bits1 = _mm256_loadu_si256(x1i.qs.as_ptr().add(j * 32) as *const __m256i);
+            let q4l1 = _mm256_and_si256(q4bits1, m4);
+            let q4h1 = _mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m4);
+            let mut p16l1 = _mm256_maddubs_epi16(q4l1, q8l);
+            p16l1 = _mm256_madd_epi16(scale_l1, p16l1);
+            let mut p16h1 = _mm256_maddubs_epi16(q4h1, q8h);
+            p16h1 = _mm256_madd_epi16(scale_h1, p16h1);
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_add_epi32(p16l1, p16h1));
+        }
+
+        acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), _mm256_cvtepi32_ps(sumi0), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(sumi1), acc1);
+    }
+
+    // reduce acc_m (4 f32 lanes) to scalar
+    acc_m0 = _mm_add_ps(acc_m0, _mm_movehl_ps(acc_m0, acc_m0));
+    acc_m0 = _mm_add_ss(acc_m0, _mm_movehdup_ps(acc_m0));
+    acc_m1 = _mm_add_ps(acc_m1, _mm_movehl_ps(acc_m1, acc_m1));
+    acc_m1 = _mm_add_ss(acc_m1, _mm_movehdup_ps(acc_m1));
+
+    (
+        hsum_f32_8(acc0) + _mm_cvtss_f32(acc_m0),
+        hsum_f32_8(acc1) + _mm_cvtss_f32(acc_m1),
+    )
+}
+
 // ── Q6_K × Q8_K ───────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
@@ -671,7 +821,8 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni_pair(
     )
 }
 
-/// Dispatch pair dot product — uses VNNI when available, falls back to two scalar calls.
+/// Dispatch pair dot product — uses maddubs+shuffle when AVX2+FMA available.
+/// maddubs+shuffle is faster than VNNI+mullo due to 4× fewer scale instructions.
 #[inline(always)]
 #[allow(unreachable_code)]
 pub fn vec_dot_q4_k_q8_k_dispatch_pair(
@@ -680,9 +831,9 @@ pub fn vec_dot_q4_k_q8_k_dispatch_pair(
     x1: &[BlockQ4K],
     y: &[BlockQ8K],
 ) -> (f32, f32) {
-    #[cfg(any(target_feature = "avxvnni", target_feature = "avx512vnni"))]
+    #[cfg(all(target_feature = "avx2", target_feature = "fma"))]
     {
-        return unsafe { vec_dot_q4_k_q8_k_vnni_pair(n, x0, x1, y) };
+        return unsafe { vec_dot_q4_k_q8_k_maddubs_pair(n, x0, x1, y) };
     }
     (
         vec_dot_q4_k_q8_k_dispatch(n, x0, y),
@@ -1280,6 +1431,8 @@ pub fn vec_dot_q4_k_q8_k_dispatch(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f
     {
         return unsafe { vec_dot_q4_k_q8_k_avx512(n, x, y) };
     }
+    // Prefer maddubs+shuffle over VNNI+mullo on AVX2: 4× fewer scale instructions
+    // and 2× better throughput on Zen 5. avx512 is kept above (512-bit advantage).
     #[cfg(all(
         not(all(
             target_feature = "avx512f",
@@ -1287,13 +1440,6 @@ pub fn vec_dot_q4_k_q8_k_dispatch(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f
             target_feature = "avx512vnni",
             target_feature = "avx512dq"
         )),
-        any(target_feature = "avxvnni", target_feature = "avx512vnni")
-    ))]
-    {
-        return unsafe { vec_dot_q4_k_q8_k_vnni(n, x, y) };
-    }
-    #[cfg(all(
-        not(any(target_feature = "avxvnni", target_feature = "avx512vnni")),
         all(target_feature = "avx2", target_feature = "fma")
     ))]
     {
@@ -2054,6 +2200,64 @@ mod tests {
 
         let diff = (scalar - avx2).abs();
         assert!(diff < 0.01, "scalar={scalar}, avx2={avx2}, diff={diff}");
+    }
+
+    #[test]
+    fn maddubs_pair_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+
+        for b in 0..4u8 {
+            let blk0 = BlockQ4K {
+                d: f32_to_f16(0.1 + 0.05 * b as f32),
+                dmin: f32_to_f16(0.01 * (b + 1) as f32),
+                scales: std::array::from_fn(|i| (b.wrapping_add(i as u8 * 3)) & 63),
+                qs: std::array::from_fn(|i| {
+                    let lo = b.wrapping_add(i as u8).wrapping_mul(3) & 0x0F;
+                    let hi = b.wrapping_add(i as u8).wrapping_mul(7) & 0x0F;
+                    lo | (hi << 4)
+                }),
+            };
+            let blk1 = BlockQ4K {
+                d: f32_to_f16(0.2 + 0.03 * b as f32),
+                dmin: f32_to_f16(0.02 * b as f32),
+                scales: std::array::from_fn(|i| (b.wrapping_mul(5).wrapping_add(i as u8 * 7)) & 63),
+                qs: std::array::from_fn(|i| {
+                    let lo = b.wrapping_mul(7).wrapping_add(i as u8).wrapping_mul(11) & 0x0F;
+                    let hi = b.wrapping_add(i as u8).wrapping_mul(13) & 0x0F;
+                    lo | (hi << 4)
+                }),
+            };
+
+            let act: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
+            let mut act_q8k = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+            quantize_row_q8_k(&act, &mut act_q8k);
+
+            let scalar0 = vec_dot::vec_dot_q4_k_q8_k(256, &[blk0], &act_q8k);
+            let scalar1 = vec_dot::vec_dot_q4_k_q8_k(256, &[blk1], &act_q8k);
+            let (pair0, pair1) =
+                unsafe { vec_dot_q4_k_q8_k_maddubs_pair(256, &[blk0], &[blk1], &act_q8k) };
+
+            let rel0 = if scalar0.abs() > 0.01 {
+                ((scalar0 - pair0) / scalar0).abs()
+            } else {
+                (scalar0 - pair0).abs()
+            };
+            let rel1 = if scalar1.abs() > 0.01 {
+                ((scalar1 - pair1) / scalar1).abs()
+            } else {
+                (scalar1 - pair1).abs()
+            };
+            assert!(
+                rel0 < 1e-4,
+                "block {b} row0: scalar={scalar0}, pair={pair0}, rel_err={rel0}"
+            );
+            assert!(
+                rel1 < 1e-4,
+                "block {b} row1: scalar={scalar1}, pair={pair1}, rel_err={rel1}"
+            );
+        }
     }
 
     #[test]
