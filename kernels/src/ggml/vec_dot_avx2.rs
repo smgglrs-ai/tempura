@@ -1031,6 +1031,223 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K])
     hsum_f32_8(acc) - mins_total
 }
 
+// ── AVX-512 4×4 micro-tile: 4 act rows × 4 weight rows = 16 outputs ──────
+//
+// Uses 32 ZMM registers without spilling:
+//   16 YMM (lower halves of zmm0-zmm15) for sumi[4][4] int accumulators
+//   8 ZMM for Q4K nibbles of w0-w3 per sub-block pair
+//   8 ZMM for Q8K 512-bit operands of a0-a3 per sub-block pair
+//   = 32 ZMM total
+//
+// Each 512-bit dpbusd covers two sub-blocks (64 elements) vs one (32) in the
+// 256-bit kernel, halving dot-product instruction count vs the 4×2 VNNI kernel.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx512dq")]
+pub unsafe fn vec_dot_q4k_q8k_avx512_4x4(
+    n: usize,
+    w0: &[BlockQ4K],
+    w1: &[BlockQ4K],
+    w2: &[BlockQ4K],
+    w3: &[BlockQ4K],
+    a0: &[BlockQ8K],
+    a1: &[BlockQ8K],
+    a2: &[BlockQ8K],
+    a3: &[BlockQ8K],
+) -> [[f32; 4]; 4] {
+    let nb = n / 256;
+    let mask_lo = _mm512_set1_epi8(0x0F_i8);
+    let zero512 = _mm512_setzero_si512();
+
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    // 16 float accumulators, one per (act_row, weight_row) pair.
+    let mut acc = [[_mm256_setzero_ps(); 4]; 4];
+    let mut mins_total = [[0.0f32; 4]; 4];
+
+    let w_ptrs = [w0.as_ptr(), w1.as_ptr(), w2.as_ptr(), w3.as_ptr()];
+    let a_ptrs = [a0.as_ptr(), a1.as_ptr(), a2.as_ptr(), a3.as_ptr()];
+
+    for i in 0..nb {
+        // Scale / min extraction for all 4 weight rows.
+        let mut utmp = [[0u32; 4]; 4];
+        let mut d_w = [0.0f32; 4];
+        let mut dmin_w = [0.0f32; 4];
+        for w in 0..4usize {
+            let wi = &*w_ptrs[w].add(i);
+            d_w[w] = f16_to_f32(wi.d);
+            dmin_w[w] = f16_to_f32(wi.dmin);
+            std::ptr::copy_nonoverlapping(wi.scales.as_ptr(), utmp[w].as_mut_ptr() as *mut u8, 12);
+            utmp[w][3] = ((utmp[w][2] >> 4) & KMASK2) | (((utmp[w][1] >> 6) & KMASK3) << 4);
+            let uaux = utmp[w][1] & KMASK1;
+            utmp[w][1] = (utmp[w][2] & KMASK2) | (((utmp[w][0] >> 6) & KMASK3) << 4);
+            utmp[w][2] = uaux;
+            utmp[w][0] &= KMASK1;
+        }
+
+        // bsums hadd and d_y for all 4 activation rows.
+        let mut q8sums = [_mm_setzero_si128(); 4];
+        let mut d_y = [0.0f32; 4];
+        let mut q8_blk_ptrs = [std::ptr::null::<i8>(); 4];
+        for r in 0..4usize {
+            let ai = &*a_ptrs[r].add(i);
+            d_y[r] = ai.d;
+            let bsums_v = _mm256_loadu_si256(ai.bsums.as_ptr() as *const __m256i);
+            q8sums[r] = _mm_hadd_epi16(
+                _mm256_castsi256_si128(bsums_v),
+                _mm256_extracti128_si256(bsums_v, 1),
+            );
+            q8_blk_ptrs[r] = ai.qs.as_ptr();
+        }
+
+        // Mins correction for all 16 (r, w) pairs.
+        for r in 0..4usize {
+            for w in 0..4usize {
+                let mins_128 = _mm_set_epi32(0, 0, utmp[w][3] as i32, utmp[w][2] as i32);
+                let prod = _mm_madd_epi16(_mm_cvtepu8_epi16(mins_128), q8sums[r]);
+                mins_total[r][w] += dmin_w[w] * d_y[r] * hsum_i32_4(prod) as f32;
+            }
+        }
+
+        // 16 integer sumi accumulators, reset per block.
+        let mut sumi = [[_mm256_setzero_si256(); 4]; 4];
+
+        // ── Sub-block pair 01 ──────────────────────────────────────────────
+        // Q4K nibble bytes 0..63: sub-blocks j=0 (bytes 0-31) and j=1 (bytes 32-63).
+        // Scales from utmp[w][0]: sc0=(b0&0xFF), sc1=(b0>>8), sc2=(b0>>16), sc3=(b0>>24).
+        for w in 0..4usize {
+            let q4_ptr = (*w_ptrs[w].add(i)).qs.as_ptr();
+            let q4_512 = _mm512_loadu_si512(q4_ptr as *const __m512i);
+            let q4_lo = _mm512_and_si512(q4_512, mask_lo);
+            let q4_hi = _mm512_and_si512(_mm512_srli_epi16(q4_512, 4), mask_lo);
+
+            let b0 = utmp[w][0];
+            let sc0 = (b0 & 0xFF) as i32;
+            let sc1 = ((b0 >> 8) & 0xFF) as i32;
+            let sc2 = ((b0 >> 16) & 0xFF) as i32;
+            let sc3 = ((b0 >> 24) & 0xFF) as i32;
+
+            for r in 0..4usize {
+                // Build 512-bit Q8K operands: [j=0_lo | j=1_lo] and [j=0_hi | j=1_hi].
+                let j0_lo = _mm256_loadu_si256(q8_blk_ptrs[r].add(0) as *const __m256i);
+                let j0_hi = _mm256_loadu_si256(q8_blk_ptrs[r].add(32) as *const __m256i);
+                let j1_lo = _mm256_loadu_si256(q8_blk_ptrs[r].add(64) as *const __m256i);
+                let j1_hi = _mm256_loadu_si256(q8_blk_ptrs[r].add(96) as *const __m256i);
+                let q8_lo = _mm512_inserti64x4(_mm512_castsi256_si512(j0_lo), j1_lo, 1);
+                let q8_hi = _mm512_inserti64x4(_mm512_castsi256_si512(j0_hi), j1_hi, 1);
+
+                // 512-bit dpbusd: lower 256 bits = j=0 dot, upper 256 bits = j=1 dot.
+                let dot_lo = _mm512_dpbusd_epi32(zero512, q4_lo, q8_lo);
+                let dot_hi = _mm512_dpbusd_epi32(zero512, q4_hi, q8_hi);
+
+                let lo0 = _mm512_castsi512_si256(dot_lo);
+                let lo1 = _mm512_extracti64x4_epi64(dot_lo, 1);
+                let hi0 = _mm512_castsi512_si256(dot_hi);
+                let hi1 = _mm512_extracti64x4_epi64(dot_hi, 1);
+
+                sumi[r][w] = _mm256_add_epi32(sumi[r][w], _mm256_mullo_epi32(lo0, _mm256_set1_epi32(sc0)));
+                sumi[r][w] = _mm256_add_epi32(sumi[r][w], _mm256_mullo_epi32(hi0, _mm256_set1_epi32(sc1)));
+                sumi[r][w] = _mm256_add_epi32(sumi[r][w], _mm256_mullo_epi32(lo1, _mm256_set1_epi32(sc2)));
+                sumi[r][w] = _mm256_add_epi32(sumi[r][w], _mm256_mullo_epi32(hi1, _mm256_set1_epi32(sc3)));
+            }
+        }
+
+        // ── Sub-block pair 23 ──────────────────────────────────────────────
+        // Q4K nibble bytes 64..127: sub-blocks j=2 (bytes 64-95) and j=3 (bytes 96-127).
+        // Scales from utmp[w][1]: sc4=(b1&0xFF), sc5=(b1>>8), sc6=(b1>>16), sc7=(b1>>24).
+        for w in 0..4usize {
+            let q4_ptr = (*w_ptrs[w].add(i)).qs.as_ptr();
+            let q4_512 = _mm512_loadu_si512(q4_ptr.add(64) as *const __m512i);
+            let q4_lo = _mm512_and_si512(q4_512, mask_lo);
+            let q4_hi = _mm512_and_si512(_mm512_srli_epi16(q4_512, 4), mask_lo);
+
+            let b1 = utmp[w][1];
+            let sc4 = (b1 & 0xFF) as i32;
+            let sc5 = ((b1 >> 8) & 0xFF) as i32;
+            let sc6 = ((b1 >> 16) & 0xFF) as i32;
+            let sc7 = ((b1 >> 24) & 0xFF) as i32;
+
+            for r in 0..4usize {
+                let j2_lo = _mm256_loadu_si256(q8_blk_ptrs[r].add(128) as *const __m256i);
+                let j2_hi = _mm256_loadu_si256(q8_blk_ptrs[r].add(160) as *const __m256i);
+                let j3_lo = _mm256_loadu_si256(q8_blk_ptrs[r].add(192) as *const __m256i);
+                let j3_hi = _mm256_loadu_si256(q8_blk_ptrs[r].add(224) as *const __m256i);
+                let q8_lo = _mm512_inserti64x4(_mm512_castsi256_si512(j2_lo), j3_lo, 1);
+                let q8_hi = _mm512_inserti64x4(_mm512_castsi256_si512(j2_hi), j3_hi, 1);
+
+                let dot_lo = _mm512_dpbusd_epi32(zero512, q4_lo, q8_lo);
+                let dot_hi = _mm512_dpbusd_epi32(zero512, q4_hi, q8_hi);
+
+                let lo2 = _mm512_castsi512_si256(dot_lo);
+                let lo3 = _mm512_extracti64x4_epi64(dot_lo, 1);
+                let hi2 = _mm512_castsi512_si256(dot_hi);
+                let hi3 = _mm512_extracti64x4_epi64(dot_hi, 1);
+
+                sumi[r][w] = _mm256_add_epi32(sumi[r][w], _mm256_mullo_epi32(lo2, _mm256_set1_epi32(sc4)));
+                sumi[r][w] = _mm256_add_epi32(sumi[r][w], _mm256_mullo_epi32(hi2, _mm256_set1_epi32(sc5)));
+                sumi[r][w] = _mm256_add_epi32(sumi[r][w], _mm256_mullo_epi32(lo3, _mm256_set1_epi32(sc6)));
+                sumi[r][w] = _mm256_add_epi32(sumi[r][w], _mm256_mullo_epi32(hi3, _mm256_set1_epi32(sc7)));
+            }
+        }
+
+        // Accumulate sumi into float accumulators.
+        for r in 0..4usize {
+            for w in 0..4usize {
+                acc[r][w] = _mm256_fmadd_ps(
+                    _mm256_set1_ps(d_w[w] * d_y[r]),
+                    _mm256_cvtepi32_ps(sumi[r][w]),
+                    acc[r][w],
+                );
+            }
+        }
+    }
+
+    let mut result = [[0.0f32; 4]; 4];
+    for r in 0..4usize {
+        for w in 0..4usize {
+            result[r][w] = hsum_f32_8(acc[r][w]) - mins_total[r][w];
+        }
+    }
+    result
+}
+
+/// Dispatch 4×4 block kernel: 4 activation rows × 4 weight rows = 16 outputs.
+/// Uses AVX-512 4×4 kernel when available; falls back to two 4×2 calls.
+/// Returns `results[r][w] = dot(a_r, w_w)` for r in 0..4, w in 0..4.
+#[inline(always)]
+#[allow(unreachable_code)]
+pub fn vec_dot_q4k_q8k_dispatch_4x4(
+    n: usize,
+    w0: &[BlockQ4K],
+    w1: &[BlockQ4K],
+    w2: &[BlockQ4K],
+    w3: &[BlockQ4K],
+    a0: &[BlockQ8K],
+    a1: &[BlockQ8K],
+    a2: &[BlockQ8K],
+    a3: &[BlockQ8K],
+) -> [[f32; 4]; 4] {
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vnni",
+        target_feature = "avx512dq"
+    ))]
+    {
+        return unsafe { vec_dot_q4k_q8k_avx512_4x4(n, w0, w1, w2, w3, a0, a1, a2, a3) };
+    }
+    // Fallback: two 4×2 calls (w0+w1, w2+w3).
+    let r01 = vec_dot_q4k_q8k_dispatch_4x2(n, w0, w1, a0, a1, a2, a3);
+    let r23 = vec_dot_q4k_q8k_dispatch_4x2(n, w2, w3, a0, a1, a2, a3);
+    [
+        [r01[0][0], r01[0][1], r23[0][0], r23[0][1]],
+        [r01[1][0], r01[1][1], r23[1][0], r23[1][1]],
+        [r01[2][0], r01[2][1], r23[2][0], r23[2][1]],
+        [r01[3][0], r01[3][1], r23[3][0], r23[3][1]],
+    ]
+}
+
 // ── Runtime dispatch ───────────────────────────────────────────────────────
 
 #[allow(unreachable_code)]
@@ -2243,6 +2460,138 @@ mod tests {
             diff < 1e-5,
             "dispatch={dispatch}, avx512={avx512}, diff={diff}"
         );
+    }
+
+    // ── avx512 4×4 micro-tile correctness ────────────────────────────────────
+
+    #[test]
+    fn avx512_4x4_matches_pair_reference() {
+        if !is_x86_feature_detected!("avx512f")
+            || !is_x86_feature_detected!("avx512bw")
+            || !is_x86_feature_detected!("avx512vnni")
+            || !is_x86_feature_detected!("avx512dq")
+        {
+            return;
+        }
+
+        // Build 4 distinct weight blocks and 4 distinct activation blocks.
+        let w_blocks: [BlockQ4K; 4] = std::array::from_fn(|w| BlockQ4K {
+            d: f32_to_f16(0.1 + 0.05 * w as f32),
+            dmin: f32_to_f16(0.01 * (w + 1) as f32),
+            scales: std::array::from_fn(|i| (w as u8 * 7 + i as u8 * 3) & 63),
+            qs: std::array::from_fn(|i| {
+                let lo = (w as u8 * 5).wrapping_add(i as u8).wrapping_mul(3) & 0x0F;
+                let hi = (w as u8 * 5).wrapping_add(i as u8).wrapping_mul(11) & 0x0F;
+                lo | (hi << 4)
+            }),
+        });
+        let act_f: Vec<Vec<f32>> = (0..4)
+            .map(|r| (0..256).map(|i| (r as f32 * 64.0 + i as f32 - 128.0) / 128.0).collect())
+            .collect();
+        let a_blocks: Vec<Vec<BlockQ8K>> = (0..4)
+            .map(|r| {
+                let mut blk = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+                super::super::quantize::quantize_row_q8_k(&act_f[r], &mut blk);
+                blk
+            })
+            .collect();
+
+        // Reference: 16 individual pair or single calls.
+        let mut ref_results = [[0.0f32; 4]; 4];
+        for r in 0..4 {
+            for w in 0..4 {
+                ref_results[r][w] =
+                    vec_dot_q4_k_q8_k_dispatch(256, &[w_blocks[w]], &a_blocks[r]);
+            }
+        }
+
+        // AVX-512 4×4 kernel.
+        let got = unsafe {
+            vec_dot_q4k_q8k_avx512_4x4(
+                256,
+                &[w_blocks[0]], &[w_blocks[1]], &[w_blocks[2]], &[w_blocks[3]],
+                &a_blocks[0], &a_blocks[1], &a_blocks[2], &a_blocks[3],
+            )
+        };
+
+        for r in 0..4 {
+            for w in 0..4 {
+                let ref_v = ref_results[r][w];
+                let got_v = got[r][w];
+                let rel = if ref_v.abs() > 0.01 {
+                    ((got_v - ref_v) / ref_v).abs()
+                } else {
+                    (got_v - ref_v).abs()
+                };
+                assert!(
+                    rel < 1e-4,
+                    "({r},{w}): ref={ref_v}, got={got_v}, rel_err={rel}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn avx512_4x4_dispatch_matches_4x2_fallback() {
+        // Validate dispatch_4x4 matches two dispatch_4x2 calls regardless of CPU.
+        let w_blocks: [BlockQ4K; 4] = std::array::from_fn(|w| BlockQ4K {
+            d: f32_to_f16(0.2 + 0.03 * w as f32),
+            dmin: f32_to_f16(0.01),
+            scales: std::array::from_fn(|i| (w * 13 + i * 7) as u8 & 63),
+            qs: std::array::from_fn(|i| {
+                let lo = (w as u8).wrapping_add((i as u8).wrapping_mul(5)) & 0x0F;
+                let hi = (w as u8).wrapping_mul(7).wrapping_add((i as u8).wrapping_mul(3)) & 0x0F;
+                lo | (hi << 4)
+            }),
+        });
+        let act_f: Vec<Vec<f32>> = (0..4)
+            .map(|r| (0..256).map(|i| (i as f32 * (r as f32 + 1.0) - 128.0) / 256.0).collect())
+            .collect();
+        let a_blocks: Vec<Vec<BlockQ8K>> = (0..4)
+            .map(|r| {
+                let mut blk = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }];
+                super::super::quantize::quantize_row_q8_k(&act_f[r], &mut blk);
+                blk
+            })
+            .collect();
+
+        // Reference via two 4×2 calls.
+        let r01 = vec_dot_q4k_q8k_dispatch_4x2(
+            256, &[w_blocks[0]], &[w_blocks[1]],
+            &a_blocks[0], &a_blocks[1], &a_blocks[2], &a_blocks[3],
+        );
+        let r23 = vec_dot_q4k_q8k_dispatch_4x2(
+            256, &[w_blocks[2]], &[w_blocks[3]],
+            &a_blocks[0], &a_blocks[1], &a_blocks[2], &a_blocks[3],
+        );
+        let ref4x4 = [
+            [r01[0][0], r01[0][1], r23[0][0], r23[0][1]],
+            [r01[1][0], r01[1][1], r23[1][0], r23[1][1]],
+            [r01[2][0], r01[2][1], r23[2][0], r23[2][1]],
+            [r01[3][0], r01[3][1], r23[3][0], r23[3][1]],
+        ];
+
+        let got = vec_dot_q4k_q8k_dispatch_4x4(
+            256,
+            &[w_blocks[0]], &[w_blocks[1]], &[w_blocks[2]], &[w_blocks[3]],
+            &a_blocks[0], &a_blocks[1], &a_blocks[2], &a_blocks[3],
+        );
+
+        for r in 0..4 {
+            for w in 0..4 {
+                let ref_v = ref4x4[r][w];
+                let got_v = got[r][w];
+                let rel = if ref_v.abs() > 0.01 {
+                    ((got_v - ref_v) / ref_v).abs()
+                } else {
+                    (got_v - ref_v).abs()
+                };
+                assert!(
+                    rel < 1e-4,
+                    "({r},{w}): ref={ref_v}, got={got_v}, rel_err={rel}"
+                );
+            }
+        }
     }
 
     // ── gemv_q4k_8x8 tests ────────────────────────────────────────────────
