@@ -4883,24 +4883,28 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
         }
 
-        // m=1 decode fast path: repack weights into BlockQ4Kx8 and run 8-wide GEMV.
-        // Uses maddubs (AVX2, no VNNI). Only beneficial when VNNI is NOT available;
-        // on VNNI CPUs the pair kernel's dpbusd is faster, so fall through to Q4kGemvJob.
-        #[cfg(not(any(target_feature = "avxvnni", target_feature = "avx512vnni")))]
-        if m == 1 && n % 8 == 0 {
+        // m=1 decode fast path: repack weights into BlockQ4Kx8 and run llama.cpp 8×8 GEMV.
+        // Uses maddubs (AVX2+F16C+FMA). Replaces both the VNNI pair kernel and Q4kGemvX8Job.
+        #[cfg(target_arch = "x86_64")]
+        if m == 1
+            && n % 8 == 0
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("f16c")
+            && is_x86_feature_detected!("fma")
+        {
             use crate::ggml::blocks::{BlockQ4K, BlockQ4Kx8};
             use crate::ggml::repack::repack_q4k_to_q4kx8;
 
             // Thread-local cache: (weight_ptr, n, bpr) → Vec<BlockQ4Kx8>.
             // Avoids re-packing every decode call once weights are stable.
             thread_local! {
-                static Q4KX8_CACHE: std::cell::RefCell<(usize, usize, usize, Vec<BlockQ4Kx8>)> =
+                static Q4KX8_LLAMA_CACHE: std::cell::RefCell<(usize, usize, usize, Vec<BlockQ4Kx8>)> =
                     const { std::cell::RefCell::new((0, 0, 0, Vec::new())) };
             }
 
             let src_ptr = b_quantized.as_ptr() as usize;
 
-            let packed_ready = Q4KX8_CACHE.with(|c| {
+            let packed_ready = Q4KX8_LLAMA_CACHE.with(|c| {
                 let cache = c.borrow();
                 cache.0 == src_ptr && cache.1 == n && cache.2 == blocks_per_row
             });
@@ -4913,30 +4917,41 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                     )
                 };
                 let repacked = repack_q4k_to_q4kx8(src_q4k, n, blocks_per_row);
-                Q4KX8_CACHE.with(|c| {
+                Q4KX8_LLAMA_CACHE.with(|c| {
                     *c.borrow_mut() = (src_ptr, n, blocks_per_row, repacked);
                 });
             }
 
-            Q4KX8_CACHE.with(|c| {
+            Q4KX8_LLAMA_CACHE.with(|c| {
                 let cache = c.borrow();
                 let packed = &cache.3;
-                let job = Q4kGemvX8Job {
-                    packed_ptr: packed.as_ptr() as *const u8,
-                    q8k_ptr: q8k_all.as_ptr() as *const u8,
-                    out_ptr: output.as_mut_ptr(),
-                    n,
-                    bpr: blocks_per_row,
-                };
-                // Dispatch over n/8 groups; each group handles 8 weight rows.
-                crate::inference_pool::par_run_job(n / 8, &job);
+                let packed_ptr = packed.as_ptr() as *const u8;
+                let q8k_ptr = q8k_all.as_ptr() as *const u8;
+                let out_ptr = output.as_mut_ptr();
+                unsafe {
+                    crate::ggml::repack_llama::ggml_gemv_q4_k_8x8_q8_k(
+                        k,
+                        out_ptr,
+                        packed_ptr,
+                        q8k_ptr,
+                        1,
+                        n,
+                    );
+                }
             });
             return Ok(());
         }
 
-        // m>1 prefill fast path: repack activations into Q8Kx4 and run 4×8 GEMM.
-        // Requires m divisible by 4 and n divisible by 8.
-        if m % 4 == 0 && n % 8 == 0 {
+        // m>1 prefill fast path: repack activations into Q8Kx4 and run llama.cpp 4×8 GEMM.
+        // Requires m divisible by 4 and n divisible by 8. Falls through to Q4kMnBlockJob
+        // if AVX2/F16C/FMA is unavailable or dimensions are not aligned.
+        #[cfg(target_arch = "x86_64")]
+        if m % 4 == 0
+            && n % 8 == 0
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("f16c")
+            && is_x86_feature_detected!("fma")
+        {
             use crate::ggml::blocks::{BlockQ4K, BlockQ4Kx8};
             use crate::ggml::repack::{quantize_mat_q8k_4x8, repack_q4k_to_q4kx8};
 
@@ -4968,14 +4983,33 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             Q4KX8_GEMM_CACHE.with(|c| {
                 let cache = c.borrow();
                 let packed_w = &cache.3;
-                crate::ggml::vec_dot_avx2::gemm_q4k_8x8_scalar(
-                    blocks_per_row,
-                    packed_w,
-                    &packed_a,
-                    output,
-                    m,
-                    n,
-                );
+                let packed_w_ptr = packed_w.as_ptr() as *const u8;
+                let packed_a_ptr = packed_a.as_ptr() as *const u8;
+                let out_ptr = output.as_mut_ptr();
+                let nb = blocks_per_row;
+                let k_dim = k;
+                let n_out = n;
+                let m_rows = m;
+                // Parallelize over n/8 weight groups; each group's output columns are
+                // non-overlapping across workers (stride = n_out, so s.add(start*8) is safe).
+                crate::inference_pool::par_run(n / 8, |start, end| {
+                    let nc_here = (end - start) * 8;
+                    unsafe {
+                        crate::ggml::repack_llama2::ggml_gemm_q4_k_8x8_q8_k(
+                            k_dim,
+                            out_ptr.add(start * 8),
+                            n_out,
+                            packed_w_ptr.add(
+                                start
+                                    * nb
+                                    * std::mem::size_of::<crate::ggml::blocks::BlockQ4Kx8>(),
+                            ),
+                            packed_a_ptr,
+                            m_rows,
+                            nc_here,
+                        );
+                    }
+                });
             });
 
             return Ok(());
