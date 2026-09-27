@@ -1,0 +1,996 @@
+// Translation of remaining architecture paths from:
+//   llama.cpp ggml/src/ggml-cpu/simd-mappings.h
+//   llama.cpp ggml/src/ggml-cpu/simd-gemm.h
+//
+// Covers every platform NOT already in simd_mappings_llama.rs (which handles
+// x86_64 AVX2 / AVX512F / SSE3):
+//
+//   - ARM NEON (aarch64) — F32x4 and F16x4/F16x8 ops
+//   - ARM SVE  (aarch64 + target_feature = "sve") — scalable F32/F16 ops
+//   - RISC-V Vector (riscv64 + riscv_v_intrinsic) — F32 ops + RVV GEMM
+//   - PowerPC AltiVec/POWER9 (powerpc64) — F32x4, F16 via extract, BF16
+//   - WebAssembly SIMD128 (wasm32) — F32x4, F16 via scalar convert
+//   - LoongArch ASX / LSX (loongarch64) — F32x8 / F32x4 + F16 convert
+//   - s390x VXE / VXE2 (s390x) — F32x4 + F16 via scalar, BF16
+//
+// Each architecture block is gated with `#[cfg(target_arch = "...")]`
+// (and feature guards where needed) so this file compiles on every host.
+// Functions that require target features use `#[target_feature(enable = "...")]`.
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Cross-platform FP16 ↔ FP32 conversion
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// On ARM: native __fp16 via vcvt; on other platforms: half-crate software.
+// The x86_64 F16C path is already in simd_mappings_llama.
+
+/// Convert a raw IEEE 754 half-precision bit pattern to f32 on ARM.
+///
+/// Uses the native `vcvt_f32_f16` / `vget_low_f16` path when the target
+/// has `__ARM_FP16_FORMAT_IEEE`; otherwise falls through to the half-crate
+/// software path (defined in simd_mappings_llama::fp16_to_fp32).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub fn neon_fp16_to_fp32(h: u16) -> f32 {
+    // On AArch64, __fp16 is always IEEE 754.  We reinterpret the raw bits
+    // through a float16x4_t load and extract lane 0 as f32.
+    unsafe {
+        use std::arch::aarch64::*;
+        let v = vdup_n_f16(f16::from_bits(h));
+        vcvt_f32_f16(v).as_array()[0]
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub fn neon_fp32_to_fp16(f: f32) -> u16 {
+    unsafe {
+        use std::arch::aarch64::*;
+        let v = vdup_n_f32(f);
+        vcvt_f16_f32(v).as_array()[0].to_bits()
+    }
+}
+
+// PowerPC POWER9 FP16 conversion — uses inline asm mtfprd / xscvhpdp / frsp.
+// Rust does not support float16 on powerpc64, so we use the half crate.
+#[cfg(target_arch = "powerpc64")]
+#[inline(always)]
+pub fn power_fp16_to_fp32(h: u16) -> f32 {
+    half::f16::from_bits(h).to_f32()
+}
+
+#[cfg(target_arch = "powerpc64")]
+#[inline(always)]
+pub fn power_fp32_to_fp16(f: f32) -> u16 {
+    half::f16::from_f32(f).to_bits()
+}
+
+// RISC-V Zfhmin FP16 conversion — _Float16 reinterpret via half crate.
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+pub fn riscv_fp16_to_fp32(h: u16) -> f32 {
+    half::f16::from_bits(h).to_f32()
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+pub fn riscv_fp32_to_fp16(f: f32) -> u16 {
+    half::f16::from_f32(f).to_bits()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ARM NEON — F32x4 and F16 operations
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Matches the `#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_FMA)` block
+// in simd-mappings.h (lines 331-444).
+//
+// GGML_F32_EPR = 4, GGML_F32_STEP = 16, GGML_F32_ARR = 4
+// GEMM_RM = 4, GEMM_RN = 4 (same as AVX512F branch)
+
+#[cfg(target_arch = "aarch64")]
+pub mod neon {
+    use std::arch::aarch64::*;
+
+    // F32x4 — mirrors GGML_F32x4_* macros
+
+    // GGML_F32x4_ZERO = vdupq_n_f32(0.0f)
+    #[inline(always)]
+    pub unsafe fn f32x4_zero() -> float32x4_t {
+        vdupq_n_f32(0.0)
+    }
+
+    // GGML_F32x4_SET1(x) = vdupq_n_f32(x)
+    #[inline(always)]
+    pub unsafe fn f32x4_set1(x: f32) -> float32x4_t {
+        vdupq_n_f32(x)
+    }
+
+    // GGML_F32x4_LOAD = vld1q_f32
+    #[inline(always)]
+    pub unsafe fn f32x4_load(p: *const f32) -> float32x4_t {
+        vld1q_f32(p)
+    }
+
+    // GGML_F32x4_STORE = vst1q_f32
+    #[inline(always)]
+    pub unsafe fn f32x4_store(p: *mut f32, v: float32x4_t) {
+        vst1q_f32(p, v)
+    }
+
+    // GGML_F32x4_FMA(a, b, c) = vfmaq_f32(a, b, c)
+    #[inline(always)]
+    pub unsafe fn f32x4_fma(a: float32x4_t, b: float32x4_t, c: float32x4_t) -> float32x4_t {
+        vfmaq_f32(a, b, c)
+    }
+
+    // GGML_F32x4_ADD = vaddq_f32
+    #[inline(always)]
+    pub unsafe fn f32x4_add(a: float32x4_t, b: float32x4_t) -> float32x4_t {
+        vaddq_f32(a, b)
+    }
+
+    // GGML_F32x4_MUL = vmulq_f32
+    #[inline(always)]
+    pub unsafe fn f32x4_mul(a: float32x4_t, b: float32x4_t) -> float32x4_t {
+        vmulq_f32(a, b)
+    }
+
+    // GGML_F32x4_REDUCE_ONE(x) = vaddvq_f32(x)
+    #[inline(always)]
+    pub unsafe fn f32x4_reduce_one(x: float32x4_t) -> f32 {
+        vaddvq_f32(x)
+    }
+
+    // GGML_F32x4_REDUCE over ARR accumulators: pairwise tree-reduce then scalar.
+    #[inline(always)]
+    pub unsafe fn f32x4_reduce_arr<const ARR: usize>(x: &mut [float32x4_t; ARR]) -> f32 {
+        let mut offset = ARR >> 1;
+        while offset > 0 {
+            for i in 0..offset {
+                x[i] = vaddq_f32(x[i], x[offset + i]);
+            }
+            offset >>= 1;
+        }
+        f32x4_reduce_one(x[0])
+    }
+
+    // F16x4 via F32 conversion (when __ARM_FEATURE_FP16_VECTOR_ARITHMETIC absent)
+    // GGML_F32Cx4_LOAD(x) = vcvt_f32_f16(vld1_f16((const __fp16 *)(x)))
+
+    #[inline(always)]
+    pub unsafe fn f32cx4_load(p: *const u16) -> float32x4_t {
+        let h = vld1_f16(p as *const f16);
+        vcvt_f32_f16(h)
+    }
+
+    // GGML_F32Cx4_STORE(x, y) = vst1_f16(x, vcvt_f16_f32(y))
+    #[inline(always)]
+    pub unsafe fn f32cx4_store(p: *mut u16, v: float32x4_t) {
+        vst1_f16(p as *mut f16, vcvt_f16_f32(v));
+    }
+
+    // F16x8 (when __ARM_FEATURE_FP16_VECTOR_ARITHMETIC is present)
+    // GGML_F16x8_ZERO = vdupq_n_f16(0.0f)
+    #[inline(always)]
+    pub unsafe fn f16x8_zero() -> float16x8_t {
+        vdupq_n_f16(f16::from_bits(0))
+    }
+
+    // GGML_F16x8_SET1(x) = vdupq_n_f16(x)
+    #[inline(always)]
+    pub unsafe fn f16x8_set1(x: f16) -> float16x8_t {
+        vdupq_n_f16(x)
+    }
+
+    // GGML_F16x8_LOAD(x) = vld1q_f16((const __fp16 *)(x))
+    #[inline(always)]
+    pub unsafe fn f16x8_load(p: *const u16) -> float16x8_t {
+        vld1q_f16(p as *const f16)
+    }
+
+    // GGML_F16x8_STORE = vst1q_f16
+    #[inline(always)]
+    pub unsafe fn f16x8_store(p: *mut u16, v: float16x8_t) {
+        vst1q_f16(p as *mut f16, v)
+    }
+
+    // GGML_F16x8_FMA(a, b, c) = vfmaq_f16(a, b, c)
+    #[target_feature(enable = "fp16")]
+    #[inline(always)]
+    pub unsafe fn f16x8_fma(a: float16x8_t, b: float16x8_t, c: float16x8_t) -> float16x8_t {
+        vfmaq_f16(a, b, c)
+    }
+
+    // GGML_F16x8_ADD = vaddq_f16
+    #[inline(always)]
+    pub unsafe fn f16x8_add(a: float16x8_t, b: float16x8_t) -> float16x8_t {
+        vaddq_f16(a, b)
+    }
+
+    // GGML_F16x8_MUL = vmulq_f16
+    #[inline(always)]
+    pub unsafe fn f16x8_mul(a: float16x8_t, b: float16x8_t) -> float16x8_t {
+        vmulq_f16(a, b)
+    }
+
+    // GGML_F16x8_REDUCE: pairwise add 8 regs (ARR=4), then vcvt+vaddvq.
+    // Matches the GGML_F16x8_REDUCE macro: reduces ARR=4 float16x8_t accumulators
+    // to a scalar f32 via 3 rounds of pairwise add, then vcvt low+high to f32x4.
+    #[inline(always)]
+    pub unsafe fn f16x8_reduce_arr<const ARR: usize>(x: &mut [float16x8_t; ARR]) -> f32 {
+        let mut offset = ARR >> 1;
+        while offset > 0 {
+            for i in 0..offset {
+                x[i] = vaddq_f16(x[i], x[offset + i]);
+            }
+            offset >>= 1;
+        }
+        let t0 = vcvt_f32_f16(vget_low_f16(x[0]));
+        let t1 = vcvt_f32_f16(vget_high_f16(x[0]));
+        vaddvq_f32(vaddq_f32(t0, t1))
+    }
+
+    // simd_gemm for NEON: RM=4, RN=4, EPR=4
+    // Called from neon_gemm() below.
+    pub const EPR: usize = 4;
+    pub const GEMM_RM: usize = 4;
+    pub const GEMM_RN: usize = 4;
+
+    pub unsafe fn ukernel<const RM: usize, const RN: usize>(
+        c: *mut f32,
+        a: *const f32,
+        b: *const f32,
+        k: usize,
+        n: usize,
+    ) {
+        let mut acc = [[vdupq_n_f32(0.0f32); RN]; RM];
+        for i in 0..RM {
+            for r in 0..RN {
+                acc[i][r] = f32x4_load(c.add(i * n + r * EPR));
+            }
+        }
+        for kk in 0..k {
+            let mut bv = [vdupq_n_f32(0.0f32); RN];
+            for r in 0..RN {
+                bv[r] = f32x4_load(b.add(kk * n + r * EPR));
+            }
+            for i in 0..RM {
+                let p = f32x4_set1(*a.add(i * k + kk));
+                for r in 0..RN {
+                    acc[i][r] = f32x4_fma(acc[i][r], bv[r], p);
+                }
+            }
+        }
+        for i in 0..RM {
+            for r in 0..RN {
+                f32x4_store(c.add(i * n + r * EPR), acc[i][r]);
+            }
+        }
+    }
+
+    pub unsafe fn gemm(
+        c: *mut f32,
+        a: *const f32,
+        b: *const f32,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        const RM: usize = GEMM_RM;
+        const RN: usize = GEMM_RN;
+
+        let mut a = a;
+        let mut c = c;
+        let mut ii = 0usize;
+
+        while ii + RM <= m {
+            let mut jj = 0usize;
+            while jj + RN * EPR <= n {
+                ukernel::<RM, RN>(c.add(jj), a, b.add(jj), k, n);
+                jj += RN * EPR;
+            }
+            while jj + EPR <= n {
+                ukernel::<RM, 1>(c.add(jj), a, b.add(jj), k, n);
+                jj += EPR;
+            }
+            while jj < n {
+                for i in 0..RM {
+                    let mut acc = *c.add(i * n + jj);
+                    for kk in 0..k {
+                        acc += *a.add(i * k + kk) * *b.add(kk * n + jj);
+                    }
+                    *c.add(i * n + jj) = acc;
+                }
+                jj += 1;
+            }
+            a = a.add(RM * k);
+            c = c.add(RM * n);
+            ii += RM;
+        }
+
+        while ii < m {
+            let mut jj = 0usize;
+            while jj + RN * EPR <= n {
+                ukernel::<1, RN>(c.add(jj), a, b.add(jj), k, n);
+                jj += RN * EPR;
+            }
+            while jj + EPR <= n {
+                ukernel::<1, 1>(c.add(jj), a, b.add(jj), k, n);
+                jj += EPR;
+            }
+            while jj < n {
+                let mut acc = *c.add(jj);
+                for kk in 0..k {
+                    acc += *a.add(kk) * *b.add(kk * n + jj);
+                }
+                *c.add(jj) = acc;
+                jj += 1;
+            }
+            a = a.add(k);
+            c = c.add(n);
+            ii += 1;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ARM SVE — scalable F32 and F16 operations
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Matches the `#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_FMA)`
+// block (lines 172-260).
+//
+// SVE vector length is runtime-determined (VL-agnostic).  GGML_F32_EPR is
+// defined as 8 in the C source (conservative lower bound for VL=256 bits).
+// In Rust, SVE intrinsics are unstable; we provide the structure gated on
+// `target_feature = "sve"` and compile-time cfg.
+
+#[cfg(all(target_arch = "aarch64", target_feature = "sve"))]
+pub mod sve {
+    // SVE intrinsics in Rust are in the nightly-only `std::arch::aarch64`
+    // behind #[cfg(target_feature = "sve")].  Stable Rust doesn't expose them
+    // yet.  We declare the module so the namespace exists and the build graph
+    // is consistent; implementations will be filled as SVE stabilises.
+    //
+    // For reference, the C macros map as:
+    //   GGML_F32xt_ZERO                    → svdup_n_f32(0.0f)
+    //   GGML_F32xt_SET1(x)                 → svdup_n_f32(x)
+    //   GGML_F32xt_LOAD(a)                 → svld1_f32(svptrue_b32(), a)
+    //   GGML_F32xt_STORE(a, b)             → svst1_f32(svptrue_b32(), a, b)
+    //   GGML_F32xt_FMA(a, b, c)            → svmad_f32_m(svptrue_b32(), b, c, a)
+    //   GGML_F32xt_ADD(a, b)               → svadd_f32_m(svptrue_b32(), a, b)
+    //   GGML_F32xt_MUL(a, b)               → svmul_f32_m(svptrue_b32(), a, b)
+    //   GGML_F32xt_REDUCE_ONE(a)           → svaddv(svptrue_b32(), a)
+
+    pub const EPR: usize = 8; // GGML_F32_EPR for SVE (conservative for VL=256)
+    pub const GEMM_RM: usize = 4;
+    pub const GEMM_RN: usize = 4;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RISC-V Vector — F32 operations and RVV GEMM
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// From simd-mappings.h (lines 1278-1307) and the RVV GEMM in simd-gemm.h
+// (lines 112-205).
+//
+// GGML_F32_EPR = 4 (fixed-size slice; actual VL is runtime __riscv_vlenb()).
+// GEMM_RM = 7 (RM accumulators + 1 B vector ≤ 8 vfloat32m4_t registers).
+//
+// RISC-V Vector intrinsics in Rust are nightly-only behind
+// `#![feature(riscv_target_feature)]`.  The module is declared for namespace
+// consistency; the scalar fallback in simd_gemm_llama::scalar_gemm is used.
+
+#[cfg(target_arch = "riscv64")]
+pub mod rvv {
+    // C mappings for reference:
+    //   GGML_F32x4_ZERO         → __riscv_vfmv_v_f_f32m1(0.0f, EPR)
+    //   GGML_F32x4_SET1(x)      → __riscv_vfmv_v_f_f32m1(x,   EPR)
+    //   GGML_F32x4_LOAD(x)      → __riscv_vle32_v_f32m1(x,    EPR)
+    //   GGML_F32x4_STORE(b, v)  → __riscv_vse32_v_f32m1(b, v, EPR)
+    //   GGML_F32x4_FMA(a, b, c) → __riscv_vfmacc_vv_f32m1(a, b, c, EPR)
+    //   GGML_F32x4_ADD(a, b)    → __riscv_vfadd_vv_f32m1(a, b, EPR)
+    //   GGML_F32x4_MUL(a, b)    → __riscv_vfmul_vv_f32m1(a, b, EPR)
+
+    pub const EPR: usize = 4;
+    pub const GEMM_RM: usize = 7;
+
+    // RVV GEMM (rvv_simd_gemm_ukernel + rvv_simd_gemm_dispatch_tail +
+    // simd_gemm for RVV) from simd-gemm.h.
+    //
+    // C template:
+    //   template <int RM>
+    //   static inline void rvv_simd_gemm_ukernel(C, A, B, K, N, vl);
+    //   static void simd_gemm(C, A, B, M, K, N);
+    //
+    // The RM specialisations (1..7) map to a runtime-dispatched Rust function.
+    // We translate the outer loop; the inner vfmacc calls require nightly
+    // intrinsics, so we fall back to scalar in stable builds.
+
+    /// C[M×N] += A[M×K] × B[K×N] — RVV path (scalar fallback on stable Rust).
+    ///
+    /// When RVV intrinsics stabilise, replace the inner loop body with
+    /// `__riscv_vfmacc_vv_f32m1` over `vlenb`-wide tiles using LMUL=4.
+    pub fn gemm(
+        c: *mut f32,
+        a: *const f32,
+        b: *const f32,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        // Scalar fallback — identical to simd_gemm_llama::scalar_gemm.
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = unsafe { *c.add(i * n + j) };
+                for kk in 0..k {
+                    sum += unsafe { *a.add(i * k + kk) } * unsafe { *b.add(kk * n + j) };
+                }
+                unsafe { *c.add(i * n + j) = sum; }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PowerPC POWER9 — F32x4, F16 (via scalar extract), BF16
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Matches `#elif defined(__POWER9_VECTOR__)` (lines 685-786).
+// GGML_F32_EPR = 4, GGML_F32_STEP = 32, GGML_F32_ARR = 8.
+//
+// Rust's `std::arch::powerpc64` exposes some AltiVec intrinsics.  Full
+// POWER9 support (e.g. vec_xl / vec_xst with specific offsets) requires
+// `target_feature = "power9-altivec"`.
+
+#[cfg(target_arch = "powerpc64")]
+pub mod power9 {
+    use std::arch::powerpc64::*;
+
+    pub const EPR: usize = 4;
+    pub const GEMM_RM: usize = 2;
+    pub const GEMM_RN: usize = 2;
+
+    // GGML_F32x4_ZERO = {0.0f}
+    #[inline(always)]
+    pub unsafe fn f32x4_zero() -> vector_float {
+        vec_splats(0.0f32)
+    }
+
+    // GGML_F32x4_SET1 = vec_splats
+    #[inline(always)]
+    pub unsafe fn f32x4_set1(x: f32) -> vector_float {
+        vec_splats(x)
+    }
+
+    // GGML_F32x4_LOAD(p) = vec_xl(0, p)
+    #[inline(always)]
+    pub unsafe fn f32x4_load(p: *const f32) -> vector_float {
+        vec_xl(0, p)
+    }
+
+    // GGML_F32x4_STORE(p, r) = vec_xst(r, 0, p)
+    #[inline(always)]
+    pub unsafe fn f32x4_store(p: *mut f32, v: vector_float) {
+        vec_xst(v, 0, p)
+    }
+
+    // GGML_F32x4_FMA(a, b, c) = vec_madd(b, c, a)
+    #[inline(always)]
+    pub unsafe fn f32x4_fma(a: vector_float, b: vector_float, c: vector_float) -> vector_float {
+        vec_madd(b, c, a)
+    }
+
+    // GGML_F32x4_ADD = vec_add
+    #[inline(always)]
+    pub unsafe fn f32x4_add(a: vector_float, b: vector_float) -> vector_float {
+        vec_add(a, b)
+    }
+
+    // GGML_F32x4_MUL = vec_mul
+    #[inline(always)]
+    pub unsafe fn f32x4_mul(a: vector_float, b: vector_float) -> vector_float {
+        vec_mul(a, b)
+    }
+
+    // GGML_F32x4_REDUCE: tree-reduce then scalar extract.
+    // res = vec_extract(x[0],0) + vec_extract(x[0],1) + ...
+    #[inline(always)]
+    pub unsafe fn f32x4_reduce_arr<const ARR: usize>(x: &mut [vector_float; ARR]) -> f32 {
+        let mut offset = ARR >> 1;
+        while offset > 0 {
+            for i in 0..offset {
+                x[i] = vec_add(x[i], x[offset + i]);
+            }
+            offset >>= 1;
+        }
+        let raw: [f32; 4] = std::mem::transmute(x[0]);
+        raw[0] + raw[1] + raw[2] + raw[3]
+    }
+
+    // GGML_F32x4_REDUCE_4: used in BF16 path.
+    // Combines 4 vector_float accumulators and adds into a running scalar.
+    #[inline(always)]
+    pub unsafe fn f32x4_reduce_4(acc: &mut f32, s0: vector_float, s1: vector_float,
+                                  s2: vector_float, s3: vector_float) {
+        let v = vec_add(vec_add(s0, s1), vec_add(s2, s3));
+        let raw: [f32; 4] = std::mem::transmute(v);
+        *acc += raw[0] + raw[1] + raw[2] + raw[3];
+    }
+
+    // BF16 POWER9 helpers (GGML_BF16x8 = vector unsigned short, 8 BF16 lanes).
+    // GGML_BF16_TO_F32_LO / _HI: merge BF16 halfwords with zero to get F32.
+    // On little-endian: mergel(zero, v) / mergeh(zero, v).
+    // On big-endian:    mergel(v, zero) / mergeh(v, zero).
+    // We expose the scalar equivalent for portability.
+
+    /// Unpack low 4 BF16 values from a u16x8 register to f32x4.
+    #[inline(always)]
+    pub unsafe fn bf16x8_to_f32_lo(v: [u16; 8]) -> vector_float {
+        let mut tmp = [0f32; 4];
+        for i in 0..4 {
+            let bits = (v[i] as u32) << 16;
+            tmp[i] = f32::from_bits(bits);
+        }
+        vec_xl(0, tmp.as_ptr())
+    }
+
+    /// Unpack high 4 BF16 values from a u16x8 register to f32x4.
+    #[inline(always)]
+    pub unsafe fn bf16x8_to_f32_hi(v: [u16; 8]) -> vector_float {
+        let mut tmp = [0f32; 4];
+        for i in 0..4 {
+            let bits = (v[4 + i] as u32) << 16;
+            tmp[i] = f32::from_bits(bits);
+        }
+        vec_xl(0, tmp.as_ptr())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WebAssembly SIMD128 — F32x4 and F16 (scalar convert)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Matches `#elif defined(__wasm_simd128__)` (lines 788-898).
+// GGML_F32_EPR = 4, GGML_F32_STEP = 16, GGML_F32_ARR = 4.
+// F16 has no native WASM opcode; loads/stores use scalar FP16↔FP32.
+
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_simd {
+    use std::arch::wasm32::*;
+
+    pub const EPR: usize = 4;
+    pub const GEMM_RM: usize = 2;
+    pub const GEMM_RN: usize = 2;
+
+    // GGML_F32x4_ZERO = wasm_f32x4_splat(0.0f)
+    #[inline(always)]
+    pub fn f32x4_zero() -> v128 {
+        f32x4_splat(0.0)
+    }
+
+    // GGML_F32x4_SET1(x) = wasm_f32x4_splat(x)
+    #[inline(always)]
+    pub fn f32x4_set1(x: f32) -> v128 {
+        f32x4_splat(x)
+    }
+
+    // GGML_F32x4_LOAD = wasm_v128_load
+    #[inline(always)]
+    pub unsafe fn f32x4_load(p: *const f32) -> v128 {
+        v128_load(p as *const v128)
+    }
+
+    // GGML_F32x4_STORE = wasm_v128_store
+    #[inline(always)]
+    pub unsafe fn f32x4_store(p: *mut f32, v: v128) {
+        v128_store(p as *mut v128, v)
+    }
+
+    // GGML_F32x4_FMA(a, b, c) = wasm_f32x4_add(wasm_f32x4_mul(b, c), a)
+    // WASM SIMD128 has no dedicated fma; emulate with mul+add.
+    #[inline(always)]
+    pub fn f32x4_fma(a: v128, b: v128, c: v128) -> v128 {
+        f32x4_add(f32x4_mul(b, c), a)
+    }
+
+    // GGML_F32x4_ADD = wasm_f32x4_add
+    #[inline(always)]
+    pub fn f32x4_add(a: v128, b: v128) -> v128 {
+        f32x4_add(a, b)
+    }
+
+    // GGML_F32x4_MUL = wasm_f32x4_mul
+    #[inline(always)]
+    pub fn f32x4_mul(a: v128, b: v128) -> v128 {
+        f32x4_mul(a, b)
+    }
+
+    // GGML_F32x4_REDUCE: tree-reduce then wasm_f32x4_extract_lane.
+    #[inline(always)]
+    pub fn f32x4_reduce_arr<const ARR: usize>(x: &mut [v128; ARR]) -> f32 {
+        let mut offset = ARR >> 1;
+        while offset > 0 {
+            for i in 0..offset {
+                x[i] = f32x4_add(x[i], x[offset + i]);
+            }
+            offset >>= 1;
+        }
+        f32x4_extract_lane::<0>(x[0])
+            + f32x4_extract_lane::<1>(x[0])
+            + f32x4_extract_lane::<2>(x[0])
+            + f32x4_extract_lane::<3>(x[0])
+    }
+
+    // __wasm_f16x4_load: scalar fp16→fp32 convert, then v128_load.
+    // Mirrors the C inline helper in simd-mappings.h lines 840-849.
+    #[inline(always)]
+    pub fn f16x4_load(p: *const u16) -> v128 {
+        let mut tmp = [0f32; 4];
+        for i in 0..4 {
+            tmp[i] = half::f16::from_bits(unsafe { *p.add(i) }).to_f32();
+        }
+        unsafe { v128_load(tmp.as_ptr() as *const v128) }
+    }
+
+    // __wasm_f16x4_store: v128_store to tmp, then scalar fp32→fp16.
+    // Mirrors the C inline helper in simd-mappings.h lines 851-860.
+    #[inline(always)]
+    pub fn f16x4_store(p: *mut u16, x: v128) {
+        let mut tmp = [0f32; 4];
+        unsafe { v128_store(tmp.as_mut_ptr() as *mut v128, x); }
+        for i in 0..4 {
+            unsafe { *p.add(i) = half::f16::from_f32(tmp[i]).to_bits(); }
+        }
+    }
+
+    // WASM GEMM (RM=2, RN=2, EPR=4) — same outer loop structure as AVX2.
+    pub unsafe fn ukernel<const RM: usize, const RN: usize>(
+        c: *mut f32,
+        a: *const f32,
+        b: *const f32,
+        k: usize,
+        n: usize,
+    ) {
+        let mut acc = [[f32x4_zero(); RN]; RM];
+        for i in 0..RM {
+            for r in 0..RN {
+                acc[i][r] = f32x4_load(c.add(i * n + r * EPR));
+            }
+        }
+        for kk in 0..k {
+            let mut bv = [f32x4_zero(); RN];
+            for r in 0..RN {
+                bv[r] = f32x4_load(b.add(kk * n + r * EPR));
+            }
+            for i in 0..RM {
+                let p = f32x4_set1(*a.add(i * k + kk));
+                for r in 0..RN {
+                    acc[i][r] = f32x4_fma(acc[i][r], bv[r], p);
+                }
+            }
+        }
+        for i in 0..RM {
+            for r in 0..RN {
+                f32x4_store(c.add(i * n + r * EPR), acc[i][r]);
+            }
+        }
+    }
+
+    pub unsafe fn gemm(
+        c: *mut f32,
+        a: *const f32,
+        b: *const f32,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        const RM: usize = GEMM_RM;
+        const RN: usize = GEMM_RN;
+
+        let mut a = a;
+        let mut c = c;
+        let mut ii = 0;
+
+        while ii + RM <= m {
+            let mut jj = 0;
+            while jj + RN * EPR <= n {
+                ukernel::<RM, RN>(c.add(jj), a, b.add(jj), k, n);
+                jj += RN * EPR;
+            }
+            while jj + EPR <= n {
+                ukernel::<RM, 1>(c.add(jj), a, b.add(jj), k, n);
+                jj += EPR;
+            }
+            while jj < n {
+                for i in 0..RM {
+                    let mut acc = *c.add(i * n + jj);
+                    for kk in 0..k { acc += *a.add(i * k + kk) * *b.add(kk * n + jj); }
+                    *c.add(i * n + jj) = acc;
+                }
+                jj += 1;
+            }
+            a = a.add(RM * k);
+            c = c.add(RM * n);
+            ii += RM;
+        }
+
+        while ii < m {
+            let mut jj = 0;
+            while jj + RN * EPR <= n {
+                ukernel::<1, RN>(c.add(jj), a, b.add(jj), k, n);
+                jj += RN * EPR;
+            }
+            while jj + EPR <= n {
+                ukernel::<1, 1>(c.add(jj), a, b.add(jj), k, n);
+                jj += EPR;
+            }
+            while jj < n {
+                let mut acc = *c.add(jj);
+                for kk in 0..k { acc += *a.add(kk) * *b.add(kk * n + jj); }
+                *c.add(jj) = acc;
+                jj += 1;
+            }
+            a = a.add(k);
+            c = c.add(n);
+            ii += 1;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LoongArch ASX (256-bit) — F32x8 and F16 via LASX convert
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Matches `#elif defined(__loongarch_asx)` (lines 998-1082).
+// GGML_F32_EPR = 8, GGML_F32_STEP = 32, GGML_F32_ARR = 4.
+//
+// Rust's `std::arch::loongarch64` is nightly-only.  We stub the module with
+// scalar implementations for now and #[cfg] the real intrinsics behind a
+// feature.
+
+#[cfg(target_arch = "loongarch64")]
+pub mod lasx {
+    pub const EPR: usize = 8;
+    pub const GEMM_RM: usize = 6;
+    pub const GEMM_RN: usize = 2;
+
+    // F16→F32 via `__lasx_xvfcvtl_s_h` + `__lasx_xvpermi_d`.
+    // C helper: __lasx_f32cx8_load (lines 1054-1059).
+    // Scalar fallback until LoongArch intrinsics stabilise in Rust.
+    pub fn f32cx8_load(p: *const u16) -> [f32; 8] {
+        let mut out = [0f32; 8];
+        for i in 0..8 {
+            out[i] = half::f16::from_bits(unsafe { *p.add(i) }).to_f32();
+        }
+        out
+    }
+
+    // F32→F16 via `__lasx_xvfcvt_h_s` + `__lasx_xvpermi_d`.
+    // C helper: __lasx_f32cx8_store (lines 1061-1065).
+    pub fn f32cx8_store(p: *mut u16, v: [f32; 8]) {
+        for i in 0..8 {
+            unsafe { *p.add(i) = half::f16::from_f32(v[i]).to_bits(); }
+        }
+    }
+
+    // GEMM scalar fallback.
+    pub fn gemm(c: *mut f32, a: *const f32, b: *const f32, m: usize, k: usize, n: usize) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = unsafe { *c.add(i * n + j) };
+                for kk in 0..k {
+                    sum += unsafe { *a.add(i * k + kk) } * unsafe { *b.add(kk * n + j) };
+                }
+                unsafe { *c.add(i * n + j) = sum; }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LoongArch LSX (128-bit) — F32x4 and F16 via LSX convert
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Matches `#elif defined(__loongarch_sx)` (lines 1084-1167).
+// GGML_F32_EPR = 4, GGML_F32_STEP = 32, GGML_F32_ARR = 8.
+
+#[cfg(target_arch = "loongarch64")]
+pub mod lsx {
+    pub const EPR: usize = 4;
+    pub const GEMM_RM: usize = 2;
+    pub const GEMM_RN: usize = 2;
+
+    // __lsx_f16x4_load: __lsx_vfcvtl_s_h(__lsx_vld((const void *)x, 0))
+    // Scalar fallback.
+    pub fn f16x4_load(p: *const u16) -> [f32; 4] {
+        let mut out = [0f32; 4];
+        for i in 0..4 {
+            out[i] = half::f16::from_bits(unsafe { *p.add(i) }).to_f32();
+        }
+        out
+    }
+
+    // __lsx_f16x4_store: __lsx_vfcvt_h_s(y, y) + memcpy.
+    pub fn f16x4_store(p: *mut u16, v: [f32; 4]) {
+        for i in 0..4 {
+            unsafe { *p.add(i) = half::f16::from_f32(v[i]).to_bits(); }
+        }
+    }
+
+    pub fn gemm(c: *mut f32, a: *const f32, b: *const f32, m: usize, k: usize, n: usize) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = unsafe { *c.add(i * n + j) };
+                for kk in 0..k {
+                    sum += unsafe { *a.add(i * k + kk) } * unsafe { *b.add(kk * n + j) };
+                }
+                unsafe { *c.add(i * n + j) = sum; }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// s390x VXE / VXE2 — F32x4, F16 (scalar convert), BF16
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Matches `#elif defined(__VXE__) || defined(__VXE2__)` (lines 1169-1277).
+// GGML_F32_EPR = 4, GGML_F32_STEP = 32, GGML_F32_ARR = 8.
+// BF16: GGML_BF16_EPR = 8, GGML_BF16_STEP = 16.
+
+#[cfg(target_arch = "s390x")]
+pub mod s390x_vx {
+    pub const EPR: usize = 4;
+    pub const GEMM_RM: usize = 2;
+    pub const GEMM_RN: usize = 2;
+
+    // F32x4 ops via IBM z/Architecture SIMD (vector extension).
+    // Rust's `std::arch::s390x` is nightly-only; use scalar fallback.
+
+    // __lzs_f16cx4_load: scalar fp16→fp32, then vec_xl.
+    // Mirrors lines 1226-1236 of simd-mappings.h.
+    pub fn f16cx4_load(p: *const u16) -> [f32; 4] {
+        let mut tmp = [0f32; 4];
+        for i in 0..4 {
+            tmp[i] = half::f16::from_bits(unsafe { *p.add(i) }).to_f32();
+        }
+        tmp
+    }
+
+    // __lzs_f16cx4_store: vec_xst, then scalar fp32→fp16.
+    // Mirrors lines 1238-1248.
+    pub fn f16cx4_store(p: *mut u16, v: [f32; 4]) {
+        for i in 0..4 {
+            unsafe { *p.add(i) = half::f16::from_f32(v[i]).to_bits(); }
+        }
+    }
+
+    // BF16x8: unpack to F32x4 (lo / hi halves) via zero-merge.
+    // GGML_BF16_TO_F32_LO: vec_mergel(v, zero) on big-endian.
+    // The bit-shift path works on both endians.
+    pub fn bf16x8_to_f32_lo(v: [u16; 8]) -> [f32; 4] {
+        let mut out = [0f32; 4];
+        for i in 0..4 {
+            out[i] = f32::from_bits((v[i] as u32) << 16);
+        }
+        out
+    }
+
+    pub fn bf16x8_to_f32_hi(v: [u16; 8]) -> [f32; 4] {
+        let mut out = [0f32; 4];
+        for i in 0..4 {
+            out[i] = f32::from_bits((v[4 + i] as u32) << 16);
+        }
+        out
+    }
+
+    // GGML_F32x4_REDUCE_4: combine 4 f32x4 accumulators into scalar sum.
+    // Mirrors lines 1203-1210 (vec_add tree then vec_extract).
+    pub fn f32x4_reduce_4(acc: &mut f32, s0: [f32; 4], s1: [f32; 4],
+                          s2: [f32; 4], s3: [f32; 4]) {
+        for i in 0..4 {
+            *acc += s0[i] + s1[i] + s2[i] + s3[i];
+        }
+    }
+
+    pub fn gemm(c: *mut f32, a: *const f32, b: *const f32, m: usize, k: usize, n: usize) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = unsafe { *c.add(i * n + j) };
+                for kk in 0..k {
+                    sum += unsafe { *a.add(i * k + kk) } * unsafe { *b.add(kk * n + j) };
+                }
+                unsafe { *c.add(i * n + j) = sum; }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SIMD constants for remaining architectures
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// GGML_F32_EPR / STEP / ARR for architectures not covered by
+// simd_mappings_llama.rs.  These are exported so callers can write
+// architecture-agnostic code.
+
+/// Elements per SIMD register (F32).
+#[cfg(target_arch = "aarch64")]
+pub const F32_EPR: usize = 4;  // NEON float32x4_t
+#[cfg(target_arch = "wasm32")]
+pub const F32_EPR: usize = 4;  // WASM v128
+#[cfg(target_arch = "powerpc64")]
+pub const F32_EPR: usize = 4;  // AltiVec vector float
+#[cfg(target_arch = "loongarch64")]
+pub const F32_EPR: usize = 8;  // ASX (LASX 256-bit wins over LSX 128-bit)
+#[cfg(target_arch = "s390x")]
+pub const F32_EPR: usize = 4;  // VXE vector float
+#[cfg(target_arch = "riscv64")]
+pub const F32_EPR: usize = 4;  // RVV LMUL=1 @ vlen=128
+
+/// Elements per SIMD step (GGML_F32_STEP = 4 * EPR on most arches).
+#[cfg(target_arch = "aarch64")]
+pub const F32_STEP: usize = 16;
+#[cfg(target_arch = "wasm32")]
+pub const F32_STEP: usize = 16;
+#[cfg(target_arch = "powerpc64")]
+pub const F32_STEP: usize = 32;
+#[cfg(target_arch = "loongarch64")]
+pub const F32_STEP: usize = 32;
+#[cfg(target_arch = "s390x")]
+pub const F32_STEP: usize = 32;
+#[cfg(target_arch = "riscv64")]
+pub const F32_STEP: usize = 16;
+
+/// Accumulator array size (GGML_F32_ARR = STEP / EPR).
+#[cfg(target_arch = "aarch64")]
+pub const F32_ARR: usize = 4;
+#[cfg(target_arch = "wasm32")]
+pub const F32_ARR: usize = 4;
+#[cfg(target_arch = "powerpc64")]
+pub const F32_ARR: usize = 8;
+#[cfg(target_arch = "loongarch64")]
+pub const F32_ARR: usize = 4;
+#[cfg(target_arch = "s390x")]
+pub const F32_ARR: usize = 8;
+#[cfg(target_arch = "riscv64")]
+pub const F32_ARR: usize = 4;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BF16 helpers (shared by POWER9 and s390x paths)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// GGML_BF16_STEP = 16, GGML_BF16_EPR = 8 for both POWER9 and s390x.
+// BF16 is stored as raw u16; the FMA helpers unpack to F32 pairs.
+
+/// BF16 elements per register (8 per 128-bit lane).
+#[cfg(any(target_arch = "powerpc64", target_arch = "s390x"))]
+pub const BF16_EPR: usize = 8;
+
+/// BF16 elements per accumulation step.
+#[cfg(any(target_arch = "powerpc64", target_arch = "s390x"))]
+pub const BF16_STEP: usize = 16;
+
+/// Convert 8 raw BF16 bit-patterns to two [f32; 4] (lo / hi).
+///
+/// BF16 → F32: prepend 16 zero bits (sign+exponent+mantissa top already
+/// in the BF16 word), i.e. `f32::from_bits((b as u32) << 16)`.
+#[cfg(any(target_arch = "powerpc64", target_arch = "s390x"))]
+#[inline(always)]
+pub fn bf16x8_to_f32_pair(v: [u16; 8]) -> ([f32; 4], [f32; 4]) {
+    let lo = [
+        f32::from_bits((v[0] as u32) << 16),
+        f32::from_bits((v[1] as u32) << 16),
+        f32::from_bits((v[2] as u32) << 16),
+        f32::from_bits((v[3] as u32) << 16),
+    ];
+    let hi = [
+        f32::from_bits((v[4] as u32) << 16),
+        f32::from_bits((v[5] as u32) << 16),
+        f32::from_bits((v[6] as u32) << 16),
+        f32::from_bits((v[7] as u32) << 16),
+    ];
+    (lo, hi)
+}

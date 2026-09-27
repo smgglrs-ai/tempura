@@ -28,6 +28,7 @@ pub mod repack_llama_generic2;
 pub mod sgemm_llama;
 pub mod sgemm_llama2;
 pub mod simd_gemm_llama;
+pub mod simd_llama_remaining;
 pub mod simd_mappings_llama;
 pub mod types;
 pub mod unary_ops_llama;
