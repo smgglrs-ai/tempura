@@ -4,6 +4,7 @@ pub mod binary_ops_llama;
 pub mod blocks;
 pub mod cpu_feats_llama;
 pub mod cpu_llama;
+pub mod cpu_llama2;
 pub mod dequantize;
 pub mod helpers;
 pub mod iqp_llama;
