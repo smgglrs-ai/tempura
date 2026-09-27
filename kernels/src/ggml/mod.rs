@@ -14,6 +14,7 @@ pub mod ops_llama;
 pub mod ops_llama2;
 pub mod ops_llama3;
 pub mod ops_llama4;
+pub mod ops_llama_simd;
 pub mod quantize;
 pub mod quants_llama;
 pub mod quants_llama_avx;
