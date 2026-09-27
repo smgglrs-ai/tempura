@@ -76,10 +76,7 @@ impl FusedSiluGate for CpuFusedSiluGate {
                 got: up.len(),
             });
         }
-        for i in 0..gate.len() {
-            let silu = gate[i] / (1.0 + (-gate[i]).exp());
-            output[i] = silu * up[i];
-        }
+        crate::ggml::vec_llama::vec_swiglu_f32(output, gate, up);
         Ok(())
     }
 }
