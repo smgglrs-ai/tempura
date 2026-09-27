@@ -187,6 +187,80 @@ pub fn quantize_mat_q8k_4x8(a: &[f32], m: usize, k: usize) -> Vec<BlockQ8Kx4> {
     out
 }
 
+/// Quantize 4 f32 activation rows into `BlockQ8Kx4` format for use with the
+/// Q6K 8×4 scalar GEMM (`ggml_gemm_q6_k_8x4_q8_k`). Matches
+/// `ggml_quantize_mat_q8_K_4x4_generic` (blck_size_interleave=4) exactly.
+///
+/// - `a`: row-major f32 activations, `m` rows × `k` columns
+/// - `m`: must be a multiple of 4
+/// - `k`: must be a multiple of 256 (QK_K)
+///
+/// Returns `(m/4) * nb` blocks where `nb = k / 256`.
+pub fn quantize_mat_q8k_4x4(a: &[f32], m: usize, k: usize) -> Vec<BlockQ8Kx4> {
+    const QK_K: usize = 256;
+    assert_eq!(m % 4, 0, "m={m} must be divisible by 4");
+    assert_eq!(k % QK_K, 0, "k={k} must be divisible by QK_K=256");
+    assert_eq!(a.len(), m * k);
+
+    let nb = k / QK_K;
+    let n_groups = m / 4;
+    let mut out: Vec<BlockQ8Kx4> = Vec::with_capacity(n_groups * nb);
+
+    for grp in 0..n_groups {
+        let rows: [&[f32]; 4] = std::array::from_fn(|r| {
+            let row = grp * 4 + r;
+            &a[row * k..(row + 1) * k]
+        });
+
+        for blk in 0..nb {
+            let mut dst = BlockQ8Kx4 {
+                d: [0.0f32; 4],
+                qs: [0i8; 1024],
+                bsums: [0i16; 64],
+            };
+
+            let blk_start = blk * QK_K;
+            let blk_end = blk_start + QK_K;
+
+            let mut iscale = [0.0f32; 4];
+            for r in 0..4 {
+                let src = &rows[r][blk_start..blk_end];
+                let mut amax = 0.0f32;
+                let mut max_signed = 0.0f32;
+                for &x in src {
+                    if x.abs() > amax {
+                        amax = x.abs();
+                        max_signed = x;
+                    }
+                }
+                if amax > 0.0 {
+                    iscale[r] = -127.0 / max_signed;
+                    dst.d[r] = 1.0 / iscale[r];
+                }
+            }
+
+            // Interleave quants: blck_size_interleave=4.
+            // For flat index j in [0, QK_K*4):
+            //   src_id     = (j % 16) / 4   (row 0..3)
+            //   src_offset = (j / 16) * 4 + j % 4
+            //   bsums index = (((j & 15) >> 2) << 2) + ((j >> 8) << 4) + ((j >> 6) & 3)
+            for j in 0..QK_K * 4 {
+                let src_id = (j % 16) / 4;
+                let src_offset = (j / 16) * 4 + j % 4;
+                let x0 = rows[src_id][blk_start + src_offset] * iscale[src_id];
+                let q = nearest_int(x0).clamp(-128, 127) as i8;
+                dst.qs[j] = q;
+                let bsum_idx = (((j & 15) >> 2) << 2) + ((j >> 8) << 4) + ((j >> 6) & 3);
+                dst.bsums[bsum_idx] += q as i16;
+            }
+
+            out.push(dst);
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
