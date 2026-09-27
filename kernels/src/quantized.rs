@@ -169,6 +169,36 @@ impl crate::inference_pool::KernelJob for Q4kGemvX8Job {
     }
 }
 
+// 8-wide GEMV job for m=1 decode with pre-packed BlockQ6Kx8 weights.
+// Uses scalar ggml_gemv_q6_k_8x8_q8_k; parallelizes over n/8 groups.
+struct Q6kGemvX8Job {
+    packed_ptr: *const u8, // &[BlockQ6Kx8], n/8 groups × bpr entries
+    q8k_ptr: *const u8,   // single activation row, bpr BlockQ8K entries
+    out_ptr: *mut f32,     // n output floats
+    bpr: usize,            // Q6Kx8 blocks per row group
+    k: usize,              // activation dimension
+}
+unsafe impl Sync for Q6kGemvX8Job {}
+impl crate::inference_pool::KernelJob for Q6kGemvX8Job {
+    #[inline(always)]
+    fn exec_range(&self, start: usize, end: usize) {
+        use crate::ggml::blocks::BlockQ6Kx8;
+        let packed_stride = self.bpr * std::mem::size_of::<BlockQ6Kx8>();
+        for grp in start..end {
+            unsafe {
+                crate::ggml::repack_llama::ggml_gemv_q6_k_8x8_q8_k(
+                    self.k,
+                    self.out_ptr.add(grp * 8),
+                    self.packed_ptr.add(grp * packed_stride),
+                    self.q8k_ptr,
+                    1,
+                    8,
+                );
+            }
+        }
+    }
+}
+
 // m×n job structs: parallelize over idx = i*n + j with static dispatch pointer.
 struct Q4kMnJob {
     bq_ptr: *const u8,
@@ -5139,6 +5169,106 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             #[cfg(not(target_arch = "x86_64"))]
             crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
         }
+
+        // m=1 decode fast path: repack weights into BlockQ6Kx8 (interleave_block=8)
+        // and run 8-wide scalar GEMV (ggml_gemv_q6_k_8x8_q8_k). Requires n%8==0.
+        if m == 1 && n % 8 == 0 {
+            use crate::ggml::blocks::{BlockQ6K, BlockQ6Kx8};
+            use crate::ggml::repack_llama::repack_q6_k_to_q6_k_8_bl;
+
+            thread_local! {
+                static Q6KX8_GEMV_CACHE: std::cell::RefCell<(usize, usize, usize, Vec<BlockQ6Kx8>)> =
+                    const { std::cell::RefCell::new((0, 0, 0, Vec::new())) };
+            }
+
+            let src_ptr = b_quantized.as_ptr() as usize;
+            let packed_ready = Q6KX8_GEMV_CACHE.with(|c| {
+                let cache = c.borrow();
+                cache.0 == src_ptr && cache.1 == n && cache.2 == blocks_per_row
+            });
+            if !packed_ready {
+                let src_q6k = unsafe {
+                    std::slice::from_raw_parts(
+                        b_quantized.as_ptr() as *const BlockQ6K,
+                        n * blocks_per_row,
+                    )
+                };
+                let mut repacked = Vec::new();
+                repack_q6_k_to_q6_k_8_bl(src_q6k, n, blocks_per_row, 8, &mut repacked)
+                    .expect("Q6K GEMV repack: n must be divisible by 8");
+                Q6KX8_GEMV_CACHE.with(|c| {
+                    *c.borrow_mut() = (src_ptr, n, blocks_per_row, repacked);
+                });
+            }
+
+            Q6KX8_GEMV_CACHE.with(|c| {
+                let cache = c.borrow();
+                let packed = &cache.3;
+                let job = Q6kGemvX8Job {
+                    packed_ptr: packed.as_ptr() as *const u8,
+                    q8k_ptr: q8k_all.as_ptr() as *const u8,
+                    out_ptr: output.as_mut_ptr(),
+                    bpr: blocks_per_row,
+                    k,
+                };
+                crate::inference_pool::par_run_job(n / 8, &job);
+            });
+            return Ok(());
+        }
+
+        // m>1 prefill fast path: repack weights into BlockQ6Kx8 (interleave_block=4)
+        // and activations into BlockQ8Kx4, then run ggml_gemm_q6_k_8x4_q8_k.
+        // Requires m%4==0 and n%8==0.
+        if m % 4 == 0 && n % 8 == 0 {
+            use crate::ggml::blocks::{BlockQ6K, BlockQ6Kx8};
+            use crate::ggml::repack::{quantize_mat_q8k_4x4};
+            use crate::ggml::repack_llama::{repack_q6_k_to_q6_k_8_bl, ggml_gemm_q6_k_8x4_q8_k};
+
+            thread_local! {
+                static Q6KX8_GEMM_CACHE: std::cell::RefCell<(usize, usize, usize, Vec<BlockQ6Kx8>)> =
+                    const { std::cell::RefCell::new((0, 0, 0, Vec::new())) };
+            }
+
+            let src_ptr = b_quantized.as_ptr() as usize;
+            let packed_ready = Q6KX8_GEMM_CACHE.with(|c| {
+                let cache = c.borrow();
+                cache.0 == src_ptr && cache.1 == n && cache.2 == blocks_per_row
+            });
+            if !packed_ready {
+                let src_q6k = unsafe {
+                    std::slice::from_raw_parts(
+                        b_quantized.as_ptr() as *const BlockQ6K,
+                        n * blocks_per_row,
+                    )
+                };
+                let mut repacked = Vec::new();
+                repack_q6_k_to_q6_k_8_bl(src_q6k, n, blocks_per_row, 4, &mut repacked)
+                    .expect("Q6K GEMM repack: n must be divisible by 8");
+                Q6KX8_GEMM_CACHE.with(|c| {
+                    *c.borrow_mut() = (src_ptr, n, blocks_per_row, repacked);
+                });
+            }
+
+            let packed_a = quantize_mat_q8k_4x4(a, m, k);
+
+            Q6KX8_GEMM_CACHE.with(|c| {
+                let cache = c.borrow();
+                let packed_w = &cache.3;
+                unsafe {
+                    ggml_gemm_q6_k_8x4_q8_k(
+                        k,
+                        output.as_mut_ptr(),
+                        n,
+                        packed_w.as_ptr() as *const u8,
+                        packed_a.as_ptr() as *const u8,
+                        m,
+                        n,
+                    );
+                }
+            });
+            return Ok(());
+        }
+
         let job = Q6kMnTiledJob {
             bq_ptr: b_quantized.as_ptr(),
             q8k_ptr: q8k_all.as_ptr() as *const u8,
@@ -7515,6 +7645,59 @@ mod tests {
         eprintln!("  Q6K large: max_diff={max_diff:.6} at [{worst_idx}], ref={:.6}, opt={:.6}, rel={rel_tol:.4}",
             out_ref[worst_idx], out_opt[worst_idx]);
         assert!(rel_tol < 0.05, "Q6K large: rel_tol={rel_tol:.4}");
+    }
+
+    #[test]
+    fn test_q6k_opt_vs_scalar_prefill() {
+        // Exercises the m%4==0 && n%8==0 GEMM fast path.
+        let k = 256;
+        let m = 4;
+        let n = 8;
+
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 23) as f32) * 0.03 - 0.3)
+            .collect();
+
+        let blocks_per_row = k / Q6K_BLOCK_SIZE;
+        let mut b_q = vec![0u8; n * blocks_per_row * Q6K_BLOCK_BYTES];
+        for blk in 0..(n * blocks_per_row) {
+            let base = blk * Q6K_BLOCK_BYTES;
+            for i in 0..128 {
+                b_q[base + i] = ((blk * 128 + i) * 7 % 256) as u8;
+            }
+            for i in 0..64 {
+                b_q[base + 128 + i] = ((blk * 64 + i) * 13 % 256) as u8;
+            }
+            for i in 0..16 {
+                b_q[base + 192 + i] = ((blk * 16 + i) * 11 % 127) as u8;
+            }
+            let d_bits = half::f16::from_f32(0.001).to_bits();
+            b_q[base + 208] = d_bits as u8;
+            b_q[base + 209] = (d_bits >> 8) as u8;
+        }
+
+        let ref_kernel = CpuMatMulQ4K;
+        let opt_kernel = CpuMatMulQ4KOpt;
+
+        let mut out_ref = vec![0.0f32; m * n];
+        let mut out_opt = vec![0.0f32; m * n];
+
+        ref_kernel
+            .forward_b_transposed_q6k(&a, &b_q, &mut out_ref, m, n, k)
+            .unwrap();
+        opt_kernel
+            .forward_b_transposed_q6k(&a, &b_q, &mut out_opt, m, n, k)
+            .unwrap();
+
+        let max_diff: f32 = out_ref
+            .iter()
+            .zip(&out_opt)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        let max_abs = out_ref.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let rel_tol = if max_abs > 0.0 { max_diff / max_abs } else { max_diff };
+        eprintln!("  Q6K prefill: max_diff={max_diff:.6}, max_abs={max_abs:.6}, rel={rel_tol:.4}");
+        assert!(rel_tol < 0.05, "Q6K prefill GEMM: rel_tol={rel_tol:.4}");
     }
 
     #[test]
