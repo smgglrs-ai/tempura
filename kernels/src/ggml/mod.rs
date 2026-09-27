@@ -20,6 +20,7 @@ pub mod quants_llama_generic;
 pub mod repack;
 pub mod repack_llama;
 pub mod repack_llama2;
+pub mod repack_llama3;
 pub mod sgemm_llama;
 pub mod sgemm_llama2;
 pub mod simd_gemm_llama;
