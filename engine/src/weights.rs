@@ -271,6 +271,7 @@ pub struct QuantizedWeights {
     q2x4: HashMap<String, (Vec<u8>, usize, usize)>,
     q2_tiled: HashMap<String, (Vec<u8>, usize, usize)>,
     q2_row_corrections: HashMap<String, Vec<f32>>,
+    q4k_repacked: HashMap<String, Vec<tempura_kernels::ggml::blocks::BlockQ4Kx8>>,
 }
 
 impl QuantizedWeights {
@@ -298,6 +299,7 @@ impl QuantizedWeights {
             q2x4: HashMap::new(),
             q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
+            q4k_repacked: HashMap::new(),
         }
     }
 
@@ -327,6 +329,7 @@ impl QuantizedWeights {
             q2x4: HashMap::new(),
             q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
+            q4k_repacked: HashMap::new(),
         }
     }
 
@@ -374,6 +377,7 @@ impl QuantizedWeights {
             q2x4: HashMap::new(),
             q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
+            q4k_repacked: HashMap::new(),
         }
     }
 
@@ -397,6 +401,7 @@ impl QuantizedWeights {
             q2x4: HashMap::new(),
             q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
+            q4k_repacked: HashMap::new(),
         }
     }
 
@@ -413,6 +418,51 @@ impl QuantizedWeights {
                     .get(name)
                     .and_then(|&(off, len)| self.mmap.as_ref().map(|m| &m[off..off + len]))
             })
+    }
+
+    pub fn get_q4k_repacked(
+        &self,
+        name: &str,
+    ) -> Option<&[tempura_kernels::ggml::blocks::BlockQ4Kx8]> {
+        self.q4k_repacked.get(name).map(|v| v.as_slice())
+    }
+
+    pub fn build_q4k_repacked(&mut self, shapes: &HashMap<String, (usize, usize)>) {
+        use tempura_kernels::ggml::blocks::{BlockQ4K, BLOCK_Q4K_SIZE};
+        use tempura_kernels::ggml::repack::repack_q4k_to_q4kx8;
+        let t = std::time::Instant::now();
+        let names: Vec<String> = shapes.keys().cloned().collect();
+        for name in &names {
+            let (n_rows, k) = match shapes.get(name) {
+                Some(&s) => s,
+                None => continue,
+            };
+            if n_rows == 0 || k == 0 || n_rows % 8 != 0 {
+                continue;
+            }
+            let bpr = k / 256;
+            if bpr == 0 {
+                continue;
+            }
+            let raw = match self.get_q4k(name) {
+                Some(r) => r,
+                None => continue,
+            };
+            let expected = n_rows * bpr * BLOCK_Q4K_SIZE;
+            if raw.len() != expected {
+                continue;
+            }
+            let src = unsafe {
+                std::slice::from_raw_parts(raw.as_ptr() as *const BlockQ4K, n_rows * bpr)
+            };
+            let repacked = repack_q4k_to_q4kx8(src, n_rows, bpr);
+            self.q4k_repacked.insert(name.clone(), repacked);
+        }
+        eprintln!(
+            "[Q4K] repacked {} tensors in {:.1}s",
+            self.q4k_repacked.len(),
+            t.elapsed().as_secs_f64()
+        );
     }
 
     pub fn get_q6k(&self, name: &str) -> Option<&[u8]> {
