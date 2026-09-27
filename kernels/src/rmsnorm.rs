@@ -20,21 +20,8 @@ impl RMSNorm for CpuRMSNorm {
                 got: weight.len(),
             });
         }
-
-        let num_tokens = x.len() / hidden_size;
-        for t in 0..num_tokens {
-            let start = t * hidden_size;
-            let row = &mut x[start..start + hidden_size];
-
-            let rms: f32 =
-                (row.iter().map(|v| v * v).sum::<f32>() / hidden_size as f32 + eps).sqrt();
-            let inv_rms = 1.0 / rms;
-
-            for (i, val) in row.iter_mut().enumerate() {
-                *val = *val * inv_rms * weight[i];
-            }
-        }
-
+        let x_in = x.to_vec();
+        crate::ggml::ops_llama::rms_norm_mul_rows_f32(&x_in, weight, x, hidden_size, eps);
         Ok(())
     }
 
@@ -53,18 +40,7 @@ impl RMSNorm for CpuRMSNorm {
             });
         }
         debug_assert_eq!(x.len(), out.len());
-        let num_tokens = x.len() / hidden_size;
-        for t in 0..num_tokens {
-            let start = t * hidden_size;
-            let row = &x[start..start + hidden_size];
-            let rms: f32 =
-                (row.iter().map(|v| v * v).sum::<f32>() / hidden_size as f32 + eps).sqrt();
-            let inv_rms = 1.0 / rms;
-            let out_row = &mut out[start..start + hidden_size];
-            for i in 0..hidden_size {
-                out_row[i] = row[i] * inv_rms * weight[i];
-            }
-        }
+        crate::ggml::ops_llama::rms_norm_mul_rows_f32(x, weight, out, hidden_size, eps);
         Ok(())
     }
 }

@@ -67,15 +67,8 @@ fn naive_attention(
                     *score = dot_fn(q_vec, k_vec) * scale;
                 }
 
-                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for s in &mut scores {
-                    *s = crate::portable_math::portable_exp(*s - max_score);
-                    sum += *s;
-                }
-                for s in &mut scores {
-                    *s /= sum;
-                }
+                let scores_in = scores.clone();
+                crate::ggml::ops_llama::soft_max_rows_f32(&scores_in, &mut scores, None, kv_len, 1.0);
 
                 let o_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
                 for d in 0..head_dim {
