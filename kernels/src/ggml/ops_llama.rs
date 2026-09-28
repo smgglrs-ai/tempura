@@ -16,15 +16,17 @@ const SQRT_2_INV: f32 = 0.707_106_78;
 // ── Scalar activation helpers (vec.h) ────────────────────────────────────────
 
 /// Direct translation of `ggml_gelu_f32` (vec.h line 968).
+/// Uses the f16 lookup table — zero tanh/exp at inference time.
 #[inline]
 pub fn gelu_f32(x: f32) -> f32 {
-    0.5 * x * (1.0 + (SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x)).tanh())
+    super::helpers::gelu_f32_lut(x)
 }
 
 /// Direct translation of `ggml_gelu_quick_f32` (vec.h line 1017).
+/// Uses the f16 lookup table — zero exp at inference time.
 #[inline]
 pub fn gelu_quick_f32(x: f32) -> f32 {
-    x * (1.0 / (1.0 + (-GELU_QUICK_COEF * x).exp()))
+    super::helpers::gelu_quick_f32_lut(x)
 }
 
 /// GELU with erf — `0.5*x*(1 + erf(x / sqrt(2)))`.

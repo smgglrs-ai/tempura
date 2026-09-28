@@ -52,6 +52,42 @@ pub fn f32_to_f16(val: f32) -> u16 {
     h
 }
 
+/// GELU lookup table: gelu(f32_from_f16(i)) stored as f16 bits (128KB).
+/// Matches llama.cpp's ggml_table_gelu_f16 — zero tanh/exp at inference time.
+#[repr(align(2))]
+struct AlignedGELUTable([u8; 65536 * 2]);
+
+static GELU_TABLE_BYTES: AlignedGELUTable =
+    AlignedGELUTable(*include_bytes!(concat!(env!("OUT_DIR"), "/gelu_table.bin")));
+
+static GELU_QUICK_TABLE_BYTES: AlignedGELUTable =
+    AlignedGELUTable(*include_bytes!(concat!(env!("OUT_DIR"), "/gelu_quick_table.bin")));
+
+/// GELU via f16 lookup table — f32→f16 index + one load, zero tanh/exp.
+/// Matches llama.cpp ggml_vec_gelu_f32 table approach.
+#[inline(always)]
+pub fn gelu_f32_lut(x: f32) -> f32 {
+    let f16_bits = f32_to_f16(x);
+    // SAFETY: f16_bits is u16 (0..=65535), table has exactly 65536 entries.
+    unsafe {
+        let ptr = GELU_TABLE_BYTES.0.as_ptr() as *const u16;
+        let result_f16 = ptr.add(f16_bits as usize).read_unaligned();
+        f16_to_f32(result_f16)
+    }
+}
+
+/// GELU-quick via f16 lookup table — x * sigmoid(1.702*x), zero exp.
+#[inline(always)]
+pub fn gelu_quick_f32_lut(x: f32) -> f32 {
+    let f16_bits = f32_to_f16(x);
+    // SAFETY: f16_bits is u16 (0..=65535), table has exactly 65536 entries.
+    unsafe {
+        let ptr = GELU_QUICK_TABLE_BYTES.0.as_ptr() as *const u16;
+        let result_f16 = ptr.add(f16_bits as usize).read_unaligned();
+        f16_to_f32(result_f16)
+    }
+}
+
 pub fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
@@ -222,6 +258,60 @@ mod tests {
             assert!(
                 fa <= fb,
                 "monotonicity: a={a} -> f16 -> {fa}, b={b} -> f16 -> {fb}"
+            );
+        }
+    }
+
+    fn reference_gelu(x: f32) -> f32 {
+        const SQRT_2_OVER_PI: f32 = 0.797_884_56;
+        const GELU_COEF_A: f32 = 0.044715;
+        0.5 * x * (1.0 + (SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x)).tanh())
+    }
+
+    fn reference_gelu_quick(x: f32) -> f32 {
+        x * (1.0 / (1.0 + (-1.702_f32 * x).exp()))
+    }
+
+    #[test]
+    fn gelu_lut_accuracy() {
+        let test_vals = [
+            -10.0f32, -5.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0,
+            10.0,
+        ];
+        for &x in &test_vals {
+            let lut = gelu_f32_lut(x);
+            let ref_val = reference_gelu(x);
+            let err = (lut - ref_val).abs();
+            let rel = if ref_val.abs() > 1e-4 {
+                err / ref_val.abs()
+            } else {
+                err
+            };
+            assert!(
+                rel < 1e-3,
+                "gelu_lut({x}): lut={lut}, ref={ref_val}, rel_err={rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn gelu_quick_lut_accuracy() {
+        let test_vals = [
+            -10.0f32, -5.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0,
+            10.0,
+        ];
+        for &x in &test_vals {
+            let lut = gelu_quick_f32_lut(x);
+            let ref_val = reference_gelu_quick(x);
+            let err = (lut - ref_val).abs();
+            let rel = if ref_val.abs() > 1e-4 {
+                err / ref_val.abs()
+            } else {
+                err
+            };
+            assert!(
+                rel < 1e-3,
+                "gelu_quick_lut({x}): lut={lut}, ref={ref_val}, rel_err={rel}"
             );
         }
     }
