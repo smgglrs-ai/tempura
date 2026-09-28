@@ -859,6 +859,23 @@ pub fn par_attention_decode(
     head_dim: usize,
     scale: f32,
 ) {
+    // Only parallelize when seq_len is large enough to justify condvar overhead.
+    // For seq_len < 64, sequential attention is faster (attention < 0.5ms, overhead ~20μs).
+    if kv_len < 64 || num_heads <= 1 {
+        // Sequential path: reuse the existing per-head functions.
+        let heads_per_group = num_heads / num_kv_heads;
+        let mut scores = vec![0.0f32; kv_len];
+        for h in 0..num_heads {
+            let kv_h = h / heads_per_group;
+            let q_head = &q[h * head_dim..(h + 1) * head_dim];
+            let out_head = &mut output[h * head_dim..(h + 1) * head_dim];
+            // k/v are the full cache slices — use actual slice length as bound
+            decode_one_head(q_head, k, v, out_head, &mut scores, kv_start, kv_len,
+                num_kv_heads, head_dim, scale, kv_h);
+        }
+        return;
+    }
+
     let mut scores_buf = vec![0.0f32; num_heads * kv_len];
     let q_ptr = q.as_ptr();
     let k_ptr = k.as_ptr();
@@ -866,16 +883,20 @@ pub fn par_attention_decode(
     let out_ptr = output.as_mut_ptr();
     let scores_ptr = scores_buf.as_mut_ptr();
     let heads_per_group = num_heads / num_kv_heads;
+    // Verify the k/v slices are large enough for the full kv_len.
+    let kv_slice_len = kv_len * num_kv_heads * head_dim;
+    assert!(k.len() >= kv_slice_len, "k slice too small: {} < {}", k.len(), kv_slice_len);
+    assert!(v.len() >= kv_slice_len, "v slice too small: {} < {}", v.len(), kv_slice_len);
     crate::inference_pool::par_run(num_heads, move |start, end| {
         for h in start..end {
             let kv_h = h / heads_per_group;
             let q_head =
                 unsafe { std::slice::from_raw_parts(q_ptr.add(h * head_dim), head_dim) };
             let k_sl = unsafe {
-                std::slice::from_raw_parts(k_ptr, kv_len * num_kv_heads * head_dim)
+                std::slice::from_raw_parts(k_ptr, kv_slice_len)
             };
             let v_sl = unsafe {
-                std::slice::from_raw_parts(v_ptr, kv_len * num_kv_heads * head_dim)
+                std::slice::from_raw_parts(v_ptr, kv_slice_len)
             };
             let out_head = unsafe {
                 std::slice::from_raw_parts_mut(out_ptr.add(h * head_dim), head_dim)
