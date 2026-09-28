@@ -7171,11 +7171,30 @@ impl CutileInferenceWrapper {
     pub fn new(config: ModelConfig) -> Self {
         use crate::pipeline::KernelPipeline;
         let pipeline = KernelPipeline::cutile();
+        let layer_weight_names = (0..config.num_layers).map(|l| {
+            let p = format!("model.layers.{l}");
+            (
+                format!("{p}.input_layernorm.weight"),
+                format!("{p}.post_attention_layernorm.weight"),
+                format!("{p}.self_attn.q_proj.weight"),
+                format!("{p}.self_attn.k_proj.weight"),
+                format!("{p}.self_attn.v_proj.weight"),
+                format!("{p}.self_attn.o_proj.weight"),
+                format!("{p}.self_attn.q_norm.weight"),
+                format!("{p}.self_attn.k_norm.weight"),
+                format!("{p}.mlp.gate_proj.weight"),
+                format!("{p}.mlp.up_proj.weight"),
+                format!("{p}.mlp.down_proj.weight"),
+                format!("{p}.self_attn.attn_sub_norm.weight"),
+                format!("{p}.mlp.ffn_sub_norm.weight"),
+            )
+        }).collect();
         let model = TransformerModel {
             config,
             pipeline,
             weights: None,
             quantized_weights: None,
+            layer_weight_names,
         };
         Self {
             model,
