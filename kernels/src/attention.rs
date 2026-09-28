@@ -613,14 +613,12 @@ pub fn attention_decode_heads(
         let q_vec = &q[q_offset..q_offset + head_dim];
 
         let scores = &mut scores[..kv_len];
+
+        // QK: AVX2 vec_dot_f32 replaces scalar d-loop (4×8-wide FMA for head_dim=128)
         for kv_s in 0..kv_len {
             let k_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
             let k_vec = &k[k_offset..k_offset + head_dim];
-            let mut dot = 0.0f32;
-            for d in 0..head_dim {
-                dot += q_vec[d] * k_vec[d];
-            }
-            scores[kv_s] = dot * scale;
+            scores[kv_s] = crate::ggml::vec_llama::vec_dot_f32(q_vec, k_vec) * scale;
         }
 
         let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -630,14 +628,19 @@ pub fn attention_decode_heads(
             *s *= inv_sum;
         }
 
+        // AV: AXPY pattern — outer loop over kv_s (contiguous v_row), inner over head_dim.
+        // Enables auto-vectorization of the inner loop (contiguous load + fmadd).
         let o_offset = h * head_dim;
-        for d in 0..head_dim {
-            let mut val = 0.0f32;
-            for (kv_s, &score) in scores.iter().enumerate() {
-                let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim + d;
-                val += score * v[v_offset];
+        let out_row = &mut output[o_offset..o_offset + head_dim];
+        for x in out_row.iter_mut() {
+            *x = 0.0;
+        }
+        for (kv_s, &score) in scores.iter().enumerate() {
+            let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+            let v_row = &v[v_offset..v_offset + head_dim];
+            for d in 0..head_dim {
+                out_row[d] += score * v_row[d];
             }
-            output[o_offset + d] = val;
         }
     }
 }
