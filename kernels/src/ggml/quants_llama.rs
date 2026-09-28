@@ -535,9 +535,12 @@ pub unsafe fn ggml_vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
 
     let m4 = _mm256_set1_epi8(0xF);
 
-    // Pre-load all 8 shuffle masks into YMM registers before the block loop.
-    // GCC hoists these into ymm8-ymm15; LLVM only does so if explicitly forced.
-    // Saves 8 × (arithmetic scatter: 2 vpsrld+vpbroadcastw) → 8 × vpshufb ymm,ymm,ymm_const.
+    // LLVM replaces _mm256_shuffle_epi8(scales, sh_i) with arithmetic extraction
+    // (vpbroadcastw + vpsrld/vpshufd/vpsrlq/vpsrldq per scale word) because the
+    // 8 YMM shuffle constants exhaust available registers. Hoisting them here would
+    // register-pressure LLVM into using the shuffle path, but it chooses arithmetic
+    // extraction instead to keep ymm8-ymm15 free for the main computation loop.
+    // The shuffle masks remain defined for documentation; the compiler does not use them.
     let sh0 = get_scale_shuffle_k4(0);
     let sh1 = get_scale_shuffle_k4(1);
     let sh2 = get_scale_shuffle_k4(2);
@@ -729,9 +732,12 @@ pub unsafe fn ggml_vec_dot_q6_k_q8_k(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -
     let m_12 = _mm256_set1_epi8(12);
     let m_48 = _mm256_set1_epi8(48);
     let m_n64 = _mm256_set1_epi8(-64i8 as i8);
-    // Hoist all 8 XMM scale shuffle constants before block loop (GCC: xmm12-xmm19).
-    // Eliminates 2 vpunpck*bw instructions per block that LLVM emits when it
-    // halves register pressure by reusing 4 constants with interleave splits.
+    // Hoist XMM scale shuffle constants before block loop. LLVM keeps sh0-sh3
+    // in xmm5-xmm8 and reuses them for both halves (via vpunpcklbw/vpunpckhbw
+    // that interleaves each scale byte with itself, letting sh0 select s0 from
+    // the lower half and the same mask select s8 from the upper half). sh4-sh7
+    // are only needed by the source macro; the compiler folds them into sh0-sh3
+    // with the vpunpck split.
     let sh0 = get_scale_shuffle(0);
     let sh1 = get_scale_shuffle(1);
     let sh2 = get_scale_shuffle(2);
