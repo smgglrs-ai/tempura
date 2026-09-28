@@ -2503,6 +2503,25 @@ where
                             h,
                         )
                         .unwrap();
+                    } else if let (Some(pq), Some(qw), Some(kw), Some(vw)) = (
+                        normed_preq.as_ref(),
+                        indexed_layers[layer].q_proj.as_ref().and_then(|w| w.as_q4k()),
+                        indexed_layers[layer].k_proj.as_ref().and_then(|w| w.as_q4k()),
+                        indexed_layers[layer].v_proj.as_ref().and_then(|w| w.as_q4k()),
+                    ) {
+                        // Q+K+V all Q4K — single dispatch eliminates 2 barriers vs 3 separate calls
+                        q4k.fused_q4k_preq_3(
+                            pq,
+                            qw,
+                            &mut q[..q_dim],
+                            q_dim,
+                            kw,
+                            &mut k[..kv_dim],
+                            kv_dim,
+                            vw,
+                            &mut v[..kv_dim],
+                            kv_dim,
+                        );
                     } else if let (Some(pq), Some(qw), Some(kw), Some(vf16)) = (
                         normed_preq.as_ref(),
                         indexed_layers[layer].q_proj.as_ref().and_then(|w| w.as_q4k()),
@@ -2544,6 +2563,25 @@ where
                             indexed_layers[layer].v_proj.as_ref().unwrap(),
                             &mut v[..kv_dim],
                             1,
+                            kv_dim,
+                            h,
+                        );
+                    } else if let (Some(qw), Some(kw), Some(vw)) = (
+                        indexed_layers[layer].q_proj.as_ref().and_then(|w| w.as_q6k()),
+                        indexed_layers[layer].k_proj.as_ref().and_then(|w| w.as_q6k()),
+                        indexed_layers[layer].v_proj.as_ref().and_then(|w| w.as_q6k()),
+                    ) {
+                        // Q+K+V all Q6K — single dispatch eliminates 2 barriers vs 3 separate calls
+                        q4k.fused_q6k_preq_3(
+                            &normed[..h],
+                            qw,
+                            &mut q[..q_dim],
+                            q_dim,
+                            kw,
+                            &mut k[..kv_dim],
+                            kv_dim,
+                            vw,
+                            &mut v[..kv_dim],
                             kv_dim,
                             h,
                         );
@@ -3255,6 +3293,21 @@ where
                                     uw,
                                     &mut up[..inter],
                                     inter,
+                                );
+                            } else if let (Some(gw), Some(uw)) = (
+                                indexed_layers[layer].gate_proj.as_ref().and_then(|w| w.as_q6k()),
+                                indexed_layers[layer].up_proj.as_ref().and_then(|w| w.as_q6k()),
+                            ) {
+                                // gate+up both Q6K — single dispatch eliminates 1 barrier
+                                q4k.fused_q6k_preq_2(
+                                    ffn_input,
+                                    gw,
+                                    &mut gate[..inter],
+                                    inter,
+                                    uw,
+                                    &mut up[..inter],
+                                    inter,
+                                    h,
                                 );
                             } else {
                                 qmm_indexed(
