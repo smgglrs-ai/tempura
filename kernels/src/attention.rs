@@ -628,20 +628,61 @@ pub fn attention_decode_heads(
             *s *= inv_sum;
         }
 
-        // AV: AXPY pattern — outer loop over kv_s (contiguous v_row), inner over head_dim.
-        // Enables auto-vectorization of the inner loop (contiguous load + fmadd).
+        // AV: AXPY pattern — outer loop over kv_s (contiguous v_row), inner AVX2 fmadd.
+        // Matches llama.cpp's ggml_vec_mad_f32 (4×8-wide fmadd per iteration).
         let o_offset = h * head_dim;
         let out_row = &mut output[o_offset..o_offset + head_dim];
         for x in out_row.iter_mut() {
             *x = 0.0;
         }
+
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_avx2 = false;
+
         for (kv_s, &score) in scores.iter().enumerate() {
             let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
             let v_row = &v[v_offset..v_offset + head_dim];
-            for d in 0..head_dim {
-                out_row[d] += score * v_row[d];
+            if use_avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe { axpy_avx2(out_row, v_row, score); }
+            } else {
+                for d in 0..head_dim {
+                    out_row[d] += score * v_row[d];
+                }
             }
         }
+    }
+}
+
+/// AVX2 AXPY: out[d] += scale * src[d] for n elements (matching llama.cpp's ggml_vec_mad_f32).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_avx2(out: &mut [f32], src: &[f32], scale: f32) {
+    use std::arch::x86_64::*;
+    let n = out.len();
+    debug_assert_eq!(n, src.len());
+    let sv = _mm256_set1_ps(scale);
+    let mut i = 0;
+    while i + 32 <= n {
+        let o0 = _mm256_loadu_ps(out.as_ptr().add(i));
+        let o1 = _mm256_loadu_ps(out.as_ptr().add(i + 8));
+        let o2 = _mm256_loadu_ps(out.as_ptr().add(i + 16));
+        let o3 = _mm256_loadu_ps(out.as_ptr().add(i + 24));
+        let r0 = _mm256_fmadd_ps(sv, _mm256_loadu_ps(src.as_ptr().add(i)), o0);
+        let r1 = _mm256_fmadd_ps(sv, _mm256_loadu_ps(src.as_ptr().add(i + 8)), o1);
+        let r2 = _mm256_fmadd_ps(sv, _mm256_loadu_ps(src.as_ptr().add(i + 16)), o2);
+        let r3 = _mm256_fmadd_ps(sv, _mm256_loadu_ps(src.as_ptr().add(i + 24)), o3);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), r0);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i + 8), r1);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i + 16), r2);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i + 24), r3);
+        i += 32;
+    }
+    while i < n {
+        out[i] += scale * src[i];
+        i += 1;
     }
 }
 
