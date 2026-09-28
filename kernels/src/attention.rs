@@ -778,6 +778,119 @@ pub fn attention_decode_heads_f16kv(
     }
 }
 
+/// Compute attention for one query head (decode, seq_len=1).
+///
+/// kv_start: first KV position to include (positions < kv_start get -inf, for sliding window).
+/// kv_h: GQA key/value head index.
+#[cfg(feature = "cpu")]
+#[inline(always)]
+fn decode_one_head(
+    q_head: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out_head: &mut [f32],
+    scores: &mut [f32],
+    kv_start: usize,
+    kv_len: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    kv_h: usize,
+) {
+    for kv_s in 0..kv_len {
+        if kv_s < kv_start {
+            scores[kv_s] = f32::NEG_INFINITY;
+        } else {
+            let k_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+            scores[kv_s] =
+                crate::ggml::vec_llama::vec_dot_f32(q_head, &k[k_offset..k_offset + head_dim])
+                    * scale;
+        }
+    }
+
+    let max_score = scores[..kv_len].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let sum =
+        crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores[..kv_len], max_score);
+    let inv_sum = (1.0 / sum) as f32;
+    for s in &mut scores[..kv_len] {
+        *s *= inv_sum;
+    }
+
+    for d in out_head.iter_mut() {
+        *d = 0.0;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
+
+    for (kv_s, &score) in scores[..kv_len].iter().enumerate() {
+        let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+        let v_row = &v[v_offset..v_offset + head_dim];
+        if use_avx2 {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                axpy_avx2(out_head, v_row, score);
+            }
+        } else {
+            for d in 0..head_dim {
+                out_head[d] += score * v_row[d];
+            }
+        }
+    }
+}
+
+/// Parallel decode attention: dispatches `num_heads` heads across the staticpar pool.
+///
+/// Each head gets its own scores scratch region; output regions are non-overlapping.
+/// kv_start: first KV step to attend to (0 = full cache, kv_len-w = sliding window of size w).
+#[cfg(feature = "cpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn par_attention_decode(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    output: &mut [f32],
+    kv_start: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+) {
+    let mut scores_buf = vec![0.0f32; num_heads * kv_len];
+    let q_ptr = q.as_ptr();
+    let k_ptr = k.as_ptr();
+    let v_ptr = v.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+    let scores_ptr = scores_buf.as_mut_ptr();
+    let heads_per_group = num_heads / num_kv_heads;
+    crate::inference_pool::par_run(num_heads, move |start, end| {
+        for h in start..end {
+            let kv_h = h / heads_per_group;
+            let q_head =
+                unsafe { std::slice::from_raw_parts(q_ptr.add(h * head_dim), head_dim) };
+            let k_sl = unsafe {
+                std::slice::from_raw_parts(k_ptr, kv_len * num_kv_heads * head_dim)
+            };
+            let v_sl = unsafe {
+                std::slice::from_raw_parts(v_ptr, kv_len * num_kv_heads * head_dim)
+            };
+            let out_head = unsafe {
+                std::slice::from_raw_parts_mut(out_ptr.add(h * head_dim), head_dim)
+            };
+            let sc = unsafe {
+                std::slice::from_raw_parts_mut(scores_ptr.add(h * kv_len), kv_len)
+            };
+            decode_one_head(
+                q_head, k_sl, v_sl, out_head, sc, kv_start, kv_len, num_kv_heads, head_dim,
+                scale, kv_h,
+            );
+        }
+    });
+}
+
 /// Process a range of (head, position) work items for prefill attention.
 /// `item_start..item_end` indexes into `num_heads * seq_len` items where
 /// item = head * seq_len + position. Uses pre-allocated `scores` buffer.
@@ -955,6 +1068,10 @@ impl Attention for CpuAttentionGgml {
                 None,
             );
         }
+        if seq_len == 1 && batch == 1 {
+            par_attention_decode(q, k, v, output, 0, kv_len, num_heads, num_kv_heads, head_dim, scale);
+            return Ok(());
+        }
         naive_attention_ggml(
             q,
             k,
@@ -986,6 +1103,11 @@ impl Attention for CpuAttentionGgml {
         scale: f32,
         window_size: usize,
     ) -> Result<()> {
+        if seq_len == 1 && batch == 1 {
+            let kv_start = kv_len.saturating_sub(window_size);
+            par_attention_decode(q, k, v, output, kv_start, kv_len, num_heads, num_kv_heads, head_dim, scale);
+            return Ok(());
+        }
         naive_attention_ggml(
             q,
             k,
@@ -1356,6 +1478,10 @@ impl Attention for CpuAttention {
         head_dim: usize,
         scale: f32,
     ) -> Result<()> {
+        if seq_len == 1 && batch == 1 {
+            par_attention_decode(q, k, v, output, 0, kv_len, num_heads, num_kv_heads, head_dim, scale);
+            return Ok(());
+        }
         naive_attention(
             q,
             k,
@@ -1388,6 +1514,11 @@ impl Attention for CpuAttention {
         scale: f32,
         window_size: usize,
     ) -> Result<()> {
+        if seq_len == 1 && batch == 1 {
+            let kv_start = kv_len.saturating_sub(window_size);
+            par_attention_decode(q, k, v, output, kv_start, kv_len, num_heads, num_kv_heads, head_dim, scale);
+            return Ok(());
+        }
         naive_attention(
             q,
             k,
