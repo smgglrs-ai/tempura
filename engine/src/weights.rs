@@ -252,6 +252,77 @@ pub struct Tl2Tensor {
     pub scale: f32,
 }
 
+/// Pre-resolved weight reference for a single tensor, avoiding repeated HashMap lookups.
+/// Computed once per (layer, projection) before the forward-pass layer loop.
+pub enum PreIndexedWeight<'a> {
+    Typed(tempura_kernels::ggml::GgmlType, &'a [u8]),
+    Tl2 {
+        tensor: &'a Tl2Tensor,
+        corrections: Option<&'a [f32]>,
+    },
+    I2s(&'a [u8]),
+    Q2Tiled {
+        q2: Option<&'a [u8]>,
+    },
+    Q2x4 {
+        x4: &'a [u8],
+        q2: Option<&'a [u8]>,
+    },
+    Q2I2s {
+        i2s: &'a [u8],
+        scales: &'a [f32],
+        q2: Option<&'a [u8]>,
+    },
+    Q2(&'a [u8]),
+    F16(&'a [u8]),
+    Q4k(&'a [u8]),
+    Q6k(&'a [u8]),
+    F32(&'a [f32]),
+}
+
+impl<'a> PreIndexedWeight<'a> {
+    pub fn as_q4k(&self) -> Option<&'a [u8]> {
+        use tempura_kernels::ggml::GgmlType;
+        match self {
+            PreIndexedWeight::Q4k(w) => Some(w),
+            PreIndexedWeight::Typed(GgmlType::Q4K, w) => Some(w),
+            _ => None,
+        }
+    }
+
+    pub fn as_q6k(&self) -> Option<&'a [u8]> {
+        use tempura_kernels::ggml::GgmlType;
+        match self {
+            PreIndexedWeight::Q6k(w) => Some(w),
+            PreIndexedWeight::Typed(GgmlType::Q6K, w) => Some(w),
+            _ => None,
+        }
+    }
+
+    pub fn as_i2s(&self) -> Option<&'a [u8]> {
+        use tempura_kernels::ggml::GgmlType;
+        match self {
+            PreIndexedWeight::I2s(w) => Some(w),
+            PreIndexedWeight::Typed(dtype, w) if *dtype == GgmlType::TQ1_0 => Some(w),
+            _ => None,
+        }
+    }
+
+    pub fn as_f16(&self) -> Option<&'a [u8]> {
+        match self {
+            PreIndexedWeight::F16(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    pub fn as_tl2(&self) -> Option<&'a Tl2Tensor> {
+        match self {
+            PreIndexedWeight::Tl2 { tensor, .. } => Some(tensor),
+            _ => None,
+        }
+    }
+}
+
 pub struct QuantizedWeights {
     q4k_tensors: HashMap<String, Vec<u8>>,
     q6k_tensors: HashMap<String, Vec<u8>>,
@@ -758,6 +829,49 @@ impl QuantizedWeights {
 
     pub fn tensor_type(&self, name: &str) -> Option<tempura_kernels::ggml::GgmlType> {
         self.typed_tensors.get(name).map(|(t, _)| *t)
+    }
+
+    /// Resolve a tensor name to a direct weight reference, performing all HashMap lookups once.
+    /// Returns None if the tensor is not found in any storage.
+    pub fn resolve_weight<'a>(&'a self, name: &str) -> Option<PreIndexedWeight<'a>> {
+        if let Some((dtype, w)) = self.get_typed(name) {
+            return Some(PreIndexedWeight::Typed(dtype, w));
+        }
+        if let Some(tensor) = self.get_tl2(name) {
+            let corrections = self.get_q2_row_corrections(name);
+            return Some(PreIndexedWeight::Tl2 { tensor, corrections });
+        }
+        if let Some(w) = self.get_i2s(name) {
+            return Some(PreIndexedWeight::I2s(w));
+        }
+        if self.get_q2_tiled(name).is_some() {
+            let q2 = self.get_q2(name);
+            return Some(PreIndexedWeight::Q2Tiled { q2 });
+        }
+        if let Some((x4, _, _)) = self.get_q2x4(name) {
+            let q2 = self.get_q2(name);
+            return Some(PreIndexedWeight::Q2x4 { x4, q2 });
+        }
+        if let Some((i2s, scales, _, _)) = self.get_q2_i2s(name) {
+            let q2 = self.get_q2(name);
+            return Some(PreIndexedWeight::Q2I2s { i2s, scales, q2 });
+        }
+        if let Some(w) = self.get_q2(name) {
+            return Some(PreIndexedWeight::Q2(w));
+        }
+        if let Some(w) = self.get_f16(name) {
+            return Some(PreIndexedWeight::F16(w));
+        }
+        if let Some(w) = self.get_q4k(name) {
+            return Some(PreIndexedWeight::Q4k(w));
+        }
+        if let Some(w) = self.get_q6k(name) {
+            return Some(PreIndexedWeight::Q6k(w));
+        }
+        if let Some(w) = self.get_f32(name) {
+            return Some(PreIndexedWeight::F32(w));
+        }
+        None
     }
 }
 
