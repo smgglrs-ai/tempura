@@ -4913,48 +4913,27 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
         }
 
-        // m=1 decode fast path: repack weights into BlockQ4Kx8 and run 8-wide GEMV.
-        // On VNNI CPUs uses dpbusd (gemv_q4k_8x8_vnni via dispatch); on AVX2+F16C uses maddubs.
-        // Requires n % 8 == 0.
-        #[cfg(target_arch = "x86_64")]
-        if m == 1 && n % 8 == 0 && is_x86_feature_detected!("avx2") {
-            use crate::ggml::blocks::{BlockQ4K, BlockQ4Kx8};
-            use crate::ggml::repack::repack_q4k_to_q4kx8;
-
-            thread_local! {
-                static Q4KX8_GEMV_CACHE: std::cell::RefCell<(usize, usize, usize, Vec<BlockQ4Kx8>)> =
-                    const { std::cell::RefCell::new((0, 0, 0, Vec::new())) };
-            }
-
-            let src_ptr = b_quantized.as_ptr() as usize;
-            let packed_ready = Q4KX8_GEMV_CACHE.with(|c| {
-                let cache = c.borrow();
-                cache.0 == src_ptr && cache.1 == n && cache.2 == blocks_per_row
-            });
-            if !packed_ready {
-                let src_q4k = unsafe {
-                    std::slice::from_raw_parts(
-                        b_quantized.as_ptr() as *const BlockQ4K,
-                        n * blocks_per_row,
-                    )
-                };
-                let repacked = repack_q4k_to_q4kx8(src_q4k, n, blocks_per_row);
-                Q4KX8_GEMV_CACHE.with(|c| {
-                    *c.borrow_mut() = (src_ptr, n, blocks_per_row, repacked);
-                });
-            }
-
-            Q4KX8_GEMV_CACHE.with(|c| {
-                let cache = c.borrow();
-                let packed = &cache.3;
-                let job = Q4kGemvX8Job {
-                    packed_ptr: packed.as_ptr() as *const u8,
-                    q8k_ptr: q8k_all.as_ptr() as *const u8,
-                    out_ptr: output.as_mut_ptr(),
-                    n,
-                    bpr: blocks_per_row,
-                };
-                crate::inference_pool::par_run_job(n / 8, &job);
+        // m=1 decode: use ggml_vec_dot_q4_k_q8_k (exact translation of llama.cpp's
+        // ggml_vec_dot_q4_K_q8_K from quants_llama.rs), parallelized over output neurons.
+        // This is what llama.cpp actually uses for decode (profiling confirmed 62% of cycles
+        // in ggml_vec_dot_q4_K_q8_K, NOT the repacked 8x8 path).
+        if m == 1 {
+            use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+            let w_q4k = unsafe {
+                std::slice::from_raw_parts(b_quantized.as_ptr() as *const BlockQ4K, n * blocks_per_row)
+            };
+            let act_q8k = unsafe {
+                std::slice::from_raw_parts(q8k_all.as_ptr(), blocks_per_row)
+            };
+            let out_ptr = output.as_mut_ptr();
+            let bpr = blocks_per_row;
+            // Parallelize over output neurons (j = 0..n) — same parallelism as Q4kGemvJob
+            crate::inference_pool::par_run(n, |start, end| {
+                for j in start..end {
+                    let w = &w_q4k[j * bpr..(j + 1) * bpr];
+                    let val = unsafe { crate::ggml::quants_llama::ggml_vec_dot_q4_k_q8_k(bpr * 256, w, act_q8k) };
+                    unsafe { *out_ptr.add(j) = val; }
+                }
             });
             return Ok(());
         }
@@ -5091,22 +5070,41 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 const { std::cell::UnsafeCell::new(Vec::new()) };
         }
 
-        // llama.cpp translation:
-        // llama.cpp translation: Q8_K activations × Q6_K weights via vec_dot_q6_K_q8_K.
-        #[cfg(feature = "openmp")]
-        if m == 1 {
-            use crate::ggml::blocks::BlockQ8K;
-            let a_row = &a[0..k];
-            let mut q8k_buf = vec![unsafe { std::mem::zeroed::<BlockQ8K>() }; blocks_per_row];
+        // Pre-quantize all m activation rows to Q8K
+        let mut q8k_all: Vec<crate::ggml::blocks::BlockQ8K> =
+            vec![unsafe { std::mem::zeroed() }; m * blocks_per_row];
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+            let dst = &mut q8k_all[i * blocks_per_row..(i + 1) * blocks_per_row];
             #[cfg(target_arch = "x86_64")]
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                unsafe { crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, &mut q8k_buf) };
+                unsafe { crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, dst) };
             } else {
-                crate::ggml::quantize::quantize_row_q8_k(a_row, &mut q8k_buf);
+                crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
             }
             #[cfg(not(target_arch = "x86_64"))]
-            crate::ggml::quantize::quantize_row_q8_k(a_row, &mut q8k_buf);
-            crate::openmp_gemv::openmp::gemv_q6k(b_quantized, &q8k_buf, output, n, blocks_per_row);
+            crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
+        }
+
+        // m=1 Q6K decode: ggml_vec_dot_q6_k_q8_k (exact translation of llama.cpp),
+        // parallelized over output neurons.
+        if m == 1 {
+            use crate::ggml::blocks::BlockQ6K;
+            let w_q6k = unsafe {
+                std::slice::from_raw_parts(b_quantized.as_ptr() as *const BlockQ6K, n * blocks_per_row)
+            };
+            let act_q8k = unsafe {
+                std::slice::from_raw_parts(q8k_all.as_ptr(), blocks_per_row)
+            };
+            let out_ptr = output.as_mut_ptr();
+            let bpr = blocks_per_row;
+            crate::inference_pool::par_run(n, |start, end| {
+                for j in start..end {
+                    let w = &w_q6k[j * bpr..(j + 1) * bpr];
+                    let val = unsafe { crate::ggml::quants_llama::ggml_vec_dot_q6_k_q8_k(bpr * 256, w, act_q8k) };
+                    unsafe { *out_ptr.add(j) = val; }
+                }
+            });
             return Ok(());
         }
         #[cfg(feature = "openmp")]
