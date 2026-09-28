@@ -1895,7 +1895,252 @@ pub unsafe fn gemv_q4k_8x8_avx2(
     out
 }
 
-/// Dispatch: 8-wide Q4K×Q8K GEMV. Uses AVX2+F16C when available, scalar fallback otherwise.
+/// 8-simultaneous-row Q4K×Q8K GEMV using AVX-VNNI `dpbusd`.
+///
+/// Replaces the maddubs+madd_epi16 chain of `gemv_q4k_8x8_avx2` with `dpbusd`+`mullo_epi32`,
+/// eliminating intermediate i16 overflow risk and saving one instruction per 4-element group
+/// on VNNI-capable CPUs (Zen 5, Intel Alder Lake+). Uses the same `BlockQ4Kx8` (8-byte
+/// interleave) weight format — no re-packing required.
+///
+/// Algorithm per block:
+///   For each sub-block (4 per block, each covering 32 nibble bytes per row):
+///     For each raw pair (4 pairs of 32-byte chunks), covering 8 nibble bytes per row:
+///       unpacklo_epi32(raw_lo_0, raw_lo_1) → interleaves rows [0,4,2,6] in i32 slots
+///       unpackhi_epi32(raw_lo_0, raw_lo_1) → rows [1,5,3,7]
+///       dpbusd with broadcast activation [a0..3, a0..3, a4..7, a4..7] × both halves
+///     Collapse with permutevar8x32 + hadd_epi32 → per-row i32 in [r0,r4,r1,r5,...] order
+///     Apply per-row scale via mullo_epi32
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+pub unsafe fn gemv_q4k_8x8_vnni(
+    nb: usize,
+    packed: &[super::blocks::BlockQ4Kx8],
+    act: &[BlockQ8K],
+) -> [f32; 8] {
+    // Permute to collapse paired i32 accumulators: acc = [ra, rb, ra', rb', rc, rd, rc', rd']
+    // → [ra, ra', rb, rb', rc, rc', rd, rd'] so hadd produces per-row sums.
+    let perm_collapse = _mm256_set_epi32(7, 5, 6, 4, 3, 1, 2, 0);
+    // Reorder min correction from natural [r0..r7] to interleaved [r0,r4,r1,r5,...] order
+    // so the same finalpermutemask correctly produces [r0..r7] for both dot and min.
+    let perm_min_reorder = _mm256_set_epi32(7, 3, 6, 2, 5, 1, 4, 0);
+    // Final permute: [r0,r4,r1,r5,r2,r6,r3,r7] → [r0..r7].
+    let finalpermutemask = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+    let deltamask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0i8);
+
+    let m4b = _mm256_set1_epi8(0x0F_u8 as i8);
+    let zero = _mm256_setzero_si256();
+
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    let mut acc_row = _mm256_setzero_ps();
+    let mut acc_min_rows = _mm256_setzero_ps();
+
+    for b in 0..nb {
+        let p = &packed[b];
+        let y = &act[b];
+
+        let row_scale_f32 = _mm256_set1_ps(y.d);
+
+        // d values: rearrange [d0..d7] to [d0,d4,d1,d5,d2,d6,d3,d7] matching iacc_b row order.
+        let col_scale_f32 = _mm256_cvtph_ps(_mm_shuffle_epi8(
+            _mm_loadu_si128(p.d.as_ptr() as *const __m128i),
+            deltamask,
+        ));
+        let col_dmin_f32 =
+            _mm256_cvtph_ps(_mm_loadu_si128(p.dmin.as_ptr() as *const __m128i));
+
+        let mut iacc_b = zero;
+        let mut iacc_min_b = zero;
+
+        // Hadd bsums for min correction (same as avx2 variant).
+        let q8sums = _mm256_loadu_si256(y.bsums.as_ptr() as *const __m256i);
+        let q8s_128 = _mm_hadd_epi16(
+            _mm256_castsi256_si128(q8sums),
+            _mm256_extracti128_si256(q8sums, 1),
+        );
+        let mut q8s = _mm256_permute2f128_si256(
+            _mm256_castsi128_si256(q8s_128),
+            _mm256_castsi128_si256(q8s_128),
+            0,
+        );
+
+        for sb in 0..4usize {
+            // Extract and decode scale/min bytes for this sub-block pair — identical to avx2.
+            let mut utmp_0 = [0u32; 4];
+            let mut utmp_1 = [0u32; 4];
+            std::ptr::copy_nonoverlapping(
+                p.scales.as_ptr().add(24 * sb),
+                utmp_0.as_mut_ptr() as *mut u8,
+                12,
+            );
+            std::ptr::copy_nonoverlapping(
+                p.scales.as_ptr().add(12 + 24 * sb),
+                utmp_1.as_mut_ptr() as *mut u8,
+                12,
+            );
+
+            utmp_0[3] = ((utmp_0[2] >> 4) & KMASK2) | (((utmp_0[1] >> 6) & KMASK3) << 4);
+            let uaux_0 = utmp_0[1] & KMASK1;
+            utmp_0[1] = (utmp_0[2] & KMASK2) | (((utmp_0[0] >> 6) & KMASK3) << 4);
+            utmp_0[2] = uaux_0;
+            utmp_0[0] &= KMASK1;
+
+            utmp_1[3] = ((utmp_1[2] >> 4) & KMASK2) | (((utmp_1[1] >> 6) & KMASK3) << 4);
+            let uaux_1 = utmp_1[1] & KMASK1;
+            utmp_1[1] = (utmp_1[2] & KMASK2) | (((utmp_1[0] >> 6) & KMASK3) << 4);
+            utmp_1[2] = uaux_1;
+            utmp_1[0] &= KMASK1;
+
+            // Build per-row scale vectors in [r0,r4,r1,r5,r2,r6,r3,r7] order to match
+            // the hadd output layout produced below. utmp_0[0] = sc[row0..3], [1] = sc[row4..7].
+            let (s0, s1, s2, s3) = (
+                (utmp_0[0] & 0xFF) as i32,
+                ((utmp_0[0] >> 8) & 0xFF) as i32,
+                ((utmp_0[0] >> 16) & 0xFF) as i32,
+                ((utmp_0[0] >> 24) & 0xFF) as i32,
+            );
+            let (s4, s5, s6, s7) = (
+                (utmp_0[1] & 0xFF) as i32,
+                ((utmp_0[1] >> 8) & 0xFF) as i32,
+                ((utmp_0[1] >> 16) & 0xFF) as i32,
+                ((utmp_0[1] >> 24) & 0xFF) as i32,
+            );
+            let scale_lo_vec = _mm256_set_epi32(s7, s3, s6, s2, s5, s1, s4, s0);
+
+            let (m0, m1, m2, m3) = (
+                (utmp_1[0] & 0xFF) as i32,
+                ((utmp_1[0] >> 8) & 0xFF) as i32,
+                ((utmp_1[0] >> 16) & 0xFF) as i32,
+                ((utmp_1[0] >> 24) & 0xFF) as i32,
+            );
+            let (m4, m5, m6, m7) = (
+                (utmp_1[1] & 0xFF) as i32,
+                ((utmp_1[1] >> 8) & 0xFF) as i32,
+                ((utmp_1[1] >> 16) & 0xFF) as i32,
+                ((utmp_1[1] >> 24) & 0xFF) as i32,
+            );
+            let scale_hi_vec = _mm256_set_epi32(m7, m3, m6, m2, m5, m1, m4, m0);
+
+            // Min correction (same structure as avx2 kernel).
+            let mas0 = _mm_set_epi32(
+                utmp_0[3] as i32,
+                utmp_0[2] as i32,
+                utmp_0[1] as i32,
+                utmp_0[0] as i32,
+            );
+            let mas1 = _mm_set_epi32(
+                utmp_1[3] as i32,
+                utmp_1[2] as i32,
+                utmp_1[1] as i32,
+                utmp_1[0] as i32,
+            );
+            let mins_01 = _mm256_cvtepu8_epi16(_mm_unpacklo_epi8(
+                _mm_shuffle_epi32(mas0, 78),
+                _mm_shuffle_epi32(mas1, 78),
+            ));
+
+            // Four raw pairs per sub-block: each covers 8 nibble bytes per row.
+            // raw_0 = rows 0-3 (8 bytes each), raw_1 = rows 4-7 (8 bytes each).
+            let base = p.qs.as_ptr().add(sb * 256);
+
+            let mut acc0_lo = zero;
+            let mut acc1_lo = zero;
+            let mut acc0_hi = zero;
+            let mut acc1_hi = zero;
+
+            for i in 0..4usize {
+                let raw_0 = _mm256_loadu_si256(base.add(i * 64) as *const __m256i);
+                let raw_1 = _mm256_loadu_si256(base.add(i * 64 + 32) as *const __m256i);
+
+                let lo_0 = _mm256_and_si256(raw_0, m4b);
+                let lo_1 = _mm256_and_si256(raw_1, m4b);
+                let hi_0 = _mm256_and_si256(_mm256_srli_epi16(raw_0, 4), m4b);
+                let hi_1 = _mm256_and_si256(_mm256_srli_epi16(raw_1, 4), m4b);
+
+                // unpacklo: [r0_b0..3, r4_b0..3, r0_b4..7, r4_b4..7, r2_b0..3, r6_b0..3, r2_b4..7, r6_b4..7]
+                // unpackhi: [r1_b0..3, r5_b0..3, r1_b4..7, r5_b4..7, r3_b0..3, r7_b0..3, r3_b4..7, r7_b4..7]
+                let lo_up0 = _mm256_unpacklo_epi32(lo_0, lo_1);
+                let lo_up1 = _mm256_unpackhi_epi32(lo_0, lo_1);
+                let hi_up0 = _mm256_unpacklo_epi32(hi_0, hi_1);
+                let hi_up1 = _mm256_unpackhi_epi32(hi_0, hi_1);
+
+                // Activation for lo nibbles: 8 bytes broadcast as [a0..3, a0..3, a4..7, a4..7] × 2.
+                // lo nibble byte j of a row pairs with Q8K[j] = y.qs[sb*64 + i*8 + j%8].
+                let act_lo_xmm =
+                    _mm_loadl_epi64(y.qs.as_ptr().add(sb * 64 + i * 8) as *const __m128i);
+                let act_lo_ymm = _mm256_broadcastsi128_si256(_mm_unpacklo_epi32(act_lo_xmm, act_lo_xmm));
+
+                acc0_lo = _mm256_dpbusd_epi32(acc0_lo, lo_up0, act_lo_ymm);
+                acc1_lo = _mm256_dpbusd_epi32(acc1_lo, lo_up1, act_lo_ymm);
+
+                // Activation for hi nibbles: hi nibble byte j pairs with Q8K[j+128-sb_base]
+                // = y.qs[sb*64 + 32 + i*8 + j%8].
+                let act_hi_xmm = _mm_loadl_epi64(
+                    y.qs.as_ptr().add(sb * 64 + 32 + i * 8) as *const __m128i,
+                );
+                let act_hi_ymm = _mm256_broadcastsi128_si256(_mm_unpacklo_epi32(act_hi_xmm, act_hi_xmm));
+
+                acc0_hi = _mm256_dpbusd_epi32(acc0_hi, hi_up0, act_hi_ymm);
+                acc1_hi = _mm256_dpbusd_epi32(acc1_hi, hi_up1, act_hi_ymm);
+            }
+
+            // Collapse: acc0_lo = [r0a, r4a, r0b, r4b, r2a, r6a, r2b, r6b] (a=first4 bytes, b=second4).
+            // perm_collapse → [r0a, r0b, r4a, r4b, r2a, r2b, r6a, r6b].
+            // hadd(perm(acc0), perm(acc1)) → [r0, r4, r1, r5, r2, r6, r3, r7] (per-row sums).
+            let acc_lo = _mm256_hadd_epi32(
+                _mm256_permutevar8x32_epi32(acc0_lo, perm_collapse),
+                _mm256_permutevar8x32_epi32(acc1_lo, perm_collapse),
+            );
+            let acc_hi = _mm256_hadd_epi32(
+                _mm256_permutevar8x32_epi32(acc0_hi, perm_collapse),
+                _mm256_permutevar8x32_epi32(acc1_hi, perm_collapse),
+            );
+
+            // Apply per-row scale via 32-bit multiply (no i16 saturation risk).
+            let scaled = _mm256_add_epi32(
+                _mm256_mullo_epi32(acc_lo, scale_lo_vec),
+                _mm256_mullo_epi32(acc_hi, scale_hi_vec),
+            );
+            iacc_b = _mm256_add_epi32(iacc_b, scaled);
+
+            // Min correction: madd produces [r0..r7] natural order. Reorder to
+            // [r0,r4,r1,r5,...] so finalpermutemask produces [r0..r7] for both iacc_b and iacc_min_b.
+            let q8s_sb = _mm256_shuffle_epi32(q8s, 0);
+            let iacc_min_sb = _mm256_madd_epi16(q8s_sb, mins_01);
+            q8s = _mm256_bsrli_epi128(q8s, 4);
+            iacc_min_b = _mm256_add_epi32(
+                iacc_min_b,
+                _mm256_permutevar8x32_epi32(iacc_min_sb, perm_min_reorder),
+            );
+        }
+
+        acc_row = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(iacc_b),
+            _mm256_mul_ps(col_scale_f32, row_scale_f32),
+            acc_row,
+        );
+        acc_min_rows = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(iacc_min_b),
+            _mm256_mul_ps(col_dmin_f32, row_scale_f32),
+            acc_min_rows,
+        );
+    }
+
+    // Both acc_row and acc_min_rows are in [r0,r4,r1,r5,r2,r6,r3,r7] order.
+    // finalpermutemask maps this to [r0..r7].
+    acc_row = _mm256_permutevar8x32_ps(acc_row, finalpermutemask);
+    acc_min_rows = _mm256_permutevar8x32_ps(acc_min_rows, finalpermutemask);
+
+    let result = _mm256_sub_ps(acc_row, acc_min_rows);
+    let mut out = [0.0f32; 8];
+    _mm256_storeu_ps(out.as_mut_ptr(), result);
+    out
+}
+
+/// Dispatch: 8-wide Q4K×Q8K GEMV. Prefers VNNI (dpbusd) on capable CPUs, falls back to
+/// AVX2+F16C (maddubs), then scalar.
 #[inline(always)]
 #[allow(unreachable_code)]
 pub fn gemv_q4k_8x8_dispatch(
@@ -1903,6 +2148,12 @@ pub fn gemv_q4k_8x8_dispatch(
     packed: &[super::blocks::BlockQ4Kx8],
     act: &[BlockQ8K],
 ) -> [f32; 8] {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avxvnni") || is_x86_feature_detected!("avx512vnni") {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { gemv_q4k_8x8_vnni(nb, packed, act) };
+        }
+    }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
         return unsafe { gemv_q4k_8x8_avx2(nb, packed, act) };
@@ -2882,6 +3133,67 @@ mod tests {
                 rel < 0.02,
                 "row={r}: avx2={}, scalar={}, rel_err={rel}",
                 avx2_result[r],
+                scalar_result[r]
+            );
+        }
+    }
+
+    #[test]
+    fn gemv_q4k_8x8_vnni_matches_scalar() {
+        if !is_x86_feature_detected!("avxvnni") && !is_x86_feature_detected!("avx512vnni") {
+            return;
+        }
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        use crate::ggml::repack::repack_q4k_to_q4kx8;
+
+        let bpr = 2usize;
+        let k = bpr * 256;
+        let n_rows = 8usize;
+
+        let src_blocks: Vec<BlockQ4K> = (0..n_rows * bpr)
+            .map(|r| {
+                use crate::ggml::helpers::f32_to_f16;
+                let d = 0.3 + (r as f32) * 0.07;
+                let mut b = BlockQ4K {
+                    d: f32_to_f16(d),
+                    dmin: f32_to_f16(0.0),
+                    scales: [0u8; 12],
+                    qs: [0u8; 128],
+                };
+                // Fill nibbles with row-dependent pattern for better coverage.
+                for j in 0..128 {
+                    let lo = ((r * 3 + j * 5) % 16) as u8;
+                    let hi = ((r * 7 + j * 11) % 16) as u8;
+                    b.qs[j] = lo | (hi << 4);
+                }
+                b.scales[0] = 1; b.scales[1] = 1; b.scales[2] = 1; b.scales[3] = 1;
+                b.scales[4] = 0; b.scales[5] = 0; b.scales[6] = 0; b.scales[7] = 0;
+                b.scales[8] = 1; b.scales[9] = 1; b.scales[10] = 1; b.scales[11] = 1;
+                b
+            })
+            .collect();
+
+        let act_float: Vec<f32> = (0..k).map(|j| (j as f32 - k as f32 / 2.0) / k as f32).collect();
+        let mut act_q8k = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }; bpr];
+        super::super::quantize::quantize_row_q8_k(&act_float, &mut act_q8k);
+
+        let packed = repack_q4k_to_q4kx8(&src_blocks, n_rows, bpr);
+
+        let scalar_result = gemv_q4k_8x8_scalar(bpr, &packed, &act_q8k);
+        let vnni_result = unsafe { gemv_q4k_8x8_vnni(bpr, &packed, &act_q8k) };
+
+        for r in 0..n_rows {
+            let rel = if scalar_result[r].abs() > 0.001 {
+                ((vnni_result[r] - scalar_result[r]) / scalar_result[r]).abs()
+            } else {
+                (vnni_result[r] - scalar_result[r]).abs()
+            };
+            assert!(
+                rel < 1e-4,
+                "row={r}: vnni={}, scalar={}, rel_err={rel}",
+                vnni_result[r],
                 scalar_result[r]
             );
         }
