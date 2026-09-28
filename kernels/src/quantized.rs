@@ -4938,15 +4938,12 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             return Ok(());
         }
 
-        // m>1 prefill fast path: repack activations into Q8Kx4 and run llama.cpp 4×8 GEMM.
-        // Requires m divisible by 4 and n divisible by 8. Falls through to Q4kMnBlockJob
-        // if AVX2/F16C/FMA is unavailable or dimensions are not aligned.
-        #[cfg(target_arch = "x86_64")]
-        if m % 4 == 0
+        // m>1 prefill: fall through to Q4kMnBlockJob (VNNI 4x2 tile, proven stable).
+        // The maddubs 8x8 GEMM translation is correct but causes SIGSEGV on longer sequences.
+        // TODO: debug ggml_gemm_q4_k_8x8_q8_k for prefill safety.
+        if false
+            && m % 4 == 0
             && n % 8 == 0
-            && is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("f16c")
-            && is_x86_feature_detected!("fma")
         {
             use crate::ggml::blocks::{BlockQ4K, BlockQ4Kx8};
             use crate::ggml::repack::{quantize_mat_q8k_4x8, repack_q4k_to_q4kx8};
