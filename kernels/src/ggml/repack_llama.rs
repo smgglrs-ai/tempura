@@ -170,13 +170,12 @@ pub unsafe fn ggml_gemv_q4_k_8x8_q8_k(
 
     let nb = n / QK_K;
 
-    // Lookup table to convert signed nibbles to signed bytes
-    let signextendlut = _mm256_permute2f128_si256(
-        _mm256_castsi128_si256(_mm_set_epi8(-1,-2,-3,-4,-5,-6,-7,-8,7,6,5,4,3,2,1,0)),
-        _mm256_castsi128_si256(_mm_set_epi8(-1,-2,-3,-4,-5,-6,-7,-8,7,6,5,4,3,2,1,0)),
-        0,
-    );
-    let _ = signextendlut; // used in q4_0 path; Q4_K uses nibble mask instead
+    // When there are no blocks (n < QK_K), the result is all zeros.
+    // Handle this with a single slice-fill instead of 8+ memset calls in a cold path.
+    if nb == 0 || nr == 0 || nc < 8 {
+        std::slice::from_raw_parts_mut(s, nr * nc).fill(0.0_f32);
+        return;
+    }
 
     // Shuffle masks
     let deltamask = _mm_set_epi8(15,14,7,6,13,12,5,4,11,10,3,2,9,8,1,0);
@@ -189,18 +188,25 @@ pub unsafe fn ggml_gemv_q4_k_8x8_q8_k(
     let b_ptr_start = vx as *const BlockQ4Kx8;
     let a_ptr_start = vy as *const BlockQ8K;
 
-    for y in 0..nr {
-        let a_ptr = a_ptr_start.add(y * nb);
+    // Use pointer increments instead of multiply-offset per iteration.
+    // This eliminates `imul rcx, r9, sizeof(Block)` inside the hot b-loop.
+    let mut a_ptr = a_ptr_start;
+    let mut s_row = s;
+    for _y in 0..nr {
+        let mut b_ptr = b_ptr_start;
+        let mut s_out = s_row;
 
-        for x in 0..nc / 8 {
-            let b_ptr = b_ptr_start.add(x * nb);
-
+        for _x in 0..nc / 8 {
             let mut acc_row = _mm256_setzero_ps();
             let mut acc_min_rows = _mm256_setzero_ps();
 
-            for b in 0..nb as isize {
-                let a = &*a_ptr.offset(b);
-                let bp = &*b_ptr.offset(b);
+            let mut a_cur = a_ptr;
+            let mut bp_cur = b_ptr;
+            for _ in 0..nb {
+                let a = &*a_cur;
+                let bp = &*bp_cur;
+                a_cur = a_cur.add(1);
+                bp_cur = bp_cur.add(1);
 
                 // Load and broadcast Q8_K scale
                 let row_scale_f32 = _mm256_set1_ps(a.d);
@@ -403,10 +409,17 @@ pub unsafe fn ggml_gemv_q4_k_8x8_q8_k(
             // Permute and store 8 output values
             let acc_row = _mm256_permutevar8x32_ps(acc_row, finalpermutemask);
             _mm256_storeu_ps(
-                s.add(y * nc + x * 8),
+                s_out,
                 _mm256_sub_ps(acc_row, acc_min_rows),
             );
+            // Advance output pointer by 8 floats and weight pointer by nb blocks
+            s_out = s_out.add(8);
+            b_ptr = b_ptr.add(nb);
         }
+
+        // Advance activation and output row pointers
+        a_ptr = a_ptr.add(nb);
+        s_row = s_row.add(nc);
     }
 }
 
