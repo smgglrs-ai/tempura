@@ -788,6 +788,168 @@ impl crate::inference_pool::KernelJob for FusedQ4k2F161PreqJob {
     }
 }
 
+// Fused QKV job: three Q4K projections sharing one pre-quantized activation, one dispatch.
+struct FusedQ4kPreq3Job {
+    b1_ptr: *const u8,
+    b2_ptr: *const u8,
+    b3_ptr: *const u8,
+    out1_ptr: *mut f32,
+    out2_ptr: *mut f32,
+    out3_ptr: *mut f32,
+    n1: usize,
+    n2: usize,
+    blocks_per_row: usize,
+    q8_ptr: *const i8,
+    scales_ptr: *const f32,
+    gsums_ptr: *const f32,
+}
+unsafe impl Sync for FusedQ4kPreq3Job {}
+impl crate::inference_pool::KernelJob for FusedQ4kPreq3Job {
+    #[inline(always)]
+    fn exec_range(&self, start: usize, end: usize) {
+        const USE_VNNI: bool = cfg!(any(
+            target_feature = "avxvnni",
+            target_feature = "avx512vnni"
+        ));
+        for idx in start..end {
+            let (b_ptr, j, o_ptr) = if idx < self.n1 {
+                (self.b1_ptr, idx, unsafe { self.out1_ptr.add(idx) })
+            } else if idx < self.n1 + self.n2 {
+                let i = idx - self.n1;
+                (self.b2_ptr, i, unsafe { self.out2_ptr.add(i) })
+            } else {
+                let i = idx - self.n1 - self.n2;
+                (self.b3_ptr, i, unsafe { self.out3_ptr.add(i) })
+            };
+            let mut sum = 0.0f32;
+            for blk in 0..self.blocks_per_row {
+                let off = (j * self.blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+                let block = unsafe { std::slice::from_raw_parts(b_ptr.add(off), Q4K_BLOCK_BYTES) };
+                let aq = unsafe {
+                    std::slice::from_raw_parts(
+                        self.q8_ptr.add(blk * Q4K_BLOCK_SIZE),
+                        Q4K_BLOCK_SIZE,
+                    )
+                };
+                let a_sc = unsafe { *self.scales_ptr.add(blk) };
+                let a_gs = unsafe {
+                    std::slice::from_raw_parts(self.gsums_ptr.add(blk * Q4K_GROUPS), Q4K_GROUPS)
+                };
+                sum += if USE_VNNI {
+                    unsafe { q4k_dot_q8_vnni(block, aq, a_sc, a_gs) }
+                } else {
+                    unsafe { q4k_dot_q8_avx2(block, aq, a_sc, a_gs) }
+                };
+            }
+            unsafe {
+                *o_ptr = sum;
+            }
+        }
+    }
+}
+
+// Fused QKV job: three Q6K projections sharing one f32 activation, one dispatch.
+struct FusedQ6kPreq3Job {
+    b1_ptr: *const u8,
+    b2_ptr: *const u8,
+    b3_ptr: *const u8,
+    out1_ptr: *mut f32,
+    out2_ptr: *mut f32,
+    out3_ptr: *mut f32,
+    n1: usize,
+    n2: usize,
+    bpr: usize,
+    af_ptr: *const f32,
+}
+unsafe impl Sync for FusedQ6kPreq3Job {}
+impl crate::inference_pool::KernelJob for FusedQ6kPreq3Job {
+    #[inline(always)]
+    fn exec_range(&self, start: usize, end: usize) {
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_avx2 = false;
+        for idx in start..end {
+            let (b_ptr, j, o_ptr) = if idx < self.n1 {
+                (self.b1_ptr, idx, unsafe { self.out1_ptr.add(idx) })
+            } else if idx < self.n1 + self.n2 {
+                let i = idx - self.n1;
+                (self.b2_ptr, i, unsafe { self.out2_ptr.add(i) })
+            } else {
+                let i = idx - self.n1 - self.n2;
+                (self.b3_ptr, i, unsafe { self.out3_ptr.add(i) })
+            };
+            let mut sum = 0.0f32;
+            for blk in 0..self.bpr {
+                let bo = (j * self.bpr + blk) * Q6K_BLOCK_BYTES;
+                let block = unsafe { std::slice::from_raw_parts(b_ptr.add(bo), Q6K_BLOCK_BYTES) };
+                let a_sl = unsafe {
+                    std::slice::from_raw_parts(
+                        self.af_ptr.add(blk * Q6K_BLOCK_SIZE),
+                        Q6K_BLOCK_SIZE,
+                    )
+                };
+                sum += if use_avx2 {
+                    unsafe { q6k_dot_block_avx2(block, a_sl) }
+                } else {
+                    q6k_dot_block(block, a_sl)
+                };
+            }
+            unsafe {
+                *o_ptr = sum;
+            }
+        }
+    }
+}
+
+// Fused gate+up job: two Q6K projections sharing one f32 activation, one dispatch.
+struct FusedQ6kPreq2Job {
+    b1_ptr: *const u8,
+    b2_ptr: *const u8,
+    out1_ptr: *mut f32,
+    out2_ptr: *mut f32,
+    n1: usize,
+    bpr: usize,
+    af_ptr: *const f32,
+}
+unsafe impl Sync for FusedQ6kPreq2Job {}
+impl crate::inference_pool::KernelJob for FusedQ6kPreq2Job {
+    #[inline(always)]
+    fn exec_range(&self, start: usize, end: usize) {
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_avx2 = false;
+        for idx in start..end {
+            let (b_ptr, j, o_ptr) = if idx < self.n1 {
+                (self.b1_ptr, idx, unsafe { self.out1_ptr.add(idx) })
+            } else {
+                let i = idx - self.n1;
+                (self.b2_ptr, i, unsafe { self.out2_ptr.add(i) })
+            };
+            let mut sum = 0.0f32;
+            for blk in 0..self.bpr {
+                let bo = (j * self.bpr + blk) * Q6K_BLOCK_BYTES;
+                let block = unsafe { std::slice::from_raw_parts(b_ptr.add(bo), Q6K_BLOCK_BYTES) };
+                let a_sl = unsafe {
+                    std::slice::from_raw_parts(
+                        self.af_ptr.add(blk * Q6K_BLOCK_SIZE),
+                        Q6K_BLOCK_SIZE,
+                    )
+                };
+                sum += if use_avx2 {
+                    unsafe { q6k_dot_block_avx2(block, a_sl) }
+                } else {
+                    q6k_dot_block(block, a_sl)
+                };
+            }
+            unsafe {
+                *o_ptr = sum;
+            }
+        }
+    }
+}
+
 pub use crate::{
     Dequantize, MatMulQ, QuantDtype, I2S_BLOCK_BYTES, I2S_BLOCK_SIZE, Q4K_BLOCK_BYTES,
     Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE, Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, Q6K_GROUPS,
@@ -4627,6 +4789,101 @@ impl CpuMatMulQ4KOpt {
             a_f32_ptr: a_f32.as_ptr(),
             k,
             row_f16_bytes: k * 2,
+        };
+        crate::inference_pool::par_run_job(total, &job);
+    }
+
+    /// Fuse three Q4K projections (Q+K+V) with the same pre-quantized activation, one dispatch.
+    /// Eliminates two pool wakes vs calling forward_q4k_preq three times.
+    pub fn fused_q4k_preq_3(
+        &self,
+        preq: &PreQuantizedActivations,
+        b1: &[u8],
+        out1: &mut [f32],
+        n1: usize,
+        b2: &[u8],
+        out2: &mut [f32],
+        n2: usize,
+        b3: &[u8],
+        out3: &mut [f32],
+        n3: usize,
+    ) {
+        let k = preq.k;
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let total = n1 + n2 + n3;
+        let job = FusedQ4kPreq3Job {
+            b1_ptr: b1.as_ptr(),
+            b2_ptr: b2.as_ptr(),
+            b3_ptr: b3.as_ptr(),
+            out1_ptr: out1.as_mut_ptr(),
+            out2_ptr: out2.as_mut_ptr(),
+            out3_ptr: out3.as_mut_ptr(),
+            n1,
+            n2,
+            blocks_per_row,
+            q8_ptr: preq.q8.as_ptr(),
+            scales_ptr: preq.scales.as_ptr(),
+            gsums_ptr: preq.group_sums_q4k.as_ptr(),
+        };
+        crate::inference_pool::par_run_job(total, &job);
+    }
+
+    /// Fuse three Q6K projections (Q+K+V) with the same f32 activation, one dispatch.
+    /// Eliminates two pool wakes vs calling forward_q6k_preq three times.
+    pub fn fused_q6k_preq_3(
+        &self,
+        a_f32: &[f32],
+        b1: &[u8],
+        out1: &mut [f32],
+        n1: usize,
+        b2: &[u8],
+        out2: &mut [f32],
+        n2: usize,
+        b3: &[u8],
+        out3: &mut [f32],
+        n3: usize,
+        k: usize,
+    ) {
+        let bpr = k / Q6K_BLOCK_SIZE;
+        let total = n1 + n2 + n3;
+        let job = FusedQ6kPreq3Job {
+            b1_ptr: b1.as_ptr(),
+            b2_ptr: b2.as_ptr(),
+            b3_ptr: b3.as_ptr(),
+            out1_ptr: out1.as_mut_ptr(),
+            out2_ptr: out2.as_mut_ptr(),
+            out3_ptr: out3.as_mut_ptr(),
+            n1,
+            n2,
+            bpr,
+            af_ptr: a_f32.as_ptr(),
+        };
+        crate::inference_pool::par_run_job(total, &job);
+    }
+
+    /// Fuse two Q6K projections (gate+up) with the same f32 activation, one dispatch.
+    /// Eliminates one pool wake vs calling forward_q6k_preq twice.
+    pub fn fused_q6k_preq_2(
+        &self,
+        a_f32: &[f32],
+        b1: &[u8],
+        out1: &mut [f32],
+        n1: usize,
+        b2: &[u8],
+        out2: &mut [f32],
+        n2: usize,
+        k: usize,
+    ) {
+        let bpr = k / Q6K_BLOCK_SIZE;
+        let total = n1 + n2;
+        let job = FusedQ6kPreq2Job {
+            b1_ptr: b1.as_ptr(),
+            b2_ptr: b2.as_ptr(),
+            out1_ptr: out1.as_mut_ptr(),
+            out2_ptr: out2.as_mut_ptr(),
+            n1,
+            bpr,
+            af_ptr: a_f32.as_ptr(),
         };
         crate::inference_pool::par_run_job(total, &job);
     }
