@@ -1053,9 +1053,10 @@ where
                     self.pipeline
                         .matmul_bt(&ffn_normed, up_w, &mut up, seq_len, inter, h)
                         .unwrap();
-                    for i in 0..gate.len() {
-                        let silu = gate[i] / (1.0 + (-gate[i]).exp());
-                        gate[i] = silu * up[i];
+                    {
+                        let n = gate.len();
+                        let gate_in = gate.to_vec();
+                        tempura_kernels::ggml::vec_llama::vec_swiglu_f32(&mut gate, &gate_in, &up[..n]);
                     }
                 }
                 crate::config::HiddenAct::SquaredRelu => {
@@ -3192,9 +3193,17 @@ where
                                 h,
                             );
                         }
-                        for i in 0..seq_len * inter {
-                            gate[i] =
-                                tempura_kernels::portable_math::portable_silu(gate[i]) * up[i];
+                        {
+                            // AVX2/AVX512 SiLU×gate: gate[i] = silu(gate[i]) * up[i]
+                            // Clone gate to avoid aliasing (gate is both x and y in vec_swiglu_f32).
+                            // 57KB clone is negligible vs 14336 scalar exp() calls.
+                            let n = seq_len * inter;
+                            let gate_in = gate[..n].to_vec();
+                            tempura_kernels::ggml::vec_llama::vec_swiglu_f32(
+                                &mut gate[..n],
+                                &gate_in,
+                                &up[..n],
+                            );
                         }
                         if det_rmsnorm.is_some() {
                             tempura_kernels::portable_math::q8_snap(&mut gate[..seq_len * inter]);
