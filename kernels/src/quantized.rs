@@ -4913,65 +4913,6 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
         }
 
-        // m=1 decode fast path: repack weights into BlockQ4Kx8 and run llama.cpp 8×8 GEMV.
-        // Uses maddubs (AVX2+F16C+FMA). Replaces both the VNNI pair kernel and Q4kGemvX8Job.
-        #[cfg(target_arch = "x86_64")]
-        if m == 1
-            && n % 8 == 0
-            && is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("f16c")
-            && is_x86_feature_detected!("fma")
-        {
-            use crate::ggml::blocks::{BlockQ4K, BlockQ4Kx8};
-            use crate::ggml::repack::repack_q4k_to_q4kx8;
-
-            // Thread-local cache: (weight_ptr, n, bpr) → Vec<BlockQ4Kx8>.
-            // Avoids re-packing every decode call once weights are stable.
-            thread_local! {
-                static Q4KX8_LLAMA_CACHE: std::cell::RefCell<(usize, usize, usize, Vec<BlockQ4Kx8>)> =
-                    const { std::cell::RefCell::new((0, 0, 0, Vec::new())) };
-            }
-
-            let src_ptr = b_quantized.as_ptr() as usize;
-
-            let packed_ready = Q4KX8_LLAMA_CACHE.with(|c| {
-                let cache = c.borrow();
-                cache.0 == src_ptr && cache.1 == n && cache.2 == blocks_per_row
-            });
-
-            if !packed_ready {
-                let src_q4k = unsafe {
-                    std::slice::from_raw_parts(
-                        b_quantized.as_ptr() as *const BlockQ4K,
-                        n * blocks_per_row,
-                    )
-                };
-                let repacked = repack_q4k_to_q4kx8(src_q4k, n, blocks_per_row);
-                Q4KX8_LLAMA_CACHE.with(|c| {
-                    *c.borrow_mut() = (src_ptr, n, blocks_per_row, repacked);
-                });
-            }
-
-            Q4KX8_LLAMA_CACHE.with(|c| {
-                let cache = c.borrow();
-                let packed = &cache.3;
-                let packed_ptr = packed.as_ptr() as *const u8;
-                let q8k_ptr = q8k_all.as_ptr() as *const u8;
-                let out_ptr = output.as_mut_ptr();
-                unsafe {
-                    crate::ggml::repack_llama::ggml_gemv_q4_k_8x8_q8_k(
-                        k,
-                        out_ptr,
-                        packed_ptr,
-                        q8k_ptr,
-                        1,
-                        n,
-                    );
-                }
-            });
-            return Ok(());
-        }
-
         // m>1 prefill fast path: repack activations into Q8Kx4 and run llama.cpp 4×8 GEMM.
         // Requires m divisible by 4 and n divisible by 8. Falls through to Q4kMnBlockJob
         // if AVX2/F16C/FMA is unavailable or dimensions are not aligned.

@@ -14,18 +14,12 @@ vstd = { version = "0.0.0-2026-06-14-0213", default-features = false }
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(verus_keep_ghost)', 'cfg(verus_keep_ghost_body)'] }
 
-# Fat LTO across all crates + single codegen unit to give LLVM the widest
-# cross-function optimisation scope.  Combined with target-cpu=native and the
-# explicit AVX-512 feature flags in .cargo/config.toml, this brings
-# ggml_gemv_q4_k_8x8_q8_k from 426 instructions down to 322 — 6% below GCC
-# -O3 -march=native at 344.
+# scripts/build-pgo.sh implements a PGO workflow.
+# LTO fat causes SIGSEGV with unsafe SIMD code due to aliasing assumptions.
+# Use thin LTO instead (intra-crate only, safer for unsafe).
 [profile.release]
-lto = "fat"
-codegen-units = 1
 opt-level = 3
 
-# Inherits release settings; used by scripts/build-pgo.sh for the optimised
-# pass so that PGO can stack on top of LTO without a profile key collision.
 [profile.release-pgo]
 inherits = "release"
 

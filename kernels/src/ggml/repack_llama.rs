@@ -321,35 +321,82 @@ pub unsafe fn ggml_gemv_q4_k_8x8_q8_k(
                     lhs_vec_10 = _mm256_permute2f128_si256(lhs_vec_10, lhs_vec_10, 0);
                     lhs_vec_11 = _mm256_permute2f128_si256(lhs_vec_11, lhs_vec_11, 0);
 
+                    // Interleave Q4K weight columns using explicit inline assembly.
+                    //
+                    // The intrinsic patterns blend_epi32(A, shuffle(B,177), 0xaa) and
+                    // shuffle(0x88)+unpacklo_epi32 are both recognized by LLVM's shuffle-combining
+                    // pass as two-source permutations and compiled to vpermt2d (AVX-512, 3-cycle
+                    // latency). Inline assembly prevents this transformation, emitting instead:
+                    //   vpshufd (1-cycle) + vpunpckldq (1-cycle)
+                    // which is the same sequence GCC -O3 generates.
+                    //
+                    // Correctness: vpshufd(A, 0x88) = [A0,A2,A0,A2, A4,A6,A4,A6]
+                    //              vpunpckldq(a_even, b_even) = [A0,B0,A2,B2, A4,B4,A6,B6]
+                    //              vpshufd(A, 0xdd) = [A1,A3,A1,A3, A5,A7,A5,A7]
+                    //              vpunpckldq(a_odd, b_odd) = [A1,B1,A3,B3, A5,B5,A7,B7]
+                    // All four are equivalent to the corresponding blend+shuffle results.
+                    macro_rules! interleave_even {
+                        ($a:expr, $b:expr) => {{
+                            let out: __m256i;
+                            core::arch::asm!(
+                                "vpshufd {tmp}, {a}, 0x88",
+                                "vpshufd {out}, {b}, 0x88",
+                                "vpunpckldq {out}, {tmp}, {out}",
+                                a   = in(ymm_reg)  $a,
+                                b   = in(ymm_reg)  $b,
+                                tmp = out(ymm_reg) _,
+                                out = out(ymm_reg) out,
+                                options(nostack, pure, nomem),
+                            );
+                            out
+                        }};
+                    }
+                    macro_rules! interleave_odd {
+                        ($a:expr, $b:expr) => {{
+                            let out: __m256i;
+                            core::arch::asm!(
+                                "vpshufd {tmp}, {a}, 0xdd",
+                                "vpshufd {out}, {b}, 0xdd",
+                                "vpunpckldq {out}, {tmp}, {out}",
+                                a   = in(ymm_reg)  $a,
+                                b   = in(ymm_reg)  $b,
+                                tmp = out(ymm_reg) _,
+                                out = out(ymm_reg) out,
+                                options(nostack, pure, nomem),
+                            );
+                            out
+                        }};
+                    }
+
                     // Dot products for sub-block 0
                     let mut iacc_0 = _mm256_setzero_si256();
 
                     iacc_0 = _mm256_add_epi16(iacc_0, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(rhs_vec_0123_00, _mm256_shuffle_epi32(rhs_vec_4567_00, 177), 170),
+                        interleave_even!(rhs_vec_0123_00, rhs_vec_4567_00),
                         _mm256_shuffle_epi32(lhs_vec_00, 0)));
                     iacc_0 = _mm256_add_epi16(iacc_0, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_00, 177), rhs_vec_4567_00, 170),
+                        interleave_odd!(rhs_vec_0123_00, rhs_vec_4567_00),
                         _mm256_shuffle_epi32(lhs_vec_00, 85)));
 
                     iacc_0 = _mm256_add_epi16(iacc_0, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(rhs_vec_0123_01, _mm256_shuffle_epi32(rhs_vec_4567_01, 177), 170),
+                        interleave_even!(rhs_vec_0123_01, rhs_vec_4567_01),
                         _mm256_shuffle_epi32(lhs_vec_00, 170)));
                     iacc_0 = _mm256_add_epi16(iacc_0, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_01, 177), rhs_vec_4567_01, 170),
+                        interleave_odd!(rhs_vec_0123_01, rhs_vec_4567_01),
                         _mm256_shuffle_epi32(lhs_vec_00, 255)));
 
                     iacc_0 = _mm256_add_epi16(iacc_0, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(rhs_vec_0123_02, _mm256_shuffle_epi32(rhs_vec_4567_02, 177), 170),
+                        interleave_even!(rhs_vec_0123_02, rhs_vec_4567_02),
                         _mm256_shuffle_epi32(lhs_vec_01, 0)));
                     iacc_0 = _mm256_add_epi16(iacc_0, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_02, 177), rhs_vec_4567_02, 170),
+                        interleave_odd!(rhs_vec_0123_02, rhs_vec_4567_02),
                         _mm256_shuffle_epi32(lhs_vec_01, 85)));
 
                     iacc_0 = _mm256_add_epi16(iacc_0, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(rhs_vec_0123_03, _mm256_shuffle_epi32(rhs_vec_4567_03, 177), 170),
+                        interleave_even!(rhs_vec_0123_03, rhs_vec_4567_03),
                         _mm256_shuffle_epi32(lhs_vec_01, 170)));
                     iacc_0 = _mm256_add_epi16(iacc_0, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_03, 177), rhs_vec_4567_03, 170),
+                        interleave_odd!(rhs_vec_0123_03, rhs_vec_4567_03),
                         _mm256_shuffle_epi32(lhs_vec_01, 255)));
 
                     iacc_0 = _mm256_madd_epi16(iacc_0, scales_0);
@@ -358,31 +405,31 @@ pub unsafe fn ggml_gemv_q4_k_8x8_q8_k(
                     let mut iacc_1 = _mm256_setzero_si256();
 
                     iacc_1 = _mm256_add_epi16(iacc_1, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(rhs_vec_0123_10, _mm256_shuffle_epi32(rhs_vec_4567_10, 177), 170),
+                        interleave_even!(rhs_vec_0123_10, rhs_vec_4567_10),
                         _mm256_shuffle_epi32(lhs_vec_10, 0)));
                     iacc_1 = _mm256_add_epi16(iacc_1, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_10, 177), rhs_vec_4567_10, 170),
+                        interleave_odd!(rhs_vec_0123_10, rhs_vec_4567_10),
                         _mm256_shuffle_epi32(lhs_vec_10, 85)));
 
                     iacc_1 = _mm256_add_epi16(iacc_1, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(rhs_vec_0123_11, _mm256_shuffle_epi32(rhs_vec_4567_11, 177), 170),
+                        interleave_even!(rhs_vec_0123_11, rhs_vec_4567_11),
                         _mm256_shuffle_epi32(lhs_vec_10, 170)));
                     iacc_1 = _mm256_add_epi16(iacc_1, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_11, 177), rhs_vec_4567_11, 170),
+                        interleave_odd!(rhs_vec_0123_11, rhs_vec_4567_11),
                         _mm256_shuffle_epi32(lhs_vec_10, 255)));
 
                     iacc_1 = _mm256_add_epi16(iacc_1, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(rhs_vec_0123_12, _mm256_shuffle_epi32(rhs_vec_4567_12, 177), 170),
+                        interleave_even!(rhs_vec_0123_12, rhs_vec_4567_12),
                         _mm256_shuffle_epi32(lhs_vec_11, 0)));
                     iacc_1 = _mm256_add_epi16(iacc_1, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_12, 177), rhs_vec_4567_12, 170),
+                        interleave_odd!(rhs_vec_0123_12, rhs_vec_4567_12),
                         _mm256_shuffle_epi32(lhs_vec_11, 85)));
 
                     iacc_1 = _mm256_add_epi16(iacc_1, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(rhs_vec_0123_13, _mm256_shuffle_epi32(rhs_vec_4567_13, 177), 170),
+                        interleave_even!(rhs_vec_0123_13, rhs_vec_4567_13),
                         _mm256_shuffle_epi32(lhs_vec_11, 170)));
                     iacc_1 = _mm256_add_epi16(iacc_1, _mm256_maddubs_epi16(
-                        _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_13, 177), rhs_vec_4567_13, 170),
+                        interleave_odd!(rhs_vec_0123_13, rhs_vec_4567_13),
                         _mm256_shuffle_epi32(lhs_vec_11, 255)));
 
                     iacc_1 = _mm256_madd_epi16(iacc_1, scales_1);
