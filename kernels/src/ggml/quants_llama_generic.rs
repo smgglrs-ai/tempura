@@ -3,9 +3,8 @@
 //! Algorithm identical to llama.cpp; no SIMD, no optimization.
 
 use super::blocks::*;
-use super::helpers::f16_to_f32;
+use super::helpers::{f16_to_f32, e8m0_to_f32_half, ue4m3_to_f32};
 use super::iq_tables::*;
-use super::dequantize::ue4m3_to_f32_pub;
 
 const QK_K: usize = 256;
 const QK8_0: usize = 32;
@@ -16,18 +15,6 @@ const QK1_0: usize = 128;
 const QK_MXFP4: usize = 32;
 const QK_NVFP4: usize = 64;
 const QK_NVFP4_SUB: usize = 16;
-
-// GGML_E8M0_TO_FP32_HALF: convert E8M0 byte to f32, then divide by 2.
-// Equal to ggml_e8m0_to_fp32_half in ggml-impl.h.
-#[inline(always)]
-fn e8m0_to_f32_half(x: u8) -> f32 {
-    let bits: u32 = if x < 2 {
-        0x00200000u32 << x
-    } else {
-        (x as u32 - 1) << 23
-    };
-    f32::from_bits(bits)
-}
 
 pub fn ggml_vec_dot_q1_0_q8_0_generic(n: usize, x: &[BlockQ1_0], y: &[BlockQ8_0]) -> f32 {
     let qk = QK1_0;
@@ -184,7 +171,7 @@ pub fn ggml_vec_dot_nvfp4_q8_0_generic(n: usize, x: &[BlockNvfp4], y: &[BlockQ8_
 
     for ib in 0..nb {
         for s_idx in 0..4usize {
-            let d = ue4m3_to_f32_pub(x[ib].d[s_idx]);
+            let d = ue4m3_to_f32(x[ib].d[s_idx]);
             let q8_block = s_idx / 2;
             let q8_off = (s_idx % 2) * QK_NVFP4_SUB;
             let dy = f16_to_f32(y[2 * ib + q8_block].d);
