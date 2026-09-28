@@ -1,32 +1,19 @@
+/// Convert f16 bits to f32. Uses F16C hardware instruction when compiled with
+/// target-feature=+f16c (enabled via .cargo/config.toml target-cpu=native),
+/// which matches llama.cpp's vcvtph2ps — 1 instruction vs 6+ for software.
+#[cfg(all(target_arch = "x86_64", target_feature = "f16c"))]
+#[inline(always)]
 pub fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let mant = (bits & 0x3ff) as u32;
-
-    if exp == 0 {
-        if mant == 0 {
-            return f32::from_bits(sign << 31);
-        }
-        // denormalized
-        let mut e = 0u32;
-        let mut m = mant;
-        while (m & 0x400) == 0 {
-            m <<= 1;
-            e += 1;
-        }
-        let f32_exp = (127u32 - 15 + 1).wrapping_sub(e);
-        let f32_mant = (m & 0x3ff) << 13;
-        return f32::from_bits((sign << 31) | (f32_exp << 23) | f32_mant);
+    unsafe {
+        use std::arch::x86_64::{_mm_cvtph_ps, _mm_cvtss_f32, _mm_set1_epi16};
+        _mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16(bits as i16)))
     }
+}
 
-    if exp == 31 {
-        let f32_mant = mant << 13;
-        return f32::from_bits((sign << 31) | (0xff << 23) | f32_mant);
-    }
-
-    let f32_exp = exp + (127 - 15);
-    let f32_mant = mant << 13;
-    f32::from_bits((sign << 31) | (f32_exp << 23) | f32_mant)
+#[cfg(not(all(target_arch = "x86_64", target_feature = "f16c")))]
+#[inline(always)]
+pub fn f16_to_f32(bits: u16) -> f32 {
+    half::f16::from_bits(bits).to_f32()
 }
 
 pub fn f32_to_f16(val: f32) -> u16 {
