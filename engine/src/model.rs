@@ -1593,7 +1593,252 @@ where
             );
         };
 
+        let qmm_indexed_inner = |preq: Option<&PreQuantizedActivations>,
+                                 a_f32: &[f32],
+                                 w: &crate::weights::PreIndexedWeight<'_>,
+                                 out: &mut [f32],
+                                 m: usize,
+                                 n: usize,
+                                 k: usize| {
+            use crate::weights::PreIndexedWeight;
+            match w {
+                PreIndexedWeight::Typed(dtype, bytes) => {
+                    use tempura_kernels::ggml::GgmlType;
+                    if m == 1 {
+                        if let Some(pq) = preq {
+                            if *dtype == GgmlType::Q4K {
+                                q4k.forward_q4k_preq(pq, a_f32, bytes, out, n).unwrap();
+                                return;
+                            }
+                            if *dtype == GgmlType::Q6K {
+                                q4k.forward_q6k_preq(pq, a_f32, bytes, out, n).unwrap();
+                                return;
+                            }
+                        }
+                    }
+                    match dtype {
+                        GgmlType::Q4K => {
+                            q4k.forward_b_transposed_q4k(a_f32, bytes, out, m, n, k).unwrap();
+                        }
+                        GgmlType::Q6K => {
+                            q4k.forward_b_transposed_q6k(a_f32, bytes, out, m, n, k).unwrap();
+                        }
+                        GgmlType::TQ2_0 => {
+                            q4k.forward_b_transposed_tq2(a_f32, bytes, out, m, n, k).unwrap();
+                        }
+                        GgmlType::TQ1_0 => {
+                            q4k.forward_b_transposed_i2s(a_f32, bytes, out, m, n, k).unwrap();
+                        }
+                        _ => {
+                            tempura_kernels::ggml::mul_mat::mul_mat_q(
+                                *dtype, bytes, a_f32, out, m, n, k,
+                            );
+                        }
+                    }
+                }
+                PreIndexedWeight::Tl2 { tensor, corrections } => {
+                    use tempura_kernels::tl2::tl2_forward_batched;
+                    if !tl2_forward_batched(a_f32, &tensor.data, tensor.scale, out, n, k, m) {
+                        out.fill(0.0);
+                    }
+                    if let Some(corr) = corrections {
+                        for row in 0..m {
+                            for j in 0..n.min(corr.len()) {
+                                out[row * n + j] *= corr[j];
+                            }
+                        }
+                    }
+                }
+                PreIndexedWeight::I2s(bytes) => {
+                    if m == 1 {
+                        if let Some(pq) = preq {
+                            q4k.forward_i2s_preq(
+                                &pq.i2s_q8, pq.i2s_scale, pq.i2s_sum, bytes, out, n, k,
+                            )
+                            .unwrap();
+                            return;
+                        }
+                    }
+                    q4k.forward_b_transposed_i2s(a_f32, bytes, out, m, n, k).unwrap();
+                }
+                PreIndexedWeight::Q2Tiled { q2 } => {
+                    if let Some(w2) = q2 {
+                        for row in 0..m {
+                            let act = &a_f32[row * k..(row + 1) * k];
+                            let nb = k / tempura_kernels::quantized::Q8_0_BLOCK_SIZE;
+                            let mut q8_buf =
+                                vec![0u8; nb * tempura_kernels::quantized::Q8_0_BLOCK_BYTES];
+                            tempura_kernels::quantized::quantize_row_q8_0(act, &mut q8_buf);
+                            tempura_kernels::quantized::q2_0_gemv_q8(
+                                w2,
+                                &q8_buf,
+                                &mut out[row * n..(row + 1) * n],
+                                n,
+                                k,
+                            );
+                        }
+                    }
+                }
+                PreIndexedWeight::Q2x4 { x4, q2 } => {
+                    if m == 1 {
+                        if let Some(pq) = preq {
+                            tempura_kernels::quantized::q2x4_gemv_preq(x4, pq, out, n, k);
+                            return;
+                        }
+                    }
+                    if let Some(w2) = q2 {
+                        for row in 0..m {
+                            tempura_kernels::quantized::q2_0_gemv(
+                                w2,
+                                &a_f32[row * k..(row + 1) * k],
+                                &mut out[row * n..(row + 1) * n],
+                                n,
+                                k,
+                            );
+                        }
+                    }
+                }
+                PreIndexedWeight::Q2I2s { i2s, scales, q2 } => {
+                    if m == 1 {
+                        if let Some(pq) = preq {
+                            tempura_kernels::quantized::q2_0_gemv_i2s(
+                                i2s, scales, pq, out, n, k,
+                            );
+                            return;
+                        }
+                    }
+                    if let Some(w2) = q2 {
+                        for row in 0..m {
+                            tempura_kernels::quantized::q2_0_gemv(
+                                w2,
+                                &a_f32[row * k..(row + 1) * k],
+                                &mut out[row * n..(row + 1) * n],
+                                n,
+                                k,
+                            );
+                        }
+                    }
+                }
+                PreIndexedWeight::Q2(w2) => {
+                    for row in 0..m {
+                        let act = &a_f32[row * k..(row + 1) * k];
+                        let nb = k / tempura_kernels::quantized::Q8_0_BLOCK_SIZE;
+                        let mut q8_buf =
+                            vec![0u8; nb * tempura_kernels::quantized::Q8_0_BLOCK_BYTES];
+                        tempura_kernels::quantized::quantize_row_q8_0(act, &mut q8_buf);
+                        tempura_kernels::quantized::q2_0_gemv_q8(
+                            w2,
+                            &q8_buf,
+                            &mut out[row * n..(row + 1) * n],
+                            n,
+                            k,
+                        );
+                    }
+                }
+                PreIndexedWeight::F16(f16_bytes) => {
+                    if m == 1 {
+                        let worker = F16GemvWorker {
+                            f16_ptr: f16_bytes.as_ptr(),
+                            a_ptr: a_f32.as_ptr(),
+                            out_ptr: out.as_mut_ptr(),
+                            k,
+                            row_f16_bytes: k * 2,
+                        };
+                        let gemv = |start: usize, end: usize| {
+                            unsafe { worker.run_range(start, end) };
+                        };
+                        tempura_kernels::inference_pool::get().run(n, &gemv);
+                    } else {
+                        let n_elems = f16_bytes.len() / 2;
+                        let f32_data: Vec<f32> = (0..n_elems)
+                            .map(|i| {
+                                let bits = u16::from_le_bytes([
+                                    f16_bytes[i * 2],
+                                    f16_bytes[i * 2 + 1],
+                                ]);
+                                tempura_kernels::ggml::helpers::f16_to_f32(bits)
+                            })
+                            .collect();
+                        self.pipeline.matmul_bt(a_f32, &f32_data, out, m, n, k).unwrap();
+                    }
+                }
+                PreIndexedWeight::Q4k(w2) => {
+                    if m == 1 {
+                        if let Some(pq) = preq {
+                            q4k.forward_q4k_preq(pq, a_f32, w2, out, n).unwrap();
+                            return;
+                        }
+                    }
+                    q4k.forward_b_transposed_q4k(a_f32, w2, out, m, n, k).unwrap();
+                }
+                PreIndexedWeight::Q6k(w2) => {
+                    if m == 1 {
+                        if let Some(pq) = preq {
+                            q4k.forward_q6k_preq(pq, a_f32, w2, out, n).unwrap();
+                            return;
+                        }
+                    }
+                    q4k.forward_b_transposed_q6k(a_f32, w2, out, m, n, k).unwrap();
+                }
+                PreIndexedWeight::F32(w2) => {
+                    self.pipeline.matmul_bt(a_f32, w2, out, m, n, k).unwrap();
+                }
+            }
+        };
+
+        let qmm_indexed = |preq: Option<&PreQuantizedActivations>,
+                           a_f32: &[f32],
+                           w: &crate::weights::PreIndexedWeight<'_>,
+                           out: &mut [f32],
+                           m: usize,
+                           n: usize,
+                           k: usize| {
+            let t = std::time::Instant::now();
+            qmm_indexed_inner(preq, a_f32, w, out, m, n, k);
+            qmm_nanos.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        };
+
         let layer_names = &self.layer_weight_names;
+
+        struct LayerQ4KWeights<'a> {
+            input_ln: Option<&'a [f32]>,
+            post_ln: Option<&'a [f32]>,
+            q_proj: Option<crate::weights::PreIndexedWeight<'a>>,
+            k_proj: Option<crate::weights::PreIndexedWeight<'a>>,
+            v_proj: Option<crate::weights::PreIndexedWeight<'a>>,
+            o_proj: Option<crate::weights::PreIndexedWeight<'a>>,
+            gate_proj: Option<crate::weights::PreIndexedWeight<'a>>,
+            up_proj: Option<crate::weights::PreIndexedWeight<'a>>,
+            down_proj: Option<crate::weights::PreIndexedWeight<'a>>,
+            q_norm: Option<&'a [f32]>,
+            k_norm: Option<&'a [f32]>,
+            attn_sub_norm: Option<&'a [f32]>,
+            ffn_sub_norm: Option<&'a [f32]>,
+        }
+
+        let indexed_layers: Vec<LayerQ4KWeights<'_>> = (0..cfg.num_layers)
+            .map(|l| {
+                let n = &layer_names[l];
+                LayerQ4KWeights {
+                    input_ln: qweights.get_f32(&n.0),
+                    post_ln: qweights.get_f32(&n.1),
+                    q_proj: qweights.resolve_weight(&n.2),
+                    k_proj: qweights.resolve_weight(&n.3),
+                    v_proj: qweights.resolve_weight(&n.4),
+                    o_proj: qweights.resolve_weight(&n.5),
+                    q_norm: qweights.get_f32(&n.6),
+                    k_norm: qweights.get_f32(&n.7),
+                    gate_proj: qweights.resolve_weight(&n.8),
+                    up_proj: qweights.resolve_weight(&n.9),
+                    down_proj: qweights.resolve_weight(&n.10),
+                    attn_sub_norm: qweights.get_f32(&n.11),
+                    ffn_sub_norm: qweights.get_f32(&n.12),
+                }
+            })
+            .collect();
 
         let cache_layer_map_q = cfg.cache_layer_map();
         let mut deltanet_layer_idx = 0usize;
@@ -1607,18 +1852,18 @@ where
 
             let (
                 ref input_ln_name,
-                ref post_ln_name,
-                ref q_w_name,
-                ref k_w_name,
-                ref v_w_name,
-                ref o_w_name,
-                ref q_norm_name,
-                ref k_norm_name,
-                ref gate_w_name,
-                ref up_w_name,
-                ref down_w_name,
-                ref attn_sub_norm_name,
-                ref ffn_sub_norm_name,
+                ref _post_ln_name,
+                ref _q_w_name,
+                ref _k_w_name,
+                ref _v_w_name,
+                ref _o_w_name,
+                ref _q_norm_name,
+                ref _k_norm_name,
+                ref _gate_w_name,
+                ref _up_w_name,
+                ref _down_w_name,
+                ref _attn_sub_norm_name,
+                ref _ffn_sub_norm_name,
             ) = layer_names[layer];
 
             if layer == 0 && std::env::var("TEMPURA_TRACE_EMBED").is_ok() {
@@ -2044,7 +2289,7 @@ where
 
                 // Fall through to FFN below
             } else {
-                let input_ln_w = qweights.get_f32(input_ln_name).unwrap();
+                let input_ln_w = indexed_layers[layer].input_ln.unwrap();
                 if let Some(ref ln) = layernorm {
                     normed.copy_from_slice(&hidden);
                     let input_ln_b =
@@ -2102,17 +2347,22 @@ where
                 let no_qgate = std::env::var("TEMPURA_NO_QGATE").is_ok();
                 let _no_qknorm = std::env::var("TEMPURA_NO_QKNORM").is_ok();
                 // Detect Q+gate fused projection (Qwen3.5 softmax layers)
-                let q_weight_cols = qweights
-                    .get_q2(q_w_name)
-                    .map(|w| w.len() / ((h / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES))
-                    .or_else(|| {
-                        qweights.get_q4k(q_w_name).map(|w| {
-                            let row_bytes = (h / 256) * 144; // Q4K block
-                            w.len().checked_div(row_bytes).unwrap_or(q_dim)
-                        })
-                    })
-                    .or_else(|| qweights.get_f32(q_w_name).map(|w| w.len() / h))
-                    .unwrap_or(q_dim);
+                let q_weight_cols = {
+                    use crate::weights::PreIndexedWeight;
+                    let iw = indexed_layers[layer].q_proj.as_ref();
+                    match iw {
+                        Some(PreIndexedWeight::Q2(w)) | Some(PreIndexedWeight::Q2Tiled { q2: Some(w) }) => {
+                            w.len() / ((h / Q2_0_BLOCK_SIZE) * Q2_0_BLOCK_BYTES)
+                        }
+                        Some(w) if w.as_q4k().is_some() => {
+                            let bytes = w.as_q4k().unwrap();
+                            let row_bytes = (h / 256) * 144;
+                            bytes.len().checked_div(row_bytes).unwrap_or(q_dim)
+                        }
+                        Some(PreIndexedWeight::F32(w)) => w.len() / h,
+                        _ => q_dim,
+                    }
+                };
                 let has_q_gate = q_weight_cols > q_dim && !no_qgate;
                 let actual_q_cols = if has_q_gate { q_weight_cols } else { q_dim };
 
@@ -2137,10 +2387,10 @@ where
                     if has_q_gate {
                         // Q+gate fused projection (Qwen3.5 attention layers):
                         // must use q_gate_buf to capture both Q and gate values
-                        qmm(
+                        qmm_indexed(
                             normed_preq.as_ref(),
                             &normed,
-                            q_w_name,
+                            indexed_layers[layer].q_proj.as_ref().unwrap(),
                             &mut q_gate_buf[..actual_q_cols],
                             1,
                             actual_q_cols,
@@ -2151,19 +2401,19 @@ where
                             q[hh * head_dim..(hh + 1) * head_dim]
                                 .copy_from_slice(&q_gate_buf[src..src + head_dim]);
                         }
-                        qmm(
+                        qmm_indexed(
                             normed_preq.as_ref(),
                             &normed,
-                            k_w_name,
+                            indexed_layers[layer].k_proj.as_ref().unwrap(),
                             &mut k[..kv_dim],
                             1,
                             kv_dim,
                             h,
                         );
-                        qmm(
+                        qmm_indexed(
                             normed_preq.as_ref(),
                             &normed,
-                            v_w_name,
+                            indexed_layers[layer].v_proj.as_ref().unwrap(),
                             &mut v[..kv_dim],
                             1,
                             kv_dim,
@@ -2183,9 +2433,9 @@ where
                         }
                     } else if let (Some(pq), Some(qw), Some(kw), Some(vw)) = (
                         normed_preq.as_ref(),
-                        qweights.get_i2s(q_w_name),
-                        qweights.get_i2s(k_w_name),
-                        qweights.get_i2s(v_w_name),
+                        indexed_layers[layer].q_proj.as_ref().and_then(|w| w.as_i2s()),
+                        indexed_layers[layer].k_proj.as_ref().and_then(|w| w.as_i2s()),
+                        indexed_layers[layer].v_proj.as_ref().and_then(|w| w.as_i2s()),
                     ) {
                         q4k.forward_i2s_preq(
                             &pq.i2s_q8,
@@ -2219,9 +2469,9 @@ where
                         .unwrap();
                     } else if let (Some(pq), Some(qw), Some(kw), Some(vf16)) = (
                         normed_preq.as_ref(),
-                        qweights.get_q4k(q_w_name),
-                        qweights.get_q4k(k_w_name),
-                        qweights.get_f16(v_w_name),
+                        indexed_layers[layer].q_proj.as_ref().and_then(|w| w.as_q4k()),
+                        indexed_layers[layer].k_proj.as_ref().and_then(|w| w.as_q4k()),
+                        indexed_layers[layer].v_proj.as_ref().and_then(|w| w.as_f16()),
                     ) {
                         // Q+K (Q4K) + V (F16) in a single Rayon region — eliminates 1 barrier
                         q4k.fused_q4k_2_f16_1_preq(
@@ -2240,8 +2490,8 @@ where
                         );
                     } else if let (Some(pq), Some(qw), Some(kw)) = (
                         normed_preq.as_ref(),
-                        qweights.get_q4k(q_w_name),
-                        qweights.get_q4k(k_w_name),
+                        indexed_layers[layer].q_proj.as_ref().and_then(|w| w.as_q4k()),
+                        indexed_layers[layer].k_proj.as_ref().and_then(|w| w.as_q4k()),
                     ) {
                         q4k.fused_q4k_preq_2(
                             pq,
@@ -2252,38 +2502,38 @@ where
                             &mut k[..kv_dim],
                             kv_dim,
                         );
-                        qmm(
+                        qmm_indexed(
                             normed_preq.as_ref(),
                             &normed,
-                            v_w_name,
+                            indexed_layers[layer].v_proj.as_ref().unwrap(),
                             &mut v[..kv_dim],
                             1,
                             kv_dim,
                             h,
                         );
                     } else {
-                        qmm(
+                        qmm_indexed(
                             normed_preq.as_ref(),
                             &normed,
-                            q_w_name,
+                            indexed_layers[layer].q_proj.as_ref().unwrap(),
                             &mut q[..q_dim],
                             1,
                             q_dim,
                             h,
                         );
-                        qmm(
+                        qmm_indexed(
                             normed_preq.as_ref(),
                             &normed,
-                            k_w_name,
+                            indexed_layers[layer].k_proj.as_ref().unwrap(),
                             &mut k[..kv_dim],
                             1,
                             kv_dim,
                             h,
                         );
-                        qmm(
+                        qmm_indexed(
                             normed_preq.as_ref(),
                             &normed,
-                            v_w_name,
+                            indexed_layers[layer].v_proj.as_ref().unwrap(),
                             &mut v[..kv_dim],
                             1,
                             kv_dim,
@@ -2299,8 +2549,8 @@ where
                     };
                     if let (Some(ref lut), Some(tl2q), Some(tl2k)) = (
                         &qkv_lut,
-                        qweights.get_tl2(q_w_name),
-                        qweights.get_tl2(k_w_name),
+                        indexed_layers[layer].q_proj.as_ref().and_then(|w| w.as_tl2()),
+                        indexed_layers[layer].k_proj.as_ref().and_then(|w| w.as_tl2()),
                     ) {
                         use tempura_kernels::tl2::tl2_gemm_with_lut;
                         tl2_gemm_with_lut(
@@ -2321,10 +2571,10 @@ where
                         );
                     } else if has_q_gate {
                         q_gate_buf.resize(seq_len * actual_q_cols, 0.0);
-                        qmm(
+                        qmm_indexed(
                             normed_preq.as_ref(),
                             &normed,
-                            q_w_name,
+                            indexed_layers[layer].q_proj.as_ref().unwrap(),
                             &mut q_gate_buf[..seq_len * actual_q_cols],
                             seq_len,
                             actual_q_cols,
@@ -2337,36 +2587,39 @@ where
                                     .copy_from_slice(&q_gate_buf[src..src + head_dim]);
                             }
                         }
-                        qmm(
+                        qmm_indexed(
                             normed_preq.as_ref(),
                             &normed,
-                            k_w_name,
+                            indexed_layers[layer].k_proj.as_ref().unwrap(),
                             &mut k[..seq_len * kv_dim],
                             seq_len,
                             kv_dim,
                             h,
                         );
                     } else {
-                        qmm(
+                        qmm_indexed(
                             normed_preq.as_ref(),
                             &normed,
-                            q_w_name,
+                            indexed_layers[layer].q_proj.as_ref().unwrap(),
                             &mut q[..seq_len * q_dim],
                             seq_len,
                             q_dim,
                             h,
                         );
-                        qmm(
+                        qmm_indexed(
                             normed_preq.as_ref(),
                             &normed,
-                            k_w_name,
+                            indexed_layers[layer].k_proj.as_ref().unwrap(),
                             &mut k[..seq_len * kv_dim],
                             seq_len,
                             kv_dim,
                             h,
                         );
                     }
-                    if let (Some(ref lut), Some(tl2v)) = (&qkv_lut, qweights.get_tl2(v_w_name)) {
+                    if let (Some(ref lut), Some(tl2v)) = (
+                        &qkv_lut,
+                        indexed_layers[layer].v_proj.as_ref().and_then(|w| w.as_tl2()),
+                    ) {
                         use tempura_kernels::tl2::tl2_gemm_with_lut;
                         tl2_gemm_with_lut(
                             lut,
@@ -2376,11 +2629,17 @@ where
                             kv_dim,
                             h,
                         );
-                    } else if seq_len > 1 || qweights.get_i2s(v_w_name).is_none() {
-                        qmm(
+                    } else if seq_len > 1
+                        || indexed_layers[layer]
+                            .v_proj
+                            .as_ref()
+                            .and_then(|w| w.as_i2s())
+                            .is_none()
+                    {
+                        qmm_indexed(
                             normed_preq.as_ref(),
                             &normed,
-                            v_w_name,
+                            indexed_layers[layer].v_proj.as_ref().unwrap(),
                             &mut v[..seq_len * kv_dim],
                             seq_len,
                             kv_dim,
@@ -2409,7 +2668,7 @@ where
 
                 if cfg.use_qk_norm {
                     if let (Some(q_norm_w), Some(k_norm_w)) =
-                        (qweights.get_f32(q_norm_name), qweights.get_f32(k_norm_name))
+                        (indexed_layers[layer].q_norm, indexed_layers[layer].k_norm)
                     {
                         apply_head_rmsnorm(
                             &mut q,
@@ -2668,7 +2927,7 @@ where
                     }
                 }
 
-                if let Some(sub_norm_w) = qweights.get_f32(attn_sub_norm_name) {
+                if let Some(sub_norm_w) = indexed_layers[layer].attn_sub_norm {
                     if let Some(ref drn) = det_rmsnorm {
                         drn.forward(
                             &mut attn_out[..seq_len * q_dim],
@@ -2700,10 +2959,10 @@ where
                 } else {
                     None
                 };
-                qmm(
+                qmm_indexed(
                     attn_preq.as_ref(),
                     &attn_out[..seq_len * q_dim],
-                    o_w_name,
+                    indexed_layers[layer].o_proj.as_ref().unwrap(),
                     &mut o_proj[..seq_len * h],
                     seq_len,
                     h,
@@ -2741,7 +3000,7 @@ where
                 };
                 (&normed as &[f32], preq)
             } else {
-                let post_ln_w = qweights.get_f32(post_ln_name).unwrap();
+                let post_ln_w = indexed_layers[layer].post_ln.unwrap();
                 if let Some(ref ln) = layernorm {
                     normed2.copy_from_slice(&hidden);
                     let post_ln_b = qweights.get_f32(&format!(
@@ -2837,19 +3096,19 @@ where
                     // Fall through to dense FFN below
                     gate.fill(0.0);
                     up.fill(0.0);
-                    qmm(
+                    qmm_indexed(
                         ffn_preq.as_ref(),
                         ffn_input,
-                        gate_w_name,
+                        indexed_layers[layer].gate_proj.as_ref().unwrap(),
                         &mut gate[..seq_len * inter],
                         seq_len,
                         inter,
                         h,
                     );
-                    qmm(
+                    qmm_indexed(
                         ffn_preq.as_ref(),
                         ffn_input,
-                        up_w_name,
+                        indexed_layers[layer].up_proj.as_ref().unwrap(),
                         &mut up[..seq_len * inter],
                         seq_len,
                         inter,
@@ -2864,10 +3123,10 @@ where
                     } else {
                         None
                     };
-                    qmm(
+                    qmm_indexed(
                         gate_preq_moe.as_ref(),
                         &gate[..seq_len * inter],
-                        down_w_name,
+                        indexed_layers[layer].down_proj.as_ref().unwrap(),
                         &mut down_out[..seq_len * h],
                         seq_len,
                         h,
@@ -2887,8 +3146,8 @@ where
                         if seq_len == 1 {
                             if let (Some(pq), Some(gw), Some(uw)) = (
                                 ffn_preq.as_ref(),
-                                qweights.get_q4k(gate_w_name),
-                                qweights.get_q4k(up_w_name),
+                                indexed_layers[layer].gate_proj.as_ref().and_then(|w| w.as_q4k()),
+                                indexed_layers[layer].up_proj.as_ref().and_then(|w| w.as_q4k()),
                             ) {
                                 q4k.fused_q4k_preq_2(
                                     pq,
@@ -2900,19 +3159,19 @@ where
                                     inter,
                                 );
                             } else {
-                                qmm(
+                                qmm_indexed(
                                     ffn_preq.as_ref(),
                                     ffn_input,
-                                    gate_w_name,
+                                    indexed_layers[layer].gate_proj.as_ref().unwrap(),
                                     &mut gate[..inter],
                                     1,
                                     inter,
                                     h,
                                 );
-                                qmm(
+                                qmm_indexed(
                                     ffn_preq.as_ref(),
                                     ffn_input,
-                                    up_w_name,
+                                    indexed_layers[layer].up_proj.as_ref().unwrap(),
                                     &mut up[..inter],
                                     1,
                                     inter,
@@ -2920,19 +3179,19 @@ where
                                 );
                             }
                         } else {
-                            qmm(
+                            qmm_indexed(
                                 ffn_preq.as_ref(),
                                 ffn_input,
-                                gate_w_name,
+                                indexed_layers[layer].gate_proj.as_ref().unwrap(),
                                 &mut gate[..seq_len * inter],
                                 seq_len,
                                 inter,
                                 h,
                             );
-                            qmm(
+                            qmm_indexed(
                                 ffn_preq.as_ref(),
                                 ffn_input,
-                                up_w_name,
+                                indexed_layers[layer].up_proj.as_ref().unwrap(),
                                 &mut up[..seq_len * inter],
                                 seq_len,
                                 inter,
@@ -2948,19 +3207,19 @@ where
                         }
                     }
                     crate::config::HiddenAct::SquaredRelu => {
-                        qmm(
+                        qmm_indexed(
                             ffn_preq.as_ref(),
                             ffn_input,
-                            gate_w_name,
+                            indexed_layers[layer].gate_proj.as_ref().unwrap(),
                             &mut gate[..seq_len * inter],
                             seq_len,
                             inter,
                             h,
                         );
-                        qmm(
+                        qmm_indexed(
                             ffn_preq.as_ref(),
                             ffn_input,
-                            up_w_name,
+                            indexed_layers[layer].up_proj.as_ref().unwrap(),
                             &mut up[..seq_len * inter],
                             seq_len,
                             inter,
@@ -2995,10 +3254,10 @@ where
                         }
                     }
                     crate::config::HiddenAct::Gelu => {
-                        qmm(
+                        qmm_indexed(
                             ffn_preq.as_ref(),
                             ffn_input,
-                            up_w_name,
+                            indexed_layers[layer].up_proj.as_ref().unwrap(),
                             &mut gate[..seq_len * inter],
                             seq_len,
                             inter,
@@ -3009,10 +3268,10 @@ where
                         }
                     }
                     crate::config::HiddenAct::GeluQuick => {
-                        qmm(
+                        qmm_indexed(
                             ffn_preq.as_ref(),
                             ffn_input,
-                            up_w_name,
+                            indexed_layers[layer].up_proj.as_ref().unwrap(),
                             &mut gate[..seq_len * inter],
                             seq_len,
                             inter,
@@ -3023,10 +3282,10 @@ where
                         }
                     }
                     crate::config::HiddenAct::Relu => {
-                        qmm(
+                        qmm_indexed(
                             ffn_preq.as_ref(),
                             ffn_input,
-                            up_w_name,
+                            indexed_layers[layer].up_proj.as_ref().unwrap(),
                             &mut gate[..seq_len * inter],
                             seq_len,
                             inter,
@@ -3037,19 +3296,19 @@ where
                         }
                     }
                     crate::config::HiddenAct::GeGLU => {
-                        qmm(
+                        qmm_indexed(
                             ffn_preq.as_ref(),
                             ffn_input,
-                            gate_w_name,
+                            indexed_layers[layer].gate_proj.as_ref().unwrap(),
                             &mut gate[..seq_len * inter],
                             seq_len,
                             inter,
                             h,
                         );
-                        qmm(
+                        qmm_indexed(
                             ffn_preq.as_ref(),
                             ffn_input,
-                            up_w_name,
+                            indexed_layers[layer].up_proj.as_ref().unwrap(),
                             &mut up[..seq_len * inter],
                             seq_len,
                             inter,
@@ -3060,19 +3319,19 @@ where
                         }
                     }
                     crate::config::HiddenAct::ReGLU => {
-                        qmm(
+                        qmm_indexed(
                             ffn_preq.as_ref(),
                             ffn_input,
-                            gate_w_name,
+                            indexed_layers[layer].gate_proj.as_ref().unwrap(),
                             &mut gate[..seq_len * inter],
                             seq_len,
                             inter,
                             h,
                         );
-                        qmm(
+                        qmm_indexed(
                             ffn_preq.as_ref(),
                             ffn_input,
-                            up_w_name,
+                            indexed_layers[layer].up_proj.as_ref().unwrap(),
                             &mut up[..seq_len * inter],
                             seq_len,
                             inter,
@@ -3084,7 +3343,7 @@ where
                     }
                 }
 
-                if let Some(sub_norm_w) = qweights.get_f32(ffn_sub_norm_name) {
+                if let Some(sub_norm_w) = indexed_layers[layer].ffn_sub_norm {
                     if let Some(ref drn) = det_rmsnorm {
                         drn.forward(
                             &mut gate[..seq_len * inter],
@@ -3116,10 +3375,10 @@ where
                 } else {
                     None
                 };
-                qmm(
+                qmm_indexed(
                     gate_preq.as_ref(),
                     &gate[..seq_len * inter],
-                    down_w_name,
+                    indexed_layers[layer].down_proj.as_ref().unwrap(),
                     &mut down_out[..seq_len * h],
                     seq_len,
                     h,
