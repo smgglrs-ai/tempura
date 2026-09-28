@@ -1042,6 +1042,42 @@ pub fn vec_soft_max_f32(y: &mut [f32], x: &[f32], max: f32) -> f64 {
     sum
 }
 
+/// In-place softmax exp: scores[i] = exp(scores[i] - max); returns Σ scores[i].
+/// AVX2+FMA path uses the fast polynomial exp approximation.
+/// Same numerics as vec_soft_max_f32 but reads and writes the same buffer.
+pub fn vec_soft_max_f32_inplace(scores: &mut [f32], max: f32) -> f64 {
+    let n = scores.len();
+    let mut i = 0;
+    let mut sum = 0.0_f64;
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        unsafe {
+            let vmax = _mm256_set1_ps(max);
+            while i + 7 < n {
+                let src = _mm256_loadu_ps(scores.as_ptr().add(i));
+                let val = expf_avx2(_mm256_sub_ps(src, vmax));
+                _mm256_storeu_ps(scores.as_mut_ptr().add(i), val);
+                let hi = _mm256_extractf128_ps(val, 1);
+                let lo = _mm256_castps256_ps128(val);
+                let s128 = _mm_add_ps(lo, hi);
+                let s64 = _mm_add_ps(s128, _mm_movehl_ps(s128, s128));
+                let s32 = _mm_add_ss(s64, _mm_movehdup_ps(s64));
+                sum += _mm_cvtss_f32(s32) as f64;
+                i += 8;
+            }
+        }
+    }
+
+    while i < n {
+        let v = crate::portable_math::ggml_exp(scores[i] - max);
+        scores[i] = v;
+        sum += v as f64;
+        i += 1;
+    }
+    sum
+}
+
 /// Log-softmax: y[i] = x[i] - max; returns log(Σ exp(y[i])).
 pub fn vec_log_soft_max_f32(y: &mut [f32], x: &[f32], max: f32) -> f64 {
     let mut sum = 0.0_f64;
