@@ -411,6 +411,7 @@ pub struct TransformerModel<A, N, R, M, S> {
     pub weights: Option<ModelWeights>,
     pub quantized_weights: Option<crate::weights::QuantizedWeights>,
     layer_weight_names: Vec<(String, String, String, String, String, String, String, String, String, String, String, String, String)>,
+    pub rope_cache: Option<std::sync::Arc<tempura_kernels::rope::RopeCache>>,
 }
 
 impl<A, N, R, M, S> TransformerModel<A, N, R, M, S>
@@ -442,12 +443,34 @@ where
                 )
             })
             .collect();
+        let rope_cache = if !config.use_alibi {
+            let rope_half_dim = config.rope_dim.unwrap_or(config.head_dim) / 2;
+            let max_pos = config.max_seq_len;
+            Some(std::sync::Arc::new(
+                tempura_kernels::rope::RopeCache::new(
+                    rope_half_dim,
+                    max_pos,
+                    config.rope_theta,
+                    1.0,
+                    0.0,
+                    1.0,
+                    32.0,
+                    1.0,
+                    max_pos,
+                    None,
+                ),
+            ))
+        } else {
+            None
+        };
+
         Self {
             config,
             pipeline,
             weights: None,
             quantized_weights: None,
             layer_weight_names,
+            rope_cache,
         }
     }
 
@@ -1267,9 +1290,11 @@ where
             == crate::config::RopeType::Norm
             || std::env::var("TEMPURA_DETERMINISTIC").is_ok()
         {
-            Some(Box::new(tempura_kernels::rope::CpuRoPEUnified::new(
-                rope_mode, head_dim,
-            )))
+            let mut rope = tempura_kernels::rope::CpuRoPEUnified::new(rope_mode, head_dim);
+            if let Some(ref arc_cache) = self.rope_cache {
+                rope.precomputed = Some(arc_cache.clone());
+            }
+            Some(Box::new(rope))
         } else {
             None
         };
@@ -7596,12 +7621,33 @@ impl CutileInferenceWrapper {
                 format!("{p}.mlp.ffn_sub_norm.weight"),
             )
         }).collect();
+        let rope_cache = if !config.use_alibi {
+            let rope_half_dim = config.rope_dim.unwrap_or(config.head_dim) / 2;
+            let max_pos = config.max_seq_len;
+            Some(std::sync::Arc::new(
+                tempura_kernels::rope::RopeCache::new(
+                    rope_half_dim,
+                    max_pos,
+                    config.rope_theta,
+                    1.0,
+                    0.0,
+                    1.0,
+                    32.0,
+                    1.0,
+                    max_pos,
+                    None,
+                ),
+            ))
+        } else {
+            None
+        };
         let model = TransformerModel {
             config,
             pipeline,
             weights: None,
             quantized_weights: None,
             layer_weight_names,
+            rope_cache,
         };
         Self {
             model,
