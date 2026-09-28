@@ -4938,12 +4938,14 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             return Ok(());
         }
 
-        // m>1 prefill: fall through to Q4kMnBlockJob (VNNI 4x2 tile, proven stable).
-        // The maddubs 8x8 GEMM translation is correct but causes SIGSEGV on longer sequences.
-        // TODO: debug ggml_gemm_q4_k_8x8_q8_k for prefill safety.
-        if false
-            && m % 4 == 0
+        // m>1 prefill fast path: repack activations into Q8Kx4 and run llama.cpp 4×8 GEMM.
+        // Requires m divisible by 4 and n divisible by 8.
+        #[cfg(target_arch = "x86_64")]
+        if m % 4 == 0
             && n % 8 == 0
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("f16c")
+            && is_x86_feature_detected!("fma")
         {
             use crate::ggml::blocks::{BlockQ4K, BlockQ4Kx8};
             use crate::ggml::repack::{quantize_mat_q8k_4x8, repack_q4k_to_q4kx8};
@@ -8096,6 +8098,77 @@ mod tests {
             eprintln!("({n},{k}) I2S-VNNI: {i2s_us:.0}μs/iter");
         }
     }
+
+    fn make_q4k_prefill_weights(n: usize, k: usize, seed: usize) -> Vec<u8> {
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let mut b_q = vec![0u8; n * blocks_per_row * Q4K_BLOCK_BYTES];
+        for blk in 0..(n * blocks_per_row) {
+            let base = blk * Q4K_BLOCK_BYTES;
+            let d_bits = half::f16::from_f32(0.001 + (blk % 7) as f32 * 0.0001).to_bits();
+            b_q[base] = d_bits as u8;
+            b_q[base + 1] = (d_bits >> 8) as u8;
+            let dmin_bits = half::f16::from_f32(0.0005).to_bits();
+            b_q[base + 2] = dmin_bits as u8;
+            b_q[base + 3] = (dmin_bits >> 8) as u8;
+            for i in 4..Q4K_BLOCK_BYTES {
+                b_q[base + i] = ((blk * seed + i * 11) % 256) as u8;
+            }
+        }
+        b_q
+    }
+
+    // Verify ggml_gemm_q4_k_8x8_q8_k (m%4==0, n%8==0 path) matches reference kernel.
+    #[test]
+    fn test_q4k_gemm_prefill_correctness() {
+        let m = 4;
+        let n = 8;
+        let k = 256;
+
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.003 - 0.5).clamp(-1.0, 1.0))
+            .collect();
+        let b_q = make_q4k_prefill_weights(n, k, 37);
+
+        let ref_kernel = CpuMatMulQ4K;
+        let opt_kernel = CpuMatMulQ4KOpt;
+        let mut out_ref = vec![0.0f32; m * n];
+        let mut out_opt = vec![0.0f32; m * n];
+
+        ref_kernel.forward_b_transposed_q4k(&a, &b_q, &mut out_ref, m, n, k).unwrap();
+        opt_kernel.forward_b_transposed_q4k(&a, &b_q, &mut out_opt, m, n, k).unwrap();
+
+        for i in 0..m * n {
+            let diff = (out_ref[i] - out_opt[i]).abs();
+            let tol = 0.05 * out_ref[i].abs().max(0.01);
+            assert!(
+                diff <= tol,
+                "mismatch at [{i}]: ref={}, opt={}, diff={diff}",
+                out_ref[i], out_opt[i]
+            );
+        }
+    }
+
+    // Verify prefill-length sequences (m=128) do not crash.
+    #[test]
+    fn test_q4k_gemm_prefill_large_m() {
+        let m = 128;
+        let n = 256;
+        let k = 512;
+
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.0001 - 0.5).clamp(-1.0, 1.0))
+            .collect();
+        let b_q = make_q4k_prefill_weights(n, k, 37);
+
+        let opt_kernel = CpuMatMulQ4KOpt;
+        let mut out = vec![0.0f32; m * n];
+        opt_kernel.forward_b_transposed_q4k(&a, &b_q, &mut out, m, n, k).unwrap();
+
+        assert!(
+            out.iter().all(|x| x.is_finite()),
+            "output has non-finite values for m={m}, n={n}, k={k}"
+        );
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -9133,5 +9206,45 @@ mod kani_q2_lut {
         let n_tiles = (n + bm - 1) / bm;
         assert!(n_tiles * bm >= n);
         assert!((n_tiles - 1) * bm < n);
+    }
+}
+
+#[cfg(test)]
+mod gemm_sigsegv_repro {
+    use super::*;
+
+    #[test]
+    fn test_gemm_large_m_no_crash() {
+        let m = 128; // longer sequence
+        let n = 4096; // typical LLaMA FFN dim
+        let k = 4096; // typical hidden dim
+
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.0001 - 0.5).clamp(-1.0, 1.0))
+            .collect();
+
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let mut b_q = vec![0u8; n * blocks_per_row * Q4K_BLOCK_BYTES];
+        for blk in 0..(n * blocks_per_row) {
+            let base = blk * Q4K_BLOCK_BYTES;
+            let d_bits = half::f16::from_f32(0.001).to_bits();
+            b_q[base] = d_bits as u8;
+            b_q[base + 1] = (d_bits >> 8) as u8;
+            let dmin_bits = half::f16::from_f32(0.0005).to_bits();
+            b_q[base + 2] = dmin_bits as u8;
+            b_q[base + 3] = (dmin_bits >> 8) as u8;
+            for i in 4..Q4K_BLOCK_BYTES {
+                b_q[base + i] = ((blk * 37 + i * 11) % 256) as u8;
+            }
+        }
+
+        let opt_kernel = CpuMatMulQ4KOpt;
+        let mut out = vec![0.0f32; m * n];
+        opt_kernel
+            .forward_b_transposed_q4k(&a, &b_q, &mut out, m, n, k)
+            .unwrap();
+
+        let all_finite = out.iter().all(|x| x.is_finite());
+        assert!(all_finite, "output contains non-finite values for m={m}, n={n}, k={k}");
     }
 }
