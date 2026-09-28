@@ -1053,11 +1053,7 @@ where
                     self.pipeline
                         .matmul_bt(&ffn_normed, up_w, &mut up, seq_len, inter, h)
                         .unwrap();
-                    {
-                        let n = gate.len();
-                        let gate_in = gate.to_vec();
-                        tempura_kernels::ggml::vec_llama::vec_swiglu_f32(&mut gate, &gate_in, &up[..n]);
-                    }
+                    { let n = gate.len(); tempura_kernels::ggml::vec_llama::vec_silu_gate_inplace(&mut gate, &up[..n]); }
                 }
                 crate::config::HiddenAct::SquaredRelu => {
                     let gate_w = weights
@@ -3194,14 +3190,9 @@ where
                             );
                         }
                         {
-                            // AVX2/AVX512 SiLU×gate: gate[i] = silu(gate[i]) * up[i]
-                            // Clone gate to avoid aliasing (gate is both x and y in vec_swiglu_f32).
-                            // 57KB clone is negligible vs 14336 scalar exp() calls.
                             let n = seq_len * inter;
-                            let gate_in = gate[..n].to_vec();
-                            tempura_kernels::ggml::vec_llama::vec_swiglu_f32(
+                            tempura_kernels::ggml::vec_llama::vec_silu_gate_inplace(
                                 &mut gate[..n],
-                                &gate_in,
                                 &up[..n],
                             );
                         }

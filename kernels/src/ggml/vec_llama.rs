@@ -843,6 +843,47 @@ pub fn vec_silu_f32(y: &mut [f32], x: &[f32]) {
     }
 }
 
+/// SwiGLU in-place: x[i] = silu(x[i]) * g[i]  (no allocation, x is both input and output).
+/// Matches llama.cpp's ggml_compute_forward_glu_f32 with GGML_GLU_OP_SILU.
+pub fn vec_silu_gate_inplace(x: &mut [f32], g: &[f32]) {
+    let n = x.len();
+    debug_assert_eq!(n, g.len());
+    let mut i = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq") {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                while i + 15 < n {
+                    let xv = _mm512_loadu_ps(x.as_ptr().add(i));
+                    let gv = _mm512_loadu_ps(g.as_ptr().add(i));
+                    _mm512_storeu_ps(
+                        x.as_mut_ptr().add(i),
+                        _mm512_mul_ps(silu_avx512(xv), gv),
+                    );
+                    i += 16;
+                }
+            }
+        } else if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe {
+                while i + 7 < n {
+                    let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+                    let gv = _mm256_loadu_ps(g.as_ptr().add(i));
+                    _mm256_storeu_ps(
+                        x.as_mut_ptr().add(i),
+                        _mm256_mul_ps(silu_avx2(xv), gv),
+                    );
+                    i += 8;
+                }
+            }
+        }
+    }
+    while i < n {
+        x[i] = silu_f32(x[i]) * g[i];
+        i += 1;
+    }
+}
+
 /// SwiGLU: y = silu(x) * g  (fused for cache efficiency)
 pub fn vec_swiglu_f32(y: &mut [f32], x: &[f32], g: &[f32]) {
     let n = y.len();
