@@ -72,19 +72,13 @@ fn apply_head_rmsnorm(
     head_dim: usize,
     eps: f32,
 ) {
+    use tempura_kernels::RMSNorm as _;
+    let norm = tempura_kernels::rmsnorm::CpuRMSNormGgml;
     for s in 0..seq_len {
         for h in 0..num_heads {
             let offset = (s * num_heads + h) * head_dim;
             let head = &mut x[offset..offset + head_dim];
-            let mut sum_sq = 0.0f32;
-            for &v in head.iter() {
-                sum_sq += v * v;
-            }
-            let rms = ((sum_sq / head_dim as f32) + eps).sqrt();
-            let inv_rms = 1.0 / rms;
-            for (d, v) in head.iter_mut().enumerate() {
-                *v = *v * inv_rms * weight[d];
-            }
+            norm.forward(head, weight, head_dim, eps).unwrap();
         }
     }
 }
