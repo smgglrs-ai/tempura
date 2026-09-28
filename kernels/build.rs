@@ -53,7 +53,62 @@ fn main() {
         std::fs::write(&gelu_quick_path, &table).unwrap();
     }
 
+    // E8M0 half lookup table: ggml_table_f32_e8m0_half (256 entries × 4 bytes = 1KB).
+    // Matches llama.cpp's ggml_table_f32_e8m0_half = GGML_E8M0_TO_FP32_HALF(i).
+    // Value = 2^(i-128) = ggml_e8m0_to_fp32(i) / 2.
+    let e8m0_half_path = std::path::Path::new(&out_dir).join("e8m0_half_table.bin");
+    if !e8m0_half_path.exists() {
+        let mut table = Vec::with_capacity(256 * 4);
+        for i in 0u8..=255 {
+            let val = e8m0_to_f32_half_build(i);
+            table.extend_from_slice(&val.to_le_bytes());
+        }
+        std::fs::write(&e8m0_half_path, &table).unwrap();
+    }
+
+    // UE4M3 lookup table: ggml_table_f32_ue4m3 (256 entries × 4 bytes = 1KB).
+    // Matches llama.cpp's ggml_ue4m3_to_fp32: unsigned 4-exp 3-mantissa, bias=7,
+    // returns raw * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 × E2M1_float).
+    let ue4m3_path = std::path::Path::new(&out_dir).join("ue4m3_table.bin");
+    if !ue4m3_path.exists() {
+        let mut table = Vec::with_capacity(256 * 4);
+        for i in 0u8..=255 {
+            let val = ue4m3_to_f32_build(i);
+            table.extend_from_slice(&val.to_le_bytes());
+        }
+        std::fs::write(&ue4m3_path, &table).unwrap();
+    }
+
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+fn e8m0_to_f32_half_build(x: u8) -> f32 {
+    // Matches ggml_e8m0_to_fp32_half: 2^(x-128).
+    // x < 2: denormal bit patterns; x >= 2: normalized with exponent (x-1).
+    let bits: u32 = if x < 2 {
+        0x00200000u32 << x
+    } else {
+        (x as u32 - 1) << 23
+    };
+    f32::from_bits(bits)
+}
+
+fn ue4m3_to_f32_build(x: u8) -> f32 {
+    // Matches ggml_ue4m3_to_fp32: UE4M3 unsigned (4 exp bits, bias=7; 3 mantissa bits).
+    // Returns raw * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 × E2M1_float).
+    if x == 0 || x == 0x7F {
+        return 0.0f32;
+    }
+    let exp = (x >> 3) & 0xF;
+    let man = x & 0x7;
+    let raw: f32 = if exp == 0 {
+        // subnormal: man * 2^(-9)
+        (man as f32) * (1.0f32 / 512.0f32)
+    } else {
+        // normalized: (1 + man/8) * 2^(exp-7)
+        (1.0f32 + (man as f32) / 8.0f32) * (2.0f32.powi(exp as i32 - 7))
+    };
+    raw * 0.5f32
 }
 
 fn gelu_f32_build(x: f32) -> f32 {
