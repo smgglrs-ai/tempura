@@ -253,12 +253,8 @@ pub fn soft_max_rows_f32(
         // find max for numerical stability
         let max = yr.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-        // exp(x - max) and sum
-        let mut sum = 0.0f64;
-        for yi in yr.iter_mut() {
-            *yi = (*yi - max).exp();
-            sum += *yi as f64;
-        }
+        // exp(x - max) and sum — AVX2 polynomial fast path
+        let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(yr, max);
 
         // normalise
         let inv_sum = (1.0 / sum) as f32;

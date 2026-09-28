@@ -146,12 +146,7 @@ fn optimized_attention_ggml(
                 }
             }
 
-            let mut sum: f64 = 0.0;
-            for sc in &mut scores[..kv_len] {
-                let val = crate::portable_math::ggml_exp(*sc - max_score);
-                sum += val as f64;
-                *sc = val;
-            }
+            let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores[..kv_len], max_score);
             let inv_sum = (1.0 / sum) as f32;
             for sc in &mut scores[..kv_len] {
                 *sc *= inv_sum;
@@ -234,15 +229,8 @@ fn naive_attention_ggml(
                     }
                 }
 
-                // C: ggml_vec_soft_max_f32 — scalar path: expf + f64 sum
-                let mut sum: f64 = 0.0;
-                for s in &mut scores {
-                    // C: float val = expf(x[i] - max);
-                    let val = crate::portable_math::ggml_exp(*s - max_score);
-                    // C: sum += (ggml_float)val;
-                    sum += val as f64;
-                    *s = val;
-                }
+                // C: ggml_vec_soft_max_f32 — AVX2 polynomial exp path
+                let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores, max_score);
 
                 // C: sum = 1.0/sum; ggml_vec_scale_f32(nc, dp, sum);
                 let inv_sum = (1.0 / sum) as f32;
@@ -326,12 +314,7 @@ fn naive_attention_ggml_softcap(
                     }
                 }
 
-                let mut sum: f64 = 0.0;
-                for s in &mut scores {
-                    let val = crate::portable_math::ggml_exp(*s - max_score);
-                    sum += val as f64;
-                    *s = val;
-                }
+                let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores, max_score);
 
                 let inv_sum = (1.0 / sum) as f32;
                 for s in &mut scores {
@@ -581,12 +564,7 @@ fn naive_attention_masked(
                     }
                 }
 
-                let mut sum: f64 = 0.0;
-                for sc in &mut scores {
-                    let val = crate::portable_math::ggml_exp(*sc - max_score);
-                    sum += val as f64;
-                    *sc = val;
-                }
+                let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores, max_score);
 
                 let inv_sum = (1.0 / sum) as f32;
                 for sc in &mut scores {
@@ -646,13 +624,10 @@ pub fn attention_decode_heads(
         }
 
         let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
+        let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(scores, max_score);
+        let inv_sum = (1.0 / sum) as f32;
         for s in scores.iter_mut() {
-            *s = crate::portable_math::portable_exp(*s - max_score);
-            sum += *s;
-        }
-        for s in scores.iter_mut() {
-            *s /= sum;
+            *s *= inv_sum;
         }
 
         let o_offset = h * head_dim;
@@ -741,13 +716,7 @@ pub fn attention_decode_heads_f16kv(
             }
         }
 
-        let mut sum: f64 = 0.0;
-        for s in scores.iter_mut() {
-            let val = crate::portable_math::ggml_exp(*s - max_score);
-            sum += val as f64;
-            *s = val;
-        }
-
+        let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(scores, max_score);
         let inv_sum = (1.0 / sum) as f32;
         for s in scores.iter_mut() {
             *s *= inv_sum;
@@ -815,12 +784,7 @@ pub fn attention_prefill_items(
             }
         }
 
-        let mut sum: f64 = 0.0;
-        for sc in &mut scores[..kv_len] {
-            let val = crate::portable_math::ggml_exp(*sc - max_score);
-            sum += val as f64;
-            *sc = val;
-        }
+        let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores[..kv_len], max_score);
         let inv_sum = (1.0 / sum) as f32;
         for sc in &mut scores[..kv_len] {
             *sc *= inv_sum;
@@ -886,12 +850,7 @@ pub fn attention_prefill_items_f16kv(
             }
         }
 
-        let mut sum: f64 = 0.0;
-        for sc in &mut scores[..kv_len] {
-            let val = crate::portable_math::ggml_exp(*sc - max_score);
-            sum += val as f64;
-            *sc = val;
-        }
+        let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores[..kv_len], max_score);
         let inv_sum = (1.0 / sum) as f32;
         for sc in &mut scores[..kv_len] {
             *sc *= inv_sum;
