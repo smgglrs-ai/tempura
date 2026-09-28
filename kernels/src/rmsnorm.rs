@@ -1,6 +1,62 @@
 pub use crate::RMSNorm;
 use crate::Result;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+/// AVX2 scale-and-weight-multiply: `row[i] = row[i] * scale * weight[i]`.
+/// Processes 32 floats per loop iteration (4 × 8-wide), matching llama.cpp's
+/// `ggml_vec_scale_f32` + `ggml_vec_mul_f32` fused pattern.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scale_mul_avx2(row: &mut [f32], weight: &[f32], scale: f32) {
+    let n = row.len();
+    debug_assert_eq!(n, weight.len());
+    let v_scale = _mm256_set1_ps(scale);
+    let mut i = 0;
+    while i + 32 <= n {
+        let r0 = _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(row.as_ptr().add(i)), v_scale), _mm256_loadu_ps(weight.as_ptr().add(i)));
+        let r1 = _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(row.as_ptr().add(i + 8)), v_scale), _mm256_loadu_ps(weight.as_ptr().add(i + 8)));
+        let r2 = _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(row.as_ptr().add(i + 16)), v_scale), _mm256_loadu_ps(weight.as_ptr().add(i + 16)));
+        let r3 = _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(row.as_ptr().add(i + 24)), v_scale), _mm256_loadu_ps(weight.as_ptr().add(i + 24)));
+        _mm256_storeu_ps(row.as_mut_ptr().add(i), r0);
+        _mm256_storeu_ps(row.as_mut_ptr().add(i + 8), r1);
+        _mm256_storeu_ps(row.as_mut_ptr().add(i + 16), r2);
+        _mm256_storeu_ps(row.as_mut_ptr().add(i + 24), r3);
+        i += 32;
+    }
+    while i < n {
+        row[i] = row[i] * scale * weight[i];
+        i += 1;
+    }
+}
+
+/// AVX2 scale-and-weight-multiply into dst: `dst[i] = src[i] * scale * weight[i]`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scale_mul_into_avx2(src: &[f32], weight: &[f32], dst: &mut [f32], scale: f32) {
+    let n = src.len();
+    debug_assert_eq!(n, weight.len());
+    debug_assert_eq!(n, dst.len());
+    let v_scale = _mm256_set1_ps(scale);
+    let mut i = 0;
+    while i + 32 <= n {
+        let r0 = _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(src.as_ptr().add(i)), v_scale), _mm256_loadu_ps(weight.as_ptr().add(i)));
+        let r1 = _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(src.as_ptr().add(i + 8)), v_scale), _mm256_loadu_ps(weight.as_ptr().add(i + 8)));
+        let r2 = _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(src.as_ptr().add(i + 16)), v_scale), _mm256_loadu_ps(weight.as_ptr().add(i + 16)));
+        let r3 = _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(src.as_ptr().add(i + 24)), v_scale), _mm256_loadu_ps(weight.as_ptr().add(i + 24)));
+        _mm256_storeu_ps(dst.as_mut_ptr().add(i), r0);
+        _mm256_storeu_ps(dst.as_mut_ptr().add(i + 8), r1);
+        _mm256_storeu_ps(dst.as_mut_ptr().add(i + 16), r2);
+        _mm256_storeu_ps(dst.as_mut_ptr().add(i + 24), r3);
+        i += 32;
+    }
+    while i < n {
+        dst[i] = src[i] * scale * weight[i];
+        i += 1;
+    }
+}
+
 #[cfg(all(feature = "cuda", not(feature = "cutile")))]
 use cuda_core::DeviceBuffer;
 
@@ -65,6 +121,12 @@ impl RMSNorm for CpuRMSNormGgml {
         }
 
         let num_tokens = x.len() / hidden_size;
+
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = is_x86_feature_detected!("avx2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_avx2 = false;
+
         for t in 0..num_tokens {
             let start = t * hidden_size;
             let row = &mut x[start..start + hidden_size];
@@ -76,16 +138,17 @@ impl RMSNorm for CpuRMSNormGgml {
                 sum += (row[i] * row[i]) as f64;
             }
 
-            // C: const float mean = sum/ne00;
             let mean: f32 = (sum / hidden_size as f64) as f32;
-
-            // C: const float scale = 1.0f/sqrtf(mean + eps);
             let scale: f32 = 1.0f32 / (mean + eps).sqrt();
 
-            // C: ggml_vec_scale_f32(ne00, y, scale);
-            // Then separately: ggml_mul(ctx, cur, mw)  — element-wise multiply by weight
-            for i in 0..hidden_size {
-                row[i] = row[i] * scale * weight[i];
+            // AVX2: 4×8-wide multiply matching llama.cpp's ggml_vec_scale_f32 + ggml_vec_mul_f32
+            if use_avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe { scale_mul_avx2(row, weight, scale); }
+            } else {
+                for i in 0..hidden_size {
+                    row[i] = row[i] * scale * weight[i];
+                }
             }
         }
 
@@ -108,6 +171,12 @@ impl RMSNorm for CpuRMSNormGgml {
         }
         debug_assert_eq!(x.len(), out.len());
         let num_tokens = x.len() / hidden_size;
+
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = is_x86_feature_detected!("avx2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_avx2 = false;
+
         for t in 0..num_tokens {
             let start = t * hidden_size;
             let row = &x[start..start + hidden_size];
@@ -118,8 +187,14 @@ impl RMSNorm for CpuRMSNormGgml {
             let mean: f32 = (sum / hidden_size as f64) as f32;
             let scale: f32 = 1.0f32 / (mean + eps).sqrt();
             let out_row = &mut out[start..start + hidden_size];
-            for i in 0..hidden_size {
-                out_row[i] = row[i] * scale * weight[i];
+
+            if use_avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe { scale_mul_into_avx2(row, weight, out_row, scale); }
+            } else {
+                for i in 0..hidden_size {
+                    out_row[i] = row[i] * scale * weight[i];
+                }
             }
         }
         Ok(())
