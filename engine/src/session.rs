@@ -6,6 +6,21 @@ use crate::deltanet_state::DeltaNetState;
 use crate::kv_cache::{KvCache, PagedKvCache};
 use crate::trace::{InferenceTrace, TraceLevel};
 
+#[derive(Default)]
+pub struct ForwardScratch {
+    pub hidden:   Vec<f32>,
+    pub normed:   Vec<f32>,
+    pub normed2:  Vec<f32>,
+    pub q_buf:    Vec<f32>,
+    pub k_buf:    Vec<f32>,
+    pub v_buf:    Vec<f32>,
+    pub attn_out: Vec<f32>,
+    pub o_proj:   Vec<f32>,
+    pub gate_buf: Vec<f32>,
+    pub up_buf:   Vec<f32>,
+    pub mlp_out:  Vec<f32>,
+}
+
 pub struct InferenceSession {
     pub cache: KvCache,
     pub paged_cache: Option<PagedKvCache>,
@@ -15,6 +30,7 @@ pub struct InferenceSession {
     pub position: usize,
     pub rng: StdRng,
     pub seed: u64,
+    pub scratch: ForwardScratch,
 }
 
 impl InferenceSession {
@@ -33,6 +49,7 @@ impl InferenceSession {
             position: 0,
             rng: StdRng::seed_from_u64(seed),
             seed,
+            scratch: ForwardScratch::default(),
         }
     }
 
@@ -57,6 +74,7 @@ impl InferenceSession {
             position: 0,
             rng: StdRng::seed_from_u64(seed),
             seed,
+            scratch: ForwardScratch::default(),
         }
     }
 
@@ -70,6 +88,7 @@ impl InferenceSession {
             position: 0,
             rng: StdRng::seed_from_u64(seed),
             seed,
+            scratch: ForwardScratch::default(),
         }
     }
 
@@ -132,6 +151,7 @@ impl InferenceSession {
             position: transfer.position,
             rng: StdRng::seed_from_u64(transfer.seed),
             seed: transfer.seed,
+            scratch: ForwardScratch::default(),
         }
     }
 }

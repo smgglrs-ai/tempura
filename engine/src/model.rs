@@ -1306,18 +1306,31 @@ where
         let kv_dim = n_kv_heads * head_dim;
         let inter = cfg.intermediate_size;
 
-        // Pre-allocate scratchpad buffers (reused across layers)
-        let mut hidden = vec![0.0f32; seq_len * h];
-        let mut normed = vec![0.0f32; seq_len * h];
-        let mut q = vec![0.0f32; seq_len * q_dim];
-        let mut k = vec![0.0f32; seq_len * kv_dim];
-        let mut v = vec![0.0f32; seq_len * kv_dim];
-        let mut attn_out = vec![0.0f32; seq_len * q_dim];
-        let mut o_proj = vec![0.0f32; seq_len * h];
-        let mut normed2 = vec![0.0f32; seq_len * h];
-        let mut gate = vec![0.0f32; seq_len * inter];
-        let mut up = vec![0.0f32; seq_len * inter];
-        let mut down_out = vec![0.0f32; seq_len * h];
+        // Reuse pre-allocated scratchpad buffers from InferenceSession.
+        // Take ownership to allow concurrent session.cache access; put back before return.
+        let mut sc = std::mem::take(&mut session.scratch);
+        sc.hidden.resize(seq_len * h, 0.0);
+        sc.normed.resize(seq_len * h, 0.0);
+        sc.normed2.resize(seq_len * h, 0.0);
+        sc.q_buf.resize(seq_len * q_dim, 0.0);
+        sc.k_buf.resize(seq_len * kv_dim, 0.0);
+        sc.v_buf.resize(seq_len * kv_dim, 0.0);
+        sc.attn_out.resize(seq_len * q_dim, 0.0);
+        sc.o_proj.resize(seq_len * h, 0.0);
+        sc.gate_buf.resize(seq_len * inter, 0.0);
+        sc.up_buf.resize(seq_len * inter, 0.0);
+        sc.mlp_out.resize(seq_len * h, 0.0);
+        let mut hidden = sc.hidden;
+        let mut normed = sc.normed;
+        let mut normed2 = sc.normed2;
+        let mut q = sc.q_buf;
+        let mut k = sc.k_buf;
+        let mut v = sc.v_buf;
+        let mut attn_out = sc.attn_out;
+        let mut o_proj = sc.o_proj;
+        let mut gate = sc.gate_buf;
+        let mut up = sc.up_buf;
+        let mut down_out = sc.mlp_out;
 
         for (t, &tok) in token_ids.iter().enumerate() {
             qweights.embed_token(tok, h, &mut hidden[t * h..(t + 1) * h]);
@@ -3288,6 +3301,19 @@ where
             );
         }
 
+        session.scratch = crate::session::ForwardScratch {
+            hidden,
+            normed,
+            normed2,
+            q_buf: q,
+            k_buf: k,
+            v_buf: v,
+            attn_out,
+            o_proj,
+            gate_buf: gate,
+            up_buf: up,
+            mlp_out: down_out,
+        };
         logits
     }
 
