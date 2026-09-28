@@ -535,6 +535,18 @@ pub unsafe fn ggml_vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
 
     let m4 = _mm256_set1_epi8(0xF);
 
+    // Pre-load all 8 shuffle masks into YMM registers before the block loop.
+    // GCC hoists these into ymm8-ymm15; LLVM only does so if explicitly forced.
+    // Saves 8 × (arithmetic scatter: 2 vpsrld+vpbroadcastw) → 8 × vpshufb ymm,ymm,ymm_const.
+    let sh0 = get_scale_shuffle_k4(0);
+    let sh1 = get_scale_shuffle_k4(1);
+    let sh2 = get_scale_shuffle_k4(2);
+    let sh3 = get_scale_shuffle_k4(3);
+    let sh4 = get_scale_shuffle_k4(4);
+    let sh5 = get_scale_shuffle_k4(5);
+    let sh6 = get_scale_shuffle_k4(6);
+    let sh7 = get_scale_shuffle_k4(7);
+
     let mut acc = _mm256_setzero_ps();
     let mut acc_m = _mm_setzero_ps();
 
@@ -573,28 +585,21 @@ pub unsafe fn ggml_vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
 
         let mut sumi = _mm256_setzero_si256();
 
-        for j in 0..(256 / 64) {
-            let scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 0));
-            let scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 1));
-
-            let q4bits = _mm256_loadu_si256(q4 as *const __m256i);
-            q4 = q4.add(32);
+        // Unrolled j=0..4 loop — compiler knows exactly which YMM register per vpshufb.
+        macro_rules! do_sub {($sl:expr, $sh_:expr) => {{
+            let q4bits = _mm256_loadu_si256(q4 as *const __m256i); q4 = q4.add(32);
             let q4l = _mm256_and_si256(q4bits, m4);
             let q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
-
-            let q8l = _mm256_loadu_si256(q8 as *const __m256i);
-            q8 = q8.add(32);
-            let mut p16l = _mm256_maddubs_epi16(q4l, q8l);
-            p16l = _mm256_madd_epi16(scale_l, p16l);
-
-            let q8h = _mm256_loadu_si256(q8 as *const __m256i);
-            q8 = q8.add(32);
-            let mut p16h = _mm256_maddubs_epi16(q4h, q8h);
-            p16h = _mm256_madd_epi16(scale_h, p16h);
-            let sumj = _mm256_add_epi32(p16l, p16h);
-
-            sumi = _mm256_add_epi32(sumi, sumj);
-        }
+            let q8l = _mm256_loadu_si256(q8 as *const __m256i); q8 = q8.add(32);
+            let q8h = _mm256_loadu_si256(q8 as *const __m256i); q8 = q8.add(32);
+            let p16l = _mm256_madd_epi16(_mm256_shuffle_epi8(scales, $sl), _mm256_maddubs_epi16(q4l, q8l));
+            let p16h = _mm256_madd_epi16(_mm256_shuffle_epi8(scales, $sh_), _mm256_maddubs_epi16(q4h, q8h));
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
+        }};}
+        do_sub!(sh0, sh1);
+        do_sub!(sh2, sh3);
+        do_sub!(sh4, sh5);
+        do_sub!(sh6, sh7);
 
         let vd = _mm256_set1_ps(d);
         acc = _mm256_fmadd_ps(vd, _mm256_cvtepi32_ps(sumi), acc);
