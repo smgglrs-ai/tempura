@@ -14,17 +14,6 @@ vstd = { version = "0.0.0-2026-06-14-0213", default-features = false }
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(verus_keep_ghost)', 'cfg(verus_keep_ghost_body)'] }
 
-[profile.release]
-lto = "fat"
-codegen-units = 1
-opt-level = 3
-
-[profile.release-pgo]
-inherits = "release"
-lto = "fat"
-codegen-units = 1
-opt-level = 3
-
 [workspace.lints.clippy]
 # Kernel functions have many parameters by necessity (SIMD, block layout, strides)
 too_many_arguments = "allow"
