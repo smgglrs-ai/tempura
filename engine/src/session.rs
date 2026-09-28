@@ -6,59 +6,6 @@ use crate::deltanet_state::DeltaNetState;
 use crate::kv_cache::{KvCache, PagedKvCache};
 use crate::trace::{InferenceTrace, TraceLevel};
 
-/// Pre-allocated scratchpads for forward pass — reused every token.
-pub struct ForwardScratch {
-    pub hidden: Vec<f32>,
-    pub residual: Vec<f32>,
-    pub normed: Vec<f32>,
-    pub q_buf: Vec<f32>,
-    pub k_buf: Vec<f32>,
-    pub v_buf: Vec<f32>,
-    pub attn_out: Vec<f32>,
-    pub gate_buf: Vec<f32>,
-    pub up_buf: Vec<f32>,
-    pub mlp_out: Vec<f32>,
-    pub logits: Vec<f32>,
-}
-
-impl ForwardScratch {
-    pub fn new(cfg: &ModelConfig) -> Self {
-        let h = cfg.hidden_size;
-        let kv = cfg.num_kv_heads * cfg.head_dim;
-        let inter = cfg.intermediate_size;
-        let vocab = cfg.vocab_size;
-        Self {
-            hidden:   vec![0.0; h],
-            residual: vec![0.0; h],
-            normed:   vec![0.0; h],
-            q_buf:    vec![0.0; h],
-            k_buf:    vec![0.0; kv],
-            v_buf:    vec![0.0; kv],
-            attn_out: vec![0.0; h],
-            gate_buf: vec![0.0; inter],
-            up_buf:   vec![0.0; inter],
-            mlp_out:  vec![0.0; h],
-            logits:   vec![0.0; vocab],
-        }
-    }
-
-    pub fn empty() -> Self {
-        Self {
-            hidden:   Vec::new(),
-            residual: Vec::new(),
-            normed:   Vec::new(),
-            q_buf:    Vec::new(),
-            k_buf:    Vec::new(),
-            v_buf:    Vec::new(),
-            attn_out: Vec::new(),
-            gate_buf: Vec::new(),
-            up_buf:   Vec::new(),
-            mlp_out:  Vec::new(),
-            logits:   Vec::new(),
-        }
-    }
-}
-
 pub struct InferenceSession {
     pub cache: KvCache,
     pub paged_cache: Option<PagedKvCache>,
@@ -68,7 +15,6 @@ pub struct InferenceSession {
     pub position: usize,
     pub rng: StdRng,
     pub seed: u64,
-    pub scratch: ForwardScratch,
 }
 
 impl InferenceSession {
@@ -87,7 +33,6 @@ impl InferenceSession {
             position: 0,
             rng: StdRng::seed_from_u64(seed),
             seed,
-            scratch: ForwardScratch::new(config),
         }
     }
 
@@ -112,7 +57,6 @@ impl InferenceSession {
             position: 0,
             rng: StdRng::seed_from_u64(seed),
             seed,
-            scratch: ForwardScratch::new(config),
         }
     }
 
@@ -126,7 +70,6 @@ impl InferenceSession {
             position: 0,
             rng: StdRng::seed_from_u64(seed),
             seed,
-            scratch: ForwardScratch::empty(),
         }
     }
 
@@ -189,7 +132,6 @@ impl InferenceSession {
             position: transfer.position,
             rng: StdRng::seed_from_u64(transfer.seed),
             seed: transfer.seed,
-            scratch: ForwardScratch::new(config),
         }
     }
 }

@@ -1306,45 +1306,18 @@ where
         let kv_dim = n_kv_heads * head_dim;
         let inter = cfg.intermediate_size;
 
-        // Grow scratch buffers to fit this batch; no alloc on decode (seq_len == 1).
-        let need_h = seq_len * h;
-        let need_q = seq_len * q_dim;
-        let need_kv = seq_len * kv_dim;
-        let need_inter = seq_len * inter;
-        {
-            let s = &mut session.scratch;
-            if s.hidden.len()   < need_h        { s.hidden.resize(need_h, 0.0); }
-            if s.residual.len() < need_h        { s.residual.resize(need_h, 0.0); }
-            if s.normed.len()   < need_h        { s.normed.resize(need_h, 0.0); }
-            if s.q_buf.len()    < need_q        { s.q_buf.resize(need_q, 0.0); }
-            if s.k_buf.len()    < need_kv       { s.k_buf.resize(need_kv, 0.0); }
-            if s.v_buf.len()    < need_kv       { s.v_buf.resize(need_kv, 0.0); }
-            if s.attn_out.len() < need_q        { s.attn_out.resize(need_q, 0.0); }
-            if s.gate_buf.len() < need_inter    { s.gate_buf.resize(need_inter, 0.0); }
-            if s.up_buf.len()   < need_inter    { s.up_buf.resize(need_inter, 0.0); }
-            if s.mlp_out.len()  < need_h        { s.mlp_out.resize(need_h, 0.0); }
-            if s.logits.len()   < cfg.vocab_size { s.logits.resize(cfg.vocab_size, 0.0); }
-        }
-        let mut hidden   = &mut session.scratch.hidden[..need_h];
-        let mut normed   = &mut session.scratch.normed[..need_h];
-        let mut q        = &mut session.scratch.q_buf[..need_q];
-        let mut k        = &mut session.scratch.k_buf[..need_kv];
-        let mut v        = &mut session.scratch.v_buf[..need_kv];
-        let mut attn_out = &mut session.scratch.attn_out[..need_q];
-        let mut o_proj   = &mut session.scratch.residual[..need_h];
-        let mut gate     = &mut session.scratch.gate_buf[..need_inter];
-        let mut up       = &mut session.scratch.up_buf[..need_inter];
-        let mut down_out = &mut session.scratch.mlp_out[..need_h];
-        hidden.fill(0.0);
-        normed.fill(0.0);
-        q.fill(0.0);
-        k.fill(0.0);
-        v.fill(0.0);
-        attn_out.fill(0.0);
-        o_proj.fill(0.0);
-        gate.fill(0.0);
-        up.fill(0.0);
-        down_out.fill(0.0);
+        // Pre-allocate scratchpad buffers (reused across layers)
+        let mut hidden = vec![0.0f32; seq_len * h];
+        let mut normed = vec![0.0f32; seq_len * h];
+        let mut q = vec![0.0f32; seq_len * q_dim];
+        let mut k = vec![0.0f32; seq_len * kv_dim];
+        let mut v = vec![0.0f32; seq_len * kv_dim];
+        let mut attn_out = vec![0.0f32; seq_len * q_dim];
+        let mut o_proj = vec![0.0f32; seq_len * h];
+        let mut normed2 = vec![0.0f32; seq_len * h];
+        let mut gate = vec![0.0f32; seq_len * inter];
+        let mut up = vec![0.0f32; seq_len * inter];
+        let mut down_out = vec![0.0f32; seq_len * h];
 
         for (t, &tok) in token_ids.iter().enumerate() {
             qweights.embed_token(tok, h, &mut hidden[t * h..(t + 1) * h]);
@@ -1352,7 +1325,7 @@ where
 
         if cfg.embedding_scale {
             let scale = (h as f32).sqrt();
-            for v in hidden.iter_mut() {
+            for v in &mut hidden {
                 *v *= scale;
             }
         }
@@ -2757,24 +2730,24 @@ where
             } else {
                 let post_ln_w = qweights.get_f32(post_ln_name).unwrap();
                 if let Some(ref ln) = layernorm {
-                    normed.copy_from_slice(&*hidden);
+                    normed2.copy_from_slice(&hidden);
                     let post_ln_b = qweights.get_f32(&format!(
                         "model.layers.{layer}.post_attention_layernorm.bias"
                     ));
-                    ln.forward(&mut normed[..need_h], post_ln_w, post_ln_b, h, cfg.layer_norm_eps)
+                    ln.forward(&mut normed2, post_ln_w, post_ln_b, h, cfg.layer_norm_eps)
                         .unwrap();
                 } else if cfg.rmsnorm_offset {
-                    normed.copy_from_slice(&*hidden);
+                    normed2.copy_from_slice(&hidden);
                     for i in 0..h {
                         norm_weight_buf[i] = 1.0 + post_ln_w[i];
                     }
                     if let Some(ref drn) = det_rmsnorm {
-                        drn.forward(&mut normed[..need_h], &norm_weight_buf, h, cfg.layer_norm_eps)
+                        drn.forward(&mut normed2, &norm_weight_buf, h, cfg.layer_norm_eps)
                             .unwrap();
                     } else {
                         self.pipeline
                             .rmsnorm(
-                                &mut normed[..need_h],
+                                &mut normed2,
                                 &norm_weight_buf,
                                 h,
                                 cfg.layer_norm_eps,
@@ -2784,14 +2757,14 @@ where
                             .unwrap();
                     }
                 } else if let Some(ref drn) = det_rmsnorm {
-                    drn.forward_into(&hidden, post_ln_w, &mut normed[..need_h], h, cfg.layer_norm_eps)
+                    drn.forward_into(&hidden, post_ln_w, &mut normed2, h, cfg.layer_norm_eps)
                         .unwrap();
                 } else {
                     self.pipeline
                         .rmsnorm_into(
                             &hidden,
                             post_ln_w,
-                            &mut normed[..need_h],
+                            &mut normed2,
                             h,
                             cfg.layer_norm_eps,
                             TraceLevel::Off,
@@ -2800,18 +2773,18 @@ where
                         .unwrap();
                 }
                 if det_rmsnorm.is_some() && layernorm.is_none() {
-                    tempura_kernels::portable_math::q8_snap(&mut normed[..seq_len * h]);
+                    tempura_kernels::portable_math::q8_snap(&mut normed2[..seq_len * h]);
                 }
                 let preq = if seq_len == 1 {
                     if cfg.hidden_act == crate::config::HiddenAct::SquaredRelu {
-                        Some(PreQuantizedActivations::i2s_only(&normed[..h]))
+                        Some(PreQuantizedActivations::i2s_only(&normed2[..h]))
                     } else {
-                        Some(PreQuantizedActivations::from_f32(&normed[..h]))
+                        Some(PreQuantizedActivations::from_f32(&normed2[..h]))
                     }
                 } else {
                     None
                 };
-                (normed as &[f32], preq)
+                (&normed2 as &[f32], preq)
             };
             let _normed2_preq = &ffn_preq;
 
@@ -3186,7 +3159,7 @@ where
         session.cache.advance(seq_len);
         session.position += seq_len;
 
-        let mut final_normed = hidden.to_vec();
+        let mut final_normed = hidden.clone();
         let final_norm_w = qweights.get_f32("model.norm.weight").unwrap();
         if let Some(ref ln) = layernorm {
             let final_norm_b = qweights.get_f32("model.norm.bias");
@@ -3244,43 +3217,40 @@ where
                 f.write_all(&v.to_le_bytes()).unwrap();
             }
         }
-        // lm_head — write into pre-allocated scratch; clone to return.
+        // lm_head
         let last_hidden = &final_normed[(seq_len - 1) * h..seq_len * h];
+        let mut logits = vec![0.0f32; cfg.vocab_size];
         let lm_head_name = "lm_head.weight";
-        {
-            let logits = &mut session.scratch.logits[..cfg.vocab_size];
-            logits.fill(0.0);
-            if let Some(tl2t) = qweights.get_tl2(lm_head_name) {
-                tl2_forward(
-                    last_hidden,
-                    &tl2t.data,
-                    tl2t.scale,
-                    logits,
-                    cfg.vocab_size,
-                    h,
-                );
-            } else if let Some(w) = qweights.get_i2s(lm_head_name) {
-                q4k.forward_b_transposed_i2s(last_hidden, w, logits, 1, cfg.vocab_size, h)
-                    .unwrap();
-            } else if let Some(w) = qweights.get_tq2(lm_head_name) {
-                q4k.forward_b_transposed_tq2(last_hidden, w, logits, 1, cfg.vocab_size, h)
-                    .unwrap();
-            } else if let Some(w) = qweights.get_q4k(lm_head_name) {
-                q4k.forward_b_transposed_q4k(last_hidden, w, logits, 1, cfg.vocab_size, h)
-                    .unwrap();
-            } else if let Some(w) = qweights.get_q6k(lm_head_name) {
-                q4k.forward_b_transposed_q6k(last_hidden, w, logits, 1, cfg.vocab_size, h)
-                    .unwrap();
-            } else if let Some(w) = qweights.get_f16(lm_head_name) {
-                tempura_kernels::f16_gemv::f16_gemv(last_hidden, w, logits, cfg.vocab_size, h);
-            } else if let Some(w) = qweights.get_q2(lm_head_name) {
-                tempura_kernels::quantized::q2_0_gemv(w, last_hidden, logits, cfg.vocab_size, h);
-            } else {
-                let w = qweights.get_f32(lm_head_name).unwrap();
-                self.pipeline
-                    .matmul_bt(last_hidden, w, logits, 1, cfg.vocab_size, h)
-                    .unwrap();
-            }
+        if let Some(tl2t) = qweights.get_tl2(lm_head_name) {
+            tl2_forward(
+                last_hidden,
+                &tl2t.data,
+                tl2t.scale,
+                &mut logits,
+                cfg.vocab_size,
+                h,
+            );
+        } else if let Some(w) = qweights.get_i2s(lm_head_name) {
+            q4k.forward_b_transposed_i2s(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
+                .unwrap();
+        } else if let Some(w) = qweights.get_tq2(lm_head_name) {
+            q4k.forward_b_transposed_tq2(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
+                .unwrap();
+        } else if let Some(w) = qweights.get_q4k(lm_head_name) {
+            q4k.forward_b_transposed_q4k(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
+                .unwrap();
+        } else if let Some(w) = qweights.get_q6k(lm_head_name) {
+            q4k.forward_b_transposed_q6k(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
+                .unwrap();
+        } else if let Some(w) = qweights.get_f16(lm_head_name) {
+            tempura_kernels::f16_gemv::f16_gemv(last_hidden, w, &mut logits, cfg.vocab_size, h);
+        } else if let Some(w) = qweights.get_q2(lm_head_name) {
+            tempura_kernels::quantized::q2_0_gemv(w, last_hidden, &mut logits, cfg.vocab_size, h);
+        } else {
+            let w = qweights.get_f32(lm_head_name).unwrap();
+            self.pipeline
+                .matmul_bt(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
+                .unwrap();
         }
 
         if do_profile {
@@ -3294,7 +3264,6 @@ where
         }
 
         if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() {
-            let logits = &session.scratch.logits[..cfg.vocab_size];
             eprint!("LOGITS_RAW:");
             for i in 0..20.min(logits.len()) {
                 eprint!(" {:.6}", logits[i]);
@@ -3319,7 +3288,7 @@ where
             );
         }
 
-        session.scratch.logits[..cfg.vocab_size].to_vec()
+        logits
     }
 
     #[allow(dead_code)]
