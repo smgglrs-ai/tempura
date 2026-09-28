@@ -757,9 +757,10 @@ pub fn vec_hardsigmoid_f32(y: &mut [f32], x: &[f32]) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// GELU scalar: 0.5 * x * (1 + tanh(√(2/π) * x * (1 + GELU_COEF_A * x²)))
+/// Uses the f16 lookup table — zero tanh/exp at inference time.
 #[inline]
 pub fn gelu_f32(x: f32) -> f32 {
-    0.5 * x * (1.0 + (SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x)).tanh())
+    super::helpers::gelu_f32_lut(x)
 }
 
 /// GELU vector (direct formula; no table).
@@ -785,9 +786,10 @@ pub fn vec_gelu_erf_f32(y: &mut [f32], x: &[f32]) {
 }
 
 /// Quick GELU scalar: x * sigmoid(1.702 * x)
+/// Uses the f16 lookup table — zero exp at inference time.
 #[inline]
 pub fn gelu_quick_f32(x: f32) -> f32 {
-    x * (1.0 / (1.0 + (GELU_QUICK_COEF * x).exp()))
+    super::helpers::gelu_quick_f32_lut(x)
 }
 
 /// Quick GELU vector.
