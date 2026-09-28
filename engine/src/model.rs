@@ -410,6 +410,7 @@ pub struct TransformerModel<A, N, R, M, S> {
     pub pipeline: KernelPipeline<A, N, R, M, S>,
     pub weights: Option<ModelWeights>,
     pub quantized_weights: Option<crate::weights::QuantizedWeights>,
+    layer_weight_names: Vec<(String, String, String, String, String, String, String, String, String, String, String, String, String)>,
 }
 
 impl<A, N, R, M, S> TransformerModel<A, N, R, M, S>
@@ -421,11 +422,32 @@ where
     S: Sampler,
 {
     pub fn new(config: ModelConfig, pipeline: KernelPipeline<A, N, R, M, S>) -> Self {
+        let layer_weight_names = (0..config.num_layers)
+            .map(|l| {
+                let p = format!("model.layers.{l}");
+                (
+                    format!("{p}.input_layernorm.weight"),
+                    format!("{p}.post_attention_layernorm.weight"),
+                    format!("{p}.self_attn.q_proj.weight"),
+                    format!("{p}.self_attn.k_proj.weight"),
+                    format!("{p}.self_attn.v_proj.weight"),
+                    format!("{p}.self_attn.o_proj.weight"),
+                    format!("{p}.self_attn.q_norm.weight"),
+                    format!("{p}.self_attn.k_norm.weight"),
+                    format!("{p}.mlp.gate_proj.weight"),
+                    format!("{p}.mlp.up_proj.weight"),
+                    format!("{p}.mlp.down_proj.weight"),
+                    format!("{p}.self_attn.attn_sub_norm.weight"),
+                    format!("{p}.mlp.ffn_sub_norm.weight"),
+                )
+            })
+            .collect();
         Self {
             config,
             pipeline,
             weights: None,
             quantized_weights: None,
+            layer_weight_names,
         }
     }
 
@@ -1558,27 +1580,7 @@ where
             );
         };
 
-        // Pre-compute all weight names to avoid 252 string allocations per token
-        let layer_names: Vec<_> = (0..cfg.num_layers)
-            .map(|l| {
-                let p = format!("model.layers.{l}");
-                (
-                    format!("{p}.input_layernorm.weight"),
-                    format!("{p}.post_attention_layernorm.weight"),
-                    format!("{p}.self_attn.q_proj.weight"),
-                    format!("{p}.self_attn.k_proj.weight"),
-                    format!("{p}.self_attn.v_proj.weight"),
-                    format!("{p}.self_attn.o_proj.weight"),
-                    format!("{p}.self_attn.q_norm.weight"),
-                    format!("{p}.self_attn.k_norm.weight"),
-                    format!("{p}.mlp.gate_proj.weight"),
-                    format!("{p}.mlp.up_proj.weight"),
-                    format!("{p}.mlp.down_proj.weight"),
-                    format!("{p}.self_attn.attn_sub_norm.weight"),
-                    format!("{p}.mlp.ffn_sub_norm.weight"),
-                )
-            })
-            .collect();
+        let layer_names = &self.layer_weight_names;
 
         let cache_layer_map_q = cfg.cache_layer_map();
         let mut deltanet_layer_idx = 0usize;
