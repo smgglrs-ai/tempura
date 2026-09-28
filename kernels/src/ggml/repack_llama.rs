@@ -321,50 +321,21 @@ pub unsafe fn ggml_gemv_q4_k_8x8_q8_k(
                     lhs_vec_10 = _mm256_permute2f128_si256(lhs_vec_10, lhs_vec_10, 0);
                     lhs_vec_11 = _mm256_permute2f128_si256(lhs_vec_11, lhs_vec_11, 0);
 
-                    // Interleave Q4K weight columns using explicit inline assembly.
-                    //
-                    // The intrinsic patterns blend_epi32(A, shuffle(B,177), 0xaa) and
-                    // shuffle(0x88)+unpacklo_epi32 are both recognized by LLVM's shuffle-combining
-                    // pass as two-source permutations and compiled to vpermt2d (AVX-512, 3-cycle
-                    // latency). Inline assembly prevents this transformation, emitting instead:
-                    //   vpshufd (1-cycle) + vpunpckldq (1-cycle)
-                    // which is the same sequence GCC -O3 generates.
-                    //
-                    // Correctness: vpshufd(A, 0x88) = [A0,A2,A0,A2, A4,A6,A4,A6]
-                    //              vpunpckldq(a_even, b_even) = [A0,B0,A2,B2, A4,B4,A6,B6]
-                    //              vpshufd(A, 0xdd) = [A1,A3,A1,A3, A5,A7,A5,A7]
-                    //              vpunpckldq(a_odd, b_odd) = [A1,B1,A3,B3, A5,B5,A7,B7]
-                    // All four are equivalent to the corresponding blend+shuffle results.
+                    // Interleave Q4K weight columns.
+                    // Use explicit vpshufd+vpunpckldq sequence to avoid LLVM combining
+                    // into vpermt2d (3-cycle latency). Pure intrinsics, no inline asm.
                     macro_rules! interleave_even {
                         ($a:expr, $b:expr) => {{
-                            let out: __m256i;
-                            core::arch::asm!(
-                                "vpshufd {tmp}, {a}, 0x88",
-                                "vpshufd {out}, {b}, 0x88",
-                                "vpunpckldq {out}, {tmp}, {out}",
-                                a   = in(ymm_reg)  $a,
-                                b   = in(ymm_reg)  $b,
-                                tmp = out(ymm_reg) _,
-                                out = out(ymm_reg) out,
-                                options(nostack, pure, nomem),
-                            );
-                            out
+                            let a_even = _mm256_shuffle_epi32($a, 0x88); // [A0,A2,A0,A2,...]
+                            let b_even = _mm256_shuffle_epi32($b, 0x88);
+                            _mm256_unpacklo_epi32(a_even, b_even)         // [A0,B0,A2,B2,...]
                         }};
                     }
                     macro_rules! interleave_odd {
                         ($a:expr, $b:expr) => {{
-                            let out: __m256i;
-                            core::arch::asm!(
-                                "vpshufd {tmp}, {a}, 0xdd",
-                                "vpshufd {out}, {b}, 0xdd",
-                                "vpunpckldq {out}, {tmp}, {out}",
-                                a   = in(ymm_reg)  $a,
-                                b   = in(ymm_reg)  $b,
-                                tmp = out(ymm_reg) _,
-                                out = out(ymm_reg) out,
-                                options(nostack, pure, nomem),
-                            );
-                            out
+                            let a_odd = _mm256_shuffle_epi32($a, 0xdd);  // [A1,A3,A1,A3,...]
+                            let b_odd = _mm256_shuffle_epi32($b, 0xdd);
+                            _mm256_unpacklo_epi32(a_odd, b_odd)           // [A1,B1,A3,B3,...]
                         }};
                     }
 
