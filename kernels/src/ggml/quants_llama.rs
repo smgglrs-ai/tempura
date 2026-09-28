@@ -134,6 +134,12 @@ static K_SHUFFLE_K4: [u8; 256] = [
     14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
 ];
 
+// 32-byte aligned 0x0F mask used as memory operand in the Q4K asm block,
+// freeing the ymm register that _mm256_set1_epi8(0xF) would otherwise occupy.
+#[repr(align(32))]
+struct M4Bytes([u8; 32]);
+static M4_MASK: M4Bytes = M4Bytes([0x0F; 32]);
+
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn get_scale_shuffle_k4(i: usize) -> __m256i {
@@ -533,14 +539,9 @@ pub unsafe fn ggml_vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
     const KMASK2: u32 = 0x0f0f0f0f;
     const KMASK3: u32 = 0x03030303;
 
-    let m4 = _mm256_set1_epi8(0xF);
-
-    // LLVM replaces _mm256_shuffle_epi8(scales, sh_i) with arithmetic extraction
-    // (vpbroadcastw + vpsrld/vpshufd/vpsrlq/vpsrldq per scale word) because the
-    // 8 YMM shuffle constants exhaust available registers. Hoisting them here would
-    // register-pressure LLVM into using the shuffle path, but it chooses arithmetic
-    // extraction instead to keep ymm8-ymm15 free for the main computation loop.
-    // The shuffle masks remain defined for documentation; the compiler does not use them.
+    // sh0-sh7 declared as in(ymm_reg) in the inner asm block; LLVM must keep
+    // all 8 in YMM registers simultaneously, mapping them to ymm8-ymm15 and
+    // emitting 8 vpshufb instructions instead of arithmetic scatter (15 insns).
     let sh0 = get_scale_shuffle_k4(0);
     let sh1 = get_scale_shuffle_k4(1);
     let sh2 = get_scale_shuffle_k4(2);
@@ -565,8 +566,8 @@ pub unsafe fn ggml_vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
         utmp[2] = uaux;
         utmp[0] &= KMASK1;
 
-        let mut q4 = x[i].qs.as_ptr();
-        let mut q8 = y[i].qs.as_ptr();
+        let mut q4_addr = x[i].qs.as_ptr() as usize;
+        let mut q8_addr = y[i].qs.as_ptr() as usize;
 
         let mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(
             utmp[3] as i32,
@@ -588,21 +589,109 @@ pub unsafe fn ggml_vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
 
         let mut sumi = _mm256_setzero_si256();
 
-        // Unrolled j=0..4 loop — compiler knows exactly which YMM register per vpshufb.
-        macro_rules! do_sub {($sl:expr, $sh_:expr) => {{
-            let q4bits = _mm256_loadu_si256(q4 as *const __m256i); q4 = q4.add(32);
-            let q4l = _mm256_and_si256(q4bits, m4);
-            let q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
-            let q8l = _mm256_loadu_si256(q8 as *const __m256i); q8 = q8.add(32);
-            let q8h = _mm256_loadu_si256(q8 as *const __m256i); q8 = q8.add(32);
-            let p16l = _mm256_madd_epi16(_mm256_shuffle_epi8(scales, $sl), _mm256_maddubs_epi16(q4l, q8l));
-            let p16h = _mm256_madd_epi16(_mm256_shuffle_epi8(scales, $sh_), _mm256_maddubs_epi16(q4h, q8h));
-            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
-        }};}
-        do_sub!(sh0, sh1);
-        do_sub!(sh2, sh3);
-        do_sub!(sh4, sh5);
-        do_sub!(sh6, sh7);
+        // Single asm block covering all 4 sub-blocks.  Declaring sh0-sh7 as
+        // in(ymm_reg) forces LLVM to hold all 8 in YMM registers concurrently
+        // (ymm8-ymm15), producing 8 vpshufb instructions instead of the 15-
+        // instruction arithmetic scatter LLVM generates when it controls alloc.
+        // m4 travels as a general-register pointer so it does not consume a YMM
+        // slot; vpand accepts a 256-bit memory operand in VEX encoding.
+        // YMM budget: sh0-sh7(8) + scales(1) + sumi(1) + t0-t5(6) = 16 exactly.
+        core::arch::asm!(
+            // sub-block 0 — scale_l = vpshufb(scales, sh0), scale_h = sh1
+            "vmovdqu {t0}, ymmword ptr [{q4}]",
+            "add {q4}, 32",
+            "vpsrld {t1}, {t0}, 4",
+            "vpand {t0}, {t0}, ymmword ptr [{m4}]",
+            "vpand {t1}, {t1}, ymmword ptr [{m4}]",
+            "vmovdqu {t2}, ymmword ptr [{q8}]",
+            "add {q8}, 32",
+            "vmovdqu {t3}, ymmword ptr [{q8}]",
+            "add {q8}, 32",
+            "vpshufb {t4}, {scales}, {sh0}",
+            "vpshufb {t5}, {scales}, {sh1}",
+            "vpmaddubsw {t0}, {t0}, {t2}",
+            "vpmaddwd {t0}, {t4}, {t0}",
+            "vpmaddubsw {t1}, {t1}, {t3}",
+            "vpmaddwd {t1}, {t5}, {t1}",
+            "vpaddd {sumi}, {sumi}, {t0}",
+            "vpaddd {sumi}, {sumi}, {t1}",
+            // sub-block 1 — sh2, sh3
+            "vmovdqu {t0}, ymmword ptr [{q4}]",
+            "add {q4}, 32",
+            "vpsrld {t1}, {t0}, 4",
+            "vpand {t0}, {t0}, ymmword ptr [{m4}]",
+            "vpand {t1}, {t1}, ymmword ptr [{m4}]",
+            "vmovdqu {t2}, ymmword ptr [{q8}]",
+            "add {q8}, 32",
+            "vmovdqu {t3}, ymmword ptr [{q8}]",
+            "add {q8}, 32",
+            "vpshufb {t4}, {scales}, {sh2}",
+            "vpshufb {t5}, {scales}, {sh3}",
+            "vpmaddubsw {t0}, {t0}, {t2}",
+            "vpmaddwd {t0}, {t4}, {t0}",
+            "vpmaddubsw {t1}, {t1}, {t3}",
+            "vpmaddwd {t1}, {t5}, {t1}",
+            "vpaddd {sumi}, {sumi}, {t0}",
+            "vpaddd {sumi}, {sumi}, {t1}",
+            // sub-block 2 — sh4, sh5
+            "vmovdqu {t0}, ymmword ptr [{q4}]",
+            "add {q4}, 32",
+            "vpsrld {t1}, {t0}, 4",
+            "vpand {t0}, {t0}, ymmword ptr [{m4}]",
+            "vpand {t1}, {t1}, ymmword ptr [{m4}]",
+            "vmovdqu {t2}, ymmword ptr [{q8}]",
+            "add {q8}, 32",
+            "vmovdqu {t3}, ymmword ptr [{q8}]",
+            "add {q8}, 32",
+            "vpshufb {t4}, {scales}, {sh4}",
+            "vpshufb {t5}, {scales}, {sh5}",
+            "vpmaddubsw {t0}, {t0}, {t2}",
+            "vpmaddwd {t0}, {t4}, {t0}",
+            "vpmaddubsw {t1}, {t1}, {t3}",
+            "vpmaddwd {t1}, {t5}, {t1}",
+            "vpaddd {sumi}, {sumi}, {t0}",
+            "vpaddd {sumi}, {sumi}, {t1}",
+            // sub-block 3 — sh6, sh7
+            "vmovdqu {t0}, ymmword ptr [{q4}]",
+            "add {q4}, 32",
+            "vpsrld {t1}, {t0}, 4",
+            "vpand {t0}, {t0}, ymmword ptr [{m4}]",
+            "vpand {t1}, {t1}, ymmword ptr [{m4}]",
+            "vmovdqu {t2}, ymmword ptr [{q8}]",
+            "add {q8}, 32",
+            "vmovdqu {t3}, ymmword ptr [{q8}]",
+            "add {q8}, 32",
+            "vpshufb {t4}, {scales}, {sh6}",
+            "vpshufb {t5}, {scales}, {sh7}",
+            "vpmaddubsw {t0}, {t0}, {t2}",
+            "vpmaddwd {t0}, {t4}, {t0}",
+            "vpmaddubsw {t1}, {t1}, {t3}",
+            "vpmaddwd {t1}, {t5}, {t1}",
+            "vpaddd {sumi}, {sumi}, {t0}",
+            "vpaddd {sumi}, {sumi}, {t1}",
+            sh0    = in(ymm_reg)    sh0,
+            sh1    = in(ymm_reg)    sh1,
+            sh2    = in(ymm_reg)    sh2,
+            sh3    = in(ymm_reg)    sh3,
+            sh4    = in(ymm_reg)    sh4,
+            sh5    = in(ymm_reg)    sh5,
+            sh6    = in(ymm_reg)    sh6,
+            sh7    = in(ymm_reg)    sh7,
+            scales = in(ymm_reg)    scales,
+            m4     = in(reg)        M4_MASK.0.as_ptr(),
+            q4     = inout(reg)     q4_addr,
+            q8     = inout(reg)     q8_addr,
+            sumi   = inout(ymm_reg) sumi,
+            t0     = out(ymm_reg)   _,
+            t1     = out(ymm_reg)   _,
+            t2     = out(ymm_reg)   _,
+            t3     = out(ymm_reg)   _,
+            t4     = out(ymm_reg)   _,
+            t5     = out(ymm_reg)   _,
+            options(nostack),
+        );
+        let _ = q4_addr;
+        let _ = q8_addr;
 
         let vd = _mm256_set1_ps(d);
         acc = _mm256_fmadd_ps(vd, _mm256_cvtepi32_ps(sumi), acc);
