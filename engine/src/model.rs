@@ -1814,6 +1814,13 @@ where
             k_norm: Option<&'a [f32]>,
             attn_sub_norm: Option<&'a [f32]>,
             ffn_sub_norm: Option<&'a [f32]>,
+            q_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
+            k_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
+            v_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
+            o_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
+            gate_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
+            up_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
+            down_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
         }
 
         let indexed_layers: Vec<LayerQ4KWeights<'_>> = (0..cfg.num_layers)
@@ -1833,6 +1840,13 @@ where
                     down_proj: qweights.resolve_weight(&n.10),
                     attn_sub_norm: qweights.get_f32(&n.11),
                     ffn_sub_norm: qweights.get_f32(&n.12),
+                    q_proj_x8: qweights.get_q4k_repacked(&n.2),
+                    k_proj_x8: qweights.get_q4k_repacked(&n.3),
+                    v_proj_x8: qweights.get_q4k_repacked(&n.4),
+                    o_proj_x8: qweights.get_q4k_repacked(&n.5),
+                    gate_proj_x8: qweights.get_q4k_repacked(&n.8),
+                    up_proj_x8: qweights.get_q4k_repacked(&n.9),
+                    down_proj_x8: qweights.get_q4k_repacked(&n.10),
                 }
             })
             .collect();
@@ -2594,24 +2608,54 @@ where
                             h,
                         );
                     } else {
-                        qmm_indexed(
-                            normed_preq.as_ref(),
-                            &normed,
-                            indexed_layers[layer].q_proj.as_ref().unwrap(),
-                            &mut q[..seq_len * q_dim],
-                            seq_len,
-                            q_dim,
-                            h,
-                        );
-                        qmm_indexed(
-                            normed_preq.as_ref(),
-                            &normed,
-                            indexed_layers[layer].k_proj.as_ref().unwrap(),
-                            &mut k[..seq_len * kv_dim],
-                            seq_len,
-                            kv_dim,
-                            h,
-                        );
+                        let q_used_x8 = indexed_layers[layer]
+                            .q_proj_x8
+                            .map(|w_x8| {
+                                q4k.forward_prefill_q4kx8(
+                                    &normed[..seq_len * h],
+                                    w_x8,
+                                    &mut q[..seq_len * q_dim],
+                                    seq_len,
+                                    q_dim,
+                                    h,
+                                )
+                            })
+                            .unwrap_or(false);
+                        if !q_used_x8 {
+                            qmm_indexed(
+                                normed_preq.as_ref(),
+                                &normed,
+                                indexed_layers[layer].q_proj.as_ref().unwrap(),
+                                &mut q[..seq_len * q_dim],
+                                seq_len,
+                                q_dim,
+                                h,
+                            );
+                        }
+                        let k_used_x8 = indexed_layers[layer]
+                            .k_proj_x8
+                            .map(|w_x8| {
+                                q4k.forward_prefill_q4kx8(
+                                    &normed[..seq_len * h],
+                                    w_x8,
+                                    &mut k[..seq_len * kv_dim],
+                                    seq_len,
+                                    kv_dim,
+                                    h,
+                                )
+                            })
+                            .unwrap_or(false);
+                        if !k_used_x8 {
+                            qmm_indexed(
+                                normed_preq.as_ref(),
+                                &normed,
+                                indexed_layers[layer].k_proj.as_ref().unwrap(),
+                                &mut k[..seq_len * kv_dim],
+                                seq_len,
+                                kv_dim,
+                                h,
+                            );
+                        }
                     }
                     if let (Some(ref lut), Some(tl2v)) = (
                         &qkv_lut,
@@ -2633,15 +2677,31 @@ where
                             .and_then(|w| w.as_i2s())
                             .is_none()
                     {
-                        qmm_indexed(
-                            normed_preq.as_ref(),
-                            &normed,
-                            indexed_layers[layer].v_proj.as_ref().unwrap(),
-                            &mut v[..seq_len * kv_dim],
-                            seq_len,
-                            kv_dim,
-                            h,
-                        );
+                        let v_used_x8 = seq_len > 1
+                            && indexed_layers[layer]
+                                .v_proj_x8
+                                .map(|w_x8| {
+                                    q4k.forward_prefill_q4kx8(
+                                        &normed[..seq_len * h],
+                                        w_x8,
+                                        &mut v[..seq_len * kv_dim],
+                                        seq_len,
+                                        kv_dim,
+                                        h,
+                                    )
+                                })
+                                .unwrap_or(false);
+                        if !v_used_x8 {
+                            qmm_indexed(
+                                normed_preq.as_ref(),
+                                &normed,
+                                indexed_layers[layer].v_proj.as_ref().unwrap(),
+                                &mut v[..seq_len * kv_dim],
+                                seq_len,
+                                kv_dim,
+                                h,
+                            );
+                        }
                     }
                 }
 
@@ -2956,15 +3016,31 @@ where
                 } else {
                     None
                 };
-                qmm_indexed(
-                    attn_preq.as_ref(),
-                    &attn_out[..seq_len * q_dim],
-                    indexed_layers[layer].o_proj.as_ref().unwrap(),
-                    &mut o_proj[..seq_len * h],
-                    seq_len,
-                    h,
-                    q_dim,
-                );
+                let o_used_x8 = seq_len > 1
+                    && indexed_layers[layer]
+                        .o_proj_x8
+                        .map(|w_x8| {
+                            q4k.forward_prefill_q4kx8(
+                                &attn_out[..seq_len * q_dim],
+                                w_x8,
+                                &mut o_proj[..seq_len * h],
+                                seq_len,
+                                h,
+                                q_dim,
+                            )
+                        })
+                        .unwrap_or(false);
+                if !o_used_x8 {
+                    qmm_indexed(
+                        attn_preq.as_ref(),
+                        &attn_out[..seq_len * q_dim],
+                        indexed_layers[layer].o_proj.as_ref().unwrap(),
+                        &mut o_proj[..seq_len * h],
+                        seq_len,
+                        h,
+                        q_dim,
+                    );
+                }
                 if std::env::var("TEMPURA_TRACE_LAYERS").is_ok() && seq_len == 1 && layer == 3 {
                     let on: f32 = o_proj[..h].iter().map(|x| x * x).sum::<f32>().sqrt();
                     let an: f32 = attn_out[..q_dim].iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -3176,24 +3252,54 @@ where
                                 );
                             }
                         } else {
-                            qmm_indexed(
-                                ffn_preq.as_ref(),
-                                ffn_input,
-                                indexed_layers[layer].gate_proj.as_ref().unwrap(),
-                                &mut gate[..seq_len * inter],
-                                seq_len,
-                                inter,
-                                h,
-                            );
-                            qmm_indexed(
-                                ffn_preq.as_ref(),
-                                ffn_input,
-                                indexed_layers[layer].up_proj.as_ref().unwrap(),
-                                &mut up[..seq_len * inter],
-                                seq_len,
-                                inter,
-                                h,
-                            );
+                            let gate_used_x8 = indexed_layers[layer]
+                                .gate_proj_x8
+                                .map(|w_x8| {
+                                    q4k.forward_prefill_q4kx8(
+                                        ffn_input,
+                                        w_x8,
+                                        &mut gate[..seq_len * inter],
+                                        seq_len,
+                                        inter,
+                                        h,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if !gate_used_x8 {
+                                qmm_indexed(
+                                    ffn_preq.as_ref(),
+                                    ffn_input,
+                                    indexed_layers[layer].gate_proj.as_ref().unwrap(),
+                                    &mut gate[..seq_len * inter],
+                                    seq_len,
+                                    inter,
+                                    h,
+                                );
+                            }
+                            let up_used_x8 = indexed_layers[layer]
+                                .up_proj_x8
+                                .map(|w_x8| {
+                                    q4k.forward_prefill_q4kx8(
+                                        ffn_input,
+                                        w_x8,
+                                        &mut up[..seq_len * inter],
+                                        seq_len,
+                                        inter,
+                                        h,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if !up_used_x8 {
+                                qmm_indexed(
+                                    ffn_preq.as_ref(),
+                                    ffn_input,
+                                    indexed_layers[layer].up_proj.as_ref().unwrap(),
+                                    &mut up[..seq_len * inter],
+                                    seq_len,
+                                    inter,
+                                    h,
+                                );
+                            }
                         }
                         {
                             let n = seq_len * inter;
@@ -3375,15 +3481,31 @@ where
                 } else {
                     None
                 };
-                qmm_indexed(
-                    gate_preq.as_ref(),
-                    &gate[..seq_len * inter],
-                    indexed_layers[layer].down_proj.as_ref().unwrap(),
-                    &mut down_out[..seq_len * h],
-                    seq_len,
-                    h,
-                    inter,
-                );
+                let down_used_x8 = seq_len > 1
+                    && indexed_layers[layer]
+                        .down_proj_x8
+                        .map(|w_x8| {
+                            q4k.forward_prefill_q4kx8(
+                                &gate[..seq_len * inter],
+                                w_x8,
+                                &mut down_out[..seq_len * h],
+                                seq_len,
+                                h,
+                                inter,
+                            )
+                        })
+                        .unwrap_or(false);
+                if !down_used_x8 {
+                    qmm_indexed(
+                        gate_preq.as_ref(),
+                        &gate[..seq_len * inter],
+                        indexed_layers[layer].down_proj.as_ref().unwrap(),
+                        &mut down_out[..seq_len * h],
+                        seq_len,
+                        h,
+                        inter,
+                    );
+                }
                 if cfg.parallel_attn_ffn {
                     for i in 0..seq_len * h {
                         hidden[i] += o_proj[i] + down_out[i];

@@ -4770,6 +4770,54 @@ impl CpuMatMulQ4KOpt {
         });
         Ok(())
     }
+
+    /// Prefill GEMM using pre-repacked Q4Kx8 weights — no per-call repacking.
+    /// Returns true if the maddubs GEMM ran, false if constraints not met (caller must fall back).
+    pub fn forward_prefill_q4kx8(
+        &self,
+        a: &[f32],
+        b_repacked: &[crate::ggml::blocks::BlockQ4Kx8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if m % 4 == 0
+                && n % 8 == 0
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("f16c")
+                && is_x86_feature_detected!("fma")
+            {
+                use crate::ggml::repack::quantize_mat_q8k_4x8;
+                let packed_a = quantize_mat_q8k_4x8(a, m, k);
+                let blocks_per_row = k / 256;
+                let out_ptr = output.as_mut_ptr();
+                let n_out = n;
+                crate::inference_pool::par_run(n / 8, |start, end| {
+                    let nc_here = (end - start) * 8;
+                    unsafe {
+                        crate::ggml::repack_llama2::ggml_gemm_q4_k_8x8_q8_k(
+                            k,
+                            out_ptr.add(start * 8),
+                            n_out,
+                            (b_repacked.as_ptr() as *const u8).add(
+                                start
+                                    * blocks_per_row
+                                    * std::mem::size_of::<crate::ggml::blocks::BlockQ4Kx8>(),
+                            ),
+                            packed_a.as_ptr() as *const u8,
+                            m,
+                            nc_here,
+                        );
+                    }
+                });
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[cfg(feature = "cpu")]
