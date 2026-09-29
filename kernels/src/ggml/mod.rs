@@ -1,6 +1,7 @@
 
 mod bench;
 pub mod binary_ops_llama;
+pub mod flash_attn_llama;
 pub mod blocks;
 pub mod cpu_feats_llama;
 pub mod cpu_llama;
