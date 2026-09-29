@@ -93,8 +93,8 @@ impl KvCache {
     pub fn new(config: &ModelConfig) -> Self {
         let num_cache_layers = config.num_attention_layers();
         let layer_size = config.max_seq_len * config.num_kv_heads * config.head_dim;
-        let use_f16 = config.hidden_act == crate::config::HiddenAct::SquaredRelu
-            && is_x86_feature_detected!("f16c");
+        // llama.cpp always stores KV cache in F16. Match that for all models.
+        let use_f16 = is_x86_feature_detected!("f16c");
         let k: Vec<Vec<f32>> = (0..num_cache_layers)
             .map(|_| {
                 if use_f16 {

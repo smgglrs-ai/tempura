@@ -2197,10 +2197,10 @@ where
                         let kv_len_l = unsafe {
                             (*(kv_cache_ptr as *const crate::kv_cache::KvCache)).seq_len + 1
                         };
-                        // Parallelize only when enough KV positions to amortize barrier overhead,
-                        // AND F16 KV is available (parallel path uses k_data_f16).
+                        // Parallel attention: all threads compute their assigned heads via F16 KV.
+                        // llama.cpp always parallelizes attention across heads — no threshold.
                         let cache_ref = unsafe { &*(kv_cache_ptr as *const crate::kv_cache::KvCache) };
-                        if kv_len_l >= n_heads_cap && cache_ref.use_f16 {
+                        if cache_ref.use_f16 {
                             let k_f16 = cache_ref.k_data_f16(lw.cl_q, kv_len_l);
                             let v_f16 = cache_ref.v_data_f16(lw.cl_q, kv_len_l);
                             let h_per = (n_heads_cap + nth - 1) / nth;
