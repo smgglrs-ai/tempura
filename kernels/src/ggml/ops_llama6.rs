@@ -479,3 +479,419 @@ pub fn out_prod_q_f32<F>(
         }
     }
 }
+
+// ── From ops.cpp:17 ──────────────────────────────────────────────────────────
+/// ggml_compute_forward_dup_same_cont — parallel memcpy for contiguous same-type tensors.
+/// Parallelizes by blocks. ith/nth = thread index / count.
+pub fn dup_same_cont(src: &[u8], dst: &mut [u8], type_size: usize, ith: usize, nth: usize) {
+    let nk = src.len() / type_size;
+    let dr = (nk + nth - 1) / nth;
+    let k0 = dr * ith;
+    let k1 = (k0 + dr).min(nk);
+    if k0 < k1 {
+        let byte_start = k0 * type_size;
+        let byte_end = k1 * type_size;
+        dst[byte_start..byte_end].copy_from_slice(&src[byte_start..byte_end]);
+    }
+}
+
+// ── From ops.cpp:47 (f32→f32 contiguous row copy variant) ────────────────────
+/// ggml_compute_forward_dup_flt — element-wise copy with type conversion via f32 intermediary.
+/// Handles f32↔f16 conversion. Parallel by rows (ith/nth).
+/// ne00: src cols, ne01: src rows, ne02: batch2, ne03: batch3
+/// nb00/nb01/nb02/nb03: src strides in bytes
+/// nb0/nb1/nb2/nb3: dst strides in bytes
+#[allow(clippy::too_many_arguments)]
+pub fn dup_flt_f32_f32(
+    src: *const u8, ne00: i64, ne01: i64, ne02: i64, ne03: i64,
+    nb00: usize, nb01: usize, nb02: usize, nb03: usize,
+    dst: *mut u8, nb0: usize, nb1: usize, nb2: usize, nb3: usize,
+    ith: usize, nth: usize,
+) {
+    let nr = ne01 as usize;
+    let dr = (nr + nth - 1) / nth;
+    let ir0 = dr * ith;
+    let ir1 = (ir0 + dr).min(nr);
+    // contiguous same-type fast path: copy by rows
+    if nb00 == 4 && nb0 == 4 && ne00 as usize * 4 == nb1.min(nb01) {
+        let rs = ne00 as usize * 4;
+        unsafe {
+            for i03 in 0..ne03 as usize {
+                for i02 in 0..ne02 as usize {
+                    for i01 in ir0..ir1 {
+                        let s = src.add(i01*nb01 + i02*nb02 + i03*nb03);
+                        let d = dst.add(i01*nb1  + i02*nb2  + i03*nb3);
+                        std::ptr::copy_nonoverlapping(s, d, rs);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    // generic strided copy (f32→f32 element-wise)
+    unsafe {
+        for i03 in 0..ne03 as usize {
+            for i02 in 0..ne02 as usize {
+                for i01 in ir0..ir1 {
+                    for i00 in 0..ne00 as usize {
+                        let sv = src.add(i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03) as *const f32;
+                        let dv = dst.add(i00*nb0  + i01*nb1  + i02*nb2  + i03*nb3)  as *mut f32;
+                        *dv = *sv;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// ggml_compute_forward_dup_flt — f32→f16 variant. Converts via f32.
+#[allow(clippy::too_many_arguments)]
+pub fn dup_flt_f32_f16(
+    src: *const u8, ne00: i64, ne01: i64, ne02: i64, ne03: i64,
+    nb00: usize, nb01: usize, nb02: usize, nb03: usize,
+    dst: *mut u8, nb0: usize, nb1: usize, nb2: usize, nb3: usize,
+    ith: usize, nth: usize,
+) {
+    let nr = ne01 as usize;
+    let dr = (nr + nth - 1) / nth;
+    let ir0 = dr * ith;
+    let ir1 = (ir0 + dr).min(nr);
+    unsafe {
+        for i03 in 0..ne03 as usize {
+            for i02 in 0..ne02 as usize {
+                for i01 in ir0..ir1 {
+                    for i00 in 0..ne00 as usize {
+                        let sv = *(src.add(i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03) as *const f32);
+                        let dv = dst.add(i00*nb0 + i01*nb1 + i02*nb2 + i03*nb3) as *mut u16;
+                        *dv = half::f16::from_f32(sv).to_bits();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// ggml_compute_forward_dup_flt — f16→f32 variant.
+#[allow(clippy::too_many_arguments)]
+pub fn dup_flt_f16_f32(
+    src: *const u8, ne00: i64, ne01: i64, ne02: i64, ne03: i64,
+    nb00: usize, nb01: usize, nb02: usize, nb03: usize,
+    dst: *mut u8, nb0: usize, nb1: usize, nb2: usize, nb3: usize,
+    ith: usize, nth: usize,
+) {
+    let nr = ne01 as usize;
+    let dr = (nr + nth - 1) / nth;
+    let ir0 = dr * ith;
+    let ir1 = (ir0 + dr).min(nr);
+    unsafe {
+        for i03 in 0..ne03 as usize {
+            for i02 in 0..ne02 as usize {
+                for i01 in ir0..ir1 {
+                    for i00 in 0..ne00 as usize {
+                        let sv_bits = *(src.add(i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03) as *const u16);
+                        let sv = f16_to_f32(sv_bits);
+                        let dv = dst.add(i00*nb0 + i01*nb1 + i02*nb2 + i03*nb3) as *mut f32;
+                        *dv = sv;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── From ops.cpp:475 ─────────────────────────────────────────────────────────
+/// ggml_compute_forward_dup_from_q — dequantize quantized src to float dst.
+/// `dequantize_row_q`: fn(&[u8], &mut [f32]) for one quantized block (qk elements).
+/// Parallel by quantized blocks (ir0..ir1 each thread).
+pub fn dup_from_q(
+    src: &[u8], dst: &mut [f32],
+    ne00: i64, ne01: i64, ne02: i64, ne03: i64,
+    nb00: usize, nb01: usize, nb02: usize, nb03: usize,
+    ne10: i64, ne11: i64, ne12: i64, ne13: i64,
+    nb10: usize, nb11: usize, nb12: usize, nb13: usize,
+    qk: usize,
+    dequantize_row_q: fn(&[u8], &mut [f32]),
+    ith: usize, nth: usize,
+) {
+    let nr = (ne10 * ne11 * ne12 * ne13) as usize / qk;
+    let dr = (nr + nth - 1) / nth;
+    let ir0 = dr * ith;
+    let ir1 = (ir0 + dr).min(nr);
+    let mut tmp = vec![0.0f32; qk];
+    for ir in ir0..ir1 {
+        let i = ir * qk;
+        let i03 = i / (ne00 as usize * ne01 as usize * ne02 as usize);
+        let i02 = (i - i03*ne00 as usize*ne01 as usize*ne02 as usize) / (ne00 as usize*ne01 as usize);
+        let i01 = (i - i03*ne00 as usize*ne01 as usize*ne02 as usize - i02*ne01 as usize*ne00 as usize) / ne00 as usize;
+        let i00 = i - i03*ne00 as usize*ne01 as usize*ne02 as usize - i02*ne01 as usize*ne00 as usize - i01*ne00 as usize;
+        let x_offset = (i00/qk)*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
+
+        let i13 = i / (ne10 as usize * ne11 as usize * ne12 as usize);
+        let i12 = (i - i13*ne10 as usize*ne11 as usize*ne12 as usize) / (ne10 as usize*ne11 as usize);
+        let i11 = (i - i13*ne10 as usize*ne11 as usize*ne12 as usize - i12*ne10 as usize*ne11 as usize) / ne10 as usize;
+        let i10 = i - i13*ne10 as usize*ne11 as usize*ne12 as usize - i12*ne10 as usize*ne11 as usize - i11*ne10 as usize;
+        let dst_offset = (i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13) / 4;
+
+        dequantize_row_q(&src[x_offset..], &mut tmp);
+        dst[dst_offset..dst_offset+qk].copy_from_slice(&tmp);
+    }
+}
+
+// ── From ops.cpp:578 ─────────────────────────────────────────────────────────
+/// ggml_compute_forward_add_q_f32 — dequantize row, add f32 src1, requantize.
+/// `dequantize_row_q`: fn(&[u8], &mut [f32]) for one quantized row (ne00 elements).
+/// `quantize_row_q`: optional fn(&[f32], &mut [u8]).
+pub fn add_q_f32(
+    src0: &[u8], src1: &[f32], dst: &mut [u8],
+    ne00: usize, nr: usize,
+    nb01: usize, nb02: usize, nb03: usize,
+    ne01: usize, ne02: usize,
+    nb11: usize, nb12: usize, nb13: usize,
+    nb1: usize, nb2: usize, nb3: usize,
+    nb0: usize,
+    dequantize_row_q: fn(&[u8], &mut [f32]),
+    quantize_row_q: Option<fn(&[f32], &mut [u8])>,
+    ith: usize, nth: usize,
+) {
+    let dr = (nr + nth - 1) / nth;
+    let ir0 = dr * ith;
+    let ir1 = (ir0 + dr).min(nr);
+    let mut wdata = vec![0.0f32; ne00];
+    for ir in ir0..ir1 {
+        let i03 = ir / (ne02 * ne01);
+        let i02 = (ir - i03*ne02*ne01) / ne01;
+        let i01 = ir - i03*ne02*ne01 - i02*ne01;
+        let i13 = i03; let i12 = i02; let i11 = i01;
+        let i3 = i03; let i2 = i02; let i1 = i01;
+        let src0_off = i01*nb01 + i02*nb02 + i03*nb03;
+        let src1_off = (i11*nb11 + i12*nb12 + i13*nb13) / 4;
+        let dst_off  = i1*nb1 + i2*nb2 + i3*nb3;
+        dequantize_row_q(&src0[src0_off..], &mut wdata);
+        let s1 = &src1[src1_off..src1_off+ne00];
+        for i in 0..ne00 { wdata[i] += s1[i]; }
+        if let Some(q) = quantize_row_q {
+            q(&wdata, &mut dst[dst_off..]);
+        } else {
+            let dwords = &mut dst[dst_off..dst_off+ne00*nb0];
+            // copy f32 wdata as bytes
+            for i in 0..ne00 {
+                let b = wdata[i].to_le_bytes();
+                dwords[i*nb0..i*nb0+4].copy_from_slice(&b);
+            }
+        }
+    }
+}
+
+// ── From ops.cpp:1513 ────────────────────────────────────────────────────────
+/// ggml_compute_forward_mean_f32 — per-row mean (single-threaded, ith==0 only).
+pub fn mean_f32(
+    src: &[f32], dst: &mut [f32],
+    ne00: usize, ne01: usize, ne02: usize, ne03: usize,
+    ith: usize,
+) {
+    if ith != 0 { return; }
+    for i03 in 0..ne03 {
+        for i02 in 0..ne02 {
+            for i01 in 0..ne01 {
+                let src_row = &src[(i01 + i02*ne01 + i03*ne02*ne01)*ne00..][..ne00];
+                let dst_idx = i01 + i02*ne01 + i03*ne02*ne01;
+                let sum: f32 = src_row.iter().sum();
+                dst[dst_idx] = sum / ne00 as f32;
+            }
+        }
+    }
+}
+
+// ── From ops.cpp:1410 ────────────────────────────────────────────────────────
+/// ggml_compute_forward_cumsum_f32 — prefix sum per row, parallel by rows.
+pub fn cumsum_f32(
+    src: &[f32], dst: &mut [f32],
+    ne00: usize, ne01: usize, ne02: usize, ne03: usize,
+    ith: usize, nth: usize,
+) {
+    let nr = ne01 * ne02 * ne03;
+    let dr = (nr + nth - 1) / nth;
+    let ir0 = dr * ith;
+    let ir1 = (ir0 + dr).min(nr);
+    for ir in ir0..ir1 {
+        let i03 = ir / (ne02 * ne01);
+        let i02 = (ir - i03*ne02*ne01) / ne01;
+        let i01 = ir - i03*ne02*ne01 - i02*ne01;
+        let src_off = (i01 + i02*ne01 + i03*ne02*ne01) * ne00;
+        let dst_off = src_off;
+        let mut acc = 0.0f32;
+        for i in 0..ne00 {
+            acc += src[src_off + i];
+            dst[dst_off + i] = acc;
+        }
+    }
+}
+
+// ── From ops.cpp:3827 ────────────────────────────────────────────────────────
+/// ggml_compute_forward_norm_f32 — layer normalization. Parallel by rows (ith step nth).
+pub fn norm_f32(
+    src: &[f32], dst: &mut [f32],
+    ne00: usize, ne01: usize, ne02: usize, ne03: usize,
+    eps: f32, ith: usize, nth: usize,
+) {
+    for i03 in 0..ne03 {
+        for i02 in 0..ne02 {
+            let mut i01 = ith;
+            while i01 < ne01 {
+                let off = (i01 + i02*ne01 + i03*ne02*ne01) * ne00;
+                let src_row = &src[off..off+ne00];
+                let dst_row = &mut dst[off..off+ne00];
+                let sum: f32 = src_row.iter().sum();
+                let mean = sum / ne00 as f32;
+                let variance: f32 = src_row.iter().map(|&x| { let v = x - mean; v*v }).sum::<f32>() / ne00 as f32;
+                let scale = 1.0 / (variance + eps).sqrt();
+                for i in 0..ne00 {
+                    dst_row[i] = (src_row[i] - mean) * scale;
+                }
+                i01 += nth;
+            }
+        }
+    }
+}
+
+// ── From ops.cpp:5496 ────────────────────────────────────────────────────────
+/// ggml_compute_forward_diag_mask_f32 — mask upper triangle with `value`.
+/// n_past: how many past tokens to keep unmasked. Parallel by rows (j step nth).
+pub fn diag_mask_f32(
+    data: &mut [f32],
+    nc: usize, nr: usize, nz: usize,
+    n_past: usize, value: f32,
+    ith: usize, nth: usize,
+) {
+    for k in 0..nz {
+        let mut j = ith;
+        while j < nr {
+            for i in n_past..nc {
+                if i > n_past + j {
+                    data[k*nr*nc + j*nc + i] = value;
+                }
+            }
+            j += nth;
+        }
+    }
+}
+
+// ── From ops.cpp:7683 ────────────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq)]
+pub enum PoolOp { Avg, Max }
+
+/// ggml_compute_forward_pool_1d_ksp — 1D pooling (avg or max). Single-threaded (ith==0).
+pub fn pool_1d_ksp(
+    src: &[f32], iw: usize,
+    dst: &mut [f32], ow: usize,
+    nr: usize,
+    op: PoolOp, k: usize, s: usize, p: usize,
+    ith: usize,
+) {
+    if ith != 0 { return; }
+    for ir in 0..nr {
+        let srow = &src[ir*iw..(ir+1)*iw];
+        let drow = &mut dst[ir*ow..(ir+1)*ow];
+        for out_w in 0..ow {
+            let mut res = match op { PoolOp::Avg => 0.0f32, PoolOp::Max => f32::NEG_INFINITY };
+            let mut count = 0usize;
+            let base = (out_w * s) as i64 - p as i64;
+            for ki in 0..k as i64 {
+                let j = base + ki;
+                if j < 0 || j >= iw as i64 { continue; }
+                let v = srow[j as usize];
+                match op {
+                    PoolOp::Avg => { res += v; count += 1; }
+                    PoolOp::Max => { if v > res { res = v; } }
+                }
+            }
+            drow[out_w] = match op {
+                PoolOp::Avg => if count > 0 { res / count as f32 } else { 0.0 },
+                PoolOp::Max => res,
+            };
+        }
+    }
+}
+
+// ── From ops.cpp:7978 ────────────────────────────────────────────────────────
+/// ggml_compute_forward_upscale_f32 — nearest-neighbor upscaling.
+/// sf0/sf1/sf2/sf3: scale factors per dimension. Parallel by i2 (ith step nth).
+#[allow(clippy::too_many_arguments)]
+pub fn upscale_f32_nearest(
+    src: &[f32], ne00: usize, ne01: usize, ne02: usize, ne03: usize,
+    dst: &mut [f32], ne0: usize, ne1: usize, ne2: usize, ne3: usize,
+    sf0: f32, sf1: f32, sf2: f32, sf3: f32,
+    ith: usize, nth: usize,
+) {
+    for i3 in 0..ne3 {
+        let i03 = (i3 as f32 / sf3) as usize;
+        let mut i2 = ith;
+        while i2 < ne2 {
+            let i02 = (i2 as f32 / sf2) as usize;
+            for i1 in 0..ne1 {
+                let i01 = (i1 as f32 / sf1) as usize;
+                for i0 in 0..ne0 {
+                    let i00 = (i0 as f32 / sf0) as usize;
+                    let sv = src[i00 + i01*ne00 + i02*ne00*ne01 + i03*ne00*ne01*ne02];
+                    dst[i0 + i1*ne0 + i2*ne0*ne1 + i3*ne0*ne1*ne2] = sv;
+                }
+            }
+            i2 += nth;
+        }
+    }
+}
+
+// ── From ops.cpp:8424 ────────────────────────────────────────────────────────
+/// ggml_compute_forward_timestep_embedding_f32 — sinusoidal timestep embeddings.
+/// Parallel by output half-dim j (ith step nth).
+pub fn timestep_embedding_f32(
+    timesteps: &[f32], dst: &mut [f32],
+    ne00: usize, dim: usize, max_period: usize,
+    ith: usize, nth: usize,
+) {
+    let half = dim / 2;
+    for i in 0..ne00 {
+        let embed_off = i * dim;
+        let mut j = ith;
+        while j < half {
+            let freq = f32::exp(-(max_period as f32).ln() * j as f32 / half as f32);
+            let arg = timesteps[i] * freq;
+            dst[embed_off + j] = arg.cos();
+            dst[embed_off + j + half] = arg.sin();
+            j += nth;
+        }
+        if dim % 2 != 0 && ith == 0 {
+            dst[embed_off + 2*half] = 0.0;
+        }
+    }
+}
+
+// ── From ops.cpp:10824 ───────────────────────────────────────────────────────
+/// ggml_compute_forward_solve_tri_f32 — lower-triangular solve Ax=B.
+/// A: [n×n], B: [k×n], X: [k×n] output. Parallel by (batch×k) columns.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_tri_f32(
+    a: &[f32], b: &[f32], x: &mut [f32],
+    n: usize, k: usize, batches: usize,
+    ith: usize, nth: usize,
+) {
+    let nr = batches * k;
+    let dr = (nr + nth - 1) / nth;
+    let ir0 = dr * ith;
+    let ir1 = (ir0 + dr).min(nr);
+    for ir in ir0..ir1 {
+        let batch = ir / k;
+        let col = ir % k;
+        let a_off = batch * n * n;
+        let b_off = batch * n * k;
+        let x_off = batch * n * k;
+        for row in 0..n {
+            let mut sum = 0.0f32;
+            for t in 0..row {
+                sum += a[a_off + row*n + t] * x[x_off + t*k + col];
+            }
+            let diag = a[a_off + row*n + row];
+            x[x_off + row*k + col] = (b[b_off + row*k + col] - sum) / diag;
+        }
+    }
+}
