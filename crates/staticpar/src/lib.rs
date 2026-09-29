@@ -2,6 +2,104 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
+// ── GraphBarrier ─────────────────────────────────────────────────────────────
+
+/// Reusable spinwait barrier.  All n_threads must call wait() before any
+/// proceeds.  Uses an epoch counter to allow reuse across multiple barrier
+/// calls (same semantics as ggml_barrier).
+pub struct GraphBarrier {
+    count: AtomicUsize,
+    epoch: AtomicUsize,
+    n_threads: usize,
+}
+
+impl GraphBarrier {
+    pub fn new(n_threads: usize) -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            epoch: AtomicUsize::new(0),
+            n_threads,
+        }
+    }
+
+    #[inline]
+    pub fn wait(&self) {
+        if self.n_threads <= 1 {
+            return;
+        }
+        let my_epoch = self.epoch.load(Ordering::Relaxed);
+        let prev = self.count.fetch_add(1, Ordering::AcqRel);
+        if prev + 1 == self.n_threads {
+            self.count.store(0, Ordering::Relaxed);
+            self.epoch.fetch_add(1, Ordering::Release);
+        } else {
+            while self.epoch.load(Ordering::Acquire) == my_epoch {
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
+// ── RawGraphNode ──────────────────────────────────────────────────────────────
+
+/// One node in a compute graph dispatched via `StaticPool::run_graph_raw`.
+///
+/// - `n > 0`: parallel node.  All threads run `fn_ptr(start, end, ctx)` for
+///   their static partition of `0..n`.
+/// - `n == 0`: sequential node.  Only the calling thread runs
+///   `fn_ptr(0, 1, ctx)`; workers call `barrier.wait()` without executing
+///   `fn_ptr`.
+#[repr(C)]
+pub struct RawGraphNode {
+    pub n: usize,
+    pub fn_ptr: usize,
+    pub ctx: usize,
+}
+
+// ── Graph worker context (private) ────────────────────────────────────────────
+
+struct GraphWorkerCtx {
+    nodes: *const RawGraphNode,
+    n_nodes: usize,
+    n_total: usize,
+    barrier: GraphBarrier,
+}
+
+// SAFETY: GraphWorkerCtx is only accessed while all referenced memory is live
+// and all concurrent accesses are correctly partitioned by the barrier.
+unsafe impl Send for GraphWorkerCtx {}
+unsafe impl Sync for GraphWorkerCtx {}
+
+#[inline]
+fn graph_partition(thread_idx: usize, n: usize, n_total: usize) -> (usize, usize) {
+    let base = n / n_total;
+    let rem = n % n_total;
+    let start = thread_idx * base + thread_idx.min(rem);
+    let end = start + base + usize::from(thread_idx < rem);
+    (start, end)
+}
+
+/// Worker graph loop.  `start` = worker_idx (encoded via ranges[k] = k<<32|(k+1)).
+unsafe fn graph_worker_fn(start: usize, _end: usize, ctx: *const ()) {
+    let worker_idx = start;
+    let gctx = &*(ctx as *const GraphWorkerCtx);
+    let n_total = gctx.n_total;
+
+    for i in 0..gctx.n_nodes {
+        let node = &*gctx.nodes.add(i);
+        if node.n > 0 {
+            let (s, e) = graph_partition(worker_idx, node.n, n_total);
+            if s < e {
+                type WorkFn = unsafe fn(usize, usize, *const ());
+                let f: WorkFn = std::mem::transmute(node.fn_ptr);
+                f(s, e, node.ctx as *const ());
+            }
+        }
+        // Sequential nodes (n==0): workers just barrier.wait() without running fn_ptr.
+        gctx.barrier.wait();
+    }
+}
+
 /// Number of `std::hint::spin_loop()` iterations before a worker falls back to
 /// condvar sleep.  Each `spin_loop()` emits `PAUSE` (≈100 cycles on modern x86).
 /// At 5 GHz: 100 cycles ≈ 20 ns → 20_000 iters ≈ 400 µs.
@@ -118,6 +216,105 @@ impl StaticPool {
         }
 
         unsafe { self.run_raw(n, trampoline::<F>, f as *const F as *const ()) }
+    }
+
+    /// Run a compute graph: dispatch workers **once** for the entire node list,
+    /// with `GraphBarrier` spinwaits between nodes.
+    ///
+    /// Workers are woken once (one condvar cycle), loop over all nodes with
+    /// sub-microsecond barriers between each, then signal done and park.
+    ///
+    /// - `n > 0` nodes: all threads execute their static partition of `0..n`.
+    /// - `n == 0` nodes: only the calling thread executes `fn_ptr(0, 1, ctx)`;
+    ///   workers spin at the barrier.
+    ///
+    /// # Safety
+    /// Same as `run_raw`: all raw pointers must be valid for the entire call.
+    pub unsafe fn run_graph_raw(&self, nodes: &[RawGraphNode]) {
+        if nodes.is_empty() {
+            return;
+        }
+        if self.n_workers == 0 {
+            // Single-threaded: run sequentially, no barriers needed.
+            for node in nodes {
+                if node.fn_ptr != 0 {
+                    type F = unsafe fn(usize, usize, *const ());
+                    let f: F = std::mem::transmute(node.fn_ptr);
+                    let (s, e) = if node.n == 0 { (0, 1) } else { (0, node.n) };
+                    f(s, e, node.ctx as *const ());
+                }
+            }
+            return;
+        }
+
+        let inner = &self.inner;
+        let n_total = self.n_workers + 1;
+
+        let gctx = GraphWorkerCtx {
+            nodes: nodes.as_ptr(),
+            n_nodes: nodes.len(),
+            n_total,
+            barrier: GraphBarrier::new(n_total),
+        };
+
+        // Encode worker indices in ranges: ranges[k] = (k << 32) | (k + 1).
+        // Workers use `start` as their index inside graph_worker_fn.
+        for k in 0..self.n_workers {
+            unsafe {
+                *inner.ranges.as_ptr().cast_mut().add(k) =
+                    ((k as u64) << 32) | (k as u64 + 1);
+            }
+        }
+
+        inner
+            .fn_ptr
+            .store(graph_worker_fn as *const () as usize as u64, Ordering::Relaxed);
+        inner
+            .ctx
+            .store(&gctx as *const GraphWorkerCtx as usize as u64, Ordering::Relaxed);
+        inner.done.store(0, Ordering::Relaxed);
+
+        // Wake workers once for the entire graph.
+        let new_gen = inner.gen_atomic.load(Ordering::Relaxed) + 1;
+        inner.gen_atomic.store(new_gen, Ordering::SeqCst);
+        {
+            let mut gen = inner.mutex.lock().unwrap();
+            *gen = new_gen;
+            inner.condvar.notify_all();
+        }
+
+        // Calling thread drives the graph loop.
+        let caller_idx = self.n_workers; // caller is the last "thread"
+        for node in nodes {
+            if node.n == 0 {
+                // Sequential: only calling thread executes.
+                if node.fn_ptr != 0 {
+                    type SeqFn = unsafe fn(usize, usize, *const ());
+                    let f: SeqFn = std::mem::transmute(node.fn_ptr);
+                    f(0, 1, node.ctx as *const ());
+                }
+            } else {
+                // Parallel: calling thread handles its partition.
+                let (s, e) = graph_partition(caller_idx, node.n, n_total);
+                if s < e && node.fn_ptr != 0 {
+                    type WorkFn = unsafe fn(usize, usize, *const ());
+                    let f: WorkFn = std::mem::transmute(node.fn_ptr);
+                    f(s, e, node.ctx as *const ());
+                }
+            }
+            gctx.barrier.wait();
+        }
+
+        // Wait for all workers to exit graph_worker_fn and signal done.
+        let mut spins = 0usize;
+        while inner.done.load(Ordering::Acquire) < self.n_workers {
+            if spins < 2_000 {
+                spins += 1;
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
     }
 
     /// Run `func(start, end, ctx)` for each static partition of `0..n`.
@@ -399,5 +596,94 @@ mod tests {
             });
             assert_eq!(sum.load(Ordering::Relaxed), (0..64u64).sum::<u64>());
         }
+    }
+
+    #[test]
+    fn test_graph_barrier_single_thread() {
+        let b = GraphBarrier::new(1);
+        b.wait(); // should not deadlock
+        b.wait();
+    }
+
+    #[test]
+    fn test_graph_barrier_multi_thread() {
+        use std::sync::Arc;
+        let n = 8usize;
+        let b = Arc::new(GraphBarrier::new(n));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..n - 1 {
+            let b2 = Arc::clone(&b);
+            let c2 = Arc::clone(&counter);
+            handles.push(std::thread::spawn(move || {
+                c2.fetch_add(1, Ordering::Relaxed);
+                b2.wait();
+                // After barrier: all n threads have incremented counter
+                assert_eq!(c2.load(Ordering::Acquire), n);
+            }));
+        }
+        // Main thread is the nth
+        counter.fetch_add(1, Ordering::Relaxed);
+        b.wait();
+        assert_eq!(counter.load(Ordering::Acquire), n);
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_run_graph_raw_parallel_nodes() {
+        let pool = StaticPool::new(4);
+        let n = 64usize;
+        let counts: Arc<Vec<AtomicI64>> = Arc::new((0..n).map(|_| AtomicI64::new(0)).collect());
+
+        unsafe fn par_fn(start: usize, end: usize, ctx: *const ()) {
+            let c = &*(ctx as *const Vec<AtomicI64>);
+            for i in start..end {
+                c[i].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let c2 = Arc::clone(&counts);
+        // Two parallel nodes, same function, same context
+        let nodes = [
+            RawGraphNode { n, fn_ptr: par_fn as usize, ctx: Arc::as_ptr(&c2) as usize },
+            RawGraphNode { n, fn_ptr: par_fn as usize, ctx: Arc::as_ptr(&c2) as usize },
+        ];
+        unsafe { pool.run_graph_raw(&nodes) };
+
+        // Each element should have been incremented twice (once per node)
+        for (i, c) in counts.iter().enumerate() {
+            assert_eq!(c.load(Ordering::Relaxed), 2, "element {i} wrong count");
+        }
+    }
+
+    #[test]
+    fn test_run_graph_raw_sequential_node() {
+        let pool = StaticPool::new(4);
+        let seq_ran = AtomicUsize::new(0);
+        let par_sum = AtomicUsize::new(0);
+
+        unsafe fn seq_fn(_start: usize, _end: usize, ctx: *const ()) {
+            let r = &*(ctx as *const AtomicUsize);
+            r.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe fn par_fn(start: usize, end: usize, ctx: *const ()) {
+            let s = &*(ctx as *const AtomicUsize);
+            s.fetch_add(end - start, Ordering::Relaxed);
+        }
+
+        let n = 32usize;
+        let nodes = [
+            RawGraphNode { n: 0, fn_ptr: seq_fn as usize, ctx: &seq_ran as *const AtomicUsize as usize },
+            RawGraphNode { n, fn_ptr: par_fn as usize, ctx: &par_sum as *const AtomicUsize as usize },
+            RawGraphNode { n: 0, fn_ptr: seq_fn as usize, ctx: &seq_ran as *const AtomicUsize as usize },
+        ];
+        unsafe { pool.run_graph_raw(&nodes) };
+
+        // seq_fn called exactly twice (once per sequential node)
+        assert_eq!(seq_ran.load(Ordering::Relaxed), 2);
+        // par_fn processes all n elements across all threads
+        assert_eq!(par_sum.load(Ordering::Relaxed), n);
     }
 }
