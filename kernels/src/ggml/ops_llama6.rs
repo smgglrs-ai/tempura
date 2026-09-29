@@ -895,3 +895,108 @@ pub fn solve_tri_f32(
         }
     }
 }
+
+// ── From ops.cpp:4979 ─────────────────────────────────────────────────────
+/// Quantized embedding lookup: dequantize selected rows from src0 (quantized)
+/// into dst (f32). Row indices come from src1 (i32 array).
+/// Translation of `ggml_compute_forward_get_rows_q`.
+pub fn get_rows_q(
+    src0: &[u8],        // quantized weight matrix rows
+    src1: &[i32],       // row indices to look up
+    dst: &mut [f32],    // output f32 rows
+    nc: usize,          // columns (embedding dim)
+    row_bytes: usize,   // bytes per quantized row
+    dequantize: fn(&[u8], &mut [f32]), // dequantize one row
+    ith: usize, nth: usize,
+) {
+    let nr = src1.len();
+    let dr = (nr + nth - 1) / nth;
+    let ir0 = dr * ith;
+    let ir1 = ir0 + dr;
+    let ir1 = ir1.min(nr);
+    for i in ir0..ir1 {
+        let i01 = src1[i] as usize;
+        let src_row = &src0[i01 * row_bytes..(i01 + 1) * row_bytes];
+        let dst_row = &mut dst[i * nc..(i + 1) * nc];
+        dequantize(src_row, dst_row);
+    }
+}
+
+// ── From ops.cpp:5328 ─────────────────────────────────────────────────────
+/// Embedding backward: scatter-add f16 src0 rows into f32 dst.
+/// Row indices from src1. Thread 0 only (sets dst to 0 first).
+/// Translation of `ggml_compute_forward_get_rows_back_f32_f16`.
+pub fn get_rows_back_f32_f16(
+    src0: &[u16],    // f16 gradient rows [nr × nc]
+    src1: &[i32],    // row indices [nr]
+    dst: &mut [f32], // f32 output table [vocab_size × nc]
+    nc: usize,
+    ith: usize,
+) {
+    if ith != 0 {
+        return;
+    }
+    for v in dst.iter_mut() {
+        *v = 0.0;
+    }
+    let nr = src1.len();
+    for i in 0..nr {
+        let r = src1[i] as usize;
+        for j in 0..nc {
+            let v = half::f16::from_bits(src0[i * nc + j]).to_f32();
+            dst[r * nc + j] += v;
+        }
+    }
+}
+
+// ── From ops.cpp:921 ──────────────────────────────────────────────────────
+/// Add scalar to each element of a quantized tensor row-by-row
+/// (dequantize → add → requantize). Thread-parallel over rows.
+/// Translation of `ggml_compute_forward_add1_q_f32`.
+pub fn add1_q_f32(
+    src0: &[u8],         // quantized source rows
+    v: f32,              // scalar to add
+    dst: &mut [u8],      // quantized output rows
+    ne0: usize,          // row length (elements)
+    nr: usize,           // total rows
+    row_bytes: usize,    // bytes per quantized row
+    dequantize: fn(&[u8], &mut [f32]),
+    quantize: fn(&[f32], &mut [u8]),
+    tmp: &mut [f32],     // scratch of length ≥ ne0
+    ith: usize, nth: usize,
+) {
+    let dr = (nr + nth - 1) / nth;
+    let ir0 = dr * ith;
+    let ir1 = (ir0 + dr).min(nr);
+    for ir in ir0..ir1 {
+        let src_row = &src0[ir * row_bytes..(ir + 1) * row_bytes];
+        let dst_row = &mut dst[ir * row_bytes..(ir + 1) * row_bytes];
+        dequantize(src_row, &mut tmp[..ne0]);
+        for x in tmp[..ne0].iter_mut() {
+            *x += v;
+        }
+        quantize(&tmp[..ne0], dst_row);
+    }
+}
+
+// ── From ops.cpp:270 ──────────────────────────────────────────────────────
+/// Copy non-quantized (f32/f16) source rows to quantized destination.
+/// Translation of `ggml_compute_forward_dup_to_q` (the contiguous path).
+pub fn dup_to_q_f32(
+    src: &[f32],
+    dst: &mut [u8],      // quantized output
+    ne00: usize,         // elements per row
+    nr: usize,           // total rows
+    dst_row_bytes: usize,
+    quantize: fn(&[f32], &mut [u8]),
+    ith: usize, nth: usize,
+) {
+    let dr = (nr + nth - 1) / nth;
+    let ir0 = dr * ith;
+    let ir1 = (ir0 + dr).min(nr);
+    for ir in ir0..ir1 {
+        let src_row = &src[ir * ne00..(ir + 1) * ne00];
+        let dst_row = &mut dst[ir * dst_row_bytes..(ir + 1) * dst_row_bytes];
+        quantize(src_row, dst_row);
+    }
+}
