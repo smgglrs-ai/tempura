@@ -18,6 +18,8 @@ pub mod ops_llama3;
 pub mod ops_llama4;
 pub mod ops_llama5;
 pub mod ops_llama6;
+pub mod ops_llama7;
+pub mod ops_llama9;
 pub mod ops_llama_simd;
 pub mod quantize;
 pub mod cpu_impl_llama;
