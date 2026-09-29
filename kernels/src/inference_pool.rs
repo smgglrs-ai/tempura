@@ -32,6 +32,18 @@ pub fn par_run_job<J: KernelJob>(n: usize, job: &J) {
     unsafe { get().run_raw(n, trampoline::<J>, job as *const J as *const ()) }
 }
 
+/// Run `f` with all inference workers held in spin-ready state for the duration.
+///
+/// Workers spin on `gen_atomic` between `run_raw` dispatches instead of falling
+/// back to the condvar, eliminating condvar wake latency (~20 µs each) across
+/// all dispatches that occur inside `f`.
+///
+/// Use this to wrap a single forward pass so that the ~128 per-token dispatches
+/// share a single spin-ready epoch rather than each paying a condvar round-trip.
+pub fn run_session<R, F: FnOnce() -> R>(f: F) -> R {
+    get().run_session(f)
+}
+
 /// Parallel run for closures that capture raw pointers.
 ///
 /// Uses `StaticPool::run_raw` to bypass the `Sync` bound on the closure.

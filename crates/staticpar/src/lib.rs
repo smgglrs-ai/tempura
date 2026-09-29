@@ -24,6 +24,13 @@ struct Inner {
     done: AtomicUsize,
     shutdown: AtomicBool,
 
+    // Session mode: when true, workers spin indefinitely between run_raw calls
+    // instead of falling back to condvar after spin_budget iterations.
+    // Written SeqCst by enter_session/drop; read Relaxed by workers.
+    // Workers write nothing to this field — all 32 workers share ONE read-only
+    // cache line with zero write-invalidation traffic.
+    session_active: AtomicBool,
+
     /// Spin budget per dispatch.  Workers spin this many `spin_loop()` calls
     /// before parking.  Tunable via `STATICPAR_SPIN_BUDGET`.
     spin_budget: u64,
@@ -76,6 +83,7 @@ impl StaticPool {
             condvar: Condvar::new(),
             done: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
+            session_active: AtomicBool::new(false),
             spin_budget,
             ranges,
             fn_ptr: AtomicU64::new(0),
@@ -118,6 +126,31 @@ impl StaticPool {
         }
 
         unsafe { self.run_raw(n, trampoline::<F>, f as *const F as *const ()) }
+    }
+
+    /// Enter session mode: workers spin indefinitely between `run_raw` calls
+    /// instead of falling back to condvar after the spin budget.
+    ///
+    /// Returns a guard whose `Drop` clears the session flag.  Workers resume
+    /// normal spin-then-condvar behaviour after the guard is dropped.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let _guard = pool.enter_session();
+    /// pool.run(n1, &f1);
+    /// pool.run(n2, &f2);  // workers stay spinning between the two dispatches
+    /// // guard drops → workers return to condvar fallback
+    /// ```
+    pub fn enter_session(&self) -> SessionGuard<'_> {
+        self.inner.session_active.store(true, Ordering::SeqCst);
+        SessionGuard { inner: &self.inner }
+    }
+
+    /// Run `f` with workers held in spin-ready state for the entire call.
+    /// Equivalent to `{ let _g = enter_session(); f() }`.
+    pub fn run_session<R, F: FnOnce() -> R>(&self, f: F) -> R {
+        let _guard = self.enter_session();
+        f()
     }
 
     /// Run `func(start, end, ctx)` for each static partition of `0..n`.
@@ -198,6 +231,22 @@ impl StaticPool {
     }
 }
 
+/// RAII guard returned by [`StaticPool::enter_session`].
+///
+/// While this guard is alive, workers spin indefinitely between `run_raw`
+/// dispatches instead of falling back to the condvar.  Dropping the guard
+/// clears the session flag; workers drain their current spin budget and then
+/// park on the condvar as usual.
+pub struct SessionGuard<'a> {
+    inner: &'a Inner,
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        self.inner.session_active.store(false, Ordering::SeqCst);
+    }
+}
+
 impl Drop for StaticPool {
     fn drop(&mut self) {
         self.inner.shutdown.store(true, Ordering::Relaxed);
@@ -232,7 +281,9 @@ fn worker_loop(worker_idx: usize, inner: Arc<Inner>) {
                 if inner.shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                if spins >= inner.spin_budget {
+                if spins >= inner.spin_budget
+                    && !inner.session_active.load(Ordering::Relaxed)
+                {
                     break g; // fall through to condvar
                 }
                 std::hint::spin_loop(); // _mm_pause()
@@ -368,6 +419,7 @@ mod tests {
             condvar: Condvar::new(),
             done: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
+            session_active: AtomicBool::new(false),
             spin_budget,
             ranges,
             fn_ptr: AtomicU64::new(0),
@@ -399,5 +451,46 @@ mod tests {
             });
             assert_eq!(sum.load(Ordering::Relaxed), (0..64u64).sum::<u64>());
         }
+    }
+
+    #[test]
+    fn test_run_session_correctness() {
+        // run_session must produce the same results as repeated run calls.
+        let pool = StaticPool::new(4);
+        let expected: u64 = (0..100u64).sum();
+        let result = pool.run_session(|| {
+            let total = AtomicU64::new(0);
+            for _ in 0..10 {
+                pool.run(100, &|start, end| {
+                    let v: u64 = (start..end).map(|i| i as u64).sum();
+                    total.fetch_add(v, Ordering::Relaxed);
+                });
+            }
+            total.load(Ordering::Relaxed)
+        });
+        assert_eq!(result, expected * 10);
+    }
+
+    #[test]
+    fn test_enter_session_guard() {
+        // Entering and dropping the guard must leave workers in normal state.
+        let pool = StaticPool::new(4);
+        {
+            let _guard = pool.enter_session();
+            assert!(pool.inner.session_active.load(Ordering::Relaxed));
+            let sum = AtomicU64::new(0);
+            pool.run(64, &|start, end| {
+                sum.fetch_add((start..end).map(|i| i as u64).sum(), Ordering::Relaxed);
+            });
+            assert_eq!(sum.load(Ordering::Relaxed), (0..64u64).sum::<u64>());
+        }
+        // After guard drop, session_active must be cleared.
+        assert!(!pool.inner.session_active.load(Ordering::Relaxed));
+        // Workers must still handle normal dispatches.
+        let sum = AtomicU64::new(0);
+        pool.run(64, &|start, end| {
+            sum.fetch_add((start..end).map(|i| i as u64).sum(), Ordering::Relaxed);
+        });
+        assert_eq!(sum.load(Ordering::Relaxed), (0..64u64).sum::<u64>());
     }
 }
