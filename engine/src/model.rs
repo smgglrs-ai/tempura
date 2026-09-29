@@ -2020,6 +2020,9 @@ where
             let gp_ptr = gate_preqs.as_mut_ptr() as usize;
 
             let kv_cache_ptr = &mut session.cache as *mut crate::kv_cache::KvCache as usize;
+            // kv_len after each layer's append — written by ith==0, read by all after barrier
+            let mut layer_kv_lens = vec![0usize; cfg.num_layers];
+            let kv_len_ptr = layer_kv_lens.as_mut_ptr() as usize;
 
             let n_layers_cap = cfg.num_layers;
             let h_cap = h;
@@ -2120,7 +2123,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── Node 2: RoPE + KV-cache + attention (ith==0) ─────────────
+                    // ── Node 2a: QK-norm + RoPE + KV-cache-append (ith==0) ───────
                     if ith == 0 {
                         let q_sl = unsafe {
                             std::slice::from_raw_parts_mut(qp as *mut f32, q_dim_cap)
@@ -2181,54 +2184,19 @@ where
                         };
                         cache.append_kv(lw.cl_q, k_sl, v_sl, 1);
                         let kv_len = cache.seq_len + 1;
-
                         let attn_sl = unsafe {
                             std::slice::from_raw_parts_mut(attn_outp as *mut f32, q_dim_cap)
                         };
                         attn_sl.fill(0.0);
-
-                        if std::env::var("TEMPURA_USE_FLASH_ATTN").is_ok() {
-                            // ggml_compute_forward_flash_attn_ext_f16 path (translated from ops.cpp)
-                            // k/v are f16 in the KV cache — pass directly to the translated function.
-                            let k_f16 = cache.k_data_f16(lw.cl_q, kv_len);
-                            let v_f16 = cache.v_data_f16(lw.cl_q, kv_len);
-                            tempura_kernels::ggml::flash_attn_llama::flash_attn_ext_f16(
-                                q_sl,
-                                k_f16,
-                                v_f16,
-                                None,   // no mask for decode (causal by construction: kv_len ≤ append position)
-                                None,   // no sinks
-                                attn_sl,
-                                1,              // neq1 = n_tokens
-                                n_heads_cap,    // neq2 = n_heads
-                                1,              // neq3 = batch
-                                kv_len,         // nek1 = n_kv
-                                n_kv_heads_cap, // nek2 = n_kv_heads
-                                1,              // nek3 = batch
-                                head_dim_cap,   // dv
-                                head_dim_cap,   // dk
+                        let k_cache = cache.k_data(lw.cl_q, kv_len);
+                        let v_cache = cache.v_data(lw.cl_q, kv_len);
+                        tempura_kernels::attention::CpuAttentionGgml
+                            .forward(
+                                q_sl, &k_cache, &v_cache, attn_sl,
+                                1, 1, kv_len, n_heads_cap, n_kv_heads_cap, head_dim_cap,
                                 attn_scale,
-                                0.0,   // max_bias (no ALiBi)
-                                0.0,   // logit_softcap (no softcap)
-                                None,  // no partials (single-thread call)
-                                0,     // partial_stride
-                                0,              // ir0 (first head)
-                                n_heads_cap,    // ir1 (last head)
-                                0,              // ic_start
-                                kv_len,         // ic_end
-                            );
-                        } else {
-                            let k_cache = cache.k_data(lw.cl_q, kv_len);
-                            let v_cache = cache.v_data(lw.cl_q, kv_len);
-                            tempura_kernels::attention::CpuAttentionGgml
-                                .forward(
-                                    q_sl, &k_cache, &v_cache, attn_sl,
-                                    1, 1, kv_len, n_heads_cap, n_kv_heads_cap, head_dim_cap,
-                                    attn_scale,
-                                )
-                                .unwrap();
-                        }
-
+                            )
+                            .unwrap();
                         let preq = PreQuantizedActivations::from_f32(attn_sl);
                         unsafe {
                             *(ap_ptr as *mut Option<PreQuantizedActivations>).add(layer) =
