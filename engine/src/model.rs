@@ -1893,7 +1893,6 @@ where
             && softcap_attn.is_none()
             && !cfg.use_alibi
             && cfg.rope_dim.is_none()
-            && !cfg.use_qk_norm
             && det_rmsnorm.is_none()
             && cfg.rope_scaling.is_none()
             && layernorm.is_none()
@@ -1937,6 +1936,9 @@ where
                 in_ln_p: usize,
                 post_ln_p: usize,
                 cl_q: usize,
+                // Optional QK norms (Qwen3-style); 0 = absent
+                q_norm_p: usize,
+                k_norm_p: usize,
                 // FFN weight types: true = Q4K, false = Q6K
                 gate_is_q4k: bool,
                 up_is_q4k: bool,
@@ -1975,6 +1977,8 @@ where
                         in_ln_p: il.input_ln.unwrap().as_ptr() as usize,
                         post_ln_p: il.post_ln.unwrap().as_ptr() as usize,
                         cl_q: cache_layer_map_q[l].unwrap(),
+                        q_norm_p: il.q_norm.map(|w| w.as_ptr() as usize).unwrap_or(0),
+                        k_norm_p: il.k_norm.map(|w| w.as_ptr() as usize).unwrap_or(0),
                         gate_is_q4k,
                         up_is_q4k,
                         down_is_q4k,
@@ -2115,6 +2119,30 @@ where
                         let v_sl = unsafe {
                             std::slice::from_raw_parts(vp as *const f32, kv_dim_cap)
                         };
+
+                        // QK norm (Qwen3-style): per-head RMSNorm before RoPE
+                        if lw.q_norm_p != 0 {
+                            let qnw = unsafe {
+                                std::slice::from_raw_parts(lw.q_norm_p as *const f32, head_dim_cap)
+                            };
+                            let knw = unsafe {
+                                std::slice::from_raw_parts(lw.k_norm_p as *const f32, head_dim_cap)
+                            };
+                            for h in 0..n_heads_cap {
+                                let off = h * head_dim_cap;
+                                let head = &mut q_sl[off..off + head_dim_cap];
+                                let ss: f32 = head.iter().map(|x| x * x).sum::<f32>();
+                                let inv = 1.0 / ((ss / head_dim_cap as f32) + eps).sqrt();
+                                for (d, v) in head.iter_mut().enumerate() { *v = *v * inv * qnw[d]; }
+                            }
+                            for h in 0..n_kv_heads_cap {
+                                let off = h * head_dim_cap;
+                                let head = &mut k_sl[off..off + head_dim_cap];
+                                let ss: f32 = head.iter().map(|x| x * x).sum::<f32>();
+                                let inv = 1.0 / ((ss / head_dim_cap as f32) + eps).sqrt();
+                                for (d, v) in head.iter_mut().enumerate() { *v = *v * inv * knw[d]; }
+                            }
+                        }
 
                         if rope_neox_cap {
                             rope_neox_f32(
