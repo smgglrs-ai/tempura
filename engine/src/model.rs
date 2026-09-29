@@ -1879,6 +1879,408 @@ where
         let cache_layer_map_q = cfg.cache_layer_map();
         let mut deltanet_layer_idx = 0usize;
 
+        // ── ggml_graph_compute_thread translation ────────────────────────────────
+        // Workers dispatched ONCE for all layers; per-node SpinBarrier;
+        // sequential ops (norm, attention) run on ith==0 only.
+        // Condition: all-Q4K dense SiluGate standard-RoPE single-token decode.
+        let can_use_graph_decode = seq_len == 1
+            && !cfg.parallel_attn_ffn
+            && !cfg.use_layernorm
+            && !cfg.rmsnorm_offset
+            && cfg.n_experts == 0
+            && cfg.hidden_act == crate::config::HiddenAct::SiluGate
+            && alibi_attn.is_none()
+            && softcap_attn.is_none()
+            && !cfg.use_alibi
+            && cfg.rope_dim.is_none()
+            && !cfg.use_qk_norm
+            && det_rmsnorm.is_none()
+            && cfg.rope_scaling.is_none()
+            && layernorm.is_none()
+            && (0..cfg.num_layers).all(|l| {
+                cfg.layer_kinds
+                    .as_ref()
+                    .map(|k| k[l] == crate::config::LayerKind::Attention)
+                    .unwrap_or(true)
+                    && indexed_layers[l].q_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
+                    && indexed_layers[l].k_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
+                    && indexed_layers[l].v_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
+                    && indexed_layers[l].o_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
+                    && indexed_layers[l].gate_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
+                    && indexed_layers[l].up_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
+                    && indexed_layers[l].down_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
+                    && indexed_layers[l].input_ln.is_some()
+                    && indexed_layers[l].post_ln.is_some()
+                    && indexed_layers[l].attn_sub_norm.is_none()
+                    && indexed_layers[l].ffn_sub_norm.is_none()
+                    && cache_layer_map_q[l].is_some()
+                    && {
+                        // Q proj must have exactly q_dim rows (no q_gate fused)
+                        let qb = indexed_layers[l].q_proj.as_ref().unwrap().as_q4k().unwrap();
+                        let row_bytes = (h / tempura_kernels::Q4K_BLOCK_SIZE)
+                            * tempura_kernels::Q4K_BLOCK_BYTES;
+                        qb.len() == q_dim * row_bytes
+                    }
+            });
+
+        'skip_layer_loop: {
+        if can_use_graph_decode {
+            #[allow(dead_code)]
+            struct GdLayerWeights {
+                qw: usize, kw: usize, vw: usize,
+                ow: usize,
+                gw: usize, uw: usize, dw: usize,
+                qkv_bpr: usize,
+                o_bpr: usize,
+                g_bpr: usize,
+                d_bpr: usize,
+                in_ln_p: usize,
+                post_ln_p: usize,
+                cl_q: usize,
+            }
+            let gd_layers: Vec<GdLayerWeights> = (0..cfg.num_layers)
+                .map(|l| {
+                    let il = &indexed_layers[l];
+                    let qw = il.q_proj.as_ref().unwrap().as_q4k().unwrap();
+                    let kw = il.k_proj.as_ref().unwrap().as_q4k().unwrap();
+                    let vw = il.v_proj.as_ref().unwrap().as_q4k().unwrap();
+                    let ow = il.o_proj.as_ref().unwrap().as_q4k().unwrap();
+                    let gw = il.gate_proj.as_ref().unwrap().as_q4k().unwrap();
+                    let uw = il.up_proj.as_ref().unwrap().as_q4k().unwrap();
+                    let dw = il.down_proj.as_ref().unwrap().as_q4k().unwrap();
+                    GdLayerWeights {
+                        qw: qw.as_ptr() as usize,
+                        kw: kw.as_ptr() as usize,
+                        vw: vw.as_ptr() as usize,
+                        ow: ow.as_ptr() as usize,
+                        gw: gw.as_ptr() as usize,
+                        uw: uw.as_ptr() as usize,
+                        dw: dw.as_ptr() as usize,
+                        qkv_bpr: h / tempura_kernels::Q4K_BLOCK_SIZE,
+                        o_bpr: q_dim / tempura_kernels::Q4K_BLOCK_SIZE,
+                        g_bpr: h / tempura_kernels::Q4K_BLOCK_SIZE,
+                        d_bpr: inter / tempura_kernels::Q4K_BLOCK_SIZE,
+                        in_ln_p: il.input_ln.unwrap().as_ptr() as usize,
+                        post_ln_p: il.post_ln.unwrap().as_ptr() as usize,
+                        cl_q: cache_layer_map_q[l].unwrap(),
+                    }
+                })
+                .collect();
+
+            let hp = hidden.as_mut_ptr() as usize;
+            let normedp = normed.as_mut_ptr() as usize;
+            let normed2p = normed2.as_mut_ptr() as usize;
+            let qp = q.as_mut_ptr() as usize;
+            let kp = k.as_mut_ptr() as usize;
+            let vp = v.as_mut_ptr() as usize;
+            let attn_outp = attn_out.as_mut_ptr() as usize;
+            let o_projp = o_proj.as_mut_ptr() as usize;
+            let gatep = gate.as_mut_ptr() as usize;
+            let upp = up.as_mut_ptr() as usize;
+            let down_outp = down_out.as_mut_ptr() as usize;
+
+            let mut normed_preqs: Vec<Option<PreQuantizedActivations>> =
+                (0..cfg.num_layers).map(|_| None).collect();
+            let mut attn_preqs: Vec<Option<PreQuantizedActivations>> =
+                (0..cfg.num_layers).map(|_| None).collect();
+            let mut ffn_preqs: Vec<Option<PreQuantizedActivations>> =
+                (0..cfg.num_layers).map(|_| None).collect();
+            let mut gate_preqs: Vec<Option<PreQuantizedActivations>> =
+                (0..cfg.num_layers).map(|_| None).collect();
+            let np_ptr = normed_preqs.as_mut_ptr() as usize;
+            let ap_ptr = attn_preqs.as_mut_ptr() as usize;
+            let fp_ptr = ffn_preqs.as_mut_ptr() as usize;
+            let gp_ptr = gate_preqs.as_mut_ptr() as usize;
+
+            let kv_cache_ptr = &mut session.cache as *mut crate::kv_cache::KvCache as usize;
+
+            let n_layers_cap = cfg.num_layers;
+            let h_cap = h;
+            let q_dim_cap = q_dim;
+            let kv_dim_cap = kv_dim;
+            let inter_cap = inter;
+            let n_heads_cap = n_heads;
+            let n_kv_heads_cap = n_kv_heads;
+            let head_dim_cap = head_dim;
+            let eps = cfg.layer_norm_eps;
+            let rope_theta_cap = cfg.rope_theta;
+            let rope_neox_cap = cfg.rope_type == crate::config::RopeType::Neox;
+            let position_cap = positions[0] as i32;
+            let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+            let pool = tempura_kernels::thread_pool::global_pool();
+            let barrier =
+                tempura_kernels::thread_pool::SpinBarrier::new(pool.thread_count());
+
+            pool.run_indexed(&|ith, nth| {
+                use tempura_kernels::quantized::{q4k_preq_range_q8k, PreQuantizedActivations};
+                use tempura_kernels::ggml::blocks::BlockQ8K;
+                use tempura_kernels::ggml::ops_llama::{
+                    rms_norm_mul_rows_f32, rope_neox_f32, rope_normal_f32,
+                };
+                use tempura_kernels::fused::residual_add;
+                use tempura_kernels::ggml::vec_llama::vec_silu_gate_inplace;
+
+                let pos_i32 = [position_cap];
+
+                for layer in 0..n_layers_cap {
+                    let lw = &gd_layers[layer];
+
+                    // ── Node 0: input RMSNorm → normed + normed_preq (ith==0) ───
+                    if ith == 0 {
+                        let hid = unsafe { std::slice::from_raw_parts(hp as *const f32, h_cap) };
+                        let in_w = unsafe {
+                            std::slice::from_raw_parts(lw.in_ln_p as *const f32, h_cap)
+                        };
+                        let nrm = unsafe {
+                            std::slice::from_raw_parts_mut(normedp as *mut f32, h_cap)
+                        };
+                        rms_norm_mul_rows_f32(hid, in_w, nrm, h_cap, eps);
+                        let preq = PreQuantizedActivations::from_f32(nrm);
+                        unsafe {
+                            *(np_ptr as *mut Option<PreQuantizedActivations>).add(layer) =
+                                Some(preq);
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── Node 1: QKV projection (parallel, virtual n=q+kv+kv) ───
+                    {
+                        let pq = unsafe {
+                            (*((np_ptr as *const Option<PreQuantizedActivations>).add(layer)))
+                                .as_ref()
+                                .unwrap()
+                        };
+                        let q8kp = pq.q8k.as_ptr();
+                        let bpr = lw.qkv_bpr;
+                        let total = q_dim_cap + kv_dim_cap + kv_dim_cap;
+                        let s = ith * total / nth;
+                        let e = (ith + 1) * total / nth;
+                        let qs = s;
+                        let qe = e.min(q_dim_cap);
+                        if qs < qe {
+                            unsafe {
+                                q4k_preq_range_q8k(
+                                    lw.qw as *const u8, q8kp, bpr, h_cap,
+                                    qp as *mut f32, qs, qe,
+                                );
+                            }
+                        }
+                        let ks = s.saturating_sub(q_dim_cap);
+                        let ke = e.saturating_sub(q_dim_cap).min(kv_dim_cap);
+                        if ks < ke {
+                            unsafe {
+                                q4k_preq_range_q8k(
+                                    lw.kw as *const u8, q8kp, bpr, h_cap,
+                                    kp as *mut f32, ks, ke,
+                                );
+                            }
+                        }
+                        let vs = s.saturating_sub(q_dim_cap + kv_dim_cap);
+                        let ve = e.saturating_sub(q_dim_cap + kv_dim_cap).min(kv_dim_cap);
+                        if vs < ve {
+                            unsafe {
+                                q4k_preq_range_q8k(
+                                    lw.vw as *const u8, q8kp, bpr, h_cap,
+                                    vp as *mut f32, vs, ve,
+                                );
+                            }
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── Node 2: RoPE + KV-cache + attention (ith==0) ─────────────
+                    if ith == 0 {
+                        let q_sl = unsafe {
+                            std::slice::from_raw_parts_mut(qp as *mut f32, q_dim_cap)
+                        };
+                        let k_sl = unsafe {
+                            std::slice::from_raw_parts_mut(kp as *mut f32, kv_dim_cap)
+                        };
+                        let v_sl = unsafe {
+                            std::slice::from_raw_parts(vp as *const f32, kv_dim_cap)
+                        };
+
+                        if rope_neox_cap {
+                            rope_neox_f32(
+                                q_sl, &pos_i32, 1, n_heads_cap, head_dim_cap, head_dim_cap,
+                                rope_theta_cap, 1.0, 0.0, 1.0, 0.0, 0.0, 0, None,
+                            );
+                            rope_neox_f32(
+                                k_sl, &pos_i32, 1, n_kv_heads_cap, head_dim_cap, head_dim_cap,
+                                rope_theta_cap, 1.0, 0.0, 1.0, 0.0, 0.0, 0, None,
+                            );
+                        } else {
+                            rope_normal_f32(
+                                q_sl, &pos_i32, 1, n_heads_cap, head_dim_cap, head_dim_cap,
+                                rope_theta_cap, 1.0, 0.0, 1.0, 0.0, 0.0, 0, None,
+                            );
+                            rope_normal_f32(
+                                k_sl, &pos_i32, 1, n_kv_heads_cap, head_dim_cap, head_dim_cap,
+                                rope_theta_cap, 1.0, 0.0, 1.0, 0.0, 0.0, 0, None,
+                            );
+                        }
+
+                        let cache = unsafe {
+                            &mut *(kv_cache_ptr as *mut crate::kv_cache::KvCache)
+                        };
+                        cache.append_kv(lw.cl_q, k_sl, v_sl, 1);
+                        let kv_len = cache.seq_len + 1;
+                        let k_cache = cache.k_data(lw.cl_q, kv_len);
+                        let v_cache = cache.v_data(lw.cl_q, kv_len);
+
+                        let attn_sl = unsafe {
+                            std::slice::from_raw_parts_mut(attn_outp as *mut f32, q_dim_cap)
+                        };
+                        attn_sl.fill(0.0);
+                        tempura_kernels::attention::CpuAttentionGgml
+                            .forward(
+                                q_sl, &k_cache, &v_cache, attn_sl,
+                                1, 1, kv_len, n_heads_cap, n_kv_heads_cap, head_dim_cap,
+                                attn_scale,
+                            )
+                            .unwrap();
+
+                        let preq = PreQuantizedActivations::from_f32(attn_sl);
+                        unsafe {
+                            *(ap_ptr as *mut Option<PreQuantizedActivations>).add(layer) =
+                                Some(preq);
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── Node 3: O_proj (parallel, n=h) ───────────────────────────
+                    {
+                        let pq = unsafe {
+                            (*((ap_ptr as *const Option<PreQuantizedActivations>).add(layer)))
+                                .as_ref()
+                                .unwrap()
+                        };
+                        let q8kp = pq.q8k.as_ptr();
+                        let s = ith * h_cap / nth;
+                        let e = (ith + 1) * h_cap / nth;
+                        if s < e {
+                            unsafe {
+                                q4k_preq_range_q8k(
+                                    lw.ow as *const u8, q8kp, lw.o_bpr, q_dim_cap,
+                                    o_projp as *mut f32, s, e,
+                                );
+                            }
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── Node 4: residual + post-norm + ffn_preq (ith==0) ─────────
+                    if ith == 0 {
+                        let hid = unsafe {
+                            std::slice::from_raw_parts_mut(hp as *mut f32, h_cap)
+                        };
+                        let op_sl =
+                            unsafe { std::slice::from_raw_parts(o_projp as *const f32, h_cap) };
+                        residual_add(hid, op_sl, h_cap);
+                        let post_w = unsafe {
+                            std::slice::from_raw_parts(lw.post_ln_p as *const f32, h_cap)
+                        };
+                        let n2 = unsafe {
+                            std::slice::from_raw_parts_mut(normed2p as *mut f32, h_cap)
+                        };
+                        rms_norm_mul_rows_f32(hid, post_w, n2, h_cap, eps);
+                        let preq = PreQuantizedActivations::from_f32(n2);
+                        unsafe {
+                            *(fp_ptr as *mut Option<PreQuantizedActivations>).add(layer) =
+                                Some(preq);
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── Node 5: gate+up (parallel, virtual n=2*inter) ─────────────
+                    {
+                        let pq = unsafe {
+                            (*((fp_ptr as *const Option<PreQuantizedActivations>).add(layer)))
+                                .as_ref()
+                                .unwrap()
+                        };
+                        let q8kp = pq.q8k.as_ptr();
+                        let total_gu = 2 * inter_cap;
+                        let s = ith * total_gu / nth;
+                        let e = (ith + 1) * total_gu / nth;
+                        let gs = s;
+                        let ge = e.min(inter_cap);
+                        if gs < ge {
+                            unsafe {
+                                q4k_preq_range_q8k(
+                                    lw.gw as *const u8, q8kp, lw.g_bpr, h_cap,
+                                    gatep as *mut f32, gs, ge,
+                                );
+                            }
+                        }
+                        let us = s.saturating_sub(inter_cap);
+                        let ue = e.saturating_sub(inter_cap).min(inter_cap);
+                        if us < ue {
+                            unsafe {
+                                q4k_preq_range_q8k(
+                                    lw.uw as *const u8, q8kp, lw.g_bpr, h_cap,
+                                    upp as *mut f32, us, ue,
+                                );
+                            }
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── Node 6: SiLU×gate + gate_preq (ith==0) ───────────────────
+                    if ith == 0 {
+                        let gate_sl = unsafe {
+                            std::slice::from_raw_parts_mut(gatep as *mut f32, inter_cap)
+                        };
+                        let up_sl =
+                            unsafe { std::slice::from_raw_parts(upp as *const f32, inter_cap) };
+                        vec_silu_gate_inplace(gate_sl, up_sl);
+                        let preq = PreQuantizedActivations::from_f32(gate_sl);
+                        unsafe {
+                            *(gp_ptr as *mut Option<PreQuantizedActivations>).add(layer) =
+                                Some(preq);
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── Node 7: down_proj (parallel, n=h) ────────────────────────
+                    {
+                        let pq = unsafe {
+                            (*((gp_ptr as *const Option<PreQuantizedActivations>).add(layer)))
+                                .as_ref()
+                                .unwrap()
+                        };
+                        let q8kp = pq.q8k.as_ptr();
+                        let s = ith * h_cap / nth;
+                        let e = (ith + 1) * h_cap / nth;
+                        if s < e {
+                            unsafe {
+                                q4k_preq_range_q8k(
+                                    lw.dw as *const u8, q8kp, lw.d_bpr, inter_cap,
+                                    down_outp as *mut f32, s, e,
+                                );
+                            }
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── Node 8: final residual (ith==0) ──────────────────────────
+                    if ith == 0 {
+                        let hid = unsafe {
+                            std::slice::from_raw_parts_mut(hp as *mut f32, h_cap)
+                        };
+                        let dn =
+                            unsafe { std::slice::from_raw_parts(down_outp as *const f32, h_cap) };
+                        residual_add(hid, dn, h_cap);
+                    }
+                    barrier.wait();
+                }
+            });
+
+            session.cache.advance(1);
+            break 'skip_layer_loop;
+        }
+
         for layer in 0..cfg.num_layers {
             let layer_kind = cfg
                 .layer_kinds
@@ -3859,6 +4261,7 @@ where
         }
 
         session.cache.advance(seq_len);
+        } // 'skip_layer_loop
         session.position += seq_len;
 
         let mut final_normed = hidden.clone();

@@ -836,6 +836,29 @@ pub unsafe fn q4k_preq_range_raw(
     }
 }
 
+/// Like `q4k_preq_range_raw` but uses `BlockQ8K` and `ggml_vec_dot_q4_k_q8_k`.
+/// Matches the kernel used in FusedQ4kPreq2Job / FusedQ4kPreq3Job.
+pub unsafe fn q4k_preq_range_q8k(
+    b_ptr: *const u8,
+    q8k: *const crate::ggml::blocks::BlockQ8K,
+    bpr: usize,
+    k: usize,
+    out_ptr: *mut f32,
+    start: usize,
+    end: usize,
+) {
+    use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+    let bq_row_bytes = bpr * Q4K_BLOCK_BYTES;
+    let a = std::slice::from_raw_parts(q8k, bpr);
+    for j in start..end {
+        let w = std::slice::from_raw_parts(
+            b_ptr.add(j * bq_row_bytes) as *const BlockQ4K,
+            bpr,
+        );
+        *out_ptr.add(j) = crate::ggml::quants_llama::ggml_vec_dot_q4_k_q8_k(k, w, a);
+    }
+}
+
 // Fused QKV job: three Q6K projections sharing one f32 activation, one dispatch.
 struct FusedQ6kPreq3Job {
     b1_ptr: *const u8,
