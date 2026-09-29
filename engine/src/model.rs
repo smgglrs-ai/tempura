@@ -1103,24 +1103,24 @@ where
                     self.pipeline
                         .matmul_bt(&ffn_normed, up_w, &mut gate, seq_len, inter, h)
                         .unwrap();
-                    for i in 0..gate.len() {
-                        gate[i] = tempura_kernels::activations::gelu(gate[i]);
+                    for x in gate.iter_mut() {
+                        *x = tempura_kernels::ggml::ops_llama::gelu_f32(*x);
                     }
                 }
                 crate::config::HiddenAct::GeluQuick => {
                     self.pipeline
                         .matmul_bt(&ffn_normed, up_w, &mut gate, seq_len, inter, h)
                         .unwrap();
-                    for i in 0..gate.len() {
-                        gate[i] = tempura_kernels::activations::gelu_quick(gate[i]);
+                    for x in gate.iter_mut() {
+                        *x = tempura_kernels::ggml::ops_llama::gelu_quick_f32(*x);
                     }
                 }
                 crate::config::HiddenAct::Relu => {
                     self.pipeline
                         .matmul_bt(&ffn_normed, up_w, &mut gate, seq_len, inter, h)
                         .unwrap();
-                    for i in 0..gate.len() {
-                        gate[i] = tempura_kernels::activations::relu(gate[i]);
+                    for x in gate.iter_mut() {
+                        *x = tempura_kernels::ggml::ops_llama::leaky_relu_f32(*x, 0.0);
                     }
                 }
                 crate::config::HiddenAct::GeGLU => {
@@ -1134,7 +1134,7 @@ where
                         .matmul_bt(&ffn_normed, up_w, &mut up, seq_len, inter, h)
                         .unwrap();
                     for i in 0..gate.len() {
-                        gate[i] = tempura_kernels::activations::geglu(gate[i], up[i]);
+                        gate[i] = tempura_kernels::ggml::ops_llama::gelu_f32(gate[i]) * up[i];
                     }
                 }
                 crate::config::HiddenAct::ReGLU => {
@@ -1148,7 +1148,7 @@ where
                         .matmul_bt(&ffn_normed, up_w, &mut up, seq_len, inter, h)
                         .unwrap();
                     for i in 0..gate.len() {
-                        gate[i] = tempura_kernels::activations::reglu(gate[i], up[i]);
+                        gate[i] = gate[i].max(0.0) * up[i];
                     }
                 }
             }
@@ -1906,9 +1906,9 @@ where
                     && indexed_layers[l].k_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
                     && indexed_layers[l].v_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
                     && indexed_layers[l].o_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
-                    && indexed_layers[l].gate_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
-                    && indexed_layers[l].up_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
-                    && indexed_layers[l].down_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
+                    && indexed_layers[l].gate_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false)
+                    && indexed_layers[l].up_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false)
+                    && indexed_layers[l].down_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false)
                     && indexed_layers[l].input_ln.is_some()
                     && indexed_layers[l].post_ln.is_some()
                     && indexed_layers[l].attn_sub_norm.is_none()
@@ -1937,6 +1937,10 @@ where
                 in_ln_p: usize,
                 post_ln_p: usize,
                 cl_q: usize,
+                // FFN weight types: true = Q4K, false = Q6K
+                gate_is_q4k: bool,
+                up_is_q4k: bool,
+                down_is_q4k: bool,
             }
             let gd_layers: Vec<GdLayerWeights> = (0..cfg.num_layers)
                 .map(|l| {
@@ -1945,24 +1949,35 @@ where
                     let kw = il.k_proj.as_ref().unwrap().as_q4k().unwrap();
                     let vw = il.v_proj.as_ref().unwrap().as_q4k().unwrap();
                     let ow = il.o_proj.as_ref().unwrap().as_q4k().unwrap();
-                    let gw = il.gate_proj.as_ref().unwrap().as_q4k().unwrap();
-                    let uw = il.up_proj.as_ref().unwrap().as_q4k().unwrap();
-                    let dw = il.down_proj.as_ref().unwrap().as_q4k().unwrap();
+                    let gate_w = il.gate_proj.as_ref().unwrap();
+                    let up_w   = il.up_proj.as_ref().unwrap();
+                    let down_w = il.down_proj.as_ref().unwrap();
+                    let gate_is_q4k = gate_w.as_q4k().is_some();
+                    let up_is_q4k   = up_w.as_q4k().is_some();
+                    let down_is_q4k = down_w.as_q4k().is_some();
+                    let gw_bytes: &[u8] = if gate_is_q4k { gate_w.as_q4k().unwrap() } else { gate_w.as_q6k().unwrap() };
+                    let uw_bytes: &[u8] = if up_is_q4k   { up_w.as_q4k().unwrap() }   else { up_w.as_q6k().unwrap() };
+                    let dw_bytes: &[u8] = if down_is_q4k { down_w.as_q4k().unwrap() } else { down_w.as_q6k().unwrap() };
+                    let g_bpr = if gate_is_q4k { h / tempura_kernels::Q4K_BLOCK_SIZE } else { h / tempura_kernels::Q6K_BLOCK_SIZE };
+                    let d_bpr = if down_is_q4k { inter / tempura_kernels::Q4K_BLOCK_SIZE } else { inter / tempura_kernels::Q6K_BLOCK_SIZE };
                     GdLayerWeights {
                         qw: qw.as_ptr() as usize,
                         kw: kw.as_ptr() as usize,
                         vw: vw.as_ptr() as usize,
                         ow: ow.as_ptr() as usize,
-                        gw: gw.as_ptr() as usize,
-                        uw: uw.as_ptr() as usize,
-                        dw: dw.as_ptr() as usize,
+                        gw: gw_bytes.as_ptr() as usize,
+                        uw: uw_bytes.as_ptr() as usize,
+                        dw: dw_bytes.as_ptr() as usize,
                         qkv_bpr: h / tempura_kernels::Q4K_BLOCK_SIZE,
                         o_bpr: q_dim / tempura_kernels::Q4K_BLOCK_SIZE,
-                        g_bpr: h / tempura_kernels::Q4K_BLOCK_SIZE,
-                        d_bpr: inter / tempura_kernels::Q4K_BLOCK_SIZE,
+                        g_bpr,
+                        d_bpr,
                         in_ln_p: il.input_ln.unwrap().as_ptr() as usize,
                         post_ln_p: il.post_ln.unwrap().as_ptr() as usize,
                         cl_q: cache_layer_map_q[l].unwrap(),
+                        gate_is_q4k,
+                        up_is_q4k,
+                        down_is_q4k,
                     }
                 })
                 .collect();
@@ -2013,7 +2028,7 @@ where
                 tempura_kernels::thread_pool::SpinBarrier::new(pool.thread_count());
 
             pool.run_indexed(&|ith, nth| {
-                use tempura_kernels::quantized::{q4k_preq_range_q8k, PreQuantizedActivations};
+                use tempura_kernels::quantized::{q4k_preq_range_q8k, q6k_preq_range_q8k, PreQuantizedActivations};
                 use tempura_kernels::ggml::blocks::BlockQ8K;
                 use tempura_kernels::ggml::ops_llama::{
                     rms_norm_mul_rows_f32, rope_neox_f32, rope_normal_f32,
@@ -2126,20 +2141,53 @@ where
                         };
                         cache.append_kv(lw.cl_q, k_sl, v_sl, 1);
                         let kv_len = cache.seq_len + 1;
-                        let k_cache = cache.k_data(lw.cl_q, kv_len);
-                        let v_cache = cache.v_data(lw.cl_q, kv_len);
 
                         let attn_sl = unsafe {
                             std::slice::from_raw_parts_mut(attn_outp as *mut f32, q_dim_cap)
                         };
                         attn_sl.fill(0.0);
-                        tempura_kernels::attention::CpuAttentionGgml
-                            .forward(
-                                q_sl, &k_cache, &v_cache, attn_sl,
-                                1, 1, kv_len, n_heads_cap, n_kv_heads_cap, head_dim_cap,
+
+                        if std::env::var("TEMPURA_USE_FLASH_ATTN").is_ok() {
+                            // ggml_compute_forward_flash_attn_ext_f16 path (translated from ops.cpp)
+                            // k/v are f16 in the KV cache — pass directly to the translated function.
+                            let k_f16 = cache.k_data_f16(lw.cl_q, kv_len);
+                            let v_f16 = cache.v_data_f16(lw.cl_q, kv_len);
+                            tempura_kernels::ggml::flash_attn_llama::flash_attn_ext_f16(
+                                q_sl,
+                                k_f16,
+                                v_f16,
+                                None,   // no mask for decode (causal by construction: kv_len ≤ append position)
+                                None,   // no sinks
+                                attn_sl,
+                                1,              // neq1 = n_tokens
+                                n_heads_cap,    // neq2 = n_heads
+                                1,              // neq3 = batch
+                                kv_len,         // nek1 = n_kv
+                                n_kv_heads_cap, // nek2 = n_kv_heads
+                                1,              // nek3 = batch
+                                head_dim_cap,   // dv
+                                head_dim_cap,   // dk
                                 attn_scale,
-                            )
-                            .unwrap();
+                                0.0,   // max_bias (no ALiBi)
+                                0.0,   // logit_softcap (no softcap)
+                                None,  // no partials (single-thread call)
+                                0,     // partial_stride
+                                0,              // ir0 (first head)
+                                n_heads_cap,    // ir1 (last head)
+                                0,              // ic_start
+                                kv_len,         // ic_end
+                            );
+                        } else {
+                            let k_cache = cache.k_data(lw.cl_q, kv_len);
+                            let v_cache = cache.v_data(lw.cl_q, kv_len);
+                            tempura_kernels::attention::CpuAttentionGgml
+                                .forward(
+                                    q_sl, &k_cache, &v_cache, attn_sl,
+                                    1, 1, kv_len, n_heads_cap, n_kv_heads_cap, head_dim_cap,
+                                    attn_scale,
+                                )
+                                .unwrap();
+                        }
 
                         let preq = PreQuantizedActivations::from_f32(attn_sl);
                         unsafe {
@@ -2207,21 +2255,39 @@ where
                         let gs = s;
                         let ge = e.min(inter_cap);
                         if gs < ge {
-                            unsafe {
-                                q4k_preq_range_q8k(
-                                    lw.gw as *const u8, q8kp, lw.g_bpr, h_cap,
-                                    gatep as *mut f32, gs, ge,
-                                );
+                            if lw.gate_is_q4k {
+                                unsafe {
+                                    q4k_preq_range_q8k(
+                                        lw.gw as *const u8, q8kp, lw.g_bpr, h_cap,
+                                        gatep as *mut f32, gs, ge,
+                                    );
+                                }
+                            } else {
+                                unsafe {
+                                    q6k_preq_range_q8k(
+                                        lw.gw as *const u8, q8kp, lw.g_bpr, h_cap,
+                                        gatep as *mut f32, gs, ge,
+                                    );
+                                }
                             }
                         }
                         let us = s.saturating_sub(inter_cap);
                         let ue = e.saturating_sub(inter_cap).min(inter_cap);
                         if us < ue {
-                            unsafe {
-                                q4k_preq_range_q8k(
-                                    lw.uw as *const u8, q8kp, lw.g_bpr, h_cap,
-                                    upp as *mut f32, us, ue,
-                                );
+                            if lw.up_is_q4k {
+                                unsafe {
+                                    q4k_preq_range_q8k(
+                                        lw.uw as *const u8, q8kp, lw.g_bpr, h_cap,
+                                        upp as *mut f32, us, ue,
+                                    );
+                                }
+                            } else {
+                                unsafe {
+                                    q6k_preq_range_q8k(
+                                        lw.uw as *const u8, q8kp, lw.g_bpr, h_cap,
+                                        upp as *mut f32, us, ue,
+                                    );
+                                }
                             }
                         }
                     }
@@ -2254,11 +2320,20 @@ where
                         let s = ith * h_cap / nth;
                         let e = (ith + 1) * h_cap / nth;
                         if s < e {
-                            unsafe {
-                                q4k_preq_range_q8k(
-                                    lw.dw as *const u8, q8kp, lw.d_bpr, inter_cap,
-                                    down_outp as *mut f32, s, e,
-                                );
+                            if lw.down_is_q4k {
+                                unsafe {
+                                    q4k_preq_range_q8k(
+                                        lw.dw as *const u8, q8kp, lw.d_bpr, inter_cap,
+                                        down_outp as *mut f32, s, e,
+                                    );
+                                }
+                            } else {
+                                unsafe {
+                                    q6k_preq_range_q8k(
+                                        lw.dw as *const u8, q8kp, lw.d_bpr, inter_cap,
+                                        down_outp as *mut f32, s, e,
+                                    );
+                                }
                             }
                         }
                     }
@@ -4078,8 +4153,8 @@ where
                             inter,
                             h,
                         );
-                        for i in 0..seq_len * inter {
-                            gate[i] = tempura_kernels::activations::gelu(gate[i]);
+                        for x in gate[..seq_len * inter].iter_mut() {
+                            *x = tempura_kernels::ggml::ops_llama::gelu_f32(*x);
                         }
                     }
                     crate::config::HiddenAct::GeluQuick => {
@@ -4092,8 +4167,8 @@ where
                             inter,
                             h,
                         );
-                        for i in 0..seq_len * inter {
-                            gate[i] = tempura_kernels::activations::gelu_quick(gate[i]);
+                        for x in gate[..seq_len * inter].iter_mut() {
+                            *x = tempura_kernels::ggml::ops_llama::gelu_quick_f32(*x);
                         }
                     }
                     crate::config::HiddenAct::Relu => {
@@ -4106,8 +4181,8 @@ where
                             inter,
                             h,
                         );
-                        for i in 0..seq_len * inter {
-                            gate[i] = tempura_kernels::activations::relu(gate[i]);
+                        for x in gate[..seq_len * inter].iter_mut() {
+                            *x = tempura_kernels::ggml::ops_llama::leaky_relu_f32(*x, 0.0);
                         }
                     }
                     crate::config::HiddenAct::GeGLU => {
@@ -4130,7 +4205,7 @@ where
                             h,
                         );
                         for i in 0..seq_len * inter {
-                            gate[i] = tempura_kernels::activations::geglu(gate[i], up[i]);
+                            gate[i] = tempura_kernels::ggml::ops_llama::gelu_f32(gate[i]) * up[i];
                         }
                     }
                     crate::config::HiddenAct::ReGLU => {
@@ -4153,7 +4228,7 @@ where
                             h,
                         );
                         for i in 0..seq_len * inter {
-                            gate[i] = tempura_kernels::activations::reglu(gate[i], up[i]);
+                            gate[i] = gate[i].max(0.0) * up[i];
                         }
                     }
                 }
