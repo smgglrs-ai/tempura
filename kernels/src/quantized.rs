@@ -792,6 +792,50 @@ impl crate::inference_pool::KernelJob for FusedQ4kPreq3Job {
     }
 }
 
+/// Compute Q4K GEMV for neurons `start..end` using pre-quantized activations.
+/// No internal dispatch — safe to call from within an already-parallel region
+/// (e.g. inside `thread_pool::run_indexed`).
+///
+/// # Safety
+/// All raw pointers must be valid and non-overlapping for the given ranges.
+pub unsafe fn q4k_preq_range_raw(
+    b_ptr: *const u8,
+    q8_ptr: *const i8,
+    scales_ptr: *const f32,
+    gsums_ptr: *const f32,
+    bpr: usize,
+    out_ptr: *mut f32,
+    start: usize,
+    end: usize,
+) {
+    const USE_VNNI: bool = cfg!(any(
+        target_feature = "avxvnni",
+        target_feature = "avx512vnni"
+    ));
+    for j in start..end {
+        let mut sum = 0.0f32;
+        for blk in 0..bpr {
+            let off = (j * bpr + blk) * Q4K_BLOCK_BYTES;
+            let block = std::slice::from_raw_parts(b_ptr.add(off), Q4K_BLOCK_BYTES);
+            let aq = std::slice::from_raw_parts(
+                q8_ptr.add(blk * Q4K_BLOCK_SIZE),
+                Q4K_BLOCK_SIZE,
+            );
+            let a_sc = *scales_ptr.add(blk);
+            let a_gs = std::slice::from_raw_parts(
+                gsums_ptr.add(blk * Q4K_GROUPS),
+                Q4K_GROUPS,
+            );
+            sum += if USE_VNNI {
+                q4k_dot_q8_vnni(block, aq, a_sc, a_gs)
+            } else {
+                q4k_dot_q8_avx2(block, aq, a_sc, a_gs)
+            };
+        }
+        *out_ptr.add(j) = sum;
+    }
+}
+
 // Fused QKV job: three Q6K projections sharing one f32 activation, one dispatch.
 struct FusedQ6kPreq3Job {
     b1_ptr: *const u8,

@@ -1994,6 +1994,7 @@ where
             }
 
             let skip_dn = std::env::var("TEMPURA_SKIP_DELTANET").is_ok();
+            let mut used_fused_post_attn = false;
 
             if layer_kind == crate::config::LayerKind::DeltaNet && skip_dn {
                 deltanet_layer_idx += 1;
@@ -3079,6 +3080,231 @@ where
                 } else {
                     None
                 };
+
+                // Fused O+gate+up+SiLU+down in one thread_pool::run_indexed wake (2 dispatches/layer).
+                // Activates for all-Q4K, non-parallel, dense, SiluGate decode layers.
+                'post_attn_fused: {
+                    let Some(pq) = attn_preq.as_ref() else { break 'post_attn_fused; };
+                    if !pq.is_quantized() { break 'post_attn_fused; }
+                    if seq_len != 1
+                        || cfg.parallel_attn_ffn
+                        || cfg.use_layernorm
+                        || cfg.rmsnorm_offset
+                        || cfg.n_experts > 0
+                    {
+                        break 'post_attn_fused;
+                    }
+                    if cfg.hidden_act != crate::config::HiddenAct::SiluGate {
+                        break 'post_attn_fused;
+                    }
+                    let Some(post_ln_w) = indexed_layers[layer].post_ln else {
+                        break 'post_attn_fused;
+                    };
+                    let Some(ow) = indexed_layers[layer]
+                        .o_proj
+                        .as_ref()
+                        .and_then(|w| w.as_q4k())
+                    else {
+                        break 'post_attn_fused;
+                    };
+                    let Some(gw) = indexed_layers[layer]
+                        .gate_proj
+                        .as_ref()
+                        .and_then(|w| w.as_q4k())
+                    else {
+                        break 'post_attn_fused;
+                    };
+                    let Some(uw) = indexed_layers[layer]
+                        .up_proj
+                        .as_ref()
+                        .and_then(|w| w.as_q4k())
+                    else {
+                        break 'post_attn_fused;
+                    };
+                    let Some(dw) = indexed_layers[layer]
+                        .down_proj
+                        .as_ref()
+                        .and_then(|w| w.as_q4k())
+                    else {
+                        break 'post_attn_fused;
+                    };
+
+                    let pool = tempura_kernels::thread_pool::global_pool();
+                    let barrier =
+                        tempura_kernels::thread_pool::SpinBarrier::new(pool.thread_count());
+
+                    let owp = ow.as_ptr() as usize;
+                    let gwp = gw.as_ptr() as usize;
+                    let uwp = uw.as_ptr() as usize;
+                    let dwp = dw.as_ptr() as usize;
+                    let plnp = post_ln_w.as_ptr() as usize;
+                    let pq_q8p = pq.q8.as_ptr() as usize;
+                    let pq_scp = pq.scales.as_ptr() as usize;
+                    let pq_gsp = pq.group_sums_q4k.as_ptr() as usize;
+                    let o_bpr = q_dim / tempura_kernels::Q4K_BLOCK_SIZE;
+                    let ffn_bpr = h / tempura_kernels::Q4K_BLOCK_SIZE;
+                    let dn_bpr = inter / tempura_kernels::Q4K_BLOCK_SIZE;
+                    let hp = hidden.as_mut_ptr() as usize;
+                    let n2p = normed2.as_mut_ptr() as usize;
+                    let op = o_proj.as_mut_ptr() as usize;
+                    let gp = gate.as_mut_ptr() as usize;
+                    let upp = up.as_mut_ptr() as usize;
+                    let dp = down_out.as_mut_ptr() as usize;
+                    let eps = cfg.layer_norm_eps;
+                    let do_snap = det_rmsnorm.is_some();
+
+                    let mut ffn_preq_store: Option<PreQuantizedActivations> = None;
+                    let mut gate_preq_store: Option<PreQuantizedActivations> = None;
+                    let fpsp =
+                        &mut ffn_preq_store as *mut Option<PreQuantizedActivations> as usize;
+                    let gpsp =
+                        &mut gate_preq_store as *mut Option<PreQuantizedActivations> as usize;
+
+                    pool.run_indexed(&|ith, nth| {
+                        use tempura_kernels::quantized::q4k_preq_range_raw;
+
+                        // Phase 1: O_proj (k=q_dim, n=h)
+                        {
+                            let s = ith * h / nth;
+                            let e = (ith + 1) * h / nth;
+                            unsafe {
+                                q4k_preq_range_raw(
+                                    owp as *const u8,
+                                    pq_q8p as *const i8,
+                                    pq_scp as *const f32,
+                                    pq_gsp as *const f32,
+                                    o_bpr,
+                                    op as *mut f32,
+                                    s,
+                                    e,
+                                );
+                            }
+                        }
+                        barrier.wait();
+
+                        // Thread 0: residual_add + RMSNorm → normed2 + preq
+                        if ith == 0 {
+                            let hid =
+                                unsafe { std::slice::from_raw_parts_mut(hp as *mut f32, h) };
+                            let oslc =
+                                unsafe { std::slice::from_raw_parts(op as *const f32, h) };
+                            tempura_kernels::fused::residual_add(hid, oslc, h);
+                            let wslc =
+                                unsafe { std::slice::from_raw_parts(plnp as *const f32, h) };
+                            let n2slc = unsafe {
+                                std::slice::from_raw_parts_mut(n2p as *mut f32, h)
+                            };
+                            tempura_kernels::ggml::ops_llama::rms_norm_mul_rows_f32(
+                                hid, wslc, n2slc, h, eps,
+                            );
+                            if do_snap {
+                                tempura_kernels::portable_math::q8_snap(n2slc);
+                            }
+                            let preq = PreQuantizedActivations::from_f32(n2slc);
+                            unsafe {
+                                *(fpsp as *mut Option<PreQuantizedActivations>) = Some(preq);
+                            }
+                        }
+                        barrier.wait();
+
+                        // Phase 2: gate+up (k=h, n=inter each; virtual index 0..2*inter)
+                        {
+                            let total_gu = 2 * inter;
+                            let s = ith * total_gu / nth;
+                            let e = (ith + 1) * total_gu / nth;
+                            let fq = unsafe {
+                                (*(fpsp as *const Option<PreQuantizedActivations>))
+                                    .as_ref()
+                                    .unwrap()
+                            };
+                            let fq8 = fq.q8.as_ptr() as usize;
+                            let fsc = fq.scales.as_ptr() as usize;
+                            let fgs = fq.group_sums_q4k.as_ptr() as usize;
+                            let gs = s;
+                            let ge = e.min(inter);
+                            if gs < ge {
+                                unsafe {
+                                    q4k_preq_range_raw(
+                                        gwp as *const u8,
+                                        fq8 as *const i8,
+                                        fsc as *const f32,
+                                        fgs as *const f32,
+                                        ffn_bpr,
+                                        gp as *mut f32,
+                                        gs,
+                                        ge,
+                                    );
+                                }
+                            }
+                            let us = s.saturating_sub(inter);
+                            let ue = e.saturating_sub(inter);
+                            if us < ue {
+                                unsafe {
+                                    q4k_preq_range_raw(
+                                        uwp as *const u8,
+                                        fq8 as *const i8,
+                                        fsc as *const f32,
+                                        fgs as *const f32,
+                                        ffn_bpr,
+                                        upp as *mut f32,
+                                        us,
+                                        ue,
+                                    );
+                                }
+                            }
+                        }
+                        barrier.wait();
+
+                        // Thread 0: SiLU + gate preq for down
+                        if ith == 0 {
+                            let gslc = unsafe {
+                                std::slice::from_raw_parts_mut(gp as *mut f32, inter)
+                            };
+                            let uslc =
+                                unsafe { std::slice::from_raw_parts(upp as *const f32, inter) };
+                            tempura_kernels::ggml::vec_llama::vec_silu_gate_inplace(gslc, uslc);
+                            if do_snap {
+                                tempura_kernels::portable_math::q8_snap(gslc);
+                            }
+                            let preq = PreQuantizedActivations::from_f32(gslc);
+                            unsafe {
+                                *(gpsp as *mut Option<PreQuantizedActivations>) = Some(preq);
+                            }
+                        }
+                        barrier.wait();
+
+                        // Phase 3: down (k=inter, n=h)
+                        {
+                            let s = ith * h / nth;
+                            let e = (ith + 1) * h / nth;
+                            let gq = unsafe {
+                                (*(gpsp as *const Option<PreQuantizedActivations>))
+                                    .as_ref()
+                                    .unwrap()
+                            };
+                            let gq8 = gq.q8.as_ptr() as usize;
+                            let gsc = gq.scales.as_ptr() as usize;
+                            let ggs = gq.group_sums_q4k.as_ptr() as usize;
+                            unsafe {
+                                q4k_preq_range_raw(
+                                    dwp as *const u8,
+                                    gq8 as *const i8,
+                                    gsc as *const f32,
+                                    ggs as *const f32,
+                                    dn_bpr,
+                                    dp as *mut f32,
+                                    s,
+                                    e,
+                                );
+                            }
+                        }
+                    });
+
+                    tempura_kernels::fused::residual_add(&mut hidden[..h], &down_out[..h], h);
+                    used_fused_post_attn = true;
+                } // 'post_attn_fused
+
+                if !used_fused_post_attn {
                 let o_used_x8 = seq_len > 1
                     && indexed_layers[layer]
                         .o_proj_x8
@@ -3116,6 +3342,7 @@ where
                         seq_len * h,
                     );
                 }
+                } // !used_fused_post_attn
 
                 if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer == 0 {
                     let last = &hidden[(seq_len - 1) * h..seq_len * h];
@@ -3127,7 +3354,9 @@ where
                 }
             } // end Attention block in forward_quantized
 
-            // FFN block
+            // FFN block — skipped when fused post-attn dispatch already handled it
+            'ffn_block: {
+            if used_fused_post_attn { break 'ffn_block; }
             let (ffn_input, ffn_preq) = if cfg.parallel_attn_ffn {
                 let preq = if seq_len == 1 {
                     Some(PreQuantizedActivations::from_f32(&normed[..h]))
@@ -3609,6 +3838,7 @@ where
                     eprintln!("[FQ-TRACE] L{layer}({kind}) hidden_norm={hn:.4}");
                 }
             } // end dense FFN else block
+            } // 'ffn_block
 
             if std::env::var("TEMPURA_DUMP_LOGITS").is_ok() && layer < 3 {
                 let last = &hidden[(seq_len - 1) * h..seq_len * h];
