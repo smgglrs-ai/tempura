@@ -1259,12 +1259,6 @@ where
         token_ids: &[u32],
         qweights: &crate::weights::QuantizedWeights,
     ) -> Vec<f32> {
-        // Keep inference workers spinning for the entire forward pass so that
-        // the ~128 per-token staticpar dispatches do not each pay a condvar
-        // wake cost (~20 µs).  Workers spin on gen_atomic between dispatches
-        // and park on the condvar only after this guard is dropped (between tokens).
-        let _pool_session = tempura_kernels::inference_pool::get().enter_session();
-
         use tempura_kernels::{RMSNorm, RoPE};
         let cfg = &self.config;
         let h = cfg.hidden_size;
