@@ -778,6 +778,64 @@ pub fn attention_decode_heads_f16kv(
     }
 }
 
+/// Like `attention_decode_heads_f16kv` but q and output are sub-slices starting
+/// at `head_start * head_dim`. Enables each thread to own a disjoint output slice
+/// (no aliased &mut across threads). The GQA kv_h mapping uses absolute head
+/// indices (head_start..head_end) against the full num_heads / num_kv_heads.
+pub fn attention_decode_heads_f16kv_offset(
+    q: &[f32],          // full q starting at q[head_start * head_dim]
+    k_f16: &[u16],
+    v_f16: &[u16],
+    output: &mut [f32], // partial: output[0] = attn_out[head_start * head_dim]
+    scores: &mut [f32],
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    head_start: usize,
+    head_end: usize,
+) {
+    let heads_per_group = num_heads / num_kv_heads;
+    let q_base = head_start * head_dim;
+
+    for h in head_start..head_end {
+        let kv_h = h / heads_per_group;
+        let q_offset = h * head_dim - q_base;
+        let q_vec = &q[q_offset..q_offset + head_dim];
+
+        let scores = &mut scores[..kv_len];
+        for kv_s in 0..kv_len {
+            let k_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+            scores[kv_s] =
+                unsafe { dot_f32_f16(q_vec, k_f16.as_ptr().add(k_offset), head_dim) } * scale;
+        }
+
+        let mut max_score = f32::NEG_INFINITY;
+        for &s in scores.iter() {
+            if s > max_score {
+                max_score = s;
+            }
+        }
+
+        let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(scores, max_score);
+        let inv_sum = (1.0 / sum) as f32;
+        for s in scores.iter_mut() {
+            *s *= inv_sum;
+        }
+
+        let o_offset = h * head_dim - q_base;
+        let out_slice = &mut output[o_offset..o_offset + head_dim];
+        for d in out_slice.iter_mut() {
+            *d = 0.0;
+        }
+        for (kv_s, &score) in scores.iter().enumerate() {
+            let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+            unsafe { weighted_add_f16(out_slice, v_f16.as_ptr().add(v_offset), score, head_dim) };
+        }
+    }
+}
+
 /// Compute attention for one query head (decode, seq_len=1).
 ///
 /// kv_start: first KV position to include (positions < kv_start get -inf, for sliding window).

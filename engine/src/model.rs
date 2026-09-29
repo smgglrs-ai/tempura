@@ -2183,20 +2183,89 @@ where
                             &mut *(kv_cache_ptr as *mut crate::kv_cache::KvCache)
                         };
                         cache.append_kv(lw.cl_q, k_sl, v_sl, 1);
-                        let kv_len = cache.seq_len + 1;
                         let attn_sl = unsafe {
                             std::slice::from_raw_parts_mut(attn_outp as *mut f32, q_dim_cap)
                         };
                         attn_sl.fill(0.0);
-                        let k_cache = cache.k_data(lw.cl_q, kv_len);
-                        let v_cache = cache.v_data(lw.cl_q, kv_len);
-                        tempura_kernels::attention::CpuAttentionGgml
-                            .forward(
-                                q_sl, &k_cache, &v_cache, attn_sl,
-                                1, 1, kv_len, n_heads_cap, n_kv_heads_cap, head_dim_cap,
-                                attn_scale,
-                            )
-                            .unwrap();
+                    }
+                    barrier.wait();
+
+                    // ── Node 2b: attention (parallel when kv_len >= n_heads, else sequential) ──
+                    // Translates flash_attn_ext_f16 ith/nth dispatch for long contexts.
+                    // All threads hit barrier.wait() unconditionally.
+                    {
+                        let kv_len_l = unsafe {
+                            (*(kv_cache_ptr as *const crate::kv_cache::KvCache)).seq_len + 1
+                        };
+                        // Parallelize only when enough KV positions to amortize barrier overhead,
+                        // AND F16 KV is available (parallel path uses k_data_f16).
+                        let cache_ref = unsafe { &*(kv_cache_ptr as *const crate::kv_cache::KvCache) };
+                        if kv_len_l >= n_heads_cap && cache_ref.use_f16 {
+                            let k_f16 = cache_ref.k_data_f16(lw.cl_q, kv_len_l);
+                            let v_f16 = cache_ref.v_data_f16(lw.cl_q, kv_len_l);
+                            let h_per = (n_heads_cap + nth - 1) / nth;
+                            let h_start = (ith * h_per).min(n_heads_cap);
+                            let h_end = ((ith + 1) * h_per).min(n_heads_cap);
+                            if h_start < h_end {
+                                let q_sl = unsafe {
+                                    std::slice::from_raw_parts(
+                                        (qp as *const f32).add(h_start * head_dim_cap),
+                                        (h_end - h_start) * head_dim_cap,
+                                    )
+                                };
+                                let out_sl = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        (attn_outp as *mut f32).add(h_start * head_dim_cap),
+                                        (h_end - h_start) * head_dim_cap,
+                                    )
+                                };
+                                let mut scores = vec![0.0f32; kv_len_l];
+                                tempura_kernels::attention::attention_decode_heads_f16kv_offset(
+                                    q_sl, k_f16, v_f16, out_sl, &mut scores,
+                                    kv_len_l, n_heads_cap, n_kv_heads_cap, head_dim_cap,
+                                    attn_scale, h_start, h_end,
+                                );
+                            }
+                        } else if ith == 0 {
+                            // Short context: sequential on thread 0.
+                            let cache = unsafe {
+                                &*(kv_cache_ptr as *const crate::kv_cache::KvCache)
+                            };
+                            let q_sl = unsafe {
+                                std::slice::from_raw_parts(qp as *const f32, q_dim_cap)
+                            };
+                            let attn_sl = unsafe {
+                                std::slice::from_raw_parts_mut(attn_outp as *mut f32, q_dim_cap)
+                            };
+                            if cache.use_f16 {
+                                let k_f16 = cache.k_data_f16(lw.cl_q, kv_len_l);
+                                let v_f16 = cache.v_data_f16(lw.cl_q, kv_len_l);
+                                let mut scores = vec![0.0f32; kv_len_l];
+                                tempura_kernels::attention::attention_decode_heads_f16kv(
+                                    q_sl, k_f16, v_f16, attn_sl, &mut scores,
+                                    kv_len_l, n_heads_cap, n_kv_heads_cap, head_dim_cap,
+                                    attn_scale, 0, n_heads_cap,
+                                );
+                            } else {
+                                let k_cache = cache.k_data(lw.cl_q, kv_len_l);
+                                let v_cache = cache.v_data(lw.cl_q, kv_len_l);
+                                tempura_kernels::attention::CpuAttentionGgml
+                                    .forward(
+                                        q_sl, &k_cache, &v_cache, attn_sl,
+                                        1, 1, kv_len_l, n_heads_cap, n_kv_heads_cap, head_dim_cap,
+                                        attn_scale,
+                                    )
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── Node 2c: quantize attn_out → attn_preq (ith==0) ──────────
+                    if ith == 0 {
+                        let attn_sl = unsafe {
+                            std::slice::from_raw_parts(attn_outp as *const f32, q_dim_cap)
+                        };
                         let preq = PreQuantizedActivations::from_f32(attn_sl);
                         unsafe {
                             *(ap_ptr as *mut Option<PreQuantizedActivations>).add(layer) =
