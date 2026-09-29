@@ -290,6 +290,14 @@ impl<'a> PreIndexedWeight<'a> {
         }
     }
 
+    pub fn as_q5k(&self) -> Option<&'a [u8]> {
+        use tempura_kernels::ggml::GgmlType;
+        match self {
+            PreIndexedWeight::Typed(GgmlType::Q5K, w) => Some(w),
+            _ => None,
+        }
+    }
+
     pub fn as_q6k(&self) -> Option<&'a [u8]> {
         use tempura_kernels::ggml::GgmlType;
         match self {

@@ -1882,7 +1882,6 @@ where
         // ── ggml_graph_compute_thread translation ────────────────────────────────
         // Workers dispatched ONCE for all layers; per-node SpinBarrier;
         // sequential ops (norm, attention) run on ith==0 only.
-        // Condition: all-Q4K dense SiluGate standard-RoPE single-token decode.
         let can_use_graph_decode = seq_len == 1
             && !cfg.parallel_attn_ffn
             && !cfg.use_layernorm
@@ -1897,29 +1896,27 @@ where
             && cfg.rope_scaling.is_none()
             && layernorm.is_none()
             && (0..cfg.num_layers).all(|l| {
-                cfg.layer_kinds
-                    .as_ref()
-                    .map(|k| k[l] == crate::config::LayerKind::Attention)
-                    .unwrap_or(true)
-                    && indexed_layers[l].q_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
-                    && indexed_layers[l].k_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
-                    && indexed_layers[l].v_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
-                    && indexed_layers[l].o_proj.as_ref().and_then(|w| w.as_q4k()).is_some()
-                    && indexed_layers[l].gate_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false)
-                    && indexed_layers[l].up_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false)
-                    && indexed_layers[l].down_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false)
-                    && indexed_layers[l].input_ln.is_some()
-                    && indexed_layers[l].post_ln.is_some()
-                    && indexed_layers[l].attn_sub_norm.is_none()
-                    && indexed_layers[l].ffn_sub_norm.is_none()
-                    && cache_layer_map_q[l].is_some()
-                    && {
-                        // Q proj must have exactly q_dim rows (no q_gate fused)
-                        let qb = indexed_layers[l].q_proj.as_ref().unwrap().as_q4k().unwrap();
-                        let row_bytes = (h / tempura_kernels::Q4K_BLOCK_SIZE)
-                            * tempura_kernels::Q4K_BLOCK_BYTES;
-                        qb.len() == q_dim * row_bytes
-                    }
+                let il = &indexed_layers[l];
+                let ok_kind = cfg.layer_kinds.as_ref().map(|k| k[l] == crate::config::LayerKind::Attention).unwrap_or(true);
+                let ok_q = il.q_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q5k().is_some() || w.as_q6k().is_some() || w.as_f16().is_some()).unwrap_or(false);
+                let ok_k = il.k_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q5k().is_some() || w.as_q6k().is_some() || w.as_f16().is_some()).unwrap_or(false);
+                let ok_v = il.v_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q5k().is_some() || w.as_q6k().is_some() || w.as_f16().is_some()).unwrap_or(false);
+                let ok_o = il.o_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q5k().is_some() || w.as_q6k().is_some() || w.as_f16().is_some()).unwrap_or(false);
+                let ok_gate = il.gate_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false);
+                let ok_up   = il.up_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false);
+                let ok_down = il.down_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false);
+                let ok_ln   = il.input_ln.is_some() && il.post_ln.is_some();
+                let ok_sub  = il.attn_sub_norm.is_none() && il.ffn_sub_norm.is_none();
+                let ok_cl   = cache_layer_map_q[l].is_some();
+                let ok_qlen = ok_q && {
+                    let qb = il.q_proj.as_ref().unwrap().as_q4k().unwrap();
+                    let row_bytes = (h / tempura_kernels::Q4K_BLOCK_SIZE) * tempura_kernels::Q4K_BLOCK_BYTES;
+                    qb.len() == q_dim * row_bytes
+                };
+                if !ok_kind || !ok_q || !ok_k || !ok_v || !ok_o || !ok_gate || !ok_up || !ok_down || !ok_ln || !ok_sub || !ok_cl || !ok_qlen {
+                    return false;
+                }
+                true
             });
 
         'skip_layer_loop: {
@@ -1939,6 +1936,8 @@ where
                 // Optional QK norms (Qwen3-style); 0 = absent
                 q_norm_p: usize,
                 k_norm_p: usize,
+                // Attention weight types (0=Q4K, 1=Q5K, 2=Q6K, 3=F16)
+                q_type: u8, k_type: u8, v_type: u8, o_type: u8,
                 // FFN weight types: true = Q4K, false = Q6K
                 gate_is_q4k: bool,
                 up_is_q4k: bool,
@@ -1947,10 +1946,17 @@ where
             let gd_layers: Vec<GdLayerWeights> = (0..cfg.num_layers)
                 .map(|l| {
                     let il = &indexed_layers[l];
-                    let qw = il.q_proj.as_ref().unwrap().as_q4k().unwrap();
-                    let kw = il.k_proj.as_ref().unwrap().as_q4k().unwrap();
-                    let vw = il.v_proj.as_ref().unwrap().as_q4k().unwrap();
-                    let ow = il.o_proj.as_ref().unwrap().as_q4k().unwrap();
+                    // Helper: (bytes, type_id) where type_id 0=Q4K, 1=Q5K, 2=Q6K
+                    fn resolve_kq<'x>(w: &crate::weights::PreIndexedWeight<'x>, block: usize) -> (&'x [u8], u8, usize) {
+                        if let Some(b) = w.as_q4k() { return (b, 0, block / tempura_kernels::Q4K_BLOCK_SIZE); }
+                        if let Some(b) = w.as_q5k() { return (b, 1, block / tempura_kernels::Q5K_BLOCK_SIZE); }
+                        if let Some(b) = w.as_q6k() { return (b, 2, block / tempura_kernels::Q6K_BLOCK_SIZE); }
+                        let b = w.as_f16().unwrap(); (b, 3, 0) // bpr unused for F16
+                    }
+                    let (qbytes, qtype, qkv_bpr) = resolve_kq(il.q_proj.as_ref().unwrap(), h);
+                    let (kbytes, ktype, _)  = resolve_kq(il.k_proj.as_ref().unwrap(), h);
+                    let (vbytes, vtype, _)  = resolve_kq(il.v_proj.as_ref().unwrap(), h);
+                    let (obytes, otype, o_bpr_l) = resolve_kq(il.o_proj.as_ref().unwrap(), q_dim);
                     let gate_w = il.gate_proj.as_ref().unwrap();
                     let up_w   = il.up_proj.as_ref().unwrap();
                     let down_w = il.down_proj.as_ref().unwrap();
@@ -1963,15 +1969,15 @@ where
                     let g_bpr = if gate_is_q4k { h / tempura_kernels::Q4K_BLOCK_SIZE } else { h / tempura_kernels::Q6K_BLOCK_SIZE };
                     let d_bpr = if down_is_q4k { inter / tempura_kernels::Q4K_BLOCK_SIZE } else { inter / tempura_kernels::Q6K_BLOCK_SIZE };
                     GdLayerWeights {
-                        qw: qw.as_ptr() as usize,
-                        kw: kw.as_ptr() as usize,
-                        vw: vw.as_ptr() as usize,
-                        ow: ow.as_ptr() as usize,
+                        qw: qbytes.as_ptr() as usize,
+                        kw: kbytes.as_ptr() as usize,
+                        vw: vbytes.as_ptr() as usize,
+                        ow: obytes.as_ptr() as usize,
                         gw: gw_bytes.as_ptr() as usize,
                         uw: uw_bytes.as_ptr() as usize,
                         dw: dw_bytes.as_ptr() as usize,
-                        qkv_bpr: h / tempura_kernels::Q4K_BLOCK_SIZE,
-                        o_bpr: q_dim / tempura_kernels::Q4K_BLOCK_SIZE,
+                        qkv_bpr,
+                        o_bpr: o_bpr_l,
                         g_bpr,
                         d_bpr,
                         in_ln_p: il.input_ln.unwrap().as_ptr() as usize,
@@ -1979,6 +1985,8 @@ where
                         cl_q: cache_layer_map_q[l].unwrap(),
                         q_norm_p: il.q_norm.map(|w| w.as_ptr() as usize).unwrap_or(0),
                         k_norm_p: il.k_norm.map(|w| w.as_ptr() as usize).unwrap_or(0),
+                        q_type: qtype, k_type: ktype, v_type: vtype,
+                        o_type: otype,
                         gate_is_q4k,
                         up_is_q4k,
                         down_is_q4k,
@@ -2032,8 +2040,20 @@ where
                 tempura_kernels::thread_pool::SpinBarrier::new(pool.thread_count());
 
             pool.run_indexed(&|ith, nth| {
-                use tempura_kernels::quantized::{q4k_preq_range_q8k, q6k_preq_range_q8k, PreQuantizedActivations};
+                use tempura_kernels::quantized::{q4k_preq_range_q8k, q5k_preq_range_q8k, q6k_preq_range_q8k, f16_preq_range, PreQuantizedActivations};
                 use tempura_kernels::ggml::blocks::BlockQ8K;
+                // Dispatch: weight type 0=Q4K, 1=Q5K, 2=Q6K, 3=F16
+                // For 0-2: uses q8k (BlockQ8K activation). For 3 (F16): uses normed_f32 directly.
+                let dispatch_qk = |b: *const u8, q8k: *const BlockQ8K, normed_f32: *const f32, bpr: usize, k: usize, out: *mut f32, s: usize, e: usize, ty: u8| {
+                    unsafe {
+                        match ty {
+                            0 => q4k_preq_range_q8k(b, q8k, bpr, k, out, s, e),
+                            1 => q5k_preq_range_q8k(b, q8k, bpr, k, out, s, e),
+                            2 => q6k_preq_range_q8k(b, q8k, bpr, k, out, s, e),
+                            _ => f16_preq_range(b, normed_f32, k, out, s, e),
+                        }
+                    }
+                };
                 use tempura_kernels::ggml::ops_llama::{
                     rms_norm_mul_rows_f32, rope_neox_f32, rope_normal_f32,
                 };
@@ -2075,35 +2095,27 @@ where
                         let total = q_dim_cap + kv_dim_cap + kv_dim_cap;
                         let s = ith * total / nth;
                         let e = (ith + 1) * total / nth;
+                        let normed_f32p = unsafe {
+                            (*((np_ptr as *const Option<PreQuantizedActivations>).add(layer)))
+                                .as_ref().unwrap().q8.as_ptr() as *const f32
+                        };
+                        // ↑ NOTE: for F16 dispatch the actual f32 normed is used not q8
+                        // Use the raw normed slice pointer which is safe here
+                        let normed_raw = normedp as *const f32;
                         let qs = s;
                         let qe = e.min(q_dim_cap);
                         if qs < qe {
-                            unsafe {
-                                q4k_preq_range_q8k(
-                                    lw.qw as *const u8, q8kp, bpr, h_cap,
-                                    qp as *mut f32, qs, qe,
-                                );
-                            }
+                            dispatch_qk(lw.qw as *const u8, q8kp, normed_raw, bpr, h_cap, qp as *mut f32, qs, qe, lw.q_type);
                         }
                         let ks = s.saturating_sub(q_dim_cap);
                         let ke = e.saturating_sub(q_dim_cap).min(kv_dim_cap);
                         if ks < ke {
-                            unsafe {
-                                q4k_preq_range_q8k(
-                                    lw.kw as *const u8, q8kp, bpr, h_cap,
-                                    kp as *mut f32, ks, ke,
-                                );
-                            }
+                            dispatch_qk(lw.kw as *const u8, q8kp, normed_raw, bpr, h_cap, kp as *mut f32, ks, ke, lw.k_type);
                         }
                         let vs = s.saturating_sub(q_dim_cap + kv_dim_cap);
                         let ve = e.saturating_sub(q_dim_cap + kv_dim_cap).min(kv_dim_cap);
                         if vs < ve {
-                            unsafe {
-                                q4k_preq_range_q8k(
-                                    lw.vw as *const u8, q8kp, bpr, h_cap,
-                                    vp as *mut f32, vs, ve,
-                                );
-                            }
+                            dispatch_qk(lw.vw as *const u8, q8kp, normed_raw, bpr, h_cap, vp as *mut f32, vs, ve, lw.v_type);
                         }
                     }
                     barrier.wait();
@@ -2235,13 +2247,10 @@ where
                         let q8kp = pq.q8k.as_ptr();
                         let s = ith * h_cap / nth;
                         let e = (ith + 1) * h_cap / nth;
+                        // For O_proj, activation is attn_out (f32), not normed
+                        let attn_f32p = attn_outp as *const f32;
                         if s < e {
-                            unsafe {
-                                q4k_preq_range_q8k(
-                                    lw.ow as *const u8, q8kp, lw.o_bpr, q_dim_cap,
-                                    o_projp as *mut f32, s, e,
-                                );
-                            }
+                            dispatch_qk(lw.ow as *const u8, q8kp, attn_f32p, lw.o_bpr, q_dim_cap, o_projp as *mut f32, s, e, lw.o_type);
                         }
                     }
                     barrier.wait();

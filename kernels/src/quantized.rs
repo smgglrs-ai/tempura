@@ -881,6 +881,55 @@ pub unsafe fn q6k_preq_range_q8k(
     }
 }
 
+/// F16 weight × f32 activation GEMV for a range of output rows.
+/// Used inside the graph decode closure (no thread-pool — caller already parallel).
+pub unsafe fn f16_preq_range(
+    b_f16: *const u8,  // F16 weight matrix, row-major, each row is k * 2 bytes
+    a_f32: *const f32, // f32 activation vector of length k
+    k: usize,
+    out_ptr: *mut f32,
+    start: usize,
+    end: usize,
+) {
+    let row_bytes = k * 2;
+    let a = std::slice::from_raw_parts(a_f32, k);
+    for j in start..end {
+        let b_row = std::slice::from_raw_parts(b_f16.add(j * row_bytes), row_bytes);
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("f16c")
+            && is_x86_feature_detected!("fma")
+        {
+            *out_ptr.add(j) = crate::f16_gemv::f16_dot_avx2(a, b_row, k);
+            continue;
+        }
+        let val = crate::f16_gemv::f16_dot_scalar(a, b_row, k);
+        *out_ptr.add(j) = val;
+    }
+}
+
+/// Like `q4k_preq_range_q8k` but for Q5K weights, using `ggml_vec_dot_q5_k_q8_k`.
+pub unsafe fn q5k_preq_range_q8k(
+    b_ptr: *const u8,
+    q8k: *const crate::ggml::blocks::BlockQ8K,
+    bpr: usize,
+    k: usize,
+    out_ptr: *mut f32,
+    start: usize,
+    end: usize,
+) {
+    use crate::ggml::blocks::{BlockQ5K, BlockQ8K};
+    let bq_row_bytes = bpr * crate::ggml::blocks::BLOCK_Q5K_SIZE;
+    let a = std::slice::from_raw_parts(q8k, bpr);
+    for j in start..end {
+        let w = std::slice::from_raw_parts(
+            b_ptr.add(j * bq_row_bytes) as *const BlockQ5K,
+            bpr,
+        );
+        *out_ptr.add(j) = crate::ggml::quants_llama::ggml_vec_dot_q5_k_q8_k(k, w, a);
+    }
+}
+
 // Fused QKV job: three Q6K projections sharing one f32 activation, one dispatch.
 struct FusedQ6kPreq3Job {
     b1_ptr: *const u8,
