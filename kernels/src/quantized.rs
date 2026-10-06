@@ -4780,6 +4780,38 @@ impl PreQuantizedActivations {
         }
     }
 
+    /// Minimal variant for graph decode: only q8 + scales + q8k.
+    /// Skips group_sums, i2s, q16, q8_32 — none used in Q4K/Q6K graph nodes.
+    pub fn from_f32_q8k_only(a: &[f32]) -> Self {
+        let k = a.len();
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            let (q8, scales, _) = unsafe { quantize_row_q8_avx2(a) };
+            let bpr = k / Q4K_BLOCK_SIZE;
+            let mut q8k: Vec<crate::ggml::blocks::BlockQ8K> = Vec::with_capacity(bpr);
+            for blk in 0..bpr {
+                let base = blk * Q4K_BLOCK_SIZE;
+                let mut qs = [0i8; 256];
+                qs.copy_from_slice(&q8[base..base + Q4K_BLOCK_SIZE]);
+                let mut bsums = [0i16; 16];
+                for g in 0..16 {
+                    let mut s = 0i32;
+                    for i in 0..16 { s += qs[g * 16 + i] as i32; }
+                    bsums[g] = s as i16;
+                }
+                q8k.push(crate::ggml::blocks::BlockQ8K { d: scales[blk], qs, bsums });
+            }
+            return Self {
+                q8, q16: Vec::new(), scales, scales_i16: Vec::new(),
+                group_sums_q4k: Vec::new(), group_sums_q6k: Vec::new(),
+                i2s_q8: Vec::new(), i2s_scale: 0.0, i2s_sum: 0,
+                q8_32: Vec::new(), scales_32: Vec::new(), asum_32: Vec::new(),
+                q8k, k,
+            };
+        }
+        Self::from_f32(a)
+    }
+
     pub fn i2s_only(a: &[f32]) -> Self {
         let k = a.len();
         #[cfg(target_arch = "x86_64")]

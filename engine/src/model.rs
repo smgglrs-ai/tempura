@@ -2078,7 +2078,7 @@ where
                             std::slice::from_raw_parts_mut(normedp as *mut f32, h_cap)
                         };
                         rms_norm_mul_rows_f32(hid, in_w, nrm, h_cap, eps);
-                        let preq = PreQuantizedActivations::from_f32(nrm);
+                        let preq = PreQuantizedActivations::from_f32_q8k_only(nrm);
                         unsafe {
                             *(np_ptr as *mut Option<PreQuantizedActivations>).add(layer) =
                                 Some(preq);
@@ -2266,7 +2266,7 @@ where
                         let attn_sl = unsafe {
                             std::slice::from_raw_parts(attn_outp as *const f32, q_dim_cap)
                         };
-                        let preq = PreQuantizedActivations::from_f32(attn_sl);
+                        let preq = PreQuantizedActivations::from_f32_q8k_only(attn_sl);
                         unsafe {
                             *(ap_ptr as *mut Option<PreQuantizedActivations>).add(layer) =
                                 Some(preq);
@@ -2307,7 +2307,7 @@ where
                             std::slice::from_raw_parts_mut(normed2p as *mut f32, h_cap)
                         };
                         rms_norm_mul_rows_f32(hid, post_w, n2, h_cap, eps);
-                        let preq = PreQuantizedActivations::from_f32(n2);
+                        let preq = PreQuantizedActivations::from_f32_q8k_only(n2);
                         unsafe {
                             *(fp_ptr as *mut Option<PreQuantizedActivations>).add(layer) =
                                 Some(preq);
@@ -2375,7 +2375,7 @@ where
                         let up_sl =
                             unsafe { std::slice::from_raw_parts(upp as *const f32, inter_cap) };
                         vec_silu_gate_inplace(gate_sl, up_sl);
-                        let preq = PreQuantizedActivations::from_f32(gate_sl);
+                        let preq = PreQuantizedActivations::from_f32_q8k_only(gate_sl);
                         unsafe {
                             *(gp_ptr as *mut Option<PreQuantizedActivations>).add(layer) =
                                 Some(preq);
