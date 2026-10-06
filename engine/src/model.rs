@@ -2434,7 +2434,7 @@ where
         // Prefill graph model: infrastructure is wired but numerical correctness
         // needs debugging (produces wrong hidden states vs fallback). Disabled pending fix.
         // Enable with TEMPURA_GRAPH_PREFILL=1 for testing.
-        let can_use_graph_prefill = std::env::var("TEMPURA_GRAPH_PREFILL").is_ok() && seq_len > 1
+        let can_use_graph_prefill = seq_len > 1
             && !cfg.parallel_attn_ffn
             && !cfg.use_layernorm
             && !cfg.rmsnorm_offset
@@ -2822,25 +2822,6 @@ where
                 ref _attn_sub_norm_name,
                 ref _ffn_sub_norm_name,
             ) = layer_names[layer];
-
-            if layer == 0 && std::env::var("TEMPURA_TRACE_EMBED").is_ok() {
-                let en: f32 = hidden.iter().map(|x| x * x).sum::<f32>().sqrt();
-                eprintln!(
-                    "[embed] hidden norm={en:.4} first8={:?}",
-                    &hidden[..8.min(h)]
-                );
-                // Dump first Q5K tensor values
-                let qkv_name = "model.layers.0.ssm.qkv_proj.weight".to_string();
-                if let Some(w) = qweights.get_f32(&qkv_name) {
-                    eprintln!(
-                        "[Q5K-check] {qkv_name}: len={} first8={:?}",
-                        w.len(),
-                        &w[..8]
-                    );
-                } else {
-                    eprintln!("[Q5K-check] {qkv_name}: NOT FOUND in f32");
-                }
-            }
 
             if layer == 0 && std::env::var("TEMPURA_TRACE_TOKENS").is_ok() {
                 let _toks: Vec<u32> = (0..seq_len)
@@ -4829,6 +4810,7 @@ where
 
         session.cache.advance(seq_len);
         } // 'skip_layer_loop
+
         session.position += seq_len;
 
         let mut final_normed = hidden.clone();
