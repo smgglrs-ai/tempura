@@ -2042,19 +2042,17 @@ where
             let barrier =
                 tempura_kernels::thread_pool::SpinBarrier::new(pool.thread_count());
 
+            // Initialise type_traits_cpu equivalent; no-op after first call.
+            let ktable = tempura_kernels::kernel_table::init();
+
             pool.run_indexed(&|ith, nth| {
-                use tempura_kernels::quantized::{q4k_preq_range_q8k, q5k_preq_range_q8k, q6k_preq_range_q8k, f16_preq_range, PreQuantizedActivations};
+                use tempura_kernels::quantized::{q4k_preq_range_q8k, q6k_preq_range_q8k, PreQuantizedActivations};
                 use tempura_kernels::ggml::blocks::BlockQ8K;
-                // Dispatch: weight type 0=Q4K, 1=Q5K, 2=Q6K, 3=F16
-                // For 0-2: uses q8k (BlockQ8K activation). For 3 (F16): uses normed_f32 directly.
+                // Dispatch via kernel table — single fn-pointer call, no match on hw at token time.
+                // Matches llama.cpp type_traits_cpu[ty].vec_dot.
                 let dispatch_qk = |b: *const u8, q8k: *const BlockQ8K, normed_f32: *const f32, bpr: usize, k: usize, out: *mut f32, s: usize, e: usize, ty: u8| {
                     unsafe {
-                        match ty {
-                            0 => q4k_preq_range_q8k(b, q8k, bpr, k, out, s, e),
-                            1 => q5k_preq_range_q8k(b, q8k, bpr, k, out, s, e),
-                            2 => q6k_preq_range_q8k(b, q8k, bpr, k, out, s, e),
-                            _ => f16_preq_range(b, normed_f32, k, out, s, e),
-                        }
+                        (ktable[ty as usize].vec_dot_q8k)(b, q8k, normed_f32, bpr, k, out, s, e)
                     }
                 };
                 use tempura_kernels::ggml::ops_llama::{

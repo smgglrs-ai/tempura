@@ -7,6 +7,7 @@ pub use tempura_kernel_api::{
     Q6K_BLOCK_SIZE, Q6K_GROUPS, Q6K_GROUP_SIZE, TQ2_BLOCK_BYTES, TQ2_BLOCK_SIZE,
 };
 
+pub use ggml::kernel_table;
 pub mod activations;
 pub mod allreduce;
 pub mod attention;
