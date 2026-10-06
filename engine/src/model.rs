@@ -2576,6 +2576,10 @@ where
             let pool = tempura_kernels::thread_pool::global_pool();
             let barrier = tempura_kernels::thread_pool::SpinBarrier::new(pool.thread_count());
 
+            // kv_len after each layer's append — written by ith==0, read by all after barrier
+            let mut layer_kv_lens_pf = vec![0usize; n_layers_cap];
+            let kv_len_pf_ptr = layer_kv_lens_pf.as_mut_ptr() as usize;
+
             pool.run_indexed(&|ith, nth| {
                 for layer in 0..n_layers_cap {
                     let lw = &gp_layers[layer];
@@ -2660,7 +2664,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N2: RoPE + KV-cache append + attention (ith==0) ────────
+                    // ── N2a: QK-norm + RoPE + KV-cache append (ith==0) ────────
                     if ith == 0 {
                         let q_sl = unsafe { std::slice::from_raw_parts_mut(qp as *mut f32, m_cap * q_dim_cap) };
                         let k_sl = unsafe { std::slice::from_raw_parts_mut(kp as *mut f32, m_cap * kv_dim_cap) };
@@ -2695,17 +2699,38 @@ where
                         let v_sl = unsafe { std::slice::from_raw_parts(vp as *const f32, m_cap * kv_dim_cap) };
                         let cache = unsafe { &mut *(kv_cache_ptr as *mut crate::kv_cache::KvCache) };
                         cache.append_kv(lw.cl_q, k_sl, v_sl, m_cap);
-                        let kv_len = cache.seq_len + m_cap;
+                        // Store kv_len for the parallel attention node
+                        unsafe { *(kv_len_pf_ptr as *mut usize).add(layer) = cache.seq_len + m_cap; }
                         let attn_sl = unsafe { std::slice::from_raw_parts_mut(attn_outp as *mut f32, m_cap * q_dim_cap) };
                         attn_sl.fill(0.0);
-                        let k_cache = cache.k_data(lw.cl_q, kv_len);
-                        let v_cache = cache.v_data(lw.cl_q, kv_len);
-                        let mut scores = vec![0.0f32; kv_len];
-                        tempura_kernels::attention::attention_prefill_items(
-                            q_sl, &k_cache, &v_cache, attn_outp,
-                            &mut scores, m_cap, kv_len,
-                            n_heads_cap, n_kv_heads_cap, head_dim_cap, attn_scale, 0, m_cap * n_heads_cap,
-                        );
+                    }
+                    barrier.wait();
+
+                    // ── N2b: parallel attention over (token × head) items ──────
+                    // All threads compute attention for their assigned (token, head) pairs.
+                    // Translates llama.cpp flash_attn_ext_f16 ith/nth dispatch for prefill.
+                    {
+                        let kv_len_l = unsafe { *(kv_len_pf_ptr as *const usize).add(layer) };
+                        let cache = unsafe { &*(kv_cache_ptr as *const crate::kv_cache::KvCache) };
+                        let k_f16 = cache.k_data_f16(lw.cl_q, kv_len_l);
+                        let v_f16 = cache.v_data_f16(lw.cl_q, kv_len_l);
+                        let q_sl = unsafe { std::slice::from_raw_parts(qp as *const f32, m_cap * q_dim_cap) };
+                        // Partition 4096 items (128 tokens × 32 heads) across threads
+                        let total_items = m_cap * n_heads_cap;
+                        let items_per = (total_items + nth - 1) / nth;
+                        let i_start = (ith * items_per).min(total_items);
+                        let i_end   = ((ith + 1) * items_per).min(total_items);
+                        let mut scores = vec![0.0f32; kv_len_l.max(1)];
+                        if i_start < i_end {
+                            tempura_kernels::attention::attention_prefill_items_f16kv(
+                                q_sl, k_f16, v_f16,
+                                attn_outp,
+                                &mut scores,
+                                m_cap, kv_len_l,
+                                n_heads_cap, n_kv_heads_cap, head_dim_cap,
+                                attn_scale, i_start, i_end,
+                            );
+                        }
                     }
                     barrier.wait();
 
