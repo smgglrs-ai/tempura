@@ -855,7 +855,7 @@ pub unsafe fn q4k_preq_range_q8k(
             b_ptr.add(j * bq_row_bytes) as *const BlockQ4K,
             bpr,
         );
-        *out_ptr.add(j) = crate::ggml::quants_llama::ggml_vec_dot_q4_k_q8_k(k, w, a);
+        *out_ptr.add(j) = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(k, w, a);
     }
 }
 
@@ -877,7 +877,7 @@ pub unsafe fn q6k_preq_range_q8k(
             b_ptr.add(j * bq_row_bytes) as *const BlockQ6K,
             bpr,
         );
-        *out_ptr.add(j) = crate::ggml::quants_llama::ggml_vec_dot_q6_k_q8_k(k, w, a);
+        *out_ptr.add(j) = crate::ggml::vec_dot_avx2::vec_dot_q6_k_q8_k_dispatch(k, w, a);
     }
 }
 
