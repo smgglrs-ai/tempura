@@ -1789,6 +1789,7 @@ impl GgufLoader {
     pub fn to_quantized_weights(self) -> crate::weights::QuantizedWeights {
         let q2_shapes = self.q2_tensor_shapes();
         let q4k_shapes = self.q4k_tensor_shapes();
+        let q6k_shapes = self.q6k_tensor_shapes();
         let mut typed_tensors = HashMap::new();
         let mut f32_tensors = HashMap::new();
 
@@ -1889,6 +1890,10 @@ impl GgufLoader {
             qw.build_q4k_repacked(&q4k_shapes);
         }
 
+        if !q6k_shapes.is_empty() {
+            qw.build_q6k_repacked(&q6k_shapes);
+        }
+
         qw
     }
 
@@ -1913,6 +1918,31 @@ impl GgufLoader {
         }
         for (name, dtype) in &self.tensor_dtypes {
             if *dtype == GgmlType::Q4K && !self.mmap_ranges.contains_key(name.as_str()) {
+                if let Some(dims) = self.raw_tensor_dims.get(name) {
+                    if dims.len() >= 2 {
+                        let key = map_gguf_name(name).unwrap_or_else(|| name.clone());
+                        shapes.insert(key, (dims[1] as usize, dims[0] as usize));
+                    }
+                }
+            }
+        }
+        shapes
+    }
+
+    pub fn q6k_tensor_shapes(&self) -> HashMap<String, (usize, usize)> {
+        let mut shapes = HashMap::new();
+        for (name, &(_, _, dtype)) in &self.mmap_ranges {
+            if dtype == GgmlType::Q6K {
+                if let Some(dims) = self.raw_tensor_dims.get(name) {
+                    if dims.len() >= 2 {
+                        let key = map_gguf_name(name).unwrap_or_else(|| name.clone());
+                        shapes.insert(key, (dims[1] as usize, dims[0] as usize));
+                    }
+                }
+            }
+        }
+        for (name, dtype) in &self.tensor_dtypes {
+            if *dtype == GgmlType::Q6K && !self.mmap_ranges.contains_key(name.as_str()) {
                 if let Some(dims) = self.raw_tensor_dims.get(name) {
                     if dims.len() >= 2 {
                         let key = map_gguf_name(name).unwrap_or_else(|| name.clone());

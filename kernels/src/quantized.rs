@@ -952,6 +952,30 @@ pub unsafe fn q4k_prefill_gemm_x8_range(
     crate::ggml::repack_llama2::ggml_gemm_q4_k_8x8_q8_k(k, s, n, vx, q8kx4_act as *const u8, m, nc);
 }
 
+/// Q6K repacked (Q6Kx8) × Q8Kx4 activation batch GEMM for `j_start..j_end` weight rows.
+/// Mirrors q4k_prefill_gemm_x8_range but for Q6K down_proj.
+/// Requires j_start%8==0, (j_end-j_start)%8==0, m%4==0.
+pub unsafe fn q6k_prefill_gemm_x8_range(
+    b_q6kx8: *const u8,
+    q8kx4_act: *const crate::ggml::blocks::BlockQ8Kx4,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    bpr: usize,
+    k: usize,
+    j_start: usize,
+    j_end: usize,
+) {
+    use crate::ggml::blocks::BlockQ6Kx8;
+    if j_start >= j_end { return; }
+    let nc = j_end - j_start;
+    if nc == 0 || nc % 8 != 0 || m % 4 != 0 { return; }
+    let bx8_row_bytes = bpr * std::mem::size_of::<BlockQ6Kx8>();
+    let vx = b_q6kx8.add((j_start / 8) * bx8_row_bytes);
+    let s = out.add(j_start);
+    crate::ggml::repack_llama::ggml_gemm_q6_k_8x4_q8_k(k, s, n, vx, q8kx4_act as *const u8, m, nc);
+}
+
 /// Q4K weight matrix × Q8K activation batch GEMM, output rows `j_start..j_end`.
 /// Equivalent to Q4kMnBlockJob::exec_range but inline (no StaticPool dispatch).
 /// Used inside pool.run_indexed for the prefill graph model.

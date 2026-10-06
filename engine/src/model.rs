@@ -1846,6 +1846,7 @@ where
             gate_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
             up_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
             down_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
+            down_proj_q6k_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ6Kx8]>,
         }
 
         let indexed_layers: Vec<LayerQ4KWeights<'_>> = (0..cfg.num_layers)
@@ -1872,6 +1873,7 @@ where
                     gate_proj_x8: qweights.get_q4k_repacked(&n.8),
                     up_proj_x8: qweights.get_q4k_repacked(&n.9),
                     down_proj_x8: qweights.get_q4k_repacked(&n.10),
+                    down_proj_q6k_x8: qweights.get_q6k_repacked(&n.10),
                 }
             })
             .collect();
@@ -2465,7 +2467,7 @@ where
         if can_use_graph_prefill {
             use tempura_kernels::quantized::{
                 quantize_rows_q8k_range, q4k_prefill_gemm_range, q6k_prefill_gemm_range,
-                f16_prefill_gemm_range, quantize_rows_q8kx4_range, q4k_prefill_gemm_x8_range,
+                f16_prefill_gemm_range, quantize_rows_q8kx4_range, q4k_prefill_gemm_x8_range, q6k_prefill_gemm_x8_range,
             };
             use tempura_kernels::ggml::blocks::{BlockQ8K, BlockQ8Kx4};
             use tempura_kernels::ggml::ops_llama::{rms_norm_mul_rows_f32, rope_neox_f32, rope_normal_f32};
@@ -2510,6 +2512,8 @@ where
                 gate_is_q4k: bool, up_is_q4k: bool, down_is_q4k: bool,
                 // Repacked Q4Kx8 weight pointers (0 = not available)
                 qx8: usize, kx8: usize, ox8: usize, gx8: usize, ux8: usize,
+                // Repacked Q6Kx8 for down_proj (0 = not available)
+                dx8: usize,
                 in_ln_p: usize, post_ln_p: usize, cl_q: usize,
                 q_norm_p: usize, k_norm_p: usize,
             }
@@ -2532,6 +2536,9 @@ where
                 let x8ptr = |opt: Option<&[tempura_kernels::ggml::blocks::BlockQ4Kx8]>| {
                     opt.map(|s| s.as_ptr() as usize).unwrap_or(0)
                 };
+                let x8ptr_q6k = |opt: Option<&[tempura_kernels::ggml::blocks::BlockQ6Kx8]>| {
+                    opt.map(|s| s.as_ptr() as usize).unwrap_or(0)
+                };
                 GpLayerWeights {
                     qw, kw, vw, ow, gw, uw, dw,
                     q_is_q4k, k_is_q4k, v_is_q4k, o_is_q4k,
@@ -2541,6 +2548,7 @@ where
                     ox8: x8ptr(il.o_proj_x8),
                     gx8: x8ptr(il.gate_proj_x8),
                     ux8: x8ptr(il.up_proj_x8),
+                    dx8: x8ptr_q6k(il.down_proj_q6k_x8),
                     in_ln_p:  il.input_ln.unwrap().as_ptr() as usize,
                     post_ln_p: il.post_ln.unwrap().as_ptr() as usize,
                     cl_q: cache_layer_map_q[l].unwrap(),
@@ -2848,7 +2856,10 @@ where
                             vec_silu_gate_inplace(&mut gate_sl[s..e], &up_sl[s..e]);
                         }
                         unsafe { quantize_rows_q8k_range(gate_sl.as_ptr(), inter_cap, q8k_gate_ptr as *mut BlockQ8K, t_start, t_end); }
-                        // Note: down_proj is Q6K — no x8 repacking for down, so q8kx4_gate not needed
+                        if use_repacked_gemm_cap && lw.dx8 != 0 && t_start % 4 == 0 && (t_end - t_start) % 4 == 0 {
+                            let q8kx4_out = q8kx4_gate_ptr as *mut tempura_kernels::ggml::blocks::BlockQ8Kx4;
+                            unsafe { quantize_rows_q8kx4_range(gate_sl.as_ptr(), inter_cap, q8kx4_out, t_start, t_end); }
+                        }
                     }
                     barrier.wait();
 
@@ -2858,13 +2869,20 @@ where
                         let j_s = (ith * j_per).min(h_cap);
                         let j_e = ((ith + 1) * j_per).min(h_cap);
                         if j_s < j_e {
-                            let q8k_act = q8k_gate_ptr as *const BlockQ8K;
-                            if lw.down_is_q4k {
-                                unsafe { q4k_prefill_gemm_range(lw.dw as *const u8, q8k_act, dnp as *mut f32,
+                            // Try repacked Q6Kx8 × Q8Kx4 GEMM first
+                            if use_repacked_gemm_cap && lw.dx8 != 0 && j_s % 8 == 0 && (j_e - j_s) % 8 == 0 {
+                                let q8kx4_act = q8kx4_gate_ptr as *const tempura_kernels::ggml::blocks::BlockQ8Kx4;
+                                unsafe { q6k_prefill_gemm_x8_range(lw.dx8 as *const u8, q8kx4_act, dnp as *mut f32,
                                     m_cap, h_cap, bpr_inter, inter_cap, j_s, j_e); }
                             } else {
-                                unsafe { q6k_prefill_gemm_range(lw.dw as *const u8, q8k_act, dnp as *mut f32,
-                                    m_cap, h_cap, bpr_inter, inter_cap, j_s, j_e); }
+                                let q8k_act = q8k_gate_ptr as *const BlockQ8K;
+                                if lw.down_is_q4k {
+                                    unsafe { q4k_prefill_gemm_range(lw.dw as *const u8, q8k_act, dnp as *mut f32,
+                                        m_cap, h_cap, bpr_inter, inter_cap, j_s, j_e); }
+                                } else {
+                                    unsafe { q6k_prefill_gemm_range(lw.dw as *const u8, q8k_act, dnp as *mut f32,
+                                        m_cap, h_cap, bpr_inter, inter_cap, j_s, j_e); }
+                                }
                             }
                         }
                     }

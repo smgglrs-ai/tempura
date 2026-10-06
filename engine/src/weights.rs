@@ -351,6 +351,7 @@ pub struct QuantizedWeights {
     q2_tiled: HashMap<String, (Vec<u8>, usize, usize)>,
     q2_row_corrections: HashMap<String, Vec<f32>>,
     q4k_repacked: HashMap<String, Vec<tempura_kernels::ggml::blocks::BlockQ4Kx8>>,
+    q6k_repacked: HashMap<String, Vec<tempura_kernels::ggml::blocks::BlockQ6Kx8>>,
 }
 
 impl QuantizedWeights {
@@ -378,7 +379,7 @@ impl QuantizedWeights {
             q2x4: HashMap::new(),
             q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
-            q4k_repacked: HashMap::new(),
+            q4k_repacked: HashMap::new(), q6k_repacked: HashMap::new(),
         }
     }
 
@@ -408,7 +409,7 @@ impl QuantizedWeights {
             q2x4: HashMap::new(),
             q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
-            q4k_repacked: HashMap::new(),
+            q4k_repacked: HashMap::new(), q6k_repacked: HashMap::new(),
         }
     }
 
@@ -456,7 +457,7 @@ impl QuantizedWeights {
             q2x4: HashMap::new(),
             q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
-            q4k_repacked: HashMap::new(),
+            q4k_repacked: HashMap::new(), q6k_repacked: HashMap::new(),
         }
     }
 
@@ -480,7 +481,7 @@ impl QuantizedWeights {
             q2x4: HashMap::new(),
             q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
-            q4k_repacked: HashMap::new(),
+            q4k_repacked: HashMap::new(), q6k_repacked: HashMap::new(),
         }
     }
 
@@ -542,6 +543,44 @@ impl QuantizedWeights {
             self.q4k_repacked.len(),
             t.elapsed().as_secs_f64()
         );
+    }
+
+    pub fn build_q6k_repacked(&mut self, shapes: &HashMap<String, (usize, usize)>) {
+        use tempura_kernels::ggml::blocks::{BlockQ6K, BLOCK_Q6K_SIZE};
+        use tempura_kernels::ggml::repack_llama::repack_q6_k_to_q6_k_8_bl;
+        let t = std::time::Instant::now();
+        let names: Vec<String> = shapes.keys().cloned().collect();
+        for name in &names {
+            let (n_rows, k) = match shapes.get(name) {
+                Some(&s) => s,
+                None => continue,
+            };
+            if n_rows == 0 || k == 0 || n_rows % 8 != 0 { continue; }
+            let bpr = k / 256;
+            if bpr == 0 { continue; }
+            let raw = match self.get_q6k(name) {
+                Some(r) => r,
+                None => continue,
+            };
+            let expected = n_rows * bpr * BLOCK_Q6K_SIZE;
+            if raw.len() != expected { continue; }
+            let src = unsafe {
+                std::slice::from_raw_parts(raw.as_ptr() as *const BlockQ6K, n_rows * bpr)
+            };
+            let mut dst = Vec::new();
+            if repack_q6_k_to_q6_k_8_bl(src, n_rows, bpr, 8, &mut dst).is_ok() {
+                self.q6k_repacked.insert(name.clone(), dst);
+            }
+        }
+        eprintln!(
+            "[Q6K] repacked {} tensors in {:.1}s",
+            self.q6k_repacked.len(),
+            t.elapsed().as_secs_f64()
+        );
+    }
+
+    pub fn get_q6k_repacked(&self, name: &str) -> Option<&[tempura_kernels::ggml::blocks::BlockQ6Kx8]> {
+        self.q6k_repacked.get(name).map(|v| v.as_slice())
     }
 
     pub fn get_q6k(&self, name: &str) -> Option<&[u8]> {
