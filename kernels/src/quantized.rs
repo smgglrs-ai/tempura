@@ -904,6 +904,54 @@ pub unsafe fn quantize_rows_q8k_range(
     }
 }
 
+/// Quantize t_start..t_end tokens (groups of 4) into BlockQ8Kx4 format for the
+/// repacked 8×8 GEMM. Requires t_start % 4 == 0 and (t_end - t_start) % 4 == 0.
+/// Output pointer q8kx4_out must have capacity [(t_end-t_start)/4 * k/256] BlockQ8Kx4.
+pub unsafe fn quantize_rows_q8kx4_range(
+    a_f32: *const f32,
+    k: usize,
+    q8kx4_out: *mut crate::ggml::blocks::BlockQ8Kx4,
+    t_start: usize,
+    t_end: usize,
+) {
+    use crate::ggml::repack::quantize_mat_q8k_4x8;
+    let nb = k / Q4K_BLOCK_SIZE;
+    let mut g = t_start / 4;
+    let mut t = t_start;
+    while t < t_end {
+        let src = std::slice::from_raw_parts(a_f32.add(t * k), 4 * k);
+        let group = quantize_mat_q8k_4x8(src, 4, k);
+        let dst = std::slice::from_raw_parts_mut(q8kx4_out.add(g * nb), nb);
+        dst.copy_from_slice(&group);
+        g += 1;
+        t += 4;
+    }
+}
+
+/// Q4Kx8 (repacked) weight × Q8Kx4 activation GEMM for output rows j_start..j_end.
+/// j_start and (j_end-j_start) must be multiples of 8. m must be a multiple of 4.
+/// q8kx4_act: [m/4 * bpr] BlockQ8Kx4, indexed as group=i/4, block=blk.
+pub unsafe fn q4k_prefill_gemm_x8_range(
+    b_q4kx8: *const u8,
+    q8kx4_act: *const crate::ggml::blocks::BlockQ8Kx4,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    bpr: usize,
+    k: usize,
+    j_start: usize,
+    j_end: usize,
+) {
+    use crate::ggml::blocks::BlockQ4Kx8;
+    if j_start >= j_end { return; }
+    let nc = j_end - j_start;
+    if nc == 0 || nc % 8 != 0 || m % 4 != 0 { return; }
+    let bx8_row_bytes = bpr * std::mem::size_of::<BlockQ4Kx8>();
+    let vx = b_q4kx8.add((j_start / 8) * bx8_row_bytes);
+    let s = out.add(j_start);
+    crate::ggml::repack_llama2::ggml_gemm_q4_k_8x8_q8_k(k, s, n, vx, q8kx4_act as *const u8, m, nc);
+}
+
 /// Q4K weight matrix × Q8K activation batch GEMM, output rows `j_start..j_end`.
 /// Equivalent to Q4kMnBlockJob::exec_range but inline (no StaticPool dispatch).
 /// Used inside pool.run_indexed for the prefill graph model.

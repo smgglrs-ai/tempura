@@ -2465,9 +2465,9 @@ where
         if can_use_graph_prefill {
             use tempura_kernels::quantized::{
                 quantize_rows_q8k_range, q4k_prefill_gemm_range, q6k_prefill_gemm_range,
-                f16_prefill_gemm_range,
+                f16_prefill_gemm_range, quantize_rows_q8kx4_range, q4k_prefill_gemm_x8_range,
             };
-            use tempura_kernels::ggml::blocks::BlockQ8K;
+            use tempura_kernels::ggml::blocks::{BlockQ8K, BlockQ8Kx4};
             use tempura_kernels::ggml::ops_llama::{rms_norm_mul_rows_f32, rope_neox_f32, rope_normal_f32};
             use tempura_kernels::fused::residual_add;
             use tempura_kernels::ggml::vec_llama::vec_silu_gate_inplace;
@@ -2488,11 +2488,28 @@ where
             let q8k_ffn_ptr    = q8k_ffn.as_mut_ptr() as usize;
             let q8k_gate_ptr   = q8k_gate.as_mut_ptr() as usize;
 
+            // Repacked Q8Kx4 buffers for 8×8 GEMM (only when m%4==0 and x8 weights exist)
+            let use_repacked_gemm = m % 4 == 0
+                && indexed_layers[0].q_proj_x8.is_some();
+            let blank_x4 = BlockQ8Kx4 { d: [0.0f32; 4], qs: [0i8; 1024], bsums: [0i16; 64] };
+            let n_groups = if use_repacked_gemm { m / 4 } else { 0 };
+            let mut q8kx4_normed: Vec<BlockQ8Kx4> = vec![blank_x4; n_groups * bpr_h];
+            let mut q8kx4_attn:   Vec<BlockQ8Kx4> = vec![blank_x4; n_groups * bpr_q];
+            let mut q8kx4_ffn:    Vec<BlockQ8Kx4> = vec![blank_x4; n_groups * bpr_h];
+            let mut q8kx4_gate:   Vec<BlockQ8Kx4> = vec![blank_x4; n_groups * bpr_inter];
+            let q8kx4_normed_ptr = q8kx4_normed.as_mut_ptr() as usize;
+            let q8kx4_attn_ptr   = q8kx4_attn.as_mut_ptr() as usize;
+            let q8kx4_ffn_ptr    = q8kx4_ffn.as_mut_ptr() as usize;
+            let q8kx4_gate_ptr   = q8kx4_gate.as_mut_ptr() as usize;
+            let use_repacked_gemm_cap = use_repacked_gemm;
+
             // Build per-layer weight dispatch table
             struct GpLayerWeights { qw: usize, kw: usize, vw: usize, ow: usize,
                 gw: usize, uw: usize, dw: usize,
                 q_is_q4k: bool, k_is_q4k: bool, v_is_q4k: bool, o_is_q4k: bool,
                 gate_is_q4k: bool, up_is_q4k: bool, down_is_q4k: bool,
+                // Repacked Q4Kx8 weight pointers (0 = not available)
+                qx8: usize, kx8: usize, ox8: usize, gx8: usize, ux8: usize,
                 in_ln_p: usize, post_ln_p: usize, cl_q: usize,
                 q_norm_p: usize, k_norm_p: usize,
             }
@@ -2512,10 +2529,18 @@ where
                 let (uw, up_is_q4k)   = resolve(il.up_proj.as_ref().unwrap());
                 let (dw, down_is_q4k) = resolve(il.down_proj.as_ref().unwrap());
                 let v_is_q4k = il.v_proj.as_ref().map(|w| w.as_q4k().is_some()).unwrap_or(false);
+                let x8ptr = |opt: Option<&[tempura_kernels::ggml::blocks::BlockQ4Kx8]>| {
+                    opt.map(|s| s.as_ptr() as usize).unwrap_or(0)
+                };
                 GpLayerWeights {
                     qw, kw, vw, ow, gw, uw, dw,
                     q_is_q4k, k_is_q4k, v_is_q4k, o_is_q4k,
                     gate_is_q4k, up_is_q4k, down_is_q4k,
+                    qx8: x8ptr(il.q_proj_x8),
+                    kx8: x8ptr(il.k_proj_x8),
+                    ox8: x8ptr(il.o_proj_x8),
+                    gx8: x8ptr(il.gate_proj_x8),
+                    ux8: x8ptr(il.up_proj_x8),
                     in_ln_p:  il.input_ln.unwrap().as_ptr() as usize,
                     post_ln_p: il.post_ln.unwrap().as_ptr() as usize,
                     cl_q: cache_layer_map_q[l].unwrap(),
@@ -2574,11 +2599,15 @@ where
                     }
                     barrier.wait();
 
-                    // ── N0b: quantize normed rows → q8k_normed ─────────────────
+                    // ── N0b: quantize normed rows → q8k_normed (+ q8kx4 if repacked) ──
                     if t_start < t_end {
                         let nrm = unsafe { std::slice::from_raw_parts(nrmp as *const f32, m_cap * h_cap) };
                         let q8k_out = q8k_normed_ptr as *mut BlockQ8K;
                         unsafe { quantize_rows_q8k_range(nrm.as_ptr(), h_cap, q8k_out, t_start, t_end); }
+                        if use_repacked_gemm_cap && t_start % 4 == 0 && (t_end - t_start) % 4 == 0 {
+                            let q8kx4_out = q8kx4_normed_ptr as *mut tempura_kernels::ggml::blocks::BlockQ8Kx4;
+                            unsafe { quantize_rows_q8kx4_range(nrm.as_ptr(), h_cap, q8kx4_out, t_start, t_end); }
+                        }
                     }
                     barrier.wait();
 
@@ -2588,23 +2617,34 @@ where
                         let j_per = (total_qkv + nth - 1) / nth;
                         let j_start = (ith * j_per).min(total_qkv);
                         let j_end   = ((ith + 1) * j_per).min(total_qkv);
-                        let q8k_act = q8k_normed_ptr as *const BlockQ8K;
+                        let q8k_act  = q8k_normed_ptr as *const BlockQ8K;
+                        let q8kx4_act = q8kx4_normed_ptr as *const tempura_kernels::ggml::blocks::BlockQ8Kx4;
 
                         // Q (q_dim_cap output rows)
                         let qj_s = j_start.min(q_dim_cap);
                         let qj_e = j_end.min(q_dim_cap);
                         if qj_s < qj_e {
-                            unsafe { q4k_prefill_gemm_range(lw.qw as *const u8, q8k_act, qp as *mut f32,
-                                m_cap, q_dim_cap, bpr_h, h_cap, qj_s, qj_e); }
+                            if use_repacked_gemm_cap && lw.qx8 != 0 && qj_s % 8 == 0 && (qj_e - qj_s) % 8 == 0 {
+                                unsafe { q4k_prefill_gemm_x8_range(lw.qx8 as *const u8, q8kx4_act, qp as *mut f32,
+                                    m_cap, q_dim_cap, bpr_h, h_cap, qj_s, qj_e); }
+                            } else {
+                                unsafe { q4k_prefill_gemm_range(lw.qw as *const u8, q8k_act, qp as *mut f32,
+                                    m_cap, q_dim_cap, bpr_h, h_cap, qj_s, qj_e); }
+                            }
                         }
                         // K
                         let kj_s = j_start.saturating_sub(q_dim_cap).min(kv_dim_cap);
                         let kj_e = j_end.saturating_sub(q_dim_cap).min(kv_dim_cap);
                         if kj_s < kj_e {
-                            unsafe { q4k_prefill_gemm_range(lw.kw as *const u8, q8k_act, kp as *mut f32,
-                                m_cap, kv_dim_cap, bpr_h, h_cap, kj_s, kj_e); }
+                            if use_repacked_gemm_cap && lw.kx8 != 0 && kj_s % 8 == 0 && (kj_e - kj_s) % 8 == 0 {
+                                unsafe { q4k_prefill_gemm_x8_range(lw.kx8 as *const u8, q8kx4_act, kp as *mut f32,
+                                    m_cap, kv_dim_cap, bpr_h, h_cap, kj_s, kj_e); }
+                            } else {
+                                unsafe { q4k_prefill_gemm_range(lw.kw as *const u8, q8k_act, kp as *mut f32,
+                                    m_cap, kv_dim_cap, bpr_h, h_cap, kj_s, kj_e); }
+                            }
                         }
-                        // V (may be F16)
+                        // V (may be F16; KV projections don't have x8 repacking)
                         let vj_s = j_start.saturating_sub(q_dim_cap + kv_dim_cap).min(kv_dim_cap);
                         let vj_e = j_end.saturating_sub(q_dim_cap + kv_dim_cap).min(kv_dim_cap);
                         if vj_s < vj_e {
@@ -2669,7 +2709,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N2b: quantize attn_out → q8k_attn ──────────────────────
+                    // ── N2b: quantize attn_out → q8k_attn (+ q8kx4) ───────────
                     {
                         let tq_per = (m_cap + nth - 1) / nth;
                         let tq_s = (ith * tq_per).min(m_cap);
@@ -2677,6 +2717,10 @@ where
                         if tq_s < tq_e {
                             let attn_sl = unsafe { std::slice::from_raw_parts(attn_outp as *const f32, m_cap * q_dim_cap) };
                             unsafe { quantize_rows_q8k_range(attn_sl.as_ptr(), q_dim_cap, q8k_attn_ptr as *mut BlockQ8K, tq_s, tq_e); }
+                            if use_repacked_gemm_cap && tq_s % 4 == 0 && (tq_e - tq_s) % 4 == 0 {
+                                let q8kx4_out = q8kx4_attn_ptr as *mut tempura_kernels::ggml::blocks::BlockQ8Kx4;
+                                unsafe { quantize_rows_q8kx4_range(attn_sl.as_ptr(), q_dim_cap, q8kx4_out, tq_s, tq_e); }
+                            }
                         }
                     }
                     barrier.wait();
@@ -2687,10 +2731,16 @@ where
                         let j_s = (ith * j_per).min(h_cap);
                         let j_e = ((ith + 1) * j_per).min(h_cap);
                         if j_s < j_e {
-                            let q8k_act = q8k_attn_ptr as *const BlockQ8K;
+                            let q8k_act   = q8k_attn_ptr as *const BlockQ8K;
+                            let q8kx4_act = q8kx4_attn_ptr as *const tempura_kernels::ggml::blocks::BlockQ8Kx4;
                             if lw.o_is_q4k {
-                                unsafe { q4k_prefill_gemm_range(lw.ow as *const u8, q8k_act, oprjp as *mut f32,
-                                    m_cap, h_cap, bpr_q, q_dim_cap, j_s, j_e); }
+                                if use_repacked_gemm_cap && lw.ox8 != 0 && j_s % 8 == 0 && (j_e - j_s) % 8 == 0 {
+                                    unsafe { q4k_prefill_gemm_x8_range(lw.ox8 as *const u8, q8kx4_act, oprjp as *mut f32,
+                                        m_cap, h_cap, bpr_q, q_dim_cap, j_s, j_e); }
+                                } else {
+                                    unsafe { q4k_prefill_gemm_range(lw.ow as *const u8, q8k_act, oprjp as *mut f32,
+                                        m_cap, h_cap, bpr_q, q_dim_cap, j_s, j_e); }
+                                }
                             } else {
                                 let attn_sl = unsafe { std::slice::from_raw_parts(attn_outp as *const f32, m_cap * q_dim_cap) };
                                 unsafe { f16_prefill_gemm_range(lw.ow as *const u8, attn_sl.as_ptr(), oprjp as *mut f32,
@@ -2714,10 +2764,14 @@ where
                     }
                     barrier.wait();
 
-                    // ── N4b: quantize normed2 → q8k_ffn ────────────────────────
+                    // ── N4b: quantize normed2 → q8k_ffn (+ q8kx4) ─────────────
                     if t_start < t_end {
                         let nrm2 = unsafe { std::slice::from_raw_parts(nrm2p as *const f32, m_cap * h_cap) };
                         unsafe { quantize_rows_q8k_range(nrm2.as_ptr(), h_cap, q8k_ffn_ptr as *mut BlockQ8K, t_start, t_end); }
+                        if use_repacked_gemm_cap && t_start % 4 == 0 && (t_end - t_start) % 4 == 0 {
+                            let q8kx4_out = q8kx4_ffn_ptr as *mut tempura_kernels::ggml::blocks::BlockQ8Kx4;
+                            unsafe { quantize_rows_q8kx4_range(nrm2.as_ptr(), h_cap, q8kx4_out, t_start, t_end); }
+                        }
                     }
                     barrier.wait();
 
@@ -2727,11 +2781,15 @@ where
                         let j_per = (total_gu + nth - 1) / nth;
                         let j_s = (ith * j_per).min(total_gu);
                         let j_e = ((ith + 1) * j_per).min(total_gu);
-                        let q8k_act = q8k_ffn_ptr as *const BlockQ8K;
+                        let q8k_act   = q8k_ffn_ptr as *const BlockQ8K;
+                        let q8kx4_act = q8kx4_ffn_ptr as *const tempura_kernels::ggml::blocks::BlockQ8Kx4;
                         let gj_s = j_s.min(inter_cap);
                         let gj_e = j_e.min(inter_cap);
                         if gj_s < gj_e {
-                            if lw.gate_is_q4k {
+                            if lw.gate_is_q4k && use_repacked_gemm_cap && lw.gx8 != 0 && gj_s % 8 == 0 && (gj_e - gj_s) % 8 == 0 {
+                                unsafe { q4k_prefill_gemm_x8_range(lw.gx8 as *const u8, q8kx4_act, gatep as *mut f32,
+                                    m_cap, inter_cap, bpr_h, h_cap, gj_s, gj_e); }
+                            } else if lw.gate_is_q4k {
                                 unsafe { q4k_prefill_gemm_range(lw.gw as *const u8, q8k_act, gatep as *mut f32,
                                     m_cap, inter_cap, bpr_h, h_cap, gj_s, gj_e); }
                             } else {
@@ -2742,7 +2800,10 @@ where
                         let uj_s = j_s.saturating_sub(inter_cap).min(inter_cap);
                         let uj_e = j_e.saturating_sub(inter_cap).min(inter_cap);
                         if uj_s < uj_e {
-                            if lw.up_is_q4k {
+                            if lw.up_is_q4k && use_repacked_gemm_cap && lw.ux8 != 0 && uj_s % 8 == 0 && (uj_e - uj_s) % 8 == 0 {
+                                unsafe { q4k_prefill_gemm_x8_range(lw.ux8 as *const u8, q8kx4_act, upp as *mut f32,
+                                    m_cap, inter_cap, bpr_h, h_cap, uj_s, uj_e); }
+                            } else if lw.up_is_q4k {
                                 unsafe { q4k_prefill_gemm_range(lw.uw as *const u8, q8k_act, upp as *mut f32,
                                     m_cap, inter_cap, bpr_h, h_cap, uj_s, uj_e); }
                             } else {
@@ -2753,7 +2814,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N6: SiLU×gate + quantize → q8k_gate ────────────────────
+                    // ── N6: SiLU×gate + quantize → q8k_gate (+ q8kx4) ─────────
                     if t_start < t_end {
                         let gate_sl = unsafe { std::slice::from_raw_parts_mut(gatep as *mut f32, m_cap * inter_cap) };
                         let up_sl   = unsafe { std::slice::from_raw_parts(upp as *const f32, m_cap * inter_cap) };
@@ -2762,6 +2823,7 @@ where
                             vec_silu_gate_inplace(&mut gate_sl[s..e], &up_sl[s..e]);
                         }
                         unsafe { quantize_rows_q8k_range(gate_sl.as_ptr(), inter_cap, q8k_gate_ptr as *mut BlockQ8K, t_start, t_end); }
+                        // Note: down_proj is Q6K — no x8 repacking for down, so q8kx4_gate not needed
                     }
                     barrier.wait();
 
