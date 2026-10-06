@@ -881,7 +881,169 @@ pub unsafe fn q6k_preq_range_q8k(
     }
 }
 
-/// F16 weight × f32 activation GEMV for a range of output rows.
+/// Quantize rows `t_start..t_end` of `a_f32` (row-major, each row is `k` elements)
+/// into `q8k_out[t_start*bpr .. t_end*bpr]`. Used for parallel activation
+/// pre-quantization in the prefill graph model (each thread calls with disjoint range).
+pub unsafe fn quantize_rows_q8k_range(
+    a_f32: *const f32,
+    k: usize,
+    q8k_out: *mut crate::ggml::blocks::BlockQ8K,
+    t_start: usize,
+    t_end: usize,
+) {
+    let bpr = k / Q4K_BLOCK_SIZE;
+    for t in t_start..t_end {
+        let src = std::slice::from_raw_parts(a_f32.add(t * k), k);
+        let dst = std::slice::from_raw_parts_mut(q8k_out.add(t * bpr), bpr);
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(src, dst);
+            continue;
+        }
+        crate::ggml::quantize::quantize_row_q8_k(src, dst);
+    }
+}
+
+/// Q4K weight matrix × Q8K activation batch GEMM, output rows `j_start..j_end`.
+/// Equivalent to Q4kMnBlockJob::exec_range but inline (no StaticPool dispatch).
+/// Used inside pool.run_indexed for the prefill graph model.
+pub unsafe fn q4k_prefill_gemm_range(
+    b_q4k: *const u8,
+    q8k_act: *const crate::ggml::blocks::BlockQ8K,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    bpr: usize,
+    k: usize,
+    j_start: usize,
+    j_end: usize,
+) {
+    use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+    use crate::ggml::vec_dot_avx2::{
+        vec_dot_q4_k_q8_k_dispatch, vec_dot_q4k_q8k_dispatch_4x4,
+    };
+    let bq_row_bytes = bpr * Q4K_BLOCK_BYTES;
+    let q8k_row_bytes = bpr * std::mem::size_of::<BlockQ8K>();
+    let mut j = j_start;
+    while j + 3 < j_end {
+        let w0 = std::slice::from_raw_parts(b_q4k.add(j * bq_row_bytes) as *const BlockQ4K, bpr);
+        let w1 = std::slice::from_raw_parts(b_q4k.add((j+1) * bq_row_bytes) as *const BlockQ4K, bpr);
+        let w2 = std::slice::from_raw_parts(b_q4k.add((j+2) * bq_row_bytes) as *const BlockQ4K, bpr);
+        let w3 = std::slice::from_raw_parts(b_q4k.add((j+3) * bq_row_bytes) as *const BlockQ4K, bpr);
+        let mut i = 0;
+        while i + 3 < m {
+            let a0 = std::slice::from_raw_parts(q8k_act.add(i * q8k_row_bytes / std::mem::size_of::<BlockQ8K>()), bpr);
+            let a1 = std::slice::from_raw_parts(q8k_act.add((i+1) * q8k_row_bytes / std::mem::size_of::<BlockQ8K>()), bpr);
+            let a2 = std::slice::from_raw_parts(q8k_act.add((i+2) * q8k_row_bytes / std::mem::size_of::<BlockQ8K>()), bpr);
+            let a3 = std::slice::from_raw_parts(q8k_act.add((i+3) * q8k_row_bytes / std::mem::size_of::<BlockQ8K>()), bpr);
+            let r = vec_dot_q4k_q8k_dispatch_4x4(k, w0, w1, w2, w3, a0, a1, a2, a3);
+            *out.add(i * n + j)     = r[0][0]; *out.add(i * n + j + 1)     = r[0][1];
+            *out.add(i * n + j + 2) = r[0][2]; *out.add(i * n + j + 3)     = r[0][3];
+            *out.add((i+1) * n + j) = r[1][0]; *out.add((i+1) * n + j + 1) = r[1][1];
+            *out.add((i+1) * n + j + 2) = r[1][2]; *out.add((i+1) * n + j + 3) = r[1][3];
+            *out.add((i+2) * n + j) = r[2][0]; *out.add((i+2) * n + j + 1) = r[2][1];
+            *out.add((i+2) * n + j + 2) = r[2][2]; *out.add((i+2) * n + j + 3) = r[2][3];
+            *out.add((i+3) * n + j) = r[3][0]; *out.add((i+3) * n + j + 1) = r[3][1];
+            *out.add((i+3) * n + j + 2) = r[3][2]; *out.add((i+3) * n + j + 3) = r[3][3];
+            i += 4;
+        }
+        while i < m {
+            let a = std::slice::from_raw_parts(q8k_act.add(i * bpr), bpr);
+            let v0 = vec_dot_q4_k_q8_k_dispatch(k, w0, a);
+            let v1 = vec_dot_q4_k_q8_k_dispatch(k, w1, a);
+            let v2 = vec_dot_q4_k_q8_k_dispatch(k, w2, a);
+            let v3 = vec_dot_q4_k_q8_k_dispatch(k, w3, a);
+            *out.add(i * n + j) = v0; *out.add(i * n + j + 1) = v1;
+            *out.add(i * n + j + 2) = v2; *out.add(i * n + j + 3) = v3;
+            i += 1;
+        }
+        j += 4;
+    }
+    while j < j_end {
+        let w = std::slice::from_raw_parts(b_q4k.add(j * bq_row_bytes) as *const BlockQ4K, bpr);
+        for i in 0..m {
+            let a = std::slice::from_raw_parts(q8k_act.add(i * bpr), bpr);
+            *out.add(i * n + j) = vec_dot_q4_k_q8_k_dispatch(k, w, a);
+        }
+        j += 1;
+    }
+}
+
+/// Q6K weight matrix × Q8K activation batch GEMM, output rows `j_start..j_end`.
+pub unsafe fn q6k_prefill_gemm_range(
+    b_q6k: *const u8,
+    q8k_act: *const crate::ggml::blocks::BlockQ8K,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    bpr: usize,
+    k: usize,
+    j_start: usize,
+    j_end: usize,
+) {
+    use crate::ggml::blocks::{BlockQ6K, BlockQ8K};
+    let bq_row_bytes = bpr * crate::ggml::blocks::BLOCK_Q6K_SIZE;
+    for j in j_start..j_end {
+        let w = std::slice::from_raw_parts(b_q6k.add(j * bq_row_bytes) as *const BlockQ6K, bpr);
+        for i in 0..m {
+            let a = std::slice::from_raw_parts(q8k_act.add(i * bpr), bpr);
+            *out.add(i * n + j) = crate::ggml::quants_llama::ggml_vec_dot_q6_k_q8_k(k, w, a);
+        }
+    }
+}
+
+/// F16 weight matrix × f32 activation batch GEMM, output rows `j_start..j_end`.
+pub unsafe fn f16_prefill_gemm_range(
+    b_f16: *const u8,
+    a_f32: *const f32,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    j_start: usize,
+    j_end: usize,
+) {
+    let row_bytes = k * 2;
+    for j in j_start..j_end {
+        let b_row = std::slice::from_raw_parts(b_f16.add(j * row_bytes), row_bytes);
+        for i in 0..m {
+            let a_row = std::slice::from_raw_parts(a_f32.add(i * k), k);
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
+                *out.add(i * n + j) = crate::f16_gemv::f16_dot_avx2(a_row, b_row, k);
+                continue;
+            }
+            *out.add(i * n + j) = crate::f16_gemv::f16_dot_scalar(a_row, b_row, k);
+        }
+    }
+}
+
+/// F16 weight × F16 activation GEMM for a row range (used when KV cache holds F16 keys).
+pub unsafe fn f16_f16_prefill_gemm_range(
+    b_f16: *const u8,
+    a_f16: *const u8,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    j_start: usize,
+    j_end: usize,
+) {
+    use crate::ggml::helpers::f16_to_f32;
+    let row_bytes = k * 2;
+    for j in j_start..j_end {
+        let b_row = std::slice::from_raw_parts(b_f16.add(j * row_bytes) as *const u16, k);
+        for i in 0..m {
+            let a_row = std::slice::from_raw_parts(a_f16.add(i * row_bytes) as *const u16, k);
+            let mut dot = 0.0f32;
+            for d in 0..k {
+                dot += f16_to_f32(b_row[d]) * f16_to_f32(a_row[d]);
+            }
+            *out.add(i * n + j) = dot;
+        }
+    }
+}
+
 /// Used inside the graph decode closure (no thread-pool — caller already parallel).
 pub unsafe fn f16_preq_range(
     b_f16: *const u8,  // F16 weight matrix, row-major, each row is k * 2 bytes

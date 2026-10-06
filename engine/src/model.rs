@@ -2428,6 +2428,378 @@ where
             break 'skip_layer_loop;
         }
 
+        // ── Prefill graph model (seq_len > 1): one pool.run_indexed for the entire
+        // forward pass. Translates ggml_graph_compute_thread for the prefill case.
+        // Parallelizes both activation quantization and matmul across workers.
+        // Prefill graph model: infrastructure is wired but numerical correctness
+        // needs debugging (produces wrong hidden states vs fallback). Disabled pending fix.
+        // Enable with TEMPURA_GRAPH_PREFILL=1 for testing.
+        let can_use_graph_prefill = std::env::var("TEMPURA_GRAPH_PREFILL").is_ok() && seq_len > 1
+            && !cfg.parallel_attn_ffn
+            && !cfg.use_layernorm
+            && !cfg.rmsnorm_offset
+            && cfg.n_experts == 0
+            && cfg.hidden_act == crate::config::HiddenAct::SiluGate
+            && alibi_attn.is_none()
+            && softcap_attn.is_none()
+            && !cfg.use_alibi
+            && cfg.rope_dim.is_none()
+            && det_rmsnorm.is_none()
+            && cfg.rope_scaling.is_none()
+            && layernorm.is_none()
+            && (0..cfg.num_layers).all(|l| {
+                let il = &indexed_layers[l];
+                let ok_q = il.q_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_f16().is_some()).unwrap_or(false);
+                let ok_k = il.k_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_f16().is_some()).unwrap_or(false);
+                let ok_v = il.v_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_f16().is_some()).unwrap_or(false);
+                let ok_o = il.o_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_f16().is_some()).unwrap_or(false);
+                let ok_gate = il.gate_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false);
+                let ok_up   = il.up_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false);
+                let ok_down = il.down_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false);
+                let ok_ln   = il.input_ln.is_some() && il.post_ln.is_some();
+                let ok_sub  = il.attn_sub_norm.is_none() && il.ffn_sub_norm.is_none();
+                ok_q && ok_k && ok_v && ok_o && ok_gate && ok_up && ok_down && ok_ln && ok_sub
+                    && cache_layer_map_q[l].is_some()
+            });
+
+        if can_use_graph_prefill {
+            use tempura_kernels::quantized::{
+                quantize_rows_q8k_range, q4k_prefill_gemm_range, q6k_prefill_gemm_range,
+                f16_prefill_gemm_range,
+            };
+            use tempura_kernels::ggml::blocks::BlockQ8K;
+            use tempura_kernels::ggml::ops_llama::{rms_norm_mul_rows_f32, rope_neox_f32, rope_normal_f32};
+            use tempura_kernels::fused::residual_add;
+            use tempura_kernels::ggml::vec_llama::vec_silu_gate_inplace;
+
+            let m = seq_len;
+            let bpr_h    = h    / tempura_kernels::Q4K_BLOCK_SIZE;
+            let bpr_q    = q_dim  / tempura_kernels::Q4K_BLOCK_SIZE;
+            let bpr_inter = inter / tempura_kernels::Q4K_BLOCK_SIZE;
+            let blank = BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] };
+
+            // Pre-allocated q8k batch buffers (reused each layer)
+            let mut q8k_normed: Vec<BlockQ8K> = vec![blank; m * bpr_h];
+            let mut q8k_attn:   Vec<BlockQ8K> = vec![blank; m * bpr_q];
+            let mut q8k_ffn:    Vec<BlockQ8K> = vec![blank; m * bpr_h];
+            let mut q8k_gate:   Vec<BlockQ8K> = vec![blank; m * bpr_inter];
+            let q8k_normed_ptr = q8k_normed.as_mut_ptr() as usize;
+            let q8k_attn_ptr   = q8k_attn.as_mut_ptr() as usize;
+            let q8k_ffn_ptr    = q8k_ffn.as_mut_ptr() as usize;
+            let q8k_gate_ptr   = q8k_gate.as_mut_ptr() as usize;
+
+            // Build per-layer weight dispatch table
+            struct GpLayerWeights { qw: usize, kw: usize, vw: usize, ow: usize,
+                gw: usize, uw: usize, dw: usize,
+                q_is_q4k: bool, k_is_q4k: bool, v_is_q4k: bool, o_is_q4k: bool,
+                gate_is_q4k: bool, up_is_q4k: bool, down_is_q4k: bool,
+                in_ln_p: usize, post_ln_p: usize, cl_q: usize,
+                q_norm_p: usize, k_norm_p: usize,
+            }
+            let gp_layers: Vec<GpLayerWeights> = (0..cfg.num_layers).map(|l| {
+                let il = &indexed_layers[l];
+                let resolve = |w: &crate::weights::PreIndexedWeight| -> (usize, bool) {
+                    if let Some(b) = w.as_q4k() { return (b.as_ptr() as usize, true); }
+                    if let Some(b) = w.as_q6k() { return (b.as_ptr() as usize, false); }
+                    if let Some(b) = w.as_f16() { return (b.as_ptr() as usize, false); }
+                    (0, false)
+                };
+                let (qw, q_is_q4k)    = resolve(il.q_proj.as_ref().unwrap());
+                let (kw, k_is_q4k)    = resolve(il.k_proj.as_ref().unwrap());
+                let (vw, _)           = resolve(il.v_proj.as_ref().unwrap());
+                let (ow, o_is_q4k)    = resolve(il.o_proj.as_ref().unwrap());
+                let (gw, gate_is_q4k) = resolve(il.gate_proj.as_ref().unwrap());
+                let (uw, up_is_q4k)   = resolve(il.up_proj.as_ref().unwrap());
+                let (dw, down_is_q4k) = resolve(il.down_proj.as_ref().unwrap());
+                let v_is_q4k = il.v_proj.as_ref().map(|w| w.as_q4k().is_some()).unwrap_or(false);
+                GpLayerWeights {
+                    qw, kw, vw, ow, gw, uw, dw,
+                    q_is_q4k, k_is_q4k, v_is_q4k, o_is_q4k,
+                    gate_is_q4k, up_is_q4k, down_is_q4k,
+                    in_ln_p:  il.input_ln.unwrap().as_ptr() as usize,
+                    post_ln_p: il.post_ln.unwrap().as_ptr() as usize,
+                    cl_q: cache_layer_map_q[l].unwrap(),
+                    q_norm_p: il.q_norm.map(|w| w.as_ptr() as usize).unwrap_or(0),
+                    k_norm_p: il.k_norm.map(|w| w.as_ptr() as usize).unwrap_or(0),
+                }
+            }).collect();
+
+            let hp   = hidden.as_mut_ptr() as usize;
+            let nrmp = normed.as_mut_ptr() as usize;
+            let nrm2p = normed2.as_mut_ptr() as usize;
+            let qp   = q.as_mut_ptr() as usize;
+            let kp   = k.as_mut_ptr() as usize;
+            let vp   = v.as_mut_ptr() as usize;
+            let attn_outp = attn_out.as_mut_ptr() as usize;
+            let oprjp = o_proj.as_mut_ptr() as usize;
+            let gatep = gate.as_mut_ptr() as usize;
+            let upp   = up.as_mut_ptr() as usize;
+            let dnp   = down_out.as_mut_ptr() as usize;
+            let kv_cache_ptr = &mut session.cache as *mut crate::kv_cache::KvCache as usize;
+
+            let n_layers_cap = cfg.num_layers;
+            let h_cap = h; let q_dim_cap = q_dim; let kv_dim_cap = kv_dim;
+            let inter_cap = inter; let m_cap = m;
+            let n_heads_cap = n_heads; let n_kv_heads_cap = n_kv_heads;
+            let head_dim_cap = head_dim;
+            let eps = cfg.layer_norm_eps;
+            let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+            let rope_neox_cap = cfg.rope_type == crate::config::RopeType::Neox;
+            let rope_theta_cap = cfg.rope_theta;
+            let positions_cap: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+
+            let pool = tempura_kernels::thread_pool::global_pool();
+            let barrier = tempura_kernels::thread_pool::SpinBarrier::new(pool.thread_count());
+
+            pool.run_indexed(&|ith, nth| {
+                for layer in 0..n_layers_cap {
+                    let lw = &gp_layers[layer];
+                    let t_per = (m_cap + nth - 1) / nth;
+                    let t_start = (ith * t_per).min(m_cap);
+                    let t_end   = ((ith + 1) * t_per).min(m_cap);
+
+                    // ── N0: RMSNorm for tokens t_start..t_end ─────────────────
+                    if t_start < t_end {
+                        let hid = unsafe { std::slice::from_raw_parts(hp as *const f32, m_cap * h_cap) };
+                        let in_w = unsafe { std::slice::from_raw_parts(lw.in_ln_p as *const f32, h_cap) };
+                        let nrm = unsafe { std::slice::from_raw_parts_mut(nrmp as *mut f32, m_cap * h_cap) };
+                        for t in t_start..t_end {
+                            rms_norm_mul_rows_f32(
+                                &hid[t * h_cap..(t + 1) * h_cap],
+                                in_w,
+                                &mut nrm[t * h_cap..(t + 1) * h_cap],
+                                h_cap, eps,
+                            );
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── N0b: quantize normed rows → q8k_normed ─────────────────
+                    if t_start < t_end {
+                        let nrm = unsafe { std::slice::from_raw_parts(nrmp as *const f32, m_cap * h_cap) };
+                        let q8k_out = q8k_normed_ptr as *mut BlockQ8K;
+                        unsafe { quantize_rows_q8k_range(nrm.as_ptr(), h_cap, q8k_out, t_start, t_end); }
+                    }
+                    barrier.wait();
+
+                    // ── N1: QKV GEMM (parallel over output rows) ───────────────
+                    {
+                        let total_qkv = q_dim_cap + kv_dim_cap + kv_dim_cap;
+                        let j_per = (total_qkv + nth - 1) / nth;
+                        let j_start = (ith * j_per).min(total_qkv);
+                        let j_end   = ((ith + 1) * j_per).min(total_qkv);
+                        let q8k_act = q8k_normed_ptr as *const BlockQ8K;
+
+                        // Q (q_dim_cap output rows)
+                        let qj_s = j_start.min(q_dim_cap);
+                        let qj_e = j_end.min(q_dim_cap);
+                        if qj_s < qj_e {
+                            unsafe { q4k_prefill_gemm_range(lw.qw as *const u8, q8k_act, qp as *mut f32,
+                                m_cap, q_dim_cap, bpr_h, h_cap, qj_s, qj_e); }
+                        }
+                        // K
+                        let kj_s = j_start.saturating_sub(q_dim_cap).min(kv_dim_cap);
+                        let kj_e = j_end.saturating_sub(q_dim_cap).min(kv_dim_cap);
+                        if kj_s < kj_e {
+                            unsafe { q4k_prefill_gemm_range(lw.kw as *const u8, q8k_act, kp as *mut f32,
+                                m_cap, kv_dim_cap, bpr_h, h_cap, kj_s, kj_e); }
+                        }
+                        // V (may be F16)
+                        let vj_s = j_start.saturating_sub(q_dim_cap + kv_dim_cap).min(kv_dim_cap);
+                        let vj_e = j_end.saturating_sub(q_dim_cap + kv_dim_cap).min(kv_dim_cap);
+                        if vj_s < vj_e {
+                            if lw.v_is_q4k {
+                                unsafe { q4k_prefill_gemm_range(lw.vw as *const u8, q8k_act, vp as *mut f32,
+                                    m_cap, kv_dim_cap, bpr_h, h_cap, vj_s, vj_e); }
+                            } else {
+                                let nrm = unsafe { std::slice::from_raw_parts(nrmp as *const f32, m_cap * h_cap) };
+                                unsafe { f16_prefill_gemm_range(lw.vw as *const u8, nrm.as_ptr(), vp as *mut f32,
+                                    m_cap, kv_dim_cap, h_cap, vj_s, vj_e); }
+                            }
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── N2: RoPE + KV-cache append + attention (ith==0) ────────
+                    if ith == 0 {
+                        let q_sl = unsafe { std::slice::from_raw_parts_mut(qp as *mut f32, m_cap * q_dim_cap) };
+                        let k_sl = unsafe { std::slice::from_raw_parts_mut(kp as *mut f32, m_cap * kv_dim_cap) };
+                        // QK norm if present
+                        if lw.q_norm_p != 0 {
+                            let qnw = unsafe { std::slice::from_raw_parts(lw.q_norm_p as *const f32, head_dim_cap) };
+                            let knw = unsafe { std::slice::from_raw_parts(lw.k_norm_p as *const f32, head_dim_cap) };
+                            for t in 0..m_cap {
+                                for h in 0..n_heads_cap {
+                                    let off = t * q_dim_cap + h * head_dim_cap;
+                                    let head = &mut q_sl[off..off + head_dim_cap];
+                                    let ss: f32 = head.iter().map(|x| x*x).sum::<f32>();
+                                    let inv = 1.0 / ((ss / head_dim_cap as f32) + eps).sqrt();
+                                    for (d, v) in head.iter_mut().enumerate() { *v = *v * inv * qnw[d]; }
+                                }
+                                for h in 0..n_kv_heads_cap {
+                                    let off = t * kv_dim_cap + h * head_dim_cap;
+                                    let head = &mut k_sl[off..off + head_dim_cap];
+                                    let ss: f32 = head.iter().map(|x| x*x).sum::<f32>();
+                                    let inv = 1.0 / ((ss / head_dim_cap as f32) + eps).sqrt();
+                                    for (d, v) in head.iter_mut().enumerate() { *v = *v * inv * knw[d]; }
+                                }
+                            }
+                        }
+                        if rope_neox_cap {
+                            rope_neox_f32(q_sl, &positions_cap, m_cap, n_heads_cap, head_dim_cap, head_dim_cap, rope_theta_cap, 1.0, 0.0, 1.0, 0.0, 0.0, 0, None);
+                            rope_neox_f32(k_sl, &positions_cap, m_cap, n_kv_heads_cap, head_dim_cap, head_dim_cap, rope_theta_cap, 1.0, 0.0, 1.0, 0.0, 0.0, 0, None);
+                        } else {
+                            rope_normal_f32(q_sl, &positions_cap, m_cap, n_heads_cap, head_dim_cap, head_dim_cap, rope_theta_cap, 1.0, 0.0, 1.0, 0.0, 0.0, 0, None);
+                            rope_normal_f32(k_sl, &positions_cap, m_cap, n_kv_heads_cap, head_dim_cap, head_dim_cap, rope_theta_cap, 1.0, 0.0, 1.0, 0.0, 0.0, 0, None);
+                        }
+                        let v_sl = unsafe { std::slice::from_raw_parts(vp as *const f32, m_cap * kv_dim_cap) };
+                        let cache = unsafe { &mut *(kv_cache_ptr as *mut crate::kv_cache::KvCache) };
+                        cache.append_kv(lw.cl_q, k_sl, v_sl, m_cap);
+                        let kv_len = cache.seq_len + m_cap;
+                        let attn_sl = unsafe { std::slice::from_raw_parts_mut(attn_outp as *mut f32, m_cap * q_dim_cap) };
+                        attn_sl.fill(0.0);
+                        let k_cache = cache.k_data(lw.cl_q, kv_len);
+                        let v_cache = cache.v_data(lw.cl_q, kv_len);
+                        let mut scores = vec![0.0f32; kv_len];
+                        tempura_kernels::attention::attention_prefill_items(
+                            q_sl, &k_cache, &v_cache, attn_outp,
+                            &mut scores, m_cap, kv_len,
+                            n_heads_cap, n_kv_heads_cap, head_dim_cap, attn_scale, 0, m_cap * n_heads_cap,
+                        );
+                    }
+                    barrier.wait();
+
+                    // ── N2b: quantize attn_out → q8k_attn ──────────────────────
+                    {
+                        let tq_per = (m_cap + nth - 1) / nth;
+                        let tq_s = (ith * tq_per).min(m_cap);
+                        let tq_e = ((ith + 1) * tq_per).min(m_cap);
+                        if tq_s < tq_e {
+                            let attn_sl = unsafe { std::slice::from_raw_parts(attn_outp as *const f32, m_cap * q_dim_cap) };
+                            unsafe { quantize_rows_q8k_range(attn_sl.as_ptr(), q_dim_cap, q8k_attn_ptr as *mut BlockQ8K, tq_s, tq_e); }
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── N3: O_proj GEMM ─────────────────────────────────────────
+                    {
+                        let j_per = (h_cap + nth - 1) / nth;
+                        let j_s = (ith * j_per).min(h_cap);
+                        let j_e = ((ith + 1) * j_per).min(h_cap);
+                        if j_s < j_e {
+                            let q8k_act = q8k_attn_ptr as *const BlockQ8K;
+                            if lw.o_is_q4k {
+                                unsafe { q4k_prefill_gemm_range(lw.ow as *const u8, q8k_act, oprjp as *mut f32,
+                                    m_cap, h_cap, bpr_q, q_dim_cap, j_s, j_e); }
+                            } else {
+                                let attn_sl = unsafe { std::slice::from_raw_parts(attn_outp as *const f32, m_cap * q_dim_cap) };
+                                unsafe { f16_prefill_gemm_range(lw.ow as *const u8, attn_sl.as_ptr(), oprjp as *mut f32,
+                                    m_cap, h_cap, q_dim_cap, j_s, j_e); }
+                            }
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── N4: residual + post-norm (parallel over tokens) ─────────
+                    if t_start < t_end {
+                        let hid = unsafe { std::slice::from_raw_parts_mut(hp as *mut f32, m_cap * h_cap) };
+                        let o = unsafe { std::slice::from_raw_parts(oprjp as *const f32, m_cap * h_cap) };
+                        let post_w = unsafe { std::slice::from_raw_parts(lw.post_ln_p as *const f32, h_cap) };
+                        let nrm2 = unsafe { std::slice::from_raw_parts_mut(nrm2p as *mut f32, m_cap * h_cap) };
+                        for t in t_start..t_end {
+                            let s = t * h_cap; let e = s + h_cap;
+                            residual_add(&mut hid[s..e], &o[s..e], h_cap);
+                            rms_norm_mul_rows_f32(&hid[s..e], post_w, &mut nrm2[s..e], h_cap, eps);
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── N4b: quantize normed2 → q8k_ffn ────────────────────────
+                    if t_start < t_end {
+                        let nrm2 = unsafe { std::slice::from_raw_parts(nrm2p as *const f32, m_cap * h_cap) };
+                        unsafe { quantize_rows_q8k_range(nrm2.as_ptr(), h_cap, q8k_ffn_ptr as *mut BlockQ8K, t_start, t_end); }
+                    }
+                    barrier.wait();
+
+                    // ── N5: gate+up GEMM ────────────────────────────────────────
+                    {
+                        let total_gu = 2 * inter_cap;
+                        let j_per = (total_gu + nth - 1) / nth;
+                        let j_s = (ith * j_per).min(total_gu);
+                        let j_e = ((ith + 1) * j_per).min(total_gu);
+                        let q8k_act = q8k_ffn_ptr as *const BlockQ8K;
+                        let gj_s = j_s.min(inter_cap);
+                        let gj_e = j_e.min(inter_cap);
+                        if gj_s < gj_e {
+                            if lw.gate_is_q4k {
+                                unsafe { q4k_prefill_gemm_range(lw.gw as *const u8, q8k_act, gatep as *mut f32,
+                                    m_cap, inter_cap, bpr_h, h_cap, gj_s, gj_e); }
+                            } else {
+                                unsafe { q6k_prefill_gemm_range(lw.gw as *const u8, q8k_act, gatep as *mut f32,
+                                    m_cap, inter_cap, bpr_h, h_cap, gj_s, gj_e); }
+                            }
+                        }
+                        let uj_s = j_s.saturating_sub(inter_cap).min(inter_cap);
+                        let uj_e = j_e.saturating_sub(inter_cap).min(inter_cap);
+                        if uj_s < uj_e {
+                            if lw.up_is_q4k {
+                                unsafe { q4k_prefill_gemm_range(lw.uw as *const u8, q8k_act, upp as *mut f32,
+                                    m_cap, inter_cap, bpr_h, h_cap, uj_s, uj_e); }
+                            } else {
+                                unsafe { q6k_prefill_gemm_range(lw.uw as *const u8, q8k_act, upp as *mut f32,
+                                    m_cap, inter_cap, bpr_h, h_cap, uj_s, uj_e); }
+                            }
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── N6: SiLU×gate + quantize → q8k_gate ────────────────────
+                    if t_start < t_end {
+                        let gate_sl = unsafe { std::slice::from_raw_parts_mut(gatep as *mut f32, m_cap * inter_cap) };
+                        let up_sl   = unsafe { std::slice::from_raw_parts(upp as *const f32, m_cap * inter_cap) };
+                        for t in t_start..t_end {
+                            let s = t * inter_cap; let e = s + inter_cap;
+                            vec_silu_gate_inplace(&mut gate_sl[s..e], &up_sl[s..e]);
+                        }
+                        unsafe { quantize_rows_q8k_range(gate_sl.as_ptr(), inter_cap, q8k_gate_ptr as *mut BlockQ8K, t_start, t_end); }
+                    }
+                    barrier.wait();
+
+                    // ── N7: down GEMM ────────────────────────────────────────────
+                    {
+                        let j_per = (h_cap + nth - 1) / nth;
+                        let j_s = (ith * j_per).min(h_cap);
+                        let j_e = ((ith + 1) * j_per).min(h_cap);
+                        if j_s < j_e {
+                            let q8k_act = q8k_gate_ptr as *const BlockQ8K;
+                            if lw.down_is_q4k {
+                                unsafe { q4k_prefill_gemm_range(lw.dw as *const u8, q8k_act, dnp as *mut f32,
+                                    m_cap, h_cap, bpr_inter, inter_cap, j_s, j_e); }
+                            } else {
+                                unsafe { q6k_prefill_gemm_range(lw.dw as *const u8, q8k_act, dnp as *mut f32,
+                                    m_cap, h_cap, bpr_inter, inter_cap, j_s, j_e); }
+                            }
+                        }
+                    }
+                    barrier.wait();
+
+                    // ── N8: final residual (parallel over tokens) ─────────────
+                    if t_start < t_end {
+                        let hid = unsafe { std::slice::from_raw_parts_mut(hp as *mut f32, m_cap * h_cap) };
+                        let dn  = unsafe { std::slice::from_raw_parts(dnp as *const f32, m_cap * h_cap) };
+                        for t in t_start..t_end {
+                            let s = t * h_cap; let e = s + h_cap;
+                            residual_add(&mut hid[s..e], &dn[s..e], h_cap);
+                        }
+                    }
+                    barrier.wait();
+                }
+            });
+
+            session.cache.advance(m);
+            break 'skip_layer_loop;
+        }
+
         for layer in 0..cfg.num_layers {
             let layer_kind = cfg
                 .layer_kinds
