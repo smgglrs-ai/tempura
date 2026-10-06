@@ -3566,6 +3566,54 @@ where
                             1.0 / (head_dim as f32).sqrt(),
                         )
                         .unwrap();
+                } else if std::env::var("TEMPURA_USE_FLASH_ATTN").is_ok()
+                    && session.cache.use_f16
+                    && alibi_attn.is_none()
+                    && softcap_attn.is_none()
+                {
+                    // ggml_compute_forward_flash_attn_ext_f16 path (translated from ops.cpp)
+                    // Prefill: n_tokens=seq_len, causal mask required.
+                    // kv_prev = kv_len - seq_len (tokens already in cache before this prefill)
+                    let kv_prev = kv_len - seq_len;
+                    // Causal mask: shape [seq_len × kv_len] as F16.
+                    // mask[i][j] = 0 (attend) if j <= kv_prev + i, else -inf (block).
+                    let f16_neg_inf: u16 = 0xFC00u16; // F16 -inf
+                    let f16_zero: u16 = 0u16;
+                    let mut mask_f16 = vec![f16_zero; seq_len * kv_len];
+                    for i in 0..seq_len {
+                        let attend_up_to = kv_prev + i; // inclusive
+                        for j in 0..kv_len {
+                            mask_f16[i * kv_len + j] = if j <= attend_up_to { f16_zero } else { f16_neg_inf };
+                        }
+                    }
+                    let k_f16 = session.cache.k_data_f16(cl_q, kv_len);
+                    let v_f16 = session.cache.v_data_f16(cl_q, kv_len);
+                    let scale = 1.0f32 / (head_dim as f32).sqrt();
+                    tempura_kernels::ggml::flash_attn_llama::flash_attn_ext_f16(
+                        &q[..seq_len * q_dim],
+                        k_f16,
+                        v_f16,
+                        Some(&mask_f16),
+                        None,
+                        &mut attn_out[..seq_len * q_dim],
+                        seq_len,     // neq1 = n_tokens
+                        n_heads,     // neq2 = n_heads
+                        1,           // neq3 = batch
+                        kv_len,      // nek1 = n_kv
+                        n_kv_heads,  // nek2 = n_kv_heads
+                        1,           // nek3
+                        head_dim,    // dv
+                        head_dim,    // dk
+                        scale,
+                        0.0,         // max_bias
+                        0.0,         // logit_softcap
+                        None,        // partials
+                        0,           // partial_stride
+                        0,           // ir0
+                        seq_len,     // ir1 (all tokens)
+                        0,           // ic_start
+                        kv_len,      // ic_end
+                    );
                 } else {
                     self.pipeline
                         .attention(
