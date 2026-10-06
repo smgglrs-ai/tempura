@@ -1056,12 +1056,7 @@ pub unsafe fn f16_prefill_gemm_range(
         let b_row = std::slice::from_raw_parts(b_f16.add(j * row_bytes), row_bytes);
         for i in 0..m {
             let a_row = std::slice::from_raw_parts(a_f32.add(i * k), k);
-            #[cfg(target_arch = "x86_64")]
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
-                *out.add(i * n + j) = crate::f16_gemv::f16_dot_avx2(a_row, b_row, k);
-                continue;
-            }
-            *out.add(i * n + j) = crate::f16_gemv::f16_dot_scalar(a_row, b_row, k);
+            *out.add(i * n + j) = crate::f16_gemv::f16_dot_dispatch(a_row, b_row, k);
         }
     }
 }
@@ -1105,16 +1100,7 @@ pub unsafe fn f16_preq_range(
     let a = std::slice::from_raw_parts(a_f32, k);
     for j in start..end {
         let b_row = std::slice::from_raw_parts(b_f16.add(j * row_bytes), row_bytes);
-        #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("f16c")
-            && is_x86_feature_detected!("fma")
-        {
-            *out_ptr.add(j) = crate::f16_gemv::f16_dot_avx2(a, b_row, k);
-            continue;
-        }
-        let val = crate::f16_gemv::f16_dot_scalar(a, b_row, k);
-        *out_ptr.add(j) = val;
+        *out_ptr.add(j) = crate::f16_gemv::f16_dot_dispatch(a, b_row, k);
     }
 }
 
