@@ -1174,25 +1174,26 @@ pub unsafe fn ggml_gemm_q4_k_8x8_q8_k_avxvnni(
                     let lhs_01_13_sp2 = _mm256_shuffle_epi32(lhs_mat_01_13, 245);
                     let lhs_23_13_sp2 = _mm256_shuffle_epi32(lhs_mat_23_13, 245);
 
-                    // VNNI: accumulate sp1 + sp2 directly into i32, then scale with mullo_epi32.
-                    // Replaces: add4_maddubs×2 + add_epi16 + madd_epi16 (16 ops) with
-                    //           8×dpbusd_avx + mullo_epi32 (9 ops) per accumulator group.
+                    // VNNI: two independent accumulator chains (sp1=chain-A, sp2=chain-B).
+                    // OoO hardware runs A and B in parallel → 4×4=16-cycle critical path
+                    // instead of the previous 8×4=32-cycle serial chain.
                     macro_rules! vnni_acc8 {
                         ($r0sp1:expr, $r1sp1:expr, $r2sp1:expr, $r3sp1:expr,
                          $r0sp2:expr, $r1sp2:expr, $r2sp2:expr, $r3sp2:expr,
                          $l0sp1:expr, $l1sp1:expr, $l2sp1:expr, $l3sp1:expr,
                          $l0sp2:expr, $l1sp2:expr, $l2sp2:expr, $l3sp2:expr,
                          $scale:expr) => {{
-                            let mut acc = _mm256_setzero_si256();
-                            acc = _mm256_dpbusd_avx_epi32(acc, $r0sp1, $l0sp1);
-                            acc = _mm256_dpbusd_avx_epi32(acc, $r1sp1, $l1sp1);
-                            acc = _mm256_dpbusd_avx_epi32(acc, $r2sp1, $l2sp1);
-                            acc = _mm256_dpbusd_avx_epi32(acc, $r3sp1, $l3sp1);
-                            acc = _mm256_dpbusd_avx_epi32(acc, $r0sp2, $l0sp2);
-                            acc = _mm256_dpbusd_avx_epi32(acc, $r1sp2, $l1sp2);
-                            acc = _mm256_dpbusd_avx_epi32(acc, $r2sp2, $l2sp2);
-                            acc = _mm256_dpbusd_avx_epi32(acc, $r3sp2, $l3sp2);
-                            _mm256_mullo_epi32(acc, $scale)
+                            let mut acc_a = _mm256_setzero_si256();
+                            let mut acc_b = _mm256_setzero_si256();
+                            acc_a = _mm256_dpbusd_avx_epi32(acc_a, $r0sp1, $l0sp1);
+                            acc_b = _mm256_dpbusd_avx_epi32(acc_b, $r0sp2, $l0sp2);
+                            acc_a = _mm256_dpbusd_avx_epi32(acc_a, $r1sp1, $l1sp1);
+                            acc_b = _mm256_dpbusd_avx_epi32(acc_b, $r1sp2, $l1sp2);
+                            acc_a = _mm256_dpbusd_avx_epi32(acc_a, $r2sp1, $l2sp1);
+                            acc_b = _mm256_dpbusd_avx_epi32(acc_b, $r2sp2, $l2sp2);
+                            acc_a = _mm256_dpbusd_avx_epi32(acc_a, $r3sp1, $l3sp1);
+                            acc_b = _mm256_dpbusd_avx_epi32(acc_b, $r3sp2, $l3sp2);
+                            _mm256_mullo_epi32(_mm256_add_epi32(acc_a, acc_b), $scale)
                         }};
                     }
 
@@ -1252,6 +1253,351 @@ pub unsafe fn ggml_gemm_q4_k_8x8_q8_k_avxvnni(
                         lhs_23_10_sp2, lhs_23_11_sp2, lhs_23_12_sp2, lhs_23_13_sp2,
                         si32_2367_1
                     );
+
+                    let iacc_row_0_0 = _mm256_blend_epi32(iacc_mat_00_0, _mm256_shuffle_epi32(iacc_mat_01_0, 78), 204);
+                    let iacc_row_1_0 = _mm256_blend_epi32(_mm256_shuffle_epi32(iacc_mat_00_0, 78), iacc_mat_01_0, 204);
+                    let iacc_row_2_0 = _mm256_blend_epi32(iacc_mat_10_0, _mm256_shuffle_epi32(iacc_mat_11_0, 78), 204);
+                    let iacc_row_3_0 = _mm256_blend_epi32(_mm256_shuffle_epi32(iacc_mat_10_0, 78), iacc_mat_11_0, 204);
+                    let iacc_row_0_1 = _mm256_blend_epi32(iacc_mat_00_1, _mm256_shuffle_epi32(iacc_mat_01_1, 78), 204);
+                    let iacc_row_1_1 = _mm256_blend_epi32(_mm256_shuffle_epi32(iacc_mat_00_1, 78), iacc_mat_01_1, 204);
+                    let iacc_row_2_1 = _mm256_blend_epi32(iacc_mat_10_1, _mm256_shuffle_epi32(iacc_mat_11_1, 78), 204);
+                    let iacc_row_3_1 = _mm256_blend_epi32(_mm256_shuffle_epi32(iacc_mat_10_1, 78), iacc_mat_11_1, 204);
+
+                    let iacc_row_0 = _mm256_add_epi32(iacc_row_0_0, iacc_row_0_1);
+                    let iacc_row_1 = _mm256_add_epi32(iacc_row_1_0, iacc_row_1_1);
+                    let iacc_row_2 = _mm256_add_epi32(iacc_row_2_0, iacc_row_2_1);
+                    let iacc_row_3 = _mm256_add_epi32(iacc_row_3_0, iacc_row_3_1);
+
+                    let row_scale_f32_sse = _mm_loadu_ps(a.d.as_ptr());
+                    let row_scale_f32 = {
+                        let v256 = _mm256_castps128_ps256(row_scale_f32_sse);
+                        _mm256_insertf128_ps(v256, row_scale_f32_sse, 1)
+                    };
+
+                    acc_rows[0] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_row_0), _mm256_mul_ps(col_scale_f32, _mm256_shuffle_ps(row_scale_f32, row_scale_f32,   0)), acc_rows[0]);
+                    acc_rows[1] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_row_1), _mm256_mul_ps(col_scale_f32, _mm256_shuffle_ps(row_scale_f32, row_scale_f32,  85)), acc_rows[1]);
+                    acc_rows[2] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_row_2), _mm256_mul_ps(col_scale_f32, _mm256_shuffle_ps(row_scale_f32, row_scale_f32, 170)), acc_rows[2]);
+                    acc_rows[3] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_row_3), _mm256_mul_ps(col_scale_f32, _mm256_shuffle_ps(row_scale_f32, row_scale_f32, 255)), acc_rows[3]);
+
+                    let iacc_row_min_0 = _mm256_madd_epi16(_mm256_shuffle_epi32(lhs_bsums_hsum,   0), mins_01);
+                    let iacc_row_min_1 = _mm256_madd_epi16(_mm256_shuffle_epi32(lhs_bsums_hsum,  85), mins_01);
+                    let iacc_row_min_2 = _mm256_madd_epi16(_mm256_shuffle_epi32(lhs_bsums_hsum, 170), mins_01);
+                    let iacc_row_min_3 = _mm256_madd_epi16(_mm256_shuffle_epi32(lhs_bsums_hsum, 255), mins_01);
+
+                    acc_min_rows[0] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_row_min_0), _mm256_mul_ps(col_dmin_f32, _mm256_shuffle_ps(row_scale_f32, row_scale_f32,   0)), acc_min_rows[0]);
+                    acc_min_rows[1] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_row_min_1), _mm256_mul_ps(col_dmin_f32, _mm256_shuffle_ps(row_scale_f32, row_scale_f32,  85)), acc_min_rows[1]);
+                    acc_min_rows[2] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_row_min_2), _mm256_mul_ps(col_dmin_f32, _mm256_shuffle_ps(row_scale_f32, row_scale_f32, 170)), acc_min_rows[2]);
+                    acc_min_rows[3] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_row_min_3), _mm256_mul_ps(col_dmin_f32, _mm256_shuffle_ps(row_scale_f32, row_scale_f32, 255)), acc_min_rows[3]);
+                }
+            }
+
+            for i in 0..4 {
+                _mm256_storeu_ps(
+                    s.add((y * 4 + i) * bs + x * 8),
+                    _mm256_sub_ps(acc_rows[i], acc_min_rows[i]),
+                );
+            }
+        }
+    }
+}
+
+/// AVX-512 VNNI variant: same 8×4 tile but packs sp1 (lower 256b) and sp2 (upper 256b)
+/// into 512-bit registers so each `_mm512_dpbusd_epi32` processes both chains at once.
+/// Halves the dpbusd instruction count vs avxvnni (4 per group vs 8) while keeping the
+/// same 4×4=16-cycle critical path — sp1 and sp2 run in the lower/upper halves
+/// of the same 512-bit pipeline slot simultaneously.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,avx2,avx512f,avx512bw,avx512vnni")]
+pub unsafe fn ggml_gemm_q4_k_8x8_q8_k_avx512vnni(
+    n:  usize,
+    s:  *mut f32,
+    bs: usize,
+    vx: *const u8,
+    vy: *const u8,
+    nr: usize,
+    nc: usize,
+) {
+    use std::arch::x86_64::*;
+
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    let nb = n / QK_K;
+    let m4b = _mm256_set1_epi8(0x0F_u8 as i8);
+    let required_order = _mm256_set_epi32(3, 2, 1, 0, 7, 6, 5, 4);
+    let mask_lo16 = _mm256_set1_epi32(0xFFFF);
+
+    let b_ptr_start = vx as *const BlockQ4Kx8;
+    let a_ptr_start = vy as *const BlockQ8Kx4;
+
+    // Pack two 256-bit vectors into a 512-bit register (lo=lower, hi=upper).
+    macro_rules! pack512 {
+        ($lo:expr, $hi:expr) => {
+            _mm512_inserti64x4(_mm512_castsi256_si512($lo), $hi, 1)
+        };
+    }
+
+    // 512-bit VNNI accumulator: packs sp1 (chain A, lower) and sp2 (chain B, upper)
+    // into 512-bit operands so one dpbusd512 advances both chains simultaneously.
+    // Critical path: 4 × 4-cycle dpbusd512 = 16 cycles (A and B in parallel).
+    macro_rules! vnni512_acc {
+        ($r0sp1:expr, $r1sp1:expr, $r2sp1:expr, $r3sp1:expr,
+         $r0sp2:expr, $r1sp2:expr, $r2sp2:expr, $r3sp2:expr,
+         $l0sp1:expr, $l1sp1:expr, $l2sp1:expr, $l3sp1:expr,
+         $l0sp2:expr, $l1sp2:expr, $l2sp2:expr, $l3sp2:expr,
+         $scale:expr) => {{
+            let mut acc = _mm512_setzero_si512();
+            acc = _mm512_dpbusd_epi32(acc, pack512!($r0sp1, $r0sp2), pack512!($l0sp1, $l0sp2));
+            acc = _mm512_dpbusd_epi32(acc, pack512!($r1sp1, $r1sp2), pack512!($l1sp1, $l1sp2));
+            acc = _mm512_dpbusd_epi32(acc, pack512!($r2sp1, $r2sp2), pack512!($l2sp1, $l2sp2));
+            acc = _mm512_dpbusd_epi32(acc, pack512!($r3sp1, $r3sp2), pack512!($l3sp1, $l3sp2));
+            let merged = _mm256_add_epi32(
+                _mm512_castsi512_si256(acc),
+                _mm512_extracti64x4_epi64(acc, 1),
+            );
+            _mm256_mullo_epi32(merged, $scale)
+        }};
+    }
+
+    for y in 0..nr / 4 {
+        let a_ptr = a_ptr_start.add(y * nb);
+        for x in 0..nc / 8 {
+            let b_ptr = b_ptr_start.add(x * nb);
+            let mut acc_rows     = [_mm256_setzero_ps(); 4];
+            let mut acc_min_rows = [_mm256_setzero_ps(); 4];
+
+            for b in 0..nb as isize {
+                let a  = &*a_ptr.offset(b);
+                let bp = &*b_ptr.offset(b);
+
+                let col_scale_f32 = _mm256_cvtph_ps(_mm_loadu_si128(bp.d.as_ptr() as *const __m128i));
+                let col_dmin_f32  = _mm256_cvtph_ps(_mm_loadu_si128(bp.dmin.as_ptr() as *const __m128i));
+
+                for sb in 0..(QK_K / 64) as isize {
+                    let base = bp.qs.as_ptr().offset(sb * 256);
+
+                    let rhs_raw_mat_0123_0 = _mm256_loadu_si256(base.add(  0) as *const __m256i);
+                    let rhs_raw_mat_4567_0 = _mm256_loadu_si256(base.add( 32) as *const __m256i);
+                    let rhs_raw_mat_0123_1 = _mm256_loadu_si256(base.add( 64) as *const __m256i);
+                    let rhs_raw_mat_4567_1 = _mm256_loadu_si256(base.add( 96) as *const __m256i);
+                    let rhs_raw_mat_0123_2 = _mm256_loadu_si256(base.add(128) as *const __m256i);
+                    let rhs_raw_mat_4567_2 = _mm256_loadu_si256(base.add(160) as *const __m256i);
+                    let rhs_raw_mat_0123_3 = _mm256_loadu_si256(base.add(192) as *const __m256i);
+                    let rhs_raw_mat_4567_3 = _mm256_loadu_si256(base.add(224) as *const __m256i);
+
+                    let rhs_raw_mat_0145_0 = _mm256_blend_epi32(rhs_raw_mat_0123_0, _mm256_permutevar8x32_epi32(rhs_raw_mat_4567_0, required_order), 240);
+                    let rhs_raw_mat_2367_0 = _mm256_blend_epi32(_mm256_permutevar8x32_epi32(rhs_raw_mat_0123_0, required_order), rhs_raw_mat_4567_0, 240);
+                    let rhs_raw_mat_0145_1 = _mm256_blend_epi32(rhs_raw_mat_0123_1, _mm256_permutevar8x32_epi32(rhs_raw_mat_4567_1, required_order), 240);
+                    let rhs_raw_mat_2367_1 = _mm256_blend_epi32(_mm256_permutevar8x32_epi32(rhs_raw_mat_0123_1, required_order), rhs_raw_mat_4567_1, 240);
+                    let rhs_raw_mat_0145_2 = _mm256_blend_epi32(rhs_raw_mat_0123_2, _mm256_permutevar8x32_epi32(rhs_raw_mat_4567_2, required_order), 240);
+                    let rhs_raw_mat_2367_2 = _mm256_blend_epi32(_mm256_permutevar8x32_epi32(rhs_raw_mat_0123_2, required_order), rhs_raw_mat_4567_2, 240);
+                    let rhs_raw_mat_0145_3 = _mm256_blend_epi32(rhs_raw_mat_0123_3, _mm256_permutevar8x32_epi32(rhs_raw_mat_4567_3, required_order), 240);
+                    let rhs_raw_mat_2367_3 = _mm256_blend_epi32(_mm256_permutevar8x32_epi32(rhs_raw_mat_0123_3, required_order), rhs_raw_mat_4567_3, 240);
+
+                    let rhs_mat_0145_00 = _mm256_and_si256(rhs_raw_mat_0145_0, m4b);
+                    let rhs_mat_2367_00 = _mm256_and_si256(rhs_raw_mat_2367_0, m4b);
+                    let rhs_mat_0145_01 = _mm256_and_si256(rhs_raw_mat_0145_1, m4b);
+                    let rhs_mat_2367_01 = _mm256_and_si256(rhs_raw_mat_2367_1, m4b);
+                    let rhs_mat_0145_02 = _mm256_and_si256(rhs_raw_mat_0145_2, m4b);
+                    let rhs_mat_2367_02 = _mm256_and_si256(rhs_raw_mat_2367_2, m4b);
+                    let rhs_mat_0145_03 = _mm256_and_si256(rhs_raw_mat_0145_3, m4b);
+                    let rhs_mat_2367_03 = _mm256_and_si256(rhs_raw_mat_2367_3, m4b);
+
+                    let rhs_mat_0145_10 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_mat_0145_0, 4), m4b);
+                    let rhs_mat_2367_10 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_mat_2367_0, 4), m4b);
+                    let rhs_mat_0145_11 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_mat_0145_1, 4), m4b);
+                    let rhs_mat_2367_11 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_mat_2367_1, 4), m4b);
+                    let rhs_mat_0145_12 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_mat_0145_2, 4), m4b);
+                    let rhs_mat_2367_12 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_mat_2367_2, 4), m4b);
+                    let rhs_mat_0145_13 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_mat_0145_3, 4), m4b);
+                    let rhs_mat_2367_13 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_mat_2367_3, 4), m4b);
+
+                    let rhs_mat_0145_00_sp1 = _mm256_shuffle_epi32(rhs_mat_0145_00, 136);
+                    let rhs_mat_2367_00_sp1 = _mm256_shuffle_epi32(rhs_mat_2367_00, 136);
+                    let rhs_mat_0145_01_sp1 = _mm256_shuffle_epi32(rhs_mat_0145_01, 136);
+                    let rhs_mat_2367_01_sp1 = _mm256_shuffle_epi32(rhs_mat_2367_01, 136);
+                    let rhs_mat_0145_02_sp1 = _mm256_shuffle_epi32(rhs_mat_0145_02, 136);
+                    let rhs_mat_2367_02_sp1 = _mm256_shuffle_epi32(rhs_mat_2367_02, 136);
+                    let rhs_mat_0145_03_sp1 = _mm256_shuffle_epi32(rhs_mat_0145_03, 136);
+                    let rhs_mat_2367_03_sp1 = _mm256_shuffle_epi32(rhs_mat_2367_03, 136);
+                    let rhs_mat_0145_10_sp1 = _mm256_shuffle_epi32(rhs_mat_0145_10, 136);
+                    let rhs_mat_2367_10_sp1 = _mm256_shuffle_epi32(rhs_mat_2367_10, 136);
+                    let rhs_mat_0145_11_sp1 = _mm256_shuffle_epi32(rhs_mat_0145_11, 136);
+                    let rhs_mat_2367_11_sp1 = _mm256_shuffle_epi32(rhs_mat_2367_11, 136);
+                    let rhs_mat_0145_12_sp1 = _mm256_shuffle_epi32(rhs_mat_0145_12, 136);
+                    let rhs_mat_2367_12_sp1 = _mm256_shuffle_epi32(rhs_mat_2367_12, 136);
+                    let rhs_mat_0145_13_sp1 = _mm256_shuffle_epi32(rhs_mat_0145_13, 136);
+                    let rhs_mat_2367_13_sp1 = _mm256_shuffle_epi32(rhs_mat_2367_13, 136);
+
+                    let rhs_mat_0145_00_sp2 = _mm256_shuffle_epi32(rhs_mat_0145_00, 221);
+                    let rhs_mat_2367_00_sp2 = _mm256_shuffle_epi32(rhs_mat_2367_00, 221);
+                    let rhs_mat_0145_01_sp2 = _mm256_shuffle_epi32(rhs_mat_0145_01, 221);
+                    let rhs_mat_2367_01_sp2 = _mm256_shuffle_epi32(rhs_mat_2367_01, 221);
+                    let rhs_mat_0145_02_sp2 = _mm256_shuffle_epi32(rhs_mat_0145_02, 221);
+                    let rhs_mat_2367_02_sp2 = _mm256_shuffle_epi32(rhs_mat_2367_02, 221);
+                    let rhs_mat_0145_03_sp2 = _mm256_shuffle_epi32(rhs_mat_0145_03, 221);
+                    let rhs_mat_2367_03_sp2 = _mm256_shuffle_epi32(rhs_mat_2367_03, 221);
+                    let rhs_mat_0145_10_sp2 = _mm256_shuffle_epi32(rhs_mat_0145_10, 221);
+                    let rhs_mat_2367_10_sp2 = _mm256_shuffle_epi32(rhs_mat_2367_10, 221);
+                    let rhs_mat_0145_11_sp2 = _mm256_shuffle_epi32(rhs_mat_0145_11, 221);
+                    let rhs_mat_2367_11_sp2 = _mm256_shuffle_epi32(rhs_mat_2367_11, 221);
+                    let rhs_mat_0145_12_sp2 = _mm256_shuffle_epi32(rhs_mat_0145_12, 221);
+                    let rhs_mat_2367_12_sp2 = _mm256_shuffle_epi32(rhs_mat_2367_12, 221);
+                    let rhs_mat_0145_13_sp2 = _mm256_shuffle_epi32(rhs_mat_0145_13, 221);
+                    let rhs_mat_2367_13_sp2 = _mm256_shuffle_epi32(rhs_mat_2367_13, 221);
+
+                    let mut utmp_0 = [0u32; 4];
+                    let mut utmp_1 = [0u32; 4];
+                    let scales_base = bp.scales.as_ptr();
+                    std::ptr::copy_nonoverlapping(scales_base.offset(24 * sb), utmp_0.as_mut_ptr() as *mut u8, 12);
+                    utmp_0[3] = ((utmp_0[2] >> 4) & KMASK2) | (((utmp_0[1] >> 6) & KMASK3) << 4);
+                    let uaux_0 = utmp_0[1] & KMASK1;
+                    utmp_0[1] = (utmp_0[2] & KMASK2) | (((utmp_0[0] >> 6) & KMASK3) << 4);
+                    utmp_0[2] = uaux_0;
+                    utmp_0[0] &= KMASK1;
+                    std::ptr::copy_nonoverlapping(scales_base.offset(12 + sb * 24), utmp_1.as_mut_ptr() as *mut u8, 12);
+                    utmp_1[3] = ((utmp_1[2] >> 4) & KMASK2) | (((utmp_1[1] >> 6) & KMASK3) << 4);
+                    let uaux_1 = utmp_1[1] & KMASK1;
+                    utmp_1[1] = (utmp_1[2] & KMASK2) | (((utmp_1[0] >> 6) & KMASK3) << 4);
+                    utmp_1[2] = uaux_1;
+                    utmp_1[0] &= KMASK1;
+
+                    let mins_and_scales_0 = _mm_set_epi32(utmp_0[3] as i32, utmp_0[2] as i32, utmp_0[1] as i32, utmp_0[0] as i32);
+                    let scales_0 = _mm256_cvtepu8_epi16(_mm_unpacklo_epi8(mins_and_scales_0, mins_and_scales_0));
+                    let mins_and_scales_1 = _mm_set_epi32(utmp_1[3] as i32, utmp_1[2] as i32, utmp_1[1] as i32, utmp_1[0] as i32);
+                    let scales_1 = _mm256_cvtepu8_epi16(_mm_unpacklo_epi8(mins_and_scales_1, mins_and_scales_1));
+                    let mins_01 = _mm256_cvtepu8_epi16(_mm_unpacklo_epi8(
+                        _mm_shuffle_epi32(mins_and_scales_0, 78),
+                        _mm_shuffle_epi32(mins_and_scales_1, 78),
+                    ));
+
+                    let scale_0145_0 = _mm256_shuffle_epi32(scales_0, 68);
+                    let scale_2367_0 = _mm256_shuffle_epi32(scales_0, 238);
+                    let scale_0145_1 = _mm256_shuffle_epi32(scales_1, 68);
+                    let scale_2367_1 = _mm256_shuffle_epi32(scales_1, 238);
+
+                    let si32_0145_0 = _mm256_and_si256(scale_0145_0, mask_lo16);
+                    let si32_2367_0 = _mm256_and_si256(scale_2367_0, mask_lo16);
+                    let si32_0145_1 = _mm256_and_si256(scale_0145_1, mask_lo16);
+                    let si32_2367_1 = _mm256_and_si256(scale_2367_1, mask_lo16);
+
+                    let lhs_base = a.qs.as_ptr().offset(256 * sb);
+                    let lhs_mat_0123_00 = _mm256_loadu_si256(lhs_base.add(  0) as *const __m256i);
+                    let lhs_mat_01_00 = _mm256_permute2f128_si256(lhs_mat_0123_00, lhs_mat_0123_00, 0);
+                    let lhs_mat_23_00 = _mm256_permute2f128_si256(lhs_mat_0123_00, lhs_mat_0123_00, 17);
+                    let lhs_mat_0123_01 = _mm256_loadu_si256(lhs_base.add( 32) as *const __m256i);
+                    let lhs_mat_01_01 = _mm256_permute2f128_si256(lhs_mat_0123_01, lhs_mat_0123_01, 0);
+                    let lhs_mat_23_01 = _mm256_permute2f128_si256(lhs_mat_0123_01, lhs_mat_0123_01, 17);
+                    let lhs_mat_0123_02 = _mm256_loadu_si256(lhs_base.add( 64) as *const __m256i);
+                    let lhs_mat_01_02 = _mm256_permute2f128_si256(lhs_mat_0123_02, lhs_mat_0123_02, 0);
+                    let lhs_mat_23_02 = _mm256_permute2f128_si256(lhs_mat_0123_02, lhs_mat_0123_02, 17);
+                    let lhs_mat_0123_03 = _mm256_loadu_si256(lhs_base.add( 96) as *const __m256i);
+                    let lhs_mat_01_03 = _mm256_permute2f128_si256(lhs_mat_0123_03, lhs_mat_0123_03, 0);
+                    let lhs_mat_23_03 = _mm256_permute2f128_si256(lhs_mat_0123_03, lhs_mat_0123_03, 17);
+                    let lhs_mat_0123_10 = _mm256_loadu_si256(lhs_base.add(128) as *const __m256i);
+                    let lhs_mat_01_10 = _mm256_permute2f128_si256(lhs_mat_0123_10, lhs_mat_0123_10, 0);
+                    let lhs_mat_23_10 = _mm256_permute2f128_si256(lhs_mat_0123_10, lhs_mat_0123_10, 17);
+                    let lhs_mat_0123_11 = _mm256_loadu_si256(lhs_base.add(160) as *const __m256i);
+                    let lhs_mat_01_11 = _mm256_permute2f128_si256(lhs_mat_0123_11, lhs_mat_0123_11, 0);
+                    let lhs_mat_23_11 = _mm256_permute2f128_si256(lhs_mat_0123_11, lhs_mat_0123_11, 17);
+                    let lhs_mat_0123_12 = _mm256_loadu_si256(lhs_base.add(192) as *const __m256i);
+                    let lhs_mat_01_12 = _mm256_permute2f128_si256(lhs_mat_0123_12, lhs_mat_0123_12, 0);
+                    let lhs_mat_23_12 = _mm256_permute2f128_si256(lhs_mat_0123_12, lhs_mat_0123_12, 17);
+                    let lhs_mat_0123_13 = _mm256_loadu_si256(lhs_base.add(224) as *const __m256i);
+                    let lhs_mat_01_13 = _mm256_permute2f128_si256(lhs_mat_0123_13, lhs_mat_0123_13, 0);
+                    let lhs_mat_23_13 = _mm256_permute2f128_si256(lhs_mat_0123_13, lhs_mat_0123_13, 17);
+
+                    let lhs_bsums_0123 = _mm256_loadu_si256((a.bsums.as_ptr().offset(16 * sb)) as *const __m256i);
+                    let lhs_bsums_hsum = {
+                        let lo = _mm256_castsi256_si128(lhs_bsums_0123);
+                        let hi = _mm256_extracti128_si256(lhs_bsums_0123, 1);
+                        let h = _mm256_castsi128_si256(_mm_hadd_epi16(lo, hi));
+                        _mm256_permute2x128_si256(h, h, 0)
+                    };
+
+                    let lhs_01_00_sp1 = _mm256_shuffle_epi32(lhs_mat_01_00, 160);
+                    let lhs_23_00_sp1 = _mm256_shuffle_epi32(lhs_mat_23_00, 160);
+                    let lhs_01_01_sp1 = _mm256_shuffle_epi32(lhs_mat_01_01, 160);
+                    let lhs_23_01_sp1 = _mm256_shuffle_epi32(lhs_mat_23_01, 160);
+                    let lhs_01_02_sp1 = _mm256_shuffle_epi32(lhs_mat_01_02, 160);
+                    let lhs_23_02_sp1 = _mm256_shuffle_epi32(lhs_mat_23_02, 160);
+                    let lhs_01_03_sp1 = _mm256_shuffle_epi32(lhs_mat_01_03, 160);
+                    let lhs_23_03_sp1 = _mm256_shuffle_epi32(lhs_mat_23_03, 160);
+                    let lhs_01_10_sp1 = _mm256_shuffle_epi32(lhs_mat_01_10, 160);
+                    let lhs_23_10_sp1 = _mm256_shuffle_epi32(lhs_mat_23_10, 160);
+                    let lhs_01_11_sp1 = _mm256_shuffle_epi32(lhs_mat_01_11, 160);
+                    let lhs_23_11_sp1 = _mm256_shuffle_epi32(lhs_mat_23_11, 160);
+                    let lhs_01_12_sp1 = _mm256_shuffle_epi32(lhs_mat_01_12, 160);
+                    let lhs_23_12_sp1 = _mm256_shuffle_epi32(lhs_mat_23_12, 160);
+                    let lhs_01_13_sp1 = _mm256_shuffle_epi32(lhs_mat_01_13, 160);
+                    let lhs_23_13_sp1 = _mm256_shuffle_epi32(lhs_mat_23_13, 160);
+
+                    let lhs_01_00_sp2 = _mm256_shuffle_epi32(lhs_mat_01_00, 245);
+                    let lhs_23_00_sp2 = _mm256_shuffle_epi32(lhs_mat_23_00, 245);
+                    let lhs_01_01_sp2 = _mm256_shuffle_epi32(lhs_mat_01_01, 245);
+                    let lhs_23_01_sp2 = _mm256_shuffle_epi32(lhs_mat_23_01, 245);
+                    let lhs_01_02_sp2 = _mm256_shuffle_epi32(lhs_mat_01_02, 245);
+                    let lhs_23_02_sp2 = _mm256_shuffle_epi32(lhs_mat_23_02, 245);
+                    let lhs_01_03_sp2 = _mm256_shuffle_epi32(lhs_mat_01_03, 245);
+                    let lhs_23_03_sp2 = _mm256_shuffle_epi32(lhs_mat_23_03, 245);
+                    let lhs_01_10_sp2 = _mm256_shuffle_epi32(lhs_mat_01_10, 245);
+                    let lhs_23_10_sp2 = _mm256_shuffle_epi32(lhs_mat_23_10, 245);
+                    let lhs_01_11_sp2 = _mm256_shuffle_epi32(lhs_mat_01_11, 245);
+                    let lhs_23_11_sp2 = _mm256_shuffle_epi32(lhs_mat_23_11, 245);
+                    let lhs_01_12_sp2 = _mm256_shuffle_epi32(lhs_mat_01_12, 245);
+                    let lhs_23_12_sp2 = _mm256_shuffle_epi32(lhs_mat_23_12, 245);
+                    let lhs_01_13_sp2 = _mm256_shuffle_epi32(lhs_mat_01_13, 245);
+                    let lhs_23_13_sp2 = _mm256_shuffle_epi32(lhs_mat_23_13, 245);
+
+                    let iacc_mat_00_0 = vnni512_acc!(
+                        rhs_mat_0145_00_sp1, rhs_mat_0145_01_sp1, rhs_mat_0145_02_sp1, rhs_mat_0145_03_sp1,
+                        rhs_mat_0145_00_sp2, rhs_mat_0145_01_sp2, rhs_mat_0145_02_sp2, rhs_mat_0145_03_sp2,
+                        lhs_01_00_sp1, lhs_01_01_sp1, lhs_01_02_sp1, lhs_01_03_sp1,
+                        lhs_01_00_sp2, lhs_01_01_sp2, lhs_01_02_sp2, lhs_01_03_sp2,
+                        si32_0145_0);
+                    let iacc_mat_01_0 = vnni512_acc!(
+                        rhs_mat_2367_00_sp1, rhs_mat_2367_01_sp1, rhs_mat_2367_02_sp1, rhs_mat_2367_03_sp1,
+                        rhs_mat_2367_00_sp2, rhs_mat_2367_01_sp2, rhs_mat_2367_02_sp2, rhs_mat_2367_03_sp2,
+                        lhs_01_00_sp1, lhs_01_01_sp1, lhs_01_02_sp1, lhs_01_03_sp1,
+                        lhs_01_00_sp2, lhs_01_01_sp2, lhs_01_02_sp2, lhs_01_03_sp2,
+                        si32_2367_0);
+                    let iacc_mat_10_0 = vnni512_acc!(
+                        rhs_mat_0145_00_sp1, rhs_mat_0145_01_sp1, rhs_mat_0145_02_sp1, rhs_mat_0145_03_sp1,
+                        rhs_mat_0145_00_sp2, rhs_mat_0145_01_sp2, rhs_mat_0145_02_sp2, rhs_mat_0145_03_sp2,
+                        lhs_23_00_sp1, lhs_23_01_sp1, lhs_23_02_sp1, lhs_23_03_sp1,
+                        lhs_23_00_sp2, lhs_23_01_sp2, lhs_23_02_sp2, lhs_23_03_sp2,
+                        si32_0145_0);
+                    let iacc_mat_11_0 = vnni512_acc!(
+                        rhs_mat_2367_00_sp1, rhs_mat_2367_01_sp1, rhs_mat_2367_02_sp1, rhs_mat_2367_03_sp1,
+                        rhs_mat_2367_00_sp2, rhs_mat_2367_01_sp2, rhs_mat_2367_02_sp2, rhs_mat_2367_03_sp2,
+                        lhs_23_00_sp1, lhs_23_01_sp1, lhs_23_02_sp1, lhs_23_03_sp1,
+                        lhs_23_00_sp2, lhs_23_01_sp2, lhs_23_02_sp2, lhs_23_03_sp2,
+                        si32_2367_0);
+                    let iacc_mat_00_1 = vnni512_acc!(
+                        rhs_mat_0145_10_sp1, rhs_mat_0145_11_sp1, rhs_mat_0145_12_sp1, rhs_mat_0145_13_sp1,
+                        rhs_mat_0145_10_sp2, rhs_mat_0145_11_sp2, rhs_mat_0145_12_sp2, rhs_mat_0145_13_sp2,
+                        lhs_01_10_sp1, lhs_01_11_sp1, lhs_01_12_sp1, lhs_01_13_sp1,
+                        lhs_01_10_sp2, lhs_01_11_sp2, lhs_01_12_sp2, lhs_01_13_sp2,
+                        si32_0145_1);
+                    let iacc_mat_01_1 = vnni512_acc!(
+                        rhs_mat_2367_10_sp1, rhs_mat_2367_11_sp1, rhs_mat_2367_12_sp1, rhs_mat_2367_13_sp1,
+                        rhs_mat_2367_10_sp2, rhs_mat_2367_11_sp2, rhs_mat_2367_12_sp2, rhs_mat_2367_13_sp2,
+                        lhs_01_10_sp1, lhs_01_11_sp1, lhs_01_12_sp1, lhs_01_13_sp1,
+                        lhs_01_10_sp2, lhs_01_11_sp2, lhs_01_12_sp2, lhs_01_13_sp2,
+                        si32_2367_1);
+                    let iacc_mat_10_1 = vnni512_acc!(
+                        rhs_mat_0145_10_sp1, rhs_mat_0145_11_sp1, rhs_mat_0145_12_sp1, rhs_mat_0145_13_sp1,
+                        rhs_mat_0145_10_sp2, rhs_mat_0145_11_sp2, rhs_mat_0145_12_sp2, rhs_mat_0145_13_sp2,
+                        lhs_23_10_sp1, lhs_23_11_sp1, lhs_23_12_sp1, lhs_23_13_sp1,
+                        lhs_23_10_sp2, lhs_23_11_sp2, lhs_23_12_sp2, lhs_23_13_sp2,
+                        si32_0145_1);
+                    let iacc_mat_11_1 = vnni512_acc!(
+                        rhs_mat_2367_10_sp1, rhs_mat_2367_11_sp1, rhs_mat_2367_12_sp1, rhs_mat_2367_13_sp1,
+                        rhs_mat_2367_10_sp2, rhs_mat_2367_11_sp2, rhs_mat_2367_12_sp2, rhs_mat_2367_13_sp2,
+                        lhs_23_10_sp1, lhs_23_11_sp1, lhs_23_12_sp1, lhs_23_13_sp1,
+                        lhs_23_10_sp2, lhs_23_11_sp2, lhs_23_12_sp2, lhs_23_13_sp2,
+                        si32_2367_1);
 
                     let iacc_row_0_0 = _mm256_blend_epi32(iacc_mat_00_0, _mm256_shuffle_epi32(iacc_mat_01_0, 78), 204);
                     let iacc_row_1_0 = _mm256_blend_epi32(_mm256_shuffle_epi32(iacc_mat_00_0, 78), iacc_mat_01_0, 204);
@@ -1576,8 +1922,34 @@ mod tests {
                 let v = out_vnni[row * bs + col];
                 assert_eq!(
                     a.to_bits(), v.to_bits(),
-                    "Mismatch at row={row} col={col}: avx2={a} vnni={v}"
+                    "Mismatch at row={row} col={col}: avx2={a} avxvnni={v}"
                 );
+            }
+        }
+
+        // Also verify avx512vnni variant if available.
+        if std::is_x86_feature_detected!("avx512vnni") {
+            let mut out_512vnni = vec![0f32; nr * nc];
+            unsafe {
+                ggml_gemm_q4_k_8x8_q8_k_avx512vnni(
+                    n,
+                    out_512vnni.as_mut_ptr(),
+                    bs,
+                    b_x8.as_ptr() as *const u8,
+                    a_x4.as_ptr() as *const u8,
+                    nr,
+                    nc,
+                );
+            }
+            for row in 0..nr {
+                for col in 0..nc {
+                    let a = out_avx2[row * bs + col];
+                    let v = out_512vnni[row * bs + col];
+                    assert_eq!(
+                        a.to_bits(), v.to_bits(),
+                        "Mismatch at row={row} col={col}: avx2={a} avx512vnni={v}"
+                    );
+                }
             }
         }
     }

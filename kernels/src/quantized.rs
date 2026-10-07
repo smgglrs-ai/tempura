@@ -949,6 +949,17 @@ pub unsafe fn q4k_prefill_gemm_x8_range(
     let bx8_row_bytes = bpr * std::mem::size_of::<BlockQ4Kx8>();
     let vx = b_q4kx8.add((j_start / 8) * bx8_row_bytes);
     let s = out.add(j_start);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx512vnni") {
+            crate::ggml::repack_llama2::ggml_gemm_q4_k_8x8_q8_k_avx512vnni(k, s, n, vx, q8kx4_act as *const u8, m, nc);
+        } else if std::arch::is_x86_feature_detected!("avxvnni") {
+            crate::ggml::repack_llama2::ggml_gemm_q4_k_8x8_q8_k_avxvnni(k, s, n, vx, q8kx4_act as *const u8, m, nc);
+        } else {
+            crate::ggml::repack_llama2::ggml_gemm_q4_k_8x8_q8_k(k, s, n, vx, q8kx4_act as *const u8, m, nc);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     crate::ggml::repack_llama2::ggml_gemm_q4_k_8x8_q8_k(k, s, n, vx, q8kx4_act as *const u8, m, nc);
 }
 
