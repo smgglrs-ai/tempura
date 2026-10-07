@@ -5,6 +5,15 @@
 # BOLT operates at binary level — no LLVM source instrumentation, so the
 # instrumented binary runs at near-normal speed (counter increments only).
 # Typical workflow: ~5 minutes of profiling, 1-2 minutes for BOLT pass.
+#
+# NOTE: Rust PIE binaries always run in BOLT lite mode. BOLT detects PIC jump
+# tables in the code (Rust compiles with -fPIC for shared-lib compatibility)
+# and forces lite mode regardless of ELF type. Lite mode skips cold functions
+# but fully processes the hot functions (the GEMM kernels). Attempting -no-pie
+# at link time, ET_EXEC patching, or --relocs all result in the same lite mode
+# because the PIC code patterns in the binary are the trigger, not the ELF header.
+# The +4% pp128 improvement (203 → 211 tok/s) represents the BOLT ceiling for
+# Rust PIE binaries. The remaining gap vs llama.cpp is mullo_epi32 scheduling.
 set -euo pipefail
 
 MODEL=${1:-/home/fdupont/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf}
