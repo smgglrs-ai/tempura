@@ -985,6 +985,8 @@ impl RoPE for CpuRoPEScaled {
 
 #[cfg(kani)]
 mod kani_proofs {
+    use super::RoPE as _;
+
     #[kani::proof]
     fn rope_indices_in_bounds() {
         let batch: usize = kani::any();
