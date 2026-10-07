@@ -1106,6 +1106,9 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         tensor_parallel_size: 1,
         quantization,
         use_qk_norm: false,
+        // llama.cpp stores KV cache in F16 for all models; enable for Q4K/Q6K (LLaMA/Qwen).
+        // Use F32 for BitNet (SquaredRelu) since KvCache::new handles that separately.
+        use_f16_kv: matches!(hidden_act, crate::config::HiddenAct::SiluGate | crate::config::HiddenAct::Gelu | crate::config::HiddenAct::GeluQuick | crate::config::HiddenAct::GeGLU),
         sliding_window: None,
         hidden_act,
         rope_type,
