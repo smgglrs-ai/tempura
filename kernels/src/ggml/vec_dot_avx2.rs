@@ -917,7 +917,9 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K])
     let mask_lo = _mm512_set1_epi8(0x0F_i8);
     let zero512 = _mm512_setzero_si512();
 
-    let mut acc = _mm256_setzero_ps();
+    // Two independent f32 accumulators — hides mullo_epi32 latency between iterations.
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
     let mut mins_total = 0.0f32;
 
     let x_ptr = x.as_ptr();
@@ -927,108 +929,100 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K])
     const KMASK2: u32 = 0x0f0f0f0f;
     const KMASK3: u32 = 0x03030303;
 
-    for i in 0..nb {
-        let xi = &*x_ptr.add(i);
-        let yi = &*y_ptr.add(i);
-
-        let d = f16_to_f32(xi.d) * yi.d;
-        let dmin = f16_to_f32(xi.dmin) * yi.d;
-
-        // Scale/min extraction — identical to 256-bit VNNI kernel.
-        let mut utmp = [0u32; 4];
-        std::ptr::copy_nonoverlapping(xi.scales.as_ptr(), utmp.as_mut_ptr() as *mut u8, 12);
-        utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
-        let uaux = utmp[1] & KMASK1;
-        utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
-        utmp[2] = uaux;
-        utmp[0] &= KMASK1;
-
-        // Mins accumulation — identical to 256-bit VNNI kernel.
-        let q8sums = _mm256_loadu_si256(yi.bsums.as_ptr() as *const __m256i);
-        let q8s = _mm_hadd_epi16(
-            _mm256_castsi256_si128(q8sums),
-            _mm256_extracti128_si256(q8sums, 1),
-        );
-        let mins_128 = _mm_set_epi32(0, 0, utmp[3] as i32, utmp[2] as i32);
-        let mins_i16 = _mm_cvtepu8_epi16(mins_128);
-        let prod = _mm_madd_epi16(mins_i16, q8s);
-        mins_total += dmin * hsum_i32_4(prod) as f32;
-
-        // Unpack 8 group scales from utmp[0..1].
-        // utmp[0] = [sc0, sc1, sc2, sc3] as LE bytes → j=0 lo/hi, j=1 lo/hi scales.
-        // utmp[1] = [sc4, sc5, sc6, sc7]             → j=2 lo/hi, j=3 lo/hi scales.
-        let sc0 = (utmp[0] & 0xFF) as i32;
-        let sc1 = ((utmp[0] >> 8) & 0xFF) as i32;
-        let sc2 = ((utmp[0] >> 16) & 0xFF) as i32;
-        let sc3 = ((utmp[0] >> 24) & 0xFF) as i32;
-        let sc4 = (utmp[1] & 0xFF) as i32;
-        let sc5 = ((utmp[1] >> 8) & 0xFF) as i32;
-        let sc6 = ((utmp[1] >> 16) & 0xFF) as i32;
-        let sc7 = ((utmp[1] >> 24) & 0xFF) as i32;
-
-        let q4 = xi.qs.as_ptr();
-        let q8 = yi.qs.as_ptr();
-
-        // ── Sub-block pair j=0,1 ─────────────────────────────────────────────
-        // Load 64 packed nibble bytes (xi.qs[0..63]): bytes 0..31 = j=0 nibbles,
-        // bytes 32..63 = j=1 nibbles. Extract lo/hi nibbles into 512-bit regs.
-        let q4_512_01 = _mm512_loadu_si512(q4 as *const __m512i);
-        let q4_lo01 = _mm512_and_si512(q4_512_01, mask_lo);
-        let q4_hi01 = _mm512_and_si512(_mm512_srli_epi16(q4_512_01, 4), mask_lo);
-
-        // Q8K sub-block j=0: lo = yi.qs[0..31], hi = yi.qs[32..63].
-        // Q8K sub-block j=1: lo = yi.qs[64..95], hi = yi.qs[96..127].
-        // Build [j0_lo | j1_lo] and [j0_hi | j1_hi] for aligned 512-bit dpbusd.
-        let j0_lo = _mm256_loadu_si256(q8.add(0) as *const __m256i);
-        let j0_hi = _mm256_loadu_si256(q8.add(32) as *const __m256i);
-        let j1_lo = _mm256_loadu_si256(q8.add(64) as *const __m256i);
-        let j1_hi = _mm256_loadu_si256(q8.add(96) as *const __m256i);
-        let q8_lo01 = _mm512_inserti64x4(_mm512_castsi256_si512(j0_lo), j1_lo, 1);
-        let q8_hi01 = _mm512_inserti64x4(_mm512_castsi256_si512(j0_hi), j1_hi, 1);
-
-        // 512-bit dpbusd: lower 256 bits → j=0 products, upper 256 bits → j=1.
-        let dot_lo01 = _mm512_dpbusd_epi32(zero512, q4_lo01, q8_lo01);
-        let dot_hi01 = _mm512_dpbusd_epi32(zero512, q4_hi01, q8_hi01);
-
-        // Extract halves and scale each by its group scale.
-        let lo0 = _mm512_castsi512_si256(dot_lo01);
-        let lo1 = _mm512_extracti64x4_epi64(dot_lo01, 1);
-        let hi0 = _mm512_castsi512_si256(dot_hi01);
-        let hi1 = _mm512_extracti64x4_epi64(dot_hi01, 1);
-        let mut sumi = _mm256_setzero_si256();
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo0, _mm256_set1_epi32(sc0)));
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi0, _mm256_set1_epi32(sc1)));
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo1, _mm256_set1_epi32(sc2)));
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi1, _mm256_set1_epi32(sc3)));
-
-        // ── Sub-block pair j=2,3 ─────────────────────────────────────────────
-        let q4_512_23 = _mm512_loadu_si512(q4.add(64) as *const __m512i);
-        let q4_lo23 = _mm512_and_si512(q4_512_23, mask_lo);
-        let q4_hi23 = _mm512_and_si512(_mm512_srli_epi16(q4_512_23, 4), mask_lo);
-
-        let j2_lo = _mm256_loadu_si256(q8.add(128) as *const __m256i);
-        let j2_hi = _mm256_loadu_si256(q8.add(160) as *const __m256i);
-        let j3_lo = _mm256_loadu_si256(q8.add(192) as *const __m256i);
-        let j3_hi = _mm256_loadu_si256(q8.add(224) as *const __m256i);
-        let q8_lo23 = _mm512_inserti64x4(_mm512_castsi256_si512(j2_lo), j3_lo, 1);
-        let q8_hi23 = _mm512_inserti64x4(_mm512_castsi256_si512(j2_hi), j3_hi, 1);
-
-        let dot_lo23 = _mm512_dpbusd_epi32(zero512, q4_lo23, q8_lo23);
-        let dot_hi23 = _mm512_dpbusd_epi32(zero512, q4_hi23, q8_hi23);
-
-        let lo2 = _mm512_castsi512_si256(dot_lo23);
-        let lo3 = _mm512_extracti64x4_epi64(dot_lo23, 1);
-        let hi2 = _mm512_castsi512_si256(dot_hi23);
-        let hi3 = _mm512_extracti64x4_epi64(dot_hi23, 1);
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo2, _mm256_set1_epi32(sc4)));
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi2, _mm256_set1_epi32(sc5)));
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo3, _mm256_set1_epi32(sc6)));
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi3, _mm256_set1_epi32(sc7)));
-
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+    // Helper macro: compute `sumi` and `d` for one block, accumulate mins.
+    macro_rules! block_compute {
+        ($i:expr, $mins_total:expr) => {{
+            let xi = &*x_ptr.add($i);
+            let yi = &*y_ptr.add($i);
+            let d = f16_to_f32(xi.d) * yi.d;
+            let dmin = f16_to_f32(xi.dmin) * yi.d;
+            let mut utmp = [0u32; 4];
+            std::ptr::copy_nonoverlapping(xi.scales.as_ptr(), utmp.as_mut_ptr() as *mut u8, 12);
+            utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
+            let uaux = utmp[1] & KMASK1;
+            utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+            utmp[2] = uaux;
+            utmp[0] &= KMASK1;
+            let q8sums = _mm256_loadu_si256(yi.bsums.as_ptr() as *const __m256i);
+            let q8s = _mm_hadd_epi16(
+                _mm256_castsi256_si128(q8sums),
+                _mm256_extracti128_si256(q8sums, 1),
+            );
+            let mins_128 = _mm_set_epi32(0, 0, utmp[3] as i32, utmp[2] as i32);
+            let mins_i16 = _mm_cvtepu8_epi16(mins_128);
+            let prod = _mm_madd_epi16(mins_i16, q8s);
+            $mins_total += dmin * hsum_i32_4(prod) as f32;
+            let sc0 = (utmp[0] & 0xFF) as i32;
+            let sc1 = ((utmp[0] >> 8) & 0xFF) as i32;
+            let sc2 = ((utmp[0] >> 16) & 0xFF) as i32;
+            let sc3 = ((utmp[0] >> 24) & 0xFF) as i32;
+            let sc4 = (utmp[1] & 0xFF) as i32;
+            let sc5 = ((utmp[1] >> 8) & 0xFF) as i32;
+            let sc6 = ((utmp[1] >> 16) & 0xFF) as i32;
+            let sc7 = ((utmp[1] >> 24) & 0xFF) as i32;
+            let q4 = xi.qs.as_ptr();
+            let q8 = yi.qs.as_ptr();
+            let q4_512_01 = _mm512_loadu_si512(q4 as *const __m512i);
+            let q4_lo01 = _mm512_and_si512(q4_512_01, mask_lo);
+            let q4_hi01 = _mm512_and_si512(_mm512_srli_epi16(q4_512_01, 4), mask_lo);
+            let j0_lo = _mm256_loadu_si256(q8.add(0) as *const __m256i);
+            let j0_hi = _mm256_loadu_si256(q8.add(32) as *const __m256i);
+            let j1_lo = _mm256_loadu_si256(q8.add(64) as *const __m256i);
+            let j1_hi = _mm256_loadu_si256(q8.add(96) as *const __m256i);
+            let q8_lo01 = _mm512_inserti64x4(_mm512_castsi256_si512(j0_lo), j1_lo, 1);
+            let q8_hi01 = _mm512_inserti64x4(_mm512_castsi256_si512(j0_hi), j1_hi, 1);
+            let dot_lo01 = _mm512_dpbusd_epi32(zero512, q4_lo01, q8_lo01);
+            let dot_hi01 = _mm512_dpbusd_epi32(zero512, q4_hi01, q8_hi01);
+            let lo0 = _mm512_castsi512_si256(dot_lo01);
+            let lo1 = _mm512_extracti64x4_epi64(dot_lo01, 1);
+            let hi0 = _mm512_castsi512_si256(dot_hi01);
+            let hi1 = _mm512_extracti64x4_epi64(dot_hi01, 1);
+            let mut sumi = _mm256_setzero_si256();
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo0, _mm256_set1_epi32(sc0)));
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi0, _mm256_set1_epi32(sc1)));
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo1, _mm256_set1_epi32(sc2)));
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi1, _mm256_set1_epi32(sc3)));
+            let q4_512_23 = _mm512_loadu_si512(q4.add(64) as *const __m512i);
+            let q4_lo23 = _mm512_and_si512(q4_512_23, mask_lo);
+            let q4_hi23 = _mm512_and_si512(_mm512_srli_epi16(q4_512_23, 4), mask_lo);
+            let j2_lo = _mm256_loadu_si256(q8.add(128) as *const __m256i);
+            let j2_hi = _mm256_loadu_si256(q8.add(160) as *const __m256i);
+            let j3_lo = _mm256_loadu_si256(q8.add(192) as *const __m256i);
+            let j3_hi = _mm256_loadu_si256(q8.add(224) as *const __m256i);
+            let q8_lo23 = _mm512_inserti64x4(_mm512_castsi256_si512(j2_lo), j3_lo, 1);
+            let q8_hi23 = _mm512_inserti64x4(_mm512_castsi256_si512(j2_hi), j3_hi, 1);
+            let dot_lo23 = _mm512_dpbusd_epi32(zero512, q4_lo23, q8_lo23);
+            let dot_hi23 = _mm512_dpbusd_epi32(zero512, q4_hi23, q8_hi23);
+            let lo2 = _mm512_castsi512_si256(dot_lo23);
+            let lo3 = _mm512_extracti64x4_epi64(dot_lo23, 1);
+            let hi2 = _mm512_castsi512_si256(dot_hi23);
+            let hi3 = _mm512_extracti64x4_epi64(dot_hi23, 1);
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo2, _mm256_set1_epi32(sc4)));
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi2, _mm256_set1_epi32(sc5)));
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo3, _mm256_set1_epi32(sc6)));
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi3, _mm256_set1_epi32(sc7)));
+            (d, sumi)
+        }};
     }
 
-    hsum_f32_8(acc) - mins_total
+    // 2× unrolled: process pairs of blocks into independent acc0/acc1.
+    // The CPU can pipeline block (i+1)'s loads/VNNI while block i's mullo chain drains.
+    let mut i = 0;
+    while i + 1 < nb {
+        let (d0, sumi0) = block_compute!(i,     mins_total);
+        let (d1, sumi1) = block_compute!(i + 1, mins_total);
+        acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), _mm256_cvtepi32_ps(sumi0), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(sumi1), acc1);
+        i += 2;
+    }
+    // Tail (nb=16 for decode → always 0; kept for correctness with odd nb).
+    while i < nb {
+        let (d, sumi) = block_compute!(i, mins_total);
+        acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc0);
+        i += 1;
+    }
+
+    hsum_f32_8(_mm256_add_ps(acc0, acc1)) - mins_total
 }
 
 // ── AVX-512 4×4 micro-tile: 4 act rows × 4 weight rows = 16 outputs ──────
