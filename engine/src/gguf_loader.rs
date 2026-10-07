@@ -90,6 +90,8 @@ impl GgmlType {
             30 => Ok(GgmlType::BF16),
             34 => Ok(GgmlType::TQ1_0),
             35 => Ok(GgmlType::TQ2_0),
+            // bitnet.cpp GGUF uses 36 for TL2/I2S (x86 LUT format); some model files encode it here
+            36 => Ok(GgmlType::I2S),
             38 => Ok(GgmlType::TL1),
             39 => Ok(GgmlType::I2S),
             40 => Ok(GgmlType::NVFP4),
