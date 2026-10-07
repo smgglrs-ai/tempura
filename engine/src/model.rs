@@ -1847,6 +1847,7 @@ where
             up_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
             down_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
             down_proj_q6k_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ6Kx8]>,
+            v_proj_q6k_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ6Kx8]>,
         }
 
         let indexed_layers: Vec<LayerQ4KWeights<'_>> = (0..cfg.num_layers)
@@ -1874,6 +1875,7 @@ where
                     up_proj_x8: qweights.get_q4k_repacked(&n.9),
                     down_proj_x8: qweights.get_q4k_repacked(&n.10),
                     down_proj_q6k_x8: qweights.get_q6k_repacked(&n.10),
+                    v_proj_q6k_x8: qweights.get_q6k_repacked(&n.4),
                 }
             })
             .collect();
@@ -2512,8 +2514,9 @@ where
                 gate_is_q4k: bool, up_is_q4k: bool, down_is_q4k: bool,
                 // Repacked Q4Kx8 weight pointers (0 = not available)
                 qx8: usize, kx8: usize, ox8: usize, gx8: usize, ux8: usize,
-                // Repacked Q6Kx8 for down_proj (0 = not available)
+                // Repacked Q6Kx8 for down_proj and v_proj (0 = not available)
                 dx8: usize,
+                vx8_q6k: usize,
                 in_ln_p: usize, post_ln_p: usize, cl_q: usize,
                 q_norm_p: usize, k_norm_p: usize,
             }
@@ -2550,6 +2553,7 @@ where
                     gx8: x8ptr(il.gate_proj_x8),
                     ux8: x8ptr(il.up_proj_x8),
                     dx8: x8ptr_q6k(il.down_proj_q6k_x8),
+                    vx8_q6k: x8ptr_q6k(il.v_proj_q6k_x8),
                     in_ln_p:  il.input_ln.unwrap().as_ptr() as usize,
                     post_ln_p: il.post_ln.unwrap().as_ptr() as usize,
                     cl_q: cache_layer_map_q[l].unwrap(),
@@ -2657,12 +2661,17 @@ where
                                     m_cap, kv_dim_cap, bpr_h, h_cap, kj_s, kj_e); }
                             }
                         }
-                        // V (may be Q4K, Q6K, or F16; KV projections don't have x8 repacking)
+                        // V (Q4K, Q6Kx8-repacked, Q6K, or F16)
                         let vj_s = j_start.saturating_sub(q_dim_cap + kv_dim_cap).min(kv_dim_cap);
                         let vj_e = j_end.saturating_sub(q_dim_cap + kv_dim_cap).min(kv_dim_cap);
                         if vj_s < vj_e {
                             if lw.v_is_q4k {
                                 unsafe { q4k_prefill_gemm_range(lw.vw as *const u8, q8k_act, vp as *mut f32,
+                                    m_cap, kv_dim_cap, bpr_h, h_cap, vj_s, vj_e); }
+                            } else if lw.v_is_q6k && use_repacked_gemm_cap && lw.vx8_q6k != 0
+                                && vj_s % 8 == 0 && (vj_e - vj_s) % 8 == 0 {
+                                let q8kx4_act = q8kx4_normed_ptr as *const tempura_kernels::ggml::blocks::BlockQ8Kx4;
+                                unsafe { q6k_prefill_gemm_x8_range(lw.vx8_q6k as *const u8, q8kx4_act, vp as *mut f32,
                                     m_cap, kv_dim_cap, bpr_h, h_cap, vj_s, vj_e); }
                             } else if lw.v_is_q6k {
                                 unsafe { q6k_prefill_gemm_range(lw.vw as *const u8, q8k_act, vp as *mut f32,
