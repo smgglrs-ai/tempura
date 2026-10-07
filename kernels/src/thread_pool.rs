@@ -109,6 +109,9 @@ struct Shared {
     work_ptr: AtomicUsize,
     work_vtable: AtomicUsize,
     worker_done_gen: Vec<CacheLine>,
+    /// Serializes concurrent parallel_chunks callers — the shared work-stealing
+    /// state (work_ptr, n_chunks, chunk_counter) is not reentrant.
+    call_mutex: Mutex<()>,
 }
 
 pub struct PersistentPool {
@@ -137,6 +140,7 @@ impl PersistentPool {
             work_ptr: AtomicUsize::new(0),
             work_vtable: AtomicUsize::new(0),
             worker_done_gen: wdg,
+            call_mutex: Mutex::new(()),
         });
 
         let mut threads = Vec::with_capacity(n_workers);
@@ -187,6 +191,9 @@ impl PersistentPool {
             f(0, total);
             return;
         }
+
+        // Serialize concurrent callers — the shared work-stealing state is not reentrant.
+        let _guard = self.shared.call_mutex.lock().unwrap();
 
         let trait_ref: &dyn Fn(usize, usize) = f;
         let raw: [usize; 2] = unsafe { std::mem::transmute(trait_ref) };

@@ -132,6 +132,8 @@ struct Inner {
     ranges: Box<[u64]>,
     fn_ptr: AtomicU64,
     ctx: AtomicU64,
+    /// Serializes concurrent run_raw callers — fn_ptr/ctx/ranges are shared state.
+    call_mutex: std::sync::Mutex<()>,
 }
 
 /// Static-partition thread pool with hybrid spin/condvar workers.
@@ -178,6 +180,7 @@ impl StaticPool {
             ranges,
             fn_ptr: AtomicU64::new(0),
             ctx: AtomicU64::new(0),
+            call_mutex: std::sync::Mutex::new(()),
         });
 
         let mut threads = Vec::with_capacity(n_workers);
@@ -333,14 +336,15 @@ impl StaticPool {
             return;
         }
         let inner = &self.inner;
+        // Enforce single-caller contract: fn_ptr/ctx/ranges are shared state.
+        let _call_guard = inner.call_mutex.lock().unwrap();
         let total = self.n_workers + 1; // +1 = calling thread
 
         let base = n / total;
         let rem = n % total;
 
         // Pre-compute worker ranges.
-        // Safety: ranges is exclusively owned by run_raw (no concurrent run_raw
-        // is possible — callers must not call concurrently).
+        // Safety: ranges is exclusively owned by this call (call_mutex serializes).
         for k in 0..self.n_workers {
             let start = k * base + k.min(rem);
             let end = start + base + usize::from(k < rem);
@@ -569,6 +573,7 @@ mod tests {
             ranges,
             fn_ptr: AtomicU64::new(0),
             ctx: AtomicU64::new(0),
+            call_mutex: std::sync::Mutex::new(()),
         });
         let pool = StaticPool {
             inner,
