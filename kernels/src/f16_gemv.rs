@@ -159,6 +159,58 @@ pub fn f16_dot_ggml_scalar(x_f16: &[u8], y_f16: &[u8], k: usize) -> f32 {
     s
 }
 
+/// AVX512 F32×F16 dot: 16 floats/iter with _mm512_cvtph_ps → _mm512_fmadd_ps.
+/// ~2× throughput vs AVX2 on 512-bit-wide hardware (9950X3D).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,f16c,fma")]
+pub unsafe fn f16_dot_avx512(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let a_ptr = a.as_ptr();
+    let b_ptr = b_f16.as_ptr() as *const __m256i;
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let k32 = k & !31;
+    let mut i = 0usize;
+    while i < k32 {
+        let b0 = _mm512_cvtph_ps(_mm256_loadu_si256(b_ptr.add(i / 16)));
+        let b1 = _mm512_cvtph_ps(_mm256_loadu_si256(b_ptr.add(i / 16 + 1)));
+        let a0 = _mm512_loadu_ps(a_ptr.add(i));
+        let a1 = _mm512_loadu_ps(a_ptr.add(i + 16));
+        acc0 = _mm512_fmadd_ps(a0, b0, acc0);
+        acc1 = _mm512_fmadd_ps(a1, b1, acc1);
+        i += 32;
+    }
+    acc0 = _mm512_add_ps(acc0, acc1);
+    // 16-element tail with AVX2
+    if i + 16 <= k {
+        let b0 = _mm512_cvtph_ps(_mm256_loadu_si256(b_ptr.add(i / 16)));
+        let a0 = _mm512_loadu_ps(a_ptr.add(i));
+        acc0 = _mm512_fmadd_ps(a0, b0, acc0);
+        i += 16;
+    }
+    let mut result = _mm512_reduce_add_ps(acc0);
+    while i < k {
+        let bv = half::f16::from_bits(u16::from_le_bytes([b_f16[i*2], b_f16[i*2+1]])).to_f32();
+        result += a[i] * bv;
+        i += 1;
+    }
+    result
+}
+
+/// Runtime-dispatch F32×F16 dot: AVX512 → AVX2 → scalar.
+#[inline]
+pub fn f16_dot_dispatch(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("f16c") {
+        return unsafe { f16_dot_avx512(a, b_f16, k) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
+        return unsafe { f16_dot_avx2(a, b_f16, k) };
+    }
+    f16_dot_scalar(a, b_f16, k)
+}
+
 pub fn f16_dot_scalar(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
     let mut acc = [0.0f32; 32];
     let k32 = k & !31;

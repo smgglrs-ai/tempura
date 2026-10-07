@@ -917,7 +917,9 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K])
     let mask_lo = _mm512_set1_epi8(0x0F_i8);
     let zero512 = _mm512_setzero_si512();
 
-    let mut acc = _mm256_setzero_ps();
+    // Two independent f32 accumulators — hides mullo_epi32 latency between iterations.
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
     let mut mins_total = 0.0f32;
 
     let x_ptr = x.as_ptr();
@@ -927,108 +929,100 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K])
     const KMASK2: u32 = 0x0f0f0f0f;
     const KMASK3: u32 = 0x03030303;
 
-    for i in 0..nb {
-        let xi = &*x_ptr.add(i);
-        let yi = &*y_ptr.add(i);
-
-        let d = f16_to_f32(xi.d) * yi.d;
-        let dmin = f16_to_f32(xi.dmin) * yi.d;
-
-        // Scale/min extraction — identical to 256-bit VNNI kernel.
-        let mut utmp = [0u32; 4];
-        std::ptr::copy_nonoverlapping(xi.scales.as_ptr(), utmp.as_mut_ptr() as *mut u8, 12);
-        utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
-        let uaux = utmp[1] & KMASK1;
-        utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
-        utmp[2] = uaux;
-        utmp[0] &= KMASK1;
-
-        // Mins accumulation — identical to 256-bit VNNI kernel.
-        let q8sums = _mm256_loadu_si256(yi.bsums.as_ptr() as *const __m256i);
-        let q8s = _mm_hadd_epi16(
-            _mm256_castsi256_si128(q8sums),
-            _mm256_extracti128_si256(q8sums, 1),
-        );
-        let mins_128 = _mm_set_epi32(0, 0, utmp[3] as i32, utmp[2] as i32);
-        let mins_i16 = _mm_cvtepu8_epi16(mins_128);
-        let prod = _mm_madd_epi16(mins_i16, q8s);
-        mins_total += dmin * hsum_i32_4(prod) as f32;
-
-        // Unpack 8 group scales from utmp[0..1].
-        // utmp[0] = [sc0, sc1, sc2, sc3] as LE bytes → j=0 lo/hi, j=1 lo/hi scales.
-        // utmp[1] = [sc4, sc5, sc6, sc7]             → j=2 lo/hi, j=3 lo/hi scales.
-        let sc0 = (utmp[0] & 0xFF) as i32;
-        let sc1 = ((utmp[0] >> 8) & 0xFF) as i32;
-        let sc2 = ((utmp[0] >> 16) & 0xFF) as i32;
-        let sc3 = ((utmp[0] >> 24) & 0xFF) as i32;
-        let sc4 = (utmp[1] & 0xFF) as i32;
-        let sc5 = ((utmp[1] >> 8) & 0xFF) as i32;
-        let sc6 = ((utmp[1] >> 16) & 0xFF) as i32;
-        let sc7 = ((utmp[1] >> 24) & 0xFF) as i32;
-
-        let q4 = xi.qs.as_ptr();
-        let q8 = yi.qs.as_ptr();
-
-        // ── Sub-block pair j=0,1 ─────────────────────────────────────────────
-        // Load 64 packed nibble bytes (xi.qs[0..63]): bytes 0..31 = j=0 nibbles,
-        // bytes 32..63 = j=1 nibbles. Extract lo/hi nibbles into 512-bit regs.
-        let q4_512_01 = _mm512_loadu_si512(q4 as *const __m512i);
-        let q4_lo01 = _mm512_and_si512(q4_512_01, mask_lo);
-        let q4_hi01 = _mm512_and_si512(_mm512_srli_epi16(q4_512_01, 4), mask_lo);
-
-        // Q8K sub-block j=0: lo = yi.qs[0..31], hi = yi.qs[32..63].
-        // Q8K sub-block j=1: lo = yi.qs[64..95], hi = yi.qs[96..127].
-        // Build [j0_lo | j1_lo] and [j0_hi | j1_hi] for aligned 512-bit dpbusd.
-        let j0_lo = _mm256_loadu_si256(q8.add(0) as *const __m256i);
-        let j0_hi = _mm256_loadu_si256(q8.add(32) as *const __m256i);
-        let j1_lo = _mm256_loadu_si256(q8.add(64) as *const __m256i);
-        let j1_hi = _mm256_loadu_si256(q8.add(96) as *const __m256i);
-        let q8_lo01 = _mm512_inserti64x4(_mm512_castsi256_si512(j0_lo), j1_lo, 1);
-        let q8_hi01 = _mm512_inserti64x4(_mm512_castsi256_si512(j0_hi), j1_hi, 1);
-
-        // 512-bit dpbusd: lower 256 bits → j=0 products, upper 256 bits → j=1.
-        let dot_lo01 = _mm512_dpbusd_epi32(zero512, q4_lo01, q8_lo01);
-        let dot_hi01 = _mm512_dpbusd_epi32(zero512, q4_hi01, q8_hi01);
-
-        // Extract halves and scale each by its group scale.
-        let lo0 = _mm512_castsi512_si256(dot_lo01);
-        let lo1 = _mm512_extracti64x4_epi64(dot_lo01, 1);
-        let hi0 = _mm512_castsi512_si256(dot_hi01);
-        let hi1 = _mm512_extracti64x4_epi64(dot_hi01, 1);
-        let mut sumi = _mm256_setzero_si256();
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo0, _mm256_set1_epi32(sc0)));
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi0, _mm256_set1_epi32(sc1)));
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo1, _mm256_set1_epi32(sc2)));
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi1, _mm256_set1_epi32(sc3)));
-
-        // ── Sub-block pair j=2,3 ─────────────────────────────────────────────
-        let q4_512_23 = _mm512_loadu_si512(q4.add(64) as *const __m512i);
-        let q4_lo23 = _mm512_and_si512(q4_512_23, mask_lo);
-        let q4_hi23 = _mm512_and_si512(_mm512_srli_epi16(q4_512_23, 4), mask_lo);
-
-        let j2_lo = _mm256_loadu_si256(q8.add(128) as *const __m256i);
-        let j2_hi = _mm256_loadu_si256(q8.add(160) as *const __m256i);
-        let j3_lo = _mm256_loadu_si256(q8.add(192) as *const __m256i);
-        let j3_hi = _mm256_loadu_si256(q8.add(224) as *const __m256i);
-        let q8_lo23 = _mm512_inserti64x4(_mm512_castsi256_si512(j2_lo), j3_lo, 1);
-        let q8_hi23 = _mm512_inserti64x4(_mm512_castsi256_si512(j2_hi), j3_hi, 1);
-
-        let dot_lo23 = _mm512_dpbusd_epi32(zero512, q4_lo23, q8_lo23);
-        let dot_hi23 = _mm512_dpbusd_epi32(zero512, q4_hi23, q8_hi23);
-
-        let lo2 = _mm512_castsi512_si256(dot_lo23);
-        let lo3 = _mm512_extracti64x4_epi64(dot_lo23, 1);
-        let hi2 = _mm512_castsi512_si256(dot_hi23);
-        let hi3 = _mm512_extracti64x4_epi64(dot_hi23, 1);
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo2, _mm256_set1_epi32(sc4)));
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi2, _mm256_set1_epi32(sc5)));
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo3, _mm256_set1_epi32(sc6)));
-        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi3, _mm256_set1_epi32(sc7)));
-
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+    // Helper macro: compute `sumi` and `d` for one block, accumulate mins.
+    macro_rules! block_compute {
+        ($i:expr, $mins_total:expr) => {{
+            let xi = &*x_ptr.add($i);
+            let yi = &*y_ptr.add($i);
+            let d = f16_to_f32(xi.d) * yi.d;
+            let dmin = f16_to_f32(xi.dmin) * yi.d;
+            let mut utmp = [0u32; 4];
+            std::ptr::copy_nonoverlapping(xi.scales.as_ptr(), utmp.as_mut_ptr() as *mut u8, 12);
+            utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
+            let uaux = utmp[1] & KMASK1;
+            utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+            utmp[2] = uaux;
+            utmp[0] &= KMASK1;
+            let q8sums = _mm256_loadu_si256(yi.bsums.as_ptr() as *const __m256i);
+            let q8s = _mm_hadd_epi16(
+                _mm256_castsi256_si128(q8sums),
+                _mm256_extracti128_si256(q8sums, 1),
+            );
+            let mins_128 = _mm_set_epi32(0, 0, utmp[3] as i32, utmp[2] as i32);
+            let mins_i16 = _mm_cvtepu8_epi16(mins_128);
+            let prod = _mm_madd_epi16(mins_i16, q8s);
+            $mins_total += dmin * hsum_i32_4(prod) as f32;
+            let sc0 = (utmp[0] & 0xFF) as i32;
+            let sc1 = ((utmp[0] >> 8) & 0xFF) as i32;
+            let sc2 = ((utmp[0] >> 16) & 0xFF) as i32;
+            let sc3 = ((utmp[0] >> 24) & 0xFF) as i32;
+            let sc4 = (utmp[1] & 0xFF) as i32;
+            let sc5 = ((utmp[1] >> 8) & 0xFF) as i32;
+            let sc6 = ((utmp[1] >> 16) & 0xFF) as i32;
+            let sc7 = ((utmp[1] >> 24) & 0xFF) as i32;
+            let q4 = xi.qs.as_ptr();
+            let q8 = yi.qs.as_ptr();
+            let q4_512_01 = _mm512_loadu_si512(q4 as *const __m512i);
+            let q4_lo01 = _mm512_and_si512(q4_512_01, mask_lo);
+            let q4_hi01 = _mm512_and_si512(_mm512_srli_epi16(q4_512_01, 4), mask_lo);
+            let j0_lo = _mm256_loadu_si256(q8.add(0) as *const __m256i);
+            let j0_hi = _mm256_loadu_si256(q8.add(32) as *const __m256i);
+            let j1_lo = _mm256_loadu_si256(q8.add(64) as *const __m256i);
+            let j1_hi = _mm256_loadu_si256(q8.add(96) as *const __m256i);
+            let q8_lo01 = _mm512_inserti64x4(_mm512_castsi256_si512(j0_lo), j1_lo, 1);
+            let q8_hi01 = _mm512_inserti64x4(_mm512_castsi256_si512(j0_hi), j1_hi, 1);
+            let dot_lo01 = _mm512_dpbusd_epi32(zero512, q4_lo01, q8_lo01);
+            let dot_hi01 = _mm512_dpbusd_epi32(zero512, q4_hi01, q8_hi01);
+            let lo0 = _mm512_castsi512_si256(dot_lo01);
+            let lo1 = _mm512_extracti64x4_epi64(dot_lo01, 1);
+            let hi0 = _mm512_castsi512_si256(dot_hi01);
+            let hi1 = _mm512_extracti64x4_epi64(dot_hi01, 1);
+            let mut sumi = _mm256_setzero_si256();
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo0, _mm256_set1_epi32(sc0)));
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi0, _mm256_set1_epi32(sc1)));
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo1, _mm256_set1_epi32(sc2)));
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi1, _mm256_set1_epi32(sc3)));
+            let q4_512_23 = _mm512_loadu_si512(q4.add(64) as *const __m512i);
+            let q4_lo23 = _mm512_and_si512(q4_512_23, mask_lo);
+            let q4_hi23 = _mm512_and_si512(_mm512_srli_epi16(q4_512_23, 4), mask_lo);
+            let j2_lo = _mm256_loadu_si256(q8.add(128) as *const __m256i);
+            let j2_hi = _mm256_loadu_si256(q8.add(160) as *const __m256i);
+            let j3_lo = _mm256_loadu_si256(q8.add(192) as *const __m256i);
+            let j3_hi = _mm256_loadu_si256(q8.add(224) as *const __m256i);
+            let q8_lo23 = _mm512_inserti64x4(_mm512_castsi256_si512(j2_lo), j3_lo, 1);
+            let q8_hi23 = _mm512_inserti64x4(_mm512_castsi256_si512(j2_hi), j3_hi, 1);
+            let dot_lo23 = _mm512_dpbusd_epi32(zero512, q4_lo23, q8_lo23);
+            let dot_hi23 = _mm512_dpbusd_epi32(zero512, q4_hi23, q8_hi23);
+            let lo2 = _mm512_castsi512_si256(dot_lo23);
+            let lo3 = _mm512_extracti64x4_epi64(dot_lo23, 1);
+            let hi2 = _mm512_castsi512_si256(dot_hi23);
+            let hi3 = _mm512_extracti64x4_epi64(dot_hi23, 1);
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo2, _mm256_set1_epi32(sc4)));
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi2, _mm256_set1_epi32(sc5)));
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(lo3, _mm256_set1_epi32(sc6)));
+            sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(hi3, _mm256_set1_epi32(sc7)));
+            (d, sumi)
+        }};
     }
 
-    hsum_f32_8(acc) - mins_total
+    // 2× unrolled: process pairs of blocks into independent acc0/acc1.
+    // The CPU can pipeline block (i+1)'s loads/VNNI while block i's mullo chain drains.
+    let mut i = 0;
+    while i + 1 < nb {
+        let (d0, sumi0) = block_compute!(i,     mins_total);
+        let (d1, sumi1) = block_compute!(i + 1, mins_total);
+        acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), _mm256_cvtepi32_ps(sumi0), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(sumi1), acc1);
+        i += 2;
+    }
+    // Tail (nb=16 for decode → always 0; kept for correctness with odd nb).
+    while i < nb {
+        let (d, sumi) = block_compute!(i, mins_total);
+        acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc0);
+        i += 1;
+    }
+
+    hsum_f32_8(_mm256_add_ps(acc0, acc1)) - mins_total
 }
 
 // ── AVX-512 4×4 micro-tile: 4 act rows × 4 weight rows = 16 outputs ──────
@@ -1895,7 +1889,252 @@ pub unsafe fn gemv_q4k_8x8_avx2(
     out
 }
 
-/// Dispatch: 8-wide Q4K×Q8K GEMV. Uses AVX2+F16C when available, scalar fallback otherwise.
+/// 8-simultaneous-row Q4K×Q8K GEMV using AVX-VNNI `dpbusd`.
+///
+/// Replaces the maddubs+madd_epi16 chain of `gemv_q4k_8x8_avx2` with `dpbusd`+`mullo_epi32`,
+/// eliminating intermediate i16 overflow risk and saving one instruction per 4-element group
+/// on VNNI-capable CPUs (Zen 5, Intel Alder Lake+). Uses the same `BlockQ4Kx8` (8-byte
+/// interleave) weight format — no re-packing required.
+///
+/// Algorithm per block:
+///   For each sub-block (4 per block, each covering 32 nibble bytes per row):
+///     For each raw pair (4 pairs of 32-byte chunks), covering 8 nibble bytes per row:
+///       unpacklo_epi32(raw_lo_0, raw_lo_1) → interleaves rows [0,4,2,6] in i32 slots
+///       unpackhi_epi32(raw_lo_0, raw_lo_1) → rows [1,5,3,7]
+///       dpbusd with broadcast activation [a0..3, a0..3, a4..7, a4..7] × both halves
+///     Collapse with permutevar8x32 + hadd_epi32 → per-row i32 in [r0,r4,r1,r5,...] order
+///     Apply per-row scale via mullo_epi32
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+pub unsafe fn gemv_q4k_8x8_vnni(
+    nb: usize,
+    packed: &[super::blocks::BlockQ4Kx8],
+    act: &[BlockQ8K],
+) -> [f32; 8] {
+    // Permute to collapse paired i32 accumulators: acc = [ra, rb, ra', rb', rc, rd, rc', rd']
+    // → [ra, ra', rb, rb', rc, rc', rd, rd'] so hadd produces per-row sums.
+    let perm_collapse = _mm256_set_epi32(7, 5, 6, 4, 3, 1, 2, 0);
+    // Reorder min correction from natural [r0..r7] to interleaved [r0,r4,r1,r5,...] order
+    // so the same finalpermutemask correctly produces [r0..r7] for both dot and min.
+    let perm_min_reorder = _mm256_set_epi32(7, 3, 6, 2, 5, 1, 4, 0);
+    // Final permute: [r0,r4,r1,r5,r2,r6,r3,r7] → [r0..r7].
+    let finalpermutemask = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+    let deltamask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0i8);
+
+    let m4b = _mm256_set1_epi8(0x0F_u8 as i8);
+    let zero = _mm256_setzero_si256();
+
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    let mut acc_row = _mm256_setzero_ps();
+    let mut acc_min_rows = _mm256_setzero_ps();
+
+    for b in 0..nb {
+        let p = &packed[b];
+        let y = &act[b];
+
+        let row_scale_f32 = _mm256_set1_ps(y.d);
+
+        // d values: rearrange [d0..d7] to [d0,d4,d1,d5,d2,d6,d3,d7] matching iacc_b row order.
+        let col_scale_f32 = _mm256_cvtph_ps(_mm_shuffle_epi8(
+            _mm_loadu_si128(p.d.as_ptr() as *const __m128i),
+            deltamask,
+        ));
+        let col_dmin_f32 =
+            _mm256_cvtph_ps(_mm_loadu_si128(p.dmin.as_ptr() as *const __m128i));
+
+        let mut iacc_b = zero;
+        let mut iacc_min_b = zero;
+
+        // Hadd bsums for min correction (same as avx2 variant).
+        let q8sums = _mm256_loadu_si256(y.bsums.as_ptr() as *const __m256i);
+        let q8s_128 = _mm_hadd_epi16(
+            _mm256_castsi256_si128(q8sums),
+            _mm256_extracti128_si256(q8sums, 1),
+        );
+        let mut q8s = _mm256_permute2f128_si256(
+            _mm256_castsi128_si256(q8s_128),
+            _mm256_castsi128_si256(q8s_128),
+            0,
+        );
+
+        for sb in 0..4usize {
+            // Extract and decode scale/min bytes for this sub-block pair — identical to avx2.
+            let mut utmp_0 = [0u32; 4];
+            let mut utmp_1 = [0u32; 4];
+            std::ptr::copy_nonoverlapping(
+                p.scales.as_ptr().add(24 * sb),
+                utmp_0.as_mut_ptr() as *mut u8,
+                12,
+            );
+            std::ptr::copy_nonoverlapping(
+                p.scales.as_ptr().add(12 + 24 * sb),
+                utmp_1.as_mut_ptr() as *mut u8,
+                12,
+            );
+
+            utmp_0[3] = ((utmp_0[2] >> 4) & KMASK2) | (((utmp_0[1] >> 6) & KMASK3) << 4);
+            let uaux_0 = utmp_0[1] & KMASK1;
+            utmp_0[1] = (utmp_0[2] & KMASK2) | (((utmp_0[0] >> 6) & KMASK3) << 4);
+            utmp_0[2] = uaux_0;
+            utmp_0[0] &= KMASK1;
+
+            utmp_1[3] = ((utmp_1[2] >> 4) & KMASK2) | (((utmp_1[1] >> 6) & KMASK3) << 4);
+            let uaux_1 = utmp_1[1] & KMASK1;
+            utmp_1[1] = (utmp_1[2] & KMASK2) | (((utmp_1[0] >> 6) & KMASK3) << 4);
+            utmp_1[2] = uaux_1;
+            utmp_1[0] &= KMASK1;
+
+            // Build per-row scale vectors in [r0,r4,r1,r5,r2,r6,r3,r7] order to match
+            // the hadd output layout produced below. utmp_0[0] = sc[row0..3], [1] = sc[row4..7].
+            let (s0, s1, s2, s3) = (
+                (utmp_0[0] & 0xFF) as i32,
+                ((utmp_0[0] >> 8) & 0xFF) as i32,
+                ((utmp_0[0] >> 16) & 0xFF) as i32,
+                ((utmp_0[0] >> 24) & 0xFF) as i32,
+            );
+            let (s4, s5, s6, s7) = (
+                (utmp_0[1] & 0xFF) as i32,
+                ((utmp_0[1] >> 8) & 0xFF) as i32,
+                ((utmp_0[1] >> 16) & 0xFF) as i32,
+                ((utmp_0[1] >> 24) & 0xFF) as i32,
+            );
+            let scale_lo_vec = _mm256_set_epi32(s7, s3, s6, s2, s5, s1, s4, s0);
+
+            let (m0, m1, m2, m3) = (
+                (utmp_1[0] & 0xFF) as i32,
+                ((utmp_1[0] >> 8) & 0xFF) as i32,
+                ((utmp_1[0] >> 16) & 0xFF) as i32,
+                ((utmp_1[0] >> 24) & 0xFF) as i32,
+            );
+            let (m4, m5, m6, m7) = (
+                (utmp_1[1] & 0xFF) as i32,
+                ((utmp_1[1] >> 8) & 0xFF) as i32,
+                ((utmp_1[1] >> 16) & 0xFF) as i32,
+                ((utmp_1[1] >> 24) & 0xFF) as i32,
+            );
+            let scale_hi_vec = _mm256_set_epi32(m7, m3, m6, m2, m5, m1, m4, m0);
+
+            // Min correction (same structure as avx2 kernel).
+            let mas0 = _mm_set_epi32(
+                utmp_0[3] as i32,
+                utmp_0[2] as i32,
+                utmp_0[1] as i32,
+                utmp_0[0] as i32,
+            );
+            let mas1 = _mm_set_epi32(
+                utmp_1[3] as i32,
+                utmp_1[2] as i32,
+                utmp_1[1] as i32,
+                utmp_1[0] as i32,
+            );
+            let mins_01 = _mm256_cvtepu8_epi16(_mm_unpacklo_epi8(
+                _mm_shuffle_epi32(mas0, 78),
+                _mm_shuffle_epi32(mas1, 78),
+            ));
+
+            // Four raw pairs per sub-block: each covers 8 nibble bytes per row.
+            // raw_0 = rows 0-3 (8 bytes each), raw_1 = rows 4-7 (8 bytes each).
+            let base = p.qs.as_ptr().add(sb * 256);
+
+            let mut acc0_lo = zero;
+            let mut acc1_lo = zero;
+            let mut acc0_hi = zero;
+            let mut acc1_hi = zero;
+
+            for i in 0..4usize {
+                let raw_0 = _mm256_loadu_si256(base.add(i * 64) as *const __m256i);
+                let raw_1 = _mm256_loadu_si256(base.add(i * 64 + 32) as *const __m256i);
+
+                let lo_0 = _mm256_and_si256(raw_0, m4b);
+                let lo_1 = _mm256_and_si256(raw_1, m4b);
+                let hi_0 = _mm256_and_si256(_mm256_srli_epi16(raw_0, 4), m4b);
+                let hi_1 = _mm256_and_si256(_mm256_srli_epi16(raw_1, 4), m4b);
+
+                // unpacklo: [r0_b0..3, r4_b0..3, r0_b4..7, r4_b4..7, r2_b0..3, r6_b0..3, r2_b4..7, r6_b4..7]
+                // unpackhi: [r1_b0..3, r5_b0..3, r1_b4..7, r5_b4..7, r3_b0..3, r7_b0..3, r3_b4..7, r7_b4..7]
+                let lo_up0 = _mm256_unpacklo_epi32(lo_0, lo_1);
+                let lo_up1 = _mm256_unpackhi_epi32(lo_0, lo_1);
+                let hi_up0 = _mm256_unpacklo_epi32(hi_0, hi_1);
+                let hi_up1 = _mm256_unpackhi_epi32(hi_0, hi_1);
+
+                // Activation for lo nibbles: 8 bytes broadcast as [a0..3, a0..3, a4..7, a4..7] × 2.
+                // lo nibble byte j of a row pairs with Q8K[j] = y.qs[sb*64 + i*8 + j%8].
+                let act_lo_xmm =
+                    _mm_loadl_epi64(y.qs.as_ptr().add(sb * 64 + i * 8) as *const __m128i);
+                let act_lo_ymm = _mm256_broadcastsi128_si256(_mm_unpacklo_epi32(act_lo_xmm, act_lo_xmm));
+
+                acc0_lo = _mm256_dpbusd_epi32(acc0_lo, lo_up0, act_lo_ymm);
+                acc1_lo = _mm256_dpbusd_epi32(acc1_lo, lo_up1, act_lo_ymm);
+
+                // Activation for hi nibbles: hi nibble byte j pairs with Q8K[j+128-sb_base]
+                // = y.qs[sb*64 + 32 + i*8 + j%8].
+                let act_hi_xmm = _mm_loadl_epi64(
+                    y.qs.as_ptr().add(sb * 64 + 32 + i * 8) as *const __m128i,
+                );
+                let act_hi_ymm = _mm256_broadcastsi128_si256(_mm_unpacklo_epi32(act_hi_xmm, act_hi_xmm));
+
+                acc0_hi = _mm256_dpbusd_epi32(acc0_hi, hi_up0, act_hi_ymm);
+                acc1_hi = _mm256_dpbusd_epi32(acc1_hi, hi_up1, act_hi_ymm);
+            }
+
+            // Collapse: acc0_lo = [r0a, r4a, r0b, r4b, r2a, r6a, r2b, r6b] (a=first4 bytes, b=second4).
+            // perm_collapse → [r0a, r0b, r4a, r4b, r2a, r2b, r6a, r6b].
+            // hadd(perm(acc0), perm(acc1)) → [r0, r4, r1, r5, r2, r6, r3, r7] (per-row sums).
+            let acc_lo = _mm256_hadd_epi32(
+                _mm256_permutevar8x32_epi32(acc0_lo, perm_collapse),
+                _mm256_permutevar8x32_epi32(acc1_lo, perm_collapse),
+            );
+            let acc_hi = _mm256_hadd_epi32(
+                _mm256_permutevar8x32_epi32(acc0_hi, perm_collapse),
+                _mm256_permutevar8x32_epi32(acc1_hi, perm_collapse),
+            );
+
+            // Apply per-row scale via 32-bit multiply (no i16 saturation risk).
+            let scaled = _mm256_add_epi32(
+                _mm256_mullo_epi32(acc_lo, scale_lo_vec),
+                _mm256_mullo_epi32(acc_hi, scale_hi_vec),
+            );
+            iacc_b = _mm256_add_epi32(iacc_b, scaled);
+
+            // Min correction: madd produces [r0..r7] natural order. Reorder to
+            // [r0,r4,r1,r5,...] so finalpermutemask produces [r0..r7] for both iacc_b and iacc_min_b.
+            let q8s_sb = _mm256_shuffle_epi32(q8s, 0);
+            let iacc_min_sb = _mm256_madd_epi16(q8s_sb, mins_01);
+            q8s = _mm256_bsrli_epi128(q8s, 4);
+            iacc_min_b = _mm256_add_epi32(
+                iacc_min_b,
+                _mm256_permutevar8x32_epi32(iacc_min_sb, perm_min_reorder),
+            );
+        }
+
+        acc_row = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(iacc_b),
+            _mm256_mul_ps(col_scale_f32, row_scale_f32),
+            acc_row,
+        );
+        acc_min_rows = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(iacc_min_b),
+            _mm256_mul_ps(col_dmin_f32, row_scale_f32),
+            acc_min_rows,
+        );
+    }
+
+    // Both acc_row and acc_min_rows are in [r0,r4,r1,r5,r2,r6,r3,r7] order.
+    // finalpermutemask maps this to [r0..r7].
+    acc_row = _mm256_permutevar8x32_ps(acc_row, finalpermutemask);
+    acc_min_rows = _mm256_permutevar8x32_ps(acc_min_rows, finalpermutemask);
+
+    let result = _mm256_sub_ps(acc_row, acc_min_rows);
+    let mut out = [0.0f32; 8];
+    _mm256_storeu_ps(out.as_mut_ptr(), result);
+    out
+}
+
+/// Dispatch: 8-wide Q4K×Q8K GEMV. Prefers VNNI (dpbusd) on capable CPUs, falls back to
+/// AVX2+F16C (maddubs), then scalar.
 #[inline(always)]
 #[allow(unreachable_code)]
 pub fn gemv_q4k_8x8_dispatch(
@@ -1903,6 +2142,12 @@ pub fn gemv_q4k_8x8_dispatch(
     packed: &[super::blocks::BlockQ4Kx8],
     act: &[BlockQ8K],
 ) -> [f32; 8] {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avxvnni") || is_x86_feature_detected!("avx512vnni") {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { gemv_q4k_8x8_vnni(nb, packed, act) };
+        }
+    }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
         return unsafe { gemv_q4k_8x8_avx2(nb, packed, act) };
@@ -2009,6 +2254,116 @@ pub fn gemv_q4k_8x8_scalar(
         }
     }
     results
+}
+
+/// Scalar 4-activation × 8-weight-row GEMM for Q4Kx8 weights and Q8Kx4 activations.
+///
+/// Translates `ggml_gemm_q4_K_8x8_q8_K_generic` (blocklen=8) from llama.cpp exactly.
+///
+/// - `packed_w`: `(nc/8) * nb` entries, weight rows pre-packed via `repack_q4k_to_q4kx8`
+/// - `packed_a`: `(nr/4) * nb` entries, activations pre-packed via `quantize_mat_q8k_4x8`
+/// - `output`:   `nr × nc` f32 matrix, row-major
+/// - `nr`:       activation rows, must be a multiple of 4
+/// - `nc`:       weight rows, must be a multiple of 8
+/// - `nb`:       K-blocks per row (k / 256)
+pub fn gemm_q4k_8x8_scalar(
+    nb: usize,
+    packed_w: &[BlockQ4Kx8],
+    packed_a: &[BlockQ8Kx4],
+    output: &mut [f32],
+    nr: usize,
+    nc: usize,
+) {
+    assert_eq!(nr % 4, 0);
+    assert_eq!(nc % 8, 0);
+    assert!(packed_w.len() >= (nc / 8) * nb);
+    assert!(packed_a.len() >= (nr / 4) * nb);
+    assert_eq!(output.len(), nr * nc);
+
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+
+    for act_grp in 0..nr / 4 {
+        let a_base = act_grp * nb;
+        for w_grp in 0..nc / 8 {
+            let b_base = w_grp * nb;
+            let mut sumf = [[0.0f32; 8]; 4];
+            let mut sum_minf = [[0.0f32; 8]; 4];
+
+            for l in 0..nb {
+                let b = &packed_w[b_base + l];
+                let a = &packed_a[a_base + l];
+
+                // Decode 8 sub-block scale groups (each 12 bytes) into utmp[32].
+                // After decode, each group sb occupies utmp[sb*4..sb*4+4]:
+                //   [s0..s3][s4..s7][m0..m3][m4..m7] (6-bit values in each byte).
+                let mut utmp = [0u32; 32];
+                for sb in 0..8usize {
+                    let src = &b.scales[sb * 12..];
+                    let u0 = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                    let u1 = u32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+                    let u2 = u32::from_le_bytes([src[8], src[9], src[10], src[11]]);
+                    utmp[sb * 4 + 3] = ((u2 >> 4) & KMASK2) | (((u1 >> 6) & KMASK3) << 4);
+                    let uaux0 = u1 & KMASK1;
+                    utmp[sb * 4 + 1] = (u2 & KMASK2) | (((u0 >> 6) & KMASK3) << 4);
+                    utmp[sb * 4 + 2] = uaux0;
+                    utmp[sb * 4 + 0] = u0 & KMASK1;
+                }
+
+                // Materialise as bytes (little-endian, consistent with C memcpy view).
+                let mut utmp_bytes = [0u8; 128];
+                for (i, &w) in utmp.iter().enumerate() {
+                    utmp_bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                }
+
+                // k-loop: QK_K / (2 * blocklen) = 256 / 16 = 16 iterations.
+                // Each iteration processes blocklen=8 consecutive weight elements (lower + upper nibble).
+                for k in 0..16usize {
+                    let scales_base = (k / 4) * 32;
+                    for m in 0..4usize {
+                        for j in 0..8usize {
+                            let mut sumi = 0i32;
+                            for i in 0..8usize {
+                                let byte_val = b.qs[k * 64 + j * 8 + i];
+                                let v0 = (byte_val & 0xF) as i32;
+                                let v1 = (byte_val >> 4) as i32;
+                                let a_off = (k >> 2) * 256 + (k % 4) * 32 + m * 8 + i;
+                                let act0 = a.qs[a_off] as i32;
+                                let act1 = a.qs[a_off + 128] as i32;
+                                let sc0 = utmp_bytes[scales_base + j] as i32;
+                                let sc1 = utmp_bytes[scales_base + 16 + j] as i32;
+                                sumi += v0 * act0 * sc0 + v1 * act1 * sc1;
+                            }
+                            sumf[m][j] += sumi as f32 * f16_to_f32(b.d[j]) * a.d[m];
+                        }
+                    }
+                }
+
+                // Mins correction: for each of 8 Q4K sub-blocks, subtract the min
+                // contribution weighted by the sum of 32 activation elements per row.
+                for sb in 0..8usize {
+                    let mins_base = 8 + sb * 16;
+                    for m in 0..4usize {
+                        let bsum_off = sb * 8 + m * 4 - (sb % 2) * 6;
+                        let bsum =
+                            (a.bsums[bsum_off] as i32 + a.bsums[bsum_off + 1] as i32) as f32;
+                        for j in 0..8usize {
+                            let min = utmp_bytes[mins_base + j] as f32;
+                            sum_minf[m][j] += min * bsum * f16_to_f32(b.dmin[j]) * a.d[m];
+                        }
+                    }
+                }
+            }
+
+            for m in 0..4usize {
+                for j in 0..8usize {
+                    output[(act_grp * 4 + m) * nc + w_grp * 8 + j] =
+                        sumf[m][j] - sum_minf[m][j];
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2774,6 +3129,179 @@ mod tests {
                 avx2_result[r],
                 scalar_result[r]
             );
+        }
+    }
+
+    #[test]
+    fn gemv_q4k_8x8_vnni_matches_scalar() {
+        if !is_x86_feature_detected!("avxvnni") && !is_x86_feature_detected!("avx512vnni") {
+            return;
+        }
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        use crate::ggml::repack::repack_q4k_to_q4kx8;
+
+        let bpr = 2usize;
+        let k = bpr * 256;
+        let n_rows = 8usize;
+
+        let src_blocks: Vec<BlockQ4K> = (0..n_rows * bpr)
+            .map(|r| {
+                use crate::ggml::helpers::f32_to_f16;
+                let d = 0.3 + (r as f32) * 0.07;
+                let mut b = BlockQ4K {
+                    d: f32_to_f16(d),
+                    dmin: f32_to_f16(0.0),
+                    scales: [0u8; 12],
+                    qs: [0u8; 128],
+                };
+                // Fill nibbles with row-dependent pattern for better coverage.
+                for j in 0..128 {
+                    let lo = ((r * 3 + j * 5) % 16) as u8;
+                    let hi = ((r * 7 + j * 11) % 16) as u8;
+                    b.qs[j] = lo | (hi << 4);
+                }
+                b.scales[0] = 1; b.scales[1] = 1; b.scales[2] = 1; b.scales[3] = 1;
+                b.scales[4] = 0; b.scales[5] = 0; b.scales[6] = 0; b.scales[7] = 0;
+                b.scales[8] = 1; b.scales[9] = 1; b.scales[10] = 1; b.scales[11] = 1;
+                b
+            })
+            .collect();
+
+        let act_float: Vec<f32> = (0..k).map(|j| (j as f32 - k as f32 / 2.0) / k as f32).collect();
+        let mut act_q8k = vec![BlockQ8K { d: 0.0, qs: [0i8; 256], bsums: [0i16; 16] }; bpr];
+        super::super::quantize::quantize_row_q8_k(&act_float, &mut act_q8k);
+
+        let packed = repack_q4k_to_q4kx8(&src_blocks, n_rows, bpr);
+
+        let scalar_result = gemv_q4k_8x8_scalar(bpr, &packed, &act_q8k);
+        let vnni_result = unsafe { gemv_q4k_8x8_vnni(bpr, &packed, &act_q8k) };
+
+        for r in 0..n_rows {
+            let rel = if scalar_result[r].abs() > 0.001 {
+                ((vnni_result[r] - scalar_result[r]) / scalar_result[r]).abs()
+            } else {
+                (vnni_result[r] - scalar_result[r]).abs()
+            };
+            assert!(
+                rel < 1e-4,
+                "row={r}: vnni={}, scalar={}, rel_err={rel}",
+                vnni_result[r],
+                scalar_result[r]
+            );
+        }
+    }
+
+    // ── gemm_q4k_8x8 tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn gemm_q4k_8x8_scalar_output_size() {
+        use crate::ggml::repack::{quantize_mat_q8k_4x8, repack_q4k_to_q4kx8};
+        let k = 256usize;
+        let nr = 4usize;
+        let nc = 8usize;
+        let nb = k / 256;
+
+        let src_blocks: Vec<super::super::blocks::BlockQ4K> = (0..nc * nb)
+            .map(|r| {
+                let d = 0.5 + (r as f32) * 0.1;
+                let mut b = super::super::blocks::BlockQ4K {
+                    d: f32_to_f16(d),
+                    dmin: f32_to_f16(0.0),
+                    scales: [0u8; 12],
+                    qs: [0x44u8; 128],
+                };
+                b.scales[0] = 1; b.scales[1] = 1; b.scales[2] = 1; b.scales[3] = 1;
+                b.scales[8] = 1; b.scales[9] = 1; b.scales[10] = 1; b.scales[11] = 1;
+                b
+            })
+            .collect();
+
+        let a_flat: Vec<f32> = (0..nr * k)
+            .map(|i| ((i as f32) * 0.001 - 0.1).clamp(-0.5, 0.5))
+            .collect();
+
+        let packed_w = repack_q4k_to_q4kx8(&src_blocks, nc, nb);
+        let packed_a = quantize_mat_q8k_4x8(&a_flat, nr, k);
+        let mut output = vec![0.0f32; nr * nc];
+
+        super::gemm_q4k_8x8_scalar(nb, &packed_w, &packed_a, &mut output, nr, nc);
+
+        assert_eq!(output.len(), nr * nc);
+        let all_finite = output.iter().all(|x| x.is_finite());
+        assert!(all_finite, "output contains non-finite values");
+    }
+
+    #[test]
+    fn gemm_q4k_8x8_scalar_matches_per_row_dot() {
+        use crate::ggml::repack::{quantize_mat_q8k_4x8, repack_q4k_to_q4kx8};
+        use crate::quantized::{q4k_dot_block, Q4K_BLOCK_BYTES};
+
+        let k = 256usize;
+        let nr = 4usize;
+        let nc = 8usize;
+        let nb = 1;
+
+        let src_blocks: Vec<super::super::blocks::BlockQ4K> = (0..nc * nb)
+            .map(|r| {
+                use super::super::blocks::BlockQ4K;
+                let d = 0.1 + (r as f32) * 0.05;
+                let dmin = 0.02f32;
+                let mut b = BlockQ4K {
+                    d: f32_to_f16(d),
+                    dmin: f32_to_f16(dmin),
+                    scales: [0u8; 12],
+                    qs: [0u8; 128],
+                };
+                for q in b.qs.iter_mut() {
+                    *q = ((r * 3 + 7) % 16) as u8 | (((r * 5 + 3) % 16) as u8) << 4;
+                }
+                b.scales[0] = 8; b.scales[1] = 8; b.scales[2] = 8; b.scales[3] = 8;
+                b.scales[4] = 4; b.scales[5] = 4; b.scales[6] = 4; b.scales[7] = 4;
+                b.scales[8] = 8; b.scales[9] = 8; b.scales[10] = 8; b.scales[11] = 8;
+                b
+            })
+            .collect();
+
+        let a_flat: Vec<f32> = (0..nr * k)
+            .map(|i| (i as f32 - (nr * k / 2) as f32) / (nr * k) as f32)
+            .collect();
+
+        // Reference: per-row scalar dot product
+        let b_bytes: Vec<u8> = unsafe {
+            std::slice::from_raw_parts(
+                src_blocks.as_ptr() as *const u8,
+                src_blocks.len() * Q4K_BLOCK_BYTES,
+            )
+            .to_vec()
+        };
+        let mut ref_out = vec![0.0f32; nr * nc];
+        for m in 0..nr {
+            let a_row = &a_flat[m * k..(m + 1) * k];
+            for j in 0..nc {
+                let blk_bytes = &b_bytes[j * Q4K_BLOCK_BYTES..(j + 1) * Q4K_BLOCK_BYTES];
+                ref_out[m * nc + j] = q4k_dot_block(blk_bytes, a_row);
+            }
+        }
+
+        // GEMM path
+        let packed_w = repack_q4k_to_q4kx8(&src_blocks, nc, nb);
+        let packed_a = quantize_mat_q8k_4x8(&a_flat, nr, k);
+        let mut got_out = vec![0.0f32; nr * nc];
+        super::gemm_q4k_8x8_scalar(nb, &packed_w, &packed_a, &mut got_out, nr, nc);
+
+        // Allow generous tolerance due to quantization in both paths
+        for m in 0..nr {
+            for j in 0..nc {
+                let r = ref_out[m * nc + j];
+                let g = got_out[m * nc + j];
+                let rel = if r.abs() > 0.001 { ((g - r) / r).abs() } else { (g - r).abs() };
+                assert!(
+                    rel < 0.15,
+                    "({m},{j}): ref={r:.4}, got={g:.4}, rel={rel:.4}"
+                );
+            }
         }
     }
 }

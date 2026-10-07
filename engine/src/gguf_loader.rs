@@ -1106,6 +1106,9 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         tensor_parallel_size: 1,
         quantization,
         use_qk_norm: false,
+        // llama.cpp stores KV cache in F16 for all models; enable for Q4K/Q6K (LLaMA/Qwen).
+        // Use F32 for BitNet (SquaredRelu) since KvCache::new handles that separately.
+        use_f16_kv: matches!(hidden_act, crate::config::HiddenAct::SiluGate | crate::config::HiddenAct::Gelu | crate::config::HiddenAct::GeluQuick | crate::config::HiddenAct::GeGLU),
         sliding_window: None,
         hidden_act,
         rope_type,
@@ -1788,6 +1791,8 @@ impl GgufLoader {
 impl GgufLoader {
     pub fn to_quantized_weights(self) -> crate::weights::QuantizedWeights {
         let q2_shapes = self.q2_tensor_shapes();
+        let q4k_shapes = self.q4k_tensor_shapes();
+        let q6k_shapes = self.q6k_tensor_shapes();
         let mut typed_tensors = HashMap::new();
         let mut f32_tensors = HashMap::new();
 
@@ -1884,6 +1889,14 @@ impl GgufLoader {
             );
         }
 
+        if !q4k_shapes.is_empty() {
+            qw.build_q4k_repacked(&q4k_shapes);
+        }
+
+        if !q6k_shapes.is_empty() {
+            qw.build_q6k_repacked(&q6k_shapes);
+        }
+
         qw
     }
 
@@ -1892,6 +1905,56 @@ impl GgufLoader {
     }
     pub fn mmap_ranges_count(&self) -> usize {
         self.mmap_ranges.len()
+    }
+
+    pub fn q4k_tensor_shapes(&self) -> HashMap<String, (usize, usize)> {
+        let mut shapes = HashMap::new();
+        for (name, &(_, _, dtype)) in &self.mmap_ranges {
+            if dtype == GgmlType::Q4K {
+                if let Some(dims) = self.raw_tensor_dims.get(name) {
+                    if dims.len() >= 2 {
+                        let key = map_gguf_name(name).unwrap_or_else(|| name.clone());
+                        shapes.insert(key, (dims[1] as usize, dims[0] as usize));
+                    }
+                }
+            }
+        }
+        for (name, dtype) in &self.tensor_dtypes {
+            if *dtype == GgmlType::Q4K && !self.mmap_ranges.contains_key(name.as_str()) {
+                if let Some(dims) = self.raw_tensor_dims.get(name) {
+                    if dims.len() >= 2 {
+                        let key = map_gguf_name(name).unwrap_or_else(|| name.clone());
+                        shapes.insert(key, (dims[1] as usize, dims[0] as usize));
+                    }
+                }
+            }
+        }
+        shapes
+    }
+
+    pub fn q6k_tensor_shapes(&self) -> HashMap<String, (usize, usize)> {
+        let mut shapes = HashMap::new();
+        for (name, &(_, _, dtype)) in &self.mmap_ranges {
+            if dtype == GgmlType::Q6K {
+                if let Some(dims) = self.raw_tensor_dims.get(name) {
+                    if dims.len() >= 2 {
+                        let key = map_gguf_name(name).unwrap_or_else(|| name.clone());
+                        shapes.insert(key, (dims[1] as usize, dims[0] as usize));
+                    }
+                }
+            }
+        }
+        for (name, dtype) in &self.tensor_dtypes {
+            if *dtype == GgmlType::Q6K && !self.mmap_ranges.contains_key(name.as_str()) {
+                if let Some(dims) = self.raw_tensor_dims.get(name) {
+                    if dims.len() >= 2 {
+                        let key = map_gguf_name(name).unwrap_or_else(|| name.clone());
+                        shapes.insert(key, (dims[1] as usize, dims[0] as usize));
+                    }
+                }
+            }
+        }
+        shapes
     }
 
     pub fn q2_tensor_shapes(&self) -> HashMap<String, (usize, usize)> {

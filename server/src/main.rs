@@ -505,6 +505,16 @@ async fn run_server(args: ServeArgs) {
         .with_graceful_shutdown(shutdown_signal(shutdown_timeout))
         .await
         .unwrap();
+
+    // Flush LLVM PGO counters before exit.
+    // tokio's graceful shutdown may not run atexit() handlers, so we call
+    // __llvm_profile_write_file() explicitly when built with --cfg profile_gen.
+    #[cfg(profile_gen)]
+    unsafe {
+        extern "C" { fn __llvm_profile_write_file() -> std::ffi::c_int; }
+        __llvm_profile_write_file();
+        eprintln!("[PGO] profile flushed");
+    }
 }
 
 async fn shutdown_signal(timeout: std::time::Duration) {

@@ -67,15 +67,8 @@ fn naive_attention(
                     *score = dot_fn(q_vec, k_vec) * scale;
                 }
 
-                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for s in &mut scores {
-                    *s = crate::portable_math::portable_exp(*s - max_score);
-                    sum += *s;
-                }
-                for s in &mut scores {
-                    *s /= sum;
-                }
+                let scores_in = scores.clone();
+                crate::ggml::ops_llama::soft_max_rows_f32(&scores_in, &mut scores, None, kv_len, 1.0);
 
                 let o_offset = ((b * seq_len + s) * num_heads + h) * head_dim;
                 for d in 0..head_dim {
@@ -153,12 +146,7 @@ fn optimized_attention_ggml(
                 }
             }
 
-            let mut sum: f64 = 0.0;
-            for sc in &mut scores[..kv_len] {
-                let val = crate::portable_math::ggml_exp(*sc - max_score);
-                sum += val as f64;
-                *sc = val;
-            }
+            let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores[..kv_len], max_score);
             let inv_sum = (1.0 / sum) as f32;
             for sc in &mut scores[..kv_len] {
                 *sc *= inv_sum;
@@ -241,15 +229,8 @@ fn naive_attention_ggml(
                     }
                 }
 
-                // C: ggml_vec_soft_max_f32 — scalar path: expf + f64 sum
-                let mut sum: f64 = 0.0;
-                for s in &mut scores {
-                    // C: float val = expf(x[i] - max);
-                    let val = crate::portable_math::ggml_exp(*s - max_score);
-                    // C: sum += (ggml_float)val;
-                    sum += val as f64;
-                    *s = val;
-                }
+                // C: ggml_vec_soft_max_f32 — AVX2 polynomial exp path
+                let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores, max_score);
 
                 // C: sum = 1.0/sum; ggml_vec_scale_f32(nc, dp, sum);
                 let inv_sum = (1.0 / sum) as f32;
@@ -333,12 +314,7 @@ fn naive_attention_ggml_softcap(
                     }
                 }
 
-                let mut sum: f64 = 0.0;
-                for s in &mut scores {
-                    let val = crate::portable_math::ggml_exp(*s - max_score);
-                    sum += val as f64;
-                    *s = val;
-                }
+                let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores, max_score);
 
                 let inv_sum = (1.0 / sum) as f32;
                 for s in &mut scores {
@@ -588,12 +564,7 @@ fn naive_attention_masked(
                     }
                 }
 
-                let mut sum: f64 = 0.0;
-                for sc in &mut scores {
-                    let val = crate::portable_math::ggml_exp(*sc - max_score);
-                    sum += val as f64;
-                    *sc = val;
-                }
+                let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores, max_score);
 
                 let inv_sum = (1.0 / sum) as f32;
                 for sc in &mut scores {
@@ -642,35 +613,76 @@ pub fn attention_decode_heads(
         let q_vec = &q[q_offset..q_offset + head_dim];
 
         let scores = &mut scores[..kv_len];
+
+        // QK: AVX2 vec_dot_f32 replaces scalar d-loop (4×8-wide FMA for head_dim=128)
         for kv_s in 0..kv_len {
             let k_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
             let k_vec = &k[k_offset..k_offset + head_dim];
-            let mut dot = 0.0f32;
-            for d in 0..head_dim {
-                dot += q_vec[d] * k_vec[d];
-            }
-            scores[kv_s] = dot * scale;
+            scores[kv_s] = crate::ggml::vec_llama::vec_dot_f32(q_vec, k_vec) * scale;
         }
 
         let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
+        let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(scores, max_score);
+        let inv_sum = (1.0 / sum) as f32;
         for s in scores.iter_mut() {
-            *s = crate::portable_math::portable_exp(*s - max_score);
-            sum += *s;
-        }
-        for s in scores.iter_mut() {
-            *s /= sum;
+            *s *= inv_sum;
         }
 
+        // AV: AXPY pattern — outer loop over kv_s (contiguous v_row), inner AVX2 fmadd.
+        // Matches llama.cpp's ggml_vec_mad_f32 (4×8-wide fmadd per iteration).
         let o_offset = h * head_dim;
-        for d in 0..head_dim {
-            let mut val = 0.0f32;
-            for (kv_s, &score) in scores.iter().enumerate() {
-                let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim + d;
-                val += score * v[v_offset];
-            }
-            output[o_offset + d] = val;
+        let out_row = &mut output[o_offset..o_offset + head_dim];
+        for x in out_row.iter_mut() {
+            *x = 0.0;
         }
+
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_avx2 = false;
+
+        for (kv_s, &score) in scores.iter().enumerate() {
+            let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+            let v_row = &v[v_offset..v_offset + head_dim];
+            if use_avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe { axpy_avx2(out_row, v_row, score); }
+            } else {
+                for d in 0..head_dim {
+                    out_row[d] += score * v_row[d];
+                }
+            }
+        }
+    }
+}
+
+/// AVX2 AXPY: out[d] += scale * src[d] for n elements (matching llama.cpp's ggml_vec_mad_f32).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_avx2(out: &mut [f32], src: &[f32], scale: f32) {
+    use std::arch::x86_64::*;
+    let n = out.len();
+    debug_assert_eq!(n, src.len());
+    let sv = _mm256_set1_ps(scale);
+    let mut i = 0;
+    while i + 32 <= n {
+        let o0 = _mm256_loadu_ps(out.as_ptr().add(i));
+        let o1 = _mm256_loadu_ps(out.as_ptr().add(i + 8));
+        let o2 = _mm256_loadu_ps(out.as_ptr().add(i + 16));
+        let o3 = _mm256_loadu_ps(out.as_ptr().add(i + 24));
+        let r0 = _mm256_fmadd_ps(sv, _mm256_loadu_ps(src.as_ptr().add(i)), o0);
+        let r1 = _mm256_fmadd_ps(sv, _mm256_loadu_ps(src.as_ptr().add(i + 8)), o1);
+        let r2 = _mm256_fmadd_ps(sv, _mm256_loadu_ps(src.as_ptr().add(i + 16)), o2);
+        let r3 = _mm256_fmadd_ps(sv, _mm256_loadu_ps(src.as_ptr().add(i + 24)), o3);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), r0);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i + 8), r1);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i + 16), r2);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i + 24), r3);
+        i += 32;
+    }
+    while i < n {
+        out[i] += scale * src[i];
+        i += 1;
     }
 }
 
@@ -748,13 +760,7 @@ pub fn attention_decode_heads_f16kv(
             }
         }
 
-        let mut sum: f64 = 0.0;
-        for s in scores.iter_mut() {
-            let val = crate::portable_math::ggml_exp(*s - max_score);
-            sum += val as f64;
-            *s = val;
-        }
-
+        let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(scores, max_score);
         let inv_sum = (1.0 / sum) as f32;
         for s in scores.iter_mut() {
             *s *= inv_sum;
@@ -770,6 +776,198 @@ pub fn attention_decode_heads_f16kv(
             unsafe { weighted_add_f16(out_slice, v_f16.as_ptr().add(v_offset), score, head_dim) };
         }
     }
+}
+
+/// Like `attention_decode_heads_f16kv` but q and output are sub-slices starting
+/// at `head_start * head_dim`. Enables each thread to own a disjoint output slice
+/// (no aliased &mut across threads). The GQA kv_h mapping uses absolute head
+/// indices (head_start..head_end) against the full num_heads / num_kv_heads.
+pub fn attention_decode_heads_f16kv_offset(
+    q: &[f32],          // full q starting at q[head_start * head_dim]
+    k_f16: &[u16],
+    v_f16: &[u16],
+    output: &mut [f32], // partial: output[0] = attn_out[head_start * head_dim]
+    scores: &mut [f32],
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    head_start: usize,
+    head_end: usize,
+) {
+    let heads_per_group = num_heads / num_kv_heads;
+    let q_base = head_start * head_dim;
+
+    for h in head_start..head_end {
+        let kv_h = h / heads_per_group;
+        let q_offset = h * head_dim - q_base;
+        let q_vec = &q[q_offset..q_offset + head_dim];
+
+        let scores = &mut scores[..kv_len];
+        for kv_s in 0..kv_len {
+            let k_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+            scores[kv_s] =
+                unsafe { dot_f32_f16(q_vec, k_f16.as_ptr().add(k_offset), head_dim) } * scale;
+        }
+
+        let mut max_score = f32::NEG_INFINITY;
+        for &s in scores.iter() {
+            if s > max_score {
+                max_score = s;
+            }
+        }
+
+        let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(scores, max_score);
+        let inv_sum = (1.0 / sum) as f32;
+        for s in scores.iter_mut() {
+            *s *= inv_sum;
+        }
+
+        let o_offset = h * head_dim - q_base;
+        let out_slice = &mut output[o_offset..o_offset + head_dim];
+        for d in out_slice.iter_mut() {
+            *d = 0.0;
+        }
+        for (kv_s, &score) in scores.iter().enumerate() {
+            let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+            unsafe { weighted_add_f16(out_slice, v_f16.as_ptr().add(v_offset), score, head_dim) };
+        }
+    }
+}
+
+/// Compute attention for one query head (decode, seq_len=1).
+///
+/// kv_start: first KV position to include (positions < kv_start get -inf, for sliding window).
+/// kv_h: GQA key/value head index.
+#[cfg(feature = "cpu")]
+#[inline(always)]
+fn decode_one_head(
+    q_head: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out_head: &mut [f32],
+    scores: &mut [f32],
+    kv_start: usize,
+    kv_len: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    kv_h: usize,
+) {
+    for kv_s in 0..kv_len {
+        if kv_s < kv_start {
+            scores[kv_s] = f32::NEG_INFINITY;
+        } else {
+            let k_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+            scores[kv_s] =
+                crate::ggml::vec_llama::vec_dot_f32(q_head, &k[k_offset..k_offset + head_dim])
+                    * scale;
+        }
+    }
+
+    let max_score = scores[..kv_len].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let sum =
+        crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores[..kv_len], max_score);
+    let inv_sum = (1.0 / sum) as f32;
+    for s in &mut scores[..kv_len] {
+        *s *= inv_sum;
+    }
+
+    for d in out_head.iter_mut() {
+        *d = 0.0;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
+
+    for (kv_s, &score) in scores[..kv_len].iter().enumerate() {
+        let v_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
+        let v_row = &v[v_offset..v_offset + head_dim];
+        if use_avx2 {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                axpy_avx2(out_head, v_row, score);
+            }
+        } else {
+            for d in 0..head_dim {
+                out_head[d] += score * v_row[d];
+            }
+        }
+    }
+}
+
+/// Parallel decode attention: dispatches `num_heads` heads across the staticpar pool.
+///
+/// Each head gets its own scores scratch region; output regions are non-overlapping.
+/// kv_start: first KV step to attend to (0 = full cache, kv_len-w = sliding window of size w).
+#[cfg(feature = "cpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn par_attention_decode(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    output: &mut [f32],
+    kv_start: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+) {
+    // Only parallelize when seq_len is large enough to justify condvar overhead.
+    // For seq_len < 64, sequential attention is faster (attention < 0.5ms, overhead ~20μs).
+    if kv_len < 64 || num_heads <= 1 {
+        // Sequential path: reuse the existing per-head functions.
+        let heads_per_group = num_heads / num_kv_heads;
+        let mut scores = vec![0.0f32; kv_len];
+        for h in 0..num_heads {
+            let kv_h = h / heads_per_group;
+            let q_head = &q[h * head_dim..(h + 1) * head_dim];
+            let out_head = &mut output[h * head_dim..(h + 1) * head_dim];
+            // k/v are the full cache slices — use actual slice length as bound
+            decode_one_head(q_head, k, v, out_head, &mut scores, kv_start, kv_len,
+                num_kv_heads, head_dim, scale, kv_h);
+        }
+        return;
+    }
+
+    let mut scores_buf = vec![0.0f32; num_heads * kv_len];
+    let q_ptr = q.as_ptr();
+    let k_ptr = k.as_ptr();
+    let v_ptr = v.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+    let scores_ptr = scores_buf.as_mut_ptr();
+    let heads_per_group = num_heads / num_kv_heads;
+    // Verify the k/v slices are large enough for the full kv_len.
+    let kv_slice_len = kv_len * num_kv_heads * head_dim;
+    assert!(k.len() >= kv_slice_len, "k slice too small: {} < {}", k.len(), kv_slice_len);
+    assert!(v.len() >= kv_slice_len, "v slice too small: {} < {}", v.len(), kv_slice_len);
+    crate::inference_pool::par_run(num_heads, move |start, end| {
+        for h in start..end {
+            let kv_h = h / heads_per_group;
+            let q_head =
+                unsafe { std::slice::from_raw_parts(q_ptr.add(h * head_dim), head_dim) };
+            let k_sl = unsafe {
+                std::slice::from_raw_parts(k_ptr, kv_slice_len)
+            };
+            let v_sl = unsafe {
+                std::slice::from_raw_parts(v_ptr, kv_slice_len)
+            };
+            let out_head = unsafe {
+                std::slice::from_raw_parts_mut(out_ptr.add(h * head_dim), head_dim)
+            };
+            let sc = unsafe {
+                std::slice::from_raw_parts_mut(scores_ptr.add(h * kv_len), kv_len)
+            };
+            decode_one_head(
+                q_head, k_sl, v_sl, out_head, sc, kv_start, kv_len, num_kv_heads, head_dim,
+                scale, kv_h,
+            );
+        }
+    });
 }
 
 /// Process a range of (head, position) work items for prefill attention.
@@ -822,12 +1020,7 @@ pub fn attention_prefill_items(
             }
         }
 
-        let mut sum: f64 = 0.0;
-        for sc in &mut scores[..kv_len] {
-            let val = crate::portable_math::ggml_exp(*sc - max_score);
-            sum += val as f64;
-            *sc = val;
-        }
+        let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores[..kv_len], max_score);
         let inv_sum = (1.0 / sum) as f32;
         for sc in &mut scores[..kv_len] {
             *sc *= inv_sum;
@@ -893,12 +1086,7 @@ pub fn attention_prefill_items_f16kv(
             }
         }
 
-        let mut sum: f64 = 0.0;
-        for sc in &mut scores[..kv_len] {
-            let val = crate::portable_math::ggml_exp(*sc - max_score);
-            sum += val as f64;
-            *sc = val;
-        }
+        let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores[..kv_len], max_score);
         let inv_sum = (1.0 / sum) as f32;
         for sc in &mut scores[..kv_len] {
             *sc *= inv_sum;
@@ -959,6 +1147,10 @@ impl Attention for CpuAttentionGgml {
                 None,
             );
         }
+        if seq_len == 1 && batch == 1 {
+            par_attention_decode(q, k, v, output, 0, kv_len, num_heads, num_kv_heads, head_dim, scale);
+            return Ok(());
+        }
         naive_attention_ggml(
             q,
             k,
@@ -990,6 +1182,11 @@ impl Attention for CpuAttentionGgml {
         scale: f32,
         window_size: usize,
     ) -> Result<()> {
+        if seq_len == 1 && batch == 1 {
+            let kv_start = kv_len.saturating_sub(window_size);
+            par_attention_decode(q, k, v, output, kv_start, kv_len, num_heads, num_kv_heads, head_dim, scale);
+            return Ok(());
+        }
         naive_attention_ggml(
             q,
             k,
@@ -1360,6 +1557,10 @@ impl Attention for CpuAttention {
         head_dim: usize,
         scale: f32,
     ) -> Result<()> {
+        if seq_len == 1 && batch == 1 {
+            par_attention_decode(q, k, v, output, 0, kv_len, num_heads, num_kv_heads, head_dim, scale);
+            return Ok(());
+        }
         naive_attention(
             q,
             k,
@@ -1392,6 +1593,11 @@ impl Attention for CpuAttention {
         scale: f32,
         window_size: usize,
     ) -> Result<()> {
+        if seq_len == 1 && batch == 1 {
+            let kv_start = kv_len.saturating_sub(window_size);
+            par_attention_decode(q, k, v, output, kv_start, kv_len, num_heads, num_kv_heads, head_dim, scale);
+            return Ok(());
+        }
         naive_attention(
             q,
             k,

@@ -169,6 +169,36 @@ impl crate::inference_pool::KernelJob for Q4kGemvX8Job {
     }
 }
 
+// 8-wide GEMV job for m=1 decode with pre-packed BlockQ6Kx8 weights.
+// Uses scalar ggml_gemv_q6_k_8x8_q8_k; parallelizes over n/8 groups.
+struct Q6kGemvX8Job {
+    packed_ptr: *const u8, // &[BlockQ6Kx8], n/8 groups × bpr entries
+    q8k_ptr: *const u8,   // single activation row, bpr BlockQ8K entries
+    out_ptr: *mut f32,     // n output floats
+    bpr: usize,            // Q6Kx8 blocks per row group
+    k: usize,              // activation dimension
+}
+unsafe impl Sync for Q6kGemvX8Job {}
+impl crate::inference_pool::KernelJob for Q6kGemvX8Job {
+    #[inline(always)]
+    fn exec_range(&self, start: usize, end: usize) {
+        use crate::ggml::blocks::BlockQ6Kx8;
+        let packed_stride = self.bpr * std::mem::size_of::<BlockQ6Kx8>();
+        for grp in start..end {
+            unsafe {
+                crate::ggml::repack_llama::ggml_gemv_q6_k_8x8_q8_k(
+                    self.k,
+                    self.out_ptr.add(grp * 8),
+                    self.packed_ptr.add(grp * packed_stride),
+                    self.q8k_ptr,
+                    1,
+                    8,
+                );
+            }
+        }
+    }
+}
+
 // m×n job structs: parallelize over idx = i*n + j with static dispatch pointer.
 struct Q4kMnJob {
     bq_ptr: *const u8,
@@ -633,19 +663,17 @@ struct FusedQ4kPreq2Job {
     out1_ptr: *mut f32,
     out2_ptr: *mut f32,
     n1: usize,
-    blocks_per_row: usize,
-    q8_ptr: *const i8,
-    scales_ptr: *const f32,
-    gsums_ptr: *const f32,
+    bpr: usize,
+    bq_row_bytes: usize,
+    k: usize,
+    q8k_ptr: *const u8,
 }
 unsafe impl Sync for FusedQ4kPreq2Job {}
 impl crate::inference_pool::KernelJob for FusedQ4kPreq2Job {
     #[inline(always)]
     fn exec_range(&self, start: usize, end: usize) {
-        const USE_VNNI: bool = cfg!(any(
-            target_feature = "avxvnni",
-            target_feature = "avx512vnni"
-        ));
+        use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+        let a = unsafe { std::slice::from_raw_parts(self.q8k_ptr as *const BlockQ8K, self.bpr) };
         for idx in start..end {
             let (b_ptr, j, o_ptr) = if idx < self.n1 {
                 (self.b1_ptr, idx, unsafe { self.out1_ptr.add(idx) })
@@ -654,28 +682,12 @@ impl crate::inference_pool::KernelJob for FusedQ4kPreq2Job {
                     self.out2_ptr.add(idx - self.n1)
                 })
             };
-            let mut sum = 0.0f32;
-            for blk in 0..self.blocks_per_row {
-                let off = (j * self.blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                let block = unsafe { std::slice::from_raw_parts(b_ptr.add(off), Q4K_BLOCK_BYTES) };
-                let aq = unsafe {
-                    std::slice::from_raw_parts(
-                        self.q8_ptr.add(blk * Q4K_BLOCK_SIZE),
-                        Q4K_BLOCK_SIZE,
-                    )
-                };
-                let a_sc = unsafe { *self.scales_ptr.add(blk) };
-                let a_gs = unsafe {
-                    std::slice::from_raw_parts(self.gsums_ptr.add(blk * Q4K_GROUPS), Q4K_GROUPS)
-                };
-                sum += if USE_VNNI {
-                    unsafe { q4k_dot_q8_vnni(block, aq, a_sc, a_gs) }
-                } else {
-                    unsafe { q4k_dot_q8_avx2(block, aq, a_sc, a_gs) }
-                };
-            }
+            let w = unsafe {
+                std::slice::from_raw_parts(b_ptr.add(j * self.bq_row_bytes) as *const BlockQ4K, self.bpr)
+            };
+            let val = unsafe { crate::ggml::quants_llama::ggml_vec_dot_q4_k_q8_k(self.k, w, a) };
             unsafe {
-                *o_ptr = sum;
+                *o_ptr = val;
             }
         }
     }
@@ -690,10 +702,9 @@ struct FusedQ4k2F161PreqJob {
     out3_ptr: *mut f32,
     n1: usize,
     n2: usize,
-    blocks_per_row: usize,
-    q8_ptr: *const i8,
-    scales_ptr: *const f32,
-    gsums_ptr: *const f32,
+    bpr: usize,
+    bq_row_bytes: usize,
+    q8k_ptr: *const u8,
     f16_ptr: *const u8,
     a_f32_ptr: *const f32,
     k: usize,
@@ -703,10 +714,8 @@ unsafe impl Sync for FusedQ4k2F161PreqJob {}
 impl crate::inference_pool::KernelJob for FusedQ4k2F161PreqJob {
     #[inline(always)]
     fn exec_range(&self, start: usize, end: usize) {
-        const USE_VNNI: bool = cfg!(any(
-            target_feature = "avxvnni",
-            target_feature = "avx512vnni"
-        ));
+        use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+        let a = unsafe { std::slice::from_raw_parts(self.q8k_ptr as *const BlockQ8K, self.bpr) };
         for idx in start..end {
             if idx < self.n1 + self.n2 {
                 let (b_ptr, j, o_ptr) = if idx < self.n1 {
@@ -716,29 +725,12 @@ impl crate::inference_pool::KernelJob for FusedQ4k2F161PreqJob {
                         self.out2_ptr.add(idx - self.n1)
                     })
                 };
-                let mut sum = 0.0f32;
-                for blk in 0..self.blocks_per_row {
-                    let off = (j * self.blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                    let block =
-                        unsafe { std::slice::from_raw_parts(b_ptr.add(off), Q4K_BLOCK_BYTES) };
-                    let aq = unsafe {
-                        std::slice::from_raw_parts(
-                            self.q8_ptr.add(blk * Q4K_BLOCK_SIZE),
-                            Q4K_BLOCK_SIZE,
-                        )
-                    };
-                    let a_sc = unsafe { *self.scales_ptr.add(blk) };
-                    let a_gs = unsafe {
-                        std::slice::from_raw_parts(self.gsums_ptr.add(blk * Q4K_GROUPS), Q4K_GROUPS)
-                    };
-                    sum += if USE_VNNI {
-                        unsafe { q4k_dot_q8_vnni(block, aq, a_sc, a_gs) }
-                    } else {
-                        unsafe { q4k_dot_q8_avx2(block, aq, a_sc, a_gs) }
-                    };
-                }
+                let w = unsafe {
+                    std::slice::from_raw_parts(b_ptr.add(j * self.bq_row_bytes) as *const BlockQ4K, self.bpr)
+                };
+                let val = unsafe { crate::ggml::quants_llama::ggml_vec_dot_q4_k_q8_k(self.k, w, a) };
                 unsafe {
-                    *o_ptr = sum;
+                    *o_ptr = val;
                 }
             } else {
                 let j = idx - self.n1 - self.n2;
@@ -753,6 +745,508 @@ impl crate::inference_pool::KernelJob for FusedQ4k2F161PreqJob {
                 unsafe {
                     *self.out3_ptr.add(j) = dot;
                 }
+            }
+        }
+    }
+}
+
+// Fused QKV job: three Q4K projections sharing one pre-quantized activation, one dispatch.
+struct FusedQ4kPreq3Job {
+    b1_ptr: *const u8,
+    b2_ptr: *const u8,
+    b3_ptr: *const u8,
+    out1_ptr: *mut f32,
+    out2_ptr: *mut f32,
+    out3_ptr: *mut f32,
+    n1: usize,
+    n2: usize,
+    bpr: usize,
+    bq_row_bytes: usize,
+    k: usize,
+    q8k_ptr: *const u8,
+}
+unsafe impl Sync for FusedQ4kPreq3Job {}
+impl crate::inference_pool::KernelJob for FusedQ4kPreq3Job {
+    #[inline(always)]
+    fn exec_range(&self, start: usize, end: usize) {
+        use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+        let a = unsafe { std::slice::from_raw_parts(self.q8k_ptr as *const BlockQ8K, self.bpr) };
+        for idx in start..end {
+            let (b_ptr, j, o_ptr) = if idx < self.n1 {
+                (self.b1_ptr, idx, unsafe { self.out1_ptr.add(idx) })
+            } else if idx < self.n1 + self.n2 {
+                let i = idx - self.n1;
+                (self.b2_ptr, i, unsafe { self.out2_ptr.add(i) })
+            } else {
+                let i = idx - self.n1 - self.n2;
+                (self.b3_ptr, i, unsafe { self.out3_ptr.add(i) })
+            };
+            let w = unsafe {
+                std::slice::from_raw_parts(b_ptr.add(j * self.bq_row_bytes) as *const BlockQ4K, self.bpr)
+            };
+            let val = unsafe { crate::ggml::quants_llama::ggml_vec_dot_q4_k_q8_k(self.k, w, a) };
+            unsafe {
+                *o_ptr = val;
+            }
+        }
+    }
+}
+
+/// Compute Q4K GEMV for neurons `start..end` using pre-quantized activations.
+/// No internal dispatch — safe to call from within an already-parallel region
+/// (e.g. inside `thread_pool::run_indexed`).
+///
+/// # Safety
+/// All raw pointers must be valid and non-overlapping for the given ranges.
+pub unsafe fn q4k_preq_range_raw(
+    b_ptr: *const u8,
+    q8_ptr: *const i8,
+    scales_ptr: *const f32,
+    gsums_ptr: *const f32,
+    bpr: usize,
+    out_ptr: *mut f32,
+    start: usize,
+    end: usize,
+) {
+    const USE_VNNI: bool = cfg!(any(
+        target_feature = "avxvnni",
+        target_feature = "avx512vnni"
+    ));
+    for j in start..end {
+        let mut sum = 0.0f32;
+        for blk in 0..bpr {
+            let off = (j * bpr + blk) * Q4K_BLOCK_BYTES;
+            let block = std::slice::from_raw_parts(b_ptr.add(off), Q4K_BLOCK_BYTES);
+            let aq = std::slice::from_raw_parts(
+                q8_ptr.add(blk * Q4K_BLOCK_SIZE),
+                Q4K_BLOCK_SIZE,
+            );
+            let a_sc = *scales_ptr.add(blk);
+            let a_gs = std::slice::from_raw_parts(
+                gsums_ptr.add(blk * Q4K_GROUPS),
+                Q4K_GROUPS,
+            );
+            sum += if USE_VNNI {
+                q4k_dot_q8_vnni(block, aq, a_sc, a_gs)
+            } else {
+                q4k_dot_q8_avx2(block, aq, a_sc, a_gs)
+            };
+        }
+        *out_ptr.add(j) = sum;
+    }
+}
+
+/// Like `q4k_preq_range_raw` but uses `BlockQ8K` and `ggml_vec_dot_q4_k_q8_k`.
+/// Matches the kernel used in FusedQ4kPreq2Job / FusedQ4kPreq3Job.
+pub unsafe fn q4k_preq_range_q8k(
+    b_ptr: *const u8,
+    q8k: *const crate::ggml::blocks::BlockQ8K,
+    bpr: usize,
+    k: usize,
+    out_ptr: *mut f32,
+    start: usize,
+    end: usize,
+) {
+    use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+    let bq_row_bytes = bpr * Q4K_BLOCK_BYTES;
+    let a = std::slice::from_raw_parts(q8k, bpr);
+    for j in start..end {
+        let w = std::slice::from_raw_parts(
+            b_ptr.add(j * bq_row_bytes) as *const BlockQ4K,
+            bpr,
+        );
+        *out_ptr.add(j) = crate::ggml::vec_dot_avx2::vec_dot_q4_k_q8_k_dispatch(k, w, a);
+    }
+}
+
+/// Like `q4k_preq_range_q8k` but for Q6K weights, using `ggml_vec_dot_q6_k_q8_k`.
+pub unsafe fn q6k_preq_range_q8k(
+    b_ptr: *const u8,
+    q8k: *const crate::ggml::blocks::BlockQ8K,
+    bpr: usize,
+    k: usize,
+    out_ptr: *mut f32,
+    start: usize,
+    end: usize,
+) {
+    use crate::ggml::blocks::{BlockQ6K, BlockQ8K};
+    let bq_row_bytes = bpr * crate::Q6K_BLOCK_BYTES;
+    let a = std::slice::from_raw_parts(q8k, bpr);
+    for j in start..end {
+        let w = std::slice::from_raw_parts(
+            b_ptr.add(j * bq_row_bytes) as *const BlockQ6K,
+            bpr,
+        );
+        *out_ptr.add(j) = crate::ggml::vec_dot_avx2::vec_dot_q6_k_q8_k_dispatch(k, w, a);
+    }
+}
+
+/// Quantize rows `t_start..t_end` of `a_f32` (row-major, each row is `k` elements)
+/// into `q8k_out[t_start*bpr .. t_end*bpr]`. Used for parallel activation
+/// pre-quantization in the prefill graph model (each thread calls with disjoint range).
+pub unsafe fn quantize_rows_q8k_range(
+    a_f32: *const f32,
+    k: usize,
+    q8k_out: *mut crate::ggml::blocks::BlockQ8K,
+    t_start: usize,
+    t_end: usize,
+) {
+    let bpr = k / Q4K_BLOCK_SIZE;
+    for t in t_start..t_end {
+        let src = std::slice::from_raw_parts(a_f32.add(t * k), k);
+        let dst = std::slice::from_raw_parts_mut(q8k_out.add(t * bpr), bpr);
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(src, dst);
+            continue;
+        }
+        crate::ggml::quantize::quantize_row_q8_k(src, dst);
+    }
+}
+
+/// Quantize t_start..t_end tokens (groups of 4) into BlockQ8Kx4 format for the
+/// repacked 8×8 GEMM. Requires t_start % 4 == 0 and (t_end - t_start) % 4 == 0.
+/// Output pointer q8kx4_out must have capacity [(t_end-t_start)/4 * k/256] BlockQ8Kx4.
+pub unsafe fn quantize_rows_q8kx4_range(
+    a_f32: *const f32,
+    k: usize,
+    q8kx4_out: *mut crate::ggml::blocks::BlockQ8Kx4,
+    t_start: usize,
+    t_end: usize,
+) {
+    use crate::ggml::repack::quantize_mat_q8k_4x8;
+    let nb = k / Q4K_BLOCK_SIZE;
+    let mut g = t_start / 4;
+    let mut t = t_start;
+    while t < t_end {
+        let src = std::slice::from_raw_parts(a_f32.add(t * k), 4 * k);
+        let group = quantize_mat_q8k_4x8(src, 4, k);
+        let dst = std::slice::from_raw_parts_mut(q8kx4_out.add(g * nb), nb);
+        dst.copy_from_slice(&group);
+        g += 1;
+        t += 4;
+    }
+}
+
+/// Q4Kx8 (repacked) weight × Q8Kx4 activation GEMM for output rows j_start..j_end.
+/// j_start and (j_end-j_start) must be multiples of 8. m must be a multiple of 4.
+/// q8kx4_act: [m/4 * bpr] BlockQ8Kx4, indexed as group=i/4, block=blk.
+pub unsafe fn q4k_prefill_gemm_x8_range(
+    b_q4kx8: *const u8,
+    q8kx4_act: *const crate::ggml::blocks::BlockQ8Kx4,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    bpr: usize,
+    k: usize,
+    j_start: usize,
+    j_end: usize,
+) {
+    use crate::ggml::blocks::BlockQ4Kx8;
+    if j_start >= j_end { return; }
+    let nc = j_end - j_start;
+    if nc == 0 || nc % 8 != 0 || m % 4 != 0 { return; }
+    let bx8_row_bytes = bpr * std::mem::size_of::<BlockQ4Kx8>();
+    let vx = b_q4kx8.add((j_start / 8) * bx8_row_bytes);
+    let s = out.add(j_start);
+    crate::ggml::repack_llama2::ggml_gemm_q4_k_8x8_q8_k(k, s, n, vx, q8kx4_act as *const u8, m, nc);
+}
+
+/// Q6K repacked (Q6Kx8) × Q8Kx4 activation batch GEMM for `j_start..j_end` weight rows.
+/// Mirrors q4k_prefill_gemm_x8_range but for Q6K down_proj.
+/// Requires j_start%8==0, (j_end-j_start)%8==0, m%4==0.
+pub unsafe fn q6k_prefill_gemm_x8_range(
+    b_q6kx8: *const u8,
+    q8kx4_act: *const crate::ggml::blocks::BlockQ8Kx4,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    bpr: usize,
+    k: usize,
+    j_start: usize,
+    j_end: usize,
+) {
+    use crate::ggml::blocks::BlockQ6Kx8;
+    if j_start >= j_end { return; }
+    let nc = j_end - j_start;
+    if nc == 0 || nc % 8 != 0 || m % 4 != 0 { return; }
+    let bx8_row_bytes = bpr * std::mem::size_of::<BlockQ6Kx8>();
+    let vx = b_q6kx8.add((j_start / 8) * bx8_row_bytes);
+    let s = out.add(j_start);
+    crate::ggml::repack_llama::ggml_gemm_q6_k_8x4_q8_k(k, s, n, vx, q8kx4_act as *const u8, m, nc);
+}
+
+/// Q4K weight matrix × Q8K activation batch GEMM, output rows `j_start..j_end`.
+/// Equivalent to Q4kMnBlockJob::exec_range but inline (no StaticPool dispatch).
+/// Used inside pool.run_indexed for the prefill graph model.
+pub unsafe fn q4k_prefill_gemm_range(
+    b_q4k: *const u8,
+    q8k_act: *const crate::ggml::blocks::BlockQ8K,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    bpr: usize,
+    k: usize,
+    j_start: usize,
+    j_end: usize,
+) {
+    use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+    use crate::ggml::vec_dot_avx2::{
+        vec_dot_q4_k_q8_k_dispatch, vec_dot_q4k_q8k_dispatch_4x4,
+    };
+    let bq_row_bytes = bpr * Q4K_BLOCK_BYTES;
+    let q8k_row_bytes = bpr * std::mem::size_of::<BlockQ8K>();
+    let mut j = j_start;
+    while j + 3 < j_end {
+        let w0 = std::slice::from_raw_parts(b_q4k.add(j * bq_row_bytes) as *const BlockQ4K, bpr);
+        let w1 = std::slice::from_raw_parts(b_q4k.add((j+1) * bq_row_bytes) as *const BlockQ4K, bpr);
+        let w2 = std::slice::from_raw_parts(b_q4k.add((j+2) * bq_row_bytes) as *const BlockQ4K, bpr);
+        let w3 = std::slice::from_raw_parts(b_q4k.add((j+3) * bq_row_bytes) as *const BlockQ4K, bpr);
+        let mut i = 0;
+        while i + 3 < m {
+            let a0 = std::slice::from_raw_parts(q8k_act.add(i * q8k_row_bytes / std::mem::size_of::<BlockQ8K>()), bpr);
+            let a1 = std::slice::from_raw_parts(q8k_act.add((i+1) * q8k_row_bytes / std::mem::size_of::<BlockQ8K>()), bpr);
+            let a2 = std::slice::from_raw_parts(q8k_act.add((i+2) * q8k_row_bytes / std::mem::size_of::<BlockQ8K>()), bpr);
+            let a3 = std::slice::from_raw_parts(q8k_act.add((i+3) * q8k_row_bytes / std::mem::size_of::<BlockQ8K>()), bpr);
+            let r = vec_dot_q4k_q8k_dispatch_4x4(k, w0, w1, w2, w3, a0, a1, a2, a3);
+            *out.add(i * n + j)     = r[0][0]; *out.add(i * n + j + 1)     = r[0][1];
+            *out.add(i * n + j + 2) = r[0][2]; *out.add(i * n + j + 3)     = r[0][3];
+            *out.add((i+1) * n + j) = r[1][0]; *out.add((i+1) * n + j + 1) = r[1][1];
+            *out.add((i+1) * n + j + 2) = r[1][2]; *out.add((i+1) * n + j + 3) = r[1][3];
+            *out.add((i+2) * n + j) = r[2][0]; *out.add((i+2) * n + j + 1) = r[2][1];
+            *out.add((i+2) * n + j + 2) = r[2][2]; *out.add((i+2) * n + j + 3) = r[2][3];
+            *out.add((i+3) * n + j) = r[3][0]; *out.add((i+3) * n + j + 1) = r[3][1];
+            *out.add((i+3) * n + j + 2) = r[3][2]; *out.add((i+3) * n + j + 3) = r[3][3];
+            i += 4;
+        }
+        while i < m {
+            let a = std::slice::from_raw_parts(q8k_act.add(i * bpr), bpr);
+            let v0 = vec_dot_q4_k_q8_k_dispatch(k, w0, a);
+            let v1 = vec_dot_q4_k_q8_k_dispatch(k, w1, a);
+            let v2 = vec_dot_q4_k_q8_k_dispatch(k, w2, a);
+            let v3 = vec_dot_q4_k_q8_k_dispatch(k, w3, a);
+            *out.add(i * n + j) = v0; *out.add(i * n + j + 1) = v1;
+            *out.add(i * n + j + 2) = v2; *out.add(i * n + j + 3) = v3;
+            i += 1;
+        }
+        j += 4;
+    }
+    while j < j_end {
+        let w = std::slice::from_raw_parts(b_q4k.add(j * bq_row_bytes) as *const BlockQ4K, bpr);
+        for i in 0..m {
+            let a = std::slice::from_raw_parts(q8k_act.add(i * bpr), bpr);
+            *out.add(i * n + j) = vec_dot_q4_k_q8_k_dispatch(k, w, a);
+        }
+        j += 1;
+    }
+}
+
+/// Q6K weight matrix × Q8K activation batch GEMM, output rows `j_start..j_end`.
+pub unsafe fn q6k_prefill_gemm_range(
+    b_q6k: *const u8,
+    q8k_act: *const crate::ggml::blocks::BlockQ8K,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    bpr: usize,
+    k: usize,
+    j_start: usize,
+    j_end: usize,
+) {
+    use crate::ggml::blocks::{BlockQ6K, BlockQ8K};
+    let bq_row_bytes = bpr * crate::ggml::blocks::BLOCK_Q6K_SIZE;
+    for j in j_start..j_end {
+        let w = std::slice::from_raw_parts(b_q6k.add(j * bq_row_bytes) as *const BlockQ6K, bpr);
+        for i in 0..m {
+            let a = std::slice::from_raw_parts(q8k_act.add(i * bpr), bpr);
+            *out.add(i * n + j) = crate::ggml::quants_llama::ggml_vec_dot_q6_k_q8_k(k, w, a);
+        }
+    }
+}
+
+/// F16 weight matrix × f32 activation batch GEMM, output rows `j_start..j_end`.
+pub unsafe fn f16_prefill_gemm_range(
+    b_f16: *const u8,
+    a_f32: *const f32,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    j_start: usize,
+    j_end: usize,
+) {
+    let row_bytes = k * 2;
+    for j in j_start..j_end {
+        let b_row = std::slice::from_raw_parts(b_f16.add(j * row_bytes), row_bytes);
+        for i in 0..m {
+            let a_row = std::slice::from_raw_parts(a_f32.add(i * k), k);
+            *out.add(i * n + j) = crate::f16_gemv::f16_dot_dispatch(a_row, b_row, k);
+        }
+    }
+}
+
+/// F16 weight × F16 activation GEMM for a row range (used when KV cache holds F16 keys).
+pub unsafe fn f16_f16_prefill_gemm_range(
+    b_f16: *const u8,
+    a_f16: *const u8,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    j_start: usize,
+    j_end: usize,
+) {
+    use crate::ggml::helpers::f16_to_f32;
+    let row_bytes = k * 2;
+    for j in j_start..j_end {
+        let b_row = std::slice::from_raw_parts(b_f16.add(j * row_bytes) as *const u16, k);
+        for i in 0..m {
+            let a_row = std::slice::from_raw_parts(a_f16.add(i * row_bytes) as *const u16, k);
+            let mut dot = 0.0f32;
+            for d in 0..k {
+                dot += f16_to_f32(b_row[d]) * f16_to_f32(a_row[d]);
+            }
+            *out.add(i * n + j) = dot;
+        }
+    }
+}
+
+/// Used inside the graph decode closure (no thread-pool — caller already parallel).
+pub unsafe fn f16_preq_range(
+    b_f16: *const u8,  // F16 weight matrix, row-major, each row is k * 2 bytes
+    a_f32: *const f32, // f32 activation vector of length k
+    k: usize,
+    out_ptr: *mut f32,
+    start: usize,
+    end: usize,
+) {
+    let row_bytes = k * 2;
+    let a = std::slice::from_raw_parts(a_f32, k);
+    for j in start..end {
+        let b_row = std::slice::from_raw_parts(b_f16.add(j * row_bytes), row_bytes);
+        *out_ptr.add(j) = crate::f16_gemv::f16_dot_dispatch(a, b_row, k);
+    }
+}
+
+/// Like `q4k_preq_range_q8k` but for Q5K weights, using `ggml_vec_dot_q5_k_q8_k`.
+pub unsafe fn q5k_preq_range_q8k(
+    b_ptr: *const u8,
+    q8k: *const crate::ggml::blocks::BlockQ8K,
+    bpr: usize,
+    k: usize,
+    out_ptr: *mut f32,
+    start: usize,
+    end: usize,
+) {
+    use crate::ggml::blocks::{BlockQ5K, BlockQ8K};
+    let bq_row_bytes = bpr * crate::ggml::blocks::BLOCK_Q5K_SIZE;
+    let a = std::slice::from_raw_parts(q8k, bpr);
+    for j in start..end {
+        let w = std::slice::from_raw_parts(
+            b_ptr.add(j * bq_row_bytes) as *const BlockQ5K,
+            bpr,
+        );
+        *out_ptr.add(j) = crate::ggml::quants_llama::ggml_vec_dot_q5_k_q8_k(k, w, a);
+    }
+}
+
+// Fused QKV job: three Q6K projections sharing one f32 activation, one dispatch.
+struct FusedQ6kPreq3Job {
+    b1_ptr: *const u8,
+    b2_ptr: *const u8,
+    b3_ptr: *const u8,
+    out1_ptr: *mut f32,
+    out2_ptr: *mut f32,
+    out3_ptr: *mut f32,
+    n1: usize,
+    n2: usize,
+    bpr: usize,
+    af_ptr: *const f32,
+}
+unsafe impl Sync for FusedQ6kPreq3Job {}
+impl crate::inference_pool::KernelJob for FusedQ6kPreq3Job {
+    #[inline(always)]
+    fn exec_range(&self, start: usize, end: usize) {
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_avx2 = false;
+        for idx in start..end {
+            let (b_ptr, j, o_ptr) = if idx < self.n1 {
+                (self.b1_ptr, idx, unsafe { self.out1_ptr.add(idx) })
+            } else if idx < self.n1 + self.n2 {
+                let i = idx - self.n1;
+                (self.b2_ptr, i, unsafe { self.out2_ptr.add(i) })
+            } else {
+                let i = idx - self.n1 - self.n2;
+                (self.b3_ptr, i, unsafe { self.out3_ptr.add(i) })
+            };
+            let mut sum = 0.0f32;
+            for blk in 0..self.bpr {
+                let bo = (j * self.bpr + blk) * Q6K_BLOCK_BYTES;
+                let block = unsafe { std::slice::from_raw_parts(b_ptr.add(bo), Q6K_BLOCK_BYTES) };
+                let a_sl = unsafe {
+                    std::slice::from_raw_parts(
+                        self.af_ptr.add(blk * Q6K_BLOCK_SIZE),
+                        Q6K_BLOCK_SIZE,
+                    )
+                };
+                sum += if use_avx2 {
+                    unsafe { q6k_dot_block_avx2(block, a_sl) }
+                } else {
+                    q6k_dot_block(block, a_sl)
+                };
+            }
+            unsafe {
+                *o_ptr = sum;
+            }
+        }
+    }
+}
+
+// Fused gate+up job: two Q6K projections sharing one f32 activation, one dispatch.
+struct FusedQ6kPreq2Job {
+    b1_ptr: *const u8,
+    b2_ptr: *const u8,
+    out1_ptr: *mut f32,
+    out2_ptr: *mut f32,
+    n1: usize,
+    bpr: usize,
+    af_ptr: *const f32,
+}
+unsafe impl Sync for FusedQ6kPreq2Job {}
+impl crate::inference_pool::KernelJob for FusedQ6kPreq2Job {
+    #[inline(always)]
+    fn exec_range(&self, start: usize, end: usize) {
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_avx2 = false;
+        for idx in start..end {
+            let (b_ptr, j, o_ptr) = if idx < self.n1 {
+                (self.b1_ptr, idx, unsafe { self.out1_ptr.add(idx) })
+            } else {
+                let i = idx - self.n1;
+                (self.b2_ptr, i, unsafe { self.out2_ptr.add(i) })
+            };
+            let mut sum = 0.0f32;
+            for blk in 0..self.bpr {
+                let bo = (j * self.bpr + blk) * Q6K_BLOCK_BYTES;
+                let block = unsafe { std::slice::from_raw_parts(b_ptr.add(bo), Q6K_BLOCK_BYTES) };
+                let a_sl = unsafe {
+                    std::slice::from_raw_parts(
+                        self.af_ptr.add(blk * Q6K_BLOCK_SIZE),
+                        Q6K_BLOCK_SIZE,
+                    )
+                };
+                sum += if use_avx2 {
+                    unsafe { q6k_dot_block_avx2(block, a_sl) }
+                } else {
+                    q6k_dot_block(block, a_sl)
+                };
+            }
+            unsafe {
+                *o_ptr = sum;
             }
         }
     }
@@ -4376,6 +4870,7 @@ pub struct PreQuantizedActivations {
     pub q8_32: Vec<i8>,
     pub scales_32: Vec<f32>,
     pub asum_32: Vec<i32>,
+    pub q8k: Vec<crate::ggml::blocks::BlockQ8K>,
     pub k: usize,
 }
 
@@ -4426,6 +4921,23 @@ impl PreQuantizedActivations {
 
             let (i2s_scale, i2s_sum, i2s_q8) = unsafe { quantize_row_i8_s_avx2(a) };
 
+            let bpr_q4k = k / Q4K_BLOCK_SIZE;
+            let mut q8k: Vec<crate::ggml::blocks::BlockQ8K> = Vec::with_capacity(bpr_q4k);
+            for blk in 0..bpr_q4k {
+                let base = blk * Q4K_BLOCK_SIZE;
+                let mut qs = [0i8; 256];
+                qs.copy_from_slice(&q8[base..base + Q4K_BLOCK_SIZE]);
+                let mut bsums = [0i16; 16];
+                for g in 0..16 {
+                    let mut s = 0i32;
+                    for i in 0..16 {
+                        s += qs[g * 16 + i] as i32;
+                    }
+                    bsums[g] = s as i16;
+                }
+                q8k.push(crate::ggml::blocks::BlockQ8K { d: scales[blk], qs, bsums });
+            }
+
             let n32 = k / 32;
             let mut q8_32 = vec![0i8; k];
             let mut scales_32 = vec![0.0f32; n32];
@@ -4463,6 +4975,7 @@ impl PreQuantizedActivations {
                 q8_32,
                 scales_32,
                 asum_32,
+                q8k,
                 k,
             };
         }
@@ -4482,8 +4995,41 @@ impl PreQuantizedActivations {
             q8_32: Vec::new(),
             scales_32: Vec::new(),
             asum_32: Vec::new(),
+            q8k: Vec::new(),
             k,
         }
+    }
+
+    /// Minimal variant for graph decode: only q8 + scales + q8k.
+    /// Skips group_sums, i2s, q16, q8_32 — none used in Q4K/Q6K graph nodes.
+    pub fn from_f32_q8k_only(a: &[f32]) -> Self {
+        let k = a.len();
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            let (q8, scales, _) = unsafe { quantize_row_q8_avx2(a) };
+            let bpr = k / Q4K_BLOCK_SIZE;
+            let mut q8k: Vec<crate::ggml::blocks::BlockQ8K> = Vec::with_capacity(bpr);
+            for blk in 0..bpr {
+                let base = blk * Q4K_BLOCK_SIZE;
+                let mut qs = [0i8; 256];
+                qs.copy_from_slice(&q8[base..base + Q4K_BLOCK_SIZE]);
+                let mut bsums = [0i16; 16];
+                for g in 0..16 {
+                    let mut s = 0i32;
+                    for i in 0..16 { s += qs[g * 16 + i] as i32; }
+                    bsums[g] = s as i16;
+                }
+                q8k.push(crate::ggml::blocks::BlockQ8K { d: scales[blk], qs, bsums });
+            }
+            return Self {
+                q8, q16: Vec::new(), scales, scales_i16: Vec::new(),
+                group_sums_q4k: Vec::new(), group_sums_q6k: Vec::new(),
+                i2s_q8: Vec::new(), i2s_scale: 0.0, i2s_sum: 0,
+                q8_32: Vec::new(), scales_32: Vec::new(), asum_32: Vec::new(),
+                q8k, k,
+            };
+        }
+        Self::from_f32(a)
     }
 
     pub fn i2s_only(a: &[f32]) -> Self {
@@ -4504,6 +5050,7 @@ impl PreQuantizedActivations {
                 q8_32: Vec::new(),
                 scales_32: Vec::new(),
                 asum_32: Vec::new(),
+                q8k: Vec::new(),
                 k,
             };
         }
@@ -4522,6 +5069,7 @@ impl PreQuantizedActivations {
             q8_32: Vec::new(),
             scales_32: Vec::new(),
             asum_32: Vec::new(),
+            q8k: Vec::new(),
             k,
         }
     }
@@ -4546,7 +5094,7 @@ impl CpuMatMulQ4KOpt {
         n2: usize,
     ) {
         let k = preq.k;
-        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let bpr = k / Q4K_BLOCK_SIZE;
         let total = n1 + n2;
         let job = FusedQ4kPreq2Job {
             b1_ptr: b1.as_ptr(),
@@ -4554,10 +5102,10 @@ impl CpuMatMulQ4KOpt {
             out1_ptr: out1.as_mut_ptr(),
             out2_ptr: out2.as_mut_ptr(),
             n1,
-            blocks_per_row,
-            q8_ptr: preq.q8.as_ptr(),
-            scales_ptr: preq.scales.as_ptr(),
-            gsums_ptr: preq.group_sums_q4k.as_ptr(),
+            bpr,
+            bq_row_bytes: bpr * Q4K_BLOCK_BYTES,
+            k,
+            q8k_ptr: preq.q8k.as_ptr() as *const u8,
         };
         crate::inference_pool::par_run_job(total, &job);
     }
@@ -4579,7 +5127,7 @@ impl CpuMatMulQ4KOpt {
         k: usize,
         a_f32: &[f32],
     ) {
-        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let bpr = k / Q4K_BLOCK_SIZE;
         let total = n1 + n2 + n3;
         let job = FusedQ4k2F161PreqJob {
             b1_ptr: b1.as_ptr(),
@@ -4589,14 +5137,108 @@ impl CpuMatMulQ4KOpt {
             out3_ptr: out3.as_mut_ptr(),
             n1,
             n2,
-            blocks_per_row,
-            q8_ptr: preq.q8.as_ptr(),
-            scales_ptr: preq.scales.as_ptr(),
-            gsums_ptr: preq.group_sums_q4k.as_ptr(),
+            bpr,
+            bq_row_bytes: bpr * Q4K_BLOCK_BYTES,
+            q8k_ptr: preq.q8k.as_ptr() as *const u8,
             f16_ptr: f16_bytes.as_ptr(),
             a_f32_ptr: a_f32.as_ptr(),
             k,
             row_f16_bytes: k * 2,
+        };
+        crate::inference_pool::par_run_job(total, &job);
+    }
+
+    /// Fuse three Q4K projections (Q+K+V) with the same pre-quantized activation, one dispatch.
+    /// Eliminates two pool wakes vs calling forward_q4k_preq three times.
+    pub fn fused_q4k_preq_3(
+        &self,
+        preq: &PreQuantizedActivations,
+        b1: &[u8],
+        out1: &mut [f32],
+        n1: usize,
+        b2: &[u8],
+        out2: &mut [f32],
+        n2: usize,
+        b3: &[u8],
+        out3: &mut [f32],
+        n3: usize,
+    ) {
+        let k = preq.k;
+        let bpr = k / Q4K_BLOCK_SIZE;
+        let total = n1 + n2 + n3;
+        let job = FusedQ4kPreq3Job {
+            b1_ptr: b1.as_ptr(),
+            b2_ptr: b2.as_ptr(),
+            b3_ptr: b3.as_ptr(),
+            out1_ptr: out1.as_mut_ptr(),
+            out2_ptr: out2.as_mut_ptr(),
+            out3_ptr: out3.as_mut_ptr(),
+            n1,
+            n2,
+            bpr,
+            bq_row_bytes: bpr * Q4K_BLOCK_BYTES,
+            k,
+            q8k_ptr: preq.q8k.as_ptr() as *const u8,
+        };
+        crate::inference_pool::par_run_job(total, &job);
+    }
+
+    /// Fuse three Q6K projections (Q+K+V) with the same f32 activation, one dispatch.
+    /// Eliminates two pool wakes vs calling forward_q6k_preq three times.
+    pub fn fused_q6k_preq_3(
+        &self,
+        a_f32: &[f32],
+        b1: &[u8],
+        out1: &mut [f32],
+        n1: usize,
+        b2: &[u8],
+        out2: &mut [f32],
+        n2: usize,
+        b3: &[u8],
+        out3: &mut [f32],
+        n3: usize,
+        k: usize,
+    ) {
+        let bpr = k / Q6K_BLOCK_SIZE;
+        let total = n1 + n2 + n3;
+        let job = FusedQ6kPreq3Job {
+            b1_ptr: b1.as_ptr(),
+            b2_ptr: b2.as_ptr(),
+            b3_ptr: b3.as_ptr(),
+            out1_ptr: out1.as_mut_ptr(),
+            out2_ptr: out2.as_mut_ptr(),
+            out3_ptr: out3.as_mut_ptr(),
+            n1,
+            n2,
+            bpr,
+            af_ptr: a_f32.as_ptr(),
+        };
+        crate::inference_pool::par_run_job(total, &job);
+    }
+
+    /// Fuse two Q6K projections (gate+up) with the same f32 activation, one dispatch.
+    /// Eliminates one pool wake vs calling forward_q6k_preq twice.
+    pub fn fused_q6k_preq_2(
+        &self,
+        a_f32: &[f32],
+        b1: &[u8],
+        out1: &mut [f32],
+        n1: usize,
+        b2: &[u8],
+        out2: &mut [f32],
+        n2: usize,
+        k: usize,
+    ) {
+        let bpr = k / Q6K_BLOCK_SIZE;
+        let total = n1 + n2;
+        let job = FusedQ6kPreq2Job {
+            b1_ptr: b1.as_ptr(),
+            b2_ptr: b2.as_ptr(),
+            out1_ptr: out1.as_mut_ptr(),
+            out2_ptr: out2.as_mut_ptr(),
+            n1,
+            bpr,
+            af_ptr: a_f32.as_ptr(),
         };
         crate::inference_pool::par_run_job(total, &job);
     }
@@ -4613,41 +5255,22 @@ impl CpuMatMulQ4KOpt {
         let blocks_per_row = k / Q4K_BLOCK_SIZE;
 
         if preq.is_quantized() {
-            const USE_VNNI: bool = cfg!(any(
-                target_feature = "avxvnni",
-                target_feature = "avx512vnni"
-            ));
-
+            use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+            let bpr = blocks_per_row;
+            let bq_row_bytes = bpr * Q4K_BLOCK_BYTES;
             let out_ptr = output.as_mut_ptr();
             let bq_ptr = b_quantized.as_ptr();
-            let q8_ptr = preq.q8.as_ptr();
-            let sc_ptr = preq.scales.as_ptr();
-            let gs_ptr = preq.group_sums_q4k.as_ptr();
+            let act_q8k = unsafe {
+                std::slice::from_raw_parts(preq.q8k.as_ptr() as *const BlockQ8K, bpr)
+            };
             crate::inference_pool::par_run(n, |start, end| {
                 for j in start..end {
-                    let mut sum = 0.0f32;
-                    for blk in 0..blocks_per_row {
-                        let bo = (j * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
-                        let block =
-                            unsafe { std::slice::from_raw_parts(bq_ptr.add(bo), Q4K_BLOCK_BYTES) };
-                        let aq = unsafe {
-                            std::slice::from_raw_parts(
-                                q8_ptr.add(blk * Q4K_BLOCK_SIZE),
-                                Q4K_BLOCK_SIZE,
-                            )
-                        };
-                        let a_sc = unsafe { *sc_ptr.add(blk) };
-                        let a_gs = unsafe {
-                            std::slice::from_raw_parts(gs_ptr.add(blk * Q4K_GROUPS), Q4K_GROUPS)
-                        };
-                        sum += if USE_VNNI {
-                            unsafe { q4k_dot_q8_vnni(block, aq, a_sc, a_gs) }
-                        } else {
-                            unsafe { q4k_dot_q8_avx2(block, aq, a_sc, a_gs) }
-                        };
-                    }
+                    let w = unsafe {
+                        std::slice::from_raw_parts(bq_ptr.add(j * bq_row_bytes) as *const BlockQ4K, bpr)
+                    };
+                    let val = unsafe { crate::ggml::quants_llama::ggml_vec_dot_q4_k_q8_k(k, w, act_q8k) };
                     unsafe {
-                        *out_ptr.add(j) = sum;
+                        *out_ptr.add(j) = val;
                     }
                 }
             });
@@ -4739,6 +5362,54 @@ impl CpuMatMulQ4KOpt {
             }
         });
         Ok(())
+    }
+
+    /// Prefill GEMM using pre-repacked Q4Kx8 weights — no per-call repacking.
+    /// Returns true if the maddubs GEMM ran, false if constraints not met (caller must fall back).
+    pub fn forward_prefill_q4kx8(
+        &self,
+        a: &[f32],
+        b_repacked: &[crate::ggml::blocks::BlockQ4Kx8],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if m % 4 == 0
+                && n % 8 == 0
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("f16c")
+                && is_x86_feature_detected!("fma")
+            {
+                use crate::ggml::repack::quantize_mat_q8k_4x8;
+                let packed_a = quantize_mat_q8k_4x8(a, m, k);
+                let blocks_per_row = k / 256;
+                let out_ptr = output.as_mut_ptr();
+                let n_out = n;
+                crate::inference_pool::par_run(n / 8, |start, end| {
+                    let nc_here = (end - start) * 8;
+                    unsafe {
+                        crate::ggml::repack_llama2::ggml_gemm_q4_k_8x8_q8_k(
+                            k,
+                            out_ptr.add(start * 8),
+                            n_out,
+                            (b_repacked.as_ptr() as *const u8).add(
+                                start
+                                    * blocks_per_row
+                                    * std::mem::size_of::<crate::ggml::blocks::BlockQ4Kx8>(),
+                            ),
+                            packed_a.as_ptr() as *const u8,
+                            m,
+                            nc_here,
+                        );
+                    }
+                });
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -4883,56 +5554,37 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
         }
 
-        // m=1 decode fast path: repack weights into BlockQ4Kx8 and run 8-wide GEMV.
-        // Uses maddubs (AVX2, no VNNI). Only beneficial when VNNI is NOT available;
-        // on VNNI CPUs the pair kernel's dpbusd is faster, so fall through to Q4kGemvJob.
-        #[cfg(not(any(target_feature = "avxvnni", target_feature = "avx512vnni")))]
-        if m == 1 && n % 8 == 0 {
-            use crate::ggml::blocks::{BlockQ4K, BlockQ4Kx8};
-            use crate::ggml::repack::repack_q4k_to_q4kx8;
-
-            // Thread-local cache: (weight_ptr, n, bpr) → Vec<BlockQ4Kx8>.
-            // Avoids re-packing every decode call once weights are stable.
-            thread_local! {
-                static Q4KX8_CACHE: std::cell::RefCell<(usize, usize, usize, Vec<BlockQ4Kx8>)> =
-                    const { std::cell::RefCell::new((0, 0, 0, Vec::new())) };
-            }
-
-            let src_ptr = b_quantized.as_ptr() as usize;
-
-            let packed_ready = Q4KX8_CACHE.with(|c| {
-                let cache = c.borrow();
-                cache.0 == src_ptr && cache.1 == n && cache.2 == blocks_per_row
-            });
-
-            if !packed_ready {
-                let src_q4k = unsafe {
-                    std::slice::from_raw_parts(
-                        b_quantized.as_ptr() as *const BlockQ4K,
-                        n * blocks_per_row,
-                    )
-                };
-                let repacked = repack_q4k_to_q4kx8(src_q4k, n, blocks_per_row);
-                Q4KX8_CACHE.with(|c| {
-                    *c.borrow_mut() = (src_ptr, n, blocks_per_row, repacked);
-                });
-            }
-
-            Q4KX8_CACHE.with(|c| {
-                let cache = c.borrow();
-                let packed = &cache.3;
-                let job = Q4kGemvX8Job {
-                    packed_ptr: packed.as_ptr() as *const u8,
-                    q8k_ptr: q8k_all.as_ptr() as *const u8,
-                    out_ptr: output.as_mut_ptr(),
-                    n,
-                    bpr: blocks_per_row,
-                };
-                // Dispatch over n/8 groups; each group handles 8 weight rows.
-                crate::inference_pool::par_run_job(n / 8, &job);
+        // m=1 decode: use ggml_vec_dot_q4_k_q8_k (exact translation of llama.cpp's
+        // ggml_vec_dot_q4_K_q8_K from quants_llama.rs), parallelized over output neurons.
+        // This is what llama.cpp actually uses for decode (profiling confirmed 62% of cycles
+        // in ggml_vec_dot_q4_K_q8_K, NOT the repacked 8x8 path).
+        if m == 1 {
+            use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
+            let w_q4k = unsafe {
+                std::slice::from_raw_parts(b_quantized.as_ptr() as *const BlockQ4K, n * blocks_per_row)
+            };
+            let act_q8k = unsafe {
+                std::slice::from_raw_parts(q8k_all.as_ptr(), blocks_per_row)
+            };
+            let out_ptr = output.as_mut_ptr();
+            let bpr = blocks_per_row;
+            // Parallelize over output neurons (j = 0..n) — same parallelism as Q4kGemvJob
+            crate::inference_pool::par_run(n, |start, end| {
+                for j in start..end {
+                    let w = &w_q4k[j * bpr..(j + 1) * bpr];
+                    let val = unsafe { crate::ggml::quants_llama::ggml_vec_dot_q4_k_q8_k(bpr * 256, w, act_q8k) };
+                    unsafe { *out_ptr.add(j) = val; }
+                }
             });
             return Ok(());
         }
+
+        // m>1 prefill: fall through to Q4kMnBlockJob.
+        // The maddubs 8×8 GEMM (ggml_gemm_q4_k_8x8_q8_k) requires weights to be
+        // pre-repacked to Q4Kx8 format at load time. Per-call repacking costs ~33MB/matrix
+        // for each of 196 calls (28 layers × 7 projections per token), making it 4× slower
+        // than the reference path (91 tok/s → 23 tok/s). Enable only when pre-repacked
+        // weights are stored in LayerQ4KWeights.
 
         let job = Q4kMnBlockJob {
             bq_ptr: b_quantized.as_ptr(),
@@ -4993,22 +5645,41 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                 const { std::cell::UnsafeCell::new(Vec::new()) };
         }
 
-        // llama.cpp translation:
-        // llama.cpp translation: Q8_K activations × Q6_K weights via vec_dot_q6_K_q8_K.
-        #[cfg(feature = "openmp")]
-        if m == 1 {
-            use crate::ggml::blocks::BlockQ8K;
-            let a_row = &a[0..k];
-            let mut q8k_buf = vec![unsafe { std::mem::zeroed::<BlockQ8K>() }; blocks_per_row];
+        // Pre-quantize all m activation rows to Q8K
+        let mut q8k_all: Vec<crate::ggml::blocks::BlockQ8K> =
+            vec![unsafe { std::mem::zeroed() }; m * blocks_per_row];
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+            let dst = &mut q8k_all[i * blocks_per_row..(i + 1) * blocks_per_row];
             #[cfg(target_arch = "x86_64")]
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                unsafe { crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, &mut q8k_buf) };
+                unsafe { crate::ggml::vec_dot_avx2::quantize_row_q8_k_avx2(a_row, dst) };
             } else {
-                crate::ggml::quantize::quantize_row_q8_k(a_row, &mut q8k_buf);
+                crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
             }
             #[cfg(not(target_arch = "x86_64"))]
-            crate::ggml::quantize::quantize_row_q8_k(a_row, &mut q8k_buf);
-            crate::openmp_gemv::openmp::gemv_q6k(b_quantized, &q8k_buf, output, n, blocks_per_row);
+            crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
+        }
+
+        // m=1 Q6K decode: ggml_vec_dot_q6_k_q8_k (exact translation of llama.cpp),
+        // parallelized over output neurons.
+        if m == 1 {
+            use crate::ggml::blocks::BlockQ6K;
+            let w_q6k = unsafe {
+                std::slice::from_raw_parts(b_quantized.as_ptr() as *const BlockQ6K, n * blocks_per_row)
+            };
+            let act_q8k = unsafe {
+                std::slice::from_raw_parts(q8k_all.as_ptr(), blocks_per_row)
+            };
+            let out_ptr = output.as_mut_ptr();
+            let bpr = blocks_per_row;
+            crate::inference_pool::par_run(n, |start, end| {
+                for j in start..end {
+                    let w = &w_q6k[j * bpr..(j + 1) * bpr];
+                    let val = unsafe { crate::ggml::quants_llama::ggml_vec_dot_q6_k_q8_k(bpr * 256, w, act_q8k) };
+                    unsafe { *out_ptr.add(j) = val; }
+                }
+            });
             return Ok(());
         }
         #[cfg(feature = "openmp")]
@@ -5058,6 +5729,106 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             #[cfg(not(target_arch = "x86_64"))]
             crate::ggml::quantize::quantize_row_q8_k(a_row, dst);
         }
+
+        // m=1 decode fast path: repack weights into BlockQ6Kx8 (interleave_block=8)
+        // and run 8-wide scalar GEMV (ggml_gemv_q6_k_8x8_q8_k). Requires n%8==0.
+        if m == 1 && n % 8 == 0 {
+            use crate::ggml::blocks::{BlockQ6K, BlockQ6Kx8};
+            use crate::ggml::repack_llama::repack_q6_k_to_q6_k_8_bl;
+
+            thread_local! {
+                static Q6KX8_GEMV_CACHE: std::cell::RefCell<(usize, usize, usize, Vec<BlockQ6Kx8>)> =
+                    const { std::cell::RefCell::new((0, 0, 0, Vec::new())) };
+            }
+
+            let src_ptr = b_quantized.as_ptr() as usize;
+            let packed_ready = Q6KX8_GEMV_CACHE.with(|c| {
+                let cache = c.borrow();
+                cache.0 == src_ptr && cache.1 == n && cache.2 == blocks_per_row
+            });
+            if !packed_ready {
+                let src_q6k = unsafe {
+                    std::slice::from_raw_parts(
+                        b_quantized.as_ptr() as *const BlockQ6K,
+                        n * blocks_per_row,
+                    )
+                };
+                let mut repacked = Vec::new();
+                repack_q6_k_to_q6_k_8_bl(src_q6k, n, blocks_per_row, 8, &mut repacked)
+                    .expect("Q6K GEMV repack: n must be divisible by 8");
+                Q6KX8_GEMV_CACHE.with(|c| {
+                    *c.borrow_mut() = (src_ptr, n, blocks_per_row, repacked);
+                });
+            }
+
+            Q6KX8_GEMV_CACHE.with(|c| {
+                let cache = c.borrow();
+                let packed = &cache.3;
+                let job = Q6kGemvX8Job {
+                    packed_ptr: packed.as_ptr() as *const u8,
+                    q8k_ptr: q8k_all.as_ptr() as *const u8,
+                    out_ptr: output.as_mut_ptr(),
+                    bpr: blocks_per_row,
+                    k,
+                };
+                crate::inference_pool::par_run_job(n / 8, &job);
+            });
+            return Ok(());
+        }
+
+        // m>1 prefill fast path: repack weights into BlockQ6Kx8 (interleave_block=4)
+        // and activations into BlockQ8Kx4, then run ggml_gemm_q6_k_8x4_q8_k.
+        // Requires m%4==0 and n%8==0.
+        if m % 4 == 0 && n % 8 == 0 {
+            use crate::ggml::blocks::{BlockQ6K, BlockQ6Kx8};
+            use crate::ggml::repack::{quantize_mat_q8k_4x4};
+            use crate::ggml::repack_llama::{repack_q6_k_to_q6_k_8_bl, ggml_gemm_q6_k_8x4_q8_k};
+
+            thread_local! {
+                static Q6KX8_GEMM_CACHE: std::cell::RefCell<(usize, usize, usize, Vec<BlockQ6Kx8>)> =
+                    const { std::cell::RefCell::new((0, 0, 0, Vec::new())) };
+            }
+
+            let src_ptr = b_quantized.as_ptr() as usize;
+            let packed_ready = Q6KX8_GEMM_CACHE.with(|c| {
+                let cache = c.borrow();
+                cache.0 == src_ptr && cache.1 == n && cache.2 == blocks_per_row
+            });
+            if !packed_ready {
+                let src_q6k = unsafe {
+                    std::slice::from_raw_parts(
+                        b_quantized.as_ptr() as *const BlockQ6K,
+                        n * blocks_per_row,
+                    )
+                };
+                let mut repacked = Vec::new();
+                repack_q6_k_to_q6_k_8_bl(src_q6k, n, blocks_per_row, 4, &mut repacked)
+                    .expect("Q6K GEMM repack: n must be divisible by 8");
+                Q6KX8_GEMM_CACHE.with(|c| {
+                    *c.borrow_mut() = (src_ptr, n, blocks_per_row, repacked);
+                });
+            }
+
+            let packed_a = quantize_mat_q8k_4x4(a, m, k);
+
+            Q6KX8_GEMM_CACHE.with(|c| {
+                let cache = c.borrow();
+                let packed_w = &cache.3;
+                unsafe {
+                    ggml_gemm_q6_k_8x4_q8_k(
+                        k,
+                        output.as_mut_ptr(),
+                        n,
+                        packed_w.as_ptr() as *const u8,
+                        packed_a.as_ptr() as *const u8,
+                        m,
+                        n,
+                    );
+                }
+            });
+            return Ok(());
+        }
+
         let job = Q6kMnTiledJob {
             bq_ptr: b_quantized.as_ptr(),
             q8k_ptr: q8k_all.as_ptr() as *const u8,
@@ -7437,6 +8208,59 @@ mod tests {
     }
 
     #[test]
+    fn test_q6k_opt_vs_scalar_prefill() {
+        // Exercises the m%4==0 && n%8==0 GEMM fast path.
+        let k = 256;
+        let m = 4;
+        let n = 8;
+
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 23) as f32) * 0.03 - 0.3)
+            .collect();
+
+        let blocks_per_row = k / Q6K_BLOCK_SIZE;
+        let mut b_q = vec![0u8; n * blocks_per_row * Q6K_BLOCK_BYTES];
+        for blk in 0..(n * blocks_per_row) {
+            let base = blk * Q6K_BLOCK_BYTES;
+            for i in 0..128 {
+                b_q[base + i] = ((blk * 128 + i) * 7 % 256) as u8;
+            }
+            for i in 0..64 {
+                b_q[base + 128 + i] = ((blk * 64 + i) * 13 % 256) as u8;
+            }
+            for i in 0..16 {
+                b_q[base + 192 + i] = ((blk * 16 + i) * 11 % 127) as u8;
+            }
+            let d_bits = half::f16::from_f32(0.001).to_bits();
+            b_q[base + 208] = d_bits as u8;
+            b_q[base + 209] = (d_bits >> 8) as u8;
+        }
+
+        let ref_kernel = CpuMatMulQ4K;
+        let opt_kernel = CpuMatMulQ4KOpt;
+
+        let mut out_ref = vec![0.0f32; m * n];
+        let mut out_opt = vec![0.0f32; m * n];
+
+        ref_kernel
+            .forward_b_transposed_q6k(&a, &b_q, &mut out_ref, m, n, k)
+            .unwrap();
+        opt_kernel
+            .forward_b_transposed_q6k(&a, &b_q, &mut out_opt, m, n, k)
+            .unwrap();
+
+        let max_diff: f32 = out_ref
+            .iter()
+            .zip(&out_opt)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        let max_abs = out_ref.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let rel_tol = if max_abs > 0.0 { max_diff / max_abs } else { max_diff };
+        eprintln!("  Q6K prefill: max_diff={max_diff:.6}, max_abs={max_abs:.6}, rel={rel_tol:.4}");
+        assert!(rel_tol < 0.05, "Q6K prefill GEMM: rel_tol={rel_tol:.4}");
+    }
+
+    #[test]
     fn test_tq2_encode_decode_roundtrip() {
         let mut values = [0.0f32; TQ2_BLOCK_SIZE];
         for i in 0..TQ2_BLOCK_SIZE {
@@ -7849,6 +8673,77 @@ mod tests {
             let i2s_us = start.elapsed().as_micros() as f64 / iters as f64;
             eprintln!("({n},{k}) I2S-VNNI: {i2s_us:.0}μs/iter");
         }
+    }
+
+    fn make_q4k_prefill_weights(n: usize, k: usize, seed: usize) -> Vec<u8> {
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let mut b_q = vec![0u8; n * blocks_per_row * Q4K_BLOCK_BYTES];
+        for blk in 0..(n * blocks_per_row) {
+            let base = blk * Q4K_BLOCK_BYTES;
+            let d_bits = half::f16::from_f32(0.001 + (blk % 7) as f32 * 0.0001).to_bits();
+            b_q[base] = d_bits as u8;
+            b_q[base + 1] = (d_bits >> 8) as u8;
+            let dmin_bits = half::f16::from_f32(0.0005).to_bits();
+            b_q[base + 2] = dmin_bits as u8;
+            b_q[base + 3] = (dmin_bits >> 8) as u8;
+            for i in 4..Q4K_BLOCK_BYTES {
+                b_q[base + i] = ((blk * seed + i * 11) % 256) as u8;
+            }
+        }
+        b_q
+    }
+
+    // Verify ggml_gemm_q4_k_8x8_q8_k (m%4==0, n%8==0 path) matches reference kernel.
+    #[test]
+    fn test_q4k_gemm_prefill_correctness() {
+        let m = 4;
+        let n = 8;
+        let k = 256;
+
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.003 - 0.5).clamp(-1.0, 1.0))
+            .collect();
+        let b_q = make_q4k_prefill_weights(n, k, 37);
+
+        let ref_kernel = CpuMatMulQ4K;
+        let opt_kernel = CpuMatMulQ4KOpt;
+        let mut out_ref = vec![0.0f32; m * n];
+        let mut out_opt = vec![0.0f32; m * n];
+
+        ref_kernel.forward_b_transposed_q4k(&a, &b_q, &mut out_ref, m, n, k).unwrap();
+        opt_kernel.forward_b_transposed_q4k(&a, &b_q, &mut out_opt, m, n, k).unwrap();
+
+        for i in 0..m * n {
+            let diff = (out_ref[i] - out_opt[i]).abs();
+            let tol = 0.05 * out_ref[i].abs().max(0.01);
+            assert!(
+                diff <= tol,
+                "mismatch at [{i}]: ref={}, opt={}, diff={diff}",
+                out_ref[i], out_opt[i]
+            );
+        }
+    }
+
+    // Verify prefill-length sequences (m=128) do not crash.
+    #[test]
+    fn test_q4k_gemm_prefill_large_m() {
+        let m = 128;
+        let n = 256;
+        let k = 512;
+
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.0001 - 0.5).clamp(-1.0, 1.0))
+            .collect();
+        let b_q = make_q4k_prefill_weights(n, k, 37);
+
+        let opt_kernel = CpuMatMulQ4KOpt;
+        let mut out = vec![0.0f32; m * n];
+        opt_kernel.forward_b_transposed_q4k(&a, &b_q, &mut out, m, n, k).unwrap();
+
+        assert!(
+            out.iter().all(|x| x.is_finite()),
+            "output has non-finite values for m={m}, n={n}, k={k}"
+        );
     }
 }
 
@@ -8887,5 +9782,45 @@ mod kani_q2_lut {
         let n_tiles = (n + bm - 1) / bm;
         assert!(n_tiles * bm >= n);
         assert!((n_tiles - 1) * bm < n);
+    }
+}
+
+#[cfg(test)]
+mod gemm_sigsegv_repro {
+    use super::*;
+
+    #[test]
+    fn test_gemm_large_m_no_crash() {
+        let m = 128; // longer sequence
+        let n = 4096; // typical LLaMA FFN dim
+        let k = 4096; // typical hidden dim
+
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.0001 - 0.5).clamp(-1.0, 1.0))
+            .collect();
+
+        let blocks_per_row = k / Q4K_BLOCK_SIZE;
+        let mut b_q = vec![0u8; n * blocks_per_row * Q4K_BLOCK_BYTES];
+        for blk in 0..(n * blocks_per_row) {
+            let base = blk * Q4K_BLOCK_BYTES;
+            let d_bits = half::f16::from_f32(0.001).to_bits();
+            b_q[base] = d_bits as u8;
+            b_q[base + 1] = (d_bits >> 8) as u8;
+            let dmin_bits = half::f16::from_f32(0.0005).to_bits();
+            b_q[base + 2] = dmin_bits as u8;
+            b_q[base + 3] = (dmin_bits >> 8) as u8;
+            for i in 4..Q4K_BLOCK_BYTES {
+                b_q[base + i] = ((blk * 37 + i * 11) % 256) as u8;
+            }
+        }
+
+        let opt_kernel = CpuMatMulQ4KOpt;
+        let mut out = vec![0.0f32; m * n];
+        opt_kernel
+            .forward_b_transposed_q4k(&a, &b_q, &mut out, m, n, k)
+            .unwrap();
+
+        let all_finite = out.iter().all(|x| x.is_finite());
+        assert!(all_finite, "output contains non-finite values for m={m}, n={n}, k={k}");
     }
 }

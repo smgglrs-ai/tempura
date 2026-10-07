@@ -2,10 +2,12 @@ pub use tempura_kernel_api::{
     AllReduce, Attention, AttentionMode, CompressedKV, DeltaNet, Dequantize, GuidedDecoder,
     KernelError, KvCacheCompressor, LayerNorm, MatMul, MatMulQ, QuantDtype, QuantizedTensor,
     RMSNorm, Result, RoPE, Sampler, SamplingParams, VerificationTier, I2S_BLOCK_BYTES,
-    I2S_BLOCK_SIZE, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE, Q6K_BLOCK_BYTES,
+    I2S_BLOCK_SIZE, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE, Q4K_GROUPS, Q4K_GROUP_SIZE,
+    Q5K_BLOCK_BYTES, Q5K_BLOCK_SIZE, Q6K_BLOCK_BYTES,
     Q6K_BLOCK_SIZE, Q6K_GROUPS, Q6K_GROUP_SIZE, TQ2_BLOCK_BYTES, TQ2_BLOCK_SIZE,
 };
 
+pub use ggml::kernel_table;
 pub mod activations;
 pub mod allreduce;
 pub mod attention;

@@ -1709,3 +1709,29 @@ mod kani_proofs {
         assert!(idx < 128);
     }
 }
+
+// ── From ggml-quants.c:439 ────────────────────────────────────────────────
+pub fn dequantize_row_q2_0(blocks: &[BlockQ2_0], output: &mut [f32]) {
+    const QK: usize = 64;
+    assert_eq!(output.len(), blocks.len() * QK);
+    for (i, blk) in blocks.iter().enumerate() {
+        let d = f16_to_f32(blk.d);
+        for j in 0..QK {
+            let byte_index = j / 4;
+            let bit_offset = (j % 4) * 2;
+            let q = ((blk.qs[byte_index] >> bit_offset) & 0x03) as i32;
+            output[i * QK + j] = (q - 1) as f32 * d;
+        }
+    }
+}
+
+// ── From ggml-quants.c:2807 ───────────────────────────────────────────────
+pub fn dequantize_row_q8_k(blocks: &[BlockQ8K], output: &mut [f32]) {
+    const QK: usize = 256;
+    assert_eq!(output.len(), blocks.len() * QK);
+    for (i, blk) in blocks.iter().enumerate() {
+        for j in 0..QK {
+            output[i * QK + j] = blk.d * blk.qs[j] as f32;
+        }
+    }
+}

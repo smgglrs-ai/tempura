@@ -359,6 +359,72 @@ pub enum RoPEMode {
     NeoX,
 }
 
+/// Precomputed sin/cos table for all positions and dimension pairs.
+///
+/// Layout: cos[pos * half_dim + dim_idx] and sin[pos * half_dim + dim_idx].
+/// Matches `CpuRoPEUnified`'s theta accumulation: theta = pos * base^(-2i/n_dims).
+#[cfg(feature = "cpu")]
+pub struct RopeCache {
+    pub cos: Vec<f32>,
+    pub sin: Vec<f32>,
+    pub max_positions: usize,
+    pub half_dim: usize,
+}
+
+#[cfg(feature = "cpu")]
+impl RopeCache {
+    pub fn new(
+        half_dim: usize,
+        max_positions: usize,
+        freq_base: f32,
+        freq_scale: f32,
+        ext_factor: f32,
+        attn_factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        original_max_position: usize,
+        freq_factors: Option<&[f32]>,
+    ) -> Self {
+        let n_dims = half_dim * 2;
+        let theta_scale: f32 = freq_base.powf(-2.0 / n_dims as f32);
+        let corr_dims = if ext_factor != 0.0 {
+            yarn_corr_dims(n_dims, original_max_position, freq_base, beta_fast, beta_slow)
+        } else {
+            [0.0, 0.0]
+        };
+
+        let mut cos = Vec::with_capacity(max_positions * half_dim);
+        let mut sin = Vec::with_capacity(max_positions * half_dim);
+
+        for pos in 0..max_positions {
+            let mut theta = pos as f32;
+            for i in 0..half_dim {
+                let ff = freq_factors.map_or(1.0, |ff| ff[i]);
+                let theta_extrap = theta / ff;
+                let (cv, sv) = if ext_factor != 0.0 {
+                    rope_yarn(theta_extrap, freq_scale, &corr_dims, i * 2, ext_factor, attn_factor)
+                } else if freq_scale != 1.0 {
+                    let scaled = freq_scale * theta_extrap;
+                    (scaled.cos(), scaled.sin())
+                } else {
+                    (theta_extrap.cos(), theta_extrap.sin())
+                };
+                cos.push(cv);
+                sin.push(sv);
+                theta *= theta_scale;
+            }
+        }
+
+        Self { cos, sin, max_positions, half_dim }
+    }
+
+    #[inline(always)]
+    pub fn get(&self, pos: usize, dim_idx: usize) -> (f32, f32) {
+        let idx = pos * self.half_dim + dim_idx;
+        (self.cos[idx], self.sin[idx])
+    }
+}
+
 /// Unified RoPE matching ggml's algorithm for both Normal and NeoX modes.
 ///
 /// Supports partial n_dims, per-dimension freq_factors (LLaMA 3.1),
@@ -387,6 +453,9 @@ pub struct CpuRoPEUnified {
     pub beta_slow: f32,
     /// Original context length before extension.
     pub original_max_position: usize,
+    /// Precomputed sin/cos table built at model load time.
+    /// When set, `forward()` does table lookups instead of computing sin/cos per token.
+    pub precomputed: Option<std::sync::Arc<RopeCache>>,
 }
 
 #[cfg(feature = "cpu")]
@@ -402,7 +471,23 @@ impl CpuRoPEUnified {
             beta_fast: 32.0,
             beta_slow: 1.0,
             original_max_position: 4096,
+            precomputed: None,
         }
+    }
+
+    pub fn build_cache(&mut self, max_positions: usize, freq_base: f32) {
+        self.precomputed = Some(std::sync::Arc::new(RopeCache::new(
+            self.n_dims / 2,
+            max_positions,
+            freq_base,
+            self.freq_scale,
+            self.ext_factor,
+            self.attn_factor,
+            self.beta_fast,
+            self.beta_slow,
+            self.original_max_position,
+            self.freq_factors.as_deref(),
+        )));
     }
 }
 
@@ -441,6 +526,43 @@ impl RoPE for CpuRoPEUnified {
         } else {
             [0.0, 0.0]
         };
+
+        if let Some(ref cache) = self.precomputed {
+            for s in 0..seq_len {
+                let pos = positions[s] as usize;
+                debug_assert!(
+                    pos < cache.max_positions,
+                    "RoPE position {} exceeds cache size {}",
+                    pos,
+                    cache.max_positions
+                );
+                for h in 0..num_heads {
+                    let offset = (s * num_heads + h) * head_dim;
+                    match self.mode {
+                        RoPEMode::Normal => {
+                            for i in 0..half_n {
+                                let (cos_val, sin_val) = cache.get(pos, i);
+                                let i0 = i * 2;
+                                let x0 = x[offset + i0];
+                                let x1 = x[offset + i0 + 1];
+                                x[offset + i0] = x0 * cos_val - x1 * sin_val;
+                                x[offset + i0 + 1] = x0 * sin_val + x1 * cos_val;
+                            }
+                        }
+                        RoPEMode::NeoX => {
+                            for i in 0..half_n {
+                                let (cos_val, sin_val) = cache.get(pos, i);
+                                let x0 = x[offset + i];
+                                let x1 = x[offset + i + half_n];
+                                x[offset + i] = x0 * cos_val - x1 * sin_val;
+                                x[offset + i + half_n] = x0 * sin_val + x1 * cos_val;
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
 
         for s in 0..seq_len {
             let p = positions[s] as f32;
@@ -1674,6 +1796,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_rope_cache_matches_onthefly_neox() {
+        let head_dim = 8;
+        let max_pos = 16;
+        let freq_base = 10000.0f32;
+        let cache = RopeCache::new(head_dim / 2, max_pos, freq_base, 1.0, 0.0, 1.0, 32.0, 1.0, max_pos, None);
+
+        let mut rope_cached = CpuRoPEUnified::new(RoPEMode::NeoX, head_dim);
+        rope_cached.precomputed = Some(std::sync::Arc::new(cache));
+
+        let rope_onthefly = CpuRoPEUnified::new(RoPEMode::NeoX, head_dim);
+
+        for pos in [0u32, 1, 3, 7, 15] {
+            let orig: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+            let positions = vec![pos];
+
+            let mut x_cached = orig.clone();
+            rope_cached.forward(&mut x_cached, 1, 1, 1, head_dim, &positions, freq_base).unwrap();
+
+            let mut x_onthefly = orig.clone();
+            rope_onthefly.forward(&mut x_onthefly, 1, 1, 1, head_dim, &positions, freq_base).unwrap();
+
+            for (i, (a, b)) in x_cached.iter().zip(x_onthefly.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "cached vs on-the-fly mismatch at pos={pos} dim={i}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rope_cache_matches_onthefly_normal() {
+        let head_dim = 8;
+        let max_pos = 16;
+        let freq_base = 10000.0f32;
+        let cache = RopeCache::new(head_dim / 2, max_pos, freq_base, 1.0, 0.0, 1.0, 32.0, 1.0, max_pos, None);
+
+        let mut rope_cached = CpuRoPEUnified::new(RoPEMode::Normal, head_dim);
+        rope_cached.precomputed = Some(std::sync::Arc::new(cache));
+
+        let rope_onthefly = CpuRoPEUnified::new(RoPEMode::Normal, head_dim);
+
+        for pos in [0u32, 1, 5, 10] {
+            let orig: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.2).collect();
+            let positions = vec![pos];
+
+            let mut x_cached = orig.clone();
+            rope_cached.forward(&mut x_cached, 1, 1, 1, head_dim, &positions, freq_base).unwrap();
+
+            let mut x_onthefly = orig.clone();
+            rope_onthefly.forward(&mut x_onthefly, 1, 1, 1, head_dim, &positions, freq_base).unwrap();
+
+            for (i, (a, b)) in x_cached.iter().zip(x_onthefly.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "cached vs on-the-fly mismatch at pos={pos} dim={i}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rope_cache_build_cache_method() {
+        let head_dim = 8;
+        let freq_base = 10000.0f32;
+
+        let mut rope = CpuRoPEUnified::new(RoPEMode::NeoX, head_dim);
+        rope.build_cache(64, freq_base);
+        assert!(rope.precomputed.is_some());
+
+        let cache = rope.precomputed.as_ref().unwrap();
+        assert_eq!(cache.max_positions, 64);
+        assert_eq!(cache.half_dim, head_dim / 2);
+        assert_eq!(cache.cos.len(), 64 * head_dim / 2);
+        assert_eq!(cache.sin.len(), 64 * head_dim / 2);
+
+        let (cv, sv) = cache.get(0, 0);
+        assert!((cv - 1.0).abs() < 1e-6, "cos(0) should be 1.0, got {cv}");
+        assert!(sv.abs() < 1e-6, "sin(0) should be 0.0, got {sv}");
     }
 }
 

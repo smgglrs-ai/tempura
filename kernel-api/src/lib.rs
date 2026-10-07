@@ -365,6 +365,9 @@ pub const Q4K_BLOCK_BYTES: usize = 144;
 pub const Q4K_GROUPS: usize = 8;
 pub const Q4K_GROUP_SIZE: usize = 32;
 
+pub const Q5K_BLOCK_SIZE: usize = 256;
+pub const Q5K_BLOCK_BYTES: usize = 176;
+
 pub const Q6K_BLOCK_SIZE: usize = 256;
 pub const Q6K_BLOCK_BYTES: usize = 210;
 pub const Q6K_GROUPS: usize = 16;
