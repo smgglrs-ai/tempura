@@ -1893,7 +1893,7 @@ where
             && alibi_attn.is_none()
             && softcap_attn.is_none()
             && !cfg.use_alibi
-            && cfg.rope_dim.is_none()
+            && cfg.rope_dim.map_or(true, |rd| rd == head_dim)
             && det_rmsnorm.is_none()
             && cfg.rope_scaling.is_none()
             && layernorm.is_none()
@@ -2445,16 +2445,16 @@ where
             && alibi_attn.is_none()
             && softcap_attn.is_none()
             && !cfg.use_alibi
-            && cfg.rope_dim.is_none()
+            && cfg.rope_dim.map_or(true, |rd| rd == head_dim)
             && det_rmsnorm.is_none()
             && cfg.rope_scaling.is_none()
             && layernorm.is_none()
             && (0..cfg.num_layers).all(|l| {
                 let il = &indexed_layers[l];
-                let ok_q = il.q_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_f16().is_some()).unwrap_or(false);
-                let ok_k = il.k_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_f16().is_some()).unwrap_or(false);
-                let ok_v = il.v_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_f16().is_some()).unwrap_or(false);
-                let ok_o = il.o_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_f16().is_some()).unwrap_or(false);
+                let ok_q = il.q_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q5k().is_some() || w.as_q6k().is_some() || w.as_f16().is_some()).unwrap_or(false);
+                let ok_k = il.k_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q5k().is_some() || w.as_q6k().is_some() || w.as_f16().is_some()).unwrap_or(false);
+                let ok_v = il.v_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q5k().is_some() || w.as_q6k().is_some() || w.as_f16().is_some()).unwrap_or(false);
+                let ok_o = il.o_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q5k().is_some() || w.as_q6k().is_some() || w.as_f16().is_some()).unwrap_or(false);
                 let ok_gate = il.gate_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false);
                 let ok_up   = il.up_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false);
                 let ok_down = il.down_proj.as_ref().map(|w| w.as_q4k().is_some() || w.as_q6k().is_some()).unwrap_or(false);
@@ -2508,7 +2508,7 @@ where
             // Build per-layer weight dispatch table
             struct GpLayerWeights { qw: usize, kw: usize, vw: usize, ow: usize,
                 gw: usize, uw: usize, dw: usize,
-                q_is_q4k: bool, k_is_q4k: bool, v_is_q4k: bool, o_is_q4k: bool,
+                q_is_q4k: bool, k_is_q4k: bool, v_is_q4k: bool, v_is_q6k: bool, o_is_q4k: bool,
                 gate_is_q4k: bool, up_is_q4k: bool, down_is_q4k: bool,
                 // Repacked Q4Kx8 weight pointers (0 = not available)
                 qx8: usize, kx8: usize, ox8: usize, gx8: usize, ux8: usize,
@@ -2533,6 +2533,7 @@ where
                 let (uw, up_is_q4k)   = resolve(il.up_proj.as_ref().unwrap());
                 let (dw, down_is_q4k) = resolve(il.down_proj.as_ref().unwrap());
                 let v_is_q4k = il.v_proj.as_ref().map(|w| w.as_q4k().is_some()).unwrap_or(false);
+                let v_is_q6k = !v_is_q4k && il.v_proj.as_ref().map(|w| w.as_q6k().is_some() || w.as_q5k().is_some()).unwrap_or(false);
                 let x8ptr = |opt: Option<&[tempura_kernels::ggml::blocks::BlockQ4Kx8]>| {
                     opt.map(|s| s.as_ptr() as usize).unwrap_or(0)
                 };
@@ -2541,7 +2542,7 @@ where
                 };
                 GpLayerWeights {
                     qw, kw, vw, ow, gw, uw, dw,
-                    q_is_q4k, k_is_q4k, v_is_q4k, o_is_q4k,
+                    q_is_q4k, k_is_q4k, v_is_q4k, v_is_q6k, o_is_q4k,
                     gate_is_q4k, up_is_q4k, down_is_q4k,
                     qx8: x8ptr(il.q_proj_x8),
                     kx8: x8ptr(il.k_proj_x8),
@@ -2656,12 +2657,15 @@ where
                                     m_cap, kv_dim_cap, bpr_h, h_cap, kj_s, kj_e); }
                             }
                         }
-                        // V (may be F16; KV projections don't have x8 repacking)
+                        // V (may be Q4K, Q6K, or F16; KV projections don't have x8 repacking)
                         let vj_s = j_start.saturating_sub(q_dim_cap + kv_dim_cap).min(kv_dim_cap);
                         let vj_e = j_end.saturating_sub(q_dim_cap + kv_dim_cap).min(kv_dim_cap);
                         if vj_s < vj_e {
                             if lw.v_is_q4k {
                                 unsafe { q4k_prefill_gemm_range(lw.vw as *const u8, q8k_act, vp as *mut f32,
+                                    m_cap, kv_dim_cap, bpr_h, h_cap, vj_s, vj_e); }
+                            } else if lw.v_is_q6k {
+                                unsafe { q6k_prefill_gemm_range(lw.vw as *const u8, q8k_act, vp as *mut f32,
                                     m_cap, kv_dim_cap, bpr_h, h_cap, vj_s, vj_e); }
                             } else {
                                 let nrm = unsafe { std::slice::from_raw_parts(nrmp as *const f32, m_cap * h_cap) };
