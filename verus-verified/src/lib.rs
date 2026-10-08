@@ -99,3 +99,4 @@ pub mod weight_shapes;
 pub mod q2_gemv_rows;
 pub mod attention_decode;
 pub mod q2_lut_tiles;
+pub mod parallel_accumulator;

@@ -236,6 +236,7 @@ MODULES=(
     q2_gemv_rows
     attention_decode
     q2_lut_tiles
+    parallel_accumulator
 )
 
 TOTAL_VERIFIED=0
