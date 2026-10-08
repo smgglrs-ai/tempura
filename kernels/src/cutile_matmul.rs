@@ -729,7 +729,11 @@ impl CutileMatMul {
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-        Ok(Arc::new(z.unpartition()))
+        let flat = z
+            .unpartition()
+            .reshape(&[m * n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(flat))
     }
 
     /// Non-blocking variant of `forward_bt_d2d_into`.
@@ -829,7 +833,13 @@ impl CutileMatMul {
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-        Ok(Arc::new(z.unpartition()))
+        // Flatten to rank-1 [m*n] so callers (elementwise, RoPE, etc.) get a
+        // single-stride tensor regardless of whether m==1 or m>1.
+        let flat = z
+            .unpartition()
+            .reshape(&[m * n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(flat))
     }
 
     /// Device-to-device GEMV for the M=1 decode path.
@@ -951,7 +961,13 @@ impl CutileMatMul {
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-        Ok(Arc::new(z.unpartition()))
+        // Explicit reshape to rank-1 [n]: unpartition() may leave partition
+        // stride metadata that cuTile counts as a second stride (rank-2).
+        let out = z
+            .unpartition()
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(out))
     }
 
     /// Coalesced device-to-device GEMV reusing a pre-allocated output buffer.
@@ -987,7 +1003,11 @@ impl CutileMatMul {
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-        Ok(Arc::new(z.unpartition()))
+        let out = z
+            .unpartition()
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(out))
     }
 
     /// Non-blocking coalesced GEMV reusing a pre-allocated output buffer.

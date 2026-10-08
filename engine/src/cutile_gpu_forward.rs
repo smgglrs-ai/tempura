@@ -156,13 +156,26 @@ impl CutileGpuModel {
     ///
     /// Returns `None` if the tensor is not present in `qw`.
     fn dequantize(qw: &QuantizedWeights, name: &str, n_elements: usize) -> Option<Vec<f32>> {
+        use tempura_kernels::ggml::dequantize::dequantize_to_f32;
+        use tempura_kernels::ggml::GgmlType;
         if let Some(f32_data) = qw.get_f32(name) {
             return Some(f32_data.to_vec());
         }
         if let Some((dtype, bytes)) = qw.get_typed(name) {
-            return Some(tempura_kernels::ggml::dequantize::dequantize_to_f32(
-                dtype, bytes, n_elements,
-            ));
+            return Some(dequantize_to_f32(dtype, bytes, n_elements));
+        }
+        // mmap-resident quantized tensors — not in typed_tensors.
+        if let Some(bytes) = qw.get_q4k(name) {
+            return Some(dequantize_to_f32(GgmlType::Q4K, bytes, n_elements));
+        }
+        if let Some(bytes) = qw.get_q6k(name) {
+            return Some(dequantize_to_f32(GgmlType::Q6K, bytes, n_elements));
+        }
+        if let Some(bytes) = qw.get_q2(name) {
+            return Some(crate::gguf_loader::dequant_q2_0_pub(bytes, n_elements));
+        }
+        if let Some(bytes) = qw.get_f16(name) {
+            return Some(dequantize_to_f32(GgmlType::F16, bytes, n_elements));
         }
         None
     }
@@ -968,16 +981,13 @@ impl CutileGpuModel {
 
             // ── 2b. QKV projections — device-to-device ───────────────────────
             // normed_dev is already [seq_len, h_pad] — directly usable by gemm_d2d.
-            // Submit all three without syncing between them — the stream
-            // executes them in order. One sync replaces three.
-            // SAFETY: sync_stream() is called immediately below before any CPU read.
-            let q_dev =
-                unsafe { self.submit_gemm_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q) };
-            let k_dev =
-                unsafe { self.submit_gemm_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K) };
-            let v_dev =
-                unsafe { self.submit_gemm_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V) };
-            self.matmul.sync_stream().expect("QKV sync failed");
+            // Use synchronous gemm_d2d_slot: the coalesced GEMV (m=1) returns a
+            // rank-1 tensor required by the RoPE kernel.  The async submit path
+            // falls back to forward_bt_device_to_device (rank-2) when the async
+            // JIT has not yet been compiled, breaking the RoPE deinterleave kernel.
+            let q_dev = self.gemm_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q);
+            let k_dev = self.gemm_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K);
+            let v_dev = self.gemm_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V);
 
             // ── 2c. RoPE (GPU) — rotate Q and K entirely on device ───────────
             // cos/sin tables (tiny: seq_len × n_heads × head_dim/2 floats each)

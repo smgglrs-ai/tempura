@@ -273,6 +273,7 @@ impl CutileRoPE {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .partition([half]);
 
+        // GEMM/GEMV callers now guarantee x_dev is rank-1 [num_sh * head_dim].
         let generics = vec![half.to_string()];
         let (x_first_dev, x_second_dev, _x) =
             kernels::cutile_deinterleave(x_first_t, x_second_t, x_dev.clone())

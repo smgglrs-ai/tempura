@@ -69,12 +69,14 @@ fn main() {
     );
 
     // --- Build model and load weights ---
+    // Use load_quantized so that mmap-resident Q4K/Q6K tensors are wired
+    // directly into QuantizedWeights without going through the WeightLoader
+    // trait (which only sees pre-dequantized f32 tensors).
     println!("\nUploading weights to GPU…");
     let t1 = Instant::now();
+    let qw = loader.to_quantized_weights();
     let mut wrapper = CutileInferenceWrapper::new(config.clone());
-    wrapper
-        .load_weights(&loader)
-        .expect("failed to load weights");
+    wrapper.load_quantized(qw);
     let load_elapsed = t1.elapsed().as_secs_f64();
     let parse_elapsed = t0.elapsed().as_secs_f64() - load_elapsed;
     println!("  Loaded in {:.2}s", load_elapsed);

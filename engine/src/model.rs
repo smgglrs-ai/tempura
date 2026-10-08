@@ -9008,6 +9008,47 @@ impl CutileInferenceWrapper {
             gpu_kv_cache: None::<std::sync::Mutex<_>>,
         }
     }
+
+    /// Load weights from a pre-built [`QuantizedWeights`] (e.g. from
+    /// [`GgufLoader::to_quantized_weights`]) and upload projection tensors
+    /// to the GPU.  Use this instead of [`load_weights`] when the loader
+    /// keeps tensors mmap-resident (Q4K, Q6K, …) and therefore cannot
+    /// dequantize them through the [`WeightLoader`] trait.
+    pub fn load_quantized(&mut self, qw: crate::weights::QuantizedWeights) {
+        self.model.quantized_weights = Some(qw);
+        let qw = self.model.quantized_weights.as_ref().unwrap();
+        match crate::cutile_gpu_forward::CutileGpuModel::from_quantized(qw, &self.model.config) {
+            Ok(gm) => {
+                let stream = gm.stream();
+                match crate::cutile_kv_cache::CutileKvCache::new(&self.model.config, stream) {
+                    Ok(kv) => {
+                        eprintln!(
+                            "[cutile] GPU KV cache allocated ({} layers × {} tokens × {} kv_dim)",
+                            self.model.config.num_layers,
+                            self.model.config.max_seq_len,
+                            self.model.config.num_kv_heads * self.model.config.head_dim,
+                        );
+                        self.gpu_kv_cache = Some(std::sync::Mutex::new(kv));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[cutile] GPU KV cache creation failed ({e}); GPU forward disabled"
+                        );
+                    }
+                }
+                eprintln!(
+                    "[cutile] GPU model ready ({} layers)",
+                    self.model.config.num_layers
+                );
+                self.gpu_model = Some(gm);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[cutile] GPU weight upload failed ({e}), falling back to CPU forward"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(feature = "cutile")]
