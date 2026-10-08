@@ -289,55 +289,53 @@ impl CutileRoPE {
         let cos_t = upload_vec(cos_exp)?;
         let sin_t = upload_vec(sin_exp)?;
 
-        // ── 3. Deinterleave x on device: x_dev → x_first_dev, x_second_dev ───
-        // Each of the two output tensors has num_sh tiles of HALF_DIM = num_sh * half elements.
+        // ── 3–5. Deinterleave → RoPE → Interleave: all async, one final sync ──
+        // Allocations (api::zeros) block only for cudaMalloc (fast); the kernel
+        // launches that fill them use async_on so no CPU sync between them.
+        // A single stream.synchronize() at the end covers all three kernels.
         let x_first_t = api::zeros::<f32>(&[num_sh * half])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .partition([half]);
-
         let x_second_t = api::zeros::<f32>(&[num_sh * half])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .partition([half]);
 
-        // GEMM/GEMV callers now guarantee x_dev is rank-1 [num_sh * head_dim].
         let generics = vec![half.to_string()];
-        let (x_first_dev, x_second_dev, _x) =
+
+        // SAFETY: tensors are read/written only after the final stream.synchronize().
+        let (x_first_dev, x_second_dev, _x) = unsafe {
             kernels::cutile_deinterleave(x_first_t, x_second_t, x_dev.clone())
                 .generics(generics.clone())
-                .sync_on(stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+        let x_first_arc: Arc<Tensor<f32>> = Arc::new(x_first_dev.unpartition());
+        let x_second_arc: Arc<Tensor<f32>> = Arc::new(x_second_dev.unpartition());
 
-        let x_first_dev: Arc<Tensor<f32>> = x_first_dev.unpartition().into();
-        let x_second_dev: Arc<Tensor<f32>> = x_second_dev.unpartition().into();
-
-        // ── 4. Run GPU RoPE kernel on already-on-device split halves ──────────
         let out_first_t = api::zeros::<f32>(&[num_sh * half])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .partition([half]);
-
         let out_second_t = api::zeros::<f32>(&[num_sh * half])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .partition([half]);
 
-        let (out_f, out_s, _xf, _xs, _c, _s) = kernels::cutile_rope_kernel(
-            out_first_t,
-            out_second_t,
-            x_first_dev,
-            x_second_dev,
-            cos_t,
-            sin_t,
-        )
-        .generics(generics)
-        .sync_on(stream)
-        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-
-        // ── 5. On-device interleave: 2×num_sh programs, each writes one half tile.
-        // z has num_sh * 2 tiles of `half` elements = num_sh * head_dim total.
-        // No indexed stores needed — pid is the tile index, pid/2 indexes first/second.
+        let (out_f, out_s, _xf, _xs, _c, _s) = unsafe {
+            kernels::cutile_rope_kernel(
+                out_first_t,
+                out_second_t,
+                x_first_arc,
+                x_second_arc,
+                cos_t,
+                sin_t,
+            )
+            .generics(generics)
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
         let first_arc: Arc<Tensor<f32>> = Arc::new(out_f.unpartition());
         let second_arc: Arc<Tensor<f32>> = Arc::new(out_s.unpartition());
 
@@ -346,11 +344,20 @@ impl CutileRoPE {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .partition([half]);
 
-        let (z_t, _of, _os) =
+        let (z_t, _of, _os) = unsafe {
             kernels::cutile_interleave(z_t, first_arc, second_arc)
                 .generics(vec![half.to_string()])
-                .sync_on(stream)
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        // Single sync covers deinterleave + rope + interleave.
+        // SAFETY: synchronize waits for all stream ops; no concurrent access.
+        unsafe {
+            stream
+                .synchronize()
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        }
 
         Ok(Arc::new(z_t.unpartition()))
     }
