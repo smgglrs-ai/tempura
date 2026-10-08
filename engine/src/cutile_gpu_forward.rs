@@ -980,14 +980,19 @@ impl CutileGpuModel {
                 .expect("CutileGpuModel: pre-attention RMSNorm failed");
 
             // ── 2b. QKV projections — device-to-device ───────────────────────
-            // normed_dev is already [seq_len, h_pad] — directly usable by gemm_d2d.
-            // Use synchronous gemm_d2d_slot: the coalesced GEMV (m=1) returns a
-            // rank-1 tensor required by the RoPE kernel.  The async submit path
-            // falls back to forward_bt_device_to_device (rank-2) when the async
-            // JIT has not yet been compiled, breaking the RoPE deinterleave kernel.
-            let q_dev = self.gemm_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q);
-            let k_dev = self.gemm_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K);
-            let v_dev = self.gemm_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V);
+            // For decode (m=1): submit_gemm_d2d_slot uses the coalesced GEMV path
+            // (submit_gemv_coalesced_d2d_into, async_on) and now returns rank-1
+            // after the unpartition().reshape(&[n]) fix.  Submit all three async
+            // so the GPU can pipeline them; one sync covers all three.
+            // For prefill (m>1): forward_bt_device_to_device also returns rank-1
+            // after the flatten fix, so the fallback path is also correct.
+            // SAFETY: sync_stream() is called via RoPE's sync_on before CPU reads.
+            let q_dev =
+                unsafe { self.submit_gemm_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q) };
+            let k_dev =
+                unsafe { self.submit_gemm_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K) };
+            let v_dev =
+                unsafe { self.submit_gemm_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V) };
 
             // ── 2c. RoPE (GPU) — rotate Q and K entirely on device ───────────
             // cos/sin tables (tiny: seq_len × n_heads × head_dim/2 floats each)

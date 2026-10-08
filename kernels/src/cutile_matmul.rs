@@ -1048,6 +1048,10 @@ impl CutileMatMul {
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
         };
 
-        Ok(Arc::new(z.unpartition()))
+        let flat = z
+            .unpartition()
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(flat))
     }
 }
