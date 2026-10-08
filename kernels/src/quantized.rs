@@ -4842,6 +4842,21 @@ unsafe fn q4k_dot_block_avx2(block: &[u8], a: &[f32]) -> f32 {
 pub struct CpuMatMulQ4KOpt;
 
 #[cfg(feature = "cpu")]
+impl crate::VerifiedEquivalent<CpuMatMulQ4K> for CpuMatMulQ4KOpt {
+    fn max_relative_error() -> f64 {
+        0.02
+    }
+    fn proof_name() -> &'static str {
+        "verus:quantized_forward::lemma_q4k_group_opt_error_bound \
+         + kani:q4k_scale_factor_distributes_exactly \
+         + kani:q4k_integer_dot_order_invariant_4"
+    }
+    fn verification_tier() -> crate::VerificationTier {
+        crate::VerificationTier::Proven
+    }
+}
+
+#[cfg(feature = "cpu")]
 impl CpuMatMulQ4KOpt {
     #[inline(always)]
     fn dequant_row(b_quantized: &[u8], row: usize, k: usize, buf: &mut [f32]) {
@@ -9063,6 +9078,22 @@ mod tests {
 
 #[cfg(feature = "cuda")]
 pub type CudaMatMulQ4K = crate::cutile_quantized_gemm::CutileQuantizedGemm;
+
+// GPU path dequantizes Q4K to f32 first (same function as CpuMatMulQ4K), so
+// GPU ≡ reference at the formula level.  Error vs. reference is IEEE 754
+// reduction-order rounding only — provably smaller than Q8 quantization error.
+#[cfg(feature = "cuda")]
+impl crate::VerifiedEquivalent<CpuMatMulQ4K> for CudaMatMulQ4K {
+    fn max_relative_error() -> f64 {
+        0.0001
+    }
+    fn proof_name() -> &'static str {
+        "verus:gpu_quantized_gemm::lemma_gpu_q4k_ref_group_equals_cpu_ref"
+    }
+    fn verification_tier() -> crate::VerificationTier {
+        crate::VerificationTier::Proven
+    }
+}
 
 #[cfg(kani)]
 mod kani_q2x4_repack {

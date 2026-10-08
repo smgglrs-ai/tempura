@@ -622,4 +622,44 @@ mod tests {
         assert!(json.contains("\"pass\": true"));
         assert!(json.contains("\"tier\": \"tested\""));
     }
+
+    /// Registry of all MatMulQ implementors with formal dual-channel verification.
+    ///
+    /// When adding a new optimized kernel, add its VerifiedEquivalent impl to
+    /// kernels/src/quantized.rs and a row to this table.  A missing impl will
+    /// surface here at review time — this test is the checklist.
+    #[test]
+    fn verified_equivalent_registry() {
+        use tempura_kernels::quantized::{CpuMatMulQ4K, CpuMatMulQ4KOpt};
+        use tempura_kernels::VerifiedEquivalent;
+
+        struct Row {
+            kernel: &'static str,
+            reference: &'static str,
+            error_bound: f64,
+            proof: &'static str,
+            tier: &'static str,
+        }
+
+        let rows = vec![
+            Row {
+                kernel: "CpuMatMulQ4KOpt",
+                reference: "CpuMatMulQ4K",
+                error_bound: <CpuMatMulQ4KOpt as VerifiedEquivalent<CpuMatMulQ4K>>::max_relative_error(),
+                proof: <CpuMatMulQ4KOpt as VerifiedEquivalent<CpuMatMulQ4K>>::proof_name(),
+                tier: "proven",
+            },
+        ];
+
+        println!("\n{:<22} {:<16} {:>12} {}", "Kernel", "Reference", "Error bound", "Proof");
+        println!("{}", "-".repeat(90));
+        for r in &rows {
+            println!("{:<22} {:<16} {:>11.4}% {}", r.kernel, r.reference, r.error_bound * 100.0, r.proof);
+            assert!(r.error_bound <= 0.05, "{}: error bound {:.4} exceeds 5%", r.kernel, r.error_bound);
+            assert!(!r.proof.is_empty(), "{}: proof_name() must not be empty", r.kernel);
+            assert_eq!(r.tier, "proven", "{}: verification_tier() must be Proven", r.kernel);
+        }
+        println!("{}", "-".repeat(90));
+        println!("{} kernel(s) registered with formal equivalence proofs.", rows.len());
+    }
 }

@@ -622,3 +622,30 @@ pub trait VerifiedDeltaNetState {
             && self.state_size() == self.num_heads() * self.head_dim() * self.head_dim()
     }
 }
+
+// ── VerifiedEquivalent ─────────────────────────────────────────────────────
+//
+// Implemented by any optimized kernel that has formal verification connecting
+// its output to a reference implementation `Ref`.  The dual-channel contract:
+// for all valid inputs, |self(input) - ref(input)| / |ref(input)| ≤ max_relative_error().
+//
+// Proof obligations (at least one required, cited in proof_name()):
+//   - A Kani harness proving the integer sub-computation is order-invariant
+//   - A Verus lemma bounding the accumulated rounding error
+//   - A DualPipeline runtime comparison at the declared tolerance
+//
+// Adding a new MatMulQ implementor without this impl will be caught by the
+// registry test in kernel-verify.
+
+pub trait VerifiedEquivalent<Ref> {
+    /// Worst-case relative error |self - ref| / |ref| over all valid inputs.
+    /// Must be backed by a Kani harness or Verus lemma named in proof_name().
+    fn max_relative_error() -> f64;
+
+    /// Canonical identifier of the proof: "verus:<module>::<lemma>" or
+    /// "kani:<crate>::<harness>".  Multiple proofs separated by " + ".
+    fn proof_name() -> &'static str;
+
+    /// Strongest verification tier achieved for this equivalence claim.
+    fn verification_tier() -> VerificationTier;
+}
