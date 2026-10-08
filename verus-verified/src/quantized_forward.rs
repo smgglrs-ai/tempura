@@ -1,8 +1,11 @@
 //! Verus-verified quantized forward pass buffer shapes — unbounded proofs
 //!
-//! Proves: pre-allocated scratchpad buffer sizes match the quantized matmul
-//! dimensions for Q4K/Q6K paths. The quantized forward reuses buffers across
-//! layers, so sizes must be sufficient for the maximum dimension.
+//! Proves:
+//!   - Pre-allocated scratchpad buffer sizes match quantized matmul dimensions.
+//!   - Q4K output error bound: the difference between the reference path
+//!     (f32 dequant + dot) and the optimized path (Q8 activation quantization
+//!     + integer GEMM + f32 scale) is bounded by the quantization step times
+//!     the L1 norm of positive weight contributions.
 
 use vstd::prelude::*;
 
@@ -180,6 +183,160 @@ proof fn scratchpad_reuse_valid(
         buf_size >= 1,
 {
 }
+
+// ============================================================================
+// Q4K opt vs ref output error bound — self-contained, no cross-module imports
+//
+// The reference path computes (per group, integer model):
+//   ref_contrib = sc_g * Σ_{i in g} q_i * a_i
+//
+// The opt path uses Q8(a_i) = a_i + e_i where |e_i| ≤ 1:
+//   opt_contrib = sc_g * Σ_{i in g} q_i * (a_i + e_i)
+//
+// Error = sc_g * Σ q_i * e_i.  Since |e_i| ≤ 1 and q_i, sc_g ≥ 0:
+//   |error| ≤ sc_g * Σ q_i  (weight L1-norm × group scale)
+// ============================================================================
+
+pub open spec fn qerr_abs(x: int) -> int {
+    if x >= 0 { x } else { -x }
+}
+
+/// All elements of a sequence are nibble values: ∈ [0, 15].
+pub open spec fn all_nibbles(q: Seq<int>) -> bool
+    decreases q.len()
+{
+    if q.len() == 0 { true }
+    else { 0 <= q.last() <= 15 && all_nibbles(q.drop_last()) }
+}
+
+/// All elements of a sequence are unit errors: ∈ [-1, 1].
+pub open spec fn all_unit_errors(e: Seq<int>) -> bool
+    decreases e.len()
+{
+    if e.len() == 0 { true }
+    else { -1 <= e.last() <= 1 && all_unit_errors(e.drop_last()) }
+}
+
+/// Σ sc_g * q_i  — upper bound on one group's Q8 quantization error.
+pub open spec fn group_error_bound(sc_g: int, q_g: Seq<int>) -> int
+    decreases q_g.len()
+{
+    if q_g.len() == 0 { 0int }
+    else { sc_g * q_g.last() + group_error_bound(sc_g, q_g.drop_last()) }
+}
+
+/// Weighted error sum: Σ (sc_g * q_i) * e_i  (= opt_contrib - ref_contrib per group).
+pub open spec fn weighted_err(sc_g: int, q_g: Seq<int>, e_g: Seq<int>) -> int
+    recommends q_g.len() == e_g.len()
+    decreases q_g.len()
+{
+    if q_g.len() == 0 { 0int }
+    else {
+        sc_g * q_g.last() * e_g.last()
+            + weighted_err(sc_g, q_g.drop_last(), e_g.drop_last())
+    }
+}
+
+/// **Main theorem**: |weighted_err(sc_g, q_g, e_g)| ≤ group_error_bound(sc_g, q_g)
+///
+/// For any Q4K group: the error introduced by replacing exact activations with their
+/// Q8-quantized approximations (|e_i| ≤ 1) is bounded by the group-scale × weight
+/// L1-norm.  Proved for ALL sc_g ∈ [0,63], ALL lengths, ALL valid inputs.
+pub proof fn lemma_q4k_group_opt_error_bound(
+    sc_g: int,
+    q_g: Seq<int>,
+    e_g: Seq<int>,
+)
+    requires
+        q_g.len() == e_g.len(),
+        sc_g >= 0 && sc_g <= 63,
+        all_nibbles(q_g),
+        all_unit_errors(e_g),
+    ensures
+        qerr_abs(weighted_err(sc_g, q_g, e_g)) <= group_error_bound(sc_g, q_g)
+    decreases q_g.len()
+{
+    if q_g.len() == 0 {
+        assert(weighted_err(sc_g, q_g, e_g) == 0int);
+        assert(group_error_bound(sc_g, q_g) == 0int);
+        assert(qerr_abs(0int) == 0int);
+    } else {
+        let q_rest = q_g.drop_last();
+        let e_rest = e_g.drop_last();
+
+        // Recursive predicates unfold to give bounds on last element
+        assert(all_nibbles(q_g));     // unfolds: 0 <= q_g.last() <= 15 && all_nibbles(q_rest)
+        assert(all_unit_errors(e_g)); // unfolds: -1 <= e_g.last() <= 1 && all_unit_errors(e_rest)
+        let ql = q_g.last();
+        let el = e_g.last();
+        assert(0 <= ql <= 15);
+        assert(-1 <= el <= 1);
+
+        // Apply IH on prefix
+        lemma_q4k_group_opt_error_bound(sc_g, q_rest, e_rest);
+
+        // Last term contribution
+        let last_term = sc_g * ql * el;
+        assert(qerr_abs(last_term) <= sc_g * ql) by (nonlinear_arith)
+            requires sc_g >= 0, 0 <= ql, ql <= 15, -1 <= el, el <= 1,
+                     last_term == sc_g * ql * el;
+
+        // Total error = last_term + inner_error
+        let inner = weighted_err(sc_g, q_rest, e_rest);
+        assert(weighted_err(sc_g, q_g, e_g) == last_term + inner);
+
+        // Triangle inequality
+        assert(qerr_abs(last_term + inner) <= qerr_abs(last_term) + qerr_abs(inner))
+            by (nonlinear_arith);
+
+        // Capture inner bound and group bound as plain ints for linear arithmetic
+        let inner_bound = group_error_bound(sc_g, q_rest);
+        assert(qerr_abs(inner) <= inner_bound);  // from IH
+
+        let last_bound = sc_g * ql;
+        assert(qerr_abs(last_term) <= last_bound);  // from last_term assertion above
+
+        // Unfold group_error_bound for the last element
+        assert(group_error_bound(sc_g, q_g) == last_bound + inner_bound);
+
+        // Now: linear arithmetic on plain ints
+        assert(qerr_abs(last_term) + qerr_abs(inner) <= last_bound + inner_bound)
+            by (nonlinear_arith)
+            requires qerr_abs(last_term) <= last_bound,
+                     qerr_abs(inner) <= inner_bound;
+    }
+}
+
+/// group_error_bound is non-negative when sc_g ≥ 0 and q_i ≥ 0.
+pub proof fn lemma_group_error_bound_nonneg(sc_g: int, q_g: Seq<int>)
+    requires sc_g >= 0, all_nibbles(q_g)
+    ensures group_error_bound(sc_g, q_g) >= 0
+    decreases q_g.len()
+{
+    if q_g.len() == 0 {
+    } else {
+        assert(all_nibbles(q_g));
+        assert(0 <= q_g.last() <= 15);
+        lemma_group_error_bound_nonneg(sc_g, q_g.drop_last());
+        assert(sc_g * q_g.last() >= 0) by (nonlinear_arith)
+            requires sc_g >= 0, q_g.last() >= 0;
+        assert(group_error_bound(sc_g, q_g) ==
+               sc_g * q_g.last() + group_error_bound(sc_g, q_g.drop_last()));
+    }
+}
+
+// Sanity check on empty sequences — proves lemma fires correctly at base case.
+proof fn check_error_bound_empty()
+    ensures qerr_abs(weighted_err(5int, Seq::<int>::empty(), Seq::<int>::empty()))
+            <= group_error_bound(5int, Seq::<int>::empty())
+{
+    lemma_q4k_group_opt_error_bound(
+        5int, Seq::<int>::empty(), Seq::<int>::empty());
+}
+
+// ============================================================================
+// End of Q4K error bound proofs
+// ============================================================================
 
 fn main() {}
 
