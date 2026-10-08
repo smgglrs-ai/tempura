@@ -7943,6 +7943,128 @@ mod kani_proofs {
         assert!(max_with_scale <= 63 * 61_440); // 3_870_720
         assert!(max_with_scale < i32::MAX as i64);
     }
+
+    // ── Q6K equivalence proofs ───────────────────────────────────────────────
+
+    /// Q6K 6-bit weight reconstruction stays in [-32, 31].
+    /// Each weight is assembled from a 4-bit low part (ql & 0xF or ql >> 4)
+    /// and a 2-bit high part ((qh >> shift) & 0x3), then biased by -32.
+    /// Proves the weight extraction never produces out-of-range values.
+    #[kani::proof]
+    fn q6k_ql_qh_extraction_in_range() {
+        let ql_byte: u8 = kani::any();
+        let qh_byte: u8 = kani::any();
+        let shift: u32 = kani::any();
+        kani::assume(shift < 4);
+
+        // Low nibble path: (ql & 0xF) | ((qh >> shift) & 0x3) << 4
+        let lo4 = (ql_byte & 0x0F) as i32;
+        let hi2 = ((qh_byte >> shift) & 0x03) as i32;
+        let weight_lo = (lo4 | (hi2 << 4)) - 32;
+
+        assert!(weight_lo >= -32 && weight_lo <= 31);
+
+        // High nibble path: (ql >> 4) | ((qh >> shift) & 0x3) << 4
+        let lo4h = (ql_byte >> 4) as i32;
+        let weight_hi = (lo4h | (hi2 << 4)) - 32;
+
+        assert!(weight_hi >= -32 && weight_hi <= 31);
+    }
+
+    /// Q6K scale bytes are valid i8 values; decoded as i32 they stay in [-128, 127].
+    /// Documents the scale extraction contract for the 16 per-block i8 scales.
+    #[kani::proof]
+    fn q6k_scale_extraction_in_range() {
+        let scale_byte: i8 = kani::any();
+        let scale_i32 = scale_byte as i32;
+        assert!(scale_i32 >= -128 && scale_i32 <= 127);
+    }
+
+    /// Q6K i16 activation × weight product fits in i32, even for full 16-element groups.
+    /// weight ∈ [-32, 31], activation ∈ [-32767, 32767].
+    /// Max per-element product: 32 × 32767 = 1,048,544.
+    /// Max 16-element sum: 16 × 1,048,544 = 16,776,704 << i32::MAX.
+    #[kani::proof]
+    fn q6k_i16_accumulator_no_overflow() {
+        let n: usize = kani::any();
+        kani::assume(n >= 1 && n <= 16);
+
+        let max_weight: i64 = 32;
+        let max_act: i64 = 32767;
+
+        let max_product = max_weight * max_act;
+        let max_group_sum = max_product * n as i64;
+
+        assert!(max_product == 1_048_544);
+        assert!(max_group_sum <= 1_048_544 * 16); // 16_776_704
+        assert!(max_group_sum < i32::MAX as i64);
+    }
+
+    /// Q6K integer dot product is invariant to summation order.
+    /// Proves that SIMD lane-grouping (paired accumulation) gives the same i32
+    /// result as sequential summation for Q6K weight × i16 activation products.
+    #[kani::proof]
+    fn q6k_integer_dot_order_invariant() {
+        let w0: i32 = kani::any();
+        let w1: i32 = kani::any();
+        let w2: i32 = kani::any();
+        let w3: i32 = kani::any();
+        kani::assume(w0 >= -32 && w0 <= 31);
+        kani::assume(w1 >= -32 && w1 <= 31);
+        kani::assume(w2 >= -32 && w2 <= 31);
+        kani::assume(w3 >= -32 && w3 <= 31);
+
+        let a0: i32 = kani::any();
+        let a1: i32 = kani::any();
+        let a2: i32 = kani::any();
+        let a3: i32 = kani::any();
+        kani::assume(a0 >= -32767 && a0 <= 32767);
+        kani::assume(a1 >= -32767 && a1 <= 32767);
+        kani::assume(a2 >= -32767 && a2 <= 32767);
+        kani::assume(a3 >= -32767 && a3 <= 32767);
+
+        // Sequential accumulation (reference path)
+        let seq: i32 = w0 * a0 + w1 * a1 + w2 * a2 + w3 * a3;
+
+        // Paired accumulation (SIMD madd_epi16 style)
+        let pair01: i32 = w0 * a0 + w1 * a1;
+        let pair23: i32 = w2 * a2 + w3 * a3;
+        let paired: i32 = pair01 + pair23;
+
+        assert!(seq == paired);
+    }
+
+    /// Q6K group indices don't overlap: the 4 interleaved weight streams
+    /// within a 32-element row of the dot loop (q1/q2/q3/q4) map to
+    /// disjoint output positions [y_off+l, y_off+l+32, y_off+l+64, y_off+l+96].
+    #[kani::proof]
+    fn q6k_group_boundary_no_overlap() {
+        let half: usize = kani::any();
+        let l: usize = kani::any();
+        kani::assume(half < 2);
+        kani::assume(l < 32);
+
+        let y_off = half * 128;
+
+        let pos0 = y_off + l;
+        let pos1 = y_off + l + 32;
+        let pos2 = y_off + l + 64;
+        let pos3 = y_off + l + 96;
+
+        // All four positions are within the 256-element block
+        assert!(pos0 < 256);
+        assert!(pos1 < 256);
+        assert!(pos2 < 256);
+        assert!(pos3 < 256);
+
+        // All four positions are distinct (no aliasing)
+        assert!(pos0 != pos1);
+        assert!(pos0 != pos2);
+        assert!(pos0 != pos3);
+        assert!(pos1 != pos2);
+        assert!(pos1 != pos3);
+        assert!(pos2 != pos3);
+    }
 }
 
 #[cfg(test)]

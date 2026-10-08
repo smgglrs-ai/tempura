@@ -338,6 +338,216 @@ proof fn check_error_bound_empty()
 // End of Q4K error bound proofs
 // ============================================================================
 
+// ============================================================================
+// Q6K error bound proofs
+// ============================================================================
+//
+// Q6K uses i16 activation quantization (32767 levels vs i8's 127).
+// Weights are 6-bit signed: w_i ∈ [-32, 31], so |w_i| ≤ 32.
+// Group scales are i8: sc_g ∈ [-128, 127].
+// Per-element Q16 error: |e_i| ≤ 1 (in i16 units; scale is max_abs/32767).
+//
+// Error bound: |Σ sc_g * w_i * e_i| ≤ |sc_g| * Σ |w_i|.
+
+/// Predicate: all weights are valid Q6K 6-bit signed values in [-32, 31].
+pub open spec fn all_q6k_weights(q: Seq<int>) -> bool
+    decreases q.len()
+{
+    if q.len() == 0 { true }
+    else { -32 <= q.last() <= 31 && all_q6k_weights(q.drop_last()) }
+}
+
+/// Predicate: all errors are unit (|e_i| ≤ 1), same as Q4K.
+pub open spec fn all_q6k_errors(e: Seq<int>) -> bool
+    decreases e.len()
+{
+    if e.len() == 0 { true }
+    else { -1 <= e.last() <= 1 && all_q6k_errors(e.drop_last()) }
+}
+
+/// L1 norm of Q6K weights: Σ |w_i|.  Each |w_i| ≤ 32.
+pub open spec fn q6k_weight_l1(q: Seq<int>) -> int
+    decreases q.len()
+{
+    if q.len() == 0 { 0int }
+    else {
+        let w = q.last();
+        (if w >= 0 { w } else { -w }) + q6k_weight_l1(q.drop_last())
+    }
+}
+
+/// Weighted error sum for Q6K: Σ sc_g * w_i * e_i.
+pub open spec fn q6k_weighted_err(sc_g: int, q_g: Seq<int>, e_g: Seq<int>) -> int
+    recommends q_g.len() == e_g.len()
+    decreases q_g.len()
+{
+    if q_g.len() == 0 { 0int }
+    else {
+        sc_g * q_g.last() * e_g.last()
+            + q6k_weighted_err(sc_g, q_g.drop_last(), e_g.drop_last())
+    }
+}
+
+/// Q6K group error bound: |sc_g| * Σ |w_i|.
+pub open spec fn q6k_group_error_bound(sc_g: int, q_g: Seq<int>) -> int
+{
+    let abs_sc = if sc_g >= 0 { sc_g } else { -sc_g };
+    abs_sc * q6k_weight_l1(q_g)
+}
+
+/// L1 norm is non-negative.
+proof fn lemma_q6k_l1_nonneg(q: Seq<int>)
+    ensures q6k_weight_l1(q) >= 0
+    decreases q.len()
+{
+    if q.len() == 0 {
+    } else {
+        lemma_q6k_l1_nonneg(q.drop_last());
+        let w = q.last();
+        let abs_w = if w >= 0 { w } else { -w };
+        assert(abs_w >= 0);
+        assert(q6k_weight_l1(q) == abs_w + q6k_weight_l1(q.drop_last()));
+    }
+}
+
+/// **Main Q6K theorem**: |weighted_err(sc_g, q_g, e_g)| ≤ |sc_g| * Σ|w_i|.
+///
+/// For any Q6K group: the error from i16 activation quantization (|e_i| ≤ 1)
+/// is bounded by the absolute scale times the L1 norm of weights.
+/// Proved for ALL sc_g ∈ [-128, 127], ALL lengths, ALL valid Q6K inputs.
+pub proof fn lemma_q6k_group_opt_error_bound(
+    sc_g: int,
+    q_g: Seq<int>,
+    e_g: Seq<int>,
+)
+    requires
+        q_g.len() == e_g.len(),
+        sc_g >= -128 && sc_g <= 127,
+        all_q6k_weights(q_g),
+        all_q6k_errors(e_g),
+    ensures
+        qerr_abs(q6k_weighted_err(sc_g, q_g, e_g)) <= q6k_group_error_bound(sc_g, q_g)
+    decreases q_g.len()
+{
+    let abs_sc = if sc_g >= 0 { sc_g } else { -sc_g };
+
+    if q_g.len() == 0 {
+        assert(q6k_weighted_err(sc_g, q_g, e_g) == 0int);
+        assert(q6k_weight_l1(q_g) == 0int);
+        assert(qerr_abs(0int) == 0int);
+    } else {
+        let q_rest = q_g.drop_last();
+        let e_rest = e_g.drop_last();
+
+        assert(all_q6k_weights(q_g));
+        assert(all_q6k_errors(e_g));
+        let wl = q_g.last();
+        let el = e_g.last();
+        assert(-32 <= wl <= 31);
+        assert(-1 <= el <= 1);
+
+        // Apply IH
+        lemma_q6k_group_opt_error_bound(sc_g, q_rest, e_rest);
+
+        // Last term: sc_g * wl * el.  |sc_g * wl * el| ≤ abs_sc * |wl|.
+        let last_term = sc_g * wl * el;
+        let abs_wl = if wl >= 0 { wl } else { -wl };
+        assert(abs_wl <= 32);
+
+        assert(qerr_abs(last_term) <= abs_sc * abs_wl) by (nonlinear_arith)
+            requires -128 <= sc_g <= 127,
+                     -32 <= wl <= 31,
+                     -1 <= el <= 1,
+                     abs_sc == (if sc_g >= 0 { sc_g } else { -sc_g }),
+                     abs_wl == (if wl >= 0 { wl } else { -wl }),
+                     last_term == sc_g * wl * el;
+
+        // Total error
+        let inner = q6k_weighted_err(sc_g, q_rest, e_rest);
+        assert(q6k_weighted_err(sc_g, q_g, e_g) == last_term + inner);
+
+        assert(qerr_abs(last_term + inner) <= qerr_abs(last_term) + qerr_abs(inner))
+            by (nonlinear_arith);
+
+        // Capture bounds as plain ints
+        let inner_bound = q6k_group_error_bound(sc_g, q_rest);
+        assert(qerr_abs(inner) <= inner_bound);
+
+        let l1_rest = q6k_weight_l1(q_rest);
+        lemma_q6k_l1_nonneg(q_rest);
+
+        assert(q6k_weight_l1(q_g) == abs_wl + l1_rest)
+            by { assert(q6k_weight_l1(q_g) == abs_wl + q6k_weight_l1(q_rest)); };
+
+        // q6k_group_error_bound unfolds to abs_sc_inner * q6k_weight_l1(q_rest)
+        // where abs_sc_inner is computed inside the spec fn.
+        // We reveal the definition and use the same conditional to tie them together.
+        let abs_sc_inner: int = if sc_g >= 0 { sc_g } else { -sc_g };
+        assert(abs_sc == abs_sc_inner);
+        assert(inner_bound == abs_sc_inner * l1_rest) by {
+            // q6k_group_error_bound(sc_g, q_rest) = abs_sc_inner * q6k_weight_l1(q_rest)
+            // by definition of q6k_group_error_bound (open spec, unfolds directly)
+            assert(q6k_group_error_bound(sc_g, q_rest) == abs_sc_inner * l1_rest);
+        };
+
+        let last_bound = abs_sc * abs_wl;
+        assert(qerr_abs(last_term) <= last_bound);
+
+        // q6k_group_error_bound(sc_g, q_g) = abs_sc_inner * (abs_wl + l1_rest)
+        assert(q6k_group_error_bound(sc_g, q_g) == abs_sc_inner * (abs_wl + l1_rest)) by {
+            assert(q6k_weight_l1(q_g) == abs_wl + l1_rest);
+            assert(q6k_group_error_bound(sc_g, q_g) == abs_sc_inner * q6k_weight_l1(q_g));
+            assert(abs_sc_inner * q6k_weight_l1(q_g) == abs_sc_inner * (abs_wl + l1_rest));
+        };
+
+        // last_bound = abs_sc * abs_wl = abs_sc_inner * abs_wl (since abs_sc == abs_sc_inner)
+        // inner_bound = abs_sc_inner * l1_rest (established above)
+        assert(last_bound == abs_sc_inner * abs_wl) by {
+            assert(abs_sc == abs_sc_inner);
+            assert(last_bound == abs_sc * abs_wl);
+        };
+        assert(last_bound + inner_bound == abs_sc_inner * abs_wl + abs_sc_inner * l1_rest);
+        assert(abs_sc_inner * abs_wl + abs_sc_inner * l1_rest == abs_sc_inner * (abs_wl + l1_rest))
+            by (nonlinear_arith);
+
+        assert(qerr_abs(last_term) + qerr_abs(inner) <= last_bound + inner_bound)
+            by (nonlinear_arith)
+            requires qerr_abs(last_term) <= last_bound,
+                     qerr_abs(inner) <= inner_bound;
+    }
+}
+
+/// Corollary: the Q6K error bound is non-negative.
+pub proof fn lemma_q6k_error_bound_nonneg(sc_g: int, q_g: Seq<int>)
+    requires sc_g >= -128 && sc_g <= 127, all_q6k_weights(q_g)
+    ensures q6k_group_error_bound(sc_g, q_g) >= 0
+{
+    let abs_sc = if sc_g >= 0 { sc_g } else { -sc_g };
+    lemma_q6k_l1_nonneg(q_g);
+    assert(q6k_group_error_bound(sc_g, q_g) == abs_sc * q6k_weight_l1(q_g))
+        by (nonlinear_arith)
+        requires abs_sc == (if sc_g >= 0 { sc_g } else { -sc_g });
+    assert(abs_sc >= 0) by {
+        assert(sc_g >= -128 && sc_g <= 127);
+        if sc_g >= 0 { assert(abs_sc == sc_g); } else { assert(abs_sc == -sc_g); }
+    };
+    assert(q6k_weight_l1(q_g) >= 0);
+    assert(abs_sc * q6k_weight_l1(q_g) >= 0) by (nonlinear_arith)
+        requires abs_sc >= 0, q6k_weight_l1(q_g) >= 0;
+}
+
+// Sanity check: Q6K lemma fires at base case.
+proof fn check_q6k_error_bound_empty()
+    ensures qerr_abs(q6k_weighted_err(5int, Seq::<int>::empty(), Seq::<int>::empty()))
+            <= q6k_group_error_bound(5int, Seq::<int>::empty())
+{
+    lemma_q6k_group_opt_error_bound(5int, Seq::<int>::empty(), Seq::<int>::empty());
+}
+
+// ============================================================================
+// End of Q6K error bound proofs
+// ============================================================================
+
 fn main() {}
 
 } // verus!
