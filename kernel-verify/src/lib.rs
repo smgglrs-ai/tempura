@@ -1,6 +1,9 @@
 use rand::{Rng, SeedableRng};
 use serde::Serialize;
-use tempura_kernel_api::{Attention, MatMul, MatMulQ, RMSNorm, RoPE, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE};
+use tempura_kernel_api::{
+    Attention, MatMul, MatMulQ, RMSNorm, RoPE, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE,
+    Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE,
+};
 
 pub mod bitnet;
 pub mod composition;
@@ -134,6 +137,35 @@ impl DualPipelineRunner {
         let mut results = Vec::new();
         for cfg in configs {
             let result = compare_q4k_single(ref_impl, opt_impl, cfg, rel_tol);
+            results.push(result);
+        }
+        let pass = results.iter().all(|r| r.pass);
+        VerificationReport {
+            kernel_name: name.into(),
+            results,
+            pass,
+            tier: if pass {
+                VerificationTier::Tested
+            } else {
+                VerificationTier::Compiled
+            },
+        }
+    }
+
+    /// Compare two `MatMulQ` implementations on Q6K matmuls.
+    /// Uses 1% relative tolerance — Q6K's i16 activation quantization is
+    /// 256× more precise than Q4K's i8, so errors are much smaller.
+    pub fn compare_q6k(
+        &self,
+        name: &str,
+        ref_impl: &dyn MatMulQ,
+        opt_impl: &dyn MatMulQ,
+        configs: &[Q6kConfig],
+        rel_tol: f32,
+    ) -> VerificationReport {
+        let mut results = Vec::new();
+        for cfg in configs {
+            let result = compare_q6k_single(ref_impl, opt_impl, cfg, rel_tol);
             results.push(result);
         }
         let pass = results.iter().all(|r| r.pass);
@@ -305,6 +337,126 @@ fn compare_q4k_single(
                     format!("rel_err={rel_err:.4} within tol={rel_tol:.3}")
                 } else {
                     format!("rel_err={rel_err:.4} exceeds tol={rel_tol:.3} (mad={mad:.6}, max_ref={max_ref:.6})")
+                },
+            }
+        }
+        (Err(e), _) => KernelTestResult {
+            test_name,
+            pass: false,
+            max_abs_diff: f32::NAN,
+            l2_distance: f32::NAN,
+            detail: format!("ref_impl error: {e}"),
+        },
+        (_, Err(e)) => KernelTestResult {
+            test_name,
+            pass: false,
+            max_abs_diff: f32::NAN,
+            l2_distance: f32::NAN,
+            detail: format!("opt_impl error: {e}"),
+        },
+    }
+}
+
+/// Configuration for a single Q6K matrix-multiply comparison.
+#[derive(Debug, Clone)]
+pub struct Q6kConfig {
+    pub m: usize,
+    pub n: usize,
+    /// Inner dimension — must be a multiple of Q6K_BLOCK_SIZE (256)
+    pub k: usize,
+}
+
+/// Generate structurally valid Q6K weight bytes for `n` rows, each of width `k`.
+///
+/// Q6K block layout (210 bytes):
+///   [0..128]   ql  — 4-bit low parts of 256 weights (2 weights/byte)
+///   [128..192] qh  — 2-bit high parts of 256 weights (4 weights/byte)
+///   [192..208] scales — 16 i8 group scales
+///   [208..210] d   — f16 block scale
+fn make_q6k_weights(n: usize, k: usize, seed: u8) -> Vec<u8> {
+    let blocks_per_row = k / Q6K_BLOCK_SIZE;
+    let total_bytes = n * blocks_per_row * Q6K_BLOCK_BYTES;
+    let mut weights = vec![0u8; total_bytes];
+    let mut cursor = 0usize;
+    for row in 0..n {
+        for blk in 0..blocks_per_row {
+            let base = cursor;
+            // ql: 128 bytes — low 4 bits of each weight
+            for i in 0..128 {
+                weights[base + i] = ((row * 128 + blk * 7 + i * 13 + seed as usize) % 256) as u8;
+            }
+            // qh: 64 bytes — high 2 bits of each weight
+            for i in 0..64 {
+                weights[base + 128 + i] =
+                    ((row * 64 + blk * 11 + i * 7 + seed as usize) % 4) as u8;
+            }
+            // scales: 16 i8 values (kept small and positive to avoid cancellation)
+            for i in 0..16 {
+                weights[base + 192 + i] = ((blk + row + i + seed as usize) % 31 + 1) as u8;
+            }
+            // d: f16 block scale — use a small positive value
+            let d_f16 = half::f16::from_f32(0.005 + (blk % 8) as f32 * 0.001);
+            let d_bits = d_f16.to_bits();
+            weights[base + 208] = d_bits as u8;
+            weights[base + 209] = (d_bits >> 8) as u8;
+            cursor += Q6K_BLOCK_BYTES;
+        }
+    }
+    weights
+}
+
+fn compare_q6k_single(
+    ref_impl: &dyn MatMulQ,
+    opt_impl: &dyn MatMulQ,
+    cfg: &Q6kConfig,
+    rel_tol: f32,
+) -> KernelTestResult {
+    let test_name = format!("q6k m={} n={} k={}", cfg.m, cfg.n, cfg.k);
+
+    if cfg.k % Q6K_BLOCK_SIZE != 0 {
+        return KernelTestResult {
+            test_name,
+            pass: false,
+            max_abs_diff: f32::NAN,
+            l2_distance: f32::NAN,
+            detail: format!("k={} not divisible by Q6K_BLOCK_SIZE={}", cfg.k, Q6K_BLOCK_SIZE),
+        };
+    }
+
+    let weights = make_q6k_weights(cfg.n, cfg.k, 42);
+    let activations: Vec<f32> = {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(17);
+        (0..cfg.m * cfg.k).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect()
+    };
+
+    let mut out_ref = vec![0.0f32; cfg.m * cfg.n];
+    let mut out_opt = vec![0.0f32; cfg.m * cfg.n];
+
+    let res_ref = ref_impl.forward_b_transposed_q6k(
+        &activations, &weights, &mut out_ref, cfg.m, cfg.n, cfg.k,
+    );
+    let res_opt = opt_impl.forward_b_transposed_q6k(
+        &activations, &weights, &mut out_opt, cfg.m, cfg.n, cfg.k,
+    );
+
+    match (res_ref, res_opt) {
+        (Ok(()), Ok(())) => {
+            let mad = max_abs_diff(&out_ref, &out_opt);
+            let l2 = l2_distance(&out_ref, &out_opt);
+            let max_ref = out_ref.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let rel_err = if max_ref > 1e-6 { mad / max_ref } else { mad };
+            let pass = rel_err <= rel_tol;
+            KernelTestResult {
+                test_name,
+                pass,
+                max_abs_diff: mad,
+                l2_distance: l2,
+                detail: if pass {
+                    format!("rel_err={rel_err:.4} within tol={rel_tol:.3}")
+                } else {
+                    format!(
+                        "rel_err={rel_err:.4} exceeds tol={rel_tol:.3} (mad={mad:.6}, max_ref={max_ref:.6})"
+                    )
                 },
             }
         }
@@ -610,6 +762,25 @@ mod tests {
         let configs = test_generators::rope_configs();
         let report = runner.compare_rope("CpuRoPE-self", &cpu, &cpu, &configs);
         assert!(report.pass);
+    }
+
+    #[test]
+    fn test_q6k_ref_vs_opt_dual_pipeline() {
+        use tempura_kernels::quantized::{CpuMatMulQ4K, CpuMatMulQ4KOpt};
+        let runner = DualPipelineRunner::new(1e-6);
+        let ref_k = CpuMatMulQ4K;
+        let opt_k = CpuMatMulQ4KOpt;
+        let configs = vec![
+            Q6kConfig { m: 1, n: 16, k: 256 },
+            Q6kConfig { m: 1, n: 64, k: 512 },
+            Q6kConfig { m: 4, n: 32, k: 256 },
+        ];
+        // 1% rel tol — Q6K i16 quant is 256× finer than Q4K i8
+        let report = runner.compare_q6k("Q6K-ref-vs-opt", &ref_k, &opt_k, &configs, 0.01);
+        for r in &report.results {
+            eprintln!("  {}: {}", r.test_name, r.detail);
+        }
+        assert!(report.pass, "Q6K dual-pipeline ref vs opt failed");
     }
 
     #[test]
