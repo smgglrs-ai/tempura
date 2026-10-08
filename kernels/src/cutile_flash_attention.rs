@@ -36,12 +36,16 @@ pub mod kernels {
     ///
     /// Grid: (ceil(seq_len / BR), 1, 1)
     /// Generics: BR (Q tile rows), BC (KV tile rows), D (head dim), KVL (kv_len padded)
+    /// KVL is now dynamic ([-1, D]) so the kernel compiles once per (BR, BC, D)
+    /// tuple instead of once per kv_len_pad value.  The iteration count is driven
+    /// by the runtime `kv_len` parameter; the tensor rank annotation just tells
+    /// cuTile the expected shape for bounds checking.
     #[cutile::entry()]
-    pub fn cutile_flash_attn_head<const BR: i32, const BC: i32, const D: i32, const KVL: i32>(
+    pub fn cutile_flash_attn_head<const BR: i32, const BC: i32, const D: i32>(
         out: &mut Tensor<f32, { [BR, D] }>,
         q: &Tensor<f32, { [-1, D] }>,
-        k: &Tensor<f32, { [KVL, D] }>,
-        v: &Tensor<f32, { [KVL, D] }>,
+        k: &Tensor<f32, { [-1, D] }>,
+        v: &Tensor<f32, { [-1, D] }>,
         scale: f32,
         cache_offset: i32,
         seq_len: i32,
@@ -395,12 +399,9 @@ impl CutileFlashAttention {
         let cache_offset = (kv_len as i32) - (seq_len as i32);
         let stream = &self.stream;
 
-        let generics = vec![
-            BR.to_string(),
-            BC.to_string(),
-            head_dim_pad.to_string(),
-            kv_len_pad.to_string(),
-        ];
+        // KVL removed: K/V tensors now use dynamic [-1, D] so the kernel compiles
+        // once per (BR, BC, D) instead of once per kv_len_pad increment.
+        let generics = vec![BR.to_string(), BC.to_string(), head_dim_pad.to_string()];
 
         for batch_idx in 0..batch {
             // ── Phase 1: host-side gather (pure CPU, zero CUDA cost) ──────────
@@ -623,12 +624,9 @@ impl Attention for CutileFlashAttention {
         let stream = &self.stream;
 
         // Build generics string for the JIT: BR, BC, D, KVL.
-        let generics = vec![
-            BR.to_string(),
-            BC.to_string(),
-            head_dim_pad.to_string(),
-            kv_len_pad.to_string(),
-        ];
+        // KVL removed: K/V tensors now use dynamic [-1, D] so the kernel compiles
+        // once per (BR, BC, D) instead of once per kv_len_pad increment.
+        let generics = vec![BR.to_string(), BC.to_string(), head_dim_pad.to_string()];
 
         // Process each (batch, head) independently.
         for batch_idx in 0..batch {
