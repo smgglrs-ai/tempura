@@ -237,6 +237,9 @@ MODULES=(
     attention_decode
     q2_lut_tiles
     parallel_accumulator
+    ggml_quants
+    deltanet
+    hybrid_dispatch
 )
 
 TOTAL_VERIFIED=0

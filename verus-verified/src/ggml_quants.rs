@@ -69,39 +69,40 @@ proof fn q5_0_5bit_reconstruction_range(qs_byte: u8, qh_bit: u8)
     ensures ({
         let lo_nibble: u8 = qs_byte & 0x0Fu8;
         let hi_nibble: u8 = qs_byte >> 4u8;
-        let v0: int = (lo_nibble as int) | ((qh_bit as int) << 4);
-        let v1: int = (hi_nibble as int) | ((qh_bit as int) << 4);
-        &&& v0 >= 0
-        &&& v0 <= 31
-        &&& v1 >= 0
-        &&& v1 <= 31
-        &&& (v0 - 16) >= -16int
-        &&& (v0 - 16) <= 15int
-        &&& (v1 - 16) >= -16int
-        &&& (v1 - 16) <= 15int
+        let v0: u8 = lo_nibble | (qh_bit << 4u8);
+        let v1: u8 = hi_nibble | (qh_bit << 4u8);
+        &&& v0 <= 31u8
+        &&& v1 <= 31u8
+        &&& (v0 as int - 16) >= -16int
+        &&& (v0 as int - 16) <= 15int
+        &&& (v1 as int - 16) >= -16int
+        &&& (v1 as int - 16) <= 15int
     }),
 {
-    assert(qs_byte & 0x0Fu8 <= 15) by (bit_vector);
-    assert(qs_byte >> 4u8 <= 15) by (bit_vector);
-    // lo_nibble <= 15, qh_bit <= 1, so lo_nibble | (qh_bit << 4) <= 15 | 16 = 31
-    // hi_nibble <= 15, so similarly <= 31
+    assert(qs_byte & 0x0Fu8 <= 15u8) by (bit_vector);
+    assert(qs_byte >> 4u8 <= 15u8) by (bit_vector);
+    assert(forall |lo: u8, hi: u8| lo <= 15u8 && hi <= 1u8 ==>
+        #[trigger] (lo | (hi << 4u8)) <= 31u8) by (bit_vector);
 }
 
 // Full Q5_0 reconstruction as done in the Kani harness: extract from u32 qh
 proof fn q5_0_5bit_range_from_qh(qs_byte: u8, qh: u32, j: nat)
     requires j < 16,
     ensures ({
-        let xh_0: int = ((qh >> (j as u32)) & 1u32) as int;
-        let xh_1: int = ((qh >> ((j + 16) as u32)) & 1u32) as int;
-        let v0: int = (qs_byte & 0x0Fu8) as int | (xh_0 << 4);
-        let v1: int = (qs_byte >> 4u8) as int | (xh_1 << 4);
-        &&& v0 >= 0 && v0 <= 31
-        &&& v1 >= 0 && v1 <= 31
+        let xh_0: u8 = (((qh >> (j as u32)) & 1u32) as u8);
+        let xh_1: u8 = (((qh >> ((j + 16) as u32)) & 1u32) as u8);
+        let v0: u8 = (qs_byte & 0x0Fu8) | (xh_0 << 4u8);
+        let v1: u8 = (qs_byte >> 4u8) | (xh_1 << 4u8);
+        &&& v0 <= 31u8
+        &&& v1 <= 31u8
     }),
 {
     assert(qs_byte & 0x0Fu8 <= 15u8) by (bit_vector);
     assert(qs_byte >> 4u8 <= 15u8) by (bit_vector);
-    assert(forall |x: u32, s: u32| s < 32 ==> (x >> s) & 1u32 <= 1u32) by (bit_vector);
+    assert(forall |x: u32, s: u32| s < 32 ==>
+        #[trigger] ((x >> s) & 1u32) <= 1u32) by (bit_vector);
+    assert(forall |lo: u8, hi: u8| lo <= 15u8 && hi <= 1u8 ==>
+        #[trigger] (lo | (hi << 4u8)) <= 31u8) by (bit_vector);
 }
 
 // ============================================================================
@@ -112,13 +113,13 @@ proof fn q6k_6bit_reconstruction(ql_byte: u8, qh_2bits: u8)
     requires qh_2bits <= 3,
     ensures ({
         let low: u8 = ql_byte & 0x0Fu8;
-        let q6: int = (low as int) | ((qh_2bits as int) << 4);
-        &&& q6 >= 0
-        &&& q6 <= 63
+        let q6: u8 = low | (qh_2bits << 4u8);
+        q6 <= 63u8
     }),
 {
-    assert(ql_byte & 0x0Fu8 <= 15) by (bit_vector);
-    // low <= 15, qh_2bits <= 3, so low | (qh_2bits << 4) <= 15 | 48 = 63
+    assert(ql_byte & 0x0Fu8 <= 15u8) by (bit_vector);
+    assert(forall |lo: u8, hi: u8| lo <= 15u8 && hi <= 3u8 ==>
+        #[trigger] (lo | (hi << 4u8)) <= 63u8) by (bit_vector);
 }
 
 // With shift extraction from qh byte (mirrors Kani dequant_q6k_6bit_range)
@@ -128,13 +129,15 @@ proof fn q6k_6bit_range_with_shift(ql_byte: u8, qh_byte: u8, shift: u32)
         let low: u8 = ql_byte & 0x0Fu8;
         let shift_amount: u8 = (shift * 2) as u8;
         let high: u8 = (qh_byte >> shift_amount) & 0x03u8;
-        let q6: int = (low as int) | ((high as int) << 4);
-        &&& q6 >= 0
-        &&& q6 <= 63
+        let q6: u8 = low | (high << 4u8);
+        q6 <= 63u8
     }),
 {
     assert(ql_byte & 0x0Fu8 <= 15u8) by (bit_vector);
-    assert(forall |b: u8, s: u8| s < 8 ==> ((b >> s) & 0x03u8) <= 3u8) by (bit_vector);
+    assert(forall |b: u8, s: u8| s < 8 ==>
+        #[trigger] ((b >> s) & 0x03u8) <= 3u8) by (bit_vector);
+    assert(forall |lo: u8, hi: u8| lo <= 15u8 && hi <= 3u8 ==>
+        #[trigger] (lo | (hi << 4u8)) <= 63u8) by (bit_vector);
 }
 
 // ============================================================================
@@ -149,7 +152,8 @@ proof fn q2k_2bit_extraction(byte: u8, shift: nat)
         q <= 3
     }),
 {
-    assert(forall |b: u8, s: u8| s < 8 ==> ((b >> s) & 3u8) <= 3u8) by (bit_vector);
+    assert(forall |b: u8, s: u8| s < 8 ==>
+        #[trigger] ((b >> s) & 3u8) <= 3u8) by (bit_vector);
 }
 
 // ============================================================================
@@ -161,12 +165,12 @@ proof fn q3k_3bit_reconstruction(low2: u8, high_bit: u8)
         low2 <= 3,
         high_bit <= 1,
     ensures ({
-        let q3: int = (low2 as int) | ((high_bit as int) << 2);
-        &&& q3 >= 0
-        &&& q3 <= 7
+        let q3: u8 = low2 | (high_bit << 2u8);
+        q3 <= 7u8
     }),
 {
-    // low2 <= 3, high_bit <= 1, so low2 | (high_bit << 2) <= 3 | 4 = 7
+    assert(forall |lo: u8, hi: u8| lo <= 3u8 && hi <= 1u8 ==>
+        #[trigger] (lo | (hi << 2u8)) <= 7u8) by (bit_vector);
 }
 
 // ============================================================================
@@ -184,7 +188,8 @@ proof fn tq2_0_trit_range(byte: u8, shift: nat)
         &&& value <= 2int
     }),
 {
-    assert(forall |b: u8, s: u8| s < 8 ==> ((b >> s) & 0x03u8) <= 3u8) by (bit_vector);
+    assert(forall |b: u8, s: u8| s < 8 ==>
+        #[trigger] ((b >> s) & 0x03u8) <= 3u8) by (bit_vector);
 }
 
 // ============================================================================
@@ -310,13 +315,13 @@ proof fn q8k_bsums_inductive(n: nat, partial_sum: int)
         partial_sum <= 127int * (n as int),
     ensures
         // adding one more i8 extends the range correctly
-        forall |x: int| -128 <= x && x <= 127 ==>
-            partial_sum + x >= -128int * ((n + 1) as int)
-            && partial_sum + x <= 127int * ((n + 1) as int),
+        forall |x: int| (-128 <= x && x <= 127) ==>
+            #[trigger] (partial_sum + x) >= -128int * ((n + 1) as int)
+            && (partial_sum + x) <= 127int * ((n + 1) as int),
 {
     assert forall |x: int| -128 <= x && x <= 127 implies
-        partial_sum + x >= -128int * ((n + 1) as int)
-        && partial_sum + x <= 127int * ((n + 1) as int)
+        #[trigger] (partial_sum + x) >= -128int * ((n + 1) as int)
+        && (partial_sum + x) <= 127int * ((n + 1) as int)
     by {
         assert(-128 * (n as int) + (-128) == -128 * ((n + 1) as int))
             by (nonlinear_arith);
@@ -404,10 +409,9 @@ proof fn mul_mat_weight_row_bytes(k: nat, block_size: nat, type_size: nat)
         nb * type_size <= k
     }),
 {
-    let nb = k / block_size;
-    assert(nb * block_size == k) by (nonlinear_arith)
+    assert((k / block_size) * block_size == k) by (nonlinear_arith)
         requires k % block_size == 0, block_size >= 1;
-    assert(nb * type_size <= nb * block_size) by (nonlinear_arith)
+    assert((k / block_size) * type_size <= (k / block_size) * block_size) by (nonlinear_arith)
         requires type_size <= block_size;
 }
 
@@ -440,7 +444,7 @@ proof fn f16_mantissa_rounding(mantissa: u32)
 proof fn q4_0_accumulator_no_i32_overflow(n: nat)
     requires n <= 16,
     ensures ({
-        let max_abs_product: int = 8 * 128;
+        let max_abs_product: int = 8int * 128int;
         let max_half_sum: int = max_abs_product * (n as int);
         &&& max_half_sum <= 16384
         &&& max_half_sum + max_half_sum <= 32768
@@ -526,14 +530,14 @@ proof fn iq2xxs_grid_index_in_bounds(value: u8)
 
 // IQ2XS: (q2 & 511) indexes into a 512-entry grid
 proof fn iq2xs_grid_index_from_q2(q2: u16)
-    ensures (q2 & 511u16) as nat < 512,
+    ensures ((q2 & 511u16) as nat) < 512,
 {
     assert(q2 & 511u16 < 512u16) by (bit_vector);
 }
 
 // IQ2XS signs: (q2 >> 9) indexes into a 128-entry table
 proof fn iq2xs_signs_index_in_bounds(q2: u16)
-    ensures (q2 >> 9u16) as nat < 128,
+    ensures ((q2 >> 9u16) as nat) < 128,
 {
     assert(q2 >> 9u16 <= 127u16) by (bit_vector);
 }
@@ -542,51 +546,49 @@ proof fn iq2xs_signs_index_in_bounds(q2: u16)
 proof fn iq2s_grid_index_in_bounds(qs: u8, qh_2bits: u8)
     requires qh_2bits <= 3,
     ensures ({
-        let idx: nat = (qs as nat) | ((qh_2bits as nat) << 8);
-        idx < 1024
+        let idx: u16 = (qs as u16) | ((qh_2bits as u16) << 8u16);
+        (idx as nat) < 1024
     }),
 {
     // qs <= 255, qh_2bits <= 3, so (qh_2bits << 8) <= 768
     // 255 | 768 = 1023 < 1024
     assert(forall |a: u8, b: u8| b <= 3 ==>
-        ((a as u16) | ((b as u16) << 8u16)) < 1024u16) by (bit_vector);
+        #[trigger] ((a as u16) | ((b as u16) << 8u16)) < 1024u16) by (bit_vector);
 }
 
 // IQ3: (qs | (bit << 8)) indexes into a 512-entry grid
 proof fn iq3_grid_index_in_bounds(qs: u8, qh_bit: u8)
     requires qh_bit <= 1,
     ensures ({
-        let idx: nat = (qs as nat) | ((qh_bit as nat) << 8);
-        idx < 512
+        let idx: u16 = (qs as u16) | ((qh_bit as u16) << 8u16);
+        (idx as nat) < 512
     }),
 {
     assert(forall |a: u8, b: u8| b <= 1 ==>
-        ((a as u16) | ((b as u16) << 8u16)) < 512u16) by (bit_vector);
+        #[trigger] ((a as u16) | ((b as u16) << 8u16)) < 512u16) by (bit_vector);
 }
 
 // IQ1S: (qs | (qh_3bits << 8)) indexes into a 2048-entry grid
 proof fn iq1s_grid_index_in_bounds(qs: u8, qh_3bits: u8)
     requires qh_3bits <= 7,
     ensures ({
-        let idx: nat = (qs as nat) | ((qh_3bits as nat) << 8);
-        idx < 2048
+        let idx: u16 = (qs as u16) | ((qh_3bits as u16) << 8u16);
+        (idx as nat) < 2048
     }),
 {
     // qs <= 255, qh_3bits <= 7, (7 << 8) = 1792, 255 | 1792 = 2047 < 2048
     assert(forall |a: u8, b: u8| b <= 7 ==>
-        ((a as u16) | ((b as u16) << 8u16)) < 2048u16) by (bit_vector);
+        #[trigger] ((a as u16) | ((b as u16) << 8u16)) < 2048u16) by (bit_vector);
 }
 
 // KSIGNS: ((val >> (7*l)) & 127) indexes into a 128-entry table
 proof fn ksigns_7bit_mask_in_bounds(val: u32, l: u32)
     requires l < 4,
-    ensures ({
-        let shift: u32 = 7 * l;
-        let masked: u32 = (val >> shift) & 127u32;
-        masked as nat < 128
-    }),
+    ensures
+        ((val >> (7u32 * l)) & 127u32) < 128u32,
 {
-    assert(forall |v: u32, s: u32| s < 28 ==> ((v >> s) & 127u32) < 128u32) by (bit_vector);
+    assert(forall |v: u32, s: u32| s < 28 ==>
+        #[trigger] ((v >> s) & 127u32) < 128u32) by (bit_vector);
 }
 
 // KMASK_IQ2XS: j < 8 means index is safe (table has 8 entries)
@@ -598,7 +600,7 @@ proof fn kmask_iq2xs_index_in_bounds(j: nat)
 
 // KVALUES_IQ4NL: (nibble & 0xF) indexes into a 16-entry table
 proof fn kvalues_iq4nl_index_in_bounds(nibble: u8)
-    ensures (nibble & 0x0Fu8) as nat < 16,
+    ensures ((nibble & 0x0Fu8) as nat) < 16,
 {
     assert(nibble & 0x0Fu8 < 16u8) by (bit_vector);
 }
