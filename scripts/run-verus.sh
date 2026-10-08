@@ -236,6 +236,10 @@ MODULES=(
     q2_gemv_rows
     attention_decode
     q2_lut_tiles
+    # Quantization format proofs (previously excluded from CI)
+    ggml_quants
+    deltanet
+    hybrid_dispatch
 )
 
 TOTAL_VERIFIED=0
