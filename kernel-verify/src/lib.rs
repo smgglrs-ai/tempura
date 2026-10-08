@@ -1,9 +1,10 @@
 use rand::{Rng, SeedableRng};
 use serde::Serialize;
-use tempura_kernel_api::{Attention, MatMul, RMSNorm, RoPE};
+use tempura_kernel_api::{Attention, MatMul, MatMulQ, RMSNorm, RoPE, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE};
 
 pub mod bitnet;
 pub mod composition;
+pub mod q4k;
 pub mod test_generators;
 
 pub use composition::{CompositionReport, CompositionVerifier, OpShape};
@@ -117,6 +118,37 @@ impl DualPipelineRunner {
         }
     }
 
+    /// Compare two `MatMulQ` implementations on Q4K workloads.
+    ///
+    /// `rel_tol` is the maximum permissible relative error between outputs.
+    /// Use 0.02 (2%) when one side uses Q8 activation quantization (ref↔SIMD);
+    /// use 0.05 (5%) when comparing CPU↔GPU (additional FP16 rounding on GPU).
+    pub fn compare_q4k(
+        &self,
+        name: &str,
+        ref_impl: &dyn MatMulQ,
+        opt_impl: &dyn MatMulQ,
+        configs: &[Q4kConfig],
+        rel_tol: f32,
+    ) -> VerificationReport {
+        let mut results = Vec::new();
+        for cfg in configs {
+            let result = compare_q4k_single(ref_impl, opt_impl, cfg, rel_tol);
+            results.push(result);
+        }
+        let pass = results.iter().all(|r| r.pass);
+        VerificationReport {
+            kernel_name: name.into(),
+            results,
+            pass,
+            tier: if pass {
+                VerificationTier::Tested
+            } else {
+                VerificationTier::Compiled
+            },
+        }
+    }
+
     pub fn compare_rope(
         &self,
         name: &str,
@@ -174,6 +206,123 @@ pub struct RoPEConfig {
     pub num_heads: usize,
     pub head_dim: usize,
     pub theta: f32,
+}
+
+/// Configuration for a single Q4K matrix-multiply comparison.
+#[derive(Debug, Clone)]
+pub struct Q4kConfig {
+    /// Number of activation rows (batch size / tokens)
+    pub m: usize,
+    /// Number of weight rows (output features)
+    pub n: usize,
+    /// Inner dimension (must be a multiple of Q4K_BLOCK_SIZE = 256)
+    pub k: usize,
+}
+
+/// Generate structurally valid Q4K weight bytes for `n` rows, each of width `k`.
+///
+/// Layout per block (144 bytes):
+///   [0..2]   d     (f16 scale)
+///   [2..4]   dmin  (f16 min scale)
+///   [4..16]  scales (12 bytes, 6-bit packed)
+///   [16..144] qs   (128 bytes, 4-bit nibble pairs)
+fn make_q4k_weights(n: usize, k: usize, seed: u8) -> Vec<u8> {
+    let blocks_per_row = k / Q4K_BLOCK_SIZE;
+    let mut out = vec![0u8; n * blocks_per_row * Q4K_BLOCK_BYTES];
+    for row in 0..n {
+        for blk in 0..blocks_per_row {
+            let s = seed.wrapping_add(row as u8).wrapping_add(blk as u8);
+            let base = (row * blocks_per_row + blk) * Q4K_BLOCK_BYTES;
+            // d (f16): small positive value
+            let d_bits = half::f16::from_f32(0.01 + 0.001 * s as f32).to_bits();
+            out[base] = d_bits as u8;
+            out[base + 1] = (d_bits >> 8) as u8;
+            // dmin (f16)
+            let dm_bits = half::f16::from_f32(0.005 * s as f32).to_bits();
+            out[base + 2] = dm_bits as u8;
+            out[base + 3] = (dm_bits >> 8) as u8;
+            // scales: 12 bytes, each nibble-field in [0,63]
+            for i in 0..12usize {
+                out[base + 4 + i] = s.wrapping_mul(i as u8 + 3) & 0x3F;
+            }
+            // qs: 128 bytes of nibble-packed 4-bit values
+            for i in 0..128usize {
+                let lo = s.wrapping_add(i as u8) & 0x0F;
+                let hi = s.wrapping_add(i as u8).wrapping_mul(3) & 0x0F;
+                out[base + 16 + i] = lo | (hi << 4);
+            }
+        }
+    }
+    out
+}
+
+fn compare_q4k_single(
+    ref_impl: &dyn MatMulQ,
+    opt_impl: &dyn MatMulQ,
+    cfg: &Q4kConfig,
+    rel_tol: f32,
+) -> KernelTestResult {
+    let test_name = format!("q4k m={} n={} k={}", cfg.m, cfg.n, cfg.k);
+
+    if cfg.k % Q4K_BLOCK_SIZE != 0 {
+        return KernelTestResult {
+            test_name,
+            pass: false,
+            max_abs_diff: f32::NAN,
+            l2_distance: f32::NAN,
+            detail: format!("k={} not divisible by Q4K_BLOCK_SIZE={}", cfg.k, Q4K_BLOCK_SIZE),
+        };
+    }
+
+    let weights = make_q4k_weights(cfg.n, cfg.k, 42);
+    let activations: Vec<f32> = {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        (0..cfg.m * cfg.k).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect()
+    };
+
+    let mut out_ref = vec![0.0f32; cfg.m * cfg.n];
+    let mut out_opt = vec![0.0f32; cfg.m * cfg.n];
+
+    let res_ref = ref_impl.forward_b_transposed_q4k(&activations, &weights, &mut out_ref, cfg.m, cfg.n, cfg.k);
+    let res_opt = opt_impl.forward_b_transposed_q4k(&activations, &weights, &mut out_opt, cfg.m, cfg.n, cfg.k);
+
+    match (res_ref, res_opt) {
+        (Ok(()), Ok(())) => {
+            let mad = max_abs_diff(&out_ref, &out_opt);
+            let l2 = l2_distance(&out_ref, &out_opt);
+
+            // Relative error: normalise by the max magnitude of the reference output
+            let max_ref = out_ref.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let rel_err = if max_ref > 1e-6 { mad / max_ref } else { mad };
+
+            let pass = rel_err <= rel_tol;
+            KernelTestResult {
+                test_name,
+                pass,
+                max_abs_diff: mad,
+                l2_distance: l2,
+                detail: if pass {
+                    format!("rel_err={rel_err:.4} within tol={rel_tol:.3}")
+                } else {
+                    format!("rel_err={rel_err:.4} exceeds tol={rel_tol:.3} (mad={mad:.6}, max_ref={max_ref:.6})")
+                },
+            }
+        }
+        (Err(e), _) => KernelTestResult {
+            test_name,
+            pass: false,
+            max_abs_diff: f32::NAN,
+            l2_distance: f32::NAN,
+            detail: format!("ref_impl error: {e}"),
+        },
+        (_, Err(e)) => KernelTestResult {
+            test_name,
+            pass: false,
+            max_abs_diff: f32::NAN,
+            l2_distance: f32::NAN,
+            detail: format!("opt_impl error: {e}"),
+        },
+    }
 }
 
 fn random_vec(len: usize, seed: u64) -> Vec<f32> {
