@@ -60,6 +60,34 @@ pub mod kernels {
         first.store(x.partition(shape![HALF_DIM]).load([2 * pid]));
         second.store(x.partition(shape![HALF_DIM]).load([2 * pid + 1]));
     }
+
+    /// Interleave kernel: merge two half-tensors back into flat [num_sh * head_dim].
+    ///
+    /// Inverse of `cutile_deinterleave`. Launches `num_sh * 2` programs so each
+    /// program writes exactly one HALF_DIM-element tile — no indexed store needed.
+    ///
+    ///   program 2*sh   → z tile 2*sh   = first tile sh
+    ///   program 2*sh+1 → z tile 2*sh+1 = second tile sh
+    ///
+    /// `z` is partitioned with HALF_DIM elements per tile (total = num_sh * 2 tiles).
+    /// Both `first` and `second` carry num_sh HALF_DIM-element tiles accessed by
+    /// indexed load at position pid/2.
+    #[cutile::entry()]
+    pub fn cutile_interleave<const HALF_DIM: i32>(
+        z: &mut Tensor<f32, { [HALF_DIM] }>,
+        first: &Tensor<f32, { [-1] }>,
+        second: &Tensor<f32, { [-1] }>,
+    ) {
+        let pid = program_id(0);
+        let sh = pid / 2;
+        let half_idx = pid % 2;
+        if half_idx == 0 {
+            z.store(first.partition(shape![HALF_DIM]).load([sh]));
+        } else {
+            z.store(second.partition(shape![HALF_DIM]).load([sh]));
+        }
+    }
+
 }
 
 /// GPU-accelerated Rotary Position Embeddings using NVIDIA cuTile Rust (`cutile-rs`).
@@ -307,31 +335,24 @@ impl CutileRoPE {
         .sync_on(stream)
         .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-        // ── 5. Download output halves and reconstruct interleaved on CPU ───────
-        // (2 D→H + 1 H→D — will be replaced by an on-device interleave kernel
-        //  once cutile gains indexed device-side store support)
-        let host_first: Vec<f32> = out_f
-            .unpartition()
-            .to_host_vec()
+        // ── 5. On-device interleave: 2×num_sh programs, each writes one half tile.
+        // z has num_sh * 2 tiles of `half` elements = num_sh * head_dim total.
+        // No indexed stores needed — pid is the tile index, pid/2 indexes first/second.
+        let first_arc: Arc<Tensor<f32>> = Arc::new(out_f.unpartition());
+        let second_arc: Arc<Tensor<f32>> = Arc::new(out_s.unpartition());
+
+        let z_t = api::zeros::<f32>(&[num_sh * head_dim])
             .sync_on(stream)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([half]);
 
-        let host_second: Vec<f32> = out_s
-            .unpartition()
-            .to_host_vec()
-            .sync_on(stream)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let (z_t, _of, _os) =
+            kernels::cutile_interleave(z_t, first_arc, second_arc)
+                .generics(vec![half.to_string()])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-        let mut result = vec![0.0f32; num_sh * head_dim];
-        for sh in 0..num_sh {
-            let base = sh * head_dim;
-            result[base..base + half].copy_from_slice(&host_first[sh * half..(sh + 1) * half]);
-            result[base + half..base + head_dim]
-                .copy_from_slice(&host_second[sh * half..(sh + 1) * half]);
-        }
-
-        // ── 6. Upload interleaved result to device and return ─────────────────
-        upload_vec(result)
+        Ok(Arc::new(z_t.unpartition()))
     }
 
     /// Shared rotation apply: splits `x` into halves, runs the GPU kernel,
