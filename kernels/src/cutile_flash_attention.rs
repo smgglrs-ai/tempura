@@ -140,6 +140,76 @@ pub mod kernels {
         // Normalize: divide each row by its softmax denominator.
         out.store(true_div(acc, l_i.broadcast(shape![BR, D])));
     }
+
+    /// Decode (seq_len=1) GQA attention — GPU-resident interleaved KV cache.
+    ///
+    /// One program per attention head.  Reads Q, K, and V entirely on device
+    /// from the flat interleaved GPU KV cache; no PCIe traffic for K or V.
+    ///
+    /// Cache layout (both K and V):
+    ///   flat [gpu_max_seq_len * kv_dim], interleaved [token, kv_head, head_dim]
+    ///   Partition by HEAD_DIM → block index (t * N_KV_HEADS + kv_h) for token t, kv-head kv_h.
+    ///
+    /// Online softmax uses the exp2 trick (same as `cutile_flash_attn_head`):
+    ///   score_exp2 = Q·K * (scale / log2)
+    ///   exp2(score_exp2) = exp(Q·K * scale)
+    ///
+    /// Grid: `n_heads` programs (one per attention head, launched by partition size).
+    #[cutile::entry()]
+    pub fn cutile_decode_attn<const N_KV_HEADS: i32, const HEAD_DIM: i32>(
+        out: &mut Tensor<f32, { [HEAD_DIM] }>,
+        q: &Tensor<f32, { [-1] }>,
+        k_cache: &Tensor<f32, { [-1] }>,
+        v_cache: &Tensor<f32, { [-1] }>,
+        kv_len: i32,
+        scale: f32,
+        heads_per_group: i32,
+    ) {
+        let h = program_id(0);
+        let kv_h = h / heads_per_group;
+
+        // Load Q for this attention head: q[h * HEAD_DIM .. (h+1) * HEAD_DIM]
+        let q_tile: Tile<f32, { [HEAD_DIM] }> = q.partition(shape![HEAD_DIM]).load([h]);
+
+        // Online softmax running statistics (exp2 trick, matching cutile_flash_attn_head).
+        let mut m: Tile<f32, { [1] }> = constant(f32::NEG_INFINITY, shape![1]);
+        let mut l: Tile<f32, { [1] }> = constant(0.0f32, shape![1]);
+        let mut acc: Tile<f32, { [HEAD_DIM] }> = constant(0.0f32, shape![HEAD_DIM]);
+
+        // Precompute scale / log2 once (broadcast_scalar accepts runtime f32 values).
+        let two: Tile<f32, { [] }> = constant(2.0f32, shape![]);
+        let log2_val: f32 = tile_to_scalar(log(two));
+        let scale_log2: Tile<f32, { [1] }> = broadcast_scalar(scale / log2_val, shape![1]);
+
+        let part_k = k_cache.partition(shape![HEAD_DIM]);
+        let part_v = v_cache.partition(shape![HEAD_DIM]);
+
+        for t in 0i32..kv_len {
+            // Cache block index for (token t, kv-head kv_h): t * N_KV_HEADS + kv_h
+            let cache_blk: i32 = t * N_KV_HEADS + kv_h;
+
+            // Load K for this token/kv-head and compute dot product with Q.
+            let k_tile: Tile<f32, { [HEAD_DIM] }> = part_k.load([cache_blk]);
+            let qk_sum: Tile<f32, { [] }> = reduce_sum(q_tile * k_tile, 0i32);
+            // Score in exp2 space: Q·K * (scale / log2)
+            let score: Tile<f32, { [1] }> = qk_sum.reshape(shape![1]) * scale_log2;
+
+            // Online softmax update (same algebra as cutile_flash_attn_head).
+            let m_new: Tile<f32, { [1] }> = max_tile(m, score);
+            let alpha: Tile<f32, { [1] }> = exp2(m - m_new, ftz::Disabled);
+            let p: Tile<f32, { [1] }> = exp2(score - m_new, ftz::Disabled);
+
+            // Load V and accumulate weighted sum.
+            let v_tile: Tile<f32, { [HEAD_DIM] }> = part_v.load([cache_blk]);
+            l = l * alpha + p;
+            acc = acc * alpha.broadcast(shape![HEAD_DIM])
+                + v_tile * p.broadcast(shape![HEAD_DIM]);
+            m = m_new;
+        }
+
+        // Normalise and write attention output for head h.
+        out.store(true_div(acc, l.broadcast(shape![HEAD_DIM])));
+    }
 }
 
 /// GPU-accelerated Flash Attention using NVIDIA cuTile Rust (`cutile-rs`).
@@ -740,6 +810,73 @@ impl CutileFlashAttention {
         }
 
         Ok(())
+    }
+}
+
+impl CutileFlashAttention {
+    /// Decode (seq_len=1) GQA attention entirely on device.
+    ///
+    /// Reads Q from `q_dev` (already on device, flat `[n_heads * head_dim]`) and
+    /// K/V from the GPU-resident interleaved cache tensors `k_cache` / `v_cache`
+    /// (flat `[gpu_max_seq_len * kv_dim]`).  No PCIe traffic for K or V.
+    ///
+    /// Returns a flat `[n_heads * head_dim]` device tensor.  Callers that need
+    /// `[1, q_pad]` for the O-projection must pad via D→D copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `n_heads` is not divisible by `n_kv_heads` or if any
+    /// cuTile / CUDA call fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_attention_device(
+        &self,
+        q_dev: &Arc<Tensor<f32>>,
+        k_cache: &Arc<Tensor<f32>>,
+        v_cache: &Arc<Tensor<f32>>,
+        kv_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        stream: &Arc<Stream>,
+    ) -> Result<Arc<Tensor<f32>>> {
+        if !n_heads.is_multiple_of(n_kv_heads) {
+            return Err(KernelError::InvalidConfig(format!(
+                "n_heads ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
+            )));
+        }
+        let q_dim = n_heads * head_dim;
+        let heads_per_group = (n_heads / n_kv_heads) as i32;
+        let generics = vec![n_kv_heads.to_string(), head_dim.to_string()];
+
+        // Allocate output: exactly n_heads blocks of HEAD_DIM — no padding.
+        let out_part = api::zeros::<f32>(&[q_dim])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([head_dim]);
+
+        let (out_part, ..) = unsafe {
+            kernels::cutile_decode_attn(
+                out_part,
+                q_dev.clone(),
+                k_cache.clone(),
+                v_cache.clone(),
+                kv_len as i32,
+                scale,
+                heads_per_group,
+            )
+            .generics(generics)
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        unsafe {
+            stream
+                .synchronize()
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        }
+
+        Ok(Arc::new(out_part.unpartition()))
     }
 }
 

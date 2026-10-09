@@ -230,6 +230,15 @@ impl CutileKvCache {
         Arc::clone(&self.v_device[layer])
     }
 
+    /// Return both K and V GPU device tensors for `layer`.
+    ///
+    /// Each tensor is flat `[gpu_max_seq_len * kv_dim]` in interleaved
+    /// `[token, kv_head, head_dim]` layout.  Only the first `seq_len * kv_dim`
+    /// elements are valid; the rest are zero-initialised.
+    pub fn kv_device_tensors(&self, layer: usize) -> (Arc<Tensor<f32>>, Arc<Tensor<f32>>) {
+        (Arc::clone(&self.k_device[layer]), Arc::clone(&self.v_device[layer]))
+    }
+
     pub fn gpu_max_seq_len(&self) -> usize {
         self.gpu_max_seq_len
     }
