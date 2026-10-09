@@ -653,25 +653,40 @@ impl CutileFlashAttention {
         }
 
         // ── Phase 4: allocate output tensors; submit kernels async ─────────────
+        // Pre-reshape K/V per-head once outside the loop.
+        // Each GPU KV cache tensor holds [gpu_max_seq_len * head_dim] elements.
+        // Reshape to [gpu_max_seq_len, head_dim] so the kernel's dynamic [-1, D]
+        // shape accepts it. The runtime `kv_len` parameter bounds tile iteration
+        // so only the first `kv_len` tokens are read regardless of gpu_max_seq_len.
+        // DO NOT reshape to [kv_len_pad, head_dim] — that would fail when
+        // gpu_max_seq_len * head_dim ≠ kv_len_pad * head_dim.
+        // Reshape K/V per-KV-head from flat [gpu_max_seq * head_dim] to 2-D
+        // [gpu_max_seq, head_dim] once outside the head loop. reshape on
+        // Arc<Tensor<f32>> returns Arc<Tensor<f32>> (zero-copy metadata).
+        let gpu_max_seq_len = k_devs[0].size() / head_dim_pad;
+        let mut k_devs_2d: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_kv_heads);
+        for t in k_devs.iter() {
+            let r = t
+                .clone()
+                .reshape(&[gpu_max_seq_len, head_dim_pad])
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            k_devs_2d.push(r);
+        }
+        let mut v_devs_2d: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_kv_heads);
+        for t in v_devs.iter() {
+            let r = t
+                .clone()
+                .reshape(&[gpu_max_seq_len, head_dim_pad])
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            v_devs_2d.push(r);
+        }
+
         let mut out_parts = Vec::with_capacity(n_heads);
         for head in 0..n_heads {
             let kv_head = head / heads_per_group;
 
-            // Reshape K/V device tensor to [kv_len_pad, head_dim] for the kernel.
-            // The gpu_max_seq_len * head_dim tensor has enough capacity; we present
-            // only the first kv_len_pad rows to the kernel shape annotation while
-            // the runtime kv_len parameter further limits iteration.
-            // k_devs[kv_head] is Arc<Tensor<f32>> holding [gpu_max_seq * head_dim]
-            // elements. Reshape to [kv_len_pad, head_dim] — reshape on Arc<Tensor>
-            // returns Arc<Tensor> (zero-copy metadata change).
-            let k_dev: Arc<Tensor<f32>> = k_devs[kv_head]
-                .clone()
-                .reshape(&[kv_len_pad, head_dim_pad])
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-            let v_dev: Arc<Tensor<f32>> = v_devs[kv_head]
-                .clone()
-                .reshape(&[kv_len_pad, head_dim_pad])
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            let k_dev = k_devs_2d[kv_head].clone();
+            let v_dev = v_devs_2d[kv_head].clone();
 
             let out_part = api::zeros::<f32>(&[seq_len_pad, head_dim_pad])
                 .sync_on(stream)

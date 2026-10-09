@@ -1,17 +1,19 @@
 /// GPU-resident KV cache.
 ///
-/// Maintains a host-side mirror of K and V data per layer (for prefill path)
-/// and a GPU-side per-head cache (for decode GPU attention path).
+/// Maintains a host-side mirror of K and V data per layer (for CPU attention
+/// and prefill flash attention) and a GPU-side flat cache (for future GPU
+/// decode attention).
 ///
-/// GPU layout: `k_device_heads[layer][kv_h]` is a flat 1-D tensor of
-/// `gpu_max_seq_len * head_dim` f32 elements.  Consecutive tokens for head
-/// `kv_h` are stored at `[seq * head_dim .. (seq+1) * head_dim]`.
+/// GPU layout: `k_device[layer]` is a flat 1-D tensor of
+/// `gpu_max_seq_len * kv_dim` f32 elements in interleaved layout
+/// `[gpu_max_seq_len, n_kv_heads, head_dim]`.  This matches the host mirror
+/// layout exactly, enabling a single D→D `cuMemcpyDtoDAsync` per new token
+/// per K or V per layer (2 copies total per layer), vs. the n_kv_heads × 2
+/// scatter copies that a per-head-contiguous layout would require.
 ///
-/// `append_device` updates both the host mirror (via a D→H copy) and the
-/// per-head GPU tensors (via async D→D `cuMemcpyDtoDAsync`) so that:
-///   - Decode attention can read K/V directly from GPU without any H2D
-///     re-upload of the growing history.
-///   - Prefill can continue to use `get_kv_host_slices` + `forward_batched`.
+/// The GPU cache is populated by `append_device` and is reserved for a future
+/// GPU-side decode attention kernel.  Current decode attention reads from the
+/// host mirror via `get_kv_host_slices`.
 use std::sync::Arc;
 
 use cuda_core::Stream;
@@ -24,9 +26,9 @@ use crate::config::ModelConfig;
 
 /// Maximum number of tokens stored in the GPU-resident KV cache.
 ///
-/// Set to 4096. For models with `max_seq_len > GPU_KV_MAX_SEQ_LEN` the GPU
-/// cache covers the first 4096 positions; sequences beyond that fall back to
-/// the CPU-attention path (which reads from the host mirror).
+/// Set to 4096.  For models with `max_seq_len > GPU_KV_MAX_SEQ_LEN` the GPU
+/// cache covers the first 4096 positions; sequences beyond that skip the GPU
+/// cache update (host mirror remains authoritative).
 pub const GPU_KV_MAX_SEQ_LEN: usize = 4096;
 
 pub struct CutileKvCache {
@@ -36,15 +38,14 @@ pub struct CutileKvCache {
     seq_len: usize,
     n_layers: usize,
     kv_dim: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
     max_seq_len: usize,
     stream: Arc<Stream>,
 
-    /// Per-head GPU tensors: k_device_heads[layer][kv_h] is flat
-    /// [gpu_max_seq_len * head_dim].  Empty when `gpu_max_seq_len == 0`.
-    k_device_heads: Vec<Vec<Arc<Tensor<f32>>>>,
-    v_device_heads: Vec<Vec<Arc<Tensor<f32>>>>,
+    /// GPU-resident KV cache: k_device[layer] is flat [gpu_max_seq_len * kv_dim].
+    /// Layout matches the host mirror: interleaved [token, kv_head, head_dim].
+    /// Populated by `append_device`; empty when `gpu_max_seq_len == 0`.
+    k_device: Vec<Arc<Tensor<f32>>>,
+    v_device: Vec<Arc<Tensor<f32>>>,
     gpu_max_seq_len: usize,
 }
 
@@ -54,14 +55,12 @@ unsafe impl Send for CutileKvCache {}
 unsafe impl Sync for CutileKvCache {}
 
 impl CutileKvCache {
-    /// Allocate host mirrors and GPU per-head tensors for all layers.
+    /// Allocate host mirrors and GPU flat tensors for all layers.
     ///
     /// `stream` must be the same CUDA stream used by the matmul / attention
-    /// kernels so that uploads are sequenced correctly.
+    /// kernels so that GPU operations are sequenced correctly.
     pub fn new(config: &ModelConfig, stream: Arc<Stream>) -> Result<Self, KernelError> {
-        let n_kv_heads = config.num_kv_heads;
-        let head_dim = config.head_dim;
-        let kv_dim = n_kv_heads * head_dim;
+        let kv_dim = config.num_kv_heads * config.head_dim;
         let layer_size = config.max_seq_len * kv_dim;
         let k_host = (0..config.num_layers)
             .map(|_| vec![0.0f32; layer_size])
@@ -71,30 +70,21 @@ impl CutileKvCache {
             .collect();
 
         let gpu_max_seq_len = config.max_seq_len.min(GPU_KV_MAX_SEQ_LEN);
-        let head_layer_size = gpu_max_seq_len * head_dim;
+        let gpu_layer_size = gpu_max_seq_len * kv_dim;
 
-        let mut k_device_heads: Vec<Vec<Arc<Tensor<f32>>>> =
-            Vec::with_capacity(config.num_layers);
-        let mut v_device_heads: Vec<Vec<Arc<Tensor<f32>>>> =
-            Vec::with_capacity(config.num_layers);
-
+        let mut k_device: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(config.num_layers);
+        let mut v_device: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(config.num_layers);
         for _ in 0..config.num_layers {
-            let mut k_layer: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_kv_heads);
-            let mut v_layer: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_kv_heads);
-            for _ in 0..n_kv_heads {
-                let k_t: Arc<Tensor<f32>> = api::zeros::<f32>(&[head_layer_size])
-                    .sync_on(&stream)
-                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                    .into();
-                let v_t: Arc<Tensor<f32>> = api::zeros::<f32>(&[head_layer_size])
-                    .sync_on(&stream)
-                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                    .into();
-                k_layer.push(k_t);
-                v_layer.push(v_t);
-            }
-            k_device_heads.push(k_layer);
-            v_device_heads.push(v_layer);
+            let k_t: Arc<Tensor<f32>> = api::zeros::<f32>(&[gpu_layer_size])
+                .sync_on(&stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into();
+            let v_t: Arc<Tensor<f32>> = api::zeros::<f32>(&[gpu_layer_size])
+                .sync_on(&stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into();
+            k_device.push(k_t);
+            v_device.push(v_t);
         }
 
         Ok(Self {
@@ -103,12 +93,10 @@ impl CutileKvCache {
             seq_len: 0,
             n_layers: config.num_layers,
             kv_dim,
-            n_kv_heads,
-            head_dim,
             max_seq_len: config.max_seq_len,
             stream,
-            k_device_heads,
-            v_device_heads,
+            k_device,
+            v_device,
             gpu_max_seq_len,
         })
     }
@@ -121,8 +109,8 @@ impl CutileKvCache {
         self.n_layers
     }
 
-    /// Returns `true` if there is a GPU-resident KV cache and the current
-    /// sequence length fits within it.
+    /// Returns `true` if the GPU-resident KV cache is available and has capacity
+    /// for the current sequence position.
     pub fn has_device_kv(&self) -> bool {
         self.gpu_max_seq_len > 0 && self.seq_len < self.gpu_max_seq_len
     }
@@ -148,16 +136,16 @@ impl CutileKvCache {
 
     /// Append `num_new_tokens` K/V tokens from device tensors for `layer`.
     ///
-    /// This method updates both the host mirror (via a D→H download) and the
-    /// per-head GPU tensors (via async D→D copies).  Callers must follow up
-    /// with `advance(num_new_tokens)` after processing all layers.
+    /// Updates both the host mirror (via D→H) and the flat GPU tensor (via
+    /// async D→D `cuMemcpyDtoDAsync`).  Callers must follow with
+    /// `advance(num_new_tokens)` after processing all layers.
     ///
-    /// `k_new` is expected to be a flat tensor of `num_new_tokens * kv_dim`
-    /// elements in interleaved layout `[num_new_tokens, n_kv_heads, head_dim]`.
+    /// `k_new` must hold `num_new_tokens * kv_dim` elements in the same
+    /// interleaved layout as the host mirror.
     ///
-    /// The D→D copies are enqueued on the cache's CUDA stream and complete
-    /// before any subsequent operation on that stream, so no explicit sync is
-    /// needed between `append_device` and the flash attention kernel.
+    /// The D→D copies are enqueued on the cache stream and complete before any
+    /// subsequent operation on the same stream, so no explicit sync is needed
+    /// between `append_device` and downstream GPU operations.
     pub fn append_device(
         &mut self,
         layer: usize,
@@ -178,42 +166,30 @@ impl CutileKvCache {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         self.append_host(layer, &k_host_new, &v_host_new, num_new_tokens);
 
-        // GPU per-head D→D scatter (if the GPU cache has capacity).
+        // GPU D→D: copy k_new/v_new into the flat GPU cache at the current
+        // sequence offset.  One copy per K and one per V (not per head).
+        // The GPU layout matches the host: [seq, kv_dim] interleaved.
         if self.seq_len + num_new_tokens > self.gpu_max_seq_len {
             return Ok(());
         }
 
-        let head_dim = self.head_dim;
-        let n_kv_heads = self.n_kv_heads;
+        let num_elems = num_new_tokens * self.kv_dim;
+        let offset_elems = self.seq_len * self.kv_dim;
         let f32_bytes = std::mem::size_of::<f32>() as u64;
 
-        // k_new layout (interleaved): token t, kv-head h → offset (t * n_kv_heads + h) * head_dim
-        let k_src_base: CUdeviceptr = k_new.device_pointer().cu_deviceptr();
-        let v_src_base: CUdeviceptr = v_new.device_pointer().cu_deviceptr();
+        let k_src: CUdeviceptr = k_new.device_pointer().cu_deviceptr();
+        let v_src: CUdeviceptr = v_new.device_pointer().cu_deviceptr();
 
-        for t in 0..num_new_tokens {
-            let dst_tok = self.seq_len + t;
-            let dst_offset_elems = dst_tok * head_dim;
+        let k_dst: CUdeviceptr =
+            self.k_device[layer].device_pointer().cu_deviceptr() + offset_elems as u64 * f32_bytes;
+        let v_dst: CUdeviceptr =
+            self.v_device[layer].device_pointer().cu_deviceptr() + offset_elems as u64 * f32_bytes;
 
-            for kv_h in 0..n_kv_heads {
-                let src_offset_elems = (t * n_kv_heads + kv_h) * head_dim;
-                let src_k: CUdeviceptr = k_src_base + (src_offset_elems as u64 * f32_bytes);
-                let src_v: CUdeviceptr = v_src_base + (src_offset_elems as u64 * f32_bytes);
-
-                let dst_k: CUdeviceptr =
-                    self.k_device_heads[layer][kv_h].device_pointer().cu_deviceptr()
-                        + (dst_offset_elems as u64 * f32_bytes);
-                let dst_v: CUdeviceptr =
-                    self.v_device_heads[layer][kv_h].device_pointer().cu_deviceptr()
-                        + (dst_offset_elems as u64 * f32_bytes);
-
-                unsafe {
-                    cuda_core::memcpy_dtod_async::<f32>(dst_k, src_k, head_dim, &self.stream)
-                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-                    cuda_core::memcpy_dtod_async::<f32>(dst_v, src_v, head_dim, &self.stream)
-                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-                }
-            }
+        unsafe {
+            cuda_core::memcpy_dtod_async::<f32>(k_dst, k_src, num_elems, &self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            cuda_core::memcpy_dtod_async::<f32>(v_dst, v_src, num_elems, &self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         }
 
         Ok(())
@@ -240,30 +216,26 @@ impl CutileKvCache {
         (&self.k_host[layer][..len], &self.v_host[layer][..len])
     }
 
-    /// Return the GPU tensor for KV-head `kv_h` in `layer`.
+    /// Return the GPU tensor for K in `layer`.
     ///
-    /// The tensor holds `gpu_max_seq_len * head_dim` elements; only the first
-    /// `seq_len * head_dim` elements are valid (written by `append_device`).
-    /// Flash attention kernels receive `kv_len` as a runtime parameter and
-    /// iterate only over valid positions.
-    pub fn k_device_head(&self, layer: usize, kv_h: usize) -> Arc<Tensor<f32>> {
-        Arc::clone(&self.k_device_heads[layer][kv_h])
+    /// The tensor holds `gpu_max_seq_len * kv_dim` elements in interleaved
+    /// layout `[gpu_max_seq_len, n_kv_heads, head_dim]`; only the first
+    /// `seq_len * kv_dim` elements are valid.  Flash attention kernels receive
+    /// `kv_len` as a runtime parameter and iterate only over valid positions.
+    pub fn k_device(&self, layer: usize) -> Arc<Tensor<f32>> {
+        Arc::clone(&self.k_device[layer])
     }
 
-    pub fn v_device_head(&self, layer: usize, kv_h: usize) -> Arc<Tensor<f32>> {
-        Arc::clone(&self.v_device_heads[layer][kv_h])
-    }
-
-    pub fn n_kv_heads(&self) -> usize {
-        self.n_kv_heads
-    }
-
-    pub fn head_dim(&self) -> usize {
-        self.head_dim
+    pub fn v_device(&self, layer: usize) -> Arc<Tensor<f32>> {
+        Arc::clone(&self.v_device[layer])
     }
 
     pub fn gpu_max_seq_len(&self) -> usize {
         self.gpu_max_seq_len
+    }
+
+    pub fn kv_dim(&self) -> usize {
+        self.kv_dim
     }
 
     /// Upload the live K/V prefix (first `kv_len` tokens) for `layer` to
@@ -330,8 +302,6 @@ mod tests {
 
     #[test]
     fn test_gpu_kv_cache_get_kv_device_roundtrip() {
-        use cutile::prelude::ToHostVec;
-
         let config = ModelConfig::tiny_test();
         let stream = make_stream();
         let mut cache = CutileKvCache::new(&config, Arc::clone(&stream)).unwrap();
@@ -373,20 +343,17 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_kv_cache_append_device_per_head() {
+    fn test_gpu_kv_cache_append_device_roundtrip() {
         use cutile::prelude::ToHostVec;
 
         let config = ModelConfig::tiny_test();
         let stream = make_stream();
         let mut cache = CutileKvCache::new(&config, Arc::clone(&stream)).unwrap();
 
-        let n_kv_heads = config.num_kv_heads;
-        let head_dim = config.head_dim;
-        let kv_dim = n_kv_heads * head_dim;
-
-        // Create a device tensor with known values.
+        let kv_dim = config.num_kv_heads * config.head_dim;
         let k_vals: Vec<f32> = (0..kv_dim).map(|i| (i + 1) as f32).collect();
         let v_vals: Vec<f32> = (0..kv_dim).map(|i| (i + 1) as f32 * 2.0).collect();
+
         let k_dev: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(k_vals.clone()))
             .sync_on(&stream)
             .unwrap()
@@ -399,24 +366,37 @@ mod tests {
         cache.append_device(0, &k_dev, &v_dev, 1).unwrap();
         cache.advance(1);
 
-        // Check host mirror.
+        // Verify host mirror.
         for i in 0..kv_dim {
-            assert!((cache.k_host[0][i] - k_vals[i]).abs() < 1e-5);
+            assert!(
+                (cache.k_host[0][i] - k_vals[i]).abs() < 1e-5,
+                "host k mismatch at {i}"
+            );
+            assert!(
+                (cache.v_host[0][i] - v_vals[i]).abs() < 1e-5,
+                "host v mismatch at {i}"
+            );
         }
 
-        // Check GPU per-head tensors.
-        for kv_h in 0..n_kv_heads {
-            let k_head = cache.k_device_head(0, kv_h);
-            let k_head_host: Vec<f32> = k_head.to_host_vec().sync_on(&stream).unwrap();
-            // First head_dim elements of k_head_host should match k_vals[kv_h*head_dim..]
-            for d in 0..head_dim {
-                let expected = k_vals[kv_h * head_dim + d];
-                assert!(
-                    (k_head_host[d] - expected).abs() < 1e-5,
-                    "kv_h={kv_h} d={d}: expected={expected} got={}",
-                    k_head_host[d]
-                );
-            }
+        // Verify GPU flat tensor (sync stream first to ensure D→D completed).
+        unsafe {
+            stream.synchronize().unwrap();
+        }
+        let k_gpu: Vec<f32> = cache.k_device(0).to_host_vec().sync_on(&stream).unwrap();
+        let v_gpu: Vec<f32> = cache.v_device(0).to_host_vec().sync_on(&stream).unwrap();
+        for i in 0..kv_dim {
+            assert!(
+                (k_gpu[i] - k_vals[i]).abs() < 1e-5,
+                "GPU k mismatch at {i}: expected={} got={}",
+                k_vals[i],
+                k_gpu[i]
+            );
+            assert!(
+                (v_gpu[i] - v_vals[i]).abs() < 1e-5,
+                "GPU v mismatch at {i}: expected={} got={}",
+                v_vals[i],
+                v_gpu[i]
+            );
         }
     }
 }
