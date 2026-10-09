@@ -240,6 +240,7 @@ MODULES=(
     ggml_quants
     deltanet
     hybrid_dispatch
+    quantized_gemv
 )
 
 TOTAL_VERIFIED=0

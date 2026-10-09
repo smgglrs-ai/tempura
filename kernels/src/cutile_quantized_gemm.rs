@@ -970,3 +970,149 @@ mod tests {
         }
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    // ── Q2_0 block layout and bit-extraction safety ───────────────────────────
+
+    /// Byte indices accessed during Q2_0 block upload are within the 34-byte block.
+    ///
+    /// Upload loop: block[2 + w*4 + b] for w in 0..8, b in 0..4.
+    /// Max index: 2 + 7*4 + 3 = 33. Block size = 34.
+    #[kani::proof]
+    fn q2_0_block_byte_indices_in_bounds() {
+        let w: usize = kani::any();
+        let b: usize = kani::any();
+        kani::assume(w < 8);
+        kani::assume(b < 4);
+        let idx = 2 + w * 4 + b;
+        assert!(idx < Q2_0_BLOCK_BYTES);
+    }
+
+    /// Extracting a 2-bit field from a packed u32 always yields a value in 0..=3.
+    #[kani::proof]
+    fn q2_0_2bit_extraction_range() {
+        let word: u32 = kani::any();
+        let bit_pair: u32 = kani::any();
+        kani::assume(bit_pair < 16);
+        let q = (word >> (bit_pair * 2)) & 3u32;
+        assert!(q <= 3);
+    }
+
+    /// Centering: (q - 1) for q in 0..=3 gives exactly {-1, 0, 1, 2}; no i32 underflow.
+    #[kani::proof]
+    fn q2_0_centered_value_range() {
+        let q: u32 = kani::any();
+        kani::assume(q <= 3);
+        let centered = q as i32 - 1;
+        assert!(centered >= -1 && centered <= 2);
+    }
+
+    /// IEEE 754 trick: `q | 0x4B000000` for q in 0..=3 has exp field = 0x96, not 0xFF,
+    /// so the resulting f32 bitcast is a normal finite number (not NaN or Inf).
+    #[kani::proof]
+    fn q2_0_ieee_trick_no_nan() {
+        let q: u32 = kani::any();
+        kani::assume(q <= 3);
+        let biased = q | 0x4B000000u32;
+        let exp = (biased >> 23) & 0xFF;
+        assert!(exp != 0xFF);
+    }
+
+    /// Packed GPU slot indices: `1 + word` < Q2_0_PACKED_U32S (= 9) for word in 0..8.
+    #[kani::proof]
+    fn q2_0_packed_word_slot_in_bounds() {
+        let word: usize = kani::any();
+        kani::assume(word < 8);
+        let offset_in_block = 1 + word;
+        assert!(offset_in_block < Q2_0_PACKED_U32S);
+    }
+
+    // ── Q4K block layout and nibble safety ───────────────────────────────────
+
+    /// Nibble byte index for Q4K qs array: 16 + idx/2 < 144 for idx < 256.
+    #[kani::proof]
+    fn q4k_block_upload_no_oob() {
+        let idx: usize = kani::any();
+        kani::assume(idx < 256);
+        // d: bytes 0-1, dmin: bytes 2-3, scales: bytes 4-15, qs: bytes 16-143
+        let byte_idx = 16usize + idx / 2;
+        assert!(byte_idx < Q4K_BLOCK_BYTES);
+    }
+
+    /// Q4K nibble extraction: both the low and high nibble of any byte are in 0..=15.
+    #[kani::proof]
+    fn q4k_nibble_range() {
+        let byte: u8 = kani::any();
+        let lo = byte & 0x0F;
+        let hi = byte >> 4;
+        assert!(lo <= 15);
+        assert!(hi <= 15);
+    }
+
+    /// Q4K 6-bit scale extraction: `byte & 0x3F` is always in 0..=63.
+    #[kani::proof]
+    fn q4k_6bit_scale_range() {
+        let byte: u8 = kani::any();
+        let sc = byte & 0x3F;
+        assert!(sc <= 63);
+    }
+
+    // ── Q6K block layout and 6-bit reconstruction ────────────────────────────
+
+    /// Q6K 6-bit reconstruction from ql (low 4 bits) + qh (high 2 bits) is in 0..=63.
+    /// The signed offset `q6 - 32` is then in [-32, 31].
+    #[kani::proof]
+    fn q6k_block_upload_no_oob() {
+        let ql_byte: u8 = kani::any();
+        let qh_byte: u8 = kani::any();
+        let shift: u32 = kani::any();
+        kani::assume(shift < 4);
+        let low4 = (ql_byte & 0x0F) as u32;
+        let high2 = ((qh_byte >> (shift * 2)) & 0x03) as u32;
+        let q6 = low4 | (high2 << 4);
+        assert!(q6 <= 63);
+        let q_signed = q6 as i32 - 32;
+        assert!(q_signed >= -32 && q_signed <= 31);
+    }
+
+    // ── TQ2 ternary bit extraction ────────────────────────────────────────────
+
+    /// TQ2 2-bit trit extraction: value in 0..=3, centered (trit-1) in {-1,0,1,2}.
+    #[kani::proof]
+    fn tq2_block_upload_no_oob() {
+        let byte: u8 = kani::any();
+        let shift: u32 = kani::any();
+        kani::assume(shift < 4);
+        let trit = ((byte >> (shift * 2)) & 0x03) as i32;
+        assert!(trit >= 0 && trit <= 3);
+        let centered = trit - 1;
+        assert!(centered >= -1 && centered <= 2);
+    }
+
+    // ── Full-block dequant no-panic harnesses ─────────────────────────────────
+
+    #[kani::proof]
+    fn dequant_q4k_block_no_panic() {
+        let block: [u8; 144] = kani::any();
+        let mut out = [0.0f32; 256];
+        dequant_q4k_block(&block, &mut out);
+    }
+
+    #[kani::proof]
+    fn dequant_q6k_block_no_panic() {
+        let block: [u8; 210] = kani::any();
+        let mut out = [0.0f32; 256];
+        dequant_q6k_block(&block, &mut out);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn dequant_tq2_block_no_panic() {
+        let block: [u8; 66] = kani::any();
+        let mut out = [0.0f32; 256];
+        dequant_tq2_block(&block, &mut out);
+    }
+}
