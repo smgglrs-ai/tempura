@@ -1264,12 +1264,13 @@ impl CutileGpuModel {
                 );
             }
         };
-        // The Q2_0 GEMV kernel expects rank-1 x (activation). normed_dev is
-        // rank-2 [seq_len, h_pad] from RMSNorm. Flatten via download + re-upload
-        // on the matmul stream so the kernel sees a contiguous rank-1 tensor.
-        let k = dw.k_blocks * tempura_kernels::cutile_quantized_gemm::Q2_0_QK;
-        let a_host = self.download_device_tensor(a);
-        let a_flat = self.to_device_flat_padded(&a_host[..k], 1, k, k);
+        // normed_dev is rank-2 [seq_len, h_pad] from RMSNorm. The Q2_0 GEMV
+        // kernel expects rank-1 x. Reshape [1, h_pad] → [h_pad] as a zero-copy
+        // metadata operation (no D→H→D round-trip). The kernel reads exactly
+        // k_blocks * Q2_0_QK elements, which is ≤ h_pad; the padding is ignored.
+        let a_flat = Arc::clone(a)
+            .reshape(&[self.h_pad])
+            .expect("gemm_q2_d2d: reshape [1, h_pad] → [h_pad] failed");
         self.q2_gemv
             .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
             .expect("CutileGpuModel::gemm_q2_d2d failed")
@@ -1291,9 +1292,10 @@ impl CutileGpuModel {
                 );
             }
         };
-        let k = dw.k_blocks * Q6K_QK;
-        let a_host = self.download_device_tensor(a);
-        let a_flat = self.to_device_flat_padded(&a_host[..k], 1, k, k);
+        // Zero-copy reshape [1, h_pad] → [h_pad]; kernel reads only k_blocks * Q6K_QK.
+        let a_flat = Arc::clone(a)
+            .reshape(&[self.h_pad])
+            .expect("gemm_q6k_d2d: reshape [1, h_pad] → [h_pad] failed");
         self.q6k_gemv
             .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
             .expect("CutileGpuModel::gemm_q6k_d2d failed")
@@ -1315,11 +1317,10 @@ impl CutileGpuModel {
                 );
             }
         };
-        // The Q4_K GEMV kernel expects a rank-1 x.  Download and re-upload as a
-        // flat contiguous tensor — same workaround as the Q2_0 path.
-        let k = dw.k_blocks * Q4K_BLOCK_SIZE;
-        let a_host = self.download_device_tensor(a);
-        let a_flat = self.to_device_flat_padded(&a_host[..k], 1, k, k);
+        // Zero-copy reshape [1, h_pad] → [h_pad]; kernel reads only k_blocks * Q4K_BLOCK_SIZE.
+        let a_flat = Arc::clone(a)
+            .reshape(&[self.h_pad])
+            .expect("gemm_q4k_d2d: reshape [1, h_pad] → [h_pad] failed");
         self.q4k_gemv
             .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
             .expect("CutileGpuModel::gemm_q4k_d2d failed")
