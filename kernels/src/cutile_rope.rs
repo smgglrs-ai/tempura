@@ -470,6 +470,15 @@ impl CutileRoPE {
         let cos_t = upload_vec(cos_exp)?;
         let sin_t = upload_vec(sin_exp)?;
 
+        // Force x_dev to rank-1 by downloading and re-uploading.  The Q2_0 GEMV
+        // path (and possibly cuTile partition artefacts) may leave 2 strides on the
+        // tensor even after reshape; a fresh upload always produces exactly 1 stride.
+        let x_host: Vec<f32> = x_dev
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let x_flat = upload_vec(x_host[..num_sh * head_dim].to_vec())?;
+
         let generics = vec![half.to_string()];
 
         // Reclaim the z output buffer from the previous call.  In single-threaded
@@ -499,7 +508,7 @@ impl CutileRoPE {
             kernels::cutile_deinterleave(
                 x_first_flat.partition([half]),
                 x_second_flat.partition([half]),
-                x_dev.clone(),
+                x_flat,
             )
             .generics(generics.clone())
             .async_on(stream)

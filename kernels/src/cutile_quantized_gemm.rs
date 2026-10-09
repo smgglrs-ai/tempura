@@ -137,11 +137,20 @@ impl CutileQ2Gemv {
                 .sync_on(stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-        let out = z
+        // Force a true rank-1 tensor: download the result and re-upload as a fresh
+        // flat allocation.  cuTile unpartition() + reshape() may leave partition
+        // stride metadata visible to subsequent kernels (cutile_deinterleave rejects
+        // tensors with 2 strides).  This round-trip is the simplest portable fix.
+        let host: Vec<f32> = z
             .unpartition()
-            .reshape(&[n])
+            .to_host_vec()
+            .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-        Ok(Arc::new(out))
+        let out_flat: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(host))
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+        Ok(out_flat)
     }
 }
 
