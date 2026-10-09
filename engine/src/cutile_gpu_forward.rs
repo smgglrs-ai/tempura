@@ -21,6 +21,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use cuda_core::sys::CUdeviceptr;
 use cuda_core::Stream;
 use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
@@ -1016,6 +1017,41 @@ impl CutileGpuModel {
         )
     }
 
+    /// Prepare the attention output on device for the O-projection GEMM.
+    ///
+    /// The decode attention kernel returns a flat `[q_dim]` tensor.  The O-proj
+    /// GEMM expects `[1, q_pad]`.  When `q_pad == q_dim` a zero-copy reshape is
+    /// done.  Otherwise a zero-padded `[1, q_pad]` buffer is allocated on the
+    /// GPU and the attention output is written into it via D→D copy — no PCIe.
+    fn attn_out_to_oproj_device(
+        &self,
+        attn_out: &Arc<Tensor<f32>>,
+        q_dim: usize,
+        q_pad: usize,
+    ) -> Arc<Tensor<f32>> {
+        let stream = self.matmul.stream();
+        if q_pad == q_dim {
+            return attn_out
+                .clone()
+                .reshape(&[1, q_pad])
+                .expect("attn_out_to_oproj_device: reshape failed")
+                .into();
+        }
+        // Allocate zero-filled padded buffer and D→D copy the valid prefix.
+        let padded: Arc<Tensor<f32>> = Arc::new(
+            api::zeros::<f32>(&[1, q_pad])
+                .sync_on(stream)
+                .expect("attn_out_to_oproj_device: zeros alloc failed"),
+        );
+        let src: CUdeviceptr = attn_out.device_pointer().cu_deviceptr();
+        let dst: CUdeviceptr = padded.device_pointer().cu_deviceptr();
+        unsafe {
+            cuda_core::memcpy_dtod_async::<f32>(dst, src, q_dim, stream)
+                .expect("attn_out_to_oproj_device: D→D copy failed");
+        }
+        padded
+    }
+
     /// Device-to-device GEMM: `output[m, n] = a[m, k_pad] @ b[n, k_pad]^T`.
     ///
     /// The caller MUST ensure `a` has exactly `dw.k_pad` columns.  No download
@@ -1812,79 +1848,111 @@ impl CutileGpuModel {
             let kv_len = gpu_kv_cache.seq_len() + seq_len;
 
             // ── 2e. Attention ─────────────────────────────────────────────────
-            let q_rot_host = self.download_device_tensor(&q_rot_dev);
-            let (k_slice, v_slice) = gpu_kv_cache.get_kv_host_slices(layer, kv_len);
-            let mut attn_output = vec![0.0f32; seq_len * n_heads * head_dim];
             let scale = 1.0 / (head_dim as f32).sqrt();
 
-            if seq_len == 1 {
-                // Decode: 1-token GQA attention is O(kv_len × head_dim) on CPU.
-                // Using per-head GPU flash attention for seq_len=1 costs ~896
-                // sync_on CUDA calls per token (32 head H2D/D2H × 28 layers),
-                // each with driver overhead that dominates at small tensor sizes.
-                // CPU GQA for 1 token: ~500K multiply-adds — essentially free.
-                let heads_per_group = n_heads / n_kv_heads;
-                let mut scores = vec![0.0f32; kv_len];
-                for h in 0..n_heads {
-                    let kv_h = h / heads_per_group;
-                    let q_head = &q_rot_host[h * head_dim..(h + 1) * head_dim];
-                    let kv_k = &k_slice[kv_h * head_dim..];
-                    let kv_v = &v_slice[kv_h * head_dim..];
-
-                    for t in 0..kv_len {
-                        let k_tok = &kv_k[t * n_kv_heads * head_dim
-                            ..t * n_kv_heads * head_dim + head_dim];
-                        scores[t] =
-                            q_head.iter().zip(k_tok).map(|(a, b)| a * b).sum::<f32>() * scale;
-                    }
-
-                    let max_s =
-                        scores[..kv_len].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let sum: f32 = scores[..kv_len]
-                        .iter_mut()
-                        .map(|s| {
-                            *s = (*s - max_s).exp();
-                            *s
-                        })
-                        .sum();
-                    for s in &mut scores[..kv_len] {
-                        *s /= sum;
-                    }
-
-                    let out_head = &mut attn_output[h * head_dim..(h + 1) * head_dim];
-                    for v_d in 0..head_dim {
-                        out_head[v_d] = 0.0;
-                    }
-                    for t in 0..kv_len {
-                        let v_tok = &kv_v[t * n_kv_heads * head_dim
-                            ..t * n_kv_heads * head_dim + head_dim];
-                        for d in 0..head_dim {
-                            out_head[d] += scores[t] * v_tok[d];
-                        }
-                    }
-                }
-            } else {
-                // Prefill: GPU flash attention (amortises CUDA overhead over many rows).
-                self.flash_attn
-                    .forward_batched(
-                        &q_rot_host,
-                        k_slice,
-                        v_slice,
-                        &mut attn_output,
-                        1,
-                        seq_len,
+            // For decode (seq_len=1) with the GPU KV cache active: run the fused
+            // `cutile_decode_attn` kernel which reads Q, K, V entirely on device,
+            // eliminating all PCIe traffic for the KV cache.  At context length L
+            // this saves 2 × L × n_kv_heads × head_dim × 4 bytes per layer per
+            // token — dominant PCIe traffic at long context.
+            //
+            // Falls back to the host-based path when:
+            //   - seq_len > 1 (prefill): GPU flash attention via forward_batched
+            //   - seq_len == 1 but kv_len > GPU_KV_MAX_SEQ_LEN: CPU GQA fallback
+            let attn_padded_dev = if seq_len == 1 && gpu_kv_cache.has_device_kv() {
+                // GPU decode attention: Q on device, K/V from GPU-resident cache.
+                let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer);
+                let attn_out_dev = self
+                    .flash_attn
+                    .decode_attention_device(
+                        &q_rot_dev,
+                        &k_dev_full,
+                        &v_dev_full,
                         kv_len,
                         n_heads,
                         n_kv_heads,
                         head_dim,
                         scale,
+                        self.matmul.stream(),
                     )
-                    .expect("CutileGpuModel: flash attention failed");
-            }
+                    .expect("CutileGpuModel: GPU decode attention failed");
+                // Pad [q_dim] → [1, q_pad] for O projection via GPU D→D copy.
+                self.attn_out_to_oproj_device(&attn_out_dev, q_dim, self.q_pad)
+            } else {
+                // Host-based path: prefill (GPU flash attn) or long-context fallback.
+                let q_rot_host = self.download_device_tensor(&q_rot_dev);
+                let (k_slice, v_slice) = gpu_kv_cache.get_kv_host_slices(layer, kv_len);
+                let mut attn_output = vec![0.0f32; seq_len * n_heads * head_dim];
+
+                if seq_len == 1 {
+                    // CPU GQA fallback for kv_len > GPU_KV_MAX_SEQ_LEN.
+                    let heads_per_group = n_heads / n_kv_heads;
+                    let mut scores = vec![0.0f32; kv_len];
+                    for h in 0..n_heads {
+                        let kv_h = h / heads_per_group;
+                        let q_head = &q_rot_host[h * head_dim..(h + 1) * head_dim];
+                        let kv_k = &k_slice[kv_h * head_dim..];
+                        let kv_v = &v_slice[kv_h * head_dim..];
+
+                        for t in 0..kv_len {
+                            let k_tok = &kv_k[t * n_kv_heads * head_dim
+                                ..t * n_kv_heads * head_dim + head_dim];
+                            scores[t] = q_head
+                                .iter()
+                                .zip(k_tok)
+                                .map(|(a, b)| a * b)
+                                .sum::<f32>()
+                                * scale;
+                        }
+
+                        let max_s =
+                            scores[..kv_len].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let sum: f32 = scores[..kv_len]
+                            .iter_mut()
+                            .map(|s| {
+                                *s = (*s - max_s).exp();
+                                *s
+                            })
+                            .sum();
+                        for s in &mut scores[..kv_len] {
+                            *s /= sum;
+                        }
+
+                        let out_head = &mut attn_output[h * head_dim..(h + 1) * head_dim];
+                        for v_d in 0..head_dim {
+                            out_head[v_d] = 0.0;
+                        }
+                        for t in 0..kv_len {
+                            let v_tok = &kv_v[t * n_kv_heads * head_dim
+                                ..t * n_kv_heads * head_dim + head_dim];
+                            for d in 0..head_dim {
+                                out_head[d] += scores[t] * v_tok[d];
+                            }
+                        }
+                    }
+                } else {
+                    // Prefill: GPU flash attention (amortises CUDA overhead over many rows).
+                    self.flash_attn
+                        .forward_batched(
+                            &q_rot_host,
+                            k_slice,
+                            v_slice,
+                            &mut attn_output,
+                            1,
+                            seq_len,
+                            kv_len,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            scale,
+                        )
+                        .expect("CutileGpuModel: flash attention failed");
+                }
+
+                self.to_device_padded(&attn_output, seq_len, q_dim, self.q_pad)
+            };
 
             // ── 2f. O projection — device-to-device ──────────────────────────
-            // Upload attn_output padded to q_pad for O projection.
-            let attn_padded_dev = self.to_device_padded(&attn_output, seq_len, q_dim, self.q_pad);
             let o_dev = self.gemm_any_d2d_slot(&attn_padded_dev, o_w_name, seq_len, SLOT_O);
 
             // ── 2g. Residual add (GPU) ────────────────────────────────────────
