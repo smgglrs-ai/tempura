@@ -8,6 +8,23 @@ use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
 use cutile::tensor::{IntoPartition, Reshape, Tensor};
 use std::sync::Arc;
 
+// ── Q6_K block layout constants ───────────────────────────────────────────────
+// Q6_K: 6-bit, 256 elements per block, 210 bytes on disk
+//   [0..128]   ql     (low 4-bit per element, 128 bytes)
+//   [128..192] qh     (high 2-bit per element, 64 bytes — 4 elements per byte)
+//   [192..208] scales (16 i8 values, one per 16-element group)
+//   [208..210] d      (f16 super-scale)
+// Dequant: q_full = (ql[i/2] >> 4*(i%2) & 0xF) | (qh bits << 4); weight = d × scale[g] × (q_full − 32)
+//
+// GPU packed format (81 u32 per block):
+//   u32[0]      = f32 bits of d (f16 → f32 at upload time)
+//   u32[1..17]  = 16 u32s, f32 bits of each i8 group scale (preconverted at upload time)
+//   u32[17..81] = 64 u32s of q_full bytes: q_full[i] packed 4 per u32 in output element order
+//                 element i occupies byte (i%4) of u32[(i/4)]
+//                 q_full ∈ [0, 63]; weight = d × scale[i/16] × (q_full − 32)
+pub const Q6K_QK: usize = 256;
+pub const Q6K_PACKED_U32S: usize = 81; // 1 + 16 + 64 = 81
+
 // ── Q2_0 block layout constants ──────────────────────────────────────────────
 // Q2_0 (PrismML): 2-bit quantized, 128 elements per block, 34 bytes per block
 //   [0..2]   d  (f16 scale)
@@ -90,6 +107,76 @@ pub mod kernels {
         }
         z.store(acc);
     }
+
+    /// Q6_K dequantized GEMV: z[1] = Σ_k dequant(packed[pid_n, k]) × x[k]
+    ///
+    /// Packed layout: [N × K_BLOCKS × Q6K_PACKED_U32S] u32
+    ///   packed[n, blk, 0]       = f32 bits of d (block super-scale)
+    ///   packed[n, blk, 1..17]   = f32 bits of 16 group scales (i8 → f32 at upload)
+    ///   packed[n, blk, 17..81]  = 64 u32 words of q_full values (4 bytes per u32)
+    ///     byte j of word w = q_full[blk*256 + w*4 + j], q_full ∈ [0, 63]
+    ///     dequant: d × scale[group] × (q_full − 32), group = elem / 16
+    ///
+    /// Grid: (N, 1, 1) — one program per output neuron.
+    #[cutile::entry()]
+    pub fn cutile_q6k_gemv<const K_BLOCKS: i32>(
+        z: &mut Tensor<f32, { [1] }>,
+        x: &Tensor<f32, { [-1] }>,
+        packed: &Tensor<u32, { [-1] }>,
+    ) {
+        let pid_n = program_id(0);
+        let part_x = x.partition(shape![1]);
+        let part_p = packed.partition(shape![1]);
+        let mut acc: Tile<f32, { [1] }> = broadcast_scalar(0.0_f32, shape![1]);
+
+        // IEEE 754 trick: bitcast(q | 0x4B000000) - 8388640.0 maps
+        // q ∈ [0, 63] to (q - 32) ∈ [−32, 31] as float.
+        // 0x4B000000 = 2^23 as f32; 8388608 + 32 = 8388640.
+        let magic: Tile<u32, { [1] }> = broadcast_scalar(0x4B000000_u32, shape![1]);
+        let mask_ff: Tile<u32, { [1] }> = broadcast_scalar(0xFF_u32, shape![1]);
+        let center: Tile<f32, { [1] }> = broadcast_scalar(8388640.0_f32, shape![1]);
+
+        for blk in 0i32..K_BLOCKS {
+            // pack_base: start of this block's 81-u32 region for neuron pid_n.
+            let pack_base = pid_n * K_BLOCKS * 81 + blk * 81;
+            let x_base = blk * 256;
+
+            // Block super-scale d stored as f32 bit pattern in slot 0.
+            let d_u32: Tile<u32, { [1] }> = part_p.load([pack_base]);
+            let d: Tile<f32, { [1] }> = bitcast(d_u32);
+
+            // 16 groups of 16 elements; group index == element_index / 16.
+            for group in 0i32..16 {
+                // Group scale (slots 1..17, preconverted from i8 to f32 on CPU).
+                let sc_u32: Tile<u32, { [1] }> = part_p.load([pack_base + 1 + group]);
+                let sc: Tile<f32, { [1] }> = bitcast(sc_u32);
+                let d_sc: Tile<f32, { [1] }> = d * sc;
+
+                // 4 u32 words per group (slots 17..81, 4 q_full bytes per word).
+                for word in 0i32..4 {
+                    let word_data: Tile<u32, { [1] }> =
+                        part_p.load([pack_base + 17 + group * 4 + word]);
+                    let x_elem_base = x_base + group * 16 + word * 4;
+
+                    // 4 elements (bytes) per word.
+                    for byte_pos in 0i32..4 {
+                        let shift: Tile<u32, { [1] }> =
+                            broadcast_scalar((byte_pos * 8) as u32, shape![1]);
+                        // Extract q_full byte in [0, 63].
+                        let q_u32: Tile<u32, { [1] }> =
+                            andi(shri(word_data, shift), mask_ff);
+                        // IEEE trick: (q_full − 32) as f32.
+                        let q_f32: Tile<f32, { [1] }> =
+                            bitcast(ori(q_u32, magic)) - center;
+                        let x_val: Tile<f32, { [1] }> =
+                            part_x.load([x_elem_base + byte_pos]);
+                        acc = acc + d_sc * q_f32 * x_val;
+                    }
+                }
+            }
+        }
+        z.store(acc);
+    }
 }
 
 /// GPU-resident Q2_0 GEMV dispatcher.
@@ -141,6 +228,65 @@ impl CutileQ2Gemv {
         // flat allocation.  cuTile unpartition() + reshape() may leave partition
         // stride metadata visible to subsequent kernels (cutile_deinterleave rejects
         // tensors with 2 strides).  This round-trip is the simplest portable fix.
+        let host: Vec<f32> = z
+            .unpartition()
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let out_flat: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(host))
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+        Ok(out_flat)
+    }
+}
+
+/// GPU-resident Q6_K GEMV dispatcher.
+///
+/// Holds the CUDA stream and dispatches `cutile_q6k_gemv` for decode (m=1)
+/// forward passes where weights are stored in pre-expanded packed Q6_K format.
+pub struct CutileQ6kGemv {
+    stream: Arc<Stream>,
+}
+
+unsafe impl Send for CutileQ6kGemv {}
+unsafe impl Sync for CutileQ6kGemv {}
+
+impl CutileQ6kGemv {
+    /// Create from an existing CUDA stream (share with `CutileMatMul`).
+    pub fn from_stream(stream: Arc<Stream>) -> Self {
+        Self { stream }
+    }
+
+    pub fn stream(&self) -> &Arc<Stream> {
+        &self.stream
+    }
+
+    /// Device-to-device Q6_K GEMV: output[n] = packed_weights × x[k].
+    ///
+    /// `packed` holds `n × k_blocks × Q6K_PACKED_U32S` u32 elements.
+    /// `x` holds `k = k_blocks × Q6K_QK` f32 activation elements.
+    pub fn forward_d2d(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let stream = &self.stream;
+
+        let z = api::zeros::<f32>(&[n])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1]);
+
+        let (z, _x, _p) =
+            kernels::cutile_q6k_gemv(z, Arc::clone(x), Arc::clone(packed))
+                .generics(vec![k_blocks.to_string()])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        // Same rank-1 force workaround as CutileQ2Gemv::forward_d2d.
         let host: Vec<f32> = z
             .unpartition()
             .to_host_vec()
@@ -793,6 +939,210 @@ mod tests {
             (got_dot - expected_dot).abs() < 1e-3,
             "dequant dot={got_dot} vs tq2_dot_block={expected_dot}"
         );
+    }
+
+    // ── Q6_K upload format helper ─────────────────────────────────────────────
+
+    /// Build a synthetic Q6_K block: d=scale, all elements = q_val ∈ [0, 63].
+    /// All 16 group scales are set to group_sc (i8).
+    fn make_q6k_block_uniform(d: f32, q_val: u8, group_sc: i8) -> Vec<u8> {
+        assert!(q_val <= 63);
+        let mut block = vec![0u8; Q6K_BLOCK_BYTES];
+        // d at [208..210]
+        let d_bits = f32_to_f16_bits(d);
+        block[208] = d_bits as u8;
+        block[209] = (d_bits >> 8) as u8;
+        // scales at [192..208] — all group_sc
+        for i in 192..208 {
+            block[i] = group_sc as u8;
+        }
+        // ql [0..128] and qh [128..192]: encode q_val for every element.
+        // q_val = (ql_nibble) | (qh_2bits << 4)
+        // We choose ql_nibble = q_val & 0xF, qh_2bits = q_val >> 4 (0..3).
+        // For element in half, sub, l:
+        //   sub=0,2: ql[half*64+l]; sub=1,3: ql[half*64+l+32]
+        //   ql low nibble for sub=0,1; ql high nibble for sub=2,3
+        //   qh[half*32+l] bits 1:0 for sub=0; bits 3:2 for sub=1; bits 5:4 for sub=2; bits 7:6 for sub=3
+        let ql_nibble = q_val & 0xF;
+        let qh_2bits = q_val >> 4; // 0..3
+        // For every ql byte: both nibbles = ql_nibble
+        let ql_byte = ql_nibble | (ql_nibble << 4);
+        for i in 0..128usize {
+            block[i] = ql_byte;
+        }
+        // For every qh byte: all 4 two-bit slots = qh_2bits
+        let qh_byte = qh_2bits | (qh_2bits << 2) | (qh_2bits << 4) | (qh_2bits << 6);
+        for i in 128..192usize {
+            block[i] = qh_byte;
+        }
+        block
+    }
+
+    /// Pack a Q6_K raw block into the 81-u32 GPU format used by `cutile_q6k_gemv`.
+    fn pack_q6k_block(block: &[u8]) -> Vec<u32> {
+        assert_eq!(block.len(), Q6K_BLOCK_BYTES);
+        let d_bits = u16::from_le_bytes([block[208], block[209]]);
+        let d_f32 = f16_to_f32(d_bits);
+
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+
+        let mut packed = Vec::with_capacity(Q6K_PACKED_U32S);
+
+        // slot 0: d as f32
+        packed.push(d_f32.to_bits());
+
+        // slots 1..17: 16 group scales as f32
+        for k in 0..16usize {
+            let s_f32 = (scales[k] as i8) as f32;
+            packed.push(s_f32.to_bits());
+        }
+
+        // slots 17..81: 64 u32 words of q_full bytes in output element order
+        // Precompute q_full[i] for i in 0..256 using the Q6K layout.
+        let mut q_full = [0u8; 256];
+        for half in 0..2usize {
+            for l in 0..32usize {
+                let ql_l = ql[half * 64 + l] as u32;
+                let ql_l32 = ql[half * 64 + l + 32] as u32;
+                let qh_l = qh[half * 32 + l] as u32;
+                q_full[half * 128 + l] =
+                    ((ql_l & 0xF) | ((qh_l & 3) << 4)) as u8; // sub=0
+                q_full[half * 128 + l + 32] =
+                    ((ql_l32 & 0xF) | (((qh_l >> 2) & 3) << 4)) as u8; // sub=1
+                q_full[half * 128 + l + 64] =
+                    ((ql_l >> 4) | (((qh_l >> 4) & 3) << 4)) as u8; // sub=2
+                q_full[half * 128 + l + 96] =
+                    ((ql_l32 >> 4) | (((qh_l >> 6) & 3) << 4)) as u8; // sub=3
+            }
+        }
+        for i in 0..64usize {
+            let w = (q_full[i * 4] as u32)
+                | ((q_full[i * 4 + 1] as u32) << 8)
+                | ((q_full[i * 4 + 2] as u32) << 16)
+                | ((q_full[i * 4 + 3] as u32) << 24);
+            packed.push(w);
+        }
+
+        assert_eq!(packed.len(), Q6K_PACKED_U32S);
+        packed
+    }
+
+    #[test]
+    fn q6k_pack_matches_cpu_dequant_uniform() {
+        // Uniform block: d=2.0, all q_full=40 (→ q_signed=8), group_sc=3
+        // expected weight per element = 2.0 * 3.0 * 8.0 = 48.0
+        // dot with all-ones activation = 256 * 48.0 = 12288.0
+        let d = 2.0f32;
+        let q_val = 40u8; // q_signed = 40 - 32 = 8
+        let group_sc = 3i8;
+        let block = make_q6k_block_uniform(d, q_val, group_sc);
+
+        // CPU dequant via dequant_q6k_block
+        let mut dequanted = vec![0.0f32; Q6K_BLOCK_SIZE];
+        dequant_q6k_block(&block, &mut dequanted);
+
+        let cpu_dot: f32 = dequanted.iter().sum();
+        let expected = 256.0 * d * (group_sc as f32) * ((q_val as f32) - 32.0);
+        assert!(
+            (cpu_dot - expected).abs() < 0.5,
+            "cpu dot={cpu_dot} expected={expected}"
+        );
+
+        // Verify packed format: q_full bytes should all be q_val.
+        let packed = pack_q6k_block(&block);
+        assert_eq!(packed.len(), Q6K_PACKED_U32S);
+        // d slot
+        assert!(
+            (f32::from_bits(packed[0]) - d).abs() < 1e-4,
+            "d mismatch: {}",
+            f32::from_bits(packed[0])
+        );
+        // scale slots: all group_sc as f32
+        for k in 1..17usize {
+            let got = f32::from_bits(packed[k]);
+            assert!(
+                (got - group_sc as f32).abs() < 1e-6,
+                "scale[{}]={} expected {}",
+                k - 1,
+                got,
+                group_sc
+            );
+        }
+        // q_full bytes: all should equal q_val
+        for w in 17..81usize {
+            let word = packed[w];
+            for bp in 0..4usize {
+                let byte = ((word >> (bp * 8)) & 0xFF) as u8;
+                assert_eq!(byte, q_val, "q_full[{}] mismatch", (w - 17) * 4 + bp);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cutile")]
+    fn q6k_gpu_gemv_matches_cpu_dequant() {
+        use cuda_core::Device;
+        use cutile::api;
+        use cutile::prelude::DeviceOp;
+
+        // Four output neurons, K = Q6K_QK (1 block each).
+        // Row 0: d=1.0, all q_full=32 (→ 0), group_sc=1  → dot with ones = 0
+        // Row 1: d=1.0, all q_full=33 (→ 1), group_sc=1  → dot = 256 * 1 = 256
+        // Row 2: d=1.0, all q_full=31 (→ -1), group_sc=1 → dot = 256 * -1 = -256
+        // Row 3: d=2.0, all q_full=40 (→ 8), group_sc=3  → dot = 256 * 2 * 3 * 8 = 12288
+        let n = 4;
+        let k = Q6K_QK;
+        let k_blocks = 1;
+        let cases: &[(f32, u8, i8, f32)] = &[
+            (1.0, 32, 1, 0.0),
+            (1.0, 33, 1, 256.0),
+            (1.0, 31, 1, -256.0),
+            (2.0, 40, 3, 12288.0),
+        ];
+
+        let x_vals = vec![1.0f32; k];
+        let mut all_packed: Vec<u32> = Vec::with_capacity(n * k_blocks * Q6K_PACKED_U32S);
+        let mut expected: Vec<f32> = Vec::with_capacity(n);
+
+        for &(d, q_val, sc, exp) in cases {
+            let block = make_q6k_block_uniform(d, q_val, sc);
+            all_packed.extend(pack_q6k_block(&block));
+            expected.push(exp);
+        }
+
+        let device = Device::new(0).expect("CUDA device 0 not available");
+        let stream: std::sync::Arc<cuda_core::Stream> =
+            device.new_stream().expect("stream").into();
+        let q6k_gemv = CutileQ6kGemv::from_stream(stream);
+
+        let x_dev: std::sync::Arc<cutile::tensor::Tensor<f32>> =
+            api::copy_host_vec_to_device(&std::sync::Arc::new(x_vals))
+                .sync_on(q6k_gemv.stream())
+                .expect("upload x")
+                .into();
+        let p_dev: std::sync::Arc<cutile::tensor::Tensor<u32>> =
+            api::copy_host_vec_to_device(&std::sync::Arc::new(all_packed))
+                .sync_on(q6k_gemv.stream())
+                .expect("upload packed")
+                .into();
+
+        let result = q6k_gemv
+            .forward_d2d(&x_dev, &p_dev, n, k_blocks)
+            .expect("q6k gemv");
+
+        let out: Vec<f32> = result
+            .to_host_vec()
+            .sync_on(q6k_gemv.stream())
+            .expect("download");
+
+        for (i, (&got, &exp)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1.0,
+                "row {i}: got {got}, expected {exp}"
+            );
+        }
     }
 
     // ── Q2_0 upload format helpers ────────────────────────────────────────────
