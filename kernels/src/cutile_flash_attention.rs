@@ -558,6 +558,191 @@ impl CutileFlashAttention {
     }
 }
 
+impl CutileFlashAttention {
+    /// Flash attention where K and V are already resident on device (per-head format).
+    ///
+    /// `k_devs[kv_h]` is a flat GPU tensor of `gpu_max_seq_len * head_dim` elements
+    /// holding the K history for KV-head `kv_h` (written by `CutileKvCache::append_device`).
+    /// `v_devs[kv_h]` is the corresponding V history.
+    ///
+    /// Only Q is supplied as a host slice (downloaded once from device by the caller).
+    /// This eliminates the `n_kv_heads × 2` H2D uploads that `forward_batched` performs
+    /// when the KV cache lives on the host, saving `2 * n_kv_heads` CUDA sync calls
+    /// per layer and eliminating the O(kv_len) PCIe traffic for K/V.
+    ///
+    /// The method follows the same phased structure as `forward_batched`:
+    ///   1. Gather Q per-head on the CPU (no CUDA cost).
+    ///   2. Upload Q per-head with `sync_on` (H2D; K/V skipped — already on device).
+    ///   3. Submit all head kernels with `async_on` (no sync between heads).
+    ///   4. Single `stream.synchronize()`.
+    ///   5. Download and scatter outputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batched_device_kv(
+        &self,
+        q: &[f32],
+        k_devs: &[Arc<Tensor<f32>>],
+        v_devs: &[Arc<Tensor<f32>>],
+        output: &mut [f32],
+        seq_len: usize,
+        kv_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<()> {
+        if k_devs.len() != n_kv_heads || v_devs.len() != n_kv_heads {
+            return Err(KernelError::InvalidConfig(format!(
+                "k_devs/v_devs length ({}/{}) != n_kv_heads ({n_kv_heads})",
+                k_devs.len(),
+                v_devs.len()
+            )));
+        }
+        if !n_heads.is_multiple_of(n_kv_heads) {
+            return Err(KernelError::InvalidConfig(format!(
+                "n_heads ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
+            )));
+        }
+
+        let seq_len_pad = seq_len.div_ceil(BR) * BR;
+        let kv_len_pad = kv_len.div_ceil(BC) * BC;
+        let head_dim_pad = head_dim;
+        let heads_per_group = n_heads / n_kv_heads;
+        let cache_offset = (kv_len as i32) - (seq_len as i32);
+        let stream = &self.stream;
+        let generics = vec![BR.to_string(), BC.to_string(), head_dim_pad.to_string()];
+
+        // ── Phase 1: Q host-side gather (CPU only) ────────────────────────────
+        let q_bufs: Vec<Vec<f32>> = (0..n_heads)
+            .map(|h| {
+                gather_q_head(
+                    q,
+                    0, // single batch
+                    h,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    seq_len_pad,
+                    head_dim_pad,
+                )
+            })
+            .collect();
+
+        // ── Phase 2: reshape K/V device tensors to [kv_len_pad, head_dim] ─────
+        // The GPU KV cache tensors hold [gpu_max_seq * head_dim] contiguous
+        // elements.  We reshape to [gpu_max_seq, head_dim] and rely on the flash
+        // attention kernel's runtime `kv_len` parameter to iterate only the valid
+        // prefix. The reshape is a zero-copy metadata operation.
+        //
+        // We cannot reshape to [kv_len_pad, head_dim] because kv_len_pad may
+        // exceed the tensor's actual element count (gpu_max_seq_len * head_dim
+        // > kv_len_pad is not guaranteed). Using the raw tensor and letting the
+        // kernel's `kv_len` bound the loop is safe and avoids the mismatch.
+        //
+        // No H2D for K or V — they are already on device.
+
+        // ── Phase 3: upload Q per-head with sync_on ───────────────────────────
+        let mut q_devs: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_heads);
+        for buf in &q_bufs {
+            let dev: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(buf.clone()))
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .reshape(&[seq_len_pad, head_dim_pad])
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into();
+            q_devs.push(dev);
+        }
+
+        // ── Phase 4: allocate output tensors; submit kernels async ─────────────
+        // Pre-reshape K/V per-head once outside the loop.
+        // Each GPU KV cache tensor holds [gpu_max_seq_len * head_dim] elements.
+        // Reshape to [gpu_max_seq_len, head_dim] so the kernel's dynamic [-1, D]
+        // shape accepts it. The runtime `kv_len` parameter bounds tile iteration
+        // so only the first `kv_len` tokens are read regardless of gpu_max_seq_len.
+        // DO NOT reshape to [kv_len_pad, head_dim] — that would fail when
+        // gpu_max_seq_len * head_dim ≠ kv_len_pad * head_dim.
+        // Reshape K/V per-KV-head from flat [gpu_max_seq * head_dim] to 2-D
+        // [gpu_max_seq, head_dim] once outside the head loop. reshape on
+        // Arc<Tensor<f32>> returns Arc<Tensor<f32>> (zero-copy metadata).
+        let gpu_max_seq_len = k_devs[0].size() / head_dim_pad;
+        let mut k_devs_2d: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_kv_heads);
+        for t in k_devs.iter() {
+            let r = t
+                .clone()
+                .reshape(&[gpu_max_seq_len, head_dim_pad])
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            k_devs_2d.push(r);
+        }
+        let mut v_devs_2d: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_kv_heads);
+        for t in v_devs.iter() {
+            let r = t
+                .clone()
+                .reshape(&[gpu_max_seq_len, head_dim_pad])
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            v_devs_2d.push(r);
+        }
+
+        let mut out_parts = Vec::with_capacity(n_heads);
+        for head in 0..n_heads {
+            let kv_head = head / heads_per_group;
+
+            let k_dev = k_devs_2d[kv_head].clone();
+            let v_dev = v_devs_2d[kv_head].clone();
+
+            let out_part = api::zeros::<f32>(&[seq_len_pad, head_dim_pad])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .partition([BR, head_dim_pad]);
+
+            let (out_part, ..) = unsafe {
+                kernels::cutile_flash_attn_head(
+                    out_part,
+                    q_devs[head].clone(),
+                    k_dev,
+                    v_dev,
+                    scale,
+                    cache_offset,
+                    seq_len as i32,
+                    kv_len as i32,
+                )
+                .generics(generics.clone())
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            };
+
+            out_parts.push(out_part);
+        }
+
+        // ── Phase 5: single sync for all head kernels ─────────────────────────
+        unsafe {
+            stream
+                .synchronize()
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        }
+
+        // ── Phase 6: download and scatter outputs ─────────────────────────────
+        for (head, out_part) in out_parts.into_iter().enumerate() {
+            let host_result: Vec<f32> = out_part
+                .unpartition()
+                .to_host_vec()
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+            scatter_output_head(
+                &host_result,
+                output,
+                0, // batch 0
+                head,
+                seq_len,
+                n_heads,
+                head_dim,
+                head_dim_pad,
+            );
+        }
+
+        Ok(())
+    }
+}
+
 impl Attention for CutileFlashAttention {
     fn verification_tier(&self) -> VerificationTier {
         VerificationTier::Tested
@@ -790,5 +975,93 @@ mod tests {
     #[test]
     fn test_cutile_flash_attn_batch() {
         run_flash_attn_vs_cpu(2, 32, 32, 2, 2, 64);
+    }
+
+    /// Verify `forward_batched_device_kv` matches `forward` (CPU reference).
+    ///
+    /// Builds per-KV-head GPU tensors from the same host K/V data used by the
+    /// CPU reference, runs `forward_batched_device_kv`, and checks that every
+    /// output element is within 1e-3 of the CPU result.
+    fn run_device_kv_vs_cpu(seq: usize, kv: usize, nh: usize, nkv: usize, hd: usize) {
+        use cutile::api;
+        use cutile::prelude::DeviceOp;
+
+        let scale = 1.0 / (hd as f32).sqrt();
+        let nq = seq * nh * hd;
+        let nkv_total = kv * nkv * hd;
+
+        let q: Vec<f32> = (0..nq).map(|i| (i as f32) * 0.01 - 0.5).collect();
+        // K/V in interleaved [kv, nkv, hd] layout.
+        let k: Vec<f32> = (0..nkv_total).map(|i| (i as f32) * 0.01 - 0.3).collect();
+        let v: Vec<f32> = (0..nkv_total).map(|i| (i as f32) * 0.005 - 0.2).collect();
+
+        let mut out_cpu = vec![0.0f32; nq];
+        let cpu = crate::attention::CpuAttention;
+        cpu.forward(&q, &k, &v, &mut out_cpu, 1, seq, kv, nh, nkv, hd, scale)
+            .expect("CPU attention failed");
+
+        let gpu = CutileFlashAttention::new().expect("CutileFlashAttention::new failed");
+        let stream = gpu.stream();
+
+        // Build per-KV-head device tensors in contiguous [kv, hd] layout.
+        let mut k_devs: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(nkv);
+        let mut v_devs: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(nkv);
+        for kv_h in 0..nkv {
+            // Gather head kv_h: stride through [kv, nkv, hd].
+            let mut k_head = vec![0.0f32; kv * hd];
+            let mut v_head = vec![0.0f32; kv * hd];
+            for t in 0..kv {
+                let src = t * nkv * hd + kv_h * hd;
+                k_head[t * hd..(t + 1) * hd].copy_from_slice(&k[src..src + hd]);
+                v_head[t * hd..(t + 1) * hd].copy_from_slice(&v[src..src + hd]);
+            }
+            let k_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(k_head))
+                .sync_on(stream)
+                .expect("k_t upload")
+                .into();
+            let v_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(v_head))
+                .sync_on(stream)
+                .expect("v_t upload")
+                .into();
+            k_devs.push(k_t);
+            v_devs.push(v_t);
+        }
+
+        let mut out_gpu_dkv = vec![0.0f32; nq];
+        gpu.forward_batched_device_kv(
+            &q,
+            &k_devs,
+            &v_devs,
+            &mut out_gpu_dkv,
+            seq,
+            kv,
+            nh,
+            nkv,
+            hd,
+            scale,
+        )
+        .expect("forward_batched_device_kv failed");
+
+        for (i, (a, b)) in out_cpu.iter().zip(out_gpu_dkv.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "device_kv mismatch at {i}: cpu={a:.6}, gpu={b:.6}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_forward_batched_device_kv_basic() {
+        run_device_kv_vs_cpu(1, 32, 2, 2, 64);
+    }
+
+    #[test]
+    fn test_forward_batched_device_kv_gqa() {
+        run_device_kv_vs_cpu(1, 64, 4, 2, 64);
+    }
+
+    #[test]
+    fn test_forward_batched_device_kv_decode_long() {
+        run_device_kv_vs_cpu(1, 128, 4, 2, 64);
     }
 }

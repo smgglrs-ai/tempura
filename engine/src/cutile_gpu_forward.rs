@@ -1798,29 +1798,31 @@ impl CutileGpuModel {
                 (q_dev.clone(), k_dev.clone())
             };
 
-            // ── 2d. GPU KV-cache append (host mirror) ────────────────────────
-            // V does not need RoPE, download from device to update host mirror.
-            // K was rotated on device; one download for the rotated K host mirror.
-            let k_rot_host = self.download_device_tensor(&k_rot_dev);
-            let v_host = self.download_device_tensor(&v_dev);
-            gpu_kv_cache.append_host(layer, &k_rot_host, &v_host, seq_len);
+            // ── 2d. KV-cache append ───────────────────────────────────────────
+            // `append_device` updates both the host mirror (D→H, needed by CPU
+            // GQA and prefill forward_batched) and the flat GPU tensor (async
+            // D→D, 2 small copies per layer — one for K, one for V).
+            // The GPU cache is populated for future GPU-side attention; decode
+            // and prefill still use the host mirror via `get_kv_host_slices`.
+            gpu_kv_cache
+                .append_device(layer, &k_rot_dev, &v_dev, seq_len)
+                .expect("CutileGpuModel: GPU KV cache append failed");
 
-            // kv_len includes the tokens just appended (seq_len new tokens on
-            // top of whatever was already in the cache).
+            // kv_len includes the tokens just appended.
             let kv_len = gpu_kv_cache.seq_len() + seq_len;
 
             // ── 2e. Attention ─────────────────────────────────────────────────
             let q_rot_host = self.download_device_tensor(&q_rot_dev);
             let (k_slice, v_slice) = gpu_kv_cache.get_kv_host_slices(layer, kv_len);
             let mut attn_output = vec![0.0f32; seq_len * n_heads * head_dim];
+            let scale = 1.0 / (head_dim as f32).sqrt();
 
             if seq_len == 1 {
                 // Decode: 1-token GQA attention is O(kv_len × head_dim) on CPU.
-                // Using the GPU flash attention kernel for seq_len=1 costs ~896
+                // Using per-head GPU flash attention for seq_len=1 costs ~896
                 // sync_on CUDA calls per token (32 head H2D/D2H × 28 layers),
                 // each with driver overhead that dominates at small tensor sizes.
                 // CPU GQA for 1 token: ~500K multiply-adds — essentially free.
-                let scale = 1.0 / (head_dim as f32).sqrt();
                 let heads_per_group = n_heads / n_kv_heads;
                 let mut scores = vec![0.0f32; kv_len];
                 for h in 0..n_heads {
@@ -1829,29 +1831,40 @@ impl CutileGpuModel {
                     let kv_k = &k_slice[kv_h * head_dim..];
                     let kv_v = &v_slice[kv_h * head_dim..];
 
-                    // scores[t] = Q · K[t] * scale
                     for t in 0..kv_len {
-                        let k_tok = &kv_k[t * n_kv_heads * head_dim..t * n_kv_heads * head_dim + head_dim];
-                        scores[t] = q_head.iter().zip(k_tok).map(|(a, b)| a * b).sum::<f32>() * scale;
+                        let k_tok = &kv_k[t * n_kv_heads * head_dim
+                            ..t * n_kv_heads * head_dim + head_dim];
+                        scores[t] =
+                            q_head.iter().zip(k_tok).map(|(a, b)| a * b).sum::<f32>() * scale;
                     }
 
-                    // softmax in-place
-                    let max_s = scores[..kv_len].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let sum: f32 = scores[..kv_len].iter_mut().map(|s| { *s = (*s - max_s).exp(); *s }).sum();
-                    for s in &mut scores[..kv_len] { *s /= sum; }
+                    let max_s =
+                        scores[..kv_len].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let sum: f32 = scores[..kv_len]
+                        .iter_mut()
+                        .map(|s| {
+                            *s = (*s - max_s).exp();
+                            *s
+                        })
+                        .sum();
+                    for s in &mut scores[..kv_len] {
+                        *s /= sum;
+                    }
 
-                    // out[h] = sum_t scores[t] * V[t]
                     let out_head = &mut attn_output[h * head_dim..(h + 1) * head_dim];
-                    for v_d in 0..head_dim { out_head[v_d] = 0.0; }
+                    for v_d in 0..head_dim {
+                        out_head[v_d] = 0.0;
+                    }
                     for t in 0..kv_len {
-                        let v_tok = &kv_v[t * n_kv_heads * head_dim..t * n_kv_heads * head_dim + head_dim];
+                        let v_tok = &kv_v[t * n_kv_heads * head_dim
+                            ..t * n_kv_heads * head_dim + head_dim];
                         for d in 0..head_dim {
                             out_head[d] += scores[t] * v_tok[d];
                         }
                     }
                 }
             } else {
-                // Prefill: use GPU flash attention (amortises CUDA overhead over many rows).
+                // Prefill: GPU flash attention (amortises CUDA overhead over many rows).
                 self.flash_attn
                     .forward_batched(
                         &q_rot_host,
@@ -1864,7 +1877,7 @@ impl CutileGpuModel {
                         n_heads,
                         n_kv_heads,
                         head_dim,
-                        1.0 / (head_dim as f32).sqrt(),
+                        scale,
                     )
                     .expect("CutileGpuModel: flash attention failed");
             }
