@@ -1326,10 +1326,179 @@ impl CutileGpuModel {
             .expect("CutileGpuModel::gemm_q4k_d2d failed")
     }
 
-    /// Unified GEMV/GEMM that transparently selects Q4_K, Q2_0 (decode only), or f32.
+    /// Device-to-device Q2_0 GEMV reusing a pre-allocated scratch buffer.
     ///
-    /// For m == 1: checks `device_weights_q4k` first, then `device_weights_q2`, then
-    /// falls through to `gemm_d2d_slot` for f32 weights.
+    /// When the pool slot holds a uniquely-owned `Arc<Tensor<f32>>`, reclaims
+    /// the tensor and enqueues the kernel asynchronously (no blocking sync).
+    /// Falls back to synchronous `forward_d2d` on a pool miss.
+    ///
+    /// Because all quantized GEMVs share the matmul CUDA stream, ordering with
+    /// subsequent GPU operations (RoPE, etc.) on the same stream is guaranteed.
+    /// CPU reads are gated by the first `sync_on` call that follows.
+    fn gemm_q2_d2d_slot(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        weight_name: &str,
+        slot: usize,
+    ) -> Arc<Tensor<f32>> {
+        let dw = match self.device_weights_q2.get(weight_name) {
+            Some(d) => d,
+            None => {
+                let stream = self.matmul.stream();
+                return Arc::new(
+                    api::zeros::<f32>(&[1])
+                        .sync_on(stream)
+                        .expect("zeros failed"),
+                );
+            }
+        };
+        let a_flat = Arc::clone(a)
+            .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::cutile_quantized_gemm::Q2_0_QK)])
+            .expect("gemm_q2_d2d_slot: reshape failed");
+
+        let maybe_tensor = {
+            let mut pool = self.scratch.borrow_mut();
+            match pool[slot].take() {
+                Some(arc) => match Arc::try_unwrap(arc) {
+                    Ok(tensor) => Some(tensor),
+                    Err(arc_back) => {
+                        pool[slot] = Some(arc_back);
+                        None
+                    }
+                },
+                None => None,
+            }
+        };
+
+        if let Some(tensor) = maybe_tensor {
+            // SAFETY: subsequent GPU ops on the same stream see the completed output
+            // before any CPU read; the first sync_on on this stream provides the barrier.
+            if let Ok(result) = unsafe {
+                self.q2_gemv
+                    .submit_d2d_into(&a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks)
+            } {
+                self.scratch.borrow_mut()[slot] = Some(result.clone());
+                return result;
+            }
+        }
+
+        self.q2_gemv
+            .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+            .expect("gemm_q2_d2d_slot failed")
+    }
+
+    /// Device-to-device Q6_K GEMV reusing a pre-allocated scratch buffer.
+    ///
+    /// Same async-on-pool-hit / sync-on-miss strategy as `gemm_q2_d2d_slot`.
+    fn gemm_q6k_d2d_slot(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        weight_name: &str,
+        slot: usize,
+    ) -> Arc<Tensor<f32>> {
+        let dw = match self.device_weights_q6k.get(weight_name) {
+            Some(d) => d,
+            None => {
+                let stream = self.matmul.stream();
+                return Arc::new(
+                    api::zeros::<f32>(&[1])
+                        .sync_on(stream)
+                        .expect("zeros failed"),
+                );
+            }
+        };
+        let a_flat = Arc::clone(a)
+            .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::cutile_quantized_gemm::Q6K_QK)])
+            .expect("gemm_q6k_d2d_slot: reshape failed");
+
+        let maybe_tensor = {
+            let mut pool = self.scratch.borrow_mut();
+            match pool[slot].take() {
+                Some(arc) => match Arc::try_unwrap(arc) {
+                    Ok(tensor) => Some(tensor),
+                    Err(arc_back) => {
+                        pool[slot] = Some(arc_back);
+                        None
+                    }
+                },
+                None => None,
+            }
+        };
+
+        if let Some(tensor) = maybe_tensor {
+            if let Ok(result) = unsafe {
+                self.q6k_gemv
+                    .submit_d2d_into(&a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks)
+            } {
+                self.scratch.borrow_mut()[slot] = Some(result.clone());
+                return result;
+            }
+        }
+
+        self.q6k_gemv
+            .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+            .expect("gemm_q6k_d2d_slot failed")
+    }
+
+    /// Device-to-device Q4_K GEMV reusing a pre-allocated scratch buffer.
+    ///
+    /// Same async-on-pool-hit / sync-on-miss strategy as `gemm_q2_d2d_slot`.
+    fn gemm_q4k_d2d_slot(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        weight_name: &str,
+        slot: usize,
+    ) -> Arc<Tensor<f32>> {
+        let dw = match self.device_weights_q4k.get(weight_name) {
+            Some(d) => d,
+            None => {
+                let stream = self.matmul.stream();
+                return Arc::new(
+                    api::zeros::<f32>(&[1])
+                        .sync_on(stream)
+                        .expect("zeros failed"),
+                );
+            }
+        };
+        let a_flat = Arc::clone(a)
+            .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::Q4K_BLOCK_SIZE)])
+            .expect("gemm_q4k_d2d_slot: reshape failed");
+
+        let maybe_tensor = {
+            let mut pool = self.scratch.borrow_mut();
+            match pool[slot].take() {
+                Some(arc) => match Arc::try_unwrap(arc) {
+                    Ok(tensor) => Some(tensor),
+                    Err(arc_back) => {
+                        pool[slot] = Some(arc_back);
+                        None
+                    }
+                },
+                None => None,
+            }
+        };
+
+        if let Some(tensor) = maybe_tensor {
+            if let Ok(result) = unsafe {
+                self.q4k_gemv
+                    .submit_d2d_into(&a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks)
+            } {
+                self.scratch.borrow_mut()[slot] = Some(result.clone());
+                return result;
+            }
+        }
+
+        self.q4k_gemv
+            .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+            .expect("gemm_q4k_d2d_slot failed")
+    }
+
+    /// Unified GEMV/GEMM that transparently selects Q4_K, Q6_K, Q2_0 (decode only), or f32.
+    ///
+    /// For m == 1: checks `device_weights_q4k` first, then `device_weights_q6k`,
+    /// then `device_weights_q2`, then falls through to `gemm_d2d_slot` for f32 weights.
+    /// The slotted quantized paths use pre-allocated scratch buffers with async dispatch,
+    /// eliminating the two `sync_on` calls (allocation + kernel) per GEMV.
     /// For m > 1 (prefill): quantized GEMV is not yet batched; fall back to
     /// host-side dequantization + f32 GEMM (slower but correct; prefill is infrequent).
     fn gemm_any_d2d_slot(
@@ -1339,15 +1508,15 @@ impl CutileGpuModel {
         m: usize,
         slot: usize,
     ) -> Arc<Tensor<f32>> {
-        // ── Decode (m == 1): on-GPU dequant GEMV ─────────────────────────────
+        // ── Decode (m == 1): on-GPU dequant GEMV with pre-allocated scratch ───
         if m == 1 && self.device_weights_q4k.contains_key(weight_name) {
-            return self.gemm_q4k_d2d(a, weight_name);
+            return self.gemm_q4k_d2d_slot(a, weight_name, slot);
         }
         if m == 1 && self.device_weights_q6k.contains_key(weight_name) {
-            return self.gemm_q6k_d2d(a, weight_name);
+            return self.gemm_q6k_d2d_slot(a, weight_name, slot);
         }
         if m == 1 && self.device_weights_q2.contains_key(weight_name) {
-            return self.gemm_q2_d2d(a, weight_name);
+            return self.gemm_q2_d2d_slot(a, weight_name, slot);
         }
 
         // ── Prefill (m > 1): host dequant + f32 GEMM ─────────────────────────
