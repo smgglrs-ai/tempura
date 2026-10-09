@@ -486,7 +486,9 @@ impl CutileRoPE {
                     .expect("RopeScratch: z fallback alloc failed")
             });
 
-        // Take the four intermediate buffers out of the pool.
+        // With rope_cap=1 the scratch is sized for exactly one decode step:
+        // cap_num_sh = n_heads and num_sh = seq_len*n_heads = n_heads. They are equal
+        // so the scratch tensors already have exactly the right number of elements.
         let x_first_flat = scratch.x_first.take().expect("RopeScratch x_first missing");
         let x_second_flat = scratch.x_second.take().expect("RopeScratch x_second missing");
         let out_first_flat = scratch.out_first.take().expect("RopeScratch out_first missing");
@@ -542,14 +544,12 @@ impl CutileRoPE {
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         }
 
-        // Reclaim intermediate buffers.  Each Arc has strong_count == 1 here because
-        // the kernel consumed the input Arc and returned a fresh one.
+        // Reclaim intermediates — cap_num_sh == num_sh so sizes match exactly.
         scratch.x_first = Some(Arc::try_unwrap(xf_ret).expect("xf_ret not unique"));
         scratch.x_second = Some(Arc::try_unwrap(xs_ret).expect("xs_ret not unique"));
         scratch.out_first = Some(Arc::try_unwrap(of_ret).expect("of_ret not unique"));
         scratch.out_second = Some(Arc::try_unwrap(os_ret).expect("os_ret not unique"));
 
-        // Wrap z output in Arc; store one ref in scratch, return the other to the caller.
         let z_arc = Arc::new(z_t.unpartition());
         scratch.z = Some(z_arc.clone());
         Ok(z_arc)

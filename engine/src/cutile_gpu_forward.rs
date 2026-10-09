@@ -413,7 +413,11 @@ impl CutileGpuModel {
         let cutile_rope = CutileRoPE::new()?;
         let cutile_elementwise = CutileElementwise::new()?;
 
-        let rope_cap = config.max_seq_len.min(4096);
+        // Scratch for exactly one decode step (seq_len=1). Prefill falls back to
+        // forward_device which allocates fresh — prefill is infrequent so the
+        // allocation cost there is amortised. Sizing at n_heads (not max_seq_len×n_heads)
+        // avoids the out-of-bounds launch that occurs when cap_num_sh > actual num_sh.
+        let rope_cap = 1usize;
         let rope_stream = cutile_rope.stream();
         let q_rope_scratch = RopeScratch::new(rope_stream, rope_cap * n_heads, head_dim)?;
         let k_rope_scratch = RopeScratch::new(rope_stream, rope_cap * n_kv_heads, head_dim)?;
@@ -512,7 +516,11 @@ impl CutileGpuModel {
         let cutile_rope = CutileRoPE::new()?;
         let cutile_elementwise = CutileElementwise::new()?;
 
-        let rope_cap = config.max_seq_len.min(4096);
+        // Scratch for exactly one decode step (seq_len=1). Prefill falls back to
+        // forward_device which allocates fresh — prefill is infrequent so the
+        // allocation cost there is amortised. Sizing at n_heads (not max_seq_len×n_heads)
+        // avoids the out-of-bounds launch that occurs when cap_num_sh > actual num_sh.
+        let rope_cap = 1usize;
         let rope_stream = cutile_rope.stream();
         let q_rope_scratch = RopeScratch::new(rope_stream, rope_cap * n_heads, head_dim)?;
         let k_rope_scratch = RopeScratch::new(rope_stream, rope_cap * n_kv_heads, head_dim)?;
