@@ -34,7 +34,26 @@ pub mod kernels {
         sum_out.store(sum.reshape(shape![1]));
     }
 
-    /// RMSNorm pass 2: apply CPU-precomputed per-token scale and weight.
+    /// RMSNorm scale kernel: compute per-token scale = 1/sqrt(sum_sq/hidden_size + eps).
+    ///
+    /// One program instance per token. Runs entirely on device between pass 1
+    /// (sum_sq) and pass 2 (apply), eliminating the CPU round-trip.
+    /// `inv_h` = 1.0 / hidden_size is pre-computed on the host and passed as
+    /// a scalar parameter to avoid integer-to-f32 casting inside the JIT.
+    #[cutile::entry()]
+    pub fn cutile_rmsnorm_scale(
+        scale: &mut Tensor<f32, { [1] }>,
+        sum_sq: &Tensor<f32, { [-1] }>,
+        inv_h: f32,
+        eps: f32,
+    ) {
+        let pid = program_id(0);
+        let s: Tile<f32, { [1] }> = sum_sq.partition(shape![1]).load([pid]);
+        let mean_eps = s * broadcast_scalar(inv_h, shape![1]) + broadcast_scalar(eps, shape![1]);
+        scale.store(rsqrt(mean_eps, ftz::Disabled));
+    }
+
+    /// RMSNorm pass 2: apply GPU-computed per-token scale and weight.
     ///
     /// One program instance per token. H = hidden_size.
     /// `scale` carries one float per token: 1/sqrt(mean(x²)+eps).
@@ -157,6 +176,84 @@ impl CutileRmsNorm {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
         // Reshape flat output to [seq_len, h_pad] for direct use by projection GEMMs.
+        let out_2d: Arc<Tensor<f32>> = out_t
+            .unpartition()
+            .reshape(&[seq_len, h_pad])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+        Ok(out_2d)
+    }
+
+    /// Fully-fused RMSNorm entirely on device — no CPU round-trip between passes.
+    ///
+    /// Same interface as `forward_device` but all three GPU kernels are submitted
+    /// asynchronously (pass 1 → scale → pass 2) and a single stream synchronize
+    /// covers them all, eliminating the two blocking `sync_on` calls that
+    /// previously forced the CPU to wait for each pass before the next began.
+    ///
+    /// 112 blocking round-trips per decode token (2 RMSNorm × 28+ layers × 2 sync_on)
+    /// become 3 async kernel launches + 1 synchronize.
+    pub fn forward_device_fused(
+        &self,
+        stream: &Arc<Stream>,
+        x_dev: Arc<Tensor<f32>>,
+        weight_dev: &Arc<Tensor<f32>>,
+        seq_len: usize,
+        hidden_size: usize,
+        h_pad: usize,
+        eps: f32,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let inv_h = 1.0f32 / hidden_size as f32;
+
+        // Pass 1: sum(x²) per token — async.
+        let sum_t = api::zeros::<f32>(&[seq_len])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1]);
+
+        // SAFETY: tensors are accessed only after the final stream.synchronize().
+        let (sum_t, x_t) = unsafe {
+            kernels::rmsnorm_sum_sq(sum_t, x_dev)
+                .generics(vec![h_pad.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+        let sum_arc: Arc<Tensor<f32>> = Arc::new(sum_t.unpartition());
+
+        // Scale kernel: scale[t] = 1/sqrt(sum_sq[t]/hidden_size + eps) — async.
+        let scale_t = api::zeros::<f32>(&[seq_len])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1]);
+
+        let (scale_t, _sum, _inv_h, _eps) = unsafe {
+            kernels::cutile_rmsnorm_scale(scale_t, sum_arc, inv_h, eps)
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+        let scale_arc: Arc<Tensor<f32>> = Arc::new(scale_t.unpartition());
+
+        // Pass 2: apply scale and weight on device — async.
+        let out_t = api::zeros::<f32>(&[seq_len * h_pad])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([h_pad]);
+
+        let (out_t, _x, _w, _s) = unsafe {
+            kernels::rmsnorm_apply(out_t, x_t, weight_dev.clone(), scale_arc)
+                .generics(vec![h_pad.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        // Single sync covers sum_sq + scale + apply.
+        // SAFETY: synchronize waits for all stream ops; no concurrent access.
+        unsafe {
+            stream
+                .synchronize()
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        }
+
         let out_2d: Arc<Tensor<f32>> = out_t
             .unpartition()
             .reshape(&[seq_len, h_pad])
