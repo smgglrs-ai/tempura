@@ -880,7 +880,13 @@ impl CutileMatMul {
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-        Ok(Arc::new(z.unpartition()))
+        // reshape(&[n]) collapses any partition-stride metadata so downstream
+        // kernels (cutile_deinterleave, etc.) see a true rank-1 (1-stride) tensor.
+        let out = z
+            .unpartition()
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(out))
     }
 
     /// Device-to-device GEMV reusing a caller-supplied pre-allocated output buffer.
@@ -924,7 +930,12 @@ impl CutileMatMul {
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-        Ok(Arc::new(z.unpartition()))
+        // reshape(&[n]) collapses partition-stride metadata for downstream kernels.
+        let out = z
+            .unpartition()
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(out))
     }
 
     /// Coalesced device-to-device GEMV — fresh output allocation.
