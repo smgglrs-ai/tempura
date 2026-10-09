@@ -968,7 +968,7 @@ impl CutileGpuModel {
                 .expect("CutileGpuModel: input_layernorm weight not pre-uploaded");
             let normed_dev = self
                 .cutile_rmsnorm
-                .forward_device(
+                .forward_device_fused(
                     self.matmul.stream(),
                     hidden_dev.clone(),
                     input_ln_w_dev,
@@ -1125,7 +1125,7 @@ impl CutileGpuModel {
                 .expect("CutileGpuModel: post_attention_layernorm weight not pre-uploaded");
             let normed2_dev = self
                 .cutile_rmsnorm
-                .forward_device(
+                .forward_device_fused(
                     self.matmul.stream(),
                     hidden_dev.clone(),
                     post_ln_w_dev,
@@ -1194,7 +1194,7 @@ impl CutileGpuModel {
             .expect("CutileGpuModel: model.norm.weight not pre-uploaded");
         let last_dev = self
             .cutile_rmsnorm
-            .forward_device(
+            .forward_device_fused(
                 self.matmul.stream(),
                 last_flat,
                 final_norm_w_dev,
