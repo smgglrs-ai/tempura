@@ -746,7 +746,7 @@ impl CutileGpuModel {
         let q2_gemv = CutileQ2Gemv::from_stream(matmul.stream().clone());
         let q6k_gemv = CutileQ6kGemv::from_stream(matmul.stream().clone());
         let cutile_rmsnorm = CutileRmsNorm::new()?;
-        let cutile_rope = CutileRoPE::new()?;
+        let mut cutile_rope = CutileRoPE::new()?;
         let cutile_elementwise = CutileElementwise::new()?;
 
         let q4k_count = dw_q4k.len();
@@ -758,6 +758,17 @@ impl CutileGpuModel {
                 "[cutile] GPU-resident quantized: {q4k_count} Q4_K, {q6k_count} Q6_K, {q2_count} Q2_0, {f32_count} f32"
             );
         }
+
+        // Pre-compute the full RoPE frequency table on the GPU once.
+        // During decode, `forward_device_scratch` reads from this table by
+        // position index — zero H2D uploads per token (was 2 sync H2D per RoPE
+        // call, 4 calls per layer × 28 layers = 112 sync_on per token).
+        cutile_rope.precompute_table(
+            config.max_seq_len.min(4096),
+            head_dim,
+            config.rope_theta,
+            matmul.stream(),
+        )?;
 
         // Scratch for exactly one decode step (seq_len=1). Prefill falls back to
         // forward_device which allocates fresh — prefill is infrequent so the
@@ -869,8 +880,16 @@ impl CutileGpuModel {
         let q2_gemv = CutileQ2Gemv::from_stream(matmul.stream().clone());
         let q6k_gemv = CutileQ6kGemv::from_stream(matmul.stream().clone());
         let cutile_rmsnorm = CutileRmsNorm::new()?;
-        let cutile_rope = CutileRoPE::new()?;
+        let mut cutile_rope = CutileRoPE::new()?;
         let cutile_elementwise = CutileElementwise::new()?;
+
+        // Pre-compute the full RoPE frequency table on the GPU once.
+        cutile_rope.precompute_table(
+            config.max_seq_len.min(4096),
+            head_dim,
+            config.rope_theta,
+            matmul.stream(),
+        )?;
 
         // Scratch for exactly one decode step (seq_len=1). Prefill falls back to
         // forward_device which allocates fresh — prefill is infrequent so the
