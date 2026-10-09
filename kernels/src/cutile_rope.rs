@@ -295,6 +295,9 @@ impl CutileRoPE {
     ///
     /// PCIe transfers per call: 2 H→D (cos/sin) + 2 D→H (output halves) + 1 H→D (result)
     /// vs. the host-side path: 1 D→H (download x) + 4 H→D + 2 D→H + 1 H→D = 8 transfers.
+    ///
+    /// The `stream` parameter is the shared CUDA stream from the caller (typically the
+    /// matmul stream), which avoids cross-stream synchronization overhead.
     pub fn forward_device(
         &self,
         x_dev: &Arc<Tensor<f32>>,
@@ -303,6 +306,7 @@ impl CutileRoPE {
         n_heads: usize,
         head_dim: usize,
         theta: f32,
+        stream: &Arc<Stream>,
     ) -> Result<Arc<Tensor<f32>>> {
         if !head_dim.is_multiple_of(2) {
             return Err(KernelError::InvalidConfig(format!(
@@ -326,8 +330,6 @@ impl CutileRoPE {
                 }
             }
         }
-
-        let stream = &self.stream;
 
         let upload_vec = |v: Vec<f32>| -> Result<Arc<Tensor<f32>>> {
             Ok(api::copy_host_vec_to_device(&Arc::new(v))
@@ -423,6 +425,9 @@ impl CutileRoPE {
     /// shared with the caller via Arc: the caller's copy is dropped at the end of
     /// the layer loop body, leaving scratch.z as the sole owner, which allows
     /// `Arc::try_unwrap` to reclaim it at the start of the next call.
+    ///
+    /// The `stream` parameter is the shared CUDA stream from the caller (typically the
+    /// matmul stream), which avoids cross-stream synchronization overhead.
     pub fn forward_device_scratch(
         &self,
         x_dev: &Arc<Tensor<f32>>,
@@ -432,10 +437,11 @@ impl CutileRoPE {
         head_dim: usize,
         theta: f32,
         scratch: &mut RopeScratch,
+        stream: &Arc<Stream>,
     ) -> Result<Arc<Tensor<f32>>> {
         let num_sh = seq_len * n_heads;
         if num_sh > scratch.cap_num_sh || head_dim != scratch.head_dim {
-            return self.forward_device(x_dev, positions, seq_len, n_heads, head_dim, theta);
+            return self.forward_device(x_dev, positions, seq_len, n_heads, head_dim, theta, stream);
         }
         if !head_dim.is_multiple_of(2) {
             return Err(KernelError::InvalidConfig(format!(
@@ -457,8 +463,6 @@ impl CutileRoPE {
                 }
             }
         }
-
-        let stream = &self.stream;
 
         let upload_vec = |v: Vec<f32>| -> Result<Arc<Tensor<f32>>> {
             Ok(api::copy_host_vec_to_device(&Arc::new(v))
