@@ -28,6 +28,9 @@ use cutile::tensor::{IntoPartition, Reshape, Tensor};
 use tempura_kernels::cutile_elementwise::CutileElementwise;
 use tempura_kernels::cutile_flash_attention::CutileFlashAttention;
 use tempura_kernels::cutile_matmul::CutileMatMul;
+use tempura_kernels::cutile_quantized_gemm::{
+    CutileQ2Gemv, Q2_0_BLOCK_BYTES, Q2_0_PACKED_U32S, Q2_0_QK,
+};
 use tempura_kernels::cutile_rmsnorm::CutileRmsNorm;
 use tempura_kernels::cutile_rope::{CutileRoPE, RopeScratch};
 
@@ -52,11 +55,58 @@ struct DeviceWeight {
     k_pad: usize,
 }
 
+/// Q2_0 quantized weight tensor resident on the GPU.
+///
+/// Packed format: [n × k_blocks × Q2_0_PACKED_U32S] u32 elements.
+/// Each block of 128 elements occupies 9 u32 slots:
+///   slot 0      : f32 bits of block scale (f16 → f32 at upload time)
+///   slots 1..=8 : 8 u32 words of 2-bit packed weights (16 values per u32)
+/// Dequant in kernel: (q - 1) × scale, q ∈ {0,1,2,3}.
+struct DeviceWeightQ2 {
+    /// Packed u32 tensor on GPU, flat shape [n × k_blocks × Q2_0_PACKED_U32S].
+    tensor: Arc<Tensor<u32>>,
+    /// Number of output neurons.
+    n: usize,
+    /// Number of Q2_0 blocks per row (= k / Q2_0_QK).
+    k_blocks: usize,
+}
+
 fn next_pow2(x: usize) -> usize {
     if x <= 1 {
         return 1;
     }
     1usize << (usize::BITS - (x - 1).leading_zeros()) as usize
+}
+
+/// IEEE 754 f16 bit pattern → f32 (used in the Q2_0 upload path).
+#[inline(always)]
+fn f16_bits_to_f32_inline(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let frac = (bits & 0x3ff) as u32;
+    if exp == 0 {
+        if frac == 0 {
+            return f32::from_bits(sign << 31);
+        }
+        let mut e = exp;
+        let mut f = frac;
+        while (f & 0x400) == 0 {
+            f <<= 1;
+            e = e.wrapping_sub(1);
+        }
+        f &= 0x3ff;
+        let f32_exp = 127 - 15 + 1 + e;
+        f32::from_bits((sign << 31) | (f32_exp << 23) | (f << 13))
+    } else if exp == 31 {
+        if frac == 0 {
+            f32::from_bits((sign << 31) | (0xff << 23))
+        } else {
+            f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13))
+        }
+    } else {
+        let f32_exp = exp + 127 - 15;
+        f32::from_bits((sign << 31) | (f32_exp << 23) | (frac << 13))
+    }
 }
 
 // Scratch-pool slot indices — one pre-allocated decode output buffer per projection.
@@ -85,10 +135,14 @@ pub struct CutileGpuModel {
     /// next_pow2(intermediate_size.div_ceil(BK) * BK) — padded column count for FFN activations.
     inter_pad: usize,
     device_weights: HashMap<String, DeviceWeight>,
+    /// Q2_0-quantized projection weights stored in packed GPU format.
+    device_weights_q2: HashMap<String, DeviceWeightQ2>,
     /// Pre-uploaded RMSNorm weight vectors (1-D, `[h_pad]` elements) keyed by
     /// their HuggingFace tensor name (e.g. `model.layers.0.input_layernorm.weight`).
     norm_weights: HashMap<String, Arc<Tensor<f32>>>,
     matmul: CutileMatMul,
+    /// Q2_0 on-GPU GEMV dispatcher — shares the same CUDA stream as `matmul`.
+    q2_gemv: CutileQ2Gemv,
     flash_attn: CutileFlashAttention,
     cutile_rmsnorm: CutileRmsNorm,
     cutile_rope: CutileRoPE,
@@ -199,6 +253,71 @@ impl CutileGpuModel {
         Ok(())
     }
 
+    /// Upload a Q2_0 weight in packed GPU format (no f32 dequantization).
+    ///
+    /// Converts the raw Q2_0 bytes to the 9-u32-per-block GPU layout:
+    ///   u32[0]    = f32 bits of block scale (f16 → f32)
+    ///   u32[1..8] = 8 u32 words of packed 2-bit data
+    ///
+    /// Returns `false` (and does nothing) when the tensor is absent.
+    fn maybe_upload_q2(
+        stream: &std::sync::Arc<cuda_core::Stream>,
+        device_weights_q2: &mut HashMap<String, DeviceWeightQ2>,
+        qw: &QuantizedWeights,
+        name: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<bool, tempura_kernels::KernelError> {
+        let bytes = match qw.get_q2(name) {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+
+        debug_assert!(
+            k % Q2_0_QK == 0,
+            "k={k} must be a multiple of Q2_0_QK={Q2_0_QK}"
+        );
+        let k_blocks = k / Q2_0_QK;
+        let total_u32s = n * k_blocks * Q2_0_PACKED_U32S;
+        let mut packed: Vec<u32> = Vec::with_capacity(total_u32s);
+
+        for row in 0..n {
+            for blk in 0..k_blocks {
+                let off = (row * k_blocks + blk) * Q2_0_BLOCK_BYTES;
+                let block = &bytes[off..off + Q2_0_BLOCK_BYTES];
+
+                // Slot 0: block scale (f16 → f32, stored as u32 bit pattern).
+                let scale_f16_bits = u16::from_le_bytes([block[0], block[1]]);
+                let scale_f32 = f16_bits_to_f32_inline(scale_f16_bits);
+                packed.push(scale_f32.to_bits());
+
+                // Slots 1-8: 32 packed bytes → 8 u32 words.
+                for w in 0..8usize {
+                    let b0 = block[2 + w * 4] as u32;
+                    let b1 = block[3 + w * 4] as u32;
+                    let b2 = block[4 + w * 4] as u32;
+                    let b3 = block[5 + w * 4] as u32;
+                    packed.push(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+                }
+            }
+        }
+
+        debug_assert_eq!(packed.len(), total_u32s);
+
+        let tensor: Arc<Tensor<u32>> = api::copy_host_vec_to_device(&Arc::new(packed))
+            .sync_on(stream)
+            .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+            .reshape(&[n * k_blocks * Q2_0_PACKED_U32S])
+            .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+            .into();
+
+        device_weights_q2.insert(
+            name.to_string(),
+            DeviceWeightQ2 { tensor, n, k_blocks },
+        );
+        Ok(true)
+    }
+
     /// Upload a norm weight vector from a host slice to a 1-D device tensor of
     /// `h_pad` elements, zero-padding from `h` to `h_pad` if necessary.
     fn upload_norm_weight(
@@ -298,6 +417,7 @@ impl CutileGpuModel {
         let matmul = CutileMatMul::new()?;
         let flash_attn = CutileFlashAttention::new()?;
         let mut dw: HashMap<String, DeviceWeight> = HashMap::new();
+        let mut dw_q2: HashMap<String, DeviceWeightQ2> = HashMap::new();
         let mut nw: HashMap<String, Arc<Tensor<f32>>> = HashMap::new();
 
         let h = config.hidden_size;
@@ -313,73 +433,38 @@ impl CutileGpuModel {
         let q_pad = next_pow2(q_dim.div_ceil(BK) * BK);
         let inter_pad = next_pow2(inter.div_ceil(BK) * BK);
 
-        // lm_head  [vocab, h]
+        // lm_head  [vocab, h] — typically not Q2_0; keep dequantized path.
         Self::maybe_upload(&matmul, &mut dw, qw, "lm_head.weight", vocab, h)?;
 
         for layer in 0..config.num_layers {
             let p = format!("model.layers.{layer}");
 
+            // For each projection: try Q2_0 GPU-resident upload first; fall back
+            // to dequantized f32. The inner block avoids a closure so both `dw`
+            // and `dw_q2` can be borrowed mutably without borrow-checker conflicts.
+            let mut try_proj = |name: String, n: usize, k: usize| {
+                (|| -> Result<(), tempura_kernels::KernelError> {
+                    let uploaded_q2 =
+                        Self::maybe_upload_q2(matmul.stream(), &mut dw_q2, qw, &name, n, k)?;
+                    if !uploaded_q2 {
+                        Self::maybe_upload(&matmul, &mut dw, qw, &name, n, k)?;
+                    }
+                    Ok(())
+                })()
+            };
+
             // Q / K / V projections: [q_dim/kv_dim, h]
-            Self::maybe_upload(
-                &matmul,
-                &mut dw,
-                qw,
-                &format!("{p}.self_attn.q_proj.weight"),
-                q_dim,
-                h,
-            )?;
-            Self::maybe_upload(
-                &matmul,
-                &mut dw,
-                qw,
-                &format!("{p}.self_attn.k_proj.weight"),
-                kv_dim,
-                h,
-            )?;
-            Self::maybe_upload(
-                &matmul,
-                &mut dw,
-                qw,
-                &format!("{p}.self_attn.v_proj.weight"),
-                kv_dim,
-                h,
-            )?;
+            try_proj(format!("{p}.self_attn.q_proj.weight"), q_dim, h)?;
+            try_proj(format!("{p}.self_attn.k_proj.weight"), kv_dim, h)?;
+            try_proj(format!("{p}.self_attn.v_proj.weight"), kv_dim, h)?;
 
             // O projection: [h, q_dim]
-            Self::maybe_upload(
-                &matmul,
-                &mut dw,
-                qw,
-                &format!("{p}.self_attn.o_proj.weight"),
-                h,
-                q_dim,
-            )?;
+            try_proj(format!("{p}.self_attn.o_proj.weight"), h, q_dim)?;
 
             // FFN projections: gate/up [inter, h], down [h, inter]
-            Self::maybe_upload(
-                &matmul,
-                &mut dw,
-                qw,
-                &format!("{p}.mlp.gate_proj.weight"),
-                inter,
-                h,
-            )?;
-            Self::maybe_upload(
-                &matmul,
-                &mut dw,
-                qw,
-                &format!("{p}.mlp.up_proj.weight"),
-                inter,
-                h,
-            )?;
-            Self::maybe_upload(
-                &matmul,
-                &mut dw,
-                qw,
-                &format!("{p}.mlp.down_proj.weight"),
-                h,
-                inter,
-            )?;
+            try_proj(format!("{p}.mlp.gate_proj.weight"), inter, h)?;
+            try_proj(format!("{p}.mlp.up_proj.weight"), inter, h)?;
+            try_proj(format!("{p}.mlp.down_proj.weight"), h, inter)?;
 
             // RMSNorm weights — pre-upload so forward_device never copies them per token.
             if let Some(w) = qw.get_f32(&format!("{p}.input_layernorm.weight")) {
@@ -409,9 +494,18 @@ impl CutileGpuModel {
             Self::upload_norm_weight(matmul.stream(), &mut nw, "model.norm.weight", w, h, h_pad)?;
         }
 
+        let q2_gemv = CutileQ2Gemv::from_stream(matmul.stream().clone());
         let cutile_rmsnorm = CutileRmsNorm::new()?;
         let cutile_rope = CutileRoPE::new()?;
         let cutile_elementwise = CutileElementwise::new()?;
+
+        let q2_count = dw_q2.len();
+        let f32_count = dw.len();
+        if q2_count > 0 {
+            eprintln!(
+                "[cutile] Q2_0 GPU-resident: {q2_count} tensors quantized, {f32_count} tensors as f32"
+            );
+        }
 
         // Scratch for exactly one decode step (seq_len=1). Prefill falls back to
         // forward_device which allocates fresh — prefill is infrequent so the
@@ -428,8 +522,10 @@ impl CutileGpuModel {
             q_pad,
             inter_pad,
             device_weights: dw,
+            device_weights_q2: dw_q2,
             norm_weights: nw,
             matmul,
+            q2_gemv,
             flash_attn,
             cutile_rmsnorm,
             cutile_rope,
@@ -512,6 +608,7 @@ impl CutileGpuModel {
             Self::upload_norm_weight(matmul.stream(), &mut nw, "model.norm.weight", w, h, h_pad)?;
         }
 
+        let q2_gemv = CutileQ2Gemv::from_stream(matmul.stream().clone());
         let cutile_rmsnorm = CutileRmsNorm::new()?;
         let cutile_rope = CutileRoPE::new()?;
         let cutile_elementwise = CutileElementwise::new()?;
@@ -531,8 +628,10 @@ impl CutileGpuModel {
             q_pad,
             inter_pad,
             device_weights: dw,
+            device_weights_q2: HashMap::new(),
             norm_weights: nw,
             matmul,
+            q2_gemv,
             flash_attn,
             cutile_rmsnorm,
             cutile_rope,
@@ -888,6 +987,46 @@ impl CutileGpuModel {
             .expect("CutileGpuModel::gemm_d2d_slot GEMM failed")
     }
 
+    /// Device-to-device GEMV for Q2_0 quantized weights (decode, m=1 only).
+    ///
+    /// Dispatches `cutile_q2_0_gemv` which dequantizes on-GPU. Falls back
+    /// silently to a zero tensor when the weight is absent in `device_weights_q2`.
+    fn gemm_q2_d2d(&self, a: &Arc<Tensor<f32>>, weight_name: &str) -> Arc<Tensor<f32>> {
+        let dw = match self.device_weights_q2.get(weight_name) {
+            Some(d) => d,
+            None => {
+                let stream = self.matmul.stream();
+                return Arc::new(
+                    api::zeros::<f32>(&[1])
+                        .sync_on(stream)
+                        .expect("zeros failed"),
+                );
+            }
+        };
+        self.q2_gemv
+            .forward_d2d(a, &dw.tensor, dw.n, dw.k_blocks)
+            .expect("CutileGpuModel::gemm_q2_d2d failed")
+    }
+
+    /// Unified GEMV/GEMM that transparently selects Q2_0 (decode only) or f32.
+    ///
+    /// For m == 1: checks `device_weights_q2` first, then falls through to
+    /// `gemm_d2d_slot` for f32 weights.
+    /// For m > 1 (prefill): Q2_0 GEMV is not yet batched, falls back to dequantized
+    /// f32 GEMM via `gemm_d2d`.
+    fn gemm_any_d2d_slot(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        weight_name: &str,
+        m: usize,
+        slot: usize,
+    ) -> Arc<Tensor<f32>> {
+        if m == 1 && self.device_weights_q2.contains_key(weight_name) {
+            return self.gemm_q2_d2d(a, weight_name);
+        }
+        self.gemm_d2d_slot(a, weight_name, m, slot)
+    }
+
     // ── inference ─────────────────────────────────────────────────────────────
 
     /// Full autoregressive forward pass with GPU-resident KV cache.
@@ -1006,19 +1145,12 @@ impl CutileGpuModel {
                 .expect("CutileGpuModel: pre-attention RMSNorm failed");
 
             // ── 2b. QKV projections — device-to-device ───────────────────────
-            // For decode (m=1): submit_gemm_d2d_slot uses the coalesced GEMV path
-            // (submit_gemv_coalesced_d2d_into, async_on) and now returns rank-1
-            // after the unpartition().reshape(&[n]) fix.  Submit all three async
-            // so the GPU can pipeline them; one sync covers all three.
-            // For prefill (m>1): forward_bt_device_to_device also returns rank-1
-            // after the flatten fix, so the fallback path is also correct.
-            // SAFETY: sync_stream() is called via RoPE's sync_on before CPU reads.
-            let q_dev =
-                unsafe { self.submit_gemm_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q) };
-            let k_dev =
-                unsafe { self.submit_gemm_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K) };
-            let v_dev =
-                unsafe { self.submit_gemm_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V) };
+            // For Q2_0 models: gemm_any_d2d_slot dequantizes on-GPU (m=1 only).
+            // For f32 models: same path as before, synchronous.
+            // For prefill (m>1): Q2_0 falls back to dequantized f32 GEMM.
+            let q_dev = self.gemm_any_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q);
+            let k_dev = self.gemm_any_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K);
+            let v_dev = self.gemm_any_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V);
 
             // ── 2c. RoPE (GPU) — rotate Q and K entirely on device ───────────
             // cos/sin tables (tiny: seq_len × n_heads × head_dim/2 floats each)
@@ -1130,7 +1262,7 @@ impl CutileGpuModel {
             // ── 2f. O projection — device-to-device ──────────────────────────
             // Upload attn_output padded to q_pad for O projection.
             let attn_padded_dev = self.to_device_padded(&attn_output, seq_len, q_dim, self.q_pad);
-            let o_dev = self.gemm_d2d_slot(&attn_padded_dev, o_w_name, seq_len, SLOT_O);
+            let o_dev = self.gemm_any_d2d_slot(&attn_padded_dev, o_w_name, seq_len, SLOT_O);
 
             // ── 2g. Residual add (GPU) ────────────────────────────────────────
             // o_dev has h columns; pad to h_pad when h_pad > h (rare edge case
@@ -1164,14 +1296,10 @@ impl CutileGpuModel {
                 .expect("CutileGpuModel: post-attention RMSNorm failed");
 
             // ── 2i. FFN gate + up — device-to-device ─────────────────────────
-            // normed2_dev is already [seq_len, h_pad] — directly usable by gemm_d2d.
-            // Submit both without an intermediate sync — single sync covers both.
-            // SAFETY: sync_stream() is called immediately below before any CPU read.
-            let gate_dev =
-                unsafe { self.submit_gemm_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE) };
-            let up_dev =
-                unsafe { self.submit_gemm_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP) };
-            self.matmul.sync_stream().expect("gate/up sync failed");
+            // For Q2_0 models gemm_any_d2d_slot dispatches on-GPU dequant (synchronous).
+            // For f32 models the synchronous gemm_d2d_slot path is used.
+            let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE);
+            let up_dev = self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
 
             // ── 2j. SiLU gate × up (GPU) ─────────────────────────────────────
             // gate_dev and up_dev already reside on the GPU.  silu_mul_device
@@ -1192,7 +1320,7 @@ impl CutileGpuModel {
                 let gate_silu_host = self.download_device_tensor(&gate_silu_n_dev);
                 self.to_device_padded(&gate_silu_host, seq_len, inter, self.inter_pad)
             };
-            let down_dev = self.gemm_d2d_slot(&gate_silu_dev, down_w_name, seq_len, SLOT_DOWN);
+            let down_dev = self.gemm_any_d2d_slot(&gate_silu_dev, down_w_name, seq_len, SLOT_DOWN);
 
             // ── 2l. Residual add (GPU) ────────────────────────────────────────
             let down_padded = if self.h_pad == h {
