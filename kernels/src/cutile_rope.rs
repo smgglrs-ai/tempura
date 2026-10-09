@@ -470,14 +470,11 @@ impl CutileRoPE {
         let cos_t = upload_vec(cos_exp)?;
         let sin_t = upload_vec(sin_exp)?;
 
-        // Force x_dev to rank-1 by downloading and re-uploading.  The Q2_0 GEMV
-        // path (and possibly cuTile partition artefacts) may leave 2 strides on the
-        // tensor even after reshape; a fresh upload always produces exactly 1 stride.
-        let x_host: Vec<f32> = x_dev
-            .to_host_vec()
-            .sync_on(stream)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-        let x_flat = upload_vec(x_host[..num_sh * head_dim].to_vec())?;
+        // x_dev is already rank-1 (1 stride) because all GEMV paths now call
+        // unpartition().reshape(&[n]) before returning, which collapses the
+        // partition-stride metadata that partition([1]).unpartition() used to leave
+        // behind.  Pass x_dev directly — no host round-trip needed.
+        let x_flat = x_dev.clone();
 
         let generics = vec![half.to_string()];
 
