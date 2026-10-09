@@ -42,6 +42,36 @@ pub mod kernels {
         out_second.store(tile_x0 * tile_sin + tile_x1 * tile_cos);
     }
 
+    /// Table-based RoPE rotation kernel for decode (seq_len=1).
+    ///
+    /// All heads share the same sequence position `pos`, which is passed as a
+    /// runtime `i32`.  The kernel reads directly from the pre-computed GPU table
+    /// `cos_table[pos * HALF_DIM .. (pos+1) * HALF_DIM]` — no H2D upload needed.
+    ///
+    /// Grid: (n_heads, 1, 1) — one program per head.
+    ///
+    /// Rotation:
+    ///   out_first[d]  =  x_first[d] * cos_table[pos, d] - x_second[d] * sin_table[pos, d]
+    ///   out_second[d] =  x_first[d] * sin_table[pos, d] + x_second[d] * cos_table[pos, d]
+    #[cutile::entry()]
+    pub fn cutile_rope_from_table<const HALF_DIM: i32>(
+        out_first: &mut Tensor<f32, { [HALF_DIM] }>,
+        out_second: &mut Tensor<f32, { [HALF_DIM] }>,
+        x_first: &Tensor<f32, { [-1] }>,
+        x_second: &Tensor<f32, { [-1] }>,
+        cos_table: &Tensor<f32, { [-1] }>,
+        sin_table: &Tensor<f32, { [-1] }>,
+        pos: i32,
+    ) {
+        let pid = program_id(0);
+        let tile_x0 = x_first.partition(shape![HALF_DIM]).load([pid]);
+        let tile_x1 = x_second.partition(shape![HALF_DIM]).load([pid]);
+        let tile_cos = cos_table.partition(shape![HALF_DIM]).load([pos]);
+        let tile_sin = sin_table.partition(shape![HALF_DIM]).load([pos]);
+        out_first.store(tile_x0 * tile_cos - tile_x1 * tile_sin);
+        out_second.store(tile_x0 * tile_sin + tile_x1 * tile_cos);
+    }
+
     /// Deinterleave kernel: split interleaved [num_sh × head_dim] into two half-tensors.
     ///
     /// `x` is a flat [num_sh * head_dim] tensor in interleaved layout:
@@ -146,9 +176,23 @@ impl RopeScratch {
 /// The host precomputes cosine and sine values per (batch × seq × head) pair
 /// so the GPU kernel receives only pre-expanded tables.  This keeps the kernel
 /// simple and avoids the need for per-program scalar parameters.
+///
+/// When `precompute_table` has been called, the full `[max_pos × half_dim]`
+/// cos/sin tables live on the GPU.  `forward_device_scratch` uses them for
+/// single-token decode steps: no H2D upload at all — just a position index
+/// passed as a runtime `i32` to `cutile_rope_from_table`.
 pub struct CutileRoPE {
     device: Arc<Device>,
     stream: Arc<Stream>,
+    /// Pre-computed cosine table on GPU: `[max_pos * half_dim]`.
+    /// Populated once by `precompute_table`; `None` until then.
+    cos_table: Option<Arc<Tensor<f32>>>,
+    /// Pre-computed sine table on GPU: `[max_pos * half_dim]`.
+    sin_table: Option<Arc<Tensor<f32>>>,
+    /// Number of positions in the pre-computed tables (0 when not populated).
+    table_max_pos: usize,
+    /// Half of the head dimension used when building the tables (0 when not populated).
+    table_half_dim: usize,
 }
 
 unsafe impl Send for CutileRoPE {}
@@ -166,7 +210,58 @@ impl CutileRoPE {
         let stream = device
             .new_stream()
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-        Ok(Self { device, stream })
+        Ok(Self {
+            device,
+            stream,
+            cos_table: None,
+            sin_table: None,
+            table_max_pos: 0,
+            table_half_dim: 0,
+        })
+    }
+
+    /// Pre-compute the full RoPE frequency table and upload it to the GPU once.
+    ///
+    /// After this call, `forward_device_scratch` uses the on-GPU tables for
+    /// single-token decode steps — no H2D cos/sin transfer per token.
+    ///
+    /// `max_pos` should be `config.max_seq_len.min(4096)`.
+    /// `head_dim` must be even.
+    pub fn precompute_table(
+        &mut self,
+        max_pos: usize,
+        head_dim: usize,
+        theta: f32,
+        stream: &Arc<Stream>,
+    ) -> Result<()> {
+        if !head_dim.is_multiple_of(2) {
+            return Err(KernelError::InvalidConfig(format!(
+                "head_dim must be even, got {head_dim}"
+            )));
+        }
+        let half = head_dim / 2;
+        let mut cos_data = vec![0.0f32; max_pos * half];
+        let mut sin_data = vec![0.0f32; max_pos * half];
+        for pos in 0..max_pos {
+            for d in 0..half {
+                let freq = pos as f32 / theta.powf(2.0 * d as f32 / head_dim as f32);
+                cos_data[pos * half + d] = freq.cos();
+                sin_data[pos * half + d] = freq.sin();
+            }
+        }
+        let cos_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(cos_data))
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+        let sin_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(sin_data))
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+        self.cos_table = Some(cos_t);
+        self.sin_table = Some(sin_t);
+        self.table_max_pos = max_pos;
+        self.table_half_dim = half;
+        Ok(())
     }
 
     pub fn device(&self) -> &Device {
@@ -450,6 +545,31 @@ impl CutileRoPE {
         }
         let half = head_dim / 2;
 
+        // ── Fast decode path: read cos/sin from pre-computed GPU table ──────────
+        // Requires seq_len=1 (all heads share the same position) and a populated
+        // table covering the requested position.  No H2D upload at all.
+        if seq_len == 1 {
+            if let (Some(cos_t), Some(sin_t)) = (&self.cos_table, &self.sin_table) {
+                if self.table_half_dim == half {
+                    let pos = positions[0] as usize;
+                    if pos < self.table_max_pos {
+                        return self.forward_device_scratch_from_table(
+                            x_dev,
+                            pos as i32,
+                            n_heads,
+                            head_dim,
+                            half,
+                            cos_t,
+                            sin_t,
+                            scratch,
+                            stream,
+                        );
+                    }
+                }
+            }
+        }
+
+        // ── Standard path: compute cos/sin on CPU, upload H2D ─────────────────
         let mut cos_exp = vec![0.0f32; num_sh * half];
         let mut sin_exp = vec![0.0f32; num_sh * half];
         for s in 0..seq_len {
@@ -555,6 +675,97 @@ impl CutileRoPE {
         }
 
         // Reclaim intermediates — cap_num_sh == num_sh so sizes match exactly.
+        scratch.x_first = Some(Arc::try_unwrap(xf_ret).expect("xf_ret not unique"));
+        scratch.x_second = Some(Arc::try_unwrap(xs_ret).expect("xs_ret not unique"));
+        scratch.out_first = Some(Arc::try_unwrap(of_ret).expect("of_ret not unique"));
+        scratch.out_second = Some(Arc::try_unwrap(os_ret).expect("os_ret not unique"));
+
+        let z_arc = Arc::new(z_t.unpartition());
+        scratch.z = Some(z_arc.clone());
+        Ok(z_arc)
+    }
+
+    /// Inner decode rotation using the pre-computed GPU table.
+    ///
+    /// Called from `forward_device_scratch` when `seq_len == 1` and the table
+    /// has been populated.  Runs deinterleave → `cutile_rope_from_table` →
+    /// interleave entirely on the GPU — zero H2D transfers per call.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_device_scratch_from_table(
+        &self,
+        x_dev: &Arc<Tensor<f32>>,
+        pos: i32,
+        n_heads: usize,
+        head_dim: usize,
+        half: usize,
+        cos_t: &Arc<Tensor<f32>>,
+        sin_t: &Arc<Tensor<f32>>,
+        scratch: &mut RopeScratch,
+        stream: &Arc<Stream>,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let num_sh = n_heads; // seq_len == 1
+        let generics = vec![half.to_string()];
+
+        let z_tensor = scratch
+            .z
+            .take()
+            .and_then(|arc| Arc::try_unwrap(arc).ok())
+            .unwrap_or_else(|| {
+                api::zeros::<f32>(&[scratch.cap_num_sh * scratch.head_dim])
+                    .sync_on(stream)
+                    .expect("RopeScratch: z fallback alloc failed")
+            });
+
+        let x_first_flat = scratch.x_first.take().expect("RopeScratch x_first missing");
+        let x_second_flat = scratch.x_second.take().expect("RopeScratch x_second missing");
+        let out_first_flat = scratch.out_first.take().expect("RopeScratch out_first missing");
+        let out_second_flat = scratch.out_second.take().expect("RopeScratch out_second missing");
+
+        let (x_first_dev, x_second_dev, _x) = unsafe {
+            kernels::cutile_deinterleave(
+                x_first_flat.partition([half]),
+                x_second_flat.partition([half]),
+                x_dev.clone(),
+            )
+            .generics(generics.clone())
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        let x_first_arc: Arc<Tensor<f32>> = Arc::new(x_first_dev.unpartition());
+        let x_second_arc: Arc<Tensor<f32>> = Arc::new(x_second_dev.unpartition());
+
+        let (out_f, out_s, xf_ret, xs_ret, _c, _s, _pos) = unsafe {
+            kernels::cutile_rope_from_table(
+                out_first_flat.partition([half]),
+                out_second_flat.partition([half]),
+                x_first_arc,
+                x_second_arc,
+                cos_t.clone(),
+                sin_t.clone(),
+                pos,
+            )
+            .generics(generics.clone())
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        let first_arc: Arc<Tensor<f32>> = Arc::new(out_f.unpartition());
+        let second_arc: Arc<Tensor<f32>> = Arc::new(out_s.unpartition());
+
+        let (z_t, of_ret, os_ret) = unsafe {
+            kernels::cutile_interleave(z_tensor.partition([half]), first_arc, second_arc)
+                .generics(vec![half.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        unsafe {
+            stream
+                .synchronize()
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        }
+
         scratch.x_first = Some(Arc::try_unwrap(xf_ret).expect("xf_ret not unique"));
         scratch.x_second = Some(Arc::try_unwrap(xs_ret).expect("xs_ret not unique"));
         scratch.out_first = Some(Arc::try_unwrap(of_ret).expect("of_ret not unique"));
