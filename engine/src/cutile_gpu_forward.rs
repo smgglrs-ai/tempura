@@ -34,7 +34,7 @@ use tempura_kernels::cutile_quantized_gemm::{
     Q4K_PACKED_U32S, Q6K_PACKED_U32S, Q6K_QK,
 };
 use tempura_kernels::{Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE};
-use tempura_kernels::cutile_rmsnorm::CutileRmsNorm;
+use tempura_kernels::cutile_rmsnorm::{CutileRmsNorm, RmsnormScratch};
 use tempura_kernels::cutile_rope::{CutileRoPE, RopeScratch};
 
 use crate::config::ModelConfig;
@@ -207,6 +207,17 @@ pub struct CutileGpuModel {
     q_rope_scratch: RefCell<RopeScratch>,
     /// Pre-allocated RoPE scratch for K (sized for min(max_seq_len, 4096) × n_kv_heads).
     k_rope_scratch: RefCell<RopeScratch>,
+    /// Pre-allocated RMSNorm scratch for pre-attention norm (seq_len=1 / decode).
+    pre_attn_norm_scratch: RefCell<RmsnormScratch>,
+    /// Pre-allocated RMSNorm scratch for post-attention norm (seq_len=1 / decode).
+    post_attn_norm_scratch: RefCell<RmsnormScratch>,
+    /// Pre-allocated output buffer for the post-attention residual add (seq_len=1).
+    ///
+    /// Eliminates the `api::zeros.sync_on` allocation inside `add_device` for
+    /// the 28 residual adds per decode token after the attention output.
+    post_attn_add_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
+    /// Pre-allocated output buffer for the post-FFN residual add (seq_len=1).
+    ffn_add_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
 }
 
 // SAFETY: CutileMatMul, CutileFlashAttention and Tensor<f32> hold raw CUDA pointers,
@@ -779,6 +790,17 @@ impl CutileGpuModel {
         let rope_cap = 1usize;
         let q_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_heads, head_dim)?;
         let k_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
+        let pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let post_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let add_alloc = |n: usize| -> Option<Arc<Tensor<f32>>> {
+            Some(Arc::new(
+                api::zeros::<f32>(&[n])
+                    .sync_on(matmul.stream())
+                    .expect("add_device scratch: device allocation failed"),
+            ))
+        };
+        let post_attn_add_scratch = add_alloc(h_pad);
+        let ffn_add_scratch = add_alloc(h_pad);
 
         let model = Self {
             config: config.clone(),
@@ -801,6 +823,10 @@ impl CutileGpuModel {
             scratch: RefCell::new(std::array::from_fn(|_| None)),
             q_rope_scratch: RefCell::new(q_rope_scratch),
             k_rope_scratch: RefCell::new(k_rope_scratch),
+            pre_attn_norm_scratch: RefCell::new(pre_attn_norm_scratch),
+            post_attn_norm_scratch: RefCell::new(post_attn_norm_scratch),
+            post_attn_add_scratch: RefCell::new(post_attn_add_scratch),
+            ffn_add_scratch: RefCell::new(ffn_add_scratch),
         };
         eprintln!("[cutile] warming up kernel specializations…");
         model.warmup_gemms();
@@ -900,6 +926,17 @@ impl CutileGpuModel {
         let rope_cap = 1usize;
         let q_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_heads, head_dim)?;
         let k_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
+        let pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let post_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let add_alloc = |n: usize| -> Option<Arc<Tensor<f32>>> {
+            Some(Arc::new(
+                api::zeros::<f32>(&[n])
+                    .sync_on(matmul.stream())
+                    .expect("add_device scratch: device allocation failed"),
+            ))
+        };
+        let post_attn_add_scratch = add_alloc(h_pad);
+        let ffn_add_scratch = add_alloc(h_pad);
 
         let model = Self {
             config: config.clone(),
@@ -922,6 +959,10 @@ impl CutileGpuModel {
             scratch: RefCell::new(std::array::from_fn(|_| None)),
             q_rope_scratch: RefCell::new(q_rope_scratch),
             k_rope_scratch: RefCell::new(k_rope_scratch),
+            pre_attn_norm_scratch: RefCell::new(pre_attn_norm_scratch),
+            post_attn_norm_scratch: RefCell::new(post_attn_norm_scratch),
+            post_attn_add_scratch: RefCell::new(post_attn_add_scratch),
+            ffn_add_scratch: RefCell::new(ffn_add_scratch),
         };
         eprintln!("[cutile] warming up kernel specializations…");
         model.warmup_gemms();
@@ -1004,6 +1045,50 @@ impl CutileGpuModel {
         .sync_on(stream)
         .expect("add_device: kernel failed");
         Arc::new(out_t.unpartition())
+    }
+
+    /// Residual add reusing a pre-allocated output buffer.
+    ///
+    /// For decode (n = h_pad, a power-of-2 value) the scratch buffer holds the
+    /// previous call's result.  `Arc::try_unwrap` reclaims it once the caller's
+    /// `hidden_dev` local is reassigned, eliminating the `api::zeros.sync_on`
+    /// allocation overhead.  Pool miss falls back to a fresh allocation.
+    fn add_device_scratch(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        b: &Arc<Tensor<f32>>,
+        n: usize,
+        scratch: &mut Option<Arc<Tensor<f32>>>,
+    ) -> Arc<Tensor<f32>> {
+        const BLOCK: usize = 32;
+        let stream = self.matmul.stream();
+        let n_pad = n.div_ceil(BLOCK) * BLOCK;
+        let out_tensor = match scratch.take() {
+            Some(arc) => match Arc::try_unwrap(arc) {
+                Ok(tensor) => tensor,
+                Err(arc_back) => {
+                    *scratch = Some(arc_back);
+                    api::zeros::<f32>(&[n_pad])
+                        .sync_on(stream)
+                        .expect("add_device_scratch: alloc failed")
+                }
+            },
+            None => api::zeros::<f32>(&[n_pad])
+                .sync_on(stream)
+                .expect("add_device_scratch: alloc failed"),
+        };
+        let out_part = out_tensor.partition([BLOCK]);
+        let (out_part, _, _) = tempura_kernels::cutile_elementwise::kernels::cutile_vector_add(
+            out_part,
+            a.clone(),
+            b.clone(),
+        )
+        .generics(vec![BLOCK.to_string()])
+        .sync_on(stream)
+        .expect("add_device_scratch: kernel failed");
+        let result = Arc::new(out_part.unpartition());
+        *scratch = Some(result.clone());
+        result
     }
 
     /// Upload a host slice to a **flat 1-D** device tensor of `rows * padded_cols`
@@ -1789,22 +1874,38 @@ impl CutileGpuModel {
 
             // ── 2a. Pre-attention RMSNorm (GPU) ───────────────────────────────
             // hidden_dev is already on device — no upload needed.
+            // For decode (seq_len=1) use scratch buffers to avoid 3 api::zeros.sync_on
+            // per call (168 blocking allocs per token across 28 layers).
             let input_ln_w_dev = self
                 .norm_weights
                 .get(input_ln_name)
                 .expect("CutileGpuModel: input_layernorm weight not pre-uploaded");
-            let normed_dev = self
-                .cutile_rmsnorm
-                .forward_device_fused(
-                    self.matmul.stream(),
-                    hidden_dev.clone(),
-                    input_ln_w_dev,
-                    seq_len,
-                    h,
-                    self.h_pad,
-                    cfg.layer_norm_eps,
-                )
-                .expect("CutileGpuModel: pre-attention RMSNorm failed");
+            let normed_dev = if seq_len == 1 {
+                self.cutile_rmsnorm
+                    .forward_device_fused_scratch(
+                        self.matmul.stream(),
+                        hidden_dev.clone(),
+                        input_ln_w_dev,
+                        seq_len,
+                        h,
+                        self.h_pad,
+                        cfg.layer_norm_eps,
+                        &mut self.pre_attn_norm_scratch.borrow_mut(),
+                    )
+                    .expect("CutileGpuModel: pre-attention RMSNorm failed")
+            } else {
+                self.cutile_rmsnorm
+                    .forward_device_fused(
+                        self.matmul.stream(),
+                        hidden_dev.clone(),
+                        input_ln_w_dev,
+                        seq_len,
+                        h,
+                        self.h_pad,
+                        cfg.layer_norm_eps,
+                    )
+                    .expect("CutileGpuModel: pre-attention RMSNorm failed")
+            };
 
             // ── 2b. QKV projections — device-to-device ───────────────────────
             // For Q2_0 models: gemm_any_d2d_slot dequantizes on-GPU (m=1 only).
@@ -1984,7 +2085,16 @@ impl CutileGpuModel {
                 let o_host = self.download_device_tensor(&o_dev);
                 self.to_device_flat_padded(&o_host, seq_len, h, self.h_pad)
             };
-            hidden_dev = self.add_device(&hidden_dev, &o_padded, seq_len * self.h_pad);
+            hidden_dev = if seq_len == 1 {
+                self.add_device_scratch(
+                    &hidden_dev,
+                    &o_padded,
+                    seq_len * self.h_pad,
+                    &mut self.post_attn_add_scratch.borrow_mut(),
+                )
+            } else {
+                self.add_device(&hidden_dev, &o_padded, seq_len * self.h_pad)
+            };
 
             // ── 2h. Post-attention RMSNorm (GPU) ─────────────────────────────
             // hidden_dev is already updated on device — no upload needed.
@@ -1992,18 +2102,32 @@ impl CutileGpuModel {
                 .norm_weights
                 .get(post_ln_name)
                 .expect("CutileGpuModel: post_attention_layernorm weight not pre-uploaded");
-            let normed2_dev = self
-                .cutile_rmsnorm
-                .forward_device_fused(
-                    self.matmul.stream(),
-                    hidden_dev.clone(),
-                    post_ln_w_dev,
-                    seq_len,
-                    h,
-                    self.h_pad,
-                    cfg.layer_norm_eps,
-                )
-                .expect("CutileGpuModel: post-attention RMSNorm failed");
+            let normed2_dev = if seq_len == 1 {
+                self.cutile_rmsnorm
+                    .forward_device_fused_scratch(
+                        self.matmul.stream(),
+                        hidden_dev.clone(),
+                        post_ln_w_dev,
+                        seq_len,
+                        h,
+                        self.h_pad,
+                        cfg.layer_norm_eps,
+                        &mut self.post_attn_norm_scratch.borrow_mut(),
+                    )
+                    .expect("CutileGpuModel: post-attention RMSNorm failed")
+            } else {
+                self.cutile_rmsnorm
+                    .forward_device_fused(
+                        self.matmul.stream(),
+                        hidden_dev.clone(),
+                        post_ln_w_dev,
+                        seq_len,
+                        h,
+                        self.h_pad,
+                        cfg.layer_norm_eps,
+                    )
+                    .expect("CutileGpuModel: post-attention RMSNorm failed")
+            };
 
             // ── 2i. FFN gate + up — device-to-device ─────────────────────────
             // For Q2_0 models gemm_any_d2d_slot dispatches on-GPU dequant (synchronous).
@@ -2039,7 +2163,16 @@ impl CutileGpuModel {
                 let down_host = self.download_device_tensor(&down_dev);
                 self.to_device_flat_padded(&down_host, seq_len, h, self.h_pad)
             };
-            hidden_dev = self.add_device(&hidden_dev, &down_padded, seq_len * self.h_pad);
+            hidden_dev = if seq_len == 1 {
+                self.add_device_scratch(
+                    &hidden_dev,
+                    &down_padded,
+                    seq_len * self.h_pad,
+                    &mut self.ffn_add_scratch.borrow_mut(),
+                )
+            } else {
+                self.add_device(&hidden_dev, &down_padded, seq_len * self.h_pad)
+            };
         }
 
         // ── 3. Final norm + lm_head ────────────────────────────────────────────
