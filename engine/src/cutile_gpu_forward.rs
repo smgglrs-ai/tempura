@@ -762,10 +762,11 @@ impl CutileGpuModel {
         // forward_device which allocates fresh — prefill is infrequent so the
         // allocation cost there is amortised. Sizing at n_heads (not max_seq_len×n_heads)
         // avoids the out-of-bounds launch that occurs when cap_num_sh > actual num_sh.
+        // Use the shared matmul stream so RoPE scratch buffers are on the same stream
+        // as all other GPU operations — eliminates cross-stream synchronization overhead.
         let rope_cap = 1usize;
-        let rope_stream = cutile_rope.stream();
-        let q_rope_scratch = RopeScratch::new(rope_stream, rope_cap * n_heads, head_dim)?;
-        let k_rope_scratch = RopeScratch::new(rope_stream, rope_cap * n_kv_heads, head_dim)?;
+        let q_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_heads, head_dim)?;
+        let k_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
 
         let model = Self {
             config: config.clone(),
@@ -874,10 +875,11 @@ impl CutileGpuModel {
         // forward_device which allocates fresh — prefill is infrequent so the
         // allocation cost there is amortised. Sizing at n_heads (not max_seq_len×n_heads)
         // avoids the out-of-bounds launch that occurs when cap_num_sh > actual num_sh.
+        // Use the shared matmul stream so RoPE scratch buffers are on the same stream
+        // as all other GPU operations — eliminates cross-stream synchronization overhead.
         let rope_cap = 1usize;
-        let rope_stream = cutile_rope.stream();
-        let q_rope_scratch = RopeScratch::new(rope_stream, rope_cap * n_heads, head_dim)?;
-        let k_rope_scratch = RopeScratch::new(rope_stream, rope_cap * n_kv_heads, head_dim)?;
+        let q_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_heads, head_dim)?;
+        let k_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
 
         let model = Self {
             config: config.clone(),
@@ -1763,6 +1765,7 @@ impl CutileGpuModel {
             // rotated on the GPU using pre-allocated scratch buffers, eliminating
             // the 5 × 2 api::zeros calls (280 blocking allocs per token at 28 layers).
             let (q_rot_dev, k_rot_dev) = if !cfg.use_alibi {
+                let shared_stream = self.matmul.stream();
                 let qr = self
                     .cutile_rope
                     .forward_device_scratch(
@@ -1773,6 +1776,7 @@ impl CutileGpuModel {
                         head_dim,
                         cfg.rope_theta,
                         &mut self.q_rope_scratch.borrow_mut(),
+                        shared_stream,
                     )
                     .expect("CutileGpuModel: GPU RoPE for Q failed");
                 let kr = self
@@ -1785,6 +1789,7 @@ impl CutileGpuModel {
                         head_dim,
                         cfg.rope_theta,
                         &mut self.k_rope_scratch.borrow_mut(),
+                        shared_stream,
                     )
                     .expect("CutileGpuModel: GPU RoPE for K failed");
                 (qr, kr)
