@@ -8,6 +8,143 @@ use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
 use cutile::tensor::{IntoPartition, Reshape, Tensor};
 use std::sync::Arc;
 
+// ── Q2_0 block layout constants ──────────────────────────────────────────────
+// Q2_0 (PrismML): 2-bit quantized, 128 elements per block, 34 bytes per block
+//   [0..2]   d  (f16 scale)
+//   [2..34]  qs (32 bytes = 128 elements × 2 bits, 4 elements per byte)
+// Dequant: (((qs[i/4] >> (2*(i%4))) & 3) - 1) × d
+// Encoding: q=0→-1, q=1→0, q=2→+1, q=3→+2
+//
+// GPU packed format (9 u32 per block):
+//   u32[0]    = f32 bits of scale (f16 → f32 at upload time)
+//   u32[1..8] = 8 u32 words of packed 2-bit data (each holds 16 elements)
+pub const Q2_0_QK: usize = 128;
+pub const Q2_0_BLOCK_BYTES: usize = 34; // raw on-disk bytes per block
+pub const Q2_0_PACKED_U32S: usize = 9;  // u32 slots per block in GPU format
+
+// ── cuTile Q2_0 GEMV kernel ───────────────────────────────────────────────────
+
+#[cutile::module]
+pub mod kernels {
+    use cutile::core::*;
+
+    /// Q2_0 dequantized GEMV: z[1] = Σ_k dequant(packed[pid_n, k]) × x[k]
+    ///
+    /// Packed layout: [N × K_BLOCKS × 9] u32 (conceptually [N, K_BLOCKS, 9]):
+    ///   packed[n, blk, 0]    = f32 bits of block scale (converted from f16)
+    ///   packed[n, blk, 1..8] = 8 u32 words of 2-bit weights
+    ///     bits[2i+1 : 2i] of word w = q of element blk*128 + w*16 + i
+    ///     dequant: (q - 1) × scale, q ∈ {0,1,2,3} → values ∈ {-1,0,1,2} × scale
+    ///
+    /// Grid: (N, 1, 1) — one program per output neuron.
+    #[cutile::entry()]
+    pub fn cutile_q2_0_gemv<const K_BLOCKS: i32>(
+        z: &mut Tensor<f32, { [1] }>,
+        x: &Tensor<f32, { [-1] }>,
+        packed: &Tensor<u32, { [-1] }>,
+    ) {
+        let pid_n = program_id(0);
+        let part_x = x.partition(shape![1]);
+        let part_p = packed.partition(shape![1]);
+        let mut acc: Tile<f32, { [1] }> = broadcast_scalar(0.0_f32, shape![1]);
+
+        for blk in 0i32..K_BLOCKS {
+            let pack_base = pid_n * K_BLOCKS * 9 + blk * 9;
+            let x_base = blk * 128;
+
+            // Load block scale stored as f32 bits in the first u32 slot.
+            let scale_u32: Tile<u32, { [1] }> = part_p.load([pack_base]);
+            let scale: Tile<f32, { [1] }> = bitcast(scale_u32);
+
+            // Process 8 u32 words; each holds 16 2-bit quantised weight values.
+            for word in 0i32..8 {
+                let word_data: Tile<u32, { [1] }> = part_p.load([pack_base + 1 + word]);
+                let x_word_base = x_base + word * 16;
+
+                // IEEE 754 integer-to-float trick — avoids itof (cutile-0.3.1 bug:
+                // itof does not emit the required 'signedness' attribute).
+                // For u32 x in [0, 2^23): bitcast(x | 0x4B000000) - 8388608.0 = (float)x.
+                // Combined constant 8388609.0 = 8388608.0 + 1.0 centres {0,1,2,3} to {-1,0,1,2}.
+                let magic: Tile<u32, { [1] }> = broadcast_scalar(0x4B000000_u32, shape![1]);
+                let bias_f32: Tile<f32, { [1] }> = broadcast_scalar(8388609.0_f32, shape![1]);
+
+                for bit_pair in 0i32..16 {
+                    // Extract 2-bit q value via right-shift + mask.
+                    let shift: Tile<u32, { [1] }> =
+                        broadcast_scalar((bit_pair * 2) as u32, shape![1]);
+                    let mask: Tile<u32, { [1] }> = broadcast_scalar(3_u32, shape![1]);
+                    let q_u32: Tile<u32, { [1] }> = andi(shri(word_data, shift), mask);
+
+                    // Integer→float via IEEE bit trick:
+                    // bitcast(q | 0x4B000000) - 8388609.0 == (q as f32) - 1.0
+                    let biased: Tile<u32, { [1] }> = ori(q_u32, magic);
+                    let q_f32: Tile<f32, { [1] }> = bitcast(biased) - bias_f32;
+
+                    // Load the corresponding activation element.
+                    let x_elem: Tile<f32, { [1] }> = part_x.load([x_word_base + bit_pair]);
+
+                    // Accumulate: acc += scale × q × x
+                    acc = acc + scale * q_f32 * x_elem;
+                }
+            }
+        }
+        z.store(acc);
+    }
+}
+
+/// GPU-resident Q2_0 GEMV dispatcher.
+///
+/// Holds the CUDA stream and dispatches `cutile_q2_0_gemv` for decode (m=1)
+/// forward passes where weights are stored in packed Q2_0 format on the GPU.
+pub struct CutileQ2Gemv {
+    stream: Arc<Stream>,
+}
+
+unsafe impl Send for CutileQ2Gemv {}
+unsafe impl Sync for CutileQ2Gemv {}
+
+impl CutileQ2Gemv {
+    /// Create from an existing CUDA stream (share with `CutileMatMul`).
+    pub fn from_stream(stream: Arc<Stream>) -> Self {
+        Self { stream }
+    }
+
+    pub fn stream(&self) -> &Arc<Stream> {
+        &self.stream
+    }
+
+    /// Device-to-device Q2_0 GEMV: output[n] = packed_weights × x[k].
+    ///
+    /// `packed` holds `n × k_blocks × Q2_0_PACKED_U32S` u32 elements.
+    /// `x` holds `k = k_blocks × Q2_0_QK` f32 activation elements.
+    pub fn forward_d2d(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let stream = &self.stream;
+
+        let z = api::zeros::<f32>(&[n])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1]);
+
+        let (z, _x, _p) =
+            kernels::cutile_q2_0_gemv(z, Arc::clone(x), Arc::clone(packed))
+                .generics(vec![k_blocks.to_string()])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let out = z
+            .unpartition()
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(out))
+    }
+}
+
 // Tile constants matching cutile_matmul.rs
 const BM: usize = 16;
 const BN: usize = 16;
@@ -647,5 +784,180 @@ mod tests {
             (got_dot - expected_dot).abs() < 1e-3,
             "dequant dot={got_dot} vs tq2_dot_block={expected_dot}"
         );
+    }
+
+    // ── Q2_0 upload format helpers ────────────────────────────────────────────
+
+    fn f32_to_f16_bits_q2(val: f32) -> u16 {
+        f32_to_f16_bits(val)
+    }
+
+    /// Build a synthetic Q2_0 block: scale=d, all 128 weights = q_val ∈ {0,1,2,3}.
+    fn make_q2_0_block(d: f32, q_val: u8) -> Vec<u8> {
+        assert!(q_val <= 3);
+        let mut block = vec![0u8; Q2_0_BLOCK_BYTES];
+        let d_bits = f32_to_f16_bits_q2(d);
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // Pack q_val into every 2-bit slot of the 32 payload bytes.
+        let packed_byte = q_val | (q_val << 2) | (q_val << 4) | (q_val << 6);
+        for b in block[2..].iter_mut() {
+            *b = packed_byte;
+        }
+        block
+    }
+
+    #[test]
+    fn q2_0_upload_format_round_trips() {
+        // Build a 2-row, 2-block weight matrix in Q2_0 format.
+        // Row 0: scale=2.0, all q=1 → dequant = (1-1)*2.0 = 0.0
+        // Row 1: scale=3.0, all q=3 → dequant = (3-1)*3.0 = 6.0
+        let n = 2;
+        let k = Q2_0_QK * 2; // 2 blocks per row
+        let k_blocks = k / Q2_0_QK;
+
+        let block0a = make_q2_0_block(2.0, 1); // row 0, block 0
+        let block0b = make_q2_0_block(2.0, 1); // row 0, block 1
+        let block1a = make_q2_0_block(3.0, 3); // row 1, block 0
+        let block1b = make_q2_0_block(3.0, 3); // row 1, block 1
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block0a);
+        raw.extend_from_slice(&block0b);
+        raw.extend_from_slice(&block1a);
+        raw.extend_from_slice(&block1b);
+
+        // Convert to packed u32 format (mirrors maybe_upload_q2 logic).
+        let total_u32s = n * k_blocks * Q2_0_PACKED_U32S;
+        let mut packed: Vec<u32> = Vec::with_capacity(total_u32s);
+
+        fn f16b_to_f32(bits: u16) -> f32 {
+            let sign = ((bits >> 15) & 1) as u32;
+            let exp = ((bits >> 10) & 0x1f) as u32;
+            let frac = (bits & 0x3ff) as u32;
+            if exp == 0 && frac == 0 {
+                return f32::from_bits(sign << 31);
+            } else if exp == 31 {
+                return f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13));
+            }
+            f32::from_bits((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13))
+        }
+
+        for row in 0..n {
+            for blk in 0..k_blocks {
+                let off = (row * k_blocks + blk) * Q2_0_BLOCK_BYTES;
+                let block = &raw[off..off + Q2_0_BLOCK_BYTES];
+                let scale_bits = u16::from_le_bytes([block[0], block[1]]);
+                packed.push(f16b_to_f32(scale_bits).to_bits());
+                for w in 0..8usize {
+                    let b0 = block[2 + w * 4] as u32;
+                    let b1 = block[3 + w * 4] as u32;
+                    let b2 = block[4 + w * 4] as u32;
+                    let b3 = block[5 + w * 4] as u32;
+                    packed.push(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+                }
+            }
+        }
+
+        assert_eq!(packed.len(), total_u32s);
+
+        // Validate scale slots.
+        let scale_row0 = f32::from_bits(packed[0]);
+        let scale_row1 = f32::from_bits(packed[k_blocks * Q2_0_PACKED_U32S]);
+        assert!(
+            (scale_row0 - 2.0).abs() < 1e-4,
+            "row 0 scale: {scale_row0}"
+        );
+        assert!(
+            (scale_row1 - 3.0).abs() < 1e-4,
+            "row 1 scale: {scale_row1}"
+        );
+
+        // Validate data words: all q=1 → packed byte 0b01_01_01_01 = 0x55.
+        let word0 = packed[1];
+        assert_eq!(word0, 0x55555555, "row0 word: 0x{:08x}", word0);
+
+        // All q=3 → packed byte 0b11_11_11_11 = 0xFF.
+        let word1 = packed[k_blocks * Q2_0_PACKED_U32S + 1];
+        assert_eq!(word1, 0xFFFFFFFF, "row1 word: 0x{:08x}", word1);
+    }
+
+    #[test]
+    #[cfg(feature = "cutile")]
+    fn q2_0_gpu_gemv_matches_cpu_dequant() {
+        use cuda_core::Device;
+        use cutile::api;
+        use cutile::prelude::DeviceOp;
+        use cutile::tensor::Reshape;
+
+        // Build a 4-output, K=128 Q2_0 GEMV:
+        // Row 0: scale=1.0, all q=2 → dequant = +1.0
+        // Row 1: scale=2.0, all q=1 → dequant =  0.0
+        // Row 2: scale=1.0, all q=0 → dequant = -1.0
+        // Row 3: scale=1.0, all q=3 → dequant = +2.0
+        let n = 4;
+        let k = Q2_0_QK;
+        let k_blocks = 1;
+        let test_cases: &[(f32, u8, f32)] = &[
+            (1.0, 2, 1.0),  // row 0: scale=1, q=2 → +1
+            (2.0, 1, 0.0),  // row 1: scale=2, q=1 →  0
+            (1.0, 0, -1.0), // row 2: scale=1, q=0 → -1
+            (1.0, 3, 2.0),  // row 3: scale=1, q=3 → +2
+        ];
+
+        // Activation: all ones → dot = sum of row weights
+        let x_vals = vec![1.0f32; k];
+
+        // Build raw Q2_0 bytes and pack.
+        let mut packed: Vec<u32> = Vec::with_capacity(n * k_blocks * Q2_0_PACKED_U32S);
+        let mut expected: Vec<f32> = Vec::with_capacity(n);
+        for &(d, q_val, elem_val) in test_cases {
+            let block = make_q2_0_block(d, q_val);
+            let scale_bits = u16::from_le_bytes([block[0], block[1]]);
+            let scale_f32 = f16_to_f32(scale_bits);
+            packed.push(scale_f32.to_bits());
+            for w in 0..8usize {
+                let b0 = block[2 + w * 4] as u32;
+                let b1 = block[3 + w * 4] as u32;
+                let b2 = block[4 + w * 4] as u32;
+                let b3 = block[5 + w * 4] as u32;
+                packed.push(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            }
+            // Expected: k elements each = elem_val, activation all 1 → dot = k * elem_val
+            expected.push(k as f32 * elem_val);
+        }
+
+        // Upload to GPU and dispatch the kernel.
+        let device = Device::new(0).expect("CUDA device 0 not available");
+        let stream: std::sync::Arc<cuda_core::Stream> =
+            device.new_stream().expect("stream").into();
+        let q2_gemv = CutileQ2Gemv::from_stream(stream);
+
+        let x_dev: std::sync::Arc<cutile::tensor::Tensor<f32>> =
+            api::copy_host_vec_to_device(&std::sync::Arc::new(x_vals))
+                .sync_on(q2_gemv.stream())
+                .expect("upload x")
+                .into();
+        let p_dev: std::sync::Arc<cutile::tensor::Tensor<u32>> =
+            api::copy_host_vec_to_device(&std::sync::Arc::new(packed))
+                .sync_on(q2_gemv.stream())
+                .expect("upload packed")
+                .into();
+
+        let result = q2_gemv
+            .forward_d2d(&x_dev, &p_dev, n, k_blocks)
+            .expect("q2_0 gemv");
+
+        let out: Vec<f32> = result
+            .to_host_vec()
+            .sync_on(q2_gemv.stream())
+            .expect("download");
+
+        for (i, (&got, &exp)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-2,
+                "row {i}: got {got}, expected {exp}"
+            );
+        }
     }
 }
