@@ -365,6 +365,43 @@ impl CutileQ2Gemv {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         Ok(Arc::new(out))
     }
+
+    /// Non-blocking Q2_0 GEMV reusing a pre-allocated output buffer.
+    ///
+    /// Enqueues the kernel without synchronising. The caller MUST ensure the
+    /// stream is synced (or a subsequent `sync_on` on the same stream runs first)
+    /// before reading the result on the CPU.
+    ///
+    /// # Safety
+    ///
+    /// The returned tensor's device memory is being written asynchronously.
+    /// Do not read it on the CPU until the stream has been synced.
+    pub unsafe fn submit_d2d_into(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        out: Tensor<f32>,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let z = out
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1]);
+
+        let (z, _x, _p) = unsafe {
+            kernels::cutile_q2_0_gemv(z, Arc::clone(x), Arc::clone(packed))
+                .generics(vec![k_blocks.to_string()])
+                .async_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        let flat = z
+            .unpartition()
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(flat))
+    }
 }
 
 /// GPU-resident Q6_K GEMV dispatcher.
@@ -420,6 +457,41 @@ impl CutileQ6kGemv {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         Ok(Arc::new(out))
     }
+
+    /// Non-blocking Q6_K GEMV reusing a pre-allocated output buffer.
+    ///
+    /// Enqueues the kernel without synchronising. The caller MUST ensure the
+    /// stream is synced before reading the result on the CPU.
+    ///
+    /// # Safety
+    ///
+    /// The returned tensor's device memory is being written asynchronously.
+    pub unsafe fn submit_d2d_into(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        out: Tensor<f32>,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let z = out
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1]);
+
+        let (z, _x, _p) = unsafe {
+            kernels::cutile_q6k_gemv(z, Arc::clone(x), Arc::clone(packed))
+                .generics(vec![k_blocks.to_string()])
+                .async_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        let flat = z
+            .unpartition()
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(flat))
+    }
 }
 
 /// GPU-resident Q4_K GEMV dispatcher.
@@ -474,6 +546,41 @@ impl CutileQ4Gemv {
             .reshape(&[n])
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         Ok(Arc::new(out))
+    }
+
+    /// Non-blocking Q4_K GEMV reusing a pre-allocated output buffer.
+    ///
+    /// Enqueues the kernel without synchronising. The caller MUST ensure the
+    /// stream is synced before reading the result on the CPU.
+    ///
+    /// # Safety
+    ///
+    /// The returned tensor's device memory is being written asynchronously.
+    pub unsafe fn submit_d2d_into(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        out: Tensor<f32>,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let z = out
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1]);
+
+        let (z, _x, _p) = unsafe {
+            kernels::cutile_q4k_gemv(z, Arc::clone(x), Arc::clone(packed))
+                .generics(vec![k_blocks.to_string()])
+                .async_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        let flat = z
+            .unpartition()
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(flat))
     }
 }
 
