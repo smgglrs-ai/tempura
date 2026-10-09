@@ -13,6 +13,49 @@ use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
 use cutile::tensor::{IntoPartition, Reshape, Tensor};
 
+/// Pre-allocated scratch buffers for `forward_device_fused_scratch`.
+///
+/// Sized for a single token (seq_len=1 / decode path).  Pre-allocating
+/// eliminates the three `api::zeros.sync_on` calls that `forward_device_fused`
+/// issues on every invocation — 168 blocking round-trips per decode token
+/// (3 allocs × 2 norms × 28 layers) become zero after the first warm-up call.
+///
+/// `sum_t` and `scale_t` are reclaimed within the same call via
+/// `Arc::try_unwrap` on the tensors returned by the scale and apply kernels.
+/// `out_t` is returned to the caller as an `Arc`; it is reclaimed at the
+/// start of the *next* call once the caller's reference has been dropped.
+pub struct RmsnormScratch {
+    pub sum_t: Option<Arc<Tensor<f32>>>,
+    pub scale_t: Option<Arc<Tensor<f32>>>,
+    pub out_t: Option<Arc<Tensor<f32>>>,
+}
+
+unsafe impl Send for RmsnormScratch {}
+unsafe impl Sync for RmsnormScratch {}
+
+impl RmsnormScratch {
+    /// Pre-allocate with a single blocking `sync_on` per buffer — called once
+    /// at model construction.  `seq_len` should be 1 (decode).
+    pub fn new(
+        stream: &Arc<Stream>,
+        seq_len: usize,
+        h_pad: usize,
+    ) -> std::result::Result<Self, KernelError> {
+        let alloc = |n: usize| -> std::result::Result<Arc<Tensor<f32>>, KernelError> {
+            Ok(Arc::new(
+                api::zeros::<f32>(&[n])
+                    .sync_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+            ))
+        };
+        Ok(Self {
+            sum_t: Some(alloc(seq_len)?),
+            scale_t: Some(alloc(seq_len)?),
+            out_t: Some(alloc(seq_len * h_pad)?),
+        })
+    }
+}
+
 #[cutile::module]
 pub mod kernels {
     use cutile::core::*;
@@ -259,6 +302,142 @@ impl CutileRmsNorm {
             .reshape(&[seq_len, h_pad])
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .into();
+        Ok(out_2d)
+    }
+
+    /// Fused RMSNorm reusing pre-allocated scratch buffers.
+    ///
+    /// Identical to `forward_device_fused` but avoids the three
+    /// `api::zeros.sync_on` allocations per call by reclaiming device memory
+    /// from `scratch`.  For decode (seq_len=1) this eliminates all per-token
+    /// allocation overhead.  Prefill callers should use `forward_device_fused`
+    /// instead since the scratch is sized for seq_len=1 only.
+    ///
+    /// # Reclaim strategy
+    ///
+    /// `sum_t` and `scale_t` are reclaimed within this call via
+    /// `Arc::try_unwrap` on the tensors the scale/apply kernels return.
+    /// `out_t` is reclaimed at the start of the *next* call once the caller
+    /// has dropped its reference; a pool miss falls back to `api::zeros.sync_on`.
+    pub fn forward_device_fused_scratch(
+        &self,
+        stream: &Arc<Stream>,
+        x_dev: Arc<Tensor<f32>>,
+        weight_dev: &Arc<Tensor<f32>>,
+        seq_len: usize,
+        hidden_size: usize,
+        h_pad: usize,
+        eps: f32,
+        scratch: &mut RmsnormScratch,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let inv_h = 1.0f32 / hidden_size as f32;
+
+        // ── Reclaim or allocate sum_t ─────────────────────────────────────────
+        let sum_tensor = match scratch.sum_t.take() {
+            Some(arc) => match Arc::try_unwrap(arc) {
+                Ok(tensor) => tensor,
+                Err(arc_back) => {
+                    scratch.sum_t = Some(arc_back);
+                    api::zeros::<f32>(&[seq_len])
+                        .sync_on(stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                }
+            },
+            None => api::zeros::<f32>(&[seq_len])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        };
+        let sum_part = sum_tensor.partition([1]);
+
+        // Pass 1: sum(x²) per token — async.
+        // SAFETY: tensors are accessed only after stream.synchronize() below.
+        let (sum_part_out, x_t) = unsafe {
+            kernels::rmsnorm_sum_sq(sum_part, x_dev)
+                .generics(vec![h_pad.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+        let sum_arc: Arc<Tensor<f32>> = Arc::new(sum_part_out.unpartition());
+
+        // ── Reclaim or allocate scale_t ───────────────────────────────────────
+        let scale_tensor = match scratch.scale_t.take() {
+            Some(arc) => match Arc::try_unwrap(arc) {
+                Ok(tensor) => tensor,
+                Err(arc_back) => {
+                    scratch.scale_t = Some(arc_back);
+                    api::zeros::<f32>(&[seq_len])
+                        .sync_on(stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                }
+            },
+            None => api::zeros::<f32>(&[seq_len])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        };
+        let scale_part = scale_tensor.partition([1]);
+
+        // Scale kernel: scale[t] = 1/sqrt(sum_sq[t]/hidden_size + eps) — async.
+        let (scale_part_out, _sum_returned, _inv_h, _eps) = unsafe {
+            kernels::cutile_rmsnorm_scale(scale_part, sum_arc, inv_h, eps)
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+        // Reclaim sum_t: the kernel returns the input Arc; unwrap back to flat tensor.
+        scratch.sum_t = match Arc::try_unwrap(_sum_returned) {
+            Ok(tensor) => Some(Arc::new(tensor)),
+            Err(arc_back) => Some(arc_back),
+        };
+        let scale_arc: Arc<Tensor<f32>> = Arc::new(scale_part_out.unpartition());
+
+        // ── Reclaim or allocate out_t ─────────────────────────────────────────
+        // The caller's Arc from the previous call should be dropped by now;
+        // reshape from [seq_len, h_pad] back to flat [seq_len * h_pad] for partition.
+        let out_tensor = match scratch.out_t.take() {
+            Some(arc) => match Arc::try_unwrap(arc) {
+                Ok(tensor) => tensor
+                    .reshape(&[seq_len * h_pad])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+                Err(arc_back) => {
+                    scratch.out_t = Some(arc_back);
+                    api::zeros::<f32>(&[seq_len * h_pad])
+                        .sync_on(stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                }
+            },
+            None => api::zeros::<f32>(&[seq_len * h_pad])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        };
+        let out_part = out_tensor.partition([h_pad]);
+
+        // Pass 2: apply scale and weight on device — async.
+        let (out_part_out, _x, _w, _s) = unsafe {
+            kernels::rmsnorm_apply(out_part, x_t, weight_dev.clone(), scale_arc)
+                .generics(vec![h_pad.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+        // Reclaim scale_t from the returned Arc.
+        scratch.scale_t = match Arc::try_unwrap(_s) {
+            Ok(tensor) => Some(Arc::new(tensor)),
+            Err(arc_back) => Some(arc_back),
+        };
+
+        // Single sync covers sum_sq + scale + apply.
+        unsafe {
+            stream
+                .synchronize()
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        }
+
+        let out_2d = Arc::new(
+            out_part_out
+                .unpartition()
+                .reshape(&[seq_len, h_pad])
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        );
+        // Store a clone so the next call can reclaim the device memory.
+        scratch.out_t = Some(out_2d.clone());
         Ok(out_2d)
     }
 }
