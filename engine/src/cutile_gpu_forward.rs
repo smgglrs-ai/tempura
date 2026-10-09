@@ -1269,8 +1269,8 @@ impl CutileGpuModel {
         // metadata operation (no D→H→D round-trip). The kernel reads exactly
         // k_blocks * Q2_0_QK elements, which is ≤ h_pad; the padding is ignored.
         let a_flat = Arc::clone(a)
-            .reshape(&[self.h_pad])
-            .expect("gemm_q2_d2d: reshape [1, h_pad] → [h_pad] failed");
+            .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::cutile_quantized_gemm::Q2_0_QK)])
+            .expect("gemm_q2_d2d: reshape [1, stride] → [stride] failed");
         self.q2_gemv
             .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
             .expect("CutileGpuModel::gemm_q2_d2d failed")
@@ -1294,8 +1294,8 @@ impl CutileGpuModel {
         };
         // Zero-copy reshape [1, h_pad] → [h_pad]; kernel reads only k_blocks * Q6K_QK.
         let a_flat = Arc::clone(a)
-            .reshape(&[self.h_pad])
-            .expect("gemm_q6k_d2d: reshape [1, h_pad] → [h_pad] failed");
+            .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::cutile_quantized_gemm::Q6K_QK)])
+            .expect("gemm_q6k_d2d: reshape [1, stride] → [stride] failed");
         self.q6k_gemv
             .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
             .expect("CutileGpuModel::gemm_q6k_d2d failed")
@@ -1319,8 +1319,8 @@ impl CutileGpuModel {
         };
         // Zero-copy reshape [1, h_pad] → [h_pad]; kernel reads only k_blocks * Q4K_BLOCK_SIZE.
         let a_flat = Arc::clone(a)
-            .reshape(&[self.h_pad])
-            .expect("gemm_q4k_d2d: reshape [1, h_pad] → [h_pad] failed");
+            .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::Q4K_BLOCK_SIZE)])
+            .expect("gemm_q4k_d2d: reshape [1, stride] → [stride] failed");
         self.q4k_gemv
             .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
             .expect("CutileGpuModel::gemm_q4k_d2d failed")
