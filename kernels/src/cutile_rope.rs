@@ -90,6 +90,57 @@ pub mod kernels {
 
 }
 
+/// Pre-allocated device buffers for zero-allocation RoPE calls.
+///
+/// Sized for up to `cap_num_sh` (sequence × head) pairs with a fixed `head_dim`.
+/// `forward_device_scratch` falls back to the allocating `forward_device` path
+/// when `seq_len * n_heads > cap_num_sh` or `head_dim` does not match.
+///
+/// x_first/x_second/out_first/out_second are half-dim intermediates that live
+/// entirely within one call: the kernel API returns them after use, so they are
+/// put back into the pool at the end of each call.
+///
+/// z is the full-dim output shared with the caller via Arc.  The caller's Arc is
+/// dropped at the end of each layer-loop body; the stored Arc's strong_count drops
+/// to 1 at that point, allowing `Arc::try_unwrap` to reclaim it at the next call.
+pub struct RopeScratch {
+    pub cap_num_sh: usize,
+    pub head_dim: usize,
+    x_first: Option<Tensor<f32>>,
+    x_second: Option<Tensor<f32>>,
+    out_first: Option<Tensor<f32>>,
+    out_second: Option<Tensor<f32>>,
+    z: Option<Arc<Tensor<f32>>>,
+}
+
+unsafe impl Send for RopeScratch {}
+unsafe impl Sync for RopeScratch {}
+
+impl RopeScratch {
+    /// Allocate five device buffers sized for `cap_num_sh` (seq × head) pairs.
+    pub fn new(
+        stream: &Arc<Stream>,
+        cap_num_sh: usize,
+        head_dim: usize,
+    ) -> std::result::Result<Self, KernelError> {
+        let half = head_dim / 2;
+        let alloc = |n: usize| -> std::result::Result<Tensor<f32>, KernelError> {
+            api::zeros::<f32>(&[n])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))
+        };
+        Ok(Self {
+            cap_num_sh,
+            head_dim,
+            x_first: Some(alloc(cap_num_sh * half)?),
+            x_second: Some(alloc(cap_num_sh * half)?),
+            out_first: Some(alloc(cap_num_sh * half)?),
+            out_second: Some(alloc(cap_num_sh * half)?),
+            z: Some(Arc::new(alloc(cap_num_sh * head_dim)?)),
+        })
+    }
+}
+
 /// GPU-accelerated Rotary Position Embeddings using NVIDIA cuTile Rust (`cutile-rs`).
 ///
 /// The host precomputes cosine and sine values per (batch × seq × head) pair
@@ -360,6 +411,148 @@ impl CutileRoPE {
         }
 
         Ok(Arc::new(z_t.unpartition()))
+    }
+
+    /// Apply RoPE on device, reusing pre-allocated scratch buffers.
+    ///
+    /// Falls back to the allocating `forward_device` path when `seq_len * n_heads`
+    /// exceeds `scratch.cap_num_sh` or `head_dim` does not match.
+    ///
+    /// Intermediate buffers (x_first/x_second/out_first/out_second) are reclaimed
+    /// from the cuTile kernel return values after each call.  The z output buffer is
+    /// shared with the caller via Arc: the caller's copy is dropped at the end of
+    /// the layer loop body, leaving scratch.z as the sole owner, which allows
+    /// `Arc::try_unwrap` to reclaim it at the start of the next call.
+    pub fn forward_device_scratch(
+        &self,
+        x_dev: &Arc<Tensor<f32>>,
+        positions: &[u32],
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        theta: f32,
+        scratch: &mut RopeScratch,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let num_sh = seq_len * n_heads;
+        if num_sh > scratch.cap_num_sh || head_dim != scratch.head_dim {
+            return self.forward_device(x_dev, positions, seq_len, n_heads, head_dim, theta);
+        }
+        if !head_dim.is_multiple_of(2) {
+            return Err(KernelError::InvalidConfig(format!(
+                "head_dim must be even, got {head_dim}"
+            )));
+        }
+        let half = head_dim / 2;
+
+        let mut cos_exp = vec![0.0f32; num_sh * half];
+        let mut sin_exp = vec![0.0f32; num_sh * half];
+        for s in 0..seq_len {
+            let pos = positions[s] as f32;
+            for h in 0..n_heads {
+                let sh = s * n_heads + h;
+                for d in 0..half {
+                    let freq = pos / theta.powf(2.0 * d as f32 / head_dim as f32);
+                    cos_exp[sh * half + d] = freq.cos();
+                    sin_exp[sh * half + d] = freq.sin();
+                }
+            }
+        }
+
+        let stream = &self.stream;
+
+        let upload_vec = |v: Vec<f32>| -> Result<Arc<Tensor<f32>>> {
+            Ok(api::copy_host_vec_to_device(&Arc::new(v))
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into())
+        };
+
+        let cos_t = upload_vec(cos_exp)?;
+        let sin_t = upload_vec(sin_exp)?;
+
+        let generics = vec![half.to_string()];
+
+        // Reclaim the z output buffer from the previous call.  In single-threaded
+        // inference the caller's Arc is always dropped before this point, so
+        // try_unwrap succeeds.  On a miss (first call or unexpected extra ref),
+        // allocate fresh without blocking the common path.
+        let z_tensor = scratch
+            .z
+            .take()
+            .and_then(|arc| Arc::try_unwrap(arc).ok())
+            .unwrap_or_else(|| {
+                api::zeros::<f32>(&[scratch.cap_num_sh * scratch.head_dim])
+                    .sync_on(stream)
+                    .expect("RopeScratch: z fallback alloc failed")
+            });
+
+        // Take the four intermediate buffers out of the pool.
+        let x_first_flat = scratch.x_first.take().expect("RopeScratch x_first missing");
+        let x_second_flat = scratch.x_second.take().expect("RopeScratch x_second missing");
+        let out_first_flat = scratch.out_first.take().expect("RopeScratch out_first missing");
+        let out_second_flat = scratch.out_second.take().expect("RopeScratch out_second missing");
+
+        // SAFETY: tensors are read/written only after the final stream.synchronize().
+        let (x_first_dev, x_second_dev, _x) = unsafe {
+            kernels::cutile_deinterleave(
+                x_first_flat.partition([half]),
+                x_second_flat.partition([half]),
+                x_dev.clone(),
+            )
+            .generics(generics.clone())
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        // x_first_arc / x_second_arc are moved into rope_kernel; the kernel
+        // returns them in the xf_ret / xs_ret slots so we can reclaim them.
+        let x_first_arc: Arc<Tensor<f32>> = Arc::new(x_first_dev.unpartition());
+        let x_second_arc: Arc<Tensor<f32>> = Arc::new(x_second_dev.unpartition());
+
+        let (out_f, out_s, xf_ret, xs_ret, _c, _s) = unsafe {
+            kernels::cutile_rope_kernel(
+                out_first_flat.partition([half]),
+                out_second_flat.partition([half]),
+                x_first_arc,
+                x_second_arc,
+                cos_t,
+                sin_t,
+            )
+            .generics(generics)
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        // first_arc / second_arc are moved into interleave; returned as of_ret / os_ret.
+        let first_arc: Arc<Tensor<f32>> = Arc::new(out_f.unpartition());
+        let second_arc: Arc<Tensor<f32>> = Arc::new(out_s.unpartition());
+
+        let (z_t, of_ret, os_ret) = unsafe {
+            kernels::cutile_interleave(z_tensor.partition([half]), first_arc, second_arc)
+                .generics(vec![half.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        // Single sync covers deinterleave + rope + interleave.
+        // SAFETY: synchronize waits for all stream ops; no concurrent access.
+        unsafe {
+            stream
+                .synchronize()
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        }
+
+        // Reclaim intermediate buffers.  Each Arc has strong_count == 1 here because
+        // the kernel consumed the input Arc and returned a fresh one.
+        scratch.x_first = Some(Arc::try_unwrap(xf_ret).expect("xf_ret not unique"));
+        scratch.x_second = Some(Arc::try_unwrap(xs_ret).expect("xs_ret not unique"));
+        scratch.out_first = Some(Arc::try_unwrap(of_ret).expect("of_ret not unique"));
+        scratch.out_second = Some(Arc::try_unwrap(os_ret).expect("os_ret not unique"));
+
+        // Wrap z output in Arc; store one ref in scratch, return the other to the caller.
+        let z_arc = Arc::new(z_t.unpartition());
+        scratch.z = Some(z_arc.clone());
+        Ok(z_arc)
     }
 
     /// Shared rotation apply: splits `x` into halves, runs the GPU kernel,

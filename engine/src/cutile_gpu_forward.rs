@@ -29,7 +29,7 @@ use tempura_kernels::cutile_elementwise::CutileElementwise;
 use tempura_kernels::cutile_flash_attention::CutileFlashAttention;
 use tempura_kernels::cutile_matmul::CutileMatMul;
 use tempura_kernels::cutile_rmsnorm::CutileRmsNorm;
-use tempura_kernels::cutile_rope::CutileRoPE;
+use tempura_kernels::cutile_rope::{CutileRoPE, RopeScratch};
 
 use crate::config::ModelConfig;
 use crate::cutile_kv_cache::CutileKvCache;
@@ -101,6 +101,10 @@ pub struct CutileGpuModel {
     /// when the next layer begins, so `Arc::try_unwrap` can reclaim the Tensor
     /// without re-allocating device memory.
     scratch: RefCell<[Option<Arc<Tensor<f32>>>; NUM_SLOTS]>,
+    /// Pre-allocated RoPE scratch for Q (sized for min(max_seq_len, 4096) × n_heads).
+    q_rope_scratch: RefCell<RopeScratch>,
+    /// Pre-allocated RoPE scratch for K (sized for min(max_seq_len, 4096) × n_kv_heads).
+    k_rope_scratch: RefCell<RopeScratch>,
 }
 
 // SAFETY: CutileMatMul, CutileFlashAttention and Tensor<f32> hold raw CUDA pointers,
@@ -409,6 +413,11 @@ impl CutileGpuModel {
         let cutile_rope = CutileRoPE::new()?;
         let cutile_elementwise = CutileElementwise::new()?;
 
+        let rope_cap = config.max_seq_len.min(4096);
+        let rope_stream = cutile_rope.stream();
+        let q_rope_scratch = RopeScratch::new(rope_stream, rope_cap * n_heads, head_dim)?;
+        let k_rope_scratch = RopeScratch::new(rope_stream, rope_cap * n_kv_heads, head_dim)?;
+
         let model = Self {
             config: config.clone(),
             h_pad,
@@ -422,6 +431,8 @@ impl CutileGpuModel {
             cutile_rope,
             cutile_elementwise,
             scratch: RefCell::new(std::array::from_fn(|_| None)),
+            q_rope_scratch: RefCell::new(q_rope_scratch),
+            k_rope_scratch: RefCell::new(k_rope_scratch),
         };
         eprintln!("[cutile] warming up kernel specializations…");
         model.warmup_gemms();
@@ -501,6 +512,11 @@ impl CutileGpuModel {
         let cutile_rope = CutileRoPE::new()?;
         let cutile_elementwise = CutileElementwise::new()?;
 
+        let rope_cap = config.max_seq_len.min(4096);
+        let rope_stream = cutile_rope.stream();
+        let q_rope_scratch = RopeScratch::new(rope_stream, rope_cap * n_heads, head_dim)?;
+        let k_rope_scratch = RopeScratch::new(rope_stream, rope_cap * n_kv_heads, head_dim)?;
+
         let model = Self {
             config: config.clone(),
             h_pad,
@@ -514,6 +530,8 @@ impl CutileGpuModel {
             cutile_rope,
             cutile_elementwise,
             scratch: RefCell::new(std::array::from_fn(|_| None)),
+            q_rope_scratch: RefCell::new(q_rope_scratch),
+            k_rope_scratch: RefCell::new(k_rope_scratch),
         };
         eprintln!("[cutile] warming up kernel specializations…");
         model.warmup_gemms();
@@ -997,30 +1015,31 @@ impl CutileGpuModel {
             // ── 2c. RoPE (GPU) — rotate Q and K entirely on device ───────────
             // cos/sin tables (tiny: seq_len × n_heads × head_dim/2 floats each)
             // are computed on CPU and uploaded.  Q and K are deinterleaved and
-            // rotated on the GPU; output halves are downloaded to reconstruct the
-            // interleaved format before a final upload.
-            // PCIe savings vs CPU path: -3 transfers for Q, -1 for K per layer.
+            // rotated on the GPU using pre-allocated scratch buffers, eliminating
+            // the 5 × 2 api::zeros calls (280 blocking allocs per token at 28 layers).
             let (q_rot_dev, k_rot_dev) = if !cfg.use_alibi {
                 let qr = self
                     .cutile_rope
-                    .forward_device(
+                    .forward_device_scratch(
                         &q_dev,
                         &positions,
                         seq_len,
                         n_heads,
                         head_dim,
                         cfg.rope_theta,
+                        &mut self.q_rope_scratch.borrow_mut(),
                     )
                     .expect("CutileGpuModel: GPU RoPE for Q failed");
                 let kr = self
                     .cutile_rope
-                    .forward_device(
+                    .forward_device_scratch(
                         &k_dev,
                         &positions,
                         seq_len,
                         n_kv_heads,
                         head_dim,
                         cfg.rope_theta,
+                        &mut self.k_rope_scratch.borrow_mut(),
                     )
                     .expect("CutileGpuModel: GPU RoPE for K failed");
                 (qr, kr)
