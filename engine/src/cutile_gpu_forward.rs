@@ -29,8 +29,9 @@ use tempura_kernels::cutile_elementwise::CutileElementwise;
 use tempura_kernels::cutile_flash_attention::CutileFlashAttention;
 use tempura_kernels::cutile_matmul::CutileMatMul;
 use tempura_kernels::cutile_quantized_gemm::{
-    CutileQ2Gemv, Q2_0_BLOCK_BYTES, Q2_0_PACKED_U32S, Q2_0_QK,
+    CutileQ2Gemv, CutileQ4Gemv, Q2_0_BLOCK_BYTES, Q2_0_PACKED_U32S, Q2_0_QK, Q4K_PACKED_U32S,
 };
+use tempura_kernels::{Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE};
 use tempura_kernels::cutile_rmsnorm::CutileRmsNorm;
 use tempura_kernels::cutile_rope::{CutileRoPE, RopeScratch};
 
@@ -68,6 +69,26 @@ struct DeviceWeightQ2 {
     /// Number of output neurons.
     n: usize,
     /// Number of Q2_0 blocks per row (= k / Q2_0_QK).
+    k_blocks: usize,
+}
+
+/// Q4_K quantized weight tensor resident on the GPU.
+///
+/// Packed format: [n × k_blocks × Q4K_PACKED_U32S] u32 elements.
+/// Each block of 256 elements occupies 42 u32 slots:
+///   slot 0       : f32 bits of d (super-scale, f16 → f32)
+///   slot 1       : f32 bits of dmin (super-min, f16 → f32)
+///   slots 2..6   : sc[2*j] | (sc[2*j+1]<<8) for j=0..4 (unpacked 6-bit → 8-bit scales)
+///   slots 6..10  : m[2*j]  | (m[2*j+1]<<8)  for j=0..4 (unpacked 6-bit → 8-bit mins)
+///   slots 10..42 : 32 u32 words of packed nibble bytes (128 bytes total)
+/// Dequant in kernel: w[j*64+l] = d*sc[2*j]*lo_nibble - dmin*m[2*j]
+///                    w[j*64+l+32] = d*sc[2*j+1]*hi_nibble - dmin*m[2*j+1]
+struct DeviceWeightQ4K {
+    /// Packed u32 tensor on GPU, flat shape [n × k_blocks × Q4K_PACKED_U32S].
+    tensor: Arc<Tensor<u32>>,
+    /// Number of output neurons.
+    n: usize,
+    /// Number of Q4_K blocks per row (= k / Q4K_BLOCK_SIZE).
     k_blocks: usize,
 }
 
@@ -135,12 +156,16 @@ pub struct CutileGpuModel {
     /// next_pow2(intermediate_size.div_ceil(BK) * BK) — padded column count for FFN activations.
     inter_pad: usize,
     device_weights: HashMap<String, DeviceWeight>,
+    /// Q4_K-quantized projection weights stored in packed GPU format.
+    device_weights_q4k: HashMap<String, DeviceWeightQ4K>,
     /// Q2_0-quantized projection weights stored in packed GPU format.
     device_weights_q2: HashMap<String, DeviceWeightQ2>,
     /// Pre-uploaded RMSNorm weight vectors (1-D, `[h_pad]` elements) keyed by
     /// their HuggingFace tensor name (e.g. `model.layers.0.input_layernorm.weight`).
     norm_weights: HashMap<String, Arc<Tensor<f32>>>,
     matmul: CutileMatMul,
+    /// Q4_K on-GPU GEMV dispatcher — shares the same CUDA stream as `matmul`.
+    q4k_gemv: CutileQ4Gemv,
     /// Q2_0 on-GPU GEMV dispatcher — shares the same CUDA stream as `matmul`.
     q2_gemv: CutileQ2Gemv,
     flash_attn: CutileFlashAttention,
@@ -318,6 +343,99 @@ impl CutileGpuModel {
         Ok(true)
     }
 
+    /// Upload a Q4_K weight in packed GPU format (no f32 dequantization on the host).
+    ///
+    /// Converts the raw Q4_K bytes to the 42-u32-per-block GPU layout:
+    ///   u32[0]      = f32 bits of d (f16 → f32)
+    ///   u32[1]      = f32 bits of dmin (f16 → f32)
+    ///   u32[2+j]    = sc[2*j] | (sc[2*j+1]<<8)  for j=0..4  (unpacked 6-bit scales)
+    ///   u32[6+j]    = m[2*j]  | (m[2*j+1]<<8)   for j=0..4  (unpacked 6-bit mins)
+    ///   u32[10..42] = 32 u32 words holding qs[0..128] (4 bytes per u32, little-endian)
+    ///
+    /// Returns `false` (and does nothing) when the tensor is absent.
+    fn maybe_upload_q4k(
+        stream: &std::sync::Arc<cuda_core::Stream>,
+        device_weights_q4k: &mut HashMap<String, DeviceWeightQ4K>,
+        qw: &QuantizedWeights,
+        name: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<bool, tempura_kernels::KernelError> {
+        let bytes = match qw.get_q4k(name) {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+
+        debug_assert!(
+            k % Q4K_BLOCK_SIZE == 0,
+            "k={k} must be a multiple of Q4K_BLOCK_SIZE={Q4K_BLOCK_SIZE}"
+        );
+        let k_blocks = k / Q4K_BLOCK_SIZE;
+        let total_u32s = n * k_blocks * Q4K_PACKED_U32S;
+        let mut packed: Vec<u32> = Vec::with_capacity(total_u32s);
+
+        for row in 0..n {
+            for blk in 0..k_blocks {
+                let off = (row * k_blocks + blk) * Q4K_BLOCK_BYTES;
+                let block = &bytes[off..off + Q4K_BLOCK_BYTES];
+
+                // u32[0]: d as f32 bits
+                let d_f16 = u16::from_le_bytes([block[0], block[1]]);
+                packed.push(f16_bits_to_f32_inline(d_f16).to_bits());
+
+                // u32[1]: dmin as f32 bits
+                let dmin_f16 = u16::from_le_bytes([block[2], block[3]]);
+                packed.push(f16_bits_to_f32_inline(dmin_f16).to_bits());
+
+                // Unpack the 12-byte scale blob into 8 sc and 8 m values.
+                // Mirrors q4k_unpack_scales in cutile_quantized_gemm.rs.
+                let ps = &block[4..16];
+                let mut sc = [0u8; 8];
+                let mut m = [0u8; 8];
+                for i in 0..4usize {
+                    sc[i] = ps[i] & 0x3F;
+                    sc[i + 4] = ((ps[i + 8] & 0x0F) | ((ps[i] >> 6) << 4)) & 0x3F;
+                    m[i] = ps[i + 4] & 0x3F;
+                    m[i + 4] = ((ps[i + 8] >> 4) | ((ps[i + 4] >> 6) << 4)) & 0x3F;
+                }
+
+                // u32[2..6]: scale pairs sc[2*j] | (sc[2*j+1]<<8) for j=0..4
+                for j in 0..4usize {
+                    packed.push(sc[2 * j] as u32 | ((sc[2 * j + 1] as u32) << 8));
+                }
+                // u32[6..10]: min pairs m[2*j] | (m[2*j+1]<<8) for j=0..4
+                for j in 0..4usize {
+                    packed.push(m[2 * j] as u32 | ((m[2 * j + 1] as u32) << 8));
+                }
+
+                // u32[10..42]: 32 u32s holding qs[0..128] (128 bytes, 4 bytes per word)
+                let qs = &block[16..144];
+                for w in 0..32usize {
+                    let b0 = qs[w * 4] as u32;
+                    let b1 = qs[w * 4 + 1] as u32;
+                    let b2 = qs[w * 4 + 2] as u32;
+                    let b3 = qs[w * 4 + 3] as u32;
+                    packed.push(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+                }
+            }
+        }
+
+        debug_assert_eq!(packed.len(), total_u32s);
+
+        let tensor: Arc<Tensor<u32>> = api::copy_host_vec_to_device(&Arc::new(packed))
+            .sync_on(stream)
+            .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+            .reshape(&[n * k_blocks * Q4K_PACKED_U32S])
+            .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+            .into();
+
+        device_weights_q4k.insert(
+            name.to_string(),
+            DeviceWeightQ4K { tensor, n, k_blocks },
+        );
+        Ok(true)
+    }
+
     /// Upload a norm weight vector from a host slice to a 1-D device tensor of
     /// `h_pad` elements, zero-padding from `h` to `h_pad` if necessary.
     fn upload_norm_weight(
@@ -417,6 +535,7 @@ impl CutileGpuModel {
         let matmul = CutileMatMul::new()?;
         let flash_attn = CutileFlashAttention::new()?;
         let mut dw: HashMap<String, DeviceWeight> = HashMap::new();
+        let mut dw_q4k: HashMap<String, DeviceWeightQ4K> = HashMap::new();
         let mut dw_q2: HashMap<String, DeviceWeightQ2> = HashMap::new();
         let mut nw: HashMap<String, Arc<Tensor<f32>>> = HashMap::new();
 
@@ -433,21 +552,24 @@ impl CutileGpuModel {
         let q_pad = next_pow2(q_dim.div_ceil(BK) * BK);
         let inter_pad = next_pow2(inter.div_ceil(BK) * BK);
 
-        // lm_head  [vocab, h] — typically not Q2_0; keep dequantized path.
+        // lm_head  [vocab, h] — typically not Q4_K/Q2_0; keep dequantized path.
         Self::maybe_upload(&matmul, &mut dw, qw, "lm_head.weight", vocab, h)?;
 
         for layer in 0..config.num_layers {
             let p = format!("model.layers.{layer}");
 
-            // For each projection: try Q2_0 GPU-resident upload first; fall back
-            // to dequantized f32. The inner block avoids a closure so both `dw`
-            // and `dw_q2` can be borrowed mutably without borrow-checker conflicts.
+            // For each projection: try Q4_K GPU-resident first, then Q2_0, then f32.
+            // The inner block avoids a closure so all three maps can be borrowed mutably.
             let mut try_proj = |name: String, n: usize, k: usize| {
                 (|| -> Result<(), tempura_kernels::KernelError> {
-                    let uploaded_q2 =
-                        Self::maybe_upload_q2(matmul.stream(), &mut dw_q2, qw, &name, n, k)?;
-                    if !uploaded_q2 {
-                        Self::maybe_upload(&matmul, &mut dw, qw, &name, n, k)?;
+                    let uploaded_q4k =
+                        Self::maybe_upload_q4k(matmul.stream(), &mut dw_q4k, qw, &name, n, k)?;
+                    if !uploaded_q4k {
+                        let uploaded_q2 =
+                            Self::maybe_upload_q2(matmul.stream(), &mut dw_q2, qw, &name, n, k)?;
+                        if !uploaded_q2 {
+                            Self::maybe_upload(&matmul, &mut dw, qw, &name, n, k)?;
+                        }
                     }
                     Ok(())
                 })()
@@ -494,16 +616,18 @@ impl CutileGpuModel {
             Self::upload_norm_weight(matmul.stream(), &mut nw, "model.norm.weight", w, h, h_pad)?;
         }
 
+        let q4k_gemv = CutileQ4Gemv::from_stream(matmul.stream().clone());
         let q2_gemv = CutileQ2Gemv::from_stream(matmul.stream().clone());
         let cutile_rmsnorm = CutileRmsNorm::new()?;
         let cutile_rope = CutileRoPE::new()?;
         let cutile_elementwise = CutileElementwise::new()?;
 
+        let q4k_count = dw_q4k.len();
         let q2_count = dw_q2.len();
         let f32_count = dw.len();
-        if q2_count > 0 {
+        if q4k_count > 0 || q2_count > 0 {
             eprintln!(
-                "[cutile] Q2_0 GPU-resident: {q2_count} tensors quantized, {f32_count} tensors as f32"
+                "[cutile] GPU-resident quantized: {q4k_count} Q4_K, {q2_count} Q2_0, {f32_count} f32"
             );
         }
 
@@ -522,9 +646,11 @@ impl CutileGpuModel {
             q_pad,
             inter_pad,
             device_weights: dw,
+            device_weights_q4k: dw_q4k,
             device_weights_q2: dw_q2,
             norm_weights: nw,
             matmul,
+            q4k_gemv,
             q2_gemv,
             flash_attn,
             cutile_rmsnorm,
@@ -608,6 +734,7 @@ impl CutileGpuModel {
             Self::upload_norm_weight(matmul.stream(), &mut nw, "model.norm.weight", w, h, h_pad)?;
         }
 
+        let q4k_gemv = CutileQ4Gemv::from_stream(matmul.stream().clone());
         let q2_gemv = CutileQ2Gemv::from_stream(matmul.stream().clone());
         let cutile_rmsnorm = CutileRmsNorm::new()?;
         let cutile_rope = CutileRoPE::new()?;
@@ -628,9 +755,11 @@ impl CutileGpuModel {
             q_pad,
             inter_pad,
             device_weights: dw,
+            device_weights_q4k: HashMap::new(),
             device_weights_q2: HashMap::new(),
             norm_weights: nw,
             matmul,
+            q4k_gemv,
             q2_gemv,
             flash_attn,
             cutile_rmsnorm,
@@ -1014,12 +1143,38 @@ impl CutileGpuModel {
             .expect("CutileGpuModel::gemm_q2_d2d failed")
     }
 
-    /// Unified GEMV/GEMM that transparently selects Q2_0 (decode only) or f32.
+    /// Device-to-device GEMV for Q4_K quantized weights (decode, m=1 only).
     ///
-    /// For m == 1: checks `device_weights_q2` first, then falls through to
-    /// `gemm_d2d_slot` for f32 weights.
-    /// For m > 1 (prefill): Q2_0 GEMV is not yet batched, falls back to dequantized
-    /// f32 GEMM via `gemm_d2d`.
+    /// Dispatches `cutile_q4k_gemv` which dequantizes on-GPU.  Falls back
+    /// silently to a zero tensor when the weight is absent in `device_weights_q4k`.
+    fn gemm_q4k_d2d(&self, a: &Arc<Tensor<f32>>, weight_name: &str) -> Arc<Tensor<f32>> {
+        let dw = match self.device_weights_q4k.get(weight_name) {
+            Some(d) => d,
+            None => {
+                let stream = self.matmul.stream();
+                return Arc::new(
+                    api::zeros::<f32>(&[1])
+                        .sync_on(stream)
+                        .expect("zeros failed"),
+                );
+            }
+        };
+        // The Q4_K GEMV kernel expects a rank-1 x.  Download and re-upload as a
+        // flat contiguous tensor — same workaround as the Q2_0 path.
+        let k = dw.k_blocks * Q4K_BLOCK_SIZE;
+        let a_host = self.download_device_tensor(a);
+        let a_flat = self.to_device_flat_padded(&a_host[..k], 1, k, k);
+        self.q4k_gemv
+            .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+            .expect("CutileGpuModel::gemm_q4k_d2d failed")
+    }
+
+    /// Unified GEMV/GEMM that transparently selects Q4_K, Q2_0 (decode only), or f32.
+    ///
+    /// For m == 1: checks `device_weights_q4k` first, then `device_weights_q2`, then
+    /// falls through to `gemm_d2d_slot` for f32 weights.
+    /// For m > 1 (prefill): quantized GEMV is not yet batched; fall back to
+    /// host-side dequantization + f32 GEMM (slower but correct; prefill is infrequent).
     fn gemm_any_d2d_slot(
         &self,
         a: &Arc<Tensor<f32>>,
@@ -1027,46 +1182,89 @@ impl CutileGpuModel {
         m: usize,
         slot: usize,
     ) -> Arc<Tensor<f32>> {
+        // ── Decode (m == 1): on-GPU dequant GEMV ─────────────────────────────
+        if m == 1 && self.device_weights_q4k.contains_key(weight_name) {
+            return self.gemm_q4k_d2d(a, weight_name);
+        }
         if m == 1 && self.device_weights_q2.contains_key(weight_name) {
             return self.gemm_q2_d2d(a, weight_name);
         }
-        // Prefill (m > 1) with Q2_0 weights: dequantize to f32 and run f32 GEMM.
-        // f32 path is slower but correct; prefill is infrequent vs decode.
+
+        // ── Prefill (m > 1): host dequant + f32 GEMM ─────────────────────────
         if m > 1 {
-            if let Some(dw) = self.device_weights_q2.get(weight_name) {
-                let k = dw.k_blocks * tempura_kernels::cutile_quantized_gemm::Q2_0_QK;
-                let q2_bytes = {
-                    // Download packed u32 tensor, reinterpret as bytes, dequantize
-                    use tempura_kernels::cutile_quantized_gemm::{Q2_0_PACKED_U32S, Q2_0_QK};
-                    let n_blocks = dw.n * dw.k_blocks;
-                    let packed_host: Vec<u32> = Arc::clone(&dw.tensor)
-                        .to_host_vec()
-                        .sync_on(self.matmul.stream())
-                        .expect("Q2_0 packed download failed");
-                    // Dequantize each block
-                    let mut f32_weights = vec![0.0f32; dw.n * k];
-                    for n in 0..dw.n {
-                        for blk in 0..dw.k_blocks {
-                            let base = (n * dw.k_blocks + blk) * Q2_0_PACKED_U32S;
-                            let scale = f32::from_bits(packed_host[base]);
-                            let k_base = blk * Q2_0_QK;
-                            for word in 0..8usize {
-                                let word_data = packed_host[base + 1 + word];
-                                for bit_pair in 0..16usize {
-                                    let q = ((word_data >> (bit_pair * 2)) & 3) as i32 - 1;
-                                    let idx = n * k + k_base + word * 16 + bit_pair;
-                                    f32_weights[idx] = q as f32 * scale;
-                                }
+            // Q4_K prefill: reconstruct f32 from packed GPU format.
+            if let Some(dw) = self.device_weights_q4k.get(weight_name) {
+                let k = dw.k_blocks * Q4K_BLOCK_SIZE;
+                let packed_host: Vec<u32> = Arc::clone(&dw.tensor)
+                    .to_host_vec()
+                    .sync_on(self.matmul.stream())
+                    .expect("Q4_K packed download failed");
+                let mut f32_weights = vec![0.0f32; dw.n * k];
+                for row in 0..dw.n {
+                    for blk in 0..dw.k_blocks {
+                        let base = (row * dw.k_blocks + blk) * Q4K_PACKED_U32S;
+                        let d = f32::from_bits(packed_host[base]);
+                        let dmin = f32::from_bits(packed_host[base + 1]);
+                        let k_base = blk * Q4K_BLOCK_SIZE;
+                        for j in 0..4usize {
+                            let sc_pair = packed_host[base + 2 + j];
+                            let m_pair = packed_host[base + 6 + j];
+                            let sc_lo = (sc_pair & 0xFF) as f32;
+                            let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
+                            let m_lo = (m_pair & 0xFF) as f32;
+                            let m_hi = ((m_pair >> 8) & 0xFF) as f32;
+                            let d1 = d * sc_lo;
+                            let m1 = dmin * m_lo;
+                            let d2 = d * sc_hi;
+                            let m2 = dmin * m_hi;
+                            for l in 0..32usize {
+                                let qs_word_idx = (j * 32 + l) / 4;
+                                let byte_shift = ((j * 32 + l) % 4) * 8;
+                                let qs_word = packed_host[base + 10 + qs_word_idx];
+                                let byte_val = (qs_word >> byte_shift) & 0xFF;
+                                let lo = (byte_val & 0xF) as f32;
+                                let hi = (byte_val >> 4) as f32;
+                                f32_weights[row * k + k_base + j * 64 + l] = d1 * lo - m1;
+                                f32_weights[row * k + k_base + j * 64 + 32 + l] = d2 * hi - m2;
                             }
                         }
                     }
-                    f32_weights
-                };
-                // Upload as f32 and run f32 GEMM
-                let k_pad = next_pow2(k.div_ceil(16) * 16);
-                let w_dev = self.to_device_padded(&q2_bytes, dw.n, k, k_pad);
+                }
+                let k_pad = next_pow2(k.div_ceil(BK) * BK);
+                let w_dev = self.to_device_padded(&f32_weights, dw.n, k, k_pad);
                 return self.matmul
-                    .forward_bt_device_to_device(a, &w_dev, m, dw.n, k)
+                    .forward_bt_device_to_device(a, &w_dev, m, dw.n, k_pad)
+                    .expect("gemm_any_d2d_slot Q4_K prefill GEMM failed");
+            }
+
+            // Q2_0 prefill: reconstruct f32 from packed GPU format.
+            if let Some(dw) = self.device_weights_q2.get(weight_name) {
+                let k = dw.k_blocks * tempura_kernels::cutile_quantized_gemm::Q2_0_QK;
+                use tempura_kernels::cutile_quantized_gemm::{Q2_0_PACKED_U32S, Q2_0_QK};
+                let packed_host: Vec<u32> = Arc::clone(&dw.tensor)
+                    .to_host_vec()
+                    .sync_on(self.matmul.stream())
+                    .expect("Q2_0 packed download failed");
+                let mut f32_weights = vec![0.0f32; dw.n * k];
+                for n in 0..dw.n {
+                    for blk in 0..dw.k_blocks {
+                        let base = (n * dw.k_blocks + blk) * Q2_0_PACKED_U32S;
+                        let scale = f32::from_bits(packed_host[base]);
+                        let k_base = blk * Q2_0_QK;
+                        for word in 0..8usize {
+                            let word_data = packed_host[base + 1 + word];
+                            for bit_pair in 0..16usize {
+                                let q = ((word_data >> (bit_pair * 2)) & 3) as i32 - 1;
+                                let idx = n * k + k_base + word * 16 + bit_pair;
+                                f32_weights[idx] = q as f32 * scale;
+                            }
+                        }
+                    }
+                }
+                let k_pad = next_pow2(k.div_ceil(BK) * BK);
+                let w_dev = self.to_device_padded(&f32_weights, dw.n, k, k_pad);
+                return self.matmul
+                    .forward_bt_device_to_device(a, &w_dev, m, dw.n, k_pad)
                     .expect("gemm_any_d2d_slot Q2_0 prefill GEMM failed");
             }
         }
