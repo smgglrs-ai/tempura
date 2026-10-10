@@ -22,8 +22,8 @@ name = "bench-real-model"
 path = "src/bench_real_model.rs"
 
 [dependencies]
-tempura-kernels = { path = "../../kernels", features = ["cutile"] }
-tempura-engine = { path = "../../engine", features = ["cutile"] }
+tempura-kernels = { path = "../../kernels", features = ["cutile", "oxide-gemv"] }
+tempura-engine = { path = "../../engine", features = ["cutile", "oxide-gemv"] }
 
 [lints]
 workspace = true
