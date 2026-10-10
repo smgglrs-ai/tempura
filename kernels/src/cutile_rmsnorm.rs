@@ -423,13 +423,10 @@ impl CutileRmsNorm {
             Err(arc_back) => Some(arc_back),
         };
 
-        // Single sync covers sum_sq + scale + apply.
-        unsafe {
-            stream
-                .synchronize()
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-        }
-
+        // All three kernels (sum_sq + scale + apply) are now queued async on
+        // the stream.  The caller is responsible for synchronising before any
+        // CPU read.  GPU-side consumers on the same stream see the correct
+        // ordering without an explicit CPU barrier here.
         let out_2d = Arc::new(
             out_part_out
                 .unpartition()

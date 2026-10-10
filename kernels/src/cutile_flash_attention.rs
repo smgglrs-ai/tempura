@@ -870,13 +870,84 @@ impl CutileFlashAttention {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
         };
 
-        unsafe {
-            stream
-                .synchronize()
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-        }
-
+        // Kernel is queued async on the stream.  GPU-side consumers on the same
+        // stream execute in order.  Caller is responsible for synchronising before
+        // any CPU read of the output tensor.
         Ok(Arc::new(out_part.unpartition()))
+    }
+
+    /// Decode attention reusing a pre-allocated output buffer.
+    ///
+    /// Identical to `decode_attention_device` but eliminates the `api::zeros.sync_on`
+    /// allocation (which is a full stream synchronize + cudaMallocAsync) by reusing
+    /// a caller-supplied `scratch` buffer.  Tries `Arc::try_unwrap` to reclaim the
+    /// previous result; falls back to a fresh allocation on a pool miss.
+    ///
+    /// # Safety
+    ///
+    /// The returned tensor is being written asynchronously.  Caller MUST synchronise
+    /// the stream (or rely on a downstream D→H `sync_on`) before reading on the CPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_attention_device_scratch(
+        &self,
+        q_dev: &Arc<Tensor<f32>>,
+        k_cache: &Arc<Tensor<f32>>,
+        v_cache: &Arc<Tensor<f32>>,
+        kv_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        stream: &Arc<Stream>,
+        scratch: &mut Option<Arc<Tensor<f32>>>,
+    ) -> Result<Arc<Tensor<f32>>> {
+        if !n_heads.is_multiple_of(n_kv_heads) {
+            return Err(KernelError::InvalidConfig(format!(
+                "n_heads ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
+            )));
+        }
+        let q_dim = n_heads * head_dim;
+        let heads_per_group = (n_heads / n_kv_heads) as i32;
+        let generics = vec![n_kv_heads.to_string(), head_dim.to_string()];
+
+        // Reclaim or allocate output buffer.
+        let out_tensor = match scratch.take() {
+            Some(arc) => match Arc::try_unwrap(arc) {
+                Ok(tensor) => tensor
+                    .reshape(&[q_dim])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+                Err(arc_back) => {
+                    *scratch = Some(arc_back);
+                    api::zeros::<f32>(&[q_dim])
+                        .sync_on(stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                }
+            },
+            None => api::zeros::<f32>(&[q_dim])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        };
+
+        let out_part = out_tensor.partition([head_dim]);
+
+        let (out_part, ..) = unsafe {
+            kernels::cutile_decode_attn(
+                out_part,
+                q_dev.clone(),
+                k_cache.clone(),
+                v_cache.clone(),
+                kv_len as i32,
+                scale,
+                heads_per_group,
+            )
+            .generics(generics)
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        let result = Arc::new(out_part.unpartition());
+        *scratch = Some(result.clone());
+        Ok(result)
     }
 }
 

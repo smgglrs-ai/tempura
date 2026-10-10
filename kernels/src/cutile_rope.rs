@@ -666,15 +666,8 @@ impl CutileRoPE {
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
         };
 
-        // Single sync covers deinterleave + rope + interleave.
-        // SAFETY: synchronize waits for all stream ops; no concurrent access.
-        unsafe {
-            stream
-                .synchronize()
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-        }
-
-        // Reclaim intermediates — cap_num_sh == num_sh so sizes match exactly.
+        // All kernels (deinterleave + rope + interleave) are queued async on the
+        // stream.  GPU-side consumers execute in order; caller syncs before CPU read.
         scratch.x_first = Some(Arc::try_unwrap(xf_ret).expect("xf_ret not unique"));
         scratch.x_second = Some(Arc::try_unwrap(xs_ret).expect("xs_ret not unique"));
         scratch.out_first = Some(Arc::try_unwrap(of_ret).expect("of_ret not unique"));
@@ -760,12 +753,8 @@ impl CutileRoPE {
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
         };
 
-        unsafe {
-            stream
-                .synchronize()
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-        }
-
+        // All kernels queued async; GPU stream ordering ensures correctness.
+        // Caller is responsible for synchronising before any CPU read.
         scratch.x_first = Some(Arc::try_unwrap(xf_ret).expect("xf_ret not unique"));
         scratch.x_second = Some(Arc::try_unwrap(xs_ret).expect("xs_ret not unique"));
         scratch.out_first = Some(Arc::try_unwrap(of_ret).expect("of_ret not unique"));

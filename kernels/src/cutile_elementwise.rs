@@ -2,7 +2,7 @@ use crate::{KernelError, Result};
 use cuda_core::{Device, Stream};
 use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
-use cutile::tensor::{IntoPartition, Tensor};
+use cutile::tensor::{IntoPartition, Reshape, Tensor};
 use std::sync::Arc;
 
 #[cutile::module]
@@ -252,12 +252,90 @@ impl CutileElementwise {
             (gt, ut)
         };
 
-        let (out_t, _g, _u) = kernels::cutile_silu_mul(out_t, gate_t, up_t)
-            .generics(vec![B.to_string()])
-            .sync_on(stream)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        // SAFETY: kernel is queued async; GPU-side consumers on the same stream
+        // execute after this kernel completes.  Caller syncs before CPU read.
+        let (out_t, _g, _u) = unsafe {
+            kernels::cutile_silu_mul(out_t, gate_t, up_t)
+                .generics(vec![B.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
 
         Ok(Arc::new(out_t.unpartition()))
+    }
+
+    /// SiLU-gated multiply reusing a pre-allocated output buffer.
+    ///
+    /// Identical to `silu_mul_device` but avoids the `api::zeros.sync_on` allocation
+    /// (a full stream synchronize + cudaMallocAsync) by reclaiming the previous call's
+    /// buffer via `Arc::try_unwrap`.  Falls back to a fresh allocation on a pool miss.
+    ///
+    /// Caller must synchronise the stream before any CPU read of the output.
+    pub fn silu_mul_device_scratch(
+        &self,
+        gate: &Arc<Tensor<f32>>,
+        up: &Arc<Tensor<f32>>,
+        seq_len: usize,
+        inter: usize,
+        scratch: &mut Option<Arc<Tensor<f32>>>,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let n = seq_len * inter;
+        let n_pad = n.div_ceil(B) * B;
+        let stream = &self.stream;
+
+        let out_tensor = match scratch.take() {
+            Some(arc) => match Arc::try_unwrap(arc) {
+                Ok(tensor) => tensor
+                    .reshape(&[n_pad])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+                Err(arc_back) => {
+                    *scratch = Some(arc_back);
+                    api::zeros::<f32>(&[n_pad])
+                        .sync_on(stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                }
+            },
+            None => api::zeros::<f32>(&[n_pad])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        };
+        let out_t = out_tensor.partition([B]);
+
+        let (gate_t, up_t): (Arc<Tensor<f32>>, Arc<Tensor<f32>>) = if n_pad == n {
+            (gate.clone(), up.clone())
+        } else {
+            let gate_host = gate
+                .to_host_vec()
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            let up_host = up
+                .to_host_vec()
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            let (gv, uv) = pad_pair(&gate_host, &up_host, n, n_pad);
+            let gt = api::copy_host_vec_to_device(&gv)
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into();
+            let ut = api::copy_host_vec_to_device(&uv)
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into();
+            (gt, ut)
+        };
+
+        // SAFETY: kernel queued async; GPU stream ordering ensures correct execution.
+        // Caller syncs before CPU read.
+        let (out_t, _g, _u) = unsafe {
+            kernels::cutile_silu_mul(out_t, gate_t, up_t)
+                .generics(vec![B.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        let result = Arc::new(out_t.unpartition());
+        *scratch = Some(result.clone());
+        Ok(result)
     }
 
     /// Q8 round-trip quantisation: snaps each element to the nearest

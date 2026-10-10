@@ -218,6 +218,15 @@ pub struct CutileGpuModel {
     post_attn_add_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
     /// Pre-allocated output buffer for the post-FFN residual add (seq_len=1).
     ffn_add_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
+    /// Pre-allocated output buffer for `decode_attention_device_scratch` (seq_len=1).
+    ///
+    /// Eliminates the `api::zeros.sync_on` (= full stream sync + alloc) inside
+    /// `decode_attention_device` — 28 blocked allocs per decode token become zero.
+    attn_out_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
+    /// Pre-allocated output buffer for `silu_mul_device_scratch` (seq_len=1).
+    ///
+    /// Same motivation as `attn_out_scratch`: eliminates 28 sync-on allocs per token.
+    silu_out_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
 }
 
 // SAFETY: CutileMatMul, CutileFlashAttention and Tensor<f32> hold raw CUDA pointers,
@@ -801,6 +810,12 @@ impl CutileGpuModel {
         };
         let post_attn_add_scratch = add_alloc(h_pad);
         let ffn_add_scratch = add_alloc(h_pad);
+        // Attention output scratch: q_dim = n_heads × head_dim (seq_len=1, no padding).
+        let attn_out_scratch = add_alloc(q_dim);
+        // SiLU-mul output scratch: inter rounded up to next multiple of 32 (the B
+        // constant used inside silu_mul_device_scratch).
+        const SILU_B: usize = 32;
+        let silu_out_scratch = add_alloc(inter.div_ceil(SILU_B) * SILU_B);
 
         let model = Self {
             config: config.clone(),
@@ -827,6 +842,8 @@ impl CutileGpuModel {
             post_attn_norm_scratch: RefCell::new(post_attn_norm_scratch),
             post_attn_add_scratch: RefCell::new(post_attn_add_scratch),
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
+            attn_out_scratch: RefCell::new(attn_out_scratch),
+            silu_out_scratch: RefCell::new(silu_out_scratch),
         };
         eprintln!("[cutile] warming up kernel specializations…");
         model.warmup_gemms();
@@ -937,6 +954,9 @@ impl CutileGpuModel {
         };
         let post_attn_add_scratch = add_alloc(h_pad);
         let ffn_add_scratch = add_alloc(h_pad);
+        let attn_out_scratch = add_alloc(q_dim);
+        const SILU_B: usize = 32;
+        let silu_out_scratch = add_alloc(inter.div_ceil(SILU_B) * SILU_B);
 
         let model = Self {
             config: config.clone(),
@@ -963,6 +983,8 @@ impl CutileGpuModel {
             post_attn_norm_scratch: RefCell::new(post_attn_norm_scratch),
             post_attn_add_scratch: RefCell::new(post_attn_add_scratch),
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
+            attn_out_scratch: RefCell::new(attn_out_scratch),
+            silu_out_scratch: RefCell::new(silu_out_scratch),
         };
         eprintln!("[cutile] warming up kernel specializations…");
         model.warmup_gemms();
@@ -1036,14 +1058,18 @@ impl CutileGpuModel {
             .sync_on(stream)
             .expect("add_device: alloc failed")
             .partition([BLOCK]);
-        let (out_t, _, _) = tempura_kernels::cutile_elementwise::kernels::cutile_vector_add(
-            out_t,
-            a.clone(),
-            b.clone(),
-        )
-        .generics(vec![BLOCK.to_string()])
-        .sync_on(stream)
-        .expect("add_device: kernel failed");
+        // SAFETY: kernel queued async; GPU stream ordering ensures a→b→add→next.
+        // Caller (or downstream D→H) provides the CPU sync before any host read.
+        let (out_t, _, _) = unsafe {
+            tempura_kernels::cutile_elementwise::kernels::cutile_vector_add(
+                out_t,
+                a.clone(),
+                b.clone(),
+            )
+            .generics(vec![BLOCK.to_string()])
+            .async_on(stream)
+            .expect("add_device: kernel failed")
+        };
         Arc::new(out_t.unpartition())
     }
 
@@ -1078,14 +1104,18 @@ impl CutileGpuModel {
                 .expect("add_device_scratch: alloc failed"),
         };
         let out_part = out_tensor.partition([BLOCK]);
-        let (out_part, _, _) = tempura_kernels::cutile_elementwise::kernels::cutile_vector_add(
-            out_part,
-            a.clone(),
-            b.clone(),
-        )
-        .generics(vec![BLOCK.to_string()])
-        .sync_on(stream)
-        .expect("add_device_scratch: kernel failed");
+        // SAFETY: kernel queued async; GPU stream ordering ensures a+b is visible
+        // to subsequent kernels.  Caller (or downstream D→H) syncs before CPU read.
+        let (out_part, _, _) = unsafe {
+            tempura_kernels::cutile_elementwise::kernels::cutile_vector_add(
+                out_part,
+                a.clone(),
+                b.clone(),
+            )
+            .generics(vec![BLOCK.to_string()])
+            .async_on(stream)
+            .expect("add_device_scratch: kernel failed")
+        };
         let result = Arc::new(out_part.unpartition());
         *scratch = Some(result.clone());
         result
@@ -1855,6 +1885,15 @@ impl CutileGpuModel {
             .collect();
 
         // ── 2. Layer loop ──────────────────────────────────────────────────────
+        // Sync the host KV mirror if it was skipped during prior GPU-only decode
+        // steps and we are about to fall back to CPU attention.  This happens once
+        // at the transition from GPU decode to long-context CPU fallback.
+        if gpu_kv_cache.is_host_stale() && !gpu_kv_cache.has_device_kv() {
+            gpu_kv_cache
+                .sync_host_from_device(gpu_kv_cache.seq_len())
+                .expect("CutileGpuModel: host KV mirror sync failed");
+        }
+
         // Upload hidden once before the loop.  It stays on device via add_device
         // across all layers; no per-layer re-upload is needed.
         let mut hidden_dev = self.to_device_flat_padded(&hidden, seq_len, h, self.h_pad);
@@ -1955,14 +1994,26 @@ impl CutileGpuModel {
             };
 
             // ── 2d. KV-cache append ───────────────────────────────────────────
-            // `append_device` updates both the host mirror (D→H, needed by CPU
-            // GQA and prefill forward_batched) and the flat GPU tensor (async
-            // D→D, 2 small copies per layer — one for K, one for V).
-            // The GPU cache is populated for future GPU-side attention; decode
-            // and prefill still use the host mirror via `get_kv_host_slices`.
-            gpu_kv_cache
-                .append_device(layer, &k_rot_dev, &v_dev, seq_len)
-                .expect("CutileGpuModel: GPU KV cache append failed");
+            // When the GPU KV cache is active and seq_len == 1 (decode), use the
+            // GPU-only append path that omits the D→H host-mirror update.
+            // This eliminates 2 × n_layers blocking D→H `sync_on` calls per token
+            // (56 for a 28-layer model) which were serialising the GPU pipeline.
+            //
+            // If we exceed the GPU KV cache capacity or need CPU attention
+            // (`has_device_kv()` returns false), fall back to the full
+            // `append_device` which also updates the host mirror.  When
+            // transitioning from GPU-only to CPU mode the host mirror is rebuilt
+            // via `sync_host_from_device` before the CPU attention path runs.
+            let use_gpu_attention = seq_len == 1 && gpu_kv_cache.has_device_kv();
+            if use_gpu_attention {
+                gpu_kv_cache
+                    .append_device_gpu_only(layer, &k_rot_dev, &v_dev, seq_len)
+                    .expect("CutileGpuModel: GPU KV cache append (gpu-only) failed");
+            } else {
+                gpu_kv_cache
+                    .append_device(layer, &k_rot_dev, &v_dev, seq_len)
+                    .expect("CutileGpuModel: GPU KV cache append failed");
+            }
 
             // kv_len includes the tokens just appended.
             let kv_len = gpu_kv_cache.seq_len() + seq_len;
@@ -1981,10 +2032,13 @@ impl CutileGpuModel {
             //   - seq_len == 1 but kv_len > GPU_KV_MAX_SEQ_LEN: CPU GQA fallback
             let attn_padded_dev = if seq_len == 1 && gpu_kv_cache.has_device_kv() {
                 // GPU decode attention: Q on device, K/V from GPU-resident cache.
+                // Use scratch variant to eliminate the per-call api::zeros.sync_on
+                // allocation (a full stream sync + cudaMallocAsync) — saves 28
+                // blocking allocs per decode token across all layers.
                 let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer);
                 let attn_out_dev = self
                     .flash_attn
-                    .decode_attention_device(
+                    .decode_attention_device_scratch(
                         &q_rot_dev,
                         &k_dev_full,
                         &v_dev_full,
@@ -1994,6 +2048,7 @@ impl CutileGpuModel {
                         head_dim,
                         scale,
                         self.matmul.stream(),
+                        &mut self.attn_out_scratch.borrow_mut(),
                     )
                     .expect("CutileGpuModel: GPU decode attention failed");
                 // Pad [q_dim] → [1, q_pad] for O projection via GPU D→D copy.
@@ -2136,14 +2191,24 @@ impl CutileGpuModel {
             let up_dev = self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
 
             // ── 2j. SiLU gate × up (GPU) ─────────────────────────────────────
-            // gate_dev and up_dev already reside on the GPU.  silu_mul_device
-            // passes them directly to the GPU kernel — 0 D→H + 0 H→D when
-            // inter is B-aligned (true for all standard models).
-            // The result has seq_len × inter elements; pad to inter_pad if needed.
-            let gate_silu_n_dev = self
-                .cutile_elementwise
-                .silu_mul_device(&gate_dev, &up_dev, seq_len, inter)
-                .expect("CutileGpuModel: GPU SiLU-mul failed");
+            // gate_dev and up_dev already reside on the GPU.  Use the scratch
+            // variant to eliminate the per-call api::zeros.sync_on allocation —
+            // saves 28 blocking allocs per decode token across all layers.
+            let gate_silu_n_dev = if seq_len == 1 {
+                self.cutile_elementwise
+                    .silu_mul_device_scratch(
+                        &gate_dev,
+                        &up_dev,
+                        seq_len,
+                        inter,
+                        &mut self.silu_out_scratch.borrow_mut(),
+                    )
+                    .expect("CutileGpuModel: GPU SiLU-mul failed")
+            } else {
+                self.cutile_elementwise
+                    .silu_mul_device(&gate_dev, &up_dev, seq_len, inter)
+                    .expect("CutileGpuModel: GPU SiLU-mul failed")
+            };
 
             // ── 2k. FFN down — device-to-device ──────────────────────────────
             // Pad gate_silu from inter to inter_pad for the down_proj GEMM.
