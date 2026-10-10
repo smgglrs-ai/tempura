@@ -47,6 +47,10 @@ pub struct CutileKvCache {
     k_device: Vec<Arc<Tensor<f32>>>,
     v_device: Vec<Arc<Tensor<f32>>>,
     gpu_max_seq_len: usize,
+    /// True when `append_device_gpu_only` has been called at least once since the
+    /// last `sync_host_from_device`.  Signals that the host mirror is stale for
+    /// the tokens appended without a D→H update.
+    host_stale: bool,
 }
 
 // SAFETY: Tensor<f32> and Stream hold raw CUDA pointers but tempura uses a
@@ -98,6 +102,7 @@ impl CutileKvCache {
             k_device,
             v_device,
             gpu_max_seq_len,
+            host_stale: false,
         })
     }
 
@@ -195,6 +200,83 @@ impl CutileKvCache {
         Ok(())
     }
 
+    /// Returns `true` if the host mirror is stale (i.e., `append_device_gpu_only`
+    /// has been called since the last `sync_host_from_device`).
+    pub fn is_host_stale(&self) -> bool {
+        self.host_stale
+    }
+
+    /// GPU-only KV append: skips the D→H host-mirror update entirely.
+    ///
+    /// For GPU decode paths where attention runs entirely on device, the host
+    /// mirror is never read — maintaining it burns 2 × n_layers D→H sync calls
+    /// (one per K, one per V per layer) per decode token, ~56 blocking transfers
+    /// for a 28-layer model.  Skipping the D→H update eliminates these.
+    ///
+    /// The host mirror becomes stale.  Callers MUST call `sync_host_from_device`
+    /// before switching to the CPU attention fallback (long-context or prefill).
+    pub fn append_device_gpu_only(
+        &mut self,
+        layer: usize,
+        k_new: &Arc<Tensor<f32>>,
+        v_new: &Arc<Tensor<f32>>,
+        num_new_tokens: usize,
+    ) -> Result<(), KernelError> {
+        use cuda_core::sys::CUdeviceptr;
+
+        if self.seq_len + num_new_tokens > self.gpu_max_seq_len {
+            return Ok(());
+        }
+
+        let num_elems = num_new_tokens * self.kv_dim;
+        let offset_elems = self.seq_len * self.kv_dim;
+        let f32_bytes = std::mem::size_of::<f32>() as u64;
+
+        let k_src: CUdeviceptr = k_new.device_pointer().cu_deviceptr();
+        let v_src: CUdeviceptr = v_new.device_pointer().cu_deviceptr();
+
+        let k_dst: CUdeviceptr =
+            self.k_device[layer].device_pointer().cu_deviceptr() + offset_elems as u64 * f32_bytes;
+        let v_dst: CUdeviceptr =
+            self.v_device[layer].device_pointer().cu_deviceptr() + offset_elems as u64 * f32_bytes;
+
+        unsafe {
+            cuda_core::memcpy_dtod_async::<f32>(k_dst, k_src, num_elems, &self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            cuda_core::memcpy_dtod_async::<f32>(v_dst, v_src, num_elems, &self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        }
+
+        self.host_stale = true;
+        Ok(())
+    }
+
+    /// Rebuild the host mirror from the GPU cache for all layers up to `kv_len`.
+    ///
+    /// Must be called before switching to the CPU attention fallback after a
+    /// sequence of `append_device_gpu_only` calls.  Performs one D→H copy per K
+    /// and V per layer (blocking, on the shared CUDA stream).
+    pub fn sync_host_from_device(&mut self, kv_len: usize) -> Result<(), KernelError> {
+        let len = kv_len * self.kv_dim;
+        if kv_len == 0 || kv_len > self.gpu_max_seq_len {
+            return Ok(());
+        }
+        for layer in 0..self.n_layers {
+            let k_host: Vec<f32> = self.k_device[layer].clone()
+                .to_host_vec()
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            let v_host: Vec<f32> = self.v_device[layer].clone()
+                .to_host_vec()
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            self.k_host[layer][..len].copy_from_slice(&k_host[..len]);
+            self.v_host[layer][..len].copy_from_slice(&v_host[..len]);
+        }
+        self.host_stale = false;
+        Ok(())
+    }
+
     /// Advance the sequence-length counter after all layers have been updated.
     pub fn advance(&mut self, n: usize) {
         self.seq_len += n;
@@ -203,6 +285,7 @@ impl CutileKvCache {
 
     pub fn reset(&mut self) {
         self.seq_len = 0;
+        self.host_stale = false;
     }
 
     /// Return host slices for the live K/V prefix (first `kv_len` tokens) for
