@@ -29,8 +29,8 @@ half = "2"
 libm = "0.2"
 cuda-device = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/cuda-device", optional = true }
 cuda-host = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/cuda-host", optional = true }
-cuda-core = { version = "0.3.1", optional = true }
-cutile = { version = "0.3.1", optional = true }
+cuda-core = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-core", optional = true }
+cutile = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cutile-rs/cutile", optional = true }
 
 [dev-dependencies]
 approx = "0.5"
