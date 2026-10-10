@@ -25,8 +25,8 @@ memmap2 = "0.9"
 sha2 = "0.10"
 rand = "0.9"
 rayon = "1"
-cutile = { version = "0.3.1", optional = true }
-cuda-core = { version = "0.3.1", optional = true }
+cutile = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cutile-rs/cutile", optional = true }
+cuda-core = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-core", optional = true }
 minijinja = { version = "2", features = ["json"] }
 vstd = { workspace = true }
 hf-chat-template = "0.2.1"

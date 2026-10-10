@@ -129,6 +129,60 @@ pub mod kernels {
         z.store(acc);
     }
 
+    /// Q2_0 multi-output GEMV: BN output neurons per program.
+    ///
+    /// Uses `MappedPartitionMut` with `iter_indices()` to write BN tiles of 1 from
+    /// a single program, reducing kernel launch overhead by BN× compared to the
+    /// scalar variant. Each program iterates over BN consecutive output neurons;
+    /// x is traversed once per neuron (x cache reuse depends on L2 hit rate across
+    /// the BN inner iterations).
+    ///
+    /// Packed layout: same as `cutile_q2_0_gemv` — `[N × K_BLOCKS × 9]` u32.
+    ///
+    /// Grid: (N/BN, 1, 1) — one program per group of BN output neurons.
+    /// MAP_SHAPE must be [BN] so each program owns BN consecutive output tiles.
+    #[cutile::entry()]
+    pub fn cutile_q2_0_gemv_bn<const K_BLOCKS: i32, const MAP_SHAPE: [i32; 1]>(
+        mut z: MappedPartitionMut<f32, { [1] }, MAP_SHAPE>,
+        x: &Tensor<f32, { [-1] }>,
+        packed: &Tensor<u32, { [-1] }>,
+    ) {
+        let part_x = x.partition(shape![1]);
+        let part_p = packed.partition(shape![1]);
+        let magic: Tile<u32, { [1] }> = broadcast_scalar(0x4B000000_u32, shape![1]);
+        let bias_f32: Tile<f32, { [1] }> = broadcast_scalar(8388609.0_f32, shape![1]);
+        let mask: Tile<u32, { [1] }> = broadcast_scalar(3_u32, shape![1]);
+
+        for index in z.iter_indices() {
+            let [n] = index.coords();
+            let mut acc: Tile<f32, { [1] }> = broadcast_scalar(0.0_f32, shape![1]);
+
+            for blk in 0i32..K_BLOCKS {
+                let pack_base = n * K_BLOCKS * 9 + blk * 9;
+                let x_base = blk * 128;
+
+                let scale_u32: Tile<u32, { [1] }> = part_p.load([pack_base]);
+                let scale: Tile<f32, { [1] }> = bitcast(scale_u32);
+
+                for word in 0i32..8 {
+                    let word_data: Tile<u32, { [1] }> = part_p.load([pack_base + 1 + word]);
+                    let x_word_base = x_base + word * 16;
+
+                    for bit_pair in 0i32..16 {
+                        let shift: Tile<u32, { [1] }> =
+                            broadcast_scalar((bit_pair * 2) as u32, shape![1]);
+                        let q_u32: Tile<u32, { [1] }> = andi(shri(word_data, shift), mask);
+                        let biased: Tile<u32, { [1] }> = ori(q_u32, magic);
+                        let q_f32: Tile<f32, { [1] }> = bitcast(biased) - bias_f32;
+                        let x_elem: Tile<f32, { [1] }> = part_x.load([x_word_base + bit_pair]);
+                        acc = acc + scale * q_f32 * x_elem;
+                    }
+                }
+            }
+            z.store(acc, index);
+        }
+    }
+
     /// Q6_K dequantized GEMV: z[1] = Σ_k dequant(packed[pid_n, k]) × x[k]
     ///
     /// Packed layout: [N × K_BLOCKS × Q6K_PACKED_U32S] u32
@@ -359,6 +413,45 @@ impl CutileQ2Gemv {
         // require exactly 1 stride and would reject the 2-stride tensor that
         // a plain unpartition() produces.  The same pattern is used in
         // forward_gemv_coalesced_d2d in cutile_matmul.rs.
+        let out = z
+            .unpartition()
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(out))
+    }
+
+    /// Device-to-device Q2_0 GEMV with BN outputs per program.
+    ///
+    /// Reduces kernel launch overhead by BN× versus `forward_d2d`.
+    /// `n` must be divisible by `bn`. Uses `MappedPartitionMut` with MAP_SHAPE=[BN]
+    /// so each program iterates over BN consecutive output neurons via `iter_indices()`.
+    pub fn forward_d2d_bn(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        n: usize,
+        k_blocks: usize,
+        bn: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        if n % bn != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "n={n} must be divisible by bn={bn}"
+            )));
+        }
+        let stream = &self.stream;
+
+        let z = api::zeros::<f32>(&[n])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1])
+            .map([bn], (n / bn) as u32);
+
+        let (z, _x, _p) =
+            kernels::cutile_q2_0_gemv_bn(z, Arc::clone(x), Arc::clone(packed))
+                .generics(vec![k_blocks.to_string(), bn.to_string()])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
         let out = z
             .unpartition()
             .reshape(&[n])
