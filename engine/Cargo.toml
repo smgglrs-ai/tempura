@@ -9,6 +9,7 @@ description = "Inference engine for tempura-serve: model loading, KV-cache, forw
 default = []
 cuda = ["tempura-kernels/cuda"]
 cutile = ["tempura-kernels/cutile", "dep:cutile", "dep:cuda-core"]
+oxide-gemv = ["tempura-kernels/oxide-gemv", "cutile"]
 edge-metrics = []
 openmp = ["tempura-kernels/openmp"]
 

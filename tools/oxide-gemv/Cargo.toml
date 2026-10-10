@@ -1,0 +1,18 @@
+[package]
+name = "oxide-gemv"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# Standalone crate — not in the main workspace.
+# Build with: cargo oxide build --manifest-path tools/oxide-gemv/Cargo.toml
+[workspace]
+
+[[bin]]
+name = "oxide-gemv"
+path = "src/main.rs"
+
+[dependencies]
+cuda-device = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/cuda-device" }
+cuda-host   = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/cuda-host" }
+cuda-core   = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-core" }

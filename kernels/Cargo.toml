@@ -10,6 +10,10 @@ default = ["cpu"]
 cpu = []
 cuda = ["cutile"]
 cutile = ["dep:cutile", "dep:cuda-core"]
+# oxide-gemv: embed the rustc-codegen-cuda Q2_0 GEMV kernel.
+# Requires build.rs to have run `cargo oxide build tools/oxide-gemv` and
+# written the PTX to $OUT_DIR/oxide_q2_gemv.ptx.  Enable alongside `cutile`.
+oxide-gemv = ["cutile"]
 npu-intel = []
 npu-qualcomm = []
 openmp = []
