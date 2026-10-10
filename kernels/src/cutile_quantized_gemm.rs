@@ -131,51 +131,117 @@ pub mod kernels {
 
     /// Q2_0 multi-output GEMV: BN output neurons per program.
     ///
-    /// Uses `MappedPartitionMut` with `iter_indices()` to write BN tiles of 1 from
-    /// a single program, reducing kernel launch overhead by BN× compared to the
-    /// scalar variant. Each program iterates over BN consecutive output neurons;
-    /// x is traversed once per neuron (x cache reuse depends on L2 hit rate across
-    /// the BN inner iterations).
+    /// Uses a rank-2 `MappedPartitionMut<f32, { [1, 1] }, MAP_SHAPE>` with
+    /// `MAP_SHAPE: [i32; 2]` = `[1, BN]`, bypassing the cuTile 0.4.0 restriction
+    /// that rank-1 tile maps must be `[1]`. Each program iterates over BN
+    /// consecutive output tiles via `iter_indices()` and computes one dot product
+    /// per iteration, reducing kernel launch overhead by BN× vs. the scalar variant.
     ///
     /// Packed layout: same as `cutile_q2_0_gemv` — `[N × K_BLOCKS × 9]` u32.
+    /// Inputs x and packed must be reshaped to rank-2 `[1, K]` / `[1, total]`
+    /// at the dispatch level so that `[1, 1]` tile loads are type-consistent
+    /// with the `[1, 1]` accumulator.
     ///
-    /// Grid: (N/BN, 1, 1) — one program per group of BN output neurons.
-    /// MAP_SHAPE must be [BN] so each program owns BN consecutive output tiles.
+    /// Grid: N/BN programs (one per group of BN output neurons).
     #[cutile::entry()]
-    pub fn cutile_q2_0_gemv_bn<const K_BLOCKS: i32, const MAP_SHAPE: [i32; 1]>(
-        mut z: MappedPartitionMut<f32, { [1] }, MAP_SHAPE>,
-        x: &Tensor<f32, { [-1] }>,
-        packed: &Tensor<u32, { [-1] }>,
+    pub fn cutile_q2_0_gemv_bn<const K_BLOCKS: i32, const MAP_SHAPE: [i32; 2]>(
+        mut z: MappedPartitionMut<f32, { [1, 1] }, MAP_SHAPE>,
+        x: &Tensor<f32, { [1, -1] }>,
+        packed: &Tensor<u32, { [1, -1] }>,
     ) {
-        let part_x = x.partition(shape![1]);
-        let part_p = packed.partition(shape![1]);
-        let magic: Tile<u32, { [1] }> = broadcast_scalar(0x4B000000_u32, shape![1]);
-        let bias_f32: Tile<f32, { [1] }> = broadcast_scalar(8388609.0_f32, shape![1]);
-        let mask: Tile<u32, { [1] }> = broadcast_scalar(3_u32, shape![1]);
+        let part_x = x.partition(shape![1, 1]);
+        let part_p = packed.partition(shape![1, 1]);
+        let magic: Tile<u32, { [1, 1] }> = broadcast_scalar(0x4B000000_u32, shape![1, 1]);
+        let bias_f32: Tile<f32, { [1, 1] }> = broadcast_scalar(8388609.0_f32, shape![1, 1]);
+        let mask: Tile<u32, { [1, 1] }> = broadcast_scalar(3_u32, shape![1, 1]);
 
         for index in z.iter_indices() {
-            let [n] = index.coords();
-            let mut acc: Tile<f32, { [1] }> = broadcast_scalar(0.0_f32, shape![1]);
+            let (_, n) = index.components();
+            let mut acc: Tile<f32, { [1, 1] }> = broadcast_scalar(0.0_f32, shape![1, 1]);
 
             for blk in 0i32..K_BLOCKS {
                 let pack_base = n * K_BLOCKS * 9 + blk * 9;
                 let x_base = blk * 128;
 
-                let scale_u32: Tile<u32, { [1] }> = part_p.load([pack_base]);
-                let scale: Tile<f32, { [1] }> = bitcast(scale_u32);
+                let scale_u32: Tile<u32, { [1, 1] }> = part_p.load([0, pack_base]);
+                let scale: Tile<f32, { [1, 1] }> = bitcast(scale_u32);
 
                 for word in 0i32..8 {
-                    let word_data: Tile<u32, { [1] }> = part_p.load([pack_base + 1 + word]);
+                    let word_data: Tile<u32, { [1, 1] }> =
+                        part_p.load([0, pack_base + 1 + word]);
                     let x_word_base = x_base + word * 16;
 
                     for bit_pair in 0i32..16 {
-                        let shift: Tile<u32, { [1] }> =
-                            broadcast_scalar((bit_pair * 2) as u32, shape![1]);
-                        let q_u32: Tile<u32, { [1] }> = andi(shri(word_data, shift), mask);
-                        let biased: Tile<u32, { [1] }> = ori(q_u32, magic);
-                        let q_f32: Tile<f32, { [1] }> = bitcast(biased) - bias_f32;
-                        let x_elem: Tile<f32, { [1] }> = part_x.load([x_word_base + bit_pair]);
+                        let shift: Tile<u32, { [1, 1] }> =
+                            broadcast_scalar((bit_pair * 2) as u32, shape![1, 1]);
+                        let q_u32: Tile<u32, { [1, 1] }> = andi(shri(word_data, shift), mask);
+                        let biased: Tile<u32, { [1, 1] }> = ori(q_u32, magic);
+                        let q_f32: Tile<f32, { [1, 1] }> = bitcast(biased) - bias_f32;
+                        let x_elem: Tile<f32, { [1, 1] }> =
+                            part_x.load([0, x_word_base + bit_pair]);
                         acc = acc + scale * q_f32 * x_elem;
+                    }
+                }
+            }
+            z.store(acc, index);
+        }
+    }
+
+    /// Q6_K multi-output GEMV: BN output neurons per program.
+    ///
+    /// Uses a rank-2 `MappedPartitionMut<f32, { [1, 1] }, MAP_SHAPE>` with
+    /// `MAP_SHAPE: [i32; 2]` = `[1, BN]`, bypassing the cuTile 0.4.0 restriction
+    /// that rank-1 tile maps must be `[1]`. Reduces kernel launch overhead by BN×.
+    ///
+    /// Packed layout: same as `cutile_q6k_gemv` — `[N × K_BLOCKS × 81]` u32.
+    ///
+    /// Grid: N/BN programs. MAP_SHAPE = [1, BN]: each program iterates BN tiles.
+    /// Dispatch: output tensor must be reshaped to `[1, N]` and partitioned `[1, 1]`
+    /// before calling `.map([1, BN], N/BN)`.
+    #[cutile::entry()]
+    pub fn cutile_q6k_gemv_bn<const K_BLOCKS: i32, const MAP_SHAPE: [i32; 2]>(
+        mut z: MappedPartitionMut<f32, { [1, 1] }, MAP_SHAPE>,
+        x: &Tensor<f32, { [1, -1] }>,
+        packed: &Tensor<u32, { [1, -1] }>,
+    ) {
+        let part_x = x.partition(shape![1, 1]);
+        let part_p = packed.partition(shape![1, 1]);
+        let magic: Tile<u32, { [1, 1] }> = broadcast_scalar(0x4B000000_u32, shape![1, 1]);
+        let mask_ff: Tile<u32, { [1, 1] }> = broadcast_scalar(0xFF_u32, shape![1, 1]);
+        let center: Tile<f32, { [1, 1] }> = broadcast_scalar(8388640.0_f32, shape![1, 1]);
+
+        for index in z.iter_indices() {
+            let (_, n) = index.components();
+            let mut acc: Tile<f32, { [1, 1] }> = broadcast_scalar(0.0_f32, shape![1, 1]);
+
+            for blk in 0i32..K_BLOCKS {
+                let pack_base = n * K_BLOCKS * 81 + blk * 81;
+                let x_base = blk * 256;
+
+                let d_u32: Tile<u32, { [1, 1] }> = part_p.load([0, pack_base]);
+                let d: Tile<f32, { [1, 1] }> = bitcast(d_u32);
+
+                for group in 0i32..16 {
+                    let sc_u32: Tile<u32, { [1, 1] }> = part_p.load([0, pack_base + 1 + group]);
+                    let sc: Tile<f32, { [1, 1] }> = bitcast(sc_u32);
+                    let d_sc: Tile<f32, { [1, 1] }> = d * sc;
+
+                    for word in 0i32..4 {
+                        let word_data: Tile<u32, { [1, 1] }> =
+                            part_p.load([0, pack_base + 17 + group * 4 + word]);
+                        let x_elem_base = x_base + group * 16 + word * 4;
+
+                        for byte_pos in 0i32..4 {
+                            let shift: Tile<u32, { [1, 1] }> =
+                                broadcast_scalar((byte_pos * 8) as u32, shape![1, 1]);
+                            let q_u32: Tile<u32, { [1, 1] }> =
+                                andi(shri(word_data, shift), mask_ff);
+                            let q_f32: Tile<f32, { [1, 1] }> =
+                                bitcast(ori(q_u32, magic)) - center;
+                            let x_val: Tile<f32, { [1, 1] }> =
+                                part_x.load([0, x_elem_base + byte_pos]);
+                            acc = acc + d_sc * q_f32 * x_val;
+                        }
                     }
                 }
             }
@@ -251,6 +317,107 @@ pub mod kernels {
             }
         }
         z.store(acc);
+    }
+
+    /// Q4_K multi-output GEMV: BN output neurons per program.
+    ///
+    /// Uses a rank-2 `MappedPartitionMut<f32, { [1, 1] }, MAP_SHAPE>` with
+    /// `MAP_SHAPE: [i32; 2]` = `[1, BN]`, bypassing the cuTile 0.4.0 restriction
+    /// that rank-1 tile maps must be `[1]`. Reduces kernel launch overhead by BN×.
+    ///
+    /// Packed layout: same as `cutile_q4k_gemv` — `[N × K_BLOCKS × 42]` u32.
+    ///
+    /// Grid: N/BN programs. MAP_SHAPE = [1, BN]: each program iterates BN tiles.
+    /// Dispatch: output tensor must be reshaped to `[1, N]` and partitioned `[1, 1]`
+    /// before calling `.map([1, BN], N/BN)`.
+    #[cutile::entry()]
+    pub fn cutile_q4k_gemv_bn<const K_BLOCKS: i32, const MAP_SHAPE: [i32; 2]>(
+        mut z: MappedPartitionMut<f32, { [1, 1] }, MAP_SHAPE>,
+        x: &Tensor<f32, { [1, -1] }>,
+        packed: &Tensor<u32, { [1, -1] }>,
+    ) {
+        let part_x = x.partition(shape![1, 1]);
+        let part_p = packed.partition(shape![1, 1]);
+        let magic: Tile<u32, { [1, 1] }> = broadcast_scalar(0x4B000000_u32, shape![1, 1]);
+        let bias_f32: Tile<f32, { [1, 1] }> = broadcast_scalar(8388608.0_f32, shape![1, 1]);
+        let mask_8: Tile<u32, { [1, 1] }> = broadcast_scalar(0xFF_u32, shape![1, 1]);
+        let mask_4: Tile<u32, { [1, 1] }> = broadcast_scalar(0xF_u32, shape![1, 1]);
+        let shift_8: Tile<u32, { [1, 1] }> = broadcast_scalar(8_u32, shape![1, 1]);
+        let shift_4: Tile<u32, { [1, 1] }> = broadcast_scalar(4_u32, shape![1, 1]);
+
+        for index in z.iter_indices() {
+            let (_, n) = index.components();
+            let mut acc: Tile<f32, { [1, 1] }> = broadcast_scalar(0.0_f32, shape![1, 1]);
+
+            for blk in 0i32..K_BLOCKS {
+                let base = n * K_BLOCKS * 42 + blk * 42;
+                let x_base = blk * 256;
+
+                let d_u32: Tile<u32, { [1, 1] }> = part_p.load([0, base]);
+                let d: Tile<f32, { [1, 1] }> = bitcast(d_u32);
+
+                let dmin_u32: Tile<u32, { [1, 1] }> = part_p.load([0, base + 1]);
+                let dmin: Tile<f32, { [1, 1] }> = bitcast(dmin_u32);
+
+                for j in 0i32..4 {
+                    let sc_pair: Tile<u32, { [1, 1] }> = part_p.load([0, base + 2 + j]);
+                    let m_pair: Tile<u32, { [1, 1] }> = part_p.load([0, base + 6 + j]);
+
+                    let sc_lo_u32: Tile<u32, { [1, 1] }> = andi(sc_pair, mask_8);
+                    let sc_hi_u32: Tile<u32, { [1, 1] }> =
+                        andi(shri(sc_pair, shift_8), mask_8);
+                    let sc_lo_f32: Tile<f32, { [1, 1] }> =
+                        bitcast(ori(sc_lo_u32, magic)) - bias_f32;
+                    let sc_hi_f32: Tile<f32, { [1, 1] }> =
+                        bitcast(ori(sc_hi_u32, magic)) - bias_f32;
+
+                    let m_lo_u32: Tile<u32, { [1, 1] }> = andi(m_pair, mask_8);
+                    let m_hi_u32: Tile<u32, { [1, 1] }> =
+                        andi(shri(m_pair, shift_8), mask_8);
+                    let m_lo_f32: Tile<f32, { [1, 1] }> =
+                        bitcast(ori(m_lo_u32, magic)) - bias_f32;
+                    let m_hi_f32: Tile<f32, { [1, 1] }> =
+                        bitcast(ori(m_hi_u32, magic)) - bias_f32;
+
+                    let d1: Tile<f32, { [1, 1] }> = d * sc_lo_f32;
+                    let m1: Tile<f32, { [1, 1] }> = dmin * m_lo_f32;
+                    let d2: Tile<f32, { [1, 1] }> = d * sc_hi_f32;
+                    let m2: Tile<f32, { [1, 1] }> = dmin * m_hi_f32;
+
+                    for l in 0i32..32 {
+                        let qs_word_idx = (j * 32 + l) / 4;
+                        let byte_shift = ((j * 32 + l) % 4) * 8;
+
+                        let qs_word: Tile<u32, { [1, 1] }> =
+                            part_p.load([0, base + 10 + qs_word_idx]);
+                        let byte_shift_tile: Tile<u32, { [1, 1] }> =
+                            broadcast_scalar(byte_shift as u32, shape![1, 1]);
+                        let byte_val: Tile<u32, { [1, 1] }> =
+                            andi(shri(qs_word, byte_shift_tile), mask_8);
+
+                        let lo_nibble: Tile<u32, { [1, 1] }> = andi(byte_val, mask_4);
+                        let hi_nibble: Tile<u32, { [1, 1] }> = shri(byte_val, shift_4);
+
+                        let lo_f32: Tile<f32, { [1, 1] }> =
+                            bitcast(ori(lo_nibble, magic)) - bias_f32;
+                        let hi_f32: Tile<f32, { [1, 1] }> =
+                            bitcast(ori(hi_nibble, magic)) - bias_f32;
+
+                        let w_lo: Tile<f32, { [1, 1] }> = d1 * lo_f32 - m1;
+                        let w_hi: Tile<f32, { [1, 1] }> = d2 * hi_f32 - m2;
+
+                        let x_lo: Tile<f32, { [1, 1] }> =
+                            part_x.load([0, x_base + j * 64 + l]);
+                        let x_hi: Tile<f32, { [1, 1] }> =
+                            part_x.load([0, x_base + j * 64 + 32 + l]);
+
+                        acc = acc + w_lo * x_lo;
+                        acc = acc + w_hi * x_hi;
+                    }
+                }
+            }
+            z.store(acc, index);
+        }
     }
 
     /// Q4_K dequantized GEMV: z[1] = Σ_k dequant(packed[pid_n, k]) × x[k]
@@ -423,8 +590,9 @@ impl CutileQ2Gemv {
     /// Device-to-device Q2_0 GEMV with BN outputs per program.
     ///
     /// Reduces kernel launch overhead by BN× versus `forward_d2d`.
-    /// `n` must be divisible by `bn`. Uses `MappedPartitionMut` with MAP_SHAPE=[BN]
-    /// so each program iterates over BN consecutive output neurons via `iter_indices()`.
+    /// `n` must be divisible by `bn`. Uses a rank-2 `MappedPartitionMut` with
+    /// `MAP_SHAPE=[1, BN]` (rank-2, bypassing the cuTile 0.4.0 rank-1 map restriction)
+    /// so each program iterates over BN consecutive output tiles via `iter_indices()`.
     pub fn forward_d2d_bn(
         &self,
         x: &Arc<Tensor<f32>>,
@@ -440,15 +608,33 @@ impl CutileQ2Gemv {
         }
         let stream = &self.stream;
 
+        let k = k_blocks * Q2_0_QK;
+        let total_packed = n * k_blocks * Q2_0_PACKED_U32S;
+
+        // Reshape inputs to rank-2 so the kernel's [1, 1] tile partition is type-consistent.
+        // Reshape output to [1, n] so the rank-2 MAP_SHAPE=[1, bn] bypasses the cuTile 0.4.0
+        // "rank-1 maps must be [1]" constraint.
+        let x_2d: Arc<Tensor<f32>> = Arc::clone(x)
+            .reshape(&[1, k])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+        let p_2d: Arc<Tensor<u32>> = Arc::clone(packed)
+            .reshape(&[1, total_packed])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+
         let z = api::zeros::<f32>(&[n])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-            .partition([1])
-            .map([bn], (n / bn) as u32);
+            .reshape(&[1, n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1, 1])
+            .map([1, bn], (n / bn) as u32);
 
         let (z, _x, _p) =
-            kernels::cutile_q2_0_gemv_bn(z, Arc::clone(x), Arc::clone(packed))
-                .generics(vec![k_blocks.to_string(), bn.to_string()])
+            kernels::cutile_q2_0_gemv_bn(z, x_2d, p_2d)
+                // MAP_SHAPE: [i32; 2] — pass as two generics: MAP_SHAPE[0]=1, MAP_SHAPE[1]=bn
+                .generics(vec![k_blocks.to_string(), "1".to_string(), bn.to_string()])
                 .sync_on(stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
@@ -551,6 +737,59 @@ impl CutileQ6kGemv {
         Ok(Arc::new(out))
     }
 
+    /// Device-to-device Q6_K GEMV with BN outputs per program.
+    ///
+    /// Reduces kernel launch overhead by BN× versus `forward_d2d`. Uses rank-2
+    /// `MappedPartitionMut<f32, { [1, 1] }, [1, BN]>` to bypass the cuTile 0.4.0
+    /// "rank-1 maps must be [1]" restriction.
+    pub fn forward_d2d_bn(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        n: usize,
+        k_blocks: usize,
+        bn: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        if n % bn != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "n={n} must be divisible by bn={bn}"
+            )));
+        }
+        let stream = &self.stream;
+
+        let k = k_blocks * Q6K_QK;
+        let total_packed = n * k_blocks * Q6K_PACKED_U32S;
+
+        let x_2d: Arc<Tensor<f32>> = Arc::clone(x)
+            .reshape(&[1, k])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+        let p_2d: Arc<Tensor<u32>> = Arc::clone(packed)
+            .reshape(&[1, total_packed])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+
+        let z = api::zeros::<f32>(&[n])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .reshape(&[1, n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1, 1])
+            .map([1, bn], (n / bn) as u32);
+
+        let (z, _x, _p) =
+            kernels::cutile_q6k_gemv_bn(z, x_2d, p_2d)
+                .generics(vec![k_blocks.to_string(), "1".to_string(), bn.to_string()])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let out = z
+            .unpartition()
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(out))
+    }
+
     /// Non-blocking Q6_K GEMV reusing a pre-allocated output buffer.
     ///
     /// Enqueues the kernel without synchronising. The caller MUST ensure the
@@ -634,6 +873,59 @@ impl CutileQ4Gemv {
 
         // reshape(&[n]) collapses partition-stride metadata left by
         // partition([1]).unpartition() — same fix as CutileQ2Gemv::forward_d2d.
+        let out = z
+            .unpartition()
+            .reshape(&[n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        Ok(Arc::new(out))
+    }
+
+    /// Device-to-device Q4_K GEMV with BN outputs per program.
+    ///
+    /// Reduces kernel launch overhead by BN× versus `forward_d2d`. Uses rank-2
+    /// `MappedPartitionMut<f32, { [1, 1] }, [1, BN]>` to bypass the cuTile 0.4.0
+    /// "rank-1 maps must be [1]" restriction.
+    pub fn forward_d2d_bn(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        n: usize,
+        k_blocks: usize,
+        bn: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        if n % bn != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "n={n} must be divisible by bn={bn}"
+            )));
+        }
+        let stream = &self.stream;
+
+        let k = k_blocks * Q4K_BLOCK_SIZE;
+        let total_packed = n * k_blocks * Q4K_PACKED_U32S;
+
+        let x_2d: Arc<Tensor<f32>> = Arc::clone(x)
+            .reshape(&[1, k])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+        let p_2d: Arc<Tensor<u32>> = Arc::clone(packed)
+            .reshape(&[1, total_packed])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .into();
+
+        let z = api::zeros::<f32>(&[n])
+            .sync_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .reshape(&[1, n])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            .partition([1, 1])
+            .map([1, bn], (n / bn) as u32);
+
+        let (z, _x, _p) =
+            kernels::cutile_q4k_gemv_bn(z, x_2d, p_2d)
+                .generics(vec![k_blocks.to_string(), "1".to_string(), bn.to_string()])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
         let out = z
             .unpartition()
             .reshape(&[n])
@@ -1926,6 +2218,238 @@ mod tests {
         for (i, (&got, &exp)) in out.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (got - exp).abs() < 1e-2,
+                "row {i}: got {got}, expected {exp}"
+            );
+        }
+    }
+
+    // ── BN variant tests: verify multi-output kernels match scalar kernels ────
+
+    #[test]
+    #[cfg(feature = "cutile")]
+    fn q2_0_gpu_gemv_bn_matches_scalar() {
+        use cuda_core::Device;
+        use cutile::api;
+        use cutile::prelude::DeviceOp;
+
+        // Same 4-case setup as q2_0_gpu_gemv_matches_cpu_dequant, but using BN=4
+        // so n=4 is divisible by bn=4.
+        let n = 4;
+        let k = Q2_0_QK;
+        let k_blocks = 1;
+        let bn = 4;
+
+        let test_cases: &[(f32, u8, f32)] = &[
+            (1.0, 2, 1.0),
+            (2.0, 1, 0.0),
+            (1.0, 0, -1.0),
+            (1.0, 3, 2.0),
+        ];
+
+        let x_vals = vec![1.0f32; k];
+        let mut packed: Vec<u32> = Vec::with_capacity(n * k_blocks * Q2_0_PACKED_U32S);
+        let mut expected: Vec<f32> = Vec::with_capacity(n);
+        for &(d, q_val, elem_val) in test_cases {
+            let block = make_q2_0_block(d, q_val);
+            let scale_bits = u16::from_le_bytes([block[0], block[1]]);
+            let scale_f32 = f16_to_f32(scale_bits);
+            packed.push(scale_f32.to_bits());
+            for w in 0..8usize {
+                let b0 = block[2 + w * 4] as u32;
+                let b1 = block[3 + w * 4] as u32;
+                let b2 = block[4 + w * 4] as u32;
+                let b3 = block[5 + w * 4] as u32;
+                packed.push(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            }
+            expected.push(k as f32 * elem_val);
+        }
+
+        let device = Device::new(0).expect("CUDA device 0 not available");
+        let stream: std::sync::Arc<cuda_core::Stream> =
+            device.new_stream().expect("stream").into();
+        let q2_gemv = CutileQ2Gemv::from_stream(stream);
+
+        let x_dev: std::sync::Arc<cutile::tensor::Tensor<f32>> =
+            api::copy_host_vec_to_device(&std::sync::Arc::new(x_vals))
+                .sync_on(q2_gemv.stream())
+                .expect("upload x")
+                .into();
+        let p_dev: std::sync::Arc<cutile::tensor::Tensor<u32>> =
+            api::copy_host_vec_to_device(&std::sync::Arc::new(packed))
+                .sync_on(q2_gemv.stream())
+                .expect("upload packed")
+                .into();
+
+        let result = q2_gemv
+            .forward_d2d_bn(&x_dev, &p_dev, n, k_blocks, bn)
+            .expect("q2_0 gemv_bn");
+
+        let out: Vec<f32> = result
+            .to_host_vec()
+            .sync_on(q2_gemv.stream())
+            .expect("download");
+
+        for (i, (&got, &exp)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-2,
+                "row {i}: got {got}, expected {exp}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cutile")]
+    fn q4k_gpu_gemv_bn_matches_scalar() {
+        use cuda_core::Device;
+        use cutile::api;
+        use cutile::prelude::DeviceOp;
+
+        let n = 4;
+        let k = Q4K_BLOCK_SIZE;
+        let k_blocks = 1;
+        let bn = 4;
+
+        let test_cases: &[(f32, f32, u8, u8, u8, f32)] = &[
+            (1.0, 0.0, 7, 1, 0, 7.0),
+            (2.0, 0.5, 4, 2, 1, 15.5),
+            (1.0, 0.0, 0, 3, 0, 0.0),
+            (0.5, 0.0, 15, 2, 0, 15.0),
+        ];
+
+        let x_vals = vec![1.0f32; k];
+
+        fn unpack_scales_inner(packed_scales: &[u8]) -> ([u8; 8], [u8; 8]) {
+            let mut sc = [0u8; 8];
+            let mut m = [0u8; 8];
+            for i in 0..4 {
+                sc[i] = packed_scales[i] & 0x3F;
+                sc[i + 4] =
+                    ((packed_scales[i + 8] & 0x0F) | ((packed_scales[i] >> 6) << 4)) & 0x3F;
+                m[i] = packed_scales[i + 4] & 0x3F;
+                m[i + 4] =
+                    ((packed_scales[i + 8] >> 4) | ((packed_scales[i + 4] >> 6) << 4)) & 0x3F;
+            }
+            (sc, m)
+        }
+
+        let mut packed: Vec<u32> = Vec::with_capacity(n * k_blocks * Q4K_PACKED_U32S);
+        let mut expected: Vec<f32> = Vec::with_capacity(n);
+
+        for &(d, dmin_val, nibble, sc_val, m_val, elem_val) in test_cases {
+            let block = make_q4k_block(d, dmin_val, nibble, sc_val, m_val);
+            let d_f32 = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let dmin_f32 = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            let (sc, m) = unpack_scales_inner(&block[4..16]);
+            let qs = &block[16..144];
+            packed.push(d_f32.to_bits());
+            packed.push(dmin_f32.to_bits());
+            for j in 0..4 {
+                packed.push(sc[2 * j] as u32 | ((sc[2 * j + 1] as u32) << 8));
+            }
+            for j in 0..4 {
+                packed.push(m[2 * j] as u32 | ((m[2 * j + 1] as u32) << 8));
+            }
+            for w in 0..32 {
+                packed.push(
+                    qs[w * 4] as u32
+                        | ((qs[w * 4 + 1] as u32) << 8)
+                        | ((qs[w * 4 + 2] as u32) << 16)
+                        | ((qs[w * 4 + 3] as u32) << 24),
+                );
+            }
+            expected.push(k as f32 * elem_val);
+        }
+
+        let device = Device::new(0).expect("CUDA device 0 not available");
+        let stream: std::sync::Arc<cuda_core::Stream> =
+            device.new_stream().expect("stream").into();
+        let q4k_gemv = CutileQ4Gemv::from_stream(stream);
+
+        let x_dev: std::sync::Arc<cutile::tensor::Tensor<f32>> =
+            api::copy_host_vec_to_device(&std::sync::Arc::new(x_vals))
+                .sync_on(q4k_gemv.stream())
+                .expect("upload x")
+                .into();
+        let p_dev: std::sync::Arc<cutile::tensor::Tensor<u32>> =
+            api::copy_host_vec_to_device(&std::sync::Arc::new(packed))
+                .sync_on(q4k_gemv.stream())
+                .expect("upload packed")
+                .into();
+
+        let result = q4k_gemv
+            .forward_d2d_bn(&x_dev, &p_dev, n, k_blocks, bn)
+            .expect("q4k gemv_bn");
+
+        let out: Vec<f32> = result
+            .to_host_vec()
+            .sync_on(q4k_gemv.stream())
+            .expect("download");
+
+        for (i, (&got, &exp)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-1,
+                "row {i}: got {got}, expected {exp}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cutile")]
+    fn q6k_gpu_gemv_bn_matches_scalar() {
+        use cuda_core::Device;
+        use cutile::api;
+        use cutile::prelude::DeviceOp;
+
+        let n = 4;
+        let k = Q6K_QK;
+        let k_blocks = 1;
+        let bn = 4;
+
+        let cases: &[(f32, u8, i8, f32)] = &[
+            (1.0, 32, 1, 0.0),
+            (1.0, 33, 1, 256.0),
+            (1.0, 31, 1, -256.0),
+            (2.0, 40, 3, 12288.0),
+        ];
+
+        let x_vals = vec![1.0f32; k];
+        let mut all_packed: Vec<u32> = Vec::with_capacity(n * k_blocks * Q6K_PACKED_U32S);
+        let mut expected: Vec<f32> = Vec::with_capacity(n);
+
+        for &(d, q_val, sc, exp) in cases {
+            let block = make_q6k_block_uniform(d, q_val, sc);
+            all_packed.extend(pack_q6k_block(&block));
+            expected.push(exp);
+        }
+
+        let device = Device::new(0).expect("CUDA device 0 not available");
+        let stream: std::sync::Arc<cuda_core::Stream> =
+            device.new_stream().expect("stream").into();
+        let q6k_gemv = CutileQ6kGemv::from_stream(stream);
+
+        let x_dev: std::sync::Arc<cutile::tensor::Tensor<f32>> =
+            api::copy_host_vec_to_device(&std::sync::Arc::new(x_vals))
+                .sync_on(q6k_gemv.stream())
+                .expect("upload x")
+                .into();
+        let p_dev: std::sync::Arc<cutile::tensor::Tensor<u32>> =
+            api::copy_host_vec_to_device(&std::sync::Arc::new(all_packed))
+                .sync_on(q6k_gemv.stream())
+                .expect("upload packed")
+                .into();
+
+        let result = q6k_gemv
+            .forward_d2d_bn(&x_dev, &p_dev, n, k_blocks, bn)
+            .expect("q6k gemv_bn");
+
+        let out: Vec<f32> = result
+            .to_host_vec()
+            .sync_on(q6k_gemv.stream())
+            .expect("download");
+
+        for (i, (&got, &exp)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1.0,
                 "row {i}: got {got}, expected {exp}"
             );
         }
