@@ -93,31 +93,28 @@ pub mod kernels {
 
     /// Interleave kernel: merge two half-tensors back into flat [num_sh * head_dim].
     ///
-    /// Inverse of `cutile_deinterleave`. Uses the 0.4.0 `MappedPartitionMut` API
-    /// so one program per head writes BOTH halves via `iter_indices()` +
-    /// indexed `store(tile, index)` — halving the program count vs. the old 2×
-    /// workaround.
+    /// Interleave kernel: merge two half-tensors back into [num_sh × head_dim].
     ///
-    /// Grid: (num_sh, 1, 1) — one program per (seq × head) pair.
-    /// Each program iterates over its two assigned tiles (indices 2*sh and 2*sh+1)
-    /// and writes `first[sh]` and `second[sh]` respectively.
+    /// Launches 2×num_sh programs — even programs read from `first`, odd from `second`.
+    /// Each program writes to exactly one HALF_DIM-element tile at its sequential
+    /// pid position using the normal unindexed `store`. No indexed store needed.
+    ///
+    /// Note: cuTile 0.4.0 rank-1 mapped partitions require MAP_SHAPE=[1]; multi-tile
+    /// maps ([2]) are not supported for rank-1 tensors. The 2×program approach avoids
+    /// that constraint entirely.
     #[cutile::entry()]
-    pub fn cutile_interleave<const HALF_DIM: i32, const MAP_SHAPE: [i32; 1]>(
-        mut z: MappedPartitionMut<f32, { [HALF_DIM] }, MAP_SHAPE>,
+    pub fn cutile_interleave<const HALF_DIM: i32>(
+        z: &mut Tensor<f32, { [HALF_DIM] }>,
         first: &Tensor<f32, { [-1] }>,
         second: &Tensor<f32, { [-1] }>,
     ) {
-        let part_first = first.partition(shape![HALF_DIM]);
-        let part_second = second.partition(shape![HALF_DIM]);
-        for index in z.iter_indices() {
-            let [tile_coord] = index.coords();
-            let sh = tile_coord / 2;
-            let half_idx = tile_coord % 2;
-            if half_idx == 0 {
-                z.store(part_first.load([sh]), index);
-            } else {
-                z.store(part_second.load([sh]), index);
-            }
+        let pid = program_id(0);
+        let sh = pid / 2;
+        let half_idx = pid % 2;
+        if half_idx == 0 {
+            z.store(first.partition(shape![HALF_DIM]).load([sh]));
+        } else {
+            z.store(second.partition(shape![HALF_DIM]).load([sh]));
         }
     }
 
@@ -490,17 +487,15 @@ impl CutileRoPE {
         let first_arc: Arc<Tensor<f32>> = Arc::new(out_f.unpartition());
         let second_arc: Arc<Tensor<f32>> = Arc::new(out_s.unpartition());
 
-        // Each program writes 2 tiles (first and second half for one head).
-        // MappedPartitionMut with MAP_SHAPE=[2] gives num_sh programs, 2 tiles each.
-        let z_mapped = api::zeros::<f32>(&[num_sh * head_dim])
+        // 2×num_sh programs, each writes one HALF_DIM tile (even→first, odd→second).
+        let z_t_alloc = api::zeros::<f32>(&[num_sh * head_dim])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-            .partition([half])
-            .map([2], num_sh as u32);
+            .partition([half]);
 
         let (z_t, _of, _os) = unsafe {
-            kernels::cutile_interleave(z_mapped, first_arc, second_arc)
-                .generics(vec![half.to_string(), "2".to_string()])
+            kernels::cutile_interleave(z_t_alloc, first_arc, second_arc)
+                .generics(vec![half.to_string()])
                 .async_on(stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
         };
@@ -665,13 +660,12 @@ impl CutileRoPE {
         let first_arc: Arc<Tensor<f32>> = Arc::new(out_f.unpartition());
         let second_arc: Arc<Tensor<f32>> = Arc::new(out_s.unpartition());
 
-        let z_mapped = z_tensor
-            .partition([half])
-            .map([2], num_sh as u32);
+        let z_tensor_part = z_tensor
+            .partition([half]);
 
         let (z_t, of_ret, os_ret) = unsafe {
-            kernels::cutile_interleave(z_mapped, first_arc, second_arc)
-                .generics(vec![half.to_string(), "2".to_string()])
+            kernels::cutile_interleave(z_tensor_part, first_arc, second_arc)
+                .generics(vec![half.to_string()])
                 .async_on(stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
         };
@@ -756,13 +750,12 @@ impl CutileRoPE {
         let first_arc: Arc<Tensor<f32>> = Arc::new(out_f.unpartition());
         let second_arc: Arc<Tensor<f32>> = Arc::new(out_s.unpartition());
 
-        let z_mapped = z_tensor
-            .partition([half])
-            .map([2], num_sh as u32);
+        let z_tensor_part = z_tensor
+            .partition([half]);
 
         let (z_t, of_ret, os_ret) = unsafe {
-            kernels::cutile_interleave(z_mapped, first_arc, second_arc)
-                .generics(vec![half.to_string(), "2".to_string()])
+            kernels::cutile_interleave(z_tensor_part, first_arc, second_arc)
+                .generics(vec![half.to_string()])
                 .async_on(stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
         };

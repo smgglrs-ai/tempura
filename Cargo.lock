@@ -702,13 +702,11 @@ dependencies = [
 
 [[package]]
 name = "cuda-async"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6d51fe2c9b1a89f4ac760d72a197761789f4e60db1d07d3f4d48de65a78adc9"
+version = "0.4.0"
 dependencies = [
  "anyhow",
- "cuda-bindings 0.3.1",
- "cuda-core 0.3.1",
+ "cuda-bindings",
+ "cuda-core",
  "dashmap",
  "futures",
  "half",
@@ -719,20 +717,6 @@ dependencies = [
 
 [[package]]
 name = "cuda-bindings"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f42e2c99c56bf2eef9d569435bfd72a478dfaea3f178b8e5bae891875bbbe2e"
-dependencies = [
- "bindgen",
- "libloading",
- "prettyplease",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "cuda-bindings"
 version = "0.4.0"
 dependencies = [
  "bindgen",
@@ -745,37 +729,13 @@ dependencies = [
 
 [[package]]
 name = "cuda-core"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84bdb592a2844148fb13bdfbbab158879f56916bde1d1a1b6580ca27f23850cd"
-dependencies = [
- "anyhow",
- "cuda-bindings 0.3.1",
- "cuda-core-derive 0.3.1",
- "half",
- "oxide-artifacts",
-]
-
-[[package]]
-name = "cuda-core"
 version = "0.4.0"
 dependencies = [
  "anyhow",
- "cuda-bindings 0.4.0",
- "cuda-core-derive 0.4.0",
+ "cuda-bindings",
+ "cuda-core-derive",
  "half",
  "oxide-artifacts",
-]
-
-[[package]]
-name = "cuda-core-derive"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a48da7d10c1078f7fbb87d7176e9476affadea148babf31946e348073872d44"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -799,7 +759,7 @@ name = "cuda-host"
 version = "0.2.1"
 dependencies = [
  "cuda-artifact-finalizer",
- "cuda-core 0.4.0",
+ "cuda-core",
  "cuda-macros",
  "half",
  "libc",
@@ -825,13 +785,11 @@ version = "0.1.0"
 
 [[package]]
 name = "cutile"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "422c8fb32ac648113eb032a6d818f09b0862812224bd4a0ed563fc174f6f5264"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "cuda-async",
- "cuda-core 0.3.1",
+ "cuda-core",
  "cutile-compiler",
  "cutile-ir",
  "cutile-macro",
@@ -849,13 +807,11 @@ dependencies = [
 
 [[package]]
 name = "cutile-compiler"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cbc52ad2ae4e8a4440800673f8ccde58909f25c705d82d4925e025f6c3f3565"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "cuda-async",
- "cuda-core 0.3.1",
+ "cuda-core",
  "cutile-ir",
  "half",
  "linkme",
@@ -871,25 +827,21 @@ dependencies = [
 
 [[package]]
 name = "cutile-ir"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2042f5b0e653ba62d472454ffe4278133f91b6a25a66b51e9dcbb35ac4ad950f"
+version = "0.4.0"
 dependencies = [
  "half",
  "indexmap 2.14.2",
  "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]
 name = "cutile-macro"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16f574e698764da8e0a6b22f12dac33949bcbe48a43d94492c02f09bb8e65b6a"
+version = "0.4.0"
 dependencies = [
  "convert_case 0.8.0",
  "cutile-compiler",
  "itertools 0.14.0",
- "phf",
  "proc-macro2",
  "quote",
  "sha2",
@@ -2559,48 +2511,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "phf"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
-dependencies = [
- "phf_macros",
- "phf_shared",
-]
-
-[[package]]
-name = "phf_generator"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
-dependencies = [
- "phf_shared",
- "rand 0.8.8",
-]
-
-[[package]]
-name = "phf_macros"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
-dependencies = [
- "phf_generator",
- "phf_shared",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "phf_shared"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
-dependencies = [
- "siphasher",
-]
-
-[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3378,12 +3288,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
-name = "siphasher"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
-
-[[package]]
 name = "sketches-ddsketch"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3634,7 +3538,7 @@ name = "tempura-engine"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "cuda-core 0.3.1",
+ "cuda-core",
  "cutile",
  "hf-chat-template",
  "memmap2",
@@ -3696,7 +3600,7 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "cc",
- "cuda-core 0.3.1",
+ "cuda-core",
  "cuda-device",
  "cuda-host",
  "cutile",
