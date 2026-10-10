@@ -71,6 +71,13 @@ unsafe impl Sync for DecodeGraph {}
 // inside CutileMatMul::forward_bt_device_to_device.
 const BK: usize = 16;
 
+// BN_GEMV: number of output neurons computed per GPU program in the multi-output
+// quantized GEMV kernels (cutile_q*_gemv_bn).  Matches a CUDA warp (32 threads)
+// so each program covers exactly one warp's worth of outputs, maximising occupancy.
+// Standard transformer dimensions (4096, 8192, 11008, 14336, …) are all multiples
+// of 32, so this value works for all projection shapes we encounter.
+const BN_GEMV: usize = 32;
+
 /// A projection weight tensor resident on the GPU with shape metadata.
 struct DeviceWeight {
     /// Pre-uploaded f32 tensor on the GPU, shaped [n, k_pad].
@@ -1630,6 +1637,14 @@ impl CutileGpuModel {
             }
         }
 
+        // Use multi-output BN kernel when n is divisible by BN_GEMV: fewer programs,
+        // better GPU utilisation.
+        if dw.n % BN_GEMV == 0 {
+            return self.q2_gemv
+                .forward_d2d_bn(&a_flat, &dw.tensor, dw.n, dw.k_blocks, BN_GEMV)
+                .expect("gemm_q2_d2d_slot (bn) failed");
+        }
+
         self.q2_gemv
             .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
             .expect("gemm_q2_d2d_slot failed")
@@ -1683,6 +1698,12 @@ impl CutileGpuModel {
             }
         }
 
+        if dw.n % BN_GEMV == 0 {
+            return self.q6k_gemv
+                .forward_d2d_bn(&a_flat, &dw.tensor, dw.n, dw.k_blocks, BN_GEMV)
+                .expect("gemm_q6k_d2d_slot (bn) failed");
+        }
+
         self.q6k_gemv
             .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
             .expect("gemm_q6k_d2d_slot failed")
@@ -1734,6 +1755,12 @@ impl CutileGpuModel {
                 self.scratch.borrow_mut()[slot] = Some(result.clone());
                 return result;
             }
+        }
+
+        if dw.n % BN_GEMV == 0 {
+            return self.q4k_gemv
+                .forward_d2d_bn(&a_flat, &dw.tensor, dw.n, dw.k_blocks, BN_GEMV)
+                .expect("gemm_q4k_d2d_slot (bn) failed");
         }
 
         self.q4k_gemv
