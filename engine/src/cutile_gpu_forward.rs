@@ -19,6 +19,7 @@
 /// mirror.  RMSNorm, RoPE, and SiLU-gated MLP all run entirely on device.
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 use cuda_core::sys::CUdeviceptr;
@@ -40,6 +41,30 @@ use tempura_kernels::cutile_rope::{CutileRoPE, RopeScratch};
 use crate::config::ModelConfig;
 use crate::cutile_kv_cache::CutileKvCache;
 use crate::weights::QuantizedWeights;
+
+/// RAII wrapper for a CUDA graph executable.
+///
+/// The exec is replayed each decode step via `cuGraphLaunch`.  Between steps
+/// `cuGraphExecUpdate_v2` refreshes the baked-in per-step parameters (token
+/// position, kv_len, KV-cache write offset) without re-instantiating the graph.
+struct DecodeGraph {
+    cu_exec: cuda_core::sys::CUgraphExec,
+    device: Arc<cuda_core::Device>,
+}
+
+impl Drop for DecodeGraph {
+    fn drop(&mut self) {
+        // Bind device context before calling driver API.
+        let _ = self.device.bind_to_thread();
+        if !self.cu_exec.is_null() {
+            let _ = unsafe { cuda_core::sys::cuGraphExecDestroy(self.cu_exec) };
+        }
+    }
+}
+
+// SAFETY: the exec handle is only ever used from a single inference thread.
+unsafe impl Send for DecodeGraph {}
+unsafe impl Sync for DecodeGraph {}
 
 // BK must be a multiple that divides all standard hidden / intermediate
 // dimensions (4096, 11008, 14336, …).  16 matches the tiling constant used
@@ -227,6 +252,35 @@ pub struct CutileGpuModel {
     ///
     /// Same motivation as `attn_out_scratch`: eliminates 28 sync-on allocs per token.
     silu_out_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
+
+    // ── CUDA graph capture fields ─────────────────────────────────────────────
+    //
+    // For decode (seq_len=1) the forward pass is captured into a CUDA graph on
+    // the first step and replayed on subsequent steps.  Before each replay the
+    // baked-in per-step kernel parameters (position, kv_len, KV write offset)
+    // are refreshed via `cuGraphExecUpdate_v2`, which re-captures a lightweight
+    // template on the same stream and patches the exec in-place — one driver call
+    // instead of ~200 individual `cuLaunchKernel` submissions.
+
+    /// Pre-allocated device buffer that holds the embedding of the current decode
+    /// token.  The CPU computes the embedding, copies it here with
+    /// `cuda_core::memcpy_htod_async` BEFORE `cuStreamBeginCapture`, so the graph
+    /// reads the latest value on every replay.
+    d_embed: Arc<Tensor<f32>>,
+
+    /// Pre-allocated RMSNorm scratch for the final model norm applied after the
+    /// layer loop (seq_len=1 decode only).  Eliminates the three `api::zeros`
+    /// allocations inside `forward_device_fused` that would otherwise block
+    /// CUDA graph capture.
+    final_norm_scratch: RefCell<RmsnormScratch>,
+
+    /// Cached CUDA graph executable for the decode forward pass.
+    ///
+    /// `None` until the first decode step.  On each decode step the graph is
+    /// re-captured (template) and the exec is updated via `cuGraphExecUpdate_v2`,
+    /// allowing per-step parameters (pos, kv_len, KV cache write offset) to vary
+    /// while the graph topology stays fixed.
+    cached_decode_graph: RefCell<Option<DecodeGraph>>,
 }
 
 // SAFETY: CutileMatMul, CutileFlashAttention and Tensor<f32> hold raw CUDA pointers,
@@ -801,6 +855,7 @@ impl CutileGpuModel {
         let k_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
         let pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let post_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let final_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let add_alloc = |n: usize| -> Option<Arc<Tensor<f32>>> {
             Some(Arc::new(
                 api::zeros::<f32>(&[n])
@@ -816,6 +871,13 @@ impl CutileGpuModel {
         // constant used inside silu_mul_device_scratch).
         const SILU_B: usize = 32;
         let silu_out_scratch = add_alloc(inter.div_ceil(SILU_B) * SILU_B);
+
+        // Pre-allocate the embedding input buffer for CUDA graph decode.
+        let d_embed = Arc::new(
+            api::zeros::<f32>(&[h_pad])
+                .sync_on(matmul.stream())
+                .expect("d_embed: device allocation failed"),
+        );
 
         let model = Self {
             config: config.clone(),
@@ -844,6 +906,9 @@ impl CutileGpuModel {
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
             attn_out_scratch: RefCell::new(attn_out_scratch),
             silu_out_scratch: RefCell::new(silu_out_scratch),
+            d_embed,
+            final_norm_scratch: RefCell::new(final_norm_scratch),
+            cached_decode_graph: RefCell::new(None),
         };
         eprintln!("[cutile] warming up kernel specializations…");
         model.warmup_gemms();
@@ -945,6 +1010,7 @@ impl CutileGpuModel {
         let k_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
         let pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let post_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let final_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let add_alloc = |n: usize| -> Option<Arc<Tensor<f32>>> {
             Some(Arc::new(
                 api::zeros::<f32>(&[n])
@@ -957,6 +1023,13 @@ impl CutileGpuModel {
         let attn_out_scratch = add_alloc(q_dim);
         const SILU_B: usize = 32;
         let silu_out_scratch = add_alloc(inter.div_ceil(SILU_B) * SILU_B);
+
+        // Pre-allocate the embedding input buffer for CUDA graph decode.
+        let d_embed = Arc::new(
+            api::zeros::<f32>(&[h_pad])
+                .sync_on(matmul.stream())
+                .expect("d_embed: device allocation failed"),
+        );
 
         let model = Self {
             config: config.clone(),
@@ -985,6 +1058,9 @@ impl CutileGpuModel {
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
             attn_out_scratch: RefCell::new(attn_out_scratch),
             silu_out_scratch: RefCell::new(silu_out_scratch),
+            d_embed,
+            final_norm_scratch: RefCell::new(final_norm_scratch),
+            cached_decode_graph: RefCell::new(None),
         };
         eprintln!("[cutile] warming up kernel specializations…");
         model.warmup_gemms();
@@ -1816,6 +1892,429 @@ impl CutileGpuModel {
     /// that occurred when using `forward_device`.
     ///
     /// `hidden_dev` is kept on device throughout the layer loop — uploaded once
+    /// Capture or update+replay the CUDA graph for a single decode step.
+    ///
+    /// # Design
+    ///
+    /// The forward pass is captured once between `cuStreamBeginCapture` and
+    /// `cuStreamEndCapture`.  The resulting template graph is then:
+    ///
+    /// - **First call**: instantiated with `cuGraphInstantiateWithFlags`.
+    /// - **Subsequent calls**: patched with `cuGraphExecUpdate_v2` — same topology,
+    ///   updated kernel parameters (position, kv_len, KV-cache write offset).
+    ///
+    /// The embedding (which changes every step) is uploaded into the pre-allocated
+    /// `d_embed` buffer BEFORE capture begins, so the graph can record the fixed
+    /// device pointer while the content changes each step.
+    ///
+    /// After `cuGraphLaunch` + `stream.synchronize()` the logits are resident in
+    /// `self.scratch[SLOT_LOGITS]` and are returned as a host Vec.
+    fn forward_decode_with_graph(
+        &self,
+        embedding: &[f32],
+        positions: &[u32],
+        gpu_kv_cache: &mut CutileKvCache,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+        let stream = self.matmul.stream();
+
+        // ── Step 1: Upload embedding into d_embed BEFORE capture ─────────────
+        // The graph reads from d_embed's fixed device pointer; we update its
+        // content here so every replay sees the current token's embedding.
+        let embed_src: Vec<f32> = if self.h_pad == h {
+            embedding.to_vec()
+        } else {
+            let mut v = vec![0.0f32; self.h_pad];
+            v[..h].copy_from_slice(&embedding[..h]);
+            v
+        };
+        unsafe {
+            cuda_core::memcpy_htod_async::<f32>(
+                self.d_embed.device_pointer().cu_deviceptr(),
+                embed_src.as_ptr(),
+                self.h_pad,
+                stream,
+            )
+            .expect("d_embed H→D copy failed");
+        }
+
+        // ── Step 2: Begin stream capture ────────────────────────────────────
+        // RELAXED mode: the current thread is not restricted from unsafe API
+        // calls.  Allocations that happen during capture (api::zeros fallbacks)
+        // execute eagerly and are NOT captured — they allocate real memory whose
+        // pointer is then baked into the graph node.  With pre-warmed scratch
+        // this path is never hit; if it is, the resulting graph node will replay
+        // correctly because the allocated tensor persists for the model's lifetime.
+        let cu_stream = stream.cu_stream();
+        let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
+        unsafe {
+            stream
+                .begin_capture(relaxed)
+                .expect("cuStreamBeginCapture failed");
+        }
+
+        // ── Step 3: Run the decode forward pass (captured, not executed) ─────
+        let hidden_dev = self.d_embed.clone();
+        self.forward_decode_inner(hidden_dev, positions, gpu_kv_cache);
+
+        // ── Step 4: End capture → template graph ────────────────────────────
+        let cu_graph = unsafe {
+            stream
+                .end_capture()
+                .expect("cuStreamEndCapture failed")
+        };
+
+        // ── Step 5: Instantiate (first call) or update exec (subsequent) ────
+        let mut graph_cache = self.cached_decode_graph.borrow_mut();
+        let cu_exec = if let Some(ref decode_graph) = *graph_cache {
+            // Update the existing exec with the new template graph.
+            let mut result_info = cuda_core::sys::CUgraphExecUpdateResultInfo_st {
+                result: cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS,
+                errorNode: std::ptr::null_mut(),
+                errorFromNode: std::ptr::null_mut(),
+            };
+            let update_rc = unsafe {
+                cuda_core::sys::cuGraphExecUpdate_v2(
+                    decode_graph.cu_exec,
+                    cu_graph,
+                    &mut result_info,
+                )
+            };
+            unsafe { cuda_core::sys::cuGraphDestroy(cu_graph) };
+            if update_rc != 0 || result_info.result != cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS {
+                // Update failed (topology mismatch or first incompatible step).
+                // This should not happen with a fixed model architecture; log and
+                // fall through to the non-graph path by returning early.
+                eprintln!(
+                    "[cuda_graph] cuGraphExecUpdate_v2 failed: rc={update_rc} result={}; falling back to direct dispatch",
+                    result_info.result
+                );
+                // Replay the capture-time results directly (they are not yet on device).
+                // Since the graph was not launched, the GPU work was not submitted.
+                // Fall back to the (already computed in Step 3) logits if they exist,
+                // else re-run without graphs.
+                drop(graph_cache);
+                return self.forward_decode_nogpu(embedding, positions, gpu_kv_cache);
+            }
+            decode_graph.cu_exec
+        } else {
+            // First decode step: instantiate the graph.
+            let mut cu_exec_uninit = MaybeUninit::<cuda_core::sys::CUgraphExec>::uninit();
+            unsafe {
+                cuda_core::sys::cuGraphInstantiateWithFlags(
+                    cu_exec_uninit.as_mut_ptr(),
+                    cu_graph,
+                    0,
+                )
+            };
+            let cu_exec = unsafe { cu_exec_uninit.assume_init() };
+            unsafe { cuda_core::sys::cuGraphDestroy(cu_graph) };
+
+            *graph_cache = Some(DecodeGraph {
+                cu_exec,
+                device: stream.device().clone(),
+            });
+            cu_exec
+        };
+
+        // ── Step 6: Launch the (updated) exec ───────────────────────────────
+        unsafe {
+            cuda_core::sys::cuGraphLaunch(cu_exec, cu_stream);
+        }
+
+        // ── Step 7: Sync and return logits ───────────────────────────────────
+        // All GPU work (embedding copy + graph) is now in-flight on the stream.
+        unsafe {
+            stream.synchronize().expect("stream sync after graph launch failed");
+        }
+        drop(graph_cache);
+
+        // Logits reside in SLOT_LOGITS — download and return.
+        let logits_arc = self
+            .scratch
+            .borrow()
+            [SLOT_LOGITS]
+            .clone()
+            .expect("SLOT_LOGITS empty after graph launch");
+        self.download_device_tensor(&logits_arc)
+    }
+
+    /// Run the decode forward pass without CUDA graph capture.
+    ///
+    /// Used as a fallback when `cuGraphExecUpdate_v2` fails or when graph capture
+    /// is not applicable (e.g. when padding mismatches require D→H sync inside
+    /// the layer loop).
+    fn forward_decode_nogpu(
+        &self,
+        embedding: &[f32],
+        positions: &[u32],
+        gpu_kv_cache: &mut CutileKvCache,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+
+        // Upload embedding to a fresh device tensor (normal non-graph path).
+        let hidden_dev = self.to_device_flat_padded(embedding, 1, h, self.h_pad);
+        self.forward_decode_inner(hidden_dev, positions, gpu_kv_cache);
+
+        // Sync the stream and download logits from SLOT_LOGITS.
+        let logits_arc = self
+            .scratch
+            .borrow()
+            [SLOT_LOGITS]
+            .clone()
+            .expect("SLOT_LOGITS empty after forward_decode_inner");
+        self.download_device_tensor(&logits_arc)
+    }
+
+    /// Inner decode forward pass: layer loop + final norm + lm_head.
+    ///
+    /// `hidden_dev` is the pre-uploaded `[h_pad]` embedding tensor.  It may be
+    /// `d_embed` (for the graph-capture path) or a freshly allocated tensor (for
+    /// the fallback non-graph path).
+    ///
+    /// All GPU work is enqueued **asynchronously** on the matmul stream.  The
+    /// caller is responsible for calling `stream.synchronize()` before reading
+    /// any output.  After the call the logits tensor resides in
+    /// `self.scratch[SLOT_LOGITS]`.
+    ///
+    /// During CUDA graph capture (`cuStreamBeginCapture` in progress) no GPU work
+    /// executes — API calls are only recorded.  The return value is a placeholder;
+    /// real data is available after `cuGraphLaunch` + sync.
+    fn forward_decode_inner(
+        &self,
+        mut hidden_dev: Arc<Tensor<f32>>,
+        positions: &[u32],
+        gpu_kv_cache: &mut CutileKvCache,
+    ) {
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+        let n_heads = cfg.num_attention_heads;
+        let n_kv_heads = cfg.num_kv_heads;
+        let head_dim = cfg.head_dim;
+        let q_dim = n_heads * head_dim;
+        let inter = cfg.intermediate_size;
+        let seq_len = 1usize;
+        let shared_stream = self.matmul.stream();
+
+        // Pre-build weight name strings for all layers.
+        #[allow(clippy::type_complexity)]
+        let layer_names: Vec<(
+            String, String, String, String, String, String, String, String, String,
+        )> = (0..cfg.num_layers)
+            .map(|l| {
+                let p = format!("model.layers.{l}");
+                (
+                    format!("{p}.input_layernorm.weight"),
+                    format!("{p}.post_attention_layernorm.weight"),
+                    format!("{p}.self_attn.q_proj.weight"),
+                    format!("{p}.self_attn.k_proj.weight"),
+                    format!("{p}.self_attn.v_proj.weight"),
+                    format!("{p}.self_attn.o_proj.weight"),
+                    format!("{p}.mlp.gate_proj.weight"),
+                    format!("{p}.mlp.up_proj.weight"),
+                    format!("{p}.mlp.down_proj.weight"),
+                )
+            })
+            .collect();
+
+        for layer in 0..cfg.num_layers {
+            let (
+                ref input_ln_name,
+                ref post_ln_name,
+                ref q_w_name,
+                ref k_w_name,
+                ref v_w_name,
+                ref o_w_name,
+                ref gate_w_name,
+                ref up_w_name,
+                ref down_w_name,
+            ) = layer_names[layer];
+
+            // Pre-attention RMSNorm (GPU, pre-allocated scratch).
+            let input_ln_w_dev = self
+                .norm_weights
+                .get(input_ln_name)
+                .expect("input_layernorm weight missing");
+            let normed_dev = self
+                .cutile_rmsnorm
+                .forward_device_fused_scratch(
+                    shared_stream,
+                    hidden_dev.clone(),
+                    input_ln_w_dev,
+                    seq_len,
+                    h,
+                    self.h_pad,
+                    cfg.layer_norm_eps,
+                    &mut self.pre_attn_norm_scratch.borrow_mut(),
+                )
+                .expect("pre-attention RMSNorm failed");
+
+            // Q / K / V projections (GPU, pre-allocated slots).
+            let q_dev = self.gemm_any_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q);
+            let k_dev = self.gemm_any_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K);
+            let v_dev = self.gemm_any_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V);
+
+            // RoPE (GPU, pre-allocated scratch; uses precomputed cos/sin table for seq_len=1).
+            let q_rot_dev = self
+                .cutile_rope
+                .forward_device_scratch(
+                    &q_dev,
+                    positions,
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    cfg.rope_theta,
+                    &mut self.q_rope_scratch.borrow_mut(),
+                    shared_stream,
+                )
+                .expect("Q RoPE failed");
+            let k_rot_dev = self
+                .cutile_rope
+                .forward_device_scratch(
+                    &k_dev,
+                    positions,
+                    seq_len,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rope_theta,
+                    &mut self.k_rope_scratch.borrow_mut(),
+                    shared_stream,
+                )
+                .expect("K RoPE failed");
+
+            // KV cache append (GPU-only; host mirror will be rebuilt on fallback if needed).
+            gpu_kv_cache
+                .append_device_gpu_only(layer, &k_rot_dev, &v_dev, seq_len)
+                .expect("GPU KV cache append failed");
+
+            // kv_len includes the token just appended.
+            let kv_len = gpu_kv_cache.seq_len() + seq_len;
+
+            // GPU decode attention (fused flash-attention, pre-allocated scratch).
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer);
+            let attn_out_dev = self
+                .flash_attn
+                .decode_attention_device_scratch(
+                    &q_rot_dev,
+                    &k_dev_full,
+                    &v_dev_full,
+                    kv_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    scale,
+                    shared_stream,
+                    &mut self.attn_out_scratch.borrow_mut(),
+                )
+                .expect("decode attention failed");
+
+            // Pad [q_dim] → [1, q_pad] for O-projection (zero-copy reshape when equal).
+            let attn_padded_dev = self.attn_out_to_oproj_device(&attn_out_dev, q_dim, self.q_pad);
+
+            // O-projection (GPU, pre-allocated slot).
+            let o_dev = self.gemm_any_d2d_slot(&attn_padded_dev, o_w_name, seq_len, SLOT_O);
+
+            // Post-attention residual add (GPU, pre-allocated scratch).
+            hidden_dev = self.add_device_scratch(
+                &hidden_dev,
+                &o_dev,
+                seq_len * self.h_pad,
+                &mut self.post_attn_add_scratch.borrow_mut(),
+            );
+
+            // Post-attention RMSNorm (GPU, pre-allocated scratch).
+            let post_ln_w_dev = self
+                .norm_weights
+                .get(post_ln_name)
+                .expect("post_attention_layernorm weight missing");
+            let normed2_dev = self
+                .cutile_rmsnorm
+                .forward_device_fused_scratch(
+                    shared_stream,
+                    hidden_dev.clone(),
+                    post_ln_w_dev,
+                    seq_len,
+                    h,
+                    self.h_pad,
+                    cfg.layer_norm_eps,
+                    &mut self.post_attn_norm_scratch.borrow_mut(),
+                )
+                .expect("post-attention RMSNorm failed");
+
+            // FFN gate + up projections.
+            let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE);
+            let up_dev = self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
+
+            // SiLU-gated MLP (GPU, pre-allocated scratch).
+            let gate_silu_n_dev = self
+                .cutile_elementwise
+                .silu_mul_device_scratch(
+                    &gate_dev,
+                    &up_dev,
+                    seq_len,
+                    inter,
+                    &mut self.silu_out_scratch.borrow_mut(),
+                )
+                .expect("SiLU-mul failed");
+
+            // FFN down projection.
+            // When inter_pad == inter (power-of-2 models) no padding is needed.
+            let gate_silu_dev = if self.inter_pad == inter {
+                gate_silu_n_dev
+            } else {
+                // inter_pad != inter: requires a D→H sync → not capturable.
+                // The check in forward_decode_with_graph() guards against this.
+                let gs_host = self.download_device_tensor(&gate_silu_n_dev);
+                self.to_device_padded(&gs_host, seq_len, inter, self.inter_pad)
+            };
+            let down_dev =
+                self.gemm_any_d2d_slot(&gate_silu_dev, down_w_name, seq_len, SLOT_DOWN);
+
+            // When h_pad == h (power-of-2 models) no padding is needed.
+            let down_padded = if self.h_pad == h {
+                down_dev
+            } else {
+                let down_host = self.download_device_tensor(&down_dev);
+                self.to_device_flat_padded(&down_host, seq_len, h, self.h_pad)
+            };
+
+            // Post-FFN residual add (GPU, pre-allocated scratch).
+            hidden_dev = self.add_device_scratch(
+                &hidden_dev,
+                &down_padded,
+                seq_len * self.h_pad,
+                &mut self.ffn_add_scratch.borrow_mut(),
+            );
+        }
+
+        // ── Final norm + lm_head ─────────────────────────────────────────────
+        // For seq_len=1 hidden_dev IS the last token — no D→H download or
+        // H→D re-upload needed.
+        let final_norm_w_dev = self
+            .norm_weights
+            .get("model.norm.weight")
+            .expect("model.norm.weight missing");
+        let last_dev = self
+            .cutile_rmsnorm
+            .forward_device_fused_scratch(
+                shared_stream,
+                hidden_dev,
+                final_norm_w_dev,
+                1,
+                h,
+                self.h_pad,
+                cfg.layer_norm_eps,
+                &mut self.final_norm_scratch.borrow_mut(),
+            )
+            .expect("final RMSNorm failed");
+
+        // lm_head GEMV — result stored in SLOT_LOGITS (pre-allocated).
+        self.gemm_d2d_slot(&last_dev, "lm_head.weight", 1, SLOT_LOGITS);
+    }
+
     /// before the loop and downloaded once after to extract the last token for
     /// the final norm + lm_head.
     ///
@@ -1884,7 +2383,30 @@ impl CutileGpuModel {
             })
             .collect();
 
-        // ── 2. Layer loop ──────────────────────────────────────────────────────
+        // ── 2. CUDA graph dispatch (decode + GPU KV cache) ─────────────────────
+        // For single-token decode with an active GPU KV cache and power-of-2 model
+        // dimensions (no D→H sync needed inside the layer loop), capture the
+        // forward pass into a CUDA graph and replay it.  This replaces ~200
+        // individual `cuLaunchKernel` submissions with one `cuGraphLaunch`.
+        //
+        // Preconditions (checked at runtime):
+        //   • seq_len == 1 — decode mode
+        //   • gpu_kv_cache.has_device_kv() — GPU flash-attention is active
+        //   • inter_pad == inter && h_pad == h — no padding round-trips needed
+        //   • !cfg.use_alibi — RoPE path (ALiBi skips rotation and could be
+        //     captured too, but is handled below for simplicity)
+        if seq_len == 1
+            && gpu_kv_cache.has_device_kv()
+            && self.inter_pad == inter
+            && self.h_pad == h
+            && !cfg.use_alibi
+        {
+            // The host KV mirror may be stale; we only rebuild it when transitioning
+            // to the CPU fallback path, which does not apply here.
+            return self.forward_decode_with_graph(&hidden, &positions, gpu_kv_cache);
+        }
+
+        // ── 3. Layer loop (prefill or CPU-attention fallback) ─────────────────
         // Sync the host KV mirror if it was skipped during prior GPU-only decode
         // steps and we are about to fall back to CPU attention.  This happens once
         // at the transition from GPU decode to long-context CPU fallback.
