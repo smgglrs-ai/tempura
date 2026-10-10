@@ -611,11 +611,10 @@ impl CutileQ2Gemv {
         let k = k_blocks * Q2_0_QK;
         let total_packed = n * k_blocks * Q2_0_PACKED_U32S;
 
-        // Reshape inputs to rank-2 so the kernel's [1, 1] tile partition is type-consistent.
-        // Reshape output to [1, n] so the rank-2 MAP_SHAPE=[1, bn] bypasses the cuTile 0.4.0
-        // "rank-1 maps must be [1]" constraint.
+        // x may have next_pow2(k) elements (activation padded for non-power-of-2 intermediates).
+        // Reshape to [1, next_pow2(k)]; kernel reads only k_blocks blocks of Q2_0_QK elements.
         let x_2d: Arc<Tensor<f32>> = Arc::clone(x)
-            .reshape(&[1, k])
+            .reshape(&[1, k.next_power_of_two()])
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .into();
         let p_2d: Arc<Tensor<u32>> = Arc::clone(packed)
@@ -761,7 +760,7 @@ impl CutileQ6kGemv {
         let total_packed = n * k_blocks * Q6K_PACKED_U32S;
 
         let x_2d: Arc<Tensor<f32>> = Arc::clone(x)
-            .reshape(&[1, k])
+            .reshape(&[1, k.next_power_of_two()])
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .into();
         let p_2d: Arc<Tensor<u32>> = Arc::clone(packed)
@@ -904,7 +903,7 @@ impl CutileQ4Gemv {
         let total_packed = n * k_blocks * Q4K_PACKED_U32S;
 
         let x_2d: Arc<Tensor<f32>> = Arc::clone(x)
-            .reshape(&[1, k])
+            .reshape(&[1, k.next_power_of_two()])
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .into();
         let p_2d: Arc<Tensor<u32>> = Arc::clone(packed)
