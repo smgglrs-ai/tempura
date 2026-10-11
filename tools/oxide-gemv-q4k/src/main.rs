@@ -33,6 +33,10 @@
  */
 
 use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, thread, warp};
+// NOTE: dp4a_s32 requires the upstream oxide backend (cuda-oxide/crates/rustc-codegen-cuda)
+// which includes dp4a in its intrinsic catalog. The fork backend (crates/rustc-codegen-cuda)
+// does not. Build q4k_gemv_decode_q8 only when the upstream backend is available.
+use cuda_device::dotprod::dp4a_s32;
 use cuda_host::cuda_module;
 use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_core::simt::LaunchConfig;
@@ -357,20 +361,21 @@ mod kernels {
         }
     }
 
-    /// Q4_K GEMV with Q8_1-quantized activations, multi-warp K-parallelism, dp4a.
+    /// Q4_K GEMV with Q8_1-quantized activations and proper 4-element dp4a.
     ///
-    /// All WARPS_PER_BLOCK warps cooperate on one output neuron (n_out = bid).
-    /// Each warp covers a stride-WARPS_PER_BLOCK subset of K blocks.
-    /// After intra-warp butterfly reduce, cross-warp reduce via shared memory.
+    /// Mini-warp structure: the 32-lane warp is divided into 4 mini-warps of 8 lanes.
+    /// Each mini-warp handles one j-group (64 elements = 32 lo + 32 hi).
+    /// Each sub-lane within a mini-warp processes 4 consecutive same-scale elements,
+    /// enabling proper 4-element dp4a packing.
     ///
-    /// dp4a usage: for each sub-block (lo or hi) per j-group, packs the nibble
-    /// (0..15, fits signed i8) and q8 value into a 2-byte dp4a call, computing
-    /// nibble*q8 as an integer dot product. Scales (sc_lo, sc_hi) differ between
-    /// sub-blocks so must be applied in f32 after the integer accumulation.
+    /// Mini-warp mw (lanes 8*mw .. 8*mw+7) → j-group mw:
+    ///   sub_l 0..7: each loads one 4-nibble u32 and one Q8_1 u32, calls dp4a_s32.
+    ///   After K loop: 3-step XOR reduce within mini-warp (all 8 lanes get the sum).
+    ///   Cross-mini-warp reduce via shared memory → write output.
     ///
-    /// Grid:  N blocks (one per output neuron).
+    /// Grid:  ceil(N / WARPS_PER_BLOCK) blocks (one output neuron per warp).
     /// Block: WARPS_PER_BLOCK * 32 threads.
-    /// Shared memory: WARPS_PER_BLOCK * 4 bytes.
+    /// Shared memory: WARPS_PER_BLOCK * 4 * sizeof(f32) = 64 bytes.
     #[kernel]
     pub fn q4k_gemv_decode_q8(
         mut out: DisjointSlice<f32>,
@@ -384,177 +389,107 @@ mod kernels {
         let bid     = thread::blockIdx_x();
         let warp_id = tid / 32;
         let lane    = tid % 32;
-        let n_out   = bid;  // one output neuron per block
+        let n_out   = bid * WARPS_PER_BLOCK + warp_id;
         if n_out >= n { return; }
+
+        // Mini-warp decomposition: 4 groups of 8 lanes, one per j-group.
+        let mw        = lane / 8;      // 0..3 — j-group this lane handles
+        let sub_l     = lane % 8;      // 0..7 — position within mini-warp
+        let mini_mask = 0xFF_u32 << (mw * 8);  // participation mask for this mini-warp
+        let base_lane = mw * 8;        // global lane ID of sub_l=0 in this mini-warp
 
         let mut acc = 0.0_f32;
 
-        // Each warp covers a stride-WARPS_PER_BLOCK subset of K blocks.
-        let mut blk = warp_id;
+        let mut blk = 0u32;
         while blk < k_blocks {
             let base = (n_out * k_blocks + blk) * 42;
 
+            // d and dmin: lane 0 (sub_l=0 of mw=0) loads, broadcasts to all 32 lanes.
             let d_raw    = if lane == 0 { packed[base as usize] } else { 0 };
             let dmin_raw = if lane == 0 { packed[(base + 1) as usize] } else { 0 };
             let d    = f32::from_bits(warp::shuffle(d_raw, 0));
             let dmin = f32::from_bits(warp::shuffle(dmin_raw, 0));
 
-            let sc_raw = if lane < 4 { packed[(base + 2 + lane) as usize] } else { 0 };
-            let m_raw  = if lane < 4 { packed[(base + 6 + lane) as usize] } else { 0 };
+            // Scale pair for j-group mw: sub_l==0 of each mini-warp loads and broadcasts.
+            let sc_raw = if sub_l == 0 { packed[(base + 2 + mw) as usize] } else { 0 };
+            let m_raw  = if sub_l == 0 { packed[(base + 6 + mw) as usize] } else { 0 };
+            let sc_raw_bc = warp::shuffle_sync(mini_mask, sc_raw, base_lane);
+            let m_raw_bc  = warp::shuffle_sync(mini_mask, m_raw,  base_lane);
+            let sc_lo = (sc_raw_bc & 0xFF) as f32;
+            let sc_hi = ((sc_raw_bc >> 8) & 0xFF) as f32;
+            let m_lo  = (m_raw_bc & 0xFF) as f32;
+            let m_hi  = ((m_raw_bc >> 8) & 0xFF) as f32;
 
-            // Helper: extract the i8 activation for this lane from a packed Q8_1 block.
-            // Block b has 8 u32s; lane l uses word b*8+l/4, byte l%4.
-            // Returns the nibble*q8 dot and the raw q8 value.
-            // Macro-inline per j-group (j=0..3).
+            // Q8_1 blocks for this j-group and K-block:
+            //   j-group mw covers Q4K elements [mw*64 .. mw*64+63] within the block,
+            //   split into lo Q8_1 block (blk*8 + mw*2) and hi (blk*8 + mw*2 + 1).
+            let q8_blk_lo = blk * 8 + mw * 2;
+            let q8_blk_hi = blk * 8 + mw * 2 + 1;
 
-            // ── j=0 ──
-            {
-                let sc_pair = warp::shuffle(sc_raw, 0);
-                let m_pair  = warp::shuffle(m_raw, 0);
-                let sc_lo = (sc_pair & 0xFF) as f32;
-                let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
-                let m_lo  = (m_pair & 0xFF) as f32;
-                let m_hi  = ((m_pair >> 8) & 0xFF) as f32;
+            let d8_lo = f16_to_f32(x_ds[q8_blk_lo as usize] & 0xFFFF);
+            let d8_hi = f16_to_f32(x_ds[q8_blk_hi as usize] & 0xFFFF);
 
-                let q8_b_lo = (blk * 8 + 0) as usize;
-                let q8_b_hi = (blk * 8 + 1) as usize;
-                let d8_lo = f16_to_f32(x_ds[q8_b_lo] & 0xFFFF);
-                let d8_hi = f16_to_f32(x_ds[q8_b_hi] & 0xFFFF);
+            // Nibble word: covers 4 consecutive lo+hi nibble pairs for this sub-lane.
+            // j-group mw nibbles start at packed word base+10+mw*8; sub_l selects which.
+            let qs_word = packed[(base + 10 + mw * 8 + sub_l) as usize];
+            let v_lo = qs_word & 0x0F0F0F0F;            // 4 lo nibbles as packed bytes
+            let v_hi = (qs_word >> 4) & 0x0F0F0F0F;     // 4 hi nibbles as packed bytes
 
-                let q8_u32_lo = x_qs[q8_b_lo * 8 + (lane / 4) as usize];
-                let q8_u32_hi = x_qs[q8_b_hi * 8 + (lane / 4) as usize];
-                let q8_raw_lo = ((q8_u32_lo >> ((lane % 4) * 8)) & 0xFF) as i8;
-                let q8_raw_hi = ((q8_u32_hi >> ((lane % 4) * 8)) & 0xFF) as i8;
+            // Q8_1 packed i8 values (4 per u32) for this sub-lane's 4 elements.
+            let u_lo = x_qs[(q8_blk_lo * 8 + sub_l) as usize];
+            let u_hi = x_qs[(q8_blk_hi * 8 + sub_l) as usize];
 
-                let qs_word  = packed[(base + 10 + lane / 4) as usize];
-                let qs_byte  = (qs_word >> ((lane % 4) * 8)) & 0xFF;
-                let nibble_lo = (qs_byte & 0xF) as u32;
-                let nibble_hi = ((qs_byte >> 4) & 0xF) as u32;
+            // dp4a: 4 nibble×q8 products per instruction.
+            // nibble 0..15 fits signed i8; q8 values are signed i8.
+            let sumi_d_lo = dp4a_s32(v_lo, u_lo, 0);
+            let sumi_d_hi = dp4a_s32(v_hi, u_hi, 0);
+            // Sum of q8 values for the dmin*m*sum(q8) min-term correction.
+            let sumi_m_lo = dp4a_s32(0x01010101, u_lo, 0);
+            let sumi_m_hi = dp4a_s32(0x01010101, u_hi, 0);
 
-                let dot_lo = (nibble_lo as i32) * (q8_raw_lo as i32);
-                let dot_hi = (nibble_hi as i32) * (q8_raw_hi as i32);
+            // Mini-warp XOR butterfly reduce (3 steps for 8 lanes: delta 4, 2, 1).
+            // After reduce all 8 lanes in the mini-warp hold the total sum.
+            let mut sd_lo = sumi_d_lo as u32;
+            let mut sd_hi = sumi_d_hi as u32;
+            let mut sm_lo = sumi_m_lo as u32;
+            let mut sm_hi = sumi_m_hi as u32;
 
-                acc += d8_lo * (d * sc_lo * (dot_lo as f32) - dmin * m_lo * (q8_raw_lo as f32))
-                     + d8_hi * (d * sc_hi * (dot_hi as f32) - dmin * m_hi * (q8_raw_hi as f32));
-            }
+            sd_lo = sd_lo.wrapping_add(warp::shuffle_xor_sync(mini_mask, sd_lo, 4));
+            sd_lo = sd_lo.wrapping_add(warp::shuffle_xor_sync(mini_mask, sd_lo, 2));
+            sd_lo = sd_lo.wrapping_add(warp::shuffle_xor_sync(mini_mask, sd_lo, 1));
+            sd_hi = sd_hi.wrapping_add(warp::shuffle_xor_sync(mini_mask, sd_hi, 4));
+            sd_hi = sd_hi.wrapping_add(warp::shuffle_xor_sync(mini_mask, sd_hi, 2));
+            sd_hi = sd_hi.wrapping_add(warp::shuffle_xor_sync(mini_mask, sd_hi, 1));
+            sm_lo = sm_lo.wrapping_add(warp::shuffle_xor_sync(mini_mask, sm_lo, 4));
+            sm_lo = sm_lo.wrapping_add(warp::shuffle_xor_sync(mini_mask, sm_lo, 2));
+            sm_lo = sm_lo.wrapping_add(warp::shuffle_xor_sync(mini_mask, sm_lo, 1));
+            sm_hi = sm_hi.wrapping_add(warp::shuffle_xor_sync(mini_mask, sm_hi, 4));
+            sm_hi = sm_hi.wrapping_add(warp::shuffle_xor_sync(mini_mask, sm_hi, 2));
+            sm_hi = sm_hi.wrapping_add(warp::shuffle_xor_sync(mini_mask, sm_hi, 1));
 
-            // ── j=1 ──
-            {
-                let sc_pair = warp::shuffle(sc_raw, 1);
-                let m_pair  = warp::shuffle(m_raw, 1);
-                let sc_lo = (sc_pair & 0xFF) as f32;
-                let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
-                let m_lo  = (m_pair & 0xFF) as f32;
-                let m_hi  = ((m_pair >> 8) & 0xFF) as f32;
+            // All 8 lanes now hold the same reduced sums. Scale and accumulate.
+            acc += d8_lo * (d * sc_lo * (sd_lo as i32 as f32) - dmin * m_lo * (sm_lo as i32 as f32))
+                 + d8_hi * (d * sc_hi * (sd_hi as i32 as f32) - dmin * m_hi * (sm_hi as i32 as f32));
 
-                let q8_b_lo = (blk * 8 + 2) as usize;
-                let q8_b_hi = (blk * 8 + 3) as usize;
-                let d8_lo = f16_to_f32(x_ds[q8_b_lo] & 0xFFFF);
-                let d8_hi = f16_to_f32(x_ds[q8_b_hi] & 0xFFFF);
-
-                let q8_u32_lo = x_qs[q8_b_lo * 8 + (lane / 4) as usize];
-                let q8_u32_hi = x_qs[q8_b_hi * 8 + (lane / 4) as usize];
-                let q8_raw_lo = ((q8_u32_lo >> ((lane % 4) * 8)) & 0xFF) as i8;
-                let q8_raw_hi = ((q8_u32_hi >> ((lane % 4) * 8)) & 0xFF) as i8;
-
-                let qs_word  = packed[(base + 10 + 8 + lane / 4) as usize];
-                let qs_byte  = (qs_word >> ((lane % 4) * 8)) & 0xFF;
-                let nibble_lo = (qs_byte & 0xF) as u32;
-                let nibble_hi = ((qs_byte >> 4) & 0xF) as u32;
-
-                let dot_lo = (nibble_lo as i32) * (q8_raw_lo as i32);
-                let dot_hi = (nibble_hi as i32) * (q8_raw_hi as i32);
-
-                acc += d8_lo * (d * sc_lo * (dot_lo as f32) - dmin * m_lo * (q8_raw_lo as f32))
-                     + d8_hi * (d * sc_hi * (dot_hi as f32) - dmin * m_hi * (q8_raw_hi as f32));
-            }
-
-            // ── j=2 ──
-            {
-                let sc_pair = warp::shuffle(sc_raw, 2);
-                let m_pair  = warp::shuffle(m_raw, 2);
-                let sc_lo = (sc_pair & 0xFF) as f32;
-                let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
-                let m_lo  = (m_pair & 0xFF) as f32;
-                let m_hi  = ((m_pair >> 8) & 0xFF) as f32;
-
-                let q8_b_lo = (blk * 8 + 4) as usize;
-                let q8_b_hi = (blk * 8 + 5) as usize;
-                let d8_lo = f16_to_f32(x_ds[q8_b_lo] & 0xFFFF);
-                let d8_hi = f16_to_f32(x_ds[q8_b_hi] & 0xFFFF);
-
-                let q8_u32_lo = x_qs[q8_b_lo * 8 + (lane / 4) as usize];
-                let q8_u32_hi = x_qs[q8_b_hi * 8 + (lane / 4) as usize];
-                let q8_raw_lo = ((q8_u32_lo >> ((lane % 4) * 8)) & 0xFF) as i8;
-                let q8_raw_hi = ((q8_u32_hi >> ((lane % 4) * 8)) & 0xFF) as i8;
-
-                let qs_word  = packed[(base + 10 + 16 + lane / 4) as usize];
-                let qs_byte  = (qs_word >> ((lane % 4) * 8)) & 0xFF;
-                let nibble_lo = (qs_byte & 0xF) as u32;
-                let nibble_hi = ((qs_byte >> 4) & 0xF) as u32;
-
-                let dot_lo = (nibble_lo as i32) * (q8_raw_lo as i32);
-                let dot_hi = (nibble_hi as i32) * (q8_raw_hi as i32);
-
-                acc += d8_lo * (d * sc_lo * (dot_lo as f32) - dmin * m_lo * (q8_raw_lo as f32))
-                     + d8_hi * (d * sc_hi * (dot_hi as f32) - dmin * m_hi * (q8_raw_hi as f32));
-            }
-
-            // ── j=3 ──
-            {
-                let sc_pair = warp::shuffle(sc_raw, 3);
-                let m_pair  = warp::shuffle(m_raw, 3);
-                let sc_lo = (sc_pair & 0xFF) as f32;
-                let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
-                let m_lo  = (m_pair & 0xFF) as f32;
-                let m_hi  = ((m_pair >> 8) & 0xFF) as f32;
-
-                let q8_b_lo = (blk * 8 + 6) as usize;
-                let q8_b_hi = (blk * 8 + 7) as usize;
-                let d8_lo = f16_to_f32(x_ds[q8_b_lo] & 0xFFFF);
-                let d8_hi = f16_to_f32(x_ds[q8_b_hi] & 0xFFFF);
-
-                let q8_u32_lo = x_qs[q8_b_lo * 8 + (lane / 4) as usize];
-                let q8_u32_hi = x_qs[q8_b_hi * 8 + (lane / 4) as usize];
-                let q8_raw_lo = ((q8_u32_lo >> ((lane % 4) * 8)) & 0xFF) as i8;
-                let q8_raw_hi = ((q8_u32_hi >> ((lane % 4) * 8)) & 0xFF) as i8;
-
-                let qs_word  = packed[(base + 10 + 24 + lane / 4) as usize];
-                let qs_byte  = (qs_word >> ((lane % 4) * 8)) & 0xFF;
-                let nibble_lo = (qs_byte & 0xF) as u32;
-                let nibble_hi = ((qs_byte >> 4) & 0xF) as u32;
-
-                let dot_lo = (nibble_lo as i32) * (q8_raw_lo as i32);
-                let dot_hi = (nibble_hi as i32) * (q8_raw_hi as i32);
-
-                acc += d8_lo * (d * sc_lo * (dot_lo as f32) - dmin * m_lo * (q8_raw_lo as f32))
-                     + d8_hi * (d * sc_hi * (dot_hi as f32) - dmin * m_hi * (q8_raw_hi as f32));
-            }
-
-            blk += WARPS_PER_BLOCK;
+            blk += 1;
         }
 
-        // Intra-warp butterfly reduce.
-        acc = warp::reduce_sum_f32(acc);
-
-        // Cross-warp reduce via shared memory.
+        // Cross-mini-warp reduce: collect one f32 per mini-warp via shared memory,
+        // then lane 0 of each warp sums its 4 j-group contributions and writes output.
+        // smem layout: slot = warp_id * 4 + mw  (WARPS_PER_BLOCK * 4 f32 slots total).
         let smem: *mut f32 = DynamicSharedArray::<f32>::get();
-        if lane == 0 {
-            unsafe { *smem.add(warp_id as usize) = acc; }
+        if sub_l == 0 {
+            unsafe { *smem.add((warp_id * 4 + mw) as usize) = acc; }
         }
         thread::sync_threads();
 
-        if warp_id == 0 {
-            acc = if lane < WARPS_PER_BLOCK {
-                unsafe { *smem.add(lane as usize) }
-            } else {
-                0.0_f32
+        if sub_l == 0 && mw == 0 {
+            let base_slot = (warp_id * 4) as usize;
+            let total = unsafe {
+                *smem.add(base_slot + 0) + *smem.add(base_slot + 1)
+                + *smem.add(base_slot + 2) + *smem.add(base_slot + 3)
             };
-            acc += warp::shuffle_xor_f32(acc, 2);
-            acc += warp::shuffle_xor_f32(acc, 1);
-            if lane == 0 {
-                unsafe { *out.get_unchecked_mut(n_out as usize) = acc; }
-            }
+            unsafe { *out.get_unchecked_mut(n_out as usize) = total; }
         }
     }
 }

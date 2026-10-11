@@ -330,13 +330,15 @@ impl OxideQ4kGemv {
                 &kb_u32  as *const _ as *mut c_void,
             ];
 
-            let grid_x = n as u32;  // one block per output neuron (multi-warp)
+            // Mini-warp kernel: one warp per output neuron; WARPS_PER_BLOCK warps per block.
+            // smem: 4 mini-warps per warp × WARPS_PER_BLOCK warps × 4 bytes = 64 bytes.
+            let grid_x = n.div_ceil(WARPS_PER_BLOCK as usize) as u32;
             unsafe {
                 launch_kernel(
                     q8_gemv_fn,
                     (grid_x, 1, 1),
                     (BLOCK_DIM, 1, 1),
-                    WARPS_PER_BLOCK * 4,  // shared memory for cross-warp reduce
+                    WARPS_PER_BLOCK * 4 * 4,  // smem: 4 f32 slots per warp × WARPS_PER_BLOCK
                     cu_stream,
                     &mut params,
                 )
