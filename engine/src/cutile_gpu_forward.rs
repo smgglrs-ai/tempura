@@ -32,7 +32,7 @@ use tempura_kernels::cutile_flash_attention::CutileFlashAttention;
 use tempura_kernels::cutile_matmul::CutileMatMul;
 use tempura_kernels::cutile_quantized_gemm::{
     CutileQ2Gemv, CutileQ4Gemv, CutileQ6kGemv, Q2_0_BLOCK_BYTES, Q2_0_PACKED_U32S, Q2_0_QK,
-    Q6K_PACKED_U32S, Q6K_QK,
+    Q4K_PACKED_U32S, Q6K_PACKED_U32S, Q6K_QK,
 };
 use tempura_kernels::oxide_q2_gemv_host::OxideQ2Gemv;
 use tempura_kernels::oxide_q4k_gemv_host::OxideQ4kGemv;
@@ -128,15 +128,17 @@ struct DeviceWeightQ6K {
 
 /// Q4_K quantized weight tensor resident on the GPU.
 ///
-/// Raw GGUF format: [n × k_blocks × 36 u32s] = [n × k_blocks × 144 bytes].
-/// Each block of 256 elements occupies 36 u32 slots (raw GGUF Q4K layout):
-///   slot 0       : bits[15:0] = f16 d, bits[31:16] = f16 dmin (raw f16, not converted)
-///   slots 1..4   : 12 bytes of 6-bit packed scales (3 u32 words)
-///   slots 4..36  : 32 u32 words of packed nibble bytes (128 bytes = 256 nibbles)
-/// Kernel decodes f16→f32 and unpacks 6-bit scales inline during GEMV.
-/// Saves 17% VRAM vs the old 42-u32 packed format (168 bytes → 144 bytes).
+/// Packed format: [n × k_blocks × Q4K_PACKED_U32S] u32 elements.
+/// Each block of 256 elements occupies 42 u32 slots:
+///   slot 0       : f32 bits of d (super-scale, f16 → f32)
+///   slot 1       : f32 bits of dmin (super-min, f16 → f32)
+///   slots 2..6   : sc[2*j] | (sc[2*j+1]<<8) for j=0..4 (unpacked 6-bit → 8-bit scales)
+///   slots 6..10  : m[2*j]  | (m[2*j+1]<<8)  for j=0..4 (unpacked 6-bit → 8-bit mins)
+///   slots 10..42 : 32 u32 words of packed nibble bytes (128 bytes total)
+/// Dequant in kernel: w[j*64+l] = d*sc[2*j]*lo_nibble - dmin*m[2*j]
+///                    w[j*64+l+32] = d*sc[2*j+1]*hi_nibble - dmin*m[2*j+1]
 struct DeviceWeightQ4K {
-    /// Raw GGUF u32 tensor on GPU, flat shape [n × k_blocks × 36].
+    /// Packed u32 tensor on GPU, flat shape [n × k_blocks × Q4K_PACKED_U32S].
     tensor: Arc<Tensor<u32>>,
     /// Number of output neurons.
     n: usize,
@@ -555,9 +557,11 @@ impl CutileGpuModel {
     /// Upload a Q4_K weight in packed GPU format (no f32 dequantization on the host).
     ///
     /// Converts the raw Q4_K bytes to the 42-u32-per-block GPU layout:
-    ///   u32[0]      = bits[15:0] = f16 d, bits[31:16] = f16 dmin (raw, not converted to f32)
-    ///   u32[1..4]   = 12 bytes of 6-bit packed scales (3 u32 words, raw GGUF bytes)
-    ///   u32[4..36]  = 32 u32 words holding qs[0..128] (128 bytes = 256 nibbles)
+    ///   u32[0]      = f32 bits of d (f16 → f32)
+    ///   u32[1]      = f32 bits of dmin (f16 → f32)
+    ///   u32[2+j]    = sc[2*j] | (sc[2*j+1]<<8)  for j=0..4  (unpacked 6-bit scales)
+    ///   u32[6+j]    = m[2*j]  | (m[2*j+1]<<8)   for j=0..4  (unpacked 6-bit mins)
+    ///   u32[10..42] = 32 u32 words holding qs[0..128] (4 bytes per u32, little-endian)
     ///
     /// Returns `false` (and does nothing) when the tensor is absent.
     fn maybe_upload_q4k(
@@ -578,26 +582,61 @@ impl CutileGpuModel {
             "k={k} must be a multiple of Q4K_BLOCK_SIZE={Q4K_BLOCK_SIZE}"
         );
         let k_blocks = k / Q4K_BLOCK_SIZE;
+        let total_u32s = n * k_blocks * Q4K_PACKED_U32S;
+        let mut packed: Vec<u32> = Vec::with_capacity(total_u32s);
 
-        debug_assert_eq!(
-            bytes.len(),
-            n * k_blocks * Q4K_BLOCK_BYTES,
-            "Q4K raw bytes length mismatch: expected {} got {}",
-            n * k_blocks * Q4K_BLOCK_BYTES,
-            bytes.len()
-        );
+        for row in 0..n {
+            for blk in 0..k_blocks {
+                let off = (row * k_blocks + blk) * Q4K_BLOCK_BYTES;
+                let block = &bytes[off..off + Q4K_BLOCK_BYTES];
 
-        // Upload raw GGUF bytes directly as u32 words — no packing or f16→f32 conversion.
-        // Raw GGUF blocks are 144 bytes = 36 u32s, aligned to 4 bytes.
-        let total_u32s = n * k_blocks * (Q4K_BLOCK_BYTES / 4);
-        let raw_u32: &[u32] = unsafe {
-            std::slice::from_raw_parts(bytes.as_ptr() as *const u32, total_u32s)
-        };
+                // u32[0]: d as f32 bits
+                let d_f16 = u16::from_le_bytes([block[0], block[1]]);
+                packed.push(f16_bits_to_f32_inline(d_f16).to_bits());
 
-        let tensor: Arc<Tensor<u32>> = api::copy_host_vec_to_device(&Arc::new(raw_u32.to_vec()))
+                // u32[1]: dmin as f32 bits
+                let dmin_f16 = u16::from_le_bytes([block[2], block[3]]);
+                packed.push(f16_bits_to_f32_inline(dmin_f16).to_bits());
+
+                // Unpack the 12-byte scale blob into 8 sc and 8 m values.
+                // Mirrors q4k_unpack_scales in cutile_quantized_gemm.rs.
+                let ps = &block[4..16];
+                let mut sc = [0u8; 8];
+                let mut m = [0u8; 8];
+                for i in 0..4usize {
+                    sc[i] = ps[i] & 0x3F;
+                    sc[i + 4] = ((ps[i + 8] & 0x0F) | ((ps[i] >> 6) << 4)) & 0x3F;
+                    m[i] = ps[i + 4] & 0x3F;
+                    m[i + 4] = ((ps[i + 8] >> 4) | ((ps[i + 4] >> 6) << 4)) & 0x3F;
+                }
+
+                // u32[2..6]: scale pairs sc[2*j] | (sc[2*j+1]<<8) for j=0..4
+                for j in 0..4usize {
+                    packed.push(sc[2 * j] as u32 | ((sc[2 * j + 1] as u32) << 8));
+                }
+                // u32[6..10]: min pairs m[2*j] | (m[2*j+1]<<8) for j=0..4
+                for j in 0..4usize {
+                    packed.push(m[2 * j] as u32 | ((m[2 * j + 1] as u32) << 8));
+                }
+
+                // u32[10..42]: 32 u32s holding qs[0..128] (128 bytes, 4 bytes per word)
+                let qs = &block[16..144];
+                for w in 0..32usize {
+                    let b0 = qs[w * 4] as u32;
+                    let b1 = qs[w * 4 + 1] as u32;
+                    let b2 = qs[w * 4 + 2] as u32;
+                    let b3 = qs[w * 4 + 3] as u32;
+                    packed.push(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+                }
+            }
+        }
+
+        debug_assert_eq!(packed.len(), total_u32s);
+
+        let tensor: Arc<Tensor<u32>> = api::copy_host_vec_to_device(&Arc::new(packed))
             .sync_on(stream)
             .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
-            .reshape(&[total_u32s])
+            .reshape(&[n * k_blocks * Q4K_PACKED_U32S])
             .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
             .into();
 
@@ -1856,35 +1895,17 @@ impl CutileGpuModel {
                 let mut f32_weights = vec![0.0f32; dw.n * k];
                 for row in 0..dw.n {
                     for blk in 0..dw.k_blocks {
-                        // Raw GGUF format: 36 u32s per block.
-                        let base = (row * dw.k_blocks + blk) * (Q4K_BLOCK_BYTES / 4);
-                        // u32[0]: f16 d in bits[15:0], f16 dmin in bits[31:16]
-                        let d_dmin = packed_host[base];
-                        let d = f16_bits_to_f32_inline((d_dmin & 0xFFFF) as u16);
-                        let dmin = f16_bits_to_f32_inline(((d_dmin >> 16) & 0xFFFF) as u16);
+                        let base = (row * dw.k_blocks + blk) * Q4K_PACKED_U32S;
+                        let d = f32::from_bits(packed_host[base]);
+                        let dmin = f32::from_bits(packed_host[base + 1]);
                         let k_base = blk * Q4K_BLOCK_SIZE;
-                        // u32[1..4]: 12 bytes of 6-bit packed scales.
-                        let ps0 = packed_host[base + 1]; // bytes 0-3
-                        let ps1 = packed_host[base + 2]; // bytes 4-7
-                        let ps2 = packed_host[base + 3]; // bytes 8-11
-                        let ps = |i: usize| -> u8 {
-                            let word = if i < 4 { ps0 } else if i < 8 { ps1 } else { ps2 };
-                            ((word >> (((i % 4) * 8) as u32)) & 0xFF) as u8
-                        };
-                        let mut sc = [0f32; 8];
-                        let mut m_arr = [0f32; 8];
-                        for i in 0..4usize {
-                            sc[i] = (ps(i) & 0x3F) as f32;
-                            sc[i + 4] = (((ps(i + 8) & 0x0F) | ((ps(i) >> 6) << 4)) & 0x3F) as f32;
-                            m_arr[i] = (ps(i + 4) & 0x3F) as f32;
-                            m_arr[i + 4] = ((((ps(i + 8) >> 4) | ((ps(i + 4) >> 6) << 4)) & 0x3F)) as f32;
-                        }
-                        // u32[4..36]: 32 nibble words (nibbles start at offset 4, was 10).
                         for j in 0..4usize {
-                            let sc_lo = sc[2 * j];
-                            let sc_hi = sc[2 * j + 1];
-                            let m_lo = m_arr[2 * j];
-                            let m_hi = m_arr[2 * j + 1];
+                            let sc_pair = packed_host[base + 2 + j];
+                            let m_pair = packed_host[base + 6 + j];
+                            let sc_lo = (sc_pair & 0xFF) as f32;
+                            let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
+                            let m_lo = (m_pair & 0xFF) as f32;
+                            let m_hi = ((m_pair >> 8) & 0xFF) as f32;
                             let d1 = d * sc_lo;
                             let m1 = dmin * m_lo;
                             let d2 = d * sc_hi;
@@ -1892,7 +1913,7 @@ impl CutileGpuModel {
                             for l in 0..32usize {
                                 let qs_word_idx = (j * 32 + l) / 4;
                                 let byte_shift = ((j * 32 + l) % 4) * 8;
-                                let qs_word = packed_host[base + 4 + qs_word_idx];
+                                let qs_word = packed_host[base + 10 + qs_word_idx];
                                 let byte_val = (qs_word >> byte_shift) & 0xFF;
                                 let lo = (byte_val & 0xF) as f32;
                                 let hi = (byte_val >> 4) as f32;
