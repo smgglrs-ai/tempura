@@ -68,6 +68,9 @@ Three-crate workspace + standalone verification crate:
      `cargo oxide build`, using warp-shuffle reductions and `shfl.sync.idx.b32`
      scale broadcasts matching llama.cpp's `vec_dot_q4_K_q8_1` design.
      Used for Q2_0/Q4K/Q6K decode GEMV (hot path). Feature flag: `oxide-gemv`.
+     **Two backends**: fork (`crates/rustc-codegen-cuda`, nightly-2026-04-03, has mma.sync)
+     and upstream (`cuda-oxide/crates/rustc-codegen-cuda`, nightly-2026-10-11, has dp4a).
+     dp4a kernels require upstream backend: `RUSTUP_TOOLCHAIN=nightly-2026-10-11`.
    Both coexist: oxide kernels auto-loaded from PTX when present, cuTile fallback.
 
 4. **Verification-first architecture — every property gets the strongest proof
@@ -161,12 +164,15 @@ Three-crate workspace + standalone verification crate:
 - [x] Fused GPU RMSNorm (no D→H→D for scale computation)
 - [x] On-device RoPE interleave kernel (cutile_interleave via MAP_SHAPE [1,BN])
 - [x] oxide GEMV kernels (rustc-codegen-cuda): Q2_0, Q4K v2, Q6K v2
-  - Q2_0: warp-per-neuron, butterfly shfl reduce, SMEM activation staging
-  - Q4K v2: shfl.sync.idx.b32 scale broadcast, 4-group unrolled nibbles (llama.cpp pattern)
+  - Q2_0: two-output-per-warp (half-warp XOR reduce), SMEM activation staging (Opt 2)
+  - Q4K v2: multi-warp K-parallelism (4 warps per neuron, smem cross-warp reduce) (Opt 8)
+  - Q4K q8: Q8_1 activation quantization + mini-warp dp4a (Opt 7, needs upstream backend)
   - Q6K v2: d broadcast via shfl, 8-step unrolled q_full
 - [x] Kani harnesses + Verus proofs for Q2_0/Q4K/Q6K block dequant bounds
 - [x] cuTile 0.4.0 upgrade (path deps to local fork); vec_width hint infrastructure
-- [x] Benchmark: Q2_0 Bonsai-1.7B 30 tok/s, Q4K Llama-3.1-8B 24 tok/s (gap: 7-9× vs llama.cpp)
+- [x] Benchmark: Q2_0 31 tok/s, Q4K 23-24 tok/s (gap: 6.7×/8.7× vs llama.cpp 209 tok/s)
+  - Root cause of Q4K gap: compute path (llama.cpp uses dp4a = 4× throughput)
+  - dp4a kernel infrastructure in place; next: add K-parallelism to dp4a kernel
 
 ## What's Next
 
