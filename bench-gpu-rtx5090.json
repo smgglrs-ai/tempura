@@ -1,0 +1,52 @@
+{
+  "timestamp": "2026-10-11T00:00:00Z",
+  "platform": "RTX 5090 (sm_120 Blackwell), 32 GB VRAM",
+  "kernel": "oxide hand-optimized (rustc-codegen-cuda)",
+  "note": "oxide kernels built with cargo oxide build from tools/oxide-gemv*/",
+  "models": [
+    {
+      "model": "Ternary-Bonsai-1.7B-Q2_0",
+      "format": "Q2_0",
+      "vram_mb": 763,
+      "decode_tok_s": 30,
+      "prefill_tok_s": 30,
+      "itl_p50_ms": 33.4,
+      "gap_vs_llamacpp": "7x",
+      "kernel": "q2_0_gemv_decode (warp-per-neuron, shfl reduce)"
+    },
+    {
+      "model": "Meta-Llama-3.1-8B-Instruct-Q4_K_M",
+      "format": "Q4K+Q6K",
+      "vram_mb": 17000,
+      "decode_tok_s": 24,
+      "prefill_tok_s": 7,
+      "itl_p50_ms": 41.5,
+      "gap_vs_llamacpp": "8.7x",
+      "kernel": "q4k_gemv_decode_v2 (shfl scale broadcast, 4-group unrolled)"
+    }
+  ],
+  "llamacpp_reference": {
+    "platform": "RTX 5090",
+    "decode_tok_s": 209,
+    "prefill_pp128_tok_s": 7335
+  },
+  "oxide_kernel_optimizations": {
+    "q2_0": [
+      "one warp (32 threads) per output neuron",
+      "lane l handles elements l, l+32, l+64, ... across K blocks",
+      "butterfly warp reduce via shfl.sync.bfly.b32",
+      "shared memory activation broadcast (staging)"
+    ],
+    "q4k_v2": [
+      "block-at-a-time outer loop",
+      "lane 0 broadcasts d, dmin via shfl.sync.idx.b32 (2 per block)",
+      "lanes 0-3 load packed scales, broadcast 8 values via shfl (8 per block)",
+      "4 j-groups fully unrolled, 2 nibble pairs per group per lane",
+      "PTX: 8 shfl scale broadcasts + 2 d/dmin broadcasts per K block"
+    ],
+    "q6k_v2": [
+      "lane 0 broadcasts d via shfl (d same across 256 elements per block)",
+      "8-step per block fully unrolled for ILP"
+    ]
+  }
+}
