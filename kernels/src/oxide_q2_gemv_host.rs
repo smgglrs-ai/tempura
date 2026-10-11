@@ -232,6 +232,10 @@ impl OxideQ2Gemv {
         let grid_x = n.div_ceil(WARPS_PER_BLOCK as usize) as u32;
         let cu_stream = self.stream.cu_stream();
 
+        // Dynamic shared memory: k * sizeof(f32) bytes to stage the activation
+        // tensor x into shared memory once per block (shared across all warps).
+        let shared_mem_bytes = (k_blocks * 128 * std::mem::size_of::<f32>()) as u32;
+
         // SAFETY: grid/block dims valid; device ptrs live for kernel duration;
         // param types match the PTX ABI (confirmed via PTX inspection of
         // tools/oxide-gemv/target/release/oxide-gemv).
@@ -240,7 +244,7 @@ impl OxideQ2Gemv {
                 self.cu_function,
                 (grid_x, 1, 1),
                 (BLOCK_DIM, 1, 1),
-                0, // no dynamic shared memory
+                shared_mem_bytes,
                 cu_stream,
                 &mut params,
             )
