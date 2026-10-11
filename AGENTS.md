@@ -61,9 +61,14 @@ Three-crate workspace + standalone verification crate:
    implementations exist for testing, Kani verification, and DualPipeline
    comparison — not as the production backend.
 
-3. **No cuda-oxide dependency yet.** It requires a custom rustc (`cargo oxide build`).
-   The crate structure is ready behind a feature flag. Phase 2 builds the verified
-   foundation; Phase 3 delivers GPU implementations.
+3. **cuda-oxide is the GPU production backend.** Two complementary paths:
+   - **cuTile JIT** — cuTile tile-DSL kernels compiled by tileiras at runtime.
+     Used for RMSNorm, RoPE, flash attention, elementwise ops, residual adds.
+   - **rustc-codegen-cuda (oxide)** — hand-optimized GEMV kernels compiled with
+     `cargo oxide build`, using warp-shuffle reductions and `shfl.sync.idx.b32`
+     scale broadcasts matching llama.cpp's `vec_dot_q4_K_q8_1` design.
+     Used for Q2_0/Q4K/Q6K decode GEMV (hot path). Feature flag: `oxide-gemv`.
+   Both coexist: oxide kernels auto-loaded from PTX when present, cuTile fallback.
 
 4. **Verification-first architecture — every property gets the strongest proof
    available.** New code without verification is incomplete code.
@@ -101,7 +106,7 @@ Three-crate workspace + standalone verification crate:
 - Rust edition 2021, resolver v2
 - No comments unless the WHY is non-obvious
 - Tests go in `#[cfg(test)] mod tests` at bottom of each file
-- Feature flags: `cpu` (default), `cuda` (future)
+- Feature flags: `cpu` (default), `cutile` (cuTile GPU kernels), `oxide-gemv` (hand-optimized oxide GEMV)
 - NEVER RUN MULTIPLE INSTANCES AT THE SAME TIME. CHECK AVAILABLE MEMORY.
 
 ## What's Implemented
@@ -141,7 +146,27 @@ Three-crate workspace + standalone verification crate:
 - [x] Prometheus metrics (TTFT, ITL, queue depth, KV usage), OpenTelemetry export
 - [x] HuggingFace config.json auto-loading, Dockerfile
 - [x] Inference traces, deterministic replay, DualPipeline comparison, batch-invariant verification
-- [x] 348 passing tests
+- [x] 540+ passing tests (CPU + GPU with cutile + oxide features)
+
+## What's Done (Phase 13: GPU Inference)
+
+- [x] cuTile GPU forward pass (CutileGpuModel) — all projection weights uploaded to GPU
+- [x] GPU-resident KV cache with D→D append (no PCIe per layer per token)
+- [x] GPU flash attention for decode (cutile_decode_attn — one warp per head)
+- [x] Q2_0, Q4K, Q6K quantized weights GPU-resident (packed u32 format, dequant on-the-fly)
+- [x] Full async pipeline (single stream.synchronize() per token)
+- [x] Pre-computed RoPE frequency table (no cos/sin H2D per call)
+- [x] Pre-allocated RMSNorm + RoPE scratch pools (no zeros alloc per layer)
+- [x] CUDA graph infrastructure (DecodeGraph, cuGraphExecUpdate_v2)
+- [x] Fused GPU RMSNorm (no D→H→D for scale computation)
+- [x] On-device RoPE interleave kernel (cutile_interleave via MAP_SHAPE [1,BN])
+- [x] oxide GEMV kernels (rustc-codegen-cuda): Q2_0, Q4K v2, Q6K v2
+  - Q2_0: warp-per-neuron, butterfly shfl reduce, SMEM activation staging
+  - Q4K v2: shfl.sync.idx.b32 scale broadcast, 4-group unrolled nibbles (llama.cpp pattern)
+  - Q6K v2: d broadcast via shfl, 8-step unrolled q_full
+- [x] Kani harnesses + Verus proofs for Q2_0/Q4K/Q6K block dequant bounds
+- [x] cuTile 0.4.0 upgrade (path deps to local fork); vec_width hint infrastructure
+- [x] Benchmark: Q2_0 Bonsai-1.7B 30 tok/s, Q4K Llama-3.1-8B 24 tok/s (gap: 7-9× vs llama.cpp)
 
 ## What's Next
 
@@ -238,11 +263,30 @@ export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codeg
 Build and benchmark GPU kernels:
 
 ```sh
-cd kernels && cargo oxide build                       # standalone kernel compile
-cd tests-gpu && cargo oxide build bench-q4k-e2e       # Q4K e2e benchmark
-cd tests-gpu && cargo oxide run --bin bench-q4k-e2e   # run benchmark
-cd tests-gpu && cargo oxide run --bin tempura-tests-gpu  # full GPU test suite
+# cuTile kernels (standard cargo build — JIT compiled at runtime)
+cargo build -p tempura-bench-gpu --release --bin bench-real-model
+
+# oxide hand-optimized GEMV kernels (require cargo oxide build)
+# Build all three oxide GEMV crates:
+for crate in oxide-gemv oxide-gemv-q4k oxide-gemv-q6k; do
+  cd tools/$crate && cargo oxide build && cd ../..
+done
+
+# Copy PTX to build output directories:
+for d in target/release/build/tempura-kernels-*/out; do
+  cp tools/oxide-gemv/oxide_gemv.ptx       $d/oxide_q2_gemv.ptx  2>/dev/null
+  cp tools/oxide-gemv-q4k/oxide_gemv_q4k.ptx $d/oxide_q4k_gemv.ptx 2>/dev/null
+  cp tools/oxide-gemv-q6k/oxide_gemv_q6k.ptx $d/oxide_q6k_gemv.ptx 2>/dev/null
+done
+
+# Benchmark (oxide-gemv feature already in tools/bench-gpu/Cargo.toml):
+cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
+  --bin bench-real-model -- /path/to/model.gguf
 ```
+
+Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
+- Bonsai-1.7B Q2_0: **30 tok/s decode** (7× gap vs llama.cpp 209 tok/s)
+- Llama-3.1-8B Q4K: **24 tok/s decode** (8.7× gap vs llama.cpp)
 
 If you see `Symbol cuda_device__mma_sync__... not found`, the backend is stale.
 Rebuild it from the fork and set `CUDA_OXIDE_BACKEND`.
