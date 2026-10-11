@@ -20,6 +20,11 @@
  *   2. Float4-vectorized global loads: x is staged via F32x4 128-bit wide
  *      loads (LDG.E.128), coalescing 4 f32 per transaction per thread.
  *      k = k_blocks * 128 is always divisible by 4, so no tail handling needed.
+ *   3. Two-output-per-warp: each 32-lane warp computes two adjacent output
+ *      neurons. Lanes 0-15 handle n_out_0, lanes 16-31 handle n_out_1.
+ *      Both halves share the same smem-staged x[], doubling arithmetic
+ *      intensity for the same memory bandwidth. Grid halves to
+ *      ceil(N / (2 * WARPS_PER_BLOCK)) blocks.
  */
 
 use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, thread, warp};
@@ -37,7 +42,7 @@ mod kernels {
 
     /// Q2_0 GEMV for M=1 decode: out[N] = dequant(packed[N, K_BLOCKS, 9]) × x[K].
     ///
-    /// Grid:  (ceil(N / WARPS_PER_BLOCK),) blocks — each warp owns one output neuron.
+    /// Grid:  (ceil(N / (2 * WARPS_PER_BLOCK)),) blocks — each warp owns TWO output neurons.
     /// Block: (WARPS_PER_BLOCK * 32,) threads.
     ///
     /// Dynamic shared memory: k * sizeof(f32) bytes per block.
@@ -49,6 +54,18 @@ mod kernels {
     ///   packed — Q2_0 packed u32 slice [N * K_BLOCKS * 9]
     ///   n      — number of output neurons
     ///   k_blocks — number of Q2_0 blocks per output row (K = k_blocks * 128)
+    /// Q2_0 GEMV for M=1 decode: two-output-per-warp variant.
+    ///
+    /// Each 32-lane warp computes TWO adjacent output neurons simultaneously:
+    ///   lanes  0-15 → n_out_0 = warp_slot * 2
+    ///   lanes 16-31 → n_out_1 = warp_slot * 2 + 1
+    ///
+    /// Both halves share the same smem-staged x[] read (Phase 1 unchanged),
+    /// then each half iterates independently over all K blocks with a 16-lane
+    /// inner loop (bit_pair = my_lane, word_idx 0..7), followed by a masked
+    /// 16-lane butterfly reduce.  Arithmetic intensity doubles vs. single-output.
+    ///
+    /// Grid:  (ceil(N / (2 * WARPS_PER_BLOCK)),) blocks.
     #[kernel]
     pub fn q2_0_gemv_decode(
         mut out: DisjointSlice<f32>,
@@ -61,7 +78,6 @@ mod kernels {
         let bid     = thread::blockIdx_x();
         let warp_id = tid / 32;
         let lane    = tid % 32;
-        let n_out   = bid * WARPS_PER_BLOCK + warp_id;
         let k = k_blocks * 128;
 
         // Phase 1: All BLOCK_DIM threads cooperatively stage x from global
@@ -90,49 +106,61 @@ mod kernels {
         // Barrier: all threads must finish writing smem before any warp reads.
         thread::sync_threads();
 
-        // Threads beyond the last output neuron participated in smem staging
+        // Two-output-per-warp split.
+        let my_half = lane / 16;  // 0 = lower half → n_out_0, 1 = upper half → n_out_1
+        let my_lane = lane % 16;  // 0-15 within half (= bit_pair position within each word)
+
+        let n_out_0 = (bid * WARPS_PER_BLOCK + warp_id) * 2;
+        let n_out_1 = n_out_0 + 1;
+
+        // Threads beyond the last warp slot participated in smem staging
         // but have no output to produce.
-        if n_out >= n {
+        if n_out_0 >= n {
             return;
         }
 
-        // Phase 2: Each warp accumulates one output neuron.
-        // Stride-32 loop: lane handles elem = lane, lane+32, lane+64, …
-        // Reads activation from shared memory (smem) instead of global x.
+        let my_n_out = if my_half == 0 { n_out_0 } else { n_out_1 };
+        // Masks and base-lane for masked shuffles within each 16-lane half.
+        let half_mask      = if my_half == 0 { 0x0000_FFFF_u32 } else { 0xFFFF_0000_u32 };
+        let half_base_lane = if my_half == 0 { 0_u32 } else { 16_u32 };
+
+        // Phase 2: Each half-warp accumulates one output neuron.
+        // Block-at-a-time loop; 16 lanes cover all 128 elements per block:
+        //   my_lane selects bit_pair (0-15), word_idx iterates 0..7 for the
+        //   8 packed u32 words → 8 elements per lane per block.
         let mut acc = 0.0_f32;
-        let mut elem = lane;
-        while elem < k {
-            let blk      = elem / 128;
-            let within   = elem % 128;
-            let word_idx = within / 16;
-            let bit_pair = within % 16;
+        let mut blk = 0u32;
+        while blk < k_blocks {
+            let base = (my_n_out * k_blocks + blk) * 9;
 
-            // Base of this block's 9-word packed region for output n_out.
-            let base = (n_out * k_blocks + blk) * 9;
+            // Scale broadcast: my_lane==0 of each half loads, all half-lanes receive.
+            let scale_raw = if my_lane == 0 { packed[base as usize] } else { 0 };
+            let scale = f32::from_bits(warp::shuffle_sync(half_mask, scale_raw, half_base_lane));
 
-            // Scale: packed[base] stored as raw f32 bits.
-            let scale = f32::from_bits(packed[base as usize]);
-
-            // 2-bit weight: extract from the packed word.
-            let w = packed[(base + 1 + word_idx) as usize];
-            let q_raw = (w >> (bit_pair * 2)) & 3;
-
-            // Dequantize: q ∈ {0,1,2,3} → weight ∈ {-1,0,1,2} × scale.
-            let q_f = (q_raw as i32 - 1) as f32;
-
-            // Read activation from shared memory (cached broadcast, no global traffic).
-            let xv = unsafe { *smem.add(elem as usize) };
-            acc += q_f * scale * xv;
-
-            elem += 32;
+            // Inner loop over 8 packed words; each lane extracts bit_pair = my_lane.
+            let mut word_idx = 0u32;
+            while word_idx < 8 {
+                let w = packed[(base + 1 + word_idx) as usize];
+                let q_raw = (w >> (my_lane * 2)) & 3;
+                let q_f = (q_raw as i32 - 1) as f32;
+                let elem = blk * 128 + word_idx * 16 + my_lane;
+                let xv = unsafe { *smem.add(elem as usize) };
+                acc += q_f * scale * xv;
+                word_idx += 1;
+            }
+            blk += 1;
         }
 
-        // Butterfly warp-reduce: all 32 lanes contribute; lane 0 gets the sum.
-        acc = warp::reduce_sum_f32(acc);
-        if lane == 0 {
-            // SAFETY: n_out < n (checked above); each warp has a unique n_out.
+        // Masked 16-lane butterfly reduce within each half.
+        acc += warp::shuffle_xor_f32_sync(half_mask, acc, 8);
+        acc += warp::shuffle_xor_f32_sync(half_mask, acc, 4);
+        acc += warp::shuffle_xor_f32_sync(half_mask, acc, 2);
+        acc += warp::shuffle_xor_f32_sync(half_mask, acc, 1);
+
+        // my_lane==0 of each half writes; guard n_out_1 for odd N.
+        if my_lane == 0 && my_n_out < n {
             unsafe {
-                *out.get_unchecked_mut(n_out as usize) = acc;
+                *out.get_unchecked_mut(my_n_out as usize) = acc;
             }
         }
     }
@@ -173,10 +201,11 @@ fn main() {
     // Load the module (PTX embedded via #[cuda_module]).
     let module = kernels::load(&ctx).expect("load oxide module");
 
-    // Grid: ceil(N / WARPS_PER_BLOCK) blocks; block: WARPS_PER_BLOCK*32 threads.
+    // Grid: ceil(N / (2 * WARPS_PER_BLOCK)) blocks (two outputs per warp);
+    // block: WARPS_PER_BLOCK*32 threads.
     // Dynamic shared memory: k * 4 bytes to stage the activation tensor.
     let wpb = WARPS_PER_BLOCK as usize;
-    let grid_x = (n + wpb - 1) / wpb;
+    let grid_x = (n + 2 * wpb - 1) / (2 * wpb);
     let shared_mem_bytes = (k * std::mem::size_of::<f32>()) as u32;
     let cfg = LaunchConfig {
         grid_dim:  (grid_x as u32, 1, 1),
