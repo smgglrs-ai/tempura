@@ -40,7 +40,7 @@ use std::sync::Arc;
 #[cfg(feature = "oxide-gemv")]
 static OXIDE_Q4K_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oxide_q4k_gemv.ptx"));
 
-const KERNEL_ENTRY: &str = "q4k_gemv_decode";
+const KERNEL_ENTRY: &str = "q4k_gemv_decode_v2";
 const WARPS_PER_BLOCK: u32 = 4;
 const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128
 
@@ -205,7 +205,7 @@ impl OxideQ4kGemv {
                 &mut params,
             )
         }
-        .map_err(|e| KernelError::InvalidConfig(format!("oxide q4k_gemv_decode: {e}")))?;
+        .map_err(|e| KernelError::InvalidConfig(format!("oxide q4k_gemv_decode_v2: {e}")))?;
 
         Ok(())
     }
