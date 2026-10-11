@@ -41,14 +41,20 @@ use std::sync::Arc;
 static OXIDE_Q4K_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oxide_q4k_gemv.ptx"));
 
 const KERNEL_ENTRY: &str = "q4k_gemv_decode_v2";
+const KERNEL_Q8_QUANTIZE: &str = "quantize_q8_1";
+const KERNEL_Q8_GEMV: &str = "q4k_gemv_decode_q8";
 const WARPS_PER_BLOCK: u32 = 4;
 const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128
 
 /// Launches the oxide-compiled Q4_K GEMV kernel for M=1 decode.
 pub struct OxideQ4kGemv {
-    cu_module:   CUmodule,
-    cu_function: CUfunction,
-    stream:      Arc<Stream>,
+    cu_module:      CUmodule,
+    cu_function:    CUfunction,
+    /// Optional Q8_1 quantize kernel (present after `cargo oxide build` with new kernels).
+    cu_q8_quantize: Option<CUfunction>,
+    /// Optional Q4K+Q8_1 GEMV kernel.
+    cu_q8_gemv:     Option<CUfunction>,
+    stream:         Arc<Stream>,
 }
 
 unsafe impl Send for OxideQ4kGemv {}
@@ -116,12 +122,26 @@ impl OxideQ4kGemv {
                 func.assume_init()
             };
 
+            // Opportunistically load the Q8_1 kernels — they are absent until the
+            // user rebuilds with `cargo oxide build` after adding the new kernels.
+            let load_fn = |name: &str| -> Option<CUfunction> {
+                let entry = CString::new(name).ok()?;
+                let mut func = std::mem::MaybeUninit::uninit();
+                let ret = unsafe {
+                    cuda_core::sys::cuModuleGetFunction(func.as_mut_ptr(), cu_module, entry.as_ptr())
+                };
+                if ret != CUDA_SUCCESS { None } else { Some(unsafe { func.assume_init() }) }
+            };
+            let cu_q8_quantize = load_fn(KERNEL_Q8_QUANTIZE);
+            let cu_q8_gemv     = load_fn(KERNEL_Q8_GEMV);
+
             eprintln!(
-                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={})",
+                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={})",
                 OXIDE_Q4K_PTX.len(),
-                KERNEL_ENTRY
+                KERNEL_ENTRY,
+                cu_q8_gemv.is_some(),
             );
-            Some(Self { cu_module, cu_function, stream })
+            Some(Self { cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, stream })
         }
     }
 
@@ -208,5 +228,126 @@ impl OxideQ4kGemv {
         .map_err(|e| KernelError::InvalidConfig(format!("oxide q4k_gemv_decode_v2: {e}")))?;
 
         Ok(())
+    }
+
+    /// Returns true when the Q8_1 quantize + integer GEMV path is compiled into the PTX.
+    pub fn has_q8_path(&self) -> bool {
+        self.cu_q8_quantize.is_some() && self.cu_q8_gemv.is_some()
+    }
+
+    /// Quantize `x` (f32 K-vector) → Q8_1 packed int8 + scales, then run Q4K GEMV.
+    ///
+    /// Allocates temporary Q8_1 buffers, chains two kernel launches on the stream,
+    /// syncs, and returns the output tensor.
+    pub fn forward_q8_d2d(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let (q8_quant_fn, q8_gemv_fn) = match (&self.cu_q8_quantize, &self.cu_q8_gemv) {
+            (Some(q), Some(g)) => (*q, *g),
+            _ => return Err(KernelError::InvalidConfig("Q8 kernels not loaded".into())),
+        };
+
+        let k = k_blocks * 256;  // total activation elements
+        let k_q8_blocks = k.div_ceil(32);  // number of Q8_1 blocks
+
+        // Temporary Q8_1 buffers: packed int8 (K/4 u32s) + scales (K/32 u32s).
+        let x_qs = api::zeros::<u32>(&[k / 4])
+            .sync_on(&self.stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let x_ds = api::zeros::<u32>(&[k_q8_blocks])
+            .sync_on(&self.stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let out = api::zeros::<f32>(&[n])
+            .sync_on(&self.stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let cu_stream = self.stream.cu_stream();
+
+        // ── Launch quantize_q8_1 ────────────────────────────────────────────
+        {
+            let qs_ptr:  u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len:  u64 = (k / 4) as u64;
+            let ds_ptr:  u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len:  u64 = k_q8_blocks as u64;
+            let x_ptr:   u64 = x.device_pointer().cu_deviceptr();
+            let x_len:   u64 = x.size() as u64;
+            let k_u32:   u32 = k as u32;
+
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr  as *const _ as *mut c_void,
+                &qs_len  as *const _ as *mut c_void,
+                &ds_ptr  as *const _ as *mut c_void,
+                &ds_len  as *const _ as *mut c_void,
+                &x_ptr   as *const _ as *mut c_void,
+                &x_len   as *const _ as *mut c_void,
+                &k_u32   as *const _ as *mut c_void,
+            ];
+
+            let grid_x = k_q8_blocks.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            unsafe {
+                launch_kernel(
+                    q8_quant_fn,
+                    (grid_x, 1, 1),
+                    (BLOCK_DIM, 1, 1),
+                    0,
+                    cu_stream,
+                    &mut params,
+                )
+            }
+            .map_err(|e| KernelError::InvalidConfig(format!("oxide quantize_q8_1: {e}")))?;
+        }
+
+        // ── Launch q4k_gemv_decode_q8 ───────────────────────────────────────
+        {
+            let out_ptr:  u64 = out.device_pointer().cu_deviceptr();
+            let out_len:  u64 = n as u64;
+            let qs_ptr:   u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len:   u64 = (k / 4) as u64;
+            let ds_ptr:   u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len:   u64 = k_q8_blocks as u64;
+            let pk_ptr:   u64 = packed.device_pointer().cu_deviceptr();
+            let pk_len:   u64 = packed.size() as u64;
+            let n_u32:    u32 = n as u32;
+            let kb_u32:   u32 = k_blocks as u32;
+
+            let mut params: [*mut c_void; 10] = [
+                &out_ptr as *const _ as *mut c_void,
+                &out_len as *const _ as *mut c_void,
+                &qs_ptr  as *const _ as *mut c_void,
+                &qs_len  as *const _ as *mut c_void,
+                &ds_ptr  as *const _ as *mut c_void,
+                &ds_len  as *const _ as *mut c_void,
+                &pk_ptr  as *const _ as *mut c_void,
+                &pk_len  as *const _ as *mut c_void,
+                &n_u32   as *const _ as *mut c_void,
+                &kb_u32  as *const _ as *mut c_void,
+            ];
+
+            let grid_x = n.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            unsafe {
+                launch_kernel(
+                    q8_gemv_fn,
+                    (grid_x, 1, 1),
+                    (BLOCK_DIM, 1, 1),
+                    0,
+                    cu_stream,
+                    &mut params,
+                )
+            }
+            .map_err(|e| KernelError::InvalidConfig(format!("oxide q4k_gemv_decode_q8: {e}")))?;
+        }
+
+        unsafe {
+            self.stream
+                .synchronize()
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        }
+
+        Ok(Arc::new(out))
     }
 }

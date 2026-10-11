@@ -1617,8 +1617,13 @@ impl CutileGpuModel {
         let a_flat = Arc::clone(a)
             .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::Q4K_BLOCK_SIZE)])
             .expect("gemm_q4k_d2d: reshape [1, stride] → [stride] failed");
-        // Prefer the oxide warp-shuffle kernel; fall back to cuTile.
+        // Prefer oxide with Q8_1 activation quantization (best perf), then v2, then cuTile.
         if let Some(oxide) = &self.oxide_q4k_gemv {
+            if oxide.has_q8_path() {
+                return oxide
+                    .forward_q8_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                    .expect("OxideQ4kGemv::forward_q8_d2d failed");
+            }
             return oxide
                 .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
                 .expect("OxideQ4kGemv::forward_d2d failed");
@@ -1841,6 +1846,11 @@ impl CutileGpuModel {
 
         // Use oxide kernel if available (preferred for M=1 decode).
         if let Some(oxide) = &self.oxide_q4k_gemv {
+            if oxide.has_q8_path() {
+                return oxide
+                    .forward_q8_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                    .expect("OxideQ4kGemv::forward_q8_d2d failed in gemm_q4k_d2d_slot");
+            }
             return oxide
                 .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
                 .expect("OxideQ4kGemv::forward_d2d failed in gemm_q4k_d2d_slot");
