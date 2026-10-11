@@ -188,16 +188,127 @@ Rebuild and benchmark. sm_120 has large register files; `WARPS_PER_BLOCK=2` may 
 
 ---
 
+## Optimization 7: Q8_1 activation quantization + dp4a (HIGH IMPACT — ~4× for Q4K)
+
+**Root cause of the 8.7× Q4K gap**: llama.cpp quantizes f32 activations to Q8_1 (int8, 32-element blocks with f16 scale) *on GPU before the GEMV*, then uses `__dp4a` (PTX `dp4a`): 4 int8 MACs in a single instruction. tempura does scalar f32 FMA, one element at a time.
+
+Two effects stack:
+- **4× instruction throughput**: dp4a vs f32 FMA
+- **3.6× less activation bandwidth**: Q8_1 is 36 bytes/32 elements vs 128 bytes as f32
+
+**Reference**: `ggml/src/ggml-cuda/vecdotq.cuh::vec_dot_q4_K_q8_1_impl_vmmq` (llama.cpp).
+
+**Fix**:
+1. Add an oxide `quantize_q8_1` kernel (f32 → int8 with per-32-element f16 scale):
+   ```rust
+   // tools/oxide-gemv-q4k/src/main.rs (or a new oxide-gemv-q8-quant crate)
+   #[kernel]
+   pub fn quantize_q8_1(
+       out_q8: *mut i8,       // [N_BLOCKS * 32] int8 quantized activations
+       out_scale: *mut u16,   // [N_BLOCKS] f16 scales
+       x: &[f32],             // [K] f32 activations
+       k: u32,
+   ) {
+       // Each warp quantizes 32 elements: find max abs, scale = max / 127, quant = round(x / scale)
+   }
+   ```
+2. Update `q4k_gemv_decode_v2` to accept `&[i8]` + `&[u16]` (Q8_1) instead of `&[f32]`:
+   ```rust
+   // Inner loop: replace f32 multiply with dp4a
+   // Pack 4 Q4K nibbles → i8 vector; pack 4 Q8_1 i8s → u32; call dp4a
+   let sumi = cuda_device::math::dp4a(q4k_i8x4, q8_i8x4, sumi);
+   // Final: scale sumi by d * sc * q8_scale - dmin * m * q8_scale
+   ```
+3. In `engine/src/cutile_gpu_forward.rs`: run `quantize_q8_1` on the activation vector before calling the oxide Q4K GEMV.
+
+**Expected impact**: Q4K 24 → ~100 tok/s (closing most of the 8.7× gap).
+
+---
+
+## Optimization 8: Multi-warp K-parallelism (HIGH IMPACT — ~1.5-2×)
+
+**Problem**: tempura assigns 1 warp → 1 output neuron, iterating all K blocks sequentially. llama.cpp assigns all 4 warps in a block to the **same single output neuron**, each covering a stride-4 subset of K blocks, then shared-memory reducing at the end. This exposes 4× more K-loop parallelism and hides memory latency.
+
+**Fix** in `tools/oxide-gemv-q4k/src/main.rs` (after Opt 7):
+
+```rust
+// All WARPS_PER_BLOCK warps cooperate on the SAME output neuron.
+// n_out = bid (one output neuron per block, not per warp).
+let n_out = thread::blockIdx_x();
+let warp_stride = WARPS_PER_BLOCK;  // each warp covers every 4th K block
+
+// Each warp handles a subset of K blocks:
+let mut blk = warp_id;
+while blk < k_blocks {
+    // ... accumulate partial sum for blocks blk, blk+4, blk+8, ...
+    blk += warp_stride;
+}
+
+// Intra-warp reduce (existing butterfly), then cross-warp reduce via smem:
+let smem_partial: *mut f32 = DynamicSharedArray::<f32>::get();
+if lane == 0 { *smem_partial.add(warp_id as usize) = acc; }
+thread::sync_threads();
+if warp_id == 0 && lane < WARPS_PER_BLOCK {
+    // Warp 0 lane 0..3 reads partial sums and reduces
+    acc = *smem_partial.add(lane as usize);
+    acc = warp::reduce_sum_f32(acc);  // reduce across 4 lanes
+}
+```
+
+Grid becomes `N` blocks (one per output neuron, up from `ceil(N/WARPS_PER_BLOCK)`).
+
+**Expected impact**: ~1.5-2× on top of Opt 7 → ~150-200 tok/s.
+
+---
+
+## Optimization 9: Fused gate+up SwiGLU (MEDIUM IMPACT — ~1.3× for FFN layers)
+
+**Problem**: For FFN layers, gate_proj and up_proj are both Q4K. tempura launches two separate GEMV kernels and re-reads activations twice. llama.cpp's kernel accepts an optional `gate` weight tensor and applies `silu(gate) * up` in the epilogue.
+
+**Fix**: Extend `q4k_gemv_decode_v2` with a `gate_packed` optional parameter:
+```rust
+#[kernel]
+pub fn q4k_gemv_decode_v2_silu(
+    mut out: DisjointSlice<f32>,
+    x_q8: &[i8], x_scale: &[u16],
+    packed_up: &[u32],    // up projection weights
+    packed_gate: &[u32],  // gate projection weights (same shape)
+    n: u32, k_blocks: u32,
+) {
+    // Compute both up and gate dot products simultaneously.
+    // Epilogue: out[n_out] = up_result * silu(gate_result)
+}
+```
+
+In the engine: replace the two separate gate + up GEMV calls with a single fused call. Requires the gate and up projections to be both Q4K (true for Llama-3.1-8B).
+
+**Expected impact**: ~1.3× for FFN layers (7/13 GEMVs per layer for Llama), ~1.1× overall.
+
+---
+
+## Status (2026-10-11)
+
+| Opt | Description | Status | Impact |
+|-----|-------------|--------|--------|
+| 1 | Raw bytes on GPU | Attempted, reverted (not bandwidth-bound) | — |
+| 2 | Two-output warp Q2_0 | **Done** | +1 tok/s (30→31) |
+| 3 | Float4 nibble reads | Deferred (needs loop restructure) | — |
+| 4 | Q4K prefill GEMM | Pending | HIGH |
+| 5 | Device-side kv_len | Pending (complex refactor) | LOW |
+| 6 | Occupancy tuning | Pending | LOW |
+| 7 | Q8_1 activation + dp4a | **Next** | ~4× |
+| 8 | Multi-warp K-parallelism | After Opt 7 | ~1.5-2× |
+| 9 | Fused gate+up SwiGLU | After Opt 8 | ~1.3× |
+
 ## Implementation priority
 
-1. **Raw bytes on GPU** (Opt 1) — biggest VRAM savings, straightforward to implement
-2. **Two-output warp** (Opt 2) — 2× arithmetic intensity, pure kernel change
-3. **Q4K prefill GEMM** (Opt 4) — closes the massive prefill gap
-4. **Float4 nibbles** (Opt 3) — bandwidth optimization for Q4K
-5. **Device kv_len** (Opt 5) — enables true single-capture CUDA graphs
-6. **Occupancy tuning** (Opt 6) — quick experiment, 10 minutes
+1. **Q8_1 + dp4a** (Opt 7) — closes most of the 8.7× Q4K gap, direct translation from llama.cpp
+2. **Multi-warp K-parallelism** (Opt 8) — 4× K-loop parallelism on top of Opt 7
+3. **Fused SwiGLU** (Opt 9) — FFN layer speedup
+4. **Q4K prefill GEMM** (Opt 4) — closes the massive prefill gap
+5. **Occupancy tuning** (Opt 6) — quick experiment, 10 minutes
 
-Implementing Opts 1-3 together should push Q4K Llama-3.1-8B from 24 → 60+ tok/s, reducing the gap to ~3× vs llama.cpp.
+Implementing Opts 7-8 should push Q4K Llama-3.1-8B from 24 → 150+ tok/s, closing the gap to ~1.4× vs llama.cpp decode.
 
 ---
 
