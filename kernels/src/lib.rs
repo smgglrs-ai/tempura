@@ -29,6 +29,10 @@ pub mod cutile_quantized_gemm;
 #[cfg(feature = "cutile")]
 pub mod oxide_q2_gemv_host;
 #[cfg(feature = "cutile")]
+pub mod oxide_q4k_gemv_host;
+#[cfg(feature = "cutile")]
+pub mod oxide_q6k_gemv_host;
+#[cfg(feature = "cutile")]
 pub mod cutile_rmsnorm;
 #[cfg(feature = "cutile")]
 pub mod cutile_rope;

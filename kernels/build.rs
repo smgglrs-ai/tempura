@@ -90,6 +90,8 @@ fn main() {
     // `None` when the PTX is absent, and the cuTile kernel is used as fallback.
     if std::env::var("CARGO_FEATURE_OXIDE_GEMV").is_ok() {
         build_oxide_q2_gemv(&out_dir);
+        build_oxide_q4k_gemv(&out_dir);
+        build_oxide_q6k_gemv(&out_dir);
     }
 }
 
@@ -202,6 +204,212 @@ sys.stdout.buffer.write(data[ptx_start:ptx_end])
         }
         Err(e) => {
             eprintln!("build.rs: python3 not available ({e}); oxide kernel disabled");
+        }
+    }
+}
+
+fn build_oxide_q4k_gemv(out_dir: &str) {
+    use std::process::Command;
+    use std::path::Path;
+
+    let oxide_crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("tools/oxide-gemv-q4k");
+
+    let ptx_path = Path::new(out_dir).join("oxide_q4k_gemv.ptx");
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        oxide_crate_dir.join("src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        oxide_crate_dir.join("Cargo.toml").display()
+    );
+
+    let oxide_binary = oxide_crate_dir.join("target/release/oxide-gemv-q4k");
+
+    if !oxide_binary.exists() {
+        eprintln!("build.rs: running `cargo oxide build` for oxide_q4k_gemv kernel…");
+        let status = Command::new("cargo")
+            .arg("oxide")
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(oxide_crate_dir.join("Cargo.toml"))
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!(
+                    "build.rs: `cargo oxide build` for Q4K failed (exit {:?}); \
+                     oxide Q4_K GEMV kernel disabled",
+                    s.code()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "build.rs: failed to invoke `cargo oxide build` for Q4K ({e}); \
+                     oxide Q4_K GEMV kernel disabled"
+                );
+                return;
+            }
+        }
+    }
+
+    if !oxide_binary.exists() {
+        eprintln!("build.rs: oxide-gemv-q4k binary not found after build; Q4K kernel disabled");
+        return;
+    }
+
+    let extract_script = r#"
+import sys
+
+with open(sys.argv[1], 'rb') as f:
+    data = f.read()
+
+tag = b'oxide_gemv_q4k.ptx\x00'
+idx = data.find(tag)
+if idx == -1:
+    print('PTX tag not found in binary', file=sys.stderr)
+    sys.exit(1)
+
+ptx_start = idx + len(tag)
+ptx_end = ptx_start
+while ptx_end < len(data) and data[ptx_end] != 0:
+    ptx_end += 1
+
+sys.stdout.buffer.write(data[ptx_start:ptx_end])
+"#;
+
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(extract_script)
+        .arg(oxide_binary.to_str().unwrap())
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() && !out.stdout.is_empty() => {
+            std::fs::write(&ptx_path, &out.stdout).unwrap();
+            eprintln!(
+                "build.rs: oxide Q4K PTX extracted → {} ({} bytes)",
+                ptx_path.display(),
+                out.stdout.len()
+            );
+        }
+        Ok(out) => {
+            eprintln!(
+                "build.rs: Q4K PTX extraction failed; stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Err(e) => {
+            eprintln!("build.rs: python3 not available ({e}); Q4K oxide kernel disabled");
+        }
+    }
+}
+
+fn build_oxide_q6k_gemv(out_dir: &str) {
+    use std::process::Command;
+    use std::path::Path;
+
+    let oxide_crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("tools/oxide-gemv-q6k");
+
+    let ptx_path = Path::new(out_dir).join("oxide_q6k_gemv.ptx");
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        oxide_crate_dir.join("src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        oxide_crate_dir.join("Cargo.toml").display()
+    );
+
+    let oxide_binary = oxide_crate_dir.join("target/release/oxide-gemv-q6k");
+
+    if !oxide_binary.exists() {
+        eprintln!("build.rs: running `cargo oxide build` for oxide_q6k_gemv kernel…");
+        let status = Command::new("cargo")
+            .arg("oxide")
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(oxide_crate_dir.join("Cargo.toml"))
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!(
+                    "build.rs: `cargo oxide build` for Q6K failed (exit {:?}); \
+                     oxide Q6_K GEMV kernel disabled",
+                    s.code()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "build.rs: failed to invoke `cargo oxide build` for Q6K ({e}); \
+                     oxide Q6_K GEMV kernel disabled"
+                );
+                return;
+            }
+        }
+    }
+
+    if !oxide_binary.exists() {
+        eprintln!("build.rs: oxide-gemv-q6k binary not found after build; Q6K kernel disabled");
+        return;
+    }
+
+    let extract_script = r#"
+import sys
+
+with open(sys.argv[1], 'rb') as f:
+    data = f.read()
+
+tag = b'oxide_gemv_q6k.ptx\x00'
+idx = data.find(tag)
+if idx == -1:
+    print('PTX tag not found in binary', file=sys.stderr)
+    sys.exit(1)
+
+ptx_start = idx + len(tag)
+ptx_end = ptx_start
+while ptx_end < len(data) and data[ptx_end] != 0:
+    ptx_end += 1
+
+sys.stdout.buffer.write(data[ptx_start:ptx_end])
+"#;
+
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(extract_script)
+        .arg(oxide_binary.to_str().unwrap())
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() && !out.stdout.is_empty() => {
+            std::fs::write(&ptx_path, &out.stdout).unwrap();
+            eprintln!(
+                "build.rs: oxide Q6K PTX extracted → {} ({} bytes)",
+                ptx_path.display(),
+                out.stdout.len()
+            );
+        }
+        Ok(out) => {
+            eprintln!(
+                "build.rs: Q6K PTX extraction failed; stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Err(e) => {
+            eprintln!("build.rs: python3 not available ({e}); Q6K oxide kernel disabled");
         }
     }
 }

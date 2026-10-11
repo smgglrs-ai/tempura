@@ -35,6 +35,8 @@ use tempura_kernels::cutile_quantized_gemm::{
     Q4K_PACKED_U32S, Q6K_PACKED_U32S, Q6K_QK,
 };
 use tempura_kernels::oxide_q2_gemv_host::OxideQ2Gemv;
+use tempura_kernels::oxide_q4k_gemv_host::OxideQ4kGemv;
+use tempura_kernels::oxide_q6k_gemv_host::OxideQ6kGemv;
 use tempura_kernels::{Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE};
 use tempura_kernels::cutile_rmsnorm::{CutileRmsNorm, RmsnormScratch};
 use tempura_kernels::cutile_rope::{CutileRoPE, RopeScratch};
@@ -227,6 +229,10 @@ pub struct CutileGpuModel {
     /// `None` when the `oxide-gemv` feature was not compiled in or when the
     /// oxide build step failed; falls back to `q2_gemv` (cuTile) in that case.
     oxide_q2_gemv: Option<OxideQ2Gemv>,
+    /// Hand-optimized oxide Q4_K GEMV kernel (replaces cuTile for M=1 decode).
+    oxide_q4k_gemv: Option<OxideQ4kGemv>,
+    /// Hand-optimized oxide Q6_K GEMV kernel (replaces cuTile for M=1 decode).
+    oxide_q6k_gemv: Option<OxideQ6kGemv>,
     /// Q6_K on-GPU GEMV dispatcher — shares the same CUDA stream as `matmul`.
     q6k_gemv: CutileQ6kGemv,
     flash_attn: CutileFlashAttention,
@@ -836,8 +842,10 @@ impl CutileGpuModel {
         let mut cutile_rope = CutileRoPE::new()?;
         let cutile_elementwise = CutileElementwise::new()?;
 
-        // Attempt to load the oxide-compiled Q2_0 GEMV kernel.
+        // Attempt to load the oxide-compiled Q2_0, Q4_K, and Q6_K GEMV kernels.
         let oxide_q2_gemv = OxideQ2Gemv::try_load(matmul.stream().clone());
+        let oxide_q4k_gemv = OxideQ4kGemv::try_load(matmul.stream().clone());
+        let oxide_q6k_gemv = OxideQ6kGemv::try_load(matmul.stream().clone());
 
         let q4k_count = dw_q4k.len();
         let q6k_count = dw_q6k.len();
@@ -910,6 +918,8 @@ impl CutileGpuModel {
             q2_gemv,
             q6k_gemv,
             oxide_q2_gemv,
+            oxide_q4k_gemv,
+            oxide_q6k_gemv,
             flash_attn,
             cutile_rmsnorm,
             cutile_rope,
@@ -1008,8 +1018,10 @@ impl CutileGpuModel {
         let mut cutile_rope = CutileRoPE::new()?;
         let cutile_elementwise = CutileElementwise::new()?;
 
-        // Attempt to load the oxide-compiled Q2_0 GEMV kernel.
+        // Attempt to load the oxide-compiled Q2_0, Q4_K, and Q6_K GEMV kernels.
         let oxide_q2_gemv = OxideQ2Gemv::try_load(matmul.stream().clone());
+        let oxide_q4k_gemv = OxideQ4kGemv::try_load(matmul.stream().clone());
+        let oxide_q6k_gemv = OxideQ6kGemv::try_load(matmul.stream().clone());
 
         // Pre-compute the full RoPE frequency table on the GPU once.
         cutile_rope.precompute_table(
@@ -1066,6 +1078,8 @@ impl CutileGpuModel {
             q2_gemv,
             q6k_gemv,
             oxide_q2_gemv,
+            oxide_q4k_gemv,
+            oxide_q6k_gemv,
             flash_attn,
             cutile_rmsnorm,
             cutile_rope,
@@ -1572,6 +1586,12 @@ impl CutileGpuModel {
         let a_flat = Arc::clone(a)
             .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::cutile_quantized_gemm::Q6K_QK)])
             .expect("gemm_q6k_d2d: reshape [1, stride] → [stride] failed");
+        // Prefer the oxide warp-shuffle kernel; fall back to cuTile.
+        if let Some(oxide) = &self.oxide_q6k_gemv {
+            return oxide
+                .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                .expect("OxideQ6kGemv::forward_d2d failed");
+        }
         self.q6k_gemv
             .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
             .expect("CutileGpuModel::gemm_q6k_d2d failed")
@@ -1597,6 +1617,12 @@ impl CutileGpuModel {
         let a_flat = Arc::clone(a)
             .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::Q4K_BLOCK_SIZE)])
             .expect("gemm_q4k_d2d: reshape [1, stride] → [stride] failed");
+        // Prefer the oxide warp-shuffle kernel; fall back to cuTile.
+        if let Some(oxide) = &self.oxide_q4k_gemv {
+            return oxide
+                .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                .expect("OxideQ4kGemv::forward_d2d failed");
+        }
         self.q4k_gemv
             .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
             .expect("CutileGpuModel::gemm_q4k_d2d failed")
@@ -1724,13 +1750,27 @@ impl CutileGpuModel {
         };
 
         if let Some(tensor) = maybe_tensor {
-            if let Ok(result) = unsafe {
+            if let Some(oxide) = &self.oxide_q6k_gemv {
+                if let Ok(result) = unsafe {
+                    oxide.submit_d2d_into(&a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks)
+                } {
+                    self.scratch.borrow_mut()[slot] = Some(result.clone());
+                    return result;
+                }
+            } else if let Ok(result) = unsafe {
                 self.q6k_gemv
                     .submit_d2d_into(&a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks)
             } {
                 self.scratch.borrow_mut()[slot] = Some(result.clone());
                 return result;
             }
+        }
+
+        // Use oxide kernel if available (preferred for M=1 decode).
+        if let Some(oxide) = &self.oxide_q6k_gemv {
+            return oxide
+                .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                .expect("OxideQ6kGemv::forward_d2d failed in gemm_q6k_d2d_slot");
         }
 
         if dw.n % BN_GEMV == 0 {
@@ -1783,13 +1823,27 @@ impl CutileGpuModel {
         };
 
         if let Some(tensor) = maybe_tensor {
-            if let Ok(result) = unsafe {
+            if let Some(oxide) = &self.oxide_q4k_gemv {
+                if let Ok(result) = unsafe {
+                    oxide.submit_d2d_into(&a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks)
+                } {
+                    self.scratch.borrow_mut()[slot] = Some(result.clone());
+                    return result;
+                }
+            } else if let Ok(result) = unsafe {
                 self.q4k_gemv
                     .submit_d2d_into(&a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks)
             } {
                 self.scratch.borrow_mut()[slot] = Some(result.clone());
                 return result;
             }
+        }
+
+        // Use oxide kernel if available (preferred for M=1 decode).
+        if let Some(oxide) = &self.oxide_q4k_gemv {
+            return oxide
+                .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                .expect("OxideQ4kGemv::forward_d2d failed in gemm_q4k_d2d_slot");
         }
 
         if dw.n % BN_GEMV == 0 {
