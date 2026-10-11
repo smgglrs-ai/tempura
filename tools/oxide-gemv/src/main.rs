@@ -11,14 +11,25 @@
  *   dequant:  q_raw = ((word >> (bit_pair*2)) & 3)
  *             weight = (q_raw as i32 - 1) as f32 * scale
  *             values: {-1, 0, 1, 2} × scale
+ *
+ * Optimizations over the scalar baseline:
+ *   1. Shared memory staging for x: all WARPS_PER_BLOCK warps in a block
+ *      compute different output neurons but read the SAME activation x.
+ *      Staging x once into shared memory (K global reads total per block,
+ *      vs K × WARPS_PER_BLOCK without smem) reduces global memory pressure.
+ *   2. Float4-vectorized global loads: x is staged via F32x4 128-bit wide
+ *      loads (LDG.E.128), coalescing 4 f32 per transaction per thread.
+ *      k = k_blocks * 128 is always divisible by 4, so no tail handling needed.
  */
 
-use cuda_device::{DisjointSlice, kernel, thread, warp};
+use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, thread, warp};
+use cuda_device::vector::F32x4;
 use cuda_host::cuda_module;
 use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_core::simt::LaunchConfig;
 
 const WARPS_PER_BLOCK: u32 = 4;
+const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128 threads per block
 
 #[cuda_module]
 mod kernels {
@@ -28,6 +39,9 @@ mod kernels {
     ///
     /// Grid:  (ceil(N / WARPS_PER_BLOCK),) blocks — each warp owns one output neuron.
     /// Block: (WARPS_PER_BLOCK * 32,) threads.
+    ///
+    /// Dynamic shared memory: k * sizeof(f32) bytes per block.
+    /// Set shared_mem_bytes = k_blocks * 128 * 4 in LaunchConfig.
     ///
     /// Parameters:
     ///   out    — output f32 slice [N] (DisjointSlice — aliasing-free)
@@ -48,15 +62,44 @@ mod kernels {
         let warp_id = tid / 32;
         let lane    = tid % 32;
         let n_out   = bid * WARPS_PER_BLOCK + warp_id;
+        let k = k_blocks * 128;
 
+        // Phase 1: All BLOCK_DIM threads cooperatively stage x from global
+        // memory into shared memory using 128-bit vectorized loads (F32x4).
+        //
+        // k is always divisible by 4 (k = k_blocks * 128, 128/4 = 32).
+        // Each thread loads k / (4 * BLOCK_DIM) = k / 512 F32x4 vectors.
+        // For k=2048: each thread loads 4 vectors (16 f32 elements).
+        //
+        // Using raw *const F32x4 and *mut F32x4 pointers ensures the load
+        // and store are NOT decomposed into lanes before use, which is the
+        // condition for the compiler to emit LDG.E.128 + STS.E.128 (128-bit
+        // wide transactions) rather than four scalar accesses.
+        let smem: *mut f32 = DynamicSharedArray::<f32>::get();
+        unsafe {
+            let x_v4    = x.as_ptr() as *const F32x4;
+            let smem_v4 = smem       as *mut   F32x4;
+            let num_v4  = k / 4;
+            let mut vi  = tid;
+            while vi < num_v4 {
+                *smem_v4.add(vi as usize) = *x_v4.add(vi as usize);
+                vi += BLOCK_DIM;
+            }
+        }
+
+        // Barrier: all threads must finish writing smem before any warp reads.
+        thread::sync_threads();
+
+        // Threads beyond the last output neuron participated in smem staging
+        // but have no output to produce.
         if n_out >= n {
             return;
         }
 
-        let mut acc = 0.0_f32;
-        let k = k_blocks * 128;
-
+        // Phase 2: Each warp accumulates one output neuron.
         // Stride-32 loop: lane handles elem = lane, lane+32, lane+64, …
+        // Reads activation from shared memory (smem) instead of global x.
+        let mut acc = 0.0_f32;
         let mut elem = lane;
         while elem < k {
             let blk      = elem / 128;
@@ -77,7 +120,8 @@ mod kernels {
             // Dequantize: q ∈ {0,1,2,3} → weight ∈ {-1,0,1,2} × scale.
             let q_f = (q_raw as i32 - 1) as f32;
 
-            let xv = x[elem as usize];
+            // Read activation from shared memory (cached broadcast, no global traffic).
+            let xv = unsafe { *smem.add(elem as usize) };
             acc += q_f * scale * xv;
 
             elem += 32;
@@ -130,12 +174,14 @@ fn main() {
     let module = kernels::load(&ctx).expect("load oxide module");
 
     // Grid: ceil(N / WARPS_PER_BLOCK) blocks; block: WARPS_PER_BLOCK*32 threads.
+    // Dynamic shared memory: k * 4 bytes to stage the activation tensor.
     let wpb = WARPS_PER_BLOCK as usize;
     let grid_x = (n + wpb - 1) / wpb;
+    let shared_mem_bytes = (k * std::mem::size_of::<f32>()) as u32;
     let cfg = LaunchConfig {
         grid_dim:  (grid_x as u32, 1, 1),
-        block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
-        shared_mem_bytes: 0,
+        block_dim: (BLOCK_DIM, 1, 1),
+        shared_mem_bytes,
     };
 
     // Test 1: q=1 → dequant=0 → all outputs should be 0.
