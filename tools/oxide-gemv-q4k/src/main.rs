@@ -33,8 +33,6 @@
  */
 
 use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, thread, warp};
-#[allow(unused_imports)]
-use cuda_device::dotprod::dp4a_s32;
 use cuda_host::cuda_module;
 use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_core::simt::LaunchConfig;
@@ -433,11 +431,8 @@ mod kernels {
                 let nibble_lo = (qs_byte & 0xF) as u32;
                 let nibble_hi = ((qs_byte >> 4) & 0xF) as u32;
 
-                // dp4a: pack nibble (unsigned, 0..15 fits i8) and q8 into bytes 0,1.
-                // v = nibble | 0 | 0 | 0  ;  u = q8 | 0 | 0 | 0
-                // dp4a_s32(v, u, 0) = nibble * q8  (bytes 1,2,3 contribute 0)
-                let dot_lo = dp4a_s32(nibble_lo, (q8_raw_lo as u32) & 0xFF, 0);
-                let dot_hi = dp4a_s32(nibble_hi, (q8_raw_hi as u32) & 0xFF, 0);
+                let dot_lo = (nibble_lo as i32) * (q8_raw_lo as i32);
+                let dot_hi = (nibble_hi as i32) * (q8_raw_hi as i32);
 
                 acc += d8_lo * (d * sc_lo * (dot_lo as f32) - dmin * m_lo * (q8_raw_lo as f32))
                      + d8_hi * (d * sc_hi * (dot_hi as f32) - dmin * m_hi * (q8_raw_hi as f32));
@@ -467,8 +462,8 @@ mod kernels {
                 let nibble_lo = (qs_byte & 0xF) as u32;
                 let nibble_hi = ((qs_byte >> 4) & 0xF) as u32;
 
-                let dot_lo = dp4a_s32(nibble_lo, (q8_raw_lo as u32) & 0xFF, 0);
-                let dot_hi = dp4a_s32(nibble_hi, (q8_raw_hi as u32) & 0xFF, 0);
+                let dot_lo = (nibble_lo as i32) * (q8_raw_lo as i32);
+                let dot_hi = (nibble_hi as i32) * (q8_raw_hi as i32);
 
                 acc += d8_lo * (d * sc_lo * (dot_lo as f32) - dmin * m_lo * (q8_raw_lo as f32))
                      + d8_hi * (d * sc_hi * (dot_hi as f32) - dmin * m_hi * (q8_raw_hi as f32));
@@ -498,8 +493,8 @@ mod kernels {
                 let nibble_lo = (qs_byte & 0xF) as u32;
                 let nibble_hi = ((qs_byte >> 4) & 0xF) as u32;
 
-                let dot_lo = dp4a_s32(nibble_lo, (q8_raw_lo as u32) & 0xFF, 0);
-                let dot_hi = dp4a_s32(nibble_hi, (q8_raw_hi as u32) & 0xFF, 0);
+                let dot_lo = (nibble_lo as i32) * (q8_raw_lo as i32);
+                let dot_hi = (nibble_hi as i32) * (q8_raw_hi as i32);
 
                 acc += d8_lo * (d * sc_lo * (dot_lo as f32) - dmin * m_lo * (q8_raw_lo as f32))
                      + d8_hi * (d * sc_hi * (dot_hi as f32) - dmin * m_hi * (q8_raw_hi as f32));
@@ -529,8 +524,8 @@ mod kernels {
                 let nibble_lo = (qs_byte & 0xF) as u32;
                 let nibble_hi = ((qs_byte >> 4) & 0xF) as u32;
 
-                let dot_lo = dp4a_s32(nibble_lo, (q8_raw_lo as u32) & 0xFF, 0);
-                let dot_hi = dp4a_s32(nibble_hi, (q8_raw_hi as u32) & 0xFF, 0);
+                let dot_lo = (nibble_lo as i32) * (q8_raw_lo as i32);
+                let dot_hi = (nibble_hi as i32) * (q8_raw_hi as i32);
 
                 acc += d8_lo * (d * sc_lo * (dot_lo as f32) - dmin * m_lo * (q8_raw_lo as f32))
                      + d8_hi * (d * sc_hi * (dot_hi as f32) - dmin * m_hi * (q8_raw_hi as f32));
