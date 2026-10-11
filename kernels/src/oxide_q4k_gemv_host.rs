@@ -212,7 +212,9 @@ impl OxideQ4kGemv {
             &k_blocks_u32 as *const _ as *mut c_void,
         ];
 
-        let grid_x = n.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+        // Multi-warp: one block per output neuron. All WARPS_PER_BLOCK warps in a
+        // block cooperate on the same neuron, each covering K/WARPS_PER_BLOCK blocks.
+        let grid_x = n as u32;
         let cu_stream = self.stream.cu_stream();
 
         unsafe {
@@ -220,7 +222,7 @@ impl OxideQ4kGemv {
                 self.cu_function,
                 (grid_x, 1, 1),
                 (BLOCK_DIM, 1, 1),
-                0,
+                WARPS_PER_BLOCK * 4,  // shared memory for cross-warp reduce (4 f32 slots)
                 cu_stream,
                 &mut params,
             )
@@ -328,13 +330,13 @@ impl OxideQ4kGemv {
                 &kb_u32  as *const _ as *mut c_void,
             ];
 
-            let grid_x = n.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            let grid_x = n as u32;  // one block per output neuron (multi-warp)
             unsafe {
                 launch_kernel(
                     q8_gemv_fn,
                     (grid_x, 1, 1),
                     (BLOCK_DIM, 1, 1),
-                    0,
+                    WARPS_PER_BLOCK * 4,  // shared memory for cross-warp reduce
                     cu_stream,
                     &mut params,
                 )
