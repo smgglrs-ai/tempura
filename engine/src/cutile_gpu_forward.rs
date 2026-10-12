@@ -2573,12 +2573,11 @@ impl CutileGpuModel {
         // Preconditions:
         //   • seq_len == 1 — decode mode
         //   • gpu_kv_cache.has_device_kv() — GPU flash-attention is active
-        //   • inter_pad == inter && h_pad == h — power-of-2 shapes (all JIT variants pre-compiled)
         //   • !cfg.use_alibi — RoPE path
+        // inter_pad/h_pad padding is handled via D→D copy (capturable), so the
+        // graph path works for non-power-of-2 shapes like Llama-3.1-8B (inter=14336).
         if seq_len == 1
             && gpu_kv_cache.has_device_kv()
-            && self.inter_pad == inter
-            && self.h_pad == h
             && !cfg.use_alibi
         {
             // The host KV mirror may be stale; we only rebuild it when transitioning
