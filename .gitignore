@@ -1,5 +1,6 @@
 /target
 tests-gpu/target/
+tools/*/target/
 *.ll
 .playwright-mcp/
 docs/public/
