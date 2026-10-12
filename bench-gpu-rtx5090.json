@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-11T00:00:00Z",
+  "timestamp": "2026-10-12T00:00:00Z",
   "platform": "RTX 5090 (sm_120 Blackwell), 32 GB VRAM",
   "kernel": "oxide hand-optimized (rustc-codegen-cuda)",
   "note": "oxide kernels built with cargo oxide build from tools/oxide-gemv*/",
@@ -8,21 +8,21 @@
       "model": "Ternary-Bonsai-1.7B-Q2_0",
       "format": "Q2_0",
       "vram_mb": 763,
-      "decode_tok_s": 30,
-      "prefill_tok_s": 30,
-      "itl_p50_ms": 33.4,
-      "gap_vs_llamacpp": "7x",
-      "kernel": "q2_0_gemv_decode (warp-per-neuron, shfl reduce)"
+      "decode_tok_s": 31,
+      "prefill_tok_s": 32,
+      "itl_p50_ms": 32.2,
+      "gap_vs_llamacpp": "6.7x",
+      "kernel": "q2_0_gemv_decode_two_out (two-output-per-warp, half-warp XOR reduce, SMEM activation staging)"
     },
     {
       "model": "Meta-Llama-3.1-8B-Instruct-Q4_K_M",
       "format": "Q4K+Q6K",
       "vram_mb": 17000,
       "decode_tok_s": 24,
-      "prefill_tok_s": 7,
+      "prefill_tok_s": 6,
       "itl_p50_ms": 41.5,
       "gap_vs_llamacpp": "8.7x",
-      "kernel": "q4k_gemv_decode_v2 (shfl scale broadcast, 4-group unrolled)"
+      "kernel": "q4k_gemv_decode_v2 (multi-warp K-parallelism + CUDA graph)"
     }
   ],
   "llamacpp_reference": {
@@ -30,23 +30,49 @@
     "decode_tok_s": 209,
     "prefill_pp128_tok_s": 7335
   },
+  "bottleneck_analysis": {
+    "q4k_bandwidth_ceiling_tok_s": 456,
+    "q4k_actual_bw_pct": "5-6%",
+    "q4k_weight_data_per_token_gb": 3.93,
+    "confirmed_not_bottleneck": [
+      "CUDA graph re-capture (graph now enabled for Llama-3.1-8B via ea43256)",
+      "CPU kernel launch overhead (CUDA graph eliminates this)",
+      "Memory load ordering (ptxas already reorders independent loads)",
+      "K-loop memory latency hiding (multi-warp K-parallelism in q4k_gemv_decode_v2)"
+    ],
+    "confirmed_bottleneck": "Arithmetic throughput: nibble extraction (bit shifts + masks + int-to-float) + f32 scale application (d*sc*dot - dmin*m*sum) per Q4K block",
+    "next_lever": "dp4a (4 int8 MACs per instruction) replacing scalar f32 FMA; requires 4-element packing with same scale — compatible with the existing Q8_1 + mini-warp infrastructure"
+  },
+  "infrastructure_done": [
+    "oxide Q2_0 two-output-per-warp (half-warp XOR butterfly reduce)",
+    "oxide Q4K multi-warp K-parallelism (4 warps/neuron, smem cross-warp reduce)",
+    "oxide Q4K Q8_1 activation quantization kernel (quantize_q8_1)",
+    "oxide Q4K mini-warp dp4a kernel structure (q4k_gemv_decode_q8_v2)",
+    "CUDA graph enabled for non-pow2 inter models (Llama-3.1-8B, inter=14336)",
+    "D-to-D padding for non-pow2 inter_pad shapes (eliminates D-H-D round-trip)",
+    "Upstream oxide backend (nightly-2026-10-11) with dp4a support compiled"
+  ],
   "oxide_kernel_optimizations": {
     "q2_0": [
-      "one warp (32 threads) per output neuron",
-      "lane l handles elements l, l+32, l+64, ... across K blocks",
-      "butterfly warp reduce via shfl.sync.bfly.b32",
-      "shared memory activation broadcast (staging)"
+      "Two-output-per-warp: lanes 0-15 → neuron n, lanes 16-31 → neuron n+1",
+      "Half-warp XOR butterfly reduce (mask 0x0000FFFF / 0xFFFF0000)",
+      "Scale broadcast within half-warp via shuffle_sync(mask, val, base_lane)",
+      "8 nibble words per lane per block (bit_pair = my_lane, constant)",
+      "SMEM activation staging via F32x4 128-bit loads"
     ],
     "q4k_v2": [
-      "block-at-a-time outer loop",
-      "lane 0 broadcasts d, dmin via shfl.sync.idx.b32 (2 per block)",
-      "lanes 0-3 load packed scales, broadcast 8 values via shfl (8 per block)",
-      "4 j-groups fully unrolled, 2 nibble pairs per group per lane",
-      "PTX: 8 shfl scale broadcasts + 2 d/dmin broadcasts per K block"
+      "Multi-warp K-parallelism: n_out=bid, K-loop strides WARPS_PER_BLOCK",
+      "All 4 warps cooperate on same output neuron",
+      "Intra-warp butterfly reduce + cross-warp smem reduce (64 bytes)",
+      "Load hoisting: all 8 block loads issued before first shuffle",
+      "CUDA graph captured once (async_on path, no stream sync in capture)"
     ],
-    "q6k_v2": [
-      "lane 0 broadcasts d via shfl (d same across 256 elements per block)",
-      "8-step per block fully unrolled for ILP"
+    "q4k_q8_v2": [
+      "Q8_1 activation quantization (quantize_q8_1 kernel, pre-allocated scratch)",
+      "Mini-warp dp4a: 4 mini-warps x 8 lanes per j-group",
+      "Proper 4-element dp4a packing: v=qs & 0x0F0F0F0F (lo), (qs>>4) & 0x0F0F0F0F (hi)",
+      "K-loop parallelism: blk strides WARPS_PER_BLOCK",
+      "8-lane XOR reduce per mini-warp + smem cross-warp reduce"
     ]
   }
 }
