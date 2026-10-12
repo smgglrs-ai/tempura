@@ -1009,10 +1009,16 @@ impl CutileMatMul {
 
         let generics = vec![BK_GEMV_COALESCED.to_string(), k_pad.to_string()];
 
-        let (z, _a, _b) = kernels::cutile_gemv_coalesced(z, Arc::clone(a), Arc::clone(b))
-            .generics(generics)
-            .sync_on(stream)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        // Use async_on (not sync_on) so this call is CUDA graph capture-compatible.
+        // sync_on acquires a non-reentrant DeviceOp execution lock that rejects
+        // re-entry during capture; async_on launches the kernel without the lock.
+        // Ordering is maintained because all ops share the same stream.
+        let (z, _a, _b) = unsafe {
+            kernels::cutile_gemv_coalesced(z, Arc::clone(a), Arc::clone(b))
+                .generics(generics)
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
 
         let out = z
             .unpartition()

@@ -1381,6 +1381,20 @@ impl CutileGpuModel {
         pool[SLOT_UP] = alloc(inter);
         pool[SLOT_DOWN] = alloc(h);
         pool[SLOT_LOGITS] = alloc(vocab);
+
+        // Pre-allocate Q8_1 scratch for the oxide Q4K GEMV — must happen before
+        // any CUDA graph capture since device allocation on a capturing stream
+        // is not permitted (CUDA error 900).
+        // max_k = inter_pad (largest activation vector fed to any Q4K projection)
+        // max_n = inter     (largest output of any Q4K projection, gate/up proj)
+        if let Some(ref oxide) = self.oxide_q4k_gemv {
+            let max_k = self.inter_pad;
+            let max_n = inter;
+            if oxide.has_q8_path() {
+                oxide.pre_allocate_q8_scratch(max_k, max_n)
+                    .expect("pre_allocate_q8_scratch failed");
+            }
+        }
     }
 
     /// Non-blocking variant of `gemm_d2d_slot`.
@@ -2573,15 +2587,12 @@ impl CutileGpuModel {
         // Preconditions:
         //   • seq_len == 1 — decode mode
         //   • gpu_kv_cache.has_device_kv() — GPU flash-attention is active
-        //   • inter_pad == inter && h_pad == h — cuTile JIT variants must be
-        //     pre-compiled for the exact padded shapes; non-pow2 inter
-        //     (e.g. Llama-3.1-8B inter=14336, inter_pad=16384) falls through
-        //     to the direct-dispatch path until JIT warmup covers padded shapes.
         //   • !cfg.use_alibi — RoPE path
+        // inter_pad/h_pad: padding is handled via D→D copy (capturable).
+        // cuTile GEMV uses async_on (capture-compatible); warmup covers all needed
+        // shapes, so no JIT compilation happens inside capture.
         if seq_len == 1
             && gpu_kv_cache.has_device_kv()
-            && self.inter_pad == inter
-            && self.h_pad == h
             && !cfg.use_alibi
         {
             // The host KV mirror may be stale; we only rebuild it when transitioning

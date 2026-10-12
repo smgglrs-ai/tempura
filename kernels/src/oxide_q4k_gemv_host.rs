@@ -58,6 +58,11 @@ pub struct OxideQ4kGemv {
     /// Optional Q4K+Q8_1 GEMV v2 kernel (K-parallelism + mini-warp dp4a combined).
     cu_q8_gemv_v2:     Option<CUfunction>,
     stream:         Arc<Stream>,
+    /// Pre-allocated Q8_1 scratch buffers (set by pre_allocate_q8_scratch before graph capture).
+    /// These avoid device allocation on a capturing stream (CUDA error 900).
+    q8_qs_scratch:  std::cell::RefCell<Option<Arc<Tensor<u32>>>>,  // [max_k / 4]
+    q8_ds_scratch:  std::cell::RefCell<Option<Arc<Tensor<u32>>>>,  // [max_k / 32]
+    q8_out_scratch: std::cell::RefCell<Option<Arc<Tensor<f32>>>>,  // [max_n]
 }
 
 unsafe impl Send for OxideQ4kGemv {}
@@ -146,7 +151,12 @@ impl OxideQ4kGemv {
                 cu_q8_gemv.is_some(),
                 cu_q8_gemv_v2.is_some(),
             );
-            Some(Self { cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, stream })
+            Some(Self {
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, stream,
+                q8_qs_scratch:  std::cell::RefCell::new(None),
+                q8_ds_scratch:  std::cell::RefCell::new(None),
+                q8_out_scratch: std::cell::RefCell::new(None),
+            })
         }
     }
 
@@ -237,6 +247,32 @@ impl OxideQ4kGemv {
         Ok(())
     }
 
+    /// Pre-allocate Q8_1 scratch buffers outside of CUDA graph capture.
+    ///
+    /// Must be called before the first `cuStreamBeginCapture` — allocations on
+    /// a capturing stream are not permitted (CUDA error 900).  The buffers are
+    /// sized for the largest K and N seen across all Q4K projections in the model.
+    pub fn pre_allocate_q8_scratch(&self, max_k: usize, max_n: usize) -> Result<()> {
+        if self.cu_q8_quantize.is_none() { return Ok(()); }
+        let k_q8_blocks = max_k.div_ceil(32);
+        *self.q8_qs_scratch.borrow_mut() = Some(Arc::new(
+            api::zeros::<u32>(&[max_k / 4])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        ));
+        *self.q8_ds_scratch.borrow_mut() = Some(Arc::new(
+            api::zeros::<u32>(&[k_q8_blocks])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        ));
+        *self.q8_out_scratch.borrow_mut() = Some(Arc::new(
+            api::zeros::<f32>(&[max_n])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        ));
+        Ok(())
+    }
+
     /// Returns true when the Q8_1 quantize + integer GEMV path is compiled into the PTX.
     pub fn has_q8_path(&self) -> bool {
         self.cu_q8_quantize.is_some() && (self.cu_q8_gemv_v2.is_some() || self.cu_q8_gemv.is_some())
@@ -270,17 +306,35 @@ impl OxideQ4kGemv {
         let k = k_blocks * 256;  // total activation elements
         let k_q8_blocks = k.div_ceil(32);  // number of Q8_1 blocks
 
-        // Temporary Q8_1 buffers: packed int8 (K/4 u32s) + scales (K/32 u32s).
-        let x_qs = api::zeros::<u32>(&[k / 4])
-            .sync_on(&self.stream)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-        let x_ds = api::zeros::<u32>(&[k_q8_blocks])
-            .sync_on(&self.stream)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        // Use pre-allocated scratch when available (required during CUDA graph capture —
+        // allocating on a capturing stream causes CUDA error 900).  Fall back to fresh
+        // allocation only when pre_allocate_q8_scratch has not been called yet.
+        let use_scratch = self.q8_qs_scratch.borrow().as_ref()
+            .map(|t| t.size() >= k / 4)
+            .unwrap_or(false);
 
-        let out = api::zeros::<f32>(&[n])
-            .sync_on(&self.stream)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let x_qs_arc: Arc<Tensor<u32>>;
+        let x_ds_arc: Arc<Tensor<u32>>;
+        let out_arc: Arc<Tensor<f32>>;
+
+        if use_scratch {
+            x_qs_arc = self.q8_qs_scratch.borrow().as_ref().unwrap().clone();
+            x_ds_arc = self.q8_ds_scratch.borrow().as_ref().unwrap().clone();
+            out_arc  = self.q8_out_scratch.borrow().as_ref().unwrap().clone();
+        } else {
+            x_qs_arc = Arc::new(api::zeros::<u32>(&[k / 4])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+            x_ds_arc = Arc::new(api::zeros::<u32>(&[k_q8_blocks])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+            out_arc  = Arc::new(api::zeros::<f32>(&[n])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+        }
+        let x_qs = x_qs_arc.as_ref();
+        let x_ds = x_ds_arc.as_ref();
+        let out  = out_arc.as_ref();
 
         let cu_stream = self.stream.cu_stream();
 
@@ -366,12 +420,10 @@ impl OxideQ4kGemv {
             .map_err(|e| KernelError::InvalidConfig(format!("oxide {kernel_name}: {e}")))?;
         }
 
-        unsafe {
-            self.stream
-                .synchronize()
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-        }
+        // No stream.synchronize() here — the caller (CUDA graph or direct dispatch)
+        // is responsible for synchronization.  Adding a sync inside capture mode
+        // would cause CUDA error 900 (operation not permitted when stream is capturing).
 
-        Ok(Arc::new(out))
+        Ok(out_arc)
     }
 }
