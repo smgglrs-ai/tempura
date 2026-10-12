@@ -171,8 +171,10 @@ Three-crate workspace + standalone verification crate:
 - [x] Kani harnesses + Verus proofs for Q2_0/Q4K/Q6K block dequant bounds
 - [x] cuTile 0.4.0 upgrade (path deps to local fork); vec_width hint infrastructure
 - [x] Benchmark: Q2_0 31 tok/s, Q4K 23-24 tok/s (gap: 6.7×/8.7× vs llama.cpp 209 tok/s)
-  - Root cause of Q4K gap: compute path (llama.cpp uses dp4a = 4× throughput)
-  - dp4a kernel infrastructure in place; next: add K-parallelism to dp4a kernel
+  - Root cause of Q4K gap: CPU overhead from CUDA graph re-capture every step (~32ms/token)
+  - Weight reads are only 3.93 GB/token → 456 tok/s ceiling; we're at 5% utilization
+  - dp4a (Opt 7+8) implemented but irrelevant until re-capture is eliminated
+  - **Critical next step**: Opt 5 (device-side kv_len + pos) to capture graph once
 
 ## What's Next
 
