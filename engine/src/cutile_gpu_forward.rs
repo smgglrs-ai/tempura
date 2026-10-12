@@ -272,6 +272,18 @@ pub struct CutileGpuModel {
     /// Same motivation as `attn_out_scratch`: eliminates 28 sync-on allocs per token.
     silu_out_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
 
+    /// Pre-allocated zero-padded scratch for down-projection input when inter_pad != inter.
+    ///
+    /// For models with non-power-of-2 intermediate sizes (e.g. Llama-3.1-8B inter=14336,
+    /// inter_pad=16384), the SiLU output needs to be padded from `inter` to `inter_pad`
+    /// before the down projection matmul.  Without this, the path does a D→H download +
+    /// H→D re-upload (with a stream sync) every layer — 32 stalls per decode token.
+    ///
+    /// This scratch holds `inter_pad` f32 elements.  Positions `0..inter` are overwritten
+    /// by a GPU-side D→D copy from the SiLU output each layer; positions `inter..inter_pad`
+    /// remain zero from the initial allocation (never written after init).
+    down_proj_pad_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
+
     // ── CUDA graph capture fields ─────────────────────────────────────────────
     //
     // For decode (seq_len=1) the forward pass is captured into a CUDA graph on
@@ -896,6 +908,15 @@ impl CutileGpuModel {
         const SILU_B: usize = 32;
         let silu_out_scratch = add_alloc(inter.div_ceil(SILU_B) * SILU_B);
 
+        // Pre-allocate the zero-padded down-projection input scratch (only needed
+        // when inter_pad != inter, e.g. Llama-3.1-8B inter=14336, inter_pad=16384).
+        // Positions 0..inter are overwritten by D→D copy each layer; inter..inter_pad stay 0.
+        let down_proj_pad_scratch = if inter_pad != inter {
+            add_alloc(inter_pad)
+        } else {
+            None
+        };
+
         // Pre-allocate the embedding input buffer for CUDA graph decode.
         let d_embed = Arc::new(
             api::zeros::<f32>(&[h_pad])
@@ -933,6 +954,7 @@ impl CutileGpuModel {
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
             attn_out_scratch: RefCell::new(attn_out_scratch),
             silu_out_scratch: RefCell::new(silu_out_scratch),
+            down_proj_pad_scratch: RefCell::new(down_proj_pad_scratch),
             d_embed,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
@@ -1056,6 +1078,12 @@ impl CutileGpuModel {
         const SILU_B: usize = 32;
         let silu_out_scratch = add_alloc(inter.div_ceil(SILU_B) * SILU_B);
 
+        let down_proj_pad_scratch = if inter_pad != inter {
+            add_alloc(inter_pad)
+        } else {
+            None
+        };
+
         // Pre-allocate the embedding input buffer for CUDA graph decode.
         let d_embed = Arc::new(
             api::zeros::<f32>(&[h_pad])
@@ -1093,6 +1121,7 @@ impl CutileGpuModel {
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
             attn_out_scratch: RefCell::new(attn_out_scratch),
             silu_out_scratch: RefCell::new(silu_out_scratch),
+            down_proj_pad_scratch: RefCell::new(down_proj_pad_scratch),
             d_embed,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
@@ -2391,10 +2420,29 @@ impl CutileGpuModel {
             let gate_silu_dev = if self.inter_pad == inter {
                 gate_silu_n_dev
             } else {
-                // inter_pad != inter: requires a D→H sync → not capturable.
-                // The check in forward_decode_with_graph() guards against this.
-                let gs_host = self.download_device_tensor(&gate_silu_n_dev);
-                self.to_device_padded(&gs_host, seq_len, inter, self.inter_pad)
+                // GPU-side zero-padding: D→D copy of `inter` elements into a pre-zeroed
+                // `inter_pad` scratch.  Eliminates the D→H stream sync that was here before.
+                // Positions 0..inter are overwritten; inter..inter_pad remain 0 from init.
+                let pad_arc = self.down_proj_pad_scratch.borrow_mut()
+                    .take()
+                    .and_then(|arc| Arc::try_unwrap(arc).ok())
+                    .unwrap_or_else(|| {
+                        api::zeros::<f32>(&[self.inter_pad])
+                            .sync_on(shared_stream)
+                            .expect("down_proj_pad: fallback alloc failed")
+                    });
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        pad_arc.device_pointer().cu_deviceptr(),
+                        gate_silu_n_dev.device_pointer().cu_deviceptr(),
+                        inter * seq_len,
+                        shared_stream,
+                    )
+                    .expect("down_proj_pad D→D copy failed");
+                }
+                let result = Arc::new(pad_arc);
+                *self.down_proj_pad_scratch.borrow_mut() = Some(result.clone());
+                result
             };
             let down_dev =
                 self.gemm_any_d2d_slot(&gate_silu_dev, down_w_name, seq_len, SLOT_DOWN);
@@ -2515,12 +2563,18 @@ impl CutileGpuModel {
         // forward pass into a CUDA graph and replay it.  This replaces ~200
         // individual `cuLaunchKernel` submissions with one `cuGraphLaunch`.
         //
-        // Preconditions (checked at runtime):
+        // The D→D padding for inter_pad != inter is now GPU-only (pre-zeroed scratch
+        // + async D→D copy), so the layer loop itself has no D→H syncs regardless.
+        // However the CUDA graph path requires all cuTile JIT variants to be
+        // pre-compiled before capture begins; for non-power-of-2 N (e.g. vocab=32000)
+        // some variants may not be warmed up, causing "not permitted during capture"
+        // errors.  Until warmup covers all shapes, restrict to power-of-2 inter models.
+        //
+        // Preconditions:
         //   • seq_len == 1 — decode mode
         //   • gpu_kv_cache.has_device_kv() — GPU flash-attention is active
-        //   • inter_pad == inter && h_pad == h — no padding round-trips needed
-        //   • !cfg.use_alibi — RoPE path (ALiBi skips rotation and could be
-        //     captured too, but is handled below for simplicity)
+        //   • inter_pad == inter && h_pad == h — power-of-2 shapes (all JIT variants pre-compiled)
+        //   • !cfg.use_alibi — RoPE path
         if seq_len == 1
             && gpu_kv_cache.has_device_kv()
             && self.inter_pad == inter
@@ -2861,8 +2915,33 @@ impl CutileGpuModel {
             // ── 2k. FFN down — device-to-device ──────────────────────────────
             // Pad gate_silu from inter to inter_pad for the down_proj GEMM.
             // When inter == inter_pad (pow-2 models) this is a free reshape.
+            // For seq_len==1 with non-power-of-2 inter (e.g. Llama-3.1-8B inter=14336):
+            // use GPU D→D copy into the pre-zeroed inter_pad scratch to avoid 32 D→H
+            // stream syncs per token — the dominant bottleneck before this fix.
             let gate_silu_dev = if self.inter_pad == inter {
                 gate_silu_n_dev
+            } else if seq_len == 1 {
+                let stream = self.matmul.stream();
+                let pad_arc = self.down_proj_pad_scratch.borrow_mut()
+                    .take()
+                    .and_then(|arc| Arc::try_unwrap(arc).ok())
+                    .unwrap_or_else(|| {
+                        api::zeros::<f32>(&[self.inter_pad])
+                            .sync_on(stream)
+                            .expect("down_proj_pad: fallback alloc failed")
+                    });
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        pad_arc.device_pointer().cu_deviceptr(),
+                        gate_silu_n_dev.device_pointer().cu_deviceptr(),
+                        inter,
+                        stream,
+                    )
+                    .expect("down_proj_pad D→D copy failed");
+                }
+                let result = Arc::new(pad_arc);
+                *self.down_proj_pad_scratch.borrow_mut() = Some(result.clone());
+                result
             } else {
                 let gate_silu_host = self.download_device_tensor(&gate_silu_n_dev);
                 self.to_device_padded(&gate_silu_host, seq_len, inter, self.inter_pad)
@@ -2889,32 +2968,47 @@ impl CutileGpuModel {
         }
 
         // ── 3. Final norm + lm_head ────────────────────────────────────────────
-        // Download hidden_dev once after the loop.  Each row is h_pad elements;
-        // the last token occupies hidden_final[(seq_len-1)*h_pad..seq_len*h_pad].
-        let hidden_final = self.download_device_tensor(&hidden_dev);
-        let last_flat = Arc::new(
-            api::copy_host_vec_to_device(&Arc::new(
-                hidden_final[(seq_len - 1) * self.h_pad..seq_len * self.h_pad].to_vec(),
-            ))
-            .sync_on(self.matmul.stream())
-            .expect("CutileGpuModel: last-token upload failed"),
-        );
+        // For decode (seq_len=1) hidden_dev IS the last token — pass it directly
+        // to the final RMSNorm, skipping the unnecessary D→H download + H→D re-upload
+        // that the prefill path needs to extract just the last token row.
         let final_norm_w_dev = self
             .norm_weights
             .get("model.norm.weight")
             .expect("CutileGpuModel: model.norm.weight not pre-uploaded");
-        let last_dev = self
-            .cutile_rmsnorm
-            .forward_device_fused(
-                self.matmul.stream(),
-                last_flat,
-                final_norm_w_dev,
-                1,
-                h,
-                self.h_pad,
-                cfg.layer_norm_eps,
-            )
-            .expect("CutileGpuModel: final RMSNorm failed");
+        let last_dev = if seq_len == 1 {
+            self.cutile_rmsnorm
+                .forward_device_fused(
+                    self.matmul.stream(),
+                    hidden_dev,
+                    final_norm_w_dev,
+                    1,
+                    h,
+                    self.h_pad,
+                    cfg.layer_norm_eps,
+                )
+                .expect("CutileGpuModel: final RMSNorm failed")
+        } else {
+            // Prefill: download, extract the last token's hidden state, re-upload.
+            let hidden_final = self.download_device_tensor(&hidden_dev);
+            let last_flat = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(
+                    hidden_final[(seq_len - 1) * self.h_pad..seq_len * self.h_pad].to_vec(),
+                ))
+                .sync_on(self.matmul.stream())
+                .expect("CutileGpuModel: last-token upload failed"),
+            );
+            self.cutile_rmsnorm
+                .forward_device_fused(
+                    self.matmul.stream(),
+                    last_flat,
+                    final_norm_w_dev,
+                    1,
+                    h,
+                    self.h_pad,
+                    cfg.layer_norm_eps,
+                )
+                .expect("CutileGpuModel: final RMSNorm failed")
+        };
 
         let logits_dev = self.gemm_d2d_slot(&last_dev, "lm_head.weight", 1, SLOT_LOGITS);
         self.download_device_tensor(&logits_dev)
