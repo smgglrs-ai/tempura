@@ -1,4 +1,4 @@
-base_url = "https://tempura.smgglrs.ai"
+base_url = "https://smgglrs-ai.github.io/tempura"
 title = "tempura"
 description = "Verified inference framework, built in Rust."
 default_language = "en"
