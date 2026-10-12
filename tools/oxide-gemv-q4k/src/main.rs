@@ -361,6 +361,124 @@ mod kernels {
         }
     }
 
+    /// Q4_K GEMV v2: K-loop parallelism + mini-warp dp4a (combined Opt 7+8).
+    ///
+    /// Two levels of parallelism:
+    ///   K-level:       WARPS_PER_BLOCK warps stride across K blocks
+    ///                  (warp w handles blocks w, w+4, w+8, …)
+    ///   Element-level: 4 mini-warps of 8 lanes each handle one j-group (64 elements)
+    ///                  via proper 4-element dp4a (sub_l loads 1 nibble u32 + 1 Q8 u32)
+    ///
+    /// Reduction:
+    ///   1. After K loop: 3-step XOR butterfly within each mini-warp (8 lanes → sub_l 0).
+    ///   2. sub_l==0 writes to smem[warp_id*4 + mw].
+    ///   3. sync_threads (unconditional).
+    ///   4. Warp 0 lane 0..3 reads all warp contributions for j-group j, sums → smem[j].
+    ///   5. sync_threads (unconditional).
+    ///   6. Warp 0 lane 0 sums smem[0..4] and writes out[n_out].
+    ///
+    /// Grid:  N blocks (one output neuron per block; all warps cooperate on K).
+    /// Block: WARPS_PER_BLOCK * 32 threads.
+    /// Shared memory: WARPS_PER_BLOCK * 4 * 4 = 64 bytes.
+    #[kernel]
+    pub fn q4k_gemv_decode_q8_v2(
+        mut out: DisjointSlice<f32>,
+        x_qs: &[u32],    // [K/4] packed i8 activations (4 per u32)
+        x_ds: &[u32],    // [K/32] Q8_1 f16 scales as u16 in low bits
+        packed: &[u32],  // [N, K_BLOCKS, 42] Q4K packed weights
+        n: u32,
+        k_blocks: u32,
+    ) {
+        let tid     = thread::threadIdx_x();
+        let bid     = thread::blockIdx_x();
+        let warp_id = tid / 32;
+        let lane    = tid % 32;
+        let n_out   = bid;  // one output neuron per BLOCK; all warps cooperate on K
+        if n_out >= n { return; }
+
+        let mw        = lane / 8;
+        let sub_l     = lane % 8;
+        let mini_mask = 0xFF_u32 << (mw * 8);
+        let base_lane = mw * 8;
+
+        let mut acc = 0.0_f32;
+
+        // K-loop: warp_id strides across K blocks (K-level parallelism).
+        let mut blk = warp_id;
+        while blk < k_blocks {
+            let base = (n_out * k_blocks + blk) * 42;
+
+            let d_raw    = if lane == 0 { packed[base as usize] } else { 0 };
+            let dmin_raw = if lane == 0 { packed[(base + 1) as usize] } else { 0 };
+            let d    = f32::from_bits(warp::shuffle(d_raw, 0));
+            let dmin = f32::from_bits(warp::shuffle(dmin_raw, 0));
+
+            let sc_raw = if sub_l == 0 { packed[(base + 2 + mw) as usize] } else { 0 };
+            let m_raw  = if sub_l == 0 { packed[(base + 6 + mw) as usize] } else { 0 };
+            let sc_raw_bc = warp::shuffle_sync(mini_mask, sc_raw, base_lane);
+            let m_raw_bc  = warp::shuffle_sync(mini_mask, m_raw,  base_lane);
+            let sc_lo = (sc_raw_bc & 0xFF) as f32;
+            let sc_hi = ((sc_raw_bc >> 8) & 0xFF) as f32;
+            let m_lo  = (m_raw_bc & 0xFF) as f32;
+            let m_hi  = ((m_raw_bc >> 8) & 0xFF) as f32;
+
+            let q8_blk_lo = blk * 8 + mw * 2;
+            let q8_blk_hi = blk * 8 + mw * 2 + 1;
+            let d8_lo = f16_to_f32(x_ds[q8_blk_lo as usize] & 0xFFFF);
+            let d8_hi = f16_to_f32(x_ds[q8_blk_hi as usize] & 0xFFFF);
+
+            let qs_word = packed[(base + 10 + mw * 8 + sub_l) as usize];
+            let v_lo = qs_word & 0x0F0F0F0F;
+            let v_hi = (qs_word >> 4) & 0x0F0F0F0F;
+
+            let u_lo = x_qs[(q8_blk_lo * 8 + sub_l) as usize];
+            let u_hi = x_qs[(q8_blk_hi * 8 + sub_l) as usize];
+
+            let sumi_d_lo = dp4a_s32(v_lo, u_lo, 0);
+            let sumi_d_hi = dp4a_s32(v_hi, u_hi, 0);
+            let sumi_m_lo = dp4a_s32(0x01010101, u_lo, 0);
+            let sumi_m_hi = dp4a_s32(0x01010101, u_hi, 0);
+
+            acc += d8_lo * (d * sc_lo * (sumi_d_lo as f32) - dmin * m_lo * (sumi_m_lo as f32))
+                 + d8_hi * (d * sc_hi * (sumi_d_hi as f32) - dmin * m_hi * (sumi_m_hi as f32));
+
+            blk += WARPS_PER_BLOCK;
+        }
+
+        // Stage 1: 3-step XOR butterfly within mini-warp (8 lanes → sub_l 0 holds sum).
+        acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 4);
+        acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 2);
+        acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 1);
+
+        // Stage 2: write each warp's j-group partial to smem[warp_id*4 + mw].
+        let smem: *mut f32 = DynamicSharedArray::<f32>::get();
+        if sub_l == 0 {
+            unsafe { *smem.add((warp_id * 4 + mw) as usize) = acc; }
+        }
+        thread::sync_threads(); // unconditional — all warps reach this
+
+        // Stage 3: warp 0 lane j accumulates j-th j-group across all warps → smem[j].
+        // Warps 1-3 are idle but must reach the next sync.
+        if warp_id == 0 && lane < 4 {
+            let j = lane;
+            let mut total = 0.0_f32;
+            let mut w = 0u32;
+            while w < WARPS_PER_BLOCK {
+                total += unsafe { *smem.add((w * 4 + j) as usize) };
+                w += 1;
+            }
+            unsafe { *smem.add(j as usize) = total; }
+        }
+        thread::sync_threads(); // unconditional
+
+        if warp_id == 0 && lane == 0 {
+            let total = unsafe {
+                *smem.add(0) + *smem.add(1) + *smem.add(2) + *smem.add(3)
+            };
+            unsafe { *out.get_unchecked_mut(n_out as usize) = total; }
+        }
+    }
+
     /// Q4_K GEMV with Q8_1-quantized activations and proper 4-element dp4a.
     ///
     /// Mini-warp structure: the 32-lane warp is divided into 4 mini-warps of 8 lanes.

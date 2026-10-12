@@ -43,6 +43,7 @@ static OXIDE_Q4K_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oxide_q4
 const KERNEL_ENTRY: &str = "q4k_gemv_decode_v2";
 const KERNEL_Q8_QUANTIZE: &str = "quantize_q8_1";
 const KERNEL_Q8_GEMV: &str = "q4k_gemv_decode_q8";
+const KERNEL_Q8_GEMV_V2: &str = "q4k_gemv_decode_q8_v2";
 const WARPS_PER_BLOCK: u32 = 4;
 const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128
 
@@ -51,9 +52,11 @@ pub struct OxideQ4kGemv {
     cu_module:      CUmodule,
     cu_function:    CUfunction,
     /// Optional Q8_1 quantize kernel (present after `cargo oxide build` with new kernels).
-    cu_q8_quantize: Option<CUfunction>,
-    /// Optional Q4K+Q8_1 GEMV kernel.
-    cu_q8_gemv:     Option<CUfunction>,
+    cu_q8_quantize:    Option<CUfunction>,
+    /// Optional Q4K+Q8_1 GEMV kernel (mini-warp only, no K-parallelism).
+    cu_q8_gemv:        Option<CUfunction>,
+    /// Optional Q4K+Q8_1 GEMV v2 kernel (K-parallelism + mini-warp dp4a combined).
+    cu_q8_gemv_v2:     Option<CUfunction>,
     stream:         Arc<Stream>,
 }
 
@@ -134,14 +137,16 @@ impl OxideQ4kGemv {
             };
             let cu_q8_quantize = load_fn(KERNEL_Q8_QUANTIZE);
             let cu_q8_gemv     = load_fn(KERNEL_Q8_GEMV);
+            let cu_q8_gemv_v2  = load_fn(KERNEL_Q8_GEMV_V2);
 
             eprintln!(
-                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={})",
+                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={}, q8v2={})",
                 OXIDE_Q4K_PTX.len(),
                 KERNEL_ENTRY,
                 cu_q8_gemv.is_some(),
+                cu_q8_gemv_v2.is_some(),
             );
-            Some(Self { cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, stream })
+            Some(Self { cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, stream })
         }
     }
 
@@ -234,7 +239,7 @@ impl OxideQ4kGemv {
 
     /// Returns true when the Q8_1 quantize + integer GEMV path is compiled into the PTX.
     pub fn has_q8_path(&self) -> bool {
-        self.cu_q8_quantize.is_some() && self.cu_q8_gemv.is_some()
+        self.cu_q8_quantize.is_some() && (self.cu_q8_gemv_v2.is_some() || self.cu_q8_gemv.is_some())
     }
 
     /// Quantize `x` (f32 K-vector) → Q8_1 packed int8 + scales, then run Q4K GEMV.
@@ -248,8 +253,17 @@ impl OxideQ4kGemv {
         n: usize,
         k_blocks: usize,
     ) -> Result<Arc<Tensor<f32>>> {
-        let (q8_quant_fn, q8_gemv_fn) = match (&self.cu_q8_quantize, &self.cu_q8_gemv) {
-            (Some(q), Some(g)) => (*q, *g),
+        // Prefer v2 (K-loop parallelism + mini-warp dp4a) over v1.
+        let (q8_quant_fn, q8_gemv_fn, use_v2) = match &self.cu_q8_quantize {
+            Some(q) => {
+                if let Some(g2) = &self.cu_q8_gemv_v2 {
+                    (*q, *g2, true)
+                } else if let Some(g) = &self.cu_q8_gemv {
+                    (*q, *g, false)
+                } else {
+                    return Err(KernelError::InvalidConfig("Q8 GEMV kernel not loaded".into()));
+                }
+            }
             _ => return Err(KernelError::InvalidConfig("Q8 kernels not loaded".into())),
         };
 
@@ -330,20 +344,26 @@ impl OxideQ4kGemv {
                 &kb_u32  as *const _ as *mut c_void,
             ];
 
-            // Mini-warp kernel: one warp per output neuron; WARPS_PER_BLOCK warps per block.
-            // smem: 4 mini-warps per warp × WARPS_PER_BLOCK warps × 4 bytes = 64 bytes.
-            let grid_x = n.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            // v2: one block per output neuron (all WARPS_PER_BLOCK warps cooperate on K).
+            // v1: ceil(N/WARPS_PER_BLOCK) blocks (one warp per neuron).
+            // smem: WARPS_PER_BLOCK warps × 4 j-groups × 4 bytes = 64 bytes (both variants).
+            let (grid_x, smem_bytes) = if use_v2 {
+                (n as u32, WARPS_PER_BLOCK * 4 * 4)
+            } else {
+                (n.div_ceil(WARPS_PER_BLOCK as usize) as u32, WARPS_PER_BLOCK * 4 * 4)
+            };
+            let kernel_name = if use_v2 { "q4k_gemv_decode_q8_v2" } else { "q4k_gemv_decode_q8" };
             unsafe {
                 launch_kernel(
                     q8_gemv_fn,
                     (grid_x, 1, 1),
                     (BLOCK_DIM, 1, 1),
-                    WARPS_PER_BLOCK * 4 * 4,  // smem: 4 f32 slots per warp × WARPS_PER_BLOCK
+                    smem_bytes,
                     cu_stream,
                     &mut params,
                 )
             }
-            .map_err(|e| KernelError::InvalidConfig(format!("oxide q4k_gemv_decode_q8: {e}")))?;
+            .map_err(|e| KernelError::InvalidConfig(format!("oxide {kernel_name}: {e}")))?;
         }
 
         unsafe {
