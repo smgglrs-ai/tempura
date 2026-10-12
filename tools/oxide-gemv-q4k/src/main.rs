@@ -194,20 +194,56 @@ mod kernels {
         }
 
         let mut acc = 0.0_f32;
+        let qs_shift = (lane % 4) * 8;
 
         // Each warp covers a stride-WARPS_PER_BLOCK subset of K blocks.
-        let mut blk = warp_id;
-        while blk < k_blocks {
-            let base = (n_out * k_blocks + blk) * 42;
+        // Load restructuring: all 8 weight loads (d, dmin, sc, m, 4×qs) are
+        // independent of each other — hoist them ALL before any shuffle so the
+        // GPU can issue them in parallel (one DRAM round-trip instead of three).
+        // Software prefetch: pre-load next block's data during current block's
+        // compute phase to hide DRAM latency across iterations.
 
-            // d and dmin: lane 0 loads, all lanes receive via full-warp shfl.
-            let d_raw    = if lane == 0 { packed[base as usize] } else { 0 };
-            let dmin_raw = if lane == 0 { packed[(base + 1) as usize] } else { 0 };
+        // Prime the prefetch registers with block warp_id data.
+        let mut blk = warp_id;
+        let mut pre_base = (n_out * k_blocks + blk) * 42;
+        let mut pre_d_raw    = if lane == 0 { packed[pre_base as usize] } else { 0 };
+        let mut pre_dmin_raw = if lane == 0 { packed[(pre_base + 1) as usize] } else { 0 };
+        let mut pre_sc_raw   = if lane < 4  { packed[(pre_base + 2 + lane) as usize] } else { 0 };
+        let mut pre_m_raw    = if lane < 4  { packed[(pre_base + 6 + lane) as usize] } else { 0 };
+        let mut pre_qs_j0 = packed[(pre_base + 10 + lane / 4) as usize];
+        let mut pre_qs_j1 = packed[(pre_base + 10 + 8 + lane / 4) as usize];
+        let mut pre_qs_j2 = packed[(pre_base + 10 + 16 + lane / 4) as usize];
+        let mut pre_qs_j3 = packed[(pre_base + 10 + 24 + lane / 4) as usize];
+
+        while blk < k_blocks {
+            // Move prefetched registers into current-block locals.
+            let d_raw    = pre_d_raw;
+            let dmin_raw = pre_dmin_raw;
+            let sc_raw   = pre_sc_raw;
+            let m_raw    = pre_m_raw;
+            let qs_j0 = pre_qs_j0;
+            let qs_j1 = pre_qs_j1;
+            let qs_j2 = pre_qs_j2;
+            let qs_j3 = pre_qs_j3;
+
+            // Issue next-block loads NOW (during this block's compute) to hide latency.
+            let next_blk = blk + WARPS_PER_BLOCK;
+            if next_blk < k_blocks {
+                pre_base  = (n_out * k_blocks + next_blk) * 42;
+                pre_d_raw    = if lane == 0 { packed[pre_base as usize] } else { 0 };
+                pre_dmin_raw = if lane == 0 { packed[(pre_base + 1) as usize] } else { 0 };
+                pre_sc_raw   = if lane < 4  { packed[(pre_base + 2 + lane) as usize] } else { 0 };
+                pre_m_raw    = if lane < 4  { packed[(pre_base + 6 + lane) as usize] } else { 0 };
+                pre_qs_j0 = packed[(pre_base + 10 + lane / 4) as usize];
+                pre_qs_j1 = packed[(pre_base + 10 + 8 + lane / 4) as usize];
+                pre_qs_j2 = packed[(pre_base + 10 + 16 + lane / 4) as usize];
+                pre_qs_j3 = packed[(pre_base + 10 + 24 + lane / 4) as usize];
+            }
+
+            // Compute: shuffle → FMA using current-block data.
+            // All loads above are already in-flight or completed.
             let d    = f32::from_bits(warp::shuffle(d_raw, 0));
             let dmin = f32::from_bits(warp::shuffle(dmin_raw, 0));
-
-            let sc_raw = if lane < 4 { packed[(base + 2 + lane) as usize] } else { 0 };
-            let m_raw  = if lane < 4 { packed[(base + 6 + lane) as usize] } else { 0 };
 
             // j=0
             {
@@ -217,9 +253,7 @@ mod kernels {
                 let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
                 let m_lo  = (m_pair & 0xFF) as f32;
                 let m_hi  = ((m_pair >> 8) & 0xFF) as f32;
-                let qs_word = packed[(base + 10 + lane / 4) as usize];
-                let qs_shift = (lane % 4) * 8;
-                let qs_byte = (qs_word >> qs_shift) & 0xFF;
+                let qs_byte = (qs_j0 >> qs_shift) & 0xFF;
                 let nibble_lo = (qs_byte & 0xF) as f32;
                 let nibble_hi = ((qs_byte >> 4) & 0xF) as f32;
                 acc += (d * sc_lo * nibble_lo - dmin * m_lo) * x[(blk * 256 + lane) as usize];
@@ -233,9 +267,7 @@ mod kernels {
                 let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
                 let m_lo  = (m_pair & 0xFF) as f32;
                 let m_hi  = ((m_pair >> 8) & 0xFF) as f32;
-                let qs_word = packed[(base + 10 + 8 + lane / 4) as usize];
-                let qs_shift = (lane % 4) * 8;
-                let qs_byte = (qs_word >> qs_shift) & 0xFF;
+                let qs_byte = (qs_j1 >> qs_shift) & 0xFF;
                 let nibble_lo = (qs_byte & 0xF) as f32;
                 let nibble_hi = ((qs_byte >> 4) & 0xF) as f32;
                 acc += (d * sc_lo * nibble_lo - dmin * m_lo) * x[(blk * 256 + 64 + lane) as usize];
@@ -249,9 +281,7 @@ mod kernels {
                 let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
                 let m_lo  = (m_pair & 0xFF) as f32;
                 let m_hi  = ((m_pair >> 8) & 0xFF) as f32;
-                let qs_word = packed[(base + 10 + 16 + lane / 4) as usize];
-                let qs_shift = (lane % 4) * 8;
-                let qs_byte = (qs_word >> qs_shift) & 0xFF;
+                let qs_byte = (qs_j2 >> qs_shift) & 0xFF;
                 let nibble_lo = (qs_byte & 0xF) as f32;
                 let nibble_hi = ((qs_byte >> 4) & 0xF) as f32;
                 acc += (d * sc_lo * nibble_lo - dmin * m_lo) * x[(blk * 256 + 128 + lane) as usize];
@@ -265,9 +295,7 @@ mod kernels {
                 let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
                 let m_lo  = (m_pair & 0xFF) as f32;
                 let m_hi  = ((m_pair >> 8) & 0xFF) as f32;
-                let qs_word = packed[(base + 10 + 24 + lane / 4) as usize];
-                let qs_shift = (lane % 4) * 8;
-                let qs_byte = (qs_word >> qs_shift) & 0xFF;
+                let qs_byte = (qs_j3 >> qs_shift) & 0xFF;
                 let nibble_lo = (qs_byte & 0xF) as f32;
                 let nibble_hi = ((qs_byte >> 4) & 0xF) as f32;
                 acc += (d * sc_lo * nibble_lo - dmin * m_lo) * x[(blk * 256 + 192 + lane) as usize];
@@ -294,9 +322,12 @@ mod kernels {
             } else {
                 0.0_f32
             };
-            // Reduce 4 lanes (WARPS_PER_BLOCK=4): 2-step XOR butterfly.
-            acc += warp::shuffle_xor_f32(acc, 2);
-            acc += warp::shuffle_xor_f32(acc, 1);
+            // N-step XOR butterfly for any power-of-2 WARPS_PER_BLOCK.
+            let mut delta = WARPS_PER_BLOCK / 2;
+            while delta >= 1 {
+                acc += warp::shuffle_xor_f32(acc, delta);
+                delta /= 2;
+            }
             if lane == 0 {
                 unsafe { *out.get_unchecked_mut(n_out as usize) = acc; }
             }
