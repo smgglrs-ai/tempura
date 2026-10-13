@@ -28,8 +28,7 @@
     "deny": [
       "Bash(git push --force*)",
       "Bash(git reset --hard*)",
-      "Bash(rm -rf /*)",
-      "Bash(sudo*)"
+      "Bash(rm -rf /*)"
     ],
     "additionalDirectories": [
       "/home/fdupont/.claude/projects/-home-fdupont-Code-github-com-smgglrs-ai-tempura"

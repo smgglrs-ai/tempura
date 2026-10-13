@@ -45,14 +45,25 @@ use crate::config::ModelConfig;
 use crate::cutile_kv_cache::CutileKvCache;
 use crate::weights::QuantizedWeights;
 
+/// Info about a KV-write memcpy node so we can update its dst pointer per step.
+#[derive(Clone)]
+struct KvMemcpyEntry {
+    node: cuda_core::sys::CUgraphNode,
+    src_ptr: cuda_core::sys::CUdeviceptr,
+    cache_base: cuda_core::sys::CUdeviceptr, // base of k_device[layer] or v_device[layer]
+    width_bytes: usize,
+}
+
 /// RAII wrapper for a CUDA graph executable.
 ///
-/// The exec is replayed each decode step via `cuGraphLaunch`.  Between steps
-/// `cuGraphExecUpdate_v2` refreshes the baked-in per-step parameters (token
-/// position, kv_len, KV-cache write offset) without re-instantiating the graph.
+/// The exec is replayed each decode step via `cuGraphLaunch`.  KV-write memcpy
+/// nodes are updated per step via `cuGraphExecMemcpyNodeSetParams` — no
+/// re-capture, no `cuGraphExecUpdate_v2`.
 struct DecodeGraph {
     cu_exec: cuda_core::sys::CUgraphExec,
     device: Arc<cuda_core::Device>,
+    /// KV write memcpy nodes to update per decode step (one K + one V per layer).
+    kv_memcpy_entries: Vec<KvMemcpyEntry>,
 }
 
 impl Drop for DecodeGraph {
@@ -303,11 +314,11 @@ pub struct CutileGpuModel {
     //
     // Written H→D before each graph replay so the graph can be captured once
     // and replayed N times without cuStreamBeginCapture per token.
-    /// kv_len after the current step's KV append (read by flash attention).
-    d_kv_len: Arc<Tensor<i32>>,
-    /// Current token position for RoPE (scalar, same for all heads in M=1 decode).
-    d_positions: Arc<Tensor<u32>>,
-    /// KV cache write slot before the current step's append (read by append kernel).
+    /// kv_len after the current step's KV append (f32 for cuTile compatibility; read by flash attention).
+    d_kv_len: Arc<Tensor<f32>>,
+    /// Current token position for RoPE (f32 for cuTile compatibility).
+    d_positions: Arc<Tensor<f32>>,
+    /// KV cache write slot before the current step's append (raw i32, not a cuTile tensor).
     d_kv_write_offset: Arc<Tensor<i32>>,
 
     /// Pre-allocated RMSNorm scratch for the final model norm applied after the
@@ -935,6 +946,23 @@ impl CutileGpuModel {
                 .expect("d_embed: device allocation failed"),
         );
 
+        // Device-side decode scalars for single-capture CUDA graph (Opt 5).
+        let d_kv_len = Arc::new(
+            api::zeros::<f32>(&[1])
+                .sync_on(matmul.stream())
+                .expect("d_kv_len alloc failed"),
+        );
+        let d_positions = Arc::new(
+            api::zeros::<f32>(&[1])
+                .sync_on(matmul.stream())
+                .expect("d_positions alloc failed"),
+        );
+        let d_kv_write_offset = Arc::new(
+            api::zeros::<i32>(&[1])
+                .sync_on(matmul.stream())
+                .expect("d_kv_write_offset alloc failed"),
+        );
+
         let model = Self {
             config: config.clone(),
             h_pad,
@@ -1107,12 +1135,12 @@ impl CutileGpuModel {
 
         // Device-side decode scalars for single-capture CUDA graph (Opt 5).
         let d_kv_len = Arc::new(
-            api::zeros::<i32>(&[1])
+            api::zeros::<f32>(&[1])
                 .sync_on(matmul.stream())
                 .expect("d_kv_len alloc failed"),
         );
         let d_positions = Arc::new(
-            api::zeros::<u32>(&[1])
+            api::zeros::<f32>(&[1])
                 .sync_on(matmul.stream())
                 .expect("d_positions alloc failed"),
         );
@@ -2126,10 +2154,9 @@ impl CutileGpuModel {
         let cfg = &self.config;
         let h = cfg.hidden_size;
         let stream = self.matmul.stream();
+        let cu_stream = stream.cu_stream();
 
-        // ── Step 1: Upload embedding into d_embed BEFORE capture ─────────────
-        // The graph reads from d_embed's fixed device pointer; we update its
-        // content here so every replay sees the current token's embedding.
+        // ── Always: Upload embedding + scalars before capture or launch ──────
         let embed_src: Vec<f32> = if self.h_pad == h {
             embedding.to_vec()
         } else {
@@ -2143,109 +2170,192 @@ impl CutileGpuModel {
                 embed_src.as_ptr(),
                 self.h_pad,
                 stream,
-            )
-            .expect("d_embed H→D copy failed");
+            ).expect("d_embed H→D copy failed");
         }
 
-        // ── Step 2: Begin stream capture ────────────────────────────────────
-        // RELAXED mode: the current thread is not restricted from unsafe API
-        // calls.  Allocations that happen during capture (api::zeros fallbacks)
-        // execute eagerly and are NOT captured — they allocate real memory whose
-        // pointer is then baked into the graph node.  With pre-warmed scratch
-        // this path is never hit; if it is, the resulting graph node will replay
-        // correctly because the allocated tensor persists for the model's lifetime.
-        let cu_stream = stream.cu_stream();
-        let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
+        // Write device scalars: kv_len, position, kv_write_offset.
+        // These are read by device kernels at execution time so the graph is
+        // topology-stable across steps (only these tiny H→D copies change).
+        let kv_write_off = gpu_kv_cache.seq_len() as i32;
+        // Bitcast i32 → f32 so the cuTile kernel can recover via transmute.
+        let kv_len_bits: f32 = f32::from_bits((kv_write_off + 1) as u32);
+        let pos_bits: f32    = f32::from_bits(positions[0]);
         unsafe {
-            stream
-                .begin_capture(relaxed)
-                .expect("cuStreamBeginCapture failed");
+            cuda_core::memcpy_htod_async::<f32>(
+                self.d_kv_len.device_pointer().cu_deviceptr(),
+                &kv_len_bits as *const f32, 1, stream,
+            ).expect("d_kv_len H→D copy failed");
+            cuda_core::memcpy_htod_async::<f32>(
+                self.d_positions.device_pointer().cu_deviceptr(),
+                &pos_bits as *const f32, 1, stream,
+            ).expect("d_positions H→D copy failed");
+            cuda_core::memcpy_htod_async::<i32>(
+                self.d_kv_write_offset.device_pointer().cu_deviceptr(),
+                &kv_write_off as *const i32, 1, stream,
+            ).expect("d_kv_write_offset H→D copy failed");
         }
 
-        // ── Step 3: Run the decode forward pass (captured, not executed) ─────
-        let hidden_dev = self.d_embed.clone();
-        self.forward_decode_inner(hidden_dev, positions, gpu_kv_cache);
-
-        // ── Step 4: End capture → template graph ────────────────────────────
-        let cu_graph = unsafe {
-            stream
-                .end_capture()
-                .expect("cuStreamEndCapture failed")
-        };
-
-        // ── Step 5: Instantiate (first call) or update exec (subsequent) ────
         let mut graph_cache = self.cached_decode_graph.borrow_mut();
-        let cu_exec = if let Some(ref decode_graph) = *graph_cache {
-            // Update the existing exec with the new template graph.
-            let mut result_info = cuda_core::sys::CUgraphExecUpdateResultInfo_st {
-                result: cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS,
-                errorNode: std::ptr::null_mut(),
-                errorFromNode: std::ptr::null_mut(),
-            };
-            let update_rc = unsafe {
-                cuda_core::sys::cuGraphExecUpdate_v2(
-                    decode_graph.cu_exec,
-                    cu_graph,
-                    &mut result_info,
-                )
-            };
-            unsafe { cuda_core::sys::cuGraphDestroy(cu_graph) };
-            if update_rc != 0 || result_info.result != cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS {
-                // Update failed (topology mismatch or first incompatible step).
-                // This should not happen with a fixed model architecture; log and
-                // fall through to the non-graph path by returning early.
-                eprintln!(
-                    "[cuda_graph] cuGraphExecUpdate_v2 failed: rc={update_rc} result={}; falling back to direct dispatch",
-                    result_info.result
-                );
-                // Replay the capture-time results directly (they are not yet on device).
-                // Since the graph was not launched, the GPU work was not submitted.
-                // Fall back to the (already computed in Step 3) logits if they exist,
-                // else re-run without graphs.
-                drop(graph_cache);
-                return self.forward_decode_nogpu(embedding, positions, gpu_kv_cache);
+
+        if let Some(ref decode_graph) = *graph_cache {
+            // ── Subsequent steps: update KV memcpy dst pointers, then launch ─
+            // Advance host KV seq_len — the GPU KV append ran in the previous launch.
+            gpu_kv_cache.advance_host_seq_len(1);
+
+            // Update each KV-write memcpy node's dst to the new slot.
+            let kv_dim    = cfg.num_kv_heads * cfg.head_dim;
+            let f32_bytes = std::mem::size_of::<f32>() as u64;
+            let new_dst_offset_bytes = (kv_write_off as u64) * (kv_dim as u64) * f32_bytes;
+
+            // Get CUDA context for cuGraphExecMemcpyNodeSetParams.
+            let mut cu_ctx: cuda_core::sys::CUcontext = std::ptr::null_mut();
+            unsafe { cuda_core::sys::cuCtxGetCurrent(&mut cu_ctx) };
+
+            for entry in &decode_graph.kv_memcpy_entries {
+                let new_dst = entry.cache_base + new_dst_offset_bytes;
+                let params = cuda_core::sys::CUDA_MEMCPY3D {
+                    srcXInBytes: 0, srcY: 0, srcZ: 0, srcLOD: 0,
+                    srcMemoryType: cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE,
+                    srcHost: std::ptr::null(),
+                    srcDevice: entry.src_ptr,
+                    srcArray: std::ptr::null_mut(),
+                    reserved0: std::ptr::null_mut(),
+                    srcPitch: 0, srcHeight: 0,
+                    dstXInBytes: 0, dstY: 0, dstZ: 0, dstLOD: 0,
+                    dstMemoryType: cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE,
+                    dstHost: std::ptr::null_mut(),
+                    dstDevice: new_dst,
+                    dstArray: std::ptr::null_mut(),
+                    reserved1: std::ptr::null_mut(),
+                    dstPitch: 0, dstHeight: 0,
+                    WidthInBytes: entry.width_bytes,
+                    Height: 1, Depth: 1,
+                };
+                let rc = unsafe {
+                    cuda_core::sys::cuGraphExecMemcpyNodeSetParams(
+                        decode_graph.cu_exec,
+                        entry.node,
+                        &params,
+                        cu_ctx,
+                    )
+                };
+                if rc != 0 {
+                    eprintln!("[cuda_graph] cuGraphExecMemcpyNodeSetParams failed: {rc}; falling back");
+                    drop(graph_cache);
+                    return self.forward_decode_nogpu(embedding, positions, gpu_kv_cache);
+                }
             }
-            decode_graph.cu_exec
+
+            unsafe { cuda_core::sys::cuGraphLaunch(decode_graph.cu_exec, cu_stream); }
+            unsafe { stream.synchronize().expect("stream sync after graph launch failed"); }
+            drop(graph_cache);
         } else {
-            // First decode step: instantiate the graph.
+            // ── First step: capture graph, instantiate, find KV nodes, launch ─
+            let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
+            unsafe { stream.begin_capture(relaxed).expect("cuStreamBeginCapture failed"); }
+
+            let hidden_dev = self.d_embed.clone();
+            self.forward_decode_inner(hidden_dev, positions, gpu_kv_cache);
+
+            let cu_graph = unsafe { stream.end_capture().expect("cuStreamEndCapture failed") };
+
             let mut cu_exec_uninit = MaybeUninit::<cuda_core::sys::CUgraphExec>::uninit();
             unsafe {
-                cuda_core::sys::cuGraphInstantiateWithFlags(
-                    cu_exec_uninit.as_mut_ptr(),
-                    cu_graph,
-                    0,
-                )
-            };
+                cuda_core::sys::cuGraphInstantiateWithFlags(cu_exec_uninit.as_mut_ptr(), cu_graph, 0);
+            }
             let cu_exec = unsafe { cu_exec_uninit.assume_init() };
+
+            // Find KV-write memcpy nodes for subsequent-step updates.
+            let kv_memcpy_entries = self.find_kv_memcpy_nodes(cu_graph, gpu_kv_cache);
             unsafe { cuda_core::sys::cuGraphDestroy(cu_graph) };
 
             *graph_cache = Some(DecodeGraph {
                 cu_exec,
                 device: stream.device().clone(),
+                kv_memcpy_entries,
             });
-            cu_exec
-        };
 
-        // ── Step 6: Launch the (updated) exec ───────────────────────────────
-        unsafe {
-            cuda_core::sys::cuGraphLaunch(cu_exec, cu_stream);
+            unsafe { cuda_core::sys::cuGraphLaunch(cu_exec, cu_stream); }
+            unsafe { stream.synchronize().expect("stream sync after first graph launch failed"); }
+            drop(graph_cache);
         }
-
-        // ── Step 7: Sync and return logits ───────────────────────────────────
-        // All GPU work (embedding copy + graph) is now in-flight on the stream.
-        unsafe {
-            stream.synchronize().expect("stream sync after graph launch failed");
-        }
-        drop(graph_cache);
 
         // Logits reside in SLOT_LOGITS — download and return.
         let logits_arc = self
-            .scratch
-            .borrow()
-            [SLOT_LOGITS]
-            .clone()
+            .scratch.borrow()[SLOT_LOGITS].clone()
             .expect("SLOT_LOGITS empty after graph launch");
         self.download_device_tensor(&logits_arc)
+    }
+
+    /// Enumerate all MEMCPY nodes in `cu_graph` that write to the KV cache.
+    ///
+    /// These nodes' destination pointers are updated per decode step via
+    /// `cuGraphExecMemcpyNodeSetParams` so the graph can be replayed without
+    /// re-capture.
+    fn find_kv_memcpy_nodes(
+        &self,
+        cu_graph: cuda_core::sys::CUgraph,
+        kv_cache: &CutileKvCache,
+    ) -> Vec<KvMemcpyEntry> {
+        let kv_dim    = self.config.num_kv_heads * self.config.head_dim;
+        let width_tgt = kv_dim * std::mem::size_of::<f32>();
+
+        // Enumerate all graph nodes.
+        let mut num_nodes = 0usize;
+        unsafe { cuda_core::sys::cuGraphGetNodes(cu_graph, std::ptr::null_mut(), &mut num_nodes) };
+        if num_nodes == 0 { return vec![]; }
+        let mut nodes = vec![std::ptr::null_mut::<cuda_core::sys::CUgraphNode_st>(); num_nodes];
+        unsafe { cuda_core::sys::cuGraphGetNodes(cu_graph, nodes.as_mut_ptr(), &mut num_nodes) };
+
+        // Collect K and V device base pointers for all layers.
+        let kv_base_ptrs: Vec<(cuda_core::sys::CUdeviceptr, cuda_core::sys::CUdeviceptr)> = (0..kv_cache.n_layers())
+            .map(|l| {
+                let (k, v) = kv_cache.kv_device_tensors(l);
+                (k.device_pointer().cu_deviceptr(), v.device_pointer().cu_deviceptr())
+            })
+            .collect();
+
+        let f32_bytes = std::mem::size_of::<f32>() as u64;
+        let kv_dim_bytes = kv_dim as u64 * f32_bytes;
+
+        let mut entries = Vec::new();
+        for node in &nodes {
+            let mut node_type: cuda_core::sys::CUgraphNodeType = 0;
+            unsafe { cuda_core::sys::cuGraphNodeGetType(*node, &mut node_type) };
+            if node_type != cuda_core::sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY {
+                continue;
+            }
+            let mut params: cuda_core::sys::CUDA_MEMCPY3D = unsafe { std::mem::zeroed() };
+            let rc = unsafe { cuda_core::sys::cuGraphMemcpyNodeGetParams(*node, &mut params) };
+            if rc != 0 { continue; }
+            if params.WidthInBytes != width_tgt { continue; }
+            if params.srcMemoryType != cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE { continue; }
+            if params.dstMemoryType != cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE { continue; }
+            // Find which layer this node belongs to by matching dst to kv cache range.
+            let dst = params.dstDevice;
+            for (k_base, v_base) in &kv_base_ptrs {
+                let kv_range = kv_cache.gpu_max_seq_len() as u64 * kv_dim_bytes;
+                if dst >= *k_base && dst < k_base + kv_range {
+                    entries.push(KvMemcpyEntry {
+                        node: *node,
+                        src_ptr: params.srcDevice,
+                        cache_base: *k_base,
+                        width_bytes: width_tgt,
+                    });
+                    break;
+                }
+                if dst >= *v_base && dst < v_base + kv_range {
+                    entries.push(KvMemcpyEntry {
+                        node: *node,
+                        src_ptr: params.srcDevice,
+                        cache_base: *v_base,
+                        width_bytes: width_tgt,
+                    });
+                    break;
+                }
+            }
+        }
+        entries
     }
 
     /// Run the decode forward pass without CUDA graph capture.
