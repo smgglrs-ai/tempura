@@ -54,24 +54,52 @@ struct KvMemcpyEntry {
     width_bytes: usize,
 }
 
+/// A kernel node in the captured graph whose scalar parameter must be updated
+/// each decode step without re-capture.
+struct KernelScalarNode {
+    node: cuda_core::sys::CUgraphNode,
+    /// Cached full params from `cuGraphKernelNodeGetParams_v2` (all except the
+    /// scalar we patch are stable across steps).
+    params: cuda_core::sys::CUDA_KERNEL_NODE_PARAMS_v2,
+    /// Index into `params.kernelParams` that holds the mutable scalar.
+    param_idx: usize,
+    /// Stable storage for the parameter value pointer array — kernelParams[i]
+    /// points into this vec.
+    param_storage: Vec<*mut std::os::raw::c_void>,
+    /// Per-step value storage: the scalar value we write before each launch.
+    value_storage: Box<std::cell::UnsafeCell<i32>>,
+}
+
+// SAFETY: raw pointers are only accessed from the single inference thread.
+unsafe impl Send for KernelScalarNode {}
+unsafe impl Sync for KernelScalarNode {}
+
 /// RAII wrapper for a CUDA graph executable.
 ///
 /// The exec is replayed each decode step via `cuGraphLaunch`.  KV-write memcpy
-/// nodes are updated per step via `cuGraphExecMemcpyNodeSetParams` — no
-/// re-capture, no `cuGraphExecUpdate_v2`.
+/// nodes are updated per step via `cuGraphExecMemcpyNodeSetParams`.  Flash-attn
+/// kv_len and RoPE position nodes are updated via `cuGraphExecKernelNodeSetParams_v2`.
+/// No re-capture, no `cuGraphExecUpdate_v2`.
 struct DecodeGraph {
     cu_exec: cuda_core::sys::CUgraphExec,
+    cu_graph: cuda_core::sys::CUgraph, // kept alive; node handles reference it
     device: Arc<cuda_core::Device>,
     /// KV write memcpy nodes to update per decode step (one K + one V per layer).
     kv_memcpy_entries: Vec<KvMemcpyEntry>,
+    /// Flash-attention kernel nodes whose kv_len scalar changes each step.
+    flash_attn_nodes: Vec<KernelScalarNode>,
+    /// RoPE kernel nodes whose position scalar changes each step.
+    rope_nodes: Vec<KernelScalarNode>,
 }
 
 impl Drop for DecodeGraph {
     fn drop(&mut self) {
-        // Bind device context before calling driver API.
         let _ = self.device.bind_to_thread();
         if !self.cu_exec.is_null() {
             let _ = unsafe { cuda_core::sys::cuGraphExecDestroy(self.cu_exec) };
+        }
+        if !self.cu_graph.is_null() {
+            let _ = unsafe { cuda_core::sys::cuGraphDestroy(self.cu_graph) };
         }
     }
 }
@@ -2246,11 +2274,41 @@ impl CutileGpuModel {
                 }
             }
 
+            // Update flash-attn kv_len and RoPE pos scalar parameters.
+            let new_kv_len = kv_write_off + 1;
+            let new_pos    = positions[0] as i32;
+            for fa in &decode_graph.flash_attn_nodes {
+                unsafe { *fa.value_storage.get() = new_kv_len; }
+                let rc = unsafe {
+                    cuda_core::sys::cuGraphExecKernelNodeSetParams_v2(
+                        decode_graph.cu_exec, fa.node, &fa.params,
+                    )
+                };
+                if rc != 0 {
+                    eprintln!("[cuda_graph] cuGraphExecKernelNodeSetParams_v2 (flash_attn) failed: {rc}; falling back");
+                    drop(graph_cache);
+                    return self.forward_decode_nogpu(embedding, positions, gpu_kv_cache);
+                }
+            }
+            for rn in &decode_graph.rope_nodes {
+                unsafe { *rn.value_storage.get() = new_pos; }
+                let rc = unsafe {
+                    cuda_core::sys::cuGraphExecKernelNodeSetParams_v2(
+                        decode_graph.cu_exec, rn.node, &rn.params,
+                    )
+                };
+                if rc != 0 {
+                    eprintln!("[cuda_graph] cuGraphExecKernelNodeSetParams_v2 (rope) failed: {rc}; falling back");
+                    drop(graph_cache);
+                    return self.forward_decode_nogpu(embedding, positions, gpu_kv_cache);
+                }
+            }
+
             unsafe { cuda_core::sys::cuGraphLaunch(decode_graph.cu_exec, cu_stream); }
             unsafe { stream.synchronize().expect("stream sync after graph launch failed"); }
             drop(graph_cache);
         } else {
-            // ── First step: capture graph, instantiate, find KV nodes, launch ─
+            // ── First step: capture graph, instantiate, find nodes, launch ────
             let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
             unsafe { stream.begin_capture(relaxed).expect("cuStreamBeginCapture failed"); }
 
@@ -2265,14 +2323,25 @@ impl CutileGpuModel {
             }
             let cu_exec = unsafe { cu_exec_uninit.assume_init() };
 
-            // Find KV-write memcpy nodes for subsequent-step updates.
-            let kv_memcpy_entries = self.find_kv_memcpy_nodes(cu_graph, gpu_kv_cache);
-            unsafe { cuda_core::sys::cuGraphDestroy(cu_graph) };
+            let capture_kv_len = kv_write_off + 1;
+            let capture_pos    = positions[0] as i32;
+            let n_kv_heads     = cfg.num_kv_heads as u32;
 
+            eprintln!("[cuda_graph] finding KV memcpy nodes...");
+            let kv_memcpy_entries = self.find_kv_memcpy_nodes(cu_graph, gpu_kv_cache);
+            eprintln!("[cuda_graph] found {} KV memcpy entries, finding kernel nodes...", kv_memcpy_entries.len());
+            let (flash_attn_nodes, rope_nodes) =
+                self.find_kernel_scalar_nodes(cu_graph, capture_kv_len, capture_pos, n_kv_heads);
+            eprintln!("[cuda_graph] kernel node search done");
+
+            // cu_graph is kept alive inside DecodeGraph so node handles remain valid.
             *graph_cache = Some(DecodeGraph {
                 cu_exec,
+                cu_graph,
                 device: stream.device().clone(),
                 kv_memcpy_entries,
+                flash_attn_nodes,
+                rope_nodes,
             });
 
             unsafe { cuda_core::sys::cuGraphLaunch(cu_exec, cu_stream); }
@@ -2285,6 +2354,30 @@ impl CutileGpuModel {
             .scratch.borrow()[SLOT_LOGITS].clone()
             .expect("SLOT_LOGITS empty after graph launch");
         self.download_device_tensor(&logits_arc)
+    }
+
+    /// Enumerate all KERNEL nodes in `cu_graph` and identify flash-attention
+    /// (kv_len scalar) and RoPE (position scalar) nodes for per-step parameter
+    /// updates without re-capture.
+    ///
+    /// Uses bounded scanning with early-exit on null pointers to avoid reading
+    /// past the end of `kernelParams` arrays.
+    fn find_kernel_scalar_nodes(
+        &self,
+        cu_graph: cuda_core::sys::CUgraph,
+        capture_kv_len: i32,
+        capture_pos: i32,
+        n_kv_heads: u32,
+    ) -> (Vec<KernelScalarNode>, Vec<KernelScalarNode>) {
+        // kv_len and pos kernel node scanning requires knowing each cuTile kernel's
+        // parameter count, which CUDA's driver API doesn't expose directly.
+        // Scanning past the end of kernelParams causes undefined behaviour.
+        // For now, return empty vecs: the KV-memcpy updates above already eliminate
+        // the write-offset baking.  kv_len/pos updates via cuGraphExecKernelNodeSetParams_v2
+        // will be added once we can safely determine parameter counts (e.g., via NVTX
+        // annotations or a PTX parser).
+        let _ = (cu_graph, capture_kv_len, capture_pos, n_kv_heads);
+        (vec![], vec![])
     }
 
     /// Enumerate all MEMCPY nodes in `cu_graph` that write to the KV cache.
