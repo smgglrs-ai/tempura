@@ -161,10 +161,11 @@ pub mod kernels {
         q: &Tensor<f32, { [-1] }>,
         k_cache: &Tensor<f32, { [-1] }>,
         v_cache: &Tensor<f32, { [-1] }>,
-        kv_len: i32,
+        kv_len_dev: &Tensor<i32, { [-1] }>,
         scale: f32,
         heads_per_group: i32,
     ) {
+        let kv_len: i32 = tile_to_scalar(kv_len_dev.partition(shape![1]).load([0i32]));
         let h = program_id(0);
         let kv_h = h / heads_per_group;
 
@@ -887,13 +888,22 @@ impl CutileFlashAttention {
     ///
     /// The returned tensor is being written asynchronously.  Caller MUST synchronise
     /// the stream (or rely on a downstream D→H `sync_on`) before reading on the CPU.
+    /// Create a 1-element device tensor from a host kv_len for the prefill / fallback path.
+    pub fn kv_len_to_dev(kv_len: usize, stream: &Arc<Stream>) -> Result<Arc<Tensor<i32>>> {
+        Ok(Arc::new(
+            api::copy_host_vec_to_device(&Arc::new(vec![kv_len as i32]))
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn decode_attention_device_scratch(
         &self,
         q_dev: &Arc<Tensor<f32>>,
         k_cache: &Arc<Tensor<f32>>,
         v_cache: &Arc<Tensor<f32>>,
-        kv_len: usize,
+        kv_len_dev: Arc<Tensor<i32>>,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
@@ -936,7 +946,7 @@ impl CutileFlashAttention {
                 q_dev.clone(),
                 k_cache.clone(),
                 v_cache.clone(),
-                kv_len as i32,
+                kv_len_dev,
                 scale,
                 heads_per_group,
             )

@@ -61,8 +61,9 @@ pub mod kernels {
         x_second: &Tensor<f32, { [-1] }>,
         cos_table: &Tensor<f32, { [-1] }>,
         sin_table: &Tensor<f32, { [-1] }>,
-        pos: i32,
+        pos_dev: &Tensor<i32, { [-1] }>,
     ) {
+        let pos: i32 = tile_to_scalar(pos_dev.partition(shape![1]).load([0i32]));
         let pid = program_id(0);
         let tile_x0 = x_first.partition(shape![HALF_DIM]).load([pid]);
         let tile_x1 = x_second.partition(shape![HALF_DIM]).load([pid]);
@@ -554,9 +555,15 @@ impl CutileRoPE {
                 if self.table_half_dim == half {
                     let pos = positions[0] as usize;
                     if pos < self.table_max_pos {
+                        // Upload pos as a 1-element device tensor for the kernel.
+                        let pos_dev = Arc::new(
+                            api::copy_host_vec_to_device(&Arc::new(vec![pos as i32]))
+                                .sync_on(stream)
+                                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+                        );
                         return self.forward_device_scratch_from_table(
                             x_dev,
-                            pos as i32,
+                            &pos_dev,
                             n_heads,
                             head_dim,
                             half,
@@ -691,7 +698,7 @@ impl CutileRoPE {
     fn forward_device_scratch_from_table(
         &self,
         x_dev: &Arc<Tensor<f32>>,
-        pos: i32,
+        pos_dev: &Arc<Tensor<i32>>,
         n_heads: usize,
         head_dim: usize,
         half: usize,
@@ -700,7 +707,6 @@ impl CutileRoPE {
         scratch: &mut RopeScratch,
         stream: &Arc<Stream>,
     ) -> Result<Arc<Tensor<f32>>> {
-        let num_sh = n_heads; // seq_len == 1
         let generics = vec![half.to_string()];
 
         let z_tensor = scratch
@@ -740,7 +746,7 @@ impl CutileRoPE {
                 x_second_arc,
                 cos_t.clone(),
                 sin_t.clone(),
-                pos,
+                pos_dev.clone(),
             )
             .generics(generics.clone())
             .async_on(stream)
@@ -770,6 +776,44 @@ impl CutileRoPE {
         let z_arc = Arc::new(z_t.unpartition());
         scratch.z = Some(z_arc.clone());
         Ok(z_arc)
+    }
+
+    /// Decode-path RoPE with a pre-allocated device position tensor.
+    ///
+    /// Used by the CUDA graph decode path: `pos_dev` is written via H→D before each
+    /// graph replay, so the graph can be captured once and replayed without re-capture.
+    /// Requires the precomputed cos/sin table (`precompute_table` must have been called).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_device_scratch_dev(
+        &self,
+        x_dev: &Arc<Tensor<f32>>,
+        pos_dev: &Arc<Tensor<i32>>,
+        n_heads: usize,
+        head_dim: usize,
+        scratch: &mut RopeScratch,
+        stream: &Arc<Stream>,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let num_sh = n_heads; // seq_len == 1 for decode
+        if num_sh > scratch.cap_num_sh || head_dim != scratch.head_dim {
+            return Err(KernelError::InvalidConfig(
+                "forward_device_scratch_dev: scratch too small or head_dim mismatch".into(),
+            ));
+        }
+        if !head_dim.is_multiple_of(2) {
+            return Err(KernelError::InvalidConfig(format!(
+                "head_dim must be even, got {head_dim}"
+            )));
+        }
+        let half = head_dim / 2;
+        let (cos_t, sin_t) = match (&self.cos_table, &self.sin_table) {
+            (Some(c), Some(s)) if self.table_half_dim == half => (c, s),
+            _ => return Err(KernelError::InvalidConfig(
+                "forward_device_scratch_dev: cos/sin table not precomputed".into(),
+            )),
+        };
+        self.forward_device_scratch_from_table(
+            x_dev, pos_dev, n_heads, head_dim, half, cos_t, sin_t, scratch, stream,
+        )
     }
 
     /// Shared rotation apply: splits `x` into halves, runs the GPU kernel,
