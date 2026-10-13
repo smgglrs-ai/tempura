@@ -44,6 +44,7 @@ const KERNEL_ENTRY: &str = "q4k_gemv_decode_v2";
 const KERNEL_Q8_QUANTIZE: &str = "quantize_q8_1";
 const KERNEL_Q8_GEMV: &str = "q4k_gemv_decode_q8";
 const KERNEL_Q8_GEMV_V2: &str = "q4k_gemv_decode_q8_v2";
+const KERNEL_Q8_GEMV_V3: &str = "q4k_gemv_decode_q8_v3";
 const WARPS_PER_BLOCK: u32 = 4;
 const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128
 
@@ -57,6 +58,8 @@ pub struct OxideQ4kGemv {
     cu_q8_gemv:        Option<CUfunction>,
     /// Optional Q4K+Q8_1 GEMV v2 kernel (K-parallelism + mini-warp dp4a combined).
     cu_q8_gemv_v2:     Option<CUfunction>,
+    /// Optional Q4K+Q8_1 GEMV v3 kernel (VDR=2 double-block K-loop).
+    cu_q8_gemv_v3:     Option<CUfunction>,
     stream:         Arc<Stream>,
     /// Pre-allocated Q8_1 scratch buffers (set by pre_allocate_q8_scratch before graph capture).
     /// These avoid device allocation on a capturing stream (CUDA error 900).
@@ -143,16 +146,18 @@ impl OxideQ4kGemv {
             let cu_q8_quantize = load_fn(KERNEL_Q8_QUANTIZE);
             let cu_q8_gemv     = load_fn(KERNEL_Q8_GEMV);
             let cu_q8_gemv_v2  = load_fn(KERNEL_Q8_GEMV_V2);
+            let cu_q8_gemv_v3  = load_fn(KERNEL_Q8_GEMV_V3);
 
             eprintln!(
-                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={}, q8v2={})",
+                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={}, q8v2={}, q8v3={})",
                 OXIDE_Q4K_PTX.len(),
                 KERNEL_ENTRY,
                 cu_q8_gemv.is_some(),
                 cu_q8_gemv_v2.is_some(),
+                cu_q8_gemv_v3.is_some(),
             );
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, stream,
                 q8_qs_scratch:  std::cell::RefCell::new(None),
                 q8_ds_scratch:  std::cell::RefCell::new(None),
                 q8_out_scratch: std::cell::RefCell::new(None),
@@ -275,7 +280,8 @@ impl OxideQ4kGemv {
 
     /// Returns true when the Q8_1 quantize + integer GEMV path is compiled into the PTX.
     pub fn has_q8_path(&self) -> bool {
-        self.cu_q8_quantize.is_some() && (self.cu_q8_gemv_v2.is_some() || self.cu_q8_gemv.is_some())
+        self.cu_q8_quantize.is_some()
+            && (self.cu_q8_gemv_v3.is_some() || self.cu_q8_gemv_v2.is_some() || self.cu_q8_gemv.is_some())
     }
 
     /// Quantize `x` (f32 K-vector) → Q8_1 packed int8 + scales, then run Q4K GEMV.
@@ -289,19 +295,22 @@ impl OxideQ4kGemv {
         n: usize,
         k_blocks: usize,
     ) -> Result<Arc<Tensor<f32>>> {
-        // Prefer v2 (K-loop parallelism + mini-warp dp4a) over v1.
-        let (q8_quant_fn, q8_gemv_fn, use_v2) = match &self.cu_q8_quantize {
+        // Prefer v3 (VDR=2 double-block) > v2 (K-parallelism + dp4a) > v1.
+        let (q8_quant_fn, q8_gemv_fn, kernel_variant) = match &self.cu_q8_quantize {
             Some(q) => {
-                if let Some(g2) = &self.cu_q8_gemv_v2 {
-                    (*q, *g2, true)
+                if let Some(g3) = &self.cu_q8_gemv_v3 {
+                    (*q, *g3, 3u8)
+                } else if let Some(g2) = &self.cu_q8_gemv_v2 {
+                    (*q, *g2, 2u8)
                 } else if let Some(g) = &self.cu_q8_gemv {
-                    (*q, *g, false)
+                    (*q, *g, 1u8)
                 } else {
                     return Err(KernelError::InvalidConfig("Q8 GEMV kernel not loaded".into()));
                 }
             }
             _ => return Err(KernelError::InvalidConfig("Q8 kernels not loaded".into())),
         };
+        let use_v2 = kernel_variant >= 2;
 
         let k = k_blocks * 256;  // total activation elements
         let k_q8_blocks = k.div_ceil(32);  // number of Q8_1 blocks
@@ -406,7 +415,11 @@ impl OxideQ4kGemv {
             } else {
                 (n.div_ceil(WARPS_PER_BLOCK as usize) as u32, WARPS_PER_BLOCK * 4 * 4)
             };
-            let kernel_name = if use_v2 { "q4k_gemv_decode_q8_v2" } else { "q4k_gemv_decode_q8" };
+            let kernel_name = match kernel_variant {
+                3 => "q4k_gemv_decode_q8_v3",
+                2 => "q4k_gemv_decode_q8_v2",
+                _ => "q4k_gemv_decode_q8",
+            };
             unsafe {
                 launch_kernel(
                     q8_gemv_fn,

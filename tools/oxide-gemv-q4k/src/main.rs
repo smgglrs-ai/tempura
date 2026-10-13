@@ -510,6 +510,158 @@ mod kernels {
         }
     }
 
+    /// Q4_K GEMV v3: VDR=2 double-block K-loop (llama.cpp access pattern).
+    ///
+    /// Same mini-warp dp4a structure as v2, but each K-loop iteration loads and
+    /// processes TWO consecutive Q4K blocks (blk, blk+1) before any computation.
+    /// This doubles concurrent DRAM requests per warp, targeting llama.cpp's 58%
+    /// DRAM throughput (vs 32% in v2).
+    ///
+    /// K-loop: warp w starts at 2*w, strides WARPS_PER_BLOCK*2.
+    /// Tail loop: handles any remaining block when k_blocks is odd.
+    ///
+    /// Grid:  N blocks (one output neuron per block; all warps cooperate on K).
+    /// Block: WARPS_PER_BLOCK * 32 threads.
+    /// Shared memory: WARPS_PER_BLOCK * 4 * 4 = 64 bytes.
+    #[kernel]
+    pub fn q4k_gemv_decode_q8_v3(
+        mut out: DisjointSlice<f32>,
+        x_qs: &[u32],    // [K/4] packed i8 activations (4 per u32)
+        x_ds: &[u32],    // [K/32] Q8_1 f16 scales as u16 in low bits
+        packed: &[u32],  // [N, K_BLOCKS, 42] Q4K packed weights
+        n: u32,
+        k_blocks: u32,
+    ) {
+        let tid     = thread::threadIdx_x();
+        let bid     = thread::blockIdx_x();
+        let warp_id = tid / 32;
+        let lane    = tid % 32;
+        let n_out   = bid;
+        if n_out >= n { return; }
+
+        let mw        = lane / 8;
+        let sub_l     = lane % 8;
+        let mini_mask = 0xFF_u32 << (mw * 8);
+        let base_lane = mw * 8;
+
+        let mut acc = 0.0_f32;
+
+        // ── Main double-block K-loop (VDR=2) ──────────────────────────────────
+        let mut blk = warp_id * 2;
+        while blk + 1 < k_blocks {
+            let base0 = (n_out * k_blocks + blk) * 42;
+            let base1 = (n_out * k_blocks + blk + 1) * 42;
+
+            // Phase 1: Issue ALL loads for BOTH blocks before any shuffle.
+            let d_raw0    = if lane == 0 { packed[base0 as usize] } else { 0 };
+            let dmin_raw0 = if lane == 0 { packed[(base0 + 1) as usize] } else { 0 };
+            let sc_raw0   = if sub_l == 0 { packed[(base0 + 2 + mw) as usize] } else { 0 };
+            let m_raw0    = if sub_l == 0 { packed[(base0 + 6 + mw) as usize] } else { 0 };
+            let qs0       = packed[(base0 + 10 + mw * 8 + sub_l) as usize];
+            let q8b0_lo   = blk * 8 + mw * 2;
+            let q8b0_hi   = q8b0_lo + 1;
+            let u0_lo     = x_qs[(q8b0_lo * 8 + sub_l) as usize];
+            let u0_hi     = x_qs[(q8b0_hi * 8 + sub_l) as usize];
+
+            let d_raw1    = if lane == 0 { packed[base1 as usize] } else { 0 };
+            let dmin_raw1 = if lane == 0 { packed[(base1 + 1) as usize] } else { 0 };
+            let sc_raw1   = if sub_l == 0 { packed[(base1 + 2 + mw) as usize] } else { 0 };
+            let m_raw1    = if sub_l == 0 { packed[(base1 + 6 + mw) as usize] } else { 0 };
+            let qs1       = packed[(base1 + 10 + mw * 8 + sub_l) as usize];
+            let q8b1_lo   = (blk + 1) * 8 + mw * 2;
+            let q8b1_hi   = q8b1_lo + 1;
+            let u1_lo     = x_qs[(q8b1_lo * 8 + sub_l) as usize];
+            let u1_hi     = x_qs[(q8b1_hi * 8 + sub_l) as usize];
+
+            // Phase 2: Compute block 0.
+            let d0    = f32::from_bits(warp::shuffle(d_raw0, 0));
+            let dmin0 = f32::from_bits(warp::shuffle(dmin_raw0, 0));
+            let sc0_bc = warp::shuffle_sync(mini_mask, sc_raw0, base_lane);
+            let m0_bc  = warp::shuffle_sync(mini_mask, m_raw0,  base_lane);
+            let d8_0_lo = f16_to_f32(x_ds[q8b0_lo as usize] & 0xFFFF);
+            let d8_0_hi = f16_to_f32(x_ds[q8b0_hi as usize] & 0xFFFF);
+            let v0_lo = qs0 & 0x0F0F0F0F;
+            let v0_hi = (qs0 >> 4) & 0x0F0F0F0F;
+            acc += d8_0_lo * (d0 * ((sc0_bc & 0xFF) as f32) * (dp4a_s32(v0_lo, u0_lo, 0) as f32)
+                             - dmin0 * ((m0_bc & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_lo, 0) as f32))
+                 + d8_0_hi * (d0 * (((sc0_bc >> 8) & 0xFF) as f32) * (dp4a_s32(v0_hi, u0_hi, 0) as f32)
+                             - dmin0 * (((m0_bc >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_hi, 0) as f32));
+
+            // Phase 3: Compute block 1.
+            let d1    = f32::from_bits(warp::shuffle(d_raw1, 0));
+            let dmin1 = f32::from_bits(warp::shuffle(dmin_raw1, 0));
+            let sc1_bc = warp::shuffle_sync(mini_mask, sc_raw1, base_lane);
+            let m1_bc  = warp::shuffle_sync(mini_mask, m_raw1,  base_lane);
+            let d8_1_lo = f16_to_f32(x_ds[q8b1_lo as usize] & 0xFFFF);
+            let d8_1_hi = f16_to_f32(x_ds[q8b1_hi as usize] & 0xFFFF);
+            let v1_lo = qs1 & 0x0F0F0F0F;
+            let v1_hi = (qs1 >> 4) & 0x0F0F0F0F;
+            acc += d8_1_lo * (d1 * ((sc1_bc & 0xFF) as f32) * (dp4a_s32(v1_lo, u1_lo, 0) as f32)
+                             - dmin1 * ((m1_bc & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_lo, 0) as f32))
+                 + d8_1_hi * (d1 * (((sc1_bc >> 8) & 0xFF) as f32) * (dp4a_s32(v1_hi, u1_hi, 0) as f32)
+                             - dmin1 * (((m1_bc >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_hi, 0) as f32));
+
+            blk += WARPS_PER_BLOCK * 2;
+        }
+
+        // ── Tail: single-block fallback for odd k_blocks ──────────────────────
+        while blk < k_blocks {
+            let base = (n_out * k_blocks + blk) * 42;
+            let d_raw    = if lane == 0 { packed[base as usize] } else { 0 };
+            let dmin_raw = if lane == 0 { packed[(base + 1) as usize] } else { 0 };
+            let d    = f32::from_bits(warp::shuffle(d_raw, 0));
+            let dmin = f32::from_bits(warp::shuffle(dmin_raw, 0));
+            let sc_raw = if sub_l == 0 { packed[(base + 2 + mw) as usize] } else { 0 };
+            let m_raw  = if sub_l == 0 { packed[(base + 6 + mw) as usize] } else { 0 };
+            let sc_bc = warp::shuffle_sync(mini_mask, sc_raw, base_lane);
+            let m_bc  = warp::shuffle_sync(mini_mask, m_raw,  base_lane);
+            let q8_lo = blk * 8 + mw * 2;
+            let q8_hi = q8_lo + 1;
+            let d8_lo = f16_to_f32(x_ds[q8_lo as usize] & 0xFFFF);
+            let d8_hi = f16_to_f32(x_ds[q8_hi as usize] & 0xFFFF);
+            let qs    = packed[(base + 10 + mw * 8 + sub_l) as usize];
+            let v_lo  = qs & 0x0F0F0F0F;
+            let v_hi  = (qs >> 4) & 0x0F0F0F0F;
+            let u_lo  = x_qs[(q8_lo * 8 + sub_l) as usize];
+            let u_hi  = x_qs[(q8_hi * 8 + sub_l) as usize];
+            acc += d8_lo * (d * ((sc_bc & 0xFF) as f32) * (dp4a_s32(v_lo, u_lo, 0) as f32)
+                           - dmin * ((m_bc & 0xFF) as f32) * (dp4a_s32(0x01010101, u_lo, 0) as f32))
+                 + d8_hi * (d * (((sc_bc >> 8) & 0xFF) as f32) * (dp4a_s32(v_hi, u_hi, 0) as f32)
+                           - dmin * (((m_bc >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u_hi, 0) as f32));
+            blk += WARPS_PER_BLOCK * 2;
+        }
+
+        // ── Reduction: identical to v2 ─────────────────────────────────────────
+        acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 4);
+        acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 2);
+        acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 1);
+
+        let smem: *mut f32 = DynamicSharedArray::<f32>::get();
+        if sub_l == 0 {
+            unsafe { *smem.add((warp_id * 4 + mw) as usize) = acc; }
+        }
+        thread::sync_threads();
+
+        if warp_id == 0 && lane < 4 {
+            let j = lane;
+            let mut total = 0.0_f32;
+            let mut w = 0u32;
+            while w < WARPS_PER_BLOCK {
+                total += unsafe { *smem.add((w * 4 + j) as usize) };
+                w += 1;
+            }
+            unsafe { *smem.add(j as usize) = total; }
+        }
+        thread::sync_threads();
+
+        if warp_id == 0 && lane == 0 {
+            let total = unsafe {
+                *smem.add(0) + *smem.add(1) + *smem.add(2) + *smem.add(3)
+            };
+            unsafe { *out.get_unchecked_mut(n_out as usize) = total; }
+        }
+    }
+
     /// Q4_K GEMV with Q8_1-quantized activations and proper 4-element dp4a.
     ///
     /// Mini-warp structure: the 32-lane warp is divided into 4 mini-warps of 8 lanes.
