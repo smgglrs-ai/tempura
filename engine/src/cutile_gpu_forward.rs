@@ -299,6 +299,17 @@ pub struct CutileGpuModel {
     /// reads the latest value on every replay.
     d_embed: Arc<Tensor<f32>>,
 
+    // ── Device-side decode scalars for single-capture CUDA graph (Opt 5) ──────
+    //
+    // Written H→D before each graph replay so the graph can be captured once
+    // and replayed N times without cuStreamBeginCapture per token.
+    /// kv_len after the current step's KV append (read by flash attention).
+    d_kv_len: Arc<Tensor<i32>>,
+    /// Current token position for RoPE (scalar, same for all heads in M=1 decode).
+    d_positions: Arc<Tensor<u32>>,
+    /// KV cache write slot before the current step's append (read by append kernel).
+    d_kv_write_offset: Arc<Tensor<i32>>,
+
     /// Pre-allocated RMSNorm scratch for the final model norm applied after the
     /// layer loop (seq_len=1 decode only).  Eliminates the three `api::zeros`
     /// allocations inside `forward_device_fused` that would otherwise block
@@ -956,6 +967,9 @@ impl CutileGpuModel {
             silu_out_scratch: RefCell::new(silu_out_scratch),
             down_proj_pad_scratch: RefCell::new(down_proj_pad_scratch),
             d_embed,
+            d_kv_len,
+            d_positions,
+            d_kv_write_offset,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
         };
@@ -1091,6 +1105,23 @@ impl CutileGpuModel {
                 .expect("d_embed: device allocation failed"),
         );
 
+        // Device-side decode scalars for single-capture CUDA graph (Opt 5).
+        let d_kv_len = Arc::new(
+            api::zeros::<i32>(&[1])
+                .sync_on(matmul.stream())
+                .expect("d_kv_len alloc failed"),
+        );
+        let d_positions = Arc::new(
+            api::zeros::<u32>(&[1])
+                .sync_on(matmul.stream())
+                .expect("d_positions alloc failed"),
+        );
+        let d_kv_write_offset = Arc::new(
+            api::zeros::<i32>(&[1])
+                .sync_on(matmul.stream())
+                .expect("d_kv_write_offset alloc failed"),
+        );
+
         let model = Self {
             config: config.clone(),
             h_pad,
@@ -1123,6 +1154,9 @@ impl CutileGpuModel {
             silu_out_scratch: RefCell::new(silu_out_scratch),
             down_proj_pad_scratch: RefCell::new(down_proj_pad_scratch),
             d_embed,
+            d_kv_len,
+            d_positions,
+            d_kv_write_offset,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
         };

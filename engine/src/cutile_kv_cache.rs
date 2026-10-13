@@ -283,6 +283,16 @@ impl CutileKvCache {
         debug_assert!(self.seq_len <= self.max_seq_len);
     }
 
+    /// Advance the host-side seq_len counter without submitting GPU work.
+    ///
+    /// Used by the Opt 5 single-capture CUDA graph path: on steps 2+, the GPU
+    /// KV append runs inside the cached graph, but the host counter must still
+    /// be incremented so subsequent host-side seq_len queries are correct.
+    pub fn advance_host_seq_len(&mut self, n: usize) {
+        self.seq_len += n;
+        debug_assert!(self.seq_len <= self.max_seq_len);
+    }
+
     pub fn reset(&mut self) {
         self.seq_len = 0;
         self.host_stale = false;
