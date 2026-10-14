@@ -293,6 +293,20 @@ impl CutileKvCache {
         debug_assert!(self.seq_len <= self.max_seq_len);
     }
 
+    /// Roll back the KV cache to `target_seq_len` without touching device memory.
+    ///
+    /// The K/V data at positions ≥ target_seq_len remains in device memory but is
+    /// considered logically overwritten on the next append.  This is safe because
+    /// `append_device_gpu_only` always writes at `seq_len` (which we reset here),
+    /// so subsequent appends will overwrite the stale positions.
+    ///
+    /// Used by speculative decoding to discard rejected draft tokens.
+    pub fn rollback(&mut self, target_seq_len: usize) {
+        debug_assert!(target_seq_len <= self.seq_len, "rollback target > seq_len");
+        self.seq_len = target_seq_len;
+        self.host_stale = true;
+    }
+
     pub fn reset(&mut self) {
         self.seq_len = 0;
         self.host_stale = false;

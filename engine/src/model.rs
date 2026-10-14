@@ -9049,6 +9049,29 @@ impl CutileInferenceWrapper {
             }
         }
     }
+
+    /// Roll back the GPU KV cache to `target_seq_len` and update the session
+    /// position and CPU mirror to match.  Used by speculative decoding to
+    /// discard rejected draft tokens without allocating a new KV cache.
+    ///
+    /// After rollback, subsequent `forward` calls overwrite the rolled-back
+    /// positions — the stale device data is never read again.
+    pub fn gpu_kv_rollback(&self, session: &mut crate::session::InferenceSession, target_seq_len: usize) {
+        if let Some(kv_mutex) = &self.gpu_kv_cache {
+            let mut kv = kv_mutex.lock().expect("GPU KV cache mutex poisoned");
+            kv.rollback(target_seq_len);
+        }
+        session.cache.rollback(target_seq_len);
+        session.position = target_seq_len;
+    }
+
+    /// Current GPU KV sequence length (number of K/V entries written).
+    pub fn gpu_kv_seq_len(&self) -> usize {
+        self.gpu_kv_cache
+            .as_ref()
+            .and_then(|m| m.lock().ok().map(|kv| kv.seq_len()))
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(feature = "cutile")]
