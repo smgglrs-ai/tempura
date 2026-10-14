@@ -1,0 +1,16 @@
+[package]
+name = "oxide-decode-attn"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[[bin]]
+name = "oxide-decode-attn"
+path = "src/main.rs"
+
+[workspace]
+
+[dependencies]
+cuda-device = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/cuda-device" }
+cuda-host   = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/cuda-host" }
+cuda-core   = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-core" }

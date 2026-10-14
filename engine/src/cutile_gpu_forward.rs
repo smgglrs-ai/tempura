@@ -37,6 +37,7 @@ use tempura_kernels::cutile_quantized_gemm::{
 use tempura_kernels::oxide_q2_gemv_host::OxideQ2Gemv;
 use tempura_kernels::oxide_q4k_gemv_host::OxideQ4kGemv;
 use tempura_kernels::oxide_q6k_gemv_host::OxideQ6kGemv;
+use tempura_kernels::oxide_decode_attn_host::OxideDecodeAttn;
 use tempura_kernels::{Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE};
 use tempura_kernels::cutile_rmsnorm::{CutileRmsNorm, RmsnormScratch};
 use tempura_kernels::cutile_rope::{CutileRoPE, RopeScratch};
@@ -268,6 +269,9 @@ pub struct CutileGpuModel {
     /// `None` when the `oxide-gemv` feature was not compiled in or when the
     /// oxide build step failed; falls back to `q2_gemv` (cuTile) in that case.
     oxide_q2_gemv: Option<OxideQ2Gemv>,
+    /// Oxide decode flash-attention kernel — accepts kv_len as device pointer,
+    /// enabling single-capture CUDA graph without stale kv_len.
+    oxide_decode_attn: Option<OxideDecodeAttn>,
     /// Hand-optimized oxide Q4_K GEMV kernel (replaces cuTile for M=1 decode).
     oxide_q4k_gemv: Option<OxideQ4kGemv>,
     /// Hand-optimized oxide Q6_K GEMV kernel (replaces cuTile for M=1 decode).
@@ -908,6 +912,8 @@ impl CutileGpuModel {
         let oxide_q2_gemv = OxideQ2Gemv::try_load(matmul.stream().clone());
         let oxide_q4k_gemv = OxideQ4kGemv::try_load(matmul.stream().clone());
         let oxide_q6k_gemv = OxideQ6kGemv::try_load(matmul.stream().clone());
+        // Oxide decode attention (kv_len read from device pointer at execution time).
+        let oxide_decode_attn = OxideDecodeAttn::new(matmul.stream().clone()).ok();
 
         let q4k_count = dw_q4k.len();
         let q6k_count = dw_q6k.len();
@@ -1006,6 +1012,7 @@ impl CutileGpuModel {
             q2_gemv,
             q6k_gemv,
             oxide_q2_gemv,
+            oxide_decode_attn,
             oxide_q4k_gemv,
             oxide_q6k_gemv,
             flash_attn,
@@ -1114,6 +1121,7 @@ impl CutileGpuModel {
         let oxide_q2_gemv = OxideQ2Gemv::try_load(matmul.stream().clone());
         let oxide_q4k_gemv = OxideQ4kGemv::try_load(matmul.stream().clone());
         let oxide_q6k_gemv = OxideQ6kGemv::try_load(matmul.stream().clone());
+        let oxide_decode_attn = OxideDecodeAttn::new(matmul.stream().clone()).ok();
 
         // Pre-compute the full RoPE frequency table on the GPU once.
         cutile_rope.precompute_table(
@@ -1193,6 +1201,7 @@ impl CutileGpuModel {
             q2_gemv,
             q6k_gemv,
             oxide_q2_gemv,
+            oxide_decode_attn,
             oxide_q4k_gemv,
             oxide_q6k_gemv,
             flash_attn,
@@ -2646,21 +2655,59 @@ impl CutileGpuModel {
             // GPU decode attention (fused flash-attention, pre-allocated scratch).
             let scale = 1.0 / (head_dim as f32).sqrt();
             let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer);
-            let attn_out_dev = self
-                .flash_attn
-                .decode_attention_device_scratch(
+
+            // Prefer oxide decode attention (kv_len read from device at execution
+            // time — correct CUDA graph replay without stale kv_len baking).
+            let attn_out_dev = if let Some(ref oda) = self.oxide_decode_attn {
+                let q_dim = n_heads * head_dim;
+                let out_tensor = {
+                    let mut scratch = self.attn_out_scratch.borrow_mut();
+                    match scratch.take() {
+                        Some(arc) => match Arc::try_unwrap(arc) {
+                            Ok(t) => Arc::new(t.reshape(&[q_dim])
+                                .expect("attn out reshape")),
+                            Err(arc_back) => {
+                                *scratch = Some(arc_back);
+                                Arc::new(cutile::api::zeros::<f32>(&[q_dim])
+                                    .sync_on(shared_stream)
+                                    .expect("attn out alloc"))
+                            }
+                        },
+                        None => Arc::new(cutile::api::zeros::<f32>(&[q_dim])
+                            .sync_on(shared_stream)
+                            .expect("attn out alloc")),
+                    }
+                };
+                oda.forward_d2d(
+                    &out_tensor,
                     &q_rot_dev,
                     &k_dev_full,
                     &v_dev_full,
-                    kv_len,
+                    &self.d_kv_len,
                     n_heads,
                     n_kv_heads,
                     head_dim,
                     scale,
-                    shared_stream,
-                    &mut self.attn_out_scratch.borrow_mut(),
-                )
-                .expect("decode attention failed");
+                ).expect("oxide decode attention failed");
+                self.attn_out_scratch.borrow_mut().replace(out_tensor.clone());
+                out_tensor
+            } else {
+                self
+                    .flash_attn
+                    .decode_attention_device_scratch(
+                        &q_rot_dev,
+                        &k_dev_full,
+                        &v_dev_full,
+                        kv_len,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        scale,
+                        shared_stream,
+                        &mut self.attn_out_scratch.borrow_mut(),
+                    )
+                    .expect("decode attention failed")
+            };
 
             // Pad [q_dim] → [1, q_pad] for O-projection (zero-copy reshape when equal).
             let attn_padded_dev = self.attn_out_to_oproj_device(&attn_out_dev, q_dim, self.q_pad);
