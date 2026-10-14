@@ -30,6 +30,8 @@
     "decode_tok_s": 209,
     "prefill_pp128_tok_s": 7335
   },
+  "decode_tok_s_single_request": 108,
+  "decode_note": "single request; batched serving amortizes GEMV+attn overhead — 5+ requests fills all 170 SMs",
   "bottleneck_analysis": {
     "q4k_bandwidth_ceiling_tok_s": 456,
     "q4k_actual_bw_pct": "34-42% (Nsight Compute measured)",
@@ -40,12 +42,12 @@
       "K-loop memory latency hiding (multi-warp K-parallelism already in v2)",
       "CUDA graph re-capture (eliminated via Opt 5: single-capture + device kv_len pointer)"
     ],
-    "remaining_1.9x_gap": [
-      "Flash attention dominates at growing kv_len (2.5ms at kv_len=21, ~5ms at avg kv_len=46)",
-      "Q4K GEMV short-scoreboard stalls (nibble extraction: 3.9% vs llama.cpp 2.6%) — dp4a would help",
-      "Q4K DRAM throughput (42% vs llama.cpp 58%) — VDR=2 helps marginally"
-    ],
-    "next_lever": "Flash attention optimization (prefill KV reuse, chunking) and/or proper dp4a via oxide GEMV (not cuTile DSL limitation)"
+    "remaining_1.9x_gap_confirmed_blockers": {
+      "gemv_6.1ms": "42% DRAM (vs llama.cpp 58%) — raw GGUF slower (scale decode overhead), VDR=2 applied, no further gains found",
+      "flash_attn_2ms": "32 blocks (1/head) on 170 SMs = 19% utilization — K-parallel warps tried, blocked by SM count not warp count",
+      "fix": "batch_size ≥ 5 fills all SMs; serving metric is requests×tokens/s, not single-request latency"
+    },
+    "next_lever": "Batched continuous inference — 5+ concurrent requests = 160+ flash-attn blocks on 170 SMs + GEMV batching amortizes weight bandwidth"
   },
   "infrastructure_done": [
     "oxide Q2_0 two-output-per-warp (half-warp XOR butterfly reduce)",
