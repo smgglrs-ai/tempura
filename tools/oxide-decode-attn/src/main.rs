@@ -280,17 +280,11 @@ mod kernels {
             oi += 32;
         }
     }
-    /// Batched decode attention: one block per (request, head) pair.
-    ///
-    /// Grid: (batch_size * n_heads, 1, 1). Block: (32, 1, 1).
-    /// Each block handles attention for one (request r, head h) pair.
-    ///
-    /// k_cache_ptrs[r] / v_cache_ptrs[r]: raw f32 device pointers, layout
-    ///   [gpu_max_seq_len, n_kv_heads, head_dim] for request r.
-    /// kv_lens[r]: current kv_len for request r (read from device).
-    /// q: [batch_size * n_heads * head_dim] batched Q (all requests concatenated).
-    #[kernel]
-    pub unsafe fn oxide_decode_attn_batch(
+    /// Batched decode attention (DISABLED — pointer-of-pointers generates invalid PTX).
+    /// Use cuTile decode_attention_device_scratch × M instead.
+    /// TODO: implement via indexed per-request KV offsets instead of pointer arrays.
+    #[allow(dead_code)]
+    pub unsafe fn oxide_decode_attn_batch_disabled(
         mut out:        DisjointSlice<f32>,    // [batch * n_heads * head_dim]
         q:              *const f32,             // [batch * n_heads * head_dim]
         k_cache_ptrs:   *const u64,            // [batch] device ptrs to K caches

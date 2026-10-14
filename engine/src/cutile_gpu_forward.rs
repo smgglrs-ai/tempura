@@ -1408,25 +1408,39 @@ impl CutileGpuModel {
         q_dim: usize,
         q_pad: usize,
     ) -> Arc<Tensor<f32>> {
+        self.attn_out_to_oproj_device_m(attn_out, q_dim, q_pad, 1)
+    }
+
+    fn attn_out_to_oproj_device_m(
+        &self,
+        attn_out: &Arc<Tensor<f32>>,
+        q_dim: usize,
+        q_pad: usize,
+        m: usize,
+    ) -> Arc<Tensor<f32>> {
         let stream = self.matmul.stream();
         if q_pad == q_dim {
             return attn_out
                 .clone()
-                .reshape(&[1, q_pad])
+                .reshape(&[m, q_pad])
                 .expect("attn_out_to_oproj_device: reshape failed")
                 .into();
         }
-        // Allocate zero-filled padded buffer and D→D copy the valid prefix.
+        // Allocate zero-filled padded buffer and D→D copy each row's valid prefix.
         let padded: Arc<Tensor<f32>> = Arc::new(
-            api::zeros::<f32>(&[1, q_pad])
+            api::zeros::<f32>(&[m, q_pad])
                 .sync_on(stream)
                 .expect("attn_out_to_oproj_device: zeros alloc failed"),
         );
-        let src: CUdeviceptr = attn_out.device_pointer().cu_deviceptr();
-        let dst: CUdeviceptr = padded.device_pointer().cu_deviceptr();
-        unsafe {
-            cuda_core::memcpy_dtod_async::<f32>(dst, src, q_dim, stream)
-                .expect("attn_out_to_oproj_device: D→D copy failed");
+        let src_base: CUdeviceptr = attn_out.device_pointer().cu_deviceptr();
+        let dst_base: CUdeviceptr = padded.device_pointer().cu_deviceptr();
+        for r in 0..m {
+            let src = src_base + (r * q_dim * std::mem::size_of::<f32>()) as u64;
+            let dst = dst_base + (r * q_pad * std::mem::size_of::<f32>()) as u64;
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(dst, src, q_dim, stream)
+                    .expect("attn_out_to_oproj_device: D→D copy failed");
+            }
         }
         padded
     }
@@ -3653,7 +3667,7 @@ impl CutileGpuModel {
             }
 
             // O-projection [M, Q_DIM] → [M, H]
-            let attn_padded = self.attn_out_to_oproj_device(&attn_out_dev, q_dim, self.q_pad);
+            let attn_padded = self.attn_out_to_oproj_device_m(&attn_out_dev, q_dim, self.q_pad, m);
             let o_dev = self.gemm_any_d2d_slot(&attn_padded, o_w_name, m, SLOT_O);
 
             // Post-attention residual add.
