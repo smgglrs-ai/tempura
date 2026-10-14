@@ -341,6 +341,60 @@ impl OxideDecodeAttn {
         }
         Ok(())
     }
+
+    /// Elementwise SiLU(gate) * up — fully on GPU, no PCIe traffic.
+    /// `n` = batch_size * inter_pad (total elements).
+    pub fn silu_mul_d2d(
+        &self,
+        out:  &Arc<Tensor<f32>>,
+        gate: &Arc<Tensor<f32>>,
+        up:   &Arc<Tensor<f32>>,
+        n:    usize,
+    ) -> Result<()> {
+        let name = std::ffi::CString::new("oxide_silu_mul").unwrap();
+        let mut cu_fn = std::ptr::null_mut::<cuda_core::sys::CUfunc_st>();
+        let rc = unsafe {
+            cuda_core::sys::cuModuleGetFunction(&mut cu_fn, self.cu_module, name.as_ptr())
+        };
+        if rc != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "OxideDecodeAttn: cuModuleGetFunction(oxide_silu_mul) failed: {rc}"
+            )));
+        }
+
+        let block_dim: u32 = 256;
+        let grid_dim  = ((n as u32) + block_dim - 1) / block_dim;
+
+        let mut out_ptr  = out.device_pointer().cu_deviceptr()  as u64;
+        let mut gate_ptr = gate.device_pointer().cu_deviceptr() as u64;
+        let mut up_ptr   = up.device_pointer().cu_deviceptr()   as u64;
+        let mut n_u32    = n as u32;
+
+        let mut params: [*mut std::ffi::c_void; 4] = [
+            &mut out_ptr  as *mut _ as *mut std::ffi::c_void,
+            &mut gate_ptr as *mut _ as *mut std::ffi::c_void,
+            &mut up_ptr   as *mut _ as *mut std::ffi::c_void,
+            &mut n_u32    as *mut _ as *mut std::ffi::c_void,
+        ];
+
+        let rc = unsafe {
+            cuda_core::sys::cuLaunchKernel(
+                cu_fn,
+                grid_dim, 1, 1,
+                block_dim, 1, 1,
+                0,
+                self.stream.cu_stream(),
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "OxideDecodeAttn::silu_mul_d2d cuLaunchKernel failed: {rc}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for OxideDecodeAttn {

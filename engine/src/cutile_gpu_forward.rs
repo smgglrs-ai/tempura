@@ -913,7 +913,10 @@ impl CutileGpuModel {
         let oxide_q4k_gemv = OxideQ4kGemv::try_load(matmul.stream().clone());
         let oxide_q6k_gemv = OxideQ6kGemv::try_load(matmul.stream().clone());
         // Oxide decode attention (kv_len read from device pointer at execution time).
-        let oxide_decode_attn = OxideDecodeAttn::new(matmul.stream().clone()).ok();
+        let oxide_decode_attn = match OxideDecodeAttn::new(matmul.stream().clone()) {
+            Ok(oda) => { eprintln!("[cutile] oxide decode-attn loaded (batch={})", oda.has_batch()); Some(oda) }
+            Err(e)  => { eprintln!("[cutile] oxide decode-attn unavailable: {e}"); None }
+        };
 
         let q4k_count = dw_q4k.len();
         let q6k_count = dw_q6k.len();
@@ -1121,7 +1124,10 @@ impl CutileGpuModel {
         let oxide_q2_gemv = OxideQ2Gemv::try_load(matmul.stream().clone());
         let oxide_q4k_gemv = OxideQ4kGemv::try_load(matmul.stream().clone());
         let oxide_q6k_gemv = OxideQ6kGemv::try_load(matmul.stream().clone());
-        let oxide_decode_attn = OxideDecodeAttn::new(matmul.stream().clone()).ok();
+        let oxide_decode_attn = match OxideDecodeAttn::new(matmul.stream().clone()) {
+            Ok(oda) => { eprintln!("[cutile] oxide decode-attn loaded (batch={})", oda.has_batch()); Some(oda) }
+            Err(e)  => { eprintln!("[cutile] oxide decode-attn unavailable: {e}"); None }
+        };
 
         // Pre-compute the full RoPE frequency table on the GPU once.
         cutile_rope.precompute_table(
@@ -3613,7 +3619,32 @@ impl CutileGpuModel {
                     attn_out
                 }
             } else {
-                panic!("forward_batch_decode requires oxide_decode_attn");
+                // cuTile fallback: run M sequential single-request attention calls.
+                // Slower than the batch oxide kernel but correct on all hardware.
+                let attn_out = Arc::new(
+                    cutile::api::zeros::<f32>(&[m * q_dim])
+                        .sync_on(stream)
+                        .expect("batch attn cutile fallback alloc"),
+                );
+                for (r, q_rot) in q_rot_parts.iter().enumerate() {
+                    let (k_full, v_full) = kv_caches[r].kv_device_tensors(layer);
+                    let kv_len_r = kv_caches[r].seq_len() as i32;
+                    let attn_r = self.flash_attn
+                        .decode_attention_device_scratch(
+                            q_rot, &k_full, &v_full, kv_len_r as usize,
+                            n_heads, n_kv_heads, head_dim, scale, stream,
+                            &mut self.attn_out_scratch.borrow_mut(),
+                        ).expect("batch cutile attn failed");
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            attn_out.device_pointer().cu_deviceptr() + (r * q_dim * 4) as u64,
+                            attn_r.device_pointer().cu_deviceptr(),
+                            q_dim,
+                            stream,
+                        ).expect("batch attn_out D→D");
+                    }
+                }
+                attn_out
             };
 
             // Advance all KV caches.
@@ -3651,25 +3682,12 @@ impl CutileGpuModel {
             let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, m, SLOT_GATE);
             let up_dev   = self.gemm_any_d2d_slot(&normed2_dev, up_w_name,   m, SLOT_UP);
 
-            // SiLU(gate) × up — need an [M, inter] intermediate.
+            // SiLU(gate) × up — use cuTile silu_mul (GPU, no PCIe round-trip, any M).
             let inter_size = m * cfg.intermediate_size;
-            let gs_host = {
-                let gate_host = self.download_device_tensor(&gate_dev);
-                let up_host   = self.download_device_tensor(&up_dev);
-                gate_host.iter().zip(up_host.iter())
-                    .map(|(&g, &u)| {
-                        let s = g / (1.0 + (-g).exp());
-                        s * u
-                    })
-                    .collect::<Vec<f32>>()
-            };
-            let gs_dev = Arc::new(
-                cutile::api::copy_host_vec_to_device(&Arc::new(gs_host))
-                    .sync_on(stream)
-                    .expect("gs_dev upload")
-                    .reshape(&[inter_size])
-                    .expect("gs_dev reshape"),
-            );
+            let gs_dev = self
+                .cutile_elementwise
+                .silu_mul_device(&gate_dev, &up_dev, m, cfg.intermediate_size)
+                .expect("batch silu_mul_device failed");
             let down_dev = self.gemm_any_d2d_slot(&gs_dev, down_w_name, m, SLOT_DOWN);
 
             hidden_dev = self.add_device_scratch(

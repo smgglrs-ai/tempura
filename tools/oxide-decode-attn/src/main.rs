@@ -386,6 +386,7 @@ mod kernels {
             oi += 32;
         }
     }
+
 }
 
 // ── Host-side correctness test ────────────────────────────────────────────────
