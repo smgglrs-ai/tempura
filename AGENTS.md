@@ -170,11 +170,11 @@ Three-crate workspace + standalone verification crate:
   - Q6K v2: d broadcast via shfl, 8-step unrolled q_full
 - [x] Kani harnesses + Verus proofs for Q2_0/Q4K/Q6K block dequant bounds
 - [x] cuTile 0.4.0 upgrade (path deps to local fork); vec_width hint infrastructure
-- [x] Benchmark: Q2_0 31 tok/s, Q4K 23-24 tok/s (gap: 6.7×/8.7× vs llama.cpp 209 tok/s)
-  - Root cause of Q4K gap: CPU overhead from CUDA graph re-capture every step (~32ms/token)
-  - Weight reads are only 3.93 GB/token → 456 tok/s ceiling; we're at 5% utilization
-  - dp4a (Opt 7+8) implemented but irrelevant until re-capture is eliminated
-  - **Critical next step**: Opt 5 (device-side kv_len + pos) to capture graph once
+- [x] Benchmark: Q2_0 31 tok/s, Q4K **108 tok/s** (gap: 6.7×/**1.9×** vs llama.cpp 209 tok/s)
+  - Opt 5 done: CUDA graph captured once per generation, H→D scalar update before each launch
+  - kv_len passed as device pointer (`*const i32`) to oxide decode attention kernel
+  - 4.5× improvement: 24 tok/s → 108 tok/s by eliminating 38ms/token CPU re-capture
+  - Remaining 1.9× gap: flash attention overhead at growing kv_len + Q4K GEMV arithmetic
 
 ## What's Next
 

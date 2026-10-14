@@ -18,11 +18,11 @@
       "model": "Meta-Llama-3.1-8B-Instruct-Q4_K_M",
       "format": "Q4K+Q6K",
       "vram_mb": 17000,
-      "decode_tok_s": 24,
+      "decode_tok_s": 108,
       "prefill_tok_s": 6,
-      "itl_p50_ms": 41.5,
-      "gap_vs_llamacpp": "8.7x",
-      "kernel": "q4k_gemv_decode_v2 (multi-warp K-parallelism + CUDA graph)"
+      "itl_p50_ms": 9.3,
+      "gap_vs_llamacpp": "1.9x",
+      "kernel": "q4k_gemv_decode_v2 + oxide decode attention (CUDA graph captured once, kv_len via device ptr)"
     }
   ],
   "llamacpp_reference": {
@@ -32,16 +32,20 @@
   },
   "bottleneck_analysis": {
     "q4k_bandwidth_ceiling_tok_s": 456,
-    "q4k_actual_bw_pct": "5-6%",
+    "q4k_actual_bw_pct": "34-42% (Nsight Compute measured)",
     "q4k_weight_data_per_token_gb": 3.93,
+    "opt5_confirmed_savings": "38ms/token CPU re-capture → 9.3ms/token total (4.5x improvement)",
     "confirmed_not_bottleneck": [
-      "CUDA graph re-capture (graph now enabled for Llama-3.1-8B via ea43256)",
-      "CPU kernel launch overhead (CUDA graph eliminates this)",
       "Memory load ordering (ptxas already reorders independent loads)",
-      "K-loop memory latency hiding (multi-warp K-parallelism in q4k_gemv_decode_v2)"
+      "K-loop memory latency hiding (multi-warp K-parallelism already in v2)",
+      "CUDA graph re-capture (eliminated via Opt 5: single-capture + device kv_len pointer)"
     ],
-    "confirmed_bottleneck": "Arithmetic throughput: nibble extraction (bit shifts + masks + int-to-float) + f32 scale application (d*sc*dot - dmin*m*sum) per Q4K block",
-    "next_lever": "dp4a (4 int8 MACs per instruction) replacing scalar f32 FMA; requires 4-element packing with same scale — compatible with the existing Q8_1 + mini-warp infrastructure"
+    "remaining_1.9x_gap": [
+      "Flash attention dominates at growing kv_len (2.5ms at kv_len=21, ~5ms at avg kv_len=46)",
+      "Q4K GEMV short-scoreboard stalls (nibble extraction: 3.9% vs llama.cpp 2.6%) — dp4a would help",
+      "Q4K DRAM throughput (42% vs llama.cpp 58%) — VDR=2 helps marginally"
+    ],
+    "next_lever": "Flash attention optimization (prefill KV reuse, chunking) and/or proper dp4a via oxide GEMV (not cuTile DSL limitation)"
   },
   "infrastructure_done": [
     "oxide Q2_0 two-output-per-warp (half-warp XOR butterfly reduce)",
