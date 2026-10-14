@@ -3688,7 +3688,15 @@ impl CutileGpuModel {
                 .cutile_elementwise
                 .silu_mul_device(&gate_dev, &up_dev, m, cfg.intermediate_size)
                 .expect("batch silu_mul_device failed");
-            let down_dev = self.gemm_any_d2d_slot(&gs_dev, down_w_name, m, SLOT_DOWN);
+            // Pad inter → inter_pad if necessary (e.g. Llama-3.1-8B: 14336→16384).
+            let inter_sz = cfg.intermediate_size;
+            let gs_padded = if self.inter_pad == inter_sz {
+                gs_dev
+            } else {
+                let gs_host = self.download_device_tensor(&gs_dev);
+                self.to_device_padded(&gs_host, m, inter_sz, self.inter_pad)
+            };
+            let down_dev = self.gemm_any_d2d_slot(&gs_padded, down_w_name, m, SLOT_DOWN);
 
             hidden_dev = self.add_device_scratch(
                 &hidden_dev, &down_dev,
