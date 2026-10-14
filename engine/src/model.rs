@@ -9065,6 +9065,47 @@ impl CutileInferenceWrapper {
         session.position = target_seq_len;
     }
 
+    /// Batched decode: M requests × 1 token each in one GPU forward pass.
+    ///
+    /// Creates fresh KV caches for each request (starting at position 0).
+    /// Callers that need persistent KV caches across steps should use the
+    /// lower-level `CutileGpuModel::forward_batch_decode` directly.
+    pub fn forward_batch_decode_fresh(
+        &self,
+        token_ids: &[u32],
+        positions: &[u32],
+    ) -> Vec<Vec<f32>> {
+        let gm = match &self.gpu_model {
+            Some(g) => g,
+            None => panic!("forward_batch_decode: GPU model not loaded"),
+        };
+        let qw = self.model.quantized_weights.as_ref()
+            .expect("forward_batch_decode: quantized weights not loaded");
+        let stream = gm.stream();
+        let m = token_ids.len();
+        let mut kv_caches: Vec<crate::cutile_kv_cache::CutileKvCache> = (0..m)
+            .map(|_| crate::cutile_kv_cache::CutileKvCache::new(&self.model.config, stream.clone())
+                .expect("KV cache alloc"))
+            .collect();
+        gm.forward_batch_decode(token_ids, positions, qw, &mut kv_caches)
+    }
+
+    /// Batched decode with caller-supplied KV caches (stateful, multi-step capable).
+    pub fn forward_batch_decode_stateful(
+        &self,
+        token_ids: &[u32],
+        positions: &[u32],
+        kv_caches: &mut [crate::cutile_kv_cache::CutileKvCache],
+    ) -> Vec<Vec<f32>> {
+        let gm = match &self.gpu_model {
+            Some(g) => g,
+            None => panic!("forward_batch_decode_stateful: GPU model not loaded"),
+        };
+        let qw = self.model.quantized_weights.as_ref()
+            .expect("forward_batch_decode_stateful: quantized weights not loaded");
+        gm.forward_batch_decode(token_ids, positions, qw, kv_caches)
+    }
+
     /// Current GPU KV sequence length (number of K/V entries written).
     pub fn gpu_kv_seq_len(&self) -> usize {
         self.gpu_kv_cache

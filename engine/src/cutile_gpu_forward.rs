@@ -3357,4 +3357,348 @@ impl CutileGpuModel {
         let logits_dev = self.gemm_d2d_slot(&last_dev, "lm_head.weight", 1, SLOT_LOGITS);
         self.download_device_tensor(&logits_dev)
     }
+
+    /// Batched decode: M requests × 1 token each, processed in a single GPU pass.
+    ///
+    /// Each request has its own KV cache (`kv_caches[r]`) and current token
+    /// (`token_ids[r]`) at position `positions[r]`. Returns M logit vectors
+    /// (one per request, length = vocab_size).
+    ///
+    /// Uses `oxide_decode_attn_batch` for flash attention — grid = M × n_heads
+    /// blocks fills all 170 RTX-5090 SMs for batch ≥ 5.
+    pub fn forward_batch_decode(
+        &self,
+        token_ids:  &[u32],
+        positions:  &[u32],
+        qweights:   &QuantizedWeights,
+        kv_caches:  &mut [CutileKvCache],
+    ) -> Vec<Vec<f32>> {
+        assert_eq!(token_ids.len(), kv_caches.len());
+        assert_eq!(positions.len(), kv_caches.len());
+        let m = token_ids.len();
+        if m == 0 { return vec![]; }
+
+        let cfg        = &self.config;
+        let h          = cfg.hidden_size;
+        let n_heads    = cfg.num_attention_heads;
+        let n_kv_heads = cfg.num_kv_heads;
+        let head_dim   = cfg.head_dim;
+        let q_dim      = n_heads * head_dim;
+        let kv_dim     = n_kv_heads * head_dim;
+        let vocab      = cfg.vocab_size;
+        let scale      = 1.0_f32 / (head_dim as f32).sqrt();
+        let stream     = self.matmul.stream();
+
+        // ── 1. Embedding lookup (CPU) ──────────────────────────────────────────
+        let embed = qweights
+            .get_f32("model.embed_tokens.weight")
+            .expect("embed_tokens.weight not found");
+        let mut hidden = vec![0.0f32; m * h];
+        for (r, &tok) in token_ids.iter().enumerate() {
+            hidden[r * h..(r + 1) * h]
+                .copy_from_slice(&embed[tok as usize * h..(tok as usize + 1) * h]);
+        }
+        if cfg.embedding_scale {
+            let s = (h as f32).sqrt();
+            for v in &mut hidden { *v *= s; }
+        }
+
+        let layer_names: Vec<_> = (0..cfg.num_layers)
+            .map(|l| {
+                let p = format!("model.layers.{l}");
+                (
+                    format!("{p}.input_layernorm.weight"),
+                    format!("{p}.post_attention_layernorm.weight"),
+                    format!("{p}.self_attn.q_proj.weight"),
+                    format!("{p}.self_attn.k_proj.weight"),
+                    format!("{p}.self_attn.v_proj.weight"),
+                    format!("{p}.self_attn.o_proj.weight"),
+                    format!("{p}.mlp.gate_proj.weight"),
+                    format!("{p}.mlp.up_proj.weight"),
+                    format!("{p}.mlp.down_proj.weight"),
+                )
+            })
+            .collect();
+
+        // Upload concatenated hidden [M, H] to device.
+        let mut hidden_dev = self.to_device_flat_padded(&hidden, m, h, self.h_pad);
+
+        for layer in 0..cfg.num_layers {
+            let (
+                ref input_ln_name, ref post_ln_name,
+                ref q_w_name, ref k_w_name, ref v_w_name, ref o_w_name,
+                ref gate_w_name, ref up_w_name, ref down_w_name,
+            ) = layer_names[layer];
+
+            let input_ln_w_dev = self.norm_weights.get(input_ln_name)
+                .expect("input_layernorm weight missing");
+            let normed_dev = self.cutile_rmsnorm
+                .forward_device_fused(
+                    stream,
+                    hidden_dev.clone(),
+                    input_ln_w_dev,
+                    m,
+                    h,
+                    self.h_pad,
+                    cfg.layer_norm_eps,
+                )
+                .expect("batch RMSNorm failed");
+
+            // QKV projections [M, H] → [M, Q_DIM] / [M, KV_DIM]
+            let q_dev = self.gemm_any_d2d_slot(&normed_dev, q_w_name, m, SLOT_Q);
+            let k_dev = self.gemm_any_d2d_slot(&normed_dev, k_w_name, m, SLOT_K);
+            let v_dev = self.gemm_any_d2d_slot(&normed_dev, v_w_name, m, SLOT_V);
+
+            // RoPE per-request (each has its own position).
+            // Process each request's Q/K slice individually.
+            let kv_pad = next_pow2(kv_dim.div_ceil(BK) * BK);
+            let mut q_rot_parts: Vec<Arc<cutile::tensor::Tensor<f32>>> = Vec::with_capacity(m);
+            for r in 0..m {
+                // Extract per-request Q/K/V slices via D→D memcpy into fresh [q_dim] tensors.
+                let q_r = {
+                    let t = Arc::new(
+                        cutile::api::zeros::<f32>(&[self.q_pad])
+                            .sync_on(stream)
+                            .expect("q_r alloc"),
+                    );
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            t.device_pointer().cu_deviceptr(),
+                            q_dev.device_pointer().cu_deviceptr() + (r * self.q_pad * 4) as u64,
+                            q_dim,
+                            stream,
+                        ).expect("q_r D→D");
+                    }
+                    t
+                };
+                let k_r = {
+                    let t = Arc::new(
+                        cutile::api::zeros::<f32>(&[kv_pad])
+                            .sync_on(stream)
+                            .expect("k_r alloc"),
+                    );
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            t.device_pointer().cu_deviceptr(),
+                            k_dev.device_pointer().cu_deviceptr() + (r * kv_pad * 4) as u64,
+                            kv_dim,
+                            stream,
+                        ).expect("k_r D→D");
+                    }
+                    t
+                };
+                let v_r = {
+                    let t = Arc::new(
+                        cutile::api::zeros::<f32>(&[kv_pad])
+                            .sync_on(stream)
+                            .expect("v_r alloc"),
+                    );
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            t.device_pointer().cu_deviceptr(),
+                            v_dev.device_pointer().cu_deviceptr() + (r * kv_pad * 4) as u64,
+                            kv_dim,
+                            stream,
+                        ).expect("v_r D→D");
+                    }
+                    t
+                };
+
+                let pos_r = [positions[r]];
+                let q_rot = self.cutile_rope
+                    .forward_device_scratch(
+                        &q_r, &pos_r, 1, n_heads, head_dim,
+                        cfg.rope_theta,
+                        &mut self.q_rope_scratch.borrow_mut(),
+                        stream,
+                    )
+                    .expect("batch Q RoPE failed");
+                let k_rot = self.cutile_rope
+                    .forward_device_scratch(
+                        &k_r, &pos_r, 1, n_kv_heads, head_dim,
+                        cfg.rope_theta,
+                        &mut self.k_rope_scratch.borrow_mut(),
+                        stream,
+                    )
+                    .expect("batch K RoPE failed");
+
+                kv_caches[r]
+                    .append_device_gpu_only(layer, &k_rot, &v_r, 1)
+                    .expect("batch KV append failed");
+                q_rot_parts.push(q_rot);
+            }
+
+            // Batch flash attention: one kernel launch, M × n_heads blocks.
+            let attn_out_dev = if let Some(ref oda) = self.oxide_decode_attn {
+                if oda.has_batch() {
+                    let attn_out = Arc::new(
+                        cutile::api::zeros::<f32>(&[m * q_dim])
+                            .sync_on(stream)
+                            .expect("batch attn out alloc"),
+                    );
+                    // Collect per-request KV cache device pointers and kv_lens.
+                    let k_ptrs: Vec<u64> = kv_caches.iter()
+                        .map(|kvc| kvc.kv_device_tensors(layer).0.device_pointer().cu_deviceptr())
+                        .collect();
+                    let v_ptrs: Vec<u64> = kv_caches.iter()
+                        .map(|kvc| kvc.kv_device_tensors(layer).1.device_pointer().cu_deviceptr())
+                        .collect();
+                    let kv_lens: Vec<i32> = kv_caches.iter()
+                        .map(|kvc| kvc.seq_len() as i32)
+                        .collect();
+
+                    // Concatenate Q-rotated parts into one tensor for the batch kernel.
+                    // q_rot_parts[r] is [q_dim], stack to [m * q_dim].
+                    let q_batch = Arc::new(
+                        cutile::api::zeros::<f32>(&[m * q_dim])
+                            .sync_on(stream)
+                            .expect("q_batch alloc"),
+                    );
+                    // Copy each q_rot_parts[r] into q_batch at offset r*q_dim.
+                    // Use D→D async memcpy via cutile.
+                    for (r, q_r) in q_rot_parts.iter().enumerate() {
+                        unsafe {
+                            cuda_core::memcpy_dtod_async::<f32>(
+                                q_batch.device_pointer().cu_deviceptr() + (r * q_dim * 4) as u64,
+                                q_r.device_pointer().cu_deviceptr(),
+                                q_dim,
+                                stream,
+                            ).expect("q_batch D→D copy");
+                        }
+                    }
+
+                    oda.forward_batch_d2d(
+                        &attn_out, &q_batch,
+                        &k_ptrs, &v_ptrs, &kv_lens,
+                        n_heads, n_kv_heads, head_dim, scale,
+                    ).expect("oxide_decode_attn_batch failed");
+                    attn_out
+                } else {
+                    // Fallback: run single-request attention M times.
+                    let attn_out = Arc::new(
+                        cutile::api::zeros::<f32>(&[m * q_dim])
+                            .sync_on(stream)
+                            .expect("batch attn fallback alloc"),
+                    );
+                    for (r, q_rot) in q_rot_parts.iter().enumerate() {
+                        let (k_full, v_full) = kv_caches[r].kv_device_tensors(layer);
+                        let kv_len_r = kv_caches[r].seq_len() as i32;
+                        // Write kv_len to d_kv_len for this request.
+                        let kv_bits = f32::from_bits(kv_len_r as u32);
+                        unsafe {
+                            cuda_core::memcpy_htod_async::<f32>(
+                                self.d_kv_len.device_pointer().cu_deviceptr(),
+                                &kv_bits as *const f32, 1, stream,
+                            ).expect("batch d_kv_len H→D");
+                        }
+                        let out_r = Arc::new(
+                            cutile::api::zeros::<f32>(&[q_dim])
+                                .sync_on(stream)
+                                .expect("attn out_r alloc"),
+                        );
+                        oda.forward_d2d(
+                            &out_r, q_rot, &k_full, &v_full,
+                            &self.d_kv_len, n_heads, n_kv_heads, head_dim, scale,
+                        ).expect("batch attn single step failed");
+                        // Copy out_r into attn_out at offset r*q_dim.
+                        unsafe {
+                            cuda_core::memcpy_dtod_async::<f32>(
+                                attn_out.device_pointer().cu_deviceptr() + (r * q_dim * 4) as u64,
+                                out_r.device_pointer().cu_deviceptr(),
+                                q_dim,
+                                stream,
+                            ).expect("attn_out D→D copy");
+                        }
+                    }
+                    attn_out
+                }
+            } else {
+                panic!("forward_batch_decode requires oxide_decode_attn");
+            };
+
+            // Advance all KV caches.
+            for kvc in kv_caches.iter_mut() {
+                kvc.advance_host_seq_len(1);
+            }
+
+            // O-projection [M, Q_DIM] → [M, H]
+            let attn_padded = self.attn_out_to_oproj_device(&attn_out_dev, q_dim, self.q_pad);
+            let o_dev = self.gemm_any_d2d_slot(&attn_padded, o_w_name, m, SLOT_O);
+
+            // Post-attention residual add.
+            hidden_dev = self.add_device_scratch(
+                &hidden_dev, &o_dev,
+                m * self.h_pad,
+                &mut self.post_attn_add_scratch.borrow_mut(),
+            );
+
+            // Post-attention RMSNorm.
+            let post_ln_w_dev = self.norm_weights.get(post_ln_name)
+                .expect("post_attention_layernorm weight missing");
+            let normed2_dev = self.cutile_rmsnorm
+                .forward_device_fused(
+                    stream,
+                    hidden_dev.clone(),
+                    post_ln_w_dev,
+                    m,
+                    h,
+                    self.h_pad,
+                    cfg.layer_norm_eps,
+                )
+                .expect("batch post-attn RMSNorm failed");
+
+            // FFN: gate/up/down projections.
+            let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, m, SLOT_GATE);
+            let up_dev   = self.gemm_any_d2d_slot(&normed2_dev, up_w_name,   m, SLOT_UP);
+
+            // SiLU(gate) × up — need an [M, inter] intermediate.
+            let inter_size = m * cfg.intermediate_size;
+            let gs_host = {
+                let gate_host = self.download_device_tensor(&gate_dev);
+                let up_host   = self.download_device_tensor(&up_dev);
+                gate_host.iter().zip(up_host.iter())
+                    .map(|(&g, &u)| {
+                        let s = g / (1.0 + (-g).exp());
+                        s * u
+                    })
+                    .collect::<Vec<f32>>()
+            };
+            let gs_dev = Arc::new(
+                cutile::api::copy_host_vec_to_device(&Arc::new(gs_host))
+                    .sync_on(stream)
+                    .expect("gs_dev upload")
+                    .reshape(&[inter_size])
+                    .expect("gs_dev reshape"),
+            );
+            let down_dev = self.gemm_any_d2d_slot(&gs_dev, down_w_name, m, SLOT_DOWN);
+
+            hidden_dev = self.add_device_scratch(
+                &hidden_dev, &down_dev,
+                m * self.h_pad,
+                &mut self.ffn_add_scratch.borrow_mut(),
+            );
+        }
+
+        // Final norm.
+        let final_ln_w_dev = self.norm_weights.get("model.norm.weight")
+            .expect("model.norm.weight missing");
+        let last_dev = self.cutile_rmsnorm
+            .forward_device_fused(
+                stream,
+                hidden_dev,
+                final_ln_w_dev,
+                m,
+                h,
+                self.h_pad,
+                cfg.layer_norm_eps,
+            )
+            .expect("batch final RMSNorm failed");
+
+        // LM head: [M, H] → [M, vocab]
+        let logits_dev = self.gemm_d2d(&last_dev, "lm_head.weight", m);
+        let logits_flat = self.download_device_tensor(&logits_dev);
+
+        // Split into M logit vectors.
+        logits_flat.chunks(vocab).map(|c| c.to_vec()).collect()
+    }
 }

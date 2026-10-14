@@ -12,15 +12,17 @@ use cutile::tensor::Tensor;
 use crate::{KernelError, Result};
 
 const PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oxide_decode_attn.ptx"));
-const KERNEL_NAME:      &str = "oxide_decode_attn";
-const KERNEL_KPAR_NAME: &str = "oxide_decode_attn_kpar";
+const KERNEL_NAME:       &str = "oxide_decode_attn";
+const KERNEL_KPAR_NAME:  &str = "oxide_decode_attn_kpar";
+const KERNEL_BATCH_NAME: &str = "oxide_decode_attn_batch";
 const WARPS_PER_BLOCK_KPAR: u32 = 8;
 
 pub struct OxideDecodeAttn {
-    cu_module:         cuda_core::sys::CUmodule,
-    cu_function:       cuda_core::sys::CUfunction,
-    cu_function_kpar:  Option<cuda_core::sys::CUfunction>,
-    stream:            Arc<Stream>,
+    cu_module:          cuda_core::sys::CUmodule,
+    cu_function:        cuda_core::sys::CUfunction,
+    cu_function_kpar:   Option<cuda_core::sys::CUfunction>,
+    cu_function_batch:  Option<cuda_core::sys::CUfunction>,
+    stream:             Arc<Stream>,
 }
 
 unsafe impl Send for OxideDecodeAttn {}
@@ -61,9 +63,17 @@ impl OxideDecodeAttn {
         };
         let cu_function_kpar = if kpar_rc == 0 { Some(cu_function_kpar) } else { None };
 
-        eprintln!("[oxide] loaded decode-attn kernel (PTX {} bytes, kpar={})",
-            PTX.len(), cu_function_kpar.is_some());
-        Ok(Self { cu_module, cu_function, cu_function_kpar, stream })
+        // Try to load the batch variant.
+        let batch_name = std::ffi::CString::new(KERNEL_BATCH_NAME).unwrap();
+        let mut cu_function_batch = std::ptr::null_mut::<cuda_core::sys::CUfunc_st>();
+        let batch_rc = unsafe {
+            cuda_core::sys::cuModuleGetFunction(&mut cu_function_batch, cu_module, batch_name.as_ptr())
+        };
+        let cu_function_batch = if batch_rc == 0 { Some(cu_function_batch) } else { None };
+
+        eprintln!("[oxide] loaded decode-attn kernel (PTX {} bytes, kpar={}, batch={})",
+            PTX.len(), cu_function_kpar.is_some(), cu_function_batch.is_some());
+        Ok(Self { cu_module, cu_function, cu_function_kpar, cu_function_batch, stream })
     }
 
     /// Run decode attention with kv_len read from a device tensor at execution time.
@@ -192,6 +202,141 @@ impl OxideDecodeAttn {
         if rc != 0 {
             return Err(KernelError::InvalidConfig(format!(
                 "OxideDecodeAttn::forward_kpar_d2d cuLaunchKernel failed: {rc}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether the batch variant is available.
+    pub fn has_batch(&self) -> bool { self.cu_function_batch.is_some() }
+
+    /// Batched decode attention: one block per (request, head) pair.
+    ///
+    /// `k_cache_ptrs` and `v_cache_ptrs` are CUdeviceptr values (device pointers
+    /// to each request's KV cache) stored in host Vecs — uploaded to device as a
+    /// small array before the kernel launch.
+    pub fn forward_batch_d2d(
+        &self,
+        out:          &Arc<Tensor<f32>>,   // [M * n_heads * head_dim]
+        q:            &Arc<Tensor<f32>>,   // [M * n_heads * head_dim]
+        k_cache_ptrs: &[u64],              // [M] CUdeviceptr per request
+        v_cache_ptrs: &[u64],              // [M] CUdeviceptr per request
+        kv_lens:      &[i32],              // [M] current kv_len per request
+        n_heads:      usize,
+        n_kv_heads:   usize,
+        head_dim:     usize,
+        scale:        f32,
+    ) -> Result<()> {
+        let f = match self.cu_function_batch {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig(
+                "oxide_decode_attn_batch not available in this PTX".into()
+            )),
+        };
+        let batch_size = kv_lens.len();
+
+        // Upload pointer arrays to device (tiny H→D, ~8 × batch_size bytes each).
+        let stream = self.stream.cu_stream();
+        let k_ptrs_dev = unsafe {
+            let mut dev_ptr: u64 = 0;
+            cuda_core::sys::cuMemAllocAsync(
+                &mut dev_ptr as *mut u64,
+                (batch_size * 8) as usize,
+                stream,
+            );
+            cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                dev_ptr,
+                k_cache_ptrs.as_ptr() as *const std::ffi::c_void,
+                batch_size * 8,
+                stream,
+            );
+            dev_ptr
+        };
+        let v_ptrs_dev = unsafe {
+            let mut dev_ptr: u64 = 0;
+            cuda_core::sys::cuMemAllocAsync(
+                &mut dev_ptr as *mut u64,
+                (batch_size * 8) as usize,
+                stream,
+            );
+            cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                dev_ptr,
+                v_cache_ptrs.as_ptr() as *const std::ffi::c_void,
+                batch_size * 8,
+                stream,
+            );
+            dev_ptr
+        };
+        let kv_lens_dev = unsafe {
+            let mut dev_ptr: u64 = 0;
+            cuda_core::sys::cuMemAllocAsync(
+                &mut dev_ptr as *mut u64,
+                (batch_size * 4) as usize,
+                stream,
+            );
+            cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                dev_ptr,
+                kv_lens.as_ptr() as *const std::ffi::c_void,
+                batch_size * 4,
+                stream,
+            );
+            dev_ptr
+        };
+
+        let kv_stride = (n_kv_heads * head_dim) as u32;
+        let heads_per_group = (n_heads / n_kv_heads) as u32;
+
+        let mut out_ptr   = out.device_pointer().cu_deviceptr() as u64;
+        let mut q_ptr     = q.device_pointer().cu_deviceptr() as u64;
+        let mut kp        = k_ptrs_dev;
+        let mut vp        = v_ptrs_dev;
+        let mut kvlp      = kv_lens_dev;
+        let mut bs        = batch_size as u32;
+        let mut nh        = n_heads as u32;
+        let mut nkv       = n_kv_heads as u32;
+        let mut hd        = head_dim as u32;
+        let mut kv_str    = kv_stride;
+        let mut sc        = scale;
+
+        let mut params: [*mut std::ffi::c_void; 11] = [
+            &mut out_ptr as *mut _ as *mut _,
+            &mut q_ptr   as *mut _ as *mut _,
+            &mut kp      as *mut _ as *mut _,
+            &mut vp      as *mut _ as *mut _,
+            &mut kvlp    as *mut _ as *mut _,
+            &mut bs      as *mut _ as *mut _,
+            &mut nh      as *mut _ as *mut _,
+            &mut nkv     as *mut _ as *mut _,
+            &mut hd      as *mut _ as *mut _,
+            &mut kv_str  as *mut _ as *mut _,
+            &mut sc      as *mut _ as *mut _,
+        ];
+
+        let shared_bytes = (2 * head_dim * 4) as u32;
+        let grid_x = (batch_size * n_heads) as u32;
+
+        let rc = unsafe {
+            cuda_core::sys::cuLaunchKernel(
+                f,
+                grid_x, 1, 1,
+                32, 1, 1,
+                shared_bytes,
+                stream,
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+
+        // Free temp device allocations asynchronously.
+        unsafe {
+            cuda_core::sys::cuMemFreeAsync(k_ptrs_dev, stream);
+            cuda_core::sys::cuMemFreeAsync(v_ptrs_dev, stream);
+            cuda_core::sys::cuMemFreeAsync(kv_lens_dev, stream);
+        }
+
+        if rc != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "OxideDecodeAttn::forward_batch_d2d cuLaunchKernel failed: {rc}"
             )));
         }
         Ok(())

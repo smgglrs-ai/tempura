@@ -25,6 +25,10 @@ path = "src/bench_real_model.rs"
 name = "bench-speculative"
 path = "src/bench_speculative.rs"
 
+[[bin]]
+name = "bench-batch"
+path = "src/bench_batch.rs"
+
 [dependencies]
 tempura-kernels = { path = "../../kernels", features = ["cutile", "oxide-gemv"] }
 tempura-engine = { path = "../../engine", features = ["cutile", "oxide-gemv"] }
