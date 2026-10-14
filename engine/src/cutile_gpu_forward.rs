@@ -3670,11 +3670,11 @@ impl CutileGpuModel {
             let attn_padded = self.attn_out_to_oproj_device_m(&attn_out_dev, q_dim, self.q_pad, m);
             let o_dev = self.gemm_any_d2d_slot(&attn_padded, o_w_name, m, SLOT_O);
 
-            // Post-attention residual add.
+            // Post-attention residual add (fresh alloc — pre-allocated scratch is M=1 sized).
             hidden_dev = self.add_device_scratch(
                 &hidden_dev, &o_dev,
                 m * self.h_pad,
-                &mut self.post_attn_add_scratch.borrow_mut(),
+                &mut None,
             );
 
             // Post-attention RMSNorm.
@@ -3715,7 +3715,7 @@ impl CutileGpuModel {
             hidden_dev = self.add_device_scratch(
                 &hidden_dev, &down_dev,
                 m * self.h_pad,
-                &mut self.ffn_add_scratch.borrow_mut(),
+                &mut None,
             );
         }
 
