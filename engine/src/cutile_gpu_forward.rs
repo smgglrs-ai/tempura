@@ -3465,9 +3465,10 @@ impl CutileGpuModel {
                 .expect("batch RMSNorm failed");
 
             // QKV projections [M, H] → [M, Q_DIM] / [M, KV_DIM]
-            let q_dev = self.gemm_any_d2d_slot(&normed_dev, q_w_name, m, SLOT_Q);
-            let k_dev = self.gemm_any_d2d_slot(&normed_dev, k_w_name, m, SLOT_K);
-            let v_dev = self.gemm_any_d2d_slot(&normed_dev, v_w_name, m, SLOT_V);
+            // Use gemm_d2d (tiled GEMM, no scratch) since pre-allocated slots are M=1 sized.
+            let q_dev = self.gemm_d2d(&normed_dev, q_w_name, m);
+            let k_dev = self.gemm_d2d(&normed_dev, k_w_name, m);
+            let v_dev = self.gemm_d2d(&normed_dev, v_w_name, m);
 
             // RoPE per-request (each has its own position).
             // Process each request's Q/K slice individually.
@@ -3668,7 +3669,7 @@ impl CutileGpuModel {
 
             // O-projection [M, Q_DIM] → [M, H]
             let attn_padded = self.attn_out_to_oproj_device_m(&attn_out_dev, q_dim, self.q_pad, m);
-            let o_dev = self.gemm_any_d2d_slot(&attn_padded, o_w_name, m, SLOT_O);
+            let o_dev = self.gemm_d2d(&attn_padded, o_w_name, m);
 
             // Post-attention residual add.
             hidden_dev = self.add_device_scratch(
@@ -3693,8 +3694,8 @@ impl CutileGpuModel {
                 .expect("batch post-attn RMSNorm failed");
 
             // FFN: gate/up/down projections.
-            let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, m, SLOT_GATE);
-            let up_dev   = self.gemm_any_d2d_slot(&normed2_dev, up_w_name,   m, SLOT_UP);
+            let gate_dev = self.gemm_d2d(&normed2_dev, gate_w_name, m);
+            let up_dev   = self.gemm_d2d(&normed2_dev, up_w_name,   m);
 
             // SiLU(gate) × up — use cuTile silu_mul (GPU, no PCIe round-trip, any M).
             let inter_size = m * cfg.intermediate_size;
@@ -3710,7 +3711,7 @@ impl CutileGpuModel {
                 let gs_host = self.download_device_tensor(&gs_dev);
                 self.to_device_padded(&gs_host, m, inter_sz, self.inter_pad)
             };
-            let down_dev = self.gemm_any_d2d_slot(&gs_padded, down_w_name, m, SLOT_DOWN);
+            let down_dev = self.gemm_d2d(&gs_padded, down_w_name, m);
 
             hidden_dev = self.add_device_scratch(
                 &hidden_dev, &down_dev,
