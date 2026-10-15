@@ -245,16 +245,20 @@ mod kernels {
         // compute phase to hide DRAM latency across iterations.
 
         // Prime the prefetch registers with block warp_id data.
+        // Guard: warps with warp_id >= k_blocks have no valid first block —
+        // use a safe fallback address (block 0 of the same neuron) so Blackwell
+        // doesn't trap on an out-of-bounds global load in a predicated instruction.
         let mut blk = warp_id;
-        let mut pre_base = (n_out * k_blocks + blk) * 42;
-        let mut pre_d_raw    = if lane == 0 { packed[pre_base as usize] } else { 0 };
-        let mut pre_dmin_raw = if lane == 0 { packed[(pre_base + 1) as usize] } else { 0 };
-        let mut pre_sc_raw   = if lane < 4  { packed[(pre_base + 2 + lane) as usize] } else { 0 };
-        let mut pre_m_raw    = if lane < 4  { packed[(pre_base + 6 + lane) as usize] } else { 0 };
-        let mut pre_qs_j0 = packed[(pre_base + 10 + lane / 4) as usize];
-        let mut pre_qs_j1 = packed[(pre_base + 10 + 8 + lane / 4) as usize];
-        let mut pre_qs_j2 = packed[(pre_base + 10 + 16 + lane / 4) as usize];
-        let mut pre_qs_j3 = packed[(pre_base + 10 + 24 + lane / 4) as usize];
+        let init_valid = blk < k_blocks;
+        let mut pre_base = if init_valid { (n_out * k_blocks + blk) * 42 } else { n_out * k_blocks * 42 };
+        let mut pre_d_raw    = if init_valid && lane == 0 { packed[pre_base as usize] } else { 0 };
+        let mut pre_dmin_raw = if init_valid && lane == 0 { packed[(pre_base + 1) as usize] } else { 0 };
+        let mut pre_sc_raw   = if init_valid && lane < 4  { packed[(pre_base + 2 + lane) as usize] } else { 0 };
+        let mut pre_m_raw    = if init_valid && lane < 4  { packed[(pre_base + 6 + lane) as usize] } else { 0 };
+        let mut pre_qs_j0 = if init_valid { packed[(pre_base + 10 + lane / 4) as usize] } else { 0 };
+        let mut pre_qs_j1 = if init_valid { packed[(pre_base + 10 + 8 + lane / 4) as usize] } else { 0 };
+        let mut pre_qs_j2 = if init_valid { packed[(pre_base + 10 + 16 + lane / 4) as usize] } else { 0 };
+        let mut pre_qs_j3 = if init_valid { packed[(pre_base + 10 + 24 + lane / 4) as usize] } else { 0 };
 
         while blk < k_blocks {
             // Move prefetched registers into current-block locals.
@@ -1192,9 +1196,6 @@ mod kernels {
 
     /// q4k_gemv_decode_q8_v3r — raw GGUF 36-u32 format variant of v3.
     /// 36 u32 (144 bytes) per block vs 42 u32 (168 bytes) → 14% less DRAM.
-    /// Inline 6-bit scale decode replaces pre-unpacked sc/m pairs.
-    /// All raw loads (d/dmin f16, ps0/ps1/ps2, nibbles, Q8_1) hoisted to
-    /// the top of each K-loop iteration before any shuffle/compute.
     #[kernel]
     pub fn q4k_gemv_decode_q8_v3r(
         mut out: DisjointSlice<f32>,
@@ -1531,7 +1532,10 @@ fn main() {
     let cfg_v2 = LaunchConfig {
         grid_dim:  (n as u32, 1, 1),
         block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
-        shared_mem_bytes: WARPS_PER_BLOCK * 4,
+        // Need 32 f32 slots (128 bytes): the reduction reads smem[lane] for all
+        // 32 lanes of warp 0 on Blackwell — predicated but LDSMEM still executes
+        // for lanes 4..31 and traps if smem is smaller than 32 f32s.
+        shared_mem_bytes: 32 * 4,
     };
 
     // ── Test 1: v1 and v2 both pass for nibble=3,sc=1,d=1,dmin=0 ──────────────

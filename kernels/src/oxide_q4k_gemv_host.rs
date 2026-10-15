@@ -175,7 +175,7 @@ impl OxideQ4kGemv {
                 cu_q8_gemv_v3.is_some(),
                 cu_batch_gemv.is_some(),
             );
-            // v3r kernel has a runtime crash (CUDA error 719) — disabled until debugged.
+            // v3r kernel produces numerical garbage (format mismatch in scale decode) — disabled.
             let uses_raw_gguf = false; // cu_q8_gemv_v3r.is_some();
             Some(Self {
                 cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_batch_gemv, cu_colocated, cu_smem, uses_raw_gguf, stream,
@@ -474,7 +474,7 @@ impl OxideQ4kGemv {
                 self.cu_function,
                 (grid_x, 1, 1),
                 (BLOCK_DIM, 1, 1),
-                WARPS_PER_BLOCK * 4,  // shared memory for cross-warp reduce (4 f32 slots)
+                32 * 4,  // 128 bytes: 32 smem f32 slots needed on Blackwell (all warp-0 lanes read smem[lane])
                 cu_stream,
                 &mut params,
             )
