@@ -86,6 +86,47 @@ fn warp_reduce_max_f32(mut v: f32) -> f32 {
     v
 }
 
+/// Inline 6-bit scale unpack for raw GGUF Q4K format.
+/// ps0 = packed u32 of bytes ps[0..4], ps1 = ps[4..8], ps2 = ps[8..12].
+/// mw = j-group index (0..3).
+/// Returns (sc_lo, sc_hi, m_lo, m_hi) as f32 for that j-group.
+#[inline(always)]
+fn unpack_scales_6bit(ps0: u32, ps1: u32, ps2: u32, mw: u32) -> (f32, f32, f32, f32) {
+    // ps[i]: byte i of the 12-byte scale section
+    // j=0: sc[0],sc[1],m[0],m[1] → ps[0],ps[1],ps[4],ps[5]
+    // j=1: sc[2],sc[3],m[2],m[3] → ps[2],ps[3],ps[6],ps[7]
+    // j=2: sc[4],sc[5],m[4],m[5] → 6-bit unpack from ps[0..2] and ps[8..10]
+    // j=3: sc[6],sc[7],m[6],m[7] → 6-bit unpack from ps[2..4] and ps[10..12]
+    let (sc_lo, sc_hi, m_lo, m_hi) = if mw < 2 {
+        let shift = mw * 16;  // j=0: bytes 0,1,4,5 (shift=0); j=1: bytes 2,3,6,7 (shift=16)
+        let a = (ps0 >> shift) & 0x3F;
+        let b = (ps0 >> (shift + 8)) & 0x3F;
+        let c = (ps1 >> shift) & 0x3F;
+        let d = (ps1 >> (shift + 8)) & 0x3F;
+        (a as f32, b as f32, c as f32, d as f32)
+    } else {
+        // j=2 (mw=2) or j=3 (mw=3)
+        let k = mw - 2;  // 0 or 1
+        let shift_lo = k * 16;      // j=2: byte 0,1,4,5 of ps0/ps1; j=3: byte 2,3,6,7
+        let shift_hi = k * 16;      // same shift for ps2
+        // ps0 bytes 0,1 (k=0) or 2,3 (k=1) hold lower 6 bits of sc[2k], sc[2k+1]
+        let ps0_lo = (ps0 >> shift_lo) & 0xFF;       // ps[2k]
+        let ps0_hi = (ps0 >> (shift_lo + 8)) & 0xFF; // ps[2k+1]
+        let ps1_lo = (ps1 >> shift_lo) & 0xFF;       // ps[4+2k]
+        let ps1_hi = (ps1 >> (shift_lo + 8)) & 0xFF; // ps[5+2k]
+        let ps2_lo = (ps2 >> shift_hi) & 0xFF;       // ps[8+2k]
+        let ps2_hi = (ps2 >> (shift_hi + 8)) & 0xFF; // ps[9+2k]
+        // sc[4+2k] = ((ps[8+2k] & 0x0F) | ((ps[2k] >> 6) << 4)) & 0x3F
+        let a = ((ps2_lo & 0x0F) | ((ps0_lo >> 6) << 4)) & 0x3F;
+        let b = ((ps2_hi & 0x0F) | ((ps0_hi >> 6) << 4)) & 0x3F;
+        // m[4+2k] = ((ps[8+2k] >> 4) | ((ps[4+2k] >> 6) << 4)) & 0x3F
+        let c = ((ps2_lo >> 4) | ((ps1_lo >> 6) << 4)) & 0x3F;
+        let d = ((ps2_hi >> 4) | ((ps1_hi >> 6) << 4)) & 0x3F;
+        (a as f32, b as f32, c as f32, d as f32)
+    };
+    (sc_lo, sc_hi, m_lo, m_hi)
+}
+
 #[cuda_module]
 mod kernels {
     use super::*;
@@ -1145,6 +1186,154 @@ mod kernels {
             let total = unsafe {
                 *smem.add(0) + *smem.add(1) + *smem.add(2) + *smem.add(3)
             };
+            unsafe { *out.get_unchecked_mut(n_out as usize) = total; }
+        }
+    }
+
+    /// q4k_gemv_decode_q8_v3r — raw GGUF 36-u32 format variant of v3.
+    /// 36 u32 (144 bytes) per block vs 42 u32 (168 bytes) → 14% less DRAM.
+    /// Inline 6-bit scale decode replaces pre-unpacked sc/m pairs.
+    /// All raw loads (d/dmin f16, ps0/ps1/ps2, nibbles, Q8_1) hoisted to
+    /// the top of each K-loop iteration before any shuffle/compute.
+    #[kernel]
+    pub fn q4k_gemv_decode_q8_v3r(
+        mut out: DisjointSlice<f32>,
+        x_qs: &[u32],
+        x_ds: &[u32],
+        packed: &[u32],   // [N, K_BLOCKS, 36] raw GGUF format
+        n: u32,
+        k_blocks: u32,
+    ) {
+        let tid     = thread::threadIdx_x();
+        let bid     = thread::blockIdx_x();
+        let warp_id = tid / 32;
+        let lane    = tid % 32;
+        let n_out   = bid;
+        if n_out >= n { return; }
+
+        let mw        = lane / 8;
+        let sub_l     = lane % 8;
+        let mini_mask = 0xFF_u32 << (mw * 8);
+        let base_lane = mw * 8;
+
+        let mut acc = 0.0_f32;
+
+        let mut blk = warp_id * 2;
+        while blk + 1 < k_blocks {
+            let base0 = (n_out * k_blocks + blk) * 36;
+            let base1 = (n_out * k_blocks + blk + 1) * 36;
+
+            // ── Phase 1: ALL loads for BOTH blocks upfront ─────────────────
+            // u32[0] = f16 d | (f16 dmin << 16)
+            let dd0 = if lane == 0 { packed[base0 as usize] } else { 0 };
+            // u32[1..4] = 12 bytes of 6-bit packed scales
+            let ps0_0 = if sub_l == 0 { packed[(base0 + 1) as usize] } else { 0 };
+            let ps1_0 = if sub_l == 0 { packed[(base0 + 2) as usize] } else { 0 };
+            let ps2_0 = if sub_l == 0 { packed[(base0 + 3) as usize] } else { 0 };
+            // u32[4+mw*8+sub_l] = nibble word (j-group mw, lane sub_l)
+            let qs0   = packed[(base0 + 4 + mw * 8 + sub_l) as usize];
+            let q8b0_lo = blk * 8 + mw * 2;
+            let q8b0_hi = q8b0_lo + 1;
+            let u0_lo = x_qs[(q8b0_lo * 8 + sub_l) as usize];
+            let u0_hi = x_qs[(q8b0_hi * 8 + sub_l) as usize];
+
+            let dd1 = if lane == 0 { packed[base1 as usize] } else { 0 };
+            let ps0_1 = if sub_l == 0 { packed[(base1 + 1) as usize] } else { 0 };
+            let ps1_1 = if sub_l == 0 { packed[(base1 + 2) as usize] } else { 0 };
+            let ps2_1 = if sub_l == 0 { packed[(base1 + 3) as usize] } else { 0 };
+            let qs1   = packed[(base1 + 4 + mw * 8 + sub_l) as usize];
+            let q8b1_lo = (blk + 1) * 8 + mw * 2;
+            let q8b1_hi = q8b1_lo + 1;
+            let u1_lo = x_qs[(q8b1_lo * 8 + sub_l) as usize];
+            let u1_hi = x_qs[(q8b1_hi * 8 + sub_l) as usize];
+
+            // ── Phase 2: Compute block 0 ────────────────────────────────────
+            let d0    = f16_to_f32(warp::shuffle(dd0, 0) & 0xFFFF);
+            let dmin0 = f16_to_f32((warp::shuffle(dd0, 0) >> 16) & 0xFFFF);
+            // Broadcast ps0/ps1/ps2 for block 0 to all sub_l within mini-warp
+            let ps0_0_bc = warp::shuffle_sync(mini_mask, ps0_0, base_lane);
+            let ps1_0_bc = warp::shuffle_sync(mini_mask, ps1_0, base_lane);
+            let ps2_0_bc = warp::shuffle_sync(mini_mask, ps2_0, base_lane);
+            // Inline 6-bit scale unpack for j-group mw
+            let (sc_lo_0, sc_hi_0, m_lo_0, m_hi_0) =
+                unpack_scales_6bit(ps0_0_bc, ps1_0_bc, ps2_0_bc, mw);
+            let d8_0_lo = f16_to_f32(x_ds[q8b0_lo as usize] & 0xFFFF);
+            let d8_0_hi = f16_to_f32(x_ds[q8b0_hi as usize] & 0xFFFF);
+            let v0_lo = qs0 & 0x0F0F0F0F;
+            let v0_hi = (qs0 >> 4) & 0x0F0F0F0F;
+            acc += d8_0_lo * (d0 * sc_lo_0 * (dp4a_s32(v0_lo, u0_lo, 0) as f32)
+                             - dmin0 * m_lo_0 * (dp4a_s32(0x01010101, u0_lo, 0) as f32))
+                 + d8_0_hi * (d0 * sc_hi_0 * (dp4a_s32(v0_hi, u0_hi, 0) as f32)
+                             - dmin0 * m_hi_0 * (dp4a_s32(0x01010101, u0_hi, 0) as f32));
+
+            // ── Phase 3: Compute block 1 ────────────────────────────────────
+            let d1    = f16_to_f32(warp::shuffle(dd1, 0) & 0xFFFF);
+            let dmin1 = f16_to_f32((warp::shuffle(dd1, 0) >> 16) & 0xFFFF);
+            let ps0_1_bc = warp::shuffle_sync(mini_mask, ps0_1, base_lane);
+            let ps1_1_bc = warp::shuffle_sync(mini_mask, ps1_1, base_lane);
+            let ps2_1_bc = warp::shuffle_sync(mini_mask, ps2_1, base_lane);
+            let (sc_lo_1, sc_hi_1, m_lo_1, m_hi_1) =
+                unpack_scales_6bit(ps0_1_bc, ps1_1_bc, ps2_1_bc, mw);
+            let d8_1_lo = f16_to_f32(x_ds[q8b1_lo as usize] & 0xFFFF);
+            let d8_1_hi = f16_to_f32(x_ds[q8b1_hi as usize] & 0xFFFF);
+            let v1_lo = qs1 & 0x0F0F0F0F;
+            let v1_hi = (qs1 >> 4) & 0x0F0F0F0F;
+            acc += d8_1_lo * (d1 * sc_lo_1 * (dp4a_s32(v1_lo, u1_lo, 0) as f32)
+                             - dmin1 * m_lo_1 * (dp4a_s32(0x01010101, u1_lo, 0) as f32))
+                 + d8_1_hi * (d1 * sc_hi_1 * (dp4a_s32(v1_hi, u1_hi, 0) as f32)
+                             - dmin1 * m_hi_1 * (dp4a_s32(0x01010101, u1_hi, 0) as f32));
+
+            blk += WARPS_PER_BLOCK * 2;
+        }
+
+        // Tail single-block
+        while blk < k_blocks {
+            let base = (n_out * k_blocks + blk) * 36;
+            let dd    = if lane == 0 { packed[base as usize] } else { 0 };
+            let ps0_v = if sub_l == 0 { packed[(base + 1) as usize] } else { 0 };
+            let ps1_v = if sub_l == 0 { packed[(base + 2) as usize] } else { 0 };
+            let ps2_v = if sub_l == 0 { packed[(base + 3) as usize] } else { 0 };
+            let qs    = packed[(base + 4 + mw * 8 + sub_l) as usize];
+            let q8_lo = blk * 8 + mw * 2;
+            let q8_hi = q8_lo + 1;
+            let u_lo  = x_qs[(q8_lo * 8 + sub_l) as usize];
+            let u_hi  = x_qs[(q8_hi * 8 + sub_l) as usize];
+            let d    = f16_to_f32(warp::shuffle(dd, 0) & 0xFFFF);
+            let dmin = f16_to_f32((warp::shuffle(dd, 0) >> 16) & 0xFFFF);
+            let ps0_bc = warp::shuffle_sync(mini_mask, ps0_v, base_lane);
+            let ps1_bc = warp::shuffle_sync(mini_mask, ps1_v, base_lane);
+            let ps2_bc = warp::shuffle_sync(mini_mask, ps2_v, base_lane);
+            let (sc_lo, sc_hi, m_lo, m_hi) = unpack_scales_6bit(ps0_bc, ps1_bc, ps2_bc, mw);
+            let d8_lo = f16_to_f32(x_ds[q8_lo as usize] & 0xFFFF);
+            let d8_hi = f16_to_f32(x_ds[q8_hi as usize] & 0xFFFF);
+            let v_lo  = qs & 0x0F0F0F0F;
+            let v_hi  = (qs >> 4) & 0x0F0F0F0F;
+            acc += d8_lo * (d * sc_lo * (dp4a_s32(v_lo, u_lo, 0) as f32)
+                           - dmin * m_lo * (dp4a_s32(0x01010101, u_lo, 0) as f32))
+                 + d8_hi * (d * sc_hi * (dp4a_s32(v_hi, u_hi, 0) as f32)
+                           - dmin * m_hi * (dp4a_s32(0x01010101, u_hi, 0) as f32));
+            blk += WARPS_PER_BLOCK * 2;
+        }
+
+        // Same reduction as v3
+        acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 4);
+        acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 2);
+        acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 1);
+        let smem: *mut f32 = DynamicSharedArray::<f32>::get();
+        if sub_l == 0 {
+            unsafe { *smem.add((warp_id * 4 + mw) as usize) = acc; }
+        }
+        thread::sync_threads();
+        if warp_id == 0 && lane < 4 {
+            let j = lane;
+            let mut total = 0.0_f32;
+            let mut w = 0u32;
+            while w < WARPS_PER_BLOCK { total += unsafe { *smem.add((w * 4 + j) as usize) }; w += 1; }
+            unsafe { *smem.add(j as usize) = total; }
+        }
+        thread::sync_threads();
+        if warp_id == 0 && lane == 0 {
+            let total = unsafe { *smem.add(0) + *smem.add(1) + *smem.add(2) + *smem.add(3) };
             unsafe { *out.get_unchecked_mut(n_out as usize) = total; }
         }
     }

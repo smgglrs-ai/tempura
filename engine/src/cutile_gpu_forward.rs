@@ -713,6 +713,36 @@ impl CutileGpuModel {
         Ok(true)
     }
 
+    /// Upload Q4K weights in raw GGUF 36-u32 format (for q4k_gemv_decode_q8_v3r kernel).
+    /// 14% less DRAM than the 42-u32 packed format (144 bytes vs 168 bytes per block).
+    fn maybe_upload_q4k_raw(
+        stream: &std::sync::Arc<cuda_core::Stream>,
+        device_weights_q4k: &mut HashMap<String, DeviceWeightQ4K>,
+        qw: &QuantizedWeights,
+        name: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<bool, tempura_kernels::KernelError> {
+        let bytes = match qw.get_q4k(name) { Some(b) => b, None => return Ok(false) };
+        debug_assert_eq!(k % Q4K_BLOCK_SIZE, 0);
+        let k_blocks = k / Q4K_BLOCK_SIZE;
+        // Each raw GGUF block is exactly 144 bytes = 36 u32s.
+        debug_assert_eq!(bytes.len(), n * k_blocks * 144,
+            "Q4K raw bytes len mismatch: {} != {}", bytes.len(), n * k_blocks * 144);
+        // Reinterpret raw bytes as u32 (blocks are 4-byte aligned in GGUF).
+        let raw_u32: &[u32] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const u32, n * k_blocks * 36)
+        };
+        let tensor: Arc<Tensor<u32>> = api::copy_host_vec_to_device(&Arc::new(raw_u32.to_vec()))
+            .sync_on(stream)
+            .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+            .reshape(&[n * k_blocks * 36])
+            .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+            .into();
+        device_weights_q4k.insert(name.to_string(), DeviceWeightQ4K { tensor, n, k_blocks });
+        Ok(true)
+    }
+
     /// Upload a norm weight vector from a host slice to a 1-D device tensor of
     /// `h_pad` elements, zero-padding from `h` to `h_pad` if necessary.
     fn upload_norm_weight(

@@ -48,6 +48,7 @@ const KERNEL_Q8_QUANTIZE: &str = "quantize_q8_1";
 const KERNEL_Q8_GEMV: &str = "q4k_gemv_decode_q8";
 const KERNEL_Q8_GEMV_V2: &str = "q4k_gemv_decode_q8_v2";
 const KERNEL_Q8_GEMV_V3: &str = "q4k_gemv_decode_q8_v3";
+const KERNEL_Q8_GEMV_V3R: &str = "q4k_gemv_decode_q8_v3r"; // raw GGUF 36-u32 format
 const WARPS_PER_BLOCK: u32 = 4;
 const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128
 
@@ -63,6 +64,8 @@ pub struct OxideQ4kGemv {
     cu_q8_gemv_v2:     Option<CUfunction>,
     /// Optional Q4K+Q8_1 GEMV v3 kernel (VDR=2 double-block K-loop).
     cu_q8_gemv_v3:     Option<CUfunction>,
+    /// Optional Q4K+Q8_1 GEMV v3r kernel (v3 + raw GGUF 36-u32 format, 14% less DRAM).
+    cu_q8_gemv_v3r:    Option<CUfunction>,
     /// Optional batched Q4K GEMV: grid=(N,M,1), L2-shared weight blocks.
     cu_batch_gemv:     Option<CUfunction>,
     /// Optional colocated GEMM: all M rows in one block, L2 broadcast for weights.
@@ -70,6 +73,8 @@ pub struct OxideQ4kGemv {
     /// Optional smem-tiled GEMM: row-0 loads weights into smem, all M rows compute from smem.
     cu_smem:           Option<CUfunction>,
     stream:         Arc<Stream>,
+    /// True when the raw-GGUF 36-u32 kernel is active (needs matching upload format).
+    pub uses_raw_gguf: bool,
     /// Pre-allocated Q8_1 scratch buffers (set by pre_allocate_q8_scratch before graph capture).
     /// These avoid device allocation on a capturing stream (CUDA error 900).
     q8_qs_scratch:  std::cell::RefCell<Option<Arc<Tensor<u32>>>>,  // [max_k / 4]
@@ -156,6 +161,7 @@ impl OxideQ4kGemv {
             let cu_q8_gemv     = load_fn(KERNEL_Q8_GEMV);
             let cu_q8_gemv_v2  = load_fn(KERNEL_Q8_GEMV_V2);
             let cu_q8_gemv_v3  = load_fn(KERNEL_Q8_GEMV_V3);
+            let cu_q8_gemv_v3r = load_fn(KERNEL_Q8_GEMV_V3R);
             let cu_batch_gemv  = load_fn(KERNEL_BATCH);
             let cu_colocated   = load_fn(KERNEL_COLOCATED);
             let cu_smem        = load_fn(KERNEL_SMEM);
@@ -169,8 +175,9 @@ impl OxideQ4kGemv {
                 cu_q8_gemv_v3.is_some(),
                 cu_batch_gemv.is_some(),
             );
+            let uses_raw_gguf = cu_q8_gemv_v3r.is_some();
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_batch_gemv, cu_colocated, cu_smem, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_batch_gemv, cu_colocated, cu_smem, uses_raw_gguf, stream,
                 q8_qs_scratch:  std::cell::RefCell::new(None),
                 q8_ds_scratch:  std::cell::RefCell::new(None),
                 q8_out_scratch: std::cell::RefCell::new(None),
@@ -519,7 +526,8 @@ impl OxideQ4kGemv {
         n: usize,
         k_blocks: usize,
     ) -> Result<Arc<Tensor<f32>>> {
-        // Prefer v3 (VDR=2 double-block) > v2 (K-parallelism + dp4a) > v1.
+        // Prefer v3 (VDR=2) > v2 > v1.
+        // v3r (raw GGUF) requires matching 36-u32 upload format — not yet wired in upload path.
         let (q8_quant_fn, q8_gemv_fn, kernel_variant) = match &self.cu_q8_quantize {
             Some(q) => {
                 if let Some(g3) = &self.cu_q8_gemv_v3 {
