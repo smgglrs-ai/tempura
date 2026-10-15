@@ -1747,5 +1747,106 @@ fn main() {
         std::process::exit(1);
     }
 
+    // ── v3r correctness test: isolated raw GGUF 36-u32 vs packed 42-u32 ──────
+    // Creates data directly without going through the engine upload path.
+    // d=1.0, dmin=0.0, sc[i]=1, m[i]=0, nibbles=3, Q8_1 q=1 d8=1.0
+    // Expected per-neuron output: 768.0 (same as existing v1/v2 test 1)
+    {
+        let n: usize = 32;
+        let k_blocks: usize = 1;
+
+        let k_q8_blocks = k_blocks * 256 / 32;  // = 8
+        // Q8_1: all i8 = 1 packed as 0x01010101, scale f16(1.0) = 0x3C00
+        let q8_qs_v: Vec<u32> = vec![0x01010101u32; k_q8_blocks * 8];
+        let q8_ds_v: Vec<u32> = vec![0x00003C00u32; k_q8_blocks];
+
+        // Packed 42-u32 for v3
+        let packed_v3_h: Vec<u32> = {
+            let mut p = vec![0u32; n * k_blocks * 42];
+            for row in 0..n {
+                let base = (row * k_blocks) * 42;
+                p[base]   = 1.0f32.to_bits();
+                p[base+1] = 0.0f32.to_bits();
+                for j in 0..4usize { p[base+2+j] = 0x00000101; }
+                for j in 0..4usize { p[base+6+j] = 0x00000000; }
+                for w in 0..32usize { p[base+10+w] = 0x33333333; }
+            }
+            p
+        };
+
+        // Raw GGUF 36-u32 for v3r
+        // ps[0..4]=[1,1,1,1] → sc[0..3]=1; ps[4..8]=[0,0,0,0] → m[0..3]=0;
+        // ps[8..12]=[1,1,1,1] → sc[4..7]=1, m[4..7]=0 (via 6-bit unpack)
+        let packed_v3r_h: Vec<u32> = {
+            let mut p = vec![0u32; n * k_blocks * 36];
+            for row in 0..n {
+                let base = (row * k_blocks) * 36;
+                p[base]   = 0x00003C00u32;  // f16(1.0) | (f16(0.0) << 16)
+                p[base+1] = 0x01010101u32;  // ps[0..4] = [1,1,1,1]
+                p[base+2] = 0x00000000u32;  // ps[4..8] = [0,0,0,0]
+                p[base+3] = 0x01010101u32;  // ps[8..12] = [1,1,1,1]
+                for w in 0..32usize { p[base+4+w] = 0x33333333; }
+            }
+            p
+        };
+
+        let x_qs_dev  = DeviceBuffer::from_host(&stream, &q8_qs_v).expect("q8_qs upload");
+        let x_ds_dev  = DeviceBuffer::from_host(&stream, &q8_ds_v).expect("q8_ds upload");
+        let pv3_dev   = DeviceBuffer::from_host(&stream, &packed_v3_h).expect("v3 upload");
+        let pv3r_dev  = DeviceBuffer::from_host(&stream, &packed_v3r_h).expect("v3r upload");
+        let mut out_v3  = DeviceBuffer::<f32>::zeroed(&stream, n).expect("out_v3");
+        let mut out_v3r = DeviceBuffer::<f32>::zeroed(&stream, n).expect("out_v3r");
+
+        let smem_v3 = WARPS_PER_BLOCK * 4 * 4;
+        let cfg_v3 = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
+            shared_mem_bytes: smem_v3,
+        };
+        unsafe {
+            module.q4k_gemv_decode_q8_v3(
+                stream.as_ref(), cfg_v3, &mut out_v3,
+                &x_qs_dev, &x_ds_dev, &pv3_dev, n as u32, k_blocks as u32,
+            )
+        }.expect("v3 launch");
+        unsafe {
+            module.q4k_gemv_decode_q8_v3r(
+                stream.as_ref(), cfg_v3, &mut out_v3r,
+                &x_qs_dev, &x_ds_dev, &pv3r_dev, n as u32, k_blocks as u32,
+            )
+        }.expect("v3r launch");
+
+        let r_v3  = out_v3.to_host_vec(&stream).expect("v3 download");
+        let r_v3r = out_v3r.to_host_vec(&stream).expect("v3r download");
+
+        let expected_v3r = 768.0f32;
+        let e_v3  = r_v3.iter().map(|v| (v - expected_v3r).abs()).fold(0.0f32, f32::max);
+        let e_v3r = r_v3r.iter().map(|v| (v - expected_v3r).abs()).fold(0.0f32, f32::max);
+        let diff  = r_v3.iter().zip(r_v3r.iter()).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+
+        println!("v3  vs expected={}: err={:.4}  first={}", expected_v3r, e_v3,  r_v3[0]);
+        println!("v3r vs expected={}: err={:.4}  first={}", expected_v3r, e_v3r, r_v3r[0]);
+        println!("v3 vs v3r max_diff={:.6}", diff);
+
+        if e_v3 > 1.0 {
+            eprintln!("v3 FAILED (expected={}, max_err={:.4}, first={})", expected_v3r, e_v3, r_v3[0]);
+            std::process::exit(1);
+        }
+        if e_v3r > 1.0 {
+            eprintln!("v3r FAILED (expected={}, max_err={:.4}, first={})", expected_v3r, e_v3r, r_v3r[0]);
+            eprintln!("  Bug is in the KERNEL (not engine upload): v3r mismatches on direct data");
+            eprintln!("  v3 first 8:  {:?}", &r_v3[..8]);
+            eprintln!("  v3r first 8: {:?}", &r_v3r[..8]);
+            std::process::exit(1);
+        }
+        if diff > 1.0 {
+            eprintln!("v3 vs v3r MISMATCH (max_diff={:.4})", diff);
+            eprintln!("  v3 first 8:  {:?}", &r_v3[..8]);
+            eprintln!("  v3r first 8: {:?}", &r_v3r[..8]);
+            std::process::exit(1);
+        }
+        println!("oxide-gemv-q4k v3 vs v3r agreement: PASSED (max_diff={:.2e})", diff);
+    }
+
     println!("oxide-gemv-q4k: all tests PASSED");
 }

@@ -730,10 +730,21 @@ impl CutileGpuModel {
         debug_assert_eq!(bytes.len(), n * k_blocks * 144,
             "Q4K raw bytes len mismatch: {} != {}", bytes.len(), n * k_blocks * 144);
         // Reinterpret raw bytes as u32 (blocks are 4-byte aligned in GGUF).
-        let raw_u32: &[u32] = unsafe {
-            std::slice::from_raw_parts(bytes.as_ptr() as *const u32, n * k_blocks * 36)
-        };
-        let tensor: Arc<Tensor<u32>> = api::copy_host_vec_to_device(&Arc::new(raw_u32.to_vec()))
+        // Alignment check: GGUF tensor data must be 4-byte aligned for u32 reinterpretation.
+        let ptr_offset = bytes.as_ptr() as usize % 4;
+        if std::env::var("TEMPURA_DEBUG_V3R").is_ok() || ptr_offset != 0 {
+            eprintln!("[v3r] {} bytes={} align_offset={} first_block_u32[0..4]={:08x?}",
+                name, bytes.len(), ptr_offset,
+                [u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+                 u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                 u32::from_le_bytes(bytes[12..16].try_into().unwrap())]);
+        }
+        // Use safe byte-by-byte copy to avoid alignment UB if ptr is not 4-byte aligned.
+        let raw_u32: Vec<u32> = bytes.chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let tensor: Arc<Tensor<u32>> = api::copy_host_vec_to_device(&Arc::new(raw_u32))
             .sync_on(stream)
             .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
             .reshape(&[n * k_blocks * 36])
@@ -2196,27 +2207,70 @@ impl CutileGpuModel {
 
         // ── Prefill (m > 1): host dequant + f32 GEMM ─────────────────────────
         if m > 1 {
-            // Q4_K prefill: reconstruct f32 from packed GPU format.
+            // Q4_K prefill: reconstruct f32 from GPU format (packed 42-u32 or raw GGUF 36-u32).
             if let Some(dw) = self.device_weights_q4k.get(weight_name) {
                 let k = dw.k_blocks * Q4K_BLOCK_SIZE;
                 let packed_host: Vec<u32> = Arc::clone(&dw.tensor)
                     .to_host_vec()
                     .sync_on(self.matmul.stream())
                     .expect("Q4_K packed download failed");
+                // Detect format from block size: 42 u32 = packed, 36 u32 = raw GGUF.
+                let total_blocks = dw.n * dw.k_blocks;
+                let u32s_per_block = packed_host.len() / total_blocks;
+                let raw_gguf = u32s_per_block == 36;
                 let mut f32_weights = vec![0.0f32; dw.n * k];
                 for row in 0..dw.n {
                     for blk in 0..dw.k_blocks {
-                        let base = (row * dw.k_blocks + blk) * Q4K_PACKED_U32S;
-                        let d = f32::from_bits(packed_host[base]);
-                        let dmin = f32::from_bits(packed_host[base + 1]);
+                        let base = (row * dw.k_blocks + blk) * u32s_per_block;
                         let k_base = blk * Q4K_BLOCK_SIZE;
+                        let (d, dmin, sc, m_sc) = if raw_gguf {
+                            // Raw GGUF: u32[0]=f16(d)|f16(dmin)<<16, u32[1..4]=6-bit scales
+                            let dd = packed_host[base];
+                            let d_f16 = dd & 0xFFFF;
+                            let dmin_f16 = (dd >> 16) & 0xFFFF;
+                            let d_v = f16_bits_to_f32_inline(d_f16 as u16);
+                            let dmin_v = f16_bits_to_f32_inline(dmin_f16 as u16);
+                            let ps0 = packed_host[base + 1];
+                            let ps1 = packed_host[base + 2];
+                            let ps2 = packed_host[base + 3];
+                            // Unpack 6-bit scales: sc[i]=ps[i]&0x3F for i=0..3,
+                            //   sc[i+4]=((ps[i+8]&0xF)|((ps[i]>>6)<<4))&0x3F
+                            // m[i]=ps[i+4]&0x3F, m[i+4]=((ps[i+8]>>4)|((ps[i+4]>>6)<<4))&0x3F
+                            let byte = |word: u32, i: u32| -> u32 { (word >> ((i % 4) * 8)) & 0xFF };
+                            let mut sc_arr = [0u8; 8];
+                            let mut m_arr = [0u8; 8];
+                            for i in 0..4u32 {
+                                let p0 = byte(ps0, i);
+                                let p4 = byte(ps1, i);
+                                let p8 = byte(ps2, i);
+                                sc_arr[i as usize]   = (p0 & 0x3F) as u8;
+                                sc_arr[4 + i as usize] = (((p8 & 0x0F) | ((p0 >> 6) << 4)) & 0x3F) as u8;
+                                m_arr[i as usize]    = (p4 & 0x3F) as u8;
+                                m_arr[4 + i as usize]  = ((( p8 >> 4) | ((p4 >> 6) << 4)) & 0x3F) as u8;
+                            }
+                            (d_v, dmin_v, sc_arr, m_arr)
+                        } else {
+                            // Packed format: d/dmin as f32 bits, scales as 8-bit pairs
+                            let d_v = f32::from_bits(packed_host[base]);
+                            let dmin_v = f32::from_bits(packed_host[base + 1]);
+                            let mut sc_arr = [0u8; 8];
+                            let mut m_arr = [0u8; 8];
+                            for j in 0..4usize {
+                                let sp = packed_host[base + 2 + j];
+                                let mp = packed_host[base + 6 + j];
+                                sc_arr[2*j]   = (sp & 0xFF) as u8;
+                                sc_arr[2*j+1] = ((sp >> 8) & 0xFF) as u8;
+                                m_arr[2*j]    = (mp & 0xFF) as u8;
+                                m_arr[2*j+1]  = ((mp >> 8) & 0xFF) as u8;
+                            }
+                            (d_v, dmin_v, sc_arr, m_arr)
+                        };
+                        let nibble_base = if raw_gguf { base + 4 } else { base + 10 };
                         for j in 0..4usize {
-                            let sc_pair = packed_host[base + 2 + j];
-                            let m_pair = packed_host[base + 6 + j];
-                            let sc_lo = (sc_pair & 0xFF) as f32;
-                            let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
-                            let m_lo = (m_pair & 0xFF) as f32;
-                            let m_hi = ((m_pair >> 8) & 0xFF) as f32;
+                            let sc_lo = sc[2*j]   as f32;
+                            let sc_hi = sc[2*j+1] as f32;
+                            let m_lo  = m_sc[2*j]   as f32;
+                            let m_hi  = m_sc[2*j+1] as f32;
                             let d1 = d * sc_lo;
                             let m1 = dmin * m_lo;
                             let d2 = d * sc_hi;
@@ -2224,7 +2278,7 @@ impl CutileGpuModel {
                             for l in 0..32usize {
                                 let qs_word_idx = (j * 32 + l) / 4;
                                 let byte_shift = ((j * 32 + l) % 4) * 8;
-                                let qs_word = packed_host[base + 10 + qs_word_idx];
+                                let qs_word = packed_host[nibble_base + qs_word_idx];
                                 let byte_val = (qs_word >> byte_shift) & 0xFF;
                                 let lo = (byte_val & 0xF) as f32;
                                 let hi = (byte_val >> 4) as f32;
