@@ -2038,6 +2038,77 @@ impl CutileGpuModel {
     ///
     /// For m == 1: checks `device_weights_q4k` first, then `device_weights_q6k`,
     /// then `device_weights_q2`, then falls through to `gemm_d2d_slot` for f32 weights.
+    /// Batched GEMM for M > 1 using M sequential GPU GEMVs — keeps quantized weights
+    /// GPU-resident instead of downloading to CPU. Each row of `a` is fed to the
+    /// M=1 GEMV path; results are D→D-concatenated into an [m, n] output.
+    ///
+    /// `row_stride` is the number of f32 elements between consecutive rows in `a`.
+    fn gemm_any_d2d_batch(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        weight_name: &str,
+        m: usize,
+        row_stride: usize,  // elements per row in `a`
+        slot: usize,
+    ) -> Arc<Tensor<f32>> {
+        let stream = self.matmul.stream();
+
+        // For f32 weights there is no PCIe bottleneck — use the existing slot path.
+        let is_q4k = self.device_weights_q4k.contains_key(weight_name);
+        let is_q6k = self.device_weights_q6k.contains_key(weight_name);
+        let is_q2  = self.device_weights_q2.contains_key(weight_name);
+        if !is_q4k && !is_q6k && !is_q2 {
+            return self.gemm_any_d2d_slot(a, weight_name, m, slot);
+        }
+
+        // Output width for this weight.
+        let n = if is_q4k {
+            self.device_weights_q4k.get(weight_name).map(|dw| dw.n).unwrap_or(0)
+        } else if is_q6k {
+            self.device_weights_q6k.get(weight_name).map(|dw| dw.n).unwrap_or(0)
+        } else {
+            self.device_weights_q2.get(weight_name).map(|dw| dw.n).unwrap_or(0)
+        };
+
+        // Run one GEMV per row of `a` (M=1 each → GPU-resident weight path).
+        let mut rows: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(m);
+        for r in 0..m {
+            let a_row: Arc<Tensor<f32>> = Arc::new(
+                api::zeros::<f32>(&[row_stride])
+                    .sync_on(stream)
+                    .expect("gemm_any_d2d_batch: a_row alloc"),
+            );
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    a_row.device_pointer().cu_deviceptr(),
+                    a.device_pointer().cu_deviceptr() + (r * row_stride * 4) as u64,
+                    row_stride,
+                    stream,
+                ).expect("gemm_any_d2d_batch: a_row D→D slice");
+            }
+            let result = self.gemm_any_d2d_slot(&a_row, weight_name, 1, slot);
+            rows.push(result);
+        }
+
+        // Concatenate M results [n] → flat [m*n] (rank-1, compatible with cuTile ops).
+        let out: Arc<Tensor<f32>> = Arc::new(
+            api::zeros::<f32>(&[m * n])
+                .sync_on(stream)
+                .expect("gemm_any_d2d_batch: output alloc"),
+        );
+        for (r, row) in rows.iter().enumerate() {
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    out.device_pointer().cu_deviceptr() + (r * n * 4) as u64,
+                    row.device_pointer().cu_deviceptr(),
+                    n,
+                    stream,
+                ).expect("gemm_any_d2d_batch: concat D→D");
+            }
+        }
+        out
+    }
+
     /// The slotted quantized paths use pre-allocated scratch buffers with async dispatch,
     /// eliminating the two `sync_on` calls (allocation + kernel) per GEMV.
     /// For m > 1 (prefill): quantized GEMV is not yet batched; fall back to
@@ -3465,9 +3536,10 @@ impl CutileGpuModel {
                 .expect("batch RMSNorm failed");
 
             // QKV projections [M, H] → [M, Q_DIM] / [M, KV_DIM]
-            let q_dev = self.gemm_any_d2d_slot(&normed_dev, q_w_name, m, SLOT_Q);
-            let k_dev = self.gemm_any_d2d_slot(&normed_dev, k_w_name, m, SLOT_K);
-            let v_dev = self.gemm_any_d2d_slot(&normed_dev, v_w_name, m, SLOT_V);
+            // normed_dev is [m, h_pad] from forward_device_fused; row stride = h_pad.
+            let q_dev = self.gemm_any_d2d_batch(&normed_dev, q_w_name, m, self.h_pad, SLOT_Q);
+            let k_dev = self.gemm_any_d2d_batch(&normed_dev, k_w_name, m, self.h_pad, SLOT_K);
+            let v_dev = self.gemm_any_d2d_batch(&normed_dev, v_w_name, m, self.h_pad, SLOT_V);
 
             // RoPE per-request (each has its own position).
             // Process each request's Q/K slice individually.
@@ -3668,7 +3740,8 @@ impl CutileGpuModel {
 
             // O-projection [M, Q_DIM] → [M, H]
             let attn_padded = self.attn_out_to_oproj_device_m(&attn_out_dev, q_dim, self.q_pad, m);
-            let o_dev = self.gemm_any_d2d_slot(&attn_padded, o_w_name, m, SLOT_O);
+            // attn_padded is [m, q_pad] from attn_out_to_oproj_device_m; row stride = q_pad.
+            let o_dev = self.gemm_any_d2d_batch(&attn_padded, o_w_name, m, self.q_pad, SLOT_O);
 
             // Post-attention residual add (fresh alloc — pre-allocated scratch is M=1 sized).
             hidden_dev = self.add_device_scratch(
@@ -3693,8 +3766,9 @@ impl CutileGpuModel {
                 .expect("batch post-attn RMSNorm failed");
 
             // FFN: gate/up/down projections.
-            let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, m, SLOT_GATE);
-            let up_dev   = self.gemm_any_d2d_slot(&normed2_dev, up_w_name,   m, SLOT_UP);
+            // normed2_dev is [m, h_pad]; row stride = h_pad.
+            let gate_dev = self.gemm_any_d2d_batch(&normed2_dev, gate_w_name, m, self.h_pad, SLOT_GATE);
+            let up_dev   = self.gemm_any_d2d_batch(&normed2_dev, up_w_name,   m, self.h_pad, SLOT_UP);
 
             // SiLU(gate) × up — use cuTile silu_mul (GPU, no PCIe round-trip, any M).
             let inter_size = m * cfg.intermediate_size;
@@ -3710,7 +3784,8 @@ impl CutileGpuModel {
                 let gs_host = self.download_device_tensor(&gs_dev);
                 self.to_device_padded(&gs_host, m, inter_sz, self.inter_pad)
             };
-            let down_dev = self.gemm_any_d2d_slot(&gs_padded, down_w_name, m, SLOT_DOWN);
+            // gs_padded is [m, inter_pad] (after silu + padding); row stride = inter_pad.
+            let down_dev = self.gemm_any_d2d_batch(&gs_padded, down_w_name, m, self.inter_pad, SLOT_DOWN);
 
             hidden_dev = self.add_device_scratch(
                 &hidden_dev, &down_dev,
