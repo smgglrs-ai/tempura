@@ -652,6 +652,175 @@ mod kernels {
         }
     }
 
+    /// Smem-tiled batched Q4_K GEMM: true M× bandwidth amortization.
+    ///
+    /// Same structure as q4k_gemm_colocated but row-0 warps explicitly load
+    /// weight K-block data into shared memory before compute. All M rows then
+    /// read weights from smem (no DRAM) during FMA, eliminating (M-1)/M of
+    /// weight DRAM traffic.
+    ///
+    /// smem layout:
+    ///   [0 .. WARPS_PER_BLOCK*42)         = weight u32 data (42 u32 per warp)
+    ///   [WARPS_PER_BLOCK*42 .. +M*WPB)    = partial-sum reduction slots (f32)
+    ///
+    /// Block: WARPS_PER_BLOCK * 32 * M threads (flat 1D encoding).
+    ///   overall_warp = tid / 32
+    ///   row     = overall_warp / WARPS_PER_BLOCK
+    ///   warp_id = overall_warp % WARPS_PER_BLOCK
+    ///   n_out   = blockIdx.x * WARPS_PER_BLOCK + warp_id
+    ///
+    /// Grid: (ceil(N / WARPS_PER_BLOCK), 1, 1)
+    /// shared_mem_bytes = (WARPS_PER_BLOCK * 42 + M * WARPS_PER_BLOCK) * 4
+    #[kernel]
+    pub unsafe fn q4k_gemm_smem(
+        mut out: DisjointSlice<f32>,   // [m * n] row-major
+        x: *const f32,                  // [m * k] row-major, k = k_blocks * 256
+        packed: &[u32],                 // [n * k_blocks * 42]
+        m: u32,
+        n: u32,
+        k_blocks: u32,
+    ) {
+        let tid          = thread::threadIdx_x();
+        let overall_warp = tid / 32;
+        let lane         = tid % 32;
+        let row          = overall_warp / WARPS_PER_BLOCK;
+        let warp_id      = overall_warp % WARPS_PER_BLOCK;
+        let n_out        = thread::blockIdx_x() * WARPS_PER_BLOCK + warp_id;
+
+        if n_out >= n || row >= m { return; }
+
+        let x_row: *const f32 = x.add((row * k_blocks * 256) as usize);
+        let qs_shift = (lane % 4) * 8;
+
+        // smem: first section holds weight u32 data (42 u32s per warp),
+        //       second section holds partial-sum reduction slots.
+        let smem: *mut f32 = DynamicSharedArray::<f32>::get();
+        let smem_w: *mut u32 = smem as *mut u32;   // weight staging
+        let smem_p_base = (WARPS_PER_BLOCK * 42) as usize;  // index of partials in f32 slots
+
+        let mut acc = 0.0_f32;
+
+        // K-loop: warp_id strides WARPS_PER_BLOCK (same K-parallelism as v2).
+        let mut blk = warp_id;
+        while blk < k_blocks {
+            let base = (n_out * k_blocks + blk) * 42;
+            let smem_blk = (warp_id * 42) as usize;
+
+            // ── Phase 1: row=0 warps load 42 u32s for this K-block into smem ──
+            // 42 u32s loaded by 32 lanes in two passes (32 + 10 = 42).
+            if row == 0 {
+                *smem_w.add(smem_blk + lane as usize) = packed[(base + lane) as usize];
+                if lane < 10 {
+                    *smem_w.add(smem_blk + 32 + lane as usize) = packed[(base + 32 + lane) as usize];
+                }
+            }
+
+            thread::sync_threads();
+
+            // ── Phase 2: all rows compute using smem weight data ──────────────
+            let d_src    = if lane == 0 { *smem_w.add(smem_blk) } else { 0 };
+            let dmin_src = if lane == 0 { *smem_w.add(smem_blk + 1) } else { 0 };
+            let d    = f32::from_bits(warp::shuffle(d_src, 0));
+            let dmin = f32::from_bits(warp::shuffle(dmin_src, 0));
+
+            let sc_raw = if lane < 4 { *smem_w.add(smem_blk + 2 + lane as usize) } else { 0 };
+            let m_raw  = if lane < 4 { *smem_w.add(smem_blk + 6 + lane as usize) } else { 0 };
+
+            // qs words: lanes 0..31 each read their own qs word from smem
+            let qs_j0 = *smem_w.add(smem_blk + 10 + (lane / 4) as usize);
+            let qs_j1 = *smem_w.add(smem_blk + 10 + 8 + (lane / 4) as usize);
+            let qs_j2 = *smem_w.add(smem_blk + 10 + 16 + (lane / 4) as usize);
+            let qs_j3 = *smem_w.add(smem_blk + 10 + 24 + (lane / 4) as usize);
+
+            // j=0
+            {
+                let sc_pair = warp::shuffle(sc_raw, 0);
+                let m_pair  = warp::shuffle(m_raw, 0);
+                let sc_lo = (sc_pair & 0xFF) as f32;
+                let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
+                let m_lo  = (m_pair & 0xFF) as f32;
+                let m_hi  = ((m_pair >> 8) & 0xFF) as f32;
+                let qs_byte = (qs_j0 >> qs_shift) & 0xFF;
+                let nl = (qs_byte & 0xF) as f32;
+                let nh = ((qs_byte >> 4) & 0xF) as f32;
+                acc += (d * sc_lo * nl - dmin * m_lo) * *x_row.add((blk * 256 + lane) as usize);
+                acc += (d * sc_hi * nh - dmin * m_hi) * *x_row.add((blk * 256 + 32 + lane) as usize);
+            }
+            // j=1
+            {
+                let sc_pair = warp::shuffle(sc_raw, 1);
+                let m_pair  = warp::shuffle(m_raw, 1);
+                let sc_lo = (sc_pair & 0xFF) as f32;
+                let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
+                let m_lo  = (m_pair & 0xFF) as f32;
+                let m_hi  = ((m_pair >> 8) & 0xFF) as f32;
+                let qs_byte = (qs_j1 >> qs_shift) & 0xFF;
+                let nl = (qs_byte & 0xF) as f32;
+                let nh = ((qs_byte >> 4) & 0xF) as f32;
+                acc += (d * sc_lo * nl - dmin * m_lo) * *x_row.add((blk * 256 + 64 + lane) as usize);
+                acc += (d * sc_hi * nh - dmin * m_hi) * *x_row.add((blk * 256 + 96 + lane) as usize);
+            }
+            // j=2
+            {
+                let sc_pair = warp::shuffle(sc_raw, 2);
+                let m_pair  = warp::shuffle(m_raw, 2);
+                let sc_lo = (sc_pair & 0xFF) as f32;
+                let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
+                let m_lo  = (m_pair & 0xFF) as f32;
+                let m_hi  = ((m_pair >> 8) & 0xFF) as f32;
+                let qs_byte = (qs_j2 >> qs_shift) & 0xFF;
+                let nl = (qs_byte & 0xF) as f32;
+                let nh = ((qs_byte >> 4) & 0xF) as f32;
+                acc += (d * sc_lo * nl - dmin * m_lo) * *x_row.add((blk * 256 + 128 + lane) as usize);
+                acc += (d * sc_hi * nh - dmin * m_hi) * *x_row.add((blk * 256 + 160 + lane) as usize);
+            }
+            // j=3
+            {
+                let sc_pair = warp::shuffle(sc_raw, 3);
+                let m_pair  = warp::shuffle(m_raw, 3);
+                let sc_lo = (sc_pair & 0xFF) as f32;
+                let sc_hi = ((sc_pair >> 8) & 0xFF) as f32;
+                let m_lo  = (m_pair & 0xFF) as f32;
+                let m_hi  = ((m_pair >> 8) & 0xFF) as f32;
+                let qs_byte = (qs_j3 >> qs_shift) & 0xFF;
+                let nl = (qs_byte & 0xF) as f32;
+                let nh = ((qs_byte >> 4) & 0xF) as f32;
+                acc += (d * sc_lo * nl - dmin * m_lo) * *x_row.add((blk * 256 + 192 + lane) as usize);
+                acc += (d * sc_hi * nh - dmin * m_hi) * *x_row.add((blk * 256 + 224 + lane) as usize);
+            }
+
+            thread::sync_threads();  // guard smem before next blk's row-0 write
+
+            blk += WARPS_PER_BLOCK;
+        }
+
+        // Intra-warp reduce.
+        acc = warp::reduce_sum_f32(acc);
+
+        // Cross-warp reduce via smem (same as colocated).
+        let smem_idx = smem_p_base + (row * WARPS_PER_BLOCK + warp_id) as usize;
+        if lane == 0 {
+            *smem.add(smem_idx) = acc;
+        }
+        thread::sync_threads();
+
+        if warp_id == 0 {
+            acc = if lane < WARPS_PER_BLOCK {
+                *smem.add(smem_p_base + (row * WARPS_PER_BLOCK + lane) as usize)
+            } else {
+                0.0_f32
+            };
+            let mut delta = WARPS_PER_BLOCK / 2;
+            while delta >= 1 {
+                acc += warp::shuffle_xor_f32(acc, delta);
+                delta /= 2;
+            }
+            if lane == 0 {
+                *out.get_unchecked_mut((row * n + n_out) as usize) = acc;
+            }
+        }
+    }
+
     /// Quantize f32 activations to Q8_1 packed format on GPU.
     ///
     /// Each warp (32 lanes) handles one 32-element Q8_1 block:

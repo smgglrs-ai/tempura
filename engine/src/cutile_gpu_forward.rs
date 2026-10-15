@@ -2070,13 +2070,14 @@ impl CutileGpuModel {
             self.device_weights_q2.get(weight_name).map(|dw| dw.n).unwrap_or(0)
         };
 
-        // Prefer the colocated GEMM (all M rows in one block → L2 broadcast for weights).
+        // Colocated GEMM: all M rows in one block → same SM → L2 broadcast for weight accesses.
+        // smem GEMM available but slower (barrier overhead > benefit for this block size).
         // Falls back to grid=(N,M) batch GEMV, then M sequential GEMVs.
         const WPB: usize = 4; // WARPS_PER_BLOCK in oxide kernel
         if is_q4k && m * WPB * 32 <= 1024 {
             if let Some(ref oxide) = self.oxide_q4k_gemv {
                 let dw = self.device_weights_q4k.get(weight_name).unwrap();
-                // Try colocated first (best L2 reuse), fall back to grid-batch.
+                // Colocated is faster than smem due to lower barrier overhead.
                 if let Ok(result) = oxide.forward_colocated_d2d(a, &dw.tensor, m, dw.n, dw.k_blocks) {
                     return result;
                 }

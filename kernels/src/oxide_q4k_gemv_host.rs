@@ -43,6 +43,7 @@ static OXIDE_Q4K_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oxide_q4
 const KERNEL_ENTRY: &str = "q4k_gemv_decode_v2";
 const KERNEL_BATCH: &str = "q4k_gemv_decode_v2_batch";
 const KERNEL_COLOCATED: &str = "q4k_gemm_colocated";
+const KERNEL_SMEM: &str = "q4k_gemm_smem";
 const KERNEL_Q8_QUANTIZE: &str = "quantize_q8_1";
 const KERNEL_Q8_GEMV: &str = "q4k_gemv_decode_q8";
 const KERNEL_Q8_GEMV_V2: &str = "q4k_gemv_decode_q8_v2";
@@ -66,6 +67,8 @@ pub struct OxideQ4kGemv {
     cu_batch_gemv:     Option<CUfunction>,
     /// Optional colocated GEMM: all M rows in one block, L2 broadcast for weights.
     cu_colocated:      Option<CUfunction>,
+    /// Optional smem-tiled GEMM: row-0 loads weights into smem, all M rows compute from smem.
+    cu_smem:           Option<CUfunction>,
     stream:         Arc<Stream>,
     /// Pre-allocated Q8_1 scratch buffers (set by pre_allocate_q8_scratch before graph capture).
     /// These avoid device allocation on a capturing stream (CUDA error 900).
@@ -155,6 +158,7 @@ impl OxideQ4kGemv {
             let cu_q8_gemv_v3  = load_fn(KERNEL_Q8_GEMV_V3);
             let cu_batch_gemv  = load_fn(KERNEL_BATCH);
             let cu_colocated   = load_fn(KERNEL_COLOCATED);
+            let cu_smem        = load_fn(KERNEL_SMEM);
 
             eprintln!(
                 "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={}, q8v2={}, q8v3={}, batch={})",
@@ -166,7 +170,7 @@ impl OxideQ4kGemv {
                 cu_batch_gemv.is_some(),
             );
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_batch_gemv, cu_colocated, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_batch_gemv, cu_colocated, cu_smem, stream,
                 q8_qs_scratch:  std::cell::RefCell::new(None),
                 q8_ds_scratch:  std::cell::RefCell::new(None),
                 q8_out_scratch: std::cell::RefCell::new(None),
@@ -331,6 +335,75 @@ impl OxideQ4kGemv {
                 &mut params8,
             )
         }.map_err(|e| KernelError::InvalidConfig(format!("colocated q4k gemm: {e}")))?;
+
+        unsafe {
+            self.stream.synchronize()
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        }
+        Ok(Arc::new(out))
+    }
+
+    pub fn has_smem_gemm(&self) -> bool { self.cu_smem.is_some() }
+
+    /// Smem-tiled GEMM: row-0 warps load 42 u32s of weight data into smem, all M rows
+    /// then compute FMAs from smem — eliminating (M-1)/M of weight DRAM traffic.
+    pub fn forward_smem_d2d(
+        &self,
+        x: &Arc<Tensor<f32>>,        // [m, k] activations
+        packed: &Arc<Tensor<u32>>,    // [n, k_blocks, 42]
+        m: usize,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let func = match &self.cu_smem {
+            Some(f) => *f,
+            None => return self.forward_colocated_d2d(x, packed, m, n, k_blocks),
+        };
+        let block_x = (WARPS_PER_BLOCK * 32) as usize * m;
+        if block_x > 1024 {
+            return Err(KernelError::InvalidConfig(
+                format!("smem GEMM: block_dim_x={block_x} > 1024 for m={m}")
+            ));
+        }
+
+        let out = api::zeros::<f32>(&[m * n])
+            .sync_on(&self.stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let out_ptr: u64 = out.device_pointer().cu_deviceptr();
+        let out_len: u64 = (m * n) as u64;
+        let x_ptr: u64 = x.device_pointer().cu_deviceptr();
+        let packed_ptr: u64 = packed.device_pointer().cu_deviceptr();
+        let packed_len: u64 = packed.size() as u64;
+        let m_u32 = m as u32;
+        let n_u32 = n as u32;
+        let k_blocks_u32 = k_blocks as u32;
+
+        let mut params8: [*mut c_void; 8] = [
+            &out_ptr      as *const _ as *mut c_void,
+            &out_len      as *const _ as *mut c_void,
+            &x_ptr        as *const _ as *mut c_void,
+            &packed_ptr   as *const _ as *mut c_void,
+            &packed_len   as *const _ as *mut c_void,
+            &m_u32        as *const _ as *mut c_void,
+            &n_u32        as *const _ as *mut c_void,
+            &k_blocks_u32 as *const _ as *mut c_void,
+        ];
+
+        let grid_x = (n_u32 + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        // smem: [WARPS_PER_BLOCK * 42 weight u32s] + [M * WARPS_PER_BLOCK partial-sum f32s]
+        let smem_bytes = (WARPS_PER_BLOCK * 42 + m_u32 * WARPS_PER_BLOCK) * 4;
+        let cu_stream = self.stream.cu_stream();
+        unsafe {
+            launch_kernel(
+                func,
+                (grid_x, 1, 1),
+                (block_x as u32, 1, 1),
+                smem_bytes,
+                cu_stream,
+                &mut params8,
+            )
+        }.map_err(|e| KernelError::InvalidConfig(format!("smem q4k gemm: {e}")))?;
 
         unsafe {
             self.stream.synchronize()
