@@ -526,11 +526,22 @@ impl OxideQ4kGemv {
         n: usize,
         k_blocks: usize,
     ) -> Result<Arc<Tensor<f32>>> {
-        // Prefer v3 (VDR=2) > v2 > v1.
-        // v3r (raw GGUF) requires matching 36-u32 upload format — not yet wired in upload path.
+        // Prefer v3r (raw GGUF, 14% less DRAM) > v3 (VDR=2) > v2 > v1.
         let (q8_quant_fn, q8_gemv_fn, kernel_variant) = match &self.cu_q8_quantize {
             Some(q) => {
-                if let Some(g3) = &self.cu_q8_gemv_v3 {
+                if self.uses_raw_gguf {
+                    if let Some(g3r) = &self.cu_q8_gemv_v3r {
+                        (*q, *g3r, 4u8)
+                    } else if let Some(g3) = &self.cu_q8_gemv_v3 {
+                        (*q, *g3, 3u8)
+                    } else if let Some(g2) = &self.cu_q8_gemv_v2 {
+                        (*q, *g2, 2u8)
+                    } else if let Some(g) = &self.cu_q8_gemv {
+                        (*q, *g, 1u8)
+                    } else {
+                        return Err(KernelError::InvalidConfig("Q8 GEMV kernel not loaded".into()));
+                    }
+                } else if let Some(g3) = &self.cu_q8_gemv_v3 {
                     (*q, *g3, 3u8)
                 } else if let Some(g2) = &self.cu_q8_gemv_v2 {
                     (*q, *g2, 2u8)

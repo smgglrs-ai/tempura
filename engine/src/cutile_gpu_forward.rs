@@ -841,6 +841,9 @@ impl CutileGpuModel {
     ) -> Result<Self, tempura_kernels::KernelError> {
         let matmul = CutileMatMul::new()?;
         let flash_attn = CutileFlashAttention::new()?;
+        // Load oxide Q4K kernel BEFORE weight upload so uses_raw_gguf can guide the format choice.
+        let oxide_q4k_gemv_early = OxideQ4kGemv::try_load(matmul.stream().clone());
+        let upload_raw_q4k = oxide_q4k_gemv_early.as_ref().map(|o| o.uses_raw_gguf).unwrap_or(false);
         let mut dw: HashMap<String, DeviceWeight> = HashMap::new();
         let mut dw_q4k: HashMap<String, DeviceWeightQ4K> = HashMap::new();
         let mut dw_q2: HashMap<String, DeviceWeightQ2> = HashMap::new();
@@ -871,8 +874,12 @@ impl CutileGpuModel {
             let mut try_proj = |name: String, n: usize, k: usize| {
                 (|| -> Result<(), tempura_kernels::KernelError> {
                     // Priority: Q4_K → Q6_K → Q2_0 → f32 dequantized.
-                    let uploaded_q4k =
-                        Self::maybe_upload_q4k(matmul.stream(), &mut dw_q4k, qw, &name, n, k)?;
+                    // Use raw GGUF 36-u32 format if the v3r kernel supports it.
+                    let uploaded_q4k = if upload_raw_q4k {
+                        Self::maybe_upload_q4k_raw(matmul.stream(), &mut dw_q4k, qw, &name, n, k)?
+                    } else {
+                        Self::maybe_upload_q4k(matmul.stream(), &mut dw_q4k, qw, &name, n, k)?
+                    };
                     if uploaded_q4k {
                         return Ok(());
                     }
@@ -940,7 +947,7 @@ impl CutileGpuModel {
 
         // Attempt to load the oxide-compiled Q2_0, Q4_K, and Q6_K GEMV kernels.
         let oxide_q2_gemv = OxideQ2Gemv::try_load(matmul.stream().clone());
-        let oxide_q4k_gemv = OxideQ4kGemv::try_load(matmul.stream().clone());
+        let oxide_q4k_gemv = oxide_q4k_gemv_early;   // reuse the early-loaded instance (upload format already matched)
         let oxide_q6k_gemv = OxideQ6kGemv::try_load(matmul.stream().clone());
         // Oxide decode attention (kv_len read from device pointer at execution time).
         let oxide_decode_attn = match OxideDecodeAttn::new(matmul.stream().clone()) {
