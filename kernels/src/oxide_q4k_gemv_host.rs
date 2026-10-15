@@ -175,7 +175,8 @@ impl OxideQ4kGemv {
                 cu_q8_gemv_v3.is_some(),
                 cu_batch_gemv.is_some(),
             );
-            let uses_raw_gguf = cu_q8_gemv_v3r.is_some();
+            // v3r kernel has a runtime crash (CUDA error 719) — disabled until debugged.
+            let uses_raw_gguf = false; // cu_q8_gemv_v3r.is_some();
             Some(Self {
                 cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_batch_gemv, cu_colocated, cu_smem, uses_raw_gguf, stream,
                 q8_qs_scratch:  std::cell::RefCell::new(None),
