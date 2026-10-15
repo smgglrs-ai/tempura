@@ -174,11 +174,12 @@ impl OxideQ4kGemv {
                 cu_q8_gemv_v2.is_some(),
                 cu_q8_gemv_v3.is_some(),
                 cu_q8_gemv_v3r.is_some(),
-                cu_q8_gemv_v3r.is_some(),
+                false, // uses_raw_gguf — v3r dispatching disabled pending correctness debug
                 cu_batch_gemv.is_some(),
             );
-            // v3r kernel has numerical output bug (garbage values) — disabled pending debug.
-            // The 36-u32 raw GGUF format + 6-bit inline decode needs correctness verification.
+            // v3r: 36-u32 raw GGUF format. Disabled — kernel produces wrong output.
+            // Root cause not yet identified; code review suggests kernel is correct but
+            // empirical testing (engine-level) shows garbage values. Needs isolated test.
             let uses_raw_gguf = false; // cu_q8_gemv_v3r.is_some()
             Some(Self {
                 cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_batch_gemv, cu_colocated, cu_smem, uses_raw_gguf, stream,
@@ -656,11 +657,16 @@ impl OxideQ4kGemv {
 
             // v2: one block per output neuron (all WARPS_PER_BLOCK warps cooperate on K).
             // v1: ceil(N/WARPS_PER_BLOCK) blocks (one warp per neuron).
-            // smem: WARPS_PER_BLOCK warps × 4 j-groups × 4 bytes = 64 bytes (both variants).
+            // smem: 32 f32 slots = 128 bytes. The cross-warp reduce uses lanes 0..3 of warp 0
+            // to read smem[(w*4+lane)] for w=0..3, lane=0..3 (max index=15, 16 slots needed).
+            // BUT on Blackwell sm_120, predicated-but-still-executing lanes 4..31 of warp 0
+            // also execute the smem load for their lane index (4..31), requiring 32 slots = 128
+            // bytes to avoid trapping on OOB shared-memory access. Use 128 bytes for all
+            // v2/v3/v3r kernels to be safe on Blackwell hardware.
             let (grid_x, smem_bytes) = if use_v2 {
-                (n as u32, WARPS_PER_BLOCK * 4 * 4)
+                (n as u32, 32 * 4)  // 128 bytes: 32 f32 slots (Blackwell predicated-smem safety)
             } else {
-                (n.div_ceil(WARPS_PER_BLOCK as usize) as u32, WARPS_PER_BLOCK * 4 * 4)
+                (n.div_ceil(WARPS_PER_BLOCK as usize) as u32, 0)
             };
             let kernel_name = match kernel_variant {
                 3 => "q4k_gemv_decode_q8_v3",
