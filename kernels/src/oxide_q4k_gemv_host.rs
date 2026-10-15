@@ -41,6 +41,7 @@ use std::sync::Arc;
 static OXIDE_Q4K_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oxide_q4k_gemv.ptx"));
 
 const KERNEL_ENTRY: &str = "q4k_gemv_decode_v2";
+const KERNEL_BATCH: &str = "q4k_gemv_decode_v2_batch";
 const KERNEL_Q8_QUANTIZE: &str = "quantize_q8_1";
 const KERNEL_Q8_GEMV: &str = "q4k_gemv_decode_q8";
 const KERNEL_Q8_GEMV_V2: &str = "q4k_gemv_decode_q8_v2";
@@ -60,6 +61,8 @@ pub struct OxideQ4kGemv {
     cu_q8_gemv_v2:     Option<CUfunction>,
     /// Optional Q4K+Q8_1 GEMV v3 kernel (VDR=2 double-block K-loop).
     cu_q8_gemv_v3:     Option<CUfunction>,
+    /// Optional batched Q4K GEMV: grid=(N,M,1), L2-shared weight blocks.
+    cu_batch_gemv:     Option<CUfunction>,
     stream:         Arc<Stream>,
     /// Pre-allocated Q8_1 scratch buffers (set by pre_allocate_q8_scratch before graph capture).
     /// These avoid device allocation on a capturing stream (CUDA error 900).
@@ -147,17 +150,19 @@ impl OxideQ4kGemv {
             let cu_q8_gemv     = load_fn(KERNEL_Q8_GEMV);
             let cu_q8_gemv_v2  = load_fn(KERNEL_Q8_GEMV_V2);
             let cu_q8_gemv_v3  = load_fn(KERNEL_Q8_GEMV_V3);
+            let cu_batch_gemv  = load_fn(KERNEL_BATCH);
 
             eprintln!(
-                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={}, q8v2={}, q8v3={})",
+                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={}, q8v2={}, q8v3={}, batch={})",
                 OXIDE_Q4K_PTX.len(),
                 KERNEL_ENTRY,
                 cu_q8_gemv.is_some(),
                 cu_q8_gemv_v2.is_some(),
                 cu_q8_gemv_v3.is_some(),
+                cu_batch_gemv.is_some(),
             );
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_batch_gemv, stream,
                 q8_qs_scratch:  std::cell::RefCell::new(None),
                 q8_ds_scratch:  std::cell::RefCell::new(None),
                 q8_out_scratch: std::cell::RefCell::new(None),
@@ -185,6 +190,78 @@ impl OxideQ4kGemv {
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         }
 
+        Ok(Arc::new(out))
+    }
+
+    /// Returns true if the tiled batch GEMV kernel is compiled into the PTX.
+    pub fn has_batch_gemv(&self) -> bool {
+        self.cu_batch_gemv.is_some()
+    }
+
+    /// Batched Q4_K GEMV: `out[m, n] = dequant(packed[n,k]) × x[m,k]`.
+    ///
+    /// Grid = (N, M, 1) — each block handles one (n_out, row) pair.
+    /// L2-cache reuse: M blocks for the same n_out share the weight data.
+    pub fn forward_batch_d2d(
+        &self,
+        x: &Arc<Tensor<f32>>,        // [m, k] activations (flat m*k elements)
+        packed: &Arc<Tensor<u32>>,    // [n, k_blocks, 42] packed Q4K weights
+        m: usize,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let func = match &self.cu_batch_gemv {
+            Some(f) => *f,
+            None => return Err(KernelError::InvalidConfig("batch GEMV not compiled".into())),
+        };
+
+        let out = api::zeros::<f32>(&[m * n])
+            .sync_on(&self.stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        let out_ptr: u64 = out.device_pointer().cu_deviceptr();
+        let out_len: u64 = (m * n) as u64;
+        // Pass x as a raw pointer (batch kernel uses *const f32 for row arithmetic).
+        let x_ptr: u64 = x.device_pointer().cu_deviceptr();
+        let packed_ptr: u64 = packed.device_pointer().cu_deviceptr();
+        let packed_len: u64 = packed.size() as u64;
+        let m_u32 = m as u32;
+        let n_u32 = n as u32;
+        let k_blocks_u32 = k_blocks as u32;
+
+        let mut params: [*mut c_void; 9] = [
+            &out_ptr     as *const _ as *mut c_void,
+            &out_len     as *const _ as *mut c_void,
+            &x_ptr       as *const _ as *mut c_void,  // *const f32 raw pointer
+            &packed_ptr  as *const _ as *mut c_void,
+            &packed_len  as *const _ as *mut c_void,
+            &m_u32       as *const _ as *mut c_void,
+            &n_u32       as *const _ as *mut c_void,
+            &k_blocks_u32 as *const _ as *mut c_void,
+            std::ptr::null_mut(),  // sentinel (no extra param)
+        ];
+        // Trim to 8 params (drop the sentinel).
+        let mut params8: [*mut c_void; 8] = [
+            params[0], params[1], params[2], params[3],
+            params[4], params[5], params[6], params[7],
+        ];
+
+        let cu_stream = self.stream.cu_stream();
+        unsafe {
+            launch_kernel(
+                func,
+                (n_u32, m_u32, 1),
+                (BLOCK_DIM, 1, 1),
+                WARPS_PER_BLOCK * 4,
+                cu_stream,
+                &mut params8,
+            )
+        }.map_err(|e| KernelError::InvalidConfig(format!("batch q4k gemv: {e}")))?;
+
+        unsafe {
+            self.stream.synchronize()
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        }
         Ok(Arc::new(out))
     }
 

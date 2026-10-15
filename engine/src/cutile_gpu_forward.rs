@@ -2070,7 +2070,18 @@ impl CutileGpuModel {
             self.device_weights_q2.get(weight_name).map(|dw| dw.n).unwrap_or(0)
         };
 
-        // Run one GEMV per row of `a` (M=1 each → GPU-resident weight path).
+        // Prefer the tiled batch GEMV kernel (L2 weight reuse across M rows).
+        if is_q4k {
+            if let Some(ref oxide) = self.oxide_q4k_gemv {
+                if oxide.has_batch_gemv() {
+                    let dw = self.device_weights_q4k.get(weight_name).unwrap();
+                    return oxide.forward_batch_d2d(a, &dw.tensor, m, dw.n, dw.k_blocks)
+                        .expect("oxide Q4K batch GEMV failed");
+                }
+            }
+        }
+
+        // Fallback: M sequential GEMVs (no L2 reuse but still GPU-resident).
         let mut rows: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(m);
         for r in 0..m {
             let a_row: Arc<Tensor<f32>> = Arc::new(
