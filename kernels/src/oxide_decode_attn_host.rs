@@ -31,6 +31,13 @@ unsafe impl Sync for OxideDecodeAttn {}
 impl OxideDecodeAttn {
     /// Load PTX from the embedded build artifact.
     pub fn new(stream: Arc<Stream>) -> Result<Self> {
+        // oxide_decode_attn_kpar has smem/layout issues in CUDA graph context — disabled.
+        // The cuTile cutile_decode_attn fallback (108 tok/s) is used instead.
+        // TODO: debug kpar smem size and verify ex2_approx_f32 numerical stability.
+        return Err(KernelError::InvalidConfig(
+            "oxide_decode_attn disabled (kpar smem bug pending debug)".into()
+        ));
+        #[allow(unreachable_code)]
         // cuModuleLoadData for PTX text format requires a null-terminated string.
         // include_bytes! does NOT add a null terminator, so we must append one.
         let ptx_nul: Vec<u8> = PTX.iter().copied().chain(std::iter::once(0u8)).collect();
