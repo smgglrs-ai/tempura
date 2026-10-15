@@ -180,7 +180,10 @@ impl OxideQ4kGemv {
             // v3r: 36-u32 raw GGUF format. Disabled — kernel produces wrong output.
             // Root cause not yet identified; code review suggests kernel is correct but
             // empirical testing (engine-level) shows garbage values. Needs isolated test.
-            let uses_raw_gguf = cu_q8_gemv_v3r.is_some();
+            // v3r produces wrong output in full model (7 tok/s vs 108 tok/s packed).
+            // Isolated kernel test passes — bug is in scale/format interaction in full model.
+            // TODO: debug by comparing first layer q_proj output v3 vs v3r.
+            let uses_raw_gguf = false; // cu_q8_gemv_v3r.is_some()
             Some(Self {
                 cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_batch_gemv, cu_colocated, cu_smem, uses_raw_gguf, stream,
                 q8_qs_scratch:  std::cell::RefCell::new(None),
