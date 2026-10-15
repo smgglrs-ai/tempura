@@ -2070,11 +2070,25 @@ impl CutileGpuModel {
             self.device_weights_q2.get(weight_name).map(|dw| dw.n).unwrap_or(0)
         };
 
-        // Prefer the tiled batch GEMV kernel (L2 weight reuse across M rows).
-        if is_q4k {
+        // Prefer the colocated GEMM (all M rows in one block → L2 broadcast for weights).
+        // Falls back to grid=(N,M) batch GEMV, then M sequential GEMVs.
+        const WPB: usize = 4; // WARPS_PER_BLOCK in oxide kernel
+        if is_q4k && m * WPB * 32 <= 1024 {
             if let Some(ref oxide) = self.oxide_q4k_gemv {
+                let dw = self.device_weights_q4k.get(weight_name).unwrap();
+                // Try colocated first (best L2 reuse), fall back to grid-batch.
+                if let Ok(result) = oxide.forward_colocated_d2d(a, &dw.tensor, m, dw.n, dw.k_blocks) {
+                    return result;
+                }
                 if oxide.has_batch_gemv() {
-                    let dw = self.device_weights_q4k.get(weight_name).unwrap();
+                    return oxide.forward_batch_d2d(a, &dw.tensor, m, dw.n, dw.k_blocks)
+                        .expect("oxide Q4K batch GEMV failed");
+                }
+            }
+        } else if is_q4k { // m too large for colocated kernel
+            if let Some(ref oxide) = self.oxide_q4k_gemv {
+                let dw = self.device_weights_q4k.get(weight_name).unwrap();
+                if oxide.has_batch_gemv() {
                     return oxide.forward_batch_d2d(a, &dw.tensor, m, dw.n, dw.k_blocks)
                         .expect("oxide Q4K batch GEMV failed");
                 }
