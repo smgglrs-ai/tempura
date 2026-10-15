@@ -2832,18 +2832,11 @@ impl CutileGpuModel {
                             .expect("attn out alloc")),
                     }
                 };
-                // Prefer K-parallel variant when available (better SM utilization).
-                if oda.has_kpar() {
-                    oda.forward_kpar_d2d(
-                        &out_tensor, &q_rot_dev, &k_dev_full, &v_dev_full,
-                        &self.d_kv_len, n_heads, n_kv_heads, head_dim, scale,
-                    ).expect("oxide kpar decode attention failed");
-                } else {
-                    oda.forward_d2d(
-                        &out_tensor, &q_rot_dev, &k_dev_full, &v_dev_full,
-                        &self.d_kv_len, n_heads, n_kv_heads, head_dim, scale,
-                    ).expect("oxide decode attention failed");
-                }
+                // Use base single-warp kernel (kpar disabled — crashes in CUDA graph).
+                oda.forward_d2d(
+                    &out_tensor, &q_rot_dev, &k_dev_full, &v_dev_full,
+                    &self.d_kv_len, n_heads, n_kv_heads, head_dim, scale,
+                ).expect("oxide decode attention failed");
                 self.attn_out_scratch.borrow_mut().replace(out_tensor.clone());
                 out_tensor
             } else {

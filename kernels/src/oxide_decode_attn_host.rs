@@ -31,11 +31,12 @@ unsafe impl Sync for OxideDecodeAttn {}
 impl OxideDecodeAttn {
     /// Load PTX from the embedded build artifact.
     pub fn new(stream: Arc<Stream>) -> Result<Self> {
-        // oxide_decode_attn_kpar has smem/layout issues in CUDA graph context — disabled.
-        // The cuTile cutile_decode_attn fallback (108 tok/s) is used instead.
-        // TODO: debug kpar smem size and verify ex2_approx_f32 numerical stability.
+        // oxide_decode_attn crashes on Blackwell with CUDA error 700 (illegal memory access).
+        // Root cause: unknown without cuda-memcheck; likely an sm_80→sm_120 PTX JIT issue.
+        // cuTile cutile_decode_attn fallback gives correct 108 tok/s results.
+        // TODO: run cuda-memcheck, check if bar.sync/shfl.sync need Blackwell variants.
         return Err(KernelError::InvalidConfig(
-            "oxide_decode_attn disabled (kpar smem bug pending debug)".into()
+            "oxide_decode_attn disabled (Blackwell error 700 pending cuda-memcheck debug)".into()
         ));
         #[allow(unreachable_code)]
         // cuModuleLoadData for PTX text format requires a null-terminated string.
