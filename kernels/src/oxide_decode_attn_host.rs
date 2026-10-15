@@ -31,11 +31,14 @@ unsafe impl Sync for OxideDecodeAttn {}
 impl OxideDecodeAttn {
     /// Load PTX from the embedded build artifact.
     pub fn new(stream: Arc<Stream>) -> Result<Self> {
+        // cuModuleLoadData for PTX text format requires a null-terminated string.
+        // include_bytes! does NOT add a null terminator, so we must append one.
+        let ptx_nul: Vec<u8> = PTX.iter().copied().chain(std::iter::once(0u8)).collect();
         let mut cu_module = std::ptr::null_mut::<cuda_core::sys::CUmod_st>();
         let rc = unsafe {
             cuda_core::sys::cuModuleLoadData(
                 &mut cu_module,
-                PTX.as_ptr() as *const std::ffi::c_void,
+                ptx_nul.as_ptr() as *const std::ffi::c_void,
             )
         };
         if rc != 0 {

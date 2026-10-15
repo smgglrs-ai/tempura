@@ -167,16 +167,19 @@ impl OxideQ4kGemv {
             let cu_smem        = load_fn(KERNEL_SMEM);
 
             eprintln!(
-                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={}, q8v2={}, q8v3={}, batch={})",
+                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={}, q8v2={}, q8v3={}, q8v3r={}, uses_raw_gguf={}, batch={})",
                 OXIDE_Q4K_PTX.len(),
                 KERNEL_ENTRY,
                 cu_q8_gemv.is_some(),
                 cu_q8_gemv_v2.is_some(),
                 cu_q8_gemv_v3.is_some(),
+                cu_q8_gemv_v3r.is_some(),
+                cu_q8_gemv_v3r.is_some(),
                 cu_batch_gemv.is_some(),
             );
-            // v3r kernel produces numerical garbage (format mismatch in scale decode) — disabled.
-            let uses_raw_gguf = false; // cu_q8_gemv_v3r.is_some();
+            // v3r kernel has numerical output bug (garbage values) — disabled pending debug.
+            // The 36-u32 raw GGUF format + 6-bit inline decode needs correctness verification.
+            let uses_raw_gguf = false; // cu_q8_gemv_v3r.is_some()
             Some(Self {
                 cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_batch_gemv, cu_colocated, cu_smem, uses_raw_gguf, stream,
                 q8_qs_scratch:  std::cell::RefCell::new(None),

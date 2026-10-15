@@ -26,7 +26,7 @@
  *   exp2(score_exp2) = exp(Q·K * scale)
  */
 
-use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, thread, warp};
+use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, thread, warp, float};
 use cuda_host::cuda_module;
 use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_core::simt::LaunchConfig;
@@ -107,8 +107,8 @@ mod kernels {
 
             let score = qk * scale_log2;
             let m_new  = if score > m_local { score } else { m_local };
-            let alpha: f32 = 2.0_f32.powf(m_local - m_new);
-            let p:     f32 = 2.0_f32.powf(score - m_new);
+            let alpha: f32 = float::ex2_approx_f32(m_local - m_new);
+            let p:     f32 = float::ex2_approx_f32(score - m_new);
 
             l_local = l_local * alpha + p;
 
@@ -140,7 +140,7 @@ mod kernels {
         }
 
         // All warps rescale their own acc region: acc_w *= exp2(m_local - m_global)
-        let alpha_w: f32 = 2.0_f32.powf(m_local - m_global);
+        let alpha_w: f32 = float::ex2_approx_f32(m_local - m_global);
         let mut di = lane;
         while di < head_dim {
             let a = *smem.add(acc_base + di as usize);
@@ -157,7 +157,7 @@ mod kernels {
             while ww < w {
                 let mw = *smem.add((head_dim + ww) as usize);
                 let lw = *smem.add((head_dim + w + ww) as usize);
-                l_global += 2.0_f32.powf(mw - m_global) * lw;
+                l_global += float::ex2_approx_f32(mw - m_global) * lw;
                 ww += 1;
             }
 
@@ -252,8 +252,8 @@ mod kernels {
 
             // Online softmax update.
             let m_new = if score > m_val { score } else { m_val };
-            let alpha: f32 = 2.0_f32.powf(m_val - m_new);
-            let p:     f32 = 2.0_f32.powf(score - m_new);
+            let alpha: f32 = float::ex2_approx_f32(m_val - m_new);
+            let p:     f32 = float::ex2_approx_f32(score - m_new);
 
             l_val = l_val * alpha + p;
 
@@ -280,105 +280,14 @@ mod kernels {
             oi += 32;
         }
     }
-    /// Batched decode attention (DISABLED — pointer-of-pointers generates invalid PTX).
-    /// Use cuTile decode_attention_device_scratch × M instead.
-    /// TODO: implement via indexed per-request KV offsets instead of pointer arrays.
+    // oxide_decode_attn_batch: pointer-of-pointers (*const u64) generates invalid PTX.
+    // Stub retained to preserve symbol — do not call.
     #[allow(dead_code)]
-    pub unsafe fn oxide_decode_attn_batch_disabled(
-        mut out:        DisjointSlice<f32>,    // [batch * n_heads * head_dim]
-        q:              *const f32,             // [batch * n_heads * head_dim]
-        k_cache_ptrs:   *const u64,            // [batch] device ptrs to K caches
-        v_cache_ptrs:   *const u64,            // [batch] device ptrs to V caches
-        kv_lens:        *const i32,            // [batch] kv_len per request
-        batch_size:     u32,
-        n_heads:        u32,
-        n_kv_heads:     u32,
-        head_dim:       u32,
-        kv_stride:      u32,  // n_kv_heads * head_dim (stide in f32 between positions)
-        scale:          f32,
+    pub unsafe fn oxide_decode_attn_batch_stub(
+        mut _out: DisjointSlice<f32>,
+        _n: u32,
     ) {
-        let block_idx = thread::blockIdx_x();
-        let lane = thread::threadIdx_x();
-
-        let req_idx = block_idx / n_heads;
-        let h = block_idx % n_heads;
-
-        if req_idx >= batch_size { return; }
-
-        let kv_len = *kv_lens.add(req_idx as usize);
-        if kv_len <= 0 { return; }
-
-        let heads_per_group = n_heads / n_kv_heads;
-        let kv_h = h / heads_per_group;
-
-        // Raw f32 device pointers for this request's K/V caches.
-        let k_cache = *k_cache_ptrs.add(req_idx as usize) as *const f32;
-        let v_cache = *v_cache_ptrs.add(req_idx as usize) as *const f32;
-
-        // Q offset: request r's heads start at r * n_heads * head_dim.
-        let q_off = (req_idx * n_heads * head_dim + h * head_dim) as usize;
-
-        let smem: *mut f32 = DynamicSharedArray::<f32>::get();
-        let ln2: f32 = 0.693_147_18_f32;
-        let scale_log2 = scale / ln2;
-
-        // Stage Q into smem[0..head_dim].
-        let mut i = lane;
-        while i < head_dim {
-            *smem.add(i as usize) = *q.add(q_off + i as usize);
-            i += 32;
-        }
-
-        // Zero accumulator in smem[head_dim..2*head_dim].
-        let acc_smem = smem.add(head_dim as usize);
-        let mut ai = lane;
-        while ai < head_dim {
-            *acc_smem.add(ai as usize) = 0.0_f32;
-            ai += 32;
-        }
-        thread::sync_threads();
-
-        let mut m_val: f32 = f32::NEG_INFINITY;
-        let mut l_val: f32 = 0.0_f32;
-
-        let mut t = 0i32;
-        while t < kv_len {
-            let kv_base = (t as u32 * kv_stride + kv_h * head_dim) as usize;
-
-            let mut qk: f32 = 0.0_f32;
-            let mut di = lane;
-            while di < head_dim {
-                qk += *smem.add(di as usize) * *k_cache.add(kv_base + di as usize);
-                di += 32;
-            }
-            qk = warp::reduce_sum_f32(qk);
-
-            let score = qk * scale_log2;
-            let m_new = if score > m_val { score } else { m_val };
-            let alpha: f32 = 2.0_f32.powf(m_val - m_new);
-            let p:     f32 = 2.0_f32.powf(score - m_new);
-
-            l_val = l_val * alpha + p;
-
-            let mut vi = lane;
-            while vi < head_dim {
-                let v_val = *v_cache.add(kv_base + vi as usize);
-                let old   = *acc_smem.add(vi as usize);
-                *acc_smem.add(vi as usize) = old * alpha + v_val * p;
-                vi += 32;
-            }
-            thread::sync_threads();
-            m_val = m_new;
-            t += 1;
-        }
-
-        // Write normalised output for (req_idx, h).
-        let out_off = (req_idx * n_heads * head_dim + h * head_dim) as usize;
-        let mut oi = lane;
-        while oi < head_dim {
-            *out.get_unchecked_mut(out_off + oi as usize) = *acc_smem.add(oi as usize) / l_val;
-            oi += 32;
-        }
+        // No-op stub to avoid invalid PTX from pointer-of-pointer dereference.
     }
 
 }
