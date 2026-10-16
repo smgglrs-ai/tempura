@@ -31,9 +31,6 @@ unsafe impl Sync for OxideDecodeAttn {}
 impl OxideDecodeAttn {
     /// Load PTX from the embedded build artifact.
     pub fn new(stream: Arc<Stream>) -> Result<Self> {
-        // DisjointSlice replaced with *mut f32 (raw pointer = 1 PTX param, ABI clean).
-        // forward_decode_nogpu now writes d_kv_len before dispatch — kv_len=0 root cause fixed.
-        #[allow(unreachable_code)]
         // cuModuleLoadData for PTX text format requires a null-terminated string.
         // include_bytes! does NOT add a null terminator, so we must append one.
         let ptx_nul: Vec<u8> = PTX.iter().copied().chain(std::iter::once(0u8)).collect();

@@ -2444,8 +2444,8 @@ impl CutileGpuModel {
 
         if let Some(ref decode_graph) = *graph_cache {
             // ── Subsequent steps: update KV memcpy dst pointers, then launch ─
-            // Advance host KV seq_len — the GPU KV append ran in the previous launch.
-            gpu_kv_cache.advance_host_seq_len(1);
+            // NOTE: seq_len is advanced by the wrapper (kv.advance) after each
+            // forward call — do NOT advance again here (would double-count).
 
             // Update each KV-write memcpy node's dst to the new slot.
             let kv_dim    = cfg.num_kv_heads * cfg.head_dim;
@@ -2529,6 +2529,14 @@ impl CutileGpuModel {
                 }
             }
 
+            // DIAGNOSTIC: read d_kv_len back from device to confirm H→D write landed
+            if std::env::var("TEMPURA_DEBUG_KV_LEN").is_ok() {
+                unsafe { stream.synchronize().expect("diag sync"); }
+                let kv_len_host: Vec<f32> = Arc::clone(&self.d_kv_len)
+                    .to_host_vec().sync_on(stream).expect("diag d2h");
+                let kv_len_bits = kv_len_host[0].to_bits();
+                eprintln!("[diag] d_kv_len bits={kv_len_bits:#010x} → kv_len={kv_len_bits}");
+            }
             unsafe { cuda_core::sys::cuGraphLaunch(decode_graph.cu_exec, cu_stream); }
             unsafe { stream.synchronize().expect("stream sync after graph launch failed"); }
             drop(graph_cache);
@@ -3071,6 +3079,13 @@ impl CutileGpuModel {
         let seq_len = token_ids.len();
         let q_dim = n_heads * head_dim;
         let inter = cfg.intermediate_size;
+
+        // Reset the GPU KV cache when starting a new sequence (position=0).
+        // The shared KV cache accumulates across sessions otherwise.
+        if position == 0 {
+            gpu_kv_cache.reset();
+            *self.cached_decode_graph.borrow_mut() = None;
+        }
 
         // ── 1. Embedding lookup (CPU) ─────────────────────────────────────────
         let embed = qweights
