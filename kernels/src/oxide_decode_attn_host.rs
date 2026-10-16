@@ -98,34 +98,33 @@ impl OxideDecodeAttn {
         head_dim:   usize,
         scale:      f32,
     ) -> Result<()> {
+        let heads_per_group = (n_heads / n_kv_heads) as u32;
         let kv_len_ptr = kv_len_dev.device_pointer().cu_deviceptr() as u64;
-        let kv_stride  = (n_kv_heads * head_dim) as u32;
 
-        // PTX param layout (10 params) matching oxide_decode_attn kernel signature:
-        // 0:out(*mut f32), 1:q, 2:k, 3:v, 4:kv_len_ptr, 5:scale,
-        // 6:n_heads, 7:n_kv_heads, 8:head_dim, 9:kv_stride
+        // PTX param layout (9 params) matching oxide_decode_attn kernel signature:
+        // 0:out(*mut f32), 1:q, 2:k_cache, 3:v_cache, 4:kv_len_ptr,
+        // 5:scale(f32), 6:n_kv_heads(u32), 7:head_dim(u32), 8:heads_per_group(u32)
+        // n_heads is the grid X dimension; kv_stride = n_kv_heads*head_dim computed in kernel.
         let mut out_ptr = out.device_pointer().cu_deviceptr() as u64;
         let mut q_ptr   = q.device_pointer().cu_deviceptr() as u64;
         let mut k_ptr   = k_cache.device_pointer().cu_deviceptr() as u64;
         let mut v_ptr   = v_cache.device_pointer().cu_deviceptr() as u64;
         let mut kv_p    = kv_len_ptr;
         let mut sc      = scale;
-        let mut nh      = n_heads as u32;
         let mut nkv     = n_kv_heads as u32;
         let mut hd      = head_dim as u32;
-        let mut kvs     = kv_stride;
+        let mut hpg     = heads_per_group;
 
-        let mut params: [*mut std::ffi::c_void; 10] = [
+        let mut params: [*mut std::ffi::c_void; 9] = [
             &mut out_ptr as *mut _ as *mut std::ffi::c_void,  // param 0: out (*mut f32)
             &mut q_ptr   as *mut _ as *mut std::ffi::c_void,  // param 1: q
             &mut k_ptr   as *mut _ as *mut std::ffi::c_void,  // param 2: k_cache
             &mut v_ptr   as *mut _ as *mut std::ffi::c_void,  // param 3: v_cache
             &mut kv_p    as *mut _ as *mut std::ffi::c_void,  // param 4: kv_len_ptr
             &mut sc      as *mut _ as *mut std::ffi::c_void,  // param 5: scale
-            &mut nh      as *mut _ as *mut std::ffi::c_void,  // param 6: n_heads
-            &mut nkv     as *mut _ as *mut std::ffi::c_void,  // param 7: n_kv_heads
-            &mut hd      as *mut _ as *mut std::ffi::c_void,  // param 8: head_dim
-            &mut kvs     as *mut _ as *mut std::ffi::c_void,  // param 9: kv_stride
+            &mut nkv     as *mut _ as *mut std::ffi::c_void,  // param 6: n_kv_heads
+            &mut hd      as *mut _ as *mut std::ffi::c_void,  // param 7: head_dim
+            &mut hpg     as *mut _ as *mut std::ffi::c_void,  // param 8: heads_per_group
         ];
 
         let shared_bytes = (2 * head_dim * 4) as u32;
