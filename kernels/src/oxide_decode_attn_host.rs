@@ -31,11 +31,12 @@ unsafe impl Sync for OxideDecodeAttn {}
 impl OxideDecodeAttn {
     /// Load PTX from the embedded build artifact.
     pub fn new(stream: Arc<Stream>) -> Result<Self> {
-        // oxide_decode_attn parameter ABI is fixed (DisjointSlice = 2 params) but the kernel
-        // produces wrong output in the CUDA graph context — needs further debugging.
-        // cuTile cutile_decode_attn gives correct 108 tok/s. Disabled until output is verified.
+        // DisjointSlice replaced with *mut f32 (raw pointer = 1 PTX param, ABI clean).
+        // Standalone test PASSES. CUDA graph context still gives wrong output —
+        // kv_len_ptr resolves to 0 inside the graph (d_kv_len write ordering issue).
+        // cuTile cutile_decode_attn gives correct 108 tok/s. Disabled until graph ordering fixed.
         return Err(KernelError::InvalidConfig(
-            "oxide_decode_attn disabled (wrong output in CUDA graph; DisjointSlice ABI fix committed)".into()
+            "oxide_decode_attn disabled (kv_len=0 in CUDA graph context; d_kv_len write ordering)".into()
         ));
         #[allow(unreachable_code)]
         // cuModuleLoadData for PTX text format requires a null-terminated string.
@@ -105,32 +106,27 @@ impl OxideDecodeAttn {
         let heads_per_group = (n_heads / n_kv_heads) as u32;
         let kv_len_ptr = kv_len_dev.device_pointer().cu_deviceptr() as u64;
 
-        // Build raw parameter pointers for cuLaunchKernel.
-        // DisjointSlice<f32> (param 0 in PTX) expands to TWO parameters:
-        //   param 0: data pointer (u64)
-        //   param 1: length (u64)  ← was missing, causing all subsequent params to be off-by-one
-        let mut out_ptr   = out.device_pointer().cu_deviceptr() as u64;
-        let mut out_len   = (n_heads * head_dim) as u64;  // DisjointSlice length component
-        let mut q_ptr     = q.device_pointer().cu_deviceptr() as u64;
-        let mut k_ptr     = k_cache.device_pointer().cu_deviceptr() as u64;
-        let mut v_ptr     = v_cache.device_pointer().cu_deviceptr() as u64;
-        let mut kv_p      = kv_len_ptr;
-        let mut sc        = scale;
-        let mut nkv       = n_kv_heads as u32;
-        let mut hd        = head_dim as u32;
-        let mut hpg       = heads_per_group;
+        // *mut f32 (raw pointer) = single PTX param. 9 params total.
+        let mut out_ptr = out.device_pointer().cu_deviceptr() as u64;
+        let mut q_ptr   = q.device_pointer().cu_deviceptr() as u64;
+        let mut k_ptr   = k_cache.device_pointer().cu_deviceptr() as u64;
+        let mut v_ptr   = v_cache.device_pointer().cu_deviceptr() as u64;
+        let mut kv_p    = kv_len_ptr;
+        let mut sc      = scale;
+        let mut nkv     = n_kv_heads as u32;
+        let mut hd      = head_dim as u32;
+        let mut hpg     = heads_per_group;
 
-        let mut params: [*mut std::ffi::c_void; 10] = [
-            &mut out_ptr as *mut _ as *mut std::ffi::c_void,  // param 0: out data ptr
-            &mut out_len as *mut _ as *mut std::ffi::c_void,  // param 1: out length (DisjointSlice)
-            &mut q_ptr   as *mut _ as *mut std::ffi::c_void,  // param 2: q
-            &mut k_ptr   as *mut _ as *mut std::ffi::c_void,  // param 3: k_cache
-            &mut v_ptr   as *mut _ as *mut std::ffi::c_void,  // param 4: v_cache
-            &mut kv_p    as *mut _ as *mut std::ffi::c_void,  // param 5: kv_len_ptr
-            &mut sc      as *mut _ as *mut std::ffi::c_void,  // param 6: scale
-            &mut nkv     as *mut _ as *mut std::ffi::c_void,  // param 7: n_kv_heads
-            &mut hd      as *mut _ as *mut std::ffi::c_void,  // param 8: head_dim
-            &mut hpg     as *mut _ as *mut std::ffi::c_void,  // param 9: heads_per_group
+        let mut params: [*mut std::ffi::c_void; 9] = [
+            &mut out_ptr as *mut _ as *mut std::ffi::c_void,  // param 0: out (*mut f32)
+            &mut q_ptr   as *mut _ as *mut std::ffi::c_void,  // param 1: q
+            &mut k_ptr   as *mut _ as *mut std::ffi::c_void,  // param 2: k_cache
+            &mut v_ptr   as *mut _ as *mut std::ffi::c_void,  // param 3: v_cache
+            &mut kv_p    as *mut _ as *mut std::ffi::c_void,  // param 4: kv_len_ptr
+            &mut sc      as *mut _ as *mut std::ffi::c_void,  // param 5: scale
+            &mut nkv     as *mut _ as *mut std::ffi::c_void,  // param 6: n_kv_heads
+            &mut hd      as *mut _ as *mut std::ffi::c_void,  // param 7: head_dim
+            &mut hpg     as *mut _ as *mut std::ffi::c_void,  // param 8: heads_per_group
         ];
 
         let shared_bytes = (2 * head_dim * 4) as u32;
@@ -177,7 +173,6 @@ impl OxideDecodeAttn {
         let kv_len_ptr = kv_len_dev.device_pointer().cu_deviceptr() as u64;
 
         let mut out_ptr = out.device_pointer().cu_deviceptr() as u64;
-        let mut out_len = (n_heads * head_dim) as u64;  // DisjointSlice length
         let mut q_ptr   = q.device_pointer().cu_deviceptr() as u64;
         let mut k_ptr   = k_cache.device_pointer().cu_deviceptr() as u64;
         let mut v_ptr   = v_cache.device_pointer().cu_deviceptr() as u64;
@@ -187,17 +182,16 @@ impl OxideDecodeAttn {
         let mut hd      = head_dim as u32;
         let mut hpg     = heads_per_group;
 
-        let mut params: [*mut std::ffi::c_void; 10] = [
-            &mut out_ptr as *mut _ as *mut std::ffi::c_void,  // param 0: out data ptr
-            &mut out_len as *mut _ as *mut std::ffi::c_void,  // param 1: out length (DisjointSlice)
-            &mut q_ptr   as *mut _ as *mut std::ffi::c_void,  // param 2: q
-            &mut k_ptr   as *mut _ as *mut std::ffi::c_void,  // param 3: k_cache
-            &mut v_ptr   as *mut _ as *mut std::ffi::c_void,  // param 4: v_cache
-            &mut kv_p    as *mut _ as *mut std::ffi::c_void,  // param 5: kv_len_ptr
-            &mut sc      as *mut _ as *mut std::ffi::c_void,  // param 6: scale
-            &mut nkv     as *mut _ as *mut std::ffi::c_void,  // param 7: n_kv_heads
-            &mut hd      as *mut _ as *mut std::ffi::c_void,  // param 8: head_dim
-            &mut hpg     as *mut _ as *mut std::ffi::c_void,  // param 9: heads_per_group
+        let mut params: [*mut std::ffi::c_void; 9] = [
+            &mut out_ptr as *mut _ as *mut std::ffi::c_void,  // param 0: out (*mut f32)
+            &mut q_ptr   as *mut _ as *mut std::ffi::c_void,  // param 1: q
+            &mut k_ptr   as *mut _ as *mut std::ffi::c_void,  // param 2: k_cache
+            &mut v_ptr   as *mut _ as *mut std::ffi::c_void,  // param 3: v_cache
+            &mut kv_p    as *mut _ as *mut std::ffi::c_void,  // param 4: kv_len_ptr
+            &mut sc      as *mut _ as *mut std::ffi::c_void,  // param 5: scale
+            &mut nkv     as *mut _ as *mut std::ffi::c_void,  // param 6: n_kv_heads
+            &mut hd      as *mut _ as *mut std::ffi::c_void,  // param 7: head_dim
+            &mut hpg     as *mut _ as *mut std::ffi::c_void,  // param 8: heads_per_group
         ];
 
         // smem: (head_dim*(W+1) + 2*W) * 4 bytes

@@ -26,7 +26,7 @@
  *   exp2(score_exp2) = exp(Q·K * scale)
  */
 
-use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, thread, warp, float};
+use cuda_device::{DynamicSharedArray, kernel, thread, warp, float};
 use cuda_host::cuda_module;
 use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_core::simt::LaunchConfig;
@@ -47,8 +47,8 @@ mod kernels {
     ///   [D+2W..D+2W+W*D]    acc_local per warp (each warp owns D floats)
     #[kernel]
     pub unsafe fn oxide_decode_attn_kpar(
-        mut out: DisjointSlice<f32>,
-        q:       *const f32,
+        out: *mut f32,          // [n_heads * head_dim] — raw ptr avoids DisjointSlice 2-param ABI
+        q:   *const f32,
         k_cache: *const f32,
         v_cache: *const f32,
         kv_len_ptr: *const i32,
@@ -171,7 +171,7 @@ mod kernels {
                     total += *smem.add((head_dim + 2 * w + ww * head_dim + oi) as usize);
                     ww += 1;
                 }
-                *out.get_unchecked_mut((out_base + oi) as usize) = total / l_global;
+                *out.add((out_base + oi) as usize) = total / l_global;
                 oi += 32;
             }
         }
@@ -183,7 +183,7 @@ mod kernels {
     /// graph replay — the kernel reads the CURRENT kv_len at execution time.
     #[kernel]
     pub unsafe fn oxide_decode_attn(
-        mut out: DisjointSlice<f32>,  // [n_heads * head_dim]
+        out: *mut f32,                // [n_heads * head_dim] — raw ptr, 1 PTX param
         q:       *const f32,          // [n_heads * head_dim]
         k_cache: *const f32,          // [gpu_max_seq_len * n_kv_heads * head_dim]
         v_cache: *const f32,          // same layout as k_cache
@@ -276,18 +276,9 @@ mod kernels {
         let mut oi = lane;
         while oi < head_dim {
             let val = *acc_smem.add(oi as usize) / l_val;
-            *out.get_unchecked_mut((out_base + oi) as usize) = val;
+            *out.add((out_base + oi) as usize) = val;
             oi += 32;
         }
-    }
-    // oxide_decode_attn_batch: pointer-of-pointers (*const u64) generates invalid PTX.
-    // Stub retained to preserve symbol — do not call.
-    #[allow(dead_code)]
-    pub unsafe fn oxide_decode_attn_batch_stub(
-        mut _out: DisjointSlice<f32>,
-        _n: u32,
-    ) {
-        // No-op stub to avoid invalid PTX from pointer-of-pointer dereference.
     }
 
 }
@@ -337,7 +328,7 @@ fn main() {
         module.oxide_decode_attn(
             stream.as_ref(),
             cfg,
-            &mut out_dev,
+            out_dev.cu_deviceptr() as *mut f32,
             q_dev.cu_deviceptr() as *const f32,
             k_dev.cu_deviceptr() as *const f32,
             v_dev.cu_deviceptr() as *const f32,
@@ -374,7 +365,7 @@ fn main() {
         module.oxide_decode_attn_kpar(
             stream.as_ref(),
             kpar_cfg,
-            &mut out_kpar,
+            out_kpar.cu_deviceptr() as *mut f32,
             q_dev.cu_deviceptr() as *const f32,
             k_dev.cu_deviceptr() as *const f32,
             v_dev.cu_deviceptr() as *const f32,
