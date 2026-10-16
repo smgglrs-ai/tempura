@@ -32,12 +32,7 @@ impl OxideDecodeAttn {
     /// Load PTX from the embedded build artifact.
     pub fn new(stream: Arc<Stream>) -> Result<Self> {
         // DisjointSlice replaced with *mut f32 (raw pointer = 1 PTX param, ABI clean).
-        // Standalone test PASSES. CUDA graph context still gives wrong output —
-        // kv_len_ptr resolves to 0 inside the graph (d_kv_len write ordering issue).
-        // cuTile cutile_decode_attn gives correct 108 tok/s. Disabled until graph ordering fixed.
-        return Err(KernelError::InvalidConfig(
-            "oxide_decode_attn disabled (kv_len=0 in CUDA graph context; d_kv_len write ordering)".into()
-        ));
+        // forward_decode_nogpu now writes d_kv_len before dispatch — kv_len=0 root cause fixed.
         #[allow(unreachable_code)]
         // cuModuleLoadData for PTX text format requires a null-terminated string.
         // include_bytes! does NOT add a null terminator, so we must append one.
@@ -103,30 +98,34 @@ impl OxideDecodeAttn {
         head_dim:   usize,
         scale:      f32,
     ) -> Result<()> {
-        let heads_per_group = (n_heads / n_kv_heads) as u32;
         let kv_len_ptr = kv_len_dev.device_pointer().cu_deviceptr() as u64;
+        let kv_stride  = (n_kv_heads * head_dim) as u32;
 
-        // *mut f32 (raw pointer) = single PTX param. 9 params total.
+        // PTX param layout (10 params) matching oxide_decode_attn kernel signature:
+        // 0:out(*mut f32), 1:q, 2:k, 3:v, 4:kv_len_ptr, 5:scale,
+        // 6:n_heads, 7:n_kv_heads, 8:head_dim, 9:kv_stride
         let mut out_ptr = out.device_pointer().cu_deviceptr() as u64;
         let mut q_ptr   = q.device_pointer().cu_deviceptr() as u64;
         let mut k_ptr   = k_cache.device_pointer().cu_deviceptr() as u64;
         let mut v_ptr   = v_cache.device_pointer().cu_deviceptr() as u64;
         let mut kv_p    = kv_len_ptr;
         let mut sc      = scale;
+        let mut nh      = n_heads as u32;
         let mut nkv     = n_kv_heads as u32;
         let mut hd      = head_dim as u32;
-        let mut hpg     = heads_per_group;
+        let mut kvs     = kv_stride;
 
-        let mut params: [*mut std::ffi::c_void; 9] = [
+        let mut params: [*mut std::ffi::c_void; 10] = [
             &mut out_ptr as *mut _ as *mut std::ffi::c_void,  // param 0: out (*mut f32)
             &mut q_ptr   as *mut _ as *mut std::ffi::c_void,  // param 1: q
             &mut k_ptr   as *mut _ as *mut std::ffi::c_void,  // param 2: k_cache
             &mut v_ptr   as *mut _ as *mut std::ffi::c_void,  // param 3: v_cache
             &mut kv_p    as *mut _ as *mut std::ffi::c_void,  // param 4: kv_len_ptr
             &mut sc      as *mut _ as *mut std::ffi::c_void,  // param 5: scale
-            &mut nkv     as *mut _ as *mut std::ffi::c_void,  // param 6: n_kv_heads
-            &mut hd      as *mut _ as *mut std::ffi::c_void,  // param 7: head_dim
-            &mut hpg     as *mut _ as *mut std::ffi::c_void,  // param 8: heads_per_group
+            &mut nh      as *mut _ as *mut std::ffi::c_void,  // param 6: n_heads
+            &mut nkv     as *mut _ as *mut std::ffi::c_void,  // param 7: n_kv_heads
+            &mut hd      as *mut _ as *mut std::ffi::c_void,  // param 8: head_dim
+            &mut kvs     as *mut _ as *mut std::ffi::c_void,  // param 9: kv_stride
         ];
 
         let shared_bytes = (2 * head_dim * 4) as u32;

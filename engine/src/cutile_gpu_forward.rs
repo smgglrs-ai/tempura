@@ -2722,6 +2722,23 @@ impl CutileGpuModel {
         let cfg = &self.config;
         let h = cfg.hidden_size;
 
+        // Write d_kv_len and d_positions so oxide kernels (e.g. oxide_decode_attn)
+        // read the correct kv_len even in the no-graph fallback path.
+        let stream = self.matmul.stream();
+        let kv_len_val = (gpu_kv_cache.seq_len() as i32) + 1;
+        let kv_len_bits: f32 = f32::from_bits(kv_len_val as u32);
+        let pos_bits: f32 = f32::from_bits(positions[0]);
+        unsafe {
+            cuda_core::memcpy_htod_async::<f32>(
+                self.d_kv_len.device_pointer().cu_deviceptr(),
+                &kv_len_bits as *const f32, 1, stream,
+            ).expect("forward_decode_nogpu d_kv_len H→D");
+            cuda_core::memcpy_htod_async::<f32>(
+                self.d_positions.device_pointer().cu_deviceptr(),
+                &pos_bits as *const f32, 1, stream,
+            ).expect("forward_decode_nogpu d_positions H→D");
+        }
+
         // Upload embedding to a fresh device tensor (normal non-graph path).
         let hidden_dev = self.to_device_flat_padded(embedding, 1, h, self.h_pad);
         self.forward_decode_inner(hidden_dev, positions, gpu_kv_cache);
