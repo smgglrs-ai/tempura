@@ -85,6 +85,13 @@ pub fn rope_configs() -> Vec<RoPEConfig> {
             head_dim: 16,
             theta: 500000.0,
         },
+        RoPEConfig {
+            batch: 1,
+            seq_len: 8,
+            num_heads: 4,
+            head_dim: 64,
+            theta: 10000.0,
+        },
     ]
 }
 

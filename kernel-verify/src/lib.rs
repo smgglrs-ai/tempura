@@ -1046,19 +1046,13 @@ mod tests {
     fn rope_ref_vs_table() {
         let runner = DualPipelineRunner::new(1e-4);
         let ref_k = CpuRoPE;
-        // CpuRoPETable built for head_dim=64, max_pos=512
+        // CpuRoPETable is built for a fixed head_dim; use head_dim=64 to match the
+        // head_dim=64 config in rope_configs().
         let opt_k = CpuRoPETable::new(512, 64, 10000.0);
-        // CpuRoPETable was built for head_dim=64; the index formula (pos * half + d) uses
-        // the config's half=head_dim/2, so only configs with head_dim==64 produce correct
-        // frequencies. The existing test_generators::rope_configs() use head_dim 8/16/32,
-        // so configs is empty here and the test returns early — valid no-op.
         let configs: Vec<_> = test_generators::rope_configs()
             .into_iter()
             .filter(|c| c.head_dim == 64)
             .collect();
-        if configs.is_empty() {
-            return;
-        }
         let report = runner.compare_rope("CpuRoPE vs CpuRoPETable", &ref_k, &opt_k, &configs);
         assert!(report.pass, "rope ref vs table: {:?}", report.results);
     }
