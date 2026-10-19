@@ -277,6 +277,15 @@ impl CutileKvCache {
         Ok(())
     }
 
+    /// Mark the host KV mirror as stale after a device-side scatter-write.
+    ///
+    /// Called when the scatter-write kernel updates the GPU cache directly
+    /// (bypassing `append_device_gpu_only`).  The host mirror must be rebuilt
+    /// via `sync_host_from_device` before any CPU attention fallback.
+    pub fn mark_host_stale(&mut self) {
+        self.host_stale = true;
+    }
+
     /// Advance the sequence-length counter after all layers have been updated.
     pub fn advance(&mut self, n: usize) {
         self.seq_len += n;
