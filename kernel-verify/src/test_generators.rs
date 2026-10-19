@@ -96,6 +96,14 @@ pub fn q4k_configs() -> Vec<Q4kConfig> {
     ]
 }
 
+pub fn q6k_configs() -> Vec<crate::Q6kConfig> {
+    vec![
+        crate::Q6kConfig { m: 1, n: 16, k: 256 },
+        crate::Q6kConfig { m: 1, n: 64, k: 512 },
+        crate::Q6kConfig { m: 4, n: 32, k: 256 },
+    ]
+}
+
 pub fn tq2_configs() -> Vec<TQ2Config> {
     vec![
         TQ2Config { m: 1, n: 16, k: 256 },

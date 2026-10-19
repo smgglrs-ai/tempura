@@ -1169,10 +1169,17 @@ mod tests {
         assert!(json.contains("\"tier\": \"tested\""));
     }
 
+    /// q6k_configs is accessible from gpu_tests via test_generators
+    #[test]
+    fn q6k_configs_accessible() {
+        let configs = test_generators::q6k_configs();
+        assert_eq!(configs.len(), 3);
+    }
+
     /// Registry of all MatMulQ implementors with formal dual-channel verification.
     ///
     /// When adding a new optimized kernel, add its VerifiedEquivalent impl to
-    /// kernels/src/quantized.rs and a row to this table.  A missing impl will
+    /// kernels/src/quantized.rs and a row to this table. A missing impl will
     /// surface here at review time — this test is the checklist.
     #[test]
     fn verified_equivalent_registry() {
@@ -1245,5 +1252,125 @@ mod tests {
         }
         println!("{}", "-".repeat(90));
         println!("{} kernel(s) registered with formal equivalence proofs.", rows.len());
+    }
+}
+
+#[cfg(all(test, feature = "cutile"))]
+mod gpu_tests {
+    use super::*;
+    use tempura_kernels::attention::CpuAttention;
+    use tempura_kernels::cutile_flash_attention::CutileFlashAttention;
+    use tempura_kernels::cutile_matmul::CutileMatMul;
+    use tempura_kernels::cutile_quantized_gemm::CutileQuantizedGemm;
+    use tempura_kernels::cutile_rmsnorm::CutileRmsNorm;
+    use tempura_kernels::cutile_rope::CutileRoPE;
+    use tempura_kernels::matmul::CpuMatMul;
+    use tempura_kernels::quantized::CpuMatMulQ4K;
+    use tempura_kernels::rmsnorm::CpuRMSNorm;
+    use tempura_kernels::rope::CpuRoPE;
+
+    #[test]
+    fn rmsnorm_cpu_vs_gpu() {
+        let gpu = CutileRmsNorm::new().unwrap();
+        let cpu = CpuRMSNorm;
+        let runner = DualPipelineRunner::new(1e-3);
+        let configs = test_generators::rmsnorm_configs();
+        let report = runner.compare_rmsnorm("CpuRMSNorm vs CutileRmsNorm", &cpu, &gpu, &configs);
+        for r in &report.results {
+            eprintln!("  {}: {}", r.test_name, r.detail);
+        }
+        assert!(report.pass, "rmsnorm cpu vs gpu failed");
+    }
+
+    #[test]
+    fn rope_cpu_vs_gpu() {
+        let gpu = CutileRoPE::new().unwrap();
+        let cpu = CpuRoPE;
+        let runner = DualPipelineRunner::new(1e-3);
+        let configs = test_generators::rope_configs();
+        let report = runner.compare_rope("CpuRoPE vs CutileRoPE", &cpu, &gpu, &configs);
+        for r in &report.results {
+            eprintln!("  {}: {}", r.test_name, r.detail);
+        }
+        assert!(report.pass, "rope cpu vs gpu failed");
+    }
+
+    #[test]
+    fn matmul_cpu_vs_gpu() {
+        let gpu = CutileMatMul::new().unwrap();
+        let cpu = CpuMatMul;
+        let runner = DualPipelineRunner::new(1e-3);
+        let configs = test_generators::matmul_configs();
+        let report = runner.compare_matmul("CpuMatMul vs CutileMatMul", &cpu, &gpu, &configs);
+        for r in &report.results {
+            eprintln!("  {}: {}", r.test_name, r.detail);
+        }
+        assert!(report.pass, "matmul cpu vs gpu failed");
+    }
+
+    #[test]
+    fn attention_cpu_vs_gpu() {
+        let gpu = CutileFlashAttention::new().unwrap();
+        let cpu = CpuAttention;
+        // Flash attention uses online softmax; naive uses standard — 1% tolerance
+        let runner = DualPipelineRunner::new(1e-2);
+        let configs = test_generators::attention_configs();
+        let report = runner.compare_attention("CpuAttention vs CutileFlashAttention", &cpu, &gpu, &configs);
+        for r in &report.results {
+            eprintln!("  {}: max_abs_diff={:.6}", r.test_name, r.max_abs_diff);
+        }
+        assert!(report.pass, "attention cpu vs gpu failed");
+    }
+
+    #[test]
+    fn q4k_cpu_vs_gpu() {
+        let gpu = CutileQuantizedGemm::new().unwrap();
+        let cpu = CpuMatMulQ4K;
+        let runner = DualPipelineRunner::new(1e-6);
+        let configs = test_generators::q4k_configs();
+        let report = runner.compare_q4k("CpuMatMulQ4K vs CutileQuantizedGemm", &cpu, &gpu, &configs, 0.001);
+        for r in &report.results {
+            eprintln!("  {}: {}", r.test_name, r.detail);
+        }
+        assert!(report.pass, "q4k cpu vs gpu failed");
+    }
+
+    #[test]
+    fn q6k_cpu_vs_gpu() {
+        let gpu = CutileQuantizedGemm::new().unwrap();
+        let cpu = CpuMatMulQ4K;
+        let runner = DualPipelineRunner::new(1e-6);
+        let configs = test_generators::q6k_configs();
+        let report = runner.compare_q6k("CpuMatMulQ4K vs CutileQuantizedGemm (Q6K)", &cpu, &gpu, &configs, 0.001);
+        for r in &report.results {
+            eprintln!("  {}: {}", r.test_name, r.detail);
+        }
+        assert!(report.pass, "q6k cpu vs gpu failed");
+    }
+
+    #[test]
+    fn tq2_cpu_vs_gpu() {
+        let gpu = CutileQuantizedGemm::new().unwrap();
+        let cpu = CpuMatMulQ4K;
+        let runner = DualPipelineRunner::new(1e-6);
+        let configs = test_generators::tq2_configs();
+        let report = runner.compare_tq2("CpuMatMulQ4K vs CutileQuantizedGemm (TQ2)", &cpu, &gpu, &configs, 0.01);
+        for r in &report.results {
+            eprintln!("  {}: {}", r.test_name, r.detail);
+        }
+        assert!(report.pass, "tq2 cpu vs gpu failed");
+    }
+
+    #[test]
+    fn i2s_cpu_vs_gpu() {
+        let gpu = CutileQuantizedGemm::new().unwrap();
+        let cpu = CpuMatMulQ4K;
+        let runner = DualPipelineRunner::new(1e-6);
+        let configs = test_generators::i2s_configs();
+        let report = runner.compare_i2s("CpuMatMulQ4K vs CutileQuantizedGemm (I2S)", &cpu, &gpu, &configs, 0.005);
+        for r in &report.results {
+            eprintln!("  {}: {}", r.test_name, r.detail);
+        }
+        assert!(report.pass, "i2s cpu vs gpu failed");
     }
 }
