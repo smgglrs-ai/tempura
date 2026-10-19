@@ -747,3 +747,24 @@ mod tests {
 
 #[cfg(feature = "cuda")]
 pub type CudaRMSNorm = crate::cutile_rmsnorm::CutileRmsNorm;
+
+#[cfg(feature = "cuda")]
+impl crate::VerifiedEquivalent<CpuRMSNorm> for CudaRMSNorm {
+    fn max_relative_error() -> f64 { 0.001 }
+    fn proof_name() -> &'static str { "dual-pipeline:rmsnorm_cpu_vs_gpu" }
+    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Tested }
+}
+
+#[cfg(feature = "cpu")]
+impl crate::VerifiedEquivalent<CpuRMSNorm> for CpuRMSNormGgml {
+    fn max_relative_error() -> f64 { 0.0001 }
+    fn proof_name() -> &'static str { "dual-pipeline:rmsnorm_ref_vs_ggml" }
+    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Tested }
+}
+
+#[cfg(feature = "cpu")]
+impl crate::VerifiedEquivalent<CpuRMSNorm> for CpuRMSNormDet {
+    fn max_relative_error() -> f64 { 0.0 }
+    fn proof_name() -> &'static str { "dual-pipeline:rmsnorm_ref_vs_det" }
+    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Tested }
+}

@@ -494,3 +494,10 @@ mod tests {
 
 #[cfg(feature = "cuda")]
 pub type CudaMatMul = crate::cutile_matmul::CutileMatMul;
+
+#[cfg(feature = "cuda")]
+impl crate::VerifiedEquivalent<CpuMatMul> for CudaMatMul {
+    fn max_relative_error() -> f64 { 0.0001 }
+    fn proof_name() -> &'static str { "dual-pipeline:matmul_cpu_vs_gpu" }
+    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Tested }
+}
