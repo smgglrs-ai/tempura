@@ -1549,9 +1549,28 @@ impl MatMulQ for CutileQuantizedGemm {
             )));
         }
 
-        // TODO: GPU dequant — expand I2S 2-bit signed weights on GPU
-        let b_f32 = dequant_weights_i2s(b_quantized, n, k);
-        cutile_gemm_bt(&self.stream, a, &b_f32, output, m, n, k)
+        // I2S uses integer arithmetic: quantize activations to i8, compute integer
+        // dot products via vec_dot_i2_i8_s, apply ZeroPoint correction.
+        // TODO: implement as GPU dp4a kernel; this CPU fallback is numerically exact.
+        let packed_bytes = n * k / 4;
+        let row_packed_bytes = k / 4;
+        let w_scale = f32::from_ne_bytes([
+            b_quantized[packed_bytes],
+            b_quantized[packed_bytes + 1],
+            b_quantized[packed_bytes + 2],
+            b_quantized[packed_bytes + 3],
+        ]);
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+            let mut a_q = vec![0i8; k];
+            let (act_scale, act_sum) = crate::quantized::quantize_row_i8_s(a_row, &mut a_q);
+            for j in 0..n {
+                let w_packed = &b_quantized[j * row_packed_bytes..(j + 1) * row_packed_bytes];
+                let raw = crate::quantized::vec_dot_i2_i8_s(w_packed, &a_q, k);
+                output[i * n + j] = (raw - act_sum) as f32 / act_scale * w_scale;
+            }
+        }
+        Ok(())
     }
 
     fn forward_i2s_preq(
