@@ -32,7 +32,7 @@
  *   The 4 j-groups are fully unrolled, each processing 2 elements per lane.
  */
 
-use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, thread, warp};
+use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, ptx_asm, thread, warp};
 // NOTE: dp4a_s32 requires the upstream oxide backend (cuda-oxide/crates/rustc-codegen-cuda)
 // which includes dp4a in its intrinsic catalog. The fork backend (crates/rustc-codegen-cuda)
 // does not. Build q4k_gemv_decode_q8 only when the upstream backend is available.
@@ -1084,6 +1084,20 @@ mod kernels {
             let base0 = (n_out * k_blocks + blk) * 42;
             let base1 = (n_out * k_blocks + blk + 1) * 42;
 
+            // Prefetch next iteration's weight blocks (1 loop step = WARPS_PER_BLOCK*2 blocks ahead).
+            // Hides DRAM latency for the next pair of blocks against current FMAs.
+            let blk_pf = blk + WARPS_PER_BLOCK * 2;
+            if blk_pf + 1 < k_blocks {
+                let base_pf0 = ((n_out * k_blocks + blk_pf) * 42) as usize;
+                let base_pf1 = ((n_out * k_blocks + blk_pf + 1) * 42) as usize;
+                unsafe {
+                    let ptr_pf0 = packed.as_ptr().add(base_pf0) as u64;
+                    let ptr_pf1 = packed.as_ptr().add(base_pf1) as u64;
+                    ptx_asm!("prefetch.global.L2 [%0];", in("l") ptr_pf0, clobber("memory"));
+                    ptx_asm!("prefetch.global.L2 [%0];", in("l") ptr_pf1, clobber("memory"));
+                }
+            }
+
             // Phase 1: Issue ALL loads for BOTH blocks before any shuffle.
             let d_raw0    = if lane == 0 { packed[base0 as usize] } else { 0 };
             let dmin_raw0 = if lane == 0 { packed[(base0 + 1) as usize] } else { 0 };
@@ -1194,6 +1208,234 @@ mod kernels {
         }
     }
 
+    /// Fused gate+up Q4K GEMV with inline SiLU: out[i] = silu(gate_dot[i]) * up_dot[i]
+    ///
+    /// Processes gate_proj and up_proj weight matrices in a single kernel launch,
+    /// sharing the Q8_1 activation load between both GEMVs and applying SiLU inline.
+    /// Halves activation DRAM traffic and kernel launches for FFN layers vs two GEMVs.
+    ///
+    /// Grid:  (N, 1, 1) — one block per output neuron
+    /// Block: (WARPS_PER_BLOCK * 32, 1, 1) — 4 warps
+    /// Smem:  32 f32 slots (128 bytes): [0..16] gate partials, [16..32] up partials
+    #[kernel]
+    pub fn q4k_gemv_fused_silu_mul(
+        mut out: DisjointSlice<f32>,
+        gate_packed: &[u32],  // [N, K_BLOCKS, 42] Q4K gate_proj weights
+        up_packed:   &[u32],  // [N, K_BLOCKS, 42] Q4K up_proj weights
+        x_qs: &[u32],         // [K/4] Q8_1 quantized activations (4 int8 per u32)
+        x_ds: &[u32],         // [K/32] Q8_1 f16 block scales
+        n: u32,
+        k_blocks: u32,
+    ) {
+        let tid     = thread::threadIdx_x();
+        let bid     = thread::blockIdx_x();
+        let warp_id = tid / 32;
+        let lane    = tid % 32;
+        let n_out   = bid;
+        if n_out >= n { return; }
+
+        let mw        = lane / 8;
+        let sub_l     = lane % 8;
+        let mini_mask = 0xFF_u32 << (mw * 8);
+        let base_lane = mw * 8;
+
+        let mut gate_acc = 0.0_f32;
+        let mut up_acc   = 0.0_f32;
+
+        // ── Main double-block K-loop (VDR=2): mirrors q4k_gemv_decode_q8_v3 ──────
+        let mut blk = warp_id * 2;
+        while blk + 1 < k_blocks {
+            let base0 = (n_out * k_blocks + blk) * 42;
+            let base1 = (n_out * k_blocks + blk + 1) * 42;
+
+            // Phase 1: Issue ALL loads for BOTH blocks and BOTH weight matrices.
+            // The activation loads (u0_lo, u0_hi, u1_lo, u1_hi) are shared.
+            let gd_raw0    = if lane == 0 { gate_packed[base0 as usize] } else { 0 };
+            let gdmin_raw0 = if lane == 0 { gate_packed[(base0 + 1) as usize] } else { 0 };
+            let gsc_raw0   = if sub_l == 0 { gate_packed[(base0 + 2 + mw) as usize] } else { 0 };
+            let gm_raw0    = if sub_l == 0 { gate_packed[(base0 + 6 + mw) as usize] } else { 0 };
+            let gqs0       = gate_packed[(base0 + 10 + mw * 8 + sub_l) as usize];
+
+            let ud_raw0    = if lane == 0 { up_packed[base0 as usize] } else { 0 };
+            let udmin_raw0 = if lane == 0 { up_packed[(base0 + 1) as usize] } else { 0 };
+            let usc_raw0   = if sub_l == 0 { up_packed[(base0 + 2 + mw) as usize] } else { 0 };
+            let um_raw0    = if sub_l == 0 { up_packed[(base0 + 6 + mw) as usize] } else { 0 };
+            let uqs0       = up_packed[(base0 + 10 + mw * 8 + sub_l) as usize];
+
+            let q8b0_lo = blk * 8 + mw * 2;
+            let q8b0_hi = q8b0_lo + 1;
+            let u0_lo   = x_qs[(q8b0_lo * 8 + sub_l) as usize];
+            let u0_hi   = x_qs[(q8b0_hi * 8 + sub_l) as usize];
+
+            let gd_raw1    = if lane == 0 { gate_packed[base1 as usize] } else { 0 };
+            let gdmin_raw1 = if lane == 0 { gate_packed[(base1 + 1) as usize] } else { 0 };
+            let gsc_raw1   = if sub_l == 0 { gate_packed[(base1 + 2 + mw) as usize] } else { 0 };
+            let gm_raw1    = if sub_l == 0 { gate_packed[(base1 + 6 + mw) as usize] } else { 0 };
+            let gqs1       = gate_packed[(base1 + 10 + mw * 8 + sub_l) as usize];
+
+            let ud_raw1    = if lane == 0 { up_packed[base1 as usize] } else { 0 };
+            let udmin_raw1 = if lane == 0 { up_packed[(base1 + 1) as usize] } else { 0 };
+            let usc_raw1   = if sub_l == 0 { up_packed[(base1 + 2 + mw) as usize] } else { 0 };
+            let um_raw1    = if sub_l == 0 { up_packed[(base1 + 6 + mw) as usize] } else { 0 };
+            let uqs1       = up_packed[(base1 + 10 + mw * 8 + sub_l) as usize];
+
+            let q8b1_lo = (blk + 1) * 8 + mw * 2;
+            let q8b1_hi = q8b1_lo + 1;
+            let u1_lo   = x_qs[(q8b1_lo * 8 + sub_l) as usize];
+            let u1_hi   = x_qs[(q8b1_hi * 8 + sub_l) as usize];
+
+            // Phase 2: Compute gate and up for block 0.
+            let d8_0_lo = f16_to_f32(x_ds[q8b0_lo as usize] & 0xFFFF);
+            let d8_0_hi = f16_to_f32(x_ds[q8b0_hi as usize] & 0xFFFF);
+
+            let gd0    = f32::from_bits(warp::shuffle(gd_raw0, 0));
+            let gdmin0 = f32::from_bits(warp::shuffle(gdmin_raw0, 0));
+            let gsc0   = warp::shuffle_sync(mini_mask, gsc_raw0, base_lane);
+            let gm0    = warp::shuffle_sync(mini_mask, gm_raw0,  base_lane);
+            let gv0_lo = gqs0 & 0x0F0F0F0F;
+            let gv0_hi = (gqs0 >> 4) & 0x0F0F0F0F;
+            gate_acc += d8_0_lo * (gd0 * ((gsc0 & 0xFF) as f32) * (dp4a_s32(gv0_lo, u0_lo, 0) as f32)
+                                 - gdmin0 * ((gm0 & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_lo, 0) as f32))
+                     + d8_0_hi * (gd0 * (((gsc0 >> 8) & 0xFF) as f32) * (dp4a_s32(gv0_hi, u0_hi, 0) as f32)
+                                 - gdmin0 * (((gm0 >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_hi, 0) as f32));
+
+            let ud0    = f32::from_bits(warp::shuffle(ud_raw0, 0));
+            let udmin0 = f32::from_bits(warp::shuffle(udmin_raw0, 0));
+            let usc0   = warp::shuffle_sync(mini_mask, usc_raw0, base_lane);
+            let um0    = warp::shuffle_sync(mini_mask, um_raw0,  base_lane);
+            let uv0_lo = uqs0 & 0x0F0F0F0F;
+            let uv0_hi = (uqs0 >> 4) & 0x0F0F0F0F;
+            up_acc += d8_0_lo * (ud0 * ((usc0 & 0xFF) as f32) * (dp4a_s32(uv0_lo, u0_lo, 0) as f32)
+                               - udmin0 * ((um0 & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_lo, 0) as f32))
+                   + d8_0_hi * (ud0 * (((usc0 >> 8) & 0xFF) as f32) * (dp4a_s32(uv0_hi, u0_hi, 0) as f32)
+                               - udmin0 * (((um0 >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_hi, 0) as f32));
+
+            // Phase 3: Compute gate and up for block 1.
+            let d8_1_lo = f16_to_f32(x_ds[q8b1_lo as usize] & 0xFFFF);
+            let d8_1_hi = f16_to_f32(x_ds[q8b1_hi as usize] & 0xFFFF);
+
+            let gd1    = f32::from_bits(warp::shuffle(gd_raw1, 0));
+            let gdmin1 = f32::from_bits(warp::shuffle(gdmin_raw1, 0));
+            let gsc1   = warp::shuffle_sync(mini_mask, gsc_raw1, base_lane);
+            let gm1    = warp::shuffle_sync(mini_mask, gm_raw1,  base_lane);
+            let gv1_lo = gqs1 & 0x0F0F0F0F;
+            let gv1_hi = (gqs1 >> 4) & 0x0F0F0F0F;
+            gate_acc += d8_1_lo * (gd1 * ((gsc1 & 0xFF) as f32) * (dp4a_s32(gv1_lo, u1_lo, 0) as f32)
+                                 - gdmin1 * ((gm1 & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_lo, 0) as f32))
+                     + d8_1_hi * (gd1 * (((gsc1 >> 8) & 0xFF) as f32) * (dp4a_s32(gv1_hi, u1_hi, 0) as f32)
+                                 - gdmin1 * (((gm1 >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_hi, 0) as f32));
+
+            let ud1    = f32::from_bits(warp::shuffle(ud_raw1, 0));
+            let udmin1 = f32::from_bits(warp::shuffle(udmin_raw1, 0));
+            let usc1   = warp::shuffle_sync(mini_mask, usc_raw1, base_lane);
+            let um1    = warp::shuffle_sync(mini_mask, um_raw1,  base_lane);
+            let uv1_lo = uqs1 & 0x0F0F0F0F;
+            let uv1_hi = (uqs1 >> 4) & 0x0F0F0F0F;
+            up_acc += d8_1_lo * (ud1 * ((usc1 & 0xFF) as f32) * (dp4a_s32(uv1_lo, u1_lo, 0) as f32)
+                               - udmin1 * ((um1 & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_lo, 0) as f32))
+                   + d8_1_hi * (ud1 * (((usc1 >> 8) & 0xFF) as f32) * (dp4a_s32(uv1_hi, u1_hi, 0) as f32)
+                               - udmin1 * (((um1 >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_hi, 0) as f32));
+
+            blk += WARPS_PER_BLOCK * 2;
+        }
+
+        // ── Tail: single-block fallback for odd k_blocks ──────────────────────
+        while blk < k_blocks {
+            let base = (n_out * k_blocks + blk) * 42;
+
+            let gd_raw    = if lane == 0 { gate_packed[base as usize] } else { 0 };
+            let gdmin_raw = if lane == 0 { gate_packed[(base + 1) as usize] } else { 0 };
+            let gsc_raw   = if sub_l == 0 { gate_packed[(base + 2 + mw) as usize] } else { 0 };
+            let gm_raw    = if sub_l == 0 { gate_packed[(base + 6 + mw) as usize] } else { 0 };
+            let gqs       = gate_packed[(base + 10 + mw * 8 + sub_l) as usize];
+
+            let ud_raw    = if lane == 0 { up_packed[base as usize] } else { 0 };
+            let udmin_raw = if lane == 0 { up_packed[(base + 1) as usize] } else { 0 };
+            let usc_raw   = if sub_l == 0 { up_packed[(base + 2 + mw) as usize] } else { 0 };
+            let um_raw    = if sub_l == 0 { up_packed[(base + 6 + mw) as usize] } else { 0 };
+            let uqs       = up_packed[(base + 10 + mw * 8 + sub_l) as usize];
+
+            let gd    = f32::from_bits(warp::shuffle(gd_raw, 0));
+            let gdmin = f32::from_bits(warp::shuffle(gdmin_raw, 0));
+            let gsc   = warp::shuffle_sync(mini_mask, gsc_raw, base_lane);
+            let gm    = warp::shuffle_sync(mini_mask, gm_raw,  base_lane);
+
+            let ud    = f32::from_bits(warp::shuffle(ud_raw, 0));
+            let udmin = f32::from_bits(warp::shuffle(udmin_raw, 0));
+            let usc   = warp::shuffle_sync(mini_mask, usc_raw, base_lane);
+            let um    = warp::shuffle_sync(mini_mask, um_raw,  base_lane);
+
+            let q8_lo = blk * 8 + mw * 2;
+            let q8_hi = q8_lo + 1;
+            let d8_lo = f16_to_f32(x_ds[q8_lo as usize] & 0xFFFF);
+            let d8_hi = f16_to_f32(x_ds[q8_hi as usize] & 0xFFFF);
+            let u_lo  = x_qs[(q8_lo * 8 + sub_l) as usize];
+            let u_hi  = x_qs[(q8_hi * 8 + sub_l) as usize];
+
+            let gv_lo = gqs & 0x0F0F0F0F;
+            let gv_hi = (gqs >> 4) & 0x0F0F0F0F;
+            gate_acc += d8_lo * (gd * ((gsc & 0xFF) as f32) * (dp4a_s32(gv_lo, u_lo, 0) as f32)
+                               - gdmin * ((gm & 0xFF) as f32) * (dp4a_s32(0x01010101, u_lo, 0) as f32))
+                     + d8_hi * (gd * (((gsc >> 8) & 0xFF) as f32) * (dp4a_s32(gv_hi, u_hi, 0) as f32)
+                               - gdmin * (((gm >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u_hi, 0) as f32));
+
+            let uv_lo = uqs & 0x0F0F0F0F;
+            let uv_hi = (uqs >> 4) & 0x0F0F0F0F;
+            up_acc += d8_lo * (ud * ((usc & 0xFF) as f32) * (dp4a_s32(uv_lo, u_lo, 0) as f32)
+                             - udmin * ((um & 0xFF) as f32) * (dp4a_s32(0x01010101, u_lo, 0) as f32))
+                   + d8_hi * (ud * (((usc >> 8) & 0xFF) as f32) * (dp4a_s32(uv_hi, u_hi, 0) as f32)
+                             - udmin * (((um >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u_hi, 0) as f32));
+
+            blk += WARPS_PER_BLOCK * 2;
+        }
+
+        // ── Mini-warp butterfly reduction for both accumulators ────────────────
+        gate_acc += warp::shuffle_xor_f32_sync(mini_mask, gate_acc, 4);
+        gate_acc += warp::shuffle_xor_f32_sync(mini_mask, gate_acc, 2);
+        gate_acc += warp::shuffle_xor_f32_sync(mini_mask, gate_acc, 1);
+        up_acc += warp::shuffle_xor_f32_sync(mini_mask, up_acc, 4);
+        up_acc += warp::shuffle_xor_f32_sync(mini_mask, up_acc, 2);
+        up_acc += warp::shuffle_xor_f32_sync(mini_mask, up_acc, 1);
+
+        // ── Cross-warp reduction via shared memory ─────────────────────────────
+        // smem layout: [0..16] gate (warp_id*4+mw), [16..32] up (16+warp_id*4+mw)
+        // Total 32 f32 slots = 128 bytes (same as v3 Blackwell safety budget).
+        let smem: *mut f32 = DynamicSharedArray::<f32>::get();
+        if sub_l == 0 {
+            unsafe {
+                *smem.add((warp_id * 4 + mw) as usize)      = gate_acc;
+                *smem.add((16 + warp_id * 4 + mw) as usize) = up_acc;
+            }
+        }
+        thread::sync_threads();
+
+        if warp_id == 0 && lane < 4 {
+            let j = lane;
+            let mut gtotal = 0.0_f32;
+            let mut utotal = 0.0_f32;
+            let mut w = 0u32;
+            while w < WARPS_PER_BLOCK {
+                gtotal += unsafe { *smem.add((w * 4 + j) as usize) };
+                utotal += unsafe { *smem.add((16 + w * 4 + j) as usize) };
+                w += 1;
+            }
+            unsafe {
+                *smem.add(j as usize)        = gtotal;
+                *smem.add((16 + j) as usize) = utotal;
+            }
+        }
+        thread::sync_threads();
+
+        if warp_id == 0 && lane == 0 {
+            let gate_val = unsafe { *smem.add(0) + *smem.add(1) + *smem.add(2) + *smem.add(3) };
+            let up_val   = unsafe { *smem.add(16) + *smem.add(17) + *smem.add(18) + *smem.add(19) };
+            // SiLU: silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+            let sigmoid = 1.0_f32 / (1.0_f32 + f32::exp(-gate_val));
+            let out_val = gate_val * sigmoid * up_val;
+            unsafe { *out.get_unchecked_mut(n_out as usize) = out_val; }
+        }
+    }
+
     /// q4k_gemv_decode_q8_v3r — raw GGUF 36-u32 format variant of v3.
     /// 36 u32 (144 bytes) per block vs 42 u32 (168 bytes) → 14% less DRAM.
     #[kernel]
@@ -1223,6 +1465,19 @@ mod kernels {
         while blk + 1 < k_blocks {
             let base0 = (n_out * k_blocks + blk) * 36;
             let base1 = (n_out * k_blocks + blk + 1) * 36;
+
+            // Prefetch next iteration's weight blocks into L2 (1 loop step ahead).
+            let blk_pf = blk + WARPS_PER_BLOCK * 2;
+            if blk_pf + 1 < k_blocks {
+                let base_pf0 = ((n_out * k_blocks + blk_pf) * 36) as usize;
+                let base_pf1 = ((n_out * k_blocks + blk_pf + 1) * 36) as usize;
+                unsafe {
+                    let ptr_pf0 = packed.as_ptr().add(base_pf0) as u64;
+                    let ptr_pf1 = packed.as_ptr().add(base_pf1) as u64;
+                    ptx_asm!("prefetch.global.L2 [%0];", in("l") ptr_pf0, clobber("memory"));
+                    ptx_asm!("prefetch.global.L2 [%0];", in("l") ptr_pf1, clobber("memory"));
+                }
+            }
 
             // ── Phase 1: ALL loads for BOTH blocks upfront ─────────────────
             // u32[0] = f16 d | (f16 dmin << 16)
@@ -1949,6 +2204,81 @@ fn main() {
             std::process::exit(1);
         }
         println!("oxide-gemv-q4k v3 vs v3r k_blocks=16 (paired loop): PASSED (max_diff={:.2e})", diff);
+    }
+
+    // ── fused gate+up SiLU test: k_blocks=16 ────────────────────────────────
+    // Both gate and up weights: d=1.0, dmin=0.0, sc=1, m=0, nibbles=3 → GEMV=12288.0
+    // SiLU(12288) ≈ 12288 (sigmoid(large positive) ≈ 1.0)
+    // Expected output ≈ 12288 * 1.0 * 12288 = 150994944.0
+    {
+        let n: usize = 32;
+        let k_blocks: usize = 16;
+        let k = k_blocks * 256;
+        let k_q8_blocks = k / 32;
+
+        let q8_qs_v: Vec<u32> = vec![0x01010101u32; k_q8_blocks * 8];
+        let q8_ds_v: Vec<u32> = vec![0x00003C00u32; k_q8_blocks];  // f16(1.0)
+
+        let packed_gate_h: Vec<u32> = {
+            let mut p = vec![0u32; n * k_blocks * 42];
+            for row in 0..n {
+                for blk in 0..k_blocks {
+                    let base = (row * k_blocks + blk) * 42;
+                    p[base]   = 1.0f32.to_bits();       // d = 1.0
+                    p[base+1] = 0.0f32.to_bits();       // dmin = 0.0
+                    for j in 0..4usize { p[base+2+j] = 0x00000101; }  // sc=1 for all groups
+                    for j in 0..4usize { p[base+6+j] = 0x00000000; }  // m=0
+                    for w in 0..32usize { p[base+10+w] = 0x33333333; } // nibbles=3
+                }
+            }
+            p
+        };
+        // up weights identical to gate for this test
+        let packed_up_h = packed_gate_h.clone();
+
+        let x_qs_dev  = DeviceBuffer::from_host(&stream, &q8_qs_v).expect("fused q8_qs");
+        let x_ds_dev  = DeviceBuffer::from_host(&stream, &q8_ds_v).expect("fused q8_ds");
+        let gate_dev  = DeviceBuffer::from_host(&stream, &packed_gate_h).expect("fused gate");
+        let up_dev    = DeviceBuffer::from_host(&stream, &packed_up_h).expect("fused up");
+        let mut out_fused = DeviceBuffer::<f32>::zeroed(&stream, n).expect("fused out");
+
+        let smem_fused = WARPS_PER_BLOCK * 4 * 4 * 2;  // 32 f32 = 128 bytes
+        let cfg_fused = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
+            shared_mem_bytes: smem_fused,
+        };
+        unsafe {
+            module.q4k_gemv_fused_silu_mul(
+                stream.as_ref(), cfg_fused, &mut out_fused,
+                &gate_dev, &up_dev, &x_qs_dev, &x_ds_dev,
+                n as u32, k_blocks as u32,
+            )
+        }.expect("fused silu launch");
+
+        let r_fused = out_fused.to_host_vec(&stream).expect("fused download");
+
+        // Each GEMV = 16 blocks × 256 elements × 3.0 = 12288.0
+        // silu(12288) * 12288: sigmoid(12288) ≈ 1.0 → expected ≈ 12288^2 = 150994944
+        let gemv_val = (k_blocks * 256) as f32 * 3.0;
+        let sigmoid_approx = 1.0_f32 / (1.0_f32 + (-gemv_val).exp());
+        let expected_fused = gemv_val * sigmoid_approx * gemv_val;
+        let e_fused = r_fused.iter().map(|v| (v - expected_fused).abs()).fold(0.0f32, f32::max);
+
+        println!("fused k_blocks=16 vs expected={:.2}: err={:.4}  first={:.2}",
+                 expected_fused, e_fused, r_fused[0]);
+
+        // Tolerance: 1.0 absolute (same as other tests) but proportionally it's
+        // very tight (12288^2 ≈ 1.5e8, so 1.0 is < 1e-7 relative).
+        // For sigmoid(large) ≈ 1.0, the rounding error is in FP32 dp4a accumulation.
+        // Use 1% relative tolerance: 1.5e6.
+        let tol = expected_fused * 0.01;
+        if e_fused > tol {
+            eprintln!("fused FAILED (expected={:.2}, max_err={:.4}, tol={:.4}, first={:.2})",
+                      expected_fused, e_fused, tol, r_fused[0]);
+            std::process::exit(1);
+        }
+        println!("oxide-gemv-q4k fused_silu_mul k_blocks=16: PASSED (max_err={:.2e})", e_fused);
     }
 
     println!("oxide-gemv-q4k: all tests PASSED");
