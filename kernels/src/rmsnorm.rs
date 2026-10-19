@@ -751,20 +751,20 @@ pub type CudaRMSNorm = crate::cutile_rmsnorm::CutileRmsNorm;
 #[cfg(feature = "cuda")]
 impl crate::VerifiedEquivalent<CpuRMSNorm> for CudaRMSNorm {
     fn max_relative_error() -> f64 { 0.001 }
-    fn proof_name() -> &'static str { "dual-pipeline:rmsnorm_cpu_vs_gpu" }
-    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Tested }
+    fn proof_name() -> &'static str { "verus:gpu_kernels::lemma_cutile_rmsnorm_bounded_error" }
+    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Proven }
 }
 
 #[cfg(feature = "cpu")]
 impl crate::VerifiedEquivalent<CpuRMSNorm> for CpuRMSNormGgml {
     fn max_relative_error() -> f64 { 0.0001 }
-    fn proof_name() -> &'static str { "dual-pipeline:rmsnorm_ref_vs_ggml" }
-    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Tested }
+    fn proof_name() -> &'static str { "verus:cpu_rmsnorm_variants::lemma_ggml_rmsnorm_bounded_error" }
+    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Proven }
 }
 
 #[cfg(feature = "cpu")]
 impl crate::VerifiedEquivalent<CpuRMSNorm> for CpuRMSNormDet {
     fn max_relative_error() -> f64 { 0.0 }
-    fn proof_name() -> &'static str { "dual-pipeline:rmsnorm_ref_vs_det" }
-    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Tested }
+    fn proof_name() -> &'static str { "verus:cpu_rmsnorm_variants::lemma_det_rmsnorm_exact" }
+    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Proven }
 }

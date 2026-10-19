@@ -241,6 +241,9 @@ MODULES=(
     deltanet
     hybrid_dispatch
     quantized_gemv
+    gpu_kernels
+    cpu_rmsnorm_variants
+    cpu_attention_variants
 )
 
 TOTAL_VERIFIED=0

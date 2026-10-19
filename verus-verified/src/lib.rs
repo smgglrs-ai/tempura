@@ -100,3 +100,6 @@ pub mod q2_gemv_rows;
 pub mod attention_decode;
 pub mod q2_lut_tiles;
 pub mod parallel_accumulator;
+pub mod gpu_kernels;
+pub mod cpu_rmsnorm_variants;
+pub mod cpu_attention_variants;

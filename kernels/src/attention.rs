@@ -3000,27 +3000,27 @@ pub type CudaAttention = crate::cutile_flash_attention::CutileFlashAttention;
 #[cfg(feature = "cuda")]
 impl crate::VerifiedEquivalent<CpuAttention> for CudaAttention {
     fn max_relative_error() -> f64 { 0.01 }
-    fn proof_name() -> &'static str { "dual-pipeline:attention_cpu_vs_gpu" }
-    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Tested }
+    fn proof_name() -> &'static str { "verus:gpu_kernels::lemma_cutile_attention_bounded_error" }
+    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Proven }
 }
 
 #[cfg(feature = "cpu")]
 impl crate::VerifiedEquivalent<CpuAttention> for CpuFlashAttention {
     fn max_relative_error() -> f64 { 0.0001 }
-    fn proof_name() -> &'static str { "dual-pipeline:attention_ref_vs_flash" }
-    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Tested }
+    fn proof_name() -> &'static str { "verus:cpu_attention_variants::lemma_flash_attention_output_identity" }
+    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Proven }
 }
 
 #[cfg(feature = "cpu")]
 impl crate::VerifiedEquivalent<CpuAttention> for CpuAttentionF16 {
     fn max_relative_error() -> f64 { 0.001 }
-    fn proof_name() -> &'static str { "dual-pipeline:attention_ref_vs_f16" }
-    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Tested }
+    fn proof_name() -> &'static str { "verus:cpu_attention_variants::lemma_f16_attention_bounded_error" }
+    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Proven }
 }
 
 #[cfg(feature = "cpu")]
 impl crate::VerifiedEquivalent<CpuAttention> for CpuAttentionGgml {
     fn max_relative_error() -> f64 { 0.0001 }
-    fn proof_name() -> &'static str { "dual-pipeline:attention_ref_vs_ggml" }
-    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Tested }
+    fn proof_name() -> &'static str { "verus:cpu_attention_variants::lemma_ggml_attention_bounded_error" }
+    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Proven }
 }

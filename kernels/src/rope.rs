@@ -1782,6 +1782,6 @@ pub type CudaRoPE = crate::cutile_rope::CutileRoPE;
 #[cfg(feature = "cuda")]
 impl crate::VerifiedEquivalent<CpuRoPE> for CudaRoPE {
     fn max_relative_error() -> f64 { 0.0001 }
-    fn proof_name() -> &'static str { "dual-pipeline:rope_cpu_vs_gpu" }
-    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Tested }
+    fn proof_name() -> &'static str { "verus:gpu_kernels::lemma_cutile_rope_bounded_error" }
+    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Proven }
 }
