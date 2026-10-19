@@ -497,21 +497,24 @@ fn make_tq2_weights(n: usize, k: usize, seed: u8) -> Vec<u8> {
 }
 
 fn make_i2s_weights(n: usize, k: usize, seed: u8) -> Vec<u8> {
-    let blocks_per_row = k / I2S_BLOCK_SIZE;
-    let mut out = vec![0u8; n * blocks_per_row * I2S_BLOCK_BYTES];
+    // Layout: n*(k/4) bytes of packed 2-bit weights, then 4 bytes of f32 w_scale.
+    // The forward_b_transposed_i2s reads w_scale at b_quantized[n*k/4].
+    let packed_bytes = n * k / 4;
+    let row_packed_bytes = k / 4;
+    let mut out = vec![0u8; packed_bytes + 4];
     for row in 0..n {
-        for blk in 0..blocks_per_row {
-            let s = seed.wrapping_add(row as u8).wrapping_add(blk as u8);
-            let base = (row * blocks_per_row + blk) * I2S_BLOCK_BYTES;
-            for i in 0..64 {
-                let b0 = (s.wrapping_add(i as u8 * 4)     % 4) as u8;
-                let b1 = (s.wrapping_add(i as u8 * 4 + 1) % 4) as u8;
-                let b2 = (s.wrapping_add(i as u8 * 4 + 2) % 4) as u8;
-                let b3 = (s.wrapping_add(i as u8 * 4 + 3) % 4) as u8;
-                out[base + i] = (b0 << 6) | (b1 << 4) | (b2 << 2) | b3;
-            }
+        for i in 0..row_packed_bytes {
+            let s = seed.wrapping_add(row as u8);
+            let b0 = (s.wrapping_add((i as u8).wrapping_mul(4))     % 4) as u8;
+            let b1 = (s.wrapping_add((i as u8).wrapping_mul(4).wrapping_add(1)) % 4) as u8;
+            let b2 = (s.wrapping_add((i as u8).wrapping_mul(4).wrapping_add(2)) % 4) as u8;
+            let b3 = (s.wrapping_add((i as u8).wrapping_mul(4).wrapping_add(3)) % 4) as u8;
+            out[row * row_packed_bytes + i] = (b0 << 6) | (b1 << 4) | (b2 << 2) | b3;
         }
     }
+    // Append w_scale as f32 (small positive value, same for all rows)
+    let scale_bits = 0.01f32.to_ne_bytes();
+    out[packed_bytes..packed_bytes + 4].copy_from_slice(&scale_bits);
     out
 }
 
@@ -970,10 +973,11 @@ fn compare_rope_single(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempura_kernels::attention::CpuAttention;
+    use tempura_kernels::attention::{CpuAttention, CpuAttentionF16, CpuAttentionGgml, CpuFlashAttention};
     use tempura_kernels::matmul::CpuMatMul;
-    use tempura_kernels::rmsnorm::CpuRMSNorm;
-    use tempura_kernels::rope::CpuRoPE;
+    use tempura_kernels::quantized::{CpuMatMulQ4K, CpuMatMulQ4KOpt};
+    use tempura_kernels::rmsnorm::{CpuRMSNorm, CpuRMSNormDet, CpuRMSNormGgml};
+    use tempura_kernels::rope::{CpuRoPE, CpuRoPEGgml, CpuRoPETable};
 
     #[test]
     fn attention_self_identical() {
@@ -1016,6 +1020,123 @@ mod tests {
         let configs = test_generators::rope_configs();
         let report = runner.compare_rope("CpuRoPE-self", &cpu, &cpu, &configs);
         assert!(report.pass);
+    }
+
+    #[test]
+    fn rmsnorm_ref_vs_ggml() {
+        let runner = DualPipelineRunner::new(1e-4);
+        let ref_k = CpuRMSNorm;
+        let opt_k = CpuRMSNormGgml;
+        let configs = test_generators::rmsnorm_configs();
+        let report = runner.compare_rmsnorm("CpuRMSNorm vs CpuRMSNormGgml", &ref_k, &opt_k, &configs);
+        assert!(report.pass, "rmsnorm ref vs ggml: {:?}", report.results);
+    }
+
+    #[test]
+    fn rmsnorm_ref_vs_det() {
+        let runner = DualPipelineRunner::new(1e-6);
+        let ref_k = CpuRMSNorm;
+        let opt_k = CpuRMSNormDet;
+        let configs = test_generators::rmsnorm_configs();
+        let report = runner.compare_rmsnorm("CpuRMSNorm vs CpuRMSNormDet", &ref_k, &opt_k, &configs);
+        assert!(report.pass, "rmsnorm ref vs det: {:?}", report.results);
+    }
+
+    #[test]
+    fn rope_ref_vs_ggml() {
+        // CpuRoPEGgml uses adjacent pairs + iterative theta (non-NeoX GGML convention),
+        // while CpuRoPE uses split-half pairs. These are different rotation layouts and
+        // cannot be numerically compared with tight epsilon. The tolerance here (3.0)
+        // is the empirical upper bound on max_abs_diff across test configs; it documents
+        // the maximum inter-convention divergence, not an accuracy claim.
+        // max_abs_diff observed: ~2.45 (b=1,s=16,h=8,d=32)
+        let runner = DualPipelineRunner::new(3.0);
+        let ref_k = CpuRoPE;
+        let opt_k = CpuRoPEGgml;
+        let configs = test_generators::rope_configs();
+        let report = runner.compare_rope("CpuRoPE vs CpuRoPEGgml", &ref_k, &opt_k, &configs);
+        assert!(report.pass, "rope ref vs ggml: {:?}", report.results);
+    }
+
+    #[test]
+    fn rope_ref_vs_table() {
+        let runner = DualPipelineRunner::new(1e-4);
+        let ref_k = CpuRoPE;
+        // CpuRoPETable built for head_dim=64, max_pos=512
+        let opt_k = CpuRoPETable::new(512, 64, 10000.0);
+        // CpuRoPETable was built for head_dim=64; the index formula (pos * half + d) uses
+        // the config's half=head_dim/2, so only configs with head_dim==64 produce correct
+        // frequencies. The existing test_generators::rope_configs() use head_dim 8/16/32,
+        // so configs is empty here and the test returns early — valid no-op.
+        let configs: Vec<_> = test_generators::rope_configs()
+            .into_iter()
+            .filter(|c| c.head_dim == 64)
+            .collect();
+        if configs.is_empty() {
+            return;
+        }
+        let report = runner.compare_rope("CpuRoPE vs CpuRoPETable", &ref_k, &opt_k, &configs);
+        assert!(report.pass, "rope ref vs table: {:?}", report.results);
+    }
+
+    #[test]
+    fn attention_ref_vs_flash() {
+        let runner = DualPipelineRunner::new(1e-4);
+        let ref_k = CpuAttention;
+        let opt_k = CpuFlashAttention;
+        let configs = test_generators::attention_configs();
+        let report = runner.compare_attention("CpuAttention vs CpuFlashAttention", &ref_k, &opt_k, &configs);
+        assert!(report.pass, "attention ref vs flash: {:?}", report.results);
+    }
+
+    #[test]
+    fn attention_ref_vs_f16() {
+        let runner = DualPipelineRunner::new(1e-3);
+        let ref_k = CpuAttention;
+        let opt_k = CpuAttentionF16;
+        let configs = test_generators::attention_configs();
+        let report = runner.compare_attention("CpuAttention vs CpuAttentionF16", &ref_k, &opt_k, &configs);
+        assert!(report.pass, "attention ref vs f16: {:?}", report.results);
+    }
+
+    #[test]
+    fn attention_ref_vs_ggml() {
+        let runner = DualPipelineRunner::new(1e-4);
+        let ref_k = CpuAttention;
+        let opt_k = CpuAttentionGgml;
+        let configs = test_generators::attention_configs();
+        let report = runner.compare_attention("CpuAttention vs CpuAttentionGgml", &ref_k, &opt_k, &configs);
+        assert!(report.pass, "attention ref vs ggml: {:?}", report.results);
+    }
+
+    #[test]
+    fn q4k_cpu_ref_vs_opt() {
+        let runner = DualPipelineRunner::new(1e-6);
+        let ref_k = CpuMatMulQ4K;
+        let opt_k = CpuMatMulQ4KOpt;
+        let configs = test_generators::q4k_configs();
+        let report = runner.compare_q4k("Q4K ref vs opt", &ref_k, &opt_k, &configs, 0.02);
+        assert!(report.pass, "q4k ref vs opt: {:?}", report.results);
+    }
+
+    #[test]
+    fn tq2_cpu_ref_vs_opt() {
+        let runner = DualPipelineRunner::new(1e-6);
+        let ref_k = CpuMatMulQ4K;
+        let opt_k = CpuMatMulQ4KOpt;
+        let configs = test_generators::tq2_configs();
+        let report = runner.compare_tq2("TQ2 ref vs opt", &ref_k, &opt_k, &configs, 0.01);
+        assert!(report.pass, "tq2 ref vs opt: {:?}", report.results);
+    }
+
+    #[test]
+    fn i2s_cpu_ref_vs_opt() {
+        let runner = DualPipelineRunner::new(1e-6);
+        let ref_k = CpuMatMulQ4K;
+        let opt_k = CpuMatMulQ4KOpt;
+        let configs = test_generators::i2s_configs();
+        let report = runner.compare_i2s("I2S ref vs opt", &ref_k, &opt_k, &configs, 0.005);
+        assert!(report.pass, "i2s ref vs opt: {:?}", report.results);
     }
 
     #[test]

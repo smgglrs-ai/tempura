@@ -1,4 +1,4 @@
-use crate::{AttentionConfig, I2SConfig, MatMulConfig, RMSNormConfig, RoPEConfig, TQ2Config};
+use crate::{AttentionConfig, I2SConfig, MatMulConfig, Q4kConfig, RMSNormConfig, RoPEConfig, TQ2Config};
 
 pub fn attention_configs() -> Vec<AttentionConfig> {
     vec![
@@ -85,6 +85,14 @@ pub fn rope_configs() -> Vec<RoPEConfig> {
             head_dim: 16,
             theta: 500000.0,
         },
+    ]
+}
+
+pub fn q4k_configs() -> Vec<Q4kConfig> {
+    vec![
+        Q4kConfig { m: 1, n: 16, k: 256 },
+        Q4kConfig { m: 1, n: 64, k: 512 },
+        Q4kConfig { m: 4, n: 32, k: 256 },
     ]
 }
 
