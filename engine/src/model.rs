@@ -36,6 +36,18 @@ use tempura_kernels::{
     Attention, DeltaNet, LayerNorm, MatMul, RMSNorm, RoPE, Sampler, SamplingParams,
 };
 
+pub(crate) fn current_rss_mb() -> usize {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+        / 1024
+}
+
 #[allow(dead_code)]
 fn q2_preq_into(a: &[f32], q8: &mut [i8], scales: &mut [f32], asum: &mut [i32], k: usize) {
     let n32 = k / 32;
@@ -9041,6 +9053,20 @@ impl CutileInferenceWrapper {
                     self.model.config.num_layers
                 );
                 self.gpu_model = Some(gm);
+                // Free CPU-side projection weights — all layer weights
+                // (Q/K/V/O/gate/up/down, layernorms, lm_head) are now GPU-
+                // resident.  Only embed_tokens.weight is still accessed from
+                // CPU during GPU inference (token embedding lookup).
+                if let Some(ref mut qw) = self.model.quantized_weights {
+                    let rss_before = crate::model::current_rss_mb();
+                    qw.free_gpu_uploaded(&["model.embed_tokens.weight"]);
+                    let rss_after = crate::model::current_rss_mb();
+                    eprintln!(
+                        "[cutile] freed CPU projection weights: {} MB → {} MB (saved {} MB)",
+                        rss_before, rss_after,
+                        rss_before.saturating_sub(rss_after)
+                    );
+                }
             }
             Err(e) => {
                 eprintln!(

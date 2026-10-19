@@ -687,6 +687,37 @@ impl QuantizedWeights {
         self.mmap_f16.keys().cloned().collect()
     }
 
+    /// Free all tensors that have been uploaded to GPU and are no longer
+    /// needed on CPU during GPU inference.  `keep_keys` lists exact tensor
+    /// names that must be retained (e.g. `model.embed_tokens.weight`).
+    ///
+    /// All heap-allocated maps are pruned via `retain`.  The mmap index maps
+    /// are also pruned so the mmap pages can be evicted under memory pressure
+    /// (the mmap itself is kept alive for any remaining CPU-resident slices).
+    pub fn free_gpu_uploaded(&mut self, keep_keys: &[&str]) {
+        let keep: std::collections::HashSet<&str> = keep_keys.iter().copied().collect();
+
+        self.q4k_tensors.retain(|k, _| keep.contains(k.as_str()));
+        self.q6k_tensors.retain(|k, _| keep.contains(k.as_str()));
+        self.tq2_tensors.retain(|k, _| keep.contains(k.as_str()));
+        self.i2s_tensors.retain(|k, _| keep.contains(k.as_str()));
+        self.tl2_tensors.retain(|k, _| keep.contains(k.as_str()));
+        self.f16_tensors.retain(|k, _| keep.contains(k.as_str()));
+        self.f32_tensors.retain(|k, _| keep.contains(k.as_str()));
+        self.typed_tensors.retain(|k, _| keep.contains(k.as_str()));
+        self.mmap_i2s.retain(|k, _| keep.contains(k.as_str()));
+        self.mmap_f16.retain(|k, _| keep.contains(k.as_str()));
+        self.mmap_q4k.retain(|k, _| keep.contains(k.as_str()));
+        self.mmap_q6k.retain(|k, _| keep.contains(k.as_str()));
+        self.mmap_q2.retain(|k, _| keep.contains(k.as_str()));
+        self.q2_i2s.retain(|k, _| keep.contains(k.as_str()));
+        self.q2x4.retain(|k, _| keep.contains(k.as_str()));
+        self.q2_tiled.retain(|k, _| keep.contains(k.as_str()));
+        self.q2_row_corrections.retain(|k, _| keep.contains(k.as_str()));
+        self.q4k_repacked.retain(|k, _| keep.contains(k.as_str()));
+        self.q6k_repacked.retain(|k, _| keep.contains(k.as_str()));
+    }
+
     pub fn embed_token(&self, token_id: u32, hidden_size: usize, output: &mut [f32]) {
         let off = token_id as usize * hidden_size;
         if let Some(f32_data) = self.get_f32("model.embed_tokens.weight") {
