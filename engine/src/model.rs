@@ -6114,7 +6114,7 @@ where
         let inter = cfg.intermediate_size;
 
         let rmsnorm = tempura_kernels::rmsnorm::CpuRMSNormGgml;
-        let rope = tempura_kernels::rope::CpuRoPEGgml;
+        let rope = tempura_kernels::rope::CpuRoPE;
 
         let mut hidden = vec![0.0f32; h];
         qweights.embed_token(token_id, h, &mut hidden);
@@ -7715,7 +7715,7 @@ where
 
         let cache_layer_map = cfg.cache_layer_map();
         let rmsnorm = tempura_kernels::rmsnorm::CpuRMSNormGgml;
-        let rope = tempura_kernels::rope::CpuRoPEGgml;
+        let rope = tempura_kernels::rope::CpuRoPE;
 
         let mut hidden = vec![0.0f32; seq_len * h];
         for (t, &tok) in token_ids.iter().enumerate() {

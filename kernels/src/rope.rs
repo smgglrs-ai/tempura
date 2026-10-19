@@ -50,64 +50,6 @@ impl RoPE for CpuRoPE {
     }
 }
 
-/// GGML-compatible RoPE: adjacent pairs, multiplicative theta accumulation.
-/// Translated from ggml.c:14943-15066 (non-NeoX mode, ext_factor=0).
-#[cfg(feature = "cpu")]
-pub struct CpuRoPEGgml;
-
-#[cfg(feature = "cpu")]
-impl RoPE for CpuRoPEGgml {
-    fn verification_tier(&self) -> crate::VerificationTier {
-        crate::VerificationTier::Tested
-    }
-
-    fn forward(
-        &self,
-        x: &mut [f32],
-        _batch: usize,
-        seq_len: usize,
-        num_heads: usize,
-        head_dim: usize,
-        positions: &[u32],
-        freq_base: f32,
-    ) -> Result<()> {
-        // C: const float theta_scale = powf(freq_base, -2.0f/n_dims);
-        let theta_scale: f32 = freq_base.powf(-2.0 / head_dim as f32);
-
-        for s in 0..seq_len {
-            // C: const int64_t p = pos[i2];
-            let p = positions[s] as f32;
-
-            // C: ggml_rope_cache_init — simplified for ext_factor=0, freq_scale=1, no freq_factors
-            // C: float theta = theta_base;  (theta_base = p)
-            // C: for (i0 = 0; i0 < ne0; i0 += 2) { cos = cosf(theta); sin = sinf(theta); theta *= theta_scale; }
-            let mut theta: f32 = p;
-
-            for i0 in (0..head_dim).step_by(2) {
-                let cos_theta = theta.cos();
-                let sin_theta = theta.sin();
-
-                // C: for (i1 = 0; i1 < ne1; i1++) — iterate over heads
-                for h in 0..num_heads {
-                    let offset = (s * num_heads + h) * head_dim;
-                    // C: const float x0 = src[0]; const float x1 = src[1];
-                    let x0 = x[offset + i0];
-                    let x1 = x[offset + i0 + 1];
-                    // C: dst_data[0] = x0*cos_theta - x1*sin_theta;
-                    // C: dst_data[1] = x0*sin_theta + x1*cos_theta;
-                    x[offset + i0] = x0 * cos_theta - x1 * sin_theta;
-                    x[offset + i0 + 1] = x0 * sin_theta + x1 * cos_theta;
-                }
-
-                // C: theta *= theta_scale;
-                theta *= theta_scale;
-            }
-        }
-
-        Ok(())
-    }
-}
-
 /// f16-native RoPE: reads f16 input, applies rotation with f32 sin/cos,
 /// writes f16 output. For research into full f16 inference pipelines.
 /// Enable with TEMPURA_F16_PIPE=1.
@@ -1184,55 +1126,6 @@ mod tests {
         // at position 0, cos=1 sin=0, so output should equal input
         for (a, b) in x.iter().zip(original.iter()) {
             assert!((a - b).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn test_unified_normal_matches_ggml() {
-        let ggml = CpuRoPEGgml;
-        let unified = CpuRoPEUnified::new(RoPEMode::Normal, 16);
-        let head_dim = 16;
-        let seq_len = 4;
-        let num_heads = 4;
-        let freq_base = 10000.0f32;
-        let n = seq_len * num_heads * head_dim;
-
-        let x_orig: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 + 0.5).collect();
-        let positions: Vec<u32> = (0..seq_len as u32).collect();
-
-        let mut x_ggml = x_orig.clone();
-        ggml.forward(
-            &mut x_ggml,
-            1,
-            seq_len,
-            num_heads,
-            head_dim,
-            &positions,
-            freq_base,
-        )
-        .unwrap();
-
-        let mut x_unified = x_orig.clone();
-        unified
-            .forward(
-                &mut x_unified,
-                1,
-                seq_len,
-                num_heads,
-                head_dim,
-                &positions,
-                freq_base,
-            )
-            .unwrap();
-
-        for i in 0..n {
-            let diff = (x_ggml[i] - x_unified[i]).abs();
-            assert!(
-                diff < 1e-5,
-                "Normal mode: unified vs ggml mismatch at {i}: ggml={}, unified={}, diff={diff}",
-                x_ggml[i],
-                x_unified[i]
-            );
         }
     }
 

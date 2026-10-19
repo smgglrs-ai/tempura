@@ -977,7 +977,7 @@ mod tests {
     use tempura_kernels::matmul::CpuMatMul;
     use tempura_kernels::quantized::{CpuMatMulQ4K, CpuMatMulQ4KOpt};
     use tempura_kernels::rmsnorm::{CpuRMSNorm, CpuRMSNormDet, CpuRMSNormGgml};
-    use tempura_kernels::rope::{CpuRoPE, CpuRoPEGgml, CpuRoPETable};
+    use tempura_kernels::rope::{CpuRoPE, CpuRoPETable};
 
     #[test]
     fn attention_self_identical() {
@@ -1040,22 +1040,6 @@ mod tests {
         let configs = test_generators::rmsnorm_configs();
         let report = runner.compare_rmsnorm("CpuRMSNorm vs CpuRMSNormDet", &ref_k, &opt_k, &configs);
         assert!(report.pass, "rmsnorm ref vs det: {:?}", report.results);
-    }
-
-    #[test]
-    fn rope_ref_vs_ggml() {
-        // CpuRoPEGgml uses adjacent pairs + iterative theta (non-NeoX GGML convention),
-        // while CpuRoPE uses split-half pairs. These are different rotation layouts and
-        // cannot be numerically compared with tight epsilon. The tolerance here (3.0)
-        // is the empirical upper bound on max_abs_diff across test configs; it documents
-        // the maximum inter-convention divergence, not an accuracy claim.
-        // max_abs_diff observed: ~2.45 (b=1,s=16,h=8,d=32)
-        let runner = DualPipelineRunner::new(3.0);
-        let ref_k = CpuRoPE;
-        let opt_k = CpuRoPEGgml;
-        let configs = test_generators::rope_configs();
-        let report = runner.compare_rope("CpuRoPE vs CpuRoPEGgml", &ref_k, &opt_k, &configs);
-        assert!(report.pass, "rope ref vs ggml: {:?}", report.results);
     }
 
     #[test]
