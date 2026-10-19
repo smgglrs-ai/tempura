@@ -124,8 +124,9 @@ impl DualPipelineRunner {
     /// Compare two `MatMulQ` implementations on Q4K workloads.
     ///
     /// `rel_tol` is the maximum permissible relative error between outputs.
-    /// Use 0.02 (2%) when one side uses Q8 activation quantization (ref↔SIMD);
-    /// use 0.05 (5%) when comparing CPU↔GPU (additional FP16 rounding on GPU).
+    /// Use 0.02 (2%) for CPU ref ↔ SIMD opt (CpuMatMulQ4KOpt): Q8 activation quantization error.
+    /// Use 0.001 (0.1%) for CPU ref ↔ GPU (CutileQuantizedGemm): reduction-order rounding only;
+    /// the Verus-proven formal bound is 0.01% (max_relative_error = 0.0001).
     pub fn compare_q4k(
         &self,
         name: &str,
@@ -722,7 +723,7 @@ mod tests {
     use tempura_kernels::rope::CpuRoPE;
 
     #[test]
-    fn test_identical_attention_zero_divergence() {
+    fn attention_self_identical() {
         let runner = DualPipelineRunner::new(1e-6);
         let cpu = CpuAttention;
         let configs = test_generators::attention_configs();
@@ -735,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identical_matmul_zero_divergence() {
+    fn matmul_self_identical() {
         let runner = DualPipelineRunner::new(1e-6);
         let cpu = CpuMatMul;
         let configs = test_generators::matmul_configs();
@@ -747,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identical_rmsnorm_zero_divergence() {
+    fn rmsnorm_self_identical() {
         let runner = DualPipelineRunner::new(1e-6);
         let cpu = CpuRMSNorm;
         let configs = test_generators::rmsnorm_configs();
@@ -756,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identical_rope_zero_divergence() {
+    fn rope_self_identical() {
         let runner = DualPipelineRunner::new(1e-6);
         let cpu = CpuRoPE;
         let configs = test_generators::rope_configs();
@@ -765,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn test_q6k_ref_vs_opt_dual_pipeline() {
+    fn q6k_cpu_ref_vs_opt() {
         use tempura_kernels::quantized::{CpuMatMulQ4K, CpuMatMulQ4KOpt};
         let runner = DualPipelineRunner::new(1e-6);
         let ref_k = CpuMatMulQ4K;
@@ -784,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn test_report_serializes_to_json() {
+    fn report_serializes_to_json() {
         let runner = DualPipelineRunner::default();
         let cpu = CpuAttention;
         let configs = vec![test_generators::attention_configs()[0].clone()];
