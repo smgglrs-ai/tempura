@@ -1844,11 +1844,12 @@ impl CutileGpuModel {
         let a_flat = Arc::clone(a)
             .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::cutile_quantized_gemm::Q6K_QK)])
             .expect("gemm_q6k_d2d: reshape [1, stride] → [stride] failed");
-        // Prefer the oxide warp-shuffle kernel; fall back to cuTile.
+        // Prefer kpar (v3, 8 warps/block → 100% SM occupancy) when available,
+        // else fall back to v2, then cuTile.
         if let Some(oxide) = &self.oxide_q6k_gemv {
             return oxide
-                .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
-                .expect("OxideQ6kGemv::forward_d2d failed");
+                .forward_kpar_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                .expect("OxideQ6kGemv::forward_kpar_d2d failed");
         }
         self.q6k_gemv
             .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
