@@ -151,7 +151,7 @@ struct DeviceWeightQ2 {
 
 /// Q6_K quantized weight tensor resident on the GPU.
 ///
-/// Packed format: [n × k_blocks × Q6K_PACKED_U32S] u32 elements.
+/// Packed format: [n × k_blocks × Q6K_PACKED_U32S] u32 elements (53 u32/block, native ql+qh).
 /// Each block of 256 elements occupies 81 u32 slots:
 ///   slot 0       : f32 bits of block super-scale d (f16 → f32 at upload)
 ///   slots 1..17  : f32 bits of 16 per-group scales (i8 → f32 at upload)
@@ -527,11 +527,14 @@ impl CutileGpuModel {
 
     /// Upload a Q6_K weight in packed GPU format (no f32 dequantization).
     ///
-    /// Converts the raw Q6_K bytes to the 81-u32-per-block GPU layout:
+    /// Converts the raw Q6_K bytes to the 53-u32-per-block compact GPU layout:
     ///   u32[0]      = f32 bits of block super-scale d (f16 → f32)
-    ///   u32[1..17]  = 16 f32 bits of group scales (i8 → f32 preconverted)
-    ///   u32[17..81] = 64 u32 words of q_full bytes (4 per word, values 0..63)
+    ///   u32[1..5]   = 4 u32 words: 16 group scales as bias-128 u8 (4 per u32)
+    ///                 stored_byte = (scale_i8 as i32 + 128) as u8
+    ///   u32[5..37]  = 32 u32 words: ql[0..128] in native GGUF order (4 per u32)
+    ///   u32[37..53] = 16 u32 words: qh[0..64] in native GGUF order (4 per u32)
     ///
+    /// Saves 35% DRAM vs the old 81-u32 expanded q_full format.
     /// Returns `false` (and does nothing) when the tensor is absent.
     fn maybe_upload_q6k(
         stream: &std::sync::Arc<cuda_core::Stream>,
@@ -571,34 +574,35 @@ impl CutileGpuModel {
                 // Slot 0: block super-scale as f32 bit pattern.
                 packed.push(d_f32.to_bits());
 
-                // Slots 1..17: 16 group scales (i8 → f32).
-                for k_g in 0..16usize {
-                    let s_f32 = (scales[k_g] as i8) as f32;
-                    packed.push(s_f32.to_bits());
+                // Slots 1..5: 16 group scales as bias-128 u8, 4 per u32.
+                for w in 0..4usize {
+                    let b0 = ((scales[w * 4] as i8) as i32 + 128) as u8;
+                    let b1 = ((scales[w * 4 + 1] as i8) as i32 + 128) as u8;
+                    let b2 = ((scales[w * 4 + 2] as i8) as i32 + 128) as u8;
+                    let b3 = ((scales[w * 4 + 3] as i8) as i32 + 128) as u8;
+                    packed.push(
+                        (b0 as u32)
+                            | ((b1 as u32) << 8)
+                            | ((b2 as u32) << 16)
+                            | ((b3 as u32) << 24),
+                    );
                 }
 
-                // Slots 17..81: 64 u32 words of q_full bytes in output element order.
-                let mut q_full = [0u8; 256];
-                for half in 0..2usize {
-                    for l in 0..32usize {
-                        let ql_l = ql[half * 64 + l] as u32;
-                        let ql_l32 = ql[half * 64 + l + 32] as u32;
-                        let qh_l = qh[half * 32 + l] as u32;
-                        q_full[half * 128 + l] =
-                            ((ql_l & 0xF) | ((qh_l & 3) << 4)) as u8;
-                        q_full[half * 128 + l + 32] =
-                            ((ql_l32 & 0xF) | (((qh_l >> 2) & 3) << 4)) as u8;
-                        q_full[half * 128 + l + 64] =
-                            ((ql_l >> 4) | (((qh_l >> 4) & 3) << 4)) as u8;
-                        q_full[half * 128 + l + 96] =
-                            ((ql_l32 >> 4) | (((qh_l >> 6) & 3) << 4)) as u8;
-                    }
+                // Slots 5..37: ql[0..128] packed 4 u8 per u32 (native GGUF order).
+                for i in 0..32usize {
+                    let w = (ql[i * 4] as u32)
+                        | ((ql[i * 4 + 1] as u32) << 8)
+                        | ((ql[i * 4 + 2] as u32) << 16)
+                        | ((ql[i * 4 + 3] as u32) << 24);
+                    packed.push(w);
                 }
-                for i in 0..64usize {
-                    let w = (q_full[i * 4] as u32)
-                        | ((q_full[i * 4 + 1] as u32) << 8)
-                        | ((q_full[i * 4 + 2] as u32) << 16)
-                        | ((q_full[i * 4 + 3] as u32) << 24);
+
+                // Slots 37..53: qh[0..64] packed 4 u8 per u32 (native GGUF order).
+                for i in 0..16usize {
+                    let w = (qh[i * 4] as u32)
+                        | ((qh[i * 4 + 1] as u32) << 8)
+                        | ((qh[i * 4 + 2] as u32) << 16)
+                        | ((qh[i * 4 + 3] as u32) << 24);
                     packed.push(w);
                 }
             }
@@ -2295,7 +2299,7 @@ impl CutileGpuModel {
                     .expect("gemm_any_d2d_slot Q4_K prefill GEMM failed");
             }
 
-            // Q6_K prefill: reconstruct f32 from packed GPU format.
+            // Q6_K prefill: reconstruct f32 from packed GPU format (53 u32/block, ql+qh).
             if let Some(dw) = self.device_weights_q6k.get(weight_name) {
                 let k = dw.k_blocks * Q6K_QK;
                 let packed_host: Vec<u32> = Arc::clone(&dw.tensor)
@@ -2308,16 +2312,29 @@ impl CutileGpuModel {
                         let base = (row * dw.k_blocks + blk) * Q6K_PACKED_U32S;
                         let d = f32::from_bits(packed_host[base]);
                         let k_base = blk * Q6K_QK;
-                        for group in 0..16usize {
-                            let sc = f32::from_bits(packed_host[base + 1 + group]);
-                            for word in 0..4usize {
-                                let word_data = packed_host[base + 17 + group * 4 + word];
-                                for byte_pos in 0..4usize {
-                                    let q = ((word_data >> (byte_pos * 8)) & 0xFF) as f32 - 32.0;
-                                    let idx = row * k + k_base + group * 16 + word * 4 + byte_pos;
-                                    f32_weights[idx] = d * sc * q;
-                                }
-                            }
+                        for within in 0..256usize {
+                            let half  = within / 128;
+                            let sub   = (within % 128) / 32;
+                            let l     = within % 32;
+                            let group = within / 16;
+
+                            let sc_word = packed_host[base + 1 + group / 4];
+                            let sc_byte = ((sc_word >> ((group % 4) * 8)) & 0xFF) as u8;
+                            let sc = sc_byte as f32 - 128.0;
+
+                            let ql_byte_idx = half * 64 + l + (sub % 2) * 32;
+                            let ql_u32 = packed_host[base + 5 + ql_byte_idx / 4];
+                            let ql_byte = ((ql_u32 >> ((ql_byte_idx % 4) * 8)) & 0xFF) as u8;
+                            let lo = (ql_byte >> ((sub / 2) * 4)) & 0xF;
+
+                            let qh_byte_idx = half * 32 + l;
+                            let qh_u32 = packed_host[base + 37 + qh_byte_idx / 4];
+                            let qh_byte = ((qh_u32 >> ((qh_byte_idx % 4) * 8)) & 0xFF) as u8;
+                            let hi = (qh_byte >> (sub * 2)) & 0x3;
+
+                            let q6 = lo | (hi << 4);
+                            let idx = row * k + k_base + within;
+                            f32_weights[idx] = d * sc * (q6 as f32 - 32.0);
                         }
                     }
                 }

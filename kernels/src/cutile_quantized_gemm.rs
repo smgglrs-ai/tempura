@@ -16,14 +16,23 @@ use std::sync::Arc;
 //   [208..210] d      (f16 super-scale)
 // Dequant: q_full = (ql[i/2] >> 4*(i%2) & 0xF) | (qh bits << 4); weight = d × scale[g] × (q_full − 32)
 //
-// GPU packed format (81 u32 per block):
+// GPU packed format (53 u32 per block, native ql+qh layout):
 //   u32[0]      = f32 bits of d (f16 → f32 at upload time)
-//   u32[1..17]  = 16 u32s, f32 bits of each i8 group scale (preconverted at upload time)
-//   u32[17..81] = 64 u32s of q_full bytes: q_full[i] packed 4 per u32 in output element order
-//                 element i occupies byte (i%4) of u32[(i/4)]
-//                 q_full ∈ [0, 63]; weight = d × scale[i/16] × (q_full − 32)
+//   u32[1..5]   = 4 u32s, 16 group scales packed as bias-128 u8 (4 per u32)
+//                 stored_byte = (scale_i8 as i32 + 128) as u8
+//                 decode: sc_f32 = bitcast(stored | 0x4B000000) − 8388736.0
+//   u32[5..37]  = 32 u32s of ql[0..128] (native GGUF order, 4 u8 per u32)
+//   u32[37..53] = 16 u32s of qh[0..64] (native GGUF order, 4 u8 per u32)
+//
+// Dequant for element within ∈ [0,255]:
+//   half = within/128, sub = (within%128)/32, l = within%32, group = within/16
+//   ql_byte_idx = half*64 + l + (sub%2)*32
+//   lo = (ql[ql_byte_idx] >> ((sub/2)*4)) & 0xF
+//   qh_byte_idx = half*32 + l
+//   hi = (qh[qh_byte_idx] >> (sub*2)) & 0x3
+//   q6 = lo | (hi<<4); weight = d × scale[group] × (q6 − 32)
 pub const Q6K_QK: usize = 256;
-pub const Q6K_PACKED_U32S: usize = 81; // 1 + 16 + 64 = 81
+pub const Q6K_PACKED_U32S: usize = 53; // 1 (d) + 4 (scales) + 32 (ql) + 16 (qh) = 53
 
 // ── Q2_0 block layout constants ──────────────────────────────────────────────
 // Q2_0 (PrismML): 2-bit quantized, 128 elements per block, 34 bytes per block
@@ -193,7 +202,7 @@ pub mod kernels {
     /// `MAP_SHAPE: [i32; 2]` = `[1, BN]`, bypassing the cuTile 0.4.0 restriction
     /// that rank-1 tile maps must be `[1]`. Reduces kernel launch overhead by BN×.
     ///
-    /// Packed layout: same as `cutile_q6k_gemv` — `[N × K_BLOCKS × 81]` u32.
+    /// Packed layout: same as `cutile_q6k_gemv` — `[N × K_BLOCKS × 53]` u32.
     ///
     /// Grid: N/BN programs. MAP_SHAPE = [1, BN]: each program iterates BN tiles.
     /// Dispatch: output tensor must be reshaped to `[1, N]` and partitioned `[1, 1]`
@@ -206,38 +215,80 @@ pub mod kernels {
     ) {
         let part_x = x.partition(shape![1, 1]);
         let part_p = packed.partition(shape![1, 1]);
-        let magic: Tile<u32, { [1, 1] }> = broadcast_scalar(0x4B000000_u32, shape![1, 1]);
-        let mask_ff: Tile<u32, { [1, 1] }> = broadcast_scalar(0xFF_u32, shape![1, 1]);
-        let center: Tile<f32, { [1, 1] }> = broadcast_scalar(8388640.0_f32, shape![1, 1]);
+        // q6 ∈ [0,63]: bitcast(q6 | 0x4B000000) − 8388640.0 → q6−32 ∈ [−32,31]
+        let magic:     Tile<u32, { [1, 1] }> = broadcast_scalar(0x4B000000_u32, shape![1, 1]);
+        let mask_ff:   Tile<u32, { [1, 1] }> = broadcast_scalar(0xFF_u32, shape![1, 1]);
+        let mask_0f:   Tile<u32, { [1, 1] }> = broadcast_scalar(0x0F_u32, shape![1, 1]);
+        let mask_03:   Tile<u32, { [1, 1] }> = broadcast_scalar(0x03_u32, shape![1, 1]);
+        let center:    Tile<f32, { [1, 1] }> = broadcast_scalar(8388640.0_f32, shape![1, 1]);
+        // scale bias-128 decode: bitcast(sc | 0x4B000000) − 8388736.0 → sc_i8 ∈ [−128,127]
+        let sc_center: Tile<f32, { [1, 1] }> = broadcast_scalar(8388736.0_f32, shape![1, 1]);
+        let sixteen:   Tile<u32, { [1, 1] }> = broadcast_scalar(16u32, shape![1, 1]);
 
         for index in z.iter_indices() {
             let (_, n) = index.components();
             let mut acc: Tile<f32, { [1, 1] }> = broadcast_scalar(0.0_f32, shape![1, 1]);
 
             for blk in 0i32..K_BLOCKS {
-                let pack_base = n * K_BLOCKS * 81 + blk * 81;
+                let pack_base = n * K_BLOCKS * 53 + blk * 53;
                 let x_base = blk * 256;
 
                 let d_u32: Tile<u32, { [1, 1] }> = part_p.load([0, pack_base]);
                 let d: Tile<f32, { [1, 1] }> = bitcast(d_u32);
 
                 for group in 0i32..16 {
-                    let sc_u32: Tile<u32, { [1, 1] }> = part_p.load([0, pack_base + 1 + group]);
-                    let sc: Tile<f32, { [1, 1] }> = bitcast(sc_u32);
+                    let half = group / 8;
+                    let sub  = (group % 8) / 2;
+
+                    // Scale: bias-128 u8 in u32[1 + group/4], byte (group%4)
+                    let sc_word: Tile<u32, { [1, 1] }> =
+                        part_p.load([0, pack_base + 1 + group / 4]);
+                    let sc_shift = (group % 4 * 8) as u32;
+                    let sc_byte: Tile<u32, { [1, 1] }> =
+                        andi(shri(sc_word, broadcast_scalar(sc_shift, shape![1, 1])), mask_ff);
+                    let sc: Tile<f32, { [1, 1] }> = bitcast(ori(sc_byte, magic)) - sc_center;
                     let d_sc: Tile<f32, { [1, 1] }> = d * sc;
 
+                    // ql u32 base: ql section starts at +5; half*16 + (sub%2)*8 u32 offset
+                    let ql_u32_base = pack_base + 5 + half * 16 + (sub % 2) * 8;
+                    // qh u32 base: qh section starts at +37; half*8 u32 offset
+                    let qh_u32_base = pack_base + 37 + half * 8;
+                    // nibble shift: sub<2 → lo nibble (shift=0), sub>=2 → hi nibble (shift=4)
+                    let nibble_shift = ((sub / 2) * 4) as u32;
+                    // qh bit shift: sub*2 (0,2,4,6)
+                    let qh_shift = (sub * 2) as u32;
+                    // l_base: (group%2)*16 elements offset within this sub's ql/qh section
+                    let l_base = group % 2 * 16;
+                    let ql_word_start = ql_u32_base + l_base / 4;
+                    let qh_word_start = qh_u32_base + l_base / 4;
+
                     for word in 0i32..4 {
-                        let word_data: Tile<u32, { [1, 1] }> =
-                            part_p.load([0, pack_base + 17 + group * 4 + word]);
+                        let ql_word: Tile<u32, { [1, 1] }> =
+                            part_p.load([0, ql_word_start + word]);
+                        let qh_word: Tile<u32, { [1, 1] }> =
+                            part_p.load([0, qh_word_start + word]);
                         let x_elem_base = x_base + group * 16 + word * 4;
 
                         for byte_pos in 0i32..4 {
                             let shift: Tile<u32, { [1, 1] }> =
                                 broadcast_scalar((byte_pos * 8) as u32, shape![1, 1]);
-                            let q_u32: Tile<u32, { [1, 1] }> =
-                                andi(shri(word_data, shift), mask_ff);
-                            let q_f32: Tile<f32, { [1, 1] }> =
-                                bitcast(ori(q_u32, magic)) - center;
+                            // Extract ql nibble
+                            let ql_byte: Tile<u32, { [1, 1] }> =
+                                andi(shri(ql_word, shift), mask_ff);
+                            let lo: Tile<u32, { [1, 1] }> = andi(
+                                shri(ql_byte, broadcast_scalar(nibble_shift, shape![1, 1])),
+                                mask_0f,
+                            );
+                            // Extract qh 2-bit field
+                            let qh_byte: Tile<u32, { [1, 1] }> =
+                                andi(shri(qh_word, shift), mask_ff);
+                            let hi: Tile<u32, { [1, 1] }> = andi(
+                                shri(qh_byte, broadcast_scalar(qh_shift, shape![1, 1])),
+                                mask_03,
+                            );
+                            // q6 = lo | (hi<<4); since ranges don't overlap, lo + hi*16 == lo | (hi<<4)
+                            let q6: Tile<u32, { [1, 1] }> = lo + hi * sixteen;
+                            let q_f32: Tile<f32, { [1, 1] }> = bitcast(ori(q6, magic)) - center;
                             let x_val: Tile<f32, { [1, 1] }> =
                                 part_x.load([0, x_elem_base + byte_pos]);
                             acc = acc + d_sc * q_f32 * x_val;
@@ -251,12 +302,12 @@ pub mod kernels {
 
     /// Q6_K dequantized GEMV: z[1] = Σ_k dequant(packed[pid_n, k]) × x[k]
     ///
-    /// Packed layout: [N × K_BLOCKS × Q6K_PACKED_U32S] u32
+    /// Packed layout: [N × K_BLOCKS × Q6K_PACKED_U32S] u32 (53 u32/block)
     ///   packed[n, blk, 0]       = f32 bits of d (block super-scale)
-    ///   packed[n, blk, 1..17]   = f32 bits of 16 group scales (i8 → f32 at upload)
-    ///   packed[n, blk, 17..81]  = 64 u32 words of q_full values (4 bytes per u32)
-    ///     byte j of word w = q_full[blk*256 + w*4 + j], q_full ∈ [0, 63]
-    ///     dequant: d × scale[group] × (q_full − 32), group = elem / 16
+    ///   packed[n, blk, 1..5]    = 4 u32 words: 16 group scales as bias-128 u8 (4/u32)
+    ///   packed[n, blk, 5..37]   = 32 u32 words: ql[0..128] native GGUF order
+    ///   packed[n, blk, 37..53]  = 16 u32 words: qh[0..64] native GGUF order
+    ///   dequant: within→(half,sub,l,group); lo+hi nibbles→q6 ∈[0,63]; d×sc×(q6-32)
     ///
     /// Grid: (N, 1, 1) — one program per output neuron.
     #[cutile::entry(optimization_hints = (sm_120 = (vec_width = 4,)))]
@@ -270,47 +321,75 @@ pub mod kernels {
         let part_p = packed.partition(shape![1]);
         let mut acc: Tile<f32, { [1] }> = broadcast_scalar(0.0_f32, shape![1]);
 
-        // IEEE 754 trick: bitcast(q | 0x4B000000) - 8388640.0 maps
-        // q ∈ [0, 63] to (q - 32) ∈ [−32, 31] as float.
-        // 0x4B000000 = 2^23 as f32; 8388608 + 32 = 8388640.
-        let magic: Tile<u32, { [1] }> = broadcast_scalar(0x4B000000_u32, shape![1]);
-        let mask_ff: Tile<u32, { [1] }> = broadcast_scalar(0xFF_u32, shape![1]);
-        let center: Tile<f32, { [1] }> = broadcast_scalar(8388640.0_f32, shape![1]);
+        // q6 ∈ [0,63]: bitcast(q6 | 0x4B000000) − 8388640.0 → q6−32 ∈ [−32,31]
+        let magic:     Tile<u32, { [1] }> = broadcast_scalar(0x4B000000_u32, shape![1]);
+        let mask_ff:   Tile<u32, { [1] }> = broadcast_scalar(0xFF_u32, shape![1]);
+        let mask_0f:   Tile<u32, { [1] }> = broadcast_scalar(0x0F_u32, shape![1]);
+        let mask_03:   Tile<u32, { [1] }> = broadcast_scalar(0x03_u32, shape![1]);
+        let center:    Tile<f32, { [1] }> = broadcast_scalar(8388640.0_f32, shape![1]);
+        // scale bias-128 decode: bitcast(sc | 0x4B000000) − 8388736.0 → sc_i8 ∈ [−128,127]
+        let sc_center: Tile<f32, { [1] }> = broadcast_scalar(8388736.0_f32, shape![1]);
+        let sixteen:   Tile<u32, { [1] }> = broadcast_scalar(16u32, shape![1]);
 
         for blk in 0i32..K_BLOCKS {
-            // pack_base: start of this block's 81-u32 region for neuron pid_n.
-            let pack_base = pid_n * K_BLOCKS * 81 + blk * 81;
+            // pack_base: start of this block's 53-u32 region for neuron pid_n.
+            let pack_base = pid_n * K_BLOCKS * 53 + blk * 53;
             let x_base = blk * 256;
 
-            // Block super-scale d stored as f32 bit pattern in slot 0.
             let d_u32: Tile<u32, { [1] }> = part_p.load([pack_base]);
             let d: Tile<f32, { [1] }> = bitcast(d_u32);
 
             // 16 groups of 16 elements; group index == element_index / 16.
             for group in 0i32..16 {
-                // Group scale (slots 1..17, preconverted from i8 to f32 on CPU).
-                let sc_u32: Tile<u32, { [1] }> = part_p.load([pack_base + 1 + group]);
-                let sc: Tile<f32, { [1] }> = bitcast(sc_u32);
+                let half = group / 8;    // 0 or 1
+                let sub  = (group % 8) / 2;  // 0..3
+
+                // Scale: bias-128 encoded u8 in u32[1 + group/4], byte (group%4)
+                let sc_word: Tile<u32, { [1] }> = part_p.load([pack_base + 1 + group / 4]);
+                let sc_shift = (group % 4 * 8) as u32;
+                let sc_byte: Tile<u32, { [1] }> =
+                    andi(shri(sc_word, broadcast_scalar(sc_shift, shape![1])), mask_ff);
+                let sc: Tile<f32, { [1] }> = bitcast(ori(sc_byte, magic)) - sc_center;
                 let d_sc: Tile<f32, { [1] }> = d * sc;
 
-                // 4 u32 words per group (slots 17..81, 4 q_full bytes per word).
+                // ql base: ql section at +5; half*16 + (sub%2)*8 selects the right 32-byte span
+                let ql_u32_base = pack_base + 5 + half * 16 + (sub % 2) * 8;
+                // qh base: qh section at +37; half*8 selects the right 32-byte span
+                let qh_u32_base = pack_base + 37 + half * 8;
+                // nibble shift: sub<2 → lo nibble (0), sub>=2 → hi nibble (4)
+                let nibble_shift = ((sub / 2) * 4) as u32;
+                // qh bit shift: sub*2 extracts the 2 bits for this sub-group
+                let qh_shift = (sub * 2) as u32;
+                // l_base = (group%2)*16: offset within the 32-element span for this group
+                let l_base = group % 2 * 16;
+                let ql_word_start = ql_u32_base + l_base / 4;
+                let qh_word_start = qh_u32_base + l_base / 4;
+
+                // 4 u32 words cover the 16 elements of this group.
                 for word in 0i32..4 {
-                    let word_data: Tile<u32, { [1] }> =
-                        part_p.load([pack_base + 17 + group * 4 + word]);
+                    let ql_word: Tile<u32, { [1] }> = part_p.load([ql_word_start + word]);
+                    let qh_word: Tile<u32, { [1] }> = part_p.load([qh_word_start + word]);
                     let x_elem_base = x_base + group * 16 + word * 4;
 
-                    // 4 elements (bytes) per word.
                     for byte_pos in 0i32..4 {
                         let shift: Tile<u32, { [1] }> =
                             broadcast_scalar((byte_pos * 8) as u32, shape![1]);
-                        // Extract q_full byte in [0, 63].
-                        let q_u32: Tile<u32, { [1] }> =
-                            andi(shri(word_data, shift), mask_ff);
-                        // IEEE trick: (q_full − 32) as f32.
-                        let q_f32: Tile<f32, { [1] }> =
-                            bitcast(ori(q_u32, magic)) - center;
-                        let x_val: Tile<f32, { [1] }> =
-                            part_x.load([x_elem_base + byte_pos]);
+                        // Extract ql byte, select nibble (lo or hi depending on sub)
+                        let ql_byte: Tile<u32, { [1] }> = andi(shri(ql_word, shift), mask_ff);
+                        let lo: Tile<u32, { [1] }> = andi(
+                            shri(ql_byte, broadcast_scalar(nibble_shift, shape![1])),
+                            mask_0f,
+                        );
+                        // Extract qh byte, select 2-bit field
+                        let qh_byte: Tile<u32, { [1] }> = andi(shri(qh_word, shift), mask_ff);
+                        let hi: Tile<u32, { [1] }> = andi(
+                            shri(qh_byte, broadcast_scalar(qh_shift, shape![1])),
+                            mask_03,
+                        );
+                        // q6 ∈ [0,63]: lo | (hi<<4). Ranges don't overlap → + == |
+                        let q6: Tile<u32, { [1] }> = lo + hi * sixteen;
+                        let q_f32: Tile<f32, { [1] }> = bitcast(ori(q6, magic)) - center;
+                        let x_val: Tile<f32, { [1] }> = part_x.load([x_elem_base + byte_pos]);
                         acc = acc + d_sc * q_f32 * x_val;
                     }
                 }
@@ -1646,7 +1725,10 @@ mod tests {
         block
     }
 
-    /// Pack a Q6_K raw block into the 81-u32 GPU format used by `cutile_q6k_gemv`.
+    /// Pack a Q6_K raw block into the 53-u32 compact GPU format.
+    ///
+    /// Layout: u32[0] = d as f32 | u32[1..5] = 16 scales as bias-128 u8 |
+    ///         u32[5..37] = ql[0..128] | u32[37..53] = qh[0..64]
     fn pack_q6k_block(block: &[u8]) -> Vec<u32> {
         assert_eq!(block.len(), Q6K_BLOCK_BYTES);
         let d_bits = u16::from_le_bytes([block[208], block[209]]);
@@ -1661,35 +1743,36 @@ mod tests {
         // slot 0: d as f32
         packed.push(d_f32.to_bits());
 
-        // slots 1..17: 16 group scales as f32
-        for k in 0..16usize {
-            let s_f32 = (scales[k] as i8) as f32;
-            packed.push(s_f32.to_bits());
+        // slots 1..5: 16 group scales packed as bias-128 u8 (4 per u32)
+        // bias-128: stored = (scale_i8 as i32 + 128) as u8; decode: (byte as f32) - 128.0
+        for w in 0..4usize {
+            let b0 = ((scales[w * 4] as i8) as i32 + 128) as u8;
+            let b1 = ((scales[w * 4 + 1] as i8) as i32 + 128) as u8;
+            let b2 = ((scales[w * 4 + 2] as i8) as i32 + 128) as u8;
+            let b3 = ((scales[w * 4 + 3] as i8) as i32 + 128) as u8;
+            packed.push(
+                (b0 as u32)
+                    | ((b1 as u32) << 8)
+                    | ((b2 as u32) << 16)
+                    | ((b3 as u32) << 24),
+            );
         }
 
-        // slots 17..81: 64 u32 words of q_full bytes in output element order
-        // Precompute q_full[i] for i in 0..256 using the Q6K layout.
-        let mut q_full = [0u8; 256];
-        for half in 0..2usize {
-            for l in 0..32usize {
-                let ql_l = ql[half * 64 + l] as u32;
-                let ql_l32 = ql[half * 64 + l + 32] as u32;
-                let qh_l = qh[half * 32 + l] as u32;
-                q_full[half * 128 + l] =
-                    ((ql_l & 0xF) | ((qh_l & 3) << 4)) as u8; // sub=0
-                q_full[half * 128 + l + 32] =
-                    ((ql_l32 & 0xF) | (((qh_l >> 2) & 3) << 4)) as u8; // sub=1
-                q_full[half * 128 + l + 64] =
-                    ((ql_l >> 4) | (((qh_l >> 4) & 3) << 4)) as u8; // sub=2
-                q_full[half * 128 + l + 96] =
-                    ((ql_l32 >> 4) | (((qh_l >> 6) & 3) << 4)) as u8; // sub=3
-            }
+        // slots 5..37: ql[0..128] packed 4 u8 per u32 (native GGUF order)
+        for i in 0..32usize {
+            let w = (ql[i * 4] as u32)
+                | ((ql[i * 4 + 1] as u32) << 8)
+                | ((ql[i * 4 + 2] as u32) << 16)
+                | ((ql[i * 4 + 3] as u32) << 24);
+            packed.push(w);
         }
-        for i in 0..64usize {
-            let w = (q_full[i * 4] as u32)
-                | ((q_full[i * 4 + 1] as u32) << 8)
-                | ((q_full[i * 4 + 2] as u32) << 16)
-                | ((q_full[i * 4 + 3] as u32) << 24);
+
+        // slots 37..53: qh[0..64] packed 4 u8 per u32 (native GGUF order)
+        for i in 0..16usize {
+            let w = (qh[i * 4] as u32)
+                | ((qh[i * 4 + 1] as u32) << 8)
+                | ((qh[i * 4 + 2] as u32) << 16)
+                | ((qh[i * 4 + 3] as u32) << 24);
             packed.push(w);
         }
 
@@ -1718,33 +1801,66 @@ mod tests {
             "cpu dot={cpu_dot} expected={expected}"
         );
 
-        // Verify packed format: q_full bytes should all be q_val.
+        // Verify packed format with the new 53-u32 compact layout.
         let packed = pack_q6k_block(&block);
         assert_eq!(packed.len(), Q6K_PACKED_U32S);
-        // d slot
+        // slot 0: d
         assert!(
             (f32::from_bits(packed[0]) - d).abs() < 1e-4,
             "d mismatch: {}",
             f32::from_bits(packed[0])
         );
-        // scale slots: all group_sc as f32
-        for k in 1..17usize {
-            let got = f32::from_bits(packed[k]);
-            assert!(
-                (got - group_sc as f32).abs() < 1e-6,
-                "scale[{}]={} expected {}",
-                k - 1,
-                got,
-                group_sc
-            );
-        }
-        // q_full bytes: all should equal q_val
-        for w in 17..81usize {
+        // slots 1..5: bias-128 scales; all should decode to group_sc
+        for w in 1..5usize {
             let word = packed[w];
             for bp in 0..4usize {
                 let byte = ((word >> (bp * 8)) & 0xFF) as u8;
-                assert_eq!(byte, q_val, "q_full[{}] mismatch", (w - 17) * 4 + bp);
+                let decoded = byte as f32 - 128.0;
+                assert!(
+                    (decoded - group_sc as f32).abs() < 1e-6,
+                    "scale[{}]={} expected {}",
+                    (w - 1) * 4 + bp,
+                    decoded,
+                    group_sc
+                );
             }
+        }
+        // Verify dequant: recompute all 256 weights from packed ql+qh and compare to CPU.
+        let mut dequanted_from_packed = vec![0.0f32; Q6K_BLOCK_SIZE];
+        let d_packed = f32::from_bits(packed[0]);
+        for within in 0..256usize {
+            let half = within / 128;
+            let sub  = (within % 128) / 32;
+            let l    = within % 32;
+            let group = within / 16;
+
+            let sc_word = packed[1 + group / 4];
+            let sc_byte = ((sc_word >> ((group % 4) * 8)) & 0xFF) as u8;
+            let sc = sc_byte as f32 - 128.0;
+
+            let ql_byte_idx = half * 64 + l + (sub % 2) * 32;
+            let ql_u32 = packed[5 + ql_byte_idx / 4];
+            let ql_byte = ((ql_u32 >> ((ql_byte_idx % 4) * 8)) & 0xFF) as u8;
+            let lo = (ql_byte >> ((sub / 2) * 4)) & 0xF;
+
+            let qh_byte_idx = half * 32 + l;
+            let qh_u32 = packed[37 + qh_byte_idx / 4];
+            let qh_byte = ((qh_u32 >> ((qh_byte_idx % 4) * 8)) & 0xFF) as u8;
+            let hi = (qh_byte >> (sub * 2)) & 0x3;
+
+            let q6 = lo | (hi << 4);
+            dequanted_from_packed[within] = d_packed * sc * (q6 as f32 - 32.0);
+        }
+        let mut dequanted_cpu = vec![0.0f32; Q6K_BLOCK_SIZE];
+        dequant_q6k_block(&block, &mut dequanted_cpu);
+        for i in 0..Q6K_BLOCK_SIZE {
+            assert!(
+                (dequanted_from_packed[i] - dequanted_cpu[i]).abs() < 1e-3,
+                "packed dequant[{i}]={} vs cpu={} (q_val={})",
+                dequanted_from_packed[i],
+                dequanted_cpu[i],
+                q_val
+            );
         }
     }
 
