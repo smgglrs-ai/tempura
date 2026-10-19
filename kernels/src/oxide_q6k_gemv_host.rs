@@ -5,16 +5,19 @@
 /// it to `$OUT_DIR/oxide_q6k_gemv.ptx`. This module embeds that PTX at
 /// compile time and loads it into the CUDA driver at runtime.
 ///
-/// ## Kernel design
+/// ## Kernel design (v3)
 ///
 /// ```text
-/// Grid:  ceil(N / WARPS_PER_BLOCK) blocks
-/// Block: WARPS_PER_BLOCK * 32 = 128 threads
+/// Grid:  N blocks  — one block per output neuron
+/// Block: 32 threads — one warp per block
 /// ```
 ///
-/// Each 32-thread warp computes ONE output neuron via stride-32 strided
-/// accumulation followed by a butterfly warp-reduce (5× `shfl.sync.bfly`).
-/// Lane 0 of each warp writes the final sum to `out[n_out]`.
+/// Each 32-thread warp (= 1 block) computes ONE output neuron via the
+/// 8-step unrolled Q6_K dequant loop (shfl d broadcast, cached ql/qh),
+/// followed by a butterfly warp-reduce. Lane 0 writes `out[blockIdx.x]`.
+///
+/// Occupancy: N=4096 → 4096 blocks / 170 SMs → 24 blocks/SM → register-capped
+/// at 16 blocks/SM → 64 warps/SM → 100% occupancy (v2 had 6 blocks/SM, 37.5%).
 ///
 /// ## PTX parameter layout
 ///
@@ -40,9 +43,12 @@ use std::sync::Arc;
 #[cfg(feature = "oxide-gemv")]
 static OXIDE_Q6K_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oxide_q6k_gemv.ptx"));
 
-const KERNEL_ENTRY: &str = "q6k_gemv_decode_v2";
-const WARPS_PER_BLOCK: u32 = 4;
-const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128
+const KERNEL_ENTRY: &str = "q6k_gemv_decode_v3";
+/// v3: 1 warp per block → grid = N blocks, block = 32 threads.
+/// 4096 blocks / 170 SMs = 24 blocks/SM → 16 blocks/SM (register-limited)
+/// → 16 warps/SM × 4 threads = 64 warps/SM → 100% occupancy (was 24 warps/SM, 37.5%).
+const WARPS_PER_BLOCK: u32 = 1;
+const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 32
 
 /// Launches the oxide-compiled Q6_K GEMV kernel for M=1 decode.
 pub struct OxideQ6kGemv {
