@@ -1848,5 +1848,108 @@ fn main() {
         println!("oxide-gemv-q4k v3 vs v3r agreement: PASSED (max_diff={:.2e})", diff);
     }
 
+    // ── v3r paired-loop test: k_blocks=16 exercises the double-block paired loop ──
+    // k_blocks=1 only tests the tail. Real models use k_blocks=16 (4096/256).
+    // d=1.0, dmin=0.0, sc[i]=1, m[i]=0, nibbles=3, Q8_1 q=1 d8=1.0
+    // Expected: 16 blocks × 256 elements × 3.0 = 12288.0 per neuron
+    {
+        let n: usize = 32;
+        let k_blocks: usize = 16;
+        let k = k_blocks * 256;
+        let k_q8_blocks = k / 32;
+
+        let q8_qs_v: Vec<u32> = vec![0x01010101u32; k_q8_blocks * 8];
+        let q8_ds_v: Vec<u32> = vec![0x00003C00u32; k_q8_blocks];
+
+        // Packed 42-u32 for v3 reference
+        let packed_v3_h: Vec<u32> = {
+            let mut p = vec![0u32; n * k_blocks * 42];
+            for row in 0..n {
+                for blk in 0..k_blocks {
+                    let base = (row * k_blocks + blk) * 42;
+                    p[base]   = 1.0f32.to_bits();
+                    p[base+1] = 0.0f32.to_bits();
+                    for j in 0..4usize { p[base+2+j] = 0x00000101; }
+                    for j in 0..4usize { p[base+6+j] = 0x00000000; }
+                    for w in 0..32usize { p[base+10+w] = 0x33333333; }
+                }
+            }
+            p
+        };
+
+        // Raw GGUF 36-u32 for v3r
+        let packed_v3r_h: Vec<u32> = {
+            let mut p = vec![0u32; n * k_blocks * 36];
+            for row in 0..n {
+                for blk in 0..k_blocks {
+                    let base = (row * k_blocks + blk) * 36;
+                    p[base]   = 0x00003C00u32;  // f16(1.0) | (f16(0.0) << 16)
+                    p[base+1] = 0x01010101u32;  // ps[0..4]=[1,1,1,1] → sc[0..3]=1
+                    p[base+2] = 0x00000000u32;  // ps[4..8]=[0,0,0,0] → m[0..3]=0
+                    p[base+3] = 0x01010101u32;  // ps[8..12]=[1,1,1,1] → sc[4..7]=1, m[4..7]=0
+                    for w in 0..32usize { p[base+4+w] = 0x33333333; }
+                }
+            }
+            p
+        };
+
+        let x_qs_dev  = DeviceBuffer::from_host(&stream, &q8_qs_v).expect("q8_qs upload kb16");
+        let x_ds_dev  = DeviceBuffer::from_host(&stream, &q8_ds_v).expect("q8_ds upload kb16");
+        let pv3_dev   = DeviceBuffer::from_host(&stream, &packed_v3_h).expect("v3 upload kb16");
+        let pv3r_dev  = DeviceBuffer::from_host(&stream, &packed_v3r_h).expect("v3r upload kb16");
+        let mut out_v3  = DeviceBuffer::<f32>::zeroed(&stream, n).expect("out_v3 kb16");
+        let mut out_v3r = DeviceBuffer::<f32>::zeroed(&stream, n).expect("out_v3r kb16");
+
+        let smem_bytes = WARPS_PER_BLOCK * 4 * 4;
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
+            shared_mem_bytes: smem_bytes,
+        };
+        unsafe {
+            module.q4k_gemv_decode_q8_v3(
+                stream.as_ref(), cfg, &mut out_v3,
+                &x_qs_dev, &x_ds_dev, &pv3_dev, n as u32, k_blocks as u32,
+            )
+        }.expect("v3 launch kb16");
+        unsafe {
+            module.q4k_gemv_decode_q8_v3r(
+                stream.as_ref(), cfg, &mut out_v3r,
+                &x_qs_dev, &x_ds_dev, &pv3r_dev, n as u32, k_blocks as u32,
+            )
+        }.expect("v3r launch kb16");
+
+        let r_v3  = out_v3.to_host_vec(&stream).expect("v3 download kb16");
+        let r_v3r = out_v3r.to_host_vec(&stream).expect("v3r download kb16");
+
+        let expected = (k_blocks * 256) as f32 * 3.0;  // 12288.0 for k_blocks=16
+        let e_v3  = r_v3.iter().map(|v| (v - expected).abs()).fold(0.0f32, f32::max);
+        let e_v3r = r_v3r.iter().map(|v| (v - expected).abs()).fold(0.0f32, f32::max);
+        let diff  = r_v3.iter().zip(r_v3r.iter()).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+
+        println!("v3  k_blocks=16 vs expected={}: err={:.4}  first={}", expected, e_v3,  r_v3[0]);
+        println!("v3r k_blocks=16 vs expected={}: err={:.4}  first={}", expected, e_v3r, r_v3r[0]);
+        println!("v3 vs v3r k_blocks=16 max_diff={:.6}", diff);
+
+        if e_v3 > 1.0 {
+            eprintln!("v3 k_blocks=16 FAILED (expected={}, max_err={:.4}, first={})", expected, e_v3, r_v3[0]);
+            std::process::exit(1);
+        }
+        if e_v3r > 1.0 {
+            eprintln!("v3r k_blocks=16 FAILED (expected={}, max_err={:.4}, first={})", expected, e_v3r, r_v3r[0]);
+            eprintln!("  Bug is in the paired LOOP of v3r kernel (not the tail loop)");
+            eprintln!("  v3  first 8: {:?}", &r_v3[..8]);
+            eprintln!("  v3r first 8: {:?}", &r_v3r[..8]);
+            std::process::exit(1);
+        }
+        if diff > 1.0 {
+            eprintln!("v3 vs v3r k_blocks=16 MISMATCH (max_diff={:.4})", diff);
+            eprintln!("  v3  first 8: {:?}", &r_v3[..8]);
+            eprintln!("  v3r first 8: {:?}", &r_v3r[..8]);
+            std::process::exit(1);
+        }
+        println!("oxide-gemv-q4k v3 vs v3r k_blocks=16 (paired loop): PASSED (max_diff={:.2e})", diff);
+    }
+
     println!("oxide-gemv-q4k: all tests PASSED");
 }

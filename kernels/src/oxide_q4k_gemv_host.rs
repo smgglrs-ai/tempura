@@ -174,16 +174,16 @@ impl OxideQ4kGemv {
                 cu_q8_gemv_v2.is_some(),
                 cu_q8_gemv_v3.is_some(),
                 cu_q8_gemv_v3r.is_some(),
-                false, // uses_raw_gguf — v3r dispatching disabled pending correctness debug
+                false, // uses_raw_gguf — see note below
                 cu_batch_gemv.is_some(),
             );
-            // v3r: 36-u32 raw GGUF format. Disabled — kernel produces wrong output.
-            // Root cause not yet identified; code review suggests kernel is correct but
-            // empirical testing (engine-level) shows garbage values. Needs isolated test.
-            // v3r produces wrong output in full model (7 tok/s vs 108 tok/s packed).
-            // Isolated kernel test passes — bug is in scale/format interaction in full model.
-            // TODO: debug by comparing first layer q_proj output v3 vs v3r.
-            let uses_raw_gguf = false; // cu_q8_gemv_v3r.is_some()
+            // v3r: 36-u32 raw GGUF format. Benchmarked and DISABLED (performance regression).
+            // uses_raw_gguf=true benchmarked at 101 tok/s vs 107 tok/s with packed format.
+            // Root cause: on-the-fly 6-bit scale unpacking in v3r adds compute overhead that
+            // exceeds the 14% DRAM bandwidth savings (144 vs 168 bytes/block).
+            // Correctness is verified (tail and paired loops both pass, prefill format-detection
+            // in gemm_any_d2d_slot handles 36-u32 format correctly), but v3 is faster.
+            let uses_raw_gguf = false;
             Some(Self {
                 cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_batch_gemv, cu_colocated, cu_smem, uses_raw_gguf, stream,
                 q8_qs_scratch:  std::cell::RefCell::new(None),
