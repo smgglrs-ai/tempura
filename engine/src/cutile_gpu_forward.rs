@@ -2987,20 +2987,35 @@ impl CutileGpuModel {
                 .expect("post-attention RMSNorm failed");
 
             // FFN gate + up projections.
-            let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE);
-            let up_dev = self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
-
-            // SiLU-gated MLP (GPU, pre-allocated scratch).
-            let gate_silu_n_dev = self
-                .cutile_elementwise
-                .silu_mul_device_scratch(
-                    &gate_dev,
-                    &up_dev,
-                    seq_len,
-                    inter,
-                    &mut self.silu_out_scratch.borrow_mut(),
-                )
-                .expect("SiLU-mul failed");
+            // Decode path: try fused gate+up GEMV with inline SiLU (halves activation DRAM).
+            // Prefill path (seq_len > 1) or non-Q4K: fall through to two separate GEMVs.
+            let gate_silu_n_dev = if seq_len == 1
+                && self.oxide_q4k_gemv.as_ref().map(|o| o.has_fused_silu()).unwrap_or(false)
+                && self.device_weights_q4k.contains_key(gate_w_name.as_str())
+                && self.device_weights_q4k.contains_key(up_w_name.as_str())
+            {
+                let oxide = self.oxide_q4k_gemv.as_ref().unwrap();
+                let gdw = self.device_weights_q4k.get(gate_w_name.as_str()).unwrap();
+                let udw = self.device_weights_q4k.get(up_w_name.as_str()).unwrap();
+                let a_flat = Arc::clone(&normed2_dev)
+                    .reshape(&[next_pow2(gdw.k_blocks * tempura_kernels::Q4K_BLOCK_SIZE)])
+                    .expect("fused silu reshape failed");
+                oxide
+                    .forward_fused_silu_mul_d2d(&a_flat, &gdw.tensor, &udw.tensor, gdw.n, gdw.k_blocks)
+                    .expect("q4k_gemv_fused_silu_mul failed")
+            } else {
+                let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE);
+                let up_dev = self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
+                self.cutile_elementwise
+                    .silu_mul_device_scratch(
+                        &gate_dev,
+                        &up_dev,
+                        seq_len,
+                        inter,
+                        &mut self.silu_out_scratch.borrow_mut(),
+                    )
+                    .expect("SiLU-mul failed")
+            };
 
             // FFN down projection.
             // When inter_pad == inter (power-of-2 models) no padding is needed.

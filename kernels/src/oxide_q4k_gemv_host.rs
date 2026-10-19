@@ -49,6 +49,7 @@ const KERNEL_Q8_GEMV: &str = "q4k_gemv_decode_q8";
 const KERNEL_Q8_GEMV_V2: &str = "q4k_gemv_decode_q8_v2";
 const KERNEL_Q8_GEMV_V3: &str = "q4k_gemv_decode_q8_v3";
 const KERNEL_Q8_GEMV_V3R: &str = "q4k_gemv_decode_q8_v3r"; // raw GGUF 36-u32 format
+const KERNEL_FUSED_SILU: &str = "q4k_gemv_fused_silu_mul"; // fused gate+up+SiLU
 const WARPS_PER_BLOCK: u32 = 4;
 const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128
 
@@ -72,14 +73,18 @@ pub struct OxideQ4kGemv {
     cu_colocated:      Option<CUfunction>,
     /// Optional smem-tiled GEMM: row-0 loads weights into smem, all M rows compute from smem.
     cu_smem:           Option<CUfunction>,
+    /// Optional fused gate+up GEMV with inline SiLU: single launch for both FFN projections.
+    cu_fused_silu:     Option<CUfunction>,
     stream:         Arc<Stream>,
     /// True when the raw-GGUF 36-u32 kernel is active (needs matching upload format).
     pub uses_raw_gguf: bool,
     /// Pre-allocated Q8_1 scratch buffers (set by pre_allocate_q8_scratch before graph capture).
     /// These avoid device allocation on a capturing stream (CUDA error 900).
-    q8_qs_scratch:  std::cell::RefCell<Option<Arc<Tensor<u32>>>>,  // [max_k / 4]
-    q8_ds_scratch:  std::cell::RefCell<Option<Arc<Tensor<u32>>>>,  // [max_k / 32]
-    q8_out_scratch: std::cell::RefCell<Option<Arc<Tensor<f32>>>>,  // [max_n]
+    q8_qs_scratch:     std::cell::RefCell<Option<Arc<Tensor<u32>>>>,  // [max_k / 4]
+    q8_ds_scratch:     std::cell::RefCell<Option<Arc<Tensor<u32>>>>,  // [max_k / 32]
+    q8_out_scratch:    std::cell::RefCell<Option<Arc<Tensor<f32>>>>,  // [max_n]
+    /// Pre-allocated output for the fused gate+up SiLU kernel.
+    fused_silu_scratch: std::cell::RefCell<Option<Arc<Tensor<f32>>>>, // [max_n]
 }
 
 unsafe impl Send for OxideQ4kGemv {}
@@ -165,15 +170,17 @@ impl OxideQ4kGemv {
             let cu_batch_gemv  = load_fn(KERNEL_BATCH);
             let cu_colocated   = load_fn(KERNEL_COLOCATED);
             let cu_smem        = load_fn(KERNEL_SMEM);
+            let cu_fused_silu  = load_fn(KERNEL_FUSED_SILU);
 
             eprintln!(
-                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={}, q8v2={}, q8v3={}, q8v3r={}, uses_raw_gguf={}, batch={})",
+                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={}, q8v2={}, q8v3={}, q8v3r={}, fused_silu={}, uses_raw_gguf={}, batch={})",
                 OXIDE_Q4K_PTX.len(),
                 KERNEL_ENTRY,
                 cu_q8_gemv.is_some(),
                 cu_q8_gemv_v2.is_some(),
                 cu_q8_gemv_v3.is_some(),
                 cu_q8_gemv_v3r.is_some(),
+                cu_fused_silu.is_some(),
                 false, // uses_raw_gguf — see note below
                 cu_batch_gemv.is_some(),
             );
@@ -185,10 +192,11 @@ impl OxideQ4kGemv {
             // in gemm_any_d2d_slot handles 36-u32 format correctly), but v3 is faster.
             let uses_raw_gguf = false;
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_batch_gemv, cu_colocated, cu_smem, uses_raw_gguf, stream,
-                q8_qs_scratch:  std::cell::RefCell::new(None),
-                q8_ds_scratch:  std::cell::RefCell::new(None),
-                q8_out_scratch: std::cell::RefCell::new(None),
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, uses_raw_gguf, stream,
+                q8_qs_scratch:      std::cell::RefCell::new(None),
+                q8_ds_scratch:      std::cell::RefCell::new(None),
+                q8_out_scratch:     std::cell::RefCell::new(None),
+                fused_silu_scratch: std::cell::RefCell::new(None),
             })
         }
     }
@@ -514,7 +522,19 @@ impl OxideQ4kGemv {
                 .sync_on(&self.stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
         ));
+        if self.cu_fused_silu.is_some() {
+            *self.fused_silu_scratch.borrow_mut() = Some(Arc::new(
+                api::zeros::<f32>(&[max_n])
+                    .sync_on(&self.stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+            ));
+        }
         Ok(())
+    }
+
+    /// Returns true when the fused gate+up SiLU kernel is compiled into the PTX.
+    pub fn has_fused_silu(&self) -> bool {
+        self.cu_fused_silu.is_some() && self.cu_q8_quantize.is_some()
     }
 
     /// Returns true when the Q8_1 quantize + integer GEMV path is compiled into the PTX.
@@ -692,6 +712,125 @@ impl OxideQ4kGemv {
         // No stream.synchronize() here — the caller (CUDA graph or direct dispatch)
         // is responsible for synchronization.  Adding a sync inside capture mode
         // would cause CUDA error 900 (operation not permitted when stream is capturing).
+
+        Ok(out_arc)
+    }
+
+    /// Fused gate+up GEMV with inline SiLU: one kernel for both FFN projections.
+    ///
+    /// Quantizes `x` into Q8_1 once, then launches `q4k_gemv_fused_silu_mul` which
+    /// computes `out[i] = silu(gate_dot[i]) * up_dot[i]` in a single pass.  Halves
+    /// activation DRAM and kernel launches vs two `forward_q8_d2d` + SiLU-mul calls.
+    ///
+    /// Returns `Err` when the fused kernel is not compiled into the PTX (caller should
+    /// fall back to two separate GEMVs + SiLU-mul).
+    pub fn forward_fused_silu_mul_d2d(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        gate_packed: &Arc<Tensor<u32>>,
+        up_packed:   &Arc<Tensor<u32>>,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let fused_fn = match self.cu_fused_silu {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("fused silu kernel not loaded".into())),
+        };
+        let q8_quant_fn = match self.cu_q8_quantize {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
+        };
+
+        let k = k_blocks * 256;
+        let k_q8_blocks = k.div_ceil(32);
+
+        // Reuse pre-allocated Q8_1 scratch (required during CUDA graph capture).
+        let use_scratch = self.q8_qs_scratch.borrow().as_ref()
+            .map(|t| t.size() >= k / 4)
+            .unwrap_or(false);
+
+        let x_qs_arc: Arc<Tensor<u32>>;
+        let x_ds_arc: Arc<Tensor<u32>>;
+        let out_arc: Arc<Tensor<f32>>;
+
+        if use_scratch && self.fused_silu_scratch.borrow().is_some() {
+            x_qs_arc = self.q8_qs_scratch.borrow().as_ref().unwrap().clone();
+            x_ds_arc = self.q8_ds_scratch.borrow().as_ref().unwrap().clone();
+            out_arc  = self.fused_silu_scratch.borrow().as_ref().unwrap().clone();
+        } else {
+            x_qs_arc = Arc::new(api::zeros::<u32>(&[k / 4])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+            x_ds_arc = Arc::new(api::zeros::<u32>(&[k_q8_blocks])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+            out_arc  = Arc::new(api::zeros::<f32>(&[n])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+        }
+
+        let cu_stream = self.stream.cu_stream();
+
+        // ── Launch quantize_q8_1 ────────────────────────────────────────────
+        {
+            let qs_ptr: u64 = x_qs_arc.device_pointer().cu_deviceptr();
+            let qs_len: u64 = (k / 4) as u64;
+            let ds_ptr: u64 = x_ds_arc.device_pointer().cu_deviceptr();
+            let ds_len: u64 = k_q8_blocks as u64;
+            let x_ptr:  u64 = x.device_pointer().cu_deviceptr();
+            let x_len:  u64 = x.size() as u64;
+            let k_u32:  u32 = k as u32;
+
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr as *const _ as *mut c_void,
+                &qs_len as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ds_len as *const _ as *mut c_void,
+                &x_ptr  as *const _ as *mut c_void,
+                &x_len  as *const _ as *mut c_void,
+                &k_u32  as *const _ as *mut c_void,
+            ];
+            let grid_x = k_q8_blocks.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            unsafe {
+                launch_kernel(q8_quant_fn, (grid_x, 1, 1), (BLOCK_DIM, 1, 1), 0, cu_stream, &mut params)
+            }.map_err(|e| KernelError::InvalidConfig(format!("oxide quantize_q8_1 (fused): {e}")))?;
+        }
+
+        // ── Launch q4k_gemv_fused_silu_mul ──────────────────────────────────
+        {
+            let out_ptr:  u64 = out_arc.device_pointer().cu_deviceptr();
+            let out_len:  u64 = n as u64;
+            let gate_ptr: u64 = gate_packed.device_pointer().cu_deviceptr();
+            let gate_len: u64 = gate_packed.size() as u64;
+            let up_ptr:   u64 = up_packed.device_pointer().cu_deviceptr();
+            let up_len:   u64 = up_packed.size() as u64;
+            let qs_ptr:   u64 = x_qs_arc.device_pointer().cu_deviceptr();
+            let qs_len:   u64 = (k / 4) as u64;
+            let ds_ptr:   u64 = x_ds_arc.device_pointer().cu_deviceptr();
+            let ds_len:   u64 = k_q8_blocks as u64;
+            let n_u32:    u32 = n as u32;
+            let kb_u32:   u32 = k_blocks as u32;
+
+            let mut params: [*mut c_void; 12] = [
+                &out_ptr  as *const _ as *mut c_void,
+                &out_len  as *const _ as *mut c_void,
+                &gate_ptr as *const _ as *mut c_void,
+                &gate_len as *const _ as *mut c_void,
+                &up_ptr   as *const _ as *mut c_void,
+                &up_len   as *const _ as *mut c_void,
+                &qs_ptr   as *const _ as *mut c_void,
+                &qs_len   as *const _ as *mut c_void,
+                &ds_ptr   as *const _ as *mut c_void,
+                &ds_len   as *const _ as *mut c_void,
+                &n_u32    as *const _ as *mut c_void,
+                &kb_u32   as *const _ as *mut c_void,
+            ];
+            // 32 f32 smem slots = 128 bytes (Blackwell predicated-smem safety, same as v3)
+            let smem_bytes: u32 = 32 * 4;
+            unsafe {
+                launch_kernel(fused_fn, (n as u32, 1, 1), (BLOCK_DIM, 1, 1), smem_bytes, cu_stream, &mut params)
+            }.map_err(|e| KernelError::InvalidConfig(format!("oxide q4k_gemv_fused_silu_mul: {e}")))?;
+        }
 
         Ok(out_arc)
     }
