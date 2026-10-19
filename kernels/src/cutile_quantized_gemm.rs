@@ -2284,7 +2284,6 @@ mod tests {
         use cuda_core::Device;
         use cutile::api;
         use cutile::prelude::DeviceOp;
-        use cutile::tensor::Reshape;
 
         // Build a 4-output, K=128 Q2_0 GEMV:
         // Row 0: scale=1.0, all q=2 → dequant = +1.0

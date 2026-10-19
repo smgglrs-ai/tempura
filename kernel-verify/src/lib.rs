@@ -2,8 +2,7 @@ use rand::{Rng, SeedableRng};
 use serde::Serialize;
 use tempura_kernel_api::{
     Attention, MatMul, MatMulQ, RMSNorm, RoPE, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE,
-    Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, TQ2_BLOCK_BYTES, TQ2_BLOCK_SIZE,
-    I2S_BLOCK_BYTES, I2S_BLOCK_SIZE,
+    Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, TQ2_BLOCK_BYTES, TQ2_BLOCK_SIZE, I2S_BLOCK_SIZE,
 };
 
 pub mod bitnet;
