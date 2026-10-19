@@ -1,4 +1,4 @@
-use crate::{AttentionConfig, MatMulConfig, RMSNormConfig, RoPEConfig};
+use crate::{AttentionConfig, I2SConfig, MatMulConfig, RMSNormConfig, RoPEConfig, TQ2Config};
 
 pub fn attention_configs() -> Vec<AttentionConfig> {
     vec![
@@ -85,5 +85,21 @@ pub fn rope_configs() -> Vec<RoPEConfig> {
             head_dim: 16,
             theta: 500000.0,
         },
+    ]
+}
+
+pub fn tq2_configs() -> Vec<TQ2Config> {
+    vec![
+        TQ2Config { m: 1, n: 16, k: 256 },
+        TQ2Config { m: 1, n: 64, k: 512 },
+        TQ2Config { m: 4, n: 32, k: 256 },
+    ]
+}
+
+pub fn i2s_configs() -> Vec<I2SConfig> {
+    vec![
+        I2SConfig { m: 1, n: 16, k: 256 },
+        I2SConfig { m: 1, n: 64, k: 512 },
+        I2SConfig { m: 4, n: 32, k: 256 },
     ]
 }

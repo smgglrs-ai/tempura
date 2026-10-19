@@ -2,7 +2,8 @@ use rand::{Rng, SeedableRng};
 use serde::Serialize;
 use tempura_kernel_api::{
     Attention, MatMul, MatMulQ, RMSNorm, RoPE, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE,
-    Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE,
+    Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, TQ2_BLOCK_BYTES, TQ2_BLOCK_SIZE,
+    I2S_BLOCK_BYTES, I2S_BLOCK_SIZE,
 };
 
 pub mod bitnet;
@@ -206,6 +207,58 @@ impl DualPipelineRunner {
             },
         }
     }
+
+    pub fn compare_tq2(
+        &self,
+        name: &str,
+        ref_impl: &dyn MatMulQ,
+        opt_impl: &dyn MatMulQ,
+        configs: &[TQ2Config],
+        rel_tol: f32,
+    ) -> VerificationReport {
+        let mut results = Vec::new();
+        for cfg in configs {
+            let result = compare_tq2_single(ref_impl, opt_impl, cfg, rel_tol);
+            results.push(result);
+        }
+        let pass = results.iter().all(|r| r.pass);
+        VerificationReport {
+            kernel_name: name.into(),
+            results,
+            pass,
+            tier: if pass {
+                VerificationTier::Tested
+            } else {
+                VerificationTier::Compiled
+            },
+        }
+    }
+
+    pub fn compare_i2s(
+        &self,
+        name: &str,
+        ref_impl: &dyn MatMulQ,
+        opt_impl: &dyn MatMulQ,
+        configs: &[I2SConfig],
+        rel_tol: f32,
+    ) -> VerificationReport {
+        let mut results = Vec::new();
+        for cfg in configs {
+            let result = compare_i2s_single(ref_impl, opt_impl, cfg, rel_tol);
+            results.push(result);
+        }
+        let pass = results.iter().all(|r| r.pass);
+        VerificationReport {
+            kernel_name: name.into(),
+            results,
+            pass,
+            tier: if pass {
+                VerificationTier::Tested
+            } else {
+                VerificationTier::Compiled
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -367,6 +420,20 @@ pub struct Q6kConfig {
     pub k: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct TQ2Config {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct I2SConfig {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+}
+
 /// Generate structurally valid Q6K weight bytes for `n` rows, each of width `k`.
 ///
 /// Q6K block layout (210 bytes):
@@ -406,6 +473,48 @@ fn make_q6k_weights(n: usize, k: usize, seed: u8) -> Vec<u8> {
     weights
 }
 
+fn make_tq2_weights(n: usize, k: usize, seed: u8) -> Vec<u8> {
+    let blocks_per_row = k / TQ2_BLOCK_SIZE;
+    let mut out = vec![0u8; n * blocks_per_row * TQ2_BLOCK_BYTES];
+    for row in 0..n {
+        for blk in 0..blocks_per_row {
+            let s = seed.wrapping_add(row as u8).wrapping_add(blk as u8);
+            let base = (row * blocks_per_row + blk) * TQ2_BLOCK_BYTES;
+            for i in 0..64 {
+                let mut packed = 0u8;
+                for shift in (0u8..8).step_by(2) {
+                    let raw = s.wrapping_add(i as u8).wrapping_add(shift) % 3;
+                    packed |= raw << shift;
+                }
+                out[base + i] = packed;
+            }
+            let d_bits = half::f16::from_f32(0.01 + 0.001 * s as f32).to_bits();
+            out[base + 64] = d_bits as u8;
+            out[base + 65] = (d_bits >> 8) as u8;
+        }
+    }
+    out
+}
+
+fn make_i2s_weights(n: usize, k: usize, seed: u8) -> Vec<u8> {
+    let blocks_per_row = k / I2S_BLOCK_SIZE;
+    let mut out = vec![0u8; n * blocks_per_row * I2S_BLOCK_BYTES];
+    for row in 0..n {
+        for blk in 0..blocks_per_row {
+            let s = seed.wrapping_add(row as u8).wrapping_add(blk as u8);
+            let base = (row * blocks_per_row + blk) * I2S_BLOCK_BYTES;
+            for i in 0..64 {
+                let b0 = (s.wrapping_add(i as u8 * 4)     % 4) as u8;
+                let b1 = (s.wrapping_add(i as u8 * 4 + 1) % 4) as u8;
+                let b2 = (s.wrapping_add(i as u8 * 4 + 2) % 4) as u8;
+                let b3 = (s.wrapping_add(i as u8 * 4 + 3) % 4) as u8;
+                out[base + i] = (b0 << 6) | (b1 << 4) | (b2 << 2) | b3;
+            }
+        }
+    }
+    out
+}
+
 fn compare_q6k_single(
     ref_impl: &dyn MatMulQ,
     opt_impl: &dyn MatMulQ,
@@ -437,6 +546,150 @@ fn compare_q6k_single(
         &activations, &weights, &mut out_ref, cfg.m, cfg.n, cfg.k,
     );
     let res_opt = opt_impl.forward_b_transposed_q6k(
+        &activations, &weights, &mut out_opt, cfg.m, cfg.n, cfg.k,
+    );
+
+    match (res_ref, res_opt) {
+        (Ok(()), Ok(())) => {
+            let mad = max_abs_diff(&out_ref, &out_opt);
+            let l2 = l2_distance(&out_ref, &out_opt);
+            let max_ref = out_ref.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let rel_err = if max_ref > 1e-6 { mad / max_ref } else { mad };
+            let pass = rel_err <= rel_tol;
+            KernelTestResult {
+                test_name,
+                pass,
+                max_abs_diff: mad,
+                l2_distance: l2,
+                detail: if pass {
+                    format!("rel_err={rel_err:.4} within tol={rel_tol:.3}")
+                } else {
+                    format!(
+                        "rel_err={rel_err:.4} exceeds tol={rel_tol:.3} (mad={mad:.6}, max_ref={max_ref:.6})"
+                    )
+                },
+            }
+        }
+        (Err(e), _) => KernelTestResult {
+            test_name,
+            pass: false,
+            max_abs_diff: f32::NAN,
+            l2_distance: f32::NAN,
+            detail: format!("ref_impl error: {e}"),
+        },
+        (_, Err(e)) => KernelTestResult {
+            test_name,
+            pass: false,
+            max_abs_diff: f32::NAN,
+            l2_distance: f32::NAN,
+            detail: format!("opt_impl error: {e}"),
+        },
+    }
+}
+
+fn compare_tq2_single(
+    ref_impl: &dyn MatMulQ,
+    opt_impl: &dyn MatMulQ,
+    cfg: &TQ2Config,
+    rel_tol: f32,
+) -> KernelTestResult {
+    let test_name = format!("tq2 m={} n={} k={}", cfg.m, cfg.n, cfg.k);
+
+    if cfg.k % TQ2_BLOCK_SIZE != 0 {
+        return KernelTestResult {
+            test_name,
+            pass: false,
+            max_abs_diff: f32::NAN,
+            l2_distance: f32::NAN,
+            detail: format!("k={} not divisible by TQ2_BLOCK_SIZE={}", cfg.k, TQ2_BLOCK_SIZE),
+        };
+    }
+
+    let weights = make_tq2_weights(cfg.n, cfg.k, 42);
+    let activations: Vec<f32> = {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(17);
+        (0..cfg.m * cfg.k).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect()
+    };
+
+    let mut out_ref = vec![0.0f32; cfg.m * cfg.n];
+    let mut out_opt = vec![0.0f32; cfg.m * cfg.n];
+
+    let res_ref = ref_impl.forward_b_transposed_tq2(
+        &activations, &weights, &mut out_ref, cfg.m, cfg.n, cfg.k,
+    );
+    let res_opt = opt_impl.forward_b_transposed_tq2(
+        &activations, &weights, &mut out_opt, cfg.m, cfg.n, cfg.k,
+    );
+
+    match (res_ref, res_opt) {
+        (Ok(()), Ok(())) => {
+            let mad = max_abs_diff(&out_ref, &out_opt);
+            let l2 = l2_distance(&out_ref, &out_opt);
+            let max_ref = out_ref.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let rel_err = if max_ref > 1e-6 { mad / max_ref } else { mad };
+            let pass = rel_err <= rel_tol;
+            KernelTestResult {
+                test_name,
+                pass,
+                max_abs_diff: mad,
+                l2_distance: l2,
+                detail: if pass {
+                    format!("rel_err={rel_err:.4} within tol={rel_tol:.3}")
+                } else {
+                    format!(
+                        "rel_err={rel_err:.4} exceeds tol={rel_tol:.3} (mad={mad:.6}, max_ref={max_ref:.6})"
+                    )
+                },
+            }
+        }
+        (Err(e), _) => KernelTestResult {
+            test_name,
+            pass: false,
+            max_abs_diff: f32::NAN,
+            l2_distance: f32::NAN,
+            detail: format!("ref_impl error: {e}"),
+        },
+        (_, Err(e)) => KernelTestResult {
+            test_name,
+            pass: false,
+            max_abs_diff: f32::NAN,
+            l2_distance: f32::NAN,
+            detail: format!("opt_impl error: {e}"),
+        },
+    }
+}
+
+fn compare_i2s_single(
+    ref_impl: &dyn MatMulQ,
+    opt_impl: &dyn MatMulQ,
+    cfg: &I2SConfig,
+    rel_tol: f32,
+) -> KernelTestResult {
+    let test_name = format!("i2s m={} n={} k={}", cfg.m, cfg.n, cfg.k);
+
+    if cfg.k % I2S_BLOCK_SIZE != 0 {
+        return KernelTestResult {
+            test_name,
+            pass: false,
+            max_abs_diff: f32::NAN,
+            l2_distance: f32::NAN,
+            detail: format!("k={} not divisible by I2S_BLOCK_SIZE={}", cfg.k, I2S_BLOCK_SIZE),
+        };
+    }
+
+    let weights = make_i2s_weights(cfg.n, cfg.k, 42);
+    let activations: Vec<f32> = {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(17);
+        (0..cfg.m * cfg.k).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect()
+    };
+
+    let mut out_ref = vec![0.0f32; cfg.m * cfg.n];
+    let mut out_opt = vec![0.0f32; cfg.m * cfg.n];
+
+    let res_ref = ref_impl.forward_b_transposed_i2s(
+        &activations, &weights, &mut out_ref, cfg.m, cfg.n, cfg.k,
+    );
+    let res_opt = opt_impl.forward_b_transposed_i2s(
         &activations, &weights, &mut out_opt, cfg.m, cfg.n, cfg.k,
     );
 
