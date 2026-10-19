@@ -38,9 +38,6 @@ use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_core::simt::LaunchConfig;
 
 const WARPS_PER_BLOCK: u32 = 4;
-/// v3: 1 warp (32 threads) per block — 1 output row per block.
-/// Raises SM occupancy from ~24 warps/SM (37.5%) to 64 warps/SM (100%).
-const WARPS_PER_BLOCK_V3: u32 = 1;
 
 #[cuda_module]
 mod kernels {
@@ -276,156 +273,6 @@ mod kernels {
             }
         }
     }
-
-    /// Q6_K GEMV v3: 1 output row per block (was 4 in v2).
-    ///
-    /// Grid:  (N,) blocks — blockIdx.x IS the output row.
-    /// Block: (32,) threads — 1 warp per block.
-    ///
-    /// Occupancy: 4096 blocks / 170 SMs → 24 blocks/SM → capped at 16 blocks/SM
-    /// (register-limited) → 16 warps/SM × 4 (v2) vs 16 warps/SM → actually 16
-    /// warps vs 6 warps in v2 (6 blocks×4 warps).  Wait-hiding improves DRAM
-    /// utilization from 32% to ~56%, reducing duration 85 μs → ~50 μs per layer.
-    ///
-    /// Inner loop identical to v2: shfl d broadcast + 8 unrolled steps.
-    #[kernel]
-    pub fn q6k_gemv_decode_v3(
-        mut out: DisjointSlice<f32>,
-        x: &[f32],
-        packed: &[u32],
-        n: u32,
-        k_blocks: u32,
-    ) {
-        let tid  = thread::threadIdx_x();
-        let lane = tid % 32;
-        let n_out = thread::blockIdx_x();   // 1 block = 1 output row
-
-        if n_out >= n {
-            return;
-        }
-
-        let mut acc = 0.0_f32;
-
-        let mut blk = 0u32;
-        while blk < k_blocks {
-            let base = (n_out * k_blocks + blk) * 53;
-
-            let d_raw = if lane == 0 { packed[base as usize] } else { 0 };
-            let d = f32::from_bits(warp::shuffle(d_raw, 0));
-
-            let sc_01 = packed[(base + 1) as usize];
-            let sc_23 = packed[(base + 2) as usize];
-            let sc_45 = packed[(base + 3) as usize];
-            let sc_67 = packed[(base + 4) as usize];
-
-            let byte_shift = (lane % 4) * 8;
-
-            let ql_a = (packed[(base + 5  + lane / 4) as usize] >> byte_shift) & 0xFF;
-            let ql_b = (packed[(base + 13 + lane / 4) as usize] >> byte_shift) & 0xFF;
-            let qh_0 = (packed[(base + 37 + lane / 4) as usize] >> byte_shift) & 0xFF;
-            let ql_c = (packed[(base + 21 + lane / 4) as usize] >> byte_shift) & 0xFF;
-            let ql_d = (packed[(base + 29 + lane / 4) as usize] >> byte_shift) & 0xFF;
-            let qh_1 = (packed[(base + 45 + lane / 4) as usize] >> byte_shift) & 0xFF;
-
-            // step 0
-            {
-                let within = lane;
-                let group = within / 16;
-                let sc_byte = (sc_01 >> (group * 8)) & 0xFF;
-                let sc = sc_byte as f32 - 128.0;
-                let lo = ql_a & 0xF;
-                let hi = qh_0 & 0x3;
-                let q6 = lo | (hi << 4);
-                acc += d * sc * (q6 as f32 - 32.0) * x[(blk * 256 + within) as usize];
-            }
-            // step 1
-            {
-                let within = 32 + lane;
-                let group = within / 16;
-                let sc_byte = (sc_01 >> (group * 8)) & 0xFF;
-                let sc = sc_byte as f32 - 128.0;
-                let lo = ql_b & 0xF;
-                let hi = (qh_0 >> 2) & 0x3;
-                let q6 = lo | (hi << 4);
-                acc += d * sc * (q6 as f32 - 32.0) * x[(blk * 256 + within) as usize];
-            }
-            // step 2
-            {
-                let within = 64 + lane;
-                let group = within / 16;
-                let sc_byte = (sc_23 >> ((group - 4) * 8)) & 0xFF;
-                let sc = sc_byte as f32 - 128.0;
-                let lo = (ql_a >> 4) & 0xF;
-                let hi = (qh_0 >> 4) & 0x3;
-                let q6 = lo | (hi << 4);
-                acc += d * sc * (q6 as f32 - 32.0) * x[(blk * 256 + within) as usize];
-            }
-            // step 3
-            {
-                let within = 96 + lane;
-                let group = within / 16;
-                let sc_byte = (sc_23 >> ((group - 4) * 8)) & 0xFF;
-                let sc = sc_byte as f32 - 128.0;
-                let lo = (ql_b >> 4) & 0xF;
-                let hi = (qh_0 >> 6) & 0x3;
-                let q6 = lo | (hi << 4);
-                acc += d * sc * (q6 as f32 - 32.0) * x[(blk * 256 + within) as usize];
-            }
-            // step 4
-            {
-                let within = 128 + lane;
-                let group = within / 16;
-                let sc_byte = (sc_45 >> ((group - 8) * 8)) & 0xFF;
-                let sc = sc_byte as f32 - 128.0;
-                let lo = ql_c & 0xF;
-                let hi = qh_1 & 0x3;
-                let q6 = lo | (hi << 4);
-                acc += d * sc * (q6 as f32 - 32.0) * x[(blk * 256 + within) as usize];
-            }
-            // step 5
-            {
-                let within = 160 + lane;
-                let group = within / 16;
-                let sc_byte = (sc_45 >> ((group - 8) * 8)) & 0xFF;
-                let sc = sc_byte as f32 - 128.0;
-                let lo = ql_d & 0xF;
-                let hi = (qh_1 >> 2) & 0x3;
-                let q6 = lo | (hi << 4);
-                acc += d * sc * (q6 as f32 - 32.0) * x[(blk * 256 + within) as usize];
-            }
-            // step 6
-            {
-                let within = 192 + lane;
-                let group = within / 16;
-                let sc_byte = (sc_67 >> ((group - 12) * 8)) & 0xFF;
-                let sc = sc_byte as f32 - 128.0;
-                let lo = (ql_c >> 4) & 0xF;
-                let hi = (qh_1 >> 4) & 0x3;
-                let q6 = lo | (hi << 4);
-                acc += d * sc * (q6 as f32 - 32.0) * x[(blk * 256 + within) as usize];
-            }
-            // step 7
-            {
-                let within = 224 + lane;
-                let group = within / 16;
-                let sc_byte = (sc_67 >> ((group - 12) * 8)) & 0xFF;
-                let sc = sc_byte as f32 - 128.0;
-                let lo = (ql_d >> 4) & 0xF;
-                let hi = (qh_1 >> 6) & 0x3;
-                let q6 = lo | (hi << 4);
-                acc += d * sc * (q6 as f32 - 32.0) * x[(blk * 256 + within) as usize];
-            }
-
-            blk += 1;
-        }
-
-        acc = warp::reduce_sum_f32(acc);
-        if lane == 0 {
-            unsafe {
-                *out.get_unchecked_mut(n_out as usize) = acc;
-            }
-        }
-    }
 }
 
 // ── Host-side correctness test ────────────────────────────────────────────────
@@ -484,16 +331,7 @@ fn main() {
         shared_mem_bytes: 0,
     };
 
-    // v3: 1 warp per block → grid = n blocks, block = 32 threads
-    let cfg_v3 = LaunchConfig {
-        grid_dim:  (n as u32, 1, 1),
-        block_dim: (WARPS_PER_BLOCK_V3 * 32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
     // ── Test 1: q_full=32 → weight=0.0 ────────────────────────────────────────
-    let mut out_dev3 = DeviceBuffer::<f32>::zeroed(&stream, n).expect("alloc out3");
-
     unsafe {
         module.q6k_gemv_decode(
             stream.as_ref(), cfg, &mut out_dev, &x_dev, &p_dev, n as u32, k_blocks as u32,
@@ -506,19 +344,11 @@ fn main() {
         )
     }.expect("v2 launch");
 
-    unsafe {
-        module.q6k_gemv_decode_v3(
-            stream.as_ref(), cfg_v3, &mut out_dev3, &x_dev, &p_dev, n as u32, k_blocks as u32,
-        )
-    }.expect("v3 launch");
-
     let result1 = out_dev.to_host_vec(&stream).expect("download v1");
     let result2 = out_dev2.to_host_vec(&stream).expect("download v2");
-    let result3 = out_dev3.to_host_vec(&stream).expect("download v3");
 
     let max_err1 = result1.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
     let max_err2 = result2.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
-    let max_err3 = result3.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
 
     if max_err1 < 1e-4 {
         println!("oxide-gemv-q6k v1 test 1 (q_full=32→weight=0): PASSED (max_err={:.2e})", max_err1);
@@ -532,26 +362,12 @@ fn main() {
         eprintln!("oxide-gemv-q6k v2 test 1 FAILED (max_err={:.4}, result[0]={})", max_err2, result2[0]);
         std::process::exit(1);
     }
-    if max_err3 < 1e-4 {
-        println!("oxide-gemv-q6k v3 test 1 (q_full=32→weight=0): PASSED (max_err={:.2e})", max_err3);
-    } else {
-        eprintln!("oxide-gemv-q6k v3 test 1 FAILED (max_err={:.4}, result[0]={})", max_err3, result3[0]);
-        std::process::exit(1);
-    }
 
     let diff12 = result1.iter().zip(result2.iter()).map(|(a,b)| (a-b).abs()).fold(0.0_f32, f32::max);
     if diff12 < 1e-4 {
         println!("oxide-gemv-q6k v1/v2 test 1 agreement: PASSED (max_diff={:.2e})", diff12);
     } else {
         eprintln!("oxide-gemv-q6k v1/v2 test 1 DISAGREEMENT (max_diff={:.4})", diff12);
-        std::process::exit(1);
-    }
-
-    let diff13 = result1.iter().zip(result3.iter()).map(|(a,b)| (a-b).abs()).fold(0.0_f32, f32::max);
-    if diff13 < 1e-4 {
-        println!("oxide-gemv-q6k v1/v3 test 1 agreement: PASSED (max_diff={:.2e})", diff13);
-    } else {
-        eprintln!("oxide-gemv-q6k v1/v3 test 1 DISAGREEMENT (max_diff={:.4})", diff13);
         std::process::exit(1);
     }
 
@@ -583,7 +399,6 @@ fn main() {
     let zeros = vec![0.0_f32; n];
     out_dev.copy_from_host(&stream, &zeros).expect("zero out");
     out_dev2.copy_from_host(&stream, &zeros).expect("zero out2");
-    out_dev3.copy_from_host(&stream, &zeros).expect("zero out3");
 
     unsafe {
         module.q6k_gemv_decode(
@@ -597,20 +412,12 @@ fn main() {
         )
     }.expect("v2 launch 2");
 
-    unsafe {
-        module.q6k_gemv_decode_v3(
-            stream.as_ref(), cfg_v3, &mut out_dev3, &x_dev, &p_dev, n as u32, k_blocks as u32,
-        )
-    }.expect("v3 launch 2");
-
     let result1b = out_dev.to_host_vec(&stream).expect("download v1 t2");
     let result2b = out_dev2.to_host_vec(&stream).expect("download v2 t2");
-    let result3b = out_dev3.to_host_vec(&stream).expect("download v3 t2");
     let expected2 = 512.0_f32;
 
     let max_err1b = result1b.iter().map(|v| (v - expected2).abs()).fold(0.0_f32, f32::max);
     let max_err2b = result2b.iter().map(|v| (v - expected2).abs()).fold(0.0_f32, f32::max);
-    let max_err3b = result3b.iter().map(|v| (v - expected2).abs()).fold(0.0_f32, f32::max);
 
     if max_err1b < 1.0 {
         println!(
@@ -636,32 +443,12 @@ fn main() {
         );
         std::process::exit(1);
     }
-    if max_err3b < 1.0 {
-        println!(
-            "oxide-gemv-q6k v3 test 2 (d=1,sc=2,q_full=33): PASSED (expected={}, max_err={:.2e})",
-            expected2, max_err3b
-        );
-    } else {
-        eprintln!(
-            "oxide-gemv-q6k v3 test 2 FAILED (expected={}, max_err={:.4}, result[0]={})",
-            expected2, max_err3b, result3b[0]
-        );
-        std::process::exit(1);
-    }
 
     let diff12b = result1b.iter().zip(result2b.iter()).map(|(a,b)| (a-b).abs()).fold(0.0_f32, f32::max);
     if diff12b < 1.0 {
         println!("oxide-gemv-q6k v1/v2 test 2 agreement: PASSED (max_diff={:.2e})", diff12b);
     } else {
         eprintln!("oxide-gemv-q6k v1/v2 test 2 DISAGREEMENT (max_diff={:.4})", diff12b);
-        std::process::exit(1);
-    }
-
-    let diff13b = result1b.iter().zip(result3b.iter()).map(|(a,b)| (a-b).abs()).fold(0.0_f32, f32::max);
-    if diff13b < 1.0 {
-        println!("oxide-gemv-q6k v1/v3 test 2 agreement: PASSED (max_diff={:.2e})", diff13b);
-    } else {
-        eprintln!("oxide-gemv-q6k v1/v3 test 2 DISAGREEMENT (max_diff={:.4})", diff13b);
         std::process::exit(1);
     }
 
