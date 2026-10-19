@@ -448,6 +448,72 @@ impl OxideQ4kGemv {
         Ok(Arc::new(out))
     }
 
+    /// Like `submit_d2d_into` but launches on an explicit CUDA stream.
+    ///
+    /// Used by the multi-stream QKV path to run K and V GEMVs on `stream_kv`
+    /// concurrently with the Q GEMV on `stream_main`.  Only the f32 kernel is
+    /// used (not the Q8 dp4a path) so that the per-weight output is written
+    /// directly into the pre-allocated slot tensor instead of shared Q8 scratch.
+    ///
+    /// # Safety
+    /// `cu_stream` must be a valid CUstream for the duration of the kernel.
+    pub unsafe fn submit_d2d_into_on(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        out: Tensor<f32>,
+        n: usize,
+        k_blocks: usize,
+        cu_stream: cuda_core::sys::CUstream,
+    ) -> Result<Arc<Tensor<f32>>> {
+        self.launch_on(x, packed, &out, n, k_blocks, cu_stream)?;
+        Ok(Arc::new(out))
+    }
+
+    fn launch_on(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        out: &Tensor<f32>,
+        n: usize,
+        k_blocks: usize,
+        cu_stream: cuda_core::sys::CUstream,
+    ) -> Result<()> {
+        let out_ptr: u64 = out.device_pointer().cu_deviceptr();
+        let out_len: u64 = n as u64;
+        let x_ptr: u64 = x.device_pointer().cu_deviceptr();
+        let x_len: u64 = x.size() as u64;
+        let packed_ptr: u64 = packed.device_pointer().cu_deviceptr();
+        let packed_len: u64 = packed.size() as u64;
+        let n_u32 = n as u32;
+        let k_blocks_u32 = k_blocks as u32;
+
+        let mut params: [*mut c_void; 8] = [
+            &out_ptr      as *const _ as *mut c_void,
+            &out_len      as *const _ as *mut c_void,
+            &x_ptr        as *const _ as *mut c_void,
+            &x_len        as *const _ as *mut c_void,
+            &packed_ptr   as *const _ as *mut c_void,
+            &packed_len   as *const _ as *mut c_void,
+            &n_u32        as *const _ as *mut c_void,
+            &k_blocks_u32 as *const _ as *mut c_void,
+        ];
+
+        let grid_x = n as u32;
+        unsafe {
+            launch_kernel(
+                self.cu_function,
+                (grid_x, 1, 1),
+                (BLOCK_DIM, 1, 1),
+                32 * 4,
+                cu_stream,
+                &mut params,
+            )
+        }
+        .map_err(|e| KernelError::InvalidConfig(format!("oxide q4k_gemv_decode_v2 (kv stream): {e}")))?;
+        Ok(())
+    }
+
     fn launch(
         &self,
         x: &Arc<Tensor<f32>>,

@@ -41,19 +41,11 @@ use tempura_kernels::oxide_decode_attn_host::OxideDecodeAttn;
 use tempura_kernels::{Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE};
 use tempura_kernels::cutile_rmsnorm::{CutileRmsNorm, RmsnormScratch};
 use tempura_kernels::cutile_rope::{CutileRoPE, RopeScratch};
+use tempura_kernels::kv_scatter_write::KvScatterWrite;
 
 use crate::config::ModelConfig;
 use crate::cutile_kv_cache::CutileKvCache;
 use crate::weights::QuantizedWeights;
-
-/// Info about a KV-write memcpy node so we can update its dst pointer per step.
-#[derive(Clone)]
-struct KvMemcpyEntry {
-    node: cuda_core::sys::CUgraphNode,
-    src_ptr: cuda_core::sys::CUdeviceptr,
-    cache_base: cuda_core::sys::CUdeviceptr, // base of k_device[layer] or v_device[layer]
-    width_bytes: usize,
-}
 
 /// A kernel node in the captured graph whose scalar (i32) parameter must be
 /// updated each decode step without re-capture.
@@ -77,16 +69,16 @@ unsafe impl Sync for KernelScalarNode {}
 
 /// RAII wrapper for a CUDA graph executable.
 ///
-/// The exec is replayed each decode step via `cuGraphLaunch`.  KV-write memcpy
-/// nodes are updated per step via `cuGraphExecMemcpyNodeSetParams`.  Flash-attn
-/// kv_len and RoPE position nodes are updated via `cuGraphExecKernelNodeSetParams_v2`.
+/// The exec is replayed each decode step via `cuGraphLaunch`.  KV writes are
+/// performed by the scatter-write kernel inside the graph, which reads
+/// `d_kv_write_offset` from device memory at execution time — no
+/// `cuGraphExecMemcpyNodeSetParams` calls required.  Flash-attn kv_len and
+/// RoPE position nodes are updated via `cuGraphExecKernelNodeSetParams_v2`.
 /// No re-capture, no `cuGraphExecUpdate_v2`.
 struct DecodeGraph {
     cu_exec: cuda_core::sys::CUgraphExec,
     cu_graph: cuda_core::sys::CUgraph, // kept alive; node handles reference it
     device: Arc<cuda_core::Device>,
-    /// KV write memcpy nodes to update per decode step (one K + one V per layer).
-    kv_memcpy_entries: Vec<KvMemcpyEntry>,
     /// Flash-attention kernel nodes whose kv_len scalar changes each step.
     flash_attn_nodes: Vec<KernelScalarNode>,
     /// RoPE kernel nodes whose position scalar changes each step.
@@ -282,6 +274,11 @@ pub struct CutileGpuModel {
     cutile_rmsnorm: CutileRmsNorm,
     cutile_rope: CutileRoPE,
     cutile_elementwise: CutileElementwise,
+    /// Scatter-write kernel for KV cache updates inside the CUDA graph.
+    ///
+    /// Reads `d_kv_write_offset` from device at execution time, eliminating
+    /// 64 `cuGraphExecMemcpyNodeSetParams` calls per decode step.
+    kv_scatter_write: KvScatterWrite,
     /// Pre-allocated decode output scratch buffers indexed by SLOT_* constants.
     ///
     /// Eliminates the `api::zeros` allocation inside `forward_bt_device_to_device`
@@ -366,6 +363,23 @@ pub struct CutileGpuModel {
     /// allowing per-step parameters (pos, kv_len, KV cache write offset) to vary
     /// while the graph topology stays fixed.
     cached_decode_graph: RefCell<Option<DecodeGraph>>,
+
+    // ── Multi-stream QKV concurrency ──────────────────────────────────────────
+    //
+    // K [kv_dim × h] and V [kv_dim × h] are independent of Q [q_dim × h] and
+    // can execute concurrently: for GQA models K and V are 4× smaller and hide
+    // behind Q's latency.  During CUDA graph capture in RELAXED mode, operations
+    // on `stream_kv` that wait on `event_fork` (recorded on `stream_main`) are
+    // automatically included in the graph as concurrent nodes.
+
+    /// Secondary CUDA stream for concurrent K and V GEMVs in decode graph.
+    stream_kv: Arc<cuda_core::Stream>,
+    /// Fork event: recorded on stream_main after normed_dev is ready; waited on
+    /// by stream_kv to join the capture graph and establish the dependency edge.
+    event_fork: cuda_core::Event,
+    /// Join event: recorded on stream_kv after V GEMV; waited on by stream_main
+    /// before RoPE to ensure K and V results are visible on the main timeline.
+    event_kv_done: cuda_core::Event,
 }
 
 // SAFETY: CutileMatMul, CutileFlashAttention and Tensor<f32> hold raw CUDA pointers,
@@ -969,6 +983,8 @@ impl CutileGpuModel {
             Ok(oda) => { eprintln!("[cutile] oxide decode-attn loaded (batch={})", oda.has_batch()); Some(oda) }
             Err(e)  => { eprintln!("[cutile] oxide decode-attn unavailable: {e}"); None }
         };
+        let kv_scatter_write = KvScatterWrite::new()
+            .expect("KvScatterWrite: failed to load scatter-write PTX kernel");
 
         let q4k_count = dw_q4k.len();
         let q6k_count = dw_q6k.len();
@@ -1052,6 +1068,15 @@ impl CutileGpuModel {
                 .expect("d_kv_write_offset alloc failed"),
         );
 
+        // Extract device before moving `matmul` into the struct.
+        let device = matmul.stream().device().clone();
+        let stream_kv = device.new_stream()
+            .expect("CutileGpuModel: stream_kv creation failed");
+        let event_fork = device.new_event()
+            .expect("CutileGpuModel: event_fork creation failed");
+        let event_kv_done = device.new_event()
+            .expect("CutileGpuModel: event_kv_done creation failed");
+
         let model = Self {
             config: config.clone(),
             h_pad,
@@ -1088,8 +1113,12 @@ impl CutileGpuModel {
             d_kv_len,
             d_positions,
             d_kv_write_offset,
+            kv_scatter_write,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
+            stream_kv,
+            event_fork,
+            event_kv_done,
         };
         eprintln!("[cutile] warming up kernel specializations…");
         model.warmup_gemms();
@@ -1180,6 +1209,8 @@ impl CutileGpuModel {
             Ok(oda) => { eprintln!("[cutile] oxide decode-attn loaded (batch={})", oda.has_batch()); Some(oda) }
             Err(e)  => { eprintln!("[cutile] oxide decode-attn unavailable: {e}"); None }
         };
+        let kv_scatter_write = KvScatterWrite::new()
+            .expect("KvScatterWrite: failed to load scatter-write PTX kernel");
 
         // Pre-compute the full RoPE frequency table on the GPU once.
         cutile_rope.precompute_table(
@@ -1244,6 +1275,15 @@ impl CutileGpuModel {
                 .expect("d_kv_write_offset alloc failed"),
         );
 
+        // Extract device before moving `matmul` into the struct.
+        let device = matmul.stream().device().clone();
+        let stream_kv = device.new_stream()
+            .expect("CutileGpuModel: stream_kv creation failed");
+        let event_fork = device.new_event()
+            .expect("CutileGpuModel: event_fork creation failed");
+        let event_kv_done = device.new_event()
+            .expect("CutileGpuModel: event_kv_done creation failed");
+
         let model = Self {
             config: config.clone(),
             h_pad,
@@ -1280,8 +1320,12 @@ impl CutileGpuModel {
             d_kv_len,
             d_positions,
             d_kv_write_offset,
+            kv_scatter_write,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
+            stream_kv,
+            event_fork,
+            event_kv_done,
         };
         eprintln!("[cutile] warming up kernel specializations…");
         model.warmup_gemms();
@@ -2086,6 +2130,179 @@ impl CutileGpuModel {
             .expect("gemm_q4k_d2d_slot failed")
     }
 
+    /// Dispatch Q, K, V projections with multi-stream concurrency for decode (seq_len=1).
+    ///
+    /// When oxide GEMVs are available for the weight format and seq_len==1, K and V
+    /// are dispatched on `stream_kv` concurrently with Q on `stream_main`, connected by
+    /// CUDA events (fork after normed_dev, join before RoPE).  This lets K [kv_dim × h]
+    /// and V [kv_dim × h] hide behind Q [q_dim × h] on the GPU.
+    ///
+    /// K and V use the oxide f32 GEMV (not the Q8 dp4a path) so each writes into its own
+    /// pre-allocated slot (SLOT_K / SLOT_V) without touching the Q8 shared scratch buffer
+    /// that Q may be using on stream_main simultaneously.
+    ///
+    /// Falls back to the sequential path when oxide GEMVs are unavailable or seq_len > 1.
+    fn dispatch_qkv_multistream(
+        &self,
+        normed: &Arc<Tensor<f32>>,
+        q_name: &str,
+        k_name: &str,
+        v_name: &str,
+        seq_len: usize,
+    ) -> (Arc<Tensor<f32>>, Arc<Tensor<f32>>, Arc<Tensor<f32>>) {
+        // Multi-stream path: oxide f32 GEMV available for Q4K, Q6K, or Q2 K/V weights.
+        if seq_len == 1 {
+            let has_q4k_kv = self.oxide_q4k_gemv.is_some()
+                && (self.device_weights_q4k.contains_key(k_name)
+                    || self.device_weights_q6k.contains_key(k_name)
+                    || self.device_weights_q2.contains_key(k_name));
+
+            if has_q4k_kv {
+                return self.dispatch_qkv_oxide_multistream(normed, q_name, k_name, v_name);
+            }
+        }
+
+        // Sequential fallback (prefill, cuTile-only, or f32 weights).
+        let q_dev = self.gemm_any_d2d_slot(normed, q_name, seq_len, SLOT_Q);
+        let k_dev = self.gemm_any_d2d_slot(normed, k_name, seq_len, SLOT_K);
+        let v_dev = self.gemm_any_d2d_slot(normed, v_name, seq_len, SLOT_V);
+        (q_dev, k_dev, v_dev)
+    }
+
+    /// Inner multi-stream QKV dispatch: fork stream_kv for K/V, Q on stream_main.
+    ///
+    /// Called only when oxide f32 GEMVs are confirmed available for K/V weights.
+    fn dispatch_qkv_oxide_multistream(
+        &self,
+        normed: &Arc<Tensor<f32>>,
+        q_name: &str,
+        k_name: &str,
+        v_name: &str,
+    ) -> (Arc<Tensor<f32>>, Arc<Tensor<f32>>, Arc<Tensor<f32>>) {
+        // Fork: normed_dev is ready on stream_main. Record a fork event and have
+        // stream_kv wait on it so the GPU graph includes a dependency edge.
+        self.event_fork
+            .record(&self.matmul.stream())
+            .expect("event_fork record failed");
+        self.stream_kv
+            .wait_event(&self.event_fork)
+            .expect("stream_kv wait_event(fork) failed");
+
+        // ── K on stream_kv ─────────────────────────────────────────────────────
+        let cu_kv = self.stream_kv.cu_stream();
+        let k_dev = self.dispatch_kv_on_stream(normed, k_name, SLOT_K, cu_kv);
+        let v_dev = self.dispatch_kv_on_stream(normed, v_name, SLOT_V, cu_kv);
+
+        // ── Q on stream_main (normal path, may use Q8 dp4a) ────────────────────
+        let q_dev = self.gemm_any_d2d_slot(normed, q_name, 1, SLOT_Q);
+
+        // Join: stream_main waits for K and V to complete before RoPE.
+        self.event_kv_done
+            .record(&self.stream_kv)
+            .expect("event_kv_done record failed");
+        self.matmul
+            .stream()
+            .wait_event(&self.event_kv_done)
+            .expect("stream_main wait_event(kv_done) failed");
+
+        (q_dev, k_dev, v_dev)
+    }
+
+    /// Dispatch a single K or V GEMV on `cu_stream` using the oxide f32 kernel.
+    ///
+    /// Takes the pre-allocated slot tensor, submits the GEMV into it, puts it
+    /// back in the pool, and returns a clone of the Arc — identical lifecycle to
+    /// `gemm_q4k_d2d_slot` but on an explicit stream instead of `self.stream`.
+    ///
+    /// # Safety
+    /// `cu_stream` must be a valid CUstream that outlives this call (it is captured
+    /// into the CUDA graph, so it lives as long as the graph does).
+    fn dispatch_kv_on_stream(
+        &self,
+        normed: &Arc<Tensor<f32>>,
+        weight_name: &str,
+        slot: usize,
+        cu_stream: cuda_core::sys::CUstream,
+    ) -> Arc<Tensor<f32>> {
+        // Q4K path.
+        if let Some(dw) = self.device_weights_q4k.get(weight_name) {
+            if let Some(oxide) = &self.oxide_q4k_gemv {
+                let a_flat = Arc::clone(normed)
+                    .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::Q4K_BLOCK_SIZE)])
+                    .expect("dispatch_kv_on_stream: Q4K reshape failed");
+                let maybe_tensor = {
+                    let mut pool = self.scratch.borrow_mut();
+                    pool[slot].take().and_then(|arc| Arc::try_unwrap(arc).ok())
+                };
+                if let Some(tensor) = maybe_tensor {
+                    if let Ok(result) = unsafe {
+                        oxide.submit_d2d_into_on(&a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks, cu_stream)
+                    } {
+                        self.scratch.borrow_mut()[slot] = Some(result.clone());
+                        return result;
+                    }
+                }
+                // Pool miss or submit failed: allocate fresh output; cannot alloc on a
+                // capturing stream, so synchronise to fall back to sequential allocation.
+                let result = oxide
+                    .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                    .expect("dispatch_kv_on_stream: Q4K forward_d2d failed");
+                return result;
+            }
+        }
+
+        // Q6K path.
+        if let Some(dw) = self.device_weights_q6k.get(weight_name) {
+            if let Some(oxide) = &self.oxide_q6k_gemv {
+                let a_flat = Arc::clone(normed)
+                    .reshape(&[next_pow2(dw.k_blocks * Q6K_QK)])
+                    .expect("dispatch_kv_on_stream: Q6K reshape failed");
+                let maybe_tensor = {
+                    let mut pool = self.scratch.borrow_mut();
+                    pool[slot].take().and_then(|arc| Arc::try_unwrap(arc).ok())
+                };
+                if let Some(tensor) = maybe_tensor {
+                    if let Ok(result) = unsafe {
+                        oxide.submit_d2d_into_on(&a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks, cu_stream)
+                    } {
+                        self.scratch.borrow_mut()[slot] = Some(result.clone());
+                        return result;
+                    }
+                }
+                return oxide
+                    .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                    .expect("dispatch_kv_on_stream: Q6K forward_d2d failed");
+            }
+        }
+
+        // Q2 path.
+        if let Some(dw) = self.device_weights_q2.get(weight_name) {
+            if let Some(oxide) = &self.oxide_q2_gemv {
+                let a_flat = Arc::clone(normed)
+                    .reshape(&[next_pow2(dw.k_blocks * Q2_0_QK)])
+                    .expect("dispatch_kv_on_stream: Q2 reshape failed");
+                let maybe_tensor = {
+                    let mut pool = self.scratch.borrow_mut();
+                    pool[slot].take().and_then(|arc| Arc::try_unwrap(arc).ok())
+                };
+                if let Some(tensor) = maybe_tensor {
+                    if let Ok(result) = unsafe {
+                        oxide.submit_d2d_into_on(&a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks, cu_stream)
+                    } {
+                        self.scratch.borrow_mut()[slot] = Some(result.clone());
+                        return result;
+                    }
+                }
+                return oxide
+                    .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                    .expect("dispatch_kv_on_stream: Q2 forward_d2d failed");
+            }
+        }
+
+        // Fallback: f32 or cuTile-only — sequential on stream_main.
+        self.gemm_any_d2d_slot(normed, weight_name, 1, slot)
+    }
+
     /// Unified GEMV/GEMM that transparently selects Q4_K, Q6_K, Q2_0 (decode only), or f32.
     ///
     /// For m == 1: checks `device_weights_q4k` first, then `device_weights_q6k`,
@@ -2460,53 +2677,11 @@ impl CutileGpuModel {
         let mut graph_cache = self.cached_decode_graph.borrow_mut();
 
         if let Some(ref decode_graph) = *graph_cache {
-            // ── Subsequent steps: update KV memcpy dst pointers, then launch ─
+            // ── Subsequent steps: update kernel scalars, then launch ──────────
+            // KV writes are handled by the scatter-write kernel inside the graph
+            // (reads d_kv_write_offset at execution time — no driver calls needed).
             // NOTE: seq_len is advanced by the wrapper (kv.advance) after each
             // forward call — do NOT advance again here (would double-count).
-
-            // Update each KV-write memcpy node's dst to the new slot.
-            let kv_dim    = cfg.num_kv_heads * cfg.head_dim;
-            let f32_bytes = std::mem::size_of::<f32>() as u64;
-            let new_dst_offset_bytes = (kv_write_off as u64) * (kv_dim as u64) * f32_bytes;
-
-            // Get CUDA context for cuGraphExecMemcpyNodeSetParams.
-            let mut cu_ctx: cuda_core::sys::CUcontext = std::ptr::null_mut();
-            unsafe { cuda_core::sys::cuCtxGetCurrent(&mut cu_ctx) };
-
-            for entry in &decode_graph.kv_memcpy_entries {
-                let new_dst = entry.cache_base + new_dst_offset_bytes;
-                let params = cuda_core::sys::CUDA_MEMCPY3D {
-                    srcXInBytes: 0, srcY: 0, srcZ: 0, srcLOD: 0,
-                    srcMemoryType: cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE,
-                    srcHost: std::ptr::null(),
-                    srcDevice: entry.src_ptr,
-                    srcArray: std::ptr::null_mut(),
-                    reserved0: std::ptr::null_mut(),
-                    srcPitch: 0, srcHeight: 0,
-                    dstXInBytes: 0, dstY: 0, dstZ: 0, dstLOD: 0,
-                    dstMemoryType: cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE,
-                    dstHost: std::ptr::null_mut(),
-                    dstDevice: new_dst,
-                    dstArray: std::ptr::null_mut(),
-                    reserved1: std::ptr::null_mut(),
-                    dstPitch: 0, dstHeight: 0,
-                    WidthInBytes: entry.width_bytes,
-                    Height: 1, Depth: 1,
-                };
-                let rc = unsafe {
-                    cuda_core::sys::cuGraphExecMemcpyNodeSetParams(
-                        decode_graph.cu_exec,
-                        entry.node,
-                        &params,
-                        cu_ctx,
-                    )
-                };
-                if rc != 0 {
-                    eprintln!("[cuda_graph] cuGraphExecMemcpyNodeSetParams failed: {rc}; falling back");
-                    drop(graph_cache);
-                    return self.forward_decode_nogpu(embedding, positions, gpu_kv_cache);
-                }
-            }
 
             // Update flash-attn kv_len and RoPE pos scalars in the graph's
             // owned parameter buffers (direct writes into extra-buffer storage).
@@ -2575,12 +2750,9 @@ impl CutileGpuModel {
 
             let capture_kv_len = kv_write_off + 1;
             let capture_pos    = positions[0] as i32;
-            let n_kv_heads     = cfg.num_kv_heads as u32;
             let n_heads        = cfg.num_attention_heads as u32;
 
-            eprintln!("[cuda_graph] finding KV memcpy nodes...");
-            let kv_memcpy_entries = self.find_kv_memcpy_nodes(cu_graph, gpu_kv_cache);
-            eprintln!("[cuda_graph] found {} KV memcpy entries, finding kernel nodes...", kv_memcpy_entries.len());
+            eprintln!("[cuda_graph] finding kernel scalar nodes...");
             let (flash_attn_nodes, rope_nodes) =
                 self.find_kernel_scalar_nodes(cu_graph, capture_kv_len, capture_pos, n_heads);
             eprintln!("[cuda_graph] kernel node search done");
@@ -2590,7 +2762,6 @@ impl CutileGpuModel {
                 cu_exec,
                 cu_graph,
                 device: stream.device().clone(),
-                kv_memcpy_entries,
                 flash_attn_nodes,
                 rope_nodes,
             });
@@ -2660,77 +2831,6 @@ impl CutileGpuModel {
             flash_attn_nodes.len(), rope_nodes.len()
         );
         (flash_attn_nodes, rope_nodes)
-    }
-
-    /// Enumerate all MEMCPY nodes in `cu_graph` that write to the KV cache.
-    ///
-    /// These nodes' destination pointers are updated per decode step via
-    /// `cuGraphExecMemcpyNodeSetParams` so the graph can be replayed without
-    /// re-capture.
-    fn find_kv_memcpy_nodes(
-        &self,
-        cu_graph: cuda_core::sys::CUgraph,
-        kv_cache: &CutileKvCache,
-    ) -> Vec<KvMemcpyEntry> {
-        let kv_dim    = self.config.num_kv_heads * self.config.head_dim;
-        let width_tgt = kv_dim * std::mem::size_of::<f32>();
-
-        // Enumerate all graph nodes.
-        let mut num_nodes = 0usize;
-        unsafe { cuda_core::sys::cuGraphGetNodes(cu_graph, std::ptr::null_mut(), &mut num_nodes) };
-        if num_nodes == 0 { return vec![]; }
-        let mut nodes = vec![std::ptr::null_mut::<cuda_core::sys::CUgraphNode_st>(); num_nodes];
-        unsafe { cuda_core::sys::cuGraphGetNodes(cu_graph, nodes.as_mut_ptr(), &mut num_nodes) };
-
-        // Collect K and V device base pointers for all layers.
-        let kv_base_ptrs: Vec<(cuda_core::sys::CUdeviceptr, cuda_core::sys::CUdeviceptr)> = (0..kv_cache.n_layers())
-            .map(|l| {
-                let (k, v) = kv_cache.kv_device_tensors(l);
-                (k.device_pointer().cu_deviceptr(), v.device_pointer().cu_deviceptr())
-            })
-            .collect();
-
-        let f32_bytes = std::mem::size_of::<f32>() as u64;
-        let kv_dim_bytes = kv_dim as u64 * f32_bytes;
-
-        let mut entries = Vec::new();
-        for node in &nodes {
-            let mut node_type: cuda_core::sys::CUgraphNodeType = 0;
-            unsafe { cuda_core::sys::cuGraphNodeGetType(*node, &mut node_type) };
-            if node_type != cuda_core::sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY {
-                continue;
-            }
-            let mut params: cuda_core::sys::CUDA_MEMCPY3D = unsafe { std::mem::zeroed() };
-            let rc = unsafe { cuda_core::sys::cuGraphMemcpyNodeGetParams(*node, &mut params) };
-            if rc != 0 { continue; }
-            if params.WidthInBytes != width_tgt { continue; }
-            if params.srcMemoryType != cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE { continue; }
-            if params.dstMemoryType != cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE { continue; }
-            // Find which layer this node belongs to by matching dst to kv cache range.
-            let dst = params.dstDevice;
-            for (k_base, v_base) in &kv_base_ptrs {
-                let kv_range = kv_cache.gpu_max_seq_len() as u64 * kv_dim_bytes;
-                if dst >= *k_base && dst < k_base + kv_range {
-                    entries.push(KvMemcpyEntry {
-                        node: *node,
-                        src_ptr: params.srcDevice,
-                        cache_base: *k_base,
-                        width_bytes: width_tgt,
-                    });
-                    break;
-                }
-                if dst >= *v_base && dst < v_base + kv_range {
-                    entries.push(KvMemcpyEntry {
-                        node: *node,
-                        src_ptr: params.srcDevice,
-                        cache_base: *v_base,
-                        width_bytes: width_tgt,
-                    });
-                    break;
-                }
-            }
-        }
-        entries
     }
 
     /// Run the decode forward pass without CUDA graph capture.
@@ -2862,9 +2962,18 @@ impl CutileGpuModel {
                 .expect("pre-attention RMSNorm failed");
 
             // Q / K / V projections (GPU, pre-allocated slots).
-            let q_dev = self.gemm_any_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q);
-            let k_dev = self.gemm_any_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K);
-            let v_dev = self.gemm_any_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V);
+            //
+            // Decode (seq_len=1) with oxide GEMVs: K and V run on `stream_kv` concurrently
+            // with Q on `stream_main`.  For GQA models K/V are 4× smaller than Q and hide
+            // behind Q's latency.  The fork/join events are captured by the CUDA graph in
+            // RELAXED mode, so the concurrent topology is replayed on every graph execution.
+            //
+            // K and V use the f32 oxide GEMV (not the Q8 dp4a path) so that each writes into
+            // its own pre-allocated slot tensor (SLOT_K / SLOT_V), avoiding the shared Q8
+            // scratch buffer that would be clobbered by concurrent Q execution on stream_main.
+            let (q_dev, k_dev, v_dev) = self.dispatch_qkv_multistream(
+                &normed_dev, q_w_name, k_w_name, v_w_name, seq_len,
+            );
 
             // RoPE (GPU, pre-allocated scratch; uses precomputed cos/sin table for seq_len=1).
             let q_rot_dev = self
@@ -2894,10 +3003,33 @@ impl CutileGpuModel {
                 )
                 .expect("K RoPE failed");
 
-            // KV cache append (GPU-only; host mirror will be rebuilt on fallback if needed).
-            gpu_kv_cache
-                .append_device_gpu_only(layer, &k_rot_dev, &v_dev, seq_len)
-                .expect("GPU KV cache append failed");
+            // Scatter-write K and V into the KV cache at the slot indicated by
+            // d_kv_write_offset (read from device at execution time).  This is
+            // graph-stable: the src/cache pointers are captured once; only the
+            // value at d_kv_write_offset changes (updated via H→D before each step).
+            let kv_dim_u32 = (n_kv_heads * head_dim) as u32;
+            let (k_cache_arc, v_cache_arc) = gpu_kv_cache.kv_device_tensors(layer);
+            let write_off_ptr = self.d_kv_write_offset.device_pointer().cu_deviceptr();
+            let cu_stream_raw = shared_stream.cu_stream();
+            self.kv_scatter_write
+                .copy_with_device_offset(
+                    k_rot_dev.device_pointer().cu_deviceptr(),
+                    k_cache_arc.device_pointer().cu_deviceptr(),
+                    write_off_ptr,
+                    kv_dim_u32,
+                    cu_stream_raw,
+                )
+                .expect("KV scatter-write K failed");
+            self.kv_scatter_write
+                .copy_with_device_offset(
+                    v_dev.device_pointer().cu_deviceptr(),
+                    v_cache_arc.device_pointer().cu_deviceptr(),
+                    write_off_ptr,
+                    kv_dim_u32,
+                    cu_stream_raw,
+                )
+                .expect("KV scatter-write V failed");
+            gpu_kv_cache.mark_host_stale();
 
             // kv_len includes the token just appended.
             let kv_len = gpu_kv_cache.seq_len() + seq_len;
