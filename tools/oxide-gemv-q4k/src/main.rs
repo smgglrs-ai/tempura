@@ -1454,7 +1454,9 @@ mod kernels {
             let u1_lo   = x_qs[(q8b1_lo * 8 + sub_l) as usize];
             let u1_hi   = x_qs[(q8b1_hi * 8 + sub_l) as usize];
 
-            // Phase 2: Compute gate and up for block 0.
+            // Phase 2: Compute gate and up for block 0 — D deferred to post-sumf (llama.cpp pattern).
+            // Accumulate sumf_d (dot terms) and sumf_m (min terms) without the super-block scale D,
+            // then apply D once: gate_acc += gd * sumf_d - gdmin * sumf_m.
             let d8_0_lo = f16_to_f32(x_ds[q8b0_lo as usize] & 0xFFFF);
             let d8_0_hi = f16_to_f32(x_ds[q8b0_hi as usize] & 0xFFFF);
 
@@ -1464,10 +1466,11 @@ mod kernels {
             let gm0    = warp::shuffle_sync(mini_mask, gm_raw0,  base_lane);
             let gv0_lo = gqs0 & 0x0F0F0F0F;
             let gv0_hi = (gqs0 >> 4) & 0x0F0F0F0F;
-            gate_acc += d8_0_lo * (gd0 * ((gsc0 & 0xFF) as f32) * (dp4a_s32(gv0_lo, u0_lo, 0) as f32)
-                                 - gdmin0 * ((gm0 & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_lo, 0) as f32))
-                     + d8_0_hi * (gd0 * (((gsc0 >> 8) & 0xFF) as f32) * (dp4a_s32(gv0_hi, u0_hi, 0) as f32)
-                                 - gdmin0 * (((gm0 >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_hi, 0) as f32));
+            let gsfd0 = d8_0_lo * ((gsc0 & 0xFF) as f32) * (dp4a_s32(gv0_lo, u0_lo, 0) as f32)
+                       + d8_0_hi * (((gsc0 >> 8) & 0xFF) as f32) * (dp4a_s32(gv0_hi, u0_hi, 0) as f32);
+            let gsfm0 = d8_0_lo * ((gm0 & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_lo, 0) as f32)
+                       + d8_0_hi * (((gm0 >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_hi, 0) as f32);
+            gate_acc += gd0 * gsfd0 - gdmin0 * gsfm0;
 
             let ud0    = f32::from_bits(warp::shuffle(ud_raw0, 0));
             let udmin0 = f32::from_bits(warp::shuffle(udmin_raw0, 0));
@@ -1475,12 +1478,13 @@ mod kernels {
             let um0    = warp::shuffle_sync(mini_mask, um_raw0,  base_lane);
             let uv0_lo = uqs0 & 0x0F0F0F0F;
             let uv0_hi = (uqs0 >> 4) & 0x0F0F0F0F;
-            up_acc += d8_0_lo * (ud0 * ((usc0 & 0xFF) as f32) * (dp4a_s32(uv0_lo, u0_lo, 0) as f32)
-                               - udmin0 * ((um0 & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_lo, 0) as f32))
-                   + d8_0_hi * (ud0 * (((usc0 >> 8) & 0xFF) as f32) * (dp4a_s32(uv0_hi, u0_hi, 0) as f32)
-                               - udmin0 * (((um0 >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_hi, 0) as f32));
+            let usfd0 = d8_0_lo * ((usc0 & 0xFF) as f32) * (dp4a_s32(uv0_lo, u0_lo, 0) as f32)
+                       + d8_0_hi * (((usc0 >> 8) & 0xFF) as f32) * (dp4a_s32(uv0_hi, u0_hi, 0) as f32);
+            let usfm0 = d8_0_lo * ((um0 & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_lo, 0) as f32)
+                       + d8_0_hi * (((um0 >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_hi, 0) as f32);
+            up_acc += ud0 * usfd0 - udmin0 * usfm0;
 
-            // Phase 3: Compute gate and up for block 1.
+            // Phase 3: Compute gate and up for block 1 — D deferred to post-sumf.
             let d8_1_lo = f16_to_f32(x_ds[q8b1_lo as usize] & 0xFFFF);
             let d8_1_hi = f16_to_f32(x_ds[q8b1_hi as usize] & 0xFFFF);
 
@@ -1490,10 +1494,11 @@ mod kernels {
             let gm1    = warp::shuffle_sync(mini_mask, gm_raw1,  base_lane);
             let gv1_lo = gqs1 & 0x0F0F0F0F;
             let gv1_hi = (gqs1 >> 4) & 0x0F0F0F0F;
-            gate_acc += d8_1_lo * (gd1 * ((gsc1 & 0xFF) as f32) * (dp4a_s32(gv1_lo, u1_lo, 0) as f32)
-                                 - gdmin1 * ((gm1 & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_lo, 0) as f32))
-                     + d8_1_hi * (gd1 * (((gsc1 >> 8) & 0xFF) as f32) * (dp4a_s32(gv1_hi, u1_hi, 0) as f32)
-                                 - gdmin1 * (((gm1 >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_hi, 0) as f32));
+            let gsfd1 = d8_1_lo * ((gsc1 & 0xFF) as f32) * (dp4a_s32(gv1_lo, u1_lo, 0) as f32)
+                       + d8_1_hi * (((gsc1 >> 8) & 0xFF) as f32) * (dp4a_s32(gv1_hi, u1_hi, 0) as f32);
+            let gsfm1 = d8_1_lo * ((gm1 & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_lo, 0) as f32)
+                       + d8_1_hi * (((gm1 >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_hi, 0) as f32);
+            gate_acc += gd1 * gsfd1 - gdmin1 * gsfm1;
 
             let ud1    = f32::from_bits(warp::shuffle(ud_raw1, 0));
             let udmin1 = f32::from_bits(warp::shuffle(udmin_raw1, 0));
@@ -1501,10 +1506,11 @@ mod kernels {
             let um1    = warp::shuffle_sync(mini_mask, um_raw1,  base_lane);
             let uv1_lo = uqs1 & 0x0F0F0F0F;
             let uv1_hi = (uqs1 >> 4) & 0x0F0F0F0F;
-            up_acc += d8_1_lo * (ud1 * ((usc1 & 0xFF) as f32) * (dp4a_s32(uv1_lo, u1_lo, 0) as f32)
-                               - udmin1 * ((um1 & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_lo, 0) as f32))
-                   + d8_1_hi * (ud1 * (((usc1 >> 8) & 0xFF) as f32) * (dp4a_s32(uv1_hi, u1_hi, 0) as f32)
-                               - udmin1 * (((um1 >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_hi, 0) as f32));
+            let usfd1 = d8_1_lo * ((usc1 & 0xFF) as f32) * (dp4a_s32(uv1_lo, u1_lo, 0) as f32)
+                       + d8_1_hi * (((usc1 >> 8) & 0xFF) as f32) * (dp4a_s32(uv1_hi, u1_hi, 0) as f32);
+            let usfm1 = d8_1_lo * ((um1 & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_lo, 0) as f32)
+                       + d8_1_hi * (((um1 >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u1_hi, 0) as f32);
+            up_acc += ud1 * usfd1 - udmin1 * usfm1;
 
             blk += WARPS_PER_BLOCK * 2;
         }
@@ -1544,17 +1550,19 @@ mod kernels {
 
             let gv_lo = gqs & 0x0F0F0F0F;
             let gv_hi = (gqs >> 4) & 0x0F0F0F0F;
-            gate_acc += d8_lo * (gd * ((gsc & 0xFF) as f32) * (dp4a_s32(gv_lo, u_lo, 0) as f32)
-                               - gdmin * ((gm & 0xFF) as f32) * (dp4a_s32(0x01010101, u_lo, 0) as f32))
-                     + d8_hi * (gd * (((gsc >> 8) & 0xFF) as f32) * (dp4a_s32(gv_hi, u_hi, 0) as f32)
-                               - gdmin * (((gm >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u_hi, 0) as f32));
+            let gsfd = d8_lo * ((gsc & 0xFF) as f32) * (dp4a_s32(gv_lo, u_lo, 0) as f32)
+                      + d8_hi * (((gsc >> 8) & 0xFF) as f32) * (dp4a_s32(gv_hi, u_hi, 0) as f32);
+            let gsfm = d8_lo * ((gm & 0xFF) as f32) * (dp4a_s32(0x01010101, u_lo, 0) as f32)
+                      + d8_hi * (((gm >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u_hi, 0) as f32);
+            gate_acc += gd * gsfd - gdmin * gsfm;
 
             let uv_lo = uqs & 0x0F0F0F0F;
             let uv_hi = (uqs >> 4) & 0x0F0F0F0F;
-            up_acc += d8_lo * (ud * ((usc & 0xFF) as f32) * (dp4a_s32(uv_lo, u_lo, 0) as f32)
-                             - udmin * ((um & 0xFF) as f32) * (dp4a_s32(0x01010101, u_lo, 0) as f32))
-                   + d8_hi * (ud * (((usc >> 8) & 0xFF) as f32) * (dp4a_s32(uv_hi, u_hi, 0) as f32)
-                             - udmin * (((um >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u_hi, 0) as f32));
+            let usfd = d8_lo * ((usc & 0xFF) as f32) * (dp4a_s32(uv_lo, u_lo, 0) as f32)
+                      + d8_hi * (((usc >> 8) & 0xFF) as f32) * (dp4a_s32(uv_hi, u_hi, 0) as f32);
+            let usfm = d8_lo * ((um & 0xFF) as f32) * (dp4a_s32(0x01010101, u_lo, 0) as f32)
+                      + d8_hi * (((um >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u_hi, 0) as f32);
+            up_acc += ud * usfd - udmin * usfm;
 
             blk += WARPS_PER_BLOCK * 2;
         }
