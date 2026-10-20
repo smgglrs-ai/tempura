@@ -1877,7 +1877,14 @@ impl CutileGpuModel {
             .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::Q4K_BLOCK_SIZE)])
             .expect("gemm_q4k_d2d: reshape [1, stride] → [stride] failed");
         // Prefer oxide with Q8_1 activation quantization (best perf), then v2, then cuTile.
+        // For large projections (n >= 4096: Q proj, O proj), use v3_kpar (8 warps/block)
+        // to achieve 100% SM warp occupancy vs 68.8% with the 4-warp v3 kernel.
         if let Some(oxide) = &self.oxide_q4k_gemv {
+            if oxide.has_v3_kpar() && dw.n >= 4096 {
+                return oxide
+                    .forward_v3_kpar_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                    .expect("OxideQ4kGemv::forward_v3_kpar_d2d failed");
+            }
             if oxide.has_q8_path() {
                 return oxide
                     .forward_q8_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
@@ -2074,7 +2081,13 @@ impl CutileGpuModel {
 
         // Q8 path (dp4a) takes priority over the scratch-tensor f32 path —
         // the quantize+dp4a kernel is preferred for M=1 decode throughput.
+        // For large projections (n >= 4096), use v3_kpar (8 warps/block) for 100% occupancy.
         if let Some(oxide) = &self.oxide_q4k_gemv {
+            if oxide.has_v3_kpar() && dw.n >= 4096 {
+                return oxide
+                    .forward_v3_kpar_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                    .expect("OxideQ4kGemv::forward_v3_kpar_d2d failed in gemm_q4k_d2d_slot");
+            }
             if oxide.has_q8_path() {
                 return oxide
                     .forward_q8_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)

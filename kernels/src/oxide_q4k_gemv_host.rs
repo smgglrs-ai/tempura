@@ -49,9 +49,12 @@ const KERNEL_Q8_GEMV: &str = "q4k_gemv_decode_q8";
 const KERNEL_Q8_GEMV_V2: &str = "q4k_gemv_decode_q8_v2";
 const KERNEL_Q8_GEMV_V3: &str = "q4k_gemv_decode_q8_v3";
 const KERNEL_Q8_GEMV_V3R: &str = "q4k_gemv_decode_q8_v3r"; // raw GGUF 36-u32 format
+const KERNEL_Q8_GEMV_V3_KPAR: &str = "q4k_gemv_decode_q8_v3_kpar"; // 8 warps/block for Q/O proj
 const KERNEL_FUSED_SILU: &str = "q4k_gemv_fused_silu_mul"; // fused gate+up+SiLU
 const WARPS_PER_BLOCK: u32 = 4;
 const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128
+const WARPS_PER_BLOCK_KPAR: u32 = 8;
+const BLOCK_DIM_KPAR: u32 = WARPS_PER_BLOCK_KPAR * 32; // 256
 
 /// Launches the oxide-compiled Q4_K GEMV kernel for M=1 decode.
 pub struct OxideQ4kGemv {
@@ -67,6 +70,8 @@ pub struct OxideQ4kGemv {
     cu_q8_gemv_v3:     Option<CUfunction>,
     /// Optional Q4K+Q8_1 GEMV v3r kernel (v3 + raw GGUF 36-u32 format, 14% less DRAM).
     cu_q8_gemv_v3r:    Option<CUfunction>,
+    /// Optional Q4K+Q8_1 GEMV v3_kpar kernel (8 warps/block → 100% SM occupancy for large N).
+    cu_q8_gemv_v3_kpar: Option<CUfunction>,
     /// Optional batched Q4K GEMV: grid=(N,M,1), L2-shared weight blocks.
     cu_batch_gemv:     Option<CUfunction>,
     /// Optional colocated GEMM: all M rows in one block, L2 broadcast for weights.
@@ -165,21 +170,23 @@ impl OxideQ4kGemv {
             let cu_q8_quantize = load_fn(KERNEL_Q8_QUANTIZE);
             let cu_q8_gemv     = load_fn(KERNEL_Q8_GEMV);
             let cu_q8_gemv_v2  = load_fn(KERNEL_Q8_GEMV_V2);
-            let cu_q8_gemv_v3  = load_fn(KERNEL_Q8_GEMV_V3);
-            let cu_q8_gemv_v3r = load_fn(KERNEL_Q8_GEMV_V3R);
+            let cu_q8_gemv_v3      = load_fn(KERNEL_Q8_GEMV_V3);
+            let cu_q8_gemv_v3r     = load_fn(KERNEL_Q8_GEMV_V3R);
+            let cu_q8_gemv_v3_kpar = load_fn(KERNEL_Q8_GEMV_V3_KPAR);
             let cu_batch_gemv  = load_fn(KERNEL_BATCH);
             let cu_colocated   = load_fn(KERNEL_COLOCATED);
             let cu_smem        = load_fn(KERNEL_SMEM);
             let cu_fused_silu  = load_fn(KERNEL_FUSED_SILU);
 
             eprintln!(
-                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={}, q8v2={}, q8v3={}, q8v3r={}, fused_silu={}, uses_raw_gguf={}, batch={})",
+                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={}, q8v2={}, q8v3={}, q8v3r={}, q8v3_kpar={}, fused_silu={}, uses_raw_gguf={}, batch={})",
                 OXIDE_Q4K_PTX.len(),
                 KERNEL_ENTRY,
                 cu_q8_gemv.is_some(),
                 cu_q8_gemv_v2.is_some(),
                 cu_q8_gemv_v3.is_some(),
                 cu_q8_gemv_v3r.is_some(),
+                cu_q8_gemv_v3_kpar.is_some(),
                 cu_fused_silu.is_some(),
                 false, // uses_raw_gguf — see note below
                 cu_batch_gemv.is_some(),
@@ -192,7 +199,7 @@ impl OxideQ4kGemv {
             // in gemm_any_d2d_slot handles 36-u32 format correctly), but v3 is faster.
             let uses_raw_gguf = false;
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, uses_raw_gguf, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_q8_gemv_v3_kpar, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, uses_raw_gguf, stream,
                 q8_qs_scratch:      std::cell::RefCell::new(None),
                 q8_ds_scratch:      std::cell::RefCell::new(None),
                 q8_out_scratch:     std::cell::RefCell::new(None),
@@ -607,6 +614,141 @@ impl OxideQ4kGemv {
     pub fn has_q8_path(&self) -> bool {
         self.cu_q8_quantize.is_some()
             && (self.cu_q8_gemv_v3.is_some() || self.cu_q8_gemv_v2.is_some() || self.cu_q8_gemv.is_some())
+    }
+
+    /// Returns true when the v3_kpar kernel (8 warps/block) is compiled into the PTX.
+    pub fn has_v3_kpar(&self) -> bool {
+        self.cu_q8_quantize.is_some() && self.cu_q8_gemv_v3_kpar.is_some()
+    }
+
+    /// K-parallel Q4K+Q8_1 GEMV using 8 warps/block for 100% SM occupancy on large projections.
+    ///
+    /// Quantizes `x` to Q8_1 then launches `q4k_gemv_decode_q8_v3_kpar` with 256 threads/block.
+    /// Use for n_rows >= 4096 (Q proj, O proj) where the 8-warp config saturates SM warp slots.
+    ///
+    /// Grid = (N, 1, 1). Block = (256, 1, 1). smem = 128 bytes.
+    pub fn forward_v3_kpar_d2d(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let q8_quant_fn = match self.cu_q8_quantize {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
+        };
+        let kpar_fn = match self.cu_q8_gemv_v3_kpar {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("v3_kpar kernel not loaded".into())),
+        };
+
+        let k = k_blocks * 256;
+        let k_q8_blocks = k.div_ceil(32);
+
+        let use_scratch = self.q8_qs_scratch.borrow().as_ref()
+            .map(|t| t.size() >= k / 4)
+            .unwrap_or(false);
+
+        let x_qs_arc: Arc<Tensor<u32>>;
+        let x_ds_arc: Arc<Tensor<u32>>;
+        let out_arc: Arc<Tensor<f32>>;
+
+        if use_scratch {
+            x_qs_arc = self.q8_qs_scratch.borrow().as_ref().unwrap().clone();
+            x_ds_arc = self.q8_ds_scratch.borrow().as_ref().unwrap().clone();
+            out_arc  = self.q8_out_scratch.borrow().as_ref().unwrap().clone();
+        } else {
+            x_qs_arc = Arc::new(api::zeros::<u32>(&[k / 4])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+            x_ds_arc = Arc::new(api::zeros::<u32>(&[k_q8_blocks])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+            out_arc  = Arc::new(api::zeros::<f32>(&[n])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+        }
+        let x_qs = x_qs_arc.as_ref();
+        let x_ds = x_ds_arc.as_ref();
+        let out  = out_arc.as_ref();
+
+        let cu_stream = self.stream.cu_stream();
+
+        // ── Launch quantize_q8_1 ────────────────────────────────────────────
+        {
+            let qs_ptr:  u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len:  u64 = (k / 4) as u64;
+            let ds_ptr:  u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len:  u64 = k_q8_blocks as u64;
+            let x_ptr:   u64 = x.device_pointer().cu_deviceptr();
+            let x_len:   u64 = x.size() as u64;
+            let k_u32:   u32 = k as u32;
+
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr  as *const _ as *mut c_void,
+                &qs_len  as *const _ as *mut c_void,
+                &ds_ptr  as *const _ as *mut c_void,
+                &ds_len  as *const _ as *mut c_void,
+                &x_ptr   as *const _ as *mut c_void,
+                &x_len   as *const _ as *mut c_void,
+                &k_u32   as *const _ as *mut c_void,
+            ];
+            let grid_x = k_q8_blocks.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            unsafe {
+                launch_kernel(
+                    q8_quant_fn,
+                    (grid_x, 1, 1),
+                    (BLOCK_DIM, 1, 1),
+                    0,
+                    cu_stream,
+                    &mut params,
+                )
+            }
+            .map_err(|e| KernelError::InvalidConfig(format!("oxide quantize_q8_1 (kpar): {e}")))?;
+        }
+
+        // ── Launch q4k_gemv_decode_q8_v3_kpar ───────────────────────────────
+        {
+            let out_ptr:  u64 = out.device_pointer().cu_deviceptr();
+            let out_len:  u64 = n as u64;
+            let qs_ptr:   u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len:   u64 = (k / 4) as u64;
+            let ds_ptr:   u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len:   u64 = k_q8_blocks as u64;
+            let pk_ptr:   u64 = packed.device_pointer().cu_deviceptr();
+            let pk_len:   u64 = packed.size() as u64;
+            let n_u32:    u32 = n as u32;
+            let kb_u32:   u32 = k_blocks as u32;
+
+            let mut params: [*mut c_void; 10] = [
+                &out_ptr as *const _ as *mut c_void,
+                &out_len as *const _ as *mut c_void,
+                &qs_ptr  as *const _ as *mut c_void,
+                &qs_len  as *const _ as *mut c_void,
+                &ds_ptr  as *const _ as *mut c_void,
+                &ds_len  as *const _ as *mut c_void,
+                &pk_ptr  as *const _ as *mut c_void,
+                &pk_len  as *const _ as *mut c_void,
+                &n_u32   as *const _ as *mut c_void,
+                &kb_u32  as *const _ as *mut c_void,
+            ];
+            // smem: 32 f32 slots = 128 bytes (8 warps × 4 mw slots; Blackwell predicated-smem safe).
+            let smem_bytes: u32 = 32 * 4;
+            unsafe {
+                launch_kernel(
+                    kpar_fn,
+                    (n as u32, 1, 1),
+                    (BLOCK_DIM_KPAR, 1, 1),
+                    smem_bytes,
+                    cu_stream,
+                    &mut params,
+                )
+            }
+            .map_err(|e| KernelError::InvalidConfig(format!("oxide q4k_gemv_decode_q8_v3_kpar: {e}")))?;
+        }
+
+        Ok(out_arc)
     }
 
     /// Quantize `x` (f32 K-vector) → Q8_1 packed int8 + scales, then run Q4K GEMV.
