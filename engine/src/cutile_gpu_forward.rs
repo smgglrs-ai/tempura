@@ -1610,6 +1610,15 @@ impl CutileGpuModel {
                     .expect("pre_allocate_q8_scratch failed");
             }
         }
+
+        // Pre-allocate kpar output scratch for the Q6K sm120_mbar GEMV.
+        // max_n = inter (largest Q6K output, e.g. gate/up_proj for MLP FFN expand).
+        if let Some(ref oxide) = self.oxide_q6k_gemv {
+            if oxide.has_kpar() {
+                oxide.pre_allocate_kpar_output_scratch(inter)
+                    .expect("oxide Q6K: pre_allocate_kpar_output_scratch failed");
+            }
+        }
     }
 
     /// Non-blocking variant of `gemm_d2d_slot`.
@@ -2024,6 +2033,17 @@ impl CutileGpuModel {
             }
         };
 
+        // Prefer kpar (sm120_mbar or dp4a_kpar8) for best throughput.
+        // kpar allocates its own output, so it must be called outside graph capture.
+        // For CUDA-graph-captured paths, the slot-hit below uses submit_kpar_d2d_into_on.
+        if let Some(oxide) = &self.oxide_q6k_gemv {
+            if oxide.has_kpar() {
+                return oxide
+                    .forward_kpar_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                    .expect("OxideQ6kGemv::forward_kpar_d2d failed in gemm_q6k_d2d_slot");
+            }
+        }
+
         if let Some(tensor) = maybe_tensor {
             if let Some(oxide) = &self.oxide_q6k_gemv {
                 if let Ok(result) = unsafe {
@@ -2041,7 +2061,7 @@ impl CutileGpuModel {
             }
         }
 
-        // Use oxide kernel if available (preferred for M=1 decode).
+        // Use oxide baseline if available (no kpar).
         if let Some(oxide) = &self.oxide_q6k_gemv {
             return oxide
                 .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
