@@ -2254,15 +2254,31 @@ impl CutileGpuModel {
                     pool[slot].take().and_then(|arc| Arc::try_unwrap(arc).ok())
                 };
                 if let Some(tensor) = maybe_tensor {
-                    if let Ok(result) = unsafe {
-                        oxide.submit_d2d_into_on(&a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks, cu_stream)
-                    } {
-                        self.scratch.borrow_mut()[slot] = Some(result.clone());
-                        return result;
+                    // Native format: use v4 kpar with per-KV-stream Q8_1 scratch.
+                    // This avoids the data race with Q's Q8 scratch on stream_main.
+                    if oxide.uses_raw_gguf && oxide.has_v4_kpar() {
+                        if let Ok(result) = unsafe {
+                            oxide.submit_v4_kpar_kv_into_slot(
+                                &a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks, cu_stream,
+                            )
+                        } {
+                            self.scratch.borrow_mut()[slot] = Some(result.clone());
+                            return result;
+                        }
+                        // v4 failed -- fall through to pool-miss path below.
+                    } else {
+                        // Repacked format: use the basic f32 GEMV (reads 42-u32).
+                        if let Ok(result) = unsafe {
+                            oxide.submit_d2d_into_on(
+                                &a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks, cu_stream,
+                            )
+                        } {
+                            self.scratch.borrow_mut()[slot] = Some(result.clone());
+                            return result;
+                        }
                     }
                 }
-                // Pool miss or submit failed: allocate fresh output; cannot alloc on a
-                // capturing stream, so synchronise to fall back to sequential allocation.
+                // Pool miss or submit failed: synchronous fallback (not during graph capture).
                 let result = oxide
                     .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
                     .expect("dispatch_kv_on_stream: Q4K forward_d2d failed");

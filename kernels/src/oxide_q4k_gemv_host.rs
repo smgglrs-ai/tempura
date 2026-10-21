@@ -100,6 +100,12 @@ pub struct OxideQ4kGemv {
     q8_out_scratch:    std::cell::RefCell<Option<Arc<Tensor<f32>>>>,  // [max_n]
     /// Pre-allocated output for the fused gate+up SiLU kernel.
     fused_silu_scratch: std::cell::RefCell<Option<Arc<Tensor<f32>>>>, // [max_n]
+    /// Separate Q8_1 activation scratch for the KV stream (stream_kv).
+    /// The main q8_qs_scratch / q8_ds_scratch are used by Q projection on stream_main.
+    /// K and V run concurrently on stream_kv -- they need their own scratch to avoid
+    /// data races when uses_raw_gguf=true (both use quantize_q8_1 via submit_v4_kpar_kv_into_slot).
+    kv_q8_qs_scratch: std::cell::RefCell<Option<Arc<Tensor<u32>>>>,
+    kv_q8_ds_scratch: std::cell::RefCell<Option<Arc<Tensor<u32>>>>,
 }
 
 unsafe impl Send for OxideQ4kGemv {}
@@ -276,17 +282,19 @@ impl OxideQ4kGemv {
                 cu_fused_silu.is_some(),
                 cu_batch_gemv.is_some(),
             );
-            // v3r: raw GGUF format for the oxide sm_80 path — benchmarked and DISABLED (101 vs 107 tok/s).
-            // uses_raw_gguf=false: v4 kernel reads repacked 42-u32 format (same as v3_kpar).
-            // dispatch_kv_on_stream uses the basic f32 GEMV (repacked format), so weights
-            // must also be in repacked format. See q4k_gemv_v4_ptx.rs for the future plan.
-            let uses_raw_gguf = false;
+            // v3r: raw GGUF format for the oxide sm_80 path — benchmarked and DISABLED.
+            // uses_raw_gguf=true when v4 is selected: v4 reads native 36-u32 GGUF format.
+            // dispatch_kv_on_stream uses submit_v4_kpar_kv_into_slot (with per-KV-stream
+            // Q8_1 scratch) when uses_raw_gguf=true, so K/V weights can also be native.
+            let uses_raw_gguf = uses_v4;
             Some(Self {
                 cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_q8_gemv_v3_kpar, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_v4_module, cu_v4_kpar, kpar_dispatch, uses_raw_gguf, stream,
                 q8_qs_scratch:      std::cell::RefCell::new(None),
                 q8_ds_scratch:      std::cell::RefCell::new(None),
                 q8_out_scratch:     std::cell::RefCell::new(None),
                 fused_silu_scratch: std::cell::RefCell::new(None),
+                kv_q8_qs_scratch:   std::cell::RefCell::new(None),
+                kv_q8_ds_scratch:   std::cell::RefCell::new(None),
             })
         }
     }
@@ -538,6 +546,97 @@ impl OxideQ4kGemv {
         Ok(Arc::new(out))
     }
 
+    /// Launch quantize_q8_1 + v4_kpar on a specified CUDA stream, writing to a
+    /// caller-supplied slot tensor.  Uses separate `kv_q8_qs_scratch` /
+    /// `kv_q8_ds_scratch` to avoid racing with the main stream's Q8 scratch
+    /// (which Q projection uses concurrently on stream_main).
+    ///
+    /// Called by `dispatch_kv_on_stream` when `uses_raw_gguf=true` (native 36-u32
+    /// format).  `packed` must be in native 36-u32 format.
+    ///
+    /// # Safety
+    /// `cu_kv_stream` must be a valid CUstream for the duration of the launches.
+    pub unsafe fn submit_v4_kpar_kv_into_slot(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        out: Tensor<f32>,
+        n: usize,
+        k_blocks: usize,
+        cu_kv_stream: cuda_core::sys::CUstream,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let kpar_fn = match &self.kpar_dispatch {
+            Some(v) if v.min_cc >= 1200 => v.cu_fn,
+            _ => return Err(KernelError::InvalidConfig("v4_kpar not available for KV dispatch".into())),
+        };
+        let q8_quant_fn = match self.cu_q8_quantize {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
+        };
+
+        let k = k_blocks * 256;
+        let k_q8_blocks = k.div_ceil(32);
+
+        // Use KV-specific activation scratch (separate from main-stream Q8 scratch).
+        let x_qs = match &*self.kv_q8_qs_scratch.borrow() {
+            Some(t) if t.size() >= k / 4 => t.clone(),
+            _ => return Err(KernelError::InvalidConfig(
+                "kv_q8_qs_scratch not pre-allocated or too small".into(),
+            )),
+        };
+        let x_ds = match &*self.kv_q8_ds_scratch.borrow() {
+            Some(t) if t.size() >= k_q8_blocks => t.clone(),
+            _ => return Err(KernelError::InvalidConfig(
+                "kv_q8_ds_scratch not pre-allocated or too small".into(),
+            )),
+        };
+
+        // ── quantize_q8_1 on cu_kv_stream ──────────────────────────────────────
+        {
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len: u64 = (k / 4) as u64;
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len: u64 = k_q8_blocks as u64;
+            let x_ptr:  u64 = x.device_pointer().cu_deviceptr();
+            let x_len:  u64 = x.size() as u64;
+            let k_u32:  u32 = k as u32;
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr as *const _ as *mut c_void,
+                &qs_len as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ds_len as *const _ as *mut c_void,
+                &x_ptr  as *const _ as *mut c_void,
+                &x_len  as *const _ as *mut c_void,
+                &k_u32  as *const _ as *mut c_void,
+            ];
+            let grid_x = k_q8_blocks.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            launch_kernel(q8_quant_fn, (grid_x, 1, 1), (BLOCK_DIM, 1, 1), 0, cu_kv_stream, &mut params)
+                .map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 (kv stream v4): {e}")))?;
+        }
+
+        // ── v4_kpar on cu_kv_stream, writing into `out` ──────────────────────
+        {
+            let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ou_ptr: u64 = out.device_pointer().cu_deviceptr();
+            let n_u32:  u32 = n as u32;
+            let kb_u32: u32 = k_blocks as u32;
+            let mut params: [*mut c_void; 6] = [
+                &wt_ptr as *const _ as *mut c_void,
+                &qs_ptr as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ou_ptr as *const _ as *mut c_void,
+                &n_u32  as *const _ as *mut c_void,
+                &kb_u32 as *const _ as *mut c_void,
+            ];
+            launch_kernel(kpar_fn, (n as u32, 1, 1), (BLOCK_DIM_KPAR, 1, 1), 128, cu_kv_stream, &mut params)
+                .map_err(|e| KernelError::InvalidConfig(format!("v4_kpar KV slot: {e}")))?;
+        }
+
+        Ok(Arc::new(out))
+    }
+
     /// Like `submit_d2d_into` but launches on an explicit CUDA stream.
     ///
     /// Used by the multi-stream QKV path to run K and V GEMVs on `stream_kv`
@@ -681,6 +780,21 @@ impl OxideQ4kGemv {
         if self.cu_fused_silu.is_some() {
             *self.fused_silu_scratch.borrow_mut() = Some(Arc::new(
                 api::zeros::<f32>(&[max_n])
+                    .sync_on(&self.stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+            ));
+        }
+        // When v4 is active (uses_raw_gguf=true), K/V projections use submit_v4_kpar_kv_into_slot
+        // on stream_kv concurrently with Q on stream_main. They need their own Q8_1 scratch to
+        // avoid data races. Size: same as main scratch (max_k covers all projection dims).
+        if self.uses_raw_gguf {
+            *self.kv_q8_qs_scratch.borrow_mut() = Some(Arc::new(
+                api::zeros::<u32>(&[max_k / 4])
+                    .sync_on(&self.stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+            ));
+            *self.kv_q8_ds_scratch.borrow_mut() = Some(Arc::new(
+                api::zeros::<u32>(&[k_q8_blocks])
                     .sync_on(&self.stream)
                     .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
             ));

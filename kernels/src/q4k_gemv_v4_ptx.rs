@@ -1,30 +1,42 @@
 /// Hand-tuned PTX kernel for Q4K x Q8_1 GEMV decode, targeting sm_120 (Blackwell RTX 5090).
 ///
-/// # Current implementation: repacked 42-u32 format (same layout as v3_kpar)
+/// # Implementation: native 36-u32 GGUF format
 ///
-/// This kernel reads Q4K weights in the REPACKED 42-u32 format (168 bytes/block)
-/// which is identical to what v3_kpar reads. The key benefit over v3_kpar is direct
-/// sm_120 codegen: optimal register allocation, instruction scheduling, and no JIT
-/// overhead (v3_kpar is sm_80 PTX JIT'd to sm_120 by the driver).
+/// This kernel reads Q4K weights in the NATIVE 36-u32 GGUF format (144 bytes/block),
+/// giving 14% fewer DRAM reads vs the repacked 42-u32 format (168 bytes/block).
 ///
-/// # Why not native 36-u32 format?
+/// The engine's `dispatch_kv_on_stream` now uses `submit_v4_kpar_kv_into_slot` for K/V
+/// projections (separate per-KV-stream Q8_1 scratch avoids racing with Q on stream_main).
 ///
-/// The production engine dispatches K/V projections via `dispatch_kv_on_stream` which
-/// calls the basic f32 GEMV kernel. That kernel reads repacked 42-u32. If we used
-/// native 36-u32 format, K/V GEMV would read the wrong memory layout, producing NaN
-/// values that crash the graph replay (CUDA error 719). Proper native-format support
-/// requires per-slot output tensors for K/V — a larger engine refactor tracked as
-/// a future optimization.
-///
-/// # Repacked Q4K block layout (42 u32 = 168 bytes per block of 256 elements)
+/// # Native Q4K block layout (36 u32 = 144 bytes per block of 256 elements)
 ///
 /// ```text
-/// u32[0]:   d    (f32 bits, was f16 in GGUF, converted at upload)
-/// u32[1]:   dmin (f32 bits)
-/// u32[2+j]: sc[2j] | sc[2j+1]<<8  for j=0..3  (8-bit sub-block scale pairs)
-/// u32[6+j]: m[2j] | m[2j+1]<<8   for j=0..3  (8-bit sub-block min pairs)
-/// u32[10..42]: qs data (128 bytes = 256 nibbles, 4-bit each)
+/// bytes  0-1:  d    (f16 super-scale)
+/// bytes  2-3:  dmin (f16 super-min)
+/// bytes  4-15: scales[12] (6-bit packed: 8 x (sc, m) pairs)
+/// bytes 16-143: qs[128] (packed nibbles)
 /// ```
+///
+/// Scale layout in scales[12]:
+///   ps0 = u32 from bytes 4-7, ps1 from bytes 8-11, ps2 from bytes 12-15
+///
+///   For mw=0,1 (shift = (mw&1)*16):
+///     sc_lo = (ps0 >> shift) & 63
+///     sc_hi = (ps0 >> (shift+8)) & 63
+///     m_lo  = (ps1 >> shift) & 63
+///     m_hi  = (ps1 >> (shift+8)) & 63
+///
+///   For mw=2,3 (shift = (mw&1)*16, cross-byte encoding):
+///     b0 = (ps0>>shift)&0xFF, b1 = (ps0>>(shift+8))&0xFF
+///     b4 = (ps1>>shift)&0xFF, b5 = (ps1>>(shift+8))&0xFF
+///     b8 = (ps2>>shift)&0xFF, b9 = (ps2>>(shift+8))&0xFF
+///     sc_lo = (b8&0x0F) | ((b0&0xC0)>>2)
+///     sc_hi = (b9&0x0F) | ((b1&0xC0)>>2)
+///     m_lo  = ((b8>>4)&0x0F) | ((b4&0xC0)>>2)
+///     m_hi  = ((b9>>4)&0x0F) | ((b5&0xC0)>>2)
+///
+///   Scale extraction is BRANCHLESS (selp) -- ITS (Independent Thread Scheduling)
+///   on Volta+ does not auto-reconverge warp divergence in hand-written PTX.
 ///
 /// # Q8_1 activation layout (9 u32 = 36 bytes per 32-element block)
 ///
@@ -35,25 +47,19 @@
 ///
 /// # Launch geometry
 ///
-/// Grid:  (n_rows, 1, 1) — one block per output row
-/// Block: (256, 1, 1)    — 8 warps x 32 threads
-/// Smem:  128 bytes      — 32 f32 slots (8 warps x 4 j-groups)
-///
-/// # Mini-warp structure (same as v3_kpar)
-///
-/// mw = lane/8 (0..3, j-group index), sub_l = lane%8 (0..7)
-/// All 32 lanes execute the same instructions (no divergence), using
-/// mw-dependent index computations for scale/qs access.
+/// Grid:  (n_rows, 1, 1)  -- one block per output row
+/// Block: (256, 1, 1)     -- 8 warps x 32 threads
+/// Smem:  128 bytes       -- 32 f32 slots (8 warps x 4 j-groups)
 ///
 /// # K-parallelism
 ///
-/// 8 warps stride by 8 blocks per iteration (VDR=1 for simplicity).
+/// 8 warps stride by 8 blocks per iteration (VDR=1).
 /// With k_blocks=16 (dim=4096), each warp handles exactly 2 blocks.
 ///
 /// # Kernel parameters
 ///
 /// ```text
-/// param_weights:  *const u32  -- repacked Q4K blocks [n_rows * k_blocks * 42]
+/// param_weights:  *const u32  -- native Q4K blocks [n_rows * k_blocks * 36]
 /// param_act_qs:   *const u32  -- Q8_1 quantized activations [k/4 packed i8s]
 /// param_act_ds:   *const u32  -- Q8_1 block scales [k/32 f16s, low 16 bits of u32]
 /// param_out:      *mut f32    -- output [n_rows]
@@ -66,24 +72,12 @@ pub const PTX: &str = r#"
 .address_size 64
 
 // q4k_gemv_decode_v4_kpar
-// Repacked Q4K (42 u32/block) x Q8_1 GEMV decode.
+// Native GGUF Q4K (36 u32/block = 144 bytes) x Q8_1 GEMV decode.
 // sm_120 (Blackwell) hand-tuned PTX -- direct codegen, no JIT.
 //
-// Reads the same repacked 42-u32 block format as v3_kpar (oxide sm_80 kernel).
-// Advantage: direct sm_120 codegen avoids driver JIT overhead and enables
-// optimal register allocation and instruction scheduling for Blackwell.
-//
-// Scale extraction is SIMPLER than native format: scales are already 8-bit
-// expanded (not 6-bit packed), with NO branch divergence in this kernel.
-//
-// Block geometry: 256 threads = 8 warps.
-//   lane    = tid & 31          (0..31)
-//   warp_id = tid >> 5          (0..7)
-//   mw      = lane >> 3         (0..3, j-group index)
-//   sub_l   = lane & 7          (0..7)
-//
-// Shared memory: 32 x 4 = 128 bytes (warp_id * 4 + mw -> partial sum).
-// K-parallelism: warp w processes k-blocks w, w+8, w+16, ... (stride 8).
+// Block: 256 threads = 8 warps. K-parallel: warp w handles blk w, w+8, w+16, ...
+// Scale extraction: BRANCHLESS (selp) -- avoids ITS warp divergence.
+// shfl.sync.bfly c=0x71F: segMask=7, maxLane=31 (correct for 8-lane mini-warp).
 .visible .entry q4k_gemv_decode_v4_kpar(
     .param .u64 param_weights,
     .param .u64 param_act_qs,
@@ -121,6 +115,14 @@ pub const PTX: &str = r#"
     shr.u32 %r6, %r4, 3;          // mw = lane >> 3  (0..3, j-group)
     and.b32 %r7, %r4, 7;          // sub_l = lane & 7
 
+    // shift = (mw & 1) << 4  [0 for mw=0,2; 16 for mw=1,3]
+    and.b32 %r8, %r6, 1;
+    shl.b32 %r8, %r8, 4;
+
+    // is_upper = mw >> 1  [1 for mw=2,3; 0 for mw=0,1]
+    shr.u32 %r9, %r6, 1;
+    setp.ne.u32 %p1, %r9, 0;      // %p1 = is_upper
+
     // sub_l == 0 predicate (for smem write in reduction)
     setp.eq.u32 %p2, %r7, 0;      // %p2 = (sub_l == 0)
 
@@ -135,182 +137,192 @@ KLOOP:
     setp.ge.u32 %p3, %r12, %r1;   // blk >= k_blocks -> exit loop
     @%p3 bra REDUCE;
 
-    // base_ptr = weights + (n_out * k_blocks + blk) * 168 bytes (42 u32 * 4)
+    // base_ptr = weights + (n_out * k_blocks + blk) * 144 bytes (36 u32 * 4)
     mad.lo.u32 %r14, %r2, %r1, %r12;  // n_out * k_blocks + blk
-    mul.lo.u32 %r15, %r14, 168;        // * 168 bytes/block
+    mul.lo.u32 %r15, %r14, 144;        // * 144 bytes/block
     cvt.u64.u32 %rd4, %r15;
     add.u64 %rd4, %rd0, %rd4;          // %rd4 = base_ptr
 
-    // -- Load d and dmin (f32 bits stored directly in repacked format) ----------
-    // u32[0] = d as f32 bits, u32[1] = dmin as f32 bits. All lanes load same
-    // address (L1 broadcast within warp).
-    ld.global.b32 %r16, [%rd4];        // d bits (f32)
-    ld.global.b32 %r17, [%rd4 + 4];   // dmin bits (f32)
-    mov.b32 %f1, %r16;                  // d as f32
-    mov.b32 %f2, %r17;                  // dmin as f32
+    // -- Load d and dmin as f16 (bytes 0-1, 2-3) -- L1 broadcast for all lanes
+    ld.global.b16 %h0, [%rd4];         // d as f16 (bytes 0-1)
+    ld.global.b16 %h1, [%rd4 + 2];    // dmin as f16 (bytes 2-3)
+    cvt.f32.f16 %f1, %h0;              // d as f32 (exact, no rounding modifier)
+    cvt.f32.f16 %f2, %h1;              // dmin as f32
 
-    // -- Load scale pair for this j-group (mw) ---------------------------------
-    // sc_pair = u32[2 + mw] = sc_lo | sc_hi<<8  (8-bit each)
-    // m_pair  = u32[6 + mw] = m_lo  | m_hi<<8
-    // Offset for sc_pair: (2 + mw) * 4 = 8 + mw*4 bytes
-    shl.b32    %r18, %r6, 2;           // mw * 4 bytes
-    add.u32    %r18, %r18, 8;          // + 8 bytes (skip u32[0,1] = d,dmin)
-    cvt.u64.u32 %rd5, %r18;
+    // -- Load scale words (bytes 4-15) -- same for all lanes, L1 broadcast
+    ld.global.b32 %r16, [%rd4 + 4];   // ps0 = scales[0..3]
+    ld.global.b32 %r17, [%rd4 + 8];   // ps1 = scales[4..7]
+    ld.global.b32 %r18, [%rd4 + 12];  // ps2 = scales[8..11]
+
+    // -- Branchless scale extraction (no branch divergence, avoids ITS issues) -
+    // Compute shift+8 once for both lower and upper formulas.
+    add.u32 %r19, %r8, 8;              // shift + 8
+
+    // Lower formula (mw=0,1): 6-bit direct extraction
+    shr.u32 %r20, %r16, %r8;           // ps0 >> shift
+    and.b32 %r20, %r20, 63;            // lo_sc_lo = & 0x3F
+
+    shr.u32 %r21, %r16, %r19;          // ps0 >> (shift+8)
+    and.b32 %r21, %r21, 63;            // lo_sc_hi
+
+    shr.u32 %r22, %r17, %r8;           // ps1 >> shift
+    and.b32 %r22, %r22, 63;            // lo_m_lo
+
+    shr.u32 %r23, %r17, %r19;          // ps1 >> (shift+8)
+    and.b32 %r23, %r23, 63;            // lo_m_hi
+
+    // Upper formula (mw=2,3): cross-byte 6-bit extraction
+    // Extract bytes from ps0,ps1,ps2 at positions shift and shift+8
+    shr.u32 %r40, %r16, %r8;  and.b32 %r40, %r40, 255;   // b0
+    shr.u32 %r41, %r16, %r19; and.b32 %r41, %r41, 255;   // b1
+    shr.u32 %r42, %r17, %r8;  and.b32 %r42, %r42, 255;   // b4
+    shr.u32 %r43, %r17, %r19; and.b32 %r43, %r43, 255;   // b5
+    shr.u32 %r44, %r18, %r8;  and.b32 %r44, %r44, 255;   // b8
+    shr.u32 %r45, %r18, %r19; and.b32 %r45, %r45, 255;   // b9
+
+    // up_sc_lo = (b8 & 0x0F) | ((b0 & 0xC0) >> 2)
+    and.b32 %r47, %r44, 15;
+    and.b32 %r46, %r40, 192; shr.u32 %r46, %r46, 2;
+    or.b32  %r47, %r47, %r46;
+
+    // up_sc_hi = (b9 & 0x0F) | ((b1 & 0xC0) >> 2)
+    and.b32 %r48, %r45, 15;
+    and.b32 %r46, %r41, 192; shr.u32 %r46, %r46, 2;
+    or.b32  %r48, %r48, %r46;
+
+    // up_m_lo = ((b8 >> 4) & 0x0F) | ((b4 & 0xC0) >> 2)
+    shr.u32 %r49, %r44, 4; and.b32 %r49, %r49, 15;
+    and.b32 %r46, %r42, 192; shr.u32 %r46, %r46, 2;
+    or.b32  %r49, %r49, %r46;
+
+    // up_m_hi = ((b9 >> 4) & 0x0F) | ((b5 & 0xC0) >> 2)
+    shr.u32 %r50, %r45, 4; and.b32 %r50, %r50, 15;
+    and.b32 %r46, %r43, 192; shr.u32 %r46, %r46, 2;
+    or.b32  %r50, %r50, %r46;
+
+    // selp: if is_upper (%p1), use upper formula; else use lower
+    selp.u32 %r20, %r47, %r20, %p1;    // sc_lo
+    selp.u32 %r21, %r48, %r21, %p1;    // sc_hi
+    selp.u32 %r22, %r49, %r22, %p1;    // m_lo
+    selp.u32 %r23, %r50, %r23, %p1;    // m_hi
+
+    // Convert 6-bit integer scales to f32
+    cvt.rn.f32.u32 %f3, %r20;         // sc_lo as f32
+    cvt.rn.f32.u32 %f4, %r21;         // sc_hi as f32
+    cvt.rn.f32.u32 %f5, %r22;         // m_lo as f32
+    cvt.rn.f32.u32 %f6, %r23;         // m_hi as f32
+
+    // -- Load qs word (lane-specific): u32[4 + mw*8 + sub_l] ------------------
+    // Byte offset = (4 + mw*8 + sub_l) * 4  (skips 16-byte header)
+    mul.lo.u32 %r24, %r6, 8;           // mw * 8
+    add.u32    %r24, %r24, 4;           // + 4 (skip header: u32[0..3])
+    add.u32    %r24, %r24, %r7;         // + sub_l
+    shl.b32    %r24, %r24, 2;           // * 4 bytes
+    cvt.u64.u32 %rd5, %r24;
     add.u64    %rd5, %rd4, %rd5;
-    ld.global.b32 %r19, [%rd5];        // sc_pair: sc_lo | sc_hi<<8
+    ld.global.b32 %r25, [%rd5];        // qs u32
 
-    add.u32    %r18, %r18, 16;         // + 16 bytes (from sc to m section: 4*4 bytes)
-    cvt.u64.u32 %rd6, %r18;
-    add.u64    %rd6, %rd4, %rd6;
-    ld.global.b32 %r20, [%rd6];        // m_pair: m_lo | m_hi<<8
-
-    // Extract 8-bit scales and convert to f32 (no 6-bit unpacking needed!)
-    and.b32 %r21, %r19, 0xFF;          // sc_lo (u32)
-    shr.u32 %r22, %r19, 8;
-    and.b32 %r22, %r22, 0xFF;          // sc_hi (u32)
-    and.b32 %r23, %r20, 0xFF;          // m_lo (u32)
-    shr.u32 %r24, %r20, 8;
-    and.b32 %r24, %r24, 0xFF;          // m_hi (u32)
-
-    cvt.rn.f32.u32 %f3, %r21;         // sc_lo as f32
-    cvt.rn.f32.u32 %f4, %r22;         // sc_hi as f32
-    cvt.rn.f32.u32 %f5, %r23;         // m_lo as f32
-    cvt.rn.f32.u32 %f6, %r24;         // m_hi as f32
-
-    // -- Load qs word (lane-specific) ------------------------------------------
-    // qs for j-group mw, sub_l: u32[10 + mw*8 + sub_l]
-    // Byte offset = (10 + mw*8 + sub_l) * 4 = 40 + mw*32 + sub_l*4
-    mul.lo.u32 %r25, %r6, 8;           // mw * 8
-    add.u32    %r25, %r25, 10;          // + 10 (skip header: d,dmin,sc*4,m*4)
-    add.u32    %r25, %r25, %r7;         // + sub_l
-    shl.b32    %r25, %r25, 2;           // * 4 bytes
-    cvt.u64.u32 %rd7, %r25;
-    add.u64    %rd7, %rd4, %rd7;
-    ld.global.b32 %r26, [%rd7];        // qs word (4 nibble pairs)
-
-    // -- Load Q8_1 activation data ---------------------------------------------
-    // q8_blk_lo = blk * 8 + mw * 2   (Q8_1 block index for lo sub-group)
-    mul.lo.u32 %r27, %r12, 8;          // blk * 8
-    mul.lo.u32 %r28, %r6, 2;           // mw * 2
-    add.u32    %r27, %r27, %r28;        // q8_blk_lo
+    // -- Load Q8_1 activation data --------------------------------------------
+    // q8_blk_lo = blk * 8 + mw * 2
+    mul.lo.u32 %r26, %r12, 8;          // blk * 8
+    mul.lo.u32 %r27, %r6, 2;           // mw * 2
+    add.u32    %r26, %r26, %r27;        // q8_blk_lo
 
     // u_lo = act_qs[q8_blk_lo * 8 + sub_l]
-    mul.lo.u32 %r28, %r27, 8;          // q8_blk_lo * 8
-    add.u32    %r28, %r28, %r7;         // + sub_l
-    shl.b32    %r29, %r28, 2;           // * 4 bytes
-    cvt.u64.u32 %rd8, %r29;
-    add.u64    %rd8, %rd1, %rd8;
-    ld.global.b32 %r29, [%rd8];        // u_lo (4 packed i8)
+    mul.lo.u32 %r27, %r26, 8;          // q8_blk_lo * 8
+    add.u32    %r27, %r27, %r7;         // + sub_l
+    shl.b32    %r28, %r27, 2;           // * 4 bytes
+    cvt.u64.u32 %rd6, %r28;
+    add.u64    %rd6, %rd1, %rd6;
+    ld.global.b32 %r28, [%rd6];        // u_lo
 
-    // u_hi = act_qs[(q8_blk_lo+1) * 8 + sub_l]
-    add.u32    %r30, %r28, 8;           // +8 to the qs index
-    shl.b32    %r31, %r30, 2;           // * 4 bytes
-    cvt.u64.u32 %rd9, %r31;
-    add.u64    %rd9, %rd1, %rd9;
-    ld.global.b32 %r30, [%rd9];        // u_hi (4 packed i8)
+    // u_hi = act_qs[q8_blk_lo*8 + sub_l + 8]
+    add.u32    %r29, %r27, 8;
+    shl.b32    %r30, %r29, 2;
+    cvt.u64.u32 %rd7, %r30;
+    add.u64    %rd7, %rd1, %rd7;
+    ld.global.b32 %r29, [%rd7];        // u_hi
 
-    // d8_lo = act_ds[q8_blk_lo]  (f16 in low 16 bits of u32)
-    shl.b32    %r31, %r27, 2;           // q8_blk_lo * 4 bytes
-    cvt.u64.u32 %rd5, %r31;
-    add.u64    %rd5, %rd2, %rd5;
-    ld.global.b16 %h2, [%rd5];         // f16 d8_lo
-    cvt.f32.f16 %f7, %h2;              // d8_lo as f32
+    // d8_lo = act_ds[q8_blk_lo]  (f16 in low 16 bits)
+    shl.b32    %r30, %r26, 2;           // q8_blk_lo * 4 bytes
+    cvt.u64.u32 %rd8, %r30;
+    add.u64    %rd8, %rd2, %rd8;
+    ld.global.b16 %h2, [%rd8];         // f16 d8_lo
+    cvt.f32.f16 %f7, %h2;
 
     // d8_hi = act_ds[q8_blk_lo + 1]
-    add.u64    %rd6, %rd5, 4;           // +4 bytes
-    ld.global.b16 %h3, [%rd6];         // f16 d8_hi
-    cvt.f32.f16 %f8, %h3;              // d8_hi as f32
+    add.u64    %rd9, %rd8, 4;
+    ld.global.b16 %h3, [%rd9];         // f16 d8_hi
+    cvt.f32.f16 %f8, %h3;
 
     // -- dp4a: Q4K nibbles x Q8_1 bytes ----------------------------------------
-    // v_lo = qs & 0x0F0F0F0F  (lo nibbles, treated as s8 since 0-15 >= 0)
-    and.b32 %r32, %r26, 0x0F0F0F0F;
-    // v_hi = (qs >> 4) & 0x0F0F0F0F  (hi nibbles)
-    shr.u32 %r33, %r26, 4;
-    and.b32 %r33, %r33, 0x0F0F0F0F;
+    and.b32 %r32, %r25, 0x0F0F0F0F;   // v_lo = lo nibbles (0-15 as s8)
+    shr.u32 %r33, %r25, 4;
+    and.b32 %r33, %r33, 0x0F0F0F0F;   // v_hi = hi nibbles
 
-    // dot_lo  = sum(v_lo[i] * u_lo[i]) for i=0..3
-    dp4a.s32.s32 %r34, %r32, %r29, 0;
-    // dot_hi  = sum(v_hi[i] * u_hi[i])
-    dp4a.s32.s32 %r35, %r33, %r30, 0;
-    // dot_min_lo = sum(1 * u_lo[i]) = sum(u_lo[i])
-    dp4a.s32.s32 %r36, 0x01010101, %r29, 0;
-    // dot_min_hi = sum(1 * u_hi[i])
-    dp4a.s32.s32 %r37, 0x01010101, %r30, 0;
+    dp4a.s32.s32 %r34, %r32, %r28, 0; // dot_lo
+    dp4a.s32.s32 %r35, %r33, %r29, 0; // dot_hi
+    dp4a.s32.s32 %r36, 0x01010101, %r28, 0; // dot_min_lo = sum(u_lo)
+    dp4a.s32.s32 %r37, 0x01010101, %r29, 0; // dot_min_hi = sum(u_hi)
 
-    // -- Accumulate -----------------------------------------------------------
-    // acc += d8_lo * (d * sc_lo * dot_lo - dmin * m_lo * dot_min_lo)
-    //      + d8_hi * (d * sc_hi * dot_hi - dmin * m_hi * dot_min_hi)
-    cvt.rn.f32.s32 %f9,  %r34;         // dot_lo as f32
-    cvt.rn.f32.s32 %f10, %r35;         // dot_hi as f32
-    cvt.rn.f32.s32 %f11, %r36;         // dot_min_lo as f32
-    cvt.rn.f32.s32 %f12, %r37;         // dot_min_hi as f32
+    // -- Accumulate ------------------------------------------------------------
+    cvt.rn.f32.s32 %f9,  %r34;
+    cvt.rn.f32.s32 %f10, %r35;
+    cvt.rn.f32.s32 %f11, %r36;
+    cvt.rn.f32.s32 %f12, %r37;
 
-    // term_lo = d * sc_lo * dot_lo - dmin * m_lo * dot_min_lo
-    mul.f32 %f13, %f1, %f3;            // d * sc_lo
-    mul.f32 %f13, %f13, %f9;           // * dot_lo
-    mul.f32 %f14, %f2, %f5;            // dmin * m_lo
-    mul.f32 %f14, %f14, %f11;          // * dot_min_lo
-    sub.f32 %f13, %f13, %f14;          // term_lo
-    mul.f32 %f13, %f13, %f7;           // * d8_lo
-    add.f32 %f0, %f0, %f13;            // acc += term_lo * d8_lo
+    // term_lo = d*sc_lo*dot_lo - dmin*m_lo*dot_min_lo
+    mul.f32 %f13, %f1, %f3; mul.f32 %f13, %f13, %f9;
+    mul.f32 %f14, %f2, %f5; mul.f32 %f14, %f14, %f11;
+    sub.f32 %f13, %f13, %f14; mul.f32 %f13, %f13, %f7;
+    add.f32 %f0, %f0, %f13;
 
-    // term_hi = d * sc_hi * dot_hi - dmin * m_hi * dot_min_hi
-    mul.f32 %f15, %f1, %f4;            // d * sc_hi
-    mul.f32 %f15, %f15, %f10;          // * dot_hi
-    mul.f32 %f16, %f2, %f6;            // dmin * m_hi
-    mul.f32 %f16, %f16, %f12;          // * dot_min_hi
-    sub.f32 %f15, %f15, %f16;          // term_hi
-    mul.f32 %f15, %f15, %f8;           // * d8_hi
-    add.f32 %f0, %f0, %f15;            // acc += term_hi * d8_hi
+    // term_hi = d*sc_hi*dot_hi - dmin*m_hi*dot_min_hi
+    mul.f32 %f15, %f1, %f4; mul.f32 %f15, %f15, %f10;
+    mul.f32 %f16, %f2, %f6; mul.f32 %f16, %f16, %f12;
+    sub.f32 %f15, %f15, %f16; mul.f32 %f15, %f15, %f8;
+    add.f32 %f0, %f0, %f15;
 
-    // -- Advance and loop ------------------------------------------------------
-    add.u32 %r12, %r12, 8;             // blk += 8 (stride = WARPS_PER_BLOCK_KPAR)
+    // -- Advance blk and loop --------------------------------------------------
+    add.u32 %r12, %r12, 8;
     bra KLOOP;
 
     // -- Reduction -------------------------------------------------------------
 REDUCE:
-    // Step 1: 3-step XOR butterfly within 8-lane mini-warp (sub_l 0..7).
-    // c = 0x71F: segMask=7 (bits[12:8]), maxLane=31 (bits[4:0]).
-    //   segMask=7: XOR stays within each 8-lane group (0-7, 8-15, 16-23, 24-31).
-    //   maxLane=31: no clamping (all warp lanes valid as sources).
-    //   member_mask=0xFFFFFFFF: all 32 lanes participate (same mask required).
+    // 3-step XOR butterfly within 8-lane mini-warp.
+    // c=0x71F: segMask=7 (XOR stays in 8-lane group), maxLane=31 (no clamping).
+    // member_mask=0xFFFFFFFF: all 32 lanes execute (required by shfl.sync).
     mov.b32 %r50, %f0;
     shfl.sync.bfly.b32 %r51, %r50, 4, 0x71F, 0xFFFFFFFF;
-    mov.b32 %f17, %r51;
-    add.f32 %f0, %f0, %f17;
+    mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
 
     mov.b32 %r50, %f0;
     shfl.sync.bfly.b32 %r51, %r50, 2, 0x71F, 0xFFFFFFFF;
-    mov.b32 %f17, %r51;
-    add.f32 %f0, %f0, %f17;
+    mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
 
     mov.b32 %r50, %f0;
     shfl.sync.bfly.b32 %r51, %r50, 1, 0x71F, 0xFFFFFFFF;
-    mov.b32 %f17, %r51;
-    add.f32 %f0, %f0, %f17;
+    mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
     // After 3 steps: ALL lanes in each mini-warp hold the mini-warp sum.
 
     // Step 2: sub_l==0 writes to smem[warp_id*4 + mw]
-    mul.lo.u32 %r52, %r5, 4;           // warp_id * 4
-    add.u32    %r52, %r52, %r6;         // + mw  ->  slot (0..31)
-    shl.b32    %r53, %r52, 2;           // * 4 bytes
-    mov.u32    %r54, smem_buf;          // smem base (32-bit shared mem ptr)
-    add.u32    %r54, %r54, %r53;        // smem slot address
-    @%p2 st.shared.f32 [%r54], %f0;    // only sub_l==0 writes
-
-    bar.sync 0;  // all 256 threads sync -- smem is now fully written
-
-    // Step 3: warp 0 lanes 0-3 sum all 8 warps' contributions per j-group.
-    setp.eq.u32 %p6, %r5, 0;           // warp_id == 0
-    setp.lt.u32 %p7, %r4, 4;           // lane < 4
-    and.pred    %p8, %p6, %p7;         // warp_id==0 && lane<4
-
-    // j-base: smem_buf + j*4 where j = lane (0..3)
-    mul.lo.u32 %r55, %r4, 4;           // lane * 4 bytes (= j * 4)
+    mul.lo.u32 %r52, %r5, 4;
+    add.u32    %r52, %r52, %r6;
+    shl.b32    %r53, %r52, 2;
     mov.u32    %r54, smem_buf;
-    add.u32    %r55, %r54, %r55;        // smem_buf + j*4
+    add.u32    %r54, %r54, %r53;
+    @%p2 st.shared.f32 [%r54], %f0;
 
-    // Unrolled 8-warp sum (stride = 16 bytes = 4 f32 slots per warp).
+    bar.sync 0;
+
+    // Step 3: warp 0 lanes 0-3 cross-warp reduce per j-group
+    setp.eq.u32 %p6, %r5, 0;
+    setp.lt.u32 %p7, %r4, 4;
+    and.pred    %p8, %p6, %p7;
+    mul.lo.u32 %r55, %r4, 4;
+    mov.u32    %r54, smem_buf;
+    add.u32    %r55, %r54, %r55;    // smem_buf + j*4
+
     mov.f32    %f18, 0f00000000;
     @%p8 ld.shared.f32 %f19, [%r55 +   0]; @%p8 add.f32 %f18, %f18, %f19; // w=0
     @%p8 ld.shared.f32 %f19, [%r55 +  16]; @%p8 add.f32 %f18, %f18, %f19; // w=1
@@ -321,27 +333,22 @@ REDUCE:
     @%p8 ld.shared.f32 %f19, [%r55 +  96]; @%p8 add.f32 %f18, %f18, %f19; // w=6
     @%p8 ld.shared.f32 %f19, [%r55 + 112]; @%p8 add.f32 %f18, %f18, %f19; // w=7
 
-    // Write j-group total back to smem[j] (first 4 slots, stride=4).
     @%p8 st.shared.f32 [%r55], %f18;
 
-    bar.sync 0;  // second sync -- smem[0..3] now hold j-group totals
+    bar.sync 0;
 
-    // Step 4: thread 0 sums smem[0..3] and writes output.
-    setp.eq.u32 %p9, %r3, 0;           // tid == 0
-    mov.u32    %r53, smem_buf;          // smem base
+    // Step 4: thread 0 sums smem[0..3] and writes output
+    setp.eq.u32 %p9, %r3, 0;
+    mov.u32    %r53, smem_buf;
     mov.f32    %f18, 0f00000000;
-    @%p9 ld.shared.f32 %f18, [%r53 +  0]; // j=0
-    @%p9 ld.shared.f32 %f19, [%r53 +  4]; // j=1
-    @%p9 add.f32 %f18, %f18, %f19;
-    @%p9 ld.shared.f32 %f19, [%r53 +  8]; // j=2
-    @%p9 add.f32 %f18, %f18, %f19;
-    @%p9 ld.shared.f32 %f19, [%r53 + 12]; // j=3
-    @%p9 add.f32 %f18, %f18, %f19;
+    @%p9 ld.shared.f32 %f18, [%r53 +  0];
+    @%p9 ld.shared.f32 %f19, [%r53 +  4]; @%p9 add.f32 %f18, %f18, %f19;
+    @%p9 ld.shared.f32 %f19, [%r53 +  8]; @%p9 add.f32 %f18, %f18, %f19;
+    @%p9 ld.shared.f32 %f19, [%r53 + 12]; @%p9 add.f32 %f18, %f18, %f19;
 
-    // out[n_out] = final_sum
-    shl.b32    %r50, %r2, 2;            // n_out * 4 bytes
+    shl.b32    %r50, %r2, 2;
     cvt.u64.u32 %rd4, %r50;
-    add.u64    %rd4, %rd3, %rd4;        // &out[n_out]
+    add.u64    %rd4, %rd3, %rd4;
     @%p9 st.global.f32 [%rd4], %f18;
 
 DONE:
@@ -354,3 +361,7 @@ pub const ENTRY: &str = "q4k_gemv_decode_v4_kpar";
 
 /// Minimum compute capability required (sm_120 = Blackwell).
 pub const MIN_CC: u32 = 1200;
+
+/// Block format: native 36-u32 GGUF (144 bytes/block).
+/// Used by engine to choose upload path and dispatch_kv_on_stream variant.
+pub const BLOCK_STRIDE_BYTES: u32 = 144;
