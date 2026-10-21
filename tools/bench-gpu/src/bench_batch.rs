@@ -89,6 +89,10 @@ fn main() {
             batch, tok_s, per_req, blocks);
     }
 
-    println!("\n  Reference (single request): 108 tok/s");
-    println!("  llama.cpp single request:   209 tok/s");
+    println!("\n  Note: using sequential per-row GEMVs (sm_120 kpar) — batch GEMV kernels disabled.");
+    println!("  Batch GEMV (sm_80 dynamic-smem PTX) crashes on RTX 5090 (sm_120/Blackwell).");
+    println!("  Fix: write sm_120-native batch GEMV PTX with static shared memory.");
+    println!();
+    println!("  Reference (single request, CUDA graph): 130 tok/s");
+    println!("  llama.cpp single request:                209 tok/s");
 }

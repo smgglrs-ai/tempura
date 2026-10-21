@@ -2394,31 +2394,13 @@ impl CutileGpuModel {
             self.device_weights_q2.get(weight_name).map(|dw| dw.n).unwrap_or(0)
         };
 
-        // Colocated GEMM: all M rows in one block → same SM → L2 broadcast for weight accesses.
-        // smem GEMM available but slower (barrier overhead > benefit for this block size).
-        // Falls back to grid=(N,M) batch GEMV, then M sequential GEMVs.
-        const WPB: usize = 4; // WARPS_PER_BLOCK in oxide kernel
-        if is_q4k && m * WPB * 32 <= 1024 {
-            if let Some(ref oxide) = self.oxide_q4k_gemv {
-                let dw = self.device_weights_q4k.get(weight_name).unwrap();
-                // Colocated is faster than smem due to lower barrier overhead.
-                if let Ok(result) = oxide.forward_colocated_d2d(a, &dw.tensor, m, dw.n, dw.k_blocks) {
-                    return result;
-                }
-                if oxide.has_batch_gemv() {
-                    return oxide.forward_batch_d2d(a, &dw.tensor, m, dw.n, dw.k_blocks)
-                        .expect("oxide Q4K batch GEMV failed");
-                }
-            }
-        } else if is_q4k { // m too large for colocated kernel
-            if let Some(ref oxide) = self.oxide_q4k_gemv {
-                let dw = self.device_weights_q4k.get(weight_name).unwrap();
-                if oxide.has_batch_gemv() {
-                    return oxide.forward_batch_d2d(a, &dw.tensor, m, dw.n, dw.k_blocks)
-                        .expect("oxide Q4K batch GEMV failed");
-                }
-            }
-        }
+        // NOTE: colocated and batch GEMV kernels (sm_80 PTX with dynamic shared memory)
+        // crash with CUDA error 719 on sm_120 (Blackwell RTX 5090). Root cause: dynamic
+        // shared memory in oxide-compiled sm_80 PTX is broken on Blackwell under JIT.
+        // Kernels using NO shared memory (quantize_q8_1) work fine; kernels using
+        // DynamicSharedArray crash. Fix: write sm_120-native batch GEMV PTX with STATIC
+        // shared memory (same approach as q4k_gemv_sm120_dp4a_kpar8 single-GEMV kernel).
+        // Until that PTX is available, fall through to M sequential single-GEMV calls.
 
         // Fallback: M sequential GEMVs (no L2 reuse but still GPU-resident).
         let mut rows: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(m);
