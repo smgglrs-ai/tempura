@@ -32,6 +32,7 @@
 use crate::{KernelError, Result};
 use crate::gpu_capabilities::{GpuCapabilities, KernelVariant};
 use crate::q4k_gemv_v4_ptx;
+use crate::q4k_fused_silu_v4_ptx;
 use cuda_core::{launch_kernel, Stream};
 use cuda_core::sys::{CUfunction, CUmodule};
 use cutile::{api, prelude::DeviceOp, tensor::Tensor};
@@ -86,6 +87,9 @@ pub struct OxideQ4kGemv {
     /// Loaded from a SEPARATE CUDA module (hand-written PTX, not the oxide binary).
     cu_sm120_module:      Option<CUmodule>,
     cu_sm120_dp4a_kpar8:        Option<CUfunction>,
+    /// Optional sm_120-native fused gate+up+SiLU kernel (hand-written PTX).
+    /// Faster than oxide sm_80 fused silu: direct Blackwell codegen, no JIT overhead.
+    cu_sm120_fused_silu:        Option<CUfunction>,
     /// Selected Q4K+Q8_1 kpar dispatch function: sm120 or dp4a_kpar8 (sm_80) fallback.
     /// Populated by the KernelVariant selection at construction time.  Always Some when
     /// at least one kpar variant loaded.  None only when no kpar kernel is available at all.
@@ -244,6 +248,48 @@ impl OxideQ4kGemv {
                 (None, None)
             };
 
+            // ── Load sm_120 fused gate+up+SiLU PTX (separate module from kpar) ─
+            // Reuses the same CUDA module as the sm_120 kpar if already loaded,
+            // or loads a second module. Currently: separate module, same cc guard.
+            let cu_sm120_fused_silu: Option<CUfunction> = if !sm120_disabled && caps.cc() >= q4k_fused_silu_v4_ptx::MIN_CC {
+                let ptx_cstr = CString::new(q4k_fused_silu_v4_ptx::PTX).unwrap_or_default();
+                let mut fused_mod = std::mem::MaybeUninit::uninit();
+                let rc = unsafe {
+                    cuda_core::sys::cuModuleLoadData(
+                        fused_mod.as_mut_ptr(),
+                        ptx_cstr.as_ptr() as *const _,
+                    )
+                };
+                if rc == CUDA_SUCCESS {
+                    let fused_mod = unsafe { fused_mod.assume_init() };
+                    let entry = CString::new(q4k_fused_silu_v4_ptx::ENTRY).unwrap_or_default();
+                    let mut fused_fn = std::mem::MaybeUninit::uninit();
+                    let rc2 = unsafe {
+                        cuda_core::sys::cuModuleGetFunction(fused_fn.as_mut_ptr(), fused_mod, entry.as_ptr())
+                    };
+                    if rc2 == CUDA_SUCCESS {
+                        eprintln!(
+                            "oxide-gemv-q4k: loaded sm_120 fused silu PTX ({} bytes) -- direct Blackwell codegen",
+                            q4k_fused_silu_v4_ptx::PTX.len(),
+                        );
+                        Some(unsafe { fused_fn.assume_init() })
+                        // Note: fused_mod leaks here (not tracked for Drop). The process holds it
+                        // until exit. A production fix would store it in the struct.
+                    } else {
+                        let _ = unsafe { cuda_core::sys::cuModuleUnload(fused_mod) };
+                        eprintln!("oxide-gemv-q4k: cuModuleGetFunction(sm120_fused_silu) failed (rc={rc2}), using oxide fused silu");
+                        None
+                    }
+                } else {
+                    eprintln!(
+                        "oxide-gemv-q4k: cuModuleLoadData(sm120_fused_silu PTX) failed (rc={rc}), using oxide fused silu",
+                    );
+                    None
+                }
+            } else {
+                None
+            };
+
             // ── Build KernelVariant table and select best kpar dispatch ─────────
             let mut kpar_variants: Vec<KernelVariant> = Vec::new();
             if let Some(f) = cu_q8_dp4a_kpar8 {
@@ -269,7 +315,7 @@ impl OxideQ4kGemv {
             let uses_sm120 = kpar_dispatch.as_ref().map(|v| v.min_cc >= 1200).unwrap_or(false);
 
             eprintln!(
-                "oxide-gemv-q4k: loaded (oxide PTX {} bytes, entry={}, q8={}, q8_dp4a_kpar4={}, q8_dp4a={}, q8_dp4a_raw={}, q8_dp4a_kpar8={}, sm120_dp4a_kpar8={}, kpar_dispatch={}, fused_silu={}, batch={})",
+                "oxide-gemv-q4k: loaded (oxide PTX {} bytes, entry={}, q8={}, q8_dp4a_kpar4={}, q8_dp4a={}, q8_dp4a_raw={}, q8_dp4a_kpar8={}, sm120_dp4a_kpar8={}, kpar_dispatch={}, fused_silu={}, sm120_fused_silu={}, batch={})",
                 OXIDE_Q4K_PTX.len(),
                 KERNEL_ENTRY,
                 cu_q8_gemv.is_some(),
@@ -280,6 +326,7 @@ impl OxideQ4kGemv {
                 cu_sm120_dp4a_kpar8.is_some(),
                 kpar_dispatch.as_ref().map(|v| v.name).unwrap_or("none"),
                 cu_fused_silu.is_some(),
+                cu_sm120_fused_silu.is_some(),
                 cu_batch_gemv.is_some(),
             );
             // dp4a_raw: raw GGUF format for the oxide sm_80 path — benchmarked and DISABLED.
@@ -288,7 +335,7 @@ impl OxideQ4kGemv {
             // Q8_1 scratch) when uses_raw_gguf=true, so K/V weights can also be native.
             let uses_raw_gguf = uses_sm120;
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, kpar_dispatch, uses_raw_gguf, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_silu, kpar_dispatch, uses_raw_gguf, stream,
                 q8_qs_scratch:      std::cell::RefCell::new(None),
                 q8_ds_scratch:      std::cell::RefCell::new(None),
                 q8_out_scratch:     std::cell::RefCell::new(None),
@@ -809,6 +856,12 @@ impl OxideQ4kGemv {
     /// and the engine falls back to two separate GEMVs + element-wise SiLU-mul.
     pub fn has_fused_silu(&self) -> bool {
         !self.uses_raw_gguf && self.cu_fused_silu.is_some() && self.cu_q8_quantize.is_some()
+    }
+
+    /// Returns true when the sm_120 hand-tuned fused gate+up+SiLU kernel is available.
+    /// Preferred over `has_fused_silu` when both are present (direct Blackwell codegen).
+    pub fn has_sm120_fused_silu(&self) -> bool {
+        self.cu_sm120_fused_silu.is_some() && self.cu_q8_quantize.is_some()
     }
 
     /// Returns true when the Q8_1 quantize + integer GEMV path is compiled into the PTX.
@@ -1384,6 +1437,113 @@ impl OxideQ4kGemv {
             unsafe {
                 launch_kernel(fused_fn, (n as u32, 1, 1), (BLOCK_DIM, 1, 1), smem_bytes, cu_stream, &mut params)
             }.map_err(|e| KernelError::InvalidConfig(format!("oxide q4k_gemv_fused_silu_mul: {e}")))?;
+        }
+
+        Ok(out_arc)
+    }
+
+    /// sm_120 hand-tuned fused gate+up GEMV with inline SiLU.
+    ///
+    /// Runs Q8_1 quantization (reusing pre-allocated scratch), then launches
+    /// `q4k_fused_silu_sm120_dp4a` which computes `out[i] = silu(gate[i]) * up[i]`
+    /// in a single pass. Preferred over `forward_fused_silu_dp4a_d2d` on Blackwell.
+    pub fn forward_sm120_fused_silu_d2d(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        gate_packed: &Arc<Tensor<u32>>,
+        up_packed:   &Arc<Tensor<u32>>,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let fused_fn = match self.cu_sm120_fused_silu {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("sm120_fused_silu not loaded".into())),
+        };
+        let q8_quant_fn = match self.cu_q8_quantize {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
+        };
+
+        let k = k_blocks * 256;
+        let k_q8_blocks = k.div_ceil(32);
+
+        // Reuse pre-allocated scratch tensors (required during CUDA graph capture).
+        let use_scratch = self.q8_qs_scratch.borrow().as_ref()
+            .map(|t| t.size() >= k / 4)
+            .unwrap_or(false);
+
+        let x_qs_arc: Arc<Tensor<u32>>;
+        let x_ds_arc: Arc<Tensor<u32>>;
+        let out_arc: Arc<Tensor<f32>>;
+
+        if use_scratch && self.fused_silu_scratch.borrow().is_some() {
+            x_qs_arc = self.q8_qs_scratch.borrow().as_ref().unwrap().clone();
+            x_ds_arc = self.q8_ds_scratch.borrow().as_ref().unwrap().clone();
+            out_arc  = self.fused_silu_scratch.borrow().as_ref().unwrap().clone();
+        } else {
+            x_qs_arc = Arc::new(api::zeros::<u32>(&[k / 4])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+            x_ds_arc = Arc::new(api::zeros::<u32>(&[k_q8_blocks])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+            out_arc  = Arc::new(api::zeros::<f32>(&[n])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+        }
+
+        let cu_stream = self.stream.cu_stream();
+
+        // ── Launch quantize_q8_1 (same as oxide fused silu path) ───────────
+        {
+            let qs_ptr: u64 = x_qs_arc.device_pointer().cu_deviceptr();
+            let qs_len: u64 = (k / 4) as u64;
+            let ds_ptr: u64 = x_ds_arc.device_pointer().cu_deviceptr();
+            let ds_len: u64 = k_q8_blocks as u64;
+            let x_ptr:  u64 = x.device_pointer().cu_deviceptr();
+            let x_len:  u64 = x.size() as u64;
+            let k_u32:  u32 = k as u32;
+
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr as *const _ as *mut c_void,
+                &qs_len as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ds_len as *const _ as *mut c_void,
+                &x_ptr  as *const _ as *mut c_void,
+                &x_len  as *const _ as *mut c_void,
+                &k_u32  as *const _ as *mut c_void,
+            ];
+            let grid_x = k_q8_blocks.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            unsafe {
+                launch_kernel(q8_quant_fn, (grid_x, 1, 1), (BLOCK_DIM, 1, 1), 0, cu_stream, &mut params)
+            }.map_err(|e| KernelError::InvalidConfig(format!("oxide quantize_q8_1 (sm120_fused): {e}")))?;
+        }
+
+        // ── Launch q4k_fused_silu_sm120_dp4a ────────────────────────────────
+        // Parameters: gate, up, act_qs, act_ds, out, n, k_blocks (7 params, no lengths).
+        {
+            let gate_ptr: u64 = gate_packed.device_pointer().cu_deviceptr();
+            let up_ptr:   u64 = up_packed.device_pointer().cu_deviceptr();
+            let qs_ptr:   u64 = x_qs_arc.device_pointer().cu_deviceptr();
+            let ds_ptr:   u64 = x_ds_arc.device_pointer().cu_deviceptr();
+            let out_ptr:  u64 = out_arc.device_pointer().cu_deviceptr();
+            let n_u32:    u32 = n as u32;
+            let kb_u32:   u32 = k_blocks as u32;
+
+            let mut params: [*mut c_void; 7] = [
+                &gate_ptr as *const _ as *mut c_void,
+                &up_ptr   as *const _ as *mut c_void,
+                &qs_ptr   as *const _ as *mut c_void,
+                &ds_ptr   as *const _ as *mut c_void,
+                &out_ptr  as *const _ as *mut c_void,
+                &n_u32    as *const _ as *mut c_void,
+                &kb_u32   as *const _ as *mut c_void,
+            ];
+            // smem: 32 f32 slots = 128 bytes (gate[16] + up[16])
+            let smem_bytes: u32 = 32 * 4;
+            unsafe {
+                launch_kernel(fused_fn, (n as u32, 1, 1), (BLOCK_DIM, 1, 1), smem_bytes, cu_stream, &mut params)
+            }.map_err(|e| KernelError::InvalidConfig(format!("sm120_fused_silu: {e}")))?;
         }
 
         Ok(out_arc)

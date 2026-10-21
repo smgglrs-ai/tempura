@@ -3177,9 +3177,9 @@ impl CutileGpuModel {
             // Decode path: try fused gate+up GEMV with inline SiLU (halves activation DRAM).
             // Prefill path (seq_len > 1) or non-Q4K: fall through to two separate GEMVs.
             let gate_silu_n_dev = if seq_len == 1
-                && self.oxide_q4k_gemv.as_ref().map(|o| o.has_fused_silu()).unwrap_or(false)
                 && self.device_weights_q4k.contains_key(gate_w_name.as_str())
                 && self.device_weights_q4k.contains_key(up_w_name.as_str())
+                && self.oxide_q4k_gemv.as_ref().map(|o| o.has_sm120_fused_silu() || o.has_fused_silu()).unwrap_or(false)
             {
                 let oxide = self.oxide_q4k_gemv.as_ref().unwrap();
                 let gdw = self.device_weights_q4k.get(gate_w_name.as_str()).unwrap();
@@ -3187,9 +3187,16 @@ impl CutileGpuModel {
                 let a_flat = Arc::clone(&normed2_dev)
                     .reshape(&[next_pow2(gdw.k_blocks * tempura_kernels::Q4K_BLOCK_SIZE)])
                     .expect("fused silu reshape failed");
-                oxide
-                    .forward_fused_silu_dp4a_d2d(&a_flat, &gdw.tensor, &udw.tensor, gdw.n, gdw.k_blocks)
-                    .expect("q4k_fused_silu_dp4a failed")
+                // Prefer sm_120 hand-tuned PTX (direct Blackwell codegen) over oxide sm_80.
+                if oxide.has_sm120_fused_silu() {
+                    oxide
+                        .forward_sm120_fused_silu_d2d(&a_flat, &gdw.tensor, &udw.tensor, gdw.n, gdw.k_blocks)
+                        .expect("q4k_fused_silu_sm120 failed")
+                } else {
+                    oxide
+                        .forward_fused_silu_dp4a_d2d(&a_flat, &gdw.tensor, &udw.tensor, gdw.n, gdw.k_blocks)
+                        .expect("q4k_fused_silu_dp4a failed")
+                }
             } else {
                 let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE);
                 let up_dev = self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
