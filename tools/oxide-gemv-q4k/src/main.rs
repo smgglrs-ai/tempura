@@ -218,7 +218,7 @@ mod kernels {
     /// Block: WARPS_PER_BLOCK * 32 threads.
     /// Shared memory: WARPS_PER_BLOCK * 4 bytes (f32 partial sums).
     #[kernel]
-    pub fn q4k_gemv_decode_v2(
+    pub fn q4k_gemv_dp4a_base(
         mut out: DisjointSlice<f32>,
         x: &[f32],
         packed: &[u32],
@@ -390,7 +390,7 @@ mod kernels {
     /// data. When M blocks run concurrently (RTX 5090 has 170 SMs), the L2 cache
     /// serves the weight data M× — effective bandwidth amortization.
     #[kernel]
-    pub fn q4k_gemv_decode_v2_batch(
+    pub fn q4k_gemv_dp4a_base_batch(
         mut out: DisjointSlice<f32>,  // [M * N] row-major
         x: *const f32,                // [M * K] row-major
         packed: &[u32],               // [N * K_BLOCKS * 42]
@@ -945,7 +945,7 @@ mod kernels {
     /// Block: WARPS_PER_BLOCK * 32 threads.
     /// Shared memory: WARPS_PER_BLOCK * 4 * 4 = 64 bytes.
     #[kernel]
-    pub fn q4k_gemv_decode_q8_v2(
+    pub fn q4k_gemv_dp4a_q8_v2(
         mut out: DisjointSlice<f32>,
         x_qs: &[u32],    // [K/4] packed i8 activations (4 per u32)
         x_ds: &[u32],    // [K/32] Q8_1 f16 scales as u16 in low bits
@@ -1057,7 +1057,7 @@ mod kernels {
     /// Block: WARPS_PER_BLOCK * 32 threads.
     /// Shared memory: WARPS_PER_BLOCK * 4 * 4 = 64 bytes.
     #[kernel]
-    pub fn q4k_gemv_decode_q8_v3(
+    pub fn q4k_gemv_dp4a_q8(
         mut out: DisjointSlice<f32>,
         x_qs: &[u32],    // [K/4] packed i8 activations (4 per u32)
         x_ds: &[u32],    // [K/32] Q8_1 f16 scales as u16 in low bits
@@ -1224,7 +1224,7 @@ mod kernels {
     /// Block: WARPS_PER_BLOCK_KPAR * 32 = 256 threads.
     /// Shared memory: 32 * 4 = 128 bytes.
     #[kernel]
-    pub fn q4k_gemv_decode_q8_v3_kpar(
+    pub fn q4k_gemv_dp4a_kpar8(
         mut out: DisjointSlice<f32>,
         x_qs: &[u32],    // [K/4] packed i8 activations (4 per u32)
         x_ds: &[u32],    // [K/32] Q8_1 f16 scales as u16 in low bits
@@ -1388,7 +1388,7 @@ mod kernels {
     /// Block: (WARPS_PER_BLOCK * 32, 1, 1) — 4 warps
     /// Smem:  32 f32 slots (128 bytes): [0..16] gate partials, [16..32] up partials
     #[kernel]
-    pub fn q4k_gemv_fused_silu_mul(
+    pub fn q4k_fused_silu_dp4a(
         mut out: DisjointSlice<f32>,
         gate_packed: &[u32],  // [N, K_BLOCKS, 42] Q4K gate_proj weights
         up_packed:   &[u32],  // [N, K_BLOCKS, 42] Q4K up_proj weights
@@ -1617,7 +1617,7 @@ mod kernels {
     /// q4k_gemv_decode_q8_v3r — raw GGUF 36-u32 format variant of v3.
     /// 36 u32 (144 bytes) per block vs 42 u32 (168 bytes) → 14% less DRAM.
     #[kernel]
-    pub fn q4k_gemv_decode_q8_v3r(
+    pub fn q4k_gemv_dp4a_q8_raw(
         mut out: DisjointSlice<f32>,
         x_qs: &[u32],
         x_ds: &[u32],
@@ -1979,7 +1979,7 @@ fn main() {
     }.expect("v1 launch");
 
     unsafe {
-        module.q4k_gemv_decode_v2(
+        module.q4k_gemv_dp4a_base(
             stream.as_ref(), cfg_v2, &mut out_dev2, &x_dev, &p_dev, n as u32, k_blocks as u32,
         )
     }.expect("v2 launch");
@@ -2056,7 +2056,7 @@ fn main() {
     }.expect("v1 launch 2");
 
     unsafe {
-        module.q4k_gemv_decode_v2(
+        module.q4k_gemv_dp4a_base(
             stream.as_ref(), cfg_v2, &mut out_dev2, &x_dev, &p_dev, n as u32, k_blocks as u32,
         )
     }.expect("v2 launch 2");
@@ -2149,7 +2149,7 @@ fn main() {
     }.expect("v1 launch 3");
 
     unsafe {
-        module.q4k_gemv_decode_v2(
+        module.q4k_gemv_dp4a_base(
             stream.as_ref(), cfg3_v2, &mut od2_3, &x_dev3, &p_dev3, n as u32, k_blocks3 as u32,
         )
     }.expect("v2 launch 3");
@@ -2237,13 +2237,13 @@ fn main() {
             shared_mem_bytes: smem_v3,
         };
         unsafe {
-            module.q4k_gemv_decode_q8_v3(
+            module.q4k_gemv_dp4a_q8(
                 stream.as_ref(), cfg_v3, &mut out_v3,
                 &x_qs_dev, &x_ds_dev, &pv3_dev, n as u32, k_blocks as u32,
             )
         }.expect("v3 launch");
         unsafe {
-            module.q4k_gemv_decode_q8_v3r(
+            module.q4k_gemv_dp4a_q8_raw(
                 stream.as_ref(), cfg_v3, &mut out_v3r,
                 &x_qs_dev, &x_ds_dev, &pv3r_dev, n as u32, k_blocks as u32,
             )
@@ -2340,13 +2340,13 @@ fn main() {
             shared_mem_bytes: smem_bytes,
         };
         unsafe {
-            module.q4k_gemv_decode_q8_v3(
+            module.q4k_gemv_dp4a_q8(
                 stream.as_ref(), cfg, &mut out_v3,
                 &x_qs_dev, &x_ds_dev, &pv3_dev, n as u32, k_blocks as u32,
             )
         }.expect("v3 launch kb16");
         unsafe {
-            module.q4k_gemv_decode_q8_v3r(
+            module.q4k_gemv_dp4a_q8_raw(
                 stream.as_ref(), cfg, &mut out_v3r,
                 &x_qs_dev, &x_ds_dev, &pv3r_dev, n as u32, k_blocks as u32,
             )
@@ -2427,7 +2427,7 @@ fn main() {
             shared_mem_bytes: smem_fused,
         };
         unsafe {
-            module.q4k_gemv_fused_silu_mul(
+            module.q4k_fused_silu_dp4a(
                 stream.as_ref(), cfg_fused, &mut out_fused,
                 &gate_dev, &up_dev, &x_qs_dev, &x_ds_dev,
                 n as u32, k_blocks as u32,
@@ -2498,7 +2498,7 @@ fn main() {
             shared_mem_bytes: 32 * 4,  // 128 bytes (Blackwell predicated-smem safe)
         };
         unsafe {
-            module.q4k_gemv_decode_q8_v3_kpar(
+            module.q4k_gemv_dp4a_kpar8(
                 stream.as_ref(), cfg_kpar, &mut out_kpar,
                 &x_qs_dev, &x_ds_dev, &pv3_dev, n as u32, k_blocks as u32,
             )

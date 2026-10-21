@@ -51,7 +51,7 @@ mod kernels {
     ///
     /// Fallback kernel: per-element stride-32 loop with native ql+qh dequant.
     #[kernel]
-    pub fn q6k_gemv_decode(
+    pub fn q6k_gemv_dp4a_base(
         mut out: DisjointSlice<f32>,
         x: &[f32],
         packed: &[u32],
@@ -124,7 +124,7 @@ mod kernels {
     ///   - scale: 4 word loads per block (sc_01 covers groups 0-3, etc.)
     ///   - coalesced: 32 lanes access 8 consecutive u32s for each ql/qh section.
     #[kernel]
-    pub fn q6k_gemv_decode_v2(
+    pub fn q6k_gemv_dp4a(
         mut out: DisjointSlice<f32>,
         x: &[f32],
         packed: &[u32],
@@ -288,7 +288,7 @@ mod kernels {
     /// Warp `w` handles k_blocks: w, w+8, w+16, ... (stride = WARPS_PER_BLOCK_KPAR).
     /// Inner block loop is the same 8-step unrolled ql+qh nibble unpack from v2.
     #[kernel]
-    pub fn q6k_gemv_decode_v3_kpar(
+    pub fn q6k_gemv_dp4a_kpar8(
         mut out: DisjointSlice<f32>,
         x: &[f32],
         packed: &[u32],
@@ -518,19 +518,19 @@ fn main() {
 
     // ── Test 1: q_full=32 → weight=0.0 ────────────────────────────────────────
     unsafe {
-        module.q6k_gemv_decode(
+        module.q6k_gemv_dp4a_base(
             stream.as_ref(), cfg, &mut out_dev, &x_dev, &p_dev, n as u32, k_blocks as u32,
         )
     }.expect("v1 launch");
 
     unsafe {
-        module.q6k_gemv_decode_v2(
+        module.q6k_gemv_dp4a(
             stream.as_ref(), cfg, &mut out_dev2, &x_dev, &p_dev, n as u32, k_blocks as u32,
         )
     }.expect("v2 launch");
 
     unsafe {
-        module.q6k_gemv_decode_v3_kpar(
+        module.q6k_gemv_dp4a_kpar8(
             stream.as_ref(), cfg_kpar, &mut out_dev_kpar, &x_dev, &p_dev, n as u32, k_blocks as u32,
         )
     }.expect("v3_kpar launch");
@@ -608,19 +608,19 @@ fn main() {
     out_dev_kpar.copy_from_host(&stream, &zeros).expect("zero out_kpar");
 
     unsafe {
-        module.q6k_gemv_decode(
+        module.q6k_gemv_dp4a_base(
             stream.as_ref(), cfg, &mut out_dev, &x_dev, &p_dev, n as u32, k_blocks as u32,
         )
     }.expect("v1 launch 2");
 
     unsafe {
-        module.q6k_gemv_decode_v2(
+        module.q6k_gemv_dp4a(
             stream.as_ref(), cfg, &mut out_dev2, &x_dev, &p_dev, n as u32, k_blocks as u32,
         )
     }.expect("v2 launch 2");
 
     unsafe {
-        module.q6k_gemv_decode_v3_kpar(
+        module.q6k_gemv_dp4a_kpar8(
             stream.as_ref(), cfg_kpar, &mut out_dev_kpar, &x_dev, &p_dev, n as u32, k_blocks as u32,
         )
     }.expect("v3_kpar launch 2");
@@ -721,12 +721,12 @@ fn main() {
         };
 
         unsafe {
-            module.q6k_gemv_decode_v2(
+            module.q6k_gemv_dp4a(
                 stream.as_ref(), cfg3, &mut o3_v2, &x3_dev, &p3_dev, n as u32, kb3 as u32,
             )
         }.expect("v2 launch t3");
         unsafe {
-            module.q6k_gemv_decode_v3_kpar(
+            module.q6k_gemv_dp4a_kpar8(
                 stream.as_ref(), cfg3_kpar, &mut o3_kpar, &x3_dev, &p3_dev, n as u32, kb3 as u32,
             )
         }.expect("v3_kpar launch t3");

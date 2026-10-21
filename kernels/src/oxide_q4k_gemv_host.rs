@@ -42,17 +42,17 @@ use std::sync::Arc;
 #[cfg(feature = "oxide-gemv")]
 static OXIDE_Q4K_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oxide_q4k_gemv.ptx"));
 
-const KERNEL_ENTRY: &str = "q4k_gemv_decode_v2";
-const KERNEL_BATCH: &str = "q4k_gemv_decode_v2_batch";
+const KERNEL_ENTRY: &str = "q4k_gemv_dp4a_base";
+const KERNEL_BATCH: &str = "q4k_gemv_dp4a_base_batch";
 const KERNEL_COLOCATED: &str = "q4k_gemm_colocated";
 const KERNEL_SMEM: &str = "q4k_gemm_smem";
 const KERNEL_Q8_QUANTIZE: &str = "quantize_q8_1";
 const KERNEL_Q8_GEMV: &str = "q4k_gemv_decode_q8";
-const KERNEL_Q8_GEMV_V2: &str = "q4k_gemv_decode_q8_v2";
-const KERNEL_Q8_GEMV_V3: &str = "q4k_gemv_decode_q8_v3";
-const KERNEL_Q8_GEMV_V3R: &str = "q4k_gemv_decode_q8_v3r"; // raw GGUF 36-u32 format
-const KERNEL_Q8_GEMV_V3_KPAR: &str = "q4k_gemv_decode_q8_v3_kpar"; // 8 warps/block for Q/O proj
-const KERNEL_FUSED_SILU: &str = "q4k_gemv_fused_silu_mul"; // fused gate+up+SiLU
+const KERNEL_Q8_GEMV_V2: &str = "q4k_gemv_dp4a_q8_v2";
+const KERNEL_Q8_GEMV_V3: &str = "q4k_gemv_dp4a_q8";
+const KERNEL_Q8_GEMV_V3R: &str = "q4k_gemv_dp4a_q8_raw"; // raw GGUF 36-u32 format
+const KERNEL_Q8_GEMV_V3_KPAR: &str = "q4k_gemv_dp4a_kpar8"; // 8 warps/block for Q/O proj
+const KERNEL_FUSED_SILU: &str = "q4k_fused_silu_dp4a"; // fused gate+up+SiLU
 const WARPS_PER_BLOCK: u32 = 4;
 const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128
 const WARPS_PER_BLOCK_KPAR: u32 = 8;

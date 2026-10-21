@@ -78,7 +78,7 @@ pub const PTX: &str = r#"
 // Block: 256 threads = 8 warps. K-parallel: warp w handles blk w, w+8, w+16, ...
 // Scale extraction: BRANCHLESS (selp) -- avoids ITS warp divergence.
 // shfl.sync.bfly c=0x71F: segMask=7, maxLane=31 (correct for 8-lane mini-warp).
-.visible .entry q4k_gemv_decode_v4_kpar(
+.visible .entry q4k_gemv_sm120_dp4a_kpar8(
     .param .u64 param_weights,
     .param .u64 param_act_qs,
     .param .u64 param_act_ds,
@@ -368,7 +368,7 @@ DONE:
 "#;
 
 /// Kernel entry name -- used by `cuModuleGetFunction`.
-pub const ENTRY: &str = "q4k_gemv_decode_v4_kpar";
+pub const ENTRY: &str = "q4k_gemv_sm120_dp4a_kpar8";
 
 /// Minimum compute capability required (sm_120 = Blackwell).
 pub const MIN_CC: u32 = 1200;

@@ -40,8 +40,8 @@ use std::sync::Arc;
 #[cfg(feature = "oxide-gemv")]
 static OXIDE_Q6K_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oxide_q6k_gemv.ptx"));
 
-const KERNEL_ENTRY: &str = "q6k_gemv_decode_v2";
-const KERNEL_ENTRY_KPAR: &str = "q6k_gemv_decode_v3_kpar";
+const KERNEL_ENTRY: &str = "q6k_gemv_dp4a";
+const KERNEL_ENTRY_KPAR: &str = "q6k_gemv_dp4a_kpar8";
 const WARPS_PER_BLOCK: u32 = 4;
 const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128
 const WARPS_PER_BLOCK_KPAR: u32 = 8;
