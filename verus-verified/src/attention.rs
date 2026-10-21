@@ -1,8 +1,8 @@
-//! Verus-verified attention kernel indexing — unbounded proofs
+//! Verus-verified attention kernel indexing -- unbounded proofs
 //!
-//! Proves 4D tensor indexing (batch × seq × heads × head_dim) for attention
+//! Proves 4D tensor indexing (batch x seq x heads x head_dim) for attention
 //! kernels, batch isolation (non-overlapping memory regions), and GPU thread
-//! decomposition — all for ANY valid parameter values.
+//! decomposition -- all for ANY valid parameter values.
 
 use vstd::prelude::*;
 
@@ -144,7 +144,7 @@ proof fn attention_batch_isolation_no_overlap(
 }
 
 // ============================================================================
-// Proof: GPU thread decomposition — flat index i decomposes into valid (b,s,h,d)
+// Proof: GPU thread decomposition -- flat index i decomposes into valid (b,s,h,d)
 // and reconstructed offset is in bounds
 // ============================================================================
 

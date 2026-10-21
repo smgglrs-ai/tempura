@@ -1,4 +1,4 @@
-//! Verus-verified KvCache struct invariants — unbounded proofs
+//! Verus-verified KvCache struct invariants -- unbounded proofs
 //!
 //! Proves that the KvCache well-formedness invariant (seq_len <= max_seq_len)
 //! is preserved by every operation: new(), append_kv()+advance(), and reset().
@@ -96,7 +96,7 @@ proof fn advance_preserves_well_formed(
 }
 
 // ============================================================================
-// Proof: append_kv + advance — offsets are valid AND invariant preserved
+// Proof: append_kv + advance -- offsets are valid AND invariant preserved
 // ============================================================================
 
 proof fn append_advance_safe(
@@ -147,7 +147,7 @@ proof fn reset_restores_well_formed(cache: KvCacheState)
 }
 
 // ============================================================================
-// Proof: capacity conservation — seq_len + remaining == max_seq_len always
+// Proof: capacity conservation -- seq_len + remaining == max_seq_len always
 // ============================================================================
 
 proof fn capacity_conservation(cache: &KvCacheState)

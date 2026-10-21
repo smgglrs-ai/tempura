@@ -1,4 +1,4 @@
-//! Verus-verified GPU elementwise kernel invariants — unbounded proofs
+//! Verus-verified GPU elementwise kernel invariants -- unbounded proofs
 //!
 //! Proves: 1D thread indexing for vector_add, silu_mul, softmax_exp,
 //! and elementwise operations. All use the pattern: if i < len { out[i] = f(a[i], b[i]) }
@@ -117,7 +117,7 @@ proof fn rmsnorm_gpu_decomposition(
 }
 
 // ============================================================================
-// RoPE GPU: i → (s, h, d) decomposition
+// RoPE GPU: i -> (s, h, d) decomposition
 // ============================================================================
 
 proof fn rope_gpu_decomposition(

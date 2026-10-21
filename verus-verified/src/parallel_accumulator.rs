@@ -1,4 +1,4 @@
-//! Verus-verified parallel-accumulator equivalence proofs — unbounded
+//! Verus-verified parallel-accumulator equivalence proofs -- unbounded
 //!
 //! Proves that the AVX-VNNI two-register accumulator pattern (split into
 //! even-indexed and odd-indexed products, then summed) is algebraically
@@ -199,10 +199,10 @@ pub proof fn lemma_parallel_accum_equals_sequential(
 // ============================================================================
 // Lemma 2: Scale factor distributes over dot product (unbounded)
 //
-// Kani proved this for sc ∈ [0,7], q ∈ [0,7], a ∈ [-7,7] (2 elements).
+// Kani proved this for sc ??? [0,7], q ??? [0,7], a ??? [-7,7] (2 elements).
 // Verus proves it for ALL int values and ALL lengths.
 //
-//   sc * Σ_i (q[i] * a[i])  ==  Σ_i ((sc * q[i]) * a[i])
+//   sc * Sigma_i (q[i] * a[i])  ==  Sigma_i ((sc * q[i]) * a[i])
 //
 // That is: dot(scale(sc, q), a) == sc * dot(q, a).
 // This is stated directly as lemma_dot_scale_left below.
@@ -263,7 +263,7 @@ pub proof fn lemma_dot_scale_left(sc: int, q: Seq<int>, a: Seq<int>)
 // ============================================================================
 // Lemma 3: Min-correction group-sum equivalence (unbounded)
 //
-// Kani proved: m * (a0 + a1) == m*a0 + m*a1  for m ∈ [0,15], a ∈ [-15,15].
+// Kani proved: m * (a0 + a1) == m*a0 + m*a1  for m ??? [0,15], a ??? [-15,15].
 // Verus proves: m * sum(a) == sum(m * a)  for ALL m, ALL sequences.
 // ============================================================================
 
@@ -303,7 +303,7 @@ pub proof fn lemma_min_correction_group_sum(m: int, a: Seq<int>)
 // ============================================================================
 // Lemma 4: Nibble pack/unpack roundtrip (bit arithmetic, u8)
 //
-// Kani proved this for lo,hi ∈ [0,15] as u8.
+// Kani proved this for lo,hi ??? [0,15] as u8.
 // Verus proves it for all u8 lo,hi satisfying lo <= 15 and hi <= 15,
 // using the bit_vector tactic (exact same domain as Kani, but deductively).
 // The key facts: (lo | (hi << 4)) & 0xF == lo  and

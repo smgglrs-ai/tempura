@@ -10,7 +10,7 @@
 //! All tensors are passed as flat slices with explicit dimension params.
 //! q is always f32; k/v are f16 (as &[u16]); mask is f16 (as &[u16]).
 //! Scratch memory that the C code pulls from `params->wdata` is allocated
-//! as local Vecs per call — correct behaviour, not as fast as the pooled
+//! as local Vecs per call -- correct behaviour, not as fast as the pooled
 //! wdata approach but faithfully equivalent.
 
 use crate::ggml::helpers::f16_to_f32;
@@ -19,7 +19,7 @@ use crate::ggml::helpers::f16_to_f32;
 const Q_TILE_SZ: usize = 64;
 const KV_TILE_SZ: usize = 64;
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// -- helpers ------------------------------------------------------------------
 
 #[inline(always)]
 fn vec_scale_f32(v: &mut [f32], s: f32) {
@@ -31,8 +31,8 @@ fn vec_mad_f32(acc: &mut [f32], src: &[f32], vs: f32) {
     for (a, &b) in acc.iter_mut().zip(src) { *a += b * vs; }
 }
 
-/// Scalar GEMM: C[m×n] += A[m×k] × B[k×n]
-/// B is stored transposed as B_T[k×n] (i.e. B[dk][kv] in the K packing).
+/// Scalar GEMM: C[mxn] += A[mxk] x B[kxn]
+/// B is stored transposed as B_T[kxn] (i.e. B[dk][kv] in the K packing).
 fn scalar_gemm_acc(c: &mut [f32], a: &[f32], b_t: &[f32], m: usize, k: usize, n: usize) {
     for i in 0..m {
         for p in 0..k {
@@ -58,7 +58,7 @@ fn vec_soft_max_f32(v: &mut [f32], max_val: f32) -> f32 {
     sum
 }
 
-// ── slope computation (ALiBi / max_bias) ─────────────────────────────────────
+// -- slope computation (ALiBi / max_bias) -------------------------------------
 
 fn head_slope(h: usize, n_head: usize, max_bias: f32) -> f32 {
     if max_bias <= 0.0 {
@@ -74,19 +74,19 @@ fn head_slope(h: usize, n_head: usize, max_bias: f32) -> f32 {
     }
 }
 
-// ── ggml_compute_forward_flash_attn_ext_f16_one_chunk ────────────────────────
+// -- ggml_compute_forward_flash_attn_ext_f16_one_chunk ------------------------
 //
 // Translated from ops.cpp ~8614. Processes query rows ir0..ir1, KV positions
 // ic_start..ic_end.
 //
 // Shape conventions (all contiguous):
-//   q:    [neq3, neq2, neq1, dk]  — neq3=batch, neq2=n_head, neq1=n_tokens
+//   q:    [neq3, neq2, neq1, dk]  -- neq3=batch, neq2=n_head, neq1=n_tokens
 //   k:    [nek3, nek2, nek1, dk]  (f16 as u16)
 //   v:    [nev3, nev2, nek1, dv]  (f16 as u16)
 //   mask: [neq1, nek1]            (f16 as u16, optional; neq1 rows)
-//   dst:  [neq3, neq2, neq1, dv]  — output (contiguous, f32)
+//   dst:  [neq3, neq2, neq1, dv]  -- output (contiguous, f32)
 //
-// ir = flat index over neq3 × neq2 × neq1.
+// ir = flat index over neq3 x neq2 x neq1.
 //
 // partials: if Some, write [M, S, VKQ[dv]] per ir into that buffer with the
 // given stride (in f32 elements); otherwise write normalized output to dst.
@@ -117,7 +117,7 @@ pub fn flash_attn_ext_f16_one_chunk(
     // kv range
     ic_start: usize,
     ic_end: usize,
-    // partial output (None → write directly to dst)
+    // partial output (None -> write directly to dst)
     partials: Option<&mut [f32]>,
     partial_stride: usize,
 ) {
@@ -234,7 +234,7 @@ pub fn flash_attn_ext_f16_one_chunk(
             let s_inv = if s_sum == 0.0 { 0.0 } else { 1.0 / s_sum };
             vec_scale_f32(&mut vkq32, s_inv);
 
-            // dst layout: permute(0,2,1,3) → [iq3, iq2, iq1] → offset = (iq3*neq2*neq1 + iq2 + iq1*neq1)*dv
+            // dst layout: permute(0,2,1,3) -> [iq3, iq2, iq1] -> offset = (iq3*neq2*neq1 + iq2 + iq1*neq1)*dv
             // (matching nb1 = dv*sizeof(f32), row = i2 + i1*ne1 where ne1 = neq2)
             let dst_off = (iq3 * neq2 * neq1 + iq2 + iq1 * neq2) * dv;
             dst[dst_off..dst_off + dv].copy_from_slice(&vkq32);
@@ -242,11 +242,11 @@ pub fn flash_attn_ext_f16_one_chunk(
     }
 }
 
-// ── ggml_compute_forward_flash_attn_ext_tiled ────────────────────────────────
+// -- ggml_compute_forward_flash_attn_ext_tiled --------------------------------
 //
-// Translated from ops.cpp ~8852. Tiled version using Q_TILE_SZ × KV_TILE_SZ
+// Translated from ops.cpp ~8852. Tiled version using Q_TILE_SZ x KV_TILE_SZ
 // blocks and a scalar GEMM kernel (replaces simd_gemm). Operates on all KV
-// positions (no ic_start/ic_end split — the caller provides ir0..ir1).
+// positions (no ic_start/ic_end split -- the caller provides ir0..ir1).
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attn_ext_tiled(
     q: &[f32],
@@ -344,7 +344,7 @@ pub fn flash_attn_ext_tiled(
                 }
             }
 
-            // KQ[Q_TILE_SZ][KV_TILE_SZ] = Q_tile[Q_TILE_SZ][dk] × K_f32[dk][KV_TILE_SZ]
+            // KQ[Q_TILE_SZ][KV_TILE_SZ] = Q_tile[Q_TILE_SZ][dk] x K_f32[dk][KV_TILE_SZ]
             kq.fill(0.0);
             scalar_gemm_acc(&mut kq, &q_tile, &k_f32, Q_TILE_SZ, dk, KV_TILE_SZ);
             vec_scale_f32(&mut kq[..Q_TILE_SZ * KV_TILE_SZ], effective_scale);
@@ -404,10 +404,10 @@ pub fn flash_attn_ext_tiled(
                 }
             }
 
-            // VKQ32 += KQ[Q_TILE_SZ][KV_TILE_SZ] × V32[KV_TILE_SZ][dv]
+            // VKQ32 += KQ[Q_TILE_SZ][KV_TILE_SZ] x V32[KV_TILE_SZ][dv]
             // V32 stored as [KV_TILE_SZ][dv] (row-major), need to transpose K dim
-            // scalar_gemm_acc expects b_t[k][n], here k=KV_TILE_SZ, n=dv → V32 already [tk][dv]
-            // but scalar_gemm_acc uses b_t[p][j] → b_t[KV_TILE_SZ][dv], which matches V32
+            // scalar_gemm_acc expects b_t[k][n], here k=KV_TILE_SZ, n=dv -> V32 already [tk][dv]
+            // but scalar_gemm_acc uses b_t[p][j] -> b_t[KV_TILE_SZ][dv], which matches V32
             scalar_gemm_acc(&mut vkq32, &kq, &v32, Q_TILE_SZ, KV_TILE_SZ, dv);
 
             ic += KV_TILE_SZ;
@@ -443,7 +443,7 @@ pub fn flash_attn_ext_tiled(
     }
 }
 
-// ── ggml_flash_attn_ext_reduce_partials ──────────────────────────────────────
+// -- ggml_flash_attn_ext_reduce_partials --------------------------------------
 //
 // Translated from ops.cpp ~9142.
 // Combines partial [M, S, VKQ[dv]] results written by different KV-chunk
@@ -460,7 +460,7 @@ pub fn flash_attn_ext_reduce_partials(
     n_kv: usize,
     chunk_size: usize,
     dv: usize,
-    neq1: usize,  // n_tokens (N) — for dst layout
+    neq1: usize,  // n_tokens (N) -- for dst layout
     neq2: usize,  // n_head
     ith: usize,
     nth: usize,
@@ -509,12 +509,12 @@ pub fn flash_attn_ext_reduce_partials(
     }
 }
 
-// ── ggml_compute_forward_flash_attn_ext_f16 (main dispatch) ──────────────────
+// -- ggml_compute_forward_flash_attn_ext_f16 (main dispatch) ------------------
 //
 // Translated from ops.cpp ~9212.
 //
 // For decode (neq1==1, neq3==1, nek1>=512, k/v same f16 type):
-//   Split KV across threads → each thread processes one chunk → barrier → reduce.
+//   Split KV across threads -> each thread processes one chunk -> barrier -> reduce.
 // Otherwise:
 //   Work-steal query rows, use tiled or one-chunk path per row range.
 //
@@ -612,9 +612,9 @@ mod tests {
             None, 0,
         );
 
-        // Q·K[0] = 1.0 * scale, Q·K[1] = 0.0 * scale
-        // After softmax: weight[0] ≈ 0.731, weight[1] ≈ 0.269
-        // Output ≈ weight[0] * V[0] + weight[1] * V[1]
+        // Q*K[0] = 1.0 * scale, Q*K[1] = 0.0 * scale
+        // After softmax: weight[0] ~= 0.731, weight[1] ~= 0.269
+        // Output ~= weight[0] * V[0] + weight[1] * V[1]
         let scale_v = scale;
         let s0 = 1.0f32 * scale_v;
         let s1 = 0.0f32;

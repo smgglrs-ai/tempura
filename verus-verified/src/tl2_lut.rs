@@ -1,4 +1,4 @@
-//! Verus-verified TL2 LUT kernel properties — unbounded proofs
+//! Verus-verified TL2 LUT kernel properties -- unbounded proofs
 //!
 //! Proves: LUT entry value bounds for three-valued and two-valued encodings,
 //! base-3 triplet and base-2 pair index ranges, nibble extraction, i16/i32
@@ -129,7 +129,7 @@ proof fn i16_accumulator_no_overflow_bk96(val: int, kk: nat)
 // ============================================================================
 // i32 accumulator safety: across all BK tiles for k up to 8192.
 // Each BK=96 tile contributes up to 4064 to i16, widened to i32.
-// n_tiles = k/96. Max i32 = 4064 * (8192/96) ≈ 346,624 ≪ 2^31.
+// n_tiles = k/96. Max i32 = 4064 * (8192/96) ~= 346,624 ??? 2^31.
 // ============================================================================
 
 proof fn i32_accumulator_no_overflow(k: nat)
@@ -210,7 +210,7 @@ proof fn trit_value_range(bits: int)
 
 // ============================================================================
 // Direct dot product accumulator: for k elements, each contributing at most
-// |trit * a_q| = 1 * 127 = 127, the sum fits in i32 for k ≤ 16,777,216.
+// |trit * a_q| = 1 * 127 = 127, the sum fits in i32 for k <= 16,777,216.
 // ============================================================================
 
 proof fn direct_dot_accumulator_fits_i32(k: nat)

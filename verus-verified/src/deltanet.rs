@@ -1,4 +1,4 @@
-//! Verus-verified DeltaNet indexing and output consistency — unbounded proofs
+//! Verus-verified DeltaNet indexing and output consistency -- unbounded proofs
 
 use vstd::prelude::*;
 
@@ -48,9 +48,9 @@ proof fn deltanet_qkv_index_in_bounds(
 
 /// Output, retrieve, and update all use state[row*d+col] with row,col < d.
 /// This proves the three operations are consistent:
-///   output[col]   = Σ_row S[row*d+col] * q[row]  → S^T @ q
-///   retrieve[col] = Σ_row S[row*d+col] * k[row]  → S^T @ k
-///   update:          S[row*d+col] += k[row]*δ[col] → S += k ⊗ δ
+///   output[col]   = Sigma_row S[row*d+col] * q[row]  -> S^T @ q
+///   retrieve[col] = Sigma_row S[row*d+col] * k[row]  -> S^T @ k
+///   update:          S[row*d+col] += k[row]*delta[col] -> S += k ??? delta
 proof fn deltanet_output_retrieve_consistent(
     head_dim: nat,
     row: nat,

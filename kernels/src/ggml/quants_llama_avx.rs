@@ -1,5 +1,5 @@
 //! Direct Rust translation of llama.cpp ggml/src/ggml-cpu/arch/x86/quants.c
-//! Plain AVX paths (#elif defined(__AVX__)) — 128-bit split operations.
+//! Plain AVX paths (#elif defined(__AVX__)) -- 128-bit split operations.
 
 #![allow(unused_imports, dead_code, unused_variables, unused_mut)]
 
@@ -51,14 +51,14 @@ static KEVEN_SIGNS_Q2XS: [i8; 1024] = [
      1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1, -1,
 ];
 
-// e8m0_to_f32_half: E8M0 byte → f32, then halved (GGML_CPU_E8M0_TO_FP32_HALF)
+// e8m0_to_f32_half: E8M0 byte -> f32, then halved (GGML_CPU_E8M0_TO_FP32_HALF)
 #[inline(always)]
 fn e8m0_to_f32_half(x: u8) -> f32 {
     let bits: u32 = if x < 2 { 0x00200000u32 << x } else { (x as u32 - 1) << 23 };
     f32::from_bits(bits)
 }
 
-// ── AVX helpers ───────────────────────────────────────────────────────────────
+// -- AVX helpers ---------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -120,7 +120,7 @@ unsafe fn sum_i16_pairs_float(xh: __m128i, xl: __m128i) -> __m256 {
     _mm256_cvtepi32_ps(mm256_set_m128i(_mm_madd_epi16(ones, xh), _mm_madd_epi16(ones, xl)))
 }
 
-// AVX mul_sum_us8_pairs_float: split 256→2×128 (lines 217-226)
+// AVX mul_sum_us8_pairs_float: split 256->2x128 (lines 217-226)
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn mul_sum_us8_pairs_float(ax: __m256i, sy: __m256i) -> __m256 {
@@ -131,7 +131,7 @@ unsafe fn mul_sum_us8_pairs_float(ax: __m256i, sy: __m256i) -> __m256 {
     sum_i16_pairs_float(_mm_maddubs_epi16(axh, syh), _mm_maddubs_epi16(axl, syl))
 }
 
-// AVX mul_sum_i8_pairs_float: split 256→2×128, sign trick (lines 229-244)
+// AVX mul_sum_i8_pairs_float: split 256->2x128, sign trick (lines 229-244)
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn mul_sum_i8_pairs_float(x: __m256i, y: __m256i) -> __m256 {
@@ -147,7 +147,7 @@ unsafe fn mul_sum_i8_pairs_float(x: __m256i, y: __m256i) -> __m256 {
     )
 }
 
-// mul_sum_i8_quad_float: 4 pairs of 128-bit → __m256 (lines 247-262)
+// mul_sum_i8_quad_float: 4 pairs of 128-bit -> __m256 (lines 247-262)
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn mul_sum_i8_quad_float(
@@ -162,7 +162,7 @@ unsafe fn mul_sum_i8_quad_float(
     _mm256_cvtepi32_ps(mm256_set_m128i(_mm_add_epi32(p2, p3), _mm_add_epi32(p0, p1)))
 }
 
-// quad_fp16_delta_float: (x0,y0)→lo, (x1,y1)→hi (lines 265-269)
+// quad_fp16_delta_float: (x0,y0)->lo, (x1,y1)->hi (lines 265-269)
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn quad_fp16_delta_float(x0: u16, y0: u16, x1: u16, y1: u16) -> __m256 {
@@ -207,7 +207,7 @@ unsafe fn signs64(idx: usize) -> u64 {
     *(KEVEN_SIGNS_Q2XS.as_ptr().add(idx * 8) as *const u64)
 }
 
-// ── ggml_vec_dot_q1_0_q8_0 — AVX section, line 607 ──────────────────────────
+// -- ggml_vec_dot_q1_0_q8_0 -- AVX section, line 607 --------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -260,7 +260,7 @@ pub unsafe fn ggml_vec_dot_q1_0_q8_0_avx(
     hsum_float_8(acc)
 }
 
-// ── ggml_vec_dot_q4_0_q8_0 — AVX section, line 742 ──────────────────────────
+// -- ggml_vec_dot_q4_0_q8_0 -- AVX section, line 742 --------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -313,7 +313,7 @@ pub unsafe fn ggml_vec_dot_q4_0_q8_0_avx(
     sumf
 }
 
-// ── ggml_vec_dot_mxfp4_q8_0 — AVX section, line 965 ─────────────────────────
+// -- ggml_vec_dot_mxfp4_q8_0 -- AVX section, line 965 -------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -359,7 +359,7 @@ pub unsafe fn ggml_vec_dot_mxfp4_q8_0_avx(
     sumf
 }
 
-// ── ggml_vec_dot_nvfp4_q8_0 — AVX section, line 1065 ────────────────────────
+// -- ggml_vec_dot_nvfp4_q8_0 -- AVX section, line 1065 ------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -423,7 +423,7 @@ unsafe fn mul_sum_i8_pairs_128(x: __m128i, y: __m128i) -> __m128i {
     _mm_madd_epi16(_mm_set1_epi16(1), dot)
 }
 
-// ── ggml_vec_dot_q5_0_q8_0 — AVX section, line 1182 ─────────────────────────
+// -- ggml_vec_dot_q5_0_q8_0 -- AVX section, line 1182 -------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -452,7 +452,7 @@ pub unsafe fn ggml_vec_dot_q5_0_q8_0_avx(
     hsum_float_8(acc)
 }
 
-// ── ggml_vec_dot_q5_1_q8_1 — AVX section, line 1265 ─────────────────────────
+// -- ggml_vec_dot_q5_1_q8_1 -- AVX section, line 1265 -------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -484,7 +484,7 @@ pub unsafe fn ggml_vec_dot_q5_1_q8_1_avx(
     hsum_float_8(acc) + summs
 }
 
-// ── ggml_vec_dot_q8_0_q8_0 — AVX section, line 1343 ─────────────────────────
+// -- ggml_vec_dot_q8_0_q8_0 -- AVX section, line 1343 -------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -522,7 +522,7 @@ pub unsafe fn ggml_vec_dot_q8_0_q8_0_avx(
     sumf
 }
 
-// ── ggml_vec_dot_q2_K_q8_K — AVX section, line 1652 ─────────────────────────
+// -- ggml_vec_dot_q2_K_q8_K -- AVX section, line 1652 -------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -606,7 +606,7 @@ pub unsafe fn ggml_vec_dot_q2_k_q8_k_avx(
     hsum_float_8(acc)
 }
 
-// ── ggml_vec_dot_q3_K_q8_K — AVX section, line 1886 ─────────────────────────
+// -- ggml_vec_dot_q3_K_q8_K -- AVX section, line 1886 -------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -701,7 +701,7 @@ pub unsafe fn ggml_vec_dot_q3_k_q8_k_avx(
     hsum_float_8(acc)
 }
 
-// ── ggml_vec_dot_q4_K_q8_K — AVX section, line 2122 ─────────────────────────
+// -- ggml_vec_dot_q4_K_q8_K -- AVX section, line 2122 -------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -772,7 +772,7 @@ pub unsafe fn ggml_vec_dot_q4_k_q8_k_avx(
     hsum_float_8(acc) + _mm_cvtss_f32(acc_m)
 }
 
-// ── ggml_vec_dot_q5_K_q8_K — AVX section, line 2314 ─────────────────────────
+// -- ggml_vec_dot_q5_K_q8_K -- AVX section, line 2314 -------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -856,7 +856,7 @@ pub unsafe fn ggml_vec_dot_q5_k_q8_k_avx(
     hsum_float_8(acc) + summs
 }
 
-// ── ggml_vec_dot_q6_K_q8_K — AVX section, line 2510 ─────────────────────────
+// -- ggml_vec_dot_q6_K_q8_K -- AVX section, line 2510 -------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -941,7 +941,7 @@ pub unsafe fn ggml_vec_dot_q6_k_q8_k_avx(
     hsum_float_8(acc)
 }
 
-// ── ggml_vec_dot_iq2_xxs_q8_K — AVX section, line 2715 ──────────────────────
+// -- ggml_vec_dot_iq2_xxs_q8_K -- AVX section, line 2715 ----------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -1002,7 +1002,7 @@ pub unsafe fn ggml_vec_dot_iq2_xxs_q8_k_avx(
     0.125 * hsum_float_8(accumf)
 }
 
-// ── ggml_vec_dot_iq2_xs_q8_K — AVX section, line 2909 ───────────────────────
+// -- ggml_vec_dot_iq2_xs_q8_K -- AVX section, line 2909 -----------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -1146,7 +1146,7 @@ pub unsafe fn ggml_vec_dot_iq2_xs_q8_k_avx(
     0.125 * hsum_float_8(accumf)
 }
 
-// ── ggml_vec_dot_iq2_s_q8_K — AVX section, line 3160 ────────────────────────
+// -- ggml_vec_dot_iq2_s_q8_K -- AVX section, line 3160 ------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -1253,7 +1253,7 @@ pub unsafe fn ggml_vec_dot_iq2_s_q8_k_avx(
     0.125 * hsum_float_8(accumf)
 }
 
-// ── ggml_vec_dot_iq3_xxs_q8_K — AVX section, line 3319 ──────────────────────
+// -- ggml_vec_dot_iq3_xxs_q8_K -- AVX section, line 3319 ----------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -1315,7 +1315,7 @@ pub unsafe fn ggml_vec_dot_iq3_xxs_q8_k_avx(
     0.25 * hsum_float_8(accumf)
 }
 
-// ── ggml_vec_dot_iq3_s_q8_K — AVX section, line 3480 ────────────────────────
+// -- ggml_vec_dot_iq3_s_q8_K -- AVX section, line 3480 ------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -1419,7 +1419,7 @@ pub unsafe fn ggml_vec_dot_iq3_s_q8_k_avx(
 }
 
 
-// ── ggml_vec_dot_iq1_s_q8_K — AVX section, line 3657 ────────────────────────
+// -- ggml_vec_dot_iq1_s_q8_K -- AVX section, line 3657 ------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -1464,7 +1464,7 @@ pub unsafe fn ggml_vec_dot_iq1_s_q8_k_avx(n: usize, x: &[BlockIQ1S], y: &[BlockQ
     hsum_float_8(accum) + IQ1S_DELTA * accum1
 }
 
-// ── ggml_vec_dot_iq1_m_q8_K — AVX section, line 3825 ────────────────────────
+// -- ggml_vec_dot_iq1_m_q8_K -- AVX section, line 3825 ------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -1534,7 +1534,7 @@ pub unsafe fn ggml_vec_dot_iq1_m_q8_k_avx(
     hsum_float_8(accum1) + IQ1M_DELTA * hsum_float_8(accum2)
 }
 
-// ── ggml_vec_dot_iq4_nl_q8_0 — AVX section, line 3966 ───────────────────────
+// -- ggml_vec_dot_iq4_nl_q8_0 -- AVX section, line 3966 -----------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]
@@ -1579,7 +1579,7 @@ pub unsafe fn ggml_vec_dot_iq4_nl_q8_0_avx(
     sumf
 }
 
-// ── ggml_vec_dot_iq4_xs_q8_K — AVX section, line 4054 ───────────────────────
+// -- ggml_vec_dot_iq4_xs_q8_K -- AVX section, line 4054 -----------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,fma,ssse3,sse4.1")]

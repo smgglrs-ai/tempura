@@ -1,4 +1,4 @@
-//! Verus-verified TurboQuant/PQO compression indexing — unbounded proofs
+//! Verus-verified TurboQuant/PQO compression indexing -- unbounded proofs
 //!
 //! Proves group-based compression and decompression indexing for any
 //! valid head_dim, num_vectors, and group_size.

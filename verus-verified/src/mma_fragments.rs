@@ -8,7 +8,7 @@ use vstd::prelude::*;
 verus! {
 
 // ============================================================================
-// MMA m16n8k16 (Tier 1, sm_80+): D[4×f32], A[4×u32], B[2×u32], C[4×f32]
+// MMA m16n8k16 (Tier 1, sm_80+): D[4xf32], A[4xu32], B[2xu32], C[4xf32]
 // ============================================================================
 
 proof fn mma_m16n8k16_fragments()
@@ -20,23 +20,23 @@ proof fn mma_m16n8k16_fragments()
         let m: nat = 16;
         let n: nat = 8;
         let k: nat = 16;
-        // 32 threads per warp × 4 outputs = 128 elements = m × n = 16 × 8
+        // 32 threads per warp x 4 outputs = 128 elements = m x n = 16 x 8
         &&& 32 * d_size == m * n
     }),
 {
 }
 
 // ============================================================================
-// MMA m16n8k32 (Tier 2, sm_120+): D[4×f32], A[4×u32], B[2×u32]
+// MMA m16n8k32 (Tier 2, sm_120+): D[4xf32], A[4xu32], B[2xu32]
 // For FP8 E4M3: each u32 holds 4 packed FP8 values
 // ============================================================================
 
 proof fn mma_m16n8k32_fragments()
     ensures ({
         let d_size: nat = 4;
-        let a_size: nat = 4;   // 4 × 4 = 16 FP8 values per thread, 32 threads × 16 = 512
+        let a_size: nat = 4;   // 4 x 4 = 16 FP8 values per thread, 32 threads x 16 = 512
         let k: nat = 32;
-        // A matrix: 16 rows × 32 cols, distributed across 32 threads
+        // A matrix: 16 rows x 32 cols, distributed across 32 threads
         // Each thread contributes 4 u32 = 16 FP8 elements
         &&& 32 * 16 == 512
         &&& 512 == 16 * k
@@ -60,7 +60,7 @@ proof fn mma_thread_output_mapping(
         n == 8,
     ensures ({
         let row_group = thread_in_warp % 16;  // 0..15
-        // Each thread produces 4 output elements: 2 per row × 2 rows
+        // Each thread produces 4 output elements: 2 per row x 2 rows
         &&& row_group < m
     }),
 {
@@ -68,7 +68,7 @@ proof fn mma_thread_output_mapping(
 }
 
 // ============================================================================
-// Warp-level tile: one warp computes m×n output tile
+// Warp-level tile: one warp computes mxn output tile
 // CTA with W warps computes W tiles
 // ============================================================================
 
@@ -92,7 +92,7 @@ proof fn warp_tile_coverage(
 }
 
 // ============================================================================
-// CTA-level tile: CTA_M × CTA_N output, processed by warps
+// CTA-level tile: CTA_M x CTA_N output, processed by warps
 // ============================================================================
 
 proof fn cta_tile_decomposition(

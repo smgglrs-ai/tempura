@@ -1,6 +1,6 @@
-//! Verus-verified GPU flash attention kernel invariants — unbounded proofs
+//! Verus-verified GPU flash attention kernel invariants -- unbounded proofs
 //!
-//! Proves: thread/warp/block decomposition, shared memory indexing (BR×HD),
+//! Proves: thread/warp/block decomposition, shared memory indexing (BRxHD),
 //! Q/KV tile loading, causal early-exit, and GQA head mapping within the kernel.
 
 use vstd::prelude::*;
@@ -14,11 +14,11 @@ pub spec const HD: nat = 128;
 pub spec const SMEM_QKV: nat = 4096; // BR * HD = 32 * 128
 
 // ============================================================================
-// Thread decomposition: tid_x → (warp_id, lane, group_id, tid)
+// Thread decomposition: tid_x -> (warp_id, lane, group_id, tid)
 // ============================================================================
 
 proof fn thread_decomposition(tid_x: nat)
-    requires tid_x < 128, // 4 warps × 32 lanes
+    requires tid_x < 128, // 4 warps x 32 lanes
     ensures ({
         let warp_id = tid_x / 32;
         let lane = tid_x % 32;
@@ -47,7 +47,7 @@ proof fn q_tile_smem_load(tid_x: nat, li: nat)
     ensures ({
         let elem = tid_x * 64 + li;
         // Total elements to load: BR * HD = 32 * 128 = 4096
-        // 128 threads × 64 elements each = 8192 ≥ 4096 (covers the tile)
+        // 128 threads x 64 elements each = 8192 >= 4096 (covers the tile)
         // But individual elem can be up to 128*64-1 = 8191
         // SMEM_QKV = 4096, so we need elem < SMEM_QKV for the access to be valid
         // The kernel checks row < sl && col < hd before writing
@@ -160,14 +160,14 @@ proof fn kv_smem_index(row: nat, col: nat)
 
 // ============================================================================
 // Output accumulator: o_acc has head_dim elements per warp row (2 rows per warp)
-// Each warp handles 2 rows × HD elements = 2 × 128 = 256, but stored as 64
-// elements (16 per MMA fragment × 4 fragments)
+// Each warp handles 2 rows x HD elements = 2 x 128 = 256, but stored as 64
+// elements (16 per MMA fragment x 4 fragments)
 // ============================================================================
 
 proof fn output_accumulator_size(hd: nat)
     requires hd == 128,
     ensures ({
-        let o_acc_size: nat = 64; // 2 rows × 32 elements per row in MMA layout
+        let o_acc_size: nat = 64; // 2 rows x 32 elements per row in MMA layout
         o_acc_size <= hd
     }),
 {

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
-# Standalone crate — not in the main workspace.
+# Standalone crate -- not in the main workspace.
 # Build with: cargo oxide build --manifest-path tools/oxide-gemv/Cargo.toml
 [workspace]
 

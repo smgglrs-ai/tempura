@@ -116,7 +116,7 @@ pub mod openmp {
         }
     }
 
-    // Per-block trampolines for the K-tiled GEMM (one Q4K block × one Q8K block)
+    // Per-block trampolines for the K-tiled GEMM (one Q4K block x one Q8K block)
     unsafe extern "C" fn q4k_q8k_block_dot(w_blk: *const u8, q8k_blk: *const u8) -> f32 {
         let x = std::slice::from_raw_parts(w_blk as *const BlockQ4K, 1);
         let y = std::slice::from_raw_parts(q8k_blk as *const BlockQ8K, 1);
@@ -129,8 +129,8 @@ pub mod openmp {
         crate::ggml::vec_dot_avx2::vec_dot_q6_k_q8_k_dispatch(256, x, y)
     }
 
-    /// K-tiled GEMM for Q4K × Q8K (prefill, m>1).
-    /// `q8k_all`: flat byte buffer of m×bpr `BlockQ8K` blocks, pre-quantized by caller.
+    /// K-tiled GEMM for Q4K x Q8K (prefill, m>1).
+    /// `q8k_all`: flat byte buffer of mxbpr `BlockQ8K` blocks, pre-quantized by caller.
     pub fn gemm_tiled_q4k(
         weights: &[u8],
         q8k_all: &[u8],
@@ -154,7 +154,7 @@ pub mod openmp {
         }
     }
 
-    /// K-tiled GEMM for Q6K × Q8K (prefill, m>1).
+    /// K-tiled GEMM for Q6K x Q8K (prefill, m>1).
     pub fn gemm_tiled_q6k(
         weights: &[u8],
         q8k_all: &[u8],

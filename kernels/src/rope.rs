@@ -138,7 +138,7 @@ fn rope_forward_f16_scalar(
     }
 }
 
-/// Fused f32→RoPE→f16: reads f32, applies rotation, writes f16.
+/// Fused f32->RoPE->f16: reads f32, applies rotation, writes f16.
 #[cfg(feature = "cpu")]
 pub fn rope_f32_to_f16(
     x: &[f32],
@@ -292,7 +292,7 @@ pub fn build_cos_sin_table(max_pos: usize, head_dim: usize, theta: f32) -> Vec<f
     table
 }
 
-/// Rotation mode for RoPE — determines how dimension pairs are formed.
+/// Rotation mode for RoPE -- determines how dimension pairs are formed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoPEMode {
     /// Adjacent pairs: (x[0],x[1]), (x[2],x[3]), ...
@@ -824,7 +824,7 @@ impl CpuRoPEScaled {
         let inv_freq = (0..half)
             .map(|d| {
                 let base_inv = 1.0 / theta.powf(2.0 * d as f32 / head_dim as f32);
-                // ramp=1 → extrapolate (keep base freq), ramp=0 → interpolate (divide by factor)
+                // ramp=1 -> extrapolate (keep base freq), ramp=0 -> interpolate (divide by factor)
                 let ramp = yarn_ramp(low, high, (d * 2) as i64);
                 base_inv / factor * (1.0 - ramp) + base_inv * ramp
             })
@@ -1013,7 +1013,7 @@ mod kani_proofs {
         let rope = super::CpuRoPEUnified::new(super::RoPEMode::Normal, n_dims);
         let _ = rope.forward(&mut x[..n], 1, 1, 1, head_dim, &positions, 10000.0);
 
-        // At position 0: theta=0, cos(0)=1, sin(0)=0 → identity
+        // At position 0: theta=0, cos(0)=1, sin(0)=0 -> identity
         for i in 0..n {
             assert!((x[i] - original[i]).abs() < 1e-5);
         }

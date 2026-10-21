@@ -1,4 +1,4 @@
-//! Verus-verified sampling chain, RoPE, and ALiBi properties — unbounded proofs
+//! Verus-verified sampling chain, RoPE, and ALiBi properties -- unbounded proofs
 //!
 //! Proves: min-p threshold range, top-k keeps at least one, repetition penalty
 //! direction, mirostat convergence, logit bias additivity, chain length invariant,
@@ -114,7 +114,7 @@ proof fn mirostat_mu_update_convergence(
     }
 }
 
-// Proof 5: logit bias is additive — |result - logit| == |bias|
+// Proof 5: logit bias is additive -- |result - logit| == |bias|
 proof fn logit_bias_is_additive(
     logit: int,
     bias: int,
@@ -172,7 +172,7 @@ proof fn dry_penalty_geometric(
         requires multiplier >= 1, base_num > base_den;
 }
 
-// Proof 8: XTC min_keep invariant — at least K tokens have finite logits
+// Proof 8: XTC min_keep invariant -- at least K tokens have finite logits
 proof fn xtc_min_keep_invariant(
     vocab_size: nat,
     filtered_count: nat,
@@ -265,7 +265,7 @@ proof fn rope_freq_factor_division(
     }
 }
 
-// Proof 12: RoPE passthrough dims — dimensions beyond n_dims are unchanged
+// Proof 12: RoPE passthrough dims -- dimensions beyond n_dims are unchanged
 // For n_dims < head_dim: dimensions [n_dims..head_dim] are not rotated
 proof fn rope_passthrough_dims(
     n_dims: nat,
@@ -342,7 +342,7 @@ proof fn alibi_slope_monotonic(
         requires c_num >= 1;
 }
 
-// Proof 15: ALiBi recency bias — distant keys are penalized
+// Proof 15: ALiBi recency bias -- distant keys are penalized
 // For q_pos > k_pos: slope * (k_pos - q_pos) < 0
 // Since slope > 0 and (k_pos - q_pos) < 0
 proof fn alibi_recency_bias(

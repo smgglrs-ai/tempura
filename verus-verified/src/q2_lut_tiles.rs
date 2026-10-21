@@ -1,4 +1,4 @@
-//! Verus-verified Q2Lut work-stealing tile dispatch properties — unbounded proofs
+//! Verus-verified Q2Lut work-stealing tile dispatch properties -- unbounded proofs
 //!
 //! Proves: tile index bounds, tile non-overlap, full coverage, atomic counter
 //! monotonicity, and Q2Lut preprocess sizing.

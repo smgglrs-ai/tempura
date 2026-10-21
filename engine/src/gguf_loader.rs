@@ -279,7 +279,7 @@ fn read_metadata_value(
     }
 }
 
-// dequantize functions removed — now using tempura_kernels::ggml::dequantize::dequantize_row
+// dequantize functions removed -- now using tempura_kernels::ggml::dequantize::dequantize_row
 
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
@@ -671,7 +671,7 @@ pub fn dequant_q2_0_pub(data: &[u8], num_elements: usize) -> Vec<f32> {
 
 fn dequant_q2_0(data: &[u8], num_elements: usize) -> Vec<f32> {
     // PrismML Q2_0: QK=128, 34 bytes per block (2-byte f16 scale + 32 bytes packed)
-    // Encoding: (q - 1) * scale → 00=-1, 01=0, 10=+1, 11=+2
+    // Encoding: (q - 1) * scale -> 00=-1, 01=0, 10=+1, 11=+2
     const QK: usize = 128;
     const BLOCK_BYTES: usize = 34;
     let num_blocks = num_elements / QK;
@@ -1085,7 +1085,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
 
     // Qwen3.5/3.6 use IMROPE (interleaved multi-rope) = adjacent-pair (Norm) RoPE.
     // Standard GGUF converter permutes Q/K weights for adjacent-pair pairing.
-    // BitNet/ternary GGUF converter does NOT permute → needs NeoX (split-half) RoPE.
+    // BitNet/ternary GGUF converter does NOT permute -> needs NeoX (split-half) RoPE.
     let rope_type = if (arch == "qwen35" || arch == "qwen35moe") && !is_bitnet {
         crate::config::RopeType::Norm
     } else {
@@ -1456,7 +1456,7 @@ impl GgufLoader {
 
             let is_quantized =
                 !matches!(info.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
-            // I2S (bitnet.cpp type 39) has no matching GPU quantized kernel yet — dequantize to f32.
+            // I2S (bitnet.cpp type 39) has no matching GPU quantized kernel yet -- dequantize to f32.
             // TL1 (type 38, ARM LUT format) also dequantized via TQ1_0 path.
             let force_dequant = matches!(info.dtype, GgmlType::I2S | GgmlType::TL1);
             let keep_raw = if std::env::var("TEMPURA_F32_ALL").is_ok() {
@@ -1506,7 +1506,7 @@ impl GgufLoader {
                     GgmlType::Q2_0 => dequant_q2_0(tensor_data, ne),
                     GgmlType::TQ1_0 | GgmlType::TL1 => dequant_tq1(tensor_data, ne),
                     GgmlType::I2S => {
-                        // I2S/TL2 embed/norm should not appear — fall back to zeros
+                        // I2S/TL2 embed/norm should not appear -- fall back to zeros
                         vec![0.0f32; ne]
                     }
                     // Types with no dequant kernel yet
@@ -1567,7 +1567,7 @@ impl GgufLoader {
             .any(|l| tensors.contains_key(&format!("model.layers.{l}.self_attn.q_norm.weight")));
 
         // Detect ternary/BitNet attention weights: if Q uses Q2_0/TQ2_0,
-        // the converter did NOT permute Q/K → need NeoX RoPE even for qwen35.
+        // the converter did NOT permute Q/K -> need NeoX RoPE even for qwen35.
         let has_ternary_attn = tensor_dtypes.iter().any(|(name, dtype)| {
             name.contains("self_attn.q_proj") && matches!(dtype, GgmlType::Q2_0 | GgmlType::TQ2_0)
         }) || mmap_ranges.iter().any(|(name, &(_, _, dtype))| {
@@ -1733,7 +1733,7 @@ impl GgufLoader {
                 GgmlType::Q2_0 => dequant_q2_0(tensor_data, ne),
                 GgmlType::TQ1_0 | GgmlType::TL1 => dequant_tq1(tensor_data, ne),
                 GgmlType::I2S => vec![0.0f32; ne],
-                // Types with no dequant kernel yet — load raw bytes, return zeros for f32 path
+                // Types with no dequant kernel yet -- load raw bytes, return zeros for f32 path
                 GgmlType::Q8_1
                 | GgmlType::Q8K
                 | GgmlType::IQ2XXS
@@ -2065,10 +2065,10 @@ mod kani_proofs {
 
     /// Prove Q6_K interleaved dequant maps all 256 elements without gaps.
     /// Layout: for each half (0..2), for l in 0..32:
-    ///   y[y_off+l]    ← ql[ql_off+l] low + qh[qh_off+l] bits 0-1
-    ///   y[y_off+l+32] ← ql[ql_off+l+32] low + qh[qh_off+l] bits 2-3
-    ///   y[y_off+l+64] ← ql[ql_off+l] high + qh[qh_off+l] bits 4-5
-    ///   y[y_off+l+96] ← ql[ql_off+l+32] high + qh[qh_off+l] bits 6-7
+    ///   y[y_off+l]    <- ql[ql_off+l] low + qh[qh_off+l] bits 0-1
+    ///   y[y_off+l+32] <- ql[ql_off+l+32] low + qh[qh_off+l] bits 2-3
+    ///   y[y_off+l+64] <- ql[ql_off+l] high + qh[qh_off+l] bits 4-5
+    ///   y[y_off+l+96] <- ql[ql_off+l+32] high + qh[qh_off+l] bits 6-7
     #[kani::proof]
     fn gguf_dequant_q6k_covers_all_256() {
         let half: usize = kani::any();
@@ -2411,7 +2411,7 @@ mod tests {
         }
     }
 
-    // Q3K nonzero test removed — byte offsets are layout-dependent,
+    // Q3K nonzero test removed -- byte offsets are layout-dependent,
     // covered by ggml cross-validation tests in kernels/src/ggml/dequantize.rs
 
     #[test]
@@ -2447,15 +2447,15 @@ mod tests {
             256,
         );
         assert_eq!(result.len(), 256);
-        // ggml Q4_K layout: low nibbles → elements 0..31, high nibbles → elements 32..63
+        // ggml Q4_K layout: low nibbles -> elements 0..31, high nibbles -> elements 32..63
         // result[0] = d * sc[0] * (qs[0] & 0xF) = 1.0 * 3 * 2 = 6.0
         assert!((result[0] - 6.0).abs() < 1e-3, "got {}", result[0]);
-        // result[32] = d * sc[1] * (qs[0] >> 4) — sc[1]=0 so result[32]=0
+        // result[32] = d * sc[1] * (qs[0] >> 4) -- sc[1]=0 so result[32]=0
         // To test high nibble, set sc[1] too:
         // (not tested here, covered by cross-validation test below)
     }
 
-    // Q5K zeros/nonzero tests removed — the old raw-byte layout doesn't match
+    // Q5K zeros/nonzero tests removed -- the old raw-byte layout doesn't match
     // BlockQ5K #[repr(C)] field ordering. Covered by ggml cross-validation.
 
     #[test]
@@ -2483,7 +2483,7 @@ mod tests {
         let m_bytes = f32_to_f16_bytes(0.5);
         block[2] = m_bytes[0];
         block[3] = m_bytes[1];
-        block[8] = 0x07; // low nibble = 7, high bit = 0 → q = 7
+        block[8] = 0x07; // low nibble = 7, high bit = 0 -> q = 7
 
         let mut result = vec![0.0f32; 32];
         tempura_kernels::ggml::dequantize::dequantize_row(

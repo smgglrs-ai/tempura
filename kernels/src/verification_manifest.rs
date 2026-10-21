@@ -221,7 +221,7 @@ pub fn manifest() -> VerificationManifest {
             KernelProof {
                 kernel: "CpuMatMulQ4K",
                 harness: "q4k_monotonicity_within_group",
-                properties: vec!["Larger nibble value → larger dequantized value within group"],
+                properties: vec!["Larger nibble value -> larger dequantized value within group"],
                 status: "proven",
             },
             KernelProof {
@@ -259,8 +259,8 @@ pub fn manifest() -> VerificationManifest {
                 kernel: "CompositionVerifier",
                 harness: "verify_transformer_layer",
                 properties: vec![
-                    "Attention chain: dimensional compatibility across RMSNorm → Q proj → RoPE → Attention → O proj → Residual",
-                    "FFN chain: dimensional compatibility across RMSNorm → gate proj → SiLU×gate → down proj → Residual",
+                    "Attention chain: dimensional compatibility across RMSNorm -> Q proj -> RoPE -> Attention -> O proj -> Residual",
+                    "FFN chain: dimensional compatibility across RMSNorm -> gate proj -> SiLUxgate -> down proj -> Residual",
                 ],
                 status: "proven",
             },
@@ -352,7 +352,7 @@ pub fn manifest() -> VerificationManifest {
             },
         ],
         caveats: vec![
-            "Proofs cover memory safety (no OOB, no panics) — NOT mathematical correctness",
+            "Proofs cover memory safety (no OOB, no panics) -- NOT mathematical correctness",
             "Floating-point operations (exp, sqrt, cos, sin) are over-approximated by CBMC; f64 reference comparison tests validate numerical adequacy of f32 implementations",
             "Full-execution harnesses prove no-panic on CpuRMSNorm, CpuSampler, and CpuLayerNorm with bounded inputs",
             "GPU kernel offset arithmetic is verified via CPU-side Kani harnesses that prove the same decomposition formulas",

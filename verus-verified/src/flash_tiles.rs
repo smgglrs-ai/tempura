@@ -1,4 +1,4 @@
-//! Verus-verified flash attention tile coverage — unbounded proofs
+//! Verus-verified flash attention tile coverage -- unbounded proofs
 //!
 //! Proves tiles cover [0..kv_len) without gaps, tile_scores length matches
 //! tile size, and online softmax correction is applied correctly.

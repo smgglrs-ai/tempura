@@ -1,4 +1,4 @@
-//! Verus-verified ModelConfig well-formedness — unbounded proofs
+//! Verus-verified ModelConfig well-formedness -- unbounded proofs
 //!
 //! Proves dimensional consistency: head_dim = hidden_size / num_heads,
 //! GQA ratio is integral, and presets satisfy all invariants.

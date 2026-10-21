@@ -1,4 +1,4 @@
-/// Kernel dispatch tables — select and cache the right Q4K/Q6K variant per layer.
+/// Kernel dispatch tables -- select and cache the right Q4K/Q6K variant per layer.
 ///
 /// `GpuArch` is gone; callers pass `&GpuCapabilities` everywhere so that
 /// `GpuCapabilities::features()` is the single source of truth for GPU ISA
@@ -256,16 +256,16 @@ mod tests {
     fn test_kernel_selection_ampere() {
         let caps = GpuCapabilities::from_cc(8, 0); // A100
 
-        // Small n + small blocks_per_row (k=2048 → 8 blocks) → Coop.
+        // Small n + small blocks_per_row (k=2048 -> 8 blocks) -> Coop.
         let cfg = Q4KKernelConfig::select(&caps, 4096, 2048);
         assert_eq!(cfg.variant, QuantKernelVariant::Coop);
 
-        // blocks_per_row >= 16 (k=4096) → CoopMultiWarp even for moderate n.
+        // blocks_per_row >= 16 (k=4096) -> CoopMultiWarp even for moderate n.
         let cfg = Q4KKernelConfig::select(&caps, 4096, 4096);
         assert_eq!(cfg.variant, QuantKernelVariant::CoopMultiWarp);
         assert_eq!(cfg.n_warps_per_col, 4);
 
-        // Large n → CoopMultiWarp regardless of blocks_per_row.
+        // Large n -> CoopMultiWarp regardless of blocks_per_row.
         let cfg = Q4KKernelConfig::select(&caps, 32768, 2048);
         assert_eq!(cfg.variant, QuantKernelVariant::CoopMultiWarp);
         assert_eq!(cfg.n_warps_per_col, 4);
@@ -278,7 +278,7 @@ mod tests {
         let cfg = Q4KKernelConfig::select(&caps, 4096, 4096);
         assert_eq!(cfg.variant, QuantKernelVariant::Coop);
 
-        // Very small k → Naive
+        // Very small k -> Naive
         let cfg = Q4KKernelConfig::select(&caps, 512, 512);
         assert_eq!(cfg.variant, QuantKernelVariant::Naive);
     }

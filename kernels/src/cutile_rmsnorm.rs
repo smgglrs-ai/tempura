@@ -17,8 +17,8 @@ use cutile::tensor::{IntoPartition, Reshape, Tensor};
 ///
 /// Sized for a single token (seq_len=1 / decode path).  Pre-allocating
 /// eliminates the three `api::zeros.sync_on` calls that `forward_device_fused`
-/// issues on every invocation — 168 blocking round-trips per decode token
-/// (3 allocs × 2 norms × 28 layers) become zero after the first warm-up call.
+/// issues on every invocation -- 168 blocking round-trips per decode token
+/// (3 allocs x 2 norms x 28 layers) become zero after the first warm-up call.
 ///
 /// `sum_t` and `scale_t` are reclaimed within the same call via
 /// `Arc::try_unwrap` on the tensors returned by the scale and apply kernels.
@@ -34,7 +34,7 @@ unsafe impl Send for RmsnormScratch {}
 unsafe impl Sync for RmsnormScratch {}
 
 impl RmsnormScratch {
-    /// Pre-allocate with a single blocking `sync_on` per buffer — called once
+    /// Pre-allocate with a single blocking `sync_on` per buffer -- called once
     /// at model construction.  `seq_len` should be 1 (decode).
     pub fn new(
         stream: &Arc<Stream>,
@@ -60,10 +60,10 @@ impl RmsnormScratch {
 pub mod kernels {
     use cutile::core::*;
 
-    /// RMSNorm pass 1: compute sum(x²) per token row into a 1-element tile.
+    /// RMSNorm pass 1: compute sum(x^2) per token row into a 1-element tile.
     ///
     /// One program instance per token. H = hidden_size.
-    /// Avoids all f32 scalar arithmetic in the JIT — sum is stored as a tile
+    /// Avoids all f32 scalar arithmetic in the JIT -- sum is stored as a tile
     /// element; the CPU computes scale = 1/sqrt(mean+eps) between the two passes.
     #[cutile::entry()]
     pub fn rmsnorm_sum_sq<const H: i32>(
@@ -99,9 +99,9 @@ pub mod kernels {
     /// RMSNorm pass 2: apply GPU-computed per-token scale and weight.
     ///
     /// One program instance per token. H = hidden_size.
-    /// `scale` carries one float per token: 1/sqrt(mean(x²)+eps).
+    /// `scale` carries one float per token: 1/sqrt(mean(x^2)+eps).
     /// Broadcasting is done via tile_to_scalar + broadcast_scalar, keeping
-    /// all operations within cuTile tile ops — no f32 scalar arithmetic.
+    /// all operations within cuTile tile ops -- no f32 scalar arithmetic.
     #[cutile::entry()]
     pub fn rmsnorm_apply<const H: i32>(
         out: &mut Tensor<f32, { [H] }>,
@@ -121,7 +121,7 @@ pub mod kernels {
 
 /// GPU-accelerated RMSNorm using NVIDIA cuTile Rust (`cutile-rs`).
 ///
-/// Two-pass approach: pass 1 computes sum(x²) per token on GPU, pass 2 applies
+/// Two-pass approach: pass 1 computes sum(x^2) per token on GPU, pass 2 applies
 /// the scale (computed on CPU from the downloaded sums) and weight on GPU.
 /// All f32 scalar arithmetic (division, sqrt) runs on CPU between the two passes,
 /// avoiding the cuTile JIT's restriction on f32 scalar arithmetic in kernels.
@@ -162,9 +162,9 @@ impl CutileRmsNorm {
     /// shape is accepted; data is treated as row-major `[seq_len, h_pad]`).
     /// `weight_dev` is a pre-uploaded 1-D tensor of `h_pad` elements.
     ///
-    /// Pass 1 computes `sum(x²)` per token on device.  Only `seq_len` f32 sums
-    /// cross the PCIe bus (D→H).  The CPU computes `scale[t] = 1/sqrt(mean+eps)`
-    /// and uploads `seq_len` f32 scales (H→D).  Pass 2 applies scale and weight
+    /// Pass 1 computes `sum(x^2)` per token on device.  Only `seq_len` f32 sums
+    /// cross the PCIe bus (D->H).  The CPU computes `scale[t] = 1/sqrt(mean+eps)`
+    /// and uploads `seq_len` f32 scales (H->D).  Pass 2 applies scale and weight
     /// entirely on device.
     ///
     /// Returns a `[seq_len, h_pad]` device tensor ready for projection GEMMs.
@@ -178,7 +178,7 @@ impl CutileRmsNorm {
         h_pad: usize,
         eps: f32,
     ) -> Result<Arc<Tensor<f32>>> {
-        // Pass 1: sum(x²) per token — one scalar per token on device.
+        // Pass 1: sum(x^2) per token -- one scalar per token on device.
         let sum_t = api::zeros::<f32>(&[seq_len])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
@@ -189,14 +189,14 @@ impl CutileRmsNorm {
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-        // Download seq_len floats — negligible PCIe traffic.
+        // Download seq_len floats -- negligible PCIe traffic.
         let sum_sq_vec: Vec<f32> = sum_t
             .unpartition()
             .to_host_vec()
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-        // CPU: scale[t] = 1/sqrt(mean(x²) + eps).
+        // CPU: scale[t] = 1/sqrt(mean(x^2) + eps).
         let scale_vec: Vec<f32> = sum_sq_vec
             .iter()
             .map(|&s| 1.0f32 / (s / hidden_size as f32 + eps).sqrt())
@@ -227,14 +227,14 @@ impl CutileRmsNorm {
         Ok(out_2d)
     }
 
-    /// Fully-fused RMSNorm entirely on device — no CPU round-trip between passes.
+    /// Fully-fused RMSNorm entirely on device -- no CPU round-trip between passes.
     ///
     /// Same interface as `forward_device` but all three GPU kernels are submitted
-    /// asynchronously (pass 1 → scale → pass 2) and a single stream synchronize
+    /// asynchronously (pass 1 -> scale -> pass 2) and a single stream synchronize
     /// covers them all, eliminating the two blocking `sync_on` calls that
     /// previously forced the CPU to wait for each pass before the next began.
     ///
-    /// 112 blocking round-trips per decode token (2 RMSNorm × 28+ layers × 2 sync_on)
+    /// 112 blocking round-trips per decode token (2 RMSNorm x 28+ layers x 2 sync_on)
     /// become 3 async kernel launches + 1 synchronize.
     pub fn forward_device_fused(
         &self,
@@ -248,7 +248,7 @@ impl CutileRmsNorm {
     ) -> Result<Arc<Tensor<f32>>> {
         let inv_h = 1.0f32 / hidden_size as f32;
 
-        // Pass 1: sum(x²) per token — async.
+        // Pass 1: sum(x^2) per token -- async.
         let sum_t = api::zeros::<f32>(&[seq_len])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
@@ -263,7 +263,7 @@ impl CutileRmsNorm {
         };
         let sum_arc: Arc<Tensor<f32>> = Arc::new(sum_t.unpartition());
 
-        // Scale kernel: scale[t] = 1/sqrt(sum_sq[t]/hidden_size + eps) — async.
+        // Scale kernel: scale[t] = 1/sqrt(sum_sq[t]/hidden_size + eps) -- async.
         let scale_t = api::zeros::<f32>(&[seq_len])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
@@ -276,7 +276,7 @@ impl CutileRmsNorm {
         };
         let scale_arc: Arc<Tensor<f32>> = Arc::new(scale_t.unpartition());
 
-        // Pass 2: apply scale and weight on device — async.
+        // Pass 2: apply scale and weight on device -- async.
         let out_t = api::zeros::<f32>(&[seq_len * h_pad])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
@@ -332,7 +332,7 @@ impl CutileRmsNorm {
     ) -> Result<Arc<Tensor<f32>>> {
         let inv_h = 1.0f32 / hidden_size as f32;
 
-        // ── Reclaim or allocate sum_t ─────────────────────────────────────────
+        // -- Reclaim or allocate sum_t -----------------------------------------
         let sum_tensor = match scratch.sum_t.take() {
             Some(arc) => match Arc::try_unwrap(arc) {
                 Ok(tensor) => tensor,
@@ -349,7 +349,7 @@ impl CutileRmsNorm {
         };
         let sum_part = sum_tensor.partition([1]);
 
-        // Pass 1: sum(x²) per token — async.
+        // Pass 1: sum(x^2) per token -- async.
         // SAFETY: tensors are accessed only after stream.synchronize() below.
         let (sum_part_out, x_t) = unsafe {
             kernels::rmsnorm_sum_sq(sum_part, x_dev)
@@ -359,7 +359,7 @@ impl CutileRmsNorm {
         };
         let sum_arc: Arc<Tensor<f32>> = Arc::new(sum_part_out.unpartition());
 
-        // ── Reclaim or allocate scale_t ───────────────────────────────────────
+        // -- Reclaim or allocate scale_t ---------------------------------------
         let scale_tensor = match scratch.scale_t.take() {
             Some(arc) => match Arc::try_unwrap(arc) {
                 Ok(tensor) => tensor,
@@ -376,7 +376,7 @@ impl CutileRmsNorm {
         };
         let scale_part = scale_tensor.partition([1]);
 
-        // Scale kernel: scale[t] = 1/sqrt(sum_sq[t]/hidden_size + eps) — async.
+        // Scale kernel: scale[t] = 1/sqrt(sum_sq[t]/hidden_size + eps) -- async.
         let (scale_part_out, _sum_returned, _inv_h, _eps) = unsafe {
             kernels::cutile_rmsnorm_scale(scale_part, sum_arc, inv_h, eps)
                 .async_on(stream)
@@ -389,7 +389,7 @@ impl CutileRmsNorm {
         };
         let scale_arc: Arc<Tensor<f32>> = Arc::new(scale_part_out.unpartition());
 
-        // ── Reclaim or allocate out_t ─────────────────────────────────────────
+        // -- Reclaim or allocate out_t -----------------------------------------
         // The caller's Arc from the previous call should be dropped by now;
         // reshape from [seq_len, h_pad] back to flat [seq_len * h_pad] for partition.
         let out_tensor = match scratch.out_t.take() {
@@ -410,7 +410,7 @@ impl CutileRmsNorm {
         };
         let out_part = out_tensor.partition([h_pad]);
 
-        // Pass 2: apply scale and weight on device — async.
+        // Pass 2: apply scale and weight on device -- async.
         let (out_part_out, _x, _w, _s) = unsafe {
             kernels::rmsnorm_apply(out_part, x_t, weight_dev.clone(), scale_arc)
                 .generics(vec![h_pad.to_string()])
@@ -459,7 +459,7 @@ impl RMSNorm for CutileRmsNorm {
 
         // cuTile JIT on sm_120 requires tile/reduction dims to be power-of-2.
         // Pad hidden_size to next power-of-2; padded elements are zero so they
-        // don't affect sum(x²) or the weighted output.
+        // don't affect sum(x^2) or the weighted output.
         let h_pad = next_pow2(hidden_size);
 
         let stream = &self.stream;
@@ -493,7 +493,7 @@ impl RMSNorm for CutileRmsNorm {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .into();
 
-        // Pass 1: compute sum(x²) per token — one element per token in sum_t.
+        // Pass 1: compute sum(x^2) per token -- one element per token in sum_t.
         let sum_t = api::zeros::<f32>(&[num_tokens])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
@@ -510,7 +510,7 @@ impl RMSNorm for CutileRmsNorm {
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-        // CPU: scale[i] = 1 / sqrt(mean(x²) + eps) — no JIT constraint here.
+        // CPU: scale[i] = 1 / sqrt(mean(x^2) + eps) -- no JIT constraint here.
         let scale_vec: Vec<f32> = sum_sq_vec
             .iter()
             .map(|&s| 1.0f32 / (s / hidden_size as f32 + eps).sqrt())

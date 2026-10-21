@@ -25,9 +25,9 @@ void tempura_omp_gemv_q4k(
     }
 }
 
-// K-tiled GEMM for Q4K: loop order (j_tile ∥, kb, i, j).
-// Weight blocks for the j_tile at k_block kb (tile_n×q4k_block_bytes ≈ 9 KB) are
-// loaded from memory once and reused for all m input rows — saving (m-1) extra fetches.
+// K-tiled GEMM for Q4K: loop order (j_tile ???, kb, i, j).
+// Weight blocks for the j_tile at k_block kb (tile_nxq4k_block_bytes ~= 9 KB) are
+// loaded from memory once and reused for all m input rows -- saving (m-1) extra fetches.
 void tempura_omp_gemm_tiled_q4k(
     const uint8_t *weights,
     const uint8_t *q8k_rows,
@@ -47,7 +47,7 @@ void tempura_omp_gemm_tiled_q4k(
         for (int i = 0; i < (int)m; i++)
             memset(output + i * n + j_start, 0, (size_t)tile_n * sizeof(float));
 
-        // K-block outer loop: N_TILE_Q4K × q4k_block_bytes ≈ 9 KB stays in L1D
+        // K-block outer loop: N_TILE_Q4K x q4k_block_bytes ~= 9 KB stays in L1D
         for (size_t kb = 0; kb < bpr; kb++) {
             for (int i = 0; i < (int)m; i++) {
                 const uint8_t *q8k_blk = q8k_rows

@@ -6,17 +6,17 @@
  * The tempura-kernels build.rs extracts that PTX and writes it to OUT_DIR.
  *
  * Q2_0 packed format (9 u32 per block, 128 elements per block):
- *   u32[0]    = f32 bits of block scale (f16 → f32 at upload time)
+ *   u32[0]    = f32 bits of block scale (f16 -> f32 at upload time)
  *   u32[1..9] = 8 u32 words of 2-bit weights (16 elements per word)
  *   dequant:  q_raw = ((word >> (bit_pair*2)) & 3)
  *             weight = (q_raw as i32 - 1) as f32 * scale
- *             values: {-1, 0, 1, 2} × scale
+ *             values: {-1, 0, 1, 2} x scale
  *
  * Optimizations over the scalar baseline:
  *   1. Shared memory staging for x: all WARPS_PER_BLOCK warps in a block
  *      compute different output neurons but read the SAME activation x.
  *      Staging x once into shared memory (K global reads total per block,
- *      vs K × WARPS_PER_BLOCK without smem) reduces global memory pressure.
+ *      vs K x WARPS_PER_BLOCK without smem) reduces global memory pressure.
  *   2. Float4-vectorized global loads: x is staged via F32x4 128-bit wide
  *      loads (LDG.E.128), coalescing 4 f32 per transaction per thread.
  *      k = k_blocks * 128 is always divisible by 4, so no tail handling needed.
@@ -40,25 +40,25 @@ const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128 threads per block
 mod kernels {
     use super::*;
 
-    /// Q2_0 GEMV for M=1 decode: out[N] = dequant(packed[N, K_BLOCKS, 9]) × x[K].
+    /// Q2_0 GEMV for M=1 decode: out[N] = dequant(packed[N, K_BLOCKS, 9]) x x[K].
     ///
-    /// Grid:  (ceil(N / (2 * WARPS_PER_BLOCK)),) blocks — each warp owns TWO output neurons.
+    /// Grid:  (ceil(N / (2 * WARPS_PER_BLOCK)),) blocks -- each warp owns TWO output neurons.
     /// Block: (WARPS_PER_BLOCK * 32,) threads.
     ///
     /// Dynamic shared memory: k * sizeof(f32) bytes per block.
     /// Set shared_mem_bytes = k_blocks * 128 * 4 in LaunchConfig.
     ///
     /// Parameters:
-    ///   out    — output f32 slice [N] (DisjointSlice — aliasing-free)
-    ///   x      — activation f32 slice [K = K_BLOCKS * 128]
-    ///   packed — Q2_0 packed u32 slice [N * K_BLOCKS * 9]
-    ///   n      — number of output neurons
-    ///   k_blocks — number of Q2_0 blocks per output row (K = k_blocks * 128)
+    ///   out    -- output f32 slice [N] (DisjointSlice -- aliasing-free)
+    ///   x      -- activation f32 slice [K = K_BLOCKS * 128]
+    ///   packed -- Q2_0 packed u32 slice [N * K_BLOCKS * 9]
+    ///   n      -- number of output neurons
+    ///   k_blocks -- number of Q2_0 blocks per output row (K = k_blocks * 128)
     /// Q2_0 GEMV for M=1 decode: two-output-per-warp variant.
     ///
     /// Each 32-lane warp computes TWO adjacent output neurons simultaneously:
-    ///   lanes  0-15 → n_out_0 = warp_slot * 2
-    ///   lanes 16-31 → n_out_1 = warp_slot * 2 + 1
+    ///   lanes  0-15 -> n_out_0 = warp_slot * 2
+    ///   lanes 16-31 -> n_out_1 = warp_slot * 2 + 1
     ///
     /// Both halves share the same smem-staged x[] read (Phase 1 unchanged),
     /// then each half iterates independently over all K blocks with a 16-lane
@@ -107,7 +107,7 @@ mod kernels {
         thread::sync_threads();
 
         // Two-output-per-warp split.
-        let my_half = lane / 16;  // 0 = lower half → n_out_0, 1 = upper half → n_out_1
+        let my_half = lane / 16;  // 0 = lower half -> n_out_0, 1 = upper half -> n_out_1
         let my_lane = lane % 16;  // 0-15 within half (= bit_pair position within each word)
 
         let n_out_0 = (bid * WARPS_PER_BLOCK + warp_id) * 2;
@@ -127,7 +127,7 @@ mod kernels {
         // Phase 2: Each half-warp accumulates one output neuron.
         // Block-at-a-time loop; 16 lanes cover all 128 elements per block:
         //   my_lane selects bit_pair (0-15), word_idx iterates 0..7 for the
-        //   8 packed u32 words → 8 elements per lane per block.
+        //   8 packed u32 words -> 8 elements per lane per block.
         let mut acc = 0.0_f32;
         let mut blk = 0u32;
         while blk < k_blocks {
@@ -166,7 +166,7 @@ mod kernels {
     }
 }
 
-// ── Host-side correctness test ────────────────────────────────────────────────
+// -- Host-side correctness test ------------------------------------------------
 
 fn main() {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
@@ -181,7 +181,7 @@ fn main() {
     let x_host: Vec<f32> = vec![1.0_f32; k];
 
     // Packed weights: scale=1.0, all q=1 (q_raw=1, dequant=0).
-    // q=1 → bit pattern 0b01 → word = 0x55555555 for all 16 elements.
+    // q=1 -> bit pattern 0b01 -> word = 0x55555555 for all 16 elements.
     let packed_u32s = n * k_blocks * 9;
     let mut packed_host = vec![0u32; packed_u32s];
     for row in 0..n {
@@ -213,7 +213,7 @@ fn main() {
         shared_mem_bytes,
     };
 
-    // Test 1: q=1 → dequant=0 → all outputs should be 0.
+    // Test 1: q=1 -> dequant=0 -> all outputs should be 0.
     unsafe {
         module.q2_0_gemv_decode(
             stream.as_ref(),
@@ -230,14 +230,14 @@ fn main() {
     let result = out_dev.to_host_vec(&stream).expect("download");
     let max_err = result.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
     if max_err < 1e-4 {
-        println!("oxide-gemv test 1 (q=1→0): PASSED (max_err={:.2e})", max_err);
+        println!("oxide-gemv test 1 (q=1->0): PASSED (max_err={:.2e})", max_err);
     } else {
         eprintln!("oxide-gemv test 1 FAILED (max_err={:.4})", max_err);
         std::process::exit(1);
     }
 
-    // Test 2: q=2 → dequant = scale = 1.0; sum = k.
-    // q=2 → bit pattern 0b10 → word = 0xAAAAAAAA.
+    // Test 2: q=2 -> dequant = scale = 1.0; sum = k.
+    // q=2 -> bit pattern 0b10 -> word = 0xAAAAAAAA.
     for row in 0..n {
         for blk in 0..k_blocks {
             let base = (row * k_blocks + blk) * 9;
@@ -270,7 +270,7 @@ fn main() {
     let max_err2 = result2.iter().map(|v| (v - expected).abs()).fold(0.0_f32, f32::max);
     if max_err2 < 1e-2 {
         println!(
-            "oxide-gemv test 2 (q=2→1.0): PASSED (expected={}, max_err={:.2e})",
+            "oxide-gemv test 2 (q=2->1.0): PASSED (expected={}, max_err={:.2e})",
             expected, max_err2
         );
     } else {

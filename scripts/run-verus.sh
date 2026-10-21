@@ -52,7 +52,7 @@ if [ -n "$MISSING" ]; then
     echo ""
     echo "  (3 covered by proptest: head_dim_scale_never_zero_division,"
     echo "   int8_dequant_bounded_error, q4k_dequant_value_bounded)"
-    echo "  (1 Kani-only: cpu_allreduce_is_identity — runtime Vec execution)"
+    echo "  (1 Kani-only: cpu_allreduce_is_identity -- runtime Vec execution)"
 fi
 
 # ---- Struct field drift detection ----
@@ -79,12 +79,12 @@ check_struct_fields() {
     local extra=$(comm -13 <(echo "$src_fields") <(echo "$verus_fields"))
 
     if [ -n "$missing" ]; then
-        echo "  DRIFT: $struct_name — fields in source but not in Verus:"
+        echo "  DRIFT: $struct_name -- fields in source but not in Verus:"
         echo "$missing" | sed 's/^/    /'
         DRIFT_ERRORS=$((DRIFT_ERRORS + 1))
     fi
     if [ -n "$extra" ]; then
-        echo "  DRIFT: $struct_name — fields in Verus but not in source:"
+        echo "  DRIFT: $struct_name -- fields in Verus but not in source:"
         echo "$extra" | sed 's/^/    /'
         DRIFT_ERRORS=$((DRIFT_ERRORS + 1))
     fi
@@ -107,7 +107,7 @@ check_trait_methods() {
     # Check trait methods exist as Verus proof or spec functions
     for method in $src_methods; do
         if ! grep -q "$method" "$verus_file" 2>/dev/null; then
-            echo "  INFO: trait ${trait_name}::${method}() — no Verus counterpart (may not need one)"
+            echo "  INFO: trait ${trait_name}::${method}() -- no Verus counterpart (may not need one)"
         fi
     done
 }

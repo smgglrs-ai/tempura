@@ -39,7 +39,7 @@ static void gen_activations(float *buf, int n, int seed) {
 int main() {
     printf("Generating ggml test vectors...\n");
 
-    // ── Q4_0 ───────────────────────────────────────────────────────────
+    // -- Q4_0 -----------------------------------------------------------
     {
         const int k = 256;
         float src[256];
@@ -60,7 +60,7 @@ int main() {
         float deq_q8[256];
         dequantize_row_q8_0(q8_data, deq_q8, k);
 
-        // f32 reference dot: dequant(q4) · dequant(q8)
+        // f32 reference dot: dequant(q4) * dequant(q8)
         float ref_dot = 0.0f;
         for (int i = 0; i < k; i++) ref_dot += deq[i] * deq_q8[i];
 
@@ -74,7 +74,7 @@ int main() {
         free(q4_data); free(q8_data);
     }
 
-    // ── Q4_K ───────────────────────────────────────────────────────────
+    // -- Q4_K -----------------------------------------------------------
     {
         const int k = 256;
         float src[256];
@@ -100,7 +100,7 @@ int main() {
         free(q4k_data); free(q8k_data);
     }
 
-    // ── Q6_K ───────────────────────────────────────────────────────────
+    // -- Q6_K -----------------------------------------------------------
     {
         const int k = 256;
         float src[256];
@@ -126,7 +126,7 @@ int main() {
         free(q6k_data); free(q8k_data);
     }
 
-    // ── IQ4_NL ─────────────────────────────────────────────────────────
+    // -- IQ4_NL ---------------------------------------------------------
     // Non-linear 4-bit lookup table quantization, 32 elements per block.
     // Block layout: { ggml_half d; uint8_t qs[16]; } = 18 bytes.
     {
@@ -150,7 +150,7 @@ int main() {
         free(iq4nl_data);
     }
 
-    // ── IQ4_XS ─────────────────────────────────────────────────────────
+    // -- IQ4_XS ---------------------------------------------------------
     // Cross-scale 4-bit quantization, 256 elements per block.
     // Block layout: { ggml_half d; uint16_t scales_h; uint8_t scales_l[4]; uint8_t qs[128]; }
     // = 2 + 2 + 4 + 128 = 136 bytes.
@@ -175,13 +175,13 @@ int main() {
         free(iq4xs_data);
     }
 
-    // ── RoPE reference values ───────────────────────────────────────────
+    // -- RoPE reference values -------------------------------------------
     // Standard NeoX-style RoPE: freq = pos / base^(2i/d), rotates pairs (x[i], x[i+d/2]).
     // These cos/sin values are the ground truth the Rust kernel must match.
     {
         const int n_pos = 8, head_dim = 64;
         const float base = 10000.0f;
-        // cos and sin for each (pos, dim_pair) — head_dim values per position
+        // cos and sin for each (pos, dim_pair) -- head_dim values per position
         float rope_cos[8 * 64], rope_sin[8 * 64];
         const int half_dim = head_dim / 2;
         for (int pos = 0; pos < n_pos; pos++) {

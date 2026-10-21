@@ -1,4 +1,4 @@
-//! Verus-verified weight dequantization indexing — unbounded proofs
+//! Verus-verified weight dequantization indexing -- unbounded proofs
 //!
 //! Proves group-based dequantization indexing for i8 and i4 packed formats.
 
@@ -7,7 +7,7 @@ use vstd::prelude::*;
 verus! {
 
 // ============================================================================
-// Proof: i8 group-based dequant — group boundaries stay within data
+// Proof: i8 group-based dequant -- group boundaries stay within data
 // ============================================================================
 
 proof fn dequant_i8_group_indices_in_bounds(
@@ -43,7 +43,7 @@ proof fn dequant_i8_group_indices_in_bounds(
 }
 
 // ============================================================================
-// Proof: i4 packed dequant — packed_idx = i/2 stays within packed_len = (n+1)/2
+// Proof: i4 packed dequant -- packed_idx = i/2 stays within packed_len = (n+1)/2
 // ============================================================================
 
 proof fn dequant_i4_packed_index_in_bounds(

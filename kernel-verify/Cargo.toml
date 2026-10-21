@@ -3,7 +3,7 @@ name = "tempura-kernel-verify"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Verification toolkit for tempura kernel implementations — DualPipeline comparison, test generators, report types"
+description = "Verification toolkit for tempura kernel implementations -- DualPipeline comparison, test generators, report types"
 
 [dependencies]
 tempura-kernel-api = { path = "../kernel-api" }

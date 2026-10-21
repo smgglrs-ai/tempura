@@ -1,4 +1,4 @@
-//! Verus-verified f16 KV cache properties — unbounded proofs
+//! Verus-verified f16 KV cache properties -- unbounded proofs
 
 use vstd::prelude::*;
 

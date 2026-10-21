@@ -286,7 +286,7 @@ pub fn ggml_vec_dot_tq1_0_q8_k_generic(n: usize, x: &[BlockTQ1_0], y: &[BlockQ8K
     for i in 0..nb {
         let mut sum = 0i32;
 
-        // First loop: j in 0..(48 - 48%32) = 0..32, step 32 → j=0
+        // First loop: j in 0..(48 - 48%32) = 0..32, step 32 -> j=0
         let qs_len = 48usize; // x[i].qs: [u8; 48]
         let first_limit = qs_len - qs_len % 32;
         let mut j = 0;
@@ -1055,7 +1055,7 @@ pub fn ggml_vec_dot_iq1_m_q8_k_generic(n: usize, x: &[BlockIQ1M], y: &[BlockQ8K]
         let qs = &x[i].qs; // [u8; 32]
         let qh = &x[i].qh; // [u8; 16]
 
-        // const uint16_t * sc = (const uint16_t *)x[i].scales;  ([u8; 8] → [u16; 4])
+        // const uint16_t * sc = (const uint16_t *)x[i].scales;  ([u8; 8] -> [u16; 4])
         let sc_bytes = &x[i].scales; // [u8; 8]
         let sc = [
             u16::from_le_bytes([sc_bytes[0], sc_bytes[1]]),
@@ -1201,7 +1201,7 @@ mod tests {
         let d_f = 0.01f32;
         let dmin_f = 0.0f32;
 
-        // Pack nibbles: low = i % 16, high = (i/16) % 16 — for i in 0..128 bytes
+        // Pack nibbles: low = i % 16, high = (i/16) % 16 -- for i in 0..128 bytes
         let mut qs = [0u8; 128];
         for j in 0..128usize {
             let lo = (j & 0xf) as u8;
@@ -1260,7 +1260,7 @@ mod tests {
             scales: [
                 // Manually encode: scales[0..8]=[16;8], mins[0..8]=[8;8]
                 // Using the 6-bit encoding format from ggml-common.h:
-                // j<4: byte = (sc & 0xf) | ((mn & 0xf) << 4)  — this is a simplification
+                // j<4: byte = (sc & 0xf) | ((mn & 0xf) << 4)  -- this is a simplification
                 // We'll just use bytes that produce stable results in both paths.
                 0x11, 0x22, 0x33, 0x44,  // lower nibbles are scales[0..4]
                 0x55, 0x66, 0x77, 0x88,  // upper nibbles encode mins
@@ -1377,11 +1377,11 @@ mod tests {
 
     #[test]
     fn tq2_0_generic_zero_weights_zero_dot() {
-        // All TQ2_0 weights = 1 (ternary midpoint: bit-pair 01 → (1-1)=0).
+        // All TQ2_0 weights = 1 (ternary midpoint: bit-pair 01 -> (1-1)=0).
         // Encoding: all bytes = 0b01010101 = 0x55.
         let n = QK_K;
         let x = [BlockTQ2_0 {
-            qs: [0x55u8; 64], // each byte: four 2-bit values, all = 1 → trit = 0
+            qs: [0x55u8; 64], // each byte: four 2-bit values, all = 1 -> trit = 0
             d: f32_to_f16(1.0),
         }];
         let acts: Vec<f32> = (0..QK_K).map(|i| i as f32).collect();
@@ -1395,14 +1395,14 @@ mod tests {
 
     #[test]
     fn tq2_0_generic_all_positive() {
-        // All TQ2_0 weights = 2 (bit-pair 10 → (2-1)=+1), all Q8K qs = -127.
+        // All TQ2_0 weights = 2 (bit-pair 10 -> (2-1)=+1), all Q8K qs = -127.
         // quantize_row_q8_k([1.0; 256]) gives qs[j]=-127, d_y=-1/127.
         // isum = 256 * (1 * -127) = -32512
         // result = d_x * d_y * isum = 0.5 * (-1/127) * (-32512) = 128.0
         let n = QK_K;
         let d_x = 0.5f32;
         let x = [BlockTQ2_0 {
-            qs: [0b10101010u8; 64], // each bit-pair = 2 → trit = +1
+            qs: [0b10101010u8; 64], // each bit-pair = 2 -> trit = +1
             d: f32_to_f16(d_x),
         }];
         let acts = vec![1.0f32; QK_K];

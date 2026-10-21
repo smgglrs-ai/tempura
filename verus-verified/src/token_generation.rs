@@ -1,4 +1,4 @@
-//! Verus-verified token generation loop invariants — unbounded proofs
+//! Verus-verified token generation loop invariants -- unbounded proofs
 //!
 //! Proves: generated count <= max_new_tokens, position advances by 1
 //! per token, EOS terminates early, loop makes progress.
@@ -20,7 +20,7 @@ pub open spec fn gen_invariant(s: &GenerationState) -> bool {
 }
 
 // ============================================================================
-// Proof: initial state — 0 tokens generated
+// Proof: initial state -- 0 tokens generated
 // ============================================================================
 
 proof fn gen_initial(max_new_tokens: nat, position: nat, max_seq_len: nat)
@@ -56,7 +56,7 @@ proof fn gen_one_token(s: GenerationState)
 }
 
 // ============================================================================
-// Proof: EOS terminates — final count <= max_new_tokens
+// Proof: EOS terminates -- final count <= max_new_tokens
 // ============================================================================
 
 proof fn eos_terminates(s: &GenerationState)
@@ -66,7 +66,7 @@ proof fn eos_terminates(s: &GenerationState)
 }
 
 // ============================================================================
-// Proof: loop terminates — generated_count strictly increases
+// Proof: loop terminates -- generated_count strictly increases
 // ============================================================================
 
 proof fn gen_loop_progress(

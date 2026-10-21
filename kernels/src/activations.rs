@@ -137,21 +137,21 @@ mod tests {
     #[test]
     fn test_gelu_known_values() {
         assert!((gelu(0.0) - 0.0).abs() < 1e-6);
-        // gelu(1.0) ≈ 0.8412
+        // gelu(1.0) ~= 0.8412
         assert!(
             (gelu(1.0) - 0.8412).abs() < 1e-3,
             "gelu(1.0) = {}",
             gelu(1.0)
         );
-        // gelu(-1.0) ≈ -0.1588
+        // gelu(-1.0) ~= -0.1588
         assert!(
             (gelu(-1.0) - (-0.1588)).abs() < 1e-3,
             "gelu(-1.0) = {}",
             gelu(-1.0)
         );
-        // large positive → ~x
+        // large positive -> ~x
         assert!((gelu(10.0) - 10.0).abs() < 1e-3);
-        // large negative → ~0
+        // large negative -> ~0
         assert!(gelu(-10.0).abs() < 1e-3);
     }
 
@@ -233,9 +233,9 @@ mod tests {
     #[test]
     fn test_gelu_edge_cases() {
         assert!(gelu(f32::NAN).is_nan());
-        // Very large positive: gelu(x) ≈ x
+        // Very large positive: gelu(x) ~= x
         assert!((gelu(50.0) - 50.0).abs() < 1e-3);
-        // Very large negative: gelu(x) ≈ 0
+        // Very large negative: gelu(x) ~= 0
         assert!(gelu(-50.0).abs() < 1e-3);
     }
 

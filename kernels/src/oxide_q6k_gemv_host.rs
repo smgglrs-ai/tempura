@@ -13,20 +13,20 @@
 /// ```
 ///
 /// Each 32-thread warp computes ONE output neuron via stride-32 strided
-/// accumulation followed by a butterfly warp-reduce (5× `shfl.sync.bfly`).
+/// accumulation followed by a butterfly warp-reduce (5x `shfl.sync.bfly`).
 /// Lane 0 of each warp writes the final sum to `out[n_out]`.
 ///
 /// ## PTX parameter layout
 ///
 /// ```text
-/// param_0: .u64 .ptr  — out pointer (DisjointSlice data ptr)
-/// param_1: .u64       — out len (u64)
-/// param_2: .u64 .ptr  — x pointer
-/// param_3: .u64       — x len (u64)
-/// param_4: .u64 .ptr  — packed pointer
-/// param_5: .u64       — packed len (u64)
-/// param_6: .u32       — n (u32)
-/// param_7: .u32       — k_blocks (u32)
+/// param_0: .u64 .ptr  -- out pointer (DisjointSlice data ptr)
+/// param_1: .u64       -- out len (u64)
+/// param_2: .u64 .ptr  -- x pointer
+/// param_3: .u64       -- x len (u64)
+/// param_4: .u64 .ptr  -- packed pointer
+/// param_5: .u64       -- packed len (u64)
+/// param_6: .u32       -- n (u32)
+/// param_7: .u32       -- k_blocks (u32)
 /// ```
 
 use crate::{KernelError, Result};
@@ -58,7 +58,7 @@ pub struct OxideQ6kGemv {
     cu_sm120_module:        Option<CUmodule>,
     /// q6k_gemv_sm120_mbar_kpar8: cp.async double-buffer variant (sm_120+).
     cu_function_sm120_mbar: Option<CUfunction>,
-    /// Pre-allocated kpar output scratch — avoids allocation during CUDA graph capture.
+    /// Pre-allocated kpar output scratch -- avoids allocation during CUDA graph capture.
     /// Set via `pre_allocate_kpar_output_scratch(max_n)` before first graph capture.
     kpar_out_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
     stream:                 Arc<Stream>,
@@ -88,7 +88,7 @@ impl OxideQ6kGemv {
         let _ = stream.device().bind_to_thread().ok()?;
         const CUDA_SUCCESS: u32 = 0;
 
-        // ── Try oxide-compiled PTX (feature-gated) ─────────────────────────────
+        // -- Try oxide-compiled PTX (feature-gated) -----------------------------
         #[cfg(not(feature = "oxide-gemv"))]
         let (cu_module, cu_function, cu_function_kpar) =
             (std::ptr::null_mut(), std::ptr::null_mut(), None);
@@ -180,7 +180,7 @@ impl OxideQ6kGemv {
             }
         };
 
-        // ── Try sm_120 cp.async mbar PTX (not feature-gated, any sm_120 GPU) ──────
+        // -- Try sm_120 cp.async mbar PTX (not feature-gated, any sm_120 GPU) ------
             // Requires Blackwell GPU (cc >= 1200). Falls back to cu_function_kpar on older GPUs.
             let sm120_disabled = std::env::var("TEMPURA_NO_SM120_Q6K")
                 .map(|v| v == "1")
@@ -306,7 +306,7 @@ impl OxideQ6kGemv {
     ///
     /// Uses the pre-allocated scratch tensor when it matches `n` (safe during CUDA
     /// graph capture). Falls back to `api::zeros` allocation otherwise (not
-    /// capture-safe — call `pre_allocate_kpar_output_scratch(n)` before capture).
+    /// capture-safe -- call `pre_allocate_kpar_output_scratch(n)` before capture).
     pub fn forward_kpar_d2d(
         &self,
         x: &Arc<Tensor<f32>>,
@@ -320,7 +320,7 @@ impl OxideQ6kGemv {
         // Use pre-allocated scratch to avoid allocation during CUDA graph capture.
         // If scratch is large enough, use it (write to its GPU buffer); the caller
         // gets a clone of the same Arc, pointing to the same GPU memory.
-        // This is safe for CUDA graph replay — the captured write address is constant.
+        // This is safe for CUDA graph replay -- the captured write address is constant.
         let use_scratch = self.kpar_out_scratch.borrow()
             .as_ref()
             .map(|t| t.size() >= n)

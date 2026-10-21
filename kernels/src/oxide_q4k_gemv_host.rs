@@ -13,20 +13,20 @@
 /// ```
 ///
 /// Each 32-thread warp computes ONE output neuron via stride-32 strided
-/// accumulation followed by a butterfly warp-reduce (5× `shfl.sync.bfly`).
+/// accumulation followed by a butterfly warp-reduce (5x `shfl.sync.bfly`).
 /// Lane 0 of each warp writes the final sum to `out[n_out]`.
 ///
 /// ## PTX parameter layout
 ///
 /// ```text
-/// param_0: .u64 .ptr  — out pointer (DisjointSlice data ptr)
-/// param_1: .u64       — out len (u64)
-/// param_2: .u64 .ptr  — x pointer
-/// param_3: .u64       — x len (u64)
-/// param_4: .u64 .ptr  — packed pointer
-/// param_5: .u64       — packed len (u64)
-/// param_6: .u32       — n (u32)
-/// param_7: .u32       — k_blocks (u32)
+/// param_0: .u64 .ptr  -- out pointer (DisjointSlice data ptr)
+/// param_1: .u64       -- out len (u64)
+/// param_2: .u64 .ptr  -- x pointer
+/// param_3: .u64       -- x len (u64)
+/// param_4: .u64 .ptr  -- packed pointer
+/// param_5: .u64       -- packed len (u64)
+/// param_6: .u32       -- n (u32)
+/// param_7: .u32       -- k_blocks (u32)
 /// ```
 
 use crate::{KernelError, Result};
@@ -74,7 +74,7 @@ pub struct OxideQ4kGemv {
     cu_q8_dp4a:     Option<CUfunction>,
     /// Optional Q4K+Q8_1 GEMV dp4a_raw kernel (dp4a + raw GGUF 36-u32 format, 14% less DRAM).
     cu_q8_dp4a_raw:    Option<CUfunction>,
-    /// Optional Q4K+Q8_1 GEMV dp4a_kpar8 kernel (8 warps/block → 100% SM occupancy for large N).
+    /// Optional Q4K+Q8_1 GEMV dp4a_kpar8 kernel (8 warps/block -> 100% SM occupancy for large N).
     cu_q8_dp4a_kpar8: Option<CUfunction>,
     /// Optional batched Q4K GEMV: grid=(N,M,1), L2-shared weight blocks.
     cu_batch_gemv:     Option<CUfunction>,
@@ -198,7 +198,7 @@ impl OxideQ4kGemv {
                 func.assume_init()
             };
 
-            // Opportunistically load the Q8_1 kernels — they are absent until the
+            // Opportunistically load the Q8_1 kernels -- they are absent until the
             // user rebuilds with `cargo oxide build` after adding the new kernels.
             let load_fn = |name: &str| -> Option<CUfunction> {
                 let entry = CString::new(name).ok()?;
@@ -219,7 +219,7 @@ impl OxideQ4kGemv {
             let cu_smem        = load_fn(KERNEL_SMEM);
             let cu_fused_silu  = load_fn(KERNEL_FUSED_SILU);
 
-            // ── Try to load sm_120 v4 PTX (Blackwell-native, native GGUF format) ───
+            // -- Try to load sm_120 v4 PTX (Blackwell-native, native GGUF format) ---
             // Query device compute capability. Only attempt the sm_120 PTX when the
             // device is Blackwell (cc >= 1200); other GPUs get the sm_80 oxide fallback.
             let caps = GpuCapabilities::query(stream.device().cu_device());
@@ -243,7 +243,7 @@ impl OxideQ4kGemv {
                     };
                     if rc2 == CUDA_SUCCESS {
                         eprintln!(
-                            "oxide-gemv-q4k: loaded sm_120 v4 PTX ({} bytes) — native GGUF format, direct Blackwell codegen",
+                            "oxide-gemv-q4k: loaded sm_120 v4 PTX ({} bytes) -- native GGUF format, direct Blackwell codegen",
                             q4k_gemv_v4_ptx::PTX.len(),
                         );
                         (Some(v4_mod), Some(unsafe { v4_fn.assume_init() }))
@@ -264,7 +264,7 @@ impl OxideQ4kGemv {
                 (None, None)
             };
 
-            // ── Load sm_120 fused gate+up+SiLU PTX (separate module from kpar) ─
+            // -- Load sm_120 fused gate+up+SiLU PTX (separate module from kpar) -
             // Reuses the same CUDA module as the sm_120 kpar if already loaded,
             // or loads a second module. Currently: separate module, same cc guard.
             let mut cu_sm120_fused_mod: Option<CUmodule> = None;
@@ -306,7 +306,7 @@ impl OxideQ4kGemv {
                 None
             };
 
-            // ── Load sm_120 batch GEMV PTX (static smem, no JIT crash on Blackwell) ─
+            // -- Load sm_120 batch GEMV PTX (static smem, no JIT crash on Blackwell) -
             // The oxide sm_80 batch kernels (q4k_gemv_dp4a_base_batch, q4k_gemm_colocated)
             // crash with CUDA error 719 on Blackwell due to dynamic smem JIT incompatibility.
             // This hand-written sm_120 PTX uses static smem and works correctly on RTX 5090.
@@ -349,7 +349,7 @@ impl OxideQ4kGemv {
                 None
             };
 
-            // ── Build KernelVariant table and select best kpar dispatch ─────────
+            // -- Build KernelVariant table and select best kpar dispatch ---------
             let mut kpar_variants: Vec<KernelVariant> = Vec::new();
             if let Some(f) = cu_q8_dp4a_kpar8 {
                 kpar_variants.push(KernelVariant { cu_fn: f, min_cc: 800, name: "q4k_gemv_dp4a_kpar8" });
@@ -360,9 +360,9 @@ impl OxideQ4kGemv {
             let kpar_dispatch = KernelVariant::select_best(&kpar_variants, &caps).cloned();
             // v4 uses native 36-u32 GGUF format in the v4 kernel itself, but the production
             // engine uses `dispatch_kv_on_stream` for K/V projections which calls the BASIC f32
-            // GEMV kernel — that reads repacked 42-u32 format. If we set uses_raw_gguf=true,
+            // GEMV kernel -- that reads repacked 42-u32 format. If we set uses_raw_gguf=true,
             // K/V weights would be in native format but the basic f32 GEMV reads them as
-            // repacked → wrong values → NaN → error 719 in graph replay.
+            // repacked -> wrong values -> NaN -> error 719 in graph replay.
             //
             // TEMPORARY WORKAROUND: Keep uses_raw_gguf=false (repacked format) until the engine
             // properly handles native format for all dispatch paths (including dispatch_kv_on_stream).
@@ -389,7 +389,7 @@ impl OxideQ4kGemv {
                 cu_batch_gemv.is_some(),
                 cu_sm120_batch.is_some(),
             );
-            // dp4a_raw: raw GGUF format for the oxide sm_80 path — benchmarked and DISABLED.
+            // dp4a_raw: raw GGUF format for the oxide sm_80 path -- benchmarked and DISABLED.
             // uses_raw_gguf=true when sm120 is selected: sm120 reads native 36-u32 GGUF format.
             // dispatch_kv_on_stream uses submit_sm120_kpar_kv_into_slot (with per-KV-stream
             // Q8_1 scratch) when uses_raw_gguf=true, so K/V weights can also be native.
@@ -434,9 +434,9 @@ impl OxideQ4kGemv {
         self.cu_batch_gemv.is_some()
     }
 
-    /// Batched Q4_K GEMV: `out[m, n] = dequant(packed[n,k]) × x[m,k]`.
+    /// Batched Q4_K GEMV: `out[m, n] = dequant(packed[n,k]) x x[m,k]`.
     ///
-    /// Grid = (N, M, 1) — each block handles one (n_out, row) pair.
+    /// Grid = (N, M, 1) -- each block handles one (n_out, row) pair.
     /// L2-cache reuse: M blocks for the same n_out share the weight data.
     pub fn forward_batch_d2d(
         &self,
@@ -574,7 +574,7 @@ impl OxideQ4kGemv {
     pub fn has_smem_gemm(&self) -> bool { self.cu_smem.is_some() }
 
     /// Smem-tiled GEMM: row-0 warps load 42 u32s of weight data into smem, all M rows
-    /// then compute FMAs from smem — eliminating (M-1)/M of weight DRAM traffic.
+    /// then compute FMAs from smem -- eliminating (M-1)/M of weight DRAM traffic.
     pub fn forward_smem_d2d(
         &self,
         x: &Arc<Tensor<f32>>,        // [m, k] activations
@@ -698,7 +698,7 @@ impl OxideQ4kGemv {
             )),
         };
 
-        // ── quantize_q8_1 on cu_kv_stream ──────────────────────────────────────
+        // -- quantize_q8_1 on cu_kv_stream --------------------------------------
         {
             let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
             let qs_len: u64 = (k / 4) as u64;
@@ -721,7 +721,7 @@ impl OxideQ4kGemv {
                 .map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 (kv stream v4): {e}")))?;
         }
 
-        // ── sm120_dp4a_kpar8 on cu_kv_stream, writing into `out` ──────────────────────
+        // -- sm120_dp4a_kpar8 on cu_kv_stream, writing into `out` ----------------------
         {
             let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
             let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
@@ -863,7 +863,7 @@ impl OxideQ4kGemv {
 
     /// Pre-allocate Q8_1 scratch buffers outside of CUDA graph capture.
     ///
-    /// Must be called before the first `cuStreamBeginCapture` — allocations on
+    /// Must be called before the first `cuStreamBeginCapture` -- allocations on
     /// a capturing stream are not permitted (CUDA error 900).  The buffers are
     /// sized for the largest K and N seen across all Q4K projections in the model.
     pub fn pre_allocate_q8_scratch(&self, max_k: usize, max_n: usize) -> Result<()> {
@@ -1049,6 +1049,102 @@ impl OxideQ4kGemv {
         Ok(out)
     }
 
+    /// Graph-capture-safe variant of `forward_sm120_batch_d2d`.
+    ///
+    /// Accepts pre-allocated Q8_1 scratch tensors and a pre-allocated output
+    /// tensor -- no device allocations or stream synchronisations are performed
+    /// inside this method, so it can be called within a `cuStreamBeginCapture`
+    /// region.
+    ///
+    /// `x`      -- flat `[m * k]` f32 activations (row-major, k = k_blocks * 256).
+    /// `packed` -- `[n * k_blocks * 36]` native GGUF Q4K weights.
+    /// `x_qs`   -- pre-allocated `[m * k / 4]` u32 Q8_1 quantise scratch.
+    /// `x_ds`   -- pre-allocated `[ceil(m*k/32)]` u32 Q8_1 scale scratch.
+    /// `out`    -- pre-allocated `[m * n]` f32 output tensor (written in-place).
+    pub fn forward_sm120_batch_d2d_into(
+        &self,
+        x:       &Arc<Tensor<f32>>,
+        packed:  &Arc<Tensor<u32>>,
+        m:       usize,
+        n:       usize,
+        k_blocks: usize,
+        x_qs:    &Arc<Tensor<u32>>,
+        x_ds:    &Arc<Tensor<u32>>,
+        out:     &Arc<Tensor<f32>>,
+    ) -> Result<()> {
+        let batch_fn = match self.cu_sm120_batch {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("sm120_batch not loaded".into())),
+        };
+        let q8_quant_fn = match self.cu_q8_quantize {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
+        };
+
+        let k = k_blocks * 256;
+        let k_total = m * k;
+        let k_q8_blocks_total = k_total.div_ceil(32);
+
+        let cu_stream = self.stream.cu_stream();
+
+        // Quantize M*K activations in one call (async -- no stream sync).
+        {
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len: u64 = (k_total / 4) as u64;
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len: u64 = k_q8_blocks_total as u64;
+            let x_ptr:  u64 = x.device_pointer().cu_deviceptr();
+            let x_len:  u64 = x.size() as u64;
+            let k_u32:  u32 = k_total as u32;
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr as *const _ as *mut c_void,
+                &qs_len as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ds_len as *const _ as *mut c_void,
+                &x_ptr  as *const _ as *mut c_void,
+                &x_len  as *const _ as *mut c_void,
+                &k_u32  as *const _ as *mut c_void,
+            ];
+            let grid_x = k_q8_blocks_total.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            unsafe {
+                launch_kernel(q8_quant_fn, (grid_x, 1, 1), (BLOCK_DIM, 1, 1), 0, cu_stream, &mut params)
+            }.map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 batch _into: {e}")))?;
+        }
+
+        // Launch sm120 batch kernel: grid=(n, m, 1), block=(256, 1, 1), smem=128 bytes.
+        {
+            let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ou_ptr: u64 = out.device_pointer().cu_deviceptr();
+            let n_u32:  u32 = n as u32;
+            let kb_u32: u32 = k_blocks as u32;
+            let m_u32:  u32 = m as u32;
+            let mut params: [*mut c_void; 7] = [
+                &wt_ptr as *const _ as *mut c_void,
+                &qs_ptr as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ou_ptr as *const _ as *mut c_void,
+                &n_u32  as *const _ as *mut c_void,
+                &kb_u32 as *const _ as *mut c_void,
+                &m_u32  as *const _ as *mut c_void,
+            ];
+            unsafe {
+                launch_kernel(
+                    batch_fn,
+                    (n_u32, m_u32, 1),
+                    (BLOCK_DIM_KPAR, 1, 1),
+                    128,
+                    cu_stream,
+                    &mut params,
+                )
+            }.map_err(|e| KernelError::InvalidConfig(format!("sm120_batch q4k gemv _into: {e}")))?;
+        }
+
+        // No stream.synchronize() -- caller owns the sync (graph launch or explicit sync).
+        Ok(())
+    }
+
     /// Returns true when ANY kpar dispatch kernel is available (sm120 or dp4a_kpar8 fallback).
     pub fn has_any_kpar(&self) -> bool {
         self.cu_q8_quantize.is_some() && self.kpar_dispatch.is_some()
@@ -1113,7 +1209,7 @@ impl OxideQ4kGemv {
 
         let cu_stream = self.stream.cu_stream();
 
-        // ── Launch quantize_q8_1 ────────────────────────────────────────────
+        // -- Launch quantize_q8_1 --------------------------------------------
         {
             let qs_ptr:  u64 = x_qs.device_pointer().cu_deviceptr();
             let qs_len:  u64 = (k / 4) as u64;
@@ -1146,7 +1242,7 @@ impl OxideQ4kGemv {
             .map_err(|e| KernelError::InvalidConfig(format!("oxide quantize_q8_1 (kpar): {e}")))?;
         }
 
-        // ── Launch q4k_gemv_dp4a_kpar8 (PTX: q4k_gemv_decode_q8_v3_kpar) ───────────────────────────────
+        // -- Launch q4k_gemv_dp4a_kpar8 (PTX: q4k_gemv_decode_q8_v3_kpar) -------------------------------
         {
             let out_ptr:  u64 = out.device_pointer().cu_deviceptr();
             let out_len:  u64 = n as u64;
@@ -1171,7 +1267,7 @@ impl OxideQ4kGemv {
                 &n_u32   as *const _ as *mut c_void,
                 &kb_u32  as *const _ as *mut c_void,
             ];
-            // smem: 32 f32 slots = 128 bytes (8 warps × 4 mw slots; Blackwell predicated-smem safe).
+            // smem: 32 f32 slots = 128 bytes (8 warps x 4 mw slots; Blackwell predicated-smem safe).
             let smem_bytes: u32 = 32 * 4;
             unsafe {
                 launch_kernel(
@@ -1244,7 +1340,7 @@ impl OxideQ4kGemv {
         let out  = out_arc.as_ref();
         let cu_stream = self.stream.cu_stream();
 
-        // ── quantize_q8_1 ───────────────────────────────────────────────────
+        // -- quantize_q8_1 ---------------------------------------------------
         {
             let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
             let qs_len: u64 = (k / 4) as u64;
@@ -1268,7 +1364,7 @@ impl OxideQ4kGemv {
             }.map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 (best_kpar): {e}")))?;
         }
 
-        // ── Dispatch: sm120_dp4a_kpar8 (6 raw-ptr params) or dp4a_kpar8 (10 slice params) ────
+        // -- Dispatch: sm120_dp4a_kpar8 (6 raw-ptr params) or dp4a_kpar8 (10 slice params) ----
         if kv.min_cc >= 1200 {
             // sm120_dp4a_kpar8: weights, act_qs, act_ds, out, n_rows, k_blocks  (6 raw-ptr params)
             let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
@@ -1323,7 +1419,7 @@ impl OxideQ4kGemv {
         Ok(out_arc)
     }
 
-    /// Quantize `x` (f32 K-vector) → Q8_1 packed int8 + scales, then run Q4K GEMV.
+    /// Quantize `x` (f32 K-vector) -> Q8_1 packed int8 + scales, then run Q4K GEMV.
     ///
     /// Allocates temporary Q8_1 buffers, chains two kernel launches on the stream,
     /// syncs, and returns the output tensor.
@@ -1366,7 +1462,7 @@ impl OxideQ4kGemv {
         let k = k_blocks * 256;  // total activation elements
         let k_q8_blocks = k.div_ceil(32);  // number of Q8_1 blocks
 
-        // Use pre-allocated scratch when available (required during CUDA graph capture —
+        // Use pre-allocated scratch when available (required during CUDA graph capture --
         // allocating on a capturing stream causes CUDA error 900).  Fall back to fresh
         // allocation only when pre_allocate_q8_scratch has not been called yet.
         let use_scratch = self.q8_qs_scratch.borrow().as_ref()
@@ -1398,7 +1494,7 @@ impl OxideQ4kGemv {
 
         let cu_stream = self.stream.cu_stream();
 
-        // ── Launch quantize_q8_1 ────────────────────────────────────────────
+        // -- Launch quantize_q8_1 --------------------------------------------
         {
             let qs_ptr:  u64 = x_qs.device_pointer().cu_deviceptr();
             let qs_len:  u64 = (k / 4) as u64;
@@ -1432,7 +1528,7 @@ impl OxideQ4kGemv {
             .map_err(|e| KernelError::InvalidConfig(format!("oxide quantize_q8_1: {e}")))?;
         }
 
-        // ── Launch q4k_gemv_decode_q8 ───────────────────────────────────────
+        // -- Launch q4k_gemv_decode_q8 ---------------------------------------
         {
             let out_ptr:  u64 = out.device_pointer().cu_deviceptr();
             let out_len:  u64 = n as u64;
@@ -1489,7 +1585,7 @@ impl OxideQ4kGemv {
             .map_err(|e| KernelError::InvalidConfig(format!("oxide {kernel_name}: {e}")))?;
         }
 
-        // No stream.synchronize() here — the caller (CUDA graph or direct dispatch)
+        // No stream.synchronize() here -- the caller (CUDA graph or direct dispatch)
         // is responsible for synchronization.  Adding a sync inside capture mode
         // would cause CUDA error 900 (operation not permitted when stream is capturing).
 
@@ -1551,7 +1647,7 @@ impl OxideQ4kGemv {
 
         let cu_stream = self.stream.cu_stream();
 
-        // ── Launch quantize_q8_1 ────────────────────────────────────────────
+        // -- Launch quantize_q8_1 --------------------------------------------
         {
             let qs_ptr: u64 = x_qs_arc.device_pointer().cu_deviceptr();
             let qs_len: u64 = (k / 4) as u64;
@@ -1576,7 +1672,7 @@ impl OxideQ4kGemv {
             }.map_err(|e| KernelError::InvalidConfig(format!("oxide quantize_q8_1 (fused): {e}")))?;
         }
 
-        // ── Launch q4k_gemv_fused_silu_mul ──────────────────────────────────
+        // -- Launch q4k_gemv_fused_silu_mul ----------------------------------
         {
             let out_ptr:  u64 = out_arc.device_pointer().cu_deviceptr();
             let out_len:  u64 = n as u64;
@@ -1667,7 +1763,7 @@ impl OxideQ4kGemv {
 
         let cu_stream = self.stream.cu_stream();
 
-        // ── Launch quantize_q8_1 (same as oxide fused silu path) ───────────
+        // -- Launch quantize_q8_1 (same as oxide fused silu path) -----------
         {
             let qs_ptr: u64 = x_qs_arc.device_pointer().cu_deviceptr();
             let qs_len: u64 = (k / 4) as u64;
@@ -1692,7 +1788,7 @@ impl OxideQ4kGemv {
             }.map_err(|e| KernelError::InvalidConfig(format!("oxide quantize_q8_1 (sm120_fused): {e}")))?;
         }
 
-        // ── Launch q4k_fused_silu_sm120_dp4a ────────────────────────────────
+        // -- Launch q4k_fused_silu_sm120_dp4a --------------------------------
         // Parameters: gate, up, act_qs, act_ds, out, n, k_blocks (7 params, no lengths).
         {
             let gate_ptr: u64 = gate_packed.device_pointer().cu_deviceptr();

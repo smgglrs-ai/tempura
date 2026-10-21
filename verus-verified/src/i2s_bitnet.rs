@@ -1,4 +1,4 @@
-//! Verus-verified I2S (BitNet) ternary format — unbounded proofs
+//! Verus-verified I2S (BitNet) ternary format -- unbounded proofs
 //!
 //! Proves: 2-bit packed ternary encoding/decoding, block layout
 //! (256 elements per block, 64 bytes data + scale), dequant indexing.
@@ -72,7 +72,7 @@ proof fn i2s_byte_index(g: nat, b: nat)
 }
 
 // ============================================================================
-// I2S covers all 256 elements: 2 groups × 128 elements = 256
+// I2S covers all 256 elements: 2 groups x 128 elements = 256
 // ============================================================================
 
 proof fn i2s_covers_all()
@@ -102,7 +102,7 @@ proof fn i8_quant_range(q: int)
 
 // ============================================================================
 // I2S matmul: per-block dot product accumulator
-// Each element: i8 × trit ∈ {-127, ..., 127} × {-1, 0, 1}
+// Each element: i8 x trit ??? {-127, ..., 127} x {-1, 0, 1}
 // Product range: [-127, 127]. Sum of 256: [-32512, 32512] < i32::MAX
 // ============================================================================
 

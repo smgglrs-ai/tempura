@@ -14,7 +14,7 @@ Every kernel implementation declares its verification tier. The tier is recorded
 
 | Tier | Requirements | What it means |
 |------|-------------|---------------|
-| **Proven** | Kani proofs pass + DualPipeline equivalence within epsilon | Formal safety + numerical fidelity |
+| **Proven** | Kani + Verus proofs pass + DualPipeline equivalence within epsilon | Formal safety + unbounded correctness + numerical fidelity |
 | **Tested** | DualPipeline equivalence only | No formal proof, but numerically matches reference |
 | **Compiled** | Type-checks against traits | No equivalence data; may diverge numerically |
 
@@ -27,8 +27,30 @@ Every kernel implementation declares its verification tier. The tier is recorded
 - **Slot accounting safety** in KV cache (no double-alloc, no OOB)
 - **Batch isolation** — attention indexing for one sequence cannot read another sequence's memory
 
+61 proof harnesses across `kernels/` and `engine/`, covering attention, RMSNorm, RoPE, matmul, sampling, quantization (Q4K/Q6K/TQ2/I2S), KV cache, speculative decoding, and more.
+
 ```sh
-cargo kani --package tempura-kernels    # 11 proof harnesses
+cargo kani --package tempura-kernels    # 61 proof harnesses
+```
+
+## Verus proofs
+
+[Verus](https://github.com/verus-lang/verus) is a deductive verifier for Rust that proves properties hold for *all inputs* (unbounded) via SMT. Where Kani checks bounded instances, Verus gives mathematical certainty.
+
+tempura uses Verus to prove:
+
+- **Struct invariants** — `KvCache`, `PageAllocator`, `BlockTable`, `Session`, `PrefixCache`
+- **Loop termination** — all iterative algorithms provably terminate
+- **State machine transitions** — prefill → decode lifecycle, KV cache append/advance
+- **GQA head mapping** — group query attention index arithmetic is in-bounds for all configs
+- **Tensor parallel sharding** — slice assignments cover the full output with no gaps or overlaps
+- **Causal masking** — attention mask is strictly lower-triangular for all sequence lengths
+- **BitNet packing roundtrips** — TQ2_0 and I2S pack/unpack are mathematical inverses
+
+828 verification conditions across 62 modules in the standalone `verus-verified/` crate.
+
+```sh
+./scripts/run-verus.sh    # 828 verification conditions across 62 modules
 ```
 
 ## DualPipeline

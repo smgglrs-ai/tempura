@@ -165,7 +165,7 @@ fn main() {
             "=== {label} (s={}, kv={}, h={}/{}, d={}) ===",
             cfg.seq_len, cfg.kv_len, cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
         );
-        println!("{:<28} {:>12} {:>10}", "", "max_diff", "time(µs)");
+        println!("{:<28} {:>12} {:>10}", "", "max_diff", "time(??s)");
 
         let (ref_out, ref_us) = run_attn(&CpuAttention, cfg, &q, &k, &v, scale, warmup, iters);
         println!("{:<28} {:>12} {:>10.1}", "CPU  f32  naive", "ref", ref_us);
@@ -179,7 +179,7 @@ fn main() {
         let d = max_diff(&ref_out, &cutile_out);
         let speedup = ref_us / cutile_us;
         println!(
-            "{:<28} {:>12.6} {:>10.1}  ({:.1}× vs CPU naive)",
+            "{:<28} {:>12.6} {:>10.1}  ({:.1}x vs CPU naive)",
             "GPU  cutile flash", d, cutile_us, speedup
         );
         println!();
@@ -194,7 +194,7 @@ fn main() {
         let cpu_rope = CpuRoPE;
         let gpu_rope = CutileRoPE::new().unwrap();
 
-        println!("─── RoPE precision (cuTile vs CPU) ───");
+        println!("--- RoPE precision (cuTile vs CPU) ---");
         for (label, hd, theta) in [("Qwen3", 128usize, 1_000_000.0f32), ("small", 16, 10_000.0)] {
             let seq_len = 4;
             let nh = 32;

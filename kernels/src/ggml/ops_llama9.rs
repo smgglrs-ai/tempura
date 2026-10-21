@@ -5,7 +5,7 @@
 
 use super::helpers::f16_to_f32;
 
-// ─── silu backward f16 (ops.cpp:2824, vec.h:1395) ────────────────────────────
+// --- silu backward f16 (ops.cpp:2824, vec.h:1395) ----------------------------
 
 #[inline]
 fn silu_backward_f16(x_bits: u16, dy_bits: u16) -> u16 {
@@ -39,12 +39,12 @@ pub fn silu_back_f16(
     }
 }
 
-// ─── conv_2d_impl (ops.cpp:7084) ─────────────────────────────────────────────
+// --- conv_2d_impl (ops.cpp:7084) ---------------------------------------------
 
 /// Translation of `ggml_compute_forward_conv_2d_impl` (ops.cpp:7084).
 ///
-/// 2D convolution: kernel [KW, KH, IC, OC] × src [W, H, IC, N] → dst [OW, OH, OC, N].
-/// Uses im2col + GEMM approach. `tmp_buf` must have length ≥ patches_per_batch * knl_n.
+/// 2D convolution: kernel [KW, KH, IC, OC] x src [W, H, IC, N] -> dst [OW, OH, OC, N].
+/// Uses im2col + GEMM approach. `tmp_buf` must have length >= patches_per_batch * knl_n.
 /// This scalar version processes all patches; in the threaded C version patches are
 /// split by `ith/nth` with a barrier between im2col and GEMM phases.
 ///
@@ -111,11 +111,11 @@ pub fn conv_2d_impl(
     }
 }
 
-// ─── conv_3d_impl (ops.cpp:7221) ─────────────────────────────────────────────
+// --- conv_3d_impl (ops.cpp:7221) ---------------------------------------------
 
 /// Translation of `ggml_compute_forward_conv_3d_impl` (ops.cpp:7221).
 ///
-/// 3D convolution: kernel [KW,KH,KD,IC,OC] × src [W,H,D,IC*N] → dst [OW,OH,OD,OC*N].
+/// 3D convolution: kernel [KW,KH,KD,IC,OC] x src [W,H,D,IC*N] -> dst [OW,OH,OD,OC*N].
 #[allow(clippy::too_many_arguments)]
 pub fn conv_3d_impl(
     kernel: &[f32],  // [knl_w * knl_h * knl_d * c * oc]
@@ -181,7 +181,7 @@ pub fn conv_3d_impl(
     }
 }
 
-// ─── conv_transpose_2d_impl (ops.cpp:7362) ───────────────────────────────────
+// --- conv_transpose_2d_impl (ops.cpp:7362) -----------------------------------
 
 /// Translation of `ggml_compute_forward_conv_transpose_2d_impl` (ops.cpp:7362).
 ///
@@ -234,7 +234,7 @@ pub fn conv_transpose_2d_f32(
     }
 }
 
-// ─── cross_entropy_loss_f32 (ops.cpp:11696) ──────────────────────────────────
+// --- cross_entropy_loss_f32 (ops.cpp:11696) ----------------------------------
 
 /// Translation of `ggml_compute_forward_cross_entropy_loss_f32` (ops.cpp:11696).
 ///
@@ -282,7 +282,7 @@ pub fn cross_entropy_loss_reduce(thread_sums: &[f32], nr: usize) -> f32 {
     -thread_sums.iter().sum::<f32>() / nr as f32
 }
 
-// ─── cross_entropy_loss_back_f32 (ops.cpp:11792) ─────────────────────────────
+// --- cross_entropy_loss_back_f32 (ops.cpp:11792) -----------------------------
 
 /// Translation of `ggml_compute_forward_cross_entropy_loss_back_f32` (ops.cpp:11792).
 ///
@@ -311,7 +311,7 @@ pub fn cross_entropy_loss_back_f32(
     }
 }
 
-// ─── opt_step_adamw_f32 (ops.cpp:11873) ──────────────────────────────────────
+// --- opt_step_adamw_f32 (ops.cpp:11873) --------------------------------------
 
 /// Translation of `ggml_compute_forward_opt_step_adamw_f32` (ops.cpp:11873).
 ///
@@ -344,7 +344,7 @@ pub fn opt_step_adamw_f32(
     }
 }
 
-// ─── opt_step_sgd_f32 (ops.cpp:11958) ────────────────────────────────────────
+// --- opt_step_sgd_f32 (ops.cpp:11958) ----------------------------------------
 
 /// Translation of `ggml_compute_forward_opt_step_sgd_f32` (ops.cpp:11958).
 ///
@@ -368,7 +368,7 @@ pub fn opt_step_sgd_f32(
     }
 }
 
-// ─── flash_attn_back_f32 — skeleton (ops.cpp:9367) ───────────────────────────
+// --- flash_attn_back_f32 -- skeleton (ops.cpp:9367) ---------------------------
 
 /// Translation of `ggml_compute_forward_flash_attn_back_f32` (ops.cpp:9367).
 ///
@@ -437,7 +437,7 @@ pub fn flash_attn_back_f32(
             }
         }
 
-        // scalar: ds = attn * (d · V - sum(attn * (d · V)))
+        // scalar: ds = attn * (d * V - sum(attn * (d * V)))
         let mut dv_dot = vec![0.0f32; m];
         for j in 0..m {
             let v_off = j * h * head_dim + ih * head_dim;

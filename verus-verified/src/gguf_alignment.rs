@@ -1,4 +1,4 @@
-//! Verus-verified GGUF tensor alignment — unbounded proofs
+//! Verus-verified GGUF tensor alignment -- unbounded proofs
 //!
 //! Proves: GGUF tensor data is aligned to 32 bytes, tensor offset
 //! computation is valid, block count matches element count.

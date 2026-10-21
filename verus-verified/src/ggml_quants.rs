@@ -1,4 +1,4 @@
-//! Verus-verified ggml quantization proofs — unbounded
+//! Verus-verified ggml quantization proofs -- unbounded
 //!
 //! Proves bit-manipulation, integer arithmetic, and indexing properties
 //! of ggml quantized formats: Q4_0, Q5_0, Q6_K, Q2_K, Q3_K, TQ2_0,
@@ -275,7 +275,7 @@ proof fn get_scale_min_k4_high_range(scales: Seq<u8>, j: nat)
 }
 
 // ============================================================================
-// 9. Q8_0 quantization output range — clamped i32 fits in i8
+// 9. Q8_0 quantization output range -- clamped i32 fits in i8
 // ============================================================================
 
 proof fn q8_0_clamp_fits_i8(val: int)
@@ -288,7 +288,7 @@ proof fn q8_0_clamp_fits_i8(val: int)
 }
 
 // ============================================================================
-// 10. Q8_K bsums consistency — sum of 16 i8 values fits in i16
+// 10. Q8_K bsums consistency -- sum of 16 i8 values fits in i16
 // ============================================================================
 
 proof fn q8k_bsums_range(sum: int)
@@ -381,7 +381,7 @@ proof fn vec_dot_aux8_index_bounds(j: nat)
 }
 
 // ============================================================================
-// 13. mul_mat dst index — row * n + col < m * n
+// 13. mul_mat dst index -- row * n + col < m * n
 // ============================================================================
 
 proof fn mul_mat_dst_index(m: nat, n: nat, row: nat, col: nat)

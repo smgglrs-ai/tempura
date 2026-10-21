@@ -17,8 +17,10 @@ toc = true
 
 ```sh
 cargo build              # build all crates
-cargo test               # run all tests (148 currently)
+cargo test               # run all tests (~580 total)
 ```
+
+> **Note:** `cargo test` requires the oxide PTX files to exist. These are built separately via `cargo oxide build` in `tools/oxide-gemv*/`. Without them the `tempura-kernels` crate will fail to compile. ~270 tests from the other packages (`engine`, `server`, `model`, etc.) run without PTX.
 
 ## Run
 

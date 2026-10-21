@@ -3,7 +3,7 @@ name = "tempura-kernel-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Kernel trait definitions for tempura — the stable contract for backend implementations"
+description = "Kernel trait definitions for tempura -- the stable contract for backend implementations"
 
 [dependencies]
 thiserror = "2"

@@ -1,4 +1,4 @@
-//! Verus-verified Q2_0 GPU GEMV dequantization proofs — unbounded
+//! Verus-verified Q2_0 GPU GEMV dequantization proofs -- unbounded
 //!
 //! Proves integer arithmetic, bit-manipulation, and block-layout properties
 //! of the Q2_0 packed GPU format and the related Q4K/Q6K/TQ2 CPU dequant
@@ -14,7 +14,7 @@ use vstd::prelude::*;
 verus! {
 
 // ============================================================================
-// Constants — mirror cutile_quantized_gemm.rs and kernel-api/src/lib.rs
+// Constants -- mirror cutile_quantized_gemm.rs and kernel-api/src/lib.rs
 // ============================================================================
 
 pub spec const Q2_0_BLOCK_BYTES: nat = 34;
@@ -31,7 +31,7 @@ pub spec const TQ2_BLOCK_BYTES: nat = 66;
 pub spec const TQ2_BLOCK_SIZE: nat = 256;
 
 // ============================================================================
-// Q2_0 — block layout and bit-field proofs
+// Q2_0 -- block layout and bit-field proofs
 // ============================================================================
 
 /// Scale field (bytes 0-1) and data words (bytes 2-33) are within the 34-byte block.
@@ -68,8 +68,8 @@ proof fn q2_0_packed_slot_in_bounds(word: nat)
 
 /// Element index to block index and word index mapping stays in bounds.
 /// For element index i < Q2_0_QK (128):
-///   byte index = i / 4  ∈ [0, 31] (within 32 payload bytes)
-///   bit offset = (i % 4) * 2  ∈ {0, 2, 4, 6} (valid shift for u8)
+///   byte index = i / 4  ??? [0, 31] (within 32 payload bytes)
+///   bit offset = (i % 4) * 2  ??? {0, 2, 4, 6} (valid shift for u8)
 proof fn q2_0_element_index_to_byte_in_bounds(i: nat)
     requires i < Q2_0_QK,
     ensures
@@ -93,7 +93,7 @@ proof fn q2_0_word_and_bitpair_in_bounds(i: nat)
 }
 
 // ============================================================================
-// Q2_0 — 2-bit value centering arithmetic
+// Q2_0 -- 2-bit value centering arithmetic
 // ============================================================================
 
 /// Two-bit mask gives 0..=3; no u32 overflow.
@@ -115,9 +115,9 @@ proof fn q2_0_shift_in_bounds(bit_pair: nat)
     assert(bit_pair * 2 < 32) by (nonlinear_arith) requires bit_pair < 16;
 }
 
-/// Center subtraction: for q ∈ {0,1,2,3}, (q as int) - 1 ∈ {-1, 0, 1, 2}.
+/// Center subtraction: for q ??? {0,1,2,3}, (q as int) - 1 ??? {-1, 0, 1, 2}.
 /// This proves the subtraction does not underflow int and produces a
-/// bounded signed value — the dequantized weight level.
+/// bounded signed value -- the dequantized weight level.
 proof fn q2_0_centering_in_range(q: u32)
     requires q <= 3,
     ensures ({
@@ -129,8 +129,8 @@ proof fn q2_0_centering_in_range(q: u32)
 }
 
 /// IEEE 754 trick used in the GPU kernel:
-/// `q | 0x4B000000` for q ∈ {0,1,2,3} has exponent field = 0x96 = 150 (decimal).
-/// 150 ≠ 255, so the u32 bitcast produces a normal finite f32 (not NaN or Inf).
+/// `q | 0x4B000000` for q ??? {0,1,2,3} has exponent field = 0x96 = 150 (decimal).
+/// 150 ??? 255, so the u32 bitcast produces a normal finite f32 (not NaN or Inf).
 proof fn q2_0_ieee_trick_exp_not_0xff(q: u32)
     requires q <= 3,
     ensures ({
@@ -144,7 +144,7 @@ proof fn q2_0_ieee_trick_exp_not_0xff(q: u32)
 }
 
 // ============================================================================
-// Q4K — block layout and nibble safety
+// Q4K -- block layout and nibble safety
 // ============================================================================
 
 /// Q4K block field layout is internally consistent and within 144 bytes.
@@ -170,7 +170,7 @@ proof fn q4k_qs_byte_index_in_bounds(idx: nat)
     assert(16 + idx / 2 < 144) by (nonlinear_arith) requires idx < 256;
 }
 
-/// Nibble extraction from any byte: low nibble (& 0x0F) ≤ 15, high nibble (>> 4) ≤ 15.
+/// Nibble extraction from any byte: low nibble (& 0x0F) <= 15, high nibble (>> 4) <= 15.
 proof fn q4k_nibble_range(byte: u8)
     ensures ({
         let lo: u8 = byte & 0x0Fu8;
@@ -183,7 +183,7 @@ proof fn q4k_nibble_range(byte: u8)
     assert(byte >> 4u8 <= 15) by (bit_vector);
 }
 
-/// Scale unpacking: `byte & 0x3F` ≤ 63 for any byte — 6-bit scale value stays in range.
+/// Scale unpacking: `byte & 0x3F` <= 63 for any byte -- 6-bit scale value stays in range.
 proof fn q4k_6bit_scale_in_range(byte: u8)
     ensures byte & 0x3Fu8 <= 63,
 {
@@ -201,7 +201,7 @@ proof fn q4k_scale_unpack_indices_in_bounds(i: nat)
 }
 
 // ============================================================================
-// Q6K — block layout and 6-bit reconstruction
+// Q6K -- block layout and 6-bit reconstruction
 // ============================================================================
 
 /// Q6K block field layout is within 210 bytes.
@@ -219,11 +219,11 @@ proof fn q6k_block_layout_in_bounds()
 {
 }
 
-/// Q6K 6-bit reconstruction: low 4 bits from ql + high 2 bits from qh ≤ 63.
+/// Q6K 6-bit reconstruction: low 4 bits from ql + high 2 bits from qh <= 63.
 ///
 /// The low 4 bits come from `ql & 0x0F` (range [0,15]) and the high 2 bits
 /// from `(qh >> shift*2) & 0x03` (range [0,3]), combined as `low | (high << 4)`.
-/// All operations are u8; the result occupies at most 6 bits, so it is ≤ 63.
+/// All operations are u8; the result occupies at most 6 bits, so it is <= 63.
 proof fn q6k_6bit_reconstruction_in_range(ql: u8, qh: u8, shift: u32)
     requires shift < 4,
     ensures ({
@@ -239,16 +239,16 @@ proof fn q6k_6bit_reconstruction_in_range(ql: u8, qh: u8, shift: u32)
 
     assert(ql & 0x0Fu8 <= 15u8) by (bit_vector);
 
-    // forall: (b >> s) & 0x03 ≤ 3 for s < 8
+    // forall: (b >> s) & 0x03 <= 3 for s < 8
     assert(forall |b: u8, s: u8| s < 8u8 ==>
         #[trigger] ((b >> s) & 0x03u8) <= 3u8) by (bit_vector);
 
-    // forall: lo | (hi << 4) ≤ 63 when lo ≤ 15 and hi ≤ 3
+    // forall: lo | (hi << 4) <= 63 when lo <= 15 and hi <= 3
     assert(forall |lo: u8, hi: u8| lo <= 15u8 && hi <= 3u8 ==>
         #[trigger] (lo | (hi << 4u8)) <= 63u8) by (bit_vector);
 }
 
-/// Signed Q6K value: q6 - 32 for q6 ∈ [0, 63] is in [-32, 31].
+/// Signed Q6K value: q6 - 32 for q6 ??? [0, 63] is in [-32, 31].
 proof fn q6k_signed_value_in_range(q6: u32)
     requires q6 <= 63,
     ensures ({
@@ -260,7 +260,7 @@ proof fn q6k_signed_value_in_range(q6: u32)
 }
 
 // ============================================================================
-// TQ2 — ternary bit extraction
+// TQ2 -- ternary bit extraction
 // ============================================================================
 
 /// TQ2 block field layout: qs at bytes 0-63, scale at bytes 64-65.
@@ -272,7 +272,7 @@ proof fn tq2_block_layout_in_bounds()
 {
 }
 
-/// TQ2 2-bit trit extraction: (byte >> shift*2) & 3 ∈ {0,1,2,3}.
+/// TQ2 2-bit trit extraction: (byte >> shift*2) & 3 ??? {0,1,2,3}.
 proof fn tq2_trit_extraction_range(byte: u8, shift: u32)
     requires shift < 4,
     ensures ({
@@ -284,7 +284,7 @@ proof fn tq2_trit_extraction_range(byte: u8, shift: u32)
         requires shift < 4u32;
 }
 
-/// TQ2 centering: (trit as int) - 1 ∈ {-1, 0, 1, 2} for trit in 0..=3.
+/// TQ2 centering: (trit as int) - 1 ??? {-1, 0, 1, 2} for trit in 0..=3.
 proof fn tq2_centering_in_range(trit: u32)
     requires trit <= 3,
     ensures ({

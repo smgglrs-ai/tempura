@@ -1,4 +1,4 @@
-//! Verus-verified layer graph I/O shape constraints — unbounded proofs
+//! Verus-verified layer graph I/O shape constraints -- unbounded proofs
 //!
 //! Proves: LayerInput/LayerOutput buffer sizes match config dimensions,
 //! PrefillInput/PrefillOutput shapes, DecodeInput/DecodeOutput shapes.
@@ -119,7 +119,7 @@ proof fn prefill_kv_layers(
 }
 
 // ============================================================================
-// DecodeInput: single token → token_embedding.len() == hidden_size
+// DecodeInput: single token -> token_embedding.len() == hidden_size
 // ============================================================================
 
 proof fn decode_single_token(hidden_size: nat)
@@ -161,13 +161,13 @@ proof fn layer_weights_consistent(
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         // input_layernorm: hidden_size
-        // q_proj: hidden_size × q_dim = hidden_size²
-        // k_proj: hidden_size × kv_dim
-        // v_proj: hidden_size × kv_dim
-        // o_proj: q_dim × hidden_size = hidden_size²
-        // gate_proj: hidden_size × intermediate_size
-        // up_proj: hidden_size × intermediate_size
-        // down_proj: intermediate_size × hidden_size
+        // q_proj: hidden_size x q_dim = hidden_size^2
+        // k_proj: hidden_size x kv_dim
+        // v_proj: hidden_size x kv_dim
+        // o_proj: q_dim x hidden_size = hidden_size^2
+        // gate_proj: hidden_size x intermediate_size
+        // up_proj: hidden_size x intermediate_size
+        // down_proj: intermediate_size x hidden_size
         &&& q_dim == hidden_size
         &&& kv_dim <= q_dim
         &&& hidden_size * intermediate_size >= hidden_size

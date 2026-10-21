@@ -1,7 +1,7 @@
 /// GPU capability discovery for kernel-variant selection.
 ///
 /// Queried once at kernel-loader construction time and cached.  The capabilities
-/// drive which PTX variant is loaded — there is no runtime branching after the
+/// drive which PTX variant is loaded -- there is no runtime branching after the
 /// constructor returns.
 ///
 /// # Usage
@@ -16,58 +16,58 @@
 use bitflags::bitflags;
 
 bitflags! {
-    /// PTX ISA / CUDA hardware feature flags — one bit per distinct feature.
+    /// PTX ISA / CUDA hardware feature flags -- one bit per distinct feature.
     ///
     /// Authoritative CC thresholds from CUDA 13.3 PTX ISA and sm_*_intrinsics.h.
     /// Use `GpuCapabilities::features()` to obtain the flag set for a device.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct GpuFeature: u64 {
-        // ── Available on RTX 5090 (sm_120) ──────────────────────────────
-        /// cc >= 610 — __dp4a / `dp4a.s32.s32` (CUDA `sm_61_intrinsics.h`).
+        // -- Available on RTX 5090 (sm_120) ------------------------------
+        /// cc >= 610 -- __dp4a / `dp4a.s32.s32` (CUDA `sm_61_intrinsics.h`).
         /// Pascal GP102/GP104/GP106/GP108; NOT GP100 (sm_60).
         const DP4A          = 1 << 0;
-        /// cc >= 610 — `dp2a.lo` / `dp2a.hi` 2-element INT8 dot.
+        /// cc >= 610 -- `dp2a.lo` / `dp2a.hi` 2-element INT8 dot.
         const DP2A          = 1 << 1;
-        /// cc >= 750 — `mma.sync.m16n8k8` FP16/INT8 tensor cores (Turing MMA).
+        /// cc >= 750 -- `mma.sync.m16n8k8` FP16/INT8 tensor cores (Turing MMA).
         const TURING_MMA    = 1 << 2;
-        /// cc >= 800 — `cp.async.cg.shared.global` (PTX ISA 7.0, Ampere).
+        /// cc >= 800 -- `cp.async.cg.shared.global` (PTX ISA 7.0, Ampere).
         const CP_ASYNC      = 1 << 3;
-        /// cc >= 800 — `ldmatrix.sync.aligned` (PTX ISA 7.5, Ampere).
+        /// cc >= 800 -- `ldmatrix.sync.aligned` (PTX ISA 7.5, Ampere).
         const LDMATRIX      = 1 << 4;
-        /// cc >= 800 — `redux.sync.add.f32` hardware warp reduction (PTX ISA 7.0).
+        /// cc >= 800 -- `redux.sync.add.f32` hardware warp reduction (PTX ISA 7.0).
         const REDUX_SYNC    = 1 << 5;
-        /// cc >= 800 — BF16 tensor cores / `hfma2.rn bf16x2` (Ampere).
+        /// cc >= 800 -- BF16 tensor cores / `hfma2.rn bf16x2` (Ampere).
         const BF16_MMA      = 1 << 6;
-        /// cc >= 800 — Ampere `m16n8k16` INT4/TF32 MMA variants.
+        /// cc >= 800 -- Ampere `m16n8k16` INT4/TF32 MMA variants.
         const AMPERE_MMA    = 1 << 7;
-        /// cc >= 900 — `elect.sync` single-thread-per-warp election (Hopper).
+        /// cc >= 900 -- `elect.sync` single-thread-per-warp election (Hopper).
         const ELECT_SYNC    = 1 << 8;
-        /// cc >= 900, sm_90a — `wgmma.mma_async` warp-group MMA (Hopper).
+        /// cc >= 900, sm_90a -- `wgmma.mma_async` warp-group MMA (Hopper).
         const WGMMA         = 1 << 9;
-        /// cc >= 900 — `cp.async.bulk` / TMA tensor memory access (Hopper).
+        /// cc >= 900 -- `cp.async.bulk` / TMA tensor memory access (Hopper).
         const TMA           = 1 << 10;
-        /// cc >= 900 — `setmaxnreg` dynamic register limit per warp (Hopper).
+        /// cc >= 900 -- `setmaxnreg` dynamic register limit per warp (Hopper).
         const SETMAXNREG    = 1 << 11;
-        /// cc >= 1000 — thread-block cluster launch (`cluster.arrive`, etc.).
+        /// cc >= 1000 -- thread-block cluster launch (`cluster.arrive`, etc.).
         const CLUSTER       = 1 << 12;
-        /// cc >= 1200 — direct sm_120 PTX codegen target (Blackwell consumer).
+        /// cc >= 1200 -- direct sm_120 PTX codegen target (Blackwell consumer).
         const SM120_ISA     = 1 << 13;
-        /// cc >= 1200 — Blackwell FP16/BF16 MMA variants (sm_120 tensor cores).
+        /// cc >= 1200 -- Blackwell FP16/BF16 MMA variants (sm_120 tensor cores).
         const BLACKWELL_MMA = 1 << 14;
-        /// sm_120a sub-variant — FP4 block-scaled MMA `mxf4.block_scale.m16n8k64.e2m1`.
+        /// sm_120a sub-variant -- FP4 block-scaled MMA `mxf4.block_scale.m16n8k64.e2m1`.
         /// Detected separately (requires cuModuleLoadData probe); not set by `features()`.
         const MXFP4_MMA     = 1 << 15;
-        // ── Datacenter / special only ────────────────────────────────────
-        /// cc == 1210 — DGX Spark `prefetch.global.L2` (NOT RTX 5090).
+        // -- Datacenter / special only ------------------------------------
+        /// cc == 1210 -- DGX Spark `prefetch.global.L2` (NOT RTX 5090).
         const L2_PREFETCH   = 1 << 16;
-        /// cc_major == 10, sm_100a/sm_103a — TCGEN05 TMEM tensor core (NOT sm_120).
+        /// cc_major == 10, sm_100a/sm_103a -- TCGEN05 TMEM tensor core (NOT sm_120).
         const TCGEN05       = 1 << 17;
-        /// cc >= 900 — `multimem.ld.reduce` NVLink multi-GPU ops.
+        /// cc >= 900 -- `multimem.ld.reduce` NVLink multi-GPU ops.
         const MULTIMEM      = 1 << 18;
-        // ── Micro-optimisations (all CC, cost-free) ───────────────────────
-        /// all CC — `ld.global.nc` non-coherent load (bypass L1 for scan-once reads).
+        // -- Micro-optimisations (all CC, cost-free) -----------------------
+        /// all CC -- `ld.global.nc` non-coherent load (bypass L1 for scan-once reads).
         const LD_NC         = 1 << 19;
-        /// all CC — `prmt.b32` byte permutation (nibble extraction, shuffle tricks).
+        /// all CC -- `prmt.b32` byte permutation (nibble extraction, shuffle tricks).
         const PRMT          = 1 << 20;
     }
 }
@@ -132,7 +132,7 @@ impl GpuCapabilities {
 
     /// Compute capability as a single comparable integer.
     ///
-    /// The encoding is `major * 100 + minor * 10`, so sm_61 → 610, sm_120 → 1200.
+    /// The encoding is `major * 100 + minor * 10`, so sm_61 -> 610, sm_120 -> 1200.
     #[inline]
     pub fn cc(&self) -> u32 {
         self.cc_major * 100 + self.cc_minor * 10
@@ -141,13 +141,13 @@ impl GpuCapabilities {
     /// Full PTX ISA feature set available on this device.
     ///
     /// Derived entirely from `cc()`.  Sub-variant features that require a probe
-    /// (`MXFP4_MMA`) are NOT set here — callers must probe separately.
+    /// (`MXFP4_MMA`) are NOT set here -- callers must probe separately.
     pub fn features(&self) -> GpuFeature {
         // LD_NC and PRMT are available on all CC.
         let mut f = GpuFeature::LD_NC | GpuFeature::PRMT;
         let cc = self.cc();
 
-        // dp4a: Pascal GP102+ (sm_61). GP100 (sm_60) lacks it — threshold is 610.
+        // dp4a: Pascal GP102+ (sm_61). GP100 (sm_60) lacks it -- threshold is 610.
         if cc >= 610  { f |= GpuFeature::DP4A  | GpuFeature::DP2A; }
         if cc >= 750  { f |= GpuFeature::TURING_MMA; }
         if cc >= 800  { f |= GpuFeature::CP_ASYNC | GpuFeature::LDMATRIX
@@ -159,11 +159,11 @@ impl GpuCapabilities {
         if cc >= 1000 { f |= GpuFeature::CLUSTER; }
         if cc >= 1200 { f |= GpuFeature::SM120_ISA | GpuFeature::BLACKWELL_MMA; }
 
-        // Datacenter Blackwell (sm_100 / sm_103) — cc_major == 10.
+        // Datacenter Blackwell (sm_100 / sm_103) -- cc_major == 10.
         // NOT RTX 5090 (sm_120, cc_major == 12).
         if self.cc_major == 10 { f |= GpuFeature::TCGEN05; }
 
-        // DGX Spark (sm_121 → cc() == 1210).
+        // DGX Spark (sm_121 -> cc() == 1210).
         if cc == 1210 { f |= GpuFeature::L2_PREFETCH; }
 
         f
@@ -224,7 +224,7 @@ impl Default for GpuCapabilities {
 ///
 /// Used by kernel loaders to build a list of loaded variants, then select the
 /// best one at construction time.  After construction the selected `CUfunction`
-/// is stored directly — no `Option` overhead on the hot path.
+/// is stored directly -- no `Option` overhead on the hot path.
 #[cfg(feature = "cutile")]
 #[derive(Clone)]
 pub struct KernelVariant {

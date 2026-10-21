@@ -1,4 +1,4 @@
-//! Verus-verified row-partitioned Q2_0 GEMV properties — unbounded proofs
+//! Verus-verified row-partitioned Q2_0 GEMV properties -- unbounded proofs
 //!
 //! Proves: row partition non-overlap across threads, output pointer bounds,
 //! weight row access bounds, and full output coverage.

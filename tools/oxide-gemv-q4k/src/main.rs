@@ -6,14 +6,14 @@
  * The tempura-kernels build.rs extracts that PTX and writes it to OUT_DIR.
  *
  * Q4_K packed GPU format (42 u32 per block, 256 elements per block):
- *   u32[0]      = f32 bits of d (super-scale, f16 → f32 at upload)
- *   u32[1]      = f32 bits of dmin (super-min, f16 → f32 at upload)
+ *   u32[0]      = f32 bits of d (super-scale, f16 -> f32 at upload)
+ *   u32[1]      = f32 bits of dmin (super-min, f16 -> f32 at upload)
  *   u32[2+j]    = sc[2*j] | (sc[2*j+1]<<8) for j=0..3 (group scale pairs, 8-bit each)
  *   u32[6+j]    = m[2*j]  | (m[2*j+1]<<8)  for j=0..3 (group min pairs, 8-bit each)
  *   u32[10..42] = 32 u32s of packed qs bytes (128 bytes = 256 nibbles, 4-bit each)
  *
  * Dequant for element `within` in a block:
- *   j       = within / 64                    — which j-pair (0..3)
+ *   j       = within / 64                    -- which j-pair (0..3)
  *   in_j    = within % 64
  *   is_hi   = in_j >= 32
  *   l       = in_j % 32
@@ -25,7 +25,7 @@
  *
  * v2 optimization (shfl-based scale sharing):
  *   One warp (32 lanes) processes 256 elements of one block per iteration.
- *   Each lane handles elements: l, l+32, l+64, …, l+224 within the block.
+ *   Each lane handles elements: l, l+32, l+64, ..., l+224 within the block.
  *   - d, dmin: lane 0 loads once; all lanes receive via shfl.
  *   - sc/m:    lanes 0..3 each load one u32 (2 scale/min values); broadcast via shfl.
  *   - qs:      each lane loads one u32 per j-group (contains lo+hi nibbles for that lane).
@@ -44,7 +44,7 @@ use cuda_core::simt::LaunchConfig;
 const WARPS_PER_BLOCK: u32 = 4;
 const WARPS_PER_BLOCK_KPAR: u32 = 8;
 
-/// f16 bits (low 16 of u32) → f32, device-safe bit arithmetic.
+/// f16 bits (low 16 of u32) -> f32, device-safe bit arithmetic.
 #[inline(always)]
 fn f16_to_f32(h: u32) -> f32 {
     let sign = (h >> 15) << 31;
@@ -60,7 +60,7 @@ fn f16_to_f32(h: u32) -> f32 {
     f32::from_bits(bits)
 }
 
-/// f32 → f16 bits stored in low 16 of u16, device-safe.
+/// f32 -> f16 bits stored in low 16 of u16, device-safe.
 #[inline(always)]
 fn f32_to_f16_bits(v: f32) -> u16 {
     let bits = v.to_bits();
@@ -94,10 +94,10 @@ fn warp_reduce_max_f32(mut v: f32) -> f32 {
 #[inline(always)]
 fn unpack_scales_6bit(ps0: u32, ps1: u32, ps2: u32, mw: u32) -> (f32, f32, f32, f32) {
     // ps[i]: byte i of the 12-byte scale section
-    // j=0: sc[0],sc[1],m[0],m[1] → ps[0],ps[1],ps[4],ps[5]
-    // j=1: sc[2],sc[3],m[2],m[3] → ps[2],ps[3],ps[6],ps[7]
-    // j=2: sc[4],sc[5],m[4],m[5] → 6-bit unpack from ps[0..2] and ps[8..10]
-    // j=3: sc[6],sc[7],m[6],m[7] → 6-bit unpack from ps[2..4] and ps[10..12]
+    // j=0: sc[0],sc[1],m[0],m[1] -> ps[0],ps[1],ps[4],ps[5]
+    // j=1: sc[2],sc[3],m[2],m[3] -> ps[2],ps[3],ps[6],ps[7]
+    // j=2: sc[4],sc[5],m[4],m[5] -> 6-bit unpack from ps[0..2] and ps[8..10]
+    // j=3: sc[6],sc[7],m[6],m[7] -> 6-bit unpack from ps[2..4] and ps[10..12]
     let (sc_lo, sc_hi, m_lo, m_hi) = if mw < 2 {
         let shift = mw * 16;  // j=0: bytes 0,1,4,5 (shift=0); j=1: bytes 2,3,6,7 (shift=16)
         let a = (ps0 >> shift) & 0x3F;
@@ -132,9 +132,9 @@ fn unpack_scales_6bit(ps0: u32, ps1: u32, ps2: u32, mw: u32) -> (f32, f32, f32, 
 mod kernels {
     use super::*;
 
-    /// Q4_K GEMV for M=1 decode: out[N] = dequant(packed[N, K_BLOCKS, 42]) × x[K].
+    /// Q4_K GEMV for M=1 decode: out[N] = dequant(packed[N, K_BLOCKS, 42]) x x[K].
     ///
-    /// Grid:  (ceil(N / WARPS_PER_BLOCK),) blocks — each warp owns one output neuron.
+    /// Grid:  (ceil(N / WARPS_PER_BLOCK),) blocks -- each warp owns one output neuron.
     /// Block: (WARPS_PER_BLOCK * 32,) threads.
     ///
     /// Fallback kernel: per-element stride-32 loop, no shfl.
@@ -239,14 +239,14 @@ mod kernels {
         let qs_shift = (lane % 4) * 8;
 
         // Each warp covers a stride-WARPS_PER_BLOCK subset of K blocks.
-        // Load restructuring: all 8 weight loads (d, dmin, sc, m, 4×qs) are
-        // independent of each other — hoist them ALL before any shuffle so the
+        // Load restructuring: all 8 weight loads (d, dmin, sc, m, 4xqs) are
+        // independent of each other -- hoist them ALL before any shuffle so the
         // GPU can issue them in parallel (one DRAM round-trip instead of three).
         // Software prefetch: pre-load next block's data during current block's
         // compute phase to hide DRAM latency across iterations.
 
         // Prime the prefetch registers with block warp_id data.
-        // Guard: warps with warp_id >= k_blocks have no valid first block —
+        // Guard: warps with warp_id >= k_blocks have no valid first block --
         // use a safe fallback address (block 0 of the same neuron) so Blackwell
         // doesn't trap on an out-of-bounds global load in a predicated instruction.
         let mut blk = warp_id;
@@ -286,7 +286,7 @@ mod kernels {
                 pre_qs_j3 = packed[(pre_base + 10 + 24 + lane / 4) as usize];
             }
 
-            // Compute: shuffle → FMA using current-block data.
+            // Compute: shuffle -> FMA using current-block data.
             // All loads above are already in-flight or completed.
             let d    = f32::from_bits(warp::shuffle(d_raw, 0));
             let dmin = f32::from_bits(warp::shuffle(dmin_raw, 0));
@@ -380,15 +380,15 @@ mod kernels {
         }
     }
 
-    /// Batched Q4_K GEMV: out[M, N] = dequant(packed[N, K_BLOCKS, 42]) × x[M, K].
+    /// Batched Q4_K GEMV: out[M, N] = dequant(packed[N, K_BLOCKS, 42]) x x[M, K].
     ///
-    /// Grid:  (N, M, 1) — blockIdx.x = output neuron, blockIdx.y = input row.
+    /// Grid:  (N, M, 1) -- blockIdx.x = output neuron, blockIdx.y = input row.
     /// Block: WARPS_PER_BLOCK * 32 threads.
     /// Shared memory: WARPS_PER_BLOCK * 4 bytes.
     ///
     /// Key benefit: all M blocks for the same blockIdx.x access the same weight
     /// data. When M blocks run concurrently (RTX 5090 has 170 SMs), the L2 cache
-    /// serves the weight data M× — effective bandwidth amortization.
+    /// serves the weight data Mx -- effective bandwidth amortization.
     #[kernel]
     pub fn q4k_gemv_dp4a_base_batch(
         mut out: DisjointSlice<f32>,  // [M * N] row-major
@@ -529,9 +529,9 @@ mod kernels {
         }
     }
 
-    /// Colocated batched Q4_K GEMV: all M rows in ONE block → same SM → L2 broadcast.
+    /// Colocated batched Q4_K GEMV: all M rows in ONE block -> same SM -> L2 broadcast.
     ///
-    /// Block: (WARPS_PER_BLOCK * 32 * M, 1, 1) — flat encoding of (row, warp, lane).
+    /// Block: (WARPS_PER_BLOCK * 32 * M, 1, 1) -- flat encoding of (row, warp, lane).
     ///   overall_warp = tid / 32
     ///   row     = overall_warp / WARPS_PER_BLOCK   (0..M)
     ///   warp_id = overall_warp % WARPS_PER_BLOCK   (0..WARPS_PER_BLOCK)
@@ -540,8 +540,8 @@ mod kernels {
     /// Grid: (ceil(N / WARPS_PER_BLOCK), 1, 1)
     ///
     /// Key: M warps with the same warp_id but different row values all run on the SAME SM.
-    /// They all access packed[n_out, blk, ...] simultaneously → GPU L2 cache broadcasts
-    /// the weight data to all M warps with a single DRAM fetch → M× bandwidth amortization.
+    /// They all access packed[n_out, blk, ...] simultaneously -> GPU L2 cache broadcasts
+    /// the weight data to all M warps with a single DRAM fetch -> Mx bandwidth amortization.
     ///
     /// smem: [M * WARPS_PER_BLOCK] f32 for cross-warp partial sum reduction.
     #[kernel]
@@ -569,7 +569,7 @@ mod kernels {
         let mut acc = 0.0_f32;
 
         // K-loop: warp_id strides WARPS_PER_BLOCK (same K-parallelism as v2).
-        // All M rows process the same base pointer for weight loads → L2 broadcast.
+        // All M rows process the same base pointer for weight loads -> L2 broadcast.
         let mut blk = warp_id;
         let mut pre_base     = (n_out * k_blocks + blk) * 42;
         let mut pre_d_raw    = if lane == 0 { packed[pre_base as usize] } else { 0 };
@@ -698,7 +698,7 @@ mod kernels {
         }
     }
 
-    /// Smem-tiled batched Q4_K GEMM: true M× bandwidth amortization.
+    /// Smem-tiled batched Q4_K GEMM: true Mx bandwidth amortization.
     ///
     /// Same structure as q4k_gemm_colocated but row-0 warps explicitly load
     /// weight K-block data into shared memory before compute. All M rows then
@@ -752,7 +752,7 @@ mod kernels {
             let base = (n_out * k_blocks + blk) * 42;
             let smem_blk = (warp_id * 42) as usize;
 
-            // ── Phase 1: row=0 warps load 42 u32s for this K-block into smem ──
+            // -- Phase 1: row=0 warps load 42 u32s for this K-block into smem --
             // 42 u32s loaded by 32 lanes in two passes (32 + 10 = 42).
             if row == 0 {
                 *smem_w.add(smem_blk + lane as usize) = packed[(base + lane) as usize];
@@ -763,7 +763,7 @@ mod kernels {
 
             thread::sync_threads();
 
-            // ── Phase 2: all rows compute using smem weight data ──────────────
+            // -- Phase 2: all rows compute using smem weight data --------------
             let d_src    = if lane == 0 { *smem_w.add(smem_blk) } else { 0 };
             let dmin_src = if lane == 0 { *smem_w.add(smem_blk + 1) } else { 0 };
             let d    = f32::from_bits(warp::shuffle(d_src, 0));
@@ -929,15 +929,15 @@ mod kernels {
     ///
     /// Two levels of parallelism:
     ///   K-level:       WARPS_PER_BLOCK warps stride across K blocks
-    ///                  (warp w handles blocks w, w+4, w+8, …)
+    ///                  (warp w handles blocks w, w+4, w+8, ...)
     ///   Element-level: 4 mini-warps of 8 lanes each handle one j-group (64 elements)
     ///                  via proper 4-element dp4a (sub_l loads 1 nibble u32 + 1 Q8 u32)
     ///
     /// Reduction:
-    ///   1. After K loop: 3-step XOR butterfly within each mini-warp (8 lanes → sub_l 0).
+    ///   1. After K loop: 3-step XOR butterfly within each mini-warp (8 lanes -> sub_l 0).
     ///   2. sub_l==0 writes to smem[warp_id*4 + mw].
     ///   3. sync_threads (unconditional).
-    ///   4. Warp 0 lane 0..3 reads all warp contributions for j-group j, sums → smem[j].
+    ///   4. Warp 0 lane 0..3 reads all warp contributions for j-group j, sums -> smem[j].
     ///   5. sync_threads (unconditional).
     ///   6. Warp 0 lane 0 sums smem[0..4] and writes out[n_out].
     ///
@@ -1009,7 +1009,7 @@ mod kernels {
             blk += WARPS_PER_BLOCK;
         }
 
-        // Stage 1: 3-step XOR butterfly within mini-warp (8 lanes → sub_l 0 holds sum).
+        // Stage 1: 3-step XOR butterfly within mini-warp (8 lanes -> sub_l 0 holds sum).
         acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 4);
         acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 2);
         acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 1);
@@ -1019,9 +1019,9 @@ mod kernels {
         if sub_l == 0 {
             unsafe { *smem.add((warp_id * 4 + mw) as usize) = acc; }
         }
-        thread::sync_threads(); // unconditional — all warps reach this
+        thread::sync_threads(); // unconditional -- all warps reach this
 
-        // Stage 3: warp 0 lane j accumulates j-th j-group across all warps → smem[j].
+        // Stage 3: warp 0 lane j accumulates j-th j-group across all warps -> smem[j].
         // Warps 1-3 are idle but must reach the next sync.
         if warp_id == 0 && lane < 4 {
             let j = lane;
@@ -1079,7 +1079,7 @@ mod kernels {
 
         let mut acc = 0.0_f32;
 
-        // ── Main double-block K-loop (VDR=2) ──────────────────────────────────
+        // -- Main double-block K-loop (VDR=2) ----------------------------------
         let mut blk = warp_id * 2;
         while blk + 1 < k_blocks {
             let base0 = (n_out * k_blocks + blk) * 42;
@@ -1151,7 +1151,7 @@ mod kernels {
             blk += WARPS_PER_BLOCK * 2;
         }
 
-        // ── Tail: single-block fallback for odd k_blocks ──────────────────────
+        // -- Tail: single-block fallback for odd k_blocks ----------------------
         while blk < k_blocks {
             let base = (n_out * k_blocks + blk) * 42;
             let d_raw    = if lane == 0 { packed[base as usize] } else { 0 };
@@ -1178,7 +1178,7 @@ mod kernels {
             blk += WARPS_PER_BLOCK * 2;
         }
 
-        // ── Reduction: identical to v2 ─────────────────────────────────────────
+        // -- Reduction: identical to v2 -----------------------------------------
         acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 4);
         acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 2);
         acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 1);
@@ -1212,15 +1212,15 @@ mod kernels {
     /// K-parallel Q4K+Q8_1 GEMV: 8 warps per block for 100% SM occupancy on large projections.
     ///
     /// Identical to q4k_gemv_decode_q8_v3 but with WARPS_PER_BLOCK_KPAR=8 warps per block.
-    /// ncu showed q4k_gemv_decode_q8_v3 on Q/O projections [4096×4096] at 68.8% occupancy:
-    ///   4096 blocks × 4 warps = 16384 warps / 170 SMs → 11 blocks/SM × 4 warps = 44 warps/SM.
+    /// ncu showed q4k_gemv_decode_q8_v3 on Q/O projections [4096x4096] at 68.8% occupancy:
+    ///   4096 blocks x 4 warps = 16384 warps / 170 SMs -> 11 blocks/SM x 4 warps = 44 warps/SM.
     /// With 8 warps/block:
-    ///   4096 blocks × 8 warps = 32768 warps / 170 SMs → capped at 64 warps/SM = 100%.
+    ///   4096 blocks x 8 warps = 32768 warps / 170 SMs -> capped at 64 warps/SM = 100%.
     ///
     /// For k_blocks=16: each warp handles exactly 2 k_blocks (warp_id*2, warp_id*2+1).
-    /// Smem: 8 warps × 4 mw slots = 32 f32 slots = 128 bytes (Blackwell predicated-smem safe).
+    /// Smem: 8 warps x 4 mw slots = 32 f32 slots = 128 bytes (Blackwell predicated-smem safe).
     ///
-    /// Grid:  (N, 1, 1) — one output neuron per block.
+    /// Grid:  (N, 1, 1) -- one output neuron per block.
     /// Block: WARPS_PER_BLOCK_KPAR * 32 = 256 threads.
     /// Shared memory: 32 * 4 = 128 bytes.
     #[kernel]
@@ -1246,7 +1246,7 @@ mod kernels {
 
         let mut acc = 0.0_f32;
 
-        // ── Main double-block K-loop (VDR=2) ──────────────────────────────────
+        // -- Main double-block K-loop (VDR=2) ----------------------------------
         let mut blk = warp_id * 2;
         while blk + 1 < k_blocks {
             let base0 = (n_out * k_blocks + blk) * 42;
@@ -1317,7 +1317,7 @@ mod kernels {
             blk += WARPS_PER_BLOCK_KPAR * 2;
         }
 
-        // ── Tail: single-block fallback for odd k_blocks ──────────────────────
+        // -- Tail: single-block fallback for odd k_blocks ----------------------
         while blk < k_blocks {
             let base = (n_out * k_blocks + blk) * 42;
             let d_raw    = if lane == 0 { packed[base as usize] } else { 0 };
@@ -1344,13 +1344,13 @@ mod kernels {
             blk += WARPS_PER_BLOCK_KPAR * 2;
         }
 
-        // ── Reduction: 8-warp cross-warp reduce via shared memory ──────────────
+        // -- Reduction: 8-warp cross-warp reduce via shared memory --------------
         // Mini-warp intra-reduce (XOR 4, 2, 1 within the 8-lane mini-warp).
         acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 4);
         acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 2);
         acc += warp::shuffle_xor_f32_sync(mini_mask, acc, 1);
 
-        // smem layout: [warp_id * 4 + mw] for warp_id 0..7, mw 0..3 → 32 slots = 128 bytes.
+        // smem layout: [warp_id * 4 + mw] for warp_id 0..7, mw 0..3 -> 32 slots = 128 bytes.
         // 128 bytes satisfies Blackwell predicated-smem safety (max speculative index = 31).
         let smem: *mut f32 = DynamicSharedArray::<f32>::get();
         if sub_l == 0 {
@@ -1384,8 +1384,8 @@ mod kernels {
     /// sharing the Q8_1 activation load between both GEMVs and applying SiLU inline.
     /// Halves activation DRAM traffic and kernel launches for FFN layers vs two GEMVs.
     ///
-    /// Grid:  (N, 1, 1) — one block per output neuron
-    /// Block: (WARPS_PER_BLOCK * 32, 1, 1) — 4 warps
+    /// Grid:  (N, 1, 1) -- one block per output neuron
+    /// Block: (WARPS_PER_BLOCK * 32, 1, 1) -- 4 warps
     /// Smem:  32 f32 slots (128 bytes): [0..16] gate partials, [16..32] up partials
     #[kernel]
     pub fn q4k_fused_silu_dp4a(
@@ -1412,7 +1412,7 @@ mod kernels {
         let mut gate_acc = 0.0_f32;
         let mut up_acc   = 0.0_f32;
 
-        // ── Main double-block K-loop (VDR=2): mirrors q4k_gemv_decode_q8_v3 ──────
+        // -- Main double-block K-loop (VDR=2): mirrors q4k_gemv_decode_q8_v3 ------
         let mut blk = warp_id * 2;
         while blk + 1 < k_blocks {
             let base0 = (n_out * k_blocks + blk) * 42;
@@ -1454,7 +1454,7 @@ mod kernels {
             let u1_lo   = x_qs[(q8b1_lo * 8 + sub_l) as usize];
             let u1_hi   = x_qs[(q8b1_hi * 8 + sub_l) as usize];
 
-            // Phase 2: Compute gate and up for block 0 — D deferred to post-sumf (llama.cpp pattern).
+            // Phase 2: Compute gate and up for block 0 -- D deferred to post-sumf (llama.cpp pattern).
             // Accumulate sumf_d (dot terms) and sumf_m (min terms) without the super-block scale D,
             // then apply D once: gate_acc += gd * sumf_d - gdmin * sumf_m.
             let d8_0_lo = f16_to_f32(x_ds[q8b0_lo as usize] & 0xFFFF);
@@ -1484,7 +1484,7 @@ mod kernels {
                        + d8_0_hi * (((um0 >> 8) & 0xFF) as f32) * (dp4a_s32(0x01010101, u0_hi, 0) as f32);
             up_acc += ud0 * usfd0 - udmin0 * usfm0;
 
-            // Phase 3: Compute gate and up for block 1 — D deferred to post-sumf.
+            // Phase 3: Compute gate and up for block 1 -- D deferred to post-sumf.
             let d8_1_lo = f16_to_f32(x_ds[q8b1_lo as usize] & 0xFFFF);
             let d8_1_hi = f16_to_f32(x_ds[q8b1_hi as usize] & 0xFFFF);
 
@@ -1515,7 +1515,7 @@ mod kernels {
             blk += WARPS_PER_BLOCK * 2;
         }
 
-        // ── Tail: single-block fallback for odd k_blocks ──────────────────────
+        // -- Tail: single-block fallback for odd k_blocks ----------------------
         while blk < k_blocks {
             let base = (n_out * k_blocks + blk) * 42;
 
@@ -1567,7 +1567,7 @@ mod kernels {
             blk += WARPS_PER_BLOCK * 2;
         }
 
-        // ── Mini-warp butterfly reduction for both accumulators ────────────────
+        // -- Mini-warp butterfly reduction for both accumulators ----------------
         gate_acc += warp::shuffle_xor_f32_sync(mini_mask, gate_acc, 4);
         gate_acc += warp::shuffle_xor_f32_sync(mini_mask, gate_acc, 2);
         gate_acc += warp::shuffle_xor_f32_sync(mini_mask, gate_acc, 1);
@@ -1575,7 +1575,7 @@ mod kernels {
         up_acc += warp::shuffle_xor_f32_sync(mini_mask, up_acc, 2);
         up_acc += warp::shuffle_xor_f32_sync(mini_mask, up_acc, 1);
 
-        // ── Cross-warp reduction via shared memory ─────────────────────────────
+        // -- Cross-warp reduction via shared memory -----------------------------
         // smem layout: [0..16] gate (warp_id*4+mw), [16..32] up (16+warp_id*4+mw)
         // Total 32 f32 slots = 128 bytes (same as v3 Blackwell safety budget).
         let smem: *mut f32 = DynamicSharedArray::<f32>::get();
@@ -1614,8 +1614,8 @@ mod kernels {
         }
     }
 
-    /// q4k_gemv_decode_q8_v3r — raw GGUF 36-u32 format variant of v3.
-    /// 36 u32 (144 bytes) per block vs 42 u32 (168 bytes) → 14% less DRAM.
+    /// q4k_gemv_decode_q8_v3r -- raw GGUF 36-u32 format variant of v3.
+    /// 36 u32 (144 bytes) per block vs 42 u32 (168 bytes) -> 14% less DRAM.
     #[kernel]
     pub fn q4k_gemv_dp4a_q8_raw(
         mut out: DisjointSlice<f32>,
@@ -1657,7 +1657,7 @@ mod kernels {
                 }
             }
 
-            // ── Phase 1: ALL loads for BOTH blocks upfront ─────────────────
+            // -- Phase 1: ALL loads for BOTH blocks upfront -----------------
             // u32[0] = f16 d | (f16 dmin << 16)
             let dd0 = if lane == 0 { packed[base0 as usize] } else { 0 };
             // u32[1..4] = 12 bytes of 6-bit packed scales
@@ -1681,7 +1681,7 @@ mod kernels {
             let u1_lo = x_qs[(q8b1_lo * 8 + sub_l) as usize];
             let u1_hi = x_qs[(q8b1_hi * 8 + sub_l) as usize];
 
-            // ── Phase 2: Compute block 0 ────────────────────────────────────
+            // -- Phase 2: Compute block 0 ------------------------------------
             let d0    = f16_to_f32(warp::shuffle(dd0, 0) & 0xFFFF);
             let dmin0 = f16_to_f32((warp::shuffle(dd0, 0) >> 16) & 0xFFFF);
             // Broadcast ps0/ps1/ps2 for block 0 to all sub_l within mini-warp
@@ -1700,7 +1700,7 @@ mod kernels {
                  + d8_0_hi * (d0 * sc_hi_0 * (dp4a_s32(v0_hi, u0_hi, 0) as f32)
                              - dmin0 * m_hi_0 * (dp4a_s32(0x01010101, u0_hi, 0) as f32));
 
-            // ── Phase 3: Compute block 1 ────────────────────────────────────
+            // -- Phase 3: Compute block 1 ------------------------------------
             let d1    = f16_to_f32(warp::shuffle(dd1, 0) & 0xFFFF);
             let dmin1 = f16_to_f32((warp::shuffle(dd1, 0) >> 16) & 0xFFFF);
             let ps0_1_bc = warp::shuffle_sync(mini_mask, ps0_1, base_lane);
@@ -1779,10 +1779,10 @@ mod kernels {
     /// Each sub-lane within a mini-warp processes 4 consecutive same-scale elements,
     /// enabling proper 4-element dp4a packing.
     ///
-    /// Mini-warp mw (lanes 8*mw .. 8*mw+7) → j-group mw:
+    /// Mini-warp mw (lanes 8*mw .. 8*mw+7) -> j-group mw:
     ///   sub_l 0..7: each loads one 4-nibble u32 and one Q8_1 u32, calls dp4a_s32.
     ///   After K loop: 3-step XOR reduce within mini-warp (all 8 lanes get the sum).
-    ///   Cross-mini-warp reduce via shared memory → write output.
+    ///   Cross-mini-warp reduce via shared memory -> write output.
     ///
     /// Grid:  ceil(N / WARPS_PER_BLOCK) blocks (one output neuron per warp).
     /// Block: WARPS_PER_BLOCK * 32 threads.
@@ -1804,8 +1804,8 @@ mod kernels {
         if n_out >= n { return; }
 
         // Mini-warp decomposition: 4 groups of 8 lanes, one per j-group.
-        let mw        = lane / 8;      // 0..3 — j-group this lane handles
-        let sub_l     = lane % 8;      // 0..7 — position within mini-warp
+        let mw        = lane / 8;      // 0..3 -- j-group this lane handles
+        let sub_l     = lane % 8;      // 0..7 -- position within mini-warp
         let mini_mask = 0xFF_u32 << (mw * 8);  // participation mask for this mini-warp
         let base_lane = mw * 8;        // global lane ID of sub_l=0 in this mini-warp
 
@@ -1850,7 +1850,7 @@ mod kernels {
             let u_lo = x_qs[(q8_blk_lo * 8 + sub_l) as usize];
             let u_hi = x_qs[(q8_blk_hi * 8 + sub_l) as usize];
 
-            // dp4a: 4 nibble×q8 products per instruction.
+            // dp4a: 4 nibblexq8 products per instruction.
             // nibble 0..15 fits signed i8; q8 values are signed i8.
             let sumi_d_lo = dp4a_s32(v_lo, u_lo, 0);
             let sumi_d_hi = dp4a_s32(v_hi, u_hi, 0);
@@ -1905,7 +1905,7 @@ mod kernels {
     }
 }
 
-// ── Host-side correctness test ────────────────────────────────────────────────
+// -- Host-side correctness test ------------------------------------------------
 
 fn main() {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
@@ -1922,7 +1922,7 @@ fn main() {
     // Build packed weights:
     //   d = 1.0, dmin = 0.0
     //   scales: all groups sc[g] = 1 (u8), m[g] = 0 (u8)
-    //   qs: all nibbles = 3 → packed byte = 0x33
+    //   qs: all nibbles = 3 -> packed byte = 0x33
     // Expected weight per element: 1.0 * 1.0 * 3 - 0.0 * 0.0 = 3.0
     // Expected output: sum over 256 elements of 3.0 * 1.0 = 768.0
     let packed_u32s = n * k_blocks * 42;
@@ -1939,7 +1939,7 @@ fn main() {
                 packed_host[base + 2 + j] = 0x00000101_u32;
                 packed_host[base + 6 + j] = 0x00000000_u32;
             }
-            // nibble=3: lo=3, hi=3, packed byte = 0x33 → u32 = 0x33333333
+            // nibble=3: lo=3, hi=3, packed byte = 0x33 -> u32 = 0x33333333
             for w in 0..32usize {
                 packed_host[base + 10 + w] = 0x33333333_u32;
             }
@@ -1966,12 +1966,12 @@ fn main() {
         grid_dim:  (n as u32, 1, 1),
         block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
         // Need 32 f32 slots (128 bytes): the reduction reads smem[lane] for all
-        // 32 lanes of warp 0 on Blackwell — predicated but LDSMEM still executes
+        // 32 lanes of warp 0 on Blackwell -- predicated but LDSMEM still executes
         // for lanes 4..31 and traps if smem is smaller than 32 f32s.
         shared_mem_bytes: 32 * 4,
     };
 
-    // ── Test 1: v1 and v2 both pass for nibble=3,sc=1,d=1,dmin=0 ──────────────
+    // -- Test 1: v1 and v2 both pass for nibble=3,sc=1,d=1,dmin=0 --------------
     unsafe {
         module.q4k_gemv_decode(
             stream.as_ref(), cfg, &mut out_dev, &x_dev, &p_dev, n as u32, k_blocks as u32,
@@ -2025,7 +2025,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    // ── Test 2: d=2.0, sc=3, nibble=4, dmin=0.5, m=2 ─────────────────────────
+    // -- Test 2: d=2.0, sc=3, nibble=4, dmin=0.5, m=2 -------------------------
     // weight = 2.0 * 3.0 * 4.0 - 0.5 * 2.0 = 24.0 - 1.0 = 23.0
     // sum over 256 elements = 256 * 23.0 = 5888.0
     let mut packed_host2 = vec![0u32; packed_u32s];
@@ -2102,7 +2102,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    // ── Test 3: multi-block (K_BLOCKS=4) ──────────────────────────────────────
+    // -- Test 3: multi-block (K_BLOCKS=4) --------------------------------------
     // weight = 1.0 * 2.0 * 5.0 - 0.0 = 10.0, sum = 256*4 * 10.0 = 10240.0
     let k_blocks3: usize = 4;
     let k3 = k_blocks3 * 256;
@@ -2180,7 +2180,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    // ── v3r correctness test: isolated raw GGUF 36-u32 vs packed 42-u32 ──────
+    // -- v3r correctness test: isolated raw GGUF 36-u32 vs packed 42-u32 ------
     // Creates data directly without going through the engine upload path.
     // d=1.0, dmin=0.0, sc[i]=1, m[i]=0, nibbles=3, Q8_1 q=1 d8=1.0
     // Expected per-neuron output: 768.0 (same as existing v1/v2 test 1)
@@ -2208,8 +2208,8 @@ fn main() {
         };
 
         // Raw GGUF 36-u32 for v3r
-        // ps[0..4]=[1,1,1,1] → sc[0..3]=1; ps[4..8]=[0,0,0,0] → m[0..3]=0;
-        // ps[8..12]=[1,1,1,1] → sc[4..7]=1, m[4..7]=0 (via 6-bit unpack)
+        // ps[0..4]=[1,1,1,1] -> sc[0..3]=1; ps[4..8]=[0,0,0,0] -> m[0..3]=0;
+        // ps[8..12]=[1,1,1,1] -> sc[4..7]=1, m[4..7]=0 (via 6-bit unpack)
         let packed_v3r_h: Vec<u32> = {
             let mut p = vec![0u32; n * k_blocks * 36];
             for row in 0..n {
@@ -2281,10 +2281,10 @@ fn main() {
         println!("oxide-gemv-q4k v3 vs v3r agreement: PASSED (max_diff={:.2e})", diff);
     }
 
-    // ── v3r paired-loop test: k_blocks=16 exercises the double-block paired loop ──
+    // -- v3r paired-loop test: k_blocks=16 exercises the double-block paired loop --
     // k_blocks=1 only tests the tail. Real models use k_blocks=16 (4096/256).
     // d=1.0, dmin=0.0, sc[i]=1, m[i]=0, nibbles=3, Q8_1 q=1 d8=1.0
-    // Expected: 16 blocks × 256 elements × 3.0 = 12288.0 per neuron
+    // Expected: 16 blocks x 256 elements x 3.0 = 12288.0 per neuron
     {
         let n: usize = 32;
         let k_blocks: usize = 16;
@@ -2317,9 +2317,9 @@ fn main() {
                 for blk in 0..k_blocks {
                     let base = (row * k_blocks + blk) * 36;
                     p[base]   = 0x00003C00u32;  // f16(1.0) | (f16(0.0) << 16)
-                    p[base+1] = 0x01010101u32;  // ps[0..4]=[1,1,1,1] → sc[0..3]=1
-                    p[base+2] = 0x00000000u32;  // ps[4..8]=[0,0,0,0] → m[0..3]=0
-                    p[base+3] = 0x01010101u32;  // ps[8..12]=[1,1,1,1] → sc[4..7]=1, m[4..7]=0
+                    p[base+1] = 0x01010101u32;  // ps[0..4]=[1,1,1,1] -> sc[0..3]=1
+                    p[base+2] = 0x00000000u32;  // ps[4..8]=[0,0,0,0] -> m[0..3]=0
+                    p[base+3] = 0x01010101u32;  // ps[8..12]=[1,1,1,1] -> sc[4..7]=1, m[4..7]=0
                     for w in 0..32usize { p[base+4+w] = 0x33333333; }
                 }
             }
@@ -2384,10 +2384,10 @@ fn main() {
         println!("oxide-gemv-q4k v3 vs v3r k_blocks=16 (paired loop): PASSED (max_diff={:.2e})", diff);
     }
 
-    // ── fused gate+up SiLU test: k_blocks=16 ────────────────────────────────
-    // Both gate and up weights: d=1.0, dmin=0.0, sc=1, m=0, nibbles=3 → GEMV=12288.0
-    // SiLU(12288) ≈ 12288 (sigmoid(large positive) ≈ 1.0)
-    // Expected output ≈ 12288 * 1.0 * 12288 = 150994944.0
+    // -- fused gate+up SiLU test: k_blocks=16 --------------------------------
+    // Both gate and up weights: d=1.0, dmin=0.0, sc=1, m=0, nibbles=3 -> GEMV=12288.0
+    // SiLU(12288) ~= 12288 (sigmoid(large positive) ~= 1.0)
+    // Expected output ~= 12288 * 1.0 * 12288 = 150994944.0
     {
         let n: usize = 32;
         let k_blocks: usize = 16;
@@ -2436,8 +2436,8 @@ fn main() {
 
         let r_fused = out_fused.to_host_vec(&stream).expect("fused download");
 
-        // Each GEMV = 16 blocks × 256 elements × 3.0 = 12288.0
-        // silu(12288) * 12288: sigmoid(12288) ≈ 1.0 → expected ≈ 12288^2 = 150994944
+        // Each GEMV = 16 blocks x 256 elements x 3.0 = 12288.0
+        // silu(12288) * 12288: sigmoid(12288) ~= 1.0 -> expected ~= 12288^2 = 150994944
         let gemv_val = (k_blocks * 256) as f32 * 3.0;
         let sigmoid_approx = 1.0_f32 / (1.0_f32 + (-gemv_val).exp());
         let expected_fused = gemv_val * sigmoid_approx * gemv_val;
@@ -2447,8 +2447,8 @@ fn main() {
                  expected_fused, e_fused, r_fused[0]);
 
         // Tolerance: 1.0 absolute (same as other tests) but proportionally it's
-        // very tight (12288^2 ≈ 1.5e8, so 1.0 is < 1e-7 relative).
-        // For sigmoid(large) ≈ 1.0, the rounding error is in FP32 dp4a accumulation.
+        // very tight (12288^2 ~= 1.5e8, so 1.0 is < 1e-7 relative).
+        // For sigmoid(large) ~= 1.0, the rounding error is in FP32 dp4a accumulation.
         // Use 1% relative tolerance: 1.5e6.
         let tol = expected_fused * 0.01;
         if e_fused > tol {
@@ -2459,7 +2459,7 @@ fn main() {
         println!("oxide-gemv-q4k fused_silu_mul k_blocks=16: PASSED (max_err={:.2e})", e_fused);
     }
 
-    // ── v3_kpar test: k_blocks=16, 8 warps per block ────────────────────────
+    // -- v3_kpar test: k_blocks=16, 8 warps per block ------------------------
     // Same inputs as the v3 k_blocks=16 test: expected=12288.0 per neuron.
     // Verifies the kpar kernel produces bit-identical results to v3.
     {
@@ -2491,7 +2491,7 @@ fn main() {
         let pv3_dev   = DeviceBuffer::from_host(&stream, &packed_v3_h).expect("kpar v3 upload");
         let mut out_kpar = DeviceBuffer::<f32>::zeroed(&stream, n).expect("out_kpar");
 
-        // kpar: 8 warps × 32 lanes = 256 threads/block; smem = 32 f32 = 128 bytes.
+        // kpar: 8 warps x 32 lanes = 256 threads/block; smem = 32 f32 = 128 bytes.
         let cfg_kpar = LaunchConfig {
             grid_dim: (n as u32, 1, 1),
             block_dim: (WARPS_PER_BLOCK_KPAR * 32, 1, 1),

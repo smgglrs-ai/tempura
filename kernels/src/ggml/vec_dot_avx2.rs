@@ -40,7 +40,7 @@ unsafe fn hsum_f32_8(v: __m256) -> f32 {
     _mm_cvtss_f32(sum32)
 }
 
-// ── Q4_0 × Q8_0 ───────────────────────────────────────────────────────────
+// -- Q4_0 x Q8_0 -----------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -72,7 +72,7 @@ pub unsafe fn vec_dot_q4_0_q8_0_avx2(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0])
         let by_hi =
             _mm256_cvtepi8_epi16(_mm_loadu_si128(y[ib].qs[16..].as_ptr() as *const __m128i));
 
-        // multiply and horizontal add: i16×i16 → i32
+        // multiply and horizontal add: i16xi16 -> i32
         let dot_lo = _mm256_madd_epi16(lo, by_lo);
         let dot_hi = _mm256_madd_epi16(hi, by_hi);
         let sum = _mm256_add_epi32(dot_lo, dot_hi);
@@ -82,7 +82,7 @@ pub unsafe fn vec_dot_q4_0_q8_0_avx2(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0])
     hsum_f32_8(acc)
 }
 
-// ── Q8_0 × Q8_0 ───────────────────────────────────────────────────────────
+// -- Q8_0 x Q8_0 -----------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -96,7 +96,7 @@ pub unsafe fn vec_dot_q8_0_q8_0_avx2(n: usize, x: &[BlockQ8_0], y: &[BlockQ8_0])
         let bx = _mm256_loadu_si256(x[ib].qs.as_ptr() as *const __m256i);
         let by = _mm256_loadu_si256(y[ib].qs.as_ptr() as *const __m256i);
 
-        // maddubs: treat bx as unsigned, by as signed → pairwise i16 products summed
+        // maddubs: treat bx as unsigned, by as signed -> pairwise i16 products summed
         // but bx is signed (i8) so we need to handle sign. Simpler: use madd_epi16 on i16
         let bx_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(bx));
         let bx_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(bx, 1));
@@ -112,7 +112,7 @@ pub unsafe fn vec_dot_q8_0_q8_0_avx2(n: usize, x: &[BlockQ8_0], y: &[BlockQ8_0])
     hsum_f32_8(acc)
 }
 
-// ── Q4_K × Q8_K ───────────────────────────────────────────────────────────
+// -- Q4_K x Q8_K -----------------------------------------------------------
 // Direct translation of ggml's AVX2 Q4K vec_dot: maddubs on nibbles,
 // scale applied via shuffle_epi8 inside madd_epi16 (no dequant buffer).
 
@@ -214,7 +214,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx2(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
         let mut sumi = _mm256_setzero_si256();
 
         for j in 0..4 {
-            // Safety: j < 4 → 2*j+1 < 8 == K_SHUFFLE_Q4K.len()
+            // Safety: j < 4 -> 2*j+1 < 8 == K_SHUFFLE_Q4K.len()
             let scale_l = _mm256_shuffle_epi8(
                 scales,
                 _mm256_loadu_si256(K_SHUFFLE_Q4K.get_unchecked(2 * j).as_ptr() as *const __m256i),
@@ -231,8 +231,8 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx2(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
             let q4l = _mm256_and_si256(q4bits, m4);
             let q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
 
-            // maddubs(u8 nibbles, i8 q8) → 16 i16 products
-            // then madd(i16 scale, i16 products) → 8 i32 scaled sums
+            // maddubs(u8 nibbles, i8 q8) -> 16 i16 products
+            // then madd(i16 scale, i16 products) -> 8 i32 scaled sums
             let q8l = _mm256_loadu_si256(q8.add(j * 64) as *const __m256i);
             let mut p16l = _mm256_maddubs_epi16(q4l, q8l);
             p16l = _mm256_madd_epi16(scale_l, p16l);
@@ -254,7 +254,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx2(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
     hsum_f32_8(acc) + _mm_cvtss_f32(acc_m)
 }
 
-// ── Q6_K × Q8_K ───────────────────────────────────────────────────────────
+// -- Q6_K x Q8_K -----------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -308,7 +308,7 @@ pub unsafe fn vec_dot_q6_k_q8_k_avx2(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -
     hsum_f32_8(acc)
 }
 
-// ── Quantize Q8_0 AVX2 ────────────────────────────────────────────────────
+// -- Quantize Q8_0 AVX2 ----------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -346,7 +346,7 @@ pub unsafe fn quantize_row_q8_0_avx2(src: &[f32], dst: &mut [BlockQ8_0]) {
         let r2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, mul));
         let r3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, mul));
 
-        // pack i32 → i16 → i8
+        // pack i32 -> i16 -> i8
         let r01 = _mm256_packs_epi32(r0, r1);
         let r23 = _mm256_packs_epi32(r2, r3);
         let r0123 = _mm256_packs_epi16(r01, r23);
@@ -371,7 +371,7 @@ unsafe fn hmax_f32_8(v: __m256) -> f32 {
     _mm_cvtss_f32(m32)
 }
 
-// ── Quantize Q8_K AVX2 ────────────────────────────────────────────────────
+// -- Quantize Q8_K AVX2 ----------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -448,7 +448,7 @@ pub unsafe fn quantize_row_q8_k_avx2(src: &[f32], dst: &mut [BlockQ8K]) {
             let v = _mm_loadu_si128(dst[i].qs[base..].as_ptr() as *const __m128i);
             let lo = _mm256_cvtepi8_epi16(v);
             let ones = _mm256_set1_epi16(1);
-            let sums = _mm256_madd_epi16(lo, ones); // pairwise sum → 8 i32
+            let sums = _mm256_madd_epi16(lo, ones); // pairwise sum -> 8 i32
             dst[i].bsums[j] = hsum_i32_8(sums) as i16;
         }
 
@@ -456,8 +456,8 @@ pub unsafe fn quantize_row_q8_k_avx2(src: &[f32], dst: &mut [BlockQ8K]) {
     }
 }
 
-// ── VNNI variants (AVX-VNNI: _mm256_dpbusd_epi32) ──────────────────────────
-// dpbusd does u8×i8→i32 accumulate across 4 byte pairs per lane in one instruction,
+// -- VNNI variants (AVX-VNNI: _mm256_dpbusd_epi32) --------------------------
+// dpbusd does u8xi8->i32 accumulate across 4 byte pairs per lane in one instruction,
 // replacing the maddubs_epi16 + madd_epi16 two-step chain.
 
 #[cfg(target_arch = "x86_64")]
@@ -473,7 +473,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
     let x_ptr = x.as_ptr();
     let y_ptr = y.as_ptr();
 
-    // Scale/min bitmask constants — same as AVX2 path.
+    // Scale/min bitmask constants -- same as AVX2 path.
     const KMASK1: u32 = 0x3f3f3f3f;
     const KMASK2: u32 = 0x0f0f0f0f;
     const KMASK3: u32 = 0x03030303;
@@ -486,7 +486,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
         let d = f16_to_f32(xi.d) * yi.d;
         let dmin = f16_to_f32(xi.dmin) * yi.d;
 
-        // Vectorized scale/min extraction (replaces 8× get_scale_min_k4 scalar calls).
+        // Vectorized scale/min extraction (replaces 8x get_scale_min_k4 scalar calls).
         // After the bit ops: utmp[0]=sc[0..3], utmp[1]=sc[4..7], utmp[2]=mn[0..3], utmp[3]=mn[4..7]
         let mut utmp = [0u32; 4];
         std::ptr::copy_nonoverlapping(xi.scales.as_ptr(), utmp.as_mut_ptr() as *mut u8, 12);
@@ -497,7 +497,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
         utmp[0] &= KMASK1;
 
         // SIMD mins accumulation: sum_{j=0..15} bsums[j] * mn[j/2]
-        // hadd pairs bsums 16→8, madd dot with 8 mins → 4 i32, then hsum.
+        // hadd pairs bsums 16->8, madd dot with 8 mins -> 4 i32, then hsum.
         let q8sums = _mm256_loadu_si256(yi.bsums.as_ptr() as *const __m256i);
         let q8s = _mm_hadd_epi16(
             _mm256_castsi256_si128(q8sums),
@@ -562,7 +562,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni_pair(
     let x1_ptr = x1.as_ptr();
     let y_ptr = y.as_ptr();
 
-    // Scale/min bitmask constants — same as AVX2 path.
+    // Scale/min bitmask constants -- same as AVX2 path.
     const KMASK1: u32 = 0x3f3f3f3f;
     const KMASK2: u32 = 0x0f0f0f0f;
     const KMASK3: u32 = 0x03030303;
@@ -593,7 +593,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni_pair(
         utmp1[2] = uaux1;
         utmp1[0] &= KMASK1;
 
-        // Shared bsums hadd — computed ONCE for both rows.
+        // Shared bsums hadd -- computed ONCE for both rows.
         let q8sums = _mm256_loadu_si256(yi.bsums.as_ptr() as *const __m256i);
         let q8s = _mm_hadd_epi16(
             _mm256_castsi256_si128(q8sums),
@@ -671,7 +671,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_vnni_pair(
     )
 }
 
-/// Dispatch pair dot product — uses VNNI when available, falls back to two scalar calls.
+/// Dispatch pair dot product -- uses VNNI when available, falls back to two scalar calls.
 #[inline(always)]
 #[allow(unreachable_code)]
 pub fn vec_dot_q4_k_q8_k_dispatch_pair(
@@ -690,9 +690,9 @@ pub fn vec_dot_q4_k_q8_k_dispatch_pair(
     )
 }
 
-/// Compute 4×2 output block: 4 activation rows × 2 weight rows = 8 outputs.
+/// Compute 4x2 output block: 4 activation rows x 2 weight rows = 8 outputs.
 /// Q4K nibbles for both weight rows are loaded once per sub-block and reused across all 4
-/// activation rows, achieving 4× better activation reuse than the pair kernel.
+/// activation rows, achieving 4x better activation reuse than the pair kernel.
 /// Returns `results[r][w] = dot(a_r, w_w)`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni")]
@@ -724,7 +724,7 @@ pub unsafe fn vec_dot_q4k_q8k_4x2_vnni(
         let w0i = &*w0_ptr.add(i);
         let w1i = &*w1_ptr.add(i);
 
-        // Vectorized scale/min extraction — replaces 2×8 get_scale_min_k4 scalar calls.
+        // Vectorized scale/min extraction -- replaces 2x8 get_scale_min_k4 scalar calls.
         let d0 = f16_to_f32(w0i.d);
         let dmin0 = f16_to_f32(w0i.dmin);
         let mut utmp0 = [0u32; 4];
@@ -758,7 +758,7 @@ pub unsafe fn vec_dot_q4k_q8k_4x2_vnni(
         let q8_ptrs: [*const i8; 4] =
             std::array::from_fn(|r| (*a_ptrs[r].add(i)).qs.as_ptr());
 
-        // SIMD mins correction for each activation × weight row pair.
+        // SIMD mins correction for each activation x weight row pair.
         for r in 0..4 {
             let d_y = d_ys[r];
             let mins0_128 = _mm_set_epi32(0, 0, utmp0[3] as i32, utmp0[2] as i32);
@@ -773,7 +773,7 @@ pub unsafe fn vec_dot_q4k_q8k_4x2_vnni(
         let mut sumi = [[_mm256_setzero_si256(), _mm256_setzero_si256()]; 4];
 
         for j in 0..4 {
-            // Q4K nibbles for w0 and w1 — loaded ONCE, reused across all 4 activation rows.
+            // Q4K nibbles for w0 and w1 -- loaded ONCE, reused across all 4 activation rows.
             let q4_chunk0 = _mm256_loadu_si256(w0i.qs.as_ptr().add(j * 32) as *const __m256i);
             let q4_lo0 = _mm256_and_si256(q4_chunk0, mask_lo);
             let q4_hi0 = _mm256_and_si256(_mm256_srli_epi16(q4_chunk0, 4), mask_lo);
@@ -835,7 +835,7 @@ pub unsafe fn vec_dot_q4k_q8k_4x2_vnni(
     result
 }
 
-/// Dispatch 4×2 block kernel. Uses VNNI when available, falls back to four pair calls.
+/// Dispatch 4x2 block kernel. Uses VNNI when available, falls back to four pair calls.
 /// Returns `results[r][w] = dot(a_r, w_w)` for r in 0..4, w in 0..2.
 #[inline(always)]
 #[allow(unreachable_code)]
@@ -884,7 +884,7 @@ pub unsafe fn vec_dot_q4_0_q8_0_vnni(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0])
 
         let q8_bytes = _mm256_loadu_si256(y[ib].qs.as_ptr() as *const __m256i);
 
-        // dpbusd needs unsigned first arg — but q4_bytes is signed (-8..7).
+        // dpbusd needs unsigned first arg -- but q4_bytes is signed (-8..7).
         // Use sign trick: abs(q4) * sign(q4) * q8 = abs(q4) * (q8 * sign(q4))
         let q4_sign = _mm256_sign_epi8(q4_bytes, q4_bytes);
         let q8_signed = _mm256_sign_epi8(q8_bytes, q4_bytes);
@@ -895,11 +895,11 @@ pub unsafe fn vec_dot_q4_0_q8_0_vnni(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0])
     hsum_f32_8(acc)
 }
 
-// ── True 512-bit VNNI variant ─────────────────────────────────────────────
+// -- True 512-bit VNNI variant ---------------------------------------------
 // Processes Q4K sub-block pairs using 512-bit dpbusd: one call handles 64 Q8K
-// bytes instead of 32, halving dpbusd instruction count per block (4 × 512-bit
-// vs 8 × 256-bit). Q8K bytes are non-contiguous within a pair (lo and hi halves
-// interleaved), so 4 × 256-bit loads build the 512-bit Q8K operands via
+// bytes instead of 32, halving dpbusd instruction count per block (4 x 512-bit
+// vs 8 x 256-bit). Q8K bytes are non-contiguous within a pair (lo and hi halves
+// interleaved), so 4 x 256-bit loads build the 512-bit Q8K operands via
 // vinserti64x4 before each pair of dpbusd calls.
 //
 // Scale groups: each 512-bit dpbusd covers two sub-blocks with independent
@@ -917,7 +917,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K])
     let mask_lo = _mm512_set1_epi8(0x0F_i8);
     let zero512 = _mm512_setzero_si512();
 
-    // Two independent f32 accumulators — hides mullo_epi32 latency between iterations.
+    // Two independent f32 accumulators -- hides mullo_epi32 latency between iterations.
     let mut acc0 = _mm256_setzero_ps();
     let mut acc1 = _mm256_setzero_ps();
     let mut mins_total = 0.0f32;
@@ -1005,7 +1005,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K])
         }};
     }
 
-    // 2× unrolled: process pairs of blocks into independent acc0/acc1.
+    // 2x unrolled: process pairs of blocks into independent acc0/acc1.
     // The CPU can pipeline block (i+1)'s loads/VNNI while block i's mullo chain drains.
     let mut i = 0;
     while i + 1 < nb {
@@ -1015,7 +1015,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K])
         acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(sumi1), acc1);
         i += 2;
     }
-    // Tail (nb=16 for decode → always 0; kept for correctness with odd nb).
+    // Tail (nb=16 for decode -> always 0; kept for correctness with odd nb).
     while i < nb {
         let (d, sumi) = block_compute!(i, mins_total);
         acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc0);
@@ -1025,7 +1025,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K])
     hsum_f32_8(_mm256_add_ps(acc0, acc1)) - mins_total
 }
 
-// ── AVX-512 4×4 micro-tile: 4 act rows × 4 weight rows = 16 outputs ──────
+// -- AVX-512 4x4 micro-tile: 4 act rows x 4 weight rows = 16 outputs ------
 //
 // Uses 32 ZMM registers without spilling:
 //   16 YMM (lower halves of zmm0-zmm15) for sumi[4][4] int accumulators
@@ -1034,7 +1034,7 @@ pub unsafe fn vec_dot_q4_k_q8_k_avx512(n: usize, x: &[BlockQ4K], y: &[BlockQ8K])
 //   = 32 ZMM total
 //
 // Each 512-bit dpbusd covers two sub-blocks (64 elements) vs one (32) in the
-// 256-bit kernel, halving dot-product instruction count vs the 4×2 VNNI kernel.
+// 256-bit kernel, halving dot-product instruction count vs the 4x2 VNNI kernel.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx512dq")]
 pub unsafe fn vec_dot_q4k_q8k_avx512_4x4(
@@ -1107,7 +1107,7 @@ pub unsafe fn vec_dot_q4k_q8k_avx512_4x4(
         // 16 integer sumi accumulators, reset per block.
         let mut sumi = [[_mm256_setzero_si256(); 4]; 4];
 
-        // ── Sub-block pair 01 ──────────────────────────────────────────────
+        // -- Sub-block pair 01 ----------------------------------------------
         // Q4K nibble bytes 0..63: sub-blocks j=0 (bytes 0-31) and j=1 (bytes 32-63).
         // Scales from utmp[w][0]: sc0=(b0&0xFF), sc1=(b0>>8), sc2=(b0>>16), sc3=(b0>>24).
         for w in 0..4usize {
@@ -1147,7 +1147,7 @@ pub unsafe fn vec_dot_q4k_q8k_avx512_4x4(
             }
         }
 
-        // ── Sub-block pair 23 ──────────────────────────────────────────────
+        // -- Sub-block pair 23 ----------------------------------------------
         // Q4K nibble bytes 64..127: sub-blocks j=2 (bytes 64-95) and j=3 (bytes 96-127).
         // Scales from utmp[w][1]: sc4=(b1&0xFF), sc5=(b1>>8), sc6=(b1>>16), sc7=(b1>>24).
         for w in 0..4usize {
@@ -1206,8 +1206,8 @@ pub unsafe fn vec_dot_q4k_q8k_avx512_4x4(
     result
 }
 
-/// Dispatch 4×4 block kernel: 4 activation rows × 4 weight rows = 16 outputs.
-/// Uses AVX-512 4×4 kernel when available; falls back to two 4×2 calls.
+/// Dispatch 4x4 block kernel: 4 activation rows x 4 weight rows = 16 outputs.
+/// Uses AVX-512 4x4 kernel when available; falls back to two 4x2 calls.
 /// Returns `results[r][w] = dot(a_r, w_w)` for r in 0..4, w in 0..4.
 #[inline(always)]
 #[allow(unreachable_code)]
@@ -1231,7 +1231,7 @@ pub fn vec_dot_q4k_q8k_dispatch_4x4(
     {
         return unsafe { vec_dot_q4k_q8k_avx512_4x4(n, w0, w1, w2, w3, a0, a1, a2, a3) };
     }
-    // Fallback: two 4×2 calls (w0+w1, w2+w3).
+    // Fallback: two 4x2 calls (w0+w1, w2+w3).
     let r01 = vec_dot_q4k_q8k_dispatch_4x2(n, w0, w1, a0, a1, a2, a3);
     let r23 = vec_dot_q4k_q8k_dispatch_4x2(n, w2, w3, a0, a1, a2, a3);
     [
@@ -1242,7 +1242,7 @@ pub fn vec_dot_q4k_q8k_dispatch_4x4(
     ]
 }
 
-// ── Runtime dispatch ───────────────────────────────────────────────────────
+// -- Runtime dispatch -------------------------------------------------------
 
 #[allow(unreachable_code)]
 pub fn vec_dot_q4_0_q8_0_dispatch(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
@@ -1321,8 +1321,8 @@ pub unsafe fn vec_dot_q6_k_q8_k_vnni(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -
         let sc = xi.scales.as_ptr();
         let q8 = yi.qs.as_ptr();
 
-        // Vectorized 6-bit dequant → 8 AVX2 registers of 32 i8 each.
-        // Each half: ql[ql_off..ql_off+64] + qh[qh_off..qh_off+32] → a[a_base..a_base+4].
+        // Vectorized 6-bit dequant -> 8 AVX2 registers of 32 i8 each.
+        // Each half: ql[ql_off..ql_off+64] + qh[qh_off..qh_off+32] -> a[a_base..a_base+4].
         // srli_epi16/slli_epi16 operate on 16-bit lanes; mask_hi2 (0x03) removes
         // inter-byte spillover from the right shifts before the left shift.
         let mut a = [_mm256_setzero_si256(); 8];
@@ -1354,7 +1354,7 @@ pub unsafe fn vec_dot_q6_k_q8_k_vnni(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -
         }
 
         // 8-iteration full 256-bit VNNI: each pass covers 32 elements (2 scale groups of 16).
-        // Lower 128 bits of dot → group j*2, upper 128 bits → group j*2+1.
+        // Lower 128 bits of dot -> group j*2, upper 128 bits -> group j*2+1.
         let mut sumi = 0i32;
         for j in 0..8usize {
             let sc0 = *sc.add(j * 2) as i32;
@@ -1539,7 +1539,7 @@ pub fn vec_dot_q6_k_q8_k_dispatch_pair(
     )
 }
 
-// ── Q4Kx8 8-row GEMV ──────────────────────────────────────────────────────
+// -- Q4Kx8 8-row GEMV ------------------------------------------------------
 
 /// AVX2 GEMV: one Q8K activation row dotted against 8 Q4K weight rows simultaneously.
 ///
@@ -1548,7 +1548,7 @@ pub fn vec_dot_q6_k_q8_k_dispatch_pair(
 ///
 /// Returns `[f32; 8]` where output[r] = dot(weight_row[r], activation).
 ///
-/// Matches llama.cpp `ggml_gemv_q4_K_8x8_q8_K` — uses maddubs+blend+shuffle to
+/// Matches llama.cpp `ggml_gemv_q4_K_8x8_q8_K` -- uses maddubs+blend+shuffle to
 /// compute all 8 rows in one pass, sharing activation loads across the group.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c")]
@@ -1557,13 +1557,13 @@ pub unsafe fn gemv_q4k_8x8_avx2(
     packed: &[super::blocks::BlockQ4Kx8],
     act: &[BlockQ8K],
 ) -> [f32; 8] {
-    // Rearranges [d0,d1,...,d7] → [d0,d4,d1,d5,d2,d6,d3,d7] to match iacc_b row order.
+    // Rearranges [d0,d1,...,d7] -> [d0,d4,d1,d5,d2,d6,d3,d7] to match iacc_b row order.
     let deltamask =
         _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0i8);
     // Duplicates each of the 8 scale bytes for madd_epi16 pairs.
     let scalemask =
         _mm_set_epi8(7, 7, 3, 3, 6, 6, 2, 2, 5, 5, 1, 1, 4, 4, 0, 0i8);
-    // Final permute restores row order [r0,r4,r1,r5,r2,r6,r3,r7] → [r0..r7].
+    // Final permute restores row order [r0,r4,r1,r5,r2,r6,r3,r7] -> [r0..r7].
     let finalpermutemask = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
     let m4b = _mm256_set1_epi8(0x0F_u8 as i8);
 
@@ -1592,7 +1592,7 @@ pub unsafe fn gemv_q4k_8x8_avx2(
         let mut iacc_b = _mm256_setzero_si256();
         let mut iacc_min_b = _mm256_setzero_si256();
 
-        // Compute hadd of Q8K bsums (16 i16 → 8 i16 pairwise sums), then broadcast to both
+        // Compute hadd of Q8K bsums (16 i16 -> 8 i16 pairwise sums), then broadcast to both
         // 128-bit halves. This gives 8 i16 sum-of-pairs values used for min correction.
         let q8sums = _mm256_loadu_si256(y.bsums.as_ptr() as *const __m256i);
         let q8s_128 = _mm_hadd_epi16(
@@ -1623,7 +1623,7 @@ pub unsafe fn gemv_q4k_8x8_avx2(
                 12,
             );
 
-            // Decode packed 6-bit scales/mins — same KMASK logic as standard Q4K but
+            // Decode packed 6-bit scales/mins -- same KMASK logic as standard Q4K but
             // applied across rows: utmp[0]=sc[r0..r3], utmp[1]=sc[r4..r7],
             // utmp[2]=min[r0..r3], utmp[3]=min[r4..r7].
             utmp_0[3] = ((utmp_0[2] >> 4) & KMASK2) | (((utmp_0[1] >> 6) & KMASK3) << 4);
@@ -1664,7 +1664,7 @@ pub unsafe fn gemv_q4k_8x8_avx2(
 
             // Load 8 weight nibble chunks (32 bytes each) for this sub-block pair.
             // Layout: [r0123_chunk0, r4567_chunk0, r0123_chunk1, r4567_chunk1, ...]
-            // r0123_chunkN = rows 0-3, nibble bytes N*8..(N+1)*8 each (8 bytes × 4 rows = 32 bytes).
+            // r0123_chunkN = rows 0-3, nibble bytes N*8..(N+1)*8 each (8 bytes x 4 rows = 32 bytes).
             let base = p.qs.as_ptr().add(sb * 256);
             let raw_0 = _mm256_loadu_si256(base as *const __m256i); // r0-3, bytes 0-7
             let raw_1 = _mm256_loadu_si256(base.add(32) as *const __m256i); // r4-7, bytes 0-7
@@ -1694,7 +1694,7 @@ pub unsafe fn gemv_q4k_8x8_avx2(
             let hi6 = _mm256_and_si256(_mm256_srli_epi16(raw_6, 4), m4b);
             let hi7 = _mm256_and_si256(_mm256_srli_epi16(raw_7, 4), m4b);
 
-            // Load activation bytes for this sb (64 bytes total, split into 4 × 16-byte chunks
+            // Load activation bytes for this sb (64 bytes total, split into 4 x 16-byte chunks
             // broadcast to 256 bits each so every row sees the same activation data).
             let q8_base = y.qs.as_ptr().add(sb * 64) as *const i8;
             let lhs_00 = {
@@ -1720,7 +1720,7 @@ pub unsafe fn gemv_q4k_8x8_avx2(
                 _mm256_permute2f128_si256(v, v, 0)
             };
 
-            // Compute iacc_0: lower sub-block (lo nibbles × activation bytes 0..63).
+            // Compute iacc_0: lower sub-block (lo nibbles x activation bytes 0..63).
             //
             // The blend+shuffle pattern interleaves rows 0-3 with rows 4-7 into the
             // 8 epi32 slots of the 256-bit register. After madd_epi16 with scales_0,
@@ -1789,7 +1789,7 @@ pub unsafe fn gemv_q4k_8x8_avx2(
             );
             iacc_0 = _mm256_madd_epi16(iacc_0, scales_0);
 
-            // Compute iacc_1: upper sub-block (hi nibbles × activation bytes 32..63).
+            // Compute iacc_1: upper sub-block (hi nibbles x activation bytes 32..63).
             let mut iacc_1 = _mm256_setzero_si256();
 
             iacc_1 = _mm256_add_epi16(
@@ -1889,20 +1889,20 @@ pub unsafe fn gemv_q4k_8x8_avx2(
     out
 }
 
-/// 8-simultaneous-row Q4K×Q8K GEMV using AVX-VNNI `dpbusd`.
+/// 8-simultaneous-row Q4KxQ8K GEMV using AVX-VNNI `dpbusd`.
 ///
 /// Replaces the maddubs+madd_epi16 chain of `gemv_q4k_8x8_avx2` with `dpbusd`+`mullo_epi32`,
 /// eliminating intermediate i16 overflow risk and saving one instruction per 4-element group
 /// on VNNI-capable CPUs (Zen 5, Intel Alder Lake+). Uses the same `BlockQ4Kx8` (8-byte
-/// interleave) weight format — no re-packing required.
+/// interleave) weight format -- no re-packing required.
 ///
 /// Algorithm per block:
 ///   For each sub-block (4 per block, each covering 32 nibble bytes per row):
 ///     For each raw pair (4 pairs of 32-byte chunks), covering 8 nibble bytes per row:
-///       unpacklo_epi32(raw_lo_0, raw_lo_1) → interleaves rows [0,4,2,6] in i32 slots
-///       unpackhi_epi32(raw_lo_0, raw_lo_1) → rows [1,5,3,7]
-///       dpbusd with broadcast activation [a0..3, a0..3, a4..7, a4..7] × both halves
-///     Collapse with permutevar8x32 + hadd_epi32 → per-row i32 in [r0,r4,r1,r5,...] order
+///       unpacklo_epi32(raw_lo_0, raw_lo_1) -> interleaves rows [0,4,2,6] in i32 slots
+///       unpackhi_epi32(raw_lo_0, raw_lo_1) -> rows [1,5,3,7]
+///       dpbusd with broadcast activation [a0..3, a0..3, a4..7, a4..7] x both halves
+///     Collapse with permutevar8x32 + hadd_epi32 -> per-row i32 in [r0,r4,r1,r5,...] order
 ///     Apply per-row scale via mullo_epi32
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni")]
@@ -1912,12 +1912,12 @@ pub unsafe fn gemv_q4k_8x8_vnni(
     act: &[BlockQ8K],
 ) -> [f32; 8] {
     // Permute to collapse paired i32 accumulators: acc = [ra, rb, ra', rb', rc, rd, rc', rd']
-    // → [ra, ra', rb, rb', rc, rc', rd, rd'] so hadd produces per-row sums.
+    // -> [ra, ra', rb, rb', rc, rc', rd, rd'] so hadd produces per-row sums.
     let perm_collapse = _mm256_set_epi32(7, 5, 6, 4, 3, 1, 2, 0);
     // Reorder min correction from natural [r0..r7] to interleaved [r0,r4,r1,r5,...] order
     // so the same finalpermutemask correctly produces [r0..r7] for both dot and min.
     let perm_min_reorder = _mm256_set_epi32(7, 3, 6, 2, 5, 1, 4, 0);
-    // Final permute: [r0,r4,r1,r5,r2,r6,r3,r7] → [r0..r7].
+    // Final permute: [r0,r4,r1,r5,r2,r6,r3,r7] -> [r0..r7].
     let finalpermutemask = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
     let deltamask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0i8);
 
@@ -1961,7 +1961,7 @@ pub unsafe fn gemv_q4k_8x8_vnni(
         );
 
         for sb in 0..4usize {
-            // Extract and decode scale/min bytes for this sub-block pair — identical to avx2.
+            // Extract and decode scale/min bytes for this sub-block pair -- identical to avx2.
             let mut utmp_0 = [0u32; 4];
             let mut utmp_1 = [0u32; 4];
             std::ptr::copy_nonoverlapping(
@@ -2060,7 +2060,7 @@ pub unsafe fn gemv_q4k_8x8_vnni(
                 let hi_up0 = _mm256_unpacklo_epi32(hi_0, hi_1);
                 let hi_up1 = _mm256_unpackhi_epi32(hi_0, hi_1);
 
-                // Activation for lo nibbles: 8 bytes broadcast as [a0..3, a0..3, a4..7, a4..7] × 2.
+                // Activation for lo nibbles: 8 bytes broadcast as [a0..3, a0..3, a4..7, a4..7] x 2.
                 // lo nibble byte j of a row pairs with Q8K[j] = y.qs[sb*64 + i*8 + j%8].
                 let act_lo_xmm =
                     _mm_loadl_epi64(y.qs.as_ptr().add(sb * 64 + i * 8) as *const __m128i);
@@ -2081,8 +2081,8 @@ pub unsafe fn gemv_q4k_8x8_vnni(
             }
 
             // Collapse: acc0_lo = [r0a, r4a, r0b, r4b, r2a, r6a, r2b, r6b] (a=first4 bytes, b=second4).
-            // perm_collapse → [r0a, r0b, r4a, r4b, r2a, r2b, r6a, r6b].
-            // hadd(perm(acc0), perm(acc1)) → [r0, r4, r1, r5, r2, r6, r3, r7] (per-row sums).
+            // perm_collapse -> [r0a, r0b, r4a, r4b, r2a, r2b, r6a, r6b].
+            // hadd(perm(acc0), perm(acc1)) -> [r0, r4, r1, r5, r2, r6, r3, r7] (per-row sums).
             let acc_lo = _mm256_hadd_epi32(
                 _mm256_permutevar8x32_epi32(acc0_lo, perm_collapse),
                 _mm256_permutevar8x32_epi32(acc1_lo, perm_collapse),
@@ -2133,7 +2133,7 @@ pub unsafe fn gemv_q4k_8x8_vnni(
     out
 }
 
-/// Dispatch: 8-wide Q4K×Q8K GEMV. Prefers VNNI (dpbusd) on capable CPUs, falls back to
+/// Dispatch: 8-wide Q4KxQ8K GEMV. Prefers VNNI (dpbusd) on capable CPUs, falls back to
 /// AVX2+F16C (maddubs), then scalar.
 #[inline(always)]
 #[allow(unreachable_code)]
@@ -2193,7 +2193,7 @@ pub fn gemv_q4k_8x8_scalar(
             let mut sumi = 0i32;
             let mut mins_sum = 0i32;
 
-            // Compute bsums for this block (pair of adjacent bsums → per-scale-group sum).
+            // Compute bsums for this block (pair of adjacent bsums -> per-scale-group sum).
             let bsums: Vec<i32> = (0..8)
                 .map(|k| y.bsums[2 * k] as i32 + y.bsums[2 * k + 1] as i32)
                 .collect();
@@ -2234,7 +2234,7 @@ pub fn gemv_q4k_8x8_scalar(
                 // Min correction for this sb pair.
                 mins_sum += mn_lo * bsums[2 * sb] + mn_hi * bsums[2 * sb + 1];
 
-                // Nibble dot product for lower sub-block (lo nibbles × act[sb*64..+32]).
+                // Nibble dot product for lower sub-block (lo nibbles x act[sb*64..+32]).
                 let qs_base = sb * 32;
                 let q8_base = sb * 64;
                 for k in 0..32usize {
@@ -2242,7 +2242,7 @@ pub fn gemv_q4k_8x8_scalar(
                     let lo = (nibble & 0x0F) as i32;
                     sumi += sc_lo * lo * (y.qs[q8_base + k] as i32);
                 }
-                // Upper sub-block (hi nibbles × act[sb*64+32..+64]).
+                // Upper sub-block (hi nibbles x act[sb*64+32..+64]).
                 for k in 0..32usize {
                     let nibble = row_qs[r][qs_base + k];
                     let hi = (nibble >> 4) as i32;
@@ -2256,13 +2256,13 @@ pub fn gemv_q4k_8x8_scalar(
     results
 }
 
-/// Scalar 4-activation × 8-weight-row GEMM for Q4Kx8 weights and Q8Kx4 activations.
+/// Scalar 4-activation x 8-weight-row GEMM for Q4Kx8 weights and Q8Kx4 activations.
 ///
 /// Translates `ggml_gemm_q4_K_8x8_q8_K_generic` (blocklen=8) from llama.cpp exactly.
 ///
 /// - `packed_w`: `(nc/8) * nb` entries, weight rows pre-packed via `repack_q4k_to_q4kx8`
 /// - `packed_a`: `(nr/4) * nb` entries, activations pre-packed via `quantize_mat_q8k_4x8`
-/// - `output`:   `nr × nc` f32 matrix, row-major
+/// - `output`:   `nr x nc` f32 matrix, row-major
 /// - `nr`:       activation rows, must be a multiple of 4
 /// - `nc`:       weight rows, must be a multiple of 8
 /// - `nb`:       K-blocks per row (k / 256)
@@ -2381,7 +2381,7 @@ mod tests {
 
         let w = BlockQ4_0 {
             d: f32_to_f16(0.5),
-            qs: [0x37; 16], // nibbles: 7 and 3 → values -1 and -5
+            qs: [0x37; 16], // nibbles: 7 and 3 -> values -1 and -5
         };
         let act: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) / 16.0).collect();
         let mut act_q8 = vec![BlockQ8_0 { d: 0, qs: [0; 32] }];
@@ -2683,7 +2683,7 @@ mod tests {
         );
     }
 
-    // ── AVX-512 real 512-bit kernel correctness ───────────────────────────────
+    // -- AVX-512 real 512-bit kernel correctness -------------------------------
 
     #[test]
     fn avx512_q4k_matches_vnni_single_block() {
@@ -2817,7 +2817,7 @@ mod tests {
         );
     }
 
-    // ── avx512 4×4 micro-tile correctness ────────────────────────────────────
+    // -- avx512 4x4 micro-tile correctness ------------------------------------
 
     #[test]
     fn avx512_4x4_matches_pair_reference() {
@@ -2860,7 +2860,7 @@ mod tests {
             }
         }
 
-        // AVX-512 4×4 kernel.
+        // AVX-512 4x4 kernel.
         let got = unsafe {
             vec_dot_q4k_q8k_avx512_4x4(
                 256,
@@ -2910,7 +2910,7 @@ mod tests {
             })
             .collect();
 
-        // Reference via two 4×2 calls.
+        // Reference via two 4x2 calls.
         let r01 = vec_dot_q4k_q8k_dispatch_4x2(
             256, &[w_blocks[0]], &[w_blocks[1]],
             &a_blocks[0], &a_blocks[1], &a_blocks[2], &a_blocks[3],
@@ -2949,7 +2949,7 @@ mod tests {
         }
     }
 
-    // ── gemv_q4k_8x8 tests ────────────────────────────────────────────────
+    // -- gemv_q4k_8x8 tests ------------------------------------------------
 
     #[allow(dead_code)]
     fn make_q4k_from_activation(weights: &[f32]) -> BlockQ4K {
@@ -2998,7 +2998,7 @@ mod tests {
     fn gemv_q4k_8x8_scalar_matches_per_row_dispatch() {
         use crate::ggml::repack::repack_q4k_to_q4kx8;
 
-        let bpr = 2usize; // 2 blocks per row → k=512
+        let bpr = 2usize; // 2 blocks per row -> k=512
         let n_rows = 8usize;
         let k = bpr * 256;
 
@@ -3059,7 +3059,7 @@ mod tests {
             })
             .collect();
 
-        // Repack and run 8×8 scalar
+        // Repack and run 8x8 scalar
         let packed = repack_q4k_to_q4kx8(&src_blocks, n_rows, bpr);
         let result8 = gemv_q4k_8x8_scalar(bpr, &packed, &act_q8k);
 
@@ -3193,7 +3193,7 @@ mod tests {
         }
     }
 
-    // ── gemm_q4k_8x8 tests ───────────────────────────────────────────────────
+    // -- gemm_q4k_8x8 tests ---------------------------------------------------
 
     #[test]
     fn gemm_q4k_8x8_scalar_output_size() {

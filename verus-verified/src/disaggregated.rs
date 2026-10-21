@@ -1,4 +1,4 @@
-//! Verus-verified disaggregated serving dimensions — unbounded proofs
+//! Verus-verified disaggregated serving dimensions -- unbounded proofs
 
 use vstd::prelude::*;
 

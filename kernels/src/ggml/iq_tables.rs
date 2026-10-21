@@ -1,4 +1,4 @@
-// Auto-generated from ggml/src/ggml-common.h — DO NOT EDIT
+// Auto-generated from ggml/src/ggml-common.h -- DO NOT EDIT
 
 pub const KMASK_IQ2XS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 

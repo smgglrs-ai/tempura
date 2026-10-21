@@ -1,4 +1,4 @@
-//! Verus-verified paged KV cache composite operations — unbounded proofs
+//! Verus-verified paged KV cache composite operations -- unbounded proofs
 //!
 //! Proves: ensure_blocks_for allocates correct count, paged append offset
 //! calculation, contiguous reconstruction, waste ratio, reset returns pages.

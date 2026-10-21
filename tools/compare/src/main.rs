@@ -13,7 +13,7 @@ const BUILTIN_PROMPTS: &[&str] = &[
     "The meaning of life is",
     "SELECT * FROM users WHERE",
     "<system>You are helpful.</system><user>Hi</user><assistant>",
-    "日本語のテキスト：",
+    "???????????????????????????",
 ];
 
 #[derive(Clone, ValueEnum, Debug)]
@@ -118,7 +118,7 @@ async fn check_server(client: &Client, url: &str, label: &str) -> bool {
             false
         }
         Err(e) => {
-            eprintln!("  {label}: connection failed — {e}");
+            eprintln!("  {label}: connection failed -- {e}");
             false
         }
     }
@@ -382,14 +382,14 @@ fn print_divergence(result: &PromptResult, index: usize, label_a: &str, label_b:
     let a = result.a.as_deref().unwrap_or("");
     let b = result.b.as_deref().unwrap_or("");
     let preview = |s: &str| {
-        let s = s.replace('\n', "↵");
+        let s = s.replace('\n', "???");
         if s.len() > 60 {
-            format!("{}…", &s[..60])
+            format!("{}...", &s[..60])
         } else {
             s.to_string()
         }
     };
-    println!("  [{index}] {:?} — diverged", &result.prompt);
+    println!("  [{index}] {:?} -- diverged", &result.prompt);
     if let Some(pos) = result.first_diff_char {
         println!("    {label_a:12}: \"{}\"", preview(a));
         println!("    {label_b:12}: \"{}\"", preview(b));
@@ -413,7 +413,7 @@ async fn main() {
         .build()
         .unwrap();
 
-    println!("Checking server connectivity…");
+    println!("Checking server connectivity...");
     let ok_a = check_server(&client, &args.server_a, &args.label_a).await;
     let ok_b = check_server(&client, &args.server_b, &args.label_b).await;
     if !ok_a || !ok_b {
@@ -460,14 +460,14 @@ async fn main() {
         };
 
         match result.status {
-            Status::Match => println!("✓  [{i}] {:?}", &prompt[..prompt.len().min(50)]),
+            Status::Match => println!("???  [{i}] {:?}", &prompt[..prompt.len().min(50)]),
             Status::Diverge => {
-                println!("✗  [{i}] {:?}", &prompt[..prompt.len().min(50)]);
+                println!("???  [{i}] {:?}", &prompt[..prompt.len().min(50)]);
                 diverged = true;
             }
             Status::Error => {
                 println!(
-                    "!  [{i}] {:?} — error: {}",
+                    "!  [{i}] {:?} -- error: {}",
                     &prompt[..prompt.len().min(50)],
                     result.error.as_deref().unwrap_or("unknown")
                 );
@@ -489,10 +489,10 @@ async fn main() {
     let total = results.len();
 
     println!();
-    println!("✓  {matches}/{total} prompts match exactly");
+    println!("???  {matches}/{total} prompts match exactly");
     if diverged {
         let n_div = total - matches;
-        println!("✗  {n_div}/{total} prompts diverge");
+        println!("???  {n_div}/{total} prompts diverge");
         println!();
         println!("Divergences:");
         for (i, r) in results.iter().enumerate() {

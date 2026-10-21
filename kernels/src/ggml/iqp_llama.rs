@@ -1,6 +1,6 @@
 //! Direct Rust translation of llama.cpp ggml/src/ggml-cpu/iqp.cpp
 //! IQP: 8-row interleaved panel decode + integer GEMV/GEMM against Q8_K rows.
-//! Pure translation — no optimization. Algorithm identical to llama.cpp.
+//! Pure translation -- no optimization. Algorithm identical to llama.cpp.
 //! GGML_IQP_USE_BIAS = 0 path (AVX2 without VNNI).
 
 #[cfg(target_arch = "x86_64")]
@@ -10,7 +10,7 @@ use super::blocks::*;
 use super::helpers::f16_to_f32;
 use super::iq_tables::*;
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// -- Constants -----------------------------------------------------------------
 
 pub const QK_K: usize = 256;
 pub const IQP_NB_ROWS: usize = 8;
@@ -19,7 +19,7 @@ pub const IQP_NSB: usize = QK_K / IQP_SB_SIZE; // 16
 pub const IQP_MIN_BATCH: usize = 8;
 pub const IQP_MIN_BATCH_ID: usize = 8;
 
-// ── BlockIqpX8 ────────────────────────────────────────────────────────────────
+// -- BlockIqpX8 ----------------------------------------------------------------
 
 /// One super-block of a grid-based IQ type decoded to int8, 8 rows interleaved.
 ///
@@ -43,7 +43,7 @@ const _: () = {
     );
 };
 
-// ── IqType enum for decode dispatch ───────────────────────────────────────────
+// -- IqType enum for decode dispatch -------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum IqType {
@@ -72,7 +72,7 @@ impl IqType {
     }
 }
 
-// ── Scalar helpers ────────────────────────────────────────────────────────────
+// -- Scalar helpers ------------------------------------------------------------
 
 /// Low 7 bits of v are the first 7 signs and the 8th is their parity
 /// (cf. unpack_ksigns in the CUDA backend).
@@ -84,7 +84,7 @@ pub fn iqp_unpack_ksigns(v: u32) -> u8 {
     (v ^ ((p & 1) << 7)) as u8
 }
 
-// ── AVX2 helpers ──────────────────────────────────────────────────────────────
+// -- AVX2 helpers --------------------------------------------------------------
 
 /// 0xFF in every byte whose sign bit is set; sv holds each sign byte broadcast
 /// over the 8 bytes it governs.
@@ -95,7 +95,7 @@ unsafe fn iqp_sign_mask(sv: __m256i) -> __m256i {
     _mm256_cmpeq_epi8(_mm256_and_si256(sv, sel), sel)
 }
 
-/// signs holds four sign bytes, byte l governing values 8*l..8*l+7 — spread
+/// signs holds four sign bytes, byte l governing values 8*l..8*l+7 -- spread
 /// each over its 8 lanes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -114,7 +114,7 @@ unsafe fn iqp_apply_signs(x: __m256i, m: __m256i) -> __m256i {
     _mm256_sub_epi8(_mm256_xor_si256(x, m), m)
 }
 
-// ── Store helpers ─────────────────────────────────────────────────────────────
+// -- Store helpers -------------------------------------------------------------
 
 /// 32 values from four 8-byte grid entries, sign byte l of signs applied to
 /// group l.
@@ -325,7 +325,7 @@ unsafe fn iqp_store_iq4_x32_avx2(dst: *mut i8, qs: *const u8) {
     );
 }
 
-// ── Decode functions ──────────────────────────────────────────────────────────
+// -- Decode functions ----------------------------------------------------------
 
 unsafe fn iqp_decode_iq2_xxs(
     vx: *const u8,
@@ -599,7 +599,7 @@ unsafe fn iqp_decode_iq1_m(
 ) {
     let x = &*(vx as *const BlockIQ1M);
 
-    // block_iq1_m has no d field — the fp16 super-block scale is spread over
+    // block_iq1_m has no d field -- the fp16 super-block scale is spread over
     // the top nibbles of the four scale words.
     let sc = [
         u16::from_le_bytes([x.scales[0], x.scales[1]]),
@@ -692,7 +692,7 @@ pub unsafe fn iqp_decode_superblock(
     }
 }
 
-// ── AVX2 interleave ───────────────────────────────────────────────────────────
+// -- AVX2 interleave -----------------------------------------------------------
 
 /// 8x8 int32 transpose of the 32-column group starting at column `off`.
 #[cfg(target_arch = "x86_64")]
@@ -735,7 +735,7 @@ unsafe fn iqp_interleave_x8(
     _mm256_storeu_si256(dst.add(7 * 32) as *mut __m256i, _mm256_permute2x128_si256(b3, b7, 0x31));
 }
 
-// ── Panel decode ──────────────────────────────────────────────────────────────
+// -- Panel decode --------------------------------------------------------------
 
 /// Decode IQP_NB_ROWS consecutive source rows (starting at src, row stride
 /// nb01) into a panel of nblocks BlockIqpX8 structs.
@@ -803,7 +803,7 @@ pub unsafe fn iqp_decode_panel_8(
     }
 }
 
-// ── AVX2 GEMM helpers ─────────────────────────────────────────────────────────
+// -- AVX2 GEMM helpers ---------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -875,7 +875,7 @@ unsafe fn iqp_acc_block(b: &BlockIqpX8, a: &BlockQ8K) -> __m256i {
     sumi
 }
 
-/// One 4-row × nc-column tile; s points at the first of the four output rows,
+/// One 4-row x nc-column tile; s points at the first of the four output rows,
 /// bs floats apart.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -938,7 +938,7 @@ unsafe fn iqp_gemm_tile_4_avx2(
     }
 }
 
-// ── Generic (scalar) kernels ──────────────────────────────────────────────────
+// -- Generic (scalar) kernels --------------------------------------------------
 
 /// Generic GEMV: one activation row against nc weight columns (nc % 8 == 0).
 pub unsafe fn iqp_gemv_8x8_q8_k_generic(
@@ -994,7 +994,7 @@ pub unsafe fn iqp_gemv_8x8_q8_k_generic(
     }
 }
 
-/// Generic tile: 4 activation rows × nc weight columns.
+/// Generic tile: 4 activation rows x nc weight columns.
 unsafe fn iqp_gemm_tile_4_generic(
     nb: usize,
     s: *mut f32,
@@ -1088,7 +1088,7 @@ pub unsafe fn iqp_gemm_8x8_q8_k_p4_generic(
     iqp_gemm_tile_4_generic(nb, s, bs, vx, vy, nc);
 }
 
-// ── Public kernel entry points ────────────────────────────────────────────────
+// -- Public kernel entry points ------------------------------------------------
 
 /// GEMV: one activation row against nc weight columns.
 /// vx: *BlockIqpX8 panel, vy: *BlockQ8K activation row.
@@ -1131,8 +1131,8 @@ pub unsafe fn iqp_gemv_8x8_q8_k(
     iqp_gemv_8x8_q8_k_generic(n, s, bs, vx, vy, nr, nc);
 }
 
-/// GEMM: nr activation rows × nc weight columns. nr must be a multiple of 4.
-/// vx: *BlockIqpX8 panel, vy: *BlockQ8K activation matrix (nr × nb blocks).
+/// GEMM: nr activation rows x nc weight columns. nr must be a multiple of 4.
+/// vx: *BlockIqpX8 panel, vy: *BlockQ8K activation matrix (nr x nb blocks).
 pub unsafe fn iqp_gemm_8x8_q8_k(
     n: usize,
     s: *mut f32,
@@ -1187,7 +1187,7 @@ pub unsafe fn iqp_gemm_8x8_q8_k_p4(
     iqp_gemm_8x8_q8_k_p4_generic(n, s, bs, vx, vy, nc);
 }
 
-// ── Dispatch helpers (ggml-free equivalents) ──────────────────────────────────
+// -- Dispatch helpers (ggml-free equivalents) ----------------------------------
 
 /// Scratch buffer size for one thread's panel, padded to 64 bytes.
 pub fn iqp_scratch_size(ne00: usize) -> usize {
@@ -1200,7 +1200,7 @@ pub fn iqp_mul_mat_id_min_batch(cne1: i64) -> bool {
     cne1 >= IQP_MIN_BATCH_ID as i64
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// -- Tests ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1214,20 +1214,20 @@ mod tests {
 
     #[test]
     fn iqp_unpack_ksigns_known_values() {
-        // 0b0000000 → all positive, parity even → parity bit 0
+        // 0b0000000 -> all positive, parity even -> parity bit 0
         assert_eq!(iqp_unpack_ksigns(0), 0);
-        // 0b0000001 → sign[0]=1, parity=1 → bit7=1 → 0b10000001 = 0x81
+        // 0b0000001 -> sign[0]=1, parity=1 -> bit7=1 -> 0b10000001 = 0x81
         assert_eq!(iqp_unpack_ksigns(1), 0x81);
-        // 0b0000011 → sign[0]=sign[1]=1, parity=0 → bit7=0 → 0b00000011 = 0x03
+        // 0b0000011 -> sign[0]=sign[1]=1, parity=0 -> bit7=0 -> 0b00000011 = 0x03
         assert_eq!(iqp_unpack_ksigns(3), 0x03);
-        // 0b1111111 → all 7 set, parity(7 ones)=1 → bit7=1 → 0x7f ^ 0x80 = 0xff
+        // 0b1111111 -> all 7 set, parity(7 ones)=1 -> bit7=1 -> 0x7f ^ 0x80 = 0xff
         assert_eq!(iqp_unpack_ksigns(0x7f), 0xff);
     }
 
     #[test]
     fn iqp_decode_iq4_xs_known_block() {
         // Construct a minimal IQ4_XS block: d=1.0 f16, scales all = 32 (dl=0),
-        // qs all 0x00 → every nibble 0 → KVALUES_IQ4NL[0] = -127.
+        // qs all 0x00 -> every nibble 0 -> KVALUES_IQ4NL[0] = -127.
         let mut block = BlockIQ4XS {
             d: 0x3c00u16, // f16 1.0
             scales_h: 0x0000,
@@ -1236,7 +1236,7 @@ mod tests {
         };
         // Set scales_l so ls = 32, dl = 0
         // ls = (scales_l[ib/2] >> 4*(ib%2)) & 0xf | (scales_h >> 2*ib & 3) << 4
-        // To get ls=32: low nibble = 0, scales_h bits = 2 → ls = 0 | (2<<4) = 32
+        // To get ls=32: low nibble = 0, scales_h bits = 2 -> ls = 0 | (2<<4) = 32
         block.scales_h = 0xAAAA; // bits [1:0] per pair = 10b = 2 for all 8 groups
 
         let mut vals = [0i8; QK_K];
@@ -1257,7 +1257,7 @@ mod tests {
         for &s in &iscales {
             assert_eq!(s, 0);
         }
-        // All qs bytes = 0x00, so all nibbles = 0 → KVALUES_IQ4NL[0] = -127
+        // All qs bytes = 0x00, so all nibbles = 0 -> KVALUES_IQ4NL[0] = -127
         for &v in &vals {
             assert_eq!(v, KVALUES_IQ4NL[0]);
         }
@@ -1266,7 +1266,7 @@ mod tests {
     #[test]
     fn iqp_decode_iq4_xs_scale_check() {
         // Test that the scale decomposition is correct.
-        // Set scales_l[0] = 0x11 (both nibbles = 1), scales_h = 0 → ls = 1, dl = -31
+        // Set scales_l[0] = 0x11 (both nibbles = 1), scales_h = 0 -> ls = 1, dl = -31
         let block = BlockIQ4XS {
             d: 0x3c00u16, // 1.0 f16
             scales_h: 0x0000,
@@ -1337,7 +1337,7 @@ mod tests {
             assert_eq!(d, 1.0f32);
         }
 
-        // All iscales should be 0 (dl=0, scales_h=0xAAAA→ls=32→dl=0)
+        // All iscales should be 0 (dl=0, scales_h=0xAAAA->ls=32->dl=0)
         for &s in &panel.iscales {
             assert_eq!(s, 0);
         }
@@ -1345,7 +1345,7 @@ mod tests {
 
     #[test]
     fn iqp_store_signed_x8_scalar_positive() {
-        // g0 = bytes [1,2,3,4,5,6,7,8], signs = 0 → all positive
+        // g0 = bytes [1,2,3,4,5,6,7,8], signs = 0 -> all positive
         let g0 = u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8]);
         let g1 = u64::from_le_bytes([9, 10, 11, 12, 13, 14, 15, 16]);
         let g2 = u64::from_le_bytes([17, 18, 19, 20, 21, 22, 23, 24]);
@@ -1363,7 +1363,7 @@ mod tests {
 
     #[test]
     fn iqp_store_signed_x8_scalar_negate_first_byte() {
-        // signs = 0x00_00_00_01: bit 0 of byte 0 set → negate dst[0]
+        // signs = 0x00_00_00_01: bit 0 of byte 0 set -> negate dst[0]
         let g0 = u64::from_le_bytes([5, 0, 0, 0, 0, 0, 0, 0]);
         let mut dst = [0i8; 32];
         unsafe {
@@ -1377,9 +1377,9 @@ mod tests {
 
     #[test]
     fn scratch_size_alignment() {
-        // ne00 = 256 → 1 block → BLOCK_IQP_X8_SIZE = 2240 → already 64-aligned
+        // ne00 = 256 -> 1 block -> BLOCK_IQP_X8_SIZE = 2240 -> already 64-aligned
         assert_eq!(iqp_scratch_size(256), 2240);
-        // ne00 = 512 → 2 blocks → 4480, padded to next 64 → 4480
+        // ne00 = 512 -> 2 blocks -> 4480, padded to next 64 -> 4480
         assert_eq!(iqp_scratch_size(512), 4480);
     }
 }

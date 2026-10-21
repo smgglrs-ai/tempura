@@ -11,10 +11,10 @@ pub mod kernels {
 
     /// Core RoPE rotation kernel.
     ///
-    /// Each program instance handles one (seq × head) pair, represented by
+    /// Each program instance handles one (seq x head) pair, represented by
     /// `pid = program_id(0)`.  The input is pre-split into first and second
     /// halves on the host so the kernel receives two separate 1D tensors.
-    /// Cosine and sine values are also pre-expanded per (seq × head) pair
+    /// Cosine and sine values are also pre-expanded per (seq x head) pair
     /// by the host, enabling a single unified kernel for both on-the-fly and
     /// table-based variants.
     ///
@@ -46,9 +46,9 @@ pub mod kernels {
     ///
     /// All heads share the same sequence position `pos`, which is passed as a
     /// runtime `i32`.  The kernel reads directly from the pre-computed GPU table
-    /// `cos_table[pos * HALF_DIM .. (pos+1) * HALF_DIM]` — no H2D upload needed.
+    /// `cos_table[pos * HALF_DIM .. (pos+1) * HALF_DIM]` -- no H2D upload needed.
     ///
-    /// Grid: (n_heads, 1, 1) — one program per head.
+    /// Grid: (n_heads, 1, 1) -- one program per head.
     ///
     /// Rotation:
     ///   out_first[d]  =  x_first[d] * cos_table[pos, d] - x_second[d] * sin_table[pos, d]
@@ -72,7 +72,7 @@ pub mod kernels {
         out_second.store(tile_x0 * tile_sin + tile_x1 * tile_cos);
     }
 
-    /// Deinterleave kernel: split interleaved [num_sh × head_dim] into two half-tensors.
+    /// Deinterleave kernel: split interleaved [num_sh x head_dim] into two half-tensors.
     ///
     /// `x` is a flat [num_sh * head_dim] tensor in interleaved layout:
     ///   x[sh * head_dim .. sh * head_dim + half_dim]       = first  half of head sh
@@ -93,14 +93,14 @@ pub mod kernels {
 
     /// Interleave kernel: merge two half-tensors back into flat [num_sh * head_dim].
     ///
-    /// Interleave kernel: merge two half-tensors back into [num_sh × head_dim].
+    /// Interleave kernel: merge two half-tensors back into [num_sh x head_dim].
     ///
-    /// Launches 2×num_sh programs — even programs read from `first`, odd from `second`.
+    /// Launches 2xnum_sh programs -- even programs read from `first`, odd from `second`.
     /// Each program writes to exactly one HALF_DIM-element tile at its sequential
     /// pid position using the normal unindexed `store`. No indexed store needed.
     ///
     /// Note: cuTile 0.4.0 rank-1 mapped partitions require MAP_SHAPE=[1]; multi-tile
-    /// maps ([2]) are not supported for rank-1 tensors. The 2×program approach avoids
+    /// maps ([2]) are not supported for rank-1 tensors. The 2xprogram approach avoids
     /// that constraint entirely.
     #[cutile::entry()]
     pub fn cutile_interleave<const HALF_DIM: i32>(
@@ -122,7 +122,7 @@ pub mod kernels {
 
 /// Pre-allocated device buffers for zero-allocation RoPE calls.
 ///
-/// Sized for up to `cap_num_sh` (sequence × head) pairs with a fixed `head_dim`.
+/// Sized for up to `cap_num_sh` (sequence x head) pairs with a fixed `head_dim`.
 /// `forward_device_scratch` falls back to the allocating `forward_device` path
 /// when `seq_len * n_heads > cap_num_sh` or `head_dim` does not match.
 ///
@@ -147,7 +147,7 @@ unsafe impl Send for RopeScratch {}
 unsafe impl Sync for RopeScratch {}
 
 impl RopeScratch {
-    /// Allocate five device buffers sized for `cap_num_sh` (seq × head) pairs.
+    /// Allocate five device buffers sized for `cap_num_sh` (seq x head) pairs.
     pub fn new(
         stream: &Arc<Stream>,
         cap_num_sh: usize,
@@ -173,13 +173,13 @@ impl RopeScratch {
 
 /// GPU-accelerated Rotary Position Embeddings using NVIDIA cuTile Rust (`cutile-rs`).
 ///
-/// The host precomputes cosine and sine values per (batch × seq × head) pair
+/// The host precomputes cosine and sine values per (batch x seq x head) pair
 /// so the GPU kernel receives only pre-expanded tables.  This keeps the kernel
 /// simple and avoids the need for per-program scalar parameters.
 ///
-/// When `precompute_table` has been called, the full `[max_pos × half_dim]`
+/// When `precompute_table` has been called, the full `[max_pos x half_dim]`
 /// cos/sin tables live on the GPU.  `forward_device_scratch` uses them for
-/// single-token decode steps: no H2D upload at all — just a position index
+/// single-token decode steps: no H2D upload at all -- just a position index
 /// passed as a runtime `i32` to `cutile_rope_from_table`.
 pub struct CutileRoPE {
     device: Arc<Device>,
@@ -223,7 +223,7 @@ impl CutileRoPE {
     /// Pre-compute the full RoPE frequency table and upload it to the GPU once.
     ///
     /// After this call, `forward_device_scratch` uses the on-GPU tables for
-    /// single-token decode steps — no H2D cos/sin transfer per token.
+    /// single-token decode steps -- no H2D cos/sin transfer per token.
     ///
     /// `max_pos` should be `config.max_seq_len.min(4096)`.
     /// `head_dim` must be even.
@@ -301,7 +301,7 @@ impl CutileRoPE {
             });
         }
 
-        // Pre-expand cos/sin: [num_sh, half] — replicate same position across all heads.
+        // Pre-expand cos/sin: [num_sh, half] -- replicate same position across all heads.
         let mut cos_exp = vec![0.0f32; num_sh * half];
         let mut sin_exp = vec![0.0f32; num_sh * half];
         for b in 0..batch {
@@ -379,17 +379,17 @@ impl RoPE for CutileRoPE {
 
 impl CutileRoPE {
     /// Apply RoPE entirely on device: deinterleave x on the GPU, rotate, and
-    /// return a rotated device tensor — no download of `x_dev` required.
+    /// return a rotated device tensor -- no download of `x_dev` required.
     ///
     /// The only host-to-device transfers are the cos/sin tables, which are
-    /// `seq_len × n_heads × head_dim/2` floats — tiny even for large batches.
+    /// `seq_len x n_heads x head_dim/2` floats -- tiny even for large batches.
     /// The rotation itself runs on the GPU via the existing split-half kernel.
     /// Output halves are downloaded and reconstructed on the CPU before a
     /// final upload; this intermediate step will be eliminated once cutile
     /// supports indexed device-side stores.
     ///
-    /// PCIe transfers per call: 2 H→D (cos/sin) + 2 D→H (output halves) + 1 H→D (result)
-    /// vs. the host-side path: 1 D→H (download x) + 4 H→D + 2 D→H + 1 H→D = 8 transfers.
+    /// PCIe transfers per call: 2 H->D (cos/sin) + 2 D->H (output halves) + 1 H->D (result)
+    /// vs. the host-side path: 1 D->H (download x) + 4 H->D + 2 D->H + 1 H->D = 8 transfers.
     ///
     /// The `stream` parameter is the shared CUDA stream from the caller (typically the
     /// matmul stream), which avoids cross-stream synchronization overhead.
@@ -411,7 +411,7 @@ impl CutileRoPE {
         let half = head_dim / 2;
         let num_sh = seq_len * n_heads;
 
-        // ── 1. Compute cos/sin tables on CPU — tiny: num_sh * half floats each ──
+        // -- 1. Compute cos/sin tables on CPU -- tiny: num_sh * half floats each --
         let mut cos_exp = vec![0.0f32; num_sh * half];
         let mut sin_exp = vec![0.0f32; num_sh * half];
         for s in 0..seq_len {
@@ -433,11 +433,11 @@ impl CutileRoPE {
                 .into())
         };
 
-        // ── 2. Upload cos/sin to device (2 H→D, tiny) ─────────────────────────
+        // -- 2. Upload cos/sin to device (2 H->D, tiny) -------------------------
         let cos_t = upload_vec(cos_exp)?;
         let sin_t = upload_vec(sin_exp)?;
 
-        // ── 3–5. Deinterleave → RoPE → Interleave: all async, one final sync ──
+        // -- 3-5. Deinterleave -> RoPE -> Interleave: all async, one final sync --
         // Allocations (api::zeros) block only for cudaMalloc (fast); the kernel
         // launches that fill them use async_on so no CPU sync between them.
         // A single stream.synchronize() at the end covers all three kernels.
@@ -487,7 +487,7 @@ impl CutileRoPE {
         let first_arc: Arc<Tensor<f32>> = Arc::new(out_f.unpartition());
         let second_arc: Arc<Tensor<f32>> = Arc::new(out_s.unpartition());
 
-        // 2×num_sh programs, each writes one HALF_DIM tile (even→first, odd→second).
+        // 2xnum_sh programs, each writes one HALF_DIM tile (even->first, odd->second).
         let z_t_alloc = api::zeros::<f32>(&[num_sh * head_dim])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
@@ -546,7 +546,7 @@ impl CutileRoPE {
         }
         let half = head_dim / 2;
 
-        // ── Fast decode path: read cos/sin from pre-computed GPU table ──────────
+        // -- Fast decode path: read cos/sin from pre-computed GPU table ----------
         // Requires seq_len=1 (all heads share the same position) and a populated
         // table covering the requested position.  No H2D upload at all.
         if seq_len == 1 {
@@ -570,7 +570,7 @@ impl CutileRoPE {
             }
         }
 
-        // ── Standard path: compute cos/sin on CPU, upload H2D ─────────────────
+        // -- Standard path: compute cos/sin on CPU, upload H2D -----------------
         let mut cos_exp = vec![0.0f32; num_sh * half];
         let mut sin_exp = vec![0.0f32; num_sh * half];
         for s in 0..seq_len {
@@ -598,7 +598,7 @@ impl CutileRoPE {
         // x_dev is already rank-1 (1 stride) because all GEMV paths now call
         // unpartition().reshape(&[n]) before returning, which collapses the
         // partition-stride metadata that partition([1]).unpartition() used to leave
-        // behind.  Pass x_dev directly — no host round-trip needed.
+        // behind.  Pass x_dev directly -- no host round-trip needed.
         let x_flat = x_dev.clone();
 
         let generics = vec![half.to_string()];
@@ -685,8 +685,8 @@ impl CutileRoPE {
     /// Inner decode rotation using the pre-computed GPU table.
     ///
     /// Called from `forward_device_scratch` when `seq_len == 1` and the table
-    /// has been populated.  Runs deinterleave → `cutile_rope_from_table` →
-    /// interleave entirely on the GPU — zero H2D transfers per call.
+    /// has been populated.  Runs deinterleave -> `cutile_rope_from_table` ->
+    /// interleave entirely on the GPU -- zero H2D transfers per call.
     #[allow(clippy::too_many_arguments)]
     fn forward_device_scratch_from_table(
         &self,

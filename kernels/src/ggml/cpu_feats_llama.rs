@@ -4,8 +4,8 @@
 //! Ref:    https://cdrdv2-public.intel.com/782156/325383-sdm-vol-2abcd.pdf
 //!
 //! Translated items:
-//!   - `struct cpuid_x86`                    → [`CpuidX86`]
-//!   - `ggml_backend_cpu_x86_score()`        → [`cpu_score`]
+//!   - `struct cpuid_x86`                    -> [`CpuidX86`]
+//!   - `ggml_backend_cpu_x86_score()`        -> [`cpu_score`]
 //!
 //! `CpuidX86` queries CPUID at construction and caches all relevant bitfields.
 //! Feature accessor methods mirror the original C++ struct exactly.
@@ -24,7 +24,7 @@ mod inner {
     use std::arch::x86_64::{__cpuid, __cpuid_count};
 
     // -----------------------------------------------------------------------
-    // CpuidX86 — mirrors cpuid_x86 from cpu-feats.cpp
+    // CpuidX86 -- mirrors cpuid_x86 from cpu-feats.cpp
     // -----------------------------------------------------------------------
 
     /// Runtime x86 CPU feature set derived from CPUID.
@@ -66,7 +66,7 @@ mod inner {
             let is_intel = vendor == "GenuineIntel";
             let is_amd = vendor == "AuthenticAMD";
 
-            // Leaf 1 — basic feature flags
+            // Leaf 1 -- basic feature flags
             let (f_1_ecx, f_1_edx) = if n_ids >= 1 {
                 let r = __cpuid(1);
                 (r.ecx, r.edx)
@@ -74,7 +74,7 @@ mod inner {
                 (0, 0)
             };
 
-            // Leaf 7 subleaf 0 — extended feature flags
+            // Leaf 7 subleaf 0 -- extended feature flags
             let (f_7_ebx, f_7_ecx, f_7_edx) = if n_ids >= 7 {
                 let r = __cpuid_count(7, 0);
                 (r.ebx, r.ecx, r.edx)
@@ -82,7 +82,7 @@ mod inner {
                 (0, 0, 0)
             };
 
-            // Leaf 7 subleaf 1 — AVX-VNNI, AVX512-BF16, AMX-FP16
+            // Leaf 7 subleaf 1 -- AVX-VNNI, AVX512-BF16, AMX-FP16
             let f_7_1_eax = if n_ids >= 7 {
                 __cpuid_count(7, 1).eax
             } else {
@@ -93,7 +93,7 @@ mod inner {
             let ext_leaf0 = __cpuid(0x8000_0000u32);
             let n_ex_ids = ext_leaf0.eax;
 
-            // Extended leaf 0x80000001 — AMD / Intel extended flags
+            // Extended leaf 0x80000001 -- AMD / Intel extended flags
             let (f_81_ecx, f_81_edx) = if n_ex_ids >= 0x8000_0001u32 {
                 let r = __cpuid(0x8000_0001u32);
                 (r.ecx, r.edx)
@@ -223,7 +223,7 @@ mod inner {
     }
 
     // -----------------------------------------------------------------------
-    // cpu_score — mirrors ggml_backend_cpu_x86_score()
+    // cpu_score -- mirrors ggml_backend_cpu_x86_score()
     //
     // Returns a capability score for the current CPU. Returns 0 if any feature
     // required by the compiled feature-flag set is absent at runtime. The
@@ -240,7 +240,7 @@ mod inner {
         let mut score: i32 = 1;
         let is = CpuidX86::new();
 
-        // FMA — leaf 1 ecx[12]; also available via is_x86_feature_detected
+        // FMA -- leaf 1 ecx[12]; also available via is_x86_feature_detected
         #[cfg(target_feature = "fma")]
         {
             if !is.FMA() {
@@ -249,7 +249,7 @@ mod inner {
             score += 1;
         }
 
-        // F16C — leaf 1 ecx[29]
+        // F16C -- leaf 1 ecx[29]
         #[cfg(target_feature = "f16c")]
         {
             if !is.F16C() {
@@ -258,7 +258,7 @@ mod inner {
             score += 1 << 1;
         }
 
-        // SSE4.2 — leaf 1 ecx[20]
+        // SSE4.2 -- leaf 1 ecx[20]
         #[cfg(target_feature = "sse4.2")]
         {
             if !is.SSE42() {
@@ -267,7 +267,7 @@ mod inner {
             score += 1 << 2;
         }
 
-        // BMI2 — leaf 7:0 ebx[8]
+        // BMI2 -- leaf 7:0 ebx[8]
         #[cfg(target_feature = "bmi2")]
         {
             if !is.BMI2() {
@@ -276,7 +276,7 @@ mod inner {
             score += 1 << 3;
         }
 
-        // AVX — leaf 1 ecx[28]
+        // AVX -- leaf 1 ecx[28]
         #[cfg(target_feature = "avx")]
         {
             if !is.AVX() {
@@ -285,7 +285,7 @@ mod inner {
             score += 1 << 4;
         }
 
-        // AVX2 — leaf 7:0 ebx[5]
+        // AVX2 -- leaf 7:0 ebx[5]
         #[cfg(target_feature = "avx2")]
         {
             if !is.AVX2() {
@@ -294,7 +294,7 @@ mod inner {
             score += 1 << 5;
         }
 
-        // AVX-VNNI — leaf 7:1 eax[4] (not in is_x86_feature_detected! stable)
+        // AVX-VNNI -- leaf 7:1 eax[4] (not in is_x86_feature_detected! stable)
         #[cfg(target_feature = "avxvnni")]
         {
             if !is.AVX_VNNI() {
@@ -318,7 +318,7 @@ mod inner {
             score += 1 << 7;
         }
 
-        // AVX512-VBMI — leaf 7:0 ecx[1]
+        // AVX512-VBMI -- leaf 7:0 ecx[1]
         #[cfg(target_feature = "avx512vbmi")]
         {
             if !is.AVX512_VBMI() {
@@ -327,7 +327,7 @@ mod inner {
             score += 1 << 8;
         }
 
-        // AVX512-BF16 — leaf 7:1 eax[5]
+        // AVX512-BF16 -- leaf 7:1 eax[5]
         #[cfg(target_feature = "avx512bf16")]
         {
             if !is.AVX512_BF16() {
@@ -336,7 +336,7 @@ mod inner {
             score += 1 << 9;
         }
 
-        // AVX512-VNNI — leaf 7:0 ecx[11]
+        // AVX512-VNNI -- leaf 7:0 ecx[11]
         #[cfg(target_feature = "avx512vnni")]
         {
             if !is.AVX512_VNNI() {
@@ -345,7 +345,7 @@ mod inner {
             score += 1 << 10;
         }
 
-        // AMX-INT8 — leaf 7:0 edx[25]
+        // AMX-INT8 -- leaf 7:0 edx[25]
         #[cfg(target_feature = "amx-int8")]
         {
             if !is.AMX_INT8() {

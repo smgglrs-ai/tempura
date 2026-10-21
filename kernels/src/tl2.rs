@@ -1,4 +1,4 @@
-//! TL2 (Ternary LUT 2-bit) kernel — direct translation of bitnet.cpp's codegen_tl2.py output.
+//! TL2 (Ternary LUT 2-bit) kernel -- direct translation of bitnet.cpp's codegen_tl2.py output.
 //!
 //! Architecture:
 //!   1. `per_tensor_quant`: quantize activations to i8 (scale = 127/max_abs)
@@ -37,7 +37,7 @@ fn gemm_chunk_size() -> usize {
     })
 }
 
-// ── AVX2 helpers (translated from bitnet.cpp) ──────────────────────────────
+// -- AVX2 helpers (translated from bitnet.cpp) ------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -89,7 +89,7 @@ unsafe fn transpose_8_8(v: &mut [__m256i; 8]) {
     v[7] = r7;
 }
 
-// ── per_tensor_quant ───────────────────────────────────────────────────────
+// -- per_tensor_quant -------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -108,7 +108,7 @@ pub unsafe fn per_tensor_quant(k: usize, b: &[f32]) -> f32 {
     127.0 / _mm_cvtss_f32(max1)
 }
 
-// ── three_lut_ctor ─────────────────────────────────────────────────────────
+// -- three_lut_ctor ---------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -189,7 +189,7 @@ pub unsafe fn three_lut_ctor(qlut: &mut [i8], b: &[f32], scale: f32, act_k: usiz
     }
 }
 
-// ── two_lut_ctor ───────────────────────────────────────────────────────────
+// -- two_lut_ctor -----------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -268,16 +268,16 @@ pub unsafe fn two_lut_ctor(qlut: &mut [i8], b: &[f32], scale: f32, act_k: usize)
     }
 }
 
-// ── three_tbl_impl ─────────────────────────────────────────────────────────
+// -- three_tbl_impl ---------------------------------------------------------
 //
-// Tiled GEMM: processes BM output rows × BK/3 reduction elements per call.
+// Tiled GEMM: processes BM output rows x BK/3 reduction elements per call.
 // For each 32-row tile within BM:
 //   - Load weight bytes (packed 4-bit indices) and sign bits
 //   - For each batch element:
 //     - For each group of 8 elements (KK/8 iterations):
 //       - 4 sub-iterations processing 4 weight bytes each
 //       - Each sub-iter: extract top/bot nibble, shuffle LUT, apply sign, accumulate i16
-//     - Widen i16→i32, store to output
+//     - Widen i16->i32, store to output
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -366,7 +366,7 @@ pub unsafe fn three_tbl_impl(
                 three_tbl_sub!(kg, 3, 12, 13, 14, 15);
             }
 
-            // Widen i16→i32 and accumulate into output
+            // Widen i16->i32 and accumulate into output
             let off = i + bm * bs;
             let mut gc0 = _mm256_loadu_si256(c.as_ptr().add(off) as *const __m256i);
             let mut gc1 = _mm256_loadu_si256(c.as_ptr().add(off + 8) as *const __m256i);
@@ -413,7 +413,7 @@ pub unsafe fn three_tbl_impl_bk96(
         let mut vec_as: [__m256i; 16] = [zero; 16]; // KK/2 = 16
         let mut vec_signs: [__m256i; 4] = [zero; 4]; // KK/8 = 4
 
-        // Fully unrolled loads — compiler knows these are exactly 16 + 4
+        // Fully unrolled loads -- compiler knows these are exactly 16 + 4
         for ai in 0..16 {
             vec_as[ai] = _mm256_loadu_si256(a.as_ptr().add(i * 16 + ai * 32) as *const __m256i);
         }
@@ -516,7 +516,7 @@ pub unsafe fn three_tbl_impl_bk96(
     }
 }
 
-// ── two_tbl_impl ───────────────────────────────────────────────────────────
+// -- two_tbl_impl -----------------------------------------------------------
 
 const BK2: usize = 32;
 
@@ -599,7 +599,7 @@ pub unsafe fn two_tbl_impl(
     }
 }
 
-// ── Top-level GEMM dispatch ────────────────────────────────────────────────
+// -- Top-level GEMM dispatch ------------------------------------------------
 
 /// TL2 tile configuration for a specific (m, k) weight shape.
 #[derive(Clone, Copy)]
@@ -666,12 +666,12 @@ impl Tl2Config {
     }
 }
 
-// ── I2S → TL2 weight repacking ────────────────────────────────────────────
+// -- I2S -> TL2 weight repacking --------------------------------------------
 //
 // Translated from preprocess_three_weights_tl2 / preprocess_two_weights_tl2
 // in convert-hf-to-gguf-bitnet.py. Converts I2S packed bytes (2-bit ternary,
 // 4 values per byte, 128-element groups) to TL2 tiled format (base-3 nibble
-// indices + sign bits, tiled by BM×BK).
+// indices + sign bits, tiled by BMxBK).
 
 fn i2s_extract_trit(i2s: &[u8], row: usize, col: usize, k: usize) -> i8 {
     let row_bytes = k / 4;
@@ -681,14 +681,14 @@ fn i2s_extract_trit(i2s: &[u8], row: usize, col: usize, k: usize) -> i8 {
     let group_pos = within % 32;
     let byte = i2s[row * row_bytes + group * 32 + group_pos];
     let bits = (byte >> (6 - 2 * group_idx)) & 0x03;
-    bits as i8 - 1 // {0,1,2} → {-1,0,+1}
+    bits as i8 - 1 // {0,1,2} -> {-1,0,+1}
 }
 
 /// Repack I2S weight data into TL2 format for a single (m, k) weight tensor.
 /// Direct translation of preprocess_weights_tl2 / preprocess_three_weights_tl2 /
 /// preprocess_two_weights_tl2 from convert-hf-to-gguf-bitnet.py.
 /// Input: I2S packed bytes (2-bit ternary, 4 per byte, 128-element groups).
-/// Output: (tl2_data, scale) — nibble indices + sign bits in tiled layout.
+/// Output: (tl2_data, scale) -- nibble indices + sign bits in tiled layout.
 pub fn repack_i2s_to_tl2(i2s: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, f32)> {
     let cfg = Tl2Config::for_dims(m, k)?;
     repack_i2s_to_tl2_with_config(i2s, m, k, &cfg)
@@ -700,9 +700,9 @@ pub fn repack_i2s_to_tl2_with_config(
     k: usize,
     cfg: &Tl2Config,
 ) -> Option<(Vec<u8>, f32)> {
-    let big_bm = cfg.bm; // BM in the Python — tile height
-    let big_by = cfg.bk; // BY/BK in the Python — reduction tile
-    let bmm: usize = 32; // bmm in the Python — inner tile
+    let big_bm = cfg.bm; // BM in the Python -- tile height
+    let big_by = cfg.bk; // BY/BK in the Python -- reduction tile
+    let bmm: usize = 32; // bmm in the Python -- inner tile
     let by: usize = 192 / bmm; // by in the Python = 6
     let three_k = cfg.three_k;
     let two_k = cfg.two_k;
@@ -744,7 +744,7 @@ pub fn repack_i2s_to_tl2_with_config(
 
     let mut final_weight: Vec<Vec<u8>> = Vec::new();
 
-    // ── Three-part: translated from preprocess_three_weights_tl2 ──
+    // -- Three-part: translated from preprocess_three_weights_tl2 --
 
     // Python line 550-556: group into triplets, compute base-3 index
     let three_n = m * three_k / 3;
@@ -764,7 +764,7 @@ pub fn repack_i2s_to_tl2_with_config(
     let mut abs_weight = vec![0u8; three_n];
     for i in 0..three_n {
         let s = if weight[i] < 0 { 1u8 } else { 0u8 };
-        // Python: sign(w) + 2, then where > 1, set 0. So negative → 1, zero/positive → 0
+        // Python: sign(w) + 2, then where > 1, set 0. So negative -> 1, zero/positive -> 0
         sign_weight[i] = s;
         abs_weight[i] = weight[i].unsigned_abs() as u8;
     }
@@ -774,12 +774,12 @@ pub fn repack_i2s_to_tl2_with_config(
     // Instead of matching each numpy op, compute the final flat index directly.
     //
     // The chain is:
-    //   (M, K3) → (M/BM, BM, K3) .T(0,2,1) → (M/BM, K3, BM)
-    //   → (M/BM, K3/BY3, BY3, BM) .T(0,1,3,2) → (M/BM, K3/BY3, BM, BY3)
+    //   (M, K3) -> (M/BM, BM, K3) .T(0,2,1) -> (M/BM, K3, BM)
+    //   -> (M/BM, K3/BY3, BY3, BM) .T(0,1,3,2) -> (M/BM, K3/BY3, BM, BY3)
     //     where K3 = three_k/3, BY3 = big_by/3
-    //   → (M/BM, K3/BY3, BM/bmm, bmm, BY3) .T(0,1,2,4,3) → (M/BM, K3/BY3, BM/bmm, BY3, bmm)
-    //   → (M/BM, K3/BY3, BM/bmm, BY3/(by/3), by/3, bmm) .T(0,1,2,3,5,4)
-    //     → (M/BM, K3/BY3, BM/bmm, BY3/(by/3), bmm, by/3)
+    //   -> (M/BM, K3/BY3, BM/bmm, bmm, BY3) .T(0,1,2,4,3) -> (M/BM, K3/BY3, BM/bmm, BY3, bmm)
+    //   -> (M/BM, K3/BY3, BM/bmm, BY3/(by/3), by/3, bmm) .T(0,1,2,3,5,4)
+    //     -> (M/BM, K3/BY3, BM/bmm, BY3/(by/3), bmm, by/3)
     //   Then pack pairs: w0 << 4 | w1
     //   Reshape to (total_chunks, bmm//8, 8), swap rows [0,2,1,3], flatten to (total_chunks, bmm)
 
@@ -821,7 +821,7 @@ pub fn repack_i2s_to_tl2_with_config(
     for chunk in 0..total_chunks {
         let base = chunk * bmm;
         // bmm=32, bmm//8=4, 4 rows of 8 bytes each
-        // swap row 1 (bytes 8..15) ↔ row 2 (bytes 16..23)
+        // swap row 1 (bytes 8..15) ??? row 2 (bytes 16..23)
         for i in 0..8 {
             nibbles.swap(base + 8 + i, base + 16 + i);
         }
@@ -832,7 +832,7 @@ pub fn repack_i2s_to_tl2_with_config(
         final_weight.push(nibbles[chunk * bmm..(chunk + 1) * bmm].to_vec());
     }
 
-    // ── Sign packing (Python lines 581-595) ──
+    // -- Sign packing (Python lines 581-595) --
     // After the same tiling as abs_weight, 16 sign bits pack into u16 words.
     // Traced mapping: for half-row hr in [0, bmm/2), bit i maps to:
     //   even i: sign_weight[t2*bmm + hr,        t1*by3 + sg*8 + i/2]
@@ -867,7 +867,7 @@ pub fn repack_i2s_to_tl2_with_config(
         }
     }
 
-    // ── Two-part weights (Python lines 523-547) ──
+    // -- Two-part weights (Python lines 523-547) --
     if two_k > 0 {
         let two_n = m * two_k / 2;
         let mut two_weight = vec![0u8; two_n];
@@ -1026,7 +1026,7 @@ pub fn tl2_preprocess(activations: &[f32], k: usize) -> Option<Tl2Lut> {
 }
 
 /// Run TL2 GEMV tiles [tile_start, tile_end) using a pre-built LUT.
-/// Called from within parallel_compute — each thread processes its own tile range.
+/// Called from within parallel_compute -- each thread processes its own tile range.
 #[cfg(target_arch = "x86_64")]
 pub fn tl2_gemv_tiles(
     lut: &Tl2Lut,
@@ -1460,7 +1460,7 @@ pub fn tl2_gemv_block_scaled(
 }
 
 /// Run a full TL2 GEMV for batch_size=1 (decode).
-/// Convenience wrapper that builds LUT internally — use tl2_preprocess + tl2_gemv
+/// Convenience wrapper that builds LUT internally -- use tl2_preprocess + tl2_gemv
 /// to share the LUT across multiple weight tensors.
 #[cfg(target_arch = "x86_64")]
 pub fn tl2_forward(
@@ -1676,7 +1676,7 @@ pub fn tl2_gemm_with_lut(
 
 /// Fill tokens [t_start..t_end) within a `BatchedTl2Lut`. Each token writes to
 /// its own LUT offset, so multiple threads can process disjoint ranges concurrently.
-/// `activations` layout: `[batch_size * k]` — only elements `[t_start*k .. t_end*k]` are read.
+/// `activations` layout: `[batch_size * k]` -- only elements `[t_start*k .. t_end*k]` are read.
 /// `lut_addr` is the `BatchedTl2Lut` pointer as usize (for Send in closures).
 #[cfg(target_arch = "x86_64")]
 pub fn tl2_preprocess_token_range(
@@ -1774,7 +1774,7 @@ pub fn tl2_preprocess_batched_into(
 }
 
 /// Process TL2 GEMM tiles [tile_start, tile_end) using a pre-built batched LUT.
-/// No thread pool dispatch — called from within a persistent thread model.
+/// No thread pool dispatch -- called from within a persistent thread model.
 /// `cbits` and `two_cbits` must be pre-allocated to at least `batch_size * bm` elements.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -2352,11 +2352,11 @@ pub unsafe fn qgemm_lut(
     );
 }
 
-// ── Scalar reference implementations (for Kani proofs + DualPipeline) ──────
+// -- Scalar reference implementations (for Kani proofs + DualPipeline) ------
 //
 // These compute the same mathematical result as the AVX2 kernels above, without
 // any SIMD. They exist to be formally verified by Kani and used as DualPipeline
-// oracles. NOT gated behind cfg(target_arch) — they run on any platform.
+// oracles. NOT gated behind cfg(target_arch) -- they run on any platform.
 
 pub fn per_tensor_quant_scalar(b: &[f32]) -> f32 {
     let mut max_abs = 0.0f32;
@@ -2511,7 +2511,7 @@ pub fn tl2_gemv_direct_scalar(
 // is not written because the post-transpose+pack layout is tightly coupled to
 // SIMD lane semantics. Instead, tl2_gemv_direct_scalar above serves as the
 // ground-truth oracle: it computes the same mathematical result (ternary weights
-// × quantized activations) from the I2S format directly. DualPipeline tests
+// x quantized activations) from the I2S format directly. DualPipeline tests
 // compare this oracle against the AVX2 TL2 path.
 
 #[cfg(test)]
@@ -2522,13 +2522,13 @@ mod tests {
     fn test_per_tensor_quant() {
         let a = vec![1.0f32, -2.0, 0.5, 3.0, -1.5, 0.0, 2.5, -3.0];
         let scale = unsafe { per_tensor_quant(8, &a) };
-        // max_abs = 3.0, scale = 127/3 ≈ 42.33
+        // max_abs = 3.0, scale = 127/3 ~= 42.33
         assert!((scale - 42.333).abs() < 0.1, "scale={scale}");
     }
 
     #[test]
     fn test_three_lut_ctor_runs() {
-        // 24 activations → 1 LUT block (24/24=1)
+        // 24 activations -> 1 LUT block (24/24=1)
         let b: Vec<f32> = (0..24).map(|i| (i as f32 - 12.0) * 0.1).collect();
         let scale = 127.0 / 1.2; // max_abs = 1.2
         let mut qlut = vec![0i8; 256];
@@ -2734,7 +2734,7 @@ mod tests {
                 }
                 let elapsed = start.elapsed();
                 let us_per = elapsed.as_micros() as f64 / iters as f64;
-                eprintln!("({m},{k}) BM={bm:>3}: {us_per:.0}µs/iter");
+                eprintln!("({m},{k}) BM={bm:>3}: {us_per:.0}??s/iter");
             }
             eprintln!();
         }
@@ -2786,7 +2786,7 @@ mod tests {
         eprintln!("max_err={max_err:.6}");
         assert!(
             max_err < 1.0,
-            "max_err={max_err:.6} — output doesn't match reference"
+            "max_err={max_err:.6} -- output doesn't match reference"
         );
     }
 
@@ -3008,7 +3008,7 @@ mod kani_proofs {
     #[kani::proof]
     fn tl2_i16_accumulator_no_overflow_bk96() {
         let val: i8 = kani::any();
-        let kk: usize = 32; // BK=96 → kk=96/3=32
+        let kk: usize = 32; // BK=96 -> kk=96/3=32
                             // Each tbl_impl iteration adds at most |val| per step
                             // kk triplet-groups per tile, each contributes one i8 LUT value
         let worst_case = val as i32 * kk as i32;
@@ -3101,19 +3101,19 @@ mod kani_proofs {
         let k: usize = kani::any();
         kani::assume(k >= 1 && k <= 8192);
 
-        // Each term: trit ∈ {-1,0,1}, a_q ∈ [-127,127]
+        // Each term: trit ??? {-1,0,1}, a_q ??? [-127,127]
         // Worst case per element: 127
-        // k elements → max |acc| = 127 * k
+        // k elements -> max |acc| = 127 * k
         let worst_case = 127i64 * k as i64;
         assert!(worst_case <= i32::MAX as i64);
     }
 
-    // ── Equivalence proofs: LUT path ≡ direct dot product ───────────────────
+    // -- Equivalence proofs: LUT path ??? direct dot product -------------------
 
     /// The three-valued LUT lookup gives the same integer result as direct
-    /// multiply-accumulate for one triplet (w0,w1,w2) × (a0,a1,a2).
+    /// multiply-accumulate for one triplet (w0,w1,w2) x (a0,a1,a2).
     ///
-    /// This is the core scalar↔SIMD equivalence claim for TL2: the AVX2 kernel
+    /// This is the core scalar???SIMD equivalence claim for TL2: the AVX2 kernel
     /// uses the same `three_lut_entries` table and the same index formula, so
     /// correctness of the LUT path for one triplet implies correctness for any
     /// tiling of the same triplets.
@@ -3136,19 +3136,19 @@ mod kani_proofs {
         // Reference: direct sequential dot product (definition of ternary GEMV)
         let direct = w0 as i32 * a0 + w1 as i32 * a1 + w2 as i32 * a2;
 
-        // LUT path: base-3 encode weights → table lookup → apply sign
+        // LUT path: base-3 encode weights -> table lookup -> apply sign
         let combined = w0 as i32 * 9 + w1 as i32 * 3 + w2 as i32;
         let abs_idx = combined.unsigned_abs() as usize;
         let sign = combined < 0;
         let entries = three_lut_entries(a0, a1, a2);
-        // max entry value: 3*127 = 381, fits in i16 — saturation is a no-op
+        // max entry value: 3*127 = 381, fits in i16 -- saturation is a no-op
         let lut_val = entries[abs_idx].clamp(-32768, 32767) as i16;
         let lut_result = if sign { -(lut_val as i32) } else { lut_val as i32 };
 
         assert!(direct == lut_result);
     }
 
-    /// Two-valued LUT lookup equals direct dot product for one pair (w0,w1) × (a0,a1).
+    /// Two-valued LUT lookup equals direct dot product for one pair (w0,w1) x (a0,a1).
     /// Same claim as above but for the two_lut_entries path used for the remainder
     /// elements (k mod 3 == 2 tail).
     #[kani::proof]
@@ -3166,7 +3166,7 @@ mod kani_proofs {
         // Reference: direct dot
         let direct = w0 as i32 * a0 + w1 as i32 * a1;
 
-        // Two-LUT path: index = w0*3 + w1 + 4 (offset so {-1,0,1}² maps to [0,8])
+        // Two-LUT path: index = w0*3 + w1 + 4 (offset so {-1,0,1}^2 maps to [0,8])
         let idx = (w0 as i32 * 3 + w1 as i32 + 4) as usize;
         let entries = two_lut_entries(a0, a1);
         let lut_val = entries[idx].clamp(-32768, 32767) as i16;
@@ -3177,10 +3177,10 @@ mod kani_proofs {
     /// Accumulation over two triplets: sequential sum equals sum of per-triplet
     /// LUT contributions.  Proves that the AVX2-style grouped accumulation (process
     /// N triplets independently, sum the group results) gives the same i32 total as
-    /// the scalar sequential loop — the core order-invariance claim for TL2.
+    /// the scalar sequential loop -- the core order-invariance claim for TL2.
     #[kani::proof]
     fn tl2_scalar_avx2_integer_block_equivalent() {
-        // Two triplets — enough to prove the grouping invariant; larger follow by induction
+        // Two triplets -- enough to prove the grouping invariant; larger follow by induction
         let w: [i8; 6] = kani::any();
         let a: [i32; 6] = kani::any();
         for i in 0..6 {

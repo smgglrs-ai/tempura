@@ -195,7 +195,7 @@ fn test_cutile_gemv_coalesced_m1() {
         (1, 256, 128),   // two outputs
         (1, 512, 256),   // wider N and K
         (1, 2560, 4096), // LLaMA-7B q_proj: n=2560, k=4096
-        (1, 4096, 4096), // square decode step (hidden_dim × hidden_dim)
+        (1, 4096, 4096), // square decode step (hidden_dim x hidden_dim)
     ];
 
     for (m, n, k) in &shapes {
@@ -227,7 +227,7 @@ fn test_cutile_gemv_coalesced_m1() {
     }
 
     // Timing measurement for the decode-critical shape (1, 2560, 4096).
-    // Routes through forward_b_transposed → forward_gemv → cutile_gemv_coalesced.
+    // Routes through forward_b_transposed -> forward_gemv -> cutile_gemv_coalesced.
     // Includes host-to-device transfer; use the d2d methods in engine benchmarks
     // for kernel-only timing without the upload overhead.
     {
@@ -256,7 +256,7 @@ fn test_cutile_gemv_coalesced_m1() {
         let bandwidth_tbs = weight_bytes / (per_call_us * 1e-6) / 1e12;
 
         println!(
-            "cutile_gemv_coalesced shape ({m}, {n}, {k}): {per_call_us:.1}µs/call \
+            "cutile_gemv_coalesced shape ({m}, {n}, {k}): {per_call_us:.1}??s/call \
              (includes H2D transfer), weight-only bandwidth {bandwidth_tbs:.3} TB/s \
              (RTX 5090 peak 1.79 TB/s)"
         );

@@ -1,4 +1,4 @@
-//! Direct translation of ggml-cpu/repack.cpp lines 1-2681 — generic scalar
+//! Direct translation of ggml-cpu/repack.cpp lines 1-2681 -- generic scalar
 //! GEMV/GEMM kernels for Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, Q2_K, IQ4_NL, mxfp4,
 //! Q1_0; and quantize-mat routines for Q8_0 / Q8_K.
 //!
@@ -11,7 +11,7 @@ use super::blocks::{
 };
 use super::repack_llama2::{BlockQ4_0x8, BlockQ8_0x4};
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// -- Constants -----------------------------------------------------------------
 
 pub const QK8_0: usize = 32;
 pub const QK_K: usize = 256;
@@ -20,7 +20,7 @@ pub const QK4_NL: usize = 32;
 pub const QK_MXFP4: usize = 32;
 pub const QK1_0: usize = 128;
 
-// ── Lookup tables ─────────────────────────────────────────────────────────────
+// -- Lookup tables -------------------------------------------------------------
 
 pub const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
@@ -31,7 +31,7 @@ pub const KVALUES_MXFP4: [i8; 16] = [
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 ];
 
-// ── New interleaved block structs ─────────────────────────────────────────────
+// -- New interleaved block structs ---------------------------------------------
 
 /// 4 Q4_0 blocks interleaved (block<4,4>): d[4] f16, qs[64] nibble-packed.
 #[repr(C)]
@@ -81,9 +81,9 @@ pub struct BlockMxfp4x8 {
     pub qs: [u8; 128],
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// -- Helpers -------------------------------------------------------------------
 
-/// Software IEEE-754 f16 → f32.
+/// Software IEEE-754 f16 -> f32.
 #[inline(always)]
 fn f16_to_f32(v: u16) -> f32 {
     let s = (v as u32 & 0x8000) << 16;
@@ -104,7 +104,7 @@ fn f16_to_f32(v: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-/// Software IEEE-754 f32 → f16 (round-to-nearest-even).
+/// Software IEEE-754 f32 -> f16 (round-to-nearest-even).
 #[inline(always)]
 fn f32_to_f16(v: f32) -> u16 {
     let bits = v.to_bits();
@@ -133,15 +133,15 @@ fn nearest_int(fval: f32) -> i32 {
     (i & 0x007fffff) - 0x00400000
 }
 
-/// E8M0 exponent byte → f32: 2^(e − 127).
+/// E8M0 exponent byte -> f32: 2^(e ??? 127).
 #[inline(always)]
 fn e8m0_to_f32(e: u8) -> f32 {
     2.0f32.powi(e as i32 - 127)
 }
 
-// ── Quantize-mat functions (generic scalar) ───────────────────────────────────
+// -- Quantize-mat functions (generic scalar) -----------------------------------
 
-/// ggml_quantize_mat_q8_0_4x4_generic — 4-row Q8_0 with blck_size_interleave=4.
+/// ggml_quantize_mat_q8_0_4x4_generic -- 4-row Q8_0 with blck_size_interleave=4.
 pub unsafe fn quantize_mat_q8_0_4x4_generic(
     x: *const f32,
     vy: *mut u8,
@@ -174,7 +174,7 @@ pub unsafe fn quantize_mat_q8_0_4x4_generic(
     }
 }
 
-/// ggml_quantize_mat_q8_0_4x8_generic — 4-row Q8_0 with blck_size_interleave=8.
+/// ggml_quantize_mat_q8_0_4x8_generic -- 4-row Q8_0 with blck_size_interleave=8.
 pub unsafe fn quantize_mat_q8_0_4x8_generic(
     x: *const f32,
     vy: *mut u8,
@@ -207,7 +207,7 @@ pub unsafe fn quantize_mat_q8_0_4x8_generic(
     }
 }
 
-/// ggml_quantize_mat_q8_K_4x4_generic — 4-row Q8_K with blck_size_interleave=4.
+/// ggml_quantize_mat_q8_K_4x4_generic -- 4-row Q8_K with blck_size_interleave=4.
 pub unsafe fn quantize_mat_q8_k_4x4_generic(
     x: *const f32,
     vy: *mut u8,
@@ -246,7 +246,7 @@ pub unsafe fn quantize_mat_q8_k_4x4_generic(
     }
 }
 
-/// ggml_quantize_mat_q8_K_4x8_generic — 4-row Q8_K with blck_size_interleave=8.
+/// ggml_quantize_mat_q8_K_4x8_generic -- 4-row Q8_K with blck_size_interleave=8.
 pub unsafe fn quantize_mat_q8_k_4x8_generic(
     x: *const f32,
     vy: *mut u8,
@@ -285,7 +285,7 @@ pub unsafe fn quantize_mat_q8_k_4x8_generic(
     }
 }
 
-// ── Helper: decode Q4K / Q5K scale bytes ──────────────────────────────────────
+// -- Helper: decode Q4K / Q5K scale bytes --------------------------------------
 
 /// Decode one 12-byte Q4K/Q5K scale group into utmp[4] (mirrors memcpy+kmask logic).
 #[inline(always)]
@@ -304,9 +304,9 @@ fn decode_q4k_scales(scales_src: &[u8], utmp: &mut [u32; 4]) {
     utmp[0] &= KMASK1;
 }
 
-// ── GEMV Q4_0 ─────────────────────────────────────────────────────────────────
+// -- GEMV Q4_0 -----------------------------------------------------------------
 
-/// ggml_gemv_q4_0_4x4_q8_0_generic — scalar, blocklen=4, ncols=4.
+/// ggml_gemv_q4_0_4x4_q8_0_generic -- scalar, blocklen=4, ncols=4.
 pub unsafe fn gemv_q4_0_4x4_q8_0_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -341,7 +341,7 @@ pub unsafe fn gemv_q4_0_4x4_q8_0_generic(
     }
 }
 
-/// ggml_gemv_q4_0_4x8_q8_0_generic — scalar, blocklen=8, ncols=4.
+/// ggml_gemv_q4_0_4x8_q8_0_generic -- scalar, blocklen=8, ncols=4.
 pub unsafe fn gemv_q4_0_4x8_q8_0_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -376,7 +376,7 @@ pub unsafe fn gemv_q4_0_4x8_q8_0_generic(
     }
 }
 
-/// ggml_gemv_q4_0_8x8_q8_0_generic — scalar, blocklen=8, ncols=8.
+/// ggml_gemv_q4_0_8x8_q8_0_generic -- scalar, blocklen=8, ncols=8.
 pub unsafe fn gemv_q4_0_8x8_q8_0_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -411,7 +411,7 @@ pub unsafe fn gemv_q4_0_8x8_q8_0_generic(
     }
 }
 
-// ── GEMV Q4_K ─────────────────────────────────────────────────────────────────
+// -- GEMV Q4_K -----------------------------------------------------------------
 
 /// Inner Q4K GEMV kernel parameterised by BLOCKLEN and NCOLS.
 /// Mirrors ggml_gemv_q4_K_8x{4,8}_q8_K_generic in repack.cpp.
@@ -492,7 +492,7 @@ unsafe fn gemv_q4_k_q8_k_impl<const BLOCKLEN: usize, const NCOLS: usize>(
     }
 }
 
-/// ggml_gemv_q4_K_8x4_q8_K_generic — blocklen=4, ncols=8.
+/// ggml_gemv_q4_K_8x4_q8_K_generic -- blocklen=4, ncols=8.
 pub unsafe fn gemv_q4_k_8x4_q8_k_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -500,7 +500,7 @@ pub unsafe fn gemv_q4_k_8x4_q8_k_generic(
     gemv_q4_k_q8_k_impl::<4, 8>(n, s, vx, vy, nc);
 }
 
-/// ggml_gemv_q4_K_8x8_q8_K_generic — blocklen=8, ncols=8.
+/// ggml_gemv_q4_K_8x8_q8_K_generic -- blocklen=8, ncols=8.
 pub unsafe fn gemv_q4_k_8x8_q8_k_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -508,9 +508,9 @@ pub unsafe fn gemv_q4_k_8x8_q8_k_generic(
     gemv_q4_k_q8_k_impl::<8, 8>(n, s, vx, vy, nc);
 }
 
-// ── GEMV Q5_K (blocklen=4 variant — the 8x8 is in repack_llama.rs) ───────────
+// -- GEMV Q5_K (blocklen=4 variant -- the 8x8 is in repack_llama.rs) -----------
 
-/// ggml_gemv_q5_K_8x4_q8_K_generic — blocklen=4, ncols=8.
+/// ggml_gemv_q5_K_8x4_q8_K_generic -- blocklen=4, ncols=8.
 pub unsafe fn gemv_q5_k_8x4_q8_k_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -594,9 +594,9 @@ pub unsafe fn gemv_q5_k_8x4_q8_k_generic(
     }
 }
 
-// ── GEMV Q6_K (blocklen=4 variant — the 8x8 is in repack_llama.rs) ───────────
+// -- GEMV Q6_K (blocklen=4 variant -- the 8x8 is in repack_llama.rs) -----------
 
-/// ggml_gemv_q6_K_8x4_q8_K_generic — blocklen=4, ncols=8.
+/// ggml_gemv_q6_K_8x4_q8_K_generic -- blocklen=4, ncols=8.
 pub unsafe fn gemv_q6_k_8x4_q8_k_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -666,9 +666,9 @@ pub unsafe fn gemv_q6_k_8x4_q8_k_generic(
     }
 }
 
-// ── GEMV IQ4_NL ──────────────────────────────────────────────────────────────
+// -- GEMV IQ4_NL --------------------------------------------------------------
 
-/// ggml_gemv_iq4_nl_4x4_q8_0_generic — blocklen=4, ncols=4.
+/// ggml_gemv_iq4_nl_4x4_q8_0_generic -- blocklen=4, ncols=4.
 pub unsafe fn gemv_iq4_nl_4x4_q8_0_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -703,7 +703,7 @@ pub unsafe fn gemv_iq4_nl_4x4_q8_0_generic(
     }
 }
 
-/// ggml_gemv_iq4_nl_8x8_q8_0_generic — blocklen=8, ncols=8.
+/// ggml_gemv_iq4_nl_8x8_q8_0_generic -- blocklen=8, ncols=8.
 pub unsafe fn gemv_iq4_nl_8x8_q8_0_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -738,9 +738,9 @@ pub unsafe fn gemv_iq4_nl_8x8_q8_0_generic(
     }
 }
 
-// ── GEMV mxfp4 ───────────────────────────────────────────────────────────────
+// -- GEMV mxfp4 ---------------------------------------------------------------
 
-/// ggml_gemv_mxfp4_4x4_q8_0_generic — blocklen=4, ncols=4.
+/// ggml_gemv_mxfp4_4x4_q8_0_generic -- blocklen=4, ncols=4.
 pub unsafe fn gemv_mxfp4_4x4_q8_0_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -775,7 +775,7 @@ pub unsafe fn gemv_mxfp4_4x4_q8_0_generic(
     }
 }
 
-/// ggml_gemv_mxfp4_8x8_q8_0_generic — blocklen=8, ncols=8.
+/// ggml_gemv_mxfp4_8x8_q8_0_generic -- blocklen=8, ncols=8.
 pub unsafe fn gemv_mxfp4_8x8_q8_0_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -810,9 +810,9 @@ pub unsafe fn gemv_mxfp4_8x8_q8_0_generic(
     }
 }
 
-// ── GEMV Q8_0 ─────────────────────────────────────────────────────────────────
+// -- GEMV Q8_0 -----------------------------------------------------------------
 
-/// ggml_gemv_q8_0_4x4_q8_0_generic — blocklen=4, ncols=4.
+/// ggml_gemv_q8_0_4x4_q8_0_generic -- blocklen=4, ncols=4.
 pub unsafe fn gemv_q8_0_4x4_q8_0_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -844,7 +844,7 @@ pub unsafe fn gemv_q8_0_4x4_q8_0_generic(
     }
 }
 
-/// ggml_gemv_q8_0_4x8_q8_0_generic — blocklen=8, ncols=4.
+/// ggml_gemv_q8_0_4x8_q8_0_generic -- blocklen=8, ncols=4.
 pub unsafe fn gemv_q8_0_4x8_q8_0_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -876,9 +876,9 @@ pub unsafe fn gemv_q8_0_4x8_q8_0_generic(
     }
 }
 
-// ── GEMV Q1_0 ─────────────────────────────────────────────────────────────────
+// -- GEMV Q1_0 -----------------------------------------------------------------
 
-/// ggml_gemv_q1_0_4x4_q8_0_generic — blocklen=QK8_0 (4-wide SIMD tiles), ncols=4.
+/// ggml_gemv_q1_0_4x4_q8_0_generic -- blocklen=QK8_0 (4-wide SIMD tiles), ncols=4.
 pub unsafe fn gemv_q1_0_4x4_q8_0_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -921,7 +921,7 @@ pub unsafe fn gemv_q1_0_4x4_q8_0_generic(
     }
 }
 
-/// ggml_gemv_q1_0_4x8_q8_0_generic — blocklen=8, ncols=4.
+/// ggml_gemv_q1_0_4x8_q8_0_generic -- blocklen=8, ncols=4.
 pub unsafe fn gemv_q1_0_4x8_q8_0_generic(
     n: usize, s: *mut f32, _bs: usize,
     vx: *const u8, vy: *const u8, _nr: usize, nc: usize,
@@ -967,9 +967,9 @@ pub unsafe fn gemv_q1_0_4x8_q8_0_generic(
     }
 }
 
-// ── GEMM Q4_0 ─────────────────────────────────────────────────────────────────
+// -- GEMM Q4_0 -----------------------------------------------------------------
 
-/// ggml_gemm_q4_0_4x4_q8_0_generic — blocklen=4, ncols=4, nrows=4.
+/// ggml_gemm_q4_0_4x4_q8_0_generic -- blocklen=4, ncols=4, nrows=4.
 pub unsafe fn gemm_q4_0_4x4_q8_0_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1014,7 +1014,7 @@ pub unsafe fn gemm_q4_0_4x4_q8_0_generic(
     }
 }
 
-/// ggml_gemm_q4_0_4x8_q8_0_generic — blocklen=8, ncols=4.
+/// ggml_gemm_q4_0_4x8_q8_0_generic -- blocklen=8, ncols=4.
 pub unsafe fn gemm_q4_0_4x8_q8_0_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1059,7 +1059,7 @@ pub unsafe fn gemm_q4_0_4x8_q8_0_generic(
     }
 }
 
-/// ggml_gemm_q4_0_8x8_q8_0_generic — blocklen=8, ncols=8.
+/// ggml_gemm_q4_0_8x8_q8_0_generic -- blocklen=8, ncols=8.
 pub unsafe fn gemm_q4_0_8x8_q8_0_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1104,7 +1104,7 @@ pub unsafe fn gemm_q4_0_8x8_q8_0_generic(
     }
 }
 
-// ── GEMM Q4_K ─────────────────────────────────────────────────────────────────
+// -- GEMM Q4_K -----------------------------------------------------------------
 
 unsafe fn gemm_q4_k_q8_k_impl<const BLOCKLEN: usize, const NCOLS: usize>(
     n: usize, s: *mut f32, bs: usize,
@@ -1187,7 +1187,7 @@ unsafe fn gemm_q4_k_q8_k_impl<const BLOCKLEN: usize, const NCOLS: usize>(
     }
 }
 
-/// ggml_gemm_q4_K_8x4_q8_K_generic — blocklen=4, ncols=8.
+/// ggml_gemm_q4_K_8x4_q8_K_generic -- blocklen=4, ncols=8.
 pub unsafe fn gemm_q4_k_8x4_q8_k_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1195,7 +1195,7 @@ pub unsafe fn gemm_q4_k_8x4_q8_k_generic(
     gemm_q4_k_q8_k_impl::<4, 8>(n, s, bs, vx, vy, nr, nc);
 }
 
-/// ggml_gemm_q4_K_8x8_q8_K_generic — blocklen=8, ncols=8.
+/// ggml_gemm_q4_K_8x8_q8_K_generic -- blocklen=8, ncols=8.
 pub unsafe fn gemm_q4_k_8x8_q8_k_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1203,9 +1203,9 @@ pub unsafe fn gemm_q4_k_8x8_q8_k_generic(
     gemm_q4_k_q8_k_impl::<8, 8>(n, s, bs, vx, vy, nr, nc);
 }
 
-// ── GEMM Q2_K ─────────────────────────────────────────────────────────────────
+// -- GEMM Q2_K -----------------------------------------------------------------
 
-/// ggml_gemm_q2_K_8x8_q8_K_generic — blocklen=8, ncols=8.
+/// ggml_gemm_q2_K_8x8_q8_K_generic -- blocklen=8, ncols=8.
 pub unsafe fn gemm_q2_k_8x8_q8_k_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1281,9 +1281,9 @@ pub unsafe fn gemm_q2_k_8x8_q8_k_generic(
     }
 }
 
-// ── GEMM Q5_K ─────────────────────────────────────────────────────────────────
+// -- GEMM Q5_K -----------------------------------------------------------------
 
-/// ggml_gemm_q5_K_8x8_q8_K_generic — blocklen=8, ncols=8 (8x4 is in repack_llama.rs).
+/// ggml_gemm_q5_K_8x8_q8_K_generic -- blocklen=8, ncols=8 (8x4 is in repack_llama.rs).
 pub unsafe fn gemm_q5_k_8x8_q8_k_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1384,9 +1384,9 @@ pub unsafe fn gemm_q5_k_8x8_q8_k_generic(
     }
 }
 
-// ── GEMM Q6_K ─────────────────────────────────────────────────────────────────
+// -- GEMM Q6_K -----------------------------------------------------------------
 
-/// ggml_gemm_q6_K_8x8_q8_K_generic — blocklen=8, ncols=8 (8x4 is in repack_llama.rs).
+/// ggml_gemm_q6_K_8x8_q8_K_generic -- blocklen=8, ncols=8 (8x4 is in repack_llama.rs).
 pub unsafe fn gemm_q6_k_8x8_q8_k_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1472,9 +1472,9 @@ pub unsafe fn gemm_q6_k_8x8_q8_k_generic(
     }
 }
 
-// ── GEMM IQ4_NL ───────────────────────────────────────────────────────────────
+// -- GEMM IQ4_NL ---------------------------------------------------------------
 
-/// ggml_gemm_iq4_nl_4x4_q8_0_generic — blocklen=4, ncols=4.
+/// ggml_gemm_iq4_nl_4x4_q8_0_generic -- blocklen=4, ncols=4.
 pub unsafe fn gemm_iq4_nl_4x4_q8_0_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1519,7 +1519,7 @@ pub unsafe fn gemm_iq4_nl_4x4_q8_0_generic(
     }
 }
 
-/// ggml_gemm_iq4_nl_8x8_q8_0_generic — blocklen=8, ncols=8.
+/// ggml_gemm_iq4_nl_8x8_q8_0_generic -- blocklen=8, ncols=8.
 pub unsafe fn gemm_iq4_nl_8x8_q8_0_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1564,9 +1564,9 @@ pub unsafe fn gemm_iq4_nl_8x8_q8_0_generic(
     }
 }
 
-// ── GEMM mxfp4 ───────────────────────────────────────────────────────────────
+// -- GEMM mxfp4 ---------------------------------------------------------------
 
-/// ggml_gemm_mxfp4_4x4_q8_0_generic — blocklen=4, ncols=4.
+/// ggml_gemm_mxfp4_4x4_q8_0_generic -- blocklen=4, ncols=4.
 pub unsafe fn gemm_mxfp4_4x4_q8_0_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1611,7 +1611,7 @@ pub unsafe fn gemm_mxfp4_4x4_q8_0_generic(
     }
 }
 
-/// ggml_gemm_mxfp4_8x8_q8_0_generic — blocklen=8, ncols=8.
+/// ggml_gemm_mxfp4_8x8_q8_0_generic -- blocklen=8, ncols=8.
 pub unsafe fn gemm_mxfp4_8x8_q8_0_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1656,9 +1656,9 @@ pub unsafe fn gemm_mxfp4_8x8_q8_0_generic(
     }
 }
 
-// ── GEMM Q8_0 ─────────────────────────────────────────────────────────────────
+// -- GEMM Q8_0 -----------------------------------------------------------------
 
-/// ggml_gemm_q8_0_4x4_q8_0_generic — blocklen=4, ncols=4.
+/// ggml_gemm_q8_0_4x4_q8_0_generic -- blocklen=4, ncols=4.
 pub unsafe fn gemm_q8_0_4x4_q8_0_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1700,7 +1700,7 @@ pub unsafe fn gemm_q8_0_4x4_q8_0_generic(
     }
 }
 
-/// ggml_gemm_q8_0_4x8_q8_0_generic — blocklen=8, ncols=4.
+/// ggml_gemm_q8_0_4x8_q8_0_generic -- blocklen=8, ncols=4.
 pub unsafe fn gemm_q8_0_4x8_q8_0_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1742,9 +1742,9 @@ pub unsafe fn gemm_q8_0_4x8_q8_0_generic(
     }
 }
 
-// ── GEMM Q1_0 ─────────────────────────────────────────────────────────────────
+// -- GEMM Q1_0 -----------------------------------------------------------------
 
-/// ggml_gemm_q1_0_4x4_q8_0_generic — ncols=4, nrows=4.
+/// ggml_gemm_q1_0_4x4_q8_0_generic -- ncols=4, nrows=4.
 pub unsafe fn gemm_q1_0_4x4_q8_0_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,
@@ -1812,7 +1812,7 @@ pub unsafe fn gemm_q1_0_4x4_q8_0_generic(
     }
 }
 
-/// ggml_gemm_q1_0_4x8_q8_0_generic — blocklen=8, ncols=4, nrows=4.
+/// ggml_gemm_q1_0_4x8_q8_0_generic -- blocklen=8, ncols=4, nrows=4.
 pub unsafe fn gemm_q1_0_4x8_q8_0_generic(
     n: usize, s: *mut f32, bs: usize,
     vx: *const u8, vy: *const u8, nr: usize, nc: usize,

@@ -1,4 +1,4 @@
-//! Verus-verified trace diff invariants — unbounded proofs
+//! Verus-verified trace diff invariants -- unbounded proofs
 //!
 //! Proves: layer_diffs count bounded by min of trace lengths,
 //! token_diffs bounded by min of generated counts, divergence

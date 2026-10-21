@@ -7,10 +7,10 @@
 //! - ARM NEON ggml_nvfp4_dot8 helper
 //! - WASM SIMD128 (via feature gate; wasm_simd128.h has no extra helpers here)
 //! - POWER9/AltiVec (via feature gate; altivec.h has no extra helpers here)
-//! - s390x VXE / VXE2 — vector types, operator macros, and helper functions
+//! - s390x VXE / VXE2 -- vector types, operator macros, and helper functions
 //! - LoongArch LSX/LASX scalar broadcast helpers
 
-// ── GgmlComputeParams ────────────────────────────────────────────────────────
+// -- GgmlComputeParams --------------------------------------------------------
 // Mirrors: struct ggml_compute_params { int ith, nth; size_t wsize; void* wdata; ... }
 
 #[derive(Debug, Clone)]
@@ -34,7 +34,7 @@ impl Default for GgmlComputeParams {
     }
 }
 
-// ── ARM NEON ─────────────────────────────────────────────────────────────────
+// -- ARM NEON -----------------------------------------------------------------
 //
 // ggml_vld1q_u32(w,x,y,z) macro: constructs a uint32x4_t from 4 u32 values.
 // On MSVC: packed as two u64; on all other compilers: direct array.
@@ -100,7 +100,7 @@ pub mod neon_compat {
         a.max(b)
     }
 
-    // vcvtnq_s32_f32: round-to-nearest float32x4 → int32x4.
+    // vcvtnq_s32_f32: round-to-nearest float32x4 -> int32x4.
     // C: res[i] = roundf(vgetq_lane_f32(v, i));
     #[inline(always)]
     pub unsafe fn vcvtnq_s32_f32_compat(v: float32x4_t) -> int32x4_t {
@@ -213,7 +213,7 @@ pub mod neon_compat {
     }
 }
 
-// ── ARM NEON (both AArch32 and AArch64) ─────────────────────────────────────
+// -- ARM NEON (both AArch32 and AArch64) -------------------------------------
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 pub mod neon_dot {
     //! ggml_vdotq_s32: dot product fallback when __ARM_FEATURE_DOTPROD is absent.
@@ -221,7 +221,7 @@ pub mod neon_dot {
 
     use std::arch::aarch64::*;
 
-    // ggml_vdotq_s32 — fallback when vdotq_s32 unavailable.
+    // ggml_vdotq_s32 -- fallback when vdotq_s32 unavailable.
     // NOTE: per the original comment, this produces the same total sum but with
     // different per-lane grouping vs native vdotq_s32.
     #[cfg(not(target_feature = "dotprod"))]
@@ -239,7 +239,7 @@ pub mod neon_dot {
         vdotq_s32(acc, a, b)
     }
 
-    // ggml_nvfp4_dot8: dot product of two pairs of int8x8 — used for NVFP4.
+    // ggml_nvfp4_dot8: dot product of two pairs of int8x8 -- used for NVFP4.
     // C: const int16x8_t p_lo = vmull_s8(q4_lo, q8_lo);
     //    const int16x8_t p_hi = vmull_s8(q4_hi, q8_hi);
     //    const int32x4_t sum_lo = vpaddlq_s16(p_lo);
@@ -260,14 +260,14 @@ pub mod neon_dot {
     }
 }
 
-// ── AArch64 (on AArch64 all the compat aliases are simple type aliases) ──────
+// -- AArch64 (on AArch64 all the compat aliases are simple type aliases) ------
 // On AArch64, the C code defines:
 //   #define ggml_int16x8x2_t  int16x8x2_t
 //   #define ggml_vld1q_s16_x2 vld1q_s16_x2
 //   ... etc.
 // In Rust, these re-export from std::arch::aarch64 directly; no extra code needed.
 
-// ── s390x VXE / VXE2 ─────────────────────────────────────────────────────────
+// -- s390x VXE / VXE2 ---------------------------------------------------------
 #[cfg(target_arch = "s390x")]
 pub mod vxe {
     //! Translation of the __VXE__ / __VXE2__ block in ggml-cpu-impl.h.
@@ -397,7 +397,7 @@ pub mod vxe {
         Int8x16(res)
     }
 
-    // vec_padd_s16: pairwise horizontal add of two int16x8 → int16x8.
+    // vec_padd_s16: pairwise horizontal add of two int16x8 -> int16x8.
     // C: const uchar8x16_t v_maske = {0,1,4,5,8,9,12,13,16,17,20,21,24,25,28,29};
     //    v_abo = vec_pack((int32x4_t)a, (int32x4_t)b);  // pack high 16 of each 32
     //    v_abe = vec_perm(a, b, v_maske);               // interleave evens
@@ -435,7 +435,7 @@ pub mod vxe {
     // ggml_vec_dot: accumulate int8 dot product into int32x4.
     // C: const int16x8_t p = vec_mule(a, b) + vec_mulo(a, b);
     //    return acc + (vec_unpackh(p) + vec_unpackl(p));
-    // vec_mule/vec_mulo: even/odd element multiply → int16x8_t
+    // vec_mule/vec_mulo: even/odd element multiply -> int16x8_t
     // vec_unpackh/l: sign-extend int16 to int32
     pub fn ggml_vec_dot(acc: Int32x4, a: Int8x16, b: Int8x16) -> Int32x4 {
         // mule: multiply even-indexed bytes (0,2,4,...14)
@@ -455,7 +455,7 @@ pub mod vxe {
         }
         // unpackh: sign-extend upper 4 int16 to int32
         // unpackl: sign-extend lower 4 int16 to int32
-        // sum: (unpackh + unpackl) gives element-wise 8→4 sum, then acc+
+        // sum: (unpackh + unpackl) gives element-wise 8->4 sum, then acc+
         let mut res = [0i32; 4];
         for i in 0..4 {
             res[i] = acc.0[i]
@@ -465,7 +465,7 @@ pub mod vxe {
     }
 }
 
-// ── LoongArch LSX/LASX ────────────────────────────────────────────────────────
+// -- LoongArch LSX/LASX --------------------------------------------------------
 #[cfg(target_arch = "loongarch64")]
 pub mod loongarch {
     //! Translation of LoongArch scalar broadcast helpers from ggml-cpu-impl.h.
@@ -487,13 +487,13 @@ pub mod loongarch {
     }
 }
 
-// ── Threadpool interface ──────────────────────────────────────────────────────
+// -- Threadpool interface ------------------------------------------------------
 // These are declared in ggml-cpu-impl.h with external linkage.
 // In the Rust codebase they are implemented elsewhere; we declare them as
 // extern "C" so that any future FFI call matches the original ABI.
 //
 // NOTE: ggml_barrier, ggml_threadpool_chunk_set, ggml_threadpool_chunk_add
-// are declared but not defined here — definition is in ggml-threading.
+// are declared but not defined here -- definition is in ggml-threading.
 // Commented out to avoid unresolved symbol errors until FFI is wired up.
 //
 // extern "C" {

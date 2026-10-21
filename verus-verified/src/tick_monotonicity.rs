@@ -1,4 +1,4 @@
-//! Verus-verified tick monotonicity — unbounded proofs
+//! Verus-verified tick monotonicity -- unbounded proofs
 //!
 //! Proves that the prefix cache tick counter is strictly increasing
 //! and that LRU ordering is consistent with tick values.

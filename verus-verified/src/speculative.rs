@@ -1,4 +1,4 @@
-//! Verus-verified speculative decoding indexing — unbounded proofs
+//! Verus-verified speculative decoding indexing -- unbounded proofs
 
 use vstd::prelude::*;
 

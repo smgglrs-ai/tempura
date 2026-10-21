@@ -14,13 +14,13 @@ pub mod kernels {
     /// Processes one head at a time: Q has shape [1, 1, seq_pad, D],
     /// K/V have shape [1, 1, kv_pad, D] (already GQA-selected on host).
     ///
-    /// Grid: (1, ceil(seq_pad / BM), 1) — one program per query tile.
+    /// Grid: (1, ceil(seq_pad / BM), 1) -- one program per query tile.
     ///
     /// Template parameters:
-    ///   BM — query tile height (rows of Q processed per program)
-    ///   BN — key-value tile height (KV positions per inner tile)
-    ///   D  — head dimension (must equal actual head_dim)
-    ///   CAUSAL — 1 to apply causal masking, 0 for full attention
+    ///   BM -- query tile height (rows of Q processed per program)
+    ///   BN -- key-value tile height (KV positions per inner tile)
+    ///   D  -- head dimension (must equal actual head_dim)
+    ///   CAUSAL -- 1 to apply causal masking, 0 for full attention
     #[cutile::entry(
         optimization_hints = (
             sm_120 = (num_cta_in_cga = 1, max_divisibility = 16,),
@@ -35,7 +35,7 @@ pub mod kernels {
         input_pos: i32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
-        // batch_idx = 0, head_idx = 0 — host already selected the right head
+        // batch_idx = 0, head_idx = 0 -- host already selected the right head
         let q_m_idx = pid.1;
 
         // Convert scale to log2 space so we can use exp2 (GPU fast path)
@@ -58,7 +58,7 @@ pub mod kernels {
         // KV sequence length from the runtime tensor shape
         let kv_seqlen: i32 = get_shape_dim(k.shape(), 2i32);
 
-        // How many KV tiles to visit (causal → only up to the last visible KV position)
+        // How many KV tiles to visit (causal -> only up to the last visible KV position)
         let m_end: i32 = input_pos + (q_m_idx + 1i32) * BM;
         let mut mask_start: i32 = kv_seqlen / BN;
         let mut tc: i32 = ceil_div(kv_seqlen, BN);
@@ -99,9 +99,9 @@ pub mod kernels {
             if CAUSAL == 1i32 && j >= mask_start {
                 let offs_n: Tile<i32, { [BM, BN] }> =
                     broadcast_scalar(j * BN, shape![BM, BN]) + offs_n_base;
-                // mask: keep (q_pos >= kv_pos) — standard causal constraint
+                // mask: keep (q_pos >= kv_pos) -- standard causal constraint
                 let causal_ok: Tile<bool, { [BM, BN] }> = ge_tile(offs_m, offs_n);
-                // mask: keep (kv_pos < kv_seqlen) — guard for padding
+                // mask: keep (kv_pos < kv_seqlen) -- guard for padding
                 let in_bounds: Tile<bool, { [BM, BN] }> = lt_tile(offs_n, kv_seqlen_tile);
                 let mask: Tile<bool, { [BM, BN] }> = causal_ok & in_bounds;
                 qk = qk + select(mask, mask_keep, mask_drop);
@@ -176,7 +176,7 @@ impl CutileAttention {
     }
 }
 
-// Tile dimensions. BM and BN must be powers-of-two ≥ 1 and divisors of the
+// Tile dimensions. BM and BN must be powers-of-two >= 1 and divisors of the
 // padded sequence lengths. D is passed as a runtime generic to the JIT.
 const BM: usize = 16;
 const BN: usize = 16;
@@ -309,7 +309,7 @@ impl Attention for CutileAttention {
                         .sync_on(stream)
                         .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
-                // Download result: [1, seq_pad, head_dim] → first seq_len rows
+                // Download result: [1, seq_pad, head_dim] -> first seq_len rows
                 let host: Vec<f32> = out_part_result
                     .unpartition()
                     .to_host_vec()
@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn cutile_attention_matches_cpu() {
         let gpu = CutileAttention::new()
-            .expect("Failed to create GPU context — is an NVIDIA GPU available?");
+            .expect("Failed to create GPU context -- is an NVIDIA GPU available?");
 
         let (batch, seq_len, kv_len) = (1, 4, 4);
         let (num_heads, num_kv_heads, head_dim) = (2, 2, 16);
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn cutile_attention_gqa() {
         let gpu = CutileAttention::new()
-            .expect("Failed to create GPU context — is an NVIDIA GPU available?");
+            .expect("Failed to create GPU context -- is an NVIDIA GPU available?");
 
         let (batch, seq_len, kv_len) = (1, 2, 4);
         let (num_heads, num_kv_heads, head_dim) = (4, 2, 16);

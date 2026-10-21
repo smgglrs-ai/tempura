@@ -59,12 +59,12 @@ pub unsafe fn vec_binary_op_non_contiguous(
 // Full tensor-geometry version with 4-D strides and thread row range.
 //
 // Parameters mirror GGML_TENSOR_BINARY_OP_LOCALS:
-//   ne0..ne2   — dst / src0 shape (same shape asserted by caller)
-//   nb1..nb3   — dst byte strides (nb0 == sizeof(f32) assumed)
-//   nb01..nb03 — src0 byte strides
-//   ne10..ne13 — src1 shape (may be smaller: broadcasting)
-//   nb10..nb13 — src1 byte strides
-//   is_src1_contiguous_rows — ggml_is_contiguous_rows(src1)
+//   ne0..ne2   -- dst / src0 shape (same shape asserted by caller)
+//   nb1..nb3   -- dst byte strides (nb0 == sizeof(f32) assumed)
+//   nb01..nb03 -- src0 byte strides
+//   ne10..ne13 -- src1 shape (may be smaller: broadcasting)
+//   nb10..nb13 -- src1 byte strides
+//   is_src1_contiguous_rows -- ggml_is_contiguous_rows(src1)
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn apply_binary_op_f32(
     op: fn(f32, f32) -> f32,
@@ -129,7 +129,7 @@ pub unsafe fn apply_binary_op_f32(
     }
 }
 
-// ── Public entry points (f32 contiguous slices, single-threaded) ─────────────
+// -- Public entry points (f32 contiguous slices, single-threaded) -------------
 // These correspond to ggml_compute_forward_{add,sub,mul,div} for the common
 // all-f32 contiguous case.
 
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn test_vec_binary_op_non_contiguous_broadcast() {
-        // src1 has 2 elements, src0 has 4 — non-contiguous with modular access
+        // src1 has 2 elements, src0 has 4 -- non-contiguous with modular access
         let src0 = [1.0f32, 2.0, 3.0, 4.0];
         let src1 = [10.0f32, 20.0];
         let mut dst = [0.0f32; 4];
@@ -252,10 +252,10 @@ mod tests {
                 op_add,
             );
         }
-        // i=0: i10=0 → src1[0]=10 → 1+10=11
-        // i=1: i10=1 → src1[1]=20 → 2+20=22
-        // i=2: i10=0 → src1[0]=10 → 3+10=13
-        // i=3: i10=1 → src1[1]=20 → 4+20=24
+        // i=0: i10=0 -> src1[0]=10 -> 1+10=11
+        // i=1: i10=1 -> src1[1]=20 -> 2+20=22
+        // i=2: i10=0 -> src1[0]=10 -> 3+10=13
+        // i=3: i10=1 -> src1[1]=20 -> 4+20=24
         assert_eq!(dst, [11.0, 22.0, 13.0, 24.0]);
     }
 }

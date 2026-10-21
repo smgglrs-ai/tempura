@@ -1,4 +1,4 @@
-//! Verus-verified KV cache append-advance atomicity — unbounded proofs
+//! Verus-verified KV cache append-advance atomicity -- unbounded proofs
 //!
 //! Proves the forward pass property: append_kv is called once per layer
 //! with the same num_new_tokens, then advance is called exactly once.
@@ -22,7 +22,7 @@ proof fn all_layers_same_tokens(
         num_new_tokens >= 1,
         layer < num_layers,
     ensures
-        // Each layer appends exactly num_new_tokens — uniform across layers
+        // Each layer appends exactly num_new_tokens -- uniform across layers
         num_new_tokens == num_new_tokens,
 {
 }
@@ -85,7 +85,7 @@ proof fn append_before_advance_offset(
 }
 
 // ============================================================================
-// Proof: advance is idempotent — calling advance(n) twice is wrong (detected)
+// Proof: advance is idempotent -- calling advance(n) twice is wrong (detected)
 // ============================================================================
 
 proof fn double_advance_exceeds(

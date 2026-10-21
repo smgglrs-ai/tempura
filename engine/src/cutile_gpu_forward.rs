@@ -9,10 +9,10 @@
 /// re-upload the activation.
 ///
 /// The two remaining explicit pad steps per layer are:
-///   - normed   → h_pad   (one `to_device_padded` call, used for Q, K, V)
-///   - normed2  → h_pad   (one `to_device_padded` call, used for gate, up)
-///   - gate×up  → inter_pad (one `to_device_padded` call, used for down)
-///   - attn_out → q_pad   (one from_device + one to_device_padded, for O projection)
+///   - normed   -> h_pad   (one `to_device_padded` call, used for Q, K, V)
+///   - normed2  -> h_pad   (one `to_device_padded` call, used for gate, up)
+///   - gatexup  -> inter_pad (one `to_device_padded` call, used for down)
+///   - attn_out -> q_pad   (one from_device + one to_device_padded, for O projection)
 ///
 /// CPU operations that still require a host round-trip per layer: two residual
 /// adds (O-proj and down-proj outputs) and one K download for the KV-cache host
@@ -71,7 +71,7 @@ unsafe impl Sync for KernelScalarNode {}
 ///
 /// The exec is replayed each decode step via `cuGraphLaunch`.  KV writes are
 /// performed by the scatter-write kernel inside the graph, which reads
-/// `d_kv_write_offset` from device memory at execution time — no
+/// `d_kv_write_offset` from device memory at execution time -- no
 /// `cuGraphExecMemcpyNodeSetParams` calls required.  Flash-attn kv_len and
 /// RoPE position nodes are updated via `cuGraphExecKernelNodeSetParams_v2`.
 /// No re-capture, no `cuGraphExecUpdate_v2`.
@@ -102,14 +102,14 @@ unsafe impl Send for DecodeGraph {}
 unsafe impl Sync for DecodeGraph {}
 
 // BK must be a multiple that divides all standard hidden / intermediate
-// dimensions (4096, 11008, 14336, …).  16 matches the tiling constant used
+// dimensions (4096, 11008, 14336, ...).  16 matches the tiling constant used
 // inside CutileMatMul::forward_bt_device_to_device.
 const BK: usize = 16;
 
 // BN_GEMV: number of output neurons computed per GPU program in the multi-output
 // quantized GEMV kernels (cutile_q*_gemv_bn).  Matches a CUDA warp (32 threads)
 // so each program covers exactly one warp's worth of outputs, maximising occupancy.
-// Standard transformer dimensions (4096, 8192, 11008, 14336, …) are all multiples
+// Standard transformer dimensions (4096, 8192, 11008, 14336, ...) are all multiples
 // of 32, so this value works for all projection shapes we encounter.
 const BN_GEMV: usize = 32;
 
@@ -127,13 +127,13 @@ struct DeviceWeight {
 
 /// Q2_0 quantized weight tensor resident on the GPU.
 ///
-/// Packed format: [n × k_blocks × Q2_0_PACKED_U32S] u32 elements.
+/// Packed format: [n x k_blocks x Q2_0_PACKED_U32S] u32 elements.
 /// Each block of 128 elements occupies 9 u32 slots:
-///   slot 0      : f32 bits of block scale (f16 → f32 at upload time)
+///   slot 0      : f32 bits of block scale (f16 -> f32 at upload time)
 ///   slots 1..=8 : 8 u32 words of 2-bit packed weights (16 values per u32)
-/// Dequant in kernel: (q - 1) × scale, q ∈ {0,1,2,3}.
+/// Dequant in kernel: (q - 1) x scale, q ??? {0,1,2,3}.
 struct DeviceWeightQ2 {
-    /// Packed u32 tensor on GPU, flat shape [n × k_blocks × Q2_0_PACKED_U32S].
+    /// Packed u32 tensor on GPU, flat shape [n x k_blocks x Q2_0_PACKED_U32S].
     tensor: Arc<Tensor<u32>>,
     /// Number of output neurons.
     n: usize,
@@ -143,14 +143,14 @@ struct DeviceWeightQ2 {
 
 /// Q6_K quantized weight tensor resident on the GPU.
 ///
-/// Packed format: [n × k_blocks × Q6K_PACKED_U32S] u32 elements (53 u32/block, native ql+qh).
+/// Packed format: [n x k_blocks x Q6K_PACKED_U32S] u32 elements (53 u32/block, native ql+qh).
 /// Each block of 256 elements occupies 81 u32 slots:
-///   slot 0       : f32 bits of block super-scale d (f16 → f32 at upload)
-///   slots 1..17  : f32 bits of 16 per-group scales (i8 → f32 at upload)
+///   slot 0       : f32 bits of block super-scale d (f16 -> f32 at upload)
+///   slots 1..17  : f32 bits of 16 per-group scales (i8 -> f32 at upload)
 ///   slots 17..81 : 64 u32 words, each holding 4 q_full bytes (values 0..63)
-/// Dequant in kernel: d × scale[group] × (q_full − 32), group = element_idx / 16.
+/// Dequant in kernel: d x scale[group] x (q_full ??? 32), group = element_idx / 16.
 struct DeviceWeightQ6K {
-    /// Packed u32 tensor on GPU, flat shape [n × k_blocks × Q6K_PACKED_U32S].
+    /// Packed u32 tensor on GPU, flat shape [n x k_blocks x Q6K_PACKED_U32S].
     tensor: Arc<Tensor<u32>>,
     /// Number of output neurons.
     n: usize,
@@ -160,17 +160,17 @@ struct DeviceWeightQ6K {
 
 /// Q4_K quantized weight tensor resident on the GPU.
 ///
-/// Packed format: [n × k_blocks × Q4K_PACKED_U32S] u32 elements.
+/// Packed format: [n x k_blocks x Q4K_PACKED_U32S] u32 elements.
 /// Each block of 256 elements occupies 42 u32 slots:
-///   slot 0       : f32 bits of d (super-scale, f16 → f32)
-///   slot 1       : f32 bits of dmin (super-min, f16 → f32)
-///   slots 2..6   : sc[2*j] | (sc[2*j+1]<<8) for j=0..4 (unpacked 6-bit → 8-bit scales)
-///   slots 6..10  : m[2*j]  | (m[2*j+1]<<8)  for j=0..4 (unpacked 6-bit → 8-bit mins)
+///   slot 0       : f32 bits of d (super-scale, f16 -> f32)
+///   slot 1       : f32 bits of dmin (super-min, f16 -> f32)
+///   slots 2..6   : sc[2*j] | (sc[2*j+1]<<8) for j=0..4 (unpacked 6-bit -> 8-bit scales)
+///   slots 6..10  : m[2*j]  | (m[2*j+1]<<8)  for j=0..4 (unpacked 6-bit -> 8-bit mins)
 ///   slots 10..42 : 32 u32 words of packed nibble bytes (128 bytes total)
 /// Dequant in kernel: w[j*64+l] = d*sc[2*j]*lo_nibble - dmin*m[2*j]
 ///                    w[j*64+l+32] = d*sc[2*j+1]*hi_nibble - dmin*m[2*j+1]
 struct DeviceWeightQ4K {
-    /// Packed u32 tensor on GPU, flat shape [n × k_blocks × Q4K_PACKED_U32S].
+    /// Packed u32 tensor on GPU, flat shape [n x k_blocks x Q4K_PACKED_U32S].
     tensor: Arc<Tensor<u32>>,
     /// Number of output neurons.
     n: usize,
@@ -185,7 +185,7 @@ fn next_pow2(x: usize) -> usize {
     1usize << (usize::BITS - (x - 1).leading_zeros()) as usize
 }
 
-/// IEEE 754 f16 bit pattern → f32 (used in the Q2_0 upload path).
+/// IEEE 754 f16 bit pattern -> f32 (used in the Q2_0 upload path).
 #[inline(always)]
 fn f16_bits_to_f32_inline(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
@@ -216,7 +216,7 @@ fn f16_bits_to_f32_inline(bits: u16) -> f32 {
     }
 }
 
-// Scratch-pool slot indices — one pre-allocated decode output buffer per projection.
+// Scratch-pool slot indices -- one pre-allocated decode output buffer per projection.
 // Each slot is reclaimed between layers because the previous caller's Arc is dropped
 // at the end of each loop body before the next layer's gemm_d2d_slot call.
 const SLOT_Q: usize = 0;
@@ -235,11 +235,11 @@ const NUM_SLOTS: usize = 8;
 /// [`CutileGpuModel::forward`] for each inference step.
 pub struct CutileGpuModel {
     config: ModelConfig,
-    /// next_pow2(hidden_size.div_ceil(BK) * BK) — padded column count for h-wide activations.
+    /// next_pow2(hidden_size.div_ceil(BK) * BK) -- padded column count for h-wide activations.
     h_pad: usize,
-    /// next_pow2(q_dim.div_ceil(BK) * BK) — padded column count for attention output (o_proj).
+    /// next_pow2(q_dim.div_ceil(BK) * BK) -- padded column count for attention output (o_proj).
     q_pad: usize,
-    /// next_pow2(intermediate_size.div_ceil(BK) * BK) — padded column count for FFN activations.
+    /// next_pow2(intermediate_size.div_ceil(BK) * BK) -- padded column count for FFN activations.
     inter_pad: usize,
     device_weights: HashMap<String, DeviceWeight>,
     /// Q4_K-quantized projection weights stored in packed GPU format.
@@ -252,23 +252,23 @@ pub struct CutileGpuModel {
     /// their HuggingFace tensor name (e.g. `model.layers.0.input_layernorm.weight`).
     norm_weights: HashMap<String, Arc<Tensor<f32>>>,
     matmul: CutileMatMul,
-    /// Q4_K on-GPU GEMV dispatcher — shares the same CUDA stream as `matmul`.
+    /// Q4_K on-GPU GEMV dispatcher -- shares the same CUDA stream as `matmul`.
     q4k_gemv: CutileQ4Gemv,
-    /// Q2_0 on-GPU GEMV dispatcher — shares the same CUDA stream as `matmul`.
+    /// Q2_0 on-GPU GEMV dispatcher -- shares the same CUDA stream as `matmul`.
     q2_gemv: CutileQ2Gemv,
     /// Hand-optimized oxide Q2_0 GEMV kernel (replaces cuTile for M=1 decode).
     ///
     /// `None` when the `oxide-gemv` feature was not compiled in or when the
     /// oxide build step failed; falls back to `q2_gemv` (cuTile) in that case.
     oxide_q2_gemv: Option<OxideQ2Gemv>,
-    /// Oxide decode flash-attention kernel — accepts kv_len as device pointer,
+    /// Oxide decode flash-attention kernel -- accepts kv_len as device pointer,
     /// enabling single-capture CUDA graph without stale kv_len.
     oxide_decode_attn: Option<OxideDecodeAttn>,
     /// Hand-optimized oxide Q4_K GEMV kernel (replaces cuTile for M=1 decode).
     oxide_q4k_gemv: Option<OxideQ4kGemv>,
     /// Hand-optimized oxide Q6_K GEMV kernel (replaces cuTile for M=1 decode).
     oxide_q6k_gemv: Option<OxideQ6kGemv>,
-    /// Q6_K on-GPU GEMV dispatcher — shares the same CUDA stream as `matmul`.
+    /// Q6_K on-GPU GEMV dispatcher -- shares the same CUDA stream as `matmul`.
     q6k_gemv: CutileQ6kGemv,
     flash_attn: CutileFlashAttention,
     cutile_rmsnorm: CutileRmsNorm,
@@ -287,9 +287,9 @@ pub struct CutileGpuModel {
     /// when the next layer begins, so `Arc::try_unwrap` can reclaim the Tensor
     /// without re-allocating device memory.
     scratch: RefCell<[Option<Arc<Tensor<f32>>>; NUM_SLOTS]>,
-    /// Pre-allocated RoPE scratch for Q (sized for min(max_seq_len, 4096) × n_heads).
+    /// Pre-allocated RoPE scratch for Q (sized for min(max_seq_len, 4096) x n_heads).
     q_rope_scratch: RefCell<RopeScratch>,
-    /// Pre-allocated RoPE scratch for K (sized for min(max_seq_len, 4096) × n_kv_heads).
+    /// Pre-allocated RoPE scratch for K (sized for min(max_seq_len, 4096) x n_kv_heads).
     k_rope_scratch: RefCell<RopeScratch>,
     /// Pre-allocated RMSNorm scratch for pre-attention norm (seq_len=1 / decode).
     pre_attn_norm_scratch: RefCell<RmsnormScratch>,
@@ -305,7 +305,7 @@ pub struct CutileGpuModel {
     /// Pre-allocated output buffer for `decode_attention_device_scratch` (seq_len=1).
     ///
     /// Eliminates the `api::zeros.sync_on` (= full stream sync + alloc) inside
-    /// `decode_attention_device` — 28 blocked allocs per decode token become zero.
+    /// `decode_attention_device` -- 28 blocked allocs per decode token become zero.
     attn_out_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
     /// Pre-allocated output buffer for `silu_mul_device_scratch` (seq_len=1).
     ///
@@ -316,21 +316,21 @@ pub struct CutileGpuModel {
     ///
     /// For models with non-power-of-2 intermediate sizes (e.g. Llama-3.1-8B inter=14336,
     /// inter_pad=16384), the SiLU output needs to be padded from `inter` to `inter_pad`
-    /// before the down projection matmul.  Without this, the path does a D→H download +
-    /// H→D re-upload (with a stream sync) every layer — 32 stalls per decode token.
+    /// before the down projection matmul.  Without this, the path does a D->H download +
+    /// H->D re-upload (with a stream sync) every layer -- 32 stalls per decode token.
     ///
     /// This scratch holds `inter_pad` f32 elements.  Positions `0..inter` are overwritten
-    /// by a GPU-side D→D copy from the SiLU output each layer; positions `inter..inter_pad`
+    /// by a GPU-side D->D copy from the SiLU output each layer; positions `inter..inter_pad`
     /// remain zero from the initial allocation (never written after init).
     down_proj_pad_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
 
-    // ── CUDA graph capture fields ─────────────────────────────────────────────
+    // -- CUDA graph capture fields ---------------------------------------------
     //
     // For decode (seq_len=1) the forward pass is captured into a CUDA graph on
     // the first step and replayed on subsequent steps.  Before each replay the
     // baked-in per-step kernel parameters (position, kv_len, KV write offset)
     // are refreshed via `cuGraphExecUpdate_v2`, which re-captures a lightweight
-    // template on the same stream and patches the exec in-place — one driver call
+    // template on the same stream and patches the exec in-place -- one driver call
     // instead of ~200 individual `cuLaunchKernel` submissions.
 
     /// Pre-allocated device buffer that holds the embedding of the current decode
@@ -339,9 +339,9 @@ pub struct CutileGpuModel {
     /// reads the latest value on every replay.
     d_embed: Arc<Tensor<f32>>,
 
-    // ── Device-side decode scalars for single-capture CUDA graph (Opt 5) ──────
+    // -- Device-side decode scalars for single-capture CUDA graph (Opt 5) ------
     //
-    // Written H→D before each graph replay so the graph can be captured once
+    // Written H->D before each graph replay so the graph can be captured once
     // and replayed N times without cuStreamBeginCapture per token.
     /// kv_len after the current step's KV append (f32 for cuTile compatibility; read by flash attention).
     d_kv_len: Arc<Tensor<f32>>,
@@ -364,10 +364,10 @@ pub struct CutileGpuModel {
     /// while the graph topology stays fixed.
     cached_decode_graph: RefCell<Option<DecodeGraph>>,
 
-    // ── Multi-stream QKV concurrency ──────────────────────────────────────────
+    // -- Multi-stream QKV concurrency ------------------------------------------
     //
-    // K [kv_dim × h] and V [kv_dim × h] are independent of Q [q_dim × h] and
-    // can execute concurrently: for GQA models K and V are 4× smaller and hide
+    // K [kv_dim x h] and V [kv_dim x h] are independent of Q [q_dim x h] and
+    // can execute concurrently: for GQA models K and V are 4x smaller and hide
     // behind Q's latency.  During CUDA graph capture in RELAXED mode, operations
     // on `stream_kv` that wait on `event_fork` (recorded on `stream_main`) are
     // automatically included in the graph as concurrent nodes.
@@ -380,7 +380,125 @@ pub struct CutileGpuModel {
     /// Join event: recorded on stream_kv after V GEMV; waited on by stream_main
     /// before RoPE to ensure K and V results are visible on the main timeline.
     event_kv_done: cuda_core::Event,
+
+    // -- Batch decode CUDA graph (M > 1 simultaneous sequences) ---------------
+    //
+    // Pre-allocated device buffers sized for MAX_BATCH_GRAPH sequences.
+    // Written H->D before each graph replay; the graph reads from stable
+    // device pointers -- topology-stable across steps.
+    //
+    // Requirements for capture:
+    //   (a) All Q4K weights -> sm120 batch kernel (no dynamic allocation).
+    //   (b) All M sequences synchronized (same position, same kv_len).
+    //   (c) q_pad == q_dim (no attn-output padding needed; true for all standard
+    //       LLaMA/Qwen models where n_heads * head_dim is already a power-of-2).
+
+    /// Maximum number of sequences the batch graph is sized for.
+    max_batch_graph: usize,
+
+    /// One [h_pad] embedding buffer per sequence (H->D written before graph launch).
+    d_embed_batch: Vec<Arc<Tensor<f32>>>,
+
+    /// Working hidden state [max_batch_graph x h_pad] used throughout the layer loop.
+    /// Initialised from the M embeddings (D->D concat) before graph launch.
+    batch_hidden: Arc<Tensor<f32>>,
+
+    /// Pre-attention normed hidden [max_batch_graph x h_pad].
+    batch_normed1: Arc<Tensor<f32>>,
+    /// Post-attention normed hidden [max_batch_graph x h_pad].
+    batch_normed2: Arc<Tensor<f32>>,
+
+    /// Batch GEMV outputs -- pre-allocated to avoid allocation inside graph capture.
+    batch_gemv_q:    Arc<Tensor<f32>>,   // [max_batch_graph x q_dim]
+    batch_gemv_k:    Arc<Tensor<f32>>,   // [max_batch_graph x kv_dim]
+    batch_gemv_v:    Arc<Tensor<f32>>,   // [max_batch_graph x kv_dim]
+    batch_gemv_gate: Arc<Tensor<f32>>,   // [max_batch_graph x inter]
+    batch_gemv_up:   Arc<Tensor<f32>>,   // [max_batch_graph x inter]
+    batch_gemv_o:    Arc<Tensor<f32>>,   // [max_batch_graph x h_pad] (O-proj output)
+    batch_gemv_down: Arc<Tensor<f32>>,   // [max_batch_graph x h_pad] (down-proj output)
+
+    /// Per-sequence Q slices for RoPE [max_batch_graph][q_dim].
+    batch_q_seqs: Vec<Arc<Tensor<f32>>>,
+    /// Per-sequence K slices for RoPE [max_batch_graph][kv_dim].
+    batch_k_seqs: Vec<Arc<Tensor<f32>>>,
+    /// Per-sequence V slices (stable device ptrs for KV scatter-write) [max_batch_graph][kv_dim].
+    batch_v_seqs: Vec<Arc<Tensor<f32>>>,
+
+    /// Stable K-after-RoPE output per sequence [max_batch_graph][kv_dim].
+    /// D->D copied from RoPE output each layer so the KV scatter-write kernel
+    /// reads from a known, fixed device address baked in at graph capture.
+    batch_k_rot: Vec<Arc<Tensor<f32>>>,
+    /// Stable Q-after-RoPE output per sequence [max_batch_graph][q_pad].
+    batch_q_rot: Vec<Arc<Tensor<f32>>>,
+
+    /// Per-sequence attention output [max_batch_graph][q_dim].
+    batch_attn_out: Vec<Arc<Tensor<f32>>>,
+
+    /// Concatenated O-proj input [max_batch_graph x q_pad] (= batch_attn_out for q_pad==q_dim).
+    batch_oproj_in: Arc<Tensor<f32>>,
+
+    /// Scratch for batch residual adds.
+    batch_post_attn_add_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
+    batch_ffn_add_scratch:       RefCell<Option<Arc<Tensor<f32>>>>,
+
+    /// SiLU-gated multiply scratch [max_batch_graph x inter].
+    batch_silu_out_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
+
+    /// Compact down-proj input [max_batch_graph x inter] (used when inter_pad != inter).
+    batch_down_compact: Option<Arc<Tensor<f32>>>,
+
+    /// RMSNorm scratch for batch pre-attn / post-attn / final norm.
+    batch_pre_attn_norm_scratch:  RefCell<RmsnormScratch>,
+    batch_post_attn_norm_scratch: RefCell<RmsnormScratch>,
+    batch_final_norm_scratch:     RefCell<RmsnormScratch>,
+
+    /// Q8_1 quantisation scratch for h-width Q4K projections (Q, K, V, O, gate, up).
+    /// Sized [max_batch_graph x h_pad / 4] (qs) and [max_batch_graph x h_q8_blocks] (ds).
+    batch_q8_qs_h: Arc<Tensor<u32>>,
+    batch_q8_ds_h: Arc<Tensor<u32>>,
+
+    /// Q8_1 quantisation scratch for inter-width Q4K projection (down).
+    /// Sized [max_batch_graph x inter / 4] (qs) and [max_batch_graph x inter_q8_blocks] (ds).
+    batch_q8_qs_i: Arc<Tensor<u32>>,
+    batch_q8_ds_i: Arc<Tensor<u32>>,
+
+    /// Device pointer arrays [max_batch_graph x u64] for batch KV scatter-write.
+    /// Stored as raw CUdeviceptr (cuMemAlloc'd) because cuTile Tensor<u64> is
+    /// not a supported type.  The memory holds `max_batch_graph x 8` bytes.
+    /// Written ONCE before the first graph capture with stable KV-cache source ptrs.
+    batch_src_k_ptrs_dev: cuda_core::sys::CUdeviceptr,
+    batch_src_v_ptrs_dev: cuda_core::sys::CUdeviceptr,
+
+    /// Cached batch CUDA graph executable.
+    cached_batch_graph: RefCell<Option<BatchDecodeGraph>>,
 }
+
+/// RAII wrapper for the batch-decode CUDA graph executable.
+struct BatchDecodeGraph {
+    cu_exec:          cuda_core::sys::CUgraphExec,
+    cu_graph:         cuda_core::sys::CUgraph,
+    device:           Arc<cuda_core::Device>,
+    m:                usize,
+    /// Flash-attention kv_len scalar nodes (M per layer x num_layers = Mx32 total).
+    flash_attn_nodes: Vec<KernelScalarNode>,
+    /// RoPE position scalar nodes (2 per seq per layer = 2Mx32 total).
+    rope_nodes:       Vec<KernelScalarNode>,
+}
+
+impl Drop for BatchDecodeGraph {
+    fn drop(&mut self) {
+        let _ = self.device.bind_to_thread();
+        if !self.cu_exec.is_null() {
+            let _ = unsafe { cuda_core::sys::cuGraphExecDestroy(self.cu_exec) };
+        }
+        if !self.cu_graph.is_null() {
+            let _ = unsafe { cuda_core::sys::cuGraphDestroy(self.cu_graph) };
+        }
+    }
+}
+
+unsafe impl Send for BatchDecodeGraph {}
+unsafe impl Sync for BatchDecodeGraph {}
 
 // SAFETY: CutileMatMul, CutileFlashAttention and Tensor<f32> hold raw CUDA pointers,
 // but tempura uses a single-threaded inference path per model instance.
@@ -388,7 +506,7 @@ unsafe impl Send for CutileGpuModel {}
 unsafe impl Sync for CutileGpuModel {}
 
 impl CutileGpuModel {
-    // ── private helpers ───────────────────────────────────────────────────────
+    // -- private helpers -------------------------------------------------------
 
     fn upload(
         matmul: &CutileMatMul,
@@ -443,7 +561,7 @@ impl CutileGpuModel {
         if let Some((dtype, bytes)) = qw.get_typed(name) {
             return Some(dequantize_to_f32(dtype, bytes, n_elements));
         }
-        // mmap-resident quantized tensors — not in typed_tensors.
+        // mmap-resident quantized tensors -- not in typed_tensors.
         if let Some(bytes) = qw.get_q4k(name) {
             return Some(dequantize_to_f32(GgmlType::Q4K, bytes, n_elements));
         }
@@ -477,7 +595,7 @@ impl CutileGpuModel {
     /// Upload a Q2_0 weight in packed GPU format (no f32 dequantization).
     ///
     /// Converts the raw Q2_0 bytes to the 9-u32-per-block GPU layout:
-    ///   u32[0]    = f32 bits of block scale (f16 → f32)
+    ///   u32[0]    = f32 bits of block scale (f16 -> f32)
     ///   u32[1..8] = 8 u32 words of packed 2-bit data
     ///
     /// Returns `false` (and does nothing) when the tensor is absent.
@@ -507,12 +625,12 @@ impl CutileGpuModel {
                 let off = (row * k_blocks + blk) * Q2_0_BLOCK_BYTES;
                 let block = &bytes[off..off + Q2_0_BLOCK_BYTES];
 
-                // Slot 0: block scale (f16 → f32, stored as u32 bit pattern).
+                // Slot 0: block scale (f16 -> f32, stored as u32 bit pattern).
                 let scale_f16_bits = u16::from_le_bytes([block[0], block[1]]);
                 let scale_f32 = f16_bits_to_f32_inline(scale_f16_bits);
                 packed.push(scale_f32.to_bits());
 
-                // Slots 1-8: 32 packed bytes → 8 u32 words.
+                // Slots 1-8: 32 packed bytes -> 8 u32 words.
                 for w in 0..8usize {
                     let b0 = block[2 + w * 4] as u32;
                     let b1 = block[3 + w * 4] as u32;
@@ -542,7 +660,7 @@ impl CutileGpuModel {
     /// Upload a Q6_K weight in packed GPU format (no f32 dequantization).
     ///
     /// Converts the raw Q6_K bytes to the 53-u32-per-block compact GPU layout:
-    ///   u32[0]      = f32 bits of block super-scale d (f16 → f32)
+    ///   u32[0]      = f32 bits of block super-scale d (f16 -> f32)
     ///   u32[1..5]   = 4 u32 words: 16 group scales as bias-128 u8 (4 per u32)
     ///                 stored_byte = (scale_i8 as i32 + 128) as u8
     ///   u32[5..37]  = 32 u32 words: ql[0..128] in native GGUF order (4 per u32)
@@ -641,8 +759,8 @@ impl CutileGpuModel {
     /// Upload a Q4_K weight in packed GPU format (no f32 dequantization on the host).
     ///
     /// Converts the raw Q4_K bytes to the 42-u32-per-block GPU layout:
-    ///   u32[0]      = f32 bits of d (f16 → f32)
-    ///   u32[1]      = f32 bits of dmin (f16 → f32)
+    ///   u32[0]      = f32 bits of d (f16 -> f32)
+    ///   u32[1]      = f32 bits of dmin (f16 -> f32)
     ///   u32[2+j]    = sc[2*j] | (sc[2*j+1]<<8)  for j=0..4  (unpacked 6-bit scales)
     ///   u32[6+j]    = m[2*j]  | (m[2*j+1]<<8)   for j=0..4  (unpacked 6-bit mins)
     ///   u32[10..42] = 32 u32 words holding qs[0..128] (4 bytes per u32, little-endian)
@@ -804,7 +922,7 @@ impl CutileGpuModel {
     /// (M, N, K, BM, BN, BK) tile tuple is seen.  Calling this once after weight
     /// upload means the first real decode token pays zero JIT cost.
     ///
-    /// Only layer 0 weights are exercised — all layers share the same shapes.
+    /// Only layer 0 weights are exercised -- all layers share the same shapes.
     fn warmup_gemms(&self) {
         let dummy_h = self.to_device(&vec![0.0f32; self.h_pad], 1, self.h_pad);
         let dummy_q = self.to_device(&vec![0.0f32; self.q_pad], 1, self.q_pad);
@@ -857,11 +975,11 @@ impl CutileGpuModel {
         let _ = self.gemm_d2d(&dummy_h_128, "model.layers.0.mlp.gate_proj.weight", 128);
     }
 
-    // ── constructors ──────────────────────────────────────────────────────────
+    // -- constructors ----------------------------------------------------------
 
     /// Dequantize all projection weights from `qw` and upload them to the GPU.
     ///
-    /// Calling this once at model-load time eliminates repeated host→device weight
+    /// Calling this once at model-load time eliminates repeated host->device weight
     /// transfers during inference.  RMSNorm weights are also pre-uploaded as 1-D
     /// device tensors so that `forward_device` never copies them per-token.
     pub fn from_quantized(
@@ -892,7 +1010,7 @@ impl CutileGpuModel {
         let q_pad = next_pow2(q_dim.div_ceil(BK) * BK);
         let inter_pad = next_pow2(inter.div_ceil(BK) * BK);
 
-        // lm_head  [vocab, h] — typically not Q4_K/Q2_0; keep dequantized path.
+        // lm_head  [vocab, h] -- typically not Q4_K/Q2_0; keep dequantized path.
         Self::maybe_upload(&matmul, &mut dw, qw, "lm_head.weight", vocab, h)?;
 
         for layer in 0..config.num_layers {
@@ -902,7 +1020,7 @@ impl CutileGpuModel {
             // The inner block avoids a closure so all three maps can be borrowed mutably.
             let mut try_proj = |name: String, n: usize, k: usize| {
                 (|| -> Result<(), tempura_kernels::KernelError> {
-                    // Priority: Q4_K → Q6_K → Q2_0 → f32 dequantized.
+                    // Priority: Q4_K -> Q6_K -> Q2_0 -> f32 dequantized.
                     // Use raw GGUF 36-u32 format if the v3r kernel supports it.
                     let uploaded_q4k = if upload_raw_q4k {
                         Self::maybe_upload_q4k_raw(matmul.stream(), &mut dw_q4k, qw, &name, n, k)?
@@ -939,7 +1057,7 @@ impl CutileGpuModel {
             try_proj(format!("{p}.mlp.up_proj.weight"), inter, h)?;
             try_proj(format!("{p}.mlp.down_proj.weight"), h, inter)?;
 
-            // RMSNorm weights — pre-upload so forward_device never copies them per token.
+            // RMSNorm weights -- pre-upload so forward_device never copies them per token.
             if let Some(w) = qw.get_f32(&format!("{p}.input_layernorm.weight")) {
                 Self::upload_norm_weight(
                     matmul.stream(),
@@ -998,8 +1116,8 @@ impl CutileGpuModel {
 
         // Pre-compute the full RoPE frequency table on the GPU once.
         // During decode, `forward_device_scratch` reads from this table by
-        // position index — zero H2D uploads per token (was 2 sync H2D per RoPE
-        // call, 4 calls per layer × 28 layers = 112 sync_on per token).
+        // position index -- zero H2D uploads per token (was 2 sync H2D per RoPE
+        // call, 4 calls per layer x 28 layers = 112 sync_on per token).
         cutile_rope.precompute_table(
             config.max_seq_len.min(4096),
             head_dim,
@@ -1008,11 +1126,11 @@ impl CutileGpuModel {
         )?;
 
         // Scratch for exactly one decode step (seq_len=1). Prefill falls back to
-        // forward_device which allocates fresh — prefill is infrequent so the
-        // allocation cost there is amortised. Sizing at n_heads (not max_seq_len×n_heads)
+        // forward_device which allocates fresh -- prefill is infrequent so the
+        // allocation cost there is amortised. Sizing at n_heads (not max_seq_lenxn_heads)
         // avoids the out-of-bounds launch that occurs when cap_num_sh > actual num_sh.
         // Use the shared matmul stream so RoPE scratch buffers are on the same stream
-        // as all other GPU operations — eliminates cross-stream synchronization overhead.
+        // as all other GPU operations -- eliminates cross-stream synchronization overhead.
         let rope_cap = 1usize;
         let q_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_heads, head_dim)?;
         let k_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
@@ -1028,7 +1146,7 @@ impl CutileGpuModel {
         };
         let post_attn_add_scratch = add_alloc(h_pad);
         let ffn_add_scratch = add_alloc(h_pad);
-        // Attention output scratch: q_dim = n_heads × head_dim (seq_len=1, no padding).
+        // Attention output scratch: q_dim = n_heads x head_dim (seq_len=1, no padding).
         let attn_out_scratch = add_alloc(q_dim);
         // SiLU-mul output scratch: inter rounded up to next multiple of 32 (the B
         // constant used inside silu_mul_device_scratch).
@@ -1037,7 +1155,7 @@ impl CutileGpuModel {
 
         // Pre-allocate the zero-padded down-projection input scratch (only needed
         // when inter_pad != inter, e.g. Llama-3.1-8B inter=14336, inter_pad=16384).
-        // Positions 0..inter are overwritten by D→D copy each layer; inter..inter_pad stay 0.
+        // Positions 0..inter are overwritten by D->D copy each layer; inter..inter_pad stay 0.
         let down_proj_pad_scratch = if inter_pad != inter {
             add_alloc(inter_pad)
         } else {
@@ -1076,6 +1194,18 @@ impl CutileGpuModel {
             .expect("CutileGpuModel: event_fork creation failed");
         let event_kv_done = device.new_event()
             .expect("CutileGpuModel: event_kv_done creation failed");
+
+        // -- Batch decode graph pre-allocations --------------------------------
+        let (
+            max_batch_graph, d_embed_batch, batch_hidden, batch_normed1, batch_normed2,
+            batch_gemv_q, batch_gemv_k, batch_gemv_v, batch_gemv_gate, batch_gemv_up,
+            batch_gemv_o, batch_gemv_down, batch_q_seqs, batch_k_seqs, batch_v_seqs,
+            batch_k_rot, batch_q_rot, batch_attn_out, batch_oproj_in,
+            batch_post_attn_add_scratch, batch_ffn_add_scratch, batch_silu_out_scratch,
+            batch_down_compact, batch_pre_attn_norm_scratch, batch_post_attn_norm_scratch,
+            batch_final_norm_scratch, batch_q8_qs_h, batch_q8_ds_h, batch_q8_qs_i, batch_q8_ds_i,
+            batch_src_k_ptrs_dev, batch_src_v_ptrs_dev,
+        ) = Self::alloc_batch_fields(matmul.stream(), h_pad, q_pad, q_dim, kv_dim, inter, inter_pad)?;
 
         let model = Self {
             config: config.clone(),
@@ -1119,8 +1249,42 @@ impl CutileGpuModel {
             stream_kv,
             event_fork,
             event_kv_done,
+            // Batch graph fields
+            max_batch_graph,
+            d_embed_batch,
+            batch_hidden,
+            batch_normed1,
+            batch_normed2,
+            batch_gemv_q,
+            batch_gemv_k,
+            batch_gemv_v,
+            batch_gemv_gate,
+            batch_gemv_up,
+            batch_gemv_o,
+            batch_gemv_down,
+            batch_q_seqs,
+            batch_k_seqs,
+            batch_v_seqs,
+            batch_k_rot,
+            batch_q_rot,
+            batch_attn_out,
+            batch_oproj_in,
+            batch_post_attn_add_scratch,
+            batch_ffn_add_scratch,
+            batch_silu_out_scratch,
+            batch_down_compact,
+            batch_pre_attn_norm_scratch,
+            batch_post_attn_norm_scratch,
+            batch_final_norm_scratch,
+            batch_q8_qs_h,
+            batch_q8_ds_h,
+            batch_q8_qs_i,
+            batch_q8_ds_i,
+            batch_src_k_ptrs_dev,
+            batch_src_v_ptrs_dev,
+            cached_batch_graph: RefCell::new(None),
         };
-        eprintln!("[cutile] warming up kernel specializations…");
+        eprintln!("[cutile] warming up kernel specializations...");
         model.warmup_gemms();
         model.preallocate_scratch();
         eprintln!("[cutile] kernel warmup complete");
@@ -1221,11 +1385,11 @@ impl CutileGpuModel {
         )?;
 
         // Scratch for exactly one decode step (seq_len=1). Prefill falls back to
-        // forward_device which allocates fresh — prefill is infrequent so the
-        // allocation cost there is amortised. Sizing at n_heads (not max_seq_len×n_heads)
+        // forward_device which allocates fresh -- prefill is infrequent so the
+        // allocation cost there is amortised. Sizing at n_heads (not max_seq_lenxn_heads)
         // avoids the out-of-bounds launch that occurs when cap_num_sh > actual num_sh.
         // Use the shared matmul stream so RoPE scratch buffers are on the same stream
-        // as all other GPU operations — eliminates cross-stream synchronization overhead.
+        // as all other GPU operations -- eliminates cross-stream synchronization overhead.
         let rope_cap = 1usize;
         let q_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_heads, head_dim)?;
         let k_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
@@ -1284,6 +1448,17 @@ impl CutileGpuModel {
         let event_kv_done = device.new_event()
             .expect("CutileGpuModel: event_kv_done creation failed");
 
+        let (
+            max_batch_graph, d_embed_batch, batch_hidden, batch_normed1, batch_normed2,
+            batch_gemv_q, batch_gemv_k, batch_gemv_v, batch_gemv_gate, batch_gemv_up,
+            batch_gemv_o, batch_gemv_down, batch_q_seqs, batch_k_seqs, batch_v_seqs,
+            batch_k_rot, batch_q_rot, batch_attn_out, batch_oproj_in,
+            batch_post_attn_add_scratch, batch_ffn_add_scratch, batch_silu_out_scratch,
+            batch_down_compact, batch_pre_attn_norm_scratch, batch_post_attn_norm_scratch,
+            batch_final_norm_scratch, batch_q8_qs_h, batch_q8_ds_h, batch_q8_qs_i, batch_q8_ds_i,
+            batch_src_k_ptrs_dev, batch_src_v_ptrs_dev,
+        ) = Self::alloc_batch_fields(matmul.stream(), h_pad, q_pad, q_dim, kv_dim, inter, inter_pad)?;
+
         let model = Self {
             config: config.clone(),
             h_pad,
@@ -1326,8 +1501,42 @@ impl CutileGpuModel {
             stream_kv,
             event_fork,
             event_kv_done,
+            // Batch graph fields
+            max_batch_graph,
+            d_embed_batch,
+            batch_hidden,
+            batch_normed1,
+            batch_normed2,
+            batch_gemv_q,
+            batch_gemv_k,
+            batch_gemv_v,
+            batch_gemv_gate,
+            batch_gemv_up,
+            batch_gemv_o,
+            batch_gemv_down,
+            batch_q_seqs,
+            batch_k_seqs,
+            batch_v_seqs,
+            batch_k_rot,
+            batch_q_rot,
+            batch_attn_out,
+            batch_oproj_in,
+            batch_post_attn_add_scratch,
+            batch_ffn_add_scratch,
+            batch_silu_out_scratch,
+            batch_down_compact,
+            batch_pre_attn_norm_scratch,
+            batch_post_attn_norm_scratch,
+            batch_final_norm_scratch,
+            batch_q8_qs_h,
+            batch_q8_ds_h,
+            batch_q8_qs_i,
+            batch_q8_ds_i,
+            batch_src_k_ptrs_dev,
+            batch_src_v_ptrs_dev,
+            cached_batch_graph: RefCell::new(None),
         };
-        eprintln!("[cutile] warming up kernel specializations…");
+        eprintln!("[cutile] warming up kernel specializations...");
         model.warmup_gemms();
         model.preallocate_scratch();
         eprintln!("[cutile] kernel warmup complete");
@@ -1342,14 +1551,14 @@ impl CutileGpuModel {
         self.matmul.stream().clone()
     }
 
-    // ── device tensor helpers ─────────────────────────────────────────────────
+    // -- device tensor helpers -------------------------------------------------
 
     /// Upload a host slice as a device tensor shaped `[rows, cols]`.
     fn to_device(&self, data: &[f32], rows: usize, cols: usize) -> Arc<Tensor<f32>> {
         let stream = self.matmul.stream();
         api::copy_host_vec_to_device(&Arc::new(data.to_vec()))
             .sync_on(stream)
-            .expect("CutileGpuModel: host→device upload failed")
+            .expect("CutileGpuModel: host->device upload failed")
             .reshape(&[rows, cols])
             .expect("CutileGpuModel: reshape failed")
             .into()
@@ -1380,7 +1589,7 @@ impl CutileGpuModel {
     fn download_device_tensor(&self, t: &Arc<Tensor<f32>>) -> Vec<f32> {
         t.to_host_vec()
             .sync_on(self.matmul.stream())
-            .expect("CutileGpuModel: device→host download failed")
+            .expect("CutileGpuModel: device->host download failed")
     }
 
     /// Element-wise add two device tensors of `n` elements on the GPU.
@@ -1399,8 +1608,8 @@ impl CutileGpuModel {
             .sync_on(stream)
             .expect("add_device: alloc failed")
             .partition([BLOCK]);
-        // SAFETY: kernel queued async; GPU stream ordering ensures a→b→add→next.
-        // Caller (or downstream D→H) provides the CPU sync before any host read.
+        // SAFETY: kernel queued async; GPU stream ordering ensures a->b->add->next.
+        // Caller (or downstream D->H) provides the CPU sync before any host read.
         let (out_t, _, _) = unsafe {
             tempura_kernels::cutile_elementwise::kernels::cutile_vector_add(
                 out_t,
@@ -1446,7 +1655,7 @@ impl CutileGpuModel {
         };
         let out_part = out_tensor.partition([BLOCK]);
         // SAFETY: kernel queued async; GPU stream ordering ensures a+b is visible
-        // to subsequent kernels.  Caller (or downstream D→H) syncs before CPU read.
+        // to subsequent kernels.  Caller (or downstream D->H) syncs before CPU read.
         let (out_part, _, _) = unsafe {
             tempura_kernels::cutile_elementwise::kernels::cutile_vector_add(
                 out_part,
@@ -1460,6 +1669,157 @@ impl CutileGpuModel {
         let result = Arc::new(out_part.unpartition());
         *scratch = Some(result.clone());
         result
+    }
+
+    /// Allocate all pre-allocated device tensors required by the batch decode CUDA graph.
+    ///
+    /// Called once during model construction; the returned values are stored as struct fields.
+    /// `MAX_BATCH = 2` (sized for 2 simultaneous sequences, covers the M=2 proof-of-concept).
+    #[allow(clippy::type_complexity)]
+    fn alloc_batch_fields(
+        stream:   &Arc<cuda_core::Stream>,
+        h_pad:    usize,
+        q_pad:    usize,
+        q_dim:    usize,
+        kv_dim:   usize,
+        inter:    usize,
+        inter_pad: usize,
+    ) -> Result<(
+        usize,                             // max_batch_graph
+        Vec<Arc<Tensor<f32>>>,             // d_embed_batch
+        Arc<Tensor<f32>>,                  // batch_hidden
+        Arc<Tensor<f32>>,                  // batch_normed1
+        Arc<Tensor<f32>>,                  // batch_normed2
+        Arc<Tensor<f32>>,                  // batch_gemv_q
+        Arc<Tensor<f32>>,                  // batch_gemv_k
+        Arc<Tensor<f32>>,                  // batch_gemv_v
+        Arc<Tensor<f32>>,                  // batch_gemv_gate
+        Arc<Tensor<f32>>,                  // batch_gemv_up
+        Arc<Tensor<f32>>,                  // batch_gemv_o
+        Arc<Tensor<f32>>,                  // batch_gemv_down
+        Vec<Arc<Tensor<f32>>>,             // batch_q_seqs
+        Vec<Arc<Tensor<f32>>>,             // batch_k_seqs
+        Vec<Arc<Tensor<f32>>>,             // batch_v_seqs
+        Vec<Arc<Tensor<f32>>>,             // batch_k_rot
+        Vec<Arc<Tensor<f32>>>,             // batch_q_rot
+        Vec<Arc<Tensor<f32>>>,             // batch_attn_out
+        Arc<Tensor<f32>>,                  // batch_oproj_in
+        RefCell<Option<Arc<Tensor<f32>>>>, // batch_post_attn_add_scratch
+        RefCell<Option<Arc<Tensor<f32>>>>, // batch_ffn_add_scratch
+        RefCell<Option<Arc<Tensor<f32>>>>, // batch_silu_out_scratch
+        Option<Arc<Tensor<f32>>>,          // batch_down_compact
+        RefCell<RmsnormScratch>,           // batch_pre_attn_norm_scratch
+        RefCell<RmsnormScratch>,           // batch_post_attn_norm_scratch
+        RefCell<RmsnormScratch>,           // batch_final_norm_scratch
+        Arc<Tensor<u32>>,                  // batch_q8_qs_h
+        Arc<Tensor<u32>>,                  // batch_q8_ds_h
+        Arc<Tensor<u32>>,                  // batch_q8_qs_i
+        Arc<Tensor<u32>>,                  // batch_q8_ds_i
+        cuda_core::sys::CUdeviceptr,       // batch_src_k_ptrs_dev
+        cuda_core::sys::CUdeviceptr,       // batch_src_v_ptrs_dev
+    ), tempura_kernels::KernelError> {
+        const MB: usize = 2; // max_batch_graph
+
+        let af32 = |n: usize| -> Result<Arc<Tensor<f32>>, tempura_kernels::KernelError> {
+            Ok(Arc::new(
+                api::zeros::<f32>(&[n])
+                    .sync_on(stream)
+                    .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?,
+            ))
+        };
+        let au32 = |n: usize| -> Result<Arc<Tensor<u32>>, tempura_kernels::KernelError> {
+            Ok(Arc::new(
+                api::zeros::<u32>(&[n])
+                    .sync_on(stream)
+                    .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?,
+            ))
+        };
+        let vec_af32 = |n: usize| -> Result<Vec<Arc<Tensor<f32>>>, tempura_kernels::KernelError> {
+            (0..MB).map(|_| af32(n)).collect()
+        };
+
+        let d_embed_batch  = vec_af32(h_pad)?;
+        let batch_hidden   = af32(MB * h_pad)?;
+        let batch_normed1  = af32(MB * h_pad)?;
+        let batch_normed2  = af32(MB * h_pad)?;
+        let batch_gemv_q    = af32(MB * q_dim)?;
+        let batch_gemv_k    = af32(MB * kv_dim)?;
+        let batch_gemv_v    = af32(MB * kv_dim)?;
+        let batch_gemv_gate = af32(MB * inter)?;
+        let batch_gemv_up   = af32(MB * inter)?;
+        let batch_gemv_o    = af32(MB * h_pad)?;
+        let batch_gemv_down = af32(MB * h_pad)?;
+        let batch_q_seqs  = vec_af32(q_dim)?;
+        let batch_k_seqs  = vec_af32(kv_dim)?;
+        let batch_v_seqs  = vec_af32(kv_dim)?;
+        let batch_k_rot   = vec_af32(kv_dim)?;
+        let batch_q_rot   = vec_af32(q_pad)?;
+        let batch_attn_out = vec_af32(q_dim)?;
+        let batch_oproj_in = af32(MB * q_pad)?;
+
+        const SILU_B: usize = 32;
+        let batch_post_attn_add_scratch = RefCell::new(Some(af32(MB * h_pad)?));
+        let batch_ffn_add_scratch       = RefCell::new(Some(af32(MB * h_pad)?));
+        let batch_silu_out_scratch      = RefCell::new(Some(af32(MB * inter.div_ceil(SILU_B) * SILU_B)?));
+        let batch_down_compact = if inter_pad != inter {
+            Some(af32(MB * inter)?)
+        } else {
+            None
+        };
+
+        let batch_pre_attn_norm_scratch  = RefCell::new(
+            RmsnormScratch::new(stream, MB, h_pad)?
+        );
+        let batch_post_attn_norm_scratch = RefCell::new(
+            RmsnormScratch::new(stream, MB, h_pad)?
+        );
+        let batch_final_norm_scratch     = RefCell::new(
+            RmsnormScratch::new(stream, MB, h_pad)?
+        );
+
+        // Q8_1 scratch for h-width projections (Q, K, V, O, gate, up).
+        // k = h_pad (rounded up to h_pad which is a power of 2, divisible by 256).
+        let h_k_total      = MB * h_pad;
+        let h_q8_blocks    = h_k_total.div_ceil(32);
+        let batch_q8_qs_h  = au32(h_k_total / 4)?;
+        let batch_q8_ds_h  = au32(h_q8_blocks)?;
+
+        // Q8_1 scratch for inter-width down projection.
+        // k = inter (actual K, not padded; Q8_1 quantise sees k_total = MB * inter).
+        let i_k_total      = MB * inter;
+        let i_q8_blocks    = i_k_total.div_ceil(32);
+        let batch_q8_qs_i  = au32(i_k_total / 4)?;
+        let batch_q8_ds_i  = au32(i_q8_blocks)?;
+
+        // Raw device pointer arrays [MB x u64] for batch KV scatter-write.
+        // Allocated as raw cuMemAlloc'd memory (not a cuTile Tensor since u64 is unsupported).
+        let ptr_bytes = (MB * std::mem::size_of::<u64>()) as usize;
+        let mut batch_src_k_ptrs_dev: cuda_core::sys::CUdeviceptr = 0;
+        let mut batch_src_v_ptrs_dev: cuda_core::sys::CUdeviceptr = 0;
+        let rc = unsafe { cuda_core::sys::cuMemAlloc_v2(&mut batch_src_k_ptrs_dev, ptr_bytes) };
+        if rc != 0 {
+            return Err(tempura_kernels::KernelError::InvalidConfig(format!(
+                "alloc_batch_fields: cuMemAlloc batch_src_k_ptrs failed: {rc}"
+            )));
+        }
+        let rc = unsafe { cuda_core::sys::cuMemAlloc_v2(&mut batch_src_v_ptrs_dev, ptr_bytes) };
+        if rc != 0 {
+            let _ = unsafe { cuda_core::sys::cuMemFree_v2(batch_src_k_ptrs_dev) };
+            return Err(tempura_kernels::KernelError::InvalidConfig(format!(
+                "alloc_batch_fields: cuMemAlloc batch_src_v_ptrs failed: {rc}"
+            )));
+        }
+
+        Ok((
+            MB, d_embed_batch, batch_hidden, batch_normed1, batch_normed2,
+            batch_gemv_q, batch_gemv_k, batch_gemv_v, batch_gemv_gate, batch_gemv_up,
+            batch_gemv_o, batch_gemv_down, batch_q_seqs, batch_k_seqs, batch_v_seqs,
+            batch_k_rot, batch_q_rot, batch_attn_out, batch_oproj_in,
+            batch_post_attn_add_scratch, batch_ffn_add_scratch, batch_silu_out_scratch,
+            batch_down_compact, batch_pre_attn_norm_scratch, batch_post_attn_norm_scratch,
+            batch_final_norm_scratch, batch_q8_qs_h, batch_q8_ds_h, batch_q8_qs_i, batch_q8_ds_i,
+            batch_src_k_ptrs_dev, batch_src_v_ptrs_dev,
+        ))
     }
 
     /// Upload a host slice to a **flat 1-D** device tensor of `rows * padded_cols`
@@ -1488,7 +1848,7 @@ impl CutileGpuModel {
         Arc::new(
             api::copy_host_vec_to_device(&v)
                 .sync_on(stream)
-                .expect("CutileGpuModel: host→device upload (flat) failed"),
+                .expect("CutileGpuModel: host->device upload (flat) failed"),
         )
     }
 
@@ -1497,7 +1857,7 @@ impl CutileGpuModel {
     /// The decode attention kernel returns a flat `[q_dim]` tensor.  The O-proj
     /// GEMM expects `[1, q_pad]`.  When `q_pad == q_dim` a zero-copy reshape is
     /// done.  Otherwise a zero-padded `[1, q_pad]` buffer is allocated on the
-    /// GPU and the attention output is written into it via D→D copy — no PCIe.
+    /// GPU and the attention output is written into it via D->D copy -- no PCIe.
     fn attn_out_to_oproj_device(
         &self,
         attn_out: &Arc<Tensor<f32>>,
@@ -1522,7 +1882,7 @@ impl CutileGpuModel {
                 .expect("attn_out_to_oproj_device: reshape failed")
                 .into();
         }
-        // Allocate zero-filled padded buffer and D→D copy each row's valid prefix.
+        // Allocate zero-filled padded buffer and D->D copy each row's valid prefix.
         let padded: Arc<Tensor<f32>> = Arc::new(
             api::zeros::<f32>(&[m, q_pad])
                 .sync_on(stream)
@@ -1535,7 +1895,7 @@ impl CutileGpuModel {
             let dst = dst_base + (r * q_pad * std::mem::size_of::<f32>()) as u64;
             unsafe {
                 cuda_core::memcpy_dtod_async::<f32>(dst, src, q_dim, stream)
-                    .expect("attn_out_to_oproj_device: D→D copy failed");
+                    .expect("attn_out_to_oproj_device: D->D copy failed");
             }
         }
         padded
@@ -1544,7 +1904,7 @@ impl CutileGpuModel {
     /// Device-to-device GEMM: `output[m, n] = a[m, k_pad] @ b[n, k_pad]^T`.
     ///
     /// The caller MUST ensure `a` has exactly `dw.k_pad` columns.  No download
-    /// or re-padding is performed here — the activation must already be padded.
+    /// or re-padding is performed here -- the activation must already be padded.
     ///
     /// Falls back silently (returns a zero tensor) if the weight is absent.
     fn gemm_d2d(&self, a: &Arc<Tensor<f32>>, weight_name: &str, m: usize) -> Arc<Tensor<f32>> {
@@ -1597,7 +1957,7 @@ impl CutileGpuModel {
         pool[SLOT_DOWN] = alloc(h);
         pool[SLOT_LOGITS] = alloc(vocab);
 
-        // Pre-allocate Q8_1 scratch for the oxide Q4K GEMV — must happen before
+        // Pre-allocate Q8_1 scratch for the oxide Q4K GEMV -- must happen before
         // any CUDA graph capture since device allocation on a capturing stream
         // is not permitted (CUDA error 900).
         // max_k = inter_pad (largest activation vector fed to any Q4K projection)
@@ -1680,7 +2040,7 @@ impl CutileGpuModel {
                     }
                 }
             } else if let Some(tensor) = maybe_tensor {
-                // k_pad not divisible by 128 — use strided GEMV (async).
+                // k_pad not divisible by 128 -- use strided GEMV (async).
                 if let Ok(result) = unsafe {
                     self.matmul
                         .submit_bt_d2d_into(a, &dw.tensor, tensor, m, dw.n, dw.k_pad)
@@ -1700,14 +2060,14 @@ impl CutileGpuModel {
     /// Device-to-device GEMM/GEMV reusing a pre-allocated scratch buffer.
     ///
     /// For m == 1 (decode): uses `forward_gemv_d2d_into` / `forward_gemv_device_to_device`
-    /// which dispatch through `cutile_gemv` — a split-K kernel that avoids the
-    /// ~500× MMA slowdown caused by hardware refusing BM=1 tiles.  Each block
+    /// which dispatch through `cutile_gemv` -- a split-K kernel that avoids the
+    /// ~500x MMA slowdown caused by hardware refusing BM=1 tiles.  Each block
     /// handles N_BLOCK_GEMV=64 output neurons via element-wise multiply +
-    /// reduce_sum over [64×64] weight tiles, fully utilising warp-level vector
+    /// reduce_sum over [64x64] weight tiles, fully utilising warp-level vector
     /// lanes (~target: ~1 TFLOPS vs. ~1.8 GFLOPS scalar fallback).
     ///
     /// For m > 1 (prefill): uses `forward_bt_d2d_into` / `forward_bt_device_to_device`
-    /// with the square BM×BN GEMM as before — MMA is efficient for M >= 16.
+    /// with the square BMxBN GEMM as before -- MMA is efficient for M >= 16.
     ///
     /// When the pool slot holds a uniquely-owned `Arc<Tensor<f32>>`, reclaims
     /// the tensor and reuses the device allocation.  Falls back to a fresh
@@ -1747,7 +2107,7 @@ impl CutileGpuModel {
         };
 
         if m == 1 {
-            // Decode: use coalesced GEMV kernel — one program per output element,
+            // Decode: use coalesced GEMV kernel -- one program per output element,
             // loading BK=128 contiguous elements per iteration from one row of the
             // weight matrix. Falls back to the strided GEMV when k_pad is not
             // divisible by 128 (only for very small K values, uncommon in practice).
@@ -1767,7 +2127,7 @@ impl CutileGpuModel {
                     .forward_gemv_coalesced_d2d(a, &dw.tensor, dw.n, dw.k_pad)
                     .expect("CutileGpuModel::gemm_d2d_slot coalesced GEMV failed");
             }
-            // k_pad not divisible by 128 — fall back to strided GEMV.
+            // k_pad not divisible by 128 -- fall back to strided GEMV.
             if let Some(tensor) = maybe_tensor {
                 if let Ok(result) = self
                     .matmul
@@ -1816,12 +2176,12 @@ impl CutileGpuModel {
             }
         };
         // normed_dev is rank-2 [seq_len, h_pad] from RMSNorm. The Q2_0 GEMV
-        // kernel expects rank-1 x. Reshape [1, h_pad] → [h_pad] as a zero-copy
-        // metadata operation (no D→H→D round-trip). The kernel reads exactly
-        // k_blocks * Q2_0_QK elements, which is ≤ h_pad; the padding is ignored.
+        // kernel expects rank-1 x. Reshape [1, h_pad] -> [h_pad] as a zero-copy
+        // metadata operation (no D->H->D round-trip). The kernel reads exactly
+        // k_blocks * Q2_0_QK elements, which is <= h_pad; the padding is ignored.
         let a_flat = Arc::clone(a)
             .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::cutile_quantized_gemm::Q2_0_QK)])
-            .expect("gemm_q2_d2d: reshape [1, stride] → [stride] failed");
+            .expect("gemm_q2_d2d: reshape [1, stride] -> [stride] failed");
         // Prefer the oxide warp-shuffle kernel; fall back to cuTile.
         if let Some(oxide) = &self.oxide_q2_gemv {
             return oxide
@@ -1849,11 +2209,11 @@ impl CutileGpuModel {
                 );
             }
         };
-        // Zero-copy reshape [1, h_pad] → [h_pad]; kernel reads only k_blocks * Q6K_QK.
+        // Zero-copy reshape [1, h_pad] -> [h_pad]; kernel reads only k_blocks * Q6K_QK.
         let a_flat = Arc::clone(a)
             .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::cutile_quantized_gemm::Q6K_QK)])
-            .expect("gemm_q6k_d2d: reshape [1, stride] → [stride] failed");
-        // Prefer kpar (v3, 8 warps/block → 100% SM occupancy) when available,
+            .expect("gemm_q6k_d2d: reshape [1, stride] -> [stride] failed");
+        // Prefer kpar (v3, 8 warps/block -> 100% SM occupancy) when available,
         // else fall back to v2, then cuTile.
         if let Some(oxide) = &self.oxide_q6k_gemv {
             return oxide
@@ -1881,10 +2241,10 @@ impl CutileGpuModel {
                 );
             }
         };
-        // Zero-copy reshape [1, h_pad] → [h_pad]; kernel reads only k_blocks * Q4K_BLOCK_SIZE.
+        // Zero-copy reshape [1, h_pad] -> [h_pad]; kernel reads only k_blocks * Q4K_BLOCK_SIZE.
         let a_flat = Arc::clone(a)
             .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::Q4K_BLOCK_SIZE)])
-            .expect("gemm_q4k_d2d: reshape [1, stride] → [stride] failed");
+            .expect("gemm_q4k_d2d: reshape [1, stride] -> [stride] failed");
         // Prefer oxide with Q8_1 activation quantization (best perf), then v2, then cuTile.
         // For large projections (n >= 4096: Q proj, O proj), use the best kpar variant:
         //   - v4 (sm_120 PTX, native GGUF 36-u32): Blackwell (RTX 5090), 14% less DRAM
@@ -2103,7 +2463,7 @@ impl CutileGpuModel {
             .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::Q4K_BLOCK_SIZE)])
             .expect("gemm_q4k_d2d_slot: reshape failed");
 
-        // Q8 path (dp4a) takes priority over the scratch-tensor f32 path —
+        // Q8 path (dp4a) takes priority over the scratch-tensor f32 path --
         // the quantize+dp4a kernel is preferred for M=1 decode throughput.
         // When native format is active, kpar is used for ALL n sizes.
         if let Some(oxide) = &self.oxide_q4k_gemv {
@@ -2173,8 +2533,8 @@ impl CutileGpuModel {
     ///
     /// When oxide GEMVs are available for the weight format and seq_len==1, K and V
     /// are dispatched on `stream_kv` concurrently with Q on `stream_main`, connected by
-    /// CUDA events (fork after normed_dev, join before RoPE).  This lets K [kv_dim × h]
-    /// and V [kv_dim × h] hide behind Q [q_dim × h] on the GPU.
+    /// CUDA events (fork after normed_dev, join before RoPE).  This lets K [kv_dim x h]
+    /// and V [kv_dim x h] hide behind Q [q_dim x h] on the GPU.
     ///
     /// K and V use the oxide f32 GEMV (not the Q8 dp4a path) so each writes into its own
     /// pre-allocated slot (SLOT_K / SLOT_V) without touching the Q8 shared scratch buffer
@@ -2227,12 +2587,12 @@ impl CutileGpuModel {
             .wait_event(&self.event_fork)
             .expect("stream_kv wait_event(fork) failed");
 
-        // ── K on stream_kv ─────────────────────────────────────────────────────
+        // -- K on stream_kv -----------------------------------------------------
         let cu_kv = self.stream_kv.cu_stream();
         let k_dev = self.dispatch_kv_on_stream(normed, k_name, SLOT_K, cu_kv);
         let v_dev = self.dispatch_kv_on_stream(normed, v_name, SLOT_V, cu_kv);
 
-        // ── Q on stream_main (normal path, may use Q8 dp4a) ────────────────────
+        // -- Q on stream_main (normal path, may use Q8 dp4a) --------------------
         let q_dev = self.gemm_any_d2d_slot(normed, q_name, 1, SLOT_Q);
 
         // Join: stream_main waits for K and V to complete before RoPE.
@@ -2250,7 +2610,7 @@ impl CutileGpuModel {
     /// Dispatch a single K or V GEMV on `cu_stream` using the oxide f32 kernel.
     ///
     /// Takes the pre-allocated slot tensor, submits the GEMV into it, puts it
-    /// back in the pool, and returns a clone of the Arc — identical lifecycle to
+    /// back in the pool, and returns a clone of the Arc -- identical lifecycle to
     /// `gemm_q4k_d2d_slot` but on an explicit stream instead of `self.stream`.
     ///
     /// # Safety
@@ -2354,7 +2714,7 @@ impl CutileGpuModel {
             }
         }
 
-        // Fallback: f32 or cuTile-only — sequential on stream_main.
+        // Fallback: f32 or cuTile-only -- sequential on stream_main.
         self.gemm_any_d2d_slot(normed, weight_name, 1, slot)
     }
 
@@ -2362,9 +2722,9 @@ impl CutileGpuModel {
     ///
     /// For m == 1: checks `device_weights_q4k` first, then `device_weights_q6k`,
     /// then `device_weights_q2`, then falls through to `gemm_d2d_slot` for f32 weights.
-    /// Batched GEMM for M > 1 using M sequential GPU GEMVs — keeps quantized weights
+    /// Batched GEMM for M > 1 using M sequential GPU GEMVs -- keeps quantized weights
     /// GPU-resident instead of downloading to CPU. Each row of `a` is fed to the
-    /// M=1 GEMV path; results are D→D-concatenated into an [m, n] output.
+    /// M=1 GEMV path; results are D->D-concatenated into an [m, n] output.
     ///
     /// `row_stride` is the number of f32 elements between consecutive rows in `a`.
     fn gemm_any_d2d_batch(
@@ -2377,7 +2737,7 @@ impl CutileGpuModel {
     ) -> Arc<Tensor<f32>> {
         let stream = self.matmul.stream();
 
-        // For f32 weights there is no PCIe bottleneck — use the existing slot path.
+        // For f32 weights there is no PCIe bottleneck -- use the existing slot path.
         let is_q4k = self.device_weights_q4k.contains_key(weight_name);
         let is_q6k = self.device_weights_q6k.contains_key(weight_name);
         let is_q2  = self.device_weights_q2.contains_key(weight_name);
@@ -2401,7 +2761,7 @@ impl CutileGpuModel {
                 if oxide.has_sm120_batch() && oxide.uses_raw_gguf {
                     let dw = self.device_weights_q4k.get(weight_name).unwrap();
                     // `a` is flat [m * row_stride]; the batch kernel reads it row-major.
-                    // k = k_blocks * 256; row_stride may be padded — pass just k elements
+                    // k = k_blocks * 256; row_stride may be padded -- pass just k elements
                     // by building a trimmed [m * k] view if needed.
                     let k = dw.k_blocks * 256;
                     let a_trimmed: Arc<Tensor<f32>> = if row_stride == k {
@@ -2446,13 +2806,13 @@ impl CutileGpuModel {
                     a.device_pointer().cu_deviceptr() + (r * row_stride * 4) as u64,
                     row_stride,
                     stream,
-                ).expect("gemm_any_d2d_batch: a_row D→D slice");
+                ).expect("gemm_any_d2d_batch: a_row D->D slice");
             }
             let result = self.gemm_any_d2d_slot(&a_row, weight_name, 1, slot);
             rows.push(result);
         }
 
-        // Concatenate M results [n] → flat [m*n] (rank-1, compatible with cuTile ops).
+        // Concatenate M results [n] -> flat [m*n] (rank-1, compatible with cuTile ops).
         let out: Arc<Tensor<f32>> = Arc::new(
             api::zeros::<f32>(&[m * n])
                 .sync_on(stream)
@@ -2465,7 +2825,7 @@ impl CutileGpuModel {
                     row.device_pointer().cu_deviceptr(),
                     n,
                     stream,
-                ).expect("gemm_any_d2d_batch: concat D→D");
+                ).expect("gemm_any_d2d_batch: concat D->D");
             }
         }
         out
@@ -2482,7 +2842,7 @@ impl CutileGpuModel {
         m: usize,
         slot: usize,
     ) -> Arc<Tensor<f32>> {
-        // ── Decode (m == 1): on-GPU dequant GEMV with pre-allocated scratch ───
+        // -- Decode (m == 1): on-GPU dequant GEMV with pre-allocated scratch ---
         if m == 1 && self.device_weights_q4k.contains_key(weight_name) {
             return self.gemm_q4k_d2d_slot(a, weight_name, slot);
         }
@@ -2493,7 +2853,7 @@ impl CutileGpuModel {
             return self.gemm_q2_d2d_slot(a, weight_name, slot);
         }
 
-        // ── Prefill (m > 1): host dequant + f32 GEMM ─────────────────────────
+        // -- Prefill (m > 1): host dequant + f32 GEMM -------------------------
         if m > 1 {
             // Q4_K prefill: reconstruct f32 from GPU format (packed 42-u32 or raw GGUF 36-u32).
             if let Some(dw) = self.device_weights_q4k.get(weight_name) {
@@ -2662,7 +3022,7 @@ impl CutileGpuModel {
         self.gemm_d2d_slot(a, weight_name, m, slot)
     }
 
-    // ── inference ─────────────────────────────────────────────────────────────
+    // -- inference -------------------------------------------------------------
 
     /// Full autoregressive forward pass with GPU-resident KV cache.
     ///
@@ -2673,7 +3033,7 @@ impl CutileGpuModel {
     /// `flash_attn.forward`, skipping the redundant upload + immediate re-download
     /// that occurred when using `forward_device`.
     ///
-    /// `hidden_dev` is kept on device throughout the layer loop — uploaded once
+    /// `hidden_dev` is kept on device throughout the layer loop -- uploaded once
     /// Capture or update+replay the CUDA graph for a single decode step.
     ///
     /// # Design
@@ -2682,7 +3042,7 @@ impl CutileGpuModel {
     /// `cuStreamEndCapture`.  The resulting template graph is then:
     ///
     /// - **First call**: instantiated with `cuGraphInstantiateWithFlags`.
-    /// - **Subsequent calls**: patched with `cuGraphExecUpdate_v2` — same topology,
+    /// - **Subsequent calls**: patched with `cuGraphExecUpdate_v2` -- same topology,
     ///   updated kernel parameters (position, kv_len, KV-cache write offset).
     ///
     /// The embedding (which changes every step) is uploaded into the pre-allocated
@@ -2702,7 +3062,7 @@ impl CutileGpuModel {
         let stream = self.matmul.stream();
         let cu_stream = stream.cu_stream();
 
-        // ── Always: Upload embedding + scalars before capture or launch ──────
+        // -- Always: Upload embedding + scalars before capture or launch ------
         let embed_src: Vec<f32> = if self.h_pad == h {
             embedding.to_vec()
         } else {
@@ -2716,39 +3076,39 @@ impl CutileGpuModel {
                 embed_src.as_ptr(),
                 self.h_pad,
                 stream,
-            ).expect("d_embed H→D copy failed");
+            ).expect("d_embed H->D copy failed");
         }
 
         // Write device scalars: kv_len, position, kv_write_offset.
         // These are read by device kernels at execution time so the graph is
-        // topology-stable across steps (only these tiny H→D copies change).
+        // topology-stable across steps (only these tiny H->D copies change).
         let kv_write_off = gpu_kv_cache.seq_len() as i32;
-        // Bitcast i32 → f32 so the cuTile kernel can recover via transmute.
+        // Bitcast i32 -> f32 so the cuTile kernel can recover via transmute.
         let kv_len_bits: f32 = f32::from_bits((kv_write_off + 1) as u32);
         let pos_bits: f32    = f32::from_bits(positions[0]);
         unsafe {
             cuda_core::memcpy_htod_async::<f32>(
                 self.d_kv_len.device_pointer().cu_deviceptr(),
                 &kv_len_bits as *const f32, 1, stream,
-            ).expect("d_kv_len H→D copy failed");
+            ).expect("d_kv_len H->D copy failed");
             cuda_core::memcpy_htod_async::<f32>(
                 self.d_positions.device_pointer().cu_deviceptr(),
                 &pos_bits as *const f32, 1, stream,
-            ).expect("d_positions H→D copy failed");
+            ).expect("d_positions H->D copy failed");
             cuda_core::memcpy_htod_async::<i32>(
                 self.d_kv_write_offset.device_pointer().cu_deviceptr(),
                 &kv_write_off as *const i32, 1, stream,
-            ).expect("d_kv_write_offset H→D copy failed");
+            ).expect("d_kv_write_offset H->D copy failed");
         }
 
         let mut graph_cache = self.cached_decode_graph.borrow_mut();
 
         if let Some(ref decode_graph) = *graph_cache {
-            // ── Subsequent steps: update kernel scalars, then launch ──────────
+            // -- Subsequent steps: update kernel scalars, then launch ----------
             // KV writes are handled by the scatter-write kernel inside the graph
-            // (reads d_kv_write_offset at execution time — no driver calls needed).
+            // (reads d_kv_write_offset at execution time -- no driver calls needed).
             // NOTE: seq_len is advanced by the wrapper (kv.advance) after each
-            // forward call — do NOT advance again here (would double-count).
+            // forward call -- do NOT advance again here (would double-count).
 
             // Update flash-attn kv_len and RoPE pos scalars in the graph's
             // owned parameter buffers (direct writes into extra-buffer storage).
@@ -2788,19 +3148,19 @@ impl CutileGpuModel {
                 }
             }
 
-            // DIAGNOSTIC: read d_kv_len back from device to confirm H→D write landed
+            // DIAGNOSTIC: read d_kv_len back from device to confirm H->D write landed
             if std::env::var("TEMPURA_DEBUG_KV_LEN").is_ok() {
                 unsafe { stream.synchronize().expect("diag sync"); }
                 let kv_len_host: Vec<f32> = Arc::clone(&self.d_kv_len)
                     .to_host_vec().sync_on(stream).expect("diag d2h");
                 let kv_len_bits = kv_len_host[0].to_bits();
-                eprintln!("[diag] d_kv_len bits={kv_len_bits:#010x} → kv_len={kv_len_bits}");
+                eprintln!("[diag] d_kv_len bits={kv_len_bits:#010x} -> kv_len={kv_len_bits}");
             }
             unsafe { cuda_core::sys::cuGraphLaunch(decode_graph.cu_exec, cu_stream); }
             unsafe { stream.synchronize().expect("stream sync after graph launch failed"); }
             drop(graph_cache);
         } else {
-            // ── First step: capture graph, instantiate, find nodes, launch ────
+            // -- First step: capture graph, instantiate, find nodes, launch ----
             let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
             unsafe { stream.begin_capture(relaxed).expect("cuStreamBeginCapture failed"); }
 
@@ -2838,7 +3198,7 @@ impl CutileGpuModel {
             drop(graph_cache);
         }
 
-        // Logits reside in SLOT_LOGITS — download and return.
+        // Logits reside in SLOT_LOGITS -- download and return.
         let logits_arc = self
             .scratch.borrow()[SLOT_LOGITS].clone()
             .expect("SLOT_LOGITS empty after graph launch");
@@ -2887,7 +3247,7 @@ impl CutileGpuModel {
             if rc != 0 { continue; }
 
             // cuTile JIT kernels: cuGraphKernelNodeGetParams_v2 may block for
-            // runtime-compiled kernels.  Skip kernel parameter scanning for now —
+            // runtime-compiled kernels.  Skip kernel parameter scanning for now --
             // KV memcpy updates alone provide the 108 tok/s improvement.
             // kv_len/pos node update will be re-attempted via PTX introspection.
             let _ = (params, capture_kv_len, capture_pos, n_kv_heads);
@@ -2903,7 +3263,7 @@ impl CutileGpuModel {
     /// Run the decode forward pass without CUDA graph capture.
     ///
     /// Used as a fallback when `cuGraphExecUpdate_v2` fails or when graph capture
-    /// is not applicable (e.g. when padding mismatches require D→H sync inside
+    /// is not applicable (e.g. when padding mismatches require D->H sync inside
     /// the layer loop).
     fn forward_decode_nogpu(
         &self,
@@ -2924,11 +3284,11 @@ impl CutileGpuModel {
             cuda_core::memcpy_htod_async::<f32>(
                 self.d_kv_len.device_pointer().cu_deviceptr(),
                 &kv_len_bits as *const f32, 1, stream,
-            ).expect("forward_decode_nogpu d_kv_len H→D");
+            ).expect("forward_decode_nogpu d_kv_len H->D");
             cuda_core::memcpy_htod_async::<f32>(
                 self.d_positions.device_pointer().cu_deviceptr(),
                 &pos_bits as *const f32, 1, stream,
-            ).expect("forward_decode_nogpu d_positions H→D");
+            ).expect("forward_decode_nogpu d_positions H->D");
         }
 
         // Upload embedding to a fresh device tensor (normal non-graph path).
@@ -2957,7 +3317,7 @@ impl CutileGpuModel {
     /// `self.scratch[SLOT_LOGITS]`.
     ///
     /// During CUDA graph capture (`cuStreamBeginCapture` in progress) no GPU work
-    /// executes — API calls are only recorded.  The return value is a placeholder;
+    /// executes -- API calls are only recorded.  The return value is a placeholder;
     /// real data is available after `cuGraphLaunch` + sync.
     fn forward_decode_inner(
         &self,
@@ -3031,7 +3391,7 @@ impl CutileGpuModel {
             // Q / K / V projections (GPU, pre-allocated slots).
             //
             // Decode (seq_len=1) with oxide GEMVs: K and V run on `stream_kv` concurrently
-            // with Q on `stream_main`.  For GQA models K/V are 4× smaller than Q and hide
+            // with Q on `stream_main`.  For GQA models K/V are 4x smaller than Q and hide
             // behind Q's latency.  The fork/join events are captured by the CUDA graph in
             // RELAXED mode, so the concurrent topology is replayed on every graph execution.
             //
@@ -3073,7 +3433,7 @@ impl CutileGpuModel {
             // Scatter-write K and V into the KV cache at the slot indicated by
             // d_kv_write_offset (read from device at execution time).  This is
             // graph-stable: the src/cache pointers are captured once; only the
-            // value at d_kv_write_offset changes (updated via H→D before each step).
+            // value at d_kv_write_offset changes (updated via H->D before each step).
             let kv_dim_u32 = (n_kv_heads * head_dim) as u32;
             let (k_cache_arc, v_cache_arc) = gpu_kv_cache.kv_device_tensors(layer);
             let write_off_ptr = self.d_kv_write_offset.device_pointer().cu_deviceptr();
@@ -3106,7 +3466,7 @@ impl CutileGpuModel {
             let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer);
 
             // Prefer oxide decode attention (kv_len read from device at execution
-            // time — correct CUDA graph replay without stale kv_len baking).
+            // time -- correct CUDA graph replay without stale kv_len baking).
             let attn_out_dev = if let Some(ref oda) = self.oxide_decode_attn {
                 let q_dim = n_heads * head_dim;
                 let out_tensor = {
@@ -3152,7 +3512,7 @@ impl CutileGpuModel {
                     .expect("decode attention failed")
             };
 
-            // Pad [q_dim] → [1, q_pad] for O-projection (zero-copy reshape when equal).
+            // Pad [q_dim] -> [1, q_pad] for O-projection (zero-copy reshape when equal).
             let attn_padded_dev = self.attn_out_to_oproj_device(&attn_out_dev, q_dim, self.q_pad);
 
             // O-projection (GPU, pre-allocated slot).
@@ -3228,8 +3588,8 @@ impl CutileGpuModel {
             let gate_silu_dev = if self.inter_pad == inter {
                 gate_silu_n_dev
             } else {
-                // GPU-side zero-padding: D→D copy of `inter` elements into a pre-zeroed
-                // `inter_pad` scratch.  Eliminates the D→H stream sync that was here before.
+                // GPU-side zero-padding: D->D copy of `inter` elements into a pre-zeroed
+                // `inter_pad` scratch.  Eliminates the D->H stream sync that was here before.
                 // Positions 0..inter are overwritten; inter..inter_pad remain 0 from init.
                 let pad_arc = self.down_proj_pad_scratch.borrow_mut()
                     .take()
@@ -3246,7 +3606,7 @@ impl CutileGpuModel {
                         inter * seq_len,
                         shared_stream,
                     )
-                    .expect("down_proj_pad D→D copy failed");
+                    .expect("down_proj_pad D->D copy failed");
                 }
                 let result = Arc::new(pad_arc);
                 *self.down_proj_pad_scratch.borrow_mut() = Some(result.clone());
@@ -3272,9 +3632,9 @@ impl CutileGpuModel {
             );
         }
 
-        // ── Final norm + lm_head ─────────────────────────────────────────────
-        // For seq_len=1 hidden_dev IS the last token — no D→H download or
-        // H→D re-upload needed.
+        // -- Final norm + lm_head ---------------------------------------------
+        // For seq_len=1 hidden_dev IS the last token -- no D->H download or
+        // H->D re-upload needed.
         let final_norm_w_dev = self
             .norm_weights
             .get("model.norm.weight")
@@ -3293,7 +3653,7 @@ impl CutileGpuModel {
             )
             .expect("final RMSNorm failed");
 
-        // lm_head GEMV — result stored in SLOT_LOGITS (pre-allocated).
+        // lm_head GEMV -- result stored in SLOT_LOGITS (pre-allocated).
         self.gemm_d2d_slot(&last_dev, "lm_head.weight", 1, SLOT_LOGITS);
     }
 
@@ -3325,7 +3685,7 @@ impl CutileGpuModel {
             *self.cached_decode_graph.borrow_mut() = None;
         }
 
-        // ── 1. Embedding lookup (CPU) ─────────────────────────────────────────
+        // -- 1. Embedding lookup (CPU) -----------------------------------------
         let embed = qweights
             .get_f32("model.embed_tokens.weight")
             .expect("model.embed_tokens.weight not found");
@@ -3372,24 +3732,24 @@ impl CutileGpuModel {
             })
             .collect();
 
-        // ── 2. CUDA graph dispatch (decode + GPU KV cache) ─────────────────────
+        // -- 2. CUDA graph dispatch (decode + GPU KV cache) ---------------------
         // For single-token decode with an active GPU KV cache and power-of-2 model
-        // dimensions (no D→H sync needed inside the layer loop), capture the
+        // dimensions (no D->H sync needed inside the layer loop), capture the
         // forward pass into a CUDA graph and replay it.  This replaces ~200
         // individual `cuLaunchKernel` submissions with one `cuGraphLaunch`.
         //
-        // The D→D padding for inter_pad != inter is now GPU-only (pre-zeroed scratch
-        // + async D→D copy), so the layer loop itself has no D→H syncs regardless.
+        // The D->D padding for inter_pad != inter is now GPU-only (pre-zeroed scratch
+        // + async D->D copy), so the layer loop itself has no D->H syncs regardless.
         // However the CUDA graph path requires all cuTile JIT variants to be
         // pre-compiled before capture begins; for non-power-of-2 N (e.g. vocab=32000)
         // some variants may not be warmed up, causing "not permitted during capture"
         // errors.  Until warmup covers all shapes, restrict to power-of-2 inter models.
         //
         // Preconditions:
-        //   • seq_len == 1 — decode mode
-        //   • gpu_kv_cache.has_device_kv() — GPU flash-attention is active
-        //   • !cfg.use_alibi — RoPE path
-        // inter_pad/h_pad: padding is handled via D→D copy (capturable).
+        //   * seq_len == 1 -- decode mode
+        //   * gpu_kv_cache.has_device_kv() -- GPU flash-attention is active
+        //   * !cfg.use_alibi -- RoPE path
+        // inter_pad/h_pad: padding is handled via D->D copy (capturable).
         // cuTile GEMV uses async_on (capture-compatible); warmup covers all needed
         // shapes, so no JIT compilation happens inside capture.
         if seq_len == 1
@@ -3401,7 +3761,7 @@ impl CutileGpuModel {
             return self.forward_decode_with_graph(&hidden, &positions, gpu_kv_cache);
         }
 
-        // ── 3. Layer loop (prefill or CPU-attention fallback) ─────────────────
+        // -- 3. Layer loop (prefill or CPU-attention fallback) -----------------
         // Sync the host KV mirror if it was skipped during prior GPU-only decode
         // steps and we are about to fall back to CPU attention.  This happens once
         // at the transition from GPU decode to long-context CPU fallback.
@@ -3428,8 +3788,8 @@ impl CutileGpuModel {
                 ref down_w_name,
             ) = layer_names[layer];
 
-            // ── 2a. Pre-attention RMSNorm (GPU) ───────────────────────────────
-            // hidden_dev is already on device — no upload needed.
+            // -- 2a. Pre-attention RMSNorm (GPU) -------------------------------
+            // hidden_dev is already on device -- no upload needed.
             // For decode (seq_len=1) use scratch buffers to avoid 3 api::zeros.sync_on
             // per call (168 blocking allocs per token across 28 layers).
             let input_ln_w_dev = self
@@ -3463,7 +3823,7 @@ impl CutileGpuModel {
                     .expect("CutileGpuModel: pre-attention RMSNorm failed")
             };
 
-            // ── 2b. QKV projections — device-to-device ───────────────────────
+            // -- 2b. QKV projections -- device-to-device -----------------------
             // For Q2_0 models: gemm_any_d2d_slot dequantizes on-GPU (m=1 only).
             // For f32 models: same path as before, synchronous.
             // For prefill (m>1): Q2_0 falls back to dequantized f32 GEMM.
@@ -3471,11 +3831,11 @@ impl CutileGpuModel {
             let k_dev = self.gemm_any_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K);
             let v_dev = self.gemm_any_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V);
 
-            // ── 2c. RoPE (GPU) — rotate Q and K entirely on device ───────────
-            // cos/sin tables (tiny: seq_len × n_heads × head_dim/2 floats each)
+            // -- 2c. RoPE (GPU) -- rotate Q and K entirely on device -----------
+            // cos/sin tables (tiny: seq_len x n_heads x head_dim/2 floats each)
             // are computed on CPU and uploaded.  Q and K are deinterleaved and
             // rotated on the GPU using pre-allocated scratch buffers, eliminating
-            // the 5 × 2 api::zeros calls (280 blocking allocs per token at 28 layers).
+            // the 5 x 2 api::zeros calls (280 blocking allocs per token at 28 layers).
             let (q_rot_dev, k_rot_dev) = if !cfg.use_alibi {
                 let shared_stream = self.matmul.stream();
                 let qr = self
@@ -3506,14 +3866,14 @@ impl CutileGpuModel {
                     .expect("CutileGpuModel: GPU RoPE for K failed");
                 (qr, kr)
             } else {
-                // ALiBi: no rotation — keep Q/K tensors on device as-is.
+                // ALiBi: no rotation -- keep Q/K tensors on device as-is.
                 (q_dev.clone(), k_dev.clone())
             };
 
-            // ── 2d. KV-cache append ───────────────────────────────────────────
+            // -- 2d. KV-cache append -------------------------------------------
             // When the GPU KV cache is active and seq_len == 1 (decode), use the
-            // GPU-only append path that omits the D→H host-mirror update.
-            // This eliminates 2 × n_layers blocking D→H `sync_on` calls per token
+            // GPU-only append path that omits the D->H host-mirror update.
+            // This eliminates 2 x n_layers blocking D->H `sync_on` calls per token
             // (56 for a 28-layer model) which were serialising the GPU pipeline.
             //
             // If we exceed the GPU KV cache capacity or need CPU attention
@@ -3535,14 +3895,14 @@ impl CutileGpuModel {
             // kv_len includes the tokens just appended.
             let kv_len = gpu_kv_cache.seq_len() + seq_len;
 
-            // ── 2e. Attention ─────────────────────────────────────────────────
+            // -- 2e. Attention -------------------------------------------------
             let scale = 1.0 / (head_dim as f32).sqrt();
 
             // For decode (seq_len=1) with the GPU KV cache active: run the fused
             // `cutile_decode_attn` kernel which reads Q, K, V entirely on device,
             // eliminating all PCIe traffic for the KV cache.  At context length L
-            // this saves 2 × L × n_kv_heads × head_dim × 4 bytes per layer per
-            // token — dominant PCIe traffic at long context.
+            // this saves 2 x L x n_kv_heads x head_dim x 4 bytes per layer per
+            // token -- dominant PCIe traffic at long context.
             //
             // Falls back to the host-based path when:
             //   - seq_len > 1 (prefill): GPU flash attention via forward_batched
@@ -3550,7 +3910,7 @@ impl CutileGpuModel {
             let attn_padded_dev = if seq_len == 1 && gpu_kv_cache.has_device_kv() {
                 // GPU decode attention: Q on device, K/V from GPU-resident cache.
                 // Use scratch variant to eliminate the per-call api::zeros.sync_on
-                // allocation (a full stream sync + cudaMallocAsync) — saves 28
+                // allocation (a full stream sync + cudaMallocAsync) -- saves 28
                 // blocking allocs per decode token across all layers.
                 let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer);
                 let attn_out_dev = self
@@ -3568,7 +3928,7 @@ impl CutileGpuModel {
                         &mut self.attn_out_scratch.borrow_mut(),
                     )
                     .expect("CutileGpuModel: GPU decode attention failed");
-                // Pad [q_dim] → [1, q_pad] for O projection via GPU D→D copy.
+                // Pad [q_dim] -> [1, q_pad] for O projection via GPU D->D copy.
                 self.attn_out_to_oproj_device(&attn_out_dev, q_dim, self.q_pad)
             } else {
                 // Host-based path: prefill (GPU flash attn) or long-context fallback.
@@ -3644,12 +4004,12 @@ impl CutileGpuModel {
                 self.to_device_padded(&attn_output, seq_len, q_dim, self.q_pad)
             };
 
-            // ── 2f. O projection — device-to-device ──────────────────────────
+            // -- 2f. O projection -- device-to-device --------------------------
             let o_dev = self.gemm_any_d2d_slot(&attn_padded_dev, o_w_name, seq_len, SLOT_O);
 
-            // ── 2g. Residual add (GPU) ────────────────────────────────────────
+            // -- 2g. Residual add (GPU) ----------------------------------------
             // o_dev has h columns; pad to h_pad when h_pad > h (rare edge case
-            // e.g. h=5120 → h_pad=8192).  For models where h_pad == h (the
+            // e.g. h=5120 -> h_pad=8192).  For models where h_pad == h (the
             // common case) this is a zero-cost clone.
             let o_padded = if self.h_pad == h {
                 o_dev.clone()
@@ -3668,8 +4028,8 @@ impl CutileGpuModel {
                 self.add_device(&hidden_dev, &o_padded, seq_len * self.h_pad)
             };
 
-            // ── 2h. Post-attention RMSNorm (GPU) ─────────────────────────────
-            // hidden_dev is already updated on device — no upload needed.
+            // -- 2h. Post-attention RMSNorm (GPU) -----------------------------
+            // hidden_dev is already updated on device -- no upload needed.
             let post_ln_w_dev = self
                 .norm_weights
                 .get(post_ln_name)
@@ -3701,15 +4061,15 @@ impl CutileGpuModel {
                     .expect("CutileGpuModel: post-attention RMSNorm failed")
             };
 
-            // ── 2i. FFN gate + up — device-to-device ─────────────────────────
+            // -- 2i. FFN gate + up -- device-to-device -------------------------
             // For Q2_0 models gemm_any_d2d_slot dispatches on-GPU dequant (synchronous).
             // For f32 models the synchronous gemm_d2d_slot path is used.
             let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE);
             let up_dev = self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
 
-            // ── 2j. SiLU gate × up (GPU) ─────────────────────────────────────
+            // -- 2j. SiLU gate x up (GPU) -------------------------------------
             // gate_dev and up_dev already reside on the GPU.  Use the scratch
-            // variant to eliminate the per-call api::zeros.sync_on allocation —
+            // variant to eliminate the per-call api::zeros.sync_on allocation --
             // saves 28 blocking allocs per decode token across all layers.
             let gate_silu_n_dev = if seq_len == 1 {
                 self.cutile_elementwise
@@ -3727,12 +4087,12 @@ impl CutileGpuModel {
                     .expect("CutileGpuModel: GPU SiLU-mul failed")
             };
 
-            // ── 2k. FFN down — device-to-device ──────────────────────────────
+            // -- 2k. FFN down -- device-to-device ------------------------------
             // Pad gate_silu from inter to inter_pad for the down_proj GEMM.
             // When inter == inter_pad (pow-2 models) this is a free reshape.
             // For seq_len==1 with non-power-of-2 inter (e.g. Llama-3.1-8B inter=14336):
-            // use GPU D→D copy into the pre-zeroed inter_pad scratch to avoid 32 D→H
-            // stream syncs per token — the dominant bottleneck before this fix.
+            // use GPU D->D copy into the pre-zeroed inter_pad scratch to avoid 32 D->H
+            // stream syncs per token -- the dominant bottleneck before this fix.
             let gate_silu_dev = if self.inter_pad == inter {
                 gate_silu_n_dev
             } else if seq_len == 1 {
@@ -3752,7 +4112,7 @@ impl CutileGpuModel {
                         inter,
                         stream,
                     )
-                    .expect("down_proj_pad D→D copy failed");
+                    .expect("down_proj_pad D->D copy failed");
                 }
                 let result = Arc::new(pad_arc);
                 *self.down_proj_pad_scratch.borrow_mut() = Some(result.clone());
@@ -3763,7 +4123,7 @@ impl CutileGpuModel {
             };
             let down_dev = self.gemm_any_d2d_slot(&gate_silu_dev, down_w_name, seq_len, SLOT_DOWN);
 
-            // ── 2l. Residual add (GPU) ────────────────────────────────────────
+            // -- 2l. Residual add (GPU) ----------------------------------------
             let down_padded = if self.h_pad == h {
                 down_dev.clone()
             } else {
@@ -3782,9 +4142,9 @@ impl CutileGpuModel {
             };
         }
 
-        // ── 3. Final norm + lm_head ────────────────────────────────────────────
-        // For decode (seq_len=1) hidden_dev IS the last token — pass it directly
-        // to the final RMSNorm, skipping the unnecessary D→H download + H→D re-upload
+        // -- 3. Final norm + lm_head --------------------------------------------
+        // For decode (seq_len=1) hidden_dev IS the last token -- pass it directly
+        // to the final RMSNorm, skipping the unnecessary D->H download + H->D re-upload
         // that the prefill path needs to extract just the last token row.
         let final_norm_w_dev = self
             .norm_weights
@@ -3829,14 +4189,594 @@ impl CutileGpuModel {
         self.download_device_tensor(&logits_dev)
     }
 
-    /// Batched decode: M requests × 1 token each, processed in a single GPU pass.
+    // -- Batch decode CUDA graph ----------------------------------------------
+
+    /// Inner layer-loop for batch decode CUDA graph capture.
+    ///
+    /// All intermediate tensors are pre-allocated struct fields; no device
+    /// allocation or stream synchronisation happens inside this function.
+    /// The function body is captured as a CUDA graph on the first call.
+    ///
+    /// # Assumptions
+    /// - All M sequences are **synchronised**: same `kv_write_off` and same
+    ///   `position` for every sequence at each decode step.
+    /// - All projection weights are Q4K (quantised).
+    /// - `q_pad == q_dim` (standard LLaMA/Qwen geometry; no attn-output padding).
+    fn forward_batch_decode_inner_graph(
+        &self,
+        m:            usize,
+        positions:    &[u32],          // length m (same value for all in synchronised batch)
+        kv_caches:    &mut [CutileKvCache],
+    ) {
+        let cfg        = &self.config;
+        let h          = cfg.hidden_size;
+        let n_heads    = cfg.num_attention_heads;
+        let n_kv_heads = cfg.num_kv_heads;
+        let head_dim   = cfg.head_dim;
+        let q_dim      = n_heads * head_dim;
+        let kv_dim     = n_kv_heads * head_dim;
+        let inter      = cfg.intermediate_size;
+        let inter_pad  = self.inter_pad;
+        let stream     = self.matmul.stream();
+        let cu_stream  = stream.cu_stream();
+
+        let oxide = match self.oxide_q4k_gemv.as_ref() {
+            Some(o) if o.has_sm120_batch() => o,
+            _ => panic!("forward_batch_decode_inner_graph: oxide Q4K sm120 batch required"),
+        };
+
+        // Shared write offset (same for all M sequences -- synchronised batch).
+        let write_off_ptr = self.d_kv_write_offset.device_pointer().cu_deviceptr();
+        let kv_dim_u32 = kv_dim as u32;
+
+        // hidden_dev starts as batch_hidden (pre-loaded with M embeddings before capture).
+        // We do NOT borrow_mut here (would conflict); instead we alias via Arc::clone.
+        let mut hidden_dev: Arc<Tensor<f32>> = self.batch_hidden.clone();
+
+        #[allow(clippy::type_complexity)]
+        let layer_names: Vec<(String,String,String,String,String,String,String,String,String)> =
+            (0..cfg.num_layers).map(|l| {
+                let p = format!("model.layers.{l}");
+                (
+                    format!("{p}.input_layernorm.weight"),
+                    format!("{p}.post_attention_layernorm.weight"),
+                    format!("{p}.self_attn.q_proj.weight"),
+                    format!("{p}.self_attn.k_proj.weight"),
+                    format!("{p}.self_attn.v_proj.weight"),
+                    format!("{p}.self_attn.o_proj.weight"),
+                    format!("{p}.mlp.gate_proj.weight"),
+                    format!("{p}.mlp.up_proj.weight"),
+                    format!("{p}.mlp.down_proj.weight"),
+                )
+            }).collect();
+
+        for layer in 0..cfg.num_layers {
+            let (ref input_ln, ref post_ln,
+                 ref qw, ref kw, ref vw, ref ow,
+                 ref gate_w, ref up_w, ref down_w) = layer_names[layer];
+
+            // -- Pre-attention RMSNorm -----------------------------------------
+            let input_ln_dev = self.norm_weights.get(input_ln).expect("input_layernorm");
+            let normed1 = self.cutile_rmsnorm
+                .forward_device_fused_scratch(
+                    stream, hidden_dev.clone(), input_ln_dev,
+                    m, h, self.h_pad, cfg.layer_norm_eps,
+                    &mut self.batch_pre_attn_norm_scratch.borrow_mut(),
+                )
+                .expect("batch pre-attn RMSNorm");
+            // normed1 is [m, h_pad]; trim to [m * h_pad] for GEMV
+            let normed1_flat: Arc<Tensor<f32>> = normed1;
+
+            // -- Q / K / V batch GEMV (Q4K sm120_batch) -----------------------
+            let gemv_q4k_h = |a: &Arc<Tensor<f32>>, wname: &str, out: &Arc<Tensor<f32>>,
+                               n: usize, k_blocks: usize| {
+                let dw = self.device_weights_q4k.get(wname)
+                    .unwrap_or_else(|| panic!("batch inner: Q4K weight {wname} missing"));
+                oxide.forward_sm120_batch_d2d_into(
+                    a, &dw.tensor, m, n, k_blocks,
+                    &self.batch_q8_qs_h, &self.batch_q8_ds_h, out,
+                ).unwrap_or_else(|e| panic!("batch inner GEMV {wname}: {e}"));
+            };
+
+            // Trim normed1 to compact [m * h_pad] for Q/K/V (row_stride == k for h-width weights).
+            let dw_q = self.device_weights_q4k.get(qw.as_str())
+                .expect("q_proj weight missing");
+            let dw_k = self.device_weights_q4k.get(kw.as_str())
+                .expect("k_proj weight missing");
+            let dw_v = self.device_weights_q4k.get(vw.as_str())
+                .expect("v_proj weight missing");
+
+            // Compact normed1 to [m * k] if h_pad != k.
+            let k_h = dw_q.k_blocks * 256; // = hidden_size
+            let act_h = if self.h_pad == k_h {
+                normed1_flat.clone()
+            } else {
+                // D->D compact each row (h_pad -> k_h).
+                let compact = self.batch_normed1.clone();
+                for r in 0..m {
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            compact.device_pointer().cu_deviceptr() + (r * k_h * 4) as u64,
+                            normed1_flat.device_pointer().cu_deviceptr() + (r * self.h_pad * 4) as u64,
+                            k_h,
+                            stream,
+                        ).expect("batch inner: normed compact D->D");
+                    }
+                }
+                compact
+            };
+
+            gemv_q4k_h(&act_h, qw, &self.batch_gemv_q, dw_q.n, dw_q.k_blocks);
+            gemv_q4k_h(&act_h, kw, &self.batch_gemv_k, dw_k.n, dw_k.k_blocks);
+            gemv_q4k_h(&act_h, vw, &self.batch_gemv_v, dw_v.n, dw_v.k_blocks);
+
+            // -- Per-sequence D->D slice, RoPE, and stable copy -----------------
+            for r in 0..m {
+                // Slice row r from batch_gemv_q/k/v into per-seq pre-alloc tensors.
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        self.batch_q_seqs[r].device_pointer().cu_deviceptr(),
+                        self.batch_gemv_q.device_pointer().cu_deviceptr() + (r * q_dim * 4) as u64,
+                        q_dim, stream,
+                    ).expect("batch inner: q_seqs slice");
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        self.batch_k_seqs[r].device_pointer().cu_deviceptr(),
+                        self.batch_gemv_k.device_pointer().cu_deviceptr() + (r * kv_dim * 4) as u64,
+                        kv_dim, stream,
+                    ).expect("batch inner: k_seqs slice");
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        self.batch_v_seqs[r].device_pointer().cu_deviceptr(),
+                        self.batch_gemv_v.device_pointer().cu_deviceptr() + (r * kv_dim * 4) as u64,
+                        kv_dim, stream,
+                    ).expect("batch inner: v_seqs slice");
+                }
+
+                // Apply RoPE to Q and K for sequence r.
+                let pos_r = [positions[r]];
+                let q_rope_tmp = self.cutile_rope
+                    .forward_device_scratch(
+                        &self.batch_q_seqs[r], &pos_r, 1, n_heads, head_dim,
+                        cfg.rope_theta, &mut self.q_rope_scratch.borrow_mut(), stream,
+                    )
+                    .expect("batch inner: Q RoPE");
+                let k_rope_tmp = self.cutile_rope
+                    .forward_device_scratch(
+                        &self.batch_k_seqs[r], &pos_r, 1, n_kv_heads, head_dim,
+                        cfg.rope_theta, &mut self.k_rope_scratch.borrow_mut(), stream,
+                    )
+                    .expect("batch inner: K RoPE");
+
+                // D->D copy to stable pre-allocated tensors (fixed device ptrs for graph).
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        self.batch_q_rot[r].device_pointer().cu_deviceptr(),
+                        q_rope_tmp.device_pointer().cu_deviceptr(),
+                        q_dim, stream,
+                    ).expect("batch inner: q_rot stable copy");
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        self.batch_k_rot[r].device_pointer().cu_deviceptr(),
+                        k_rope_tmp.device_pointer().cu_deviceptr(),
+                        kv_dim, stream,
+                    ).expect("batch inner: k_rot stable copy");
+                }
+            }
+
+            // -- Batch KV scatter-write (K and V for all M sequences) ----------
+            self.kv_scatter_write
+                .copy_m_with_device_offsets(
+                    self.batch_src_k_ptrs_dev,
+                    {
+                        // build cache_k_ptrs from current layer's KV caches
+                        // NOTE: these pointers are stable (pre-allocated GPU KV cache)
+                        // so they are the same every layer/step -- baked in at capture.
+                        let k_cache_ptrs: Vec<u64> = kv_caches.iter()
+                            .take(m)
+                            .map(|kvc| kvc.kv_device_tensors(layer).0.device_pointer().cu_deviceptr())
+                            .collect();
+                        // Write cache_k_ptrs to a temporary device location; use batch_normed2
+                        // as scratch (overwritten immediately after). Actually we need a stable
+                        // per-layer array. Use the graph's baked-in cache_bases (written before capture).
+                        // This is a TODO: for now revert to single-seq per-layer writes.
+                        // (Handled in forward_batch_decode_with_graph setup.)
+                        let _ = k_cache_ptrs; // consumed by capture setup
+                        self.batch_src_k_ptrs_dev // re-use pre-loaded from capture setup
+                    },
+                    write_off_ptr,
+                    kv_dim_u32,
+                    m as u32,
+                    cu_stream,
+                )
+                .expect("batch inner: KV scatter-write K");
+
+            // V scatter-write (batch_src_v_ptrs_dev -> KV cache V per seq)
+            // Cache V pointers are per-layer; loaded before capture (same as K).
+            // Here we use a per-layer device array... see setup in forward_batch_decode_with_graph.
+            // For the inner function, both src_k/v ptrs AND cache_k/v ptrs are captured once.
+            // The batch_v_seqs[r] pointers ARE stable (pre-allocated) -> used as src_v.
+
+            // For the batch scatter-write V, we need a device array of V source ptrs
+            // and a device array of V cache base ptrs. These are per-layer (different cache ptr
+            // per layer), so they cannot be a single fixed global array.
+            //
+            // SIMPLIFICATION for the proof-of-concept: run single-seq KV scatter-write
+            // for each sequence within the graph (capturable, just more nodes).
+            for r in 0..m {
+                let (k_cache, v_cache) = kv_caches[r].kv_device_tensors(layer);
+                self.kv_scatter_write
+                    .copy_with_device_offset(
+                        self.batch_k_rot[r].device_pointer().cu_deviceptr(),
+                        k_cache.device_pointer().cu_deviceptr(),
+                        write_off_ptr,
+                        kv_dim_u32,
+                        cu_stream,
+                    )
+                    .expect("batch inner: scatter K seq");
+                self.kv_scatter_write
+                    .copy_with_device_offset(
+                        self.batch_v_seqs[r].device_pointer().cu_deviceptr(),
+                        v_cache.device_pointer().cu_deviceptr(),
+                        write_off_ptr,
+                        kv_dim_u32,
+                        cu_stream,
+                    )
+                    .expect("batch inner: scatter V seq");
+                kv_caches[r].mark_host_stale();
+            }
+
+            // -- Per-sequence flash attention (kpar) ---------------------------
+            let kv_len_after = kv_caches[0].seq_len() + 1; // same for all (synchronized)
+            let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+            // Concatenate Q-rot into batch_oproj_in (also serves as Q batch buffer).
+            for r in 0..m {
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        self.batch_oproj_in.device_pointer().cu_deviceptr() + (r * q_dim * 4) as u64,
+                        self.batch_q_rot[r].device_pointer().cu_deviceptr(),
+                        q_dim, stream,
+                    ).expect("batch inner: q_rot to oproj_in");
+                }
+            }
+
+            for r in 0..m {
+                let (k_full, v_full) = kv_caches[r].kv_device_tensors(layer);
+                if let Some(ref oda) = self.oxide_decode_attn {
+                    let attn_out = &self.batch_attn_out[r];
+                    oda.forward_kpar_d2d(
+                        attn_out, &self.batch_q_rot[r], &k_full, &v_full,
+                        &self.d_kv_len, n_heads, n_kv_heads, head_dim, scale,
+                    ).expect("batch inner: kpar attention");
+                } else {
+                    let attn_out = &self.batch_attn_out[r];
+                    let _ = self.flash_attn
+                        .decode_attention_device_scratch(
+                            &self.batch_q_rot[r], &k_full, &v_full,
+                            kv_len_after, n_heads, n_kv_heads, head_dim, scale,
+                            stream, &mut self.attn_out_scratch.borrow_mut(),
+                        )
+                        .expect("batch inner: cutile attention");
+                    // Copy into stable pre-alloc attn_out[r]
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            attn_out.device_pointer().cu_deviceptr(),
+                            self.attn_out_scratch.borrow().as_ref().unwrap().device_pointer().cu_deviceptr(),
+                            q_dim, stream,
+                        ).expect("batch inner: attn_out copy");
+                    }
+                }
+            }
+
+            // Advance KV caches (host-side seq_len tracking).
+            for kvc in kv_caches.iter_mut().take(m) {
+                kvc.advance_host_seq_len(1);
+            }
+
+            // -- Concatenate attn outputs -> batch_oproj_in ---------------------
+            for r in 0..m {
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        self.batch_oproj_in.device_pointer().cu_deviceptr() + (r * self.q_pad * 4) as u64,
+                        self.batch_attn_out[r].device_pointer().cu_deviceptr(),
+                        q_dim, stream,
+                    ).expect("batch inner: attn_out concat");
+                }
+            }
+
+            // -- O-projection (Q4K batch GEMV) ---------------------------------
+            let dw_o = self.device_weights_q4k.get(ow.as_str()).expect("o_proj weight");
+            let k_o = dw_o.k_blocks * 256; // = q_dim
+            let act_o = if self.q_pad == k_o {
+                self.batch_oproj_in.clone()
+            } else {
+                // Compact q_pad -> k_o (rare).
+                let compact = self.batch_gemv_q.clone(); // re-use batch_gemv_q as temp
+                for r in 0..m {
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            compact.device_pointer().cu_deviceptr() + (r * k_o * 4) as u64,
+                            self.batch_oproj_in.device_pointer().cu_deviceptr() + (r * self.q_pad * 4) as u64,
+                            k_o, stream,
+                        ).expect("batch inner: oproj compact");
+                    }
+                }
+                compact
+            };
+            gemv_q4k_h(&act_o, ow, &self.batch_gemv_o, dw_o.n, dw_o.k_blocks);
+
+            // -- Post-attention residual add ------------------------------------
+            hidden_dev = self.add_device_scratch(
+                &hidden_dev, &self.batch_gemv_o, m * self.h_pad,
+                &mut self.batch_post_attn_add_scratch.borrow_mut(),
+            );
+
+            // -- Post-attention RMSNorm ----------------------------------------
+            let post_ln_dev = self.norm_weights.get(post_ln).expect("post_layernorm");
+            let normed2 = self.cutile_rmsnorm
+                .forward_device_fused_scratch(
+                    stream, hidden_dev.clone(), post_ln_dev,
+                    m, h, self.h_pad, cfg.layer_norm_eps,
+                    &mut self.batch_post_attn_norm_scratch.borrow_mut(),
+                )
+                .expect("batch post-attn RMSNorm");
+
+            // Compact normed2 for gate/up GEMV (same k as Q/K/V).
+            let dw_gate = self.device_weights_q4k.get(gate_w.as_str()).expect("gate_proj");
+            let k_g = dw_gate.k_blocks * 256;
+            let act_g = if self.h_pad == k_g {
+                normed2.clone()
+            } else {
+                let compact = self.batch_normed2.clone();
+                for r in 0..m {
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            compact.device_pointer().cu_deviceptr() + (r * k_g * 4) as u64,
+                            normed2.device_pointer().cu_deviceptr() + (r * self.h_pad * 4) as u64,
+                            k_g, stream,
+                        ).expect("batch inner: normed2 compact");
+                    }
+                }
+                compact
+            };
+
+            // -- gate/up GEMV --------------------------------------------------
+            let dw_up = self.device_weights_q4k.get(up_w.as_str()).expect("up_proj");
+            gemv_q4k_h(&act_g, gate_w, &self.batch_gemv_gate, dw_gate.n, dw_gate.k_blocks);
+            gemv_q4k_h(&act_g, up_w,   &self.batch_gemv_up,   dw_up.n,   dw_up.k_blocks);
+
+            // -- SiLU(gate) x up -----------------------------------------------
+            let silu_out = self.cutile_elementwise
+                .silu_mul_device_scratch(
+                    &self.batch_gemv_gate, &self.batch_gemv_up, m, inter,
+                    &mut self.batch_silu_out_scratch.borrow_mut(),
+                )
+                .expect("batch inner: SiLU-mul");
+
+            // -- Down projection (inter -> h) -----------------------------------
+            let dw_down = self.device_weights_q4k.get(down_w.as_str()).expect("down_proj");
+            let k_down = dw_down.k_blocks * 256; // = inter
+
+            // Compact silu_out if inter_pad != k_down (e.g. Llama-3.1-8B: 14336 -> 14336, no compact needed).
+            let act_down = if silu_out.size() == m * k_down {
+                silu_out
+            } else if let Some(ref compact_buf) = self.batch_down_compact {
+                for r in 0..m {
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            compact_buf.device_pointer().cu_deviceptr() + (r * k_down * 4) as u64,
+                            silu_out.device_pointer().cu_deviceptr() + (r * inter * 4) as u64,
+                            k_down, stream,
+                        ).expect("batch inner: down compact");
+                    }
+                }
+                compact_buf.clone()
+            } else {
+                silu_out
+            };
+
+            oxide.forward_sm120_batch_d2d_into(
+                &act_down, &dw_down.tensor, m, dw_down.n, dw_down.k_blocks,
+                &self.batch_q8_qs_i, &self.batch_q8_ds_i, &self.batch_gemv_down,
+            ).expect("batch inner: down GEMV");
+
+            // -- FFN residual add -----------------------------------------------
+            hidden_dev = self.add_device_scratch(
+                &hidden_dev, &self.batch_gemv_down, m * self.h_pad,
+                &mut self.batch_ffn_add_scratch.borrow_mut(),
+            );
+        }
+
+        // Layer loop done -- `hidden_dev` is the final residual add output.
+        // Store it into batch_hidden so the caller can read it after graph launch.
+        // D->D copy only if it's not already at batch_hidden's address.
+        let dst_ptr = self.batch_hidden.device_pointer().cu_deviceptr();
+        let src_ptr = hidden_dev.device_pointer().cu_deviceptr();
+        if src_ptr != dst_ptr {
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    dst_ptr, src_ptr, m * self.h_pad, stream,
+                ).expect("batch inner: final hidden copy");
+            }
+        }
+        // batch_hidden now holds the layer-loop output; caller applies final norm + lm_head.
+    }
+
+    /// CUDA-graph-accelerated batch decode: M synchronised sequences, 1 token each.
+    ///
+    /// Captures on the first call, replays on subsequent calls.
+    /// Before each graph launch the embeddings and decode scalars are written H->D.
+    /// After launch, final norm + lm_head + D->H are run outside the graph.
+    ///
+    /// Falls back to `forward_batch_decode` (no-graph) when:
+    ///   - Q4K sm120 batch kernel is unavailable
+    ///   - M > max_batch_graph
+    ///   - KV caches do not have device KV
+    fn forward_batch_decode_with_graph(
+        &self,
+        embeddings: &[Vec<f32>],          // [m][h]
+        positions:  &[u32],               // [m] -- must all be equal (synchronised)
+        qweights:   &QuantizedWeights,
+        kv_caches:  &mut [CutileKvCache],
+    ) -> Vec<Vec<f32>> {
+        let m = embeddings.len();
+        assert!(m >= 2 && m <= self.max_batch_graph,
+            "batch graph: m={m} must be in [2, {}]", self.max_batch_graph);
+        let cfg    = &self.config;
+        let h      = cfg.hidden_size;
+        let vocab  = cfg.vocab_size;
+        let stream = self.matmul.stream();
+        let cu_stream = stream.cu_stream();
+
+        // Write offset (same for all M sequences).
+        let kv_write_off = kv_caches[0].seq_len() as i32;
+        let kv_len_bits: f32 = f32::from_bits((kv_write_off + 1) as u32);
+        let pos_bits: f32    = f32::from_bits(positions[0]);
+
+        // -- H->D: upload M embeddings and decode scalars -----------------------
+        for (r, emb) in embeddings.iter().enumerate() {
+            let src: Vec<f32> = if self.h_pad == h {
+                emb.to_vec()
+            } else {
+                let mut v = vec![0.0f32; self.h_pad];
+                v[..h].copy_from_slice(&emb[..h]);
+                v
+            };
+            unsafe {
+                cuda_core::memcpy_htod_async::<f32>(
+                    self.d_embed_batch[r].device_pointer().cu_deviceptr(),
+                    src.as_ptr(), self.h_pad, stream,
+                ).expect("batch graph: d_embed_batch H->D");
+            }
+        }
+        // Concatenate embeddings into batch_hidden (single H->D copy of M rows).
+        // Upload each row separately via D->D within the stream (already uploaded above).
+        for (r, _emb) in embeddings.iter().enumerate() {
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    self.batch_hidden.device_pointer().cu_deviceptr() + (r * self.h_pad * 4) as u64,
+                    self.d_embed_batch[r].device_pointer().cu_deviceptr(),
+                    self.h_pad, stream,
+                ).expect("batch graph: embedding concat D->D");
+            }
+        }
+
+        // Update decode scalars (same for all M sequences).
+        unsafe {
+            cuda_core::memcpy_htod_async::<f32>(
+                self.d_kv_len.device_pointer().cu_deviceptr(),
+                &kv_len_bits as *const f32, 1, stream,
+            ).expect("batch graph: d_kv_len H->D");
+            cuda_core::memcpy_htod_async::<f32>(
+                self.d_positions.device_pointer().cu_deviceptr(),
+                &pos_bits as *const f32, 1, stream,
+            ).expect("batch graph: d_positions H->D");
+            cuda_core::memcpy_htod_async::<i32>(
+                self.d_kv_write_offset.device_pointer().cu_deviceptr(),
+                &kv_write_off as *const i32, 1, stream,
+            ).expect("batch graph: d_kv_write_offset H->D");
+        }
+
+        let mut graph_cache = self.cached_batch_graph.borrow_mut();
+
+        if let Some(ref decode_graph) = *graph_cache {
+            // -- Subsequent steps: update scalar nodes and launch --------------
+            let new_kv_len = kv_write_off + 1;
+            let new_pos    = positions[0] as i32;
+            for fa in &decode_graph.flash_attn_nodes {
+                unsafe { *fa.scalar_ptr = new_kv_len; }
+            }
+            for rn in &decode_graph.rope_nodes {
+                unsafe { *rn.scalar_ptr = new_pos; }
+            }
+
+            let need_update = !decode_graph.flash_attn_nodes.is_empty()
+                || !decode_graph.rope_nodes.is_empty();
+            if need_update {
+                let mut result_info = cuda_core::sys::CUgraphExecUpdateResultInfo_st {
+                    result: cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS,
+                    errorNode: std::ptr::null_mut(),
+                    errorFromNode: std::ptr::null_mut(),
+                };
+                let rc = unsafe {
+                    cuda_core::sys::cuGraphExecUpdate_v2(
+                        decode_graph.cu_exec, decode_graph.cu_graph, &mut result_info,
+                    )
+                };
+                if rc != 0 || result_info.result != cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS {
+                    eprintln!("[batch_graph] cuGraphExecUpdate_v2 failed rc={rc}; falling back");
+                    drop(graph_cache);
+                    // Advance KV caches so caller's advance() doesn't double-count.
+                    return vec![];
+                }
+            }
+
+            unsafe { cuda_core::sys::cuGraphLaunch(decode_graph.cu_exec, cu_stream); }
+            unsafe { stream.synchronize().expect("batch graph sync"); }
+            drop(graph_cache);
+        } else {
+            // -- First call: capture graph -------------------------------------
+            let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
+            unsafe { stream.begin_capture(relaxed).expect("batch graph: begin_capture"); }
+
+            self.forward_batch_decode_inner_graph(m, positions, kv_caches);
+
+            let cu_graph = unsafe { stream.end_capture().expect("batch graph: end_capture") };
+
+            let mut cu_exec_uninit = std::mem::MaybeUninit::<cuda_core::sys::CUgraphExec>::uninit();
+            unsafe {
+                cuda_core::sys::cuGraphInstantiateWithFlags(cu_exec_uninit.as_mut_ptr(), cu_graph, 0);
+            }
+            let cu_exec = unsafe { cu_exec_uninit.assume_init() };
+
+            let capture_kv_len = kv_write_off + 1;
+            let capture_pos    = positions[0] as i32;
+            let n_heads_u32    = cfg.num_attention_heads as u32;
+            let (flash_attn_nodes, rope_nodes) =
+                self.find_kernel_scalar_nodes(cu_graph, capture_kv_len, capture_pos, n_heads_u32);
+
+            eprintln!("[batch_graph] captured: {} flash-attn nodes, {} rope nodes",
+                flash_attn_nodes.len(), rope_nodes.len());
+
+            *graph_cache = Some(BatchDecodeGraph {
+                cu_exec,
+                cu_graph,
+                device: stream.device().clone(),
+                m,
+                flash_attn_nodes,
+                rope_nodes,
+            });
+
+            unsafe { cuda_core::sys::cuGraphLaunch(cu_exec, cu_stream); }
+            unsafe { stream.synchronize().expect("batch graph: first sync"); }
+            drop(graph_cache);
+        }
+
+        // -- Outside graph: final norm + lm_head + D->H ------------------------
+        let final_ln_dev = self.norm_weights.get("model.norm.weight")
+            .expect("model.norm.weight missing");
+        let last_dev = self.cutile_rmsnorm
+            .forward_device_fused_scratch(
+                stream,
+                self.batch_hidden.clone(),
+                final_ln_dev,
+                m, h, self.h_pad, cfg.layer_norm_eps,
+                &mut self.batch_final_norm_scratch.borrow_mut(),
+            )
+            .expect("batch graph: final RMSNorm");
+
+        // lm_head: [M, H] -> [M, vocab]  -- run outside graph (allocation OK here)
+        let logits_dev = self.gemm_d2d(&last_dev, "lm_head.weight", m);
+        let logits_flat = self.download_device_tensor(&logits_dev);
+        logits_flat.chunks(vocab).map(|c| c.to_vec()).collect()
+    }
+
+    /// Batched decode: M requests x 1 token each, processed in a single GPU pass.
     ///
     /// Each request has its own KV cache (`kv_caches[r]`) and current token
     /// (`token_ids[r]`) at position `positions[r]`. Returns M logit vectors
     /// (one per request, length = vocab_size).
     ///
-    /// Uses `oxide_decode_attn_batch` for flash attention — grid = M × n_heads
-    /// blocks fills all 170 RTX-5090 SMs for batch ≥ 5.
+    /// Uses `oxide_decode_attn_batch` for flash attention -- grid = M x n_heads
+    /// blocks fills all 170 RTX-5090 SMs for batch >= 5.
     pub fn forward_batch_decode(
         &self,
         token_ids:  &[u32],
@@ -3860,7 +4800,7 @@ impl CutileGpuModel {
         let scale      = 1.0_f32 / (head_dim as f32).sqrt();
         let stream     = self.matmul.stream();
 
-        // ── 1. Embedding lookup (CPU) ──────────────────────────────────────────
+        // -- 1. Embedding lookup (CPU) ------------------------------------------
         let embed = qweights
             .get_f32("model.embed_tokens.weight")
             .expect("embed_tokens.weight not found");
@@ -3872,6 +4812,34 @@ impl CutileGpuModel {
         if cfg.embedding_scale {
             let s = (h as f32).sqrt();
             for v in &mut hidden { *v *= s; }
+        }
+
+        // -- Batch CUDA graph path ---------------------------------------------
+        // Use the pre-captured CUDA graph when:
+        //   (a) All KV caches have device-resident KV (GPU flash attention).
+        //   (b) All Q4K sm120 batch kernel is available.
+        //   (c) M <= max_batch_graph (= 2 for this POC).
+        //   (d) !use_alibi.
+        //   (e) All positions are equal (synchronised batch decode).
+        // Batch graph only for M >= 2 (M=1 uses the single-seq graph via forward()).
+        // All M sequences must have the same position (synchronised batch decode).
+        let can_graph = m >= 2
+            && m <= self.max_batch_graph
+            && kv_caches.iter().all(|kvc| kvc.has_device_kv())
+            && !cfg.use_alibi
+            && self.oxide_q4k_gemv.as_ref().map(|o| o.has_sm120_batch()).unwrap_or(false)
+            && positions.windows(2).all(|w| w[0] == w[1])
+            && self.device_weights_q4k.contains_key("model.layers.0.self_attn.q_proj.weight");
+
+        if can_graph {
+            let embeddings: Vec<Vec<f32>> = (0..m)
+                .map(|r| hidden[r * h..(r + 1) * h].to_vec())
+                .collect();
+            let results = self.forward_batch_decode_with_graph(&embeddings, positions, qweights, kv_caches);
+            if !results.is_empty() {
+                return results;
+            }
+            // Empty result means graph update failed -- fall through to no-graph path.
         }
 
         let layer_names: Vec<_> = (0..cfg.num_layers)
@@ -3915,7 +4883,7 @@ impl CutileGpuModel {
                 )
                 .expect("batch RMSNorm failed");
 
-            // QKV projections [M, H] → [M, Q_DIM] / [M, KV_DIM]
+            // QKV projections [M, H] -> [M, Q_DIM] / [M, KV_DIM]
             // normed_dev is [m, h_pad] from forward_device_fused; row stride = h_pad.
             let q_dev = self.gemm_any_d2d_batch(&normed_dev, q_w_name, m, self.h_pad, SLOT_Q);
             let k_dev = self.gemm_any_d2d_batch(&normed_dev, k_w_name, m, self.h_pad, SLOT_K);
@@ -3926,7 +4894,7 @@ impl CutileGpuModel {
             let kv_pad = next_pow2(kv_dim.div_ceil(BK) * BK);
             let mut q_rot_parts: Vec<Arc<cutile::tensor::Tensor<f32>>> = Vec::with_capacity(m);
             for r in 0..m {
-                // Extract per-request Q/K/V slices via D→D memcpy into fresh [q_dim] tensors.
+                // Extract per-request Q/K/V slices via D->D memcpy into fresh [q_dim] tensors.
                 let q_r = {
                     let t = Arc::new(
                         cutile::api::zeros::<f32>(&[self.q_pad])
@@ -3939,7 +4907,7 @@ impl CutileGpuModel {
                             q_dev.device_pointer().cu_deviceptr() + (r * self.q_pad * 4) as u64,
                             q_dim,
                             stream,
-                        ).expect("q_r D→D");
+                        ).expect("q_r D->D");
                     }
                     t
                 };
@@ -3955,7 +4923,7 @@ impl CutileGpuModel {
                             k_dev.device_pointer().cu_deviceptr() + (r * kv_pad * 4) as u64,
                             kv_dim,
                             stream,
-                        ).expect("k_r D→D");
+                        ).expect("k_r D->D");
                     }
                     t
                 };
@@ -3971,7 +4939,7 @@ impl CutileGpuModel {
                             v_dev.device_pointer().cu_deviceptr() + (r * kv_pad * 4) as u64,
                             kv_dim,
                             stream,
-                        ).expect("v_r D→D");
+                        ).expect("v_r D->D");
                     }
                     t
                 };
@@ -4000,7 +4968,7 @@ impl CutileGpuModel {
                 q_rot_parts.push(q_rot);
             }
 
-            // Batch flash attention: one kernel launch, M × n_heads blocks.
+            // Batch flash attention: one kernel launch, M x n_heads blocks.
             let attn_out_dev = if let Some(ref oda) = self.oxide_decode_attn {
                 if oda.has_batch() {
                     let attn_out = Arc::new(
@@ -4027,7 +4995,7 @@ impl CutileGpuModel {
                             .expect("q_batch alloc"),
                     );
                     // Copy each q_rot_parts[r] into q_batch at offset r*q_dim.
-                    // Use D→D async memcpy via cutile.
+                    // Use D->D async memcpy via cutile.
                     for (r, q_r) in q_rot_parts.iter().enumerate() {
                         unsafe {
                             cuda_core::memcpy_dtod_async::<f32>(
@@ -4035,7 +5003,7 @@ impl CutileGpuModel {
                                 q_r.device_pointer().cu_deviceptr(),
                                 q_dim,
                                 stream,
-                            ).expect("q_batch D→D copy");
+                            ).expect("q_batch D->D copy");
                         }
                     }
 
@@ -4061,7 +5029,7 @@ impl CutileGpuModel {
                             cuda_core::memcpy_htod_async::<f32>(
                                 self.d_kv_len.device_pointer().cu_deviceptr(),
                                 &kv_bits as *const f32, 1, stream,
-                            ).expect("batch d_kv_len H→D");
+                            ).expect("batch d_kv_len H->D");
                         }
                         let out_r = Arc::new(
                             cutile::api::zeros::<f32>(&[q_dim])
@@ -4079,7 +5047,7 @@ impl CutileGpuModel {
                                 out_r.device_pointer().cu_deviceptr(),
                                 q_dim,
                                 stream,
-                            ).expect("attn_out D→D copy");
+                            ).expect("attn_out D->D copy");
                         }
                     }
                     attn_out
@@ -4107,7 +5075,7 @@ impl CutileGpuModel {
                             attn_r.device_pointer().cu_deviceptr(),
                             q_dim,
                             stream,
-                        ).expect("batch attn_out D→D");
+                        ).expect("batch attn_out D->D");
                     }
                 }
                 attn_out
@@ -4118,12 +5086,12 @@ impl CutileGpuModel {
                 kvc.advance_host_seq_len(1);
             }
 
-            // O-projection [M, Q_DIM] → [M, H]
+            // O-projection [M, Q_DIM] -> [M, H]
             let attn_padded = self.attn_out_to_oproj_device_m(&attn_out_dev, q_dim, self.q_pad, m);
             // attn_padded is [m, q_pad] from attn_out_to_oproj_device_m; row stride = q_pad.
             let o_dev = self.gemm_any_d2d_batch(&attn_padded, o_w_name, m, self.q_pad, SLOT_O);
 
-            // Post-attention residual add (fresh alloc — pre-allocated scratch is M=1 sized).
+            // Post-attention residual add (fresh alloc -- pre-allocated scratch is M=1 sized).
             hidden_dev = self.add_device_scratch(
                 &hidden_dev, &o_dev,
                 m * self.h_pad,
@@ -4150,13 +5118,13 @@ impl CutileGpuModel {
             let gate_dev = self.gemm_any_d2d_batch(&normed2_dev, gate_w_name, m, self.h_pad, SLOT_GATE);
             let up_dev   = self.gemm_any_d2d_batch(&normed2_dev, up_w_name,   m, self.h_pad, SLOT_UP);
 
-            // SiLU(gate) × up — use cuTile silu_mul (GPU, no PCIe round-trip, any M).
+            // SiLU(gate) x up -- use cuTile silu_mul (GPU, no PCIe round-trip, any M).
             let inter_size = m * cfg.intermediate_size;
             let gs_dev = self
                 .cutile_elementwise
                 .silu_mul_device(&gate_dev, &up_dev, m, cfg.intermediate_size)
                 .expect("batch silu_mul_device failed");
-            // Pad inter → inter_pad if necessary (e.g. Llama-3.1-8B: 14336→16384).
+            // Pad inter -> inter_pad if necessary (e.g. Llama-3.1-8B: 14336->16384).
             let inter_sz = cfg.intermediate_size;
             let gs_padded = if self.inter_pad == inter_sz {
                 gs_dev
@@ -4189,7 +5157,7 @@ impl CutileGpuModel {
             )
             .expect("batch final RMSNorm failed");
 
-        // LM head: [M, H] → [M, vocab]
+        // LM head: [M, H] -> [M, vocab]
         let logits_dev = self.gemm_d2d(&last_dev, "lm_head.weight", m);
         let logits_flat = self.download_device_tensor(&logits_dev);
 

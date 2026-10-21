@@ -1,5 +1,5 @@
 //! Direct Rust translation of llama.cpp ggml/src/ggml-cpu/arch/x86/quants.c
-//! Pure translation — no optimization. AVX2 sections only. Algorithm identical to llama.cpp.
+//! Pure translation -- no optimization. AVX2 sections only. Algorithm identical to llama.cpp.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -7,7 +7,7 @@ use std::arch::x86_64::*;
 use super::blocks::*;
 use super::helpers::f16_to_f32;
 
-// ── Helper: MM256_SET_M128I(hi, lo) macro equivalent ─────────────────────────
+// -- Helper: MM256_SET_M128I(hi, lo) macro equivalent -------------------------
 // C: _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -15,7 +15,7 @@ unsafe fn mm256_set_m128i(hi: __m128i, lo: __m128i) -> __m256i {
     _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1)
 }
 
-// ── Helper: bytes_from_nibbles_32 ────────────────────────────────────────────
+// -- Helper: bytes_from_nibbles_32 --------------------------------------------
 // Unpack 32 4-bit fields into 32 bytes, each in [0..15]
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -26,7 +26,7 @@ unsafe fn bytes_from_nibbles_32(rsi: *const u8) -> __m256i {
     _mm256_and_si256(low_mask, bytes)
 }
 
-// ── Helper: bytes_from_bits_32 ───────────────────────────────────────────────
+// -- Helper: bytes_from_bits_32 -----------------------------------------------
 // Spread 32 bits to 32 bytes { 0x00, 0xFF }
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -45,7 +45,7 @@ unsafe fn bytes_from_bits_32(x: *const u8) -> __m256i {
     _mm256_cmpeq_epi8(bytes, _mm256_set1_epi64x(-1i64))
 }
 
-// ── Helper: mul_add_epi8 ─────────────────────────────────────────────────────
+// -- Helper: mul_add_epi8 -----------------------------------------------------
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn mul_add_epi8(x: __m256i, y: __m256i) -> __m256i {
@@ -54,7 +54,7 @@ unsafe fn mul_add_epi8(x: __m256i, y: __m256i) -> __m256i {
     _mm256_maddubs_epi16(ax, sy)
 }
 
-// ── Helper: sum_i16_pairs_float ──────────────────────────────────────────────
+// -- Helper: sum_i16_pairs_float ----------------------------------------------
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn sum_i16_pairs_float(x: __m256i) -> __m256 {
@@ -63,8 +63,8 @@ unsafe fn sum_i16_pairs_float(x: __m256i) -> __m256 {
     _mm256_cvtepi32_ps(summed_pairs)
 }
 
-// ── Helper: mul_sum_us8_pairs_float ──────────────────────────────────────────
-// unsigned × signed → float (maddubs path, no VNNI)
+// -- Helper: mul_sum_us8_pairs_float ------------------------------------------
+// unsigned x signed -> float (maddubs path, no VNNI)
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn mul_sum_us8_pairs_float(ax: __m256i, sy: __m256i) -> __m256 {
@@ -72,8 +72,8 @@ unsafe fn mul_sum_us8_pairs_float(ax: __m256i, sy: __m256i) -> __m256 {
     sum_i16_pairs_float(dot)
 }
 
-// ── Helper: mul_sum_i8_pairs_float ───────────────────────────────────────────
-// signed × signed → float
+// -- Helper: mul_sum_i8_pairs_float -------------------------------------------
+// signed x signed -> float
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn mul_sum_i8_pairs_float(x: __m256i, y: __m256i) -> __m256 {
@@ -82,7 +82,7 @@ unsafe fn mul_sum_i8_pairs_float(x: __m256i, y: __m256i) -> __m256 {
     mul_sum_us8_pairs_float(ax, sy)
 }
 
-// ── Helper: hsum_float_8 ─────────────────────────────────────────────────────
+// -- Helper: hsum_float_8 -----------------------------------------------------
 // Horizontally sum 8 floats in a __m256 vector
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -94,7 +94,7 @@ unsafe fn hsum_float_8(x: __m256) -> f32 {
     _mm_cvtss_f32(res)
 }
 
-// ── Shuffle tables ────────────────────────────────────────────────────────────
+// -- Shuffle tables ------------------------------------------------------------
 
 // get_scale_shuffle_q3k: 128 bytes, loaded as 32-byte chunks via index
 static K_SHUFFLE_Q3K: [u8; 128] = [
@@ -164,7 +164,7 @@ unsafe fn get_scale_shuffle(i: usize) -> __m128i {
     _mm_loadu_si128(K_SHUFFLE.as_ptr().add(i * 16) as *const __m128i)
 }
 
-// ── ggml_vec_dot_q4_0_q8_0 — AVX2 section, line 701 ─────────────────────────
+// -- ggml_vec_dot_q4_0_q8_0 -- AVX2 section, line 701 -------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -191,7 +191,7 @@ pub unsafe fn ggml_vec_dot_q4_0_q8_0(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0])
     hsum_float_8(acc)
 }
 
-// ── ggml_vec_dot_q4_1_q8_1 — AVX2 section, line 859 ─────────────────────────
+// -- ggml_vec_dot_q4_1_q8_1 -- AVX2 section, line 859 -------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -223,7 +223,7 @@ pub unsafe fn ggml_vec_dot_q4_1_q8_1(n: usize, x: &[BlockQ4_1], y: &[BlockQ8_1])
     hsum_float_8(acc) + summs
 }
 
-// ── ggml_vec_dot_q5_0_q8_0 — AVX2 section, line 1142 ────────────────────────
+// -- ggml_vec_dot_q5_0_q8_0 -- AVX2 section, line 1142 ------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -250,7 +250,7 @@ pub unsafe fn ggml_vec_dot_q5_0_q8_0(n: usize, x: &[BlockQ5_0], y: &[BlockQ8_0])
     hsum_float_8(acc)
 }
 
-// ── ggml_vec_dot_q5_1_q8_1 — AVX2 section, line 1222 ────────────────────────
+// -- ggml_vec_dot_q5_1_q8_1 -- AVX2 section, line 1222 ------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -281,7 +281,7 @@ pub unsafe fn ggml_vec_dot_q5_1_q8_1(n: usize, x: &[BlockQ5_1], y: &[BlockQ8_1])
     hsum_float_8(acc) + summs
 }
 
-// ── ggml_vec_dot_q8_0_q8_0 — AVX2 section, line 1308 ────────────────────────
+// -- ggml_vec_dot_q8_0_q8_0 -- AVX2 section, line 1308 ------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -303,7 +303,7 @@ pub unsafe fn ggml_vec_dot_q8_0_q8_0(n: usize, x: &[BlockQ8_0], y: &[BlockQ8_0])
     hsum_float_8(acc)
 }
 
-// ── ggml_vec_dot_q2_K_q8_K — AVX2 section, line 1574 ────────────────────────
+// -- ggml_vec_dot_q2_K_q8_K -- AVX2 section, line 1574 ------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -383,7 +383,7 @@ pub unsafe fn ggml_vec_dot_q2_k_q8_k(n: usize, x: &[BlockQ2K], y: &[BlockQ8K]) -
     hsum_float_8(acc)
 }
 
-// ── ggml_vec_dot_q3_K_q8_K — AVX2 section, line 1766 ────────────────────────
+// -- ggml_vec_dot_q3_K_q8_K -- AVX2 section, line 1766 ------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -435,7 +435,7 @@ pub unsafe fn ggml_vec_dot_q3_k_q8_k(n: usize, x: &[BlockQ3K], y: &[BlockQ8K]) -
             q3 = q3.add(32);
 
             // Use variable-count shift intrinsics (_mm256_sll/srl_epi16) since
-            // `bit` is a runtime value — the const-immediate versions would fail.
+            // `bit` is a runtime value -- the const-immediate versions would fail.
             let q3l_0 = _mm256_and_si256(q3bits, m3);
             let q3h_0 = _mm256_slli_epi16(
                 _mm256_srl_epi16(
@@ -528,7 +528,7 @@ pub unsafe fn ggml_vec_dot_q3_k_q8_k(n: usize, x: &[BlockQ3K], y: &[BlockQ8K]) -
     hsum_float_8(acc)
 }
 
-// ── ggml_vec_dot_q4_K_q8_K — AVX2 section, line 2038 ────────────────────────
+// -- ggml_vec_dot_q4_K_q8_K -- AVX2 section, line 2038 ------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -597,7 +597,7 @@ pub unsafe fn ggml_vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
         // slot; vpand accepts a 256-bit memory operand in VEX encoding.
         // YMM budget: sh0-sh7(8) + scales(1) + sumi(1) + t0-t5(6) = 16 exactly.
         core::arch::asm!(
-            // sub-block 0 — scale_l = vpshufb(scales, sh0), scale_h = sh1
+            // sub-block 0 -- scale_l = vpshufb(scales, sh0), scale_h = sh1
             "vmovdqu {t0}, ymmword ptr [{q4}]",
             "add {q4}, 32",
             "vpsrld {t1}, {t0}, 4",
@@ -615,7 +615,7 @@ pub unsafe fn ggml_vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
             "vpmaddwd {t1}, {t5}, {t1}",
             "vpaddd {sumi}, {sumi}, {t0}",
             "vpaddd {sumi}, {sumi}, {t1}",
-            // sub-block 1 — sh2, sh3
+            // sub-block 1 -- sh2, sh3
             "vmovdqu {t0}, ymmword ptr [{q4}]",
             "add {q4}, 32",
             "vpsrld {t1}, {t0}, 4",
@@ -633,7 +633,7 @@ pub unsafe fn ggml_vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
             "vpmaddwd {t1}, {t5}, {t1}",
             "vpaddd {sumi}, {sumi}, {t0}",
             "vpaddd {sumi}, {sumi}, {t1}",
-            // sub-block 2 — sh4, sh5
+            // sub-block 2 -- sh4, sh5
             "vmovdqu {t0}, ymmword ptr [{q4}]",
             "add {q4}, 32",
             "vpsrld {t1}, {t0}, 4",
@@ -651,7 +651,7 @@ pub unsafe fn ggml_vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
             "vpmaddwd {t1}, {t5}, {t1}",
             "vpaddd {sumi}, {sumi}, {t0}",
             "vpaddd {sumi}, {sumi}, {t1}",
-            // sub-block 3 — sh6, sh7
+            // sub-block 3 -- sh6, sh7
             "vmovdqu {t0}, ymmword ptr [{q4}]",
             "add {q4}, 32",
             "vpsrld {t1}, {t0}, 4",
@@ -703,7 +703,7 @@ pub unsafe fn ggml_vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -
     hsum_float_8(acc) + _mm_cvtss_f32(acc_m)
 }
 
-// ── ggml_vec_dot_q5_K_q8_K — AVX2 section, line 2216 ────────────────────────
+// -- ggml_vec_dot_q5_K_q8_K -- AVX2 section, line 2216 ------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -808,7 +808,7 @@ pub unsafe fn ggml_vec_dot_q5_k_q8_k(n: usize, x: &[BlockQ5K], y: &[BlockQ8K]) -
     hsum_float_8(acc) + summs
 }
 
-// ── ggml_vec_dot_q6_K_q8_K — AVX2 section, line 2426 ────────────────────────
+// -- ggml_vec_dot_q6_K_q8_K -- AVX2 section, line 2426 ------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -956,7 +956,7 @@ pub unsafe fn ggml_vec_dot_q6_k_q8_k(n: usize, x: &[BlockQ6K], y: &[BlockQ8K]) -
     hsum_float_8(acc)
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// -- Tests ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1036,7 +1036,7 @@ mod tests {
         if !is_x86_avx2() {
             return;
         }
-        // x = all 1, y = all 1, d_x = d_y = 1/127 → dot = 32 * (1/127)^2 * 127^2 / 32? No.
+        // x = all 1, y = all 1, d_x = d_y = 1/127 -> dot = 32 * (1/127)^2 * 127^2 / 32? No.
         // d is the scale factor. Result = sum(x.qs[i] * y.qs[i]) * d_x * d_y
         // With qs = [1; 32], d = f16(1.0): result = 32 * 1.0 * 1.0 = 32
         let one_f16 = half::f16::from_f32(1.0).to_bits();

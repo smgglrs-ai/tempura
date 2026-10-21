@@ -1,4 +1,4 @@
-//! Verus-verified forward pass projection dimensions — unbounded proofs
+//! Verus-verified forward pass projection dimensions -- unbounded proofs
 //!
 //! Proves Q/K/V/O matmul buffer sizes match the matrix dimensions in the
 //! LLaMA-style forward pass. This is the shape consistency property that
@@ -9,7 +9,7 @@ use vstd::prelude::*;
 verus! {
 
 // ============================================================================
-// Q projection: normed[seq*h] × q_w[h×q_dim] → q[seq×q_dim]
+// Q projection: normed[seq*h] x q_w[hxq_dim] -> q[seqxq_dim]
 // where q_dim = num_heads * head_dim
 // ============================================================================
 
@@ -31,7 +31,7 @@ proof fn q_projection_shape(
         let output_len = seq_len * q_dim;
         let weight_len = hidden_size * q_dim;
         // matmul_bt(normed, q_w, q, seq_len, q_dim, h)
-        // A: [seq_len × h], B^T: [q_dim × h], C: [seq_len × q_dim]
+        // A: [seq_len x h], B^T: [q_dim x h], C: [seq_len x q_dim]
         &&& input_len == seq_len * hidden_size
         &&& output_len == seq_len * q_dim
         &&& output_len == input_len  // q_dim == hidden_size
@@ -41,7 +41,7 @@ proof fn q_projection_shape(
 }
 
 // ============================================================================
-// K/V projection: normed[seq*h] × kv_w[h×kv_dim] → k[seq×kv_dim]
+// K/V projection: normed[seq*h] x kv_w[hxkv_dim] -> k[seqxkv_dim]
 // where kv_dim = num_kv_heads * head_dim
 // ============================================================================
 
@@ -68,7 +68,7 @@ proof fn kv_projection_shape(
 }
 
 // ============================================================================
-// O projection: attn_out[seq*q_dim] × o_w[q_dim×h] → out[seq*h]
+// O projection: attn_out[seq*q_dim] x o_w[q_dimxh] -> out[seq*h]
 // ============================================================================
 
 proof fn o_projection_shape(
@@ -94,7 +94,7 @@ proof fn o_projection_shape(
 }
 
 // ============================================================================
-// FFN gate+up: hidden[seq*h] × gate_up_w[h × 2*inter] → gate_up[seq×2*inter]
+// FFN gate+up: hidden[seq*h] x gate_up_w[h x 2*inter] -> gate_up[seqx2*inter]
 // Then split: gate[seq*inter], up[seq*inter]
 // ============================================================================
 
@@ -123,7 +123,7 @@ proof fn ffn_gate_up_shape(
 }
 
 // ============================================================================
-// FFN down: activated[seq*inter] × down_w[inter×h] → out[seq*h]
+// FFN down: activated[seq*inter] x down_w[interxh] -> out[seq*h]
 // ============================================================================
 
 proof fn ffn_down_shape(
@@ -165,7 +165,7 @@ proof fn residual_add_shape(
 }
 
 // ============================================================================
-// Full forward pass: seq_len tokens → vocab_size logits
+// Full forward pass: seq_len tokens -> vocab_size logits
 // ============================================================================
 
 proof fn forward_pass_io_shape(

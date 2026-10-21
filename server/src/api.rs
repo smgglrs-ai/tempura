@@ -2105,7 +2105,7 @@ mod tests {
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // No weights loaded in test state → 503
+        // No weights loaded in test state -> 503
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -2126,7 +2126,7 @@ mod tests {
         assert!(resp.status().is_client_error());
     }
 
-    // ── /tokenize ──────────────────────────────────────────────────────────
+    // -- /tokenize ----------------------------------------------------------
 
     #[tokio::test]
     async fn test_tokenize_no_tokenizer_returns_503() {
@@ -2173,7 +2173,7 @@ mod tests {
         assert!(resp.status().is_client_error());
     }
 
-    // ── /detokenize ────────────────────────────────────────────────────────
+    // -- /detokenize --------------------------------------------------------
 
     #[tokio::test]
     async fn test_detokenize_no_tokenizer_returns_503() {
@@ -2205,7 +2205,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    // ── /v1/models ─────────────────────────────────────────────────────────
+    // -- /v1/models ---------------------------------------------------------
 
     #[tokio::test]
     async fn test_list_models_returns_200_with_model() {
@@ -2225,7 +2225,7 @@ mod tests {
         assert_eq!(v["data"][0]["id"], "test");
     }
 
-    // ── /tempura/v1/traces ─────────────────────────────────────────────────
+    // -- /tempura/v1/traces -------------------------------------------------
 
     #[tokio::test]
     async fn test_traces_list_empty() {
@@ -2267,7 +2267,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    // ── /tempura/v1/verified ───────────────────────────────────────────────
+    // -- /tempura/v1/verified -----------------------------------------------
 
     #[tokio::test]
     async fn test_verified_status_returns_200() {
@@ -2281,7 +2281,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // ── /metrics ───────────────────────────────────────────────────────────
+    // -- /metrics -----------------------------------------------------------
 
     #[tokio::test]
     async fn test_metrics_returns_prometheus_text() {
@@ -2299,7 +2299,7 @@ mod tests {
         assert!(text.is_empty() || text.contains('#') || text.contains('_'));
     }
 
-    // ── Error handling ─────────────────────────────────────────────────────
+    // -- Error handling -----------------------------------------------------
 
     #[tokio::test]
     async fn test_malformed_json_chat_returns_client_error() {
@@ -2342,7 +2342,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    // ── /v1/completions ────────────────────────────────────────────────────
+    // -- /v1/completions ----------------------------------------------------
 
     #[tokio::test]
     async fn test_completions_missing_prompt_returns_error() {
@@ -2359,7 +2359,7 @@ mod tests {
         assert!(resp.status().is_client_error());
     }
 
-    // ── Streaming ──────────────────────────────────────────────────────────
+    // -- Streaming ----------------------------------------------------------
 
     #[tokio::test]
     async fn test_stream_response_is_sse_content_type() {

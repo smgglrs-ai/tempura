@@ -19,8 +19,8 @@
     }
   },
   "gaps": {
-    "pp128": "4x — dequant-on-the-fly GEMM exhausted; need quantized GEMM kernel",
-    "tg32": "2.6x — memory bandwidth; Q4K row loads ~3GB/token at 100GB/s DDR5"
+    "pp128": "4x -- dequant-on-the-fly GEMM exhausted; need quantized GEMM kernel",
+    "tg32": "2.6x -- memory bandwidth; Q4K row loads ~3GB/token at 100GB/s DDR5"
   },
   "optimizations_applied": [
     "Q8_K activation pairing (correct llama.cpp format)",

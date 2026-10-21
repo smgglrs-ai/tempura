@@ -45,7 +45,7 @@ pub fn ggml_exp(x: f32) -> f32 {
     const R: f32 = 12582912.0; // 0x1.8p23 = 1.5 * 2^23
 
     // C: const __m256 z = _mm256_fmadd_ps(x, 0x1.715476p+0f, r);
-    // 0x1.715476p+0 = log2(e) ≈ 1.4426950216293335
+    // 0x1.715476p+0 = log2(e) ~= 1.4426950216293335
     const LOG2E: f32 = f32::from_bits(0x3fb8aa3b); // 0x1.715476p+0
     let z: f32 = x.mul_add(LOG2E, R);
 
@@ -62,7 +62,7 @@ pub fn ggml_exp(x: f32) -> f32 {
     // C: k = castsi256_ps(add_epi32(e, castps_si256(set1_ps(1))))
     let k: f32 = f32::from_bits(e.wrapping_add(1.0f32.to_bits()));
 
-    // C: c = cmp(andnot(-0.f, n), 126, _CMP_GT_OQ)  — overflow check
+    // C: c = cmp(andnot(-0.f, n), 126, _CMP_GT_OQ)  -- overflow check
     let n_abs = n.abs();
     let overflow = n_abs > 126.0;
 
@@ -99,7 +99,7 @@ pub fn ggml_exp(x: f32) -> f32 {
     // C: s2 = castsi256_ps(sub(e, g))
     let s2 = f32::from_bits(e.wrapping_sub(g));
 
-    // C: d = cmp(abs(n), 192, _CMP_GT_OQ) — extreme overflow
+    // C: d = cmp(abs(n), 192, _CMP_GT_OQ) -- extreme overflow
     let extreme = n_abs > 192.0;
 
     if extreme {

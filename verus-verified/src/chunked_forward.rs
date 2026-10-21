@@ -1,4 +1,4 @@
-//! Verus-verified chunked forward partition — unbounded proofs
+//! Verus-verified chunked forward partition -- unbounded proofs
 //!
 //! Proves the chunked_forward loop covers [0..token_ids_len) exactly:
 //! no gaps, no overlaps, and the loop terminates.
@@ -35,7 +35,7 @@ proof fn chunk_bounds_valid(
 }
 
 // ============================================================================
-// Proof: chunks are contiguous — next offset == previous end (no gaps)
+// Proof: chunks are contiguous -- next offset == previous end (no gaps)
 // ============================================================================
 
 proof fn chunks_contiguous(
@@ -63,7 +63,7 @@ proof fn chunks_contiguous(
 }
 
 // ============================================================================
-// Proof: loop termination — offset strictly increases each iteration
+// Proof: loop termination -- offset strictly increases each iteration
 // ============================================================================
 
 proof fn chunk_loop_progress(
@@ -87,7 +87,7 @@ proof fn chunk_loop_progress(
 }
 
 // ============================================================================
-// Proof: total coverage — after all iterations, offset == token_ids_len
+// Proof: total coverage -- after all iterations, offset == token_ids_len
 // ============================================================================
 
 proof fn chunk_total_coverage(
@@ -119,7 +119,7 @@ proof fn chunk_total_coverage(
 }
 
 // ============================================================================
-// Proof: small input optimization — len <= chunk_size means single forward call
+// Proof: small input optimization -- len <= chunk_size means single forward call
 // ============================================================================
 
 proof fn single_chunk_optimization(

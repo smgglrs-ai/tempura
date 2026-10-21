@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-// ── GraphBarrier ─────────────────────────────────────────────────────────────
+// -- GraphBarrier -------------------------------------------------------------
 
 /// Reusable spinwait barrier.  All n_threads must call wait() before any
 /// proceeds.  Uses an epoch counter to allow reuse across multiple barrier
@@ -40,7 +40,7 @@ impl GraphBarrier {
     }
 }
 
-// ── RawGraphNode ──────────────────────────────────────────────────────────────
+// -- RawGraphNode --------------------------------------------------------------
 
 /// One node in a compute graph dispatched via `StaticPool::run_graph_raw`.
 ///
@@ -56,7 +56,7 @@ pub struct RawGraphNode {
     pub ctx: usize,
 }
 
-// ── Graph worker context (private) ────────────────────────────────────────────
+// -- Graph worker context (private) --------------------------------------------
 
 struct GraphWorkerCtx {
     nodes: *const RawGraphNode,
@@ -101,10 +101,10 @@ unsafe fn graph_worker_fn(start: usize, _end: usize, ctx: *const ()) {
 }
 
 /// Number of `std::hint::spin_loop()` iterations before a worker falls back to
-/// condvar sleep.  Each `spin_loop()` emits `PAUSE` (≈100 cycles on modern x86).
-/// At 5 GHz: 100 cycles ≈ 20 ns → 20_000 iters ≈ 400 µs.
+/// condvar sleep.  Each `spin_loop()` emits `PAUSE` (~=100 cycles on modern x86).
+/// At 5 GHz: 100 cycles ~= 20 ns -> 20_000 iters ~= 400 ??s.
 ///
-/// For decode at ~7.8 tok/s the inter-matmul gap is ~0.85 ms.  A 400 µs spin
+/// For decode at ~7.8 tok/s the inter-matmul gap is ~0.85 ms.  A 400 ??s spin
 /// budget catches the majority of dispatches while keeping idle CPU burn modest.
 /// Override at runtime with `STATICPAR_SPIN_BUDGET` (0 = condvar-only).
 const DEFAULT_SPIN_BUDGET: u64 = 20_000;
@@ -112,7 +112,7 @@ const DEFAULT_SPIN_BUDGET: u64 = 20_000;
 struct Inner {
     // Fast path: workers spin on this atomic before falling back to condvar.
     // Written by the dispatcher with seq_cst; read by workers with acquire.
-    // All workers read the SAME cache line — shared reads don't pollute.
+    // All workers read the SAME cache line -- shared reads don't pollute.
     gen_atomic: AtomicU64,
 
     // Slow path: condvar for workers that exhausted their spin budget.
@@ -132,7 +132,7 @@ struct Inner {
     ranges: Box<[u64]>,
     fn_ptr: AtomicU64,
     ctx: AtomicU64,
-    /// Serializes concurrent run_raw callers — fn_ptr/ctx/ranges are shared state.
+    /// Serializes concurrent run_raw callers -- fn_ptr/ctx/ranges are shared state.
     call_mutex: std::sync::Mutex<()>,
 }
 
@@ -144,18 +144,18 @@ struct Inner {
 ///
 /// ## Why spinning doesn't regress memory bandwidth
 ///
-/// All workers READ the same `gen_atomic` cache line — shared reads have no
+/// All workers READ the same `gen_atomic` cache line -- shared reads have no
 /// write-invalidation traffic.  The previous regression came from workers
 /// spinning on a PER-WORKER write target, which caused cache-line bouncing.
 /// Here only the dispatcher ever writes `gen_atomic`.
 ///
 /// ## Spin budget tuning
 ///
-/// Default: 20 000 iterations ≈ 400 µs (at 5 GHz with `PAUSE` ≈ 100 cycles).
+/// Default: 20 000 iterations ~= 400 ??s (at 5 GHz with `PAUSE` ~= 100 cycles).
 /// Override: `STATICPAR_SPIN_BUDGET=<N>` env var (0 = condvar-only).
 ///
-/// At 7.8 tok/s with ~150 matmul dispatches the inter-matmul gap ≈ 0.85 ms,
-/// so a 400 µs budget catches most dispatches without sleeping.
+/// At 7.8 tok/s with ~150 matmul dispatches the inter-matmul gap ~= 0.85 ms,
+/// so a 400 ??s budget catches most dispatches without sleeping.
 pub struct StaticPool {
     inner: Arc<Inner>,
     n_workers: usize,
@@ -366,7 +366,7 @@ impl StaticPool {
         // Wake workers.
         //
         // Step 1: seq_cst store on gen_atomic wakes spinning workers without
-        //         any mutex acquisition — same as llama.cpp's kickoff seq_cst
+        //         any mutex acquisition -- same as llama.cpp's kickoff seq_cst
         //         store to `n_graph`.  The seq_cst fence ensures workers see
         //         the fn_ptr/ctx/ranges stores above.
         let new_gen = inner.gen_atomic.load(Ordering::Relaxed) + 1;
@@ -417,10 +417,10 @@ impl Drop for StaticPool {
 fn worker_loop(worker_idx: usize, inner: Arc<Inner>) {
     let mut last_gen = 0u64;
     loop {
-        // ── PHASE 1: spin ──────────────────────────────────────────────────
+        // -- PHASE 1: spin --------------------------------------------------
         // Mirror llama.cpp `ggml_graph_compute_poll_for_work`:
         // spin on a single shared atomic (`gen_atomic`) with `PAUSE` hints.
-        // All workers READ the same cache line → no write-invalidation traffic.
+        // All workers READ the same cache line -> no write-invalidation traffic.
         let current_gen = {
             let mut spins = 0u64;
             loop {
@@ -441,9 +441,9 @@ fn worker_loop(worker_idx: usize, inner: Arc<Inner>) {
             }
         };
 
-        // ── PHASE 2: condvar sleep if spin didn't find new work ────────────
+        // -- PHASE 2: condvar sleep if spin didn't find new work ------------
         let current_gen = if current_gen == last_gen {
-            // No dispatch arrived within spin budget — park.
+            // No dispatch arrived within spin budget -- park.
             let guard = inner.mutex.lock().unwrap();
             let guard = inner
                 .condvar
@@ -461,7 +461,7 @@ fn worker_loop(worker_idx: usize, inner: Arc<Inner>) {
         }
         last_gen = current_gen;
 
-        // ── PHASE 3: execute assigned range ───────────────────────────────
+        // -- PHASE 3: execute assigned range -------------------------------
         // The Acquire on gen_atomic (phase 1) or the condvar mutex unlock
         // (phase 2) ensures we see fn_ptr/ctx/ranges written by the dispatcher.
         let packed = unsafe { *inner.ranges.as_ptr().add(worker_idx) };

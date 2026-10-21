@@ -116,10 +116,10 @@ impl Q6kGemvJob {
 }
 
 // 8-wide GEMV job for m=1 decode. Parallelises over groups of 8 weight rows.
-// Requires n % 8 == 0. Uses repacked BlockQ4Kx8 data for 4× better scale amortisation
+// Requires n % 8 == 0. Uses repacked BlockQ4Kx8 data for 4x better scale amortisation
 // and the AVX2 8-simultaneous-row kernel matching llama.cpp's gemv_q4_K_8x8_q8_K.
 struct Q4kGemvX8Job {
-    packed_ptr: *const u8, // &[BlockQ4Kx8], n/8 groups × bpr entries
+    packed_ptr: *const u8, // &[BlockQ4Kx8], n/8 groups x bpr entries
     q8k_ptr: *const u8,   // single activation row, bpr BlockQ8K entries
     out_ptr: *mut f32,     // n output floats
     n: usize,              // total output neurons (must be divisible by 8)
@@ -172,7 +172,7 @@ impl crate::inference_pool::KernelJob for Q4kGemvX8Job {
 // 8-wide GEMV job for m=1 decode with pre-packed BlockQ6Kx8 weights.
 // Uses scalar ggml_gemv_q6_k_8x8_q8_k; parallelizes over n/8 groups.
 struct Q6kGemvX8Job {
-    packed_ptr: *const u8, // &[BlockQ6Kx8], n/8 groups × bpr entries
+    packed_ptr: *const u8, // &[BlockQ6Kx8], n/8 groups x bpr entries
     q8k_ptr: *const u8,   // single activation row, bpr BlockQ8K entries
     out_ptr: *mut f32,     // n output floats
     bpr: usize,            // Q6Kx8 blocks per row group
@@ -199,7 +199,7 @@ impl crate::inference_pool::KernelJob for Q6kGemvX8Job {
     }
 }
 
-// m×n job structs: parallelize over idx = i*n + j with static dispatch pointer.
+// mxn job structs: parallelize over idx = i*n + j with static dispatch pointer.
 struct Q4kMnJob {
     bq_ptr: *const u8,
     q8k_ptr: *const u8,
@@ -375,8 +375,8 @@ impl crate::inference_pool::KernelJob for Q4kMnTiledJob {
     }
 }
 
-// Block micro-tile GEMM job: processes 4 activation rows × 2 weight rows per tile,
-// achieving 4× better activation reuse than Q4kMnTiledJob.
+// Block micro-tile GEMM job: processes 4 activation rows x 2 weight rows per tile,
+// achieving 4x better activation reuse than Q4kMnTiledJob.
 struct Q4kMnBlockJob {
     bq_ptr: *const u8,
     q8k_ptr: *const u8,
@@ -398,7 +398,7 @@ impl crate::inference_pool::KernelJob for Q4kMnBlockJob {
             vec_dot_q4k_q8k_dispatch_4x2, vec_dot_q4k_q8k_dispatch_4x4,
         };
         let mut j = start;
-        // BN=4 tile: process 4 weight rows simultaneously with 4×4 dispatch.
+        // BN=4 tile: process 4 weight rows simultaneously with 4x4 dispatch.
         while j + 3 < end {
             let w0 = unsafe {
                 std::slice::from_raw_parts(
@@ -793,7 +793,7 @@ impl crate::inference_pool::KernelJob for FusedQ4kPreq3Job {
 }
 
 /// Compute Q4K GEMV for neurons `start..end` using pre-quantized activations.
-/// No internal dispatch — safe to call from within an already-parallel region
+/// No internal dispatch -- safe to call from within an already-parallel region
 /// (e.g. inside `thread_pool::run_indexed`).
 ///
 /// # Safety
@@ -905,7 +905,7 @@ pub unsafe fn quantize_rows_q8k_range(
 }
 
 /// Quantize t_start..t_end tokens (groups of 4) into BlockQ8Kx4 format for the
-/// repacked 8×8 GEMM. Requires t_start % 4 == 0 and (t_end - t_start) % 4 == 0.
+/// repacked 8x8 GEMM. Requires t_start % 4 == 0 and (t_end - t_start) % 4 == 0.
 /// Output pointer q8kx4_out must have capacity [(t_end-t_start)/4 * k/256] BlockQ8Kx4.
 pub unsafe fn quantize_rows_q8kx4_range(
     a_f32: *const f32,
@@ -928,7 +928,7 @@ pub unsafe fn quantize_rows_q8kx4_range(
     }
 }
 
-/// Q4Kx8 (repacked) weight × Q8Kx4 activation GEMM for output rows j_start..j_end.
+/// Q4Kx8 (repacked) weight x Q8Kx4 activation GEMM for output rows j_start..j_end.
 /// j_start and (j_end-j_start) must be multiples of 8. m must be a multiple of 4.
 /// q8kx4_act: [m/4 * bpr] BlockQ8Kx4, indexed as group=i/4, block=blk.
 pub unsafe fn q4k_prefill_gemm_x8_range(
@@ -963,7 +963,7 @@ pub unsafe fn q4k_prefill_gemm_x8_range(
     crate::ggml::repack_llama2::ggml_gemm_q4_k_8x8_q8_k(k, s, n, vx, q8kx4_act as *const u8, m, nc);
 }
 
-/// Q6K repacked (Q6Kx8) × Q8Kx4 activation batch GEMM for `j_start..j_end` weight rows.
+/// Q6K repacked (Q6Kx8) x Q8Kx4 activation batch GEMM for `j_start..j_end` weight rows.
 /// Mirrors q4k_prefill_gemm_x8_range but for Q6K down_proj.
 /// Requires j_start%8==0, (j_end-j_start)%8==0, m%4==0.
 pub unsafe fn q6k_prefill_gemm_x8_range(
@@ -987,7 +987,7 @@ pub unsafe fn q6k_prefill_gemm_x8_range(
     crate::ggml::repack_llama::ggml_gemm_q6_k_8x4_q8_k(k, s, n, vx, q8kx4_act as *const u8, m, nc);
 }
 
-/// Q4K weight matrix × Q8K activation batch GEMM, output rows `j_start..j_end`.
+/// Q4K weight matrix x Q8K activation batch GEMM, output rows `j_start..j_end`.
 /// Equivalent to Q4kMnBlockJob::exec_range but inline (no StaticPool dispatch).
 /// Used inside pool.run_indexed for the prefill graph model.
 pub unsafe fn q4k_prefill_gemm_range(
@@ -1052,7 +1052,7 @@ pub unsafe fn q4k_prefill_gemm_range(
     }
 }
 
-/// Q6K weight matrix × Q8K activation batch GEMM, output rows `j_start..j_end`.
+/// Q6K weight matrix x Q8K activation batch GEMM, output rows `j_start..j_end`.
 pub unsafe fn q6k_prefill_gemm_range(
     b_q6k: *const u8,
     q8k_act: *const crate::ggml::blocks::BlockQ8K,
@@ -1075,7 +1075,7 @@ pub unsafe fn q6k_prefill_gemm_range(
     }
 }
 
-/// F16 weight matrix × f32 activation batch GEMM, output rows `j_start..j_end`.
+/// F16 weight matrix x f32 activation batch GEMM, output rows `j_start..j_end`.
 pub unsafe fn f16_prefill_gemm_range(
     b_f16: *const u8,
     a_f32: *const f32,
@@ -1096,7 +1096,7 @@ pub unsafe fn f16_prefill_gemm_range(
     }
 }
 
-/// F16 weight × F16 activation GEMM for a row range (used when KV cache holds F16 keys).
+/// F16 weight x F16 activation GEMM for a row range (used when KV cache holds F16 keys).
 pub unsafe fn f16_f16_prefill_gemm_range(
     b_f16: *const u8,
     a_f16: *const u8,
@@ -1122,7 +1122,7 @@ pub unsafe fn f16_f16_prefill_gemm_range(
     }
 }
 
-/// Used inside the graph decode closure (no thread-pool — caller already parallel).
+/// Used inside the graph decode closure (no thread-pool -- caller already parallel).
 pub unsafe fn f16_preq_range(
     b_f16: *const u8,  // F16 weight matrix, row-major, each row is k * 2 bytes
     a_f32: *const f32, // f32 activation vector of length k
@@ -1481,7 +1481,7 @@ unsafe fn q6k_dot_block_avx2_i16(block: &[u8], a: &[f32]) -> f32 {
             scaled,
             _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
         ));
-        // Pack i32 → i16 with saturation
+        // Pack i32 -> i16 with saturation
         let lo = _mm256_castsi256_si128(rounded);
         let hi = _mm256_extracti128_si256(rounded, 1);
         let packed = _mm_packs_epi32(lo, hi); // 8 i16 values
@@ -1522,18 +1522,18 @@ unsafe fn q6k_dot_block_avx2_i16(block: &[u8], a: &[f32]) -> f32 {
         macro_rules! process_group {
             ($q6:expr, $a_off:expr, $sc_idx0:expr, $sc_idx1:expr) => {{
                 let q6_vec = $q6;
-                // Widen u8 → i16 for low 16 bytes and high 16 bytes
+                // Widen u8 -> i16 for low 16 bytes and high 16 bytes
                 let lo_128 = _mm256_castsi256_si128(q6_vec);
                 let hi_128 = _mm256_extracti128_si256(q6_vec, 1);
 
-                // Low 16 elements: q6[0..15] → i16, subtract 32
+                // Low 16 elements: q6[0..15] -> i16, subtract 32
                 let q_lo = _mm256_sub_epi16(_mm256_cvtepu8_epi16(lo_128), offset_32_i16);
                 let a_lo = _mm256_loadu_si256(a_i16.as_ptr().add($a_off) as *const __m256i);
-                // madd_epi16: i16 × i16 → i32, sums adjacent pairs → 8 i32
+                // madd_epi16: i16 x i16 -> i32, sums adjacent pairs -> 8 i32
                 let dot_lo = _mm256_madd_epi16(q_lo, a_lo);
                 let idot_lo = hsum_i32(dot_lo);
 
-                // High 16 elements: q6[16..31] → i16, subtract 32
+                // High 16 elements: q6[16..31] -> i16, subtract 32
                 let q_hi = _mm256_sub_epi16(_mm256_cvtepu8_epi16(hi_128), offset_32_i16);
                 let a_hi = _mm256_loadu_si256(a_i16.as_ptr().add($a_off + 16) as *const __m256i);
                 let dot_hi = _mm256_madd_epi16(q_hi, a_hi);
@@ -1631,7 +1631,7 @@ unsafe fn q6k_dot_preq_i16(block: &[u8], a_i16: &[i16], a_scale: f32) -> f32 {
 }
 
 /// F32-domain Q6_K dot product using AVX2 for 6-bit extraction and FMA for accumulation.
-/// Activations stay in f32 — no quantization, no error accumulation across layers.
+/// Activations stay in f32 -- no quantization, no error accumulation across layers.
 /// Kept as fallback for non-AVX2 or when precision is critical.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
@@ -1677,10 +1677,10 @@ unsafe fn q6k_dot_block_avx2(block: &[u8], a: &[f32]) -> f32 {
         );
 
         // For each group of 32 elements, process in 4 chunks of 8
-        // q6_0 → elements y_off+0..31, scales half*8+{0,1}
-        // q6_1 → elements y_off+32..63, scales half*8+{2,3}
-        // q6_2 → elements y_off+64..95, scales half*8+{4,5}
-        // q6_3 → elements y_off+96..127, scales half*8+{6,7}
+        // q6_0 -> elements y_off+0..31, scales half*8+{0,1}
+        // q6_1 -> elements y_off+32..63, scales half*8+{2,3}
+        // q6_2 -> elements y_off+64..95, scales half*8+{4,5}
+        // q6_3 -> elements y_off+96..127, scales half*8+{6,7}
 
         macro_rules! process_q6_group {
             ($q6:expr, $elem_off:expr, $sc_base:expr) => {{
@@ -1800,7 +1800,7 @@ unsafe fn q6k_dot_q8_avx2(block: &[u8], a_q8: &[i8], a_scale: f32, a_group_sums:
         let aq_2 = _mm256_loadu_si256(a_q8.as_ptr().add(y_off + 64) as *const __m256i);
         let aq_3 = _mm256_loadu_si256(a_q8.as_ptr().add(y_off + 96) as *const __m256i);
 
-        // Integer dot: u8 × i8 → i16 → i32
+        // Integer dot: u8 x i8 -> i16 -> i32
         let p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(q6_0, aq_0), ones_16);
         let p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(q6_1, aq_1), ones_16);
         let p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(q6_2, aq_2), ones_16);
@@ -1814,14 +1814,14 @@ unsafe fn q6k_dot_q8_avx2(block: &[u8], a_q8: &[i8], a_scale: f32, a_group_sums:
         // Scales: Q6_K has 16 scales (i8), 1 per 16 elements
         // For the 32-element groups, each uses 2 consecutive scales
         // Group 0 (elements y_off..y_off+31): scales[half*8 + 0] and scales[half*8 + 1]
-        // But maddubs mixed them — need to split or use averaged scale
+        // But maddubs mixed them -- need to split or use averaged scale
         // Actually, the scale repeats for l=0..15 (is=0) and l=16..31 (is=1)
         // maddubs processes all 32 at once with one scale pattern
         // We can split the hsum into two halves for the two sub-scales
 
         // Simpler approach: use one average scale for the 32 elements
-        // More accurate: split 32 into 2×16 and apply different scales
-        // For now, use the full-group approach — sum the integer dot,
+        // More accurate: split 32 into 2x16 and apply different scales
+        // For now, use the full-group approach -- sum the integer dot,
         // then apply per-group scales in f32
 
         // Per-half, we have 4 groups of 32 elements.
@@ -1861,7 +1861,7 @@ unsafe fn q6k_dot_q8_avx2(block: &[u8], a_q8: &[i8], a_scale: f32, a_group_sums:
 
         let gs = |g: usize| -> f32 { a_group_sums[y_off / Q6K_GROUP_SIZE + g] };
 
-        // Group 0: elements y_off+0..y_off+31 → 2 sub-groups of 16
+        // Group 0: elements y_off+0..y_off+31 -> 2 sub-groups of 16
         result += d * sc(half * 8) * (a_scale * lo_0 as f32 - 32.0 * gs(0));
         result += d * sc(half * 8 + 1) * (a_scale * hi_0 as f32 - 32.0 * gs(1));
         // Group 1: elements y_off+32..y_off+63
@@ -1887,7 +1887,7 @@ unsafe fn hsum_i32_128(v: std::arch::x86_64::__m128i) -> i32 {
     _mm_cvtsi128_si32(sum32)
 }
 
-// ── TQ2_0 ternary (2-bit packing, 2.0625 bpw) ─────────────────────────────
+// -- TQ2_0 ternary (2-bit packing, 2.0625 bpw) -----------------------------
 
 pub fn tq2_block_d(block: &[u8]) -> f32 {
     f16_to_f32(u16::from_le_bytes([block[64], block[65]]))
@@ -1981,16 +1981,16 @@ fn f32_to_f16(val: f32) -> u16 {
     ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
 }
 
-// ── I2_S ternary (bitnet.cpp format: 2-bit packed + per-tensor f32 scale) ──
+// -- I2_S ternary (bitnet.cpp format: 2-bit packed + per-tensor f32 scale) --
 //
 // Translated line-by-line from bitnet.cpp (ggml.c + ggml-bitnet-mad.cpp).
 // Data layout per tensor: [packed_2bit_weights (n*k/4 bytes) | f32 scale]
 //
 // Source functions translated:
-//   nearest_int()       — ggml.c:12536
-//   quantize_row_i8_s() — ggml-quants.c:3503
-//   ggml_vec_dot_i2_i8_s_1x1() — ggml-bitnet-mad.cpp:198
-//   mul_mat rescaling   — ggml.c:12521
+//   nearest_int()       -- ggml.c:12536
+//   quantize_row_i8_s() -- ggml-quants.c:3503
+//   ggml_vec_dot_i2_i8_s_1x1() -- ggml-bitnet-mad.cpp:198
+//   mul_mat rescaling   -- ggml.c:12521
 
 /// Translated from ggml.c:12536-12541.
 /// Banker's rounding via the magic-number trick.
@@ -2033,14 +2033,14 @@ pub fn quantize_row_i8_s(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
 }
 
 /// Translated from ggml-bitnet-mad.cpp:198-296, scalar path (nrc=1).
-/// Computes unsigned dot product of 2-bit packed weights × i8 activations.
+/// Computes unsigned dot product of 2-bit packed weights x i8 activations.
 ///
 /// Weight layout: 128 elements per 32-byte group.
 /// Byte b (0..31) contains 4 2-bit values:
-///   bits[7:6] → element b       (group_idx=0)
-///   bits[5:4] → element 32+b    (group_idx=1)
-///   bits[3:2] → element 64+b    (group_idx=2)
-///   bits[1:0] → element 96+b    (group_idx=3)
+///   bits[7:6] -> element b       (group_idx=0)
+///   bits[5:4] -> element 32+b    (group_idx=1)
+///   bits[3:2] -> element 64+b    (group_idx=2)
+///   bits[1:0] -> element 96+b    (group_idx=3)
 /// Values {0,1,2} represent ternary {-1,0,+1}.
 pub fn vec_dot_i2_i8_s(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
     // C: const int nb = n / QK_I2_S;  // QK_I2_S = 128
@@ -2055,15 +2055,15 @@ pub fn vec_dot_i2_i8_s(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
 
         for j in 0..32 {
             let byte = packed[px + j];
-            // C: xq8_0 = (byte >> 6) & 0x03  → element j
-            // C: xq8_1 = (byte >> 4) & 0x03  → element 32+j
-            // C: xq8_2 = (byte >> 2) & 0x03  → element 64+j
-            // C: xq8_3 = (byte >> 0) & 0x03  → element 96+j
+            // C: xq8_0 = (byte >> 6) & 0x03  -> element j
+            // C: xq8_1 = (byte >> 4) & 0x03  -> element 32+j
+            // C: xq8_2 = (byte >> 2) & 0x03  -> element 64+j
+            // C: xq8_3 = (byte >> 0) & 0x03  -> element 96+j
             let w0 = ((byte >> 6) & 0x03) as i32;
             let w1 = ((byte >> 4) & 0x03) as i32;
             let w2 = ((byte >> 2) & 0x03) as i32;
             let w3 = (byte & 0x03) as i32;
-            // C: maddubs(xq8_0, yq8_0) — unsigned × signed multiply-add
+            // C: maddubs(xq8_0, yq8_0) -- unsigned x signed multiply-add
             accu += w0 * a_q[py + j] as i32;
             accu += w1 * a_q[py + 32 + j] as i32;
             accu += w2 * a_q[py + 64 + j] as i32;
@@ -2085,7 +2085,7 @@ pub fn i2s_dequant_block(block: &[u8], output: &mut [f32; I2S_BLOCK_SIZE]) {
     }
 }
 
-/// AVX2 per-tensor INT8 activation quantization — zero-allocation, writes directly into dst.
+/// AVX2 per-tensor INT8 activation quantization -- zero-allocation, writes directly into dst.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn quantize_row_i8_s_avx2_into(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
@@ -2206,7 +2206,7 @@ unsafe fn quantize_row_i8_s_avx2(x: &[f32]) -> (f32, i32, Vec<i8>) {
             _mm256_set1_epi32(-128),
             _mm256_min_epi32(_mm256_set1_epi32(127), rounded),
         );
-        // Pack i32 → i16 → i8 (8 values)
+        // Pack i32 -> i16 -> i8 (8 values)
         let lo128 = _mm256_castsi256_si128(clamped);
         let hi128 = _mm256_extracti128_si256(clamped, 1);
         let packed16 = _mm_packs_epi32(lo128, hi128);
@@ -2214,7 +2214,7 @@ unsafe fn quantize_row_i8_s_avx2(x: &[f32]) -> (f32, i32, Vec<i8>) {
         let ptr = dst.as_mut_ptr().add(i * 8) as *mut i64;
         *ptr = _mm_cvtsi128_si64(packed8);
 
-        // Accumulate sum: extend i32 → add
+        // Accumulate sum: extend i32 -> add
         sum_acc = _mm256_add_epi32(sum_acc, clamped);
     }
 
@@ -2236,7 +2236,7 @@ unsafe fn quantize_row_i8_s_avx2(x: &[f32]) -> (f32, i32, Vec<i8>) {
     (s, sum, dst)
 }
 
-/// AVX2 I2S ternary dot product: 2-bit packed weights × i8 activations.
+/// AVX2 I2S ternary dot product: 2-bit packed weights x i8 activations.
 /// Processes 128 elements per group using _mm256_maddubs_epi16.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
@@ -2249,7 +2249,7 @@ pub unsafe fn vec_dot_i2_i8_s_avx2(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
     let mut acc = _mm256_setzero_si256();
 
     // Batch 32 groups in i16 before widening to i32 (bitnet.cpp pattern).
-    // Each maddubs result is max ±254 as i16. 32 such values sum to max ±8128, fits i16.
+    // Each maddubs result is max ??254 as i16. 32 such values sum to max ??8128, fits i16.
     let group32_num = nb / 32;
 
     for batch in 0..group32_num {
@@ -2362,12 +2362,12 @@ unsafe fn hsum_i32_512(v: std::arch::x86_64::__m512i) -> i32 {
     hsum_i32(sum256)
 }
 
-// ── Q2_0 (PrismML ternary, QK=128, per-block f16 scale) ──────────────────────
+// -- Q2_0 (PrismML ternary, QK=128, per-block f16 scale) ----------------------
 
 pub const Q2_0_BLOCK_SIZE: usize = 128;
 pub const Q2_0_BLOCK_BYTES: usize = 34; // 2-byte f16 scale + 32 bytes packed
 
-pub const Q2X4_BLOCK_BYTES: usize = 8 + 128; // 4×f16 scales + 4×32 packed bytes
+pub const Q2X4_BLOCK_BYTES: usize = 8 + 128; // 4xf16 scales + 4x32 packed bytes
 
 pub fn q2_to_i2s_approx(q2_data: &[u8], n_rows: usize, k: usize) -> (Vec<u8>, f32, Vec<f32>) {
     let blocks_per_row = k / Q2_0_BLOCK_SIZE;
@@ -2403,7 +2403,7 @@ pub fn q2_to_i2s_approx(q2_data: &[u8], n_rows: usize, k: usize) -> (Vec<u8>, f3
             };
 
             if (ratio - 1.0).abs() < 0.02 {
-                // Exact match — direct bit transcode
+                // Exact match -- direct bit transcode
                 for j in 0..32 {
                     let b = q2_packed[j];
                     let elems = [4 * j, 4 * j + 1, 4 * j + 2, 4 * j + 3];
@@ -2691,11 +2691,11 @@ fn q2_0_dot_q8_preq_scalar(w_packed: &[u8], q8_act: &[u8], k: usize) -> f32 {
     sumf
 }
 
-/// AVX2 Q2_0 × Q8_0 dot product.
+/// AVX2 Q2_0 x Q8_0 dot product.
 ///
 /// Each Q2_0 sub-block has 8 packed bytes encoding 32 ternary weights.
-/// AVX-VNNI Q2_0 × Q8_0 dot product — translated from llama.cpp's
-/// ggml_vec_dot_q2_0_q8_0 VNNI path. Uses dpbusd for 4-element u8×i8
+/// AVX-VNNI Q2_0 x Q8_0 dot product -- translated from llama.cpp's
+/// ggml_vec_dot_q2_0_q8_0 VNNI path. Uses dpbusd for 4-element u8xi8
 /// dot-accumulate. Same unpack as AVX2 but with single dpbusd instruction.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "avxvnni")]
@@ -2742,7 +2742,7 @@ unsafe fn q2_0_dot_q8_preq_avx512(w_packed: &[u8], q8_act: &[u8], k: usize) -> f
     sumf
 }
 
-/// AVX2 Q2_0 × Q8_0 dot product — translated from llama.cpp's
+/// AVX2 Q2_0 x Q8_0 dot product -- translated from llama.cpp's
 /// ggml_vec_dot_q2_0_q8_0 (PrismML fork, ggml-cpu/arch/x86/quants.c).
 /// Unpack 2-bit codes via mullo_epi16 multiply trick, then maddubs+madd
 /// for the dot product with -1 bias correction.
@@ -2800,10 +2800,10 @@ pub fn q2_0_gemv_q8(packed_w: &[u8], q8_act: &[u8], output: &mut [f32], n: usize
     }
 }
 
-/// Parallel Q2_0 × Q8_0 GEMM: m activation vectors × n output rows.
+/// Parallel Q2_0 x Q8_0 GEMM: m activation vectors x n output rows.
 /// Each thread takes a partition of output rows, quantizes the activation
 /// to Q8_0, and computes its rows. Threads share the weight data (read-only)
-/// and each produces independent output rows — no synchronization needed.
+/// and each produces independent output rows -- no synchronization needed.
 pub fn q2_0_gemm_q8_parallel(
     packed_w: &[u8],
     a_f32: &[f32],
@@ -2836,7 +2836,7 @@ pub fn q2_0_gemm_q8_parallel(
 
 /// Fused quantize + row-partitioned GEMV: each thread independently quantizes
 /// the activation from f32 to Q8_0 then computes its row partition.
-/// Eliminates the serial Q8_0 quantize barrier — all threads run in parallel.
+/// Eliminates the serial Q8_0 quantize barrier -- all threads run in parallel.
 ///
 /// # Safety
 /// Same as `q2_0_gemv_q8_rows`.
@@ -2862,7 +2862,7 @@ pub unsafe fn q2_0_gemv_fused_rows(
     }
 }
 
-/// Row-partitioned Q2_0 × Q8_0 GEMV for parallel dispatch.
+/// Row-partitioned Q2_0 x Q8_0 GEMV for parallel dispatch.
 /// Computes rows [row_start..row_end) writing to `output_ptr + row_start`.
 /// Uses raw pointer writes so multiple threads can write disjoint row ranges
 /// without mutable aliasing.
@@ -2891,7 +2891,7 @@ pub unsafe fn q2_0_gemv_q8_rows(
     }
 }
 
-/// Q2_0 × q8_0 dot product matching ggml's vec_dot_q2_0_q8_0.
+/// Q2_0 x q8_0 dot product matching ggml's vec_dot_q2_0_q8_0.
 /// Activations are quantized per 32-element block (q8_0 format) for precision.
 fn q2_0_dot_q8(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
     let nb = k / Q2_0_BLOCK_SIZE; // number of Q2_0 blocks (128 elements each)
@@ -3006,7 +3006,7 @@ unsafe fn q2_0_dot_q8_avx2(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
             let w_8 =
                 _mm256_broadcastsi128_si256(_mm_loadl_epi64(qs_ptr.add(sub * 8) as *const __m128i));
             // We have 8 bytes in the low 64 bits of each 128-bit lane
-            // Need to unpack: byte[j] bits 0-1 → element 4j, bits 2-3 → 4j+1, etc.
+            // Need to unpack: byte[j] bits 0-1 -> element 4j, bits 2-3 -> 4j+1, etc.
             // Use shuffle to replicate each byte 4 times, then shift+mask
             let shuffle = _mm256_setr_epi8(
                 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6,
@@ -3030,7 +3030,7 @@ unsafe fn q2_0_dot_q8_avx2(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
             let w2 = _mm256_and_si256(_mm256_srli_epi16(w_rep, 4), mask_2bit);
             let w3 = _mm256_and_si256(_mm256_srli_epi16(w_rep, 6), mask_2bit);
             // Now w0 has bits 0-1 of each byte, but replicated 4 times per byte
-            // We need: position 4j → byte j bits 0-1, position 4j+1 → bits 2-3, etc.
+            // We need: position 4j -> byte j bits 0-1, position 4j+1 -> bits 2-3, etc.
             // Use blend: take bit-0 from w0, bit-2 from w1, bit-4 from w2, bit-6 from w3
             // at positions 0,1,2,3 within each 4-byte group
             // blend_epi8 selects per byte. Create mask: pos%4==0 from w0, pos%4==1 from w1, etc.
@@ -3047,14 +3047,14 @@ unsafe fn q2_0_dot_q8_avx2(w_packed: &[u8], a_f32: &[f32], k: usize) -> f32 {
             let w_all = _mm256_blendv_epi8(w_01, w_23, blend_2);
 
             // w_all[i] is the Q2_0 weight value {0,1,2,3} for element i
-            // maddubs: unsigned × signed. w_all is unsigned, q_i8 is signed.
-            // result = sum(w_all[i] * q_i8[i]) for pairs → i16
+            // maddubs: unsigned x signed. w_all is unsigned, q_i8 is signed.
+            // result = sum(w_all[i] * q_i8[i]) for pairs -> i16
             let prod = _mm256_maddubs_epi16(w_all, q_i8);
             // sum(w * a) in i16, widen to i32
             let sum32 = _mm256_madd_epi16(prod, ones_16);
             let dot_wa = hsum_i32(sum32);
 
-            // sum(a) = sum(q_i8) — for the (q-1) correction
+            // sum(a) = sum(q_i8) -- for the (q-1) correction
             let asum16 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, q_i8), ones_16);
             let sum_a = hsum_i32(asum16);
 
@@ -3154,7 +3154,7 @@ unsafe fn q2_0_dot_nrows_preq_avx512(
             let q_i8 = _mm512_loadu_si512(q8.as_ptr().add(si0 * 32) as *const __m512i);
 
             for r in 0..nr {
-                // Load 16 packed bytes (2 sub-blocks × 8 bytes) and unpack to 64 u8
+                // Load 16 packed bytes (2 sub-blocks x 8 bytes) and unpack to 64 u8
                 let w_raw = _mm_loadu_si128(qs_ptrs[r].add(sub0 * 8) as *const __m128i);
                 let w_broad = _mm512_broadcast_i32x4(w_raw);
                 let w_rep = _mm512_permutexvar_epi8(perm_idx, w_broad);
@@ -3170,7 +3170,7 @@ unsafe fn q2_0_dot_nrows_preq_avx512(
                 let w_23 = _mm512_mask_blend_epi8(mask_odd, w2, w3);
                 let w_all = _mm512_mask_blend_epi8(mask_pair, w_01, w_23);
 
-                // Fused dot product: dpbusd accumulates unsigned×signed byte pairs → i32
+                // Fused dot product: dpbusd accumulates unsignedxsigned byte pairs -> i32
                 let dot_i32 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w_all, q_i8);
 
                 // Split into two 256-bit halves for per-sub-block scaling
@@ -3502,7 +3502,7 @@ pub fn q2_0_gemv_preq(
     q2_0_gemv(packed, &vec![0.0f32; k], output, n, k);
 }
 
-/// AVX512 per-tensor INT8 activation quantization — zero-allocation, writes directly into dst.
+/// AVX512 per-tensor INT8 activation quantization -- zero-allocation, writes directly into dst.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn quantize_row_i8_s_avx512_into(x: &[f32], dst: &mut [i8]) -> (f32, i32) {
@@ -3603,7 +3603,7 @@ unsafe fn quantize_row_i8_s_avx512(x: &[f32]) -> (f32, i32, Vec<i8>) {
         let clamped = _mm512_max_epi32(min_val, _mm512_min_epi32(max_val, rounded));
         sum_acc = _mm512_add_epi32(sum_acc, clamped);
 
-        // Pack i32 → i8: extract two 256-bit halves, pack each
+        // Pack i32 -> i8: extract two 256-bit halves, pack each
         let lo256 = _mm512_castsi512_si256(clamped);
         let hi256 = _mm512_extracti64x4_epi64(clamped, 1);
         let lo128_a = _mm256_castsi256_si128(lo256);
@@ -3627,7 +3627,7 @@ unsafe fn quantize_row_i8_s_avx512(x: &[f32]) -> (f32, i32, Vec<i8>) {
 }
 
 /// AVX512 VNNI I2S ternary dot product using _mm512_dpbusd_epi32.
-/// Uses 512-bit maddubs (processes 64 u8×i8 pairs per instruction) — 2x throughput over AVX2.
+/// Uses 512-bit maddubs (processes 64 u8xi8 pairs per instruction) -- 2x throughput over AVX2.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
 unsafe fn vec_dot_i2_i8_s_avx512(packed: &[u8], a_q: &[i8], k: usize) -> i32 {
@@ -3765,7 +3765,7 @@ pub fn i2s_quantize_into(a: &[f32], dst: &mut [i8]) -> (f32, i32) {
 }
 
 /// Single-threaded I2S GEMV on column range [col_start, col_end).
-/// Called by layer-level threading — each thread processes its own column slice.
+/// Called by layer-level threading -- each thread processes its own column slice.
 /// Uses raw addresses to satisfy Sync bounds in parallel closures.
 #[cfg(target_arch = "x86_64")]
 pub fn i2s_gemv_cols(
@@ -3837,8 +3837,8 @@ macro_rules! i2s_dot_iter {
     }};
 }
 
-/// I2S GEMV inner kernel: dot product of 32 × 128-element blocks.
-/// Macro-unrolled — no loop, 32 stamped-out iterations.
+/// I2S GEMV inner kernel: dot product of 32 x 128-element blocks.
+/// Macro-unrolled -- no loop, 32 stamped-out iterations.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn i2s_dot_block32(
@@ -3886,7 +3886,7 @@ unsafe fn i2s_dot_block32(
     _mm256_madd_epi16(acc, ones)
 }
 
-/// Sequential-row I2S GEMV — one row at a time, activation in L1 cache.
+/// Sequential-row I2S GEMV -- one row at a time, activation in L1 cache.
 /// Inner 32-block kernel is #[inline(always)] to force unrolling.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -3954,7 +3954,7 @@ unsafe fn i2s_gemv_cols_multi_row(
     }
 }
 
-/// I2S GEMV with f16 output — writes u16 (f16 bits) via F16C cvtps_ph.
+/// I2S GEMV with f16 output -- writes u16 (f16 bits) via F16C cvtps_ph.
 #[cfg(target_arch = "x86_64")]
 pub fn i2s_gemv_cols_f16(
     preq_q8: &[i8],
@@ -4047,11 +4047,11 @@ pub fn i2s_weight_scale(b_quantized: &[u8], n: usize, k: usize) -> f32 {
     ])
 }
 
-// ── LUT-based I2S ternary dot product (bitnet.cpp TL2 translation) ─────────
+// -- LUT-based I2S ternary dot product (bitnet.cpp TL2 translation) ---------
 //
 // Instead of maddubs(weight_u8, activation_i8), precompute ALL possible
 // partial sums from activation pairs, then use weight nibbles as table indices.
-// Activations quantized to [-63, 63] so pair sums fit in i8 → single shuffle per nibble.
+// Activations quantized to [-63, 63] so pair sums fit in i8 -> single shuffle per nibble.
 
 #[inline]
 fn decode_ternary(w: u8) -> i8 {
@@ -4114,11 +4114,11 @@ fn i2s_build_all_pair_luts_i8(a_q: &[i8], k: usize) -> Vec<i8> {
 
 /// Build all pair LUTs with pre-split lo/hi bytes for AVX2 shuffle.
 /// Layout per pair: 16 lo-bytes then 16 hi-bytes = 32 bytes.
-/// Total: 64 pairs per group × 32 bytes = 2048 bytes per group.
+/// Total: 64 pairs per group x 32 bytes = 2048 bytes per group.
 /// Uses full 127-scale precision (i16 entries, no range reduction).
 fn i2s_build_all_pair_luts_split(a_q: &[i8], k: usize) -> Vec<u8> {
     let nb = k / 128;
-    let mut luts = vec![0u8; nb * 64 * 32]; // 64 pairs × 32 bytes per group
+    let mut luts = vec![0u8; nb * 64 * 32]; // 64 pairs x 32 bytes per group
 
     for g in 0..nb {
         let base = g * 128;
@@ -4597,11 +4597,11 @@ pub unsafe fn q4k_dot_q8_avx2(
         let aq_lo = _mm256_loadu_si256(a_q8.as_ptr().add(j * 64) as *const __m256i);
         let aq_hi = _mm256_loadu_si256(a_q8.as_ptr().add(j * 64 + 32) as *const __m256i);
 
-        // u8 × i8 → i16 paired sums (32 mults → 16 sums per call)
+        // u8 x i8 -> i16 paired sums (32 mults -> 16 sums per call)
         let p_lo = _mm256_maddubs_epi16(lo_nib, aq_lo);
         let p_hi = _mm256_maddubs_epi16(hi_nib, aq_hi);
 
-        // i16 → i32 (sum adjacent pairs)
+        // i16 -> i32 (sum adjacent pairs)
         let s_lo = _mm256_madd_epi16(p_lo, ones_16);
         let s_hi = _mm256_madd_epi16(p_hi, ones_16);
 
@@ -4617,7 +4617,7 @@ pub unsafe fn q4k_dot_q8_avx2(
     result
 }
 
-/// VNNI variant: uses _mm256_dpbusd_epi32 (single instruction u8×i8→i32 accumulate)
+/// VNNI variant: uses _mm256_dpbusd_epi32 (single instruction u8xi8->i32 accumulate)
 /// instead of the two-instruction maddubs+madd chain. ~1.5-2x throughput.
 #[cfg(all(feature = "cpu", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,avxvnni")]
@@ -4642,7 +4642,7 @@ unsafe fn q4k_dot_q8_vnni(block: &[u8], a_q8: &[i8], a_scale: f32, a_group_sums:
         let aq_lo = _mm256_loadu_si256(a_q8.as_ptr().add(j * 64) as *const __m256i);
         let aq_hi = _mm256_loadu_si256(a_q8.as_ptr().add(j * 64 + 32) as *const __m256i);
 
-        // dpbusd: for each i32 lane, sum 4 u8×i8 products and accumulate
+        // dpbusd: for each i32 lane, sum 4 u8xi8 products and accumulate
         // Replaces maddubs_epi16 + madd_epi16 in a single instruction
         let s_lo = _mm256_dpbusd_epi32(_mm256_setzero_si256(), lo_nib, aq_lo);
         let s_hi = _mm256_dpbusd_epi32(_mm256_setzero_si256(), hi_nib, aq_hi);
@@ -4695,7 +4695,7 @@ unsafe fn q4k_dot_block_avx2_int8(block: &[u8], a: &[f32]) -> f32 {
             scaled,
             _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
         ));
-        // Pack i32 → i16 → i8 (with saturation)
+        // Pack i32 -> i16 -> i8 (with saturation)
         let lo128 = _mm256_castsi256_si128(rounded);
         let hi128 = _mm256_extracti128_si256(rounded, 1);
         let packed16 = _mm_packs_epi32(lo128, hi128);
@@ -4717,11 +4717,11 @@ unsafe fn q4k_dot_block_avx2_int8(block: &[u8], a: &[f32]) -> f32 {
         let aq_lo = _mm256_loadu_si256(a_q8.as_ptr().add(j * 64) as *const __m256i);
         let aq_hi = _mm256_loadu_si256(a_q8.as_ptr().add(j * 64 + 32) as *const __m256i);
 
-        // Integer dot: u8 × i8 → i16 paired sums
+        // Integer dot: u8 x i8 -> i16 paired sums
         let p_lo = _mm256_maddubs_epi16(lo_nib, aq_lo);
         let p_hi = _mm256_maddubs_epi16(hi_nib, aq_hi);
 
-        // i16 → i32 (sum adjacent pairs)
+        // i16 -> i32 (sum adjacent pairs)
         let s_lo = _mm256_madd_epi16(p_lo, ones_16);
         let s_hi = _mm256_madd_epi16(p_hi, ones_16);
 
@@ -4730,7 +4730,7 @@ unsafe fn q4k_dot_block_avx2_int8(block: &[u8], a: &[f32]) -> f32 {
         let hsum_hi = hsum_i32(s_hi);
 
         // Activation sums per group (for min correction)
-        // sum(a_q8[group]) — use madd with ones to sum i8 as i16 pairs, then i32
+        // sum(a_q8[group]) -- use madd with ones to sum i8 as i16 pairs, then i32
         let aq_lo_16 =
             _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(aq_lo)), ones_16);
         let aq_lo_16b = _mm256_madd_epi16(
@@ -5027,7 +5027,7 @@ impl PreQuantizedActivations {
     }
 
     /// Minimal variant for graph decode: only q8 + scales + q8k.
-    /// Skips group_sums, i2s, q16, q8_32 — none used in Q4K/Q6K graph nodes.
+    /// Skips group_sums, i2s, q16, q8_32 -- none used in Q4K/Q6K graph nodes.
     pub fn from_f32_q8k_only(a: &[f32]) -> Self {
         let k = a.len();
         #[cfg(target_arch = "x86_64")]
@@ -5390,7 +5390,7 @@ impl CpuMatMulQ4KOpt {
         Ok(())
     }
 
-    /// Prefill GEMM using pre-repacked Q4Kx8 weights — no per-call repacking.
+    /// Prefill GEMM using pre-repacked Q4Kx8 weights -- no per-call repacking.
     /// Returns true if the maddubs GEMM ran, false if constraints not met (caller must fall back).
     pub fn forward_prefill_q4kx8(
         &self,
@@ -5511,7 +5511,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             return Ok(());
         }
 
-        // llama.cpp translation: Q8_K activations × Q4_K weights via vec_dot_q4_K_q8_K.
+        // llama.cpp translation: Q8_K activations x Q4_K weights via vec_dot_q4_K_q8_K.
         // Thread-local buffer avoids one Vec allocation per input row per Rayon worker.
         #[cfg(feature = "openmp")]
         if m == 1 {
@@ -5594,7 +5594,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
             };
             let out_ptr = output.as_mut_ptr();
             let bpr = blocks_per_row;
-            // Parallelize over output neurons (j = 0..n) — same parallelism as Q4kGemvJob
+            // Parallelize over output neurons (j = 0..n) -- same parallelism as Q4kGemvJob
             crate::inference_pool::par_run(n, |start, end| {
                 for j in start..end {
                     let w = &w_q4k[j * bpr..(j + 1) * bpr];
@@ -5606,10 +5606,10 @@ impl MatMulQ for CpuMatMulQ4KOpt {
         }
 
         // m>1 prefill: fall through to Q4kMnBlockJob.
-        // The maddubs 8×8 GEMM (ggml_gemm_q4_k_8x8_q8_k) requires weights to be
+        // The maddubs 8x8 GEMM (ggml_gemm_q4_k_8x8_q8_k) requires weights to be
         // pre-repacked to Q4Kx8 format at load time. Per-call repacking costs ~33MB/matrix
-        // for each of 196 calls (28 layers × 7 projections per token), making it 4× slower
-        // than the reference path (91 tok/s → 23 tok/s). Enable only when pre-repacked
+        // for each of 196 calls (28 layers x 7 projections per token), making it 4x slower
+        // than the reference path (91 tok/s -> 23 tok/s). Enable only when pre-repacked
         // weights are stored in LayerQ4KWeights.
 
         let job = Q4kMnBlockJob {
@@ -6169,15 +6169,15 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                                     let l_lo_r = _mm256_shuffle_epi8(tbl_l_lo, lower);
                                     let l_hi_r = _mm256_shuffle_epi8(tbl_l_hi, lower);
 
-                                    // Reconstruct i16: unpack(lo_bytes, hi_bytes) → i16
-                                    // unpacklo: bytes 0-7 per lane → cols [0-7 | 16-23]
-                                    // unpackhi: bytes 8-15 per lane → cols [8-15 | 24-31]
+                                    // Reconstruct i16: unpack(lo_bytes, hi_bytes) -> i16
+                                    // unpacklo: bytes 0-7 per lane -> cols [0-7 | 16-23]
+                                    // unpackhi: bytes 8-15 per lane -> cols [8-15 | 24-31]
                                     let u_i16_c0 = _mm256_unpacklo_epi8(u_lo_r, u_hi_r);
                                     let u_i16_c1 = _mm256_unpackhi_epi8(u_lo_r, u_hi_r);
                                     let l_i16_c0 = _mm256_unpacklo_epi8(l_lo_r, l_hi_r);
                                     let l_i16_c1 = _mm256_unpackhi_epi8(l_lo_r, l_hi_r);
 
-                                    // Accumulate in i16 (32 byte positions × max ±254 per position → max ±8128, fits i16)
+                                    // Accumulate in i16 (32 byte positions x max ??254 per position -> max ??8128, fits i16)
                                     vec_c0 = _mm256_add_epi16(
                                         vec_c0,
                                         _mm256_add_epi16(u_i16_c0, l_i16_c0),
@@ -6188,7 +6188,7 @@ impl MatMulQ for CpuMatMulQ4KOpt {
                                     );
                                 }
 
-                                // Widen i16 → i32 once per group
+                                // Widen i16 -> i32 once per group
                                 acc0 = _mm256_add_epi32(
                                     acc0,
                                     _mm256_cvtepi16_epi32(_mm256_castsi256_si128(vec_c0)),
@@ -7278,8 +7278,8 @@ mod kani_proofs {
     }
 
     /// Prove scale unpacking matches ggml's get_scale_min_k4 for ALL 8 indices.
-    /// ggml: j<4 → sc=q[j]&63, m=q[j+4]&63
-    ///       j≥4 → sc=(q[j+4]&0xF)|((q[j-4]>>6)<<4), m=(q[j+4]>>4)|((q[j]>>6)<<4)
+    /// ggml: j<4 -> sc=q[j]&63, m=q[j+4]&63
+    ///       j>=4 -> sc=(q[j+4]&0xF)|((q[j-4]>>6)<<4), m=(q[j+4]>>4)|((q[j]>>6)<<4)
     #[kani::proof]
     fn q4k_scale_unpack_matches_ggml() {
         let packed: [u8; 12] = kani::any();
@@ -7344,7 +7344,7 @@ mod kani_proofs {
     }
 
     /// Prove f32 accumulator stays finite for realistic matmul dimensions.
-    /// Max per-element product: max_activation × (d × 63 × 15 + dmin × 63).
+    /// Max per-element product: max_activation x (d x 63 x 15 + dmin x 63).
     /// For k=12288 (largest FFN dim), sum of 12288 such terms must not overflow f32.
     #[kani::proof]
     fn q4k_accumulator_no_overflow() {
@@ -7382,7 +7382,7 @@ mod kani_proofs {
         assert!(max_error <= max_abs as f64 / 254.0 + 0.001);
     }
 
-    /// Prove Q4K monotonicity: within a group, larger nibble value → larger dequantized value.
+    /// Prove Q4K monotonicity: within a group, larger nibble value -> larger dequantized value.
     /// dequant(q) = d * sc * q - dmin * m. For fixed d, sc, dmin, m: if q1 > q2 then
     /// dequant(q1) >= dequant(q2), since d * sc >= 0 (both non-negative).
     #[kani::proof]
@@ -7739,11 +7739,11 @@ mod kani_proofs {
         assert!(offset <= end);
     }
 
-    // ── Equivalence proofs: optimized path ≡ reference path ────────────────
+    // -- Equivalence proofs: optimized path ??? reference path ----------------
 
     /// Nibble packing is a lossless bijection.
     /// Proves that both reference and optimized paths read identical nibble values
-    /// from the same packed byte — the optimization cannot corrupt weight data.
+    /// from the same packed byte -- the optimization cannot corrupt weight data.
     #[kani::proof]
     fn q4k_nibble_pack_unpack_roundtrip() {
         let lo: u8 = kani::any();
@@ -7761,7 +7761,7 @@ mod kani_proofs {
 
     /// Integer dot product is invariant to summation grouping.
     /// SIMD lanes process pairs (q0*a0 + q1*a1) before adding to the accumulator,
-    /// but integer addition is associative and exact — the i32 result is identical
+    /// but integer addition is associative and exact -- the i32 result is identical
     /// for sequential and any paired grouping.  This is the core correctness claim
     /// for the VNNI/AVX2 repacked GEMM paths.
     #[kani::proof]
@@ -7795,8 +7795,8 @@ mod kani_proofs {
     }
 
     /// Scale factoring is algebraically exact in the integer domain.
-    /// The reference computes: Σ_i (sc * q_i * a_i) element-by-element.
-    /// The optimized path computes: sc * Σ_i (q_i * a_i) with a single multiply.
+    /// The reference computes: Sigma_i (sc * q_i * a_i) element-by-element.
+    /// The optimized path computes: sc * Sigma_i (q_i * a_i) with a single multiply.
     /// These are identical because integer multiplication distributes over addition
     /// without rounding.  Proves the group-scale factoring in the repacked GEMM.
     /// Restricted to 2 elements to keep SAT solving tractable for Kani.
@@ -7827,8 +7827,8 @@ mod kani_proofs {
     }
 
     /// Min-correction term distributes identically in both paths.
-    /// Reference: Σ_i (m * a_i) — per-element multiply.
-    /// Optimized: m * Σ_i a_i  — group sum precomputed, single multiply.
+    /// Reference: Sigma_i (m * a_i) -- per-element multiply.
+    /// Optimized: m * Sigma_i a_i  -- group sum precomputed, single multiply.
     /// Pure integer distributivity proof for the activation-sum shortcut.
     #[kani::proof]
     fn q4k_min_correction_group_sum_equivalent() {
@@ -7846,7 +7846,7 @@ mod kani_proofs {
         assert!(ref_sum == opt_sum);
     }
 
-    /// I2S 2-bit encoding roundtrip: trit ∈ {-1,0,1} → packed bits → trit.
+    /// I2S 2-bit encoding roundtrip: trit ??? {-1,0,1} -> packed bits -> trit.
     /// The packed format stores trits as (trit+1) in 2 bits; decoding subtracts 1.
     /// Proves the I2S weight format is lossless: scalar and SIMD paths decode the
     /// same trit value from any valid byte.
@@ -7893,11 +7893,11 @@ mod kani_proofs {
         assert!(dot_seq == dot_paired);
     }
 
-    /// I2S 2-bit field × i8 activation pair does not overflow i16.
+    /// I2S 2-bit field x i8 activation pair does not overflow i16.
     /// In I2S, each 2-bit field is in [0,2] (trit encoding); the maddubs accumulator
     /// widens to i16 per-pair.  Even for the worst-case ALL-3 byte (invalid I2S but
     /// reachable if we skip validation), the product stays within i16:
-    /// 3×127 + 3×127 = 762 << i16::MAX.  This proves per-iteration safety.
+    /// 3x127 + 3x127 = 762 << i16::MAX.  This proves per-iteration safety.
     #[kani::proof]
     fn i2s_per_byte_dot_no_i16_overflow() {
         // Use i32 to avoid any i16 overflow check during proof arithmetic
@@ -7919,14 +7919,14 @@ mod kani_proofs {
         // Min: 3*(-128) + 3*(-128) = -768 > i16::MIN (-32768)
         assert!(pair <= 762);
         assert!(pair >= -768);
-        // No i16 overflow → accumulation into i16 accumulator is safe per iteration
+        // No i16 overflow -> accumulation into i16 accumulator is safe per iteration
         assert!(pair <= i16::MAX as i32);
         assert!(pair >= i16::MIN as i32);
     }
 
     /// Q4K per-group i32 accumulator is safe from overflow for 32 elements.
-    /// The integer GEMM accumulates sc_g * Σ_{i in g} q_i * a_i into i32.
-    /// Max: sc=63, q=15, a=127, n=32 → 63 × 15 × 127 × 32 = 3,840,480 << i32::MAX.
+    /// The integer GEMM accumulates sc_g * Sigma_{i in g} q_i * a_i into i32.
+    /// Max: sc=63, q=15, a=127, n=32 -> 63 x 15 x 127 x 32 = 3,840,480 << i32::MAX.
     #[kani::proof]
     fn q4k_per_group_32_accumulator_no_overflow() {
         let n: usize = kani::any();
@@ -7944,7 +7944,7 @@ mod kani_proofs {
         assert!(max_with_scale < i32::MAX as i64);
     }
 
-    // ── Q6K equivalence proofs ───────────────────────────────────────────────
+    // -- Q6K equivalence proofs -----------------------------------------------
 
     /// Q6K 6-bit weight reconstruction stays in [-32, 31].
     /// Each weight is assembled from a 4-bit low part (ql & 0xF or ql >> 4)
@@ -7980,10 +7980,10 @@ mod kani_proofs {
         assert!(scale_i32 >= -128 && scale_i32 <= 127);
     }
 
-    /// Q6K i16 activation × weight product fits in i32, even for full 16-element groups.
-    /// weight ∈ [-32, 31], activation ∈ [-32767, 32767].
-    /// Max per-element product: 32 × 32767 = 1,048,544.
-    /// Max 16-element sum: 16 × 1,048,544 = 16,776,704 << i32::MAX.
+    /// Q6K i16 activation x weight product fits in i32, even for full 16-element groups.
+    /// weight ??? [-32, 31], activation ??? [-32767, 32767].
+    /// Max per-element product: 32 x 32767 = 1,048,544.
+    /// Max 16-element sum: 16 x 1,048,544 = 16,776,704 << i32::MAX.
     #[kani::proof]
     fn q6k_i16_accumulator_no_overflow() {
         let n: usize = kani::any();
@@ -8002,7 +8002,7 @@ mod kani_proofs {
 
     /// Q6K integer dot product is invariant to summation order.
     /// Proves that SIMD lane-grouping (paired accumulation) gives the same i32
-    /// result as sequential summation for Q6K weight × i16 activation products.
+    /// result as sequential summation for Q6K weight x i16 activation products.
     #[kani::proof]
     fn q6k_integer_dot_order_invariant() {
         let w0: i32 = kani::any();
@@ -8130,7 +8130,7 @@ mod prop_tests {
     proptest! {
         /// Q8 activation quantization introduces at most 0.5 LSB error.
         /// For any finite activation x with known max_abs, the scalar path computes
-        /// Q8(x) = round(x * 127/max_abs), giving |Q8(x)/scale - x| ≤ scale/2.
+        /// Q8(x) = round(x * 127/max_abs), giving |Q8(x)/scale - x| <= scale/2.
         /// This bounds the error each optimized path introduces vs the reference.
         #[test]
         fn prop_q8_quantize_bounded_round_trip_error(
@@ -8153,7 +8153,7 @@ mod prop_tests {
         }
 
         /// q4k_dot_block matches element-wise dequant+dot when activations are all 1.0.
-        /// For a=1 everywhere, dot_block = Σ dequant[i], a provable algebraic identity
+        /// For a=1 everywhere, dot_block = Sigma dequant[i], a provable algebraic identity
         /// since the summation order doesn't affect the dequantized weight values.
         /// This tests the REFERENCE path's formula correctness on a clean invariant.
         #[test]
@@ -8264,8 +8264,8 @@ mod tests {
 
         // Pack nibbles in ggml Q4_K interleaved layout:
         // Each group of 64 elements uses 32 bytes.
-        // Low nibbles of 32 bytes → elements 0..31 (within the 64-elem group)
-        // High nibbles of the same 32 bytes → elements 32..63
+        // Low nibbles of 32 bytes -> elements 0..31 (within the 64-elem group)
+        // High nibbles of the same 32 bytes -> elements 32..63
         for j in 0..4 {
             for l in 0..32 {
                 let lo_val = values[j * 64 + l];
@@ -8579,7 +8579,7 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f32::max);
 
-        // Int8 quantization introduces small errors — allow 5% relative tolerance
+        // Int8 quantization introduces small errors -- allow 5% relative tolerance
         let max_abs = out_ref.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
         let rel_tol = if max_abs > 0.0 {
             max_diff / max_abs
@@ -8751,7 +8751,7 @@ mod tests {
 
         let dot = tq2_dot_block(&block, &a);
         // Expected: 1*2 + (-1)*3 + 0*5 + 1*7 = 2 - 3 + 0 + 7 = 6
-        // Scale d = max(|values|) = 1.0, so d≈1.0 (fp16 roundtrip)
+        // Scale d = max(|values|) = 1.0, so d~=1.0 (fp16 roundtrip)
         assert!((dot - 6.0).abs() < 0.1, "tq2 dot expected ~6.0, got {dot}");
     }
 
@@ -8847,13 +8847,13 @@ mod tests {
         packed[0] = 0b10_01_00_10;
 
         let mut a_q = vec![0i8; k];
-        a_q[0] = 10; // element 0: w=+1 → value 2
-        a_q[32] = 20; // element 32: w=0 → value 1
-        a_q[64] = 30; // element 64: w=-1 → value 0
-        a_q[96] = 40; // element 96: w=+1 → value 2
+        a_q[0] = 10; // element 0: w=+1 -> value 2
+        a_q[32] = 20; // element 32: w=0 -> value 1
+        a_q[64] = 30; // element 64: w=-1 -> value 0
+        a_q[96] = 40; // element 96: w=+1 -> value 2
 
         let dot = vec_dot_i2_i8_s(&packed, &a_q, k);
-        // w values: 2,1,0,2 → unsigned dot: 2*10 + 1*20 + 0*30 + 2*40 = 20 + 20 + 0 + 80 = 120
+        // w values: 2,1,0,2 -> unsigned dot: 2*10 + 1*20 + 0*30 + 2*40 = 20 + 20 + 0 + 80 = 120
         assert_eq!(dot, 120, "i2s vec_dot expected 120, got {dot}");
     }
 
@@ -8878,13 +8878,13 @@ mod tests {
         let scale_bytes = 1.0f32.to_ne_bytes();
         b_quantized[total_packed..total_packed + 4].copy_from_slice(&scale_bytes);
 
-        // But weight values are {0,1,2} → ternary {-1,0,+1}
+        // But weight values are {0,1,2} -> ternary {-1,0,+1}
         // So w=2 means +1, w=1 means 0, w=0 means -1
-        // All zero bytes → w=0 → ternary -1. That's a problem for "identity".
+        // All zero bytes -> w=0 -> ternary -1. That's a problem for "identity".
         // The rescaling formula is: (raw - act_sum) / act_scale * w_scale
         //
         // For a cleaner test: use all w=1 (ternary 0) except the identity positions.
-        // w=1 → byte pattern where each 2-bit field is 01.
+        // w=1 -> byte pattern where each 2-bit field is 01.
         // 0b01_01_01_01 = 0x55
         b_quantized
             .iter_mut()
@@ -8905,8 +8905,8 @@ mod tests {
             .forward_b_transposed_i2s(&a, &b_quantized, &mut output, m, n, k)
             .unwrap();
 
-        // Row 0 has w=+1 at elem 0, w=0 everywhere else → dot product picks up a[0]=10.0
-        // Row 1 has w=+1 at elem 1, w=0 everywhere else → dot product picks up a[1]=20.0
+        // Row 0 has w=+1 at elem 0, w=0 everywhere else -> dot product picks up a[0]=10.0
+        // Row 1 has w=+1 at elem 1, w=0 everywhere else -> dot product picks up a[1]=20.0
         // After INT8 quantization + rescaling, values won't be exact but should be close
         assert!(
             (output[0] - 10.0).abs() < 1.0,
@@ -9122,7 +9122,7 @@ mod tests {
                 }
             }
             let i2s_us = start.elapsed().as_micros() as f64 / iters as f64;
-            eprintln!("({n},{k}) I2S-VNNI: {i2s_us:.0}μs/iter");
+            eprintln!("({n},{k}) I2S-VNNI: {i2s_us:.0}mus/iter");
         }
     }
 
@@ -9203,7 +9203,7 @@ pub type CudaMatMulQ4K = crate::cutile_quantized_gemm::CutileQuantizedGemm;
 
 // CutileQuantizedGemm handles Q4K, Q6K, TQ2, and I2S formats.  The Q4K path
 // dequantizes to f32 identically to CpuMatMulQ4K (same formula, provably
-// ≡ reference).  Q6K/TQ2/I2S use activation quantization paths with slightly
+// ??? reference).  Q6K/TQ2/I2S use activation quantization paths with slightly
 // looser bounds.  max_relative_error is the conservative multi-format ceiling.
 #[cfg(feature = "cuda")]
 impl crate::VerifiedEquivalent<CpuMatMulQ4K> for CudaMatMulQ4K {
@@ -9360,9 +9360,9 @@ mod test_q2_roundtrip {
     }
 }
 
-// ── Q2_0 base-4 LUT GEMV ─────────────────────────────────────────────────────
+// -- Q2_0 base-4 LUT GEMV -----------------------------------------------------
 //
-// Groups pairs of Q2_0 values into 4-bit indices (4²=16 entries per pair).
+// Groups pairs of Q2_0 values into 4-bit indices (4^2=16 entries per pair).
 // LUT precomputed from activation: lut[pair][idx] = (w0-1)*a[2j] + (w1-1)*a[2j+1]
 // Lookup via pshufb: one instruction handles 16-entry table for 32 rows.
 
@@ -9649,7 +9649,7 @@ pub unsafe fn q2_lut_gemv_tiled_avx2(
     for tile in tile_start..tile_end {
         let tile_off = tile * tile_data_size;
         let tile_rows = BM.min(n - tile * BM);
-        // 4 × __m256 f32 accumulators: rows 0..7, 8..15, 16..23, 24..31
+        // 4 x __m256 f32 accumulators: rows 0..7, 8..15, 16..23, 24..31
         let mut acc_f32 = [_mm256_setzero_ps(); 4];
 
         for blk in 0..blocks_per_row {
@@ -9691,7 +9691,7 @@ pub unsafe fn q2_lut_gemv_tiled_avx2(
             // Convert i16 accumulators to f32 and apply per-block scales
             // blk_lo has 16 i16 values for rows 0..15
             // blk_hi has 16 i16 values for rows 16..31
-            // Split each into 2 × 8 i32 → 2 × 8 f32
+            // Split each into 2 x 8 i32 -> 2 x 8 f32
             let lo_lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(blk_lo));
             let lo_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(blk_lo, 1));
             let hi_lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(blk_hi));
@@ -9724,7 +9724,7 @@ pub unsafe fn q2_lut_gemv_tiled_avx2(
 }
 
 #[cfg(target_arch = "x86_64")]
-/// Batched Q2Lut GEMM: multiple activation vectors × shared tiled weights.
+/// Batched Q2Lut GEMM: multiple activation vectors x shared tiled weights.
 /// Preprocesses Q2Lut for each of m tokens, then dispatches tiles across
 /// the persistent thread pool. Each tile processes all m tokens before the
 /// next tile, amortizing weight cache loads. Output: output[row * n + col].

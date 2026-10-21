@@ -1,4 +1,4 @@
-//! Verus-verified guided decoding invariants — unbounded proofs
+//! Verus-verified guided decoding invariants -- unbounded proofs
 //!
 //! Proves: JSON state machine has finite states, stack depth bounds,
 //! mask_logits only sets values to -inf (never reads OOB), and
@@ -24,7 +24,7 @@ proof fn json_state_finite(state: nat)
 }
 
 // ============================================================================
-// Stack depth: balanced brackets → stack depth bounded by nesting depth
+// Stack depth: balanced brackets -> stack depth bounded by nesting depth
 // ============================================================================
 
 proof fn stack_push_bounded(stack_depth: nat, max_depth: nat)

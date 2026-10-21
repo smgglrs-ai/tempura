@@ -1,4 +1,4 @@
-//! Verus-verified causal mask correctness — unbounded proofs
+//! Verus-verified causal mask correctness -- unbounded proofs
 //!
 //! Proves: causal masking prevents future token access, window masking
 //! restricts to a sliding window, and the valid range covers all

@@ -1,4 +1,4 @@
-//! Verus-verified RadixTree prefix cache invariants — unbounded proofs
+//! Verus-verified RadixTree prefix cache invariants -- unbounded proofs
 //!
 //! Proves: node_count >= 1, lookup matched_len <= input length,
 //! ref_count non-negative, tick monotonicity, eviction safety.
@@ -19,7 +19,7 @@ pub open spec fn well_formed(t: &RadixTreeState) -> bool {
 }
 
 // ============================================================================
-// Proof: new() — root node always exists, node_count >= 1
+// Proof: new() -- root node always exists, node_count >= 1
 // ============================================================================
 
 proof fn new_well_formed()

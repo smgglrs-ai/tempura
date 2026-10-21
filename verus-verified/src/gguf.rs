@@ -1,4 +1,4 @@
-//! Verus-verified GGUF dequantization proofs — unbounded
+//! Verus-verified GGUF dequantization proofs -- unbounded
 //!
 //! Proves GGUF header parsing, Q4_0/Q8_0 block layout, Q6K element coverage,
 //! and Q6K value reconstruction range.
@@ -28,7 +28,7 @@ proof fn gguf_header_parse_in_bounds(data_len: nat)
 }
 
 // ============================================================================
-// Proof: Q4_0 block access — block_start + 18 fits in total_bytes
+// Proof: Q4_0 block access -- block_start + 18 fits in total_bytes
 // ============================================================================
 
 proof fn gguf_dequant_q4_0_block_size(num_elements: nat, b: nat)
@@ -54,7 +54,7 @@ proof fn gguf_dequant_q4_0_block_size(num_elements: nat, b: nat)
 }
 
 // ============================================================================
-// Proof: Q8_0 block access — block_start + 34 fits in total_bytes
+// Proof: Q8_0 block access -- block_start + 34 fits in total_bytes
 // ============================================================================
 
 proof fn gguf_dequant_q8_0_block_size(num_elements: nat, b: nat)

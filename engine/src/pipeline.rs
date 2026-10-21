@@ -38,7 +38,7 @@ impl
         }
     }
 
-    /// Production CPU pipeline — same kernels as cpu_verified() today; diverges as
+    /// Production CPU pipeline -- same kernels as cpu_verified() today; diverges as
     /// ARM NEON/SVE and other native backends are added. Quantized matmul dispatch
     /// (Q4K, Q6K) uses AVX2/VNNI via CpuMatMulQ4KOpt, wired in forward_quantized.
     pub fn cpu_native() -> Self {
@@ -186,7 +186,7 @@ where
         Ok(())
     }
 
-    /// Fused RMSNorm + elementwise multiply, source → output.
+    /// Fused RMSNorm + elementwise multiply, source -> output.
     /// Reads from `x`, writes to `out` without an intermediate copy.
     pub fn rmsnorm_into(
         &self,
@@ -243,7 +243,7 @@ where
         self.matmul.forward(a, b, output, m, n, k)
     }
 
-    /// Matrix multiply with B transposed: output = a × bᵀ
+    /// Matrix multiply with B transposed: output = a x b???
     /// b is [n, k] row-major (PyTorch Linear weight convention)
     pub fn matmul_bt(
         &self,

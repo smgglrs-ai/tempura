@@ -35,7 +35,7 @@ pub mod kernels {
     /// Shapes: z: [M, N], x: [M, K], y: [N, K]
     /// Tile dimensions: BM, BN, BK; K must be divisible by BK.
     /// GEMM with B transposed: z = x @ y^T
-    /// Accumulator starts at 0 in registers — caller need NOT pre-zero z.
+    /// Accumulator starts at 0 in registers -- caller need NOT pre-zero z.
     #[cutile::entry()]
     pub fn cutile_gemm_b_transposed<const BM: i32, const BN: i32, const BK: i32, const K: i32>(
         z: &mut Tensor<f32, { [BM, BN] }>,
@@ -46,7 +46,7 @@ pub mod kernels {
         let part_y = y.partition(shape![BN, BK]);
         let pid_m = program_id(0);
         let pid_n = program_id(1);
-        // Zero accumulator in registers — no memory load, no pre-zero of z required.
+        // Zero accumulator in registers -- no memory load, no pre-zero of z required.
         let mut tile_z: Tile<f32, { [BM, BN] }> = broadcast_scalar(0.0f32, shape![BM, BN]);
         for i in 0i32..(K / BK) {
             let tile_x = part_x.load([pid_m, i]);
@@ -56,7 +56,7 @@ pub mod kernels {
         z.store(tile_z);
     }
 
-    /// GEMV: z[N_BLOCK] = x[0, 0..K] · y[pid_n*N_BLOCK..(pid_n+1)*N_BLOCK, 0..K]
+    /// GEMV: z[N_BLOCK] = x[0, 0..K] * y[pid_n*N_BLOCK..(pid_n+1)*N_BLOCK, 0..K]
     ///
     /// Replaces the BM=1 GEMM path for M=1 (decode) with an element-wise
     /// multiply + reduce_sum pattern that maps efficiently to GPU vector units
@@ -66,10 +66,10 @@ pub mod kernels {
     /// row (only row 0 is read), y: [N, K] weight matrix (B-transposed layout).
     /// K must be divisible by BK.
     ///
-    /// Grid: (ceil(N / N_BLOCK), 1, 1) — one block per output tile.
+    /// Grid: (ceil(N / N_BLOCK), 1, 1) -- one block per output tile.
     ///
     /// Throughput: for N=2560, K=4096, N_BLOCK=64, BK=64 this launches 40 blocks
-    /// each doing 64 iterations of a [64×64] element multiply + reduce_sum,
+    /// each doing 64 iterations of a [64x64] element multiply + reduce_sum,
     /// fully utilizing warp-level vector lanes instead of the ~1.8 GFLOPS
     /// scalar fallback from the MMA BM=1 path.
     #[cutile::entry()]
@@ -81,7 +81,7 @@ pub mod kernels {
         let pid_n = program_id(0);
         // Partition x as [1, BK] tiles (only row 0 is the activation).
         let part_x = x.partition(shape![1, BK]);
-        // Partition weight as [N_BLOCK, BK] tiles — one N-slice per block.
+        // Partition weight as [N_BLOCK, BK] tiles -- one N-slice per block.
         let part_y = y.partition(shape![N_BLOCK, BK]);
         // Accumulate element-wise products in [N_BLOCK, BK] space across all K
         // tiles, then reduce once at the end.  Keeping the accumulator in 2-D
@@ -95,18 +95,18 @@ pub mod kernels {
             let tile_x_bc: Tile<f32, { [N_BLOCK, BK] }> = tile_x.broadcast(shape![N_BLOCK, BK]);
             // Load [N_BLOCK, BK] weight tile.
             let tile_y: Tile<f32, { [N_BLOCK, BK] }> = part_y.load([pid_n, i]);
-            // Element-wise multiply and accumulate — same type throughout.
+            // Element-wise multiply and accumulate -- same type throughout.
             acc = acc + tile_y * tile_x_bc;
         }
-        // Reduce BK dimension → [N_BLOCK] after all K tiles are processed.
+        // Reduce BK dimension -> [N_BLOCK] after all K tiles are processed.
         let result: Tile<f32, { [N_BLOCK] }> = reduce_sum(acc, 1i32);
         z.store(result);
     }
 
-    /// Coalesced GEMV: z[n] = x[0, 0..K] · y[n, 0..K]
+    /// Coalesced GEMV: z[n] = x[0, 0..K] * y[n, 0..K]
     ///
     /// One program per output element (grid = N). Each program loads
-    /// y[pid_n, i*BK:(i+1)*BK] — a contiguous BK-element slice from a single
+    /// y[pid_n, i*BK:(i+1)*BK] -- a contiguous BK-element slice from a single
     /// row of the weight matrix. This eliminates the strided access pattern of
     /// `cutile_gemv` which loaded [N_BLOCK, BK] tiles with N_BLOCK rows
     /// simultaneously (stride K between consecutive rows in row-major storage).
@@ -114,7 +114,7 @@ pub mod kernels {
     /// Shapes: z: [1] per program, x: [1, K] activation, y: [N, K] weights.
     /// K must be divisible by BK.
     ///
-    /// Grid: (N, 1, 1) — one program per output neuron.
+    /// Grid: (N, 1, 1) -- one program per output neuron.
     ///
     /// Access pattern: part_y.load([pid_n, i]) loads y[pid_n, i*BK:(i+1)*BK],
     /// which is BK contiguous floats in one row. Fully coalesced at 1.79 TB/s.
@@ -129,14 +129,14 @@ pub mod kernels {
         let part_y = y.partition(shape![1, BK]);
         let mut acc: Tile<f32, { [1, BK] }> = broadcast_scalar(0.0f32, shape![1, BK]);
         for i in 0i32..(K / BK) {
-            // Load BK elements from activation row 0 — same for all programs.
+            // Load BK elements from activation row 0 -- same for all programs.
             let tile_x: Tile<f32, { [1, BK] }> = part_x.load([0i32, i]);
             // Load BK contiguous elements from row pid_n of the weight matrix.
             // y[pid_n, i*BK:(i+1)*BK] is a contiguous slice in row-major storage.
             let tile_y: Tile<f32, { [1, BK] }> = part_y.load([pid_n, i]);
             acc = acc + tile_y * tile_x;
         }
-        // Reduce [1, BK] → [1] by collapsing the BK dimension.
+        // Reduce [1, BK] -> [1] by collapsing the BK dimension.
         let result: Tile<f32, { [1] }> = reduce_sum(acc, 1i32);
         z.store(result);
     }
@@ -181,7 +181,7 @@ const BM: usize = 64;
 const BN: usize = 64;
 const BK: usize = 16;
 
-/// Round up to the next power-of-2 ≥ x. Required: cuTile JIT on sm_120
+/// Round up to the next power-of-2 >= x. Required: cuTile JIT on sm_120
 /// rejects non-power-of-2 K const generics in MMA-accumulation loops.
 fn next_pow2(x: usize) -> usize {
     if x <= 1 {
@@ -200,7 +200,7 @@ const BK_GEMV: usize = 64;
 // Coalesced GEMV path (m == 1): one program per output element, BK=128 for
 // maximum PCIe / HBM bus utilisation (512 bytes per load = 4 cache lines).
 // Requires k_pad % BK_GEMV_COALESCED == 0; fall back to forward_gemv_d2d_into
-// for shapes where this is not satisfied (uncommon in practice: K ≥ 128 always
+// for shapes where this is not satisfied (uncommon in practice: K >= 128 always
 // holds for real LLMs).
 const BK_GEMV_COALESCED: usize = 128;
 
@@ -473,7 +473,7 @@ impl CutileMatMul {
 }
 
 impl CutileMatMul {
-    /// Both A and B are already on device — no host-to-device upload needed.
+    /// Both A and B are already on device -- no host-to-device upload needed.
     ///
     /// A: [M, K] on device, B: [N, K] on device (B-transposed layout).
     /// Writes [M, N] result to `output` on the host.
@@ -516,7 +516,7 @@ impl CutileMatMul {
         Ok(())
     }
 
-    /// A on host, B already on device — only A is uploaded.
+    /// A on host, B already on device -- only A is uploaded.
     ///
     /// A: [M, K] on host, B: [N, K] on device (B-transposed layout).
     /// Writes [M, N] result to `output` on the host.
@@ -618,7 +618,7 @@ impl CutileMatMul {
         let a_vec: Arc<Vec<f32>> = if k_pad == k {
             Arc::new(a.to_vec())
         } else {
-            // Pad activation to [1, k_pad] — row 0 is the only row.
+            // Pad activation to [1, k_pad] -- row 0 is the only row.
             let mut padded = vec![0.0f32; k_pad];
             padded[..k].copy_from_slice(a);
             Arc::new(padded)
@@ -694,9 +694,9 @@ impl CutileMatMul {
 
     /// Device-to-device GEMM reusing a caller-supplied pre-allocated output buffer.
     ///
-    /// `out` must contain exactly m×n elements (typically pre-allocated as a 1-D
+    /// `out` must contain exactly mxn elements (typically pre-allocated as a 1-D
     /// tensor via `api::zeros::<f32>(&[n])`). It is zeroed in-place then reshaped
-    /// to `[m, n]` — no new device allocation is made. Returns the filled tensor
+    /// to `[m, n]` -- no new device allocation is made. Returns the filled tensor
     /// as an `Arc` so the caller can store a clone in a scratch pool and later
     /// reclaim the underlying `Tensor<f32>` via `Arc::try_unwrap` once its
     /// reference count drops to one.
@@ -711,7 +711,7 @@ impl CutileMatMul {
     ) -> Result<Arc<Tensor<f32>>> {
         let stream = &self.stream;
 
-        // Kernel initializes accumulator to 0 in registers — no fill needed.
+        // Kernel initializes accumulator to 0 in registers -- no fill needed.
         let z = out
             .reshape(&[m, n])
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
@@ -738,7 +738,7 @@ impl CutileMatMul {
 
     /// Non-blocking variant of `forward_bt_d2d_into`.
     ///
-    /// Enqueues the GEMM kernel on the stream and returns immediately — the GPU
+    /// Enqueues the GEMM kernel on the stream and returns immediately -- the GPU
     /// may still be writing to the output tensor when this function returns.
     /// The caller MUST call `sync_stream()` before reading the result on the CPU.
     ///
@@ -804,7 +804,7 @@ impl CutileMatMul {
     /// Full device-to-device: A and B on device, output stays on device.
     ///
     /// A: [M, K] on device, B: [N, K] on device (B-transposed layout).
-    /// Returns [M, N] tensor on device — no host round-trip.
+    /// Returns [M, N] tensor on device -- no host round-trip.
     pub fn forward_bt_device_to_device(
         &self,
         a: &Arc<Tensor<f32>>,
@@ -846,10 +846,10 @@ impl CutileMatMul {
     ///
     /// A: [1, K_pad] on device (single activation row), B: [N, K_pad] on device
     /// (B-transposed weight layout). K_pad must be divisible by BK_GEMV (64).
-    /// Returns a [N] tensor on device — no host round-trip.
+    /// Returns a [N] tensor on device -- no host round-trip.
     ///
     /// Uses `cutile_gemv` instead of `cutile_gemm_b_transposed` to avoid the
-    /// ~500× slowdown from hardware MMA rejecting BM=1 tiles and falling back
+    /// ~500x slowdown from hardware MMA rejecting BM=1 tiles and falling back
     /// to scalar FMA.
     pub fn forward_gemv_device_to_device(
         &self,
@@ -893,7 +893,7 @@ impl CutileMatMul {
     ///
     /// Analogous to `forward_bt_d2d_into` but for the M=1 GEMV path.  `out`
     /// must hold at least `n` f32 elements (pre-allocated as a 1-D tensor via
-    /// `api::zeros::<f32>(&[n])`).  It is reshaped to `[n]` in-place — no new
+    /// `api::zeros::<f32>(&[n])`).  It is reshaped to `[n]` in-place -- no new
     /// device allocation is made.  Returns the filled tensor as an `Arc` so the
     /// caller can store a clone in a scratch pool.
     ///
@@ -912,7 +912,7 @@ impl CutileMatMul {
         );
         let stream = &self.stream;
 
-        // Kernel initialises its accumulator to 0 in registers — the output
+        // Kernel initialises its accumulator to 0 in registers -- the output
         // tensor does not need to be zeroed first.
         let z = out
             .reshape(&[n])
@@ -938,7 +938,7 @@ impl CutileMatMul {
         Ok(Arc::new(out))
     }
 
-    /// Coalesced device-to-device GEMV — fresh output allocation.
+    /// Coalesced device-to-device GEMV -- fresh output allocation.
     ///
     /// One program per output element (grid N). Each program loads BK=128
     /// contiguous elements from one row of y, eliminating the N_BLOCK-row

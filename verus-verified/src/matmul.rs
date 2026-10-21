@@ -1,4 +1,4 @@
-//! Verus-verified matrix multiply indexing — unbounded proofs
+//! Verus-verified matrix multiply indexing -- unbounded proofs
 //!
 //! Proves standard GEMM indexing (A[i,p], B[p,j], O[i,j]) and tiled
 //! GEMM shared memory indexing for any valid matrix dimensions.
@@ -43,7 +43,7 @@ proof fn matmul_indices_in_bounds(
 }
 
 // ============================================================================
-// Proof: tiled GEMM — shared memory index ty*TILE+tx < TILE*TILE,
+// Proof: tiled GEMM -- shared memory index ty*TILE+tx < TILE*TILE,
 // and global indices row*n+col < m*n when row<m, col<n
 // ============================================================================
 

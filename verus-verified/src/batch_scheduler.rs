@@ -1,4 +1,4 @@
-//! Verus-verified BatchScheduler invariants — unbounded proofs
+//! Verus-verified BatchScheduler invariants -- unbounded proofs
 //!
 //! Proves slot accounting (allocated <= num_slots), request conservation
 //! (no silent drops), and preemption correctness.
@@ -59,7 +59,7 @@ proof fn submit_preserves(s: BatchSchedulerState)
 }
 
 // ============================================================================
-// Proof: admit moves pending→active, allocates slot, total unchanged
+// Proof: admit moves pending->active, allocates slot, total unchanged
 // ============================================================================
 
 proof fn admit_one_preserves(s: BatchSchedulerState)
@@ -103,7 +103,7 @@ proof fn complete_preserves(s: BatchSchedulerState)
 }
 
 // ============================================================================
-// Proof: preemption moves active→preempted, releases slot, total unchanged
+// Proof: preemption moves active->preempted, releases slot, total unchanged
 // ============================================================================
 
 proof fn preempt_preserves(s: BatchSchedulerState)
@@ -167,7 +167,7 @@ proof fn slot_indices_in_bounds(num_slots: nat, idx: nat)
 }
 
 // ============================================================================
-// Proof: no double allocation — allocating a free slot keeps count valid
+// Proof: no double allocation -- allocating a free slot keeps count valid
 // ============================================================================
 
 proof fn slot_no_double_alloc(allocated: nat, num_slots: nat)

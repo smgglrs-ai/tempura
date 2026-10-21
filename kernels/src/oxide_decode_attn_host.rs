@@ -2,7 +2,7 @@
 ///
 /// Unlike `CutileFlashAttention::decode_attention_device_scratch`, this accepts
 /// `kv_len_dev` as a device tensor whose VALUE is read at kernel execution time.
-/// The POINTER is baked into the CUDA graph at capture; the value is updated H→D
+/// The POINTER is baked into the CUDA graph at capture; the value is updated H->D
 /// each step. This eliminates the stale-kv_len problem.
 use std::sync::Arc;
 
@@ -58,7 +58,7 @@ impl OxideDecodeAttn {
             )));
         }
 
-        // Try to load the K-parallel variant (optional — falls back to single-warp).
+        // Try to load the K-parallel variant (optional -- falls back to single-warp).
         let kpar_name = std::ffi::CString::new(KERNEL_KPAR_NAME).unwrap();
         let mut cu_function_kpar = std::ptr::null_mut::<cuda_core::sys::CUfunc_st>();
         let kpar_rc = unsafe {
@@ -82,10 +82,10 @@ impl OxideDecodeAttn {
     /// Run decode attention with kv_len read from a device tensor at execution time.
     ///
     /// `kv_len_dev` must be a 1-element i32 (or f32 bit-encoded i32) device tensor.
-    /// The engine writes the current step's kv_len H→D before each graph replay.
+    /// The engine writes the current step's kv_len H->D before each graph replay.
     pub fn forward_d2d(
         &self,
-        out:        &Arc<Tensor<f32>>,   // [n_heads * head_dim] — written in-place
+        out:        &Arc<Tensor<f32>>,   // [n_heads * head_dim] -- written in-place
         q:          &Arc<Tensor<f32>>,   // [n_heads * head_dim]
         k_cache:    &Arc<Tensor<f32>>,   // [gpu_max_seq_len * kv_dim]
         v_cache:    &Arc<Tensor<f32>>,   // [gpu_max_seq_len * kv_dim]
@@ -219,7 +219,7 @@ impl OxideDecodeAttn {
     /// Batched decode attention: one block per (request, head) pair.
     ///
     /// `k_cache_ptrs` and `v_cache_ptrs` are CUdeviceptr values (device pointers
-    /// to each request's KV cache) stored in host Vecs — uploaded to device as a
+    /// to each request's KV cache) stored in host Vecs -- uploaded to device as a
     /// small array before the kernel launch.
     pub fn forward_batch_d2d(
         &self,
@@ -241,7 +241,7 @@ impl OxideDecodeAttn {
         };
         let batch_size = kv_lens.len();
 
-        // Upload pointer arrays to device (tiny H→D, ~8 × batch_size bytes each).
+        // Upload pointer arrays to device (tiny H->D, ~8 x batch_size bytes each).
         let stream = self.stream.cu_stream();
         let k_ptrs_dev = unsafe {
             let mut dev_ptr: u64 = 0;
@@ -348,7 +348,7 @@ impl OxideDecodeAttn {
         Ok(())
     }
 
-    /// Elementwise SiLU(gate) * up — fully on GPU, no PCIe traffic.
+    /// Elementwise SiLU(gate) * up -- fully on GPU, no PCIe traffic.
     /// `n` = batch_size * inter_pad (total elements).
     pub fn silu_mul_d2d(
         &self,

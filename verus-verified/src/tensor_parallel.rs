@@ -1,4 +1,4 @@
-//! Verus-verified tensor parallelism invariants — unbounded proofs
+//! Verus-verified tensor parallelism invariants -- unbounded proofs
 //!
 //! Proves: sharded dimensions are valid, allreduce input/output sizes match,
 //! each shard processes a disjoint slice of the weight matrix.
@@ -8,7 +8,7 @@ use vstd::prelude::*;
 verus! {
 
 // ============================================================================
-// Column parallel: weight[hidden_size × shard_dim], shard_dim = out_dim / tp_size
+// Column parallel: weight[hidden_size x shard_dim], shard_dim = out_dim / tp_size
 // ============================================================================
 
 proof fn column_parallel_shard(
@@ -39,7 +39,7 @@ proof fn column_parallel_shard(
 }
 
 // ============================================================================
-// Row parallel: weight[shard_dim × hidden_size], input split across tp ranks
+// Row parallel: weight[shard_dim x hidden_size], input split across tp ranks
 // ============================================================================
 
 proof fn row_parallel_shard(
@@ -69,7 +69,7 @@ proof fn row_parallel_shard(
 }
 
 // ============================================================================
-// Shards are disjoint: rank1 != rank2 → shard ranges don't overlap
+// Shards are disjoint: rank1 != rank2 -> shard ranges don't overlap
 // ============================================================================
 
 proof fn shards_disjoint(

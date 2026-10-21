@@ -1,4 +1,4 @@
-//! Verus-verified trace system invariants — unbounded proofs
+//! Verus-verified trace system invariants -- unbounded proofs
 //!
 //! Proves: TraceLevel ordering, layer snapshot count bounds, trace metadata.
 
@@ -101,7 +101,7 @@ proof fn sampling_steps_bounded(
 }
 
 // ============================================================================
-// Proof: speculative steps — accepted + rejected == proposed for each step
+// Proof: speculative steps -- accepted + rejected == proposed for each step
 // ============================================================================
 
 proof fn speculative_step_accounting(

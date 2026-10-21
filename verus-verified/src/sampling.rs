@@ -1,4 +1,4 @@
-//! Verus-verified sampling indexing — unbounded proofs
+//! Verus-verified sampling indexing -- unbounded proofs
 
 use vstd::prelude::*;
 

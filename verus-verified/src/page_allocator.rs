@@ -1,4 +1,4 @@
-//! Verus-verified PageAllocator conservation — unbounded proofs
+//! Verus-verified PageAllocator conservation -- unbounded proofs
 //!
 //! Proves the resource conservation law: available + in_use == total_pages,
 //! preserved across new(), allocate(), and free() operations.
@@ -26,7 +26,7 @@ pub open spec fn in_use(alloc: &PageAllocatorState) -> nat {
 }
 
 // ============================================================================
-// Proof: new(total_pages) — all pages free, conservation holds
+// Proof: new(total_pages) -- all pages free, conservation holds
 // ============================================================================
 
 proof fn new_is_well_formed(total_pages: nat)
@@ -41,7 +41,7 @@ proof fn new_is_well_formed(total_pages: nat)
 }
 
 // ============================================================================
-// Proof: allocate() — conservation preserved, in_use increases by 1
+// Proof: allocate() -- conservation preserved, in_use increases by 1
 // ============================================================================
 
 proof fn allocate_preserves_conservation(alloc: PageAllocatorState)
@@ -62,7 +62,7 @@ proof fn allocate_preserves_conservation(alloc: PageAllocatorState)
 }
 
 // ============================================================================
-// Proof: free() — conservation preserved, in_use decreases by 1
+// Proof: free() -- conservation preserved, in_use decreases by 1
 // ============================================================================
 
 proof fn free_preserves_conservation(alloc: PageAllocatorState)

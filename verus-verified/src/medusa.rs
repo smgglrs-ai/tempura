@@ -1,4 +1,4 @@
-//! Verus-verified Multi-token (Medusa) predictor invariants — unbounded proofs
+//! Verus-verified Multi-token (Medusa) predictor invariants -- unbounded proofs
 //!
 //! Proves: weight indexing safety, draft count matches heads, acceptance bounds.
 

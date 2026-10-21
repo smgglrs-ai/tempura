@@ -1,4 +1,4 @@
-//! Verus-verified config validation — unbounded proofs
+//! Verus-verified config validation -- unbounded proofs
 //!
 //! Proves: ModelConfig presets satisfy all dimensional constraints,
 //! from_hf_json derived head_dim is correct, tensor parallel splits evenly.

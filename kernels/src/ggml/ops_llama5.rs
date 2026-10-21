@@ -3,7 +3,7 @@
 //!
 //! Sources: ggml/src/ggml-cpu/ops.cpp
 
-// ─── sum_f16 / sum_bf16 ──────────────────────────────────────────────────────
+// --- sum_f16 / sum_bf16 ------------------------------------------------------
 // ops.cpp lines 1316-1380
 
 /// Translation of `ggml_compute_forward_sum_f16`.
@@ -45,7 +45,7 @@ pub fn sum_bf16(
             for i01 in 0..ne01 {
                 let base = (i01 * nb01 + i02 * nb02 + i03 * nb03) / 2;
                 for i00 in 0..ne00 {
-                    // bf16 → f32: shift bits left 16
+                    // bf16 -> f32: shift bits left 16
                     let bits = (src[base + i00] as u32) << 16;
                     sum += f32::from_bits(bits);
                 }
@@ -55,15 +55,15 @@ pub fn sum_bf16(
     sum
 }
 
-// ─── repeat_f16 ──────────────────────────────────────────────────────────────
+// --- repeat_f16 --------------------------------------------------------------
 // ops.cpp lines 1742-1787
 
 /// Translation of `ggml_compute_forward_repeat_f16`.
-/// Tiles src (ne00×ne01×ne02×ne03) into dst (ne0×ne1×ne2×ne3).
+/// Tiles src (ne00xne01xne02xne03) into dst (ne0xne1xne2xne3).
 /// Both are contiguous with element size 2 bytes.
 /// Thread 0 only; not parallelised in the original either.
 pub fn repeat_f16(
-    src: &[u16],    // f16/bf16/i16 bits — treated as opaque 16-bit
+    src: &[u16],    // f16/bf16/i16 bits -- treated as opaque 16-bit
     dst: &mut [u16],
     ne00: usize, ne01: usize, ne02: usize, ne03: usize,
     ne0:  usize, ne1:  usize, ne2:  usize, ne3:  usize,
@@ -97,7 +97,7 @@ pub fn repeat_f16(
     }
 }
 
-// ─── concat_f16 / concat_any ─────────────────────────────────────────────────
+// --- concat_f16 / concat_any -------------------------------------------------
 // ops.cpp lines 1899-2035
 
 /// Translation of `ggml_compute_forward_concat_f16`.
@@ -152,7 +152,7 @@ pub fn concat_f16(
     let _ = (ne3, ne1, ne0);
 }
 
-// ─── set_f32 / set_i32 ───────────────────────────────────────────────────────
+// --- set_f32 / set_i32 -------------------------------------------------------
 // ops.cpp lines 4769-4909
 
 /// Translation of `ggml_compute_forward_set_f32`.
@@ -210,14 +210,14 @@ pub fn set_i32(
     }
 }
 
-// ─── get_rows_f16 / get_rows_bf16 / get_rows_q ───────────────────────────────
+// --- get_rows_f16 / get_rows_bf16 / get_rows_q -------------------------------
 // ops.cpp lines 4979-5120
 
 /// Translation of `ggml_compute_forward_get_rows_f16`.
-/// For each index in src1, copies the corresponding f16 row from src0 → dst as f32.
+/// For each index in src1, copies the corresponding f16 row from src0 -> dst as f32.
 pub fn get_rows_f16(
-    src0: &[u16], // f16 weights [ne01 × ne00] (+batch dims)
-    src1: &[i32], // row indices [ne10 × ne11 × ne12]
+    src0: &[u16], // f16 weights [ne01 x ne00] (+batch dims)
+    src1: &[i32], // row indices [ne10 x ne11 x ne12]
     dst: &mut [f32],
     ne00: usize, ne01: usize,
     ne10: usize, ne11: usize, ne12: usize,
@@ -278,7 +278,7 @@ pub fn get_rows_bf16(
     let _ = ne00;
 }
 
-// ─── pad_f32 ─────────────────────────────────────────────────────────────────
+// --- pad_f32 -----------------------------------------------------------------
 // ops.cpp lines 8196-8258 (non-circular variant)
 
 /// Translation of `ggml_compute_forward_pad_f32<false>` (zero-padding).
@@ -359,7 +359,7 @@ pub fn pad_circular_f32(
     }
 }
 
-// ─── roll_f32 ────────────────────────────────────────────────────────────────
+// --- roll_f32 ----------------------------------------------------------------
 // ops.cpp lines 8328-8363
 
 /// Translation of `ggml_compute_forward_roll_f32`.
@@ -403,7 +403,7 @@ pub fn roll_f32(
     let _ = (ne0, ne3, s3);
 }
 
-// ─── argsort_f32 ─────────────────────────────────────────────────────────────
+// --- argsort_f32 -------------------------------------------------------------
 // ops.cpp lines 8489-8545
 
 /// Translation of `ggml_compute_forward_argsort_f32`.
@@ -442,7 +442,7 @@ pub fn argsort_f32(
     }
 }
 
-// ─── top_k_f32 ───────────────────────────────────────────────────────────────
+// --- top_k_f32 ---------------------------------------------------------------
 // ops.cpp lines 8557-8594
 
 /// Translation of `ggml_compute_forward_top_k_f32`.
@@ -477,13 +477,13 @@ pub fn top_k_f32(
     }
 }
 
-// ─── get_rel_pos_f16 ─────────────────────────────────────────────────────────
+// --- get_rel_pos_f16 ---------------------------------------------------------
 // ops.cpp lines 10285-10308
 
 /// Translation of `ggml_compute_forward_get_rel_pos_f16`.
 /// Used by SAM image encoder for relative positional embeddings.
-/// src0: [ne00, ne_src0] — the position embedding table
-/// dst:  [ne0, ne1, ne2] — relative position output
+/// src0: [ne00, ne_src0] -- the position embedding table
+/// dst:  [ne0, ne1, ne2] -- relative position output
 pub fn get_rel_pos_f16(
     src0: &[u16], // f16 bits
     dst: &mut [u16],
@@ -501,7 +501,7 @@ pub fn get_rel_pos_f16(
     }
 }
 
-// ─── pad_reflect_1d_f32 ──────────────────────────────────────────────────────
+// --- pad_reflect_1d_f32 ------------------------------------------------------
 // ops.cpp lines 8284-8315
 
 /// Translation of `ggml_compute_forward_pad_reflect_1d`.

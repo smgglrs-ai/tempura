@@ -1,4 +1,4 @@
-//! Verus-verified GQA (Grouped Query Attention) head mapping — unbounded proofs
+//! Verus-verified GQA (Grouped Query Attention) head mapping -- unbounded proofs
 //!
 //! Proves the core GQA correctness property: for every query head h,
 //! the KV head h_kv = h / (num_heads / num_kv_heads) is valid (< num_kv_heads).
@@ -9,7 +9,7 @@ use vstd::prelude::*;
 verus! {
 
 // ============================================================================
-// Proof: GQA head mapping — every query head maps to a valid KV head
+// Proof: GQA head mapping -- every query head maps to a valid KV head
 // ============================================================================
 
 proof fn gqa_head_mapping_valid(
@@ -123,7 +123,7 @@ proof fn same_group_same_kv(
 }
 
 // ============================================================================
-// Proof: KV buffer size with GQA — num_kv_heads * head_dim (not num_heads * head_dim)
+// Proof: KV buffer size with GQA -- num_kv_heads * head_dim (not num_heads * head_dim)
 // ============================================================================
 
 proof fn gqa_kv_buffer_size(

@@ -12,13 +12,15 @@ toc = true
 
 1. **Kernel traits as the verification contract.** Engine code is generic over kernel implementations. The same trait is implemented by CPU (for verification) and GPU (for production). Kani proves both adhere to the contract.
 
-2. **Three-layer verification.** Kani proves safety (no panics, no OOB). DualPipeline validates numerical equivalence. Property tests cover mathematical properties Kani can't handle.
+2. **Tiered verification.** Kani proves safety (no panics, no OOB) on bounded instances. Verus proves properties for all inputs via SMT (struct invariants, loop termination, state machines). DualPipeline validates numerical equivalence. Property tests cover floating-point properties neither tool can handle.
 
 3. **Inference traces are first-class.** Every forward pass produces a structured `InferenceTrace` at configurable granularity. Traces are queryable, diffable, and replayable.
 
 4. **Deterministic by design.** Seeded RNG, controlled reduction order. Same input + seed = bit-identical output.
 
 ## Crate ecosystem
+
+Four crates in the main workspace, plus a standalone verification crate:
 
 ### tempura-kernel-api
 

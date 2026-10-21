@@ -3,13 +3,13 @@
 //! translation.
 //!
 //! Translated functions (all x86_64):
-//!   rwkv_wkv6_f32_avx      — ops.cpp line 10450 (#if AVX && !AVX512F)
-//!   rwkv_wkv6_f32_avx512   — ops.cpp line 10458 (#elif AVX512F)
-//!   gla_f32_avx            — ops.cpp line 10662 (#if AVX && !AVX512F)
-//!   gla_f32_avx512         — ops.cpp line 10670 (#elif AVX512F)
-//!   rwkv_wkv7_f32_avx2     — ops.cpp line 11496 (#else branch of GGML_SIMD
+//!   rwkv_wkv6_f32_avx      -- ops.cpp line 10450 (#if AVX && !AVX512F)
+//!   rwkv_wkv6_f32_avx512   -- ops.cpp line 10458 (#elif AVX512F)
+//!   gla_f32_avx            -- ops.cpp line 10662 (#if AVX && !AVX512F)
+//!   gla_f32_avx512         -- ops.cpp line 10670 (#elif AVX512F)
+//!   rwkv_wkv7_f32_avx2     -- ops.cpp line 11496 (#else branch of GGML_SIMD
 //!                             with GGML_F32_VEC=__m256, ARR=4, EPR=8, STEP=32)
-//!   rwkv_wkv7_f32_avx512   — ops.cpp line 11496, GGML_F32_VEC=__m512,
+//!   rwkv_wkv7_f32_avx512   -- ops.cpp line 11496, GGML_F32_VEC=__m512,
 //!                             ARR=4, EPR=16, STEP=64
 //!
 //! Scalar dispatch wrappers at the bottom select the appropriate path at
@@ -19,9 +19,9 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(dead_code)]
 
-// ─── rwkv_wkv6 SIMD paths ────────────────────────────────────────────────────
+// --- rwkv_wkv6 SIMD paths ----------------------------------------------------
 //
-// ops.cpp lines 10450–10601.
+// ops.cpp lines 10450-10601.
 //
 // The #if-AVX / #elif-AVX512F blocks share identical structure; only the
 // vector width (8 vs 16 floats per register) differs.
@@ -229,9 +229,9 @@ pub unsafe fn rwkv_wkv6_f32_avx512(
     }
 }
 
-// ─── gla SIMD paths ──────────────────────────────────────────────────────────
+// --- gla SIMD paths ----------------------------------------------------------
 //
-// ops.cpp lines 10662–10802.
+// ops.cpp lines 10662-10802.
 //
 // The GLA kernel is structurally identical to wkv6 except:
 //   - inputs are k, v, q, g  (no time_faaaa / time_decay)
@@ -433,9 +433,9 @@ pub unsafe fn gla_f32_avx512(
     }
 }
 
-// ─── rwkv_wkv7 SIMD paths ────────────────────────────────────────────────────
+// --- rwkv_wkv7 SIMD paths ----------------------------------------------------
 //
-// ops.cpp lines 11496–11573  (#else branch when GGML_SIMD is defined and not
+// ops.cpp lines 11496-11573  (#else branch when GGML_SIMD is defined and not
 // SVE/RVV).
 //
 // The C++ code uses the generic GGML_F32_VEC abstraction.  We translate two
@@ -464,7 +464,7 @@ unsafe fn hsum_avx(v: std::arch::x86_64::__m256) -> f32 {
     _mm_cvtss_f32(_mm_hadd_ps(t1, t1))
 }
 
-/// AVX2 (4×8-wide) path for `ggml_compute_forward_rwkv_wkv7_f32`.
+/// AVX2 (4x8-wide) path for `ggml_compute_forward_rwkv_wkv7_f32`.
 /// ops.cpp line 11496.  Instantiates GGML_F32_VEC = __m256 with ARR=4,
 /// EPR=8, STEP=32.
 #[cfg(target_arch = "x86_64")]
@@ -603,7 +603,7 @@ unsafe fn hsum_avx512(v: std::arch::x86_64::__m512) -> f32 {
     _mm512_reduce_add_ps(v)
 }
 
-/// AVX-512F (4×16-wide) path for `ggml_compute_forward_rwkv_wkv7_f32`.
+/// AVX-512F (4x16-wide) path for `ggml_compute_forward_rwkv_wkv7_f32`.
 /// Same structure as `rwkv_wkv7_f32_avx2` but with 512-bit registers.
 /// ARR=4, EPR=16, STEP=64.
 #[cfg(target_arch = "x86_64")]
@@ -723,7 +723,7 @@ pub unsafe fn rwkv_wkv7_f32_avx512(
     }
 }
 
-// ─── Runtime dispatch ────────────────────────────────────────────────────────
+// --- Runtime dispatch --------------------------------------------------------
 //
 // These wrappers are called from the scalar dispatch in ops_llama4.rs.  They
 // select the widest SIMD path available at runtime and fall back to the scalar

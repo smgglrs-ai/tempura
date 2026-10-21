@@ -124,8 +124,8 @@ impl DualPipelineRunner {
     /// Compare two `MatMulQ` implementations on Q4K workloads.
     ///
     /// `rel_tol` is the maximum permissible relative error between outputs.
-    /// Use 0.02 (2%) for CPU ref ↔ SIMD opt (CpuMatMulQ4KOpt): Q8 activation quantization error.
-    /// Use 0.001 (0.1%) for CPU ref ↔ GPU (CutileQuantizedGemm): reduction-order rounding only;
+    /// Use 0.02 (2%) for CPU ref ??? SIMD opt (CpuMatMulQ4KOpt): Q8 activation quantization error.
+    /// Use 0.001 (0.1%) for CPU ref ??? GPU (CutileQuantizedGemm): reduction-order rounding only;
     /// the Verus-proven formal bound is 0.01% (max_relative_error = 0.0001).
     pub fn compare_q4k(
         &self,
@@ -154,8 +154,8 @@ impl DualPipelineRunner {
     }
 
     /// Compare two `MatMulQ` implementations on Q6K matmuls.
-    /// Uses 1% relative tolerance — Q6K's i16 activation quantization is
-    /// 256× more precise than Q4K's i8, so errors are much smaller.
+    /// Uses 1% relative tolerance -- Q6K's i16 activation quantization is
+    /// 256x more precise than Q4K's i8, so errors are much smaller.
     pub fn compare_q6k(
         &self,
         name: &str,
@@ -415,7 +415,7 @@ fn compare_q4k_single(
 pub struct Q6kConfig {
     pub m: usize,
     pub n: usize,
-    /// Inner dimension — must be a multiple of Q6K_BLOCK_SIZE (256)
+    /// Inner dimension -- must be a multiple of Q6K_BLOCK_SIZE (256)
     pub k: usize,
 }
 
@@ -436,10 +436,10 @@ pub struct I2SConfig {
 /// Generate structurally valid Q6K weight bytes for `n` rows, each of width `k`.
 ///
 /// Q6K block layout (210 bytes):
-///   [0..128]   ql  — 4-bit low parts of 256 weights (2 weights/byte)
-///   [128..192] qh  — 2-bit high parts of 256 weights (4 weights/byte)
-///   [192..208] scales — 16 i8 group scales
-///   [208..210] d   — f16 block scale
+///   [0..128]   ql  -- 4-bit low parts of 256 weights (2 weights/byte)
+///   [128..192] qh  -- 2-bit high parts of 256 weights (4 weights/byte)
+///   [192..208] scales -- 16 i8 group scales
+///   [208..210] d   -- f16 block scale
 fn make_q6k_weights(n: usize, k: usize, seed: u8) -> Vec<u8> {
     let blocks_per_row = k / Q6K_BLOCK_SIZE;
     let total_bytes = n * blocks_per_row * Q6K_BLOCK_BYTES;
@@ -448,11 +448,11 @@ fn make_q6k_weights(n: usize, k: usize, seed: u8) -> Vec<u8> {
     for row in 0..n {
         for blk in 0..blocks_per_row {
             let base = cursor;
-            // ql: 128 bytes — low 4 bits of each weight
+            // ql: 128 bytes -- low 4 bits of each weight
             for i in 0..128 {
                 weights[base + i] = ((row * 128 + blk * 7 + i * 13 + seed as usize) % 256) as u8;
             }
-            // qh: 64 bytes — high 2 bits of each weight
+            // qh: 64 bytes -- high 2 bits of each weight
             for i in 0..64 {
                 weights[base + 128 + i] =
                     ((row * 64 + blk * 11 + i * 7 + seed as usize) % 4) as u8;
@@ -461,7 +461,7 @@ fn make_q6k_weights(n: usize, k: usize, seed: u8) -> Vec<u8> {
             for i in 0..16 {
                 weights[base + 192 + i] = ((blk + row + i + seed as usize) % 31 + 1) as u8;
             }
-            // d: f16 block scale — use a small positive value
+            // d: f16 block scale -- use a small positive value
             let d_f16 = half::f16::from_f32(0.005 + (blk % 8) as f32 * 0.001);
             let d_bits = d_f16.to_bits();
             weights[base + 208] = d_bits as u8;
@@ -1127,7 +1127,7 @@ mod tests {
             Q6kConfig { m: 1, n: 64, k: 512 },
             Q6kConfig { m: 4, n: 32, k: 256 },
         ];
-        // 1% rel tol — Q6K i16 quant is 256× finer than Q4K i8
+        // 1% rel tol -- Q6K i16 quant is 256x finer than Q4K i8
         let report = runner.compare_q6k("Q6K-ref-vs-opt", &ref_k, &opt_k, &configs, 0.01);
         for r in &report.results {
             eprintln!("  {}: {}", r.test_name, r.detail);
@@ -1157,7 +1157,7 @@ mod tests {
     ///
     /// When adding a new optimized kernel, add its VerifiedEquivalent impl to
     /// kernels/src/quantized.rs and a row to this table. A missing impl will
-    /// surface here at review time — this test is the checklist.
+    /// surface here at review time -- this test is the checklist.
     #[test]
     fn verified_equivalent_registry() {
         use tempura_kernels::quantized::{CpuMatMulQ4K, CpuMatMulQ4KOpt};
@@ -1289,7 +1289,7 @@ mod gpu_tests {
     fn attention_cpu_vs_gpu() {
         let gpu = CutileFlashAttention::new().unwrap();
         let cpu = CpuAttention;
-        // Flash attention uses online softmax; naive uses standard — 1% tolerance
+        // Flash attention uses online softmax; naive uses standard -- 1% tolerance
         let runner = DualPipelineRunner::new(1e-2);
         let configs = test_generators::attention_configs();
         let report = runner.compare_attention("CpuAttention vs CutileFlashAttention", &cpu, &gpu, &configs);

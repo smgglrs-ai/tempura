@@ -17,7 +17,7 @@ RUSTFLAGS="-Cprofile-generate=$PGO_DIR --cfg profile_gen" \
   cargo build --release -p tempura-serve
 
 echo "=== Step 2: Collect profile (prefill + decode coverage) ==="
-# Note: instrumented binary is ~10x slower — requests may take 5-10 minutes each.
+# Note: instrumented binary is ~10x slower -- requests may take 5-10 minutes each.
 # We use curl with a 30-minute timeout and send a mix of prefill + decode requests.
 fuser -k $PORT/tcp 2>/dev/null || true; sleep 1
 LLVM_PROFILE_FILE="$PGO_DIR/tempura-%p.profraw" TEMPURA_THREADS=$THREADS \
@@ -57,4 +57,4 @@ ls -lh /tmp/pgo-merged.profdata
 echo "=== Step 4: PGO-optimized build ==="
 RUSTFLAGS="-Cprofile-use=/tmp/pgo-merged.profdata" \
   cargo build --release -p tempura-serve
-echo "Done — run the benchmark to verify."
+echo "Done -- run the benchmark to verify."

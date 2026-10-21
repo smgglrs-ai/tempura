@@ -1,18 +1,18 @@
-//! Direct Rust translation of llama.cpp ggml/src/ggml-cpu/ops.cpp lines 1–4000.
+//! Direct Rust translation of llama.cpp ggml/src/ggml-cpu/ops.cpp lines 1-4000.
 //!
 //! Every function carries a doc-comment referencing the original C source line.
-//! GGML threading (ith/nth) and wdata workspace are stripped — callers manage
+//! GGML threading (ith/nth) and wdata workspace are stripped -- callers manage
 //! parallelism externally. The ggml_tensor struct is not used; callers supply
 //! raw slices and explicit shape/stride values where needed.
 //!
-//! Half-float (f16/bf16) variants are omitted — the project's kernel layer
+//! Half-float (f16/bf16) variants are omitted -- the project's kernel layer
 //! operates in f32; quantized paths are handled in quants_llama.rs.
 
 use super::ops_llama::{
     gelu_erf_f32, gelu_f32, gelu_quick_f32, leaky_relu_f32, silu_f32,
 };
 
-// ── dup (copy) ──────────────────────────────────────────────────────────────
+// -- dup (copy) --------------------------------------------------------------
 
 /// Copy `n_bytes` of raw bytes between same-type contiguous tensors.
 /// Direct translation of `ggml_compute_forward_dup_same_cont` (ops.cpp line 17).
@@ -27,7 +27,7 @@ pub fn dup_bytes(dst: &mut [u8], src: &[u8]) {
 /// Copy a strided 4-D f32 tensor to a flat contiguous f32 slice.
 ///
 /// Derived from `ggml_compute_forward_dup_flt<float,float>` (ops.cpp line 47)
-/// — the same-type, contiguous-dst branch.  Strides `nb01/nb02/nb03` are byte
+/// -- the same-type, contiguous-dst branch.  Strides `nb01/nb02/nb03` are byte
 /// offsets between rows / dim-2 slices / dim-3 batches in the *source*.
 /// Destination is written in C-contiguous (row-major) order.
 ///
@@ -122,7 +122,7 @@ pub fn dup_f32_strided(
     let _ = (i10, i11, i12, i13);
 }
 
-// ── add ─────────────────────────────────────────────────────────────────────
+// -- add ---------------------------------------------------------------------
 
 /// Add a scalar `v` to every element of a contiguous f32 row.
 /// Direct translation of the inner loop in `ggml_compute_forward_add1_f32`
@@ -178,7 +178,7 @@ pub fn acc_f32(
     nb03: usize,
     offset_bytes: usize,
 ) {
-    // copy src0 → dst first (non-inplace path: caller already did memcpy if needed)
+    // copy src0 -> dst first (non-inplace path: caller already did memcpy if needed)
     let _ = (nb1, nb2, nb3, nb01, nb02, nb03, offset_bytes);
     for ir in 0..nr {
         let i3 = ir / (ne12 * ne11);
@@ -197,7 +197,7 @@ pub fn acc_f32(
     }
 }
 
-// ── sum ─────────────────────────────────────────────────────────────────────
+// -- sum ---------------------------------------------------------------------
 
 /// Reduce all f32 elements in a contiguous slice to a single sum.
 /// Direct translation of `ggml_compute_forward_sum_f32` (ops.cpp line 1284).
@@ -234,7 +234,7 @@ pub fn sum_f32_strided(
     total as f32
 }
 
-// ── cumsum ───────────────────────────────────────────────────────────────────
+// -- cumsum -------------------------------------------------------------------
 
 /// Per-row prefix (cumulative) sum of a contiguous f32 matrix.
 /// Direct translation of `ggml_compute_forward_cumsum_f32` (ops.cpp line 1410).
@@ -258,7 +258,7 @@ pub fn cumsum_rows_f32(src: &[f32], dst: &mut [f32], n: usize) {
     }
 }
 
-// ── sum_rows ─────────────────────────────────────────────────────────────────
+// -- sum_rows -----------------------------------------------------------------
 
 /// Reduce each row of a contiguous f32 matrix to its sum.
 /// Direct translation of `ggml_compute_forward_sum_rows_f32` (ops.cpp line 1460).
@@ -278,7 +278,7 @@ pub fn sum_rows_f32(src: &[f32], dst: &mut [f32], n: usize) {
     }
 }
 
-// ── mean ─────────────────────────────────────────────────────────────────────
+// -- mean ---------------------------------------------------------------------
 
 /// Reduce each row of a contiguous f32 matrix to its arithmetic mean.
 /// Direct translation of `ggml_compute_forward_mean_f32` (ops.cpp line 1513).
@@ -296,7 +296,7 @@ pub fn mean_rows_f32(src: &[f32], dst: &mut [f32], n: usize) {
     }
 }
 
-// ── argmax ───────────────────────────────────────────────────────────────────
+// -- argmax -------------------------------------------------------------------
 
 /// Index of the maximum element in a contiguous f32 slice.
 /// Direct translation of `ggml_vec_argmax_f32` called by
@@ -325,7 +325,7 @@ pub fn argmax_rows_f32(src: &[f32], dst: &mut [i32], n: usize) {
     }
 }
 
-// ── count_equal ──────────────────────────────────────────────────────────────
+// -- count_equal --------------------------------------------------------------
 
 /// Count element-wise equal pairs between two contiguous i32 slices.
 /// Direct translation of `ggml_compute_forward_count_equal_i32` (ops.cpp line 1618).
@@ -337,7 +337,7 @@ pub fn count_equal_i32(a: &[i32], b: &[i32]) -> i64 {
     a.iter().zip(b.iter()).filter(|(x, y)| x == y).count() as i64
 }
 
-// ── repeat ───────────────────────────────────────────────────────────────────
+// -- repeat -------------------------------------------------------------------
 
 /// Tile a 4-D contiguous f32 tensor into a larger output.
 /// Direct translation of `ggml_compute_forward_repeat_f32` (ops.cpp line 1698).
@@ -446,7 +446,7 @@ pub fn repeat_back_f32(
     }
 }
 
-// ── concat ───────────────────────────────────────────────────────────────────
+// -- concat -------------------------------------------------------------------
 
 /// Concatenate two contiguous f32 tensors along dimension `dim`.
 ///
@@ -456,7 +456,7 @@ pub fn repeat_back_f32(
 /// - src1: `[ne10, ne11, ne12, ne13]`
 /// - dst:  result of concat along `dim` (computed by caller)
 ///
-/// For contiguous f32 row-major tensors with `dim ∈ {0, 1, 2, 3}`.
+/// For contiguous f32 row-major tensors with `dim ??? {0, 1, 2, 3}`.
 #[allow(clippy::too_many_arguments)]
 pub fn concat_f32(
     src0: &[f32],
@@ -546,7 +546,7 @@ pub fn concat_i8(
     }
 }
 
-// ── fill ─────────────────────────────────────────────────────────────────────
+// -- fill ---------------------------------------------------------------------
 
 /// Fill a contiguous f32 slice with a constant value.
 /// Direct translation of `ggml_compute_forward_fill_f32` (ops.cpp line 2230).
@@ -582,7 +582,7 @@ pub fn fill_rows_f32(
     }
 }
 
-// ── tri (triangular mask) ────────────────────────────────────────────────────
+// -- tri (triangular mask) ----------------------------------------------------
 
 /// Triangular type selector for `tri_f32`.
 /// Direct translation of `ggml_tri_type` (ops.cpp line 2289).
@@ -639,7 +639,7 @@ pub fn tri_f32(
     }
 }
 
-// ── activation row-wise wrappers ─────────────────────────────────────────────
+// -- activation row-wise wrappers ---------------------------------------------
 
 /// Apply GELU to every element in each contiguous row.
 /// Direct translation of `ggml_compute_forward_gelu_f32` (ops.cpp line 2111).
@@ -691,10 +691,10 @@ pub fn leaky_relu_rows_f32(src: &[f32], dst: &mut [f32], nc: usize, nr: usize, n
     }
 }
 
-// ── silu_back ────────────────────────────────────────────────────────────────
+// -- silu_back ----------------------------------------------------------------
 
 /// Gradient of SiLU with respect to its input.
-/// `σ(x) = x / (1 + e^{-x})`, so `dσ/dx = σ(x)(1 + x(1 - σ(x)))`.
+/// `??(x) = x / (1 + e^{-x})`, so `d??/dx = ??(x)(1 + x(1 - ??(x)))`.
 /// Direct translation of `ggml_vec_silu_backward_f32` called by
 /// `ggml_compute_forward_silu_back_f32` (ops.cpp line 2781).
 #[inline]
@@ -720,7 +720,7 @@ pub fn silu_back_rows_f32(src1: &[f32], grad: &[f32], dst: &mut [f32]) {
     }
 }
 
-// ── gated activation helpers ─────────────────────────────────────────────────
+// -- gated activation helpers -------------------------------------------------
 
 /// ReLU-gated linear unit scalar: `relu(gate) * up`.
 /// Used by reglu (ops.cpp line 2892).
@@ -757,7 +757,7 @@ fn geglu_quick_scalar(gate: f32, up: f32) -> f32 {
     gelu_quick_f32(gate) * up
 }
 
-// ── reglu ────────────────────────────────────────────────────────────────────
+// -- reglu --------------------------------------------------------------------
 
 /// ReGLU (ReLU gated linear unit) over `nr` rows, `nc` elements each.
 ///
@@ -800,7 +800,7 @@ pub fn reglu_rows_f32(
     }
 }
 
-// ── geglu ────────────────────────────────────────────────────────────────────
+// -- geglu --------------------------------------------------------------------
 
 /// GeGLU (GELU gated linear unit) over `nr` rows.
 /// Direct translation of `ggml_compute_forward_geglu_f32` (ops.cpp line 3035).
@@ -833,7 +833,7 @@ pub fn geglu_rows_f32(
     }
 }
 
-// ── swiglu ───────────────────────────────────────────────────────────────────
+// -- swiglu -------------------------------------------------------------------
 
 /// SwiGLU (SiLU gated linear unit) over `nr` rows.
 /// Direct translation of `ggml_compute_forward_swiglu_f32` (ops.cpp line 3178).
@@ -866,11 +866,11 @@ pub fn swiglu_rows_f32(
     }
 }
 
-// ── swiglu_oai ───────────────────────────────────────────────────────────────
+// -- swiglu_oai ---------------------------------------------------------------
 
 /// SwiGLU variant used by OpenAI models: `silu_clamped(gate) * (up + 1)`.
 ///
-/// `gate` is clamped to `(-∞, limit]` and `up` is clamped to `[-limit, limit]`
+/// `gate` is clamped to `(-inf, limit]` and `up` is clamped to `[-limit, limit]`
 /// before the gating multiplication.
 ///
 /// Direct translation of `ggml_compute_forward_swiglu_oai_f32` (ops.cpp line 3321).
@@ -909,11 +909,11 @@ pub fn swiglu_oai_rows_f32(
     }
 }
 
-// ── swiglu_clamp ─────────────────────────────────────────────────────────────
+// -- swiglu_clamp -------------------------------------------------------------
 
 /// SwiGLU with clamped inputs: `silu_clamped(gate) * up_clamped`.
 ///
-/// `gate` is clamped to `(-∞, limit]` and `up` is clamped to `[-limit, limit]`.
+/// `gate` is clamped to `(-inf, limit]` and `up` is clamped to `[-limit, limit]`.
 ///
 /// Direct translation of `ggml_compute_forward_swiglu_clamp_f32` (ops.cpp line 3408).
 pub fn swiglu_clamp_rows_f32(
@@ -948,7 +948,7 @@ pub fn swiglu_clamp_rows_f32(
     }
 }
 
-// ── geglu_erf ────────────────────────────────────────────────────────────────
+// -- geglu_erf ----------------------------------------------------------------
 
 /// GeGLU-erf gated linear unit over `nr` rows.
 /// Direct translation of `ggml_compute_forward_geglu_erf_f32` (ops.cpp line 3541).
@@ -981,7 +981,7 @@ pub fn geglu_erf_rows_f32(
     }
 }
 
-// ── geglu_quick ──────────────────────────────────────────────────────────────
+// -- geglu_quick --------------------------------------------------------------
 
 /// GeGLU-quick gated linear unit over `nr` rows.
 /// Direct translation of `ggml_compute_forward_geglu_quick_f32` (ops.cpp line 3684).
@@ -1014,7 +1014,7 @@ pub fn geglu_quick_rows_f32(
     }
 }
 
-// ── norm (layer norm) ────────────────────────────────────────────────────────
+// -- norm (layer norm) --------------------------------------------------------
 
 /// Layer normalization over a strided f32 tensor.
 ///
@@ -1109,7 +1109,7 @@ pub fn norm_rows_f32(src: &[f32], dst: &mut [f32], n: usize, eps: f32) {
     }
 }
 
-// ── rms_norm ─────────────────────────────────────────────────────────────────
+// -- rms_norm -----------------------------------------------------------------
 
 /// RMS normalization over contiguous f32 rows.
 /// Direct translation of `ggml_compute_forward_rms_norm_f32<NONE>` (ops.cpp line 3924).
@@ -1156,7 +1156,7 @@ pub fn rms_norm_mul_rows_f32(src: &[f32], weight: &[f32], dst: &mut [f32], n: us
     }
 }
 
-// ── tests ────────────────────────────────────────────────────────────────────
+// -- tests --------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1226,15 +1226,15 @@ mod tests {
         let src = vec![1.0f32; 9];
         let mut dst = vec![0.0f32; 9];
         tri_f32(&src, &mut dst, 3, 3, 1, 1, TriType::LowerDiag);
-        // row 0: col 0 ≤ 0 → keep; cols 1,2 → zero
+        // row 0: col 0 <= 0 -> keep; cols 1,2 -> zero
         assert_eq!(dst[0], 1.0);
         assert_eq!(dst[1], 0.0);
         assert_eq!(dst[2], 0.0);
-        // row 1: cols 0,1 ≤ 1 → keep; col 2 → zero
+        // row 1: cols 0,1 <= 1 -> keep; col 2 -> zero
         assert_eq!(dst[3], 1.0);
         assert_eq!(dst[4], 1.0);
         assert_eq!(dst[5], 0.0);
-        // row 2: all ≤ 2 → keep
+        // row 2: all <= 2 -> keep
         assert_eq!(dst[6], 1.0);
         assert_eq!(dst[7], 1.0);
         assert_eq!(dst[8], 1.0);
@@ -1249,13 +1249,13 @@ mod tests {
         silu_back_rows_f32(&src1, &grad, &mut dst);
         // x=0: s=0, dx = 0*(1+0) = 0
         assert!(dst[0].abs() < 1e-6);
-        // x=1: s=silu(1)≈0.7311, dx=s*(1+1*(1-s))≈0.7311*(1+0.2689)≈0.9277
+        // x=1: s=silu(1)~=0.7311, dx=s*(1+1*(1-s))~=0.7311*(1+0.2689)~=0.9277
         assert!((dst[1] - 0.9277).abs() < 1e-3);
     }
 
     #[test]
     fn test_reglu_rows() {
-        // gate=2 (relu=2), up=3 → 6
+        // gate=2 (relu=2), up=3 -> 6
         let src0 = vec![2.0f32, 3.0]; // [gate, up] interleaved
         let mut dst = vec![0.0f32; 1];
         reglu_rows_f32(&src0, None, &mut dst, 1, 1, false);
@@ -1264,7 +1264,7 @@ mod tests {
 
     #[test]
     fn test_swiglu_rows() {
-        // gate=0 → silu(0)=0 → result=0
+        // gate=0 -> silu(0)=0 -> result=0
         let src0 = vec![0.0f32, 1.0]; // gate=0, up=1
         let mut dst = vec![0.0f32; 1];
         swiglu_rows_f32(&src0, None, &mut dst, 1, 1, false);
@@ -1273,7 +1273,7 @@ mod tests {
 
     #[test]
     fn test_geglu_rows() {
-        // gelu(0) = 0 → 0 * up = 0
+        // gelu(0) = 0 -> 0 * up = 0
         let src0 = vec![0.0f32, 5.0]; // gate=0, up=5
         let mut dst = vec![0.0f32; 1];
         geglu_rows_f32(&src0, None, &mut dst, 1, 1, false);
@@ -1335,7 +1335,7 @@ mod tests {
         gelu_rows_f32(&src, &mut dst, 2, 1);
         // gelu(0) = 0
         assert!(dst[0].abs() < 1e-5);
-        // gelu(1) ≈ 0.8413
+        // gelu(1) ~= 0.8413
         assert!((dst[1] - 0.8413).abs() < 1e-3);
     }
 
@@ -1345,7 +1345,7 @@ mod tests {
         let mut dst = vec![0.0f32; 2];
         silu_rows_f32(&src, &mut dst, 2, 1);
         assert!(dst[0].abs() < 1e-5);
-        // silu(1) = 1/(1+exp(-1)) ≈ 0.7311
+        // silu(1) = 1/(1+exp(-1)) ~= 0.7311
         assert!((dst[1] - 0.7311).abs() < 1e-3);
     }
 
@@ -1354,7 +1354,7 @@ mod tests {
         let src = vec![1.0f32, 2.0, 3.0];
         let mut dst = vec![0.0f32; 3];
         norm_rows_f32(&src, &mut dst, 3, 1e-5);
-        // mean=2, var=2/3, scale=1/sqrt(2/3+eps) ≈ sqrt(3/2)
+        // mean=2, var=2/3, scale=1/sqrt(2/3+eps) ~= sqrt(3/2)
         let mean = 2.0f32;
         let var = ((1.0 - mean).powi(2) + (2.0 - mean).powi(2) + (3.0 - mean).powi(2)) / 3.0;
         let scale = 1.0 / (var + 1e-5).sqrt();

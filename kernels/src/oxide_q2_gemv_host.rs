@@ -13,20 +13,20 @@
 /// ```
 ///
 /// Each 32-thread warp computes ONE output neuron via stride-32 strided
-/// accumulation followed by a butterfly warp-reduce (5× `shfl.sync.bfly`).
+/// accumulation followed by a butterfly warp-reduce (5x `shfl.sync.bfly`).
 /// Lane 0 of each warp writes the final sum to `out[n_out]`.
 ///
 /// ## PTX parameter layout (from tools/oxide-gemv PTX inspection)
 ///
 /// ```text
-/// param_0: .u64 .ptr  — out pointer (DisjointSlice data ptr)
-/// param_1: .u64       — out len (u64)
-/// param_2: .u64 .ptr  — x pointer
-/// param_3: .u64       — x len (u64)
-/// param_4: .u64 .ptr  — packed pointer
-/// param_5: .u64       — packed len (u64)
-/// param_6: .u32       — n (u32)
-/// param_7: .u32       — k_blocks (u32)
+/// param_0: .u64 .ptr  -- out pointer (DisjointSlice data ptr)
+/// param_1: .u64       -- out len (u64)
+/// param_2: .u64 .ptr  -- x pointer
+/// param_3: .u64       -- x len (u64)
+/// param_4: .u64 .ptr  -- packed pointer
+/// param_5: .u64       -- packed len (u64)
+/// param_6: .u32       -- n (u32)
+/// param_7: .u32       -- k_blocks (u32)
 /// ```
 
 use crate::{KernelError, Result};
@@ -148,10 +148,10 @@ impl OxideQ2Gemv {
 
     /// Device-to-device Q2_0 GEMV: `out[n] = sum_k dequant(packed[n,k]) * x[k]`.
     ///
-    /// `x`        — activation tensor [K = k_blocks * 128]
-    /// `packed`   — packed Q2_0 weights [N * k_blocks * 9] u32
-    /// `n`        — number of output neurons
-    /// `k_blocks` — number of Q2_0 blocks per output row
+    /// `x`        -- activation tensor [K = k_blocks * 128]
+    /// `packed`   -- packed Q2_0 weights [N * k_blocks * 9] u32
+    /// `n`        -- number of output neurons
+    /// `k_blocks` -- number of Q2_0 blocks per output row
     ///
     /// Returns a new device tensor of shape [n].
     pub fn forward_d2d(

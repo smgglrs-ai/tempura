@@ -2,26 +2,26 @@
 //!
 //! Source files:
 //!   - ggml/src/ggml-cpu/ggml-cpu.c  (threadpool, barrier, graph compute loop)
-//!   - ggml/src/ggml-cpu/ggml-cpu.cpp (backend context — struct only)
+//!   - ggml/src/ggml-cpu/ggml-cpu.cpp (backend context -- struct only)
 //!
 //! Translated sections (non-mul_mat):
-//!   - `struct ggml_threadpool`               → [`Threadpool`]
-//!   - `struct ggml_compute_state`            → [`ComputeState`]
-//!   - `struct ggml_compute_params`           → [`ComputeParams`]
-//!   - `ggml_barrier`                         → [`barrier`]
-//!   - `ggml_get_n_tasks`                     → [`get_n_tasks`]
-//!   - `ggml_compute_forward` (dispatch table)→ [`compute_forward`]
-//!   - `ggml_graph_compute_thread`            → [`graph_compute_thread`]
-//!   - `ggml_graph_compute_secondary_thread`  → [`graph_compute_secondary_thread`]
-//!   - `ggml_graph_compute_kickoff`           → [`graph_compute_kickoff`]
-//!   - `ggml_threadpool_new_impl`             → [`Threadpool::new`]
-//!   - `ggml_threadpool_free`                 → [`Threadpool::free`] / `Drop`
-//!   - `ggml_graph_compute`                   → [`graph_compute`]
+//!   - `struct ggml_threadpool`               -> [`Threadpool`]
+//!   - `struct ggml_compute_state`            -> [`ComputeState`]
+//!   - `struct ggml_compute_params`           -> [`ComputeParams`]
+//!   - `ggml_barrier`                         -> [`barrier`]
+//!   - `ggml_get_n_tasks`                     -> [`get_n_tasks`]
+//!   - `ggml_compute_forward` (dispatch table)-> [`compute_forward`]
+//!   - `ggml_graph_compute_thread`            -> [`graph_compute_thread`]
+//!   - `ggml_graph_compute_secondary_thread`  -> [`graph_compute_secondary_thread`]
+//!   - `ggml_graph_compute_kickoff`           -> [`graph_compute_kickoff`]
+//!   - `ggml_threadpool_new_impl`             -> [`Threadpool::new`]
+//!   - `ggml_threadpool_free`                 -> [`Threadpool::free`] / `Drop`
+//!   - `ggml_graph_compute`                   -> [`graph_compute`]
 //!
 //! The mul_mat dispatch (`GGML_OP_MUL_MAT`) is handled in `mul_mat_llama.rs`
 //! and referenced here via `compute_forward_mul_mat_stub`.
 //!
-//! Naming map (C → Rust):
+//! Naming map (C -> Rust):
 //!   GGML_THREADPOOL_N_THREADS_MASK = N_THREADS_MASK
 //!   GGML_THREADPOOL_N_THREADS_BITS = N_THREADS_BITS
 //!   memory_order_relaxed            = Ordering::Relaxed
@@ -176,11 +176,11 @@ impl GgmlOp {
 // ---------------------------------------------------------------------------
 //
 // These mirror the C struct fields used by the scheduling logic only.  They
-// are not full GGML tensors — the full tensor type lives in the GGUF loader.
+// are not full GGML tensors -- the full tensor type lives in the GGUF loader.
 
 /// Tensor flags (GGML_TENSOR_FLAG_*).
 pub mod tensor_flags {
-    /// GGML_TENSOR_FLAG_COMPUTE — this node participates in forward pass.
+    /// GGML_TENSOR_FLAG_COMPUTE -- this node participates in forward pass.
     pub const COMPUTE: u32 = 1 << 1;
 }
 
@@ -189,15 +189,15 @@ pub mod tensor_flags {
 pub struct GgmlTensor {
     pub op: GgmlOp,
     pub flags: u32,
-    /// ne[0..4] — element counts per dimension (C: node->ne[0..3])
+    /// ne[0..4] -- element counts per dimension (C: node->ne[0..3])
     pub ne: [i64; 4],
     /// Number of source tensors (C: node->src[i] != NULL).
     pub n_src: usize,
-    /// ne[1] of src[1] — used by RWKV/GLA to get n_heads.
+    /// ne[1] of src[1] -- used by RWKV/GLA to get n_heads.
     pub src1_ne1: i64,
-    /// op_params[0] — used by custom ops (n_tasks) and flash attn back (masked).
+    /// op_params[0] -- used by custom ops (n_tasks) and flash attn back (masked).
     pub op_param0: i32,
-    /// op_params[1] — used by CUSTOM/MAP_CUSTOM (n_tasks field).
+    /// op_params[1] -- used by CUSTOM/MAP_CUSTOM (n_tasks field).
     pub op_param1: i32,
 }
 
@@ -207,7 +207,7 @@ impl GgmlTensor {
     }
 }
 
-/// Minimal ggml_cgraph — just the node list.
+/// Minimal ggml_cgraph -- just the node list.
 pub struct GgmlCgraph<'a> {
     pub nodes: &'a [GgmlTensor],
 }
@@ -252,7 +252,7 @@ pub enum SchedPrio {
 }
 
 // ---------------------------------------------------------------------------
-// Compute params (ggml_compute_params — passed per call to each forward fn)
+// Compute params (ggml_compute_params -- passed per call to each forward fn)
 // ---------------------------------------------------------------------------
 
 /// Per-call compute parameters threaded through every operator forward pass.
@@ -310,7 +310,7 @@ pub struct ThreadpoolShared {
     pub n_graph: AtomicI32,
     /// Count of threads currently inside the barrier.
     pub n_barrier: AtomicI32,
-    /// Barrier epoch — incremented when all threads have crossed.
+    /// Barrier epoch -- incremented when all threads have crossed.
     pub n_barrier_passed: AtomicI32,
     /// Next matmul chunk to claim (shared work-stealing counter).
     pub current_chunk: AtomicI32,
@@ -364,7 +364,7 @@ pub struct ThreadpoolParams {
 }
 
 impl ThreadpoolParams {
-    /// Default params — matches `ggml_threadpool_params_default`.
+    /// Default params -- matches `ggml_threadpool_params_default`.
     pub fn default(n_threads: usize) -> Self {
         Self {
             n_threads,
@@ -449,7 +449,7 @@ impl Threadpool {
 }
 
 // ---------------------------------------------------------------------------
-// Barrier  (ggml_barrier — ggml-cpu.c lines 576-612)
+// Barrier  (ggml_barrier -- ggml-cpu.c lines 576-612)
 // ---------------------------------------------------------------------------
 //
 // Spinning barrier: threads count in via n_barrier; the last one resets the
@@ -472,7 +472,7 @@ pub fn barrier(tp: &ThreadpoolShared) {
     let n_barrier = tp.n_barrier.fetch_add(1, Ordering::SeqCst);
 
     if n_barrier == (n_threads - 1) {
-        // We are the last thread — reset counter and advance epoch.
+        // We are the last thread -- reset counter and advance epoch.
         tp.n_barrier.store(0, Ordering::Relaxed);
         tp.n_barrier_passed.fetch_add(1, Ordering::SeqCst);
         return;
@@ -516,7 +516,7 @@ pub fn chunk_add(tp: &ThreadpoolShared, value: i32) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// get_n_tasks — per-op parallelism (ggml_get_n_tasks, ggml-cpu.c lines 2253-2523)
+// get_n_tasks -- per-op parallelism (ggml_get_n_tasks, ggml-cpu.c lines 2253-2523)
 // ---------------------------------------------------------------------------
 //
 // Returns the number of threads that should participate in computing `node`.
@@ -530,7 +530,7 @@ pub fn get_n_tasks(node: &GgmlTensor, n_threads: usize) -> usize {
     }
 
     match node.op {
-        // n_threads — fully parallel
+        // n_threads -- fully parallel
         GgmlOp::Cpy
         | GgmlOp::Dup
         | GgmlOp::Cont
@@ -567,8 +567,8 @@ pub fn get_n_tasks(node: &GgmlTensor, n_threads: usize) -> usize {
 
         // Unary: depends on which unary op (op_param0 encodes ggml_unary_op).
         GgmlOp::Unary => {
-            // GGML_UNARY_OP_GELU / GELU_ERF / GELU_QUICK / SILU / XIELU → n_threads.
-            // All others → 1.
+            // GGML_UNARY_OP_GELU / GELU_ERF / GELU_QUICK / SILU / XIELU -> n_threads.
+            // All others -> 1.
             // Translate by checking op_param0 values:
             //   GELU=6, GELU_ERF=14, GELU_QUICK=7, SILU=9, XIELU=15 (from ggml.h enum ggml_unary_op)
             match node.op_param0 {
@@ -661,7 +661,7 @@ pub fn get_n_tasks(node: &GgmlTensor, n_threads: usize) -> usize {
 
         // Custom ops: use n_tasks field from op_params, or n_threads if GGML_N_TASKS_MAX (-1).
         GgmlOp::MapCustom1 | GgmlOp::MapCustom2 | GgmlOp::MapCustom3 | GgmlOp::Custom => {
-            // C: p.n_tasks == GGML_N_TASKS_MAX (-1) → n_threads, else min(p.n_tasks, n_threads)
+            // C: p.n_tasks == GGML_N_TASKS_MAX (-1) -> n_threads, else min(p.n_tasks, n_threads)
             if node.op_param1 == -1 {
                 n_threads
             } else {
@@ -682,13 +682,13 @@ pub fn get_n_tasks(node: &GgmlTensor, n_threads: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// compute_forward — operator dispatch table
+// compute_forward -- operator dispatch table
 // (ggml_compute_forward, ggml-cpu.c lines 1744-2177)
 // ---------------------------------------------------------------------------
 //
 // In the C source every case calls a concrete implementation function defined
 // in ops.h / unary-ops.h / binary-ops.h (e.g. ggml_compute_forward_add).
-// Those functions are NOT translated here — this module is responsible only
+// Those functions are NOT translated here -- this module is responsible only
 // for the dispatch routing.  Individual operator forward passes are
 // implemented in separate Rust modules and called via the `OpDispatch` trait.
 //
@@ -925,7 +925,7 @@ pub fn compute_forward<D: OpDispatch>(
 }
 
 // ---------------------------------------------------------------------------
-// Worker thread — per-graph compute loop
+// Worker thread -- per-graph compute loop
 // (ggml_graph_compute_thread, ggml-cpu.c lines 3109-3182)
 // ---------------------------------------------------------------------------
 //
@@ -935,10 +935,10 @@ pub fn compute_forward<D: OpDispatch>(
 
 /// Translated from `ggml_graph_compute_thread`.
 ///
-/// `state`    — this thread's per-thread state.
-/// `cgraph`   — the graph to compute (all threads share the same graph).
-/// `cplan`    — the compute plan (work buffer, abort callback, etc.).
-/// `dispatch` — operator implementations.
+/// `state`    -- this thread's per-thread state.
+/// `cgraph`   -- the graph to compute (all threads share the same graph).
+/// `cplan`    -- the compute plan (work buffer, abort callback, etc.).
+/// `dispatch` -- operator implementations.
 pub fn graph_compute_thread<D: OpDispatch>(
     state:    &ComputeState,
     cgraph:   &GgmlCgraph<'_>,
@@ -1107,7 +1107,7 @@ pub fn graph_compute_secondary_thread(mut state: ComputeState) {
 }
 
 // ---------------------------------------------------------------------------
-// Kickoff — signal workers to start a new graph
+// Kickoff -- signal workers to start a new graph
 // (ggml_graph_compute_kickoff, ggml-cpu.c lines 3288-3318)
 // ---------------------------------------------------------------------------
 
@@ -1134,7 +1134,7 @@ pub fn graph_compute_kickoff(tp: &ThreadpoolShared, n_threads: usize) {
 }
 
 // ---------------------------------------------------------------------------
-// graph_compute — top-level entry point
+// graph_compute -- top-level entry point
 // (ggml_graph_compute, ggml-cpu.c lines 3399-3474)
 // ---------------------------------------------------------------------------
 //
@@ -1200,7 +1200,7 @@ where
     };
 
     if n_threads > tp.n_threads {
-        // Warn: more threads requested than available — cap to pool size.
+        // Warn: more threads requested than available -- cap to pool size.
         let n_threads = tp.n_threads;
         let _ = n_threads;
     }

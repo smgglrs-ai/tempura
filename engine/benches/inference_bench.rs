@@ -170,7 +170,7 @@ fn main() {
         let k_data: Vec<f32> = (0..stride).map(|i| i as f32 * 0.01).collect();
         let v_data = k_data.clone();
 
-        bench("contiguous append 1 token × 100", 2, 100, || {
+        bench("contiguous append 1 token x 100", 2, 100, || {
             let mut cache = KvCache::new(&config);
             for _ in 0..100 {
                 cache.append_kv(0, &k_data, &v_data, 1);
@@ -178,7 +178,7 @@ fn main() {
             }
         });
 
-        bench("paged append 1 token × 100 (bs=16)", 2, 100, || {
+        bench("paged append 1 token x 100 (bs=16)", 2, 100, || {
             let mut cache = PagedKvCache::new(&config, 128, 16);
             for _ in 0..100 {
                 cache.append_kv(0, &k_data, &v_data, 1);

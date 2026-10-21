@@ -1,4 +1,4 @@
-//! Direct Rust translation of llama.cpp ggml/src/ggml-cpu/ops.cpp lines 7978–12206.
+//! Direct Rust translation of llama.cpp ggml/src/ggml-cpu/ops.cpp lines 7978-12206.
 //!
 //! Functions translated in this file:
 //!   ggml_compute_forward_upscale_f32 / upscale
@@ -42,7 +42,7 @@
 
 use half::f16;
 
-// ─── Scale / upscale modes (mirrors ggml_scale_mode / ggml_scale_flag) ──────
+// --- Scale / upscale modes (mirrors ggml_scale_mode / ggml_scale_flag) ------
 
 pub const SCALE_FLAG_ALIGN_CORNERS: i32 = 1 << 8;
 pub const SCALE_FLAG_ANTIALIAS: i32 = 1 << 9;
@@ -55,7 +55,7 @@ pub const SCALE_MODE_BICUBIC: i32 = 2;
 pub const SORT_ORDER_ASC: i32 = 0;
 pub const SORT_ORDER_DESC: i32 = 1;
 
-// ─── Helper: wrap-around index used by pad (circular) ────────────────────────
+// --- Helper: wrap-around index used by pad (circular) ------------------------
 
 /// Direct translation of `ggml_wrap_around` (ops.cpp inline helper).
 #[inline]
@@ -63,7 +63,7 @@ fn wrap_around(i: i64, n: i64) -> i64 {
     ((i % n) + n) % n
 }
 
-// ─── ggml_compute_forward_upscale_f32 (ops.cpp lines 7978–8172) ──────────────
+// --- ggml_compute_forward_upscale_f32 (ops.cpp lines 7978-8172) --------------
 //
 // Parameters carry all information that ggml_tensor fields would:
 //   src_data / dst_data : raw byte pointers (F32 tensors)
@@ -275,7 +275,7 @@ pub unsafe fn compute_forward_upscale_f32(
     }
 }
 
-// ─── ggml_compute_forward_pad_f32 (ops.cpp lines 8196–8258) ──────────────────
+// --- ggml_compute_forward_pad_f32 (ops.cpp lines 8196-8258) ------------------
 
 /// Direct translation of `ggml_compute_forward_pad_f32<false>` (zero-padding variant).
 /// ops.cpp line 8196.
@@ -355,7 +355,7 @@ pub unsafe fn compute_forward_pad_circular_f32(
     }
 }
 
-// ─── ggml_compute_forward_pad_reflect_1d (ops.cpp lines 8284–8315) ───────────
+// --- ggml_compute_forward_pad_reflect_1d (ops.cpp lines 8284-8315) -----------
 
 /// Direct translation of `ggml_compute_forward_pad_reflect_1d` (ops.cpp line 8284).
 pub unsafe fn compute_forward_pad_reflect_1d_f32(
@@ -396,7 +396,7 @@ pub unsafe fn compute_forward_pad_reflect_1d_f32(
     }
 }
 
-// ─── ggml_wrap_index / ggml_compute_forward_roll_f32 (ops.cpp lines 8319–8382) ─
+// --- ggml_wrap_index / ggml_compute_forward_roll_f32 (ops.cpp lines 8319-8382) -
 
 /// Direct translation of `ggml_wrap_index` (ops.cpp line 8319).
 #[inline]
@@ -440,7 +440,7 @@ pub unsafe fn compute_forward_roll_f32(
     }
 }
 
-// ─── ggml_compute_forward_arange_f32 (ops.cpp lines 8386–8407) ───────────────
+// --- ggml_compute_forward_arange_f32 (ops.cpp lines 8386-8407) ---------------
 
 /// Direct translation of `ggml_compute_forward_arange_f32` (ops.cpp line 8386).
 pub fn compute_forward_arange_f32(
@@ -457,7 +457,7 @@ pub fn compute_forward_arange_f32(
     }
 }
 
-// ─── ggml_compute_forward_timestep_embedding_f32 (ops.cpp lines 8424–8455) ───
+// --- ggml_compute_forward_timestep_embedding_f32 (ops.cpp lines 8424-8455) ---
 
 /// Direct translation of `ggml_compute_forward_timestep_embedding_f32` (ops.cpp line 8424).
 /// src: flat &[f32] of shape [ne00]
@@ -488,7 +488,7 @@ pub unsafe fn compute_forward_timestep_embedding_f32(
     }
 }
 
-// ─── ggml_compute_forward_argsort_f32 (ops.cpp lines 8489–8546) ──────────────
+// --- ggml_compute_forward_argsort_f32 (ops.cpp lines 8489-8546) --------------
 
 /// Direct translation of `ggml_compute_forward_argsort_f32` (ops.cpp line 8489).
 pub unsafe fn compute_forward_argsort_f32(
@@ -529,7 +529,7 @@ pub unsafe fn compute_forward_argsort_f32(
     }
 }
 
-// ─── ggml_compute_forward_top_k_f32 (ops.cpp lines 8557–8611) ────────────────
+// --- ggml_compute_forward_top_k_f32 (ops.cpp lines 8557-8611) ----------------
 
 /// Direct translation of `ggml_compute_forward_top_k_f32` (ops.cpp line 8557).
 pub unsafe fn compute_forward_top_k_f32(
@@ -570,7 +570,7 @@ pub unsafe fn compute_forward_top_k_f32(
     }
 }
 
-// ─── Flash attention scalar helper (vec scale / mad / max for f32) ────────────
+// --- Flash attention scalar helper (vec scale / mad / max for f32) ------------
 
 #[inline]
 fn vec_scale_f32(n: usize, x: &mut [f32], v: f32) {
@@ -608,8 +608,8 @@ fn vec_soft_max_f32(n: usize, dst: &mut [f32], src: &[f32], max: f32) -> f32 {
     sum
 }
 
-// ─── ggml_compute_forward_flash_attn_ext_f16_one_chunk ───────────────────────
-// ops.cpp lines 8614–8850  (scalar F32 path; F16 V path omitted for simplicity)
+// --- ggml_compute_forward_flash_attn_ext_f16_one_chunk -----------------------
+// ops.cpp lines 8614-8850  (scalar F32 path; F16 V path omitted for simplicity)
 
 /// Scalar translation of `ggml_compute_forward_flash_attn_ext_f16_one_chunk`.
 /// All tensors are assumed F32 for Q, K, V.
@@ -764,7 +764,7 @@ pub unsafe fn flash_attn_ext_one_chunk_f32(
     }
 }
 
-// ─── ggml_flash_attn_ext_reduce_partials (ops.cpp lines 9142–9210) ────────────
+// --- ggml_flash_attn_ext_reduce_partials (ops.cpp lines 9142-9210) ------------
 
 /// Direct translation of `ggml_flash_attn_ext_reduce_partials` (ops.cpp line 9142).
 pub unsafe fn flash_attn_ext_reduce_partials(
@@ -821,7 +821,7 @@ pub unsafe fn flash_attn_ext_reduce_partials(
     }
 }
 
-// ─── SSM conv (ops.cpp lines 9703–9769) ───────────────────────────────────────
+// --- SSM conv (ops.cpp lines 9703-9769) ---------------------------------------
 
 /// Direct translation of `ggml_compute_forward_ssm_conv_f32` (ops.cpp line 9703).
 pub unsafe fn compute_forward_ssm_conv_f32(
@@ -862,7 +862,7 @@ pub unsafe fn compute_forward_ssm_conv_f32(
     }
 }
 
-// ─── SSM scan scalar (ops.cpp lines 9773–9994) ────────────────────────────────
+// --- SSM scan scalar (ops.cpp lines 9773-9994) --------------------------------
 
 /// Direct translation of `ggml_compute_forward_ssm_scan_f32` (scalar Mamba-1 path).
 /// ops.cpp line 9773.
@@ -983,7 +983,7 @@ fn softplus_f32(x: f32) -> f32 {
     if x > 20.0 { x } else { (1.0f32 + x.exp()).ln() }
 }
 
-// ─── Win part / unpart (ops.cpp lines 10011–10133) ───────────────────────────
+// --- Win part / unpart (ops.cpp lines 10011-10133) ---------------------------
 
 /// Direct translation of `ggml_compute_forward_win_part_f32` (ops.cpp line 10013).
 pub unsafe fn compute_forward_win_part_f32(
@@ -1050,7 +1050,7 @@ pub unsafe fn compute_forward_win_unpart_f32(
     }
 }
 
-// ─── get_rel_pos (ops.cpp lines 10285–10328) ──────────────────────────────────
+// --- get_rel_pos (ops.cpp lines 10285-10328) ----------------------------------
 
 /// Direct translation of `ggml_compute_forward_get_rel_pos_f16` (ops.cpp line 10285).
 pub unsafe fn compute_forward_get_rel_pos_f16(
@@ -1072,7 +1072,7 @@ pub unsafe fn compute_forward_get_rel_pos_f16(
     }
 }
 
-// ─── add_rel_pos (ops.cpp lines 10332–10408) ──────────────────────────────────
+// --- add_rel_pos (ops.cpp lines 10332-10408) ----------------------------------
 
 /// Direct translation of `ggml_compute_forward_add_rel_pos_f32` (ops.cpp line 10332).
 pub unsafe fn compute_forward_add_rel_pos_f32(
@@ -1106,7 +1106,7 @@ pub unsafe fn compute_forward_add_rel_pos_f32(
     }
 }
 
-// ─── RWKV WKV6 scalar (ops.cpp lines 10413–10621) ────────────────────────────
+// --- RWKV WKV6 scalar (ops.cpp lines 10413-10621) ----------------------------
 
 /// Direct translation of scalar path of `ggml_compute_forward_rwkv_wkv6_f32`.
 /// ops.cpp line 10413.
@@ -1172,7 +1172,7 @@ pub unsafe fn compute_forward_rwkv_wkv6_f32(
     }
 }
 
-// ─── GLA scalar (ops.cpp lines 10625–10822) ───────────────────────────────────
+// --- GLA scalar (ops.cpp lines 10625-10822) -----------------------------------
 
 /// Direct translation of scalar path of `ggml_compute_forward_gla_f32`.
 /// ops.cpp line 10625.
@@ -1232,7 +1232,7 @@ pub unsafe fn compute_forward_gla_f32(
     }
 }
 
-// ─── solve_tri (ops.cpp lines 10824–10892) ────────────────────────────────────
+// --- solve_tri (ops.cpp lines 10824-10892) ------------------------------------
 
 /// Direct translation of `ggml_compute_forward_solve_tri_f32` (ops.cpp line 10824).
 pub unsafe fn compute_forward_solve_tri_f32(
@@ -1269,7 +1269,7 @@ pub unsafe fn compute_forward_solve_tri_f32(
     }
 }
 
-// ─── Gated delta net (ops.cpp lines 10895–11105) ─────────────────────────────
+// --- Gated delta net (ops.cpp lines 10895-11105) -----------------------------
 
 /// Direct translation of `ggml_compute_forward_gated_delta_net_one_chunk` (ops.cpp line 10895).
 #[allow(clippy::too_many_arguments)]
@@ -1389,7 +1389,7 @@ pub unsafe fn compute_forward_gated_delta_net_one_chunk(
     }
 }
 
-// ─── DSV4 HC comb helpers (ops.cpp lines 11110–11244) ────────────────────────
+// --- DSV4 HC comb helpers (ops.cpp lines 11110-11244) ------------------------
 
 const DSV4_HC: usize = 4;
 
@@ -1480,7 +1480,7 @@ pub unsafe fn compute_forward_dsv4_hc_comb_f32(
     }
 }
 
-// ─── DSV4 HC pre (ops.cpp lines 11248–11324) ──────────────────────────────────
+// --- DSV4 HC pre (ops.cpp lines 11248-11324) ----------------------------------
 
 /// Direct translation of `ggml_compute_forward_dsv4_hc_pre_f32` (ops.cpp line 11248).
 pub unsafe fn compute_forward_dsv4_hc_pre_f32(
@@ -1512,7 +1512,7 @@ pub unsafe fn compute_forward_dsv4_hc_pre_f32(
     }
 }
 
-// ─── DSV4 HC post (ops.cpp lines 11328–11418) ─────────────────────────────────
+// --- DSV4 HC post (ops.cpp lines 11328-11418) ---------------------------------
 
 /// Direct translation of `ggml_compute_forward_dsv4_hc_post_f32` (ops.cpp line 11328).
 #[allow(clippy::too_many_arguments)]
@@ -1550,7 +1550,7 @@ pub unsafe fn compute_forward_dsv4_hc_post_f32(
     }
 }
 
-// ─── RWKV WKV7 scalar (ops.cpp lines 11422–11635) ────────────────────────────
+// --- RWKV WKV7 scalar (ops.cpp lines 11422-11635) ----------------------------
 
 /// Direct translation of scalar path of `ggml_compute_forward_rwkv_wkv7_f32`.
 /// ops.cpp line 11422.
@@ -1620,7 +1620,7 @@ pub unsafe fn compute_forward_rwkv_wkv7_f32(
     }
 }
 
-// ─── Cross entropy loss (ops.cpp lines 11696–11788) ──────────────────────────
+// --- Cross entropy loss (ops.cpp lines 11696-11788) --------------------------
 
 /// Direct translation of `ggml_compute_forward_cross_entropy_loss_f32` (ops.cpp line 11696).
 pub unsafe fn compute_forward_cross_entropy_loss_f32(
@@ -1707,7 +1707,7 @@ pub unsafe fn compute_forward_cross_entropy_loss_back_f32(
     }
 }
 
-// ─── AdamW optimizer (ops.cpp lines 11873–11956) ─────────────────────────────
+// --- AdamW optimizer (ops.cpp lines 11873-11956) -----------------------------
 
 /// Direct translation of `ggml_compute_forward_opt_step_adamw_f32` (ops.cpp line 11873).
 #[allow(clippy::too_many_arguments)]
@@ -1748,7 +1748,7 @@ pub unsafe fn compute_forward_opt_step_adamw_f32(
     }
 }
 
-// ─── SGD optimizer (ops.cpp lines 11958–11999) ────────────────────────────────
+// --- SGD optimizer (ops.cpp lines 11958-11999) --------------------------------
 
 /// Direct translation of `ggml_compute_forward_opt_step_sgd_f32` (ops.cpp line 11958).
 pub unsafe fn compute_forward_opt_step_sgd_f32(
@@ -1775,7 +1775,7 @@ pub unsafe fn compute_forward_opt_step_sgd_f32(
     }
 }
 
-// ─── FWHT (Fast Walsh-Hadamard Transform, ops.cpp lines 12018–12122) ──────────
+// --- FWHT (Fast Walsh-Hadamard Transform, ops.cpp lines 12018-12122) ----------
 
 /// Direct translation of `ggml_compute_forward_fwht_impl` for F32 src (ops.cpp line 12026).
 pub unsafe fn compute_forward_fwht_f32(
@@ -1853,7 +1853,7 @@ pub unsafe fn compute_forward_fwht_f16(
     }
 }
 
-// ─── Lightning indexer (ops.cpp lines 12124–12206) ───────────────────────────
+// --- Lightning indexer (ops.cpp lines 12124-12206) ---------------------------
 
 /// Direct translation of `ggml_compute_forward_lightning_indexer` (ops.cpp line 12126).
 #[allow(clippy::too_many_arguments)]

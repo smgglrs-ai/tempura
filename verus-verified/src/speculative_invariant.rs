@@ -1,4 +1,4 @@
-//! Verus-verified speculative decoding loop invariants — unbounded proofs
+//! Verus-verified speculative decoding loop invariants -- unbounded proofs
 //!
 //! Proves that the speculative decoding loop maintains:
 //! - draft_tokens.len() <= k
@@ -79,7 +79,7 @@ proof fn parallel_arrays_grow_together(
 }
 
 // ============================================================================
-// Proof: accepting n tokens — generated grows, draft consumed
+// Proof: accepting n tokens -- generated grows, draft consumed
 // ============================================================================
 
 proof fn accept_tokens_safe(
@@ -124,7 +124,7 @@ proof fn accept_all_plus_bonus(
 }
 
 // ============================================================================
-// Proof: rejection with correction — generated grows by 1 (correction token)
+// Proof: rejection with correction -- generated grows by 1 (correction token)
 // ============================================================================
 
 proof fn reject_with_correction(
@@ -150,7 +150,7 @@ proof fn reject_with_correction(
 }
 
 // ============================================================================
-// Proof: loop termination — generated_len strictly increases each iteration
+// Proof: loop termination -- generated_len strictly increases each iteration
 // ============================================================================
 
 proof fn loop_progress(

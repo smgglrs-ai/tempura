@@ -1,8 +1,8 @@
-//! Verus-verified GPU ≡ CPU definitional equivalences for RMSNorm, RoPE, MatMul, Attention.
+//! Verus-verified GPU ??? CPU definitional equivalences for RMSNorm, RoPE, MatMul, Attention.
 //!
 //! Proves that CutileRmsNorm, CudaRoPE/CutileRoPE, CudaMatMul/CutileMatMul, and
 //! CudaAttention/CutileFlashAttention compute the same abstract spec as their CPU
-//! reference implementations. These are definitional equivalences — both GPU and CPU
+//! reference implementations. These are definitional equivalences -- both GPU and CPU
 //! compute the same mathematical formula at the spec level.
 //!
 //! Spec functions are self-contained; names are prefixed gk_ to avoid collisions.
@@ -27,8 +27,8 @@ pub open spec fn gk_abs(x: int) -> int {
 //
 // At the integer spec level we abstract the per-element weighted product as
 // gk_rmsnorm_spec(x, w)[i] = x[i] * w[i], sharing a common (implicit) scale.
-// The scale factor is a monotone function of ‖x‖²; both implementations apply
-// the same scale — the definitional equivalence holds at the spec level.
+// The scale factor is a monotone function of ???x???^2; both implementations apply
+// the same scale -- the definitional equivalence holds at the spec level.
 // ============================================================================
 
 pub open spec fn gk_rmsnorm_spec(x: Seq<int>, w: Seq<int>) -> Seq<int>
@@ -56,14 +56,14 @@ proof fn lemma_gk_rmsnorm_spec_len(x: Seq<int>, w: Seq<int>)
     }
 }
 
-// ── RMSNorm Theorem: CutileRmsNorm ≡ CpuRMSNorm ─────────────────────────────
+// -- RMSNorm Theorem: CutileRmsNorm ??? CpuRMSNorm -----------------------------
 //
 // Both GPU (CutileRmsNorm) and CPU (CpuRMSNorm) compute gk_rmsnorm_spec(x, w).
 // The GPU uses a warp-level parallel reduction for the squared-sum; the CPU uses
-// a sequential loop. Both apply the same formula: out = x * w * rsqrt(mean(x²)+eps).
-// At the abstract spec level the output is identical — this is definitional.
+// a sequential loop. Both apply the same formula: out = x * w * rsqrt(mean(x^2)+eps).
+// At the abstract spec level the output is identical -- this is definitional.
 //
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 pub proof fn lemma_cutile_rmsnorm_bounded_error(x: Seq<int>, w: Seq<int>)
     requires x.len() == w.len()
@@ -76,7 +76,7 @@ pub proof fn lemma_cutile_rmsnorm_bounded_error(x: Seq<int>, w: Seq<int>)
 // RoPE abstract spec
 //
 // Both CpuRoPE (CudaRoPE) and CutileRoPE compute:
-//   out[2i]   = x[2i] * cos(pos / θ^(2i/d)) − x[2i+1] * sin(...)
+//   out[2i]   = x[2i] * cos(pos / ??^(2i/d)) ??? x[2i+1] * sin(...)
 //   out[2i+1] = x[2i] * sin(...) + x[2i+1] * cos(...)
 //
 // Key invariant: rotation is length-preserving.
@@ -99,13 +99,13 @@ pub proof fn lemma_rope_pair_index_in_bounds(head_dim: nat, pair_idx: nat)
         requires pair_idx < head_dim / 2, head_dim % 2 == 0, head_dim >= 2;
 }
 
-// ── RoPE Theorem: CutileRoPE ≡ CudaRoPE ≡ CpuRoPE ───────────────────────────
+// -- RoPE Theorem: CutileRoPE ??? CudaRoPE ??? CpuRoPE ---------------------------
 //
 // Both GPU (CudaRoPE / CutileRoPE) and CPU (CpuRoPE) apply the same rotation
-// formula. The output length equals the input length — a key spec invariant.
+// formula. The output length equals the input length -- a key spec invariant.
 // At the abstract spec level, both compute gk_rope_output_len(seq_len * head_dim).
 //
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 pub proof fn lemma_cutile_rope_bounded_error(head_dim: nat, seq_len: nat)
     requires head_dim >= 2, head_dim % 2 == 0, seq_len >= 1
@@ -117,9 +117,9 @@ pub proof fn lemma_cutile_rope_bounded_error(head_dim: nat, seq_len: nat)
 // ============================================================================
 // MatMul abstract spec
 //
-// Both CpuMatMul (CudaMatMul) and CutileMatMul compute C = A × B via the
+// Both CpuMatMul (CudaMatMul) and CutileMatMul compute C = A x B via the
 // standard triple-loop dot-product formula:
-//   C[i][j] = Σ_p A[i][p] * B[p][j]
+//   C[i][j] = Sigma_p A[i][p] * B[p][j]
 //
 // At the integer spec level we represent one output element as a dot product.
 // The GPU uses tiled SMEM blocking; the CPU uses a sequential triple loop.
@@ -134,14 +134,14 @@ pub open spec fn gk_seq_dot(a: Seq<int>, b: Seq<int>) -> int
     else { a.last() * b.last() + gk_seq_dot(a.drop_last(), b.drop_last()) }
 }
 
-// ── MatMul Theorem: CutileMatMul ≡ CudaMatMul ≡ CpuMatMul ───────────────────
+// -- MatMul Theorem: CutileMatMul ??? CudaMatMul ??? CpuMatMul -------------------
 //
 // Both GPU (CudaMatMul / CutileMatMul) and CPU (CpuMatMul) compute the same dot
 // product gk_seq_dot(a_row, b_col) for each output element.
 // The GPU uses shared memory tiling; the CPU uses the sequential formula.
-// Both evaluate the same mathematical sum — definitional at the spec level.
+// Both evaluate the same mathematical sum -- definitional at the spec level.
 //
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 pub proof fn lemma_cutile_matmul_bounded_error(a: Seq<int>, b: Seq<int>)
     requires a.len() == b.len()
@@ -150,7 +150,7 @@ pub proof fn lemma_cutile_matmul_bounded_error(a: Seq<int>, b: Seq<int>)
     // Definitional equivalence: both compute gk_seq_dot. Reflexivity.
 }
 
-// ── Supporting: gk_seq_dot is commutative ────────────────────────────────────
+// -- Supporting: gk_seq_dot is commutative ------------------------------------
 
 pub proof fn lemma_gk_seq_dot_comm(a: Seq<int>, b: Seq<int>)
     requires a.len() == b.len()
@@ -172,7 +172,7 @@ pub proof fn lemma_gk_seq_dot_comm(a: Seq<int>, b: Seq<int>)
 // Attention abstract spec
 //
 // Both CpuAttention (CudaAttention) and CutileFlashAttention compute:
-//   out = softmax(Q K^T / sqrt(d)) × V
+//   out = softmax(Q K^T / sqrt(d)) x V
 //
 // CutileFlashAttention uses the online softmax trick (Flash Attention).
 // The mathematical identity flash = standard was proved in the Flash Attention
@@ -188,13 +188,13 @@ pub open spec fn gk_all_bounded(v: Seq<int>, bound: int) -> bool
     else { gk_abs(v.last()) <= bound && gk_all_bounded(v.drop_last(), bound) }
 }
 
-// ── Attention Theorem: CutileFlashAttention ≡ CudaAttention ≡ CpuAttention ──
+// -- Attention Theorem: CutileFlashAttention ??? CudaAttention ??? CpuAttention --
 //
 // Online softmax (Flash Attention) is mathematically equivalent to standard softmax.
 // Both compute the same weighted sum of V rows. At the spec level, if V is bounded,
 // the output is bounded by the same value (convex combination property).
 //
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 pub proof fn lemma_cutile_attention_bounded_error(v: Seq<int>, bound: int)
     requires bound >= 0, gk_all_bounded(v, bound)
@@ -204,7 +204,7 @@ pub proof fn lemma_cutile_attention_bounded_error(v: Seq<int>, bound: int)
     // The output is the same convex combination of V rows in both implementations.
 }
 
-// ── Sanity checks ──────────────────────────────────────────────────────────
+// -- Sanity checks ----------------------------------------------------------
 
 proof fn check_rmsnorm_spec_empty()
     ensures gk_rmsnorm_spec(Seq::<int>::empty(), Seq::<int>::empty()) =~= Seq::<int>::empty()

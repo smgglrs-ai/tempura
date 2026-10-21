@@ -11,7 +11,7 @@
 //!   ne00 = k    (inner dimension, elements per weight row)
 //!   ne01 = n    (weight rows = output neurons)
 //!   ne10 = k    (inner dimension, elements per activation row)
-//!   ne11 = m    (activation rows — 1 for decode, >1 for prefill)
+//!   ne11 = m    (activation rows -- 1 for decode, >1 for prefill)
 //!   ne0  = ne01 = n
 //!   ne1  = ne11 = m
 //!   ne2/ne3 = batch dims (1 for standard single-sequence inference)
@@ -31,8 +31,8 @@ use super::GgmlType;
 //
 // C definition (ggml-cpu.h):
 //   struct ggml_type_traits_cpu {
-//       ggml_from_float_t  from_float;    // f32[] → quantized[]
-//       ggml_vec_dot_t     vec_dot;       // dot(weight_row, act_row) → f32
+//       ggml_from_float_t  from_float;    // f32[] -> quantized[]
+//       ggml_vec_dot_t     vec_dot;       // dot(weight_row, act_row) -> f32
 //       enum ggml_type     vec_dot_type;  // what format activations must be in
 //       int64_t            nrows;         // weight rows processed per vec_dot call
 //   };
@@ -40,8 +40,8 @@ use super::GgmlType;
 // Key entries for the quant types we care about:
 //
 //   Q4_K:
-//     from_float    = quantize_row_q4_K          (f32 → block_q4_K[])
-//     vec_dot       = ggml_vec_dot_q4_K_q8_K     (block_q4_K[] · block_q8_K[])
+//     from_float    = quantize_row_q4_K          (f32 -> block_q4_K[])
+//     vec_dot       = ggml_vec_dot_q4_K_q8_K     (block_q4_K[] * block_q8_K[])
 //     vec_dot_type  = GGML_TYPE_Q8_K
 //     nrows         = 2  (ARM MATMUL_INT8 mmla path)
 //                   = 1  (x86, all other targets)
@@ -60,7 +60,7 @@ use super::GgmlType;
 //
 //   Q8_K (activations-only, used as vec_dot_type for *_K weights):
 //     from_float    = quantize_row_q8_K
-//     vec_dot       = (none — Q8_K is only used as the activation format)
+//     vec_dot       = (none -- Q8_K is only used as the activation format)
 //
 //   F32:
 //     from_float    = identity copy
@@ -73,8 +73,8 @@ use super::GgmlType;
 
 /// Trait-table nrows on x86 (no ARM mmla).
 ///
-/// On ARM with MATMUL_INT8, Q4_0, Q4_1, Q8_0, Q4_K, Q6_K → nrows = 2, which
-/// enables the mmla kernel that processes 2 weight rows × 2 activation rows per
+/// On ARM with MATMUL_INT8, Q4_0, Q4_1, Q8_0, Q4_K, Q6_K -> nrows = 2, which
+/// enables the mmla kernel that processes 2 weight rows x 2 activation rows per
 /// call. On x86 this is always 1.
 pub fn nrows_for_type(t: GgmlType) -> usize {
     // ARM nrows=2 path requires target_feature="neon" + ARM_FEATURE_MATMUL_INT8.
@@ -112,30 +112,30 @@ pub fn nrows_for_type(t: GgmlType) -> usize {
 // so strides are just row_bytes.
 //
 // Block tiling:
-//   blck_0 = 16  (weight-row tile — iterates over nr0, output neurons)
-//   blck_1 = 16  (activation-row tile — iterates over nr1, tokens)
+//   blck_0 = 16  (weight-row tile -- iterates over nr0, output neurons)
+//   blck_1 = 16  (activation-row tile -- iterates over nr1, tokens)
 //
 // The loop structure is:
 //   for iir1 in (ir1_start..ir1_end).step_by(blck_1)
 //     for iir0 in (ir0_start..ir0_end).step_by(blck_0)
-//       for ir1 in (iir1..iir1+blck_1).step_by(num_rows_per_vec_dot) ← token loop
-//         for ir0 in (iir0..iir0+blck_0).step_by(num_rows_per_vec_dot) ← neuron loop
+//       for ir1 in (iir1..iir1+blck_1).step_by(num_rows_per_vec_dot) <- token loop
+//         for ir0 in (iir0..iir0+blck_0).step_by(num_rows_per_vec_dot) <- neuron loop
 //           vec_dot(k, &mut tmp[ir0-iir0], src0_row+ir0*row0, src1_col+ir1*row1, num_rows)
-//         memcpy tmp → dst_col
+//         memcpy tmp -> dst_col
 //
 // When num_rows_per_vec_dot == 1 (x86 path):
-//   vec_dot processes one weight row × one activation row → one f32 output.
+//   vec_dot processes one weight row x one activation row -> one f32 output.
 // When num_rows_per_vec_dot == 2 (ARM mmla path):
-//   vec_dot processes 2 weight rows × 2 activation rows → 4 f32 outputs stored
+//   vec_dot processes 2 weight rows x 2 activation rows -> 4 f32 outputs stored
 //   in tmp at offsets [0..16) and [16..32) (16-float stride).
 
 /// Translated inner-chunk kernel.
 ///
 /// Arguments:
-///   src0            weight bytes, row-major, n rows × weight_row_bytes
+///   src0            weight bytes, row-major, n rows x weight_row_bytes
 ///   src1_q          activation bytes already quantized to vec_dot_type,
-///                   row-major, m rows × act_row_bytes
-///   dst             output f32, row-major, m rows × n cols
+///                   row-major, m rows x act_row_bytes
+///   dst             output f32, row-major, m rows x n cols
 ///   n               output neurons (weight rows)
 ///   m               tokens (activation rows)
 ///   k               inner dimension (elements)
@@ -203,7 +203,7 @@ pub fn mul_mat_one_chunk(
                     //           num_rows_per_vec_dot);
                     //
                     // When num_rows_per_vec_dot == 1:
-                    //   All stride args are 0 — scalar single-row dot product.
+                    //   All stride args are 0 -- scalar single-row dot product.
                     //   Result stored at tmp[ir0 - iir0].
                     //
                     // When num_rows_per_vec_dot == 2 (ARM mmla):
@@ -263,7 +263,7 @@ pub fn mul_mat_one_chunk(
 //
 // High-level flow:
 //
-//  1. [llamafile sgemm fast path — F32/F16 only, skipped here]
+//  1. [llamafile sgemm fast path -- F32/F16 only, skipped here]
 //
 //  2. Activation quantization (line 1323-1366):
 //     If src1 is not already in vec_dot_type format (always true when src1 is
@@ -274,15 +274,15 @@ pub fn mul_mat_one_chunk(
 //
 //  3. Barrier (ggml_barrier): all threads wait until quantization is complete.
 //
-//  4. [IQ panel gemm — for IQ2/IQ3 quants, skipped here]
+//  4. [IQ panel gemm -- for IQ2/IQ3 quants, skipped here]
 //
 //  5. Chunk setup (lines 1406-1437):
-//     nr0 = ne01 = n   (output neurons — the "weight rows" dimension)
-//     nr1 = ne11 * ne12 * ne13 = m   (tokens × batch dims)
+//     nr0 = ne01 = n   (output neurons -- the "weight rows" dimension)
+//     nr1 = ne11 * ne12 * ne13 = m   (tokens x batch dims)
 //
 //     chunk_size = 16  (default)
 //     if nr0 == 1 or nr1 == 1: chunk_size = 64
-//       → decode (m==1, nr1==1): chunk_size bumped to 64, so most chunks cover
+//       -> decode (m==1, nr1==1): chunk_size bumped to 64, so most chunks cover
 //         weight-row tiles of 64 instead of 16, reducing per-chunk overhead.
 //
 //     nchunk0 = CEIL(nr0 / chunk_size)   (chunks along weight-row axis)
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn mul_mat_one_chunk_zero_weights() {
-        // m=1 (decode), all-zero buffers → all-zero output.
+        // m=1 (decode), all-zero buffers -> all-zero output.
         // Exercises the chunk dispatch path without a weight quantizer.
         let n = 8;
         let m = 1;
@@ -533,7 +533,7 @@ mod tests {
             quantize_row_q8_0(src_row, dst_blocks);
         }
 
-        // Naive reference: f32 weights × f32 activations.
+        // Naive reference: f32 weights x f32 activations.
         let mut ref_dst = vec![0.0f32; m * n];
         for i in 0..m {
             for j in 0..n {

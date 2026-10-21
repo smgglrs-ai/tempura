@@ -4,7 +4,7 @@
 
 use crate::ggml::helpers::f16_to_f32;
 
-// ─── gelu_f16 ────────────────────────────────────────────────────────────────
+// --- gelu_f16 ----------------------------------------------------------------
 // ops.cpp lines 2158-2204
 
 /// Translation of `ggml_compute_forward_gelu_f16`.
@@ -29,7 +29,7 @@ pub fn gelu_rows_f16(
     }
 }
 
-// ─── gelu_erf_f16 ────────────────────────────────────────────────────────────
+// --- gelu_erf_f16 ------------------------------------------------------------
 // ops.cpp lines 2388-2434
 
 /// Translation of `ggml_compute_forward_gelu_erf_f16`.
@@ -53,7 +53,7 @@ pub fn gelu_erf_rows_f16(
     }
 }
 
-// ─── gelu_quick_f16 ──────────────────────────────────────────────────────────
+// --- gelu_quick_f16 ----------------------------------------------------------
 // ops.cpp lines 2507-2553
 
 /// Translation of `ggml_compute_forward_gelu_quick_f16`.
@@ -78,7 +78,7 @@ pub fn gelu_quick_rows_f16(
     }
 }
 
-// ─── leaky_relu_f16 ──────────────────────────────────────────────────────────
+// --- leaky_relu_f16 ----------------------------------------------------------
 // ops.cpp lines 2727-2755
 
 /// Translation of `ggml_compute_forward_leaky_relu_f16`.
@@ -104,7 +104,7 @@ pub fn leaky_relu_rows_f16(
     }
 }
 
-// ─── geglu_f16 ───────────────────────────────────────────────────────────────
+// --- geglu_f16 ---------------------------------------------------------------
 // ops.cpp lines 3094-3152
 
 /// Translation of `ggml_compute_forward_geglu_f16`.
@@ -140,7 +140,7 @@ pub fn geglu_rows_f16(
     }
 }
 
-// ─── geglu_erf_f16 ───────────────────────────────────────────────────────────
+// --- geglu_erf_f16 -----------------------------------------------------------
 // ops.cpp lines 3600-3657 (identical algorithm to geglu_f16 for f16 path)
 
 /// Translation of `ggml_compute_forward_geglu_erf_f16`.
@@ -156,7 +156,7 @@ pub fn geglu_erf_rows_f16(
     geglu_rows_f16(src0, src1, dst, nc, nr, src0_row_stride, src1_row_stride, swapped, ith, nth);
 }
 
-// ─── geglu_quick_f16 ─────────────────────────────────────────────────────────
+// --- geglu_quick_f16 ---------------------------------------------------------
 // ops.cpp lines 3743-3800
 
 /// Translation of `ggml_compute_forward_geglu_quick_f16`.
@@ -191,7 +191,7 @@ pub fn geglu_quick_rows_f16(
     }
 }
 
-// ─── fill_f16 ────────────────────────────────────────────────────────────────
+// --- fill_f16 ----------------------------------------------------------------
 // ops.cpp lines 2249-2265
 
 /// Translation of `ggml_compute_forward_fill_f16`.
@@ -212,7 +212,7 @@ pub fn fill_rows_f16(
     }
 }
 
-// ─── add1_f16_f32 / add1_f16_f16 / add1_bf16_f32 / add1_bf16_bf16 ───────────
+// --- add1_f16_f32 / add1_f16_f16 / add1_bf16_f32 / add1_bf16_bf16 -----------
 // ops.cpp lines 825-1080
 
 /// Translation of `ggml_compute_forward_add1_f16_f32`.
@@ -301,7 +301,7 @@ pub fn add1_f32(
     }
 }
 
-// ─── add_id_f32 ──────────────────────────────────────────────────────────────
+// --- add_id_f32 --------------------------------------------------------------
 // ops.cpp lines 704-753
 
 /// Translation of `ggml_compute_forward_add_id_f32`.
@@ -336,7 +336,7 @@ pub fn add_id_f32(
     }
 }
 
-// ─── add_rel_pos_f32 ─────────────────────────────────────────────────────────
+// --- add_rel_pos_f32 ---------------------------------------------------------
 // ops.cpp lines 10332-10391
 
 /// Translation of `ggml_compute_forward_add_rel_pos_f32`.
@@ -376,7 +376,7 @@ pub fn add_rel_pos_f32(
     }
 }
 
-// ─── concat_any ──────────────────────────────────────────────────────────────
+// --- concat_any --------------------------------------------------------------
 // ops.cpp lines 1899-1949
 
 /// Translation of `ggml_compute_forward_concat_any`.
@@ -410,7 +410,7 @@ pub fn concat_any(
     let row_bytes_src0 = ne00 * elem_size;
     let row_bytes_src1 = ne10 * elem_size;
 
-    // Region 1: src0 → dst, parallelise over i2
+    // Region 1: src0 -> dst, parallelise over i2
     for i3 in 0..ne03 {
         let mut i2 = ith;
         while i2 < ne02 {
@@ -424,7 +424,7 @@ pub fn concat_any(
         }
     }
 
-    // Region 2: src1 → dst with offset
+    // Region 2: src1 -> dst with offset
     for i3 in 0..ne13 {
         let mut i2 = ith;
         while i2 < ne12 {
@@ -439,7 +439,7 @@ pub fn concat_any(
     }
 }
 
-// ─── out_prod_q_f32 ──────────────────────────────────────────────────────────
+// --- out_prod_q_f32 ----------------------------------------------------------
 // ops.cpp lines 4492-4579
 
 /// Translation of `ggml_compute_forward_out_prod_q_f32`.
@@ -480,8 +480,8 @@ pub fn out_prod_q_f32<F>(
     }
 }
 
-// ── From ops.cpp:17 ──────────────────────────────────────────────────────────
-/// ggml_compute_forward_dup_same_cont — parallel memcpy for contiguous same-type tensors.
+// -- From ops.cpp:17 ----------------------------------------------------------
+/// ggml_compute_forward_dup_same_cont -- parallel memcpy for contiguous same-type tensors.
 /// Parallelizes by blocks. ith/nth = thread index / count.
 pub fn dup_same_cont(src: &[u8], dst: &mut [u8], type_size: usize, ith: usize, nth: usize) {
     let nk = src.len() / type_size;
@@ -495,9 +495,9 @@ pub fn dup_same_cont(src: &[u8], dst: &mut [u8], type_size: usize, ith: usize, n
     }
 }
 
-// ── From ops.cpp:47 (f32→f32 contiguous row copy variant) ────────────────────
-/// ggml_compute_forward_dup_flt — element-wise copy with type conversion via f32 intermediary.
-/// Handles f32↔f16 conversion. Parallel by rows (ith/nth).
+// -- From ops.cpp:47 (f32->f32 contiguous row copy variant) --------------------
+/// ggml_compute_forward_dup_flt -- element-wise copy with type conversion via f32 intermediary.
+/// Handles f32???f16 conversion. Parallel by rows (ith/nth).
 /// ne00: src cols, ne01: src rows, ne02: batch2, ne03: batch3
 /// nb00/nb01/nb02/nb03: src strides in bytes
 /// nb0/nb1/nb2/nb3: dst strides in bytes
@@ -528,7 +528,7 @@ pub fn dup_flt_f32_f32(
         }
         return;
     }
-    // generic strided copy (f32→f32 element-wise)
+    // generic strided copy (f32->f32 element-wise)
     unsafe {
         for i03 in 0..ne03 as usize {
             for i02 in 0..ne02 as usize {
@@ -544,7 +544,7 @@ pub fn dup_flt_f32_f32(
     }
 }
 
-/// ggml_compute_forward_dup_flt — f32→f16 variant. Converts via f32.
+/// ggml_compute_forward_dup_flt -- f32->f16 variant. Converts via f32.
 #[allow(clippy::too_many_arguments)]
 pub fn dup_flt_f32_f16(
     src: *const u8, ne00: i64, ne01: i64, ne02: i64, ne03: i64,
@@ -571,7 +571,7 @@ pub fn dup_flt_f32_f16(
     }
 }
 
-/// ggml_compute_forward_dup_flt — f16→f32 variant.
+/// ggml_compute_forward_dup_flt -- f16->f32 variant.
 #[allow(clippy::too_many_arguments)]
 pub fn dup_flt_f16_f32(
     src: *const u8, ne00: i64, ne01: i64, ne02: i64, ne03: i64,
@@ -599,8 +599,8 @@ pub fn dup_flt_f16_f32(
     }
 }
 
-// ── From ops.cpp:475 ─────────────────────────────────────────────────────────
-/// ggml_compute_forward_dup_from_q — dequantize quantized src to float dst.
+// -- From ops.cpp:475 ---------------------------------------------------------
+/// ggml_compute_forward_dup_from_q -- dequantize quantized src to float dst.
 /// `dequantize_row_q`: fn(&[u8], &mut [f32]) for one quantized block (qk elements).
 /// Parallel by quantized blocks (ir0..ir1 each thread).
 pub fn dup_from_q(
@@ -637,8 +637,8 @@ pub fn dup_from_q(
     }
 }
 
-// ── From ops.cpp:578 ─────────────────────────────────────────────────────────
-/// ggml_compute_forward_add_q_f32 — dequantize row, add f32 src1, requantize.
+// -- From ops.cpp:578 ---------------------------------------------------------
+/// ggml_compute_forward_add_q_f32 -- dequantize row, add f32 src1, requantize.
 /// `dequantize_row_q`: fn(&[u8], &mut [f32]) for one quantized row (ne00 elements).
 /// `quantize_row_q`: optional fn(&[f32], &mut [u8]).
 pub fn add_q_f32(
@@ -682,8 +682,8 @@ pub fn add_q_f32(
     }
 }
 
-// ── From ops.cpp:1513 ────────────────────────────────────────────────────────
-/// ggml_compute_forward_mean_f32 — per-row mean (single-threaded, ith==0 only).
+// -- From ops.cpp:1513 --------------------------------------------------------
+/// ggml_compute_forward_mean_f32 -- per-row mean (single-threaded, ith==0 only).
 pub fn mean_f32(
     src: &[f32], dst: &mut [f32],
     ne00: usize, ne01: usize, ne02: usize, ne03: usize,
@@ -702,8 +702,8 @@ pub fn mean_f32(
     }
 }
 
-// ── From ops.cpp:1410 ────────────────────────────────────────────────────────
-/// ggml_compute_forward_cumsum_f32 — prefix sum per row, parallel by rows.
+// -- From ops.cpp:1410 --------------------------------------------------------
+/// ggml_compute_forward_cumsum_f32 -- prefix sum per row, parallel by rows.
 pub fn cumsum_f32(
     src: &[f32], dst: &mut [f32],
     ne00: usize, ne01: usize, ne02: usize, ne03: usize,
@@ -727,8 +727,8 @@ pub fn cumsum_f32(
     }
 }
 
-// ── From ops.cpp:3827 ────────────────────────────────────────────────────────
-/// ggml_compute_forward_norm_f32 — layer normalization. Parallel by rows (ith step nth).
+// -- From ops.cpp:3827 --------------------------------------------------------
+/// ggml_compute_forward_norm_f32 -- layer normalization. Parallel by rows (ith step nth).
 pub fn norm_f32(
     src: &[f32], dst: &mut [f32],
     ne00: usize, ne01: usize, ne02: usize, ne03: usize,
@@ -754,8 +754,8 @@ pub fn norm_f32(
     }
 }
 
-// ── From ops.cpp:5496 ────────────────────────────────────────────────────────
-/// ggml_compute_forward_diag_mask_f32 — mask upper triangle with `value`.
+// -- From ops.cpp:5496 --------------------------------------------------------
+/// ggml_compute_forward_diag_mask_f32 -- mask upper triangle with `value`.
 /// n_past: how many past tokens to keep unmasked. Parallel by rows (j step nth).
 pub fn diag_mask_f32(
     data: &mut [f32],
@@ -776,11 +776,11 @@ pub fn diag_mask_f32(
     }
 }
 
-// ── From ops.cpp:7683 ────────────────────────────────────────────────────────
+// -- From ops.cpp:7683 --------------------------------------------------------
 #[derive(Clone, Copy, PartialEq)]
 pub enum PoolOp { Avg, Max }
 
-/// ggml_compute_forward_pool_1d_ksp — 1D pooling (avg or max). Single-threaded (ith==0).
+/// ggml_compute_forward_pool_1d_ksp -- 1D pooling (avg or max). Single-threaded (ith==0).
 pub fn pool_1d_ksp(
     src: &[f32], iw: usize,
     dst: &mut [f32], ow: usize,
@@ -813,8 +813,8 @@ pub fn pool_1d_ksp(
     }
 }
 
-// ── From ops.cpp:7978 ────────────────────────────────────────────────────────
-/// ggml_compute_forward_upscale_f32 — nearest-neighbor upscaling.
+// -- From ops.cpp:7978 --------------------------------------------------------
+/// ggml_compute_forward_upscale_f32 -- nearest-neighbor upscaling.
 /// sf0/sf1/sf2/sf3: scale factors per dimension. Parallel by i2 (ith step nth).
 #[allow(clippy::too_many_arguments)]
 pub fn upscale_f32_nearest(
@@ -841,8 +841,8 @@ pub fn upscale_f32_nearest(
     }
 }
 
-// ── From ops.cpp:8424 ────────────────────────────────────────────────────────
-/// ggml_compute_forward_timestep_embedding_f32 — sinusoidal timestep embeddings.
+// -- From ops.cpp:8424 --------------------------------------------------------
+/// ggml_compute_forward_timestep_embedding_f32 -- sinusoidal timestep embeddings.
 /// Parallel by output half-dim j (ith step nth).
 pub fn timestep_embedding_f32(
     timesteps: &[f32], dst: &mut [f32],
@@ -866,9 +866,9 @@ pub fn timestep_embedding_f32(
     }
 }
 
-// ── From ops.cpp:10824 ───────────────────────────────────────────────────────
-/// ggml_compute_forward_solve_tri_f32 — lower-triangular solve Ax=B.
-/// A: [n×n], B: [k×n], X: [k×n] output. Parallel by (batch×k) columns.
+// -- From ops.cpp:10824 -------------------------------------------------------
+/// ggml_compute_forward_solve_tri_f32 -- lower-triangular solve Ax=B.
+/// A: [nxn], B: [kxn], X: [kxn] output. Parallel by (batchxk) columns.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_tri_f32(
     a: &[f32], b: &[f32], x: &mut [f32],
@@ -896,7 +896,7 @@ pub fn solve_tri_f32(
     }
 }
 
-// ── From ops.cpp:4979 ─────────────────────────────────────────────────────
+// -- From ops.cpp:4979 -----------------------------------------------------
 /// Quantized embedding lookup: dequantize selected rows from src0 (quantized)
 /// into dst (f32). Row indices come from src1 (i32 array).
 /// Translation of `ggml_compute_forward_get_rows_q`.
@@ -922,14 +922,14 @@ pub fn get_rows_q(
     }
 }
 
-// ── From ops.cpp:5328 ─────────────────────────────────────────────────────
+// -- From ops.cpp:5328 -----------------------------------------------------
 /// Embedding backward: scatter-add f16 src0 rows into f32 dst.
 /// Row indices from src1. Thread 0 only (sets dst to 0 first).
 /// Translation of `ggml_compute_forward_get_rows_back_f32_f16`.
 pub fn get_rows_back_f32_f16(
-    src0: &[u16],    // f16 gradient rows [nr × nc]
+    src0: &[u16],    // f16 gradient rows [nr x nc]
     src1: &[i32],    // row indices [nr]
-    dst: &mut [f32], // f32 output table [vocab_size × nc]
+    dst: &mut [f32], // f32 output table [vocab_size x nc]
     nc: usize,
     ith: usize,
 ) {
@@ -949,9 +949,9 @@ pub fn get_rows_back_f32_f16(
     }
 }
 
-// ── From ops.cpp:921 ──────────────────────────────────────────────────────
+// -- From ops.cpp:921 ------------------------------------------------------
 /// Add scalar to each element of a quantized tensor row-by-row
-/// (dequantize → add → requantize). Thread-parallel over rows.
+/// (dequantize -> add -> requantize). Thread-parallel over rows.
 /// Translation of `ggml_compute_forward_add1_q_f32`.
 pub fn add1_q_f32(
     src0: &[u8],         // quantized source rows
@@ -962,7 +962,7 @@ pub fn add1_q_f32(
     row_bytes: usize,    // bytes per quantized row
     dequantize: fn(&[u8], &mut [f32]),
     quantize: fn(&[f32], &mut [u8]),
-    tmp: &mut [f32],     // scratch of length ≥ ne0
+    tmp: &mut [f32],     // scratch of length >= ne0
     ith: usize, nth: usize,
 ) {
     let dr = (nr + nth - 1) / nth;
@@ -979,7 +979,7 @@ pub fn add1_q_f32(
     }
 }
 
-// ── From ops.cpp:270 ──────────────────────────────────────────────────────
+// -- From ops.cpp:270 ------------------------------------------------------
 /// Copy non-quantized (f32/f16) source rows to quantized destination.
 /// Translation of `ggml_compute_forward_dup_to_q` (the contiguous path).
 pub fn dup_to_q_f32(

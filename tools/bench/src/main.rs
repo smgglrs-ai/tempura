@@ -208,7 +208,7 @@ async fn bench_tg(
                 let mut last_token: Option<Instant> = None;
                 let mut token_count = 0usize;
 
-                // Stream chunks as they arrive — r.bytes() buffers everything,
+                // Stream chunks as they arrive -- r.bytes() buffers everything,
                 // collapsing first/last timestamps to near-zero.
                 use futures_util::StreamExt;
                 let mut stream = r.bytes_stream();
@@ -424,7 +424,7 @@ async fn main() {
             eprintln!("REGRESSIONS DETECTED:");
             for r in &regressions {
                 eprintln!(
-                    "  {}: {:.1} → {:.1} tok/s ({:+.1}%)",
+                    "  {}: {:.1} -> {:.1} tok/s ({:+.1}%)",
                     r.label, r.baseline, r.current, r.pct
                 );
             }

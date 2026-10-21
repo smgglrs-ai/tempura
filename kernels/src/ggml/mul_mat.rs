@@ -60,15 +60,15 @@ fn vec_dot_best(n: usize, result: &mut f32, vx: &[u8], vy: &[u8], weight_type: G
 /// Registry-driven quantized mat-mul, matching ggml's `ggml_compute_forward_mul_mat` pattern.
 ///
 /// src0 (weights) is quantized with type `src0_type`, stored row-major.
-/// src1 (activations) is f32, stored row-major as m rows × k cols.
-/// dst is f32, stored row-major as m rows × n cols.
+/// src1 (activations) is f32, stored row-major as m rows x k cols.
+/// dst is f32, stored row-major as m rows x n cols.
 ///
 /// Each weight row is `k / block_size * type_size` bytes.
 /// n = number of weight rows = number of output columns.
 ///
 /// Algorithm:
 /// 1. Quantize each src1 row to vec_dot_type (Q8_0 or Q8_K)
-/// 2. For each (src1_row, weight_row), call vec_dot → one output element
+/// 2. For each (src1_row, weight_row), call vec_dot -> one output element
 pub fn mul_mat_q(
     src0_type: GgmlType,
     src0: &[u8],
@@ -174,7 +174,7 @@ impl PreQuantizedQ8 {
     }
 }
 
-/// mul_mat with pre-quantized activations — avoids re-quantizing when
+/// mul_mat with pre-quantized activations -- avoids re-quantizing when
 /// the same activations are used across multiple weight tensors.
 pub fn mul_mat_q_preq(
     src0_type: GgmlType,
@@ -273,7 +273,7 @@ mod tests {
         let n = 2; // 2 weight rows (output cols)
         let k = 256; // must be multiple of 256 for Q4K
 
-        // create Q4K weight blocks (2 rows × 1 block each)
+        // create Q4K weight blocks (2 rows x 1 block each)
         let mut weights = Vec::new();
         for row_idx in 0..n {
             let blk = BlockQ4K {
@@ -352,7 +352,7 @@ mod tests {
         assert!(out[0].abs() < 0.1, "expected ~0, got {}", out[0]);
     }
 
-    // ── Determinism: same input → bit-identical output ──
+    // -- Determinism: same input -> bit-identical output --
 
     #[test]
     fn determinism_q4k_avx2() {
@@ -404,9 +404,9 @@ mod tests {
         }
     }
 
-    // ── Scalar vs AVX2 equivalence (not bit-identical due to f32 associativity) ──
+    // -- Scalar vs AVX2 equivalence (not bit-identical due to f32 associativity) --
     // madd_epi16(scale, maddubs(q4, q8)) computes scale*(a0*b0+a1*b1)
-    // scalar computes scale*a0*b0 + scale*a1*b1 — different rounding.
+    // scalar computes scale*a0*b0 + scale*a1*b1 -- different rounding.
     // Tolerance: < 0.01 relative error (acceptable for quantized inference).
 
     fn make_q4k_weights(n: usize, k: usize, seed: u8) -> Vec<u8> {
@@ -663,7 +663,7 @@ mod tests {
     fn dual_pipeline_q4k_batch_scalar_vs_avx2() {
         let n = 8;
         let k = 512;
-        let m = 4; // batch of 4 — exercises batched activation quantization
+        let m = 4; // batch of 4 -- exercises batched activation quantization
         let weights = make_q4k_weights(n, k, 99);
         let activations = make_activations(m, k);
 

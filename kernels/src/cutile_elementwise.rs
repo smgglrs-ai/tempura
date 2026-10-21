@@ -200,17 +200,17 @@ impl CutileElementwise {
 
     /// SiLU-gated projection operating entirely on device tensors.
     ///
-    /// `gate` and `up` must already reside on the GPU (`seq_len × inter` elements
+    /// `gate` and `up` must already reside on the GPU (`seq_len x inter` elements
     /// each, flat 1-D).  The result is computed on the GPU and returned as a
-    /// device tensor of `seq_len × inter` elements — no host round-trip for the
+    /// device tensor of `seq_len x inter` elements -- no host round-trip for the
     /// gate or up inputs.
     ///
     /// When `inter` is already a multiple of `B` (true for all standard models,
-    /// e.g. 11008 = 344 × 32) the inputs are used directly; otherwise a small
+    /// e.g. 11008 = 344 x 32) the inputs are used directly; otherwise a small
     /// host-side zero-padding pass is inserted.
     ///
-    /// PCIe transfers: 0 D→H + 0 H→D for the standard (B-aligned) path.
-    /// Compare to the CPU path: 2 D→H (gate + up) + 1 H→D (silu result) = 3 transfers.
+    /// PCIe transfers: 0 D->H + 0 H->D for the standard (B-aligned) path.
+    /// Compare to the CPU path: 2 D->H (gate + up) + 1 H->D (silu result) = 3 transfers.
     pub fn silu_mul_device(
         &self,
         gate: &Arc<Tensor<f32>>,
@@ -228,7 +228,7 @@ impl CutileElementwise {
             .partition([B]);
 
         let (gate_t, up_t): (Arc<Tensor<f32>>, Arc<Tensor<f32>>) = if n_pad == n {
-            // Already B-aligned: pass device tensors directly — 0 PCIe transfers.
+            // Already B-aligned: pass device tensors directly -- 0 PCIe transfers.
             (gate.clone(), up.clone())
         } else {
             // Rare: inter not a multiple of B.  Download, pad, upload.

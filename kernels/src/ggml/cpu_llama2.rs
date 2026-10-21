@@ -3,36 +3,36 @@
 //! Source file: ggml/src/ggml-cpu/ggml-cpu.c
 //!
 //! Translated sections:
-//!   - `ggml_graph_plan`             → [`graph_plan`]
-//!   - `ggml_cpu_try_fuse_ops`       → [`try_fuse_ops`]
-//!   - `ggml_cpu_fp32_to_fp32`       → [`fp32_to_fp32`]
-//!   - `ggml_cpu_fp32_to_fp16`       → [`fp32_to_fp16`]
-//!   - `ggml_cpu_fp16_to_fp32`       → [`fp16_to_fp32`]
-//!   - `ggml_cpu_fp32_to_bf16`       → [`fp32_to_bf16`]
-//!   - `ggml_cpu_fp32_to_i32`        → [`fp32_to_i32`]
-//!   - `ggml_cpu_bf16_to_fp32`       → [`bf16_to_fp32`]
-//!   - `ggml_cpu_has_avx`            → [`has_avx`]
-//!   - `ggml_cpu_has_avx2`           → [`has_avx2`]
-//!   - `ggml_cpu_has_avx_vnni`       → [`has_avx_vnni`]
-//!   - `ggml_cpu_has_avx512`         → [`has_avx512`]
-//!   - `ggml_cpu_has_avx512_vbmi`    → [`has_avx512_vbmi`]
-//!   - `ggml_cpu_has_avx512_vnni`    → [`has_avx512_vnni`]
-//!   - `ggml_cpu_has_avx512_bf16`    → [`has_avx512_bf16`]
-//!   - `ggml_cpu_has_amx_int8`       → [`has_amx_int8`]
-//!   - `ggml_cpu_has_bmi2`           → [`has_bmi2`]
-//!   - `ggml_cpu_has_fma`            → [`has_fma`]
-//!   - `ggml_cpu_has_arm_fma`        → [`has_arm_fma`]
-//!   - `ggml_cpu_has_riscv_v`        → [`has_riscv_v`]
-//!   - `ggml_cpu_has_f16c`           → [`has_f16c`]
-//!   - `ggml_cpu_has_fp16_va`        → [`has_fp16_va`]
-//!   - `ggml_cpu_has_wasm_simd`      → [`has_wasm_simd`]
-//!   - `ggml_cpu_has_sse3`           → [`has_sse3`]
-//!   - `ggml_cpu_has_ssse3`          → [`has_ssse3`]
-//!   - `ggml_cpu_has_vsx`            → [`has_vsx`]
-//!   - `ggml_cpu_has_neon`           → [`has_neon`]
-//!   - `ggml_cpu_has_dotprod`        → [`has_dotprod`]
-//!   - `ggml_cpu_has_sve`            → [`has_sve`]
-//!   - `ggml_cpu_has_matmul_int8`    → [`has_matmul_int8`]
+//!   - `ggml_graph_plan`             -> [`graph_plan`]
+//!   - `ggml_cpu_try_fuse_ops`       -> [`try_fuse_ops`]
+//!   - `ggml_cpu_fp32_to_fp32`       -> [`fp32_to_fp32`]
+//!   - `ggml_cpu_fp32_to_fp16`       -> [`fp32_to_fp16`]
+//!   - `ggml_cpu_fp16_to_fp32`       -> [`fp16_to_fp32`]
+//!   - `ggml_cpu_fp32_to_bf16`       -> [`fp32_to_bf16`]
+//!   - `ggml_cpu_fp32_to_i32`        -> [`fp32_to_i32`]
+//!   - `ggml_cpu_bf16_to_fp32`       -> [`bf16_to_fp32`]
+//!   - `ggml_cpu_has_avx`            -> [`has_avx`]
+//!   - `ggml_cpu_has_avx2`           -> [`has_avx2`]
+//!   - `ggml_cpu_has_avx_vnni`       -> [`has_avx_vnni`]
+//!   - `ggml_cpu_has_avx512`         -> [`has_avx512`]
+//!   - `ggml_cpu_has_avx512_vbmi`    -> [`has_avx512_vbmi`]
+//!   - `ggml_cpu_has_avx512_vnni`    -> [`has_avx512_vnni`]
+//!   - `ggml_cpu_has_avx512_bf16`    -> [`has_avx512_bf16`]
+//!   - `ggml_cpu_has_amx_int8`       -> [`has_amx_int8`]
+//!   - `ggml_cpu_has_bmi2`           -> [`has_bmi2`]
+//!   - `ggml_cpu_has_fma`            -> [`has_fma`]
+//!   - `ggml_cpu_has_arm_fma`        -> [`has_arm_fma`]
+//!   - `ggml_cpu_has_riscv_v`        -> [`has_riscv_v`]
+//!   - `ggml_cpu_has_f16c`           -> [`has_f16c`]
+//!   - `ggml_cpu_has_fp16_va`        -> [`has_fp16_va`]
+//!   - `ggml_cpu_has_wasm_simd`      -> [`has_wasm_simd`]
+//!   - `ggml_cpu_has_sse3`           -> [`has_sse3`]
+//!   - `ggml_cpu_has_ssse3`          -> [`has_ssse3`]
+//!   - `ggml_cpu_has_vsx`            -> [`has_vsx`]
+//!   - `ggml_cpu_has_neon`           -> [`has_neon`]
+//!   - `ggml_cpu_has_dotprod`        -> [`has_dotprod`]
+//!   - `ggml_cpu_has_sve`            -> [`has_sve`]
+//!   - `ggml_cpu_has_matmul_int8`    -> [`has_matmul_int8`]
 
 use super::cpu_llama::{GgmlOp, GgmlCplan, DEFAULT_N_THREADS};
 use super::GgmlType;
@@ -89,7 +89,7 @@ pub struct PlanNode {
     pub ne: [i64; 4],
     /// Optional source tensors (up to 3).
     pub src: [Option<PlanSrc>; 3],
-    /// op_params[0] — used by GATED_DELTA_NET (K stride).
+    /// op_params[0] -- used by GATED_DELTA_NET (K stride).
     pub op_param0: i32,
 }
 
@@ -99,7 +99,7 @@ impl PlanNode {
     fn src2(&self) -> Option<PlanSrc> { self.src[2] }
 }
 
-/// Minimal graph view for planning — just the node slice.
+/// Minimal graph view for planning -- just the node slice.
 pub struct PlanGraph<'a> {
     pub nodes: &'a [PlanNode],
 }
@@ -131,23 +131,23 @@ fn row_size(typ: GgmlType, n: i64) -> usize {
     ((n + bs - 1) / bs) as usize * ts
 }
 
-/// `ggml_nelements(src)` — total element count.
+/// `ggml_nelements(src)` -- total element count.
 #[inline]
 fn nelements(ne: &[i64; 4]) -> i64 {
     ne[0] * ne[1] * ne[2] * ne[3]
 }
 
 // ---------------------------------------------------------------------------
-// graph_plan — translated from `ggml_graph_plan` (ggml-cpu.c lines 2815-3068)
+// graph_plan -- translated from `ggml_graph_plan` (ggml-cpu.c lines 2815-3068)
 // ---------------------------------------------------------------------------
 //
 // Computes the scratch work-buffer size required by each node in `cgraph`
 // and returns a `GgmlCplan` with `work_data` pre-allocated to that size.
 //
 // External functions with complex dependencies are stubbed:
-//   - `ggml_cpu_extra_work_size`       → always returns `false` (not applicable)
-//   - `ggml_cpu_iqp_supports_mul_mat`  → always returns `false`
-//   - `ggml_cpu_iqp_scratch_size`      → returns 0
+//   - `ggml_cpu_extra_work_size`       -> always returns `false` (not applicable)
+//   - `ggml_cpu_iqp_supports_mul_mat`  -> always returns `false`
+//   - `ggml_cpu_iqp_scratch_size`      -> returns 0
 //
 // The caller must populate `PlanNode` fields accurately for the work-buffer
 // estimate to be correct; incorrect sizes lead to under/over-allocation
@@ -155,7 +155,7 @@ fn nelements(ne: &[i64; 4]) -> i64 {
 
 /// Translated from `ggml_graph_plan` (ggml-cpu.c lines 2815-3068).
 ///
-/// `n_threads_hint` — if 0, defaults to `DEFAULT_N_THREADS`.
+/// `n_threads_hint` -- if 0, defaults to `DEFAULT_N_THREADS`.
 /// Returns a `GgmlCplan` with `work_data` allocated (or empty if not needed).
 pub fn graph_plan(cgraph: &PlanGraph<'_>, n_threads_hint: usize) -> GgmlCplan {
     let n_threads = if n_threads_hint == 0 {
@@ -177,7 +177,7 @@ pub fn graph_plan(cgraph: &PlanGraph<'_>, n_threads_hint: usize) -> GgmlCplan {
 
         let mut cur: usize = 0;
 
-        // ggml_cpu_extra_work_size stub: always false → proceed with switch.
+        // ggml_cpu_extra_work_size stub: always false -> proceed with switch.
 
         match node.op {
             GgmlOp::Cpy | GgmlOp::Dup => {
@@ -228,7 +228,7 @@ pub fn graph_plan(cgraph: &PlanGraph<'_>, n_threads_hint: usize) -> GgmlCplan {
 
             GgmlOp::MulMatId => {
                 // Scratch for: src1 conversion + matrix_row_counts + matrix_rows + atomic chunks.
-                // Stubbed: ggml_cpu_iqp_supports_mul_mat_id → false.
+                // Stubbed: ggml_cpu_iqp_supports_mul_mat_id -> false.
                 if let (Some(src0), Some(src1), Some(_ids)) =
                     (node.src0(), node.src1(), node.src2())
                 {
@@ -486,7 +486,7 @@ fn get_n_tasks_for_plan(node: &PlanNode, n_threads: usize) -> usize {
         | GgmlOp::MapCustom2
         | GgmlOp::MapCustom3
         | GgmlOp::Custom => {
-            // op_param0 == -1 (GGML_N_TASKS_MAX) → n_threads; else min(param, n_threads)
+            // op_param0 == -1 (GGML_N_TASKS_MAX) -> n_threads; else min(param, n_threads)
             if node.op_param0 == -1 {
                 n_threads
             } else {
@@ -499,7 +499,7 @@ fn get_n_tasks_for_plan(node: &PlanNode, n_threads: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// try_fuse_ops — translated from `ggml_cpu_try_fuse_ops` (ggml-cpu.c lines 3075-3107)
+// try_fuse_ops -- translated from `ggml_cpu_try_fuse_ops` (ggml-cpu.c lines 3075-3107)
 // ---------------------------------------------------------------------------
 //
 // In the C source, this checks `ggml_can_fuse(cgraph, node_n, fuse_ops, 2)`
@@ -522,7 +522,7 @@ pub trait CanFuse {
     fn can_fuse(&self, node_n: usize, ops: &[GgmlOp]) -> bool;
 }
 
-/// Fusion dispatcher — executed when a fusion is detected.
+/// Fusion dispatcher -- executed when a fusion is detected.
 pub trait FusedDispatch<P> {
     /// Execute the RMS_NORM + MUL fused kernel.
     fn forward_rms_norm_mul_fused(&self, params: &P, rms_node_n: usize, mul_node_n: usize);
@@ -563,12 +563,12 @@ pub struct FuseNodeInfo {
 ///
 /// Returns the number of nodes consumed by fusion (0 = no fusion applied).
 ///
-/// `node_n`  — index of the current node in the graph.
-/// `rms_node` — info for the RMS_NORM candidate.
-/// `mul_node` — info for the following MUL node (caller provides if exists).
-/// `use_ref`  — from the compute plan; disables fusion when true.
-/// `can_fuse` — graph-level predicate (implements [`CanFuse`]).
-/// `dispatch` — called to execute the fused kernel.
+/// `node_n`  -- index of the current node in the graph.
+/// `rms_node` -- info for the RMS_NORM candidate.
+/// `mul_node` -- info for the following MUL node (caller provides if exists).
+/// `use_ref`  -- from the compute plan; disables fusion when true.
+/// `can_fuse` -- graph-level predicate (implements [`CanFuse`]).
+/// `dispatch` -- called to execute the fused kernel.
 pub fn try_fuse_ops<P, D: FusedDispatch<P>, C: CanFuse>(
     node_n: usize,
     rms_node: &FuseNodeInfo,
@@ -609,7 +609,7 @@ pub fn try_fuse_ops<P, D: FusedDispatch<P>, C: CanFuse>(
 // The Rust translations use the `half` crate for scalar fallback; SIMD paths
 // are added via `target_feature` blocks on x86_64 for the AVX-512/F16C cases.
 
-/// Translated from `ggml_cpu_fp32_to_fp32` — memcpy (ggml-cpu.c line 3484).
+/// Translated from `ggml_cpu_fp32_to_fp32` -- memcpy (ggml-cpu.c line 3484).
 pub fn fp32_to_fp32(src: &[f32], dst: &mut [f32]) {
     debug_assert_eq!(src.len(), dst.len());
     dst.copy_from_slice(src);
@@ -745,7 +745,7 @@ pub fn fp32_to_bf16(src: &[f32], dst: &mut [u16]) {
 
 /// Translated from `ggml_cpu_fp32_to_i32` (ggml-cpu.c lines 3582-3587).
 ///
-/// Truncates f32 → i32 (C cast: `y[i] = x[i]`).
+/// Truncates f32 -> i32 (C cast: `y[i] = x[i]`).
 pub fn fp32_to_i32(src: &[f32], dst: &mut [i32]) {
     debug_assert_eq!(src.len(), dst.len());
     for (s, d) in src.iter().zip(dst.iter_mut()) {
@@ -767,7 +767,7 @@ pub fn bf16_to_fp32(src: &[u16], dst: &mut [f32]) {
         use std::arch::x86_64::*;
         unsafe {
             while i + 16 <= n {
-                // Load 16 u16 → zero-extend to i32 → shift left 16 → reinterpret as f32.
+                // Load 16 u16 -> zero-extend to i32 -> shift left 16 -> reinterpret as f32.
                 let xv = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
                 let z32 = _mm512_cvtepu16_epi32(xv);
                 let shifted = _mm512_slli_epi32(z32, 16);
@@ -821,7 +821,7 @@ pub fn bf16_to_fp32(src: &[u16], dst: &mut [f32]) {
 // where compile-time detection is insufficient.
 // ---------------------------------------------------------------------------
 
-/// `ggml_cpu_has_avx` — AVX support (ggml-cpu.c line 3643).
+/// `ggml_cpu_has_avx` -- AVX support (ggml-cpu.c line 3643).
 pub fn has_avx() -> bool {
     #[cfg(target_feature = "avx")]
     return true;
@@ -829,7 +829,7 @@ pub fn has_avx() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_avx_vnni` — AVX-VNNI support (ggml-cpu.c line 3651).
+/// `ggml_cpu_has_avx_vnni` -- AVX-VNNI support (ggml-cpu.c line 3651).
 pub fn has_avx_vnni() -> bool {
     #[cfg(target_feature = "avxvnni")]
     return true;
@@ -837,7 +837,7 @@ pub fn has_avx_vnni() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_avx2` — AVX2 support (ggml-cpu.c line 3659).
+/// `ggml_cpu_has_avx2` -- AVX2 support (ggml-cpu.c line 3659).
 pub fn has_avx2() -> bool {
     #[cfg(target_feature = "avx2")]
     return true;
@@ -845,7 +845,7 @@ pub fn has_avx2() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_avx512` — AVX-512F support (ggml-cpu.c line 3667).
+/// `ggml_cpu_has_avx512` -- AVX-512F support (ggml-cpu.c line 3667).
 pub fn has_avx512() -> bool {
     #[cfg(target_feature = "avx512f")]
     return true;
@@ -853,7 +853,7 @@ pub fn has_avx512() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_avx512_vbmi` — AVX-512 VBMI support (ggml-cpu.c line 3675).
+/// `ggml_cpu_has_avx512_vbmi` -- AVX-512 VBMI support (ggml-cpu.c line 3675).
 pub fn has_avx512_vbmi() -> bool {
     #[cfg(target_feature = "avx512vbmi")]
     return true;
@@ -861,7 +861,7 @@ pub fn has_avx512_vbmi() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_avx512_vnni` — AVX-512 VNNI support (ggml-cpu.c line 3683).
+/// `ggml_cpu_has_avx512_vnni` -- AVX-512 VNNI support (ggml-cpu.c line 3683).
 pub fn has_avx512_vnni() -> bool {
     #[cfg(target_feature = "avx512vnni")]
     return true;
@@ -869,7 +869,7 @@ pub fn has_avx512_vnni() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_avx512_bf16` — AVX-512 BF16 support (ggml-cpu.c line 3691).
+/// `ggml_cpu_has_avx512_bf16` -- AVX-512 BF16 support (ggml-cpu.c line 3691).
 pub fn has_avx512_bf16() -> bool {
     #[cfg(target_feature = "avx512bf16")]
     return true;
@@ -877,7 +877,7 @@ pub fn has_avx512_bf16() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_amx_int8` — AMX INT8 support (ggml-cpu.c line 3699).
+/// `ggml_cpu_has_amx_int8` -- AMX INT8 support (ggml-cpu.c line 3699).
 pub fn has_amx_int8() -> bool {
     #[cfg(target_feature = "amx-int8")]
     return true;
@@ -885,7 +885,7 @@ pub fn has_amx_int8() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_bmi2` — BMI2 support (ggml-cpu.c line 3707).
+/// `ggml_cpu_has_bmi2` -- BMI2 support (ggml-cpu.c line 3707).
 pub fn has_bmi2() -> bool {
     #[cfg(target_feature = "bmi2")]
     return true;
@@ -893,7 +893,7 @@ pub fn has_bmi2() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_fma` — FMA support (ggml-cpu.c line 3715).
+/// `ggml_cpu_has_fma` -- FMA support (ggml-cpu.c line 3715).
 pub fn has_fma() -> bool {
     #[cfg(target_feature = "fma")]
     return true;
@@ -901,7 +901,7 @@ pub fn has_fma() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_arm_fma` — ARM FMA support (ggml-cpu.c line 3723).
+/// `ggml_cpu_has_arm_fma` -- ARM FMA support (ggml-cpu.c line 3723).
 pub fn has_arm_fma() -> bool {
     #[cfg(target_feature = "neon")]
     return true;
@@ -909,12 +909,12 @@ pub fn has_arm_fma() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_riscv_v` — RISC-V V intrinsics (ggml-cpu.c line 3731).
+/// `ggml_cpu_has_riscv_v` -- RISC-V V intrinsics (ggml-cpu.c line 3731).
 pub fn has_riscv_v() -> bool {
     false // Rust stable doesn't expose riscv_v_intrinsic cfg
 }
 
-/// `ggml_cpu_has_f16c` — F16C (half-float convert) support (ggml-cpu.c line 3747).
+/// `ggml_cpu_has_f16c` -- F16C (half-float convert) support (ggml-cpu.c line 3747).
 pub fn has_f16c() -> bool {
     #[cfg(target_feature = "f16c")]
     return true;
@@ -922,12 +922,12 @@ pub fn has_f16c() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_fp16_va` — ARM FP16 vector arithmetic (ggml-cpu.c line 3755).
+/// `ggml_cpu_has_fp16_va` -- ARM FP16 vector arithmetic (ggml-cpu.c line 3755).
 pub fn has_fp16_va() -> bool {
     false // not yet exposed as a stable Rust cfg target_feature
 }
 
-/// `ggml_cpu_has_wasm_simd` — WebAssembly SIMD128 (ggml-cpu.c line 3763).
+/// `ggml_cpu_has_wasm_simd` -- WebAssembly SIMD128 (ggml-cpu.c line 3763).
 pub fn has_wasm_simd() -> bool {
     #[cfg(target_feature = "simd128")]
     return true;
@@ -935,7 +935,7 @@ pub fn has_wasm_simd() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_sse3` — SSE3 support (ggml-cpu.c line 3779).
+/// `ggml_cpu_has_sse3` -- SSE3 support (ggml-cpu.c line 3779).
 pub fn has_sse3() -> bool {
     #[cfg(target_feature = "sse3")]
     return true;
@@ -943,7 +943,7 @@ pub fn has_sse3() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_ssse3` — SSSE3 support (ggml-cpu.c line 3787).
+/// `ggml_cpu_has_ssse3` -- SSSE3 support (ggml-cpu.c line 3787).
 pub fn has_ssse3() -> bool {
     #[cfg(target_feature = "ssse3")]
     return true;
@@ -951,12 +951,12 @@ pub fn has_ssse3() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_vsx` — PowerPC VSX (POWER9_VECTOR) (ggml-cpu.c line 3795).
+/// `ggml_cpu_has_vsx` -- PowerPC VSX (POWER9_VECTOR) (ggml-cpu.c line 3795).
 pub fn has_vsx() -> bool {
     false // PowerPC VSX not exposed in stable Rust cfg
 }
 
-/// `ggml_cpu_has_neon` — ARM NEON (ggml-cpu.c line 3811).
+/// `ggml_cpu_has_neon` -- ARM NEON (ggml-cpu.c line 3811).
 pub fn has_neon() -> bool {
     #[cfg(target_feature = "neon")]
     return true;
@@ -964,7 +964,7 @@ pub fn has_neon() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_dotprod` — ARM dot-product (ggml-cpu.c line 3819).
+/// `ggml_cpu_has_dotprod` -- ARM dot-product (ggml-cpu.c line 3819).
 pub fn has_dotprod() -> bool {
     #[cfg(target_feature = "dotprod")]
     return true;
@@ -972,12 +972,12 @@ pub fn has_dotprod() -> bool {
     return false;
 }
 
-/// `ggml_cpu_has_sve` — ARM SVE (ggml-cpu.c line 3827).
+/// `ggml_cpu_has_sve` -- ARM SVE (ggml-cpu.c line 3827).
 pub fn has_sve() -> bool {
     false // ARM SVE not yet stable in Rust cfg
 }
 
-/// `ggml_cpu_has_matmul_int8` — ARM matmul int8 (ggml-cpu.c line 3835).
+/// `ggml_cpu_has_matmul_int8` -- ARM matmul int8 (ggml-cpu.c line 3835).
 pub fn has_matmul_int8() -> bool {
     false // not yet in stable Rust
 }
@@ -1014,7 +1014,7 @@ mod tests {
         let nodes = [make_plan_node(GgmlOp::Add, GgmlType::F32, [64, 1, 1, 1])];
         let g = PlanGraph { nodes: &nodes };
         let plan = graph_plan(&g, 4);
-        // ADD with F32 src needs no scratch → work_size = 0.
+        // ADD with F32 src needs no scratch -> work_size = 0.
         assert_eq!(plan.work_data.len(), 0);
     }
 

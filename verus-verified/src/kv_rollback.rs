@@ -1,4 +1,4 @@
-//! Verus-verified KV cache rollback invariants — unbounded proofs
+//! Verus-verified KV cache rollback invariants -- unbounded proofs
 //!
 //! Proves: rollback preserves well-formedness, new_seq_len <= old seq_len,
 //! and the remaining data is still valid.

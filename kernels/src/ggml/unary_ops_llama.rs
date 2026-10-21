@@ -3,7 +3,7 @@
 // hardsigmoid, exp, hardswish, sqr, sqrt, sin, cos, log, expm1, softplus,
 // floor, ceil, round, trunc, xielu.
 
-// ── Scalar ops ───────────────────────────────────────────────────────────────
+// -- Scalar ops ---------------------------------------------------------------
 
 #[inline(always)]
 fn op_abs(x: f32) -> f32 {
@@ -134,7 +134,7 @@ fn op_trunc(x: f32) -> f32 {
     x.trunc()
 }
 
-// ── Vector loops ─────────────────────────────────────────────────────────────
+// -- Vector loops -------------------------------------------------------------
 
 // vec_unary_op<op, float, float>
 #[inline(always)]
@@ -144,7 +144,7 @@ pub fn vec_unary_op(n: i64, y: &mut [f32], x: &[f32], op: fn(f32) -> f32) {
     }
 }
 
-// vec_unary_op_functor — functor / closure variant (for parameterised ops like xielu)
+// vec_unary_op_functor -- functor / closure variant (for parameterised ops like xielu)
 #[inline(always)]
 pub fn vec_unary_op_functor<F: Fn(f32) -> f32>(n: i64, y: &mut [f32], x: &[f32], op: F) {
     for i in 0..n as usize {
@@ -152,17 +152,17 @@ pub fn vec_unary_op_functor<F: Fn(f32) -> f32>(n: i64, y: &mut [f32], x: &[f32],
     }
 }
 
-// ── Full tensor-geometry apply (f32 contiguous rows) ─────────────────────────
+// -- Full tensor-geometry apply (f32 contiguous rows) -------------------------
 
 // apply_unary_op<op, float, float>
 // Mirrors the C++ loop over linearised rows (ir0..ir1).
 //
 // Parameters:
-//   ne0        — elements per row (ne0 == ne00, same shape asserted)
-//   ne1        — rows per matrix (ne01)
-//   ne2        — matrices per batch (ne02)
-//   nb1..nb3   — dst byte strides
-//   nb01..nb03 — src0 byte strides
+//   ne0        -- elements per row (ne0 == ne00, same shape asserted)
+//   ne1        -- rows per matrix (ne01)
+//   ne2        -- matrices per batch (ne02)
+//   nb1..nb3   -- dst byte strides
+//   nb01..nb03 -- src0 byte strides
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn apply_unary_op_f32(
     op: fn(f32) -> f32,
@@ -197,7 +197,7 @@ pub unsafe fn apply_unary_op_f32(
     }
 }
 
-// apply_unary_op_functor — functor variant for parameterised ops
+// apply_unary_op_functor -- functor variant for parameterised ops
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn apply_unary_op_functor_f32<F: Fn(f32) -> f32>(
     op: F,
@@ -232,7 +232,7 @@ pub unsafe fn apply_unary_op_functor_f32<F: Fn(f32) -> f32>(
     }
 }
 
-// ── Public entry points (f32 contiguous slices, single-threaded) ─────────────
+// -- Public entry points (f32 contiguous slices, single-threaded) -------------
 
 pub fn compute_forward_abs(n: usize, y: &mut [f32], x: &[f32]) {
     vec_unary_op(n as i64, y, x, op_abs);
@@ -339,7 +339,7 @@ pub fn compute_forward_xielu(
 mod tests {
     use super::*;
 
-    // ── Scalar reference tests ────────────────────────────────────────────────
+    // -- Scalar reference tests ------------------------------------------------
 
     #[test]
     fn test_op_abs() {
@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(op_elu(1.0), 1.0);
         // elu(0) = expm1(0) = 0
         assert_eq!(op_elu(0.0), 0.0);
-        // elu(-1) = expm1(-1) = e^-1 - 1 ≈ -0.6321
+        // elu(-1) = expm1(-1) = e^-1 - 1 ~= -0.6321
         let v = op_elu(-1.0);
         assert!((v - ((-1.0f32).exp() - 1.0)).abs() < 1e-6);
     }
@@ -426,7 +426,7 @@ mod tests {
     fn test_op_softplus() {
         // softplus(21.0) = 21.0 (threshold branch)
         assert_eq!(op_softplus(21.0), 21.0);
-        // softplus(0.0) = ln(2) ≈ 0.6931
+        // softplus(0.0) = ln(2) ~= 0.6931
         let v = op_softplus(0.0);
         assert!((v - 2.0f32.ln()).abs() < 1e-6);
     }
@@ -456,7 +456,7 @@ mod tests {
         assert!((v - expected).abs() < 1e-6);
     }
 
-    // ── vec_unary_op vs scalar ────────────────────────────────────────────────
+    // -- vec_unary_op vs scalar ------------------------------------------------
 
     fn check_vec_vs_scalar(vals: &[f32], op: fn(f32) -> f32) {
         let mut y = vec![0.0f32; vals.len()];

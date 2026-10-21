@@ -1,22 +1,22 @@
-//! F16×F16 tinyBLAS path from `llamafile/sgemm.cpp`.
+//! F16xF16 tinyBLAS path from `llamafile/sgemm.cpp`.
 //!
 //! Source: llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp
 //! Copyright 2024 Mozilla Foundation (MIT License). Translated to Rust.
 //!
-//! This file translates the F16 × F16 specialisation of the `tinyBLAS` template
-//! (C++ lines 353–370, 484–641, 3957–4039) that was left as TODO in
+//! This file translates the F16 x F16 specialisation of the `tinyBLAS` template
+//! (C++ lines 353-370, 484-641, 3957-4039) that was left as TODO in
 //! `sgemm_llama.rs`.
 //!
 //! On x86-64 two paths are provided:
 //!
-//! - [`TinyBlasF16Avx2`]   — KN=8,  V=__m256 (AVX2 + F16C)
-//! - [`TinyBlasF16Avx512`] — KN=16, V=__m512 (AVX-512F)
+//! - [`TinyBlasF16Avx2`]   -- KN=8,  V=__m256 (AVX2 + F16C)
+//! - [`TinyBlasF16Avx512`] -- KN=16, V=__m512 (AVX-512F)
 //!
 //! Both share the same tile algorithm as [`super::sgemm_llama::TinyBlasF32Avx2`];
 //! the only difference is the load function: f16 values are read as raw u16 and
 //! widened to f32 with F16C / AVX-512 conversion intrinsics before FMA.
 //!
-//! BF16 × BF16 is left as TODO: it requires `_mm512_dpbf16_ps` (AVX-512BF16)
+//! BF16 x BF16 is left as TODO: it requires `_mm512_dpbf16_ps` (AVX-512BF16)
 //! which is not yet widely available and uses a different accumulation scheme.
 //!
 //! **Note on Q4_K / Q6_K**: those quantisation types are NOT present in
@@ -26,9 +26,9 @@
 use super::sgemm_llama::block_size;
 use super::types::GgmlType;
 
-// ─── AVX2 + F16C path ────────────────────────────────────────────────────────
+// --- AVX2 + F16C path --------------------------------------------------------
 
-/// F16 × F16 GEMM using AVX2 + F16C intrinsics.
+/// F16 x F16 GEMM using AVX2 + F16C intrinsics.
 ///
 /// Implements `tinyBLAS<8, __m256, __m256, ggml_fp16_t, ggml_fp16_t, float>`
 /// (C++ lines 3966-3973).
@@ -116,7 +116,7 @@ impl TinyBlasF16Avx2 {
         _mm_cvtss_f32(sum)
     }
 
-    /// Inner tile kernel: accumulate RM×RN dot products for tile (ii, jj).
+    /// Inner tile kernel: accumulate RMxRN dot products for tile (ii, jj).
     ///
     /// Mirrors `tinyBLAS::gemm_bloc<RM, RN>` (C++ lines 548-580) with
     /// `load<__m256>` replaced by `load_f16`.
@@ -200,16 +200,16 @@ impl TinyBlasF16Avx2 {
     }
 }
 
-// ─── AVX-512F path ────────────────────────────────────────────────────────────
+// --- AVX-512F path ------------------------------------------------------------
 
-/// F16 × F16 GEMM using AVX-512F intrinsics.
+/// F16 x F16 GEMM using AVX-512F intrinsics.
 ///
 /// Implements `tinyBLAS<16, __m512, __m512, ggml_fp16_t, ggml_fp16_t, float>`
 /// (C++ lines 3958-3965).
 ///
 /// Each load reads 16 f16 values (256 bits) and converts to 16 f32 values in a
 /// 512-bit register via `_mm512_cvtph_ps(_mm256_loadu_si256(...))`.
-/// On AVX-512 (32 registers) the max tile is 4×6 vs 4×3 for AVX2.
+/// On AVX-512 (32 registers) the max tile is 4x6 vs 4x3 for AVX2.
 #[cfg(target_arch = "x86_64")]
 pub struct TinyBlasF16Avx512 {
     a: *const u16,
@@ -368,9 +368,9 @@ impl TinyBlasF16Avx512 {
     }
 }
 
-// ─── Entry point ─────────────────────────────────────────────────────────────
+// --- Entry point -------------------------------------------------------------
 
-/// Dispatch F16 × F16 GEMM, called from `sgemm_llama::llamafile_sgemm`.
+/// Dispatch F16 x F16 GEMM, called from `sgemm_llama::llamafile_sgemm`.
 ///
 /// Selects AVX-512 when available (KN=16), otherwise falls back to AVX2+F16C
 /// (KN=8). Returns `false` if neither is available or `k` is not aligned.
@@ -413,7 +413,7 @@ pub unsafe fn llamafile_sgemm_f16(
             );
             let ok = tb.matmul(m, n);
             if ok { return true; }
-            // k not multiple of 16 — try AVX2 (KN=8) below.
+            // k not multiple of 16 -- try AVX2 (KN=8) below.
         }
 
         // AVX2 + F16C path (KN=8).
@@ -430,7 +430,7 @@ pub unsafe fn llamafile_sgemm_f16(
     false
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
+// --- Tests --------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -453,8 +453,8 @@ mod tests {
         vec![f32_to_f16(value); n]
     }
 
-    // 4×4 F16×F16: A is 4 rows × 8 cols of 1.0, B is 4 rows × 8 cols of 1.0.
-    // Each dot product sums 8 pairs of (1.0 × 1.0) = 8.0.
+    // 4x4 F16xF16: A is 4 rows x 8 cols of 1.0, B is 4 rows x 8 cols of 1.0.
+    // Each dot product sums 8 pairs of (1.0 x 1.0) = 8.0.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_f16_f16_4x4() {
@@ -474,14 +474,14 @@ mod tests {
             0, 1,
         );
         let ok = tb.matmul(4, 4);
-        assert!(ok, "F16 4×4 matmul should succeed");
+        assert!(ok, "F16 4x4 matmul should succeed");
 
         for j in 0..4 {
             for i in 0..4 {
                 let v = c[j * 4 + i];
                 assert!(
                     (v - 8.0).abs() < 0.05,
-                    "C[{j},{i}] = {v}, expected ≈ 8.0"
+                    "C[{j},{i}] = {v}, expected ~= 8.0"
                 );
             }
         }
@@ -505,7 +505,7 @@ mod tests {
         assert!(!tb.matmul(4, 4), "should return false for k not % 8");
     }
 
-    // 4×2 tile with n=2 (exercises SIZE_N=2 dispatch).
+    // 4x2 tile with n=2 (exercises SIZE_N=2 dispatch).
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_f16_f16_4x2() {
@@ -528,7 +528,7 @@ mod tests {
         assert!(ok);
 
         for v in &c {
-            assert!((*v - 8.0).abs() < 0.05, "expected ≈ 8.0, got {v}");
+            assert!((*v - 8.0).abs() < 0.05, "expected ~= 8.0, got {v}");
         }
     }
 
@@ -557,7 +557,7 @@ mod tests {
         assert!(handled);
 
         for v in &c {
-            assert!((*v - 8.0).abs() < 0.05, "expected ≈ 8.0, got {v}");
+            assert!((*v - 8.0).abs() < 0.05, "expected ~= 8.0, got {v}");
         }
     }
 }

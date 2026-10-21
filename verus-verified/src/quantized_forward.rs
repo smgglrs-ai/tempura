@@ -1,4 +1,4 @@
-//! Verus-verified quantized forward pass buffer shapes — unbounded proofs
+//! Verus-verified quantized forward pass buffer shapes -- unbounded proofs
 //!
 //! Proves:
 //!   - Pre-allocated scratchpad buffer sizes match quantized matmul dimensions.
@@ -179,29 +179,29 @@ proof fn scratchpad_reuse_valid(
         layer < num_layers,
         buf_size >= 1,
     ensures
-        // Buffer size doesn't depend on layer index — same size works for all layers
+        // Buffer size doesn't depend on layer index -- same size works for all layers
         buf_size >= 1,
 {
 }
 
 // ============================================================================
-// Q4K opt vs ref output error bound — self-contained, no cross-module imports
+// Q4K opt vs ref output error bound -- self-contained, no cross-module imports
 //
 // The reference path computes (per group, integer model):
-//   ref_contrib = sc_g * Σ_{i in g} q_i * a_i
+//   ref_contrib = sc_g * Sigma_{i in g} q_i * a_i
 //
-// The opt path uses Q8(a_i) = a_i + e_i where |e_i| ≤ 1:
-//   opt_contrib = sc_g * Σ_{i in g} q_i * (a_i + e_i)
+// The opt path uses Q8(a_i) = a_i + e_i where |e_i| <= 1:
+//   opt_contrib = sc_g * Sigma_{i in g} q_i * (a_i + e_i)
 //
-// Error = sc_g * Σ q_i * e_i.  Since |e_i| ≤ 1 and q_i, sc_g ≥ 0:
-//   |error| ≤ sc_g * Σ q_i  (weight L1-norm × group scale)
+// Error = sc_g * Sigma q_i * e_i.  Since |e_i| <= 1 and q_i, sc_g >= 0:
+//   |error| <= sc_g * Sigma q_i  (weight L1-norm x group scale)
 // ============================================================================
 
 pub open spec fn qerr_abs(x: int) -> int {
     if x >= 0 { x } else { -x }
 }
 
-/// All elements of a sequence are nibble values: ∈ [0, 15].
+/// All elements of a sequence are nibble values: ??? [0, 15].
 pub open spec fn all_nibbles(q: Seq<int>) -> bool
     decreases q.len()
 {
@@ -209,7 +209,7 @@ pub open spec fn all_nibbles(q: Seq<int>) -> bool
     else { 0 <= q.last() <= 15 && all_nibbles(q.drop_last()) }
 }
 
-/// All elements of a sequence are unit errors: ∈ [-1, 1].
+/// All elements of a sequence are unit errors: ??? [-1, 1].
 pub open spec fn all_unit_errors(e: Seq<int>) -> bool
     decreases e.len()
 {
@@ -217,7 +217,7 @@ pub open spec fn all_unit_errors(e: Seq<int>) -> bool
     else { -1 <= e.last() <= 1 && all_unit_errors(e.drop_last()) }
 }
 
-/// Σ sc_g * q_i  — upper bound on one group's Q8 quantization error.
+/// Sigma sc_g * q_i  -- upper bound on one group's Q8 quantization error.
 pub open spec fn group_error_bound(sc_g: int, q_g: Seq<int>) -> int
     decreases q_g.len()
 {
@@ -225,7 +225,7 @@ pub open spec fn group_error_bound(sc_g: int, q_g: Seq<int>) -> int
     else { sc_g * q_g.last() + group_error_bound(sc_g, q_g.drop_last()) }
 }
 
-/// Weighted error sum: Σ (sc_g * q_i) * e_i  (= opt_contrib - ref_contrib per group).
+/// Weighted error sum: Sigma (sc_g * q_i) * e_i  (= opt_contrib - ref_contrib per group).
 pub open spec fn weighted_err(sc_g: int, q_g: Seq<int>, e_g: Seq<int>) -> int
     recommends q_g.len() == e_g.len()
     decreases q_g.len()
@@ -237,11 +237,11 @@ pub open spec fn weighted_err(sc_g: int, q_g: Seq<int>, e_g: Seq<int>) -> int
     }
 }
 
-/// **Main theorem**: |weighted_err(sc_g, q_g, e_g)| ≤ group_error_bound(sc_g, q_g)
+/// **Main theorem**: |weighted_err(sc_g, q_g, e_g)| <= group_error_bound(sc_g, q_g)
 ///
 /// For any Q4K group: the error introduced by replacing exact activations with their
-/// Q8-quantized approximations (|e_i| ≤ 1) is bounded by the group-scale × weight
-/// L1-norm.  Proved for ALL sc_g ∈ [0,63], ALL lengths, ALL valid inputs.
+/// Q8-quantized approximations (|e_i| <= 1) is bounded by the group-scale x weight
+/// L1-norm.  Proved for ALL sc_g ??? [0,63], ALL lengths, ALL valid inputs.
 pub proof fn lemma_q4k_group_opt_error_bound(
     sc_g: int,
     q_g: Seq<int>,
@@ -307,7 +307,7 @@ pub proof fn lemma_q4k_group_opt_error_bound(
     }
 }
 
-/// group_error_bound is non-negative when sc_g ≥ 0 and q_i ≥ 0.
+/// group_error_bound is non-negative when sc_g >= 0 and q_i >= 0.
 pub proof fn lemma_group_error_bound_nonneg(sc_g: int, q_g: Seq<int>)
     requires sc_g >= 0, all_nibbles(q_g)
     ensures group_error_bound(sc_g, q_g) >= 0
@@ -325,7 +325,7 @@ pub proof fn lemma_group_error_bound_nonneg(sc_g: int, q_g: Seq<int>)
     }
 }
 
-// Sanity check on empty sequences — proves lemma fires correctly at base case.
+// Sanity check on empty sequences -- proves lemma fires correctly at base case.
 proof fn check_error_bound_empty()
     ensures qerr_abs(weighted_err(5int, Seq::<int>::empty(), Seq::<int>::empty()))
             <= group_error_bound(5int, Seq::<int>::empty())
@@ -343,11 +343,11 @@ proof fn check_error_bound_empty()
 // ============================================================================
 //
 // Q6K uses i16 activation quantization (32767 levels vs i8's 127).
-// Weights are 6-bit signed: w_i ∈ [-32, 31], so |w_i| ≤ 32.
-// Group scales are i8: sc_g ∈ [-128, 127].
-// Per-element Q16 error: |e_i| ≤ 1 (in i16 units; scale is max_abs/32767).
+// Weights are 6-bit signed: w_i ??? [-32, 31], so |w_i| <= 32.
+// Group scales are i8: sc_g ??? [-128, 127].
+// Per-element Q16 error: |e_i| <= 1 (in i16 units; scale is max_abs/32767).
 //
-// Error bound: |Σ sc_g * w_i * e_i| ≤ |sc_g| * Σ |w_i|.
+// Error bound: |Sigma sc_g * w_i * e_i| <= |sc_g| * Sigma |w_i|.
 
 /// Predicate: all weights are valid Q6K 6-bit signed values in [-32, 31].
 pub open spec fn all_q6k_weights(q: Seq<int>) -> bool
@@ -357,7 +357,7 @@ pub open spec fn all_q6k_weights(q: Seq<int>) -> bool
     else { -32 <= q.last() <= 31 && all_q6k_weights(q.drop_last()) }
 }
 
-/// Predicate: all errors are unit (|e_i| ≤ 1), same as Q4K.
+/// Predicate: all errors are unit (|e_i| <= 1), same as Q4K.
 pub open spec fn all_q6k_errors(e: Seq<int>) -> bool
     decreases e.len()
 {
@@ -365,7 +365,7 @@ pub open spec fn all_q6k_errors(e: Seq<int>) -> bool
     else { -1 <= e.last() <= 1 && all_q6k_errors(e.drop_last()) }
 }
 
-/// L1 norm of Q6K weights: Σ |w_i|.  Each |w_i| ≤ 32.
+/// L1 norm of Q6K weights: Sigma |w_i|.  Each |w_i| <= 32.
 pub open spec fn q6k_weight_l1(q: Seq<int>) -> int
     decreases q.len()
 {
@@ -376,7 +376,7 @@ pub open spec fn q6k_weight_l1(q: Seq<int>) -> int
     }
 }
 
-/// Weighted error sum for Q6K: Σ sc_g * w_i * e_i.
+/// Weighted error sum for Q6K: Sigma sc_g * w_i * e_i.
 pub open spec fn q6k_weighted_err(sc_g: int, q_g: Seq<int>, e_g: Seq<int>) -> int
     recommends q_g.len() == e_g.len()
     decreases q_g.len()
@@ -388,7 +388,7 @@ pub open spec fn q6k_weighted_err(sc_g: int, q_g: Seq<int>, e_g: Seq<int>) -> in
     }
 }
 
-/// Q6K group error bound: |sc_g| * Σ |w_i|.
+/// Q6K group error bound: |sc_g| * Sigma |w_i|.
 pub open spec fn q6k_group_error_bound(sc_g: int, q_g: Seq<int>) -> int
 {
     let abs_sc = if sc_g >= 0 { sc_g } else { -sc_g };
@@ -410,11 +410,11 @@ proof fn lemma_q6k_l1_nonneg(q: Seq<int>)
     }
 }
 
-/// **Main Q6K theorem**: |weighted_err(sc_g, q_g, e_g)| ≤ |sc_g| * Σ|w_i|.
+/// **Main Q6K theorem**: |weighted_err(sc_g, q_g, e_g)| <= |sc_g| * Sigma|w_i|.
 ///
-/// For any Q6K group: the error from i16 activation quantization (|e_i| ≤ 1)
+/// For any Q6K group: the error from i16 activation quantization (|e_i| <= 1)
 /// is bounded by the absolute scale times the L1 norm of weights.
-/// Proved for ALL sc_g ∈ [-128, 127], ALL lengths, ALL valid Q6K inputs.
+/// Proved for ALL sc_g ??? [-128, 127], ALL lengths, ALL valid Q6K inputs.
 pub proof fn lemma_q6k_group_opt_error_bound(
     sc_g: int,
     q_g: Seq<int>,
@@ -449,7 +449,7 @@ pub proof fn lemma_q6k_group_opt_error_bound(
         // Apply IH
         lemma_q6k_group_opt_error_bound(sc_g, q_rest, e_rest);
 
-        // Last term: sc_g * wl * el.  |sc_g * wl * el| ≤ abs_sc * |wl|.
+        // Last term: sc_g * wl * el.  |sc_g * wl * el| <= abs_sc * |wl|.
         let last_term = sc_g * wl * el;
         let abs_wl = if wl >= 0 { wl } else { -wl };
         assert(abs_wl <= 32);

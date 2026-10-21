@@ -1,4 +1,4 @@
-//! Verus-verified model indexing — unbounded proofs
+//! Verus-verified model indexing -- unbounded proofs
 //!
 //! Proves embedding lookup, last-token extraction, and logprob token
 //! indexing for any valid vocab/hidden/seq dimensions.

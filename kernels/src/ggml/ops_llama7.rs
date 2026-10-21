@@ -5,7 +5,7 @@
 //! dsv4_hc_comb_f32, dsv4_hc_pre_f32, dsv4_hc_post_f32,
 //! fwht_f32.
 
-// ── ssm_conv_f32 (ops.cpp:9703) ──────────────────────────────────────────────
+// -- ssm_conv_f32 (ops.cpp:9703) ----------------------------------------------
 
 /// Translation of ggml_compute_forward_ssm_conv_f32.
 /// src0: conv_x {d_conv - 1 + n_t, d_inner, n_seqs}
@@ -47,7 +47,7 @@ pub fn ssm_conv_f32(
     }
 }
 
-// ── ssm_scan_f32 (ops.cpp:9773) ──────────────────────────────────────────────
+// -- ssm_scan_f32 (ops.cpp:9773) ----------------------------------------------
 
 /// Softplus: log(1 + exp(x)), numerically stable version.
 #[inline]
@@ -62,14 +62,14 @@ fn softplus(x: f32) -> f32 {
 ///
 /// All tensors are provided as flat contiguous f32 slices with explicit strides.
 /// Layout mirrors the C struct member access:
-///   s0:  [d_state, dim, n_head, n_seqs]  — previous state
-///   s:   [d_state, dim, n_head, n_seqs]  — new state (output portion)
+///   s0:  [d_state, dim, n_head, n_seqs]  -- previous state
+///   s:   [d_state, dim, n_head, n_seqs]  -- new state (output portion)
 ///   x:   [dim, n_head, n_seq_tokens, n_seqs]
 ///   dt:  [n_head, n_seq_tokens, n_seqs]
 ///   A:   [d_state, n_head] (element-wise) or [1, n_head] (scalar)
 ///   B:   [d_state, n_group, n_seq_tokens, n_seqs]
 ///   C:   [d_state, n_group, n_seq_tokens, n_seqs]
-///   ids: [n_seqs]  — sequence-slot mapping
+///   ids: [n_seqs]  -- sequence-slot mapping
 ///   y:   output attention [dim, n_head, n_seq_tokens, n_seqs]
 #[allow(clippy::too_many_arguments)]
 pub fn ssm_scan_f32(
@@ -99,7 +99,7 @@ pub fn ssm_scan_f32(
         let s_seq_base  = i3 * seq_stride + s_off as usize;
 
         let s0_seq = &s0_data[s0_seq_base..s0_seq_base + seq_stride];
-        // copy s0 → s for this sequence slot (will be updated in-place below)
+        // copy s0 -> s for this sequence slot (will be updated in-place below)
         s_data[s_seq_base..s_seq_base + seq_stride].copy_from_slice(s0_seq);
 
         for i2 in 0..nt {
@@ -168,7 +168,7 @@ pub fn ssm_scan_f32(
     }
 }
 
-// ── win_part_f32 / win_unpart_f32 (ops.cpp:10013, 10076) ─────────────────────
+// -- win_part_f32 / win_unpart_f32 (ops.cpp:10013, 10076) ---------------------
 
 /// Translation of ggml_compute_forward_win_part_f32.
 /// Partitions src0 into windows and zero-pads out-of-bounds.
@@ -230,7 +230,7 @@ pub fn win_unpart_f32(
     }
 }
 
-// ── rwkv_wkv6_f32 (ops.cpp:10413) ────────────────────────────────────────────
+// -- rwkv_wkv6_f32 (ops.cpp:10413) --------------------------------------------
 
 /// Translation of ggml_compute_forward_rwkv_wkv6_f32 (scalar path, #else branch).
 /// dst_data: [C * T] output + [head_size * C * n_seqs] state trailing
@@ -302,7 +302,7 @@ pub fn rwkv_wkv6_f32(
     }
 }
 
-// ── rwkv_wkv7_f32 (ops.cpp:11422) ────────────────────────────────────────────
+// -- rwkv_wkv7_f32 (ops.cpp:11422) --------------------------------------------
 
 /// Translation of ggml_compute_forward_rwkv_wkv7_f32 (scalar path).
 #[allow(clippy::too_many_arguments)]
@@ -370,7 +370,7 @@ pub fn rwkv_wkv7_f32(
     }
 }
 
-// ── gla_f32 (ops.cpp:10625) ───────────────────────────────────────────────────
+// -- gla_f32 (ops.cpp:10625) ---------------------------------------------------
 
 /// Translation of ggml_compute_forward_gla_f32 (scalar #else path).
 #[allow(clippy::too_many_arguments)]
@@ -434,7 +434,7 @@ pub fn gla_f32(
     }
 }
 
-// ── gated_delta_net (ops.cpp:10895) ──────────────────────────────────────────
+// -- gated_delta_net (ops.cpp:10895) ------------------------------------------
 
 /// Translation of ggml_compute_forward_gated_delta_net_one_chunk.
 /// All inputs are contiguous flat slices. Index math follows the C source.
@@ -475,7 +475,7 @@ pub fn gated_delta_net_one_chunk(
                 // exp(g) element-wise into delta
                 let g_base = iv3 * n_tokens * h * h_sv + t * h * h_sv + iv1 * h_sv;
                 for i in 0..h_sv { delta[i] = g[g_base + i].exp(); }
-                // S[i][:] *= exp(g[i]) — for each col j of M: M[j][i] *= delta[i]
+                // S[i][:] *= exp(g[i]) -- for each col j of M: M[j][i] *= delta[i]
                 for j in 0..h_sv {
                     for i in 0..h_sv {
                         s_out_slice[j * h_sv + i] *= delta[i];
@@ -487,7 +487,7 @@ pub fn gated_delta_net_one_chunk(
                 for x in s_out_slice.iter_mut() { *x *= eg; }
             }
 
-            // delta[j] = dot(row j of M, k) — then delta[j] = (v[j] - delta[j]) * beta
+            // delta[j] = dot(row j of M, k) -- then delta[j] = (v[j] - delta[j]) * beta
             for j in 0..h_sv {
                 let mut sum = 0.0f32;
                 for i in 0..h_sv { sum += s_out_slice[j * h_sv + i] * k[k_base + i]; }
@@ -531,7 +531,7 @@ pub fn gated_delta_net_one_chunk(
     }
 }
 
-// ── dsv4_hc_comb helpers (ops.cpp:11110) ─────────────────────────────────────
+// -- dsv4_hc_comb helpers (ops.cpp:11110) -------------------------------------
 
 fn dsv4_hc_comb_norm_cols(comb: &mut [f32], eps: f32) {
     const HC: usize = 4;
@@ -553,7 +553,7 @@ fn dsv4_hc_comb_norm_rows(comb: &mut [f32], eps: f32) {
     }
 }
 
-// ── dsv4_hc_comb_f32 (ops.cpp:11142) ─────────────────────────────────────────
+// -- dsv4_hc_comb_f32 (ops.cpp:11142) -----------------------------------------
 
 /// Translation of ggml_compute_forward_dsv4_hc_comb_f32.
 /// mixes: [hc_mix_dim, n_tokens], scale: [>=3], base: [hc_mix_dim]
@@ -615,7 +615,7 @@ pub fn dsv4_hc_comb_f32(
     }
 }
 
-// ── dsv4_hc_pre_f32 (ops.cpp:11248) ──────────────────────────────────────────
+// -- dsv4_hc_pre_f32 (ops.cpp:11248) ------------------------------------------
 
 /// Translation of ggml_compute_forward_dsv4_hc_pre_f32.
 /// x: [n_embd, hc, n_tokens], weights: [n_embd, hc, n_tokens] (gated) or [hc, n_tokens]
@@ -651,7 +651,7 @@ pub fn dsv4_hc_pre_f32(
     }
 }
 
-// ── dsv4_hc_post_f32 (ops.cpp:11328) ─────────────────────────────────────────
+// -- dsv4_hc_post_f32 (ops.cpp:11328) -----------------------------------------
 
 /// Translation of ggml_compute_forward_dsv4_hc_post_f32.
 /// x: [n_embd, n_tokens], residual: [n_embd, hc, n_tokens]
@@ -692,7 +692,7 @@ pub fn dsv4_hc_post_f32(
     }
 }
 
-// ── fwht_f32 (ops.cpp:12027) ──────────────────────────────────────────────────
+// -- fwht_f32 (ops.cpp:12027) --------------------------------------------------
 
 /// Translation of ggml_compute_forward_fwht_impl (f32 specialization, scalar path).
 /// src: flat contiguous [ne13 * ne12 * ne11 * n], dst: same shape

@@ -440,21 +440,21 @@ mod kani_deltanet_output {
         kani::assume(col < head_dim);
         kani::assume(row < head_dim);
 
-        // Output computation: output[col] = Σ_row state[row*d + col] * q[row]
-        // This is (S^T @ q)[col] = Σ_row S[row][col] * q[row]
+        // Output computation: output[col] = Sigma_row state[row*d + col] * q[row]
+        // This is (S^T @ q)[col] = Sigma_row S[row][col] * q[row]
         // where S[row][col] = state[row*d + col]
         let out_state_idx = row * head_dim + col;
         assert!(out_state_idx < d2);
 
-        // Retrieve computation: retrieved[col] = Σ_row state[row*d + col] * k[row]
+        // Retrieve computation: retrieved[col] = Sigma_row state[row*d + col] * k[row]
         // Same transposition: (S^T @ k)[col]
         let ret_state_idx = row * head_dim + col;
         assert!(ret_state_idx < d2);
 
         // Update: state[row*d + col] += k[row] * delta[col]
         // This is S += outer(k, delta) = S[row][col] += k[row]*d[col]
-        // Consistent: retrieve = S^T@k, output = S^T@q, update = S += k⊗delta
-        // The delta rule: S^T @ q = (S_old*decay + k⊗β(v - S^T@k))^T @ q
+        // Consistent: retrieve = S^T@k, output = S^T@q, update = S += k???delta
+        // The delta rule: S^T @ q = (S_old*decay + k???beta(v - S^T@k))^T @ q
         let upd_state_idx = row * head_dim + col;
         assert!(upd_state_idx < d2);
     }

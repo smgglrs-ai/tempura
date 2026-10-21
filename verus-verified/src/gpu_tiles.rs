@@ -1,6 +1,6 @@
-//! Verus-verified GPU kernel tile/thread decomposition — unbounded proofs
+//! Verus-verified GPU kernel tile/thread decomposition -- unbounded proofs
 //!
-//! Proves tile boundary safety for flash attention (BR×BC×HD), quantized GEMM
+//! Proves tile boundary safety for flash attention (BRxBCxHD), quantized GEMM
 //! block iteration, MMA shared memory tiles, and flash decode split-K.
 
 use vstd::prelude::*;
@@ -67,7 +67,7 @@ proof fn flash_attn_smem_index(
 }
 
 // ============================================================================
-// Flash Attention tile contiguity — tiles cover [0..kv_len) without gaps
+// Flash Attention tile contiguity -- tiles cover [0..kv_len) without gaps
 // ============================================================================
 
 proof fn flash_attn_tiles_contiguous(
@@ -112,7 +112,7 @@ proof fn qgemm_block_iteration(
 }
 
 // ============================================================================
-// MMA shared memory tiles: CTA_M × MMA_K and CTA_N × MMA_K
+// MMA shared memory tiles: CTA_M x MMA_K and CTA_N x MMA_K
 // ============================================================================
 
 proof fn mma_smem_tile_index(

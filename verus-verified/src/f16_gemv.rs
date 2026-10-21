@@ -1,4 +1,4 @@
-//! Verus-verified F16 GEMV properties — unbounded proofs
+//! Verus-verified F16 GEMV properties -- unbounded proofs
 //!
 //! Proves: index bounds for F16 byte access, GEMV row indexing, and the
 //! relationship between element count and byte count (2 bytes per f16).
@@ -54,7 +54,7 @@ proof fn f16_gemv_row_in_bounds(n: nat, k: nat, j: nat)
 }
 
 // ============================================================================
-// F16 data size: n rows × k columns × 2 bytes = 2*n*k bytes
+// F16 data size: n rows x k columns x 2 bytes = 2*n*k bytes
 // ============================================================================
 
 proof fn f16_data_size(n: nat, k: nat)

@@ -1,4 +1,4 @@
-//! Direct translation of llama.cpp ggml-cpu/repack.cpp lines 2598–5253.
+//! Direct translation of llama.cpp ggml-cpu/repack.cpp lines 2598-5253.
 //!
 //! Covers:
 //! - ggml_gemm_q1_0_4x8_q8_0_generic       (lines 2598-2681)
@@ -27,7 +27,7 @@ use super::blocks::{
 };
 use super::repack_llama2::{make_block_q8_0x4, BlockQ8_0x4};
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// -- Constants -----------------------------------------------------------------
 
 const QK1_0: usize = 128;
 const QK4_0: usize = 32;
@@ -36,14 +36,14 @@ const QK_K: usize = 256;
 const QK4_NL: usize = 32;
 const QK_MXFP4: usize = 32;
 
-// ── f16 helper ────────────────────────────────────────────────────────────────
+// -- f16 helper ----------------------------------------------------------------
 
 #[inline(always)]
 fn f16_to_f32(v: u16) -> f32 {
     half::f16::from_bits(v).to_f32()
 }
 
-// ── New interleaved block structs ─────────────────────────────────────────────
+// -- New interleaved block structs ---------------------------------------------
 
 /// 4 Q1_0 blocks interleaved (block_q1_0x4 from repack.h).
 /// d[4] f16 scales + qs[64] packed bits.
@@ -152,7 +152,7 @@ pub struct BlockMxfp4x8 {
     pub qs: [u8; 128],
 }
 
-// ── Size assertions ────────────────────────────────────────────────────────────
+// -- Size assertions ------------------------------------------------------------
 
 const _: () = assert!(std::mem::size_of::<BlockQ1_0x4>() == 72);
 const _: () = assert!(std::mem::size_of::<BlockQ4_0x4>() == 72);
@@ -166,7 +166,7 @@ const _: () = assert!(std::mem::size_of::<BlockIQ4NLx16>() == 288);
 const _: () = assert!(std::mem::size_of::<BlockMxfp4x4>() == 68);
 const _: () = assert!(std::mem::size_of::<BlockMxfp4x8>() == 136);
 
-// ── IQ4_NL lookup table ───────────────────────────────────────────────────────
+// -- IQ4_NL lookup table -------------------------------------------------------
 
 /// Non-linear 4-bit lookup table from ggml-quants.h.
 #[rustfmt::skip]
@@ -174,7 +174,7 @@ const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 
-// ── GEMM generic implementation ────────────────────────────────────────────────
+// -- GEMM generic implementation ------------------------------------------------
 
 /// Direct translation of ggml_gemm_q1_0_4x8_q8_0_generic (repack.cpp lines 2598-2681).
 ///
@@ -270,11 +270,11 @@ pub unsafe fn ggml_gemm_q1_0_4x8_q8_0_generic(
     }
 }
 
-// ── RISC-V specific generic GEMMs ─────────────────────────────────────────────
+// -- RISC-V specific generic GEMMs ---------------------------------------------
 // Lines 2683-3018: only compiled on riscv targets with zvfh extension.
 
 /// Direct translation of ggml_gemm_q4_0_16x1_q8_0_generic (repack.cpp lines 2685-2737).
-/// 16-column outer-product GEMM for Q4_0 × Q8_0. Only meaningful on RISC-V zvfh.
+/// 16-column outer-product GEMM for Q4_0 x Q8_0. Only meaningful on RISC-V zvfh.
 #[cfg(target_arch = "riscv64")]
 pub unsafe fn ggml_gemm_q4_0_16x1_q8_0_generic(
     n:   i32,
@@ -631,7 +631,7 @@ pub unsafe fn ggml_gemm_q2_k_16x1_q8_k_generic(
     }
 }
 
-// ── make_block helpers ────────────────────────────────────────────────────────
+// -- make_block helpers --------------------------------------------------------
 
 /// Direct translation of make_block_q1_0x4 (repack.cpp lines 3039-3081).
 ///
@@ -1059,7 +1059,7 @@ pub fn make_block_mxfp4x8(in_blocks: &[BlockMxfp4; 8], blck_size_interleave: usi
     out
 }
 
-// ── Bulk repack functions ─────────────────────────────────────────────────────
+// -- Bulk repack functions -----------------------------------------------------
 
 /// Tensor shape passed to repack functions (mirrors ggml_tensor fields used here).
 pub struct TensorShape {
@@ -1071,7 +1071,7 @@ pub struct TensorShape {
 
 /// Direct translation of repack_q4_0_to_q4_0_4_bl (repack.cpp lines 3541-3570).
 ///
-/// Repacks nrow × nblocks Q4_0 blocks into 4-row-interleaved BlockQ4_0x4 layout.
+/// Repacks nrow x nblocks Q4_0 blocks into 4-row-interleaved BlockQ4_0x4 layout.
 /// Returns 0 on success, -1 if alignment constraints are not met.
 pub fn repack_q4_0_to_q4_0_4_bl(
     shape: &TensorShape,
@@ -1496,7 +1496,7 @@ pub fn repack_mxfp4_to_mxfp4_8_bl(
     0
 }
 
-// ── Repack type selector ──────────────────────────────────────────────────────
+// -- Repack type selector ------------------------------------------------------
 
 /// Which interleaved layout and kernel should be used for a weight tensor.
 ///
@@ -1504,59 +1504,59 @@ pub fn repack_mxfp4_to_mxfp4_8_bl(
 /// The returned value identifies the (BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE) specialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepackKind {
-    /// Q4_0 weights, 8-byte interleave, 4 cols — ARM dotprod
+    /// Q4_0 weights, 8-byte interleave, 4 cols -- ARM dotprod
     Q4_0_4x4_Q8_0,
-    /// Q4_0 weights, 8-byte interleave, 4 rows, 8 interleave — ARM i8mm
+    /// Q4_0 weights, 8-byte interleave, 4 rows, 8 interleave -- ARM i8mm
     Q4_0_4x8_Q8_0,
-    /// Q4_0 weights, 8-byte interleave, 8 cols — AVX2 / SVE
+    /// Q4_0 weights, 8-byte interleave, 8 cols -- AVX2 / SVE
     Q4_0_8x8_Q8_0,
-    /// Q4_0 weights, 1-byte interleave, 16 cols — RISC-V zvfh
+    /// Q4_0 weights, 1-byte interleave, 16 cols -- RISC-V zvfh
     Q4_0_16x1_Q8_0,
 
-    /// Q4K weights, 4-byte interleave, 8 cols — ARM dotprod
+    /// Q4K weights, 4-byte interleave, 8 cols -- ARM dotprod
     Q4K_8x4_Q8K,
-    /// Q4K weights, 8-byte interleave, 8 cols — AVX2 / ARM i8mm
+    /// Q4K weights, 8-byte interleave, 8 cols -- AVX2 / ARM i8mm
     Q4K_8x8_Q8K,
-    /// Q4K weights, 1-byte interleave, 16 cols — RISC-V zvfh
+    /// Q4K weights, 1-byte interleave, 16 cols -- RISC-V zvfh
     Q4K_16x1_Q8K,
 
-    /// Q5K weights, 4-byte interleave, 8 cols — ARM dotprod
+    /// Q5K weights, 4-byte interleave, 8 cols -- ARM dotprod
     Q5K_8x4_Q8K,
-    /// Q5K weights, 8-byte interleave, 8 cols — ARM i8mm
+    /// Q5K weights, 8-byte interleave, 8 cols -- ARM i8mm
     Q5K_8x8_Q8K,
 
-    /// Q6K weights, 4-byte interleave, 8 cols — ARM dotprod
+    /// Q6K weights, 4-byte interleave, 8 cols -- ARM dotprod
     Q6K_8x4_Q8K,
-    /// Q6K weights, 8-byte interleave, 8 cols — ARM i8mm
+    /// Q6K weights, 8-byte interleave, 8 cols -- ARM i8mm
     Q6K_8x8_Q8K,
 
-    /// Q2K weights, 8-byte interleave, 8 cols — AVX-512
+    /// Q2K weights, 8-byte interleave, 8 cols -- AVX-512
     Q2K_8x8_Q8K,
-    /// Q2K weights, 1-byte interleave, 16 cols — RISC-V zvfh
+    /// Q2K weights, 1-byte interleave, 16 cols -- RISC-V zvfh
     Q2K_16x1_Q8K,
 
-    /// IQ4_NL weights, 4-byte interleave, 4 cols — ARM dotprod
+    /// IQ4_NL weights, 4-byte interleave, 4 cols -- ARM dotprod
     IQ4NL_4x4_Q8_0,
-    /// IQ4_NL weights, 8-byte interleave, 8 cols — AVX2
+    /// IQ4_NL weights, 8-byte interleave, 8 cols -- AVX2
     IQ4NL_8x8_Q8_0,
-    /// IQ4_NL weights, 1-byte interleave, 16 cols — RISC-V zvfh
+    /// IQ4_NL weights, 1-byte interleave, 16 cols -- RISC-V zvfh
     IQ4NL_16x1_Q8_0,
 
-    /// MXFP4 weights, 4-byte interleave, 4 cols — ARM dotprod
+    /// MXFP4 weights, 4-byte interleave, 4 cols -- ARM dotprod
     MXFP4_4x4_Q8_0,
-    /// MXFP4 weights, 8-byte interleave, 8 cols — AVX2
+    /// MXFP4 weights, 8-byte interleave, 8 cols -- AVX2
     MXFP4_8x8_Q8_0,
 
-    /// Q8_0 weights, 4-byte interleave, 4 cols — ARM dotprod
+    /// Q8_0 weights, 4-byte interleave, 4 cols -- ARM dotprod
     Q8_0_4x4_Q8_0,
-    /// Q8_0 weights, 8-byte interleave, 4 rows — ARM i8mm
+    /// Q8_0 weights, 8-byte interleave, 4 rows -- ARM i8mm
     Q8_0_4x8_Q8_0,
-    /// Q8_0 weights, 1-byte interleave, 16 cols — RISC-V zvfh
+    /// Q8_0 weights, 1-byte interleave, 16 cols -- RISC-V zvfh
     Q8_0_16x1_Q8_0,
 
-    /// Q1_0 weights, 4-byte interleave, 4 cols — ARM dotprod
+    /// Q1_0 weights, 4-byte interleave, 4 cols -- ARM dotprod
     Q1_0_4x4_Q8_0,
-    /// Q1_0 weights, 8-byte interleave, 4 cols — ARM i8mm
+    /// Q1_0 weights, 8-byte interleave, 4 cols -- ARM i8mm
     Q1_0_4x8_Q8_0,
 }
 
@@ -1593,7 +1593,7 @@ pub fn get_optimal_repack_type(quant: QuantType, _ne0: i64, ne1: i64) -> Option<
         #[cfg(not(target_arch = "x86_64"))]
         { false }
     };
-    // NEON + dotprod / matmul_int8 — ARM only; always false on x86
+    // NEON + dotprod / matmul_int8 -- ARM only; always false on x86
     let has_neon_dotprod: bool = false;
     let has_neon_i8mm: bool    = false;
 
@@ -1685,7 +1685,7 @@ pub fn get_optimal_repack_type(quant: QuantType, _ne0: i64, ne1: i64) -> Option<
     }
 }
 
-// ── Default impls needed by repack functions ──────────────────────────────────
+// -- Default impls needed by repack functions ----------------------------------
 
 impl Default for BlockQ4_0 {
     fn default() -> Self {
@@ -1809,7 +1809,7 @@ mod tests {
             b.d = i as u16;
         }
         let out = make_block_q4_0x16(&blocks, 1);
-        // All source nibbles are 0, XOR with 0x88 → output should be 0x88
+        // All source nibbles are 0, XOR with 0x88 -> output should be 0x88
         for byte in &out.qs {
             assert_eq!(*byte, 0x88, "expected 0x88 from XOR mask on zero input");
         }
@@ -1865,7 +1865,7 @@ mod tests {
 
     #[test]
     fn test_repack_q1_0_bad_alignment() {
-        // ne1 = 3 is not a multiple of 4 → should return -1
+        // ne1 = 3 is not a multiple of 4 -> should return -1
         let shape = TensorShape { ne0: 128, ne1: 3 };
         let src  = vec![zero_q1_0(); 3 * 1];
         let mut dst = vec![BlockQ1_0x4 { d: [0; 4], qs: [0; 64] }; 10];

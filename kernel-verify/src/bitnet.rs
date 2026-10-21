@@ -59,7 +59,7 @@ fn random_f16_bytes(len: usize, seed: u64) -> Vec<u8> {
     bytes
 }
 
-// ── 1. I2S dot product: scalar vs AVX2 ────────────────────────────────────────
+// -- 1. I2S dot product: scalar vs AVX2 ----------------------------------------
 
 pub fn compare_i2s_dot(k: usize) -> KernelTestResult {
     use tempura_kernels::quantized::{vec_dot_i2_i8_s, vec_dot_i2_i8_s_avx2};
@@ -84,7 +84,7 @@ pub fn compare_i2s_dot(k: usize) -> KernelTestResult {
     }
 }
 
-// ── 2. I2S quantization: scalar vs AVX2 ───────────────────────────────────────
+// -- 2. I2S quantization: scalar vs AVX2 ---------------------------------------
 
 pub fn compare_i2s_quant(k: usize) -> KernelTestResult {
     use tempura_kernels::quantized::{quantize_row_i8_s, quantize_row_i8_s_avx2_into};
@@ -130,7 +130,7 @@ pub fn compare_i2s_quant(k: usize) -> KernelTestResult {
     }
 }
 
-// ── 3. TL2 end-to-end: AVX2 LUT vs scalar direct oracle ──────────────────────
+// -- 3. TL2 end-to-end: AVX2 LUT vs scalar direct oracle ----------------------
 
 pub fn compare_tl2_vs_direct(m: usize, k: usize, epsilon: f32) -> KernelTestResult {
     use tempura_kernels::quantized::i2s_weight_scale;
@@ -179,7 +179,7 @@ pub fn compare_tl2_vs_direct(m: usize, k: usize, epsilon: f32) -> KernelTestResu
     }
 }
 
-// ── 4. F16 dot product: scalar vs AVX2 ────────────────────────────────────────
+// -- 4. F16 dot product: scalar vs AVX2 ----------------------------------------
 
 pub fn compare_f16_dot(k: usize, epsilon: f32) -> KernelTestResult {
     use tempura_kernels::f16_gemv::{f16_dot_avx2, f16_dot_scalar};
@@ -206,7 +206,7 @@ pub fn compare_f16_dot(k: usize, epsilon: f32) -> KernelTestResult {
     }
 }
 
-// ── 5. Per-tensor quant: scalar vs AVX2 ───────────────────────────────────────
+// -- 5. Per-tensor quant: scalar vs AVX2 ---------------------------------------
 
 pub fn compare_per_tensor_quant(k: usize) -> KernelTestResult {
     use tempura_kernels::tl2::{per_tensor_quant, per_tensor_quant_scalar};
@@ -231,7 +231,7 @@ pub fn compare_per_tensor_quant(k: usize) -> KernelTestResult {
     }
 }
 
-// ── 6. Fused SqReLU*Mul: scalar vs AVX2 ──────────────────────────────────────
+// -- 6. Fused SqReLU*Mul: scalar vs AVX2 --------------------------------------
 
 pub fn compare_fused_sqrelu(n: usize) -> KernelTestResult {
     use tempura_kernels::fused::fused_sqrelu_mul_avx2;
@@ -267,7 +267,7 @@ pub fn compare_fused_sqrelu(n: usize) -> KernelTestResult {
     }
 }
 
-// ── 7. Fused residual_add: scalar vs AVX2 ─────────────────────────────────────
+// -- 7. Fused residual_add: scalar vs AVX2 -------------------------------------
 
 pub fn compare_fused_residual_add(n: usize) -> KernelTestResult {
     use tempura_kernels::fused::residual_add_avx2;

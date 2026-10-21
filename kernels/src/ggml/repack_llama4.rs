@@ -1,14 +1,14 @@
 /// Direct translation of ggml_gemm_q2_K_8x8_q8_K (arch/x86/repack.cpp lines 3526-6407).
-/// AVX2 GEMM: BlockQ2Kx8 weights × BlockQ8Kx4 activations → float output.
+/// AVX2 GEMM: BlockQ2Kx8 weights x BlockQ8Kx4 activations -> float output.
 ///
 /// Translated path: the `for (; y < nr/4; y++)` AVX2-only loop
 /// (source lines 5733-6400), which handles one BlockQ8Kx4 group (4 rows)
 /// per outer iteration. Identical in structure to ggml_gemm_q4_k_8x8_q8_k
 /// but with 2-bit quant extraction and 4-bit packed scale+min encoding.
 ///
-/// - vx: packed weights as BlockQ2Kx8 (nc/8 × nb)
-/// - vy: activations as BlockQ8Kx4 (nr/4 × nb)
-/// - s:  output matrix, row-major, nr rows × nc cols floats
+/// - vx: packed weights as BlockQ2Kx8 (nc/8 x nb)
+/// - vy: activations as BlockQ8Kx4 (nr/4 x nb)
+/// - s:  output matrix, row-major, nr rows x nc cols floats
 /// - bs: output row stride in elements
 /// - n:  token dimension (multiple of QK_K = 256)
 
@@ -65,7 +65,7 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                     let lhs_base = (ap.qs.as_ptr() as *const u8).add(512 * sb);
                     let bs_base  = ap.bsums.as_ptr().add(32 * sb);
 
-                    // ── Load raw RHS (weight) bytes ───────────────────────────────────────
+                    // -- Load raw RHS (weight) bytes ---------------------------------------
                     let rhs_raw_mat_0123_0 = _mm256_loadu_si256(qs_base.add(  0) as *const __m256i);
                     let rhs_raw_mat_4567_0 = _mm256_loadu_si256(qs_base.add( 32) as *const __m256i);
                     let rhs_raw_mat_0123_1 = _mm256_loadu_si256(qs_base.add( 64) as *const __m256i);
@@ -75,7 +75,7 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                     let rhs_raw_mat_0123_3 = _mm256_loadu_si256(qs_base.add(192) as *const __m256i);
                     let rhs_raw_mat_4567_3 = _mm256_loadu_si256(qs_base.add(224) as *const __m256i);
 
-                    // ── Rearrange to B0B1B4B5 / B2B3B6B7 interleaving ────────────────────
+                    // -- Rearrange to B0B1B4B5 / B2B3B6B7 interleaving --------------------
                     let rhs_raw_mat_0145_0 = _mm256_blend_epi32(rhs_raw_mat_0123_0, _mm256_permutevar8x32_epi32(rhs_raw_mat_4567_0, required_order), 240);
                     let rhs_raw_mat_2367_0 = _mm256_blend_epi32(_mm256_permutevar8x32_epi32(rhs_raw_mat_0123_0, required_order), rhs_raw_mat_4567_0, 240);
                     let rhs_raw_mat_0145_1 = _mm256_blend_epi32(rhs_raw_mat_0123_1, _mm256_permutevar8x32_epi32(rhs_raw_mat_4567_1, required_order), 240);
@@ -85,7 +85,7 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                     let rhs_raw_mat_0145_3 = _mm256_blend_epi32(rhs_raw_mat_0123_3, _mm256_permutevar8x32_epi32(rhs_raw_mat_4567_3, required_order), 240);
                     let rhs_raw_mat_2367_3 = _mm256_blend_epi32(_mm256_permutevar8x32_epi32(rhs_raw_mat_0123_3, required_order), rhs_raw_mat_4567_3, 240);
 
-                    // ── Extract 2-bit sub-blocks (8 sub-blocks × 2 halves each) ──────────
+                    // -- Extract 2-bit sub-blocks (8 sub-blocks x 2 halves each) ----------
                     // Sub-block 0 (bits 1:0 of raw_*_0 and raw_*_1)
                     let rhs_mat_0145_00 = _mm256_and_si256(rhs_raw_mat_0145_0, m3b);
                     let rhs_mat_2367_00 = _mm256_and_si256(rhs_raw_mat_2367_0, m3b);
@@ -127,7 +127,7 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                     let rhs_mat_0145_71 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_mat_0145_3, 6), m3b);
                     let rhs_mat_2367_71 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_mat_2367_3, 6), m3b);
 
-                    // ── RHS shuffle pattern 1 (imm8=136 = 0b10_00_10_00) ─────────────────
+                    // -- RHS shuffle pattern 1 (imm8=136 = 0b10_00_10_00) -----------------
                     let rhs_mat_0145_00_sp1 = _mm256_shuffle_epi32(rhs_mat_0145_00, 136);
                     let rhs_mat_2367_00_sp1 = _mm256_shuffle_epi32(rhs_mat_2367_00, 136);
                     let rhs_mat_0145_01_sp1 = _mm256_shuffle_epi32(rhs_mat_0145_01, 136);
@@ -161,7 +161,7 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                     let rhs_mat_0145_71_sp1 = _mm256_shuffle_epi32(rhs_mat_0145_71, 136);
                     let rhs_mat_2367_71_sp1 = _mm256_shuffle_epi32(rhs_mat_2367_71, 136);
 
-                    // ── RHS shuffle pattern 2 (imm8=221 = 0b11_01_11_01) ─────────────────
+                    // -- RHS shuffle pattern 2 (imm8=221 = 0b11_01_11_01) -----------------
                     let rhs_mat_0145_00_sp2 = _mm256_shuffle_epi32(rhs_mat_0145_00, 221);
                     let rhs_mat_2367_00_sp2 = _mm256_shuffle_epi32(rhs_mat_2367_00, 221);
                     let rhs_mat_0145_01_sp2 = _mm256_shuffle_epi32(rhs_mat_0145_01, 221);
@@ -195,14 +195,14 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                     let rhs_mat_0145_71_sp2 = _mm256_shuffle_epi32(rhs_mat_0145_71, 221);
                     let rhs_mat_2367_71_sp2 = _mm256_shuffle_epi32(rhs_mat_2367_71, 221);
 
-                    // ── Load packed scales+mins (4-bit each) ──────────────────────────────
+                    // -- Load packed scales+mins (4-bit each) ------------------------------
                     // Layout: s00 m00 s01 m01 s10 m10 ... for 8 sub-block pairs
                     let mins_and_scales_01 = _mm_loadu_si128(sc_base.add( 0) as *const __m128i);
                     let mins_and_scales_23 = _mm_loadu_si128(sc_base.add(16) as *const __m128i);
                     let mins_and_scales_45 = _mm_loadu_si128(sc_base.add(32) as *const __m128i);
                     let mins_and_scales_67 = _mm_loadu_si128(sc_base.add(48) as *const __m128i);
 
-                    // Lower nibbles → scales; upper nibbles → mins
+                    // Lower nibbles -> scales; upper nibbles -> mins
                     let scales_01 = _mm_and_si128(mins_and_scales_01, m4b_sse);
                     let scales_23 = _mm_and_si128(mins_and_scales_23, m4b_sse);
                     let scales_45 = _mm_and_si128(mins_and_scales_45, m4b_sse);
@@ -241,8 +241,8 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                     let scale_0145_7 = _mm256_shuffle_epi32(scales_7,  68);
                     let scale_2367_7 = _mm256_shuffle_epi32(scales_7, 238);
 
-                    // ── Load LHS (activation) bytes ───────────────────────────────────────
-                    // 8 pairs × 32 bytes each = 256 bytes per half super-block
+                    // -- Load LHS (activation) bytes ---------------------------------------
+                    // 8 pairs x 32 bytes each = 256 bytes per half super-block
                     let lhs_mat_0123_00 = _mm256_loadu_si256(lhs_base.add(  0) as *const __m256i);
                     let lhs_mat_01_00   = _mm256_permute2f128_si256(lhs_mat_0123_00, lhs_mat_0123_00,  0);
                     let lhs_mat_23_00   = _mm256_permute2f128_si256(lhs_mat_0123_00, lhs_mat_0123_00, 17);
@@ -292,13 +292,13 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                     let lhs_mat_01_71   = _mm256_permute2f128_si256(lhs_mat_0123_71, lhs_mat_0123_71,  0);
                     let lhs_mat_23_71   = _mm256_permute2f128_si256(lhs_mat_0123_71, lhs_mat_0123_71, 17);
 
-                    // ── Load bsums (i16; 4 groups of 8) ──────────────────────────────────
+                    // -- Load bsums (i16; 4 groups of 8) ----------------------------------
                     let lhs_raw_bsums_01_0123 = _mm_loadu_si128(bs_base.add( 0) as *const __m128i);
                     let lhs_raw_bsums_23_0123 = _mm_loadu_si128(bs_base.add( 8) as *const __m128i);
                     let lhs_raw_bsums_01_4567 = _mm_loadu_si128(bs_base.add(16) as *const __m128i);
                     let lhs_raw_bsums_23_4567 = _mm_loadu_si128(bs_base.add(24) as *const __m128i);
 
-                    // ── LHS shuffle pattern 1 (imm8=160 = 0b10_10_00_00) ─────────────────
+                    // -- LHS shuffle pattern 1 (imm8=160 = 0b10_10_00_00) -----------------
                     let lhs_mat_01_00_sp1 = _mm256_shuffle_epi32(lhs_mat_01_00, 160);
                     let lhs_mat_23_00_sp1 = _mm256_shuffle_epi32(lhs_mat_23_00, 160);
                     let lhs_mat_01_01_sp1 = _mm256_shuffle_epi32(lhs_mat_01_01, 160);
@@ -332,7 +332,7 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                     let lhs_mat_01_71_sp1 = _mm256_shuffle_epi32(lhs_mat_01_71, 160);
                     let lhs_mat_23_71_sp1 = _mm256_shuffle_epi32(lhs_mat_23_71, 160);
 
-                    // ── LHS shuffle pattern 2 (imm8=245 = 0b11_11_01_01) ─────────────────
+                    // -- LHS shuffle pattern 2 (imm8=245 = 0b11_11_01_01) -----------------
                     let lhs_mat_01_00_sp2 = _mm256_shuffle_epi32(lhs_mat_01_00, 245);
                     let lhs_mat_23_00_sp2 = _mm256_shuffle_epi32(lhs_mat_23_00, 245);
                     let lhs_mat_01_01_sp2 = _mm256_shuffle_epi32(lhs_mat_01_01, 245);
@@ -366,10 +366,10 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                     let lhs_mat_01_71_sp2 = _mm256_shuffle_epi32(lhs_mat_01_71, 245);
                     let lhs_mat_23_71_sp2 = _mm256_shuffle_epi32(lhs_mat_23_71, 245);
 
-                    // ── Dot products via maddubs (unsigned × signed → i16, summed pairs) ─
-                    // Each iacc_mat_XY_K_spP accumulates 2-bit quant × int8 for sub-block K
-                    // X=0 → LHS rows 0,1; X=1 → LHS rows 2,3
-                    // Y=0 → RHS cols 0,1,4,5; Y=1 → RHS cols 2,3,6,7
+                    // -- Dot products via maddubs (unsigned x signed -> i16, summed pairs) -
+                    // Each iacc_mat_XY_K_spP accumulates 2-bit quant x int8 for sub-block K
+                    // X=0 -> LHS rows 0,1; X=1 -> LHS rows 2,3
+                    // Y=0 -> RHS cols 0,1,4,5; Y=1 -> RHS cols 2,3,6,7
                     let iacc_mat_00_0_sp1 = _mm256_add_epi16(_mm256_maddubs_epi16(rhs_mat_0145_00_sp1, lhs_mat_01_00_sp1), _mm256_maddubs_epi16(rhs_mat_0145_01_sp1, lhs_mat_01_01_sp1));
                     let iacc_mat_01_0_sp1 = _mm256_add_epi16(_mm256_maddubs_epi16(rhs_mat_2367_00_sp1, lhs_mat_01_00_sp1), _mm256_maddubs_epi16(rhs_mat_2367_01_sp1, lhs_mat_01_01_sp1));
                     let iacc_mat_10_0_sp1 = _mm256_add_epi16(_mm256_maddubs_epi16(rhs_mat_0145_00_sp1, lhs_mat_23_00_sp1), _mm256_maddubs_epi16(rhs_mat_0145_01_sp1, lhs_mat_23_01_sp1));
@@ -436,7 +436,7 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                     let iacc_mat_10_7_sp2 = _mm256_add_epi16(_mm256_maddubs_epi16(rhs_mat_0145_70_sp2, lhs_mat_23_70_sp2), _mm256_maddubs_epi16(rhs_mat_0145_71_sp2, lhs_mat_23_71_sp2));
                     let iacc_mat_11_7_sp2 = _mm256_add_epi16(_mm256_maddubs_epi16(rhs_mat_2367_70_sp2, lhs_mat_23_70_sp2), _mm256_maddubs_epi16(rhs_mat_2367_71_sp2, lhs_mat_23_71_sp2));
 
-                    // ── Combine sp1 and sp2 ───────────────────────────────────────────────
+                    // -- Combine sp1 and sp2 -----------------------------------------------
                     let mut iacc_mat_00_0 = _mm256_add_epi16(iacc_mat_00_0_sp1, iacc_mat_00_0_sp2);
                     let mut iacc_mat_01_0 = _mm256_add_epi16(iacc_mat_01_0_sp1, iacc_mat_01_0_sp2);
                     let mut iacc_mat_10_0 = _mm256_add_epi16(iacc_mat_10_0_sp1, iacc_mat_10_0_sp2);
@@ -470,7 +470,7 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                     let mut iacc_mat_10_7 = _mm256_add_epi16(iacc_mat_10_7_sp1, iacc_mat_10_7_sp2);
                     let mut iacc_mat_11_7 = _mm256_add_epi16(iacc_mat_11_7_sp1, iacc_mat_11_7_sp2);
 
-                    // ── Apply per-sub-block scales via madd_epi16 ─────────────────────────
+                    // -- Apply per-sub-block scales via madd_epi16 -------------------------
                     iacc_mat_00_0 = _mm256_madd_epi16(iacc_mat_00_0, scale_0145_0);
                     iacc_mat_01_0 = _mm256_madd_epi16(iacc_mat_01_0, scale_2367_0);
                     iacc_mat_10_0 = _mm256_madd_epi16(iacc_mat_10_0, scale_0145_0);
@@ -504,7 +504,7 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                     iacc_mat_10_7 = _mm256_madd_epi16(iacc_mat_10_7, scale_0145_7);
                     iacc_mat_11_7 = _mm256_madd_epi16(iacc_mat_11_7, scale_2367_7);
 
-                    // ── Sum all 8 sub-block partial sums ──────────────────────────────────
+                    // -- Sum all 8 sub-block partial sums ----------------------------------
                     let iacc_mat_00 = _mm256_add_epi32(
                         _mm256_add_epi32(_mm256_add_epi32(iacc_mat_00_0, iacc_mat_00_1), _mm256_add_epi32(iacc_mat_00_2, iacc_mat_00_3)),
                         _mm256_add_epi32(_mm256_add_epi32(iacc_mat_00_4, iacc_mat_00_5), _mm256_add_epi32(iacc_mat_00_6, iacc_mat_00_7)));
@@ -518,7 +518,7 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                         _mm256_add_epi32(_mm256_add_epi32(iacc_mat_11_0, iacc_mat_11_1), _mm256_add_epi32(iacc_mat_11_2, iacc_mat_11_3)),
                         _mm256_add_epi32(_mm256_add_epi32(iacc_mat_11_4, iacc_mat_11_5), _mm256_add_epi32(iacc_mat_11_6, iacc_mat_11_7)));
 
-                    // ── Straighten interleaved 00/01/10/11 into 4 output row vectors ──────
+                    // -- Straighten interleaved 00/01/10/11 into 4 output row vectors ------
                     let iacc_row_0 = _mm256_blend_epi32(iacc_mat_00, _mm256_shuffle_epi32(iacc_mat_01, 78), 204);
                     let iacc_row_1 = _mm256_blend_epi32(_mm256_shuffle_epi32(iacc_mat_00, 78), iacc_mat_01, 204);
                     let iacc_row_2 = _mm256_blend_epi32(iacc_mat_10, _mm256_shuffle_epi32(iacc_mat_11, 78), 204);
@@ -531,13 +531,13 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                         _mm256_insertf128_ps(v, row_scale_f32_sse, 1)
                     };
 
-                    // ── Accumulate weighted dot products ──────────────────────────────────
+                    // -- Accumulate weighted dot products ----------------------------------
                     acc_rows[0] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_row_0), _mm256_mul_ps(col_scale_f32, _mm256_shuffle_ps(row_scale_f32, row_scale_f32,   0)), acc_rows[0]);
                     acc_rows[1] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_row_1), _mm256_mul_ps(col_scale_f32, _mm256_shuffle_ps(row_scale_f32, row_scale_f32,  85)), acc_rows[1]);
                     acc_rows[2] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_row_2), _mm256_mul_ps(col_scale_f32, _mm256_shuffle_ps(row_scale_f32, row_scale_f32, 170)), acc_rows[2]);
                     acc_rows[3] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc_row_3), _mm256_mul_ps(col_scale_f32, _mm256_shuffle_ps(row_scale_f32, row_scale_f32, 255)), acc_rows[3]);
 
-                    // ── Min correction via bsums ──────────────────────────────────────────
+                    // -- Min correction via bsums ------------------------------------------
                     // Broadcast each raw bsum 128-bit load into 256-bit
                     let lhs_bsums_01_0123 = _mm256_inserti128_si256(_mm256_castsi128_si256(lhs_raw_bsums_01_0123), lhs_raw_bsums_01_0123, 1);
                     let lhs_bsums_23_0123 = _mm256_inserti128_si256(_mm256_castsi128_si256(lhs_raw_bsums_23_0123), lhs_raw_bsums_23_0123, 1);
@@ -574,7 +574,7 @@ pub unsafe fn ggml_gemm_q2_k_8x8_q8_k(
                 } // end sb loop
             } // end b loop
 
-            // ── Store 4 output rows × 8 columns ──────────────────────────────────
+            // -- Store 4 output rows x 8 columns ----------------------------------
             for i in 0..4 {
                 _mm256_storeu_ps(
                     s.add((y * 4 + i) * bs + x * 8),

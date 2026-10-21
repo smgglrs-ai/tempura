@@ -1,5 +1,5 @@
 # Pinned nightly for cuda-oxide codegen backend.
-# Only used by `cargo oxide build` — regular `cargo build` uses
+# Only used by `cargo oxide build` -- regular `cargo build` uses
 # the system toolchain via rustup override.
 [toolchain]
 channel = "nightly-2026-04-03"

@@ -1,4 +1,4 @@
-//! Verus-verified sampling penalty bounds — unbounded proofs
+//! Verus-verified sampling penalty bounds -- unbounded proofs
 //!
 //! Proves: apply_penalties only accesses logits[tok] for tok < logits.len(),
 //! penalty counts are bounded by prior_tokens.len().

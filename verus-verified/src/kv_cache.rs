@@ -1,4 +1,4 @@
-//! Verus-verified KV cache indexing — unbounded proofs
+//! Verus-verified KV cache indexing -- unbounded proofs
 //!
 //! This module proves the KvCache indexing arithmetic from engine/src/kv_cache.rs
 //! for ALL possible parameter values, not just the bounded instances Kani checks

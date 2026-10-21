@@ -1,4 +1,4 @@
-//! Verus-verified fused kernel indexing — unbounded proofs
+//! Verus-verified fused kernel indexing -- unbounded proofs
 //!
 //! Proves indexing safety for fused RMSNorm+residual and SiLU+gate kernels.
 
@@ -79,7 +79,7 @@ proof fn fused_silu_gate_element_index(
 
 // ============================================================================
 // Fused SiLU: silu(x) = x * sigmoid(x), gate*silu applied elementwise
-// Output index i reads gate[i], up[i], writes output[i] — no cross-talk
+// Output index i reads gate[i], up[i], writes output[i] -- no cross-talk
 // ============================================================================
 
 proof fn fused_silu_no_cross_talk(

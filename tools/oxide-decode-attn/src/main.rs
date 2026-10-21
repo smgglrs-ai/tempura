@@ -3,7 +3,7 @@
  *
  * Unlike the cuTile version (cutile_decode_attn), this kernel accepts kv_len
  * as a *const i32 device pointer. The pointer address is stable (baked into
- * the CUDA graph at capture); the value at that address is updated H→D each
+ * the CUDA graph at capture); the value at that address is updated H->D each
  * decode step. This eliminates the stale-kv_len problem in the single-capture
  * CUDA graph.
  *
@@ -17,13 +17,13 @@
  *   v_cache: same layout as k_cache
  *   out:     [n_heads * head_dim] f32
  *
- * Grid:  (n_heads, 1, 1) — one block per attention head
- * Block: (32, 1, 1) — one warp per head (32 lanes share the work)
+ * Grid:  (n_heads, 1, 1) -- one block per attention head
+ * Block: (32, 1, 1) -- one warp per head (32 lanes share the work)
  * Smem:  2 * head_dim * 4 bytes = Q stage + accumulator
  *
  * Online softmax (exp2 trick, matching cutile_decode_attn):
- *   score_exp2 = Q·K * (scale / ln2)
- *   exp2(score_exp2) = exp(Q·K * scale)
+ *   score_exp2 = Q*K * (scale / ln2)
+ *   exp2(score_exp2) = exp(Q*K * scale)
  */
 
 use cuda_device::{DynamicSharedArray, kernel, thread, warp, float};
@@ -47,7 +47,7 @@ mod kernels {
     ///   [D+2W..D+2W+W*D]    acc_local per warp (each warp owns D floats)
     #[kernel]
     pub unsafe fn oxide_decode_attn_kpar(
-        out: *mut f32,          // [n_heads * head_dim] — raw ptr avoids DisjointSlice 2-param ABI
+        out: *mut f32,          // [n_heads * head_dim] -- raw ptr avoids DisjointSlice 2-param ABI
         q:   *const f32,
         k_cache: *const f32,
         v_cache: *const f32,
@@ -123,7 +123,7 @@ mod kernels {
             t += WARPS_PER_BLOCK_KPAR as i32;
         }
 
-        // Write per-warp m and l to smem — ALL warps participate
+        // Write per-warp m and l to smem -- ALL warps participate
         if lane == 0 {
             *smem.add((head_dim + warp_id) as usize) = m_local;
             *smem.add((head_dim + w + warp_id) as usize) = l_local;
@@ -179,15 +179,15 @@ mod kernels {
 
     /// Decode attention: one block per attention head, one warp per block.
     ///
-    /// kv_len_ptr is a stable device pointer updated H→D before each CUDA
-    /// graph replay — the kernel reads the CURRENT kv_len at execution time.
+    /// kv_len_ptr is a stable device pointer updated H->D before each CUDA
+    /// graph replay -- the kernel reads the CURRENT kv_len at execution time.
     #[kernel]
     pub unsafe fn oxide_decode_attn(
-        out: *mut f32,                // [n_heads * head_dim] — raw ptr, 1 PTX param
+        out: *mut f32,                // [n_heads * head_dim] -- raw ptr, 1 PTX param
         q:       *const f32,          // [n_heads * head_dim]
         k_cache: *const f32,          // [gpu_max_seq_len * n_kv_heads * head_dim]
         v_cache: *const f32,          // same layout as k_cache
-        kv_len_ptr: *const i32,       // device pointer — read at execution time
+        kv_len_ptr: *const i32,       // device pointer -- read at execution time
         scale: f32,
         n_kv_heads: u32,
         head_dim: u32,
@@ -239,7 +239,7 @@ mod kernels {
         while t < kv_len {
             let kv_base = (t as u32 * kv_stride + kv_h * head_dim) as usize;
 
-            // Q·K dot product: each lane accumulates a stripe, then warp-reduce.
+            // Q*K dot product: each lane accumulates a stripe, then warp-reduce.
             let mut qk: f32 = 0.0_f32;
             let mut di = lane;
             while di < head_dim {
@@ -283,7 +283,7 @@ mod kernels {
 
 }
 
-// ── Host-side correctness test ────────────────────────────────────────────────
+// -- Host-side correctness test ------------------------------------------------
 
 fn main() {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
@@ -300,7 +300,7 @@ fn main() {
     // Q: all ones.
     let q_host: Vec<f32> = vec![1.0_f32; n_heads * head_dim];
 
-    // KV cache: all ones (simplified, so Q·K = head_dim for all t, kv_h).
+    // KV cache: all ones (simplified, so Q*K = head_dim for all t, kv_h).
     // shape: [kv_len_max=8, n_kv_heads, head_dim]
     let kv_max = 8usize;
     let k_host: Vec<f32> = vec![1.0_f32; kv_max * n_kv_heads * head_dim];
@@ -316,7 +316,7 @@ fn main() {
 
     let module = kernels::load(&ctx).expect("load oxide decode-attn module");
 
-    // ── Test 1: original single-warp kernel ────────────────────────────────────
+    // -- Test 1: original single-warp kernel ------------------------------------
     let shared_bytes = (2 * head_dim * std::mem::size_of::<f32>()) as u32;
     let cfg = LaunchConfig {
         grid_dim:  (n_heads as u32, 1, 1),
@@ -344,13 +344,13 @@ fn main() {
     let expected = 0.5_f32;
     let max_err = result.iter().map(|v| (v - expected).abs()).fold(0.0_f32, f32::max);
     if max_err < 0.01 {
-        println!("oxide-decode-attn single-warp: PASSED (expected≈{expected:.3}, max_err={max_err:.4})");
+        println!("oxide-decode-attn single-warp: PASSED (expected~={expected:.3}, max_err={max_err:.4})");
     } else {
         eprintln!("oxide-decode-attn single-warp: FAILED (max_err={max_err:.4})");
         std::process::exit(1);
     }
 
-    // ── Test 2: K-parallel kernel (WARPS_PER_BLOCK_KPAR warps) ────────────────
+    // -- Test 2: K-parallel kernel (WARPS_PER_BLOCK_KPAR warps) ----------------
     let w = WARPS_PER_BLOCK_KPAR as usize;
     // smem: (head_dim*(W+1) + 2*W) * 4 bytes
     let kpar_smem = ((head_dim * (w + 1) + 2 * w) * std::mem::size_of::<f32>()) as u32;

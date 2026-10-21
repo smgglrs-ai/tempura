@@ -1,4 +1,4 @@
-// bench-speculative — measure speculative decoding throughput on GPU
+// bench-speculative -- measure speculative decoding throughput on GPU
 //
 // Usage:
 //   cargo run -p tempura-bench-gpu --release --bin bench-speculative \
@@ -9,9 +9,9 @@
 //   2. Target model verifies K+1 tokens (K draft + 1 correction)
 //   3. Accept/reject per-token; on rejection, rollback and correct
 //
-// NOTE: Speedup requires draft ITL < target_ITL × (1 - 1/(Kα+1)).
+// NOTE: Speedup requires draft ITL < target_ITL x (1 - 1/(Kalpha+1)).
 // With Bonsai-1.7B Q2_0 (~32ms/tok) as draft and Llama-3.1-8B Q4K (~9.3ms/tok)
-// as target, the draft is too slow for net speedup at K=4, α=0.7.
+// as target, the draft is too slow for net speedup at K=4, alpha=0.7.
 // A 150+ tok/s draft model is needed to beat the target alone.
 
 use std::path::Path;
@@ -121,22 +121,22 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: bench-speculative <draft.gguf> <target.gguf>");
-        eprintln!("  draft.gguf  — small fast model (e.g. Bonsai-1.7B-Q2_0)");
-        eprintln!("  target.gguf — large target model (e.g. Llama-3.1-8B-Q4K)");
+        eprintln!("  draft.gguf  -- small fast model (e.g. Bonsai-1.7B-Q2_0)");
+        eprintln!("  target.gguf -- large target model (e.g. Llama-3.1-8B-Q4K)");
         std::process::exit(1);
     }
     let draft_path = &args[1];
     let target_path = &args[2];
 
-    println!("╔══════════════════════════════════════════════════════╗");
-    println!("║  tempura Speculative Decoding Benchmark               ║");
-    println!("╚══════════════════════════════════════════════════════╝\n");
+    println!("????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????");
+    println!("???  tempura Speculative Decoding Benchmark               ???");
+    println!("????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????\n");
     println!("  Draft:  {draft_path}");
     println!("  Target: {target_path}");
     println!("  K={K} draft steps per round, greedy sampling\n");
 
     // Load draft model.
-    println!("Loading draft model…");
+    println!("Loading draft model...");
     let t0 = Instant::now();
     let draft_loader = GgufLoader::from_file_quantized(Path::new(draft_path))
         .expect("failed to open draft GGUF");
@@ -147,7 +147,7 @@ fn main() {
     println!("  Draft loaded in {:.2}s", t0.elapsed().as_secs_f64());
 
     // Load target model.
-    println!("Loading target model…");
+    println!("Loading target model...");
     let t1 = Instant::now();
     let target_loader = GgufLoader::from_file_quantized(Path::new(target_path))
         .expect("failed to open target GGUF");
@@ -169,13 +169,13 @@ fn main() {
     let mut draft_session = InferenceSession::new(&draft_config, TraceLevel::Off, 0);
     let mut target_session = InferenceSession::new(&target_config, TraceLevel::Off, 0);
 
-    println!("Prefilling both models ({} tokens)…", prompt.len());
+    println!("Prefilling both models ({} tokens)...", prompt.len());
     draft_wrapper.forward(&mut draft_session, &prompt);
     target_wrapper.forward(&mut target_session, &prompt);
     let last_token = 1u32; // start decode from token 1
 
     // Warmup rounds.
-    println!("Warmup ({WARMUP} rounds)…");
+    println!("Warmup ({WARMUP} rounds)...");
     for _ in 0..WARMUP {
         speculative_round(
             &draft_wrapper, &target_wrapper,
@@ -185,7 +185,7 @@ fn main() {
     }
 
     // Benchmark.
-    println!("Benchmarking ({BENCH_ROUNDS} rounds)…\n");
+    println!("Benchmarking ({BENCH_ROUNDS} rounds)...\n");
     let mut total_tokens = 0usize;
     let mut total_ms = 0.0f64;
     let mut acceptance_sum = 0.0f64;
@@ -206,7 +206,7 @@ fn main() {
     let ms_per_round = total_ms / BENCH_ROUNDS as f64;
     let toks_per_round = total_tokens as f64 / BENCH_ROUNDS as f64;
 
-    println!("─── Speculative Decode Results ───");
+    println!("--- Speculative Decode Results ---");
     println!("  Draft steps K:       {K}");
     println!("  Avg acceptance rate: {:.1}%", avg_acceptance * 100.0);
     println!("  Tokens per round:    {toks_per_round:.2}");
@@ -218,10 +218,10 @@ fn main() {
 
     let target_alone_ms = 1000.0 / 108.0;
     let speedup = target_alone_ms * toks_per_round / ms_per_round;
-    println!("  Speedup vs target-alone: {speedup:.2}×");
+    println!("  Speedup vs target-alone: {speedup:.2}x");
     if speedup < 1.0 {
         println!("  NOTE: Draft model too slow for net speedup.");
-        println!("  Need draft ITL < {:.1}ms ({:.0} tok/s) for K={K}, α={:.0}%",
+        println!("  Need draft ITL < {:.1}ms ({:.0} tok/s) for K={K}, alpha={:.0}%",
             target_alone_ms * (1.0 - 1.0 / (K as f64 * avg_acceptance + 1.0)),
             1000.0 / (target_alone_ms * (1.0 - 1.0 / (K as f64 * avg_acceptance + 1.0))),
             avg_acceptance * 100.0,

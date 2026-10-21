@@ -69,10 +69,10 @@ impl ActiveSession {
 }
 
 /// Parse TEMPURA_CCD_CORES env var.
-/// "0-15"  → (16, Some(0..=15))   pin to CCD0
-/// "16-31" → (16, Some(16..=31))  pin to CCD1
-/// "0-31"  → (32, Some(0..=31))   pin all, no migration
-/// unset   → (available, None)    no pinning (default)
+/// "0-15"  -> (16, Some(0..=15))   pin to CCD0
+/// "16-31" -> (16, Some(16..=31))  pin to CCD1
+/// "0-31"  -> (32, Some(0..=31))   pin all, no migration
+/// unset   -> (available, None)    no pinning (default)
 fn parse_ccd_cores_env() -> (usize, Option<Vec<usize>>) {
     let available = std::thread::available_parallelism()
         .map(|n| n.get())

@@ -23,8 +23,8 @@ pub trait KernelJob: Sync {
     fn exec_range(&self, start: usize, end: usize);
 }
 
-/// Parallel dispatch using a concrete job type — single stable function pointer.
-/// All calls using the same `J` share `trampoline::<J>` → good branch prediction.
+/// Parallel dispatch using a concrete job type -- single stable function pointer.
+/// All calls using the same `J` share `trampoline::<J>` -> good branch prediction.
 pub fn par_run_job<J: KernelJob>(n: usize, job: &J) {
     unsafe fn trampoline<J: KernelJob>(start: usize, end: usize, ctx: *const ()) {
         (*{ ctx as *const J }).exec_range(start, end)

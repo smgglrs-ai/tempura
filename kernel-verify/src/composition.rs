@@ -68,7 +68,7 @@ impl CompositionVerifier {
                 .filter(|b| !b.compatible)
                 .map(|b| {
                     format!(
-                        "{} → {}: output {} ≠ input {}",
+                        "{} -> {}: output {} ??? input {}",
                         b.from_op, b.to_op, b.from_output, b.to_input
                     )
                 })
@@ -160,7 +160,7 @@ impl CompositionVerifier {
                 output_elements: s * inter,
             },
             OpShape {
-                name: "SiLU×gate",
+                name: "SiLUxgate",
                 input_elements: s * inter,
                 output_elements: s * inter,
             },
@@ -207,7 +207,7 @@ impl CompositionVerifier {
         let ffn_chain = vec![
             ops[9].clone(),  // RMSNorm(post-attn)
             ops[10].clone(), // gate proj
-            ops[12].clone(), // SiLU×gate
+            ops[12].clone(), // SiLUxgate
             ops[13].clone(), // down proj
             ops[14].clone(), // Residual(FFN)
         ];

@@ -3,33 +3,33 @@
 //!
 //! Every function carries a doc-comment referencing the original C source line.
 //! Signatures use raw f32/i8 slices with explicit size parameters instead of
-//! ggml_tensor; the GGML threading (ith/nth) and wdata workspace are stripped —
+//! ggml_tensor; the GGML threading (ith/nth) and wdata workspace are stripped --
 //! callers manage parallelism externally.
 
-// ── Constants (vec.h) ────────────────────────────────────────────────────────
+// -- Constants (vec.h) --------------------------------------------------------
 
 const GELU_COEF_A: f32 = 0.044715;
 const GELU_QUICK_COEF: f32 = -1.702;
 const SQRT_2_OVER_PI: f32 = 0.797_884_56;
 const SQRT_2_INV: f32 = 0.707_106_78;
 
-// ── Scalar activation helpers (vec.h) ────────────────────────────────────────
+// -- Scalar activation helpers (vec.h) ----------------------------------------
 
 /// Direct translation of `ggml_gelu_f32` (vec.h line 968).
-/// Uses the f16 lookup table — zero tanh/exp at inference time.
+/// Uses the f16 lookup table -- zero tanh/exp at inference time.
 #[inline]
 pub fn gelu_f32(x: f32) -> f32 {
     super::helpers::gelu_f32_lut(x)
 }
 
 /// Direct translation of `ggml_gelu_quick_f32` (vec.h line 1017).
-/// Uses the f16 lookup table — zero exp at inference time.
+/// Uses the f16 lookup table -- zero exp at inference time.
 #[inline]
 pub fn gelu_quick_f32(x: f32) -> f32 {
     super::helpers::gelu_quick_f32_lut(x)
 }
 
-/// GELU with erf — `0.5*x*(1 + erf(x / sqrt(2)))`.
+/// GELU with erf -- `0.5*x*(1 + erf(x / sqrt(2)))`.
 /// Derived from `ggml_vec_gelu_erf_f32` (vec.h line 1010).
 #[inline]
 pub fn gelu_erf_f32(x: f32) -> f32 {
@@ -48,7 +48,7 @@ pub fn leaky_relu_f32(x: f32, ns: f32) -> f32 {
     (if x > 0.0 { x } else { 0.0 }) + ns * (if x < 0.0 { x } else { 0.0 })
 }
 
-// ── Element-wise vector ops ───────────────────────────────────────────────────
+// -- Element-wise vector ops ---------------------------------------------------
 
 /// Apply GELU to every element.
 /// Direct translation of `ggml_vec_gelu_f32` (vec.h line 1003).
@@ -138,7 +138,7 @@ pub fn vec_div_f32(z: &mut [f32], x: &[f32], y: &[f32]) {
     }
 }
 
-// ── Normalization ─────────────────────────────────────────────────────────────
+// -- Normalization -------------------------------------------------------------
 
 /// Layer normalization over a single contiguous row of length `n`.
 ///
@@ -215,9 +215,9 @@ pub fn rms_norm_mul_rows_f32(x: &[f32], w: &[f32], out: &mut [f32], n: usize, ep
     }
 }
 
-// ── Softmax ───────────────────────────────────────────────────────────────────
+// -- Softmax -------------------------------------------------------------------
 
-/// Softmax over rows of a [n_rows × n] matrix.
+/// Softmax over rows of a [n_rows x n] matrix.
 ///
 /// `scale` multiplies each logit before softmax.  `mask` is an optional matrix
 /// of the same shape (additive, already in the same dtype as x).  When `mask`
@@ -253,7 +253,7 @@ pub fn soft_max_rows_f32(
         // find max for numerical stability
         let max = yr.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-        // exp(x - max) and sum — AVX2 polynomial fast path
+        // exp(x - max) and sum -- AVX2 polynomial fast path
         let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(yr, max);
 
         // normalise
@@ -264,7 +264,7 @@ pub fn soft_max_rows_f32(
     }
 }
 
-// ── RoPE (Rotary Position Embeddings) ────────────────────────────────────────
+// -- RoPE (Rotary Position Embeddings) ----------------------------------------
 
 /// YaRN ramp function.
 /// Direct translation of `rope_yarn_ramp` (ops.cpp line 5951).
@@ -299,8 +299,8 @@ fn rope_yarn(
 
 /// Compute YaRN correction dimensions.
 /// Direct translation of `ggml_rope_yarn_corr_dims` (ggml.c / llama.cpp internals).
-/// Formula: low = n_dims * log(n_ctx_orig / (beta_fast * 2π)) / (2 * log(freq_base))
-///          high = n_dims * log(n_ctx_orig / (beta_slow * 2π)) / (2 * log(freq_base))
+/// Formula: low = n_dims * log(n_ctx_orig / (beta_fast * 2pi)) / (2 * log(freq_base))
+///          high = n_dims * log(n_ctx_orig / (beta_slow * 2pi)) / (2 * log(freq_base))
 pub fn rope_yarn_corr_dims(
     n_dims: usize,
     n_ctx_orig: usize,
@@ -453,10 +453,10 @@ pub fn rotate_pairs_f32(
     }
 }
 
-/// RoPE (Rotary Position Embedding) forward pass — f32, NeoX mode.
+/// RoPE (Rotary Position Embedding) forward pass -- f32, NeoX mode.
 ///
 /// Applies rotary embeddings in-place to `x`, which is a flat array of shape
-/// `[n_tokens × n_heads × head_dim]`.  `positions` contains one integer token
+/// `[n_tokens x n_heads x head_dim]`.  `positions` contains one integer token
 /// position per token (length `n_tokens`).
 ///
 /// Parameters match llama.cpp defaults:
@@ -527,7 +527,7 @@ pub fn rope_neox_f32(
     }
 }
 
-/// RoPE forward pass — f32, normal (GPT-J) mode.
+/// RoPE forward pass -- f32, normal (GPT-J) mode.
 ///
 /// Like `rope_neox_f32` but rotates `(x[i], x[i+1])` pairs (interleaved).
 /// Direct translation of the `GGML_ROPE_TYPE_NORMAL` branch in `rotate_pairs`
@@ -575,7 +575,7 @@ pub fn rope_normal_f32(
             let base = tok * n_heads * head_dim + head * head_dim;
             let src: Vec<f32> = x[base..base + head_dim].to_vec();
             let dst = &mut x[base..base + head_dim];
-            // scale=1 ⟹ ic = i0 (interleaved pairs)
+            // scale=1 ??? ic = i0 (interleaved pairs)
             rotate_pairs_f32(n_dims, 1, &cache, &src, dst, 1);
             for i in n_dims..head_dim {
                 dst[i] = src[i];
@@ -584,19 +584,19 @@ pub fn rope_normal_f32(
     }
 }
 
-// ── Flash Attention ───────────────────────────────────────────────────────────
+// -- Flash Attention -----------------------------------------------------------
 
-/// Online-softmax flash attention — pure f32.
+/// Online-softmax flash attention -- pure f32.
 ///
 /// Computes `out[iq, :] = softmax(Q[iq] K^T * scale) V` using the
 /// numerically-stable online algorithm (Dao et al., 2022).
 ///
 /// Shapes:
-/// - `q`:  `[n_q × d_k]` — query matrix (row-major)
-/// - `k`:  `[n_kv × d_k]` — key matrix (row-major)
-/// - `v`:  `[n_kv × d_v]` — value matrix (row-major)
-/// - `out`: `[n_q × d_v]` — output (row-major)
-/// - `mask`: optional `[n_q × n_kv]` additive attention mask (e.g. causal)
+/// - `q`:  `[n_q x d_k]` -- query matrix (row-major)
+/// - `k`:  `[n_kv x d_k]` -- key matrix (row-major)
+/// - `v`:  `[n_kv x d_v]` -- value matrix (row-major)
+/// - `out`: `[n_q x d_v]` -- output (row-major)
+/// - `mask`: optional `[n_q x n_kv]` additive attention mask (e.g. causal)
 ///
 /// Direct translation of `ggml_compute_forward_flash_attn_ext_f16_one_chunk`
 /// (ops.cpp line 8614), simplified to f32 throughout and a single-threaded,
@@ -683,7 +683,7 @@ pub fn flash_attn_f32(
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// -- Tests ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -693,7 +693,7 @@ mod tests {
         (a - b).abs() < tol
     }
 
-    // ── RMS norm ──────────────────────────────────────────────────────────────
+    // -- RMS norm --------------------------------------------------------------
 
     #[test]
     fn test_rms_norm_unit_vector() {
@@ -734,7 +734,7 @@ mod tests {
         }
     }
 
-    // ── RMS norm + mul fused ──────────────────────────────────────────────────
+    // -- RMS norm + mul fused --------------------------------------------------
 
     #[test]
     fn test_rms_norm_mul_scales_by_weight() {
@@ -748,7 +748,7 @@ mod tests {
         }
     }
 
-    // ── Layer norm ────────────────────────────────────────────────────────────
+    // -- Layer norm ------------------------------------------------------------
 
     #[test]
     fn test_layer_norm_zero_mean() {
@@ -763,7 +763,7 @@ mod tests {
         assert!(approx_eq(out[3], 0.0, 1e-6));
     }
 
-    // ── Softmax ───────────────────────────────────────────────────────────────
+    // -- Softmax ---------------------------------------------------------------
 
     #[test]
     fn test_softmax_uniform() {
@@ -782,7 +782,7 @@ mod tests {
         soft_max_rows_f32(&x, &mut out, None, 4, 1.0);
         let sum: f32 = out.iter().sum();
         assert!(approx_eq(sum, 1.0, 1e-6));
-        // monotone: larger input → larger probability
+        // monotone: larger input -> larger probability
         assert!(out[3] > out[2]);
         assert!(out[2] > out[1]);
         assert!(out[1] > out[0]);
@@ -795,19 +795,19 @@ mod tests {
         let mask = vec![0.0f32, f32::NEG_INFINITY, 0.0, 0.0];
         let mut out = vec![0.0f32; 4];
         soft_max_rows_f32(&x, &mut out, Some(&mask), 2, 1.0);
-        // row 0: only first element survives  → [1, 0]
+        // row 0: only first element survives  -> [1, 0]
         assert!(approx_eq(out[0], 1.0, 1e-5));
         assert!(approx_eq(out[1], 0.0, 1e-5));
-        // row 1: both equal → [0.5, 0.5]
+        // row 1: both equal -> [0.5, 0.5]
         assert!(approx_eq(out[2], 0.5, 1e-5));
         assert!(approx_eq(out[3], 0.5, 1e-5));
     }
 
-    // ── RoPE ──────────────────────────────────────────────────────────────────
+    // -- RoPE ------------------------------------------------------------------
 
     #[test]
     fn test_rope_cache_identity_at_zero() {
-        // position 0 → all θ = 0 → cos=1, sin=0 → rotation is identity
+        // position 0 -> all ?? = 0 -> cos=1, sin=0 -> rotation is identity
         let mut cache = vec![0.0f32; 4];
         rope_cache_init(0.0, 1.0, None, [0.0, 0.0], 4, 0.0, 1.0, &mut cache, 1.0, 0.5);
         // cache[0] = cos(0) = 1, cache[1] = sin(0) = 0
@@ -847,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_rope_neox_position_zero_is_identity() {
-        // At position 0, θ = 0 everywhere, so RoPE is the identity transform.
+        // At position 0, ?? = 0 everywhere, so RoPE is the identity transform.
         let n_tokens = 1;
         let n_heads = 2;
         let head_dim = 4;
@@ -876,7 +876,7 @@ mod tests {
         }
     }
 
-    // ── Flash attention ───────────────────────────────────────────────────────
+    // -- Flash attention -------------------------------------------------------
 
     #[test]
     fn test_flash_attn_single_query_uniform_keys() {
@@ -890,7 +890,7 @@ mod tests {
         let v = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut out = vec![0.0f32; n_q * d_v];
         flash_attn_f32(&q, &k, &v, &mut out, None, n_q, n_kv, d_k, d_v, 1.0);
-        // uniform weights → output = mean of V rows = [3, 4]
+        // uniform weights -> output = mean of V rows = [3, 4]
         assert!(approx_eq(out[0], 3.0, 1e-4));
         assert!(approx_eq(out[1], 4.0, 1e-4));
     }
@@ -909,17 +909,17 @@ mod tests {
         let mask = vec![0.0f32, f32::NEG_INFINITY, 0.0, 0.0];
         let mut out = vec![0.0f32; n_q * d_v];
         flash_attn_f32(&q, &k, &v, &mut out, Some(&mask), n_q, n_kv, d_k, d_v, 1.0);
-        // q0 → only attends to k0 → v0 = 10
+        // q0 -> only attends to k0 -> v0 = 10
         assert!(approx_eq(out[0], 10.0, 1e-4));
-        // q1 → attends to both k0, k1 equally → (10+20)/2 = 15
+        // q1 -> attends to both k0, k1 equally -> (10+20)/2 = 15
         assert!(approx_eq(out[1], 15.0, 1e-4));
     }
 
-    // ── Activations ───────────────────────────────────────────────────────────
+    // -- Activations -----------------------------------------------------------
 
     #[test]
     fn test_silu_positive() {
-        // silu(x) = x * sigmoid(x); for large x, silu ≈ x
+        // silu(x) = x * sigmoid(x); for large x, silu ~= x
         let y = silu_f32(10.0);
         assert!(approx_eq(y, 10.0, 0.01));
     }
@@ -936,7 +936,7 @@ mod tests {
 
     #[test]
     fn test_gelu_large_positive() {
-        // gelu(x) ≈ x for large x
+        // gelu(x) ~= x for large x
         let y = gelu_f32(10.0);
         assert!(approx_eq(y, 10.0, 0.01));
     }
@@ -956,7 +956,7 @@ mod tests {
         assert!(approx_eq(leaky_relu_f32(-2.0, 0.1), -0.2, 1e-6));
     }
 
-    // ── Element-wise ops ──────────────────────────────────────────────────────
+    // -- Element-wise ops ------------------------------------------------------
 
     #[test]
     fn test_vec_add_f32() {

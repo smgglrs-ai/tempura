@@ -10,7 +10,7 @@
     "llamacpp": {"pp128": 204.0, "pp512": 207.0, "tg32": 9.7, "tg128": 9.4}
   },
   "gaps": {"pp128": "2.8x", "tg32": "1.5x"},
-  "session_gains": {"pp128": "22 → 72.9 tok/s (3.3x)", "tg32": "1.68 → 6.6 tok/s (3.9x)"},
+  "session_gains": {"pp128": "22 -> 72.9 tok/s (3.3x)", "tg32": "1.68 -> 6.6 tok/s (3.9x)"},
   "profiling_findings": {
     "instructions_per_32tok": "521B vs 99B (llama.cpp)",
     "top_hotspots": [
@@ -28,8 +28,8 @@
     "Software prefetch _mm_prefetch T1",
     "AVX512VNNI _mm256_dpbusd_epi32 in Q4K/Q6K dot",
     "Dedicated engine OS thread + private Rayon pool",
-    "Fused QKV projection (3 barriers → 1)",
-    "Fused gate+up (2 barriers → 1)",
+    "Fused QKV projection (3 barriers -> 1)",
+    "Fused gate+up (2 barriers -> 1)",
     "Parallel F16 GEMV for V projection",
     "Dual-output Q4K GEMV (j and j+1 simultaneously)",
     "unsafe slice indexing in hot kernel loops",

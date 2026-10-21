@@ -1,4 +1,4 @@
-//! Verus-verified activation and MoE routing proofs — unbounded
+//! Verus-verified activation and MoE routing proofs -- unbounded
 //!
 //! Proves integer/logical properties of activation functions and MoE routing
 //! that generalize to all inputs. Float-specific properties (GELU accuracy,
@@ -9,7 +9,7 @@ use vstd::prelude::*;
 verus! {
 
 // ============================================================================
-// 1. relu_non_negative — for any real x: max(0, x) >= 0
+// 1. relu_non_negative -- for any real x: max(0, x) >= 0
 // ============================================================================
 
 proof fn relu_non_negative(x: int)
@@ -21,7 +21,7 @@ proof fn relu_non_negative(x: int)
 }
 
 // ============================================================================
-// 2. softmax_partition — for n > 0 and k <= n: selecting top-k from n experts
+// 2. softmax_partition -- for n > 0 and k <= n: selecting top-k from n experts
 //    gives k indices, all < n
 // ============================================================================
 
@@ -44,7 +44,7 @@ proof fn softmax_partition(n: nat, k: nat)
 }
 
 // ============================================================================
-// 3. moe_weight_normalization — for k positive weights: normalized weights
+// 3. moe_weight_normalization -- for k positive weights: normalized weights
 //    sum to 1 (expressed as: sum of (w_i / sum) = 1)
 // ============================================================================
 
@@ -69,13 +69,13 @@ proof fn moe_weight_normalization(k: nat, total: int)
 proof fn normalization_ratio(sum: int)
     requires sum > 0,
     ensures
-        // sum / sum == 1 — the fundamental normalization identity
+        // sum / sum == 1 -- the fundamental normalization identity
         sum / sum == 1int,
 {
 }
 
 // ============================================================================
-// 4. gelu_symmetry — gelu(-x) ≈ -gelu(x) (odd function, linear term)
+// 4. gelu_symmetry -- gelu(-x) ~= -gelu(x) (odd function, linear term)
 //    For the linear component: x * f(x) where f is even means g(x) = x*f(x) is odd.
 //    We prove the algebraic identity for the integer/linear term.
 // ============================================================================
@@ -93,7 +93,7 @@ proof fn gelu_symmetry_linear_term(x: int)
 }
 
 // ============================================================================
-// 5. logit_softcapping_bounded — for any x and cap > 0:
+// 5. logit_softcapping_bounded -- for any x and cap > 0:
 //    |tanh(x/cap) * cap| <= cap
 //    Since |tanh(t)| <= 1 for all t, |tanh(x/cap) * cap| <= 1 * cap = cap.
 //    We prove the bounding property in integer arithmetic.

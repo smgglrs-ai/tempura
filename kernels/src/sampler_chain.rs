@@ -40,7 +40,7 @@ impl Default for SamplerChain {
     }
 }
 
-// ── MinP ───────────────────────────────────────────────────────────────────
+// -- MinP -------------------------------------------------------------------
 //
 // Keeps tokens with probability >= min_p * max_probability.
 // Operates on logits (pre-softmax): keeps tokens where
@@ -79,7 +79,7 @@ impl LogitProcessor for MinPSampler {
     }
 }
 
-// ── TypicalP ───────────────────────────────────────────────────────────────
+// -- TypicalP ---------------------------------------------------------------
 //
 // Keeps tokens whose information content (-log p) is closest to the
 // distribution's entropy. Selects the "typical" tokens up to the
@@ -141,7 +141,7 @@ impl LogitProcessor for TypicalSampler {
     }
 }
 
-// ── Mirostat v2 ────────────────────────────────────────────────────────────
+// -- Mirostat v2 ------------------------------------------------------------
 //
 // Adaptive sampling targeting a specific surprise level (tau).
 // Truncates tokens with surprise > mu, then updates mu after sampling.
@@ -209,7 +209,7 @@ impl LogitProcessor for MirostatV2Sampler {
     }
 }
 
-// ── RepetitionPenalty ───────────────────────────────────────────────────────
+// -- RepetitionPenalty -------------------------------------------------------
 //
 // Penalizes repeated tokens within a window of last_n tokens.
 // If logit > 0, divide by penalty; if logit <= 0, multiply by penalty.
@@ -246,7 +246,7 @@ impl LogitProcessor for RepetitionPenalizer {
     }
 }
 
-// ── LogitBias ──────────────────────────────────────────────────────────────
+// -- LogitBias --------------------------------------------------------------
 
 pub struct LogitBiaser {
     pub biases: Vec<(u32, f32)>,
@@ -263,7 +263,7 @@ impl LogitProcessor for LogitBiaser {
     }
 }
 
-// ── TopNSigma ──────────────────────────────────────────────────────────────
+// -- TopNSigma --------------------------------------------------------------
 //
 // Keeps tokens within n standard deviations of the max logit.
 // Excludes -infinity logits from mean/std calculation.
@@ -575,13 +575,13 @@ mod tests {
 
         // simulate selecting a high-probability token (low surprise)
         sampler.update_mu(0.9);
-        // surprise of 0.9 ≈ 0.15 bits, well below tau=5, so mu should increase
+        // surprise of 0.9 ~= 0.15 bits, well below tau=5, so mu should increase
         assert!(sampler.mu > initial_mu);
 
         // simulate selecting a low-probability token (high surprise)
         let mu_before = sampler.mu;
         sampler.update_mu(0.001);
-        // surprise of 0.001 ≈ 10 bits, above tau=5, so mu should decrease
+        // surprise of 0.001 ~= 10 bits, above tau=5, so mu should decrease
         assert!(sampler.mu < mu_before);
     }
 
@@ -738,9 +738,9 @@ mod tests {
         // uniform-ish logits with one outlier
         let mut logits = vec![1.0, 1.0, 1.0, 1.0, 1.0, 20.0];
 
-        // mean = (5*1 + 20)/6 = 25/6 ≈ 4.17
-        // var = (5*(1-4.17)^2 + (20-4.17)^2)/6 ≈ (5*10.03 + 250.69)/6 ≈ 50.1+250.7/6 ≈ 50.1
-        // std ≈ 7.08
+        // mean = (5*1 + 20)/6 = 25/6 ~= 4.17
+        // var = (5*(1-4.17)^2 + (20-4.17)^2)/6 ~= (5*10.03 + 250.69)/6 ~= 50.1+250.7/6 ~= 50.1
+        // std ~= 7.08
         // threshold = 20 - 1.0 * 7.08 = 12.92
         // only logit 20.0 survives
         let mut sampler = TopNSigmaSampler {
@@ -838,9 +838,9 @@ mod tests {
     }
 }
 
-// ── Mirostat v1 ────────────────────────────────────────────────────────────
+// -- Mirostat v1 ------------------------------------------------------------
 
-/// Mirostat v1 — estimates Zipf exponent from top-m tokens, computes dynamic
+/// Mirostat v1 -- estimates Zipf exponent from top-m tokens, computes dynamic
 /// top-k targeting entropy tau. Translated from llama_sampler_mirostat_apply.
 pub struct MirostatV1Sampler {
     pub n_vocab: usize,
@@ -930,7 +930,7 @@ impl LogitProcessor for MirostatV1Sampler {
     }
 }
 
-// ── Reasoning Budget ───────────────────────────────────────────────────────
+// -- Reasoning Budget -------------------------------------------------------
 
 /// Limits token generation budget for thinking/reasoning phases.
 /// Blocks thinking_end_token before min_budget, forces it after max_budget.

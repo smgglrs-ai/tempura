@@ -1,4 +1,4 @@
-//! Verus-verified I2S vec_dot indexing — unbounded proofs
+//! Verus-verified I2S vec_dot indexing -- unbounded proofs
 //!
 //! Proves: vec_dot_i2_i8_s inner loop indexing (packed weight bytes,
 //! INT8 activation indices), group decomposition, and accumulator bounds.
@@ -78,7 +78,7 @@ proof fn i2s_activation_index(
 }
 
 // ============================================================================
-// Weight byte → 4 elements: bits[7:6], bits[5:4], bits[3:2], bits[1:0]
+// Weight byte -> 4 elements: bits[7:6], bits[5:4], bits[3:2], bits[1:0]
 // Maps to elements {j, 32+j, 64+j, 96+j} within the group
 // ============================================================================
 
@@ -100,12 +100,12 @@ proof fn i2s_byte_to_elements(byte: u8)
 }
 
 // ============================================================================
-// Per-element product bound: w ∈ {0,1,2}, a_q ∈ [-128,127]
-// Product: w * a_q ∈ [-256, 254]
+// Per-element product bound: w ??? {0,1,2}, a_q ??? [-128,127]
+// Product: w * a_q ??? [-256, 254]
 // ============================================================================
 
-// For well-formed I2S data (w ∈ {0,1,2}), product ∈ [-256, 254]
-// For arbitrary data (w ∈ {0,1,2,3}), product ∈ [-384, 381]
+// For well-formed I2S data (w ??? {0,1,2}), product ??? [-256, 254]
+// For arbitrary data (w ??? {0,1,2,3}), product ??? [-384, 381]
 proof fn i2s_element_product_bound(w: nat, a_q: int)
     requires
         w <= 3,
@@ -127,7 +127,7 @@ proof fn i2s_element_product_bound(w: nat, a_q: int)
 
 // ============================================================================
 // Per-group accumulator: 128 products, each in [-384, 381]
-// Group sum: [-49152, 48768] — fits in i32
+// Group sum: [-49152, 48768] -- fits in i32
 // ============================================================================
 
 proof fn i2s_group_accumulator()

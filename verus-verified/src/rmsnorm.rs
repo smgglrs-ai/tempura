@@ -1,6 +1,6 @@
-//! Verus-verified RMSNorm indexing — unbounded proofs
+//! Verus-verified RMSNorm indexing -- unbounded proofs
 //!
-//! Proves token×hidden 2D indexing and GPU pass decomposition for any
+//! Proves tokenxhidden 2D indexing and GPU pass decomposition for any
 //! valid parameters, not just the Kani bounds (hidden<=8, tokens<=4).
 
 use vstd::prelude::*;
@@ -38,7 +38,7 @@ proof fn rmsnorm_indices_in_bounds(
 }
 
 // ============================================================================
-// Proof: GPU RMSNorm pass — row*h+i in bounds, and flat index decomposes validly
+// Proof: GPU RMSNorm pass -- row*h+i in bounds, and flat index decomposes validly
 // ============================================================================
 
 proof fn gpu_rmsnorm_pass_indices_in_bounds(

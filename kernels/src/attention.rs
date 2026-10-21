@@ -4,7 +4,7 @@ use crate::Result;
 #[cfg(all(feature = "cuda", not(feature = "cutile")))]
 use cuda_core::DeviceBuffer;
 
-// ── Dot product strategies ─────────────────────────────────────────────────
+// -- Dot product strategies -------------------------------------------------
 
 #[cfg(feature = "cpu")]
 #[inline(always)]
@@ -21,7 +21,7 @@ fn dot_f16(q: &[f32], k: &[f32]) -> f32 {
         .sum()
 }
 
-// ── Naive attention (parameterized by dot product) ─────────────────────────
+// -- Naive attention (parameterized by dot product) -------------------------
 
 #[cfg(feature = "cpu")]
 #[allow(clippy::too_many_arguments)]
@@ -229,7 +229,7 @@ fn naive_attention_ggml(
                     }
                 }
 
-                // C: ggml_vec_soft_max_f32 — AVX2 polynomial exp path
+                // C: ggml_vec_soft_max_f32 -- AVX2 polynomial exp path
                 let sum = crate::ggml::vec_llama::vec_soft_max_f32_inplace(&mut scores, max_score);
 
                 // C: sum = 1.0/sum; ggml_vec_scale_f32(nc, dp, sum);
@@ -337,7 +337,7 @@ fn naive_attention_ggml_softcap(
     Ok(())
 }
 
-// ── Flash attention (tiled online softmax, parameterized by dot product) ───
+// -- Flash attention (tiled online softmax, parameterized by dot product) ---
 
 #[cfg(feature = "cpu")]
 const FLASH_BC: usize = 32;
@@ -448,7 +448,7 @@ fn flash_attention(
     Ok(())
 }
 
-// ── ALiBi slope computation ───────────────────────────────────────────────
+// -- ALiBi slope computation -----------------------------------------------
 //
 // Translated from ggml's ggml_compute_forward_soft_max_f32 (ops.cpp:5348-5370).
 // For n_heads heads with max_bias > 0:
@@ -478,7 +478,7 @@ pub fn alibi_slopes(n_heads: usize, max_bias: f32) -> Vec<f32> {
         .collect()
 }
 
-// ── Masked attention with ALiBi ──────────────────────────────────────────
+// -- Masked attention with ALiBi ------------------------------------------
 //
 // Supports:
 // - Additive mask: mask[q_pos * kv_len + k_pos] added to score before softmax
@@ -614,7 +614,7 @@ pub fn attention_decode_heads(
 
         let scores = &mut scores[..kv_len];
 
-        // QK: AVX2 vec_dot_f32 replaces scalar d-loop (4×8-wide FMA for head_dim=128)
+        // QK: AVX2 vec_dot_f32 replaces scalar d-loop (4x8-wide FMA for head_dim=128)
         for kv_s in 0..kv_len {
             let k_offset = (kv_s * num_kv_heads + kv_h) * head_dim;
             let k_vec = &k[k_offset..k_offset + head_dim];
@@ -628,8 +628,8 @@ pub fn attention_decode_heads(
             *s *= inv_sum;
         }
 
-        // AV: AXPY pattern — outer loop over kv_s (contiguous v_row), inner AVX2 fmadd.
-        // Matches llama.cpp's ggml_vec_mad_f32 (4×8-wide fmadd per iteration).
+        // AV: AXPY pattern -- outer loop over kv_s (contiguous v_row), inner AVX2 fmadd.
+        // Matches llama.cpp's ggml_vec_mad_f32 (4x8-wide fmadd per iteration).
         let o_offset = h * head_dim;
         let out_row = &mut output[o_offset..o_offset + head_dim];
         for x in out_row.iter_mut() {
@@ -686,7 +686,7 @@ unsafe fn axpy_avx2(out: &mut [f32], src: &[f32], scale: f32) {
     }
 }
 
-/// SIMD f16→f32 dot product: q[f32] · k[f16], head_dim elements.
+/// SIMD f16->f32 dot product: q[f32] * k[f16], head_dim elements.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
 unsafe fn dot_f32_f16(q: &[f32], k_f16: *const u16, head_dim: usize) -> f32 {
@@ -918,7 +918,7 @@ pub fn par_attention_decode(
     scale: f32,
 ) {
     // Only parallelize when seq_len is large enough to justify condvar overhead.
-    // For seq_len < 64, sequential attention is faster (attention < 0.5ms, overhead ~20μs).
+    // For seq_len < 64, sequential attention is faster (attention < 0.5ms, overhead ~20mus).
     if kv_len < 64 || num_heads <= 1 {
         // Sequential path: reuse the existing per-head functions.
         let heads_per_group = num_heads / num_kv_heads;
@@ -927,7 +927,7 @@ pub fn par_attention_decode(
             let kv_h = h / heads_per_group;
             let q_head = &q[h * head_dim..(h + 1) * head_dim];
             let out_head = &mut output[h * head_dim..(h + 1) * head_dim];
-            // k/v are the full cache slices — use actual slice length as bound
+            // k/v are the full cache slices -- use actual slice length as bound
             decode_one_head(q_head, k, v, out_head, &mut scores, kv_start, kv_len,
                 num_kv_heads, head_dim, scale, kv_h);
         }
@@ -1106,7 +1106,7 @@ pub fn attention_prefill_items_f16kv(
     }
 }
 
-// ── Concrete CPU attention structs ─────────────────────────────────────────
+// -- Concrete CPU attention structs -----------------------------------------
 
 #[cfg(feature = "cpu")]
 pub struct CpuAttentionGgml;
@@ -2305,7 +2305,7 @@ mod tests {
         )
         .unwrap();
 
-        // Token 0: window=2 but only 1 token visible → same as full
+        // Token 0: window=2 but only 1 token visible -> same as full
         for d in 0..head_dim {
             assert!(
                 (out_full[d] - out_windowed[d]).abs() < 1e-5,
@@ -2601,7 +2601,7 @@ mod tests {
 
     #[test]
     fn test_alibi_slopes_power_of_two_heads() {
-        // 8 heads, max_bias=8 → standard ALiBi slopes
+        // 8 heads, max_bias=8 -> standard ALiBi slopes
         // n_head_log2=8, m0 = 2^(-8/8) = 0.5
         // slopes: 0.5^1, 0.5^2, ..., 0.5^8
         let slopes = alibi_slopes(8, 8.0);
@@ -2619,7 +2619,7 @@ mod tests {
 
     #[test]
     fn test_alibi_slopes_non_power_of_two_heads() {
-        // 6 heads, max_bias=8 → n_head_log2=4
+        // 6 heads, max_bias=8 -> n_head_log2=4
         // m0 = 2^(-8/4) = 0.25
         // m1 = 2^(-8/2/4) = 2^(-1) = 0.5
         // heads 0..3: m0^(h+1) = 0.25, 0.0625, 0.015625, 0.00390625
@@ -2647,7 +2647,7 @@ mod tests {
         let num_kv_heads = 2;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        // Uniform Q and K so all dot products are equal → without ALiBi,
+        // Uniform Q and K so all dot products are equal -> without ALiBi,
         // attention weights would be uniform over visible positions.
         let q = vec![1.0f32; seq_len * num_heads * head_dim];
         let k = vec![1.0f32; kv_len * num_kv_heads * head_dim];
@@ -2719,7 +2719,7 @@ mod tests {
 
         let q = vec![0.5f32; seq_len * num_heads * head_dim];
         let k = vec![0.5f32; kv_len * num_kv_heads * head_dim];
-        // V = [0,0,0,0, 1,1,1,1, ...] — later tokens have higher values
+        // V = [0,0,0,0, 1,1,1,1, ...] -- later tokens have higher values
         let v: Vec<f32> = (0..kv_len * num_kv_heads * head_dim)
             .map(|i| (i / head_dim) as f32)
             .collect();
@@ -2743,8 +2743,8 @@ mod tests {
             )
             .unwrap();
 
-        // Without ALiBi, uniform weights → mean value ≈ 3.5
-        // With ALiBi, recency bias → output should be > 3.5 (biased toward later tokens)
+        // Without ALiBi, uniform weights -> mean value ~= 3.5
+        // With ALiBi, recency bias -> output should be > 3.5 (biased toward later tokens)
         let mean_val = out_alibi.iter().sum::<f32>() / out_alibi.len() as f32;
         assert!(
             mean_val > 3.5,
@@ -2923,7 +2923,7 @@ mod tests {
         // Normal score0 = dot(q,k0)*scale = 1600*0.5 = 800
         // Normal score1 = dot(q,k1)*scale = 80*0.5 = 40
         // Huge gap => normal attention puts ~100% on key0
-        // Softcap: tanh(800/5)*5 ≈ 5.0, tanh(40/5)*5 ≈ 5.0 (both saturated)
+        // Softcap: tanh(800/5)*5 ~= 5.0, tanh(40/5)*5 ~= 5.0 (both saturated)
         // So softcapped attention is ~50/50 between the two keys
 
         let mut out_normal = vec![0.0f32; head_dim];

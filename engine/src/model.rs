@@ -601,7 +601,7 @@ where
                 let mut alpha = vec![0.0f32; seq_len * dn_heads];
                 let mut beta = vec![0.0f32; seq_len * dn_heads];
 
-                // in_proj: hidden → [Q, K, V, Z] where Z is output gating
+                // in_proj: hidden -> [Q, K, V, Z] where Z is output gating
                 if let Some(in_w) = weights.get(&format!("{prefix}.ssm.in_proj.weight")) {
                     let in_cols = 4 * dn_dim;
                     let mut in_proj = vec![0.0f32; seq_len * in_cols];
@@ -1400,7 +1400,7 @@ where
                          m: usize,
                          n: usize,
                          k: usize| {
-            // Check typed_tensors FIRST — routes all formats through ggml::mul_mat_q
+            // Check typed_tensors FIRST -- routes all formats through ggml::mul_mat_q
             if let Some((dtype, w)) = qweights.get_typed(name) {
                 use tempura_kernels::ggml::GgmlType;
                 // Use optimized pre-quantized path for Q4K/Q6K decode
@@ -1553,7 +1553,7 @@ where
                 }
                 return;
             }
-            // F16 mmap tensors — parallel GEMV for m=1, materialise for m>1
+            // F16 mmap tensors -- parallel GEMV for m=1, materialise for m>1
             if let Some(f16_bytes) = qweights.get_f16(name) {
                 if m == 1 {
                     let worker = F16GemvWorker {
@@ -1895,7 +1895,7 @@ where
         let cache_layer_map_q = cfg.cache_layer_map();
         let mut deltanet_layer_idx = 0usize;
 
-        // ── ggml_graph_compute_thread translation ────────────────────────────────
+        // -- ggml_graph_compute_thread translation --------------------------------
         // Workers dispatched ONCE for all layers; per-node SpinBarrier;
         // sequential ops (norm, attention) run on ith==0 only.
         let can_use_graph_decode = seq_len == 1
@@ -2036,7 +2036,7 @@ where
             let gp_ptr = gate_preqs.as_mut_ptr() as usize;
 
             let kv_cache_ptr = &mut session.cache as *mut crate::kv_cache::KvCache as usize;
-            // kv_len after each layer's append — written by ith==0, read by all after barrier
+            // kv_len after each layer's append -- written by ith==0, read by all after barrier
             let mut layer_kv_lens = vec![0usize; cfg.num_layers];
             let kv_len_ptr = layer_kv_lens.as_mut_ptr() as usize;
 
@@ -2064,7 +2064,7 @@ where
             pool.run_indexed(&|ith, nth| {
                 use tempura_kernels::quantized::{q4k_preq_range_q8k, q6k_preq_range_q8k, PreQuantizedActivations};
                 use tempura_kernels::ggml::blocks::BlockQ8K;
-                // Dispatch via kernel table — single fn-pointer call, no match on hw at token time.
+                // Dispatch via kernel table -- single fn-pointer call, no match on hw at token time.
                 // Matches llama.cpp type_traits_cpu[ty].vec_dot.
                 let dispatch_qk = |b: *const u8, q8k: *const BlockQ8K, normed_f32: *const f32, bpr: usize, k: usize, out: *mut f32, s: usize, e: usize, ty: u8| {
                     unsafe {
@@ -2082,7 +2082,7 @@ where
                 for layer in 0..n_layers_cap {
                     let lw = &gd_layers[layer];
 
-                    // ── Node 0: input RMSNorm → normed + normed_preq (ith==0) ───
+                    // -- Node 0: input RMSNorm -> normed + normed_preq (ith==0) ---
                     if ith == 0 {
                         let hid = unsafe { std::slice::from_raw_parts(hp as *const f32, h_cap) };
                         let in_w = unsafe {
@@ -2100,7 +2100,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── Node 1: QKV projection (parallel, virtual n=q+kv+kv) ───
+                    // -- Node 1: QKV projection (parallel, virtual n=q+kv+kv) ---
                     {
                         let pq = unsafe {
                             (*((np_ptr as *const Option<PreQuantizedActivations>).add(layer)))
@@ -2116,7 +2116,7 @@ where
                             (*((np_ptr as *const Option<PreQuantizedActivations>).add(layer)))
                                 .as_ref().unwrap().q8.as_ptr() as *const f32
                         };
-                        // ↑ NOTE: for F16 dispatch the actual f32 normed is used not q8
+                        // ??? NOTE: for F16 dispatch the actual f32 normed is used not q8
                         // Use the raw normed slice pointer which is safe here
                         let normed_raw = normedp as *const f32;
                         let qs = s;
@@ -2137,7 +2137,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── Node 2a: QK-norm + RoPE + KV-cache-append (ith==0) ───────
+                    // -- Node 2a: QK-norm + RoPE + KV-cache-append (ith==0) -------
                     if ith == 0 {
                         let q_sl = unsafe {
                             std::slice::from_raw_parts_mut(qp as *mut f32, q_dim_cap)
@@ -2204,7 +2204,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── Node 2b: attention (parallel when kv_len >= n_heads, else sequential) ──
+                    // -- Node 2b: attention (parallel when kv_len >= n_heads, else sequential) --
                     // Translates flash_attn_ext_f16 ith/nth dispatch for long contexts.
                     // All threads hit barrier.wait() unconditionally.
                     {
@@ -2212,7 +2212,7 @@ where
                             (*(kv_cache_ptr as *const crate::kv_cache::KvCache)).seq_len + 1
                         };
                         // Parallel attention: all threads compute their assigned heads via F16 KV.
-                        // llama.cpp always parallelizes attention across heads — no threshold.
+                        // llama.cpp always parallelizes attention across heads -- no threshold.
                         let cache_ref = unsafe { &*(kv_cache_ptr as *const crate::kv_cache::KvCache) };
                         if cache_ref.use_f16 {
                             let k_f16 = cache_ref.k_data_f16(lw.cl_q, kv_len_l);
@@ -2275,7 +2275,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── Node 2c: quantize attn_out → attn_preq (ith==0) ──────────
+                    // -- Node 2c: quantize attn_out -> attn_preq (ith==0) ----------
                     if ith == 0 {
                         let attn_sl = unsafe {
                             std::slice::from_raw_parts(attn_outp as *const f32, q_dim_cap)
@@ -2288,7 +2288,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── Node 3: O_proj (parallel, n=h) ───────────────────────────
+                    // -- Node 3: O_proj (parallel, n=h) ---------------------------
                     {
                         let pq = unsafe {
                             (*((ap_ptr as *const Option<PreQuantizedActivations>).add(layer)))
@@ -2306,7 +2306,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── Node 4: residual + post-norm + ffn_preq (ith==0) ─────────
+                    // -- Node 4: residual + post-norm + ffn_preq (ith==0) ---------
                     if ith == 0 {
                         let hid = unsafe {
                             std::slice::from_raw_parts_mut(hp as *mut f32, h_cap)
@@ -2329,7 +2329,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── Node 5: gate+up (parallel, virtual n=2*inter) ─────────────
+                    // -- Node 5: gate+up (parallel, virtual n=2*inter) -------------
                     {
                         let pq = unsafe {
                             (*((fp_ptr as *const Option<PreQuantizedActivations>).add(layer)))
@@ -2381,7 +2381,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── Node 6: SiLU×gate + gate_preq (ith==0) ───────────────────
+                    // -- Node 6: SiLUxgate + gate_preq (ith==0) -------------------
                     if ith == 0 {
                         let gate_sl = unsafe {
                             std::slice::from_raw_parts_mut(gatep as *mut f32, inter_cap)
@@ -2397,7 +2397,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── Node 7: down_proj (parallel, n=h) ────────────────────────
+                    // -- Node 7: down_proj (parallel, n=h) ------------------------
                     {
                         let pq = unsafe {
                             (*((gp_ptr as *const Option<PreQuantizedActivations>).add(layer)))
@@ -2427,7 +2427,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── Node 8: final residual (ith==0) ──────────────────────────
+                    // -- Node 8: final residual (ith==0) --------------------------
                     if ith == 0 {
                         let hid = unsafe {
                             std::slice::from_raw_parts_mut(hp as *mut f32, h_cap)
@@ -2444,7 +2444,7 @@ where
             break 'skip_layer_loop;
         }
 
-        // ── Prefill graph model (seq_len > 1): one pool.run_indexed for the entire
+        // -- Prefill graph model (seq_len > 1): one pool.run_indexed for the entire
         // forward pass. Translates ggml_graph_compute_thread for the prefill case.
         // Parallelizes both activation quantization and matmul across workers.
         // Prefill graph model: infrastructure is wired but numerical correctness
@@ -2504,7 +2504,7 @@ where
             let q8k_ffn_ptr    = q8k_ffn.as_mut_ptr() as usize;
             let q8k_gate_ptr   = q8k_gate.as_mut_ptr() as usize;
 
-            // Repacked Q8Kx4 buffers for 8×8 GEMM (only when m%4==0 and x8 weights exist)
+            // Repacked Q8Kx4 buffers for 8x8 GEMM (only when m%4==0 and x8 weights exist)
             let use_repacked_gemm = m % 4 == 0
                 && indexed_layers[0].q_proj_x8.is_some();
             let blank_x4 = BlockQ8Kx4 { d: [0.0f32; 4], qs: [0i8; 1024], bsums: [0i16; 64] };
@@ -2601,7 +2601,7 @@ where
             let pool = tempura_kernels::thread_pool::global_pool();
             let barrier = tempura_kernels::thread_pool::SpinBarrier::new(pool.thread_count());
 
-            // kv_len after each layer's append — written by ith==0, read by all after barrier
+            // kv_len after each layer's append -- written by ith==0, read by all after barrier
             let mut layer_kv_lens_pf = vec![0usize; n_layers_cap];
             let kv_len_pf_ptr = layer_kv_lens_pf.as_mut_ptr() as usize;
 
@@ -2612,7 +2612,7 @@ where
                     let t_start = (ith * t_per).min(m_cap);
                     let t_end   = ((ith + 1) * t_per).min(m_cap);
 
-                    // ── N0: RMSNorm for tokens t_start..t_end ─────────────────
+                    // -- N0: RMSNorm for tokens t_start..t_end -----------------
                     if t_start < t_end {
                         let hid = unsafe { std::slice::from_raw_parts(hp as *const f32, m_cap * h_cap) };
                         let in_w = unsafe { std::slice::from_raw_parts(lw.in_ln_p as *const f32, h_cap) };
@@ -2628,7 +2628,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N0b: quantize normed rows → q8k_normed (+ q8kx4 if repacked) ──
+                    // -- N0b: quantize normed rows -> q8k_normed (+ q8kx4 if repacked) --
                     if t_start < t_end {
                         let nrm = unsafe { std::slice::from_raw_parts(nrmp as *const f32, m_cap * h_cap) };
                         let q8k_out = q8k_normed_ptr as *mut BlockQ8K;
@@ -2640,7 +2640,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N1: QKV GEMM (parallel over output rows) ───────────────
+                    // -- N1: QKV GEMM (parallel over output rows) ---------------
                     {
                         let total_qkv = q_dim_cap + kv_dim_cap + kv_dim_cap;
                         let j_per = (total_qkv + nth - 1) / nth;
@@ -2697,7 +2697,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N2a: QK-norm + RoPE + KV-cache append (ith==0) ────────
+                    // -- N2a: QK-norm + RoPE + KV-cache append (ith==0) --------
                     if ith == 0 {
                         let q_sl = unsafe { std::slice::from_raw_parts_mut(qp as *mut f32, m_cap * q_dim_cap) };
                         let k_sl = unsafe { std::slice::from_raw_parts_mut(kp as *mut f32, m_cap * kv_dim_cap) };
@@ -2739,7 +2739,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N2b: parallel attention over (token × head) items ──────
+                    // -- N2b: parallel attention over (token x head) items ------
                     // All threads compute attention for their assigned (token, head) pairs.
                     // Translates llama.cpp flash_attn_ext_f16 ith/nth dispatch for prefill.
                     {
@@ -2748,7 +2748,7 @@ where
                         let k_f16 = cache.k_data_f16(lw.cl_q, kv_len_l);
                         let v_f16 = cache.v_data_f16(lw.cl_q, kv_len_l);
                         let q_sl = unsafe { std::slice::from_raw_parts(qp as *const f32, m_cap * q_dim_cap) };
-                        // Partition 4096 items (128 tokens × 32 heads) across threads
+                        // Partition 4096 items (128 tokens x 32 heads) across threads
                         let total_items = m_cap * n_heads_cap;
                         let items_per = (total_items + nth - 1) / nth;
                         let i_start = (ith * items_per).min(total_items);
@@ -2767,7 +2767,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N2b: quantize attn_out → q8k_attn (+ q8kx4) ───────────
+                    // -- N2b: quantize attn_out -> q8k_attn (+ q8kx4) -----------
                     {
                         let tq_per = (m_cap + nth - 1) / nth;
                         let tq_s = (ith * tq_per).min(m_cap);
@@ -2783,7 +2783,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N3: O_proj GEMM ─────────────────────────────────────────
+                    // -- N3: O_proj GEMM -----------------------------------------
                     {
                         let j_per = (h_cap + nth - 1) / nth;
                         let j_s = (ith * j_per).min(h_cap);
@@ -2808,7 +2808,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N4: residual + post-norm (parallel over tokens) ─────────
+                    // -- N4: residual + post-norm (parallel over tokens) ---------
                     if t_start < t_end {
                         let hid = unsafe { std::slice::from_raw_parts_mut(hp as *mut f32, m_cap * h_cap) };
                         let o = unsafe { std::slice::from_raw_parts(oprjp as *const f32, m_cap * h_cap) };
@@ -2822,7 +2822,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N4b: quantize normed2 → q8k_ffn (+ q8kx4) ─────────────
+                    // -- N4b: quantize normed2 -> q8k_ffn (+ q8kx4) -------------
                     if t_start < t_end {
                         let nrm2 = unsafe { std::slice::from_raw_parts(nrm2p as *const f32, m_cap * h_cap) };
                         unsafe { quantize_rows_q8k_range(nrm2.as_ptr(), h_cap, q8k_ffn_ptr as *mut BlockQ8K, t_start, t_end); }
@@ -2833,7 +2833,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N5: gate+up GEMM ────────────────────────────────────────
+                    // -- N5: gate+up GEMM ----------------------------------------
                     {
                         let total_gu = 2 * inter_cap;
                         let j_per = (total_gu + nth - 1) / nth;
@@ -2872,7 +2872,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N6: SiLU×gate + quantize → q8k_gate (+ q8kx4) ─────────
+                    // -- N6: SiLUxgate + quantize -> q8k_gate (+ q8kx4) ---------
                     if t_start < t_end {
                         let gate_sl = unsafe { std::slice::from_raw_parts_mut(gatep as *mut f32, m_cap * inter_cap) };
                         let up_sl   = unsafe { std::slice::from_raw_parts(upp as *const f32, m_cap * inter_cap) };
@@ -2888,13 +2888,13 @@ where
                     }
                     barrier.wait();
 
-                    // ── N7: down GEMM ────────────────────────────────────────────
+                    // -- N7: down GEMM --------------------------------------------
                     {
                         let j_per = (h_cap + nth - 1) / nth;
                         let j_s = (ith * j_per).min(h_cap);
                         let j_e = ((ith + 1) * j_per).min(h_cap);
                         if j_s < j_e {
-                            // Try repacked Q6Kx8 × Q8Kx4 GEMM first
+                            // Try repacked Q6Kx8 x Q8Kx4 GEMM first
                             if use_repacked_gemm_cap && lw.dx8 != 0 && j_s % 8 == 0 && (j_e - j_s) % 8 == 0 {
                                 let q8kx4_act = q8kx4_gate_ptr as *const tempura_kernels::ggml::blocks::BlockQ8Kx4;
                                 unsafe { q6k_prefill_gemm_x8_range(lw.dx8 as *const u8, q8kx4_act, dnp as *mut f32,
@@ -2913,7 +2913,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── N8: final residual (parallel over tokens) ─────────────
+                    // -- N8: final residual (parallel over tokens) -------------
                     if t_start < t_end {
                         let hid = unsafe { std::slice::from_raw_parts_mut(hp as *mut f32, m_cap * h_cap) };
                         let dn  = unsafe { std::slice::from_raw_parts(dnp as *const f32, m_cap * h_cap) };
@@ -3122,7 +3122,7 @@ where
                             .copy_from_slice(&src[3 * dn_dim..4 * dn_dim]);
                     }
                 } else if has_qkv {
-                    // QKV projection → raw qkv_buf goes directly into conv (no split yet)
+                    // QKV projection -> raw qkv_buf goes directly into conv (no split yet)
                     let qkv_cols = 2 * key_dim + dn_dim;
                     let mut qkv_buf = vec![0.0f32; seq_len * qkv_cols];
                     qmm(None, &normed, &qkv_name, &mut qkv_buf, seq_len, qkv_cols, h);
@@ -3177,7 +3177,7 @@ where
                         let dt_b = dt_bias_w.and_then(|b| b.get(h)).copied().unwrap_or(0.0);
                         let ssm_a = ssm_a_w.and_then(|a| a.get(h)).copied().unwrap_or(-1.0);
                         let sp = (1.0f32 + (alpha[idx] + dt_b).exp()).ln();
-                        alpha[idx] = sp * ssm_a; // pre-computed gate (negative → decay < 1)
+                        alpha[idx] = sp * ssm_a; // pre-computed gate (negative -> decay < 1)
                     }
                 }
 
@@ -3278,7 +3278,7 @@ where
                     }
                 }
 
-                // GDN kernel with pre-computed gate (alpha) and beta — ssm_a=1.0 means "pre-computed"
+                // GDN kernel with pre-computed gate (alpha) and beta -- ssm_a=1.0 means "pre-computed"
                 let dn_state = session.deltanet_state.as_mut().unwrap();
                 let state = dn_state.state_mut(deltanet_layer_idx);
                 let mut dn_out = vec![0.0f32; seq_len * dn_dim];
@@ -3451,7 +3451,7 @@ where
                     Vec::new()
                 };
 
-                // QMM/TL2 overwrites output entirely — no zero-fill needed
+                // QMM/TL2 overwrites output entirely -- no zero-fill needed
                 if seq_len == 1 {
                     if has_q_gate {
                         // Q+gate fused projection (Qwen3.5 attention layers):
@@ -3542,7 +3542,7 @@ where
                         indexed_layers[layer].k_proj.as_ref().and_then(|w| w.as_q4k()),
                         indexed_layers[layer].v_proj.as_ref().and_then(|w| w.as_q4k()),
                     ) {
-                        // Q+K+V all Q4K — single dispatch eliminates 2 barriers vs 3 separate calls
+                        // Q+K+V all Q4K -- single dispatch eliminates 2 barriers vs 3 separate calls
                         q4k.fused_q4k_preq_3(
                             pq,
                             qw,
@@ -3561,7 +3561,7 @@ where
                         indexed_layers[layer].k_proj.as_ref().and_then(|w| w.as_q4k()),
                         indexed_layers[layer].v_proj.as_ref().and_then(|w| w.as_f16()),
                     ) {
-                        // Q+K (Q4K) + V (F16) in a single Rayon region — eliminates 1 barrier
+                        // Q+K (Q4K) + V (F16) in a single Rayon region -- eliminates 1 barrier
                         q4k.fused_q4k_2_f16_1_preq(
                             pq,
                             qw,
@@ -3604,7 +3604,7 @@ where
                         indexed_layers[layer].k_proj.as_ref().and_then(|w| w.as_q6k()),
                         indexed_layers[layer].v_proj.as_ref().and_then(|w| w.as_q6k()),
                     ) {
-                        // Q+K+V all Q6K — single dispatch eliminates 2 barriers vs 3 separate calls
+                        // Q+K+V all Q6K -- single dispatch eliminates 2 barriers vs 3 separate calls
                         q4k.fused_q6k_preq_3(
                             &normed[..h],
                             qw,
@@ -4056,7 +4056,7 @@ where
                     // Prefill: n_tokens=seq_len, causal mask required.
                     // kv_prev = kv_len - seq_len (tokens already in cache before this prefill)
                     let kv_prev = kv_len - seq_len;
-                    // Causal mask: shape [seq_len × kv_len] as F16.
+                    // Causal mask: shape [seq_len x kv_len] as F16.
                     // mask[i][j] = 0 (attend) if j <= kv_prev + i, else -inf (block).
                     let f16_neg_inf: u16 = 0xFC00u16; // F16 -inf
                     let f16_zero: u16 = 0u16;
@@ -4262,7 +4262,7 @@ where
                         }
                         barrier.wait();
 
-                        // Thread 0: residual_add + RMSNorm → normed2 + preq
+                        // Thread 0: residual_add + RMSNorm -> normed2 + preq
                         if ith == 0 {
                             let hid =
                                 unsafe { std::slice::from_raw_parts_mut(hp as *mut f32, h) };
@@ -4434,7 +4434,7 @@ where
                 }
             } // end Attention block in forward_quantized
 
-            // FFN block — skipped when fused post-attn dispatch already handled it
+            // FFN block -- skipped when fused post-attn dispatch already handled it
             'ffn_block: {
             if used_fused_post_attn { break 'ffn_block; }
             let (ffn_input, ffn_preq) = if cfg.parallel_attn_ffn {
@@ -4607,7 +4607,7 @@ where
                                 indexed_layers[layer].gate_proj.as_ref().and_then(|w| w.as_q6k()),
                                 indexed_layers[layer].up_proj.as_ref().and_then(|w| w.as_q6k()),
                             ) {
-                                // gate+up both Q6K — single dispatch eliminates 1 barrier
+                                // gate+up both Q6K -- single dispatch eliminates 1 barrier
                                 q4k.fused_q6k_preq_2(
                                     ffn_input,
                                     gw,
@@ -4741,7 +4741,7 @@ where
                             let last = &gate[(seq_len - 1) * inter..seq_len * inter];
                             let norm: f32 = last.iter().map(|x| x * x).sum::<f32>().sqrt();
                             eprintln!(
-                                "L0 FFN after relu²*up[0..8]: {:?} norm={norm:.4}",
+                                "L0 FFN after relu^2*up[0..8]: {:?} norm={norm:.4}",
                                 &last[..8.min(inter)]
                             );
                         }
@@ -5236,7 +5236,7 @@ where
                 let input_ln = format!("{prefix}.input_layernorm.weight");
                 let post_ln = format!("{prefix}.post_attention_layernorm.weight");
 
-                // ── B0: Thread 0 — RMSNorm + LUT prep ──
+                // -- B0: Thread 0 -- RMSNorm + LUT prep --
                 if ith == 0 {
                     let ln_w = qweights.get_f32(&input_ln).unwrap();
                     self.pipeline
@@ -5269,7 +5269,7 @@ where
                 barrier.wait();
 
                 if layer_kind == crate::config::LayerKind::DeltaNet {
-                    // ── B1: all threads — QKV + gate GEMV (TL2 work-stealing) ──
+                    // -- B1: all threads -- QKV + gate GEMV (TL2 work-stealing) --
                     {
                         let qkv_name = format!("{prefix}.ssm.qkv_proj.weight");
                         let gate_name = format!("{prefix}.ssm.gate_proj.weight");
@@ -5371,7 +5371,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── B2: thread 0 — conv1d + GDN + norm + z_gate + preq for O proj ──
+                    // -- B2: thread 0 -- conv1d + GDN + norm + z_gate + preq for O proj --
                     if ith == 0 {
                         let qkv_name = format!("{prefix}.ssm.qkv_proj.weight");
                         let qkv_cols = qweights
@@ -5523,7 +5523,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── B3: all threads — O proj GEMV (TL2) ──
+                    // -- B3: all threads -- O proj GEMV (TL2) --
                     {
                         let out_proj_name = format!("{prefix}.ssm.out_proj.weight");
                         if lut_dn_ptr != 0 {
@@ -5568,7 +5568,7 @@ where
                     }
                     barrier.wait();
 
-                    // ── B4: thread 0 — residual ──
+                    // -- B4: thread 0 -- residual --
                     if ith == 0 {
                         let hidden_s = fsm!(hp, h);
                         let o_s = fs!(op, h);
@@ -5578,7 +5578,7 @@ where
                     }
                     barrier.wait();
                 } else {
-                    // ── Attention: QKV parallel, rest serial on thread 0 ──
+                    // -- Attention: QKV parallel, rest serial on thread 0 --
                     // B1: all threads GEMV: Q+gate, K, V (TL2 work-stealing)
                     {
                         let q_w_name = format!("{prefix}.self_attn.q_proj.weight");
@@ -5673,7 +5673,7 @@ where
                     }
                     barrier.wait();
 
-                    // B2: Thread 0 — Q extraction, QK norm, RoPE, KV cache, attention, gate
+                    // B2: Thread 0 -- Q extraction, QK norm, RoPE, KV cache, attention, gate
                     if ith == 0 {
                         let q_w_name = format!("{prefix}.self_attn.q_proj.weight");
                         let has_q_gate = qweights
@@ -5886,7 +5886,7 @@ where
                     }
                     barrier.wait();
 
-                    // B4: Thread 0 — residual
+                    // B4: Thread 0 -- residual
                     if ith == 0 {
                         let hidden_s = fsm!(hp, h);
                         let o_s = fs!(op, h);
@@ -5897,8 +5897,8 @@ where
                     barrier.wait();
                 }
 
-                // ── FFN (shared by DeltaNet and Attention) ──
-                // B5: Thread 0 — post-attention RMSNorm + LUT
+                // -- FFN (shared by DeltaNet and Attention) --
+                // B5: Thread 0 -- post-attention RMSNorm + LUT
                 if ith == 0 {
                     let pln_w = qweights.get_f32(&post_ln).unwrap();
                     self.pipeline
@@ -5968,7 +5968,7 @@ where
                 }
                 barrier.wait();
 
-                // B7: Thread 0 — SiLU*gate + LUT
+                // B7: Thread 0 -- SiLU*gate + LUT
                 if ith == 0 {
                     let g = fsm!(gp, inter);
                     let u = fs!(up, inter);
@@ -6022,7 +6022,7 @@ where
                 }
                 barrier.wait();
 
-                // B9: Thread 0 — residual
+                // B9: Thread 0 -- residual
                 if ith == 0 {
                     let hidden_s = fsm!(hp, h);
                     let d_s = fs!(dp, h);
@@ -6033,7 +6033,7 @@ where
                 barrier.wait();
             }
 
-            // ── Final: lm_head ──
+            // -- Final: lm_head --
             if ith == 0 {
                 let hidden_s = fsm!(hp, h);
                 let final_norm_w = qweights.get_f32("model.norm.weight").unwrap();
@@ -6181,7 +6181,7 @@ where
         let pp = preq_buf.as_mut_ptr() as usize;
         let sp = session as *mut InferenceSession as usize;
 
-        // Pre-allocate TL2 LUTs — reused across all layers (no heap allocs in the loop)
+        // Pre-allocate TL2 LUTs -- reused across all layers (no heap allocs in the loop)
         let mut lut_h = Tl2Lut::new_for_k(h);
         let mut lut_qdim = if q_dim != h {
             Tl2Lut::new_for_k(q_dim)
@@ -6275,7 +6275,7 @@ where
                     ref fsn,
                 ) = layer_names[layer];
 
-                // ── Fused: copy + RMSNorm + q8_snap + i2s_quantize + TL2 preprocess ──
+                // -- Fused: copy + RMSNorm + q8_snap + i2s_quantize + TL2 preprocess --
                 let _t0 = Instant::now();
                 if ith == 0 {
                     fsm!(np, h).copy_from_slice(fs!(hp, h));
@@ -6302,7 +6302,7 @@ where
                         );
                     }
                 }
-                barrier.wait(); // B1: quant + LUT ready → QKV matmul
+                barrier.wait(); // B1: quant + LUT ready -> QKV matmul
 
                 let _t1 = Instant::now();
                 let ps = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
@@ -6412,7 +6412,7 @@ where
                 }
                 barrier.wait(); // B2: QKV done
 
-                // ── Thread 0: RoPE + KV cache append ──
+                // -- Thread 0: RoPE + KV cache append --
                 if ith == 0 {
                     let _tr = Instant::now();
                     use tempura_kernels::RoPE;
@@ -6449,7 +6449,7 @@ where
                 }
                 barrier.wait(); // B2.5: RoPE done, KV cache ready
 
-                // ── All threads: parallel attention across heads ──
+                // -- All threads: parallel attention across heads --
                 let _ta = Instant::now();
                 {
                     let kvl = shared_kvl.load(std::sync::atomic::Ordering::Acquire);
@@ -6482,7 +6482,7 @@ where
                 }
                 barrier.wait(); // B3: attention done
 
-                // ── Thread 0: attn_sub_norm + i2s_quantize + TL2 preprocess ──
+                // -- Thread 0: attn_sub_norm + i2s_quantize + TL2 preprocess --
                 let _t2 = Instant::now();
                 if ith == 0 {
                     if let Some(w) = qweights.get_f32(asn) {
@@ -6519,7 +6519,7 @@ where
                         );
                     }
                 }
-                barrier.wait(); // B3.5: attn quant ready → O matmul
+                barrier.wait(); // B3.5: attn quant ready -> O matmul
 
                 let _t3 = Instant::now();
                 let as2 = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
@@ -6566,7 +6566,7 @@ where
                 }
                 barrier.wait(); // B4: O matmul done
 
-                // ── Fused: residual + RMSNorm + q8_snap + i2s_quantize + TL2 preprocess ──
+                // -- Fused: residual + RMSNorm + q8_snap + i2s_quantize + TL2 preprocess --
                 let _t4 = Instant::now();
                 if ith == 0 {
                     let w = qweights.get_f32(pln).unwrap();
@@ -6599,7 +6599,7 @@ where
                         );
                     }
                 }
-                barrier.wait(); // B5: FFN quant ready → gate/up matmul
+                barrier.wait(); // B5: FFN quant ready -> gate/up matmul
 
                 let _t5 = Instant::now();
                 let ns = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
@@ -6659,7 +6659,7 @@ where
                 }
                 barrier.wait(); // B6: gate/up done
 
-                // ── Fused: sqrelu + sub_norm + i2s_quantize + TL2 preprocess ──
+                // -- Fused: sqrelu + sub_norm + i2s_quantize + TL2 preprocess --
                 let _t6 = Instant::now();
                 if ith == 0 {
                     fused_sqrelu_mul(fsm!(gp, inter), fs!(upp, inter), inter);
@@ -6692,7 +6692,7 @@ where
                         );
                     }
                 }
-                barrier.wait(); // B7: down quant ready → down matmul
+                barrier.wait(); // B7: down quant ready -> down matmul
 
                 let _t7 = Instant::now();
                 let gs = f32::from_bits(shared_scale.load(std::sync::atomic::Ordering::Acquire));
@@ -6744,8 +6744,8 @@ where
                 }
             }
 
-            // ── lm_head (inside persistent threads) ──────────────────────
-            barrier.wait(); // B9: last residual done → lm_head
+            // -- lm_head (inside persistent threads) ----------------------
+            barrier.wait(); // B9: last residual done -> lm_head
 
             let _t_lm = Instant::now();
 
@@ -6771,7 +6771,7 @@ where
 
                 tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
             }
-            barrier.wait(); // B10: norm + LUT ready → lm_head matmul
+            barrier.wait(); // B10: norm + LUT ready -> lm_head matmul
 
             let lut_ok = shared_lut_ok.load(std::sync::atomic::Ordering::Acquire);
             if lut_ok && lut_h_ptr != 0 {
@@ -6858,9 +6858,9 @@ where
             let at = prof_attn.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
             let lp = prof_lut_prep.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
             let lmh = prof_lm_head.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
-            eprintln!("[PROFILE] pos={} per-layer avg (μs): s1={:.0} qkv={:.0} s2={:.0}[rope={:.0} attn={:.0} lut={:.0}] o={:.0} s3={:.0} gu={:.0} s4={:.0} dn={:.0} total={:.0}",
+            eprintln!("[PROFILE] pos={} per-layer avg (mus): s1={:.0} qkv={:.0} s2={:.0}[rope={:.0} attn={:.0} lut={:.0}] o={:.0} s3={:.0} gu={:.0} s4={:.0} dn={:.0} total={:.0}",
                 session.position - 1, s1, qkv, s2, rp, at, lp, omm, s3, gu, s4, dn, total);
-            eprintln!("[PROFILE] lm_head: {:.0}μs", lmh);
+            eprintln!("[PROFILE] lm_head: {:.0}mus", lmh);
         }
 
         logits
@@ -7285,7 +7285,7 @@ where
                     barrier.wait();
 
                     if is_deltanet {
-                    // ── DeltaNet attention block ──
+                    // -- DeltaNet attention block --
                     if ith == 0 && layer == 0 && _token_step == 0 {
                         let has_tiled_qkv = qweights.get_q2_tiled(&dn_names[0].as_ref().unwrap().qkv_proj).is_some();
                         let has_raw_q2 = qweights.get_q2(&dn_names[0].as_ref().unwrap().qkv_proj).is_some();
@@ -7440,7 +7440,7 @@ where
                     }
                     barrier.wait();
 
-                    // B3: O-proj GEMV (dn_dim → h, Q8_0-based row-partitioned)
+                    // B3: O-proj GEMV (dn_dim -> h, Q8_0-based row-partitioned)
                     if ith == 0 {
                         let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
                         let dn_q8_bytes = (dn_dim / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
@@ -7459,7 +7459,7 @@ where
                     barrier.wait();
 
                     } else {
-                    // ── Attention block: QKV GEMV (row-partitioned) ──
+                    // -- Attention block: QKV GEMV (row-partitioned) --
                     {
                         let q8 = unsafe { std::slice::from_raw_parts(q8p as *const u8, q8_act_len) };
                         let h_q8_bytes = (h / tempura_kernels::quantized::Q8_0_BLOCK_SIZE) * tempura_kernels::quantized::Q8_0_BLOCK_BYTES;
@@ -7512,7 +7512,7 @@ where
                         eprintln!("[ATN-DBG L3] o_proj_norm={on:.4} hidden_before_ffn={hn:.4}");
                     }
 
-                    // ── Shared FFN block ──
+                    // -- Shared FFN block --
                     if ith == 0 {
                         let hid = fsm!(hp,h);
                         let res = fs!(op,h);
@@ -7579,7 +7579,7 @@ where
                     }
                 }
 
-                // ── lm_head ──
+                // -- lm_head --
                 if ith == 0 { _layer_us = _tok_start.elapsed().as_micros() as u64; }
                 barrier.wait();
                 if ith == 0 {
@@ -7643,9 +7643,9 @@ where
                 }
                 barrier.wait();
 
-                // ── Thread 0: sampling + next token embedding ──
+                // -- Thread 0: sampling + next token embedding --
                 // Non-zero threads yield here to reduce thermal pressure while
-                // thread 0 does argmax + embedding (~100-200μs).
+                // thread 0 does argmax + embedding (~100-200mus).
                 if ith == 0 {
                     _lmhead_us = _tok_start.elapsed().as_micros() as u64 - _layer_us;
                     let logits_slice = fs!(logits_ptr, vocab_size);
@@ -7655,7 +7655,7 @@ where
 
                     if do_profile && _token_step % 10 == 9 {
                         let total = _tok_start.elapsed().as_micros() as u64;
-                        eprintln!("[PROFILE] step={} layers={_layer_us}μs lm_head={_lmhead_us}μs total={total}μs", _token_step);
+                        eprintln!("[PROFILE] step={} layers={_layer_us}mus lm_head={_lmhead_us}mus total={total}mus", _token_step);
                     }
 
                     if std::env::var("TEMPURA_TRACE_TOKENS").is_ok() {
@@ -7880,7 +7880,7 @@ where
                 let t_start = ith * seq_len / nth;
                 let t_end = (ith + 1) * seq_len / nth;
                 let _t_layer = Instant::now();
-                // ── All threads: copy + RMSNorm + q8_snap + LUT build (per-token parallel) ──
+                // -- All threads: copy + RMSNorm + q8_snap + LUT build (per-token parallel) --
                 let _t_norm = Instant::now();
                 {
                     let n = fsm!(np, seq_len * h);
@@ -7905,7 +7905,7 @@ where
                 tile_counter.store(0, std::sync::atomic::Ordering::Relaxed);
                 barrier.wait(); // B1
 
-                // ── All threads: QKV GEMM (work-stealing — 12 tiles / 8 threads) ──
+                // -- All threads: QKV GEMM (work-stealing -- 12 tiles / 8 threads) --
                 let _t1 = Instant::now();
                 if lut_h_ptr != 0 {
                     let lut = unsafe { &*(lut_h_ptr as *const BatchedTl2Lut) };
@@ -7982,7 +7982,7 @@ where
                 }
                 barrier.wait(); // B2
 
-                // ── All threads: parallel RoPE on token ranges ──
+                // -- All threads: parallel RoPE on token ranges --
                 let _t_rope = Instant::now();
                 {
                     use tempura_kernels::RoPE;
@@ -8040,7 +8040,7 @@ where
                         .unwrap();
                     }
                 }
-                // ── All threads: parallel KV cache copy ──
+                // -- All threads: parallel KV cache copy --
                 {
                     let sess = unsafe { &*(sp as *const InferenceSession) };
                     let stride = n_kv_heads * head_dim;
@@ -8077,7 +8077,7 @@ where
                 }
                 barrier.wait(); // B2.5: RoPE + KV cache ready
 
-                // ── All threads: attention + sub_norm + LUT (fused, token-parallel) ──
+                // -- All threads: attention + sub_norm + LUT (fused, token-parallel) --
                 let _ta = Instant::now();
                 {
                     let kvl = shared_kvl.load(std::sync::atomic::Ordering::Acquire);
@@ -8134,7 +8134,7 @@ where
                 }
                 barrier.wait(); // B3 (attention + sub_norm + LUT done)
 
-                // ── All threads: O-proj GEMM (static) ──
+                // -- All threads: O-proj GEMM (static) --
                 let _t_oproj = Instant::now();
                 if lut_qdim_ptr != 0 {
                     let lut = unsafe { &*(lut_qdim_ptr as *const BatchedTl2Lut) };
@@ -8169,7 +8169,7 @@ where
                 }
                 barrier.wait(); // B4
 
-                // ── All threads: residual + RMSNorm + q8_snap + LUT for FFN (parallel) ──
+                // -- All threads: residual + RMSNorm + q8_snap + LUT for FFN (parallel) --
                 {
                     let h_buf = fsm!(hp, seq_len * h);
                     let o_buf = fs!(op, seq_len * h);
@@ -8195,7 +8195,7 @@ where
                 }
                 barrier.wait(); // B5
 
-                // ── All threads: gate+up GEMM (static tile assignment) ──
+                // -- All threads: gate+up GEMM (static tile assignment) --
                 let _t_gu = Instant::now();
                 if lut_h_ptr != 0 {
                     let lut = unsafe { &*(lut_h_ptr as *const BatchedTl2Lut) };
@@ -8250,7 +8250,7 @@ where
                 }
                 barrier.wait(); // B6
 
-                // ── All threads: activation + ffn_sub_norm + LUT for down-proj (parallel) ──
+                // -- All threads: activation + ffn_sub_norm + LUT for down-proj (parallel) --
                 {
                     let g = fsm!(gp, seq_len * inter);
                     let u = fs!(upp, seq_len * inter);
@@ -8288,7 +8288,7 @@ where
                 }
                 barrier.wait(); // B7
 
-                // ── All threads: down-proj GEMM (static) ──
+                // -- All threads: down-proj GEMM (static) --
                 let _t_down = Instant::now();
                 if lut_inter_ptr != 0 {
                     let lut = unsafe { &*(lut_inter_ptr as *const BatchedTl2Lut) };
@@ -8353,7 +8353,7 @@ where
             let d = prof_down.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
             let l = prof_layer.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0 / nl;
             let profiled = n + q + r + a + o + g + d;
-            eprintln!("[PROFILE] per-layer (μs): norm={n:.0} qkv={q:.0} rope={r:.0} attn={a:.0} oproj={o:.0} gu={g:.0} down={d:.0} layer={l:.0} other={:.0}", l - profiled);
+            eprintln!("[PROFILE] per-layer (mus): norm={n:.0} qkv={q:.0} rope={r:.0} attn={a:.0} oproj={o:.0} gu={g:.0} down={d:.0} layer={l:.0} other={:.0}", l - profiled);
         }
 
         session.cache.advance(seq_len);
@@ -8940,7 +8940,7 @@ where
 /// CPU-KV-cache + cutile-GPU-kernel inference wrapper.
 ///
 /// Uses cutile kernels (flash attention, RMSNorm, RoPE, GEMM) compiled at
-/// runtime via the cuTile JIT — no `cargo oxide build` required. Quantized
+/// runtime via the cuTile JIT -- no `cargo oxide build` required. Quantized
 /// Inference wrapper that uses cuTile GPU kernels for all projection GEMMs.
 ///
 /// On the first [`load_weights`] call, all weight matrices are dequantized once on the
@@ -9024,7 +9024,7 @@ impl CutileInferenceWrapper {
     /// Load weights from a pre-built [`QuantizedWeights`] (e.g. from
     /// [`GgufLoader::to_quantized_weights`]) and upload projection tensors
     /// to the GPU.  Use this instead of [`load_weights`] when the loader
-    /// keeps tensors mmap-resident (Q4K, Q6K, …) and therefore cannot
+    /// keeps tensors mmap-resident (Q4K, Q6K, ...) and therefore cannot
     /// dequantize them through the [`WeightLoader`] trait.
     pub fn load_quantized(&mut self, qw: crate::weights::QuantizedWeights) {
         self.model.quantized_weights = Some(qw);
@@ -9035,7 +9035,7 @@ impl CutileInferenceWrapper {
                 match crate::cutile_kv_cache::CutileKvCache::new(&self.model.config, stream) {
                     Ok(kv) => {
                         eprintln!(
-                            "[cutile] GPU KV cache allocated ({} layers × {} tokens × {} kv_dim)",
+                            "[cutile] GPU KV cache allocated ({} layers x {} tokens x {} kv_dim)",
                             self.model.config.num_layers,
                             self.model.config.max_seq_len,
                             self.model.config.num_kv_heads * self.model.config.head_dim,
@@ -9053,7 +9053,7 @@ impl CutileInferenceWrapper {
                     self.model.config.num_layers
                 );
                 self.gpu_model = Some(gm);
-                // Free CPU-side projection weights — all layer weights
+                // Free CPU-side projection weights -- all layer weights
                 // (Q/K/V/O/gate/up/down, layernorms, lm_head) are now GPU-
                 // resident.  Only embed_tokens.weight is still accessed from
                 // CPU during GPU inference (token embedding lookup).
@@ -9062,7 +9062,7 @@ impl CutileInferenceWrapper {
                     qw.free_gpu_uploaded(&["model.embed_tokens.weight"]);
                     let rss_after = crate::model::current_rss_mb();
                     eprintln!(
-                        "[cutile] freed CPU projection weights: {} MB → {} MB (saved {} MB)",
+                        "[cutile] freed CPU projection weights: {} MB -> {} MB (saved {} MB)",
                         rss_before, rss_after,
                         rss_before.saturating_sub(rss_after)
                     );
@@ -9081,7 +9081,7 @@ impl CutileInferenceWrapper {
     /// discard rejected draft tokens without allocating a new KV cache.
     ///
     /// After rollback, subsequent `forward` calls overwrite the rolled-back
-    /// positions — the stale device data is never read again.
+    /// positions -- the stale device data is never read again.
     pub fn gpu_kv_rollback(&self, session: &mut crate::session::InferenceSession, target_seq_len: usize) {
         if let Some(kv_mutex) = &self.gpu_kv_cache {
             let mut kv = kv_mutex.lock().expect("GPU KV cache mutex poisoned");
@@ -9091,7 +9091,7 @@ impl CutileInferenceWrapper {
         session.position = target_seq_len;
     }
 
-    /// Batched decode: M requests × 1 token each in one GPU forward pass.
+    /// Batched decode: M requests x 1 token each in one GPU forward pass.
     ///
     /// Creates fresh KV caches for each request (starting at position 0).
     /// Callers that need persistent KV caches across steps should use the
@@ -9271,7 +9271,7 @@ impl InferenceModel for CutileInferenceWrapper {
                         Ok(kv) => {
                             self.gpu_kv_cache = Some(std::sync::Mutex::new(kv));
                             eprintln!(
-                                "[cutile] GPU KV cache allocated ({} layers × {} tokens × {} kv_dim)",
+                                "[cutile] GPU KV cache allocated ({} layers x {} tokens x {} kv_dim)",
                                 self.model.config.num_layers,
                                 self.model.config.max_seq_len,
                                 self.model.config.num_kv_heads * self.model.config.head_dim,
@@ -9483,7 +9483,7 @@ mod kani_proofs {
         let idx: usize = kani::any();
         kani::assume(idx < n);
 
-        // argmax iterates enumerate().max_by() — the result index < len
+        // argmax iterates enumerate().max_by() -- the result index < len
         // Prove: for any valid iterator output, idx < n
         assert!(idx < n);
     }
@@ -10211,7 +10211,7 @@ mod tests {
         model.quantized_weights = Some(qw);
 
         let mut session = InferenceSession::new(&moe_cfg, TraceLevel::Off, 42);
-        // Should not panic — falls back to dense FFN
+        // Should not panic -- falls back to dense FFN
         let logits = model.forward(&mut session, &[1, 2, 3]);
         assert_eq!(logits.len(), moe_cfg.vocab_size);
         assert!(!logits.iter().all(|&v| v == 0.0));

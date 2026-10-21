@@ -1,11 +1,11 @@
 //! Verus-verified definitional equivalences between CpuAttention variants.
 //!
 //! Proves:
-//!   CpuFlashAttention ≡ CpuAttention  (online softmax == standard softmax)
-//!   CpuAttentionF16 ≡ CpuAttention    (f16 KV cache introduces bounded rounding)
-//!   CpuAttentionGgml ≡ CpuAttention   (GGML-compatible computation path)
+//!   CpuFlashAttention ??? CpuAttention  (online softmax == standard softmax)
+//!   CpuAttentionF16 ??? CpuAttention    (f16 KV cache introduces bounded rounding)
+//!   CpuAttentionGgml ??? CpuAttention   (GGML-compatible computation path)
 //!
-//! All compute softmax(QK^T/scale) × V; the differences are in storage format
+//! All compute softmax(QK^T/scale) x V; the differences are in storage format
 //! and reduction order, not in the mathematical formula.
 //!
 //! Spec functions are self-contained; names are prefixed cav_ to avoid collisions.
@@ -28,7 +28,7 @@ pub open spec fn cav_abs(x: int) -> int {
 // All CpuAttention variants compute:
 //   scores[j] = dot(q, k[j]) / scale   for j in 0..seq_len
 //   weights    = softmax(scores)
-//   out        = Σ_j weights[j] * v[j]
+//   out        = Sigma_j weights[j] * v[j]
 //
 // At the integer spec level we capture two key invariants:
 //   1. Output length equals head_dim (same shape as a single V vector)
@@ -86,13 +86,13 @@ pub open spec fn cav_attn_score(q: Seq<int>, k: Seq<int>, scale: int) -> int
 }
 
 // ============================================================================
-// CpuFlashAttention ≡ CpuAttention
+// CpuFlashAttention ??? CpuAttention
 //
 // Online softmax (Flash Attention) and standard softmax produce the same output.
 // Standard:
 //   s_j = dot(q, k_j) / scale
-//   w   = softmax(s) = exp(s) / Σ exp(s_j)
-//   out = Σ w_j * v_j
+//   w   = softmax(s) = exp(s) / Sigma exp(s_j)
+//   out = Sigma w_j * v_j
 //
 // Flash (online):
 //   Maintain m = running max, l = running normalizer, o = running output.
@@ -117,7 +117,7 @@ pub proof fn lemma_flash_attention_output_identity(
 }
 
 // ============================================================================
-// CpuAttentionF16 ≡ CpuAttention  (bounded f16 rounding error)
+// CpuAttentionF16 ??? CpuAttention  (bounded f16 rounding error)
 //
 // CpuAttentionF16 stores K and V in f16 format. Loading from f16 introduces a
 // rounding error per element bounded by |v| / 1024 (f16 has 10-bit mantissa).
@@ -125,7 +125,7 @@ pub proof fn lemma_flash_attention_output_identity(
 // At the integer spec level:
 //   v_f16[i] = v[i] + e[i]  where |e[i]| * 1024 <= |v[i]| + 1
 //   dot(q, v_f16) = dot(q, v) + dot(q, e)
-//   |dot(q, v_f16) - dot(q, v)| = |dot(q, e)| <= Σ |q[i]| * |e[i]|
+//   |dot(q, v_f16) - dot(q, v)| = |dot(q, e)| <= Sigma |q[i]| * |e[i]|
 //
 // We prove that the error in the dot product is bounded by the f16 error terms.
 // ============================================================================
@@ -139,7 +139,7 @@ pub open spec fn cav_f16_error_term(q: Seq<int>, e: Seq<int>) -> int
     else { q.last() * e.last() + cav_f16_error_term(q.drop_last(), e.drop_last()) }
 }
 
-/// |dot(q, e)| <= Σ |q[i]| * |e[i]|: triangle inequality for dot products.
+/// |dot(q, e)| <= Sigma |q[i]| * |e[i]|: triangle inequality for dot products.
 proof fn lemma_cav_dot_triangle(q: Seq<int>, e: Seq<int>)
     requires q.len() == e.len()
     ensures cav_abs(cav_f16_error_term(q, e)) <= cav_f16_error_term_abs_bound(q, e)
@@ -162,7 +162,7 @@ proof fn lemma_cav_dot_triangle(q: Seq<int>, e: Seq<int>)
     }
 }
 
-/// Upper bound on |cav_f16_error_term|: Σ |q[i]| * |e[i]|.
+/// Upper bound on |cav_f16_error_term|: Sigma |q[i]| * |e[i]|.
 pub open spec fn cav_f16_error_term_abs_bound(q: Seq<int>, e: Seq<int>) -> int
     recommends q.len() == e.len()
     decreases q.len()
@@ -188,13 +188,13 @@ proof fn lemma_cav_bound_nonneg(q: Seq<int>, e: Seq<int>)
     }
 }
 
-// ── F16 Attention Theorem: |f16_output - ref_output| ≤ f16 error bound ───────
+// -- F16 Attention Theorem: |f16_output - ref_output| <= f16 error bound -------
 //
 // When K and V are stored in f16, loading them introduces a rounding error.
-// The dot product error is bounded by Σ |q[i]| * |e[i]|, where |e[i]| * 1024
+// The dot product error is bounded by Sigma |q[i]| * |e[i]|, where |e[i]| * 1024
 // <= |v[i]| + 1 from the f16 format guarantee.
 //
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 pub proof fn lemma_f16_attention_bounded_error(
     q: Seq<int>, v: Seq<int>, e: Seq<int>,
@@ -211,13 +211,13 @@ pub proof fn lemma_f16_attention_bounded_error(
 }
 
 // ============================================================================
-// CpuAttentionGgml ≡ CpuAttention
+// CpuAttentionGgml ??? CpuAttention
 //
 // CpuAttentionGgml implements the same softmax-weighted attention formula
 // matching the ggml_compute_forward_flash_attn_back computation path.
 // It uses f32 for score accumulation and f32 for the softmax weights.
 // The mathematical formula is identical to CpuAttention.
-// At the spec level both compute cav_attn_score(q, k, scale) → softmax → weighted sum.
+// At the spec level both compute cav_attn_score(q, k, scale) -> softmax -> weighted sum.
 // ============================================================================
 
 pub proof fn lemma_ggml_attention_bounded_error(
@@ -231,7 +231,7 @@ pub proof fn lemma_ggml_attention_bounded_error(
     // mathematical operations with the same f32 precision. Proved by reflexivity.
 }
 
-// ── Useful supporting lemma: seq_dot is commutative ──────────────────────────
+// -- Useful supporting lemma: seq_dot is commutative --------------------------
 
 pub proof fn lemma_cav_seq_dot_comm(a: Seq<int>, b: Seq<int>)
     requires a.len() == b.len()
@@ -247,7 +247,7 @@ pub proof fn lemma_cav_seq_dot_comm(a: Seq<int>, b: Seq<int>)
     }
 }
 
-// ── Sanity checks ──────────────────────────────────────────────────────────
+// -- Sanity checks ----------------------------------------------------------
 
 proof fn check_cav_dot_empty()
     ensures cav_seq_dot(Seq::<int>::empty(), Seq::<int>::empty()) == 0int

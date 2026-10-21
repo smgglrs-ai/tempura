@@ -1,7 +1,7 @@
 use super::blocks::*;
 use super::helpers::f16_to_f32;
 
-// ── Q8_0 family (basic quants, QK = 32) ────────────────────────────────────
+// -- Q8_0 family (basic quants, QK = 32) ------------------------------------
 
 pub fn vec_dot_q4_0_q8_0(n: usize, x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
     const QK: usize = 32;
@@ -99,7 +99,7 @@ pub fn vec_dot_q8_0_q8_0(n: usize, x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
     sumf
 }
 
-// ── Q8_K family (K-quants, QK_K = 256) ─────────────────────────────────────
+// -- Q8_K family (K-quants, QK_K = 256) -------------------------------------
 
 pub fn vec_dot_q4_k_q8_k(n: usize, x: &[BlockQ4K], y: &[BlockQ8K]) -> f32 {
     const QK: usize = 256;
@@ -466,7 +466,7 @@ pub fn vec_dot_q5_k_q8_k(n: usize, x: &[BlockQ5K], y: &[BlockQ8K]) -> f32 {
     sumf
 }
 
-// ── Ternary quants ─────────────────────────────────────────────────────────
+// -- Ternary quants ---------------------------------------------------------
 
 pub fn vec_dot_tq2_0_q8_k(n: usize, x: &[BlockTQ2_0], y: &[BlockQ8K]) -> f32 {
     const QK: usize = 256;
@@ -526,7 +526,7 @@ pub fn vec_dot_tq1_0_q8_k(n: usize, x: &[BlockTQ1_0], y: &[BlockQ8K]) -> f32 {
     sumf
 }
 
-// ── IQ quants ──────────────────────────────────────────────────────────────
+// -- IQ quants --------------------------------------------------------------
 
 pub fn vec_dot_iq4_nl_q8_0(n: usize, x: &[BlockIQ4NL], y: &[BlockQ8_0]) -> f32 {
     use super::iq_tables::KVALUES_IQ4NL;
@@ -555,7 +555,7 @@ pub fn vec_dot_mxfp4_q8_0(n: usize, x: &[BlockMxfp4], y: &[BlockQ8_0]) -> f32 {
     assert_eq!(n % QK, 0);
     let mut sumf = 0.0f32;
     for ib in 0..nb {
-        // E8M0 shared exponent → scale
+        // E8M0 shared exponent -> scale
         let e8m0 = x[ib].e;
         let scale = if e8m0 == 0 {
             0.0f32
@@ -1075,7 +1075,7 @@ pub fn vec_dot_iq4_xs_q8_k(n: usize, x: &[BlockIQ4XS], y: &[BlockQ8K]) -> f32 {
     sumf
 }
 
-// ── Raw-byte interface for type-erased dispatch ────────────────────────────
+// -- Raw-byte interface for type-erased dispatch ----------------------------
 
 pub fn vec_dot(n: usize, result: &mut f32, vx: &[u8], vy: &[u8], weight_type: super::GgmlType) {
     use super::GgmlType::*;
@@ -1245,7 +1245,7 @@ mod tests {
     fn q4_0_dot_vs_dequant() {
         let w_data = BlockQ4_0 {
             d: f32_to_f16(0.5),
-            qs: [0x48; 16], // nibbles: 8 and 4 → values 0 and -4
+            qs: [0x48; 16], // nibbles: 8 and 4 -> values 0 and -4
         };
         let mut w_f32 = [0.0f32; 32];
         dequantize_row_q4_0(&[w_data], &mut w_f32);
@@ -1346,7 +1346,7 @@ mod tests {
     fn tq2_0_dot_identity() {
         // all trits = 1 (value = 0), dot should be ~0
         let w = BlockTQ2_0 {
-            qs: [0x55; 64], // 0b01_01_01_01 = all trits 1 → all values 0
+            qs: [0x55; 64], // 0b01_01_01_01 = all trits 1 -> all values 0
             d: f32_to_f16(1.0),
         };
         let act: Vec<f32> = (0..256).map(|i| i as f32).collect();

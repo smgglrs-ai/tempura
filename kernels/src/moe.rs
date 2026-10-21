@@ -45,7 +45,7 @@ impl MoeRouter {
 
     /// Route tokens to experts.
     ///
-    /// `router_logits`: flat array of shape [num_tokens, n_experts] — raw logits
+    /// `router_logits`: flat array of shape [num_tokens, n_experts] -- raw logits
     /// from the router linear projection.
     ///
     /// Returns one `MoeRoutingResult` per token.

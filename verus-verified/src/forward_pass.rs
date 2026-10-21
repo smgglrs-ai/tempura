@@ -1,4 +1,4 @@
-//! Verus-verified forward pass layer iteration bounds — unbounded proofs
+//! Verus-verified forward pass layer iteration bounds -- unbounded proofs
 //!
 //! Proves: forward pass iterates exactly num_layers times, intermediate
 //! buffer sizes match dimensions, layer indexing stays in bounds.
@@ -64,7 +64,7 @@ proof fn ffn_intermediate_size(seq_len: nat, intermediate_size: nat, pos: nat)
 
 // ============================================================================
 // Proof: weight matrix dimensions for attention projections
-// Q/K/V: [hidden_size × head_dim * num_heads] (or num_kv_heads for K/V)
+// Q/K/V: [hidden_size x head_dim * num_heads] (or num_kv_heads for K/V)
 // ============================================================================
 
 proof fn attention_weight_index(
@@ -90,7 +90,7 @@ proof fn attention_weight_index(
 }
 
 // ============================================================================
-// Proof: output projection [hidden_size × vocab_size] — lm_head
+// Proof: output projection [hidden_size x vocab_size] -- lm_head
 // ============================================================================
 
 proof fn lm_head_index(
@@ -113,7 +113,7 @@ proof fn lm_head_index(
 }
 
 // ============================================================================
-// Proof: gate_up projection — concatenated weight [hidden × 2*intermediate]
+// Proof: gate_up projection -- concatenated weight [hidden x 2*intermediate]
 // ============================================================================
 
 proof fn gate_up_weight_index(

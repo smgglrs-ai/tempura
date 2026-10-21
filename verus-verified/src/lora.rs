@@ -1,6 +1,6 @@
-//! Verus-verified LoRA adapter indexing — unbounded proofs
+//! Verus-verified LoRA adapter indexing -- unbounded proofs
 //!
-//! Proves: low-rank matmul indexing for A[r×k] and B[n×r] projections,
+//! Proves: low-rank matmul indexing for A[rxk] and B[nxr] projections,
 //! intermediate buffer size, and output accumulation bounds.
 
 use vstd::prelude::*;
@@ -58,7 +58,7 @@ proof fn lora_b_index(m: nat, n: nat, r: nat, i: nat, j: nat, p: nat)
 }
 
 // ============================================================================
-// LoRA intermediate buffer: m × r elements
+// LoRA intermediate buffer: m x r elements
 // ============================================================================
 
 proof fn lora_intermediate_size(m: nat, r: nat)

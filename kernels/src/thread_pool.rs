@@ -1,4 +1,4 @@
-//! Persistent thread pool — translated from ggml's threading model.
+//! Persistent thread pool -- translated from ggml's threading model.
 //! Workers sleep via Condvar when idle (zero CPU). Per-worker generation tracking
 //! prevents the stale-signal race that caused deadlocks in spin-wait variants.
 
@@ -6,7 +6,7 @@ use std::sync::atomic::{fence, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
-// ── SpinBarrier (translated from ggml_barrier) ─────────────────────────────
+// -- SpinBarrier (translated from ggml_barrier) -----------------------------
 
 pub struct SpinBarrier {
     n_threads: i32,
@@ -42,7 +42,7 @@ impl SpinBarrier {
     }
 }
 
-// ── TaskPhase (producer-consumer phase counter) ───────────────────────────
+// -- TaskPhase (producer-consumer phase counter) ---------------------------
 
 pub struct TaskPhase {
     ready: std::sync::atomic::AtomicU32,
@@ -91,7 +91,7 @@ impl TaskPhase {
     }
 }
 
-// ── PersistentPool ─────────────────────────────────────────────────────────
+// -- PersistentPool ---------------------------------------------------------
 
 #[repr(align(64))]
 struct CacheLine(AtomicUsize);
@@ -109,7 +109,7 @@ struct Shared {
     work_ptr: AtomicUsize,
     work_vtable: AtomicUsize,
     worker_done_gen: Vec<CacheLine>,
-    /// Serializes concurrent parallel_chunks callers — the shared work-stealing
+    /// Serializes concurrent parallel_chunks callers -- the shared work-stealing
     /// state (work_ptr, n_chunks, chunk_counter) is not reentrant.
     call_mutex: Mutex<()>,
 }
@@ -166,7 +166,7 @@ impl PersistentPool {
     }
 
     /// Dispatch an indexed computation: each of N threads calls f(ith, nth).
-    /// Uses the persistent pool — no thread spawn/join overhead.
+    /// Uses the persistent pool -- no thread spawn/join overhead.
     #[inline]
     pub fn run_indexed<F: Fn(usize, usize) + Sync>(&self, f: &F) {
         let nth = self.shared.n_workers + 1;
@@ -192,7 +192,7 @@ impl PersistentPool {
             return;
         }
 
-        // Serialize concurrent callers — the shared work-stealing state is not reentrant.
+        // Serialize concurrent callers -- the shared work-stealing state is not reentrant.
         let _guard = self.shared.call_mutex.lock().unwrap();
 
         let trait_ref: &dyn Fn(usize, usize) = f;
@@ -299,7 +299,7 @@ pub fn global_pool() -> &'static PersistentPool {
     })
 }
 
-// ── parallel_compute ───────────────────────────────────────────────────────
+// -- parallel_compute -------------------------------------------------------
 
 pub struct ComputeParams<'a> {
     pub ith: usize,

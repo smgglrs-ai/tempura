@@ -1,7 +1,7 @@
 use super::blocks::*;
 use super::helpers::{bf16_to_f32, f16_to_f32, get_scale_min_k4};
 
-// ── Basic quants (QK = 32) ─────────────────────────────────────────────────
+// -- Basic quants (QK = 32) -------------------------------------------------
 
 pub fn dequantize_row_q4_0(blocks: &[BlockQ4_0], output: &mut [f32]) {
     const QK: usize = 32;
@@ -102,7 +102,7 @@ pub fn dequantize_row_q1_0(data: &[u8], output: &mut [f32], num_elements: usize)
     }
 }
 
-// ── K-quants (QK_K = 256) ──────────────────────────────────────────────────
+// -- K-quants (QK_K = 256) --------------------------------------------------
 
 pub fn dequantize_row_q2_k(blocks: &[BlockQ2K], output: &mut [f32]) {
     const QK: usize = 256;
@@ -281,7 +281,7 @@ pub fn dequantize_row_q6_k(blocks: &[BlockQ6K], output: &mut [f32]) {
     }
 }
 
-// ── Ternary quants ─────────────────────────────────────────────────────────
+// -- Ternary quants ---------------------------------------------------------
 
 pub fn dequantize_row_tq2_0(blocks: &[BlockTQ2_0], output: &mut [f32]) {
     const QK: usize = 256;
@@ -293,7 +293,7 @@ pub fn dequantize_row_tq2_0(blocks: &[BlockTQ2_0], output: &mut [f32]) {
             let byte = blk.qs[j];
             for b in 0..4 {
                 let trit = ((byte >> (b * 2)) & 3) as i32;
-                // 0 → -1, 1 → 0, 2 → +1
+                // 0 -> -1, 1 -> 0, 2 -> +1
                 y[j * 4 + b] = d * (trit - 1) as f32;
             }
         }
@@ -336,7 +336,7 @@ pub fn dequantize_row_tq1_0(blocks: &[BlockTQ1_0], output: &mut [f32]) {
     }
 }
 
-// ── Micro-FP quants ────────────────────────────────────────────────────────
+// -- Micro-FP quants --------------------------------------------------------
 
 pub fn dequantize_row_mxfp4(blocks: &[BlockMxfp4], output: &mut [f32]) {
     const QK: usize = 32;
@@ -424,7 +424,7 @@ fn e2m1_to_f32(nibble: u8) -> f32 {
     mxfp4_to_f32(nibble & 0x07 | (sign << 3)) // sign already handled in mxfp4_to_f32
 }
 
-// ── IQ quants ──────────────────────────────────────────────────────────────
+// -- IQ quants --------------------------------------------------------------
 
 pub fn dequantize_row_iq2_xxs(blocks: &[BlockIQ2XXS], output: &mut [f32]) {
     use super::iq_tables::*;
@@ -816,7 +816,7 @@ pub fn dequantize_row_iq4_nl(blocks: &[BlockIQ4NL], output: &mut [f32]) {
     }
 }
 
-// ── Raw-byte interface for type-erased dispatch ────────────────────────────
+// -- Raw-byte interface for type-erased dispatch ----------------------------
 
 pub fn dequantize_row(
     data: &[u8],
@@ -1710,7 +1710,7 @@ mod kani_proofs {
     }
 }
 
-// ── From ggml-quants.c:439 ────────────────────────────────────────────────
+// -- From ggml-quants.c:439 ------------------------------------------------
 pub fn dequantize_row_q2_0(blocks: &[BlockQ2_0], output: &mut [f32]) {
     const QK: usize = 64;
     assert_eq!(output.len(), blocks.len() * QK);
@@ -1725,7 +1725,7 @@ pub fn dequantize_row_q2_0(blocks: &[BlockQ2_0], output: &mut [f32]) {
     }
 }
 
-// ── From ggml-quants.c:2807 ───────────────────────────────────────────────
+// -- From ggml-quants.c:2807 -----------------------------------------------
 pub fn dequantize_row_q8_k(blocks: &[BlockQ8K], output: &mut [f32]) {
     const QK: usize = 256;
     assert_eq!(output.len(), blocks.len() * QK);

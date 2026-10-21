@@ -1,4 +1,4 @@
-//! Verus-verified LayerNorm indexing — unbounded proofs
+//! Verus-verified LayerNorm indexing -- unbounded proofs
 
 use vstd::prelude::*;
 

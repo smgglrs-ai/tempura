@@ -1,4 +1,4 @@
-//! Verus-verified GPU quantized GEMM kernel invariants — unbounded proofs
+//! Verus-verified GPU quantized GEMM kernel invariants -- unbounded proofs
 //!
 //! Proves: Q4K block iteration, Q8 activation quantization groups,
 //! shared memory tile loading, warp reduction, and split-K decomposition.
@@ -92,7 +92,7 @@ proof fn q8_activation_group(
 }
 
 // ============================================================================
-// Shared memory tile: WARPS_Y × 256 × 4 bytes per CTA
+// Shared memory tile: WARPS_Y x 256 x 4 bytes per CTA
 // ============================================================================
 
 proof fn smem_tile_index(
@@ -160,7 +160,7 @@ proof fn split_k_decomposition(
 
 // ============================================================================
 // DP4A: 4 i8 multiplications accumulated into i32
-// max per dp4a: 4 × 127 × 127 = 64516 < i32::MAX
+// max per dp4a: 4 x 127 x 127 = 64516 < i32::MAX
 // ============================================================================
 
 proof fn dp4a_no_overflow()
@@ -183,26 +183,26 @@ proof fn dp4a_block_accumulator()
 // CutileQuantizedGemm first dequantizes Q4K weights to f32 (via the same
 // dequant_q4k_block function as CpuMatMulQ4K), then runs a generic f32 GEMM
 // on the GPU.  This means the GPU and CPU reference compute the SAME
-// mathematical formula — the only difference is f32 reduction order.
+// mathematical formula -- the only difference is f32 reduction order.
 //
 // Modelling arithmetic as exact integers (no f32 rounding), we prove:
 //   1. gpu_q4k_output == cpu_ref_q4k_output  (same formula)
-//   2. |gpu_q4k_output - cpu_opt_q4k_output| ≤ error_bound
+//   2. |gpu_q4k_output - cpu_opt_q4k_output| <= error_bound
 //      where the error comes from Q8 activation quantization, NOT from the GPU.
 //
 // Spec functions are self-contained (run-verus.sh compiles each module
 // standalone); names are prefixed gpu_ to avoid collisions.
 // ============================================================================
 
-// ── Utility ──────────────────────────────────────────────────────────────────
+// -- Utility ------------------------------------------------------------------
 
 pub open spec fn gpu_abs(x: int) -> int {
     if x >= 0 { x } else { -x }
 }
 
-// ── Predicates on sequences ───────────────────────────────────────────────────
+// -- Predicates on sequences ---------------------------------------------------
 
-/// All elements are nibble values: ∈ [0, 15].
+/// All elements are nibble values: ??? [0, 15].
 pub open spec fn gpu_all_nibbles(q: Seq<int>) -> bool
     decreases q.len()
 {
@@ -210,7 +210,7 @@ pub open spec fn gpu_all_nibbles(q: Seq<int>) -> bool
     else { 0 <= q.last() <= 15 && gpu_all_nibbles(q.drop_last()) }
 }
 
-/// All elements are Q8-quantization unit errors: ∈ [-1, 1].
+/// All elements are Q8-quantization unit errors: ??? [-1, 1].
 pub open spec fn gpu_all_unit_errors(e: Seq<int>) -> bool
     decreases e.len()
 {
@@ -218,7 +218,7 @@ pub open spec fn gpu_all_unit_errors(e: Seq<int>) -> bool
     else { -1 <= e.last() <= 1 && gpu_all_unit_errors(e.drop_last()) }
 }
 
-/// All elements are valid Q8 activations: ∈ [-127, 127].
+/// All elements are valid Q8 activations: ??? [-127, 127].
 pub open spec fn gpu_all_q8(a: Seq<int>) -> bool
     decreases a.len()
 {
@@ -226,7 +226,7 @@ pub open spec fn gpu_all_q8(a: Seq<int>) -> bool
     else { -127 <= a.last() <= 127 && gpu_all_q8(a.drop_last()) }
 }
 
-// ── Core spec functions ───────────────────────────────────────────────────────
+// -- Core spec functions -------------------------------------------------------
 
 /// Integer dot product of two sequences.
 pub open spec fn gpu_seq_dot(a: Seq<int>, b: Seq<int>) -> int
@@ -246,7 +246,7 @@ pub open spec fn gpu_seq_sum(a: Seq<int>) -> int
 }
 
 /// Reference formula for one Q4K group (integer model, treating d=dmin=1 for
-/// algebraic clarity — the caller folds d and dmin into the result):
+/// algebraic clarity -- the caller folds d and dmin into the result):
 ///   ref_group(sc_g, m_g, q_g, a_g) = sc_g * dot(q_g, a_g) - m_g * sum(a_g)
 pub open spec fn gpu_q4k_ref_group(sc_g: int, m_g: int, q_g: Seq<int>, a_g: Seq<int>) -> int
     recommends q_g.len() == a_g.len()
@@ -272,7 +272,7 @@ pub open spec fn seq_add(a: Seq<int>, b: Seq<int>) -> Seq<int>
     else { seq_add(a.drop_last(), b.drop_last()).push(a.last() + b.last()) }
 }
 
-/// Error bound for one group: sc_g * Σ q_i  (max |e| when |e_i| ≤ 1).
+/// Error bound for one group: sc_g * Sigma q_i  (max |e| when |e_i| <= 1).
 pub open spec fn gpu_group_error_bound(sc_g: int, q_g: Seq<int>) -> int
     decreases q_g.len()
 {
@@ -280,7 +280,7 @@ pub open spec fn gpu_group_error_bound(sc_g: int, q_g: Seq<int>) -> int
     else { sc_g * q_g.last() + gpu_group_error_bound(sc_g, q_g.drop_last()) }
 }
 
-/// Error term for one group: sc_g * Σ q_i * e_i.
+/// Error term for one group: sc_g * Sigma q_i * e_i.
 pub open spec fn gpu_weighted_err(sc_g: int, q_g: Seq<int>, e_g: Seq<int>) -> int
     recommends q_g.len() == e_g.len()
     decreases q_g.len()
@@ -292,7 +292,7 @@ pub open spec fn gpu_weighted_err(sc_g: int, q_g: Seq<int>, e_g: Seq<int>) -> in
     }
 }
 
-// ── Helper lemmas (self-contained) ────────────────────────────────────────────
+// -- Helper lemmas (self-contained) --------------------------------------------
 
 /// seq_dot over seq_add equals seq_dot(q, a) + seq_dot(q, e).
 proof fn lemma_gpu_dot_add_split(q: Seq<int>, a: Seq<int>, e: Seq<int>)
@@ -309,7 +309,7 @@ proof fn lemma_gpu_dot_add_split(q: Seq<int>, a: Seq<int>, e: Seq<int>)
         let ae = seq_add(a, e);
         // Establish structural properties of seq_add
         assert(ae.len() == a.len()) by {
-            // seq_add produces same length as inputs — prove by induction
+            // seq_add produces same length as inputs -- prove by induction
             lemma_seq_add_len(a, e);
         }
         assert(ae.last() == a.last() + e.last()) by {
@@ -456,7 +456,7 @@ proof fn lemma_gpu_weighted_err_is_scaled_dot(sc_g: int, q_g: Seq<int>, e_g: Seq
     }
 }
 
-/// error_bound is non-negative when sc_g ≥ 0 and all q_i ≥ 0.
+/// error_bound is non-negative when sc_g >= 0 and all q_i >= 0.
 proof fn lemma_gpu_error_bound_nonneg(sc_g: int, q_g: Seq<int>)
     requires sc_g >= 0, gpu_all_nibbles(q_g)
     ensures gpu_group_error_bound(sc_g, q_g) >= 0
@@ -472,14 +472,14 @@ proof fn lemma_gpu_error_bound_nonneg(sc_g: int, q_g: Seq<int>)
     }
 }
 
-// ── Theorem 1: GPU formula == CPU reference formula ───────────────────────────
+// -- Theorem 1: GPU formula == CPU reference formula ---------------------------
 //
 // The GPU kernel (CutileQuantizedGemm) first calls dequant_q4k_block (same
 // function as CpuMatMulQ4K) to get f32 weights, then runs a GPU GEMM.
 // Treating f32 as exact integers, both compute gpu_q4k_ref_group per group.
 // The equivalence is definitional.
 //
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 pub proof fn lemma_gpu_q4k_ref_group_equals_cpu_ref(
     sc_g: int, m_g: int, q_g: Seq<int>, a_g: Seq<int>,
@@ -491,7 +491,7 @@ pub proof fn lemma_gpu_q4k_ref_group_equals_cpu_ref(
 {
 }
 
-// ── Theorem 2: GPU output ≈ CPU opt output, within Q8 error bound ─────────────
+// -- Theorem 2: GPU output ~= CPU opt output, within Q8 error bound -------------
 //
 // GPU computes: d * ref_group(sc_g, m_g, q_g, a_g)           (exact activations)
 // CPU opt:      d * opt_group(sc_g, m_g, q_g, a_g, e_g)      (Q8 activations)
@@ -499,8 +499,8 @@ pub proof fn lemma_gpu_q4k_ref_group_equals_cpu_ref(
 //             = sc_g * (dot(q_g, a_g) - dot(q_g, a_g+e_g))
 //             = -sc_g * dot(q_g, e_g)
 //             = -gpu_weighted_err(sc_g, q_g, e_g)
-// |Error| ≤ gpu_group_error_bound(sc_g, q_g)   [by Theorem 3 below]
-// ─────────────────────────────────────────────────────────────────────────────
+// |Error| <= gpu_group_error_bound(sc_g, q_g)   [by Theorem 3 below]
+// -----------------------------------------------------------------------------
 
 pub proof fn lemma_gpu_vs_opt_group_error(
     sc_g: int, m_g: int, q_g: Seq<int>, a_g: Seq<int>, e_g: Seq<int>,
@@ -531,7 +531,7 @@ pub proof fn lemma_gpu_vs_opt_group_error(
             gpu_weighted_err(sc_g, q_g, e_g) == sc_g * gpu_seq_dot(q_g, e_g);
 }
 
-// ── Theorem 3: |GPU − CPU_opt| ≤ group_error_bound ───────────────────────────
+// -- Theorem 3: |GPU ??? CPU_opt| <= group_error_bound ---------------------------
 
 pub proof fn lemma_gpu_q4k_output_error_bound(
     sc_g: int,
@@ -565,8 +565,8 @@ pub proof fn lemma_gpu_q4k_output_error_bound(
     lemma_gpu_weighted_err_bounded(sc_g, q_g, e_g);
 }
 
-/// |weighted_err(sc_g, q_g, e_g)| ≤ group_error_bound(sc_g, q_g)
-/// when |e_i| ≤ 1 and q_i ∈ [0,15] and sc_g ∈ [0,63].
+/// |weighted_err(sc_g, q_g, e_g)| <= group_error_bound(sc_g, q_g)
+/// when |e_i| <= 1 and q_i ??? [0,15] and sc_g ??? [0,63].
 pub proof fn lemma_gpu_weighted_err_bounded(
     sc_g: int,
     q_g: Seq<int>,
@@ -623,7 +623,7 @@ pub proof fn lemma_gpu_weighted_err_bounded(
     }
 }
 
-// ── Sanity checks ─────────────────────────────────────────────────────────────
+// -- Sanity checks -------------------------------------------------------------
 
 proof fn check_gpu_ref_group_trivial()
     ensures gpu_q4k_ref_group(1int, 0int, Seq::<int>::empty(), Seq::<int>::empty()) == 0int

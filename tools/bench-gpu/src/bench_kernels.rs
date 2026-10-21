@@ -38,7 +38,7 @@ fn bench_matmul(gpu: &CutileMatMul, cpu: &CpuMatMul, m: usize, n: usize, k: usiz
     let cpu_gflops = flops / (cpu_us * 1e3);
 
     println!(
-        "  MatMul {m:>5}×{k:>5}×{n:>5}  GPU: {:>8.1}µs ({:>7.1} GFLOPS)  CPU: {:>8.0}µs ({:>5.1} GFLOPS)  speedup: {:.1}×",
+        "  MatMul {m:>5}x{k:>5}x{n:>5}  GPU: {:>8.1}??s ({:>7.1} GFLOPS)  CPU: {:>8.0}??s ({:>5.1} GFLOPS)  speedup: {:.1}x",
         gpu_us, gpu_gflops, cpu_us, cpu_gflops, cpu_us / gpu_us
     );
 }
@@ -74,7 +74,7 @@ fn bench_rmsnorm(gpu: &CutileRmsNorm, cpu: &CpuRMSNorm, hidden_size: usize, num_
     let gpu_gbps = bytes / (gpu_us * 1e3);
 
     println!(
-        "  RMSNorm h={hidden_size:>5} t={num_tokens:>3}  GPU: {:>8.1}µs ({:.1} GB/s)  CPU: {:>8.0}µs  speedup: {:.1}×",
+        "  RMSNorm h={hidden_size:>5} t={num_tokens:>3}  GPU: {:>8.1}??s ({:.1} GB/s)  CPU: {:>8.0}??s  speedup: {:.1}x",
         gpu_us, gpu_gbps, cpu_us, cpu_us / gpu_us
     );
 }
@@ -142,7 +142,7 @@ fn bench_attention(
     let gpu_gflops = flops / (gpu_us * 1e3);
 
     println!(
-        "  Attn {label:<25}  GPU: {:>8.1}µs ({:>7.1} GFLOPS)",
+        "  Attn {label:<25}  GPU: {:>8.1}??s ({:>7.1} GFLOPS)",
         gpu_us, gpu_gflops
     );
 }
@@ -183,15 +183,15 @@ fn bench_q4k_gemv(gpu: &CutileQuantizedGemm, label: &str, m: usize, n: usize, k:
     let gbps = weight_bytes / (us * 1e3);
 
     println!(
-        "  Q4K GEMV {label:<20}  {:>8.1}µs  ({:.1} GB/s effective weight BW)",
+        "  Q4K GEMV {label:<20}  {:>8.1}??s  ({:.1} GB/s effective weight BW)",
         us, gbps
     );
 }
 
 fn main() {
-    println!("╔══════════════════════════════════════════════════════╗");
-    println!("║  tempura cuTile Kernel Microbenchmarks                 ║");
-    println!("╚══════════════════════════════════════════════════════╝");
+    println!("????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????");
+    println!("???  tempura cuTile Kernel Microbenchmarks                 ???");
+    println!("????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????");
     println!("  Warmup: {WARMUP} iters, Measured: {ITERS} iters\n");
 
     let gpu_matmul = CutileMatMul::new().unwrap();
@@ -201,7 +201,7 @@ fn main() {
     let gpu_attention = CutileFlashAttention::new().unwrap();
     let gpu_q4k = CutileQuantizedGemm::new().unwrap();
 
-    println!("─── MatMul (B-transposed) ───");
+    println!("--- MatMul (B-transposed) ---");
     bench_matmul(&gpu_matmul, &cpu_matmul, 1, 4096, 4096);
     bench_matmul(&gpu_matmul, &cpu_matmul, 1, 11008, 4096);
     bench_matmul(&gpu_matmul, &cpu_matmul, 1, 32000, 4096);
@@ -209,13 +209,13 @@ fn main() {
     bench_matmul(&gpu_matmul, &cpu_matmul, 512, 4096, 4096);
     println!();
 
-    println!("─── RMSNorm ───");
+    println!("--- RMSNorm ---");
     bench_rmsnorm(&gpu_rmsnorm, &cpu_rmsnorm, 4096, 1);
     bench_rmsnorm(&gpu_rmsnorm, &cpu_rmsnorm, 4096, 8);
     bench_rmsnorm(&gpu_rmsnorm, &cpu_rmsnorm, 4096, 128);
     println!();
 
-    println!("─── Flash Attention (GQA, 32 heads / 8 kv heads, d=128) ───");
+    println!("--- Flash Attention (GQA, 32 heads / 8 kv heads, d=128) ---");
     bench_attention(&gpu_attention, "decode s=1 kv=128", 1, 128, 32, 8, 128);
     bench_attention(&gpu_attention, "decode s=1 kv=512", 1, 512, 32, 8, 128);
     bench_attention(&gpu_attention, "decode s=1 kv=2048", 1, 2048, 32, 8, 128);
@@ -223,7 +223,7 @@ fn main() {
     bench_attention(&gpu_attention, "prefill s=512 kv=512", 512, 512, 32, 8, 128);
     println!();
 
-    println!("─── Q4K Quantized GEMV (dequant-then-GEMM path) ───");
+    println!("--- Q4K Quantized GEMV (dequant-then-GEMM path) ---");
     bench_q4k_gemv(&gpu_q4k, "h=4096 n=4096", 1, 4096, 4096);
     bench_q4k_gemv(&gpu_q4k, "h=4096 n=11008", 1, 11008, 4096);
     bench_q4k_gemv(&gpu_q4k, "h=4096 n=32000", 1, 32000, 4096);

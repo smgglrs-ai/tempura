@@ -77,7 +77,7 @@ pub fn quantize_row_q8_k(src: &[f32], dst: &mut [BlockQ8K]) {
     }
 }
 
-// ── Raw-byte interface ─────────────────────────────────────────────────────
+// -- Raw-byte interface -----------------------------------------------------
 
 pub fn quantize_activations(src: &[f32], dst: &mut [u8], ggml_type: super::GgmlType) {
     use super::GgmlType::*;

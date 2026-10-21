@@ -1,17 +1,17 @@
 // Translation of llama.cpp ggml/src/ggml-cpu/simd-gemm.h
 //
-// Computes C[M × N] += A[M × K] × B[K × N] (accumulate into C).
+// Computes C[M x N] += A[M x K] x B[K x N] (accumulate into C).
 //
 // Three implementations are provided, selected at compile time:
 //
-//   1. avx2_gemm   — AVX2 path, RM=6 × RN=2 × 8 tile  (15/16 ymm registers)
-//   2. avx512_gemm — AVX-512F path, RM=4 × RN=4 × 16 tile (21/32 zmm registers)
-//   3. scalar_gemm — portable fallback with no intrinsics
+//   1. avx2_gemm   -- AVX2 path, RM=6 x RN=2 x 8 tile  (15/16 ymm registers)
+//   2. avx512_gemm -- AVX-512F path, RM=4 x RN=4 x 16 tile (21/32 zmm registers)
+//   3. scalar_gemm -- portable fallback with no intrinsics
 //
 // The public `simd_gemm` entry point dispatches at compile time to the
 // fastest available path, matching the #ifdef chain in the original header.
 
-// ── AVX2 path ─────────────────────────────────────────────────────────────
+// -- AVX2 path -------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[allow(dead_code)]
@@ -22,7 +22,7 @@ mod avx2_impl {
     const EPR: usize = 8; // GGML_F32_EPR for AVX2: 8 f32 per __m256
 
     // simd_gemm_ukernel<RM, RN>:
-    //   C[ RM × (RN*EPR) ] += A[ RM × K ] × B[ K × (RN*EPR) ]
+    //   C[ RM x (RN*EPR) ] += A[ RM x K ] x B[ K x (RN*EPR) ]
     //
     // Template parameters become Rust const generics.
     // Each accumulator covers one (row, col-block) pair:
@@ -75,7 +75,7 @@ mod avx2_impl {
         }
     }
 
-    // simd_gemm (AVX2): C[M×N] += A[M×K] × B[K×N]
+    // simd_gemm (AVX2): C[MxN] += A[MxK] x B[KxN]
     //
     // Outer tiling loop from llama.cpp simd-gemm.h `simd_gemm` function.
     // RM=6, RN=2 for AVX2 as per GEMM_RM/GEMM_RN constants.
@@ -163,7 +163,7 @@ mod avx2_impl {
     }
 }
 
-// ── AVX-512F path ─────────────────────────────────────────────────────────
+// -- AVX-512F path ---------------------------------------------------------
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 #[allow(dead_code)]
@@ -274,7 +274,7 @@ mod avx512_impl {
     }
 }
 
-// ── Scalar fallback path ───────────────────────────────────────────────────
+// -- Scalar fallback path ---------------------------------------------------
 //
 // Matches the `#else // scalar path` branch in simd-gemm.h.
 // Used when no SIMD feature is detected at compile time.
@@ -303,20 +303,20 @@ fn scalar_gemm(
     }
 }
 
-// ── Public entry point ─────────────────────────────────────────────────────
+// -- Public entry point -----------------------------------------------------
 //
-// `simd_gemm(C, A, B, M, K, N)` — C[M×N] += A[M×K] × B[K×N]
+// `simd_gemm(C, A, B, M, K, N)` -- C[MxN] += A[MxK] x B[KxN]
 //
 // Dispatches at compile time to the best available path:
-//   avx512f  → avx512_impl::gemm
-//   avx2     → avx2_impl::gemm
-//   otherwise → scalar_gemm
+//   avx512f  -> avx512_impl::gemm
+//   avx2     -> avx2_impl::gemm
+//   otherwise -> scalar_gemm
 //
 // Safety: C, A, B must point to valid, non-overlapping f32 arrays of the
 //         indicated sizes (M*N, M*K, K*N respectively).  No bounds checking
 //         is performed.
 
-/// C\[M×N\] += A\[M×K\] × B\[K×N\].  All three matrices are row-major,
+/// C\[MxN\] += A\[MxK\] x B\[KxN\].  All three matrices are row-major,
 /// C is accumulated into (not overwritten).
 ///
 /// # Safety
@@ -360,7 +360,7 @@ pub fn gemm_slices(
     unsafe { simd_gemm(c.as_mut_ptr(), a.as_ptr(), b.as_ptr(), m, k, n) }
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────
+// -- Tests ------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

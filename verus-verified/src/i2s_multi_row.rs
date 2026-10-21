@@ -1,4 +1,4 @@
-//! Verus-verified multi-row I2S GEMV indexing — unbounded proofs
+//! Verus-verified multi-row I2S GEMV indexing -- unbounded proofs
 //!
 //! Proves: macro-unrolled inner loop indexing for the multi-row I2S
 //! GEMV kernel. Weight and activation addresses stay within bounds
@@ -34,10 +34,10 @@ proof fn multi_row_weight_index(
 {
     let nb = k / 128;
     let row_packed = k / 4;
-    // k % 128 == 0 ⟹ k == (k/128)*128
+    // k % 128 == 0 ??? k == (k/128)*128
     assert(k % 128 == 0);
     assert(k / 128 * 128 + k % 128 == k) by (nonlinear_arith);
-    // ∴ nb * 128 == k
+    // ??? nb * 128 == k
     assert(nb * 32 == k / 4) by (nonlinear_arith)
         requires nb * 128 == k;
     assert(g * 32 + 32 <= nb * 32) by (nonlinear_arith)
@@ -87,7 +87,7 @@ proof fn group32_decomposition(k: nat)
     assert(nb / 32 * 32 + nb % 32 == nb) by (nonlinear_arith);
 }
 
-// i16 accumulator overflow safety: 32 groups × 4 maddubs × max ±254 = ±32512
+// i16 accumulator overflow safety: 32 groups x 4 maddubs x max ??254 = ??32512
 // fits i16 range [-32768, 32767]
 proof fn i16_accumulator_no_overflow()
     ensures ({

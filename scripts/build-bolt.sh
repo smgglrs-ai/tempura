@@ -2,7 +2,7 @@
 # BOLT post-link optimization for tempura-serve.
 # Requires: llvm-bolt, merge-fdata (both in /usr/bin from llvm-bolt package).
 #
-# BOLT operates at binary level — no LLVM source instrumentation, so the
+# BOLT operates at binary level -- no LLVM source instrumentation, so the
 # instrumented binary runs at near-normal speed (counter increments only).
 # Typical workflow: ~5 minutes of profiling, 1-2 minutes for BOLT pass.
 #
@@ -12,7 +12,7 @@
 # but fully processes the hot functions (the GEMM kernels). Attempting -no-pie
 # at link time, ET_EXEC patching, or --relocs all result in the same lite mode
 # because the PIC code patterns in the binary are the trigger, not the ELF header.
-# The +4% pp128 improvement (203 → 211 tok/s) represents the BOLT ceiling for
+# The +4% pp128 improvement (203 -> 211 tok/s) represents the BOLT ceiling for
 # Rust PIE binaries. The remaining gap vs llama.cpp is mullo_epi32 scheduling.
 set -euo pipefail
 
@@ -50,7 +50,7 @@ echo "Waiting for model load..."
 for i in $(seq 1 30); do
   sleep 3
   curl -sf --max-time 5 "http://localhost:$PORT/v1/models" >/dev/null 2>&1 && \
-    echo "Ready after ${i}×3s" && break
+    echo "Ready after ${i}x3s" && break
 done
 
 CURL="curl -s -X POST http://localhost:$PORT/v1/completions \

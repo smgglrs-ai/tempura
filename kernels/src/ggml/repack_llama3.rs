@@ -1,5 +1,5 @@
-//! Direct translation of llama.cpp arch/x86/repack.cpp — IQ4_NL / MXFP4 GEMV and
-//! Q4_0 / IQ4_NL / MXFP4 8×8 GEMM (AVX2 path).
+//! Direct translation of llama.cpp arch/x86/repack.cpp -- IQ4_NL / MXFP4 GEMV and
+//! Q4_0 / IQ4_NL / MXFP4 8x8 GEMM (AVX2 path).
 //!
 //! Sources:
 //! - ggml_gemv_iq4_nl_8x8_q8_0:   arch/x86/repack.cpp  lines 1687-1698
@@ -21,9 +21,9 @@ const IQ4_NL_VALUES: [i8; 16] = [
 // MXFP4 / FP4 codebook (= kvalues_fp4 / kvalues_mxfp4 in ggml-common.h)
 const MXFP4_VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
-// ── New interleaved block structs ─────────────────────────────────────────────
+// -- New interleaved block structs ---------------------------------------------
 
-/// 8 IQ4_NL blocks interleaved — same memory layout as BlockQ4_0x8.
+/// 8 IQ4_NL blocks interleaved -- same memory layout as BlockQ4_0x8.
 /// d[8]: f16 scales; qs[128]: 4-bit nibbles (iq4_nl index, not raw quant).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -42,16 +42,16 @@ pub struct BlockMxfp4x8 {
     pub qs: [i8; 128],
 }
 
-// ── Shared helpers ────────────────────────────────────────────────────────────
+// -- Shared helpers ------------------------------------------------------------
 
-/// GGML_E8M0_TO_FP32_HALF: convert E8M0 byte exponent → f32 with ×0.5.
+/// GGML_E8M0_TO_FP32_HALF: convert E8M0 byte exponent -> f32 with x0.5.
 #[inline(always)]
 fn e8m0_to_f32_half(x: u8) -> f32 {
     let bits: u32 = if x < 2 { 0x00200000u32 << x } else { (x as u32 - 1) << 23 };
     f32::from_bits(bits)
 }
 
-/// acc += sign(x)·|x| ⊗ sign(x)·y  (maddubs + madd trick, AVX2).
+/// acc += sign(x)*|x| ??? sign(x)*y  (maddubs + madd trick, AVX2).
 /// Direct translation of mul_sum_i8_pairs_acc_int32x8 (arch/x86/repack.cpp line 165).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -69,15 +69,15 @@ unsafe fn mul_sum_i8_pairs(
     _mm256_add_epi32(acc, _mm256_madd_epi16(ones, dot))
 }
 
-// ── GEMV helpers ──────────────────────────────────────────────────────────────
+// -- GEMV helpers --------------------------------------------------------------
 
 /// AVX2 GEMV for q4-style blocks with 8 f16 deltas.
 /// Used for Q4_0 and IQ4_NL (identical layout, different signextendlut).
 /// Direct translation of gemv_q4_b32_8x8_q8_0_lut_avx (arch/x86/repack.cpp line 522)
 /// for block_q4_0x8 / block_iq4_nlx8.
 ///
-/// vx must point to (nc/8 × nb) of block_q4_0x8 / block_iq4_nlx8.
-/// vy must point to (nr × nb) of block_q8_0.
+/// vx must point to (nc/8 x nb) of block_q4_0x8 / block_iq4_nlx8.
+/// vy must point to (nr x nb) of block_q8_0.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
 unsafe fn gemv_q4_d_lut(
@@ -124,14 +124,14 @@ unsafe fn gemv_q4_d_lut(
                 let rhs_6 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(_mm256_srli_epi16(rhs_raw_2, 4), m4b));
                 let rhs_7 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(_mm256_srli_epi16(rhs_raw_3, 4), m4b));
 
-                // column scales: 8 f16 deltas → 8 f32
+                // column scales: 8 f16 deltas -> 8 f32
                 let col_scale_f32 = _mm256_cvtph_ps(_mm_loadu_si128(bp.d.as_ptr() as *const __m128i));
 
                 // row scale
                 let row_d_f32 = f16_to_f32(ap.d);
                 let row_scale = _mm256_set1_ps(row_d_f32);
 
-                // activations: 32 i8 values → broadcast each 8-byte half
+                // activations: 32 i8 values -> broadcast each 8-byte half
                 let lhs_v0 = _mm256_permute2f128_si256(
                     _mm256_castsi128_si256(_mm_loadu_si128(ap.qs.as_ptr() as *const __m128i)),
                     _mm256_castsi128_si256(_mm_loadu_si128(ap.qs.as_ptr() as *const __m128i)),
@@ -214,7 +214,7 @@ unsafe fn gemv_mxfp4_lut(
                 let rhs_6 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(_mm256_srli_epi16(rhs_raw_2, 4), m4b));
                 let rhs_7 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(_mm256_srli_epi16(rhs_raw_3, 4), m4b));
 
-                // column scales: 8 E8M0 exponent bytes → 8 f32
+                // column scales: 8 E8M0 exponent bytes -> 8 f32
                 let col_scale_f32 = _mm256_set_ps(
                     e8m0_to_f32_half(bp.e[7]),
                     e8m0_to_f32_half(bp.e[6]),
@@ -263,9 +263,9 @@ unsafe fn gemv_mxfp4_lut(
     }
 }
 
-// ── GEMM AVX2 core ────────────────────────────────────────────────────────────
+// -- GEMM AVX2 core ------------------------------------------------------------
 
-/// Load 4 Q8_0x4 row scales (d[4] f16) and repeat: [d0,d1,d0,d1,d2,d3,d2,d3] → 8 f32.
+/// Load 4 Q8_0x4 row scales (d[4] f16) and repeat: [d0,d1,d0,d1,d2,d3,d2,d3] -> 8 f32.
 /// Direct translation of GGML_F32Cx8_REPEAT_LOAD (arch/x86/repack.cpp line 35).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c")]
@@ -282,8 +282,8 @@ unsafe fn repeat_load_row_scales(d: *const u16) -> std::arch::x86_64::__m256 {
 /// Direct translation of gemm_q4_b32_8x8_q8_0_lut_avx<block_q4_0x8> AVX2 path
 /// (arch/x86/repack.cpp lines 1097-1444).
 ///
-/// - vx: packed weights as (nc/8 × nb) of block with d[8]+qs[128]
-/// - vy: packed activations as (nr/4 × nb) of BlockQ8_0x4
+/// - vx: packed weights as (nc/8 x nb) of block with d[8]+qs[128]
+/// - vy: packed activations as (nr/4 x nb) of BlockQ8_0x4
 /// - s:  output floats, row-major, row stride = bs floats
 /// - n, nr, nc: must satisfy n%32==0, nr%4==0, nc%8==0
 #[cfg(target_arch = "x86_64")]
@@ -311,7 +311,7 @@ unsafe fn gemm_q4_b32_avx2_d(
     let anr = nr - nr % 16;
     let mut y: usize = 0;
 
-    // ── Big loop: 16 output rows at a time (4 groups × 4 rows) ──────────────
+    // -- Big loop: 16 output rows at a time (4 groups x 4 rows) --------------
     while y < anr / 4 {
         let a_ptrs = [
             a_ptr_start.add(y       * nb),
@@ -327,7 +327,7 @@ unsafe fn gemm_q4_b32_avx2_d(
             for b in 0..nb as isize {
                 let bp = &*b_ptr.offset(b);
 
-                // Load 4×32 bytes of RHS nibbles
+                // Load 4x32 bytes of RHS nibbles
                 let rhs_raw_0123_0 = _mm256_loadu_si256(bp.qs.as_ptr() as *const __m256i);
                 let rhs_raw_4567_0 = _mm256_loadu_si256(bp.qs.as_ptr().add(32) as *const __m256i);
                 let rhs_raw_0123_1 = _mm256_loadu_si256(bp.qs.as_ptr().add(64) as *const __m256i);
@@ -339,7 +339,7 @@ unsafe fn gemm_q4_b32_avx2_d(
                 let rhs_raw_0145_1 = _mm256_blend_epi32(rhs_raw_0123_1, _mm256_permutevar8x32_epi32(rhs_raw_4567_1, required_order), 240);
                 let rhs_raw_2367_1 = _mm256_blend_epi32(_mm256_permutevar8x32_epi32(rhs_raw_0123_1, required_order), rhs_raw_4567_1, 240);
 
-                // Sign-extend nibbles via LUT (4 groups: lo/hi × first/second half)
+                // Sign-extend nibbles via LUT (4 groups: lo/hi x first/second half)
                 let rhs_0145_0 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs_raw_0145_0, m4b));
                 let rhs_2367_0 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs_raw_2367_0, m4b));
                 let rhs_0145_1 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs_raw_0145_1, m4b));
@@ -368,7 +368,7 @@ unsafe fn gemm_q4_b32_avx2_d(
                 let r0145_3_sp2 = _mm256_shuffle_epi32(rhs_0145_3, 221);
                 let r2367_3_sp2 = _mm256_shuffle_epi32(rhs_2367_3, 221);
 
-                // Column scale: 8 f16 deltas → 8 f32
+                // Column scale: 8 f16 deltas -> 8 f32
                 let col_scale = _mm256_cvtph_ps(_mm_loadu_si128(bp.d.as_ptr() as *const __m128i));
 
                 // Process 4 row groups
@@ -448,7 +448,7 @@ unsafe fn gemm_q4_b32_avx2_d(
         y += 4;
     }
 
-    // ── Small loop: 4 output rows at a time (1 group) ────────────────────────
+    // -- Small loop: 4 output rows at a time (1 group) ------------------------
     while y < nr / 4 {
         let a_ptr = a_ptr_start.add(y * nb);
 
@@ -595,7 +595,7 @@ unsafe fn gemm_q4_b32_avx2_mxfp4(
     let anr = nr - nr % 16;
     let mut y: usize = 0;
 
-    // ── Big loop: 16 output rows at a time ───────────────────────────────────
+    // -- Big loop: 16 output rows at a time -----------------------------------
     while y < anr / 4 {
         let a_ptrs = [
             a_ptr_start.add(y       * nb),
@@ -727,7 +727,7 @@ unsafe fn gemm_q4_b32_avx2_mxfp4(
         y += 4;
     }
 
-    // ── Small loop: 4 output rows at a time ──────────────────────────────────
+    // -- Small loop: 4 output rows at a time ----------------------------------
     while y < nr / 4 {
         let a_ptr = a_ptr_start.add(y * nb);
 
@@ -851,16 +851,16 @@ unsafe fn gemm_q4_b32_avx2_mxfp4(
     }
 }
 
-// ── f16 → f32 conversion helper ──────────────────────────────────────────────
+// -- f16 -> f32 conversion helper ----------------------------------------------
 
 #[inline(always)]
 fn f16_to_f32(v: u16) -> f32 {
-    // IEEE 754 half → single via bitfield expansion.
+    // IEEE 754 half -> single via bitfield expansion.
     let sign = ((v as u32) >> 15) & 1;
     let exp  = ((v as u32) >> 10) & 0x1f;
     let mant =  (v as u32)        & 0x3ff;
     let bits = if exp == 0 {
-        // subnormal → flush to zero for our use case
+        // subnormal -> flush to zero for our use case
         if mant == 0 { sign << 31 } else { (sign << 31) | ((mant as u32) << 13) }
     } else if exp == 31 {
         (sign << 31) | 0x7f80_0000 | (mant << 13)
@@ -870,10 +870,10 @@ fn f16_to_f32(v: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-// ── Public GEMV functions ─────────────────────────────────────────────────────
+// -- Public GEMV functions -----------------------------------------------------
 
 /// Direct translation of ggml_gemv_iq4_nl_8x8_q8_0 (arch/x86/repack.cpp line 1687).
-/// AVX2 GEMV: BlockIQ4NLx8 weights × Q8_0 activations → float output.
+/// AVX2 GEMV: BlockIQ4NLx8 weights x Q8_0 activations -> float output.
 /// IQ4_NL layout is identical to BlockQ4_0x8 (d[8] f16 + qs[128]).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
@@ -887,7 +887,7 @@ pub unsafe fn ggml_gemv_iq4_nl_8x8_q8_0(
 }
 
 /// Direct translation of ggml_gemv_mxfp4_8x8_q8_0 (arch/x86/repack.cpp line 1700).
-/// AVX2 GEMV: BlockMxfp4x8 weights × Q8_0 activations → float output.
+/// AVX2 GEMV: BlockMxfp4x8 weights x Q8_0 activations -> float output.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
 pub unsafe fn ggml_gemv_mxfp4_8x8_q8_0(
@@ -899,12 +899,12 @@ pub unsafe fn ggml_gemv_mxfp4_8x8_q8_0(
     gemv_mxfp4_lut(n, s, vx, vy, nr, nc, signextendlut);
 }
 
-// ── Public GEMM functions ─────────────────────────────────────────────────────
+// -- Public GEMM functions -----------------------------------------------------
 
 /// Direct translation of ggml_gemm_q4_0_8x8_q8_0 (arch/x86/repack.cpp line 2026).
-/// AVX2 GEMM: BlockQ4_0x8 weights × BlockQ8_0x4 activations → float output.
+/// AVX2 GEMM: BlockQ4_0x8 weights x BlockQ8_0x4 activations -> float output.
 ///
-/// vx: (nc/8 × nb) packed Q4_0 blocks;  vy: (nr/4 × nb) packed Q8_0x4 blocks.
+/// vx: (nc/8 x nb) packed Q4_0 blocks;  vy: (nr/4 x nb) packed Q8_0x4 blocks.
 /// s: output row-major, row stride bs.  Requires nr%4==0, nc%8==0, n%32==0.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
@@ -918,7 +918,7 @@ pub unsafe fn ggml_gemm_q4_0_8x8_q8_0(
 }
 
 /// Direct translation of ggml_gemm_iq4_nl_8x8_q8_0 (arch/x86/repack.cpp line 3496).
-/// AVX2 GEMM: BlockIQ4NLx8 weights × BlockQ8_0x4 activations → float output.
+/// AVX2 GEMM: BlockIQ4NLx8 weights x BlockQ8_0x4 activations -> float output.
 /// Layout identical to Q4_0x8 (d[8] f16 + qs[128]); only the LUT differs.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
@@ -932,7 +932,7 @@ pub unsafe fn ggml_gemm_iq4_nl_8x8_q8_0(
 }
 
 /// Direct translation of ggml_gemm_mxfp4_8x8_q8_0 (arch/x86/repack.cpp line 3511).
-/// AVX2 GEMM: BlockMxfp4x8 weights × BlockQ8_0x4 activations → float output.
+/// AVX2 GEMM: BlockMxfp4x8 weights x BlockQ8_0x4 activations -> float output.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
 pub unsafe fn ggml_gemm_mxfp4_8x8_q8_0(

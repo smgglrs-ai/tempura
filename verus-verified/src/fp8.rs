@@ -1,4 +1,4 @@
-//! Verus-verified FP8 E4M3 encoding properties — unbounded proofs
+//! Verus-verified FP8 E4M3 encoding properties -- unbounded proofs
 //!
 //! Proves: sign bit isolation, exponent/mantissa field widths,
 //! encoded value fits in u8, max finite value representation.
@@ -85,7 +85,7 @@ proof fn fp8_max_finite_encoding()
 }
 
 // ============================================================================
-// Proof: NaN encoding = 0x7F (exp=15, mant=7) — all bits set except sign
+// Proof: NaN encoding = 0x7F (exp=15, mant=7) -- all bits set except sign
 // ============================================================================
 
 proof fn fp8_nan_encoding()

@@ -1,8 +1,8 @@
 //! Q4K dual-pipeline: ref (CpuMatMulQ4K) vs SIMD-opt (CpuMatMulQ4KOpt) and GPU.
 //!
 //! The Q4K optimised path quantises activations to Q8 (int8) before the dot
-//! product, introducing ≤ max_abs/127 rounding per activation.  The relative
-//! error across a realistic LLM projection is empirically < 2% — confirmed
+//! product, introducing <= max_abs/127 rounding per activation.  The relative
+//! error across a realistic LLM projection is empirically < 2% -- confirmed
 //! here at the kernel level.  For GPU, FP16 accumulation adds another rounding
 //! tier; 5% covers the combined error.
 
@@ -28,7 +28,7 @@ pub fn compare_ref_vs_opt() -> VerificationReport {
 }
 
 /// Compare CpuMatMulQ4K (scalar reference) vs the GPU kernel (CutileQuantizedGemm)
-/// on a single LLM projection.  Relative tolerance 5% — GPU uses FP16 accumulation.
+/// on a single LLM projection.  Relative tolerance 5% -- GPU uses FP16 accumulation.
 ///
 /// Requires the `cutile` feature and an NVIDIA GPU.  Run with:
 ///   cargo test --package tempura-kernel-verify --features cutile
@@ -57,7 +57,7 @@ mod tests {
         for r in &report.results {
             assert!(
                 r.pass,
-                "Q4K ref↔opt mismatch on {}: {}",
+                "Q4K ref???opt mismatch on {}: {}",
                 r.test_name, r.detail
             );
         }
@@ -71,7 +71,7 @@ mod tests {
         for r in &report.results {
             assert!(
                 r.pass,
-                "Q4K ref↔GPU mismatch on {}: {}",
+                "Q4K ref???GPU mismatch on {}: {}",
                 r.test_name, r.detail
             );
         }

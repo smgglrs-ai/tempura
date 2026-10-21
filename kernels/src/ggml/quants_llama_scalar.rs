@@ -14,20 +14,20 @@ const QK8_0: usize = 32;
 const QK8_1: usize = 32;
 const QK_NVFP4_SUB: usize = 16;
 
-// ── quantize_row_q8_0 scalar path ────────────────────────────────────────────
+// -- quantize_row_q8_0 scalar path --------------------------------------------
 // C: #else quantize_row_q8_0_ref(x, y, k);
 // Called when no AVX/AVX2 target feature is available.
 pub fn quantize_row_q8_0_scalar(x: &[f32], y: &mut [BlockQ8_0]) {
     quantize_row_q8_0_ref(x, y);
 }
 
-// ── quantize_row_q8_1 scalar path ────────────────────────────────────────────
+// -- quantize_row_q8_1 scalar path --------------------------------------------
 // C: #else quantize_row_q8_1_ref(x, y, k);
 pub fn quantize_row_q8_1_scalar(x: &[f32], y: &mut [BlockQ8_1]) {
     quantize_row_q8_1_ref(x, y);
 }
 
-// ── ggml_vec_dot_q4_0_q8_0 scalar tail loop ─────────────────────────────────
+// -- ggml_vec_dot_q4_0_q8_0 scalar tail loop ---------------------------------
 // This loop runs unconditionally in C after the #endif of the SIMD block to
 // process any remaining blocks (SIMD may leave ib < nb).
 // In the pure-scalar path ib starts at 0 and processes all nb blocks.
@@ -54,7 +54,7 @@ pub fn ggml_vec_dot_q4_0_q8_0_scalar_tail(
     sumf
 }
 
-// ── ggml_vec_dot_q8_0_q8_0 scalar tail loop ─────────────────────────────────
+// -- ggml_vec_dot_q8_0_q8_0 scalar tail loop ---------------------------------
 // C: for (; ib < nb; ++ib) { int sumi = 0; ... *s = sumf; }
 pub fn ggml_vec_dot_q8_0_q8_0_scalar_tail(
     x: &[BlockQ8_0],
@@ -74,7 +74,7 @@ pub fn ggml_vec_dot_q8_0_q8_0_scalar_tail(
     sumf
 }
 
-// ── ggml_vec_dot_mxfp4_q8_0 scalar tail loop ────────────────────────────────
+// -- ggml_vec_dot_mxfp4_q8_0 scalar tail loop --------------------------------
 // C: for (;ib < nb; ++ib) { const float d = ...; ... sumf += dy * d * (...); }
 // Called after #endif for any remaining blocks.
 pub fn ggml_vec_dot_mxfp4_q8_0_scalar_tail(
@@ -99,7 +99,7 @@ pub fn ggml_vec_dot_mxfp4_q8_0_scalar_tail(
     sumf
 }
 
-// ── ggml_vec_dot_nvfp4_q8_0 scalar tail loop ────────────────────────────────
+// -- ggml_vec_dot_nvfp4_q8_0 scalar tail loop --------------------------------
 // C: for (;ib < nb; ++ib) { for (int s_idx = 0; s_idx < 4; ++s_idx) { ... } }
 pub fn ggml_vec_dot_nvfp4_q8_0_scalar_tail(
     x: &[BlockNvfp4],
@@ -130,7 +130,7 @@ pub fn ggml_vec_dot_nvfp4_q8_0_scalar_tail(
     sumf
 }
 
-// ── Scalar dispatch wrappers for all vec_dot functions ───────────────────────
+// -- Scalar dispatch wrappers for all vec_dot functions -----------------------
 // These mirror the #else branches in arch/x86/quants.c:
 //   #else
 //     ggml_vec_dot_*_generic(n, s, bs, vx, bx, vy, by, nrc);
@@ -212,7 +212,7 @@ pub fn ggml_vec_dot_iq4_xs_q8_k_scalar(n: usize, x: &[BlockIQ4XS], y: &[BlockQ8K
     ggml_vec_dot_iq4_xs_q8_k_generic(n, x, y)
 }
 
-// ── Internal helpers ─────────────────────────────────────────────────────────
+// -- Internal helpers ---------------------------------------------------------
 
 // GGML_CPU_E8M0_TO_FP32_HALF: decode E8M0 biased exponent, divide by 2.
 #[inline(always)]

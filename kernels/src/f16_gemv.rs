@@ -1,8 +1,8 @@
-// ── F16 GEMV (lm_head) ────────────────────────────────────────────────────────
+// -- F16 GEMV (lm_head) --------------------------------------------------------
 
-/// F16×F16 dot product matching llama.cpp's ggml_vec_dot_f16 AVX-512 path exactly.
-/// Both inputs are raw F16 bytes. Uses 4 × __m512 accumulators, 64 elements/iter,
-/// tree reduction, _mm512_reduce_add_ps — same structure as GGML_F32Cx16_REDUCE.
+/// F16xF16 dot product matching llama.cpp's ggml_vec_dot_f16 AVX-512 path exactly.
+/// Both inputs are raw F16 bytes. Uses 4 x __m512 accumulators, 64 elements/iter,
+/// tree reduction, _mm512_reduce_add_ps -- same structure as GGML_F32Cx16_REDUCE.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,f16c,fma")]
 pub unsafe fn f16_dot_ggml(x_f16: &[u8], y_f16: &[u8], k: usize) -> f32 {
@@ -105,7 +105,7 @@ pub unsafe fn f16_dot_avx2(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
     result
 }
 
-/// F16×F16 scalar ref matching ggml_vec_dot_f16 AVX-512 accumulation order.
+/// F16xF16 scalar ref matching ggml_vec_dot_f16 AVX-512 accumulation order.
 pub fn f16_dot_ggml_scalar(x_f16: &[u8], y_f16: &[u8], k: usize) -> f32 {
     let mut acc = [0.0f32; 64];
     let k64 = k & !63;
@@ -159,8 +159,8 @@ pub fn f16_dot_ggml_scalar(x_f16: &[u8], y_f16: &[u8], k: usize) -> f32 {
     s
 }
 
-/// AVX512 F32×F16 dot: 16 floats/iter with _mm512_cvtph_ps → _mm512_fmadd_ps.
-/// ~2× throughput vs AVX2 on 512-bit-wide hardware (9950X3D).
+/// AVX512 F32xF16 dot: 16 floats/iter with _mm512_cvtph_ps -> _mm512_fmadd_ps.
+/// ~2x throughput vs AVX2 on 512-bit-wide hardware (9950X3D).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,f16c,fma")]
 pub unsafe fn f16_dot_avx512(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
@@ -197,7 +197,7 @@ pub unsafe fn f16_dot_avx512(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
     result
 }
 
-/// Runtime-dispatch F32×F16 dot: AVX512 → AVX2 → scalar.
+/// Runtime-dispatch F32xF16 dot: AVX512 -> AVX2 -> scalar.
 #[inline]
 pub fn f16_dot_dispatch(a: &[f32], b_f16: &[u8], k: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]

@@ -1,4 +1,4 @@
-//! Verus-verified RoPE indexing — unbounded proofs
+//! Verus-verified RoPE indexing -- unbounded proofs
 //!
 //! Proves 4D tensor indexing with half_dim pairing (RoPE applies rotations
 //! to pairs of dimensions) and GPU thread decomposition.
@@ -70,7 +70,7 @@ proof fn rope_indices_in_bounds(
 }
 
 // ============================================================================
-// Proof: GPU RoPE thread decomposition — flat index decomposes into valid (s,h,d)
+// Proof: GPU RoPE thread decomposition -- flat index decomposes into valid (s,h,d)
 // ============================================================================
 
 proof fn gpu_rope_thread_decomposition_in_bounds(

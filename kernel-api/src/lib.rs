@@ -12,7 +12,7 @@ pub enum KernelError {
 
 pub type Result<T> = std::result::Result<T, KernelError>;
 
-// ── VerificationTier ────────────────────────────────────────────────────────
+// -- VerificationTier --------------------------------------------------------
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -24,7 +24,7 @@ pub enum VerificationTier {
     Proven,
 }
 
-// ── AttentionMode ──────────────────────────────────────────────────────────
+// -- AttentionMode ----------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -63,7 +63,7 @@ impl std::str::FromStr for AttentionMode {
     }
 }
 
-// ── Attention ───────────────────────────────────────────────────────────────
+// -- Attention ---------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 pub trait Attention: Send + Sync {
@@ -167,7 +167,7 @@ pub trait Attention: Send + Sync {
     }
 }
 
-// ── MatMul ──────────────────────────────────────────────────────────────────
+// -- MatMul ------------------------------------------------------------------
 
 pub trait MatMul: Send + Sync {
     fn forward(
@@ -195,12 +195,12 @@ pub trait MatMul: Send + Sync {
     }
 }
 
-// ── RMSNorm ─────────────────────────────────────────────────────────────────
+// -- RMSNorm -----------------------------------------------------------------
 
 pub trait RMSNorm: Send + Sync {
     fn forward(&self, x: &mut [f32], weight: &[f32], hidden_size: usize, eps: f32) -> Result<()>;
 
-    /// Fused RMSNorm + elementwise multiply, source → output.
+    /// Fused RMSNorm + elementwise multiply, source -> output.
     /// Reads from `x` (unchanged), writes normalized*weight to `out`.
     /// Eliminates the copy_from_slice that in-place callers need before forward().
     /// Default: copy then forward in-place.
@@ -221,7 +221,7 @@ pub trait RMSNorm: Send + Sync {
     }
 }
 
-// ── RoPE ────────────────────────────────────────────────────────────────────
+// -- RoPE --------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 pub trait RoPE: Send + Sync {
@@ -241,7 +241,7 @@ pub trait RoPE: Send + Sync {
     }
 }
 
-// ── Sampler ─────────────────────────────────────────────────────────────────
+// -- Sampler -----------------------------------------------------------------
 
 pub struct SamplingParams {
     pub temperature: f32,
@@ -300,7 +300,7 @@ pub trait Sampler: Send + Sync {
     }
 }
 
-// ── LayerNorm ───────────────────────────────────────────────────────────────
+// -- LayerNorm ---------------------------------------------------------------
 
 pub trait LayerNorm: Send + Sync {
     fn forward(
@@ -317,7 +317,7 @@ pub trait LayerNorm: Send + Sync {
     }
 }
 
-// ── AllReduce ───────────────────────────────────────────────────────────────
+// -- AllReduce ---------------------------------------------------------------
 
 pub trait AllReduce: Send + Sync {
     fn sum_in_place(&self, data: &mut [f32]) -> Result<()>;
@@ -327,7 +327,7 @@ pub trait AllReduce: Send + Sync {
     }
 }
 
-// ── KvCacheCompressor ───────────────────────────────────────────────────────
+// -- KvCacheCompressor -------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct CompressedKV {
@@ -358,7 +358,7 @@ pub trait KvCacheCompressor: Send + Sync {
     }
 }
 
-// ── MatMulQ (quantized) ─────────────────────────────────────────────────────
+// -- MatMulQ (quantized) -----------------------------------------------------
 
 pub const Q4K_BLOCK_SIZE: usize = 256;
 pub const Q4K_BLOCK_BYTES: usize = 144;
@@ -421,7 +421,7 @@ pub trait MatMulQ: Send + Sync {
         k: usize,
     ) -> Result<()>;
 
-    /// I2S matmul with pre-quantized activations — skips per-call quantization.
+    /// I2S matmul with pre-quantized activations -- skips per-call quantization.
     fn forward_i2s_preq(
         &self,
         preq_q8: &[i8],
@@ -446,7 +446,7 @@ pub trait MatMulQ: Send + Sync {
     ) -> Result<()>;
 }
 
-// ── Dequantize ──────────────────────────────────────────────────────────────
+// -- Dequantize --------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -482,7 +482,7 @@ pub trait Dequantize: Send + Sync {
     }
 }
 
-// ── GuidedDecoder ───────────────────────────────────────────────────────────
+// -- GuidedDecoder -----------------------------------------------------------
 
 pub trait GuidedDecoder: Send {
     fn mask_logits(&mut self, token_ids_so_far: &[u32], logits: &mut [f32]);
@@ -494,7 +494,7 @@ pub trait GuidedDecoder: Send {
     }
 }
 
-// ── DeltaNet (Gated Delta Rule) ────────────────────────────────────────
+// -- DeltaNet (Gated Delta Rule) ----------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 pub trait DeltaNet: Send + Sync {
@@ -533,7 +533,7 @@ pub trait DeltaNet: Send + Sync {
     }
 }
 
-// ── Verification contracts ─────────────────────────────────────────────────
+// -- Verification contracts -------------------------------------------------
 //
 // Shared trait contracts for struct invariants. Both the real implementation
 // and the Verus verification crate implement these traits, ensuring the
@@ -623,11 +623,11 @@ pub trait VerifiedDeltaNetState {
     }
 }
 
-// ── VerifiedEquivalent ─────────────────────────────────────────────────────
+// -- VerifiedEquivalent -----------------------------------------------------
 //
 // Implemented by any optimized kernel that has formal verification connecting
 // its output to a reference implementation `Ref`.  The dual-channel contract:
-// for all valid inputs, |self(input) - ref(input)| / |ref(input)| ≤ max_relative_error().
+// for all valid inputs, |self(input) - ref(input)| / |ref(input)| <= max_relative_error().
 //
 // Proof obligations (at least one required, cited in proof_name()):
 //   - A Kani harness proving the integer sub-computation is order-invariant

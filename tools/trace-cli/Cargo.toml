@@ -3,7 +3,7 @@ name = "tempura-trace"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "TUI viewer for tempura inference traces — the Wireshark of inference"
+description = "TUI viewer for tempura inference traces -- the Wireshark of inference"
 
 [[bin]]
 name = "tempura-trace"

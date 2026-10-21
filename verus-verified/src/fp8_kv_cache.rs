@@ -1,4 +1,4 @@
-//! Verus-verified FP8 paged KV cache invariants — unbounded proofs
+//! Verus-verified FP8 paged KV cache invariants -- unbounded proofs
 //!
 //! Proves: FP8 page buffer sizes (u8 not f32), paged append indexing for
 //! quantized KV, encode/decode field extraction, page_stride consistency.
@@ -8,7 +8,7 @@ use vstd::prelude::*;
 verus! {
 
 // ============================================================================
-// FP8 pages use u8 (1 byte per element vs 4 for f32) — 4x compression
+// FP8 pages use u8 (1 byte per element vs 4 for f32) -- 4x compression
 // ============================================================================
 
 proof fn fp8_compression_ratio(
@@ -110,7 +110,7 @@ proof fn fp8_encode_fits_u8(sign: u8, exp: u8, mantissa: u8)
         mantissa <= 7,
     ensures ({
         let byte = sign | (exp << 3u8) | mantissa;
-        // Always valid u8 — no overflow possible since sign|exp<<3|mant fits in 8 bits
+        // Always valid u8 -- no overflow possible since sign|exp<<3|mant fits in 8 bits
         byte <= 0xFFu8
     }),
 {

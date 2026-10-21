@@ -756,7 +756,7 @@ pub fn new_shared_prefix_cache(max_entries: usize) -> SharedPrefixCache {
     Arc::new(Mutex::new(PrefixCacheTable::new(max_entries)))
 }
 
-// ── Paged KV Cache ─────────────────────────────────────────────────────────
+// -- Paged KV Cache ---------------------------------------------------------
 
 pub const DEFAULT_BLOCK_SIZE: usize = 16;
 
@@ -1075,7 +1075,7 @@ impl PagedKvCache {
     }
 }
 
-// ── FP8 E4M3 KV Cache ──────────────────────────────────────────────────────
+// -- FP8 E4M3 KV Cache ------------------------------------------------------
 
 fn f32_to_fp8_e4m3(x: f32) -> u8 {
     let sign: u8 = if x.is_sign_negative() { 0x80 } else { 0 };
@@ -1112,7 +1112,7 @@ fn f32_to_fp8_e4m3(x: f32) -> u8 {
     // Round mantissa: f32 has 23 bits, E4M3 has 3 bits, drop 20 with rounding
     let mantissa = ((f32_frac + (1 << 19)) >> 20) as u8;
     if mantissa >= 8 {
-        // Mantissa overflow → increment exponent
+        // Mantissa overflow -> increment exponent
         let new_exp = e4m3_exp + 1;
         if new_exp > 14 {
             return sign | 0x7E;

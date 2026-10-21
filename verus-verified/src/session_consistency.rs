@@ -1,4 +1,4 @@
-//! Verus-verified session position consistency — unbounded proofs
+//! Verus-verified session position consistency -- unbounded proofs
 //!
 //! Proves that InferenceSession.position and cache.seq_len stay in sync
 //! across all session operations: new(), forward+advance, reset(), from_transfer().

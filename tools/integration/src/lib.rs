@@ -68,7 +68,7 @@ fn free_port() -> u16 {
 
 static SERVER_PORT: OnceLock<u16> = OnceLock::new();
 
-/// Shared server URL — starts one server instance for the whole test run.
+/// Shared server URL -- starts one server instance for the whole test run.
 pub fn shared_server_url() -> String {
     let port = SERVER_PORT.get_or_init(|| {
         let port = free_port();
@@ -169,7 +169,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        // 200 with a real model, 503 with stub (no weights loaded) — both are valid
+        // 200 with a real model, 503 with stub (no weights loaded) -- both are valid
         assert!(resp.status() == 200 || resp.status() == 503);
         if resp.status() == 200 {
             let body: serde_json::Value = resp.json().await.unwrap();
@@ -254,7 +254,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        // 200 with tokenizer, 4xx without tokenizer, 5xx if server error — all valid for stub
+        // 200 with tokenizer, 4xx without tokenizer, 5xx if server error -- all valid for stub
         assert!(
             r1.status().is_success()
                 || r1.status().is_client_error()

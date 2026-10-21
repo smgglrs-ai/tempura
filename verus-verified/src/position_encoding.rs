@@ -1,4 +1,4 @@
-//! Verus-verified position encoding invariants — unbounded proofs
+//! Verus-verified position encoding invariants -- unbounded proofs
 //!
 //! Proves: position array construction, position values within max_seq_len,
 //! RoPE position index safety, ALiBi slope computation.
@@ -88,7 +88,7 @@ proof fn position_after_decode(
 }
 
 // ============================================================================
-// RoPE frequency depends on position and dimension — both bounded
+// RoPE frequency depends on position and dimension -- both bounded
 // ============================================================================
 
 proof fn rope_freq_inputs(

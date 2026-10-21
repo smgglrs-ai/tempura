@@ -2,7 +2,7 @@
 // Every struct is #[repr(C)] so raw GGUF bytes can be reinterpreted safely.
 // Size constants are validated by const_assert! at the bottom.
 
-// ── Basic quants (QK = 32) ─────────────────────────────────────────────────
+// -- Basic quants (QK = 32) -------------------------------------------------
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -73,7 +73,7 @@ pub struct BlockQ8_1 {
 }
 pub const BLOCK_Q8_1_SIZE: usize = 36;
 
-// ── K-quants (QK_K = 256) ──────────────────────────────────────────────────
+// -- K-quants (QK_K = 256) --------------------------------------------------
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -110,8 +110,8 @@ pub const BLOCK_Q4K_SIZE: usize = 144;
 /// Layout (1152 bytes total):
 /// - d[8]:       f16 super-block scales, one per weight row
 /// - dmin[8]:    f16 super-block mins, one per weight row
-/// - scales[96]: 8×12 scale bytes interleaved by sub-block pair (24 bytes per sb pair)
-/// - qs[1024]:   8×128 nibble bytes interleaved in 8-byte chunks
+/// - scales[96]: 8x12 scale bytes interleaved by sub-block pair (24 bytes per sb pair)
+/// - qs[1024]:   8x128 nibble bytes interleaved in 8-byte chunks
 ///               [B0[0:8], B1[0:8], ..., B7[0:8], B0[8:16], ..., B7[24:32],
 ///                B0[32:40], ..., B7[56:64], ...] (one complete 256-byte sb, then next)
 #[repr(C)]
@@ -153,11 +153,11 @@ pub struct BlockQ8K {
 }
 pub const BLOCK_Q8K_SIZE: usize = 292;
 
-/// 4 Q8K activation rows interleaved for 4×8 GEMM with Q4Kx8 weights.
+/// 4 Q8K activation rows interleaved for 4x8 GEMM with Q4Kx8 weights.
 ///
 /// Layout (1168 bytes total, matches llama.cpp block_q8_Kx4):
 /// - d[4]:       f32 scales, one per activation row
-/// - qs[1024]:   4×256 int8 quants interleaved with blck_size_interleave=8:
+/// - qs[1024]:   4x256 int8 quants interleaved with blck_size_interleave=8:
 ///               groups of 32 bytes: 8 from row 0, 8 from row 1, 8 from row 2, 8 from row 3
 /// - bsums[64]:  per-16-element sums, index = row*4 + 16*(elem/64) + (elem/16)%4
 #[repr(C)]
@@ -187,7 +187,7 @@ impl std::fmt::Debug for BlockQ8K {
 /// - d[8]:       f16 super-block scales
 /// - dmin[8]:    f16 super-block mins
 /// - scales[128]: interleaved scale+min bytes; 16-byte groups per sub-block pair
-/// - qs[512]:    8×64 2-bit quants interleaved in 8-byte chunks
+/// - qs[512]:    8x64 2-bit quants interleaved in 8-byte chunks
 #[repr(C)]
 pub struct BlockQ2Kx8 {
     pub d: [u16; 8],
@@ -202,9 +202,9 @@ pub const BLOCK_Q2KX8_SIZE: usize = 672;
 /// Layout (1408 bytes total):
 /// - d[8]:      f16 super-block scales
 /// - dmin[8]:   f16 super-block mins
-/// - scales[96]: 8 × K_SCALE_SIZE(12) scale bytes, one per sub-block pair across 8 rows
-/// - qh[256]:   8×32 high-bit bytes interleaved in blck_size_interleave chunks
-/// - qs[1024]:  8×128 nibble bytes interleaved in blck_size_interleave chunks
+/// - scales[96]: 8 x K_SCALE_SIZE(12) scale bytes, one per sub-block pair across 8 rows
+/// - qh[256]:   8x32 high-bit bytes interleaved in blck_size_interleave chunks
+/// - qs[1024]:  8x128 nibble bytes interleaved in blck_size_interleave chunks
 #[repr(C)]
 pub struct BlockQ5Kx8 {
     pub d: [u16; 8],
@@ -231,12 +231,12 @@ pub struct BlockQ6Kx8 {
 }
 pub const BLOCK_Q6KX8_SIZE: usize = 1680;
 
-// ── Ternary quants (QK_K = 256) ────────────────────────────────────────────
+// -- Ternary quants (QK_K = 256) --------------------------------------------
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockTQ1_0 {
-    pub qs: [u8; 48], // base-3 packed: 5 trits per byte (256/5≈52, but 48+4=52 trits)
+    pub qs: [u8; 48], // base-3 packed: 5 trits per byte (256/5~=52, but 48+4=52 trits)
     pub qh: [u8; 4],  // 4 trits per byte (remaining 8 trits)
     pub d: u16,       // f16 scale
 }
@@ -250,7 +250,7 @@ pub struct BlockTQ2_0 {
 }
 pub const BLOCK_TQ2_0_SIZE: usize = 66;
 
-// ── Micro-FP quants ────────────────────────────────────────────────────────
+// -- Micro-FP quants --------------------------------------------------------
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -268,7 +268,7 @@ pub struct BlockNvfp4 {
 }
 pub const BLOCK_NVFP4_SIZE: usize = 36;
 
-// ── IQ (importance-based) quants ───────────────────────────────────────────
+// -- IQ (importance-based) quants -------------------------------------------
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -284,7 +284,7 @@ pub const BLOCK_IQ1S_SIZE: usize = 50;
 pub struct BlockIQ1M {
     pub qs: [u8; 32],    // grid indices
     pub qh: [u8; 16],    // high bits
-    pub scales: [u8; 8], // scales (no d field — uses iq1m_scale_t union)
+    pub scales: [u8; 8], // scales (no d field -- uses iq1m_scale_t union)
 }
 pub const BLOCK_IQ1M_SIZE: usize = 56;
 
@@ -352,7 +352,7 @@ pub struct BlockIQ4XS {
 }
 pub const BLOCK_IQ4XS_SIZE: usize = 136;
 
-// ── Size assertions ────────────────────────────────────────────────────────
+// -- Size assertions --------------------------------------------------------
 
 macro_rules! assert_block_size {
     ($ty:ty, $expected:expr) => {
@@ -396,7 +396,7 @@ assert_block_size!(BlockIQ3S, BLOCK_IQ3S_SIZE);
 assert_block_size!(BlockIQ4NL, BLOCK_IQ4NL_SIZE);
 assert_block_size!(BlockIQ4XS, BLOCK_IQ4XS_SIZE);
 
-// ── Block reinterpretation helpers ─────────────────────────────────────────
+// -- Block reinterpretation helpers -----------------------------------------
 
 pub fn cast_blocks<T: Copy>(data: &[u8], type_size: usize) -> &[T] {
     assert_eq!(std::mem::size_of::<T>(), type_size);

@@ -1,5 +1,5 @@
 //! Direct Rust translation of llama.cpp ggml/src/ggml-cpu/arch/x86/quants.c
-//! AVX-512 VNNI paths only — functions that use mul_sum_us8_pairs_float via dpbusd.
+//! AVX-512 VNNI paths only -- functions that use mul_sum_us8_pairs_float via dpbusd.
 //! The `#if defined(__AVX512VNNI__) && defined(__AVX512VL__)` variant of the helper
 //! replaces maddubs+madd with a single _mm256_dpbusd_epi32, benefiting q4_1 and q5_1.
 
@@ -9,7 +9,7 @@ use std::arch::x86_64::*;
 use super::blocks::*;
 use super::helpers::f16_to_f32;
 
-// ── Local helpers (same as in quants_llama.rs, private to this module) ────────
+// -- Local helpers (same as in quants_llama.rs, private to this module) --------
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -53,7 +53,7 @@ unsafe fn hsum_float_8(x: __m256) -> f32 {
     _mm_cvtss_f32(res)
 }
 
-// ── VNNI-accelerated mul_sum_us8_pairs_float ──────────────────────────────────
+// -- VNNI-accelerated mul_sum_us8_pairs_float ----------------------------------
 // C: #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
 //    const __m256i zero = _mm256_setzero_si256();
 //    const __m256i summed_pairs = _mm256_dpbusd_epi32(zero, ax, sy);
@@ -69,7 +69,7 @@ unsafe fn mul_sum_us8_pairs_float_vnni(ax: __m256i, sy: __m256i) -> __m256 {
     _mm256_cvtepi32_ps(summed_pairs)
 }
 
-// ── ggml_vec_dot_q4_1_q8_1 — AVX-512 VNNI path ───────────────────────────────
+// -- ggml_vec_dot_q4_1_q8_1 -- AVX-512 VNNI path -------------------------------
 // Same body as the AVX2 translation in quants_llama.rs but uses VNNI helper.
 // Source: line 859-916 of quants.c, shared #if defined(__AVX2__) || defined(__AVX__)
 // with d0d1 accumulation replaced by add+mul for the shared path, but fmadd is OK
@@ -106,7 +106,7 @@ pub unsafe fn ggml_vec_dot_q4_1_q8_1_vnni(
     hsum_float_8(acc) + summs
 }
 
-// ── ggml_vec_dot_q5_1_q8_1 — AVX-512 VNNI path ───────────────────────────────
+// -- ggml_vec_dot_q5_1_q8_1 -- AVX-512 VNNI path -------------------------------
 // Source: line 1222-1305 of quants.c, AVX2/AVX shared body.
 
 #[cfg(target_arch = "x86_64")]

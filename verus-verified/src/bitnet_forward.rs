@@ -1,4 +1,4 @@
-//! Verus-verified BitNet forward pass properties — unbounded proofs
+//! Verus-verified BitNet forward pass properties -- unbounded proofs
 //!
 //! Proves: INT8 activation quantization pipeline, I2S matmul dimension
 //! consistency, squared ReLU activation, and the BitNet-specific
@@ -21,7 +21,7 @@ proof fn i8_quantize_clamp(q: int)
 
 // ============================================================================
 // Act sum: sum of k INT8 values, each in [-128, 127]
-// For k=12288: sum in [-1572864, 1556736] — fits in i32
+// For k=12288: sum in [-1572864, 1556736] -- fits in i32
 // ============================================================================
 
 proof fn i8_act_sum_fits_i32(k: nat)
@@ -42,7 +42,7 @@ proof fn i8_act_sum_fits_i32(k: nat)
 }
 
 // ============================================================================
-// I2S matmul dimensions: a[m×k] × w_packed[n×k/4] → output[m×n]
+// I2S matmul dimensions: a[mxk] x w_packed[nxk/4] -> output[mxn]
 // ============================================================================
 
 proof fn bitnet_matmul_dims(
@@ -87,24 +87,24 @@ proof fn bitnet_a_row_index(m: nat, k: nat, i: nat)
 }
 
 // ============================================================================
-// Squared ReLU: relu(x)² = max(0, x)² ≥ 0 (always non-negative)
+// Squared ReLU: relu(x)^2 = max(0, x)^2 >= 0 (always non-negative)
 // ============================================================================
 
 proof fn squared_relu_non_negative()
     ensures
-        // For any x: max(0, x)² ≥ 0
-        // This is trivially true since squaring a real number is always ≥ 0
+        // For any x: max(0, x)^2 >= 0
+        // This is trivially true since squaring a real number is always >= 0
         true,
 {
 }
 
 // ============================================================================
-// Squared ReLU sparsity: x < 0 → relu(x)² = 0
+// Squared ReLU sparsity: x < 0 -> relu(x)^2 = 0
 // ============================================================================
 
 proof fn squared_relu_zero_for_negative()
     ensures
-        // If x < 0, then max(0, x) = 0, so max(0, x)² = 0
+        // If x < 0, then max(0, x) = 0, so max(0, x)^2 = 0
         true,
 {
 }
@@ -147,7 +147,7 @@ proof fn bitnet_same_shapes(
 }
 
 // ============================================================================
-// BitNet GGUF detection: model_type == "bitnet" → SquaredRelu + I2S quant
+// BitNet GGUF detection: model_type == "bitnet" -> SquaredRelu + I2S quant
 // ============================================================================
 
 proof fn bitnet_config_implies_i2s()

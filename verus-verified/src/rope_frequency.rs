@@ -1,4 +1,4 @@
-//! Verus-verified RoPE frequency computation — unbounded proofs
+//! Verus-verified RoPE frequency computation -- unbounded proofs
 //!
 //! Proves: frequency index stays within half_dim, position index
 //! stays within max_seq_len, paired dimensions don't overlap.

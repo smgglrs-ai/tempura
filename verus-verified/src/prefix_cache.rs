@@ -1,4 +1,4 @@
-//! Verus-verified PrefixCacheTable capacity and ref_count — unbounded proofs
+//! Verus-verified PrefixCacheTable capacity and ref_count -- unbounded proofs
 //!
 //! Proves: entries.len() <= max_entries after any store,
 //! ref_count tracks probe/release correctly,
@@ -20,7 +20,7 @@ pub open spec fn well_formed(cache: &PrefixCacheState) -> bool {
 }
 
 // ============================================================================
-// Proof: new() — empty cache, well-formed
+// Proof: new() -- empty cache, well-formed
 // ============================================================================
 
 proof fn new_is_well_formed(max_entries: nat)
@@ -34,7 +34,7 @@ proof fn new_is_well_formed(max_entries: nat)
 }
 
 // ============================================================================
-// Proof: store — eviction keeps num_entries <= max_entries
+// Proof: store -- eviction keeps num_entries <= max_entries
 // ============================================================================
 
 proof fn store_preserves_capacity(cache: PrefixCacheState)
@@ -54,7 +54,7 @@ proof fn store_preserves_capacity(cache: PrefixCacheState)
 }
 
 // ============================================================================
-// Proof: store when entry already exists — no size change (HashMap::insert replaces)
+// Proof: store when entry already exists -- no size change (HashMap::insert replaces)
 // ============================================================================
 
 proof fn store_existing_entry_no_growth(cache: PrefixCacheState)
@@ -68,7 +68,7 @@ proof fn store_existing_entry_no_growth(cache: PrefixCacheState)
 }
 
 // ============================================================================
-// Proof: probe increments ref_count — ref_count after probe >= 1
+// Proof: probe increments ref_count -- ref_count after probe >= 1
 // ============================================================================
 
 proof fn probe_increments_ref_count(ref_count_before: nat)
@@ -80,7 +80,7 @@ proof fn probe_increments_ref_count(ref_count_before: nat)
 }
 
 // ============================================================================
-// Proof: release decrements ref_count — saturating_sub prevents underflow
+// Proof: release decrements ref_count -- saturating_sub prevents underflow
 // ============================================================================
 
 proof fn release_saturating(ref_count_before: nat)
@@ -96,7 +96,7 @@ proof fn release_saturating(ref_count_before: nat)
 }
 
 // ============================================================================
-// Proof: probe+release roundtrip — ref_count returns to original
+// Proof: probe+release roundtrip -- ref_count returns to original
 // ============================================================================
 
 proof fn probe_release_roundtrip(ref_count: nat)

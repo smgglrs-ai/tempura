@@ -1,4 +1,4 @@
-//! Verus-verified weight shape validation — unbounded proofs
+//! Verus-verified weight shape validation -- unbounded proofs
 //!
 //! Proves: tensor dimensions in the LLaMA weight layout match the
 //! ModelConfig parameters. Any mismatch would cause OOB access in forward().
@@ -8,7 +8,7 @@ use vstd::prelude::*;
 verus! {
 
 // ============================================================================
-// Embedding: vocab_size × hidden_size
+// Embedding: vocab_size x hidden_size
 // ============================================================================
 
 proof fn embed_weight_shape(vocab_size: nat, hidden_size: nat)
@@ -20,7 +20,7 @@ proof fn embed_weight_shape(vocab_size: nat, hidden_size: nat)
 }
 
 // ============================================================================
-// Q projection: hidden_size × (num_heads * head_dim) = hidden_size²
+// Q projection: hidden_size x (num_heads * head_dim) = hidden_size^2
 // ============================================================================
 
 proof fn q_proj_weight_shape(
@@ -41,7 +41,7 @@ proof fn q_proj_weight_shape(
 }
 
 // ============================================================================
-// K/V projection: hidden_size × (num_kv_heads * head_dim) = hidden_size × kv_dim
+// K/V projection: hidden_size x (num_kv_heads * head_dim) = hidden_size x kv_dim
 // ============================================================================
 
 proof fn kv_proj_weight_shape(
@@ -66,7 +66,7 @@ proof fn kv_proj_weight_shape(
 }
 
 // ============================================================================
-// O projection: (num_heads * head_dim) × hidden_size = hidden_size²
+// O projection: (num_heads * head_dim) x hidden_size = hidden_size^2
 // ============================================================================
 
 proof fn o_proj_weight_shape(
@@ -87,7 +87,7 @@ proof fn o_proj_weight_shape(
 }
 
 // ============================================================================
-// Gate+Up (fused): hidden_size × (2 * intermediate_size)
+// Gate+Up (fused): hidden_size x (2 * intermediate_size)
 // ============================================================================
 
 proof fn gate_up_weight_shape(
@@ -106,7 +106,7 @@ proof fn gate_up_weight_shape(
 }
 
 // ============================================================================
-// Down projection: intermediate_size × hidden_size
+// Down projection: intermediate_size x hidden_size
 // ============================================================================
 
 proof fn down_proj_weight_shape(
@@ -122,7 +122,7 @@ proof fn down_proj_weight_shape(
 }
 
 // ============================================================================
-// LM head: hidden_size × vocab_size (may be tied to embedding)
+// LM head: hidden_size x vocab_size (may be tied to embedding)
 // ============================================================================
 
 proof fn lm_head_weight_shape(

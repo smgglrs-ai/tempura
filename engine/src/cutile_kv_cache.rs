@@ -7,8 +7,8 @@
 /// GPU layout: `k_device[layer]` is a flat 1-D tensor of
 /// `gpu_max_seq_len * kv_dim` f32 elements in interleaved layout
 /// `[gpu_max_seq_len, n_kv_heads, head_dim]`.  This matches the host mirror
-/// layout exactly, enabling a single D→D `cuMemcpyDtoDAsync` per new token
-/// per K or V per layer (2 copies total per layer), vs. the n_kv_heads × 2
+/// layout exactly, enabling a single D->D `cuMemcpyDtoDAsync` per new token
+/// per K or V per layer (2 copies total per layer), vs. the n_kv_heads x 2
 /// scatter copies that a per-head-contiguous layout would require.
 ///
 /// The GPU cache is populated by `append_device` and is reserved for a future
@@ -49,7 +49,7 @@ pub struct CutileKvCache {
     gpu_max_seq_len: usize,
     /// True when `append_device_gpu_only` has been called at least once since the
     /// last `sync_host_from_device`.  Signals that the host mirror is stale for
-    /// the tokens appended without a D→H update.
+    /// the tokens appended without a D->H update.
     host_stale: bool,
 }
 
@@ -141,14 +141,14 @@ impl CutileKvCache {
 
     /// Append `num_new_tokens` K/V tokens from device tensors for `layer`.
     ///
-    /// Updates both the host mirror (via D→H) and the flat GPU tensor (via
-    /// async D→D `cuMemcpyDtoDAsync`).  Callers must follow with
+    /// Updates both the host mirror (via D->H) and the flat GPU tensor (via
+    /// async D->D `cuMemcpyDtoDAsync`).  Callers must follow with
     /// `advance(num_new_tokens)` after processing all layers.
     ///
     /// `k_new` must hold `num_new_tokens * kv_dim` elements in the same
     /// interleaved layout as the host mirror.
     ///
-    /// The D→D copies are enqueued on the cache stream and complete before any
+    /// The D->D copies are enqueued on the cache stream and complete before any
     /// subsequent operation on the same stream, so no explicit sync is needed
     /// between `append_device` and downstream GPU operations.
     pub fn append_device(
@@ -160,7 +160,7 @@ impl CutileKvCache {
     ) -> Result<(), KernelError> {
         use cuda_core::sys::CUdeviceptr;
 
-        // Update host mirror (D→H).
+        // Update host mirror (D->H).
         let k_host_new: Vec<f32> = k_new
             .to_host_vec()
             .sync_on(&self.stream)
@@ -171,7 +171,7 @@ impl CutileKvCache {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         self.append_host(layer, &k_host_new, &v_host_new, num_new_tokens);
 
-        // GPU D→D: copy k_new/v_new into the flat GPU cache at the current
+        // GPU D->D: copy k_new/v_new into the flat GPU cache at the current
         // sequence offset.  One copy per K and one per V (not per head).
         // The GPU layout matches the host: [seq, kv_dim] interleaved.
         if self.seq_len + num_new_tokens > self.gpu_max_seq_len {
@@ -206,12 +206,12 @@ impl CutileKvCache {
         self.host_stale
     }
 
-    /// GPU-only KV append: skips the D→H host-mirror update entirely.
+    /// GPU-only KV append: skips the D->H host-mirror update entirely.
     ///
     /// For GPU decode paths where attention runs entirely on device, the host
-    /// mirror is never read — maintaining it burns 2 × n_layers D→H sync calls
+    /// mirror is never read -- maintaining it burns 2 x n_layers D->H sync calls
     /// (one per K, one per V per layer) per decode token, ~56 blocking transfers
-    /// for a 28-layer model.  Skipping the D→H update eliminates these.
+    /// for a 28-layer model.  Skipping the D->H update eliminates these.
     ///
     /// The host mirror becomes stale.  Callers MUST call `sync_host_from_device`
     /// before switching to the CPU attention fallback (long-context or prefill).
@@ -254,7 +254,7 @@ impl CutileKvCache {
     /// Rebuild the host mirror from the GPU cache for all layers up to `kv_len`.
     ///
     /// Must be called before switching to the CPU attention fallback after a
-    /// sequence of `append_device_gpu_only` calls.  Performs one D→H copy per K
+    /// sequence of `append_device_gpu_only` calls.  Performs one D->H copy per K
     /// and V per layer (blocking, on the shared CUDA stream).
     pub fn sync_host_from_device(&mut self, kv_len: usize) -> Result<(), KernelError> {
         let len = kv_len * self.kv_dim;
@@ -304,7 +304,7 @@ impl CutileKvCache {
 
     /// Roll back the KV cache to `target_seq_len` without touching device memory.
     ///
-    /// The K/V data at positions ≥ target_seq_len remains in device memory but is
+    /// The K/V data at positions >= target_seq_len remains in device memory but is
     /// considered logically overwritten on the next append.  This is safe because
     /// `append_device_gpu_only` always writes at `seq_len` (which we reset here),
     /// so subsequent appends will overwrite the stale positions.
@@ -367,7 +367,7 @@ impl CutileKvCache {
     /// device and return the resulting device tensors.
     ///
     /// The returned tensors are flat 1-D tensors of length `kv_len * kv_dim`
-    /// on the GPU — ready to pass to `CutileFlashAttention::forward_device`.
+    /// on the GPU -- ready to pass to `CutileFlashAttention::forward_device`.
     #[allow(clippy::type_complexity)]
     pub fn get_kv_device(
         &self,
@@ -503,7 +503,7 @@ mod tests {
             );
         }
 
-        // Verify GPU flat tensor (sync stream first to ensure D→D completed).
+        // Verify GPU flat tensor (sync stream first to ensure D->D completed).
         unsafe {
             stream.synchronize().unwrap();
         }

@@ -10,9 +10,9 @@
 //! structure and maps to intrinsics via `std::arch::x86_64`.
 //!
 //! **Coverage** (file is >3000 lines; focus is on x86 paths):
-//! - [`TinyBlasQ0Avx`] — Q4_0 × Q8_0, Q5_0 × Q8_0, Q8_0 × Q8_0, IQ4_NL × Q8_0  (full)
-//! - [`TinyBlasF32Avx2`] — F32 × F32 on AVX2 (full tiling, no threadpool dep)
-//! - [`llamafile_sgemm`] — entry-point type dispatch (x86 paths)
+//! - [`TinyBlasQ0Avx`] -- Q4_0 x Q8_0, Q5_0 x Q8_0, Q8_0 x Q8_0, IQ4_NL x Q8_0  (full)
+//! - [`TinyBlasF32Avx2`] -- F32 x F32 on AVX2 (full tiling, no threadpool dep)
+//! - [`llamafile_sgemm`] -- entry-point type dispatch (x86 paths)
 //! - ARM NEON (`tinyBLAS_Q0_ARM`): TODO
 //! - RISC-V RVV (`tinyBLAS_RVV`): TODO
 //! - PowerPC MMA (`tinyBLAS_PPC`, `tinyBLAS_Q0_PPC`, `tinyBLAS_HP16_PPC`): TODO
@@ -21,17 +21,17 @@ use super::blocks::{BlockIQ4NL, BlockQ4_0, BlockQ5_0, BlockQ8_0};
 use super::helpers::f16_to_f32;
 use super::types::GgmlType;
 
-// ─── Vectorized helpers ──────────────────────────────────────────────────────
+// --- Vectorized helpers ------------------------------------------------------
 //
 // These correspond to the `add`, `sub`, `mul`, `madd`, `hsum`, and `load`
-// template-specialization families in sgemm.cpp (lines 88–484).
+// template-specialization families in sgemm.cpp (lines 88-484).
 
 #[cfg(target_arch = "x86_64")]
 mod avx {
     use super::*;
     use std::arch::x86_64::*;
 
-    // ── hsum ──────────────────────────────────────────────────────────────────
+    // -- hsum ------------------------------------------------------------------
     // C++: inline float hsum(__m128 x) / hsum(__m256 x) / hsum(__m512 x)
 
     #[inline(always)]
@@ -56,7 +56,7 @@ mod avx {
         _mm512_reduce_add_ps(x)
     }
 
-    // ── madd ──────────────────────────────────────────────────────────────────
+    // -- madd ------------------------------------------------------------------
     // C++: inline __m256 madd(__m256 a, __m256 b, __m256 c) with FMA override
 
     #[inline(always)]
@@ -64,7 +64,7 @@ mod avx {
         _mm256_fmadd_ps(a, b, c)
     }
 
-    // ── updot ─────────────────────────────────────────────────────────────────
+    // -- updot -----------------------------------------------------------------
     // C++ lines 1754-1764: inline __m256 updot(__m256i u, __m256i s)
     // u is unsigned (abs), s is signed. Computes sum of u[i]*s[i] as f32.
     // Uses VNNI (_mm256_dpbusd_epi32) when available, fallback to maddubs+madd.
@@ -73,7 +73,7 @@ mod avx {
     pub unsafe fn updot(u: __m256i, s: __m256i) -> __m256 {
         // AVX-512VNNI + AVX-512VL path: use _mm256_dpbusd_epi32
         // We always fall through to the AVX2 maddubs path for portability.
-        // AVX2 fallback: maddubs (u8×i8→i16) then madd (i16×1→i32)
+        // AVX2 fallback: maddubs (u8xi8->i16) then madd (i16x1->i32)
         let res = _mm256_madd_epi16(
             _mm256_set1_epi16(1),
             _mm256_maddubs_epi16(u, s),
@@ -81,7 +81,7 @@ mod avx {
         _mm256_cvtepi32_ps(res)
     }
 
-    // ── denibble ──────────────────────────────────────────────────────────────
+    // -- denibble --------------------------------------------------------------
     // C++ lines 1766-1771: static inline __m256i denibble(const uint8_t *p)
     // Splits 16 packed-nibble bytes into 32 nibbles across 256 bits.
 
@@ -98,7 +98,7 @@ mod avx {
         )
     }
 
-    // ── bittobyte ─────────────────────────────────────────────────────────────
+    // -- bittobyte -------------------------------------------------------------
     // C++ lines 1773-1782: static inline __m256i bittobyte(const uint8_t *p)
     // Expands 32 bits from qh (Q5_0 high bits) to a mask per nibble.
 
@@ -124,7 +124,7 @@ mod avx {
         _mm256_andnot_si256(bytes, _mm256_set1_epi8(-16i8)) // ~bytes & 0xF0
     }
 
-    // ── Block loading helpers ─────────────────────────────────────────────────
+    // -- Block loading helpers -------------------------------------------------
     // C++ lines 1684-1752: type-specific load/load0/load1 methods.
 
     // block_q8_0 load: just load the 32 bytes of qs.
@@ -236,14 +236,14 @@ mod avx {
     }
 } // mod avx
 
-// ─── Trait for AVX2-loadable Q0 blocks ───────────────────────────────────────
+// --- Trait for AVX2-loadable Q0 blocks ---------------------------------------
 //
 // Corresponds to the load/load0/load1 method overloads in tinyBLAS_Q0_AVX.
 
 #[cfg(target_arch = "x86_64")]
 pub trait Q0BlockAvx {
     /// Load the quantized data as a 256-bit integer vector (32 int8 values).
-    /// For Q8_0: raw bytes. For Q4_0: denibbled − 8. For Q5_0: denibble | bittobyte.
+    /// For Q8_0: raw bytes. For Q4_0: denibbled ??? 8. For Q5_0: denibble | bittobyte.
     unsafe fn load_avx2(&self, iq4nlt: std::arch::x86_64::__m128i) -> std::arch::x86_64::__m256i;
     unsafe fn load0_sse(&self, iq4nlt: std::arch::x86_64::__m128i) -> std::arch::x86_64::__m128i;
     unsafe fn load1_sse(&self, iq4nlt: std::arch::x86_64::__m128i) -> std::arch::x86_64::__m128i;
@@ -322,11 +322,11 @@ impl Q0BlockAvx for BlockIQ4NL {
     fn scale(&self) -> u16 { self.d }
 }
 
-// ─── tinyBLAS_Q0_AVX ─────────────────────────────────────────────────────────
+// --- tinyBLAS_Q0_AVX ---------------------------------------------------------
 //
 // C++ lines 1353-1795: `template<typename TA, typename TB, typename TC> class tinyBLAS_Q0_AVX`
 //
-// Handles A ∈ {block_q8_0, block_q4_0, block_q5_0, block_iq4_nl} × B = block_q8_0.
+// Handles A ??? {block_q8_0, block_q4_0, block_q5_0, block_iq4_nl} x B = block_q8_0.
 // Output C is f32. Each "block" is one quantized chunk (QK=32 elements).
 // k = number of blocks (not elements). lda/ldb = row stride in blocks.
 // A is transposed: A[lda*(ii+i)+l] is the i-th weight row, l-th block.
@@ -375,17 +375,17 @@ impl<'a, A: Q0BlockAvx, B: Q0BlockAvx> TinyBlasQ0Avx<'a, A, B> {
         Self { a, b, c, k, lda, ldb, ldc, ith, nth, iq4nlt }
     }
 
-    /// C++ `matmul(m, n)` — entry point (line 1371).
+    /// C++ `matmul(m, n)` -- entry point (line 1371).
     pub fn matmul(&mut self, m: i64, n: i64) {
         self.mnpack(0, m, 0, n);
     }
 
-    // ── mnpack ────────────────────────────────────────────────────────────────
+    // -- mnpack ----------------------------------------------------------------
     // C++ lines 1376-1518: recursive tile-size dispatch via switch on
     // `(MIN(m-m0,4) << 4) | MIN(n-n0,4)`.
     //
-    // On 32-register CPUs (AVX-512 / ARM NEON) the maximum tile is 4×4.
-    // On 16-register CPUs (AVX2) the maximum tile is 4×2.
+    // On 32-register CPUs (AVX-512 / ARM NEON) the maximum tile is 4x4.
+    // On 16-register CPUs (AVX2) the maximum tile is 4x2.
     // The F16C+AVX2 fast paths (gemm4xN / gemmMx4) use vectorized delta loading.
     // We translate the AVX2 gemm4xN/gemmMx4 paths; the fallback generic<RM,RN> path
     // is also translated.
@@ -422,7 +422,7 @@ impl<'a, A: Q0BlockAvx, B: Q0BlockAvx> TinyBlasQ0Avx<'a, A, B> {
             _ => return,
         }
 
-        // AVX2 (16-register) path collapses 4x4/4x3/4x2 → 4x2, 3x4/2x4 → 2x4
+        // AVX2 (16-register) path collapses 4x4/4x3/4x2 -> 4x2, 3x4/2x4 -> 2x4
         #[cfg(not(target_feature = "avx512f"))]
         match key {
             0x44 | 0x43 | 0x42 => { mc = 4; nc = 2; unsafe { self.gemm4x_n::<2>(m0, m, n0, n); } }
@@ -447,10 +447,10 @@ impl<'a, A: Q0BlockAvx, B: Q0BlockAvx> TinyBlasQ0Avx<'a, A, B> {
         self.mnpack(m0, m, np, n);
     }
 
-    // ── gemm4xN ───────────────────────────────────────────────────────────────
+    // -- gemm4xN ---------------------------------------------------------------
     // C++ lines 1521-1574: `template<int RN> void gemm4xN(...)`
     //
-    // 4 A-rows × RN B-rows tile with vectorized F16C delta loading.
+    // 4 A-rows x RN B-rows tile with vectorized F16C delta loading.
     // Requires AVX2 + F16C (checked at call site).
     // The delta trick: pack 4 f16 scale values into a u64, convert with
     // `_mm_cvtph_ps(_mm_set_epi64x(0, delta))` in one instruction.
@@ -536,10 +536,10 @@ impl<'a, A: Q0BlockAvx, B: Q0BlockAvx> TinyBlasQ0Avx<'a, A, B> {
         }
     }
 
-    // ── gemmMx4 ───────────────────────────────────────────────────────────────
+    // -- gemmMx4 ---------------------------------------------------------------
     // C++ lines 1576-1631: `template<int RM> void gemmMx4(...)`
     //
-    // RM A-rows × 4 B-rows tile, symmetric to gemm4xN.
+    // RM A-rows x 4 B-rows tile, symmetric to gemm4xN.
 
     #[target_feature(enable = "avx2,f16c")]
     unsafe fn gemmm_x4<const RM: usize>(&mut self, m0: i64, m: i64, n0: i64, n: i64) {
@@ -617,7 +617,7 @@ impl<'a, A: Q0BlockAvx, B: Q0BlockAvx> TinyBlasQ0Avx<'a, A, B> {
         }
     }
 
-    // ── gemm (generic RM×RN) ─────────────────────────────────────────────────
+    // -- gemm (generic RMxRN) -------------------------------------------------
     // C++ lines 1634-1681: `template<int RM, int RN> NOINLINE void gemm(...)`
     //
     // Scalar-delta path: one f32 scale per (A row, B row) pair.
@@ -673,11 +673,11 @@ impl<'a, A: Q0BlockAvx, B: Q0BlockAvx> TinyBlasQ0Avx<'a, A, B> {
     }
 }
 
-// ─── tinyBLAS (F32 × F32, AVX2 path) ────────────────────────────────────────
+// --- tinyBLAS (F32 x F32, AVX2 path) ----------------------------------------
 //
 // C++ lines 484-642: `template<int KN, typename D, typename V, typename TA, typename TB, typename TC>`
 //
-// For F32 × F32:
+// For F32 x F32:
 //   - AVX-512: KN=16, V=__m512 (16 floats per register)
 //   - AVX2:    KN= 8, V=__m256 (8  floats per register)
 //   - ARM:     KN= 4, V=float32x4_t                          [TODO]
@@ -700,7 +700,7 @@ pub(super) fn block_size(m: i64, cap: i64) -> i64 {
     if m % nb == 0 { m / nb } else { m / nb + 1 }
 }
 
-/// F32 × F32 GEMM using AVX2 intrinsics.
+/// F32 x F32 GEMM using AVX2 intrinsics.
 ///
 /// Implements C++ `tinyBLAS<8, __m256, __m256, float, float, float>` (AVX2).
 ///
@@ -733,14 +733,14 @@ impl TinyBlasF32Avx2 {
         Self { a, b, c, k, lda, ldb, ldc, ith, nth }
     }
 
-    /// C++ `matmul(m, n)` — entry point (line 494).
+    /// C++ `matmul(m, n)` -- entry point (line 494).
     ///
     /// Chooses tile sizes based on m and register count.
     /// Returns false if k is not a multiple of the vector width (8 for AVX2).
     pub fn matmul(&self, m: i64, n: i64) -> bool {
         if self.k % 8 != 0 { return false; }
-        // AVX2: 16 registers → max RN=3 per C++ source (lines 514-530).
-        // For simplicity we use the 4×3 tile across all cases.
+        // AVX2: 16 registers -> max RN=3 per C++ source (lines 514-530).
+        // For simplicity we use the 4x3 tile across all cases.
         let size_n = block_size(n, 3);
         if m % 4 == 0 {
             unsafe { self.gemm_dispatch(m, n, size_n, 3); }
@@ -762,10 +762,10 @@ impl TinyBlasF32Avx2 {
         }
     }
 
-    // ── gemm_bloc<RM, RN> ─────────────────────────────────────────────────────
+    // -- gemm_bloc<RM, RN> -----------------------------------------------------
     // C++ lines 548-580.
     //
-    // Inner kernel: accumulate RN×RM dot products for one tile position.
+    // Inner kernel: accumulate RNxRM dot products for one tile position.
     // A and B rows are loaded in KN=8 float chunks (one __m256 per load).
 
     #[target_feature(enable = "avx2")]
@@ -812,7 +812,7 @@ impl TinyBlasF32Avx2 {
         }
     }
 
-    // ── gemm<RM, RN> (outer tiled loop) ──────────────────────────────────────
+    // -- gemm<RM, RN> (outer tiled loop) --------------------------------------
     // C++ lines 582-631: `template<int RM, int RN, int BM> NOINLINE void gemm(...)`
     //
     // We simplify BM=1 (no super-tiling) to avoid threadpool dependency.
@@ -837,7 +837,7 @@ impl TinyBlasF32Avx2 {
             if jj + RN as i64 <= n {
                 self.gemm_bloc::<RM, RN>(ii, jj);
             } else {
-                // Trailing columns — dispatch to smaller tile.
+                // Trailing columns -- dispatch to smaller tile.
                 match n - jj {
                     2 if RN >= 2 => self.gemm_bloc::<RM, 2>(ii, jj),
                     1 => self.gemm_bloc::<RM, 1>(ii, jj),
@@ -848,7 +848,7 @@ impl TinyBlasF32Avx2 {
     }
 }
 
-// ─── llamafile_sgemm ─────────────────────────────────────────────────────────
+// --- llamafile_sgemm ---------------------------------------------------------
 //
 // C++ lines 3805-4164: `bool llamafile_sgemm(const struct ggml_compute_params*,
 //     int64_t m, int64_t n, int64_t k,
@@ -863,16 +863,16 @@ impl TinyBlasF32Avx2 {
 
 /// High-performance tiled GEMM for LLM inference (prefill / n>1 path).
 ///
-/// Computes `C = Aᵀ * B` where A is stored transposed (weight matrix),
+/// Computes `C = A??? * B` where A is stored transposed (weight matrix),
 /// B is stored row-major (activation matrix), and C is row-major output.
 ///
-/// - `m`   — rows in A (transposed) and C
-/// - `n`   — columns in B and C
-/// - `k`   — blocks (not elements): columns in A, rows in B
-/// - `lda` — row stride of A in blocks
-/// - `ldb` — row stride of B in blocks
-/// - `ldc` — row stride of C in f32 elements
-/// - `ith` / `nth` — thread index / thread count
+/// - `m`   -- rows in A (transposed) and C
+/// - `n`   -- columns in B and C
+/// - `k`   -- blocks (not elements): columns in A, rows in B
+/// - `lda` -- row stride of A in blocks
+/// - `ldb` -- row stride of B in blocks
+/// - `ldc` -- row stride of C in f32 elements
+/// - `ith` / `nth` -- thread index / thread count
 ///
 /// Returns `true` if the matmul was handled, `false` to fall back to vec_dot.
 ///
@@ -913,7 +913,7 @@ pub unsafe fn llamafile_sgemm(
     #[cfg(target_arch = "x86_64")]
     {
         match a_type {
-            // ── F32 × F32 ─────────────────────────────────────────────────────
+            // -- F32 x F32 -----------------------------------------------------
             // C++ lines 3829-3891.
             GgmlType::F32 if b_type == GgmlType::F32 => {
                 #[cfg(target_feature = "avx2")]
@@ -931,7 +931,7 @@ pub unsafe fn llamafile_sgemm(
                 return false;
             }
 
-            // ── F16 × F16 ────────────────────────────────────────────────────
+            // -- F16 x F16 ----------------------------------------------------
             // C++ lines 3957-4039: tinyBLAS<8,__m256,__m256,fp16,fp16,float>
             // (AVX2+F16C) and tinyBLAS<16,__m512,__m512,fp16,fp16,float>
             // (AVX-512). Implemented in sgemm_llama2.
@@ -941,14 +941,14 @@ pub unsafe fn llamafile_sgemm(
                 );
             }
 
-            // ── BF16 paths ───────────────────────────────────────────────────
+            // -- BF16 paths ---------------------------------------------------
             // C++ lines 3893-3955: requires AVX-512BF16 _mm512_dpbf16_ps or
             // the 16-bit left-shift F32 widening trick. Not yet translated.
             GgmlType::BF16 => {
                 return false; // TODO: tinyBLAS BF16
             }
 
-            // ── Q8_0 × Q8_0 ──────────────────────────────────────────────────
+            // -- Q8_0 x Q8_0 --------------------------------------------------
             // C++ lines 4041-4076.
             GgmlType::Q8_0 if b_type == GgmlType::Q8_0 => {
                 #[cfg(target_feature = "avx2")]
@@ -971,7 +971,7 @@ pub unsafe fn llamafile_sgemm(
                 return false;
             }
 
-            // ── Q4_0 × Q8_0 ──────────────────────────────────────────────────
+            // -- Q4_0 x Q8_0 --------------------------------------------------
             // C++ lines 4078-4113.
             GgmlType::Q4_0 if b_type == GgmlType::Q8_0 => {
                 #[cfg(target_feature = "avx2")]
@@ -994,7 +994,7 @@ pub unsafe fn llamafile_sgemm(
                 return false;
             }
 
-            // ── Q5_0 × Q8_0 ──────────────────────────────────────────────────
+            // -- Q5_0 x Q8_0 --------------------------------------------------
             // C++ lines 4115-4130.
             GgmlType::Q5_0 if b_type == GgmlType::Q8_0 => {
                 #[cfg(target_feature = "avx2")]
@@ -1017,7 +1017,7 @@ pub unsafe fn llamafile_sgemm(
                 return false;
             }
 
-            // ── IQ4_NL × Q8_0 ────────────────────────────────────────────────
+            // -- IQ4_NL x Q8_0 ------------------------------------------------
             // C++ lines 4131-4145.
             GgmlType::IQ4NL if b_type == GgmlType::Q8_0 => {
                 #[cfg(target_feature = "avx2")]
@@ -1040,16 +1040,16 @@ pub unsafe fn llamafile_sgemm(
                 return false;
             }
 
-            // ── ARM NEON paths: tinyBLAS_Q0_ARM ──────────────────────────────
-            // C++ lines 1216-1352: handles Q4_0×Q8_0 and Q8_0×Q8_0 on ARM with
+            // -- ARM NEON paths: tinyBLAS_Q0_ARM ------------------------------
+            // C++ lines 1216-1352: handles Q4_0xQ8_0 and Q8_0xQ8_0 on ARM with
             // vdotq_s32 (ARMv8.2+ DOTPROD extension).
             // TODO: translate to std::arch::aarch64 intrinsics.
 
-            // ── RISC-V RVV paths: tinyBLAS_RVV ───────────────────────────────
+            // -- RISC-V RVV paths: tinyBLAS_RVV -------------------------------
             // C++ lines 646-1215: generic float GEMM on RISC-V vector extension.
             // TODO: translate to riscv intrinsics.
 
-            // ── PowerPC MMA paths: tinyBLAS_PPC / tinyBLAS_Q0_PPC ────────────
+            // -- PowerPC MMA paths: tinyBLAS_PPC / tinyBLAS_Q0_PPC ------------
             // C++ lines 1797-3775: complex MMA outer-product kernels for IBM POWER.
             // TODO: translate to __builtin_mma_* intrinsics via asm.
 
@@ -1061,7 +1061,7 @@ pub unsafe fn llamafile_sgemm(
     false
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
+// --- Tests --------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1088,9 +1088,9 @@ mod tests {
         BlockQ4_0 { d: f32_to_f16(scale), qs }
     }
 
-    // Basic smoke test: 1×1 GEMM with one block. Q8_0 × Q8_0 dot product.
-    // A[0] = {scale=1.0, qs=[1,0,...,0]} → sum = 1.
-    // B[0] = {scale=1.0, qs=[1,0,...,0]} → sum = 1.
+    // Basic smoke test: 1x1 GEMM with one block. Q8_0 x Q8_0 dot product.
+    // A[0] = {scale=1.0, qs=[1,0,...,0]} -> sum = 1.
+    // B[0] = {scale=1.0, qs=[1,0,...,0]} -> sum = 1.
     // Expected: C[0] = 1.0 * 1.0 * (1 * 1) = 1.0
     #[test]
     #[cfg(target_arch = "x86_64")]
@@ -1115,13 +1115,13 @@ mod tests {
         let _ = c[0]; // don't assert value for n=1 degenerate case
     }
 
-    // 2×2 GEMM: two A rows, two B rows, one block each.
+    // 2x2 GEMM: two A rows, two B rows, one block each.
     // A[0] = {1.0, [2,0,...,0]}, A[1] = {1.0, [0,3,0,...,0]}
     // B[0] = {1.0, [1,0,...,0]}, B[1] = {1.0, [0,1,0,...,0]}
     // C[B0][A0] = 1*1*(2*1) = 2.0
     // C[B0][A1] = 1*1*(0*1) = 0.0
     // C[B1][A0] = 1*1*(2*0) = 0.0
-    // C[B1][A1] = 1*1*(0*3*1) = 3.0  wait: A1[1]=3, B1[1]=1 → 3
+    // C[B1][A1] = 1*1*(0*3*1) = 3.0  wait: A1[1]=3, B1[1]=1 -> 3
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_q8_q8_2x2() {
@@ -1169,9 +1169,9 @@ mod tests {
         );
     }
 
-    // Q4_0 × Q8_0: verify that the denibble+subtract-8 path works.
-    // A block with qs=[0x88,...] → nibbles 8,8,... → after -8 → 0,0,... → dot = 0.
-    // A block with qs=[0x09,...] → low nibble 9→1, high nibble 0→-8.
+    // Q4_0 x Q8_0: verify that the denibble+subtract-8 path works.
+    // A block with qs=[0x88,...] -> nibbles 8,8,... -> after -8 -> 0,0,... -> dot = 0.
+    // A block with qs=[0x09,...] -> low nibble 9->1, high nibble 0->-8.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_q4_q8_smoke() {
@@ -1180,8 +1180,8 @@ mod tests {
         }
         // qs[i] encodes two 4-bit values: lo = qs & 0xF, hi = qs >> 4.
         // After denibble: 32 values in [0,15]. After -8: values in [-8,7].
-        // All-8 bytes → all nibbles = 8 → after -8 → 0 → dot product = 0.
-        let qs_a = [0x88u8; 16]; // all nibbles = 8 → after -8 = 0
+        // All-8 bytes -> all nibbles = 8 -> after -8 -> 0 -> dot product = 0.
+        let qs_a = [0x88u8; 16]; // all nibbles = 8 -> after -8 = 0
         let mut qs_b = [0i8; 32];
         qs_b[0] = 1;
         let a = [make_q4_0(2.0, qs_a)];
@@ -1196,7 +1196,7 @@ mod tests {
         assert!((c[0]).abs() < 1e-5, "expected 0, got {}", c[0]);
     }
 
-    // F32 × F32 via TinyBlasF32Avx2.
+    // F32 x F32 via TinyBlasF32Avx2.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_f32_f32_4x4() {
@@ -1205,11 +1205,11 @@ mod tests {
         }
         // A: 4 rows of 8 f32s (k=8, lda=8).
         // B: 4 rows of 8 f32s.
-        // C = Aᵀ * B (but A is already stored transposed so just dot rows).
-        // Each A row is all-1s; each B row is all-1s → dot = 8.
+        // C = A??? * B (but A is already stored transposed so just dot rows).
+        // Each A row is all-1s; each B row is all-1s -> dot = 8.
         let a: Vec<f32> = vec![1.0f32; 4 * 8];
         let b: Vec<f32> = vec![1.0f32; 4 * 8];
-        let mut c = vec![0.0f32; 4 * 4]; // 4×4 output, ldc=4
+        let mut c = vec![0.0f32; 4 * 4]; // 4x4 output, ldc=4
 
         let tb = TinyBlasF32Avx2::new(
             8,
@@ -1219,7 +1219,7 @@ mod tests {
             0, 1,
         );
         let ok = tb.matmul(4, 4);
-        assert!(ok, "expected matmul to handle 4×4 f32 case");
+        assert!(ok, "expected matmul to handle 4x4 f32 case");
 
         for j in 0..4 {
             for i in 0..4 {

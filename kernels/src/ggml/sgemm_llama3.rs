@@ -7,20 +7,20 @@
 //! This file covers all architecture paths **not** handled by `sgemm_llama.rs`
 //! (x86 AVX2/AVX-512) or `sgemm_llama2.rs` (x86 F16/BF16):
 //!
-//! - [`TinyBlasQ0Arm`]    — ARM NEON + DOTPROD: Q8_0×Q8_0 and Q4_0×Q8_0
-//! - [`TinyBlasF32Neon`]  — ARM NEON: F32×F32 (KN=4, float32x4_t)
-//! - [`TinyBlasF16Neon`]  — ARM NEON FP16: F16×F16 (KN=8, float16x8_t)
-//! - [`TinyBlasScalar`]   — portable scalar fallback (KN=1), used when no
+//! - [`TinyBlasQ0Arm`]    -- ARM NEON + DOTPROD: Q8_0xQ8_0 and Q4_0xQ8_0
+//! - [`TinyBlasF32Neon`]  -- ARM NEON: F32xF32 (KN=4, float32x4_t)
+//! - [`TinyBlasF16Neon`]  -- ARM NEON FP16: F16xF16 (KN=8, float16x8_t)
+//! - [`TinyBlasScalar`]   -- portable scalar fallback (KN=1), used when no
 //!                          SIMD is available on any architecture
-//! - PowerPC MMA paths    — stubbed: Rust has no stable `__builtin_mma_*`
+//! - PowerPC MMA paths    -- stubbed: Rust has no stable `__builtin_mma_*`
 //!                          intrinsics; full translation left as TODO
-//! - RISC-V RVV paths     — stubbed: Rust RISC-V V extension intrinsics are
+//! - RISC-V RVV paths     -- stubbed: Rust RISC-V V extension intrinsics are
 //!                          unstable (nightly only); full translation TODO
 //!
 //! Architecture guards follow the C++ source conventions:
-//! - `#[cfg(target_arch = "aarch64")]` → ARM NEON / DOTPROD paths
-//! - `#[cfg(target_arch = "powerpc64")]` → PowerPC MMA stubs
-//! - `#[cfg(target_arch = "riscv64")]`   → RISC-V RVV stubs
+//! - `#[cfg(target_arch = "aarch64")]` -> ARM NEON / DOTPROD paths
+//! - `#[cfg(target_arch = "powerpc64")]` -> PowerPC MMA stubs
+//! - `#[cfg(target_arch = "riscv64")]`   -> RISC-V RVV stubs
 
 #[allow(unused_imports)]
 use super::blocks::{BlockQ4_0, BlockQ8_0};
@@ -29,18 +29,18 @@ use super::helpers::f16_to_f32;
 use super::sgemm_llama::block_size;
 use super::types::GgmlType;
 
-// ─── Scalar fallback ─────────────────────────────────────────────────────────
+// --- Scalar fallback ---------------------------------------------------------
 //
 // C++: tinyBLAS<1, float, float, float, float, float> specialisation.
 // Used when no SIMD extension is available.  The same tile-scheduling logic
 // applies; V is just `f32` and KN=1.
 //
-// C++ lines 484–642.
+// C++ lines 484-642.
 
-/// Scalar (non-SIMD) F32×F32 GEMM.
+/// Scalar (non-SIMD) F32xF32 GEMM.
 ///
 /// Implements `tinyBLAS<1, float, float, float, float, float>` from
-/// `sgemm.cpp` lines 484–642. Used as a fallback on architectures where no
+/// `sgemm.cpp` lines 484-642. Used as a fallback on architectures where no
 /// SIMD kernel is available.
 pub struct TinyBlasScalar {
     a: *const f32,
@@ -65,7 +65,7 @@ impl TinyBlasScalar {
         Self { a, b, c, k, lda, ldb, ldc, ith, nth }
     }
 
-    /// C++: `tinyBLAS::matmul(m, n)` — scalar specialisation, KN=1.
+    /// C++: `tinyBLAS::matmul(m, n)` -- scalar specialisation, KN=1.
     ///
     /// Returns `false` when no tile size fits (m not a multiple of 4).
     pub fn matmul(&self, m: i64, n: i64) -> bool {
@@ -77,7 +77,7 @@ impl TinyBlasScalar {
         true
     }
 
-    // C++: `mnpack<RM=4, RN, BM>` — dispatch to tile function.
+    // C++: `mnpack<RM=4, RN, BM>` -- dispatch to tile function.
     unsafe fn gemm_dispatch(&self, m: i64, n: i64, size_n: i64) {
         match size_n {
             3 => self.gemm::<4, 3>(m, n),
@@ -86,7 +86,7 @@ impl TinyBlasScalar {
         }
     }
 
-    // C++: `gemm<RM, RN, BM>` — tile loop with work-stealing.
+    // C++: `gemm<RM, RN, BM>` -- tile loop with work-stealing.
     // For the scalar path BM=1 to keep register pressure low.
     unsafe fn gemm<const RM: usize, const RN: usize>(&self, m: i64, n: i64) {
         debug_assert_eq!(m % RM as i64, 0);
@@ -104,7 +104,7 @@ impl TinyBlasScalar {
         }
     }
 
-    // C++: `gemm_bloc<RM, RN>` — compute one RM×RN output tile.
+    // C++: `gemm_bloc<RM, RN>` -- compute one RMxRN output tile.
     unsafe fn gemm_bloc<const RM: usize, const RN: usize>(&self, ii: i64, jj: i64) {
         let mut cv = [[0.0f32; RM]; RN];
         let mut l = 0i64;
@@ -126,19 +126,19 @@ impl TinyBlasScalar {
     }
 }
 
-// ─── ARM NEON paths ───────────────────────────────────────────────────────────
+// --- ARM NEON paths -----------------------------------------------------------
 
-// C++ lines 105–115: ARM NEON add/sub/mul helpers for float32x4_t / float16x8_t
-// C++ lines 163–174: ARM FMA (vfmaq_f32 / vfmaq_f16) madd specialisations
-// C++ lines 231–242: ARM NEON hsum (vaddvq_f32)
-// C++ lines 304–316: ARM NEON load<float32x4_t>(float*) and load<float16x8_t>(ggml_fp16_t*)
+// C++ lines 105-115: ARM NEON add/sub/mul helpers for float32x4_t / float16x8_t
+// C++ lines 163-174: ARM FMA (vfmaq_f32 / vfmaq_f16) madd specialisations
+// C++ lines 231-242: ARM NEON hsum (vaddvq_f32)
+// C++ lines 304-316: ARM NEON load<float32x4_t>(float*) and load<float16x8_t>(ggml_fp16_t*)
 
-// ── F32×F32 on NEON (KN=4) ───────────────────────────────────────────────────
+// -- F32xF32 on NEON (KN=4) ---------------------------------------------------
 
-/// F32×F32 GEMM on ARM NEON.
+/// F32xF32 GEMM on ARM NEON.
 ///
 /// Implements `tinyBLAS<4, float32x4_t, float32x4_t, float, float, float>`
-/// from `sgemm.cpp` lines 3844–3851.
+/// from `sgemm.cpp` lines 3844-3851.
 ///
 /// Requires: m % 4 == 0, k % 4 == 0.
 #[cfg(target_arch = "aarch64")]
@@ -166,7 +166,7 @@ impl TinyBlasF32Neon {
         Self { a, b, c, k, lda, ldb, ldc, ith, nth }
     }
 
-    /// C++: `tinyBLAS::matmul` — ARM NEON F32 path.
+    /// C++: `tinyBLAS::matmul` -- ARM NEON F32 path.
     ///
     /// Returns `false` if k is not a multiple of 4 (vector width) or m not a
     /// multiple of 4, or n < 4.
@@ -175,7 +175,7 @@ impl TinyBlasF32Neon {
         if self.k % 4 != 0 { return false; }
         if m % 4 != 0 { return false; }
         // VECTOR_REGISTERS == 32 on NEON (ARM has 32 NEON registers).
-        // C++: uses 4×3 tile with BN=12 at the outer level.
+        // C++: uses 4x3 tile with BN=12 at the outer level.
         let size_n = block_size(n, 6);
         unsafe { self.gemm_dispatch(m, n, size_n); }
         true
@@ -207,7 +207,7 @@ impl TinyBlasF32Neon {
         }
     }
 
-    // C++: `gemm_bloc<RM, RN>` — one RM×RN tile using float32x4_t.
+    // C++: `gemm_bloc<RM, RN>` -- one RMxRN tile using float32x4_t.
     // KN=4: each load reads 4 floats.
     #[target_feature(enable = "neon")]
     unsafe fn gemm_bloc<const RM: usize, const RN: usize>(&self, ii: i64, jj: i64) {
@@ -235,12 +235,12 @@ impl TinyBlasF32Neon {
     }
 }
 
-// ── F16×F16 on NEON FP16 (KN=8) ─────────────────────────────────────────────
+// -- F16xF16 on NEON FP16 (KN=8) ---------------------------------------------
 
-/// F16×F16 GEMM on ARM NEON with FP16 arithmetic.
+/// F16xF16 GEMM on ARM NEON with FP16 arithmetic.
 ///
 /// Implements `tinyBLAS<8, float16x8_t, float16x8_t, ggml_fp16_t, ggml_fp16_t, float>`
-/// from `sgemm.cpp` lines 3974–3983.
+/// from `sgemm.cpp` lines 3974-3983.
 ///
 /// Requires `__ARM_FEATURE_FP16_VECTOR_ARITHMETIC` (e.g. Cortex-A55+, Apple M1).
 /// Rust target feature: `fp16`.
@@ -313,19 +313,19 @@ impl TinyBlasF16Neon {
     // KN=8: load 8 f16 values, accumulate into float16x8_t, hsum at end.
     // The C++ hsum for float16x8_t is: vaddvq_f32(vaddq_f32(vcvt_f32_f16(vget_low_f16(x)),
     //                                              vcvt_f32_f16(vget_high_f16(x))))
-    // TODO: verify intrinsics — `float16x8_t` requires `target_feature = "fp16"` which
+    // TODO: verify intrinsics -- `float16x8_t` requires `target_feature = "fp16"` which
     // is not yet stable in Rust. This implementation widens to f32 on load as a
     // portable fallback that is correct but not as efficient as the C++ version.
     #[target_feature(enable = "neon")]
     unsafe fn gemm_bloc<const RM: usize, const RN: usize>(&self, ii: i64, jj: i64) {
         use std::arch::aarch64::*;
-        // Widen f16→f32 on load and accumulate in f32 (portable fallback).
+        // Widen f16->f32 on load and accumulate in f32 (portable fallback).
         // The C++ FP16 path accumulates in float16x8_t for higher throughput;
-        // the f32 accumulation is numerically more accurate but ~2× fewer lanes.
+        // the f32 accumulation is numerically more accurate but ~2x fewer lanes.
         let mut cv = [[vdupq_n_f32(0.0f32); RM]; RN];
         let mut l = 0i64;
         while l < self.k {
-            // Load f16×8, widen low/high halves to f32×4 each.
+            // Load f16x8, widen low/high halves to f32x4 each.
             let load_wide = |ptr: *const u16| -> [float32x4_t; 2] {
                 let raw = vld1q_u16(ptr);
                 let lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(raw)));
@@ -356,12 +356,12 @@ impl TinyBlasF16Neon {
     }
 }
 
-// ── F16→F32 widening path on plain NEON (no FP16 arithmetic) ─────────────────
+// -- F16->F32 widening path on plain NEON (no FP16 arithmetic) -----------------
 
-/// F16×F32 GEMM on ARM NEON without FP16 arithmetic support.
+/// F16xF32 GEMM on ARM NEON without FP16 arithmetic support.
 ///
 /// Implements `tinyBLAS<4, float32x4_t, float32x4_t, ggml_fp16_t, float, float>`
-/// from `sgemm.cpp` lines 3984–3991.
+/// from `sgemm.cpp` lines 3984-3991.
 ///
 /// A rows are f16 (widened to f32 on load). B rows are already f32.
 /// Used when `__ARM_FEATURE_FP16_VECTOR_ARITHMETIC` is unavailable.
@@ -433,7 +433,7 @@ impl TinyBlasF16F32Neon {
         let mut cv = [[vdupq_n_f32(0.0f32); RM]; RN];
         let mut l = 0i64;
         while l < self.k {
-            // Load 4 f16 values and widen to f32×4.
+            // Load 4 f16 values and widen to f32x4.
             let av: [float32x4_t; RM] = std::array::from_fn(|i| {
                 let p = self.a.offset((self.lda * (ii + i as i64) + l) as isize);
                 vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(p)))
@@ -455,16 +455,16 @@ impl TinyBlasF16F32Neon {
     }
 }
 
-// ── Quantised Q8_0 / Q4_0 on ARM DOTPROD ─────────────────────────────────────
+// -- Quantised Q8_0 / Q4_0 on ARM DOTPROD -------------------------------------
 
-/// Quantised (Q8_0 or Q4_0 × Q8_0) GEMM on ARM with DOTPROD.
+/// Quantised (Q8_0 or Q4_0 x Q8_0) GEMM on ARM with DOTPROD.
 ///
-/// Implements `tinyBLAS_Q0_ARM<TA>` from `sgemm.cpp` lines 1214–1348.
+/// Implements `tinyBLAS_Q0_ARM<TA>` from `sgemm.cpp` lines 1214-1348.
 ///
 /// Requires `__ARM_FEATURE_DOTPROD` (ARMv8.2+, all Apple Silicon, Cortex-A55+).
 ///
 /// The tile scheduler is the same as the original: `mnpack` dispatches to
-/// `gemm<RM, RN>` for tiles up to 3×3 outputs, then recurses for remainders.
+/// `gemm<RM, RN>` for tiles up to 3x3 outputs, then recurses for remainders.
 #[cfg(target_arch = "aarch64")]
 pub struct TinyBlasQ0Arm<TA> {
     a: *const TA,
@@ -495,7 +495,7 @@ impl<TA: Q0ArmBlock> TinyBlasQ0Arm<TA> {
         self.mnpack(0, m, 0, n);
     }
 
-    // C++: `tinyBLAS_Q0_ARM::mnpack` — recursive tile dispatch.
+    // C++: `tinyBLAS_Q0_ARM::mnpack` -- recursive tile dispatch.
     fn mnpack(&self, m0: i64, m: i64, n0: i64, n: i64) {
         let rm = (m - m0).min(3);
         let rn = (n - n0).min(3);
@@ -517,7 +517,7 @@ impl<TA: Q0ArmBlock> TinyBlasQ0Arm<TA> {
         self.mnpack(m0, m, np, n);
     }
 
-    // C++: `tinyBLAS_Q0_ARM::gemm<RM, RN>` — work-stealing tile loop.
+    // C++: `tinyBLAS_Q0_ARM::gemm<RM, RN>` -- work-stealing tile loop.
     #[target_feature(enable = "neon,dotprod")]
     unsafe fn gemm<const RM: usize, const RN: usize>(
         &self, m0: i64, m: i64, n0: i64, n: i64,
@@ -532,7 +532,7 @@ impl<TA: Q0ArmBlock> TinyBlasQ0Arm<TA> {
         for job in start..end {
             let ii = m0 + (job / xtiles) * RM as i64;
             let jj = n0 + (job % xtiles) * RN as i64;
-            // Cv[j][i]: RM×RN accumulators, one float32x4_t per output cell.
+            // Cv[j][i]: RMxRN accumulators, one float32x4_t per output cell.
             let mut cv = [[vdupq_n_f32(0.0f32); RM]; RN];
             // C++ inner loop: for l in 0..k.
             // Each block = QK8_0 (32) int8 values + one f16 scale.
@@ -594,7 +594,7 @@ unsafe fn scale_q8(b: *const BlockQ8_0) -> f32 {
 /// Trait that abstracts the per-block load and scale operations.
 ///
 /// C++: `load_lo(const TA*)` / `load_hi(const TA*)` template specialisations
-/// in `tinyBLAS_Q0_ARM` (sgemm.cpp lines 1320–1337).
+/// in `tinyBLAS_Q0_ARM` (sgemm.cpp lines 1320-1337).
 #[cfg(target_arch = "aarch64")]
 pub trait Q0ArmBlock {
     unsafe fn load_lo(p: *const Self) -> std::arch::aarch64::int8x16_t;
@@ -604,13 +604,13 @@ pub trait Q0ArmBlock {
 
 #[cfg(target_arch = "aarch64")]
 impl Q0ArmBlock for BlockQ8_0 {
-    // C++ lines 1320–1326: `load_lo(const block_q8_0 *b) = vld1q_s8(b->qs)`
+    // C++ lines 1320-1326: `load_lo(const block_q8_0 *b) = vld1q_s8(b->qs)`
     #[target_feature(enable = "neon")]
     unsafe fn load_lo(p: *const Self) -> std::arch::aarch64::int8x16_t {
         use std::arch::aarch64::*;
         vld1q_s8((*p).qs.as_ptr())
     }
-    // C++ lines 1324–1326: `load_hi(const block_q8_0 *b) = vld1q_s8(b->qs + 16)`
+    // C++ lines 1324-1326: `load_hi(const block_q8_0 *b) = vld1q_s8(b->qs + 16)`
     #[target_feature(enable = "neon")]
     unsafe fn load_hi(p: *const Self) -> std::arch::aarch64::int8x16_t {
         use std::arch::aarch64::*;
@@ -623,7 +623,7 @@ impl Q0ArmBlock for BlockQ8_0 {
 
 #[cfg(target_arch = "aarch64")]
 impl Q0ArmBlock for BlockQ4_0 {
-    // C++ lines 1328–1332:
+    // C++ lines 1328-1332:
     //   load_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vld1q_u8(b->qs), 0x0f)), 0x8)
     #[target_feature(enable = "neon")]
     unsafe fn load_lo(p: *const Self) -> std::arch::aarch64::int8x16_t {
@@ -633,7 +633,7 @@ impl Q0ArmBlock for BlockQ4_0 {
         let lo = vandq_u8(raw, mask);
         vsubq_s8(vreinterpretq_s8_u8(lo), vdupq_n_s8(0x8))
     }
-    // C++ lines 1334–1337:
+    // C++ lines 1334-1337:
     //   load_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(vld1q_u8(b->qs), 4)), 0x8)
     #[target_feature(enable = "neon")]
     unsafe fn load_hi(p: *const Self) -> std::arch::aarch64::int8x16_t {
@@ -647,9 +647,9 @@ impl Q0ArmBlock for BlockQ4_0 {
     }
 }
 
-// ─── PowerPC MMA stubs ────────────────────────────────────────────────────────
+// --- PowerPC MMA stubs --------------------------------------------------------
 //
-// C++ lines 1798–3804 implement `tinyBLAS_HP16_PPC` and `tinyBLAS_Q0_PPC`
+// C++ lines 1798-3804 implement `tinyBLAS_HP16_PPC` and `tinyBLAS_Q0_PPC`
 // using GCC/XL built-ins: `__builtin_mma_xvf16ger2pp`, `__builtin_mma_xvbf16ger2pp`,
 // `__builtin_mma_disassemble_acc`, `__builtin_vsx_lxvp`, etc.
 //
@@ -661,11 +661,11 @@ impl Q0ArmBlock for BlockQ4_0 {
 // Until then these structs are defined but `matmul` panics at runtime.
 // TODO: implement full PowerPC MMA kernels via asm! or C FFI.
 
-/// F32×F32 GEMM on PowerPC using MMA accumulator instructions.
+/// F32xF32 GEMM on PowerPC using MMA accumulator instructions.
 ///
-/// Stub for `tinyBLAS_PPC` from `sgemm.cpp` lines 3296–3803.
+/// Stub for `tinyBLAS_PPC` from `sgemm.cpp` lines 3296-3803.
 ///
-/// TODO: verify intrinsics — PowerPC MMA builtins not yet in stable Rust.
+/// TODO: verify intrinsics -- PowerPC MMA builtins not yet in stable Rust.
 #[cfg(target_arch = "powerpc64")]
 pub struct TinyBlasPpc {
     a: *const f32,
@@ -693,7 +693,7 @@ impl TinyBlasPpc {
 
     /// Falls back to scalar GEMM.  MMA path is not yet implemented in Rust.
     pub fn matmul(&self, m: i64, n: i64) {
-        // TODO: verify intrinsics — replace with MMA implementation.
+        // TODO: verify intrinsics -- replace with MMA implementation.
         let scalar = TinyBlasScalar::new(
             self.k,
             self.a, self.lda,
@@ -705,11 +705,11 @@ impl TinyBlasPpc {
     }
 }
 
-/// BF16/F16×BF16/F16 GEMM on PowerPC using MMA + xvf16ger2pp / xvbf16ger2pp.
+/// BF16/F16xBF16/F16 GEMM on PowerPC using MMA + xvf16ger2pp / xvbf16ger2pp.
 ///
-/// Stub for `tinyBLAS_HP16_PPC` from `sgemm.cpp` lines 1798–2418.
+/// Stub for `tinyBLAS_HP16_PPC` from `sgemm.cpp` lines 1798-2418.
 ///
-/// TODO: verify intrinsics — PowerPC MMA builtins not yet in stable Rust.
+/// TODO: verify intrinsics -- PowerPC MMA builtins not yet in stable Rust.
 #[cfg(target_arch = "powerpc64")]
 pub struct TinyBlasHp16Ppc {
     a: *const u16, // bf16 or f16 stored as raw u16
@@ -737,10 +737,10 @@ impl TinyBlasHp16Ppc {
 
     /// Falls back to scalar GEMM (f16 widened to f32).
     ///
-    /// TODO: verify intrinsics — replace with MMA xvf16ger2pp implementation.
+    /// TODO: verify intrinsics -- replace with MMA xvf16ger2pp implementation.
     pub fn matmul(&self, m: i64, n: i64) {
-        // Widen f16→f32 then call scalar kernel.
-        // This is correct but ~2× slower than the MMA path.
+        // Widen f16->f32 then call scalar kernel.
+        // This is correct but ~2x slower than the MMA path.
         let n_f32 = (m * self.lda).max(1) as usize;
         let mut a_f32 = vec![0.0f32; n_f32];
         for i in 0..n_f32 {
@@ -749,8 +749,8 @@ impl TinyBlasHp16Ppc {
         let scalar = TinyBlasScalar::new(
             self.k,
             a_f32.as_ptr(), self.lda,
-            // B widening omitted for brevity — this stub is not performance-critical.
-            // TODO: verify intrinsics — widen B and call proper MMA kernel.
+            // B widening omitted for brevity -- this stub is not performance-critical.
+            // TODO: verify intrinsics -- widen B and call proper MMA kernel.
             a_f32.as_ptr(), self.ldb,
             self.c, self.ldc,
             self.ith as i64, self.nth as i64,
@@ -759,11 +759,11 @@ impl TinyBlasHp16Ppc {
     }
 }
 
-/// Quantised Q8_0 / Q4_0 × Q8_0 GEMM on PowerPC using MMA.
+/// Quantised Q8_0 / Q4_0 x Q8_0 GEMM on PowerPC using MMA.
 ///
-/// Stub for `tinyBLAS_Q0_PPC` from `sgemm.cpp` lines 2419–3293.
+/// Stub for `tinyBLAS_Q0_PPC` from `sgemm.cpp` lines 2419-3293.
 ///
-/// TODO: verify intrinsics — PowerPC MMA builtins not yet in stable Rust.
+/// TODO: verify intrinsics -- PowerPC MMA builtins not yet in stable Rust.
 #[cfg(target_arch = "powerpc64")]
 pub struct TinyBlasQ0Ppc<TA> {
     a: *const TA,
@@ -789,18 +789,18 @@ impl<TA> TinyBlasQ0Ppc<TA> {
         Self { a, b, c, k, lda, ldb, ldc, ith, nth }
     }
 
-    /// Stub — always panics in debug, returns without computing in release.
+    /// Stub -- always panics in debug, returns without computing in release.
     ///
-    /// TODO: verify intrinsics — implement PowerPC MMA quant kernel.
+    /// TODO: verify intrinsics -- implement PowerPC MMA quant kernel.
     #[allow(unused_variables)]
     pub fn matmul(&self, m: i64, n: i64) {
-        debug_assert!(false, "TinyBlasQ0Ppc::matmul not yet implemented — PowerPC MMA intrinsics required");
+        debug_assert!(false, "TinyBlasQ0Ppc::matmul not yet implemented -- PowerPC MMA intrinsics required");
     }
 }
 
-// ─── RISC-V RVV stubs ─────────────────────────────────────────────────────────
+// --- RISC-V RVV stubs ---------------------------------------------------------
 //
-// C++ lines 644–1208 implement `tinyBLAS_RVV` using RISC-V Vector (RVV)
+// C++ lines 644-1208 implement `tinyBLAS_RVV` using RISC-V Vector (RVV)
 // intrinsics from <riscv_vector.h>: `__riscv_vle32_v_f32m*`,
 // `__riscv_vfmacc_vv_f32m*`, `__riscv_vfredusum_vs_f32m*_f32m1`, etc.
 //
@@ -808,14 +808,14 @@ impl<TA> TinyBlasQ0Ppc<TA> {
 // `#[target_feature(enable="v")]` and the `riscv_target_feature` unstable
 // feature.  A complete translation is therefore deferred.
 //
-// TODO: verify intrinsics — implement tinyBLAS_RVV once RISC-V V intrinsics
+// TODO: verify intrinsics -- implement tinyBLAS_RVV once RISC-V V intrinsics
 // are stable in Rust.
 
 /// RISC-V RVV GEMM stub.
 ///
-/// Implements `tinyBLAS_RVV<D, V, TA, TB, TC>` from `sgemm.cpp` lines 644–1208.
+/// Implements `tinyBLAS_RVV<D, V, TA, TB, TC>` from `sgemm.cpp` lines 644-1208.
 ///
-/// TODO: verify intrinsics — RISC-V V extension not yet stable in Rust.
+/// TODO: verify intrinsics -- RISC-V V extension not yet stable in Rust.
 #[cfg(target_arch = "riscv64")]
 pub struct TinyBlasRvv {
     a: *const f32,
@@ -843,7 +843,7 @@ impl TinyBlasRvv {
 
     /// Falls back to scalar GEMM.
     ///
-    /// TODO: verify intrinsics — replace with RVV vfmacc kernel.
+    /// TODO: verify intrinsics -- replace with RVV vfmacc kernel.
     pub fn matmul(&self, m: i64, n: i64) -> bool {
         let scalar = TinyBlasScalar::new(
             self.k,
@@ -856,9 +856,9 @@ impl TinyBlasRvv {
     }
 }
 
-// ─── Top-level dispatch for non-x86 architectures ────────────────────────────
+// --- Top-level dispatch for non-x86 architectures ----------------------------
 //
-// C++: `llamafile_sgemm` (sgemm.cpp lines 3805–4164) — the full switch for all
+// C++: `llamafile_sgemm` (sgemm.cpp lines 3805-4164) -- the full switch for all
 // Atype/Btype/Ctype combinations.  The x86 arms are in `sgemm_llama.rs` and
 // `sgemm_llama2.rs`; this function handles the remaining arms.
 
@@ -869,7 +869,7 @@ impl TinyBlasRvv {
 ///
 /// Corresponds to the `#elif defined(__ARM_NEON)`, `#elif defined(__MMA__)`,
 /// `#elif defined(__riscv_v_intrinsic)`, and `#else` arms of each `Atype`
-/// case in `llamafile_sgemm` (sgemm.cpp lines 3844–4113).
+/// case in `llamafile_sgemm` (sgemm.cpp lines 3844-4113).
 #[allow(unused_variables)]
 pub fn llamafile_sgemm_non_x86(
     m: i64, n: i64, k: i64,
@@ -885,13 +885,13 @@ pub fn llamafile_sgemm_non_x86(
     }
 
     match atype {
-        // ── F32 × F32 ────────────────────────────────────────────────────────
+        // -- F32 x F32 --------------------------------------------------------
         GgmlType::F32 => {
             if btype != GgmlType::F32 { return false; }
 
             #[cfg(target_arch = "aarch64")]
             {
-                // C++ sgemm.cpp line 3844–3851.
+                // C++ sgemm.cpp line 3844-3851.
                 if n < 4 { return false; }
                 let tb = TinyBlasF32Neon::new(
                     k,
@@ -905,7 +905,7 @@ pub fn llamafile_sgemm_non_x86(
 
             #[cfg(target_arch = "powerpc64")]
             {
-                // C++ sgemm.cpp line 3860–3869.
+                // C++ sgemm.cpp line 3860-3869.
                 if k % 8 != 0 { return false; }
                 let tb = TinyBlasPpc::new(
                     k,
@@ -920,7 +920,7 @@ pub fn llamafile_sgemm_non_x86(
 
             #[cfg(target_arch = "riscv64")]
             {
-                // C++ sgemm.cpp line 3870–3887.
+                // C++ sgemm.cpp line 3870-3887.
                 let tb = TinyBlasRvv::new(
                     k,
                     a as *const f32, lda,
@@ -931,19 +931,19 @@ pub fn llamafile_sgemm_non_x86(
                 return tb.matmul(m, n);
             }
 
-            // Scalar fallback — C++ line 3888–3890 (`#else return false`).
+            // Scalar fallback -- C++ line 3888-3890 (`#else return false`).
             // On a true scalar build there is no SIMD, so return false just
             // like the C++ source does.
             #[allow(unreachable_code)]
             false
         }
 
-        // ── F16 × F16 / F32 ──────────────────────────────────────────────────
+        // -- F16 x F16 / F32 --------------------------------------------------
         GgmlType::F16 => {
             #[cfg(target_arch = "aarch64")]
             {
                 if btype == GgmlType::F16 {
-                    // C++ sgemm.cpp lines 3974–3983: ARM FP16 vector path.
+                    // C++ sgemm.cpp lines 3974-3983: ARM FP16 vector path.
                     // We use the widening f32 fallback because float16x8_t
                     // accumulation requires `target_feature = "fp16"` which is
                     // nightly-only.  TODO: add #[cfg(target_feature = "fp16")]
@@ -959,7 +959,7 @@ pub fn llamafile_sgemm_non_x86(
                     return tb.matmul(m, n);
                 }
                 if btype == GgmlType::F32 {
-                    // C++ sgemm.cpp lines 3984–3991: plain NEON, widen F16→F32.
+                    // C++ sgemm.cpp lines 3984-3991: plain NEON, widen F16->F32.
                     let tb = TinyBlasF16F32Neon::new(
                         k,
                         a as *const u16, lda,
@@ -974,7 +974,7 @@ pub fn llamafile_sgemm_non_x86(
 
             #[cfg(target_arch = "powerpc64")]
             {
-                // C++ sgemm.cpp lines 4022–4036.
+                // C++ sgemm.cpp lines 4022-4036.
                 if btype != GgmlType::F16 { return false; }
                 if k % 8 != 0 { return false; }
                 let tb = TinyBlasHp16Ppc::new(
@@ -992,13 +992,13 @@ pub fn llamafile_sgemm_non_x86(
             false
         }
 
-        // ── Q8_0 × Q8_0 ──────────────────────────────────────────────────────
+        // -- Q8_0 x Q8_0 ------------------------------------------------------
         GgmlType::Q8_0 => {
             if btype != GgmlType::Q8_0 { return false; }
 
             #[cfg(target_arch = "aarch64")]
             {
-                // C++ sgemm.cpp lines 4052–4059.
+                // C++ sgemm.cpp lines 4052-4059.
                 let tb = TinyBlasQ0Arm::<BlockQ8_0>::new(
                     k,
                     a as *const BlockQ8_0, lda,
@@ -1012,7 +1012,7 @@ pub fn llamafile_sgemm_non_x86(
 
             #[cfg(target_arch = "powerpc64")]
             {
-                // C++ sgemm.cpp lines 4060–4072.
+                // C++ sgemm.cpp lines 4060-4072.
                 if (n < 8 && n != 4) || (m < 8 && m != 4) { return false; }
                 let tb = TinyBlasQ0Ppc::<BlockQ8_0>::new(
                     k,
@@ -1029,13 +1029,13 @@ pub fn llamafile_sgemm_non_x86(
             false
         }
 
-        // ── Q4_0 × Q8_0 ──────────────────────────────────────────────────────
+        // -- Q4_0 x Q8_0 ------------------------------------------------------
         GgmlType::Q4_0 => {
             if btype != GgmlType::Q8_0 { return false; }
 
             #[cfg(target_arch = "aarch64")]
             {
-                // C++ sgemm.cpp lines 4089–4096.
+                // C++ sgemm.cpp lines 4089-4096.
                 let tb = TinyBlasQ0Arm::<BlockQ4_0>::new(
                     k,
                     a as *const BlockQ4_0, lda,
@@ -1049,7 +1049,7 @@ pub fn llamafile_sgemm_non_x86(
 
             #[cfg(target_arch = "powerpc64")]
             {
-                // C++ sgemm.cpp lines 4097–4109.
+                // C++ sgemm.cpp lines 4097-4109.
                 if (n < 8 && n != 4) || (m < 8 && m != 4) { return false; }
                 let tb = TinyBlasQ0Ppc::<BlockQ4_0>::new(
                     k,
@@ -1076,13 +1076,13 @@ mod tests {
 
     #[test]
     fn scalar_gemm_2x2() {
-        // Simple 2×2 identity-ish check for the scalar path.
-        // A = [[1,0],[0,1]], B = [[2,0],[0,3]], C = Aᵀ * B = [[2,0],[0,3]]
+        // Simple 2x2 identity-ish check for the scalar path.
+        // A = [[1,0],[0,1]], B = [[2,0],[0,3]], C = A??? * B = [[2,0],[0,3]]
         let a = [1.0f32, 0.0, 0.0, 1.0];
         let b = [2.0f32, 0.0, 0.0, 3.0];
         let mut c = [0.0f32; 4];
         // Use k=2, m=2, n=2, lda=ldb=ldc=2.
-        // TinyBlasScalar requires m % 4 == 0, so use 4×4 test.
+        // TinyBlasScalar requires m % 4 == 0, so use 4x4 test.
         let a4 = [
             1.0f32, 0.0, 0.0, 0.0,
             0.0, 1.0, 0.0, 0.0,
@@ -1100,9 +1100,9 @@ mod tests {
             4, a4.as_ptr(), 4, b4.as_ptr(), 4, c4.as_mut_ptr(), 4, 0, 1,
         );
         assert!(tb.matmul(4, 4));
-        // C = Aᵀ*B; A is identity so C should equal B (column-major output).
+        // C = A???*B; A is identity so C should equal B (column-major output).
         // C[ldc*j + i] = sum_l A[lda*i+l] * B[ldb*j+l]
-        // A=I → C[j][i] = B[ldb*j + i]
+        // A=I -> C[j][i] = B[ldb*j + i]
         assert!((c4[0] - 2.0).abs() < 1e-5, "C[0][0] = {}", c4[0]);
         assert!((c4[5] - 3.0).abs() < 1e-5, "C[1][1] = {}", c4[5]);
         assert!((c4[10] - 5.0).abs() < 1e-5, "C[2][2] = {}", c4[10]);
@@ -1115,7 +1115,7 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn neon_f32_gemm_smoke() {
-        // Smoke test: 4×4 identity matmul on NEON.
+        // Smoke test: 4x4 identity matmul on NEON.
         let a: Vec<f32> = (0..16).map(|i| if i % 5 == 0 { 1.0 } else { 0.0 }).collect();
         let b: Vec<f32> = (0..16).map(|i| (i + 1) as f32).collect();
         let mut c = vec![0.0f32; 16];

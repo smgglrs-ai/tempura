@@ -1,5 +1,5 @@
 //! Direct translation of llama.cpp ggml-cpu/repack.cpp and arch/x86/repack.cpp.
-//! Q4_0 × Q8_0 GEMV/GEMM, Q8 quantization, and repacking routines.
+//! Q4_0 x Q8_0 GEMV/GEMM, Q8 quantization, and repacking routines.
 //!
 //! Sources:
 //! - ggml_quantize_mat_q8_0_4x8:   arch/x86/repack.cpp  lines 178-288
@@ -18,7 +18,7 @@ const QK4_0: usize = 32;
 const QK8_0: usize = 32;
 const QK_K: usize = 256;
 
-// ── New interleaved block structs ─────────────────────────────────────────────
+// -- New interleaved block structs ---------------------------------------------
 
 /// 8 Q4_0 blocks interleaved for 8-wide SIMD GEMV/GEMM (block<4,8> from repack.h).
 /// d[8]: f16 scales; qs[128]: 4-bit nibbles XOR'd with 0x88 per 8-byte chunk, interleaved.
@@ -32,7 +32,7 @@ pub struct BlockQ4_0x8 {
     pub qs: [i8; 128],
 }
 
-/// 4 Q8_0 blocks interleaved for 4×8 GEMM (block<8,4> from repack.h).
+/// 4 Q8_0 blocks interleaved for 4x8 GEMM (block<8,4> from repack.h).
 /// d[4]: f16 scales; qs[128]: 8-bit quants, 4-row interleaved in chunks.
 /// Total: 4*2 + 128 = 136 bytes.
 #[repr(C)]
@@ -42,7 +42,7 @@ pub struct BlockQ8_0x4 {
     pub qs: [i8; 128],
 }
 
-// ── Repacking ─────────────────────────────────────────────────────────────────
+// -- Repacking -----------------------------------------------------------------
 
 /// Direct translation of make_block_q4_0x8 (ggml-cpu/repack.cpp line 3128).
 /// Interleaves 8 Q4_0 blocks into BlockQ4_0x8 format.
@@ -109,7 +109,7 @@ pub fn make_block_q8_0x4(in_blocks: &[BlockQ8_0; 4], blck_size_interleave: usize
 }
 
 /// Direct translation of repack_q4_0_to_q4_0_8_bl (ggml-cpu/repack.cpp line 3790).
-/// Repacks a full weight matrix (nrow × nblocks Q4_0 blocks) into BlockQ4_0x8 format.
+/// Repacks a full weight matrix (nrow x nblocks Q4_0 blocks) into BlockQ4_0x8 format.
 /// nrow must be a multiple of 8; interleave_block must be 8.
 pub fn repack_q4_0_to_q4_0_8_bl(
     src: &[BlockQ4_0],
@@ -142,7 +142,7 @@ pub fn repack_q4_0_to_q4_0_8_bl(
     Ok(())
 }
 
-// ── AVX2 quantization ─────────────────────────────────────────────────────────
+// -- AVX2 quantization ---------------------------------------------------------
 
 /// Direct translation of ggml_quantize_mat_q8_0_4x8 (arch/x86/repack.cpp line 178).
 /// Quantizes 4 rows of fp32 into BlockQ8_0x4 format.
@@ -240,7 +240,7 @@ pub unsafe fn ggml_quantize_mat_q8_k_4x8(x: *const f32, vy: *mut u8, k: i64) {
     let nb = (k as usize) / QK_K;
     let y = vy as *mut BlockQ8Kx4;
 
-    // 8 sub-blocks of 32 floats per row per super-block → 32 AVX8 vectors per row
+    // 8 sub-blocks of 32 floats per row per super-block -> 32 AVX8 vectors per row
     let mut srcv: [[__m256; 32]; 4] = [[_mm256_setzero_ps(); 32]; 4];
     let mut iscale_vec = [_mm256_setzero_ps(); 4];
 
@@ -454,13 +454,13 @@ pub unsafe fn ggml_quantize_mat_q8_k_4x8(x: *const f32, vy: *mut u8, k: i64) {
     }
 }
 
-// ── AVX2 GEMV for Q4_0 × Q8_0 ────────────────────────────────────────────────
+// -- AVX2 GEMV for Q4_0 x Q8_0 ------------------------------------------------
 
-/// Inner AVX2 LUT GEMV kernel for Q4 (32-element blocks) × Q8_0.
+/// Inner AVX2 LUT GEMV kernel for Q4 (32-element blocks) x Q8_0.
 /// Direct translation of gemv_q4_b32_8x8_q8_0_lut_avx<block_q4_0x8>
 /// (arch/x86/repack.cpp lines 521-636).
 ///
-/// - s[y * nr + x * 8 .. +8] += Q4_0x8_block[x] · Q8_0_block[y]  (for all x, y)
+/// - s[y * nr + x * 8 .. +8] += Q4_0x8_block[x] * Q8_0_block[y]  (for all x, y)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
 unsafe fn gemv_q4_b32_8x8_q8_0_lut_avx(
@@ -488,13 +488,13 @@ unsafe fn gemv_q4_b32_8x8_q8_0_lut_avx(
             let mut acc_row = _mm256_setzero_ps();
 
             for b in 0..nb as isize {
-                // Load 4 × 32-byte chunks covering 8 interleaved blocks (128 bytes total)
+                // Load 4 x 32-byte chunks covering 8 interleaved blocks (128 bytes total)
                 let rhs_raw_0 = _mm256_loadu_si256((*b_ptr.offset(b)).qs.as_ptr() as *const __m256i);
                 let rhs_raw_1 = _mm256_loadu_si256((*b_ptr.offset(b)).qs.as_ptr().add(32) as *const __m256i);
                 let rhs_raw_2 = _mm256_loadu_si256((*b_ptr.offset(b)).qs.as_ptr().add(64) as *const __m256i);
                 let rhs_raw_3 = _mm256_loadu_si256((*b_ptr.offset(b)).qs.as_ptr().add(96) as *const __m256i);
 
-                // 4-bit → 8-bit with sign extension via LUT: low nibbles (elements 0-7,16-23)
+                // 4-bit -> 8-bit with sign extension via LUT: low nibbles (elements 0-7,16-23)
                 let rhs_vec_0123_0 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs_raw_0, m4b));
                 let rhs_vec_4567_0 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs_raw_1, m4b));
                 let rhs_vec_0123_1 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs_raw_2, m4b));
@@ -510,7 +510,7 @@ unsafe fn gemv_q4_b32_8x8_q8_0_lut_avx(
                 let col_scale_f32 = _mm256_cvtph_ps(
                     _mm_shuffle_epi8(_mm_loadu_si128((*b_ptr.offset(b)).d.as_ptr() as *const __m128i), changemask));
 
-                // Load and broadcast Q8_0 row scale (f16 → f32)
+                // Load and broadcast Q8_0 row scale (f16 -> f32)
                 let row_d_f16 = (*a_ptr.offset(b)).d;
                 let row_d_f32 = _mm_cvtss_f32(
                     _mm_cvtph_ps(_mm_insert_epi16(_mm_setzero_si128(), row_d_f16 as i32, 0))
@@ -574,7 +574,7 @@ unsafe fn gemv_q4_b32_8x8_q8_0_lut_avx(
     }
 }
 
-/// mul_sum_i8_pairs_acc_int32x8: acc += sign(x)*|x| · sign(x)*y via maddubs.
+/// mul_sum_i8_pairs_acc_int32x8: acc += sign(x)*|x| * sign(x)*y via maddubs.
 /// Direct translation of mul_sum_i8_pairs_acc_int32x8 (arch/x86/repack.cpp line 165).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -593,7 +593,7 @@ unsafe fn mul_sum_i8_pairs_acc_int32x8(
 }
 
 /// Direct translation of ggml_gemv_q4_0_8x8_q8_0 (arch/x86/repack.cpp line 1448).
-/// AVX2 GEMV: BlockQ4_0x8 weights × Q8_0 activations → float output.
+/// AVX2 GEMV: BlockQ4_0x8 weights x Q8_0 activations -> float output.
 ///
 /// Computes s[y * nr + x * 8 .. +8] for each activation row y and weight tile x.
 #[cfg(target_arch = "x86_64")]
@@ -609,15 +609,15 @@ pub unsafe fn ggml_gemv_q4_0_8x8_q8_0(
     gemv_q4_b32_8x8_q8_0_lut_avx(n, s, vx, vy, nr, nc, signextendlut);
 }
 
-// ── AVX2 GEMM for Q4_K × Q8_K (8×8, 4 rows at a time) ───────────────────────
+// -- AVX2 GEMM for Q4_K x Q8_K (8x8, 4 rows at a time) -----------------------
 
 /// Direct translation of ggml_gemm_q4_K_8x8_q8_K AVX2 path
 /// (arch/x86/repack.cpp lines 2042-end).
 ///
 /// Computes s[(y*4+m)*bs + x*8 .. +8] for m in 0..4, using:
-/// - vx: packed weights as BlockQ4Kx8, shape (nc/8) × nb blocks
-/// - vy: packed activations as BlockQ8Kx4, shape (nr/4) × nb blocks
-/// - s:  output floats, nr × nc
+/// - vx: packed weights as BlockQ4Kx8, shape (nc/8) x nb blocks
+/// - vy: packed activations as BlockQ8Kx4, shape (nr/4) x nb blocks
+/// - s:  output floats, nr x nc
 /// - bs: row stride in floats (typically = nc)
 /// - n:  token dimension (multiple of QK_K = 256)
 /// - nr: activation rows (multiple of 4)
@@ -935,15 +935,15 @@ pub unsafe fn ggml_gemm_q4_k_8x8_q8_k(
 
 /// AVX-VNNI variant of ggml_gemm_q4_k_8x8_q8_k.
 ///
-/// Replaces add4_maddubs (u8×i8→i16 with saturation) + madd_epi16 (i16×i16→i32 scale)
-/// with dpbusd_avx (u8×i8→i32 direct accumulation) + mullo_epi32 (i32×i32 scale).
+/// Replaces add4_maddubs (u8xi8->i16 with saturation) + madd_epi16 (i16xi16->i32 scale)
+/// with dpbusd_avx (u8xi8->i32 direct accumulation) + mullo_epi32 (i32xi32 scale).
 /// This eliminates the i16 intermediate, avoids saturation risk, and removes the
 /// madd_epi16 instruction that rustc schedules ~11 cycles worse than GCC.
 ///
 /// Correctness: dpbusd_avx(0, w_sp1, a_sp1)[k] + dpbusd_avx(0, w_sp2, a_sp2)[k]
 /// = add4_maddubs_sp1[2k] + add4_maddubs_sp1[2k+1] + add4_maddubs_sp2[2k] + add4_maddubs_sp2[2k+1]
 /// = madd_epi16(add_epi16(sp1, sp2), scale)[k] / scale  (without scale factor, same sum).
-/// scale_i32[k] = lower 16 bits of scale_i16 dword[k] (which is always (s, s) → s).
+/// scale_i32[k] = lower 16 bits of scale_i16 dword[k] (which is always (s, s) -> s).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni,f16c,fma")]
 pub unsafe fn ggml_gemm_q4_k_8x8_q8_k_avxvnni(
@@ -1099,7 +1099,7 @@ pub unsafe fn ggml_gemm_q4_k_8x8_q8_k_avxvnni(
                     let scale_0145_1 = _mm256_shuffle_epi32(scales_1, 68);
                     let scale_2367_1 = _mm256_shuffle_epi32(scales_1, 238);
 
-                    // Convert i16 scale pairs (s,s) per i32 dword → i32 scale (just lower 16 bits)
+                    // Convert i16 scale pairs (s,s) per i32 dword -> i32 scale (just lower 16 bits)
                     let si32_0145_0 = _mm256_and_si256(scale_0145_0, mask_lo16);
                     let si32_2367_0 = _mm256_and_si256(scale_2367_0, mask_lo16);
                     let si32_0145_1 = _mm256_and_si256(scale_0145_1, mask_lo16);
@@ -1175,8 +1175,8 @@ pub unsafe fn ggml_gemm_q4_k_8x8_q8_k_avxvnni(
                     let lhs_23_13_sp2 = _mm256_shuffle_epi32(lhs_mat_23_13, 245);
 
                     // VNNI: two independent accumulator chains (sp1=chain-A, sp2=chain-B).
-                    // OoO hardware runs A and B in parallel → 4×4=16-cycle critical path
-                    // instead of the previous 8×4=32-cycle serial chain.
+                    // OoO hardware runs A and B in parallel -> 4x4=16-cycle critical path
+                    // instead of the previous 8x4=32-cycle serial chain.
                     macro_rules! vnni_acc8 {
                         ($r0sp1:expr, $r1sp1:expr, $r2sp1:expr, $r3sp1:expr,
                          $r0sp2:expr, $r1sp2:expr, $r2sp2:expr, $r3sp2:expr,
@@ -1301,10 +1301,10 @@ pub unsafe fn ggml_gemm_q4_k_8x8_q8_k_avxvnni(
     }
 }
 
-/// AVX-512 VNNI variant: same 8×4 tile but packs sp1 (lower 256b) and sp2 (upper 256b)
+/// AVX-512 VNNI variant: same 8x4 tile but packs sp1 (lower 256b) and sp2 (upper 256b)
 /// into 512-bit registers so each `_mm512_dpbusd_epi32` processes both chains at once.
 /// Halves the dpbusd instruction count vs avxvnni (4 per group vs 8) while keeping the
-/// same 4×4=16-cycle critical path — sp1 and sp2 run in the lower/upper halves
+/// same 4x4=16-cycle critical path -- sp1 and sp2 run in the lower/upper halves
 /// of the same 512-bit pipeline slot simultaneously.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,avx512f,avx512bw,avx512vnni")]
@@ -1340,7 +1340,7 @@ pub unsafe fn ggml_gemm_q4_k_8x8_q8_k_avx512vnni(
 
     // 512-bit VNNI accumulator: packs sp1 (chain A, lower) and sp2 (chain B, upper)
     // into 512-bit operands so one dpbusd512 advances both chains simultaneously.
-    // Critical path: 4 × 4-cycle dpbusd512 = 16 cycles (A and B in parallel).
+    // Critical path: 4 x 4-cycle dpbusd512 = 16 cycles (A and B in parallel).
     macro_rules! vnni512_acc {
         ($r0sp1:expr, $r1sp1:expr, $r2sp1:expr, $r3sp1:expr,
          $r0sp2:expr, $r1sp2:expr, $r2sp2:expr, $r3sp2:expr,
@@ -1666,10 +1666,10 @@ unsafe fn add4_maddubs(
     )
 }
 
-// ── Scalar GEMM for Q4_K×8 × Q8_Kx4 with blocklen=4 ─────────────────────────
+// -- Scalar GEMM for Q4_Kx8 x Q8_Kx4 with blocklen=4 -------------------------
 
 /// Direct translation of ggml_gemm_q4_K_8x4_q8_K_generic (ggml-cpu/repack.cpp line 1949).
-/// Scalar reference implementation: Q4_Kx8 weights × Q8_Kx4 activations, blocklen=4.
+/// Scalar reference implementation: Q4_Kx8 weights x Q8_Kx4 activations, blocklen=4.
 pub fn ggml_gemm_q4_k_8x4_q8_k_generic(
     n:  usize,
     s:  *mut f32,
@@ -1693,7 +1693,7 @@ pub fn ggml_gemm_q4_k_8x4_q8_k_generic(
     let b_ptr_start = vx as *const BlockQ4Kx8;
     let a_ptr_start = vy as *const BlockQ8Kx4;
 
-    // f16 → f32 via bit manipulation (soft conversion)
+    // f16 -> f32 via bit manipulation (soft conversion)
     let f16_to_f32 = |bits: u16| -> f32 {
         let sign: u32   = ((bits as u32) >> 15) << 31;
         let exp: u32    = (((bits as u32) >> 10) & 0x1F).wrapping_sub(15).wrapping_add(127) << 23;
@@ -1806,7 +1806,7 @@ pub fn ggml_gemm_q4_k_8x4_q8_k_generic(
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// -- Tests ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1831,7 +1831,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<BlockQ8_0x4>(), 4 * 2 + 128);
     }
 
-    /// Verify VNNI variant produces identical results to AVX2 for a small Q4Kx8 × Q8Kx4 GEMM.
+    /// Verify VNNI variant produces identical results to AVX2 for a small Q4Kx8 x Q8Kx4 GEMM.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_vnni_vs_avx2_q4k_gemm() {
@@ -2032,7 +2032,7 @@ mod tests {
 
     #[test]
     fn test_repack_q4_0_requires_multiple_of_8() {
-        let src = vec![zero_block_q4_0(); 3]; // 3 rows × 1 block
+        let src = vec![zero_block_q4_0(); 3]; // 3 rows x 1 block
         let mut dst = Vec::new();
         let result = repack_q4_0_to_q4_0_8_bl(&src, 3, 1, 8, &mut dst);
         assert!(result.is_err());
@@ -2134,30 +2134,30 @@ mod kani_proofs {
     const QS_PER_BLOCK: usize = 1024; // BlockQ4Kx8::qs
     const SB_COUNT: usize = QK_K_KANI / 64; // = 4 sub-blocks per Q4K block
 
-    /// All index arithmetic for the 8×8 tile GEMM loop is within bounds.
+    /// All index arithmetic for the 8x8 tile GEMM loop is within bounds.
     ///
     /// The kernels iterate: y in 0..nr/4, x in 0..nc/8, b in 0..nb, sb in 0..QK_K/64.
     /// This harness fixes symbolic (y, x, b, sb) and proves every array index derived
     /// from them stays within the allocated weight/activation/output buffers.
     ///
-    /// Covers both the avxvnni and avx512vnni kernels — their outer loop structure
+    /// Covers both the avxvnni and avx512vnni kernels -- their outer loop structure
     /// and index formulas are identical; only the inner SIMD accumulation differs.
     #[kani::proof]
     fn q4kx8_tile_loop_index_in_bounds() {
         // nb = n / QK_K; constrain directly to avoid division before assume
         let nb: usize = kani::any();
-        kani::assume(nb >= 1 && nb <= 2); // n ∈ {256, 512}
+        kani::assume(nb >= 1 && nb <= 2); // n ??? {256, 512}
 
         // nr_div4 = nr / 4;  nc_div8 = nc / 8
         let nr_div4: usize = kani::any();
         let nc_div8: usize = kani::any();
-        kani::assume(nr_div4 >= 1 && nr_div4 <= 2); // nr ∈ {4, 8}
-        kani::assume(nc_div8 >= 1 && nc_div8 <= 2); // nc ∈ {8, 16}
+        kani::assume(nr_div4 >= 1 && nr_div4 <= 2); // nr ??? {4, 8}
+        kani::assume(nc_div8 >= 1 && nc_div8 <= 2); // nc ??? {8, 16}
 
         let nr = nr_div4 * 4;
         let nc = nc_div8 * 8;
 
-        // bs: output row stride (≥ nc)
+        // bs: output row stride (>= nc)
         let bs: usize = kani::any();
         kani::assume(bs >= nc && bs <= 32);
 
@@ -2174,9 +2174,9 @@ mod kani_proofs {
         kani::assume(sb < SB_COUNT);
         kani::assume(row < 4);
 
-        // ── Weight buffer (BlockQ4Kx8 array): nc_div8 × nb blocks ───────────
+        // -- Weight buffer (BlockQ4Kx8 array): nc_div8 x nb blocks -----------
         let total_weight_blocks = nc_div8 * nb;
-        // Kernel: b_ptr_start.add(x * nb).offset(b as isize)  →  x*nb + b
+        // Kernel: b_ptr_start.add(x * nb).offset(b as isize)  ->  x*nb + b
         let weight_block_idx = x * nb + b;
         assert!(weight_block_idx < total_weight_blocks);
 
@@ -2187,13 +2187,13 @@ mod kani_proofs {
         assert!(qs_base < QS_PER_BLOCK);
         assert!(qs_end  < QS_PER_BLOCK);
 
-        // ── Activation buffer (BlockQ8Kx4 array): nr_div4 × nb blocks ───────
+        // -- Activation buffer (BlockQ8Kx4 array): nr_div4 x nb blocks -------
         let total_act_blocks = nr_div4 * nb;
-        // Kernel: a_ptr_start.add(y * nb).offset(b as isize)  →  y*nb + b
+        // Kernel: a_ptr_start.add(y * nb).offset(b as isize)  ->  y*nb + b
         let act_block_idx = y * nb + b;
         assert!(act_block_idx < total_act_blocks);
 
-        // ── Output buffer (f32, shape nr × bs) ───────────────────────────────
+        // -- Output buffer (f32, shape nr x bs) -------------------------------
         let total_output = nr * bs;
         // Kernel: s.add((y*4 + row) * bs + x * 8) for row in 0..4
         let out_row_base = (y * 4 + row) * bs + x * 8;
@@ -2204,20 +2204,20 @@ mod kani_proofs {
 
     /// The parallel i32 VNNI accumulators cannot overflow for worst-case inputs.
     ///
-    /// The avxvnni kernel uses dpbusd: Σ (u8_weight × i8_act) accumulated into i32.
-    /// Per Q4K sub-block (64 elements × 8 columns = 512 products per acc lane):
-    ///   max_product = 15 × 127 = 1905   (4-bit weight ∈ [0,15], i8 act ∈ [-128,127])
-    ///   max_per_lane = 1905 × 512 = 975,360
+    /// The avxvnni kernel uses dpbusd: Sigma (u8_weight x i8_act) accumulated into i32.
+    /// Per Q4K sub-block (64 elements x 8 columns = 512 products per acc lane):
+    ///   max_product = 15 x 127 = 1905   (4-bit weight ??? [0,15], i8 act ??? [-128,127])
+    ///   max_per_lane = 1905 x 512 = 975,360
     ///
     /// Over all sub-blocks (4) and blocks (max 2):
-    ///   max total = 975,360 × 4 × 2 = 7,802,880 << i32::MAX (2,147,483,647)
+    ///   max total = 975,360 x 4 x 2 = 7,802,880 << i32::MAX (2,147,483,647)
     ///
     /// The avx512vnni path accumulates sp1 and sp2 independently in the lower and
-    /// upper 256 bits of a 512-bit register — each chain has the same bound.
+    /// upper 256 bits of a 512-bit register -- each chain has the same bound.
     #[kani::proof]
     fn q4kx8_parallel_accumulator_no_overflow() {
         let nb: usize = kani::any();
-        kani::assume(nb >= 1 && nb <= 8); // realistic: n/256 for n ≤ 2048
+        kani::assume(nb >= 1 && nb <= 8); // realistic: n/256 for n <= 2048
 
         let max_weight_nibble: i64 = 15;
         let max_act_i8: i64 = 127;
@@ -2239,16 +2239,16 @@ mod kani_proofs {
 
     /// Index safety for Q8Kx4 activation quantization (ggml_quantize_mat_q8_k_4x8).
     ///
-    /// The function reads from a f32 source of shape 4 rows × k elements and writes
+    /// The function reads from a f32 source of shape 4 rows x k elements and writes
     /// into a BlockQ8Kx4 array of nb = k/QK_K blocks.  Proves no OOB access.
     #[kani::proof]
     fn q4kx8_repack_q8k_index_in_bounds() {
         // nb = k / QK_K; avoid symbolic division by constraining nb directly
         let nb: usize = kani::any();
-        kani::assume(nb >= 1 && nb <= 2); // k ∈ {256, 512}
+        kani::assume(nb >= 1 && nb <= 2); // k ??? {256, 512}
         let k = nb * QK_K_KANI;
 
-        // Source array: 4 rows × k elements
+        // Source array: 4 rows x k elements
         let src_len = 4 * k;
 
         // chunk: index of 8-float AVX vector within one QK_K block
@@ -2272,7 +2272,7 @@ mod kani_proofs {
         // Destination BlockQ8Kx4 array: nb blocks, each written at index i
         assert!(i < nb);
 
-        // Within a BlockQ8Kx4, qs has 1024 bytes (4 rows × 256 elements).
+        // Within a BlockQ8Kx4, qs has 1024 bytes (4 rows x 256 elements).
         // Written in interleaved 8-byte groups: chunk selects the 32-byte group,
         // row selects the 8-byte lane within that group.
         let qs_chunk_base = chunk * 32 + row * 8;
@@ -2290,8 +2290,8 @@ mod kani_proofs {
         // Use derived values directly to avoid symbolic division before assumes
         let nr_div4: usize = kani::any();
         let nc_div8: usize = kani::any();
-        kani::assume(nr_div4 >= 1 && nr_div4 <= 2); // nr ∈ {4, 8}
-        kani::assume(nc_div8 >= 1 && nc_div8 <= 2); // nc ∈ {8, 16}
+        kani::assume(nr_div4 >= 1 && nr_div4 <= 2); // nr ??? {4, 8}
+        kani::assume(nc_div8 >= 1 && nc_div8 <= 2); // nc ??? {8, 16}
 
         let nr = nr_div4 * 4;
         let nc = nc_div8 * 8;

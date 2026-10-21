@@ -7,7 +7,7 @@
 //!
 //! Verification hierarchy:
 //!   - Kani: implementation properties (bounded model checking, e.g. max_seq_len<=8)
-//!   - Verus: implementation properties (deductive, unbounded — all N)
+//!   - Verus: implementation properties (deductive, unbounded -- all N)
 //!
 //! Proof categories:
 //!   - Indexing arithmetic (mirrors Kani harnesses): kv_cache, attention, rmsnorm,

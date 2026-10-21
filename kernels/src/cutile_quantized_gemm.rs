@@ -8,58 +8,58 @@ use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
 use cutile::tensor::{IntoPartition, Reshape, Tensor};
 use std::sync::Arc;
 
-// ── Q6_K block layout constants ───────────────────────────────────────────────
+// -- Q6_K block layout constants -----------------------------------------------
 // Q6_K: 6-bit, 256 elements per block, 210 bytes on disk
 //   [0..128]   ql     (low 4-bit per element, 128 bytes)
-//   [128..192] qh     (high 2-bit per element, 64 bytes — 4 elements per byte)
+//   [128..192] qh     (high 2-bit per element, 64 bytes -- 4 elements per byte)
 //   [192..208] scales (16 i8 values, one per 16-element group)
 //   [208..210] d      (f16 super-scale)
-// Dequant: q_full = (ql[i/2] >> 4*(i%2) & 0xF) | (qh bits << 4); weight = d × scale[g] × (q_full − 32)
+// Dequant: q_full = (ql[i/2] >> 4*(i%2) & 0xF) | (qh bits << 4); weight = d x scale[g] x (q_full ??? 32)
 //
 // GPU packed format (53 u32 per block, native ql+qh layout):
-//   u32[0]      = f32 bits of d (f16 → f32 at upload time)
+//   u32[0]      = f32 bits of d (f16 -> f32 at upload time)
 //   u32[1..5]   = 4 u32s, 16 group scales packed as bias-128 u8 (4 per u32)
 //                 stored_byte = (scale_i8 as i32 + 128) as u8
-//                 decode: sc_f32 = bitcast(stored | 0x4B000000) − 8388736.0
+//                 decode: sc_f32 = bitcast(stored | 0x4B000000) ??? 8388736.0
 //   u32[5..37]  = 32 u32s of ql[0..128] (native GGUF order, 4 u8 per u32)
 //   u32[37..53] = 16 u32s of qh[0..64] (native GGUF order, 4 u8 per u32)
 //
-// Dequant for element within ∈ [0,255]:
+// Dequant for element within ??? [0,255]:
 //   half = within/128, sub = (within%128)/32, l = within%32, group = within/16
 //   ql_byte_idx = half*64 + l + (sub%2)*32
 //   lo = (ql[ql_byte_idx] >> ((sub/2)*4)) & 0xF
 //   qh_byte_idx = half*32 + l
 //   hi = (qh[qh_byte_idx] >> (sub*2)) & 0x3
-//   q6 = lo | (hi<<4); weight = d × scale[group] × (q6 − 32)
+//   q6 = lo | (hi<<4); weight = d x scale[group] x (q6 ??? 32)
 pub const Q6K_QK: usize = 256;
 pub const Q6K_PACKED_U32S: usize = 53; // 1 (d) + 4 (scales) + 32 (ql) + 16 (qh) = 53
 
-// ── Q2_0 block layout constants ──────────────────────────────────────────────
+// -- Q2_0 block layout constants ----------------------------------------------
 // Q2_0 (PrismML): 2-bit quantized, 128 elements per block, 34 bytes per block
 //   [0..2]   d  (f16 scale)
-//   [2..34]  qs (32 bytes = 128 elements × 2 bits, 4 elements per byte)
-// Dequant: (((qs[i/4] >> (2*(i%4))) & 3) - 1) × d
-// Encoding: q=0→-1, q=1→0, q=2→+1, q=3→+2
+//   [2..34]  qs (32 bytes = 128 elements x 2 bits, 4 elements per byte)
+// Dequant: (((qs[i/4] >> (2*(i%4))) & 3) - 1) x d
+// Encoding: q=0->-1, q=1->0, q=2->+1, q=3->+2
 //
 // GPU packed format (9 u32 per block):
-//   u32[0]    = f32 bits of scale (f16 → f32 at upload time)
+//   u32[0]    = f32 bits of scale (f16 -> f32 at upload time)
 //   u32[1..8] = 8 u32 words of packed 2-bit data (each holds 16 elements)
 pub const Q2_0_QK: usize = 128;
 pub const Q2_0_BLOCK_BYTES: usize = 34; // raw on-disk bytes per block
 pub const Q2_0_PACKED_U32S: usize = 9;  // u32 slots per block in GPU format
 
-// ── Q4_K block layout constants ──────────────────────────────────────────────
+// -- Q4_K block layout constants ----------------------------------------------
 // Q4_K: 4-bit quantized, 256 elements per block, 144 bytes per block
 //   [0..2]    d      (f16 super-scale)
 //   [2..4]    dmin   (f16 super-minimum)
-//   [4..16]   sc     (12 bytes packed: 8 groups × 6-bit scale + 8 groups × 6-bit min)
+//   [4..16]   sc     (12 bytes packed: 8 groups x 6-bit scale + 8 groups x 6-bit min)
 //   [16..144] qs     (128 bytes = 256 nibbles, 4-bit each)
 //
 // GPU packed format (42 u32 per block):
-//   u32[0]       : f32 bits of d (f16 → f32 at upload time)
-//   u32[1]       : f32 bits of dmin (f16 → f32 at upload time)
-//   u32[2+j]     : sc[2*j] | (sc[2*j+1]<<8) for j=0..4  — 4 u32s for 8 unpacked scale values
-//   u32[6+j]     : m[2*j]  | (m[2*j+1]<<8)  for j=0..4  — 4 u32s for 8 unpacked min values
+//   u32[0]       : f32 bits of d (f16 -> f32 at upload time)
+//   u32[1]       : f32 bits of dmin (f16 -> f32 at upload time)
+//   u32[2+j]     : sc[2*j] | (sc[2*j+1]<<8) for j=0..4  -- 4 u32s for 8 unpacked scale values
+//   u32[6+j]     : m[2*j]  | (m[2*j+1]<<8)  for j=0..4  -- 4 u32s for 8 unpacked min values
 //   u32[10..42]  : 32 u32s holding qs[0..128] (4 bytes per u32, little-endian)
 //
 // Dequant per element i (group g = i/32):
@@ -69,21 +69,21 @@ pub const Q2_0_PACKED_U32S: usize = 9;  // u32 slots per block in GPU format
 //     out[j*64+l+32] = d * sc[2*j+1] * (qs[j*32+l] >> 4)   - dmin * m[2*j+1]
 pub const Q4K_PACKED_U32S: usize = 42; // u32 slots per block in GPU format
 
-// ── cuTile Q2_0 GEMV kernel ───────────────────────────────────────────────────
+// -- cuTile Q2_0 GEMV kernel ---------------------------------------------------
 
 #[cutile::module]
 pub mod kernels {
     use cutile::core::*;
 
-    /// Q2_0 dequantized GEMV: z[1] = Σ_k dequant(packed[pid_n, k]) × x[k]
+    /// Q2_0 dequantized GEMV: z[1] = Sigma_k dequant(packed[pid_n, k]) x x[k]
     ///
-    /// Packed layout: [N × K_BLOCKS × 9] u32 (conceptually [N, K_BLOCKS, 9]):
+    /// Packed layout: [N x K_BLOCKS x 9] u32 (conceptually [N, K_BLOCKS, 9]):
     ///   packed[n, blk, 0]    = f32 bits of block scale (converted from f16)
     ///   packed[n, blk, 1..8] = 8 u32 words of 2-bit weights
     ///     bits[2i+1 : 2i] of word w = q of element blk*128 + w*16 + i
-    ///     dequant: (q - 1) × scale, q ∈ {0,1,2,3} → values ∈ {-1,0,1,2} × scale
+    ///     dequant: (q - 1) x scale, q ??? {0,1,2,3} -> values ??? {-1,0,1,2} x scale
     ///
-    /// Grid: (N, 1, 1) — one program per output neuron.
+    /// Grid: (N, 1, 1) -- one program per output neuron.
     #[cutile::entry(optimization_hints = (sm_120 = (vec_width = 4,)))]
     pub fn cutile_q2_0_gemv<const K_BLOCKS: i32>(
         z: &mut Tensor<f32, { [1] }>,
@@ -108,7 +108,7 @@ pub mod kernels {
                 let word_data: Tile<u32, { [1] }> = part_p.load([pack_base + 1 + word]);
                 let x_word_base = x_base + word * 16;
 
-                // IEEE 754 integer-to-float trick — avoids itof (cutile-0.3.1 bug:
+                // IEEE 754 integer-to-float trick -- avoids itof (cutile-0.3.1 bug:
                 // itof does not emit the required 'signedness' attribute).
                 // For u32 x in [0, 2^23): bitcast(x | 0x4B000000) - 8388608.0 = (float)x.
                 // Combined constant 8388609.0 = 8388608.0 + 1.0 centres {0,1,2,3} to {-1,0,1,2}.
@@ -122,7 +122,7 @@ pub mod kernels {
                     let mask: Tile<u32, { [1] }> = broadcast_scalar(3_u32, shape![1]);
                     let q_u32: Tile<u32, { [1] }> = andi(shri(word_data, shift), mask);
 
-                    // Integer→float via IEEE bit trick:
+                    // Integer->float via IEEE bit trick:
                     // bitcast(q | 0x4B000000) - 8388609.0 == (q as f32) - 1.0
                     let biased: Tile<u32, { [1] }> = ori(q_u32, magic);
                     let q_f32: Tile<f32, { [1] }> = bitcast(biased) - bias_f32;
@@ -130,7 +130,7 @@ pub mod kernels {
                     // Load the corresponding activation element.
                     let x_elem: Tile<f32, { [1] }> = part_x.load([x_word_base + bit_pair]);
 
-                    // Accumulate: acc += scale × q × x
+                    // Accumulate: acc += scale x q x x
                     acc = acc + scale * q_f32 * x_elem;
                 }
             }
@@ -144,9 +144,9 @@ pub mod kernels {
     /// `MAP_SHAPE: [i32; 2]` = `[1, BN]`, bypassing the cuTile 0.4.0 restriction
     /// that rank-1 tile maps must be `[1]`. Each program iterates over BN
     /// consecutive output tiles via `iter_indices()` and computes one dot product
-    /// per iteration, reducing kernel launch overhead by BN× vs. the scalar variant.
+    /// per iteration, reducing kernel launch overhead by BNx vs. the scalar variant.
     ///
-    /// Packed layout: same as `cutile_q2_0_gemv` — `[N × K_BLOCKS × 9]` u32.
+    /// Packed layout: same as `cutile_q2_0_gemv` -- `[N x K_BLOCKS x 9]` u32.
     /// Inputs x and packed must be reshaped to rank-2 `[1, K]` / `[1, total]`
     /// at the dispatch level so that `[1, 1]` tile loads are type-consistent
     /// with the `[1, 1]` accumulator.
@@ -200,9 +200,9 @@ pub mod kernels {
     ///
     /// Uses a rank-2 `MappedPartitionMut<f32, { [1, 1] }, MAP_SHAPE>` with
     /// `MAP_SHAPE: [i32; 2]` = `[1, BN]`, bypassing the cuTile 0.4.0 restriction
-    /// that rank-1 tile maps must be `[1]`. Reduces kernel launch overhead by BN×.
+    /// that rank-1 tile maps must be `[1]`. Reduces kernel launch overhead by BNx.
     ///
-    /// Packed layout: same as `cutile_q6k_gemv` — `[N × K_BLOCKS × 53]` u32.
+    /// Packed layout: same as `cutile_q6k_gemv` -- `[N x K_BLOCKS x 53]` u32.
     ///
     /// Grid: N/BN programs. MAP_SHAPE = [1, BN]: each program iterates BN tiles.
     /// Dispatch: output tensor must be reshaped to `[1, N]` and partitioned `[1, 1]`
@@ -215,13 +215,13 @@ pub mod kernels {
     ) {
         let part_x = x.partition(shape![1, 1]);
         let part_p = packed.partition(shape![1, 1]);
-        // q6 ∈ [0,63]: bitcast(q6 | 0x4B000000) − 8388640.0 → q6−32 ∈ [−32,31]
+        // q6 ??? [0,63]: bitcast(q6 | 0x4B000000) ??? 8388640.0 -> q6???32 ??? [???32,31]
         let magic:     Tile<u32, { [1, 1] }> = broadcast_scalar(0x4B000000_u32, shape![1, 1]);
         let mask_ff:   Tile<u32, { [1, 1] }> = broadcast_scalar(0xFF_u32, shape![1, 1]);
         let mask_0f:   Tile<u32, { [1, 1] }> = broadcast_scalar(0x0F_u32, shape![1, 1]);
         let mask_03:   Tile<u32, { [1, 1] }> = broadcast_scalar(0x03_u32, shape![1, 1]);
         let center:    Tile<f32, { [1, 1] }> = broadcast_scalar(8388640.0_f32, shape![1, 1]);
-        // scale bias-128 decode: bitcast(sc | 0x4B000000) − 8388736.0 → sc_i8 ∈ [−128,127]
+        // scale bias-128 decode: bitcast(sc | 0x4B000000) ??? 8388736.0 -> sc_i8 ??? [???128,127]
         let sc_center: Tile<f32, { [1, 1] }> = broadcast_scalar(8388736.0_f32, shape![1, 1]);
         let sixteen:   Tile<u32, { [1, 1] }> = broadcast_scalar(16u32, shape![1, 1]);
 
@@ -253,7 +253,7 @@ pub mod kernels {
                     let ql_u32_base = pack_base + 5 + half * 16 + (sub % 2) * 8;
                     // qh u32 base: qh section starts at +37; half*8 u32 offset
                     let qh_u32_base = pack_base + 37 + half * 8;
-                    // nibble shift: sub<2 → lo nibble (shift=0), sub>=2 → hi nibble (shift=4)
+                    // nibble shift: sub<2 -> lo nibble (shift=0), sub>=2 -> hi nibble (shift=4)
                     let nibble_shift = ((sub / 2) * 4) as u32;
                     // qh bit shift: sub*2 (0,2,4,6)
                     let qh_shift = (sub * 2) as u32;
@@ -300,16 +300,16 @@ pub mod kernels {
         }
     }
 
-    /// Q6_K dequantized GEMV: z[1] = Σ_k dequant(packed[pid_n, k]) × x[k]
+    /// Q6_K dequantized GEMV: z[1] = Sigma_k dequant(packed[pid_n, k]) x x[k]
     ///
-    /// Packed layout: [N × K_BLOCKS × Q6K_PACKED_U32S] u32 (53 u32/block)
+    /// Packed layout: [N x K_BLOCKS x Q6K_PACKED_U32S] u32 (53 u32/block)
     ///   packed[n, blk, 0]       = f32 bits of d (block super-scale)
     ///   packed[n, blk, 1..5]    = 4 u32 words: 16 group scales as bias-128 u8 (4/u32)
     ///   packed[n, blk, 5..37]   = 32 u32 words: ql[0..128] native GGUF order
     ///   packed[n, blk, 37..53]  = 16 u32 words: qh[0..64] native GGUF order
-    ///   dequant: within→(half,sub,l,group); lo+hi nibbles→q6 ∈[0,63]; d×sc×(q6-32)
+    ///   dequant: within->(half,sub,l,group); lo+hi nibbles->q6 ???[0,63]; dxscx(q6-32)
     ///
-    /// Grid: (N, 1, 1) — one program per output neuron.
+    /// Grid: (N, 1, 1) -- one program per output neuron.
     #[cutile::entry(optimization_hints = (sm_120 = (vec_width = 4,)))]
     pub fn cutile_q6k_gemv<const K_BLOCKS: i32>(
         z: &mut Tensor<f32, { [1] }>,
@@ -321,13 +321,13 @@ pub mod kernels {
         let part_p = packed.partition(shape![1]);
         let mut acc: Tile<f32, { [1] }> = broadcast_scalar(0.0_f32, shape![1]);
 
-        // q6 ∈ [0,63]: bitcast(q6 | 0x4B000000) − 8388640.0 → q6−32 ∈ [−32,31]
+        // q6 ??? [0,63]: bitcast(q6 | 0x4B000000) ??? 8388640.0 -> q6???32 ??? [???32,31]
         let magic:     Tile<u32, { [1] }> = broadcast_scalar(0x4B000000_u32, shape![1]);
         let mask_ff:   Tile<u32, { [1] }> = broadcast_scalar(0xFF_u32, shape![1]);
         let mask_0f:   Tile<u32, { [1] }> = broadcast_scalar(0x0F_u32, shape![1]);
         let mask_03:   Tile<u32, { [1] }> = broadcast_scalar(0x03_u32, shape![1]);
         let center:    Tile<f32, { [1] }> = broadcast_scalar(8388640.0_f32, shape![1]);
-        // scale bias-128 decode: bitcast(sc | 0x4B000000) − 8388736.0 → sc_i8 ∈ [−128,127]
+        // scale bias-128 decode: bitcast(sc | 0x4B000000) ??? 8388736.0 -> sc_i8 ??? [???128,127]
         let sc_center: Tile<f32, { [1] }> = broadcast_scalar(8388736.0_f32, shape![1]);
         let sixteen:   Tile<u32, { [1] }> = broadcast_scalar(16u32, shape![1]);
 
@@ -356,7 +356,7 @@ pub mod kernels {
                 let ql_u32_base = pack_base + 5 + half * 16 + (sub % 2) * 8;
                 // qh base: qh section at +37; half*8 selects the right 32-byte span
                 let qh_u32_base = pack_base + 37 + half * 8;
-                // nibble shift: sub<2 → lo nibble (0), sub>=2 → hi nibble (4)
+                // nibble shift: sub<2 -> lo nibble (0), sub>=2 -> hi nibble (4)
                 let nibble_shift = ((sub / 2) * 4) as u32;
                 // qh bit shift: sub*2 extracts the 2 bits for this sub-group
                 let qh_shift = (sub * 2) as u32;
@@ -386,7 +386,7 @@ pub mod kernels {
                             shri(qh_byte, broadcast_scalar(qh_shift, shape![1])),
                             mask_03,
                         );
-                        // q6 ∈ [0,63]: lo | (hi<<4). Ranges don't overlap → + == |
+                        // q6 ??? [0,63]: lo | (hi<<4). Ranges don't overlap -> + == |
                         let q6: Tile<u32, { [1] }> = lo + hi * sixteen;
                         let q_f32: Tile<f32, { [1] }> = bitcast(ori(q6, magic)) - center;
                         let x_val: Tile<f32, { [1] }> = part_x.load([x_elem_base + byte_pos]);
@@ -402,9 +402,9 @@ pub mod kernels {
     ///
     /// Uses a rank-2 `MappedPartitionMut<f32, { [1, 1] }, MAP_SHAPE>` with
     /// `MAP_SHAPE: [i32; 2]` = `[1, BN]`, bypassing the cuTile 0.4.0 restriction
-    /// that rank-1 tile maps must be `[1]`. Reduces kernel launch overhead by BN×.
+    /// that rank-1 tile maps must be `[1]`. Reduces kernel launch overhead by BNx.
     ///
-    /// Packed layout: same as `cutile_q4k_gemv` — `[N × K_BLOCKS × 42]` u32.
+    /// Packed layout: same as `cutile_q4k_gemv` -- `[N x K_BLOCKS x 42]` u32.
     ///
     /// Grid: N/BN programs. MAP_SHAPE = [1, BN]: each program iterates BN tiles.
     /// Dispatch: output tensor must be reshaped to `[1, N]` and partitioned `[1, 1]`
@@ -499,20 +499,20 @@ pub mod kernels {
         }
     }
 
-    /// Q4_K dequantized GEMV: z[1] = Σ_k dequant(packed[pid_n, k]) × x[k]
+    /// Q4_K dequantized GEMV: z[1] = Sigma_k dequant(packed[pid_n, k]) x x[k]
     ///
     /// GPU packed format per block (42 u32s):
     ///   u32[0]      : f32 bits of d (super-scale, converted from f16 at upload)
     ///   u32[1]      : f32 bits of dmin (super-min, converted from f16 at upload)
-    ///   u32[2+j]    : sc[2*j] | (sc[2*j+1]<<8) for j=0..4 (group pair scales, 6-bit → 8-bit slots)
+    ///   u32[2+j]    : sc[2*j] | (sc[2*j+1]<<8) for j=0..4 (group pair scales, 6-bit -> 8-bit slots)
     ///   u32[6+j]    : m[2*j]  | (m[2*j+1]<<8)  for j=0..4 (group pair mins)
     ///   u32[10..42] : 32 u32s of packed qs bytes (128 bytes = 256 4-bit weights)
     ///
     /// Dequant: for j=0..4, l=0..32:
-    ///   lo = qs[j*32+l] & 0xF  → w = d * sc[2*j]   * lo  - dmin * m[2*j]   (element j*64+l)
-    ///   hi = qs[j*32+l] >> 4   → w = d * sc[2*j+1] * hi  - dmin * m[2*j+1] (element j*64+l+32)
+    ///   lo = qs[j*32+l] & 0xF  -> w = d * sc[2*j]   * lo  - dmin * m[2*j]   (element j*64+l)
+    ///   hi = qs[j*32+l] >> 4   -> w = d * sc[2*j+1] * hi  - dmin * m[2*j+1] (element j*64+l+32)
     ///
-    /// Grid: (N, 1, 1) — one program per output neuron.
+    /// Grid: (N, 1, 1) -- one program per output neuron.
     #[cutile::entry(optimization_hints = (sm_120 = (vec_width = 4,)))]
     pub fn cutile_q4k_gemv<const K_BLOCKS: i32>(
         z: &mut Tensor<f32, { [1] }>,
@@ -524,7 +524,7 @@ pub mod kernels {
         let part_p = packed.partition(shape![1]);
         let mut acc: Tile<f32, { [1] }> = broadcast_scalar(0.0_f32, shape![1]);
 
-        // Q4K_PACKED_U32S = 42 (literal — cutile const generics not available here)
+        // Q4K_PACKED_U32S = 42 (literal -- cutile const generics not available here)
         for blk in 0i32..K_BLOCKS {
             let base = pid_n * K_BLOCKS * 42 + blk * 42;
             let x_base = blk * 256;
@@ -572,7 +572,7 @@ pub mod kernels {
                 let m2: Tile<f32, { [1] }> = dmin * m_hi_f32; // dmin * m[2*j+1]
 
                 // 32 qs bytes for this j-pair: qs[j*32+l], l=0..32.
-                // Each byte: low nibble → element j*64+l, high nibble → element j*64+l+32.
+                // Each byte: low nibble -> element j*64+l, high nibble -> element j*64+l+32.
                 // qs byte j*32+l lives in u32[10 + (j*32+l)/4] at byte (j*32+l)%4.
                 for l in 0i32..32 {
                     let qs_word_idx = (j * 32 + l) / 4;
@@ -629,10 +629,10 @@ impl CutileQ2Gemv {
         &self.stream
     }
 
-    /// Device-to-device Q2_0 GEMV: output[n] = packed_weights × x[k].
+    /// Device-to-device Q2_0 GEMV: output[n] = packed_weights x x[k].
     ///
-    /// `packed` holds `n × k_blocks × Q2_0_PACKED_U32S` u32 elements.
-    /// `x` holds `k = k_blocks × Q2_0_QK` f32 activation elements.
+    /// `packed` holds `n x k_blocks x Q2_0_PACKED_U32S` u32 elements.
+    /// `x` holds `k = k_blocks x Q2_0_QK` f32 activation elements.
     pub fn forward_d2d(
         &self,
         x: &Arc<Tensor<f32>>,
@@ -668,7 +668,7 @@ impl CutileQ2Gemv {
 
     /// Device-to-device Q2_0 GEMV with BN outputs per program.
     ///
-    /// Reduces kernel launch overhead by BN× versus `forward_d2d`.
+    /// Reduces kernel launch overhead by BNx versus `forward_d2d`.
     /// `n` must be divisible by `bn`. Uses a rank-2 `MappedPartitionMut` with
     /// `MAP_SHAPE=[1, BN]` (rank-2, bypassing the cuTile 0.4.0 rank-1 map restriction)
     /// so each program iterates over BN consecutive output tiles via `iter_indices()`.
@@ -711,7 +711,7 @@ impl CutileQ2Gemv {
 
         let (z, _x, _p) =
             kernels::cutile_q2_0_gemv_bn(z, x_2d, p_2d)
-                // MAP_SHAPE: [i32; 2] — pass as two generics: MAP_SHAPE[0]=1, MAP_SHAPE[1]=bn
+                // MAP_SHAPE: [i32; 2] -- pass as two generics: MAP_SHAPE[0]=1, MAP_SHAPE[1]=bn
                 .generics(vec![k_blocks.to_string(), "1".to_string(), bn.to_string()])
                 .sync_on(stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
@@ -782,10 +782,10 @@ impl CutileQ6kGemv {
         &self.stream
     }
 
-    /// Device-to-device Q6_K GEMV: output[n] = packed_weights × x[k].
+    /// Device-to-device Q6_K GEMV: output[n] = packed_weights x x[k].
     ///
-    /// `packed` holds `n × k_blocks × Q6K_PACKED_U32S` u32 elements.
-    /// `x` holds `k = k_blocks × Q6K_QK` f32 activation elements.
+    /// `packed` holds `n x k_blocks x Q6K_PACKED_U32S` u32 elements.
+    /// `x` holds `k = k_blocks x Q6K_QK` f32 activation elements.
     pub fn forward_d2d(
         &self,
         x: &Arc<Tensor<f32>>,
@@ -807,7 +807,7 @@ impl CutileQ6kGemv {
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
         // reshape(&[n]) collapses partition-stride metadata left by
-        // partition([1]).unpartition() — same fix as CutileQ2Gemv::forward_d2d.
+        // partition([1]).unpartition() -- same fix as CutileQ2Gemv::forward_d2d.
         let out = z
             .unpartition()
             .reshape(&[n])
@@ -817,7 +817,7 @@ impl CutileQ6kGemv {
 
     /// Device-to-device Q6_K GEMV with BN outputs per program.
     ///
-    /// Reduces kernel launch overhead by BN× versus `forward_d2d`. Uses rank-2
+    /// Reduces kernel launch overhead by BNx versus `forward_d2d`. Uses rank-2
     /// `MappedPartitionMut<f32, { [1, 1] }, [1, BN]>` to bypass the cuTile 0.4.0
     /// "rank-1 maps must be [1]" restriction.
     pub fn forward_d2d_bn(
@@ -925,10 +925,10 @@ impl CutileQ4Gemv {
         &self.stream
     }
 
-    /// Device-to-device Q4_K GEMV: output[n] = packed_weights × x[k].
+    /// Device-to-device Q4_K GEMV: output[n] = packed_weights x x[k].
     ///
-    /// `packed` holds `n × k_blocks × Q4K_PACKED_U32S` u32 elements.
-    /// `x` holds `k = k_blocks × 256` f32 activation elements.
+    /// `packed` holds `n x k_blocks x Q4K_PACKED_U32S` u32 elements.
+    /// `x` holds `k = k_blocks x 256` f32 activation elements.
     pub fn forward_d2d(
         &self,
         x: &Arc<Tensor<f32>>,
@@ -950,7 +950,7 @@ impl CutileQ4Gemv {
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
         // reshape(&[n]) collapses partition-stride metadata left by
-        // partition([1]).unpartition() — same fix as CutileQ2Gemv::forward_d2d.
+        // partition([1]).unpartition() -- same fix as CutileQ2Gemv::forward_d2d.
         let out = z
             .unpartition()
             .reshape(&[n])
@@ -960,7 +960,7 @@ impl CutileQ4Gemv {
 
     /// Device-to-device Q4_K GEMV with BN outputs per program.
     ///
-    /// Reduces kernel launch overhead by BN× versus `forward_d2d`. Uses rank-2
+    /// Reduces kernel launch overhead by BNx versus `forward_d2d`. Uses rank-2
     /// `MappedPartitionMut<f32, { [1, 1] }, [1, BN]>` to bypass the cuTile 0.4.0
     /// "rank-1 maps must be [1]" restriction.
     pub fn forward_d2d_bn(
@@ -1052,11 +1052,11 @@ const BM: usize = 16;
 const BN: usize = 16;
 const BK: usize = 8;
 
-// ── Block layout constants ────────────────────────────────────────────────────
+// -- Block layout constants ----------------------------------------------------
 // Q4_K: 4-bit, 256 elements per block, 144 bytes
 //   [0..2]   d      (f16)
 //   [2..4]   dmin   (f16)
-//   [4..16]  scales (12 bytes packed, 8 groups × 6-bit sc + 8 groups × 6-bit m)
+//   [4..16]  scales (12 bytes packed, 8 groups x 6-bit sc + 8 groups x 6-bit m)
 //   [16..144] qs    (128 bytes = 256 nibbles)
 //
 // Q6_K: 6-bit, 256 elements per block, 210 bytes
@@ -1071,7 +1071,7 @@ const BK: usize = 8;
 //
 // I2S: 2-bit signed, variable layout (handled by existing CPU impl)
 
-// ── f16 bit conversion (mirrors quantized.rs) ────────────────────────────────
+// -- f16 bit conversion (mirrors quantized.rs) --------------------------------
 #[inline(always)]
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
@@ -1102,7 +1102,7 @@ fn f16_to_f32(bits: u16) -> f32 {
     }
 }
 
-// ── Q4_K scale unpacking (mirrors quantized.rs::q4k_unpack_scales) ───────────
+// -- Q4_K scale unpacking (mirrors quantized.rs::q4k_unpack_scales) -----------
 fn q4k_unpack_scales(packed: &[u8]) -> ([f32; Q4K_GROUPS], [f32; Q4K_GROUPS]) {
     let mut sc = [0u8; Q4K_GROUPS];
     let mut m = [0u8; Q4K_GROUPS];
@@ -1129,8 +1129,8 @@ fn q4k_unpack_scales(packed: &[u8]) -> ([f32; Q4K_GROUPS], [f32; Q4K_GROUPS]) {
     (to_f32(sc), to_f32(m))
 }
 
-// ── Dequantize a single Q4_K block to 256 f32 values ────────────────────────
-// TODO: GPU dequant — currently runs on CPU before GEMM
+// -- Dequantize a single Q4_K block to 256 f32 values ------------------------
+// TODO: GPU dequant -- currently runs on CPU before GEMM
 fn dequant_q4k_block(block: &[u8], out: &mut [f32]) {
     debug_assert_eq!(block.len(), Q4K_BLOCK_BYTES);
     debug_assert_eq!(out.len(), Q4K_BLOCK_SIZE);
@@ -1157,8 +1157,8 @@ fn dequant_q4k_block(block: &[u8], out: &mut [f32]) {
     }
 }
 
-// ── Dequantize a single Q6_K block to 256 f32 values ────────────────────────
-// TODO: GPU dequant — currently runs on CPU before GEMM
+// -- Dequantize a single Q6_K block to 256 f32 values ------------------------
+// TODO: GPU dequant -- currently runs on CPU before GEMM
 fn dequant_q6k_block(block: &[u8], out: &mut [f32]) {
     debug_assert_eq!(block.len(), Q6K_BLOCK_BYTES);
     debug_assert_eq!(out.len(), Q6K_BLOCK_SIZE);
@@ -1189,8 +1189,8 @@ fn dequant_q6k_block(block: &[u8], out: &mut [f32]) {
     }
 }
 
-// ── Dequantize a single TQ2 block to 256 f32 values ─────────────────────────
-// TODO: GPU dequant — currently runs on CPU before GEMM
+// -- Dequantize a single TQ2 block to 256 f32 values -------------------------
+// TODO: GPU dequant -- currently runs on CPU before GEMM
 fn dequant_tq2_block(block: &[u8], out: &mut [f32]) {
     debug_assert_eq!(block.len(), TQ2_BLOCK_BYTES);
     debug_assert_eq!(out.len(), TQ2_BLOCK_SIZE);
@@ -1206,8 +1206,8 @@ fn dequant_tq2_block(block: &[u8], out: &mut [f32]) {
     }
 }
 
-// ── Full weight matrix dequantization ────────────────────────────────────────
-// Expands [N, blocks_per_row * BLOCK_BYTES] → [N, K] f32
+// -- Full weight matrix dequantization ----------------------------------------
+// Expands [N, blocks_per_row * BLOCK_BYTES] -> [N, K] f32
 fn dequant_weights_q4k(b_quantized: &[u8], n: usize, k: usize) -> Vec<f32> {
     let blocks_per_row = k / Q4K_BLOCK_SIZE;
     let mut b_f32 = vec![0.0f32; n * k];
@@ -1256,7 +1256,7 @@ fn dequant_weights_tq2(b_quantized: &[u8], n: usize, k: usize) -> Vec<f32> {
 // I2S dequantization: 2-bit signed integer packed weights with a single global scale.
 // Layout: packed_bytes = n*k/4 bytes of 2-bit values, then 4 bytes f32 scale.
 // Each 2-bit value encodes a value in {-1, 0, 1, 2} (i2s signed: -2..1 range).
-// TODO: GPU dequant — currently runs on CPU before GEMM
+// TODO: GPU dequant -- currently runs on CPU before GEMM
 fn dequant_weights_i2s(b_quantized: &[u8], n: usize, k: usize) -> Vec<f32> {
     let packed_bytes = n * k / 4;
     let w_scale = f32::from_ne_bytes([
@@ -1274,7 +1274,7 @@ fn dequant_weights_i2s(b_quantized: &[u8], n: usize, k: usize) -> Vec<f32> {
         for &byte in w_packed {
             for shift in 0..4 {
                 let raw = (byte >> (shift * 2)) & 0x03;
-                // i2s: 0→0, 1→1, 2→-2, 3→-1 (two's complement 2-bit)
+                // i2s: 0->0, 1->1, 2->-2, 3->-1 (two's complement 2-bit)
                 let val = (raw as i8).wrapping_shl(6).wrapping_shr(6) as f32;
                 row[idx] = val * w_scale;
                 idx += 1;
@@ -1284,7 +1284,7 @@ fn dequant_weights_i2s(b_quantized: &[u8], n: usize, k: usize) -> Vec<f32> {
     b_f32
 }
 
-// ── Cutile GEMM helper (B transposed): output[M,N] = A[M,K] @ B^T[N,K] ──────
+// -- Cutile GEMM helper (B transposed): output[M,N] = A[M,K] @ B^T[N,K] ------
 fn cutile_gemm_bt(
     stream: &Arc<Stream>,
     a: &[f32],
@@ -1357,7 +1357,7 @@ fn cutile_gemm_bt(
     Ok(())
 }
 
-// ── CutileQuantizedGemm struct ────────────────────────────────────────────────
+// -- CutileQuantizedGemm struct ------------------------------------------------
 
 /// GPU-accelerated quantized GEMM using cutile-rs.
 ///
@@ -1365,7 +1365,7 @@ fn cutile_gemm_bt(
 /// f32 GEMM on GPU via cutile. All methods are `forward_b_transposed_*`:
 /// weights are stored transposed ([N, K]) and activations are [M, K].
 ///
-/// TODO: GPU dequant — move block-format expansion to GPU kernels for
+/// TODO: GPU dequant -- move block-format expansion to GPU kernels for
 /// full end-to-end GPU execution.
 pub struct CutileQuantizedGemm {
     device: Arc<Device>,
@@ -1437,7 +1437,7 @@ impl MatMulQ for CutileQuantizedGemm {
             });
         }
 
-        // TODO: GPU dequant — expand Q4_K on GPU to avoid host→device bandwidth for weights
+        // TODO: GPU dequant -- expand Q4_K on GPU to avoid host->device bandwidth for weights
         let b_f32 = dequant_weights_q4k(b_quantized, n, k);
         cutile_gemm_bt(&self.stream, a, &b_f32, output, m, n, k)
     }
@@ -1477,7 +1477,7 @@ impl MatMulQ for CutileQuantizedGemm {
             });
         }
 
-        // TODO: GPU dequant — expand Q6_K on GPU
+        // TODO: GPU dequant -- expand Q6_K on GPU
         let b_f32 = dequant_weights_q6k(b_quantized, n, k);
         cutile_gemm_bt(&self.stream, a, &b_f32, output, m, n, k)
     }
@@ -1517,7 +1517,7 @@ impl MatMulQ for CutileQuantizedGemm {
             });
         }
 
-        // TODO: GPU dequant — expand TQ2 ternary weights on GPU (all-add/sub/skip paths)
+        // TODO: GPU dequant -- expand TQ2 ternary weights on GPU (all-add/sub/skip paths)
         let b_f32 = dequant_weights_tq2(b_quantized, n, k);
         cutile_gemm_bt(&self.stream, a, &b_f32, output, m, n, k)
     }
@@ -1611,7 +1611,7 @@ mod tests {
     use crate::quantized::{q4k_dot_block, q6k_dot_block, tq2_dot_block};
 
     fn f32_to_f16_bits(val: f32) -> u16 {
-        // Simple f32→f16 for test values that fit in normal f16 range
+        // Simple f32->f16 for test values that fit in normal f16 range
         let bits = val.to_bits();
         let sign = (bits >> 31) as u16;
         let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
@@ -1627,7 +1627,7 @@ mod tests {
 
     #[test]
     fn dequant_q4k_block_matches_dot_block_identity() {
-        // Build a block with d=1, dmin=0 and all nibbles=7 → each element = 7.0
+        // Build a block with d=1, dmin=0 and all nibbles=7 -> each element = 7.0
         let mut block = vec![0u8; Q4K_BLOCK_BYTES];
         let d_bits = f32_to_f16_bits(1.0);
         block[0] = d_bits as u8;
@@ -1658,19 +1658,19 @@ mod tests {
     #[test]
     fn dequant_q6k_block_matches_dot_block_identity() {
         let mut block = vec![0u8; Q6K_BLOCK_BYTES];
-        // d = 1.0 → f16 bits at [208..210]
+        // d = 1.0 -> f16 bits at [208..210]
         let d_bits = f32_to_f16_bits(1.0);
         block[208] = d_bits as u8;
         block[209] = (d_bits >> 8) as u8;
-        // scales: all 1 (i8 value 1 → all groups have sc=1)
+        // scales: all 1 (i8 value 1 -> all groups have sc=1)
         for i in 192..208 {
             block[i] = 1u8;
         }
-        // ql: all 0x11 → low nibbles=1, meaning q1=(1|0<<4)-32=-31
+        // ql: all 0x11 -> low nibbles=1, meaning q1=(1|0<<4)-32=-31
         for i in 0..128 {
             block[i] = 0x11;
         }
-        // qh: 0 → high bits=0
+        // qh: 0 -> high bits=0
         let a = vec![1.0f32; Q6K_BLOCK_SIZE];
         let expected_dot = q6k_dot_block(&block, &a);
 
@@ -1690,7 +1690,7 @@ mod tests {
         let d_bits = f32_to_f16_bits(1.0);
         block[64] = d_bits as u8;
         block[65] = (d_bits >> 8) as u8;
-        // qs: 0b10101010 → each pair = 0b10 = 2 → trit = 2-1 = 1
+        // qs: 0b10101010 -> each pair = 0b10 = 2 -> trit = 2-1 = 1
         for i in 0..64 {
             block[i] = 0xAA;
         }
@@ -1707,9 +1707,9 @@ mod tests {
         );
     }
 
-    // ── Q6_K upload format helper ─────────────────────────────────────────────
+    // -- Q6_K upload format helper ---------------------------------------------
 
-    /// Build a synthetic Q6_K block: d=scale, all elements = q_val ∈ [0, 63].
+    /// Build a synthetic Q6_K block: d=scale, all elements = q_val ??? [0, 63].
     /// All 16 group scales are set to group_sc (i8).
     fn make_q6k_block_uniform(d: f32, q_val: u8, group_sc: i8) -> Vec<u8> {
         assert!(q_val <= 63);
@@ -1718,7 +1718,7 @@ mod tests {
         let d_bits = f32_to_f16_bits(d);
         block[208] = d_bits as u8;
         block[209] = (d_bits >> 8) as u8;
-        // scales at [192..208] — all group_sc
+        // scales at [192..208] -- all group_sc
         for i in 192..208 {
             block[i] = group_sc as u8;
         }
@@ -1801,7 +1801,7 @@ mod tests {
 
     #[test]
     fn q6k_pack_matches_cpu_dequant_uniform() {
-        // Uniform block: d=2.0, all q_full=40 (→ q_signed=8), group_sc=3
+        // Uniform block: d=2.0, all q_full=40 (-> q_signed=8), group_sc=3
         // expected weight per element = 2.0 * 3.0 * 8.0 = 48.0
         // dot with all-ones activation = 256 * 48.0 = 12288.0
         let d = 2.0f32;
@@ -1891,10 +1891,10 @@ mod tests {
         use cutile::prelude::DeviceOp;
 
         // Four output neurons, K = Q6K_QK (1 block each).
-        // Row 0: d=1.0, all q_full=32 (→ 0), group_sc=1  → dot with ones = 0
-        // Row 1: d=1.0, all q_full=33 (→ 1), group_sc=1  → dot = 256 * 1 = 256
-        // Row 2: d=1.0, all q_full=31 (→ -1), group_sc=1 → dot = 256 * -1 = -256
-        // Row 3: d=2.0, all q_full=40 (→ 8), group_sc=3  → dot = 256 * 2 * 3 * 8 = 12288
+        // Row 0: d=1.0, all q_full=32 (-> 0), group_sc=1  -> dot with ones = 0
+        // Row 1: d=1.0, all q_full=33 (-> 1), group_sc=1  -> dot = 256 * 1 = 256
+        // Row 2: d=1.0, all q_full=31 (-> -1), group_sc=1 -> dot = 256 * -1 = -256
+        // Row 3: d=2.0, all q_full=40 (-> 8), group_sc=3  -> dot = 256 * 2 * 3 * 8 = 12288
         let n = 4;
         let k = Q6K_QK;
         let k_blocks = 1;
@@ -1948,13 +1948,13 @@ mod tests {
         }
     }
 
-    // ── Q2_0 upload format helpers ────────────────────────────────────────────
+    // -- Q2_0 upload format helpers --------------------------------------------
 
     fn f32_to_f16_bits_q2(val: f32) -> u16 {
         f32_to_f16_bits(val)
     }
 
-    /// Build a synthetic Q2_0 block: scale=d, all 128 weights = q_val ∈ {0,1,2,3}.
+    /// Build a synthetic Q2_0 block: scale=d, all 128 weights = q_val ??? {0,1,2,3}.
     fn make_q2_0_block(d: f32, q_val: u8) -> Vec<u8> {
         assert!(q_val <= 3);
         let mut block = vec![0u8; Q2_0_BLOCK_BYTES];
@@ -1972,8 +1972,8 @@ mod tests {
     #[test]
     fn q2_0_upload_format_round_trips() {
         // Build a 2-row, 2-block weight matrix in Q2_0 format.
-        // Row 0: scale=2.0, all q=1 → dequant = (1-1)*2.0 = 0.0
-        // Row 1: scale=3.0, all q=3 → dequant = (3-1)*3.0 = 6.0
+        // Row 0: scale=2.0, all q=1 -> dequant = (1-1)*2.0 = 0.0
+        // Row 1: scale=3.0, all q=3 -> dequant = (3-1)*3.0 = 6.0
         let n = 2;
         let k = Q2_0_QK * 2; // 2 blocks per row
         let k_blocks = k / Q2_0_QK;
@@ -2035,16 +2035,16 @@ mod tests {
             "row 1 scale: {scale_row1}"
         );
 
-        // Validate data words: all q=1 → packed byte 0b01_01_01_01 = 0x55.
+        // Validate data words: all q=1 -> packed byte 0b01_01_01_01 = 0x55.
         let word0 = packed[1];
         assert_eq!(word0, 0x55555555, "row0 word: 0x{:08x}", word0);
 
-        // All q=3 → packed byte 0b11_11_11_11 = 0xFF.
+        // All q=3 -> packed byte 0b11_11_11_11 = 0xFF.
         let word1 = packed[k_blocks * Q2_0_PACKED_U32S + 1];
         assert_eq!(word1, 0xFFFFFFFF, "row1 word: 0x{:08x}", word1);
     }
 
-    // ── Q4_K upload format helpers ────────────────────────────────────────────
+    // -- Q4_K upload format helpers --------------------------------------------
 
     /// Build a synthetic Q4_K block (144 bytes): d=`d`, dmin=`dmin_val`, all nibbles=`nibble`.
     /// Scale group g: sc[g]=`sc_val`, m[g]=`m_val` for all 8 groups.
@@ -2061,10 +2061,10 @@ mod tests {
         block[2] = dmin_bits as u8;
         block[3] = (dmin_bits >> 8) as u8;
         // Packed scales [4..16]: encode sc_val into sc[0..4] and m_val into m[0..4].
-        // sc[i] = packed[i] & 0x3F for i=0..4 → set packed[i] = sc_val
-        // m[i] = packed[i+4] & 0x3F for i=0..4 → set packed[i+4] = m_val
-        // sc[i+4] = (packed[i+8] & 0x0F) | ((packed[i] >> 6) << 4) → high bits zero (sc_val < 64)
-        // m[i+4] = (packed[i+8] >> 4) | ((packed[i+4] >> 6) << 4) → high bits zero
+        // sc[i] = packed[i] & 0x3F for i=0..4 -> set packed[i] = sc_val
+        // m[i] = packed[i+4] & 0x3F for i=0..4 -> set packed[i+4] = m_val
+        // sc[i+4] = (packed[i+8] & 0x0F) | ((packed[i] >> 6) << 4) -> high bits zero (sc_val < 64)
+        // m[i+4] = (packed[i+8] >> 4) | ((packed[i+4] >> 6) << 4) -> high bits zero
         for i in 0..4 {
             block[4 + i] = sc_val;
             block[8 + i] = m_val;
@@ -2075,19 +2075,19 @@ mod tests {
         //   group B: packed_scales[4..8] = block[8..12]
         //   group C: packed_scales[8..12] = block[12..16]
         // Unpack rules (for i=0..4):
-        //   sc[i]   = packed_scales[i]   & 0x3F          → set block[4+i] = sc_val
+        //   sc[i]   = packed_scales[i]   & 0x3F          -> set block[4+i] = sc_val
         //   sc[i+4] = (packed_scales[i+8] & 0x0F)
-        //             | ((packed_scales[i] >> 6) << 4)   → set block[12+i] lo nibble = sc_val (sc_val ≤ 15)
-        //   m[i]    = packed_scales[i+4] & 0x3F          → set block[8+i] = m_val
+        //             | ((packed_scales[i] >> 6) << 4)   -> set block[12+i] lo nibble = sc_val (sc_val <= 15)
+        //   m[i]    = packed_scales[i+4] & 0x3F          -> set block[8+i] = m_val
         //   m[i+4]  = (packed_scales[i+8] >> 4)
-        //             | ((packed_scales[i+4] >> 6) << 4) → set block[12+i] hi nibble = m_val (m_val ≤ 15)
-        // This only works correctly for sc_val ≤ 15 and m_val ≤ 15 (no high-bit overflow).
+        //             | ((packed_scales[i+4] >> 6) << 4) -> set block[12+i] hi nibble = m_val (m_val <= 15)
+        // This only works correctly for sc_val <= 15 and m_val <= 15 (no high-bit overflow).
         for i in 0..4 {
             block[4 + i] = sc_val;
             block[8 + i] = m_val;
             block[12 + i] = (sc_val & 0x0F) | ((m_val & 0x0F) << 4);
         }
-        // nibble byte: lo=nibble, hi=nibble → byte = nibble | (nibble << 4)
+        // nibble byte: lo=nibble, hi=nibble -> byte = nibble | (nibble << 4)
         let qs_byte = nibble | (nibble << 4);
         for i in 16..144 {
             block[i] = qs_byte;
@@ -2098,8 +2098,8 @@ mod tests {
     #[test]
     fn q4k_upload_format_round_trips() {
         // Build a 2-row, 1-block Q4K matrix and verify the packed u32 format.
-        // Row 0: d=1.0, dmin=0.0, all nibbles=7, sc=1, m=0 → each elem = 1.0*1*7 - 0.0*0 = 7.0
-        // Row 1: d=2.0, dmin=0.5, all nibbles=4, sc=2, m=1 → each elem = 2.0*2*4 - 0.5*1 = 15.5
+        // Row 0: d=1.0, dmin=0.0, all nibbles=7, sc=1, m=0 -> each elem = 1.0*1*7 - 0.0*0 = 7.0
+        // Row 1: d=2.0, dmin=0.5, all nibbles=4, sc=2, m=1 -> each elem = 2.0*2*4 - 0.5*1 = 15.5
         let block0 = make_q4k_block(1.0, 0.0, 7, 1, 0);
         let block1 = make_q4k_block(2.0, 0.5, 4, 2, 1);
 
@@ -2172,7 +2172,7 @@ mod tests {
         let mut dq = vec![0.0f32; Q4K_BLOCK_SIZE];
         dequant_q4k_block(&block, &mut dq);
         let sum: f32 = dq.iter().sum();
-        // d=1, sc=1, nibble=7, dmin=0, m=0 → each of 256 elements = 1*1*7 - 0 = 7.0
+        // d=1, sc=1, nibble=7, dmin=0, m=0 -> each of 256 elements = 1*1*7 - 0 = 7.0
         assert!(
             (sum - 256.0 * 7.0).abs() < 1e-2,
             "q4k dequant sum: {sum} expected {}",
@@ -2188,10 +2188,10 @@ mod tests {
         use cutile::prelude::DeviceOp;
 
         // Build a 4-output Q4K GEMV, K=256 (1 block each):
-        // Row 0: d=1.0, dmin=0.0, nibble=7, sc=1, m=0 → each element = 7.0
-        // Row 1: d=2.0, dmin=0.5, nibble=4, sc=2, m=1 → each element = 2.0*2*4 - 0.5*1 = 15.5
-        // Row 2: d=1.0, dmin=0.0, nibble=0, sc=3, m=0 → each element = 0.0
-        // Row 3: d=0.5, dmin=0.0, nibble=15, sc=2, m=0 → each element = 0.5*2*15 = 15.0
+        // Row 0: d=1.0, dmin=0.0, nibble=7, sc=1, m=0 -> each element = 7.0
+        // Row 1: d=2.0, dmin=0.5, nibble=4, sc=2, m=1 -> each element = 2.0*2*4 - 0.5*1 = 15.5
+        // Row 2: d=1.0, dmin=0.0, nibble=0, sc=3, m=0 -> each element = 0.0
+        // Row 3: d=0.5, dmin=0.0, nibble=15, sc=2, m=0 -> each element = 0.5*2*15 = 15.0
         let n = 4;
         let k = Q4K_BLOCK_SIZE; // 256
         let k_blocks = 1;
@@ -2241,7 +2241,7 @@ mod tests {
                         | ((qs[w * 4 + 3] as u32) << 24),
                 );
             }
-            // activation all ones → dot = k * elem_val
+            // activation all ones -> dot = k * elem_val
             expected.push(k as f32 * elem_val);
         }
 
@@ -2286,21 +2286,21 @@ mod tests {
         use cutile::prelude::DeviceOp;
 
         // Build a 4-output, K=128 Q2_0 GEMV:
-        // Row 0: scale=1.0, all q=2 → dequant = +1.0
-        // Row 1: scale=2.0, all q=1 → dequant =  0.0
-        // Row 2: scale=1.0, all q=0 → dequant = -1.0
-        // Row 3: scale=1.0, all q=3 → dequant = +2.0
+        // Row 0: scale=1.0, all q=2 -> dequant = +1.0
+        // Row 1: scale=2.0, all q=1 -> dequant =  0.0
+        // Row 2: scale=1.0, all q=0 -> dequant = -1.0
+        // Row 3: scale=1.0, all q=3 -> dequant = +2.0
         let n = 4;
         let k = Q2_0_QK;
         let k_blocks = 1;
         let test_cases: &[(f32, u8, f32)] = &[
-            (1.0, 2, 1.0),  // row 0: scale=1, q=2 → +1
-            (2.0, 1, 0.0),  // row 1: scale=2, q=1 →  0
-            (1.0, 0, -1.0), // row 2: scale=1, q=0 → -1
-            (1.0, 3, 2.0),  // row 3: scale=1, q=3 → +2
+            (1.0, 2, 1.0),  // row 0: scale=1, q=2 -> +1
+            (2.0, 1, 0.0),  // row 1: scale=2, q=1 ->  0
+            (1.0, 0, -1.0), // row 2: scale=1, q=0 -> -1
+            (1.0, 3, 2.0),  // row 3: scale=1, q=3 -> +2
         ];
 
-        // Activation: all ones → dot = sum of row weights
+        // Activation: all ones -> dot = sum of row weights
         let x_vals = vec![1.0f32; k];
 
         // Build raw Q2_0 bytes and pack.
@@ -2318,7 +2318,7 @@ mod tests {
                 let b3 = block[5 + w * 4] as u32;
                 packed.push(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
             }
-            // Expected: k elements each = elem_val, activation all 1 → dot = k * elem_val
+            // Expected: k elements each = elem_val, activation all 1 -> dot = k * elem_val
             expected.push(k as f32 * elem_val);
         }
 
@@ -2356,7 +2356,7 @@ mod tests {
         }
     }
 
-    // ── BN variant tests: verify multi-output kernels match scalar kernels ────
+    // -- BN variant tests: verify multi-output kernels match scalar kernels ----
 
     #[test]
     #[cfg(feature = "cutile")]
@@ -2593,7 +2593,7 @@ mod tests {
 mod kani_proofs {
     use super::*;
 
-    // ── Q2_0 block layout and bit-extraction safety ───────────────────────────
+    // -- Q2_0 block layout and bit-extraction safety ---------------------------
 
     /// Byte indices accessed during Q2_0 block upload are within the 34-byte block.
     ///
@@ -2648,7 +2648,7 @@ mod kani_proofs {
         assert!(offset_in_block < Q2_0_PACKED_U32S);
     }
 
-    // ── Q4K block layout and nibble safety ───────────────────────────────────
+    // -- Q4K block layout and nibble safety -----------------------------------
 
     /// Nibble byte index for Q4K qs array: 16 + idx/2 < 144 for idx < 256.
     #[kani::proof]
@@ -2678,7 +2678,7 @@ mod kani_proofs {
         assert!(sc <= 63);
     }
 
-    // ── Q6K block layout and 6-bit reconstruction ────────────────────────────
+    // -- Q6K block layout and 6-bit reconstruction ----------------------------
 
     /// Q6K 6-bit reconstruction from ql (low 4 bits) + qh (high 2 bits) is in 0..=63.
     /// The signed offset `q6 - 32` is then in [-32, 31].
@@ -2696,7 +2696,7 @@ mod kani_proofs {
         assert!(q_signed >= -32 && q_signed <= 31);
     }
 
-    // ── TQ2 ternary bit extraction ────────────────────────────────────────────
+    // -- TQ2 ternary bit extraction --------------------------------------------
 
     /// TQ2 2-bit trit extraction: value in 0..=3, centered (trit-1) in {-1,0,1,2}.
     #[kani::proof]
@@ -2710,7 +2710,7 @@ mod kani_proofs {
         assert!(centered >= -1 && centered <= 2);
     }
 
-    // ── Full-block dequant no-panic harnesses ─────────────────────────────────
+    // -- Full-block dequant no-panic harnesses ---------------------------------
 
     #[kani::proof]
     fn dequant_q4k_block_no_panic() {

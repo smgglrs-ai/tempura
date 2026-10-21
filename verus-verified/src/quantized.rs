@@ -1,4 +1,4 @@
-//! Verus-verified quantization proofs — unbounded
+//! Verus-verified quantization proofs -- unbounded
 //!
 //! Proves indexing, bit-manipulation, and integer arithmetic properties
 //! of Q4K, Q6K, TQ2, and INT8 quantization formats.
@@ -330,7 +330,7 @@ proof fn q4k_accumulator_no_overflow(k: nat)
     ensures ({
         let max_per_element: nat = 100 * 945;
         let max_sum = max_per_element * k;
-        // Well within i32::MAX (2,147,483,647) — and therefore trivially < f32::MAX (3.4e38)
+        // Well within i32::MAX (2,147,483,647) -- and therefore trivially < f32::MAX (3.4e38)
         &&& max_sum <= 2147483647
         // The product 94500 * 12288 = 1,161,216,000
         &&& max_per_element * 12288 <= 2147483647
@@ -357,7 +357,7 @@ proof fn tq2_block_access_in_bounds(idx: nat)
 }
 
 // Note: the Kani harness asserts trit <= 1, which only holds for well-formed TQ2
-// data (valid trits encode as 0,1,2 — never 3). For arbitrary bytes, the provable
+// data (valid trits encode as 0,1,2 -- never 3). For arbitrary bytes, the provable
 // bound is trit <= 2. The well-formedness constraint is enforced by tq2_encode_block.
 proof fn tq2_decode_value_in_range(byte_val: u8, shift: u32)
     requires shift < 4,

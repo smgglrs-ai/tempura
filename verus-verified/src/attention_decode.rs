@@ -1,4 +1,4 @@
-//! Verus-verified attention_layer_decode properties — unbounded proofs
+//! Verus-verified attention_layer_decode properties -- unbounded proofs
 //!
 //! Proves: Q-gate deinterleave index correctness (no overlap, full coverage,
 //! value preservation), sigmoid output bounds, and partial RoPE indexing.
@@ -80,7 +80,7 @@ proof fn q_compaction_forward_safe(n_heads: nat, head_dim: nat, hh: nat)
 }
 
 // ============================================================================
-// Gate buffer: extracted gate values cover all heads × head_dim
+// Gate buffer: extracted gate values cover all heads x head_dim
 // ============================================================================
 
 proof fn gate_buffer_coverage(n_heads: nat, head_dim: nat)

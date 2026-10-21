@@ -21,17 +21,17 @@ pub mod kernels {
     /// Each program handles one Q tile of BR rows.
     ///
     /// Algorithm (online softmax, exp2-based for stability):
-    ///   For each Q tile q_tile (BR × D):
-    ///     For each KV tile (j): k_tile (BC × D), v_tile (BC × D):
-    ///       S = q_tile @ k_tile^T                  [BR × BC]
-    ///       Apply causal mask (set future positions to -∞)
+    ///   For each Q tile q_tile (BR x D):
+    ///     For each KV tile (j): k_tile (BC x D), v_tile (BC x D):
+    ///       S = q_tile @ k_tile^T                  [BR x BC]
+    ///       Apply causal mask (set future positions to -inf)
     ///       S *= scale / log2                       (for exp2 trick)
-    ///       qk_max = rowmax(S)                      [BR × 1]
+    ///       qk_max = rowmax(S)                      [BR x 1]
     ///       m_new = max(m_old, qk_max)
     ///       alpha = exp2(m_old - m_new)
-    ///       P = exp2(S - m_new)                     [BR × BC]
-    ///       l_new = alpha * l_old + rowsum(P)       [BR × 1]
-    ///       acc = alpha * acc + P @ v_tile          [BR × D]
+    ///       P = exp2(S - m_new)                     [BR x BC]
+    ///       l_new = alpha * l_old + rowsum(P)       [BR x 1]
+    ///       acc = alpha * acc + P @ v_tile          [BR x D]
     ///     out_tile = acc / l_new
     ///
     /// Grid: (ceil(seq_len / BR), 1, 1)
@@ -101,7 +101,7 @@ pub mod kernels {
         for j in 0i32..tile_count {
             let tile_k: Tile<f32, { [BC, D] }> = part_k.load_pipelined::<4>([j, 0i32]);
 
-            // S = Q @ K^T  [BR × BC]
+            // S = Q @ K^T  [BR x BC]
             let mut qk: Tile<f32, { [BR, BC] }> = constant(0.0f32, shape![BR, BC]);
             qk = mma(tq, tile_k.transpose(), qk);
             qk = qk * qk_scale;
@@ -122,7 +122,7 @@ pub mod kernels {
             // Correction factor for previously accumulated rows.
             let alpha: Tile<f32, { [BR, 1] }> = exp2(m_i - m_ij, ftz::Disabled);
 
-            // P = exp2(S - m_new)  [BR × BC]
+            // P = exp2(S - m_new)  [BR x BC]
             let qk_shifted: Tile<f32, { [BR, BC] }> = qk - m_ij.broadcast(shape![BR, BC]);
             let p: Tile<f32, { [BR, BC] }> = exp2(qk_shifted, ftz::Disabled);
 
@@ -141,18 +141,18 @@ pub mod kernels {
         out.store(true_div(acc, l_i.broadcast(shape![BR, D])));
     }
 
-    /// Decode (seq_len=1) GQA attention — GPU-resident interleaved KV cache.
+    /// Decode (seq_len=1) GQA attention -- GPU-resident interleaved KV cache.
     ///
     /// One program per attention head.  Reads Q, K, and V entirely on device
     /// from the flat interleaved GPU KV cache; no PCIe traffic for K or V.
     ///
     /// Cache layout (both K and V):
     ///   flat [gpu_max_seq_len * kv_dim], interleaved [token, kv_head, head_dim]
-    ///   Partition by HEAD_DIM → block index (t * N_KV_HEADS + kv_h) for token t, kv-head kv_h.
+    ///   Partition by HEAD_DIM -> block index (t * N_KV_HEADS + kv_h) for token t, kv-head kv_h.
     ///
     /// Online softmax uses the exp2 trick (same as `cutile_flash_attn_head`):
-    ///   score_exp2 = Q·K * (scale / log2)
-    ///   exp2(score_exp2) = exp(Q·K * scale)
+    ///   score_exp2 = Q*K * (scale / log2)
+    ///   exp2(score_exp2) = exp(Q*K * scale)
     ///
     /// Grid: `n_heads` programs (one per attention head, launched by partition size).
     #[cutile::entry()]
@@ -191,7 +191,7 @@ pub mod kernels {
             // Load K for this token/kv-head and compute dot product with Q.
             let k_tile: Tile<f32, { [HEAD_DIM] }> = part_k.load([cache_blk]);
             let qk_sum: Tile<f32, { [] }> = reduce_sum(q_tile * k_tile, 0i32);
-            // Score in exp2 space: Q·K * (scale / log2)
+            // Score in exp2 space: Q*K * (scale / log2)
             let score: Tile<f32, { [1] }> = qk_sum.reshape(shape![1]) * scale_log2;
 
             // Online softmax update (same algebra as cutile_flash_attn_head).
@@ -407,12 +407,12 @@ impl CutileFlashAttention {
     ///   2. Uploads Q/K/V for all heads with `sync_on` (tensor handles required
     ///      before kernel dispatch; H2D copies are fast).
     ///   3. Allocates all output tensors with `sync_on`.
-    ///   4. Submits all N head kernels with `async_on` — NO sync between heads.
+    ///   4. Submits all N head kernels with `async_on` -- NO sync between heads.
     ///   5. A single `stream.synchronize()` covers all N kernels.
     ///   6. Downloads and scatters all outputs.
     ///
     /// Reduces per-layer attention kernel syncs from N (one per head) to 1.
-    /// For 20 heads × 30 layers = 600 kernel syncs down to 30.
+    /// For 20 heads x 30 layers = 600 kernel syncs down to 30.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_batched(
         &self,
@@ -474,7 +474,7 @@ impl CutileFlashAttention {
         let generics = vec![BR.to_string(), BC.to_string(), head_dim_pad.to_string()];
 
         for batch_idx in 0..batch {
-            // ── Phase 1: host-side gather (pure CPU, zero CUDA cost) ──────────
+            // -- Phase 1: host-side gather (pure CPU, zero CUDA cost) ----------
             let q_bufs: Vec<Vec<f32>> = (0..n_heads)
                 .map(|h| {
                     gather_q_head(
@@ -518,7 +518,7 @@ impl CutileFlashAttention {
                 })
                 .collect();
 
-            // ── Phase 2: upload all Q head tensors ────────────────────────────
+            // -- Phase 2: upload all Q head tensors ----------------------------
             // sync_on is required here to obtain the Arc<Tensor<f32>> handle for
             // each head before launching the corresponding kernel.  H2D copies
             // are fast (PCIe bandwidth, not compute-bound).
@@ -533,7 +533,7 @@ impl CutileFlashAttention {
                 q_devs.push(dev);
             }
 
-            // ── Phase 3: upload all K kv-head tensors ─────────────────────────
+            // -- Phase 3: upload all K kv-head tensors -------------------------
             let mut k_devs: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_kv_heads);
             for buf in &k_bufs {
                 let dev: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(buf.clone()))
@@ -545,7 +545,7 @@ impl CutileFlashAttention {
                 k_devs.push(dev);
             }
 
-            // ── Phase 4: upload all V kv-head tensors ─────────────────────────
+            // -- Phase 4: upload all V kv-head tensors -------------------------
             let mut v_devs: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_kv_heads);
             for buf in &v_bufs {
                 let dev: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(buf.clone()))
@@ -557,8 +557,8 @@ impl CutileFlashAttention {
                 v_devs.push(dev);
             }
 
-            // ── Phase 5: allocate output tensors for all heads ─────────────────
-            // ── Phase 6: submit all head kernels — NO sync between heads ────────
+            // -- Phase 5: allocate output tensors for all heads -----------------
+            // -- Phase 6: submit all head kernels -- NO sync between heads --------
             // All N kernel launches go onto the stream without blocking the CPU.
             // The GPU executes them serially (single stream); the CPU immediately
             // proceeds to the next head's launch.
@@ -593,7 +593,7 @@ impl CutileFlashAttention {
                 out_parts.push(out_part);
             }
 
-            // ── Phase 7: single synchronisation for all N head kernels ─────────
+            // -- Phase 7: single synchronisation for all N head kernels ---------
             // SAFETY: all async_on calls above queued on this stream; synchronize
             // ensures all GPU writes to out_parts are visible before CPU reads.
             unsafe {
@@ -602,7 +602,7 @@ impl CutileFlashAttention {
                     .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
             }
 
-            // ── Phase 8: download and scatter all head outputs ─────────────────
+            // -- Phase 8: download and scatter all head outputs -----------------
             // Stream is idle; sync_on here is a fast D2H copy with no GPU wait.
             for (head, out_part) in out_parts.into_iter().enumerate() {
                 let host_result: Vec<f32> = out_part
@@ -636,13 +636,13 @@ impl CutileFlashAttention {
     /// `v_devs[kv_h]` is the corresponding V history.
     ///
     /// Only Q is supplied as a host slice (downloaded once from device by the caller).
-    /// This eliminates the `n_kv_heads × 2` H2D uploads that `forward_batched` performs
+    /// This eliminates the `n_kv_heads x 2` H2D uploads that `forward_batched` performs
     /// when the KV cache lives on the host, saving `2 * n_kv_heads` CUDA sync calls
     /// per layer and eliminating the O(kv_len) PCIe traffic for K/V.
     ///
     /// The method follows the same phased structure as `forward_batched`:
     ///   1. Gather Q per-head on the CPU (no CUDA cost).
-    ///   2. Upload Q per-head with `sync_on` (H2D; K/V skipped — already on device).
+    ///   2. Upload Q per-head with `sync_on` (H2D; K/V skipped -- already on device).
     ///   3. Submit all head kernels with `async_on` (no sync between heads).
     ///   4. Single `stream.synchronize()`.
     ///   5. Download and scatter outputs.
@@ -681,7 +681,7 @@ impl CutileFlashAttention {
         let stream = &self.stream;
         let generics = vec![BR.to_string(), BC.to_string(), head_dim_pad.to_string()];
 
-        // ── Phase 1: Q host-side gather (CPU only) ────────────────────────────
+        // -- Phase 1: Q host-side gather (CPU only) ----------------------------
         let q_bufs: Vec<Vec<f32>> = (0..n_heads)
             .map(|h| {
                 gather_q_head(
@@ -697,7 +697,7 @@ impl CutileFlashAttention {
             })
             .collect();
 
-        // ── Phase 2: reshape K/V device tensors to [kv_len_pad, head_dim] ─────
+        // -- Phase 2: reshape K/V device tensors to [kv_len_pad, head_dim] -----
         // The GPU KV cache tensors hold [gpu_max_seq * head_dim] contiguous
         // elements.  We reshape to [gpu_max_seq, head_dim] and rely on the flash
         // attention kernel's runtime `kv_len` parameter to iterate only the valid
@@ -708,9 +708,9 @@ impl CutileFlashAttention {
         // > kv_len_pad is not guaranteed). Using the raw tensor and letting the
         // kernel's `kv_len` bound the loop is safe and avoids the mismatch.
         //
-        // No H2D for K or V — they are already on device.
+        // No H2D for K or V -- they are already on device.
 
-        // ── Phase 3: upload Q per-head with sync_on ───────────────────────────
+        // -- Phase 3: upload Q per-head with sync_on ---------------------------
         let mut q_devs: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(n_heads);
         for buf in &q_bufs {
             let dev: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(buf.clone()))
@@ -722,14 +722,14 @@ impl CutileFlashAttention {
             q_devs.push(dev);
         }
 
-        // ── Phase 4: allocate output tensors; submit kernels async ─────────────
+        // -- Phase 4: allocate output tensors; submit kernels async -------------
         // Pre-reshape K/V per-head once outside the loop.
         // Each GPU KV cache tensor holds [gpu_max_seq_len * head_dim] elements.
         // Reshape to [gpu_max_seq_len, head_dim] so the kernel's dynamic [-1, D]
         // shape accepts it. The runtime `kv_len` parameter bounds tile iteration
         // so only the first `kv_len` tokens are read regardless of gpu_max_seq_len.
-        // DO NOT reshape to [kv_len_pad, head_dim] — that would fail when
-        // gpu_max_seq_len * head_dim ≠ kv_len_pad * head_dim.
+        // DO NOT reshape to [kv_len_pad, head_dim] -- that would fail when
+        // gpu_max_seq_len * head_dim ??? kv_len_pad * head_dim.
         // Reshape K/V per-KV-head from flat [gpu_max_seq * head_dim] to 2-D
         // [gpu_max_seq, head_dim] once outside the head loop. reshape on
         // Arc<Tensor<f32>> returns Arc<Tensor<f32>> (zero-copy metadata).
@@ -782,14 +782,14 @@ impl CutileFlashAttention {
             out_parts.push(out_part);
         }
 
-        // ── Phase 5: single sync for all head kernels ─────────────────────────
+        // -- Phase 5: single sync for all head kernels -------------------------
         unsafe {
             stream
                 .synchronize()
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         }
 
-        // ── Phase 6: download and scatter outputs ─────────────────────────────
+        // -- Phase 6: download and scatter outputs -----------------------------
         for (head, out_part) in out_parts.into_iter().enumerate() {
             let host_result: Vec<f32> = out_part
                 .unpartition()
@@ -821,7 +821,7 @@ impl CutileFlashAttention {
     /// (flat `[gpu_max_seq_len * kv_dim]`).  No PCIe traffic for K or V.
     ///
     /// Returns a flat `[n_heads * head_dim]` device tensor.  Callers that need
-    /// `[1, q_pad]` for the O-projection must pad via D→D copy.
+    /// `[1, q_pad]` for the O-projection must pad via D->D copy.
     ///
     /// # Errors
     ///
@@ -849,7 +849,7 @@ impl CutileFlashAttention {
         let heads_per_group = (n_heads / n_kv_heads) as i32;
         let generics = vec![n_kv_heads.to_string(), head_dim.to_string()];
 
-        // Allocate output: exactly n_heads blocks of HEAD_DIM — no padding.
+        // Allocate output: exactly n_heads blocks of HEAD_DIM -- no padding.
         let out_part = api::zeros::<f32>(&[q_dim])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
@@ -886,7 +886,7 @@ impl CutileFlashAttention {
     /// # Safety
     ///
     /// The returned tensor is being written asynchronously.  Caller MUST synchronise
-    /// the stream (or rely on a downstream D→H `sync_on`) before reading on the CPU.
+    /// the stream (or rely on a downstream D->H `sync_on`) before reading on the CPU.
     #[allow(clippy::too_many_arguments)]
     pub fn decode_attention_device_scratch(
         &self,

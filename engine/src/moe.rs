@@ -31,7 +31,7 @@ pub fn moe_ffn(
 ) {
     let q4k = tempura_kernels::quantized::CpuMatMulQ4KOpt;
 
-    // Step 1: Compute router logits — input [num_tokens, hidden_size] x router [n_experts, hidden_size]^T
+    // Step 1: Compute router logits -- input [num_tokens, hidden_size] x router [n_experts, hidden_size]^T
     let n_experts = router.n_experts;
     let mut router_logits = vec![0.0f32; num_tokens * n_experts];
 
@@ -196,7 +196,7 @@ fn expert_ffn_combine(
     }
 }
 
-/// Generic quantized matmul dispatch — mirrors the qmm closure in model.rs forward_quantized.
+/// Generic quantized matmul dispatch -- mirrors the qmm closure in model.rs forward_quantized.
 fn qmm_generic(
     q4k: &tempura_kernels::quantized::CpuMatMulQ4KOpt,
     qweights: &QuantizedWeights,

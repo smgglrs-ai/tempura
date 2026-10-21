@@ -6,13 +6,15 @@ weight: 10
 
 # oxide GEMV — Next Optimizations
 
-**Current state** (2026-10-11, RTX 5090 Blackwell sm_120):
+**Current state** (2026-10-12, RTX 5090 Blackwell sm_120):
 
 | Model | Format | tok/s decode | ITL P50 | Gap vs llama.cpp |
 |-------|--------|-------------|---------|-----------------|
-| Bonsai-1.7B | Q2_0 | 30 | 33ms | 7× |
-| Llama-3.1-8B | Q4K+Q6K | 24 | 41ms | 8.7× |
+| Bonsai-1.7B | Q2_0 | 31 | 32ms | 6.7× |
+| Llama-3.1-8B | Q4K+Q6K | 108 | 9.3ms | 1.9× |
 | llama.cpp ref | — | 209 | 5ms | 1× |
+
+The Q4K gap closed from 8.7× to 1.9× via Opt 5 (CUDA graph single-capture + device kv_len pointer, 4.5× improvement), Opt 7 (Q8_1 activation quantization + dp4a), and Opt 8 (multi-warp K-parallelism). Remaining 1.9× gap is flash attention at growing kv_len (19% SM utilization at batch=1) and raw GGUF scale decode overhead in GEMV.
 
 All oxide kernels live in `tools/oxide-gemv*/src/main.rs`. Build instructions are in CLAUDE.md ("GPU Kernels" section) and `bench-gpu-rtx5090.json`.
 
@@ -286,29 +288,28 @@ In the engine: replace the two separate gate + up GEMV calls with a single fused
 
 ---
 
-## Status (2026-10-11)
+## Status (2026-10-12)
 
-| Opt | Description | Status | Impact |
-|-----|-------------|--------|--------|
+| Opt | Description | Status | Measured impact |
+|-----|-------------|--------|----------------|
 | 1 | Raw bytes on GPU | Attempted, reverted (not bandwidth-bound) | — |
 | 2 | Two-output warp Q2_0 | **Done** | +1 tok/s (30→31) |
 | 3 | Float4 nibble reads | Deferred (needs loop restructure) | — |
 | 4 | Q4K prefill GEMM | Pending | HIGH |
-| 5 | Device-side kv_len | Pending (complex refactor) | LOW |
+| 5 | Device-side kv_len (CUDA graph single-capture) | **Done** | 24→67 tok/s (2.8×) |
 | 6 | Occupancy tuning | Pending | LOW |
-| 7 | Q8_1 activation + dp4a | **Next** | ~4× |
-| 8 | Multi-warp K-parallelism | After Opt 7 | ~1.5-2× |
-| 9 | Fused gate+up SwiGLU | After Opt 8 | ~1.3× |
+| 7 | Q8_1 activation + dp4a | **Done** | contributes to 108 tok/s |
+| 8 | Multi-warp K-parallelism | **Done** (Q4K + Q6K kpar 8 warps) | contributes to 108 tok/s |
+| 9 | Fused gate+up SwiGLU | Pending | ~1.3× |
 
 ## Implementation priority
 
-1. **Q8_1 + dp4a** (Opt 7) — closes most of the 8.7× Q4K gap, direct translation from llama.cpp
-2. **Multi-warp K-parallelism** (Opt 8) — 4× K-loop parallelism on top of Opt 7
-3. **Fused SwiGLU** (Opt 9) — FFN layer speedup
-4. **Q4K prefill GEMM** (Opt 4) — closes the massive prefill gap
-5. **Occupancy tuning** (Opt 6) — quick experiment, 10 minutes
+Opts 5, 7, 8 are done — Q4K Llama-3.1-8B is at 108 tok/s, a 1.9× gap from llama.cpp. Remaining levers:
 
-Implementing Opts 7-8 should push Q4K Llama-3.1-8B from 24 → 150+ tok/s, closing the gap to ~1.4× vs llama.cpp decode.
+1. **Batched continuous inference** — 5+ concurrent requests fills all 170 SMs and amortizes GEMV weight bandwidth; serving metric is requests×tokens/s, not single-request latency
+2. **Q4K prefill GEMM** (Opt 4) — closes the massive prefill gap (currently 6 tok/s vs llama.cpp 7335 pp128)
+3. **Fused SwiGLU** (Opt 9) — FFN layer speedup (~1.3×)
+4. **Occupancy tuning** (Opt 6) — quick experiment, 10 minutes
 
 ---
 

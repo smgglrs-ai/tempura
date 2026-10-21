@@ -1,1 +1,1 @@
-// CUDA backend (cuda feature, non-cutile path) — placeholder for future gpu kernels
+// CUDA backend (cuda feature, non-cutile path) -- placeholder for future gpu kernels

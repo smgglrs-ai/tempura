@@ -1,4 +1,4 @@
-//! Verus-verified BlockTable sentinel invariant — unbounded proofs
+//! Verus-verified BlockTable sentinel invariant -- unbounded proofs
 //!
 //! Proves that the BlockTable maintains its sentinel invariant:
 //! table[i] != u32::MAX iff i < num_blocks, preserved by new(), set_block(), clear().
@@ -17,7 +17,7 @@ pub open spec fn well_formed(bt: &BlockTableState) -> bool {
 }
 
 // ============================================================================
-// Proof: new() — num_blocks == 0, all slots are sentinel
+// Proof: new() -- num_blocks == 0, all slots are sentinel
 // ============================================================================
 
 proof fn new_is_well_formed(max_blocks: nat)
@@ -31,7 +31,7 @@ proof fn new_is_well_formed(max_blocks: nat)
 }
 
 // ============================================================================
-// Proof: set_block(idx, page) — num_blocks grows to cover idx
+// Proof: set_block(idx, page) -- num_blocks grows to cover idx
 // ============================================================================
 
 proof fn set_block_preserves_well_formed(
@@ -56,7 +56,7 @@ proof fn set_block_preserves_well_formed(
 }
 
 // ============================================================================
-// Proof: set_block monotonicity — num_blocks never decreases
+// Proof: set_block monotonicity -- num_blocks never decreases
 // ============================================================================
 
 proof fn set_block_monotone(
@@ -107,7 +107,7 @@ proof fn as_slice_length(bt: &BlockTableState)
 }
 
 // ============================================================================
-// Proof: clear() — resets to num_blocks == 0
+// Proof: clear() -- resets to num_blocks == 0
 // ============================================================================
 
 proof fn clear_restores_empty(bt: BlockTableState)

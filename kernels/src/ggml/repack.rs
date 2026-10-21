@@ -5,12 +5,12 @@ use super::helpers::nearest_int;
 /// into `BlockQ4Kx8` groups. `n_rows` must be divisible by 8.
 ///
 /// Returns a `Vec<BlockQ4Kx8>` with `(n_rows/8) * bpr` entries. Each entry
-/// corresponds to one group of 8 weight rows × one K-dimension block.
+/// corresponds to one group of 8 weight rows x one K-dimension block.
 ///
 /// The layout exactly matches llama.cpp's `make_block_q4_Kx8` with
 /// `blck_size_interleave = 8`:
 /// - `qs`: 128 groups of 8 bytes, cycling through rows 0-7 at each source offset
-/// - `scales`: 4 sub-block pairs × 24 bytes, encoding 8 rows' scale/min data
+/// - `scales`: 4 sub-block pairs x 24 bytes, encoding 8 rows' scale/min data
 ///   using the same 6-bit packed format as standard Q4K but across rows
 pub fn repack_q4k_to_q4kx8(src: &[BlockQ4K], n_rows: usize, bpr: usize) -> Vec<BlockQ4Kx8> {
     assert_eq!(n_rows % 8, 0, "n_rows={n_rows} must be divisible by 8");
@@ -55,7 +55,7 @@ pub fn repack_q4k_to_q4kx8(src: &[BlockQ4K], n_rows: usize, bpr: usize) -> Vec<B
                     .copy_from_slice(&rows[src_row].qs[src_byte..src_byte + 8]);
             }
 
-            // Pack scales (96 bytes = 4 sub-block pairs × 24 bytes).
+            // Pack scales (96 bytes = 4 sub-block pairs x 24 bytes).
             // Each 12-byte group encodes one Q4K scale index across all 8 rows,
             // using the same 6-bit format as standard Q4K, applied row-wise.
             //
@@ -111,10 +111,10 @@ pub fn repack_q4k_to_q4kx8(src: &[BlockQ4K], n_rows: usize, bpr: usize) -> Vec<B
 }
 
 /// Quantize 4 f32 activation rows into `BlockQ8Kx4` format for use with the
-/// 4×8 Q4K GEMM (`gemm_q4k_8x8_scalar`). Matches `ggml_quantize_mat_q8_K_4x8_generic`
+/// 4x8 Q4K GEMM (`gemm_q4k_8x8_scalar`). Matches `ggml_quantize_mat_q8_K_4x8_generic`
 /// (blck_size_interleave=8) exactly.
 ///
-/// - `a`: row-major f32 activations, `m` rows × `k` columns
+/// - `a`: row-major f32 activations, `m` rows x `k` columns
 /// - `m`: must be a multiple of 4
 /// - `k`: must be a multiple of 256 (QK_K)
 ///
@@ -188,10 +188,10 @@ pub fn quantize_mat_q8k_4x8(a: &[f32], m: usize, k: usize) -> Vec<BlockQ8Kx4> {
 }
 
 /// Quantize 4 f32 activation rows into `BlockQ8Kx4` format for use with the
-/// Q6K 8×4 scalar GEMM (`ggml_gemm_q6_k_8x4_q8_k`). Matches
+/// Q6K 8x4 scalar GEMM (`ggml_gemm_q6_k_8x4_q8_k`). Matches
 /// `ggml_quantize_mat_q8_K_4x4_generic` (blck_size_interleave=4) exactly.
 ///
-/// - `a`: row-major f32 activations, `m` rows × `k` columns
+/// - `a`: row-major f32 activations, `m` rows x `k` columns
 /// - `m`: must be a multiple of 4
 /// - `k`: must be a multiple of 256 (QK_K)
 ///

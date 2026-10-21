@@ -6,7 +6,7 @@
  * The tempura-kernels build.rs extracts that PTX and writes it to OUT_DIR.
  *
  * Q6_K packed GPU format (53 u32 per block, 256 elements per block):
- *   u32[0]      = f32 bits of d (super-scale, f16 → f32 at upload)
+ *   u32[0]      = f32 bits of d (super-scale, f16 -> f32 at upload)
  *   u32[1..5]   = 4 u32s: 16 group scales as bias-128 u8 (4 per u32)
  *                 stored_byte = (scale_i8 + 128) as u8; decode: byte as f32 - 128.0
  *   u32[5..37]  = 32 u32s: ql[0..128] in native GGUF order (4 u8 per u32)
@@ -44,9 +44,9 @@ const WARPS_PER_BLOCK_KPAR: u32 = 8;
 mod kernels {
     use super::*;
 
-    /// Q6_K GEMV for M=1 decode: out[N] = dequant(packed[N, K_BLOCKS, 53]) × x[K].
+    /// Q6_K GEMV for M=1 decode: out[N] = dequant(packed[N, K_BLOCKS, 53]) x x[K].
     ///
-    /// Grid:  (ceil(N / WARPS_PER_BLOCK),) blocks — each warp owns one output neuron.
+    /// Grid:  (ceil(N / WARPS_PER_BLOCK),) blocks -- each warp owns one output neuron.
     /// Block: (WARPS_PER_BLOCK * 32,) threads.
     ///
     /// Fallback kernel: per-element stride-32 loop with native ql+qh dequant.
@@ -275,15 +275,15 @@ mod kernels {
         }
     }
 
-    /// Q6_K GEMV v3 kpar: K-parallel — 8 warps per block split the k_blocks dimension.
+    /// Q6_K GEMV v3 kpar: K-parallel -- 8 warps per block split the k_blocks dimension.
     ///
-    /// Motivation: v2 uses 1 warp/output-row × 4 warps/block → 24 warps/SM → 37.5% occupancy.
-    /// kpar uses 8 warps/block, one block per output row → 64 warps/SM → 100% occupancy.
+    /// Motivation: v2 uses 1 warp/output-row x 4 warps/block -> 24 warps/SM -> 37.5% occupancy.
+    /// kpar uses 8 warps/block, one block per output row -> 64 warps/SM -> 100% occupancy.
     /// More outstanding memory requests improve DRAM throughput from ~32% to ~56%.
     ///
-    /// Grid:  (N, 1, 1) — one block per output neuron.
+    /// Grid:  (N, 1, 1) -- one block per output neuron.
     /// Block: (WARPS_PER_BLOCK_KPAR * 32 = 256, 1, 1) threads.
-    /// Smem:  WARPS_PER_BLOCK_KPAR * 4 = 32 bytes — partial f32 sums, one per warp.
+    /// Smem:  WARPS_PER_BLOCK_KPAR * 4 = 32 bytes -- partial f32 sums, one per warp.
     ///
     /// Warp `w` handles k_blocks: w, w+8, w+16, ... (stride = WARPS_PER_BLOCK_KPAR).
     /// Inner block loop is the same 8-step unrolled ql+qh nibble unpack from v2.
@@ -322,7 +322,7 @@ mod kernels {
             let sc_45 = packed[(base + 3) as usize];
             let sc_67 = packed[(base + 4) as usize];
 
-            // Cache ql and qh per lane — same 6-load pattern as v2.
+            // Cache ql and qh per lane -- same 6-load pattern as v2.
             let ql_a = (packed[(base + 5  + lane / 4) as usize] >> byte_shift) & 0xFF;
             let ql_b = (packed[(base + 13 + lane / 4) as usize] >> byte_shift) & 0xFF;
             let qh_0 = (packed[(base + 37 + lane / 4) as usize] >> byte_shift) & 0xFF;
@@ -451,7 +451,7 @@ mod kernels {
     }
 }
 
-// ── Host-side correctness test ────────────────────────────────────────────────
+// -- Host-side correctness test ------------------------------------------------
 
 fn main() {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
@@ -465,10 +465,10 @@ fn main() {
 
     // Build packed weights (53 u32/block, native ql+qh format):
     //   d = 1.0, all group scales = 1 (stored as bias-128 u8 = 129 = 0x81)
-    //   all q_full = 32 (→ weight = 0.0)
+    //   all q_full = 32 (-> weight = 0.0)
     //   q_full=32 = 0x20: lo nibble = 0, hi 2-bits = 2
-    //   ql: all nibbles = 0 → all ql bytes = 0x00
-    //   qh: all 4 bit-pairs = 2 (=0b10) → qh byte = 0b10_10_10_10 = 0xAA
+    //   ql: all nibbles = 0 -> all ql bytes = 0x00
+    //   qh: all 4 bit-pairs = 2 (=0b10) -> qh byte = 0b10_10_10_10 = 0xAA
     // Expected output: 0.0 for all neurons.
     let packed_u32s = n * k_blocks * 53;
     let mut packed_host = vec![0u32; packed_u32s];
@@ -477,7 +477,7 @@ fn main() {
             let base = (row * k_blocks + blk) * 53;
             // slot 0: d = 1.0
             packed_host[base] = 1.0_f32.to_bits();
-            // slots 1..5: 16 scales = 1 as bias-128 u8 → 1+128=129=0x81
+            // slots 1..5: 16 scales = 1 as bias-128 u8 -> 1+128=129=0x81
             for w in 0..4usize {
                 packed_host[base + 1 + w] = 0x81818181_u32;
             }
@@ -516,7 +516,7 @@ fn main() {
 
     let mut out_dev_kpar = DeviceBuffer::<f32>::zeroed(&stream, n).expect("alloc out_kpar");
 
-    // ── Test 1: q_full=32 → weight=0.0 ────────────────────────────────────────
+    // -- Test 1: q_full=32 -> weight=0.0 ----------------------------------------
     unsafe {
         module.q6k_gemv_dp4a_base(
             stream.as_ref(), cfg, &mut out_dev, &x_dev, &p_dev, n as u32, k_blocks as u32,
@@ -544,19 +544,19 @@ fn main() {
     let max_err_kpar = result_kpar.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
 
     if max_err1 < 1e-4 {
-        println!("oxide-gemv-q6k v1 test 1 (q_full=32→weight=0): PASSED (max_err={:.2e})", max_err1);
+        println!("oxide-gemv-q6k v1 test 1 (q_full=32->weight=0): PASSED (max_err={:.2e})", max_err1);
     } else {
         eprintln!("oxide-gemv-q6k v1 test 1 FAILED (max_err={:.4}, result[0]={})", max_err1, result1[0]);
         std::process::exit(1);
     }
     if max_err2 < 1e-4 {
-        println!("oxide-gemv-q6k v2 test 1 (q_full=32→weight=0): PASSED (max_err={:.2e})", max_err2);
+        println!("oxide-gemv-q6k v2 test 1 (q_full=32->weight=0): PASSED (max_err={:.2e})", max_err2);
     } else {
         eprintln!("oxide-gemv-q6k v2 test 1 FAILED (max_err={:.4}, result[0]={})", max_err2, result2[0]);
         std::process::exit(1);
     }
     if max_err_kpar < 1e-4 {
-        println!("oxide-gemv-q6k v3_kpar test 1 (q_full=32→weight=0): PASSED (max_err={:.2e})", max_err_kpar);
+        println!("oxide-gemv-q6k v3_kpar test 1 (q_full=32->weight=0): PASSED (max_err={:.2e})", max_err_kpar);
     } else {
         eprintln!("oxide-gemv-q6k v3_kpar test 1 FAILED (max_err={:.4}, result[0]={})", max_err_kpar, result_kpar[0]);
         std::process::exit(1);
@@ -577,20 +577,20 @@ fn main() {
         std::process::exit(1);
     }
 
-    // ── Test 2: d=1.0, scale=2, q_full=33 → weight=2.0, sum=512.0 ──────────
+    // -- Test 2: d=1.0, scale=2, q_full=33 -> weight=2.0, sum=512.0 ----------
     // q_full=33 = 0x21: lo nibble = 1, hi 2-bits = 2
-    //   ql: all nibbles = 1 → ql byte = 0x11 (lo nibble = 1, hi nibble = 1)
-    //   qh: all pairs = 2 → qh byte = 0xAA (same as test 1)
-    //   scale=2: bias-128 → 2+128=130=0x82
+    //   ql: all nibbles = 1 -> ql byte = 0x11 (lo nibble = 1, hi nibble = 1)
+    //   qh: all pairs = 2 -> qh byte = 0xAA (same as test 1)
+    //   scale=2: bias-128 -> 2+128=130=0x82
     // weight = d * sc * (q6 - 32) = 1 * 2 * (33 - 32) = 2.0
-    // Expected: 256 elements × 2.0 = 512.0
+    // Expected: 256 elements x 2.0 = 512.0
     let mut packed_host2 = vec![0u32; packed_u32s];
     for row in 0..n {
         for blk in 0..k_blocks {
             let base = (row * k_blocks + blk) * 53;
             packed_host2[base] = 1.0_f32.to_bits();
             for w in 0..4usize {
-                packed_host2[base + 1 + w] = 0x82828282_u32; // scale=2 → 2+128=130=0x82
+                packed_host2[base + 1 + w] = 0x82828282_u32; // scale=2 -> 2+128=130=0x82
             }
             for w in 0..32usize {
                 packed_host2[base + 5 + w] = 0x11111111_u32; // ql: all nibbles = 1
@@ -686,9 +686,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    // ── Test 3 (kpar multi-block): k_blocks=16 exercises all 8 warps ─────────
+    // -- Test 3 (kpar multi-block): k_blocks=16 exercises all 8 warps ---------
     // Each warp handles 2 blocks (16 / 8 = 2). d=1, scale=2, q_full=33.
-    // Expected: 256 × 2.0 × 16 = 8192.0
+    // Expected: 256 x 2.0 x 16 = 8192.0
     {
         let kb3: usize = 16;
         let k3 = kb3 * 256;

@@ -1,19 +1,19 @@
-//! Direct Rust translation of llama.cpp ggml/src/ggml-cpu/ops.cpp lines 4001–8000.
+//! Direct Rust translation of llama.cpp ggml/src/ggml-cpu/ops.cpp lines 4001-8000.
 //!
 //! Every function carries a doc-comment referencing the original C source line.
 //! Signatures use raw f32/i8 slices with explicit size parameters instead of
-//! ggml_tensor; the GGML threading (ith/nth) and wdata workspace are stripped —
+//! ggml_tensor; the GGML threading (ith/nth) and wdata workspace are stripped --
 //! callers manage parallelism externally.
 
-// ── RMS norm backward ────────────────────────────────────────────────────────
+// -- RMS norm backward --------------------------------------------------------
 
 /// Backward pass for RMS normalisation.
 /// Direct translation of `ggml_compute_forward_rms_norm_back_f32` (ops.cpp line 4031).
 ///
-/// `dz`  — gradient from the forward pass output (ne0 elements)
-/// `x`   — original input to the forward RMS-norm (ne0 elements)
-/// `dx`  — output gradient w.r.t. the input (ne0 elements)
-/// `eps` — epsilon used in the forward pass
+/// `dz`  -- gradient from the forward pass output (ne0 elements)
+/// `x`   -- original input to the forward RMS-norm (ne0 elements)
+/// `dx`  -- output gradient w.r.t. the input (ne0 elements)
+/// `eps` -- epsilon used in the forward pass
 pub fn rms_norm_back_f32(dz: &[f32], x: &[f32], dx: &mut [f32], eps: f32) {
     let n = dz.len();
     assert_eq!(x.len(), n);
@@ -37,19 +37,19 @@ pub fn rms_norm_back_f32(dz: &[f32], x: &[f32], dx: &mut [f32], eps: f32) {
     }
 }
 
-// ── Group norm ────────────────────────────────────────────────────────────────
+// -- Group norm ----------------------------------------------------------------
 
 /// Group normalisation for a single 3-D slice.
 /// Direct translation of `ggml_compute_forward_group_norm_f32` inner logic
 /// (ops.cpp line 4208).
 ///
 /// Layout: `data[i02][i01][i00]` stored row-major.
-/// `ne00` — inner-most dimension (vector length)
-/// `ne01` — second dimension (rows)
-/// `ne02` — channel count (third dimension)
-/// `n_groups` — number of normalisation groups (must divide ne02 evenly or the
+/// `ne00` -- inner-most dimension (vector length)
+/// `ne01` -- second dimension (rows)
+/// `ne02` -- channel count (third dimension)
+/// `n_groups` -- number of normalisation groups (must divide ne02 evenly or the
 ///              last group is smaller)
-/// `eps` — epsilon for numerical stability
+/// `eps` -- epsilon for numerical stability
 pub fn group_norm_f32(
     src: &[f32],
     dst: &mut [f32],
@@ -81,7 +81,7 @@ pub fn group_norm_f32(
         }
         let mean = sum as f32 / (ne00 * ne01 * step) as f32;
 
-        // subtract mean → dst, accumulate variance
+        // subtract mean -> dst, accumulate variance
         let mut sum2: f64 = 0.0;
         for i02 in start..end {
             for i01 in 0..ne01 {
@@ -108,15 +108,15 @@ pub fn group_norm_f32(
     }
 }
 
-// ── L2 norm ───────────────────────────────────────────────────────────────────
+// -- L2 norm -------------------------------------------------------------------
 
 /// L2 normalisation of a flat row vector.
 /// Direct translation of `ggml_compute_forward_l2_norm_f32` inner kernel
 /// (ops.cpp line 4303).
 ///
-/// `x`   — input slice (ne00 elements, contiguous)
-/// `y`   — output slice (ne00 elements)
-/// `eps` — minimum norm (max(||x||, eps) is used as divisor)
+/// `x`   -- input slice (ne00 elements, contiguous)
+/// `y`   -- output slice (ne00 elements)
+/// `eps` -- minimum norm (max(||x||, eps) is used as divisor)
 pub fn l2_norm_row_f32(x: &[f32], y: &mut [f32], eps: f32) {
     assert_eq!(x.len(), y.len());
     let mut sum: f64 = 0.0;
@@ -143,18 +143,18 @@ pub fn l2_norm_f32(src: &[f32], dst: &mut [f32], ne00: usize, ne01: usize, eps: 
     }
 }
 
-// ── Outer product ─────────────────────────────────────────────────────────────
+// -- Outer product -------------------------------------------------------------
 
 /// Outer product accumulation: `dst[i0] += src0[i0, i01] * src1[i1, i01]`.
 /// Direct translation of `ggml_compute_forward_out_prod_f32` inner loop
 /// (ops.cpp line 4371).
 ///
-/// `ne0`  — number of rows in src0 / columns in dst row
-/// `ne01` — shared contraction dimension
-/// `ne1`  — number of rows in src1
-/// `src0` — row-major [ne01, ne0]
-/// `src1` — row-major [ne01, ne1]
-/// `dst`  — row-major [ne1, ne0], **accumulated** (caller must zero before use)
+/// `ne0`  -- number of rows in src0 / columns in dst row
+/// `ne01` -- shared contraction dimension
+/// `ne1`  -- number of rows in src1
+/// `src0` -- row-major [ne01, ne0]
+/// `src1` -- row-major [ne01, ne1]
+/// `dst`  -- row-major [ne1, ne0], **accumulated** (caller must zero before use)
 pub fn out_prod_f32(src0: &[f32], src1: &[f32], dst: &mut [f32], ne0: usize, ne01: usize, ne1: usize) {
     assert_eq!(src0.len(), ne01 * ne0);
     assert_eq!(src1.len(), ne01 * ne1);
@@ -202,7 +202,7 @@ pub fn out_prod_f16_f32(
     }
 }
 
-// ── Scale ─────────────────────────────────────────────────────────────────────
+// -- Scale ---------------------------------------------------------------------
 
 /// Scale each element: `dst[i] = src[i] * s + b`.
 /// Direct translation of `ggml_compute_forward_scale_f32` (ops.cpp line 4697).
@@ -222,17 +222,17 @@ pub fn scale_f32(src: &[f32], dst: &mut [f32], s: f32, b: f32) {
     }
 }
 
-// ── Get-rows ──────────────────────────────────────────────────────────────────
+// -- Get-rows ------------------------------------------------------------------
 
 /// Gather rows from a float32 embedding table.
 /// Direct translation of `ggml_compute_forward_get_rows_f32` kernel body
 /// (ops.cpp line 5105).
 ///
-/// `table`  — row-major [n_vocab, nc], all rows contiguous
-/// `indices`— row indices to gather (values in [0, n_vocab))
-/// `dst`    — output [indices.len(), nc]
-/// `nc`     — number of columns (embedding dimension)
-/// `n_vocab`— number of rows in table
+/// `table`  -- row-major [n_vocab, nc], all rows contiguous
+/// `indices`-- row indices to gather (values in [0, n_vocab))
+/// `dst`    -- output [indices.len(), nc]
+/// `nc`     -- number of columns (embedding dimension)
+/// `n_vocab`-- number of rows in table
 pub fn get_rows_f32(table: &[f32], indices: &[i32], dst: &mut [f32], nc: usize, n_vocab: usize) {
     assert_eq!(table.len(), n_vocab * nc);
     assert_eq!(dst.len(), indices.len() * nc);
@@ -265,15 +265,15 @@ pub fn get_rows_f16(
     }
 }
 
-// ── Get-rows backward ─────────────────────────────────────────────────────────
+// -- Get-rows backward ---------------------------------------------------------
 
 /// Backward pass for get_rows (f32 src0).
 /// Direct translation of `ggml_compute_forward_get_rows_back_f32` (ops.cpp line 5361).
 ///
 /// Scatter-accumulates gradients: `dst[indices[i]] += src0[i]`.
-/// `src0`    — upstream gradient rows, [nr, nc]
-/// `indices` — which dst row each src0 row maps to (length nr)
-/// `dst`     — accumulation buffer, pre-zeroed, [n_vocab, nc]
+/// `src0`    -- upstream gradient rows, [nr, nc]
+/// `indices` -- which dst row each src0 row maps to (length nr)
+/// `dst`     -- accumulation buffer, pre-zeroed, [n_vocab, nc]
 pub fn get_rows_back_f32(src0: &[f32], indices: &[i32], dst: &mut [f32], nc: usize) {
     let nr = indices.len();
     assert_eq!(src0.len(), nr * nc);
@@ -287,7 +287,7 @@ pub fn get_rows_back_f32(src0: &[f32], indices: &[i32], dst: &mut [f32], nc: usi
     }
 }
 
-/// Backward pass for get_rows (f16 src0 → f32 accumulation).
+/// Backward pass for get_rows (f16 src0 -> f32 accumulation).
 /// Direct translation of `ggml_compute_forward_get_rows_back_f32_f16` (ops.cpp line 5328).
 pub fn get_rows_back_f16(
     src0_f16: &[u16], // raw f16 bits, [nr, nc]
@@ -307,14 +307,14 @@ pub fn get_rows_back_f16(
     }
 }
 
-// ── Diagonal ─────────────────────────────────────────────────────────────────
+// -- Diagonal -----------------------------------------------------------------
 
 /// Build a diagonal matrix from a 1-D vector.
 /// Direct translation of `ggml_compute_forward_diag_f32` (ops.cpp line 5436).
 ///
-/// `src`   — input vector length `n`
-/// `dst`   — output [n, n] row-major (must be zeroed by caller)
-/// `n`     — size
+/// `src`   -- input vector length `n`
+/// `dst`   -- output [n, n] row-major (must be zeroed by caller)
+/// `n`     -- size
 pub fn diag_f32(src: &[f32], dst: &mut [f32], n: usize) {
     assert_eq!(src.len(), n);
     assert_eq!(dst.len(), n * n);
@@ -324,17 +324,17 @@ pub fn diag_f32(src: &[f32], dst: &mut [f32], n: usize) {
     }
 }
 
-// ── Diagonal mask ─────────────────────────────────────────────────────────────
+// -- Diagonal mask -------------------------------------------------------------
 
 /// Set above-diagonal entries to `value` (in-place or out-of-place).
 /// Direct translation of `ggml_compute_forward_diag_mask_f32` inner loop
 /// (ops.cpp line 5496).
 ///
-/// `data`   — row-major [nz, nr, nc] in row-major order
-/// `nr`     — number of rows per "z-slice"
-/// `nc`     — number of columns (inner-most)
-/// `nz`     — number of z-slices
-/// `n_past` — columns up to `n_past` (inclusive) are left intact; columns
+/// `data`   -- row-major [nz, nr, nc] in row-major order
+/// `nr`     -- number of rows per "z-slice"
+/// `nc`     -- number of columns (inner-most)
+/// `nz`     -- number of z-slices
+/// `n_past` -- columns up to `n_past` (inclusive) are left intact; columns
 ///            `n_past+1..j` (i.e. those above the diagonal + n_past offset)
 ///            are set to `value`
 pub fn diag_mask_inplace_f32(data: &mut [f32], nr: usize, nc: usize, nz: usize, n_past: usize, value: f32) {
@@ -362,19 +362,19 @@ pub fn diag_mask_zero_f32(data: &mut [f32], nr: usize, nc: usize, nz: usize, n_p
     diag_mask_inplace_f32(data, nr, nc, nz, n_past, 0.0);
 }
 
-// ── Softmax ───────────────────────────────────────────────────────────────────
+// -- Softmax -------------------------------------------------------------------
 
 /// Numerically-stable softmax over a single row.
 /// Direct translation of the inner body of `ggml_compute_forward_soft_max_f32`
 /// (ops.cpp line 5584).
 ///
-/// `scale`     — multiply inputs by `scale` before softmax
-/// `max_bias`  — ALiBi head-slope bias (0 = no ALiBi)
-/// `n_head`    — total number of attention heads (for ALiBi computation)
-/// `head_idx`  — zero-based head index (for ALiBi)
-/// `x`         — logits input (ne00 elements)
-/// `mask`      — optional additive mask (same length as `x`); may be `None`
-/// `y`         — softmax output
+/// `scale`     -- multiply inputs by `scale` before softmax
+/// `max_bias`  -- ALiBi head-slope bias (0 = no ALiBi)
+/// `n_head`    -- total number of attention heads (for ALiBi computation)
+/// `head_idx`  -- zero-based head index (for ALiBi)
+/// `x`         -- logits input (ne00 elements)
+/// `mask`      -- optional additive mask (same length as `x`); may be `None`
+/// `y`         -- softmax output
 pub fn softmax_row_f32(
     x: &[f32],
     mask: Option<&[f32]>,
@@ -433,16 +433,16 @@ pub fn softmax_row_f32(
 /// Direct translation of `ggml_compute_forward_soft_max_ext_back_f32` kernel
 /// (ops.cpp line 5717).
 ///
-/// `dy` — upstream gradient (softmax output gradient)
-/// `y`  — softmax forward-pass output
-/// `dx` — gradient w.r.t. softmax input
-/// `scale` — scale that was applied in the forward pass
+/// `dy` -- upstream gradient (softmax output gradient)
+/// `y`  -- softmax forward-pass output
+/// `dx` -- gradient w.r.t. softmax input
+/// `scale` -- scale that was applied in the forward pass
 pub fn softmax_back_row_f32(dy: &[f32], y: &[f32], dx: &mut [f32], scale: f32) {
     let n = dy.len();
     assert_eq!(y.len(), n);
     assert_eq!(dx.len(), n);
 
-    // dot_y_dy = y · dy
+    // dot_y_dy = y * dy
     let dot_y_dy: f32 = y.iter().zip(dy.iter()).map(|(&yi, &di)| yi * di).sum();
 
     // dx = y * (dy - dot_y_dy) * scale
@@ -451,7 +451,7 @@ pub fn softmax_back_row_f32(dy: &[f32], y: &[f32], dx: &mut [f32], scale: f32) {
     }
 }
 
-// ── Clamp ─────────────────────────────────────────────────────────────────────
+// -- Clamp ---------------------------------------------------------------------
 
 /// Element-wise clamp.
 /// Direct translation of `ggml_compute_forward_clamp_f32` (ops.cpp line 5821).
@@ -472,7 +472,7 @@ pub fn clamp_f16(src_f16: &[u16], dst_f16: &mut [u16], min: f32, max: f32) {
     }
 }
 
-// ── RoPE helpers ──────────────────────────────────────────────────────────────
+// -- RoPE helpers --------------------------------------------------------------
 
 /// YaRN ramp function.
 /// Direct translation of `rope_yarn_ramp` (ops.cpp line 5951).
@@ -587,7 +587,7 @@ pub fn rotate_pairs_f16(
     }
 }
 
-// ── RoPE mode constants (mirrors GGML_ROPE_TYPE_*) ───────────────────────────
+// -- RoPE mode constants (mirrors GGML_ROPE_TYPE_*) ---------------------------
 
 /// RoPE rotation modes (mirror of `GGML_ROPE_TYPE_*`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -599,22 +599,22 @@ pub enum RopeMode {
     IMRope,  // GGML_ROPE_TYPE_IMROPE = 25 (qwen3vl)
 }
 
-// ── 1-D transposed convolution ────────────────────────────────────────────────
+// -- 1-D transposed convolution ------------------------------------------------
 
 /// 1-D transposed convolution accumulation (single output row, f32 kernel).
 /// Direct translation of the inner kernel in
 /// `ggml_compute_forward_conv_transpose_1d_f32` (ops.cpp line 6376).
 ///
-/// `kernel`     — permuted kernel: row `i1` has shape [ne02, ne00], stored as
+/// `kernel`     -- permuted kernel: row `i1` has shape [ne02, ne00], stored as
 ///                `wdata[i1 * ne02 * ne00 ..]`
-/// `src`        — permuted source: shape [ne10, ne11], stored as
+/// `src`        -- permuted source: shape [ne10, ne11], stored as
 ///                `wdata_src[..]` (ne11 = channels, ne10 = time-steps)
-/// `dst_row`    — output row (length at least `ne10 * s0 + ne00`)
-/// `ne00`       — kernel width
-/// `ne02`       — number of input channels (Cin)
-/// `ne10`       — source time-steps
-/// `ne11`       — source channels (must equal ne02)
-/// `s0`         — output stride
+/// `dst_row`    -- output row (length at least `ne10 * s0 + ne00`)
+/// `ne00`       -- kernel width
+/// `ne02`       -- number of input channels (Cin)
+/// `ne10`       -- source time-steps
+/// `ne11`       -- source channels (must equal ne02)
+/// `s0`         -- output stride
 pub fn conv_transpose_1d_row_f32(
     kernel: &[f32],  // shape [ne00, ne02] (row i1 slice)
     src: &[f32],     // shape [ne10, ne11]
@@ -643,7 +643,7 @@ pub fn conv_transpose_1d_row_f32(
     }
 }
 
-// ── im2col ────────────────────────────────────────────────────────────────────
+// -- im2col --------------------------------------------------------------------
 
 /// im2col for a 2-D convolution (f32 output).
 /// Direct translation of `ggml_compute_forward_im2col_f32` (ops.cpp line 6490).
@@ -742,13 +742,13 @@ pub fn im2col_f16_from_f32(
     }
 }
 
-// ── im2col backward ───────────────────────────────────────────────────────────
+// -- im2col backward -----------------------------------------------------------
 
 /// Backward pass of im2col (col2im-style gradient accumulation).
 /// Direct translation of `ggml_compute_forward_im2col_back_f32` (ops.cpp line 6665).
 ///
-/// `grad_out` — gradient of im2col output, [N, OH, OW, IC*KH*KW]
-/// `grad_in`  — gradient w.r.t. im2col input, [N, IC, IH, IW]
+/// `grad_out` -- gradient of im2col output, [N, OH, OW, IC*KH*KW]
+/// `grad_in`  -- gradient w.r.t. im2col input, [N, IC, IH, IW]
 pub fn im2col_back_f32(
     grad_out: &[f32],
     grad_in: &mut [f32],
@@ -804,7 +804,7 @@ pub fn im2col_back_f32(
     }
 }
 
-// ── im2col 3D ─────────────────────────────────────────────────────────────────
+// -- im2col 3D -----------------------------------------------------------------
 
 /// im2col for 3-D convolution (f32 output, f32 input).
 /// Direct translation of `ggml_compute_forward_im2col_3d_f32` (ops.cpp line 6851).
@@ -882,20 +882,20 @@ pub fn im2col_3d_f32(
     }
 }
 
-// ── col2im 1D ─────────────────────────────────────────────────────────────────
+// -- col2im 1D -----------------------------------------------------------------
 
 /// col2im scatter-accumulation for 1-D signals.
 /// Direct translation of `ggml_compute_forward_col2im_1d_impl<float>` (ops.cpp line 7017).
 ///
-/// `col`    — column data layout [K*OC, T_in]
-/// `dst`    — output signal layout [T_out, OC]  (must be pre-zeroed)
-/// `k_oc`  — K * OC (number of rows in col)
-/// `t_in`  — number of input time-steps
-/// `t_out` — number of output time-steps
-/// `oc`    — number of output channels
-/// `k`     — kernel size
-/// `s0`    — stride
-/// `p0`    — padding
+/// `col`    -- column data layout [K*OC, T_in]
+/// `dst`    -- output signal layout [T_out, OC]  (must be pre-zeroed)
+/// `k_oc`  -- K * OC (number of rows in col)
+/// `t_in`  -- number of input time-steps
+/// `t_out` -- number of output time-steps
+/// `oc`    -- number of output channels
+/// `k`     -- kernel size
+/// `s0`    -- stride
+/// `p0`    -- padding
 pub fn col2im_1d_f32(
     col: &[f32],
     dst: &mut [f32],
@@ -938,14 +938,14 @@ pub fn col2im_1d_f32(
     }
 }
 
-// ── Depthwise 2-D convolution ─────────────────────────────────────────────────
+// -- Depthwise 2-D convolution -------------------------------------------------
 
 /// Depthwise 2-D convolution, WHCN layout (channels-last in channel axis).
 /// Direct translation of `ggml_compute_forward_conv_2d_dw_whcn` (ops.cpp line 7603).
 ///
-/// `src`    — [N, C, IH, IW] stored as `src[batch * c * ih * iw + c_i * ih * iw + ..]`
-/// `kernel` — [C, KH, KW] stored as `kernel[c_i * kh * kw + ..]`
-/// `dst`    — [N, C, OH, OW] same layout
+/// `src`    -- [N, C, IH, IW] stored as `src[batch * c * ih * iw + c_i * ih * iw + ..]`
+/// `kernel` -- [C, KH, KW] stored as `kernel[c_i * kh * kw + ..]`
+/// `dst`    -- [N, C, OH, OW] same layout
 pub fn conv_2d_dw_whcn(
     src: &[f32],
     kernel: &[f32],
@@ -1002,9 +1002,9 @@ pub fn conv_2d_dw_whcn(
 /// Depthwise 2-D convolution, CWHN layout (channels-first in the outer axis).
 /// Direct translation of `ggml_compute_forward_conv_2d_dw_cwhn` (ops.cpp line 7520).
 ///
-/// `src`    — [N, OH, OW, C] where the batch and spatial dims come first
-/// `kernel` — [KH, KW, C] stored as `kernel[(knl_y * knl_w + knl_x) * channels + c_i]`
-/// `dst`    — same shape as src
+/// `src`    -- [N, OH, OW, C] where the batch and spatial dims come first
+/// `kernel` -- [KH, KW, C] stored as `kernel[(knl_y * knl_w + knl_x) * channels + c_i]`
+/// `dst`    -- same shape as src
 pub fn conv_2d_dw_cwhn(
     src: &[f32],
     kernel: &[f32],
@@ -1060,7 +1060,7 @@ pub fn conv_2d_dw_cwhn(
     }
 }
 
-// ── 1-D pooling ──────────────────────────────────────────────────────────────
+// -- 1-D pooling --------------------------------------------------------------
 
 /// Pool operation selector (mirrors `ggml_op_pool`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1073,8 +1073,8 @@ pub enum PoolOp {
 /// Direct translation of `ggml_compute_forward_pool_1d_ksp` inner loop
 /// (ops.cpp line 7683).
 ///
-/// `src_row` — input row length `iw`
-/// `dst_row` — output row length `ow`; `ow = (iw + 2*p - k) / s + 1`
+/// `src_row` -- input row length `iw`
+/// `dst_row` -- output row length `ow`; `ow = (iw + 2*p - k) / s + 1`
 pub fn pool_1d_row_f32(
     src_row: &[f32],
     dst_row: &mut [f32],
@@ -1126,8 +1126,8 @@ pub fn pool_1d_row_f32(
 /// Direct translation of `ggml_compute_forward_pool_2d` inner loops
 /// (ops.cpp line 7769).
 ///
-/// `src_plane` — [IH, IW] row-major
-/// `dst_plane` — [OH, OW] row-major
+/// `src_plane` -- [IH, IW] row-major
+/// `dst_plane` -- [OH, OW] row-major
 pub fn pool_2d_plane_f32(
     src_plane: &[f32],
     dst_plane: &mut [f32],
@@ -1187,9 +1187,9 @@ pub fn pool_2d_plane_f32(
 /// For max pooling: scatters gradient to the location of the argmax.
 /// For avg pooling: distributes gradient evenly over the pooling window.
 ///
-/// `grad_out`   — upstream gradient [OH, OW]
-/// `fwd_dst`    — forward-pass output (needed for max argmax) [IH, IW]
-/// `grad_in`    — output gradient [IH, IW] (pre-zeroed)
+/// `grad_out`   -- upstream gradient [OH, OW]
+/// `fwd_dst`    -- forward-pass output (needed for max argmax) [IH, IW]
+/// `grad_in`    -- output gradient [IH, IW] (pre-zeroed)
 pub fn pool_2d_back_plane_f32(
     grad_out: &[f32],
     fwd_dst: &[f32],
@@ -1260,14 +1260,14 @@ pub fn pool_2d_back_plane_f32(
     }
 }
 
-// ── Upscale ───────────────────────────────────────────────────────────────────
+// -- Upscale -------------------------------------------------------------------
 
 /// Nearest-neighbour upscale for a 4-D tensor.
 /// Direct translation of `ggml_compute_forward_upscale_f32` nearest-neighbour
 /// branch (ops.cpp line 7978).
 ///
-/// `src`  — [ne00, ne01, ne02, ne03]
-/// `dst`  — [ne0, ne1, ne2, ne3]
+/// `src`  -- [ne00, ne01, ne02, ne03]
+/// `dst`  -- [ne0, ne1, ne2, ne3]
 /// Scale factors: `sf_i = ne_i / ne0i`.
 pub fn upscale_nearest_f32(
     src: &[f32],
@@ -1406,16 +1406,16 @@ mod tests {
     #[test]
     fn test_rope_yarn_ramp() {
         // at low boundary: ramp = 1 - 0 = 1
-        let r = rope_yarn_ramp(2.0, 4.0, 4); // i0/2=2 → y=(2-2)/(4-2)=0 → 1-0=1
+        let r = rope_yarn_ramp(2.0, 4.0, 4); // i0/2=2 -> y=(2-2)/(4-2)=0 -> 1-0=1
         assert!((r - 1.0).abs() < 1e-6);
         // at high boundary: ramp = 0
-        let r2 = rope_yarn_ramp(2.0, 4.0, 8); // i0/2=4 → y=(4-2)/2=1 → 1-1=0
+        let r2 = rope_yarn_ramp(2.0, 4.0, 8); // i0/2=4 -> y=(4-2)/2=1 -> 1-1=0
         assert!((r2 - 0.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_im2col_f32_identity() {
-        // 1x1 kernel, stride=1, no pad → output equals input
+        // 1x1 kernel, stride=1, no pad -> output equals input
         let src = vec![1.0_f32, 2.0, 3.0, 4.0];
         let mut dst = vec![0.0_f32; 4];
         im2col_f32(&src, &mut dst, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 0, 0, 1, 1);

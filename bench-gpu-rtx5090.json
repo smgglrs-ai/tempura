@@ -31,23 +31,23 @@
     "prefill_pp128_tok_s": 7335
   },
   "decode_tok_s_single_request": 108,
-  "decode_note": "single request; batched serving amortizes GEMV+attn overhead — 5+ requests fills all 170 SMs",
+  "decode_note": "single request; batched serving amortizes GEMV+attn overhead -- 5+ requests fills all 170 SMs",
   "bottleneck_analysis": {
     "q4k_bandwidth_ceiling_tok_s": 456,
     "q4k_actual_bw_pct": "34-42% (Nsight Compute measured)",
     "q4k_weight_data_per_token_gb": 3.93,
-    "opt5_confirmed_savings": "38ms/token CPU re-capture → 9.3ms/token total (4.5x improvement)",
+    "opt5_confirmed_savings": "38ms/token CPU re-capture -> 9.3ms/token total (4.5x improvement)",
     "confirmed_not_bottleneck": [
       "Memory load ordering (ptxas already reorders independent loads)",
       "K-loop memory latency hiding (multi-warp K-parallelism already in v2)",
       "CUDA graph re-capture (eliminated via Opt 5: single-capture + device kv_len pointer)"
     ],
     "remaining_1.9x_gap_confirmed_blockers": {
-      "gemv_6.1ms": "42% DRAM (vs llama.cpp 58%) — raw GGUF slower (scale decode overhead), VDR=2 applied, no further gains found",
-      "flash_attn_2ms": "32 blocks (1/head) on 170 SMs = 19% utilization — K-parallel warps tried, blocked by SM count not warp count",
-      "fix": "batch_size ≥ 5 fills all SMs; serving metric is requests×tokens/s, not single-request latency"
+      "gemv_6.1ms": "42% DRAM (vs llama.cpp 58%) -- raw GGUF slower (scale decode overhead), VDR=2 applied, no further gains found",
+      "flash_attn_2ms": "32 blocks (1/head) on 170 SMs = 19% utilization -- K-parallel warps tried, blocked by SM count not warp count",
+      "fix": "batch_size >= 5 fills all SMs; serving metric is requestsxtokens/s, not single-request latency"
     },
-    "next_lever": "Batched continuous inference — 5+ concurrent requests = 160+ flash-attn blocks on 170 SMs + GEMV batching amortizes weight bandwidth"
+    "next_lever": "Batched continuous inference -- 5+ concurrent requests = 160+ flash-attn blocks on 170 SMs + GEMV batching amortizes weight bandwidth"
   },
   "infrastructure_done": [
     "oxide Q2_0 two-output-per-warp (half-warp XOR butterfly reduce)",
@@ -60,7 +60,7 @@
   ],
   "oxide_kernel_optimizations": {
     "q2_0": [
-      "Two-output-per-warp: lanes 0-15 → neuron n, lanes 16-31 → neuron n+1",
+      "Two-output-per-warp: lanes 0-15 -> neuron n, lanes 16-31 -> neuron n+1",
       "Half-warp XOR butterfly reduce (mask 0x0000FFFF / 0xFFFF0000)",
       "Scale broadcast within half-warp via shuffle_sync(mask, val, base_lane)",
       "8 nibble words per lane per block (bit_pair = my_lane, constant)",

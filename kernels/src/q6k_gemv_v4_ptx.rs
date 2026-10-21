@@ -2,7 +2,7 @@
 ///
 /// # Why this kernel
 ///
-/// Q6K down_proj [4096×14336] has k_blocks=56 with 8 warps → 7 k_blocks/warp.
+/// Q6K down_proj [4096x14336] has k_blocks=56 with 8 warps -> 7 k_blocks/warp.
 /// ncu showed 32% DRAM utilization on the oxide kpar8 baseline. With 7 iterations,
 /// a 2-stage cp.async pipeline hides latency for all but the first block: the next
 /// block's 212-byte load overlaps with the current block's 8-step dequant + f32 FMA.
@@ -10,44 +10,44 @@
 /// # Q6K packed format (53 u32 = 212 bytes/block, native GGUF upload format)
 ///
 /// ```text
-/// u32[0]:      d (f32 bits) — super-scale, f16 → f32 at upload
+/// u32[0]:      d (f32 bits) -- super-scale, f16 -> f32 at upload
 /// u32[1..5]:   16 group scales as bias-128 u8 (4 per u32)
 ///              stored_byte = (scale_i8 + 128) as u8; decode: byte as f32 - 128.0
-/// u32[5..37]:  ql[0..128] — lower 4 bits of each weight (4 bytes per u32)
-/// u32[37..53]: qh[0..64]  — upper 2 bits of each weight (4 bytes per u32)
+/// u32[5..37]:  ql[0..128] -- lower 4 bits of each weight (4 bytes per u32)
+/// u32[37..53]: qh[0..64]  -- upper 2 bits of each weight (4 bytes per u32)
 /// ```
 ///
 /// # Launch geometry
 ///
-/// Grid:  (n_rows, 1, 1) — one block per output row
-/// Block: (256, 1, 1)    — 8 warps × 32 threads
-/// Smem:  3424 bytes (static): 32 bytes reduction + 8 warps × 2 buffers × 212 bytes
+/// Grid:  (n_rows, 1, 1) -- one block per output row
+/// Block: (256, 1, 1)    -- 8 warps x 32 threads
+/// Smem:  3424 bytes (static): 32 bytes reduction + 8 warps x 2 buffers x 212 bytes
 ///
 /// # K-parallelism with double-buffering
 ///
 /// Warp w handles blocks: w, w+8, w+16, ... (stride=8 warps).
 /// For k_blocks=56: each warp handles exactly 7 blocks.
 ///
-/// Prologue: cp.async block 0 → buf_A, wait, then enter loop.
+/// Prologue: cp.async block 0 -> buf_A, wait, then enter loop.
 /// Loop iteration i:
-///   1. Issue cp.async of block i+1 → buf_next (overlaps with step 2)
+///   1. Issue cp.async of block i+1 -> buf_next (overlaps with step 2)
 ///   2. Compute block i from buf_curr (8-step dequant + FMA, same as oxide kpar8)
 ///   3. cp.async.wait_group 0 (wait for block i+1 to land)
 ///   4. swap(curr, next)
 ///
-/// Hides ≈6/7 of per-block DRAM latency (blocks 0–5 overlap with next prefetch).
+/// Hides ~=6/7 of per-block DRAM latency (blocks 0-5 overlap with next prefetch).
 ///
 /// # Parameters (same layout as oxide q6k_gemv_dp4a_kpar8)
 ///
 /// ```text
-/// param_out:        .u64 — *mut f32, output [n_rows]
-/// param_out_len:    .u64 — n_rows (bounds guard)
-/// param_x:          .u64 — *const f32, activation [k_blocks * 256]
-/// param_x_len:      .u64 — activation length
-/// param_packed:     .u64 — *const u32, Q6K blocks [n_rows * k_blocks * 53]
-/// param_packed_len: .u64 — packed length
-/// param_n:          .u32 — n_rows
-/// param_k_blocks:   .u32 — k_blocks
+/// param_out:        .u64 -- *mut f32, output [n_rows]
+/// param_out_len:    .u64 -- n_rows (bounds guard)
+/// param_x:          .u64 -- *const f32, activation [k_blocks * 256]
+/// param_x_len:      .u64 -- activation length
+/// param_packed:     .u64 -- *const u32, Q6K blocks [n_rows * k_blocks * 53]
+/// param_packed_len: .u64 -- packed length
+/// param_n:          .u32 -- n_rows
+/// param_k_blocks:   .u32 -- k_blocks
 /// ```
 pub const PTX: &str = r#"
 .version 8.7
@@ -524,7 +524,7 @@ DONE:
 }
 "#;
 
-/// Kernel entry-point name — used by `cuModuleGetFunction`.
+/// Kernel entry-point name -- used by `cuModuleGetFunction`.
 pub const ENTRY: &str = "q6k_gemv_sm120_mbar_kpar8";
 
 /// Minimum compute capability (sm_120 = Blackwell consumer).

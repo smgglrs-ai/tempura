@@ -5,7 +5,7 @@ use crate::Result;
 use std::arch::x86_64::*;
 
 /// AVX2 scale-and-weight-multiply: `row[i] = row[i] * scale * weight[i]`.
-/// Processes 32 floats per loop iteration (4 × 8-wide), matching llama.cpp's
+/// Processes 32 floats per loop iteration (4 x 8-wide), matching llama.cpp's
 /// `ggml_vec_scale_f32` + `ggml_vec_mul_f32` fused pattern.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -141,7 +141,7 @@ impl RMSNorm for CpuRMSNormGgml {
             let mean: f32 = (sum / hidden_size as f64) as f32;
             let scale: f32 = 1.0f32 / (mean + eps).sqrt();
 
-            // AVX2: 4×8-wide multiply matching llama.cpp's ggml_vec_scale_f32 + ggml_vec_mul_f32
+            // AVX2: 4x8-wide multiply matching llama.cpp's ggml_vec_scale_f32 + ggml_vec_mul_f32
             if use_avx2 {
                 #[cfg(target_arch = "x86_64")]
                 unsafe { scale_mul_avx2(row, weight, scale); }
@@ -576,7 +576,7 @@ mod tests {
 
         rn.forward(&mut x, &weight, hidden, 1e-6).unwrap();
 
-        // RMS of [3,4] = sqrt((9+16)/2) = sqrt(12.5) ≈ 3.5355
+        // RMS of [3,4] = sqrt((9+16)/2) = sqrt(12.5) ~= 3.5355
         let rms_orig = (12.5f32).sqrt();
         assert_relative_eq!(x[0], 3.0 / rms_orig * 2.0, epsilon = 1e-4);
         assert_relative_eq!(x[1], 4.0 / rms_orig * 0.5, epsilon = 1e-4);

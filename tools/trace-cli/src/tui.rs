@@ -82,7 +82,7 @@ pub fn run_tui(
             };
             let footer = Line::from(vec![
                 Span::styled(tab_label, Style::default().fg(Color::Cyan)),
-                Span::raw("  |  ↑↓ scroll  q quit"),
+                Span::raw("  |  ?????? scroll  q quit"),
             ]);
             f.render_widget(Paragraph::new(footer), chunks[2]);
         })?;

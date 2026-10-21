@@ -1,14 +1,14 @@
-//! Verus-verified end-to-end pipeline composition — unbounded proofs
+//! Verus-verified end-to-end pipeline composition -- unbounded proofs
 //!
 //! Proves: the full inference pipeline composes correctly when each component's
-//! preconditions are met. Config → weights → forward → KV cache → sampling → output.
+//! preconditions are met. Config -> weights -> forward -> KV cache -> sampling -> output.
 
 use vstd::prelude::*;
 
 verus! {
 
 // ============================================================================
-// Pipeline: config is valid → embedding lookup is safe
+// Pipeline: config is valid -> embedding lookup is safe
 // ============================================================================
 
 proof fn config_enables_embedding(
@@ -30,7 +30,7 @@ proof fn config_enables_embedding(
 }
 
 // ============================================================================
-// Pipeline: forward produces hidden[seq_len × hidden_size] → matmul with lm_head
+// Pipeline: forward produces hidden[seq_len x hidden_size] -> matmul with lm_head
 // ============================================================================
 
 proof fn forward_feeds_lm_head(
@@ -58,7 +58,7 @@ proof fn forward_feeds_lm_head(
 }
 
 // ============================================================================
-// Pipeline: logits[vocab_size] → sampling → token_id < vocab_size
+// Pipeline: logits[vocab_size] -> sampling -> token_id < vocab_size
 // ============================================================================
 
 proof fn sampling_produces_valid_token(
@@ -74,7 +74,7 @@ proof fn sampling_produces_valid_token(
 }
 
 // ============================================================================
-// Pipeline: token_id → next forward call (single token decode)
+// Pipeline: token_id -> next forward call (single token decode)
 // ============================================================================
 
 proof fn decode_step_feeds_forward(
@@ -97,7 +97,7 @@ proof fn decode_step_feeds_forward(
 }
 
 // ============================================================================
-// Pipeline: forward → KV cache append → advance — seq_len tracks correctly
+// Pipeline: forward -> KV cache append -> advance -- seq_len tracks correctly
 // ============================================================================
 
 proof fn forward_kv_advance_pipeline(
@@ -175,7 +175,7 @@ proof fn session_consistent_through_generation(
 
 // ============================================================================
 // Pipeline: GQA is safe end-to-end
-// Q projection → GQA head mapping → KV access → attention output
+// Q projection -> GQA head mapping -> KV access -> attention output
 // ============================================================================
 
 proof fn gqa_pipeline_safe(

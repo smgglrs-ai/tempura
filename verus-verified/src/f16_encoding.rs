@@ -1,4 +1,4 @@
-//! Verus-verified f16 (half precision) encoding properties — unbounded proofs
+//! Verus-verified f16 (half precision) encoding properties -- unbounded proofs
 //!
 //! Proves: field extraction, exponent bias conversion, special value encoding
 //! (zero, inf, NaN), and bit field widths for IEEE 754 half precision.
@@ -102,7 +102,7 @@ proof fn f16_nan_has_nonzero_frac(bits: u16)
 }
 
 // ============================================================================
-// f16→f32 exponent conversion: f32_exp = f16_exp - 15 + 127
+// f16->f32 exponent conversion: f32_exp = f16_exp - 15 + 127
 // ============================================================================
 
 proof fn f16_to_f32_exp_bias(f16_exp: nat)
@@ -118,7 +118,7 @@ proof fn f16_to_f32_exp_bias(f16_exp: nat)
 }
 
 // ============================================================================
-// f32→f16 exponent conversion: f16_exp = f32_exp - 127 + 15
+// f32->f16 exponent conversion: f16_exp = f32_exp - 127 + 15
 // ============================================================================
 
 proof fn f32_to_f16_exp_bias(f32_exp: nat)

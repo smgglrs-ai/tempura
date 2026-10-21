@@ -13,8 +13,8 @@ fn main() {
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
-    // Generate f16→f32 lookup table (65536 entries × 4 bytes = 256KB).
-    // Matches llama.cpp's ggml_table_f32_f16 — allows single indexed load [table+idx*4].
+    // Generate f16->f32 lookup table (65536 entries x 4 bytes = 256KB).
+    // Matches llama.cpp's ggml_table_f32_f16 -- allows single indexed load [table+idx*4].
     let table_path = std::path::Path::new(&out_dir).join("f16_table.bin");
     if !table_path.exists() {
         let mut table = Vec::with_capacity(65536 * 4);
@@ -26,8 +26,8 @@ fn main() {
         std::fs::write(&table_path, &table).unwrap();
     }
 
-    // GELU lookup table: gelu(f32_from_f16(i)) stored as f16 bits (65536 × 2 = 128KB).
-    // Matches llama.cpp's ggml_table_gelu_f16 — f32→f16 index + one load replaces tanh/exp.
+    // GELU lookup table: gelu(f32_from_f16(i)) stored as f16 bits (65536 x 2 = 128KB).
+    // Matches llama.cpp's ggml_table_gelu_f16 -- f32->f16 index + one load replaces tanh/exp.
     let gelu_path = std::path::Path::new(&out_dir).join("gelu_table.bin");
     if !gelu_path.exists() {
         let mut table = Vec::with_capacity(65536 * 2);
@@ -53,7 +53,7 @@ fn main() {
         std::fs::write(&gelu_quick_path, &table).unwrap();
     }
 
-    // E8M0 half lookup table: ggml_table_f32_e8m0_half (256 entries × 4 bytes = 1KB).
+    // E8M0 half lookup table: ggml_table_f32_e8m0_half (256 entries x 4 bytes = 1KB).
     // Matches llama.cpp's ggml_table_f32_e8m0_half = GGML_E8M0_TO_FP32_HALF(i).
     // Value = 2^(i-128) = ggml_e8m0_to_fp32(i) / 2.
     let e8m0_half_path = std::path::Path::new(&out_dir).join("e8m0_half_table.bin");
@@ -66,9 +66,9 @@ fn main() {
         std::fs::write(&e8m0_half_path, &table).unwrap();
     }
 
-    // UE4M3 lookup table: ggml_table_f32_ue4m3 (256 entries × 4 bytes = 1KB).
+    // UE4M3 lookup table: ggml_table_f32_ue4m3 (256 entries x 4 bytes = 1KB).
     // Matches llama.cpp's ggml_ue4m3_to_fp32: unsigned 4-exp 3-mantissa, bias=7,
-    // returns raw * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 × E2M1_float).
+    // returns raw * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 x E2M1_float).
     let ue4m3_path = std::path::Path::new(&out_dir).join("ue4m3_table.bin");
     if !ue4m3_path.exists() {
         let mut table = Vec::with_capacity(256 * 4);
@@ -81,7 +81,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
 
-    // ── oxide-gemv: compile Q2_0 GEMV kernel with rustc-codegen-cuda ─────────
+    // -- oxide-gemv: compile Q2_0 GEMV kernel with rustc-codegen-cuda ---------
     // When the `oxide-gemv` feature is requested and `cargo-oxide` is in PATH,
     // we build `tools/oxide-gemv` with `cargo oxide build`, then extract the
     // embedded PTX from the compiled binary and write it to OUT_DIR.
@@ -101,7 +101,7 @@ fn build_oxide_q2_gemv(out_dir: &str) {
 
     // Path to the oxide-gemv standalone crate (relative to workspace root).
     let oxide_crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()  // kernels/ → workspace root
+        .parent()  // kernels/ -> workspace root
         .unwrap()
         .join("tools/oxide-gemv");
 
@@ -124,7 +124,7 @@ fn build_oxide_q2_gemv(out_dir: &str) {
 
     if !oxide_binary.exists() {
         // Run `cargo oxide build` to compile the kernel.
-        eprintln!("build.rs: running `cargo oxide build` for oxide_q2_gemv kernel…");
+        eprintln!("build.rs: running `cargo oxide build` for oxide_q2_gemv kernel...");
         let status = Command::new("cargo")
             .arg("oxide")
             .arg("build")
@@ -191,7 +191,7 @@ sys.stdout.buffer.write(data[ptx_start:ptx_end])
         Ok(out) if out.status.success() && !out.stdout.is_empty() => {
             std::fs::write(&ptx_path, &out.stdout).unwrap();
             eprintln!(
-                "build.rs: oxide PTX extracted → {} ({} bytes)",
+                "build.rs: oxide PTX extracted -> {} ({} bytes)",
                 ptx_path.display(),
                 out.stdout.len()
             );
@@ -231,7 +231,7 @@ fn build_oxide_q4k_gemv(out_dir: &str) {
     let oxide_binary = oxide_crate_dir.join("target/release/oxide-gemv-q4k");
 
     if !oxide_binary.exists() {
-        eprintln!("build.rs: running `cargo oxide build` for oxide_q4k_gemv kernel…");
+        eprintln!("build.rs: running `cargo oxide build` for oxide_q4k_gemv kernel...");
         let status = Command::new("cargo")
             .arg("oxide")
             .arg("build")
@@ -294,7 +294,7 @@ sys.stdout.buffer.write(data[ptx_start:ptx_end])
         Ok(out) if out.status.success() && !out.stdout.is_empty() => {
             std::fs::write(&ptx_path, &out.stdout).unwrap();
             eprintln!(
-                "build.rs: oxide Q4K PTX extracted → {} ({} bytes)",
+                "build.rs: oxide Q4K PTX extracted -> {} ({} bytes)",
                 ptx_path.display(),
                 out.stdout.len()
             );
@@ -334,7 +334,7 @@ fn build_oxide_q6k_gemv(out_dir: &str) {
     let oxide_binary = oxide_crate_dir.join("target/release/oxide-gemv-q6k");
 
     if !oxide_binary.exists() {
-        eprintln!("build.rs: running `cargo oxide build` for oxide_q6k_gemv kernel…");
+        eprintln!("build.rs: running `cargo oxide build` for oxide_q6k_gemv kernel...");
         let status = Command::new("cargo")
             .arg("oxide")
             .arg("build")
@@ -397,7 +397,7 @@ sys.stdout.buffer.write(data[ptx_start:ptx_end])
         Ok(out) if out.status.success() && !out.stdout.is_empty() => {
             std::fs::write(&ptx_path, &out.stdout).unwrap();
             eprintln!(
-                "build.rs: oxide Q6K PTX extracted → {} ({} bytes)",
+                "build.rs: oxide Q6K PTX extracted -> {} ({} bytes)",
                 ptx_path.display(),
                 out.stdout.len()
             );
@@ -427,7 +427,7 @@ fn e8m0_to_f32_half_build(x: u8) -> f32 {
 
 fn ue4m3_to_f32_build(x: u8) -> f32 {
     // Matches ggml_ue4m3_to_fp32: UE4M3 unsigned (4 exp bits, bias=7; 3 mantissa bits).
-    // Returns raw * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 × E2M1_float).
+    // Returns raw * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 x E2M1_float).
     if x == 0 || x == 0x7F {
         return 0.0f32;
     }

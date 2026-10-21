@@ -6,7 +6,7 @@
 // ARM NEON/SVE, RISC-V, POWER9, LoongArch, WASM, and s390x are omitted
 // because this crate targets x86-64 inference workloads.
 
-// ── FP16 ↔ FP32 conversion ────────────────────────────────────────────────
+// -- FP16 ??? FP32 conversion ------------------------------------------------
 //
 // On x86: GGML_CPU_COMPUTE_FP16_TO_FP32(x) = _cvtsh_ss(x)  (F16C)
 //         GGML_CPU_COMPUTE_FP32_TO_FP16(x) = _cvtss_sh(x, 0) (F16C)
@@ -51,16 +51,16 @@ pub fn fp32_to_fp16(f: f32) -> u16 {
     }
 }
 
-// ── SIMD constants ─────────────────────────────────────────────────────────
+// -- SIMD constants ---------------------------------------------------------
 //
 // GGML_F32_EPR: elements per register (number of f32 lanes in one SIMD vec).
 // GGML_F32_STEP = 4 * GGML_F32_EPR (llama.cpp unrolls 4 vectors per step).
 // GGML_F32_ARR  = GGML_F32_STEP / GGML_F32_EPR = 4 (accumulator array size).
 //
-// AVX512F: __m512  → 16 lanes  STEP=64  ARR=4
-// AVX2:    __m256  →  8 lanes  STEP=32  ARR=4
-// SSE3:    __m128  →  4 lanes  STEP=32  ARR=8  (llama.cpp uses STEP=32/EPR=4)
-// Scalar:           →  1 lane  (no SIMD)
+// AVX512F: __m512  -> 16 lanes  STEP=64  ARR=4
+// AVX2:    __m256  ->  8 lanes  STEP=32  ARR=4
+// SSE3:    __m128  ->  4 lanes  STEP=32  ARR=8  (llama.cpp uses STEP=32/EPR=4)
+// Scalar:           ->  1 lane  (no SIMD)
 
 #[cfg(target_feature = "avx512f")]
 pub const F32_EPR: usize = 16;
@@ -102,13 +102,13 @@ pub const F32_STEP: usize = 1;
 #[cfg(not(any(target_feature = "sse3", target_feature = "avx2", target_feature = "avx512f")))]
 pub const F32_ARR: usize = 1;
 
-// ── GEMM register tile constants ───────────────────────────────────────────
+// -- GEMM register tile constants -------------------------------------------
 //
 // Matching llama.cpp simd-gemm.h GEMM_RM / GEMM_RN.
 // These are in units of F32_EPR (one tile column = RN * EPR floats).
 //
-// AVX512F / ARM NEON: RM=4  RN=4  → 4*4+4+1 = 21/32 registers
-// AVX2    / AVX:      RM=6  RN=2  → 6*2+2+1 = 15/16 registers
+// AVX512F / ARM NEON: RM=4  RN=4  -> 4*4+4+1 = 21/32 registers
+// AVX2    / AVX:      RM=6  RN=2  -> 6*2+2+1 = 15/16 registers
 // Other SIMD:         RM=2  RN=2
 
 #[cfg(target_feature = "avx512f")]
@@ -126,9 +126,9 @@ pub const GEMM_RM: usize = 2;
 #[cfg(not(any(target_feature = "avx2", target_feature = "avx512f")))]
 pub const GEMM_RN: usize = 2;
 
-// ── AVX2 F32x8 operations ──────────────────────────────────────────────────
+// -- AVX2 F32x8 operations --------------------------------------------------
 //
-// Maps GGML_F32x8_* macros from simd-mappings.h § "F32 AVX" to Rust.
+// Maps GGML_F32x8_* macros from simd-mappings.h ?? "F32 AVX" to Rust.
 // All functions are `#[inline(always)] unsafe` to match the macro semantics.
 
 #[cfg(target_arch = "x86_64")]
@@ -217,9 +217,9 @@ pub mod avx2 {
     }
 }
 
-// ── AVX512F F32x16 operations ──────────────────────────────────────────────
+// -- AVX512F F32x16 operations ----------------------------------------------
 //
-// Maps GGML_F32x16_* macros from simd-mappings.h § "F32 AVX512".
+// Maps GGML_F32x16_* macros from simd-mappings.h ?? "F32 AVX512".
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 pub mod avx512 {
@@ -287,9 +287,9 @@ pub mod avx512 {
     }
 }
 
-// ── SSE3 F32x4 operations ─────────────────────────────────────────────────
+// -- SSE3 F32x4 operations -------------------------------------------------
 //
-// Maps GGML_F32x4_* macros from simd-mappings.h § "F32 SSE".
+// Maps GGML_F32x4_* macros from simd-mappings.h ?? "F32 SSE".
 
 #[cfg(target_arch = "x86_64")]
 pub mod sse3 {

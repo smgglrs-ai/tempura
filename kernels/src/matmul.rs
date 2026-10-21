@@ -62,7 +62,7 @@ impl MatMul for CpuMatMul {
                 1,          // rhs_cs
                 n as isize, // rhs_rs
                 0.0f32,     // alpha: not reading dst
-                1.0f32,     // beta: dst = 1.0 * lhs × rhs
+                1.0f32,     // beta: dst = 1.0 * lhs x rhs
                 false,      // conj_dst
                 false,      // conj_lhs
                 false,      // conj_rhs
@@ -101,7 +101,7 @@ impl MatMul for CpuMatMul {
             });
         }
 
-        // b is [n, k] row-major — swap rhs strides to read it as [k, n]
+        // b is [n, k] row-major -- swap rhs strides to read it as [k, n]
         unsafe {
             gemm::gemm(
                 m,
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn test_identity_matrix() {
         let mm = CpuMatMul;
-        // 2x2 identity × [1,2; 3,4] = [1,2; 3,4]
+        // 2x2 identity x [1,2; 3,4] = [1,2; 3,4]
         let identity = vec![1.0, 0.0, 0.0, 1.0];
         let b = vec![1.0, 2.0, 3.0, 4.0];
         let mut output = vec![0.0; 4];
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn test_known_2x2() {
         let mm = CpuMatMul;
-        // [1,2; 3,4] × [5,6; 7,8] = [19,22; 43,50]
+        // [1,2; 3,4] x [5,6; 7,8] = [19,22; 43,50]
         let a = vec![1.0, 2.0, 3.0, 4.0];
         let b = vec![5.0, 6.0, 7.0, 8.0];
         let mut output = vec![0.0; 4];
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn test_known_3x3() {
         let mm = CpuMatMul;
-        // [1,0,0; 0,1,0; 0,0,1] × [1,2,3; 4,5,6; 7,8,9]
+        // [1,0,0; 0,1,0; 0,0,1] x [1,2,3; 4,5,6; 7,8,9]
         let a = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let b = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
         let mut output = vec![0.0; 9];
@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn test_non_square() {
         let mm = CpuMatMul;
-        // [1,2,3] (1x3) × [4; 5; 6] (3x1) = [32] (1x1)
+        // [1,2,3] (1x3) x [4; 5; 6] (3x1) = [32] (1x1)
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![4.0, 5.0, 6.0];
         let mut output = vec![0.0; 1];

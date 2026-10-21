@@ -1,5 +1,5 @@
 //! Direct translation of llama.cpp arch/x86/repack.cpp and ggml-cpu/repack.cpp
-//! AVX2 GEMV/GEMM kernels for Q4_K × Q8_K, and scalar GEMV/GEMM for Q2_K/Q5_K/Q6_K.
+//! AVX2 GEMV/GEMM kernels for Q4_K x Q8_K, and scalar GEMV/GEMM for Q2_K/Q5_K/Q6_K.
 //!
 //! Sources:
 //! - ggml_gemv_q4_K_8x8_q8_K:     arch/x86/repack.cpp lines 1464-1685
@@ -31,7 +31,7 @@ const QK_K: usize = 256;
 // K_SCALE_SIZE: bytes per sub-block scale encoding in Q4_K/Q5_K
 const K_SCALE_SIZE: usize = 12;
 
-// ── repacking ────────────────────────────────────────────────────────────────
+// -- repacking ----------------------------------------------------------------
 
 /// Direct translation of make_block_q4_Kx8 (ggml-cpu/repack.cpp line 3177).
 /// Interleaves 8 Q4_K blocks into the packed BlockQ4Kx8 format.
@@ -103,7 +103,7 @@ pub fn make_block_q4_kx8(in_blocks: &[BlockQ4K; 8], blck_size_interleave: usize)
 }
 
 /// Direct translation of repack_q4_K_to_q4_K_8_bl (ggml-cpu/repack.cpp line 3572).
-/// Repacks a full weight matrix (nrow × nblocks Q4_K blocks) into BlockQ4Kx8 format.
+/// Repacks a full weight matrix (nrow x nblocks Q4_K blocks) into BlockQ4Kx8 format.
 /// Returns Err if dimensions are not multiples of 8.
 pub fn repack_q4_k_to_q4_k_8_bl(
     src: &[BlockQ4K],
@@ -141,16 +141,16 @@ pub fn repack_q4_k_to_q4_k_8_bl(
     Ok(())
 }
 
-// ── AVX2 GEMV ────────────────────────────────────────────────────────────────
+// -- AVX2 GEMV ----------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
 /// Direct translation of ggml_gemv_q4_K_8x8_q8_K (arch/x86/repack.cpp line 1464).
 ///
-/// Computes s[y * nc .. y * nc + nc] += Q4_K_packed × Q8_K activation.
-/// - vx: packed weights as BlockQ4Kx8 slice (nc/8 × nb blocks)
-/// - vy: activation as BlockQ8K slice (nr × nb blocks)
-/// - s:  output, nr × nc floats
+/// Computes s[y * nc .. y * nc + nc] += Q4_K_packed x Q8_K activation.
+/// - vx: packed weights as BlockQ4Kx8 slice (nc/8 x nb blocks)
+/// - vy: activation as BlockQ8K slice (nr x nb blocks)
+/// - s:  output, nr x nc floats
 /// - n:  token dimension (must be multiple of QK_K=256)
 /// - nr: number of activation rows (usually 1 for decode)
 /// - nc: number of weight columns (must be multiple of 8)
@@ -218,7 +218,7 @@ pub unsafe fn ggml_gemv_q4_k_8x8_q8_k(
                 let mut iacc_b     = _mm256_setzero_si256();
                 let mut iacc_min_b = _mm256_setzero_si256();
 
-                // Load bsums from Q8_K (16 × i16 = 32 bytes)
+                // Load bsums from Q8_K (16 x i16 = 32 bytes)
                 let q8sums = _mm256_loadu_si256(a.bsums.as_ptr() as *const __m256i);
                 let mut q8s = _mm256_castsi128_si256(_mm_hadd_epi16(
                     _mm256_castsi256_si128(q8sums),
@@ -228,7 +228,7 @@ pub unsafe fn ggml_gemv_q4_k_8x8_q8_k(
 
                 // Process two sub-blocks per iteration (QK_K/64 = 4 iterations)
                 for sb in 0..(QK_K / 64) as isize {
-                    // Load 8 interleaved Q4_K sub-block data (8 × 32 bytes = 256 bytes per sub-block pair)
+                    // Load 8 interleaved Q4_K sub-block data (8 x 32 bytes = 256 bytes per sub-block pair)
                     let base = bp.qs.as_ptr().offset(sb * 256);
                     let rhs_raw_vec_0123_0 = _mm256_loadu_si256(base.offset(  0) as *const __m256i);
                     let rhs_raw_vec_4567_0 = _mm256_loadu_si256(base.offset( 32) as *const __m256i);
@@ -239,7 +239,7 @@ pub unsafe fn ggml_gemv_q4_k_8x8_q8_k(
                     let rhs_raw_vec_0123_3 = _mm256_loadu_si256(base.offset(192) as *const __m256i);
                     let rhs_raw_vec_4567_3 = _mm256_loadu_si256(base.offset(224) as *const __m256i);
 
-                    // 4-bit → 8-bit: first sub-block (low nibbles)
+                    // 4-bit -> 8-bit: first sub-block (low nibbles)
                     let rhs_vec_0123_00 = _mm256_and_si256(rhs_raw_vec_0123_0, m4b);
                     let rhs_vec_4567_00 = _mm256_and_si256(rhs_raw_vec_4567_0, m4b);
                     let rhs_vec_0123_01 = _mm256_and_si256(rhs_raw_vec_0123_1, m4b);
@@ -249,7 +249,7 @@ pub unsafe fn ggml_gemv_q4_k_8x8_q8_k(
                     let rhs_vec_0123_03 = _mm256_and_si256(rhs_raw_vec_0123_3, m4b);
                     let rhs_vec_4567_03 = _mm256_and_si256(rhs_raw_vec_4567_3, m4b);
 
-                    // 4-bit → 8-bit: second sub-block (high nibbles)
+                    // 4-bit -> 8-bit: second sub-block (high nibbles)
                     let rhs_vec_0123_10 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_vec_0123_0, 4), m4b);
                     let rhs_vec_4567_10 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_vec_4567_0, 4), m4b);
                     let rhs_vec_0123_11 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_vec_0123_1, 4), m4b);
@@ -308,7 +308,7 @@ pub unsafe fn ggml_gemv_q4_k_8x8_q8_k(
                         _mm_shuffle_epi32(mins_and_scales_1, 78),
                     ));
 
-                    // Load Q8_K quants for this sub-block pair (2 × 32 = 64 bytes)
+                    // Load Q8_K quants for this sub-block pair (2 x 32 = 64 bytes)
                     let lhs_base = a.qs.as_ptr().offset(sb * 64);
                     let mut lhs_vec_00 = _mm256_castsi128_si256(_mm_loadu_si128(lhs_base.offset( 0) as *const __m128i));
                     let mut lhs_vec_01 = _mm256_castsi128_si256(_mm_loadu_si128(lhs_base.offset(16) as *const __m128i));
@@ -441,7 +441,7 @@ pub unsafe fn ggml_gemv_q4_k_8x8_q8_k(
     }
 }
 
-// ── AVX2 GEMM (4-row tail loop) ───────────────────────────────────────────────
+// -- AVX2 GEMM (4-row tail loop) -----------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
@@ -449,9 +449,9 @@ pub unsafe fn ggml_gemv_q4_k_8x8_q8_k(
 /// (arch/x86/repack.cpp lines 3158-3493).
 ///
 /// Processes rows in groups of 4 (one BlockQ8Kx4 per group).
-/// - vx:  packed weights as BlockQ4Kx8, shape (nc/8) × nb
-/// - vy:  packed activations as BlockQ8Kx4, shape (nr/4) × nb
-/// - s:   output floats, nr × nc
+/// - vx:  packed weights as BlockQ4Kx8, shape (nc/8) x nb
+/// - vy:  packed activations as BlockQ8Kx4, shape (nr/4) x nb
+/// - s:   output floats, nr x nc
 /// - bs:  stride between rows of s (in floats, usually = nc)
 /// - n:   token dimension (multiple of QK_K)
 /// - nr:  activation rows (must be multiple of 4)
@@ -519,7 +519,7 @@ pub unsafe fn ggml_gemm_q4_k_8x8_q8_k_avx2_tail(
                     let rhs_raw_mat_0145_3 = _mm256_blend_epi32(rhs_raw_mat_0123_3, _mm256_permutevar8x32_epi32(rhs_raw_mat_4567_3, required_order), 240);
                     let rhs_raw_mat_2367_3 = _mm256_blend_epi32(_mm256_permutevar8x32_epi32(rhs_raw_mat_0123_3, required_order), rhs_raw_mat_4567_3, 240);
 
-                    // 4-bit → 8-bit: sub-block 0 (low nibbles)
+                    // 4-bit -> 8-bit: sub-block 0 (low nibbles)
                     let rhs_mat_0145_00 = _mm256_and_si256(rhs_raw_mat_0145_0, m4b);
                     let rhs_mat_2367_00 = _mm256_and_si256(rhs_raw_mat_2367_0, m4b);
                     let rhs_mat_0145_01 = _mm256_and_si256(rhs_raw_mat_0145_1, m4b);
@@ -529,7 +529,7 @@ pub unsafe fn ggml_gemm_q4_k_8x8_q8_k_avx2_tail(
                     let rhs_mat_0145_03 = _mm256_and_si256(rhs_raw_mat_0145_3, m4b);
                     let rhs_mat_2367_03 = _mm256_and_si256(rhs_raw_mat_2367_3, m4b);
 
-                    // 4-bit → 8-bit: sub-block 1 (high nibbles)
+                    // 4-bit -> 8-bit: sub-block 1 (high nibbles)
                     let rhs_mat_0145_10 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_mat_0145_0, 4), m4b);
                     let rhs_mat_2367_10 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_mat_2367_0, 4), m4b);
                     let rhs_mat_0145_11 = _mm256_and_si256(_mm256_srli_epi16(rhs_raw_mat_0145_1, 4), m4b);
@@ -785,7 +785,7 @@ pub unsafe fn ggml_gemm_q4_k_8x8_q8_k_avx2_tail(
                 }
             }
 
-            // Store 4 rows × 8 cols
+            // Store 4 rows x 8 cols
             for i in 0..4 {
                 _mm256_storeu_ps(
                     s.add((y * 4 + i) * bs + x * 8),
@@ -796,9 +796,9 @@ pub unsafe fn ggml_gemm_q4_k_8x8_q8_k_avx2_tail(
     }
 }
 
-// ── AVX2 helpers ──────────────────────────────────────────────────────────────
+// -- AVX2 helpers --------------------------------------------------------------
 
-/// Software f16→f32 conversion for 8 packed f16 values.
+/// Software f16->f32 conversion for 8 packed f16 values.
 /// Equivalent to GGML_F32Cx8_LOAD (non-F16C path).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c")]
@@ -839,9 +839,9 @@ unsafe fn add4_maddubs(
     )
 }
 
-// ── f16→f32 scalar helper (for non-AVX2 code paths) ──────────────────────────
+// -- f16->f32 scalar helper (for non-AVX2 code paths) --------------------------
 
-/// Software IEEE-754 f16 → f32 conversion.
+/// Software IEEE-754 f16 -> f32 conversion.
 #[inline(always)]
 fn f16_to_f32(v: u16) -> f32 {
     let s = (v as u32 & 0x8000) << 16;
@@ -868,7 +868,7 @@ fn f16_to_f32(v: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-// ── Q2K repacking ─────────────────────────────────────────────────────────────
+// -- Q2K repacking -------------------------------------------------------------
 
 /// Direct translation of make_block_q2_Kx8 (ggml-cpu/repack.cpp line 3306).
 /// Interleaves 8 Q2_K blocks into the packed BlockQ2Kx8 format.
@@ -910,7 +910,7 @@ pub fn make_block_q2_kx8(in_blocks: &[BlockQ2K; 8], blck_size_interleave: usize)
 }
 
 /// Direct translation of repack_q2_K_to_q2_K_8_bl (ggml-cpu/repack.cpp line 3633).
-/// Repacks a full weight matrix (nrow × nblocks Q2_K blocks) into BlockQ2Kx8 format.
+/// Repacks a full weight matrix (nrow x nblocks Q2_K blocks) into BlockQ2Kx8 format.
 pub fn repack_q2_k_to_q2_k_8_bl(
     src: &[BlockQ2K],
     nrow: usize,
@@ -946,7 +946,7 @@ pub fn repack_q2_k_to_q2_k_8_bl(
     Ok(())
 }
 
-// ── Q5K repacking ─────────────────────────────────────────────────────────────
+// -- Q5K repacking -------------------------------------------------------------
 
 /// Direct translation of make_block_q5_Kx8 (ggml-cpu/repack.cpp line 3348).
 /// Interleaves 8 Q5_K blocks into the packed BlockQ5Kx8 format.
@@ -1066,7 +1066,7 @@ pub fn repack_q5_k_to_q5_k_8_bl(
     Ok(())
 }
 
-// ── Q6K repacking ─────────────────────────────────────────────────────────────
+// -- Q6K repacking -------------------------------------------------------------
 
 /// Direct translation of make_block_q6_Kx8 (ggml-cpu/repack.cpp line 3433).
 /// Interleaves 8 Q6_K blocks into the packed BlockQ6Kx8 format.
@@ -1152,13 +1152,13 @@ pub fn repack_q6_k_to_q6_k_8_bl(
     Ok(())
 }
 
-// ── Q2K scalar GEMV ───────────────────────────────────────────────────────────
+// -- Q2K scalar GEMV -----------------------------------------------------------
 
 /// Direct translation of ggml_gemv_q2_K_8x8_q8_K_generic (ggml-cpu/repack.cpp line 1029).
-/// Scalar GEMV: Q2_K packed weights × Q8_K activations → f32 output.
+/// Scalar GEMV: Q2_K packed weights x Q8_K activations -> f32 output.
 /// blocklen=8, ncols_interleaved=8.
 ///
-/// - vx: packed weights as BlockQ2Kx8 slice (nc/8 × nb blocks)
+/// - vx: packed weights as BlockQ2Kx8 slice (nc/8 x nb blocks)
 /// - vy: activation as BlockQ8K slice (nb blocks, single row)
 /// - s:  output, nc floats
 /// - n:  token dimension (multiple of QK_K=256)
@@ -1244,12 +1244,12 @@ pub unsafe fn ggml_gemv_q2_k_8x8_q8_k(
     }
 }
 
-// ── Q5K scalar GEMV ───────────────────────────────────────────────────────────
+// -- Q5K scalar GEMV -----------------------------------------------------------
 
 /// Direct translation of ggml_gemv_q5_K_NxM_q8_K_generic_impl<8,8>
 /// (ggml-cpu/repack.cpp lines 551-643). blocklen=8, ncols_interleaved=8.
 ///
-/// - vx: packed weights as BlockQ5Kx8 (nc/8 × nb)
+/// - vx: packed weights as BlockQ5Kx8 (nc/8 x nb)
 /// - vy: activation as BlockQ8K (nb blocks, single row)
 /// - s:  output, nc floats
 /// - n:  token dimension (multiple of QK_K=256)
@@ -1362,14 +1362,14 @@ pub unsafe fn ggml_gemv_q5_k_8x8_q8_k(
     }
 }
 
-// ── Q5K scalar GEMM ───────────────────────────────────────────────────────────
+// -- Q5K scalar GEMM -----------------------------------------------------------
 
 /// Direct translation of ggml_gemm_q5_K_NxM_q8_K_generic_impl<4,8>
 /// (ggml-cpu/repack.cpp lines 647-750). blocklen=4, ncols_interleaved=8.
 ///
-/// - vx: packed weights as BlockQ5Kx8 (nc/8 × nb)
-/// - vy: packed activations as BlockQ8Kx4 (nr/4 × nb)
-/// - s:  output, nr × nc floats (row-major, stride bs)
+/// - vx: packed weights as BlockQ5Kx8 (nc/8 x nb)
+/// - vy: packed activations as BlockQ8Kx4 (nr/4 x nb)
+/// - s:  output, nr x nc floats (row-major, stride bs)
 /// - bs: output row stride in f32 elements
 pub unsafe fn ggml_gemm_q5_k_8x4_q8_k(
     n: usize,
@@ -1495,12 +1495,12 @@ pub unsafe fn ggml_gemm_q5_k_8x4_q8_k(
     }
 }
 
-// ── Q6K scalar GEMV ───────────────────────────────────────────────────────────
+// -- Q6K scalar GEMV -----------------------------------------------------------
 
 /// Direct translation of ggml_gemv_q6_K_NxM_q8_K_generic_impl<8,8>
 /// (ggml-cpu/repack.cpp lines 357-443). blocklen=8, ncols_interleaved=8.
 ///
-/// - vx: packed weights as BlockQ6Kx8 (nc/8 × nb)
+/// - vx: packed weights as BlockQ6Kx8 (nc/8 x nb)
 /// - vy: activation as BlockQ8K (nb blocks, single row)
 /// - s:  output, nc floats
 pub unsafe fn ggml_gemv_q6_k_8x8_q8_k(
@@ -1587,14 +1587,14 @@ pub unsafe fn ggml_gemv_q6_k_8x8_q8_k(
     }
 }
 
-// ── Q6K scalar GEMM ───────────────────────────────────────────────────────────
+// -- Q6K scalar GEMM -----------------------------------------------------------
 
 /// Direct translation of ggml_gemm_q6_K_NxM_q8_K_generic_impl<4,8>
 /// (ggml-cpu/repack.cpp lines 447-548). blocklen=4, ncols_interleaved=8.
 ///
-/// - vx: packed weights as BlockQ6Kx8 (nc/8 × nb)
-/// - vy: packed activations as BlockQ8Kx4 (nr/4 × nb)
-/// - s:  output, nr × nc floats (row-major, stride bs)
+/// - vx: packed weights as BlockQ6Kx8 (nc/8 x nb)
+/// - vy: packed activations as BlockQ8Kx4 (nr/4 x nb)
+/// - s:  output, nr x nc floats (row-major, stride bs)
 /// - bs: output row stride in f32 elements
 pub unsafe fn ggml_gemm_q6_k_8x4_q8_k(
     n: usize,
@@ -1694,7 +1694,7 @@ pub unsafe fn ggml_gemm_q6_k_8x4_q8_k(
     }
 }
 
-// ── tests ─────────────────────────────────────────────────────────────────────
+// -- tests ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1796,7 +1796,7 @@ mod tests {
         let nc = 8usize;
         let nr = 1usize;
 
-        // Q8K: all quants = 1, d = 1.0, bsums = 16 per group (16 elements × 1)
+        // Q8K: all quants = 1, d = 1.0, bsums = 16 per group (16 elements x 1)
         let mut a = zero_block_q8k();
         a.d = 1.0;
         a.qs.fill(1);
@@ -1839,7 +1839,7 @@ mod tests {
         }
     }
 
-    // ── Q2K ─────────────────────────────────────────────────────────────────
+    // -- Q2K -----------------------------------------------------------------
 
     fn zero_block_q2k() -> BlockQ2K {
         BlockQ2K { scales: [0u8; 16], qs: [0u8; 64], d: 0, dmin: 0 }
@@ -1885,7 +1885,7 @@ mod tests {
         }
     }
 
-    // ── Q5K ─────────────────────────────────────────────────────────────────
+    // -- Q5K -----------------------------------------------------------------
 
     fn zero_block_q5k() -> BlockQ5K {
         BlockQ5K { d: 0, dmin: 0, scales: [0u8; 12], qh: [0u8; 32], qs: [0u8; 128] }
@@ -1932,7 +1932,7 @@ mod tests {
         }
     }
 
-    // ── Q6K ─────────────────────────────────────────────────────────────────
+    // -- Q6K -----------------------------------------------------------------
 
     fn zero_block_q6k() -> BlockQ6K {
         BlockQ6K { ql: [0u8; 128], qh: [0u8; 64], scales: [0i8; 16], d: 0 }
