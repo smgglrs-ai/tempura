@@ -143,16 +143,16 @@ KLOOP:
     cvt.u64.u32 %rd4, %r15;
     add.u64 %rd4, %rd0, %rd4;          // %rd4 = base_ptr
 
-    // -- Load d and dmin as f16 (bytes 0-1, 2-3) -- L1 broadcast for all lanes
-    ld.global.b16 %h0, [%rd4];         // d as f16 (bytes 0-1)
-    ld.global.b16 %h1, [%rd4 + 2];    // dmin as f16 (bytes 2-3)
+    // -- Load d and dmin as f16 (bytes 0-1, 2-3) -- .nc: weights are scan-once
+    ld.global.nc.b16 %h0, [%rd4];         // d as f16 (bytes 0-1)
+    ld.global.nc.b16 %h1, [%rd4 + 2];    // dmin as f16 (bytes 2-3)
     cvt.f32.f16 %f1, %h0;              // d as f32 (exact, no rounding modifier)
     cvt.f32.f16 %f2, %h1;              // dmin as f32
 
-    // -- Load scale words (bytes 4-15) -- same for all lanes, L1 broadcast
-    ld.global.b32 %r16, [%rd4 + 4];   // ps0 = scales[0..3]
-    ld.global.b32 %r17, [%rd4 + 8];   // ps1 = scales[4..7]
-    ld.global.b32 %r18, [%rd4 + 12];  // ps2 = scales[8..11]
+    // -- Load scale words (bytes 4-15) -- .nc: weights are scan-once, free L1 for activations
+    ld.global.nc.b32 %r16, [%rd4 + 4];   // ps0 = scales[0..3]
+    ld.global.nc.b32 %r17, [%rd4 + 8];   // ps1 = scales[4..7]
+    ld.global.nc.b32 %r18, [%rd4 + 12];  // ps2 = scales[8..11]
 
     // -- Branchless scale extraction (no branch divergence, avoids ITS issues) -
     // Compute shift+8 once for both lower and upper formulas.
@@ -220,7 +220,7 @@ KLOOP:
     shl.b32    %r24, %r24, 2;           // * 4 bytes
     cvt.u64.u32 %rd5, %r24;
     add.u64    %rd5, %rd4, %rd5;
-    ld.global.b32 %r25, [%rd5];        // qs u32
+    ld.global.nc.b32 %r25, [%rd5];     // qs u32 (.nc: weight, scan-once)
 
     // -- Load Q8_1 activation data --------------------------------------------
     // q8_blk_lo = blk * 8 + mw * 2
@@ -292,6 +292,7 @@ REDUCE:
     // 3-step XOR butterfly within 8-lane mini-warp.
     // c=0x71F: segMask=7 (XOR stays in 8-lane group), maxLane=31 (no clamping).
     // member_mask=0xFFFFFFFF: all 32 lanes execute (required by shfl.sync).
+    // Note: redux.sync.add.f32 does NOT exist in PTX ISA (only integer types).
     mov.b32 %r50, %f0;
     shfl.sync.bfly.b32 %r51, %r50, 4, 0x71F, 0xFFFFFFFF;
     mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
