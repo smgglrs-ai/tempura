@@ -2394,13 +2394,43 @@ impl CutileGpuModel {
             self.device_weights_q2.get(weight_name).map(|dw| dw.n).unwrap_or(0)
         };
 
-        // NOTE: colocated and batch GEMV kernels (sm_80 PTX with dynamic shared memory)
-        // crash with CUDA error 719 on sm_120 (Blackwell RTX 5090). Root cause: dynamic
-        // shared memory in oxide-compiled sm_80 PTX is broken on Blackwell under JIT.
-        // Kernels using NO shared memory (quantize_q8_1) work fine; kernels using
-        // DynamicSharedArray crash. Fix: write sm_120-native batch GEMV PTX with STATIC
-        // shared memory (same approach as q4k_gemv_sm120_dp4a_kpar8 single-GEMV kernel).
-        // Until that PTX is available, fall through to M sequential single-GEMV calls.
+        // sm_120 batch Q4K kernel: hand-written PTX with static smem, avoids error 719.
+        // Only available when uses_raw_gguf=true (weights in native 36-u32 GGUF format).
+        if is_q4k {
+            if let Some(oxide) = &self.oxide_q4k_gemv {
+                if oxide.has_sm120_batch() && oxide.uses_raw_gguf {
+                    let dw = self.device_weights_q4k.get(weight_name).unwrap();
+                    // `a` is flat [m * row_stride]; the batch kernel reads it row-major.
+                    // k = k_blocks * 256; row_stride may be padded — pass just k elements
+                    // by building a trimmed [m * k] view if needed.
+                    let k = dw.k_blocks * 256;
+                    let a_trimmed: Arc<Tensor<f32>> = if row_stride == k {
+                        a.clone()
+                    } else {
+                        // row_stride != k: copy each row's k elements into a compact [m*k] tensor.
+                        let compact = Arc::new(
+                            api::zeros::<f32>(&[m * k])
+                                .sync_on(stream)
+                                .expect("gemm_any_d2d_batch sm120: compact alloc"),
+                        );
+                        for r in 0..m {
+                            unsafe {
+                                cuda_core::memcpy_dtod_async::<f32>(
+                                    compact.device_pointer().cu_deviceptr() + (r * k * 4) as u64,
+                                    a.device_pointer().cu_deviceptr() + (r * row_stride * 4) as u64,
+                                    k,
+                                    stream,
+                                ).expect("gemm_any_d2d_batch sm120: row copy");
+                            }
+                        }
+                        compact
+                    };
+                    return oxide
+                        .forward_sm120_batch_d2d(&a_trimmed, &dw.tensor, m, dw.n, dw.k_blocks)
+                        .expect("sm120_batch Q4K GEMV failed");
+                }
+            }
+        }
 
         // Fallback: M sequential GEMVs (no L2 reuse but still GPU-resident).
         let mut rows: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(m);

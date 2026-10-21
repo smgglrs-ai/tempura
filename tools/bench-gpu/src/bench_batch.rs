@@ -89,9 +89,9 @@ fn main() {
             batch, tok_s, per_req, blocks);
     }
 
-    println!("\n  Note: using sequential per-row GEMVs (sm_120 kpar) — batch GEMV kernels disabled.");
-    println!("  Batch GEMV (sm_80 dynamic-smem PTX) crashes on RTX 5090 (sm_120/Blackwell).");
-    println!("  Fix: write sm_120-native batch GEMV PTX with static shared memory.");
+    println!("\n  Kernel: q4k_gemv_sm120_batch (sm_120 PTX, static smem, grid=(N,M,1)).");
+    println!("  Replaces oxide sm_80 batch kernels that crashed on Blackwell (error 719).");
+    println!("  Remaining gap at high M: flash attention scales as O(M*kv_len*n_heads).");
     println!();
     println!("  Reference (single request, CUDA graph): 130 tok/s");
     println!("  llama.cpp single request:                209 tok/s");
