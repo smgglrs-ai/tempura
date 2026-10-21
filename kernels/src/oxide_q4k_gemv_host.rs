@@ -89,6 +89,7 @@ pub struct OxideQ4kGemv {
     cu_sm120_dp4a_kpar8:        Option<CUfunction>,
     /// Optional sm_120-native fused gate+up+SiLU kernel (hand-written PTX).
     /// Faster than oxide sm_80 fused silu: direct Blackwell codegen, no JIT overhead.
+    cu_sm120_fused_module:      Option<CUmodule>,
     cu_sm120_fused_silu:        Option<CUfunction>,
     /// Selected Q4K+Q8_1 kpar dispatch function: sm120 or dp4a_kpar8 (sm_80) fallback.
     /// Populated by the KernelVariant selection at construction time.  Always Some when
@@ -121,6 +122,11 @@ impl Drop for OxideQ4kGemv {
             let _ = unsafe { cuda_core::sys::cuModuleUnload(self.cu_module) };
         }
         if let Some(m) = self.cu_sm120_module {
+            if !m.is_null() {
+                let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
+            }
+        }
+        if let Some(m) = self.cu_sm120_fused_module {
             if !m.is_null() {
                 let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
             }
@@ -251,6 +257,7 @@ impl OxideQ4kGemv {
             // ── Load sm_120 fused gate+up+SiLU PTX (separate module from kpar) ─
             // Reuses the same CUDA module as the sm_120 kpar if already loaded,
             // or loads a second module. Currently: separate module, same cc guard.
+            let mut cu_sm120_fused_mod: Option<CUmodule> = None;
             let cu_sm120_fused_silu: Option<CUfunction> = if !sm120_disabled && caps.cc() >= q4k_fused_silu_v4_ptx::MIN_CC {
                 let ptx_cstr = CString::new(q4k_fused_silu_v4_ptx::PTX).unwrap_or_default();
                 let mut fused_mod = std::mem::MaybeUninit::uninit();
@@ -272,9 +279,8 @@ impl OxideQ4kGemv {
                             "oxide-gemv-q4k: loaded sm_120 fused silu PTX ({} bytes) -- direct Blackwell codegen",
                             q4k_fused_silu_v4_ptx::PTX.len(),
                         );
+                        cu_sm120_fused_mod = Some(fused_mod);
                         Some(unsafe { fused_fn.assume_init() })
-                        // Note: fused_mod leaks here (not tracked for Drop). The process holds it
-                        // until exit. A production fix would store it in the struct.
                     } else {
                         let _ = unsafe { cuda_core::sys::cuModuleUnload(fused_mod) };
                         eprintln!("oxide-gemv-q4k: cuModuleGetFunction(sm120_fused_silu) failed (rc={rc2}), using oxide fused silu");
@@ -335,7 +341,7 @@ impl OxideQ4kGemv {
             // Q8_1 scratch) when uses_raw_gguf=true, so K/V weights can also be native.
             let uses_raw_gguf = uses_sm120;
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_silu, kpar_dispatch, uses_raw_gguf, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_module: cu_sm120_fused_mod, cu_sm120_fused_silu, kpar_dispatch, uses_raw_gguf, stream,
                 q8_qs_scratch:      std::cell::RefCell::new(None),
                 q8_ds_scratch:      std::cell::RefCell::new(None),
                 q8_out_scratch:     std::cell::RefCell::new(None),
