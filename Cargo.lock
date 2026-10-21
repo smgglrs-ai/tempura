@@ -3609,6 +3609,7 @@ name = "tempura-kernels"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "bitflags",
  "cc",
  "cuda-core",
  "cuda-device",
