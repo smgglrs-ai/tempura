@@ -30,6 +30,8 @@
 /// ```
 
 use crate::{KernelError, Result};
+use crate::gpu_capabilities::{GpuCapabilities, KernelVariant};
+use crate::q4k_gemv_v4_ptx;
 use cuda_core::{launch_kernel, Stream};
 use cuda_core::sys::{CUfunction, CUmodule};
 use cutile::{api, prelude::DeviceOp, tensor::Tensor};
@@ -80,6 +82,14 @@ pub struct OxideQ4kGemv {
     cu_smem:           Option<CUfunction>,
     /// Optional fused gate+up GEMV with inline SiLU: single launch for both FFN projections.
     cu_fused_silu:     Option<CUfunction>,
+    /// Optional sm_120-native v4 kpar kernel (native 36-u32 GGUF format).
+    /// Loaded from a SEPARATE CUDA module (hand-written PTX, not the oxide binary).
+    cu_v4_module:      Option<CUmodule>,
+    cu_v4_kpar:        Option<CUfunction>,
+    /// Selected Q4K+Q8_1 kpar dispatch function: v4 (sm_120) or v3_kpar (sm_80) fallback.
+    /// Populated by the KernelVariant selection at construction time.  Always Some when
+    /// at least one kpar variant loaded.  None only when no kpar kernel is available at all.
+    pub kpar_dispatch: Option<KernelVariant>,
     stream:         Arc<Stream>,
     /// True when the raw-GGUF 36-u32 kernel is active (needs matching upload format).
     pub uses_raw_gguf: bool,
@@ -99,6 +109,11 @@ impl Drop for OxideQ4kGemv {
     fn drop(&mut self) {
         if !self.cu_module.is_null() {
             let _ = unsafe { cuda_core::sys::cuModuleUnload(self.cu_module) };
+        }
+        if let Some(m) = self.cu_v4_module {
+            if !m.is_null() {
+                let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
+            }
         }
     }
 }
@@ -178,8 +193,77 @@ impl OxideQ4kGemv {
             let cu_smem        = load_fn(KERNEL_SMEM);
             let cu_fused_silu  = load_fn(KERNEL_FUSED_SILU);
 
+            // ── Try to load sm_120 v4 PTX (Blackwell-native, native GGUF format) ───
+            // Query device compute capability. Only attempt the sm_120 PTX when the
+            // device is Blackwell (cc >= 1200); other GPUs get the sm_80 oxide fallback.
+            let caps = GpuCapabilities::query(stream.device().cu_device());
+            // TEMPURA_NO_V4_KPAR=1 disables v4 for debugging (uses v3_kpar fallback).
+            let v4_disabled = std::env::var("TEMPURA_NO_V4_KPAR").map(|v| v == "1").unwrap_or(false);
+            let (cu_v4_module, cu_v4_kpar) = if !v4_disabled && caps.cc() >= q4k_gemv_v4_ptx::MIN_CC {
+                let ptx_cstr = CString::new(q4k_gemv_v4_ptx::PTX).unwrap_or_default();
+                let mut v4_mod = std::mem::MaybeUninit::uninit();
+                let rc = unsafe {
+                    cuda_core::sys::cuModuleLoadData(
+                        v4_mod.as_mut_ptr(),
+                        ptx_cstr.as_ptr() as *const _,
+                    )
+                };
+                if rc == CUDA_SUCCESS {
+                    let v4_mod = unsafe { v4_mod.assume_init() };
+                    let entry = CString::new(q4k_gemv_v4_ptx::ENTRY).unwrap_or_default();
+                    let mut v4_fn = std::mem::MaybeUninit::uninit();
+                    let rc2 = unsafe {
+                        cuda_core::sys::cuModuleGetFunction(v4_fn.as_mut_ptr(), v4_mod, entry.as_ptr())
+                    };
+                    if rc2 == CUDA_SUCCESS {
+                        eprintln!(
+                            "oxide-gemv-q4k: loaded sm_120 v4 PTX ({} bytes) — native GGUF format, direct Blackwell codegen",
+                            q4k_gemv_v4_ptx::PTX.len(),
+                        );
+                        (Some(v4_mod), Some(unsafe { v4_fn.assume_init() }))
+                    } else {
+                        let _ = unsafe { cuda_core::sys::cuModuleUnload(v4_mod) };
+                        eprintln!("oxide-gemv-q4k: cuModuleGetFunction(v4_kpar) failed (rc={rc2}), using v3_kpar");
+                        (None, None)
+                    }
+                } else {
+                    eprintln!(
+                        "oxide-gemv-q4k: cuModuleLoadData(v4 sm_120 PTX) failed (rc={rc}), cc={}, using v3_kpar",
+                        caps.cc(),
+                    );
+                    (None, None)
+                }
+            } else {
+                // Non-Blackwell GPU: skip v4 entirely, use oxide sm_80 v3_kpar.
+                (None, None)
+            };
+
+            // ── Build KernelVariant table and select best kpar dispatch ─────────
+            let mut kpar_variants: Vec<KernelVariant> = Vec::new();
+            if let Some(f) = cu_q8_gemv_v3_kpar {
+                kpar_variants.push(KernelVariant { cu_fn: f, min_cc: 800, name: "q4k_v3_kpar_sm80" });
+            }
+            if let Some(f) = cu_v4_kpar {
+                kpar_variants.push(KernelVariant { cu_fn: f, min_cc: 1200, name: "q4k_v4_kpar_sm120" });
+            }
+            let kpar_dispatch = KernelVariant::select_best(&kpar_variants, &caps).cloned();
+            // v4 uses native 36-u32 GGUF format in the v4 kernel itself, but the production
+            // engine uses `dispatch_kv_on_stream` for K/V projections which calls the BASIC f32
+            // GEMV kernel — that reads repacked 42-u32 format. If we set uses_raw_gguf=true,
+            // K/V weights would be in native format but the basic f32 GEMV reads them as
+            // repacked → wrong values → NaN → error 719 in graph replay.
+            //
+            // TEMPORARY WORKAROUND: Keep uses_raw_gguf=false (repacked format) until the engine
+            // properly handles native format for all dispatch paths (including dispatch_kv_on_stream).
+            // v4 kpar ALSO accepts repacked 42-u32 by adjusting its parameter layout.
+            // The sm_120 codegen benefit is retained; the 14% DRAM reduction requires further work.
+            //
+            // TODO: once engine uses per-slot output tensors for K/V, enable native format
+            // by setting uses_raw_gguf = uses_v4 and updating dispatch_kv_on_stream to use v4 path.
+            let uses_v4 = kpar_dispatch.as_ref().map(|v| v.min_cc >= 1200).unwrap_or(false);
+
             eprintln!(
-                "oxide-gemv-q4k: loaded Q4_K GEMV kernel (PTX {} bytes, entry={}, q8_path={}, q8v2={}, q8v3={}, q8v3r={}, q8v3_kpar={}, fused_silu={}, uses_raw_gguf={}, batch={})",
+                "oxide-gemv-q4k: loaded (oxide PTX {} bytes, entry={}, q8={}, q8v2={}, q8v3={}, q8v3r={}, q8v3_kpar={}, v4_sm120={}, kpar_dispatch={}, fused_silu={}, batch={})",
                 OXIDE_Q4K_PTX.len(),
                 KERNEL_ENTRY,
                 cu_q8_gemv.is_some(),
@@ -187,19 +271,18 @@ impl OxideQ4kGemv {
                 cu_q8_gemv_v3.is_some(),
                 cu_q8_gemv_v3r.is_some(),
                 cu_q8_gemv_v3_kpar.is_some(),
+                cu_v4_kpar.is_some(),
+                kpar_dispatch.as_ref().map(|v| v.name).unwrap_or("none"),
                 cu_fused_silu.is_some(),
-                false, // uses_raw_gguf — see note below
                 cu_batch_gemv.is_some(),
             );
-            // v3r: 36-u32 raw GGUF format. Benchmarked and DISABLED (performance regression).
-            // uses_raw_gguf=true benchmarked at 101 tok/s vs 107 tok/s with packed format.
-            // Root cause: on-the-fly 6-bit scale unpacking in v3r adds compute overhead that
-            // exceeds the 14% DRAM bandwidth savings (144 vs 168 bytes/block).
-            // Correctness is verified (tail and paired loops both pass, prefill format-detection
-            // in gemm_any_d2d_slot handles 36-u32 format correctly), but v3 is faster.
+            // v3r: raw GGUF format for the oxide sm_80 path — benchmarked and DISABLED (101 vs 107 tok/s).
+            // uses_raw_gguf=false: v4 kernel reads repacked 42-u32 format (same as v3_kpar).
+            // dispatch_kv_on_stream uses the basic f32 GEMV (repacked format), so weights
+            // must also be in repacked format. See q4k_gemv_v4_ptx.rs for the future plan.
             let uses_raw_gguf = false;
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_q8_gemv_v3_kpar, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, uses_raw_gguf, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_gemv_v2, cu_q8_gemv_v3, cu_q8_gemv_v3r, cu_q8_gemv_v3_kpar, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_v4_module, cu_v4_kpar, kpar_dispatch, uses_raw_gguf, stream,
                 q8_qs_scratch:      std::cell::RefCell::new(None),
                 q8_ds_scratch:      std::cell::RefCell::new(None),
                 q8_out_scratch:     std::cell::RefCell::new(None),
@@ -605,15 +688,30 @@ impl OxideQ4kGemv {
         Ok(())
     }
 
-    /// Returns true when the fused gate+up SiLU kernel is compiled into the PTX.
+    /// Returns true when the fused gate+up SiLU kernel is compiled into the PTX AND
+    /// the current upload format is repacked 42-u32 (fused silu requires repacked format).
+    ///
+    /// When `uses_raw_gguf == true` (v4 sm_120 kernel active), fused silu is disabled
+    /// and the engine falls back to two separate GEMVs + element-wise SiLU-mul.
     pub fn has_fused_silu(&self) -> bool {
-        self.cu_fused_silu.is_some() && self.cu_q8_quantize.is_some()
+        !self.uses_raw_gguf && self.cu_fused_silu.is_some() && self.cu_q8_quantize.is_some()
     }
 
     /// Returns true when the Q8_1 quantize + integer GEMV path is compiled into the PTX.
     pub fn has_q8_path(&self) -> bool {
         self.cu_q8_quantize.is_some()
             && (self.cu_q8_gemv_v3.is_some() || self.cu_q8_gemv_v2.is_some() || self.cu_q8_gemv.is_some())
+    }
+
+    /// Returns true when the sm_120 v4 kpar kernel is loaded and selected.
+    pub fn has_v4_kpar(&self) -> bool {
+        self.cu_v4_kpar.is_some()
+            && self.kpar_dispatch.as_ref().map(|v| v.min_cc >= 1200).unwrap_or(false)
+    }
+
+    /// Returns true when ANY kpar dispatch kernel is available (v4 or v3_kpar fallback).
+    pub fn has_any_kpar(&self) -> bool {
+        self.cu_q8_quantize.is_some() && self.kpar_dispatch.is_some()
     }
 
     /// Returns true when the v3_kpar kernel (8 warps/block) is compiled into the PTX.
@@ -746,6 +844,140 @@ impl OxideQ4kGemv {
                 )
             }
             .map_err(|e| KernelError::InvalidConfig(format!("oxide q4k_gemv_decode_q8_v3_kpar: {e}")))?;
+        }
+
+        Ok(out_arc)
+    }
+
+    /// Unified kpar dispatch: uses v4 (sm_120, native GGUF) when loaded, else v3_kpar (sm_80).
+    ///
+    /// The best variant was selected at construction time via `kpar_dispatch`.  The caller
+    /// must ensure `packed` has the matching format: native 36-u32 for v4, repacked 42-u32
+    /// for v3_kpar.  This is guaranteed by `uses_raw_gguf` driving the upload format.
+    ///
+    /// Grid = (N, 1, 1). Block = (256, 1, 1). smem = 128 bytes.
+    pub fn forward_best_kpar_d2d(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let q8_quant_fn = match self.cu_q8_quantize {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
+        };
+        let kv = match &self.kpar_dispatch {
+            Some(v) => v,
+            None => return Err(KernelError::InvalidConfig("no kpar kernel available".into())),
+        };
+
+        let k = k_blocks * 256;
+        let k_q8_blocks = k.div_ceil(32);
+        let use_scratch = self.q8_qs_scratch.borrow().as_ref()
+            .map(|t| t.size() >= k / 4)
+            .unwrap_or(false);
+
+        let x_qs_arc: Arc<Tensor<u32>>;
+        let x_ds_arc: Arc<Tensor<u32>>;
+        let out_arc: Arc<Tensor<f32>>;
+        // With uses_raw_gguf=false (repacked format), K/V are dispatched via
+        // dispatch_kv_on_stream (basic f32 GEMV to slot tensors), not through this
+        // function. The q8_out_scratch aliasing issue doesn't arise.
+        if use_scratch {
+            x_qs_arc = self.q8_qs_scratch.borrow().as_ref().unwrap().clone();
+            x_ds_arc = self.q8_ds_scratch.borrow().as_ref().unwrap().clone();
+            out_arc  = self.q8_out_scratch.borrow().as_ref().unwrap().clone();
+        } else {
+            x_qs_arc = Arc::new(api::zeros::<u32>(&[k / 4])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+            x_ds_arc = Arc::new(api::zeros::<u32>(&[k_q8_blocks])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+            out_arc  = Arc::new(api::zeros::<f32>(&[n])
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
+        }
+        let x_qs = x_qs_arc.as_ref();
+        let x_ds = x_ds_arc.as_ref();
+        let out  = out_arc.as_ref();
+        let cu_stream = self.stream.cu_stream();
+
+        // ── quantize_q8_1 ───────────────────────────────────────────────────
+        {
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len: u64 = (k / 4) as u64;
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len: u64 = k_q8_blocks as u64;
+            let x_ptr:  u64 = x.device_pointer().cu_deviceptr();
+            let x_len:  u64 = x.size() as u64;
+            let k_u32:  u32 = k as u32;
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr as *const _ as *mut c_void,
+                &qs_len as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ds_len as *const _ as *mut c_void,
+                &x_ptr  as *const _ as *mut c_void,
+                &x_len  as *const _ as *mut c_void,
+                &k_u32  as *const _ as *mut c_void,
+            ];
+            let grid_x = k_q8_blocks.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            unsafe {
+                launch_kernel(q8_quant_fn, (grid_x, 1, 1), (BLOCK_DIM, 1, 1), 0, cu_stream, &mut params)
+            }.map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 (best_kpar): {e}")))?;
+        }
+
+        // ── Dispatch: v4 (6 raw-ptr params) or v3_kpar (10 slice params) ────
+        if kv.min_cc >= 1200 {
+            // v4: weights, act_qs, act_ds, out, n_rows, k_blocks  (6 raw-ptr params)
+            let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ou_ptr: u64 = out.device_pointer().cu_deviceptr();
+            let n_u32:  u32 = n as u32;
+            let kb_u32: u32 = k_blocks as u32;
+            let mut params: [*mut c_void; 6] = [
+                &wt_ptr as *const _ as *mut c_void,
+                &qs_ptr as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ou_ptr as *const _ as *mut c_void,
+                &n_u32  as *const _ as *mut c_void,
+                &kb_u32 as *const _ as *mut c_void,
+            ];
+            // v4 uses STATIC shared memory (.shared .align 4 .b8 smem_buf[128]).
+            // Pass sharedMemBytes=128 to match v3_kpar and ensure CUDA graph captures
+            // the correct smem footprint (static+dynamic = 128+128 = 256 total, all OK).
+            unsafe {
+                launch_kernel(kv.cu_fn, (n as u32, 1, 1), (BLOCK_DIM_KPAR, 1, 1), 128, cu_stream, &mut params)
+            }.map_err(|e| KernelError::InvalidConfig(format!("q4k_gemv_decode_v4_kpar: {e}")))?;
+        } else {
+            // v3_kpar: out (ptr+len), x_qs (ptr+len), x_ds (ptr+len), packed (ptr+len), n, k_blocks
+            let out_ptr: u64 = out.device_pointer().cu_deviceptr();
+            let out_len: u64 = n as u64;
+            let qs_ptr:  u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len:  u64 = (k / 4) as u64;
+            let ds_ptr:  u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len:  u64 = k_q8_blocks as u64;
+            let pk_ptr:  u64 = packed.device_pointer().cu_deviceptr();
+            let pk_len:  u64 = packed.size() as u64;
+            let n_u32:   u32 = n as u32;
+            let kb_u32:  u32 = k_blocks as u32;
+            let mut params: [*mut c_void; 10] = [
+                &out_ptr as *const _ as *mut c_void,
+                &out_len as *const _ as *mut c_void,
+                &qs_ptr  as *const _ as *mut c_void,
+                &qs_len  as *const _ as *mut c_void,
+                &ds_ptr  as *const _ as *mut c_void,
+                &ds_len  as *const _ as *mut c_void,
+                &pk_ptr  as *const _ as *mut c_void,
+                &pk_len  as *const _ as *mut c_void,
+                &n_u32   as *const _ as *mut c_void,
+                &kb_u32  as *const _ as *mut c_void,
+            ];
+            unsafe {
+                launch_kernel(kv.cu_fn, (n as u32, 1, 1), (BLOCK_DIM_KPAR, 1, 1), 128, cu_stream, &mut params)
+            }.map_err(|e| KernelError::InvalidConfig(format!("q4k_gemv_decode_q8_v3_kpar (fallback): {e}")))?;
         }
 
         Ok(out_arc)

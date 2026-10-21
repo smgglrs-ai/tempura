@@ -27,9 +27,13 @@ pub mod cutile_matmul_host;
 #[cfg(feature = "cutile")]
 pub mod cutile_quantized_gemm;
 #[cfg(feature = "cutile")]
+pub mod gpu_capabilities;
+#[cfg(feature = "cutile")]
 pub mod oxide_q2_gemv_host;
 #[cfg(feature = "cutile")]
 pub mod oxide_q4k_gemv_host;
+#[cfg(feature = "cutile")]
+pub mod q4k_gemv_v4_ptx;
 #[cfg(feature = "cutile")]
 pub mod oxide_q6k_gemv_host;
 #[cfg(feature = "cutile")]
