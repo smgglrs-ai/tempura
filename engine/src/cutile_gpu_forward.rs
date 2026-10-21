@@ -2254,18 +2254,18 @@ impl CutileGpuModel {
                     pool[slot].take().and_then(|arc| Arc::try_unwrap(arc).ok())
                 };
                 if let Some(tensor) = maybe_tensor {
-                    // Native format: use v4 kpar with per-KV-stream Q8_1 scratch.
+                    // Native format: use sm120_kpar with per-KV-stream Q8_1 scratch.
                     // This avoids the data race with Q's Q8 scratch on stream_main.
-                    if oxide.uses_raw_gguf && oxide.has_v4_kpar() {
+                    if oxide.uses_raw_gguf && oxide.has_sm120_kpar() {
                         if let Ok(result) = unsafe {
-                            oxide.submit_v4_kpar_kv_into_slot(
+                            oxide.submit_sm120_kpar_kv_into_slot(
                                 &a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks, cu_stream,
                             )
                         } {
                             self.scratch.borrow_mut()[slot] = Some(result.clone());
                             return result;
                         }
-                        // v4 failed -- fall through to pool-miss path below.
+                        // sm120_kpar failed -- fall through to pool-miss path below.
                     } else {
                         // Repacked format: use the basic f32 GEMV (reads 42-u32).
                         if let Ok(result) = unsafe {
@@ -3168,8 +3168,8 @@ impl CutileGpuModel {
                     .reshape(&[next_pow2(gdw.k_blocks * tempura_kernels::Q4K_BLOCK_SIZE)])
                     .expect("fused silu reshape failed");
                 oxide
-                    .forward_fused_silu_mul_d2d(&a_flat, &gdw.tensor, &udw.tensor, gdw.n, gdw.k_blocks)
-                    .expect("q4k_gemv_fused_silu_mul failed")
+                    .forward_fused_silu_dp4a_d2d(&a_flat, &gdw.tensor, &udw.tensor, gdw.n, gdw.k_blocks)
+                    .expect("q4k_fused_silu_dp4a failed")
             } else {
                 let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE);
                 let up_dev = self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);

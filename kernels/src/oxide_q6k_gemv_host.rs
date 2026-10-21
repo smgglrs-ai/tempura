@@ -139,7 +139,7 @@ impl OxideQ6kGemv {
                     Some(unsafe { func.assume_init() })
                 } else {
                     eprintln!(
-                        "oxide-gemv-q6k: kpar variant not found (code={ret}); using v2"
+                        "oxide-gemv-q6k: kpar variant not found (code={ret}); using dp4a baseline"
                     );
                     None
                 }
@@ -154,7 +154,7 @@ impl OxideQ6kGemv {
         }
     }
 
-    /// Returns `true` when the kpar kernel (v3) was successfully loaded.
+    /// Returns `true` when the kpar kernel (dp4a_kpar8) was successfully loaded.
     pub fn has_kpar(&self) -> bool {
         self.cu_function_kpar.is_some()
     }
@@ -162,7 +162,7 @@ impl OxideQ6kGemv {
     /// K-parallel GEMV: grid=(n,1,1), block=(256,1,1), smem=32 bytes.
     ///
     /// Preferred over `forward_d2d` for large k_blocks (e.g. down_proj k_blocks=56)
-    /// because 8 warps per block → 100% SM occupancy vs. 37.5% for v2.
+    /// because 8 warps per block → 100% SM occupancy vs. 37.5% for dp4a baseline.
     pub fn forward_kpar_d2d(
         &self,
         x: &Arc<Tensor<f32>>,
@@ -250,7 +250,7 @@ impl OxideQ6kGemv {
                 &mut params,
             )
         }
-        .map_err(|e| KernelError::InvalidConfig(format!("oxide q6k_gemv_decode_v3_kpar: {e}")))?;
+        .map_err(|e| KernelError::InvalidConfig(format!("oxide q6k_gemv_dp4a_kpar8: {e}")))?;
         Ok(())
     }
 
