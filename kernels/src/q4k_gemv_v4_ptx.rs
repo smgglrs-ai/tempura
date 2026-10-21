@@ -87,10 +87,10 @@ pub const PTX: &str = r#"
     .param .u32 param_k_blocks
 )
 {
-    .reg .u32  %r<56>;
-    .reg .u64  %rd<10>;
+    .reg .u32  %r<57>;
+    .reg .u64  %rd<11>;
     .reg .f32  %f<20>;
-    .reg .pred %p<10>;
+    .reg .pred %p<11>;
     .reg .b16  %h<4>;
 
     // 32 f32 slots: smem[warp_id * 4 + mw] holds the mini-warp partial sum.
@@ -142,6 +142,16 @@ KLOOP:
     mul.lo.u32 %r15, %r14, 144;        // * 144 bytes/block
     cvt.u64.u32 %rd4, %r15;
     add.u64 %rd4, %rd0, %rd4;          // %rd4 = base_ptr
+
+    // --- Prefetch next block into L2 ---
+    // next_blk = blk + 8 (warp stride = WARPS_PER_BLOCK_KPAR = 8).
+    // Only prefetch if next_blk < k_blocks (i.e. a second iteration exists).
+    // For k_blocks=16 with 8 warps, this fires for the 1st of 2 iterations per warp.
+    // 8 blocks * 144 bytes/block = 1152 bytes stride.
+    add.u32 %r56, %r12, 8;
+    setp.lt.u32 %p10, %r56, %r1;
+    add.u64 %rd10, %rd4, 1152;
+    @%p10 prefetch.global.L2 [%rd10];
 
     // -- Load d and dmin as f16 (bytes 0-1, 2-3) -- .nc: weights are scan-once
     ld.global.nc.b16 %h0, [%rd4];         // d as f16 (bytes 0-1)
