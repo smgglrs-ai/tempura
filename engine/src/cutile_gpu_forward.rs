@@ -4404,7 +4404,7 @@ impl CutileGpuModel {
         let cu_stream  = stream.cu_stream();
 
         let oxide = match self.oxide_q4k_gemv.as_ref() {
-            Some(o) if o.has_mma_batch() || o.has_sm120_batch() => o,
+            Some(o) if o.has_streamk_batch() || o.has_mma_batch() || o.has_sm120_batch() => o,
             _ => panic!("forward_batch_decode_inner_graph: oxide Q4K sm120 batch required"),
         };
 
@@ -4455,7 +4455,12 @@ impl CutileGpuModel {
                                n: usize, k_blocks: usize| {
                 let dw = self.device_weights_q4k.get(wname)
                     .unwrap_or_else(|| panic!("batch inner: Q4K weight {wname} missing"));
-                if oxide.has_mma_batch() {
+                if oxide.has_streamk_batch() {
+                    oxide.forward_streamk_batch_d2d_into(
+                        a, &dw.tensor, m, n, k_blocks,
+                        &self.batch_q8_qs_h, &self.batch_q8_ds_h, out,
+                    ).unwrap_or_else(|e| panic!("batch inner stream-K GEMM {wname}: {e}"));
+                } else if oxide.has_mma_batch() {
                     oxide.forward_mma_batch_d2d_into(
                         a, &dw.tensor, m, n, k_blocks,
                         &self.batch_q8_qs_h, &self.batch_q8_ds_h, out,
@@ -4795,7 +4800,12 @@ impl CutileGpuModel {
                 } else {
                     silu_out
                 };
-                if oxide.has_mma_batch() {
+                if oxide.has_streamk_batch() {
+                    oxide.forward_streamk_batch_d2d_into(
+                        &act_down, &dw_down.tensor, m, dw_down.n, dw_down.k_blocks,
+                        &self.batch_q8_qs_i, &self.batch_q8_ds_i, &self.batch_gemv_down,
+                    ).expect("batch inner: down Q4K stream-K GEMM");
+                } else if oxide.has_mma_batch() {
                     oxide.forward_mma_batch_d2d_into(
                         &act_down, &dw_down.tensor, m, dw_down.n, dw_down.k_blocks,
                         &self.batch_q8_qs_i, &self.batch_q8_ds_i, &self.batch_gemv_down,
@@ -5217,7 +5227,7 @@ impl CutileGpuModel {
             && kv_caches.iter().all(|kvc| kvc.has_device_kv())
             && !cfg.use_alibi
             && self.all_proj_q4k
-            && self.oxide_q4k_gemv.as_ref().map(|o| o.has_mma_batch() || o.has_sm120_batch()).unwrap_or(false)
+            && self.oxide_q4k_gemv.as_ref().map(|o| o.has_streamk_batch() || o.has_mma_batch() || o.has_sm120_batch()).unwrap_or(false)
             && positions.windows(2).all(|w| w[0] == w[1]);
 
         if can_graph {
