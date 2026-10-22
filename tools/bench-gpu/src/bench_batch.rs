@@ -3,6 +3,9 @@
 /// Simulates B concurrent decode requests sharing a single GPU forward pass.
 /// At B=5: 5x32=160 flash-attention blocks on RTX 5090 (170 SMs) -> full SM utilization.
 ///
+/// Uses persistent KV caches so the CUDA graph captures ONCE (first decode step)
+/// and all subsequent steps replay directly without re-capture overhead (~3ms saved/step).
+///
 /// Usage:
 ///   RUSTUP_TOOLCHAIN=nightly-2026-10-11 cargo run -p tempura-bench-gpu --release \
 ///     --bin bench-batch -- /path/to/model.gguf
@@ -10,7 +13,6 @@
 use std::path::Path;
 use std::time::Instant;
 
-use tempura_engine::cutile_kv_cache::CutileKvCache;
 use tempura_engine::gguf_loader::GgufLoader;
 use tempura_engine::model::CutileInferenceWrapper;
 
@@ -18,35 +20,32 @@ const WARMUP_STEPS: usize = 10;
 const BENCH_STEPS:  usize = 50;
 
 fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> f64 {
-    let cfg = &wrapper.model.config;
+    // Allocate M persistent KV caches once.
+    let mut kv_caches = wrapper.new_batch_kv_caches(batch);
 
-    // Allocate one KV cache per request using the model's GPU stream.
-    // We use forward_batch_decode_stateful which accepts external KV caches.
-    // For now, fresh per-call caches suffice for throughput measurement.
-    let mut cur_pos = 0usize;
-
-    // First call -- prefill at position 0.
+    // Prefill: position 0, one token per request.
+    let mut cur_pos = 0u32;
     {
         let toks: Vec<u32> = vec![1u32; batch];
-        let pos:  Vec<u32> = vec![cur_pos as u32; batch];
-        let _    = wrapper.forward_batch_decode_fresh(&toks, &pos);
+        let pos:  Vec<u32> = vec![cur_pos; batch];
+        let _    = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
         cur_pos += 1;
     }
 
-    // Warmup.
+    // Warmup: first step captures the CUDA graph, subsequent steps replay it.
     for _ in 0..WARMUP_STEPS {
         let toks: Vec<u32> = vec![2u32; batch];
-        let pos:  Vec<u32> = vec![cur_pos as u32; batch];
-        let _    = wrapper.forward_batch_decode_fresh(&toks, &pos);
+        let pos:  Vec<u32> = vec![cur_pos; batch];
+        let _    = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
         cur_pos += 1;
     }
 
-    // Timed.
+    // Timed: all steps are graph replays (no re-capture).
     let t0 = Instant::now();
     for _ in 0..BENCH_STEPS {
         let toks: Vec<u32> = vec![2u32; batch];
-        let pos:  Vec<u32> = vec![cur_pos as u32; batch];
-        let _    = wrapper.forward_batch_decode_fresh(&toks, &pos);
+        let pos:  Vec<u32> = vec![cur_pos; batch];
+        let _    = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
         cur_pos += 1;
     }
     let elapsed = t0.elapsed().as_secs_f64();
@@ -60,11 +59,12 @@ fn main() {
             "/home/fdupont/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf".to_string()
         });
 
-    println!("????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????");
-    println!("???  tempura Batched Decode Benchmark                      ???");
-    println!("????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????\n");
+    println!("================================================================================");
+    println!("  tempura Batched Decode Benchmark                      ");
+    println!("================================================================================\n");
     println!("  Model: {model_path}");
-    println!("  Warmup: {WARMUP_STEPS} steps, Bench: {BENCH_STEPS} steps per batch size\n");
+    println!("  Warmup: {WARMUP_STEPS} steps (step 1 captures CUDA graph, 2-{WARMUP_STEPS} replay)");
+    println!("  Bench:  {BENCH_STEPS} steps (all graph replays)\n");
 
     println!("Loading model...");
     let t0 = Instant::now();
@@ -90,7 +90,7 @@ fn main() {
     }
 
     println!("\n  Kernel: q4k_gemv_sm120_batch (sm_120 PTX, static smem, grid=(N,M,1)).");
-    println!("  Replaces oxide sm_80 batch kernels that crashed on Blackwell (error 719).");
+    println!("  Persistent KV caches: CUDA graph captures once, all bench steps replay.");
     println!("  Remaining gap at high M: flash attention scales as O(M*kv_len*n_heads).");
     println!();
     println!("  Reference (single request, CUDA graph): 130 tok/s");

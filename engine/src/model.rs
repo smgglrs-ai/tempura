@@ -9091,6 +9091,21 @@ impl CutileInferenceWrapper {
         session.position = target_seq_len;
     }
 
+    /// Allocate `n` fresh KV caches using the GPU model's stream.
+    ///
+    /// Use this to set up persistent caches for `forward_batch_decode_stateful`.
+    pub fn new_batch_kv_caches(
+        &self,
+        n: usize,
+    ) -> Vec<crate::cutile_kv_cache::CutileKvCache> {
+        let gm = self.gpu_model.as_ref().expect("new_batch_kv_caches: GPU model not loaded");
+        let stream = gm.stream();
+        (0..n)
+            .map(|_| crate::cutile_kv_cache::CutileKvCache::new(&self.model.config, stream.clone())
+                .expect("KV cache alloc"))
+            .collect()
+    }
+
     /// Batched decode: M requests x 1 token each in one GPU forward pass.
     ///
     /// Creates fresh KV caches for each request (starting at position 0).
