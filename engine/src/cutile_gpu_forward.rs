@@ -529,6 +529,83 @@ unsafe impl Sync for BatchDecodeGraph {}
 unsafe impl Send for CutileGpuModel {}
 unsafe impl Sync for CutileGpuModel {}
 
+/// Query free device VRAM using cuMemGetInfo_v2.
+/// Returns 0 on failure (caller treats it as "no headroom").
+fn query_free_vram_bytes() -> usize {
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    let rc = unsafe { cuda_core::sys::cuMemGetInfo_v2(&mut free as *mut _, &mut total as *mut _) };
+    if rc != 0 {
+        eprintln!("[cutile] cuMemGetInfo_v2 failed (rc={rc}); falling back to max_batch=2");
+        return 0;
+    }
+    free
+}
+
+/// Compute the maximum batch size the GPU can sustain for the batch decode graph.
+///
+/// Scratch tensors sized `[mb x dim]` and KV cache slots dominate VRAM per extra
+/// sequence.  We query free VRAM after model weights are uploaded and divide by
+/// the per-sequence cost, then clamp to [2, 16].
+fn compute_max_batch(
+    config: &ModelConfig,
+    h_pad: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    inter: usize,
+) -> usize {
+    let gpu_max_seq_len = config.max_seq_len.min(crate::cutile_kv_cache::GPU_KV_MAX_SEQ_LEN);
+
+    // Scratch tensors allocated once for the whole batch (flat [mb x dim], f32).
+    // batch_hidden, batch_normed1, batch_normed2   -> 3 x h_pad
+    // batch_gemv_q                                 -> q_dim
+    // batch_gemv_k, batch_gemv_v                   -> 2 x kv_dim
+    // batch_gemv_gate, batch_gemv_up               -> 2 x inter
+    // batch_gemv_o, batch_gemv_down                -> 2 x h_pad
+    // batch_oproj_in                               -> q_dim  (q_pad ~ q_dim)
+    // batch_post_attn_add, batch_ffn_add           -> 2 x h_pad
+    // batch_silu_out                               -> inter
+    // batch_down_compact (worst case)              -> inter
+    // Q8 scratch (qs_h + ds_h + qs_i + ds_i)      -> h_pad/4 + h_pad/32 + inter/4 + inter/32 (f32 elements in u32)
+    // RmsnormScratch x3, silu_row_bufs, d_embed    -> approximated as h_pad
+    // Total approximation (in f32 elements per extra sequence):
+    let f32_per_extra = 3 * h_pad          // hidden, normed1, normed2
+        + q_dim                            // gemv_q
+        + 2 * kv_dim                       // gemv_k, gemv_v
+        + 2 * inter                        // gemv_gate, gemv_up
+        + 2 * h_pad                        // gemv_o, gemv_down
+        + q_dim                            // oproj_in
+        + 2 * h_pad                        // post_attn_add, ffn_add
+        + inter                            // silu_out
+        + inter                            // down_compact (worst case)
+        + h_pad;                           // per-seq vecs + rmsnorm + silu_row
+
+    let scratch_bytes_per_extra = f32_per_extra * std::mem::size_of::<f32>();
+
+    // KV cache per extra sequence (f32 per layer per K and V, gpu_max_seq_len slots).
+    let kv_cache_bytes_per_extra =
+        config.num_layers * 2 * gpu_max_seq_len * kv_dim * std::mem::size_of::<f32>();
+
+    let vram_per_extra = scratch_bytes_per_extra + kv_cache_bytes_per_extra;
+
+    let free_vram = query_free_vram_bytes();
+    // Reserve 1 GB headroom for cuTile workspace and driver overhead.
+    let usable = free_vram.saturating_sub(1 << 30);
+
+    let extra = if vram_per_extra > 0 { usable / vram_per_extra } else { 0 };
+    let mb = (1 + extra).clamp(2, 16);
+
+    eprintln!(
+        "[cutile] batch graph max_batch={mb} \
+        (scratch={:.1}MiB/seq, kv_cache={:.0}MiB/seq, free_vram={:.1}GB)",
+        scratch_bytes_per_extra as f64 / (1 << 20) as f64,
+        kv_cache_bytes_per_extra as f64 / (1 << 20) as f64,
+        free_vram as f64 / (1u64 << 30) as f64,
+    );
+
+    mb
+}
+
 impl CutileGpuModel {
     // -- private helpers -------------------------------------------------------
 
@@ -1232,6 +1309,9 @@ impl CutileGpuModel {
         });
         eprintln!("[batch_graph] all_proj_q4k={all_proj_q4k}");
 
+        // Dynamic max_batch: query free VRAM after weight upload.
+        let max_batch_graph = compute_max_batch(config, h_pad, q_dim, kv_dim, inter);
+
         let (
             max_batch_graph, d_embed_batch, batch_hidden, batch_normed1, batch_normed2,
             batch_gemv_q, batch_gemv_k, batch_gemv_v, batch_gemv_gate, batch_gemv_up,
@@ -1243,7 +1323,7 @@ impl CutileGpuModel {
             batch_silu_row_bufs,
             batch_src_k_ptrs_dev, batch_src_v_ptrs_dev, batch_attn_kv_lens_dev,
             batch_attn_all_k_ptrs, batch_attn_all_v_ptrs,
-        ) = Self::alloc_batch_fields(matmul.stream(), h_pad, q_pad, q_dim, kv_dim, inter, inter_pad)?;
+        ) = Self::alloc_batch_fields(matmul.stream(), max_batch_graph, h_pad, q_pad, q_dim, kv_dim, inter, inter_pad)?;
 
         let model = Self {
             config: config.clone(),
@@ -1491,6 +1571,9 @@ impl CutileGpuModel {
         let event_kv_done = device.new_event()
             .expect("CutileGpuModel: event_kv_done creation failed");
 
+        // Dynamic max_batch: query free VRAM after weight upload.
+        let max_batch_graph = compute_max_batch(config, h_pad, q_dim, kv_dim, inter);
+
         let (
             max_batch_graph, d_embed_batch, batch_hidden, batch_normed1, batch_normed2,
             batch_gemv_q, batch_gemv_k, batch_gemv_v, batch_gemv_gate, batch_gemv_up,
@@ -1502,7 +1585,7 @@ impl CutileGpuModel {
             batch_silu_row_bufs,
             batch_src_k_ptrs_dev, batch_src_v_ptrs_dev, batch_attn_kv_lens_dev,
             batch_attn_all_k_ptrs, batch_attn_all_v_ptrs,
-        ) = Self::alloc_batch_fields(matmul.stream(), h_pad, q_pad, q_dim, kv_dim, inter, inter_pad)?;
+        ) = Self::alloc_batch_fields(matmul.stream(), max_batch_graph, h_pad, q_pad, q_dim, kv_dim, inter, inter_pad)?;
 
         let model = Self {
             config: config.clone(),
@@ -1724,10 +1807,11 @@ impl CutileGpuModel {
     /// Allocate all pre-allocated device tensors required by the batch decode CUDA graph.
     ///
     /// Called once during model construction; the returned values are stored as struct fields.
-    /// `MAX_BATCH = 2` (sized for 2 simultaneous sequences, covers the M=2 proof-of-concept).
+    /// `mb` is the dynamic max-batch size computed from available GPU VRAM.
     #[allow(clippy::type_complexity)]
     fn alloc_batch_fields(
         stream:   &Arc<cuda_core::Stream>,
+        mb:       usize,
         h_pad:    usize,
         q_pad:    usize,
         q_dim:    usize,
@@ -1772,8 +1856,7 @@ impl CutileGpuModel {
         cuda_core::sys::CUdeviceptr,       // batch_attn_all_k_ptrs
         cuda_core::sys::CUdeviceptr,       // batch_attn_all_v_ptrs
     ), tempura_kernels::KernelError> {
-        const MB: usize = 2; // max_batch_graph
-
+        // mb is passed in from compute_max_batch (dynamic VRAM-based sizing).
         let af32 = |n: usize| -> Result<Arc<Tensor<f32>>, tempura_kernels::KernelError> {
             Ok(Arc::new(
                 api::zeros::<f32>(&[n])
@@ -1789,65 +1872,65 @@ impl CutileGpuModel {
             ))
         };
         let vec_af32 = |n: usize| -> Result<Vec<Arc<Tensor<f32>>>, tempura_kernels::KernelError> {
-            (0..MB).map(|_| af32(n)).collect()
+            (0..mb).map(|_| af32(n)).collect()
         };
 
         let d_embed_batch  = vec_af32(h_pad)?;
-        let batch_hidden   = af32(MB * h_pad)?;
-        let batch_normed1  = af32(MB * h_pad)?;
-        let batch_normed2  = af32(MB * h_pad)?;
-        let batch_gemv_q    = af32(MB * q_dim)?;
-        let batch_gemv_k    = af32(MB * kv_dim)?;
-        let batch_gemv_v    = af32(MB * kv_dim)?;
-        let batch_gemv_gate = af32(MB * inter)?;
-        let batch_gemv_up   = af32(MB * inter)?;
-        let batch_gemv_o    = af32(MB * h_pad)?;
-        let batch_gemv_down = af32(MB * h_pad)?;
+        let batch_hidden   = af32(mb * h_pad)?;
+        let batch_normed1  = af32(mb * h_pad)?;
+        let batch_normed2  = af32(mb * h_pad)?;
+        let batch_gemv_q    = af32(mb * q_dim)?;
+        let batch_gemv_k    = af32(mb * kv_dim)?;
+        let batch_gemv_v    = af32(mb * kv_dim)?;
+        let batch_gemv_gate = af32(mb * inter)?;
+        let batch_gemv_up   = af32(mb * inter)?;
+        let batch_gemv_o    = af32(mb * h_pad)?;
+        let batch_gemv_down = af32(mb * h_pad)?;
         let batch_q_seqs  = vec_af32(q_dim)?;
         let batch_k_seqs  = vec_af32(kv_dim)?;
         let batch_v_seqs  = vec_af32(kv_dim)?;
         let batch_k_rot   = vec_af32(kv_dim)?;
         let batch_q_rot   = vec_af32(q_pad)?;
         let batch_attn_out = vec_af32(q_dim)?;
-        let batch_oproj_in = af32(MB * q_pad)?;
+        let batch_oproj_in = af32(mb * q_pad)?;
 
         const SILU_B: usize = 32;
-        let batch_post_attn_add_scratch = RefCell::new(Some(af32(MB * h_pad)?));
-        let batch_ffn_add_scratch       = RefCell::new(Some(af32(MB * h_pad)?));
-        let batch_silu_out_scratch      = RefCell::new(Some(af32(MB * inter.div_ceil(SILU_B) * SILU_B)?));
+        let batch_post_attn_add_scratch = RefCell::new(Some(af32(mb * h_pad)?));
+        let batch_ffn_add_scratch       = RefCell::new(Some(af32(mb * h_pad)?));
+        let batch_silu_out_scratch      = RefCell::new(Some(af32(mb * inter.div_ceil(SILU_B) * SILU_B)?));
         let batch_down_compact = if inter_pad != inter {
-            Some(af32(MB * inter)?)
+            Some(af32(mb * inter)?)
         } else {
             None
         };
 
         let batch_pre_attn_norm_scratch  = RefCell::new(
-            RmsnormScratch::new(stream, MB, h_pad)?
+            RmsnormScratch::new(stream, mb, h_pad)?
         );
         let batch_post_attn_norm_scratch = RefCell::new(
-            RmsnormScratch::new(stream, MB, h_pad)?
+            RmsnormScratch::new(stream, mb, h_pad)?
         );
         let batch_final_norm_scratch     = RefCell::new(
-            RmsnormScratch::new(stream, MB, h_pad)?
+            RmsnormScratch::new(stream, mb, h_pad)?
         );
 
         // Q8_1 scratch for h-width projections (Q, K, V, O, gate, up).
         // k = h_pad (rounded up to h_pad which is a power of 2, divisible by 256).
-        let h_k_total      = MB * h_pad;
+        let h_k_total      = mb * h_pad;
         let h_q8_blocks    = h_k_total.div_ceil(32);
         let batch_q8_qs_h  = au32(h_k_total / 4)?;
         let batch_q8_ds_h  = au32(h_q8_blocks)?;
 
         // Q8_1 scratch for inter-width down projection.
-        // k = inter (actual K, not padded; Q8_1 quantise sees k_total = MB * inter).
-        let i_k_total      = MB * inter;
+        // k = inter (actual K, not padded; Q8_1 quantise sees k_total = mb * inter).
+        let i_k_total      = mb * inter;
         let i_q8_blocks    = i_k_total.div_ceil(32);
         let batch_q8_qs_i  = au32(i_k_total / 4)?;
         let batch_q8_ds_i  = au32(i_q8_blocks)?;
 
-        // Raw device pointer arrays [MB x u64] for batch KV scatter-write.
+        // Raw device pointer arrays [mb x u64] for batch KV scatter-write.
         // Allocated as raw cuMemAlloc'd memory (not a cuTile Tensor since u64 is unsupported).
-        let ptr_bytes = (MB * std::mem::size_of::<u64>()) as usize;
+        let ptr_bytes = (mb * std::mem::size_of::<u64>()) as usize;
         let mut batch_src_k_ptrs_dev: cuda_core::sys::CUdeviceptr = 0;
         let mut batch_src_v_ptrs_dev: cuda_core::sys::CUdeviceptr = 0;
         let rc = unsafe { cuda_core::sys::cuMemAlloc_v2(&mut batch_src_k_ptrs_dev, ptr_bytes) };
@@ -1864,8 +1947,8 @@ impl CutileGpuModel {
             )));
         }
 
-        // Per-sequence kv_len array [MB x i32] for oxide_decode_attn_batch kernel.
-        let kv_len_bytes = MB * std::mem::size_of::<i32>();
+        // Per-sequence kv_len array [mb x i32] for oxide_decode_attn_batch kernel.
+        let kv_len_bytes = mb * std::mem::size_of::<i32>();
         let mut batch_attn_kv_lens_dev: cuda_core::sys::CUdeviceptr = 0;
         let rc = unsafe { cuda_core::sys::cuMemAlloc_v2(&mut batch_attn_kv_lens_dev, kv_len_bytes) };
         if rc != 0 {
@@ -1879,7 +1962,7 @@ impl CutileGpuModel {
         // Per-layer K/V cache pointer arrays for oxide_decode_attn_batch.
         // MAX_ATTN_LAYERS=64 covers any realistic model; actual layers checked at runtime.
         const MAX_ATTN_LAYERS: usize = 64;
-        let all_ptrs_bytes = MAX_ATTN_LAYERS * MB * std::mem::size_of::<u64>();
+        let all_ptrs_bytes = MAX_ATTN_LAYERS * mb * std::mem::size_of::<u64>();
         let mut batch_attn_all_k_ptrs: cuda_core::sys::CUdeviceptr = 0;
         let mut batch_attn_all_v_ptrs: cuda_core::sys::CUdeviceptr = 0;
         let rc = unsafe { cuda_core::sys::cuMemAlloc_v2(&mut batch_attn_all_k_ptrs, all_ptrs_bytes) };
@@ -1904,12 +1987,12 @@ impl CutileGpuModel {
 
         // Sized inter_pad (not inter) because gemm_q6k_d2d_slot reshapes input to
         // next_pow2(k_blocks * Q6K_QK) = next_pow2(inter), which equals inter_pad.
-        let batch_silu_row_bufs: Vec<Arc<Tensor<f32>>> = (0..MB)
+        let batch_silu_row_bufs: Vec<Arc<Tensor<f32>>> = (0..mb)
             .map(|_| af32(inter_pad))
             .collect::<Result<_, _>>()?;
 
         Ok((
-            MB, d_embed_batch, batch_hidden, batch_normed1, batch_normed2,
+            mb, d_embed_batch, batch_hidden, batch_normed1, batch_normed2,
             batch_gemv_q, batch_gemv_k, batch_gemv_v, batch_gemv_gate, batch_gemv_up,
             batch_gemv_o, batch_gemv_down, batch_q_seqs, batch_k_seqs, batch_v_seqs,
             batch_k_rot, batch_q_rot, batch_attn_out, batch_oproj_in,
@@ -4724,7 +4807,7 @@ impl CutileGpuModel {
                     && silu_out.size() == m * k_down
                 {
                     // silu_out is [m * k_down] f32 -- row 0 then row 1 contiguous.
-                    // batch_gemv_down is [MB * h_pad]; kernel writes row i at i * h_out.
+                    // batch_gemv_down is [mb * h_pad]; kernel writes row i at i * h_out.
                     oxide_q6k.forward_sm120_batch_d2d_into(
                         &silu_out, &dw_down.tensor, &self.batch_gemv_down,
                         h_out, dw_down.k_blocks, m, cu_stream,
