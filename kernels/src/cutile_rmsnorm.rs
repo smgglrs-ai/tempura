@@ -391,20 +391,32 @@ impl CutileRmsNorm {
 
         // -- Reclaim or allocate out_t -----------------------------------------
         // The caller's Arc from the previous call should be dropped by now;
-        // reshape from [seq_len, h_pad] back to flat [seq_len * h_pad] for partition.
+        // Reclaim or allocate out_t.  The pre-allocated scratch may have been
+        // sized for a different seq_len (e.g. max_batch at construction vs. the
+        // actual M at call time).  If element counts differ, discard and re-allocate.
+        let n_out = seq_len * h_pad;
         let out_tensor = match scratch.out_t.take() {
             Some(arc) => match Arc::try_unwrap(arc) {
-                Ok(tensor) => tensor
-                    .reshape(&[seq_len * h_pad])
-                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+                Ok(tensor) => {
+                    if tensor.size() == n_out {
+                        tensor
+                            .reshape(&[n_out])
+                            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    } else {
+                        // Pre-allocated for a different seq_len; drop and allocate fresh.
+                        api::zeros::<f32>(&[n_out])
+                            .sync_on(stream)
+                            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    }
+                }
                 Err(arc_back) => {
                     scratch.out_t = Some(arc_back);
-                    api::zeros::<f32>(&[seq_len * h_pad])
+                    api::zeros::<f32>(&[n_out])
                         .sync_on(stream)
                         .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
                 }
             },
-            None => api::zeros::<f32>(&[seq_len * h_pad])
+            None => api::zeros::<f32>(&[n_out])
                 .sync_on(stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
         };

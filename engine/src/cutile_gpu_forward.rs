@@ -4962,13 +4962,21 @@ impl CutileGpuModel {
         // invalidate the cached graph so the else-branch re-captures.
         {
             let need_invalidate = match *graph_cache {
-                Some(ref dg) => !(0..cfg.num_layers).all(|l| {
-                    (0..m).all(|r| {
-                        let (k, v) = kv_caches[r].kv_device_tensors(l);
-                        k.device_pointer().cu_deviceptr() == dg.captured_k_ptrs[l][r]
-                            && v.device_pointer().cu_deviceptr() == dg.captured_v_ptrs[l][r]
-                    })
-                }),
+                Some(ref dg) => {
+                    if dg.m != m {
+                        // Batch size changed: re-capture for new m.
+                        eprintln!("[batch_graph] batch size changed ({} -> {m}) -- re-capturing", dg.m);
+                        true
+                    } else {
+                        !(0..cfg.num_layers).all(|l| {
+                            (0..m).all(|r| {
+                                let (k, v) = kv_caches[r].kv_device_tensors(l);
+                                k.device_pointer().cu_deviceptr() == dg.captured_k_ptrs[l][r]
+                                    && v.device_pointer().cu_deviceptr() == dg.captured_v_ptrs[l][r]
+                            })
+                        })
+                    }
+                }
                 None => false,
             };
             if need_invalidate {
@@ -5039,6 +5047,28 @@ impl CutileGpuModel {
                         );
                     }
                 }
+            }
+
+            // Pre-size batch scratch tensors for seq_len=m before CUDA graph capture.
+            // Scratch was pre-allocated for max_batch at construction; the reshape inside
+            // forward_device_fused_scratch requires the correct element count.  Synchronous
+            // alloc is safe here because we are not yet in capture mode.
+            {
+                const SILU_B: usize = 32;
+                let inter = cfg.intermediate_size;
+                let inter_pad = inter.div_ceil(SILU_B) * SILU_B;
+                let h_pad = self.h_pad;
+                let alloc_flat = |n: usize| -> Arc<Tensor<f32>> {
+                    Arc::new(
+                        api::zeros::<f32>(&[n])
+                            .sync_on(stream)
+                            .expect("batch_graph: scratch pre-size"),
+                    )
+                };
+                self.batch_pre_attn_norm_scratch.borrow_mut().out_t  = Some(alloc_flat(m * h_pad));
+                self.batch_post_attn_norm_scratch.borrow_mut().out_t = Some(alloc_flat(m * h_pad));
+                self.batch_final_norm_scratch.borrow_mut().out_t     = Some(alloc_flat(m * h_pad));
+                *self.batch_silu_out_scratch.borrow_mut() = Some(alloc_flat(m * inter_pad));
             }
 
             let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;

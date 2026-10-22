@@ -285,9 +285,18 @@ impl CutileElementwise {
 
         let out_tensor = match scratch.take() {
             Some(arc) => match Arc::try_unwrap(arc) {
-                Ok(tensor) => tensor
-                    .reshape(&[n_pad])
-                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+                Ok(tensor) => {
+                    if tensor.size() == n_pad {
+                        tensor
+                            .reshape(&[n_pad])
+                            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    } else {
+                        // Pre-allocated for a different seq_len; discard and re-allocate.
+                        api::zeros::<f32>(&[n_pad])
+                            .sync_on(stream)
+                            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    }
+                }
                 Err(arc_back) => {
                     *scratch = Some(arc_back);
                     api::zeros::<f32>(&[n_pad])
