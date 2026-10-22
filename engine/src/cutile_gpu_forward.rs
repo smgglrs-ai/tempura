@@ -4710,40 +4710,50 @@ impl CutileGpuModel {
                     &self.batch_q8_qs_i, &self.batch_q8_ds_i, &self.batch_gemv_down,
                 ).expect("batch inner: down Q4K GEMV");
             } else if let Some(dw_down) = self.device_weights_q6k.get(down_w.as_str()) {
-                // Q6K down_proj (Q4_K_M models): M sequential single-seq GEMVs.
-                // Uses pre-allocated batch_silu_row_bufs[r] (no dynamic allocation
-                // during capture), so these nodes are captured in the CUDA graph.
+                // Q6K down_proj (Q4_K_M models).
                 let h_out = dw_down.n;
                 let k_down = dw_down.k_blocks * Q6K_QK; // Q6K block size = 256
-                for r in 0..m {
-                    // D->D copy silu_out row r into pre-allocated row buffer.
-                    let copy_len = k_down.min(inter);
-                    unsafe {
-                        cuda_core::memcpy_dtod_async::<f32>(
-                            self.batch_silu_row_bufs[r].device_pointer().cu_deviceptr(),
-                            silu_out.device_pointer().cu_deviceptr() + (r * inter * 4) as u64,
-                            copy_len, stream,
-                        ).expect("batch inner: Q6K silu row D->D");
-                    }
-                    // Use a pre-allocated output slice at row r of batch_gemv_down.
-                    // We don't have a [h_out] view into batch_gemv_down, so use
-                    // batch_q_seqs[0] (q_dim=h_pad >= h_out) as a single-seq output temp.
-                    // Then D->D to batch_gemv_down row r.
-                    if let Some(ref oxide_q6k) = self.oxide_q6k_gemv {
+
+                // Prefer batch kernel (M=2): one block per neuron, weights loaded ONCE.
+                // Requires silu_out to be [m * k_down] f32 (no padding between rows).
+                // For LLaMA-3.1-8B: inter=14336=k_down, so silu_out.size()==m*k_down.
+                let oxide_q6k = self.oxide_q6k_gemv.as_ref()
+                    .expect("batch inner: oxide_q6k_gemv required for Q6K down path");
+                if m > 1
+                    && oxide_q6k.has_sm120_batch()
+                    && silu_out.size() == m * k_down
+                {
+                    // silu_out is [m * k_down] f32 -- row 0 then row 1 contiguous.
+                    // batch_gemv_down is [MB * h_pad]; kernel writes row i at i * h_out.
+                    oxide_q6k.forward_sm120_batch_d2d_into(
+                        &silu_out, &dw_down.tensor, &self.batch_gemv_down,
+                        h_out, dw_down.k_blocks, m, cu_stream,
+                    ).expect("batch inner: Q6K batch down_proj GEMV");
+                } else {
+                    // Sequential fallback: M single-seq GEMVs (reads weights M times).
+                    // Uses pre-allocated batch_silu_row_bufs[r] and batch_q_seqs[0]
+                    // (no dynamic allocation during capture).
+                    for r in 0..m {
+                        let copy_len = k_down.min(inter);
+                        unsafe {
+                            cuda_core::memcpy_dtod_async::<f32>(
+                                self.batch_silu_row_bufs[r].device_pointer().cu_deviceptr(),
+                                silu_out.device_pointer().cu_deviceptr() + (r * inter * 4) as u64,
+                                copy_len, stream,
+                            ).expect("batch inner: Q6K silu row D->D");
+                        }
                         oxide_q6k.submit_d2d_arc_on(
                             &self.batch_silu_row_bufs[r], &dw_down.tensor,
                             &self.batch_q_seqs[0], h_out, dw_down.k_blocks,
                             cu_stream,
                         ).expect("batch inner: Q6K down_proj GEMV");
-                    } else {
-                        panic!("batch inner: oxide_q6k_gemv required for Q6K down path");
-                    }
-                    unsafe {
-                        cuda_core::memcpy_dtod_async::<f32>(
-                            self.batch_gemv_down.device_pointer().cu_deviceptr() + (r * h_out * 4) as u64,
-                            self.batch_q_seqs[0].device_pointer().cu_deviceptr(),
-                            h_out, stream,
-                        ).expect("batch inner: Q6K down_proj concat");
+                        unsafe {
+                            cuda_core::memcpy_dtod_async::<f32>(
+                                self.batch_gemv_down.device_pointer().cu_deviceptr() + (r * h_out * 4) as u64,
+                                self.batch_q_seqs[0].device_pointer().cu_deviceptr(),
+                                h_out, stream,
+                            ).expect("batch inner: Q6K down_proj concat");
+                        }
                     }
                 }
             } else {

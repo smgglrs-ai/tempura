@@ -49,7 +49,7 @@ const WARPS_PER_BLOCK_KPAR: u32 = 8;
 const BLOCK_DIM_KPAR: u32 = WARPS_PER_BLOCK_KPAR * 32; // 256
 const SMEM_KPAR: u32 = WARPS_PER_BLOCK_KPAR * 4; // 32 bytes
 
-/// Launches the oxide-compiled Q6_K GEMV kernel for M=1 decode.
+/// Launches the oxide-compiled Q6_K GEMV kernel for M=1 or M=2 decode.
 pub struct OxideQ6kGemv {
     cu_module:              CUmodule,
     cu_function:            CUfunction,
@@ -58,6 +58,10 @@ pub struct OxideQ6kGemv {
     cu_sm120_module:        Option<CUmodule>,
     /// q6k_gemv_sm120_mbar_kpar8: cp.async double-buffer variant (sm_120+).
     cu_function_sm120_mbar: Option<CUfunction>,
+    /// sm_120 batch module: q6k_gemv_sm120_batch (M=2, shared weight reads).
+    cu_sm120_batch_module:  Option<CUmodule>,
+    /// q6k_gemv_sm120_batch: true-batch kernel, one block per output neuron. (sm_120+).
+    cu_function_sm120_batch: Option<CUfunction>,
     /// Pre-allocated kpar output scratch -- avoids allocation during CUDA graph capture.
     /// Set via `pre_allocate_kpar_output_scratch(max_n)` before first graph capture.
     kpar_out_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
@@ -73,6 +77,9 @@ impl Drop for OxideQ6kGemv {
             let _ = unsafe { cuda_core::sys::cuModuleUnload(self.cu_module) };
         }
         if let Some(m) = self.cu_sm120_module.take() {
+            let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
+        }
+        if let Some(m) = self.cu_sm120_batch_module.take() {
             let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
         }
     }
@@ -243,6 +250,56 @@ impl OxideQ6kGemv {
                 (None, None)
             };
 
+        // -- Try sm_120 batch PTX (q6k_gemv_sm120_batch, M=2) -------------------
+        let (cu_sm120_batch_module, cu_function_sm120_batch) =
+            if cu_sm120_module.is_some() {
+                // cc is already >= 1200 (sm120_mbar was loaded), reuse the check.
+                let ptx_cstr = CString::new(crate::q6k_batch_sm120_ptx::PTX)
+                    .unwrap_or_default();
+                let mut batch_mod = std::mem::MaybeUninit::uninit();
+                let rc = unsafe {
+                    cuda_core::sys::cuModuleLoadData(
+                        batch_mod.as_mut_ptr(),
+                        ptx_cstr.as_ptr() as *const _,
+                    )
+                };
+                if rc == CUDA_SUCCESS {
+                    let batch_mod = unsafe { batch_mod.assume_init() };
+                    let entry_cstr = CString::new(crate::q6k_batch_sm120_ptx::ENTRY)
+                        .unwrap_or_default();
+                    let mut fn_out = std::mem::MaybeUninit::uninit();
+                    let rc2 = unsafe {
+                        cuda_core::sys::cuModuleGetFunction(
+                            fn_out.as_mut_ptr(),
+                            batch_mod,
+                            entry_cstr.as_ptr(),
+                        )
+                    };
+                    if rc2 == CUDA_SUCCESS {
+                        eprintln!(
+                            "oxide-gemv-q6k: loaded sm120_batch variant (entry={})",
+                            crate::q6k_batch_sm120_ptx::ENTRY,
+                        );
+                        (Some(batch_mod), Some(unsafe { fn_out.assume_init() }))
+                    } else {
+                        eprintln!(
+                            "oxide-gemv-q6k: cuModuleGetFunction(sm120_batch) \
+                             failed (rc={rc2}); batch variant unavailable"
+                        );
+                        let _ = unsafe { cuda_core::sys::cuModuleUnload(batch_mod) };
+                        (None, None)
+                    }
+                } else {
+                    eprintln!(
+                        "oxide-gemv-q6k: cuModuleLoadData(sm120_batch PTX) \
+                         failed (rc={rc}); batch variant unavailable"
+                    );
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
         // Return Some only when at least one kernel is available.
         let any_loaded = !cu_function.is_null()
             || cu_function_kpar.is_some()
@@ -252,15 +309,19 @@ impl OxideQ6kGemv {
             if !cu_module.is_null() {
                 let _ = unsafe { cuda_core::sys::cuModuleUnload(cu_module) };
             }
+            if let Some(m) = cu_sm120_batch_module {
+                let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
+            }
             eprintln!("oxide-gemv-q6k: no Q6K kernel variant available; falling back to cuTile");
             return None;
         }
 
         eprintln!(
-            "oxide-gemv-q6k: Q6K kernels loaded (oxide_fn={}, kpar={}, sm120_mbar={})",
+            "oxide-gemv-q6k: Q6K kernels loaded (oxide_fn={}, kpar={}, sm120_mbar={}, sm120_batch={})",
             !cu_function.is_null(),
             cu_function_kpar.is_some(),
             cu_function_sm120_mbar.is_some(),
+            cu_function_sm120_batch.is_some(),
         );
         Some(Self {
             cu_module,
@@ -268,6 +329,8 @@ impl OxideQ6kGemv {
             cu_function_kpar,
             cu_sm120_module,
             cu_function_sm120_mbar,
+            cu_sm120_batch_module,
+            cu_function_sm120_batch,
             kpar_out_scratch: RefCell::new(None),
             stream,
         })
@@ -281,6 +344,71 @@ impl OxideQ6kGemv {
     /// Returns `true` when the sm_120 cp.async mbar kpar variant was loaded.
     pub fn has_sm120_mbar(&self) -> bool {
         self.cu_function_sm120_mbar.is_some()
+    }
+
+    /// Returns `true` when the sm_120 batch variant (M=2) was loaded.
+    pub fn has_sm120_batch(&self) -> bool {
+        self.cu_function_sm120_batch.is_some()
+    }
+
+    /// Batch Q6K GEMV for M=2 decode: reads each weight block ONCE, computes both rows.
+    ///
+    /// Grid: (n, 1, 1). Block: (256, 1, 1). Static smem: 3456 bytes.
+    ///
+    /// - `x_m`: `[M * k_blocks * 256]` f32 -- M activation rows concatenated (row 0 then row 1).
+    /// - `packed`: `[n * k_blocks * 53]` u32 -- Q6K weight blocks.
+    /// - `out_m`: `[M * n]` f32 -- output buffer (row 0 at `[0..n-1]`, row 1 at `[n..2n-1]`).
+    /// - `n`: output neurons per row.
+    /// - `k_blocks`: Q6K blocks per activation row.
+    /// - `cu_stream`: CUDA stream (must be the graph-capture stream when inside capture).
+    ///
+    /// No allocation; safe inside `cuStreamBeginCapture` / `cuStreamEndCapture`.
+    pub fn forward_sm120_batch_d2d_into(
+        &self,
+        x_m: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        out_m: &Arc<Tensor<f32>>,
+        n: usize,
+        k_blocks: usize,
+        _m: usize,
+        cu_stream: cuda_core::sys::CUstream,
+    ) -> Result<()> {
+        let batch_fn = self.cu_function_sm120_batch.ok_or_else(|| {
+            KernelError::InvalidConfig("q6k_gemv_sm120_batch not loaded".into())
+        })?;
+
+        let out_ptr: u64 = out_m.device_pointer().cu_deviceptr();
+        let out_len: u64 = out_m.size() as u64;
+        let x_ptr: u64 = x_m.device_pointer().cu_deviceptr();
+        let x_len: u64 = x_m.size() as u64;
+        let packed_ptr: u64 = packed.device_pointer().cu_deviceptr();
+        let packed_len: u64 = packed.size() as u64;
+        let n_u32 = n as u32;
+        let k_blocks_u32 = k_blocks as u32;
+
+        let mut params: [*mut c_void; 8] = [
+            &out_ptr      as *const _ as *mut c_void,
+            &out_len      as *const _ as *mut c_void,
+            &x_ptr        as *const _ as *mut c_void,
+            &x_len        as *const _ as *mut c_void,
+            &packed_ptr   as *const _ as *mut c_void,
+            &packed_len   as *const _ as *mut c_void,
+            &n_u32        as *const _ as *mut c_void,
+            &k_blocks_u32 as *const _ as *mut c_void,
+        ];
+
+        unsafe {
+            launch_kernel(
+                batch_fn,
+                (n as u32, 1, 1),
+                (BLOCK_DIM_KPAR, 1, 1),
+                0, // static smem only (3456 bytes declared in PTX)
+                cu_stream,
+                &mut params,
+            )
+        }
+        .map_err(|e| KernelError::InvalidConfig(format!("q6k_gemv_sm120_batch: {e}")))?;
+        Ok(())
     }
 
     /// Pre-allocate a kpar output scratch tensor of size `max_n`.

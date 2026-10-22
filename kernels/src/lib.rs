@@ -38,6 +38,8 @@ pub mod q4k_batch_sm120_ptx;
 #[cfg(feature = "cutile")]
 pub mod q6k_gemv_v4_ptx;
 #[cfg(feature = "cutile")]
+pub mod q6k_batch_sm120_ptx;
+#[cfg(feature = "cutile")]
 pub mod oxide_q6k_gemv_host;
 #[cfg(feature = "cutile")]
 pub mod oxide_decode_attn_host;
