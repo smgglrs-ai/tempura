@@ -35,6 +35,7 @@ pub mod oxide_q4k_gemv_host;
 pub mod q4k_gemv_v4_ptx;
 pub mod q4k_fused_silu_v4_ptx;
 pub mod q4k_batch_sm120_ptx;
+pub mod q4k_mma_batch_sm120_ptx;
 #[cfg(feature = "cutile")]
 pub mod q6k_gemv_v4_ptx;
 #[cfg(feature = "cutile")]

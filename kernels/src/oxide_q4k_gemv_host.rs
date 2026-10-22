@@ -34,6 +34,7 @@ use crate::gpu_capabilities::{GpuCapabilities, KernelVariant};
 use crate::q4k_gemv_v4_ptx;
 use crate::q4k_fused_silu_v4_ptx;
 use crate::q4k_batch_sm120_ptx;
+use crate::q4k_mma_batch_sm120_ptx;
 use cuda_core::{launch_kernel, Stream};
 use cuda_core::sys::{CUfunction, CUmodule};
 use cutile::{api, prelude::DeviceOp, tensor::Tensor};
@@ -59,6 +60,10 @@ const WARPS_PER_BLOCK: u32 = 4;
 const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128
 const WARPS_PER_BLOCK_KPAR: u32 = 8;
 const BLOCK_DIM_KPAR: u32 = WARPS_PER_BLOCK_KPAR * 32; // 256
+/// Block dimension for the MMA batch GEMM kernel.
+/// Derived: floor(65536 / (39 * 128)) * 4 = 52 warps/SM > floor(65536 / (42 * 256)) * 8 = 48.
+/// WARPS=4 maximises sm_120 occupancy given register budget; must divide k_blocks*8=128 evenly.
+const BLOCK_DIM_MMA: u32 = 4 * 32; // 128 (4 warps)
 
 /// Launches the oxide-compiled Q4_K GEMV kernel for M=1 decode.
 pub struct OxideQ4kGemv {
@@ -96,6 +101,11 @@ pub struct OxideQ4kGemv {
     /// Replaces the oxide sm_80 batch kernels that crash on Blackwell (error 719).
     cu_sm120_batch_module:      Option<CUmodule>,
     cu_sm120_batch:             Option<CUfunction>,
+    /// Optional sm_120 INT8 tensor-core batch GEMM (mma.sync.aligned.m16n8k32).
+    /// Uses ~4000 TOPS INT8 tensor cores vs ~840 TOPS dp4a SIMD.
+    /// Grid (N/8, 1, 1), Block (32, 1, 1). Requires sm_120 + uses_raw_gguf.
+    cu_mma_batch_module:        Option<CUmodule>,
+    cu_mma_batch:               Option<CUfunction>,
     /// Selected Q4K+Q8_1 kpar dispatch function: sm120 or dp4a_kpar8 (sm_80) fallback.
     /// Populated by the KernelVariant selection at construction time.  Always Some when
     /// at least one kpar variant loaded.  None only when no kpar kernel is available at all.
@@ -137,6 +147,11 @@ impl Drop for OxideQ4kGemv {
             }
         }
         if let Some(m) = self.cu_sm120_batch_module {
+            if !m.is_null() {
+                let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
+            }
+        }
+        if let Some(m) = self.cu_mma_batch_module {
             if !m.is_null() {
                 let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
             }
@@ -349,6 +364,44 @@ impl OxideQ4kGemv {
                 None
             };
 
+            // -- Load sm_120 MMA batch GEMM PTX (INT8 tensor cores, m16n8k32) ---
+            let mut cu_mma_batch_mod: Option<CUmodule> = None;
+            let cu_mma_batch: Option<CUfunction> = if !sm120_disabled && caps.cc() >= q4k_mma_batch_sm120_ptx::MIN_CC {
+                let ptx_cstr = CString::new(q4k_mma_batch_sm120_ptx::PTX).unwrap_or_default();
+                let mut mma_mod = std::mem::MaybeUninit::uninit();
+                let rc = unsafe {
+                    cuda_core::sys::cuModuleLoadData(
+                        mma_mod.as_mut_ptr(),
+                        ptx_cstr.as_ptr() as *const _,
+                    )
+                };
+                if rc == CUDA_SUCCESS {
+                    let mma_mod = unsafe { mma_mod.assume_init() };
+                    let entry = CString::new(q4k_mma_batch_sm120_ptx::ENTRY).unwrap_or_default();
+                    let mut mma_fn = std::mem::MaybeUninit::uninit();
+                    let rc2 = unsafe {
+                        cuda_core::sys::cuModuleGetFunction(mma_fn.as_mut_ptr(), mma_mod, entry.as_ptr())
+                    };
+                    if rc2 == CUDA_SUCCESS {
+                        eprintln!(
+                            "oxide-gemv-q4k: loaded sm_120 MMA batch PTX ({} bytes) -- INT8 tensor cores m16n8k32",
+                            q4k_mma_batch_sm120_ptx::PTX.len(),
+                        );
+                        cu_mma_batch_mod = Some(mma_mod);
+                        Some(unsafe { mma_fn.assume_init() })
+                    } else {
+                        let _ = unsafe { cuda_core::sys::cuModuleUnload(mma_mod) };
+                        eprintln!("oxide-gemv-q4k: cuModuleGetFunction(mma_batch) failed (rc={rc2}), falling back to dp4a batch");
+                        None
+                    }
+                } else {
+                    eprintln!("oxide-gemv-q4k: cuModuleLoadData(mma_batch PTX) failed (rc={rc}), falling back to dp4a batch");
+                    None
+                }
+            } else {
+                None
+            };
+
             // -- Build KernelVariant table and select best kpar dispatch ---------
             let mut kpar_variants: Vec<KernelVariant> = Vec::new();
             if let Some(f) = cu_q8_dp4a_kpar8 {
@@ -374,7 +427,7 @@ impl OxideQ4kGemv {
             let uses_sm120 = kpar_dispatch.as_ref().map(|v| v.min_cc >= 1200).unwrap_or(false);
 
             eprintln!(
-                "oxide-gemv-q4k: loaded (oxide PTX {} bytes, entry={}, q8={}, q8_dp4a_kpar4={}, q8_dp4a={}, q8_dp4a_raw={}, q8_dp4a_kpar8={}, sm120_dp4a_kpar8={}, kpar_dispatch={}, fused_silu={}, sm120_fused_silu={}, batch={}, sm120_batch={})",
+                "oxide-gemv-q4k: loaded (oxide PTX {} bytes, entry={}, q8={}, q8_dp4a_kpar4={}, q8_dp4a={}, q8_dp4a_raw={}, q8_dp4a_kpar8={}, sm120_dp4a_kpar8={}, kpar_dispatch={}, fused_silu={}, sm120_fused_silu={}, batch={}, sm120_batch={}, mma_batch={})",
                 OXIDE_Q4K_PTX.len(),
                 KERNEL_ENTRY,
                 cu_q8_gemv.is_some(),
@@ -388,6 +441,7 @@ impl OxideQ4kGemv {
                 cu_sm120_fused_silu.is_some(),
                 cu_batch_gemv.is_some(),
                 cu_sm120_batch.is_some(),
+                cu_mma_batch.is_some(),
             );
             // dp4a_raw: raw GGUF format for the oxide sm_80 path -- benchmarked and DISABLED.
             // uses_raw_gguf=true when sm120 is selected: sm120 reads native 36-u32 GGUF format.
@@ -395,7 +449,7 @@ impl OxideQ4kGemv {
             // Q8_1 scratch) when uses_raw_gguf=true, so K/V weights can also be native.
             let uses_raw_gguf = uses_sm120;
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_module: cu_sm120_fused_mod, cu_sm120_fused_silu, cu_sm120_batch_module: cu_sm120_batch_mod, cu_sm120_batch, kpar_dispatch, uses_raw_gguf, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_module: cu_sm120_fused_mod, cu_sm120_fused_silu, cu_sm120_batch_module: cu_sm120_batch_mod, cu_sm120_batch, cu_mma_batch_module: cu_mma_batch_mod, cu_mma_batch, kpar_dispatch, uses_raw_gguf, stream,
                 q8_qs_scratch:      std::cell::RefCell::new(None),
                 q8_ds_scratch:      std::cell::RefCell::new(None),
                 q8_out_scratch:     std::cell::RefCell::new(None),
@@ -941,6 +995,11 @@ impl OxideQ4kGemv {
         self.cu_sm120_batch.is_some() && self.cu_q8_quantize.is_some()
     }
 
+    /// Returns true when the sm_120 MMA batch GEMM kernel is loaded (INT8 tensor cores).
+    pub fn has_mma_batch(&self) -> bool {
+        self.cu_mma_batch.is_some() && self.cu_q8_quantize.is_some()
+    }
+
     /// Batched Q4K+Q8_1 GEMV on sm_120: quantize M rows then launch grid=(N,M,1).
     ///
     /// Avoids the CUDA error 719 crash from oxide sm_80 dynamic-smem batch kernels on Blackwell.
@@ -1144,6 +1203,103 @@ impl OxideQ4kGemv {
         }
 
         // No stream.synchronize() -- caller owns the sync (graph launch or explicit sync).
+        Ok(())
+    }
+
+    /// Graph-capture-safe INT8 tensor-core batch GEMM using mma.sync.aligned.m16n8k32.
+    ///
+    /// Requires pre-quantized Q8_1 scratch (`x_qs`, `x_ds`) and pre-allocated output `out`.
+    /// No device allocations or stream synchronisations inside -- safe for CUDA graph capture.
+    ///
+    /// `x`       -- flat [m * k] f32 activations (row-major, k = k_blocks * 256).
+    /// `packed`  -- [n * k_blocks * 36] native GGUF Q4K weights (uses_raw_gguf=true required).
+    /// `x_qs`    -- pre-allocated [m * k / 4] u32 Q8_1 INT8 scratch (from q8_quantize).
+    /// `x_ds`    -- pre-allocated [ceil(m*k/32)] u32 Q8_1 scale scratch.
+    /// `out`     -- pre-allocated [m * n] f32 output (written in-place, MUST be zeroed before
+    ///              graph capture since the kernel accumulates via smem, not direct global write).
+    pub fn forward_mma_batch_d2d_into(
+        &self,
+        x:        &Arc<Tensor<f32>>,
+        packed:   &Arc<Tensor<u32>>,
+        m:        usize,
+        n:        usize,
+        k_blocks: usize,
+        x_qs:     &Arc<Tensor<u32>>,
+        x_ds:     &Arc<Tensor<u32>>,
+        out:      &Arc<Tensor<f32>>,
+    ) -> Result<()> {
+        let mma_fn = match self.cu_mma_batch {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("mma_batch not loaded".into())),
+        };
+        let q8_quant_fn = match self.cu_q8_quantize {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
+        };
+
+        let k = k_blocks * 256;
+        let k_total = m * k;
+        let k_q8_blocks_total = k_total.div_ceil(32);
+
+        let cu_stream = self.stream.cu_stream();
+
+        // Quantize M*K activations in one call (async).
+        {
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len: u64 = (k_total / 4) as u64;
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len: u64 = k_q8_blocks_total as u64;
+            let x_ptr:  u64 = x.device_pointer().cu_deviceptr();
+            let x_len:  u64 = x.size() as u64;
+            let k_u32:  u32 = k_total as u32;
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr as *const _ as *mut c_void,
+                &qs_len as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ds_len as *const _ as *mut c_void,
+                &x_ptr  as *const _ as *mut c_void,
+                &x_len  as *const _ as *mut c_void,
+                &k_u32  as *const _ as *mut c_void,
+            ];
+            let grid_x = k_q8_blocks_total.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            unsafe {
+                launch_kernel(q8_quant_fn, (grid_x, 1, 1), (BLOCK_DIM, 1, 1), 0, cu_stream, &mut params)
+            }.map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 mma_batch: {e}")))?;
+        }
+
+        // Launch MMA batch kernel:
+        // Grid: (ceil(n/8), 1, 1), Block: (32, 1, 1) -- 1 warp per n8 tile.
+        {
+            let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ou_ptr: u64 = out.device_pointer().cu_deviceptr();
+            let n_u32:  u32 = n as u32;
+            let kb_u32: u32 = k_blocks as u32;
+            let m_u32:  u32 = m as u32;
+            let mut params: [*mut c_void; 7] = [
+                &wt_ptr as *const _ as *mut c_void,
+                &qs_ptr as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ou_ptr as *const _ as *mut c_void,
+                &n_u32  as *const _ as *mut c_void,
+                &kb_u32 as *const _ as *mut c_void,
+                &m_u32  as *const _ as *mut c_void,
+            ];
+            let grid_x = n_u32.div_ceil(8);
+            unsafe {
+                launch_kernel(
+                    mma_fn,
+                    (grid_x, 1, 1),
+                    (BLOCK_DIM_MMA, 1, 1),  // 4 warps: optimal sm_120 occupancy
+                    0,            // no dynamic smem (uses static smem in PTX)
+                    cu_stream,
+                    &mut params,
+                )
+            }.map_err(|e| KernelError::InvalidConfig(format!("mma_batch q4k gemm: {e}")))?;
+        }
+
+        // No stream.synchronize() -- caller owns the sync.
         Ok(())
     }
 
