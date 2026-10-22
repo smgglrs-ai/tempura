@@ -993,8 +993,10 @@ impl OxideQ4kGemv {
     }
 
     /// Returns true when the sm_120 MMA batch GEMM kernel is loaded (INT8 tensor cores).
+    /// Currently disabled: the simple (N/8,1,1) grid has low SM occupancy vs dp4a.
+    /// Re-enable when stream-K variant (grid=SM_COUNT, fixup pass) is implemented.
     pub fn has_mma_batch(&self) -> bool {
-        self.cu_mma_batch.is_some() && self.cu_q8_quantize.is_some()
+        false
     }
 
     /// Batched Q4K+Q8_1 GEMV on sm_120: quantize M rows then launch grid=(N,M,1).
