@@ -458,6 +458,40 @@ impl OxideQ6kGemv {
         Ok(Arc::new(out))
     }
 
+    /// Non-blocking, graph-safe variant: launches the baseline Q6K GEMV and writes
+    /// into a caller-owned `Arc<Tensor<f32>>`.  No allocation, no stream sync.
+    /// Safe to call inside `cuStreamBeginCapture` / `cuStreamEndCapture` regions.
+    ///
+    /// Uses the oxide stream internally.  For explicit stream control (needed when
+    /// the calling code runs on a different stream than the oxide stream), use
+    /// `submit_d2d_arc_on`.
+    pub fn submit_d2d_arc(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        out: &Arc<Tensor<f32>>,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<()> {
+        unsafe { self.launch(x, packed, out, n, k_blocks) }
+    }
+
+    /// Like `submit_d2d_arc` but launches on an explicit `cu_stream`.
+    ///
+    /// Use this inside CUDA graph capture regions to ensure the kernel is captured
+    /// on the same stream as the surrounding operations.
+    pub fn submit_d2d_arc_on(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        out: &Arc<Tensor<f32>>,
+        n: usize,
+        k_blocks: usize,
+        cu_stream: cuda_core::sys::CUstream,
+    ) -> Result<()> {
+        unsafe { self.launch_on(x, packed, out, n, k_blocks, cu_stream) }
+    }
+
     /// Non-blocking variant: re-uses a pre-allocated output tensor.
     pub unsafe fn submit_d2d_into(
         &self,
