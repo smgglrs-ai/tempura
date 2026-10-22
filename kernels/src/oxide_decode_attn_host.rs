@@ -216,6 +216,83 @@ impl OxideDecodeAttn {
     /// Whether the batch variant is available.
     pub fn has_batch(&self) -> bool { self.cu_function_batch.is_some() }
 
+    /// Batch decode attention for CUDA graph capture (pre-allocated device arrays).
+    ///
+    /// Unlike `forward_batch_d2d`, does NOT call cuMemAllocAsync.
+    /// All device arrays must be pre-allocated with stable addresses.
+    /// `kv_lens_dev` is updated H->D BEFORE each graph launch by the caller;
+    /// `k_ptrs_dev` and `v_ptrs_dev` are stable (baked in at graph capture).
+    pub fn forward_batch_graph_d2d(
+        &self,
+        out:         &Arc<Tensor<f32>>,  // [M * n_heads * head_dim]
+        q:           &Arc<Tensor<f32>>,  // [M * n_heads * head_dim]
+        k_ptrs_dev:  u64,                // CUdeviceptr to [M x u64] K-cache pointers
+        v_ptrs_dev:  u64,                // CUdeviceptr to [M x u64] V-cache pointers
+        kv_lens_dev: u64,                // CUdeviceptr to [M x i32] kv_len values
+        m:           usize,
+        n_heads:     usize,
+        n_kv_heads:  usize,
+        head_dim:    usize,
+        scale:       f32,
+    ) -> Result<()> {
+        let f = match self.cu_function_batch {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig(
+                "oxide_decode_attn_batch not available in this PTX".into()
+            )),
+        };
+
+        let kv_stride = (n_kv_heads * head_dim) as u32;
+
+        let mut out_ptr  = out.device_pointer().cu_deviceptr() as u64;
+        let mut q_ptr    = q.device_pointer().cu_deviceptr() as u64;
+        let mut kp       = k_ptrs_dev;
+        let mut vp       = v_ptrs_dev;
+        let mut kvlp     = kv_lens_dev;
+        let mut bs       = m as u32;
+        let mut nh       = n_heads as u32;
+        let mut nkv      = n_kv_heads as u32;
+        let mut hd       = head_dim as u32;
+        let mut kv_str   = kv_stride;
+        let mut sc       = scale;
+
+        let mut params: [*mut std::ffi::c_void; 11] = [
+            &mut out_ptr as *mut _ as *mut _,
+            &mut q_ptr   as *mut _ as *mut _,
+            &mut kp      as *mut _ as *mut _,
+            &mut vp      as *mut _ as *mut _,
+            &mut kvlp    as *mut _ as *mut _,
+            &mut bs      as *mut _ as *mut _,
+            &mut nh      as *mut _ as *mut _,
+            &mut nkv     as *mut _ as *mut _,
+            &mut hd      as *mut _ as *mut _,
+            &mut kv_str  as *mut _ as *mut _,
+            &mut sc      as *mut _ as *mut _,
+        ];
+
+        let shared_bytes = (2 * head_dim * 4) as u32;
+        let grid_x = (m * n_heads) as u32;
+        let stream = self.stream.cu_stream();
+
+        let rc = unsafe {
+            cuda_core::sys::cuLaunchKernel(
+                f,
+                grid_x, 1, 1,
+                32, 1, 1,
+                shared_bytes,
+                stream,
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "OxideDecodeAttn::forward_batch_graph_d2d cuLaunchKernel failed: {rc}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Batched decode attention: one block per (request, head) pair.
     ///
     /// `k_cache_ptrs` and `v_cache_ptrs` are CUdeviceptr values (device pointers

@@ -81,6 +81,18 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
 
+    // -- oxide-decode-attn: copy pre-built PTX to OUT_DIR ----------------------
+    // The PTX is hand-authored and lives in tools/oxide-decode-attn/.
+    // It contains oxide_decode_attn, oxide_decode_attn_kpar, and oxide_decode_attn_batch.
+    {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tools/oxide-decode-attn/oxide_decode_attn.ptx");
+        let dst = std::path::Path::new(&out_dir).join("oxide_decode_attn.ptx");
+        std::fs::copy(&src, &dst)
+            .unwrap_or_else(|e| panic!("build.rs: failed to copy oxide_decode_attn.ptx: {e}"));
+        println!("cargo:rerun-if-changed=../tools/oxide-decode-attn/oxide_decode_attn.ptx");
+    }
+
     // -- oxide-gemv: compile Q2_0 GEMV kernel with rustc-codegen-cuda ---------
     // When the `oxide-gemv` feature is requested and `cargo-oxide` is in PATH,
     // we build `tools/oxide-gemv` with `cargo oxide build`, then extract the

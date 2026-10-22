@@ -470,9 +470,19 @@ pub struct CutileGpuModel {
     /// Device pointer arrays [max_batch_graph x u64] for batch KV scatter-write.
     /// Stored as raw CUdeviceptr (cuMemAlloc'd) because cuTile Tensor<u64> is
     /// not a supported type.  The memory holds `max_batch_graph x 8` bytes.
-    /// Written ONCE before the first graph capture with stable KV-cache source ptrs.
+    /// Repurposed as K/V cache base pointer arrays for oxide_decode_attn_batch.
     batch_src_k_ptrs_dev: cuda_core::sys::CUdeviceptr,
     batch_src_v_ptrs_dev: cuda_core::sys::CUdeviceptr,
+
+    /// Per-sequence kv_len device array [max_batch_graph x i32].
+    /// Updated H->D before each batch graph replay with current seq_len+1 values.
+    batch_attn_kv_lens_dev: cuda_core::sys::CUdeviceptr,
+
+    /// Per-layer K/V cache base pointers [MAX_ATTN_LAYERS x max_batch_graph x u64].
+    /// Filled once before graph capture (stable KV cache addresses); never updated
+    /// inside the CUDA graph itself.
+    batch_attn_all_k_ptrs: cuda_core::sys::CUdeviceptr,
+    batch_attn_all_v_ptrs: cuda_core::sys::CUdeviceptr,
 
     /// Cached batch CUDA graph executable.
     cached_batch_graph: RefCell<Option<BatchDecodeGraph>>,
@@ -1231,7 +1241,8 @@ impl CutileGpuModel {
             batch_down_compact, batch_pre_attn_norm_scratch, batch_post_attn_norm_scratch,
             batch_final_norm_scratch, batch_q8_qs_h, batch_q8_ds_h, batch_q8_qs_i, batch_q8_ds_i,
             batch_silu_row_bufs,
-            batch_src_k_ptrs_dev, batch_src_v_ptrs_dev,
+            batch_src_k_ptrs_dev, batch_src_v_ptrs_dev, batch_attn_kv_lens_dev,
+            batch_attn_all_k_ptrs, batch_attn_all_v_ptrs,
         ) = Self::alloc_batch_fields(matmul.stream(), h_pad, q_pad, q_dim, kv_dim, inter, inter_pad)?;
 
         let model = Self {
@@ -1310,6 +1321,9 @@ impl CutileGpuModel {
             batch_silu_row_bufs,
             batch_src_k_ptrs_dev,
             batch_src_v_ptrs_dev,
+            batch_attn_kv_lens_dev,
+            batch_attn_all_k_ptrs,
+            batch_attn_all_v_ptrs,
             cached_batch_graph: RefCell::new(None),
             all_proj_q4k,
         };
@@ -1486,7 +1500,8 @@ impl CutileGpuModel {
             batch_down_compact, batch_pre_attn_norm_scratch, batch_post_attn_norm_scratch,
             batch_final_norm_scratch, batch_q8_qs_h, batch_q8_ds_h, batch_q8_qs_i, batch_q8_ds_i,
             batch_silu_row_bufs,
-            batch_src_k_ptrs_dev, batch_src_v_ptrs_dev,
+            batch_src_k_ptrs_dev, batch_src_v_ptrs_dev, batch_attn_kv_lens_dev,
+            batch_attn_all_k_ptrs, batch_attn_all_v_ptrs,
         ) = Self::alloc_batch_fields(matmul.stream(), h_pad, q_pad, q_dim, kv_dim, inter, inter_pad)?;
 
         let model = Self {
@@ -1565,6 +1580,9 @@ impl CutileGpuModel {
             batch_silu_row_bufs,
             batch_src_k_ptrs_dev,
             batch_src_v_ptrs_dev,
+            batch_attn_kv_lens_dev,
+            batch_attn_all_k_ptrs,
+            batch_attn_all_v_ptrs,
             cached_batch_graph: RefCell::new(None),
             all_proj_q4k: false, // from_f32 uses f32 weights, not Q4K
         };
@@ -1750,6 +1768,9 @@ impl CutileGpuModel {
         Vec<Arc<Tensor<f32>>>,             // batch_silu_row_bufs
         cuda_core::sys::CUdeviceptr,       // batch_src_k_ptrs_dev
         cuda_core::sys::CUdeviceptr,       // batch_src_v_ptrs_dev
+        cuda_core::sys::CUdeviceptr,       // batch_attn_kv_lens_dev
+        cuda_core::sys::CUdeviceptr,       // batch_attn_all_k_ptrs
+        cuda_core::sys::CUdeviceptr,       // batch_attn_all_v_ptrs
     ), tempura_kernels::KernelError> {
         const MB: usize = 2; // max_batch_graph
 
@@ -1843,6 +1864,44 @@ impl CutileGpuModel {
             )));
         }
 
+        // Per-sequence kv_len array [MB x i32] for oxide_decode_attn_batch kernel.
+        let kv_len_bytes = MB * std::mem::size_of::<i32>();
+        let mut batch_attn_kv_lens_dev: cuda_core::sys::CUdeviceptr = 0;
+        let rc = unsafe { cuda_core::sys::cuMemAlloc_v2(&mut batch_attn_kv_lens_dev, kv_len_bytes) };
+        if rc != 0 {
+            let _ = unsafe { cuda_core::sys::cuMemFree_v2(batch_src_k_ptrs_dev) };
+            let _ = unsafe { cuda_core::sys::cuMemFree_v2(batch_src_v_ptrs_dev) };
+            return Err(tempura_kernels::KernelError::InvalidConfig(format!(
+                "alloc_batch_fields: cuMemAlloc batch_attn_kv_lens failed: {rc}"
+            )));
+        }
+
+        // Per-layer K/V cache pointer arrays for oxide_decode_attn_batch.
+        // MAX_ATTN_LAYERS=64 covers any realistic model; actual layers checked at runtime.
+        const MAX_ATTN_LAYERS: usize = 64;
+        let all_ptrs_bytes = MAX_ATTN_LAYERS * MB * std::mem::size_of::<u64>();
+        let mut batch_attn_all_k_ptrs: cuda_core::sys::CUdeviceptr = 0;
+        let mut batch_attn_all_v_ptrs: cuda_core::sys::CUdeviceptr = 0;
+        let rc = unsafe { cuda_core::sys::cuMemAlloc_v2(&mut batch_attn_all_k_ptrs, all_ptrs_bytes) };
+        if rc != 0 {
+            let _ = unsafe { cuda_core::sys::cuMemFree_v2(batch_src_k_ptrs_dev) };
+            let _ = unsafe { cuda_core::sys::cuMemFree_v2(batch_src_v_ptrs_dev) };
+            let _ = unsafe { cuda_core::sys::cuMemFree_v2(batch_attn_kv_lens_dev) };
+            return Err(tempura_kernels::KernelError::InvalidConfig(format!(
+                "alloc_batch_fields: cuMemAlloc batch_attn_all_k_ptrs failed: {rc}"
+            )));
+        }
+        let rc = unsafe { cuda_core::sys::cuMemAlloc_v2(&mut batch_attn_all_v_ptrs, all_ptrs_bytes) };
+        if rc != 0 {
+            let _ = unsafe { cuda_core::sys::cuMemFree_v2(batch_src_k_ptrs_dev) };
+            let _ = unsafe { cuda_core::sys::cuMemFree_v2(batch_src_v_ptrs_dev) };
+            let _ = unsafe { cuda_core::sys::cuMemFree_v2(batch_attn_kv_lens_dev) };
+            let _ = unsafe { cuda_core::sys::cuMemFree_v2(batch_attn_all_k_ptrs) };
+            return Err(tempura_kernels::KernelError::InvalidConfig(format!(
+                "alloc_batch_fields: cuMemAlloc batch_attn_all_v_ptrs failed: {rc}"
+            )));
+        }
+
         // Sized inter_pad (not inter) because gemm_q6k_d2d_slot reshapes input to
         // next_pow2(k_blocks * Q6K_QK) = next_pow2(inter), which equals inter_pad.
         let batch_silu_row_bufs: Vec<Arc<Tensor<f32>>> = (0..MB)
@@ -1858,7 +1917,8 @@ impl CutileGpuModel {
             batch_down_compact, batch_pre_attn_norm_scratch, batch_post_attn_norm_scratch,
             batch_final_norm_scratch, batch_q8_qs_h, batch_q8_ds_h, batch_q8_qs_i, batch_q8_ds_i,
             batch_silu_row_bufs,
-            batch_src_k_ptrs_dev, batch_src_v_ptrs_dev,
+            batch_src_k_ptrs_dev, batch_src_v_ptrs_dev, batch_attn_kv_lens_dev,
+            batch_attn_all_k_ptrs, batch_attn_all_v_ptrs,
         ))
     }
 
@@ -4461,7 +4521,7 @@ impl CutileGpuModel {
                 // after graph launch to avoid advancing seq_len 32x during capture.
             }
 
-            // -- Per-sequence flash attention (kpar) ---------------------------
+            // -- Attention: batch (single kernel) or sequential fallback -----------
             let kv_len_after = kv_caches[0].seq_len() + 1; // same for all (synchronized)
             let scale = 1.0_f32 / (head_dim as f32).sqrt();
 
@@ -4476,30 +4536,67 @@ impl CutileGpuModel {
                 }
             }
 
-            for r in 0..m {
-                let (k_full, v_full) = kv_caches[r].kv_device_tensors(layer);
-                if let Some(ref oda) = self.oxide_decode_attn {
-                    let attn_out = &self.batch_attn_out[r];
-                    oda.forward_kpar_d2d(
-                        attn_out, &self.batch_q_rot[r], &k_full, &v_full,
-                        &self.d_kv_len, n_heads, n_kv_heads, head_dim, scale,
-                    ).expect("batch inner: kpar attention");
+            // K/V cache base pointers for this layer (filled before graph capture,
+            // stored in batch_attn_all_{k,v}_ptrs at offset layer * m * 8).
+            let layer_k_ptrs_dev = self.batch_attn_all_k_ptrs + (layer * m * 8) as u64;
+            let layer_v_ptrs_dev = self.batch_attn_all_v_ptrs + (layer * m * 8) as u64;
+
+            let used_batch_attn = if let Some(ref oda) = self.oxide_decode_attn {
+                if oda.has_batch() && self.batch_attn_all_k_ptrs != 0 {
+                    // Q is already concatenated in batch_oproj_in at stride q_dim.
+                    // Reuse batch_gemv_q as the flat output buffer [m * q_dim].
+                    let batch_q_flat = &self.batch_oproj_in;
+                    let batch_out_flat = &self.batch_gemv_q;
+                    oda.forward_batch_graph_d2d(
+                        batch_out_flat, batch_q_flat,
+                        layer_k_ptrs_dev,
+                        layer_v_ptrs_dev,
+                        self.batch_attn_kv_lens_dev,
+                        m, n_heads, n_kv_heads, head_dim, scale,
+                    ).expect("batch inner: batch attention");
+                    // Scatter batch output into stable per-seq attn_out[r] tensors.
+                    for r in 0..m {
+                        unsafe {
+                            cuda_core::memcpy_dtod_async::<f32>(
+                                self.batch_attn_out[r].device_pointer().cu_deviceptr(),
+                                batch_out_flat.device_pointer().cu_deviceptr() + (r * q_dim * 4) as u64,
+                                q_dim, stream,
+                            ).expect("batch inner: scatter attn_out");
+                        }
+                    }
+                    true
                 } else {
-                    let attn_out = &self.batch_attn_out[r];
-                    let _ = self.flash_attn
-                        .decode_attention_device_scratch(
-                            &self.batch_q_rot[r], &k_full, &v_full,
-                            kv_len_after, n_heads, n_kv_heads, head_dim, scale,
-                            stream, &mut self.attn_out_scratch.borrow_mut(),
-                        )
-                        .expect("batch inner: cutile attention");
-                    // Copy into stable pre-alloc attn_out[r]
-                    unsafe {
-                        cuda_core::memcpy_dtod_async::<f32>(
-                            attn_out.device_pointer().cu_deviceptr(),
-                            self.attn_out_scratch.borrow().as_ref().unwrap().device_pointer().cu_deviceptr(),
-                            q_dim, stream,
-                        ).expect("batch inner: attn_out copy");
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !used_batch_attn {
+                for r in 0..m {
+                    let (k_full, v_full) = kv_caches[r].kv_device_tensors(layer);
+                    if let Some(ref oda) = self.oxide_decode_attn {
+                        let attn_out = &self.batch_attn_out[r];
+                        oda.forward_kpar_d2d(
+                            attn_out, &self.batch_q_rot[r], &k_full, &v_full,
+                            &self.d_kv_len, n_heads, n_kv_heads, head_dim, scale,
+                        ).expect("batch inner: kpar attention");
+                    } else {
+                        let attn_out = &self.batch_attn_out[r];
+                        let _ = self.flash_attn
+                            .decode_attention_device_scratch(
+                                &self.batch_q_rot[r], &k_full, &v_full,
+                                kv_len_after, n_heads, n_kv_heads, head_dim, scale,
+                                stream, &mut self.attn_out_scratch.borrow_mut(),
+                            )
+                            .expect("batch inner: cutile attention");
+                        unsafe {
+                            cuda_core::memcpy_dtod_async::<f32>(
+                                attn_out.device_pointer().cu_deviceptr(),
+                                self.attn_out_scratch.borrow().as_ref().unwrap().device_pointer().cu_deviceptr(),
+                                q_dim, stream,
+                            ).expect("batch inner: attn_out copy");
+                        }
                     }
                 }
             }
@@ -4750,6 +4847,21 @@ impl CutileGpuModel {
             ).expect("batch graph: d_kv_write_offset H->D");
         }
 
+        // Update kv_len array for oxide_decode_attn_batch kernel.
+        // All M sequences are synchronized, so all entries are the same value.
+        if self.batch_attn_kv_lens_dev != 0 {
+            let kv_len_after = kv_write_off + 1;
+            let kv_lens: Vec<i32> = (0..m).map(|_| kv_len_after).collect();
+            unsafe {
+                cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                    self.batch_attn_kv_lens_dev,
+                    kv_lens.as_ptr() as *const std::ffi::c_void,
+                    m * 4,
+                    cu_stream,
+                );
+            }
+        }
+
         let mut graph_cache = self.cached_batch_graph.borrow_mut();
 
         // Validate KV-cache device pointers before replay.
@@ -4808,7 +4920,34 @@ impl CutileGpuModel {
             unsafe { stream.synchronize().expect("batch graph sync"); }
             drop(graph_cache);
         } else {
-            // -- First call: capture graph -------------------------------------
+            // -- First call: fill per-layer K/V ptr arrays, then capture graph --
+            // Upload K/V cache base pointers for all layers to the stable device
+            // arrays BEFORE begin_capture.  These pointers are stable (same KV
+            // cache objects throughout a generation); they are baked into the
+            // captured kernel launch parameters and never updated inside the graph.
+            if self.batch_attn_all_k_ptrs != 0 {
+                for l in 0..cfg.num_layers {
+                    let k_ptrs: Vec<u64> = (0..m)
+                        .map(|r| kv_caches[r].kv_device_tensors(l).0.device_pointer().cu_deviceptr())
+                        .collect();
+                    let v_ptrs: Vec<u64> = (0..m)
+                        .map(|r| kv_caches[r].kv_device_tensors(l).1.device_pointer().cu_deviceptr())
+                        .collect();
+                    unsafe {
+                        cuda_core::sys::cuMemcpyHtoD_v2(
+                            self.batch_attn_all_k_ptrs + (l * m * 8) as u64,
+                            k_ptrs.as_ptr() as *const std::ffi::c_void,
+                            m * 8,
+                        );
+                        cuda_core::sys::cuMemcpyHtoD_v2(
+                            self.batch_attn_all_v_ptrs + (l * m * 8) as u64,
+                            v_ptrs.as_ptr() as *const std::ffi::c_void,
+                            m * 8,
+                        );
+                    }
+                }
+            }
+
             let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
             unsafe { stream.begin_capture(relaxed).expect("batch graph: begin_capture"); }
 
