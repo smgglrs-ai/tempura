@@ -60,10 +60,7 @@ const WARPS_PER_BLOCK: u32 = 4;
 const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128
 const WARPS_PER_BLOCK_KPAR: u32 = 8;
 const BLOCK_DIM_KPAR: u32 = WARPS_PER_BLOCK_KPAR * 32; // 256
-/// Block dimension for the MMA batch GEMM kernel.
-/// Derived: floor(65536 / (39 * 128)) * 4 = 52 warps/SM > floor(65536 / (42 * 256)) * 8 = 48.
-/// WARPS=4 maximises sm_120 occupancy given register budget; must divide k_blocks*8=128 evenly.
-const BLOCK_DIM_MMA: u32 = 4 * 32; // 128 (4 warps)
+
 
 /// Launches the oxide-compiled Q4_K GEMV kernel for M=1 decode.
 pub struct OxideQ4kGemv {
@@ -1287,11 +1284,18 @@ impl OxideQ4kGemv {
                 &m_u32  as *const _ as *mut c_void,
             ];
             let grid_x = n_u32.div_ceil(8);
+            // Warp count: largest divisor of k_blocks*8 that maximises sm_120 occupancy.
+            // Occupancy formula: floor(65536 / (regs * W * 32)) * W.
+            // W=4 (regs~39): floor(65536/4992)*4 = 52 warps/SM.
+            // W=8 (regs~42): floor(65536/10752)*8 = 48 warps/SM.
+            // W=4 wins; k_blocks*8 is always divisible by 4 for k_blocks >= 1.
+            let warps = if k_blocks * 8 % 4 == 0 { 4u32 } else { 2u32 };
+            let block_dim = warps * 32;
             unsafe {
                 launch_kernel(
                     mma_fn,
                     (grid_x, 1, 1),
-                    (BLOCK_DIM_MMA, 1, 1),  // 4 warps: optimal sm_120 occupancy
+                    (block_dim, 1, 1),
                     0,            // no dynamic smem (uses static smem in PTX)
                     cu_stream,
                     &mut params,
