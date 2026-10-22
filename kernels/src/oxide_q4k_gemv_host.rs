@@ -1012,7 +1012,8 @@ impl OxideQ4kGemv {
             }.map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 batch: {e}")))?;
         }
 
-        // Launch sm120 batch kernel: grid=(n, m, 1), block=(256, 1, 1), smem=128 bytes.
+        // Launch sm120 batch kernel v2: grid=(n, 1, 1) -- one block per output
+        // neuron, weights read ONCE and shared across all M activation rows.
         {
             let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
             let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
@@ -1033,7 +1034,7 @@ impl OxideQ4kGemv {
             unsafe {
                 launch_kernel(
                     batch_fn,
-                    (n_u32, m_u32, 1),
+                    (n_u32, 1, 1),
                     (BLOCK_DIM_KPAR, 1, 1),
                     128,
                     cu_stream,
@@ -1111,7 +1112,8 @@ impl OxideQ4kGemv {
             }.map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 batch _into: {e}")))?;
         }
 
-        // Launch sm120 batch kernel: grid=(n, m, 1), block=(256, 1, 1), smem=128 bytes.
+        // Launch sm120 batch kernel v2: grid=(n, 1, 1) -- one block per output
+        // neuron, weights read ONCE and shared across all M activation rows.
         {
             let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
             let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
@@ -1132,7 +1134,7 @@ impl OxideQ4kGemv {
             unsafe {
                 launch_kernel(
                     batch_fn,
-                    (n_u32, m_u32, 1),
+                    (n_u32, 1, 1),
                     (BLOCK_DIM_KPAR, 1, 1),
                     128,
                     cu_stream,
