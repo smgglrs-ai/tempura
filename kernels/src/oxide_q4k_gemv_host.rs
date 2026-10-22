@@ -1056,9 +1056,11 @@ impl OxideQ4kGemv {
     }
 
     /// Returns true when the sm_120 stream-K batch GEMM kernel is loaded.
-    /// Requires sm_120 + Q8_1 quantize kernel.
+    /// Currently disabled: without cp.async pipelining the sequential tile loop
+    /// stalls on DRAM latency, giving worse throughput than dp4a batch at k_blocks=16.
+    /// Re-enable when cp.async overlap (next-tile prefetch during current-tile mma) is added.
     pub fn has_streamk_batch(&self) -> bool {
-        self.cu_streamk.is_some() && self.cu_q8_quantize.is_some()
+        false
     }
 
     /// Batched Q4K+Q8_1 GEMV on sm_120: quantize M rows then launch grid=(N,M,1).
