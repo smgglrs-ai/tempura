@@ -89,7 +89,7 @@ fn main() {
             batch, tok_s, per_req, blocks);
     }
 
-    println!("\n  Kernel: q4k_gemv_sm120_batch (sm_120 PTX, static smem, grid=(N,M,1)).");
+    println!("\n  Kernel: q4k_streamk_batch_sm120 (stream-K, cp.async, 8 warps, grid=(SM_COUNT,1,1)).");
     println!("  Persistent KV caches: CUDA graph captures once, all bench steps replay.");
     println!("  Remaining gap at high M: flash attention scales as O(M*kv_len*n_heads).");
     println!();

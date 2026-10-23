@@ -1060,7 +1060,7 @@ impl OxideQ4kGemv {
     /// stalls on DRAM latency, giving worse throughput than dp4a batch at k_blocks=16.
     /// Re-enable when cp.async overlap (next-tile prefetch during current-tile mma) is added.
     pub fn has_streamk_batch(&self) -> bool {
-        false
+        self.cu_streamk.is_some() && self.cu_q8_quantize.is_some()
     }
 
     /// Batched Q4K+Q8_1 GEMV on sm_120: quantize M rows then launch grid=(N,M,1).
@@ -1433,7 +1433,7 @@ impl OxideQ4kGemv {
             }.map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 streamk: {e}")))?;
         }
 
-        // Launch stream-K kernel: grid=(SM_COUNT,1,1), block=(128,1,1) -- 4 warps.
+        // Launch stream-K kernel: grid=(SM_COUNT,1,1), block=(256,1,1) -- 8 warps.
         {
             let wt_ptr:  u64 = packed.device_pointer().cu_deviceptr();
             let qs_ptr:  u64 = x_qs.device_pointer().cu_deviceptr();
@@ -1457,8 +1457,8 @@ impl OxideQ4kGemv {
                 launch_kernel(
                     sk_fn,
                     (sm_count, 1, 1),
-                    (128, 1, 1),   // 4 warps
-                    0,             // static smem in PTX (2432 bytes)
+                    (256, 1, 1),   // 8 warps
+                    0,             // static smem in PTX (5120 bytes)
                     cu_stream,
                     &mut params,
                 )
