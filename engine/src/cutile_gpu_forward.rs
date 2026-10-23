@@ -178,6 +178,28 @@ struct DeviceWeightQ4K {
     k_blocks: usize,
 }
 
+/// MXFP4-quantized projection weight in E2M1 packed nibble + UE8M0 block-scale format.
+///
+/// Each row has `k_blocks32` blocks of 32 elements:
+///   - 16 packed E2M1 bytes per block (2 nibbles/byte, lo nibble first)
+///   - 1 UE8M0 scale byte per block (scale = 2^(e-127))
+///
+/// GPU layout:
+///   - `packed` tensor shape: [n * k_blocks32 * 16] u8 (E2M1 nibbles)
+///   - `scales` tensor shape: [n * k_blocks32]      u8 (UE8M0 scales)
+///
+/// Per 256-element superblock: 128 + 8 = 136 bytes (vs Q4K 168 bytes, 19% smaller).
+struct DeviceWeightMxfp4 {
+    /// Packed E2M1 nibbles, flat shape [n * k_blocks32 * 16].
+    packed: Arc<Tensor<u8>>,
+    /// UE8M0 block scales, flat shape [n * k_blocks32].
+    scales: Arc<Tensor<u8>>,
+    /// Number of output neurons.
+    n: usize,
+    /// Number of 32-element blocks per row (= k / 32).
+    k_blocks32: usize,
+}
+
 fn next_pow2(x: usize) -> usize {
     if x <= 1 {
         return 1;
@@ -248,6 +270,9 @@ pub struct CutileGpuModel {
     device_weights_q2: HashMap<String, DeviceWeightQ2>,
     /// Q6_K-quantized projection weights stored in packed GPU format.
     device_weights_q6k: HashMap<String, DeviceWeightQ6K>,
+    /// MXFP4-quantized projection weights (E2M1 packed + UE8M0 block scales).
+    /// Populated when original BF16/F16 safetensors weights are available.
+    device_weights_mxfp4: HashMap<String, DeviceWeightMxfp4>,
     /// Pre-uploaded RMSNorm weight vectors (1-D, `[h_pad]` elements) keyed by
     /// their HuggingFace tensor name (e.g. `model.layers.0.input_layernorm.weight`).
     norm_weights: HashMap<String, Arc<Tensor<f32>>>,
@@ -991,6 +1016,132 @@ impl CutileGpuModel {
         Ok(true)
     }
 
+    /// Quantize BF16 or F16 weights to MXFP4 (E2M1 packed nibbles + UE8M0 block scales)
+    /// and upload the result to the GPU as two separate u8 tensors.
+    ///
+    /// `dtype` controls the source interpretation: `"bf16"` or `"f16"`.
+    ///
+    /// Returns `false` (and does nothing) when the tensor is absent in `qw`.
+    fn maybe_upload_mxfp4(
+        stream: &Arc<Stream>,
+        device_weights_mxfp4: &mut HashMap<String, DeviceWeightMxfp4>,
+        qw: &QuantizedWeights,
+        name: &str,
+        n: usize,
+        k: usize,
+        dtype: &str,
+    ) -> Result<bool, tempura_kernels::KernelError> {
+        use tempura_kernels::mxfp4::{
+            bf16_bytes_to_f32, f16_bytes_to_f32, quantize_row_to_mxfp4, MXFP4_BLOCK_SIZE,
+        };
+
+        let raw_bytes: &[u8] = match dtype {
+            "bf16" => match qw.get_f16(name) {
+                Some(b) if b.len() == n * k * 2 => b,
+                Some(_) | None => return Ok(false),
+            },
+            "f16" => match qw.get_f16(name) {
+                Some(b) if b.len() == n * k * 2 => b,
+                Some(_) | None => return Ok(false),
+            },
+            "f32" => {
+                // f32 path: go through get_f32 and convert directly.
+                let f32_data = match qw.get_f32(name) {
+                    Some(d) if d.len() == n * k => d,
+                    Some(_) | None => return Ok(false),
+                };
+                if k % MXFP4_BLOCK_SIZE != 0 {
+                    return Err(tempura_kernels::KernelError::InvalidConfig(format!(
+                        "MXFP4 requires k={k} to be a multiple of block_size={MXFP4_BLOCK_SIZE}"
+                    )));
+                }
+                let k_blocks32 = k / MXFP4_BLOCK_SIZE;
+                let mut all_packed: Vec<u8> = Vec::with_capacity(n * k / 2);
+                let mut all_scales: Vec<u8> = Vec::with_capacity(n * k_blocks32);
+                for row in 0..n {
+                    let row_data = &f32_data[row * k..(row + 1) * k];
+                    let (p, s) = quantize_row_to_mxfp4(row_data);
+                    all_packed.extend_from_slice(&p);
+                    all_scales.extend_from_slice(&s);
+                }
+                let packed_tensor: Arc<Tensor<u8>> =
+                    api::copy_host_vec_to_device(&Arc::new(all_packed))
+                        .sync_on(stream)
+                        .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+                        .into();
+                let scales_tensor: Arc<Tensor<u8>> =
+                    api::copy_host_vec_to_device(&Arc::new(all_scales))
+                        .sync_on(stream)
+                        .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+                        .into();
+                device_weights_mxfp4.insert(
+                    name.to_string(),
+                    DeviceWeightMxfp4 {
+                        packed: packed_tensor,
+                        scales: scales_tensor,
+                        n,
+                        k_blocks32,
+                    },
+                );
+                return Ok(true);
+            }
+            other => {
+                return Err(tempura_kernels::KernelError::InvalidConfig(format!(
+                    "maybe_upload_mxfp4: unsupported dtype '{other}'; use 'bf16', 'f16', or 'f32'"
+                )));
+            }
+        };
+
+        if k % MXFP4_BLOCK_SIZE != 0 {
+            return Err(tempura_kernels::KernelError::InvalidConfig(format!(
+                "MXFP4 requires k={k} to be a multiple of block_size={MXFP4_BLOCK_SIZE}"
+            )));
+        }
+        let k_blocks32 = k / MXFP4_BLOCK_SIZE;
+
+        // Convert bytes to f32 according to the declared dtype.
+        let f32_vals: Vec<f32> = match dtype {
+            "bf16" => bf16_bytes_to_f32(raw_bytes),
+            _ => f16_bytes_to_f32(raw_bytes),
+        };
+
+        debug_assert_eq!(f32_vals.len(), n * k);
+
+        let mut all_packed: Vec<u8> = Vec::with_capacity(n * k / 2);
+        let mut all_scales: Vec<u8> = Vec::with_capacity(n * k_blocks32);
+        for row in 0..n {
+            let row_data = &f32_vals[row * k..(row + 1) * k];
+            let (p, s) = quantize_row_to_mxfp4(row_data);
+            all_packed.extend_from_slice(&p);
+            all_scales.extend_from_slice(&s);
+        }
+
+        debug_assert_eq!(all_packed.len(), n * k / 2);
+        debug_assert_eq!(all_scales.len(), n * k_blocks32);
+
+        let packed_tensor: Arc<Tensor<u8>> =
+            api::copy_host_vec_to_device(&Arc::new(all_packed))
+                .sync_on(stream)
+                .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+                .into();
+        let scales_tensor: Arc<Tensor<u8>> =
+            api::copy_host_vec_to_device(&Arc::new(all_scales))
+                .sync_on(stream)
+                .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+                .into();
+
+        device_weights_mxfp4.insert(
+            name.to_string(),
+            DeviceWeightMxfp4 {
+                packed: packed_tensor,
+                scales: scales_tensor,
+                n,
+                k_blocks32,
+            },
+        );
+        Ok(true)
+    }
+
     /// Upload a norm weight vector from a host slice to a 1-D device tensor of
     /// `h_pad` elements, zero-padding from `h` to `h_pad` if necessary.
     fn upload_norm_weight(
@@ -1334,6 +1485,7 @@ impl CutileGpuModel {
             device_weights_q4k: dw_q4k,
             device_weights_q2: dw_q2,
             device_weights_q6k: dw_q6k,
+            device_weights_mxfp4: HashMap::new(),
             norm_weights: nw,
             matmul,
             q4k_gemv,
@@ -1596,6 +1748,7 @@ impl CutileGpuModel {
             device_weights_q4k: HashMap::new(),
             device_weights_q2: HashMap::new(),
             device_weights_q6k: HashMap::new(),
+            device_weights_mxfp4: HashMap::new(),
             norm_weights: nw,
             matmul,
             q4k_gemv,

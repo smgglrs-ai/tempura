@@ -63,6 +63,7 @@ pub mod inference_pool;
 pub mod layernorm;
 pub mod matmul;
 pub mod moe;
+pub mod mxfp4;
 #[cfg(any(feature = "npu-intel", feature = "npu-qualcomm"))]
 pub mod npu;
 #[cfg(feature = "openmp")]
