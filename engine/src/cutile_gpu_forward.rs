@@ -42,6 +42,7 @@ use tempura_kernels::{Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE};
 use tempura_kernels::cutile_rmsnorm::{CutileRmsNorm, RmsnormScratch};
 use tempura_kernels::cutile_rope::{CutileRoPE, RopeScratch};
 use tempura_kernels::kv_scatter_write::KvScatterWrite;
+use tempura_kernels::mxfp4_dispatch::MxfpGemm;
 
 use crate::config::ModelConfig;
 use crate::cutile_kv_cache::CutileKvCache;
@@ -200,6 +201,23 @@ struct DeviceWeightMxfp4 {
     k_blocks32: usize,
 }
 
+/// MXFP4-quantized projection weight in tiled kernel layout for mxf4_batch_gemm_tiled.
+///
+/// Packed E2M1 nibbles: [N][K/2] bytes, row-major.
+/// Tile scales (b_scales): [(N/8)][(K/32)] bytes = [n8_tiles][k32_blocks].
+///   Each scale covers all 8 n-rows x 32 k-cols in the tile.
+///   Kernel index: b_scale_base = tile_n * k32_blocks + k32_idx.
+struct DeviceWeightMxfp4Tiled {
+    /// Packed E2M1 nibbles, flat [n * k/2] u8.
+    packed: Arc<Tensor<u8>>,
+    /// UE8M0 tile scales, flat [(n/8) * (k/32)] u8.
+    tiled_scales: Arc<Tensor<u8>>,
+    /// Number of output neurons (N).
+    n: usize,
+    /// Input feature dimension (K).
+    k: usize,
+}
+
 fn next_pow2(x: usize) -> usize {
     if x <= 1 {
         return 1;
@@ -273,6 +291,22 @@ pub struct CutileGpuModel {
     /// MXFP4-quantized projection weights (E2M1 packed + UE8M0 block scales).
     /// Populated when original BF16/F16 safetensors weights are available.
     device_weights_mxfp4: HashMap<String, DeviceWeightMxfp4>,
+    /// MXFP4-quantized weights in tiled kernel layout for mxf4_batch_gemm_tiled.
+    /// Populated at model load time by dequanting Q4K weights to f32, then to MXFP4 tiled format.
+    device_weights_mxfp4_tiled: HashMap<String, DeviceWeightMxfp4Tiled>,
+    /// MXFP4 tiled batch GEMM dispatcher (sm_120a only, None on other hardware).
+    mxfp4_gemm: Option<MxfpGemm>,
+    /// Pre-allocated device buffer for MXFP4 activation packed nibbles (batch decode).
+    /// Sized for [max_batch_graph * h_pad / 2] u8. Reused across layers.
+    mxfp4_act_packed: Option<Arc<Tensor<u8>>>,
+    /// Pre-allocated device buffer for MXFP4 activation tile scales (batch decode).
+    /// Sized for [(max_batch_graph/16) * (h_pad/32)] u8.
+    mxfp4_act_scales: Option<Arc<Tensor<u8>>>,
+    /// Pre-allocated device buffer for MXFP4 output buffers (batch decode, inter-width).
+    /// Sized for [max_batch_graph * inter] f32. Reused for gate/up/down projections.
+    mxfp4_out_inter: Option<Arc<Tensor<f32>>>,
+    /// Pre-allocated device buffer for MXFP4 output (h-width projections: Q, K, V, O, final).
+    mxfp4_out_h: Option<Arc<Tensor<f32>>>,
     /// Pre-uploaded RMSNorm weight vectors (1-D, `[h_pad]` elements) keyed by
     /// their HuggingFace tensor name (e.g. `model.layers.0.input_layernorm.weight`).
     norm_weights: HashMap<String, Arc<Tensor<f32>>>,
@@ -1142,6 +1176,72 @@ impl CutileGpuModel {
         Ok(true)
     }
 
+    /// Dequantize a Q4K weight row from GGUF bytes to f32, then quantize to MXFP4 tiled
+    /// kernel layout and upload to GPU.
+    ///
+    /// `n` and `k` are the weight matrix shape [N, K].
+    /// `k` must be a multiple of 64, `n` must be a multiple of 8.
+    ///
+    /// Returns `false` when the tensor is absent in `qw` or dimensions are incompatible.
+    fn maybe_upload_mxfp4_tiled_from_q4k(
+        stream: &Arc<Stream>,
+        dw_mxfp4_tiled: &mut HashMap<String, DeviceWeightMxfp4Tiled>,
+        qw: &QuantizedWeights,
+        name: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<bool, tempura_kernels::KernelError> {
+        use tempura_kernels::ggml::blocks::{BlockQ4K, BLOCK_Q4K_SIZE};
+        use tempura_kernels::ggml::dequantize::dequantize_row_q4_k;
+        use tempura_kernels::mxfp4::quantize_matrix_to_mxfp4_tiled;
+
+        if n % 8 != 0 || k % 64 != 0 {
+            return Ok(false);
+        }
+        let k_blocks = k / 256; // Q4K block size is 256 elements
+        if k_blocks == 0 {
+            return Ok(false);
+        }
+        let raw = match qw.get_q4k(name) {
+            Some(b) if b.len() == n * k_blocks * BLOCK_Q4K_SIZE => b,
+            _ => return Ok(false),
+        };
+
+        // Dequantize all N rows from Q4K to f32.
+        let mut f32_weights = vec![0.0f32; n * k];
+        let blocks_per_row = k_blocks;
+        for row in 0..n {
+            let block_start = row * blocks_per_row;
+            let blocks = unsafe {
+                std::slice::from_raw_parts(
+                    raw.as_ptr().add(block_start * BLOCK_Q4K_SIZE) as *const BlockQ4K,
+                    blocks_per_row,
+                )
+            };
+            dequantize_row_q4_k(blocks, &mut f32_weights[row * k..(row + 1) * k]);
+        }
+
+        // Quantize to MXFP4 tiled kernel layout.
+        let (packed, tiled_scales) = quantize_matrix_to_mxfp4_tiled(&f32_weights, n, k);
+
+        let packed_tensor: Arc<Tensor<u8>> =
+            api::copy_host_vec_to_device(&Arc::new(packed))
+                .sync_on(stream)
+                .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+                .into();
+        let scales_tensor: Arc<Tensor<u8>> =
+            api::copy_host_vec_to_device(&Arc::new(tiled_scales))
+                .sync_on(stream)
+                .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+                .into();
+
+        dw_mxfp4_tiled.insert(
+            name.to_string(),
+            DeviceWeightMxfp4Tiled { packed: packed_tensor, tiled_scales: scales_tensor, n, k },
+        );
+        Ok(true)
+    }
+
     /// Upload a norm weight vector from a host slice to a 1-D device tensor of
     /// `h_pad` elements, zero-padding from `h` to `h_pad` if necessary.
     fn upload_norm_weight(
@@ -1247,6 +1347,7 @@ impl CutileGpuModel {
         let mut dw_q4k: HashMap<String, DeviceWeightQ4K> = HashMap::new();
         let mut dw_q2: HashMap<String, DeviceWeightQ2> = HashMap::new();
         let mut dw_q6k: HashMap<String, DeviceWeightQ6K> = HashMap::new();
+        let mut dw_mxfp4_tiled: HashMap<String, DeviceWeightMxfp4Tiled> = HashMap::new();
         let mut nw: HashMap<String, Arc<Tensor<f32>>> = HashMap::new();
 
         let h = config.hidden_size;
@@ -1309,6 +1410,24 @@ impl CutileGpuModel {
             try_proj(format!("{p}.mlp.up_proj.weight"), inter, h)?;
             try_proj(format!("{p}.mlp.down_proj.weight"), h, inter)?;
 
+            // MXFP4 tiled upload: dequant Q4K -> f32 -> MXFP4 tiled format for sm_120a.
+            // Best-effort; silently skips if shape is incompatible or Q4K data absent.
+            for (wname, n_dim, k_dim) in [
+                (format!("{p}.self_attn.q_proj.weight"),    q_dim, h),
+                (format!("{p}.self_attn.k_proj.weight"),    kv_dim, h),
+                (format!("{p}.self_attn.v_proj.weight"),    kv_dim, h),
+                (format!("{p}.self_attn.o_proj.weight"),    h,      q_dim),
+                (format!("{p}.mlp.gate_proj.weight"),       inter,  h),
+                (format!("{p}.mlp.up_proj.weight"),         inter,  h),
+                (format!("{p}.mlp.down_proj.weight"),       h,      inter),
+            ] {
+                if let Err(e) = Self::maybe_upload_mxfp4_tiled_from_q4k(
+                    matmul.stream(), &mut dw_mxfp4_tiled, qw, &wname, n_dim, k_dim,
+                ) {
+                    eprintln!("[mxfp4] tiled upload {wname}: {e}");
+                }
+            }
+
             // RMSNorm weights -- pre-upload so forward_device never copies them per token.
             if let Some(w) = qw.get_f32(&format!("{p}.input_layernorm.weight")) {
                 Self::upload_norm_weight(
@@ -1355,6 +1474,13 @@ impl CutileGpuModel {
         };
         let kv_scatter_write = KvScatterWrite::new()
             .expect("KvScatterWrite: failed to load scatter-write PTX kernel");
+
+        // Load MXFP4 tiled batch GEMM (sm_120a only, None on other hardware).
+        let mxfp4_gemm = MxfpGemm::try_load(matmul.stream().clone());
+        let mxfp4_count = dw_mxfp4_tiled.len();
+        if mxfp4_count > 0 {
+            eprintln!("[mxfp4] {mxfp4_count} MXFP4 tiled weights ready; gemm={}", mxfp4_gemm.is_some());
+        }
 
         let q4k_count = dw_q4k.len();
         let q6k_count = dw_q6k.len();
@@ -1486,6 +1612,12 @@ impl CutileGpuModel {
             device_weights_q2: dw_q2,
             device_weights_q6k: dw_q6k,
             device_weights_mxfp4: HashMap::new(),
+            device_weights_mxfp4_tiled: dw_mxfp4_tiled,
+            mxfp4_gemm,
+            mxfp4_act_packed: None,
+            mxfp4_act_scales: None,
+            mxfp4_out_inter: None,
+            mxfp4_out_h: None,
             norm_weights: nw,
             matmul,
             q4k_gemv,
@@ -1749,6 +1881,12 @@ impl CutileGpuModel {
             device_weights_q2: HashMap::new(),
             device_weights_q6k: HashMap::new(),
             device_weights_mxfp4: HashMap::new(),
+            device_weights_mxfp4_tiled: HashMap::new(),
+            mxfp4_gemm: None,
+            mxfp4_act_packed: None,
+            mxfp4_act_scales: None,
+            mxfp4_out_inter: None,
+            mxfp4_out_h: None,
             norm_weights: nw,
             matmul,
             q4k_gemv,
@@ -1835,6 +1973,125 @@ impl CutileGpuModel {
     /// sequenced on the same stream as the GEMM kernels.
     pub fn stream(&self) -> Arc<cuda_core::Stream> {
         self.matmul.stream().clone()
+    }
+
+    /// Returns true if MXFP4 tiled batch GEMM is available (sm_120a hardware + weights loaded).
+    pub fn has_mxfp4(&self) -> bool {
+        self.mxfp4_gemm.is_some() && !self.device_weights_mxfp4_tiled.is_empty()
+    }
+
+    /// Number of MXFP4 tiled weight tensors currently loaded.
+    pub fn mxfp4_weight_count(&self) -> usize {
+        self.device_weights_mxfp4_tiled.len()
+    }
+
+    /// Run all 7 MXFP4 GEMMs for one transformer layer and return elapsed seconds.
+    ///
+    /// Uses a pre-quantized random MXFP4 activation [m, h] as input.
+    /// The output is discarded. Useful for benchmarking raw MXFP4 GEMM throughput
+    /// without the overhead of activation quantization.
+    ///
+    /// Returns `None` when MXFP4 is not available or the model is not Q4K.
+    pub fn bench_mxfp4_one_layer(
+        &self,
+        layer: usize,
+        m: usize,
+    ) -> Option<std::time::Duration> {
+        use tempura_kernels::mxfp4::quantize_activation_to_mxfp4_tiled;
+
+        let mxfp4 = self.mxfp4_gemm.as_ref()?;
+        if self.device_weights_mxfp4_tiled.is_empty() {
+            return None;
+        }
+
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+        let inter = cfg.intermediate_size;
+        let p = format!("model.layers.{layer}");
+        let stream = self.matmul.stream();
+
+        // Pad m to nearest multiple of 16 (m16-tiles requirement).
+        let m_pad = (m + 15) & !15;
+        // Pad k to nearest multiple of 64 (k64-tiles requirement).
+        let h_pad64 = (h + 63) & !63;
+        let inter_pad64 = (inter + 63) & !63;
+
+        // Build a random f32 activation [m_pad, h_pad64] and quantize to MXFP4.
+        let act_h_f32: Vec<f32> = (0..m_pad * h_pad64).map(|i| (i as f32) * 0.001).collect();
+        let (act_h_packed, act_h_scales) =
+            quantize_activation_to_mxfp4_tiled(&act_h_f32, m_pad, h_pad64);
+
+        let act_i_f32: Vec<f32> = (0..m_pad * inter_pad64).map(|i| (i as f32) * 0.001).collect();
+        let (act_i_packed, act_i_scales) =
+            quantize_activation_to_mxfp4_tiled(&act_i_f32, m_pad, inter_pad64);
+
+        // Upload activation MXFP4 tensors to GPU.
+        let a_h_packed: Arc<Tensor<u8>> = api::copy_host_vec_to_device(&Arc::new(act_h_packed))
+            .sync_on(stream).ok()?.into();
+        let a_h_scales: Arc<Tensor<u8>> = api::copy_host_vec_to_device(&Arc::new(act_h_scales))
+            .sync_on(stream).ok()?.into();
+        let a_i_packed: Arc<Tensor<u8>> = api::copy_host_vec_to_device(&Arc::new(act_i_packed))
+            .sync_on(stream).ok()?.into();
+        let a_i_scales: Arc<Tensor<u8>> = api::copy_host_vec_to_device(&Arc::new(act_i_scales))
+            .sync_on(stream).ok()?.into();
+
+        let mk_out_f32 = |rows: usize, cols: usize| -> Arc<Tensor<f32>> {
+            Arc::new(
+                api::zeros::<f32>(&[rows * cols])
+                    .sync_on(stream)
+                    .expect("bench_mxfp4_one_layer: output alloc"),
+            )
+        };
+
+        let q_dim = cfg.num_attention_heads * cfg.head_dim;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+
+        // Pre-allocate output tensors.
+        let out_q    = mk_out_f32(m_pad, q_dim);
+        let out_k    = mk_out_f32(m_pad, kv_dim);
+        let out_v    = mk_out_f32(m_pad, kv_dim);
+        let out_o    = mk_out_f32(m_pad, h);
+        let out_gate = mk_out_f32(m_pad, inter);
+        let out_up   = mk_out_f32(m_pad, inter);
+        let out_down = mk_out_f32(m_pad, h);
+
+        let run_gemm = |a_packed: &Arc<Tensor<u8>>, a_scales: &Arc<Tensor<u8>>,
+                         wname: &str, out: &Arc<Tensor<f32>>| {
+            let dw = self.device_weights_mxfp4_tiled.get(wname)?;
+            let k64_tiles = (dw.k / 64) as u32;
+            mxfp4.forward(
+                a_packed, a_scales,
+                &dw.packed, &dw.tiled_scales,
+                out,
+                m_pad as u32, dw.n as u32, k64_tiles,
+            ).ok()?;
+            Some(())
+        };
+
+        // Warmup pass (one layer).
+        run_gemm(&a_h_packed, &a_h_scales, &format!("{p}.self_attn.q_proj.weight"), &out_q);
+        run_gemm(&a_h_packed, &a_h_scales, &format!("{p}.self_attn.k_proj.weight"), &out_k);
+        run_gemm(&a_h_packed, &a_h_scales, &format!("{p}.self_attn.v_proj.weight"), &out_v);
+        run_gemm(&a_h_packed, &a_h_scales, &format!("{p}.self_attn.o_proj.weight"), &out_o);
+        run_gemm(&a_h_packed, &a_h_scales, &format!("{p}.mlp.gate_proj.weight"), &out_gate);
+        run_gemm(&a_h_packed, &a_h_scales, &format!("{p}.mlp.up_proj.weight"), &out_up);
+        run_gemm(&a_i_packed, &a_i_scales, &format!("{p}.mlp.down_proj.weight"), &out_down);
+        unsafe { stream.synchronize().ok()? };
+
+        // Timed pass.
+        let t0 = std::time::Instant::now();
+        const ITERS: usize = 50;
+        for _ in 0..ITERS {
+            run_gemm(&a_h_packed, &a_h_scales, &format!("{p}.self_attn.q_proj.weight"), &out_q);
+            run_gemm(&a_h_packed, &a_h_scales, &format!("{p}.self_attn.k_proj.weight"), &out_k);
+            run_gemm(&a_h_packed, &a_h_scales, &format!("{p}.self_attn.v_proj.weight"), &out_v);
+            run_gemm(&a_h_packed, &a_h_scales, &format!("{p}.self_attn.o_proj.weight"), &out_o);
+            run_gemm(&a_h_packed, &a_h_scales, &format!("{p}.mlp.gate_proj.weight"), &out_gate);
+            run_gemm(&a_h_packed, &a_h_scales, &format!("{p}.mlp.up_proj.weight"), &out_up);
+            run_gemm(&a_i_packed, &a_i_scales, &format!("{p}.mlp.down_proj.weight"), &out_down);
+        }
+        unsafe { stream.synchronize().ok()? };
+        Some(t0.elapsed() / ITERS as u32)
     }
 
     // -- device tensor helpers -------------------------------------------------

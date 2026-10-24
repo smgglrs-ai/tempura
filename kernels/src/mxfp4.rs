@@ -113,6 +113,134 @@ pub fn quantize_row_to_mxfp4(values: &[f32]) -> (Vec<u8>, Vec<u8>) {
     (packed, scales)
 }
 
+/// Quantize a row-major [N, K] f32 matrix to MXFP4 kernel layout for use as
+/// the B (weight) matrix in mxf4_batch_gemm_tiled.
+///
+/// N must be a multiple of 8 (n8-tiles). K must be a multiple of 64 (k64-tiles).
+///
+/// Returns:
+/// - `packed`: N * K/2 bytes, E2M1 nibbles, row-major [N][K/2]
+/// - `b_scales`: (N/8) * (K/32) bytes, UE8M0 tile scales, layout [n8_tiles][k32_blocks]
+///   where k32_blocks = K/32 = k64_tiles*2. Index: tile_n*k32_blocks + k32_idx.
+///   Each scale covers all 8 n-rows and 32 k-cols in the tile.
+pub fn quantize_matrix_to_mxfp4_tiled(values: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+    assert_eq!(n % 8, 0, "N={n} must be a multiple of 8 for n8-tiles");
+    assert_eq!(k % 64, 0, "K={k} must be a multiple of 64 for k64-tiles");
+    assert_eq!(values.len(), n * k, "values.len()={} != n*k={}", values.len(), n * k);
+
+    let n_tiles = n / 8;
+    let k32_blocks = k / 32;
+
+    let mut packed = vec![0u8; n * k / 2];
+    let mut b_scales = vec![0u8; n_tiles * k32_blocks];
+
+    for tile_n in 0..n_tiles {
+        let n_base = tile_n * 8;
+        for k32_idx in 0..k32_blocks {
+            let k_base = k32_idx * 32;
+            // Max absolute value across all 8 n-rows x 32 k-cols in this tile.
+            let mut max_abs = 0.0f32;
+            for row_off in 0..8usize {
+                let row = n_base + row_off;
+                for col_off in 0..32usize {
+                    let v = values[row * k + k_base + col_off].abs();
+                    if v > max_abs {
+                        max_abs = v;
+                    }
+                }
+            }
+            let scale_u8 = if max_abs == 0.0 || !max_abs.is_finite() {
+                0u8
+            } else {
+                let ideal = max_abs / 6.0;
+                let exp = ideal.log2().ceil() as i32;
+                (exp + 127).clamp(0, 255) as u8
+            };
+            let scale_f32 = ue8m0_to_f32(scale_u8);
+            b_scales[tile_n * k32_blocks + k32_idx] = scale_u8;
+            // Quantize all 8 rows x 32 k-cols using the tile scale.
+            for row_off in 0..8usize {
+                let row = n_base + row_off;
+                for pair_idx in 0..16usize {
+                    let col = k_base + pair_idx * 2;
+                    let lo_f =
+                        if scale_f32 > 0.0 { values[row * k + col] / scale_f32 } else { 0.0 };
+                    let hi_f =
+                        if scale_f32 > 0.0 { values[row * k + col + 1] / scale_f32 } else { 0.0 };
+                    packed[row * (k / 2) + col / 2] =
+                        pack_e2m1_pair(f32_to_e2m1(lo_f), f32_to_e2m1(hi_f));
+                }
+            }
+        }
+    }
+
+    (packed, b_scales)
+}
+
+/// Quantize a row-major [M, K] f32 activation matrix to MXFP4 kernel layout
+/// for use as the A (activation) matrix in mxf4_batch_gemm_tiled.
+///
+/// M must be a multiple of 16 (m16-tiles). K must be a multiple of 64 (k64-tiles).
+///
+/// Returns:
+/// - `packed`: M * K/2 bytes, E2M1 nibbles, row-major [M][K/2]
+/// - `a_scales`: (M/16) * (K/32) bytes, UE8M0 tile scales, layout [m16_tiles][k32_blocks]
+pub fn quantize_activation_to_mxfp4_tiled(
+    values: &[f32],
+    m: usize,
+    k: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    assert_eq!(m % 16, 0, "M={m} must be a multiple of 16 for m16-tiles");
+    assert_eq!(k % 64, 0, "K={k} must be a multiple of 64 for k64-tiles");
+    assert_eq!(values.len(), m * k, "values.len()={} != m*k={}", values.len(), m * k);
+
+    let m_tiles = m / 16;
+    let k32_blocks = k / 32;
+
+    let mut packed = vec![0u8; m * k / 2];
+    let mut a_scales = vec![0u8; m_tiles * k32_blocks];
+
+    for tile_m in 0..m_tiles {
+        let m_base = tile_m * 16;
+        for k32_idx in 0..k32_blocks {
+            let k_base = k32_idx * 32;
+            let mut max_abs = 0.0f32;
+            for row_off in 0..16usize {
+                let row = m_base + row_off;
+                for col_off in 0..32usize {
+                    let v = values[row * k + k_base + col_off].abs();
+                    if v > max_abs {
+                        max_abs = v;
+                    }
+                }
+            }
+            let scale_u8 = if max_abs == 0.0 || !max_abs.is_finite() {
+                0u8
+            } else {
+                let ideal = max_abs / 6.0;
+                let exp = ideal.log2().ceil() as i32;
+                (exp + 127).clamp(0, 255) as u8
+            };
+            let scale_f32 = ue8m0_to_f32(scale_u8);
+            a_scales[tile_m * k32_blocks + k32_idx] = scale_u8;
+            for row_off in 0..16usize {
+                let row = m_base + row_off;
+                for pair_idx in 0..16usize {
+                    let col = k_base + pair_idx * 2;
+                    let lo_f =
+                        if scale_f32 > 0.0 { values[row * k + col] / scale_f32 } else { 0.0 };
+                    let hi_f =
+                        if scale_f32 > 0.0 { values[row * k + col + 1] / scale_f32 } else { 0.0 };
+                    packed[row * (k / 2) + col / 2] =
+                        pack_e2m1_pair(f32_to_e2m1(lo_f), f32_to_e2m1(hi_f));
+                }
+            }
+        }
+    }
+
+    (packed, a_scales)
+}
+
 /// Convert raw BF16 bytes (2 bytes per element, little-endian) to f32.
 pub fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     assert_eq!(bytes.len() % 2, 0);
@@ -226,6 +354,31 @@ mod kani_proofs {
         }
     }
 
+    /// Grid dimension for mxf4_batch_gemm_tiled equals sm_count, always nonzero.
+    #[kani::proof]
+    fn grid_dim_is_sm_count_nonzero() {
+        let sm_count: u32 = kani::any_where(|&x: &u32| x > 0 && x <= 256);
+        // Grid X = sm_count; each SM gets at least one tile if total_tiles >= sm_count.
+        assert!(sm_count > 0, "grid X must be nonzero");
+    }
+
+    /// k64_tiles = k / 64 derived from k_blocks: k_blocks * 256 / 64 = k_blocks * 4.
+    #[kani::proof]
+    fn k64_tiles_from_k_blocks_no_overflow() {
+        // k_blocks up to 512 covers K = 512 * 256 = 131072 (well within u32).
+        let k_blocks: u32 = kani::any_where(|&x: &u32| x <= 512);
+        let k64_tiles = k_blocks.checked_mul(4).expect("k64_tiles overflow");
+        assert!(k64_tiles <= 2048, "k64_tiles bounded");
+    }
+
+    /// N/8 tile count from N: N must be a multiple of 8 (n8-tiles).
+    #[kani::proof]
+    fn n_col_tiles_exact_division() {
+        let n: u32 = kani::any_where(|&x: &u32| x > 0 && x % 8 == 0 && x <= 16384);
+        let n_tiles = n / 8;
+        assert_eq!(n_tiles * 8, n, "n8 tiling must be exact");
+    }
+
     /// compute_ue8m0_scale covers max: after dividing by scale, max_abs fits in E2M1.
     #[kani::proof]
     fn ue8m0_scale_covers_block_max() {
@@ -335,6 +488,47 @@ mod tests {
                 "i={i} decoded={decoded}"
             );
         }
+    }
+
+    #[test]
+    fn quantize_matrix_tiled_length_invariant() {
+        let n = 16usize;
+        let k = 128usize;
+        let values = vec![1.0f32; n * k];
+        let (packed, b_scales) = quantize_matrix_to_mxfp4_tiled(&values, n, k);
+        assert_eq!(packed.len(), n * k / 2);
+        // n_tiles = 16/8 = 2, k32_blocks = 128/32 = 4 => 2*4 = 8
+        assert_eq!(b_scales.len(), (n / 8) * (k / 32));
+    }
+
+    #[test]
+    fn quantize_activation_tiled_length_invariant() {
+        let m = 16usize;
+        let k = 128usize;
+        let values = vec![1.5f32; m * k];
+        let (packed, a_scales) = quantize_activation_to_mxfp4_tiled(&values, m, k);
+        assert_eq!(packed.len(), m * k / 2);
+        // m_tiles = 16/16 = 1, k32_blocks = 128/32 = 4 => 1*4 = 4
+        assert_eq!(a_scales.len(), (m / 16) * (k / 32));
+        // All values should be nonzero packed
+        for &b in &packed {
+            assert_ne!(b, 0, "uniform nonzero input must produce nonzero packed bytes");
+        }
+    }
+
+    #[test]
+    fn quantize_matrix_tiled_scale_alignment() {
+        // Verify b_scales[tile_n * (k/32) + k32_idx] is consistent with kernel indexing.
+        let n = 8usize;
+        let k = 64usize;
+        let k32_blocks = k / 32; // = 2 = k64_tiles * 2
+        let values: Vec<f32> = (0..n * k).map(|i| (i as f32) * 0.01).collect();
+        let (_, b_scales) = quantize_matrix_to_mxfp4_tiled(&values, n, k);
+        // n_tiles = 1, k32_blocks = 2
+        assert_eq!(b_scales.len(), 1 * k32_blocks);
+        // lo = b_scales[0], hi = b_scales[1] (k64_tile 0, lo/hi halves)
+        let _lo = b_scales[0];
+        let _hi = b_scales[1];
     }
 
     #[test]

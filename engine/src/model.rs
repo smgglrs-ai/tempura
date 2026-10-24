@@ -9154,6 +9154,32 @@ impl CutileInferenceWrapper {
             .and_then(|m| m.lock().ok().map(|kv| kv.seq_len()))
             .unwrap_or(0)
     }
+
+    /// Returns true if the MXFP4 tiled batch GEMM kernel is available.
+    /// Requires sm_120a (RTX 5090) hardware and Q4K weights.
+    pub fn has_mxfp4(&self) -> bool {
+        self.gpu_model.as_ref().map(|g| g.has_mxfp4()).unwrap_or(false)
+    }
+
+    /// Number of MXFP4 tiled weight tensors loaded.
+    pub fn mxfp4_weight_count(&self) -> usize {
+        self.gpu_model
+            .as_ref()
+            .map(|g| g.mxfp4_weight_count())
+            .unwrap_or(0)
+    }
+
+    /// Benchmark 7 projection GEMMs for one layer using MXFP4 tiled kernel.
+    ///
+    /// Uses pre-quantized random activations (not real token embeddings).
+    /// Returns the duration per layer over 50 iterations, or None if unavailable.
+    pub fn bench_mxfp4_one_layer(
+        &self,
+        layer: usize,
+        batch: usize,
+    ) -> Option<std::time::Duration> {
+        self.gpu_model.as_ref()?.bench_mxfp4_one_layer(layer, batch)
+    }
 }
 
 #[cfg(feature = "cutile")]
