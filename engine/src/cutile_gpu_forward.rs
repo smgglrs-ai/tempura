@@ -543,8 +543,13 @@ pub struct CutileGpuModel {
     batch_attn_all_k_ptrs: cuda_core::sys::CUdeviceptr,
     batch_attn_all_v_ptrs: cuda_core::sys::CUdeviceptr,
 
-    /// Cached batch CUDA graph executable.
+    /// Cached batch CUDA graph executable (dp4a path).
     cached_batch_graph: RefCell<Option<BatchDecodeGraph>>,
+
+    /// Cached MXFP4 batch CUDA graph executable.
+    /// Separate from cached_batch_graph so both dp4a and MXFP4 graphs can coexist.
+    /// Captured with forward_batch_mxfp4_inner_graph (MXFP4 unconditional).
+    cached_mxfp4_batch_graph: RefCell<Option<BatchDecodeGraph>>,
 
     /// True when every projection weight in every layer is Q4K -- a precondition
     /// for the batch CUDA graph path (which only handles Q4K projections).
@@ -1717,6 +1722,7 @@ impl CutileGpuModel {
             batch_attn_all_k_ptrs,
             batch_attn_all_v_ptrs,
             cached_batch_graph: RefCell::new(None),
+            cached_mxfp4_batch_graph: RefCell::new(None),
             all_proj_q4k,
         };
         eprintln!("[cutile] warming up kernel specializations...");
@@ -1986,6 +1992,7 @@ impl CutileGpuModel {
             batch_attn_all_k_ptrs,
             batch_attn_all_v_ptrs,
             cached_batch_graph: RefCell::new(None),
+            cached_mxfp4_batch_graph: RefCell::new(None),
             all_proj_q4k: false, // from_f32 uses f32 weights, not Q4K
         };
         eprintln!("[cutile] warming up kernel specializations...");
@@ -2023,6 +2030,29 @@ impl CutileGpuModel {
         self.mxfp4_gemm.is_some()
             && self.mxfp4_act_packed.is_some()
             && !self.device_weights_mxfp4_tiled.is_empty()
+    }
+
+    /// Returns true if ALL Q4K projection layers have MXFP4 tiled weights loaded,
+    /// making the MXFP4 batch graph eligible. This check is stable across all replays:
+    /// device_weights_mxfp4_tiled is write-once at model load and never mutated during
+    /// forward passes (proven by Kani: mxfp4_graph_eligibility_is_deterministic).
+    fn mxfp4_eligible_for_batch_graph(&self) -> bool {
+        if !self.mxfp4_active() {
+            return false;
+        }
+        let cfg = &self.config;
+        (0..cfg.num_layers).all(|l| {
+            let p = format!("model.layers.{l}");
+            let qw   = format!("{p}.self_attn.q_proj.weight");
+            let kw   = format!("{p}.self_attn.k_proj.weight");
+            let ow   = format!("{p}.self_attn.o_proj.weight");
+            let gatew = format!("{p}.mlp.gate_proj.weight");
+            let upw  = format!("{p}.mlp.up_proj.weight");
+            // V and down projections stay as Q4K/Q6K (Q4_K_M format).
+            [qw.as_str(), kw.as_str(), ow.as_str(), gatew.as_str(), upw.as_str()]
+                .iter()
+                .all(|n| self.device_weights_mxfp4_tiled.contains_key(*n))
+        })
     }
 
     /// Maximum batch size supported by the CUDA graph decode path.
@@ -4845,6 +4875,7 @@ impl CutileGpuModel {
         m:            usize,
         positions:    &[u32],          // length m (same value for all in synchronised batch)
         kv_caches:    &mut [CutileKvCache],
+        use_mxfp4:    bool,            // if true: MXFP4 tensor-core path for Q/K/O/gate/up
     ) {
         let cfg        = &self.config;
         let h          = cfg.hidden_size;
@@ -4872,8 +4903,10 @@ impl CutileGpuModel {
         let mut hidden_dev: Arc<Tensor<f32>> = self.batch_hidden.clone();
 
         // MXFP4 path: sm_120a tensor-core GEMM + on-GPU activation quantization.
-        // Constant for all layers and all graph replays (determined at model load).
-        let mxfp4_active = self.mxfp4_gemm.is_some()
+        // Gated by use_mxfp4 which is set at graph-capture time and baked into the graph.
+        // Two separate graphs: dp4a (use_mxfp4=false) and MXFP4 (use_mxfp4=true).
+        let mxfp4_active = use_mxfp4
+            && self.mxfp4_gemm.is_some()
             && self.mxfp4_act_packed.is_some()
             && self.mxfp4_act_scales.is_some()
             && !self.device_weights_mxfp4_tiled.is_empty();
@@ -5502,6 +5535,276 @@ impl CutileGpuModel {
         // batch_hidden now holds the layer-loop output; caller applies final norm + lm_head.
     }
 
+    /// Inner body for the MXFP4 batch CUDA graph: MXFP4 tensor-core GEMM unconditionally
+    /// for Q/K/O/gate/up projections. V stays Q4K, down stays Q6K.
+    ///
+    /// Eligibility must be verified by the caller (mxfp4_eligible_for_batch_graph()).
+    /// Called exclusively between cuStreamBeginCapture and cuStreamEndCapture to bake
+    /// MXFP4 kernel launches into the CUDA graph with no runtime branching.
+    fn forward_batch_mxfp4_inner_graph(
+        &self,
+        m:         usize,
+        positions: &[u32],
+        kv_caches: &mut [CutileKvCache],
+    ) {
+        // Delegates to the shared inner graph with use_mxfp4=true.
+        // At capture time, mxfp4_active = true, so all Q/K/O/gate/up dispatch uses
+        // MXFP4 tensor cores. The captured graph nodes are MXFP4-only (no dp4a fallback).
+        self.forward_batch_decode_inner_graph(m, positions, kv_caches, true);
+    }
+
+    /// MXFP4 batch CUDA graph: captures forward_batch_mxfp4_inner_graph once,
+    /// replays on subsequent calls. Uses a separate graph cache from the dp4a path.
+    ///
+    /// Returns None if MXFP4 is not eligible (caller falls back to dp4a graph).
+    fn forward_batch_mxfp4_with_graph(
+        &self,
+        embeddings: &[Vec<f32>],
+        positions:  &[u32],
+        qweights:   &QuantizedWeights,
+        kv_caches:  &mut [CutileKvCache],
+    ) -> Option<Vec<Vec<f32>>> {
+        if !self.mxfp4_eligible_for_batch_graph() {
+            return None;
+        }
+        let m = embeddings.len();
+        let cfg    = &self.config;
+        let h      = cfg.hidden_size;
+        let vocab  = cfg.vocab_size;
+        let stream = self.matmul.stream();
+        let cu_stream = stream.cu_stream();
+
+        let kv_write_off = kv_caches[0].seq_len() as i32;
+        let kv_len_bits: f32 = f32::from_bits((kv_write_off + 1) as u32);
+        let pos_bits: f32    = f32::from_bits(positions[0]);
+
+        // H->D: upload M embeddings and decode scalars.
+        for (r, emb) in embeddings.iter().enumerate() {
+            let src: Vec<f32> = if self.h_pad == h {
+                emb.to_vec()
+            } else {
+                let mut v = vec![0.0f32; self.h_pad];
+                v[..h].copy_from_slice(&emb[..h]);
+                v
+            };
+            unsafe {
+                cuda_core::memcpy_htod_async::<f32>(
+                    self.d_embed_batch[r].device_pointer().cu_deviceptr(),
+                    src.as_ptr(), self.h_pad, stream,
+                ).expect("mxfp4 batch graph: d_embed_batch H->D");
+            }
+        }
+        for (r, _emb) in embeddings.iter().enumerate() {
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    self.batch_hidden.device_pointer().cu_deviceptr() + (r * self.h_pad * 4) as u64,
+                    self.d_embed_batch[r].device_pointer().cu_deviceptr(),
+                    self.h_pad, stream,
+                ).expect("mxfp4 batch graph: embedding concat D->D");
+            }
+        }
+        unsafe {
+            cuda_core::memcpy_htod_async::<f32>(
+                self.d_kv_len.device_pointer().cu_deviceptr(),
+                &kv_len_bits as *const f32, 1, stream,
+            ).expect("mxfp4 batch graph: d_kv_len H->D");
+            cuda_core::memcpy_htod_async::<f32>(
+                self.d_positions.device_pointer().cu_deviceptr(),
+                &pos_bits as *const f32, 1, stream,
+            ).expect("mxfp4 batch graph: d_positions H->D");
+            cuda_core::memcpy_htod_async::<i32>(
+                self.d_kv_write_offset.device_pointer().cu_deviceptr(),
+                &kv_write_off as *const i32, 1, stream,
+            ).expect("mxfp4 batch graph: d_kv_write_offset H->D");
+        }
+        if self.batch_attn_kv_lens_dev != 0 {
+            let kv_len_after = kv_write_off + 1;
+            let kv_lens: Vec<i32> = (0..m).map(|_| kv_len_after).collect();
+            unsafe {
+                cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                    self.batch_attn_kv_lens_dev,
+                    kv_lens.as_ptr() as *const std::ffi::c_void,
+                    m * 4,
+                    cu_stream,
+                );
+            }
+        }
+
+        let mut graph_cache = self.cached_mxfp4_batch_graph.borrow_mut();
+
+        // Validate KV-cache device pointers before replay.
+        {
+            let need_invalidate = match *graph_cache {
+                Some(ref dg) => {
+                    if dg.m != m {
+                        eprintln!("[mxfp4_graph] batch size changed ({} -> {m}) -- re-capturing", dg.m);
+                        true
+                    } else {
+                        !(0..cfg.num_layers).all(|l| {
+                            (0..m).all(|r| {
+                                let (k, v) = kv_caches[r].kv_device_tensors(l);
+                                k.device_pointer().cu_deviceptr() == dg.captured_k_ptrs[l][r]
+                                    && v.device_pointer().cu_deviceptr() == dg.captured_v_ptrs[l][r]
+                            })
+                        })
+                    }
+                }
+                None => false,
+            };
+            if need_invalidate {
+                eprintln!("[mxfp4_graph] KV cache ptrs changed -- re-capturing");
+                *graph_cache = None;
+            }
+        }
+
+        if let Some(ref decode_graph) = *graph_cache {
+            // Subsequent steps: update scalar nodes and launch.
+            let new_kv_len = kv_write_off + 1;
+            let new_pos    = positions[0] as i32;
+            for fa in &decode_graph.flash_attn_nodes {
+                unsafe { *fa.scalar_ptr = new_kv_len; }
+            }
+            for rn in &decode_graph.rope_nodes {
+                unsafe { *rn.scalar_ptr = new_pos; }
+            }
+            let need_update = !decode_graph.flash_attn_nodes.is_empty()
+                || !decode_graph.rope_nodes.is_empty();
+            if need_update {
+                let mut result_info = cuda_core::sys::CUgraphExecUpdateResultInfo_st {
+                    result: cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS,
+                    errorNode: std::ptr::null_mut(),
+                    errorFromNode: std::ptr::null_mut(),
+                };
+                let rc = unsafe {
+                    cuda_core::sys::cuGraphExecUpdate_v2(
+                        decode_graph.cu_exec, decode_graph.cu_graph, &mut result_info,
+                    )
+                };
+                if rc != 0 || result_info.result != cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS {
+                    eprintln!("[mxfp4_graph] cuGraphExecUpdate_v2 failed rc={rc}; invalidating and falling back");
+                    *graph_cache = None;
+                    drop(graph_cache);
+                    return Some(vec![]);
+                }
+            }
+            unsafe { cuda_core::sys::cuGraphLaunch(decode_graph.cu_exec, cu_stream); }
+            unsafe { stream.synchronize().expect("mxfp4 batch graph sync"); }
+            drop(graph_cache);
+        } else {
+            // First call: fill K/V ptr arrays, then capture MXFP4 graph.
+            if self.batch_attn_all_k_ptrs != 0 {
+                for l in 0..cfg.num_layers {
+                    let k_ptrs: Vec<u64> = (0..m)
+                        .map(|r| kv_caches[r].kv_device_tensors(l).0.device_pointer().cu_deviceptr())
+                        .collect();
+                    let v_ptrs: Vec<u64> = (0..m)
+                        .map(|r| kv_caches[r].kv_device_tensors(l).1.device_pointer().cu_deviceptr())
+                        .collect();
+                    unsafe {
+                        cuda_core::sys::cuMemcpyHtoD_v2(
+                            self.batch_attn_all_k_ptrs + (l * m * 8) as u64,
+                            k_ptrs.as_ptr() as *const std::ffi::c_void,
+                            m * 8,
+                        );
+                        cuda_core::sys::cuMemcpyHtoD_v2(
+                            self.batch_attn_all_v_ptrs + (l * m * 8) as u64,
+                            v_ptrs.as_ptr() as *const std::ffi::c_void,
+                            m * 8,
+                        );
+                    }
+                }
+            }
+
+            // Pre-size batch scratch tensors before capture.
+            {
+                const SILU_B: usize = 32;
+                let inter = cfg.intermediate_size;
+                let inter_pad = inter.div_ceil(SILU_B) * SILU_B;
+                let h_pad = self.h_pad;
+                let alloc_flat = |n: usize| -> Arc<Tensor<f32>> {
+                    Arc::new(
+                        api::zeros::<f32>(&[n])
+                            .sync_on(stream)
+                            .expect("mxfp4 batch_graph: scratch pre-size"),
+                    )
+                };
+                self.batch_pre_attn_norm_scratch.borrow_mut().out_t  = Some(alloc_flat(m * h_pad));
+                self.batch_post_attn_norm_scratch.borrow_mut().out_t = Some(alloc_flat(m * h_pad));
+                self.batch_final_norm_scratch.borrow_mut().out_t     = Some(alloc_flat(m * h_pad));
+                *self.batch_silu_out_scratch.borrow_mut() = Some(alloc_flat(m * inter_pad));
+            }
+
+            let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
+            unsafe { stream.begin_capture(relaxed).expect("mxfp4 batch graph: begin_capture"); }
+
+            // Capture MXFP4 path (use_mxfp4=true). All Q/K/O/gate/up projections use
+            // mxfp4_quantize_activation_tiled + mxf4_batch_gemm_tiled kernel nodes.
+            self.forward_batch_mxfp4_inner_graph(m, positions, kv_caches);
+
+            let cu_graph = unsafe { stream.end_capture().expect("mxfp4 batch graph: end_capture") };
+
+            let mut cu_exec_uninit = std::mem::MaybeUninit::<cuda_core::sys::CUgraphExec>::uninit();
+            unsafe {
+                cuda_core::sys::cuGraphInstantiateWithFlags(cu_exec_uninit.as_mut_ptr(), cu_graph, 0);
+            }
+            let cu_exec = unsafe { cu_exec_uninit.assume_init() };
+
+            let capture_kv_len = kv_write_off + 1;
+            let capture_pos    = positions[0] as i32;
+            let n_heads_u32    = cfg.num_attention_heads as u32;
+            let (flash_attn_nodes, rope_nodes) =
+                self.find_kernel_scalar_nodes(cu_graph, capture_kv_len, capture_pos, n_heads_u32);
+
+            eprintln!("[mxfp4_graph] captured: {} flash-attn nodes, {} rope nodes",
+                flash_attn_nodes.len(), rope_nodes.len());
+
+            let captured_k_ptrs: Vec<Vec<u64>> = (0..cfg.num_layers)
+                .map(|l| (0..m).map(|r| kv_caches[r].kv_device_tensors(l).0.device_pointer().cu_deviceptr()).collect())
+                .collect();
+            let captured_v_ptrs: Vec<Vec<u64>> = (0..cfg.num_layers)
+                .map(|l| (0..m).map(|r| kv_caches[r].kv_device_tensors(l).1.device_pointer().cu_deviceptr()).collect())
+                .collect();
+
+            *graph_cache = Some(BatchDecodeGraph {
+                cu_exec,
+                cu_graph,
+                device: stream.device().clone(),
+                m,
+                flash_attn_nodes,
+                rope_nodes,
+                captured_k_ptrs,
+                captured_v_ptrs,
+            });
+
+            unsafe { cuda_core::sys::cuGraphLaunch(cu_exec, cu_stream); }
+            unsafe { stream.synchronize().expect("mxfp4 batch graph: first sync"); }
+            drop(graph_cache);
+        }
+
+        // Advance KV cache host-side seq_len once per step.
+        for kvc in kv_caches.iter_mut().take(m) {
+            kvc.advance_host_seq_len(1);
+            kvc.mark_host_stale();
+        }
+
+        // Outside graph: final norm + lm_head + D->H.
+        let final_ln_dev = self.norm_weights.get("model.norm.weight")
+            .expect("model.norm.weight missing");
+        let last_dev = self.cutile_rmsnorm
+            .forward_device_fused_scratch(
+                stream,
+                self.batch_hidden.clone(),
+                final_ln_dev,
+                m, h, self.h_pad, cfg.layer_norm_eps,
+                &mut self.batch_final_norm_scratch.borrow_mut(),
+            )
+            .expect("mxfp4 batch graph: final RMSNorm");
+
+        let logits_dev = self.gemm_d2d(&last_dev, "lm_head.weight", m);
+        let logits_flat = self.download_device_tensor(&logits_dev);
+        Some(logits_flat.chunks(vocab).map(|c| c.to_vec()).collect())
+    }
+
     /// CUDA-graph-accelerated batch decode: M synchronised sequences, 1 token each.
     ///
     /// Captures on the first call, replays on subsequent calls.
@@ -5522,6 +5825,17 @@ impl CutileGpuModel {
         let m = embeddings.len();
         assert!(m >= 2 && m <= self.max_batch_graph,
             "batch graph: m={m} must be in [2, {}]", self.max_batch_graph);
+
+        // Try MXFP4 tensor-core path first: separate graph cache, MXFP4-unconditional
+        // inner body. When MXFP4 weights are loaded for all Q4K projections, this path
+        // captures a graph with mxfp4_quantize_activation_tiled + mxf4_batch_gemm_tiled
+        // nodes (no dp4a fallback nodes). Returns None if ineligible.
+        if let Some(result) = self.forward_batch_mxfp4_with_graph(embeddings, positions, qweights, kv_caches) {
+            if !result.is_empty() {
+                return result;
+            }
+            // Empty result means MXFP4 graph update failed; fall through to dp4a.
+        }
         let cfg    = &self.config;
         let h      = cfg.hidden_size;
         let vocab  = cfg.vocab_size;
@@ -5711,7 +6025,9 @@ impl CutileGpuModel {
             let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
             unsafe { stream.begin_capture(relaxed).expect("batch graph: begin_capture"); }
 
-            self.forward_batch_decode_inner_graph(m, positions, kv_caches);
+            // Capture dp4a path (use_mxfp4=false). MXFP4 is captured in a separate graph
+            // via forward_batch_mxfp4_with_graph when MXFP4 weights are eligible.
+            self.forward_batch_decode_inner_graph(m, positions, kv_caches, false);
 
             let cu_graph = unsafe { stream.end_capture().expect("batch graph: end_capture") };
 
