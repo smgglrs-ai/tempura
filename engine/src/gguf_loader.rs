@@ -1471,6 +1471,16 @@ impl GgufLoader {
             if info.dtype == GgmlType::F16 {
                 mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, GgmlType::F16));
             }
+            // BF16 projection weights: register for zero-copy MXFP4 conversion.
+            // All BF16 tensors still dequantize to f32 (skip_f32 stays false for BF16)
+            // so that embed_tokens / norm weights remain accessible via get_f32().
+            let bf16_is_proj = info.dtype == GgmlType::BF16
+                && (mapped_name.contains("_proj.weight")
+                    || mapped_name.ends_with(".weight")
+                        && (mapped_name.contains("self_attn") || mapped_name.contains("mlp")));
+            if bf16_is_proj {
+                mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, GgmlType::BF16));
+            }
 
             let skip_f32 = info.dtype == GgmlType::F16;
 
@@ -1845,6 +1855,9 @@ impl GgufLoader {
                     }
                     GgmlType::F16 => {
                         qw.register_mmap_f16(key, off, len);
+                    }
+                    GgmlType::BF16 => {
+                        qw.register_mmap_bf16(key, off, len);
                     }
                     GgmlType::Q4K => {
                         qw.register_mmap_q4k(key, off, len);

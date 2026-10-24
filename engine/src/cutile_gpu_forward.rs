@@ -1247,6 +1247,58 @@ impl CutileGpuModel {
         Ok(true)
     }
 
+    /// Load BF16 weights from a GGUF mmap, convert BF16->f32->MXFP4, and upload
+    /// the tiled kernel layout to the GPU.
+    ///
+    /// BF16 is an exact truncation of f32 (upper 16 bits), so conversion is lossless
+    /// within the f32 range -- no quantization error beyond the original BF16 precision.
+    ///
+    /// `n` and `k` are the weight matrix shape [N, K].
+    /// `k` must be a multiple of 64, `n` must be a multiple of 8.
+    ///
+    /// Returns `false` when the tensor is absent in `qw` or dimensions are incompatible.
+    fn maybe_upload_mxfp4_tiled_from_bf16(
+        stream: &Arc<Stream>,
+        dw_mxfp4_tiled: &mut HashMap<String, DeviceWeightMxfp4Tiled>,
+        qw: &QuantizedWeights,
+        name: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<bool, tempura_kernels::KernelError> {
+        use tempura_kernels::mxfp4::{bf16_bytes_to_f32, quantize_matrix_to_mxfp4_tiled};
+
+        if n % 8 != 0 || k % 64 != 0 {
+            return Ok(false);
+        }
+        let raw = match qw.get_bf16(name) {
+            Some(b) if b.len() == n * k * 2 => b,
+            _ => return Ok(false),
+        };
+
+        // BF16 -> f32: exact upcast, no information loss beyond original BF16 precision.
+        let f32_weights = bf16_bytes_to_f32(raw);
+        debug_assert_eq!(f32_weights.len(), n * k);
+
+        let (packed, tiled_scales) = quantize_matrix_to_mxfp4_tiled(&f32_weights, n, k);
+
+        let packed_tensor: Arc<Tensor<u8>> =
+            api::copy_host_vec_to_device(&Arc::new(packed))
+                .sync_on(stream)
+                .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+                .into();
+        let scales_tensor: Arc<Tensor<u8>> =
+            api::copy_host_vec_to_device(&Arc::new(tiled_scales))
+                .sync_on(stream)
+                .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+                .into();
+
+        dw_mxfp4_tiled.insert(
+            name.to_string(),
+            DeviceWeightMxfp4Tiled { packed: packed_tensor, tiled_scales: scales_tensor, n, k },
+        );
+        Ok(true)
+    }
+
     /// Upload a norm weight vector from a host slice to a 1-D device tensor of
     /// `h_pad` elements, zero-padding from `h` to `h_pad` if necessary.
     fn upload_norm_weight(
@@ -1426,10 +1478,20 @@ impl CutileGpuModel {
                 (format!("{p}.mlp.up_proj.weight"),         inter,  h),
                 (format!("{p}.mlp.down_proj.weight"),       h,      inter),
             ] {
-                if let Err(e) = Self::maybe_upload_mxfp4_tiled_from_q4k(
+                // Try Q4K first (quantized GGUF), then BF16 (full-precision GGUF).
+                // Only one will succeed; the other returns false without touching GPU state.
+                let q4k_ok = match Self::maybe_upload_mxfp4_tiled_from_q4k(
                     matmul.stream(), &mut dw_mxfp4_tiled, qw, &wname, n_dim, k_dim,
                 ) {
-                    eprintln!("[mxfp4] tiled upload {wname}: {e}");
+                    Ok(ok) => ok,
+                    Err(e) => { eprintln!("[mxfp4] tiled q4k {wname}: {e}"); false }
+                };
+                if !q4k_ok {
+                    if let Err(e) = Self::maybe_upload_mxfp4_tiled_from_bf16(
+                        matmul.stream(), &mut dw_mxfp4_tiled, qw, &wname, n_dim, k_dim,
+                    ) {
+                        eprintln!("[mxfp4] tiled bf16 {wname}: {e}");
+                    }
                 }
             }
 

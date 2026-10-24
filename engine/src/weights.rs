@@ -343,6 +343,7 @@ pub struct QuantizedWeights {
     mmap: Option<memmap2::Mmap>,
     mmap_i2s: HashMap<String, (usize, usize)>,
     mmap_f16: HashMap<String, (usize, usize)>,
+    mmap_bf16: HashMap<String, (usize, usize)>,
     mmap_q4k: HashMap<String, (usize, usize)>,
     mmap_q6k: HashMap<String, (usize, usize)>,
     mmap_q2: HashMap<String, (usize, usize)>,
@@ -372,6 +373,7 @@ impl QuantizedWeights {
             mmap: None,
             mmap_i2s: HashMap::new(),
             mmap_f16: HashMap::new(),
+            mmap_bf16: HashMap::new(),
             mmap_q4k: HashMap::new(),
             mmap_q6k: HashMap::new(),
             mmap_q2: HashMap::new(),
@@ -402,6 +404,7 @@ impl QuantizedWeights {
             mmap: None,
             mmap_i2s: HashMap::new(),
             mmap_f16: HashMap::new(),
+            mmap_bf16: HashMap::new(),
             mmap_q4k: HashMap::new(),
             mmap_q6k: HashMap::new(),
             mmap_q2: HashMap::new(),
@@ -450,6 +453,7 @@ impl QuantizedWeights {
             mmap: None,
             mmap_i2s: HashMap::new(),
             mmap_f16: HashMap::new(),
+            mmap_bf16: HashMap::new(),
             mmap_q4k: HashMap::new(),
             mmap_q6k: HashMap::new(),
             mmap_q2: HashMap::new(),
@@ -474,6 +478,7 @@ impl QuantizedWeights {
             mmap: None,
             mmap_i2s: HashMap::new(),
             mmap_f16: HashMap::new(),
+            mmap_bf16: HashMap::new(),
             mmap_q4k: HashMap::new(),
             mmap_q6k: HashMap::new(),
             mmap_q2: HashMap::new(),
@@ -649,6 +654,16 @@ impl QuantizedWeights {
 
     pub fn register_mmap_f16(&mut self, name: String, offset: usize, len: usize) {
         self.mmap_f16.insert(name, (offset, len));
+    }
+
+    pub fn register_mmap_bf16(&mut self, name: String, offset: usize, len: usize) {
+        self.mmap_bf16.insert(name, (offset, len));
+    }
+
+    pub fn get_bf16(&self, name: &str) -> Option<&[u8]> {
+        self.mmap_bf16
+            .get(name)
+            .and_then(|&(off, len)| self.mmap.as_ref().map(|m| &m[off..off + len]))
     }
 
     pub fn register_mmap_q4k(&mut self, name: String, offset: usize, len: usize) {
