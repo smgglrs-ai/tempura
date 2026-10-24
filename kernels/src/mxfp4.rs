@@ -162,6 +162,90 @@ pub fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// E2M1 nibble is always in 0..=15 (4 bits fit).
+    #[kani::proof]
+    fn e2m1_nibble_fits_in_4_bits() {
+        let bits: u32 = kani::any();
+        // Construct a finite f32 from exact representable magnitudes only.
+        let mag_idx: usize = kani::any();
+        let sign_flag: bool = kani::any();
+        kani::assume(mag_idx < E2M1_MAGNITUDES.len());
+        let mag = E2M1_MAGNITUDES[mag_idx];
+        let x = if sign_flag { -mag } else { mag };
+        let nibble = f32_to_e2m1(x);
+        assert!(nibble <= 15, "E2M1 nibble must fit in 4 bits");
+        let _ = bits;
+    }
+
+    /// pack_e2m1_pair / unpack roundtrip: lo in bits[3:0], hi in bits[7:4].
+    #[kani::proof]
+    fn pack_unpack_roundtrip() {
+        let lo: u8 = kani::any();
+        let hi: u8 = kani::any();
+        kani::assume(lo <= 15);
+        kani::assume(hi <= 15);
+        let packed = pack_e2m1_pair(lo, hi);
+        assert_eq!(packed & 0xF, lo, "lo nibble roundtrip");
+        assert_eq!((packed >> 4) & 0xF, hi, "hi nibble roundtrip");
+    }
+
+    /// e2m1_to_f32 produces a value in the known representable set.
+    #[kani::proof]
+    fn e2m1_decode_in_representable_set() {
+        let nibble: u8 = kani::any();
+        kani::assume(nibble <= 15);
+        let val = e2m1_to_f32(nibble);
+        let mag = val.abs();
+        let valid = mag == 0.0
+            || mag == 0.5
+            || mag == 1.0
+            || mag == 1.5
+            || mag == 2.0
+            || mag == 3.0
+            || mag == 4.0
+            || mag == 6.0;
+        assert!(valid, "e2m1_to_f32 must land on a representable magnitude");
+    }
+
+    /// Sign bit in E2M1 nibble is bit 3; negative inputs set it.
+    #[kani::proof]
+    fn e2m1_sign_bit_correct() {
+        let mag_idx: usize = kani::any();
+        kani::assume(mag_idx < E2M1_MAGNITUDES.len());
+        let mag = E2M1_MAGNITUDES[mag_idx];
+        if mag > 0.0 {
+            let pos = f32_to_e2m1(mag);
+            let neg = f32_to_e2m1(-mag);
+            assert_eq!(pos & 0b1000, 0, "positive value must have sign bit 0");
+            assert_eq!(neg & 0b1000, 0b1000, "negative value must have sign bit 1");
+            assert_eq!(pos & 0b0111, neg & 0b0111, "magnitude index must be equal for +/-");
+        }
+    }
+
+    /// compute_ue8m0_scale covers max: after dividing by scale, max_abs fits in E2M1.
+    #[kani::proof]
+    fn ue8m0_scale_covers_block_max() {
+        let mag_idx: usize = kani::any();
+        kani::assume(mag_idx < E2M1_MAGNITUDES.len());
+        let max_val = E2M1_MAGNITUDES[mag_idx];
+        let mut block = [0.0f32; MXFP4_BLOCK_SIZE];
+        block[0] = max_val;
+        let s = compute_ue8m0_scale(&block);
+        let sf = ue8m0_to_f32(s);
+        if max_val > 0.0 {
+            assert!(sf > 0.0, "scale must be positive for nonzero input");
+            let scaled = max_val / sf;
+            assert!(scaled <= 6.0 + 1e-5, "scaled value must fit in E2M1 range");
+        } else {
+            assert_eq!(s, 0, "scale must be 0 for zero block");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

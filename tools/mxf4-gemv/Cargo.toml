@@ -1,0 +1,20 @@
+[package]
+name = "mxf4-gemv"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Minimal SM120a MXFP4 tensor-core GEMV correctness test using cute-rs mma_mxf4"
+
+# Standalone crate -- not in the main workspace.
+# Build: cd tools/mxf4-gemv && CUDA_OXIDE_DEVICE_BACKEND=cutlass-mlir cargo oxide build --arch sm_120a
+[workspace]
+
+[[bin]]
+name = "mxf4-gemv"
+path = "src/main.rs"
+
+[dependencies]
+ctm-rs   = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/cute-rs-preview/ctm-rs" }
+cuda-device = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/cuda-device" }
+cuda-host   = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/cuda-host" }
+cuda-core   = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-core" }
