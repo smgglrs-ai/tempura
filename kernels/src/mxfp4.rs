@@ -681,3 +681,43 @@ mod gpu_quant_verification {
         );
     }
 }
+
+#[cfg(kani)]
+mod dispatch_correctness {
+    /// k64_tiles derived correctly from hidden_size.
+    /// Proves: for all k that are multiples of 64 in [64, 8192],
+    /// k64_tiles = k/64 is an exact integer with no remainder.
+    #[kani::proof]
+    fn k64_tiles_from_hidden_size() {
+        let k: u32 = kani::any_where(|&x: &u32| x % 64 == 0 && x >= 64 && x <= 8192);
+        let k64_tiles = k / 64;
+        assert!(k64_tiles >= 1);
+        assert_eq!(k64_tiles * 64, k);
+    }
+
+    /// Activation buffer sizes are consistent: no remainder for E2M1 packing
+    /// (2 elements per byte) and UE8M0 scale grouping (32 elements per scale).
+    /// Proves for all valid (m16_tiles, k) pairs that buffer layout is exact.
+    #[kani::proof]
+    fn activation_buffer_sizes_exact() {
+        // m must be a multiple of 16 (m16-tile requirement).
+        let m: u32 = kani::any_where(|&x: &u32| x % 16 == 0 && x >= 16 && x <= 256);
+        // k must be a multiple of 32 (scale-group requirement) and 64 (tile requirement).
+        let k: u32 = kani::any_where(|&x: &u32| x % 64 == 0 && x >= 64 && x <= 65536);
+        let packed_size = m * k / 2;     // E2M1: 2 elements per byte
+        let scales_size = (m / 16) * (k / 32); // one UE8M0 per 16-row x 32-col tile
+        // No remainder in packing: m*k is always even (both m>=16 and k>=64 are even).
+        assert_eq!(packed_size * 2, m * k);
+        // No remainder in scale indexing: k divisible by 32, m divisible by 16.
+        assert_eq!(scales_size * 16 * 32, m * k);
+    }
+
+    /// m_pad=16 is sufficient for any batch size in [1, 16].
+    /// Proves: for all m in [1, 16], (m+15)&!15 == 16.
+    #[kani::proof]
+    fn m_pad_16_covers_all_batch_sizes() {
+        let m: u32 = kani::any_where(|&x: &u32| x >= 1 && x <= 16);
+        let m_pad = (m + 15) & !15u32;
+        assert_eq!(m_pad, 16);
+    }
+}

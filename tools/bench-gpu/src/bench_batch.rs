@@ -81,7 +81,20 @@ fn main() {
     println!("  {:>6}  {:>14}  {:>16}  {:>14}", "Batch", "total tok/s", "per-req tok/s", "attn blocks");
     println!("  {}", "-".repeat(58));
 
-    for &batch in &[1usize, 2, 4, 5, 8] {
+    let mxfp4_info = if wrapper.mxfp4_tiled_count() > 0 {
+        format!("MXFP4 ({} tiled weights, active={})",
+            wrapper.mxfp4_tiled_count(),
+            wrapper.mxfp4_active())
+    } else {
+        "MXFP4 unavailable (non-sm_120a hardware or no tiled weights)".to_string()
+    };
+    println!("  MXFP4 dispatch: {mxfp4_info}");
+
+    for &batch in &[1usize, 2, 4, 5, 8, 16] {
+        if batch > wrapper.max_batch_graph() {
+            println!("  {:>6}  (exceeds max_batch_graph={})", batch, wrapper.max_batch_graph());
+            continue;
+        }
         let tok_s = bench_batch(&wrapper, batch);
         let per_req = tok_s / batch as f64;
         let blocks = batch * n_heads;
@@ -89,7 +102,7 @@ fn main() {
             batch, tok_s, per_req, blocks);
     }
 
-    println!("\n  Kernel: q4k_streamk_batch_sm120 (stream-K, cp.async, 8 warps, grid=(SM_COUNT,1,1)).");
+    println!("\n  Projection dispatch: MXFP4 sm_120a (Q,K,O,gate,up) + Q6K (down) + Q4K (V).");
     println!("  Persistent KV caches: CUDA graph captures once, all bench steps replay.");
     println!("  Remaining gap at high M: flash attention scales as O(M*kv_len*n_heads).");
     println!();

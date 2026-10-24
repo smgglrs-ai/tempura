@@ -9169,6 +9169,21 @@ impl CutileInferenceWrapper {
             .unwrap_or(0)
     }
 
+    /// Alias for mxfp4_weight_count, used by benchmarks.
+    pub fn mxfp4_tiled_count(&self) -> usize {
+        self.mxfp4_weight_count()
+    }
+
+    /// True if the batch decode CUDA graph dispatches projections via MXFP4 tensor cores.
+    pub fn mxfp4_active(&self) -> bool {
+        self.gpu_model.as_ref().map(|g| g.mxfp4_active()).unwrap_or(false)
+    }
+
+    /// Maximum batch size supported by the CUDA graph decode path.
+    pub fn max_batch_graph(&self) -> usize {
+        self.gpu_model.as_ref().map(|g| g.max_batch_graph()).unwrap_or(1)
+    }
+
     /// Benchmark 7 projection GEMMs for one layer using MXFP4 tiled kernel.
     ///
     /// Uses pre-quantized random activations (not real token embeddings).
