@@ -949,6 +949,15 @@ impl CutileGpuModel {
             "k={k} must be a multiple of Q4K_BLOCK_SIZE={Q4K_BLOCK_SIZE}"
         );
         let k_blocks = k / Q4K_BLOCK_SIZE;
+        let expected_bytes = n * k_blocks * Q4K_BLOCK_BYTES;
+        if bytes.len() != expected_bytes {
+            eprintln!(
+                "[q4k] {name}: expected {expected_bytes} bytes (n={n} k={k}), got {} -- \
+                 shape mismatch (hybrid SSM model?), skipping Q4K upload",
+                bytes.len()
+            );
+            return Ok(false);
+        }
         let total_u32s = n * k_blocks * Q4K_PACKED_U32S;
         let mut packed: Vec<u32> = Vec::with_capacity(total_u32s);
 
@@ -1028,8 +1037,18 @@ impl CutileGpuModel {
         debug_assert_eq!(k % Q4K_BLOCK_SIZE, 0);
         let k_blocks = k / Q4K_BLOCK_SIZE;
         // Each raw GGUF block is exactly 144 bytes = 36 u32s.
-        debug_assert_eq!(bytes.len(), n * k_blocks * 144,
-            "Q4K raw bytes len mismatch: {} != {}", bytes.len(), n * k_blocks * 144);
+        let expected_bytes = n * k_blocks * 144;
+        if bytes.len() != expected_bytes {
+            // Shape mismatch -- e.g. hybrid models (qwen35/Mamba) where attention layers
+            // store a non-standard Q dim (12288 vs expected 6144 for n_heads*head_dim).
+            // Fall back to f32 dequantized path rather than crashing with a cuTile reshape error.
+            eprintln!(
+                "[q4k_raw] {name}: expected {expected_bytes} bytes (n={n} k={k} k_blocks={k_blocks}), \
+                 got {} -- likely unsupported architecture (hybrid SSM or non-standard Q dim), skipping Q4K upload",
+                bytes.len()
+            );
+            return Ok(false);
+        }
         // Reinterpret raw bytes as u32 (blocks are 4-byte aligned in GGUF).
         // Alignment check: GGUF tensor data must be 4-byte aligned for u32 reinterpretation.
         let ptr_offset = bytes.as_ptr() as usize % 4;

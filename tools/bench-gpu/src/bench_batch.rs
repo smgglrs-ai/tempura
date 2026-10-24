@@ -70,7 +70,16 @@ fn main() {
     let t0 = Instant::now();
     let loader = GgufLoader::from_file_quantized(Path::new(&model_path))
         .expect("failed to open GGUF");
-    let config = loader.config.clone();
+    let mut config = loader.config.clone();
+    // Allow overriding max_seq_len via env var so large models fit in VRAM during bench.
+    // Default: keep model's native max_seq_len for standard models, cap at 8192 for 27B+.
+    if let Ok(s) = std::env::var("TEMPURA_BENCH_MAX_SEQ_LEN") {
+        let cap: usize = s.parse().expect("TEMPURA_BENCH_MAX_SEQ_LEN must be an integer");
+        if cap < config.max_seq_len {
+            eprintln!("[bench] capping max_seq_len {} -> {} (TEMPURA_BENCH_MAX_SEQ_LEN)", config.max_seq_len, cap);
+            config.max_seq_len = cap;
+        }
+    }
     let qw = loader.to_quantized_weights();
     let mut wrapper = CutileInferenceWrapper::new(config);
     wrapper.load_quantized(qw);
