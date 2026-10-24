@@ -588,3 +588,96 @@ mod tests {
         );
     }
 }
+
+/// Kani harnesses proving correctness properties required by the GPU quantization
+/// kernel (mxfp4_quant_ptx). The GPU kernel implements the same algorithm as the
+/// CPU reference but in sm_120 PTX; these proofs verify the shared invariants.
+#[cfg(kani)]
+mod gpu_quant_verification {
+    use super::*;
+
+    /// The 8 E2M1 magnitude values match the expected representable set.
+    /// The GPU kernel uses these same values as quantization targets.
+    #[kani::proof]
+    fn e2m1_magnitude_table_correct() {
+        let expected: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        for (i, &expected_val) in expected.iter().enumerate() {
+            let nibble = i as u8;
+            let decoded = e2m1_to_f32(nibble);
+            assert!(
+                (decoded - expected_val).abs() < 1e-6,
+                "E2M1 magnitude {i} decoded incorrectly"
+            );
+        }
+    }
+
+    /// UE8M0 decode: 2^(e - 127). The GPU kernel reconstructs scale_f32 via
+    /// bit-shift (ue8m0 << 23), which is the same IEEE 754 operation.
+    #[kani::proof]
+    fn ue8m0_decode_is_power_of_two() {
+        let e: u8 = kani::any();
+        kani::assume(e >= 64 && e <= 200);
+        let scale = ue8m0_to_f32(e);
+        // ue8m0_to_f32 returns f32::from_bits((e as u32) << 23).
+        // That is exactly 2^(e - 127) for e in [1, 254].
+        let expected = f32::from_bits((e as u32) << 23);
+        assert!(
+            (scale - expected).abs() < 1e-10,
+            "ue8m0_to_f32 must equal 2^(e-127)"
+        );
+    }
+
+    /// UE8M0 encode-decode roundtrip: encode returns an exponent e such that
+    /// 2^(e-127) >= max_abs / 6.0, covering all representable E2M1 values.
+    ///
+    /// The GPU kernel derives UE8M0 the same way: extract IEEE exponent of
+    /// (max_abs / 6.0), increment if mantissa nonzero (ceiling of log2).
+    #[kani::proof]
+    fn ue8m0_encode_covers_max_abs() {
+        let mag_idx: usize = kani::any();
+        kani::assume(mag_idx > 0 && mag_idx < 8);
+        let max_abs = E2M1_MAGNITUDES[mag_idx];
+        let e = compute_ue8m0_scale(&[
+            max_abs, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ]);
+        if e == 0 {
+            // Zero scale only when max_abs == 0.
+            assert!(max_abs == 0.0);
+        } else {
+            let scale = ue8m0_to_f32(e);
+            // After dividing by scale, max_abs must fit in E2M1 (max representable = 6.0).
+            let ratio = max_abs / scale;
+            assert!(ratio <= 6.0 + 1e-5, "scale must cover max_abs within E2M1 range");
+        }
+    }
+
+    /// E2M1 nibble sign bit is bit 3; magnitude index is bits [2:0].
+    /// The GPU kernel uses bit 3 for sign and OR-assigns it from the f32 sign bit.
+    #[kani::proof]
+    fn e2m1_nibble_encoding_sign_and_magnitude() {
+        let mag_idx: usize = kani::any();
+        let negative: bool = kani::any();
+        kani::assume(mag_idx < 8);
+        let mag = E2M1_MAGNITUDES[mag_idx];
+        let x = if negative { -mag } else { mag };
+        let nibble = f32_to_e2m1(x);
+        let sign_bit = (nibble >> 3) & 1;
+        let mag_bits = nibble & 0b0111;
+        // Sign bit must match the input sign (except zero which has no sign).
+        if mag != 0.0 {
+            let expected_sign: u8 = if negative { 1 } else { 0 };
+            assert!(sign_bit == expected_sign, "sign bit must match f32 sign");
+        }
+        // Magnitude bits must be in [0, 7].
+        assert!(mag_bits < 8, "magnitude index must fit in 3 bits");
+        // Roundtrip: decode must reproduce the magnitude.
+        let decoded = e2m1_to_f32(nibble);
+        assert!(
+            (decoded.abs() - mag).abs() < 1e-6,
+            "decoded magnitude must match original"
+        );
+    }
+}

@@ -66,6 +66,8 @@ pub mod moe;
 pub mod mxfp4;
 #[cfg(feature = "cutile")]
 pub mod mxfp4_dispatch;
+#[cfg(feature = "cutile")]
+pub mod mxfp4_quant_ptx;
 #[cfg(any(feature = "npu-intel", feature = "npu-qualcomm"))]
 pub mod npu;
 #[cfg(feature = "openmp")]
