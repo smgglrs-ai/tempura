@@ -344,6 +344,7 @@ pub struct QuantizedWeights {
     mmap_i2s: HashMap<String, (usize, usize)>,
     mmap_f16: HashMap<String, (usize, usize)>,
     mmap_bf16: HashMap<String, (usize, usize)>,
+    bf16_vecs: HashMap<String, Vec<u8>>,
     mmap_q4k: HashMap<String, (usize, usize)>,
     mmap_q6k: HashMap<String, (usize, usize)>,
     mmap_q2: HashMap<String, (usize, usize)>,
@@ -374,6 +375,7 @@ impl QuantizedWeights {
             mmap_i2s: HashMap::new(),
             mmap_f16: HashMap::new(),
             mmap_bf16: HashMap::new(),
+            bf16_vecs: HashMap::new(),
             mmap_q4k: HashMap::new(),
             mmap_q6k: HashMap::new(),
             mmap_q2: HashMap::new(),
@@ -405,6 +407,7 @@ impl QuantizedWeights {
             mmap_i2s: HashMap::new(),
             mmap_f16: HashMap::new(),
             mmap_bf16: HashMap::new(),
+            bf16_vecs: HashMap::new(),
             mmap_q4k: HashMap::new(),
             mmap_q6k: HashMap::new(),
             mmap_q2: HashMap::new(),
@@ -454,6 +457,7 @@ impl QuantizedWeights {
             mmap_i2s: HashMap::new(),
             mmap_f16: HashMap::new(),
             mmap_bf16: HashMap::new(),
+            bf16_vecs: HashMap::new(),
             mmap_q4k: HashMap::new(),
             mmap_q6k: HashMap::new(),
             mmap_q2: HashMap::new(),
@@ -479,6 +483,7 @@ impl QuantizedWeights {
             mmap_i2s: HashMap::new(),
             mmap_f16: HashMap::new(),
             mmap_bf16: HashMap::new(),
+            bf16_vecs: HashMap::new(),
             mmap_q4k: HashMap::new(),
             mmap_q6k: HashMap::new(),
             mmap_q2: HashMap::new(),
@@ -660,7 +665,14 @@ impl QuantizedWeights {
         self.mmap_bf16.insert(name, (offset, len));
     }
 
+    pub fn insert_bf16(&mut self, name: String, data: Vec<u8>) {
+        self.bf16_vecs.insert(name, data);
+    }
+
     pub fn get_bf16(&self, name: &str) -> Option<&[u8]> {
+        if let Some(v) = self.bf16_vecs.get(name) {
+            return Some(v.as_slice());
+        }
         self.mmap_bf16
             .get(name)
             .and_then(|&(off, len)| self.mmap.as_ref().map(|m| &m[off..off + len]))
@@ -720,6 +732,7 @@ impl QuantizedWeights {
         self.f16_tensors.retain(|k, _| keep.contains(k.as_str()));
         self.f32_tensors.retain(|k, _| keep.contains(k.as_str()));
         self.typed_tensors.retain(|k, _| keep.contains(k.as_str()));
+        self.bf16_vecs.retain(|k, _| keep.contains(k.as_str()));
         self.mmap_i2s.retain(|k, _| keep.contains(k.as_str()));
         self.mmap_f16.retain(|k, _| keep.contains(k.as_str()));
         self.mmap_q4k.retain(|k, _| keep.contains(k.as_str()));
@@ -965,6 +978,82 @@ impl QuantizedWeights {
             return Some(PreIndexedWeight::F32(w));
         }
         None
+    }
+
+    /// Load a Llama-style HuggingFace BF16 safetensors directory into QuantizedWeights.
+    ///
+    /// Projection weights (q/k/v/o/gate/up/down) are stored as raw BF16 bytes in
+    /// `bf16_vecs` so `maybe_upload_mxfp4_tiled_from_bf16` can convert them directly.
+    /// All other tensors (norms, embeddings, lm_head) are converted to f32.
+    ///
+    /// Shards are processed one at a time to bound peak CPU RAM usage.
+    pub fn from_safetensors_bf16_dir(
+        dir: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        use safetensors::SafeTensors;
+
+        fn bf16_bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
+            bytes
+                .chunks_exact(2)
+                .map(|c| {
+                    let bits = u16::from_le_bytes([c[0], c[1]]);
+                    // BF16 -> f32: shift mantissa into high half.
+                    f32::from_bits((bits as u32) << 16)
+                })
+                .collect()
+        }
+
+        fn is_projection(name: &str) -> bool {
+            (name.contains(".self_attn.") || name.contains(".mlp."))
+                && name.ends_with("_proj.weight")
+        }
+
+        let mut shard_paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "safetensors"))
+            .collect();
+        shard_paths.sort();
+
+        if shard_paths.is_empty() {
+            return Err("no .safetensors files found in directory".into());
+        }
+
+        let mut qw = Self::empty();
+
+        for shard_path in &shard_paths {
+            eprintln!("[safetensors] loading shard {:?}", shard_path.file_name().unwrap());
+            let bytes = std::fs::read(shard_path)?;
+            let st = SafeTensors::deserialize(&bytes)?;
+            for (name, view) in st.tensors() {
+                let data = view.data();
+                let dtype = view.dtype();
+                if is_projection(&name) && dtype == safetensors::Dtype::BF16 {
+                    qw.insert_bf16(name.to_string(), data.to_vec());
+                } else {
+                    let f32_data = match dtype {
+                        safetensors::Dtype::BF16 => bf16_bytes_to_f32_vec(data),
+                        safetensors::Dtype::F32 => data
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect(),
+                        safetensors::Dtype::F16 => data
+                            .chunks_exact(2)
+                            .map(|c| f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                            .collect(),
+                        _ => continue,
+                    };
+                    qw.insert_f32(name.to_string(), f32_data);
+                }
+            }
+        }
+
+        eprintln!(
+            "[safetensors] loaded {} BF16 projection tensors, {} f32 tensors",
+            qw.bf16_vecs.len(),
+            qw.f32_tensors.len()
+        );
+        Ok(qw)
     }
 }
 

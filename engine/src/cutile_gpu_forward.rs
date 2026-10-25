@@ -4970,10 +4970,14 @@ impl CutileGpuModel {
         let stream     = self.matmul.stream();
         let cu_stream  = stream.cu_stream();
 
-        let oxide = match self.oxide_q4k_gemv.as_ref() {
-            Some(o) if o.has_streamk_batch() || o.has_mma_batch() || o.has_sm120_batch() => o,
-            _ => panic!("forward_batch_decode_inner_graph: oxide Q4K sm120 batch required"),
-        };
+        // oxide_q4k batch is required for Q4K projection paths but not for all-MXFP4 models.
+        // When use_mxfp4=true and all projections are MXFP4, oxide is never called.
+        let oxide = self.oxide_q4k_gemv.as_ref().filter(|o| {
+            o.has_streamk_batch() || o.has_mma_batch() || o.has_sm120_batch()
+        });
+        if oxide.is_none() && !use_mxfp4 {
+            panic!("forward_batch_decode_inner_graph: oxide Q4K sm120 batch required for non-MXFP4 path");
+        }
 
         // Shared write offset (same for all M sequences -- synchronised batch).
         let write_off_ptr = self.d_kv_write_offset.device_pointer().cu_deviceptr();
@@ -5029,22 +5033,24 @@ impl CutileGpuModel {
             let normed1_flat: Arc<Tensor<f32>> = normed1;
 
             // -- Q / K / V batch GEMM (MMA tensor-core preferred, dp4a fallback) -
+            // gemv_q4k_h is only called when the weight is Q4K; oxide must be Some then.
             let gemv_q4k_h = |a: &Arc<Tensor<f32>>, wname: &str, out: &Arc<Tensor<f32>>,
                                n: usize, k_blocks: usize| {
                 let dw = self.device_weights_q4k.get(wname)
                     .unwrap_or_else(|| panic!("batch inner: Q4K weight {wname} missing"));
-                if oxide.has_streamk_batch() {
-                    oxide.forward_streamk_batch_d2d_into(
+                let ox = oxide.unwrap_or_else(|| panic!("batch inner: oxide Q4K required for Q4K path"));
+                if ox.has_streamk_batch() {
+                    ox.forward_streamk_batch_d2d_into(
                         a, &dw.tensor, m, n, k_blocks,
                         &self.batch_q8_qs_h, &self.batch_q8_ds_h, out,
                     ).unwrap_or_else(|e| panic!("batch inner stream-K GEMM {wname}: {e}"));
-                } else if oxide.has_mma_batch() {
-                    oxide.forward_mma_batch_d2d_into(
+                } else if ox.has_mma_batch() {
+                    ox.forward_mma_batch_d2d_into(
                         a, &dw.tensor, m, n, k_blocks,
                         &self.batch_q8_qs_h, &self.batch_q8_ds_h, out,
                     ).unwrap_or_else(|e| panic!("batch inner MMA GEMM {wname}: {e}"));
                 } else {
-                    oxide.forward_sm120_batch_d2d_into(
+                    ox.forward_sm120_batch_d2d_into(
                         a, &dw.tensor, m, n, k_blocks,
                         &self.batch_q8_qs_h, &self.batch_q8_ds_h, out,
                     ).unwrap_or_else(|e| panic!("batch inner GEMV {wname}: {e}"));
@@ -5052,12 +5058,17 @@ impl CutileGpuModel {
             };
 
             // Trim normed1 to compact [m * k] if h_pad != k (k = hidden_size for Q/K/V).
-            let dw_q = self.device_weights_q4k.get(qw.as_str())
-                .expect("q_proj weight missing");
-            let dw_k = self.device_weights_q4k.get(kw.as_str())
-                .expect("k_proj weight missing");
+            // dw_q/dw_k are None for all-MXFP4 models (BF16 safetensors); k_h from MXFP4 then.
+            let dw_q = self.device_weights_q4k.get(qw.as_str());
+            let dw_k = self.device_weights_q4k.get(kw.as_str());
 
-            let k_h = dw_q.k_blocks * 256; // hidden_size
+            let k_h = if let Some(dw) = dw_q.as_ref() {
+                dw.k_blocks * 256
+            } else if let Some(dw_mx) = self.device_weights_mxfp4_tiled.get(qw.as_str()) {
+                dw_mx.k
+            } else {
+                panic!("batch inner: q_proj weight {qw} missing from Q4K and MXFP4");
+            };
             let act_h = if self.h_pad == k_h {
                 normed1_flat.clone()
             } else {
@@ -5117,9 +5128,52 @@ impl CutileGpuModel {
                 true
             };
 
-            // V projection: Q4K batch GEMV or Q6K sequential per-seq GEMVs.
-            // V is Q6K in Q4_K_M models -- always falls back from MXFP4 path.
-            if let Some(dw_v) = self.device_weights_q4k.get(vw.as_str()) {
+            // V projection: MXFP4 / Q4K batch GEMV / Q6K sequential GEMVs.
+            // BF16 (all-MXFP4) models have V in device_weights_mxfp4_tiled.
+            // Q4_K_M models have V as Q6K; MXFP4 check first.
+            if mxfp4_active && self.device_weights_mxfp4_tiled.contains_key(vw.as_str()) {
+                // MXFP4 V: reuse already-quantized h-width activation (same packed/scales as Q/K).
+                let mxfp4  = self.mxfp4_gemm.as_ref().unwrap();
+                let packed  = self.mxfp4_act_packed.as_ref().unwrap();
+                let scales  = self.mxfp4_act_scales.as_ref().unwrap();
+                if !h_act_quantized {
+                    let k_h_pad64 = ((k_h + 63) & !63) as u32;
+                    // Ensure batch_normed1 has valid data for all 16 rows.
+                    let act_ptr   = act_h.device_pointer().cu_deviceptr();
+                    let norm1_ptr = self.batch_normed1.device_pointer().cu_deviceptr();
+                    if act_ptr != norm1_ptr {
+                        for r in 0..m {
+                            unsafe {
+                                cuda_core::memcpy_dtod_async::<f32>(
+                                    norm1_ptr + (r * k_h * 4) as u64,
+                                    act_ptr   + (r * k_h * 4) as u64,
+                                    k_h, stream,
+                                ).expect("mxfp4 V: normed1 -> batch_normed1");
+                            }
+                        }
+                    }
+                    mxfp4.quantize_activation(
+                        &self.batch_normed1, packed, scales,
+                        mxfp4_m_pad, k_h_pad64, cu_stream,
+                    ).unwrap_or_else(|e| panic!("mxfp4 V quant L{layer}: {e}"));
+                }
+                let dw_v_mx = self.device_weights_mxfp4_tiled.get(vw.as_str()).unwrap();
+                mxfp4.forward(
+                    packed, scales,
+                    &dw_v_mx.packed, &dw_v_mx.tiled_scales,
+                    &self.batch_gemv_v,
+                    mxfp4_m_pad, dw_v_mx.n as u32, (dw_v_mx.k / 64) as u32,
+                ).unwrap_or_else(|e| panic!("mxfp4 V L{layer}: {e}"));
+                for r in 0..m {
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            self.batch_v_seqs[r].device_pointer().cu_deviceptr(),
+                            self.batch_gemv_v.device_pointer().cu_deviceptr() + (r * kv_dim * 4) as u64,
+                            kv_dim, stream,
+                        ).expect("batch inner: v_seqs MXFP4 slice");
+                    }
+                }
+            } else if let Some(dw_v) = self.device_weights_q4k.get(vw.as_str()) {
                 gemv_q4k_h(&act_h, vw, &self.batch_gemv_v, dw_v.n, dw_v.k_blocks);
                 for r in 0..m {
                     unsafe {
@@ -5153,7 +5207,7 @@ impl CutileGpuModel {
                     }
                 }
             } else {
-                panic!("batch inner: v_proj {} not in Q4K or Q6K maps", vw);
+                panic!("batch inner: v_proj {} not in MXFP4, Q4K, or Q6K maps", vw);
             }
 
             // Q projection: MXFP4 tensor-core or Q4K stream-K.
@@ -5168,8 +5222,10 @@ impl CutileGpuModel {
                     &self.batch_gemv_q,
                     mxfp4_m_pad, dw_q_mx.n as u32, (dw_q_mx.k / 64) as u32,
                 ).unwrap_or_else(|e| panic!("mxfp4 Q L{layer}: {e}"));
+            } else if let Some(dq) = dw_q.as_ref() {
+                gemv_q4k_h(&act_h, qw, &self.batch_gemv_q, dq.n, dq.k_blocks);
             } else {
-                gemv_q4k_h(&act_h, qw, &self.batch_gemv_q, dw_q.n, dw_q.k_blocks);
+                panic!("batch inner: q_proj {qw} not in MXFP4 or Q4K");
             }
 
             // K projection: MXFP4 tensor-core or Q4K stream-K.
@@ -5184,8 +5240,10 @@ impl CutileGpuModel {
                     &self.batch_gemv_k,
                     mxfp4_m_pad, dw_k_mx.n as u32, (dw_k_mx.k / 64) as u32,
                 ).unwrap_or_else(|e| panic!("mxfp4 K L{layer}: {e}"));
+            } else if let Some(dk) = dw_k.as_ref() {
+                gemv_q4k_h(&act_h, kw, &self.batch_gemv_k, dk.n, dk.k_blocks);
             } else {
-                gemv_q4k_h(&act_h, kw, &self.batch_gemv_k, dw_k.n, dw_k.k_blocks);
+                panic!("batch inner: k_proj {kw} not in MXFP4 or Q4K");
             }
 
             // -- Per-sequence D->D slice, RoPE, and stable copy -----------------
@@ -5360,8 +5418,14 @@ impl CutileGpuModel {
             }
 
             // -- O-projection dispatch -----------------------------------------
-            let dw_o = self.device_weights_q4k.get(ow.as_str()).expect("o_proj weight");
-            let k_o = dw_o.k_blocks * 256; // = q_dim
+            let dw_o = self.device_weights_q4k.get(ow.as_str());
+            let k_o = if let Some(dw) = dw_o.as_ref() {
+                dw.k_blocks * 256
+            } else if let Some(dw_mx) = self.device_weights_mxfp4_tiled.get(ow.as_str()) {
+                dw_mx.k
+            } else {
+                q_dim // fallback: q_dim is the input width for o_proj
+            };
             // MXFP4 path: quantize batch_oproj_in [mb * q_pad] (rows 0..m valid),
             // then tensor-core GEMM. Requires q_pad == k_o (no stride gap); if not,
             // fall back to Q4K compact path.
@@ -5403,7 +5467,11 @@ impl CutileGpuModel {
                     }
                     compact
                 };
-                gemv_q4k_h(&act_o, ow, &self.batch_gemv_o, dw_o.n, dw_o.k_blocks);
+                if let Some(dw) = dw_o.as_ref() {
+                    gemv_q4k_h(&act_o, ow, &self.batch_gemv_o, dw.n, dw.k_blocks);
+                } else {
+                    panic!("batch inner: o_proj {ow} not in MXFP4 or Q4K");
+                }
             }
 
             // -- Post-attention residual add ------------------------------------
@@ -5423,8 +5491,14 @@ impl CutileGpuModel {
                 .expect("batch post-attn RMSNorm");
 
             // Compact normed2 for gate/up GEMV (same k as Q/K/V).
-            let dw_gate = self.device_weights_q4k.get(gate_w.as_str()).expect("gate_proj");
-            let k_g = dw_gate.k_blocks * 256;
+            let dw_gate = self.device_weights_q4k.get(gate_w.as_str());
+            let k_g = if let Some(dw) = dw_gate.as_ref() {
+                dw.k_blocks * 256
+            } else if let Some(dw_mx) = self.device_weights_mxfp4_tiled.get(gate_w.as_str()) {
+                dw_mx.k
+            } else {
+                h // fallback: gate uses hidden_size input
+            };
             let act_g = if self.h_pad == k_g {
                 normed2.clone()
             } else {
@@ -5442,7 +5516,7 @@ impl CutileGpuModel {
             };
 
             // -- gate/up dispatch -----------------------------------------------
-            let dw_up = self.device_weights_q4k.get(up_w.as_str()).expect("up_proj");
+            let dw_up = self.device_weights_q4k.get(up_w.as_str());
             let use_mxfp4_gateup = mxfp4_active
                 && self.device_weights_mxfp4_tiled.contains_key(gate_w.as_str())
                 && self.device_weights_mxfp4_tiled.contains_key(up_w.as_str());
@@ -5485,9 +5559,11 @@ impl CutileGpuModel {
                     &self.batch_gemv_up,
                     mxfp4_m_pad, dw_up_mx.n as u32, (dw_up_mx.k / 64) as u32,
                 ).unwrap_or_else(|e| panic!("mxfp4 up L{layer}: {e}"));
+            } else if let (Some(dg), Some(du)) = (dw_gate.as_ref(), dw_up.as_ref()) {
+                gemv_q4k_h(&act_g, gate_w, &self.batch_gemv_gate, dg.n, dg.k_blocks);
+                gemv_q4k_h(&act_g, up_w,   &self.batch_gemv_up,   du.n, du.k_blocks);
             } else {
-                gemv_q4k_h(&act_g, gate_w, &self.batch_gemv_gate, dw_gate.n, dw_gate.k_blocks);
-                gemv_q4k_h(&act_g, up_w,   &self.batch_gemv_up,   dw_up.n,   dw_up.k_blocks);
+                panic!("batch inner: gate/up proj not in MXFP4 or Q4K for layer {layer}");
             }
 
             // -- SiLU(gate) x up -----------------------------------------------
@@ -5539,18 +5615,19 @@ impl CutileGpuModel {
                 } else {
                     silu_out
                 };
-                if oxide.has_streamk_batch() {
-                    oxide.forward_streamk_batch_d2d_into(
+                let ox_down = oxide.expect("batch inner: oxide Q4K required for Q4K down path");
+                if ox_down.has_streamk_batch() {
+                    ox_down.forward_streamk_batch_d2d_into(
                         &act_down, &dw_down.tensor, m, dw_down.n, dw_down.k_blocks,
                         &self.batch_q8_qs_i, &self.batch_q8_ds_i, &self.batch_gemv_down,
                     ).expect("batch inner: down Q4K stream-K GEMM");
-                } else if oxide.has_mma_batch() {
-                    oxide.forward_mma_batch_d2d_into(
+                } else if ox_down.has_mma_batch() {
+                    ox_down.forward_mma_batch_d2d_into(
                         &act_down, &dw_down.tensor, m, dw_down.n, dw_down.k_blocks,
                         &self.batch_q8_qs_i, &self.batch_q8_ds_i, &self.batch_gemv_down,
                     ).expect("batch inner: down Q4K MMA GEMM");
                 } else {
-                    oxide.forward_sm120_batch_d2d_into(
+                    ox_down.forward_sm120_batch_d2d_into(
                         &act_down, &dw_down.tensor, m, dw_down.n, dw_down.k_blocks,
                         &self.batch_q8_qs_i, &self.batch_q8_ds_i, &self.batch_gemv_down,
                     ).expect("batch inner: down Q4K GEMV");
@@ -6232,13 +6309,16 @@ impl CutileGpuModel {
         // Batch graph only for M >= 2 (M=1 uses the single-seq graph via forward()).
         // All M sequences must have the same position (synchronised batch decode).
         // All projection weights must be Q4K (checked once at model load time).
-        let can_graph = m >= 2
-            && m <= self.max_batch_graph
-            && kv_caches.iter().all(|kvc| kvc.has_device_kv())
-            && !cfg.use_alibi
+        let positions_equal = positions.windows(2).all(|w| w[0] == w[1]);
+        let kv_all_device  = kv_caches.iter().all(|kvc| kvc.has_device_kv());
+        let base_ok = m >= 2 && m <= self.max_batch_graph && kv_all_device && !cfg.use_alibi && positions_equal;
+        // Q4K dp4a/sm120 batch graph: requires oxide Q4K batch kernel.
+        let can_q4k_graph = base_ok
             && self.all_proj_q4k
-            && self.oxide_q4k_gemv.as_ref().map(|o| o.has_streamk_batch() || o.has_mma_batch() || o.has_sm120_batch()).unwrap_or(false)
-            && positions.windows(2).all(|w| w[0] == w[1]);
+            && self.oxide_q4k_gemv.as_ref().map(|o| o.has_streamk_batch() || o.has_mma_batch() || o.has_sm120_batch()).unwrap_or(false);
+        // MXFP4 tensor-core batch graph: Q/K/O/gate/up in MXFP4 tiled; no Q4K batch kernel needed.
+        let can_mxfp4_graph = base_ok && self.mxfp4_eligible_for_batch_graph();
+        let can_graph = can_q4k_graph || can_mxfp4_graph;
 
         if can_graph {
             let embeddings: Vec<Vec<f32>> = (0..m)

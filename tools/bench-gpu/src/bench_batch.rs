@@ -13,8 +13,10 @@
 use std::path::Path;
 use std::time::Instant;
 
+use tempura_engine::config::ModelConfig;
 use tempura_engine::gguf_loader::GgufLoader;
 use tempura_engine::model::CutileInferenceWrapper;
+use tempura_engine::weights::QuantizedWeights;
 
 const WARMUP_STEPS: usize = 10;
 const BENCH_STEPS:  usize = 50;
@@ -68,9 +70,22 @@ fn main() {
 
     println!("Loading model...");
     let t0 = Instant::now();
-    let loader = GgufLoader::from_file_quantized(Path::new(&model_path))
-        .expect("failed to open GGUF");
-    let mut config = loader.config.clone();
+    let model_p = Path::new(&model_path);
+    let (mut config, qw) = if model_p.is_dir() {
+        // BF16 safetensors directory: load config.json + raw BF16 weights.
+        let config_path = model_p.join("config.json");
+        let cfg = ModelConfig::from_hf_config(&config_path)
+            .expect("failed to read config.json");
+        let qw = QuantizedWeights::from_safetensors_bf16_dir(model_p)
+            .expect("failed to load safetensors");
+        (cfg, qw)
+    } else {
+        let loader = GgufLoader::from_file_quantized(model_p)
+            .expect("failed to open GGUF");
+        let cfg = loader.config.clone();
+        let qw = loader.to_quantized_weights();
+        (cfg, qw)
+    };
     // Allow overriding max_seq_len via env var so large models fit in VRAM during bench.
     // Default: keep model's native max_seq_len for standard models, cap at 8192 for 27B+.
     if let Ok(s) = std::env::var("TEMPURA_BENCH_MAX_SEQ_LEN") {
@@ -80,7 +95,6 @@ fn main() {
             config.max_seq_len = cap;
         }
     }
-    let qw = loader.to_quantized_weights();
     let mut wrapper = CutileInferenceWrapper::new(config);
     wrapper.load_quantized(qw);
     println!("  Loaded in {:.2}s\n", t0.elapsed().as_secs_f64());
@@ -99,9 +113,16 @@ fn main() {
     };
     println!("  MXFP4 dispatch: {mxfp4_info}");
 
+    // For MXFP4-only models (BF16 safetensors), M=1 non-graph path has no MXFP4 dispatch yet.
+    // M>=2 uses the MXFP4 CUDA graph path which is fully supported.
+    let mxfp4_only = wrapper.mxfp4_tiled_count() > 0 && !model_p.is_file();
     for &batch in &[1usize, 2, 4, 5, 8, 16] {
         if batch > wrapper.max_batch_graph() {
             println!("  {:>6}  (exceeds max_batch_graph={})", batch, wrapper.max_batch_graph());
+            continue;
+        }
+        if mxfp4_only && batch == 1 {
+            println!("  {:>6}  (skipped: M=1 non-graph path has no MXFP4 dispatch; use M>=2)", batch);
             continue;
         }
         let tok_s = bench_batch(&wrapper, batch);
