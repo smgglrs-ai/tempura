@@ -17,10 +17,15 @@ toc = true
 
 ```sh
 cargo build              # build all crates
-cargo test               # run all tests (~580 total)
+cargo test               # run all tests (907 total, 26 ignored)
 ```
 
-> **Note:** `cargo test` requires the oxide PTX files to exist. These are built separately via `cargo oxide build` in `tools/oxide-gemv*/`. Without them the `tempura-kernels` crate will fail to compile. ~270 tests from the other packages (`engine`, `server`, `model`, etc.) run without PTX.
+> **Note:** `cargo test` compiles `tempura-kernels` with the `oxide-gemv`
+> feature (feature unification via `tools/bench-gpu`), so the oxide GEMV PTX
+> must exist in the kernels build out dirs — build them with
+> `cargo oxide build` in `tools/oxide-gemv*/` (or, from the laptop,
+> `scripts/fishtank.sh oxide`). Without them `tempura-kernels` fails to
+> compile; tests from the other packages still run.
 
 ## Run
 
@@ -57,7 +62,7 @@ export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codeg
 
 # Build oxide GEMV kernels
 cd /path/to/tempura
-for crate in oxide-gemv oxide-gemv-q4k oxide-gemv-q6k; do
+for crate in oxide-gemv oxide-gemv-q4k oxide-gemv-q6k oxide-decode-attn; do
   cd tools/$crate && cargo oxide build && cd ../..
 done
 
@@ -65,9 +70,9 @@ done
 cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
   --bin bench-real-model -- ~/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
 
-# Batch decode benchmark (M=8, RTX 5090: 417 tok/s aggregate)
+# Batch decode benchmark (M=1..16 in one run; RTX 5090: 417 tok/s aggregate at M=8)
 cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
-  --bin bench-batch-decode -- ~/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf --batch 8
+  --bin bench-batch -- ~/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
 ```
 
 ## MXFP4 pipeline (sm_120a / RTX 5090)

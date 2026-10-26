@@ -63,7 +63,7 @@ cargo run -- serve --model /path/to/model.gguf --port 8080
 ```sh
 # Build oxide GEMV kernels
 export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
-for crate in oxide-gemv oxide-gemv-q4k oxide-gemv-q6k; do
+for crate in oxide-gemv oxide-gemv-q4k oxide-gemv-q6k oxide-decode-attn; do
   cd tools/$crate && cargo oxide build && cd ../..
 done
 
@@ -71,15 +71,18 @@ done
 cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
   --bin bench-real-model -- ~/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
 
-# Benchmark batch decode (M=8)
+# Benchmark batch decode (benches M=1,2,4,5,8,16 in one run)
 cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
-  --bin bench-batch-decode -- ~/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf --batch 8
+  --bin bench-batch -- ~/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
 ```
+
+When the GPU lives on another machine, `scripts/fishtank.sh` drives the whole
+loop over SSH (sync → oxide build → bench → pull results) — see AGENTS.md.
 
 ## Formal Verification
 
 ```sh
-cargo test                            # 864 test functions
+cargo test                            # 907 test functions
 cargo kani --package tempura-kernels  # 240 bounded harnesses
 ./scripts/run-verus.sh               # 588 Verus proof functions, 80 modules
 ```

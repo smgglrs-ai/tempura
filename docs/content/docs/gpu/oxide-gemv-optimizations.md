@@ -78,7 +78,7 @@ The `q4k_unpack_scales` function in `kernels/src/cutile_quantized_gemm.rs` alrea
 
 **Problem**: Each warp makes a complete pass through `x[]` to compute ONE output neuron. Adjacent output neurons read the same activation — if they shared the pass, we'd get 2× arithmetic intensity for the same bandwidth cost.
 
-**Fix** in `tools/oxide-gemv-q2k/src/main.rs` (and Q4K/Q6K):
+**Fix** in `tools/oxide-gemv/src/main.rs` (and Q4K/Q6K):
 
 ```rust
 // Split warp: lanes 0-15 → output n, lanes 16-31 → output n+1
@@ -331,7 +331,7 @@ MXFP4 batch at M>=32:
 export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
 WDIR=/home/fdupont/Code/github.com/smgglrs-ai/tempura
 
-for crate in oxide-gemv oxide-gemv-q4k oxide-gemv-q6k; do
+for crate in oxide-gemv oxide-gemv-q4k oxide-gemv-q6k oxide-decode-attn; do
   cd $WDIR/tools/$crate && cargo oxide build && cd ../..
 done
 
