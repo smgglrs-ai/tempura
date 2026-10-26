@@ -1,6 +1,7 @@
 #!/bin/bash
 # Two-machine workflow: edit/verify/commit on the laptop, build+benchmark on
-# the GPU host (fishtank.home.local, RTX 5090) over passwordless SSH.
+# the remote GPU host (default fishtank.home.local, RTX 5090) over
+# passwordless SSH.
 #
 # Source code moves between the machines ONLY through git origin -- never
 # rsync target/, .oxide-artifacts/ or model files.
@@ -8,27 +9,30 @@
 # Commands:
 #   status                   pre-flight: GPU/RAM/instances/tmux/git both ends
 #   models                   list GGUF models in the remote cache
-#   sync [--wip]             push this repo, pull on fishtank (same branch)
+#   sync [--wip]             push this repo, pull on the remote host (same
+#                               branch)
 #                               --wip: snapshot uncommitted work (tracked +
 #                               untracked, .gitignore honored) onto the
 #                               branch wip/<hostname> without local commits
 #   bench [--no-sync] BIN [args...]
 #                            sync, then build+run tools/bench-gpu BIN on
-#                            fishtank inside tmux. A bare arg matching a
-#                            filename in the remote model cache is rewritten
-#                            to its full path. PTX is re-copied after build.
-#   run 'shell command'      run an arbitrary command on fishtank in tmux
-#   oxide                    cargo oxide build all GEMV/attn crates on
-#                            fishtank + copy PTX into build dirs
+#                            the remote host inside tmux. A bare arg
+#                            matching a filename in the remote model cache
+#                            is rewritten to its full path. PTX is
+#                            re-copied after build.
+#   run 'shell command'      run an arbitrary command on the remote host
+#                            in tmux
+#   oxide                    cargo oxide build all GEMV/attn crates on the
+#                            remote host + copy PTX into build dirs
 #   watch                    attach to the remote tmux session
 #   log [N]                  tail newest remote run log (default 30 lines)
 #   results                  pull bench-*.json + newest log into this repo
 #   stop                     kill the remote tmux session
 #
 # Environment overrides:
-#   FISHTANK_HOST (fishtank.home.local)   FISHTANK_SESSION (fishtank)
-#   FISHTANK_GPU_BUSY_MB (1500)           FISHTANK_GPU_BUSY_UTIL (10)
-#   FISHTANK_ALLOW_PROCS (unset)          skip the no-other-instances check
+#   GPU_REMOTE_HOST (fishtank.home.local)  GPU_REMOTE_SESSION (gpu-remote)
+#   GPU_REMOTE_BUSY_MB (1500)              GPU_REMOTE_BUSY_UTIL (10)
+#   GPU_REMOTE_ALLOW_PROCS (unset)         skip the no-other-instances check
 #                                         (e.g. known idle CPU-mode servers)
 
 set -euo pipefail
@@ -38,15 +42,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-HOST="${FISHTANK_HOST:-fishtank.home.local}"
-SESSION="${FISHTANK_SESSION:-fishtank}"
-GPU_BUSY_MB="${FISHTANK_GPU_BUSY_MB:-1500}"
-GPU_BUSY_UTIL="${FISHTANK_GPU_BUSY_UTIL:-10}"
+HOST="${GPU_REMOTE_HOST:-fishtank.home.local}"
+SESSION="${GPU_REMOTE_SESSION:-gpu-remote}"
+GPU_BUSY_MB="${GPU_REMOTE_BUSY_MB:-1500}"
+GPU_BUSY_UTIL="${GPU_REMOTE_BUSY_UTIL:-10}"
 
 # Single-quoted on purpose: $HOME must expand on the remote host.
 REMOTE_REPO='$HOME/Code/github.com/smgglrs-ai/tempura'
 REMOTE_MODELS='$HOME/.cache/tempura/models'
-REMOTE_RUNDIR='$HOME/.cache/tempura/fishtank'
+REMOTE_RUNDIR='$HOME/.cache/tempura/gpu-remote'
 
 SSH="ssh -o BatchMode=yes"
 
@@ -70,10 +74,10 @@ preflight() {
     if [ "$util" -gt "$GPU_BUSY_UTIL" ]; then
         die "GPU on $HOST is busy (${util}% utilization)"
     fi
-    if [ -z "${FISHTANK_ALLOW_PROCS:-}" ] && $SSH "$HOST" "pgrep -f '[t]empura|[b]ench-' >/dev/null"; then
+    if [ -z "${GPU_REMOTE_ALLOW_PROCS:-}" ] && $SSH "$HOST" "pgrep -f '[t]empura|[b]ench-' >/dev/null"; then
         echo "tempura/bench processes already running on $HOST:" >&2
         $SSH "$HOST" "pgrep -af '[t]empura|[b]ench-'" | grep -v 'bash -c' >&2 || true
-        die "never run multiple instances (AGENTS.md) -- set FISHTANK_ALLOW_PROCS=1 to override (e.g. known idle CPU-mode servers)"
+        die "never run multiple instances (AGENTS.md) -- set GPU_REMOTE_ALLOW_PROCS=1 to override (e.g. known idle CPU-mode servers)"
     fi
     if $SSH "$HOST" "tmux has-session -t $SESSION 2>/dev/null"; then
         die "tmux session '$SESSION' already exists on $HOST -- use watch/log/results, or stop it first"
@@ -101,7 +105,7 @@ if cd "$HOME/Code/github.com/smgglrs-ai/tempura" 2>/dev/null; then
 else
     echo "git:    no clone"
 fi
-log=$(ls -t "$HOME/.cache/tempura/fishtank"/*.log 2>/dev/null | head -1)
+log=$(ls -t "$HOME/.cache/tempura/gpu-remote"/*.log 2>/dev/null | head -1)
 if [ -n "$log" ]; then
     echo "log:    $log"
     tail -n 3 "$log" | sed "s/^/          /"
@@ -137,7 +141,7 @@ cmd_sync() {
         commit=$(git commit-tree "$tree" -p HEAD -m "wip: $(hostname -s) $(date -u +%FT%TZ)")
         git push --force origin "$commit:refs/heads/$wip_branch"
         $SSH "$HOST" "cd $REMOTE_REPO && git fetch origin $wip_branch && git checkout -B $wip_branch FETCH_HEAD && git log --oneline -1"
-        echo "synced: wip snapshot -> $wip_branch (fishtank checked out on it)"
+        echo "synced: wip snapshot -> $wip_branch ($HOST checked out on it)"
         return
     fi
 
@@ -151,7 +155,7 @@ cmd_sync() {
         git push -u origin "$branch"
     fi
     $SSH "$HOST" "cd $REMOTE_REPO && git fetch origin && git checkout $branch && git pull --ff-only origin $branch && git log --oneline -1"
-    echo "synced: $branch (laptop -> origin -> fishtank)"
+    echo "synced: $branch (laptop -> origin -> $HOST)"
 }
 
 cmd_bench() {
@@ -159,7 +163,7 @@ cmd_bench() {
     if [ "${1:-}" = "--no-sync" ]; then nosync=1; shift; fi
     local bin="${1:-}"
     if [ -z "$bin" ]; then
-        die "usage: fishtank.sh bench [--no-sync] <bin> [args...] -- bins: $(ls tools/bench-gpu/src/bench_*.rs | xargs -n1 basename | sed 's/^bench_//;s/\.rs$//' | tr '\n' ' ') (bench- prefix optional)"
+        die "usage: gpu-remote.sh bench [--no-sync] <bin> [args...] -- bins: $(ls tools/bench-gpu/src/bench_*.rs | xargs -n1 basename | sed 's/^bench_//;s/\.rs$//' | tr '\n' ' ') (bench- prefix optional)"
     fi
     shift
     local bin_dashed="${bin//_/-}"
@@ -181,7 +185,7 @@ args=()
 for a in$args_q; do
     if [ -f "\$models/\$a" ]; then args+=("\$models/\$a"); else args+=("\$a"); fi
 done
-echo "=== fishtank bench: $bin_dashed \${args[*]:-} ==="
+echo "=== gpu-remote bench: $bin_dashed \${args[*]:-} ==="
 cargo build --manifest-path tools/bench-gpu/Cargo.toml --release --bin $bin_dashed || exit \$?
 # WHY: a rebuild lands tempura-kernels in a new fingerprinted out dir; the
 # oxide PTX must be copied there again or the loader silently falls back to
@@ -203,14 +207,14 @@ EOF
 )
     launch bench "$stamp" "$runner"
     echo "bench '$bin_dashed' running in tmux session '$SESSION' on $HOST"
-    echo "  scripts/fishtank.sh watch     # attach (Ctrl-b d to detach)"
-    echo "  scripts/fishtank.sh log       # tail the log"
-    echo "  scripts/fishtank.sh results   # pull bench-*.json + log when done"
-    echo "  scripts/fishtank.sh stop      # kill it"
+    echo "  scripts/gpu-remote.sh watch     # attach (Ctrl-b d to detach)"
+    echo "  scripts/gpu-remote.sh log       # tail the log"
+    echo "  scripts/gpu-remote.sh results   # pull bench-*.json + log when done"
+    echo "  scripts/gpu-remote.sh stop      # kill it"
 }
 
 cmd_run() {
-    [ $# -gt 0 ] || die "usage: fishtank.sh run '<shell command>'  (runs on $HOST in tmux, cwd = the repo)"
+    [ $# -gt 0 ] || die "usage: gpu-remote.sh run '<shell command>'  (runs on $HOST in tmux, cwd = the repo)"
     preflight
     local cmd="$*" stamp runner
     stamp=$(date +%Y%m%d-%H%M%S)
@@ -280,8 +284,8 @@ cmd_results() {
     if [ -n "${newest:-}" ]; then
         base=$(basename "$newest")
         $SSH "$HOST" "tar cf - -C $REMOTE_RUNDIR $base" | tar xf -
-        mv -f "$base" "tempura-fishtank-$base"
-        echo "log: $PROJECT_ROOT/tempura-fishtank-$base (gitignored)"
+        mv -f "$base" "tempura-gpu-remote-$base"
+        echo "log: $PROJECT_ROOT/tempura-gpu-remote-$base (gitignored)"
     fi
 }
 

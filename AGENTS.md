@@ -355,7 +355,7 @@ cargo run -- serve --model /path/to/model.gguf --port 8080
 
 Note: `cargo test` compiles `tempura-kernels` with the `oxide-gemv` feature
 (feature unification via tools/bench-gpu), so the oxide GEMV PTX must be
-present in the kernels build out dirs — `scripts/fishtank.sh oxide` or the
+present in the kernels build out dirs — `scripts/gpu-remote.sh oxide` or the
 manual copy loop in the GPU section provides them.
 
 Benchmarks: `tools/bench` (HTTP throughput, llama.cpp-bench-style pp/tg),
@@ -365,14 +365,14 @@ servers), `engine/benches` (custom `harness = false` timing benches, not
 criterion). Results in `bench-*.json` at root.
 
 Two-machine workflow: the RTX 5090 lives on `fishtank.home.local`
-(passwordless SSH); development happens on the laptop. `scripts/fishtank.sh`
-drives the GPU host: `status` (pre-flight — enforces the
-never-run-multiple-instances rule), `sync [--wip]` (source moves through git
-origin only; never `target/`, `.oxide-artifacts/` or models; `--wip` pushes
-a snapshot of uncommitted work as `wip/<hostname>`), `bench [--no-sync] BIN`
-(sync + tmux job + PTX re-copy after build), `run`, `oxide`, `watch`/
-`log`/`results`/`stop`. Remote run scripts and logs live in
-`~/.cache/tempura/fishtank/`, models in `~/.cache/tempura/models/` (a bare
+(passwordless SSH); development happens on the laptop. `scripts/gpu-remote.sh`
+drives the remote GPU host (any host: `GPU_REMOTE_HOST`): `status`
+(pre-flight — enforces the never-run-multiple-instances rule), `sync [--wip]`
+(source moves through git origin only; never `target/`, `.oxide-artifacts/`
+or models; `--wip` pushes a snapshot of uncommitted work as `wip/<hostname>`),
+`bench [--no-sync] BIN` (sync + tmux job + PTX re-copy after build), `run`,
+`oxide`, `watch`/`log`/`results`/`stop`. Remote run scripts and logs live in
+`~/.cache/tempura/gpu-remote/`, models in `~/.cache/tempura/models/` (a bare
 model filename passed to `bench` resolves there).
 
 ## GPU Kernels (cuda-oxide)
@@ -411,9 +411,9 @@ for d in target/release/build/tempura-kernels-*/out; do
   cp tools/oxide-decode-attn/oxide_decode_attn.ptx $d/oxide_decode_attn.ptx 2>/dev/null
 done
 
-# From the laptop, scripts/fishtank.sh runs all of this on fishtank:
-#   scripts/fishtank.sh oxide
-#   scripts/fishtank.sh bench real-model Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+# From the laptop, scripts/gpu-remote.sh runs all of this on the GPU host:
+#   scripts/gpu-remote.sh oxide
+#   scripts/gpu-remote.sh bench real-model Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
 
 # Benchmark (oxide-gemv feature already in tools/bench-gpu/Cargo.toml):
 cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \

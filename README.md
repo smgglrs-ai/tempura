@@ -76,7 +76,7 @@ cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
   --bin bench-batch -- ~/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
 ```
 
-When the GPU lives on another machine, `scripts/fishtank.sh` drives the whole
+When the GPU lives on another machine, `scripts/gpu-remote.sh` drives the whole
 loop over SSH (sync → oxide build → bench → pull results) — see AGENTS.md.
 
 ## Formal Verification
