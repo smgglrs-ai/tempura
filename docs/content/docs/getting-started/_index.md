@@ -24,7 +24,7 @@ cargo test               # run all tests (907 total, 26 ignored)
 > feature (feature unification via `tools/bench-gpu`), so the oxide GEMV PTX
 > must exist in the kernels build out dirs — build them with
 > `cargo oxide build` in `tools/oxide-gemv*/` (or, from the laptop,
-> `scripts/fishtank.sh oxide`). Without them `tempura-kernels` fails to
+> `scripts/gpu-remote.sh oxide`). Without them `tempura-kernels` fails to
 > compile; tests from the other packages still run.
 
 ## Run
