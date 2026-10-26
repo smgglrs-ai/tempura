@@ -42,10 +42,52 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+## GPU inference (cuda-oxide)
+
+The GPU path uses cuda-oxide for hand-optimized PTX kernels. You need the
+`CUDA_OXIDE_BACKEND` environment variable pointing at the local fork build.
+
+```sh
+# Build the backend from the fork (once)
+cd ~/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codegen-cuda
+cargo build --release
+
+# Export in every shell that runs GPU benchmarks
+export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
+
+# Build oxide GEMV kernels
+cd /path/to/tempura
+for crate in oxide-gemv oxide-gemv-q4k oxide-gemv-q6k; do
+  cd tools/$crate && cargo oxide build && cd ../..
+done
+
+# Single-sequence benchmark (Llama-3.1-8B Q4K, RTX 5090: 130 tok/s)
+cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
+  --bin bench-real-model -- ~/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+
+# Batch decode benchmark (M=8, RTX 5090: 417 tok/s aggregate)
+cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
+  --bin bench-batch-decode -- ~/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf --batch 8
+```
+
+## MXFP4 pipeline (sm_120a / RTX 5090)
+
+MXFP4 requires sm_120a (RTX 5090 consumer Blackwell). Load from BF16 safetensors:
+
+```sh
+# Benchmark MXFP4 at M=64 (55.6 TFLOPS on RTX 5090)
+cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
+  --bin bench-mxfp4 -- /path/to/model-bf16/model.safetensors
+```
+
+Weights are tiled from BF16 to E2M1+UE8M0 at load time. MXFP4 is efficient
+at M>=16 (batch). For M<16 batch decode, the stream-K Q4K path is faster.
+
 ## Formal verification
 
 ```sh
-cargo kani --package tempura-kernels   # verify kernel safety properties
+cargo kani --package tempura-kernels   # 78 bounded harnesses
+./scripts/run-verus.sh                 # 828 Verus verification conditions
 ```
 
 ## Project structure
@@ -56,4 +98,6 @@ tempura/
   kernels/       # CPU and CUDA implementations
   engine/        # Inference engine, model loading, traces
   server/        # HTTP serving, OpenAI API, batch scheduling
+  tools/         # Benchmarks, oxide GEMV crates, bench-gpu
+  verus-verified/ # Standalone Verus deductive proofs (own toolchain)
 ```

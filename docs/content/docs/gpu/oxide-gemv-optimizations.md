@@ -1,20 +1,27 @@
 ---
-title: "oxide GEMV — Next Optimizations"
-description: "Concrete next steps to close the 7-9× gap to llama.cpp on RTX 5090"
+title: "oxide GEMV -- Optimizations and Status"
+description: "How the 8.7x gap to llama.cpp was closed to 1.6x, and what remains"
 weight: 10
 ---
 
-# oxide GEMV — Next Optimizations
+# oxide GEMV -- Optimizations and Status
 
-**Current state** (2026-10-12, RTX 5090 Blackwell sm_120):
+**Current state** (2026-10-26, RTX 5090 Blackwell sm_120a):
 
-| Model | Format | tok/s decode | ITL P50 | Gap vs llama.cpp |
-|-------|--------|-------------|---------|-----------------|
-| Bonsai-1.7B | Q2_0 | 31 | 32ms | 6.7× |
-| Llama-3.1-8B | Q4K+Q6K | 108 | 9.3ms | 1.9× |
-| llama.cpp ref | — | 209 | 5ms | 1× |
+| Mode | Format | tok/s | ITL P50 | Gap vs llama.cpp |
+|------|--------|-------|---------|-----------------|
+| Single decode | Q4K+Q6K | 130 | 7.7ms | 1.60x |
+| Batch M=2 | Q4K stream-K | 134 aggregate | -- | -- |
+| Batch M=4 | Q4K stream-K | 243 aggregate | -- | -- |
+| Batch M=8 | Q4K stream-K | 417 aggregate | 3.5ms/seq | -- |
+| Batch M=16 | Q4K stream-K | ~600 aggregate | -- | -- |
+| MXFP4 M=64 | E2M1+UE8M0 | 55.6 TFLOPS | -- | -- |
+| llama.cpp ref | -- | 209 | 5ms | 1x |
 
-The Q4K gap closed from 8.7× to 1.9× via Opt 5 (CUDA graph single-capture + device kv_len pointer, 4.5× improvement), Opt 7 (Q8_1 activation quantization + dp4a), and Opt 8 (multi-warp K-parallelism). Remaining 1.9× gap is flash attention at growing kv_len (19% SM utilization at batch=1) and raw GGUF scale decode overhead in GEMV.
+The Q4K single-sequence gap closed from 8.7x to 1.60x through the full optimization
+stack. Batch decode reaches 417 tok/s at M=8 via stream-K GEMM. The remaining 1.60x
+single-sequence gap is flash attention overhead at growing kv_len and residual GEMV
+arithmetic throughput.
 
 All oxide kernels live in `tools/oxide-gemv*/src/main.rs`. Build instructions are in CLAUDE.md ("GPU Kernels" section) and `bench-gpu-rtx5090.json`.
 
@@ -288,28 +295,33 @@ In the engine: replace the two separate gate + up GEMV calls with a single fused
 
 ---
 
-## Status (2026-10-12)
+## Status (2026-10-26)
 
 | Opt | Description | Status | Measured impact |
 |-----|-------------|--------|----------------|
-| 1 | Raw bytes on GPU | Attempted, reverted (not bandwidth-bound) | — |
-| 2 | Two-output warp Q2_0 | **Done** | +1 tok/s (30→31) |
-| 3 | Float4 nibble reads | Deferred (needs loop restructure) | — |
-| 4 | Q4K prefill GEMM | Pending | HIGH |
-| 5 | Device-side kv_len (CUDA graph single-capture) | **Done** | 24→67 tok/s (2.8×) |
-| 6 | Occupancy tuning | Pending | LOW |
-| 7 | Q8_1 activation + dp4a | **Done** | contributes to 108 tok/s |
-| 8 | Multi-warp K-parallelism | **Done** (Q4K + Q6K kpar 8 warps) | contributes to 108 tok/s |
-| 9 | Fused gate+up SwiGLU | Pending | ~1.3× |
+| 1 | Raw bytes on GPU | Attempted, reverted (not bandwidth-bound) | -- |
+| 2 | Two-output warp Q2_0 | **Done** | +1 tok/s (30->31) |
+| 3 | Float4 nibble reads | Deferred (needs loop restructure) | -- |
+| 4 | Q4K prefill GEMM | **Done** (stream-K batch) | 243 tok/s at M=4, 417 at M=8 |
+| 5 | Device-side kv_len (CUDA graph single-capture) | **Done** | 24->130 tok/s (+5.4x) |
+| 6 | Occupancy tuning | **Done** (kpar8) | contributes to 130 tok/s |
+| 7 | Q8_1 activation + dp4a | **Done** | contributes to 130 tok/s |
+| 8 | Multi-warp K-parallelism | **Done** (Q4K + Q6K kpar 8 warps) | contributes to 130 tok/s |
+| 9 | Fused gate+up SwiGLU | **Done** (q4k_fused_silu_sm120_dp4a) | ~1.1x FFN speedup |
+| 10 | sm_120a native PTX | **Done** | eliminates JIT overhead |
+| 11 | KV scatter-write | **Done** | eliminates 64 graph update calls/step |
+| 12 | Batch CUDA graph | **Done** | 417 tok/s at M=8 |
+| 13 | MXFP4 pipeline | **Done** | 55.6 TFLOPS at M=64 |
 
-## Implementation priority
+## Current gaps and next steps
 
-Opts 5, 7, 8 are done — Q4K Llama-3.1-8B is at 108 tok/s, a 1.9× gap from llama.cpp. Remaining levers:
+Single-sequence (130 vs 209 tok/s, 1.60x gap):
+- Flash attention overhead at growing kv_len (multi-query heads approach 209 requires paged flash attn)
+- Batch decode already exceeds single-sequence ceiling at M=4+
 
-1. **Batched continuous inference** — 5+ concurrent requests fills all 170 SMs and amortizes GEMV weight bandwidth; serving metric is requests×tokens/s, not single-request latency
-2. **Q4K prefill GEMM** (Opt 4) — closes the massive prefill gap (currently 6 tok/s vs llama.cpp 7335 pp128)
-3. **Fused SwiGLU** (Opt 9) — FFN layer speedup (~1.3×)
-4. **Occupancy tuning** (Opt 6) — quick experiment, 10 minutes
+MXFP4 batch at M>=32:
+- E2M1+UE8M0 pipeline is verified and functional; padding waste at M<16 limits efficiency
+- Need tiled MXFP4 GEMM for small-M batch (M=2..8) to replace stream-K path
 
 ---
 

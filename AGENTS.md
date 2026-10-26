@@ -153,28 +153,53 @@ Three-crate workspace + standalone verification crate:
 
 ## What's Done (Phase 13: GPU Inference)
 
-- [x] cuTile GPU forward pass (CutileGpuModel) — all projection weights uploaded to GPU
-- [x] GPU-resident KV cache with D→D append (no PCIe per layer per token)
-- [x] GPU flash attention for decode (cutile_decode_attn — one warp per head)
+- [x] cuTile GPU forward pass (CutileGpuModel) -- all projection weights uploaded to GPU
+- [x] GPU-resident KV cache with D->D append (no PCIe per layer per token)
+- [x] GPU flash attention for decode (cutile_decode_attn -- one warp per head)
 - [x] Q2_0, Q4K, Q6K quantized weights GPU-resident (packed u32 format, dequant on-the-fly)
 - [x] Full async pipeline (single stream.synchronize() per token)
 - [x] Pre-computed RoPE frequency table (no cos/sin H2D per call)
 - [x] Pre-allocated RMSNorm + RoPE scratch pools (no zeros alloc per layer)
-- [x] CUDA graph infrastructure (DecodeGraph, cuGraphExecUpdate_v2)
-- [x] Fused GPU RMSNorm (no D→H→D for scale computation)
+- [x] CUDA graph infrastructure (DecodeGraph, single cuGraphLaunch per step)
+- [x] Fused GPU RMSNorm (no D->H->D for scale computation)
 - [x] On-device RoPE interleave kernel (cutile_interleave via MAP_SHAPE [1,BN])
-- [x] oxide GEMV kernels (rustc-codegen-cuda): Q2_0, Q4K v2, Q6K v2
-  - Q2_0: two-output-per-warp (half-warp XOR reduce), SMEM activation staging (Opt 2)
-  - Q4K v2: multi-warp K-parallelism (4 warps per neuron, smem cross-warp reduce) (Opt 8)
-  - Q4K q8: Q8_1 activation quantization + mini-warp dp4a (Opt 7, needs upstream backend)
-  - Q6K v2: d broadcast via shfl, 8-step unrolled q_full
+- [x] oxide GEMV kernels (rustc-codegen-cuda): Q2_0, Q4K, Q6K
+  - Q2_0: two-output-per-warp (half-warp XOR reduce), SMEM activation staging
+  - Q4K dp4a: Q8_1 activation quantization + mini-warp dp4a, kpar8 (8 warps per neuron)
+  - Q6K: d broadcast via shfl, 8-step unrolled q_full, kpar8, cp.async mbar
+- [x] sm_120a native PTX kernels (direct Blackwell codegen, no JIT):
+  - q4k_gemv_sm120_dp4a_kpar8: sm_120 ISA, kpar8 warps
+  - q4k_fused_silu_sm120_dp4a: fused gate+up SiLU in sm_120 PTX
+  - q6k_gemv_sm120_mbar_kpar8: cp.async mbar, down_proj optimized
+- [x] Stream-K Q4K batch GEMM (q4k_streamk_batch_sm120): grid SM_COUNT=170 persistent blocks,
+      cp.async double-buffer, mma.sync tensor cores
+- [x] KV scatter-write kernel (kv_scatter_write.rs): reads kv_write_offset from device at
+      execution time, eliminates 64 cuGraphExecMemcpyNodeSetParams per step
+- [x] GpuCapabilities struct + GpuFeature bitflags for runtime dispatch:
+  - DP4A: cc >= 610 (Volta+)
+  - SM120_ISA: cc >= 1200 (Blackwell)
+  - MXFP4_MMA: sm_120a only (RTX 5090 consumer Blackwell)
+- [x] Feature-based kernel naming (KernelVariant table): q4k_gemv_sm120_dp4a_kpar8,
+      q4k_gemv_dp4a_kpar8, q6k_gemv_sm120_mbar_kpar8 -- named by feature not version
+- [x] Batch decode with CUDA graph (BatchDecodeGraph, M=2..16+):
+  - Dynamic max_batch_graph from VRAM (13+ sequences on RTX 5090 Llama-3.1-8B)
+  - Concurrent QKV projections on separate CUDA streams
+  - Q6K batch GEMM (q6k_gemv_sm120_batch)
+- [x] Native MXFP4 pipeline (E2M1+UE8M0, cute-rs, CUTLASS MLIR sm_120a):
+  - All 7 projections (QKV, O, gate, up, down) in MXFP4
+  - BF16 safetensors loader with native MXFP4 tiling
+  - bench_mxfp4: 55.6 TFLOPS at M=64
 - [x] Kani harnesses + Verus proofs for Q2_0/Q4K/Q6K block dequant bounds
+- [x] 17 new Kani harnesses: MXFP4 quantization (E2M1 nibble bounds, UE8M0 encode/decode,
+      BF16 upcast), GPU dispatch (grid dims, buffer sizes), batch graph eligibility determinism
 - [x] cuTile 0.4.0 upgrade (path deps to local fork); vec_width hint infrastructure
-- [x] Benchmark: Q2_0 31 tok/s, Q4K **108 tok/s** (gap: 6.7×/**1.9×** vs llama.cpp 209 tok/s)
-  - Opt 5 done: CUDA graph captured once per generation, H→D scalar update before each launch
-  - kv_len passed as device pointer (`*const i32`) to oxide decode attention kernel
-  - 4.5× improvement: 24 tok/s → 108 tok/s by eliminating 38ms/token CPU re-capture
-  - Remaining 1.9× gap: flash attention overhead at growing kv_len + Q4K GEMV arithmetic
+- [x] Benchmarks (RTX 5090, Llama-3.1-8B Q4_K_M):
+  - Single-sequence decode: **130 tok/s** (1.60x gap vs llama.cpp 209 tok/s)
+  - Batch M=2: 134 tok/s aggregate
+  - Batch M=4: 243 tok/s aggregate
+  - Batch M=8: **417 tok/s** aggregate (3.5ms ITL/seq)
+  - Batch M=16: ~600 tok/s aggregate
+  - MXFP4 M=64: 55.6 TFLOPS
 
 ## What's Next
 
@@ -293,8 +318,10 @@ cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
 ```
 
 Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
-- Bonsai-1.7B Q2_0: **30 tok/s decode** (7× gap vs llama.cpp 209 tok/s)
-- Llama-3.1-8B Q4K: **24 tok/s decode** (8.7× gap vs llama.cpp)
+- Llama-3.1-8B Q4K single-sequence: **130 tok/s decode** (1.60x gap vs llama.cpp 209 tok/s)
+- Llama-3.1-8B Q4K batch M=8: **417 tok/s** aggregate (3.5ms ITL/seq)
+- Llama-3.1-8B Q4K batch M=16: ~600 tok/s aggregate
+- MXFP4 M=64: 55.6 TFLOPS
 
 If you see `Symbol cuda_device__mma_sync__... not found`, the backend is stale.
 Rebuild it from the fork and set `CUDA_OXIDE_BACKEND`.
@@ -322,7 +349,7 @@ deliverable, not a follow-up task. When adding or modifying code:
 
 ```sh
 cargo test                           # unit + property tests (315 tests)
-cargo kani --package tempura-kernels  # Kani: bounded model checking (61 harnesses)
+cargo kani --package tempura-kernels  # Kani: bounded model checking (78 harnesses)
 ./scripts/run-verus.sh               # Verus: deductive unbounded proofs (828 verification conditions)
 ```
 
@@ -339,9 +366,11 @@ cargo kani --package tempura-kernels  # Kani: bounded model checking (61 harness
 
 ### Coverage Summary
 
-**Kani:** 61 bounded harnesses across kernels/ and engine/ — indexing arithmetic
-for attention, RMSNorm, RoPE, matmul, sampling, turboquant, quantized (Q4K/Q6K/TQ2/I2S),
-KV cache, model, speculative, disaggregated, weights, GGUF.
+**Kani:** 78 bounded harnesses across kernels/ and engine/ -- 61 original + 17 new MXFP4
+harnesses. Covers indexing arithmetic for attention, RMSNorm, RoPE, matmul, sampling,
+turboquant, quantized (Q4K/Q6K/TQ2/I2S), KV cache, model, speculative, disaggregated,
+weights, GGUF. New harnesses: E2M1 encoding bounds, UE8M0 encode/decode, BF16 upcast
+correctness, GPU dispatch grid dims, buffer sizes, batch graph eligibility determinism.
 
 **Verus:** 62 modules, 828 verification conditions — 56 of 57 Kani harnesses
 proven unboundedly (54 directly + 2 restated as integer arithmetic), plus 48
