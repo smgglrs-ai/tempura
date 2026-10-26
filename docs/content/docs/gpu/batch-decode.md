@@ -75,15 +75,14 @@ llama.cpp single-sequence reference: 209 tok/s.
 export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
 
 # Build oxide kernels
-for crate in oxide-gemv oxide-gemv-q4k oxide-gemv-q6k; do
+for crate in oxide-gemv oxide-gemv-q4k oxide-gemv-q6k oxide-decode-attn; do
   cd tools/$crate && cargo oxide build && cd ../..
 done
 
-# Batch decode benchmark (M=8)
+# Batch decode benchmark (M=1..16 in one run)
 cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
-  --bin bench-batch-decode -- \
-  ~/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
-  --batch 8
+  --bin bench-batch -- \
+  ~/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
 ```
 
 ## Formal verification

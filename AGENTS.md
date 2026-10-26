@@ -156,8 +156,10 @@ docs/ (Zola site, deployed by .github/workflows/pages.yml)
 - **docs/** — Zola site with a full curriculum (math → hardware → kernel math
   → verification → serving); deployed by CI (`pages.yml`).
 
-Scale: 949 first-party Rust files, ~569k lines (excludes `target/` and
-`.oxide-artifacts/`). 851 commits on main. CI: `kani.yml` (Kani 0.67.0 on
+Scale: 173 first-party Rust files, ~142k lines (workspace crates + tools;
+excludes all `target/` dirs with their generated cuda-bindings, and
+`.claude/worktrees/` copies), plus 80 Verus proof modules (~13.6k lines).
+853 commits on main. CI: `kani.yml` (Kani 0.67.0 on
 every PR/push), `pages.yml`.
 
 ## Key Design Decisions
@@ -301,6 +303,8 @@ Qwen3.6-27B weights** — see open work.
       L1-sized chunking; parity with bitnet.cpp (36 tok/s decode, 1.24GB on
       Lunar Lake; pp42 up to 2× bitnet.cpp)
 - [x] staticpar hybrid spin/condvar pool, OpenMP GEMV variant (`openmp`)
+- [x] BOLT post-link optimization (scripts/build-bolt.sh): +4% pp128
+      (203→211 tok/s); Rust PIE forces BOLT lite mode — that is the ceiling
 - [x] PGO workflow (scripts/build-pgo.sh); thin LTO only (fat LTO SIGSEGVs
       unsafe SIMD — see root Cargo.toml)
 
@@ -342,12 +346,17 @@ typical-p/repeat/presence/frequency)
 
 ```sh
 cargo build              # build all workspace crates
-cargo test               # 864 test functions (3 #[ignore])
+cargo test               # 907 test functions (26 ignored)
 cargo kani --package tempura-kernels   # 240 Kani harnesses (kernels+engine)
 ./scripts/run-verus.sh   # 588 Verus proof functions, 80 modules
 cargo run -- --help      # CLI: serve, pull, list, inspect
 cargo run -- serve --model /path/to/model.gguf --port 8080
 ```
+
+Note: `cargo test` compiles `tempura-kernels` with the `oxide-gemv` feature
+(feature unification via tools/bench-gpu), so the oxide GEMV PTX must be
+present in the kernels build out dirs — `scripts/fishtank.sh oxide` or the
+manual copy loop in the GPU section provides them.
 
 Benchmarks: `tools/bench` (HTTP throughput, llama.cpp-bench-style pp/tg),
 `tools/bench-gpu` (bench-real-model, bench-batch, bench-mxfp4, bench-e2e,
@@ -445,7 +454,7 @@ code:
 ### Running Verification
 
 ```sh
-cargo test                            # unit + property tests (864 tests)
+cargo test                            # unit + property tests (907 tests)
 cargo kani --package tempura-kernels  # Kani: bounded model checking (240 harnesses)
 ./scripts/run-verus.sh               # Verus: deductive unbounded proofs (588 proof fns, 80 modules)
 ```
