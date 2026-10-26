@@ -355,6 +355,17 @@ bench-attn, bench-kernels, bench-speculative), `tools/compare` (A/B two
 servers), `engine/benches` (custom `harness = false` timing benches, not
 criterion). Results in `bench-*.json` at root.
 
+Two-machine workflow: the RTX 5090 lives on `fishtank.home.local`
+(passwordless SSH); development happens on the laptop. `scripts/fishtank.sh`
+drives the GPU host: `status` (pre-flight — enforces the
+never-run-multiple-instances rule), `sync [--wip]` (source moves through git
+origin only; never `target/`, `.oxide-artifacts/` or models; `--wip` pushes
+a snapshot of uncommitted work as `wip/<hostname>`), `bench [--no-sync] BIN`
+(sync + tmux job + PTX re-copy after build), `run`, `oxide`, `watch`/
+`log`/`results`/`stop`. Remote run scripts and logs live in
+`~/.cache/tempura/fishtank/`, models in `~/.cache/tempura/models/` (a bare
+model filename passed to `bench` resolves there).
+
 ## GPU Kernels (cuda-oxide)
 
 We use a fork of cuda-oxide at `~/Code/github.com/NVLabs/cuda-oxide` with
@@ -379,7 +390,7 @@ cargo build -p tempura-bench-gpu --release --bin bench-real-model
 
 # oxide hand-optimized GEMV kernels (require cargo oxide build)
 # Build all oxide GEMV crates:
-for crate in oxide-gemv oxide-gemv-q4k oxide-gemv-q6k; do
+for crate in oxide-gemv oxide-gemv-q4k oxide-gemv-q6k oxide-decode-attn; do
   cd tools/$crate && cargo oxide build && cd ../..
 done
 
@@ -388,7 +399,12 @@ for d in target/release/build/tempura-kernels-*/out; do
   cp tools/oxide-gemv/oxide_gemv.ptx       $d/oxide_q2_gemv.ptx  2>/dev/null
   cp tools/oxide-gemv-q4k/oxide_gemv_q4k.ptx $d/oxide_q4k_gemv.ptx 2>/dev/null
   cp tools/oxide-gemv-q6k/oxide_gemv_q6k.ptx $d/oxide_q6k_gemv.ptx 2>/dev/null
+  cp tools/oxide-decode-attn/oxide_decode_attn.ptx $d/oxide_decode_attn.ptx 2>/dev/null
 done
+
+# From the laptop, scripts/fishtank.sh runs all of this on fishtank:
+#   scripts/fishtank.sh oxide
+#   scripts/fishtank.sh bench real-model Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
 
 # Benchmark (oxide-gemv feature already in tools/bench-gpu/Cargo.toml):
 cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
