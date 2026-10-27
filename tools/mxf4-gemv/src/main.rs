@@ -129,12 +129,26 @@ mod kernels {
         let total_tiles = m_tiles * n_tiles;
 
         // Stream-K: each warp picks a tile index, strides by (grid * 4) each iteration.
-        let mut tile_idx = bid * 4 + warp_id;
+        //
+        // Division-free (tile_m, tile_n) decomposition: the cutlass-mlir backend
+        // lowers integer `/`/`%` to MUFU.RCP-based emulation that mis-computes
+        // tile_idx / n_tiles for some operands >= 512, leaving tiles unwritten
+        // (stale output memory) and others double-written -- the m > 16 prefill
+        // nondeterminism (rows >= 16 of the output drifted run-to-run while
+        // m_pad = 16 batch decode, whose tile_idx < 512, stayed bitwise-stable).
+        // The flat index is decomposed once by subtraction and advanced by
+        // subtractive carry, so no division or modulo ever executes.
+        let slot = bid * 4 + warp_id;
+        let stride = grid * 4;
+        let mut tile_m: u32 = 0;
+        let mut tile_n: u32 = slot;
+        while tile_n >= n_tiles {
+            tile_n -= n_tiles;
+            tile_m += 1;
+        }
+        let mut tile_idx = slot;
 
         while tile_idx < total_tiles {
-            let tile_m = tile_idx / n_tiles;
-            let tile_n = tile_idx % n_tiles;
-
             let mut acc = Accumulator16x8::zero();
 
             let mut k = 0u32;
@@ -223,7 +237,12 @@ mod kernels {
                 *c.add(r1 * n_usize + c1) = regs[3];
             }
 
-            tile_idx += grid * 4;
+            tile_idx += stride;
+            tile_n += stride;
+            while tile_n >= n_tiles {
+                tile_n -= n_tiles;
+                tile_m += 1;
+            }
         }
     }
 }
