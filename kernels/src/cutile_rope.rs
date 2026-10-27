@@ -264,6 +264,34 @@ impl CutileRoPE {
         Ok(())
     }
 
+    /// Device pointers and geometry of the precomputed cos/sin tables:
+    /// `(cos_ptr, sin_ptr, half_dim, max_pos)`.
+    ///
+    /// Used by the engine to refresh one-row cos/sin buffers per decode step
+    /// via `KvScatterWrite::gather_row_by_device_pos` (position read from
+    /// device memory), keeping CUDA-graph RoPE replays position-correct.
+    /// Returns `None` when no table has been precomputed.
+    pub fn table_ptrs(
+        &self,
+    ) -> Option<(cuda_core::sys::CUdeviceptr, cuda_core::sys::CUdeviceptr, usize, usize)> {
+        let cos = self.cos_table.as_ref()?;
+        let sin = self.sin_table.as_ref()?;
+        Some((
+            cos.device_pointer().cu_deviceptr(),
+            sin.device_pointer().cu_deviceptr(),
+            self.table_half_dim,
+            self.table_max_pos,
+        ))
+    }
+
+    /// Number of positions covered by the precomputed table.
+    ///
+    /// Decode steps at positions >= this value must not use the graph/table
+    /// rope path (the engine routes them to the standard rope path).
+    pub fn table_max_pos(&self) -> usize {
+        self.table_max_pos
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }
@@ -700,7 +728,64 @@ impl CutileRoPE {
         scratch: &mut RopeScratch,
         stream: &Arc<Stream>,
     ) -> Result<Arc<Tensor<f32>>> {
-        let num_sh = n_heads; // seq_len == 1
+        let _ = n_heads; // grid is derived from the pre-sized scratch tensors
+        self.rope_launch_from_table(x_dev, pos, head_dim, half, cos_t, sin_t, scratch, stream)
+    }
+
+    /// Graph-stable decode rotation for CUDA-graph capture.
+    ///
+    /// Identical computation to `forward_device_scratch_from_table` but reads
+    /// cos/sin from caller-managed ONE-ROW buffers (`cos_row`/`sin_row`,
+    /// `[half]` elements each) and pins the kernel's `pos` argument to 0.
+    ///
+    /// Why: `cutile_rope_from_table` takes `pos` as a host launch scalar, so
+    /// a CUDA graph captures the capture-time position and replays it stale
+    /// on every subsequent step (all decoded tokens rotate at the first
+    /// step's position). The caller refreshes the row buffers each step with
+    /// `KvScatterWrite::gather_row_by_device_pos`, which reads the position
+    /// from device memory at execution time -- the graph stays
+    /// topology-stable and position-correct.
+    ///
+    /// `cos_row`/`sin_row` must be `[head_dim / 2]` elements matching the
+    /// precomputed table's `half` (debug-asserted).
+    pub fn forward_device_scratch_graph(
+        &self,
+        x_dev: &Arc<Tensor<f32>>,
+        n_heads: usize,
+        head_dim: usize,
+        cos_row: &Arc<Tensor<f32>>,
+        sin_row: &Arc<Tensor<f32>>,
+        scratch: &mut RopeScratch,
+        stream: &Arc<Stream>,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let _ = n_heads; // grid is derived from the pre-sized scratch tensors
+        let half = head_dim / 2;
+        if !head_dim.is_multiple_of(2) {
+            return Err(KernelError::InvalidConfig(format!(
+                "head_dim must be even, got {head_dim}"
+            )));
+        }
+        debug_assert_eq!(self.table_half_dim, half,
+            "row buffers must match the precomputed table's half dim");
+        debug_assert_eq!(cos_row.size(), half, "cos_row must hold exactly one table row");
+        debug_assert_eq!(sin_row.size(), half, "sin_row must hold exactly one table row");
+        self.rope_launch_from_table(x_dev, 0, head_dim, half, cos_row, sin_row, scratch, stream)
+    }
+
+    /// Shared table-rotation launch: deinterleave -> `cutile_rope_from_table`
+    /// with `pos` -> interleave, all on pre-allocated scratch buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_launch_from_table(
+        &self,
+        x_dev: &Arc<Tensor<f32>>,
+        pos: i32,
+        head_dim: usize,
+        half: usize,
+        cos_t: &Arc<Tensor<f32>>,
+        sin_t: &Arc<Tensor<f32>>,
+        scratch: &mut RopeScratch,
+        stream: &Arc<Stream>,
+    ) -> Result<Arc<Tensor<f32>>> {
         let generics = vec![half.to_string()];
 
         let z_tensor = scratch

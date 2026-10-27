@@ -184,10 +184,13 @@ impl MxfpGemm {
     /// Launches `mxfp4_quantize_activation_tiled` entirely on-GPU; no PCIe transfer.
     /// One block per [16-row x 32-col] tile (matches quantize_activation_to_mxfp4_tiled).
     ///
-    /// - `src`:        [m * k] f32, row-major activation
+    /// - `src`:        [m * k] f32, row-major activation (may hold only m_valid rows
+    ///                 when m_valid < m -- padding rows are never loaded)
     /// - `packed`:     [m * k / 2] u8, output E2M1 nibbles (lo nibble = first elem)
     /// - `scales`:     [(m/16) * (k/32)] u8, output UE8M0 tile scales
     /// - `m`, `k`:     dimensions (m must be multiple of 16, k multiple of 32)
+    /// - `m_valid`:    live rows [0, m_valid); rows >= m_valid are masked to zero so
+    ///                 the shared tile-max scale ignores stale buffer contents
     /// - `stream`:     CUDA stream for async launch
     ///
     /// Returns `Err` if the quant kernel was not loaded (non-sm_120 hardware or
@@ -199,6 +202,7 @@ impl MxfpGemm {
         scales: &Arc<Tensor<u8>>,
         m:      u32,
         k:      u32,
+        m_valid: u32,
         stream: sys::CUstream,
     ) -> Result<()> {
         let qfn = self.cu_quant_fn.ok_or_else(|| {
@@ -207,6 +211,7 @@ impl MxfpGemm {
 
         debug_assert_eq!(m % 16, 0, "m must be multiple of 16");
         debug_assert_eq!(k % 32, 0, "k must be multiple of 32");
+        debug_assert!(m_valid <= m, "m_valid={m_valid} must be <= m={m}");
 
         let k32_blocks = k / 32;
         let m16_tiles  = m / 16;
@@ -218,14 +223,16 @@ impl MxfpGemm {
         let mut pm       = m;
         let mut pk       = k;
         let mut pk32     = k32_blocks;
+        let mut pmv      = m_valid;
 
-        let mut params: [*mut std::ffi::c_void; 6] = [
+        let mut params: [*mut std::ffi::c_void; 7] = [
             &mut p_src    as *mut _ as *mut std::ffi::c_void,
             &mut p_packed as *mut _ as *mut std::ffi::c_void,
             &mut p_scales as *mut _ as *mut std::ffi::c_void,
             &mut pm       as *mut _ as *mut std::ffi::c_void,
             &mut pk       as *mut _ as *mut std::ffi::c_void,
             &mut pk32     as *mut _ as *mut std::ffi::c_void,
+            &mut pmv      as *mut _ as *mut std::ffi::c_void,
         ];
 
         let rc = unsafe {

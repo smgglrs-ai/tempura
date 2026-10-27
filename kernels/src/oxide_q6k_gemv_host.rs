@@ -48,7 +48,6 @@ const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128
 const WARPS_PER_BLOCK_KPAR: u32 = 8;
 const BLOCK_DIM_KPAR: u32 = WARPS_PER_BLOCK_KPAR * 32; // 256
 const SMEM_KPAR: u32 = WARPS_PER_BLOCK_KPAR * 4; // 32 bytes
-
 /// Launches the oxide-compiled Q6_K GEMV kernel for M=1 or M=2 decode.
 pub struct OxideQ6kGemv {
     cu_module:              CUmodule,
@@ -58,7 +57,7 @@ pub struct OxideQ6kGemv {
     cu_sm120_module:        Option<CUmodule>,
     /// q6k_gemv_sm120_mbar_kpar8: cp.async double-buffer variant (sm_120+).
     cu_function_sm120_mbar: Option<CUfunction>,
-    /// sm_120 batch module: q6k_gemv_sm120_batch (M=2, shared weight reads).
+    /// sm_120 batch module: q6k_gemv_sm120_batch (M rows, shared weight reads).
     cu_sm120_batch_module:  Option<CUmodule>,
     /// q6k_gemv_sm120_batch: true-batch kernel, one block per output neuron. (sm_120+).
     cu_function_sm120_batch: Option<CUfunction>,
@@ -86,6 +85,11 @@ impl Drop for OxideQ6kGemv {
 }
 
 impl OxideQ6kGemv {
+    /// Opt-in dynamic shared memory ceiling for the sm120 batch kernel
+    /// (set via `cuFuncSetAttribute` at load). 64 KiB covers k_blocks <= 305
+    /// (down_proj K up to ~78k); larger shapes fall back to per-row GEMVs.
+    const MAX_BATCH_DYNAMIC_SMEM: usize = 64 * 1024;
+
     /// Load Q6_K GEMV kernels.
     ///
     /// Attempts to load the oxide-compiled PTX (baseline + kpar8) and, on sm_120+,
@@ -250,7 +254,7 @@ impl OxideQ6kGemv {
                 (None, None)
             };
 
-        // -- Try sm_120 batch PTX (q6k_gemv_sm120_batch, M=2) -------------------
+        // -- Try sm_120 batch PTX (q6k_gemv_sm120_batch, M rows 2..=16) ----------
         let (cu_sm120_batch_module, cu_function_sm120_batch) =
             if cu_sm120_module.is_some() {
                 // cc is already >= 1200 (sm120_mbar was loaded), reuse the check.
@@ -276,11 +280,29 @@ impl OxideQ6kGemv {
                         )
                     };
                     if rc2 == CUDA_SUCCESS {
+                        let batch_fn = unsafe { fn_out.assume_init() };
+                        // Raise the dynamic-smem opt-in ceiling for the batch
+                        // kernel (weights + reduction area live in dynamic smem).
+                        // Best-effort: on failure the kernel still works for
+                        // shapes under the default 48 KiB limit.
+                        let rc_attr = unsafe {
+                            cuda_core::sys::cuFuncSetAttribute(
+                                batch_fn,
+                                cuda_core::sys::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                Self::MAX_BATCH_DYNAMIC_SMEM as i32,
+                            )
+                        };
+                        if rc_attr != CUDA_SUCCESS {
+                            eprintln!(
+                                "oxide-gemv-q6k: cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) \
+                                 failed (rc={rc_attr}); batch kernel limited to 48 KiB smem"
+                            );
+                        }
                         eprintln!(
                             "oxide-gemv-q6k: loaded sm120_batch variant (entry={})",
                             crate::q6k_batch_sm120_ptx::ENTRY,
                         );
-                        (Some(batch_mod), Some(unsafe { fn_out.assume_init() }))
+                        (Some(batch_mod), Some(batch_fn))
                     } else {
                         eprintln!(
                             "oxide-gemv-q6k: cuModuleGetFunction(sm120_batch) \
@@ -346,20 +368,22 @@ impl OxideQ6kGemv {
         self.cu_function_sm120_mbar.is_some()
     }
 
-    /// Returns `true` when the sm_120 batch variant (M=2) was loaded.
+    /// Returns `true` when the sm_120 batch variant (M rows, 2..=16) was loaded.
     pub fn has_sm120_batch(&self) -> bool {
         self.cu_function_sm120_batch.is_some()
     }
 
-    /// Batch Q6K GEMV for M=2 decode: reads each weight block ONCE, computes both rows.
+    /// Batch Q6K GEMV for M-row decode (2..=16): reads each weight block ONCE
+    /// from DRAM/L2 (into shared memory) and computes all M dot products.
     ///
-    /// Grid: (n, 1, 1). Block: (256, 1, 1). Static smem: 3456 bytes.
+    /// Grid: (n, 1, 1). Block: (256, 1, 1). Dynamic smem: k_blocks*212 + 512.
     ///
-    /// - `x_m`: `[M * k_blocks * 256]` f32 -- M activation rows concatenated (row 0 then row 1).
+    /// - `x_m`: `[M * k_blocks * 256]` f32 -- M activation rows, row-major.
     /// - `packed`: `[n * k_blocks * 53]` u32 -- Q6K weight blocks.
-    /// - `out_m`: `[M * n]` f32 -- output buffer (row 0 at `[0..n-1]`, row 1 at `[n..2n-1]`).
+    /// - `out_m`: `[M * n]` f32 -- row r at `[r*n .. (r+1)*n)`.
     /// - `n`: output neurons per row.
-    /// - `k_blocks`: Q6K blocks per activation row.
+    /// - `k_blocks`: Q6K blocks per activation row (any value; no %8 constraint).
+    /// - `m`: batch rows, 2..=16 (rows above 16 would overflow the reduction area).
     /// - `cu_stream`: CUDA stream (must be the graph-capture stream when inside capture).
     ///
     /// No allocation; safe inside `cuStreamBeginCapture` / `cuStreamEndCapture`.
@@ -370,15 +394,20 @@ impl OxideQ6kGemv {
         out_m: &Arc<Tensor<f32>>,
         n: usize,
         k_blocks: usize,
-        _m: usize,
+        m: usize,
         cu_stream: cuda_core::sys::CUstream,
     ) -> Result<()> {
-        // The batch kernel's K-loop uses CTA-wide bar.sync 0 (cp.async
-        // cross-lane visibility); deadlock-free only when k_blocks is a
-        // multiple of 8 (uniform barrier count across all 8 warps).
-        if k_blocks % 8 != 0 {
+        if m < 2 || m > 16 {
             return Err(KernelError::InvalidConfig(format!(
-                "q6k_gemv_sm120_batch requires k_blocks % 8 == 0 (got {k_blocks})"
+                "q6k_gemv_sm120_batch requires m in 2..=16 (got {m})"
+            )));
+        }
+        let smem_bytes = crate::q6k_batch_sm120_ptx::dynamic_smem_bytes(k_blocks);
+        if smem_bytes > Self::MAX_BATCH_DYNAMIC_SMEM {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k_gemv_sm120_batch needs {smem_bytes} B dynamic smem (> {}); \
+                 falling back to per-row GEMVs",
+                Self::MAX_BATCH_DYNAMIC_SMEM
             )));
         }
         let batch_fn = self.cu_function_sm120_batch.ok_or_else(|| {
@@ -393,8 +422,9 @@ impl OxideQ6kGemv {
         let packed_len: u64 = packed.size() as u64;
         let n_u32 = n as u32;
         let k_blocks_u32 = k_blocks as u32;
+        let m_u32 = m as u32;
 
-        let mut params: [*mut c_void; 8] = [
+        let mut params: [*mut c_void; 9] = [
             &out_ptr      as *const _ as *mut c_void,
             &out_len      as *const _ as *mut c_void,
             &x_ptr        as *const _ as *mut c_void,
@@ -403,6 +433,7 @@ impl OxideQ6kGemv {
             &packed_len   as *const _ as *mut c_void,
             &n_u32        as *const _ as *mut c_void,
             &k_blocks_u32 as *const _ as *mut c_void,
+            &m_u32        as *const _ as *mut c_void,
         ];
 
         unsafe {
@@ -410,7 +441,7 @@ impl OxideQ6kGemv {
                 batch_fn,
                 (n as u32, 1, 1),
                 (BLOCK_DIM_KPAR, 1, 1),
-                0, // static smem only (3456 bytes declared in PTX)
+                smem_bytes as u32,
                 cu_stream,
                 &mut params,
             )

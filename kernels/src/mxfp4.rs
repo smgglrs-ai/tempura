@@ -182,6 +182,13 @@ pub fn quantize_matrix_to_mxfp4_tiled(values: &[f32], n: usize, k: usize) -> (Ve
 ///
 /// M must be a multiple of 16 (m16-tiles). K must be a multiple of 64 (k64-tiles).
 ///
+/// `m_valid` rows (0..m_valid) carry live data; rows m_valid..M are padding.
+/// The m16k32 tile-max UE8M0 scale is shared by ALL 16 rows of a tile, so
+/// padding rows MUST NOT contribute to the max: they are masked to zero here
+/// (and their nibbles are written as 0). Without the mask the scale depends on
+/// stale buffer contents, making outputs allocation-dependent (the M=4
+/// all-NaN batch bug). `values` must still hold m*k elements.
+///
 /// Returns:
 /// - `packed`: M * K/2 bytes, E2M1 nibbles, row-major [M][K/2]
 /// - `a_scales`: (M/16) * (K/32) bytes, UE8M0 tile scales, layout [m16_tiles][k32_blocks]
@@ -189,9 +196,11 @@ pub fn quantize_activation_to_mxfp4_tiled(
     values: &[f32],
     m: usize,
     k: usize,
+    m_valid: usize,
 ) -> (Vec<u8>, Vec<u8>) {
     assert_eq!(m % 16, 0, "M={m} must be a multiple of 16 for m16-tiles");
     assert_eq!(k % 64, 0, "K={k} must be a multiple of 64 for k64-tiles");
+    assert!(m_valid <= m, "m_valid={m_valid} must be <= m={m}");
     assert_eq!(values.len(), m * k, "values.len()={} != m*k={}", values.len(), m * k);
 
     let m_tiles = m / 16;
@@ -207,6 +216,9 @@ pub fn quantize_activation_to_mxfp4_tiled(
             let mut max_abs = 0.0f32;
             for row_off in 0..16usize {
                 let row = m_base + row_off;
+                if row >= m_valid {
+                    continue;
+                }
                 for col_off in 0..32usize {
                     let v = values[row * k + k_base + col_off].abs();
                     if v > max_abs {
@@ -225,12 +237,19 @@ pub fn quantize_activation_to_mxfp4_tiled(
             a_scales[tile_m * k32_blocks + k32_idx] = scale_u8;
             for row_off in 0..16usize {
                 let row = m_base + row_off;
+                let row_live = row < m_valid;
                 for pair_idx in 0..16usize {
                     let col = k_base + pair_idx * 2;
-                    let lo_f =
-                        if scale_f32 > 0.0 { values[row * k + col] / scale_f32 } else { 0.0 };
-                    let hi_f =
-                        if scale_f32 > 0.0 { values[row * k + col + 1] / scale_f32 } else { 0.0 };
+                    let lo_f = if row_live && scale_f32 > 0.0 {
+                        values[row * k + col] / scale_f32
+                    } else {
+                        0.0
+                    };
+                    let hi_f = if row_live && scale_f32 > 0.0 {
+                        values[row * k + col + 1] / scale_f32
+                    } else {
+                        0.0
+                    };
                     packed[row * (k / 2) + col / 2] =
                         pack_e2m1_pair(f32_to_e2m1(lo_f), f32_to_e2m1(hi_f));
                 }
@@ -506,13 +525,59 @@ mod tests {
         let m = 16usize;
         let k = 128usize;
         let values = vec![1.5f32; m * k];
-        let (packed, a_scales) = quantize_activation_to_mxfp4_tiled(&values, m, k);
+        let (packed, a_scales) = quantize_activation_to_mxfp4_tiled(&values, m, k, m);
         assert_eq!(packed.len(), m * k / 2);
         // m_tiles = 16/16 = 1, k32_blocks = 128/32 = 4 => 1*4 = 4
         assert_eq!(a_scales.len(), (m / 16) * (k / 32));
         // All values should be nonzero packed
         for &b in &packed {
             assert_ne!(b, 0, "uniform nonzero input must produce nonzero packed bytes");
+        }
+    }
+
+    /// Padding rows (>= m_valid) must not influence the shared m16k32 tile-max
+    /// scale, whatever garbage they hold, and must quantize to zero nibbles.
+    /// This is the CPU twin of the M=4 all-NaN batch bug: the tile scale spans
+    /// all 16 rows of the tile, so unmasked stale rows make the scale (and
+    /// therefore every valid row's output) allocation-dependent.
+    #[test]
+    fn quantize_activation_tiled_masks_padding_rows() {
+        let m = 16usize;
+        let k = 128usize;
+        let m_valid = 4usize;
+        let mut poisoned = vec![0.0f32; m * k];
+        // Valid rows: small values.
+        for r in 0..m_valid {
+            for c in 0..k {
+                poisoned[r * k + c] = 0.25 + (c % 7) as f32 * 0.125;
+            }
+        }
+        // Padding rows: NaN / Inf / huge garbage.
+        for r in m_valid..m {
+            for c in 0..k {
+                poisoned[r * k + c] = match r % 3 {
+                    0 => f32::NAN,
+                    1 => f32::INFINITY,
+                    _ => 1e30,
+                };
+            }
+        }
+        let (packed, scales) = quantize_activation_to_mxfp4_tiled(&poisoned, m, k, m_valid);
+
+        // Scales must match a clean quantization of the valid rows only.
+        let mut clean = vec![0.0f32; m * k];
+        for r in 0..m_valid {
+            clean[r * k..(r + 1) * k].copy_from_slice(&poisoned[r * k..(r + 1) * k]);
+        }
+        let (clean_packed, clean_scales) = quantize_activation_to_mxfp4_tiled(&clean, m, k, m_valid);
+        assert_eq!(scales, clean_scales, "tile scales must ignore poisoned padding rows");
+        assert_eq!(packed, clean_packed, "packed output must ignore poisoned padding rows");
+
+        // Padding rows quantize to zero nibbles.
+        for r in m_valid..m {
+            for b in 0..k / 2 {
+                assert_eq!(packed[r * (k / 2) + b], 0, "padding row {r} byte {b} must be 0");
+            }
         }
     }
 
