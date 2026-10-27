@@ -322,44 +322,55 @@ Qwen3.6-27B weights** — see open work.
       quant, tensor-core GEMM, all 7 projections, BF16 loader; 55.6 TFLOPS
       at M=64
 - [x] Prefill fast path (2026-10-27): m>1 GEMMs run on-GPU -- tiled Q4K
-      projections via MXFP4 quant + mxf4_batch_gemm_tiled in 16-row chunks,
-      Q6K tensors via the sm120 M-row batch GEMV chunked over rows
-      (capped_batch_chunks); host-dequant fallback remains for incompatible
-      strides. 394 tok/s pp128 (was 7 host-bound), TTFT P50 324 ms, gap vs
-      llama.cpp 7335 down to 18.6x. Verified: NaN-free, fresh-session logits
-      bitwise-replay (bench-real-model fingerprints + TEMPURA_BENCH_PREFILL_AB
-      numerics delta vs exact-dequant); batch-decode fingerprints unchanged.
+      projections via MXFP4 quant + mxf4_batch_gemm_tiled in a single launch
+      at full m_pad, Q6K tensors via the sm120 M-row batch GEMV chunked over
+      rows (capped_batch_chunks); host-dequant fallback remains for
+      incompatible strides. 408 tok/s pp128 (was 7 host-bound), TTFT P50
+      314 ms, gap vs llama.cpp 7335 down to 18x. Verified: NaN-free,
+      fresh-session logits bitwise-replay, A/B numerics vs exact-dequant
+      max |logit| delta rel 0.10 (TEMPURA_BENCH_PREFILL_AB=1).
       TEMPURA_NO_GPU_PREFILL=1 bisects back to the host path. Remaining
-      prefill levers: attention still host-staged (Q download + host-mirror KV
-      + re-upload per layer), GEMM chunked at m=16 pending the cutlass-mlir
-      codegen fix (see open work).
-- [x] Benchmarks (2026-10-27, post-fix, RTX 5090, bench-batch all-M
-      verified with NO bisect switches — NaN-free + fresh-cache replay
-      bitwise): single-seq 134 tok/s decode, ITL 7.44 ms; prefill 394 tok/s
-      pp128, TTFT P50 324 ms, logits fingerprint det=OK (bench-real-model);
-      batch M=1 135, M=2 93, M=4 164, M=5 190, M=8 259, M=16 374 tok/s
+      prefill levers: attention still host-staged (Q download + host-mirror
+      KV + re-upload per layer), KV host-mirror syncs per layer.
+- [x] Benchmarks (2026-10-27, post-store-mapping-fix, RTX 5090, bench-batch
+      all-M verified with NO bisect switches — NaN-free + fresh-cache replay
+      bitwise): single-seq 134 tok/s decode, ITL 7.44 ms; prefill 408 tok/s
+      pp128, TTFT P50 314 ms, logits fingerprint det=OK (bench-real-model);
+      batch M=1 135, M=2 133, M=4 224, M=5 253, M=8 332, M=16 444 tok/s
       (llama.cpp single-seq reference: 209; pp128 reference: 7335).
-      All fingerprints are post-fix values: pre-fix outputs were computed
-      with frozen-position RoPE and the wrong FFN (see open work) — old
-      numbers retracted, these are the first fully-verified batch numbers.
-      Batch decode uses the generalized M-row q6k batch kernel (M>=2) and
-      MXFP4 tensor-core Q/K/O/gate/up with m_valid-masked activation quant.
+      All M>=2 batch fingerprints were RE-BASELINED 2026-10-27: every earlier
+      MXFP4 batch output was computed with the broken accumulator store
+      mapping (see Decode correctness) and is retracted. Earlier same-day
+      retraction (frozen-position RoPE, wrong FFN) still applies to anything
+      measured before that.
 - [x] Decode correctness (2026-10-27): fixed sm120 fused-silu format mismatch
       (fed native 36-u32 weights to a repacked-42-u32 kernel -> all-NaN logits
       since introduction; every prior bench computed garbage at full speed) and
       the cp.async cross-lane visibility race in the q6k sm120 kernels
       (wait_group is per-thread; needs bar.sync 0 after it, mbar variant now
-      gated on k_blocks % 8 == 0). bench-real-model prints a NaN-tolerant
-      logits fingerprint; TEMPURA_DEBUG_NAN=1 gives per-op NaN bisection;
+      gated on k_blocks % 8 == 0). Third fix round (same day, found via the
+      prefill det=MISMATCH hunt + compute-sanitizer): the mxf4 GEMM's
+      hand-derived m16n8 accumulator store mapping was wrong (row =
+      lane%16 + 8*(j/2) wrote up to 7 rows past every m16 tile into the
+      cudaMallocAsync pool -- silent neighbor corruption at small grids,
+      CUDA error 700 at ~896+ blocks; columns 4-7 never written). Every
+      MXFP4 batch-decode output M>=2 was computed with it and is retracted.
+      The canonical mapping (mma_frag::acc_coords: row = lane/4 + 8*(j>>1),
+      col = 2*(lane%4) + (j&1)) is validated by a random-data CPU reference
+      in tools/mxf4-gemv -- uniform-data tests cannot catch fragment-mapping
+      bugs (any store permutation "passes", NaN comparisons are false).
+      bench-real-model prints a NaN-tolerant logits fingerprint;
+      TEMPURA_DEBUG_NAN=1 gives per-op NaN bisection;
       TEMPURA_NO_SM120_KPAR / TEMPURA_NO_SM120_Q6K / TEMPURA_NO_OXIDE_ATTN /
-      TEMPURA_NO_DUAL_BLOCK / TEMPURA_NO_MXFP4 / TEMPURA_NO_FUSED_SILU are
-      kernel-path bisect switches (TEMPURA_ALLOW_SM120_Q6K=1 opts back into
-      the disabled-by-default mbar GEMV). Divergence-hunting tooling added
-      2026-10-27: per-op bits_sum in the nan-trace, TEMPURA_DEBUG_SLICES
-      (per-1k-element slice sums), bench-batch TEMPURA_BENCH_STEP_FP /
-      TEMPURA_BENCH_ONLY_M / TEMPURA_BENCH_DUMP (element-wise logit diff at
-      the first diverging step) — this is how the silu stream race, the
-      gate/up aliasing, and the mbar drift were localized.
+      TEMPURA_NO_DUAL_BLOCK / TEMPURA_NO_MXFP4 / TEMPURA_NO_FUSED_SILU /
+      TEMPURA_NO_GPU_PREFILL are kernel-path bisect switches
+      (TEMPURA_ALLOW_SM120_Q6K=1 opts back into the disabled-by-default mbar
+      GEMV). Divergence-hunting tooling added 2026-10-27: per-op bits_sum in
+      the nan-trace, TEMPURA_DEBUG_SLICES (per-1k-element slice sums),
+      bench-batch TEMPURA_BENCH_STEP_FP / TEMPURA_BENCH_ONLY_M /
+      TEMPURA_BENCH_DUMP, and compute-sanitizer on the standalone repro —
+      this is how the silu stream race, the gate/up aliasing, and the store
+      mapping were localized.
       Second fix round (batch re-verification, same day): the M=2-hardcoded
       q6k sm120 batch kernel was rewritten as a generalized M-row two-phase
       kernel; MXFP4 activation quant got m_valid masking (stale m_pad rows
@@ -399,38 +410,11 @@ typical-p/repeat/presence/frequency)
       sm120 fused gate+up+SiLU kernel to native 36-u32 format (currently
       bypassed by the format gate), GEMV still ~40% DRAM (dmon: sm
       99-100%, mem 36-46%), host-side per-token overhead
-- [ ] Prefill on GPU: 394 tok/s pp128, TTFT P50 324 ms (2026-10-27 fast
-      path, verified) vs llama.cpp 7335 (18.6x gap). Remaining levers:
+- [ ] Prefill on GPU: 408 tok/s pp128, TTFT P50 314 ms (2026-10-27 fast
+      path, verified) vs llama.cpp 7335 (18x gap). Remaining levers:
       attention is host-staged (per layer: Q D->H download, K/V read from the
       host mirror, attn output H->D re-upload -- forward_batched host API),
-      KV host-mirror updates sync the stream twice per layer, and the MXFP4
-      GEMMs are chunked at m=16 per launch pending the codegen fix below
-- [ ] cutlass-mlir codegen bug (CUDA_OXIDE/cutlass 4.7.0, persists at upstream
-      main 225756b63 + rebuilt backend 2026-10-27): mxf4_batch_gemm_tiled
-      miscompiles at larger grids. Found 2026-10-27 via the prefill
-      det=MISMATCH hunt. Three facts pinned by the standalone shape
-      bisection (tools/mxf4-gemv, RTX 5090): (a) the fault triggers on
-      TOTAL BLOCK COUNT (gridX*gridY) -- gridX=128 gridY<=6 (768 blocks)
-      passes, gridY=7 (896) faults, gridY=8 at gridX=16 (128 blocks) passes
-      -- NOT on m, gridY, or k-loop trip count alone; (b) the original
-      persistent tile-walk variant additionally lost ~half its output tiles
-      via loop-carry miscompilation once a warp iterated (m >= 32); (c) the
-      MLIR handed to libCutlassCompiler is clean (64-bit GEP addressing,
-      correct sreg reads -- dump via CUDA_OXIDE_MLIR_OUTPUT), so the bug is
-      in the compiler's cute.kernel partitioning pass, downstream of our
-      source. Workaround shipped and verified: MxfpGemm::forward_offset
-      chunks prefill GEMMs at m=16 (gridY=1, the bitwise-verified
-      batch-decode configuration; the standalone binary carries the
-      shape-table regression tests). Needs an upstream issue with the
-      standalone repro; a hand-written-PTX GEMM (like the quant kernel,
-      which is shape-safe) is the local escape.
-      WHEN A FIX LANDS on the cuda-oxide bug-hunt branch: rebuild the backend
-      .so + the cubin (recipe in GPU Kernels below), then gate on (1) the
-      standalone repro passing every shape, (2) tempura's tools/mxf4-gemv
-      shape tests passing, (3) bench-batch fingerprints BITWISE-UNCHANGED
-      (m=16 must not move). Then drop the m=16 chunk loop in
-      gemm_mxfp4_prefill (single MxfpGemm::forward launch at full m_pad),
-      verify prefill det=OK in bench-real-model, and re-bench.
+      KV host-mirror updates sync the stream twice per layer
 - [ ] Validate hybrid DeltaNet pipeline against real Qwen3.6 / Bonsai 2
       weights (last attempt: "architecture incompatible" — diagnostics added,
       commit 9c6362d)
@@ -489,10 +473,13 @@ We use a fork of cuda-oxide at `~/Code/github.com/NVLabs/cuda-oxide` with
 mma.sync intrinsics and invariant.load codegen.
 
 Bug-hunt branch `cutlass-mlir-block-count-miscompile` (local, on both the
-laptop and fishtank, based on upstream main `225756b63`): carries the issue
-draft + verified reproducer in `repro/mxf4-block-count/` for the
-`cute.kernel` partitioning miscompile (see open work). Fix work goes there;
-tempura builds against whatever cuda-oxide has checked out on fishtank.
+laptop and fishtank, based on upstream main `225756b63`): created 2026-10-27
+to chase what looked like a cutlass-mlir miscompile; **RESOLVED as our own
+kernel's wrong accumulator store mapping** (see Decode correctness in
+Implemented capabilities — the m16n8 store overflowed tiles into the
+cudaMallocAsync pool). No cuda-oxide bug existed; the branch carries only a
+postmortem in `repro/mxf4-block-count/` and can be deleted. tempura builds
+against whatever cuda-oxide has checked out on fishtank.
 
 **`cargo oxide build` uses a
 cached backend `.so` from `~/.cargo/cuda-oxide/`, built from upstream — NOT
@@ -552,8 +539,9 @@ export CUDA_OXIDE_CUTLASS_COMPILER=~/.cargo/cuda-oxide/toolchains/cutlass/4.7.0/
 export LD_LIBRARY_PATH=~/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/lib:$LD_LIBRARY_PATH
 RUSTC_BOOTSTRAP=1 RUSTUP_TOOLCHAIN=1.99.1 CUDA_OXIDE_DEVICE_BACKEND=cutlass-mlir \
   cargo oxide build --arch sm_120a
-# The standalone binary runs the shape-table regression tests for the
-# cutlass-mlir block-count miscompile (see open work):
+# The standalone binary validates the kernel against a random-data CPU
+# reference (uniform-data tests cannot catch fragment-mapping bugs) across
+# all shapes incl. the engine's (128, 4096, 4096):
 LD_LIBRARY_PATH=~/.rustup/toolchains/nightly-2026-10-11-x86_64-unknown-linux-gnu/lib:$LD_LIBRARY_PATH \
   ./target/release/mxf4-gemv
 
@@ -570,17 +558,18 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
 - Llama-3.1-8B Q4K single-sequence: **134 tok/s decode**, ITL 7.44 ms
       (1.56x gap vs llama.cpp 209 tok/s; outputs verified NaN-free +
       deterministic, 2026-10-27 post-fix)
-- Llama-3.1-8B Q4K batch decode (2026-10-27 post-fix, NO bisect switches;
-      verified = NaN scan every step + final-step fingerprints + fresh-cache
-      replay bitwise identical; measured twice, incl. after the avx512
-      rustflags fix):
-      **M=1 134-135, M=2 92-93, M=4 164, M=5 189-190, M=8 259-260,
-      M=16 372-374 tok/s** — every bench-batch M verified.
-      M>=2 uses the generalized M-row q6k sm120 batch kernel + MXFP4
-      tensor-core Q/K/O/gate/up (m_valid-masked activation quant); M=1
-      routes to the single-seq CUDA graph path.
-      All pre-2026-10-27 batch numbers are retracted (frozen-position RoPE,
-      wrong FFN, all-NaN fused silu — see Decode correctness above).
+- Llama-3.1-8B Q4K prefill: **408 tok/s pp128**, TTFT P50 314 ms
+      (18x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
+      exact-dequant max |logit| rel 0.10)
+- Llama-3.1-8B Q4K batch decode (2026-10-27, post-store-mapping-fix, NO
+      bisect switches; verified = NaN scan every step + final-step
+      fingerprints + fresh-cache replay bitwise identical; every M>=2
+      fingerprint re-baselined this day — earlier MXFP4 batch outputs were
+      computed with the broken accumulator store mapping and retracted):
+      **M=1 135, M=2 133, M=4 224, M=5 253, M=8 332, M=16 444 tok/s**.
+      M>=2 uses the generalized M-row q6k batch kernel + MXFP4 tensor-core
+      Q/K/O/gate/up (m_valid-masked activation quant); M=1 routes to the
+      single-seq CUDA graph path.
 - MXFP4 M=64: 55.6 TFLOPS
 
 If you see `Symbol cuda_device__mma_sync__... not found`, the backend is stale.

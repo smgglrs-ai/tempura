@@ -84,20 +84,22 @@ mod kernels {
 
     // Tiled MXFP4 batch GEMM: C[M][N] = A[M][K] x B[K][N] (f32 output).
     //
-    // Grid: (ceil(n_tiles/4), m_tiles, 1) -- ONE TILE PER WARP, no flat-index
-    // decomposition and no multi-iteration tile loop. Block: (128, 1, 1) = 4 warps;
-    // warp w of block (bx, by) computes tile (tile_m = by, tile_n = bx*4 + w).
-    // Tile size: m16 x n8. Accumulates over all k64_tiles using SM120a MMA.
+    // Grid: (ceil(n_tiles/4), m_tiles, 1) -- ONE TILE PER WARP. Block:
+    // (128, 1, 1) = 4 warps; warp w of block (bx, by) computes tile
+    // (tile_m = by, tile_n = bx*4 + w). Tile size: m16 x n8. Accumulates
+    // over all k64_tiles using SM120a MMA.
     //
-    // WHY one tile per warp: the cutlass-mlir codegen miscompiles loop-carried
-    // multi-variable tile walks -- when total tiles exceed the warp slots
-    // (m >= 32), ~half the output tiles were left unwritten (stale memory) and
-    // the rest stored garbage from mis-carried registers, giving NaN-free
-    // run-to-run drift at m=128 while m=16 (single iteration per warp, no
-    // carry) stayed bitwise-stable. A 2D grid expresses the tile coordinates
-    // directly from blockIdx, so nothing is carried across iterations. At
-    // m=16 the warp-to-tile assignment is identical to the previous flat
-    // slot-indexed kernel, keeping batch-decode outputs bit-identical.
+    // HISTORY: this kernel shipped with a wrong hand-derived accumulator
+    // store mapping (row = lane%16 + 8*(j/2) overflowed the m16 tile into
+    // the cudaMallocAsync pool, columns 4-7 were never written). The OOB
+    // rows silently corrupted neighboring tensors at small grids and raised
+    // CUDA error 700 at ~896+ blocks, which we misdiagnosed for a day as a
+    // cutlass-mlir block-count miscompile (an earlier persistent tile-walk
+    // variant was likewise misread as a loop-carry miscompilation). The fix
+    // is the canonical cuda-device mma_frag::acc_coords mapping; test 4
+    // validates against a random-data CPU reference, which uniform-data
+    // tests fundamentally cannot (any store permutation "passes" and NaN
+    // comparisons are false).
     //
     // A packing: row-major [M x K/2] u8, 2 E2M1 nibbles per byte.
     //   a_packed[m][k/2] contains nibbles for (m, k) and (m, k+1).
