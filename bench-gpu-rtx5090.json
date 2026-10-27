@@ -19,11 +19,11 @@
    "format": "Q4K+Q6K",
    "vram_mb": 17000,
    "decode_tok_s": 134,
-   "prefill_tok_s": 394,
+   "prefill_tok_s": 408,
    "itl_p50_ms": 7.44,
-   "ttft_p50_ms": 323.8,
-   "gap_vs_llamacpp": "decode 1.56x, prefill 18.6x",
-   "kernel": "single-seq: q4k_gemv_sm120_dp4a_kpar8_dual_block + splitk decode attention (S=16, PTX 42587B) + q6k_gemv_dp4a_kpar8 (sm120 mbar variant DEFAULT OFF, history-dependent outputs). batch M>=2: generalized M-row q6k_gemv_sm120_batch + MXFP4 tensor-core Q/K/O/gate/up with m_valid-masked activation quant. prefill m>1: MXFP4 GEMM in 16-row chunks (MxfpGemm::forward_offset) + q6k sm120 batch chunked via capped_batch_chunks (Q6K down_proj; Q4_K_M mixes down between Q4K/MXFP4-tiled and Q6K per layer). Outputs VERIFIED post-fix (2026-10-27): decode NaN-free + deterministic, batch + prefill fresh-session replay bitwise identical, no bisect switches"
+   "ttft_p50_ms": 313.6,
+   "gap_vs_llamacpp": "decode 1.56x, prefill 18.0x",
+   "kernel": "single-seq: q4k_gemv_sm120_dp4a_kpar8_dual_block + splitk decode attention (S=16, PTX 42587B) + q6k_gemv_dp4a_kpar8 (sm120 mbar variant DEFAULT OFF, history-dependent outputs). batch M>=2: generalized M-row q6k_gemv_sm120_batch + MXFP4 tensor-core Q/K/O/gate/up with m_valid-masked activation quant. prefill m>1: single-launch MXFP4 GEMM at full m_pad + q6k sm120 batch chunked via capped_batch_chunks (Q6K down_proj; Q4_K_M mixes down between Q4K/MXFP4-tiled and Q6K per layer). Outputs VERIFIED post-fix (2026-10-27): decode NaN-free + deterministic, batch + prefill fresh-session replay bitwise identical, no bisect switches. M>=2 batch fingerprints RE-BASELINED 2026-10-27 after the accumulator store-mapping fix (earlier MXFP4 batch outputs were wrong)"
   }
  ],
  "llamacpp_reference": {
@@ -35,12 +35,12 @@
  "decode_note": "single request; batched serving amortizes GEMV+attn overhead -- 5+ requests fills all 170 SMs",
  "batch_decode_tok_s": {
   "measured": "2026-10-27 post-fix, NO bisect switches, run twice (second run after the avx512 rustflags fix); every M verified: NaN scan every step, final-step fingerprints, fresh-cache replay bitwise identical",
-  "M1": 134,
-  "M2": 92,
-  "M4": 164,
-  "M5": 189,
-  "M8": 260,
-  "M16": 372,
+  "M1": 135,
+  "M2": 133,
+  "M4": 224,
+  "M5": 253,
+  "M8": 332,
+  "M16": 444,
   "note": "M=1 routes to the single-seq CUDA graph path; M>=2 uses the batch graph (q6k sm120 M-row batch kernel + MXFP4 tensor cores)"
  },
  "bottleneck_analysis": {
@@ -63,7 +63,7 @@
    "gemv": "dp4a kpar8 dual-block unroll added (2x MLP/warp, bitwise-equal by construction); still latency-bound around 40% DRAM during decode (nvidia-smi dmon: sm 99-100%, mem 36-46%)",
    "attention": "split-K flash decode (grid n_heads x 16) replaces one-block-per-head (19% SM util); long-context decode at kv~2700 drops to ~79 tok/s (attention reads ~1MB/token per kv_len -- GQA 4x re-read)",
    "fused_silu_disabled": "gate+up+SiLU fused kernel bypassed (format mismatch) -- separate GEMVs + silu_mul cost ~2-4% vs the broken fused path; porting to native 36-u32 format is the known lever",
-   "prefill": "394 tok/s pp128 (18.6x gap) after the m>1 GPU fast path (2026-10-27; was 7 tok/s host-bound). Remaining: host-staged attention (Q download + host-mirror KV + re-upload per layer) and m=16 GEMM chunking pending the cutlass-mlir codegen fix",
+   "prefill": "408 tok/s pp128 (18x gap) after the m>1 GPU fast path (2026-10-27; was 7 tok/s host-bound). Remaining: host-staged attention (Q download + host-mirror KV + re-upload per layer) and KV host-mirror syncs per layer",
    "splitk_result": "125 -> 134 tok/s (ITL 7.98 -> 7.44ms) post-fix verified (pre-(e)/(f) runs measured 136 with the wrong FFN)"
   }
  },
@@ -108,6 +108,7 @@
    "b_mxfp4_padding_rows": "quantize_activation ran with m_pad=16 while only m rows are valid; the m16k32 tile-max UE8M0 scale is shared by all 16 rows, so stale rows (and OOB reads past the [m*inter] silu buffer) poisoned the scale for valid rows (the M=4 all-NaN). Fixed with m_valid predicated loads + zeroed padding nibbles on the GPU kernel, CPU reference, and all five engine call sites.",
    "c_m1_fallback": "the old no-graph m=1 batch fallback (16 tok/s, nondeterministic NaNs) is no longer reachable; m=1 routes to the verified single-seq forward() path.",
    "d_frozen_position_rope": "cuTile flash-attn kv_len + cutile rope pos were HOST launch scalars baked at graph-capture time and replayed stale -- every replay after the first rotated Q/K at the capture-time position. Determinism+NaN verification cannot catch this class. Fixed by device-scalar indirection: d2d_gather_row PTX kernel copies the rope cos/sin row indexed by the position read from d_positions at execution time; graph paths require oxide_decode_attn (reads kv_len from device).",
+   "third_round_store_mapping": "The mxf4 GEMM's hand-derived m16n8 accumulator store mapping was wrong (row = lane%16 + 8*(j/2) wrote up to 7 rows past every m16 tile into the cudaMallocAsync pool -- silent neighbor corruption at small grids, CUDA error 700 at ~896+ blocks; columns 4-7 never written). Misdiagnosed for a day as a cutlass-mlir block-count miscompile; compute-sanitizer showed writes at correct C-relative offsets landing past the C allocation, pointing at the store mapping. Fixed with the canonical mma_frag::acc_coords mapping (row = lane/4 + 8*(j>>1), col = 2*(lane%4) + (j&1)), validated by a random-data CPU-reference test in tools/mxf4-gemv. Uniform-data tests cannot catch fragment-mapping bugs: any store permutation passes, NaN comparisons are false. Every MXFP4 batch-decode output M>=2 computed before this fix is retracted; M=16 batch throughput rose 372 -> 444 tok/s from the corrected store loop.",
    "e_silu_private_stream": "CutileElementwise launched the SiLU kernel on a PRIVATE stream while producers/consumers ran on the matmul stream with no events -- allocation-layout-dependent race. silu_mul_device(_scratch) now take the caller's stream.",
    "f_gate_up_aliasing": "gemm_q4k_d2d_slot's kpar branch returned the SHARED q8_out_scratch: gate and up projections wrote the same buffer and silu computed silu(up)*up -- the single-seq FFN was mathematically wrong. kpar GEMVs now write per-slot pool tensors; pool misses fall back to the fresh-output oxide f32 GEMV."
   },

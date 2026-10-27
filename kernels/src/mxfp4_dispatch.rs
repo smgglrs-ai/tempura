@@ -4,10 +4,9 @@
 //! GEMM kernel: `mxf4_batch_gemm_tiled` -- one m16n8 output tile per warp on a
 //! 2D grid (ceil(n_tiles/4), m_tiles, 1), block=(128,1,1) = 4 warps. Computes
 //! C[M][N] = A_mxfp4[M][K] x B_mxfp4[N][K] with f32 output using SM120a
-//! m16n8k64 MMA tensor cores. (No flat-index tile walk: the cutlass-mlir
-//! codegen miscompiles loop-carried tile state when a warp iterates more than
-//! once -- m >= 32 left ~half the output tiles unwritten; see the kernel doc
-//! in tools/mxf4-gemv/src/main.rs.)
+//! m16n8k64 MMA tensor cores. Validated against a random-data CPU reference
+//! in tools/mxf4-gemv (uniform-data tests cannot catch fragment-mapping
+//! bugs: any store permutation "passes" and NaN comparisons are false).
 //! Compiled from `tools/mxf4-gemv/` with:
 //!   CUDA_OXIDE_DEVICE_BACKEND=cutlass-mlir cargo oxide build --arch sm_120a
 //!
@@ -120,17 +119,15 @@ impl MxfpGemm {
         Some(Self { cu_module: module, cu_function: func, cu_quant_mod, cu_quant_fn, sm_count, stream })
     }
 
-    /// Row-offset chunk variant of [`MxfpGemm::forward`] for prefill.
+    /// Row-offset chunk variant of [`MxfpGemm::forward`].
     ///
     /// Computes rows `[a_row, a_row + m)` of A into rows `[c_row, c_row + m)`
-    /// of C against the SAME B weights. `m` here is the CHUNK height: call
-    /// with m = 16 to run every launch in the single-iteration-per-warp grid
-    /// `(ceil(n_tiles/4), 1, 1)` -- the configuration that is bitwise-verified
-    /// in the batch-decode path and in the standalone shape tests. The
-    /// cutlass-mlir codegen goes illegally out-of-bounds at larger m_tiles
-    /// (m >= 128 faults even with k64_tiles = 1; smaller m_tiles are fine but
-    /// only m = 16 carries a verification record), so the engine chunks
-    /// prefill GEMMs through this entry point.
+    /// of C against the SAME B weights. Kept as a utility for callers that
+    /// want to bound a single launch's grid (e.g. feeding a kernel whose
+    /// output tile coverage is still being validated); the prefill path
+    /// launches at full m_pad since the accumulator store mapping was fixed
+    /// (2026-10-27) and every shape up to (128, 4096, 4096) is validated
+    /// against a random-data CPU reference in tools/mxf4-gemv.
     pub fn forward_offset(
         &self,
         a_packed:  &Arc<Tensor<u8>>,
@@ -208,9 +205,9 @@ impl MxfpGemm {
     ///
     /// `m` must be multiple of 16, `n` multiple of 8, `k` multiple of 64.
     /// Grid: (ceil(n_tiles/4), m_tiles, 1) -- one m16n8 output tile per warp.
-    /// Verified shapes: m = 16 (batch-decode path, bitwise) and the standalone
-    /// shape tests; LARGER m miscompiles (illegal memory access) -- chunk
-    /// through [`MxfpGemm::forward_offset`] with m = 16 instead.
+    /// The kernel is validated against a random-data CPU reference for every
+    /// shape in tools/mxf4-gemv (including (128, 4096, 4096) at 1024 blocks)
+    /// plus a bitwise double-launch determinism check.
     /// Launch is async on the stored stream; caller syncs if needed.
     pub fn forward(
         &self,
