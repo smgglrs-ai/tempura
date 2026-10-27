@@ -217,10 +217,15 @@ impl CutileElementwise {
         up: &Arc<Tensor<f32>>,
         seq_len: usize,
         inter: usize,
+        stream: &Arc<Stream>,
     ) -> Result<Arc<Tensor<f32>>> {
         let n = seq_len * inter;
         let n_pad = n.div_ceil(B) * B;
-        let stream = &self.stream;
+        // Launch on the CALLER's stream: this struct owns a private stream,
+        // and running the kernel there races with the producers of gate/up and
+        // the consumers of the output, which all run on the caller's stream
+        // with no cross-stream events (found via bench-batch fresh-cache
+        // replay: allocation-history-dependent logits).
 
         let out_t = api::zeros::<f32>(&[n_pad])
             .sync_on(stream)
@@ -278,10 +283,12 @@ impl CutileElementwise {
         seq_len: usize,
         inter: usize,
         scratch: &mut Option<Arc<Tensor<f32>>>,
+        stream: &Arc<Stream>,
     ) -> Result<Arc<Tensor<f32>>> {
         let n = seq_len * inter;
         let n_pad = n.div_ceil(B) * B;
-        let stream = &self.stream;
+        // Launch on the CALLER's stream (see silu_mul_device): this struct's
+        // private stream has no events tying it to the surrounding ops.
 
         let out_tensor = match scratch.take() {
             Some(arc) => match Arc::try_unwrap(arc) {
