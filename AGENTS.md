@@ -445,13 +445,6 @@ typical-p/repeat/presence/frequency)
 - [ ] Prefill on GPU is host-bound: 7 tok/s pp128 (TTFT P50 19.3 s,
       2026-10-27 post-fix re-measure; CPU 97%, GPU 8% through it) vs
       llama.cpp 7335 (~1100x gap)
-- [ ] `.cargo/config.toml` forces `+avx512f,+avx512bw,+avx512vnni,+avx512dq`
-      (commit 876a0a8, for the fishtank CPU) — every cargo build on the
-      Lunar Lake laptop SIGILLs in build scripts with a baffling
-      `signal: 4` (the laptop has AVX2/AVX-VNNI, no AVX-512). Workaround:
-      `RUSTFLAGS="-C target-cpu=native"` overrides the config. Fix: drop
-      the explicit avx512 features (target-cpu=native already enables
-      what the build host supports) or gate them per-host.
 - [ ] Validate hybrid DeltaNet pipeline against real Qwen3.6 / Bonsai 2
       weights (last attempt: "architecture incompatible" — diagnostics added,
       commit 9c6362d)
@@ -467,6 +460,10 @@ typical-p/repeat/presence/frequency)
 
 ```sh
 cargo build              # build all workspace crates
+                         # (.cargo/config.toml uses target-cpu=native only --
+                         # never force +avx512* features: hosts without
+                         # AVX-512 SIGILL, hosts with it get the full set
+                         # from native anyway)
 cargo test               # 907 test functions (26 ignored)
 cargo kani --package tempura-kernels   # 240 Kani harnesses (kernels+engine)
 ./scripts/run-verus.sh   # 588 Verus proof functions, 80 modules
