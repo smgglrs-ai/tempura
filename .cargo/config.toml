@@ -1,5 +1,8 @@
 [build]
-rustflags = [
-    "-C", "target-cpu=native",
-    "-C", "target-feature=+avx2,+fma,+avxvnni,+avx512f,+avx512bw,+avx512vnni,+avx512dq,+f16c",
-]
+# target-cpu=native only. Do NOT add explicit +avx512* features here:
+# - on hosts WITH AVX-512 (fishtank's 9950X3D) native already enables the
+#   full set -- a superset of any hand-written list;
+# - on hosts WITHOUT it (the Lunar Lake laptop) forced features compile
+#   AVX-512 instructions into every path, including the
+#   is_x86_feature_detected!("avx2") fallbacks, and every build SIGILLs.
+rustflags = ["-C", "target-cpu=native"]
