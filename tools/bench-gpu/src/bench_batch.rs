@@ -181,6 +181,30 @@ fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> BatchResult {
                     println!("           step {s:>3}: run1={} run2={}{mark}",
                         step_fps[s], v_step_fps[s]);
                 }
+                // TEMPURA_BENCH_DUMP: element-wise diff of the diverging step's
+                // logits (run 1 vs run 2), localizing which output region moves.
+                if std::env::var("TEMPURA_BENCH_DUMP").is_ok() && !last.is_empty() && !v_last.is_empty() {
+                    for r in 0..last.len().min(v_last.len()) {
+                        let a = &last[r];
+                        let b = &v_last[r];
+                        let n = a.len().min(b.len());
+                        let (mut ndiff, mut first_idx) = (0usize, None);
+                        for j in 0..n {
+                            if a[j].to_bits() != b[j].to_bits() {
+                                ndiff += 1;
+                                if first_idx.is_none() { first_idx = Some(j); }
+                            }
+                        }
+                        println!("           [dump] req {r}: {ndiff}/{} logits differ, first at idx {:?}",
+                            n, first_idx);
+                        if let Some(j) = first_idx {
+                            println!("             run1[{j}]={:?} run2[{j}]={:?}", a[j], b[j]);
+                            println!("             run1[j-2..j+3]={:?} run2[j-2..j+3]={:?}",
+                                &a[j.saturating_sub(2)..(j + 3).min(n)],
+                                &b[j.saturating_sub(2)..(j + 3).min(n)]);
+                        }
+                    }
+                }
             }
             None => println!("         [step-fp] no step-level divergence ({} steps)", step_fps.len()),
         }
