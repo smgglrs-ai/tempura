@@ -4449,7 +4449,12 @@ impl CutileGpuModel {
             // FFN gate + up projections.
             // Decode path: try fused gate+up GEMV with inline SiLU (halves activation DRAM).
             // Prefill path (seq_len > 1) or non-Q4K: fall through to two separate GEMVs.
+            // TEMPURA_NO_FUSED_SILU=1 bisects the fused kernel off (separate GEMVs).
+            let fused_silu_disabled = std::env::var("TEMPURA_NO_FUSED_SILU")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             let gate_silu_n_dev = if seq_len == 1
+                && !fused_silu_disabled
                 && self.device_weights_q4k.contains_key(gate_w_name.as_str())
                 && self.device_weights_q4k.contains_key(up_w_name.as_str())
                 && self.oxide_q4k_gemv.as_ref().map(|o| o.has_sm120_fused_silu() || o.has_fused_silu()).unwrap_or(false)
