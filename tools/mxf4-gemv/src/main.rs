@@ -435,4 +435,102 @@ fn main() {
             std::process::exit(1);
         }
     }
+
+    // --- Test 4: engine-shape GEMM (m=128, n=4096, k=4096: k64_tiles=64) ---
+    // The exact shape the prefill path launches (q_proj at m_pad=128). Uniform
+    // 1.0 data with 1.0 scales: every output must be exactly K = 4096.0, and
+    // two back-to-back launches into separate buffers must agree bitwise --
+    // the engine's isolation probe showed run-varying divergence at this
+    // shape (NaN-free, identical inputs) which smaller shapes do not
+    // reproduce.
+    {
+        let m: u32 = 128;
+        let n: u32 = 4096;
+        let k: u32 = 4096;
+        let k64_tiles: u32 = k / 64;
+        let nibble_one: u8 = 0x2;
+        let scale_one: u8 = 0x7F;
+
+        let a_data = build_uniform_e2m1(m as usize, k as usize, nibble_one);
+        let b_data = build_uniform_e2m1(n as usize, k as usize, nibble_one);
+        let a_scales = build_uniform_scales((m / 16) as usize, k64_tiles as usize, scale_one);
+        let b_scales = build_uniform_scales((n / 8) as usize, k64_tiles as usize, scale_one);
+
+        let a_dev = DeviceBuffer::from_host(&stream, &a_data).expect("alloc A");
+        let b_dev = DeviceBuffer::from_host(&stream, &b_data).expect("alloc B");
+        let a_sc_dev = DeviceBuffer::from_host(&stream, &a_scales).expect("alloc a_scales");
+        let b_sc_dev = DeviceBuffer::from_host(&stream, &b_scales).expect("alloc b_scales");
+
+        let c_size = (m * n) as usize;
+        let run = |poison: f32| -> Vec<f32> {
+            let c_dev = DeviceBuffer::from_host(&stream, &vec![poison; c_size]).expect("alloc C");
+            let config = LaunchConfig {
+                grid_dim: ((n / 8).div_ceil(4), m / 16, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                module
+                    .mxf4_batch_gemm_tiled(
+                        &stream,
+                        config,
+                        a_dev.cu_deviceptr() as *const u8,
+                        a_sc_dev.cu_deviceptr() as *const u8,
+                        b_dev.cu_deviceptr() as *const u8,
+                        b_sc_dev.cu_deviceptr() as *const u8,
+                        c_dev.cu_deviceptr() as *mut f32,
+                        m,
+                        n,
+                        k64_tiles,
+                    )
+                    .expect("tiled engine-shape launch");
+            }
+            stream.synchronize().expect("synchronize");
+            c_dev.to_host_vec(&stream).expect("copy C")
+        };
+
+        let expected = k as f32;
+        let mut pass = true;
+        for run_idx in 0..2 {
+            let result = run(f32::NAN);
+            let mut bad = 0usize;
+            let mut first: Option<usize> = None;
+            for (i, &v) in result.iter().enumerate() {
+                if (v - expected).abs() > 1e-2 {
+                    if first.is_none() {
+                        first = Some(i);
+                    }
+                    bad += 1;
+                }
+            }
+            if bad == 0 {
+                println!(
+                    "PASS tiled engine-shape (run {run_idx}): M={m} N={n} K={k} all {c_size} outputs = {expected:.1}"
+                );
+            } else {
+                eprintln!(
+                    "FAIL tiled engine-shape (run {run_idx}): {bad}/{c_size} wrong (first at {first:?}, value {:?})",
+                    first.map(|i| result[i])
+                );
+                pass = false;
+            }
+        }
+        // Bitwise determinism: two launches, identical inputs, must agree.
+        let r1 = run(f32::NAN);
+        let r2 = run(f32::NAN);
+        let first_diff = r1.iter().zip(&r2).position(|(x, y)| x.to_bits() != y.to_bits());
+        if let Some(i) = first_diff {
+            eprintln!(
+                "FAIL tiled engine-shape determinism: first diff at {i}: {:08x} vs {:08x}",
+                r1[i].to_bits(),
+                r2[i].to_bits()
+            );
+            pass = false;
+        } else {
+            println!("PASS tiled engine-shape determinism: two launches bitwise identical");
+        }
+        if !pass {
+            std::process::exit(1);
+        }
+    }
 }
