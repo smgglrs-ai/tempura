@@ -321,11 +321,24 @@ Qwen3.6-27B weights** — see open work.
 - [x] Native MXFP4 pipeline: E2M1+UE8M0 quant (CPU), on-GPU activation
       quant, tensor-core GEMM, all 7 projections, BF16 loader; 55.6 TFLOPS
       at M=64
+- [x] Prefill fast path (2026-10-27): m>1 GEMMs run on-GPU -- tiled Q4K
+      projections via MXFP4 quant + mxf4_batch_gemm_tiled in 16-row chunks,
+      Q6K tensors via the sm120 M-row batch GEMV chunked over rows
+      (capped_batch_chunks); host-dequant fallback remains for incompatible
+      strides. 394 tok/s pp128 (was 7 host-bound), TTFT P50 324 ms, gap vs
+      llama.cpp 7335 down to 18.6x. Verified: NaN-free, fresh-session logits
+      bitwise-replay (bench-real-model fingerprints + TEMPURA_BENCH_PREFILL_AB
+      numerics delta vs exact-dequant); batch-decode fingerprints unchanged.
+      TEMPURA_NO_GPU_PREFILL=1 bisects back to the host path. Remaining
+      prefill levers: attention still host-staged (Q download + host-mirror KV
+      + re-upload per layer), GEMM chunked at m=16 pending the cutlass-mlir
+      codegen fix (see open work).
 - [x] Benchmarks (2026-10-27, post-fix, RTX 5090, bench-batch all-M
       verified with NO bisect switches — NaN-free + fresh-cache replay
-      bitwise): single-seq 134 tok/s decode, ITL 7.44 ms (bench-real-model);
+      bitwise): single-seq 134 tok/s decode, ITL 7.44 ms; prefill 394 tok/s
+      pp128, TTFT P50 324 ms, logits fingerprint det=OK (bench-real-model);
       batch M=1 135, M=2 93, M=4 164, M=5 190, M=8 259, M=16 374 tok/s
-      (llama.cpp single-seq reference: 209).
+      (llama.cpp single-seq reference: 209; pp128 reference: 7335).
       All fingerprints are post-fix values: pre-fix outputs were computed
       with frozen-position RoPE and the wrong FFN (see open work) — old
       numbers retracted, these are the first fully-verified batch numbers.
@@ -386,9 +399,26 @@ typical-p/repeat/presence/frequency)
       sm120 fused gate+up+SiLU kernel to native 36-u32 format (currently
       bypassed by the format gate), GEMV still ~40% DRAM (dmon: sm
       99-100%, mem 36-46%), host-side per-token overhead
-- [ ] Prefill on GPU is host-bound: 7 tok/s pp128 (TTFT P50 19.3 s,
-      2026-10-27 post-fix re-measure; CPU 97%, GPU 8% through it) vs
-      llama.cpp 7335 (~1100x gap)
+- [ ] Prefill on GPU: 394 tok/s pp128, TTFT P50 324 ms (2026-10-27 fast
+      path, verified) vs llama.cpp 7335 (18.6x gap). Remaining levers:
+      attention is host-staged (per layer: Q D->H download, K/V read from the
+      host mirror, attn output H->D re-upload -- forward_batched host API),
+      KV host-mirror updates sync the stream twice per layer, and the MXFP4
+      GEMMs are chunked at m=16 per launch pending the codegen fix below
+- [ ] cutlass-mlir codegen bug (cuda-oxide, upstream): mxf4_batch_gemm_tiled
+      miscompiles at larger grids. Two manifestations found 2026-10-27 via the
+      prefill det=MISMATCH hunt: (a) the original persistent tile-walk
+      (flat index + loop carry) left ~half the output tiles unwritten and
+      stored garbage from mis-carried registers once a warp iterated more
+      than once (m >= 32); (b) even a trivial one-tile-per-warp 2D-grid
+      rewrite makes ILLEGAL memory accesses at m_tiles >= 8 (standalone shape
+      bisection: (16,4096,4096) and (32,4096,4096) pass, (128,4096,64)
+      faults with CUDA error 700; all source-level indexing is exactly
+      in-bounds). Workaround shipped: MxfpGemm::forward_offset chunks prefill
+      GEMMs at m=16 (the bitwise-verified batch-decode configuration; the
+      standalone binary in tools/mxf4-gemv carries the shape-bisection
+      regression tests). Needs an upstream issue + fix; a hand-written-PTX
+      GEMM (like the quant kernel, which is shape-safe) is the local escape.
 - [ ] Validate hybrid DeltaNet pipeline against real Qwen3.6 / Bonsai 2
       weights (last attempt: "architecture incompatible" — diagnostics added,
       commit 9c6362d)
