@@ -9,19 +9,29 @@ use std::sync::Arc;
 use cuda_core::{CudaContext, DeviceBuffer, Stream};
 use cutile::tensor::Tensor;
 
+use crate::decode_attn_splitk as splitk_math;
 use crate::{KernelError, Result};
 
 const PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oxide_decode_attn.ptx"));
 const KERNEL_NAME:       &str = "oxide_decode_attn";
 const KERNEL_KPAR_NAME:  &str = "oxide_decode_attn_kpar";
 const KERNEL_BATCH_NAME: &str = "oxide_decode_attn_batch";
+const KERNEL_SPLITK_NAME:  &str = "oxide_decode_attn_splitk";
+const KERNEL_COMBINE_NAME: &str = "oxide_decode_attn_combine";
 const WARPS_PER_BLOCK_KPAR: u32 = 8;
+const WARPS_PER_BLOCK_SPLITK: u32 = 4;
+const BLOCK_DIM_SPLITK: u32 = WARPS_PER_BLOCK_SPLITK * 32;
+
+/// KV-length splits per head (grid Y dim); see `decode_attn_splitk`.
+pub use splitk_math::ATTN_SPLITK_SPLITS;
 
 pub struct OxideDecodeAttn {
     cu_module:          cuda_core::sys::CUmodule,
     cu_function:        cuda_core::sys::CUfunction,
     cu_function_kpar:   Option<cuda_core::sys::CUfunction>,
     cu_function_batch:  Option<cuda_core::sys::CUfunction>,
+    cu_function_splitk: Option<cuda_core::sys::CUfunction>,
+    cu_function_combine: Option<cuda_core::sys::CUfunction>,
     stream:             Arc<Stream>,
 }
 
@@ -29,6 +39,11 @@ unsafe impl Send for OxideDecodeAttn {}
 unsafe impl Sync for OxideDecodeAttn {}
 
 impl OxideDecodeAttn {
+    /// Device scratch length (f32 elements) for the split-K decode attention.
+    pub const fn splitk_scratch_len(n_heads: usize, head_dim: usize) -> usize {
+        splitk_math::scratch_len(n_heads, head_dim, ATTN_SPLITK_SPLITS)
+    }
+
     /// Load PTX from the embedded build artifact.
     pub fn new(stream: Arc<Stream>) -> Result<Self> {
         // cuModuleLoadData for PTX text format requires a null-terminated string.
@@ -74,9 +89,26 @@ impl OxideDecodeAttn {
         };
         let cu_function_batch = if batch_rc == 0 { Some(cu_function_batch) } else { None };
 
-        eprintln!("[oxide] loaded decode-attn kernel (PTX {} bytes, kpar={}, batch={})",
-            PTX.len(), cu_function_kpar.is_some(), cu_function_batch.is_some());
-        Ok(Self { cu_module, cu_function, cu_function_kpar, cu_function_batch, stream })
+        // Try to load the split-K + combine pair (falls back to kpar).
+        let splitk_name = std::ffi::CString::new(KERNEL_SPLITK_NAME).unwrap();
+        let mut cu_function_splitk = std::ptr::null_mut::<cuda_core::sys::CUfunc_st>();
+        let splitk_rc = unsafe {
+            cuda_core::sys::cuModuleGetFunction(&mut cu_function_splitk, cu_module, splitk_name.as_ptr())
+        };
+        let combine_name = std::ffi::CString::new(KERNEL_COMBINE_NAME).unwrap();
+        let mut cu_function_combine = std::ptr::null_mut::<cuda_core::sys::CUfunc_st>();
+        let combine_rc = unsafe {
+            cuda_core::sys::cuModuleGetFunction(&mut cu_function_combine, cu_module, combine_name.as_ptr())
+        };
+        let (cu_function_splitk, cu_function_combine) = if splitk_rc == 0 && combine_rc == 0 {
+            (Some(cu_function_splitk), Some(cu_function_combine))
+        } else {
+            (None, None)
+        };
+
+        eprintln!("[oxide] loaded decode-attn kernel (PTX {} bytes, kpar={}, batch={}, splitk={})",
+            PTX.len(), cu_function_kpar.is_some(), cu_function_batch.is_some(), cu_function_splitk.is_some());
+        Ok(Self { cu_module, cu_function, cu_function_kpar, cu_function_batch, cu_function_splitk, cu_function_combine, stream })
     }
 
     /// Run decode attention with kv_len read from a device tensor at execution time.
@@ -208,6 +240,111 @@ impl OxideDecodeAttn {
         if rc != 0 {
             return Err(KernelError::InvalidConfig(format!(
                 "OxideDecodeAttn::forward_kpar_d2d cuLaunchKernel failed: {rc}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether the split-K + combine pair is available.
+    pub fn has_splitk(&self) -> bool { self.cu_function_splitk.is_some() }
+
+    /// Split-K decode attention: grid (n_heads, ATTN_SPLITK_SPLITS), 4 warps
+    /// per block, each block covering ceil(kv_len / splits) KV tokens.
+    ///
+    /// `scratch` must be a stable-address device tensor of
+    /// `splitk_scratch_len(n_heads, head_dim)` f32 elements, pre-allocated
+    /// BEFORE CUDA graph capture (the engine owns it for the graph's lifetime).
+    /// Falls back to `forward_kpar_d2d` when the PTX lacks the split-K pair.
+    pub fn forward_splitk_d2d(
+        &self,
+        out:        &Arc<Tensor<f32>>,
+        q:          &Arc<Tensor<f32>>,
+        k_cache:    &Arc<Tensor<f32>>,
+        v_cache:    &Arc<Tensor<f32>>,
+        kv_len_dev: &Arc<Tensor<f32>>,
+        scratch:    &Arc<Tensor<f32>>,
+        n_heads:    usize,
+        n_kv_heads: usize,
+        head_dim:   usize,
+        scale:      f32,
+    ) -> Result<()> {
+        let f = match (self.cu_function_splitk, self.cu_function_combine) {
+            (Some(f), Some(c)) => (f, c),
+            _ => return self.forward_kpar_d2d(out, q, k_cache, v_cache, kv_len_dev, n_heads, n_kv_heads, head_dim, scale),
+        };
+        let heads_per_group = (n_heads / n_kv_heads) as u32;
+        let kv_len_ptr = kv_len_dev.device_pointer().cu_deviceptr() as u64;
+
+        let mut scr_ptr = scratch.device_pointer().cu_deviceptr() as u64;
+        let mut q_ptr   = q.device_pointer().cu_deviceptr() as u64;
+        let mut k_ptr   = k_cache.device_pointer().cu_deviceptr() as u64;
+        let mut v_ptr   = v_cache.device_pointer().cu_deviceptr() as u64;
+        let mut kv_p    = kv_len_ptr;
+        let mut sc      = scale;
+        let mut nkv     = n_kv_heads as u32;
+        let mut hd      = head_dim as u32;
+        let mut hpg     = heads_per_group;
+        let mut spl     = ATTN_SPLITK_SPLITS;
+
+        let mut params: [*mut std::ffi::c_void; 10] = [
+            &mut scr_ptr as *mut _ as *mut std::ffi::c_void,  // param 0: scratch
+            &mut q_ptr   as *mut _ as *mut std::ffi::c_void,  // param 1: q
+            &mut k_ptr   as *mut _ as *mut std::ffi::c_void,  // param 2: k_cache
+            &mut v_ptr   as *mut _ as *mut std::ffi::c_void,  // param 3: v_cache
+            &mut kv_p    as *mut _ as *mut std::ffi::c_void,  // param 4: kv_len_ptr
+            &mut sc      as *mut _ as *mut std::ffi::c_void,  // param 5: scale
+            &mut nkv     as *mut _ as *mut std::ffi::c_void,  // param 6: n_kv_heads
+            &mut hd      as *mut _ as *mut std::ffi::c_void,  // param 7: head_dim
+            &mut hpg     as *mut _ as *mut std::ffi::c_void,  // param 8: heads_per_group
+            &mut spl     as *mut _ as *mut std::ffi::c_void,  // param 9: n_splits
+        ];
+
+        // smem: (head_dim*(W+1) + 2*W) * 4 bytes, W = WARPS_PER_BLOCK_SPLITK
+        let w = WARPS_PER_BLOCK_SPLITK as usize;
+        let shared_bytes = ((head_dim * (w + 1) + 2 * w) * 4) as u32;
+
+        let rc = unsafe {
+            cuda_core::sys::cuLaunchKernel(
+                f.0,
+                n_heads as u32, ATTN_SPLITK_SPLITS, 1,
+                BLOCK_DIM_SPLITK, 1, 1,
+                shared_bytes,
+                self.stream.cu_stream(),
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "OxideDecodeAttn::forward_splitk_d2d cuLaunchKernel(splitk) failed: {rc}"
+            )));
+        }
+
+        // Combine pass: merge per-split partials and normalise.
+        let mut out_ptr = out.device_pointer().cu_deviceptr() as u64;
+        let mut spl2    = ATTN_SPLITK_SPLITS;
+        let mut hd2     = head_dim as u32;
+        let mut cparams: [*mut std::ffi::c_void; 4] = [
+            &mut out_ptr as *mut _ as *mut std::ffi::c_void,  // param 0: out
+            &mut scr_ptr as *mut _ as *mut std::ffi::c_void,  // param 1: scratch
+            &mut spl2    as *mut _ as *mut std::ffi::c_void,  // param 2: n_splits
+            &mut hd2     as *mut _ as *mut std::ffi::c_void,  // param 3: head_dim
+        ];
+
+        let rc = unsafe {
+            cuda_core::sys::cuLaunchKernel(
+                f.1,
+                n_heads as u32, 1, 1,
+                BLOCK_DIM_SPLITK, 1, 1,
+                0,
+                self.stream.cu_stream(),
+                cparams.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "OxideDecodeAttn::forward_splitk_d2d cuLaunchKernel(combine) failed: {rc}"
             )));
         }
         Ok(())
