@@ -3831,10 +3831,34 @@ impl CutileGpuModel {
             )
             .unwrap_or_else(|e| panic!("mxfp4 prefill gemm {weight_name}: {e}"));
         if self.debug_nan_trace {
+            // Isolation probe: same inputs, second launch, fresh output buffer.
+            // If out2 != out the kernel/codegen itself is nondeterministic.
+            let out2 = Arc::new(
+                api::zeros::<f32>(&[m_pad * n])
+                    .sync_on(stream)
+                    .expect("dbg out2 alloc"),
+            );
+            mxfp4
+                .forward(
+                    &packed,
+                    &scales,
+                    &dw.packed,
+                    &dw.tiled_scales,
+                    &out2,
+                    m_pad as u32,
+                    n as u32,
+                    (k / 64) as u32,
+                )
+                .unwrap_or_else(|e| panic!("mxfp4 dbg gemm2 {weight_name}: {e}"));
             let ob: Vec<f32> = Arc::clone(&out).to_host_vec().sync_on(stream).expect("dbg out");
+            let ob2: Vec<f32> = Arc::clone(&out2).to_host_vec().sync_on(stream).expect("dbg out2");
             let osum: u64 = ob[..(m_pad * n).min(ob.len())].iter().map(|v| v.to_bits() as u64).sum();
+            let osum2: u64 = ob2[..(m_pad * n).min(ob2.len())].iter().map(|v| v.to_bits() as u64).sum();
+            let first_diff = ob.iter().zip(&ob2).position(|(x, y)| x.to_bits() != y.to_bits());
             eprintln!(
-                "[nan-trace] {weight_name} mxfp4-gemm: out_fresh={osum} (len={} m_pad*n={})",
+                "[nan-trace] {weight_name} mxfp4-gemm: out_fresh={osum} out2_fresh={osum2} \
+                 same={} first_diff={first_diff:?} (len={} m_pad*n={})",
+                osum == osum2,
                 ob.len(),
                 m_pad * n
             );
