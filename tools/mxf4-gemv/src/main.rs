@@ -212,23 +212,29 @@ mod kernels {
             }
 
             // --- Store accumulator to C ---
-            // C[M][N] f32 row-major. m16n8 accumulator PTX layout:
-            //   reg[j]: row = (lane%16) + 8*(j/2), col = (lane/16)*2 + (j%2) [within tile]
+            // C[M][N] f32 row-major. Canonical m16n8 accumulator layout
+            // (cuda-device mma_frag::acc_coords):
+            //   row = lane/4 + 8*(j>>1)  in [0,16)
+            //   col = 2*(lane%4) + (j&1) in [0,8)
+            // The original hand-derived mapping (row = lane%16 + 8*(j/2),
+            // col = (lane/16)*2 + j%2) overflowed the tile: rows up to 23
+            // wrote past the tile into the cudaMallocAsync pool (silent
+            // neighbor corruption at small grids, illegal access at ~896+
+            // blocks) and columns 4-7 were never written. Validated against
+            // a random-data CPU reference; the uniform-data tests could not
+            // catch it (any store permutation "passes", and NaN comparisons
+            // are false).
             let c_row_base = (tile_m * 16) as usize;
             let c_col_base = (tile_n * 8) as usize;
             let n_usize = n as usize;
             let regs = acc.registers();
 
-            let r0 = c_row_base + lane % 16;
-            let r1 = c_row_base + lane % 16 + 8;
-            let c0 = c_col_base + (lane / 16) * 2;
-            let c1 = c_col_base + (lane / 16) * 2 + 1;
-
-            unsafe {
-                *c.add(r0 * n_usize + c0) = regs[0];
-                *c.add(r0 * n_usize + c1) = regs[1];
-                *c.add(r1 * n_usize + c0) = regs[2];
-                *c.add(r1 * n_usize + c1) = regs[3];
+            for j in 0..4usize {
+                let row = c_row_base + lane / 4 + 8 * (j >> 1);
+                let col = c_col_base + 2 * (lane % 4) + (j & 1);
+                unsafe {
+                    *c.add(row * n_usize + col) = regs[j];
+                }
             }
     }
 }
@@ -353,7 +359,7 @@ fn main() {
         let expected = 64.0_f32;
         let mut pass = true;
         for (i, &v) in result.iter().enumerate() {
-            if (v - expected).abs() > 1e-3 {
+            if v.is_nan() || (v - expected).abs() > 1e-3 {
                 eprintln!("  tiled FAIL C[{i}] = {v} (expected {expected})");
                 pass = false;
             }
@@ -421,7 +427,7 @@ fn main() {
         let expected = 64.0_f32;
         let mut pass = true;
         for (i, &v) in result.iter().enumerate() {
-            if (v - expected).abs() > 1e-3 {
+            if v.is_nan() || (v - expected).abs() > 1e-3 {
                 eprintln!("  tiled multi-tile FAIL C[{i}] = {v} (expected {expected})");
                 pass = false;
             }
@@ -436,43 +442,67 @@ fn main() {
         }
     }
 
-    // --- Test 4: shape bisection + engine-shape GEMM -----------------------
-    // Uniform 1.0 data with 1.0 scales: every output must be exactly K. The
-    // engine's isolation probe showed run-varying divergence at the prefill
-    // shape (m=128, n=4096, k=4096) which smaller shapes do not reproduce;
-    // bisect which dimension triggers it, then verify the engine shape
-    // end-to-end including a bitwise double-launch determinism check.
+    // --- Test 4: random-data reference validation across shapes ------------
+    // Uniform-data tests cannot validate fragment lane mappings (any store
+    // permutation "passes" and NaN comparisons are false); this test uses
+    // random E2M1 nibbles with uniform 1.0 scales so the CPU reference is a
+    // plain dot product. It exists because the original hand-derived store
+    // mapping was wrong (row = lane%16 + 8 overflowed the m16 tile into the
+    // cudaMallocAsync pool -- silent neighbor corruption at small grids,
+    // illegal access at ~896+ blocks -- misdiagnosed for a day as a
+    // cutlass-mlir block-count miscompile). Includes the shapes that used
+    // to fault plus the engine shape, and a bitwise double-launch check.
     {
-        let nibble_one: u8 = 0x2;
         let scale_one: u8 = 0x7F;
-        // Shape table accumulated across bisection runs (RTX 5090, cutlass
-        // 4.7.0, backend 225756b63): faults trigger on TOTAL BLOCK COUNT
-        // (gridX * gridY), not on m, gridY, or the k-loop alone --
-        //   (16..96, 4096, .) gridX=128, gridY<=6  (<=768 blocks): PASS
-        //   (112, 4096, 64)   gridX=128, gridY=7   ( 896 blocks): FAULT
-        //   (128, 16|512, 64) gridX<=64, gridY=8   (<=512 blocks): PASS
-        //   (128, 4096, .)    gridX=128, gridY=8   (1024 blocks): FAULT
-        // The MLIR handed to libCutlassCompiler is clean (64-bit GEP
-        // addressing, correct sreg reads), so the miscompilation is in the
-        // compiler's cute.kernel partitioning pass.
+        let mut seed = 0x12345678u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const E2M1_MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
         for &(m, n, k) in [
-            (16u32, 4096u32, 4096u32),
+            (16u32, 8u32, 64u32),
+            (16, 4096, 4096),
             (32, 4096, 4096),
-            (64, 4096, 64),
             (96, 4096, 64),
             (128, 16, 64),
             (128, 512, 64),
-            (112, 4096, 64),
-            (128, 4096, 64),
-            (128, 4096, 4096),
+            (112, 4096, 64),   // used to fault (896 blocks)
+            (128, 4096, 64),   // used to fault (1024 blocks)
+            (128, 4096, 4096), // engine prefill shape
         ]
         .iter()
         {
             let k64_tiles: u32 = k / 64;
-            let a_data = build_uniform_e2m1(m as usize, k as usize, nibble_one);
-            let b_data = build_uniform_e2m1(n as usize, k as usize, nibble_one);
+            let a_data: Vec<u8> = (0..(m as usize * k as usize / 2))
+                .map(|_| (rnd() & 0xFF) as u8)
+                .collect();
+            let b_data: Vec<u8> = (0..(n as usize * k as usize / 2))
+                .map(|_| (rnd() & 0xFF) as u8)
+                .collect();
             let a_scales = build_uniform_scales((m / 16) as usize, k64_tiles as usize, scale_one);
             let b_scales = build_uniform_scales((n / 8) as usize, k64_tiles as usize, scale_one);
+
+            // CPU reference: decode nibbles, plain dot (scales are 1.0).
+            let decode = |buf: &[u8], row: usize, kk: usize, rowlen_k: usize| -> f32 {
+                let byte = buf[row * (rowlen_k / 2) + kk / 2];
+                let nib = if kk % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                let mag = E2M1_MAG[(nib & 0x7) as usize];
+                if nib & 8 != 0 { -mag } else { mag }
+            };
+            let mut reference = vec![0.0f32; (m * n) as usize];
+            for mi in 0..m as usize {
+                for ni in 0..n as usize {
+                    let mut sum = 0.0f32;
+                    for kk in 0..k as usize {
+                        sum += decode(&a_data, mi, kk, k as usize)
+                            * decode(&b_data, ni, kk, k as usize);
+                    }
+                    reference[mi * n as usize + ni] = sum;
+                }
+            }
 
             let a_dev = DeviceBuffer::from_host(&stream, &a_data).expect("alloc A");
             let b_dev = DeviceBuffer::from_host(&stream, &b_data).expect("alloc B");
@@ -480,7 +510,6 @@ fn main() {
             let b_sc_dev = DeviceBuffer::from_host(&stream, &b_scales).expect("alloc b_scales");
 
             let c_size = (m * n) as usize;
-            let expected = k as f32;
             let launch = |c_dev: &DeviceBuffer<f32>| {
                 let config = LaunchConfig {
                     grid_dim: ((n / 8).div_ceil(4), m / 16, 1),
@@ -509,8 +538,15 @@ fn main() {
             launch(&c_dev);
             stream.synchronize().expect("synchronize");
             let r1 = c_dev.to_host_vec(&stream).expect("copy C");
-            let bad = r1.iter().filter(|v| (**v - expected).abs() > 1e-2).count();
-            let first = r1.iter().position(|v| (*v - expected).abs() > 1e-2);
+            let nan = r1.iter().filter(|v| v.is_nan()).count();
+            let over = r1
+                .iter()
+                .zip(&reference)
+                .filter(|(got, want)| {
+                    !(**got).is_nan()
+                        && ((**got) - (**want)).abs() / (**want).abs().max(1.0) > 1e-3
+                })
+                .count();
 
             let c2_dev = DeviceBuffer::from_host(&stream, &vec![f32::NAN; c_size]).expect("alloc C2");
             launch(&c2_dev);
@@ -519,9 +555,10 @@ fn main() {
             let det_diff = r1.iter().zip(&r2).position(|(x, y)| x.to_bits() != y.to_bits());
 
             println!(
-                "shape M={m} N={n} K={k}: wrong={bad}/{c_size} first={first:?} \
+                "shape M={m} N={n} K={k}: blocks={} nan={nan}/{c_size} ref_over_tol={over} \
                  det_first_diff={det_diff:?} {}",
-                if bad == 0 && det_diff.is_none() { "PASS" } else { "FAIL" }
+                (n / 8).div_ceil(4) * (m / 16),
+                if nan == 0 && over == 0 && det_diff.is_none() { "PASS" } else { "FAIL" }
             );
         }
     }
