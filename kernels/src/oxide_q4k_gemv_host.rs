@@ -999,13 +999,14 @@ impl OxideQ4kGemv {
     /// alive independently.
     ///
     /// # Safety
-    /// Caller must guarantee `out` is not concurrently written by another
-    /// in-flight kernel.
+    /// `out` must not be concurrently written by another in-flight kernel
+    /// (stream ordering on `self.stream` provides this for the engine's
+    /// per-slot usage).
     pub unsafe fn submit_sm120_kpar_into_slot(
         &self,
         x: &Arc<Tensor<f32>>,
         packed: &Arc<Tensor<u32>>,
-        out: Tensor<f32>,
+        out: &Arc<Tensor<f32>>,
         n: usize,
         k_blocks: usize,
     ) -> Result<Arc<Tensor<f32>>> {
@@ -1079,20 +1080,21 @@ impl OxideQ4kGemv {
                 .map_err(|e| KernelError::InvalidConfig(format!("sm120_dp4a_kpar8 slot: {e}")))?;
         }
 
-        Ok(Arc::new(out))
+        Ok(out.clone())
     }
 
     /// Oxide dp4a_kpar8 into a caller slot (non-sm120 GPUs). Quantizes into the
     /// main Q8 scratch and writes `out` on `self.stream`.
     ///
     /// # Safety
-    /// Caller must guarantee `out` is not concurrently written by another
-    /// in-flight kernel.
+    /// `out` must not be concurrently written by another in-flight kernel
+    /// (stream ordering on `self.stream` provides this for the engine's
+    /// per-slot usage).
     pub unsafe fn submit_dp4a_kpar_into_slot(
         &self,
         x: &Arc<Tensor<f32>>,
         packed: &Arc<Tensor<u32>>,
-        out: Tensor<f32>,
+        out: &Arc<Tensor<f32>>,
         n: usize,
         k_blocks: usize,
     ) -> Result<Arc<Tensor<f32>>> {
@@ -1174,7 +1176,7 @@ impl OxideQ4kGemv {
                 .map_err(|e| KernelError::InvalidConfig(format!("dp4a_kpar8 slot: {e}")))?;
         }
 
-        Ok(Arc::new(out))
+        Ok(out.clone())
     }
 
     /// Pre-allocate Q8_1 scratch buffers outside of CUDA graph capture.

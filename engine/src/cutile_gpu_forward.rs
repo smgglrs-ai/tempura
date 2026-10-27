@@ -3301,44 +3301,36 @@ impl CutileGpuModel {
         // consecutive GEMV outputs ALIAS: gate and up both wrote q8_out_scratch,
         // so the silu read silu(up)*up with gate's values clobbered (found via
         // bench-batch fresh-cache replay + per-op bits_sum diffing).
+        //
+        // The pool Arc is borrowed, never taken: the slot's device memory is
+        // reused every call (stream-ordered writes make this safe) and callers
+        // get clones. This cannot miss, so the fresh-allocation fallback below
+        // is unreachable during CUDA graph capture (a sync alloc there is a
+        // hard error).
         if let Some(oxide) = &self.oxide_q4k_gemv {
             let min_kpar_n = if oxide.uses_raw_gguf { 0 } else { 4096 };
             if oxide.has_any_kpar() && dw.n >= min_kpar_n {
-                let maybe_tensor = {
-                    let mut pool = self.scratch.borrow_mut();
-                    match pool[slot].take() {
-                        Some(arc) => match Arc::try_unwrap(arc) {
-                            Ok(tensor) => Some(tensor),
-                            Err(arc_back) => {
-                                pool[slot] = Some(arc_back);
-                                None
-                            }
-                        },
-                        None => None,
-                    }
-                };
-                if let Some(tensor) = maybe_tensor {
+                let slot_arc = self.scratch.borrow()[slot].clone();
+                if let Some(slot_arc) = slot_arc {
                     let submitted = unsafe {
                         if oxide.uses_raw_gguf {
                             oxide.submit_sm120_kpar_into_slot(
-                                &a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks,
+                                &a_flat, &dw.tensor, &slot_arc, dw.n, dw.k_blocks,
                             )
                         } else {
                             oxide.submit_dp4a_kpar_into_slot(
-                                &a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks,
+                                &a_flat, &dw.tensor, &slot_arc, dw.n, dw.k_blocks,
                             )
                         }
                     };
                     if let Ok(result) = submitted {
-                        self.scratch.borrow_mut()[slot] = Some(result.clone());
                         return result;
                     }
-                    // Submit failed (scratch too small, kernel missing): fall
+                    // Submit failed (kernel missing, scratch too small): fall
                     // through to the fresh-allocation paths below.
                 } else {
-                    // Pool miss: a fresh allocation via forward_best_kpar_d2d
-                    // would use the SHARED output scratch (aliasing hazard for
-                    // gate+up); use the oxide f32 GEMV (fresh output) instead.
+                    // Pool slot not pre-allocated (only possible before
+                    // preallocate_scratch, i.e. never during graph capture).
                     return oxide
                         .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
                         .expect("OxideQ4kGemv::forward_d2d failed in gemm_q4k_d2d_slot (pool miss)");
