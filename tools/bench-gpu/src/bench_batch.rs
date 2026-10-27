@@ -6,9 +6,15 @@
 /// Uses persistent KV caches so the CUDA graph captures ONCE (first decode step)
 /// and all subsequent steps replay directly without re-capture overhead (~3ms saved/step).
 ///
+/// Verification (2026-10-27 standard): every step's logits are scanned for NaNs
+/// and the final step is fingerprinted (NaN-tolerant bits_sum + total_cmp argmax,
+/// same scheme as bench-real-model). The whole schedule is then replayed on
+/// FRESH caches -- forcing the CUDA graph to re-capture -- and the fingerprints
+/// must match bitwise. Numbers count as verified only when both passes are
+/// NaN-free and identical.
+///
 /// Usage:
-///   RUSTUP_TOOLCHAIN=nightly-2026-10-11 cargo run -p tempura-bench-gpu --release \
-///     --bin bench-batch -- /path/to/model.gguf
+///   cargo run -p tempura-bench-gpu --release --bin bench-batch -- /path/to/model.gguf
 
 use std::path::Path;
 use std::time::Instant;
@@ -20,17 +26,72 @@ use tempura_engine::weights::QuantizedWeights;
 
 const WARMUP_STEPS: usize = 10;
 const BENCH_STEPS:  usize = 50;
+/// Verification replay: the full prefill + warmup + bench schedule, re-run.
+const VERIFY_STEPS: usize = 1 + WARMUP_STEPS + BENCH_STEPS;
 
-fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> f64 {
+/// NaN-tolerant logits fingerprint over a whole batch. Broken kernels are
+/// DIAGNOSED (explicit NaN count) instead of silently discarding logits.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Fingerprint {
+    nan_count: usize,
+    bits_sum:  u64,
+    argmax:    usize,
+    n_logits:  usize,
+}
+
+fn fingerprint(logits_batch: &[Vec<f32>]) -> Fingerprint {
+    let mut fp = Fingerprint { nan_count: 0, bits_sum: 0, argmax: 0, n_logits: 0 };
+    for logits in logits_batch {
+        fp.nan_count += logits.iter().filter(|v| v.is_nan()).count();
+        fp.bits_sum = fp.bits_sum
+            .wrapping_add(logits.iter().map(|v| v.to_bits() as u64).sum::<u64>());
+        fp.n_logits += logits.len();
+        if let Some((i, _)) = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)) {
+            fp.argmax = i;
+        }
+    }
+    fp
+}
+
+fn nan_count(logits_batch: &[Vec<f32>]) -> usize {
+    logits_batch
+        .iter()
+        .map(|l| l.iter().filter(|v| v.is_nan()).count())
+        .sum()
+}
+
+struct BatchResult {
+    tok_s:     f64,
+    nan_total: usize,          // NaNs across EVERY step of the timed run
+    final_fp:  Fingerprint,    // final step of the timed run
+    verify_fp: Fingerprint,    // final step of the fresh-cache replay
+}
+
+impl BatchResult {
+    /// Verified = both passes NaN-free, non-empty logits, bitwise-identical
+    /// fingerprints (engine is deterministic by design).
+    fn verified(&self) -> bool {
+        self.nan_total == 0
+            && self.final_fp.nan_count == 0
+            && self.verify_fp.nan_count == 0
+            && self.final_fp.n_logits > 0
+            && self.final_fp == self.verify_fp
+    }
+}
+
+fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> BatchResult {
     // Allocate M persistent KV caches once.
     let mut kv_caches = wrapper.new_batch_kv_caches(batch);
+    let mut nan_total = 0usize;
+    let mut last: Vec<Vec<f32>> = Vec::new();
 
     // Prefill: position 0, one token per request.
     let mut cur_pos = 0u32;
     {
         let toks: Vec<u32> = vec![1u32; batch];
         let pos:  Vec<u32> = vec![cur_pos; batch];
-        let _    = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
+        let logits = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
+        nan_total += nan_count(&logits);
         cur_pos += 1;
     }
 
@@ -38,7 +99,8 @@ fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> f64 {
     for _ in 0..WARMUP_STEPS {
         let toks: Vec<u32> = vec![2u32; batch];
         let pos:  Vec<u32> = vec![cur_pos; batch];
-        let _    = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
+        let logits = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
+        nan_total += nan_count(&logits);
         cur_pos += 1;
     }
 
@@ -47,11 +109,37 @@ fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> f64 {
     for _ in 0..BENCH_STEPS {
         let toks: Vec<u32> = vec![2u32; batch];
         let pos:  Vec<u32> = vec![cur_pos; batch];
-        let _    = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
+        let logits = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
+        nan_total += nan_count(&logits);
+        last = logits;
         cur_pos += 1;
     }
     let elapsed = t0.elapsed().as_secs_f64();
-    (batch * BENCH_STEPS) as f64 / elapsed
+    let tok_s = (batch * BENCH_STEPS) as f64 / elapsed;
+
+    // Verification replay: identical token/position schedule on fresh caches.
+    // The KV pointers change, so the cached CUDA graph re-captures -- proving
+    // capture path and replay path agree. Deterministic by design -> the final
+    // fingerprints must be bitwise identical.
+    let mut kv_verify = wrapper.new_batch_kv_caches(batch);
+    let mut v_pos = 0u32;
+    let mut v_last: Vec<Vec<f32>> = Vec::new();
+    for i in 0..VERIFY_STEPS {
+        let tok = if i == 0 { 1u32 } else { 2u32 };
+        let toks: Vec<u32> = vec![tok; batch];
+        let pos:  Vec<u32> = vec![v_pos; batch];
+        let logits = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_verify);
+        nan_total += nan_count(&logits);
+        v_last = logits;
+        v_pos += 1;
+    }
+
+    BatchResult {
+        tok_s,
+        nan_total,
+        final_fp: fingerprint(&last),
+        verify_fp: fingerprint(&v_last),
+    }
 }
 
 fn main() {
@@ -66,7 +154,8 @@ fn main() {
     println!("================================================================================\n");
     println!("  Model: {model_path}");
     println!("  Warmup: {WARMUP_STEPS} steps (step 1 captures CUDA graph, 2-{WARMUP_STEPS} replay)");
-    println!("  Bench:  {BENCH_STEPS} steps (all graph replays)\n");
+    println!("  Bench:  {BENCH_STEPS} steps (all graph replays)");
+    println!("  Verify: {VERIFY_STEPS}-step replay on fresh caches (graph re-capture) + NaN scan\n");
 
     println!("Loading model...");
     let t0 = Instant::now();
@@ -101,8 +190,8 @@ fn main() {
 
     let n_heads = wrapper.model.config.num_attention_heads;
 
-    println!("  {:>6}  {:>14}  {:>16}  {:>14}", "Batch", "total tok/s", "per-req tok/s", "attn blocks");
-    println!("  {}", "-".repeat(58));
+    println!("  {:>6}  {:>11}  {:>13}  {:>11}  {:>9}", "Batch", "total tok/s", "per-req tok/s", "attn blocks", "verified");
+    println!("  {}", "-".repeat(64));
 
     let mxfp4_info = if wrapper.mxfp4_tiled_count() > 0 {
         format!("MXFP4 ({} tiled weights, active={})",
@@ -116,6 +205,7 @@ fn main() {
     // For MXFP4-only models (BF16 safetensors), M=1 non-graph path has no MXFP4 dispatch yet.
     // M>=2 uses the MXFP4 CUDA graph path which is fully supported.
     let mxfp4_only = wrapper.mxfp4_tiled_count() > 0 && !model_p.is_file();
+    let mut all_verified = true;
     for &batch in &[1usize, 2, 4, 5, 8, 16] {
         if batch > wrapper.max_batch_graph() {
             println!("  {:>6}  (exceeds max_batch_graph={})", batch, wrapper.max_batch_graph());
@@ -125,17 +215,29 @@ fn main() {
             println!("  {:>6}  (skipped: M=1 non-graph path has no MXFP4 dispatch; use M>=2)", batch);
             continue;
         }
-        let tok_s = bench_batch(&wrapper, batch);
-        let per_req = tok_s / batch as f64;
+        let r = bench_batch(&wrapper, batch);
+        let per_req = r.tok_s / batch as f64;
         let blocks = batch * n_heads;
-        println!("  {:>6}  {:>14.0}  {:>16.0}  {:>14}",
-            batch, tok_s, per_req, blocks);
+        let verified = if r.verified() { "yes" } else { "NO" };
+        if !r.verified() { all_verified = false; }
+        println!("  {:>6}  {:>11.0}  {:>13.0}  {:>11}  {:>9}",
+            batch, r.tok_s, per_req, blocks, verified);
+        println!("         fp: bits_sum={} argmax={} n={} | nan={}/{} det={}",
+            r.final_fp.bits_sum, r.final_fp.argmax, r.final_fp.n_logits,
+            r.nan_total, r.verify_fp.nan_count,
+            if r.final_fp == r.verify_fp { "OK" } else { "MISMATCH" });
     }
 
-    println!("\n  Projection dispatch: MXFP4 sm_120a (Q,K,O,gate,up) + Q6K (down) + Q4K (V).");
-    println!("  Persistent KV caches: CUDA graph captures once, all bench steps replay.");
+    println!("\n  Persistent KV caches: CUDA graph captures once, all bench steps replay.");
     println!("  Remaining gap at high M: flash attention scales as O(M*kv_len*n_heads).");
+    if all_verified {
+        println!("  All batch sizes verified: NaN-free + deterministic (fresh-cache replay identical).");
+    } else {
+        println!("  WARNING: some batch sizes UNVERIFIED (NaNs, empty logits, or nondeterminism).");
+        println!("           Bisect with TEMPURA_NO_SM120_KPAR / TEMPURA_NO_SM120_Q6K /");
+        println!("           TEMPURA_NO_OXIDE_ATTN / TEMPURA_NO_DUAL_BLOCK.");
+    }
     println!();
-    println!("  Reference (single request, CUDA graph): 130 tok/s");
+    println!("  Reference (single request, CUDA graph): 136 tok/s (verified NaN-free 2026-10-27)");
     println!("  llama.cpp single request:                209 tok/s");
 }
