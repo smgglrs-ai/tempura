@@ -373,7 +373,11 @@ or models; `--wip` pushes a snapshot of uncommitted work as `wip/<hostname>`),
 `bench [--no-sync] BIN` (sync + tmux job + PTX re-copy after build), `run`,
 `oxide`, `watch`/`log`/`results`/`stop`. Remote run scripts and logs live in
 `~/.cache/tempura/gpu-remote/`, models in `~/.cache/tempura/models/` (a bare
-model filename passed to `bench` resolves there).
+model filename passed to `bench` resolves there). Env overrides:
+`GPU_REMOTE_HOST`, `GPU_REMOTE_SESSION`, `GPU_REMOTE_BUSY_MB`/`_BUSY_UTIL`
+(pre-flight thresholds), `GPU_REMOTE_ALLOW_PROCS=1` (skip the
+no-other-instances check when idle CPU-mode servers live on the host). Full
+usage: run the script with no arguments.
 
 ## GPU Kernels (cuda-oxide)
 
