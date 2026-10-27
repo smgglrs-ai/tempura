@@ -303,6 +303,38 @@ where
     }
 }
 
+/// Split `total` rows into batch chunks within `[min, cap]`.
+///
+/// For kernels whose single launch accepts at most `cap` rows and rejects
+/// fewer than `min` -- e.g. the q6k sm120 batch GEMV (2..=16 rows; its
+/// shared-memory reduction area is sized by the row count), fed with
+/// `capped_batch_chunks(m, 2, 16)` by the GPU prefill path. Full `cap`-row
+/// chunks first; whenever the remaining tail would drop below `min`, take
+/// `rem - min` instead so the final chunk lands exactly on `min` and every
+/// chunk stays in range while the sizes sum to `total`.
+///
+/// # Panics
+/// Panics when `total < min` (fewer rows than the smallest legal chunk --
+/// callers must route those to a different kernel) or `cap < 2 * min - 1`
+/// (the split-early step needs both halves >= min).
+pub fn capped_batch_chunks(total: usize, min: usize, cap: usize) -> Vec<usize> {
+    assert!(min >= 1, "min chunk size must be >= 1");
+    assert!(cap >= min, "cap must be >= min");
+    assert!(cap >= 2 * min - 1, "cap too small for the split-early tail");
+    assert!(total >= min, "total < min: route to a smaller-row kernel instead");
+    let mut chunks = Vec::new();
+    let mut rem = total;
+    while rem > cap {
+        // rem - cap < min means a plain cap-sized chunk would strand a tail
+        // below min; take rem - min now so the tail lands exactly on min.
+        let take = if rem - cap < min { rem - min } else { cap };
+        chunks.push(take);
+        rem -= take;
+    }
+    chunks.push(rem);
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +389,70 @@ mod tests {
 
         pipeline.matmul(&a, &b, &mut output, 2, 2, 2).unwrap();
         assert_eq!(output, vec![19.0, 22.0, 43.0, 50.0]);
+    }
+
+    /// Every chunk must be in `[min, cap]` and the chunks must sum to `total`.
+    fn chunks_valid(total: usize, min: usize, cap: usize) -> bool {
+        let chunks = capped_batch_chunks(total, min, cap);
+        !chunks.is_empty()
+            && chunks.iter().all(|&c| c >= min && c <= cap)
+            && chunks.iter().sum::<usize>() == total
+    }
+
+    #[test]
+    fn capped_batch_chunks_single_chunk_within_kernel_range() {
+        for m in 2..=16 {
+            assert_eq!(capped_batch_chunks(m, 2, 16), vec![m]);
+        }
+    }
+
+    #[test]
+    fn capped_batch_chunks_split_early_tail() {
+        // 17 = 16 + 1 would strand a 1-row tail; splits as 15 + 2 instead.
+        assert_eq!(capped_batch_chunks(17, 2, 16), vec![15, 2]);
+        assert_eq!(capped_batch_chunks(33, 2, 16), vec![16, 15, 2]);
+        assert_eq!(capped_batch_chunks(512, 2, 16), vec![16; 32]);
+    }
+
+    #[test]
+    fn capped_batch_chunks_sum_to_total_for_all_relevant_sizes() {
+        // Engine prefill chunks are 512 tokens; bench uses 128; arbitrary
+        // prompt tails can be any length. Also covers larger min values.
+        for m in 2..=1024 {
+            assert!(chunks_valid(m, 2, 16), "chunk scheme invalid at m={m}");
+        }
+        for m in 3..=256 {
+            assert!(chunks_valid(m, 3, 8), "chunk scheme invalid at m={m} (3,8)");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "total < min")]
+    fn capped_batch_chunks_rejects_below_min() {
+        capped_batch_chunks(1, 2, 16);
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::capped_batch_chunks;
+
+    /// For any total/min/cap satisfying the preconditions, every chunk lands
+    /// in [min, cap] and the chunk sizes sum to exactly `total` -- no stranded
+    /// below-min tail (out-of-range kernel launch) and no lost rows.
+    #[kani::proof]
+    #[kani::unwind(14)]
+    fn capped_batch_chunks_valid_for_all_totals() {
+        let min: usize = kani::any();
+        let cap: usize = kani::any();
+        let total: usize = kani::any();
+        kani::assume(min >= 2 && min <= 3);
+        kani::assume(cap >= 2 * min - 1 && cap <= 8);
+        kani::assume(total >= min && total <= 20);
+
+        let chunks = capped_batch_chunks(total, min, cap);
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|&c| c >= min && c <= cap));
+        assert_eq!(chunks.iter().sum::<usize>(), total);
     }
 }
