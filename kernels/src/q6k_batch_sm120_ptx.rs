@@ -63,7 +63,7 @@ pub const PTX: &str = r#"
     .param .u32 param_k_blocks
 )
 {
-    .reg .u32  %r<82>;
+    .reg .u32  %r<84>;
     .reg .u64  %rd<13>;
     .reg .f32  %f<16>;
     .reg .pred %p<8>;
@@ -149,6 +149,13 @@ pub const PTX: &str = r#"
 
     cp.async.commit_group;
     cp.async.wait_group 0;
+    // cp.async.wait_group is PER-THREAD: it does not make other lanes' async
+    // copies visible, and every lane reads smem words copied by different
+    // lanes. CTA-wide barrier (canonical cp.async pattern). Deadlock-free:
+    // the host only selects this kernel when k_blocks is a multiple of 8 so
+    // all 8 warps execute the same number of loop barriers. Same fix as
+    // q6k_gemv_v4_ptx.rs.
+    bar.sync 0;
 
     // -- K-loop: blk = warp_id, warp_id+8, ...  --------------------------------
     mov.u32 %r30, %r5;               // blk = warp_id
@@ -451,6 +458,9 @@ SKIP_LOAD:
     // -- Wait for next block (if prefetch was issued) ---------------------------
     @!%p3 bra NO_WAIT;
     cp.async.wait_group 0;
+    // Per-thread wait_group caveat: CTA-wide barrier makes every lane's
+    // copy of the next block visible before the buffer swap.
+    bar.sync 0;
 NO_WAIT:
 
     // -- Swap curr/next smem buffer pointers -----------------------------------

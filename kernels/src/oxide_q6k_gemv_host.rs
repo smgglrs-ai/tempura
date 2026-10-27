@@ -373,6 +373,14 @@ impl OxideQ6kGemv {
         _m: usize,
         cu_stream: cuda_core::sys::CUstream,
     ) -> Result<()> {
+        // The batch kernel's K-loop uses CTA-wide bar.sync 0 (cp.async
+        // cross-lane visibility); deadlock-free only when k_blocks is a
+        // multiple of 8 (uniform barrier count across all 8 warps).
+        if k_blocks % 8 != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k_gemv_sm120_batch requires k_blocks % 8 == 0 (got {k_blocks})"
+            )));
+        }
         let batch_fn = self.cu_function_sm120_batch.ok_or_else(|| {
             KernelError::InvalidConfig("q6k_gemv_sm120_batch not loaded".into())
         })?;
@@ -442,7 +450,7 @@ impl OxideQ6kGemv {
         n: usize,
         k_blocks: usize,
     ) -> Result<Arc<Tensor<f32>>> {
-        let (kpar_fn, is_sm120) = self.select_kpar_fn()
+        let (kpar_fn, is_sm120) = self.select_kpar_fn(k_blocks)
             .ok_or_else(|| KernelError::InvalidConfig("no kpar variant loaded".into()))?;
 
         // Use pre-allocated scratch to avoid allocation during CUDA graph capture.
@@ -492,7 +500,7 @@ impl OxideQ6kGemv {
         k_blocks: usize,
         cu_stream: cuda_core::sys::CUstream,
     ) -> Result<Arc<Tensor<f32>>> {
-        let (kpar_fn, is_sm120) = match self.select_kpar_fn() {
+        let (kpar_fn, is_sm120) = match self.select_kpar_fn(k_blocks) {
             Some(v) => v,
             None => return self.submit_d2d_into_on(x, packed, out, n, k_blocks, cu_stream),
         };
@@ -501,9 +509,18 @@ impl OxideQ6kGemv {
     }
 
     /// Select the best available kpar function: sm120_mbar > dp4a_kpar8 > None.
-    fn select_kpar_fn(&self) -> Option<(CUfunction, bool)> {
+    /// Select the kpar kernel. The sm_120 mbar variant requires
+    /// `k_blocks % 8 == 0`: its K-loop uses CTA-wide `bar.sync 0` to make
+    /// cp.async writes visible across lanes, which is only deadlock-free
+    /// when all 8 warps execute the same number of loop barriers -- true
+    /// exactly when k_blocks is a multiple of 8 (each warp then runs
+    /// k_blocks/8 iterations with k_blocks/8 - 1 uniform barriers).
+    /// Other shapes fall back to the dp4a kpar kernel.
+    fn select_kpar_fn(&self, k_blocks: usize) -> Option<(CUfunction, bool)> {
         if let Some(f) = self.cu_function_sm120_mbar {
-            return Some((f, true));
+            if k_blocks % 8 == 0 {
+                return Some((f, true));
+            }
         }
         self.cu_function_kpar.map(|f| (f, false))
     }
