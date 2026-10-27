@@ -5098,6 +5098,14 @@ impl CutileGpuModel {
                 // ALiBi: no rotation -- keep Q/K tensors on device as-is.
                 (q_dev.clone(), k_dev.clone())
             };
+            if self.debug_nan_trace {
+                self.nan_report(&format!("L{layer} pre-attn-norm"), &normed_dev);
+                self.nan_report(&format!("L{layer} q-proj"), &q_dev);
+                self.nan_report(&format!("L{layer} k-proj"), &k_dev);
+                self.nan_report(&format!("L{layer} v-proj"), &v_dev);
+                self.nan_report(&format!("L{layer} q-rot"), &q_rot_dev);
+                self.nan_report(&format!("L{layer} k-rot"), &k_rot_dev);
+            }
 
             // -- 2d. KV-cache append -------------------------------------------
             // When the GPU KV cache is active and seq_len == 1 (decode), use the
@@ -5235,6 +5243,10 @@ impl CutileGpuModel {
 
             // -- 2f. O projection -- device-to-device --------------------------
             let o_dev = self.gemm_any_d2d_slot(&attn_padded_dev, o_w_name, seq_len, SLOT_O);
+            if self.debug_nan_trace {
+                self.nan_report(&format!("L{layer} attn-out"), &attn_padded_dev);
+                self.nan_report(&format!("L{layer} o-proj"), &o_dev);
+            }
 
             // -- 2g. Residual add (GPU) ----------------------------------------
             // o_dev has h columns; pad to h_pad when h_pad > h (rare edge case
@@ -5295,6 +5307,12 @@ impl CutileGpuModel {
             // For f32 models the synchronous gemm_d2d_slot path is used.
             let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE);
             let up_dev = self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
+            if self.debug_nan_trace {
+                self.nan_report(&format!("L{layer} post-attn-hidden"), &hidden_dev);
+                self.nan_report(&format!("L{layer} post-attn-norm"), &normed2_dev);
+                self.nan_report(&format!("L{layer} gate-dev"), &gate_dev);
+                self.nan_report(&format!("L{layer} up-dev"), &up_dev);
+            }
 
             // -- 2j. SiLU gate x up (GPU) -------------------------------------
             // gate_dev and up_dev already reside on the GPU.  Use the scratch
@@ -5358,6 +5376,10 @@ impl CutileGpuModel {
                 gate_silu_n_dev
             };
             let down_dev = self.gemm_any_d2d_slot(&gate_silu_dev, down_w_name, seq_len, SLOT_DOWN);
+            if self.debug_nan_trace {
+                self.nan_report(&format!("L{layer} gate-silu"), &gate_silu_dev);
+                self.nan_report(&format!("L{layer} down-proj"), &down_dev);
+            }
 
             // -- 2l. Residual add (GPU) ----------------------------------------
             let down_padded = if self.h_pad == h {
@@ -5376,6 +5398,9 @@ impl CutileGpuModel {
             } else {
                 self.add_device(&hidden_dev, &down_padded, seq_len * self.h_pad)
             };
+            if self.debug_nan_trace {
+                self.nan_report(&format!("L{layer} post-ffn-hidden"), &hidden_dev);
+            }
         }
 
         // -- 3. Final norm + lm_head --------------------------------------------
