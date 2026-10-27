@@ -477,8 +477,15 @@ impl OxideQ4kGemv {
             if let Some(f) = cu_sm120_dp4a_kpar8 {
                 kpar_variants.push(KernelVariant { cu_fn: f, min_cc: 1200, name: "q4k_gemv_sm120_dp4a_kpar8" });
             }
+            // TEMPURA_NO_DUAL_BLOCK=1 selects single-block kpar8 (A/B testing
+            // and numerical cross-check: both kernels are bitwise-equal by
+            // construction, so logits checksums must match exactly).
+            let dual_block_disabled =
+                std::env::var("TEMPURA_NO_DUAL_BLOCK").map(|v| v == "1").unwrap_or(false);
             if let Some(f) = cu_sm120_dp4a_kpar8_dual_block {
-                kpar_variants.push(KernelVariant { cu_fn: f, min_cc: 1200, name: "q4k_gemv_sm120_dp4a_kpar8_dual_block" });
+                if !dual_block_disabled {
+                    kpar_variants.push(KernelVariant { cu_fn: f, min_cc: 1200, name: "q4k_gemv_sm120_dp4a_kpar8_dual_block" });
+                }
             }
             let kpar_dispatch = KernelVariant::select_best(&kpar_variants, &caps).cloned();
             // v4 uses native 36-u32 GGUF format in the v4 kernel itself, but the production
