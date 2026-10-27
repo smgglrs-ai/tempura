@@ -3212,6 +3212,20 @@ impl CutileGpuModel {
             .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::cutile_quantized_gemm::Q6K_QK)])
             .expect("gemm_q6k_d2d_slot: reshape failed");
 
+        // Prefer kpar (sm120_mbar or dp4a_kpar8) for best throughput.
+        // kpar allocates its own output, so it must be called outside graph capture.
+        // For CUDA-graph-captured paths, the slot-hit below uses submit_kpar_d2d_into_on.
+        // NOTE: this check MUST run before the pool take below -- taking the slot
+        // and returning here leaked it (Q6K down_projs drained pool[SLOT_DOWN],
+        // which the Q4K kpar path of a mixed-quant model then found empty).
+        if let Some(oxide) = &self.oxide_q6k_gemv {
+            if oxide.has_kpar() {
+                return oxide
+                    .forward_kpar_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                    .expect("OxideQ6kGemv::forward_kpar_d2d failed in gemm_q6k_d2d_slot");
+            }
+        }
+
         let maybe_tensor = {
             let mut pool = self.scratch.borrow_mut();
             match pool[slot].take() {
@@ -3225,17 +3239,6 @@ impl CutileGpuModel {
                 None => None,
             }
         };
-
-        // Prefer kpar (sm120_mbar or dp4a_kpar8) for best throughput.
-        // kpar allocates its own output, so it must be called outside graph capture.
-        // For CUDA-graph-captured paths, the slot-hit below uses submit_kpar_d2d_into_on.
-        if let Some(oxide) = &self.oxide_q6k_gemv {
-            if oxide.has_kpar() {
-                return oxide
-                    .forward_kpar_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
-                    .expect("OxideQ6kGemv::forward_kpar_d2d failed in gemm_q6k_d2d_slot");
-            }
-        }
 
         if let Some(tensor) = maybe_tensor {
             if let Some(oxide) = &self.oxide_q6k_gemv {
