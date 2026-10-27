@@ -120,21 +120,18 @@ impl MxfpGemm {
         Some(Self { cu_module: module, cu_function: func, cu_quant_mod, cu_quant_fn, sm_count, stream })
     }
 
-    /// Launch MXFP4 tiled batch GEMM: A[m, k] x B[n, k]^T -> C[m, n] (f32).
+    /// Row-offset chunk variant of [`MxfpGemm::forward`] for prefill.
     ///
-    /// - `a_packed`:  [m * k/2] u8, E2M1 nibbles row-major [M][K/2]
-    /// - `a_scales`:  [(m/16) * (k/32)] u8, UE8M0 tile scales [m16_tiles][k32_blocks]
-    /// - `b_packed`:  [n * k/2] u8, E2M1 nibbles row-major [N][K/2]
-    /// - `b_scales`:  [(n/8) * (k/32)] u8, UE8M0 tile scales [n8_tiles][k32_blocks]
-    /// - `c`:         [m * n] f32, output row-major [M][N]
-    /// - `k64_tiles`: k / 64
-    ///
-    /// `m` must be multiple of 16, `n` multiple of 8, `k` multiple of 64.
-    /// Grid: (ceil(n_tiles/4), m_tiles, 1) -- one m16n8 output tile per warp,
-    /// no flat-index decomposition and no tile loop (see the kernel doc for
-    /// why the previous persistent walk miscompiled at m >= 32).
-    /// Launch is async on the stored stream; caller syncs if needed.
-    pub fn forward(
+    /// Computes rows `[a_row, a_row + m)` of A into rows `[c_row, c_row + m)`
+    /// of C against the SAME B weights. `m` here is the CHUNK height: call
+    /// with m = 16 to run every launch in the single-iteration-per-warp grid
+    /// `(ceil(n_tiles/4), 1, 1)` -- the configuration that is bitwise-verified
+    /// in the batch-decode path and in the standalone shape tests. The
+    /// cutlass-mlir codegen goes illegally out-of-bounds at larger m_tiles
+    /// (m >= 128 faults even with k64_tiles = 1; smaller m_tiles are fine but
+    /// only m = 16 carries a verification record), so the engine chunks
+    /// prefill GEMMs through this entry point.
+    pub fn forward_offset(
         &self,
         a_packed:  &Arc<Tensor<u8>>,
         a_scales:  &Arc<Tensor<u8>>,
@@ -144,6 +141,8 @@ impl MxfpGemm {
         m:         u32,
         n:         u32,
         k64_tiles: u32,
+        a_row:     u32,
+        c_row:     u32,
     ) -> Result<()> {
         let cu_stream = self.stream.cu_stream();
 
@@ -153,11 +152,17 @@ impl MxfpGemm {
         debug_assert!(m_tiles >= 1, "m must be >= 16 (got {m})");
         let grid_x = n_tiles.div_ceil(4);
 
-        let mut p_ap = a_packed.device_pointer().cu_deviceptr() as u64;
-        let mut p_as = a_scales.device_pointer().cu_deviceptr() as u64;
+        // Byte offsets: a packed row = k64_tiles * 32 bytes; the m16 tile
+        // scale rows advance every 16 packed rows; a C row = n f32.
+        let a_row_bytes = (a_row as u64) * (k64_tiles as u64) * 32;
+        let a_scales_bytes = ((a_row / 16) as u64) * (k64_tiles as u64) * 2;
+        let c_row_bytes = (c_row as u64) * (n as u64) * 4;
+
+        let mut p_ap = a_packed.device_pointer().cu_deviceptr() as u64 + a_row_bytes;
+        let mut p_as = a_scales.device_pointer().cu_deviceptr() as u64 + a_scales_bytes;
         let mut p_bp = b_packed.device_pointer().cu_deviceptr() as u64;
         let mut p_bs = b_scales.device_pointer().cu_deviceptr() as u64;
-        let mut p_c  = c.device_pointer().cu_deviceptr() as u64;
+        let mut p_c  = c.device_pointer().cu_deviceptr() as u64 + c_row_bytes;
         let mut pm   = m;
         let mut pn   = n;
         let mut pk   = k64_tiles;
@@ -190,6 +195,35 @@ impl MxfpGemm {
             )));
         }
         Ok(())
+    }
+
+    /// Launch MXFP4 tiled batch GEMM: A[m, k] x B[n, k]^T -> C[m, n] (f32).
+    ///
+    /// - `a_packed`:  [m * k/2] u8, E2M1 nibbles row-major [M][K/2]
+    /// - `a_scales`:  [(m/16) * (k/32)] u8, UE8M0 tile scales [m16_tiles][k32_blocks]
+    /// - `b_packed`:  [n * k/2] u8, E2M1 nibbles row-major [N][K/2]
+    /// - `b_scales`:  [(n/8) * (k/32)] u8, UE8M0 tile scales [n8_tiles][k32_blocks]
+    /// - `c`:         [m * n] f32, output row-major [M][N]
+    /// - `k64_tiles`: k / 64
+    ///
+    /// `m` must be multiple of 16, `n` multiple of 8, `k` multiple of 64.
+    /// Grid: (ceil(n_tiles/4), m_tiles, 1) -- one m16n8 output tile per warp.
+    /// Verified shapes: m = 16 (batch-decode path, bitwise) and the standalone
+    /// shape tests; LARGER m miscompiles (illegal memory access) -- chunk
+    /// through [`MxfpGemm::forward_offset`] with m = 16 instead.
+    /// Launch is async on the stored stream; caller syncs if needed.
+    pub fn forward(
+        &self,
+        a_packed:  &Arc<Tensor<u8>>,
+        a_scales:  &Arc<Tensor<u8>>,
+        b_packed:  &Arc<Tensor<u8>>,
+        b_scales:  &Arc<Tensor<u8>>,
+        c:         &Arc<Tensor<f32>>,
+        m:         u32,
+        n:         u32,
+        k64_tiles: u32,
+    ) -> Result<()> {
+        self.forward_offset(a_packed, a_scales, b_packed, b_scales, c, m, n, k64_tiles, 0, 0)
     }
 
     /// GPU-side activation quantization: f32[M*K] -> (packed_e2m1, scales_ue8m0).

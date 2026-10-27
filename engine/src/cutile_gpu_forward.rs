@@ -3818,60 +3818,39 @@ impl CutileGpuModel {
             }
             pool[slot].as_ref().unwrap().clone()
         };
-        mxfp4
-            .forward(
-                &packed,
-                &scales,
-                &dw.packed,
-                &dw.tiled_scales,
-                &out,
-                m_pad as u32,
-                n as u32,
-                (k / 64) as u32,
-            )
-            .unwrap_or_else(|e| panic!("mxfp4 prefill gemm {weight_name}: {e}"));
-        if self.debug_nan_trace {
-            // Isolation probe: same inputs, second launch, fresh output buffer.
-            // If out2 != out the kernel/codegen itself is nondeterministic.
-            let out2 = Arc::new(
-                api::zeros::<f32>(&[m_pad * n])
-                    .sync_on(stream)
-                    .expect("dbg out2 alloc"),
-            );
+        // Chunk the GEMM at m = 16 rows per launch: the cutlass-mlir codegen
+        // miscompiles larger grids (illegal memory access at m_tiles >= 8 --
+        // silent garbage in the engine's pool neighborhood, the source of the
+        // prefill nondeterminism), while m = 16 is the single-tile-per-warp
+        // grid bitwise-verified by the batch-decode path and the standalone
+        // shape tests. The quant kernel is hand-written PTX and shape-safe, so
+        // it runs once at full m_pad above.
+        let mut row = 0u32;
+        while row < m_pad as u32 {
             mxfp4
-                .forward(
+                .forward_offset(
                     &packed,
                     &scales,
                     &dw.packed,
                     &dw.tiled_scales,
-                    &out2,
-                    m_pad as u32,
+                    &out,
+                    16,
                     n as u32,
                     (k / 64) as u32,
+                    row,
+                    row,
                 )
-                .unwrap_or_else(|e| panic!("mxfp4 dbg gemm2 {weight_name}: {e}"));
+                .unwrap_or_else(|e| {
+                    panic!("mxfp4 prefill gemm {weight_name} rows {row}..{}: {e}", row + 16)
+                });
+            row += 16;
+        }
+        if self.debug_nan_trace {
             let ob: Vec<f32> = Arc::clone(&out).to_host_vec().sync_on(stream).expect("dbg out");
-            let ob2: Vec<f32> = Arc::clone(&out2).to_host_vec().sync_on(stream).expect("dbg out2");
             let osum: u64 = ob[..(m_pad * n).min(ob.len())].iter().map(|v| v.to_bits() as u64).sum();
-            let osum2: u64 = ob2[..(m_pad * n).min(ob2.len())].iter().map(|v| v.to_bits() as u64).sum();
-            let first_diff = ob.iter().zip(&ob2).position(|(x, y)| x.to_bits() != y.to_bits());
-            let zeros_out = ob.iter().filter(|v| v.to_bits() == 0).count();
-            let zeros_out2 = ob2.iter().filter(|v| v.to_bits() == 0).count();
-            let fd = first_diff.unwrap_or(0);
-            let fd_vals: Vec<String> = (0..4usize)
-                .map(|i| {
-                    format!(
-                        "{:08x}/{:08x}",
-                        ob.get(fd + i).map(|v| v.to_bits()).unwrap_or(0),
-                        ob2.get(fd + i).map(|v| v.to_bits()).unwrap_or(0)
-                    )
-                })
-                .collect();
             eprintln!(
-                "[nan-trace] {weight_name} mxfp4-gemm: out_fresh={osum} out2_fresh={osum2} \
-                 same={} first_diff={first_diff:?} fd_vals={fd_vals:?} zeros={zeros_out}/{zeros_out2} \
+                "[nan-trace] {weight_name} mxfp4-gemm (16-row chunks): out_fresh={osum} \
                  (len={} m_pad*n={})",
-                osum == osum2,
                 ob.len(),
                 m_pad * n
             );
