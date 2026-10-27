@@ -20,9 +20,19 @@ use tempura_engine::model::{CutileInferenceWrapper, InferenceModel};
 use tempura_engine::session::InferenceSession;
 use tempura_engine::trace::TraceLevel;
 
-const WARMUP_DECODE: usize = 20;
-const BENCH_DECODE: usize = 50;
+const WARMUP_DECODE_DEFAULT: usize = 20;
+const BENCH_DECODE_DEFAULT: usize = 50;
 const PREFILL_LEN: usize = 128;
+
+/// Env-overridable so a sustained decode can be held for external
+/// observation (e.g. `nvidia-smi dmon` utilization sampling):
+/// TEMPURA_BENCH_WARMUP_DECODE / TEMPURA_BENCH_DECODE.
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
     let idx = ((sorted.len() as f64 * pct / 100.0).ceil() as usize).saturating_sub(1);
@@ -48,7 +58,9 @@ fn main() {
     println!("???  tempura cuTile Real-Model Benchmark                   ???");
     println!("????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????\n");
     println!("  Model: {model_path}");
-    println!("  Warmup decode: {WARMUP_DECODE} steps, Bench decode: {BENCH_DECODE} steps");
+    println!("  Warmup decode: {} steps, Bench decode: {} steps",
+        env_usize("TEMPURA_BENCH_WARMUP_DECODE", WARMUP_DECODE_DEFAULT),
+        env_usize("TEMPURA_BENCH_DECODE", BENCH_DECODE_DEFAULT));
     println!("  Prefill length: {PREFILL_LEN} tokens\n");
 
     // --- Load GGUF ---
@@ -136,20 +148,22 @@ fn main() {
 
     // --- Decode benchmark ---
     println!("\n--- Decode (single-token autoregressive) ---");
+    let warmup_decode = env_usize("TEMPURA_BENCH_WARMUP_DECODE", WARMUP_DECODE_DEFAULT);
+    let bench_decode = env_usize("TEMPURA_BENCH_DECODE", BENCH_DECODE_DEFAULT);
     let mut session = InferenceSession::new(&config, TraceLevel::Off, 0);
     try_forward(&wrapper, &mut session, &prompt);
 
     let decode_token = [1u32];
 
     // Warmup decode
-    println!("  Warming up {WARMUP_DECODE} decode steps...");
-    for _ in 0..WARMUP_DECODE {
+    println!("  Warming up {warmup_decode} decode steps...");
+    for _ in 0..warmup_decode {
         try_forward(&wrapper, &mut session, &decode_token);
     }
 
     // Measure
-    let mut decode_times: Vec<f64> = Vec::with_capacity(BENCH_DECODE);
-    for _ in 0..BENCH_DECODE {
+    let mut decode_times: Vec<f64> = Vec::with_capacity(bench_decode);
+    for _ in 0..bench_decode {
         let start = Instant::now();
         try_forward(&wrapper, &mut session, &decode_token);
         decode_times.push(start.elapsed().as_secs_f64() * 1e6); // ??s
