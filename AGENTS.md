@@ -479,7 +479,15 @@ usage: run the script with no arguments.
 ## GPU Kernels (cuda-oxide)
 
 We use a fork of cuda-oxide at `~/Code/github.com/NVLabs/cuda-oxide` with
-mma.sync intrinsics and invariant.load codegen. **`cargo oxide build` uses a
+mma.sync intrinsics and invariant.load codegen.
+
+Bug-hunt branch `cutlass-mlir-block-count-miscompile` (local, on both the
+laptop and fishtank, based on upstream main `225756b63`): carries the issue
+draft + verified reproducer in `repro/mxf4-block-count/` for the
+`cute.kernel` partitioning miscompile (see open work). Fix work goes there;
+tempura builds against whatever cuda-oxide has checked out on fishtank.
+
+**`cargo oxide build` uses a
 cached backend `.so` from `~/.cargo/cuda-oxide/`, built from upstream — NOT
 the fork.** You MUST point it at the local build:
 
