@@ -3818,33 +3818,25 @@ impl CutileGpuModel {
             }
             pool[slot].as_ref().unwrap().clone()
         };
-        // Chunk the GEMM at m = 16 rows per launch: the cutlass-mlir codegen
-        // miscompiles larger grids (illegal memory access at m_tiles >= 8 --
-        // silent garbage in the engine's pool neighborhood, the source of the
-        // prefill nondeterminism), while m = 16 is the single-tile-per-warp
-        // grid bitwise-verified by the batch-decode path and the standalone
-        // shape tests. The quant kernel is hand-written PTX and shape-safe, so
-        // it runs once at full m_pad above.
-        let mut row = 0u32;
-        while row < m_pad as u32 {
-            mxfp4
-                .forward_offset(
-                    &packed,
-                    &scales,
-                    &dw.packed,
-                    &dw.tiled_scales,
-                    &out,
-                    16,
-                    n as u32,
-                    (k / 64) as u32,
-                    row,
-                    row,
-                )
-                .unwrap_or_else(|e| {
-                    panic!("mxfp4 prefill gemm {weight_name} rows {row}..{}: {e}", row + 16)
-                });
-            row += 16;
-        }
+        // Single launch at full m_pad. (An earlier revision chunked this at
+        // m=16 rows believing the cutlass-mlir backend miscompiled larger
+        // grids; the real bug was our own accumulator store mapping writing
+        // up to 7 rows past every m16 tile into the cudaMallocAsync pool --
+        // silent corruption at small grids, illegal access at large ones.
+        // Fixed and validated against a random-data CPU reference at every
+        // shape up to (128, 4096, 4096) in tools/mxf4-gemv.)
+        mxfp4
+            .forward(
+                &packed,
+                &scales,
+                &dw.packed,
+                &dw.tiled_scales,
+                &out,
+                m_pad as u32,
+                n as u32,
+                (k / 64) as u32,
+            )
+            .unwrap_or_else(|e| panic!("mxfp4 prefill gemm {weight_name}: {e}"));
         if self.debug_nan_trace {
             let ob: Vec<f32> = Arc::clone(&out).to_host_vec().sync_on(stream).expect("dbg out");
             let osum: u64 = ob[..(m_pad * n).min(ob.len())].iter().map(|v| v.to_bits() as u64).sum();
