@@ -102,6 +102,22 @@ fn main() {
     let probe_tokens = vec![1u32];
     let mut probe_session = InferenceSession::new(&config, TraceLevel::Off, 0);
     let probe_result = try_forward(&wrapper, &mut probe_session, &probe_tokens);
+    // Deterministic logits fingerprint: the same token through the same
+    // kernels must reproduce bitwise (engine is deterministic by design), so
+    // this checksum cross-checks kernel swaps (e.g. TEMPURA_NO_DUAL_BLOCK A/B).
+    if let Some(logits) = &probe_result {
+        let sum: f32 = logits.iter().sum();
+        let argmax = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        println!(
+            "  Logits fingerprint: sum={sum:.6} argmax={argmax} n={}",
+            logits.len()
+        );
+    }
     if probe_result.is_none() {
         println!("  WARNING: forward pass failed (likely cuTile JIT requires power-of-2 tile");
         println!(
