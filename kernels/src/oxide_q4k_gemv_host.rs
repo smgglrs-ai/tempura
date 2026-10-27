@@ -250,7 +250,7 @@ impl OxideQ4kGemv {
             let caps = GpuCapabilities::query(stream.device().cu_device());
             // TEMPURA_NO_SM120_KPAR=1 disables sm120 for debugging (uses dp4a_kpar8 fallback).
             let sm120_disabled = std::env::var("TEMPURA_NO_SM120_KPAR").map(|v| v == "1").unwrap_or(false);
-            let (cu_sm120_module, cu_sm120_dp4a_kpar8) = if !sm120_disabled && caps.cc() >= q4k_gemv_v4_ptx::MIN_CC {
+            let (cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_dp4a_kpar8_dual_block) = if !sm120_disabled && caps.cc() >= q4k_gemv_v4_ptx::MIN_CC {
                 let ptx_cstr = CString::new(q4k_gemv_v4_ptx::PTX).unwrap_or_default();
                 let mut v4_mod = std::mem::MaybeUninit::uninit();
                 let rc = unsafe {
@@ -267,26 +267,40 @@ impl OxideQ4kGemv {
                         cuda_core::sys::cuModuleGetFunction(v4_fn.as_mut_ptr(), v4_mod, entry.as_ptr())
                     };
                     if rc2 == CUDA_SUCCESS {
+                        // Two-block-per-iteration unroll of kpar8 (same ABI,
+                        // bitwise-equal output). Optional: absent -> kpar8.
+                        let entry_db = CString::new(q4k_gemv_v4_ptx::ENTRY_DUAL_BLOCK).unwrap_or_default();
+                        let mut db_fn = std::mem::MaybeUninit::uninit();
+                        let rc3 = unsafe {
+                            cuda_core::sys::cuModuleGetFunction(db_fn.as_mut_ptr(), v4_mod, entry_db.as_ptr())
+                        };
+                        let dual_block = if rc3 == CUDA_SUCCESS {
+                            Some(unsafe { db_fn.assume_init() })
+                        } else {
+                            eprintln!("oxide-gemv-q4k: cuModuleGetFunction(dual_block) failed (rc={rc3}), using single-block kpar8");
+                            None
+                        };
                         eprintln!(
-                            "oxide-gemv-q4k: loaded sm_120 v4 PTX ({} bytes) -- native GGUF format, direct Blackwell codegen",
+                            "oxide-gemv-q4k: loaded sm_120 v4 PTX ({} bytes) -- native GGUF format, direct Blackwell codegen, dual_block={}",
                             q4k_gemv_v4_ptx::PTX.len(),
+                            dual_block.is_some(),
                         );
-                        (Some(v4_mod), Some(unsafe { v4_fn.assume_init() }))
+                        (Some(v4_mod), Some(unsafe { v4_fn.assume_init() }), dual_block)
                     } else {
                         let _ = unsafe { cuda_core::sys::cuModuleUnload(v4_mod) };
                         eprintln!("oxide-gemv-q4k: cuModuleGetFunction(sm120_dp4a_kpar8) failed (rc={rc2}), using dp4a_kpar8");
-                        (None, None)
+                        (None, None, None)
                     }
                 } else {
                     eprintln!(
                         "oxide-gemv-q4k: cuModuleLoadData(sm_120 PTX) failed (rc={rc}), cc={}, using dp4a_kpar8",
                         caps.cc(),
                     );
-                    (None, None)
+                    (None, None, None)
                 }
             } else {
                 // Non-Blackwell GPU: skip sm120 entirely, use oxide sm_80 dp4a_kpar8.
-                (None, None)
+                (None, None, None)
             };
 
             // -- Load sm_120 fused gate+up+SiLU PTX (separate module from kpar) -
@@ -454,12 +468,17 @@ impl OxideQ4kGemv {
             };
 
             // -- Build KernelVariant table and select best kpar dispatch ---------
+            // (select_best = max min_cc; ties resolve to the LAST pushed entry,
+            // so the dual-block unroll wins over single-block kpar8 on sm_120.)
             let mut kpar_variants: Vec<KernelVariant> = Vec::new();
             if let Some(f) = cu_q8_dp4a_kpar8 {
                 kpar_variants.push(KernelVariant { cu_fn: f, min_cc: 800, name: "q4k_gemv_dp4a_kpar8" });
             }
             if let Some(f) = cu_sm120_dp4a_kpar8 {
                 kpar_variants.push(KernelVariant { cu_fn: f, min_cc: 1200, name: "q4k_gemv_sm120_dp4a_kpar8" });
+            }
+            if let Some(f) = cu_sm120_dp4a_kpar8_dual_block {
+                kpar_variants.push(KernelVariant { cu_fn: f, min_cc: 1200, name: "q4k_gemv_sm120_dp4a_kpar8_dual_block" });
             }
             let kpar_dispatch = KernelVariant::select_best(&kpar_variants, &caps).cloned();
             // v4 uses native 36-u32 GGUF format in the v4 kernel itself, but the production

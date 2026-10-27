@@ -365,10 +365,386 @@ REDUCE:
 DONE:
     ret;
 }
+
+// q4k_gemv_sm120_dp4a_kpar8_dual_block: two-block-per-iteration unroll of
+// kpar8.
+//
+// kpar8 processes ONE 144-byte block per warp-iteration. With k_blocks=16
+// (h=4096) each warp runs only 2 iterations -- the loop is latency-bound:
+// 7 dependent weight loads per iteration, little to overlap.
+//
+// This variant processes blocks blkA and blkB=blkA+8 per iteration: both
+// blocks' weight loads issue back-to-back (2x memory-level parallelism per
+// warp), then compute A, load B activations, compute B. For k_blocks=16 the
+// loop collapses to a single iteration with 14 loads in flight.
+//
+// Accumulation order per warp is IDENTICAL to kpar8 (blkA, blkB, blkA+16,
+// ...), so results are bitwise-equal by construction.
+//
+// When blkB >= k_blocks (ragged tail, e.g. down_proj k_blocks=56), baseB and
+// B's activation indices clamp to block A's (safe addresses -- Blackwell
+// traps on OOB even under predication) and B's accumulate is predicated off.
+.visible .entry q4k_gemv_sm120_dp4a_kpar8_dual_block(
+    .param .u64 param_weights,
+    .param .u64 param_act_qs,
+    .param .u64 param_act_ds,
+    .param .u64 param_out,
+    .param .u32 param_n_rows,
+    .param .u32 param_k_blocks
+)
+{
+    .reg .u32  %r<80>;
+    .reg .u64  %rd<16>;
+    .reg .f32  %f<40>;
+    .reg .pred %p<16>;
+    .reg .b16  %h<8>;
+
+    // 32 f32 slots: smem[warp_id * 4 + mw] holds the mini-warp partial sum.
+    .shared .align 4 .b8 smem_buf[128];
+
+    // -- Load kernel parameters -----------------------------------------------
+    ld.param.u64 %rd0, [param_weights];
+    ld.param.u64 %rd1, [param_act_qs];
+    ld.param.u64 %rd2, [param_act_ds];
+    ld.param.u64 %rd3, [param_out];
+    ld.param.u32 %r0,  [param_n_rows];
+    ld.param.u32 %r1,  [param_k_blocks];
+
+    // -- Thread index decomposition --------------------------------------------
+    mov.u32 %r2, %ctaid.x;       // n_out = blockIdx.x
+    setp.ge.u32 %p0, %r2, %r0;   // guard: n_out >= n_rows -> exit
+    @%p0 bra DONE2;
+
+    mov.u32 %r3, %tid.x;          // flat thread index (0..255)
+    and.b32 %r4, %r3, 31;         // lane = tid & 31
+    shr.u32 %r5, %r3, 5;          // warp_id = tid >> 5  (0..7)
+    shr.u32 %r6, %r4, 3;          // mw = lane >> 3  (0..3, j-group)
+    and.b32 %r7, %r4, 7;          // sub_l = lane & 7
+
+    // shift = (mw & 1) << 4  [0 for mw=0,2; 16 for mw=1,3]
+    and.b32 %r8, %r6, 1;
+    shl.b32 %r8, %r8, 4;
+    add.u32 %r19, %r8, 8;         // shift + 8
+
+    // is_upper = mw >> 1  [1 for mw=2,3; 0 for mw=0,1]
+    shr.u32 %r9, %r6, 1;
+    setp.ne.u32 %p1, %r9, 0;      // %p1 = is_upper
+
+    // sub_l == 0 predicate (for smem write in reduction)
+    setp.eq.u32 %p2, %r7, 0;      // %p2 = (sub_l == 0)
+
+    // acc = 0.0
+    mov.f32 %f0, 0f00000000;
+
+    // Per-lane qs word byte offset within a block: (4 + mw*8 + sub_l) * 4.
+    mul.lo.u32 %r24, %r6, 8;
+    add.u32    %r24, %r24, 4;
+    add.u32    %r24, %r24, %r7;
+    shl.b32    %r24, %r24, 2;
+
+    // K-loop: warp strides by 16 (two 144-byte blocks per iteration).
+    mov.u32 %r12, %r5;            // blkA = warp_id
+
+KLOOP2:
+    setp.ge.u32 %p3, %r12, %r1;   // blkA >= k_blocks -> exit loop
+    @%p3 bra REDUCE2;
+
+    // -- Addresses --------------------------------------------------------------
+    // baseA = weights + (n_out * k_blocks + blkA) * 144
+    mad.lo.u32 %r14, %r2, %r1, %r12;
+    mul.lo.u32 %r15, %r14, 144;
+    cvt.u64.u32 %rd4, %r15;
+    add.u64 %rd4, %rd0, %rd4;
+
+    // blkB = blkA + 8; clamp baseB to baseA when invalid (safe load address).
+    add.u32 %r60, %r12, 8;
+    setp.lt.u32 %p10, %r60, %r1;  // %p10 = B valid
+    mad.lo.u32 %r61, %r2, %r1, %r60;
+    mul.lo.u32 %r62, %r61, 144;
+    cvt.u64.u32 %rd5, %r62;
+    add.u64 %rd5, %rd0, %rd5;
+    selp.u64 %rd5, %rd5, %rd4, %p10;
+
+    // -- Prefetch next pair into L2 (16 blocks ahead = 2304 bytes) -------------
+    add.u32 %r63, %r12, 16;
+    setp.lt.u32 %p11, %r63, %r1;
+    add.u64 %rd10, %rd4, 2304;
+    @%p11 prefetch.global.L2 [%rd10];
+
+    // ---- Load A weights (d, dmin, 3 scale words, qs) --------------------------
+    ld.global.nc.b16 %h0, [%rd4];
+    ld.global.nc.b16 %h1, [%rd4 + 2];
+    cvt.f32.f16 %f1, %h0;              // d
+    cvt.f32.f16 %f2, %h1;              // dmin
+    ld.global.nc.b32 %r16, [%rd4 + 4];   // ps0
+    ld.global.nc.b32 %r17, [%rd4 + 8];   // ps1
+    ld.global.nc.b32 %r18, [%rd4 + 12];  // ps2
+    cvt.u64.u32 %rd13, %r24;             // qs_off (per-lane byte offset)
+    add.u64 %rd6, %rd4, %rd13;
+    ld.global.nc.b32 %r25, [%rd6];       // qs word A
+
+    // ---- Load B weights (clamped-safe when invalid) ---------------------------
+    ld.global.nc.b16 %h4, [%rd5];
+    ld.global.nc.b16 %h5, [%rd5 + 2];
+    cvt.f32.f16 %f20, %h4;             // d_B
+    cvt.f32.f16 %f21, %h5;             // dmin_B
+    ld.global.nc.b32 %r64, [%rd5 + 4];
+    ld.global.nc.b32 %r65, [%rd5 + 8];
+    ld.global.nc.b32 %r66, [%rd5 + 12];
+    add.u64 %rd7, %rd5, %rd13;
+    ld.global.nc.b32 %r67, [%rd7];       // qs word B
+
+    // =============== COMPUTE BLOCK A ==========================================
+    // Branchless scale extraction (identical to kpar8).
+    shr.u32 %r20, %r16, %r8;           and.b32 %r20, %r20, 63;
+    shr.u32 %r21, %r16, %r19;          and.b32 %r21, %r21, 63;
+    shr.u32 %r22, %r17, %r8;           and.b32 %r22, %r22, 63;
+    shr.u32 %r23, %r17, %r19;          and.b32 %r23, %r23, 63;
+
+    shr.u32 %r40, %r16, %r8;  and.b32 %r40, %r40, 255;   // b0
+    shr.u32 %r41, %r16, %r19; and.b32 %r41, %r41, 255;   // b1
+    shr.u32 %r42, %r17, %r8;  and.b32 %r42, %r42, 255;   // b4
+    shr.u32 %r43, %r17, %r19; and.b32 %r43, %r43, 255;   // b5
+    shr.u32 %r44, %r18, %r8;  and.b32 %r44, %r44, 255;   // b8
+    shr.u32 %r45, %r18, %r19; and.b32 %r45, %r45, 255;   // b9
+
+    and.b32 %r47, %r44, 15;
+    and.b32 %r46, %r40, 192; shr.u32 %r46, %r46, 2;
+    or.b32  %r47, %r47, %r46;
+    and.b32 %r48, %r45, 15;
+    and.b32 %r46, %r41, 192; shr.u32 %r46, %r46, 2;
+    or.b32  %r48, %r48, %r46;
+    shr.u32 %r49, %r44, 4; and.b32 %r49, %r49, 15;
+    and.b32 %r46, %r42, 192; shr.u32 %r46, %r46, 2;
+    or.b32  %r49, %r49, %r46;
+    shr.u32 %r50, %r45, 4; and.b32 %r50, %r50, 15;
+    and.b32 %r46, %r43, 192; shr.u32 %r46, %r46, 2;
+    or.b32  %r50, %r50, %r46;
+
+    selp.u32 %r20, %r47, %r20, %p1;    // sc_lo
+    selp.u32 %r21, %r48, %r21, %p1;    // sc_hi
+    selp.u32 %r22, %r49, %r22, %p1;    // m_lo
+    selp.u32 %r23, %r50, %r23, %p1;    // m_hi
+
+    cvt.rn.f32.u32 %f3, %r20;
+    cvt.rn.f32.u32 %f4, %r21;
+    cvt.rn.f32.u32 %f5, %r22;
+    cvt.rn.f32.u32 %f6, %r23;
+
+    // -- A activations: q8_blk_lo = blkA * 8 + mw * 2 ---------------------------
+    mul.lo.u32 %r26, %r12, 8;
+    mul.lo.u32 %r27, %r6, 2;
+    add.u32    %r26, %r26, %r27;
+
+    mul.lo.u32 %r27, %r26, 8;
+    add.u32    %r27, %r27, %r7;
+    shl.b32    %r28, %r27, 2;
+    cvt.u64.u32 %rd8, %r28;
+    add.u64 %rd8, %rd1, %rd8;
+    ld.global.b32 %r28, [%rd8];        // u_lo A
+
+    add.u32 %r29, %r27, 8;
+    shl.b32 %r30, %r29, 2;
+    cvt.u64.u32 %rd9, %r30;
+    add.u64 %rd9, %rd1, %rd9;
+    ld.global.b32 %r29, [%rd9];        // u_hi A
+
+    shl.b32 %r30, %r26, 2;
+    cvt.u64.u32 %rd11, %r30;
+    add.u64 %rd11, %rd2, %rd11;
+    ld.global.b16 %h2, [%rd11];
+    cvt.f32.f16 %f7, %h2;              // d8_lo A
+    add.u64 %rd12, %rd11, 4;
+    ld.global.b16 %h3, [%rd12];
+    cvt.f32.f16 %f8, %h3;              // d8_hi A
+
+    // -- A dp4a -----------------------------------------------------------------
+    and.b32 %r32, %r25, 0x0F0F0F0F;
+    shr.u32 %r33, %r25, 4;
+    and.b32 %r33, %r33, 0x0F0F0F0F;
+
+    dp4a.s32.s32 %r34, %r32, %r28, 0;
+    dp4a.s32.s32 %r35, %r33, %r29, 0;
+    dp4a.s32.s32 %r36, 0x01010101, %r28, 0;
+    dp4a.s32.s32 %r37, 0x01010101, %r29, 0;
+
+    cvt.rn.f32.s32 %f9,  %r34;
+    cvt.rn.f32.s32 %f10, %r35;
+    cvt.rn.f32.s32 %f11, %r36;
+    cvt.rn.f32.s32 %f12, %r37;
+
+    mul.f32 %f13, %f1, %f3; mul.f32 %f13, %f13, %f9;
+    mul.f32 %f14, %f2, %f5; mul.f32 %f14, %f14, %f11;
+    sub.f32 %f13, %f13, %f14; mul.f32 %f13, %f13, %f7;
+    add.f32 %f0, %f0, %f13;
+
+    mul.f32 %f15, %f1, %f4; mul.f32 %f15, %f15, %f10;
+    mul.f32 %f16, %f2, %f6; mul.f32 %f16, %f16, %f12;
+    sub.f32 %f15, %f15, %f16; mul.f32 %f15, %f15, %f8;
+    add.f32 %f0, %f0, %f15;
+
+    // =============== COMPUTE BLOCK B ==========================================
+    // Scale extraction from B's scale words (identical shape to A).
+    shr.u32 %r20, %r64, %r8;           and.b32 %r20, %r20, 63;
+    shr.u32 %r21, %r64, %r19;          and.b32 %r21, %r21, 63;
+    shr.u32 %r22, %r65, %r8;           and.b32 %r22, %r22, 63;
+    shr.u32 %r23, %r65, %r19;          and.b32 %r23, %r23, 63;
+
+    shr.u32 %r40, %r64, %r8;  and.b32 %r40, %r40, 255;
+    shr.u32 %r41, %r64, %r19; and.b32 %r41, %r41, 255;
+    shr.u32 %r42, %r65, %r8;  and.b32 %r42, %r42, 255;
+    shr.u32 %r43, %r65, %r19; and.b32 %r43, %r43, 255;
+    shr.u32 %r44, %r66, %r8;  and.b32 %r44, %r44, 255;
+    shr.u32 %r45, %r66, %r19; and.b32 %r45, %r45, 255;
+
+    and.b32 %r47, %r44, 15;
+    and.b32 %r46, %r40, 192; shr.u32 %r46, %r46, 2;
+    or.b32  %r47, %r47, %r46;
+    and.b32 %r48, %r45, 15;
+    and.b32 %r46, %r41, 192; shr.u32 %r46, %r46, 2;
+    or.b32  %r48, %r48, %r46;
+    shr.u32 %r49, %r44, 4; and.b32 %r49, %r49, 15;
+    and.b32 %r46, %r42, 192; shr.u32 %r46, %r46, 2;
+    or.b32  %r49, %r49, %r46;
+    shr.u32 %r50, %r45, 4; and.b32 %r50, %r50, 15;
+    and.b32 %r46, %r43, 192; shr.u32 %r46, %r46, 2;
+    or.b32  %r50, %r50, %r46;
+
+    selp.u32 %r20, %r47, %r20, %p1;
+    selp.u32 %r21, %r48, %r21, %p1;
+    selp.u32 %r22, %r49, %r22, %p1;
+    selp.u32 %r23, %r50, %r23, %p1;
+
+    cvt.rn.f32.u32 %f3, %r20;
+    cvt.rn.f32.u32 %f4, %r21;
+    cvt.rn.f32.u32 %f5, %r22;
+    cvt.rn.f32.u32 %f6, %r23;
+
+    // -- B activations: q8_blk_lo = blkB * 8 + mw * 2 (clamped to A when invalid)
+    mul.lo.u32 %r68, %r60, 8;
+    selp.u32 %r68, %r68, %r26, %p10;
+    mul.lo.u32 %r27, %r6, 2;
+    add.u32    %r68, %r68, %r27;
+
+    mul.lo.u32 %r27, %r68, 8;
+    add.u32    %r27, %r27, %r7;
+    shl.b32    %r28, %r27, 2;
+    cvt.u64.u32 %rd8, %r28;
+    add.u64 %rd8, %rd1, %rd8;
+    ld.global.b32 %r28, [%rd8];        // u_lo B
+
+    add.u32 %r29, %r27, 8;
+    shl.b32 %r30, %r29, 2;
+    cvt.u64.u32 %rd9, %r30;
+    add.u64 %rd9, %rd1, %rd9;
+    ld.global.b32 %r29, [%rd9];        // u_hi B
+
+    shl.b32 %r30, %r68, 2;
+    cvt.u64.u32 %rd11, %r30;
+    add.u64 %rd11, %rd2, %rd11;
+    ld.global.b16 %h2, [%rd11];
+    cvt.f32.f16 %f7, %h2;              // d8_lo B
+    add.u64 %rd12, %rd11, 4;
+    ld.global.b16 %h3, [%rd12];
+    cvt.f32.f16 %f8, %h3;              // d8_hi B
+
+    // -- B dp4a (accumulate guarded: B may be the clamped duplicate of A) --------
+    and.b32 %r32, %r67, 0x0F0F0F0F;
+    shr.u32 %r33, %r67, 4;
+    and.b32 %r33, %r33, 0x0F0F0F0F;
+
+    dp4a.s32.s32 %r34, %r32, %r28, 0;
+    dp4a.s32.s32 %r35, %r33, %r29, 0;
+    dp4a.s32.s32 %r36, 0x01010101, %r28, 0;
+    dp4a.s32.s32 %r37, 0x01010101, %r29, 0;
+
+    cvt.rn.f32.s32 %f9,  %r34;
+    cvt.rn.f32.s32 %f10, %r35;
+    cvt.rn.f32.s32 %f11, %r36;
+    cvt.rn.f32.s32 %f12, %r37;
+
+    mul.f32 %f13, %f20, %f3; mul.f32 %f13, %f13, %f9;
+    mul.f32 %f14, %f21, %f5; mul.f32 %f14, %f14, %f11;
+    sub.f32 %f13, %f13, %f14; mul.f32 %f13, %f13, %f7;
+    @%p10 add.f32 %f0, %f0, %f13;
+
+    mul.f32 %f15, %f20, %f4; mul.f32 %f15, %f15, %f10;
+    mul.f32 %f16, %f21, %f6; mul.f32 %f16, %f16, %f12;
+    sub.f32 %f15, %f15, %f16; mul.f32 %f15, %f15, %f8;
+    @%p10 add.f32 %f0, %f0, %f15;
+
+    // -- Advance: next pair ------------------------------------------------------
+    add.u32 %r12, %r12, 16;
+    bra KLOOP2;
+
+    // -- Reduction (identical to kpar8) ------------------------------------------
+REDUCE2:
+    mov.b32 %r50, %f0;
+    shfl.sync.bfly.b32 %r51, %r50, 4, 0x71F, 0xFFFFFFFF;
+    mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
+
+    mov.b32 %r50, %f0;
+    shfl.sync.bfly.b32 %r51, %r50, 2, 0x71F, 0xFFFFFFFF;
+    mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
+
+    mov.b32 %r50, %f0;
+    shfl.sync.bfly.b32 %r51, %r50, 1, 0x71F, 0xFFFFFFFF;
+    mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
+
+    mul.lo.u32 %r52, %r5, 4;
+    add.u32    %r52, %r52, %r6;
+    shl.b32    %r53, %r52, 2;
+    mov.u32    %r54, smem_buf;
+    add.u32    %r54, %r54, %r53;
+    @%p2 st.shared.f32 [%r54], %f0;
+
+    bar.sync 0;
+
+    setp.eq.u32 %p6, %r5, 0;
+    setp.lt.u32 %p7, %r4, 4;
+    and.pred    %p8, %p6, %p7;
+    mul.lo.u32 %r55, %r4, 4;
+    mov.u32    %r54, smem_buf;
+    add.u32    %r55, %r54, %r55;
+
+    mov.f32 %f18, 0f00000000;
+    @%p8 ld.shared.f32 %f19, [%r55 +   0]; @%p8 add.f32 %f18, %f18, %f19;
+    @%p8 ld.shared.f32 %f19, [%r55 +  16]; @%p8 add.f32 %f18, %f18, %f19;
+    @%p8 ld.shared.f32 %f19, [%r55 +  32]; @%p8 add.f32 %f18, %f18, %f19;
+    @%p8 ld.shared.f32 %f19, [%r55 +  48]; @%p8 add.f32 %f18, %f18, %f19;
+    @%p8 ld.shared.f32 %f19, [%r55 +  64]; @%p8 add.f32 %f18, %f18, %f19;
+    @%p8 ld.shared.f32 %f19, [%r55 +  80]; @%p8 add.f32 %f18, %f18, %f19;
+    @%p8 ld.shared.f32 %f19, [%r55 +  96]; @%p8 add.f32 %f18, %f18, %f19;
+    @%p8 ld.shared.f32 %f19, [%r55 + 112]; @%p8 add.f32 %f18, %f18, %f19;
+
+    @%p8 st.shared.f32 [%r55], %f18;
+
+    bar.sync 0;
+
+    setp.eq.u32 %p9, %r3, 0;
+    mov.u32    %r53, smem_buf;
+    mov.f32 %f18, 0f00000000;
+    @%p9 ld.shared.f32 %f18, [%r53 +  0];
+    @%p9 ld.shared.f32 %f19, [%r53 +  4]; @%p9 add.f32 %f18, %f18, %f19;
+    @%p9 ld.shared.f32 %f19, [%r53 +  8]; @%p9 add.f32 %f18, %f18, %f19;
+    @%p9 ld.shared.f32 %f19, [%r53 + 12]; @%p9 add.f32 %f18, %f18, %f19;
+
+    shl.b32    %r50, %r2, 2;
+    cvt.u64.u32 %rd4, %r50;
+    add.u64 %rd4, %rd3, %rd4;
+    @%p9 st.global.f32 [%rd4], %f18;
+
+DONE2:
+    ret;
+}
 "#;
 
 /// Kernel entry name -- used by `cuModuleGetFunction`.
 pub const ENTRY: &str = "q4k_gemv_sm120_dp4a_kpar8";
+
+/// Two-block-per-iteration unroll of [`ENTRY`] (same ABI and launch config).
+/// Selected on sm_120+ when present; bitwise-equal output by construction.
+pub const ENTRY_DUAL_BLOCK: &str = "q4k_gemv_sm120_dp4a_kpar8_dual_block";
 
 /// Minimum compute capability required (sm_120 = Blackwell).
 pub const MIN_CC: u32 = 1200;
