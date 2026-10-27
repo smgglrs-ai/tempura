@@ -3296,15 +3296,53 @@ impl CutileGpuModel {
             .reshape(&[next_pow2(dw.k_blocks * tempura_kernels::Q4K_BLOCK_SIZE)])
             .expect("gemm_q4k_d2d_slot: reshape failed");
 
-        // Q8 path (dp4a) takes priority over the scratch-tensor f32 path --
-        // the quantize+dp4a kernel is preferred for M=1 decode throughput.
-        // When native format is active, kpar is used for ALL n sizes.
+        // Q8 kpar path: quantize + kpar GEMV into the PER-SLOT output tensor.
+        // The previous shared-scratch output (forward_best_kpar_d2d) made
+        // consecutive GEMV outputs ALIAS: gate and up both wrote q8_out_scratch,
+        // so the silu read silu(up)*up with gate's values clobbered (found via
+        // bench-batch fresh-cache replay + per-op bits_sum diffing).
         if let Some(oxide) = &self.oxide_q4k_gemv {
             let min_kpar_n = if oxide.uses_raw_gguf { 0 } else { 4096 };
             if oxide.has_any_kpar() && dw.n >= min_kpar_n {
-                return oxide
-                    .forward_best_kpar_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
-                    .expect("OxideQ4kGemv::forward_best_kpar_d2d failed in gemm_q4k_d2d_slot");
+                let maybe_tensor = {
+                    let mut pool = self.scratch.borrow_mut();
+                    match pool[slot].take() {
+                        Some(arc) => match Arc::try_unwrap(arc) {
+                            Ok(tensor) => Some(tensor),
+                            Err(arc_back) => {
+                                pool[slot] = Some(arc_back);
+                                None
+                            }
+                        },
+                        None => None,
+                    }
+                };
+                if let Some(tensor) = maybe_tensor {
+                    let submitted = unsafe {
+                        if oxide.uses_raw_gguf {
+                            oxide.submit_sm120_kpar_into_slot(
+                                &a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks,
+                            )
+                        } else {
+                            oxide.submit_dp4a_kpar_into_slot(
+                                &a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks,
+                            )
+                        }
+                    };
+                    if let Ok(result) = submitted {
+                        self.scratch.borrow_mut()[slot] = Some(result.clone());
+                        return result;
+                    }
+                    // Submit failed (scratch too small, kernel missing): fall
+                    // through to the fresh-allocation paths below.
+                } else {
+                    // Pool miss: a fresh allocation via forward_best_kpar_d2d
+                    // would use the SHARED output scratch (aliasing hazard for
+                    // gate+up); use the oxide f32 GEMV (fresh output) instead.
+                    return oxide
+                        .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
+                        .expect("OxideQ4kGemv::forward_d2d failed in gemm_q4k_d2d_slot (pool miss)");
+                }
             }
             if oxide.has_q8_path() {
                 return oxide
@@ -4499,6 +4537,7 @@ impl CutileGpuModel {
                         seq_len,
                         inter,
                         &mut self.silu_out_scratch.borrow_mut(),
+                        &shared_stream,
                     )
                     .expect("SiLU-mul failed")
             };
@@ -5027,6 +5066,7 @@ impl CutileGpuModel {
             // variant to eliminate the per-call api::zeros.sync_on allocation --
             // saves 28 blocking allocs per decode token across all layers.
             let gate_silu_n_dev = if seq_len == 1 {
+                let silu_stream = self.matmul.stream();
                 self.cutile_elementwise
                     .silu_mul_device_scratch(
                         &gate_dev,
@@ -5034,11 +5074,13 @@ impl CutileGpuModel {
                         seq_len,
                         inter,
                         &mut self.silu_out_scratch.borrow_mut(),
+                        &silu_stream,
                     )
                     .expect("CutileGpuModel: GPU SiLU-mul failed")
             } else {
+                let silu_stream = self.matmul.stream();
                 self.cutile_elementwise
-                    .silu_mul_device(&gate_dev, &up_dev, seq_len, inter)
+                    .silu_mul_device(&gate_dev, &up_dev, seq_len, inter, &silu_stream)
                     .expect("CutileGpuModel: GPU SiLU-mul failed")
             };
 
@@ -5810,6 +5852,7 @@ impl CutileGpuModel {
                 .silu_mul_device_scratch(
                     &self.batch_gemv_gate, &self.batch_gemv_up, m, inter,
                     &mut self.batch_silu_out_scratch.borrow_mut(),
+                    &stream,
                 )
                 .expect("batch inner: SiLU-mul");
 
@@ -6809,7 +6852,7 @@ impl CutileGpuModel {
             let inter_size = m * cfg.intermediate_size;
             let gs_dev = self
                 .cutile_elementwise
-                .silu_mul_device(&gate_dev, &up_dev, m, cfg.intermediate_size)
+                .silu_mul_device(&gate_dev, &up_dev, m, cfg.intermediate_size, &stream)
                 .expect("batch silu_mul_device failed");
             // Pad inter -> inter_pad if necessary (e.g. Llama-3.1-8B: 14336->16384).
             let inter_sz = cfg.intermediate_size;

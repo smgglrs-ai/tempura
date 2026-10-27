@@ -987,6 +987,196 @@ impl OxideQ4kGemv {
         Ok(())
     }
 
+    /// Main-stream twin of `submit_sm120_kpar_kv_into_slot`: quantize `x` into
+    /// the MAIN Q8_1 scratch and run the sm120 kpar GEMV writing into the
+    /// caller-supplied slot tensor, on `self.stream`.
+    ///
+    /// This is what `gemm_q4k_d2d_slot` uses for every Q4K projection: the
+    /// shared `q8_out_scratch` output of `forward_best_kpar_d2d` made
+    /// consecutive GEMV outputs ALIAS (gate and up both wrote the same buffer,
+    /// so SiLU computed silu(up)*up -- gate's values were clobbered before
+    /// being read). Per-slot output tensors keep every projection's result
+    /// alive independently.
+    ///
+    /// # Safety
+    /// Caller must guarantee `out` is not concurrently written by another
+    /// in-flight kernel.
+    pub unsafe fn submit_sm120_kpar_into_slot(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        out: Tensor<f32>,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let kpar_fn = match &self.kpar_dispatch {
+            Some(v) if v.min_cc >= 1200 => v.cu_fn,
+            _ => return Err(KernelError::InvalidConfig("sm120_dp4a_kpar8 not available".into())),
+        };
+        let q8_quant_fn = match self.cu_q8_quantize {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
+        };
+
+        let k = k_blocks * 256;
+        let k_q8_blocks = k.div_ceil(32);
+
+        let x_qs = match &*self.q8_qs_scratch.borrow() {
+            Some(t) if t.size() >= k / 4 => t.clone(),
+            _ => return Err(KernelError::InvalidConfig(
+                "q8_qs_scratch not pre-allocated or too small".into(),
+            )),
+        };
+        let x_ds = match &*self.q8_ds_scratch.borrow() {
+            Some(t) if t.size() >= k_q8_blocks => t.clone(),
+            _ => return Err(KernelError::InvalidConfig(
+                "q8_ds_scratch not pre-allocated or too small".into(),
+            )),
+        };
+
+        let cu_stream = self.stream.cu_stream();
+
+        // -- quantize_q8_1 on the main stream ------------------------------------
+        {
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len: u64 = (k / 4) as u64;
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len: u64 = k_q8_blocks as u64;
+            let x_ptr:  u64 = x.device_pointer().cu_deviceptr();
+            let x_len:  u64 = x.size() as u64;
+            let k_u32:  u32 = k as u32;
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr as *const _ as *mut c_void,
+                &qs_len as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ds_len as *const _ as *mut c_void,
+                &x_ptr  as *const _ as *mut c_void,
+                &x_len  as *const _ as *mut c_void,
+                &k_u32  as *const _ as *mut c_void,
+            ];
+            let grid_x = k_q8_blocks.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            launch_kernel(q8_quant_fn, (grid_x, 1, 1), (BLOCK_DIM, 1, 1), 0, cu_stream, &mut params)
+                .map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 (slot): {e}")))?;
+        }
+
+        // -- sm120_dp4a_kpar8 writing into the slot tensor ------------------------
+        {
+            let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ou_ptr: u64 = out.device_pointer().cu_deviceptr();
+            let n_u32:  u32 = n as u32;
+            let kb_u32: u32 = k_blocks as u32;
+            let mut params: [*mut c_void; 6] = [
+                &wt_ptr as *const _ as *mut c_void,
+                &qs_ptr as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ou_ptr as *const _ as *mut c_void,
+                &n_u32  as *const _ as *mut c_void,
+                &kb_u32 as *const _ as *mut c_void,
+            ];
+            launch_kernel(kpar_fn, (n as u32, 1, 1), (BLOCK_DIM_KPAR, 1, 1), 128, cu_stream, &mut params)
+                .map_err(|e| KernelError::InvalidConfig(format!("sm120_dp4a_kpar8 slot: {e}")))?;
+        }
+
+        Ok(Arc::new(out))
+    }
+
+    /// Oxide dp4a_kpar8 into a caller slot (non-sm120 GPUs). Quantizes into the
+    /// main Q8 scratch and writes `out` on `self.stream`.
+    ///
+    /// # Safety
+    /// Caller must guarantee `out` is not concurrently written by another
+    /// in-flight kernel.
+    pub unsafe fn submit_dp4a_kpar_into_slot(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        packed: &Arc<Tensor<u32>>,
+        out: Tensor<f32>,
+        n: usize,
+        k_blocks: usize,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let kpar_fn = match self.cu_q8_dp4a_kpar8 {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("dp4a_kpar8 not loaded".into())),
+        };
+        let q8_quant_fn = match self.cu_q8_quantize {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
+        };
+
+        let k = k_blocks * 256;
+        let k_q8_blocks = k.div_ceil(32);
+
+        let x_qs = match &*self.q8_qs_scratch.borrow() {
+            Some(t) if t.size() >= k / 4 => t.clone(),
+            _ => return Err(KernelError::InvalidConfig(
+                "q8_qs_scratch not pre-allocated or too small".into(),
+            )),
+        };
+        let x_ds = match &*self.q8_ds_scratch.borrow() {
+            Some(t) if t.size() >= k_q8_blocks => t.clone(),
+            _ => return Err(KernelError::InvalidConfig(
+                "q8_ds_scratch not pre-allocated or too small".into(),
+            )),
+        };
+
+        let cu_stream = self.stream.cu_stream();
+
+        // quantize_q8_1
+        {
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len: u64 = (k / 4) as u64;
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len: u64 = k_q8_blocks as u64;
+            let x_ptr:  u64 = x.device_pointer().cu_deviceptr();
+            let x_len:  u64 = x.size() as u64;
+            let k_u32:  u32 = k as u32;
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr as *const _ as *mut c_void,
+                &qs_len as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ds_len as *const _ as *mut c_void,
+                &x_ptr  as *const _ as *mut c_void,
+                &x_len  as *const _ as *mut c_void,
+                &k_u32  as *const _ as *mut c_void,
+            ];
+            let grid_x = k_q8_blocks.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            launch_kernel(q8_quant_fn, (grid_x, 1, 1), (BLOCK_DIM, 1, 1), 0, cu_stream, &mut params)
+                .map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 (dp4a slot): {e}")))?;
+        }
+
+        // dp4a_kpar8 into the slot tensor
+        {
+            let out_ptr: u64 = out.device_pointer().cu_deviceptr();
+            let out_len: u64 = n as u64;
+            let qs_ptr:  u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len:  u64 = (k / 4) as u64;
+            let ds_ptr:  u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len:  u64 = k_q8_blocks as u64;
+            let pk_ptr:  u64 = packed.device_pointer().cu_deviceptr();
+            let pk_len:  u64 = packed.size() as u64;
+            let n_u32:   u32 = n as u32;
+            let kb_u32:  u32 = k_blocks as u32;
+            let mut params: [*mut c_void; 10] = [
+                &out_ptr as *const _ as *mut c_void,
+                &out_len as *const _ as *mut c_void,
+                &qs_ptr  as *const _ as *mut c_void,
+                &qs_len  as *const _ as *mut c_void,
+                &ds_ptr  as *const _ as *mut c_void,
+                &ds_len  as *const _ as *mut c_void,
+                &pk_ptr  as *const _ as *mut c_void,
+                &pk_len  as *const _ as *mut c_void,
+                &n_u32   as *const _ as *mut c_void,
+                &kb_u32  as *const _ as *mut c_void,
+            ];
+            launch_kernel(kpar_fn, (n as u32, 1, 1), (BLOCK_DIM_KPAR, 1, 1), 128, cu_stream, &mut params)
+                .map_err(|e| KernelError::InvalidConfig(format!("dp4a_kpar8 slot: {e}")))?;
+        }
+
+        Ok(Arc::new(out))
+    }
+
     /// Pre-allocate Q8_1 scratch buffers outside of CUDA graph capture.
     ///
     /// Must be called before the first `cuStreamBeginCapture` -- allocations on
