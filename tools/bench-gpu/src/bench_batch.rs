@@ -86,6 +86,9 @@ fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> BatchResult {
     let mut kv_caches = wrapper.new_batch_kv_caches(batch);
     let mut nan_run1 = 0usize;
     let mut last: Vec<Vec<f32>> = Vec::new();
+    // Per-step fingerprints (divergence localization: TEMPURA_BENCH_STEP_FP=1).
+    let trace_steps = std::env::var("TEMPURA_BENCH_STEP_FP").is_ok();
+    let mut step_fps: Vec<u64> = Vec::new();
 
     // Prefill: position 0, one token per request.
     let mut cur_pos = 0u32;
@@ -94,6 +97,9 @@ fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> BatchResult {
         let pos:  Vec<u32> = vec![cur_pos; batch];
         let logits = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
         nan_run1 += nan_count(&logits);
+        if trace_steps {
+            step_fps.push(fingerprint(&logits).bits_sum);
+        }
         cur_pos += 1;
     }
 
@@ -103,6 +109,9 @@ fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> BatchResult {
         let pos:  Vec<u32> = vec![cur_pos; batch];
         let logits = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
         nan_run1 += nan_count(&logits);
+        if trace_steps {
+            step_fps.push(fingerprint(&logits).bits_sum);
+        }
         cur_pos += 1;
     }
 
@@ -113,6 +122,9 @@ fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> BatchResult {
         let pos:  Vec<u32> = vec![cur_pos; batch];
         let logits = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
         nan_run1 += nan_count(&logits);
+        if trace_steps {
+            step_fps.push(fingerprint(&logits).bits_sum);
+        }
         last = logits;
         cur_pos += 1;
     }
@@ -134,14 +146,53 @@ fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> BatchResult {
     let mut nan_run2 = 0usize;
     let mut v_pos = 0u32;
     let mut v_last: Vec<Vec<f32>> = Vec::new();
+    let mut v_step_fps: Vec<u64> = Vec::new();
     for i in 0..VERIFY_STEPS {
         let tok = if i == 0 { 1u32 } else { 2u32 };
         let toks: Vec<u32> = vec![tok; batch];
         let pos:  Vec<u32> = vec![v_pos; batch];
         let logits = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_verify);
         nan_run2 += nan_count(&logits);
+        if trace_steps {
+            v_step_fps.push(fingerprint(&logits).bits_sum);
+        }
         v_last = logits;
         v_pos += 1;
+    }
+
+    if trace_steps {
+        // First step where the two runs diverge (schedule is identical, so
+        // any difference is the bug). 0 = capture step (prefill), 1..10 =
+        // warmup (1 captures the graph), 11..60 = timed replays.
+        let mut diverged_at = None;
+        for (i, (a, b)) in step_fps.iter().zip(v_step_fps.iter()).enumerate() {
+            if a != b {
+                diverged_at = Some(i);
+                break;
+            }
+        }
+        match diverged_at {
+            Some(i) => {
+                println!("         [step-fp] first divergence at step {i} (kv_len={}):", i + 1);
+                let lo = i.saturating_sub(2);
+                let hi = (i + 3).min(step_fps.len());
+                for s in lo..hi {
+                    let mark = if s == i { " <-- diverge" } else { "" };
+                    println!("           step {s:>3}: run1={} run2={}{mark}",
+                        step_fps[s], v_step_fps[s]);
+                }
+            }
+            None => println!("         [step-fp] no step-level divergence ({} steps)", step_fps.len()),
+        }
+        // All requests share identical inputs, so per-request bits_sums of
+        // the final step must be EQUAL -- inequality is cross-request
+        // contamination inside the batch kernels.
+        let per_req: Vec<u64> = last.iter()
+            .map(|l| l.iter().map(|v| v.to_bits() as u64).sum::<u64>())
+            .collect();
+        let all_same = per_req.windows(2).all(|w| w[0] == w[1]);
+        println!("         [per-req] final step per-request bits_sums {}",
+            if all_same { "all equal".to_string() } else { format!("DIVERGE: {per_req:?}") });
     }
 
     BatchResult {
@@ -217,7 +268,15 @@ fn main() {
     // M>=2 uses the MXFP4 CUDA graph path which is fully supported.
     let mxfp4_only = wrapper.mxfp4_tiled_count() > 0 && !model_p.is_file();
     let mut all_verified = true;
-    for &batch in &[1usize, 2, 4, 5, 8, 16] {
+    // TEMPURA_BENCH_ONLY_M=N: bench a single batch size (divergence hunting).
+    let only_m: Option<usize> = std::env::var("TEMPURA_BENCH_ONLY_M")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let batch_sizes: Vec<usize> = match only_m {
+        Some(m) => vec![m],
+        None => vec![1usize, 2, 4, 5, 8, 16],
+    };
+    for &batch in &batch_sizes {
         if batch > wrapper.max_batch_graph() {
             println!("  {:>6}  (exceeds max_batch_graph={})", batch, wrapper.max_batch_graph());
             continue;
