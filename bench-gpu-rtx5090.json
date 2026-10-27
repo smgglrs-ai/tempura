@@ -1,84 +1,97 @@
 {
-  "timestamp": "2026-10-12T00:00:00Z",
-  "platform": "RTX 5090 (sm_120 Blackwell), 32 GB VRAM",
-  "kernel": "oxide hand-optimized (rustc-codegen-cuda)",
-  "note": "oxide kernels built with cargo oxide build from tools/oxide-gemv*/",
-  "models": [
-    {
-      "model": "Ternary-Bonsai-1.7B-Q2_0",
-      "format": "Q2_0",
-      "vram_mb": 763,
-      "decode_tok_s": 31,
-      "prefill_tok_s": 32,
-      "itl_p50_ms": 32.2,
-      "gap_vs_llamacpp": "6.7x",
-      "kernel": "q2_0_gemv_decode_two_out (two-output-per-warp, half-warp XOR reduce, SMEM activation staging)"
-    },
-    {
-      "model": "Meta-Llama-3.1-8B-Instruct-Q4_K_M",
-      "format": "Q4K+Q6K",
-      "vram_mb": 17000,
-      "decode_tok_s": 108,
-      "prefill_tok_s": 6,
-      "itl_p50_ms": 9.3,
-      "gap_vs_llamacpp": "1.9x",
-      "kernel": "q4k_gemv_decode_v2 + oxide decode attention (CUDA graph captured once, kv_len via device ptr)"
-    }
-  ],
-  "llamacpp_reference": {
-    "platform": "RTX 5090",
-    "decode_tok_s": 209,
-    "prefill_pp128_tok_s": 7335
+ "timestamp": "2026-10-27T11:00:00Z",
+ "platform": "RTX 5090 (sm_120 Blackwell), 32 GB VRAM",
+ "kernel": "oxide hand-optimized (rustc-codegen-cuda)",
+ "note": "oxide kernels built with cargo oxide build from tools/oxide-gemv*/",
+ "models": [
+  {
+   "model": "Ternary-Bonsai-1.7B-Q2_0",
+   "format": "Q2_0",
+   "vram_mb": 763,
+   "decode_tok_s": 31,
+   "prefill_tok_s": 32,
+   "itl_p50_ms": 32.2,
+   "gap_vs_llamacpp": "6.7x",
+   "kernel": "q2_0_gemv_decode_two_out (two-output-per-warp, half-warp XOR reduce, SMEM activation staging)"
   },
-  "decode_tok_s_single_request": 108,
-  "decode_note": "single request; batched serving amortizes GEMV+attn overhead -- 5+ requests fills all 170 SMs",
-  "bottleneck_analysis": {
-    "q4k_bandwidth_ceiling_tok_s": 456,
-    "q4k_actual_bw_pct": "34-42% (Nsight Compute measured)",
-    "q4k_weight_data_per_token_gb": 3.93,
-    "opt5_confirmed_savings": "38ms/token CPU re-capture -> 9.3ms/token total (4.5x improvement)",
-    "confirmed_not_bottleneck": [
-      "Memory load ordering (ptxas already reorders independent loads)",
-      "K-loop memory latency hiding (multi-warp K-parallelism already in v2)",
-      "CUDA graph re-capture (eliminated via Opt 5: single-capture + device kv_len pointer)"
-    ],
-    "remaining_1.9x_gap_confirmed_blockers": {
-      "gemv_6.1ms": "42% DRAM (vs llama.cpp 58%) -- raw GGUF slower (scale decode overhead), VDR=2 applied, no further gains found",
-      "flash_attn_2ms": "32 blocks (1/head) on 170 SMs = 19% utilization -- K-parallel warps tried, blocked by SM count not warp count",
-      "fix": "batch_size >= 5 fills all SMs; serving metric is requestsxtokens/s, not single-request latency"
-    },
-    "next_lever": "Batched continuous inference -- 5+ concurrent requests = 160+ flash-attn blocks on 170 SMs + GEMV batching amortizes weight bandwidth"
-  },
-  "infrastructure_done": [
-    "oxide Q2_0 two-output-per-warp (half-warp XOR butterfly reduce)",
-    "oxide Q4K multi-warp K-parallelism (4 warps/neuron, smem cross-warp reduce)",
-    "oxide Q4K Q8_1 activation quantization kernel (quantize_q8_1)",
-    "oxide Q4K mini-warp dp4a kernel structure (q4k_gemv_decode_q8_v2)",
-    "CUDA graph enabled for non-pow2 inter models (Llama-3.1-8B, inter=14336)",
-    "D-to-D padding for non-pow2 inter_pad shapes (eliminates D-H-D round-trip)",
-    "Upstream oxide backend (nightly-2026-10-11) with dp4a support compiled"
-  ],
-  "oxide_kernel_optimizations": {
-    "q2_0": [
-      "Two-output-per-warp: lanes 0-15 -> neuron n, lanes 16-31 -> neuron n+1",
-      "Half-warp XOR butterfly reduce (mask 0x0000FFFF / 0xFFFF0000)",
-      "Scale broadcast within half-warp via shuffle_sync(mask, val, base_lane)",
-      "8 nibble words per lane per block (bit_pair = my_lane, constant)",
-      "SMEM activation staging via F32x4 128-bit loads"
-    ],
-    "q4k_v2": [
-      "Multi-warp K-parallelism: n_out=bid, K-loop strides WARPS_PER_BLOCK",
-      "All 4 warps cooperate on same output neuron",
-      "Intra-warp butterfly reduce + cross-warp smem reduce (64 bytes)",
-      "Load hoisting: all 8 block loads issued before first shuffle",
-      "CUDA graph captured once (async_on path, no stream sync in capture)"
-    ],
-    "q4k_q8_v2": [
-      "Q8_1 activation quantization (quantize_q8_1 kernel, pre-allocated scratch)",
-      "Mini-warp dp4a: 4 mini-warps x 8 lanes per j-group",
-      "Proper 4-element dp4a packing: v=qs & 0x0F0F0F0F (lo), (qs>>4) & 0x0F0F0F0F (hi)",
-      "K-loop parallelism: blk strides WARPS_PER_BLOCK",
-      "8-lane XOR reduce per mini-warp + smem cross-warp reduce"
-    ]
+  {
+   "model": "Meta-Llama-3.1-8B-Instruct-Q4_K_M",
+   "format": "Q4K+Q6K",
+   "vram_mb": 17000,
+   "decode_tok_s": 136,
+   "prefill_tok_s": 6,
+   "itl_p50_ms": 7.34,
+   "gap_vs_llamacpp": "1.54x",
+   "kernel": "q4k_gemv_sm120_dp4a_kpar8_dual_block + splitk decode attention (S=16, PTX 42587B) + q6k_gemv_sm120_mbar_kpar8 (bar.sync fixed); outputs VERIFIED NaN-free + deterministic (identical logits fingerprints across runs, and bit-identical between kpar and splitk attention). Earlier 108-141 tok/s numbers on this config computed all-NaN logits (see correctness_fixes_2026_10_27)"
   }
+ ],
+ "llamacpp_reference": {
+  "platform": "RTX 5090",
+  "decode_tok_s": 209,
+  "prefill_pp128_tok_s": 7335
+ },
+ "decode_tok_s_single_request": 136,
+ "decode_note": "single request; batched serving amortizes GEMV+attn overhead -- 5+ requests fills all 170 SMs",
+ "bottleneck_analysis": {
+  "q4k_bandwidth_ceiling_tok_s": 456,
+  "q4k_actual_bw_pct": "34-42% (Nsight Compute measured)",
+  "q4k_weight_data_per_token_gb": 3.93,
+  "opt5_confirmed_savings": "38ms/token CPU re-capture -> 9.3ms/token total (4.5x improvement)",
+  "confirmed_not_bottleneck": [
+   "Memory load ordering (ptxas already reorders independent loads)",
+   "K-loop memory latency hiding (multi-warp K-parallelism already in v2)",
+   "CUDA graph re-capture (eliminated via Opt 5: single-capture + device kv_len pointer)"
+  ],
+  "remaining_1.9x_gap_confirmed_blockers": {
+   "gemv_6.1ms": "42% DRAM (vs llama.cpp 58%) -- raw GGUF slower (scale decode overhead), VDR=2 applied, no further gains found",
+   "flash_attn_2ms": "32 blocks (1/head) on 170 SMs = 19% utilization -- K-parallel warps tried, blocked by SM count not warp count",
+   "fix": "batch_size >= 5 fills all SMs; serving metric is requestsxtokens/s, not single-request latency"
+  },
+  "next_lever": "Batched continuous inference -- 5+ concurrent requests = 160+ flash-attn blocks on 170 SMs + GEMV batching amortizes weight bandwidth",
+  "remaining_gap_analysis_2026_10_27": {
+   "gemv": "dp4a kpar8 dual-block unroll added (2x MLP/warp, bitwise-equal by construction); still latency-bound around 40% DRAM during decode (nvidia-smi dmon: sm 99-100%, mem 36-46%)",
+   "attention": "split-K flash decode (grid n_heads x 16) replaces one-block-per-head (19% SM util); long-context decode at kv~2700 drops to ~79 tok/s (attention reads ~1MB/token per kv_len -- GQA 4x re-read)",
+   "fused_silu_disabled": "gate+up+SiLU fused kernel bypassed (format mismatch) -- separate GEMVs + silu_mul cost ~2-4% vs the broken fused path",
+   "prefill": "6 tok/s pp128 (1152x gap) -- host-bound, GPU nearly idle; separate issue",
+   "splitk_result": "125 -> 136 tok/s (ITL 7.98 -> 7.34ms) from split-K attention with verified outputs"
+  }
+ },
+ "infrastructure_done": [
+  "oxide Q2_0 two-output-per-warp (half-warp XOR butterfly reduce)",
+  "oxide Q4K multi-warp K-parallelism (4 warps/neuron, smem cross-warp reduce)",
+  "oxide Q4K Q8_1 activation quantization kernel (quantize_q8_1)",
+  "oxide Q4K mini-warp dp4a kernel structure (q4k_gemv_decode_q8_v2)",
+  "CUDA graph enabled for non-pow2 inter models (Llama-3.1-8B, inter=14336)",
+  "D-to-D padding for non-pow2 inter_pad shapes (eliminates D-H-D round-trip)",
+  "Upstream oxide backend (nightly-2026-10-11) with dp4a support compiled"
+ ],
+ "oxide_kernel_optimizations": {
+  "q2_0": [
+   "Two-output-per-warp: lanes 0-15 -> neuron n, lanes 16-31 -> neuron n+1",
+   "Half-warp XOR butterfly reduce (mask 0x0000FFFF / 0xFFFF0000)",
+   "Scale broadcast within half-warp via shuffle_sync(mask, val, base_lane)",
+   "8 nibble words per lane per block (bit_pair = my_lane, constant)",
+   "SMEM activation staging via F32x4 128-bit loads"
+  ],
+  "q4k_v2": [
+   "Multi-warp K-parallelism: n_out=bid, K-loop strides WARPS_PER_BLOCK",
+   "All 4 warps cooperate on same output neuron",
+   "Intra-warp butterfly reduce + cross-warp smem reduce (64 bytes)",
+   "Load hoisting: all 8 block loads issued before first shuffle",
+   "CUDA graph captured once (async_on path, no stream sync in capture)"
+  ],
+  "q4k_q8_v2": [
+   "Q8_1 activation quantization (quantize_q8_1 kernel, pre-allocated scratch)",
+   "Mini-warp dp4a: 4 mini-warps x 8 lanes per j-group",
+   "Proper 4-element dp4a packing: v=qs & 0x0F0F0F0F (lo), (qs>>4) & 0x0F0F0F0F (hi)",
+   "K-loop parallelism: blk strides WARPS_PER_BLOCK",
+   "8-lane XOR reduce per mini-warp + smem cross-warp reduce"
+  ]
+ },
+ "correctness_fixes_2026_10_27": {
+  "summary": "Every prior GPU decode bench of Llama-3.1-8B Q4_K_M on this card produced all-NaN logits at full speed; bench-real-model never inspected outputs (decode feeds a constant token). Found via the new NaN-tolerant logits fingerprint + TEMPURA_DEBUG_NAN per-op trace.",
+  "bug_1_fused_silu_format": "has_sm120_fused_silu() lacked the !uses_raw_gguf gate its sm_80 sibling documents; the sm120 fused gate+up+SiLU kernel parses repacked 42-u32 but was fed native 36-u32 weights -> every block misparsed + reads past tensor end. First NaN: L0 gate-silu, 12262/14336. Fixed by gating; porting the kernel to native format is follow-up work.",
+  "bug_2_cpasync_visibility": "q6k_gemv_sm120_mbar_kpar8/batch: cp.async.wait_group is a PER-THREAD wait; no barrier after it, so lanes read smem words copied by other lanes before landing (word 0 is raw f32 bits -> NaN). 1-6/14336 NaN varying per run. Fixed with CTA bar.sync 0 after each wait (canonical pattern); host selects the mbar kernel only when k_blocks % 8 == 0 (uniform barrier counts -> no deadlock).",
+  "verification": "TEMPURA_DEBUG_NAN trace: 0 NaN lines. 3x runs: identical logits fingerprint bits_sum=283107618863711 argmax=83334 nan=0."
+ }
 }

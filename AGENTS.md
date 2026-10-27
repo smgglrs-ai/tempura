@@ -320,8 +320,19 @@ Qwen3.6-27B weights** — see open work.
 - [x] Native MXFP4 pipeline: E2M1+UE8M0 quant (CPU), on-GPU activation
       quant, tensor-core GEMM, all 7 projections, BF16 loader; 55.6 TFLOPS
       at M=64
-- [x] Benchmarks: 130 tok/s single-seq decode (llama.cpp: 209), 417 tok/s
-      batch M=8, ~600 tok/s M=16
+- [x] Benchmarks (outputs NaN-free + deterministic, verified via logits
+      fingerprints 2026-10-27): 136 tok/s single-seq decode (llama.cpp: 209,
+      gap 1.54x), ITL 7.34 ms; 417 tok/s batch M=8 (predates the 2026-10-27
+      correctness fixes -- re-measure before relying on it)
+- [x] Decode correctness (2026-10-27): fixed sm120 fused-silu format mismatch
+      (fed native 36-u32 weights to a repacked-42-u32 kernel -> all-NaN logits
+      since introduction; every prior bench computed garbage at full speed) and
+      the cp.async cross-lane visibility race in the q6k sm120 kernels
+      (wait_group is per-thread; needs bar.sync 0 after it, mbar variant now
+      gated on k_blocks % 8 == 0). bench-real-model prints a NaN-tolerant
+      logits fingerprint; TEMPURA_DEBUG_NAN=1 gives per-op NaN bisection;
+      TEMPURA_NO_SM120_KPAR / TEMPURA_NO_SM120_Q6K / TEMPURA_NO_OXIDE_ATTN /
+      TEMPURA_NO_DUAL_BLOCK are kernel-path bisect switches
 
 **Decoding strategies**: speculative (target+draft), Medusa multi-token,
 guided (json/json_schema), sampler chain (temperature/top-k/top-p/min-p/
@@ -329,8 +340,13 @@ typical-p/repeat/presence/frequency)
 
 ## Open work (verified gaps — do not assume these are done)
 
-- [ ] Close the 1.6× single-sequence GPU decode gap vs llama.cpp
-      (130 vs 209 tok/s)
+- [ ] Close the 1.54× single-sequence GPU decode gap vs llama.cpp
+      (136 vs 209 tok/s, outputs verified NaN-free 2026-10-27). Known levers:
+      port the sm120 fused gate+up+SiLU kernel to native 36-u32 format
+      (currently bypassed by the format gate), GEMV still ~40% DRAM
+      (dmon: sm 99-100%, mem 36-46%), host-side per-token overhead
+- [ ] Prefill on GPU is host-bound: 6 tok/s pp128 vs llama.cpp 7335
+      (1152x gap, GPU nearly idle through it)
 - [ ] Validate hybrid DeltaNet pipeline against real Qwen3.6 / Bonsai 2
       weights (last attempt: "architecture incompatible" — diagnostics added,
       commit 9c6362d)
@@ -395,6 +411,21 @@ cargo build --release
 export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
 ```
 
+The UPSTREAM backend (`cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda`) is
+required for oxide-decode-attn (ex2_approx_f32) and the dp4a crates. Its
+current build links the **1.99.1** toolchain's rustc driver (the upstream
+tree pins channel "1.99.1"), and `cargo oxide` passes `-Z codegen-backend`,
+which stable rejects — so:
+
+```sh
+export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
+export LD_LIBRARY_PATH=~/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/lib:$LD_LIBRARY_PATH
+RUSTC_BOOTSTRAP=1 RUSTUP_TOOLCHAIN=1.99.1 cargo oxide build
+# If the backend .so is rebuilt from a different toolchain, match
+# LD_LIBRARY_PATH/RUSTUP_TOOLCHAIN to that toolchain (the .so dlopens a
+# versioned librustc_driver-*.so).
+```
+
 Build and benchmark GPU kernels:
 
 ```sh
@@ -425,7 +456,9 @@ cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
 ```
 
 Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
-- Llama-3.1-8B Q4K single-sequence: **130 tok/s decode** (1.60x gap vs llama.cpp 209 tok/s)
+- Llama-3.1-8B Q4K single-sequence: **136 tok/s decode** (1.54x gap vs
+      llama.cpp 209 tok/s; outputs verified NaN-free + deterministic,
+      2026-10-27; split-K flash decode + dual-block GEMV + correctness fixes)
 - Llama-3.1-8B Q4K batch M=8: **417 tok/s** aggregate (3.5ms ITL/seq)
 - Llama-3.1-8B Q4K batch M=16: ~600 tok/s aggregate
 - MXFP4 M=64: 55.6 TFLOPS
