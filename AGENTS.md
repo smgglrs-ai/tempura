@@ -347,6 +347,20 @@ Qwen3.6-27B weights** — see open work.
       TEMPURA_BENCH_ONLY_M / TEMPURA_BENCH_DUMP (element-wise logit diff at
       the first diverging step) — this is how the silu stream race, the
       gate/up aliasing, and the mbar drift were localized.
+      Second fix round (batch re-verification, same day): the M=2-hardcoded
+      q6k sm120 batch kernel was rewritten as a generalized M-row two-phase
+      kernel; MXFP4 activation quant got m_valid masking (stale m_pad rows
+      poisoned the m16k32 tile scale); m=1 batch decode routes to the
+      verified single-seq path; graph-replayed host launch scalars (kv_len,
+      rope pos) were replaced by device-scalar indirection (d2d_gather_row
+      + oxide_decode_attn reading kv_len from device) — frozen-position
+      RoPE, a bug class determinism+NaN checks CANNOT catch; silu_mul runs
+      on the caller's stream (private-stream race); kpar GEMVs write
+      per-slot outputs (gate/up aliased the shared q8_out_scratch ->
+      wrong FFN). Post-fix fishtank re-verification, NO bisect switches,
+      run twice (incl. after the avx512 rustflags fix): every bench-batch M
+      (1,2,4,5,8,16) NaN-free with bitwise-identical fresh-cache replay;
+      single-seq 134 tok/s.
 
 **Decoding strategies**: speculative (target+draft), Medusa multi-token,
 guided (json/json_schema), sampler chain (temperature/top-k/top-p/min-p/
@@ -354,76 +368,6 @@ typical-p/repeat/presence/frequency)
 
 ## Open work (verified gaps — do not assume these are done)
 
-- [ ] Re-verify GPU decode on fishtank after the 2026-10-27 batch-correctness
-      fix set (implemented locally, NOT yet benched on the GPU host — numbers
-      below are from before the fixes and must be re-measured):
-      `scripts/gpu-remote.sh bench batch` + `bench real-model`, expecting
-      every M in 2..16 verified (NaN-free + fresh-cache replay bitwise)
-      with NO bisect switches set. Root causes found and fixed:
-      (a) q6k_gemv_sm120_batch was M=2-hardcoded (2 accumulators, output
-          rows 2..M never written) but launched for every m>1 because
-          silu_out.size()==m*k_down holds for all m — rows 2..M held stale
-          memory (the "nondeterministic at M>=5"; misattributed to the
-          sm120_mbar GEMV, which was innocent). REWRITTEN as a generalized
-          M-row two-phase kernel: phase 1 cp.asyncs ALL weight blocks into
-          dynamic smem (one commit+wait+bar.sync, so the k_blocks%8==0 gate
-          is gone), phase 2 computes per row-pair with k-split across warps.
-          Host passes real m + dynamic smem bytes (opt-in attribute set at
-          load); forward_sm120_batch_d2d_into validates m in 2..=16.
-      (b) MXFP4 quantize_activation ran with m_pad=16 while only m rows are
-          valid: the m16k32 tile-max UE8M0 scale is shared by all 16 rows,
-          so stale rows (and OOB reads past the [m*inter] silu buffer)
-          poisoned the scale for valid rows -> allocation-dependent outputs
-          (the M=4 all-NaN). FIXED: m_valid param on the GPU quant kernel
-          (predicated loads + zero nibbles for rows >= m_valid), the CPU
-          reference (quantize_activation_to_mxfp4_tiled), and all five
-          engine call sites pass m. CPU twin test:
-          quantize_activation_tiled_masks_padding_rows.
-      (c) m=1 batch decode now routes to the verified single-seq forward()
-          path (the old no-graph m=1 fallback was 16 tok/s + nondeterministic
-          NaNs and is no longer reachable from forward_batch_decode).
-      (d) cuTile flash-attn kv_len + cutile rope pos are HOST launch scalars
-          baked at capture and replayed stale — find_kernel_scalar_nodes was
-          a stub returning empty vectors, so NOTHING was ever patched. This
-          also affected the single-seq graph: every replay after the first
-          rotated Q/K at the CAPTURE-time position (frozen-position RoPE).
-          Determinism+NaN verification cannot catch this class of bug.
-          FIXED by device-scalar indirection (kv_scatter_write pattern):
-          new d2d_gather_row PTX kernel copies the rope cos/sin table row
-          indexed by the position read from d_positions AT EXECUTION TIME
-          (in-graph, topology-stable; rope kernel runs with pos=0 against
-          the one-row buffers), and the graph paths now REQUIRE
-          oxide_decode_attn (which reads kv_len from device) — without it
-          they fall back to the no-graph path (fresh host kv_len per step,
-          correct but slower). The dead KernelScalarNode/exec-update
-          machinery is removed.
-      bench-batch verifies: NaN scan every step, final-step + per-request
-      fingerprints, full fresh-cache replay must match bitwise
-      (TEMPURA_BENCH_STEP_FP=1 / TEMPURA_BENCH_ONLY_M=N for divergence
-      hunting). NOTE: all output fingerprints measured before these fixes
-      were computed with frozen-position RoPE — the numbers' SPEED is
-      roughly representative but no pre-fix output correctness claim
-      survives; re-measure.
-      The M=1-phase replay mismatch (fixed same day) exposed two MORE
-      single-seq bugs, both pre-existing on the "verified" 136 tok/s path:
-      (e) CutileElementwise owns a PRIVATE CUDA stream and launched the
-          SiLU kernel on it while its input producers (gate/up GEMVs) and
-          consumer (down-proj) run on the matmul stream with no events —
-          a cross-stream race whose outcome depends on the allocation
-          layout (deterministic per layout, so run-to-run same-cache tests
-          never caught it). silu_mul_device(_scratch) now take the
-          caller's stream. Found by per-op bits_sum diffing
-          (TEMPURA_DEBUG_NAN=1) between the timed run and the fresh-cache
-          replay: first diverging op L0 gate-silu, inputs matching.
-      (f) gemm_q4k_d2d_slot's kpar branch returned the SHARED
-          q8_out_scratch, so gate and up projections wrote the same
-          buffer and the silu computed silu(up)*up — the single-seq FFN
-          was mathematically wrong (gate-dev bits == up-dev bits in the
-          nan-trace). The kpar GEMVs now write per-slot pool tensors
-          (submit_sm120_kpar_into_slot / submit_dp4a_kpar_into_slot,
-          mirroring the KV-stream slot path); pool misses fall back to
-          the fresh-output oxide f32 GEMV. Every pre-fix single-seq
-          output was computed with the wrong FFN.
 - [ ] q6k_gemv_sm120_mbar_kpar8 (single-seq Q6K GEMV): outputs are
       allocation/kernel-history dependent. CONFIRMED 2026-10-27 (was
       "suspected" in the original batch re-measure): with every other fix
@@ -558,22 +502,20 @@ cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
 ```
 
 Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
-- Llama-3.1-8B Q4K single-sequence: **136 tok/s decode** (1.54x gap vs
-      llama.cpp 209 tok/s; outputs verified NaN-free + deterministic,
-      2026-10-27; split-K flash decode + dual-block GEMV + correctness fixes)
-- Llama-3.1-8B Q4K batch decode (2026-10-27 re-measure; bench-batch now scans
-      every step for NaNs, fingerprints the final step, and replays the full
-      schedule on fresh caches -- numbers count as verified only when the
-      replay is bitwise identical):
-      - default config: NO batch size verified (M=4 all-NaN, M>=5
-        nondeterministic); M=8 293, M=16 452 tok/s -- real speed, suspect
-        outputs
-      - TEMPURA_NO_SM120_Q6K=1 + TEMPURA_NO_MXFP4=1 (both bugs dodged):
-        **M=2 134, M=4 215, M=5 246, M=8 312, M=16 398 tok/s -- verified
-        NaN-free + deterministic**
-      - the pre-2026-10-27 claims of 417 (M=8) / ~600 (M=16) tok/s are
-        retracted: they were measured with the fused-silu all-NaN bug
-        computing garbage at full speed
+- Llama-3.1-8B Q4K single-sequence: **134 tok/s decode**, ITL 7.44 ms
+      (1.56x gap vs llama.cpp 209 tok/s; outputs verified NaN-free +
+      deterministic, 2026-10-27 post-fix)
+- Llama-3.1-8B Q4K batch decode (2026-10-27 post-fix, NO bisect switches;
+      verified = NaN scan every step + final-step fingerprints + fresh-cache
+      replay bitwise identical; measured twice, incl. after the avx512
+      rustflags fix):
+      **M=1 134-135, M=2 92-93, M=4 164, M=5 189-190, M=8 259-260,
+      M=16 372-374 tok/s** — every bench-batch M verified.
+      M>=2 uses the generalized M-row q6k sm120 batch kernel + MXFP4
+      tensor-core Q/K/O/gate/up (m_valid-masked activation quant); M=1
+      routes to the single-seq CUDA graph path.
+      All pre-2026-10-27 batch numbers are retracted (frozen-position RoPE,
+      wrong FFN, all-NaN fused silu — see Decode correctness above).
 - MXFP4 M=64: 55.6 TFLOPS
 
 If you see `Symbol cuda_device__mma_sync__... not found`, the backend is stale.

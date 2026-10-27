@@ -332,6 +332,6 @@ fn main() {
         println!("           TEMPURA_NO_OXIDE_ATTN / TEMPURA_NO_DUAL_BLOCK.");
     }
     println!();
-    println!("  Reference (single request, CUDA graph): 136 tok/s (verified NaN-free 2026-10-27)");
+    println!("  Reference (single request, CUDA graph): 134 tok/s (verified NaN-free 2026-10-27 post-fix)");
     println!("  llama.cpp single request:                209 tok/s");
 }
