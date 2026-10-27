@@ -3323,17 +3323,25 @@ impl CutileGpuModel {
                             )
                         }
                     };
-                    if let Ok(result) = submitted {
-                        return result;
+                    match submitted {
+                        Ok(result) => return result,
+                        Err(e) => panic!(
+                            "gemm_q4k_d2d_slot: kpar submit failed for {weight_name} \
+                             (n={}, k_blocks={}): {e}",
+                            dw.n, dw.k_blocks
+                        ),
                     }
-                    // Submit failed (kernel missing, scratch too small): fall
-                    // through to the fresh-allocation paths below.
                 } else {
-                    // Pool slot not pre-allocated (only possible before
-                    // preallocate_scratch, i.e. never during graph capture).
-                    return oxide
-                        .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
-                        .expect("OxideQ4kGemv::forward_d2d failed in gemm_q4k_d2d_slot (pool miss)");
+                    // Pool slot not pre-allocated. This should be impossible
+                    // after preallocate_scratch; include the pool state in the
+                    // panic to diagnose any recurrence.
+                    let pool_state: Vec<bool> =
+                        self.scratch.borrow().iter().map(|s| s.is_some()).collect();
+                    panic!(
+                        "gemm_q4k_d2d_slot: pool slot {slot} empty for weight \
+                         {weight_name} (n={}, k_blocks={}); pool occupied: {pool_state:?}",
+                        dw.n, dw.k_blocks
+                    );
                 }
             }
             if oxide.has_q8_path() {
