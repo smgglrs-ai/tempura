@@ -1,9 +1,13 @@
 //! Host-side dispatch for the cute-rs sm_120a MXFP4 tiled batch GEMM and the
 //! sm_120 GPU-side activation quantization kernel.
 //!
-//! GEMM kernel: `mxf4_batch_gemm_tiled` -- stream-K persistent, grid=(sm_count,1,1),
-//! block=(128,1,1) = 4 warps. Computes C[M][N] = A_mxfp4[M][K] x B_mxfp4[N][K]
-//! with f32 output using SM120a m16n8k64 MMA tensor cores.
+//! GEMM kernel: `mxf4_batch_gemm_tiled` -- one m16n8 output tile per warp on a
+//! 2D grid (ceil(n_tiles/4), m_tiles, 1), block=(128,1,1) = 4 warps. Computes
+//! C[M][N] = A_mxfp4[M][K] x B_mxfp4[N][K] with f32 output using SM120a
+//! m16n8k64 MMA tensor cores. (No flat-index tile walk: the cutlass-mlir
+//! codegen miscompiles loop-carried tile state when a warp iterates more than
+//! once -- m >= 32 left ~half the output tiles unwritten; see the kernel doc
+//! in tools/mxf4-gemv/src/main.rs.)
 //! Compiled from `tools/mxf4-gemv/` with:
 //!   CUDA_OXIDE_DEVICE_BACKEND=cutlass-mlir cargo oxide build --arch sm_120a
 //!
@@ -126,6 +130,9 @@ impl MxfpGemm {
     /// - `k64_tiles`: k / 64
     ///
     /// `m` must be multiple of 16, `n` multiple of 8, `k` multiple of 64.
+    /// Grid: (ceil(n_tiles/4), m_tiles, 1) -- one m16n8 output tile per warp,
+    /// no flat-index decomposition and no tile loop (see the kernel doc for
+    /// why the previous persistent walk miscompiled at m >= 32).
     /// Launch is async on the stored stream; caller syncs if needed.
     pub fn forward(
         &self,
@@ -139,6 +146,12 @@ impl MxfpGemm {
         k64_tiles: u32,
     ) -> Result<()> {
         let cu_stream = self.stream.cu_stream();
+
+        let n_tiles = n / 8;
+        let m_tiles = m / 16;
+        debug_assert!(n_tiles >= 1, "n must be >= 8 (got {n})");
+        debug_assert!(m_tiles >= 1, "m must be >= 16 (got {m})");
+        let grid_x = n_tiles.div_ceil(4);
 
         let mut p_ap = a_packed.device_pointer().cu_deviceptr() as u64;
         let mut p_as = a_scales.device_pointer().cu_deviceptr() as u64;
@@ -163,7 +176,7 @@ impl MxfpGemm {
         let rc = unsafe {
             sys::cuLaunchKernel(
                 self.cu_function,
-                self.sm_count, 1, 1,
+                grid_x, m_tiles, 1,
                 128, 1, 1,
                 0,
                 cu_stream,
