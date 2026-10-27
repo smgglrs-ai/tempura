@@ -62,7 +62,8 @@ fn nan_count(logits_batch: &[Vec<f32>]) -> usize {
 
 struct BatchResult {
     tok_s:     f64,
-    nan_total: usize,          // NaNs across EVERY step of the timed run
+    nan_run1:  usize,          // NaNs across EVERY step of the timed run
+    nan_run2:  usize,          // NaNs across every step of the verification replay
     final_fp:  Fingerprint,    // final step of the timed run
     verify_fp: Fingerprint,    // final step of the fresh-cache replay
 }
@@ -71,7 +72,8 @@ impl BatchResult {
     /// Verified = both passes NaN-free, non-empty logits, bitwise-identical
     /// fingerprints (engine is deterministic by design).
     fn verified(&self) -> bool {
-        self.nan_total == 0
+        self.nan_run1 == 0
+            && self.nan_run2 == 0
             && self.final_fp.nan_count == 0
             && self.verify_fp.nan_count == 0
             && self.final_fp.n_logits > 0
@@ -82,7 +84,7 @@ impl BatchResult {
 fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> BatchResult {
     // Allocate M persistent KV caches once.
     let mut kv_caches = wrapper.new_batch_kv_caches(batch);
-    let mut nan_total = 0usize;
+    let mut nan_run1 = 0usize;
     let mut last: Vec<Vec<f32>> = Vec::new();
 
     // Prefill: position 0, one token per request.
@@ -91,7 +93,7 @@ fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> BatchResult {
         let toks: Vec<u32> = vec![1u32; batch];
         let pos:  Vec<u32> = vec![cur_pos; batch];
         let logits = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
-        nan_total += nan_count(&logits);
+        nan_run1 += nan_count(&logits);
         cur_pos += 1;
     }
 
@@ -100,7 +102,7 @@ fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> BatchResult {
         let toks: Vec<u32> = vec![2u32; batch];
         let pos:  Vec<u32> = vec![cur_pos; batch];
         let logits = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
-        nan_total += nan_count(&logits);
+        nan_run1 += nan_count(&logits);
         cur_pos += 1;
     }
 
@@ -110,18 +112,26 @@ fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> BatchResult {
         let toks: Vec<u32> = vec![2u32; batch];
         let pos:  Vec<u32> = vec![cur_pos; batch];
         let logits = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_caches);
-        nan_total += nan_count(&logits);
+        nan_run1 += nan_count(&logits);
         last = logits;
         cur_pos += 1;
     }
     let elapsed = t0.elapsed().as_secs_f64();
     let tok_s = (batch * BENCH_STEPS) as f64 / elapsed;
 
+    // WHY drop before the replay: KV caches are ~1 GiB/seq; at M=16 holding
+    // both generations (32 GiB + model) exceeds RTX 5090 VRAM and the
+    // verification pass OOMs. The cached CUDA graph only compares these
+    // pointers (never dereferences) when deciding to re-capture, so freeing
+    // them is safe.
+    drop(kv_caches);
+
     // Verification replay: identical token/position schedule on fresh caches.
     // The KV pointers change, so the cached CUDA graph re-captures -- proving
     // capture path and replay path agree. Deterministic by design -> the final
     // fingerprints must be bitwise identical.
     let mut kv_verify = wrapper.new_batch_kv_caches(batch);
+    let mut nan_run2 = 0usize;
     let mut v_pos = 0u32;
     let mut v_last: Vec<Vec<f32>> = Vec::new();
     for i in 0..VERIFY_STEPS {
@@ -129,14 +139,15 @@ fn bench_batch(wrapper: &CutileInferenceWrapper, batch: usize) -> BatchResult {
         let toks: Vec<u32> = vec![tok; batch];
         let pos:  Vec<u32> = vec![v_pos; batch];
         let logits = wrapper.forward_batch_decode_stateful(&toks, &pos, &mut kv_verify);
-        nan_total += nan_count(&logits);
+        nan_run2 += nan_count(&logits);
         v_last = logits;
         v_pos += 1;
     }
 
     BatchResult {
         tok_s,
-        nan_total,
+        nan_run1,
+        nan_run2,
         final_fp: fingerprint(&last),
         verify_fp: fingerprint(&v_last),
     }
@@ -224,7 +235,7 @@ fn main() {
             batch, r.tok_s, per_req, blocks, verified);
         println!("         fp: bits_sum={} argmax={} n={} | nan={}/{} det={}",
             r.final_fp.bits_sum, r.final_fp.argmax, r.final_fp.n_logits,
-            r.nan_total, r.verify_fp.nan_count,
+            r.nan_run1, r.nan_run2,
             if r.final_fp == r.verify_fp { "OK" } else { "MISMATCH" });
     }
 
