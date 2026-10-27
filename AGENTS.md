@@ -424,6 +424,13 @@ typical-p/repeat/presence/frequency)
       shape-table regression tests). Needs an upstream issue with the
       standalone repro; a hand-written-PTX GEMM (like the quant kernel,
       which is shape-safe) is the local escape.
+      WHEN A FIX LANDS on the cuda-oxide bug-hunt branch: rebuild the backend
+      .so + the cubin (recipe in GPU Kernels below), then gate on (1) the
+      standalone repro passing every shape, (2) tempura's tools/mxf4-gemv
+      shape tests passing, (3) bench-batch fingerprints BITWISE-UNCHANGED
+      (m=16 must not move). Then drop the m=16 chunk loop in
+      gemm_mxfp4_prefill (single MxfpGemm::forward launch at full m_pad),
+      verify prefill det=OK in bench-real-model, and re-bench.
 - [ ] Validate hybrid DeltaNet pipeline against real Qwen3.6 / Bonsai 2
       weights (last attempt: "architecture incompatible" — diagnostics added,
       commit 9c6362d)
@@ -534,6 +541,21 @@ for d in target/release/build/tempura-kernels-*/out; do
   cp tools/oxide-gemv-q6k/oxide_gemv_q6k.ptx $d/oxide_q6k_gemv.ptx 2>/dev/null
   cp tools/oxide-decode-attn/oxide_decode_attn.ptx $d/oxide_decode_attn.ptx 2>/dev/null
 done
+
+# mxf4-gemv (MXFP4 tensor-core GEMM cubin): DIFFERENT recipe from the crates
+# above — upstream backend (nested tree), cutlass-mlir device backend, and the
+# managed CUTLASS compiler. The cubin is include_bytes!()d by tempura-kernels,
+# so a normal cargo build picks it up after this step.
+cd tools/mxf4-gemv
+export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
+export CUDA_OXIDE_CUTLASS_COMPILER=~/.cargo/cuda-oxide/toolchains/cutlass/4.7.0/x86_64-cu13/lib/libCutlassCompiler.so
+export LD_LIBRARY_PATH=~/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/lib:$LD_LIBRARY_PATH
+RUSTC_BOOTSTRAP=1 RUSTUP_TOOLCHAIN=1.99.1 CUDA_OXIDE_DEVICE_BACKEND=cutlass-mlir \
+  cargo oxide build --arch sm_120a
+# The standalone binary runs the shape-table regression tests for the
+# cutlass-mlir block-count miscompile (see open work):
+LD_LIBRARY_PATH=~/.rustup/toolchains/nightly-2026-10-11-x86_64-unknown-linux-gnu/lib:$LD_LIBRARY_PATH \
+  ./target/release/mxf4-gemv
 
 # From the laptop, scripts/gpu-remote.sh runs all of this on the GPU host:
 #   scripts/gpu-remote.sh oxide
