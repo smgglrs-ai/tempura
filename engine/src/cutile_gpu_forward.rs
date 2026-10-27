@@ -4127,13 +4127,21 @@ impl CutileGpuModel {
 
     /// TEMPURA_DEBUG_NAN helper: D2H a tensor and eprintln a NaN report.
     /// Only called when `debug_nan_trace` is set (never during graph capture).
+    ///
+    /// Also prints the NaN-tolerant bits_sum of the tensor: with
+    /// TEMPURA_DEBUG_NAN=1, diffing the per-op sums between two otherwise
+    /// identical runs localizes the first op whose output is
+    /// allocation-history-dependent (read-before-write scratch).
     fn nan_report(&self, label: &str, t: &Arc<Tensor<f32>>) {
         let stream = self.matmul.stream();
         let v = t.to_host_vec().sync_on(stream).expect("nan-trace download");
         let n = v.iter().filter(|x| x.is_nan()).count();
+        let bits_sum: u64 = v.iter().map(|x| x.to_bits() as u64).sum();
         if n > 0 {
             let first = v.iter().position(|x| x.is_nan()).unwrap_or(0);
-            eprintln!("[nan-trace] {label}: {n}/{} NaN (first at idx {first})", v.len());
+            eprintln!("[nan-trace] {label}: {n}/{} NaN (first at idx {first}) bits_sum={bits_sum}", v.len());
+        } else {
+            eprintln!("[nan-trace] {label}: ok bits_sum={bits_sum}");
         }
     }
 
