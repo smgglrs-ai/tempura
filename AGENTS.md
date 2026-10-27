@@ -338,7 +338,14 @@ Qwen3.6-27B weights** — see open work.
       gated on k_blocks % 8 == 0). bench-real-model prints a NaN-tolerant
       logits fingerprint; TEMPURA_DEBUG_NAN=1 gives per-op NaN bisection;
       TEMPURA_NO_SM120_KPAR / TEMPURA_NO_SM120_Q6K / TEMPURA_NO_OXIDE_ATTN /
-      TEMPURA_NO_DUAL_BLOCK / TEMPURA_NO_MXFP4 are kernel-path bisect switches
+      TEMPURA_NO_DUAL_BLOCK / TEMPURA_NO_MXFP4 / TEMPURA_NO_FUSED_SILU are
+      kernel-path bisect switches (TEMPURA_ALLOW_SM120_Q6K=1 opts back into
+      the disabled-by-default mbar GEMV). Divergence-hunting tooling added
+      2026-10-27: per-op bits_sum in the nan-trace, TEMPURA_DEBUG_SLICES
+      (per-1k-element slice sums), bench-batch TEMPURA_BENCH_STEP_FP /
+      TEMPURA_BENCH_ONLY_M / TEMPURA_BENCH_DUMP (element-wise logit diff at
+      the first diverging step) — this is how the silu stream race, the
+      gate/up aliasing, and the mbar drift were localized.
 
 **Decoding strategies**: speculative (target+draft), Medusa multi-token,
 guided (json/json_schema), sampler chain (temperature/top-k/top-p/min-p/
@@ -434,8 +441,16 @@ typical-p/repeat/presence/frequency)
       sm120 fused gate+up+SiLU kernel to native 36-u32 format (currently
       bypassed by the format gate), GEMV still ~40% DRAM (dmon: sm
       99-100%, mem 36-46%), host-side per-token overhead
-- [ ] Prefill on GPU is host-bound: 6 tok/s pp128 vs llama.cpp 7335
-      (1152x gap, GPU nearly idle through it)
+- [ ] Prefill on GPU is host-bound: 7 tok/s pp128 (TTFT P50 19.3 s,
+      2026-10-27 post-fix re-measure; CPU 97%, GPU 8% through it) vs
+      llama.cpp 7335 (~1100x gap)
+- [ ] `.cargo/config.toml` forces `+avx512f,+avx512bw,+avx512vnni,+avx512dq`
+      (commit 876a0a8, for the fishtank CPU) — every cargo build on the
+      Lunar Lake laptop SIGILLs in build scripts with a baffling
+      `signal: 4` (the laptop has AVX2/AVX-VNNI, no AVX-512). Workaround:
+      `RUSTFLAGS="-C target-cpu=native"` overrides the config. Fix: drop
+      the explicit avx512 features (target-cpu=native already enables
+      what the build host supports) or gate them per-host.
 - [ ] Validate hybrid DeltaNet pipeline against real Qwen3.6 / Bonsai 2
       weights (last attempt: "architecture incompatible" — diagnostics added,
       commit 9c6362d)
