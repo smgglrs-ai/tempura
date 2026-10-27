@@ -4143,6 +4143,16 @@ impl CutileGpuModel {
         } else {
             eprintln!("[nan-trace] {label}: ok bits_sum={bits_sum}");
         }
+        // Per-1k-element slice sums: localizes WHICH region of a diverging
+        // tensor moves (stale tail vs whole-tensor difference).
+        if std::env::var("TEMPURA_DEBUG_SLICES").is_ok() && v.len() > 1024 {
+            let mut out = String::new();
+            for (si, chunk) in v.chunks(1024).enumerate() {
+                let s: u64 = chunk.iter().map(|x| x.to_bits() as u64).sum();
+                out.push_str(&format!(" {si}:{s}"));
+            }
+            eprintln!("[nan-trace] {label} slices:{out}");
+        }
     }
 
     /// Inner decode forward pass: layer loop + final norm + lm_head.
