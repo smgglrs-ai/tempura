@@ -7,6 +7,10 @@
 //! Grid:  (m16_tiles * k32_blocks, 1, 1) -- one block per tile
 //! Block: (256, 1, 1) -- 8 warps, each thread quantizes 2 elements
 //!
+//! Rows >= m_valid are padding: they are NOT loaded (the source buffer may be
+//! shorter than M rows) and are quantized to zero so the shared tile-max scale
+//! depends only on live rows (CUDA-graph replay determinism).
+//!
 //! Output layout matches quantize_activation_to_mxfp4_tiled (CPU reference):
 //!   packed:  [M][K/2] bytes, E2M1 nibbles, row-major
 //!   scales:  [M/16][K/32] bytes, UE8M0 tile scales
@@ -53,14 +57,15 @@ pub const PTX: &str = r#"
     .param .u64 param_scales,    // *mut u8    -- output [M/16 * K/32]
     .param .u32 param_m,         // M (multiple of 16)
     .param .u32 param_k,         // K (multiple of 32)
-    .param .u32 param_k32_blocks // K / 32
+    .param .u32 param_k32_blocks, // K / 32
+    .param .u32 param_m_valid    // live rows [0, m_valid); rows >= m_valid are padding
 )
 {
     .reg .u32  %r<40>;
     .reg .u64  %rd<8>;
     .reg .f32  %f<12>;
     .reg .b32  %b<8>;
-    .reg .pred %p<6>;
+    .reg .pred %p<7>;
 
     // smem: 8 f32 slots (one per warp) for inter-warp max-abs reduce.
     .shared .align 4 .b8 smem[32];
@@ -72,6 +77,7 @@ pub const PTX: &str = r#"
     ld.param.u32 %r0,  [param_m];
     ld.param.u32 %r1,  [param_k];
     ld.param.u32 %r2,  [param_k32_blocks];
+    ld.param.u32 %r34, [param_m_valid];
 
     mov.u32 %r3, %ctaid.x;    // block_idx
     mov.u32 %r4, %tid.x;      // threadIdx.x [0,256)
@@ -97,6 +103,13 @@ pub const PTX: &str = r#"
     // global_row = m_base + row_in_tile
     add.u32 %r11, %r7, %r9;
 
+    // Live-row predicate: rows >= m_valid are padding. The tile-max scale is
+    // shared by all 16 rows of the tile, so padding rows must contribute 0 to
+    // the max (else the scale depends on stale memory -- the M=4 all-NaN batch
+    // bug) and their loads are skipped entirely (the source buffer may hold
+    // only m_valid rows, e.g. the [m*inter] silu output at m < 16).
+    setp.lt.u32 %p6, %r11, %r34;
+
     // global_col0 = k_base + col_in_tile
     add.u32 %r12, %r8, %r10;
 
@@ -105,14 +118,16 @@ pub const PTX: &str = r#"
     add.u32    %r13, %r13, %r12;
     mul.lo.u32 %r14, %r13, 4;
 
-    // Load val0 = src[global_row * K + global_col0]
+    // Load val0 = src[global_row * K + global_col0]  (live rows only)
     cvt.u64.u32 %rd3, %r14;
     add.u64     %rd3, %rd0, %rd3;
-    ld.global.f32 %f0, [%rd3];
+    @%p6  ld.global.f32 %f0, [%rd3];
+    @!%p6 mov.f32       %f0, 0f00000000;
 
     // Load val1 = src[global_row * K + global_col0 + 1]  (+4 bytes)
     add.u64     %rd4, %rd3, 4;
-    ld.global.f32 %f1, [%rd4];
+    @%p6  ld.global.f32 %f1, [%rd4];
+    @!%p6 mov.f32       %f1, 0f00000000;
 
     // max_abs = max(abs(val0), abs(val1))
     abs.f32 %f2, %f0;

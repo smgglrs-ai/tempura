@@ -27,6 +27,17 @@ use cuda_core::sys;
 //           write_off_ptr (u64 -> *const i32 -- single offset shared by all seqs),
 //           kv_dim (u32), m (u32).
 //
+// Row-gather kernel (d2d_gather_row):
+//   Grid:  ceil(row_len / BLOCK_SIZE) blocks.
+//   Block: BLOCK_SIZE threads.
+//   Params: src (u64), dst (u64), pos_ptr (u64 -> *const i32), row_len (u32),
+//           max_pos (u32).
+//   Copies row `pos` of a row-major [max_pos x row_len] f32 table into dst.
+//   `pos` is read from DEVICE memory at execution time, so a CUDA graph that
+//   captures this kernel stays correct when the position changes per step
+//   (same pattern as the write-offset read above). Used to refresh the RoPE
+//   cos/sin row without re-capturing the decode graph.
+//
 // PTX ISA 8.7 / sm_120 (Blackwell consumer, RTX 5090).
 const PTX_SOURCE: &str = r#"
 .version 8.7
@@ -163,20 +174,88 @@ done_single:
 done_batch:
     ret;
 }
+
+// Row-gather entry: dst[tid] = src[pos * row_len + tid], pos from device memory.
+// The position scalar is uploaded by the engine as an f32 bitcast, so it is
+// read back with ld.global.s32 (the register is untyped; the bit pattern is
+// the original i32 position).
+.visible .entry d2d_gather_row(
+    .param .u64 param_src,
+    .param .u64 param_dst,
+    .param .u64 param_pos_ptr,
+    .param .u32 param_row_len,
+    .param .u32 param_max_pos
+)
+{
+    // %r0 = row_len  %r1 = max_pos  %r2 = ctaid.x  %r3 = ntid.x  %r4 = tid
+    // %r5 = global tid  %r6 = pos
+    // %rd0 = src  %rd1 = dst  %rd2 = pos_ptr
+    // %rd3 = src elem addr  %rd4 = row_len64  %rd5 = tid64  %rd6 = dst addr
+    .reg .u32   %r<8>;
+    .reg .u64   %rd<8>;
+    .reg .f32   %f1;
+    .reg .pred  %p1;
+
+    ld.param.u64 %rd0, [param_src];
+    ld.param.u64 %rd1, [param_dst];
+    ld.param.u64 %rd2, [param_pos_ptr];
+    ld.param.u32 %r0,  [param_row_len];
+    ld.param.u32 %r1,  [param_max_pos];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;
+
+    setp.ge.u32 %p1, %r5, %r0;
+    @%p1 bra done_gather;
+
+    // Position read at EXECUTION time (CUDA-graph stable).
+    ld.global.s32 %r6, [%rd2];
+
+    // Clamp to [0, max_pos): the engine routes out-of-range positions away
+    // from graph replay, but never trust a scalar we do not control.
+    setp.ge.s32 %p1, %r6, %r1;
+    @%p1 sub.s32  %r6, %r1, 1;
+    setp.lt.s32 %p1, %r6, 0;
+    @%p1 mov.u32  %r6, 0;
+
+    // src element address = src + (pos * row_len + tid) * 4
+    cvt.u64.s32 %rd3, %r6;
+    cvt.u64.u32 %rd4, %r0;
+    mul.lo.u64  %rd3, %rd3, %rd4;
+    cvt.u64.u32 %rd5, %r5;
+    add.u64     %rd3, %rd3, %rd5;
+    shl.b64     %rd3, %rd3, 2;
+    add.u64     %rd3, %rd0, %rd3;
+
+    // dst element address = dst + tid * 4
+    shl.b64  %rd6, %rd5, 2;
+    add.u64  %rd6, %rd1, %rd6;
+
+    ld.global.f32 %f1, [%rd3];
+    st.global.f32 [%rd6], %f1;
+
+done_gather:
+    ret;
+}
 "#;
 
 const BLOCK_SIZE: u32 = 256;
 const KERNEL_NAME: &str = "kv_scatter_write";
 const KERNEL_NAME_BATCH: &str = "kv_scatter_write_batch";
+const KERNEL_NAME_GATHER: &str = "d2d_gather_row";
 
 /// Scatter-write kernel loader and launcher.
 ///
-/// Holds function handles for both the single-sequence and batch variants;
-/// both are resolved from the same PTX module so the module lifetime covers both.
+/// Holds function handles for the single-sequence and batch scatter-write
+/// variants plus the row-gather kernel; all are resolved from the same PTX
+/// module so the module lifetime covers them.
 pub struct KvScatterWrite {
-    cu_module:         sys::CUmodule,
-    cu_function:       sys::CUfunction,
-    cu_function_batch: sys::CUfunction,
+    cu_module:          sys::CUmodule,
+    cu_function:        sys::CUfunction,
+    cu_function_batch:  sys::CUfunction,
+    cu_function_gather: sys::CUfunction,
 }
 
 unsafe impl Send for KvScatterWrite {}
@@ -228,7 +307,19 @@ impl KvScatterWrite {
             )));
         }
 
-        Ok(Self { cu_module, cu_function, cu_function_batch })
+        let name_gather = std::ffi::CString::new(KERNEL_NAME_GATHER).unwrap();
+        let mut cu_function_gather = std::ptr::null_mut::<sys::CUfunc_st>();
+        let rc = unsafe {
+            sys::cuModuleGetFunction(&mut cu_function_gather, cu_module, name_gather.as_ptr())
+        };
+        if rc != 0 {
+            let _ = unsafe { sys::cuModuleUnload(cu_module) };
+            return Err(KernelError::InvalidConfig(format!(
+                "KvScatterWrite: cuModuleGetFunction({KERNEL_NAME_GATHER}) failed: {rc}"
+            )));
+        }
+
+        Ok(Self { cu_module, cu_function, cu_function_batch, cu_function_gather })
     }
 
     /// Copy `kv_dim` f32 elements from `src_ptr` into
@@ -324,6 +415,66 @@ impl KvScatterWrite {
         if rc != 0 {
             return Err(KernelError::InvalidConfig(format!(
                 "KvScatterWrite::copy_m_with_device_offsets cuLaunchKernel failed: {rc}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Copy row `pos` of a row-major f32 table `[max_pos * row_len]` into
+    /// `dst` (`row_len` elements), where `pos` is read from device memory at
+    /// execution time.
+    ///
+    /// `pos_ptr` points at an i32 scalar (the engine uploads the position as
+    /// an f32 bitcast into an f32-typed buffer; the bit pattern is the i32
+    /// position). CUDA-graph stable: the graph captures the pointers, only
+    /// the value at `pos_ptr` changes per step. `pos` is clamped to
+    /// `[0, max_pos)` on device.
+    ///
+    /// Used to refresh the RoPE cos/sin row each decode step without
+    /// re-capturing the decode graph (the position is otherwise a baked
+    /// kernel launch scalar and replays stale).
+    pub fn gather_row_by_device_pos(
+        &self,
+        src:       sys::CUdeviceptr,
+        dst:       sys::CUdeviceptr,
+        pos_ptr:   sys::CUdeviceptr,
+        row_len:   u32,
+        max_pos:   u32,
+        cu_stream: sys::CUstream,
+    ) -> Result<()> {
+        if row_len == 0 {
+            return Ok(());
+        }
+        let grid = row_len.div_ceil(BLOCK_SIZE);
+
+        let mut p_src = src;
+        let mut p_dst = dst;
+        let mut p_pos = pos_ptr;
+        let mut p_len = row_len;
+        let mut p_max = max_pos;
+
+        let mut params: [*mut std::ffi::c_void; 5] = [
+            &mut p_src as *mut _ as *mut std::ffi::c_void,
+            &mut p_dst as *mut _ as *mut std::ffi::c_void,
+            &mut p_pos as *mut _ as *mut std::ffi::c_void,
+            &mut p_len as *mut _ as *mut std::ffi::c_void,
+            &mut p_max as *mut _ as *mut std::ffi::c_void,
+        ];
+
+        let rc = unsafe {
+            sys::cuLaunchKernel(
+                self.cu_function_gather,
+                grid, 1, 1,
+                BLOCK_SIZE, 1, 1,
+                0,
+                cu_stream,
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "KvScatterWrite::gather_row_by_device_pos cuLaunchKernel failed: {rc}"
             )));
         }
         Ok(())

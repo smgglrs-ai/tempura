@@ -48,42 +48,18 @@ use crate::config::ModelConfig;
 use crate::cutile_kv_cache::CutileKvCache;
 use crate::weights::QuantizedWeights;
 
-/// A kernel node in the captured graph whose scalar (i32) parameter must be
-/// updated each decode step without re-capture.
-///
-/// cuTile kernels pack all parameters into a flat byte buffer passed via the
-/// CUDA `extra` launch mechanism (`CU_LAUNCH_PARAM_BUFFER_POINTER`).  After
-/// `cuGraphKernelNodeGetParams_v2` the `extra[1]` field points directly into
-/// the graph node's owned parameter storage.  Writing to `scalar_ptr` modifies
-/// that storage in place; the change is visible to `cuGraphExecUpdate_v2`.
-struct KernelScalarNode {
-    node: cuda_core::sys::CUgraphNode,
-    /// Direct pointer into the graph node's extra-buffer at the i32 scalar's
-    /// byte offset.  Valid for the lifetime of the owning `DecodeGraph`
-    /// (which keeps `cu_graph` alive).
-    scalar_ptr: *mut i32,
-}
-
-// SAFETY: raw pointers are only accessed from the single inference thread.
-unsafe impl Send for KernelScalarNode {}
-unsafe impl Sync for KernelScalarNode {}
-
 /// RAII wrapper for a CUDA graph executable.
 ///
-/// The exec is replayed each decode step via `cuGraphLaunch`.  KV writes are
-/// performed by the scatter-write kernel inside the graph, which reads
-/// `d_kv_write_offset` from device memory at execution time -- no
-/// `cuGraphExecMemcpyNodeSetParams` calls required.  Flash-attn kv_len and
-/// RoPE position nodes are updated via `cuGraphExecKernelNodeSetParams_v2`.
-/// No re-capture, no `cuGraphExecUpdate_v2`.
+/// The exec is replayed each decode step via `cuGraphLaunch`.  All per-step
+/// scalars (kv_len, position, KV write offset) are read from DEVICE memory at
+/// execution time -- the oxide attention kernels read `d_kv_len`, the
+/// scatter-write kernel reads `d_kv_write_offset`, and the RoPE row gather
+/// reads `d_positions` -- so no graph node parameters ever need patching and
+/// no `cuGraphExecUpdate_v2` is required.
 struct DecodeGraph {
     cu_exec: cuda_core::sys::CUgraphExec,
     cu_graph: cuda_core::sys::CUgraph, // kept alive; node handles reference it
     device: Arc<cuda_core::Device>,
-    /// Flash-attention kernel nodes whose kv_len scalar changes each step.
-    flash_attn_nodes: Vec<KernelScalarNode>,
-    /// RoPE kernel nodes whose position scalar changes each step.
-    rope_nodes: Vec<KernelScalarNode>,
 }
 
 impl Drop for DecodeGraph {
@@ -419,6 +395,20 @@ pub struct CutileGpuModel {
     /// KV cache write slot before the current step's append (raw i32, not a cuTile tensor).
     d_kv_write_offset: Arc<Tensor<i32>>,
 
+    // -- CUDA-graph-stable RoPE rows --------------------------------------------
+    //
+    // cutile_rope_from_table takes `pos` as a host launch scalar, which a CUDA
+    // graph bakes at capture time and replays STALE (every decoded token after
+    // the first rotated at the capture position). Instead of patching graph
+    // nodes, the captured graph gathers the current cos/sin table row into
+    // these one-row buffers with `d2d_gather_row`, which reads the position
+    // from `d_positions` at EXECUTION time (same pattern as the KV write
+    // offset). The rope kernel then runs with pos=0 against the row buffers.
+    /// Current cos table row `[head_dim/2]`, refreshed in-graph per step.
+    d_rope_cos_row: Arc<Tensor<f32>>,
+    /// Current sin table row `[head_dim/2]`, refreshed in-graph per step.
+    d_rope_sin_row: Arc<Tensor<f32>>,
+
     /// Pre-allocated RMSNorm scratch for the final model norm applied after the
     /// layer loop (seq_len=1 decode only).  Eliminates the three `api::zeros`
     /// allocations inside `forward_device_fused` that would otherwise block
@@ -572,10 +562,6 @@ struct BatchDecodeGraph {
     cu_graph:         cuda_core::sys::CUgraph,
     device:           Arc<cuda_core::Device>,
     m:                usize,
-    /// Flash-attention kv_len scalar nodes (M per layer x num_layers = Mx32 total).
-    flash_attn_nodes: Vec<KernelScalarNode>,
-    /// RoPE position scalar nodes (2 per seq per layer = 2Mx32 total).
-    rope_nodes:       Vec<KernelScalarNode>,
     /// KV-cache device pointers captured at graph instantiation time [layer][seq].
     /// Checked on every replay: if any pointer changes (fresh-per-call bench pattern),
     /// the graph is invalidated and re-captured on the next call.
@@ -1721,6 +1707,19 @@ impl CutileGpuModel {
                 .sync_on(matmul.stream())
                 .expect("d_kv_write_offset alloc failed"),
         );
+        // One-row cos/sin buffers for CUDA-graph-stable RoPE (gathered in-graph
+        // by d2d_gather_row reading the position from d_positions).
+        let rope_half = config.head_dim / 2;
+        let d_rope_cos_row = Arc::new(
+            api::zeros::<f32>(&[rope_half])
+                .sync_on(matmul.stream())
+                .expect("d_rope_cos_row alloc failed"),
+        );
+        let d_rope_sin_row = Arc::new(
+            api::zeros::<f32>(&[rope_half])
+                .sync_on(matmul.stream())
+                .expect("d_rope_sin_row alloc failed"),
+        );
 
         // Extract device before moving `matmul` into the struct.
         let device = matmul.stream().device().clone();
@@ -1805,6 +1804,8 @@ impl CutileGpuModel {
             d_kv_len,
             d_positions,
             d_kv_write_offset,
+            d_rope_cos_row,
+            d_rope_sin_row,
             kv_scatter_write,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
@@ -2018,6 +2019,19 @@ impl CutileGpuModel {
                 .sync_on(matmul.stream())
                 .expect("d_kv_write_offset alloc failed"),
         );
+        // One-row cos/sin buffers for CUDA-graph-stable RoPE (gathered in-graph
+        // by d2d_gather_row reading the position from d_positions).
+        let rope_half = config.head_dim / 2;
+        let d_rope_cos_row = Arc::new(
+            api::zeros::<f32>(&[rope_half])
+                .sync_on(matmul.stream())
+                .expect("d_rope_cos_row alloc failed"),
+        );
+        let d_rope_sin_row = Arc::new(
+            api::zeros::<f32>(&[rope_half])
+                .sync_on(matmul.stream())
+                .expect("d_rope_sin_row alloc failed"),
+        );
 
         // Extract device before moving `matmul` into the struct.
         let device = matmul.stream().device().clone();
@@ -2089,6 +2103,8 @@ impl CutileGpuModel {
             d_kv_len,
             d_positions,
             d_kv_write_offset,
+            d_rope_cos_row,
+            d_rope_sin_row,
             kv_scatter_write,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
@@ -2233,13 +2249,14 @@ impl CutileGpuModel {
         let inter_pad64 = (inter + 63) & !63;
 
         // Build a random f32 activation [m_pad, h_pad64] and quantize to MXFP4.
+        // All m_pad rows carry live data here (bench input), so m_valid = m_pad.
         let act_h_f32: Vec<f32> = (0..m_pad * h_pad64).map(|i| (i as f32) * 0.001).collect();
         let (act_h_packed, act_h_scales) =
-            quantize_activation_to_mxfp4_tiled(&act_h_f32, m_pad, h_pad64);
+            quantize_activation_to_mxfp4_tiled(&act_h_f32, m_pad, h_pad64, m_pad);
 
         let act_i_f32: Vec<f32> = (0..m_pad * inter_pad64).map(|i| (i as f32) * 0.001).collect();
         let (act_i_packed, act_i_scales) =
-            quantize_activation_to_mxfp4_tiled(&act_i_f32, m_pad, inter_pad64);
+            quantize_activation_to_mxfp4_tiled(&act_i_f32, m_pad, inter_pad64, m_pad);
 
         // Upload activation MXFP4 tensors to GPU.
         let a_h_packed: Arc<Tensor<u8>> = api::copy_host_vec_to_device(&Arc::new(act_h_packed))
@@ -3930,49 +3947,14 @@ impl CutileGpuModel {
         }
 
         if let Some(ref decode_graph) = *graph_cache {
-            // -- Subsequent steps: update kernel scalars, then launch ----------
+            // -- Subsequent steps: plain replay ---------------------------------
             // KV writes are handled by the scatter-write kernel inside the graph
             // (reads d_kv_write_offset at execution time -- no driver calls needed).
+            // Attention kv_len is read from d_kv_len and the RoPE cos/sin row is
+            // gathered by d2d_gather_row reading d_positions -- both at execution
+            // time, so no kernel-node parameter patching is needed here.
             // NOTE: seq_len is advanced by the wrapper (kv.advance) after each
             // forward call -- do NOT advance again here (would double-count).
-
-            // Update flash-attn kv_len and RoPE pos scalars in the graph's
-            // owned parameter buffers (direct writes into extra-buffer storage).
-            let new_kv_len = kv_write_off + 1;
-            let new_pos    = positions[0] as i32;
-            let need_exec_update = !decode_graph.flash_attn_nodes.is_empty()
-                || !decode_graph.rope_nodes.is_empty();
-
-            for fa in &decode_graph.flash_attn_nodes {
-                unsafe { *fa.scalar_ptr = new_kv_len; }
-            }
-            for rn in &decode_graph.rope_nodes {
-                unsafe { *rn.scalar_ptr = new_pos; }
-            }
-
-            // If we updated any kernel scalars, propagate changes from the template
-            // graph into the exec via cuGraphExecUpdate_v2.  Only changed nodes are
-            // re-patched (no topology check cost for unchanged nodes).
-            if need_exec_update {
-                let mut result_info = cuda_core::sys::CUgraphExecUpdateResultInfo_st {
-                    result: cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS,
-                    errorNode: std::ptr::null_mut(),
-                    errorFromNode: std::ptr::null_mut(),
-                };
-                let rc = unsafe {
-                    cuda_core::sys::cuGraphExecUpdate_v2(
-                        decode_graph.cu_exec,
-                        decode_graph.cu_graph,
-                        &mut result_info,
-                    )
-                };
-                if rc != 0 || result_info.result != cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS {
-                    eprintln!("[cuda_graph] cuGraphExecUpdate_v2 (scalar patch) failed rc={rc} result={}; falling back",
-                        result_info.result);
-                    drop(graph_cache);
-                    return self.forward_decode_nogpu(embedding, positions, gpu_kv_cache);
-                }
-            }
 
             // DIAGNOSTIC: read d_kv_len back from device to confirm H->D write landed
             if std::env::var("TEMPURA_DEBUG_KV_LEN").is_ok() {
@@ -3986,7 +3968,7 @@ impl CutileGpuModel {
             unsafe { stream.synchronize().expect("stream sync after graph launch failed"); }
             drop(graph_cache);
         } else {
-            // -- First step: capture graph, instantiate, find nodes, launch ----
+            // -- First step: capture graph, instantiate, launch ----------------
             let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
             unsafe { stream.begin_capture(relaxed).expect("cuStreamBeginCapture failed"); }
 
@@ -4001,22 +3983,11 @@ impl CutileGpuModel {
             }
             let cu_exec = unsafe { cu_exec_uninit.assume_init() };
 
-            let capture_kv_len = kv_write_off + 1;
-            let capture_pos    = positions[0] as i32;
-            let n_heads        = cfg.num_attention_heads as u32;
-
-            eprintln!("[cuda_graph] finding kernel scalar nodes...");
-            let (flash_attn_nodes, rope_nodes) =
-                self.find_kernel_scalar_nodes(cu_graph, capture_kv_len, capture_pos, n_heads);
-            eprintln!("[cuda_graph] kernel node search done");
-
             // cu_graph is kept alive inside DecodeGraph so node handles remain valid.
             *graph_cache = Some(DecodeGraph {
                 cu_exec,
                 cu_graph,
                 device: stream.device().clone(),
-                flash_attn_nodes,
-                rope_nodes,
             });
 
             unsafe { cuda_core::sys::cuGraphLaunch(cu_exec, cu_stream); }
@@ -4031,59 +4002,47 @@ impl CutileGpuModel {
         self.download_device_tensor(&logits_arc)
     }
 
-    /// Enumerate all KERNEL nodes in `cu_graph` and identify flash-attention
-    /// (kv_len scalar) and RoPE (position scalar) nodes for per-step parameter
-    /// updates without re-capture.
+    /// Refresh the CUDA-graph-stable RoPE cos/sin row buffers for the CURRENT
+    /// position and report whether the graph rope path is usable.
     ///
-    /// cuTile kernels pass parameters via the `extra` launch mechanism: a flat
-    /// byte buffer whose address and size are exposed in `extra[1]` /`extra[3]`.
-    /// We scan that buffer for `capture_kv_len` (flash-attn) and `capture_pos`
-    /// (RoPE) and record direct pointers into the graph's owned storage.
-    fn find_kernel_scalar_nodes(
-        &self,
-        cu_graph: cuda_core::sys::CUgraph,
-        capture_kv_len: i32,
-        capture_pos: i32,
-        n_kv_heads: u32,
-    ) -> (Vec<KernelScalarNode>, Vec<KernelScalarNode>) {
-        // CU_LAUNCH_PARAM_BUFFER_POINTER sentinel value (== 1).
-        const BUF_PTR_TAG: usize = 1;
-        // CU_LAUNCH_PARAM_BUFFER_SIZE sentinel value (== 2).
-        const BUF_SIZE_TAG: usize = 2;
-
-        let mut num_nodes = 0usize;
-        unsafe { cuda_core::sys::cuGraphGetNodes(cu_graph, std::ptr::null_mut(), &mut num_nodes) };
-        if num_nodes == 0 { return (vec![], vec![]); }
-        let mut nodes = vec![std::ptr::null_mut::<cuda_core::sys::CUgraphNode_st>(); num_nodes];
-        unsafe { cuda_core::sys::cuGraphGetNodes(cu_graph, nodes.as_mut_ptr(), &mut num_nodes) };
-
-        let mut flash_attn_nodes = Vec::new();
-        let mut rope_nodes       = Vec::new();
-
-        for node in &nodes {
-            let mut ntype: cuda_core::sys::CUgraphNodeType = 0;
-            unsafe { cuda_core::sys::cuGraphNodeGetType(*node, &mut ntype) };
-            if ntype != cuda_core::sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL {
-                continue;
-            }
-
-            let mut params: cuda_core::sys::CUDA_KERNEL_NODE_PARAMS_v2 =
-                unsafe { std::mem::zeroed() };
-            let rc = unsafe { cuda_core::sys::cuGraphKernelNodeGetParams_v2(*node, &mut params) };
-            if rc != 0 { continue; }
-
-            // cuTile JIT kernels: cuGraphKernelNodeGetParams_v2 may block for
-            // runtime-compiled kernels.  Skip kernel parameter scanning for now --
-            // KV memcpy updates alone provide the 108 tok/s improvement.
-            // kv_len/pos node update will be re-attempted via PTX introspection.
-            let _ = (params, capture_kv_len, capture_pos, n_kv_heads);
+    /// Enqueues two `d2d_gather_row` kernels on the matmul stream that copy
+    /// table row `pos` into `d_rope_cos_row` / `d_rope_sin_row`, where `pos`
+    /// is read from `d_positions` at EXECUTION time. Inside a CUDA graph
+    /// capture these kernels are recorded once and re-gather the right row on
+    /// every replay -- unlike `cutile_rope_from_table`'s `pos` host launch
+    /// scalar, which the graph bakes at capture time and replays stale.
+    ///
+    /// Returns `false` (and gathers nothing) when the precomputed table does
+    /// not cover `pos_hint` or the gather fails; the caller must then use the
+    /// standard `forward_device_scratch` rope path. Callers that capture this
+    /// into a graph must gate replay on `positions[0] < table_max_pos()` so
+    /// replay-time positions stay in range (the gather clamps as defense in
+    /// depth).
+    fn rope_rows_graph_ready(&self, pos_hint: u32) -> bool {
+        let Some((cos_ptr, sin_ptr, half, max_pos)) = self.cutile_rope.table_ptrs() else {
+            return false;
+        };
+        if pos_hint as usize >= max_pos {
+            return false;
         }
-
-        eprintln!(
-            "[cuda_graph] scalar nodes: {} flash_attn, {} rope",
-            flash_attn_nodes.len(), rope_nodes.len()
-        );
-        (flash_attn_nodes, rope_nodes)
+        let stream = self.matmul.stream();
+        let cu_stream = stream.cu_stream();
+        let pos_ptr = self.d_positions.device_pointer().cu_deviceptr();
+        let cos_dst = self.d_rope_cos_row.device_pointer().cu_deviceptr();
+        let sin_dst = self.d_rope_sin_row.device_pointer().cu_deviceptr();
+        let res = self
+            .kv_scatter_write
+            .gather_row_by_device_pos(cos_ptr, cos_dst, pos_ptr, half as u32, max_pos as u32, cu_stream)
+            .and_then(|_| {
+                self.kv_scatter_write.gather_row_by_device_pos(
+                    sin_ptr, sin_dst, pos_ptr, half as u32, max_pos as u32, cu_stream,
+                )
+            });
+        if let Err(e) = res {
+            eprintln!("[rope] gather_row_by_device_pos failed: {e}; using standard rope");
+            return false;
+        }
+        true
     }
 
     /// Run the decode forward pass without CUDA graph capture.
@@ -4194,6 +4153,13 @@ impl CutileGpuModel {
             })
             .collect();
 
+        // Refresh the graph-stable RoPE cos/sin rows once per step. The two
+        // gather kernels read the position from d_positions at EXECUTION time,
+        // so inside a CUDA graph they are captured once and re-gather the
+        // correct table row on every replay. When the table does not cover the
+        // position (or gathering fails), fall back to the standard rope path.
+        let rope_graph = self.rope_rows_graph_ready(positions[0]);
+
         for layer in 0..cfg.num_layers {
             let (
                 ref input_ln_name,
@@ -4245,32 +4211,63 @@ impl CutileGpuModel {
             );
 
             // RoPE (GPU, pre-allocated scratch; uses precomputed cos/sin table for seq_len=1).
-            let q_rot_dev = self
-                .cutile_rope
-                .forward_device_scratch(
-                    &q_dev,
-                    positions,
-                    seq_len,
-                    n_heads,
-                    head_dim,
-                    cfg.rope_theta,
-                    &mut self.q_rope_scratch.borrow_mut(),
-                    shared_stream,
-                )
-                .expect("Q RoPE failed");
-            let k_rot_dev = self
-                .cutile_rope
-                .forward_device_scratch(
-                    &k_dev,
-                    positions,
-                    seq_len,
-                    n_kv_heads,
-                    head_dim,
-                    cfg.rope_theta,
-                    &mut self.k_rope_scratch.borrow_mut(),
-                    shared_stream,
-                )
-                .expect("K RoPE failed");
+            // Graph-stable path: the cos/sin row for the CURRENT position is
+            // gathered into the one-row buffers by d2d_gather_row (reads
+            // d_positions at execution time), so a captured graph replays with
+            // the correct rotation for every position. `rope_graph` was
+            // computed once before the layer loop.
+            let q_rot_dev = if rope_graph {
+                self.cutile_rope
+                    .forward_device_scratch_graph(
+                        &q_dev,
+                        n_heads,
+                        head_dim,
+                        &self.d_rope_cos_row,
+                        &self.d_rope_sin_row,
+                        &mut self.q_rope_scratch.borrow_mut(),
+                        shared_stream,
+                    )
+                    .expect("Q RoPE (graph rows) failed")
+            } else {
+                self.cutile_rope
+                    .forward_device_scratch(
+                        &q_dev,
+                        positions,
+                        seq_len,
+                        n_heads,
+                        head_dim,
+                        cfg.rope_theta,
+                        &mut self.q_rope_scratch.borrow_mut(),
+                        shared_stream,
+                    )
+                    .expect("Q RoPE failed")
+            };
+            let k_rot_dev = if rope_graph {
+                self.cutile_rope
+                    .forward_device_scratch_graph(
+                        &k_dev,
+                        n_kv_heads,
+                        head_dim,
+                        &self.d_rope_cos_row,
+                        &self.d_rope_sin_row,
+                        &mut self.k_rope_scratch.borrow_mut(),
+                        shared_stream,
+                    )
+                    .expect("K RoPE (graph rows) failed")
+            } else {
+                self.cutile_rope
+                    .forward_device_scratch(
+                        &k_dev,
+                        positions,
+                        seq_len,
+                        n_kv_heads,
+                        head_dim,
+                        cfg.rope_theta,
+                        &mut self.k_rope_scratch.borrow_mut(),
+                        shared_stream,
+                    )
+                    .expect("K RoPE failed")
+            };
 
             // Scatter-write K and V into the KV cache at the slot indicated by
             // d_kv_write_offset (read from device at execution time).  This is
@@ -4629,6 +4626,13 @@ impl CutileGpuModel {
         //   * seq_len == 1 -- decode mode
         //   * gpu_kv_cache.has_device_kv() -- GPU flash-attention is active
         //   * !cfg.use_alibi -- RoPE path
+        //   * oxide_decode_attn present -- the captured attention must read
+        //     kv_len from device memory; the cuTile flash-attn fallback takes
+        //     kv_len as a host launch scalar which the graph would bake at
+        //     capture and replay stale
+        //   * position < rope table_max_pos -- the captured RoPE gathers the
+        //     cos/sin row by device-side position; beyond the table the graph
+        //     would clamp to the last row (wrong rotation)
         // inter_pad/h_pad: padding is handled via D->D copy (capturable).
         // cuTile GEMV uses async_on (capture-compatible); warmup covers all needed
         // shapes, so no JIT compilation happens inside capture.
@@ -4636,9 +4640,18 @@ impl CutileGpuModel {
             && gpu_kv_cache.has_device_kv()
             && !cfg.use_alibi
         {
-            // The host KV mirror may be stale; we only rebuild it when transitioning
-            // to the CPU fallback path, which does not apply here.
-            return self.forward_decode_with_graph(&hidden, &positions, gpu_kv_cache);
+            if self.oxide_decode_attn.is_some()
+                && position < self.cutile_rope.table_max_pos()
+            {
+                // The host KV mirror may be stale; we only rebuild it when transitioning
+                // to the CPU fallback path, which does not apply here.
+                return self.forward_decode_with_graph(&hidden, &positions, gpu_kv_cache);
+            }
+            // Graph-capture correctness gate failed: run the same decode inner
+            // WITHOUT a graph.  The cuTile flash-attn gets a fresh host kv_len
+            // every call and the standard RoPE path handles any position, so
+            // both cases stay correct -- just slower.
+            return self.forward_decode_nogpu(&hidden, &positions, gpu_kv_cache);
         }
 
         // -- 3. Layer loop (prefill or CPU-attention fallback) -----------------
@@ -5146,6 +5159,12 @@ impl CutileGpuModel {
                 )
             }).collect();
 
+        // Refresh the graph-stable RoPE cos/sin rows once per step (gather
+        // kernels read the position from d_positions at execution time; inside
+        // the CUDA graph they re-gather the right row on every replay). All M
+        // sequences share one position (synchronised batch -- graph gate).
+        let rope_graph = self.rope_rows_graph_ready(positions[0]);
+
         for layer in 0..cfg.num_layers {
             let (ref input_ln, ref post_ln,
                  ref qw, ref kw, ref vw, ref ow,
@@ -5252,9 +5271,11 @@ impl CutileGpuModel {
                 let packed    = self.mxfp4_act_packed.as_ref().unwrap();
                 let scales    = self.mxfp4_act_scales.as_ref().unwrap();
                 let k_h_pad64 = ((k_h + 63) & !63) as u32;
+                // m_valid=m: rows m..16 of batch_normed1 are stale and MUST NOT
+                // contribute to the shared m16k32 tile-max scale.
                 mxfp4.quantize_activation(
                     &self.batch_normed1, packed, scales,
-                    mxfp4_m_pad, k_h_pad64, cu_stream,
+                    mxfp4_m_pad, k_h_pad64, m as u32, cu_stream,
                 ).unwrap_or_else(|e| panic!("mxfp4 h-act quant L{layer}: {e}"));
                 true
             };
@@ -5285,7 +5306,7 @@ impl CutileGpuModel {
                     }
                     mxfp4.quantize_activation(
                         &self.batch_normed1, packed, scales,
-                        mxfp4_m_pad, k_h_pad64, cu_stream,
+                        mxfp4_m_pad, k_h_pad64, m as u32, cu_stream,
                     ).unwrap_or_else(|e| panic!("mxfp4 V quant L{layer}: {e}"));
                 }
                 let dw_v_mx = self.device_weights_mxfp4_tiled.get(vw.as_str()).unwrap();
@@ -5395,20 +5416,44 @@ impl CutileGpuModel {
                     ).expect("batch inner: k_seqs slice");
                 }
 
-                // Apply RoPE to Q and K for sequence r.
-                let pos_r = [positions[r]];
-                let q_rope_tmp = self.cutile_rope
-                    .forward_device_scratch(
-                        &self.batch_q_seqs[r], &pos_r, 1, n_heads, head_dim,
-                        cfg.rope_theta, &mut self.q_rope_scratch.borrow_mut(), stream,
-                    )
-                    .expect("batch inner: Q RoPE");
-                let k_rope_tmp = self.cutile_rope
-                    .forward_device_scratch(
-                        &self.batch_k_seqs[r], &pos_r, 1, n_kv_heads, head_dim,
-                        cfg.rope_theta, &mut self.k_rope_scratch.borrow_mut(), stream,
-                    )
-                    .expect("batch inner: K RoPE");
+                // Apply RoPE to Q and K for sequence r. Graph-stable path uses
+                // the one-row cos/sin buffers gathered once per step (position
+                // read from d_positions at execution time); all sequences share
+                // the same position (synchronised batch -- graph gate).
+                let q_rope_tmp = if rope_graph {
+                    self.cutile_rope
+                        .forward_device_scratch_graph(
+                            &self.batch_q_seqs[r], n_heads, head_dim,
+                            &self.d_rope_cos_row, &self.d_rope_sin_row,
+                            &mut self.q_rope_scratch.borrow_mut(), stream,
+                        )
+                        .expect("batch inner: Q RoPE (graph rows)")
+                } else {
+                    let pos_r = [positions[r]];
+                    self.cutile_rope
+                        .forward_device_scratch(
+                            &self.batch_q_seqs[r], &pos_r, 1, n_heads, head_dim,
+                            cfg.rope_theta, &mut self.q_rope_scratch.borrow_mut(), stream,
+                        )
+                        .expect("batch inner: Q RoPE")
+                };
+                let k_rope_tmp = if rope_graph {
+                    self.cutile_rope
+                        .forward_device_scratch_graph(
+                            &self.batch_k_seqs[r], n_kv_heads, head_dim,
+                            &self.d_rope_cos_row, &self.d_rope_sin_row,
+                            &mut self.k_rope_scratch.borrow_mut(), stream,
+                        )
+                        .expect("batch inner: K RoPE (graph rows)")
+                } else {
+                    let pos_r = [positions[r]];
+                    self.cutile_rope
+                        .forward_device_scratch(
+                            &self.batch_k_seqs[r], &pos_r, 1, n_kv_heads, head_dim,
+                            cfg.rope_theta, &mut self.k_rope_scratch.borrow_mut(), stream,
+                        )
+                        .expect("batch inner: K RoPE")
+                };
 
                 // D->D copy to stable pre-allocated tensors (fixed device ptrs for graph).
                 unsafe {
@@ -5568,11 +5613,12 @@ impl CutileGpuModel {
                 let packed  = self.mxfp4_act_packed.as_ref().unwrap();
                 let scales  = self.mxfp4_act_scales.as_ref().unwrap();
                 let k_o_pad64 = ((k_o + 63) & !63) as u32;
-                // batch_oproj_in is [mb * q_pad] = [16 * q_dim]; rows m..15 are stale
-                // but their GEMM outputs are never read downstream.
+                // batch_oproj_in is [mb * q_pad] = [16 * q_dim]; rows m..15 are
+                // stale. They never reach the GEMM output consumers, but the
+                // shared tile-max scale WOULD be poisoned by them without m_valid.
                 mxfp4.quantize_activation(
                     &self.batch_oproj_in, packed, scales,
-                    mxfp4_m_pad, k_o_pad64, cu_stream,
+                    mxfp4_m_pad, k_o_pad64, m as u32, cu_stream,
                 ).unwrap_or_else(|e| panic!("mxfp4 O quant L{layer}: {e}"));
                 let dw_o_mx = self.device_weights_mxfp4_tiled.get(ow.as_str()).unwrap();
                 mxfp4.forward(
@@ -5674,7 +5720,7 @@ impl CutileGpuModel {
                 let k_g_pad64 = ((k_g + 63) & !63) as u32;
                 mxfp4.quantize_activation(
                     &self.batch_normed2, packed, scales,
-                    mxfp4_m_pad, k_g_pad64, cu_stream,
+                    mxfp4_m_pad, k_g_pad64, m as u32, cu_stream,
                 ).unwrap_or_else(|e| panic!("mxfp4 gateup quant L{layer}: {e}"));
                 let dw_gate_mx = self.device_weights_mxfp4_tiled.get(gate_w.as_str()).unwrap();
                 mxfp4.forward(
@@ -5716,9 +5762,12 @@ impl CutileGpuModel {
                 let scales  = self.mxfp4_act_scales.as_ref().unwrap();
                 // inter must be multiple of 64 (holds for all standard LLaMA/Qwen models).
                 let inter_pad64 = ((inter + 63) & !63) as u32;
+                // silu_out holds only m*inter elements (m < 16): m_valid both
+                // masks the scale and stops the kernel from reading past the
+                // end of the tensor (the old all-NaN-at-M=4 OOB read).
                 mxfp4.quantize_activation(
                     &silu_out, packed, scales,
-                    mxfp4_m_pad, inter_pad64, cu_stream,
+                    mxfp4_m_pad, inter_pad64, m as u32, cu_stream,
                 ).unwrap_or_else(|e| panic!("mxfp4 down quant L{layer}: {e}"));
                 let dw_down_mx = self.device_weights_mxfp4_tiled.get(down_w.as_str()).unwrap();
                 mxfp4.forward(
@@ -5947,35 +5996,10 @@ impl CutileGpuModel {
         }
 
         if let Some(ref decode_graph) = *graph_cache {
-            // Subsequent steps: update scalar nodes and launch.
-            let new_kv_len = kv_write_off + 1;
-            let new_pos    = positions[0] as i32;
-            for fa in &decode_graph.flash_attn_nodes {
-                unsafe { *fa.scalar_ptr = new_kv_len; }
-            }
-            for rn in &decode_graph.rope_nodes {
-                unsafe { *rn.scalar_ptr = new_pos; }
-            }
-            let need_update = !decode_graph.flash_attn_nodes.is_empty()
-                || !decode_graph.rope_nodes.is_empty();
-            if need_update {
-                let mut result_info = cuda_core::sys::CUgraphExecUpdateResultInfo_st {
-                    result: cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS,
-                    errorNode: std::ptr::null_mut(),
-                    errorFromNode: std::ptr::null_mut(),
-                };
-                let rc = unsafe {
-                    cuda_core::sys::cuGraphExecUpdate_v2(
-                        decode_graph.cu_exec, decode_graph.cu_graph, &mut result_info,
-                    )
-                };
-                if rc != 0 || result_info.result != cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS {
-                    eprintln!("[mxfp4_graph] cuGraphExecUpdate_v2 failed rc={rc}; invalidating and falling back");
-                    *graph_cache = None;
-                    drop(graph_cache);
-                    return Some(vec![]);
-                }
-            }
+            // Subsequent steps: plain replay. kv_lens for the batch attention
+            // are read from batch_attn_kv_lens_dev (H->D above), the KV write
+            // offset from d_kv_write_offset, and the RoPE cos/sin row is
+            // re-gathered from d_positions -- all at execution time.
             unsafe { cuda_core::sys::cuGraphLaunch(decode_graph.cu_exec, cu_stream); }
             unsafe { stream.synchronize().expect("mxfp4 batch graph sync"); }
             drop(graph_cache);
@@ -6038,15 +6062,6 @@ impl CutileGpuModel {
             }
             let cu_exec = unsafe { cu_exec_uninit.assume_init() };
 
-            let capture_kv_len = kv_write_off + 1;
-            let capture_pos    = positions[0] as i32;
-            let n_heads_u32    = cfg.num_attention_heads as u32;
-            let (flash_attn_nodes, rope_nodes) =
-                self.find_kernel_scalar_nodes(cu_graph, capture_kv_len, capture_pos, n_heads_u32);
-
-            eprintln!("[mxfp4_graph] captured: {} flash-attn nodes, {} rope nodes",
-                flash_attn_nodes.len(), rope_nodes.len());
-
             let captured_k_ptrs: Vec<Vec<u64>> = (0..cfg.num_layers)
                 .map(|l| (0..m).map(|r| kv_caches[r].kv_device_tensors(l).0.device_pointer().cu_deviceptr()).collect())
                 .collect();
@@ -6059,8 +6074,6 @@ impl CutileGpuModel {
                 cu_graph,
                 device: stream.device().clone(),
                 m,
-                flash_attn_nodes,
-                rope_nodes,
                 captured_k_ptrs,
                 captured_v_ptrs,
             });
@@ -6226,37 +6239,9 @@ impl CutileGpuModel {
         }
 
         if let Some(ref decode_graph) = *graph_cache {
-            // -- Subsequent steps: update scalar nodes and launch --------------
-            let new_kv_len = kv_write_off + 1;
-            let new_pos    = positions[0] as i32;
-            for fa in &decode_graph.flash_attn_nodes {
-                unsafe { *fa.scalar_ptr = new_kv_len; }
-            }
-            for rn in &decode_graph.rope_nodes {
-                unsafe { *rn.scalar_ptr = new_pos; }
-            }
-
-            let need_update = !decode_graph.flash_attn_nodes.is_empty()
-                || !decode_graph.rope_nodes.is_empty();
-            if need_update {
-                let mut result_info = cuda_core::sys::CUgraphExecUpdateResultInfo_st {
-                    result: cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS,
-                    errorNode: std::ptr::null_mut(),
-                    errorFromNode: std::ptr::null_mut(),
-                };
-                let rc = unsafe {
-                    cuda_core::sys::cuGraphExecUpdate_v2(
-                        decode_graph.cu_exec, decode_graph.cu_graph, &mut result_info,
-                    )
-                };
-                if rc != 0 || result_info.result != cuda_core::sys::CUgraphExecUpdateResult_enum_CU_GRAPH_EXEC_UPDATE_SUCCESS {
-                    eprintln!("[batch_graph] cuGraphExecUpdate_v2 failed rc={rc}; falling back");
-                    drop(graph_cache);
-                    // Advance KV caches so caller's advance() doesn't double-count.
-                    return vec![];
-                }
-            }
-
+            // -- Subsequent steps: plain replay --------------------------------
+            // Per-step scalars are all read from device memory at execution
+            // time (batch_attn_kv_lens_dev, d_kv_write_offset, d_positions).
             unsafe { cuda_core::sys::cuGraphLaunch(decode_graph.cu_exec, cu_stream); }
             unsafe { stream.synchronize().expect("batch graph sync"); }
             drop(graph_cache);
@@ -6326,15 +6311,6 @@ impl CutileGpuModel {
             }
             let cu_exec = unsafe { cu_exec_uninit.assume_init() };
 
-            let capture_kv_len = kv_write_off + 1;
-            let capture_pos    = positions[0] as i32;
-            let n_heads_u32    = cfg.num_attention_heads as u32;
-            let (flash_attn_nodes, rope_nodes) =
-                self.find_kernel_scalar_nodes(cu_graph, capture_kv_len, capture_pos, n_heads_u32);
-
-            eprintln!("[batch_graph] captured: {} flash-attn nodes, {} rope nodes",
-                flash_attn_nodes.len(), rope_nodes.len());
-
             // Record KV cache device pointers so replay can detect staleness.
             let captured_k_ptrs: Vec<Vec<u64>> = (0..cfg.num_layers)
                 .map(|l| (0..m).map(|r| kv_caches[r].kv_device_tensors(l).0.device_pointer().cu_deviceptr()).collect())
@@ -6348,8 +6324,6 @@ impl CutileGpuModel {
                 cu_graph,
                 device: stream.device().clone(),
                 m,
-                flash_attn_nodes,
-                rope_nodes,
                 captured_k_ptrs,
                 captured_v_ptrs,
             });
@@ -6405,6 +6379,20 @@ impl CutileGpuModel {
         let m = token_ids.len();
         if m == 0 { return vec![]; }
 
+        // Single request: delegate to the verified single-sequence CUDA-graph
+        // path. m=1 never qualifies for the batch graph (requires m >= 2), and
+        // the generic no-graph fallback below is slow (per-token allocations)
+        // and was never output-verified (the old "M=1 fallback broken" bug).
+        if m == 1 {
+            let logits = self.forward(
+                positions[0] as usize,
+                &token_ids[..1],
+                qweights,
+                &mut kv_caches[0],
+            );
+            return vec![logits];
+        }
+
         let cfg        = &self.config;
         let h          = cfg.hidden_size;
         let n_heads    = cfg.num_attention_heads;
@@ -6434,15 +6422,28 @@ impl CutileGpuModel {
         // Use the pre-captured CUDA graph when:
         //   (a) All KV caches have device-resident KV (GPU flash attention).
         //   (b) All Q4K sm120 batch kernel is available.
-        //   (c) M <= max_batch_graph (= 2 for this POC).
+        //   (c) M <= max_batch_graph.
         //   (d) !use_alibi.
         //   (e) All positions are equal (synchronised batch decode).
+        //   (f) oxide_decode_attn present -- the captured attention must read
+        //       kv_len from device memory; the cuTile flash-attn fallback takes
+        //       kv_len as a host launch scalar the graph would bake and replay
+        //       stale.
+        //   (g) position < RoPE table_max_pos -- the captured RoPE gathers the
+        //       cos/sin row by device-side position; beyond the table the
+        //       gather would clamp to the last row (wrong rotation).
         // Batch graph only for M >= 2 (M=1 uses the single-seq graph via forward()).
         // All M sequences must have the same position (synchronised batch decode).
         // All projection weights must be Q4K (checked once at model load time).
         let positions_equal = positions.windows(2).all(|w| w[0] == w[1]);
         let kv_all_device  = kv_caches.iter().all(|kvc| kvc.has_device_kv());
-        let base_ok = m >= 2 && m <= self.max_batch_graph && kv_all_device && !cfg.use_alibi && positions_equal;
+        let base_ok = m >= 2
+            && m <= self.max_batch_graph
+            && kv_all_device
+            && !cfg.use_alibi
+            && positions_equal
+            && self.oxide_decode_attn.is_some()
+            && (positions[0] as usize) < self.cutile_rope.table_max_pos();
         // Q4K dp4a/sm120 batch graph: requires oxide Q4K batch kernel.
         let can_q4k_graph = base_ok
             && self.all_proj_q4k
