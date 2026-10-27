@@ -323,6 +323,12 @@ pub struct CutileGpuModel {
     /// Oxide decode flash-attention kernel -- accepts kv_len as device pointer,
     /// enabling single-capture CUDA graph without stale kv_len.
     oxide_decode_attn: Option<OxideDecodeAttn>,
+    /// Stable-address device scratch for the split-K decode attention
+    /// (`OxideDecodeAttn::splitk_scratch_len` f32 elements). Allocated before
+    /// any CUDA graph capture so the baked-in pointer stays valid for every
+    /// replay of the graph's lifetime. `None` when the split-K pair is absent
+    /// from the PTX (falls back to kpar) or allocation failed.
+    attn_splitk_scratch: Option<Arc<Tensor<f32>>>,
     /// Hand-optimized oxide Q4_K GEMV kernel (replaces cuTile for M=1 decode).
     oxide_q4k_gemv: Option<OxideQ4kGemv>,
     /// Hand-optimized oxide Q6_K GEMV kernel (replaces cuTile for M=1 decode).
@@ -1555,9 +1561,20 @@ impl CutileGpuModel {
         let oxide_q6k_gemv = OxideQ6kGemv::try_load(matmul.stream().clone());
         // Oxide decode attention (kv_len read from device pointer at execution time).
         let oxide_decode_attn = match OxideDecodeAttn::new(matmul.stream().clone()) {
-            Ok(oda) => { eprintln!("[cutile] oxide decode-attn loaded (batch={})", oda.has_batch()); Some(oda) }
+            Ok(oda) => { eprintln!("[cutile] oxide decode-attn loaded (batch={}, splitk={})", oda.has_batch(), oda.has_splitk()); Some(oda) }
             Err(e)  => { eprintln!("[cutile] oxide decode-attn unavailable: {e}"); None }
         };
+        // Split-K decode attention scratch: one stable-address buffer for the
+        // CUDA graph's lifetime (pointer baked in at capture, never reallocated).
+        let attn_splitk_scratch = oxide_decode_attn.as_ref()
+            .filter(|oda| oda.has_splitk())
+            .map(|_| {
+                Arc::new(
+                    api::zeros::<f32>(&[OxideDecodeAttn::splitk_scratch_len(n_heads, head_dim)])
+                        .sync_on(matmul.stream())
+                        .expect("splitk attn scratch: device allocation failed"),
+                )
+            });
         let kv_scatter_write = KvScatterWrite::new()
             .expect("KvScatterWrite: failed to load scatter-write PTX kernel");
 
@@ -1739,6 +1756,7 @@ impl CutileGpuModel {
             q6k_gemv,
             oxide_q2_gemv,
             oxide_decode_attn,
+            attn_splitk_scratch,
             oxide_q4k_gemv,
             oxide_q6k_gemv,
             flash_attn,
@@ -2009,6 +2027,7 @@ impl CutileGpuModel {
             q6k_gemv,
             oxide_q2_gemv,
             oxide_decode_attn,
+            attn_splitk_scratch,
             oxide_q4k_gemv,
             oxide_q6k_gemv,
             flash_attn,
@@ -4236,11 +4255,19 @@ impl CutileGpuModel {
                             .expect("attn out alloc")),
                     }
                 };
-                // K-parallel variant: 8 warps per head reduce the sequential KV scan.
-                oda.forward_kpar_d2d(
-                    &out_tensor, &q_rot_dev, &k_dev_full, &v_dev_full,
-                    &self.d_kv_len, n_heads, n_kv_heads, head_dim, scale,
-                ).expect("oxide decode attention kpar failed");
+                // Split-K variant: grid (n_heads x 16) fills all SMs; the
+                // kpar fallback still beats the single-warp scan.
+                if let Some(ref splitk_scratch) = self.attn_splitk_scratch {
+                    oda.forward_splitk_d2d(
+                        &out_tensor, &q_rot_dev, &k_dev_full, &v_dev_full,
+                        &self.d_kv_len, splitk_scratch, n_heads, n_kv_heads, head_dim, scale,
+                    ).expect("oxide decode attention splitk failed");
+                } else {
+                    oda.forward_kpar_d2d(
+                        &out_tensor, &q_rot_dev, &k_dev_full, &v_dev_full,
+                        &self.d_kv_len, n_heads, n_kv_heads, head_dim, scale,
+                    ).expect("oxide decode attention kpar failed");
+                }
                 self.attn_out_scratch.borrow_mut().replace(out_tensor.clone());
                 out_tensor
             } else {
