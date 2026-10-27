@@ -82,11 +82,22 @@ mod kernels {
         }
     }
 
-    // Tiled stream-K MXFP4 batch GEMM: C[M][N] = A[M][K] x B[K][N] (f32 output).
+    // Tiled MXFP4 batch GEMM: C[M][N] = A[M][K] x B[K][N] (f32 output).
     //
-    // Grid: (sm_count, 1, 1) persistent. Block: (128, 1, 1) = 4 warps.
-    // Each warp independently processes output tiles from a flat tile work queue.
+    // Grid: (ceil(n_tiles/4), m_tiles, 1) -- ONE TILE PER WARP, no flat-index
+    // decomposition and no multi-iteration tile loop. Block: (128, 1, 1) = 4 warps;
+    // warp w of block (bx, by) computes tile (tile_m = by, tile_n = bx*4 + w).
     // Tile size: m16 x n8. Accumulates over all k64_tiles using SM120a MMA.
+    //
+    // WHY one tile per warp: the cutlass-mlir codegen miscompiles loop-carried
+    // multi-variable tile walks -- when total tiles exceed the warp slots
+    // (m >= 32), ~half the output tiles were left unwritten (stale memory) and
+    // the rest stored garbage from mis-carried registers, giving NaN-free
+    // run-to-run drift at m=128 while m=16 (single iteration per warp, no
+    // carry) stayed bitwise-stable. A 2D grid expresses the tile coordinates
+    // directly from blockIdx, so nothing is carried across iterations. At
+    // m=16 the warp-to-tile assignment is identical to the previous flat
+    // slot-indexed kernel, keeping batch-decode outputs bit-identical.
     //
     // A packing: row-major [M x K/2] u8, 2 E2M1 nibbles per byte.
     //   a_packed[m][k/2] contains nibbles for (m, k) and (m, k+1).
@@ -106,7 +117,7 @@ mod kernels {
     //
     // # Safety
     // All pointers are device addresses. m, n must be multiples of 16, 8.
-    // k64_tiles >= 1. sm_count must be <= device SM count.
+    // k64_tiles >= 1.
     #[kernel]
     pub unsafe fn mxf4_batch_gemm_tiled(
         a_packed: *const u8,
@@ -119,36 +130,19 @@ mod kernels {
         k64_tiles: u32,
     ) {
         let tid = thread::threadIdx_x();
-        let bid = thread::blockIdx_x();
-        let grid = thread::gridDim_x();
+        let bid_x = thread::blockIdx_x();
+        let bid_y = thread::blockIdx_y();
         let warp_id = tid / 32;
         let lane = (tid % 32) as usize;
 
         let m_tiles = m / 16;
         let n_tiles = n / 8;
-        let total_tiles = m_tiles * n_tiles;
 
-        // Stream-K: each warp picks a tile index, strides by (grid * 4) each iteration.
-        //
-        // Division-free (tile_m, tile_n) decomposition: the cutlass-mlir backend
-        // lowers integer `/`/`%` to MUFU.RCP-based emulation that mis-computes
-        // tile_idx / n_tiles for some operands >= 512, leaving tiles unwritten
-        // (stale output memory) and others double-written -- the m > 16 prefill
-        // nondeterminism (rows >= 16 of the output drifted run-to-run while
-        // m_pad = 16 batch decode, whose tile_idx < 512, stayed bitwise-stable).
-        // The flat index is decomposed once by subtraction and advanced by
-        // subtractive carry, so no division or modulo ever executes.
-        let slot = bid * 4 + warp_id;
-        let stride = grid * 4;
-        let mut tile_m: u32 = 0;
-        let mut tile_n: u32 = slot;
-        while tile_n >= n_tiles {
-            tile_n -= n_tiles;
-            tile_m += 1;
+        let tile_m = bid_y;
+        let tile_n = bid_x * 4 + warp_id;
+        if tile_n >= n_tiles {
+            return;
         }
-        let mut tile_idx = slot;
-
-        while tile_idx < total_tiles {
             let mut acc = Accumulator16x8::zero();
 
             let mut k = 0u32;
@@ -236,14 +230,6 @@ mod kernels {
                 *c.add(r1 * n_usize + c0) = regs[2];
                 *c.add(r1 * n_usize + c1) = regs[3];
             }
-
-            tile_idx += stride;
-            tile_n += stride;
-            while tile_n >= n_tiles {
-                tile_n -= n_tiles;
-                tile_m += 1;
-            }
-        }
     }
 }
 
@@ -378,6 +364,74 @@ fn main() {
             );
         } else {
             eprintln!("FAIL tiled: incorrect output.");
+            std::process::exit(1);
+        }
+    }
+
+    // --- Test 3: multi-tile GEMM (m=32, n=16: four m16n8 tiles) ---
+    // Regression for the loop-carry miscompilation: when a warp had to walk
+    // more than one tile, ~half the output tiles were never written (left as
+    // the NaN poison below) and others stored garbage. One-tile-per-warp on
+    // the 2D grid must cover every tile; any unwritten element stays NaN and
+    // fails the check.
+    {
+        let m: u32 = 32;
+        let n: u32 = 16;
+        let k: u32 = 64;
+        let k64_tiles: u32 = 1;
+        let nibble_one: u8 = 0x2;
+        let scale_one: u8 = 0x7F;
+
+        let a_data = build_uniform_e2m1(m as usize, k as usize, nibble_one);
+        let b_data = build_uniform_e2m1(n as usize, k as usize, nibble_one);
+        let a_scales = build_uniform_scales((m / 16) as usize, 1, scale_one);
+        let b_scales = build_uniform_scales((n / 8) as usize, 1, scale_one);
+
+        let a_dev = DeviceBuffer::from_host(&stream, &a_data).expect("alloc A");
+        let b_dev = DeviceBuffer::from_host(&stream, &b_data).expect("alloc B");
+        let a_sc_dev = DeviceBuffer::from_host(&stream, &a_scales).expect("alloc a_scales");
+        let b_sc_dev = DeviceBuffer::from_host(&stream, &b_scales).expect("alloc b_scales");
+
+        let c_size = (m * n) as usize;
+        let c_poison = vec![f32::NAN; c_size];
+        let c_dev = DeviceBuffer::from_host(&stream, &c_poison).expect("alloc C");
+
+        let config = LaunchConfig {
+            grid_dim: ((n / 8).div_ceil(4), m / 16, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let a_ptr = a_dev.cu_deviceptr() as *const u8;
+        let a_sc_ptr = a_sc_dev.cu_deviceptr() as *const u8;
+        let b_ptr = b_dev.cu_deviceptr() as *const u8;
+        let b_sc_ptr = b_sc_dev.cu_deviceptr() as *const u8;
+        let c_ptr = c_dev.cu_deviceptr() as *mut f32;
+
+        unsafe {
+            module
+                .mxf4_batch_gemm_tiled(
+                    &stream, config, a_ptr, a_sc_ptr, b_ptr, b_sc_ptr, c_ptr, m, n, k64_tiles,
+                )
+                .expect("tiled multi-tile launch");
+        }
+        stream.synchronize().expect("synchronize");
+
+        let result = c_dev.to_host_vec(&stream).expect("copy C");
+        let expected = 64.0_f32;
+        let mut pass = true;
+        for (i, &v) in result.iter().enumerate() {
+            if (v - expected).abs() > 1e-3 {
+                eprintln!("  tiled multi-tile FAIL C[{i}] = {v} (expected {expected})");
+                pass = false;
+            }
+        }
+        if pass {
+            println!(
+                "PASS tiled multi-tile: M={m} N={n} K={k} all {c_size} outputs = {expected:.1}"
+            );
+        } else {
+            eprintln!("FAIL tiled multi-tile: unwritten or incorrect tiles.");
             std::process::exit(1);
         }
     }
