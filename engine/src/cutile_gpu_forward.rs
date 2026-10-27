@@ -1560,9 +1560,17 @@ impl CutileGpuModel {
         let oxide_q4k_gemv = oxide_q4k_gemv_early;   // reuse the early-loaded instance (upload format already matched)
         let oxide_q6k_gemv = OxideQ6kGemv::try_load(matmul.stream().clone());
         // Oxide decode attention (kv_len read from device pointer at execution time).
-        let oxide_decode_attn = match OxideDecodeAttn::new(matmul.stream().clone()) {
-            Ok(oda) => { eprintln!("[cutile] oxide decode-attn loaded (batch={}, splitk={})", oda.has_batch(), oda.has_splitk()); Some(oda) }
-            Err(e)  => { eprintln!("[cutile] oxide decode-attn unavailable: {e}"); None }
+        // TEMPURA_NO_OXIDE_ATTN=1 disables the module (attention falls back to
+        // cuTile flash-attn, SiLU to the cutile elementwise path) -- numerical
+        // bisect switch for the decode pipeline.
+        let oxide_decode_attn = if std::env::var("TEMPURA_NO_OXIDE_ATTN").map(|v| v == "1").unwrap_or(false) {
+            eprintln!("[cutile] oxide decode-attn disabled (TEMPURA_NO_OXIDE_ATTN=1)");
+            None
+        } else {
+            match OxideDecodeAttn::new(matmul.stream().clone()) {
+                Ok(oda) => { eprintln!("[cutile] oxide decode-attn loaded (batch={}, splitk={})", oda.has_batch(), oda.has_splitk()); Some(oda) }
+                Err(e)  => { eprintln!("[cutile] oxide decode-attn unavailable: {e}"); None }
+            }
         };
         // Split-K decode attention scratch: one stable-address buffer for the
         // CUDA graph's lifetime (pointer baked in at capture, never reallocated).
