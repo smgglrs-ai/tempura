@@ -391,9 +391,28 @@ typical-p/repeat/presence/frequency)
       were computed with frozen-position RoPE — the numbers' SPEED is
       roughly representative but no pre-fix output correctness claim
       survives; re-measure.
+      The M=1-phase replay mismatch (fixed same day) exposed two MORE
+      single-seq bugs, both pre-existing on the "verified" 136 tok/s path:
+      (e) CutileElementwise owns a PRIVATE CUDA stream and launched the
+          SiLU kernel on it while its input producers (gate/up GEMVs) and
+          consumer (down-proj) run on the matmul stream with no events —
+          a cross-stream race whose outcome depends on the allocation
+          layout (deterministic per layout, so run-to-run same-cache tests
+          never caught it). silu_mul_device(_scratch) now take the
+          caller's stream. Found by per-op bits_sum diffing
+          (TEMPURA_DEBUG_NAN=1) between the timed run and the fresh-cache
+          replay: first diverging op L0 gate-silu, inputs matching.
+      (f) gemm_q4k_d2d_slot's kpar branch returned the SHARED
+          q8_out_scratch, so gate and up projections wrote the same
+          buffer and the silu computed silu(up)*up — the single-seq FFN
+          was mathematically wrong (gate-dev bits == up-dev bits in the
+          nan-trace). The kpar GEMVs now write per-slot pool tensors
+          (submit_sm120_kpar_into_slot / submit_dp4a_kpar_into_slot,
+          mirroring the KV-stream slot path); pool misses fall back to
+          the fresh-output oxide f32 GEMV. Every pre-fix single-seq
+          output was computed with the wrong FFN.
 - [ ] Close the 1.54× single-sequence GPU decode gap vs llama.cpp
-      (136 vs 209 tok/s pre-fix; re-measure after the rope fix — the graph
-      gains 2 gather kernels/step, expected low single-digit % cost).
+      (136 vs 209 tok/s pre-fix; re-measure after the rope + FFN fixes).
       Known levers: port the sm120 fused gate+up+SiLU kernel to native
       36-u32 format (currently bypassed by the format gate), GEMV still
       ~40% DRAM (dmon: sm 99-100%, mem 36-46%), host-side per-token
