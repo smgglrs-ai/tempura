@@ -7,9 +7,16 @@
  * decode step. This eliminates the stale-kv_len problem in the single-capture
  * CUDA graph.
  *
- * Build:
+ * Build (upstream backend; the fork backend lacks ex2_approx_f32 and cannot
+ * build this crate -- q4k/q6k dp4a crates share this requirement):
  *   export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
- *   RUSTUP_TOOLCHAIN=nightly-2026-10-11 cargo oxide build
+ *   export LD_LIBRARY_PATH=~/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/lib:$LD_LIBRARY_PATH
+ *   RUSTC_BOOTSTRAP=1 RUSTUP_TOOLCHAIN=1.99.1 cargo oxide build
+ * (The backend .so links librustc_driver-7ed0375ae352bd75.so from the 1.99.1
+ * toolchain -- the upstream tree pins channel "1.99.1". RUSTC_BOOTSTRAP=1
+ * lets the stable compiler accept cargo-oxide's -Z codegen-backend flag.
+ * If the backend .so is rebuilt from a different toolchain, match this
+ * recipe to that toolchain's driver.)
  *
  * Layout (matching cutile_decode_attn and CutileKvCache):
  *   q:       [n_heads * head_dim] f32

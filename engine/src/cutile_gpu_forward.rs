@@ -1910,9 +1910,20 @@ impl CutileGpuModel {
         let oxide_q4k_gemv = OxideQ4kGemv::try_load(matmul.stream().clone());
         let oxide_q6k_gemv = OxideQ6kGemv::try_load(matmul.stream().clone());
         let oxide_decode_attn = match OxideDecodeAttn::new(matmul.stream().clone()) {
-            Ok(oda) => { eprintln!("[cutile] oxide decode-attn loaded (batch={})", oda.has_batch()); Some(oda) }
+            Ok(oda) => { eprintln!("[cutile] oxide decode-attn loaded (batch={}, splitk={})", oda.has_batch(), oda.has_splitk()); Some(oda) }
             Err(e)  => { eprintln!("[cutile] oxide decode-attn unavailable: {e}"); None }
         };
+        // Split-K decode attention scratch: one stable-address buffer for the
+        // CUDA graph's lifetime (pointer baked in at capture, never reallocated).
+        let attn_splitk_scratch = oxide_decode_attn.as_ref()
+            .filter(|oda| oda.has_splitk())
+            .map(|_| {
+                Arc::new(
+                    api::zeros::<f32>(&[OxideDecodeAttn::splitk_scratch_len(n_heads, head_dim)])
+                        .sync_on(matmul.stream())
+                        .expect("splitk attn scratch: device allocation failed"),
+                )
+            });
         let kv_scatter_write = KvScatterWrite::new()
             .expect("KvScatterWrite: failed to load scatter-write PTX kernel");
 
