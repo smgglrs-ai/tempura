@@ -311,7 +311,8 @@ Qwen3.6-27B weights** — see open work.
 **GPU inference (RTX 5090, Llama-3.1-8B Q4_K_M)**
 - [x] cuTile forward pass, GPU-resident KV (D→D append), fused RMSNorm,
       on-device RoPE, batched flash attention
-- [x] oxide GEMV: Q2_0, Q4K (dp4a), Q6K (mbar cp.async); oxide decode attn
+- [x] oxide GEMV: Q2_0, Q4K (dp4a), Q6K (dp4a kpar8; the sm120 mbar variant
+      is default-off pending the race fix, see open work); oxide decode attn
 - [x] sm_120a native PTX: q4k/q6k GEMV, fused gate+up SiLU, mma.sync batch
       GEMM, stream-K batch GEMM (persistent blocks, grid=SM_COUNT)
 - [x] CUDA graphs for single + batch decode (M=2..16+, dynamic
