@@ -6418,6 +6418,8 @@ impl CutileGpuModel {
         // path. m=1 never qualifies for the batch graph (requires m >= 2), and
         // the generic no-graph fallback below is slow (per-token allocations)
         // and was never output-verified (the old "M=1 fallback broken" bug).
+        // forward() leaves seq_len advancement to its caller, so advance here
+        // to preserve forward_batch_decode's stateful contract.
         if m == 1 {
             let logits = self.forward(
                 positions[0] as usize,
@@ -6425,6 +6427,8 @@ impl CutileGpuModel {
                 qweights,
                 &mut kv_caches[0],
             );
+            kv_caches[0].advance_host_seq_len(1);
+            kv_caches[0].mark_host_stale();
             return vec![logits];
         }
 
