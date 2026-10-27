@@ -322,8 +322,9 @@ Qwen3.6-27B weights** — see open work.
       at M=64
 - [x] Benchmarks (outputs NaN-free + deterministic, verified via logits
       fingerprints 2026-10-27): 136 tok/s single-seq decode (llama.cpp: 209,
-      gap 1.54x), ITL 7.34 ms; 417 tok/s batch M=8 (predates the 2026-10-27
-      correctness fixes -- re-measure before relying on it)
+      gap 1.54x), ITL 7.34 ms. Batch decode is NOT verified -- three
+      distinct bugs found by the 2026-10-27 bench-batch re-measure (see
+      open work); old 417/600 batch claims retracted
 - [x] Decode correctness (2026-10-27): fixed sm120 fused-silu format mismatch
       (fed native 36-u32 weights to a repacked-42-u32 kernel -> all-NaN logits
       since introduction; every prior bench computed garbage at full speed) and
@@ -332,7 +333,7 @@ Qwen3.6-27B weights** — see open work.
       gated on k_blocks % 8 == 0). bench-real-model prints a NaN-tolerant
       logits fingerprint; TEMPURA_DEBUG_NAN=1 gives per-op NaN bisection;
       TEMPURA_NO_SM120_KPAR / TEMPURA_NO_SM120_Q6K / TEMPURA_NO_OXIDE_ATTN /
-      TEMPURA_NO_DUAL_BLOCK are kernel-path bisect switches
+      TEMPURA_NO_DUAL_BLOCK / TEMPURA_NO_MXFP4 are kernel-path bisect switches
 
 **Decoding strategies**: speculative (target+draft), Medusa multi-token,
 guided (json/json_schema), sampler chain (temperature/top-k/top-p/min-p/
@@ -340,6 +341,32 @@ typical-p/repeat/presence/frequency)
 
 ## Open work (verified gaps — do not assume these are done)
 
+- [ ] Batch decode correctness (found 2026-10-27 by the bench-batch
+      re-measure; three distinct bugs + one suspect, none fixed yet):
+      (a) q6k sm120_mbar down-proj kernel (k_blocks=56) is nondeterministic
+          at M>=5 -- the fresh-cache replay fingerprint mismatches.
+          TEMPURA_NO_SM120_Q6K=1 (dp4a fallback, ~20% slower) flips M=5/8/16
+          to verified. Same cp.async-visibility family as the fixed q6k
+          k_blocks%8 race, but this one survives in the mbar variant.
+      (b) MXFP4 batch path produces all-NaN logits at M=4 ONLY (48 of 244
+          step-requests; all requests get IDENTICAL wrong values; divergence
+          starts at the prefill/capture step; outcomes are bitwise-stable per
+          allocation pattern, i.e. the kernel reads allocation-dependent
+          memory). Prime suspect: the m16k32 tile-max UE8M0 activation scale
+          spans all 16 m-rows of the tile including the 12 stale rows above
+          m=4 (see quantize_activation_to_mxfp4_tiled and the GPU twin).
+          TEMPURA_NO_MXFP4=1 dodges it.
+      (c) M=1 non-graph batch fallback (forward_batch_decode with m=1) is
+          broken: 16 tok/s and nondeterministic NaNs -- use the single-seq
+          forward() path (verified 136 tok/s) instead.
+      (d) suspected: cuTile flash-attn inside the batch graph takes kv_len as
+          a host launch arg, baked at capture and replayed stale (det=OK but
+          all-NaN under TEMPURA_NO_OXIDE_ATTN=1) -- needs device-scalar
+          indirection like the kpar attention kernel.
+      bench-batch verifies: NaN scan every step, final-step + per-request
+      fingerprints, full fresh-cache replay must match bitwise
+      (TEMPURA_BENCH_STEP_FP=1 / TEMPURA_BENCH_ONLY_M=N for divergence
+      hunting).
 - [ ] Close the 1.54× single-sequence GPU decode gap vs llama.cpp
       (136 vs 209 tok/s, outputs verified NaN-free 2026-10-27). Known levers:
       port the sm120 fused gate+up+SiLU kernel to native 36-u32 format
@@ -459,8 +486,19 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
 - Llama-3.1-8B Q4K single-sequence: **136 tok/s decode** (1.54x gap vs
       llama.cpp 209 tok/s; outputs verified NaN-free + deterministic,
       2026-10-27; split-K flash decode + dual-block GEMV + correctness fixes)
-- Llama-3.1-8B Q4K batch M=8: **417 tok/s** aggregate (3.5ms ITL/seq)
-- Llama-3.1-8B Q4K batch M=16: ~600 tok/s aggregate
+- Llama-3.1-8B Q4K batch decode (2026-10-27 re-measure; bench-batch now scans
+      every step for NaNs, fingerprints the final step, and replays the full
+      schedule on fresh caches -- numbers count as verified only when the
+      replay is bitwise identical):
+      - default config: NO batch size verified (M=4 all-NaN, M>=5
+        nondeterministic); M=8 293, M=16 452 tok/s -- real speed, suspect
+        outputs
+      - TEMPURA_NO_SM120_Q6K=1 + TEMPURA_NO_MXFP4=1 (both bugs dodged):
+        **M=2 134, M=4 215, M=5 246, M=8 312, M=16 398 tok/s -- verified
+        NaN-free + deterministic**
+      - the pre-2026-10-27 claims of 417 (M=8) / ~600 (M=16) tok/s are
+        retracted: they were measured with the fused-silu all-NaN bug
+        computing garbage at full speed
 - MXFP4 M=64: 55.6 TFLOPS
 
 If you see `Symbol cuda_device__mma_sync__... not found`, the backend is stale.
