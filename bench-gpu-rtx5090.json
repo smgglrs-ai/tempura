@@ -19,10 +19,11 @@
    "format": "Q4K+Q6K",
    "vram_mb": 17000,
    "decode_tok_s": 134,
-   "prefill_tok_s": 7,
+   "prefill_tok_s": 394,
    "itl_p50_ms": 7.44,
-   "gap_vs_llamacpp": "1.56x",
-   "kernel": "single-seq: q4k_gemv_sm120_dp4a_kpar8_dual_block + splitk decode attention (S=16, PTX 42587B) + q6k_gemv_dp4a_kpar8 (sm120 mbar variant DEFAULT OFF, history-dependent outputs). batch M>=2: generalized M-row q6k_gemv_sm120_batch + MXFP4 tensor-core Q/K/O/gate/up with m_valid-masked activation quant. Outputs VERIFIED post-fix (2026-10-27): NaN-free + deterministic, fresh-cache replay bitwise identical, no bisect switches"
+   "ttft_p50_ms": 323.8,
+   "gap_vs_llamacpp": "decode 1.56x, prefill 18.6x",
+   "kernel": "single-seq: q4k_gemv_sm120_dp4a_kpar8_dual_block + splitk decode attention (S=16, PTX 42587B) + q6k_gemv_dp4a_kpar8 (sm120 mbar variant DEFAULT OFF, history-dependent outputs). batch M>=2: generalized M-row q6k_gemv_sm120_batch + MXFP4 tensor-core Q/K/O/gate/up with m_valid-masked activation quant. prefill m>1: MXFP4 GEMM in 16-row chunks (MxfpGemm::forward_offset) + q6k sm120 batch chunked via capped_batch_chunks (Q6K down_proj; Q4_K_M mixes down between Q4K/MXFP4-tiled and Q6K per layer). Outputs VERIFIED post-fix (2026-10-27): decode NaN-free + deterministic, batch + prefill fresh-session replay bitwise identical, no bisect switches"
   }
  ],
  "llamacpp_reference": {
@@ -62,7 +63,7 @@
    "gemv": "dp4a kpar8 dual-block unroll added (2x MLP/warp, bitwise-equal by construction); still latency-bound around 40% DRAM during decode (nvidia-smi dmon: sm 99-100%, mem 36-46%)",
    "attention": "split-K flash decode (grid n_heads x 16) replaces one-block-per-head (19% SM util); long-context decode at kv~2700 drops to ~79 tok/s (attention reads ~1MB/token per kv_len -- GQA 4x re-read)",
    "fused_silu_disabled": "gate+up+SiLU fused kernel bypassed (format mismatch) -- separate GEMVs + silu_mul cost ~2-4% vs the broken fused path; porting to native 36-u32 format is the known lever",
-   "prefill": "7 tok/s pp128 (~1100x gap) -- host-bound (CPU 97%, GPU 8%), GPU nearly idle; separate issue",
+   "prefill": "394 tok/s pp128 (18.6x gap) after the m>1 GPU fast path (2026-10-27; was 7 tok/s host-bound). Remaining: host-staged attention (Q download + host-mirror KV + re-upload per layer) and m=16 GEMM chunking pending the cutlass-mlir codegen fix",
    "splitk_result": "125 -> 134 tok/s (ITL 7.98 -> 7.44ms) post-fix verified (pre-(e)/(f) runs measured 136 with the wrong FFN)"
   }
  },
