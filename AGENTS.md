@@ -322,8 +322,9 @@ Qwen3.6-27B weights** — see open work.
       at M=64
 - [x] Benchmarks (2026-10-27, post-fix, RTX 5090, bench-batch all-M
       verified with NO bisect switches — NaN-free + fresh-cache replay
-      bitwise): single-seq M=1 135 tok/s; batch M=2 93, M=4 164, M=5 190,
-      M=8 259, M=16 374 tok/s (llama.cpp single-seq reference: 209).
+      bitwise): single-seq 134 tok/s decode, ITL 7.44 ms (bench-real-model);
+      batch M=1 135, M=2 93, M=4 164, M=5 190, M=8 259, M=16 374 tok/s
+      (llama.cpp single-seq reference: 209).
       All fingerprints are post-fix values: pre-fix outputs were computed
       with frozen-position RoPE and the wrong FFN (see open work) — old
       numbers retracted, these are the first fully-verified batch numbers.
@@ -428,12 +429,11 @@ typical-p/repeat/presence/frequency)
       the double-buffer swap on sm_120 (bar.sync after wait_group is the
       canonical pattern but insufficient here); needs a memory-model
       audit or an mbarrier-based rewrite.
-- [ ] Close the 1.54× single-sequence GPU decode gap vs llama.cpp
-      (136 vs 209 tok/s pre-fix; re-measure after the rope + FFN fixes).
-      Known levers: port the sm120 fused gate+up+SiLU kernel to native
-      36-u32 format (currently bypassed by the format gate), GEMV still
-      ~40% DRAM (dmon: sm 99-100%, mem 36-46%), host-side per-token
-      overhead
+- [ ] Close the 1.56× single-sequence GPU decode gap vs llama.cpp
+      (134 vs 209 tok/s, post-fix, verified). Known levers: port the
+      sm120 fused gate+up+SiLU kernel to native 36-u32 format (currently
+      bypassed by the format gate), GEMV still ~40% DRAM (dmon: sm
+      99-100%, mem 36-46%), host-side per-token overhead
 - [ ] Prefill on GPU is host-bound: 6 tok/s pp128 vs llama.cpp 7335
       (1152x gap, GPU nearly idle through it)
 - [ ] Validate hybrid DeltaNet pipeline against real Qwen3.6 / Bonsai 2
