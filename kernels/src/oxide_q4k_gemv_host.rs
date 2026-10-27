@@ -488,19 +488,12 @@ impl OxideQ4kGemv {
                 }
             }
             let kpar_dispatch = KernelVariant::select_best(&kpar_variants, &caps).cloned();
-            // v4 uses native 36-u32 GGUF format in the v4 kernel itself, but the production
-            // engine uses `dispatch_kv_on_stream` for K/V projections which calls the BASIC f32
-            // GEMV kernel -- that reads repacked 42-u32 format. If we set uses_raw_gguf=true,
-            // K/V weights would be in native format but the basic f32 GEMV reads them as
-            // repacked -> wrong values -> NaN -> error 719 in graph replay.
-            //
-            // TEMPORARY WORKAROUND: Keep uses_raw_gguf=false (repacked format) until the engine
-            // properly handles native format for all dispatch paths (including dispatch_kv_on_stream).
-            // sm120 kpar ALSO accepts repacked 42-u32 by adjusting its parameter layout.
-            // The sm_120 codegen benefit is retained; the 14% DRAM reduction requires further work.
-            //
-            // TODO: once engine uses per-slot output tensors for K/V, enable native format
-            // by setting uses_raw_gguf = uses_sm120 and updating dispatch_kv_on_stream to use sm120 path.
+            // When an sm_120 kpar variant is selected, ALL Q4K weights upload in
+            // native 36-u32 GGUF format (144 bytes/block -- 14% fewer DRAM reads
+            // than the repacked 42-u32 format): the sm120 kpar kernel, the sm120
+            // K/V dispatch (submit_sm120_kpar_kv_into_slot via dispatch_kv_on_stream)
+            // and the sm120 fused-silu path all read native format directly.
+            // Non-sm120 dispatch (dp4a_kpar8) requires the repacked 42-u32 format.
             let uses_sm120 = kpar_dispatch.as_ref().map(|v| v.min_cc >= 1200).unwrap_or(false);
 
             eprintln!(
