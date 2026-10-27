@@ -445,11 +445,26 @@ fn main() {
     {
         let nibble_one: u8 = 0x2;
         let scale_one: u8 = 0x7F;
+        // Shape table accumulated across bisection runs (RTX 5090, cutlass
+        // 4.7.0, backend 225756b63): faults trigger on TOTAL BLOCK COUNT
+        // (gridX * gridY), not on m, gridY, or the k-loop alone --
+        //   (16..96, 4096, .) gridX=128, gridY<=6  (<=768 blocks): PASS
+        //   (112, 4096, 64)   gridX=128, gridY=7   ( 896 blocks): FAULT
+        //   (128, 16|512, 64) gridX<=64, gridY=8   (<=512 blocks): PASS
+        //   (128, 4096, .)    gridX=128, gridY=8   (1024 blocks): FAULT
+        // The MLIR handed to libCutlassCompiler is clean (64-bit GEP
+        // addressing, correct sreg reads), so the miscompilation is in the
+        // compiler's cute.kernel partitioning pass.
         for &(m, n, k) in [
-            (112u32, 4096u32, 64u32),
-            (128u32, 4088u32, 64u32),
-            (128u32, 4104u32, 64u32),
-            (128u32, 4096u32, 64u32),
+            (16u32, 4096u32, 4096u32),
+            (32, 4096, 4096),
+            (64, 4096, 64),
+            (96, 4096, 64),
+            (128, 16, 64),
+            (128, 512, 64),
+            (112, 4096, 64),
+            (128, 4096, 64),
+            (128, 4096, 4096),
         ]
         .iter()
         {
