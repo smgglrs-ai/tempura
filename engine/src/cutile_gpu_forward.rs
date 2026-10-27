@@ -56,10 +56,17 @@ use crate::weights::QuantizedWeights;
 /// scatter-write kernel reads `d_kv_write_offset`, and the RoPE row gather
 /// reads `d_positions` -- so no graph node parameters ever need patching and
 /// no `cuGraphExecUpdate_v2` is required.
+///
+/// KV-cache device pointers are baked at capture and validated on every
+/// replay: a different cache object (new session, fresh-cache bench pass)
+/// invalidates the graph and forces a re-capture.
 struct DecodeGraph {
     cu_exec: cuda_core::sys::CUgraphExec,
     cu_graph: cuda_core::sys::CUgraph, // kept alive; node handles reference it
     device: Arc<cuda_core::Device>,
+    /// KV-cache device pointers captured at graph creation, per layer.
+    captured_k_ptrs: Vec<u64>,
+    captured_v_ptrs: Vec<u64>,
 }
 
 impl Drop for DecodeGraph {
@@ -3946,6 +3953,24 @@ impl CutileGpuModel {
             return self.download_device_tensor(&logits_arc);
         }
 
+        // Validate KV-cache device pointers before replay: a different cache
+        // object (new session, fresh-cache bench verification pass) must
+        // re-capture -- the graph bakes the cache pointers at capture time.
+        {
+            let kv_ptrs_stale = match *graph_cache {
+                Some(ref dg) => (0..cfg.num_layers).any(|l| {
+                    let (k, v) = gpu_kv_cache.kv_device_tensors(l);
+                    k.device_pointer().cu_deviceptr() != dg.captured_k_ptrs[l]
+                        || v.device_pointer().cu_deviceptr() != dg.captured_v_ptrs[l]
+                }),
+                None => false,
+            };
+            if kv_ptrs_stale {
+                eprintln!("[cuda_graph] KV cache ptrs changed -- re-capturing");
+                *graph_cache = None;
+            }
+        }
+
         if let Some(ref decode_graph) = *graph_cache {
             // -- Subsequent steps: plain replay ---------------------------------
             // KV writes are handled by the scatter-write kernel inside the graph
@@ -3983,11 +4008,21 @@ impl CutileGpuModel {
             }
             let cu_exec = unsafe { cu_exec_uninit.assume_init() };
 
+            // Record the KV-cache device pointers this graph was captured with.
+            let captured_k_ptrs: Vec<u64> = (0..cfg.num_layers)
+                .map(|l| gpu_kv_cache.kv_device_tensors(l).0.device_pointer().cu_deviceptr())
+                .collect();
+            let captured_v_ptrs: Vec<u64> = (0..cfg.num_layers)
+                .map(|l| gpu_kv_cache.kv_device_tensors(l).1.device_pointer().cu_deviceptr())
+                .collect();
+
             // cu_graph is kept alive inside DecodeGraph so node handles remain valid.
             *graph_cache = Some(DecodeGraph {
                 cu_exec,
                 cu_graph,
                 device: stream.device().clone(),
+                captured_k_ptrs,
+                captured_v_ptrs,
             });
 
             unsafe { cuda_core::sys::cuGraphLaunch(cu_exec, cu_stream); }
