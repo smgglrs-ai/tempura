@@ -4478,6 +4478,10 @@ impl CutileGpuModel {
             } else {
                 let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE);
                 let up_dev = self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
+                if self.debug_nan_trace {
+                    self.nan_report(&format!("L{layer} gate-dev"), &gate_dev);
+                    self.nan_report(&format!("L{layer} up-dev"), &up_dev);
+                }
                 self.cutile_elementwise
                     .silu_mul_device_scratch(
                         &gate_dev,
