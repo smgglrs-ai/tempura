@@ -192,72 +192,98 @@ impl OxideQ6kGemv {
         };
 
         // -- Try sm_120 cp.async mbar PTX (not feature-gated, any sm_120 GPU) ------
-            // Requires Blackwell GPU (cc >= 1200). Falls back to cu_function_kpar on older GPUs.
-            let sm120_disabled = std::env::var("TEMPURA_NO_SM120_Q6K")
-                .map(|v| v == "1")
-                .unwrap_or(false);
+        // Requires Blackwell GPU (cc >= 1200). Falls back to cu_function_kpar on
+        // older GPUs.
+        //
+        // DEFAULT OFF since 2026-10-27: the mbar GEMV's outputs are
+        // allocation/kernel-history dependent (bench-batch M=1 fresh-cache replay:
+        // bitwise-identical inputs -> ULP-level output drift, first diverging op
+        // L0 down-proj with every other op matching; TEMPURA_NO_SM120_Q6K=1
+        // flips the full matrix to verified). The bar.sync-after-wait_group fix
+        // was insufficient -- a residual cp.async visibility hole survives in
+        // this variant. Opt back in with TEMPURA_ALLOW_SM120_Q6K=1 after
+        // root-causing (suspect: async-proxy -> generic-proxy ordering of the
+        // double-buffer swap on sm_120).
+        let sm120_force_off = std::env::var("TEMPURA_NO_SM120_Q6K")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let sm120_opt_in = std::env::var("TEMPURA_ALLOW_SM120_Q6K")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let sm120_disabled = sm120_force_off || !sm120_opt_in;
 
-            let (cu_sm120_module, cu_function_sm120_mbar) = if !sm120_disabled {
-                let caps = crate::gpu_capabilities::GpuCapabilities::query(
-                    stream.device().cu_device()
-                );
-                if caps.cc() >= crate::q6k_gemv_v4_ptx::MIN_CC {
-                    let ptx_cstr = CString::new(crate::q6k_gemv_v4_ptx::PTX)
-                        .unwrap_or_default();
-                    let mut sm120_mod = std::mem::MaybeUninit::uninit();
-                    let rc = unsafe {
-                        cuda_core::sys::cuModuleLoadData(
-                            sm120_mod.as_mut_ptr(),
-                            ptx_cstr.as_ptr() as *const _,
-                        )
-                    };
-                    if rc == CUDA_SUCCESS {
-                        let sm120_mod = unsafe { sm120_mod.assume_init() };
-                        let entry_cstr = CString::new(crate::q6k_gemv_v4_ptx::ENTRY)
-                            .unwrap_or_default();
-                        let mut fn_out = std::mem::MaybeUninit::uninit();
-                        let rc2 = unsafe {
-                            cuda_core::sys::cuModuleGetFunction(
-                                fn_out.as_mut_ptr(),
-                                sm120_mod,
-                                entry_cstr.as_ptr(),
-                            )
-                        };
-                        if rc2 == CUDA_SUCCESS {
-                            eprintln!(
-                                "oxide-gemv-q6k: loaded sm120_mbar variant \
-                                 (entry={}, cc={})",
-                                crate::q6k_gemv_v4_ptx::ENTRY,
-                                caps.cc(),
-                            );
-                            (Some(sm120_mod), Some(unsafe { fn_out.assume_init() }))
-                        } else {
-                            eprintln!(
-                                "oxide-gemv-q6k: cuModuleGetFunction(sm120_mbar) \
-                                 failed (rc={rc2}); using kpar8 baseline"
-                            );
-                            let _ = unsafe { cuda_core::sys::cuModuleUnload(sm120_mod) };
-                            (None, None)
-                        }
-                    } else {
-                        eprintln!(
-                            "oxide-gemv-q6k: cuModuleLoadData(sm120 PTX) \
-                             failed (rc={rc}); using kpar8 baseline"
-                        );
-                        (None, None)
-                    }
+        let sm120_cc = {
+            let caps = crate::gpu_capabilities::GpuCapabilities::query(
+                stream.device().cu_device()
+            );
+            caps.cc()
+        };
+        let sm120_cc_ok = sm120_cc >= crate::q6k_gemv_v4_ptx::MIN_CC;
+
+        let (cu_sm120_module, cu_function_sm120_mbar) = if !sm120_disabled && sm120_cc_ok {
+            let ptx_cstr = CString::new(crate::q6k_gemv_v4_ptx::PTX)
+                .unwrap_or_default();
+            let mut sm120_mod = std::mem::MaybeUninit::uninit();
+            let rc = unsafe {
+                cuda_core::sys::cuModuleLoadData(
+                    sm120_mod.as_mut_ptr(),
+                    ptx_cstr.as_ptr() as *const _,
+                )
+            };
+            if rc == CUDA_SUCCESS {
+                let sm120_mod = unsafe { sm120_mod.assume_init() };
+                let entry_cstr = CString::new(crate::q6k_gemv_v4_ptx::ENTRY)
+                    .unwrap_or_default();
+                let mut fn_out = std::mem::MaybeUninit::uninit();
+                let rc2 = unsafe {
+                    cuda_core::sys::cuModuleGetFunction(
+                        fn_out.as_mut_ptr(),
+                        sm120_mod,
+                        entry_cstr.as_ptr(),
+                    )
+                };
+                if rc2 == CUDA_SUCCESS {
+                    eprintln!(
+                        "oxide-gemv-q6k: loaded sm120_mbar variant \
+                         (entry={}, cc={sm120_cc})",
+                        crate::q6k_gemv_v4_ptx::ENTRY,
+                    );
+                    (Some(sm120_mod), Some(unsafe { fn_out.assume_init() }))
                 } else {
+                    eprintln!(
+                        "oxide-gemv-q6k: cuModuleGetFunction(sm120_mbar) \
+                         failed (rc={rc2}); using kpar8 baseline"
+                    );
+                    let _ = unsafe { cuda_core::sys::cuModuleUnload(sm120_mod) };
                     (None, None)
                 }
             } else {
-                eprintln!("oxide-gemv-q6k: TEMPURA_NO_SM120_Q6K=1, skipping sm120_mbar");
+                eprintln!(
+                    "oxide-gemv-q6k: cuModuleLoadData(sm120 PTX) \
+                     failed (rc={rc}); using kpar8 baseline"
+                );
                 (None, None)
-            };
+            }
+        } else if sm120_disabled && !sm120_force_off {
+            eprintln!(
+                "oxide-gemv-q6k: sm120_mbar DISABLED BY DEFAULT \
+                 (history-dependent outputs; see comment); \
+                 opt in with TEMPURA_ALLOW_SM120_Q6K=1"
+            );
+            (None, None)
+        } else if sm120_force_off {
+            eprintln!("oxide-gemv-q6k: TEMPURA_NO_SM120_Q6K=1, skipping sm120_mbar");
+            (None, None)
+        } else {
+            (None, None)
+        };
 
         // -- Try sm_120 batch PTX (q6k_gemv_sm120_batch, M rows 2..=16) ----------
+        // Loads independently of the mbar GEMV above: the batch kernel is a
+        // different code path (two-phase, verified by bench-batch replay) and
+        // must stay available even when the racy mbar GEMV is disabled.
         let (cu_sm120_batch_module, cu_function_sm120_batch) =
-            if cu_sm120_module.is_some() {
-                // cc is already >= 1200 (sm120_mbar was loaded), reuse the check.
+            if !sm120_force_off && sm120_cc_ok {
                 let ptx_cstr = CString::new(crate::q6k_batch_sm120_ptx::PTX)
                     .unwrap_or_default();
                 let mut batch_mod = std::mem::MaybeUninit::uninit();

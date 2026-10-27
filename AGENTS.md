@@ -411,6 +411,19 @@ typical-p/repeat/presence/frequency)
           mirroring the KV-stream slot path); pool misses fall back to
           the fresh-output oxide f32 GEMV. Every pre-fix single-seq
           output was computed with the wrong FFN.
+- [ ] q6k_gemv_sm120_mbar_kpar8 (single-seq Q6K GEMV): outputs are
+      allocation/kernel-history dependent. CONFIRMED 2026-10-27 (was
+      "suspected" in the original batch re-measure): with every other fix
+      in place, the M=1 fresh-cache replay diverges at L0 down-proj with
+      BITWISE-IDENTICAL inputs (gate-silu matched) -- ULP-level output
+      drift only. TEMPURA_NO_SM120_Q6K=1 (dp4a kpar8) flips the entire
+      batch matrix to verified. The mbar variant is now DEFAULT OFF
+      (opt in with TEMPURA_ALLOW_SM120_Q6K=1); the sm120 BATCH kernel is
+      unaffected (different code path, replay-verified) and loads
+      independently. Suspect: async-proxy -> generic-proxy ordering of
+      the double-buffer swap on sm_120 (bar.sync after wait_group is the
+      canonical pattern but insufficient here); needs a memory-model
+      audit or an mbarrier-based rewrite.
 - [ ] Close the 1.54× single-sequence GPU decode gap vs llama.cpp
       (136 vs 209 tok/s pre-fix; re-measure after the rope + FFN fixes).
       Known levers: port the sm120 fused gate+up+SiLU kernel to native
