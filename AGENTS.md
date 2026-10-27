@@ -411,7 +411,7 @@ typical-p/repeat/presence/frequency)
       det=MISMATCH hunt. Three facts pinned by the standalone shape
       bisection (tools/mxf4-gemv, RTX 5090): (a) the fault triggers on
       TOTAL BLOCK COUNT (gridX*gridY) -- gridX=128 gridY<=6 (768 blocks)
-      passes, gridY=7 (896) faults, gridY=8 at gridX<=64 (512 blocks) passes
+      passes, gridY=7 (896) faults, gridY=8 at gridX=16 (128 blocks) passes
       -- NOT on m, gridY, or k-loop trip count alone; (b) the original
       persistent tile-walk variant additionally lost ~half its output tiles
       via loop-carry miscompilation once a warp iterated (m >= 32); (c) the
