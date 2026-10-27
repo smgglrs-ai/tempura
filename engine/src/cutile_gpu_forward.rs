@@ -1452,6 +1452,18 @@ impl CutileGpuModel {
         // lm_head  [vocab, h] -- typically not Q4_K/Q2_0; keep dequantized path.
         Self::maybe_upload(&matmul, &mut dw, qw, "lm_head.weight", vocab, h)?;
 
+        // TEMPURA_NO_MXFP4=1 skips MXFP4 tiling of the Q4K/BF16 projections so
+        // the batch decode graph dispatches the original Q4K/Q6K GEMV kernels
+        // instead of the MXFP4 tensor-core path -- numerical bisect switch for
+        // the batch pipeline (TEMPURA_NO_OXIDE_ATTN pattern). The tiled map
+        // stays empty and every dispatch site falls back naturally.
+        let mxfp4_tiling_disabled = std::env::var("TEMPURA_NO_MXFP4")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if mxfp4_tiling_disabled {
+            eprintln!("[mxfp4] tiled upload disabled (TEMPURA_NO_MXFP4=1)");
+        }
+
         for layer in 0..config.num_layers {
             let p = format!("model.layers.{layer}");
 
@@ -1498,28 +1510,30 @@ impl CutileGpuModel {
 
             // MXFP4 tiled upload: dequant Q4K -> f32 -> MXFP4 tiled format for sm_120a.
             // Best-effort; silently skips if shape is incompatible or Q4K data absent.
-            for (wname, n_dim, k_dim) in [
-                (format!("{p}.self_attn.q_proj.weight"),    q_dim, h),
-                (format!("{p}.self_attn.k_proj.weight"),    kv_dim, h),
-                (format!("{p}.self_attn.v_proj.weight"),    kv_dim, h),
-                (format!("{p}.self_attn.o_proj.weight"),    h,      q_dim),
-                (format!("{p}.mlp.gate_proj.weight"),       inter,  h),
-                (format!("{p}.mlp.up_proj.weight"),         inter,  h),
-                (format!("{p}.mlp.down_proj.weight"),       h,      inter),
-            ] {
-                // Try Q4K first (quantized GGUF), then BF16 (full-precision GGUF).
-                // Only one will succeed; the other returns false without touching GPU state.
-                let q4k_ok = match Self::maybe_upload_mxfp4_tiled_from_q4k(
-                    matmul.stream(), &mut dw_mxfp4_tiled, qw, &wname, n_dim, k_dim,
-                ) {
-                    Ok(ok) => ok,
-                    Err(e) => { eprintln!("[mxfp4] tiled q4k {wname}: {e}"); false }
-                };
-                if !q4k_ok {
-                    if let Err(e) = Self::maybe_upload_mxfp4_tiled_from_bf16(
+            if !mxfp4_tiling_disabled {
+                for (wname, n_dim, k_dim) in [
+                    (format!("{p}.self_attn.q_proj.weight"),    q_dim, h),
+                    (format!("{p}.self_attn.k_proj.weight"),    kv_dim, h),
+                    (format!("{p}.self_attn.v_proj.weight"),    kv_dim, h),
+                    (format!("{p}.self_attn.o_proj.weight"),    h,      q_dim),
+                    (format!("{p}.mlp.gate_proj.weight"),       inter,  h),
+                    (format!("{p}.mlp.up_proj.weight"),         inter,  h),
+                    (format!("{p}.mlp.down_proj.weight"),       h,      inter),
+                ] {
+                    // Try Q4K first (quantized GGUF), then BF16 (full-precision GGUF).
+                    // Only one will succeed; the other returns false without touching GPU state.
+                    let q4k_ok = match Self::maybe_upload_mxfp4_tiled_from_q4k(
                         matmul.stream(), &mut dw_mxfp4_tiled, qw, &wname, n_dim, k_dim,
                     ) {
-                        eprintln!("[mxfp4] tiled bf16 {wname}: {e}");
+                        Ok(ok) => ok,
+                        Err(e) => { eprintln!("[mxfp4] tiled q4k {wname}: {e}"); false }
+                    };
+                    if !q4k_ok {
+                        if let Err(e) = Self::maybe_upload_mxfp4_tiled_from_bf16(
+                            matmul.stream(), &mut dw_mxfp4_tiled, qw, &wname, n_dim, k_dim,
+                        ) {
+                            eprintln!("[mxfp4] tiled bf16 {wname}: {e}");
+                        }
                     }
                 }
             }
