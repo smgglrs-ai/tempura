@@ -3992,11 +3992,14 @@ impl CutileGpuModel {
         }
 
         // -- Prefill (m > 1): GPU fast paths, then host-dequant fallback ------
+        // Q6K weights go through the q6k batch GEMV FIRST (matching the batch-
+        // decode dispatch, which keeps down_proj at Q6K precision); tiled Q4K
+        // projections then take the MXFP4 tensor-core path.
         if m > 1 && std::env::var("TEMPURA_NO_GPU_PREFILL").as_deref() != Ok("1") {
-            if let Some(out) = self.gemm_mxfp4_prefill(a, weight_name, m, slot) {
+            if let Some(out) = self.gemm_q6k_prefill_batch(a, weight_name, m, slot) {
                 return out;
             }
-            if let Some(out) = self.gemm_q6k_prefill_batch(a, weight_name, m, slot) {
+            if let Some(out) = self.gemm_mxfp4_prefill(a, weight_name, m, slot) {
                 return out;
             }
         }
