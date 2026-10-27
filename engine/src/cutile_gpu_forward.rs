@@ -329,6 +329,10 @@ pub struct CutileGpuModel {
     /// replay of the graph's lifetime. `None` when the split-K pair is absent
     /// from the PTX (falls back to kpar) or allocation failed.
     attn_splitk_scratch: Option<Arc<Tensor<f32>>>,
+    /// TEMPURA_DEBUG_NAN=1: run decode steps WITHOUT CUDA graph capture and
+    /// D2H-check every intermediate tensor, eprinting the first op that
+    /// produces NaN (numerical bisection of the decode pipeline).
+    debug_nan_trace: bool,
     /// Hand-optimized oxide Q4_K GEMV kernel (replaces cuTile for M=1 decode).
     oxide_q4k_gemv: Option<OxideQ4kGemv>,
     /// Hand-optimized oxide Q6_K GEMV kernel (replaces cuTile for M=1 decode).
@@ -1583,6 +1587,7 @@ impl CutileGpuModel {
                         .expect("splitk attn scratch: device allocation failed"),
                 )
             });
+        let debug_nan_trace = std::env::var("TEMPURA_DEBUG_NAN").is_ok();
         let kv_scatter_write = KvScatterWrite::new()
             .expect("KvScatterWrite: failed to load scatter-write PTX kernel");
 
@@ -1765,6 +1770,7 @@ impl CutileGpuModel {
             oxide_q2_gemv,
             oxide_decode_attn,
             attn_splitk_scratch,
+            debug_nan_trace,
             oxide_q4k_gemv,
             oxide_q6k_gemv,
             flash_attn,
@@ -1932,6 +1938,7 @@ impl CutileGpuModel {
                         .expect("splitk attn scratch: device allocation failed"),
                 )
             });
+        let debug_nan_trace = std::env::var("TEMPURA_DEBUG_NAN").is_ok();
         let kv_scatter_write = KvScatterWrite::new()
             .expect("KvScatterWrite: failed to load scatter-write PTX kernel");
 
@@ -2047,6 +2054,7 @@ impl CutileGpuModel {
             oxide_q2_gemv,
             oxide_decode_attn,
             attn_splitk_scratch,
+            debug_nan_trace,
             oxide_q4k_gemv,
             oxide_q6k_gemv,
             flash_attn,
@@ -3890,6 +3898,23 @@ impl CutileGpuModel {
 
         let mut graph_cache = self.cached_decode_graph.borrow_mut();
 
+        if self.debug_nan_trace {
+            // Numerical bisection mode: execute the step WITHOUT graph capture
+            // so per-op D2H NaN checks inside forward_decode_inner are legal
+            // (async D2H during stream capture is not).
+            drop(graph_cache);
+            let hidden_dev = self.d_embed.clone();
+            self.forward_decode_inner(hidden_dev, positions, gpu_kv_cache);
+            unsafe { stream.synchronize().expect("nan-trace stream sync failed"); }
+            let logits_arc = self
+                .scratch
+                .borrow()
+                [SLOT_LOGITS]
+                .clone()
+                .expect("SLOT_LOGITS empty after nan-trace step");
+            return self.download_device_tensor(&logits_arc);
+        }
+
         if let Some(ref decode_graph) = *graph_cache {
             // -- Subsequent steps: update kernel scalars, then launch ----------
             // KV writes are handled by the scatter-write kernel inside the graph
@@ -4092,6 +4117,18 @@ impl CutileGpuModel {
         self.download_device_tensor(&logits_arc)
     }
 
+    /// TEMPURA_DEBUG_NAN helper: D2H a tensor and eprintln a NaN report.
+    /// Only called when `debug_nan_trace` is set (never during graph capture).
+    fn nan_report(&self, label: &str, t: &Arc<Tensor<f32>>) {
+        let stream = self.matmul.stream();
+        let v = t.to_host_vec().sync_on(stream).expect("nan-trace download");
+        let n = v.iter().filter(|x| x.is_nan()).count();
+        if n > 0 {
+            let first = v.iter().position(|x| x.is_nan()).unwrap_or(0);
+            eprintln!("[nan-trace] {label}: {n}/{} NaN (first at idx {first})", v.len());
+        }
+    }
+
     /// Inner decode forward pass: layer loop + final norm + lm_head.
     ///
     /// `hidden_dev` is the pre-uploaded `[h_pad]` embedding tensor.  It may be
@@ -4174,6 +4211,10 @@ impl CutileGpuModel {
                     &mut self.pre_attn_norm_scratch.borrow_mut(),
                 )
                 .expect("pre-attention RMSNorm failed");
+            if self.debug_nan_trace {
+                self.nan_report(&format!("L{layer} input-hidden"), &hidden_dev);
+                self.nan_report(&format!("L{layer} pre-attn-norm"), &normed_dev);
+            }
 
             // Q / K / V projections (GPU, pre-allocated slots).
             //
@@ -4309,6 +4350,10 @@ impl CutileGpuModel {
 
             // Pad [q_dim] -> [1, q_pad] for O-projection (zero-copy reshape when equal).
             let attn_padded_dev = self.attn_out_to_oproj_device(&attn_out_dev, q_dim, self.q_pad);
+            if self.debug_nan_trace {
+                self.nan_report(&format!("L{layer} attn-out"), &attn_out_dev);
+                self.nan_report(&format!("L{layer} q-rot"), &q_rot_dev);
+            }
 
             // O-projection (GPU, pre-allocated slot).
             let o_dev = self.gemm_any_d2d_slot(&attn_padded_dev, o_w_name, seq_len, SLOT_O);
@@ -4320,6 +4365,10 @@ impl CutileGpuModel {
                 seq_len * self.h_pad,
                 &mut self.post_attn_add_scratch.borrow_mut(),
             );
+            if self.debug_nan_trace {
+                self.nan_report(&format!("L{layer} o-proj"), &o_dev);
+                self.nan_report(&format!("L{layer} post-attn-hidden"), &hidden_dev);
+            }
 
             // Post-attention RMSNorm (GPU, pre-allocated scratch).
             let post_ln_w_dev = self
@@ -4339,6 +4388,9 @@ impl CutileGpuModel {
                     &mut self.post_attn_norm_scratch.borrow_mut(),
                 )
                 .expect("post-attention RMSNorm failed");
+            if self.debug_nan_trace {
+                self.nan_report(&format!("L{layer} post-attn-norm"), &normed2_dev);
+            }
 
             // FFN gate + up projections.
             // Decode path: try fused gate+up GEMV with inline SiLU (halves activation DRAM).
@@ -4377,6 +4429,9 @@ impl CutileGpuModel {
                     )
                     .expect("SiLU-mul failed")
             };
+            if self.debug_nan_trace {
+                self.nan_report(&format!("L{layer} gate-silu"), &gate_silu_n_dev);
+            }
 
             // FFN down projection.
             // When inter_pad == inter (power-of-2 models) no padding is needed.
@@ -4425,6 +4480,10 @@ impl CutileGpuModel {
                 seq_len * self.h_pad,
                 &mut self.ffn_add_scratch.borrow_mut(),
             );
+            if self.debug_nan_trace {
+                self.nan_report(&format!("L{layer} down-proj"), &down_padded);
+                self.nan_report(&format!("L{layer} post-ffn-hidden"), &hidden_dev);
+            }
         }
 
         // -- Final norm + lm_head ---------------------------------------------
@@ -4447,9 +4506,21 @@ impl CutileGpuModel {
                 &mut self.final_norm_scratch.borrow_mut(),
             )
             .expect("final RMSNorm failed");
+        if self.debug_nan_trace {
+            self.nan_report("final-norm", &last_dev);
+        }
 
         // lm_head GEMV -- result stored in SLOT_LOGITS (pre-allocated).
         self.gemm_d2d_slot(&last_dev, "lm_head.weight", 1, SLOT_LOGITS);
+        if self.debug_nan_trace {
+            let logits_arc = self
+                .scratch
+                .borrow()
+                [SLOT_LOGITS]
+                .clone()
+                .expect("SLOT_LOGITS empty after lm_head");
+            self.nan_report("lm_head", &logits_arc);
+        }
     }
 
     /// before the loop and downloaded once after to extract the last token for
