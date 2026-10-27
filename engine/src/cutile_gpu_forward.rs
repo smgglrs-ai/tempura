@@ -3891,6 +3891,16 @@ impl CutileGpuModel {
         m: usize,
         slot: usize,
     ) -> Option<Arc<Tensor<f32>>> {
+        if self.debug_nan_trace {
+            let dwk = self.device_weights_q6k.get(weight_name).map(|d| (d.k_blocks, d.n));
+            eprintln!(
+                "[nan-trace] q6k-prefill-probe {weight_name}: m={m} a_size={} q6k_map={dwk:?} \
+                 has_batch={:?} expect_a={}",
+                a.size(),
+                self.oxide_q6k_gemv.as_ref().map(|o| o.has_sm120_batch()),
+                dwk.map(|(kb, _)| m * kb * 256).unwrap_or(0)
+            );
+        }
         if m < 2 {
             return None;
         }
