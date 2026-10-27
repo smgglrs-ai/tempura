@@ -405,20 +405,25 @@ typical-p/repeat/presence/frequency)
       host mirror, attn output H->D re-upload -- forward_batched host API),
       KV host-mirror updates sync the stream twice per layer, and the MXFP4
       GEMMs are chunked at m=16 per launch pending the codegen fix below
-- [ ] cutlass-mlir codegen bug (cuda-oxide, upstream): mxf4_batch_gemm_tiled
-      miscompiles at larger grids. Two manifestations found 2026-10-27 via the
-      prefill det=MISMATCH hunt: (a) the original persistent tile-walk
-      (flat index + loop carry) left ~half the output tiles unwritten and
-      stored garbage from mis-carried registers once a warp iterated more
-      than once (m >= 32); (b) even a trivial one-tile-per-warp 2D-grid
-      rewrite makes ILLEGAL memory accesses at m_tiles >= 8 (standalone shape
-      bisection: (16,4096,4096) and (32,4096,4096) pass, (128,4096,64)
-      faults with CUDA error 700; all source-level indexing is exactly
-      in-bounds). Workaround shipped: MxfpGemm::forward_offset chunks prefill
-      GEMMs at m=16 (the bitwise-verified batch-decode configuration; the
-      standalone binary in tools/mxf4-gemv carries the shape-bisection
-      regression tests). Needs an upstream issue + fix; a hand-written-PTX
-      GEMM (like the quant kernel, which is shape-safe) is the local escape.
+- [ ] cutlass-mlir codegen bug (CUDA_OXIDE/cutlass 4.7.0, persists at upstream
+      main 225756b63 + rebuilt backend 2026-10-27): mxf4_batch_gemm_tiled
+      miscompiles at larger grids. Found 2026-10-27 via the prefill
+      det=MISMATCH hunt. Three facts pinned by the standalone shape
+      bisection (tools/mxf4-gemv, RTX 5090): (a) the fault triggers on
+      TOTAL BLOCK COUNT (gridX*gridY) -- gridX=128 gridY<=6 (768 blocks)
+      passes, gridY=7 (896) faults, gridY=8 at gridX<=64 (512 blocks) passes
+      -- NOT on m, gridY, or k-loop trip count alone; (b) the original
+      persistent tile-walk variant additionally lost ~half its output tiles
+      via loop-carry miscompilation once a warp iterated (m >= 32); (c) the
+      MLIR handed to libCutlassCompiler is clean (64-bit GEP addressing,
+      correct sreg reads -- dump via CUDA_OXIDE_MLIR_OUTPUT), so the bug is
+      in the compiler's cute.kernel partitioning pass, downstream of our
+      source. Workaround shipped and verified: MxfpGemm::forward_offset
+      chunks prefill GEMMs at m=16 (gridY=1, the bitwise-verified
+      batch-decode configuration; the standalone binary carries the
+      shape-table regression tests). Needs an upstream issue with the
+      standalone repro; a hand-written-PTX GEMM (like the quant kernel,
+      which is shape-safe) is the local escape.
 - [ ] Validate hybrid DeltaNet pipeline against real Qwen3.6 / Bonsai 2
       weights (last attempt: "architecture incompatible" — diagnostics added,
       commit 9c6362d)
