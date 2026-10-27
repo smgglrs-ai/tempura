@@ -3791,10 +3791,17 @@ impl CutileGpuModel {
             let pb: Vec<u8> = Arc::clone(&packed).to_host_vec().sync_on(stream).expect("dbg packed");
             let sb: Vec<u8> = Arc::clone(&scales).to_host_vec().sync_on(stream).expect("dbg scales");
             let asum: u64 = ab.iter().map(|v| v.to_bits() as u64).sum();
+            let fresh_p = m_pad * k / 2;
+            let fresh_s = (m_pad / 16) * (k / 32);
             let psum: u64 = pb.iter().map(|&b| b as u64).sum();
+            let pfr: u64 = pb[..fresh_p.min(pb.len())].iter().map(|&b| b as u64).sum();
             let ssum: u64 = sb.iter().map(|&b| b as u64).sum();
+            let sfr: u64 = sb[..fresh_s.min(sb.len())].iter().map(|&b| b as u64).sum();
             eprintln!(
-                "[nan-trace] {weight_name} quant: a_sum={asum} packed_sum={psum} scales_sum={ssum} (m={m} k={k})"
+                "[nan-trace] {weight_name} quant: a_sum={asum} packed_fresh={pfr} (len={} fresh={fresh_p}) \
+                 scales_fresh={sfr} (len={} fresh={fresh_s} full={ssum}) (m={m} k={k})",
+                pb.len(),
+                sb.len()
             );
         }
 
@@ -3825,8 +3832,12 @@ impl CutileGpuModel {
             .unwrap_or_else(|e| panic!("mxfp4 prefill gemm {weight_name}: {e}"));
         if self.debug_nan_trace {
             let ob: Vec<f32> = Arc::clone(&out).to_host_vec().sync_on(stream).expect("dbg out");
-            let osum: u64 = ob.iter().map(|v| v.to_bits() as u64).sum();
-            eprintln!("[nan-trace] {weight_name} mxfp4-gemm: out_sum={osum} (m_pad={m_pad} n={n})");
+            let osum: u64 = ob[..(m_pad * n).min(ob.len())].iter().map(|v| v.to_bits() as u64).sum();
+            eprintln!(
+                "[nan-trace] {weight_name} mxfp4-gemm: out_fresh={osum} (len={} m_pad*n={})",
+                ob.len(),
+                m_pad * n
+            );
         }
 
         if m_pad == m {
