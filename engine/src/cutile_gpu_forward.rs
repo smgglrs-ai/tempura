@@ -3855,9 +3855,22 @@ impl CutileGpuModel {
             let osum: u64 = ob[..(m_pad * n).min(ob.len())].iter().map(|v| v.to_bits() as u64).sum();
             let osum2: u64 = ob2[..(m_pad * n).min(ob2.len())].iter().map(|v| v.to_bits() as u64).sum();
             let first_diff = ob.iter().zip(&ob2).position(|(x, y)| x.to_bits() != y.to_bits());
+            let zeros_out = ob.iter().filter(|v| v.to_bits() == 0).count();
+            let zeros_out2 = ob2.iter().filter(|v| v.to_bits() == 0).count();
+            let fd = first_diff.unwrap_or(0);
+            let fd_vals: Vec<String> = (0..4usize)
+                .map(|i| {
+                    format!(
+                        "{:08x}/{:08x}",
+                        ob.get(fd + i).map(|v| v.to_bits()).unwrap_or(0),
+                        ob2.get(fd + i).map(|v| v.to_bits()).unwrap_or(0)
+                    )
+                })
+                .collect();
             eprintln!(
                 "[nan-trace] {weight_name} mxfp4-gemm: out_fresh={osum} out2_fresh={osum2} \
-                 same={} first_diff={first_diff:?} (len={} m_pad*n={})",
+                 same={} first_diff={first_diff:?} fd_vals={fd_vals:?} zeros={zeros_out}/{zeros_out2} \
+                 (len={} m_pad*n={})",
                 osum == osum2,
                 ob.len(),
                 m_pad * n
