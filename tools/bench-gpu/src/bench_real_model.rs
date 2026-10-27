@@ -23,10 +23,14 @@ use tempura_engine::trace::TraceLevel;
 const WARMUP_DECODE_DEFAULT: usize = 20;
 const BENCH_DECODE_DEFAULT: usize = 50;
 const PREFILL_LEN: usize = 128;
+const PREFILL_WARMUP_DEFAULT: usize = 5;
+const PREFILL_ITERS_DEFAULT: usize = 20;
 
 /// Env-overridable so a sustained decode can be held for external
 /// observation (e.g. `nvidia-smi dmon` utilization sampling):
 /// TEMPURA_BENCH_WARMUP_DECODE / TEMPURA_BENCH_DECODE.
+/// TEMPURA_BENCH_PREFILL_WARMUP / TEMPURA_BENCH_PREFILL_ITERS shorten the
+/// (host-bound, slow) prefill section for quick decode-only iterations.
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -122,13 +126,15 @@ fn main() {
         .collect();
 
     // Warmup prefill (lets JIT settle for all kernel variants)
-    for _ in 0..5 {
+    let prefill_warmup = env_usize("TEMPURA_BENCH_PREFILL_WARMUP", PREFILL_WARMUP_DEFAULT);
+    for _ in 0..prefill_warmup {
         let mut session = InferenceSession::new(&config, TraceLevel::Off, 0);
         try_forward(&wrapper, &mut session, &prompt);
     }
 
-    let mut prefill_times = Vec::with_capacity(20);
-    for _ in 0..20 {
+    let prefill_iters = env_usize("TEMPURA_BENCH_PREFILL_ITERS", PREFILL_ITERS_DEFAULT);
+    let mut prefill_times = Vec::with_capacity(prefill_iters);
+    for _ in 0..prefill_iters {
         let mut session = InferenceSession::new(&config, TraceLevel::Off, 0);
         let start = Instant::now();
         try_forward(&wrapper, &mut session, &prompt);
