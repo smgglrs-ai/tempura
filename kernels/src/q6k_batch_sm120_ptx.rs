@@ -58,6 +58,10 @@ pub const PTX: &str = r#"
 .target sm_120
 .address_size 64
 
+// Dynamic shared memory (weights + cross-warp partials); module-scope extern,
+// sized at launch via cuLaunchKernel's sharedMemBytes.
+.extern .shared .align 4 .b8 smem[];
+
 // q6k_gemv_sm120_batch (M rows, 2..=16)
 // Q6K x f32 GEMV decode, M activation rows sharing one weight read per block.
 // Grid: (n_rows, 1, 1). Block: (256, 1, 1) = 8 warps.
@@ -81,9 +85,6 @@ pub const PTX: &str = r#"
     .reg .u64  %rd<13>;
     .reg .f32  %f<16>;
     .reg .pred %p<9>;
-
-    // Dynamic shared memory: weights then cross-warp partials.
-    .extern .shared .align 4 .b8 smem[];
 
     // -- Load parameters --------------------------------------------------------
     ld.param.u64 %rd0,  [param_out];
