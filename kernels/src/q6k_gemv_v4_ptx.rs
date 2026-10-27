@@ -161,7 +161,20 @@ pub const PTX: &str = r#"
 
     cp.async.commit_group;
     cp.async.wait_group 0;
-    // (SIMT lockstep: all 32 threads waited - smem[curr] is fully populated.)
+    // cp.async.wait_group is PER-THREAD: it waits only for the executing
+    // thread's own async groups and does NOT make other lanes' copies
+    // visible. Every lane reads smem words copied by different lanes (d at
+    // word 0 is copied by lane 0 but read by all 32), so a CTA-wide barrier
+    // is required after the wait -- the canonical cp.async consumption
+    // pattern (cp.async.wait_group 0; bar.sync 0). Without it, lanes read
+    // stale/uninitialised smem -- word 0 is raw f32 bits, so stale data
+    // yields NaN outputs at a few scattered rows (observed: 1-6/14336,
+    // varying every run; a warp-named bar.sync id,32 reduced but did not
+    // eliminate the race). bar.sync 0 in the loop is deadlock-free because
+    // the host only selects this kernel when k_blocks is a multiple of 8,
+    // so all 8 warps execute the same number of loop barriers.
+    bar.sync 0;
+    // (All threads waited AND synced: curr buffer fully landed, CTA-visible.)
 
     // -- K-loop: blk = warp_id, warp_id+8, ...  --------------------------------
     mov.u32 %r30, %r5;               // blk = warp_id
@@ -445,7 +458,9 @@ SKIP_LOAD:
     // -- Wait for next block (if prefetch was issued) ---------------------------
     @!%p3 bra NO_WAIT;
     cp.async.wait_group 0;
-    // SIMT lockstep: all 32 threads return here together - next smem buffer is ready.
+    // Same per-thread wait_group caveat as the prologue: CTA-wide barrier
+    // makes every lane's copy of the next block visible before the swap.
+    bar.sync 0;
 NO_WAIT:
 
     // -- Swap curr/next smem buffer pointers -----------------------------------
