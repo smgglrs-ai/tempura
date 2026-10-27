@@ -1,5 +1,5 @@
 {
- "timestamp": "2026-10-27T11:00:00Z",
+ "timestamp": "2026-10-27T15:21:00Z",
  "platform": "RTX 5090 (sm_120 Blackwell), 32 GB VRAM",
  "kernel": "oxide hand-optimized (rustc-codegen-cuda)",
  "note": "oxide kernels built with cargo oxide build from tools/oxide-gemv*/",
@@ -12,17 +12,17 @@
    "prefill_tok_s": 32,
    "itl_p50_ms": 32.2,
    "gap_vs_llamacpp": "6.7x",
-   "kernel": "q2_0_gemv_decode_two_out (two-output-per-warp, half-warp XOR reduce, SMEM activation staging)"
+   "kernel": "q2_0_gemv_decode_two_out (two-output-per-warp, half-harp XOR reduce, SMEM activation staging)"
   },
   {
    "model": "Meta-Llama-3.1-8B-Instruct-Q4_K_M",
    "format": "Q4K+Q6K",
    "vram_mb": 17000,
-   "decode_tok_s": 136,
-   "prefill_tok_s": 6,
-   "itl_p50_ms": 7.34,
-   "gap_vs_llamacpp": "1.54x",
-   "kernel": "q4k_gemv_sm120_dp4a_kpar8_dual_block + splitk decode attention (S=16, PTX 42587B) + q6k_gemv_sm120_mbar_kpar8 (bar.sync fixed); outputs VERIFIED NaN-free + deterministic (identical logits fingerprints across runs, and bit-identical between kpar and splitk attention). Earlier 108-141 tok/s numbers on this config computed all-NaN logits (see correctness_fixes_2026_10_27)"
+   "decode_tok_s": 134,
+   "prefill_tok_s": 7,
+   "itl_p50_ms": 7.44,
+   "gap_vs_llamacpp": "1.56x",
+   "kernel": "single-seq: q4k_gemv_sm120_dp4a_kpar8_dual_block + splitk decode attention (S=16, PTX 42587B) + q6k_gemv_dp4a_kpar8 (sm120 mbar variant DEFAULT OFF, history-dependent outputs). batch M>=2: generalized M-row q6k_gemv_sm120_batch + MXFP4 tensor-core Q/K/O/gate/up with m_valid-masked activation quant. Outputs VERIFIED post-fix (2026-10-27): NaN-free + deterministic, fresh-cache replay bitwise identical, no bisect switches"
   }
  ],
  "llamacpp_reference": {
@@ -30,8 +30,18 @@
   "decode_tok_s": 209,
   "prefill_pp128_tok_s": 7335
  },
- "decode_tok_s_single_request": 136,
+ "decode_tok_s_single_request": 134,
  "decode_note": "single request; batched serving amortizes GEMV+attn overhead -- 5+ requests fills all 170 SMs",
+ "batch_decode_tok_s": {
+  "measured": "2026-10-27 post-fix, NO bisect switches, run twice (second run after the avx512 rustflags fix); every M verified: NaN scan every step, final-step fingerprints, fresh-cache replay bitwise identical",
+  "M1": 134,
+  "M2": 92,
+  "M4": 164,
+  "M5": 189,
+  "M8": 260,
+  "M16": 372,
+  "note": "M=1 routes to the single-seq CUDA graph path; M>=2 uses the batch graph (q6k sm120 M-row batch kernel + MXFP4 tensor cores)"
+ },
  "bottleneck_analysis": {
   "q4k_bandwidth_ceiling_tok_s": 456,
   "q4k_actual_bw_pct": "34-42% (Nsight Compute measured)",
@@ -51,9 +61,9 @@
   "remaining_gap_analysis_2026_10_27": {
    "gemv": "dp4a kpar8 dual-block unroll added (2x MLP/warp, bitwise-equal by construction); still latency-bound around 40% DRAM during decode (nvidia-smi dmon: sm 99-100%, mem 36-46%)",
    "attention": "split-K flash decode (grid n_heads x 16) replaces one-block-per-head (19% SM util); long-context decode at kv~2700 drops to ~79 tok/s (attention reads ~1MB/token per kv_len -- GQA 4x re-read)",
-   "fused_silu_disabled": "gate+up+SiLU fused kernel bypassed (format mismatch) -- separate GEMVs + silu_mul cost ~2-4% vs the broken fused path",
-   "prefill": "6 tok/s pp128 (1152x gap) -- host-bound, GPU nearly idle; separate issue",
-   "splitk_result": "125 -> 136 tok/s (ITL 7.98 -> 7.34ms) from split-K attention with verified outputs"
+   "fused_silu_disabled": "gate+up+SiLU fused kernel bypassed (format mismatch) -- separate GEMVs + silu_mul cost ~2-4% vs the broken fused path; porting to native 36-u32 format is the known lever",
+   "prefill": "7 tok/s pp128 (~1100x gap) -- host-bound (CPU 97%, GPU 8%), GPU nearly idle; separate issue",
+   "splitk_result": "125 -> 134 tok/s (ITL 7.98 -> 7.44ms) post-fix verified (pre-(e)/(f) runs measured 136 with the wrong FFN)"
   }
  },
  "infrastructure_done": [
@@ -89,9 +99,17 @@
   ]
  },
  "correctness_fixes_2026_10_27": {
-  "summary": "Every prior GPU decode bench of Llama-3.1-8B Q4_K_M on this card produced all-NaN logits at full speed; bench-real-model never inspected outputs (decode feeds a constant token). Found via the new NaN-tolerant logits fingerprint + TEMPURA_DEBUG_NAN per-op trace.",
+  "summary": "Every prior GPU decode bench of Llama-3.1-8B Q4_K_M on this card produced all-NaN logits at full speed; bench-real-model never inspected outputs (decode feeds a constant token). Found via the new NaN-tolerant logits fingerprint + TEMPURA_DEBUG_NAN per-op trace. A second fix round (same day) was found by the batch fresh-cache replay; all numbers in this file are post-both-rounds and verified.",
   "bug_1_fused_silu_format": "has_sm120_fused_silu() lacked the !uses_raw_gguf gate its sm_80 sibling documents; the sm120 fused gate+up+SiLU kernel parses repacked 42-u32 but was fed native 36-u32 weights -> every block misparsed + reads past tensor end. First NaN: L0 gate-silu, 12262/14336. Fixed by gating; porting the kernel to native format is follow-up work.",
   "bug_2_cpasync_visibility": "q6k_gemv_sm120_mbar_kpar8/batch: cp.async.wait_group is a PER-THREAD wait; no barrier after it, so lanes read smem words copied by other lanes before landing (word 0 is raw f32 bits -> NaN). 1-6/14336 NaN varying per run. Fixed with CTA bar.sync 0 after each wait (canonical pattern); host selects the mbar kernel only when k_blocks % 8 == 0 (uniform barrier counts -> no deadlock).",
-  "verification": "TEMPURA_DEBUG_NAN trace: 0 NaN lines. 3x runs: identical logits fingerprint bits_sum=283107618863711 argmax=83334 nan=0."
+  "second_round_batch_replay": {
+   "a_batch_kernel_m2_hardcoded": "q6k_gemv_sm120_batch had 2 accumulators (M=2 hardcoded) but launched for every m>1; rows 2..M held stale memory. Rewritten as a generalized M-row two-phase kernel (phase 1: cp.async ALL weight blocks into dynamic smem; phase 2: per row-pair compute with k-split across warps).",
+   "b_mxfp4_padding_rows": "quantize_activation ran with m_pad=16 while only m rows are valid; the m16k32 tile-max UE8M0 scale is shared by all 16 rows, so stale rows (and OOB reads past the [m*inter] silu buffer) poisoned the scale for valid rows (the M=4 all-NaN). Fixed with m_valid predicated loads + zeroed padding nibbles on the GPU kernel, CPU reference, and all five engine call sites.",
+   "c_m1_fallback": "the old no-graph m=1 batch fallback (16 tok/s, nondeterministic NaNs) is no longer reachable; m=1 routes to the verified single-seq forward() path.",
+   "d_frozen_position_rope": "cuTile flash-attn kv_len + cutile rope pos were HOST launch scalars baked at graph-capture time and replayed stale -- every replay after the first rotated Q/K at the capture-time position. Determinism+NaN verification cannot catch this class. Fixed by device-scalar indirection: d2d_gather_row PTX kernel copies the rope cos/sin row indexed by the position read from d_positions at execution time; graph paths require oxide_decode_attn (reads kv_len from device).",
+   "e_silu_private_stream": "CutileElementwise launched the SiLU kernel on a PRIVATE stream while producers/consumers ran on the matmul stream with no events -- allocation-layout-dependent race. silu_mul_device(_scratch) now take the caller's stream.",
+   "f_gate_up_aliasing": "gemm_q4k_d2d_slot's kpar branch returned the SHARED q8_out_scratch: gate and up projections wrote the same buffer and silu computed silu(up)*up -- the single-seq FFN was mathematically wrong. kpar GEMVs now write per-slot pool tensors; pool misses fall back to the fresh-output oxide f32 GEMV."
+  },
+  "verification": "Post-fix fishtank re-verification, NO bisect switches, run twice (incl. after the avx512 rustflags fix): bench-batch every M (1,2,4,5,8,16) NaN-free with bitwise-identical fresh-cache replay; bench-real-model single-seq 134 tok/s NaN-free + deterministic. All pre-2026-10-27 output fingerprints are retracted (computed with frozen-position RoPE and/or the wrong FFN)."
  }
 }
