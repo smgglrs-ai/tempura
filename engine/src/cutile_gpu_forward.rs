@@ -376,6 +376,21 @@ pub struct CutileGpuModel {
     /// remain zero from the initial allocation (never written after init).
     down_proj_pad_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
 
+    /// Prefill (m>1) GEMM output buffers indexed by SLOT_* constants.
+    ///
+    /// The decode `scratch` pool is sized for m=1 and its tensors are handed
+    /// to CUDA-graph-captured decode paths, so prefill keeps a separate pool:
+    /// grown on demand to `[m_pad * n]` for the largest chunk seen, reused
+    /// across layers (single-stream ordering makes overwrite-after-consume
+    /// safe). Never referenced by any captured graph -- prefill runs eager.
+    prefill_scratch: RefCell<[Option<Arc<Tensor<f32>>>; NUM_SLOTS]>,
+    /// MXFP4 activation buffers for prefill, grown on demand to the largest
+    /// `[m_pad, k]` seen. Kept separate from `mxfp4_act_packed`/`_scales`
+    /// because those are pointer-baked into the captured batch-decode graph
+    /// and must never be reallocated.
+    prefill_mxfp4_packed: RefCell<Option<Arc<Tensor<u8>>>>,
+    prefill_mxfp4_scales: RefCell<Option<Arc<Tensor<u8>>>>,
+
     // -- CUDA graph capture fields ---------------------------------------------
     //
     // For decode (seq_len=1) the forward pass is captured into a CUDA graph on
@@ -1807,6 +1822,9 @@ impl CutileGpuModel {
             attn_out_scratch: RefCell::new(attn_out_scratch),
             silu_out_scratch: RefCell::new(silu_out_scratch),
             down_proj_pad_scratch: RefCell::new(down_proj_pad_scratch),
+            prefill_scratch: RefCell::new(std::array::from_fn(|_| None)),
+            prefill_mxfp4_packed: RefCell::new(None),
+            prefill_mxfp4_scales: RefCell::new(None),
             d_embed,
             d_kv_len,
             d_positions,
@@ -2106,6 +2124,9 @@ impl CutileGpuModel {
             attn_out_scratch: RefCell::new(attn_out_scratch),
             silu_out_scratch: RefCell::new(silu_out_scratch),
             down_proj_pad_scratch: RefCell::new(down_proj_pad_scratch),
+            prefill_scratch: RefCell::new(std::array::from_fn(|_| None)),
+            prefill_mxfp4_packed: RefCell::new(None),
+            prefill_mxfp4_scales: RefCell::new(None),
             d_embed,
             d_kv_len,
             d_positions,
@@ -3705,10 +3726,210 @@ impl CutileGpuModel {
         out
     }
 
+    /// Prefill (m > 1) GEMM via the MXFP4 tensor-core path: on-GPU activation
+    /// quantization + `mxf4_batch_gemm_tiled` (stream-K persistent, arbitrary M).
+    ///
+    /// Engagement guard: `a` must be a compact row-major `[m, k]` activation
+    /// (`a.size() == m * dw.k`), e.g. RMSNorm rows when `h_pad == h`. Strided or
+    /// padded activations (h_pad > h) are not layout-compatible and fall back.
+    ///
+    /// The quant kernel never loads rows >= m_valid, so the compact input needs
+    /// no staged padding rows; rows `m..m_pad` of the output are zeros and are
+    /// trimmed so callers always receive exactly `[m, n]`.
+    fn gemm_mxfp4_prefill(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        weight_name: &str,
+        m: usize,
+        slot: usize,
+    ) -> Option<Arc<Tensor<f32>>> {
+        let mxfp4 = self.mxfp4_gemm.as_ref()?;
+        let dw = self.device_weights_mxfp4_tiled.get(weight_name)?;
+        let k = dw.k;
+        if k % 64 != 0 || a.size() != m * k {
+            return None;
+        }
+        let n = dw.n;
+        let m_pad = m.div_ceil(16) * 16;
+        let stream = self.matmul.stream();
+        let cu_stream = stream.cu_stream();
+
+        // Grow-on-demand activation buffers. Reused across layers and chunks at
+        // whatever [m_pad, k] stride the current call uses (each call's quant +
+        // GEMM agree on the stride; no state crosses calls). The alloc's
+        // stream sync guarantees prior consumers have finished before the old
+        // buffer is dropped.
+        let packed_sz = m_pad * k / 2;
+        let scales_sz = (m_pad / 16) * (k / 32);
+        {
+            let mut buf = self.prefill_mxfp4_packed.borrow_mut();
+            if buf.as_ref().is_none_or(|t| t.size() < packed_sz) {
+                *buf = Some(Arc::new(
+                    api::zeros::<u8>(&[packed_sz])
+                        .sync_on(stream)
+                        .expect("prefill mxfp4 packed buffer alloc"),
+                ));
+            }
+        }
+        {
+            let mut buf = self.prefill_mxfp4_scales.borrow_mut();
+            if buf.as_ref().is_none_or(|t| t.size() < scales_sz) {
+                *buf = Some(Arc::new(
+                    api::zeros::<u8>(&[scales_sz])
+                        .sync_on(stream)
+                        .expect("prefill mxfp4 scales buffer alloc"),
+                ));
+            }
+        }
+        let packed = self.prefill_mxfp4_packed.borrow().as_ref().unwrap().clone();
+        let scales = self.prefill_mxfp4_scales.borrow().as_ref().unwrap().clone();
+        mxfp4
+            .quantize_activation(a, &packed, &scales, m_pad as u32, k as u32, m as u32, cu_stream)
+            .unwrap_or_else(|e| panic!("mxfp4 prefill quant {weight_name}: {e}"));
+
+        // Output: [m_pad, n] from the per-slot pool. Every element is written
+        // by the GEMM, so a grown-then-reused buffer needs no re-zeroing.
+        let out = {
+            let mut pool = self.prefill_scratch.borrow_mut();
+            if pool[slot].as_ref().is_none_or(|t| t.size() < m_pad * n) {
+                pool[slot] = Some(Arc::new(
+                    api::zeros::<f32>(&[m_pad * n])
+                        .sync_on(stream)
+                        .expect("prefill output buffer alloc"),
+                ));
+            }
+            pool[slot].as_ref().unwrap().clone()
+        };
+        mxfp4
+            .forward(
+                &packed,
+                &scales,
+                &dw.packed,
+                &dw.tiled_scales,
+                &out,
+                m_pad as u32,
+                n as u32,
+                (k / 64) as u32,
+            )
+            .unwrap_or_else(|e| panic!("mxfp4 prefill gemm {weight_name}: {e}"));
+
+        if m_pad == m {
+            Some(out)
+        } else {
+            // Trim [m_pad, n] -> [m, n]: fresh tensor + one D->D row copy so
+            // downstream consumers see the exact shape the fallback path
+            // returns (they all index rows by the explicit seq_len/m param,
+            // but shape-exactness keeps every assert and size check honest).
+            let trimmed = Arc::new(
+                api::zeros::<f32>(&[m * n])
+                    .sync_on(stream)
+                    .expect("prefill trim alloc"),
+            );
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    trimmed.device_pointer().cu_deviceptr(),
+                    out.device_pointer().cu_deviceptr(),
+                    m * n,
+                    stream,
+                )
+                .expect("prefill mxfp4 trim copy");
+            }
+            Some(trimmed)
+        }
+    }
+
+    /// Prefill (m > 1) Q6_K GEMM via the sm120 M-row batch GEMV, chunked over
+    /// rows: one launch per <= 16 rows, each reading the packed weights once
+    /// into shared memory and writing its rows of the `[m, n]` output.
+    fn gemm_q6k_prefill_batch(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        weight_name: &str,
+        m: usize,
+        slot: usize,
+    ) -> Option<Arc<Tensor<f32>>> {
+        if m < 2 {
+            return None;
+        }
+        let oxide = self.oxide_q6k_gemv.as_ref()?;
+        if !oxide.has_sm120_batch() {
+            return None;
+        }
+        let dw = self.device_weights_q6k.get(weight_name)?;
+        let k = dw.k_blocks * 256;
+        if a.size() != m * k {
+            return None;
+        }
+        let n = dw.n;
+        let stream = self.matmul.stream();
+        let cu_stream = stream.cu_stream();
+        let out = {
+            let mut pool = self.prefill_scratch.borrow_mut();
+            if pool[slot].as_ref().is_none_or(|t| t.size() < m * n) {
+                pool[slot] = Some(Arc::new(
+                    api::zeros::<f32>(&[m * n])
+                        .sync_on(stream)
+                        .expect("q6k prefill output buffer alloc"),
+                ));
+            }
+            pool[slot].as_ref().unwrap().clone()
+        };
+        // Chunks of 2..=16 rows: the kernel's shared-memory reduction area caps
+        // one launch at 16 rows and it rejects m < 2.
+        let mut row = 0usize;
+        for &rows in &crate::pipeline::capped_batch_chunks(m, 2, 16) {
+            oxide
+                .forward_sm120_batch_rows(
+                    a,
+                    row,
+                    &dw.tensor,
+                    &out,
+                    row,
+                    n,
+                    dw.k_blocks,
+                    rows,
+                    cu_stream,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("q6k prefill batch {weight_name} rows {row}..{}: {e}", row + rows)
+                });
+            row += rows;
+        }
+        Some(out)
+    }
+
+    /// Prepare an m>1 activation for the host-dequant f32 fallback GEMM.
+    ///
+    /// The fallback GEMM runs at `k_pad` (next-pow2) columns with zero padding.
+    /// Prefill callers feed the GPU fast paths COMPACT `[m, k]` activations
+    /// (the FFN silu output, so the q6k batch kernel can consume it directly);
+    /// when the fast paths decline, pad here on the host. An already-padded
+    /// `[m, k_pad]` activation (attention/hidden rows) passes through.
+    fn pad_prefill_activation_for_f32_gemm(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        m: usize,
+        k: usize,
+        k_pad: usize,
+    ) -> Arc<Tensor<f32>> {
+        if k_pad == k || a.size() == m * k_pad {
+            return a.clone();
+        }
+        debug_assert_eq!(
+            a.size(),
+            m * k,
+            "prefill activation is neither [m, k] nor [m, k_pad]"
+        );
+        let compact = self.download_device_tensor(a);
+        self.to_device_padded(&compact, m, k, k_pad)
+    }
+
     /// The slotted quantized paths use pre-allocated scratch buffers with async dispatch,
     /// eliminating the two `sync_on` calls (allocation + kernel) per GEMV.
-    /// For m > 1 (prefill): quantized GEMV is not yet batched; fall back to
-    /// host-side dequantization + f32 GEMM (slower but correct; prefill is infrequent).
+    /// For m > 1 (prefill): MXFP4 tensor-core GEMM (tiled Q4K/BF16 weights) or
+    /// chunked sm120 q6k batch GEMV when the activation is layout-compatible;
+    /// otherwise fall back to host-side dequantization + f32 GEMM.
+    /// TEMPURA_NO_GPU_PREFILL=1 bisects both GPU fast paths off.
     fn gemm_any_d2d_slot(
         &self,
         a: &Arc<Tensor<f32>>,
@@ -3727,7 +3948,15 @@ impl CutileGpuModel {
             return self.gemm_q2_d2d_slot(a, weight_name, slot);
         }
 
-        // -- Prefill (m > 1): host dequant + f32 GEMM -------------------------
+        // -- Prefill (m > 1): GPU fast paths, then host-dequant fallback ------
+        if m > 1 && std::env::var("TEMPURA_NO_GPU_PREFILL").as_deref() != Ok("1") {
+            if let Some(out) = self.gemm_mxfp4_prefill(a, weight_name, m, slot) {
+                return out;
+            }
+            if let Some(out) = self.gemm_q6k_prefill_batch(a, weight_name, m, slot) {
+                return out;
+            }
+        }
         if m > 1 {
             // Q4_K prefill: reconstruct f32 from GPU format (packed 42-u32 or raw GGUF 36-u32).
             if let Some(dw) = self.device_weights_q4k.get(weight_name) {
@@ -3812,8 +4041,9 @@ impl CutileGpuModel {
                 }
                 let k_pad = next_pow2(k.div_ceil(BK) * BK);
                 let w_dev = self.to_device_padded(&f32_weights, dw.n, k, k_pad);
+                let a_gemm = self.pad_prefill_activation_for_f32_gemm(a, m, k, k_pad);
                 return self.matmul
-                    .forward_bt_device_to_device(a, &w_dev, m, dw.n, k_pad)
+                    .forward_bt_device_to_device(&a_gemm, &w_dev, m, dw.n, k_pad)
                     .expect("gemm_any_d2d_slot Q4_K prefill GEMM failed");
             }
 
@@ -3858,8 +4088,9 @@ impl CutileGpuModel {
                 }
                 let k_pad = next_pow2(k.div_ceil(BK) * BK);
                 let w_dev = self.to_device_padded(&f32_weights, dw.n, k, k_pad);
+                let a_gemm = self.pad_prefill_activation_for_f32_gemm(a, m, k, k_pad);
                 return self.matmul
-                    .forward_bt_device_to_device(a, &w_dev, m, dw.n, k_pad)
+                    .forward_bt_device_to_device(&a_gemm, &w_dev, m, dw.n, k_pad)
                     .expect("gemm_any_d2d_slot Q6K prefill GEMM failed");
             }
 
@@ -3888,8 +4119,9 @@ impl CutileGpuModel {
                 }
                 let k_pad = next_pow2(k.div_ceil(BK) * BK);
                 let w_dev = self.to_device_padded(&f32_weights, dw.n, k, k_pad);
+                let a_gemm = self.pad_prefill_activation_for_f32_gemm(a, m, k, k_pad);
                 return self.matmul
-                    .forward_bt_device_to_device(a, &w_dev, m, dw.n, k_pad)
+                    .forward_bt_device_to_device(&a_gemm, &w_dev, m, dw.n, k_pad)
                     .expect("gemm_any_d2d_slot Q2_0 prefill GEMM failed");
             }
         }
@@ -5093,6 +5325,11 @@ impl CutileGpuModel {
             // For seq_len==1 with non-power-of-2 inter (e.g. Llama-3.1-8B inter=14336):
             // use GPU D->D copy into the pre-zeroed inter_pad scratch to avoid 32 D->H
             // stream syncs per token -- the dominant bottleneck before this fix.
+            // For seq_len>1: pass the COMPACT [seq_len, inter] silu output -- the
+            // q6k sm120 batch fast path in gemm_any_d2d_slot consumes it directly
+            // (same layout the batch-decode path feeds the same kernel). The
+            // host-dequant f32 fallback pads to inter_pad internally; the old
+            // D->H->D pad here cost a full download+upload round-trip per layer.
             let gate_silu_dev = if self.inter_pad == inter {
                 gate_silu_n_dev
             } else if seq_len == 1 {
@@ -5118,8 +5355,7 @@ impl CutileGpuModel {
                 *self.down_proj_pad_scratch.borrow_mut() = Some(result.clone());
                 result
             } else {
-                let gate_silu_host = self.download_device_tensor(&gate_silu_n_dev);
-                self.to_device_padded(&gate_silu_host, seq_len, inter, self.inter_pad)
+                gate_silu_n_dev
             };
             let down_dev = self.gemm_any_d2d_slot(&gate_silu_dev, down_w_name, seq_len, SLOT_DOWN);
 

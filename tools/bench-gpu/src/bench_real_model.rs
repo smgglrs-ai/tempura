@@ -171,6 +171,59 @@ fn main() {
     println!("  Prefill tok/s:   {pp_tok_s:.0}");
     println!("  llama.cpp ref:   7335 tok/s pp128 (RTX 5090)");
 
+    // --- Prefill output verification ---
+    // Two fresh-session runs must produce bitwise-identical logits (the GPU
+    // prefill path -- MXFP4 tensor-core GEMMs + chunked q6k batch GEMV --
+    // is deterministic by construction; this catches history-dependent
+    // buffers, stale pool state, or racing streams). NaN-tolerant fingerprint
+    // mirrors the decode one so broken kernels are diagnosed, not hidden.
+    let logits_fp = |logits: &Vec<f32>| -> (u64, usize, usize) {
+        let nan_count = logits.iter().filter(|v| v.is_nan()).count();
+        let bits_sum: u64 = logits.iter().map(|v| v.to_bits() as u64).sum();
+        let argmax = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        (bits_sum, argmax, nan_count)
+    };
+    let mut v1 = InferenceSession::new(&config, TraceLevel::Off, 0);
+    let l1 = try_forward(&wrapper, &mut v1, &prompt).expect("prefill verify run 1 failed");
+    let mut v2 = InferenceSession::new(&config, TraceLevel::Off, 0);
+    let l2 = try_forward(&wrapper, &mut v2, &prompt).expect("prefill verify run 2 failed");
+    let (bs1, am1, nan1) = logits_fp(&l1);
+    let (bs2, _am2, nan2) = logits_fp(&l2);
+    let det = if bs1 == bs2 && nan1 == 0 && nan2 == 0 {
+        "OK"
+    } else {
+        "MISMATCH"
+    };
+    println!(
+        "  Prefill logits fp: bits_sum={bs1} argmax={am1} n={} nan={nan1}/{nan2} det={det}",
+        l1.len()
+    );
+    // TEMPURA_BENCH_PREFILL_AB=1: also run the host-dequant fallback
+    // (TEMPURA_NO_GPU_PREFILL=1) and report the numerics delta of the fast
+    // path vs the exact-dequant f32 reference GEMMs.
+    if std::env::var("TEMPURA_BENCH_PREFILL_AB").as_deref() == Ok("1") {
+        std::env::set_var("TEMPURA_NO_GPU_PREFILL", "1");
+        let mut v3 = InferenceSession::new(&config, TraceLevel::Off, 0);
+        let l3 = try_forward(&wrapper, &mut v3, &prompt).expect("prefill A/B fallback run failed");
+        std::env::remove_var("TEMPURA_NO_GPU_PREFILL");
+        let max_abs = l1
+            .iter()
+            .zip(&l3)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_ref = l3.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        println!(
+            "  Prefill A/B (fast vs host-dequant): max_abs_diff={max_abs:.4} \
+             (ref max |logit|={max_ref:.4}, rel={:.4})",
+            max_abs / max_ref.max(1e-9)
+        );
+    }
+
     // --- Decode benchmark ---
     println!("\n--- Decode (single-token autoregressive) ---");
     let warmup_decode = env_usize("TEMPURA_BENCH_WARMUP_DECODE", WARMUP_DECODE_DEFAULT);

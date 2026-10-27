@@ -476,6 +476,97 @@ impl OxideQ6kGemv {
         Ok(())
     }
 
+    /// Row-offset variant of `forward_sm120_batch_d2d_into` for prefill chunking.
+    ///
+    /// Computes rows `[x_row, x_row + m)` of X into rows `[out_row, out_row + m)`
+    /// of OUT, reading the SAME packed weights. Lets a prefill chunk of M > 16
+    /// rows run as ceil-chunks of <= 16 rows against one [M * n] output tensor
+    /// while the kernel still reads each weight block once per launch.
+    ///
+    /// The kernel loads only the pointer/shape params (the `*_len` guards are
+    /// host-side), so base-pointer arithmetic is the only change.
+    pub fn forward_sm120_batch_rows(
+        &self,
+        x_m: &Arc<Tensor<f32>>,
+        x_row: usize,
+        packed: &Arc<Tensor<u32>>,
+        out_m: &Arc<Tensor<f32>>,
+        out_row: usize,
+        n: usize,
+        k_blocks: usize,
+        m: usize,
+        cu_stream: cuda_core::sys::CUstream,
+    ) -> Result<()> {
+        if m < 2 || m > 16 {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k_gemv_sm120_batch_rows requires m in 2..=16 (got {m})"
+            )));
+        }
+        let k = k_blocks * 256;
+        let row_bytes = k * 4;
+        let x_row_bytes = x_row * row_bytes;
+        let out_row_bytes = out_row * n * 4;
+        if x_row_bytes + m * row_bytes > x_m.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k_gemv_sm120_batch_rows: x slice [{x_row}, {x_row}+{m}) x {k} \
+                 exceeds tensor ({} f32)",
+                x_m.size()
+            )));
+        }
+        if out_row_bytes + m * n * 4 > out_m.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k_gemv_sm120_batch_rows: out slice [{out_row}, {out_row}+{m}) x {n} \
+                 exceeds tensor ({} f32)",
+                out_m.size()
+            )));
+        }
+        let smem_bytes = crate::q6k_batch_sm120_ptx::dynamic_smem_bytes(k_blocks);
+        if smem_bytes > Self::MAX_BATCH_DYNAMIC_SMEM {
+            return Err(KernelError::InvalidConfig(format!(
+                "q6k_gemv_sm120_batch_rows needs {smem_bytes} B dynamic smem (> {})",
+                Self::MAX_BATCH_DYNAMIC_SMEM
+            )));
+        }
+        let batch_fn = self.cu_function_sm120_batch.ok_or_else(|| {
+            KernelError::InvalidConfig("q6k_gemv_sm120_batch not loaded".into())
+        })?;
+
+        let out_ptr: u64 = out_m.device_pointer().cu_deviceptr() as u64 + out_row_bytes as u64;
+        let out_len: u64 = out_m.size() as u64 - (out_row_bytes / 4) as u64;
+        let x_ptr: u64 = x_m.device_pointer().cu_deviceptr() as u64 + x_row_bytes as u64;
+        let x_len: u64 = x_m.size() as u64 - (x_row_bytes / 4) as u64;
+        let packed_ptr: u64 = packed.device_pointer().cu_deviceptr() as u64;
+        let packed_len: u64 = packed.size() as u64;
+        let n_u32 = n as u32;
+        let k_blocks_u32 = k_blocks as u32;
+        let m_u32 = m as u32;
+
+        let mut params: [*mut c_void; 9] = [
+            &out_ptr      as *const _ as *mut c_void,
+            &out_len      as *const _ as *mut c_void,
+            &x_ptr        as *const _ as *mut c_void,
+            &x_len        as *const _ as *mut c_void,
+            &packed_ptr   as *const _ as *mut c_void,
+            &packed_len   as *const _ as *mut c_void,
+            &n_u32        as *const _ as *mut c_void,
+            &k_blocks_u32 as *const _ as *mut c_void,
+            &m_u32        as *const _ as *mut c_void,
+        ];
+
+        unsafe {
+            launch_kernel(
+                batch_fn,
+                (n as u32, 1, 1),
+                (BLOCK_DIM_KPAR, 1, 1),
+                smem_bytes as u32,
+                cu_stream,
+                &mut params,
+            )
+        }
+        .map_err(|e| KernelError::InvalidConfig(format!("q6k_gemv_sm120_batch_rows: {e}")))?;
+        Ok(())
+    }
+
     /// Pre-allocate a kpar output scratch tensor of size `max_n`.
     ///
     /// Must be called BEFORE CUDA graph capture starts (e.g., in the engine's
