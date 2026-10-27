@@ -105,16 +105,19 @@ fn main() {
     // Deterministic logits fingerprint: the same token through the same
     // kernels must reproduce bitwise (engine is deterministic by design), so
     // this checksum cross-checks kernel swaps (e.g. TEMPURA_NO_DUAL_BLOCK A/B).
+    // NaN-tolerant: bit-level sum + total_cmp argmax + explicit NaN count, so
+    // broken kernels are DIAGNOSED (how many NaNs) instead of panicking.
     if let Some(logits) = &probe_result {
-        let sum: f32 = logits.iter().sum();
+        let nan_count = logits.iter().filter(|v| v.is_nan()).count();
+        let bits_sum: u64 = logits.iter().map(|v| v.to_bits() as u64).sum();
         let argmax = logits
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i)
             .unwrap_or(0);
         println!(
-            "  Logits fingerprint: sum={sum:.6} argmax={argmax} n={}",
+            "  Logits fingerprint: bits_sum={bits_sum} argmax={argmax} n={} nan={nan_count}",
             logits.len()
         );
     }
