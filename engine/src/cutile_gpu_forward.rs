@@ -3786,6 +3786,17 @@ impl CutileGpuModel {
         mxfp4
             .quantize_activation(a, &packed, &scales, m_pad as u32, k as u32, m as u32, cu_stream)
             .unwrap_or_else(|e| panic!("mxfp4 prefill quant {weight_name}: {e}"));
+        if self.debug_nan_trace {
+            let ab: Vec<f32> = Arc::clone(a).to_host_vec().sync_on(stream).expect("dbg a");
+            let pb: Vec<u8> = Arc::clone(&packed).to_host_vec().sync_on(stream).expect("dbg packed");
+            let sb: Vec<u8> = Arc::clone(&scales).to_host_vec().sync_on(stream).expect("dbg scales");
+            let asum: u64 = ab.iter().map(|v| v.to_bits() as u64).sum();
+            let psum: u64 = pb.iter().map(|&b| b as u64).sum();
+            let ssum: u64 = sb.iter().map(|&b| b as u64).sum();
+            eprintln!(
+                "[nan-trace] {weight_name} quant: a_sum={asum} packed_sum={psum} scales_sum={ssum} (m={m} k={k})"
+            );
+        }
 
         // Output: [m_pad, n] from the per-slot pool. Every element is written
         // by the GEMM, so a grown-then-reused buffer needs no re-zeroing.
@@ -3812,6 +3823,11 @@ impl CutileGpuModel {
                 (k / 64) as u32,
             )
             .unwrap_or_else(|e| panic!("mxfp4 prefill gemm {weight_name}: {e}"));
+        if self.debug_nan_trace {
+            let ob: Vec<f32> = Arc::clone(&out).to_host_vec().sync_on(stream).expect("dbg out");
+            let osum: u64 = ob.iter().map(|v| v.to_bits() as u64).sum();
+            eprintln!("[nan-trace] {weight_name} mxfp4-gemm: out_sum={osum} (m_pad={m_pad} n={n})");
+        }
 
         if m_pad == m {
             Some(out)
