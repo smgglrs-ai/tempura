@@ -320,11 +320,15 @@ Qwen3.6-27B weights** — see open work.
 - [x] Native MXFP4 pipeline: E2M1+UE8M0 quant (CPU), on-GPU activation
       quant, tensor-core GEMM, all 7 projections, BF16 loader; 55.6 TFLOPS
       at M=64
-- [x] Benchmarks (2026-10-27, pre-batch-fix): 136 tok/s single-seq decode
-      (llama.cpp: 209, gap 1.54x), ITL 7.34 ms — NaN-free + deterministic,
-      but measured BEFORE the frozen-RoPE-position graph fix (see open
-      work): speed roughly representative, output fingerprints stale.
-      Batch decode numbers from that date are retracted pending re-run.
+- [x] Benchmarks (2026-10-27, post-fix, RTX 5090, bench-batch all-M
+      verified with NO bisect switches — NaN-free + fresh-cache replay
+      bitwise): single-seq M=1 135 tok/s; batch M=2 93, M=4 164, M=5 190,
+      M=8 259, M=16 374 tok/s (llama.cpp single-seq reference: 209).
+      All fingerprints are post-fix values: pre-fix outputs were computed
+      with frozen-position RoPE and the wrong FFN (see open work) — old
+      numbers retracted, these are the first fully-verified batch numbers.
+      Batch decode uses the generalized M-row q6k batch kernel (M>=2) and
+      MXFP4 tensor-core Q/K/O/gate/up with m_valid-masked activation quant.
 - [x] Decode correctness (2026-10-27): fixed sm120 fused-silu format mismatch
       (fed native 36-u32 weights to a repacked-42-u32 kernel -> all-NaN logits
       since introduction; every prior bench computed garbage at full speed) and
