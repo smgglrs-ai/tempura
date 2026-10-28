@@ -120,8 +120,8 @@ docs/ (Zola site, deployed by .github/workflows/pages.yml)
 
 - **model/** (`tempura-model`) — HuggingFace hub download/inspect library
   (`pull`, `list`, `inspect` format/arch detection; consumed by the CLI).
-  Model store at `~/.tempura/models` (legacy `~/.tempura-serve/models`
-  still used when present).
+  Model store at `~/.cache/tempura/models` (XDG cache via `dirs::cache_dir()`,
+  `XDG_CACHE_HOME` respected — same root the gpu-remote workflow uses).
 
 - **server/** (`tempura-server`, ~4.2k lines, library) — Axum. OpenAI-compatible:
   `/v1/chat/completions` (SSE streaming, `stream_options.include_usage`,

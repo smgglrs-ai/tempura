@@ -18,21 +18,12 @@ pub struct ModelStore {
     root: PathBuf,
 }
 
-// Pre-rename installs keep their models in ~/.tempura-serve; prefer that dir
-// when it exists so existing downloads stay visible, otherwise use ~/.tempura.
-fn models_dir(home: &Path) -> PathBuf {
-    let legacy = home.join(".tempura-serve").join("models");
-    if legacy.exists() {
-        legacy
-    } else {
-        home.join(".tempura").join("models")
-    }
-}
-
 impl ModelStore {
     pub fn default_path() -> PathBuf {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        models_dir(&home)
+        dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("tempura")
+            .join("models")
     }
 
     pub fn new(root: PathBuf) -> Self {
@@ -98,22 +89,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn models_dir_fresh_install_uses_new_path() {
-        let home = tempfile::tempdir().unwrap();
-        assert_eq!(
-            models_dir(home.path()),
-            home.path().join(".tempura").join("models")
-        );
-    }
-
-    #[test]
-    fn models_dir_prefers_legacy_dir_when_present() {
-        let home = tempfile::tempdir().unwrap();
-        fs::create_dir_all(home.path().join(".tempura-serve").join("models")).unwrap();
-        assert_eq!(
-            models_dir(home.path()),
-            home.path().join(".tempura-serve").join("models")
-        );
+    fn default_path_is_in_xdg_cache() {
+        assert!(ModelStore::default_path().ends_with("tempura/models"));
     }
 
     #[test]
