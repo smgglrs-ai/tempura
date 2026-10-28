@@ -345,7 +345,7 @@ Qwen3.6-27B weights** — see open work.
       max |logit| delta rel 0.10 (TEMPURA_BENCH_PREFILL_AB=1).
       TEMPURA_NO_GPU_PREFILL=1 bisects back to the host path.
 - [x] Prefill attention on-device (2026-10-28): see open work for the
-      current state (5126 tok/s pp128, TTFT P50 25 ms, 1.4x gap) --
+      current state (5485 tok/s pp128, TTFT P50 23.4 ms, 1.3x gap) --
       gather/flash/scatter kernel chain + scratch RoPE with cos/sin cache
       + pooled prefill norms/adds/SiLU + Q6K down_proj via MXFP4 (nsys-
       driven), TEMPURA_NO_GPU_ATTN bisect, latent stale-host-mirror fix.
@@ -450,10 +450,11 @@ typical-p/repeat/presence/frequency)
       held, bench-decode-ops fused-silu real-weights test rel 0.0007.
       Remaining levers: GEMV still ~40% DRAM (dmon: sm 99-100%, mem
       36-46%), host-side per-token overhead
-- [ ] Prefill on GPU: 5126 tok/s pp128, TTFT P50 25 ms (2026-10-28, nsys-
+- [ ] Prefill on GPU: 5485 tok/s pp128, TTFT P50 23.4 ms (2026-10-28, nsys-
       driven: on-device attention + scratch RoPE + pooled norms/adds/SiLU +
-      Q6K down_proj via MXFP4) vs llama.cpp 7335 (1.4x gap; 12.6x the 408
-      tok/s host-staged baseline). Four changes landed 2026-10-28:
+      Q6K down_proj via MXFP4 + flash BR=16 tile tuning) vs llama.cpp 7335
+      (1.3x gap; 13.4x the 408 tok/s host-staged baseline). Five changes
+      landed 2026-10-28:
       (a) The prefill attention is fully on-device: 3
       `cutile_gather_heads` (de-interleave Q/K/V into head-major padded
       buffers) + ONE `cutile_flash_attn_heads` launch for all heads (the
@@ -511,6 +512,15 @@ typical-p/repeat/presence/frequency)
       (the new size checks in forward_device_fused_scratch /
       add_device_scratch realloc on mismatch, which is illegal inside
       stream capture -- found by bench-batch, DriverError 900).
+      (e) Flash-attn tile tuning: the multi-head kernel was CTA-count-bound
+      at prefill sizes (grid 128 CTAs on 170 SMs at seq=128, running at
+      ~2.7 TFLOPS / 13% of prefill GPU time). A (BR, BC) sweep (now a
+      permanent bench-decode-ops section -- BR/BC are launch-time generics,
+      one build sweeps all tuples) found BR=16 ~1.9x faster at both seq=128
+      (48 vs 91us) and seq=512 (400 vs 754us); BR=8 overcorrects, larger
+      BC strictly worse. BR 32 -> 16; BITWISE-neutral (per-row math
+      unchanged -- identical logits fingerprint and identical bench-quality
+      verdict). 5126 -> 5485 tok/s.
       Verified 2026-10-28: bench-decode-ops "prefill attn dev" 8/8, "rope
       prefill scratch" 4/4 and "rmsnorm prefill scratch" (grow/reuse/
       shrink/odd-seq) 4/4 all
@@ -764,15 +774,16 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       bench-quality now shows 100% argmax agreement vs the CPU reference,
       64/64 identical tokens free-running. 2026-10-28 fused-silu raw-format
       port: 134 -> 140 tok/s)
-- Llama-3.1-8B Q4K prefill: **5126 tok/s pp128**, TTFT P50 25 ms
-      (1.4x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
+- Llama-3.1-8B Q4K prefill: **5485 tok/s pp128**, TTFT P50 23.4 ms
+      (1.3x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1331 -- the MXFP4 band including the
       Q6K->MXFP4 down_proj double-quantization (lossier than the Q4K path's
       0.1015; bench-quality teacher-forced PASS 89.1%, all mismatches
       near-ties). 2026-10-28 stack: on-device attention (408 -> 815) +
       scratch RoPE with a cos/sin cache (815 -> 1305) + pooled prefill
       norms/adds/SiLU (1305 -> 1365) + Q6K down_proj via MXFP4
-      (1365 -> 5126, nsys-driven). Kernel-level verification bitwise-exact
+      (1365 -> 5126, nsys-driven) + flash BR=16 tile tuning (5126 -> 5485,
+      bitwise-neutral). Kernel-level verification bitwise-exact
       vs the CPU causal reference for the attention/RoPE/norm paths, see
       open work's prefill item. Decode unchanged at 139-140 tok/s)
 - Llama-3.1-8B Q4K batch decode (2026-10-27, post-store-mapping-fix, NO

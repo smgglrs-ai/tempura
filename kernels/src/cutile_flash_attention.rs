@@ -8,7 +8,11 @@ use cutile::tensor::{IntoPartition, Reshape, Tensor};
 use crate::{Attention, KernelError, Result, VerificationTier};
 
 /// Tile dimensions (compile-time constants for the JIT).
-const BR: usize = 32;
+/// BR=16: the flash kernels are CTA-count-bound at prefill sizes -- at
+/// seq=128, BR=16 gives 256 CTAs on 170 SMs vs 128 at BR=32, ~1.9x faster
+/// (tile sweep in bench-decode-ops, 2026-10-28; BR=8 overcorrects to
+/// 57.8us).  BC=32: larger KV tiles are strictly slower at these sizes.
+const BR: usize = 16;
 const BC: usize = 32;
 
 #[cutile::module]

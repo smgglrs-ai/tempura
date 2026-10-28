@@ -25,8 +25,8 @@
 use std::sync::Arc;
 use cuda_core::Stream;
 use cutile::api;
-use cutile::prelude::{DeviceOp, ToHostVec};
-use cutile::tensor::Tensor;
+use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
+use cutile::tensor::{IntoPartition, Reshape, Tensor};
 use tempura_kernels::cutile_rope::{CutileRoPE, RopeScratch};
 use tempura_kernels::cutile_quantized_gemm::{Q6K_PACKED_U32S, Q6K_QK};
 use tempura_kernels::ggml::dequantize::dequantize_to_f32;
@@ -445,6 +445,136 @@ fn main() {
                     &gpu,
                     &cpu,
                 );
+            }
+        }
+
+        // ---- 3c. Prefill flash-attn tile sweep (BR x BC) ----
+        // The multi-head flash kernel runs at ~2.7 TFLOPS at seq=128 (98us
+        // per layer, nsys 2026-10-28) -- latency/overhead bound at small
+        // tiles.  BR/BC are launch-time generics (JIT per tuple), so one
+        // build sweeps them all: time cutile_flash_attn_heads directly on
+        // CPU-gathered head-major buffers padded to 128 (a multiple of
+        // every candidate), correctness vs the CPU causal reference.
+        {
+            use tempura_kernels::cutile_flash_attention::kernels as fk;
+            let sweep_stream = fa.stream().clone();
+            for &(seq_len, kv_len) in &[(128usize, 128usize), (512usize, 512usize)] {
+                // Padded rows per head: multiple of 128 (every candidate
+                // BR/BC divides it) and >= max(seq, kv).
+                let pad = seq_len.max(kv_len).div_ceil(128) * 128;
+                let q = prng_data(seq_len * N_HEADS * HEAD_DIM, 71);
+                let k = prng_data(kv_len * N_KV_HEADS * HEAD_DIM, 72);
+                let v = prng_data(kv_len * N_KV_HEADS * HEAD_DIM, 73);
+                let cpu = cpu_prefill_attention(&q, &k, &v, seq_len, kv_len, scale);
+                // CPU gather to head-major, zero-padded to `pad` rows/head.
+                let gather_hm = |src: &[f32], heads: usize, len: usize| -> Vec<f32> {
+                    let mut g = vec![0.0f32; heads * pad * HEAD_DIM];
+                    for h in 0..heads {
+                        for i in 0..len {
+                            for d in 0..HEAD_DIM {
+                                g[(h * pad + i) * HEAD_DIM + d] =
+                                    src[(i * heads + h) * HEAD_DIM + d];
+                            }
+                        }
+                    }
+                    g
+                };
+                let up2d = |data: Vec<f32>, rows: usize| -> Arc<Tensor<f32>> {
+                    api::copy_host_vec_to_device(&Arc::new(data))
+                        .sync_on(&sweep_stream)
+                        .expect("sweep upload failed")
+                        .reshape(&[rows, HEAD_DIM])
+                        .expect("sweep reshape failed")
+                        .into()
+                };
+                let qg = up2d(gather_hm(&q, N_HEADS, seq_len), N_HEADS * pad);
+                let kg = up2d(gather_hm(&k, N_KV_HEADS, kv_len), N_KV_HEADS * pad);
+                let vg = up2d(gather_hm(&v, N_KV_HEADS, kv_len), N_KV_HEADS * pad);
+                let cache_offset = (kv_len - seq_len) as i32;
+                let hpg = (N_HEADS / N_KV_HEADS) as i32;
+
+                println!("  -- flash tile sweep (seq={seq_len} kv={kv_len}) --");
+                for &(br, bc) in &[
+                    (8usize, 32usize),
+                    (16usize, 32usize),
+                    (16usize, 64usize),
+                    (32usize, 32usize),
+                    (32usize, 64usize),
+                    (64usize, 32usize),
+                    (64usize, 64usize),
+                    (32usize, 128usize),
+                    (64usize, 128usize),
+                ] {
+                    let out_t = api::zeros::<f32>(&[N_HEADS * pad, HEAD_DIM])
+                        .sync_on(&sweep_stream)
+                        .expect("sweep out alloc failed");
+                    // warmup (JIT) + timed iters, one sync at the end.
+                    let mut launch = |part: _| -> Result<_, String> {
+                        let (p, ..) = unsafe {
+                            fk::cutile_flash_attn_heads(
+                                part,
+                                qg.clone(),
+                                kg.clone(),
+                                vg.clone(),
+                                scale,
+                                cache_offset,
+                                seq_len as i32,
+                                kv_len as i32,
+                                (pad / br) as i32,
+                                (pad / bc) as i32,
+                                hpg,
+                            )
+                            .generics(vec![br.to_string(), bc.to_string(), HEAD_DIM.to_string()])
+                            .async_on(&sweep_stream)
+                            .map_err(|e| e.to_string())?
+                        };
+                        Ok(p)
+                    };
+                    let mut part_opt = Some(out_t.partition([br, HEAD_DIM]));
+                    let mut ok = true;
+                    for _ in 0..3 {
+                        match launch(part_opt.take().unwrap()) {
+                            Ok(p) => part_opt = Some(p),
+                            Err(e) => {
+                                println!("  BR={br:<3} BC={bc:<3} SKIP ({e})");
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    let mut part = part_opt.unwrap();
+                    let iters = 50;
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..iters {
+                        part = launch(part).expect("sweep launch failed");
+                    }
+                    unsafe { sweep_stream.synchronize().expect("sweep sync failed") };
+                    let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                    // Correctness: scatter head-major rows < seq_len back to
+                    // interleaved and compare vs the CPU reference.
+                    let out_flat = Arc::new(part.unpartition())
+                        .to_host_vec()
+                        .sync_on(&sweep_stream)
+                        .expect("sweep download failed");
+                    let mut gpu = vec![0.0f32; seq_len * N_HEADS * HEAD_DIM];
+                    for h in 0..N_HEADS {
+                        for i in 0..seq_len {
+                            for d in 0..HEAD_DIM {
+                                gpu[(i * N_HEADS + h) * HEAD_DIM + d] =
+                                    out_flat[(h * pad + i) * HEAD_DIM + d];
+                            }
+                        }
+                    }
+                    let good = report(
+                        &format!("flash BR={br:<3} BC={bc:<3} ({us:7.1} us/iter)"),
+                        &gpu,
+                        &cpu,
+                    );
+                    all_ok &= good;
+                }
             }
         }
     }
