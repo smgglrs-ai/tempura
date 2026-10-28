@@ -451,13 +451,27 @@ typical-p/repeat/presence/frequency)
       graph-gather paths, KV scatter-write, q6k kpar GEMV, q4k sm120 kpar
       GEMV, oxide decode attention (splitk + kpar, incl. dirty
       4096-row cache), rmsnorm fused scratch, silu_mul.
-- [ ] q4k_gemv_dp4a_q8_raw (the sm_80 Rust-codegen raw-format GEMV,
-      fallback when sm120 is unavailable): numerically wrong vs its
-      Q8-quantized CPU reference (max_abs 0.72 on q_proj, rel 0.33) while
-      correct on large-magnitude outputs -- a second, distinct kernel bug
-      found by bench-decode-ops. NOT on the production sm_120 decode path
-      (dispatch prefers the sm120 kpar kernel), but it poisons the
-      TEMPURA_NO_SM120_KPAR bisect and any pre-Blackwell fallback.
+- [x] q4k_gemv_dp4a_q8_raw (sm_80 Rust-codegen fallback GEMV): WRONG --
+      FOUND and FIXED (2026-10-28). Root cause: the crate's device-side
+      f16_to_f32 returned f32-DENORMAL bits for f16-subnormal inputs
+      (exp==0 path: sign | mant<<13), so every Q4_K weight block whose f16
+      super-scale d fell just below 2^-14 (extremely common -- quantizers
+      emit d right around the subnormal boundary) lost its scale term and
+      only the -dmin*m contribution survived: 414/4096 output rows off by
+      ~0.1-0.4 (additive error, invisible on large outputs -- "correct on
+      large, wrong on small"). The sm_120 PTX kernels dequant d/dmin via the
+      hardware cvt.f32.f16 and were never affected. Also fixed
+      f32_to_f16_bits (used by the SHARED quantize_q8_1 kernel): it flushed
+      subnormal f16 Q8_1 activation scales to zero, silently dropping any
+      32-element activation block with amax < ~0.0078 -- now rounds to
+      nearest subnormal. Post-fix: bench-decode-ops q8_raw rel 0.0003
+      (was 0.333), 0/4096 bad rows, one-hot sweeps (tail + main loop,
+      incl. negative d) clean; 134 tok/s decode unchanged. Regression
+      tests: the q8_raw real-weights census + crafted one-hot sweeps +
+      per-block isolation in bench-decode-ops. NOTE: the PTX is a
+      gitignored build artifact -- kernel-source changes to
+      tools/oxide-gemv-q4k require `cargo oxide build` + the out-dir copy
+      loop (see the GPU Kernels section) on every clone.
 - [x] **Short-prompt GPU prefill wrong -- FOUND and FIXED (2026-10-28, three
       distinct bugs, found by bench-quality + bench-decode-ops)**:
       1. The embedded mxf4_gemv.cubin was STALE: the 2026-10-27 accumulator

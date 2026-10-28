@@ -51,7 +51,21 @@ fn f16_to_f32(h: u32) -> f32 {
     let exp  = (h >> 10) & 0x1F;
     let mant = h & 0x3FF;
     let bits = if exp == 0 {
-        sign | (mant << 13)
+        if mant == 0 {
+            // ±0
+            sign
+        } else {
+            // f16 SUBNORMAL: value = mant * 2^-24. The old code returned
+            // sign | (mant << 13) -- an f32 DENORMAL, ~2^125x too small, so
+            // every weight block with a subnormal f16 d (common: quantizers
+            // emit d just below 2^-14) lost its scale term entirely and only
+            // the -dmin*m contribution survived (found by per-block
+            // isolation in bench-decode-ops, 2026-10-28). Normalize:
+            // mant = m << s with m in [512, 1023], value = 2^(-15-s) * 1.frac.
+            let s = mant.leading_zeros() - 22; // 0..=9
+            let m = mant << s;
+            sign | (((112 - s) as u32) << 23) | ((m & 0x1FF) << 14)
+        }
     } else if exp == 31 {
         sign | 0x7F80_0000 | (mant << 13)
     } else {
@@ -71,7 +85,28 @@ fn f32_to_f16_bits(v: f32) -> u16 {
         return (sign | 0x7C00 | (mant >> 13)) as u16;
     }
     let exp16 = exp - 127 + 15;
-    if exp16 <= 0 { return sign as u16; }
+    if exp16 <= 0 {
+        // Subnormal f16 (or underflow). The old code flushed to zero, which
+        // zeroed the Q8_1 activation scale d8 whenever a 32-element block's
+        // amax < 127 * 2^-14 (~0.0078) -- the whole block's contribution was
+        // silently dropped. Round to nearest subnormal (step 2^-24) instead.
+        if exp16 < -10 {
+            // Below half of the smallest subnormal (with the implicit bit,
+            // value < 2^-25): rounds to zero.
+            return sign as u16;
+        }
+        let shift = 14 - exp16; // 14..=24: value*2^24 = full >> shift
+        let full = 0x0080_0000 | mant; // implicit bit + 23-bit mantissa
+        let sub = full >> shift;
+        let rem = full & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        let sub = if rem >= half { sub + 1 } else { sub };
+        if sub >= 0x400 {
+            // Rounded up to the smallest NORMAL f16.
+            return (sign | 0x0400) as u16;
+        }
+        return (sign | sub) as u16;
+    }
     if exp16 >= 31 { return (sign | 0x7C00) as u16; }
     (sign | ((exp16 as u32) << 10) | (mant >> 13)) as u16
 }

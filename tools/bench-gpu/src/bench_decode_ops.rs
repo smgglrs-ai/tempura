@@ -518,6 +518,214 @@ fn main() {
         );
         all_ok &= rel3 < 0.02;
 
+        // q8_raw per-row error census + one-hot sweeps (tail and main loops).
+        {
+            let mut bad_rows = 0usize;
+            let mut first_bads: Vec<(usize, f32, f32)> = Vec::new();
+            for (i, (a, b)) in g3.iter().zip(&q8_cpu).enumerate() {
+                if (a - b).abs() > 0.05 {
+                    bad_rows += 1;
+                    if first_bads.len() < 12 {
+                        first_bads.push((i, *a, *b));
+                    }
+                }
+            }
+            println!(
+                "    q8_raw rows with |err|>0.05: {bad_rows}/{} (first: {:?})",
+                g3.len(),
+                first_bads
+            );
+
+            let scj = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+            // -- k_blocks=1 (tail path): d=1, dmin=0, sc_j=j+1, qs[b]=b ----
+            let mk = |d: f32, dmin: f32, seed: usize| -> Vec<u32> {
+                let mut b = vec![0u32; 36];
+                b[0] = f32_to_f16_bits(d) | (f32_to_f16_bits(dmin) << 16);
+                b[1] = 0x04030201;
+                b[2] = 0x01010101;
+                b[3] = 0x18171615;
+                for i in 0..32usize {
+                    let mut w = 0u32;
+                    for j in 0..4 {
+                        w |= (((seed + i * 4 + j) & 0xFF) as u32) << (8 * j);
+                    }
+                    b[4 + i] = w;
+                }
+                b
+            };
+            let expected_at = |b: &[u32], e: usize| -> f32 {
+                let d = f16_bits_to_f32((b[0] & 0xFFFF) as u16);
+                let dmin = f16_bits_to_f32((b[0] >> 16) as u16);
+                let g = e / 64;
+                let l = e % 64;
+                let byte_idx = 32 * g + (l % 32);
+                let byte = b[4 + byte_idx / 4] >> (8 * (byte_idx % 4)) & 0xFF;
+                let nib = if l < 32 { (byte & 0xF) as f32 } else { (byte >> 4) as f32 };
+                // m = 1 in every block; scales are per j-group half.
+                let sc = scj[2 * g + (l >= 32) as usize];
+                let m = 1.0f32;
+                d * sc * nib - dmin * m
+            };
+            let upload2 = |bs: Vec<u32>| -> Arc<Tensor<u32>> {
+                Arc::new(
+                    api::copy_host_vec_to_device(&Arc::new(bs))
+                        .sync_on(&stream)
+                        .expect("probe ul"),
+                )
+            };
+            // tail sweep: 1 block, dmin = 0.
+            {
+                let blk = mk(1.0, 0.0, 0);
+                let packed = upload2(vec![blk.clone(), blk.clone()].concat());
+                let mut bad = Vec::new();
+                for e in 0..256usize {
+                    let mut xv = vec![0.0f32; 256];
+                    xv[e] = 1.0;
+                    let xe_dev = upload(xv, &stream);
+                    let r = oxide_q4k
+                        .forward_q8_d2d(&xe_dev, &packed, 2, 1)
+                        .expect("tail probe failed");
+                    let v = download(&r, &stream);
+                    let exp = expected_at(&blk, e);
+                    if (v[0] - exp).abs() > 0.01 {
+                        bad.push((e, v[0], exp));
+                    }
+                }
+                println!(
+                    "    q8_raw one-hot sweep (k_blocks=1 tail): {}/256 WRONG{}",
+                    bad.len(),
+                    if bad.is_empty() { String::new() } else { format!(" first: {:?}", &bad[..bad.len().min(6)]) }
+                );
+            }
+            // main-loop sweep: 16 blocks with per-block d/dmin/qs seeds.
+            {
+                let nb = 16usize;
+                // Half the blocks use NEGATIVE d: real Q4_K weights carry
+                // negative f16 super-scales; crafted positive-only data
+                // cannot catch a sign-handling bug.
+                let dblock = |b: usize| -> f32 {
+                    if b % 2 == 1 {
+                        -(1.0 + (b % 4) as f32)
+                    } else {
+                        1.0 + (b % 4) as f32
+                    }
+                };
+                let blocks: Vec<u32> = (0..nb)
+                    .flat_map(|b| mk(dblock(b), 0.25 + 0.1 * b as f32, b * 7))
+                    .collect();
+                let per_block: Vec<Vec<u32>> = (0..nb)
+                    .map(|b| mk(dblock(b), 0.25 + 0.1 * b as f32, b * 7))
+                    .collect();
+                let packed = upload2(vec![blocks.clone(), blocks].concat());
+                let k16 = nb * 256;
+                let mut bad = Vec::new();
+                for e in (0..k16).step_by(7) {
+                    let mut xv = vec![0.0f32; k16];
+                    xv[e] = 1.0;
+                    let exp = expected_at(&per_block[e / 256], e % 256);
+                    let xe_dev = upload(xv, &stream);
+                    let r = oxide_q4k
+                        .forward_q8_d2d(&xe_dev, &packed, 2, nb)
+                        .expect("main probe failed");
+                    let v = download(&r, &stream);
+                    // Relative tolerance: the one-hot x reconstructs through
+                    // an f16 Q8 scale (~1e-4 relative error).
+                    if (v[0] - exp).abs() > 0.001 * exp.abs().max(1.0) {
+                        bad.push((e, v[0], exp));
+                    }
+                }
+                println!(
+                    "    q8_raw one-hot sweep (k_blocks=16 main, +/-d): {}/{} WRONG{}",
+                    bad.len(),
+                    (k16 + 6) / 7,
+                    if bad.is_empty() { String::new() } else { format!(" first: {:?}", &bad[..bad.len().min(8)]) }
+                );
+            }
+
+            // Per-block isolation for real-weight bad rows: run each of a
+            // bad row's 16 blocks alone (k_blocks=1) and compare against the
+            // Q8-quantized CPU dot for that block -- pinpoints WHICH block
+            // and WHAT byte pattern triggers the corruption.
+            {
+                let row_bytes = |row: usize| -> Vec<u8> {
+                    q_bytes[row * q_k_blocks * 144..(row * q_k_blocks + q_k_blocks) * 144].to_vec()
+                };
+                let mut done = 0usize;
+                for (row, _, _) in first_bads.iter().take(3) {
+                    let rb = row_bytes(*row);
+                    let mut bad_blocks = Vec::new();
+                    for blk in 0..q_k_blocks {
+                        let bytes = &rb[blk * 144..(blk + 1) * 144];
+                        let raw: Vec<u32> = bytes
+                            .chunks_exact(4)
+                            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+                        let packed1: Arc<Tensor<u32>> = Arc::new(
+                            api::copy_host_vec_to_device(&Arc::new(vec![raw.clone(), raw].concat()))
+                                .sync_on(&stream)
+                                .expect("iso ul"),
+                        );
+                        // x restricted to this block's 256 elements.
+                        let mut xv = vec![0.0f32; 256];
+                        xv.copy_from_slice(&qx[blk * 256..(blk + 1) * 256]);
+                        let xe_dev = upload(xv.clone(), &stream);
+                        let r = oxide_q4k
+                            .forward_q8_d2d(&xe_dev, &packed1, 2, 1)
+                            .expect("iso run failed");
+                        let v = download(&r, &stream);
+                        // CPU: Q8-quantized x for this block, exact weights.
+                        let mut xq = xv.clone();
+                        for c in xq.chunks_exact_mut(32) {
+                            let amax = c.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                            let d = if amax == 0.0 { 1.0 } else { amax / 127.0 };
+                            for v in c.iter_mut() {
+                                let rr = (*v / d + if *v >= 0.0 { 0.5 } else { -0.5 }) as i32;
+                                *v = rr.clamp(-127, 127) as f32 * d;
+                            }
+                        }
+                        let w = dequantize_to_f32(GgmlType::Q4K, bytes, 256);
+                        let cpu: f32 = w.iter().zip(&xq).map(|(a, b)| a * b).sum();
+                        if (v[0] - cpu).abs() > 0.02 {
+                            bad_blocks.push((blk, v[0], cpu));
+                        }
+                    }
+                    println!(
+                        "    row {row} per-block (k_blocks=1 each): {}/{} blocks WRONG {:?}",
+                        bad_blocks.len(),
+                        q_k_blocks,
+                        &bad_blocks[..bad_blocks.len().min(4)]
+                    );
+                    // Dump the failing block's header vs a good block's.
+                    for (blk, _, _) in bad_blocks.iter().take(2) {
+                        let bytes = &rb[blk * 144..(blk + 1) * 144];
+                        let d = f16_bits_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+                        let dmin = f16_bits_to_f32(u16::from_le_bytes([bytes[2], bytes[3]]));
+                        println!(
+                            "      blk {blk}: d={d:e} dmin={dmin:e} scales={:?} qs[0..8]={:?}",
+                            &bytes[4..16],
+                            &bytes[16..24]
+                        );
+                    }
+                    {
+                        let gblk = (0..q_k_blocks)
+                            .find(|b| !bad_blocks.iter().any(|(bb, _, _)| bb == b))
+                            .unwrap();
+                        let bytes = &rb[gblk * 144..(gblk + 1) * 144];
+                        let d = f16_bits_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+                        let dmin = f16_bits_to_f32(u16::from_le_bytes([bytes[2], bytes[3]]));
+                        println!(
+                            "      (good blk {gblk}: d={d:e} dmin={dmin:e} scales={:?})",
+                            &bytes[4..16]
+                        );
+                    }
+                    done += 1;
+                    if done >= 3 {
+                        break;
+                    }
+                }
+            }
+        }
+
         // Error-structure dump: ratio/correlation reveal the bug's shape
         // (scale factor? offset? permutation? missing term?).
         {
