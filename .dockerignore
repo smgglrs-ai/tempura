@@ -3,4 +3,10 @@ target/
 .github/
 .lean/
 .claude/
+docs/
+tla/
+tests-ggml/
+verus-verified/
+*.gguf
 *.md
+bench-*.json

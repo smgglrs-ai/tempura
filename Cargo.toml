@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/staticpar", "kernel-api", "kernels", "kernel-verify", "engine", "model", "server", "tools/trace-cli", "tools/bench-gpu", "tools/bench", "tools/compare", "tools/integration"]
+members = ["crates/staticpar", "kernel-api", "kernels", "kernel-verify", "engine", "model", "server", "cli", "tools/trace-cli", "tools/bench-gpu", "tools/bench", "tools/compare", "tools/integration"]
 resolver = "2"
 
 [workspace.package]

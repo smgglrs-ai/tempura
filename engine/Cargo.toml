@@ -3,7 +3,7 @@ name = "tempura-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Inference engine for tempura-serve: model loading, KV-cache, forward pass"
+description = "Inference engine for tempura: model loading, KV-cache, forward pass"
 
 [features]
 default = []

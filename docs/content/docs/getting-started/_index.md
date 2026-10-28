@@ -30,9 +30,9 @@ cargo test               # run all tests (907 total, 26 ignored)
 ## Run
 
 ```sh
-cargo run -- --help              # see CLI options
-cargo run -- --port 8080         # start server (CPU inference)
-cargo run -- --model /path/to/model --port 8080  # load a real model
+cargo run -p tempura -- --help              # see CLI options
+cargo run -p tempura -- serve --port 8080   # start server (CPU inference)
+cargo run -p tempura -- serve --model /path/to/model --port 8080  # load a real model
 ```
 
 The server exposes an OpenAI-compatible API:

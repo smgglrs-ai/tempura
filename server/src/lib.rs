@@ -1,13 +1,13 @@
 #![allow(dead_code, unused_imports)]
-mod api;
-mod auth;
-mod batch;
+pub mod api;
+pub mod auth;
+pub mod batch;
 pub mod engine_task;
 pub mod replay;
-mod sse;
-mod trace_store;
+pub mod sse;
+pub mod trace_store;
 
-use clap::Parser;
+use clap::Args;
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,33 +18,29 @@ use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Parser, Debug)]
-#[command(name = "tempura-serve", about = "Rust-native LLM inference server")]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
+pub type CpuModel = TransformerModel<
+    tempura_kernels::attention::CpuAttention,
+    tempura_kernels::rmsnorm::CpuRMSNorm,
+    tempura_kernels::rope::CpuRoPE,
+    tempura_kernels::matmul::CpuMatMul,
+    tempura_kernels::sampling::CpuSampler,
+>;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub model: Arc<dyn tempura_engine::InferenceModel>,
+    pub tokenizer: Option<Arc<Tokenizer>>,
+    pub model_id: String,
+    pub scheduler: Arc<Mutex<batch::BatchScheduler>>,
+    pub trace_store: Arc<Mutex<trace_store::TraceStore>>,
+    pub metrics_handle: PrometheusHandle,
+    pub request_timeout: std::time::Duration,
+    pub api_key: Option<String>,
+    pub engine_tx: Arc<tokio::sync::mpsc::Sender<engine_task::EngineRequest>>,
 }
 
-#[derive(clap::Subcommand, Debug)]
-enum Command {
-    /// Start the inference server (default)
-    Serve(Box<ServeArgs>),
-    /// Download a model from HuggingFace
-    Pull {
-        /// HuggingFace repo ID (e.g. TinyLlama/TinyLlama-1.1B-Chat-v1.0)
-        repo_id: String,
-    },
-    /// List downloaded models
-    List,
-    /// Inspect a model (show config, format, architecture)
-    Inspect {
-        /// Path to model file or directory
-        path: String,
-    },
-}
-
-#[derive(clap::Args, Debug)]
-struct ServeArgs {
+#[derive(Args, Debug)]
+pub struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
 
@@ -110,111 +106,7 @@ struct ServeArgs {
     api_key: Option<String>,
 }
 
-pub type CpuModel = TransformerModel<
-    tempura_kernels::attention::CpuAttention,
-    tempura_kernels::rmsnorm::CpuRMSNorm,
-    tempura_kernels::rope::CpuRoPE,
-    tempura_kernels::matmul::CpuMatMul,
-    tempura_kernels::sampling::CpuSampler,
->;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub model: Arc<dyn tempura_engine::InferenceModel>,
-    pub tokenizer: Option<Arc<Tokenizer>>,
-    pub model_id: String,
-    pub scheduler: Arc<Mutex<batch::BatchScheduler>>,
-    pub trace_store: Arc<Mutex<trace_store::TraceStore>>,
-    pub metrics_handle: PrometheusHandle,
-    pub request_timeout: std::time::Duration,
-    pub api_key: Option<String>,
-    pub engine_tx: Arc<tokio::sync::mpsc::Sender<engine_task::EngineRequest>>,
-}
-
-#[tokio::main]
-async fn main() {
-    let cli = Cli::parse();
-
-    match cli.command {
-        Some(Command::Pull { repo_id }) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::from_default_env())
-                .init();
-            let store = tempura_model::store::ModelStore::open();
-            match tempura_model::hub::pull(&store, &repo_id) {
-                Ok(entry) => {
-                    println!("Downloaded {} to {}", entry.repo_id, entry.path.display());
-                    println!(
-                        "  Format: {}, Size: {:.1} MB",
-                        entry.format,
-                        entry.size_bytes as f64 / 1_048_576.0
-                    );
-                }
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
-            }
-            return;
-        }
-        Some(Command::List) => {
-            let store = tempura_model::store::ModelStore::open();
-            let models = store.list();
-            if models.is_empty() {
-                println!(
-                    "No models installed. Use `tempura-serve pull <repo-id>` to download one."
-                );
-            } else {
-                println!("{:<40} {:<15} {:>10}", "NAME", "FORMAT", "SIZE");
-                println!("{}", "-".repeat(67));
-                for m in &models {
-                    let size_mb = m.size_bytes as f64 / 1_048_576.0;
-                    let size_str = if size_mb > 1024.0 {
-                        format!("{:.1} GB", size_mb / 1024.0)
-                    } else {
-                        format!("{:.0} MB", size_mb)
-                    };
-                    println!("{:<40} {:<15} {:>10}", m.name, m.format, size_str);
-                }
-            }
-            return;
-        }
-        Some(Command::Inspect { path }) => {
-            match tempura_model::inspect::inspect(Path::new(&path)) {
-                Ok(info) => print!("{info}"),
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
-            }
-            return;
-        }
-        Some(Command::Serve(args)) => {
-            run_server(*args).await;
-        }
-        None => {
-            run_server(ServeArgs {
-                host: "0.0.0.0".into(),
-                port: 8080,
-                model: None,
-                tokenizer: None,
-                model_config: "llama2-7b".into(),
-                max_batch_size: 32,
-                max_seq_len: 4096,
-                max_traces: 100,
-                shutdown_timeout: 30,
-                request_timeout_secs: 300,
-                otlp_endpoint: None,
-                device: "cpu".into(),
-                attn_mode: "auto".into(),
-                api_key: None,
-            })
-            .await;
-        }
-    }
-}
-
-async fn run_server(args: ServeArgs) {
+pub async fn run_server(args: ServeArgs) {
     #[cfg(feature = "openmp")]
     {
         // Allow GOMP_SPINCOUNT to be overridden; default 1000 lets threads spin
@@ -381,7 +273,7 @@ async fn run_server(args: ServeArgs) {
             .with_state(state);
 
         let addr = format!("{}:{}", args.host, args.port);
-        tracing::info!("Starting tempura-serve on {}", addr);
+        tracing::info!("Starting tempura on {}", addr);
 
         let shutdown_timeout = std::time::Duration::from_secs(args.shutdown_timeout);
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
@@ -419,7 +311,7 @@ async fn run_server(args: ServeArgs) {
             _ => ModelConfig::llama2_7b(),
         };
         tracing::warn!("No --model provided, running with unloaded weights (stub responses)");
-        (config, "tempura-serve-unloaded".to_string())
+        (config, "tempura-unloaded".to_string())
     };
 
     let model: Arc<dyn tempura_engine::InferenceModel> = if let Some(model_p) = model_path {
@@ -497,7 +389,7 @@ async fn run_server(args: ServeArgs) {
         .with_state(state);
 
     let addr = format!("{}:{}", args.host, args.port);
-    tracing::info!("Starting tempura-serve on {}", addr);
+    tracing::info!("Starting tempura on {}", addr);
 
     let shutdown_timeout = std::time::Duration::from_secs(args.shutdown_timeout);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
@@ -511,7 +403,9 @@ async fn run_server(args: ServeArgs) {
     // __llvm_profile_write_file() explicitly when built with --cfg profile_gen.
     #[cfg(profile_gen)]
     unsafe {
-        extern "C" { fn __llvm_profile_write_file() -> std::ffi::c_int; }
+        extern "C" {
+            fn __llvm_profile_write_file() -> std::ffi::c_int;
+        }
         __llvm_profile_write_file();
         eprintln!("[PGO] profile flushed");
     }
@@ -562,12 +456,12 @@ fn init_tracing(_otlp_endpoint: &Option<String>) {
             let provider = opentelemetry_sdk::trace::TracerProvider::builder()
                 .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
                 .with_resource(opentelemetry_sdk::Resource::new(vec![
-                    opentelemetry::KeyValue::new("service.name", "tempura-serve"),
+                    opentelemetry::KeyValue::new("service.name", "tempura"),
                     opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
                 ]))
                 .build();
 
-            let tracer = provider.tracer("tempura-serve");
+            let tracer = provider.tracer("tempura");
             let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
             let subscriber = tracing_subscriber::Registry::default()

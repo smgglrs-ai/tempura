@@ -3,7 +3,7 @@ name = "tempura-model"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Model management for tempura-serve: download, store, list, inspect"
+description = "Model management for tempura: download, store, list, inspect"
 
 [dependencies]
 tempura-engine = { path = "../engine" }

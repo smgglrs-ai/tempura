@@ -74,7 +74,7 @@ fn test_tempura_vs_llama_cpp_reference() {
     }
     if !tempura_available() {
         eprintln!(
-            "SKIP: tempura-serve not running on :8090 (run with --model tinyllama --port 8090)"
+            "SKIP: tempura not running on :8090 (run `tempura serve --model tinyllama --port 8090`)"
         );
         return;
     }
