@@ -41,7 +41,7 @@
 ///
 /// # Reduction
 ///
-/// Mini-warp butterfly (3-step XOR within 8-lane mini-warp, c=0x71F).
+/// Mini-warp butterfly (3-step XOR within 8-lane mini-warp, c=0x181F).
 /// Cross-warp via smem: warp 0 lanes 0..3 sum across warps per mw group.
 /// Thread 0 sums mw groups, applies SiLU, writes out[blockIdx.x].
 ///
@@ -152,7 +152,7 @@ KLOOP:
     add.u64 %rd8, %rd5, %rd8;
     mov.u32 %r21, 0;
     @%p2 ld.global.nc.b32 %r21, [%rd8];
-    shfl.sync.idx.b32 %r21, %r21, %r8, 0x71F, 0xFFFFFFFF;  // broadcast within mini-warp
+    shfl.sync.idx.b32 %r21, %r21, %r8, 0x181F, 0xFFFFFFFF;  // broadcast within mini-warp
 
     // -- Load gate min word: u32[6 + mw]
     add.u32 %r22, %r6, 6;
@@ -161,21 +161,21 @@ KLOOP:
     add.u64 %rd8, %rd5, %rd8;
     mov.u32 %r23, 0;
     @%p2 ld.global.nc.b32 %r23, [%rd8];
-    shfl.sync.idx.b32 %r23, %r23, %r8, 0x71F, 0xFFFFFFFF;
+    shfl.sync.idx.b32 %r23, %r23, %r8, 0x181F, 0xFFFFFFFF;
 
     // -- Load up scale word: u32[2 + mw]
     cvt.u64.u32 %rd8, %r20;
     add.u64 %rd8, %rd6, %rd8;
     mov.u32 %r24, 0;
     @%p2 ld.global.nc.b32 %r24, [%rd8];
-    shfl.sync.idx.b32 %r24, %r24, %r8, 0x71F, 0xFFFFFFFF;
+    shfl.sync.idx.b32 %r24, %r24, %r8, 0x181F, 0xFFFFFFFF;
 
     // -- Load up min word: u32[6 + mw]
     cvt.u64.u32 %rd8, %r22;
     add.u64 %rd8, %rd6, %rd8;
     mov.u32 %r25, 0;
     @%p2 ld.global.nc.b32 %r25, [%rd8];
-    shfl.sync.idx.b32 %r25, %r25, %r8, 0x71F, 0xFFFFFFFF;
+    shfl.sync.idx.b32 %r25, %r25, %r8, 0x181F, 0xFFFFFFFF;
 
     // -- Extract scale/min byte fields
     // sc_lo = word & 0xFF, sc_hi = (word >> 8) & 0xFF
@@ -336,27 +336,28 @@ KLOOP:
     bra KLOOP;
 
     // -- Mini-warp butterfly reduction ----------------------------------------
-    // 3-step XOR within 8-lane mini-warp. c=0x71F: segMask=7, maxLane=31.
+    // 3-step XOR within 8-lane mini-warp. c=0x181F: nvcc width-8 encoding
+    // (the old 0x71F broke mini-warp 3 -- see q4k_gemv_v4_ptx.rs header).
     // After 3 steps all lanes in each mini-warp hold the mini-warp partial sum.
 REDUCE:
     mov.b32 %r58, %f0;
-    shfl.sync.bfly.b32 %r59, %r58, 4, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r59, %r58, 4, 0x181F, 0xFFFFFFFF;
     mov.b32 %f24, %r59; add.f32 %f0, %f0, %f24;
     mov.b32 %r58, %f0;
-    shfl.sync.bfly.b32 %r59, %r58, 2, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r59, %r58, 2, 0x181F, 0xFFFFFFFF;
     mov.b32 %f24, %r59; add.f32 %f0, %f0, %f24;
     mov.b32 %r58, %f0;
-    shfl.sync.bfly.b32 %r59, %r58, 1, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r59, %r58, 1, 0x181F, 0xFFFFFFFF;
     mov.b32 %f24, %r59; add.f32 %f0, %f0, %f24;
 
     mov.b32 %r58, %f1;
-    shfl.sync.bfly.b32 %r59, %r58, 4, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r59, %r58, 4, 0x181F, 0xFFFFFFFF;
     mov.b32 %f24, %r59; add.f32 %f1, %f1, %f24;
     mov.b32 %r58, %f1;
-    shfl.sync.bfly.b32 %r59, %r58, 2, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r59, %r58, 2, 0x181F, 0xFFFFFFFF;
     mov.b32 %f24, %r59; add.f32 %f1, %f1, %f24;
     mov.b32 %r58, %f1;
-    shfl.sync.bfly.b32 %r59, %r58, 1, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r59, %r58, 1, 0x181F, 0xFFFFFFFF;
     mov.b32 %f24, %r59; add.f32 %f1, %f1, %f24;
 
     // -- Write mini-warp sums to smem (sub_l == 0 only) -----------------------

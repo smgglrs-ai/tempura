@@ -319,13 +319,13 @@ KLOOP:
 REDUCE:
     // Row 0: 3-step XOR butterfly within 8-lane mini-warp
     mov.b32 %r50, %f0;
-    shfl.sync.bfly.b32 %r51, %r50, 4, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r51, %r50, 4, 0x181F, 0xFFFFFFFF;
     mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
     mov.b32 %r50, %f0;
-    shfl.sync.bfly.b32 %r51, %r50, 2, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r51, %r50, 2, 0x181F, 0xFFFFFFFF;
     mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
     mov.b32 %r50, %f0;
-    shfl.sync.bfly.b32 %r51, %r50, 1, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r51, %r50, 1, 0x181F, 0xFFFFFFFF;
     mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
 
     // sub_l==0 writes row 0 mini-warp sum to smem[0..127]
@@ -338,13 +338,13 @@ REDUCE:
 
     // Row 1: 3-step XOR butterfly within 8-lane mini-warp
     mov.b32 %r50, %f19;
-    shfl.sync.bfly.b32 %r51, %r50, 4, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r51, %r50, 4, 0x181F, 0xFFFFFFFF;
     mov.b32 %f18, %r51; add.f32 %f19, %f19, %f18;
     mov.b32 %r50, %f19;
-    shfl.sync.bfly.b32 %r51, %r50, 2, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r51, %r50, 2, 0x181F, 0xFFFFFFFF;
     mov.b32 %f18, %r51; add.f32 %f19, %f19, %f18;
     mov.b32 %r50, %f19;
-    shfl.sync.bfly.b32 %r51, %r50, 1, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r51, %r50, 1, 0x181F, 0xFFFFFFFF;
     mov.b32 %f18, %r51; add.f32 %f19, %f19, %f18;
 
     // sub_l==0 writes row 1 mini-warp sum to smem[128..255]

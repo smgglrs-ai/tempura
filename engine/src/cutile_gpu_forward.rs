@@ -3445,7 +3445,11 @@ impl CutileGpuModel {
         seq_len: usize,
     ) -> (Arc<Tensor<f32>>, Arc<Tensor<f32>>, Arc<Tensor<f32>>) {
         // Multi-stream path: oxide f32 GEMV available for Q4K, Q6K, or Q2 K/V weights.
-        if seq_len == 1 {
+        // TEMPURA_NO_MULTISTREAM=1 bisects the stream_kv fork/join off (decode
+        // numerics debugging -- see bench-quality / bench-decode-ops).
+        if seq_len == 1
+            && std::env::var("TEMPURA_NO_MULTISTREAM").as_deref() != Ok("1")
+        {
             let has_q4k_kv = self.oxide_q4k_gemv.is_some()
                 && (self.device_weights_q4k.contains_key(k_name)
                     || self.device_weights_q6k.contains_key(k_name)
@@ -3973,7 +3977,11 @@ impl CutileGpuModel {
         slot: usize,
     ) -> Arc<Tensor<f32>> {
         // -- Decode (m == 1): on-GPU dequant GEMV with pre-allocated scratch ---
-        if m == 1 && self.device_weights_q4k.contains_key(weight_name) {
+        // TEMPURA_DECODE_F32_GEMV=1 bisects the quantized GEMVs off: the step
+        // runs through the exact f32 host-dequant GEMM (prefill-style) instead.
+        let f32_decode = m == 1
+            && std::env::var("TEMPURA_DECODE_F32_GEMV").as_deref() == Ok("1");
+        if m == 1 && !f32_decode && self.device_weights_q4k.contains_key(weight_name) {
             return self.gemm_q4k_d2d_slot(a, weight_name, slot);
         }
         if m == 1 && self.device_weights_q6k.contains_key(weight_name) {
@@ -3995,10 +4003,9 @@ impl CutileGpuModel {
                 return out;
             }
         }
-        if m > 1 {
+        if m > 1 || f32_decode {
             // Q4_K prefill: reconstruct f32 from GPU format (packed 42-u32 or raw GGUF 36-u32).
-            if let Some(dw) = self.device_weights_q4k.get(weight_name) {
-                let k = dw.k_blocks * Q4K_BLOCK_SIZE;
+            if let Some(dw) = self.device_weights_q4k.get(weight_name) {                let k = dw.k_blocks * Q4K_BLOCK_SIZE;
                 let packed_host: Vec<u32> = Arc::clone(&dw.tensor)
                     .to_host_vec()
                     .sync_on(self.matmul.stream())
@@ -4079,14 +4086,33 @@ impl CutileGpuModel {
                 }
                 let k_pad = next_pow2(k.div_ceil(BK) * BK);
                 let w_dev = self.to_device_padded(&f32_weights, dw.n, k, k_pad);
-                let a_gemm = self.pad_prefill_activation_for_f32_gemm(a, m, k, k_pad);
-                return self.matmul
+                let a_gemm = if m == 1 {
+                    // f32_decode bisect: decode activations arrive rank-1.
+                    let host = self.download_device_tensor(a);
+                    self.to_device_padded(&host, 1, k, k_pad)
+                } else {
+                    self.pad_prefill_activation_for_f32_gemm(a, m, k, k_pad)
+                };
+                let out = self.matmul
                     .forward_bt_device_to_device(&a_gemm, &w_dev, m, dw.n, k_pad)
                     .expect("gemm_any_d2d_slot Q4_K prefill GEMM failed");
+                if m == 1 {
+                    // f32_decode bisect: decode consumers expect a rank-1 [n]
+                    // tensor; the f32 GEMM returns rank-2 with partition stride
+                    // metadata that survives Arc-level reshape. Flatten via the
+                    // host (eager mode only -- this switch requires DEBUG_NAN).
+                    let host = self.download_device_tensor(&out);
+                    return self.to_device_flat_padded(&host, 1, dw.n, dw.n);
+                }
+                return out;
             }
 
             // Q6_K prefill: reconstruct f32 from packed GPU format (53 u32/block, ql+qh).
-            if let Some(dw) = self.device_weights_q6k.get(weight_name) {
+            // (f32_decode bisect skips this: the m=1 activation arrives rank-1
+            // and the q6k kpar GEMV is independently validated.)
+            if m > 1
+            {
+                if let Some(dw) = self.device_weights_q6k.get(weight_name) {
                 let k = dw.k_blocks * Q6K_QK;
                 let packed_host: Vec<u32> = Arc::clone(&dw.tensor)
                     .to_host_vec()
@@ -4130,6 +4156,7 @@ impl CutileGpuModel {
                 return self.matmul
                     .forward_bt_device_to_device(&a_gemm, &w_dev, m, dw.n, k_pad)
                     .expect("gemm_any_d2d_slot Q6K prefill GEMM failed");
+                }
             }
 
             // Q2_0 prefill: reconstruct f32 from packed GPU format.
@@ -4573,6 +4600,11 @@ impl CutileGpuModel {
             let (q_dev, k_dev, v_dev) = self.dispatch_qkv_multistream(
                 &normed_dev, q_w_name, k_w_name, v_w_name, seq_len,
             );
+            if self.debug_nan_trace {
+                self.nan_report(&format!("L{layer} q-proj"), &q_dev);
+                self.nan_report(&format!("L{layer} k-proj"), &k_dev);
+                self.nan_report(&format!("L{layer} v-proj"), &v_dev);
+            }
 
             // RoPE (GPU, pre-allocated scratch; uses precomputed cos/sin table for seq_len=1).
             // Graph-stable path: the cos/sin row for the CURRENT position is
@@ -5010,9 +5042,15 @@ impl CutileGpuModel {
         // inter_pad/h_pad: padding is handled via D->D copy (capturable).
         // cuTile GEMV uses async_on (capture-compatible); warmup covers all needed
         // shapes, so no JIT compilation happens inside capture.
+        // TEMPURA_FORCE_PREFILL_M1=1: bisect switch that routes a single-token
+        // forward through the prefill loop (host-staged attention, prefill
+        // GEMMs) instead of the decode path -- used with TEMPURA_DEBUG_NAN to
+        // diff per-op bits_sums between two m=1 runs (decode bug hunting).
+        // TEMPURA_DEBUG_NAN prints the gate values here when set.
         if seq_len == 1
             && gpu_kv_cache.has_device_kv()
             && !cfg.use_alibi
+            && std::env::var("TEMPURA_FORCE_PREFILL_M1").as_deref() != Ok("1")
         {
             if self.oxide_decode_attn.is_some()
                 && position < self.cutile_rope.table_max_pos()
