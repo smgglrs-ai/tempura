@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BOLT post-link optimization for tempura-serve.
+# BOLT post-link optimization for tempura.
 # Requires: llvm-bolt, merge-fdata (both in /usr/bin from llvm-bolt package).
 #
 # BOLT operates at binary level -- no LLVM source instrumentation, so the
@@ -20,12 +20,12 @@ MODEL=${1:-/home/fdupont/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M
 PORT=8099
 THREADS=16
 BOLT_DIR=/tmp/bolt-data
-BINARY=target/release/tempura-serve
+BINARY=target/release/tempura
 
 echo "=== Step 1: Build with --emit-relocs (BOLT requirement) ==="
 mkdir -p "$BOLT_DIR" && rm -f "$BOLT_DIR"/*.fdata
 RUSTFLAGS="-C target-cpu=native -C link-arg=-Wl,--emit-relocs" \
-  cargo build --release --bin tempura-serve
+  cargo build --release --bin tempura
 ls -lh "$BINARY"
 
 echo "=== Step 2: Instrument binary with BOLT ==="

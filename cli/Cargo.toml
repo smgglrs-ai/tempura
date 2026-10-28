@@ -1,0 +1,23 @@
+[package]
+name = "tempura"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "tempura command-line interface: serve, pull, list, inspect"
+
+[dependencies]
+tempura-server = { path = "../server" }
+tempura-model = { path = "../model" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+cuda = ["tempura-server/cuda"]
+cutile = ["tempura-server/cutile"]
+otlp = ["tempura-server/otlp"]
+openmp = ["tempura-server/openmp"]
+
+[lints]
+workspace = true

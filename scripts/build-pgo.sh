@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PGO build script for tempura-serve.
+# PGO build script for tempura.
 # Requires: rustup component add llvm-tools-preview (for matching llvm-profdata)
 set -euo pipefail
 
@@ -12,16 +12,16 @@ PROFDATA=$(find ~/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu \
 
 echo "=== Step 1: Instrumented build (profile_gen cfg enabled) ==="
 mkdir -p "$PGO_DIR" && rm -f "$PGO_DIR"/*.profraw
-touch server/src/main.rs  # force rebuild
+touch server/src/lib.rs cli/src/main.rs  # force rebuild
 RUSTFLAGS="-Cprofile-generate=$PGO_DIR --cfg profile_gen" \
-  cargo build --release -p tempura-serve
+  cargo build --release -p tempura
 
 echo "=== Step 2: Collect profile (prefill + decode coverage) ==="
 # Note: instrumented binary is ~10x slower -- requests may take 5-10 minutes each.
 # We use curl with a 30-minute timeout and send a mix of prefill + decode requests.
 fuser -k $PORT/tcp 2>/dev/null || true; sleep 1
 LLVM_PROFILE_FILE="$PGO_DIR/tempura-%p.profraw" TEMPURA_THREADS=$THREADS \
-  ./target/release/tempura-serve serve --model "$MODEL" \
+  ./target/release/tempura serve --model "$MODEL" \
   --port $PORT --max-seq-len 512 > /tmp/pgo-srv.log 2>&1 &
 SRV_PID=$!
 
@@ -56,5 +56,5 @@ ls -lh /tmp/pgo-merged.profdata
 
 echo "=== Step 4: PGO-optimized build ==="
 RUSTFLAGS="-Cprofile-use=/tmp/pgo-merged.profdata" \
-  cargo build --release -p tempura-serve
+  cargo build --release -p tempura
 echo "Done -- run the benchmark to verify."

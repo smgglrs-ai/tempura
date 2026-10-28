@@ -40,8 +40,9 @@ parity with bitnet.cpp; short-prompt prefill up to 2x faster.
 - **crates/staticpar/** -- Static-partition thread pool (spin/condvar hybrid, epoch barrier).
 - **kernel-verify/** -- DualPipeline numerical comparison of kernel implementations.
 - **engine/** -- Inference engine: 6 architecture families (29 model_types), hybrid attention/DeltaNet layers, MoE, KV caches (F16/paged/FP8/prefix), GGUF + safetensors loaders, speculative decoding, Medusa, disaggregated prefill/decode, CUDA-graph execution.
-- **model/** -- HuggingFace hub download/inspect CLI.
-- **server/** -- OpenAI-compatible HTTP API (chat/completions/responses/embeddings), continuous batching with priority preemption, SSE streaming, Prometheus metrics.
+- **model/** -- HuggingFace hub download/inspect library (model store at `~/.tempura/models`).
+- **server/** -- OpenAI-compatible HTTP API (chat/completions/responses/embeddings), continuous batching with priority preemption, SSE streaming, Prometheus metrics. Library crate.
+- **cli/** -- The `tempura` binary: `serve`, `pull`, `list`, `inspect`.
 - **tools/** -- trace-cli (TUI trace viewer), bench, bench-gpu, compare, integration (workspace); oxide-gemv{,-q4k,-q6k}, oxide-decode-attn, mxf4-gemv (standalone `cargo oxide` crates).
 - **verus-verified/** -- Standalone Verus deductive proofs (own toolchain, 80 modules).
 - **tla/** -- TLA+ specs: BatchScheduler, SpeculativeDecoding (TLC-checked).
@@ -53,9 +54,9 @@ parity with bitnet.cpp; short-prompt prefill up to 2x faster.
 ```sh
 cargo build
 cargo test
-cargo run -- --help
-cargo run -- pull TinyLlama/TinyLlama-1.1B-Chat-v1.0   # download from HuggingFace
-cargo run -- serve --model /path/to/model.gguf --port 8080
+cargo run -p tempura -- --help
+cargo run -p tempura -- pull TinyLlama/TinyLlama-1.1B-Chat-v1.0   # download from HuggingFace
+cargo run -p tempura -- serve --model /path/to/model.gguf --port 8080
 ```
 
 ## GPU (cuda-oxide)

@@ -1,4 +1,4 @@
-# tempura-serve
+# tempura
 
 Rust-native LLM inference server, started as a translation of llama.cpp and
 now an independent engine. **Research project today; the ambition is a real
@@ -24,7 +24,7 @@ commit.**
 
 ## Architecture
 
-Twelve workspace crates (see root `Cargo.toml`), one standalone verification
+Thirteen workspace crates (see root `Cargo.toml`), one standalone verification
 crate, five standalone `cargo oxide` tool crates, plus TLA+ specs, C
 cross-validation vectors, and a Zola docs site.
 
@@ -38,8 +38,10 @@ kernel-verify ─ DualPipeline numerical comparison of kernel impls
     │
 engine ──────── models, KV caches, loaders, traces, decoding strategies
     │
-    ├─ model ─── HuggingFace hub download/inspect (CLI: pull/list/inspect)
-    └─ server ── Axum HTTP: OpenAI-compatible API + tempura extensions
+    ├─ model ─── HuggingFace hub download/inspect (library)
+    ├─ server ── Axum HTTP library: OpenAI-compatible API + tempura
+    │             extensions
+    └─ cli ───── the `tempura` binary: serve, pull, list, inspect
 
 tools/ (workspace): trace-cli (TUI trace viewer), bench (HTTP throughput),
   bench-gpu (7 GPU benchmarks), compare (server-vs-server), integration
@@ -116,10 +118,12 @@ docs/ (Zola site, deployed by .github/workflows/pages.yml)
     templates), `trace.rs`/`trace_diff.rs` (first-class traces),
     `cutile_gpu_forward.rs` (~6.7k lines, CUDA-graph decode).
 
-- **model/** (`tempura-model`) — `tempura-serve pull <repo-id>` HuggingFace
-  download, `list`, `inspect` (format/arch detection).
+- **model/** (`tempura-model`) — HuggingFace hub download/inspect library
+  (`pull`, `list`, `inspect` format/arch detection; consumed by the CLI).
+  Model store at `~/.tempura/models` (legacy `~/.tempura-serve/models`
+  still used when present).
 
-- **server/** (`tempura-server`, ~4.2k lines) — Axum. OpenAI-compatible:
+- **server/** (`tempura-server`, ~4.2k lines, library) — Axum. OpenAI-compatible:
   `/v1/chat/completions` (SSE streaming, `stream_options.include_usage`,
   `seed`, `max_completion_tokens` alias, logprobs, n, penalties, tools,
   `response_format` json_object/json_schema, guided decoding wired into
@@ -135,6 +139,12 @@ docs/ (Zola site, deployed by .github/workflows/pages.yml)
   (`engine_task.rs`, mpsc-fed) with 512-token chunked prefill;
   `batch.rs` `BatchScheduler` does slot allocation, priority preemption,
   preemption-requeue, prefix matching.
+
+- **cli/** (`tempura`) — the `tempura` binary: `serve` (delegates to
+  tempura-server's `run_server`), `pull`/`list`/`inspect` (tempura-model).
+  Forwards `cuda`/`cutile`/`otlp`/`openmp` features to tempura-server; builds
+  with `cargo build -p tempura`. API-visible identity strings
+  (`system_fingerprint`, `owned_by`, OTel `service.name`) are `tempura`.
 
 - **verus-verified/** (standalone, own `rust-toolchain.toml`, stable 1.96.0) —
   deductive proofs for ALL inputs. 80 modules, 588 proof functions. Re-declares
@@ -156,7 +166,7 @@ docs/ (Zola site, deployed by .github/workflows/pages.yml)
 - **docs/** — Zola site with a full curriculum (math → hardware → kernel math
   → verification → serving); deployed by CI (`pages.yml`).
 
-Scale: 173 first-party Rust files, ~142k lines (workspace crates + tools;
+Scale: 174 first-party Rust files, ~142k lines (workspace crates + tools;
 excludes all `target/` dirs with their generated cuda-bindings, and
 `.claude/worktrees/` copies), plus 80 Verus proof modules (~13.6k lines).
 853 commits on main. CI: `kani.yml` (Kani 0.67.0 on
@@ -260,7 +270,9 @@ Qwen3.6-27B weights** — see open work.
   - kernels: `cpu` (default), `cuda` (alias of `cutile`), `cutile`,
     `oxide-gemv`, `npu-intel`, `npu-qualcomm`, `openmp`
   - engine: `cuda`, `cutile`, `oxide-gemv`, `edge-metrics`, `openmp`
-  - server: `cuda`, `cutile`, `otlp`, `openmp`
+  - server (lib): `cuda`, `cutile`, `otlp`, `openmp`
+  - cli: same four, forwarded to tempura-server (the `tempura` binary lives
+    here — `cargo build -p tempura --features otlp` etc.)
 - NEVER RUN MULTIPLE INSTANCES AT THE SAME TIME. CHECK AVAILABLE MEMORY.
 - Update this file when adding crates/modules/capabilities — CLAUDE.md is a
   symlink to it, so one edit covers both.
@@ -446,8 +458,8 @@ cargo build              # build all workspace crates
 cargo test               # 907 test functions (26 ignored)
 cargo kani --package tempura-kernels   # 240 Kani harnesses (kernels+engine)
 ./scripts/run-verus.sh   # 588 Verus proof functions, 80 modules
-cargo run -- --help      # CLI: serve, pull, list, inspect
-cargo run -- serve --model /path/to/model.gguf --port 8080
+cargo run -p tempura -- --help   # CLI: serve, pull, list, inspect
+cargo run -p tempura -- serve --model /path/to/model.gguf --port 8080
 ```
 
 Note: `cargo test` compiles `tempura-kernels` with the `oxide-gemv` feature

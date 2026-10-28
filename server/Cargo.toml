@@ -1,9 +1,9 @@
 [package]
-name = "tempura-serve"
+name = "tempura-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "OpenAI-compatible HTTP server for tempura-serve"
+description = "OpenAI-compatible HTTP server library for tempura"
 
 [dependencies]
 tempura-engine = { path = "../engine" }

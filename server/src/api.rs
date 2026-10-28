@@ -758,7 +758,7 @@ async fn chat_completions(
             object: "chat.completion".to_string(),
             created: 0,
             model: req.model,
-            system_fingerprint: format!("tempura-serve-{}", env!("CARGO_PKG_VERSION")),
+            system_fingerprint: format!("tempura-{}", env!("CARGO_PKG_VERSION")),
             choices,
             usage: Usage {
                 prompt_tokens,
@@ -932,7 +932,7 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
         data: vec![ModelInfo {
             id: state.model_id.clone(),
             object: "model".to_string(),
-            owned_by: "tempura-serve".to_string(),
+            owned_by: "tempura".to_string(),
         }],
     })
 }

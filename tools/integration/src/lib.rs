@@ -12,7 +12,7 @@ impl TestServer {
         let mut path = std::env::current_exe().unwrap();
         path.pop(); // deps/
         path.pop(); // debug/
-        path.push("tempura-serve");
+        path.push("tempura");
         path
     }
 
@@ -23,7 +23,7 @@ impl TestServer {
             Command::new(&binary)
         } else {
             let mut c = Command::new("cargo");
-            c.args(["run", "--quiet", "--package", "tempura-serve", "--"]);
+            c.args(["run", "--quiet", "--package", "tempura", "--"]);
             c
         };
         cmd.args([
@@ -35,7 +35,7 @@ impl TestServer {
             "--api-key",
             api_key,
         ]);
-        let child = cmd.spawn().expect("failed to spawn tempura-serve");
+        let child = cmd.spawn().expect("failed to spawn tempura");
         for _ in 0..150 {
             std::thread::sleep(std::time::Duration::from_millis(100));
             if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
@@ -77,7 +77,7 @@ pub fn shared_server_url() -> String {
             Command::new(&binary)
         } else {
             let mut c = Command::new("cargo");
-            c.args(["run", "--quiet", "--package", "tempura-serve", "--"]);
+            c.args(["run", "--quiet", "--package", "tempura", "--"]);
             c
         };
         cmd.args([
@@ -87,7 +87,7 @@ pub fn shared_server_url() -> String {
             "--model-config",
             "tiny-test",
         ]);
-        let child = cmd.spawn().expect("failed to spawn tempura-serve");
+        let child = cmd.spawn().expect("failed to spawn tempura");
         std::mem::forget(child);
         for _ in 0..150 {
             std::thread::sleep(std::time::Duration::from_millis(100));
