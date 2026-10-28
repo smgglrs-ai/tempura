@@ -458,15 +458,34 @@ typical-p/repeat/presence/frequency)
       found by bench-decode-ops. NOT on the production sm_120 decode path
       (dispatch prefers the sm120 kpar kernel), but it poisons the
       TEMPURA_NO_SM120_KPAR bisect and any pre-Blackwell fallback.
-- [ ] **Short-prompt GPU prefill is broken (2026-10-28, found by
-      bench-quality)**. At m~11 (real 11-token prompt): the MXFP4 fast path
-      diverges from CPU by max_abs ~17 (rel >1), and the TEMPURA_NO_GPU_PREFILL
-      host-dequant fallback emits ALL-NaN logits (128256/128256 entries).
-      At m=85 both paths are finite with argmax match (fast: max_abs 4.08,
-      fallback: 1.77). The pp128 A/B numbers do not hold at small m;
-      suspect m_pad/m_valid handling or chunked-GEMV row caps. Note
-      f32::max-based max_abs diffs silently swallow NaNs -- use the
-      nan_diffs counter pattern from bench-quality when comparing.
+- [x] **Short-prompt GPU prefill wrong -- FOUND and FIXED (2026-10-28, three
+      distinct bugs, found by bench-quality + bench-decode-ops)**:
+      1. The embedded mxf4_gemv.cubin was STALE: the 2026-10-27 accumulator
+         store-mapping fix (11d2d7c) changed tools/mxf4-gemv/src/main.rs but
+         the cubin was never rebuilt/committed -- the engine ran the pre-fix
+         kernel (rows written past the m16 tile into the cudaMallocAsync
+         pool; outputs allocation-history dependent) while the standalone
+         tool compiled the fixed source and passed. Symlink-style trap: the
+         tool validates SOURCE, the engine runs the CHECKED-IN BINARY.
+         Lesson recorded below in the mxf4 build recipe. Post-rebuild the
+         bench-decode-ops quant+GEMM composition test is bit-exact at every
+         m (the old cubin failed at ALL m including 128; uniform-scale and
+         permutation-cancelling random-nibble tests cannot catch it).
+      2. cutile_flash_attn_head computed num_kv_tiles = kv_len / BC
+         (truncating): kv_len=12 gave 0 tiles (all-NaN logits from 0/0) and
+         kv_len=85 silently dropped keys 64..84 for the last rows. Fixed to
+         ceil_div -- this also cut the m=86 host-dequant prefill delta from
+         1.77 to 0.34 and the teacher-forced decode delta from 1.87 to 0.37.
+      3. The GGUF tokenizer defaulted add_bos=false when the
+         tokenizer.ggml.add_bos_token key is absent -- Llama-3.1 GGUFs ship
+         bos_token_id without that key, so prompts lost their BOS
+         (generation degraded, worst on short prompts). from_gguf_metadata
+         now defaults BOS-on for the llama/mistral/gemma families (llama.cpp
+         LLM_ARCH semantics); llama.cpp-arbiter verified.
+      Post-fix: fast prefill argmax-MATCH at every prompt length (m=13: 3.43,
+      m=86: 1.91, both vs the CPU reference -- the intrinsic MXFP4 4-bit
+      noise band, matching the documented pp128 A/B rel 0.10); short-prompt
+      CPU and GPU continuations are identical text.
 - [x] Generation-quality validation of the MXFP4/decode paths (2026-10-28):
       bench-quality (greedy GPU-vs-CPU continuation, per-position argmax
       agreement, teacher forcing, NaN-aware diffs, GPU decode-vs-prefill
@@ -588,6 +607,15 @@ done
 # above — upstream backend (nested tree), cutlass-mlir device backend, and the
 # managed CUTLASS compiler. The cubin is include_bytes!()d by tempura-kernels,
 # so a normal cargo build picks it up after this step.
+#
+# WARNING (2026-10-28 stale-cubin incident): any change to
+# tools/mxf4-gemv/src/main.rs MUST be followed by this rebuild AND a commit
+# of the regenerated mxf4_gemv.cubin in the SAME commit. The standalone
+# `mxf4-gemv` binary compiles from source and will pass while the engine
+# runs the checked-in binary -- a stale cubin shipped the pre-fix
+# accumulator store mapping for a day and produced allocation-history-
+# dependent garbage prefill outputs. Regression test: bench-decode-ops
+# "mxfp4 quant+gemm composition" (bit-exact, real quant scales, padded m).
 cd tools/mxf4-gemv
 export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
 export CUDA_OXIDE_CUTLASS_COMPILER=~/.cargo/cuda-oxide/toolchains/cutlass/4.7.0/x86_64-cu13/lib/libCutlassCompiler.so
@@ -619,8 +647,11 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       64/64 identical tokens free-running, 134 tok/s unchanged)
 - Llama-3.1-8B Q4K prefill: **408 tok/s pp128**, TTFT P50 314 ms
       (18x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
-      exact-dequant max |logit| rel 0.10. CAVEAT 2026-10-28: these hold at
-      m=128 only -- small-m prefill is broken, see open work)
+      exact-dequant max |logit| rel 0.10. Re-verified 2026-10-28 with the
+      freshly rebuilt cubin + flash-attn tile fix: 400 tok/s, A/B rel 0.1015,
+      and fast-prefill argmax-MATCH vs the CPU reference at every prompt
+      length -- the 2026-10-28 small-m caveat is resolved, see open work's
+      fixed item)
 - Llama-3.1-8B Q4K batch decode (2026-10-27, post-store-mapping-fix, NO
       bisect switches; verified = NaN scan every step + final-step
       fingerprints + fresh-cache replay bitwise identical; every M>=2

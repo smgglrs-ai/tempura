@@ -68,7 +68,13 @@ pub mod kernels {
 
         let part_k = k.partition(shape![BC, D]);
         let part_v = v.partition(shape![BC, D]);
-        let num_kv_tiles: i32 = kv_len / BC;
+        // Ceil, NOT truncating division: K/V buffers are padded to a multiple
+        // of BC and the bounds mask (offs_n < kv_len) excludes the pad, but a
+        // truncated count DROPS the final partial tile entirely -- kv_len=12
+        // gave 0 tiles (all-NaN output from 0/0) and kv_len=85 silently
+        // skipped keys 64..84 for the last rows (found by bench-quality
+        // small-m prefill NaN + nan-trace, 2026-10-28).
+        let num_kv_tiles: i32 = ceil_div(kv_len, BC);
 
         // Causal boundary: only process KV tiles reachable from this Q tile.
         // cache_offset = kv_len - seq_len (positions already in KV cache before current tokens).
