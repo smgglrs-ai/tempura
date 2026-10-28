@@ -168,9 +168,12 @@ fn greedy_generate(
             break;
         }
         // Teacher forcing keeps both paths on the reference token sequence;
-        // EOS only ends the run when the reference itself ended there.
+        // EOS only ends the run when the reference itself ended there. The
+        // next token to FEED is the one just pushed (its logits come next):
+        // feed follow[len-1], NOT follow[len] (an off-by-one here skips the
+        // first generated token and invalidates the whole comparison).
         let next = match follow {
-            Some(seq) => seq.get(run.tokens.len()).copied(),
+            Some(seq) => seq.get(run.tokens.len() - 1).copied(),
             None => Some(tok),
         };
         let next = match next {
@@ -358,6 +361,49 @@ fn main() {
             "free-running"
         },
     );
+
+    // TEMPURA_QUALITY_GPU_SELFTEST=1: recompute each teacher-forced position
+    // via a fresh GPU prefill (host-dequant, TEMPURA_NO_GPU_PREFILL respected)
+    // of [prompt + tokens so far] and compare last-row logits against the
+    // decode path -- a GPU-internal measure of decode-path error with no CPU
+    // reference involved.
+    let gpu_selftest = std::env::var("TEMPURA_QUALITY_GPU_SELFTEST").as_deref() == Ok("1");
+    let mut selftest_deltas: Vec<f32> = Vec::new();
+    if gpu_selftest {
+        println!("\n--- GPU decode-vs-prefill self-test ---");
+        for j in 0..gpu_run.logits.len() {
+            let mut prefix = prompt.clone();
+            prefix.extend_from_slice(&cpu_run.tokens[..j]);
+            let mut sess = InferenceSession::new(&config, TraceLevel::Off, 0);
+            let pl = forward_catch(&wrapper, &mut sess, &prefix)
+                .expect("selftest prefill failed");
+            let dl = &gpu_run.logits[j];
+            let mut max_abs = 0.0f32;
+            let mut nan_diffs = 0usize;
+            for (a, b) in pl.iter().zip(dl) {
+                if a.is_nan() || b.is_nan() {
+                    if a.is_nan() != b.is_nan() {
+                        nan_diffs += 1;
+                    }
+                } else {
+                    max_abs = max_abs.max((a - b).abs());
+                }
+            }
+            selftest_deltas.push(max_abs);
+            // Prefill-vs-CPU for the same position: if this grows with j, the
+            // reference side (longer prefills) is what drifts, not decode.
+            let cl = &cpu_run.logits[j];
+            let mut pf_max = 0.0f32;
+            for (a, b) in pl.iter().zip(cl) {
+                if !a.is_nan() && !b.is_nan() {
+                    pf_max = pf_max.max((a - b).abs());
+                }
+            }
+            println!(
+                "  pos {j:>3}: prefill-vs-decode max_abs={max_abs:.4} prefill-vs-cpu={pf_max:.4} nan_diffs={nan_diffs}"
+            );
+        }
+    }
 
     // --- Comparison ---
     let cmp = compare_runs(&cpu_run, &gpu_run);

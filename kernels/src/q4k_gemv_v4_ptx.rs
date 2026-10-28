@@ -77,7 +77,12 @@ pub const PTX: &str = r#"
 //
 // Block: 256 threads = 8 warps. K-parallel: warp w handles blk w, w+8, w+16, ...
 // Scale extraction: BRANCHLESS (selp) -- avoids ITS warp divergence.
-// shfl.sync.bfly c=0x71F: segMask=7, maxLane=31 (correct for 8-lane mini-warp).
+// shfl.sync.bfly c=0x181F: nvcc's encoding for __shfl_xor_sync(..., width=8)
+// (verified via nvcc --ptx on sm_120). The previous c=0x71F silently collapsed
+// mini-warp 3 (lanes 24-31) onto lane 24: the reduction returned 8x lane-24's
+// partial and dropped sub_l 1-7 -- j-group 3 contributed garbage whenever its
+// qs bytes were non-uniform. Found by the bench-decode-ops one-hot sweep
+// (2026-10-28); uniform-data tests cannot catch it.
 .visible .entry q4k_gemv_sm120_dp4a_kpar8(
     .param .u64 param_weights,
     .param .u64 param_act_qs,
@@ -300,19 +305,19 @@ KLOOP:
     // -- Reduction -------------------------------------------------------------
 REDUCE:
     // 3-step XOR butterfly within 8-lane mini-warp.
-    // c=0x71F: segMask=7 (XOR stays in 8-lane group), maxLane=31 (no clamping).
+    // c=0x181F = nvcc width-8 XOR-bfly encoding (see file header note).
     // member_mask=0xFFFFFFFF: all 32 lanes execute (required by shfl.sync).
     // Note: redux.sync.add.f32 does NOT exist in PTX ISA (only integer types).
     mov.b32 %r50, %f0;
-    shfl.sync.bfly.b32 %r51, %r50, 4, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r51, %r50, 4, 0x181F, 0xFFFFFFFF;
     mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
 
     mov.b32 %r50, %f0;
-    shfl.sync.bfly.b32 %r51, %r50, 2, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r51, %r50, 2, 0x181F, 0xFFFFFFFF;
     mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
 
     mov.b32 %r50, %f0;
-    shfl.sync.bfly.b32 %r51, %r50, 1, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r51, %r50, 1, 0x181F, 0xFFFFFFFF;
     mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
     // After 3 steps: ALL lanes in each mini-warp hold the mini-warp sum.
 
@@ -680,15 +685,15 @@ KLOOP2:
     // -- Reduction (identical to kpar8) ------------------------------------------
 REDUCE2:
     mov.b32 %r50, %f0;
-    shfl.sync.bfly.b32 %r51, %r50, 4, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r51, %r50, 4, 0x181F, 0xFFFFFFFF;
     mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
 
     mov.b32 %r50, %f0;
-    shfl.sync.bfly.b32 %r51, %r50, 2, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r51, %r50, 2, 0x181F, 0xFFFFFFFF;
     mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
 
     mov.b32 %r50, %f0;
-    shfl.sync.bfly.b32 %r51, %r50, 1, 0x71F, 0xFFFFFFFF;
+    shfl.sync.bfly.b32 %r51, %r50, 1, 0x181F, 0xFFFFFFFF;
     mov.b32 %f17, %r51; add.f32 %f0, %f0, %f17;
 
     mul.lo.u32 %r52, %r5, 4;

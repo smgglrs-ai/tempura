@@ -37,9 +37,16 @@ path = "src/bench_mxfp4.rs"
 name = "bench-quality"
 path = "src/bench_quality.rs"
 
+[[bin]]
+name = "bench-decode-ops"
+path = "src/bench_decode_ops.rs"
+
 [dependencies]
 tempura-kernels = { path = "../../kernels", features = ["cutile", "oxide-gemv"] }
 tempura-engine = { path = "../../engine", features = ["cutile", "oxide-gemv"] }
+cutile = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cutile-rs/cutile" }
+cuda-core = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-core" }
+half = "2"
 
 [lints]
 workspace = true
