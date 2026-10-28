@@ -345,10 +345,10 @@ Qwen3.6-27B weights** — see open work.
       max |logit| delta rel 0.10 (TEMPURA_BENCH_PREFILL_AB=1).
       TEMPURA_NO_GPU_PREFILL=1 bisects back to the host path.
 - [x] Prefill attention on-device (2026-10-28): see open work for the
-      current state (1365 tok/s pp128, TTFT P50 94 ms, 5.4x gap) --
+      current state (5126 tok/s pp128, TTFT P50 25 ms, 1.4x gap) --
       gather/flash/scatter kernel chain + scratch RoPE with cos/sin cache
-      + pooled prefill norms/adds/SiLU, TEMPURA_NO_GPU_ATTN bisect, latent
-      stale-host-mirror fix.
+      + pooled prefill norms/adds/SiLU + Q6K down_proj via MXFP4 (nsys-
+      driven), TEMPURA_NO_GPU_ATTN bisect, latent stale-host-mirror fix.
 - [x] Benchmarks (2026-10-27, post-store-mapping-fix, RTX 5090, bench-batch
       all-M verified with NO bisect switches — NaN-free + fresh-cache replay
       bitwise): single-seq 134 tok/s decode, ITL 7.44 ms; prefill 408 tok/s
@@ -450,10 +450,10 @@ typical-p/repeat/presence/frequency)
       held, bench-decode-ops fused-silu real-weights test rel 0.0007.
       Remaining levers: GEMV still ~40% DRAM (dmon: sm 99-100%, mem
       36-46%), host-side per-token overhead
-- [ ] Prefill on GPU: 1365 tok/s pp128, TTFT P50 94 ms (2026-10-28 on-device
-      attention + scratch RoPE + pooled norms/adds/SiLU, 3.3x the 408 tok/s
-      host-staged path) vs llama.cpp 7335 (5.4x gap). Three changes landed
-      2026-10-28:
+- [ ] Prefill on GPU: 5126 tok/s pp128, TTFT P50 25 ms (2026-10-28, nsys-
+      driven: on-device attention + scratch RoPE + pooled norms/adds/SiLU +
+      Q6K down_proj via MXFP4) vs llama.cpp 7335 (1.4x gap; 12.6x the 408
+      tok/s host-staged baseline). Four changes landed 2026-10-28:
       (a) The prefill attention is fully on-device: 3
       `cutile_gather_heads` (de-interleave Q/K/V into head-major padded
       buffers) + ONE `cutile_flash_attn_heads` launch for all heads (the
@@ -485,6 +485,32 @@ typical-p/repeat/presence/frequency)
       blocking api::zeros.sync_on allocs per 32-layer chunk (3 per norm x2,
       1 per add x2, 1 per SiLU); 1305 -> 1365 tok/s, logits fingerprint
       still bitwise-identical.
+      (d) nsys showed q6k_gemv_sm120_batch at 77% of prefill GPU time: the
+      kernel caps at 16 rows per launch (smem reduction area), so an m=128
+      chunk launches 8x per layer, each re-reading the full 47MB down_proj
+      weight matrix at ~40% DRAM efficiency (~2.3ms/layer, ~74ms of the
+      94ms TTFT). Fix: Q6K down_proj is now converted to MXFP4 tiled at
+      load (maybe_upload_mxfp4_tiled_from_q6k -- the same double-
+      quantization the Q4K projections already use, but LOSSIER: Q6K is
+      6.5-bit) and prefill dispatch tries gemm_mxfp4_prefill before the
+      q6k batch GEMV. +~1GB VRAM for the 32 MXFP4 down_proj copies.
+      1365 -> 5126 tok/s, TTFT 94 -> 25 ms. PRECISION TRADEOFF (accepted):
+      prefill A/B rel 0.1015 -> 0.1331; bench-quality teacher-forced PASS
+      89.1% (57/64, all 7 mismatches cpu_margin <= 0.65 near-ties), prefill
+      last-position argmax MISMATCH vs CPU (margin 0.264 near-tie; was
+      MATCH). Escape hatches: decode (m=1) keeps the exact Q6K kpar GEMV;
+      TEMPURA_NO_MXFP4=1 skips the conversion (down_proj falls back to the
+      q6k batch path, prefill ~1365 tok/s, exact); TEMPURA_NO_GPU_PREFILL=1
+      keeps the host-dequant prefill. Batch decode M>=2 also switched
+      down_proj to MXFP4 (the batch path already preferred it when present)
+      -- fingerprints RE-BASELINED 2026-10-28 and batch throughput ROSE:
+      M=2 133->136, M=4 224->243, M=5 253->290, M=8 332->407,
+      M=16 444->602 tok/s (all M re-verified NaN-free + fresh-cache replay
+      bitwise). The capture-pre-size blocks in both batch graph captures
+      now pre-size sum_t/scale_t and the add scratches to exact-m as well
+      (the new size checks in forward_device_fused_scratch /
+      add_device_scratch realloc on mismatch, which is illegal inside
+      stream capture -- found by bench-batch, DriverError 900).
       Verified 2026-10-28: bench-decode-ops "prefill attn dev" 8/8, "rope
       prefill scratch" 4/4 and "rmsnorm prefill scratch" (grow/reuse/
       shrink/odd-seq) 4/4 all
@@ -738,21 +764,26 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       bench-quality now shows 100% argmax agreement vs the CPU reference,
       64/64 identical tokens free-running. 2026-10-28 fused-silu raw-format
       port: 134 -> 140 tok/s)
-- Llama-3.1-8B Q4K prefill: **1365 tok/s pp128**, TTFT P50 94 ms
-      (5.4x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
-      exact-dequant max |logit| rel 0.1015 -- the documented MXFP4 band.
-      2026-10-28 on-device attention (408 -> 815) + scratch RoPE with a
-      cos/sin cache (815 -> 1305) + pooled prefill norms/adds/SiLU
-      (1305 -> 1365); every step bitwise-transparent (identical logits
-      fingerprint). Kernel-level verification bitwise-exact vs the CPU
-      causal reference, see open work's prefill item. Decode unchanged at
-      139-140 tok/s)
+- Llama-3.1-8B Q4K prefill: **5126 tok/s pp128**, TTFT P50 25 ms
+      (1.4x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
+      exact-dequant max |logit| rel 0.1331 -- the MXFP4 band including the
+      Q6K->MXFP4 down_proj double-quantization (lossier than the Q4K path's
+      0.1015; bench-quality teacher-forced PASS 89.1%, all mismatches
+      near-ties). 2026-10-28 stack: on-device attention (408 -> 815) +
+      scratch RoPE with a cos/sin cache (815 -> 1305) + pooled prefill
+      norms/adds/SiLU (1305 -> 1365) + Q6K down_proj via MXFP4
+      (1365 -> 5126, nsys-driven). Kernel-level verification bitwise-exact
+      vs the CPU causal reference for the attention/RoPE/norm paths, see
+      open work's prefill item. Decode unchanged at 139-140 tok/s)
 - Llama-3.1-8B Q4K batch decode (2026-10-27, post-store-mapping-fix, NO
       bisect switches; verified = NaN scan every step + final-step
       fingerprints + fresh-cache replay bitwise identical; every M>=2
       fingerprint re-baselined this day — earlier MXFP4 batch outputs were
       computed with the broken accumulator store mapping and retracted):
-      **M=1 135, M=2 133, M=4 224, M=5 253, M=8 332, M=16 444 tok/s**.
+      **M=1 141, M=2 136, M=4 243, M=5 290, M=8 407, M=16 602 tok/s**
+      (re-baselined 2026-10-28 after down_proj moved to MXFP4 -- was
+      M=1 135, M=2 133, M=4 224, M=5 253, M=8 332, M=16 444 on Q6K batch
+      GEMV; all M re-verified NaN-free + fresh-cache replay bitwise).
       M>=2 uses the generalized M-row q6k batch kernel + MXFP4 tensor-core
       Q/K/O/gate/up (m_valid-masked activation quant); M=1 routes to the
       single-seq CUDA graph path.
