@@ -809,10 +809,11 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       fingerprints + fresh-cache replay bitwise identical; every M>=2
       fingerprint re-baselined this day — earlier MXFP4 batch outputs were
       computed with the broken accumulator store mapping and retracted):
-      **M=1 141, M=2 136, M=4 243, M=5 290, M=8 407, M=16 602 tok/s**
+      **M=1 174, M=2 136, M=4 243, M=5 290, M=8 407, M=16 602 tok/s**
       (re-baselined 2026-10-28 after down_proj moved to MXFP4 -- was
       M=1 135, M=2 133, M=4 224, M=5 253, M=8 332, M=16 444 on Q6K batch
-      GEMV; all M re-verified NaN-free + fresh-cache replay bitwise).
+      GEMV; M=1 rose again 141 -> 174 with the lm_head BK=512 fix; all M
+      re-verified NaN-free + fresh-cache replay bitwise).
       M>=2 uses the generalized M-row q6k batch kernel + MXFP4 tensor-core
       Q/K/O/gate/up (m_valid-masked activation quant); M=1 routes to the
       single-seq CUDA graph path.
