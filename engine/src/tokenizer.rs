@@ -256,13 +256,25 @@ impl Tokenizer {
             .get("tokenizer.ggml.eos_token_id")
             .and_then(|v| v.as_u32());
 
-        let add_bos = metadata
-            .get("tokenizer.ggml.add_bos_token")
-            .and_then(|v| match v {
-                GgufValue::Bool(b) => Some(*b),
-                _ => None,
-            })
-            .unwrap_or(false);
+        // BOS prepending: honour the explicit GGUF flag; when it is absent,
+        // default per architecture the way llama.cpp does (llama.cpp's
+        // LLM_ARCH defaults). Llama-3.1 HF GGUFs ship bos_token_id without
+        // add_bos_token -- without this default the prompt loses its BOS and
+        // generation degrades (worst on short prompts; found via the llama.cpp
+        // arbiter in the bench-quality small-m prefill hunt, 2026-10-28).
+        let add_bos = match metadata.get("tokenizer.ggml.add_bos_token") {
+            Some(GgufValue::Bool(b)) => *b,
+            _ => {
+                let arch = metadata
+                    .get("general.architecture")
+                    .and_then(|v| match v {
+                        GgufValue::String(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                matches!(arch, "llama" | "mistral" | "gemma" | "gemma2" | "gemma3")
+            }
+        };
 
         let gguf_template = metadata
             .get("tokenizer.chat_template")

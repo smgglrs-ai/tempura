@@ -309,6 +309,9 @@ fn main() {
     };
     let eos = tokenizer.as_ref().and_then(|t| t.eos_token_id());
     println!("  Prompt tokens: {}", prompt.len());
+    if std::env::var("TEMPURA_DEBUG_TOKENS").is_ok() {
+        println!("  Prompt token ids: {:?}", &prompt[..prompt.len().min(40)]);
+    }
 
     // --- GPU model ---
     println!("\nUploading weights to GPU...");

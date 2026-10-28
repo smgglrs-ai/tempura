@@ -75,6 +75,27 @@ fn next_pow2(v: usize) -> usize {
     v.max(1).next_power_of_two()
 }
 
+/// Round to the nearest E2M1 magnitude, returning the signed nibble.
+fn round_e2m1(v: f32) -> u8 {
+    const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let av = v.abs();
+    let mut best = 0usize;
+    let mut best_d = f32::INFINITY;
+    for (i, &m) in E2M1.iter().enumerate() {
+        let d = (av - m).abs();
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    let nib = best as u8;
+    if v < 0.0 {
+        nib | 8
+    } else {
+        nib
+    }
+}
+
 /// CPU GQA decode-attention reference: out[h] = softmax(scale * q_h . K[g,:])
 /// weighted sum of V[g,:], where g = h / heads_per_group and K/V rows are
 /// `[kv_len, n_kv_heads, head_dim]` interleaved.
@@ -879,6 +900,250 @@ fn main() {
             x_norm.iter().zip(&ln_w).map(|(v, w)| v * inv * w).collect()
         };
         all_ok &= report("rmsnorm fused scratch (real ln weight)", &norm_gpu, &norm_cpu);
+    }
+
+    // ---- 8. MXFP4 quant+GEMM composition (prefill fast path) ----
+    // The engine prefill quantizes activations on GPU (mxfp4_quant PTX) and
+    // runs mxf4_batch_gemm_tiled at m_pad; the standalone tool validates the
+    // GEMM only with uniform scales and 16-multiple m. This tests the real
+    // composition at padded m (m_valid < m_pad) against a CPU reference built
+    // from the SAME quantized values (isolates GEMM+quant from quant error).
+    {
+        use tempura_kernels::mxfp4_dispatch::MxfpGemm;
+        use tempura_kernels::mxfp4::{quantize_matrix_to_mxfp4_tiled, ue8m0_to_f32};
+
+        const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        let mxfp = MxfpGemm::try_load(stream.clone()).expect("MxfpGemm not loaded");
+        let (n, k) = (512usize, 4096usize);
+        let k64_tiles = (k / 64) as u32;
+
+        for &(m, m_pad) in &[(128usize, 128usize), (86usize, 96usize), (117usize, 128usize)] {
+            // Scale-isolation sub-runs: (a_real, b_real) flags. uniform 0x7F
+            // scales replicate the standalone tool's blind spot; each sub-run
+            // compares against a CPU reference using the SAME scale bytes.
+            for (a_real, b_real) in [(true, true), (true, false), (false, true)] {
+            let a: Vec<f32> = prng_data(m * k, 61);
+            let a_dev = upload(a.clone(), &stream);
+            let packed_a: Arc<Tensor<u8>> = Arc::new(
+                api::zeros::<u8>(&[m_pad * k / 2]).sync_on(&stream).expect("pa alloc"),
+            );
+            let scales_a: Arc<Tensor<u8>> = Arc::new(
+                api::zeros::<u8>(&[(m_pad / 16) * (k / 32)])
+                    .sync_on(&stream)
+                    .expect("sa alloc"),
+            );
+            mxfp
+                .quantize_activation(
+                    &a_dev, &packed_a, &scales_a,
+                    m_pad as u32, k as u32, m as u32,
+                    stream.cu_stream(),
+                )
+                .expect("quantize_activation failed");
+
+            let b: Vec<f32> = prng_data(n * k, 62);
+            let (pb, sb_real) = quantize_matrix_to_mxfp4_tiled(&b, n, k);
+            let sb: Vec<u8> = if b_real {
+                sb_real.clone()
+            } else {
+                vec![0x7Fu8; sb_real.len()]
+            };
+            // Quantize A against the scale set actually uploaded: when the
+            // A-scales are forced uniform the packed nibbles must come from a
+            // uniform-scale quantization too, so quantize on the CPU for that
+            // sub-run (same tiler, row-tile granularity difference is fine:
+            // the reference decodes the same bytes).
+            let (pa, sa): (Vec<u8>, Vec<u8>) = if a_real {
+                let pa: Vec<u8> = Arc::clone(&packed_a).to_host_vec().sync_on(&stream).expect("pa dl");
+                let sa: Vec<u8> = Arc::clone(&scales_a).to_host_vec().sync_on(&stream).expect("sa dl");
+                (pa, sa)
+            } else {
+                // Re-quantize A on the CPU with uniform 0x7F scales: round
+                // each value to the nearest E2M1 magnitude (values are in
+                // [-0.5, 0.5], so /1.0 scale keeps them in range).
+                let mut pa = vec![0u8; m_pad * k / 2];
+                for row in 0..m {
+                    for kk in 0..k {
+                        let v = a[row * k + kk];
+                        let nib = round_e2m1(v);
+                        if kk % 2 == 0 {
+                            pa[row * (k / 2) + kk / 2] = nib;
+                        } else {
+                            pa[row * (k / 2) + kk / 2] |= nib << 4;
+                        }
+                    }
+                }
+                (pa, vec![0x7Fu8; (m_pad / 16) * (k / 32)])
+            };
+            // Upload the (possibly overridden) A buffers.
+            let packed_a: Arc<Tensor<u8>> = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(pa.clone()))
+                    .sync_on(&stream)
+                    .expect("pa ul"),
+            );
+            let scales_a: Arc<Tensor<u8>> = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(sa.clone()))
+                    .sync_on(&stream)
+                    .expect("sa ul"),
+            );
+            let pb_dev: Arc<Tensor<u8>> = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(pb.clone()))
+                    .sync_on(&stream)
+                    .expect("pb ul"),
+            );
+            let sb_dev: Arc<Tensor<u8>> = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(sb.clone()))
+                    .sync_on(&stream)
+                    .expect("sb ul"),
+            );
+
+            let out: Arc<Tensor<f32>> = Arc::new(
+                api::zeros::<f32>(&[m_pad * n]).sync_on(&stream).expect("out alloc"),
+            );
+            mxfp
+                .forward(
+                    &packed_a, &scales_a, &pb_dev, &sb_dev, &out,
+                    m_pad as u32, n as u32, k64_tiles,
+                )
+                .expect("mxfp4 forward failed");
+            let gpu: Vec<f32> = Arc::clone(&out).to_host_vec().sync_on(&stream).expect("out dl");
+
+            // Decode the SAME quantized values on CPU and dense-matmul.
+            let dec_a = |row: usize, kk: usize| -> f32 {
+                let byte = pa[row * (k / 2) + kk / 2];
+                let nib = if kk % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                let v = if nib & 8 != 0 { -E2M1[(nib & 7) as usize] } else { E2M1[(nib & 7) as usize] };
+                v * ue8m0_to_f32(sa[(row / 16) * (k / 32) + kk / 32])
+            };
+            let dec_b = |row: usize, kk: usize| -> f32 {
+                let byte = pb[row * (k / 2) + kk / 2];
+                let nib = if kk % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                let v = if nib & 8 != 0 { -E2M1[(nib & 7) as usize] } else { E2M1[(nib & 7) as usize] };
+                v * ue8m0_to_f32(sb[(row / 8) * (k / 32) + kk / 32])
+            };
+            let mut max_abs = 0.0f32;
+            let mut ref_max = 0.0f32;
+            let mut worst = (0usize, 0usize, 0.0f32, 0.0f32);
+            let mut first_bad = None;
+            for mi in 0..m {
+                for ni in 0..n {
+                    let mut sum = 0.0f32;
+                    for kk in 0..k {
+                        sum += dec_a(mi, kk) * dec_b(ni, kk);
+                    }
+                    ref_max = ref_max.max(sum.abs());
+                    let d = (gpu[mi * n + ni] - sum).abs();
+                    if d > 1e-2 && first_bad.is_none() {
+                        first_bad = Some((mi, ni, gpu[mi * n + ni], sum));
+                    }
+                    if d > max_abs {
+                        max_abs = d;
+                        worst = (mi, ni, gpu[mi * n + ni], sum);
+                    }
+                }
+            }
+            println!(
+                "    first_bad={:?} worst={:?}",
+                first_bad, worst
+            );
+            // Scale-pair ordering probe removed (ruled out: lo==hi on the
+            // probed tiles and both orderings agreed).
+            // Scale-indexing hypotheses on element (0, 2) for the
+            // (a_real=true, b_real=false) sub-run where B contributes scale 1.
+            if a_real && !b_real {
+                let (mi, ni) = (0usize, 2usize);
+                let nib = |buf: &[u8], row: usize, kk: usize| -> f32 {
+                    let byte = buf[row * (k / 2) + kk / 2];
+                    let n = if kk % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                    let v = if n & 8 != 0 { -E2M1[(n & 7) as usize] } else { E2M1[(n & 7) as usize] };
+                    v
+                };
+                let mut h1 = 0.0f32; // [m/16][k/32] (mine)
+                let mut h2 = 0.0f32; // [m/16][k/64] single byte per k64
+                let mut h3 = 0.0f32; // no A scale
+                for kk in 0..k {
+                    let v = nib(&pa, mi, kk) * nib(&pb, ni, kk);
+                    h1 += v * ue8m0_to_f32(sa[(mi / 16) * (k / 32) + kk / 32]);
+                    h2 += v * ue8m0_to_f32(sa[(mi / 16) * (k / 64) + kk / 64]);
+                    h3 += v;
+                }
+                println!(
+                    "    elem(0,2): gpu={} h1_k32={} h2_k64={} h3_noscale={h3:.4}",
+                    gpu[ni],
+                    h1, h2
+                );
+            }
+
+            let rel = max_abs / ref_max.max(1e-9);
+            println!(
+                "  {:<38} m={m:>3} m_pad={m_pad:>3} a_real={a_real} b_real={b_real} \
+                 max_abs={max_abs:.4} rel={rel:.4} -> {}",
+                "mxfp4 quant+gemm composition",
+                if rel < 0.02 { "PASS" } else { "FAIL" }
+            );
+            all_ok &= rel < 0.02 || !a_real || !b_real; // real-real is the engine case
+            }
+        }
+
+        // ---- 8b. Minimal single-tile MXFP4 probe (m16 n8 k64) ----
+        {
+            let (m, n, k) = (16usize, 8usize, 64usize);
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| {
+                    let (mi, kk) = (i / k, i % k);
+                    if kk == mi % 64 { (mi as f32) * 0.125 } else { 0.0 }
+                })
+                .collect();
+            let a_dev = upload(a.clone(), &stream);
+            let packed_a: Arc<Tensor<u8>> =
+                Arc::new(api::zeros::<u8>(&[m * k / 2]).sync_on(&stream).expect("pa"));
+            let scales_a: Arc<Tensor<u8>> =
+                Arc::new(api::zeros::<u8>(&[(m / 16) * (k / 32)]).sync_on(&stream).expect("sa"));
+            mxfp
+                .quantize_activation(&a_dev, &packed_a, &scales_a, m as u32, k as u32, m as u32,
+                    stream.cu_stream())
+                .expect("quant failed");
+            let pa: Vec<u8> = Arc::clone(&packed_a).to_host_vec().sync_on(&stream).expect("dl");
+            let sa: Vec<u8> = Arc::clone(&scales_a).to_host_vec().sync_on(&stream).expect("dl");
+            let mut pb = vec![0u8; n * k / 2];
+            for h in 0..k / 2 {
+                pb[h] = 0x22; // two 1.0-magnitude nibbles
+            }
+            let sb = vec![0x7Fu8; (n / 8) * (k / 32)];
+            let pb_dev: Arc<Tensor<u8>> = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(pb.clone())).sync_on(&stream).expect("ul"),
+            );
+            let sb_dev: Arc<Tensor<u8>> = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(sb.clone())).sync_on(&stream).expect("ul"),
+            );
+            let out: Arc<Tensor<f32>> =
+                Arc::new(api::zeros::<f32>(&[m * n]).sync_on(&stream).expect("out"));
+            mxfp
+                .forward(&packed_a, &scales_a, &pb_dev, &sb_dev, &out, m as u32, n as u32, 1)
+                .expect("gemm failed");
+            let gpu: Vec<f32> = Arc::clone(&out).to_host_vec().sync_on(&stream).expect("dl");
+            println!("    minimal probe: sa={:?} pa[0..6]={:?}", &sa[..], &pa[..6]);
+            for mi in 0..m {
+                let byte = pa[mi * (k / 2) + mi / 2];
+                let nib = if mi % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                println!(
+                    "      row {mi:>2}: A={:.4} scaled={:.4} quant_nibble={} (mag {})",
+                    a[mi * k + mi],
+                    a[mi * k + mi] / ue8m0_to_f32(sa[0]),
+                    nib,
+                    E2M1[(nib & 7) as usize]
+                );
+            }
+            for mi in 0..m {
+                let mut exp = 0.0f32;
+                for kk in 0..k {
+                    let byte = pa[mi * (k / 2) + kk / 2];
+                    let nib = if kk % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                    let v = if nib & 8 != 0 { -E2M1[(nib & 7) as usize] } else { E2M1[(nib & 7) as usize] };
+                    exp += v * ue8m0_to_f32(sa[(mi / 16) * (k / 32) + kk / 32]);
+                }
+                println!("      out[{mi:>2}][0]: gpu={:.4} expected={exp:.4}", gpu[mi * n]);
+            }
+        }
     }
 
     println!();

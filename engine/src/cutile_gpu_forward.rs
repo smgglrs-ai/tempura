@@ -3844,11 +3844,27 @@ impl CutileGpuModel {
         if self.debug_nan_trace {
             let ob: Vec<f32> = Arc::clone(&out).to_host_vec().sync_on(stream).expect("dbg out");
             let osum: u64 = ob[..(m_pad * n).min(ob.len())].iter().map(|v| v.to_bits() as u64).sum();
+            // Per-row zero census: localizes which m_pad rows the GEMM left
+            // unwritten or zeroed (prefill m < m_pad bisection).
+            let zero_rows: Vec<usize> = (0..m_pad)
+                .filter(|&r| {
+                    ob[r * n..(r + 1) * n]
+                        .iter()
+                        .all(|v| v.to_bits() == 0)
+                })
+                .collect();
+            let nan_rows = ob
+                .chunks(n)
+                .filter(|c| c.iter().any(|v| v.is_nan()))
+                .count();
             eprintln!(
                 "[nan-trace] {weight_name} mxfp4-gemm (16-row chunks): out_fresh={osum} \
-                 (len={} m_pad*n={})",
+                 (len={} m_pad*n={}) zero_rows={}/{} first_zero={:?} nan_rows={nan_rows}",
                 ob.len(),
-                m_pad * n
+                m_pad * n,
+                zero_rows.len(),
+                m_pad,
+                zero_rows.first(),
             );
         }
 
