@@ -375,6 +375,17 @@ pub struct CutileGpuModel {
     ///
     /// Same motivation as `attn_out_scratch`: eliminates 28 sync-on allocs per token.
     silu_out_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
+    /// Prefill-only scratch pools (norms / residual adds / SiLU) -- the decode
+    /// pools are sized for seq_len=1 and, for the graph path, pointer-baked;
+    /// prefill reuses the same *_scratch methods with these dedicated pools,
+    /// whose buffers grow on the first size-mismatched call.  Eliminates the
+    /// ~288 blocking api::zeros.sync_on allocs a 32-layer 128-token chunk used
+    /// to issue (3 per RMSNorm x2, 1 per residual add x2, 1 per SiLU).
+    prefill_pre_attn_norm_scratch: RefCell<RmsnormScratch>,
+    prefill_post_attn_norm_scratch: RefCell<RmsnormScratch>,
+    prefill_post_attn_add_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
+    prefill_ffn_add_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
+    prefill_silu_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
 
     /// Pre-allocated zero-padded scratch for down-projection input when inter_pad != inter.
     ///
@@ -1697,6 +1708,8 @@ impl CutileGpuModel {
         let pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let post_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let final_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let prefill_pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let prefill_post_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let add_alloc = |n: usize| -> Option<Arc<Tensor<f32>>> {
             Some(Arc::new(
                 api::zeros::<f32>(&[n])
@@ -1840,6 +1853,11 @@ impl CutileGpuModel {
             attn_out_scratch: RefCell::new(attn_out_scratch),
             prefill_attn_scratch: RefCell::new(PrefillAttnScratch::default()),
             silu_out_scratch: RefCell::new(silu_out_scratch),
+            prefill_pre_attn_norm_scratch: RefCell::new(prefill_pre_attn_norm_scratch),
+            prefill_post_attn_norm_scratch: RefCell::new(prefill_post_attn_norm_scratch),
+            prefill_post_attn_add_scratch: RefCell::new(None),
+            prefill_ffn_add_scratch: RefCell::new(None),
+            prefill_silu_scratch: RefCell::new(None),
             down_proj_pad_scratch: RefCell::new(down_proj_pad_scratch),
             prefill_scratch: RefCell::new(std::array::from_fn(|_| None)),
             prefill_mxfp4_packed: RefCell::new(None),
@@ -2025,6 +2043,8 @@ impl CutileGpuModel {
         let pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let post_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let final_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let prefill_pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let prefill_post_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let add_alloc = |n: usize| -> Option<Arc<Tensor<f32>>> {
             Some(Arc::new(
                 api::zeros::<f32>(&[n])
@@ -2149,6 +2169,11 @@ impl CutileGpuModel {
             attn_out_scratch: RefCell::new(attn_out_scratch),
             prefill_attn_scratch: RefCell::new(PrefillAttnScratch::default()),
             silu_out_scratch: RefCell::new(silu_out_scratch),
+            prefill_pre_attn_norm_scratch: RefCell::new(prefill_pre_attn_norm_scratch),
+            prefill_post_attn_norm_scratch: RefCell::new(prefill_post_attn_norm_scratch),
+            prefill_post_attn_add_scratch: RefCell::new(None),
+            prefill_ffn_add_scratch: RefCell::new(None),
+            prefill_silu_scratch: RefCell::new(None),
             down_proj_pad_scratch: RefCell::new(down_proj_pad_scratch),
             prefill_scratch: RefCell::new(std::array::from_fn(|_| None)),
             prefill_mxfp4_packed: RefCell::new(None),
@@ -2422,37 +2447,6 @@ impl CutileGpuModel {
             .expect("CutileGpuModel: device->host download failed")
     }
 
-    /// Element-wise add two device tensors of `n` elements on the GPU.
-    ///
-    /// Returns a new flat 1-D tensor of `n` elements (rounded up to the
-    /// nearest 32 for the cuTile tile width).  Both `a` and `b` must have at
-    /// least `n` elements.
-    ///
-    /// When `h_pad == h` for typical model sizes (power-of-2 multiples of BK)
-    /// this is a pure GPU operation with zero host round-trips.
-    fn add_device(&self, a: &Arc<Tensor<f32>>, b: &Arc<Tensor<f32>>, n: usize) -> Arc<Tensor<f32>> {
-        const BLOCK: usize = 32;
-        let stream = self.matmul.stream();
-        let n_pad = n.div_ceil(BLOCK) * BLOCK;
-        let out_t = api::zeros::<f32>(&[n_pad])
-            .sync_on(stream)
-            .expect("add_device: alloc failed")
-            .partition([BLOCK]);
-        // SAFETY: kernel queued async; GPU stream ordering ensures a->b->add->next.
-        // Caller (or downstream D->H) provides the CPU sync before any host read.
-        let (out_t, _, _) = unsafe {
-            tempura_kernels::cutile_elementwise::kernels::cutile_vector_add(
-                out_t,
-                a.clone(),
-                b.clone(),
-            )
-            .generics(vec![BLOCK.to_string()])
-            .async_on(stream)
-            .expect("add_device: kernel failed")
-        };
-        Arc::new(out_t.unpartition())
-    }
-
     /// Residual add reusing a pre-allocated output buffer.
     ///
     /// For decode (n = h_pad, a power-of-2 value) the scratch buffer holds the
@@ -2469,9 +2463,22 @@ impl CutileGpuModel {
         const BLOCK: usize = 32;
         let stream = self.matmul.stream();
         let n_pad = n.div_ceil(BLOCK) * BLOCK;
+        // Size check: a pooled buffer sized for a different n would partition
+        // to more blocks than the inputs hold (OOB reads) or fewer (truncated
+        // add) -- realloc on mismatch.
         let out_tensor = match scratch.take() {
             Some(arc) => match Arc::try_unwrap(arc) {
-                Ok(tensor) => tensor,
+                Ok(tensor) => {
+                    if tensor.size() == n_pad {
+                        tensor
+                            .reshape(&[n_pad])
+                            .expect("add_device_scratch: reshape failed")
+                    } else {
+                        api::zeros::<f32>(&[n_pad])
+                            .sync_on(stream)
+                            .expect("add_device_scratch: alloc failed")
+                    }
+                }
                 Err(arc_back) => {
                     *scratch = Some(arc_back);
                     api::zeros::<f32>(&[n_pad])
@@ -5177,7 +5184,7 @@ impl CutileGpuModel {
                     .expect("CutileGpuModel: pre-attention RMSNorm failed")
             } else {
                 self.cutile_rmsnorm
-                    .forward_device_fused(
+                    .forward_device_fused_scratch(
                         self.matmul.stream(),
                         hidden_dev.clone(),
                         input_ln_w_dev,
@@ -5185,6 +5192,7 @@ impl CutileGpuModel {
                         h,
                         self.h_pad,
                         cfg.layer_norm_eps,
+                        &mut self.prefill_pre_attn_norm_scratch.borrow_mut(),
                     )
                     .expect("CutileGpuModel: pre-attention RMSNorm failed")
             };
@@ -5434,7 +5442,12 @@ impl CutileGpuModel {
                     &mut self.post_attn_add_scratch.borrow_mut(),
                 )
             } else {
-                self.add_device(&hidden_dev, &o_padded, seq_len * self.h_pad)
+                self.add_device_scratch(
+                    &hidden_dev,
+                    &o_padded,
+                    seq_len * self.h_pad,
+                    &mut self.prefill_post_attn_add_scratch.borrow_mut(),
+                )
             };
 
             // -- 2h. Post-attention RMSNorm (GPU) -----------------------------
@@ -5458,7 +5471,7 @@ impl CutileGpuModel {
                     .expect("CutileGpuModel: post-attention RMSNorm failed")
             } else {
                 self.cutile_rmsnorm
-                    .forward_device_fused(
+                    .forward_device_fused_scratch(
                         self.matmul.stream(),
                         hidden_dev.clone(),
                         post_ln_w_dev,
@@ -5466,6 +5479,7 @@ impl CutileGpuModel {
                         h,
                         self.h_pad,
                         cfg.layer_norm_eps,
+                        &mut self.prefill_post_attn_norm_scratch.borrow_mut(),
                     )
                     .expect("CutileGpuModel: post-attention RMSNorm failed")
             };
@@ -5501,7 +5515,14 @@ impl CutileGpuModel {
             } else {
                 let silu_stream = self.matmul.stream();
                 self.cutile_elementwise
-                    .silu_mul_device(&gate_dev, &up_dev, seq_len, inter, &silu_stream)
+                    .silu_mul_device_scratch(
+                        &gate_dev,
+                        &up_dev,
+                        seq_len,
+                        inter,
+                        &mut self.prefill_silu_scratch.borrow_mut(),
+                        &silu_stream,
+                    )
                     .expect("CutileGpuModel: GPU SiLU-mul failed")
             };
 
@@ -5564,7 +5585,12 @@ impl CutileGpuModel {
                     &mut self.ffn_add_scratch.borrow_mut(),
                 )
             } else {
-                self.add_device(&hidden_dev, &down_padded, seq_len * self.h_pad)
+                self.add_device_scratch(
+                    &hidden_dev,
+                    &down_padded,
+                    seq_len * self.h_pad,
+                    &mut self.prefill_ffn_add_scratch.borrow_mut(),
+                )
             };
             if self.debug_nan_trace {
                 self.nan_report(&format!("L{layer} post-ffn-hidden"), &hidden_dev);

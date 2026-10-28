@@ -310,8 +310,9 @@ impl CutileRmsNorm {
     /// Identical to `forward_device_fused` but avoids the three
     /// `api::zeros.sync_on` allocations per call by reclaiming device memory
     /// from `scratch`.  For decode (seq_len=1) this eliminates all per-token
-    /// allocation overhead.  Prefill callers should use `forward_device_fused`
-    /// instead since the scratch is sized for seq_len=1 only.
+    /// allocation overhead.  Prefill callers use it too, with a scratch whose
+    /// buffers grow on the first (size-mismatched) call -- steady state is
+    /// zero allocations at any seq_len.
     ///
     /// # Reclaim strategy
     ///
@@ -333,9 +334,23 @@ impl CutileRmsNorm {
         let inv_h = 1.0f32 / hidden_size as f32;
 
         // -- Reclaim or allocate sum_t -----------------------------------------
+        // Size check: the scratch may be sized for a different seq_len
+        // (decode-sized allocation vs a prefill chunk).  A stale smaller
+        // buffer would partition to fewer programs than tokens -- silently
+        // norming only the first rows.
         let sum_tensor = match scratch.sum_t.take() {
             Some(arc) => match Arc::try_unwrap(arc) {
-                Ok(tensor) => tensor,
+                Ok(tensor) => {
+                    if tensor.size() == seq_len {
+                        tensor
+                            .reshape(&[seq_len])
+                            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    } else {
+                        api::zeros::<f32>(&[seq_len])
+                            .sync_on(stream)
+                            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    }
+                }
                 Err(arc_back) => {
                     scratch.sum_t = Some(arc_back);
                     api::zeros::<f32>(&[seq_len])
@@ -360,9 +375,20 @@ impl CutileRmsNorm {
         let sum_arc: Arc<Tensor<f32>> = Arc::new(sum_part_out.unpartition());
 
         // -- Reclaim or allocate scale_t ---------------------------------------
+        // Same size check as sum_t above.
         let scale_tensor = match scratch.scale_t.take() {
             Some(arc) => match Arc::try_unwrap(arc) {
-                Ok(tensor) => tensor,
+                Ok(tensor) => {
+                    if tensor.size() == seq_len {
+                        tensor
+                            .reshape(&[seq_len])
+                            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    } else {
+                        api::zeros::<f32>(&[seq_len])
+                            .sync_on(stream)
+                            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    }
+                }
                 Err(arc_back) => {
                     scratch.scale_t = Some(arc_back);
                     api::zeros::<f32>(&[seq_len])
