@@ -1432,6 +1432,179 @@ fn main() {
         }
     }
 
+    // ---- 9. q6k sm120_mbar determinism stress (default-off kernel) ----
+    // The mbar cp.async double-buffer variant is disabled by default
+    // (history-dependent outputs). This stress test runs it on identical
+    // real weights/activations repeatedly -- with interleaved device
+    // allocations and an intervening kernel launch to vary the allocation
+    // and kernel history -- and checks bitwise determinism. Requires
+    // TEMPURA_ALLOW_SM120_Q6K=1 in the environment when the tool starts.
+    {
+        let o6 = tempura_kernels::oxide_q6k_gemv_host::OxideQ6kGemv::try_load(
+            stream.clone(),
+        );
+        match o6 {
+            Some(o6) if o6.has_sm120_mbar() => {
+                let model_path2 = std::path::Path::new(&model_path);
+                let loader2 = tempura_engine::gguf_loader::GgufLoader::from_file_quantized(
+                    model_path2,
+                )
+                .expect("re-open GGUF for mbar test");
+                let qw2 = loader2.to_quantized_weights();
+                let n = 4096usize; // hidden (down_proj output rows)
+                let kb = 56usize; // inter/256
+                let k = kb * 256;
+                let x: Vec<f32> = prng_data(k, 71);
+                let x_dev = upload(x.clone(), &stream);
+                let (packed, cpu_ref, p_full): (Arc<Tensor<u32>>, Vec<f32>, Vec<u32>) = {
+                    let bytes = qw2
+                        .get_q6k("model.layers.0.mlp.down_proj.weight")
+                        .expect("down_proj Q6K");
+                    // Pack into the ENGINE's 53-u32 format (d f32 bits + 4
+                    // scale words + 32 ql + 16 qh) -- the same layout
+                    // maybe_upload_q6k produces.
+                    let mut p: Vec<u32> = Vec::with_capacity(n * kb * 53);
+                    const Q6K_BYTES: usize = 210;
+                    for row in 0..n {
+                        for blk in 0..kb {
+                            let off = (row * kb + blk) * Q6K_BYTES;
+                            let block = &bytes[off..off + Q6K_BYTES];
+                            let ql = &block[0..128];
+                            let qh = &block[128..192];
+                            let scales = &block[192..208];
+                            let d_bits = u16::from_le_bytes([block[208], block[209]]);
+                            let d_f32 = f16_bits_to_f32(d_bits);
+                            p.push(d_f32.to_bits());
+                            for w in 0..4usize {
+                                let b = |i: usize| ((scales[w * 4 + i] as i8) as i32 + 128) as u8;
+                                p.push(
+                                    (b(0) as u32)
+                                        | ((b(1) as u32) << 8)
+                                        | ((b(2) as u32) << 16)
+                                        | ((b(3) as u32) << 24),
+                                );
+                            }
+                            for i in 0..32usize {
+                                p.push(
+                                    (ql[i * 4] as u32)
+                                        | ((ql[i * 4 + 1] as u32) << 8)
+                                        | ((ql[i * 4 + 2] as u32) << 16)
+                                        | ((ql[i * 4 + 3] as u32) << 24),
+                                );
+                            }
+                            for i in 0..16usize {
+                                p.push(
+                                    (qh[i * 4] as u32)
+                                        | ((qh[i * 4 + 1] as u32) << 8)
+                                        | ((qh[i * 4 + 2] as u32) << 16)
+                                        | ((qh[i * 4 + 3] as u32) << 24),
+                                );
+                            }
+                        }
+                    }
+                    let w = dequantize_to_f32(GgmlType::Q6K, bytes, n * k);
+                    let c: Vec<f32> = (0..n)
+                        .map(|i| {
+                            w[i * k..(i + 1) * k]
+                                .iter()
+                                .zip(&x)
+                                .map(|(a, b)| a * b)
+                                .sum()
+                        })
+                        .collect();
+                    (
+                        Arc::new(
+                            api::copy_host_vec_to_device(&Arc::new(p.clone()))
+                                .sync_on(&stream)
+                                .expect("mbar packed ul"),
+                        ),
+                        c,
+                        p,
+                    )
+                };
+                let r0 = o6
+                    .forward_kpar_d2d(&x_dev, &packed, n, kb)
+                    .expect("mbar run 0 failed");
+                let v0 = download(&r0, &stream);
+                let max_ref = v0
+                    .iter()
+                    .zip(&cpu_ref)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                let infs = v0.iter().filter(|v| !v.is_finite()).count();
+                println!(
+                    "  q6k mbar vs CPU (kb=56): max_abs={max_ref:.6} nonfinite={infs}/{n}"
+                );
+
+                // Shape bisect: kb=8 (ONE loop iteration, no swap) and
+                // kb=16 (two iterations, one swap) from the same weights.
+                for &kbt in &[8usize, 16usize] {
+                    let kt = kbt * 256;
+                    let xt: Vec<f32> = x[..kt].to_vec();
+                    let xt_dev = upload(xt.clone(), &stream);
+                    let packed_t: Arc<Tensor<u32>> = Arc::new(
+                        api::copy_host_vec_to_device(&Arc::new(
+                            (0..n)
+                                .flat_map(|r| {
+                                    let base = r * kb * 53;
+                                    p_full[base..base + kbt * 53].to_vec()
+                                })
+                                .collect::<Vec<u32>>(),
+                        ))
+                        .sync_on(&stream)
+                        .expect("packed_t ul"),
+                    );
+                    let rt = o6
+                        .forward_kpar_d2d(&xt_dev, &packed_t, n, kbt)
+                        .expect("mbar shape run failed");
+                    let vt = download(&rt, &stream);
+                    let wt = dequantize_to_f32(GgmlType::Q6K, &qw2.get_q6k("model.layers.0.mlp.down_proj.weight").unwrap(), n * k);
+                    let cpu_t: Vec<f32> = (0..n)
+                        .map(|i| {
+                            wt[i * k..i * k + kt]
+                                .iter()
+                                .zip(&xt)
+                                .map(|(a, b)| a * b)
+                                .sum()
+                        })
+                        .collect();
+                    let mt = vt
+                        .iter()
+                        .zip(&cpu_t)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    let badt = vt
+                        .iter()
+                        .zip(&cpu_t)
+                        .filter(|(a, b)| (**a - **b).abs() > 0.01)
+                        .count();
+                    println!(
+                        "  q6k mbar shape bisect kb={kbt}: max_abs={mt:.6} bad={badt}/{n}"
+                    );
+                }
+                let mut nondet = 0usize;
+                for it in 1..=8u32 {
+                    // History churn: fresh allocation + an intervening
+                    // kernel launch on the same stream.
+                    let junk = upload(prng_data(7777, it), &stream);
+                    let _ = o6.forward_kpar_d2d(&junk, &packed, 64, kb);
+                    let r = o6
+                        .forward_kpar_d2d(&x_dev, &packed, n, kb)
+                        .expect("mbar stress run failed");
+                    let v = download(&r, &stream);
+                    if !v.iter().zip(&v0).all(|(a, b)| a.to_bits() == b.to_bits()) {
+                        nondet += 1;
+                    }
+                }
+                println!(
+                    "  q6k mbar determinism: {nondet}/8 stress runs bitwise-differ -> {}",
+                    if nondet == 0 { "DETERMINISTIC" } else { "NONDETERMINISTIC (race live)" }
+                );
+            }
+            _ => println!("  (q6k mbar variant not loaded; run with TEMPURA_ALLOW_SM120_Q6K=1)"),
+        }
+    }
+
     println!();
     if all_ok {
         println!("All decode-op mechanisms match CPU math -- the decode");
