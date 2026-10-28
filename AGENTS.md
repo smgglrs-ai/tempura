@@ -345,9 +345,9 @@ Qwen3.6-27B weights** — see open work.
       max |logit| delta rel 0.10 (TEMPURA_BENCH_PREFILL_AB=1).
       TEMPURA_NO_GPU_PREFILL=1 bisects back to the host path.
 - [x] Prefill attention on-device (2026-10-28): see open work for the
-      current state (815 tok/s pp128, TTFT P50 156 ms, 9.0x gap) --
-      gather/flash/scatter kernel chain, TEMPURA_NO_GPU_ATTN bisect, latent
-      stale-host-mirror fix.
+      current state (1305 tok/s pp128, TTFT P50 98 ms, 5.6x gap) --
+      gather/flash/scatter kernel chain + scratch RoPE with cos/sin cache,
+      TEMPURA_NO_GPU_ATTN bisect, latent stale-host-mirror fix.
 - [x] Benchmarks (2026-10-27, post-store-mapping-fix, RTX 5090, bench-batch
       all-M verified with NO bisect switches — NaN-free + fresh-cache replay
       bitwise): single-seq 134 tok/s decode, ITL 7.44 ms; prefill 408 tok/s
@@ -449,29 +449,39 @@ typical-p/repeat/presence/frequency)
       held, bench-decode-ops fused-silu real-weights test rel 0.0007.
       Remaining levers: GEMV still ~40% DRAM (dmon: sm 99-100%, mem
       36-46%), host-side per-token overhead
-- [ ] Prefill on GPU: 815 tok/s pp128, TTFT P50 156 ms (2026-10-28 on-device
-      attention, 2.0x the 408 tok/s host-staged path) vs llama.cpp 7335
-      (9.0x gap). The prefill attention is now fully on-device: 3
+- [ ] Prefill on GPU: 1305 tok/s pp128, TTFT P50 98 ms (2026-10-28 on-device
+      attention + scratch RoPE, 3.2x the 408 tok/s host-staged path) vs
+      llama.cpp 7335 (5.6x gap). Two changes landed 2026-10-28:
+      (a) The prefill attention is fully on-device: 3
       `cutile_gather_heads` (de-interleave Q/K/V into head-major padded
       buffers) + ONE `cutile_flash_attn_heads` launch for all heads (the
       audited `cutile_flash_attn_head` math with multi-head tiling) +
       `cutile_scatter_heads` back to interleaved -- 5 async kernels per
       layer, zero PCIe, zero host syncs, scratch pooled
-      (`PrefillAttnScratch`, RopeScratch-style take/try_unwrap). Prefill KV
-      append uses `append_device_gpu_only` (the staleness guard before the
-      layer loop now syncs the host mirror whenever THIS call needs host
-      attention -- this also fixes a latent stale-mirror bug where a prefill
-      chunk after GPU-only decode read a mirror missing the GPU-only region).
-      TEMPURA_NO_GPU_ATTN=1 bisects back to the host-staged path. Verified
-      2026-10-28: bench-decode-ops "prefill attn dev" 8/8 bitwise-exact vs
-      the CPU causal GQA reference (partial BR/BC tiles, cache_offset>0,
-      pooled-scratch reuse); bench-real-model NaN-free, det=OK, A/B vs
-      host-dequant rel 0.1015 (the documented MXFP4 band); decode unchanged
-      at 139-140 tok/s. Remaining levers: per-token host overhead in the
-      chunk loop (cos/sin table upload per RoPE call, gemm dispatch), the
-      gather/scatter copies (~3 extra passes over Q/K/V activations --
-      fusible into the flash kernel or the RoPE/GEMM epilogues), BR/BC tile
-      tuning for long prompts
+      (`PrefillAttnScratch`, RopeScratch-style take/try_unwrap). 408 ->
+      815 tok/s. Prefill KV append uses `append_device_gpu_only` (the
+      staleness guard before the layer loop now syncs the host mirror
+      whenever THIS call needs host attention -- this also fixes a latent
+      stale-mirror bug where a prefill chunk after GPU-only decode read a
+      mirror missing the GPU-only region). TEMPURA_NO_GPU_ATTN=1 bisects
+      back to the host-staged path.
+      (b) Prefill RoPE left the `forward_device` fallback (which per layer
+      recomputed cos/sin on the CPU, did 2 blocking H2D uploads, 5 blocking
+      allocs and a FULL stream synchronize) for dedicated prefill rope
+      scratches: `RopeScratch::ensure_capacity` grows the buffers to the
+      chunk size once, and a (positions, theta)-keyed cos/sin cache makes
+      layers 2..N upload-free -- 815 -> 1305 tok/s, logits fingerprint
+      BITWISE-identical (pure overhead removal). The prefill scratches are
+      separate fields because ensure_capacity reallocates and the
+      decode/graph scratches are pointer-baked into captured CUDA graphs.
+      Verified 2026-10-28: bench-decode-ops "prefill attn dev" 8/8 and
+      "rope prefill scratch" (grow/cache-hit/cache-miss/shrink) 4/4 all
+      bitwise-exact vs their references; bench-real-model NaN-free, det=OK,
+      A/B vs host-dequant rel 0.1015 (the documented MXFP4 band); decode
+      unchanged at 139-140 tok/s. Remaining levers: gemm dispatch host
+      overhead in the chunk loop, the gather/scatter copies (~3 extra
+      passes over Q/K/V activations -- fusible into the flash kernel or the
+      RoPE/GEMM epilogues), BR/BC tile tuning for long prompts
 - [ ] Validate hybrid DeltaNet pipeline against real Qwen3.6 / Bonsai 2
       weights (last attempt: "architecture incompatible" — diagnostics added,
       commit 9c6362d)
@@ -716,12 +726,14 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       bench-quality now shows 100% argmax agreement vs the CPU reference,
       64/64 identical tokens free-running. 2026-10-28 fused-silu raw-format
       port: 134 -> 140 tok/s)
-- Llama-3.1-8B Q4K prefill: **815 tok/s pp128**, TTFT P50 156 ms
-      (9.0x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
+- Llama-3.1-8B Q4K prefill: **1305 tok/s pp128**, TTFT P50 98 ms
+      (5.6x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1015 -- the documented MXFP4 band.
-      2026-10-28 on-device attention doubled the 408 tok/s host-staged path;
-      kernel-level verification bitwise-exact vs the CPU causal reference,
-      see open work's prefill item. Decode unchanged at 139-140 tok/s)
+      2026-10-28 on-device attention (408 -> 815) + scratch RoPE with a
+      cos/sin cache (815 -> 1305); the RoPE change is bitwise-transparent
+      (identical logits fingerprint). Kernel-level verification
+      bitwise-exact vs the CPU causal reference, see open work's prefill
+      item. Decode unchanged at 139-140 tok/s)
 - Llama-3.1-8B Q4K batch decode (2026-10-27, post-store-mapping-fix, NO
       bisect switches; verified = NaN scan every step + final-step
       fingerprints + fresh-cache replay bitwise identical; every M>=2

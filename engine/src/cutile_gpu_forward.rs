@@ -343,6 +343,14 @@ pub struct CutileGpuModel {
     q_rope_scratch: RefCell<RopeScratch>,
     /// Pre-allocated RoPE scratch for K (sized for min(max_seq_len, 4096) x n_kv_heads).
     k_rope_scratch: RefCell<RopeScratch>,
+    /// Prefill-only RoPE scratch for Q.  Separate from `q_rope_scratch`
+    /// because prefill grows these via `ensure_capacity` (chunk-sized num_sh),
+    /// which reallocates -- the decode/graph scratches must keep their
+    /// pointer-baked buffers stable.  Also hosts the cos/sin cache that makes
+    /// layers 2..N of a chunk upload-free.
+    prefill_q_rope_scratch: RefCell<RopeScratch>,
+    /// Prefill-only RoPE scratch for K (see `prefill_q_rope_scratch`).
+    prefill_k_rope_scratch: RefCell<RopeScratch>,
     /// Pre-allocated RMSNorm scratch for pre-attention norm (seq_len=1 / decode).
     pre_attn_norm_scratch: RefCell<RmsnormScratch>,
     /// Pre-allocated RMSNorm scratch for post-attention norm (seq_len=1 / decode).
@@ -1673,15 +1681,19 @@ impl CutileGpuModel {
             matmul.stream(),
         )?;
 
-        // Scratch for exactly one decode step (seq_len=1). Prefill falls back to
-        // forward_device which allocates fresh -- prefill is infrequent so the
-        // allocation cost there is amortised. Sizing at n_heads (not max_seq_lenxn_heads)
-        // avoids the out-of-bounds launch that occurs when cap_num_sh > actual num_sh.
+        // Scratch for exactly one decode step (seq_len=1). Prefill uses its own
+        // scratch pair (prefill_q/k_rope_scratch) that grows to the chunk size
+        // via ensure_capacity -- never shared with the graph-captured decode
+        // path, whose pointer-baked buffers must not move.
         // Use the shared matmul stream so RoPE scratch buffers are on the same stream
         // as all other GPU operations -- eliminates cross-stream synchronization overhead.
         let rope_cap = 1usize;
         let q_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_heads, head_dim)?;
         let k_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
+        let prefill_q_rope_scratch =
+            RopeScratch::new(matmul.stream(), rope_cap * n_heads, head_dim)?;
+        let prefill_k_rope_scratch =
+            RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
         let pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let post_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let final_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
@@ -1819,6 +1831,8 @@ impl CutileGpuModel {
             scratch: RefCell::new(std::array::from_fn(|_| None)),
             q_rope_scratch: RefCell::new(q_rope_scratch),
             k_rope_scratch: RefCell::new(k_rope_scratch),
+            prefill_q_rope_scratch: RefCell::new(prefill_q_rope_scratch),
+            prefill_k_rope_scratch: RefCell::new(prefill_k_rope_scratch),
             pre_attn_norm_scratch: RefCell::new(pre_attn_norm_scratch),
             post_attn_norm_scratch: RefCell::new(post_attn_norm_scratch),
             post_attn_add_scratch: RefCell::new(post_attn_add_scratch),
@@ -1995,15 +2009,19 @@ impl CutileGpuModel {
             matmul.stream(),
         )?;
 
-        // Scratch for exactly one decode step (seq_len=1). Prefill falls back to
-        // forward_device which allocates fresh -- prefill is infrequent so the
-        // allocation cost there is amortised. Sizing at n_heads (not max_seq_lenxn_heads)
-        // avoids the out-of-bounds launch that occurs when cap_num_sh > actual num_sh.
+        // Scratch for exactly one decode step (seq_len=1). Prefill uses its own
+        // scratch pair (prefill_q/k_rope_scratch) that grows to the chunk size
+        // via ensure_capacity -- never shared with the graph-captured decode
+        // path, whose pointer-baked buffers must not move.
         // Use the shared matmul stream so RoPE scratch buffers are on the same stream
         // as all other GPU operations -- eliminates cross-stream synchronization overhead.
         let rope_cap = 1usize;
         let q_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_heads, head_dim)?;
         let k_rope_scratch = RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
+        let prefill_q_rope_scratch =
+            RopeScratch::new(matmul.stream(), rope_cap * n_heads, head_dim)?;
+        let prefill_k_rope_scratch =
+            RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
         let pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let post_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let final_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
@@ -2122,6 +2140,8 @@ impl CutileGpuModel {
             scratch: RefCell::new(std::array::from_fn(|_| None)),
             q_rope_scratch: RefCell::new(q_rope_scratch),
             k_rope_scratch: RefCell::new(k_rope_scratch),
+            prefill_q_rope_scratch: RefCell::new(prefill_q_rope_scratch),
+            prefill_k_rope_scratch: RefCell::new(prefill_k_rope_scratch),
             pre_attn_norm_scratch: RefCell::new(pre_attn_norm_scratch),
             post_attn_norm_scratch: RefCell::new(post_attn_norm_scratch),
             post_attn_add_scratch: RefCell::new(post_attn_add_scratch),
@@ -5178,10 +5198,13 @@ impl CutileGpuModel {
             let v_dev = self.gemm_any_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V);
 
             // -- 2c. RoPE (GPU) -- rotate Q and K entirely on device -----------
-            // cos/sin tables (tiny: seq_len x n_heads x head_dim/2 floats each)
-            // are computed on CPU and uploaded.  Q and K are deinterleaved and
-            // rotated on the GPU using pre-allocated scratch buffers, eliminating
-            // the 5 x 2 api::zeros calls (280 blocking allocs per token at 28 layers).
+            // Prefill uses the dedicated scratch pair: buffers grow to the
+            // chunk size once (ensure_capacity) and cos/sin upload once per
+            // chunk (cached across layers) -- layers 2..N run 3 async kernels
+            // with zero host work and zero H2D.  Previously every layer
+            // recomputed cos/sin on the CPU (num_sh*half transcendentals x2),
+            // did 2 blocking H2D uploads, 5 blocking allocs and a full stream
+            // synchronize via the forward_device fallback.
             let (q_rot_dev, k_rot_dev) = if !cfg.use_alibi {
                 let shared_stream = self.matmul.stream();
                 let qr = self
@@ -5193,7 +5216,7 @@ impl CutileGpuModel {
                         n_heads,
                         head_dim,
                         cfg.rope_theta,
-                        &mut self.q_rope_scratch.borrow_mut(),
+                        &mut self.prefill_q_rope_scratch.borrow_mut(),
                         shared_stream,
                     )
                     .expect("CutileGpuModel: GPU RoPE for Q failed");
@@ -5206,7 +5229,7 @@ impl CutileGpuModel {
                         n_kv_heads,
                         head_dim,
                         cfg.rope_theta,
-                        &mut self.k_rope_scratch.borrow_mut(),
+                        &mut self.prefill_k_rope_scratch.borrow_mut(),
                         shared_stream,
                     )
                     .expect("CutileGpuModel: GPU RoPE for K failed");
