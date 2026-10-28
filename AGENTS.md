@@ -418,6 +418,15 @@ typical-p/repeat/presence/frequency)
 - [ ] Validate hybrid DeltaNet pipeline against real Qwen3.6 / Bonsai 2
       weights (last attempt: "architecture incompatible" — diagnostics added,
       commit 9c6362d)
+- [ ] Generation-quality validation of the MXFP4 paths: every batch M>=2 and
+      prefill output before 2026-10-27 was computed with the broken
+      accumulator store mapping (deterministic + NaN-free, hence "verified",
+      but wrong -- see Decode correctness). The fixed path passes the
+      random-data CPU reference and the A/B exact-dequant delta is rel 0.10,
+      but no end-to-end text-generation quality check exists (e.g. greedy
+      continuation of a fixed prompt vs the CPU reference / llama.cpp, argmax
+      agreement per position). Same gap applies to the m=1 decode path's
+      numerics claims.
 - [ ] ARM NEON/SVE optimized CPU kernels (optimized paths are x86-only today)
 - [ ] NPU backends: `npu-intel`/`npu-qualcomm` are todo!() stubs (OpenVINO /
       QNN SDK required)
