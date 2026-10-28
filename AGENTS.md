@@ -479,16 +479,10 @@ usage: run the script with no arguments.
 ## GPU Kernels (cuda-oxide)
 
 We use a fork of cuda-oxide at `~/Code/github.com/NVLabs/cuda-oxide` with
-mma.sync intrinsics and invariant.load codegen.
-
-Bug-hunt branch `cutlass-mlir-block-count-miscompile` (local, on both the
-laptop and fishtank, based on upstream main `225756b63`): created 2026-10-27
-to chase what looked like a cutlass-mlir miscompile; **RESOLVED as our own
-kernel's wrong accumulator store mapping** (see Decode correctness in
-Implemented capabilities — the m16n8 store overflowed tiles into the
-cudaMallocAsync pool). No cuda-oxide bug existed; the branch carries only a
-postmortem in `repro/mxf4-block-count/` and can be deleted. tempura builds
-against whatever cuda-oxide has checked out on fishtank.
+mma.sync intrinsics and invariant.load codegen. (A 2026-10-27 bug-hunt
+branch here was deleted after the "cutlass-mlir miscompile" resolved as our
+own kernel's wrong accumulator store mapping — see Decode correctness in
+Implemented capabilities; the record lives in tempura's history.)
 
 **`cargo oxide build` uses a
 cached backend `.so` from `~/.cargo/cuda-oxide/`, built from upstream — NOT
