@@ -44,7 +44,9 @@ engine ──────── models, KV caches, loaders, traces, decoding str
     └─ cli ───── the `tempura` binary: serve, pull, list, inspect
 
 tools/ (workspace): trace-cli (TUI trace viewer), bench (HTTP throughput),
-  bench-gpu (7 GPU benchmarks), compare (server-vs-server), integration
+  bench-gpu (8 GPU benchmarks: bench-real-model, bench-batch, bench-mxfp4,
+  bench-e2e, bench-attn, bench-kernels, bench-speculative, bench-quality),
+  compare (server-vs-server), integration
 tools/ (standalone, cargo oxide): oxide-gemv (Q2_0), oxide-gemv-q4k,
   oxide-gemv-q6k, oxide-decode-attn, mxf4-gemv (cute-rs SM120a test)
 
@@ -430,15 +432,44 @@ typical-p/repeat/presence/frequency)
 - [ ] Validate hybrid DeltaNet pipeline against real Qwen3.6 / Bonsai 2
       weights (last attempt: "architecture incompatible" — diagnostics added,
       commit 9c6362d)
-- [ ] Generation-quality validation of the MXFP4 paths: every batch M>=2 and
-      prefill output before 2026-10-27 was computed with the broken
-      accumulator store mapping (deterministic + NaN-free, hence "verified",
-      but wrong -- see Decode correctness). The fixed path passes the
-      random-data CPU reference and the A/B exact-dequant delta is rel 0.10,
-      but no end-to-end text-generation quality check exists (e.g. greedy
-      continuation of a fixed prompt vs the CPU reference / llama.cpp, argmax
-      agreement per position). Same gap applies to the m=1 decode path's
-      numerics claims.
+- [ ] **m=1 GPU decode path produces wrong logits (2026-10-28, found by
+      bench-quality)**. Teacher-forced onto the CPU token sequence after a
+      good prefill (m=85, argmax match, host-dequant fallback), the
+      single-sequence decode path's logits diverge from the CPU reference by
+      max_abs 12-18 (logits scale ~10 -- relative error >1) at EVERY decode
+      step. NOT any switchable kernel: identical divergence with
+      TEMPURA_NO_SM120_KPAR / NO_OXIDE_ATTN / NO_DUAL_BLOCK / NO_MXFP4 /
+      NO_FUSED_SILU / NO_SM120_Q6K, individually and all together -- the
+      suspect is the shared decode orchestration (decode-time KV append,
+      RoPE position handling, CUDA-graph device scalars, or the final
+      logits projection). llama.cpp arbiter (same GGUF, raw completion):
+      " The first AI program, called Logical Theorist, was" -- tempura CPU
+      matches it for 2 tokens then near-tie diverges (healthy); tempura GPU
+      is wrong from token 1 ("Thes the the the..."). All prior m=1 decode
+      claims (134 tok/s, det=OK, NaN-free) measured speed and determinism
+      only -- the outputs were wrong. Repro:
+      `scripts/gpu-remote.sh bench quality` then
+      `TEMPURA_QUALITY_TEACHER=1` runs (see bench-quality header).
+- [ ] **Short-prompt GPU prefill is broken (2026-10-28, found by
+      bench-quality)**. At m~11 (real 11-token prompt): the MXFP4 fast path
+      diverges from CPU by max_abs ~17 (rel >1), and the TEMPURA_NO_GPU_PREFILL
+      host-dequant fallback emits ALL-NaN logits (128256/128256 entries).
+      At m=85 both paths are finite with argmax match (fast: max_abs 4.08,
+      fallback: 1.77). The pp128 A/B numbers do not hold at small m;
+      suspect m_pad/m_valid handling or chunked-GEMV row caps. Note
+      f32::max-based max_abs diffs silently swallow NaNs -- use the
+      nan_diffs counter pattern from bench-quality when comparing.
+- [ ] Generation-quality validation of the MXFP4 paths: the harness now
+      exists (tools/bench-gpu bench-quality: greedy GPU-vs-CPU continuation,
+      per-position argmax agreement, teacher-forcing mode, NaN-aware logit
+      diffs, llama.cpp-arbiter method documented in the file header). It
+      found the two bugs above; after they are fixed, run it end-to-end and
+      record the agreement numbers (target: >=80% argmax agreement on an
+      85-token prompt, 64 generated tokens). Cross-impl note: the CPU
+      reference itself diverges from llama.cpp after ~2 greedy tokens
+      (near-tie argmax flips, quantized-impl accumulation differences), so
+      100% CPU-vs-GPU agreement is not the right bar; llama.cpp text output
+      is the ground truth for "is the model thinking correctly".
 - [ ] ARM NEON/SVE optimized CPU kernels (optimized paths are x86-only today)
 - [ ] NPU backends: `npu-intel`/`npu-qualcomm` are todo!() stubs (OpenVINO /
       QNN SDK required)
@@ -572,10 +603,13 @@ cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
 Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
 - Llama-3.1-8B Q4K single-sequence: **134 tok/s decode**, ITL 7.44 ms
       (1.56x gap vs llama.cpp 209 tok/s; outputs verified NaN-free +
-      deterministic, 2026-10-27 post-fix)
+      deterministic, 2026-10-27 post-fix. RETRACTED 2026-10-28: speed and
+      determinism hold, but bench-quality showed the m=1 decode logits are
+      numerically wrong vs CPU/llama.cpp -- see open work)
 - Llama-3.1-8B Q4K prefill: **408 tok/s pp128**, TTFT P50 314 ms
       (18x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
-      exact-dequant max |logit| rel 0.10)
+      exact-dequant max |logit| rel 0.10. CAVEAT 2026-10-28: these hold at
+      m=128 only -- small-m prefill is broken, see open work)
 - Llama-3.1-8B Q4K batch decode (2026-10-27, post-store-mapping-fix, NO
       bisect switches; verified = NaN scan every step + final-step
       fingerprints + fresh-cache replay bitwise identical; every M>=2
