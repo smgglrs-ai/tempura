@@ -136,6 +136,55 @@ fn cpu_gqa_attention(
     out
 }
 
+/// CPU causal GQA prefill-attention reference.
+///
+/// Q: [seq_len, n_heads, head_dim] interleaved.  K/V caches:
+/// [kv_len, n_kv_heads, head_dim] interleaved (cache_offset = kv_len -
+/// seq_len tokens of history before the prompt).  Output: [seq_len,
+/// n_heads * head_dim] interleaved.  Row i attends to cache positions
+/// [0, cache_offset + i] (causal).
+fn cpu_prefill_attention(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    seq_len: usize,
+    kv_len: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let hpg = N_HEADS / N_KV_HEADS;
+    let cache_offset = kv_len - seq_len;
+    let mut out = vec![0.0f32; seq_len * N_HEADS * HEAD_DIM];
+    for i in 0..seq_len {
+        let causal_max = cache_offset + i; // inclusive
+        for h in 0..N_HEADS {
+            let g = h / hpg;
+            let q_h = &q[(i * N_HEADS + h) * HEAD_DIM..][..HEAD_DIM];
+            let mut scores = vec![0.0f32; causal_max + 1];
+            let mut max_s = f32::NEG_INFINITY;
+            for p in 0..=causal_max {
+                let k_row = &k_cache[(p * N_KV_HEADS + g) * HEAD_DIM..][..HEAD_DIM];
+                let s: f32 = q_h.iter().zip(k_row).map(|(a, b)| a * b).sum::<f32>() * scale;
+                scores[p] = s;
+                max_s = max_s.max(s);
+            }
+            let mut sum = 0.0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - max_s).exp();
+                sum += *s;
+            }
+            let o = &mut out[(i * N_HEADS + h) * HEAD_DIM..][..HEAD_DIM];
+            for p in 0..=causal_max {
+                let v_row = &v_cache[(p * N_KV_HEADS + g) * HEAD_DIM..][..HEAD_DIM];
+                let prob = scores[p] / sum;
+                for d in 0..HEAD_DIM {
+                    o[d] += prob * v_row[d];
+                }
+            }
+        }
+    }
+    out
+}
+
 /// CPU NeoX-style rotation reference for one (seq_len=1) position.
 fn cpu_rope(x: &[f32], pos: usize, n_heads: usize) -> Vec<f32> {
     let half = HEAD_DIM / 2;
@@ -287,6 +336,65 @@ fn main() {
     let mut cpu_c = vec![0.0f32; rows * kv_dim];
     cpu_c[row_off * kv_dim..(row_off + 1) * kv_dim].copy_from_slice(&src);
     all_ok &= report("kv scatter write (row 7 of 16)", &gpu_c, &cpu_c);
+
+    // ---- 3b. On-device prefill attention (gather/flash/scatter) ----
+    // The new prefill path (prefill_attention_device) must match the CPU
+    // causal GQA reference on RANDOM data at every shape class: partial
+    // BR/BC tiles (seq/kv not multiples of 32), prompt-with-history
+    // (cache_offset > 0), exact tiles, and scratch-pool reuse (second call
+    // with the same shapes exercises the take/try_unwrap pool path that the
+    // engine hits from layer 2 onward).
+    {
+        use tempura_kernels::cutile_flash_attention::{
+            CutileFlashAttention, PrefillAttnScratch,
+        };
+        let fa = CutileFlashAttention::new().expect("CutileFlashAttention init failed");
+        let fa_stream = fa.stream().clone();
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let cap = 512usize; // >= every kv_len below (capacity-sized caches)
+        let mut scratch = PrefillAttnScratch::default();
+
+        // (seq_len, kv_len, seed): (13,13) partial tiles no history;
+        // (64,149) partial KV tiles with 85 tokens of history; (128,128)
+        // exact tiles; (33, 65) both partial with history.
+        for &(seq_len, kv_len, seed) in
+            &[(13usize, 13usize, 11u32), (64, 149, 12), (128, 128, 13), (33, 65, 14)]
+        {
+            let q = prng_data(seq_len * N_HEADS * HEAD_DIM, seed);
+            let k = prng_data(cap * N_KV_HEADS * HEAD_DIM, seed + 1);
+            let v = prng_data(cap * N_KV_HEADS * HEAD_DIM, seed + 2);
+            let cpu = cpu_prefill_attention(&q, &k, &v, seq_len, kv_len, scale);
+            let q_dev = upload(q, &fa_stream);
+            let k_dev = upload(k, &fa_stream);
+            let v_dev = upload(v, &fa_stream);
+
+            // Two calls with identical shapes: the second exercises the
+            // pooled-scratch path (and must not corrupt anything).
+            for call in 0..2 {
+                let out = fa
+                    .prefill_attention_device(
+                        &q_dev,
+                        &k_dev,
+                        &v_dev,
+                        seq_len,
+                        kv_len,
+                        N_HEADS,
+                        N_KV_HEADS,
+                        HEAD_DIM,
+                        scale,
+                        &fa_stream,
+                        &mut scratch,
+                    )
+                    .expect("prefill_attention_device failed");
+                let gpu = download(&out, &fa_stream);
+                all_ok &= report(
+                    &format!("prefill attn dev (seq={seq_len} kv={kv_len} call{call})"),
+                    &gpu,
+                    &cpu,
+                );
+            }
+        }
+    }
 
     // ---- 4. Q6K decode GEMV (down_proj) on REAL model weights ----
     // The m=1 decode path runs every Q6_K tensor (down_proj in Q4_K_M, one

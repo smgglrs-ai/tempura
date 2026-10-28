@@ -334,11 +334,16 @@ fn main() {
     println!("  Ready in {:.2}s", t2.elapsed().as_secs_f64());
 
     // --- Greedy generation on both paths ---
-    // TEMPURA_QUALITY_TEACHER=1: teacher-force the GPU run onto the CPU
-    // token sequence so per-step logit deltas isolate numerics instead of
-    // cascading through divergent argmax choices (debugging mode; the
-    // default end-to-end mode is the quality metric).
-    let teacher = std::env::var("TEMPURA_QUALITY_TEACHER").as_deref() == Ok("1");
+    // Default: teacher-force the GPU run onto the CPU token sequence so
+    // per-step logit deltas isolate numerics instead of cascading through
+    // divergent argmax choices.  Free-running agreement is a coin flip
+    // whenever the prompt lands the model in near-tie territory (2026-10-28:
+    // first divergence at a margin-0.014 top1/top2 gap, after which the two
+    // runs hold different contexts and every later position "disagrees" with
+    // logit deltas of 10-20 that say nothing about kernel health).
+    // TEMPURA_QUALITY_FREE=1 restores the old free-running end-to-end mode
+    // (still printed below either way -- the GPU run records its own argmax).
+    let teacher = std::env::var("TEMPURA_QUALITY_FREE").as_deref() != Ok("1");
     println!("\n--- CPU reference greedy generation ---");
     let cpu_run = greedy_generate(&cpu_model, &config, &prompt, max_new, eos, None);
     println!(

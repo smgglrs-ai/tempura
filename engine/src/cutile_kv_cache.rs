@@ -120,6 +120,14 @@ impl CutileKvCache {
         self.gpu_max_seq_len > 0 && self.seq_len < self.gpu_max_seq_len
     }
 
+    /// Returns `true` if `append_device_gpu_only` can accept `n` new tokens
+    /// without exceeding the GPU cache capacity.  Unlike `has_device_kv`
+    /// (which only guarantees room for one more token), this covers multi-
+    /// token prefill chunks.
+    pub fn can_append_device(&self, n: usize) -> bool {
+        self.gpu_max_seq_len > 0 && self.seq_len + n <= self.gpu_max_seq_len
+    }
+
     /// Write `num_new_tokens` K/V rows into the host mirror at the current
     /// sequence position for `layer`.
     ///

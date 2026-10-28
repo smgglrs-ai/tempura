@@ -28,7 +28,7 @@ use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
 use cutile::tensor::{IntoPartition, Reshape, Tensor};
 use tempura_kernels::cutile_elementwise::CutileElementwise;
-use tempura_kernels::cutile_flash_attention::CutileFlashAttention;
+use tempura_kernels::cutile_flash_attention::{CutileFlashAttention, PrefillAttnScratch};
 use tempura_kernels::cutile_matmul::CutileMatMul;
 use tempura_kernels::cutile_quantized_gemm::{
     CutileQ2Gemv, CutileQ4Gemv, CutileQ6kGemv, Q2_0_BLOCK_BYTES, Q2_0_PACKED_U32S, Q2_0_QK,
@@ -359,6 +359,10 @@ pub struct CutileGpuModel {
     /// Eliminates the `api::zeros.sync_on` (= full stream sync + alloc) inside
     /// `decode_attention_device` -- 28 blocked allocs per decode token become zero.
     attn_out_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
+    /// Pooled buffers for on-device prefill attention (`prefill_attention_device`):
+    /// head-major Q/K/V gathers, flash output, interleaved output.  Grown on
+    /// demand per (seq_pad, kv_pad); zero steady-state allocs per layer.
+    prefill_attn_scratch: RefCell<PrefillAttnScratch>,
     /// Pre-allocated output buffer for `silu_mul_device_scratch` (seq_len=1).
     ///
     /// Same motivation as `attn_out_scratch`: eliminates 28 sync-on allocs per token.
@@ -1820,6 +1824,7 @@ impl CutileGpuModel {
             post_attn_add_scratch: RefCell::new(post_attn_add_scratch),
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
             attn_out_scratch: RefCell::new(attn_out_scratch),
+            prefill_attn_scratch: RefCell::new(PrefillAttnScratch::default()),
             silu_out_scratch: RefCell::new(silu_out_scratch),
             down_proj_pad_scratch: RefCell::new(down_proj_pad_scratch),
             prefill_scratch: RefCell::new(std::array::from_fn(|_| None)),
@@ -2122,6 +2127,7 @@ impl CutileGpuModel {
             post_attn_add_scratch: RefCell::new(post_attn_add_scratch),
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
             attn_out_scratch: RefCell::new(attn_out_scratch),
+            prefill_attn_scratch: RefCell::new(PrefillAttnScratch::default()),
             silu_out_scratch: RefCell::new(silu_out_scratch),
             down_proj_pad_scratch: RefCell::new(down_proj_pad_scratch),
             prefill_scratch: RefCell::new(std::array::from_fn(|_| None)),
@@ -5059,9 +5065,10 @@ impl CutileGpuModel {
         // cuTile GEMV uses async_on (capture-compatible); warmup covers all needed
         // shapes, so no JIT compilation happens inside capture.
         // TEMPURA_FORCE_PREFILL_M1=1: bisect switch that routes a single-token
-        // forward through the prefill loop (host-staged attention, prefill
-        // GEMMs) instead of the decode path -- used with TEMPURA_DEBUG_NAN to
-        // diff per-op bits_sums between two m=1 runs (decode bug hunting).
+        // forward through the prefill loop (prefill GEMMs + the prefill
+        // attention path) instead of the decode path -- used with
+        // TEMPURA_DEBUG_NAN to diff per-op bits_sums between two m=1 runs
+        // (decode bug hunting).
         // TEMPURA_DEBUG_NAN prints the gate values here when set.
         if seq_len == 1
             && gpu_kv_cache.has_device_kv()
@@ -5083,10 +5090,28 @@ impl CutileGpuModel {
         }
 
         // -- 3. Layer loop (prefill or CPU-attention fallback) -----------------
-        // Sync the host KV mirror if it was skipped during prior GPU-only decode
-        // steps and we are about to fall back to CPU attention.  This happens once
-        // at the transition from GPU decode to long-context CPU fallback.
-        if gpu_kv_cache.is_host_stale() && !gpu_kv_cache.has_device_kv() {
+        // On-device prefill attention: seq_len > 1, GPU KV cache active with
+        // room for the whole chunk, and the TEMPURA_NO_GPU_ATTN=1 bisect
+        // switch off.  Replaces the host-staged prefill attention (Q D->H,
+        // K/V from the host mirror, ~n_heads+2*n_kv_heads H2D + n_heads D2H
+        // + a full stream sync per layer) with 5 async device kernels.
+        let prefill_device_attn = seq_len > 1
+            && gpu_kv_cache.can_append_device(seq_len)
+            && std::env::var("TEMPURA_NO_GPU_ATTN").as_deref() != Ok("1");
+
+        // True when THIS call will read the host KV mirror (CPU GQA fallback
+        // or host-staged prefill attention).  Decode with device KV exited
+        // above, so the remaining device-attention case is prefill above.
+        let needs_host_attn =
+            !(prefill_device_attn || (seq_len == 1 && gpu_kv_cache.has_device_kv()));
+
+        // Sync the host KV mirror if it was skipped during prior GPU-only
+        // decode/prefill steps and we are about to fall back to host
+        // attention.  This covers both the GPU-decode -> long-context CPU
+        // fallback transition AND prefill chunks that exceed the GPU cache
+        // capacity after GPU-only appends (without this sync the host mirror
+        // would be missing the GPU-only region).
+        if gpu_kv_cache.is_host_stale() && needs_host_attn {
             gpu_kv_cache
                 .sync_host_from_device(gpu_kv_cache.seq_len())
                 .expect("CutileGpuModel: host KV mirror sync failed");
@@ -5200,17 +5225,22 @@ impl CutileGpuModel {
             }
 
             // -- 2d. KV-cache append -------------------------------------------
-            // When the GPU KV cache is active and seq_len == 1 (decode), use the
-            // GPU-only append path that omits the D->H host-mirror update.
-            // This eliminates 2 x n_layers blocking D->H `sync_on` calls per token
-            // (56 for a 28-layer model) which were serialising the GPU pipeline.
+            // When device attention will consume the cache this call (decode,
+            // or prefill via `prefill_attention_device`), use the GPU-only
+            // append path that omits the D->H host-mirror update.  This
+            // eliminates 2 x n_layers blocking D->H `sync_on` calls per token
+            // (56 for a 28-layer model) which were serialising the GPU
+            // pipeline -- and, for prefill, 2 per layer per chunk.
             //
-            // If we exceed the GPU KV cache capacity or need CPU attention
-            // (`has_device_kv()` returns false), fall back to the full
-            // `append_device` which also updates the host mirror.  When
-            // transitioning from GPU-only to CPU mode the host mirror is rebuilt
-            // via `sync_host_from_device` before the CPU attention path runs.
-            let use_gpu_attention = seq_len == 1 && gpu_kv_cache.has_device_kv();
+            // If we exceed the GPU KV cache capacity or need host attention
+            // (capacity overflow or TEMPURA_NO_GPU_ATTN=1), fall back to the
+            // full `append_device` which also updates the host mirror; the
+            // mirror was already synced above in that case.
+            let use_gpu_attention = if seq_len == 1 {
+                gpu_kv_cache.has_device_kv()
+            } else {
+                prefill_device_attn
+            };
             if use_gpu_attention {
                 gpu_kv_cache
                     .append_device_gpu_only(layer, &k_rot_dev, &v_dev, seq_len)
@@ -5259,6 +5289,29 @@ impl CutileGpuModel {
                     .expect("CutileGpuModel: GPU decode attention failed");
                 // Pad [q_dim] -> [1, q_pad] for O projection via GPU D->D copy.
                 self.attn_out_to_oproj_device(&attn_out_dev, q_dim, self.q_pad)
+            } else if prefill_device_attn {
+                // Prefill: fully on-device attention over the GPU KV cache.
+                // gather Q/K/V -> one multi-head flash-attn launch -> scatter,
+                // all async on the stream; the O-proj input is padded via
+                // D->D copy below.  Zero PCIe, zero host syncs.
+                let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer);
+                let attn_flat = self
+                    .flash_attn
+                    .prefill_attention_device(
+                        &q_rot_dev,
+                        &k_dev_full,
+                        &v_dev_full,
+                        seq_len,
+                        kv_len,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        scale,
+                        self.matmul.stream(),
+                        &mut self.prefill_attn_scratch.borrow_mut(),
+                    )
+                    .expect("CutileGpuModel: GPU prefill attention failed");
+                self.attn_out_to_oproj_device_m(&attn_flat, q_dim, self.q_pad, seq_len)
             } else {
                 // Host-based path: prefill (GPU flash attn) or long-context fallback.
                 let q_rot_host = self.download_device_tensor(&q_rot_dev);
