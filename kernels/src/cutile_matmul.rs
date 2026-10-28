@@ -197,12 +197,15 @@ fn next_pow2(x: usize) -> usize {
 const N_BLOCK_GEMV: usize = 64;
 const BK_GEMV: usize = 64;
 
-// Coalesced GEMV path (m == 1): one program per output element, BK=128 for
-// maximum PCIe / HBM bus utilisation (512 bytes per load = 4 cache lines).
+// Coalesced GEMV path (m == 1): one program per output element.
+// BK=512: 1475 GB/s on the f32 lm_head (82% of the 5090's peak) vs 709 GB/s
+// at the old BK=128 -- the [1, BK] tile load is the only memory transaction
+// per iteration, so bigger BK = fewer, longer per-program chains (real-
+// weights sweep in bench-decode-ops, 2026-10-28; BK=1024 is no better).
 // Requires k_pad % BK_GEMV_COALESCED == 0; fall back to forward_gemv_d2d_into
-// for shapes where this is not satisfied (uncommon in practice: K >= 128 always
-// holds for real LLMs).
-const BK_GEMV_COALESCED: usize = 128;
+// for shapes where this is not satisfied (uncommon in practice: K >= 512
+// holds for real LLM hidden sizes).
+const BK_GEMV_COALESCED: usize = 512;
 
 impl MatMul for CutileMatMul {
     fn verification_tier(&self) -> VerificationTier {
@@ -965,7 +968,10 @@ impl CutileMatMul {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .partition([1]);
 
-        let generics = vec![BK_GEMV_COALESCED.to_string(), k_pad.to_string()];
+        // BK=512 when the shape allows (1475 GB/s vs 709 at 128); fall back
+        // to 128 for small-k shapes so the divisibility assert never fires.
+        let bk = if k_pad.is_multiple_of(512) { 512usize } else { 128 };
+        let generics = vec![bk.to_string(), k_pad.to_string()];
 
         let (z, _a, _b) = kernels::cutile_gemv_coalesced(z, Arc::clone(a), Arc::clone(b))
             .generics(generics)
@@ -1007,7 +1013,9 @@ impl CutileMatMul {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .partition([1]);
 
-        let generics = vec![BK_GEMV_COALESCED.to_string(), k_pad.to_string()];
+        // BK=512 when the shape allows; fall back to 128 for small-k shapes.
+        let bk = if k_pad.is_multiple_of(512) { 512usize } else { 128 };
+        let generics = vec![bk.to_string(), k_pad.to_string()];
 
         // Use async_on (not sync_on) so this call is CUDA graph capture-compatible.
         // sync_on acquires a non-reentrant DeviceOp execution lock that rejects
@@ -1056,7 +1064,9 @@ impl CutileMatMul {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .partition([1]);
 
-        let generics = vec![BK_GEMV_COALESCED.to_string(), k_pad.to_string()];
+        // BK=512 when the shape allows; fall back to 128 for small-k shapes.
+        let bk = if k_pad.is_multiple_of(512) { 512usize } else { 128 };
+        let generics = vec![bk.to_string(), k_pad.to_string()];
 
         let (z, _a, _b) = unsafe {
             kernels::cutile_gemv_coalesced(z, Arc::clone(a), Arc::clone(b))

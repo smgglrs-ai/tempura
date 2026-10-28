@@ -1501,6 +1501,109 @@ fn main() {
                 &download(&a, &stream),
             );
         }
+
+        // ---- 7c. lm_head GEMV BK sweep ----
+    // The f32 lm_head projection (output.weight, [vocab, h]) runs through
+    // cutile_gemv_coalesced at ~810 GB/s of the 5090's ~1.8 TB/s (nsys
+    // 2026-10-28: 2.6ms per prefill, 11% of TTFT).  BK is a launch-time
+    // generic -- sweep it on the REAL weights.
+    {
+        use tempura_kernels::cutile_matmul::kernels as mk;
+        // lm_head lives in the GGUF in whatever dtype -- mirror the engine's
+        // dequantize() fallback chain.
+        let lm_w: Vec<f32> = {
+            use tempura_kernels::ggml::dequantize::dequantize_to_f32;
+            use tempura_kernels::ggml::GgmlType;
+            let n_elems = cfg.vocab_size * cfg.hidden_size;
+            let name = "lm_head.weight";
+            if let Some(d) = qw.get_f32(name) {
+                d.to_vec()
+            } else if let Some((dtype, bytes)) = qw.get_typed(name) {
+                dequantize_to_f32(dtype, bytes, n_elems)
+            } else if let Some(bytes) = qw.get_q4k(name) {
+                dequantize_to_f32(GgmlType::Q4K, bytes, n_elems)
+            } else if let Some(bytes) = qw.get_q6k(name) {
+                dequantize_to_f32(GgmlType::Q6K, bytes, n_elems)
+            } else if let Some(bytes) = qw.get_q2(name) {
+                tempura_engine::gguf_loader::dequant_q2_0_pub(bytes, n_elems)
+            } else if let Some(bytes) = qw.get_f16(name) {
+                dequantize_to_f32(GgmlType::F16, bytes, n_elems)
+            } else {
+                panic!("lm_head.weight not found in any format");
+            }
+        };
+        let n = cfg.vocab_size;
+        let k = cfg.hidden_size;
+        assert_eq!(lm_w.len(), n * k, "lm_head shape mismatch");
+        let y: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(lm_w.clone()))
+            .sync_on(&stream)
+            .expect("lm_head upload failed")
+            .reshape(&[n, k])
+            .expect("lm_head reshape failed")
+            .into();
+        let x: Vec<f32> = prng_data(k, 91);
+        let x_dev: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(x.clone()))
+            .sync_on(&stream)
+            .expect("x upload failed")
+            .reshape(&[1, k])
+            .expect("x reshape failed")
+            .into();
+        // CPU reference dots for the first/middle/last rows.
+        let ref_dot = |r: usize| -> f32 {
+            lm_w[r * k..(r + 1) * k].iter().zip(&x).map(|(w, v)| w * v).sum()
+        };
+        println!("  -- lm_head gemv BK sweep (n={n} k={k}) --");
+        for &bk in &[64usize, 128usize, 256usize, 512usize, 1024usize] {
+            let z_t = api::zeros::<f32>(&[n])
+                .sync_on(&stream)
+                .expect("z alloc failed");
+            let mut part_opt = Some(z_t.partition([1]));
+            let launch = |part: _| -> Result<_, String> {
+                let (p, ..) = unsafe {
+                    mk::cutile_gemv_coalesced(part, x_dev.clone(), y.clone())
+                        .generics(vec![bk.to_string(), k.to_string()])
+                        .async_on(&stream)
+                        .map_err(|e| e.to_string())?
+                };
+                Ok(p)
+            };
+            let mut ok = true;
+            for _ in 0..3 {
+                match launch(part_opt.take().unwrap()) {
+                    Ok(p) => part_opt = Some(p),
+                    Err(e) => {
+                        println!("  BK={bk:<4} SKIP ({e})");
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let iters = 20;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                part_opt = Some(launch(part_opt.take().unwrap()).expect("sweep launch failed"));
+            }
+            unsafe { stream.synchronize().expect("sweep sync failed") };
+            let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            let gbps = (n * k * 4) as f64 / 1e9 / (us / 1e6);
+            let z = Arc::new(part_opt.unwrap().unpartition())
+                .to_host_vec()
+                .sync_on(&stream)
+                .expect("z download failed");
+            let max_abs = [0usize, n / 2, n - 1]
+                .iter()
+                .map(|&r| (z[r] - ref_dot(r)).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "  BK={bk:<4} {us:8.1} us/iter ({gbps:6.0} GB/s) max_abs={max_abs:.6} -> {}",
+                if max_abs < 1e-2 { "PASS" } else { "FAIL" }
+            );
+            all_ok &= max_abs < 1e-2;
+        }
+    }
     }
 
     // ---- 8. MXFP4 quant+GEMM composition (prefill fast path) ----

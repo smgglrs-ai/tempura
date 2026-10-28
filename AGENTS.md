@@ -345,7 +345,7 @@ Qwen3.6-27B weights** — see open work.
       max |logit| delta rel 0.10 (TEMPURA_BENCH_PREFILL_AB=1).
       TEMPURA_NO_GPU_PREFILL=1 bisects back to the host path.
 - [x] Prefill attention on-device (2026-10-28): see open work for the
-      current state (5485 tok/s pp128, TTFT P50 23.4 ms, 1.3x gap) --
+      current state (5816 tok/s pp128, TTFT P50 22.1 ms, 1.26x gap) --
       gather/flash/scatter kernel chain + scratch RoPE with cos/sin cache
       + pooled prefill norms/adds/SiLU + Q6K down_proj via MXFP4 (nsys-
       driven), TEMPURA_NO_GPU_ATTN bisect, latent stale-host-mirror fix.
@@ -441,8 +441,12 @@ typical-p/repeat/presence/frequency)
       no deferred-barrier involvement) -- a substantial PTX rewrite of the
       double-buffer scheme. The dp4a kpar8 fallback is correct and within
       ~7% of the mbar variant's speed, so this is low-priority.
-- [ ] Close the 1.49x single-sequence GPU decode gap vs llama.cpp
-      (140 vs 209 tok/s, 2026-10-28 post fused-silu port, verified).
+- [ ] Close the 1.22x single-sequence GPU decode gap vs llama.cpp
+      (171 vs 209 tok/s, ITL 5.83 ms, 2026-10-28). Was 1.49x (140 tok/s)
+      before the lm_head BK=512 fix -- the f32 lm_head GEMV was running at
+      709 GB/s and costing ~1.5ms of every token; BK=512 (1475 GB/s) took
+      decode 139 -> 171 tok/s and prefill to 5816 (see the prefill item,
+      change (f)).
       The sm120 fused gate+up+SiLU kernel was ported to the native
       36-u32 raw GGUF format (2026-10-28; scale extraction mirrors
       q4k_gemv_v4_ptx, d/dmin via cvt.f32.f16) and re-enabled -- 134
@@ -450,11 +454,11 @@ typical-p/repeat/presence/frequency)
       held, bench-decode-ops fused-silu real-weights test rel 0.0007.
       Remaining levers: GEMV still ~40% DRAM (dmon: sm 99-100%, mem
       36-46%), host-side per-token overhead
-- [ ] Prefill on GPU: 5485 tok/s pp128, TTFT P50 23.4 ms (2026-10-28, nsys-
+- [ ] Prefill on GPU: 5816 tok/s pp128, TTFT P50 22.1 ms (2026-10-28, nsys-
       driven: on-device attention + scratch RoPE + pooled norms/adds/SiLU +
-      Q6K down_proj via MXFP4 + flash BR=16 tile tuning) vs llama.cpp 7335
-      (1.3x gap; 13.4x the 408 tok/s host-staged baseline). Five changes
-      landed 2026-10-28:
+      Q6K down_proj via MXFP4 + flash BR=16 + lm_head BK=512/last-row d2d)
+      vs llama.cpp 7335 (1.26x gap; 14.3x the 408 tok/s host-staged
+      baseline). Six changes landed 2026-10-28:
       (a) The prefill attention is fully on-device: 3
       `cutile_gather_heads` (de-interleave Q/K/V into head-major padded
       buffers) + ONE `cutile_flash_attn_heads` launch for all heads (the
@@ -521,6 +525,18 @@ typical-p/repeat/presence/frequency)
       BC strictly worse. BR 32 -> 16; BITWISE-neutral (per-row math
       unchanged -- identical logits fingerprint and identical bench-quality
       verdict). 5126 -> 5485 tok/s.
+      (f) lm_head GEMV BK=512 + final-norm last-row d2d: the f32 lm_head
+      projection ran cutile_gemv_coalesced at BK=128 = 709 GB/s (2.6ms per
+      prefill, 11% of TTFT, and ~1.5ms of EVERY decode token). A BK sweep
+      on the real weights (permanent bench-decode-ops section) found BK=512
+      at 1475 GB/s (82% of peak, 2.08x); the d2d wrappers pick 512 when
+      k_pad allows, 128 otherwise. The prefill final-norm also stopped
+      downloading the whole [seq, h_pad] hidden state to extract the last
+      row (blocking sync + PCIe) -- one D->D row copy now. 5485 -> 5816
+      tok/s prefill, TTFT 23.4 -> 22.1 ms; DECODE 139 -> 171 tok/s
+      (ITL 7.15 -> 5.83 ms -- the decode gap item below). Not bitwise
+      (reduction order), but det=OK, NaN-free, bench-quality PASS 89.1%
+      unchanged, argmax identical.
       Verified 2026-10-28: bench-decode-ops "prefill attn dev" 8/8, "rope
       prefill scratch" 4/4 and "rmsnorm prefill scratch" (grow/reuse/
       shrink/odd-seq) 4/4 all
@@ -766,16 +782,17 @@ cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
 ```
 
 Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
-- Llama-3.1-8B Q4K single-sequence: **140 tok/s decode**, ITL 7.15 ms
-      (1.49x gap vs llama.cpp 209 tok/s; outputs verified NaN-free +
+- Llama-3.1-8B Q4K single-sequence: **171 tok/s decode**, ITL 5.83 ms
+      (1.22x gap vs llama.cpp 209 tok/s; outputs verified NaN-free +
       deterministic, 2026-10-27 post-fix. A 2026-10-28 retraction (outputs
       numerically wrong vs CPU/llama.cpp) was resolved the same day: the
       sm_120 PTX shuffle-encoding bug -- see open work's fixed item.
       bench-quality now shows 100% argmax agreement vs the CPU reference,
       64/64 identical tokens free-running. 2026-10-28 fused-silu raw-format
-      port: 134 -> 140 tok/s)
-- Llama-3.1-8B Q4K prefill: **5485 tok/s pp128**, TTFT P50 23.4 ms
-      (1.3x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
+      port: 134 -> 140 tok/s; lm_head GEMV BK=128 -> 512 (709 -> 1475 GB/s):
+      140 -> 171 tok/s)
+- Llama-3.1-8B Q4K prefill: **5816 tok/s pp128**, TTFT P50 22.1 ms
+      (1.26x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1331 -- the MXFP4 band including the
       Q6K->MXFP4 down_proj double-quantization (lossier than the Q4K path's
       0.1015; bench-quality teacher-forced PASS 89.1%, all mismatches
@@ -783,9 +800,10 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       scratch RoPE with a cos/sin cache (815 -> 1305) + pooled prefill
       norms/adds/SiLU (1305 -> 1365) + Q6K down_proj via MXFP4
       (1365 -> 5126, nsys-driven) + flash BR=16 tile tuning (5126 -> 5485,
-      bitwise-neutral). Kernel-level verification bitwise-exact
+      bitwise-neutral) + lm_head BK=512 + last-row d2d (5485 -> 5816).
+      Kernel-level verification bitwise-exact
       vs the CPU causal reference for the attention/RoPE/norm paths, see
-      open work's prefill item. Decode unchanged at 139-140 tok/s)
+      open work's prefill item. Decode at 171 tok/s)
 - Llama-3.1-8B Q4K batch decode (2026-10-27, post-store-mapping-fix, NO
       bisect switches; verified = NaN scan every step + final-step
       fingerprints + fresh-cache replay bitwise identical; every M>=2
