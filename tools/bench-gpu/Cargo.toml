@@ -33,6 +33,10 @@ path = "src/bench_batch.rs"
 name = "bench-mxfp4"
 path = "src/bench_mxfp4.rs"
 
+[[bin]]
+name = "bench-quality"
+path = "src/bench_quality.rs"
+
 [dependencies]
 tempura-kernels = { path = "../../kernels", features = ["cutile", "oxide-gemv"] }
 tempura-engine = { path = "../../engine", features = ["cutile", "oxide-gemv"] }
