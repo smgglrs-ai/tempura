@@ -122,9 +122,11 @@ pub mod kernels {
 
 /// Pre-allocated device buffers for zero-allocation RoPE calls.
 ///
-/// Sized for up to `cap_num_sh` (sequence x head) pairs with a fixed `head_dim`.
-/// `forward_device_scratch` falls back to the allocating `forward_device` path
-/// when `seq_len * n_heads > cap_num_sh` or `head_dim` does not match.
+/// Sized for exactly `cap_num_sh` (sequence x head) pairs with a fixed
+/// `head_dim`; the z partition's launch grid is derived from the buffer
+/// size, so the invariant `num_sh == cap_num_sh` must hold for every
+/// `forward_device_scratch` call -- `ensure_capacity` restores it by
+/// reallocating when the request size differs (e.g. prefill chunks).
 ///
 /// x_first/x_second/out_first/out_second are half-dim intermediates that live
 /// entirely within one call: the kernel API returns them after use, so they are
@@ -133,6 +135,11 @@ pub mod kernels {
 /// z is the full-dim output shared with the caller via Arc.  The caller's Arc is
 /// dropped at the end of each layer-loop body; the stored Arc's strong_count drops
 /// to 1 at that point, allowing `Arc::try_unwrap` to reclaim it at the next call.
+///
+/// cos_t/sin_t cache the uploaded cos/sin tables for the standard
+/// (multi-token) path keyed by (positions, theta): identical across all layer
+/// calls within one forward, so the CPU compute + 2 H2D uploads happen once
+/// per chunk instead of once per layer.
 pub struct RopeScratch {
     pub cap_num_sh: usize,
     pub head_dim: usize,
@@ -141,6 +148,10 @@ pub struct RopeScratch {
     out_first: Option<Tensor<f32>>,
     out_second: Option<Tensor<f32>>,
     z: Option<Arc<Tensor<f32>>>,
+    cs_theta: f32,
+    cs_positions: Vec<u32>,
+    cos_t: Option<Arc<Tensor<f32>>>,
+    sin_t: Option<Arc<Tensor<f32>>>,
 }
 
 unsafe impl Send for RopeScratch {}
@@ -167,7 +178,46 @@ impl RopeScratch {
             out_first: Some(alloc(cap_num_sh * half)?),
             out_second: Some(alloc(cap_num_sh * half)?),
             z: Some(Arc::new(alloc(cap_num_sh * head_dim)?)),
+            cs_theta: 0.0,
+            cs_positions: Vec::new(),
+            cos_t: None,
+            sin_t: None,
         })
+    }
+
+    /// Reallocate the five rotation buffers for exactly `num_sh` pairs.
+    ///
+    /// Called by the multi-token path when the current allocation does not
+    /// match (prefill chunks vs the decode-sized initial allocation).  Only
+    /// blocking cost is the allocation itself, once per size change -- never
+    /// per layer.
+    ///
+    /// MUST NOT be called on a scratch whose buffers are pointer-baked into a
+    /// captured CUDA graph (reallocation invalidates the captured pointers).
+    /// The engine keeps separate prefill scratches for this reason; the
+    /// decode/graph scratches always call with num_sh == cap_num_sh so this
+    /// is a no-op for them.
+    pub fn ensure_capacity(
+        &mut self,
+        num_sh: usize,
+        stream: &Arc<Stream>,
+    ) -> std::result::Result<(), KernelError> {
+        if num_sh == self.cap_num_sh {
+            return Ok(());
+        }
+        let half = self.head_dim / 2;
+        let alloc = |n: usize| -> std::result::Result<Tensor<f32>, KernelError> {
+            api::zeros::<f32>(&[n])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))
+        };
+        self.x_first = Some(alloc(num_sh * half)?);
+        self.x_second = Some(alloc(num_sh * half)?);
+        self.out_first = Some(alloc(num_sh * half)?);
+        self.out_second = Some(alloc(num_sh * half)?);
+        self.z = Some(Arc::new(alloc(num_sh * self.head_dim)?));
+        self.cap_num_sh = num_sh;
+        Ok(())
     }
 }
 
@@ -564,7 +614,7 @@ impl CutileRoPE {
         stream: &Arc<Stream>,
     ) -> Result<Arc<Tensor<f32>>> {
         let num_sh = seq_len * n_heads;
-        if num_sh > scratch.cap_num_sh || head_dim != scratch.head_dim {
+        if head_dim != scratch.head_dim {
             return self.forward_device(x_dev, positions, seq_len, n_heads, head_dim, theta, stream);
         }
         if !head_dim.is_multiple_of(2) {
@@ -573,6 +623,12 @@ impl CutileRoPE {
             )));
         }
         let half = head_dim / 2;
+
+        // Grow/shrink the rotation buffers to exactly num_sh (prefill chunks
+        // vs the decode-sized initial allocation).  No-op for decode callers
+        // (num_sh == cap).  See RopeScratch::ensure_capacity for the
+        // graph-safety contract.
+        scratch.ensure_capacity(num_sh, stream)?;
 
         // -- Fast decode path: read cos/sin from pre-computed GPU table ----------
         // Requires seq_len=1 (all heads share the same position) and a populated
@@ -599,29 +655,53 @@ impl CutileRoPE {
         }
 
         // -- Standard path: compute cos/sin on CPU, upload H2D -----------------
-        let mut cos_exp = vec![0.0f32; num_sh * half];
-        let mut sin_exp = vec![0.0f32; num_sh * half];
-        for s in 0..seq_len {
-            let pos = positions[s] as f32;
-            for h in 0..n_heads {
-                let sh = s * n_heads + h;
+        // Cache hit (same positions + theta, e.g. layers 2..N of the same
+        // prefill chunk): zero host math, zero H2D.  The per-(s,d) frequency
+        // is computed once and replicated across heads (the old loop recomputed
+        // powf/cos/sin per head -- num_sh*half transcendentals per layer).
+        let cs_hit = scratch.cs_theta == theta
+            && scratch.cs_positions.as_slice() == positions
+            && scratch.cos_t.is_some()
+            && scratch.sin_t.is_some();
+        let (cos_t, sin_t) = if cs_hit {
+            (
+                scratch.cos_t.clone().unwrap(),
+                scratch.sin_t.clone().unwrap(),
+            )
+        } else {
+            let mut freqs = vec![0.0f32; seq_len * half];
+            for s in 0..seq_len {
+                let pos = positions[s] as f32;
                 for d in 0..half {
-                    let freq = pos / theta.powf(2.0 * d as f32 / head_dim as f32);
-                    cos_exp[sh * half + d] = freq.cos();
-                    sin_exp[sh * half + d] = freq.sin();
+                    freqs[s * half + d] = pos / theta.powf(2.0 * d as f32 / head_dim as f32);
                 }
             }
-        }
+            let mut cos_exp = vec![0.0f32; num_sh * half];
+            let mut sin_exp = vec![0.0f32; num_sh * half];
+            for s in 0..seq_len {
+                for h in 0..n_heads {
+                    let sh = s * n_heads + h;
+                    for d in 0..half {
+                        let f = freqs[s * half + d];
+                        cos_exp[sh * half + d] = f.cos();
+                        sin_exp[sh * half + d] = f.sin();
+                    }
+                }
+            }
 
-        let upload_vec = |v: Vec<f32>| -> Result<Arc<Tensor<f32>>> {
-            Ok(api::copy_host_vec_to_device(&Arc::new(v))
-                .sync_on(stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                .into())
+            let upload_vec = |v: Vec<f32>| -> Result<Arc<Tensor<f32>>> {
+                Ok(api::copy_host_vec_to_device(&Arc::new(v))
+                    .sync_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .into())
+            };
+
+            let cos_t = upload_vec(cos_exp)?;
+            let sin_t = upload_vec(sin_exp)?;
+            scratch.cs_theta = theta;
+            scratch.cs_positions = positions.to_vec();
+            (cos_t, sin_t)
         };
-
-        let cos_t = upload_vec(cos_exp)?;
-        let sin_t = upload_vec(sin_exp)?;
 
         // x_dev is already rank-1 (1 stride) because all GEMV paths now call
         // unpartition().reshape(&[n]) before returning, which collapses the
@@ -670,7 +750,7 @@ impl CutileRoPE {
         let x_first_arc: Arc<Tensor<f32>> = Arc::new(x_first_dev.unpartition());
         let x_second_arc: Arc<Tensor<f32>> = Arc::new(x_second_dev.unpartition());
 
-        let (out_f, out_s, xf_ret, xs_ret, _c, _s) = unsafe {
+        let (out_f, out_s, xf_ret, xs_ret, c_ret, s_ret) = unsafe {
             kernels::cutile_rope_kernel(
                 out_first_flat.partition([half]),
                 out_second_flat.partition([half]),
@@ -704,6 +784,13 @@ impl CutileRoPE {
         scratch.x_second = Some(Arc::try_unwrap(xs_ret).expect("xs_ret not unique"));
         scratch.out_first = Some(Arc::try_unwrap(of_ret).expect("of_ret not unique"));
         scratch.out_second = Some(Arc::try_unwrap(os_ret).expect("os_ret not unique"));
+        // On a cache miss the freshly uploaded tables enter the cache via the
+        // kernel returns; on a hit the returns are clones of what is already
+        // cached and simply drop.
+        if !cs_hit {
+            scratch.cos_t = Some(c_ret);
+            scratch.sin_t = Some(s_ret);
+        }
 
         let z_arc = Arc::new(z_t.unpartition());
         scratch.z = Some(z_arc.clone());

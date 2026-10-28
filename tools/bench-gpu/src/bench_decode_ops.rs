@@ -260,6 +260,59 @@ fn main() {
     let gpu_std = download(&out_std, &stream);
     all_ok &= report("rope standard path (pos=85, 32 heads)", &gpu_std, &cpu);
 
+    // ---- 1b. RoPE prefill scratch path: growth + cos/sin cache ----
+    // forward_device_scratch with a decode-sized scratch grows to the chunk
+    // size (ensure_capacity) and caches cos/sin across calls with identical
+    // positions.  Must match the allocating forward_device path bitwise on:
+    // first call (fresh upload + grown buffers), second call (cache hit),
+    // changed positions (cache miss), and a smaller chunk (buffer shrink).
+    {
+        let seq_len = 128usize;
+        let mk_pos = |base: usize| -> Vec<u32> {
+            (base..base + seq_len).map(|p| p as u32).collect()
+        };
+        let xq: Vec<f32> = prng_data(seq_len * N_HEADS * HEAD_DIM, 21);
+        let xq_dev = upload(xq, &stream);
+        // Decode-sized (cap = n_heads): the first prefill call must grow it.
+        let mut pf_scratch = RopeScratch::new(&stream, N_HEADS, HEAD_DIM).unwrap();
+        let mut run_pair = |positions: &[u32]| -> (Vec<f32>, Vec<f32>) {
+            let r = rope
+                .forward_device(&xq_dev, positions, seq_len, N_HEADS, HEAD_DIM, THETA, &stream)
+                .expect("ref forward_device failed");
+            let s = rope
+                .forward_device_scratch(
+                    &xq_dev, positions, seq_len, N_HEADS, HEAD_DIM, THETA,
+                    &mut pf_scratch, &stream,
+                )
+                .expect("scratch forward failed");
+            (download(&s, &stream), download(&r, &stream))
+        };
+        let (gpu, cpu_ref) = run_pair(&mk_pos(85));
+        all_ok &= report("rope prefill scratch (seq=128, grow)", &gpu, &cpu_ref);
+        let (gpu, cpu_ref) = run_pair(&mk_pos(85));
+        all_ok &= report("rope prefill scratch (seq=128, cache hit)", &gpu, &cpu_ref);
+        let (gpu, cpu_ref) = run_pair(&mk_pos(1000));
+        all_ok &= report("rope prefill scratch (seq=128, cache miss)", &gpu, &cpu_ref);
+        // Smaller chunk: buffers shrink back down.
+        let x_small: Vec<f32> = prng_data(64 * N_HEADS * HEAD_DIM, 22);
+        let x_small_dev = upload(x_small, &stream);
+        let pos64: Vec<u32> = (2000..2064).map(|p| p as u32).collect();
+        let r = rope
+            .forward_device(&x_small_dev, &pos64, 64, N_HEADS, HEAD_DIM, THETA, &stream)
+            .expect("ref forward_device (64) failed");
+        let s = rope
+            .forward_device_scratch(
+                &x_small_dev, &pos64, 64, N_HEADS, HEAD_DIM, THETA,
+                &mut pf_scratch, &stream,
+            )
+            .expect("scratch forward (64) failed");
+        all_ok &= report(
+            "rope prefill scratch (seq=64, shrink)",
+            &download(&s, &stream),
+            &download(&r, &stream),
+        );
+    }
+
     // ---- 2. RoPE graph path: gather row + scratch_graph ----
     let (cos_ptr, sin_ptr, half_dim, max_pos) = rope.table_ptrs().expect("table_ptrs failed");
     assert_eq!(half_dim, HEAD_DIM / 2);
