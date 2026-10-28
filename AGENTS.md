@@ -407,18 +407,37 @@ typical-p/repeat/presence/frequency)
 ## Open work (verified gaps — do not assume these are done)
 
 - [ ] q6k_gemv_sm120_mbar_kpar8 (single-seq Q6K GEMV): outputs are
-      allocation/kernel-history dependent. CONFIRMED 2026-10-27 (was
-      "suspected" in the original batch re-measure): with every other fix
-      in place, the M=1 fresh-cache replay diverges at L0 down-proj with
-      BITWISE-IDENTICAL inputs (gate-silu matched) -- ULP-level output
-      drift only. TEMPURA_NO_SM120_Q6K=1 (dp4a kpar8) flips the entire
-      batch matrix to verified. The mbar variant is now DEFAULT OFF
-      (opt in with TEMPURA_ALLOW_SM120_Q6K=1); the sm120 BATCH kernel is
-      unaffected (different code path, replay-verified) and loads
-      independently. Suspect: async-proxy -> generic-proxy ordering of
-      the double-buffer swap on sm_120 (bar.sync after wait_group is the
-      canonical pattern but insufficient here); needs a memory-model
-      audit or an mbarrier-based rewrite.
+      allocation/kernel-history dependent. AUDITED 2026-10-28 (see below);
+      still DEFAULT OFF (TEMPURA_ALLOW_SM120_Q6K=1 opts in); the fix path
+      is an mbarrier-based rewrite. Audit findings (SASS via
+      ptxas/cuobjdump on sm_120a + a standalone repro -- the new
+      bench-decode-ops "q6k mbar determinism stress": correct 53-u32
+      packing, kb=56 real down_proj weights, churn loop; kb=8/16 always
+      clean, kb=56 intermittently wrong and 8/8 nondeterministic under
+      churn):
+        - The kernel's structure is sound: per-warp smem buffers, warp-local
+          reads, uniform barrier counts for k_blocks % 8 == 0.
+        - ptxas lowers bar.sync 0 to BAR.SYNC.DEFER_BLOCKING (Blackwell
+          deferred CTA barrier): warps continue past the barrier until an
+          instruction requires completion. The next loop iteration's LDGSTS
+          (cp.async prefetch into the buffer other lanes were still reading)
+          does NOT require completion and can slip past the sync point --
+          the suspected race window, now SASS-confirmed.
+        - Tried and INSUFFICIENT: (1) fence.proxy.async.shared::cta between
+          wait_group and bar.sync; (2) bar.warp.sync (ptxas ELIMINATES it --
+          a converged warp needs no barrier; catastrophic garbage);
+          (3) bar.sync 0,256 (still DEFER_BLOCKING); (4) hoisting an
+          ld.shared of the next d word after the barrier to force
+          completion. All four: race persists.
+        - NOT the cause: weight-format confusion (a stress test that fed
+          raw 210-byte GGUF blocks instead of the engine's 53-u32 packing
+          produced inf -- fixed in the test), the k_blocks%8 barrier-uniformity
+          gate (verified sound).
+      The sanctioned sm_90+ fix is cp.async.mbarrier.arrive +
+      mbarrier.try_wait.parity (async completion tracked BY the mbarrier,
+      no deferred-barrier involvement) -- a substantial PTX rewrite of the
+      double-buffer scheme. The dp4a kpar8 fallback is correct and within
+      ~7% of the mbar variant's speed, so this is low-priority.
 - [ ] Close the 1.49x single-sequence GPU decode gap vs llama.cpp
       (140 vs 209 tok/s, 2026-10-28 post fused-silu port, verified).
       The sm120 fused gate+up+SiLU kernel was ported to the native
