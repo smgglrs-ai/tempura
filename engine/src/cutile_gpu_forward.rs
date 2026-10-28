@@ -1307,6 +1307,80 @@ impl CutileGpuModel {
         Ok(true)
     }
 
+    /// Load Q6K weights from a GGUF mmap, dequant Q6K -> f32 -> MXFP4, and
+    /// upload the tiled kernel layout to the GPU.
+    ///
+    /// Q6K is 6.5-bit and MXFP4 is 4-bit -- unlike the Q4K (4.5-bit) and BF16
+    /// (f32-exact) variants this is a LOSSY double-quantization.  It exists
+    /// because the q6k sm120 batch GEMV caps at 16 rows per launch (shared-
+    /// memory reduction area), so an m-row prefill chunk re-reads the full
+    /// weight matrix once per 16 rows at ~40% DRAM efficiency: down_proj was
+    /// 77% of prefill GPU time (nsys, 2026-10-28).  Decode (m=1) keeps the
+    /// exact Q6K kpar GEMV; TEMPURA_NO_GPU_PREFILL=1 keeps the exact
+    /// host-dequant prefill path.
+    ///
+    /// `n` must be a multiple of 8, `k` a multiple of 64.
+    /// Returns `false` when the tensor is absent in `qw` or dimensions are
+    /// incompatible.
+    fn maybe_upload_mxfp4_tiled_from_q6k(
+        stream: &Arc<Stream>,
+        dw_mxfp4_tiled: &mut HashMap<String, DeviceWeightMxfp4Tiled>,
+        qw: &QuantizedWeights,
+        name: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<bool, tempura_kernels::KernelError> {
+        use tempura_kernels::ggml::blocks::{BlockQ6K, BLOCK_Q6K_SIZE};
+        use tempura_kernels::ggml::dequantize::dequantize_row_q6_k;
+        use tempura_kernels::mxfp4::quantize_matrix_to_mxfp4_tiled;
+
+        if n % 8 != 0 || k % 64 != 0 {
+            return Ok(false);
+        }
+        let k_blocks = k / 256; // Q6K block size is 256 elements
+        if k_blocks == 0 {
+            return Ok(false);
+        }
+        let raw = match qw.get_q6k(name) {
+            Some(b) if b.len() == n * k_blocks * BLOCK_Q6K_SIZE => b,
+            _ => return Ok(false),
+        };
+
+        // Dequantize all N rows from Q6K to f32.
+        let mut f32_weights = vec![0.0f32; n * k];
+        let blocks_per_row = k_blocks;
+        for row in 0..n {
+            let block_start = row * blocks_per_row;
+            let blocks = unsafe {
+                std::slice::from_raw_parts(
+                    raw.as_ptr().add(block_start * BLOCK_Q6K_SIZE) as *const BlockQ6K,
+                    blocks_per_row,
+                )
+            };
+            dequantize_row_q6_k(blocks, &mut f32_weights[row * k..(row + 1) * k]);
+        }
+
+        // Quantize to MXFP4 tiled kernel layout.
+        let (packed, tiled_scales) = quantize_matrix_to_mxfp4_tiled(&f32_weights, n, k);
+
+        let packed_tensor: Arc<Tensor<u8>> =
+            api::copy_host_vec_to_device(&Arc::new(packed))
+                .sync_on(stream)
+                .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+                .into();
+        let scales_tensor: Arc<Tensor<u8>> =
+            api::copy_host_vec_to_device(&Arc::new(tiled_scales))
+                .sync_on(stream)
+                .map_err(|e| tempura_kernels::KernelError::InvalidConfig(e.to_string()))?
+                .into();
+
+        dw_mxfp4_tiled.insert(
+            name.to_string(),
+            DeviceWeightMxfp4Tiled { packed: packed_tensor, tiled_scales: scales_tensor, n, k },
+        );
+        Ok(true)
+    }
+
     /// Load BF16 weights from a GGUF mmap, convert BF16->f32->MXFP4, and upload
     /// the tiled kernel layout to the GPU.
     ///
@@ -1551,19 +1625,31 @@ impl CutileGpuModel {
                     (format!("{p}.mlp.up_proj.weight"),         inter,  h),
                     (format!("{p}.mlp.down_proj.weight"),       h,      inter),
                 ] {
-                    // Try Q4K first (quantized GGUF), then BF16 (full-precision GGUF).
-                    // Only one will succeed; the other returns false without touching GPU state.
+                    // Try Q4K first (quantized GGUF), then BF16 (full-precision
+                    // GGUF), then Q6K (lossy double-quantization -- see
+                    // maybe_upload_mxfp4_tiled_from_q6k; Q4_K_M down_proj).
+                    // Only one will succeed; the others return false without
+                    // touching GPU state.
                     let q4k_ok = match Self::maybe_upload_mxfp4_tiled_from_q4k(
                         matmul.stream(), &mut dw_mxfp4_tiled, qw, &wname, n_dim, k_dim,
                     ) {
                         Ok(ok) => ok,
                         Err(e) => { eprintln!("[mxfp4] tiled q4k {wname}: {e}"); false }
                     };
-                    if !q4k_ok {
-                        if let Err(e) = Self::maybe_upload_mxfp4_tiled_from_bf16(
+                    let mut uploaded = q4k_ok;
+                    if !uploaded {
+                        uploaded = match Self::maybe_upload_mxfp4_tiled_from_bf16(
                             matmul.stream(), &mut dw_mxfp4_tiled, qw, &wname, n_dim, k_dim,
                         ) {
-                            eprintln!("[mxfp4] tiled bf16 {wname}: {e}");
+                            Ok(ok) => ok,
+                            Err(e) => { eprintln!("[mxfp4] tiled bf16 {wname}: {e}"); false }
+                        };
+                    }
+                    if !uploaded {
+                        if let Err(e) = Self::maybe_upload_mxfp4_tiled_from_q6k(
+                            matmul.stream(), &mut dw_mxfp4_tiled, qw, &wname, n_dim, k_dim,
+                        ) {
+                            eprintln!("[mxfp4] tiled q6k {wname}: {e}");
                         }
                     }
                 }
@@ -4041,14 +4127,17 @@ impl CutileGpuModel {
         }
 
         // -- Prefill (m > 1): GPU fast paths, then host-dequant fallback ------
-        // Q6K weights go through the q6k batch GEMV FIRST (matching the batch-
-        // decode dispatch, which keeps down_proj at Q6K precision); tiled Q4K
-        // projections then take the MXFP4 tensor-core path.
+        // MXFP4 tensor-core GEMM first (tiled Q4K/BF16/Q6K weights): the q6k
+        // sm120 batch GEMV caps at 16 rows per launch and re-reads the full
+        // weight matrix per chunk -- at m=128 it was 77% of prefill GPU time
+        // (nsys, 2026-10-28).  Q6K weights without an MXFP4 conversion
+        // (dimension edge cases) keep the q6k batch path, which preserves
+        // Q6K precision; decode (m=1) always keeps the exact Q6K kpar GEMV.
         if m > 1 && std::env::var("TEMPURA_NO_GPU_PREFILL").as_deref() != Ok("1") {
-            if let Some(out) = self.gemm_q6k_prefill_batch(a, weight_name, m, slot) {
+            if let Some(out) = self.gemm_mxfp4_prefill(a, weight_name, m, slot) {
                 return out;
             }
-            if let Some(out) = self.gemm_mxfp4_prefill(a, weight_name, m, slot) {
+            if let Some(out) = self.gemm_q6k_prefill_batch(a, weight_name, m, slot) {
                 return out;
             }
         }
@@ -6592,6 +6681,9 @@ impl CutileGpuModel {
             }
 
             // Pre-size batch scratch tensors before capture.
+            // sum_t/scale_t must be exact-m sized too: the size checks in
+            // forward_device_fused_scratch realloc on mismatch, which is
+            // illegal inside graph capture (DriverError 900).
             {
                 const SILU_B: usize = 32;
                 let inter = cfg.intermediate_size;
@@ -6604,9 +6696,17 @@ impl CutileGpuModel {
                             .expect("mxfp4 batch_graph: scratch pre-size"),
                     )
                 };
-                self.batch_pre_attn_norm_scratch.borrow_mut().out_t  = Some(alloc_flat(m * h_pad));
-                self.batch_post_attn_norm_scratch.borrow_mut().out_t = Some(alloc_flat(m * h_pad));
-                self.batch_final_norm_scratch.borrow_mut().out_t     = Some(alloc_flat(m * h_pad));
+                for s in [&self.batch_pre_attn_norm_scratch,
+                          &self.batch_post_attn_norm_scratch,
+                          &self.batch_final_norm_scratch] {
+                    let mut s = s.borrow_mut();
+                    s.sum_t   = Some(alloc_flat(m));
+                    s.scale_t = Some(alloc_flat(m));
+                    s.out_t   = Some(alloc_flat(m * h_pad));
+                }
+                // add_device_scratch has the same exact-size check.
+                *self.batch_post_attn_add_scratch.borrow_mut() = Some(alloc_flat(m * h_pad));
+                *self.batch_ffn_add_scratch.borrow_mut()       = Some(alloc_flat(m * h_pad));
                 *self.batch_silu_out_scratch.borrow_mut() = Some(alloc_flat(m * inter_pad));
             }
 
@@ -6839,7 +6939,9 @@ impl CutileGpuModel {
 
             // Pre-size batch scratch tensors for seq_len=m before CUDA graph capture.
             // Scratch was pre-allocated for max_batch at construction; the reshape inside
-            // forward_device_fused_scratch requires the correct element count.  Synchronous
+            // forward_device_fused_scratch requires the correct element count, and
+            // sum_t/scale_t must be exact-m sized as well (their size checks realloc
+            // on mismatch, which is illegal inside capture).  Synchronous
             // alloc is safe here because we are not yet in capture mode.
             {
                 const SILU_B: usize = 32;
@@ -6853,9 +6955,17 @@ impl CutileGpuModel {
                             .expect("batch_graph: scratch pre-size"),
                     )
                 };
-                self.batch_pre_attn_norm_scratch.borrow_mut().out_t  = Some(alloc_flat(m * h_pad));
-                self.batch_post_attn_norm_scratch.borrow_mut().out_t = Some(alloc_flat(m * h_pad));
-                self.batch_final_norm_scratch.borrow_mut().out_t     = Some(alloc_flat(m * h_pad));
+                for s in [&self.batch_pre_attn_norm_scratch,
+                          &self.batch_post_attn_norm_scratch,
+                          &self.batch_final_norm_scratch] {
+                    let mut s = s.borrow_mut();
+                    s.sum_t   = Some(alloc_flat(m));
+                    s.scale_t = Some(alloc_flat(m));
+                    s.out_t   = Some(alloc_flat(m * h_pad));
+                }
+                // add_device_scratch has the same exact-size check.
+                *self.batch_post_attn_add_scratch.borrow_mut() = Some(alloc_flat(m * h_pad));
+                *self.batch_ffn_add_scratch.borrow_mut()       = Some(alloc_flat(m * h_pad));
                 *self.batch_silu_out_scratch.borrow_mut() = Some(alloc_flat(m * inter_pad));
             }
 
