@@ -238,17 +238,37 @@ cmd_oxide() {
     remote_ok || die "no clone at ~/Code/github.com/smgglrs-ai/tempura on $HOST"
     $SSH "$HOST" bash -s <<'EOF'
 set -euo pipefail
-backend="$HOME/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so"
-if [ ! -f "$backend" ]; then
-    echo "error: oxide backend .so missing on $(hostname): $backend" >&2
+fork_backend="$HOME/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so"
+upstream_backend="$HOME/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so"
+if [ ! -f "$fork_backend" ]; then
+    echo "error: oxide fork backend .so missing on $(hostname): $fork_backend" >&2
     echo "  build it: cd ~/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codegen-cuda && cargo build --release" >&2
     exit 1
 fi
-export CUDA_OXIDE_BACKEND="$backend"
+if [ ! -f "$upstream_backend" ]; then
+    echo "error: oxide upstream backend .so missing on $(hostname): $upstream_backend" >&2
+    echo "  build it: cd ~/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda && cargo build --release" >&2
+    exit 1
+fi
 cd "$HOME/Code/github.com/smgglrs-ai/tempura"
-for crate in oxide-gemv oxide-gemv-q4k oxide-gemv-q6k oxide-decode-attn; do
-    echo "--- cargo oxide build: tools/$crate ---"
-    (cd "tools/$crate" && cargo oxide build)
+# WHY two backends: the fork has mma.sync but its LLVM path cannot compile the
+# f16-subnormal fix in oxide-gemv-q4k (verification failure); the dp4a crates
+# (q4k, q6k, decode-attn) require the upstream backend on the 1.99.1
+# toolchain -- building them with the fork silently produces no PTX update
+# (the stale-PTX trap the mxf4 cubin already taught us).
+build_fork() {
+    CUDA_OXIDE_BACKEND="$fork_backend" cargo oxide build
+}
+build_upstream() {
+    CUDA_OXIDE_BACKEND="$upstream_backend" \
+    LD_LIBRARY_PATH="$HOME/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/lib:${LD_LIBRARY_PATH:-}" \
+    RUSTC_BOOTSTRAP=1 RUSTUP_TOOLCHAIN=1.99.1 cargo oxide build
+}
+echo "--- cargo oxide build: tools/oxide-gemv (fork backend) ---"
+(cd tools/oxide-gemv && build_fork)
+for crate in oxide-gemv-q4k oxide-gemv-q6k oxide-decode-attn; do
+    echo "--- cargo oxide build: tools/$crate (upstream dp4a backend, 1.99.1) ---"
+    (cd "tools/$crate" && build_upstream)
 done
 for d in target/release/build/tempura-kernels-*/out; do
     [ -d "$d" ] || continue
@@ -258,7 +278,6 @@ for d in target/release/build/tempura-kernels-*/out; do
     cp tools/oxide-decode-attn/oxide_decode_attn.ptx "$d/oxide_decode_attn.ptx" 2>/dev/null || true
 done
 echo "PTX copied into tempura-kernels build dirs"
-echo "note: for the upstream dp4a backend variant see AGENTS.md (RUSTUP_TOOLCHAIN=nightly-2026-10-11)"
 EOF
 }
 

@@ -343,9 +343,11 @@ Qwen3.6-27B weights** — see open work.
       314 ms, gap vs llama.cpp 7335 down to 18x. Verified: NaN-free,
       fresh-session logits bitwise-replay, A/B numerics vs exact-dequant
       max |logit| delta rel 0.10 (TEMPURA_BENCH_PREFILL_AB=1).
-      TEMPURA_NO_GPU_PREFILL=1 bisects back to the host path. Remaining
-      prefill levers: attention still host-staged (Q download + host-mirror
-      KV + re-upload per layer), KV host-mirror syncs per layer.
+      TEMPURA_NO_GPU_PREFILL=1 bisects back to the host path.
+- [x] Prefill attention on-device (2026-10-28): see open work for the
+      current state (815 tok/s pp128, TTFT P50 156 ms, 9.0x gap) --
+      gather/flash/scatter kernel chain, TEMPURA_NO_GPU_ATTN bisect, latent
+      stale-host-mirror fix.
 - [x] Benchmarks (2026-10-27, post-store-mapping-fix, RTX 5090, bench-batch
       all-M verified with NO bisect switches — NaN-free + fresh-cache replay
       bitwise): single-seq 134 tok/s decode, ITL 7.44 ms; prefill 408 tok/s
@@ -447,11 +449,29 @@ typical-p/repeat/presence/frequency)
       held, bench-decode-ops fused-silu real-weights test rel 0.0007.
       Remaining levers: GEMV still ~40% DRAM (dmon: sm 99-100%, mem
       36-46%), host-side per-token overhead
-- [ ] Prefill on GPU: 408 tok/s pp128, TTFT P50 314 ms (2026-10-27 fast
-      path, verified) vs llama.cpp 7335 (18x gap). Remaining levers:
-      attention is host-staged (per layer: Q D->H download, K/V read from the
-      host mirror, attn output H->D re-upload -- forward_batched host API),
-      KV host-mirror updates sync the stream twice per layer
+- [ ] Prefill on GPU: 815 tok/s pp128, TTFT P50 156 ms (2026-10-28 on-device
+      attention, 2.0x the 408 tok/s host-staged path) vs llama.cpp 7335
+      (9.0x gap). The prefill attention is now fully on-device: 3
+      `cutile_gather_heads` (de-interleave Q/K/V into head-major padded
+      buffers) + ONE `cutile_flash_attn_heads` launch for all heads (the
+      audited `cutile_flash_attn_head` math with multi-head tiling) +
+      `cutile_scatter_heads` back to interleaved -- 5 async kernels per
+      layer, zero PCIe, zero host syncs, scratch pooled
+      (`PrefillAttnScratch`, RopeScratch-style take/try_unwrap). Prefill KV
+      append uses `append_device_gpu_only` (the staleness guard before the
+      layer loop now syncs the host mirror whenever THIS call needs host
+      attention -- this also fixes a latent stale-mirror bug where a prefill
+      chunk after GPU-only decode read a mirror missing the GPU-only region).
+      TEMPURA_NO_GPU_ATTN=1 bisects back to the host-staged path. Verified
+      2026-10-28: bench-decode-ops "prefill attn dev" 8/8 bitwise-exact vs
+      the CPU causal GQA reference (partial BR/BC tiles, cache_offset>0,
+      pooled-scratch reuse); bench-real-model NaN-free, det=OK, A/B vs
+      host-dequant rel 0.1015 (the documented MXFP4 band); decode unchanged
+      at 139-140 tok/s. Remaining levers: per-token host overhead in the
+      chunk loop (cos/sin table upload per RoPE call, gemm dispatch), the
+      gather/scatter copies (~3 extra passes over Q/K/V activations --
+      fusible into the flash kernel or the RoPE/GEMM epilogues), BR/BC tile
+      tuning for long prompts
 - [ ] Validate hybrid DeltaNet pipeline against real Qwen3.6 / Bonsai 2
       weights (last attempt: "architecture incompatible" — diagnostics added,
       commit 9c6362d)
@@ -531,6 +551,16 @@ typical-p/repeat/presence/frequency)
       shuffle fix: 100% argmax agreement, 64/64 identical tokens
       free-running (85-token prompt, Llama-3.1-8B Q4_K_M, logits max_abs
       4.08 / avg 2.17 -- same band as the prefill's own CPU delta).
+      MODE CHANGE (2026-10-28, later): teacher forcing is now the DEFAULT
+      (TEMPURA_QUALITY_FREE=1 restores free-running). The free-running
+      verdict is a coin flip -- post-BOS-fix prompts land the model in
+      near-tie territory (first divergence at a margin-0.014 top1/top2 gap)
+      and every position after the flip "disagrees" with logit deltas of
+      10-20 that measure different contexts, not kernel health. Same code,
+      same day: free-running 15.6% FAIL while teacher-forced PASSes at
+      92.2% with max_abs 4.27 / avg 2.44 (the documented band). Use
+      teacher-forced agreement + the logit-delta band as the quality gate;
+      use free-running only to eyeball continuation text.
       Cross-impl note: the CPU reference diverges from llama.cpp after ~2
       greedy tokens (near-tie argmax flips, quantized-impl accumulation
       differences) -- llama.cpp text output remains the ground truth for
@@ -561,7 +591,10 @@ cargo run -p tempura -- serve --model /path/to/model.gguf --port 8080
 Note: `cargo test` compiles `tempura-kernels` with the `oxide-gemv` feature
 (feature unification via tools/bench-gpu), so the oxide GEMV PTX must be
 present in the kernels build out dirs — `scripts/gpu-remote.sh oxide` or the
-manual copy loop in the GPU section provides them.
+manual copy loop in the GPU section provides them. `oxide` now selects the
+backend per crate (fork for oxide-gemv, upstream+1.99.1 for the dp4a crates)
+-- the fork backend cannot compile the f16-subnormal fix in oxide-gemv-q4k
+and silently leaves a stale PTX behind.
 
 Benchmarks: `tools/bench` (HTTP throughput, llama.cpp-bench-style pp/tg),
 `tools/bench-gpu` (bench-real-model, bench-batch, bench-mxfp4, bench-e2e,
@@ -683,13 +716,12 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       bench-quality now shows 100% argmax agreement vs the CPU reference,
       64/64 identical tokens free-running. 2026-10-28 fused-silu raw-format
       port: 134 -> 140 tok/s)
-- Llama-3.1-8B Q4K prefill: **408 tok/s pp128**, TTFT P50 314 ms
-      (18x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
-      exact-dequant max |logit| rel 0.10. Re-verified 2026-10-28 with the
-      freshly rebuilt cubin + flash-attn tile fix: 400 tok/s, A/B rel 0.1015,
-      and fast-prefill argmax-MATCH vs the CPU reference at every prompt
-      length -- the 2026-10-28 small-m caveat is resolved, see open work's
-      fixed item)
+- Llama-3.1-8B Q4K prefill: **815 tok/s pp128**, TTFT P50 156 ms
+      (9.0x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
+      exact-dequant max |logit| rel 0.1015 -- the documented MXFP4 band.
+      2026-10-28 on-device attention doubled the 408 tok/s host-staged path;
+      kernel-level verification bitwise-exact vs the CPU causal reference,
+      see open work's prefill item. Decode unchanged at 139-140 tok/s)
 - Llama-3.1-8B Q4K batch decode (2026-10-27, post-store-mapping-fix, NO
       bisect switches; verified = NaN scan every step + final-step
       fingerprints + fresh-cache replay bitwise identical; every M>=2

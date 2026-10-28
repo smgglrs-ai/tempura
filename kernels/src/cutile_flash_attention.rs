@@ -147,6 +147,191 @@ pub mod kernels {
         out.store(true_div(acc, l_i.broadcast(shape![BR, D])));
     }
 
+    /// Multi-head prefill flash attention over head-major (gathered) buffers.
+    ///
+    /// Identical math to `cutile_flash_attn_head` (same online-softmax loop,
+    /// same causal masking), but one launch covers ALL attention heads:
+    ///
+    ///   q: flat [n_heads * seq_pad * D], head-major -- head h owns rows
+    ///      [h * seq_pad, (h+1) * seq_pad).  Rank-2 view [-1, D].
+    ///   k, v: flat [n_kv_heads * kv_pad * D], head-major, same layout.
+    ///   out: same layout/shape as q.
+    ///
+    /// Grid: (n_heads * seq_pad / BR, 1, 1) -- inferred from the out
+    /// partition.  program_id(0) is the GLOBAL Q-tile index; the head and
+    /// the tile-within-head are recovered by division.  GQA maps head h to
+    /// kv-head h / heads_per_group; that head's KV tiles start at block
+    /// kv_head * kv_tiles_per_head.
+    ///
+    /// q rows in [seq_len, seq_pad) and kv rows in [kv_len, kv_pad) are
+    /// zero-padding written by `cutile_gather_heads`; the causal + bounds
+    /// masks make them irrelevant, and the scatter never reads them back.
+    #[cutile::entry()]
+    pub fn cutile_flash_attn_heads<const BR: i32, const BC: i32, const D: i32>(
+        out: &mut Tensor<f32, { [BR, D] }>,
+        q: &Tensor<f32, { [-1, D] }>,
+        k: &Tensor<f32, { [-1, D] }>,
+        v: &Tensor<f32, { [-1, D] }>,
+        scale: f32,
+        cache_offset: i32,
+        seq_len: i32,
+        kv_len: i32,
+        q_tiles_per_head: i32,
+        kv_tiles_per_head: i32,
+        heads_per_group: i32,
+    ) {
+        let q_tile_global = program_id(0);
+        let head = q_tile_global / q_tiles_per_head;
+        let q_tile_idx = q_tile_global % q_tiles_per_head;
+        let kv_head = head / heads_per_group;
+
+        let part_q = q.partition(shape![BR, D]);
+        let tq: Tile<f32, { [BR, D] }> = part_q.load([q_tile_global, 0i32]);
+
+        // exp2 trick: use scale / log2 so exp2(qk * scale/log2) = exp(qk * scale).
+        let two: Tile<f32, { [] }> = constant(2.0f32, shape![]);
+        let log2: f32 = tile_to_scalar(log(two));
+        let qk_scale: Tile<f32, { [BR, BC] }> = broadcast_scalar(scale / log2, shape![BR, BC]);
+
+        // Running statistics for online softmax.
+        let mut m_i: Tile<f32, { [BR, 1] }> = constant(f32::NEG_INFINITY, shape![BR, 1]);
+        let mut l_i: Tile<f32, { [BR, 1] }> = constant(0.0f32, shape![BR, 1]);
+        let mut acc: Tile<f32, { [BR, D] }> = constant(0.0f32, shape![BR, D]);
+
+        let part_k = k.partition(shape![BC, D]);
+        let part_v = v.partition(shape![BC, D]);
+        // Ceil, NOT truncating division (see cutile_flash_attn_head).
+        let num_kv_tiles: i32 = ceil_div(kv_len, BC);
+
+        // Causal boundary: only process KV tiles reachable from this Q tile.
+        // cache_offset = kv_len - seq_len (positions already in KV cache before current tokens).
+        let last_q_row: i32 = q_tile_idx * BR + BR - 1;
+        let causal_limit_row: i32 = if last_q_row < seq_len {
+            last_q_row
+        } else {
+            seq_len - 1
+        };
+        let causal_kv_max: i32 = cache_offset + causal_limit_row;
+        let max_kv_tile: i32 = ceil_div(causal_kv_max + 1, BC);
+        let tile_count: i32 = min(num_kv_tiles, max_kv_tile);
+
+        // Precompute per-lane Q row indices (absolute, including cache offset).
+        let offs_m_iota: Tile<i32, { [BR] }> = iota(shape![BR]);
+        let offs_m_base: Tile<i32, { [BR, 1] }> =
+            broadcast_scalar(q_tile_idx * BR + cache_offset, shape![BR, 1])
+                + offs_m_iota.reshape(shape![BR, 1]);
+        let offs_m: Tile<i32, { [BR, BC] }> = offs_m_base.broadcast(shape![BR, BC]);
+
+        // KV column iota (reused across tiles; each tile adds j*BC).
+        let offs_n_iota: Tile<i32, { [BC] }> = iota(shape![BC]);
+        let offs_n_base: Tile<i32, { [BR, BC] }> =
+            offs_n_iota.reshape(shape![1, BC]).broadcast(shape![BR, BC]);
+
+        let kv_len_tile: Tile<i32, { [BR, BC] }> = broadcast_scalar(kv_len, shape![BR, BC]);
+        let mask_add_true: Tile<f32, { [BR, BC] }> = constant(0.0f32, shape![BR, BC]);
+        let mask_add_false: Tile<f32, { [BR, BC] }> = constant(f32::NEG_INFINITY, shape![BR, BC]);
+
+        let kv_block_base: i32 = kv_head * kv_tiles_per_head;
+        for j in 0i32..tile_count {
+            let tile_k: Tile<f32, { [BC, D] }> =
+                part_k.load_pipelined::<4>([kv_block_base + j, 0i32]);
+
+            // S = Q @ K^T  [BR x BC]
+            let mut qk: Tile<f32, { [BR, BC] }> = constant(0.0f32, shape![BR, BC]);
+            qk = mma(tq, tile_k.transpose(), qk);
+            qk = qk * qk_scale;
+
+            // Causal mask: allow kv_col <= q_row (causal) and kv_col < kv_len (padding).
+            let offs_n: Tile<i32, { [BR, BC] }> =
+                offs_n_base + broadcast_scalar(j * BC, shape![BR, BC]);
+            let causal_mask: Tile<bool, { [BR, BC] }> = ge_tile(offs_m, offs_n);
+            let bounds_mask: Tile<bool, { [BR, BC] }> = lt_tile(offs_n, kv_len_tile);
+            let combined_mask: Tile<bool, { [BR, BC] }> = causal_mask & bounds_mask;
+            qk = qk + select(combined_mask, mask_add_true, mask_add_false);
+
+            // Online softmax update.
+            let qk_max_1d: Tile<f32, { [BR] }> = reduce_max(qk, 1);
+            let qk_max: Tile<f32, { [BR, 1] }> = qk_max_1d.reshape(shape![BR, 1]);
+            let m_ij: Tile<f32, { [BR, 1] }> = max_tile(m_i, qk_max);
+
+            // Correction factor for previously accumulated rows.
+            let alpha: Tile<f32, { [BR, 1] }> = exp2(m_i - m_ij, ftz::Disabled);
+
+            // P = exp2(S - m_new)  [BR x BC]
+            let qk_shifted: Tile<f32, { [BR, BC] }> = qk - m_ij.broadcast(shape![BR, BC]);
+            let p: Tile<f32, { [BR, BC] }> = exp2(qk_shifted, ftz::Disabled);
+
+            // Update running sum and output accumulator.
+            let l_ij_1d: Tile<f32, { [BR] }> = reduce_sum(p, 1);
+            let l_ij: Tile<f32, { [BR, 1] }> = l_ij_1d.reshape(shape![BR, 1]);
+            l_i = l_i * alpha + l_ij;
+            acc = acc * alpha.broadcast(shape![BR, D]);
+
+            let tile_v: Tile<f32, { [BC, D] }> =
+                part_v.load_pipelined::<4>([kv_block_base + j, 0i32]);
+            acc = mma(p, tile_v, acc);
+            m_i = m_ij;
+        }
+
+        // Normalize: divide each row by its softmax denominator.
+        out.store(true_div(acc, l_i.broadcast(shape![BR, D])));
+    }
+
+    /// De-interleave head rows for one tensor: [len, heads, D] -> [heads, rows_per_head, D].
+    ///
+    /// `out` is the head-major destination, rank-2 [heads * rows_per_head, D],
+    /// partitioned [1, D] -> grid heads * rows_per_head.  `src` is the flat
+    /// interleaved source, rank-1 [len * heads * D].  Program blk maps to
+    /// (h = blk / rows_per_head, i = blk % rows_per_head) and copies src row
+    /// (i, h) -- block i * heads + h of the [D]-partition -- to out row blk.
+    /// Rows i >= len are zero-filled (Q padding for the flash kernel; the
+    /// causal/bounds masks make K/V padding inert either way).
+    ///
+    /// Same indexing scheme as `cutile_decode_attn`'s cache reads (computed
+    /// block indices into a rank-1 partition), plus the conditional-store
+    /// pattern of `cutile_interleave`.
+    #[cutile::entry()]
+    pub fn cutile_gather_heads<const D: i32>(
+        out: &mut Tensor<f32, { [1, D] }>,
+        src: &Tensor<f32, { [-1] }>,
+        src_len: i32,
+        src_heads: i32,
+        rows_per_head: i32,
+    ) {
+        let blk = program_id(0);
+        let h = blk / rows_per_head;
+        let i = blk % rows_per_head;
+        let part_src = src.partition(shape![D]);
+        if i < src_len {
+            let t: Tile<f32, { [D] }> = part_src.load([i * src_heads + h]);
+            out.store(t.reshape(shape![1, D]));
+        } else {
+            let z: Tile<f32, { [1, D] }> = constant(0.0f32, shape![1, D]);
+            out.store(z);
+        }
+    }
+
+    /// Re-interleave head rows: [heads, rows_per_head, D] -> [len, heads, D].
+    ///
+    /// `out` is the interleaved destination, rank-2 [len, heads * D],
+    /// partitioned [1, D] -> grid (len, heads): program_id(0) = token row i,
+    /// program_id(1) = head h.  `src` is the head-major flash-output buffer,
+    /// rank-2 [heads * rows_per_head, D]; block (h * rows_per_head + i, 0)
+    /// holds the attention output for (i, h).  Pad rows (i >= len) are never
+    /// launched, so no bounds masking is needed.
+    #[cutile::entry()]
+    pub fn cutile_scatter_heads<const D: i32>(
+        out: &mut Tensor<f32, { [1, D] }>,
+        src: &Tensor<f32, { [-1, D] }>,
+        rows_per_head: i32,
+    ) {
+        let i = program_id(0);
+        let h = program_id(1);
+        let part_src = src.partition(shape![1, D]);
+        let t: Tile<f32, { [1, D] }> = part_src.load([h * rows_per_head + i, 0i32]);
+        out.store(t);
+    }
+
     /// Decode (seq_len=1) GQA attention -- GPU-resident interleaved KV cache.
     ///
     /// One program per attention head.  Reads Q, K, and V entirely on device
@@ -955,6 +1140,199 @@ impl CutileFlashAttention {
         *scratch = Some(result.clone());
         Ok(result)
     }
+
+    /// On-device prefill (seq_len > 1) attention over the GPU-resident KV cache.
+    ///
+    /// Replaces the host-staged prefill path (Q D->H download, K/V reads from
+    /// the host mirror, per-head H2D uploads, per-head D2H downloads, output
+    /// H->D re-upload) with five async device kernels per layer:
+    ///
+    ///   1-3. `cutile_gather_heads` x3 -- de-interleave Q (from `q_dev`) and
+    ///        K/V (from the flat GPU cache) into head-major padded buffers.
+    ///   4.   `cutile_flash_attn_heads` -- ONE launch for all heads (the
+    ///        audited `cutile_flash_attn_head` math, multi-head tiling).
+    ///   5.   `cutile_scatter_heads` -- re-interleave into [seq_len, q_dim].
+    ///
+    /// Zero PCIe traffic, zero host synchronisations, zero steady-state
+    /// allocations (all buffers pooled in `scratch`, RopeScratch-style:
+    /// take -> try_unwrap -> partition, restore after the launch).
+    ///
+    /// `q_dev`: flat rank-1 [seq_len * n_heads * head_dim], interleaved
+    /// [token, head, dim] (RoPE output).  `k_cache`/`v_cache`: flat rank-1
+    /// GPU-cache tensors (any length >= kv_len * n_kv_heads * head_dim;
+    /// `CutileKvCache::kv_device_tensors` returns the full-capacity buffers).
+    ///
+    /// Returns rank-2 [seq_len, n_heads * head_dim] on device -- feed to
+    /// `attn_out_to_oproj_device_m`.
+    ///
+    /// # Safety
+    ///
+    /// The returned tensor is written asynchronously; callers must rely on
+    /// stream ordering (or sync) before any CPU read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_attention_device(
+        &self,
+        q_dev: &Arc<Tensor<f32>>,
+        k_cache: &Arc<Tensor<f32>>,
+        v_cache: &Arc<Tensor<f32>>,
+        seq_len: usize,
+        kv_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        stream: &Arc<Stream>,
+        scratch: &mut PrefillAttnScratch,
+    ) -> Result<Arc<Tensor<f32>>> {
+        if seq_len == 0 || kv_len == 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "prefill_attention_device: empty seq_len/kv_len ({seq_len}/{kv_len})"
+            )));
+        }
+        if !n_heads.is_multiple_of(n_kv_heads) {
+            return Err(KernelError::InvalidConfig(format!(
+                "n_heads ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
+            )));
+        }
+        let expected_q = seq_len * n_heads * head_dim;
+        let got_q = q_dev.shape().iter().map(|&d| d as usize).product::<usize>();
+        if got_q < expected_q {
+            return Err(KernelError::DimensionMismatch {
+                expected: expected_q,
+                got: got_q,
+            });
+        }
+
+        let seq_pad = seq_len.div_ceil(BR) * BR;
+        let kv_pad = kv_len.div_ceil(BC) * BC;
+        let q_rows = n_heads * seq_pad;
+        let kv_rows = n_kv_heads * kv_pad;
+        let q_dim = n_heads * head_dim;
+        let heads_per_group = n_heads / n_kv_heads;
+
+        // Head-major scratch buffers, exact logical size.  Pool hits (same
+        // shape as the previous layer/chunk) avoid api::zeros.sync_on; only
+        // k_g/v_g resize as kv_len grows across prefill chunks.
+        let q_g = take_or_alloc(&mut scratch.q_gathered, &[q_rows, head_dim], stream)?;
+        let k_g = take_or_alloc(&mut scratch.k_gathered, &[kv_rows, head_dim], stream)?;
+        let v_g = take_or_alloc(&mut scratch.v_gathered, &[kv_rows, head_dim], stream)?;
+        let out_g = take_or_alloc(&mut scratch.out_gathered, &[q_rows, head_dim], stream)?;
+        let out_flat = take_or_alloc(&mut scratch.out_flat, &[seq_len, q_dim], stream)?;
+
+        // -- 1-3. gathers: interleaved -> head-major (async, stream-ordered) --
+        let gather = |out_t: Tensor<f32>,
+                      src: &Arc<Tensor<f32>>,
+                      src_len: usize,
+                      src_heads: usize,
+                      rows_per_head: usize|
+         -> Result<Arc<Tensor<f32>>> {
+            let (part, ..) = unsafe {
+                kernels::cutile_gather_heads(
+                    out_t.partition([1, head_dim]),
+                    src.clone(),
+                    src_len as i32,
+                    src_heads as i32,
+                    rows_per_head as i32,
+                )
+                .generics(vec![head_dim.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            };
+            Ok(Arc::new(part.unpartition()))
+        };
+        let q_g = gather(q_g, q_dev, seq_len, n_heads, seq_pad)?;
+        let k_g = gather(k_g, k_cache, kv_len, n_kv_heads, kv_pad)?;
+        let v_g = gather(v_g, v_cache, kv_len, n_kv_heads, kv_pad)?;
+        scratch.q_gathered = Some(q_g.clone());
+        scratch.k_gathered = Some(k_g.clone());
+        scratch.v_gathered = Some(v_g.clone());
+
+        // -- 4. flash attention: one launch for all heads ---------------------
+        // cache_offset = kv_len - seq_len (tokens already cached pre-prompt).
+        let cache_offset = (kv_len - seq_len) as i32;
+        let (out_part, ..) = unsafe {
+            kernels::cutile_flash_attn_heads(
+                out_g.partition([BR, head_dim]),
+                q_g.clone(),
+                k_g.clone(),
+                v_g.clone(),
+                scale,
+                cache_offset,
+                seq_len as i32,
+                kv_len as i32,
+                (seq_pad / BR) as i32,
+                (kv_pad / BC) as i32,
+                heads_per_group as i32,
+            )
+            .generics(vec![BR.to_string(), BC.to_string(), head_dim.to_string()])
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+        let out_g = Arc::new(out_part.unpartition());
+        scratch.out_gathered = Some(out_g.clone());
+
+        // -- 5. scatter: head-major -> interleaved [seq_len, q_dim] -----------
+        let (out_part, ..) = unsafe {
+            kernels::cutile_scatter_heads(
+                out_flat.partition([1, head_dim]),
+                out_g.clone(),
+                seq_pad as i32,
+            )
+            .generics(vec![head_dim.to_string()])
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+        let result = Arc::new(out_part.unpartition());
+        scratch.out_flat = Some(result.clone());
+        Ok(result)
+    }
+}
+
+/// Pooled device buffers for `CutileFlashAttention::prefill_attention_device`.
+///
+/// RopeScratch-style pooling: each buffer is `take`n, `Arc::try_unwrap`ped,
+/// partitioned as the kernel output and restored after the launch.  q_gathered
+/// / k_gathered / v_gathered / out_gathered never leave the method, so their
+/// Arcs are always unique at the next call.  out_flat is shared with the
+/// caller (returned); the caller drops it before the next layer, restoring
+/// uniqueness -- same contract as the decode `attn_out_scratch`.
+///
+/// All buffers are exact-logical-size (per-call seq_pad/kv_pad); k_gathered
+/// and v_gathered grow with kv_len across prefill chunks, reallocating only
+/// on the (rare) size change.
+#[derive(Default)]
+pub struct PrefillAttnScratch {
+    q_gathered: Option<Arc<Tensor<f32>>>,
+    k_gathered: Option<Arc<Tensor<f32>>>,
+    v_gathered: Option<Arc<Tensor<f32>>>,
+    out_gathered: Option<Arc<Tensor<f32>>>,
+    out_flat: Option<Arc<Tensor<f32>>>,
+}
+
+unsafe impl Send for PrefillAttnScratch {}
+unsafe impl Sync for PrefillAttnScratch {}
+
+/// Reclaim a pooled buffer with the requested shape, or allocate a fresh one.
+///
+/// Pool miss (wrong shape, extra Arc owners, first call) falls back to
+/// `api::zeros(...).sync_on(...)` -- a blocking alloc that only happens on
+/// size changes, never in the steady state.
+fn take_or_alloc(
+    pool: &mut Option<Arc<Tensor<f32>>>,
+    shape: &[usize],
+    stream: &Arc<Stream>,
+) -> Result<Tensor<f32>> {
+    let want: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
+    if let Some(t) = pool
+        .take()
+        .and_then(|arc| Arc::try_unwrap(arc).ok())
+        .filter(|t| t.shape() == want.as_slice())
+    {
+        return Ok(t);
+    }
+    Ok(api::zeros::<f32>(shape)
+        .sync_on(stream)
+        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?)
 }
 
 impl Attention for CutileFlashAttention {
