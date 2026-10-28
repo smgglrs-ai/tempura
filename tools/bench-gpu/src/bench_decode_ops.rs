@@ -1001,6 +1001,84 @@ fn main() {
             all_ok &= report("silu_mul scratch (decode FFN)", &gs, &cpu);
         }
 
+        // ---- 5f. sm120 fused gate+up+SiLU (production FFN path, raw format) ----
+        // gate_silu[i] = silu(gate_i . a) * (up_i . a), real weights, with
+        // the Q8_1-quantized activation as the reference (the kernel
+        // quantizes a on the fly).
+        {
+            let gate_name = "model.layers.0.mlp.gate_proj.weight";
+            let up_name = "model.layers.0.mlp.up_proj.weight";
+            let (g_bytes, u_bytes) = (
+                qw.get_q4k(gate_name).expect("gate not Q4K"),
+                qw.get_q4k(up_name).expect("up not Q4K"),
+            );
+            let (gn, gk) = (cfg.intermediate_size, cfg.hidden_size);
+            let g_k_blocks = gk / 256;
+            let to_u32 = |b: &[u8]| -> Vec<u32> {
+                b.chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect()
+            };
+            let g_packed: Arc<Tensor<u32>> = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(to_u32(g_bytes)))
+                    .sync_on(&stream)
+                    .expect("gate upload failed"),
+            );
+            let u_packed: Arc<Tensor<u32>> = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(to_u32(u_bytes)))
+                    .sync_on(&stream)
+                    .expect("up upload failed"),
+            );
+            let a: Vec<f32> = prng_data(gk, 41);
+            let a_dev = upload(a.clone(), &stream);
+            let out = oxide_q4k
+                .forward_sm120_fused_silu_d2d(&a_dev, &g_packed, &u_packed, gn, g_k_blocks)
+                .expect("fused silu failed");
+            let gs = download(&out, &stream);
+            let gw = dequantize_to_f32(GgmlType::Q4K, g_bytes, gn * gk);
+            let uw = dequantize_to_f32(GgmlType::Q4K, u_bytes, gn * gk);
+            // Q8_1-quantized reference (the kernel quantizes activations).
+            let mut aq = a.clone();
+            for blk in (0..gk).step_by(32) {
+                let chunk = &mut aq[blk..blk + 32];
+                let amax = chunk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                let d = if amax == 0.0 { 1.0 } else { amax / 127.0 };
+                for v in chunk.iter_mut() {
+                    let r = (*v / d + if *v >= 0.0 { 0.5 } else { -0.5 }) as i32;
+                    *v = r.clamp(-127, 127) as f32 * d;
+                }
+            }
+            let cpu_fs: Vec<f32> = (0..gn)
+                .map(|i| {
+                    let g: f32 = gw[i * gk..(i + 1) * gk]
+                        .iter()
+                        .zip(&aq)
+                        .map(|(w, x)| w * x)
+                        .sum();
+                    let u: f32 = uw[i * gk..(i + 1) * gk]
+                        .iter()
+                        .zip(&aq)
+                        .map(|(w, x)| w * x)
+                        .sum();
+                    let s = g / (1.0 + (-g).exp());
+                    s * u
+                })
+                .collect();
+            let fs_max = gs
+                .iter()
+                .zip(&cpu_fs)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let ref_max = cpu_fs.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let rel_fs = fs_max / ref_max.max(1e-9);
+            println!(
+                "  {:<38} max_abs={fs_max:.4} rel={rel_fs:.4} -> {}",
+                "q4k sm120 fused silu (real gate/up)",
+                if rel_fs < 0.02 { "PASS" } else { "FAIL" }
+            );
+            all_ok &= rel_fs < 0.02;
+        }
+
         // ---- 6. Oxide decode attention vs CPU GQA math ----
         let kv_len = 86usize;
         let kv_dim = N_KV_HEADS * HEAD_DIM;

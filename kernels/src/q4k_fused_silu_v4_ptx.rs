@@ -4,17 +4,18 @@
 /// Computes: out[i] = silu(gate_dot[i]) * up_dot[i]
 ///   where gate_dot[i] and up_dot[i] are Q4K x Q8_1 dot products.
 ///
-/// # Weight format: repacked 42-u32 (168 bytes/block of 256 elements)
+/// # Weight format: native raw GGUF 36-u32 (144 bytes/block of 256 elements)
 ///
 /// ```text
-/// u32[0]      : f32 bits of d    (f16->f32 at upload time)
-/// u32[1]      : f32 bits of dmin (f16->f32 at upload time)
-/// u32[2+mw]   : scale word for mini-warp mw (mw=0..3):
-///                 bits[7:0]  = sc_lo (scale for lo Q8_1 sub-block)
-///                 bits[15:8] = sc_hi (scale for hi Q8_1 sub-block)
-/// u32[6+mw]   : min word for mini-warp mw (same encoding as scale)
-/// u32[10+mw*8+sub_l]: packed nibble weights (32 u32s, one per lane)
+/// u32[0]      : f16 d | f16 dmin << 16 (converted on the fly via cvt.f32.f16)
+/// u32[1..4]   : 12 bytes of 6-bit packed scales (sc/m for 8 j-groups)
+/// u32[4+mw*8+sub_l]: packed nibble weights (32 u32s, one per lane)
 /// ```
+///
+/// Ported from the repacked 42-u32 format 2026-10-28: the engine uploads
+/// raw GGUF bytes when the sm120 kernels are active (uses_raw_gguf), so the
+/// old format gate bypassed this kernel entirely. Scale extraction follows
+/// q4k_gemv_v4_ptx.rs's branchless 6-bit unpack.
 ///
 /// # Q8_1 activation format (9 u32 = 36 bytes per 32-element block)
 ///
@@ -57,7 +58,7 @@ pub const PTX: &str = r#"
 // q4k_fused_silu_sm120_dp4a
 // Fused gate+up Q4K GEMV with inline SiLU. sm_120 hand-tuned PTX.
 // Block: 128 threads = 4 warps. Grid: (N,1,1). Smem: 128 bytes (32 f32 slots).
-// Weights: repacked 42-u32 format. Activations: Q8_1 (pre-quantized).
+// Weights: native raw GGUF 36-u32 format. Activations: Q8_1 (pre-quantized).
 .visible .entry q4k_fused_silu_sm120_dp4a(
     .param .u64 param_gate,
     .param .u64 param_up,
@@ -121,92 +122,115 @@ KLOOP:
     setp.ge.u32 %p3, %r12, %r1;      // blk >= k_blocks -> reduce
     @%p3 bra REDUCE;
 
-    // byte_offset = (n_out * k_blocks + blk) * 168  (42 u32s * 4 bytes)
+    // byte_offset = (n_out * k_blocks + blk) * 144  (36 u32s * 4 bytes)
     mad.lo.u32 %r14, %r2, %r1, %r12; // block_idx = n_out * k_blocks + blk
-    mul.lo.u32 %r15, %r14, 168;       // * 168 bytes/block
+    mul.lo.u32 %r15, %r14, 144;       // * 144 bytes/block (raw GGUF)
     cvt.u64.u32 %rd7, %r15;           // u64 byte offset
     add.u64 %rd5, %rd0, %rd7;         // gate block base
     add.u64 %rd6, %rd1, %rd7;         // up block base
 
-    // -- Load gate d, dmin (stored as f32 bits at u32[0], u32[1]; broadcast from lane 0)
-    ld.global.nc.b32 %r16, [%rd5];
-    ld.global.nc.b32 %r17, [%rd5 + 4];
-    shfl.sync.idx.b32 %r16, %r16, 0, 31, 0xFFFFFFFF;  // broadcast d from lane 0
-    shfl.sync.idx.b32 %r17, %r17, 0, 31, 0xFFFFFFFF;  // broadcast dmin
-    mov.b32 %f2, %r16;                 // gd
-    mov.b32 %f3, %r17;                 // gdmin
+    // -- Load gate d, dmin: f16 pair packed in u32[0] (raw GGUF layout).
+    //    Every lane converts independently (cvt.f32.f16 handles subnormals,
+    //    unlike a bit reinterpret).
+    ld.global.nc.b16 %h0, [%rd5];
+    ld.global.nc.b16 %h1, [%rd5 + 2];
+    cvt.f32.f16 %f2, %h0;             // gd
+    cvt.f32.f16 %f3, %h1;             // gdmin
 
     // -- Load up d, dmin
-    ld.global.nc.b32 %r18, [%rd6];
-    ld.global.nc.b32 %r19, [%rd6 + 4];
-    shfl.sync.idx.b32 %r18, %r18, 0, 31, 0xFFFFFFFF;
-    shfl.sync.idx.b32 %r19, %r19, 0, 31, 0xFFFFFFFF;
-    mov.b32 %f4, %r18;                 // ud
-    mov.b32 %f5, %r19;                 // udmin
+    ld.global.nc.b16 %h0, [%rd6];
+    ld.global.nc.b16 %h1, [%rd6 + 2];
+    cvt.f32.f16 %f4, %h0;             // ud
+    cvt.f32.f16 %f5, %h1;             // udmin
 
-    // -- Load gate scale word for this mini-warp: u32[2 + mw]
-    //    Only sub_l==0 lane loads; then broadcast within mini-warp.
-    add.u32 %r20, %r6, 2;             // 2 + mw
-    shl.b32 %r20, %r20, 2;            // * 4 bytes
-    cvt.u64.u32 %rd8, %r20;
-    add.u64 %rd8, %rd5, %rd8;
-    mov.u32 %r21, 0;
-    @%p2 ld.global.nc.b32 %r21, [%rd8];
-    shfl.sync.idx.b32 %r21, %r21, %r8, 0x181F, 0xFFFFFFFF;  // broadcast within mini-warp
+    // -- Load scale words: raw GGUF u32[1..4] = 12 bytes of 6-bit packed
+    //    scales. All lanes load the same words (no shuffle needed).
+    ld.global.nc.b32 %r16, [%rd5 + 4];   // gate ps0
+    ld.global.nc.b32 %r17, [%rd5 + 8];   // gate ps1
+    ld.global.nc.b32 %r18, [%rd5 + 12];  // gate ps2
+    ld.global.nc.b32 %r19, [%rd6 + 4];   // up ps0
+    ld.global.nc.b32 %r20, [%rd6 + 8];   // up ps1
+    ld.global.nc.b32 %r21, [%rd6 + 12];  // up ps2
 
-    // -- Load gate min word: u32[6 + mw]
-    add.u32 %r22, %r6, 6;
-    shl.b32 %r22, %r22, 2;
-    cvt.u64.u32 %rd8, %r22;
-    add.u64 %rd8, %rd5, %rd8;
-    mov.u32 %r23, 0;
-    @%p2 ld.global.nc.b32 %r23, [%rd8];
-    shfl.sync.idx.b32 %r23, %r23, %r8, 0x181F, 0xFFFFFFFF;
+    // -- Branchless 6-bit scale extraction (same as q4k_gemv_v4_ptx) ------
+    // shift = (mw & 1) << 4 ; is_upper = mw >> 1
+    and.b32 %r22, %r6, 1;
+    shl.b32 %r22, %r22, 4;
+    add.u32 %r23, %r22, 8;            // shift + 8
+    shr.u32 %r24, %r6, 1;
+    setp.ne.u32 %p7, %r24, 0;         // is_upper
 
-    // -- Load up scale word: u32[2 + mw]
-    cvt.u64.u32 %rd8, %r20;
-    add.u64 %rd8, %rd6, %rd8;
-    mov.u32 %r24, 0;
-    @%p2 ld.global.nc.b32 %r24, [%rd8];
-    shfl.sync.idx.b32 %r24, %r24, %r8, 0x181F, 0xFFFFFFFF;
+    // GATE scales: sc_lo/sc_hi/m_lo/m_hi for this mini-warp's j-group.
+    // Lower formula (mw=0,1): direct 6-bit extraction from ps0/ps1.
+    shr.u32 %r25, %r16, %r22;  and.b32 %r25, %r25, 63;
+    shr.u32 %r26, %r16, %r23;  and.b32 %r26, %r26, 63;
+    shr.u32 %r27, %r17, %r22;  and.b32 %r27, %r27, 63;
+    shr.u32 %r28, %r17, %r23;  and.b32 %r28, %r28, 63;
+    // Upper formula (mw=2,3): cross-byte 6-bit extraction from ps0/ps1/ps2.
+    shr.u32 %r29, %r16, %r22;  and.b32 %r29, %r29, 255;   // b0
+    shr.u32 %r30, %r16, %r23;  and.b32 %r30, %r30, 255;   // b1
+    shr.u32 %r31, %r17, %r22;  and.b32 %r31, %r31, 255;   // b4
+    shr.u32 %r32, %r17, %r23;  and.b32 %r32, %r32, 255;   // b5
+    shr.u32 %r33, %r18, %r22;  and.b32 %r33, %r33, 255;   // b8
+    shr.u32 %r34, %r18, %r23;  and.b32 %r34, %r34, 255;   // b9
+    and.b32 %r35, %r33, 15;
+    and.b32 %r36, %r29, 192;  shr.u32 %r36, %r36, 2;
+    or.b32  %r35, %r35, %r36;                              // up_sc_lo
+    and.b32 %r37, %r34, 15;
+    and.b32 %r36, %r30, 192;  shr.u32 %r36, %r36, 2;
+    or.b32  %r37, %r37, %r36;                              // up_sc_hi
+    shr.u32 %r38, %r33, 4;  and.b32 %r38, %r38, 15;
+    and.b32 %r36, %r31, 192;  shr.u32 %r36, %r36, 2;
+    or.b32  %r38, %r38, %r36;                              // up_m_lo
+    shr.u32 %r39, %r34, 4;  and.b32 %r39, %r39, 15;
+    and.b32 %r36, %r32, 192;  shr.u32 %r36, %r36, 2;
+    or.b32  %r39, %r39, %r36;                              // up_m_hi
+    selp.u32 %r25, %r35, %r25, %p7;
+    selp.u32 %r26, %r37, %r26, %p7;
+    selp.u32 %r27, %r38, %r27, %p7;
+    selp.u32 %r28, %r39, %r28, %p7;
+    cvt.rn.f32.u32 %f6,  %r25;        // gsc_lo
+    cvt.rn.f32.u32 %f7,  %r26;        // gsc_hi
+    cvt.rn.f32.u32 %f8,  %r27;        // gm_lo
+    cvt.rn.f32.u32 %f9,  %r28;        // gm_hi
 
-    // -- Load up min word: u32[6 + mw]
-    cvt.u64.u32 %rd8, %r22;
-    add.u64 %rd8, %rd6, %rd8;
-    mov.u32 %r25, 0;
-    @%p2 ld.global.nc.b32 %r25, [%rd8];
-    shfl.sync.idx.b32 %r25, %r25, %r8, 0x181F, 0xFFFFFFFF;
+    // UP scales: same extraction from up ps0/ps1/ps2.
+    shr.u32 %r25, %r19, %r22;  and.b32 %r25, %r25, 63;
+    shr.u32 %r26, %r19, %r23;  and.b32 %r26, %r26, 63;
+    shr.u32 %r27, %r20, %r22;  and.b32 %r27, %r27, 63;
+    shr.u32 %r28, %r20, %r23;  and.b32 %r28, %r28, 63;
+    shr.u32 %r29, %r19, %r22;  and.b32 %r29, %r29, 255;
+    shr.u32 %r30, %r19, %r23;  and.b32 %r30, %r30, 255;
+    shr.u32 %r31, %r20, %r22;  and.b32 %r31, %r31, 255;
+    shr.u32 %r32, %r20, %r23;  and.b32 %r32, %r32, 255;
+    shr.u32 %r33, %r21, %r22;  and.b32 %r33, %r33, 255;
+    shr.u32 %r34, %r21, %r23;  and.b32 %r34, %r34, 255;
+    and.b32 %r35, %r33, 15;
+    and.b32 %r36, %r29, 192;  shr.u32 %r36, %r36, 2;
+    or.b32  %r35, %r35, %r36;
+    and.b32 %r37, %r34, 15;
+    and.b32 %r36, %r30, 192;  shr.u32 %r36, %r36, 2;
+    or.b32  %r37, %r37, %r36;
+    shr.u32 %r38, %r33, 4;  and.b32 %r38, %r38, 15;
+    and.b32 %r36, %r31, 192;  shr.u32 %r36, %r36, 2;
+    or.b32  %r38, %r38, %r36;
+    shr.u32 %r39, %r34, 4;  and.b32 %r39, %r39, 15;
+    and.b32 %r36, %r32, 192;  shr.u32 %r36, %r36, 2;
+    or.b32  %r39, %r39, %r36;
+    selp.u32 %r25, %r35, %r25, %p7;
+    selp.u32 %r26, %r37, %r26, %p7;
+    selp.u32 %r27, %r38, %r27, %p7;
+    selp.u32 %r28, %r39, %r28, %p7;
+    cvt.rn.f32.u32 %f10, %r25;        // usc_lo
+    cvt.rn.f32.u32 %f11, %r26;        // usc_hi
+    cvt.rn.f32.u32 %f12, %r27;        // um_lo
+    cvt.rn.f32.u32 %f13, %r28;        // um_hi
 
-    // -- Extract scale/min byte fields
-    // sc_lo = word & 0xFF, sc_hi = (word >> 8) & 0xFF
-    and.b32 %r26, %r21, 255;          // gate sc_lo
-    shr.u32 %r27, %r21, 8;
-    and.b32 %r27, %r27, 255;          // gate sc_hi
-    and.b32 %r28, %r23, 255;          // gate m_lo
-    shr.u32 %r29, %r23, 8;
-    and.b32 %r29, %r29, 255;          // gate m_hi
-
-    and.b32 %r30, %r24, 255;          // up sc_lo
-    shr.u32 %r31, %r24, 8;
-    and.b32 %r31, %r31, 255;          // up sc_hi
-    and.b32 %r32, %r25, 255;          // up m_lo
-    shr.u32 %r33, %r25, 8;
-    and.b32 %r33, %r33, 255;          // up m_hi
-
-    cvt.rn.f32.u32 %f6,  %r26;        // gsc_lo f32
-    cvt.rn.f32.u32 %f7,  %r27;        // gsc_hi f32
-    cvt.rn.f32.u32 %f8,  %r28;        // gm_lo f32
-    cvt.rn.f32.u32 %f9,  %r29;        // gm_hi f32
-    cvt.rn.f32.u32 %f10, %r30;        // usc_lo f32
-    cvt.rn.f32.u32 %f11, %r31;        // usc_hi f32
-    cvt.rn.f32.u32 %f12, %r32;        // um_lo f32
-    cvt.rn.f32.u32 %f13, %r33;        // um_hi f32
-
-    // -- Load gate qs: u32[10 + mw*8 + sub_l]
+    // -- Load gate qs: u32[4 + mw*8 + sub_l] (raw GGUF qs section) --------
     mul.lo.u32 %r34, %r6, 8;          // mw * 8
-    add.u32    %r34, %r34, 10;         // + 10 (skip header)
-    add.u32    %r34, %r34, %r7;        // + sub_l
-    shl.b32    %r34, %r34, 2;          // * 4 bytes
+    add.u32    %r34, %r34, 4;         // + 4 (skip d/dmin/scales header)
+    add.u32    %r34, %r34, %r7;       // + sub_l
+    shl.b32    %r34, %r34, 2;         // * 4 bytes
     cvt.u64.u32 %rd8, %r34;
     add.u64    %rd8, %rd5, %rd8;
     ld.global.nc.b32 %r35, [%rd8];    // gate qs u32

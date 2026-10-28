@@ -1240,14 +1240,15 @@ impl OxideQ4kGemv {
     /// available AND the weight format matches what it parses.
     ///
     /// The sm_120 fused kernel reads the REPACKED 42-u32 format (168 B/block)
-    /// -- same constraint as `has_fused_silu`. When `uses_raw_gguf` is true
-    /// (sm_120 kpar selected, native 36-u32/144 B uploads) the formats
-    /// mismatch: the kernel would misparse every block and read past the
-    /// tensor end, producing NaN (found via TEMPURA_DEBUG_NAN: first NaN at
-    /// L0 gate-silu, 12262/14336). Gate on format until the kernel is ported
-    /// to native format.
+    /// -- PORTED to the native 36-u32/144 B raw GGUF format on 2026-10-28
+    /// (scale extraction mirrors q4k_gemv_v4_ptx's branchless 6-bit unpack;
+    /// d/dmin convert via cvt.f32.f16). The old repacked-42-u32 requirement
+    /// mismatched the sm_120 weight upload (uses_raw_gguf) and bypassed the
+    /// kernel on Blackwell; before the port it misparsed every block and
+    /// read past the tensor end, producing NaN (found via TEMPURA_DEBUG_NAN:
+    /// first NaN at L0 gate-silu, 12262/14336).
     pub fn has_sm120_fused_silu(&self) -> bool {
-        !self.uses_raw_gguf && self.cu_sm120_fused_silu.is_some() && self.cu_q8_quantize.is_some()
+        self.uses_raw_gguf && self.cu_sm120_fused_silu.is_some() && self.cu_q8_quantize.is_some()
     }
 
     /// Returns true when the Q8_1 quantize + integer GEMV path is compiled into the PTX.
