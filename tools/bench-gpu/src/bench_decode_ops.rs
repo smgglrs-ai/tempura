@@ -1347,6 +1347,30 @@ fn main() {
             x_norm.iter().zip(&ln_w).map(|(v, w)| v * inv * w).collect()
         };
         all_ok &= report("rmsnorm fused scratch (real ln weight)", &norm_gpu, &norm_cpu);
+
+        // ---- 7b. RMSNorm fused scratch, prefill sizes (grow + reuse) ----
+        // The engine's prefill norm now uses the scratch path with a
+        // decode-sized initial scratch: the first call grows sum/scale/out,
+        // later calls (and other chunk sizes) must stay exact.  Compare the
+        // scratch path against the allocating forward_device_fused, which
+        // shares the kernels but not the pooling.
+        for seq_len in [128usize, 128, 64, 33] {
+            let xp: Vec<f32> = prng_data(seq_len * h, 40 + seq_len as u32);
+            let xp_dev = upload(xp, &stream);
+            let a = rms
+                .forward_device_fused(&stream, xp_dev.clone(), &ln_w_dev, seq_len, h, h, 1e-5)
+                .expect("fused rmsnorm (ref) failed");
+            let b = rms
+                .forward_device_fused_scratch(
+                    &stream, xp_dev, &ln_w_dev, seq_len, h, h, 1e-5, &mut norm_scratch,
+                )
+                .expect("fused-scratch rmsnorm (prefill) failed");
+            all_ok &= report(
+                &format!("rmsnorm prefill scratch (seq={seq_len})"),
+                &download(&b, &stream),
+                &download(&a, &stream),
+            );
+        }
     }
 
     // ---- 8. MXFP4 quant+GEMM composition (prefill fast path) ----

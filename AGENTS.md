@@ -345,9 +345,10 @@ Qwen3.6-27B weights** — see open work.
       max |logit| delta rel 0.10 (TEMPURA_BENCH_PREFILL_AB=1).
       TEMPURA_NO_GPU_PREFILL=1 bisects back to the host path.
 - [x] Prefill attention on-device (2026-10-28): see open work for the
-      current state (1305 tok/s pp128, TTFT P50 98 ms, 5.6x gap) --
-      gather/flash/scatter kernel chain + scratch RoPE with cos/sin cache,
-      TEMPURA_NO_GPU_ATTN bisect, latent stale-host-mirror fix.
+      current state (1365 tok/s pp128, TTFT P50 94 ms, 5.4x gap) --
+      gather/flash/scatter kernel chain + scratch RoPE with cos/sin cache
+      + pooled prefill norms/adds/SiLU, TEMPURA_NO_GPU_ATTN bisect, latent
+      stale-host-mirror fix.
 - [x] Benchmarks (2026-10-27, post-store-mapping-fix, RTX 5090, bench-batch
       all-M verified with NO bisect switches — NaN-free + fresh-cache replay
       bitwise): single-seq 134 tok/s decode, ITL 7.44 ms; prefill 408 tok/s
@@ -449,9 +450,10 @@ typical-p/repeat/presence/frequency)
       held, bench-decode-ops fused-silu real-weights test rel 0.0007.
       Remaining levers: GEMV still ~40% DRAM (dmon: sm 99-100%, mem
       36-46%), host-side per-token overhead
-- [ ] Prefill on GPU: 1305 tok/s pp128, TTFT P50 98 ms (2026-10-28 on-device
-      attention + scratch RoPE, 3.2x the 408 tok/s host-staged path) vs
-      llama.cpp 7335 (5.6x gap). Two changes landed 2026-10-28:
+- [ ] Prefill on GPU: 1365 tok/s pp128, TTFT P50 94 ms (2026-10-28 on-device
+      attention + scratch RoPE + pooled norms/adds/SiLU, 3.3x the 408 tok/s
+      host-staged path) vs llama.cpp 7335 (5.4x gap). Three changes landed
+      2026-10-28:
       (a) The prefill attention is fully on-device: 3
       `cutile_gather_heads` (de-interleave Q/K/V into head-major padded
       buffers) + ONE `cutile_flash_attn_heads` launch for all heads (the
@@ -474,8 +476,18 @@ typical-p/repeat/presence/frequency)
       BITWISE-identical (pure overhead removal). The prefill scratches are
       separate fields because ensure_capacity reallocates and the
       decode/graph scratches are pointer-baked into captured CUDA graphs.
-      Verified 2026-10-28: bench-decode-ops "prefill attn dev" 8/8 and
-      "rope prefill scratch" (grow/cache-hit/cache-miss/shrink) 4/4 all
+      (c) Prefill norms/residuals/SiLU left the allocating paths for
+      dedicated prefill scratch pools: forward_device_fused_scratch for both
+      RMSNorms (sum_t/scale_t gained missing size checks -- a stale smaller
+      buffer would silently norm only the first rows), add_device_scratch
+      for both residual adds (gained the same size check; add_device
+      removed), silu_mul_device_scratch for the FFN. Eliminates ~288
+      blocking api::zeros.sync_on allocs per 32-layer chunk (3 per norm x2,
+      1 per add x2, 1 per SiLU); 1305 -> 1365 tok/s, logits fingerprint
+      still bitwise-identical.
+      Verified 2026-10-28: bench-decode-ops "prefill attn dev" 8/8, "rope
+      prefill scratch" 4/4 and "rmsnorm prefill scratch" (grow/reuse/
+      shrink/odd-seq) 4/4 all
       bitwise-exact vs their references; bench-real-model NaN-free, det=OK,
       A/B vs host-dequant rel 0.1015 (the documented MXFP4 band); decode
       unchanged at 139-140 tok/s. Remaining levers: gemm dispatch host
@@ -726,14 +738,15 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       bench-quality now shows 100% argmax agreement vs the CPU reference,
       64/64 identical tokens free-running. 2026-10-28 fused-silu raw-format
       port: 134 -> 140 tok/s)
-- Llama-3.1-8B Q4K prefill: **1305 tok/s pp128**, TTFT P50 98 ms
-      (5.6x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
+- Llama-3.1-8B Q4K prefill: **1365 tok/s pp128**, TTFT P50 94 ms
+      (5.4x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1015 -- the documented MXFP4 band.
       2026-10-28 on-device attention (408 -> 815) + scratch RoPE with a
-      cos/sin cache (815 -> 1305); the RoPE change is bitwise-transparent
-      (identical logits fingerprint). Kernel-level verification
-      bitwise-exact vs the CPU causal reference, see open work's prefill
-      item. Decode unchanged at 139-140 tok/s)
+      cos/sin cache (815 -> 1305) + pooled prefill norms/adds/SiLU
+      (1305 -> 1365); every step bitwise-transparent (identical logits
+      fingerprint). Kernel-level verification bitwise-exact vs the CPU
+      causal reference, see open work's prefill item. Decode unchanged at
+      139-140 tok/s)
 - Llama-3.1-8B Q4K batch decode (2026-10-27, post-store-mapping-fix, NO
       bisect switches; verified = NaN scan every step + final-step
       fingerprints + fresh-cache replay bitwise identical; every M>=2
