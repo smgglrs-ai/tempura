@@ -5707,18 +5707,29 @@ impl CutileGpuModel {
                 )
                 .expect("CutileGpuModel: final RMSNorm failed")
         } else {
-            // Prefill: download, extract the last token's hidden state, re-upload.
-            let hidden_final = self.download_device_tensor(&hidden_dev);
-            let last_flat = Arc::new(
-                api::copy_host_vec_to_device(&Arc::new(
-                    hidden_final[(seq_len - 1) * self.h_pad..seq_len * self.h_pad].to_vec(),
-                ))
-                .sync_on(self.matmul.stream())
-                .expect("CutileGpuModel: last-token upload failed"),
+            // Prefill: D->D copy of just the last token's hidden row.  The
+            // old path downloaded the whole [seq, h_pad] hidden state
+            // (blocking full-stream sync + PCIe round trip) to extract one
+            // row on the CPU and re-upload it.
+            let stream = self.matmul.stream();
+            let last_flat: Arc<Tensor<f32>> = Arc::new(
+                api::zeros::<f32>(&[self.h_pad])
+                    .sync_on(stream)
+                    .expect("CutileGpuModel: last-row buffer alloc failed"),
             );
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(
+                    last_flat.device_pointer().cu_deviceptr(),
+                    hidden_dev.device_pointer().cu_deviceptr()
+                        + (((seq_len - 1) * self.h_pad) as u64 * 4),
+                    self.h_pad,
+                    stream,
+                )
+                .expect("CutileGpuModel: last-row D->D copy failed");
+            }
             self.cutile_rmsnorm
                 .forward_device_fused(
-                    self.matmul.stream(),
+                    stream,
                     last_flat,
                     final_norm_w_dev,
                     1,
