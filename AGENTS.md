@@ -419,11 +419,15 @@ typical-p/repeat/presence/frequency)
       the double-buffer swap on sm_120 (bar.sync after wait_group is the
       canonical pattern but insufficient here); needs a memory-model
       audit or an mbarrier-based rewrite.
-- [ ] Close the 1.56× single-sequence GPU decode gap vs llama.cpp
-      (134 vs 209 tok/s, post-fix, verified). Known levers: port the
-      sm120 fused gate+up+SiLU kernel to native 36-u32 format (currently
-      bypassed by the format gate), GEMV still ~40% DRAM (dmon: sm
-      99-100%, mem 36-46%), host-side per-token overhead
+- [ ] Close the 1.49x single-sequence GPU decode gap vs llama.cpp
+      (140 vs 209 tok/s, 2026-10-28 post fused-silu port, verified).
+      The sm120 fused gate+up+SiLU kernel was ported to the native
+      36-u32 raw GGUF format (2026-10-28; scale extraction mirrors
+      q4k_gemv_v4_ptx, d/dmin via cvt.f32.f16) and re-enabled -- 134
+      -> 140 tok/s, ITL 7.49 -> 7.15 ms, bench-quality 100% agreement
+      held, bench-decode-ops fused-silu real-weights test rel 0.0007.
+      Remaining levers: GEMV still ~40% DRAM (dmon: sm 99-100%, mem
+      36-46%), host-side per-token overhead
 - [ ] Prefill on GPU: 408 tok/s pp128, TTFT P50 314 ms (2026-10-27 fast
       path, verified) vs llama.cpp 7335 (18x gap). Remaining levers:
       attention is host-staged (per layer: Q D->H download, K/V read from the
@@ -652,13 +656,14 @@ cargo run --manifest-path tools/bench-gpu/Cargo.toml --release \
 ```
 
 Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
-- Llama-3.1-8B Q4K single-sequence: **134 tok/s decode**, ITL 7.44 ms
-      (1.56x gap vs llama.cpp 209 tok/s; outputs verified NaN-free +
+- Llama-3.1-8B Q4K single-sequence: **140 tok/s decode**, ITL 7.15 ms
+      (1.49x gap vs llama.cpp 209 tok/s; outputs verified NaN-free +
       deterministic, 2026-10-27 post-fix. A 2026-10-28 retraction (outputs
       numerically wrong vs CPU/llama.cpp) was resolved the same day: the
       sm_120 PTX shuffle-encoding bug -- see open work's fixed item.
       bench-quality now shows 100% argmax agreement vs the CPU reference,
-      64/64 identical tokens free-running, 134 tok/s unchanged)
+      64/64 identical tokens free-running. 2026-10-28 fused-silu raw-format
+      port: 134 -> 140 tok/s)
 - Llama-3.1-8B Q4K prefill: **408 tok/s pp128**, TTFT P50 314 ms
       (18x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.10. Re-verified 2026-10-28 with the
