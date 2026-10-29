@@ -499,7 +499,9 @@ typical-p/repeat/presence/frequency)
       NOTE: this GGUF (bartowski Llama-3.1-8B Q4_K_M) has a mixed layout
       -- 16 layers with Q6K v+down_proj, 16 with Q4K -- verified from the
       GGUF tensor-type census (193 Q4K + 33 Q6K) and the trace.
-- [ ] Prefill on GPU: 7257 tok/s pp128, TTFT P50 17.6 ms (2026-10-28/29, nsys-
+- [x] **Prefill on GPU: 7304 tok/s pp128, TTFT P50 17.5 ms -- llama.cpp
+      PARITY (ref 7335, 1.004x; 2026-10-29).** Lever-by-lever history
+      below (nsys-
       driven: on-device attention + scratch RoPE + pooled norms/adds/SiLU +
       Q6K down_proj via MXFP4 + flash BR=16 + lm_head BK=512/last-row d2d)
       vs llama.cpp 7335 (1.01x gap -- parity; 17.8x the 408 tok/s host-staged
@@ -628,6 +630,18 @@ typical-p/repeat/presence/frequency)
       elementwise -> bitwise-identical for any tile size; the q8_snap
       kernel keeps B=32 -- one Q8 block). 6865 -> 7257 tok/s, TTFT
       18.6 -> 17.6 ms (1.01x gap).
+      (k) GEMM-epilogue fusion experiment (2026-10-29): rb4m32_silu (UP
+      projection: C = silu(gate) * up, gate read in the store epilogue)
+      and rb2m32_add (DOWN: C = acc + residual) -- both validated (tool
+      test 4: silu within 1e-3 of the f64 reference, add exact) but
+      MEASURED AS A REGRESSION in-pipeline: prefill 7257 -> 6994 tok/s.
+      The epilogue reads gate/res at the m16n8 accumulator's scattered
+      store addresses (~32B transactions) -- that costs more than the
+      eliminated silu_mul/vector_add kernels. Dispatch is default-OFF
+      (TEMPURA_FUSED_EPILOGUE=1 opts in); the kernels + validation stay
+      in tools/mxf4-gemv for a future attempt that stages the epilogue
+      read through coalesced smem. Post-revert: 7304 tok/s, TTFT
+      17.5 ms, 1.004x gap -- prefill parity.
       Verified 2026-10-28: bench-decode-ops "prefill attn dev" 8/8, "rope
       prefill scratch" 4/4 and "rmsnorm prefill scratch" (grow/reuse/
       shrink/odd-seq) 4/4 all
@@ -893,8 +907,8 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       instantiation removed the 122-139us serialized launch cost:
       **210 tok/s -- llama.cpp parity reached (ref 209)**, ITL 4.77 ms,
       teacher-forced PASS 89.1%)
-- Llama-3.1-8B Q4K prefill: **7257 tok/s pp128**, TTFT P50 17.6 ms
-      (1.01x gap vs llama.cpp 7335 -- parity; logits det=OK, NaN-free; A/B numerics vs
+- Llama-3.1-8B Q4K prefill: **7304 tok/s pp128**, TTFT P50 17.5 ms
+      (1.004x gap vs llama.cpp 7335 -- parity; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1331 -- the MXFP4 band including the
       Q6K->MXFP4 down_proj double-quantization (lossier than the Q4K path's
       0.1015; bench-quality teacher-forced PASS 89.1%, all mismatches

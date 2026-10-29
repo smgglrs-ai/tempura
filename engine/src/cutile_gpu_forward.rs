@@ -247,6 +247,17 @@ const SLOT_K: usize = 1;
 const SLOT_V: usize = 2;
 const SLOT_O: usize = 3;
 const SLOT_GATE: usize = 4;
+
+/// Fused-epilogue flavor for the MXFP4 prefill GEMM (see
+/// `gemm_mxfp4_prefill_ep`).
+enum PrefillEpilogue<'a> {
+    None,
+    /// UP projection: C = silu(gate) * up.
+    Silu(&'a Arc<Tensor<f32>>),
+    /// DOWN projection: C = acc + residual.
+    AddRes(&'a Arc<Tensor<f32>>),
+}
+
 const SLOT_UP: usize = 5;
 const SLOT_DOWN: usize = 6;
 const SLOT_LOGITS: usize = 7;
@@ -3959,6 +3970,25 @@ impl CutileGpuModel {
         m: usize,
         slot: usize,
     ) -> Option<Arc<Tensor<f32>>> {
+        self.gemm_mxfp4_prefill_ep(a, weight_name, m, slot, PrefillEpilogue::None)
+    }
+
+    /// Fused-epilogue flavors of the MXFP4 prefill GEMM:
+    /// - `Silu`: the UP projection, C = silu(gate) * up (gate = the gate
+    ///   projection's output; eliminates the separate silu_mul kernel).
+    /// - `AddRes`: the DOWN projection, C = acc + residual (eliminates the
+    ///   separate vector_add; requires h_pad == n and m == m_pad so the
+    ///   residual's rows and strides match).
+    /// Returns None when the fused variant is not eligible -- the caller
+    /// falls back to the plain path.
+    fn gemm_mxfp4_prefill_ep(
+        &self,
+        a: &Arc<Tensor<f32>>,
+        weight_name: &str,
+        m: usize,
+        slot: usize,
+        ep: PrefillEpilogue<'_>,
+    ) -> Option<Arc<Tensor<f32>>> {
         let mxfp4 = self.mxfp4_gemm.as_ref()?;
         let dw = self.device_weights_mxfp4_tiled.get(weight_name)?;
         let k = dw.k;
@@ -3967,6 +3997,39 @@ impl CutileGpuModel {
         }
         let n = dw.n;
         let m_pad = m.div_ceil(16) * 16;
+        // Fused-epilogue eligibility: check BEFORE quantizing so the caller
+        // can fall back wholesale (plain GEMM + separate silu/add kernels).
+        match &ep {
+            PrefillEpilogue::None => {}
+            PrefillEpilogue::Silu(gate) => {
+                // MEASURED REGRESSION (2026-10-29, bench-real-model: prefill
+                // 7257 -> 6994 tok/s): the epilogue reads gate/res at the
+                // m16n8 accumulator's scattered store addresses (~32B
+                // transactions), which costs more than the eliminated
+                // silu_mul / vector_add kernels. Default OFF; opt in with
+                // TEMPURA_FUSED_EPILOGUE=1 to re-experiment (e.g. after
+                // staging the epilogue read through smem coalesced).
+                if !std::env::var("TEMPURA_FUSED_EPILOGUE").map(|v| v == "1").unwrap_or(false) {
+                    return None;
+                }
+                if !mxfp4.silu_eligible(m_pad as u32, n as u32)
+                    || gate.size() != m_pad * n
+                {
+                    return None;
+                }
+            }
+            PrefillEpilogue::AddRes(res) => {
+                if !std::env::var("TEMPURA_FUSED_EPILOGUE").map(|v| v == "1").unwrap_or(false) {
+                    return None;
+                }
+                if !mxfp4.add_eligible(m_pad as u32, n as u32)
+                    || m_pad != m
+                    || res.size() != m * n
+                {
+                    return None;
+                }
+            }
+        }
         let stream = self.matmul.stream();
         let cu_stream = stream.cu_stream();
 
@@ -4041,18 +4104,54 @@ impl CutileGpuModel {
         // silent corruption at small grids, illegal access at large ones.
         // Fixed and validated against a random-data CPU reference at every
         // shape up to (128, 4096, 4096) in tools/mxf4-gemv.)
-        mxfp4
-            .forward(
-                &packed,
-                &scales,
-                &dw.packed,
-                &dw.tiled_scales,
-                &out,
-                m_pad as u32,
-                n as u32,
-                (k / 64) as u32,
-            )
-            .unwrap_or_else(|e| panic!("mxfp4 prefill gemm {weight_name}: {e}"));
+        match &ep {
+            PrefillEpilogue::None => {
+                mxfp4
+                    .forward(
+                        &packed,
+                        &scales,
+                        &dw.packed,
+                        &dw.tiled_scales,
+                        &out,
+                        m_pad as u32,
+                        n as u32,
+                        (k / 64) as u32,
+                    )
+                    .unwrap_or_else(|e| panic!("mxfp4 prefill gemm {weight_name}: {e}"));
+            }
+            PrefillEpilogue::Silu(gate) => {
+                mxfp4
+                    .forward_silu(
+                        &packed,
+                        &scales,
+                        &dw.packed,
+                        &dw.tiled_scales,
+                        gate,
+                        &out,
+                        m_pad as u32,
+                        n as u32,
+                        (k / 64) as u32,
+                    )
+                    .expect("mxfp4 prefill gemm+silu eligibility checked above")
+                    .unwrap_or_else(|e| panic!("mxfp4 prefill gemm+silu {weight_name}: {e}"));
+            }
+            PrefillEpilogue::AddRes(res) => {
+                mxfp4
+                    .forward_add(
+                        &packed,
+                        &scales,
+                        &dw.packed,
+                        &dw.tiled_scales,
+                        res,
+                        &out,
+                        m_pad as u32,
+                        n as u32,
+                        (k / 64) as u32,
+                    )
+                    .expect("mxfp4 prefill gemm+add eligibility checked above")
+                    .unwrap_or_else(|e| panic!("mxfp4 prefill gemm+add {weight_name}: {e}"));
+            }
+        }
         if self.debug_nan_trace {
             let ob: Vec<f32> = Arc::clone(&out).to_host_vec().sync_on(stream).expect("dbg out");
             let osum: u64 = ob[..(m_pad * n).min(ob.len())].iter().map(|v| v.to_bits() as u64).sum();
@@ -5671,44 +5770,60 @@ impl CutileGpuModel {
             // -- 2i. FFN gate + up -- device-to-device -------------------------
             // For Q2_0 models gemm_any_d2d_slot dispatches on-GPU dequant (synchronous).
             // For f32 models the synchronous gemm_d2d_slot path is used.
+            // Prefill (m>1): the UP projection first tries the fused
+            // gemm+SiLU-epilogue variant (reads the gate projection's output
+            // in the store epilogue -- eliminates the separate silu_mul
+            // kernel's re-read of the up matrix); falls back wholesale.
             let gate_dev = self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE);
-            let up_dev = self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
-            if self.debug_nan_trace {
-                self.nan_report(&format!("L{layer} post-attn-hidden"), &hidden_dev);
-                self.nan_report(&format!("L{layer} post-attn-norm"), &normed2_dev);
-                self.nan_report(&format!("L{layer} gate-dev"), &gate_dev);
-                self.nan_report(&format!("L{layer} up-dev"), &up_dev);
-            }
-
-            // -- 2j. SiLU gate x up (GPU) -------------------------------------
-            // gate_dev and up_dev already reside on the GPU.  Use the scratch
-            // variant to eliminate the per-call api::zeros.sync_on allocation --
-            // saves 28 blocking allocs per decode token across all layers.
-            let gate_silu_n_dev = if seq_len == 1 {
-                let silu_stream = self.matmul.stream();
-                self.cutile_elementwise
+            let (gate_silu_n_dev, up_dev_dbg) = if seq_len > 1 {
+                match self.gemm_mxfp4_prefill_ep(
+                    &normed2_dev,
+                    up_w_name,
+                    seq_len,
+                    SLOT_UP,
+                    PrefillEpilogue::Silu(&gate_dev),
+                ) {
+                    Some(act) => (act, None),
+                    None => {
+                        let up_dev =
+                            self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
+                        let act = self
+                            .cutile_elementwise
+                            .silu_mul_device_scratch(
+                                &gate_dev,
+                                &up_dev,
+                                seq_len,
+                                inter,
+                                &mut self.prefill_silu_scratch.borrow_mut(),
+                                &self.matmul.stream(),
+                            )
+                            .expect("CutileGpuModel: GPU SiLU-mul failed");
+                        (act, Some(up_dev))
+                    }
+                }
+            } else {
+                let up_dev = self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
+                let act = self
+                    .cutile_elementwise
                     .silu_mul_device_scratch(
                         &gate_dev,
                         &up_dev,
                         seq_len,
                         inter,
                         &mut self.silu_out_scratch.borrow_mut(),
-                        &silu_stream,
+                        &self.matmul.stream(),
                     )
-                    .expect("CutileGpuModel: GPU SiLU-mul failed")
-            } else {
-                let silu_stream = self.matmul.stream();
-                self.cutile_elementwise
-                    .silu_mul_device_scratch(
-                        &gate_dev,
-                        &up_dev,
-                        seq_len,
-                        inter,
-                        &mut self.prefill_silu_scratch.borrow_mut(),
-                        &silu_stream,
-                    )
-                    .expect("CutileGpuModel: GPU SiLU-mul failed")
+                    .expect("CutileGpuModel: GPU SiLU-mul failed");
+                (act, Some(up_dev))
             };
+            if self.debug_nan_trace {
+                self.nan_report(&format!("L{layer} post-attn-hidden"), &hidden_dev);
+                self.nan_report(&format!("L{layer} post-attn-norm"), &normed2_dev);
+                self.nan_report(&format!("L{layer} gate-dev"), &gate_dev);
+                if let Some(up_dev) = &up_dev_dbg {
+                    self.nan_report(&format!("L{layer} up-dev"), up_dev);
+                }
+            }
 
             // -- 2k. FFN down -- device-to-device ------------------------------
             // Pad gate_silu from inter to inter_pad for the down_proj GEMM.
@@ -5748,33 +5863,55 @@ impl CutileGpuModel {
             } else {
                 gate_silu_n_dev
             };
-            let down_dev = self.gemm_any_d2d_slot(&gate_silu_dev, down_w_name, seq_len, SLOT_DOWN);
-            if self.debug_nan_trace {
-                self.nan_report(&format!("L{layer} gate-silu"), &gate_silu_dev);
-                self.nan_report(&format!("L{layer} down-proj"), &down_dev);
-            }
-
-            // -- 2l. Residual add (GPU) ----------------------------------------
-            let down_padded = if self.h_pad == h {
-                down_dev.clone()
+            let down_fused = if seq_len > 1 && self.h_pad == h {
+                self.gemm_mxfp4_prefill_ep(
+                    &gate_silu_dev,
+                    down_w_name,
+                    seq_len,
+                    SLOT_DOWN,
+                    PrefillEpilogue::AddRes(&hidden_dev),
+                )
             } else {
-                let down_host = self.download_device_tensor(&down_dev);
-                self.to_device_flat_padded(&down_host, seq_len, h, self.h_pad)
+                None
             };
-            hidden_dev = if seq_len == 1 {
-                self.add_device_scratch(
-                    &hidden_dev,
-                    &down_padded,
-                    seq_len * self.h_pad,
-                    &mut self.ffn_add_scratch.borrow_mut(),
-                )
-            } else {
-                self.add_device_scratch(
-                    &hidden_dev,
-                    &down_padded,
-                    seq_len * self.h_pad,
-                    &mut self.prefill_ffn_add_scratch.borrow_mut(),
-                )
+            hidden_dev = match down_fused {
+                // The new hidden is produced directly in the SLOT_DOWN buffer
+                // (residual added in the store epilogue). In-place safe: each
+                // epilogue thread reads res[row, col] before writing
+                // c[row, col] at the same address -- relevant because hidden
+                // may BE the previous layer's SLOT_DOWN buffer.
+                Some(new_hidden) => new_hidden,
+                None => {
+                    let down_dev =
+                        self.gemm_any_d2d_slot(&gate_silu_dev, down_w_name, seq_len, SLOT_DOWN);
+                    if self.debug_nan_trace {
+                        self.nan_report(&format!("L{layer} gate-silu"), &gate_silu_dev);
+                        self.nan_report(&format!("L{layer} down-proj"), &down_dev);
+                    }
+
+                    // -- 2l. Residual add (GPU) ------------------------------------
+                    let down_padded = if self.h_pad == h {
+                        down_dev.clone()
+                    } else {
+                        let down_host = self.download_device_tensor(&down_dev);
+                        self.to_device_flat_padded(&down_host, seq_len, h, self.h_pad)
+                    };
+                    if seq_len == 1 {
+                        self.add_device_scratch(
+                            &hidden_dev,
+                            &down_padded,
+                            seq_len * self.h_pad,
+                            &mut self.ffn_add_scratch.borrow_mut(),
+                        )
+                    } else {
+                        self.add_device_scratch(
+                            &hidden_dev,
+                            &down_padded,
+                            seq_len * self.h_pad,
+                            &mut self.prefill_ffn_add_scratch.borrow_mut(),
+                        )
+                    }
+                }
             };
             if self.debug_nan_trace {
                 self.nan_report(&format!("L{layer} post-ffn-hidden"), &hidden_dev);
