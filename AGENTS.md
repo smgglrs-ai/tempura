@@ -499,7 +499,7 @@ typical-p/repeat/presence/frequency)
       NOTE: this GGUF (bartowski Llama-3.1-8B Q4_K_M) has a mixed layout
       -- 16 layers with Q6K v+down_proj, 16 with Q4K -- verified from the
       GGUF tensor-type census (193 Q4K + 33 Q6K) and the trace.
-- [ ] Prefill on GPU: 6865 tok/s pp128, TTFT P50 18.6 ms (2026-10-28/29, nsys-
+- [ ] Prefill on GPU: 7257 tok/s pp128, TTFT P50 17.6 ms (2026-10-28/29, nsys-
       driven: on-device attention + scratch RoPE + pooled norms/adds/SiLU +
       Q6K down_proj via MXFP4 + flash BR=16 + lm_head BK=512/last-row d2d)
       vs llama.cpp 7335 (1.17x gap; 15.3x the 408 tok/s host-staged
@@ -621,6 +621,13 @@ typical-p/repeat/presence/frequency)
       (1.07x gap). Remaining GEMM structure: ~12ms of the 18.6ms;
       non-GEMM overhead ~5ms (flash 1.5, silu 0.9, adds/rope/gather/
       scatter/rmsnorm/quant ~2.0, host ~0.6).
+      (j) Elementwise tile width (2026-10-29): the residual adds and the
+      SiLU-mul ran on 32-element cutile tiles -- 384B moved per program
+      (2x128B reads + 128B store), 16K tiny blocks per [128,4096] add at
+      ~690 GB/s = half of DRAM peak (nsys). B 32 -> 256 (1KB tiles;
+      elementwise -> bitwise-identical for any tile size; the q8_snap
+      kernel keeps B=32 -- one Q8 block). 6865 -> 7257 tok/s, TTFT
+      18.6 -> 17.6 ms (1.01x gap).
       Verified 2026-10-28: bench-decode-ops "prefill attn dev" 8/8, "rope
       prefill scratch" 4/4 and "rmsnorm prefill scratch" (grow/reuse/
       shrink/odd-seq) 4/4 all
@@ -886,8 +893,8 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       instantiation removed the 122-139us serialized launch cost:
       **210 tok/s -- llama.cpp parity reached (ref 209)**, ITL 4.77 ms,
       teacher-forced PASS 89.1%)
-- Llama-3.1-8B Q4K prefill: **6865 tok/s pp128**, TTFT P50 18.6 ms
-      (1.07x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
+- Llama-3.1-8B Q4K prefill: **7257 tok/s pp128**, TTFT P50 17.6 ms
+      (1.01x gap vs llama.cpp 7335 -- parity; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1331 -- the MXFP4 band including the
       Q6K->MXFP4 down_proj double-quantization (lossier than the Q4K path's
       0.1015; bench-quality teacher-forced PASS 89.1%, all mismatches
