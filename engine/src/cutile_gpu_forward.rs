@@ -69,6 +69,44 @@ struct DecodeGraph {
     captured_v_ptrs: Vec<u64>,
 }
 
+/// CUDA graph for the prefill chunk's layer loop (m > 1). Captured on the
+/// SECOND call with the same (seq_len, positions) key; replayed on the
+/// third and subsequent calls. Eliminates ~800 individual cuLaunchKernel
+/// submissions (measured ~0.6ms of host dispatch per chunk, nsys
+/// 2026-10-29).
+struct PrefillGraph {
+    cu_exec: cuda_core::sys::CUgraphExec,
+    cu_graph: cuda_core::sys::CUgraph,
+    device: Arc<cuda_core::Device>,
+    /// Graph key: chunk size + rope positions (determines cos/sin and KV
+    /// write offsets). A mismatch requires re-capture.
+    seq_len: usize,
+    positions: Vec<u32>,
+    /// KV-cache device pointers (stale pointers require re-capture).
+    captured_k_ptrs: Vec<u64>,
+    captured_v_ptrs: Vec<u64>,
+    /// The final hidden-state device tensor after the layer loop -- on
+    /// replay, the graph writes to this same address; the final norm +
+    /// lm_head read from it outside the graph.
+    hidden_out: Arc<Tensor<f32>>,
+}
+
+impl Drop for PrefillGraph {
+    fn drop(&mut self) {
+        let _ = self.device.bind_to_thread();
+        if !self.cu_exec.is_null() {
+            let _ = unsafe { cuda_core::sys::cuGraphExecDestroy(self.cu_exec) };
+        }
+        if !self.cu_graph.is_null() {
+            let _ = unsafe { cuda_core::sys::cuGraphDestroy(self.cu_graph) };
+        }
+    }
+}
+
+// SAFETY: the exec handle is only ever used from a single inference thread.
+unsafe impl Send for PrefillGraph {}
+unsafe impl Sync for PrefillGraph {}
+
 impl Drop for DecodeGraph {
     fn drop(&mut self) {
         let _ = self.device.bind_to_thread();
@@ -485,6 +523,17 @@ pub struct CutileGpuModel {
     /// allowing per-step parameters (pos, kv_len, KV cache write offset) to vary
     /// while the graph topology stays fixed.
     cached_decode_graph: RefCell<Option<DecodeGraph>>,
+    /// CUDA graph for the prefill chunk's layer loop (captured on 2nd call
+    /// with the same key, replayed on 3rd+). None when not yet captured.
+    cached_prefill_graph: RefCell<Option<PrefillGraph>>,
+    /// The key of the LAST prefill forward -- used to detect the 2nd call
+    /// (the first call runs eagerly to allocate all buffers; the second
+    /// captures).
+    prefill_last_key: RefCell<Option<(usize, Vec<u32>)>>,
+    /// Pre-allocated last-row buffer for the prefill final norm (the old
+    /// path allocated it per call with api::zeros.sync_on -- illegal during
+    /// graph capture). Stable address; the D->D row copy writes into it.
+    prefill_last_row: RefCell<Option<Arc<Tensor<f32>>>>,
 
     // -- Multi-stream QKV concurrency ------------------------------------------
     //
@@ -2024,6 +2073,9 @@ impl CutileGpuModel {
             kv_scatter_write,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
+            cached_prefill_graph: RefCell::new(None),
+            prefill_last_key: RefCell::new(None),
+            prefill_last_row: RefCell::new(None),
             greedy_argmax,
             greedy_out,
             stream_kv,
@@ -2357,6 +2409,9 @@ impl CutileGpuModel {
             kv_scatter_write,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
+            cached_prefill_graph: RefCell::new(None),
+            prefill_last_key: RefCell::new(None),
+            prefill_last_row: RefCell::new(None),
             greedy_argmax,
             greedy_out,
             stream_kv,
@@ -5537,6 +5592,65 @@ impl CutileGpuModel {
         // across all layers; no per-layer re-upload is needed.
         let mut hidden_dev = self.to_device_flat_padded(&hidden, seq_len, h, self.h_pad);
 
+        // -- Prefill CUDA graph dispatch ----------------------------------------
+        // The layer loop (~800 kernel launches for 32 layers, ~0.6ms of host
+        // dispatch per chunk) is captured into a CUDA graph on the SECOND call
+        // with the same (seq_len, positions) key and replayed on subsequent
+        // calls. The first call runs eagerly (all scratch buffers get
+        // allocated/grown). TEMPURA_NO_PREFILL_GRAPH=1 bisects to eager.
+        // The final norm + lm_head stay OUTSIDE the graph (their download
+        // is not capture-safe).
+        let prefill_graph_eligible = seq_len > 1
+            && seq_len % 16 == 0 // m_pad == m: no trim alloc during capture
+            && !cfg.use_alibi
+            && !self.debug_nan_trace
+            && prefill_device_attn
+            && gpu_kv_cache.has_device_kv()
+            && std::env::var("TEMPURA_NO_PREFILL_GRAPH").as_deref() != Ok("1");
+
+        let mut skip_layer_loop = false;
+        let mut prefill_capturing = false;
+
+        if prefill_graph_eligible {
+            let stream = self.matmul.stream();
+            let cu_stream = stream.cu_stream();
+            let key = (seq_len, positions.clone());
+            let mut graph_cache = self.cached_prefill_graph.borrow_mut();
+
+            // REPLAY: graph exists and key matches -> launch, skip the loop.
+            let replay = graph_cache.as_ref().is_some_and(|pg| {
+                pg.seq_len == key.0 && pg.positions == key.1
+            });
+            if replay {
+                let pg = graph_cache.as_ref().unwrap();
+                unsafe {
+                    cuda_core::sys::cuGraphLaunch(pg.cu_exec, cu_stream);
+                }
+                drop(graph_cache);
+                unsafe { stream.synchronize().expect("prefill graph launch sync failed"); }
+                hidden_dev = self.cached_prefill_graph.borrow()
+                    .as_ref().unwrap().hidden_out.clone();
+                skip_layer_loop = true;
+            } else {
+                drop(graph_cache);
+                // CAPTURE on the 2nd call with the same key (the 1st ran
+                // eagerly and allocated all scratch buffers).
+                let should_capture = {
+                    let last = self.prefill_last_key.borrow();
+                    last.as_ref().is_some_and(|k| k == &key)
+                };
+                *self.prefill_last_key.borrow_mut() = Some(key);
+                if should_capture {
+                    let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
+                    unsafe { stream.begin_capture(relaxed).expect("prefill graph begin_capture failed"); }
+                    prefill_capturing = true;
+                }
+            }
+        } else {
+            *self.prefill_last_key.borrow_mut() = None;
+        }
+
+        if !skip_layer_loop {
         for layer in 0..cfg.num_layers {
             let (
                 ref input_ln_name,
@@ -6023,6 +6137,47 @@ impl CutileGpuModel {
                 self.nan_report(&format!("L{layer} post-ffn-hidden"), &hidden_dev);
             }
         }
+        } // !skip_layer_loop
+
+        // -- Prefill graph capture end + launch ---------------------------------
+        if prefill_capturing {
+            let stream = self.matmul.stream();
+            let cu_stream = stream.cu_stream();
+            let cu_graph = unsafe { stream.end_capture().expect("prefill graph end_capture failed") };
+            let mut cu_exec_uninit = MaybeUninit::<cuda_core::sys::CUgraphExec>::uninit();
+            unsafe {
+                cuda_core::sys::cuGraphInstantiateWithFlags(
+                    cu_exec_uninit.as_mut_ptr(), cu_graph, 0,
+                );
+            }
+            let cu_exec = unsafe { cu_exec_uninit.assume_init() };
+            // Pre-stage on the device (same recipe as the decode graph).
+            let rc_up = unsafe { cuda_core::sys::cuGraphUpload(cu_exec, cu_stream) };
+            if rc_up != 0 {
+                eprintln!("[prefill_graph] cuGraphUpload rc={rc_up} (continuing)");
+            }
+            // Store the graph + the final hidden-state pointer.
+            let captured_k_ptrs: Vec<u64> = (0..cfg.num_layers)
+                .map(|l| gpu_kv_cache.kv_device_tensors(l).0.device_pointer().cu_deviceptr())
+                .collect();
+            let captured_v_ptrs: Vec<u64> = (0..cfg.num_layers)
+                .map(|l| gpu_kv_cache.kv_device_tensors(l).1.device_pointer().cu_deviceptr())
+                .collect();
+            *self.cached_prefill_graph.borrow_mut() = Some(PrefillGraph {
+                cu_exec,
+                cu_graph,
+                device: stream.device().clone(),
+                seq_len,
+                positions: positions.clone(),
+                captured_k_ptrs,
+                captured_v_ptrs,
+                hidden_out: hidden_dev.clone(),
+            });
+            // Launch the graph (capture recorded but did not execute).
+            unsafe { cuda_core::sys::cuGraphLaunch(cu_exec, cu_stream); }
+            unsafe { stream.synchronize().expect("prefill graph first launch sync failed"); }
+            eprintln!("[prefill_graph] captured {seq_len}-token chunk ({} nodes approx)", cfg.num_layers * 25);
+        }
 
         // -- 3. Final norm + lm_head --------------------------------------------
         // For decode (seq_len=1) hidden_dev IS the last token -- pass it directly
@@ -6048,13 +6203,37 @@ impl CutileGpuModel {
             // Prefill: D->D copy of just the last token's hidden row.  The
             // old path downloaded the whole [seq, h_pad] hidden state
             // (blocking full-stream sync + PCIe round trip) to extract one
-            // row on the CPU and re-upload it.
+            // row on the CPU and re-upload it.  The buffer is pre-allocated
+            // (stable address, reused across calls -- the old per-call
+            // api::zeros.sync_on is illegal during CUDA graph capture).
             let stream = self.matmul.stream();
-            let last_flat: Arc<Tensor<f32>> = Arc::new(
-                api::zeros::<f32>(&[self.h_pad])
-                    .sync_on(stream)
-                    .expect("CutileGpuModel: last-row buffer alloc failed"),
-            );
+            let last_flat: Arc<Tensor<f32>> = {
+                let mut lr = self.prefill_last_row.borrow_mut();
+                match lr.take() {
+                    Some(arc) => match Arc::try_unwrap(arc) {
+                        Ok(tensor) => Arc::new(
+                            tensor.reshape(&[self.h_pad])
+                                .expect("last-row reshape failed"),
+                        ),
+                        Err(arc_back) => {
+                            *lr = Some(arc_back);
+                            Arc::new(
+                                api::zeros::<f32>(&[self.h_pad])
+                                    .sync_on(stream)
+                                    .expect("last-row fallback alloc failed"),
+                            )
+                        }
+                    },
+                    None => Arc::new(
+                        api::zeros::<f32>(&[self.h_pad])
+                            .sync_on(stream)
+                            .expect("last-row first alloc failed"),
+                    ),
+                }
+            };
+            // Store a clone back for the next call (the rmsnorm consumes
+            // the original Arc; the clone keeps the device memory alive).
+            *self.prefill_last_row.borrow_mut() = Some(last_flat.clone());
             unsafe {
                 cuda_core::memcpy_dtod_async::<f32>(
                     last_flat.device_pointer().cu_deviceptr(),
