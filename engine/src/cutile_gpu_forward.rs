@@ -3776,8 +3776,16 @@ impl CutileGpuModel {
                     pool[slot].take().and_then(|arc| Arc::try_unwrap(arc).ok())
                 };
                 if let Some(tensor) = maybe_tensor {
+                    // kpar (sm120 dual-block preferred) into the caller's slot
+                    // tensor on THIS stream: the q6k kpar kernels read f32
+                    // activations directly and keep no shared scratch (unlike
+                    // the Q4K kpar's Q8 state), so this is safe on the private
+                    // KV stream and during graph capture. The dp4a baseline
+                    // this replaces ran [1024,4096] at ~280 GB/s.
                     if let Ok(result) = unsafe {
-                        oxide.submit_d2d_into_on(&a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks, cu_stream)
+                        oxide.submit_kpar_d2d_into_on(
+                            &a_flat, &dw.tensor, tensor, dw.n, dw.k_blocks, cu_stream,
+                        )
                     } {
                         self.scratch.borrow_mut()[slot] = Some(result.clone());
                         return result;
