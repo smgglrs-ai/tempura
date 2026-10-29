@@ -317,6 +317,13 @@ pub struct CutileGpuModel {
     /// Oxide decode flash-attention kernel -- accepts kv_len as device pointer,
     /// enabling single-capture CUDA graph without stale kv_len.
     oxide_decode_attn: Option<OxideDecodeAttn>,
+    /// GPU greedy argmax (decode fast path): None on non-sm_120 or load
+    /// failure -- forward_greedy then returns None and callers fall back to
+    /// the full logits download + CPU argmax.
+    greedy_argmax: Option<tempura_kernels::greedy_argmax::GreedyArgmax>,
+    /// 2-element u32 (one packed u64) output buffer for the argmax kernel.
+    /// Stable address; re-zeroed via cuMemsetD32Async before each launch.
+    greedy_out: Option<Arc<Tensor<u32>>>,
     /// Stable-address device scratch for the split-K decode attention
     /// (`OxideDecodeAttn::splitk_scratch_len` f32 elements). Allocated before
     /// any CUDA graph capture so the baked-in pointer stays valid for every
@@ -1763,6 +1770,21 @@ impl CutileGpuModel {
                         .expect("splitk attn scratch: device allocation failed"),
                 )
             });
+        // GPU greedy argmax (decode fast path) + its stable-address packed
+        // output buffer (re-zeroed via cuMemsetD32Async before each launch).
+        let (greedy_argmax, greedy_out) = {
+            let ga = tempura_kernels::greedy_argmax::GreedyArgmax::try_load(
+                matmul.stream().clone(),
+            );
+            let out = ga.as_ref().map(|_| {
+                Arc::new(
+                    api::zeros::<u32>(&[2])
+                        .sync_on(matmul.stream())
+                        .expect("greedy argmax out buffer alloc"),
+                )
+            });
+            (ga, out)
+        };
         let debug_nan_trace = std::env::var("TEMPURA_DEBUG_NAN").is_ok();
         let kv_scatter_write = KvScatterWrite::new()
             .expect("KvScatterWrite: failed to load scatter-write PTX kernel");
@@ -2002,6 +2024,8 @@ impl CutileGpuModel {
             kv_scatter_write,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
+            greedy_argmax,
+            greedy_out,
             stream_kv,
             event_fork,
             event_kv_done,
@@ -2146,6 +2170,21 @@ impl CutileGpuModel {
                         .expect("splitk attn scratch: device allocation failed"),
                 )
             });
+        // GPU greedy argmax (decode fast path) + its stable-address packed
+        // output buffer (re-zeroed via cuMemsetD32Async before each launch).
+        let (greedy_argmax, greedy_out) = {
+            let ga = tempura_kernels::greedy_argmax::GreedyArgmax::try_load(
+                matmul.stream().clone(),
+            );
+            let out = ga.as_ref().map(|_| {
+                Arc::new(
+                    api::zeros::<u32>(&[2])
+                        .sync_on(matmul.stream())
+                        .expect("greedy argmax out buffer alloc"),
+                )
+            });
+            (ga, out)
+        };
         let debug_nan_trace = std::env::var("TEMPURA_DEBUG_NAN").is_ok();
         let kv_scatter_write = KvScatterWrite::new()
             .expect("KvScatterWrite: failed to load scatter-write PTX kernel");
@@ -2318,6 +2357,8 @@ impl CutileGpuModel {
             kv_scatter_write,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
+            greedy_argmax,
+            greedy_out,
             stream_kv,
             event_fork,
             event_kv_done,
@@ -4557,7 +4598,7 @@ impl CutileGpuModel {
         embedding: &[f32],
         positions: &[u32],
         gpu_kv_cache: &mut CutileKvCache,
-    ) -> Vec<f32> {
+    ) -> Arc<Tensor<f32>> {
         let cfg = &self.config;
         let h = cfg.hidden_size;
         let stream = self.matmul.stream();
@@ -4618,7 +4659,7 @@ impl CutileGpuModel {
                 [SLOT_LOGITS]
                 .clone()
                 .expect("SLOT_LOGITS empty after nan-trace step");
-            return self.download_device_tensor(&logits_arc);
+            return logits_arc;
         }
 
         // Validate KV-cache device pointers before replay: a different cache
@@ -4705,11 +4746,10 @@ impl CutileGpuModel {
             drop(graph_cache);
         }
 
-        // Logits reside in SLOT_LOGITS -- download and return.
-        let logits_arc = self
-            .scratch.borrow()[SLOT_LOGITS].clone()
-            .expect("SLOT_LOGITS empty after graph launch");
-        self.download_device_tensor(&logits_arc)
+        // Logits reside in SLOT_LOGITS -- return the DEVICE tensor; the
+        // caller downloads (or runs the GPU greedy argmax on it).
+        self.scratch.borrow()[SLOT_LOGITS].clone()
+            .expect("SLOT_LOGITS empty after graph launch")
     }
 
     /// Refresh the CUDA-graph-stable RoPE cos/sin row buffers for the CURRENT
@@ -5277,6 +5317,70 @@ impl CutileGpuModel {
     ///
     /// The caller is responsible for calling `gpu_kv_cache.advance(token_ids.len())`
     /// and incrementing the session position after this returns.
+    /// Greedy-decode fast path: runs the decode CUDA graph and computes the
+    /// argmax ON DEVICE (one small kernel + a 4-byte download) instead of
+    /// downloading the full logits vector (513KB + CPU argmax, ~90-140us of
+    /// serialized host time per token). Returns None when the fast path is
+    /// unavailable (non-decode call, graph gates failed, argmax kernel not
+    /// loaded, or the first call of a sequence which is prefill-shaped) --
+    /// the caller falls back to forward() + CPU argmax. Tie-breaking
+    /// matches the CPU argmax exactly (Rust max_by: last max wins).
+    pub fn forward_greedy(
+        &self,
+        position: usize,
+        token_ids: &[u32],
+        qweights: &QuantizedWeights,
+        gpu_kv_cache: &mut CutileKvCache,
+    ) -> Option<u32> {
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+        if token_ids.len() != 1
+            || self.greedy_argmax.is_none()
+            || self.greedy_out.is_none()
+            || cfg.use_alibi
+            || !gpu_kv_cache.has_device_kv()
+            || self.oxide_decode_attn.is_none()
+            || position >= self.cutile_rope.table_max_pos()
+            || std::env::var("TEMPURA_FORCE_PREFILL_M1").as_deref() == Ok("1")
+            || position == 0
+        {
+            return None;
+        }
+        // Same prelude as forward(): embedding lookup for the single token.
+        let embed = qweights
+            .get_f32("model.embed_tokens.weight")
+            .expect("model.embed_tokens.weight not found");
+        let tok = token_ids[0] as usize;
+        let mut hidden = embed[tok * h..(tok + 1) * h].to_vec();
+        if cfg.embedding_scale {
+            let scale = (h as f32).sqrt();
+            for v in &mut hidden {
+                *v *= scale;
+            }
+        }
+        let positions = vec![position as u32];
+        let logits_arc = self.forward_decode_with_graph(&hidden, &positions, gpu_kv_cache);
+
+        // GPU argmax: zero the packed u64 output, launch, read the index.
+        let ga = self.greedy_argmax.as_ref().unwrap();
+        let out = self.greedy_out.as_ref().unwrap();
+        let stream = self.matmul.stream();
+        unsafe {
+            cuda_core::sys::cuMemsetD32Async(
+                out.device_pointer().cu_deviceptr(),
+                0,
+                2,
+                stream.cu_stream(),
+            );
+        }
+        ga.launch(&logits_arc, out, cfg.vocab_size).ok()?;
+        let packed = out.to_host_vec().sync_on(stream).ok()?;
+        if packed.len() < 2 {
+            return None;
+        }
+        Some(packed[0])
+    }
+
     pub fn forward(
         &self,
         position: usize,
@@ -5390,7 +5494,9 @@ impl CutileGpuModel {
             {
                 // The host KV mirror may be stale; we only rebuild it when transitioning
                 // to the CPU fallback path, which does not apply here.
-                return self.forward_decode_with_graph(&hidden, &positions, gpu_kv_cache);
+                let logits_arc =
+                    self.forward_decode_with_graph(&hidden, &positions, gpu_kv_cache);
+                return self.download_device_tensor(&logits_arc);
             }
             // Graph-capture correctness gate failed: run the same decode inner
             // WITHOUT a graph.  The cuTile flash-attn gets a fresh host kv_len

@@ -305,6 +305,17 @@ pub trait InferenceModel: Send + Sync {
     fn config(&self) -> &ModelConfig;
     fn has_weights(&self) -> bool;
     fn forward(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Vec<f32>;
+    /// Greedy fast path: decode one token and return its argmax WITHOUT
+    /// materializing the logits on the host (GPU argmax where available).
+    /// Returns None when unavailable -- the caller uses forward() + the CPU
+    /// argmax. Default: always None.
+    fn forward_greedy(
+        &self,
+        _session: &mut InferenceSession,
+        _token_ids: &[u32],
+    ) -> Option<u32> {
+        None
+    }
     fn generate(
         &self,
         session: &mut InferenceSession,
@@ -8511,12 +8522,19 @@ where
                 break;
             }
 
-            let logits = self.forward(session, &[*generated.last().unwrap()]);
-
+            // Greedy decode: prefer the GPU argmax fast path (no logits
+            // download); fall back to forward() + the CPU argmax.
+            let last_tok = *generated.last().unwrap();
             let token = if greedy {
-                argmax(&logits)
+                match self.forward_greedy(session, &[last_tok]) {
+                    Some(token) => token,
+                    None => {
+                        let logits = self.forward(session, &[last_tok]);
+                        argmax(&logits)
+                    }
+                }
             } else {
-                let mut logits = logits;
+                let mut logits = self.forward(session, &[last_tok]);
                 params.apply_penalties(&mut logits, &generated);
                 let mut probs = vec![0.0f32; logits.len()];
                 self.pipeline
@@ -9223,6 +9241,31 @@ impl InferenceModel for CutileInferenceWrapper {
         // Fallback: CPU forward (GPU model or KV cache not ready).
         self.model.forward(session, token_ids)
     }
+    fn forward_greedy(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Option<u32> {
+        if let (Some(gm), Some(qw), Some(kv_mutex)) = (
+            &self.gpu_model,
+            &self.model.quantized_weights,
+            &self.gpu_kv_cache,
+        ) {
+            let mut kv = kv_mutex.lock().expect("GPU KV cache mutex poisoned");
+            let token = gm.forward_greedy(session.position, token_ids, qw, &mut kv);
+            if token.is_some() {
+                // Same bookkeeping as forward(): the fast path appended to
+                // the GPU KV cache (device-side scatter) -- advance the host
+                // mirror counter to match.
+                kv.advance(token_ids.len());
+            }
+            drop(kv);
+            if let Some(token) = token {
+                // Same bookkeeping as forward() -- the fast path ran the
+                // full decode step on the GPU.
+                session.cache.advance(token_ids.len());
+                session.position += token_ids.len();
+                return Some(token);
+            }
+        }
+        None
+    }
     fn generate(
         &self,
         session: &mut InferenceSession,
@@ -9231,8 +9274,83 @@ impl InferenceModel for CutileInferenceWrapper {
         params: &SamplingParams,
         eos_token: Option<u32>,
     ) -> Vec<u32> {
-        self.model
-            .generate(session, token_ids, max_new_tokens, params, eos_token)
+        // GPU-native loop (the old delegation to self.model.generate ran
+        // the CPU forward, which panics on GPU-loaded models whose CPU
+        // projection weights were freed). Greedy steps prefer the GPU
+        // argmax fast path (forward_greedy: no logits download).
+        let greedy = params.temperature == 0.0
+            && params.presence_penalty == 0.0
+            && params.frequency_penalty == 0.0;
+
+        let total_start = Instant::now();
+        let prompt_start = Instant::now();
+        let logits = self.forward(session, token_ids);
+        let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.prompt_tokens = token_ids.len();
+        let gen_start = Instant::now();
+
+        let first_token = if greedy {
+            argmax(&logits)
+        } else {
+            let mut probs = vec![0.0f32; logits.len()];
+            self.model
+                .pipeline
+                .sampler
+                .apply(&logits, &mut probs, params)
+                .unwrap();
+            let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                None
+            } else {
+                Some(&mut session.rng)
+            };
+            self.model.pipeline.sampler.sample_token(&probs, rng_ref)
+        };
+
+        let mut generated = vec![first_token];
+
+        for _step in 1..max_new_tokens {
+            if eos_token == Some(*generated.last().unwrap()) {
+                break;
+            }
+            let last_tok = *generated.last().unwrap();
+            let token = if greedy {
+                match self.forward_greedy(session, &[last_tok]) {
+                    Some(token) => token,
+                    None => argmax(&self.forward(session, &[last_tok])),
+                }
+            } else {
+                let mut logits = self.forward(session, &[last_tok]);
+                params.apply_penalties(&mut logits, &generated);
+                let mut probs = vec![0.0f32; logits.len()];
+                self.model
+                    .pipeline
+                    .sampler
+                    .apply(&logits, &mut probs, params)
+                    .unwrap();
+                let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
+                    None
+                } else {
+                    Some(&mut session.rng)
+                };
+                self.model.pipeline.sampler.sample_token(&probs, rng_ref)
+            };
+            generated.push(token);
+        }
+
+        let generation_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        session.trace.generated_tokens = generated.len();
+        session.trace.timing = Some(TimingInfo {
+            total_ms,
+            prompt_ms,
+            generation_ms,
+            tokens_per_second: if generation_ms > 0.0 {
+                generated.len() as f64 / (generation_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+        generated
     }
     fn generate_with_logprobs(
         &self,
