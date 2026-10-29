@@ -1414,8 +1414,15 @@ where
             // Check typed_tensors FIRST -- routes all formats through ggml::mul_mat_q
             if let Some((dtype, w)) = qweights.get_typed(name) {
                 use tempura_kernels::ggml::GgmlType;
+                // TEMPURA_CPU_SIMD=1: route Q4K/Q6K through the ggml
+                // SIMD registry (AVX2/VNNI/AVX-512 -- the same kernel
+                // family llama.cpp uses) instead of the scalar f32
+                // reference. Bisect switch for the cross-implementation
+                // quality comparison (bench-quality).
+                let use_simd = std::env::var("TEMPURA_CPU_SIMD")
+                    .as_deref() == Ok("1");
                 // Use optimized pre-quantized path for Q4K/Q6K decode
-                if m == 1 {
+                if m == 1 && !use_simd {
                     if let Some(pq) = preq {
                         if dtype == GgmlType::Q4K {
                             q4k.forward_q4k_preq(pq, a_f32, w, out, n).unwrap();
@@ -1429,13 +1436,18 @@ where
                 }
                 // Optimized legacy path for formats with dedicated kernels
                 match dtype {
-                    GgmlType::Q4K => {
+                    GgmlType::Q4K if !use_simd => {
                         q4k.forward_b_transposed_q4k(a_f32, w, out, m, n, k)
                             .unwrap();
                     }
-                    GgmlType::Q6K => {
+                    GgmlType::Q6K if !use_simd => {
                         q4k.forward_b_transposed_q6k(a_f32, w, out, m, n, k)
                             .unwrap();
+                    }
+                    GgmlType::Q4K | GgmlType::Q6K => {
+                        // SIMD path: ggml registry (AVX2/VNNI/AVX-512)
+                        tempura_kernels::ggml::mul_mat::mul_mat_q(
+                            dtype, w, a_f32, out, m, n, k);
                     }
                     GgmlType::TQ2_0 => {
                         q4k.forward_b_transposed_tq2(a_f32, w, out, m, n, k)
