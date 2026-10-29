@@ -72,6 +72,54 @@ pub mod kernels {
         out_second.store(tile_x0 * tile_sin + tile_x1 * tile_cos);
     }
 
+    /// Fused RoPE-on-interleaved kernel: reads the interleaved
+    /// [num_sh * head_dim] tensor, applies the rotation, writes the
+    /// interleaved result -- replacing the deinterleave -> rope ->
+    /// interleave 3-kernel chain (which costs 6 memory round-trips and 3
+    /// kernel launches per Q/K per layer; nsys showed ~15us/layer of
+    /// prefill time on the chain, 2026-10-29).
+    ///
+    /// Launches 2*num_sh programs (same grid as `cutile_interleave`):
+    /// program `2*sh` writes the rotated FIRST half of head `sh`,
+    /// program `2*sh+1` writes the rotated SECOND half. Both programs for
+    /// the same `sh` load both halves (L1/L2 absorbs the duplicate read)
+    /// and compute the full rotation -- the extra FLOPs are negligible
+    /// next to the eliminated round-trips.
+    ///
+    /// cos/sin tables are PRE-BROADCAST to [num_sh * HALF_DIM] (same
+    /// layout the rope_kernel uses): element `sh*HALF_DIM + d` holds the
+    /// rotation for (seq_pos = sh/n_heads, dim = d).
+    ///
+    /// Bitwise-equal to the 3-kernel chain (same indexed loads, same
+    /// rotation formula, same store positions).
+    #[cutile::entry()]
+    pub fn cutile_rope_interleaved<const HALF_DIM: i32>(
+        z: &mut Tensor<f32, { [HALF_DIM] }>,
+        x: &Tensor<f32, { [-1] }>,
+        cos_table: &Tensor<f32, { [-1] }>,
+        sin_table: &Tensor<f32, { [-1] }>,
+    ) {
+        let pid = program_id(0);
+        let sh = pid / 2;
+        let half_idx = pid % 2;
+        // Load both halves of head sh (deinterleave-style indexed loads).
+        let tile_x0 = x.partition(shape![HALF_DIM]).load([2 * sh]);
+        let tile_x1 = x.partition(shape![HALF_DIM]).load([2 * sh + 1]);
+        // Load cos/sin for this (seq, head) pair.
+        let tile_cos = cos_table.partition(shape![HALF_DIM]).load([sh]);
+        let tile_sin = sin_table.partition(shape![HALF_DIM]).load([sh]);
+        // Rotate (identical formula to cutile_rope_kernel).
+        let out0 = tile_x0 * tile_cos - tile_x1 * tile_sin;
+        let out1 = tile_x0 * tile_sin + tile_x1 * tile_cos;
+        // Store interleaved: even programs write the first half of head sh
+        // (position 2*sh), odd programs write the second half (2*sh+1).
+        if half_idx == 0 {
+            z.store(out0);
+        } else {
+            z.store(out1);
+        }
+    }
+
     /// Deinterleave kernel: split interleaved [num_sh x head_dim] into two half-tensors.
     ///
     /// `x` is a flat [num_sh * head_dim] tensor in interleaved layout:
@@ -703,6 +751,45 @@ impl CutileRoPE {
             (cos_t, sin_t)
         };
 
+        // -- Fused single-kernel path (default) --------------------------------
+        // ONE kernel replaces the deinterleave -> rope -> interleave chain:
+        // reads the interleaved input, applies the rotation, writes the
+        // interleaved output (bitwise-equal; eliminates 4 memory
+        // round-trips and 2 kernel launches per Q/K per layer).
+        // TEMPURA_NO_FUSED_ROPE=1 bisects back to the 3-kernel chain.
+        if std::env::var("TEMPURA_NO_FUSED_ROPE").as_deref() != Ok("1") {
+            let x_flat = x_dev.clone();
+
+            let z_tensor = scratch
+                .z
+                .take()
+                .and_then(|arc| Arc::try_unwrap(arc).ok())
+                .unwrap_or_else(|| {
+                    api::zeros::<f32>(&[scratch.cap_num_sh * scratch.head_dim])
+                        .sync_on(stream)
+                        .expect("RopeScratch: z fallback alloc failed")
+                });
+
+            let z_part = z_tensor.partition([half]);
+            let (z_t, _x, c_ret, s_ret) = unsafe {
+                kernels::cutile_rope_interleaved(z_part, x_flat, cos_t, sin_t)
+                    .generics(vec![half.to_string()])
+                    .async_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            };
+
+            if !cs_hit {
+                scratch.cos_t = Some(c_ret);
+                scratch.sin_t = Some(s_ret);
+            }
+
+            let z_arc = Arc::new(z_t.unpartition());
+            scratch.z = Some(z_arc.clone());
+            return Ok(z_arc);
+        }
+
+        // -- 3-kernel chain (TEMPURA_NO_FUSED_ROPE=1 bisect path) --------------
+
         // x_dev is already rank-1 (1 stride) because all GEMV paths now call
         // unpartition().reshape(&[n]) before returning, which collapses the
         // partition-stride metadata that partition([1]).unpartition() used to leave
@@ -787,6 +874,113 @@ impl CutileRoPE {
         // On a cache miss the freshly uploaded tables enter the cache via the
         // kernel returns; on a hit the returns are clones of what is already
         // cached and simply drop.
+        if !cs_hit {
+            scratch.cos_t = Some(c_ret);
+            scratch.sin_t = Some(s_ret);
+        }
+
+        let z_arc = Arc::new(z_t.unpartition());
+        scratch.z = Some(z_arc.clone());
+        Ok(z_arc)
+    }
+
+    /// Fused RoPE-on-interleaved: ONE kernel replaces the
+    /// deinterleave -> rope -> interleave chain (bitwise-equal output).
+    ///
+    /// Uses only the z output scratch and the cos/sin tables (which are
+    /// pre-broadcast to [num_sh * half]); the x_first/x_second/out_first/
+    /// out_second intermediates are eliminated entirely.
+    pub fn forward_device_scratch_fused(
+        &self,
+        x_dev: &Arc<Tensor<f32>>,
+        positions: &[u32],
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        theta: f32,
+        scratch: &mut RopeScratch,
+        stream: &Arc<Stream>,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let num_sh = seq_len * n_heads;
+        if !head_dim.is_multiple_of(2) {
+            return Err(KernelError::InvalidConfig(format!(
+                "head_dim must be even, got {head_dim}"
+            )));
+        }
+        let half = head_dim / 2;
+
+        // Grow/shrink the output buffer to exactly num_sh * head_dim.
+        scratch.ensure_capacity(num_sh, stream)?;
+
+        // Cos/sin tables: same cache-and-broadcast logic as the 3-kernel
+        // path (the fused kernel uses the same [num_sh * half] layout).
+        let cs_hit = scratch.cs_theta == theta
+            && scratch.cs_positions.as_slice() == positions
+            && scratch.cos_t.is_some()
+            && scratch.sin_t.is_some();
+        let (cos_t, sin_t) = if cs_hit {
+            (
+                scratch.cos_t.clone().unwrap(),
+                scratch.sin_t.clone().unwrap(),
+            )
+        } else {
+            let mut freqs = vec![0.0f32; seq_len * half];
+            for s in 0..seq_len {
+                let pos = positions[s] as f32;
+                for d in 0..half {
+                    freqs[s * half + d] = pos / theta.powf(2.0 * d as f32 / head_dim as f32);
+                }
+            }
+            let mut cos_exp = vec![0.0f32; num_sh * half];
+            let mut sin_exp = vec![0.0f32; num_sh * half];
+            for s in 0..seq_len {
+                for h in 0..n_heads {
+                    let sh = s * n_heads + h;
+                    for d in 0..half {
+                        let f = freqs[s * half + d];
+                        cos_exp[sh * half + d] = f.cos();
+                        sin_exp[sh * half + d] = f.sin();
+                    }
+                }
+            }
+
+            let upload_vec = |v: Vec<f32>| -> Result<Arc<Tensor<f32>>> {
+                Ok(api::copy_host_vec_to_device(&Arc::new(v))
+                    .sync_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .into())
+            };
+
+            let cos_t = upload_vec(cos_exp)?;
+            let sin_t = upload_vec(sin_exp)?;
+            scratch.cs_theta = theta;
+            scratch.cs_positions = positions.to_vec();
+            (cos_t, sin_t)
+        };
+
+        // x_dev is rank-1 flat [num_sh * head_dim] interleaved.
+        let x_flat = x_dev.clone();
+
+        // Reclaim the z output buffer (interleaved [num_sh * head_dim]).
+        let z_tensor = scratch
+            .z
+            .take()
+            .and_then(|arc| Arc::try_unwrap(arc).ok())
+            .unwrap_or_else(|| {
+                api::zeros::<f32>(&[scratch.cap_num_sh * scratch.head_dim])
+                    .sync_on(stream)
+                    .expect("RopeScratch: z fallback alloc failed")
+            });
+
+        // Fused kernel: 2*num_sh programs, z partitioned as [half].
+        let z_part = z_tensor.partition([half]);
+        let (z_t, _x, c_ret, s_ret) = unsafe {
+            kernels::cutile_rope_interleaved(z_part, x_flat, cos_t, sin_t)
+                .generics(vec![half.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
         if !cs_hit {
             scratch.cos_t = Some(c_ret);
             scratch.sin_t = Some(s_ret);

@@ -510,8 +510,9 @@ typical-p/repeat/presence/frequency)
       NOTE: this GGUF (bartowski Llama-3.1-8B Q4_K_M) has a mixed layout
       -- 16 layers with Q6K v+down_proj, 16 with Q4K -- verified from the
       GGUF tensor-type census (193 Q4K + 33 Q6K) and the trace.
-- [x] **Prefill on GPU: 7304 tok/s pp128, TTFT P50 17.5 ms -- llama.cpp
-      PARITY (ref 7335, 1.004x; 2026-10-29).** Lever-by-lever history
+- [x] **Prefill on GPU: 7473 tok/s pp128, TTFT P50 17.1 ms -- BEATING
+      llama.cpp (ref 7335, 1.02x in our favor; 2026-10-29).**
+      Lever-by-lever history
       below (nsys-
       driven: on-device attention + scratch RoPE + pooled norms/adds/SiLU +
       Q6K down_proj via MXFP4 + flash BR=16 + lm_head BK=512/last-row d2d)
@@ -653,6 +654,16 @@ typical-p/repeat/presence/frequency)
       in tools/mxf4-gemv for a future attempt that stages the epilogue
       read through coalesced smem. Post-revert: 7304 tok/s, TTFT
       17.5 ms, 1.004x gap -- prefill parity.
+      (l) Fused RoPE-on-interleaved (2026-10-29): the prefill Q/K rope ran
+      as a 3-kernel chain (deinterleave -> rope -> interleave) -- 6 memory
+      round-trips and 3 kernel launches per Q/K per layer, ~15us/layer
+      (nsys). cutile_rope_interleaved does it in ONE kernel (reads the
+      interleaved [num_sh*head_dim] tensor, applies the rotation, writes
+      interleaved; same indexed loads, same formula, same store positions
+      -> bitwise-equal). TEMPURA_NO_FUSED_ROPE=1 bisects back to the
+      3-kernel chain. 7304 -> 7473 tok/s, TTFT 17.5 -> 17.1 ms --
+      BEATING llama.cpp 7335 (1.02x in our favor). Logits fingerprint
+      bitwise-identical, bench-quality PASS 89.1%.
       Verified 2026-10-28: bench-decode-ops "prefill attn dev" 8/8, "rope
       prefill scratch" 4/4 and "rmsnorm prefill scratch" (grow/reuse/
       shrink/odd-seq) 4/4 all
@@ -918,8 +929,8 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       instantiation removed the 122-139us serialized launch cost:
       **210 tok/s -- llama.cpp parity reached (ref 209)**, ITL 4.77 ms,
       teacher-forced PASS 89.1%)
-- Llama-3.1-8B Q4K prefill: **7304 tok/s pp128**, TTFT P50 17.5 ms
-      (1.004x gap vs llama.cpp 7335 -- parity; logits det=OK, NaN-free; A/B numerics vs
+- Llama-3.1-8B Q4K prefill: **7473 tok/s pp128**, TTFT P50 17.1 ms
+      (BEATING llama.cpp 7335 by 1.02x; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1331 -- the MXFP4 band including the
       Q6K->MXFP4 down_proj double-quantization (lossier than the Q4K path's
       0.1015; bench-quality teacher-forced PASS 89.1%, all mismatches
