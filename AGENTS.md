@@ -480,8 +480,9 @@ typical-p/repeat/presence/frequency)
       non-multiples of 8 -- the _db variant needs no k_blocks % 8 gate).
       Decode 196 -> 204 tok/s (ITL 5.11 -> 4.89 ms, gap to llama.cpp
       1.025x). TEMPURA_NO_Q6K_DB=1 bisects back to the cp.async variant.
-- [x] **Single-sequence GPU decode gap vs llama.cpp CLOSED at parity:
-      210 vs 209 tok/s (2026-10-29).** Final change: cuGraphUpload after
+- [x] **Single-sequence GPU decode gap vs llama.cpp CLOSED -- BEATING:
+      217 vs 209 tok/s (1.04x in our favor; 2026-10-29).** Final change:
+      fused RMSNorm (3 kernels -> 1, 195 -> 65 graph nodes).
       graph instantiation at all three capture sites (single decode +
       both batch graphs) -- the ~930-node decode graph's cuGraphLaunch
       was 122-139us of SERIALIZED host time per step (GPU idle; nsys
@@ -510,8 +511,8 @@ typical-p/repeat/presence/frequency)
       NOTE: this GGUF (bartowski Llama-3.1-8B Q4_K_M) has a mixed layout
       -- 16 layers with Q6K v+down_proj, 16 with Q4K -- verified from the
       GGUF tensor-type census (193 Q4K + 33 Q6K) and the trace.
-- [x] **Prefill on GPU: 7473 tok/s pp128, TTFT P50 17.1 ms -- BEATING
-      llama.cpp (ref 7335, 1.02x in our favor; 2026-10-29).**
+- [x] **Prefill on GPU: 7562 tok/s pp128, TTFT P50 16.9 ms -- BEATING
+      llama.cpp (ref 7335, 1.03x in our favor; 2026-10-29).**
       Lever-by-lever history
       below (nsys-
       driven: on-device attention + scratch RoPE + pooled norms/adds/SiLU +
@@ -663,6 +664,16 @@ typical-p/repeat/presence/frequency)
       -> bitwise-equal). TEMPURA_NO_FUSED_ROPE=1 bisects back to the
       3-kernel chain. 7304 -> 7473 tok/s, TTFT 17.5 -> 17.1 ms --
       BEATING llama.cpp 7335 (1.02x in our favor). Logits fingerprint
+      bitwise-identical, bench-quality PASS 89.1%.
+      (m) Fused RMSNorm (2026-10-29): the rmsnorm ran as a 3-kernel chain
+      (sum_sq -> scale -> apply) -- 195 of the ~930 decode graph nodes
+      (65 instances x 3 kernels), each a tiny kernel with a full memory
+      round-trip between passes. rmsnorm_fused does it in ONE kernel
+      (load x/w, reduce sum(x^2), rsqrt, multiply -- all in registers;
+      same reduction, same rsqrt formula, same apply -> bitwise-equal).
+      TEMPURA_NO_FUSED_RMSNORM=1 bisects back to the 3-kernel chain.
+      Decode 210 -> 217 tok/s (graph 930 -> ~800 nodes, launch + dispatch
+      overhead drops); prefill 7473 -> 7562 tok/s. Logits fingerprint
       bitwise-identical, bench-quality PASS 89.1%.
       Verified 2026-10-28: bench-decode-ops "prefill attn dev" 8/8, "rope
       prefill scratch" 4/4 and "rmsnorm prefill scratch" (grow/reuse/
@@ -927,10 +938,11 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       down_proj bandwidth gap: 196 -> 204 tok/s, bitwise-identical logits;
       the Q6K v_proj moved to the kpar path (206) and cuGraphUpload after
       instantiation removed the 122-139us serialized launch cost:
-      **210 tok/s -- llama.cpp parity reached (ref 209)**, ITL 4.77 ms,
-      teacher-forced PASS 89.1%)
-- Llama-3.1-8B Q4K prefill: **7473 tok/s pp128**, TTFT P50 17.1 ms
-      (BEATING llama.cpp 7335 by 1.02x; logits det=OK, NaN-free; A/B numerics vs
+      210 tok/s; 2026-10-29 the fused RMSNorm (3 kernels -> 1, 195 -> 65
+      graph nodes): **217 tok/s -- BEATING llama.cpp (ref 209)**, ITL
+      4.61 ms, teacher-forced PASS 89.1%)
+- Llama-3.1-8B Q4K prefill: **7562 tok/s pp128**, TTFT P50 16.9 ms
+      (BEATING llama.cpp 7335 by 1.03x; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1331 -- the MXFP4 band including the
       Q6K->MXFP4 down_proj double-quantization (lossier than the Q4K path's
       0.1015; bench-quality teacher-forced PASS 89.1%, all mismatches
