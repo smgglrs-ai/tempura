@@ -75,6 +75,12 @@ pub mod kernels {
 /// Tile width for 1D elementwise and q8 kernels (32 elements = one Q8 block).
 const B: usize = 32;
 
+/// Tile width for the device-side SiLU-gated multiply: 256 f32 (1KB) per
+/// program. The 32-element tiles moved only 384B per block; 256 keeps the
+/// same math (elementwise -- bitwise-identical for any tile size) with
+/// properly sized memory transactions.
+const SILU_B: usize = 256;
+
 /// GPU-accelerated elementwise operations using NVIDIA cuTile Rust (`cutile-rs`).
 ///
 /// Covers: vector add, SiLU-gated projection, and Q8 round-trip quantisation.
@@ -220,7 +226,7 @@ impl CutileElementwise {
         stream: &Arc<Stream>,
     ) -> Result<Arc<Tensor<f32>>> {
         let n = seq_len * inter;
-        let n_pad = n.div_ceil(B) * B;
+        let n_pad = n.div_ceil(SILU_B) * SILU_B;
         // Launch on the CALLER's stream: this struct owns a private stream,
         // and running the kernel there races with the producers of gate/up and
         // the consumers of the output, which all run on the caller's stream
@@ -230,7 +236,7 @@ impl CutileElementwise {
         let out_t = api::zeros::<f32>(&[n_pad])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-            .partition([B]);
+            .partition([SILU_B]);
 
         let (gate_t, up_t): (Arc<Tensor<f32>>, Arc<Tensor<f32>>) = if n_pad == n {
             // Already B-aligned: pass device tensors directly -- 0 PCIe transfers.
@@ -261,7 +267,7 @@ impl CutileElementwise {
         // execute after this kernel completes.  Caller syncs before CPU read.
         let (out_t, _g, _u) = unsafe {
             kernels::cutile_silu_mul(out_t, gate_t, up_t)
-                .generics(vec![B.to_string()])
+                .generics(vec![SILU_B.to_string()])
                 .async_on(stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
         };
@@ -286,7 +292,7 @@ impl CutileElementwise {
         stream: &Arc<Stream>,
     ) -> Result<Arc<Tensor<f32>>> {
         let n = seq_len * inter;
-        let n_pad = n.div_ceil(B) * B;
+        let n_pad = n.div_ceil(SILU_B) * SILU_B;
         // Launch on the CALLER's stream (see silu_mul_device): this struct's
         // private stream has no events tying it to the surrounding ops.
 
@@ -315,7 +321,7 @@ impl CutileElementwise {
                 .sync_on(stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
         };
-        let out_t = out_tensor.partition([B]);
+        let out_t = out_tensor.partition([SILU_B]);
 
         let (gate_t, up_t): (Arc<Tensor<f32>>, Arc<Tensor<f32>>) = if n_pad == n {
             (gate.clone(), up.clone())
@@ -344,7 +350,7 @@ impl CutileElementwise {
         // Caller syncs before CPU read.
         let (out_t, _g, _u) = unsafe {
             kernels::cutile_silu_mul(out_t, gate_t, up_t)
-                .generics(vec![B.to_string()])
+                .generics(vec![SILU_B.to_string()])
                 .async_on(stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
         };
@@ -359,7 +365,7 @@ impl CutileElementwise {
     pub fn q8_snap(&self, data: &mut [f32]) -> Result<()> {
         let n = data.len();
         // Align to multiples of B (= 32 = Q8 block size).
-        let n_pad = n.div_ceil(B) * B;
+        let n_pad = n.div_ceil(SILU_B) * SILU_B;
         let mut padded = data.to_vec();
         padded.resize(n_pad, 0.0f32);
 
@@ -368,7 +374,7 @@ impl CutileElementwise {
         let out_t = api::zeros::<f32>(&[n_pad])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-            .partition([B]);
+            .partition([SILU_B]);
 
         let in_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(padded))
             .sync_on(stream)
@@ -376,7 +382,7 @@ impl CutileElementwise {
             .into();
 
         let (out_t, _in) = kernels::cutile_q8_snap(out_t, in_t)
-            .generics(vec![B.to_string()])
+            .generics(vec![SILU_B.to_string()])
             .sync_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 

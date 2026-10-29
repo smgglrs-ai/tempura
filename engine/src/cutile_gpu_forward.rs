@@ -1841,9 +1841,9 @@ impl CutileGpuModel {
         let ffn_add_scratch = add_alloc(h_pad);
         // Attention output scratch: q_dim = n_heads x head_dim (seq_len=1, no padding).
         let attn_out_scratch = add_alloc(q_dim);
-        // SiLU-mul output scratch: inter rounded up to next multiple of 32 (the B
-        // constant used inside silu_mul_device_scratch).
-        const SILU_B: usize = 32;
+        // SiLU-mul output scratch: inter rounded up to next multiple of 256
+        // (the SILU_B constant used inside silu_mul_device_scratch).
+        const SILU_B: usize = 256;
         let silu_out_scratch = add_alloc(inter.div_ceil(SILU_B) * SILU_B);
 
         // Pre-allocate the zero-padded down-projection input scratch (only needed
@@ -2580,7 +2580,11 @@ impl CutileGpuModel {
         n: usize,
         scratch: &mut Option<Arc<Tensor<f32>>>,
     ) -> Arc<Tensor<f32>> {
-        const BLOCK: usize = 32;
+        // 256 f32 (1KB) per program: the original 32-element tiles moved only
+        // 384B per block (2x128B reads + 128B store) and ran the [128,4096]
+        // residual adds at ~690 GB/s -- half of DRAM peak (nsys 2026-10-29).
+        // Elementwise add is bitwise-identical for any block size.
+        const BLOCK: usize = 256;
         let stream = self.matmul.stream();
         let n_pad = n.div_ceil(BLOCK) * BLOCK;
         // Size check: a pooled buffer sized for a different n would partition
