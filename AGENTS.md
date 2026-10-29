@@ -462,8 +462,26 @@ typical-p/repeat/presence/frequency)
       teacher-forced PASS 90.6% UNCHANGED (same mismatch list); bench-batch
       all M NaN-free + fresh-cache replay bitwise (fingerprints
       re-baselined for the MXFP4 lm_head).
-- [ ] Close the 1.07x single-sequence GPU decode gap vs llama.cpp
-      (196 vs 209 tok/s, ITL 5.11 ms, 2026-10-29). Was 1.49x (140 tok/s)
+- [x] **q6k sm120 kpar8 bandwidth gap FIXED (dual-block direct-load
+      variant, 2026-10-29)**: the cp.async kernel ran down_proj
+      [4096,14336] at ~0.86 TB/s while the q4k dual_block kernel does the
+      same shape at ~1.25 TB/s -- the cp.async design's load-bearing CTA
+      bar.sync x3 per iteration (21 per CTA) locksteps all 8 warps: every
+      warp waits for the slowest warp's prefetch+compute before issuing
+      its next, exposing DRAM latency with no way to skew.
+      `q6k_gemv_sm120_kpar8_db` (second entry in the same module) adopts
+      the q4k recipe with the register-exchange consume: weights load
+      DIRECTLY into registers via ld.global.nc (2 warp-instructions per
+      212-byte block -- no smem, no cp.async, no proxy fences, NO barriers
+      in the loop), dual-block (blocks A and A+8 per iteration, 2x MLP),
+      prefetch.global.L2 16 blocks ahead, running x pointers.
+      Accumulation order unchanged -> bitwise-equal output (probe
+      fingerprint identical; micro harness 0/81920 at every kb including
+      non-multiples of 8 -- the _db variant needs no k_blocks % 8 gate).
+      Decode 196 -> 204 tok/s (ITL 5.11 -> 4.89 ms, gap to llama.cpp
+      1.025x). TEMPURA_NO_Q6K_DB=1 bisects back to the cp.async variant.
+- [ ] Close the 1.03x single-sequence GPU decode gap vs llama.cpp
+      (204 vs 209 tok/s, ITL 4.89 ms, 2026-10-29). Was 1.49x (140 tok/s)
       before the lm_head BK=512 fix -- the f32 lm_head GEMV was running at
       709 GB/s and costing ~1.5ms of every token; BK=512 (1475 GB/s) took
       decode 139 -> 171 tok/s and prefill to 5816 (see the prefill item,
@@ -473,12 +491,9 @@ typical-p/repeat/presence/frequency)
       q4k_gemv_v4_ptx, d/dmin via cvt.f32.f16) and re-enabled -- 134
       -> 140 tok/s, ITL 7.49 -> 7.15 ms, bench-quality 100% agreement
       held, bench-decode-ops fused-silu real-weights test rel 0.0007.
-      Remaining levers (nsys step profile, 2026-10-29): the q6k sm120
-      kpar8 GEMV runs down_proj at ~0.86 TB/s while the q4k dual_block
-      kernel does the same shape at ~1.25 TB/s (16 Q6K layers x 17us
-      gap = ~280us/step); the Q6K v_proj in dispatch_kv_on_stream still
-      uses the dp4a BASELINE kernel (280 GB/s on [1024,4096], ~10us x 16
-      layers = ~160us/step); a ~230us host gap between graph launches.
+      Remaining levers: the Q6K v_proj in dispatch_kv_on_stream still uses
+      the dp4a BASELINE kernel (280 GB/s on [1024,4096], ~160us/step); a
+      ~230us host gap between graph launches.
       NOTE: this GGUF (bartowski Llama-3.1-8B Q4_K_M) has a mixed layout
       -- 16 layers with Q6K v+down_proj, 16 with Q4K -- verified from the
       GGUF tensor-type census (193 Q4K + 33 Q6K) and the trace.
@@ -822,9 +837,11 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       sm120 q6k kernel fixed the kb=16 residual and made it default-ON
       (169 tok/s); 2026-10-29 the lm_head upload switched from dequantized
       f32 (2.1GB read per token) to the GGUF's native Q6_K via the kpar
-      GEMV: 196 tok/s, ITL 5.11 ms, bench-quality teacher-forced PASS 90.6%
-      unchanged, +1.3GB VRAM)
-- Llama-3.1-8B Q4K prefill: **6033 tok/s pp128**, TTFT P50 21.2 ms
+      GEMV: 204 tok/s, ITL 4.89 ms, bench-quality teacher-forced PASS 90.6%
+      unchanged, +1.3GB VRAM; 2026-10-29 the dual-block direct-load q6k
+      variant (no cp.async/barriers, 2x MLP, L2 prefetch) closed the q6k
+      down_proj bandwidth gap: 196 -> 204 tok/s, bitwise-identical logits)
+- Llama-3.1-8B Q4K prefill: **6084 tok/s pp128**, TTFT P50 21.0 ms
       (1.22x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1331 -- the MXFP4 band including the
       Q6K->MXFP4 down_proj double-quantization (lossier than the Q4K path's

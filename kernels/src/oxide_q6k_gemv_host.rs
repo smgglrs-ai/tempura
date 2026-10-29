@@ -58,6 +58,11 @@ pub struct OxideQ6kGemv {
     /// q6k_gemv_sm120_kpar8: cp.async triple-buffer + register-exchange
     /// variant (sm_120+). Default since 2026-10-29.
     cu_function_sm120_mbar: Option<CUfunction>,
+    /// q6k_gemv_sm120_kpar8_db: dual-block DIRECT-LOAD variant (same module,
+    /// second entry) -- no cp.async/smem/barriers in the loop, 2x MLP, L2
+    /// prefetch. Preferred over kpar8 for ANY k_blocks since 2026-10-29
+    /// (TEMPURA_NO_Q6K_DB=1 bisects back to the cp.async variant).
+    cu_function_sm120_db:   Option<CUfunction>,
     /// sm_120 batch module: q6k_gemv_sm120_batch (M rows, shared weight reads).
     cu_sm120_batch_module:  Option<CUmodule>,
     /// q6k_gemv_sm120_batch: true-batch kernel, one block per output neuron. (sm_120+).
@@ -219,7 +224,8 @@ impl OxideQ6kGemv {
         };
         let sm120_cc_ok = sm120_cc >= crate::q6k_gemv_v4_ptx::MIN_CC;
 
-        let (cu_sm120_module, cu_function_sm120_mbar) = if !sm120_disabled && sm120_cc_ok {
+        let (cu_sm120_module, cu_function_sm120_mbar, cu_function_sm120_db_raw) =
+            if !sm120_disabled && sm120_cc_ok {
             let ptx_cstr = CString::new(crate::q6k_gemv_v4_ptx::PTX)
                 .unwrap_or_default();
             let mut sm120_mod = std::mem::MaybeUninit::uninit();
@@ -242,32 +248,62 @@ impl OxideQ6kGemv {
                     )
                 };
                 if rc2 == CUDA_SUCCESS {
+                    let kpar_fn = unsafe { fn_out.assume_init() };
                     eprintln!(
                         "oxide-gemv-q6k: loaded sm120 kpar8 variant \
                          (entry={}, cc={sm120_cc})",
                         crate::q6k_gemv_v4_ptx::ENTRY,
                     );
-                    (Some(sm120_mod), Some(unsafe { fn_out.assume_init() }))
+                    // Second entry in the same module: the dual-block
+                    // direct-load variant. Best-effort -- select_kpar_fn
+                    // falls back to the cp.async variant when absent.
+                    let db_fn = {
+                        let db_cstr = CString::new(crate::q6k_gemv_v4_ptx::ENTRY_DB)
+                            .unwrap_or_default();
+                        let mut db_out = std::mem::MaybeUninit::uninit();
+                        let rc3 = unsafe {
+                            cuda_core::sys::cuModuleGetFunction(
+                                db_out.as_mut_ptr(),
+                                sm120_mod,
+                                db_cstr.as_ptr(),
+                            )
+                        };
+                        if rc3 == CUDA_SUCCESS {
+                            eprintln!(
+                                "oxide-gemv-q6k: loaded sm120 kpar8_db variant \
+                                 (entry={}, cc={sm120_cc})",
+                                crate::q6k_gemv_v4_ptx::ENTRY_DB,
+                            );
+                            Some(unsafe { db_out.assume_init() })
+                        } else {
+                            eprintln!(
+                                "oxide-gemv-q6k: cuModuleGetFunction(kpar8_db) \
+                                 failed (rc={rc3}); using the cp.async variant"
+                            );
+                            None
+                        }
+                    };
+                    (Some(sm120_mod), Some(kpar_fn), db_fn)
                 } else {
                     eprintln!(
                         "oxide-gemv-q6k: cuModuleGetFunction(sm120_mbar) \
                          failed (rc={rc2}); using kpar8 baseline"
                     );
                     let _ = unsafe { cuda_core::sys::cuModuleUnload(sm120_mod) };
-                    (None, None)
+                    (None, None, None)
                 }
             } else {
                 eprintln!(
                     "oxide-gemv-q6k: cuModuleLoadData(sm120 PTX) \
                      failed (rc={rc}); using kpar8 baseline"
                 );
-                (None, None)
+                (None, None, None)
             }
         } else if sm120_force_off {
             eprintln!("oxide-gemv-q6k: TEMPURA_NO_SM120_Q6K=1, skipping sm120 kpar8");
-            (None, None)
+            (None, None, None)
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         // -- Try sm_120 batch PTX (q6k_gemv_sm120_batch, M rows 2..=16) ----------
@@ -369,6 +405,15 @@ impl OxideQ6kGemv {
             cu_function_kpar,
             cu_sm120_module,
             cu_function_sm120_mbar,
+            cu_function_sm120_db: if std::env::var("TEMPURA_NO_Q6K_DB")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                eprintln!("oxide-gemv-q6k: TEMPURA_NO_Q6K_DB=1, using the cp.async kpar8 variant");
+                None
+            } else {
+                cu_function_sm120_db_raw
+            },
             cu_sm120_batch_module,
             cu_function_sm120_batch,
             kpar_out_scratch: RefCell::new(None),
@@ -648,14 +693,19 @@ impl OxideQ6kGemv {
         Ok(Arc::new(out))
     }
 
-    /// Select the best available kpar function: sm120_kpar8 > dp4a_kpar8 > None.
-    /// The sm_120 register-exchange variant requires `k_blocks % 8 == 0`:
-    /// its loop-tail publication point uses CTA-wide `bar.sync 0` (load-
-    /// bearing on this hw -- see the kernel doc), which is only deadlock-
-    /// free when all 8 warps run the same number of loop iterations, true
-    /// exactly when k_blocks is a multiple of 8. Other shapes fall back to
-    /// the dp4a kpar kernel.
+    /// Select the best available kpar function:
+    /// sm120_kpar8_db > sm120_kpar8 > dp4a_kpar8 > None.
+    /// - The dual-block direct-load variant (`_db`) has no CTA loop barriers,
+    ///   so it works for ANY k_blocks (its B-block is simply invalid on the
+    ///   ragged tail).
+    /// - The cp.async variant requires `k_blocks % 8 == 0`: its loop-tail
+    ///   publication point uses CTA-wide `bar.sync 0` (load-bearing on this
+    ///   hw -- see the kernel doc), which is only deadlock-free when all 8
+    ///   warps run the same number of loop iterations.
     fn select_kpar_fn(&self, k_blocks: usize) -> Option<(CUfunction, bool)> {
+        if let Some(f) = self.cu_function_sm120_db {
+            return Some((f, true));
+        }
         if let Some(f) = self.cu_function_sm120_mbar {
             if k_blocks % 8 == 0 {
                 return Some((f, true));
