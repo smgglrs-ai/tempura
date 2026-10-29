@@ -254,6 +254,11 @@ fn main() {
         let mut func: sys::CUfunction = std::ptr::null_mut();
         let rc = unsafe { sys::cuModuleGetFunction(&mut func, module, name_c.as_ptr()) };
         assert_eq!(rc, 0, "micro cuModuleGetFunction rc={rc}");
+        let name_db_c =
+            std::ffi::CString::new(tempura_kernels::q6k_gemv_v4_ptx::ENTRY_DB).unwrap();
+        let mut func_db: sys::CUfunction = std::ptr::null_mut();
+        let rc = unsafe { sys::cuModuleGetFunction(&mut func_db, module, name_db_c.as_ptr()) };
+        assert_eq!(rc, 0, "micro cuModuleGetFunction(db) rc={rc}");
         eprintln!("[micro] uploading bufs...");
         const GRID: usize = 64;
         // Synthetic Q6K blocks: d = (b+1) as f32 bits, all group scales = 1
@@ -279,7 +284,20 @@ fn main() {
         let x_ptr = x_dev.device_pointer().cu_deviceptr();
         let mut mismatches = 0u32;
         static row0_checked: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        for &kb in &[8usize, 16, 24, 32, 40, 48, 56] {
+        // Both sm120 entries drive the exact same math: the cp.async kpar8
+        // (barrier-gated to k_blocks % 8 == 0) and the dual-block direct-load
+        // _db variant (any k_blocks -- no CTA loop barriers). Exact
+        // arithmetic: any wrong bit shows up as a wrong output.
+        let variants: Vec<(&str, sys::CUfunction, Vec<usize>)> = vec![
+            ("sm120_kpar8", func, vec![8, 16, 24, 32, 40, 48, 56]),
+            (
+                "sm120_kpar8_db",
+                func_db,
+                vec![3, 8, 9, 13, 16, 23, 24, 32, 40, 48, 55, 56],
+            ),
+        ];
+        for (vlabel, vfunc, kbs) in &variants {
+        for &kb in kbs {
             let w = mk_weights(kb);
             let w_dev: Arc<Tensor<u32>> = Arc::new(
                 api::copy_host_vec_to_device(&Arc::new(w))
@@ -308,7 +326,7 @@ fn main() {
                 ];
                 let rc = unsafe {
                     sys::cuLaunchKernel(
-                        func, 4096, 1, 1, 256, 1, 1, 0,
+                        *vfunc, 4096, 1, 1, 256, 1, 1, 0,
                         stream.cu_stream(),
                         args8.as_mut_ptr() as *mut _,
                         std::ptr::null_mut(),
@@ -322,13 +340,15 @@ fn main() {
                     kb_bad_total += bad as u32;
                 }
             }
-            println!("  sm120_kpar8 micro kb={kb}: {kb_bad_total}/81920 wrong (20 iters x 4096 rows)");
+            println!("  {vlabel} micro kb={kb}: {kb_bad_total}/81920 wrong (20 iters x 4096 rows)");
         }
         println!(
-            "  sm120 kpar8 micro (REAL kernel, synthetic weights): wrong={mismatches} -> {}",
+            "  {vlabel} micro (REAL kernel, synthetic weights): wrong={mismatches} -> {}",
             if mismatches == 0 { "PASS" } else { "FAIL" }
         );
         all_ok &= mismatches == 0;
+        mismatches = 0;
+        }
     }
 
 
@@ -2054,11 +2074,10 @@ fn main() {
                     "  q6k sm120_kpar8 vs CPU (kb=56): max_abs={max_ref:.6} nonfinite={infs}/{n}"
                 );
 
-                // Shape bisect: kb=8 (ONE loop iteration, no swap) and
-                // kb=16 (two iterations, one swap -- the shape that
-                // exposed the old barrier design's residual race, now
-                // fixed by the register exchange) from the same weights.
-                for &kbt in &[8usize, 16, 24, 32, 40, 48, 56] {
+                // Shape bisect via forward_kpar_d2d (dispatches the
+                // dual-block direct-load variant for ANY k_blocks now --
+                // includes non-multiples of 8 and the ragged tails).
+                for &kbt in &[8usize, 13, 16, 23, 24, 32, 40, 48, 55, 56] {
                     let kt = kbt * 256;
                     let xt: Vec<f32> = x[..kt].to_vec();
                     let xt_dev = upload(xt.clone(), &stream);

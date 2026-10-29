@@ -654,10 +654,634 @@ REDUCE_WAIT:
 DONE:
     ret;
 }
+
+// q6k_gemv_sm120_kpar8_db: dual-block DIRECT-LOAD variant (2026-10-29).
+//
+// The cp.async variant above is barrier-bound: its loop-tail publication
+// point needs CTA-wide bar.sync x3 (load-bearing on this hw), which
+// locksteps all 8 warps -- every warp waits for the slowest warp's
+// prefetch+compute before issuing its next, and the DRAM latency beyond
+// compute is exposed. Measured: down_proj [4096,14336] at ~0.86 TB/s while
+// the q4k dual_block kernel (no cp.async, no smem, no barriers, L2
+// prefetch, free-running warps) does the same shape at ~1.25 TB/s.
+//
+// This variant adopts that recipe with the register-exchange consume:
+//   - weights load DIRECTLY into registers via ld.global.nc (round 1:
+//     lane l -> word l; round 2: lanes 0..20 -> words 32+l; 2 warp-
+//     instructions per 212-byte block) -- no smem, no cp.async, no proxy
+//     fences, and NO barriers in the loop at all
+//   - dual-block: blocks (blkA, blkA+8) per iteration -- both blocks'
+//     loads issue back-to-back (2x memory-level parallelism), compute A,
+//     then compute B (branch-skipped when B is past k_blocks)
+//   - prefetch.global.L2 16 blocks ahead (2 lines cover the 212-byte block)
+//   - running x pointers (rd7 += 128 per step) instead of per-step address
+//     recomputation
+// Accumulation order per warp is IDENTICAL to kpar8 (blocks w, w+8,
+// w+16, ... in sequence, same 8-step FMA order, same reduce), so results
+// are bitwise-equal by construction (validated by the exact-arithmetic
+// micro harness). Side benefit: no CTA loop barriers means k_blocks does
+// NOT have to be a multiple of 8 (blkB is simply invalid on the ragged
+// tail).
+.visible .entry q6k_gemv_sm120_kpar8_db(
+    .param .u64 param_out,
+    .param .u64 param_out_len,
+    .param .u64 param_x,
+    .param .u64 param_x_len,
+    .param .u64 param_packed,
+    .param .u64 param_packed_len,
+    .param .u32 param_n,
+    .param .u32 param_k_blocks
+)
+{
+    .reg .u32  %r<110>;
+    .reg .u64  %rd<16>;
+    .reg .f32  %f<12>;
+    .reg .pred %p<16>;
+
+    // [0..31]: 8 f32 partials; [5376..5379]: reduce handoff counter.
+    .shared .align 8 .b8 smem_buf[5380];
+
+    // -- Load parameters --------------------------------------------------------
+    ld.param.u64 %rd0,  [param_out];
+    ld.param.u64 %rd1,  [param_x];
+    ld.param.u64 %rd2,  [param_packed];
+    ld.param.u32 %r0,   [param_n];
+    ld.param.u32 %r1,   [param_k_blocks];
+
+    // -- Thread decomposition ---------------------------------------------------
+    mov.u32 %r2, %ctaid.x;          // row = blockIdx.x
+    setp.ge.u32 %p0, %r2, %r0;
+    @%p0 bra DONE;
+
+    mov.u32 %r3, %tid.x;            // tid  (0..255)
+    and.b32 %r4, %r3, 31;           // lane = tid & 31
+    shr.u32 %r5, %r3, 5;            // warp_id = tid >> 5  (0..7)
+
+    // byte_shift = (lane % 4) * 8  - for ql/qh byte extraction from u32
+    and.b32 %r6, %r4, 3;
+    shl.b32 %r6, %r6, 3;            // %r6 = byte_shift
+
+    // lane_div4 = lane >> 2  - for ql/qh word index
+    shr.u32 %r7, %r4, 2;            // %r7 = lane_div4
+
+    // sc_shift_even / sc_shift_odd
+    shr.u32 %r8, %r4, 4;
+    shl.b32 %r8, %r8, 3;            // (lane>>4)*8  (0 or 8)
+    add.u32 %r9, %r8, 16;           // (16 or 24)
+
+    // Round-2 predicate: lanes 0..20 load words 32+l.
+    setp.lt.u32 %p1, %r4, 21;
+
+    // lane*4 (byte offset of this lane's round-1 word)
+    shl.b32 %r34, %r4, 2;
+
+    // -- Accumulator ------------------------------------------------------------
+    mov.f32 %f0, 0f00000000;        // acc = 0.0
+
+    // -- Constants --------------------------------------------------------------
+    mov.f32 %f10, 0f43000000;       // 128.0f
+    mov.f32 %f11, 0f42000000;       //  32.0f
+
+    // -- CTA-wide reduce HANDOFF COUNTER (zeroed by thread 0) -------------------
+    mov.u32 %r99, smem_buf;
+    add.u32 %r99, %r99, 5376;
+    setp.eq.u32 %p9, %r3, 0;
+    @%p9 st.shared.u32 [%r99], 0;
+    // Double barrier (DEFER_BLOCKING quirk -- see kpar8's comment). These are
+    // the ONLY CTA barriers in the kernel; the K-loop is barrier-free.
+    bar.sync 0;
+    bar.sync 0;
+
+    // -- K-loop: blkA = warp_id, warp_id+16, ...  (blocks A and A+8 per pass) --
+    mov.u32 %r30, %r5;               // blkA = warp_id
+
+KLOOP_DB:
+    setp.ge.u32 %p0, %r30, %r1;     // blkA >= k_blocks?
+    @%p0 bra REDUCE;
+
+    // -- Addresses ---------------------------------------------------------------
+    // baseA = packed + (row*k_blocks + blkA) * 212
+    mad.lo.u32 %r32, %r2, %r1, %r30;
+    mul.lo.u32 %r33, %r32, 212;
+    cvt.u64.u32 %rd4, %r33;
+    add.u64 %rd4, %rd2, %rd4;
+
+    // blkB = blkA + 8; clamp baseB to baseA when invalid (safe load address:
+    // Blackwell traps on OOB even under predication; the loaded garbage is
+    // never used -- the whole B section is branch-skipped).
+    add.u32 %r31, %r30, 8;
+    setp.lt.u32 %p10, %r31, %r1;    // %p10 = B valid
+    mad.lo.u32 %r61, %r2, %r1, %r31;
+    mul.lo.u32 %r62, %r61, 212;
+    cvt.u64.u32 %rd5, %r62;
+    add.u64 %rd5, %rd2, %rd5;
+    selp.u64 %rd5, %rd5, %rd4, %p10;
+
+    // -- Prefetch the block pair 16 blocks ahead into L2 (2 lines cover the
+    // 212-byte block). Clamped to baseA when out of range.
+    add.u32 %r63, %r30, 16;
+    setp.lt.u32 %p11, %r63, %r1;
+    add.u64 %rd6, %rd4, 3392;       // 16 * 212
+    selp.u64 %rd6, %rd6, %rd4, %p11;
+    prefetch.global.L2 [%rd6];
+    add.u64 %rd6, %rd6, 128;
+    selp.u64 %rd6, %rd6, %rd4, %p11;
+    prefetch.global.L2 [%rd6];
+
+    // -- Load block A + block B words straight into registers -------------------
+    // Round 1: lane l -> word l; round 2 (lanes < 21): word 32+l.
+    // 4 independent warp-instructions in flight -- the memory-level
+    // parallelism the cp.async variant could not reach through its barriers.
+    cvt.u64.u32 %rd7, %r34;
+    add.u64 %rd7, %rd4, %rd7;
+    ld.global.nc.b32 %r40, [%rd7];              // Ra (word lane)
+    add.u64 %rd7, %rd7, 128;
+    @%p1 ld.global.nc.b32 %r51, [%rd7];         // Pa (word 32+lane)
+    cvt.u64.u32 %rd7, %r34;
+    add.u64 %rd7, %rd5, %rd7;
+    ld.global.nc.b32 %r58, [%rd7];              // Rb (word lane)
+    add.u64 %rd7, %rd7, 128;
+    @%p1 ld.global.nc.b32 %r59, [%rd7];         // Pb (word 32+lane)
+
+    // -- Register-exchange consume + 8-step dequant/FMA for block A -------------
+    // (identical math and order to kpar8's consume; sources are registers.)
+    // d (f32 bits) from lane 0's Ra
+    shfl.sync.idx.b32 %r57, %r40, 0, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f1, %r57;                // d
+
+    // scale words 1..4 from lanes 1..4
+    shfl.sync.idx.b32 %r41, %r40, 1, 0x1F, 0xFFFFFFFF;  // sc_01
+    shfl.sync.idx.b32 %r42, %r40, 2, 0x1F, 0xFFFFFFFF;  // sc_23
+    shfl.sync.idx.b32 %r43, %r40, 3, 0x1F, 0xFFFFFFFF;  // sc_45
+    shfl.sync.idx.b32 %r44, %r40, 4, 0x1F, 0xFFFFFFFF;  // sc_67
+
+    // ql_a/ql_b/ql_c bytes (words 5+q / 13+q / 21+q of block A)
+    add.u32 %r54, %r7, 5;
+    shfl.sync.idx.b32 %r53, %r40, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r45, %r53, %r6;
+    and.b32 %r45, %r45, 255;
+
+    add.u32 %r54, %r7, 13;
+    shfl.sync.idx.b32 %r53, %r40, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r46, %r53, %r6;
+    and.b32 %r46, %r46, 255;
+
+    add.u32 %r54, %r7, 21;
+    shfl.sync.idx.b32 %r53, %r40, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r47, %r53, %r6;
+    and.b32 %r47, %r47, 255;
+
+    // ql_d: word 29+q -- round-1 (q<3) or round-2 (q>=3, lane q-3's Pa)
+    add.u32 %r54, %r7, 29;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r40, %r54, 0x1F, 0xFFFFFFFF;
+    shfl.sync.idx.b32 %r55, %r51, %r54, 0x1F, 0xFFFFFFFF;
+    setp.lt.u32 %p8, %r7, 3;
+    selp.b32 %r56, %r53, %r55, %p8;
+    shr.u32 %r48, %r56, %r6;
+    and.b32 %r48, %r48, 255;
+
+    // qh_0 (word 37+q, lane 5+q's Pa) / qh_1 (word 45+q, lane 13+q's Pa)
+    add.u32 %r54, %r7, 37;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r51, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r49, %r53, %r6;
+    and.b32 %r49, %r49, 255;
+
+    add.u32 %r54, %r7, 45;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r51, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r50, %r53, %r6;
+    and.b32 %r50, %r50, 255;
+
+    // Running x pointer for block A: x + (blkA*256 + lane)*4; += 128 per step.
+    mul.lo.u32 %r60, %r30, 256;
+    add.u32 %r60, %r60, %r4;
+    shl.b32 %r60, %r60, 2;
+    cvt.u64.u32 %rd7, %r60;
+    add.u64 %rd7, %rd1, %rd7;
+
+    // Step 0
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r41, %r8;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    and.b32 %r62, %r45, 15;
+    and.b32 %r63, %r49, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f1, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 1
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r41, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    and.b32 %r62, %r46, 15;
+    shr.u32 %r63, %r49, 2;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f1, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 2
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r42, %r8;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    shr.u32 %r62, %r45, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r49, 4;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f1, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 3
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r42, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    shr.u32 %r62, %r46, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r49, 6;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f1, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 4
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r43, %r8;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    and.b32 %r62, %r47, 15;
+    and.b32 %r63, %r50, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f1, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 5
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r43, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    and.b32 %r62, %r48, 15;
+    shr.u32 %r63, %r50, 2;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f1, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 6
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r44, %r8;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    shr.u32 %r62, %r47, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r50, 4;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f1, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 7
+    ld.global.nc.f32 %f4, [%rd7];
+    shr.u32 %r61, %r44, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    shr.u32 %r62, %r48, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r50, 6;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f1, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // -- Block B (skipped entirely when blkB >= k_blocks; uniform per warp) -----
+    @!%p10 bra SKIP_B;
+
+    shfl.sync.idx.b32 %r57, %r58, 0, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f9, %r57;                // dB
+
+    shfl.sync.idx.b32 %r41, %r58, 1, 0x1F, 0xFFFFFFFF;
+    shfl.sync.idx.b32 %r42, %r58, 2, 0x1F, 0xFFFFFFFF;
+    shfl.sync.idx.b32 %r43, %r58, 3, 0x1F, 0xFFFFFFFF;
+    shfl.sync.idx.b32 %r44, %r58, 4, 0x1F, 0xFFFFFFFF;
+
+    add.u32 %r54, %r7, 5;
+    shfl.sync.idx.b32 %r53, %r58, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r45, %r53, %r6;
+    and.b32 %r45, %r45, 255;
+
+    add.u32 %r54, %r7, 13;
+    shfl.sync.idx.b32 %r53, %r58, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r46, %r53, %r6;
+    and.b32 %r46, %r46, 255;
+
+    add.u32 %r54, %r7, 21;
+    shfl.sync.idx.b32 %r53, %r58, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r47, %r53, %r6;
+    and.b32 %r47, %r47, 255;
+
+    add.u32 %r54, %r7, 29;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r58, %r54, 0x1F, 0xFFFFFFFF;
+    shfl.sync.idx.b32 %r55, %r59, %r54, 0x1F, 0xFFFFFFFF;
+    selp.b32 %r56, %r53, %r55, %p8;
+    shr.u32 %r48, %r56, %r6;
+    and.b32 %r48, %r48, 255;
+
+    add.u32 %r54, %r7, 37;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r59, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r49, %r53, %r6;
+    and.b32 %r49, %r49, 255;
+
+    add.u32 %r54, %r7, 45;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r59, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r50, %r53, %r6;
+    and.b32 %r50, %r50, 255;
+
+    // Running x pointer for block B.
+    mul.lo.u32 %r60, %r31, 256;
+    add.u32 %r60, %r60, %r4;
+    shl.b32 %r60, %r60, 2;
+    cvt.u64.u32 %rd7, %r60;
+    add.u64 %rd7, %rd1, %rd7;
+
+    // Step 0
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r41, %r8;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    and.b32 %r62, %r45, 15;
+    and.b32 %r63, %r49, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f9, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 1
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r41, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    and.b32 %r62, %r46, 15;
+    shr.u32 %r63, %r49, 2;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f9, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 2
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r42, %r8;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    shr.u32 %r62, %r45, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r49, 4;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f9, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 3
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r42, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    shr.u32 %r62, %r46, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r49, 6;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f9, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 4
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r43, %r8;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    and.b32 %r62, %r47, 15;
+    and.b32 %r63, %r50, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f9, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 5
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r43, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    and.b32 %r62, %r48, 15;
+    shr.u32 %r63, %r50, 2;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f9, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 6
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    shr.u32 %r61, %r44, %r8;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    shr.u32 %r62, %r47, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r50, 4;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f9, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+    // Step 7
+    ld.global.nc.f32 %f4, [%rd7];
+    shr.u32 %r61, %r44, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f10;
+    shr.u32 %r62, %r48, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r50, 6;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f11;
+    mul.f32 %f5, %f9, %f2;
+    mul.f32 %f5, %f5, %f3;
+    fma.rn.f32 %f0, %f5, %f4, %f0;
+
+SKIP_B:
+    // -- Advance blkA by 16 (two blocks) and loop --------------------------------
+    add.u32 %r30, %r30, 16;
+    bra KLOOP_DB;
+
+    // -- Warp butterfly reduction (identical to kpar8) --------------------------
+REDUCE:
+    mov.b32 %r71, %f0;
+    shfl.sync.bfly.b32 %r72, %r71, 16, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f6, %r72; add.f32 %f0, %f0, %f6;
+
+    mov.b32 %r71, %f0;
+    shfl.sync.bfly.b32 %r72, %r71, 8, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f6, %r72; add.f32 %f0, %f0, %f6;
+
+    mov.b32 %r71, %f0;
+    shfl.sync.bfly.b32 %r72, %r71, 4, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f6, %r72; add.f32 %f0, %f0, %f6;
+
+    mov.b32 %r71, %f0;
+    shfl.sync.bfly.b32 %r72, %r71, 2, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f6, %r72; add.f32 %f0, %f0, %f6;
+
+    mov.b32 %r71, %f0;
+    shfl.sync.bfly.b32 %r72, %r71, 1, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f6, %r72; add.f32 %f0, %f0, %f6;
+
+    // Cross-warp handoff: st.shared + membar.cta + red.release counter bump /
+    // ld.acquire poll; thread 0 sums the 8 partials sequentially.
+    setp.eq.u32 %p4, %r4, 0;
+    mov.u32 %r73, smem_buf;
+    mul.lo.u32 %r74, %r5, 4;
+    add.u32 %r74, %r73, %r74;
+    @%p4 st.shared.f32 [%r74], %f0;
+    @%p4 membar.cta;
+    @%p4 red.release.cta.shared.add.u32 [%r99], 1;
+    setp.eq.u32 %p5, %r5, 0;
+    @!%p5 bra DONE;
+REDUCE_WAIT_DB:
+    ld.acquire.cta.shared.u32 %r78, [%r99];
+    setp.lt.u32 %p9, %r78, 8;
+    @%p9 bra REDUCE_WAIT_DB;
+    membar.cta;
+
+    setp.eq.u32 %p4, %r3, 0;
+    shl.b32 %r76, %r2, 2;
+    cvt.u64.u32 %rd8, %r76;
+    add.u64 %rd8, %rd0, %rd8;
+    mov.f32 %f7, 0f00000000;
+    mov.u32 %r77, smem_buf;
+    @%p4 ld.shared.f32 %f8, [%r77];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+4];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+8];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+12];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+16];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+20];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+24];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+28];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 st.global.f32 [%rd8], %f7;
+
+DONE:
+    ret;
+}
 "#;
 
 /// Kernel entry-point name -- used by `cuModuleGetFunction`.
 pub const ENTRY: &str = "q6k_gemv_sm120_kpar8";
+
+/// Dual-block direct-load variant entry (same module, second entry).
+pub const ENTRY_DB: &str = "q6k_gemv_sm120_kpar8_db";
 
 /// Minimum compute capability (sm_120 = Blackwell consumer).
 pub const MIN_CC: u32 = 1200;
