@@ -38,7 +38,7 @@
 //   ./target/release/mxf4-gemv
 
 use ctm_rs::mma::{Accumulator16x8, Mxf4A, Mxf4B, ScalePairA, ScalePairB, mma_mxf4};
-use ctm_rs::{cuda_module, kernel, thread};
+use ctm_rs::{cuda_module, float, kernel, thread};
 use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
 
@@ -56,6 +56,13 @@ const OUT_ELEMS: usize = 128;
 #[cuda_module]
 mod kernels {
     use super::*;
+
+    // silu(x) = x / (1 + exp(-x)), exp via the ex2 approximation.
+    fn silu_mul(x: f32, up: f32) -> f32 {
+        let e = float::ex2_approx_f32(x * -1.4426950408889634_f32);
+        x * (1.0_f32 / (1.0_f32 + e)) * up
+    }
+
 
     // One warp computes one m16n8k64 MXFP4 MMA tile (hello-world correctness test).
     //
@@ -769,6 +776,373 @@ mod kernels {
             }
         }
     }
+    // rb4m32 + SiLU epilogue (the UP projection): C = silu(gate) * up,
+    // where gate (the GATE projection's output, same [m, n] layout) is
+    // read in the store epilogue -- eliminates the separate silu_mul
+    // kernel's read of the up matrix (14.7MB per layer at m=128) and its
+    // kernel boundary. silu via ex2_approx (the same approx family the
+    // q4k fused-silu decode kernel uses) -- NOT bitwise-equal to the
+    // cutile silu_mul's exp (gated by bench-quality). Base tiling:
+    // m32 x n32 per warp (TWO m16 halves x FOUR n8 tiles). In addition
+    // to rb4's A-fragment sharing across n-tiles, the B fragments are
+    // shared across the two m-halves -- the B re-read traffic across
+    // m-tiles halves (m_tiles/2 instead of m_tiles), which is the binding
+    // limit for the large-n GEMMs after rb4: gate/up [128,14336,4096] re-
+    // reads the 29MB B matrix 8x = 235MB per GEMM, ~3.3 TB/s of L2 traffic
+    // at 106us. Grid: (ceil(n_tiles/16), m/32); block (128,1,1) = 4 warps;
+    // warp w computes n-tiles [bx*16 + w*4, +4) for m rows [by*32, +32).
+    // m must be a multiple of 32 (the dispatch gates on it). Bitwise-equal
+    // to mxf4_batch_gemm_tiled for the same inputs (same MMA, same k
+    // order; validated by test 4's random-data reference + the cross-kernel
+    // bit comparison).
+    #[kernel]
+    pub unsafe fn mxf4_batch_gemm_tiled_rb4m32_silu(
+        a_packed: *const u8,
+        a_scales: *const u8,
+        b_packed: *const u8,
+        b_scales: *const u8,
+        c_gate: *const f32,
+        c: *mut f32,
+        m: u32,
+        n: u32,
+        k64_tiles: u32,
+    ) {
+        let tid = thread::threadIdx_x();
+        let bid_x = thread::blockIdx_x();
+        let bid_y = thread::blockIdx_y();
+        let warp_id = tid / 32;
+        let lane = (tid % 32) as usize;
+
+        let n_tiles = n / 8;
+
+        let tile_m0 = bid_y * 2;
+        let tile_n0 = bid_x * 16 + warp_id * 4;
+        if tile_n0 >= n_tiles {
+            return;
+        }
+
+        let tn = [
+            tile_n0 as usize,
+            (tile_n0 + 1) as usize,
+            (tile_n0 + 2) as usize,
+            (tile_n0 + 3) as usize,
+        ];
+        let n_clamp = (n_tiles - 1) as usize;
+        let tnc = [
+            tn[0].min(n_clamp),
+            tn[1].min(n_clamp),
+            tn[2].min(n_clamp),
+            tn[3].min(n_clamp),
+        ];
+        let j_valid = [
+            tn[0] < n_tiles as usize,
+            tn[1] < n_tiles as usize,
+            tn[2] < n_tiles as usize,
+            tn[3] < n_tiles as usize,
+        ];
+
+        // 8 accumulators: [m-half][n-tile].
+        let mut a00 = Accumulator16x8::zero();
+        let mut a01 = Accumulator16x8::zero();
+        let mut a02 = Accumulator16x8::zero();
+        let mut a03 = Accumulator16x8::zero();
+        let mut a10 = Accumulator16x8::zero();
+        let mut a11 = Accumulator16x8::zero();
+        let mut a12 = Accumulator16x8::zero();
+        let mut a13 = Accumulator16x8::zero();
+
+        let a_ptr = a_packed as *const u32;
+        let a_row_u32 = (k64_tiles * 8) as usize;
+        let b_ptr = b_packed as *const u32;
+        let b_row_u32 = (k64_tiles * 8) as usize;
+
+        let mut k = 0u32;
+        while k < k64_tiles {
+            let k_u32_base = (k * 8) as usize;
+            let row0 = (tile_m0 * 16) as usize + lane / 4;
+            let row1 = row0 + 8;
+            let row2 = row0 + 16;
+            let row3 = row0 + 24;
+            let col_lo = lane % 4;
+            let col_hi = (lane % 4) + 4;
+
+            // A fragments for both m16 halves.
+            let a_reg_lo = [
+                unsafe { *a_ptr.add(row0 * a_row_u32 + k_u32_base + col_lo) },
+                unsafe { *a_ptr.add(row1 * a_row_u32 + k_u32_base + col_lo) },
+                unsafe { *a_ptr.add(row0 * a_row_u32 + k_u32_base + col_hi) },
+                unsafe { *a_ptr.add(row1 * a_row_u32 + k_u32_base + col_hi) },
+            ];
+            let a_frag_lo = Mxf4A::from_registers(a_reg_lo);
+            let a_reg_hi = [
+                unsafe { *a_ptr.add(row2 * a_row_u32 + k_u32_base + col_lo) },
+                unsafe { *a_ptr.add(row3 * a_row_u32 + k_u32_base + col_lo) },
+                unsafe { *a_ptr.add(row2 * a_row_u32 + k_u32_base + col_hi) },
+                unsafe { *a_ptr.add(row3 * a_row_u32 + k_u32_base + col_hi) },
+            ];
+            let a_frag_hi = Mxf4A::from_registers(a_reg_hi);
+
+            let bk_base = (k * 8) as usize;
+            let bk_lo = lane % 4;
+            let bk_hi = (lane % 4) + 4;
+            let bs_base = (k * 2) as usize;
+
+            // A scale pairs (one per m-half; shared across the 4 n-tiles).
+            let as_lo = (tile_m0 * k64_tiles * 2 + k * 2) as usize;
+            let as_hi = ((tile_m0 + 1) * k64_tiles * 2 + k * 2) as usize;
+            let sa_lo = unsafe { *a_scales.add(as_lo) };
+            let sa_hi = unsafe { *a_scales.add(as_lo + 1) };
+            let scale_a_lo =
+                ScalePairA::from_bits((sa_lo as u16) | ((sa_hi as u16) << 8));
+            let sb_lo = unsafe { *a_scales.add(as_hi) };
+            let sb_hi = unsafe { *a_scales.add(as_hi + 1) };
+            let scale_a_hi =
+                ScalePairA::from_bits((sb_lo as u16) | ((sb_hi as u16) << 8));
+
+            // Per-n-tile: B fragment + scale pair, shared by both m-halves.
+            let b_reg0 = [
+                unsafe { *b_ptr.add((tnc[0] * 8 + lane / 4) * b_row_u32 + bk_base + bk_lo) },
+                unsafe { *b_ptr.add((tnc[0] * 8 + lane / 4) * b_row_u32 + bk_base + bk_hi) },
+            ];
+            let b_frag0 = Mxf4B::from_registers(b_reg0);
+            let b0_lo = unsafe { *b_scales.add(tnc[0] * k64_tiles as usize * 2 + bs_base) };
+            let b0_hi = unsafe { *b_scales.add(tnc[0] * k64_tiles as usize * 2 + bs_base + 1) };
+            let scale_b0 = ScalePairB::from_bits((b0_lo as u16) | ((b0_hi as u16) << 8));
+            a00 = unsafe { mma_mxf4(a00, a_frag_lo, b_frag0, scale_a_lo, scale_b0) };
+            a10 = unsafe { mma_mxf4(a10, a_frag_hi, b_frag0, scale_a_hi, scale_b0) };
+
+            let b_reg1 = [
+                unsafe { *b_ptr.add((tnc[1] * 8 + lane / 4) * b_row_u32 + bk_base + bk_lo) },
+                unsafe { *b_ptr.add((tnc[1] * 8 + lane / 4) * b_row_u32 + bk_base + bk_hi) },
+            ];
+            let b_frag1 = Mxf4B::from_registers(b_reg1);
+            let b1_lo = unsafe { *b_scales.add(tnc[1] * k64_tiles as usize * 2 + bs_base) };
+            let b1_hi = unsafe { *b_scales.add(tnc[1] * k64_tiles as usize * 2 + bs_base + 1) };
+            let scale_b1 = ScalePairB::from_bits((b1_lo as u16) | ((b1_hi as u16) << 8));
+            a01 = unsafe { mma_mxf4(a01, a_frag_lo, b_frag1, scale_a_lo, scale_b1) };
+            a11 = unsafe { mma_mxf4(a11, a_frag_hi, b_frag1, scale_a_hi, scale_b1) };
+
+            let b_reg2 = [
+                unsafe { *b_ptr.add((tnc[2] * 8 + lane / 4) * b_row_u32 + bk_base + bk_lo) },
+                unsafe { *b_ptr.add((tnc[2] * 8 + lane / 4) * b_row_u32 + bk_base + bk_hi) },
+            ];
+            let b_frag2 = Mxf4B::from_registers(b_reg2);
+            let b2_lo = unsafe { *b_scales.add(tnc[2] * k64_tiles as usize * 2 + bs_base) };
+            let b2_hi = unsafe { *b_scales.add(tnc[2] * k64_tiles as usize * 2 + bs_base + 1) };
+            let scale_b2 = ScalePairB::from_bits((b2_lo as u16) | ((b2_hi as u16) << 8));
+            a02 = unsafe { mma_mxf4(a02, a_frag_lo, b_frag2, scale_a_lo, scale_b2) };
+            a12 = unsafe { mma_mxf4(a12, a_frag_hi, b_frag2, scale_a_hi, scale_b2) };
+
+            let b_reg3 = [
+                unsafe { *b_ptr.add((tnc[3] * 8 + lane / 4) * b_row_u32 + bk_base + bk_lo) },
+                unsafe { *b_ptr.add((tnc[3] * 8 + lane / 4) * b_row_u32 + bk_base + bk_hi) },
+            ];
+            let b_frag3 = Mxf4B::from_registers(b_reg3);
+            let b3_lo = unsafe { *b_scales.add(tnc[3] * k64_tiles as usize * 2 + bs_base) };
+            let b3_hi = unsafe { *b_scales.add(tnc[3] * k64_tiles as usize * 2 + bs_base + 1) };
+            let scale_b3 = ScalePairB::from_bits((b3_lo as u16) | ((b3_hi as u16) << 8));
+            a03 = unsafe { mma_mxf4(a03, a_frag_lo, b_frag3, scale_a_lo, scale_b3) };
+            a13 = unsafe { mma_mxf4(a13, a_frag_hi, b_frag3, scale_a_hi, scale_b3) };
+
+            k += 1;
+        }
+
+        // Stores: canonical m16n8 accumulator mapping, 8 tiles.
+        let c_row_base = (tile_m0 * 16) as usize;
+        let n_usize = n as usize;
+        let r0 = a00.registers();
+        let r1 = a01.registers();
+        let r2 = a02.registers();
+        let r3 = a03.registers();
+        let r4 = a10.registers();
+        let r5 = a11.registers();
+        let r6 = a12.registers();
+        let r7 = a13.registers();
+        for j in 0..4usize {
+            let sub = 2 * (lane % 4) + (j & 1);
+            let row_lo = c_row_base + lane / 4 + 8 * (j >> 1);
+            let row_hi = row_lo + 16;
+            if j_valid[0] {
+                unsafe { *c.add(row_lo * n_usize + tn[0] * 8 + sub) = silu_mul(unsafe { *c_gate.add(row_lo * n_usize + tn[0] * 8 + sub) }, r0[j]); }
+                unsafe { *c.add(row_hi * n_usize + tn[0] * 8 + sub) = silu_mul(unsafe { *c_gate.add(row_hi * n_usize + tn[0] * 8 + sub) }, r4[j]); }
+            }
+            if j_valid[1] {
+                unsafe { *c.add(row_lo * n_usize + tn[1] * 8 + sub) = silu_mul(unsafe { *c_gate.add(row_lo * n_usize + tn[1] * 8 + sub) }, r1[j]); }
+                unsafe { *c.add(row_hi * n_usize + tn[1] * 8 + sub) = silu_mul(unsafe { *c_gate.add(row_hi * n_usize + tn[1] * 8 + sub) }, r5[j]); }
+            }
+            if j_valid[2] {
+                unsafe { *c.add(row_lo * n_usize + tn[2] * 8 + sub) = silu_mul(unsafe { *c_gate.add(row_lo * n_usize + tn[2] * 8 + sub) }, r2[j]); }
+                unsafe { *c.add(row_hi * n_usize + tn[2] * 8 + sub) = silu_mul(unsafe { *c_gate.add(row_hi * n_usize + tn[2] * 8 + sub) }, r6[j]); }
+            }
+            if j_valid[3] {
+                unsafe { *c.add(row_lo * n_usize + tn[3] * 8 + sub) = silu_mul(unsafe { *c_gate.add(row_lo * n_usize + tn[3] * 8 + sub) }, r3[j]); }
+                unsafe { *c.add(row_hi * n_usize + tn[3] * 8 + sub) = silu_mul(unsafe { *c_gate.add(row_hi * n_usize + tn[3] * 8 + sub) }, r7[j]); }
+            }
+        }
+    }
+
+
+    // rb2m32 + residual-add epilogue (the DOWN projection): C = acc + res,
+    // where res (the residual hidden state, same [m, n] layout and row
+    // stride) is read in the store epilogue -- eliminates the separate
+    // vector_add kernel and its re-read of the down output. Requires
+    // m == m_pad (res only covers the valid rows) and h_pad == n.
+    // Base tiling: m32 x n16 per warp.
+    // (TWO m16 halves x TWO n8 tiles = 4 MMAs per k64 step). Finer grid
+    // than rb4m32 (2x the warps) for the small-n/long-k shapes whose
+    // rb4m32 grid underfills the SMs and cannot hide DRAM latency:
+    // down_proj [128,4096,14336] ran 162.7us in-pipeline vs 114 isolated
+    // (nsys, 2026-10-29) at 512 warps = 3/SM.
+    // Grid: (ceil(n_tiles/8), m/32); block (128,1,1) = 4 warps; warp w
+    // computes n-tiles [bx*8 + w*2, +2) for m rows [by*32, +32). m must be
+    // a multiple of 32. Bitwise-equal to mxf4_batch_gemm_tiled (same MMA,
+    // same k-order; validated by the random-data reference + cross-kernel
+    // bit comparison).
+    #[kernel]
+    pub unsafe fn mxf4_batch_gemm_tiled_rb2m32_add(
+        a_packed: *const u8,
+        a_scales: *const u8,
+        b_packed: *const u8,
+        b_scales: *const u8,
+        c_res: *const f32,
+        c: *mut f32,
+        m: u32,
+        n: u32,
+        k64_tiles: u32,
+    ) {
+        let tid = thread::threadIdx_x();
+        let bid_x = thread::blockIdx_x();
+        let bid_y = thread::blockIdx_y();
+        let warp_id = tid / 32;
+        let lane = (tid % 32) as usize;
+
+        let n_tiles = n / 8;
+
+        let tile_m0 = bid_y * 2;
+        let tile_n0 = bid_x * 8 + warp_id * 2;
+        if tile_n0 >= n_tiles {
+            return;
+        }
+
+        let tn = [
+            tile_n0 as usize,
+            (tile_n0 + 1) as usize,
+        ];
+        let n_clamp = (n_tiles - 1) as usize;
+        let tnc = [
+            tn[0].min(n_clamp),
+            tn[1].min(n_clamp),
+        ];
+        let j_valid = [
+            tn[0] < n_tiles as usize,
+            tn[1] < n_tiles as usize,
+        ];
+
+        // 8 accumulators: [m-half][n-tile].
+        let mut a00 = Accumulator16x8::zero();
+        let mut a01 = Accumulator16x8::zero();
+
+        let mut a10 = Accumulator16x8::zero();
+        let mut a11 = Accumulator16x8::zero();
+
+
+        let a_ptr = a_packed as *const u32;
+        let a_row_u32 = (k64_tiles * 8) as usize;
+        let b_ptr = b_packed as *const u32;
+        let b_row_u32 = (k64_tiles * 8) as usize;
+
+        let mut k = 0u32;
+        while k < k64_tiles {
+            let k_u32_base = (k * 8) as usize;
+            let row0 = (tile_m0 * 16) as usize + lane / 4;
+            let row1 = row0 + 8;
+            let row2 = row0 + 16;
+            let row3 = row0 + 24;
+            let col_lo = lane % 4;
+            let col_hi = (lane % 4) + 4;
+
+            // A fragments for both m16 halves.
+            let a_reg_lo = [
+                unsafe { *a_ptr.add(row0 * a_row_u32 + k_u32_base + col_lo) },
+                unsafe { *a_ptr.add(row1 * a_row_u32 + k_u32_base + col_lo) },
+                unsafe { *a_ptr.add(row0 * a_row_u32 + k_u32_base + col_hi) },
+                unsafe { *a_ptr.add(row1 * a_row_u32 + k_u32_base + col_hi) },
+            ];
+            let a_frag_lo = Mxf4A::from_registers(a_reg_lo);
+            let a_reg_hi = [
+                unsafe { *a_ptr.add(row2 * a_row_u32 + k_u32_base + col_lo) },
+                unsafe { *a_ptr.add(row3 * a_row_u32 + k_u32_base + col_lo) },
+                unsafe { *a_ptr.add(row2 * a_row_u32 + k_u32_base + col_hi) },
+                unsafe { *a_ptr.add(row3 * a_row_u32 + k_u32_base + col_hi) },
+            ];
+            let a_frag_hi = Mxf4A::from_registers(a_reg_hi);
+
+            let bk_base = (k * 8) as usize;
+            let bk_lo = lane % 4;
+            let bk_hi = (lane % 4) + 4;
+            let bs_base = (k * 2) as usize;
+
+            // A scale pairs (one per m-half; shared across the 4 n-tiles).
+            let as_lo = (tile_m0 * k64_tiles * 2 + k * 2) as usize;
+            let as_hi = ((tile_m0 + 1) * k64_tiles * 2 + k * 2) as usize;
+            let sa_lo = unsafe { *a_scales.add(as_lo) };
+            let sa_hi = unsafe { *a_scales.add(as_lo + 1) };
+            let scale_a_lo =
+                ScalePairA::from_bits((sa_lo as u16) | ((sa_hi as u16) << 8));
+            let sb_lo = unsafe { *a_scales.add(as_hi) };
+            let sb_hi = unsafe { *a_scales.add(as_hi + 1) };
+            let scale_a_hi =
+                ScalePairA::from_bits((sb_lo as u16) | ((sb_hi as u16) << 8));
+
+            // Per-n-tile: B fragment + scale pair, shared by both m-halves.
+            let b_reg0 = [
+                unsafe { *b_ptr.add((tnc[0] * 8 + lane / 4) * b_row_u32 + bk_base + bk_lo) },
+                unsafe { *b_ptr.add((tnc[0] * 8 + lane / 4) * b_row_u32 + bk_base + bk_hi) },
+            ];
+            let b_frag0 = Mxf4B::from_registers(b_reg0);
+            let b0_lo = unsafe { *b_scales.add(tnc[0] * k64_tiles as usize * 2 + bs_base) };
+            let b0_hi = unsafe { *b_scales.add(tnc[0] * k64_tiles as usize * 2 + bs_base + 1) };
+            let scale_b0 = ScalePairB::from_bits((b0_lo as u16) | ((b0_hi as u16) << 8));
+            a00 = unsafe { mma_mxf4(a00, a_frag_lo, b_frag0, scale_a_lo, scale_b0) };
+            a10 = unsafe { mma_mxf4(a10, a_frag_hi, b_frag0, scale_a_hi, scale_b0) };
+
+            let b_reg1 = [
+                unsafe { *b_ptr.add((tnc[1] * 8 + lane / 4) * b_row_u32 + bk_base + bk_lo) },
+                unsafe { *b_ptr.add((tnc[1] * 8 + lane / 4) * b_row_u32 + bk_base + bk_hi) },
+            ];
+            let b_frag1 = Mxf4B::from_registers(b_reg1);
+            let b1_lo = unsafe { *b_scales.add(tnc[1] * k64_tiles as usize * 2 + bs_base) };
+            let b1_hi = unsafe { *b_scales.add(tnc[1] * k64_tiles as usize * 2 + bs_base + 1) };
+            let scale_b1 = ScalePairB::from_bits((b1_lo as u16) | ((b1_hi as u16) << 8));
+            a01 = unsafe { mma_mxf4(a01, a_frag_lo, b_frag1, scale_a_lo, scale_b1) };
+            a11 = unsafe { mma_mxf4(a11, a_frag_hi, b_frag1, scale_a_hi, scale_b1) };
+
+            k += 1;
+        }
+
+        // Stores: canonical m16n8 accumulator mapping, 4 tiles.
+        let c_row_base = (tile_m0 * 16) as usize;
+        let n_usize = n as usize;
+        let r0 = a00.registers();
+        let r1 = a01.registers();
+
+        let r4 = a10.registers();
+        let r5 = a11.registers();
+
+        for j in 0..4usize {
+            let sub = 2 * (lane % 4) + (j & 1);
+            let row_lo = c_row_base + lane / 4 + 8 * (j >> 1);
+            let row_hi = row_lo + 16;
+            if j_valid[0] {
+                unsafe { *c.add(row_lo * n_usize + tn[0] * 8 + sub) = r0[j] + unsafe { *c_res.add(row_lo * n_usize + tn[0] * 8 + sub) }; }
+                unsafe { *c.add(row_hi * n_usize + tn[0] * 8 + sub) = r4[j] + unsafe { *c_res.add(row_hi * n_usize + tn[0] * 8 + sub) }; }
+            }
+            if j_valid[1] {
+                unsafe { *c.add(row_lo * n_usize + tn[1] * 8 + sub) = r1[j] + unsafe { *c_res.add(row_lo * n_usize + tn[1] * 8 + sub) }; }
+                unsafe { *c.add(row_hi * n_usize + tn[1] * 8 + sub) = r5[j] + unsafe { *c_res.add(row_hi * n_usize + tn[1] * 8 + sub) }; }
+            }
+        }
+    }
 }
 
 // Pack a uniform E2M1 nibble value into an 8-nibble u32.
@@ -1211,6 +1585,98 @@ fn main() {
                 (0, 0, 0)
             };
 
+            // Epilogue variants (m % 32 == 0): silu (C = silu(gate) * up) and
+            // residual-add (C = up + res). Host references use f64 libm exp;
+            // the kernel's ex2 approx differs by ~1ulp on the sigmoid, so the
+            // tolerance is relative 1e-3 (same as the GEMM reference).
+            let (ep_silu_bad, ep_add_bad) = if m % 32 == 0 {
+                let c_size_us = c_size;
+                let gate_f32: Vec<f32> = (0..c_size_us)
+                    .map(|i| ((rnd() % 2000) as f32) / 1000.0 - 1.0)
+                    .collect();
+                let res_f32: Vec<f32> = (0..c_size_us)
+                    .map(|i| ((rnd() % 2000) as f32) / 1000.0 - 1.0)
+                    .collect();
+                let gate_dev = DeviceBuffer::from_host(&stream, &gate_f32).expect("alloc gate");
+                let res_dev = DeviceBuffer::from_host(&stream, &res_f32).expect("alloc res");
+
+                let launch_ep = |silu: bool, c_dev: &DeviceBuffer<f32>, aux: &DeviceBuffer<f32>| {
+                    let config = LaunchConfig {
+                        grid_dim: (
+                            if silu { (n / 8).div_ceil(16) } else { (n / 8).div_ceil(8) },
+                            m / 32,
+                            1,
+                        ),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    if silu {
+                        unsafe {
+                            module
+                                .mxf4_batch_gemm_tiled_rb4m32_silu(
+                                    &stream, config,
+                                    a_dev.cu_deviceptr() as *const u8,
+                                    a_sc_dev.cu_deviceptr() as *const u8,
+                                    b_dev.cu_deviceptr() as *const u8,
+                                    b_sc_dev.cu_deviceptr() as *const u8,
+                                    aux.cu_deviceptr() as *const f32,
+                                    c_dev.cu_deviceptr() as *mut f32,
+                                    m, n, k64_tiles,
+                                )
+                                .expect("rb4m32_silu launch")
+                        }
+                    } else {
+                        unsafe {
+                            module
+                                .mxf4_batch_gemm_tiled_rb2m32_add(
+                                    &stream, config,
+                                    a_dev.cu_deviceptr() as *const u8,
+                                    a_sc_dev.cu_deviceptr() as *const u8,
+                                    b_dev.cu_deviceptr() as *const u8,
+                                    b_sc_dev.cu_deviceptr() as *const u8,
+                                    aux.cu_deviceptr() as *const f32,
+                                    c_dev.cu_deviceptr() as *mut f32,
+                                    m, n, k64_tiles,
+                                )
+                                .expect("rb2m32_add launch")
+                        }
+                    }
+                };
+
+                let c_s = DeviceBuffer::from_host(&stream, &vec![f32::NAN; c_size_us])
+                    .expect("alloc C_silu");
+                launch_ep(true, &c_s, &gate_dev);
+                let c_a = DeviceBuffer::from_host(&stream, &vec![f32::NAN; c_size_us])
+                    .expect("alloc C_add");
+                launch_ep(false, &c_a, &res_dev);
+                stream.synchronize().expect("sync ep");
+                let rs = c_s.to_host_vec(&stream).expect("copy C_silu");
+                let ra = c_a.to_host_vec(&stream).expect("copy C_add");
+
+                let silu_ref = |x: f32| -> f64 {
+                    let xd = x as f64;
+                    xd / (1.0 + (-xd).exp())
+                };
+                let sb = rs
+                    .iter()
+                    .zip(&reference)
+                    .zip(&gate_f32)
+                    .filter(|((got, want), g)| {
+                        let expect = silu_ref(**g) * (**want as f64);
+                        !(**got).is_nan() && ((**got) as f64 - expect).abs() > 1e-3 * expect.abs().max(1.0)
+                    })
+                    .count();
+                let ab = ra
+                    .iter()
+                    .zip(&reference)
+                    .zip(&res_f32)
+                    .filter(|((got, want), r)| (**got) != (**want) + (**r))
+                    .count();
+                (sb, ab)
+            } else {
+                (0, 0)
+            };
+
             let nan = r1.iter().filter(|v| v.is_nan()).count();
             let over = r1
                 .iter()
@@ -1232,11 +1698,13 @@ fn main() {
                  det_first_diff={det_diff:?} rb4[nan={rb_nan} ref_over_tol={rb_over} \
                  xdiff_vs_m16n8={rb_xdiff}] rb4m32[nan={m32_nan} ref_over_tol={m32_over} \
                  xdiff_vs_m16n8={m32_xdiff}] rb2m32[nan={r2m32_nan} ref_over_tol={r2m32_over} \
-                 xdiff_vs_m16n8={r2m32_xdiff}] {}",
+                 xdiff_vs_m16n8={r2m32_xdiff}] epilogues[silu_bad={ep_silu_bad} \
+                 add_bad={ep_add_bad}] {}",
                 (n / 8).div_ceil(4) * (m / 16),
                 if nan == 0 && over == 0 && det_diff.is_none() && rb_nan == 0 && rb_over == 0
                     && rb_xdiff == 0 && m32_nan == 0 && m32_over == 0 && m32_xdiff == 0
                     && r2m32_nan == 0 && r2m32_over == 0 && r2m32_xdiff == 0
+                    && ep_silu_bad == 0 && ep_add_bad == 0
                 { "PASS" } else { "FAIL" }
             );
         }

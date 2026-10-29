@@ -30,6 +30,8 @@ const KERNEL_NAME: &str = "mxf4_batch_gemm_tiled";
 const KERNEL_NAME_RB4: &str = "mxf4_batch_gemm_tiled_rb4";
 const KERNEL_NAME_RB4M32: &str = "mxf4_batch_gemm_tiled_rb4m32";
 const KERNEL_NAME_RB2M32: &str = "mxf4_batch_gemm_tiled_rb2m32";
+const KERNEL_NAME_RB4M32_SILU: &str = "mxf4_batch_gemm_tiled_rb4m32_silu";
+const KERNEL_NAME_RB2M32_ADD: &str = "mxf4_batch_gemm_tiled_rb2m32_add";
 
 /// Minimum rb4 grid size (blocks) for the register-blocked kernel to beat
 /// the m16n8 kernel: rb4 quarters the block count (each warp covers 4 n8
@@ -76,6 +78,12 @@ pub struct MxfpGemm {
     /// m % 32 == 0, the rb4m32 grid is too small, and its own grid >=
     /// RB2M32_MIN_BLOCKS. None when the cubin predates it.
     cu_function_rb2m32: Option<sys::CUfunction>,
+    /// rb4m32 + SiLU epilogue (the UP projection): C = silu(gate) * up.
+    /// NOT bit-identical to the separate silu_mul kernel (ex2 approx exp).
+    cu_function_rb4m32_silu: Option<sys::CUfunction>,
+    /// rb2m32 + residual-add epilogue (the DOWN projection): C = acc + res.
+    /// Bit-identical to GEMM + vector_add (same elementwise sum).
+    cu_function_rb2m32_add: Option<sys::CUfunction>,
     /// GPU activation quantization: f32 -> E2M1+UE8M0 tiled. None if unsupported.
     cu_quant_mod:  Option<sys::CUmodule>,
     cu_quant_fn:   Option<sys::CUfunction>,
@@ -130,6 +138,8 @@ impl MxfpGemm {
         let cu_function_rb4 = load_entry(KERNEL_NAME_RB4);
         let cu_function_rb4m32 = load_entry(KERNEL_NAME_RB4M32);
         let cu_function_rb2m32 = load_entry(KERNEL_NAME_RB2M32);
+        let cu_function_rb4m32_silu = load_entry(KERNEL_NAME_RB4M32_SILU);
+        let cu_function_rb2m32_add = load_entry(KERNEL_NAME_RB2M32_ADD);
 
         let mut sm_count = 0i32;
         unsafe {
@@ -173,7 +183,135 @@ impl MxfpGemm {
             "[mxfp4] MxfpGemm loaded: {KERNEL_NAME} ({} bytes cubin, sm_count={sm_count})",
             MXFP4_CUBIN.len()
         );
-        Some(Self { cu_module: module, cu_function: func, cu_function_rb4, cu_function_rb4m32, cu_function_rb2m32, cu_quant_mod, cu_quant_fn, sm_count, stream })
+        Some(Self { cu_module: module, cu_function: func, cu_function_rb4, cu_function_rb4m32, cu_function_rb2m32, cu_function_rb4m32_silu, cu_function_rb2m32_add, cu_quant_mod, cu_quant_fn, sm_count, stream })
+    }
+
+    /// rb4m32-tier eligibility (used by forward_silu and the engine's
+    /// pre-check so a fused path can fall back wholesale before quantizing).
+    pub fn silu_eligible(&self, m: u32, n: u32) -> bool {
+        self.cu_function_rb4m32_silu.is_some()
+            && m % 32 == 0
+            && (n / 8).div_ceil(16) * (m / 32) >= RB4M32_MIN_BLOCKS
+    }
+
+    /// rb2m32-tier eligibility (used by forward_add and the engine's
+    /// pre-check). The caller must additionally guarantee m == m_pad and
+    /// matching row strides.
+    pub fn add_eligible(&self, m: u32, n: u32) -> bool {
+        self.cu_function_rb2m32_add.is_some()
+            && m % 32 == 0
+            && (n / 8).div_ceil(8) * (m / 32) >= RB2M32_MIN_BLOCKS
+    }
+
+    /// rb4m32 + SiLU epilogue: C = silu(c_gate) * up. Eligibility mirrors
+    /// the rb4m32 tier (m % 32 == 0, grid >= RB4M32_MIN_BLOCKS); returns
+    /// `None` when ineligible or the cubin predates the variant -- the
+    /// caller then uses the plain GEMM + a separate silu_mul kernel.
+    /// NOT bit-identical to that path (ex2 approx exp vs cutile's exp).
+    pub fn forward_silu(
+        &self,
+        a_packed:  &Arc<Tensor<u8>>,
+        a_scales:  &Arc<Tensor<u8>>,
+        b_packed:  &Arc<Tensor<u8>>,
+        b_scales:  &Arc<Tensor<u8>>,
+        c_gate:    &Arc<Tensor<f32>>,
+        c:         &Arc<Tensor<f32>>,
+        m:         u32,
+        n:         u32,
+        k64_tiles: u32,
+    ) -> Option<Result<()>> {
+        let func = self.cu_function_rb4m32_silu?;
+        if !self.silu_eligible(m, n) {
+            return None;
+        }
+        let grid_x = (n / 8).div_ceil(16);
+        self.launch_epilogue(
+            func, grid_x, m / 32, KERNEL_NAME_RB4M32_SILU,
+            a_packed, a_scales, b_packed, b_scales, c_gate, c, m, n, k64_tiles,
+        );
+        Some(Ok(()))
+    }
+
+    /// rb2m32 + residual-add epilogue: C = acc + c_res. Eligibility mirrors
+    /// the rb2m32 tier; additionally the caller must guarantee m == m_pad
+    /// (c_res only covers the valid rows) and matching row strides.
+    /// Bit-identical to the plain GEMM followed by vector_add.
+    pub fn forward_add(
+        &self,
+        a_packed:  &Arc<Tensor<u8>>,
+        a_scales:  &Arc<Tensor<u8>>,
+        b_packed:  &Arc<Tensor<u8>>,
+        b_scales:  &Arc<Tensor<u8>>,
+        c_res:     &Arc<Tensor<f32>>,
+        c:         &Arc<Tensor<f32>>,
+        m:         u32,
+        n:         u32,
+        k64_tiles: u32,
+    ) -> Option<Result<()>> {
+        let func = self.cu_function_rb2m32_add?;
+        if !self.add_eligible(m, n) {
+            return None;
+        }
+        let grid_x = (n / 8).div_ceil(8);
+        self.launch_epilogue(
+            func, grid_x, m / 32, KERNEL_NAME_RB2M32_ADD,
+            a_packed, a_scales, b_packed, b_scales, c_res, c, m, n, k64_tiles,
+        );
+        Some(Ok(()))
+    }
+
+    /// Shared 9-parameter launch for the epilogue variants.
+    fn launch_epilogue(
+        &self,
+        func:      sys::CUfunction,
+        grid_x:    u32,
+        grid_y:    u32,
+        name:      &str,
+        a_packed:  &Arc<Tensor<u8>>,
+        a_scales:  &Arc<Tensor<u8>>,
+        b_packed:  &Arc<Tensor<u8>>,
+        b_scales:  &Arc<Tensor<u8>>,
+        c_aux:     &Arc<Tensor<f32>>,
+        c:         &Arc<Tensor<f32>>,
+        m:         u32,
+        n:         u32,
+        k64_tiles: u32,
+    ) {
+        let cu_stream = self.stream.cu_stream();
+        let mut p_ap = a_packed.device_pointer().cu_deviceptr() as u64;
+        let mut p_as = a_scales.device_pointer().cu_deviceptr() as u64;
+        let mut p_bp = b_packed.device_pointer().cu_deviceptr() as u64;
+        let mut p_bs = b_scales.device_pointer().cu_deviceptr() as u64;
+        let mut p_aux = c_aux.device_pointer().cu_deviceptr() as u64;
+        let mut p_c = c.device_pointer().cu_deviceptr() as u64;
+        let mut pm = m;
+        let mut pn = n;
+        let mut pk = k64_tiles;
+        let mut params: [*mut std::ffi::c_void; 9] = [
+            &mut p_ap as *mut _ as *mut std::ffi::c_void,
+            &mut p_as as *mut _ as *mut std::ffi::c_void,
+            &mut p_bp as *mut _ as *mut std::ffi::c_void,
+            &mut p_bs as *mut _ as *mut std::ffi::c_void,
+            &mut p_aux as *mut _ as *mut std::ffi::c_void,
+            &mut p_c as *mut _ as *mut std::ffi::c_void,
+            &mut pm as *mut _ as *mut std::ffi::c_void,
+            &mut pn as *mut _ as *mut std::ffi::c_void,
+            &mut pk as *mut _ as *mut std::ffi::c_void,
+        ];
+        let rc = unsafe {
+            sys::cuLaunchKernel(
+                func,
+                grid_x, grid_y, 1,
+                128, 1, 1,
+                0,
+                cu_stream,
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            panic!("{name} cuLaunchKernel failed: {rc}");
+        }
     }
 
     /// Row-offset chunk variant of [`MxfpGemm::forward`].
