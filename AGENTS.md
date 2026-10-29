@@ -511,8 +511,8 @@ typical-p/repeat/presence/frequency)
       NOTE: this GGUF (bartowski Llama-3.1-8B Q4_K_M) has a mixed layout
       -- 16 layers with Q6K v+down_proj, 16 with Q4K -- verified from the
       GGUF tensor-type census (193 Q4K + 33 Q6K) and the trace.
-- [x] **Prefill on GPU: 7562 tok/s pp128, TTFT P50 16.9 ms -- BEATING
-      llama.cpp (ref 7335, 1.03x in our favor; 2026-10-29).**
+- [x] **Prefill on GPU: 7700 tok/s pp128, TTFT P50 16.5 ms -- BEATING
+      llama.cpp (ref 7335, 1.05x in our favor; 2026-10-29).**
       Lever-by-lever history
       below (nsys-
       driven: on-device attention + scratch RoPE + pooled norms/adds/SiLU +
@@ -675,6 +675,18 @@ typical-p/repeat/presence/frequency)
       Decode 210 -> 217 tok/s (graph 930 -> ~800 nodes, launch + dispatch
       overhead drops); prefill 7473 -> 7562 tok/s. Logits fingerprint
       bitwise-identical, bench-quality PASS 89.1%.
+      (n) Prefill CUDA graph (2026-10-29): the prefill chunk's layer loop
+      (~800 kernel launches, ~0.6ms of host dispatch per chunk) is
+      captured into a CUDA graph on the SECOND call with the same
+      (seq_len, positions) key and replayed on subsequent calls. The
+      first call runs eagerly (all scratch buffers get allocated/grown);
+      the second captures; the third+ replays. The final norm + lm_head
+      stay OUTSIDE the graph (their D2H download is not capture-safe).
+      Requires seq_len % 16 == 0 (m_pad == m: no trim alloc during
+      capture); TEMPURA_NO_PREFILL_GRAPH=1 bisects to eager. The
+      last-row buffer (final norm input) is pre-allocated with a stable
+      address. 7562 -> 7700 tok/s, TTFT 16.9 -> 16.5 ms. Logits
+      fingerprint bitwise-identical, det=OK, bench-quality PASS 89.1%.
       Verified 2026-10-28: bench-decode-ops "prefill attn dev" 8/8, "rope
       prefill scratch" 4/4 and "rmsnorm prefill scratch" (grow/reuse/
       shrink/odd-seq) 4/4 all
@@ -941,8 +953,8 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       210 tok/s; 2026-10-29 the fused RMSNorm (3 kernels -> 1, 195 -> 65
       graph nodes): **217 tok/s -- BEATING llama.cpp (ref 209)**, ITL
       4.61 ms, teacher-forced PASS 89.1%)
-- Llama-3.1-8B Q4K prefill: **7562 tok/s pp128**, TTFT P50 16.9 ms
-      (BEATING llama.cpp 7335 by 1.03x; logits det=OK, NaN-free; A/B numerics vs
+- Llama-3.1-8B Q4K prefill: **7700 tok/s pp128**, TTFT P50 16.5 ms
+      (BEATING llama.cpp 7335 by 1.05x; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1331 -- the MXFP4 band including the
       Q6K->MXFP4 down_proj double-quantization (lossier than the Q4K path's
       0.1015; bench-quality teacher-forced PASS 89.1%, all mismatches
