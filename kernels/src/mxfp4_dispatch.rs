@@ -28,6 +28,7 @@ static MXFP4_CUBIN: &[u8] = include_bytes!("../../tools/mxf4-gemv/mxf4_gemv.cubi
 
 const KERNEL_NAME: &str = "mxf4_batch_gemm_tiled";
 const KERNEL_NAME_RB4: &str = "mxf4_batch_gemm_tiled_rb4";
+const KERNEL_NAME_RB4M32: &str = "mxf4_batch_gemm_tiled_rb4m32";
 
 /// Minimum rb4 grid size (blocks) for the register-blocked kernel to beat
 /// the m16n8 kernel: rb4 quarters the block count (each warp covers 4 n8
@@ -37,6 +38,13 @@ const KERNEL_NAME_RB4: &str = "mxf4_batch_gemm_tiled_rb4";
 /// blocks) vs (128,4096,4096) 35.8 vs 38.8 us (256 blocks) and
 /// (128,1024,4096) 11.7 vs 37.0 us (64 blocks).
 const RB4_MIN_BLOCKS: u32 = 512;
+
+/// Minimum rb4m32 grid size. The m32 variant also halves the B re-read
+/// traffic across m-tiles (the binding limit for large-n GEMMs after rb4):
+/// (128,14336,4096) 123.3 -> 57.8 us (259.9 TFLOPS, 448 blocks) and
+/// (128,4096,14336) 127.4 -> 114.4 us (131.5 TFLOPS, 128 blocks) vs
+/// (128,1024,4096) 11.7 vs 34.5 us (32 blocks).
+const RB4M32_MIN_BLOCKS: u32 = 128;
 
 /// Host-side dispatch for the cute-rs sm_120a MXFP4 tiled batch GEMM and the
 /// sm_120 GPU activation quantization kernel.
@@ -50,6 +58,11 @@ pub struct MxfpGemm {
     /// fragment): bit-identical output, preferred on large-n grids.
     /// None when the cubin predates it.
     cu_function_rb4: Option<sys::CUfunction>,
+    /// m32 register-blocked variant (m32n32 per warp, 8 MMAs; B fragments
+    /// shared across the two m16 halves, halving the B re-read traffic):
+    /// bit-identical output, preferred when m % 32 == 0 on grids >=
+    /// RB4M32_MIN_BLOCKS. None when the cubin predates it.
+    cu_function_rb4m32: Option<sys::CUfunction>,
     /// GPU activation quantization: f32 -> E2M1+UE8M0 tiled. None if unsupported.
     cu_quant_mod:  Option<sys::CUmodule>,
     cu_quant_fn:   Option<sys::CUfunction>,
@@ -88,21 +101,21 @@ impl MxfpGemm {
         }
         let func = unsafe { func.assume_init() };
 
-        // Best-effort: the register-blocked variant (same cubin, second
-        // entry). Older cubins without it keep working.
-        let cu_function_rb4 = {
-            let rb_name = CString::new(KERNEL_NAME_RB4).unwrap_or_default();
-            let mut rb_fn = std::mem::MaybeUninit::uninit();
-            let rb_rc = unsafe {
-                sys::cuModuleGetFunction(rb_fn.as_mut_ptr(), module, rb_name.as_ptr())
-            };
-            if rb_rc == 0 {
-                Some(unsafe { rb_fn.assume_init() })
+        // Best-effort: the register-blocked variants (same cubin, extra
+        // entries). Older cubins without them keep working.
+        let load_entry = |name: &str| -> Option<sys::CUfunction> {
+            let cstr = CString::new(name).unwrap_or_default();
+            let mut fn_out = std::mem::MaybeUninit::uninit();
+            let rc = unsafe { sys::cuModuleGetFunction(fn_out.as_mut_ptr(), module, cstr.as_ptr()) };
+            if rc == 0 {
+                Some(unsafe { fn_out.assume_init() })
             } else {
-                eprintln!("[mxfp4] cuModuleGetFunction({KERNEL_NAME_RB4}) failed (rc={rb_rc})");
+                eprintln!("[mxfp4] cuModuleGetFunction({name}) failed (rc={rc})");
                 None
             }
         };
+        let cu_function_rb4 = load_entry(KERNEL_NAME_RB4);
+        let cu_function_rb4m32 = load_entry(KERNEL_NAME_RB4M32);
 
         let mut sm_count = 0i32;
         unsafe {
@@ -146,7 +159,7 @@ impl MxfpGemm {
             "[mxfp4] MxfpGemm loaded: {KERNEL_NAME} ({} bytes cubin, sm_count={sm_count})",
             MXFP4_CUBIN.len()
         );
-        Some(Self { cu_module: module, cu_function: func, cu_function_rb4, cu_quant_mod, cu_quant_fn, sm_count, stream })
+        Some(Self { cu_module: module, cu_function: func, cu_function_rb4, cu_function_rb4m32, cu_quant_mod, cu_quant_fn, sm_count, stream })
     }
 
     /// Row-offset chunk variant of [`MxfpGemm::forward`].
@@ -183,6 +196,53 @@ impl MxfpGemm {
         let a_row_bytes = (a_row as u64) * (k64_tiles as u64) * 32;
         let a_scales_bytes = ((a_row / 16) as u64) * (k64_tiles as u64) * 2;
         let c_row_bytes = (c_row as u64) * (n as u64) * 4;
+
+        // Kernel choice (all bit-identical; measured winners per grid):
+        //   rb4m32 (m32n32/warp, B re-reads halved) when m % 32 == 0 and
+        //     its grid >= RB4M32_MIN_BLOCKS,
+        //   rb4 (m16n32/warp) when m % 32 != 0 but large-n,
+        //   m16n8 otherwise.
+        let rb4m32_eligible = m % 32 == 0;
+        let rb4m32_grid_x = n_tiles.div_ceil(16);
+        if let Some(rb_fn) = self.cu_function_rb4m32 {
+            if rb4m32_eligible && rb4m32_grid_x * (m / 32) >= RB4M32_MIN_BLOCKS {
+                let mut p_ap = a_packed.device_pointer().cu_deviceptr() as u64 + a_row_bytes;
+                let mut p_as = a_scales.device_pointer().cu_deviceptr() as u64 + a_scales_bytes;
+                let mut p_bp = b_packed.device_pointer().cu_deviceptr() as u64;
+                let mut p_bs = b_scales.device_pointer().cu_deviceptr() as u64;
+                let mut p_c  = c.device_pointer().cu_deviceptr() as u64 + c_row_bytes;
+                let mut pm   = m;
+                let mut pn   = n;
+                let mut pk   = k64_tiles;
+                let mut params: [*mut std::ffi::c_void; 8] = [
+                    &mut p_ap as *mut _ as *mut std::ffi::c_void,
+                    &mut p_as as *mut _ as *mut std::ffi::c_void,
+                    &mut p_bp as *mut _ as *mut std::ffi::c_void,
+                    &mut p_bs as *mut _ as *mut std::ffi::c_void,
+                    &mut p_c  as *mut _ as *mut std::ffi::c_void,
+                    &mut pm   as *mut _ as *mut std::ffi::c_void,
+                    &mut pn   as *mut _ as *mut std::ffi::c_void,
+                    &mut pk   as *mut _ as *mut std::ffi::c_void,
+                ];
+                let rc = unsafe {
+                    sys::cuLaunchKernel(
+                        rb_fn,
+                        rb4m32_grid_x, m / 32, 1,
+                        128, 1, 1,
+                        0,
+                        cu_stream,
+                        params.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != 0 {
+                    return Err(KernelError::InvalidConfig(format!(
+                        "{KERNEL_NAME_RB4M32} cuLaunchKernel failed: {rc}"
+                    )));
+                }
+                return Ok(());
+            }
+        }
 
         // Register-blocked variant on large-n grids (see RB4_MIN_BLOCKS).
         // Bit-identical output; same 8-parameter signature.
