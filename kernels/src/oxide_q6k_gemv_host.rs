@@ -55,7 +55,8 @@ pub struct OxideQ6kGemv {
     cu_function_kpar:       Option<CUfunction>,
     /// sm_120 hand-written PTX module (separate from oxide module).
     cu_sm120_module:        Option<CUmodule>,
-    /// q6k_gemv_sm120_mbar_kpar8: cp.async double-buffer variant (sm_120+).
+    /// q6k_gemv_sm120_kpar8: cp.async triple-buffer + register-exchange
+    /// variant (sm_120+). Default since 2026-10-29.
     cu_function_sm120_mbar: Option<CUfunction>,
     /// sm_120 batch module: q6k_gemv_sm120_batch (M rows, shared weight reads).
     cu_sm120_batch_module:  Option<CUmodule>,
@@ -93,7 +94,7 @@ impl OxideQ6kGemv {
     /// Load Q6_K GEMV kernels.
     ///
     /// Attempts to load the oxide-compiled PTX (baseline + kpar8) and, on sm_120+,
-    /// the hand-written cp.async double-buffer kernel (`q6k_gemv_sm120_mbar_kpar8`).
+    /// the hand-written cp.async kernel (`q6k_gemv_sm120_kpar8`).
     /// Returns `None` only when no kernel variant could be loaded at all.
     pub fn try_load(stream: Arc<Stream>) -> Option<Self> {
         let _ = stream.device().bind_to_thread().ok()?;
@@ -191,26 +192,24 @@ impl OxideQ6kGemv {
             }
         };
 
-        // -- Try sm_120 cp.async mbar PTX (not feature-gated, any sm_120 GPU) ------
-        // Requires Blackwell GPU (cc >= 1200). Falls back to cu_function_kpar on
-        // older GPUs.
+        // -- Try sm_120 cp.async PTX (not feature-gated, any sm_120 GPU) ------
+        // Requires Blackwell GPU (cc >= 1200). Falls back to cu_function_kpar
+        // on older GPUs.
         //
-        // DEFAULT OFF since 2026-10-27: the mbar GEMV's outputs are
-        // allocation/kernel-history dependent (bench-batch M=1 fresh-cache replay:
-        // bitwise-identical inputs -> ULP-level output drift, first diverging op
-        // L0 down-proj with every other op matching; TEMPURA_NO_SM120_Q6K=1
-        // flips the full matrix to verified). The bar.sync-after-wait_group fix
-        // was insufficient -- a residual cp.async visibility hole survives in
-        // this variant. Opt back in with TEMPURA_ALLOW_SM120_Q6K=1 after
-        // root-causing (suspect: async-proxy -> generic-proxy ordering of the
-        // double-buffer swap on sm_120).
+        // DEFAULT ON since 2026-10-29 (register-exchange rewrite): the
+        // kernel's loop no longer contains any CTA-wide barriers. Each lane
+        // reads only the smem words it copied itself (per-thread
+        // wait_group + fence.proxy.async), cross-lane values arrive via
+        // shfl.sync.idx register exchange, and the cross-warp partial
+        // handoff is a generic-proxy release/acquire counter. The prior
+        // variants' races (elided warp-uniform mbarrier pairs,
+        // DEFER_BLOCKING bar.sync, the kb=16 residual) all lived in the
+        // cross-lane async->generic smem publication this design removes.
+        // TEMPURA_NO_SM120_Q6K=1 opts out to the dp4a kpar baseline.
         let sm120_force_off = std::env::var("TEMPURA_NO_SM120_Q6K")
             .map(|v| v == "1")
             .unwrap_or(false);
-        let sm120_opt_in = std::env::var("TEMPURA_ALLOW_SM120_Q6K")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        let sm120_disabled = sm120_force_off || !sm120_opt_in;
+        let sm120_disabled = sm120_force_off;
 
         let sm120_cc = {
             let caps = crate::gpu_capabilities::GpuCapabilities::query(
@@ -244,7 +243,7 @@ impl OxideQ6kGemv {
                 };
                 if rc2 == CUDA_SUCCESS {
                     eprintln!(
-                        "oxide-gemv-q6k: loaded sm120_mbar variant \
+                        "oxide-gemv-q6k: loaded sm120 kpar8 variant \
                          (entry={}, cc={sm120_cc})",
                         crate::q6k_gemv_v4_ptx::ENTRY,
                     );
@@ -264,24 +263,17 @@ impl OxideQ6kGemv {
                 );
                 (None, None)
             }
-        } else if sm120_disabled && !sm120_force_off {
-            eprintln!(
-                "oxide-gemv-q6k: sm120_mbar DISABLED BY DEFAULT \
-                 (history-dependent outputs; see comment); \
-                 opt in with TEMPURA_ALLOW_SM120_Q6K=1"
-            );
-            (None, None)
         } else if sm120_force_off {
-            eprintln!("oxide-gemv-q6k: TEMPURA_NO_SM120_Q6K=1, skipping sm120_mbar");
+            eprintln!("oxide-gemv-q6k: TEMPURA_NO_SM120_Q6K=1, skipping sm120 kpar8");
             (None, None)
         } else {
             (None, None)
         };
 
         // -- Try sm_120 batch PTX (q6k_gemv_sm120_batch, M rows 2..=16) ----------
-        // Loads independently of the mbar GEMV above: the batch kernel is a
+        // Loads independently of the kpar8 GEMV above: the batch kernel is a
         // different code path (two-phase, verified by bench-batch replay) and
-        // must stay available even when the racy mbar GEMV is disabled.
+        // must stay available even when the kpar8 GEMV is disabled.
         let (cu_sm120_batch_module, cu_function_sm120_batch) =
             if !sm120_force_off && sm120_cc_ok {
                 let ptx_cstr = CString::new(crate::q6k_batch_sm120_ptx::PTX)
@@ -656,14 +648,13 @@ impl OxideQ6kGemv {
         Ok(Arc::new(out))
     }
 
-    /// Select the best available kpar function: sm120_mbar > dp4a_kpar8 > None.
-    /// Select the kpar kernel. The sm_120 mbar variant requires
-    /// `k_blocks % 8 == 0`: its K-loop uses CTA-wide `bar.sync 0` to make
-    /// cp.async writes visible across lanes, which is only deadlock-free
-    /// when all 8 warps execute the same number of loop barriers -- true
-    /// exactly when k_blocks is a multiple of 8 (each warp then runs
-    /// k_blocks/8 iterations with k_blocks/8 - 1 uniform barriers).
-    /// Other shapes fall back to the dp4a kpar kernel.
+    /// Select the best available kpar function: sm120_kpar8 > dp4a_kpar8 > None.
+    /// The sm_120 register-exchange variant requires `k_blocks % 8 == 0`:
+    /// its loop-tail publication point uses CTA-wide `bar.sync 0` (load-
+    /// bearing on this hw -- see the kernel doc), which is only deadlock-
+    /// free when all 8 warps run the same number of loop iterations, true
+    /// exactly when k_blocks is a multiple of 8. Other shapes fall back to
+    /// the dp4a kpar kernel.
     fn select_kpar_fn(&self, k_blocks: usize) -> Option<(CUfunction, bool)> {
         if let Some(f) = self.cu_function_sm120_mbar {
             if k_blocks % 8 == 0 {
@@ -704,10 +695,10 @@ impl OxideQ6kGemv {
             &k_blocks_u32 as *const _ as *mut c_void,
         ];
 
-        // sm120_mbar declares 3424 bytes of static shared memory; pass 0 dynamic.
+        // sm120 kpar8 declares 5384 bytes of static shared memory; pass 0 dynamic.
         // dp4a_kpar8 uses SMEM_KPAR (32 bytes) dynamic shared memory.
         let smem = if is_sm120_mbar { 0 } else { SMEM_KPAR };
-        let label = if is_sm120_mbar { "q6k_gemv_sm120_mbar_kpar8" } else { "oxide q6k_gemv_dp4a_kpar8" };
+        let label = if is_sm120_mbar { "q6k_gemv_sm120_kpar8" } else { "oxide q6k_gemv_dp4a_kpar8" };
 
         unsafe {
             launch_kernel(

@@ -231,13 +231,15 @@ fn main() {
     rope.precompute_table(MAX_POS, HEAD_DIM, THETA, &stream)
         .expect("precompute_table failed");
 
-    // ---- 10. mbarrier primitive micro-test --------------------------------
-    // Isolates the mbarrier arrive/try_wait.parity mechanics from the q6k
-    // kernel: 32 threads, N rounds of [thread 0 stores a round-marker to
-    // smem; all 32 arrive; all wait the phase parity; everyone reads the
-    // marker and checks it equals the round].  Any early wait pass or
-    // visibility failure shows up as a marker mismatch.  This is the
-    // ground truth for whether the primitives work on this hw/ptxas.
+    // ---- 10. sm120 kpar8 synthetic-weights micro-test ------------------------
+    // Drives the REAL q6k_gemv_sm120_kpar8 kernel with exact-arithmetic
+    // synthetic weights (d = b+1, scales = 1.0, ql/qh = 0, x = 1.0 -> every
+    // output is exactly -8192 * kb*(kb+1)/2). Uniform-data tests cannot
+    // catch fragment-mapping bugs, but EXACT-ARITHMETIC synthetic weights
+    // catch visibility races: any torn/stale smem word shows up as a
+    // wrong output. k_blocks must be a multiple of 8 (the kernel's CTA
+    // loop barriers require uniform warp trip counts; other shapes
+    // dispatch to the dp4a baseline).
     {
         use cuda_core::sys;
         eprintln!("[micro] building module...");
@@ -320,10 +322,10 @@ fn main() {
                     kb_bad_total += bad as u32;
                 }
             }
-            println!("  mbar micro kb={kb}: {kb_bad_total}/81920 wrong (20 iters x 4096 rows)");
+            println!("  sm120_kpar8 micro kb={kb}: {kb_bad_total}/81920 wrong (20 iters x 4096 rows)");
         }
         println!(
-            "  mbar micro (REAL q6k kernel, synthetic weights): wrong={mismatches} -> {}",
+            "  sm120 kpar8 micro (REAL kernel, synthetic weights): wrong={mismatches} -> {}",
             if mismatches == 0 { "PASS" } else { "FAIL" }
         );
         all_ok &= mismatches == 0;
@@ -680,10 +682,9 @@ fn main() {
 
     // ---- 4. Q6K decode GEMV (down_proj) on REAL model weights ----
     // The m=1 decode path runs every Q6_K tensor (down_proj in Q4_K_M, one
-    // per layer) through oxide_q6k_gemv.forward_kpar_d2d -- the dp4a kpar8
-    // variant, which has NO bisect switch (TEMPURA_NO_SM120_Q6K only gates
-    // the already-default-off mbar variant) and was previously validated
-    // for replay determinism only, never numerics vs CPU.
+    // per layer) through oxide_q6k_gemv.forward_kpar_d2d -- the sm120
+    // register-exchange kpar8 variant on Blackwell (dp4a kpar8 elsewhere);
+    // TEMPURA_NO_SM120_Q6K=1 bisects back to the dp4a baseline.
     let model_arg = std::env::args().nth(1);
     let model_path = match model_arg {
         Some(p) => std::path::PathBuf::from(p),
@@ -768,7 +769,7 @@ fn main() {
         let oxide_q6k = OxideQ6kGemv::try_load(stream.clone())
             .expect("OxideQ6kGemv PTX not loaded (copy loop missing?)");
         println!(
-            "  oxide_q6k loaded (kpar={}, sm120_mbar={}, sm120_batch={})",
+            "  oxide_q6k loaded (kpar={}, sm120_kpar8={}, sm120_batch={})",
             oxide_q6k.has_kpar(),
             oxide_q6k.has_sm120_mbar(),
             oxide_q6k.has_sm120_batch(),
@@ -1949,13 +1950,13 @@ fn main() {
         }
     }
 
-    // ---- 9. q6k sm120_mbar determinism stress (default-off kernel) ----
-    // The mbar cp.async double-buffer variant is disabled by default
-    // (history-dependent outputs). This stress test runs it on identical
-    // real weights/activations repeatedly -- with interleaved device
-    // allocations and an intervening kernel launch to vary the allocation
-    // and kernel history -- and checks bitwise determinism. Requires
-    // TEMPURA_ALLOW_SM120_Q6K=1 in the environment when the tool starts.
+    // ---- 9. q6k sm120_kpar8 determinism stress (default-on kernel) ----
+    // The register-exchange cp.async variant is the default kpar path on
+    // sm_120. This stress test runs it on identical real weights/
+    // activations repeatedly -- with interleaved device allocations and an
+    // intervening kernel launch to vary the allocation and kernel history
+    // -- and checks bitwise determinism. TEMPURA_NO_SM120_Q6K=1 unloads it
+    // (the section then reports not-loaded).
     {
         let o6 = tempura_kernels::oxide_q6k_gemv_host::OxideQ6kGemv::try_load(
             stream.clone(),
@@ -2050,12 +2051,14 @@ fn main() {
                     .fold(0.0f32, f32::max);
                 let infs = v0.iter().filter(|v| !v.is_finite()).count();
                 println!(
-                    "  q6k mbar vs CPU (kb=56): max_abs={max_ref:.6} nonfinite={infs}/{n}"
+                    "  q6k sm120_kpar8 vs CPU (kb=56): max_abs={max_ref:.6} nonfinite={infs}/{n}"
                 );
 
                 // Shape bisect: kb=8 (ONE loop iteration, no swap) and
-                // kb=16 (two iterations, one swap) from the same weights.
-                for &kbt in &[8usize, 16usize, 24usize, 32usize, 40usize, 48usize, 56usize] {
+                // kb=16 (two iterations, one swap -- the shape that
+                // exposed the old barrier design's residual race, now
+                // fixed by the register exchange) from the same weights.
+                for &kbt in &[8usize, 16, 24, 32, 40, 48, 56] {
                     let kt = kbt * 256;
                     let xt: Vec<f32> = x[..kt].to_vec();
                     let xt_dev = upload(xt.clone(), &stream);
@@ -2096,7 +2099,7 @@ fn main() {
                         .filter(|(a, b)| (**a - **b).abs() > 0.01)
                         .count();
                     println!(
-                        "  q6k mbar shape bisect kb={kbt}: max_abs={mt:.6} bad={badt}/{n}"
+                        "  q6k sm120_kpar8 shape bisect kb={kbt}: max_abs={mt:.6} bad={badt}/{n}"
                     );
                 }
                 let mut nondet = 0usize;
@@ -2114,11 +2117,11 @@ fn main() {
                     }
                 }
                 println!(
-                    "  q6k mbar determinism: {nondet}/8 stress runs bitwise-differ -> {}",
+                    "  q6k sm120_kpar8 determinism: {nondet}/8 stress runs bitwise-differ -> {}",
                     if nondet == 0 { "DETERMINISTIC" } else { "NONDETERMINISTIC (race live)" }
                 );
             }
-            _ => println!("  (q6k mbar variant not loaded; run with TEMPURA_ALLOW_SM120_Q6K=1)"),
+            _ => println!("  (q6k sm120 kpar8 variant not loaded; TEMPURA_NO_SM120_Q6K=1?)"),
         }
     }
 
