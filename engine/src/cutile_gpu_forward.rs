@@ -4572,6 +4572,13 @@ impl CutileGpuModel {
                 cuda_core::sys::cuGraphInstantiateWithFlags(cu_exec_uninit.as_mut_ptr(), cu_graph, 0);
             }
             let cu_exec = unsafe { cu_exec_uninit.assume_init() };
+            // Pre-stage the graph on the device: cuGraphUpload moves upload
+            // work out of cuGraphLaunch (the ~930-node decode graph's launch
+            // was 122-139us of serialized host time per step, nsys 2026-10-29).
+            let rc_up = unsafe { cuda_core::sys::cuGraphUpload(cu_exec, cu_stream) };
+            if rc_up != 0 {
+                eprintln!("[graph] cuGraphUpload rc={rc_up} (continuing; first launch uploads)");
+            }
 
             // Record the KV-cache device pointers this graph was captured with.
             let captured_k_ptrs: Vec<u64> = (0..cfg.num_layers)
@@ -6819,6 +6826,13 @@ impl CutileGpuModel {
                 cuda_core::sys::cuGraphInstantiateWithFlags(cu_exec_uninit.as_mut_ptr(), cu_graph, 0);
             }
             let cu_exec = unsafe { cu_exec_uninit.assume_init() };
+            // Pre-stage the graph on the device: cuGraphUpload moves upload
+            // work out of cuGraphLaunch (the ~930-node decode graph's launch
+            // was 122-139us of serialized host time per step, nsys 2026-10-29).
+            let rc_up = unsafe { cuda_core::sys::cuGraphUpload(cu_exec, cu_stream) };
+            if rc_up != 0 {
+                eprintln!("[graph] cuGraphUpload rc={rc_up} (continuing; first launch uploads)");
+            }
 
             let captured_k_ptrs: Vec<Vec<u64>> = (0..cfg.num_layers)
                 .map(|l| (0..m).map(|r| kv_caches[r].kv_device_tensors(l).0.device_pointer().cu_deviceptr()).collect())
@@ -7078,6 +7092,13 @@ impl CutileGpuModel {
                 cuda_core::sys::cuGraphInstantiateWithFlags(cu_exec_uninit.as_mut_ptr(), cu_graph, 0);
             }
             let cu_exec = unsafe { cu_exec_uninit.assume_init() };
+            // Pre-stage the graph on the device: cuGraphUpload moves upload
+            // work out of cuGraphLaunch (the ~930-node decode graph's launch
+            // was 122-139us of serialized host time per step, nsys 2026-10-29).
+            let rc_up = unsafe { cuda_core::sys::cuGraphUpload(cu_exec, cu_stream) };
+            if rc_up != 0 {
+                eprintln!("[graph] cuGraphUpload rc={rc_up} (continuing; first launch uploads)");
+            }
 
             // Record KV cache device pointers so replay can detect staleness.
             let captured_k_ptrs: Vec<Vec<u64>> = (0..cfg.num_layers)
