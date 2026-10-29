@@ -480,29 +480,22 @@ typical-p/repeat/presence/frequency)
       non-multiples of 8 -- the _db variant needs no k_blocks % 8 gate).
       Decode 196 -> 204 tok/s (ITL 5.11 -> 4.89 ms, gap to llama.cpp
       1.025x). TEMPURA_NO_Q6K_DB=1 bisects back to the cp.async variant.
-- [ ] Close the 1.02x single-sequence GPU decode gap vs llama.cpp
-      (206 vs 209 tok/s, ITL 4.86 ms, 2026-10-29). Was 1.49x (140 tok/s)
-      before the lm_head BK=512 fix -- the f32 lm_head GEMV was running at
-      709 GB/s and costing ~1.5ms of every token; BK=512 (1475 GB/s) took
-      decode 139 -> 171 tok/s and prefill to 5816 (see the prefill item,
-      change (f)).
-      The sm120 fused gate+up+SiLU kernel was ported to the native
-      36-u32 raw GGUF format (2026-10-28; scale extraction mirrors
-      q4k_gemv_v4_ptx, d/dmin via cvt.f32.f16) and re-enabled -- 134
-      -> 140 tok/s, ITL 7.49 -> 7.15 ms, bench-quality 100% agreement
-      held, bench-decode-ops fused-silu real-weights test rel 0.0007.
-      2026-10-29: the Q6K v_proj in dispatch_kv_on_stream moved from the
-      dp4a baseline (~280 GB/s on [1024,4096]) to submit_kpar_d2d_into_on
-      on the KV stream (safe: the q6k kpar kernels keep no shared scratch,
-      unlike the Q4K kpar's Q8 state) -- 204 -> 206 tok/s; bench-quality
-      teacher-forced PASS 89.1% (one near-tie flipped by the accumulation
-      order, same band).
-      Remaining lever: ~180us/step of serialized host overhead between
-      graph launches (nsys runtime trace: cuGraphLaunch 122-139us for the
-      ~930-node graph + logits DtoH 39-49us + H2D ~10us, GPU idle
-      throughout) -- fixable by node-count reduction (rmsnorm is 3
-      kernels x 65, the q/k rope chain is 6 kernels x 32) or a GPU-side
-      greedy argmax path.
+- [x] **Single-sequence GPU decode gap vs llama.cpp CLOSED at parity:
+      210 vs 209 tok/s (2026-10-29).** Final change: cuGraphUpload after
+      graph instantiation at all three capture sites (single decode +
+      both batch graphs) -- the ~930-node decode graph's cuGraphLaunch
+      was 122-139us of SERIALIZED host time per step (GPU idle; nsys
+      runtime trace); pre-staging the graph on the device took ITL
+      4.86 -> 4.77 ms (206 -> 210 tok/s), logits bitwise-unchanged.
+      Cumulative decode timeline on this item: 140 (BK=512 lm_head) ->
+      169 (q6k sm120 register exchange, default ON) -> 196 (lm_head via
+      the GGUF's native Q6_K instead of 2.1GB dequantized f32) -> 204
+      (q6k dual-block direct-load GEMV) -> 206 (Q6K v_proj via kpar) ->
+      210 (cuGraphUpload). bench-quality teacher-forced PASS 89.1%
+      throughout. Remaining micro-optimizations (not a gap anymore):
+      logits DtoH 39-49us/step (GPU-side greedy argmax would collapse it
+      to 4B) and ~40us residual launch cost (node-count reduction:
+      rmsnorm is 3 kernels x 65, the q/k rope chain 6 kernels x 32).
       NOTE: this GGUF (bartowski Llama-3.1-8B Q4_K_M) has a mixed layout
       -- 16 layers with Q6K v+down_proj, 16 with Q4K -- verified from the
       GGUF tensor-type census (193 Q4K + 33 Q6K) and the trace.
@@ -850,7 +843,10 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       unchanged, +1.3GB VRAM; 2026-10-29 the dual-block direct-load q6k
       variant (no cp.async/barriers, 2x MLP, L2 prefetch) closed the q6k
       down_proj bandwidth gap: 196 -> 204 tok/s, bitwise-identical logits;
-      the Q6K v_proj moved to the kpar path: 206 tok/s, 1.02x gap)
+      the Q6K v_proj moved to the kpar path (206) and cuGraphUpload after
+      instantiation removed the 122-139us serialized launch cost:
+      **210 tok/s -- llama.cpp parity reached (ref 209)**, ITL 4.77 ms,
+      teacher-forced PASS 89.1%)
 - Llama-3.1-8B Q4K prefill: **6084 tok/s pp128**, TTFT P50 21.0 ms
       (1.22x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1331 -- the MXFP4 band including the
