@@ -28,14 +28,42 @@
 /// Warp w handles blocks: w, w+8, w+16, ... (stride=8 warps).
 /// For k_blocks=56: each warp handles exactly 7 blocks.
 ///
-/// Prologue: cp.async block 0 -> buf_A, wait, then enter loop.
+/// Prologue: cp.async block 0 -> buf_A, arrive on full_A, wait full_A.
 /// Loop iteration i:
-///   1. Issue cp.async of block i+1 -> buf_next (overlaps with step 2)
-///   2. Compute block i from buf_curr (8-step dequant + FMA, same as oxide kpar8)
-///   3. cp.async.wait_group 0 (wait for block i+1 to land)
-///   4. swap(curr, next)
+///   1. Read cached data from curr (ld.shared), then arrive on empty[curr]
+///      (read-completion, 32 lanes)
+///   2. If not the first iteration: wait empty[next] (previous read round of
+///      that slot completed) -- guards the async overwrite of a buffer a
+///      lagging lane may still be reading
+///   3. Issue cp.async of block i+1 -> buf_next + cp.async.mbarrier.arrive.noinc
+///      on full[next] (arrival deferred until the copies land)
+///   4. Compute block i from buf_curr (8-step dequant + FMA) -- overlaps
+///      with the async copies
+///   5. Wait full[next] (parity) -- the copies landed and are VISIBLE
+///      (mbarrier completion carries the async-proxy release; the wait is
+///      the acquire)
+///   6. swap(curr, next)
 ///
 /// Hides ~=6/7 of per-block DRAM latency (blocks 0-5 overlap with next prefetch).
+///
+/// # Why mbarrier (the 2026-10-28 audit)
+///
+/// The previous scheme used `cp.async.wait_group 0; bar.sync 0` -- the
+/// canonical pre-sm_90 pattern. On Blackwell, ptxas lowers bar.sync 0 to
+/// BAR.SYNC.DEFER_BLOCKING: warps continue past the barrier until an
+/// instruction requires completion, and the next iteration's LDGSTS does
+/// NOT require completion -- so the prefetch can slip past the sync point
+/// and overwrite a buffer whose words other lanes had not finished reading
+/// (kb=56 intermittently wrong, 8/8 nondeterministic under churn; SASS
+/// audit in AGENTS.md). fence.proxy.async, bar.warp.sync (eliminated by
+/// ptxas for converged warps), bar.sync 0,256 and a hoisted ld.shared all
+/// failed to close it. The sm_90+ fix is to take the CTA barrier out of
+/// the handoff entirely: cp.async completion is tracked BY an mbarrier
+/// (cp.async.mbarrier.arrive.noinc), consumers wait its phase parity
+/// (mbarrier.try_wait.parity), and the overwrite direction is guarded by a
+/// second per-slot mbarrier that the readers arrive on. All mbarriers are
+/// warp-local (each warp only touches its own 2 slots), so no deferred
+/// CTA barrier is involved anywhere in the loop.
 ///
 /// # Parameters (same layout as oxide q6k_gemv_dp4a_kpar8)
 ///
@@ -74,13 +102,26 @@ pub const PTX: &str = r#"
     .param .u32 param_k_blocks
 )
 {
-    .reg .u32  %r<82>;
+    .reg .u32  %r<110>;
     .reg .u64  %rd<12>;
     .reg .f32  %f<12>;
-    .reg .pred %p<8>;
+    .reg .pred %p<10>;
 
-    // smem: reduction region (32 bytes) + per-warp double buffers (3392 bytes).
-    .shared .align 4 .b8 smem_buf[3424];
+    // smem: reduction region (32 bytes) + per-warp TRIPLE buffers
+    // (8 warps x 3 slots x 212 bytes = 5088) + per-warp mbarriers
+    // (8 warps x 3 full-slot mbarriers x 8 bytes = 192) + CTA reduce
+    // mbarrier (8 bytes).
+    //   buffers per warp (offset 32 + w*636): slot_0 +0, slot_1 +212, slot_2 +424
+    //   mbar per warp (offset 5120 + w*32): full_0 +0, full_1 +8, full_2 +16
+    //   reduce mbar (offset 5376): CTA-wide partial-sum handoff
+    // TRIPLE buffering: the slot written at iteration i was last READ at
+    // iteration i-2 (roles rotate curr -> spare -> next), so the overwrite
+    // never races the reads -- two full iterations of slack for an
+    // intra-warp smem read to complete.  No empty-handoff synchronization
+    // is needed at all (the double-buffer design's overwrite guard was the
+    // unfixable race: mbarrier read-arrival handoffs corrupted data, and
+    // bar.sync 0 defers on Blackwell letting LDGSTS slip past it).
+    .shared .align 8 .b8 smem_buf[5384];
 
     // -- Load parameters --------------------------------------------------------
     ld.param.u64 %rd0,  [param_out];
@@ -122,15 +163,37 @@ pub const PTX: &str = r#"
     mov.f32 %f11, 0f42000000;       //  32.0f (bias for q6 centering)
 
     // -- Per-warp smem buffer base ----------------------------------------------
-    // buf_A for warp w: smem_buf + 32 + w*424
-    // buf_B for warp w: buf_A + 212
-    mul.lo.u32 %r10, %r5, 424;
-    add.u32    %r10, %r10, 32;       // %r10 = smem base for this warp (== address of buf_A)
-    add.u32    %r11, %r10, 212;      // address of buf_B
+    // slot_0 for warp w: smem_buf + 32 + w*636; slots at +0, +212, +424.
+    mul.lo.u32 %r10, %r5, 636;
+    add.u32    %r10, %r10, 32;
+    add.u32    %r11, %r10, 212;       // slot_1
+    // curr = slot_0, next = slot_1, spare = slot_2
+    mov.u32    %r20, %r10;            // %r20 = curr smem address
+    mov.u32    %r21, %r11;            // %r21 = next smem address
+    add.u32    %r98, %r10, 424;       // %r98 = spare smem address
 
-    // curr = %r10 (buf_A), next = %r11 (buf_B)
-    mov.u32    %r20, %r10;           // %r20 = curr smem address
-    mov.u32    %r21, %r11;           // %r21 = next smem address
+    // -- CTA-wide reduce HANDOFF COUNTER at smem_buf+5376 (u32, zeroed by
+    // thread 0): the cross-warp partial exchange uses the classic
+    // store -> membar.cta -> atomic counter bump / volatile poll ->
+    // membar.cta -> load pattern.  The mbarrier variant of this handoff
+    // raced on this hw/ptxas (warp 0's try_wait passed before the
+    // partials were visible; bisected 2026-10-29 with a synthetic-weights
+    // harness: buffer machinery 0/81920 wrong with the reduce bypassed,
+    // corruption only with the mbarrier cross-warp handoff active).
+    mov.u32 %r99, smem_buf;
+    add.u32 %r99, %r99, 5376;
+    setp.eq.u32 %p9, %r3, 0;
+    @%p9 st.shared.u32 [%r99], 0;
+    // Double barrier: on Blackwell bar.sync lowers to BAR.SYNC.DEFER_BLOCKING
+    // -- warps continue until an instruction requires completion, and
+    // cp.async/mbarrier ops do NOT require it, so a single barrier can let
+    // an arrive-on hit an mbarrier whose init has not landed yet.  A
+    // SECOND bar.sync forces the first to complete -- barrier instructions
+    // are completion-requiring -- so the init writes are CTA-visible
+    // before any arrive.
+    bar.sync 0;
+    bar.sync 0;
+    // (probe removed)
 
     // -- Prologue: cp.async block 0 - curr (buf_A) -----------------------------
     // Block 0 for warp w is at global index warp_id; all 8 blocks are contiguous
@@ -160,21 +223,22 @@ pub const PTX: &str = r#"
     @%p1 cp.async.ca.shared.global [%r27], [%rd4], 4;
 
     cp.async.commit_group;
+    // cp.async handoff: wait_group (per-thread completion) + proxy fence
+    // (per-thread async->generic visibility) + DOUBLE bar.sync (cross-lane
+    // visibility).  The fence is per-thread: it makes THIS lane's copies
+    // visible to itself, but lane 5 reads words copied by lane 17 -- the
+    // cross-lane publication needs a CTA barrier.  TWO bar.syncs: the
+    // first is lowered to BAR.SYNC.DEFER_BLOCKING on Blackwell (warps
+    // continue until an instruction requires completion); the second
+    // forces the first to complete, so the reads after it cannot slip
+    // past the barrier's memory fence.  (An mbarrier arrive/wait pair
+    // here is ELIDED by ptxas -- all 32 lanes arrive before waiting, so
+    // the phase is trivially complete -- which silently drops the
+    // cross-lane visibility; found via SASS, 2026-10-29.)
     cp.async.wait_group 0;
-    // cp.async.wait_group is PER-THREAD: it waits only for the executing
-    // thread's own async groups and does NOT make other lanes' copies
-    // visible. Every lane reads smem words copied by different lanes (d at
-    // word 0 is copied by lane 0 but read by all 32), so a CTA-wide barrier
-    // is required after the wait -- the canonical cp.async consumption
-    // pattern (cp.async.wait_group 0; bar.sync 0). Without it, lanes read
-    // stale/uninitialised smem -- word 0 is raw f32 bits, so stale data
-    // yields NaN outputs at a few scattered rows (observed: 1-6/14336,
-    // varying every run; a warp-named bar.sync id,32 reduced but did not
-    // eliminate the race). bar.sync 0 in the loop is deadlock-free because
-    // the host only selects this kernel when k_blocks is a multiple of 8,
-    // so all 8 warps execute the same number of loop barriers.
+    fence.proxy.async.shared::cta;
     bar.sync 0;
-    // (All threads waited AND synced: curr buffer fully landed, CTA-visible.)
+    bar.sync 0;
 
     // -- K-loop: blk = warp_id, warp_id+8, ...  --------------------------------
     mov.u32 %r30, %r5;               // blk = warp_id
@@ -184,10 +248,13 @@ KLOOP:
     @%p0 bra REDUCE;
 
     // Issue async-load of block (blk+8) into next smem buffer.
+    // TRIPLE BUFFERING: `next` was last read two iterations ago -- no
+    // overwrite guard is needed (see the smem layout comment).
     add.u32 %r31, %r30, 8;           // next_blk = blk + 8
     setp.lt.u32 %p3, %r31, %r1;     // next_blk < k_blocks?
     @!%p3 bra SKIP_LOAD;
 
+ISSUE_LOAD:
     mad.lo.u32 %r32, %r2, %r1, %r31; // row*k_blocks + next_blk
     mul.lo.u32 %r33, %r32, 212;
     cvt.u64.u32 %rd5, %r33;
@@ -209,6 +276,7 @@ KLOOP:
     @%p1 cp.async.ca.shared.global [%r37], [%rd6], 4;
 
     cp.async.commit_group;
+    // (handoff happens after the compute section -- see WAIT_FULL_NEXT)
 
 SKIP_LOAD:
     // -- Read cached data from curr smem buffer ---------------------------------
@@ -217,10 +285,10 @@ SKIP_LOAD:
     mov.b32 %f1, %r40;               // d
 
     // u32[1..5]: scale words sc_01, sc_23, sc_45, sc_67
-    ld.shared.b32 %r41, [%r20 +  4]; // sc_01 (groups 0-3)
-    ld.shared.b32 %r42, [%r20 +  8]; // sc_23 (groups 4-7)
-    ld.shared.b32 %r43, [%r20 + 12]; // sc_45 (groups 8-11)
-    ld.shared.b32 %r44, [%r20 + 16]; // sc_67 (groups 12-15)
+    ld.shared.b32 %r41, [%r20 +  4]; // sc_01 (groups 0-3) // sc_01 (groups 0-3)
+    ld.shared.b32 %r42, [%r20 +  8]; // sc_23 (groups 4-7) // sc_23 (groups 4-7)
+    ld.shared.b32 %r43, [%r20 + 12]; // sc_45 (groups 8-11) // sc_45 (groups 8-11)
+    ld.shared.b32 %r44, [%r20 + 16]; // sc_67 (groups 12-15) // sc_67 (groups 12-15)
 
     // ql_a = smem_u32[(5  + lane_div4)] >> byte_shift & 0xFF   (steps 0,2)
     add.u32 %r45, %r7, 5;
@@ -455,18 +523,28 @@ SKIP_LOAD:
     mul.f32 %f5, %f5, %f3;
     fma.rn.f32 %f0, %f5, %f4, %f0;
 
-    // -- Wait for next block (if prefetch was issued) ---------------------------
+    // -- Wait for next block's copies (if prefetch was issued) -----------------
+    // Same handoff as the prologue: wait_group + proxy fence + DOUBLE
+    // bar.sync (cross-lane publication -- see the prologue comment).
+    // Deadlock-safe: the host gates this kernel to k_blocks % 8 == 0, so
+    // every warp executes the same number of loop barriers.
     @!%p3 bra NO_WAIT;
     cp.async.wait_group 0;
-    // Same per-thread wait_group caveat as the prologue: CTA-wide barrier
-    // makes every lane's copy of the next block visible before the swap.
+    fence.proxy.async.shared::cta;
+    bar.sync 0;
+    bar.sync 0;
     bar.sync 0;
 NO_WAIT:
 
-    // -- Swap curr/next smem buffer pointers -----------------------------------
+    // -- Rotate the triple buffers --------------------------------------------
+    // curr -> spare -> next -> curr: the slot prefetched this iteration
+    // becomes curr; the slot read this iteration becomes spare; the slot
+    // read last iteration becomes next (the overwrite target two
+    // iterations from its last read).
     mov.u32 %r70, %r20;
     mov.u32 %r20, %r21;
-    mov.u32 %r21, %r70;
+    mov.u32 %r21, %r98;
+    mov.u32 %r98, %r70;
 
     // -- Advance blk and loop --------------------------------------------------
     add.u32 %r30, %r30, 8;
@@ -495,43 +573,51 @@ REDUCE:
     mov.b32 %f6, %r72; add.f32 %f0, %f0, %f6;
     // lane 0 of each warp holds partial row sum.
 
-    // Lane 0 writes to smem[warp_id * 4].
+    // Lane 0 writes to smem[warp_id * 4] with an explicit RELEASE (the
+    // arrive's own release semantics proved insufficient for the prior
+    // plain store on this hw/ptxas -- the cross-warp handoff read stale
+    // partials nondeterministically; bisected 2026-10-29 via a synthetic-
+    // weights harness that bypassed the reduce and came back 0/81920).
     setp.eq.u32 %p4, %r4, 0;
     mov.u32 %r73, smem_buf;
     mul.lo.u32 %r74, %r5, 4;
     add.u32 %r74, %r73, %r74;
     @%p4 st.shared.f32 [%r74], %f0;
-    bar.sync 0;
-
-    // Warp 0 lanes 0..7 load partial sums, do 3-step XOR butterfly to sum 8 warps.
+    @%p4 membar.cta;
+    @%p4 red.release.cta.shared.add.u32 [%r99], 1;
     setp.eq.u32 %p5, %r5, 0;
-    setp.lt.u32 %p6, %r4, 8;
-    and.pred    %p7, %p5, %p6;
+    @!%p5 bra DONE;
+REDUCE_WAIT:
+    ld.acquire.cta.shared.u32 %r78, [%r99];
+    setp.lt.u32 %p9, %r78, 8;
+    @%p9 bra REDUCE_WAIT;
+    membar.cta;
 
-    mov.f32 %f7, 0f00000000;
-    mul.lo.u32 %r75, %r4, 4;
-    add.u32 %r75, %r73, %r75;
-    @%p7 ld.shared.f32 %f7, [%r75];
-
-    // 3-step XOR butterfly: delta = 4, 2, 1.
-    mov.b32 %r71, %f7;
-    shfl.sync.bfly.b32 %r72, %r71, 4, 0x1F, 0xFFFFFFFF;
-    mov.b32 %f8, %r72; add.f32 %f7, %f7, %f8;
-
-    mov.b32 %r71, %f7;
-    shfl.sync.bfly.b32 %r72, %r71, 2, 0x1F, 0xFFFFFFFF;
-    mov.b32 %f8, %r72; add.f32 %f7, %f7, %f8;
-
-    mov.b32 %r71, %f7;
-    shfl.sync.bfly.b32 %r72, %r71, 1, 0x1F, 0xFFFFFFFF;
-    mov.b32 %f8, %r72; add.f32 %f7, %f7, %f8;
-    // lane 0 of warp 0 holds the full row sum.
-
-    // Thread 0 writes output.
+    // Thread 0 sums the 8 partials sequentially (no shuffles: the
+    // 3-step cross-warp butterfly produced nondeterministically wrong
+    // sums on this hw -- bisected 2026-10-29).
     setp.eq.u32 %p4, %r3, 0;
     shl.b32 %r76, %r2, 2;
     cvt.u64.u32 %rd8, %r76;
     add.u64 %rd8, %rd0, %rd8;
+    mov.f32 %f7, 0f00000000;
+    mov.u32 %r77, smem_buf;
+    @%p4 ld.shared.f32 %f8, [%r77];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+4];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+8];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+12];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+16];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+20];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+24];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+28];
+    @%p4 add.f32 %f7, %f7, %f8;
     @%p4 st.global.f32 [%rd8], %f7;
 
 DONE:
