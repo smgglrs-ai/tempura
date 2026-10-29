@@ -446,9 +446,24 @@ typical-p/repeat/presence/frequency)
        CTA loop barrier requires uniform warp trip counts). Run the
        micro harness: `bench-decode-ops` (section "sm120_kpar8 micro
        (REAL kernel, synthetic weights)").
-- [ ] Close the 1.24x single-sequence GPU decode gap vs llama.cpp
-      (169 vs 209 tok/s, ITL 5.92 ms, 2026-10-29, sm120 q6k kpar8
-      default-ON). Was 1.49x (140 tok/s)
+- [x] **lm_head was dequantized to f32 at load (2.1GB) although the GGUF
+      stores it Q6_K (435MB) -- FIXED 2026-10-29** (nsys
+      `--cuda-graph-trace=node` per-kernel profile of one decode step: the
+      f32 lm_head GEMV alone was 1.24ms = 21% of the 5.92ms ITL). lm_head
+      now goes through the same Q4_K -> Q6_K -> Q2_0 -> f32 upload priority
+      as the layer projections (try_proj); decode/prefill m=1 dispatch the
+      exact Q6K kpar8 GEMV (result mirrored into SLOT_LOGITS with a D2D
+      copy so the graph callers keep finding it there); m>1 batch paths get
+      an MXFP4 tiled copy (435MB -> 109MB). Decode 169 -> 196 tok/s
+      (ITL 5.92 -> 5.11 ms, gap 1.07x), prefill 5866 -> 6033, batch
+      M=2 136 -> 244 / M=16 602 -> 796 (the batch lm_head GEMM re-read
+      2.1GB f32 per step), +1.3GB VRAM. Verified: probe/prefill argmax
+      IDENTICAL to the f32 path, bits_sum within ULP noise; bench-quality
+      teacher-forced PASS 90.6% UNCHANGED (same mismatch list); bench-batch
+      all M NaN-free + fresh-cache replay bitwise (fingerprints
+      re-baselined for the MXFP4 lm_head).
+- [ ] Close the 1.07x single-sequence GPU decode gap vs llama.cpp
+      (196 vs 209 tok/s, ITL 5.11 ms, 2026-10-29). Was 1.49x (140 tok/s)
       before the lm_head BK=512 fix -- the f32 lm_head GEMV was running at
       709 GB/s and costing ~1.5ms of every token; BK=512 (1475 GB/s) took
       decode 139 -> 171 tok/s and prefill to 5816 (see the prefill item,
@@ -458,12 +473,19 @@ typical-p/repeat/presence/frequency)
       q4k_gemv_v4_ptx, d/dmin via cvt.f32.f16) and re-enabled -- 134
       -> 140 tok/s, ITL 7.49 -> 7.15 ms, bench-quality 100% agreement
       held, bench-decode-ops fused-silu real-weights test rel 0.0007.
-      Remaining levers: GEMV still ~40% DRAM (dmon: sm 99-100%, mem
-      36-46%), host-side per-token overhead
-- [ ] Prefill on GPU: 5816 tok/s pp128, TTFT P50 22.1 ms (2026-10-28, nsys-
+      Remaining levers (nsys step profile, 2026-10-29): the q6k sm120
+      kpar8 GEMV runs down_proj at ~0.86 TB/s while the q4k dual_block
+      kernel does the same shape at ~1.25 TB/s (16 Q6K layers x 17us
+      gap = ~280us/step); the Q6K v_proj in dispatch_kv_on_stream still
+      uses the dp4a BASELINE kernel (280 GB/s on [1024,4096], ~10us x 16
+      layers = ~160us/step); a ~230us host gap between graph launches.
+      NOTE: this GGUF (bartowski Llama-3.1-8B Q4_K_M) has a mixed layout
+      -- 16 layers with Q6K v+down_proj, 16 with Q4K -- verified from the
+      GGUF tensor-type census (193 Q4K + 33 Q6K) and the trace.
+- [ ] Prefill on GPU: 6033 tok/s pp128, TTFT P50 21.2 ms (2026-10-28/29, nsys-
       driven: on-device attention + scratch RoPE + pooled norms/adds/SiLU +
       Q6K down_proj via MXFP4 + flash BR=16 + lm_head BK=512/last-row d2d)
-      vs llama.cpp 7335 (1.26x gap; 14.3x the 408 tok/s host-staged
+      vs llama.cpp 7335 (1.22x gap; 14.3x the 408 tok/s host-staged
       baseline). Six changes landed 2026-10-28:
       (a) The prefill attention is fully on-device: 3
       `cutile_gather_heads` (de-interleave Q/K/V into head-major padded
@@ -797,10 +819,13 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       64/64 identical tokens free-running. 2026-10-28 fused-silu raw-format
       port: 134 -> 140 tok/s; lm_head GEMV BK=128 -> 512 (709 -> 1475 GB/s):
       140 -> 171 tok/s; 2026-10-29 the register-exchange rewrite of the
-      sm120 q6k kernel fixed the kb=16 residual and made it default-ON:
-      169 tok/s, ITL 5.92 ms, bench-quality teacher-forced PASS 90.6%)
-- Llama-3.1-8B Q4K prefill: **5816 tok/s pp128**, TTFT P50 22.1 ms
-      (1.26x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
+      sm120 q6k kernel fixed the kb=16 residual and made it default-ON
+      (169 tok/s); 2026-10-29 the lm_head upload switched from dequantized
+      f32 (2.1GB read per token) to the GGUF's native Q6_K via the kpar
+      GEMV: 196 tok/s, ITL 5.11 ms, bench-quality teacher-forced PASS 90.6%
+      unchanged, +1.3GB VRAM)
+- Llama-3.1-8B Q4K prefill: **6033 tok/s pp128**, TTFT P50 21.2 ms
+      (1.22x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1331 -- the MXFP4 band including the
       Q6K->MXFP4 down_proj double-quantization (lossier than the Q4K path's
       0.1015; bench-quality teacher-forced PASS 89.1%, all mismatches
@@ -817,7 +842,12 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       fingerprints + fresh-cache replay bitwise identical; every M>=2
       fingerprint re-baselined this day — earlier MXFP4 batch outputs were
       computed with the broken accumulator store mapping and retracted):
-      **M=1 174, M=2 136, M=4 243, M=5 290, M=8 407, M=16 602 tok/s**
+      **M=1 198, M=2 244, M=4 407, M=5 466, M=8 606, M=16 796 tok/s**
+      (re-baselined 2026-10-29 after the lm_head upload switched from
+      dequantized f32 to the GGUF's native Q6_K + an MXFP4 tiled copy for
+      the M-row batch GEMM -- the f32 lm_head re-read 2.1GB per batch step;
+      was M=1 174, M=2 136, M=4 243, M=5 290, M=8 407, M=16 602 on
+      2026-10-28; all M re-verified NaN-free + fresh-cache replay bitwise).
       (re-baselined 2026-10-28 after down_proj moved to MXFP4 -- was
       M=1 135, M=2 133, M=4 224, M=5 253, M=8 332, M=16 444 on Q6K batch
       GEMV; M=1 rose again 141 -> 174 with the lm_head BK=512 fix; all M
