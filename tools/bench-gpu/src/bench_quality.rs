@@ -26,7 +26,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tempura_engine::gguf_loader::GgufLoader;
-use tempura_engine::model::{CutileInferenceWrapper, InferenceModel};
+use tempura_engine::model::{CutileInferenceWrapper, InferenceModel, SampleParams};
 use tempura_engine::pipeline::KernelPipeline;
 use tempura_engine::session::InferenceSession;
 use tempura_engine::tokenizer::Tokenizer;
@@ -477,8 +477,37 @@ fn main() {
         println!("  GPU: {gpu_text}");
     }
 
+    // --- GPU greedy fast-path check ---------------------------------------
+    // InferenceModel::generate with temperature=0 routes through
+    // forward_greedy (GPU argmax, no logits download) when available. The
+    // generated tokens must match a FREE-RUNNING manual continuation
+    // (forward + CPU argmax) on the same model -- this validates the
+    // kernel's tie-breaking (Rust max_by: last max wins) end-to-end.
+    // (The main gpu_run above is teacher-forced by default and diverges
+    // from any free-running path at near-ties by design.)
+    let fast_path_ok = {
+        let free_gpu = greedy_generate(&wrapper, &config, &prompt, max_new, eos, None);
+        let params = SampleParams {
+            temperature: 0.0,
+            ..SampleParams::default()
+        };
+        let mut session = InferenceSession::new(&config, TraceLevel::Off, 0);
+        let gen = wrapper.generate(&mut session, &prompt, max_new, &params, eos);
+        let n = gen.len().min(free_gpu.tokens.len());
+        let diff = (0..n).filter(|&i| gen[i] != free_gpu.tokens[i]).count();
+        let fast = diff == 0 && n == free_gpu.tokens.len() && n > 0;
+        println!(
+            "\n  greedy fast-path (generate vs free-run manual continuation): \
+             {n}/{} tokens, {diff} diffs -> {}",
+            free_gpu.tokens.len(),
+            if fast { "MATCH" } else { "MISMATCH" }
+        );
+        fast
+    };
+    println!();
+
     // --- Verdict + JSON report ---
-    let passed = agreement >= min_agree
+    let passed = agreement >= min_agree && fast_path_ok
         && gpu_run.nan_steps == 0
         && cmp.nan_diffs == 0;
     println!("\n--- Verdict ---");

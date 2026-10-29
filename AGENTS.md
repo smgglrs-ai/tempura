@@ -493,9 +493,20 @@ typical-p/repeat/presence/frequency)
       (q6k dual-block direct-load GEMV) -> 206 (Q6K v_proj via kpar) ->
       210 (cuGraphUpload). bench-quality teacher-forced PASS 89.1%
       throughout. Remaining micro-optimizations (not a gap anymore):
-      logits DtoH 39-49us/step (GPU-side greedy argmax would collapse it
-      to 4B) and ~40us residual launch cost (node-count reduction:
-      rmsnorm is 3 kernels x 65, the q/k rope chain 6 kernels x 32).
+      logits DtoH 39-49us/step and the CPU argmax are GONE for greedy
+      decoding since 2026-10-29: `forward_greedy` (InferenceModel trait,
+      CutileInferenceWrapper override) runs the decode graph + a GPU
+      argmax kernel (kernels/src/greedy_argmax.rs -- packed
+      (ordered-key<<32)|index u64 atomicMax reduction whose tie-break
+      exactly matches Rust max_by's last-max-wins; validated by a
+      permanent bench-quality section: generate vs free-run manual
+      continuation, 64/64 MATCH) and downloads 4 bytes instead of 513KB.
+      The same change fixed a pre-existing bug: CutileInferenceWrapper::
+      generate delegated to the CPU model's generate, which runs the CPU
+      forward and PANICS on GPU-loaded models whose CPU projection
+      weights were freed -- it is now a GPU-native loop. Remaining: ~40us
+      residual launch cost (node-count reduction: rmsnorm is 3 kernels x
+      65, the q/k rope chain 6 kernels x 32).
       NOTE: this GGUF (bartowski Llama-3.1-8B Q4_K_M) has a mixed layout
       -- 16 layers with Q6K v+down_proj, 16 with Q4K -- verified from the
       GGUF tensor-type census (193 Q4K + 33 Q6K) and the trace.
