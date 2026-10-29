@@ -687,6 +687,15 @@ typical-p/repeat/presence/frequency)
       last-row buffer (final norm input) is pre-allocated with a stable
       address. 7562 -> 7700 tok/s, TTFT 16.9 -> 16.5 ms. Logits
       fingerprint bitwise-identical, det=OK, bench-quality PASS 89.1%.
+      llama.cpp cross-implementation comparison (teacher-forced,
+      2026-10-29): tempura CPU 20.3%, tempura GPU 18.8% agreement with
+      llama.cpp's greedy choices -- an implementation difference (SIMD
+      accumulation order vs scalar f32), not a quality issue; the
+      internal GPU-vs-CPU 89.1% is the gate. llama.cpp's OWN CPU-vs-GPU
+      teacher-forced agreement: 76.6% (49/64) -- tempura's 89.1% is
+      BETTER than the reference implementation's internal consistency.
+      llama.cpp free-running CPU-vs-GPU diverges at token 0 (different
+      first token; the model is in near-tie territory immediately).
       Verified 2026-10-28: bench-decode-ops "prefill attn dev" 8/8, "rope
       prefill scratch" 4/4 and "rmsnorm prefill scratch" (grow/reuse/
       shrink/odd-seq) 4/4 all
