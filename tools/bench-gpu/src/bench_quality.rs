@@ -663,6 +663,38 @@ fn main() {
                         agree_gpu, n_follow, pct_gpu
                     );
 
+                    // Run tempura CPU through the ggml SIMD path
+                    // (AVX2/VNNI/AVX-512 -- the same kernel family
+                    // llama.cpp uses) and compare with llama.cpp.
+                    // Completes the quality matrix: scalar-vs-SIMD vs
+                    // SIMD-vs-SIMD agreement.
+                    {
+                        std::env::set_var("TEMPURA_CPU_SIMD", "1");
+                        let cpu_simd_vs_llama = greedy_generate(
+                            &cpu_model,
+                            &config,
+                            &prompt,
+                            n_follow,
+                            eos,
+                            Some(&llama_toks[..]),
+                        );
+                        std::env::remove_var("TEMPURA_CPU_SIMD");
+
+                        let agree_simd = (0..n_follow)
+                            .filter(|&i| {
+                                i < cpu_simd_vs_llama.tokens.len()
+                                    && cpu_simd_vs_llama.tokens[i] == llama_toks[i]
+                            })
+                            .count();
+                        let pct_simd =
+                            100.0 * agree_simd as f64 / n_follow.max(1) as f64;
+                        println!(
+                            "  tempura CPU (ggml SIMD) vs llama.cpp \
+                             (teacher-forced): {}/{} ({:.1}%)",
+                            agree_simd, n_follow, pct_simd
+                        );
+                    }
+
                     // Decode llama.cpp's text for display
                     if let Ok(text) = tok.decode(&llama_toks) {
                         println!("  llama.cpp text: {}", &text[..text.len().min(120)]);
