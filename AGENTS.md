@@ -189,10 +189,10 @@ every PR/push), `pages.yml`.
    - **rustc-codegen-cuda (oxide)** — hand-optimized kernels compiled with
      `cargo oxide build`: Q2_0/Q4K/Q6K decode GEMV (warp-shuffle reductions,
      dp4a), decode attention. Feature flag: `oxide-gemv`.
-     **Two backends**: fork (`crates/rustc-codegen-cuda`, nightly-2026-04-03,
-     has mma.sync) and upstream (`cuda-oxide/crates/rustc-codegen-cuda`,
-     nightly-2026-10-11, has dp4a). dp4a kernels require the upstream
-     backend: `RUSTUP_TOOLCHAIN=nightly-2026-10-11`.
+     **Upstream backend** (`cuda-oxide/crates/rustc-codegen-cuda`,
+     toolchain 1.99.1, has dp4a + libm-to-libdevice). The old fork
+     (mma.sync, invariant.load) was dropped 2026-10-29: no tempura
+     kernel used the fork-only features.
    Both coexist: oxide kernels auto-loaded from PTX when present, cuTile
    fallback. A third path: hand-written **sm_120a PTX** modules for Blackwell
    (dp4a/mma.sync/cp.async mbar kernels, stream-K batch GEMM).
@@ -815,10 +815,8 @@ cargo run -p tempura -- serve --model /path/to/model.gguf --port 8080
 Note: `cargo test` compiles `tempura-kernels` with the `oxide-gemv` feature
 (feature unification via tools/bench-gpu), so the oxide GEMV PTX must be
 present in the kernels build out dirs — `scripts/gpu-remote.sh oxide` or the
-manual copy loop in the GPU section provides them. `oxide` now selects the
-backend per crate (fork for oxide-gemv, upstream+1.99.1 for the dp4a crates)
--- the fork backend cannot compile the f16-subnormal fix in oxide-gemv-q4k
-and silently leaves a stale PTX behind.
+manual copy loop in the GPU section provides them. All oxide crates use
+the upstream backend (toolchain 1.99.1).
 
 Benchmarks: `tools/bench` (HTTP throughput, llama.cpp-bench-style pp/tg),
 `tools/bench-gpu` (bench-real-model, bench-batch, bench-mxfp4, bench-e2e,
@@ -843,23 +841,22 @@ usage: run the script with no arguments.
 
 ## GPU Kernels (cuda-oxide)
 
-We use a fork of cuda-oxide at `~/Code/github.com/NVLabs/cuda-oxide` with
-mma.sync intrinsics and invariant.load codegen. (A 2026-10-27 bug-hunt
-branch here was deleted after the "cutlass-mlir miscompile" resolved as our
-own kernel's wrong accumulator store mapping — see Decode correctness in
-Implemented capabilities; the record lives in tempura's history.)
+We use upstream cuda-oxide main at `~/Code/github.com/NVLabs/cuda-oxide`
+(switched from the fork 2026-10-29: no tempura kernel used the fork-only
+features — mma.sync, invariant.load, multi-output ptx_asm — and upstream
+gained libm-to-libdevice, u64 cooperative groups, and #[nounroll]).
 
 **`cargo oxide build` uses a
-cached backend `.so` from `~/.cargo/cuda-oxide/`, built from upstream — NOT
-the fork.** You MUST point it at the local build:
+cached backend `.so` from `~/.cargo/cuda-oxide/`** — point it at the local
+upstream build:
 
 ```sh
-# Build the codegen backend from our fork (once, or after fork changes)
-cd ~/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codegen-cuda
-cargo build --release
+# Build the codegen backend from upstream (once, or after upstream changes)
+cd ~/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda
+RUSTC_BOOTSTRAP=1 cargo build --release
 
 # Set this in every shell that runs cargo oxide build
-export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
+export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
 ```
 
 The UPSTREAM backend (`cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda`) is
@@ -991,7 +988,7 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       grid for small-n/long-k): 154.1 TFLOPS at (128, 4096, 14336)
 
 If you see `Symbol cuda_device__mma_sync__... not found`, the backend is stale.
-Rebuild it from the fork and set `CUDA_OXIDE_BACKEND`.
+Rebuild it from upstream and set `CUDA_OXIDE_BACKEND`.
 
 ## Formal Verification
 
