@@ -502,7 +502,7 @@ typical-p/repeat/presence/frequency)
 - [ ] Prefill on GPU: 7257 tok/s pp128, TTFT P50 17.6 ms (2026-10-28/29, nsys-
       driven: on-device attention + scratch RoPE + pooled norms/adds/SiLU +
       Q6K down_proj via MXFP4 + flash BR=16 + lm_head BK=512/last-row d2d)
-      vs llama.cpp 7335 (1.17x gap; 15.3x the 408 tok/s host-staged
+      vs llama.cpp 7335 (1.01x gap -- parity; 17.8x the 408 tok/s host-staged
       baseline). Six changes landed 2026-10-28:
       (a) The prefill attention is fully on-device: 3
       `cutile_gather_heads` (de-interleave Q/K/V into head-major padded
