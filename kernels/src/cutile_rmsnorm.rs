@@ -60,6 +60,46 @@ impl RmsnormScratch {
 pub mod kernels {
     use cutile::core::*;
 
+    /// Fused RMSNorm: sum-of-squares + rsqrt scale + apply in ONE kernel.
+    ///
+    /// Replaces the 3-kernel chain (rmsnorm_sum_sq -> cutile_rmsnorm_scale
+    /// -> rmsnorm_apply) which costs 3 kernel launches and 4 memory
+    /// round-trips per call (× 65 instances per decode step = 195 of the
+    /// ~930 graph nodes). The fused kernel computes everything in
+    /// registers: load x and w, reduce sum(x^2), rsqrt, multiply.
+    ///
+    /// Bitwise-equal to the 3-kernel chain: same reduction (reduce_sum on
+    /// the [H] tile), same scale formula (rsqrt(sum*inv_h + eps)), same
+    /// apply (x * scale * w), same cutile rsqrt (ftz::Disabled).
+    #[cutile::entry()]
+    pub fn rmsnorm_fused<const H: i32>(
+        out: &mut Tensor<f32, { [H] }>,
+        x: &Tensor<f32, { [-1] }>,
+        weight: &Tensor<f32, { [-1] }>,
+        inv_h: f32,
+        eps: f32,
+    ) {
+        let pid = program_id(0);
+        let tile_x: Tile<f32, { [H] }> = x.partition(shape![H]).load([pid]);
+        let tile_w: Tile<f32, { [H] }> = weight.partition(shape![H]).load([0i32]);
+
+        // Pass 1: sum(x^2) -- same reduction as rmsnorm_sum_sq.
+        let sq: Tile<f32, { [H] }> = tile_x * tile_x;
+        let sum: Tile<f32, { [] }> = reduce_sum(sq, 0i32);
+        let sum_tile: Tile<f32, { [1] }> = sum.reshape(shape![1]);
+
+        // Pass 2: scale = rsqrt(sum/H + eps) -- same formula as
+        // cutile_rmsnorm_scale.
+        let mean_eps = sum_tile * broadcast_scalar(inv_h, shape![1])
+            + broadcast_scalar(eps, shape![1]);
+        let scale_tile: Tile<f32, { [1] }> = rsqrt(mean_eps, ftz::Disabled);
+
+        // Pass 3: apply (x * scale * w) -- same as rmsnorm_apply.
+        let s_broad: Tile<f32, { [H] }> =
+            broadcast_scalar(tile_to_scalar(reduce_sum(scale_tile, 0i32)), shape![H]);
+        out.store(tile_x * s_broad * tile_w);
+    }
+
     /// RMSNorm pass 1: compute sum(x^2) per token row into a 1-element tile.
     ///
     /// One program instance per token. H = hidden_size.
@@ -332,6 +372,59 @@ impl CutileRmsNorm {
         scratch: &mut RmsnormScratch,
     ) -> Result<Arc<Tensor<f32>>> {
         let inv_h = 1.0f32 / hidden_size as f32;
+
+        // -- Fused single-kernel path (default) --------------------------------
+        // ONE kernel replaces the sum_sq -> scale -> apply chain: computes
+        // everything in registers (bitwise-equal -- same reduction, same
+        // rsqrt, same apply formula). Eliminates 2 kernel launches and 4
+        // memory round-trips per call (× 65 instances per decode step).
+        // TEMPURA_NO_FUSED_RMSNORM=1 bisects back to the 3-kernel chain.
+        if std::env::var("TEMPURA_NO_FUSED_RMSNORM").as_deref() != Ok("1") {
+            let n_out = seq_len * h_pad;
+            let out_tensor = match scratch.out_t.take() {
+                Some(arc) => match Arc::try_unwrap(arc) {
+                    Ok(tensor) => {
+                        if tensor.size() == n_out {
+                            tensor
+                                .reshape(&[n_out])
+                                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        } else {
+                            api::zeros::<f32>(&[n_out])
+                                .sync_on(stream)
+                                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        }
+                    }
+                    Err(arc_back) => {
+                        scratch.out_t = Some(arc_back);
+                        api::zeros::<f32>(&[n_out])
+                            .sync_on(stream)
+                            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    }
+                },
+                None => api::zeros::<f32>(&[n_out])
+                    .sync_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+            };
+            let out_part = out_tensor.partition([h_pad]);
+
+            let (out_part_out, _x, _w, _ih, _ep) = unsafe {
+                kernels::rmsnorm_fused(out_part, x_dev, weight_dev.clone(), inv_h, eps)
+                    .generics(vec![h_pad.to_string()])
+                    .async_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            };
+
+            let out_2d = Arc::new(
+                out_part_out
+                    .unpartition()
+                    .reshape(&[seq_len, h_pad])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+            );
+            scratch.out_t = Some(out_2d.clone());
+            return Ok(out_2d);
+        }
+
+        // -- 3-kernel chain (TEMPURA_NO_FUSED_RMSNORM=1 bisect path) -----------
 
         // -- Reclaim or allocate sum_t -----------------------------------------
         // Size check: the scratch may be sized for a different seq_len
