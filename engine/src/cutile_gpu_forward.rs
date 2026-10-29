@@ -1510,7 +1510,7 @@ impl CutileGpuModel {
             1,
             SLOT_DOWN,
         );
-        let _ = self.gemm_d2d_slot(&dummy_h, "lm_head.weight", 1, SLOT_LOGITS);
+        let _ = self.lm_head_gemm(&dummy_h, 1, SLOT_LOGITS);
 
         // Also warm up the m>1 prefill path (tiled GEMM) for a representative batch.
         let dummy_h_128 = self.to_device(&vec![0.0f32; 128 * self.h_pad], 128, self.h_pad);
@@ -1554,8 +1554,40 @@ impl CutileGpuModel {
         let q_pad = next_pow2(q_dim.div_ceil(BK) * BK);
         let inter_pad = next_pow2(inter.div_ceil(BK) * BK);
 
-        // lm_head  [vocab, h] -- typically not Q4_K/Q2_0; keep dequantized path.
-        Self::maybe_upload(&matmul, &mut dw, qw, "lm_head.weight", vocab, h)?;
+        // Per-projection upload priority: Q4_K -> Q6_K -> Q2_0 -> f32 dequant.
+        // Use raw GGUF 36-u32 format if the v3r kernel supports it.
+        // (Hoisted out of the layer loop so lm_head can use the same chain.)
+        let mut try_proj = |name: String, n: usize, k: usize| {
+            (|| -> Result<(), tempura_kernels::KernelError> {
+                let uploaded_q4k = if upload_raw_q4k {
+                    Self::maybe_upload_q4k_raw(matmul.stream(), &mut dw_q4k, qw, &name, n, k)?
+                } else {
+                    Self::maybe_upload_q4k(matmul.stream(), &mut dw_q4k, qw, &name, n, k)?
+                };
+                if uploaded_q4k {
+                    return Ok(());
+                }
+                let uploaded_q6k =
+                    Self::maybe_upload_q6k(matmul.stream(), &mut dw_q6k, qw, &name, n, k)?;
+                if uploaded_q6k {
+                    return Ok(());
+                }
+                let uploaded_q2 =
+                    Self::maybe_upload_q2(matmul.stream(), &mut dw_q2, qw, &name, n, k)?;
+                if !uploaded_q2 {
+                    Self::maybe_upload(&matmul, &mut dw, qw, &name, n, k)?;
+                }
+                Ok(())
+            })()
+        };
+
+        // lm_head [vocab, h] -- same quant priority as the layer projections.
+        // Q4_K_M quantizes output.weight to Q6_K (435MB packed vs 2.1GB
+        // dequantized f32): keeping it packed makes the m=1 decode GEMV read
+        // the packed form instead of 2.1GB of f32 every token (~21% of ITL,
+        // nsys 2026-10-29) and saves ~1.6GB VRAM. Unquantized heads keep the
+        // f32 dequant path.
+        try_proj("lm_head.weight".to_string(), vocab, h)?;
 
         // TEMPURA_NO_MXFP4=1 skips MXFP4 tiling of the Q4K/BF16 projections so
         // the batch decode graph dispatches the original Q4K/Q6K GEMV kernels
@@ -1571,34 +1603,6 @@ impl CutileGpuModel {
 
         for layer in 0..config.num_layers {
             let p = format!("model.layers.{layer}");
-
-            // For each projection: try Q4_K GPU-resident first, then Q2_0, then f32.
-            // The inner block avoids a closure so all three maps can be borrowed mutably.
-            let mut try_proj = |name: String, n: usize, k: usize| {
-                (|| -> Result<(), tempura_kernels::KernelError> {
-                    // Priority: Q4_K -> Q6_K -> Q2_0 -> f32 dequantized.
-                    // Use raw GGUF 36-u32 format if the v3r kernel supports it.
-                    let uploaded_q4k = if upload_raw_q4k {
-                        Self::maybe_upload_q4k_raw(matmul.stream(), &mut dw_q4k, qw, &name, n, k)?
-                    } else {
-                        Self::maybe_upload_q4k(matmul.stream(), &mut dw_q4k, qw, &name, n, k)?
-                    };
-                    if uploaded_q4k {
-                        return Ok(());
-                    }
-                    let uploaded_q6k =
-                        Self::maybe_upload_q6k(matmul.stream(), &mut dw_q6k, qw, &name, n, k)?;
-                    if uploaded_q6k {
-                        return Ok(());
-                    }
-                    let uploaded_q2 =
-                        Self::maybe_upload_q2(matmul.stream(), &mut dw_q2, qw, &name, n, k)?;
-                    if !uploaded_q2 {
-                        Self::maybe_upload(&matmul, &mut dw, qw, &name, n, k)?;
-                    }
-                    Ok(())
-                })()
-            };
 
             // Q / K / V projections: [q_dim/kv_dim, h]
             try_proj(format!("{p}.self_attn.q_proj.weight"), q_dim, h)?;
@@ -1681,6 +1685,36 @@ impl CutileGpuModel {
         // Final norm weight.
         if let Some(w) = qw.get_f32("model.norm.weight") {
             Self::upload_norm_weight(matmul.stream(), &mut nw, "model.norm.weight", w, h, h_pad)?;
+        }
+
+        // lm_head MXFP4 tiling for the m>1 paths (prefill + batch-decode
+        // logits, which run outside the decode graph): the m=1 decode keeps
+        // the exact Q6K kpar GEMV; the tiled copy serves the batch GEMM
+        // (435MB Q6K -> 109MB MXFP4 -- the f32 GEMM previously re-read
+        // 2.1GB per prefill). Best-effort, same chain as the layer weights.
+        if !mxfp4_tiling_disabled {
+            let q4k_ok = match Self::maybe_upload_mxfp4_tiled_from_q4k(
+                matmul.stream(), &mut dw_mxfp4_tiled, qw, "lm_head.weight", vocab, h,
+            ) {
+                Ok(ok) => ok,
+                Err(e) => { eprintln!("[mxfp4] tiled q4k lm_head: {e}"); false }
+            };
+            let mut uploaded = q4k_ok;
+            if !uploaded {
+                uploaded = match Self::maybe_upload_mxfp4_tiled_from_bf16(
+                    matmul.stream(), &mut dw_mxfp4_tiled, qw, "lm_head.weight", vocab, h,
+                ) {
+                    Ok(ok) => ok,
+                    Err(e) => { eprintln!("[mxfp4] tiled bf16 lm_head: {e}"); false }
+                };
+            }
+            if !uploaded {
+                if let Err(e) = Self::maybe_upload_mxfp4_tiled_from_q6k(
+                    matmul.stream(), &mut dw_mxfp4_tiled, qw, "lm_head.weight", vocab, h,
+                ) {
+                    eprintln!("[mxfp4] tiled q6k lm_head: {e}");
+                }
+            }
         }
 
         let q4k_gemv = CutileQ4Gemv::from_stream(matmul.stream().clone());
@@ -2002,8 +2036,8 @@ impl CutileGpuModel {
             all_proj_q4k,
         };
         eprintln!("[cutile] warming up kernel specializations...");
-        model.warmup_gemms();
         model.preallocate_scratch();
+        model.warmup_gemms();
         eprintln!("[cutile] kernel warmup complete");
         Ok(model)
     }
@@ -2318,8 +2352,8 @@ impl CutileGpuModel {
             all_proj_q4k: false, // from_f32 uses f32 weights, not Q4K
         };
         eprintln!("[cutile] warming up kernel specializations...");
-        model.warmup_gemms();
         model.preallocate_scratch();
+        model.warmup_gemms();
         eprintln!("[cutile] kernel warmup complete");
         Ok(model)
     }
@@ -2944,11 +2978,13 @@ impl CutileGpuModel {
             }
         }
 
-        // Pre-allocate kpar output scratch for the Q6K sm120_mbar GEMV.
-        // max_n = inter (largest Q6K output, e.g. gate/up_proj for MLP FFN expand).
+        // Pre-allocate kpar output scratch for the Q6K sm120 kpar8 GEMV.
+        // max_n = max(inter, vocab): inter is the largest layer output
+        // (gate/up), vocab covers lm_head (quantized heads also dispatch
+        // through the kpar path -- nsys 2026-10-29).
         if let Some(ref oxide) = self.oxide_q6k_gemv {
             if oxide.has_kpar() {
-                oxide.pre_allocate_kpar_output_scratch(inter)
+                oxide.pre_allocate_kpar_output_scratch(inter.max(vocab))
                     .expect("oxide Q6K: pre_allocate_kpar_output_scratch failed");
             }
         }
@@ -3045,6 +3081,51 @@ impl CutileGpuModel {
     /// When the pool slot holds a uniquely-owned `Arc<Tensor<f32>>`, reclaims
     /// the tensor and reuses the device allocation.  Falls back to a fresh
     /// allocation if the Arc is shared or the slot is empty.
+    /// lm_head dispatch: f32 device map first (unquantized heads -- BF16
+    /// models), then the quant maps via `gemm_any_d2d_slot` (m=1 -> exact
+    /// Q6K/Q4K kpar GEMV on the packed weights; m>1 -> MXFP4 tiled GEMM when
+    /// the tiled copy exists, q6k batch GEMV otherwise).
+    ///
+    /// The m=1 quant path writes the shared kpar output scratch, NOT the
+    /// caller's slot -- so the result is mirrored into `scratch[slot]` with a
+    /// D2D copy (~0.5MB, captured inside the decode graph): the graph callers
+    /// download logits from SLOT_LOGITS after the launch and must keep
+    /// finding them there.
+    fn lm_head_gemm(&self, a: &Arc<Tensor<f32>>, m: usize, slot: usize) -> Arc<Tensor<f32>> {
+        if self.device_weights.contains_key("lm_head.weight") {
+            if m == 1 {
+                return self.gemm_d2d_slot(a, "lm_head.weight", 1, slot);
+            }
+            return self.gemm_d2d(a, "lm_head.weight", m);
+        }
+        let result = self.gemm_any_d2d_slot(a, "lm_head.weight", m, slot);
+        if m == 1 {
+            let dst = self.scratch.borrow()[slot].clone();
+            match dst {
+                Some(dst) => {
+                    if dst.device_pointer().cu_deviceptr()
+                        != result.device_pointer().cu_deviceptr()
+                    {
+                        let n = result.size();
+                        unsafe {
+                            cuda_core::memcpy_dtod_async::<f32>(
+                                dst.device_pointer().cu_deviceptr(),
+                                result.device_pointer().cu_deviceptr(),
+                                n,
+                                self.matmul.stream(),
+                            )
+                            .expect("lm_head_gemm: slot mirror D->D copy failed");
+                        }
+                    }
+                }
+                None => {
+                    self.scratch.borrow_mut()[slot] = Some(result.clone());
+                }
+            }
+        }
+        result
+    }
+
     fn gemm_d2d_slot(
         &self,
         a: &Arc<Tensor<f32>>,
@@ -5065,16 +5146,11 @@ impl CutileGpuModel {
             self.nan_report("final-norm", &last_dev);
         }
 
-        // lm_head GEMV -- result stored in SLOT_LOGITS (pre-allocated).
-        self.gemm_d2d_slot(&last_dev, "lm_head.weight", 1, SLOT_LOGITS);
+        // lm_head GEMV -- result stored in SLOT_LOGITS (pre-allocated) or the
+        // kpar output scratch (quantized heads, m=1).
+        let logits_dev = self.lm_head_gemm(&last_dev, 1, SLOT_LOGITS);
         if self.debug_nan_trace {
-            let logits_arc = self
-                .scratch
-                .borrow()
-                [SLOT_LOGITS]
-                .clone()
-                .expect("SLOT_LOGITS empty after lm_head");
-            self.nan_report("lm_head", &logits_arc);
+            self.nan_report("lm_head", &logits_dev);
         }
     }
 
@@ -5740,7 +5816,7 @@ impl CutileGpuModel {
                 .expect("CutileGpuModel: final RMSNorm failed")
         };
 
-        let logits_dev = self.gemm_d2d_slot(&last_dev, "lm_head.weight", 1, SLOT_LOGITS);
+        let logits_dev = self.lm_head_gemm(&last_dev, 1, SLOT_LOGITS);
         self.download_device_tensor(&logits_dev)
     }
 
@@ -6776,7 +6852,7 @@ impl CutileGpuModel {
             )
             .expect("mxfp4 batch graph: final RMSNorm");
 
-        let logits_dev = self.gemm_d2d(&last_dev, "lm_head.weight", m);
+        let logits_dev = self.lm_head_gemm(&last_dev, m, SLOT_LOGITS);
         let logits_flat = self.download_device_tensor(&logits_dev);
         Some(logits_flat.chunks(vocab).map(|c| c.to_vec()).collect())
     }
@@ -7038,7 +7114,7 @@ impl CutileGpuModel {
             .expect("batch graph: final RMSNorm");
 
         // lm_head: [M, H] -> [M, vocab]  -- run outside graph (allocation OK here)
-        let logits_dev = self.gemm_d2d(&last_dev, "lm_head.weight", m);
+        let logits_dev = self.lm_head_gemm(&last_dev, m, SLOT_LOGITS);
         let logits_flat = self.download_device_tensor(&logits_dev);
         logits_flat.chunks(vocab).map(|c| c.to_vec()).collect()
     }
