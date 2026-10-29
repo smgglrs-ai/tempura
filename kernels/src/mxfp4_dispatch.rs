@@ -27,6 +27,16 @@ use std::sync::Arc;
 static MXFP4_CUBIN: &[u8] = include_bytes!("../../tools/mxf4-gemv/mxf4_gemv.cubin");
 
 const KERNEL_NAME: &str = "mxf4_batch_gemm_tiled";
+const KERNEL_NAME_RB4: &str = "mxf4_batch_gemm_tiled_rb4";
+
+/// Minimum rb4 grid size (blocks) for the register-blocked kernel to beat
+/// the m16n8 kernel: rb4 quarters the block count (each warp covers 4 n8
+/// tiles), so it only wins on large-n shapes that still fill the SMs --
+/// measured on the prefill m=128 shapes (tools/mxf4-gemv benchmark,
+/// 2026-10-29): (128,14336,4096) 122.4 -> 106.2 us (141.6 TFLOPS, 896
+/// blocks) vs (128,4096,4096) 35.8 vs 38.8 us (256 blocks) and
+/// (128,1024,4096) 11.7 vs 37.0 us (64 blocks).
+const RB4_MIN_BLOCKS: u32 = 512;
 
 /// Host-side dispatch for the cute-rs sm_120a MXFP4 tiled batch GEMM and the
 /// sm_120 GPU activation quantization kernel.
@@ -36,6 +46,10 @@ const KERNEL_NAME: &str = "mxf4_batch_gemm_tiled";
 pub struct MxfpGemm {
     cu_module:     sys::CUmodule,
     cu_function:   sys::CUfunction,
+    /// Register-blocked variant (m16n32 per warp, 4 MMAs sharing the A
+    /// fragment): bit-identical output, preferred on large-n grids.
+    /// None when the cubin predates it.
+    cu_function_rb4: Option<sys::CUfunction>,
     /// GPU activation quantization: f32 -> E2M1+UE8M0 tiled. None if unsupported.
     cu_quant_mod:  Option<sys::CUmodule>,
     cu_quant_fn:   Option<sys::CUfunction>,
@@ -73,6 +87,22 @@ impl MxfpGemm {
             return None;
         }
         let func = unsafe { func.assume_init() };
+
+        // Best-effort: the register-blocked variant (same cubin, second
+        // entry). Older cubins without it keep working.
+        let cu_function_rb4 = {
+            let rb_name = CString::new(KERNEL_NAME_RB4).unwrap_or_default();
+            let mut rb_fn = std::mem::MaybeUninit::uninit();
+            let rb_rc = unsafe {
+                sys::cuModuleGetFunction(rb_fn.as_mut_ptr(), module, rb_name.as_ptr())
+            };
+            if rb_rc == 0 {
+                Some(unsafe { rb_fn.assume_init() })
+            } else {
+                eprintln!("[mxfp4] cuModuleGetFunction({KERNEL_NAME_RB4}) failed (rc={rb_rc})");
+                None
+            }
+        };
 
         let mut sm_count = 0i32;
         unsafe {
@@ -116,7 +146,7 @@ impl MxfpGemm {
             "[mxfp4] MxfpGemm loaded: {KERNEL_NAME} ({} bytes cubin, sm_count={sm_count})",
             MXFP4_CUBIN.len()
         );
-        Some(Self { cu_module: module, cu_function: func, cu_quant_mod, cu_quant_fn, sm_count, stream })
+        Some(Self { cu_module: module, cu_function: func, cu_function_rb4, cu_quant_mod, cu_quant_fn, sm_count, stream })
     }
 
     /// Row-offset chunk variant of [`MxfpGemm::forward`].
@@ -147,13 +177,57 @@ impl MxfpGemm {
         let m_tiles = m / 16;
         debug_assert!(n_tiles >= 1, "n must be >= 8 (got {n})");
         debug_assert!(m_tiles >= 1, "m must be >= 16 (got {m})");
-        let grid_x = n_tiles.div_ceil(4);
 
         // Byte offsets: a packed row = k64_tiles * 32 bytes; the m16 tile
         // scale rows advance every 16 packed rows; a C row = n f32.
         let a_row_bytes = (a_row as u64) * (k64_tiles as u64) * 32;
         let a_scales_bytes = ((a_row / 16) as u64) * (k64_tiles as u64) * 2;
         let c_row_bytes = (c_row as u64) * (n as u64) * 4;
+
+        // Register-blocked variant on large-n grids (see RB4_MIN_BLOCKS).
+        // Bit-identical output; same 8-parameter signature.
+        if let Some(rb4_fn) = self.cu_function_rb4 {
+            let rb4_grid_x = n_tiles.div_ceil(16);
+            if rb4_grid_x * m_tiles >= RB4_MIN_BLOCKS {
+                let mut p_ap = a_packed.device_pointer().cu_deviceptr() as u64 + a_row_bytes;
+                let mut p_as = a_scales.device_pointer().cu_deviceptr() as u64 + a_scales_bytes;
+                let mut p_bp = b_packed.device_pointer().cu_deviceptr() as u64;
+                let mut p_bs = b_scales.device_pointer().cu_deviceptr() as u64;
+                let mut p_c  = c.device_pointer().cu_deviceptr() as u64 + c_row_bytes;
+                let mut pm   = m;
+                let mut pn   = n;
+                let mut pk   = k64_tiles;
+                let mut params: [*mut std::ffi::c_void; 8] = [
+                    &mut p_ap as *mut _ as *mut std::ffi::c_void,
+                    &mut p_as as *mut _ as *mut std::ffi::c_void,
+                    &mut p_bp as *mut _ as *mut std::ffi::c_void,
+                    &mut p_bs as *mut _ as *mut std::ffi::c_void,
+                    &mut p_c  as *mut _ as *mut std::ffi::c_void,
+                    &mut pm   as *mut _ as *mut std::ffi::c_void,
+                    &mut pn   as *mut _ as *mut std::ffi::c_void,
+                    &mut pk   as *mut _ as *mut std::ffi::c_void,
+                ];
+                let rc = unsafe {
+                    sys::cuLaunchKernel(
+                        rb4_fn,
+                        rb4_grid_x, m_tiles, 1,
+                        128, 1, 1,
+                        0,
+                        cu_stream,
+                        params.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != 0 {
+                    return Err(KernelError::InvalidConfig(format!(
+                        "{KERNEL_NAME_RB4} cuLaunchKernel failed: {rc}"
+                    )));
+                }
+                return Ok(());
+            }
+        }
+
+        let grid_x = n_tiles.div_ceil(4);
 
         let mut p_ap = a_packed.device_pointer().cu_deviceptr() as u64 + a_row_bytes;
         let mut p_as = a_scales.device_pointer().cu_deviceptr() as u64 + a_scales_bytes;

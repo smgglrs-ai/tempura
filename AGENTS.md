@@ -499,10 +499,10 @@ typical-p/repeat/presence/frequency)
       NOTE: this GGUF (bartowski Llama-3.1-8B Q4_K_M) has a mixed layout
       -- 16 layers with Q6K v+down_proj, 16 with Q4K -- verified from the
       GGUF tensor-type census (193 Q4K + 33 Q6K) and the trace.
-- [ ] Prefill on GPU: 6033 tok/s pp128, TTFT P50 21.2 ms (2026-10-28/29, nsys-
+- [ ] Prefill on GPU: 6255 tok/s pp128, TTFT P50 20.4 ms (2026-10-28/29, nsys-
       driven: on-device attention + scratch RoPE + pooled norms/adds/SiLU +
       Q6K down_proj via MXFP4 + flash BR=16 + lm_head BK=512/last-row d2d)
-      vs llama.cpp 7335 (1.22x gap; 14.3x the 408 tok/s host-staged
+      vs llama.cpp 7335 (1.17x gap; 15.3x the 408 tok/s host-staged
       baseline). Six changes landed 2026-10-28:
       (a) The prefill attention is fully on-device: 3
       `cutile_gather_heads` (de-interleave Q/K/V into head-major padded
@@ -582,6 +582,24 @@ typical-p/repeat/presence/frequency)
       (ITL 7.15 -> 5.83 ms -- the decode gap item below). Not bitwise
       (reduction order), but det=OK, NaN-free, bench-quality PASS 89.1%
       unchanged, argmax identical.
+      (g) MXFP4 GEMM register-blocked variant (2026-10-29): the m16n8
+      kernel issues ~10 global loads per MMA (load-issue-bound at
+      111-127 TFLOPS on the m=128 prefill shapes; GEMMs = 75% of prefill
+      GPU time, nsys). mxf4_batch_gemm_tiled_rb4 gives each warp an
+      m16 x n32 tile -- 4 MMAs share each A-fragment load (per-MMA load
+      count ~4.5, A re-read traffic /4). BITWISE-equal output (same MMA,
+      same k-order; validated by the tool's random-data CPU reference AND
+      a cross-kernel bit comparison, plus the in-engine prefill logits
+      fingerprint staying identical). Wins only on large-n grids (it
+      quarters the block count): gate/up [128,14336,4096] 122.4 -> 106.2 us
+      (141.6 TFLOPS) but loses at n<=4096 -- the host dispatches rb4 only
+      when ceil(n_tiles/16) * m_tiles >= 512 (RB4_MIN_BLOCKS; m=16 batch
+      decode never qualifies). 6084 -> 6255 tok/s, TTFT 21.0 -> 20.4 ms.
+      A first cut dropped the `+ lane/4` from the B row index -- the
+      cross-kernel bit comparison caught it instantly (uniform-data tests
+      could not have). Remaining levers: B L2 re-read traffic across
+      m-tiles (smem staging or m32 tiles), the attention gather/scatter
+      copies, SiLU-into-GEMM-epilogue fusion.
       Verified 2026-10-28: bench-decode-ops "prefill attn dev" 8/8, "rope
       prefill scratch" 4/4 and "rmsnorm prefill scratch" (grow/reuse/
       shrink/odd-seq) 4/4 all
@@ -847,8 +865,8 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       instantiation removed the 122-139us serialized launch cost:
       **210 tok/s -- llama.cpp parity reached (ref 209)**, ITL 4.77 ms,
       teacher-forced PASS 89.1%)
-- Llama-3.1-8B Q4K prefill: **6084 tok/s pp128**, TTFT P50 21.0 ms
-      (1.22x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
+- Llama-3.1-8B Q4K prefill: **6255 tok/s pp128**, TTFT P50 20.4 ms
+      (1.17x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1331 -- the MXFP4 band including the
       Q6K->MXFP4 down_proj double-quantization (lossier than the Q4K path's
       0.1015; bench-quality teacher-forced PASS 89.1%, all mismatches
@@ -878,7 +896,8 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       M>=2 uses the generalized M-row q6k batch kernel + MXFP4 tensor-core
       Q/K/O/gate/up (m_valid-masked activation quant); M=1 routes to the
       single-seq CUDA graph path.
-- MXFP4 M=64: 55.6 TFLOPS
+- MXFP4 M=64: 55.6 TFLOPS; register-blocked rb4 variant (m16n32/warp,
+      large-n grids only): 141.6 TFLOPS at (128, 14336, 4096)
 
 If you see `Symbol cuda_device__mma_sync__... not found`, the backend is stale.
 Rebuild it from the fork and set `CUDA_OXIDE_BACKEND`.

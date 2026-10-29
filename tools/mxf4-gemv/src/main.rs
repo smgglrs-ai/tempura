@@ -239,6 +239,182 @@ mod kernels {
                 }
             }
     }
+
+    // Register-blocked variant: each warp computes an m16 x n32 tile (FOUR
+    // consecutive n8 tiles). The A fragment -- and its 4 global loads -- is
+    // shared by all 4 MMAs of a k64 step, cutting the per-MMA load count
+    // from ~10 (the m16n8 kernel: 4 A + 2 B + 4 scale byte-loads per single
+    // MMA) to ~4.5, and the A re-read traffic across n-tiles drops 4x.
+    // The m16n8 kernel's inner loop is load-issue-bound at 111-127 TFLOPS
+    // (nsys, prefill m=128 shapes); this attacks exactly that ratio.
+    //
+    // Grid: (ceil(n_tiles/16), m_tiles, 1); block (128,1,1) = 4 warps; warp
+    // w computes n-tiles [bx*16 + w*4, +4). n must be a multiple of 8; a
+    // partial trailing group (n_tiles % 4 != 0) is handled by clamping the
+    // invalid tiles' B/scale addresses to tile 0 (Blackwell traps on OOB
+    // even under predication) and skipping their stores.
+    //
+    // Numerics: identical MMA instruction and k-order -> bitwise-equal to
+    // mxf4_batch_gemm_tiled for the same inputs (validated by test 4's
+    // random-data reference + a direct cross-kernel comparison).
+    #[kernel]
+    pub unsafe fn mxf4_batch_gemm_tiled_rb4(
+        a_packed: *const u8,
+        a_scales: *const u8,
+        b_packed: *const u8,
+        b_scales: *const u8,
+        c: *mut f32,
+        m: u32,
+        n: u32,
+        k64_tiles: u32,
+    ) {
+        let tid = thread::threadIdx_x();
+        let bid_x = thread::blockIdx_x();
+        let bid_y = thread::blockIdx_y();
+        let warp_id = tid / 32;
+        let lane = (tid % 32) as usize;
+
+        let m_tiles = m / 16;
+        let n_tiles = n / 8;
+
+        let tile_m = bid_y;
+        let tile_n0 = bid_x * 16 + warp_id * 4;
+        if tile_n0 >= n_tiles {
+            return;
+        }
+
+        // Per-j tile indices, clamped to a valid tile for address formation.
+        let tn = [
+            tile_n0 as usize,
+            (tile_n0 + 1) as usize,
+            (tile_n0 + 2) as usize,
+            (tile_n0 + 3) as usize,
+        ];
+        let n_clamp = (n_tiles - 1) as usize;
+        let tnc = [
+            tn[0].min(n_clamp),
+            tn[1].min(n_clamp),
+            tn[2].min(n_clamp),
+            tn[3].min(n_clamp),
+        ];
+        let j_valid = [
+            tn[0] < n_tiles as usize,
+            tn[1] < n_tiles as usize,
+            tn[2] < n_tiles as usize,
+            tn[3] < n_tiles as usize,
+        ];
+
+        let mut acc0 = Accumulator16x8::zero();
+        let mut acc1 = Accumulator16x8::zero();
+        let mut acc2 = Accumulator16x8::zero();
+        let mut acc3 = Accumulator16x8::zero();
+
+        let mut k = 0u32;
+        while k < k64_tiles {
+            let a_ptr = a_packed as *const u32;
+            let a_row_u32 = (k64_tiles * 8) as usize;
+            let k_u32_base = (k * 8) as usize;
+            let base_m = (tile_m * 16) as usize;
+
+            let row0 = base_m + lane / 4;
+            let row1 = base_m + lane / 4 + 8;
+            let col_lo = lane % 4;
+            let col_hi = (lane % 4) + 4;
+
+            let a_reg = [
+                unsafe { *a_ptr.add(row0 * a_row_u32 + k_u32_base + col_lo) },
+                unsafe { *a_ptr.add(row1 * a_row_u32 + k_u32_base + col_lo) },
+                unsafe { *a_ptr.add(row0 * a_row_u32 + k_u32_base + col_hi) },
+                unsafe { *a_ptr.add(row1 * a_row_u32 + k_u32_base + col_hi) },
+            ];
+            let a_frag = Mxf4A::from_registers(a_reg);
+
+            let b_ptr = b_packed as *const u32;
+            let b_row_u32 = (k64_tiles * 8) as usize;
+            let bk_base = (k * 8) as usize;
+            let bk_lo = lane % 4;
+            let bk_hi = (lane % 4) + 4;
+
+            let b_scale_ptr = b_scales;
+            let bs_base = (k * 2) as usize;
+
+            // A scale pair (shared by all 4 MMAs).
+            let a_scale_base = (tile_m * k64_tiles * 2 + k * 2) as usize;
+            let a_lo = unsafe { *a_scales.add(a_scale_base) };
+            let a_hi = unsafe { *a_scales.add(a_scale_base + 1) };
+            let scale_a = ScalePairA::from_bits((a_lo as u16) | ((a_hi as u16) << 8));
+
+            // NOTE: unrolled by hand -- ctm-rs arrays of frags did not
+            // index cleanly; 4 explicit blocks keep the register mapping
+            // identical to the validated m16n8 kernel.
+            let b_reg0 = [
+                unsafe { *b_ptr.add((tnc[0] * 8 + lane / 4) * b_row_u32 + bk_base + bk_lo) },
+                unsafe { *b_ptr.add((tnc[0] * 8 + lane / 4) * b_row_u32 + bk_base + bk_hi) },
+            ];
+            let b_frag0 = Mxf4B::from_registers(b_reg0);
+            let b_lo0 = unsafe { *b_scale_ptr.add(tnc[0] * k64_tiles as usize * 2 + bs_base) };
+            let b_hi0 = unsafe { *b_scale_ptr.add(tnc[0] * k64_tiles as usize * 2 + bs_base + 1) };
+            let scale_b0 = ScalePairB::from_bits((b_lo0 as u16) | ((b_hi0 as u16) << 8));
+            acc0 = unsafe { mma_mxf4(acc0, a_frag, b_frag0, scale_a, scale_b0) };
+
+            let b_reg1 = [
+                unsafe { *b_ptr.add((tnc[1] * 8 + lane / 4) * b_row_u32 + bk_base + bk_lo) },
+                unsafe { *b_ptr.add((tnc[1] * 8 + lane / 4) * b_row_u32 + bk_base + bk_hi) },
+            ];
+            let b_frag1 = Mxf4B::from_registers(b_reg1);
+            let b_lo1 = unsafe { *b_scale_ptr.add(tnc[1] * k64_tiles as usize * 2 + bs_base) };
+            let b_hi1 = unsafe { *b_scale_ptr.add(tnc[1] * k64_tiles as usize * 2 + bs_base + 1) };
+            let scale_b1 = ScalePairB::from_bits((b_lo1 as u16) | ((b_hi1 as u16) << 8));
+            acc1 = unsafe { mma_mxf4(acc1, a_frag, b_frag1, scale_a, scale_b1) };
+
+            let b_reg2 = [
+                unsafe { *b_ptr.add((tnc[2] * 8 + lane / 4) * b_row_u32 + bk_base + bk_lo) },
+                unsafe { *b_ptr.add((tnc[2] * 8 + lane / 4) * b_row_u32 + bk_base + bk_hi) },
+            ];
+            let b_frag2 = Mxf4B::from_registers(b_reg2);
+            let b_lo2 = unsafe { *b_scale_ptr.add(tnc[2] * k64_tiles as usize * 2 + bs_base) };
+            let b_hi2 = unsafe { *b_scale_ptr.add(tnc[2] * k64_tiles as usize * 2 + bs_base + 1) };
+            let scale_b2 = ScalePairB::from_bits((b_lo2 as u16) | ((b_hi2 as u16) << 8));
+            acc2 = unsafe { mma_mxf4(acc2, a_frag, b_frag2, scale_a, scale_b2) };
+
+            let b_reg3 = [
+                unsafe { *b_ptr.add((tnc[3] * 8 + lane / 4) * b_row_u32 + bk_base + bk_lo) },
+                unsafe { *b_ptr.add((tnc[3] * 8 + lane / 4) * b_row_u32 + bk_base + bk_hi) },
+            ];
+            let b_frag3 = Mxf4B::from_registers(b_reg3);
+            let b_lo3 = unsafe { *b_scale_ptr.add(tnc[3] * k64_tiles as usize * 2 + bs_base) };
+            let b_hi3 = unsafe { *b_scale_ptr.add(tnc[3] * k64_tiles as usize * 2 + bs_base + 1) };
+            let scale_b3 = ScalePairB::from_bits((b_lo3 as u16) | ((b_hi3 as u16) << 8));
+            acc3 = unsafe { mma_mxf4(acc3, a_frag, b_frag3, scale_a, scale_b3) };
+
+            k += 1;
+        }
+
+        // Stores: canonical m16n8 accumulator mapping (see the m16n8 kernel's
+        // comment), guarded per j for the ragged n tail.
+        let c_row_base = (tile_m * 16) as usize;
+        let n_usize = n as usize;
+        let regs0 = acc0.registers();
+        let regs1 = acc1.registers();
+        let regs2 = acc2.registers();
+        let regs3 = acc3.registers();
+        for j in 0..4usize {
+            let row = c_row_base + lane / 4 + 8 * (j >> 1);
+            let sub = 2 * (lane % 4) + (j & 1);
+            if j_valid[0] {
+                unsafe { *c.add(row * n_usize + tn[0] * 8 + sub) = regs0[j]; }
+            }
+            if j_valid[1] {
+                unsafe { *c.add(row * n_usize + tn[1] * 8 + sub) = regs1[j]; }
+            }
+            if j_valid[2] {
+                unsafe { *c.add(row * n_usize + tn[2] * 8 + sub) = regs2[j]; }
+            }
+            if j_valid[3] {
+                unsafe { *c.add(row * n_usize + tn[3] * 8 + sub) = regs3[j]; }
+            }
+        }
+    }
 }
 
 // Pack a uniform E2M1 nibble value into an 8-nibble u32.
@@ -540,6 +716,51 @@ fn main() {
             launch(&c_dev);
             stream.synchronize().expect("synchronize");
             let r1 = c_dev.to_host_vec(&stream).expect("copy C");
+
+            // rb4: same reference, PLUS a bitwise cross-check vs the m16n8
+            // kernel (identical MMA and k-order -> must be bit-equal).
+            let launch_rb4 = |c_dev: &DeviceBuffer<f32>| {
+                let config = LaunchConfig {
+                    grid_dim: ((n / 8).div_ceil(16), m / 16, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    module
+                        .mxf4_batch_gemm_tiled_rb4(
+                            &stream,
+                            config,
+                            a_dev.cu_deviceptr() as *const u8,
+                            a_sc_dev.cu_deviceptr() as *const u8,
+                            b_dev.cu_deviceptr() as *const u8,
+                            b_sc_dev.cu_deviceptr() as *const u8,
+                            c_dev.cu_deviceptr() as *mut f32,
+                            m,
+                            n,
+                            k64_tiles,
+                        )
+                        .expect("rb4 launch")
+                }
+            };
+            let c_rb = DeviceBuffer::from_host(&stream, &vec![f32::NAN; c_size]).expect("alloc C_rb");
+            launch_rb4(&c_rb);
+            stream.synchronize().expect("synchronize rb4");
+            let rr = c_rb.to_host_vec(&stream).expect("copy C_rb");
+            let rb_nan = rr.iter().filter(|v| v.is_nan()).count();
+            let rb_over = rr
+                .iter()
+                .zip(&reference)
+                .filter(|(got, want)| {
+                    !(**got).is_nan()
+                        && ((**got) - (**want)).abs() / (**want).abs().max(1.0) > 1e-3
+                })
+                .count();
+            let rb_xdiff = r1
+                .iter()
+                .zip(&rr)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+
             let nan = r1.iter().filter(|v| v.is_nan()).count();
             let over = r1
                 .iter()
@@ -558,10 +779,97 @@ fn main() {
 
             println!(
                 "shape M={m} N={n} K={k}: blocks={} nan={nan}/{c_size} ref_over_tol={over} \
-                 det_first_diff={det_diff:?} {}",
+                 det_first_diff={det_diff:?} rb4[nan={rb_nan} ref_over_tol={rb_over} \
+                 xdiff_vs_m16n8={rb_xdiff}] {}",
                 (n / 8).div_ceil(4) * (m / 16),
-                if nan == 0 && over == 0 && det_diff.is_none() { "PASS" } else { "FAIL" }
+                if nan == 0 && over == 0 && det_diff.is_none() && rb_nan == 0 && rb_over == 0
+                    && rb_xdiff == 0 { "PASS" } else { "FAIL" }
             );
+        }
+    }
+
+    // --- Benchmark: engine prefill shapes, m16n8 vs rb4 -----------------------
+    {
+        println!("\n--- benchmark (m=128 prefill shapes) ---");
+        for &(m, n, k) in [
+            (128u32, 1024u32, 4096u32),   // k/v proj
+            (128, 4096, 4096),            // q/o proj
+            (128, 14336, 4096),           // gate/up proj
+            (128, 4096, 14336),           // down proj
+        ]
+        .iter()
+        {
+            let k64_tiles: u32 = k / 64;
+            let a_data: Vec<u8> = (0..(m as usize * k as usize / 2))
+                .map(|i| (i as u8).wrapping_mul(31))
+                .collect();
+            let b_data: Vec<u8> = (0..(n as usize * k as usize / 2))
+                .map(|i| (i as u8).wrapping_mul(17))
+                .collect();
+            let scale_one: u8 = 0x7F;
+            let a_scales = build_uniform_scales((m / 16) as usize, k64_tiles as usize, scale_one);
+            let b_scales = build_uniform_scales((n / 8) as usize, k64_tiles as usize, scale_one);
+            let a_dev = DeviceBuffer::from_host(&stream, &a_data).expect("alloc A");
+            let b_dev = DeviceBuffer::from_host(&stream, &b_data).expect("alloc B");
+            let a_sc_dev = DeviceBuffer::from_host(&stream, &a_scales).expect("alloc a_scales");
+            let b_sc_dev = DeviceBuffer::from_host(&stream, &b_scales).expect("alloc b_scales");
+            let c_dev =
+                DeviceBuffer::from_host(&stream, &vec![0.0f32; (m * n) as usize]).expect("alloc C");
+
+            let flops = 2.0 * m as f64 * n as f64 * k as f64;
+            let bench = |label: &str, grid_x: u32, rb4: bool| {
+                let config = LaunchConfig {
+                    grid_dim: (grid_x, m / 16, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let launch_one = || {
+                    if rb4 {
+                        unsafe {
+                            module
+                                .mxf4_batch_gemm_tiled_rb4(
+                                    &stream, config,
+                                    a_dev.cu_deviceptr() as *const u8,
+                                    a_sc_dev.cu_deviceptr() as *const u8,
+                                    b_dev.cu_deviceptr() as *const u8,
+                                    b_sc_dev.cu_deviceptr() as *const u8,
+                                    c_dev.cu_deviceptr() as *mut f32,
+                                    m, n, k64_tiles,
+                                )
+                                .expect("bench rb4 launch")
+                        }
+                    } else {
+                        unsafe {
+                            module
+                                .mxf4_batch_gemm_tiled(
+                                    &stream, config,
+                                    a_dev.cu_deviceptr() as *const u8,
+                                    a_sc_dev.cu_deviceptr() as *const u8,
+                                    b_dev.cu_deviceptr() as *const u8,
+                                    b_sc_dev.cu_deviceptr() as *const u8,
+                                    c_dev.cu_deviceptr() as *mut f32,
+                                    m, n, k64_tiles,
+                                )
+                                .expect("bench launch")
+                        }
+                    }
+                };
+                for _ in 0..3 {
+                    launch_one();
+                    stream.synchronize().expect("sync");
+                }
+                let iters = 50u32;
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    launch_one();
+                }
+                stream.synchronize().expect("bench sync");
+                let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                let tflops = flops / (us * 1e-6) / 1e12;
+                println!("  {label:<10} M={m} N={n} K={k}: {us:8.1} us  {tflops:6.1} TFLOPS");
+            };
+            bench("m16n8", (n / 8).div_ceil(4), false);
+            bench("rb4", (n / 8).div_ceil(16), true);
         }
     }
 }
