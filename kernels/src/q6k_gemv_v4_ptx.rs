@@ -1,11 +1,13 @@
-/// Hand-tuned sm_120 PTX kernel for Q6K x f32 GEMV decode with cp.async double-buffering.
+/// Hand-tuned sm_120 PTX kernel for Q6K x f32 GEMV decode with cp.async
+/// triple-buffering and REGISTER-EXCHANGE consumption.
 ///
 /// # Why this kernel
 ///
 /// Q6K down_proj [4096x14336] has k_blocks=56 with 8 warps -> 7 k_blocks/warp.
-/// ncu showed 32% DRAM utilization on the oxide kpar8 baseline. With 7 iterations,
-/// a 2-stage cp.async pipeline hides latency for all but the first block: the next
-/// block's 212-byte load overlaps with the current block's 8-step dequant + f32 FMA.
+/// ncu showed 32% DRAM utilization on the oxide kpar8 baseline. With 7
+/// iterations, a cp.async pipeline hides latency for all but the first block:
+/// the next block's 212-byte load overlaps with the current block's 8-step
+/// dequant + f32 FMA.
 ///
 /// # Q6K packed format (53 u32 = 212 bytes/block, native GGUF upload format)
 ///
@@ -21,49 +23,64 @@
 ///
 /// Grid:  (n_rows, 1, 1) -- one block per output row
 /// Block: (256, 1, 1)    -- 8 warps x 32 threads
-/// Smem:  3424 bytes (static): 32 bytes reduction + 8 warps x 2 buffers x 212 bytes
+/// Smem:  5384 bytes (static): 32 bytes reduction + 8 warps x 3 buffers
+///        x 212 bytes + u32 reduce counter (region 5120..5375 is dead,
+///        reserved from the removed mbarrier design)
 ///
-/// # K-parallelism with double-buffering
+/// # K-parallelism with triple-buffering
 ///
 /// Warp w handles blocks: w, w+8, w+16, ... (stride=8 warps).
 /// For k_blocks=56: each warp handles exactly 7 blocks.
 ///
-/// Prologue: cp.async block 0 -> buf_A, arrive on full_A, wait full_A.
 /// Loop iteration i:
-///   1. Read cached data from curr (ld.shared), then arrive on empty[curr]
-///      (read-completion, 32 lanes)
-///   2. If not the first iteration: wait empty[next] (previous read round of
-///      that slot completed) -- guards the async overwrite of a buffer a
-///      lagging lane may still be reading
-///   3. Issue cp.async of block i+1 -> buf_next + cp.async.mbarrier.arrive.noinc
-///      on full[next] (arrival deferred until the copies land)
-///   4. Compute block i from buf_curr (8-step dequant + FMA) -- overlaps
-///      with the async copies
-///   5. Wait full[next] (parity) -- the copies landed and are VISIBLE
-///      (mbarrier completion carries the async-proxy release; the wait is
-///      the acquire)
-///   6. swap(curr, next)
+///   1. Issue cp.async of block i+1 -> buf_next + commit_group (FIRST, so
+///      the copy overlaps this iteration's consume+compute)
+///   2. Each lane loads ONLY the words it copied itself (see "The register
+///      exchange" below) -- the copies landing in `curr` were completed and
+///      published by iteration i-1's tail (or the prologue for i=0)
+///   3. Register broadcast via shfl.sync.idx -- every lane obtains d, the 4
+///      scale words and its 6 ql/qh words
+///   4. Compute block i (8-step dequant + FMA) from registers
+///   5. cp.async.wait_group 0 + fence.proxy.async + bar.sync 0 x3 (the
+///      publication point -- see below)
+///   6. swap(curr, next) -- the slot written at i was last read at i-2
+///      (triple buffers)
 ///
-/// Hides ~=6/7 of per-block DRAM latency (blocks 0-5 overlap with next prefetch).
+/// # The register exchange -- what fixes the kb=16 residual
 ///
-/// # Why mbarrier (the 2026-10-28 audit)
+/// The 2026-10-29 rewrite eliminated CROSS-LANE smem reads: each lane reads
+/// exclusively the words it copied ITSELF (round 1: lane l copies word l;
+/// round 2: lanes 0..20 copy words 32+l). The values a lane needs from
+/// other lanes' words (d, the scale words, the ql/qh words addressed by
+/// lane>>2) are exchanged in REGISTERS via shfl.sync.idx: registers carry
+/// no proxy semantics, and the shuffle's data dependence on the source
+/// lane's ld.shared result forces that load to complete first. This closed
+/// the last residual race of the barrier-based design (~3/81920 wrong at
+/// kb=16 only): cross-lane publication of cp.async data was the one thing
+/// the CTA barriers could not fully order.
 ///
-/// The previous scheme used `cp.async.wait_group 0; bar.sync 0` -- the
-/// canonical pre-sm_90 pattern. On Blackwell, ptxas lowers bar.sync 0 to
-/// BAR.SYNC.DEFER_BLOCKING: warps continue past the barrier until an
-/// instruction requires completion, and the next iteration's LDGSTS does
-/// NOT require completion -- so the prefetch can slip past the sync point
-/// and overwrite a buffer whose words other lanes had not finished reading
-/// (kb=56 intermittently wrong, 8/8 nondeterministic under churn; SASS
-/// audit in AGENTS.md). fence.proxy.async, bar.warp.sync (eliminated by
-/// ptxas for converged warps), bar.sync 0,256 and a hoisted ld.shared all
-/// failed to close it. The sm_90+ fix is to take the CTA barrier out of
-/// the handoff entirely: cp.async completion is tracked BY an mbarrier
-/// (cp.async.mbarrier.arrive.noinc), consumers wait its phase parity
-/// (mbarrier.try_wait.parity), and the overwrite direction is guarded by a
-/// second per-slot mbarrier that the readers arrive on. All mbarriers are
-/// warp-local (each warp only touches its own 2 slots), so no deferred
-/// CTA barrier is involved anywhere in the loop.
+/// # Why the CTA barriers stay (2026-10-29 bisection)
+///
+/// Removing the loop's bar.sync x3 (keeping wait_group + the per-thread
+/// fence.proxy.async, SASS audited correct with the DEPBAR lexically after
+/// the commit AND at the rotated loop head) made iteration >= 2 read
+/// UNWRITTEN slots at kb=13/16/40: MEMBAR.ALL.CTA + FENCE.VIEW.ASYNC.S
+/// does not publish LDGSTS data to subsequent same-thread LDS on this
+/// hw/ptxas without a CTA barrier. The bars are load-bearing. Consequently:
+///   - bar.sync lowers to BAR.SYNC.DEFER_BLOCKING on Blackwell (warps run
+///     past it until an instruction requires completion); the second bar
+///     forces the first to complete, the third pins it
+///   - the barrier is CTA-wide, so all 8 warps must run the same number of
+///     loop iterations -- the HOST GATES this kernel to k_blocks % 8 == 0
+///     (other shapes fall back to the dp4a kpar kernel)
+///
+/// # Cross-warp reduction
+///
+/// The final 8 partial sums are exchanged via a smem store ->
+/// membar.cta -> red.release.cta counter bump / ld.acquire.cta poll ->
+/// sequential sum on thread 0 (generic proxy only; the mbarrier and
+/// shuffle-butterfly variants of this handoff raced on this hw, bisected
+/// 2026-10-29).
 ///
 /// # Parameters (same layout as oxide q6k_gemv_dp4a_kpar8)
 ///
@@ -82,16 +99,20 @@ pub const PTX: &str = r#"
 .target sm_120
 .address_size 64
 
-// q6k_gemv_sm120_mbar_kpar8
+// q6k_gemv_sm120_kpar8
 // Q6K (53 u32/block = 212 bytes) x f32 GEMV decode, sm_120.
-// cp.async double-buffering: next block loads while current block is computed.
-// Same 8-step dequant as oxide q6k_gemv_dp4a_kpar8; reads from per-warp smem buffers.
+// cp.async triple-buffering: next block loads while current block is computed.
+// Same 8-step dequant as oxide q6k_gemv_dp4a_kpar8; consumption is per-lane
+// (own copies only) + shfl.sync.idx register broadcast -- see the Rust doc
+// comment above for why the loop has no barriers.
 //
 // Grid: (n_rows, 1, 1). Block: (256, 1, 1) = 8 warps.
-// Smem layout (3424 bytes static):
+// Smem layout (5384 bytes static):
 //   [0..31]:     8 f32 partial sums for cross-warp reduction
-//   [32..3423]:  8 warps x (buf_A[212] + buf_B[212]) = 3392 bytes
-.visible .entry q6k_gemv_sm120_mbar_kpar8(
+//   [32..5119]:  8 warps x 3 slots x 212 bytes = 5088 bytes
+//   [5120..5375]: dead (reserved from the removed mbarrier design)
+//   [5376..5379]: u32 cross-warp reduce handoff counter
+.visible .entry q6k_gemv_sm120_kpar8(
     .param .u64 param_out,
     .param .u64 param_out_len,
     .param .u64 param_x,
@@ -107,20 +128,6 @@ pub const PTX: &str = r#"
     .reg .f32  %f<12>;
     .reg .pred %p<10>;
 
-    // smem: reduction region (32 bytes) + per-warp TRIPLE buffers
-    // (8 warps x 3 slots x 212 bytes = 5088) + per-warp mbarriers
-    // (8 warps x 3 full-slot mbarriers x 8 bytes = 192) + CTA reduce
-    // mbarrier (8 bytes).
-    //   buffers per warp (offset 32 + w*636): slot_0 +0, slot_1 +212, slot_2 +424
-    //   mbar per warp (offset 5120 + w*32): full_0 +0, full_1 +8, full_2 +16
-    //   reduce mbar (offset 5376): CTA-wide partial-sum handoff
-    // TRIPLE buffering: the slot written at iteration i was last READ at
-    // iteration i-2 (roles rotate curr -> spare -> next), so the overwrite
-    // never races the reads -- two full iterations of slack for an
-    // intra-warp smem read to complete.  No empty-handoff synchronization
-    // is needed at all (the double-buffer design's overwrite guard was the
-    // unfixable race: mbarrier read-arrival handoffs corrupted data, and
-    // bar.sync 0 defers on Blackwell letting LDGSTS slip past it).
     .shared .align 8 .b8 smem_buf[5384];
 
     // -- Load parameters --------------------------------------------------------
@@ -153,6 +160,7 @@ pub const PTX: &str = r#"
     add.u32 %r9, %r8, 16;           // sc_shift_odd  (16 or 24)
 
     // Predicate for round-2 of cp.async: lanes 0..20 issue 2 copies, 21..31 issue 1.
+    // Round 1: lane l copies word l. Round 2: lane l (<21) copies word 32+l.
     setp.lt.u32 %p1, %r4, 21;
 
     // -- Accumulator ------------------------------------------------------------
@@ -162,14 +170,12 @@ pub const PTX: &str = r#"
     mov.f32 %f10, 0f43000000;       // 128.0f (bias for scale decoding)
     mov.f32 %f11, 0f42000000;       //  32.0f (bias for q6 centering)
 
-    // -- Per-warp smem buffer base ----------------------------------------------
+    // -- Per-warp smem slot pointers --------------------------------------------
     // slot_0 for warp w: smem_buf + 32 + w*636; slots at +0, +212, +424.
     mul.lo.u32 %r10, %r5, 636;
     add.u32    %r10, %r10, 32;
-    add.u32    %r11, %r10, 212;       // slot_1
-    // curr = slot_0, next = slot_1, spare = slot_2
     mov.u32    %r20, %r10;            // %r20 = curr smem address
-    mov.u32    %r21, %r11;            // %r21 = next smem address
+    add.u32    %r21, %r10, 212;       // %r21 = next smem address
     add.u32    %r98, %r10, 424;       // %r98 = spare smem address
 
     // -- CTA-wide reduce HANDOFF COUNTER at smem_buf+5376 (u32, zeroed by
@@ -193,12 +199,11 @@ pub const PTX: &str = r#"
     // before any arrive.
     bar.sync 0;
     bar.sync 0;
-    // (probe removed)
 
-    // -- Prologue: cp.async block 0 - curr (buf_A) -----------------------------
-    // Block 0 for warp w is at global index warp_id; all 8 blocks are contiguous
-    // within the row.  Global byte offset = (row*k_blocks + warp_id) * 212.
-    // Guard: if warp_id >= k_blocks, skip prologue and jump to REDUCE.
+    // -- Prologue: issue cp.async of block warp_id -> curr (slot_0) -------------
+    // Guard: if warp_id >= k_blocks, skip to REDUCE. (Dead under the host's
+    // k_blocks % 8 == 0 gate -- kb >= 8 covers all 8 warps -- but kept for
+    // safety.)
     setp.ge.u32 %p2, %r5, %r1;
     @%p2 bra REDUCE;
 
@@ -207,14 +212,14 @@ pub const PTX: &str = r#"
     cvt.u64.u32 %rd3, %r23;
     add.u64 %rd3, %rd2, %rd3;          // %rd3 = ptr to block 0 for this warp
 
-    // 53 u32s = 212 bytes.  Round 1 (all 32 lanes): lane l - smem[curr + l*4].
+    // 53 u32s = 212 bytes.  Round 1 (all 32 lanes): lane l -> smem[curr + l*4].
     shl.b32 %r24, %r4, 2;             // lane*4
     add.u32 %r25, %r20, %r24;         // smem dst (curr + lane*4)
     cvt.u64.u32 %rd4, %r24;
     add.u64 %rd4, %rd3, %rd4;          // global src (block0 + lane*4)
     cp.async.ca.shared.global [%r25], [%rd4], 4;
 
-    // Round 2 (lanes 0..20): lane l - smem[curr + (32+l)*4].
+    // Round 2 (lanes 0..20): lane l -> smem[curr + (32+l)*4].
     add.u32 %r26, %r4, 32;            // 32+lane
     shl.b32 %r26, %r26, 2;            // (32+lane)*4
     add.u32 %r27, %r20, %r26;
@@ -223,18 +228,11 @@ pub const PTX: &str = r#"
     @%p1 cp.async.ca.shared.global [%r27], [%rd4], 4;
 
     cp.async.commit_group;
-    // cp.async handoff: wait_group (per-thread completion) + proxy fence
-    // (per-thread async->generic visibility) + DOUBLE bar.sync (cross-lane
-    // visibility).  The fence is per-thread: it makes THIS lane's copies
-    // visible to itself, but lane 5 reads words copied by lane 17 -- the
-    // cross-lane publication needs a CTA barrier.  TWO bar.syncs: the
-    // first is lowered to BAR.SYNC.DEFER_BLOCKING on Blackwell (warps
-    // continue until an instruction requires completion); the second
-    // forces the first to complete, so the reads after it cannot slip
-    // past the barrier's memory fence.  (An mbarrier arrive/wait pair
-    // here is ELIDED by ptxas -- all 32 lanes arrive before waiting, so
-    // the phase is trivially complete -- which silently drops the
-    // cross-lane visibility; found via SASS, 2026-10-29.)
+    // Publication point for iteration 1's consume: completion + proxy fence
+    // + CTA bars (the bars are load-bearing on this hw -- see the tail-sync
+    // comment in the KLOOP; the same recipe as the old kernel's prologue).
+    // Uniform: with the host's k_blocks % 8 == 0 gate, every warp enters
+    // the prologue.
     cp.async.wait_group 0;
     fence.proxy.async.shared::cta;
     bar.sync 0;
@@ -247,27 +245,30 @@ KLOOP:
     setp.ge.u32 %p0, %r30, %r1;     // blk >= k_blocks?
     @%p0 bra REDUCE;
 
-    // Issue async-load of block (blk+8) into next smem buffer.
-    // TRIPLE BUFFERING: `next` was last read two iterations ago -- no
-    // overwrite guard is needed (see the smem layout comment).
+    // -- Issue async-load of block (blk+8) into next smem slot FIRST -----
+    // (before the consume+compute of this iteration, so the copy overlaps
+    // them; the tail's wait_group then rarely stalls).
+    // TRIPLE BUFFERING: `next` was last read two iterations ago, and the
+    // tail's fences + CTA bars order that read before this overwrite.
+    // The tail barrier is CTA-wide, so every warp must run the same number
+    // of loop iterations -- the host gates this kernel to k_blocks % 8 == 0.
     add.u32 %r31, %r30, 8;           // next_blk = blk + 8
     setp.lt.u32 %p3, %r31, %r1;     // next_blk < k_blocks?
     @!%p3 bra SKIP_LOAD;
 
-ISSUE_LOAD:
     mad.lo.u32 %r32, %r2, %r1, %r31; // row*k_blocks + next_blk
     mul.lo.u32 %r33, %r32, 212;
     cvt.u64.u32 %rd5, %r33;
     add.u64 %rd5, %rd2, %rd5;         // global ptr to next_blk
 
-    // Round 1 (all 32 lanes)
+    // Round 1 (all 32 lanes): lane l -> word l
     shl.b32 %r34, %r4, 2;
     add.u32 %r35, %r21, %r34;
     cvt.u64.u32 %rd6, %r34;
     add.u64 %rd6, %rd5, %rd6;
     cp.async.ca.shared.global [%r35], [%rd6], 4;
 
-    // Round 2 (lanes 0..20)
+    // Round 2 (lanes 0..20): lane l -> word 32+l
     add.u32 %r36, %r4, 32;
     shl.b32 %r36, %r36, 2;
     add.u32 %r37, %r21, %r36;
@@ -276,66 +277,89 @@ ISSUE_LOAD:
     @%p1 cp.async.ca.shared.global [%r37], [%rd6], 4;
 
     cp.async.commit_group;
-    // (handoff happens after the compute section -- see WAIT_FULL_NEXT)
 
 SKIP_LOAD:
-    // -- Read cached data from curr smem buffer ---------------------------------
-    // u32[0]: d (f32 bits)
-    ld.shared.b32 %r40, [%r20 + 0];
-    mov.b32 %f1, %r40;               // d
+    // -- Consume curr -----------------------------------------------------------
+    // Data landing in `curr` was completed + published by the PREVIOUS
+    // iteration's tail (or the prologue for iteration 1).
+    // Every lane reads exclusively the words IT copied (round 1: word
+    // `lane`; round 2: word `32+lane`) -- no cross-lane smem reads exist,
+    // which is what fixes the old kb=16 residual: cross-lane publication
+    // of cp.async data was the one thing the CTA bars could not fully
+    // order (~3/81920 wrong, 2026-10-29).  Values held in OTHER lanes'
+    // words arrive via shfl.sync.idx REGISTER exchange below (registers
+    // carry no proxy semantics; the shuffle's data dependence on the
+    // source lane's ld.shared forces that load to complete first).
+    // Own words -> registers.
+    shl.b32 %r52, %r4, 2;             // lane*4
+    add.u32 %r52, %r20, %r52;         // &curr[word lane]
+    ld.shared.b32 %r40, [%r52];       // %r40 = Ra (round-1 word)
+    add.u32 %r53, %r52, 128;          // &curr[word 32+lane]
+    @%p1 ld.shared.b32 %r51, [%r53];  // %r51 = Pa (round-2 word, lanes<21)
 
-    // u32[1..5]: scale words sc_01, sc_23, sc_45, sc_67
-    ld.shared.b32 %r41, [%r20 +  4]; // sc_01 (groups 0-3) // sc_01 (groups 0-3)
-    ld.shared.b32 %r42, [%r20 +  8]; // sc_23 (groups 4-7) // sc_23 (groups 4-7)
-    ld.shared.b32 %r43, [%r20 + 12]; // sc_45 (groups 8-11) // sc_45 (groups 8-11)
-    ld.shared.b32 %r44, [%r20 + 16]; // sc_67 (groups 12-15) // sc_67 (groups 12-15)
+    // Register broadcast.  Read-set per lane (q = lane>>2, byte = (lane%4)*8):
+    //   d: word 0                (lane 0's Ra)
+    //   sc_01..sc_67: words 1..4 (lanes 1..4's Ra)
+    //   ql_a/ql_b/ql_c: words 5+q / 13+q / 21+q  (round-1, lanes 5+q/13+q/21+q)
+    //   ql_d: word 29+q -- round-1 when q<3, round-2 (copied by lane q-3) else
+    //   qh_0/qh_1: words 37+q / 45+q (round-2, lanes 5+q / 13+q)
+    // All shfl.sync execute on all 32 lanes (they must be warp-uniform;
+    // predication would break the sync); inapplicable sources yield garbage
+    // that the selp discards.
 
-    // ql_a = smem_u32[(5  + lane_div4)] >> byte_shift & 0xFF   (steps 0,2)
-    add.u32 %r45, %r7, 5;
-    shl.b32 %r45, %r45, 2;
-    add.u32 %r45, %r20, %r45;
-    ld.shared.b32 %r45, [%r45];
-    shr.u32 %r45, %r45, %r6;
+    // d (f32 bits) from lane 0
+    shfl.sync.idx.b32 %r57, %r40, 0, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f1, %r57;                // d
+
+    // scale words 1..4 from lanes 1..4
+    shfl.sync.idx.b32 %r41, %r40, 1, 0x1F, 0xFFFFFFFF;  // sc_01
+    shfl.sync.idx.b32 %r42, %r40, 2, 0x1F, 0xFFFFFFFF;  // sc_23
+    shfl.sync.idx.b32 %r43, %r40, 3, 0x1F, 0xFFFFFFFF;  // sc_45
+    shfl.sync.idx.b32 %r44, %r40, 4, 0x1F, 0xFFFFFFFF;  // sc_67
+
+    // ql_a = byte of word 5+q
+    add.u32 %r54, %r7, 5;
+    shfl.sync.idx.b32 %r53, %r40, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r45, %r53, %r6;
     and.b32 %r45, %r45, 255;          // ql_a
 
-    // ql_b = smem_u32[(13 + lane_div4)] >> byte_shift & 0xFF   (steps 1,3)
-    add.u32 %r46, %r7, 13;
-    shl.b32 %r46, %r46, 2;
-    add.u32 %r46, %r20, %r46;
-    ld.shared.b32 %r46, [%r46];
-    shr.u32 %r46, %r46, %r6;
+    // ql_b = byte of word 13+q
+    add.u32 %r54, %r7, 13;
+    shfl.sync.idx.b32 %r53, %r40, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r46, %r53, %r6;
     and.b32 %r46, %r46, 255;          // ql_b
 
-    // ql_c = smem_u32[(21 + lane_div4)] >> byte_shift & 0xFF   (steps 4,6)
-    add.u32 %r47, %r7, 21;
-    shl.b32 %r47, %r47, 2;
-    add.u32 %r47, %r20, %r47;
-    ld.shared.b32 %r47, [%r47];
-    shr.u32 %r47, %r47, %r6;
+    // ql_c = byte of word 21+q
+    add.u32 %r54, %r7, 21;
+    shfl.sync.idx.b32 %r53, %r40, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r47, %r53, %r6;
     and.b32 %r47, %r47, 255;          // ql_c
 
-    // ql_d = smem_u32[(29 + lane_div4)] >> byte_shift & 0xFF   (steps 5,7)
-    add.u32 %r48, %r7, 29;
-    shl.b32 %r48, %r48, 2;
-    add.u32 %r48, %r20, %r48;
-    ld.shared.b32 %r48, [%r48];
-    shr.u32 %r48, %r48, %r6;
+    // ql_d = byte of word 29+q: round-1 (q<3, src lane 29+q) or round-2
+    // (q>=3, word 29+q = 32+(q-3), src lane q-3's Pa).  (29+q)&31 gives
+    // both source lanes.  The q<3 lanes' Pa shuffle reads lanes 29..31,
+    // which never loaded Pa -- garbage, discarded by the selp.
+    add.u32 %r54, %r7, 29;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r40, %r54, 0x1F, 0xFFFFFFFF;  // q<3 value
+    shfl.sync.idx.b32 %r55, %r51, %r54, 0x1F, 0xFFFFFFFF;  // q>=3 value
+    setp.lt.u32 %p8, %r7, 3;
+    selp.b32 %r56, %r53, %r55, %p8;
+    shr.u32 %r48, %r56, %r6;
     and.b32 %r48, %r48, 255;          // ql_d
 
-    // qh_0 = smem_u32[(37 + lane_div4)] >> byte_shift & 0xFF   (steps 0-3)
-    add.u32 %r49, %r7, 37;
-    shl.b32 %r49, %r49, 2;
-    add.u32 %r49, %r20, %r49;
-    ld.shared.b32 %r49, [%r49];
-    shr.u32 %r49, %r49, %r6;
+    // qh_0 = byte of word 37+q (round-2, src lane 5+q)
+    add.u32 %r54, %r7, 37;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r51, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r49, %r53, %r6;
     and.b32 %r49, %r49, 255;          // qh_0
 
-    // qh_1 = smem_u32[(45 + lane_div4)] >> byte_shift & 0xFF   (steps 4-7)
-    add.u32 %r50, %r7, 45;
-    shl.b32 %r50, %r50, 2;
-    add.u32 %r50, %r20, %r50;
-    ld.shared.b32 %r50, [%r50];
-    shr.u32 %r50, %r50, %r6;
+    // qh_1 = byte of word 45+q (round-2, src lane 13+q)
+    add.u32 %r54, %r7, 45;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r51, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r50, %r53, %r6;
     and.b32 %r50, %r50, 255;          // qh_1
 
     // -- 8-step dequant + FMA (mirrors oxide q6k_gemv_dp4a_kpar8 v2 logic) ------
@@ -523,11 +547,18 @@ SKIP_LOAD:
     mul.f32 %f5, %f5, %f3;
     fma.rn.f32 %f0, %f5, %f4, %f0;
 
-    // -- Wait for next block's copies (if prefetch was issued) -----------------
-    // Same handoff as the prologue: wait_group + proxy fence + DOUBLE
-    // bar.sync (cross-lane publication -- see the prologue comment).
-    // Deadlock-safe: the host gates this kernel to k_blocks % 8 == 0, so
-    // every warp executes the same number of loop barriers.
+    // -- Tail sync: publish the prefetch issued at the top of THIS iteration --
+    // Skipped on the last iteration (no prefetch in flight, nothing to
+    // publish) -- uniform across warps because k_blocks % 8 == 0.
+    // The bar.sync x3 is REQUIRED, not belt-and-suspenders: with only
+    // wait_group + fence.proxy.async (per-thread), iteration >= 2 read
+    // UNWRITTEN slots at kb=13/16/40 on this hw with BOTH wait placements,
+    // SASS audited correct in both (2026-10-29) -- MEMBAR.ALL.CTA +
+    // FENCE.VIEW.ASYNC.S does not publish LDGSTS data to subsequent LDS
+    // without a CTA barrier.  (bar.sync lowers to DEFER_BLOCKING on
+    // Blackwell: warps continue until an instruction requires completion;
+    // the second bar forces the first to complete, the third pins it --
+    // SASS-audited 2026-10-29.)
     @!%p3 bra NO_WAIT;
     cp.async.wait_group 0;
     fence.proxy.async.shared::cta;
@@ -626,7 +657,7 @@ DONE:
 "#;
 
 /// Kernel entry-point name -- used by `cuModuleGetFunction`.
-pub const ENTRY: &str = "q6k_gemv_sm120_mbar_kpar8";
+pub const ENTRY: &str = "q6k_gemv_sm120_kpar8";
 
 /// Minimum compute capability (sm_120 = Blackwell consumer).
 pub const MIN_CC: u32 = 1200;
