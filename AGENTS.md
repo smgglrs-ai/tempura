@@ -409,38 +409,44 @@ typical-p/repeat/presence/frequency)
 
 ## Open work (verified gaps — do not assume these are done)
 
-- [ ] q6k_gemv_sm120_mbar_kpar8 (single-seq Q6K GEMV): outputs are
-      allocation/kernel-history dependent. AUDITED 2026-10-28 (see below);
-      still DEFAULT OFF (TEMPURA_ALLOW_SM120_Q6K=1 opts in); the fix path
-      is an mbarrier-based rewrite. Audit findings (SASS via
-      ptxas/cuobjdump on sm_120a + a standalone repro -- the new
-      bench-decode-ops "q6k mbar determinism stress": correct 53-u32
-      packing, kb=56 real down_proj weights, churn loop; kb=8/16 always
-      clean, kb=56 intermittently wrong and 8/8 nondeterministic under
-      churn):
-        - The kernel's structure is sound: per-warp smem buffers, warp-local
-          reads, uniform barrier counts for k_blocks % 8 == 0.
-        - ptxas lowers bar.sync 0 to BAR.SYNC.DEFER_BLOCKING (Blackwell
-          deferred CTA barrier): warps continue past the barrier until an
-          instruction requires completion. The next loop iteration's LDGSTS
-          (cp.async prefetch into the buffer other lanes were still reading)
-          does NOT require completion and can slip past the sync point --
-          the suspected race window, now SASS-confirmed.
-        - Tried and INSUFFICIENT: (1) fence.proxy.async.shared::cta between
-          wait_group and bar.sync; (2) bar.warp.sync (ptxas ELIMINATES it --
-          a converged warp needs no barrier; catastrophic garbage);
-          (3) bar.sync 0,256 (still DEFER_BLOCKING); (4) hoisting an
-          ld.shared of the next d word after the barrier to force
-          completion. All four: race persists.
-        - NOT the cause: weight-format confusion (a stress test that fed
-          raw 210-byte GGUF blocks instead of the engine's 53-u32 packing
-          produced inf -- fixed in the test), the k_blocks%8 barrier-uniformity
-          gate (verified sound).
-      The sanctioned sm_90+ fix is cp.async.mbarrier.arrive +
-      mbarrier.try_wait.parity (async completion tracked BY the mbarrier,
-      no deferred-barrier involvement) -- a substantial PTX rewrite of the
-      double-buffer scheme. The dp4a kpar8 fallback is correct and within
-      ~7% of the mbar variant's speed, so this is low-priority.
+- [ ] q6k_gemv_sm120_mbar_kpar8 (single-seq Q6K GEMV): outputs were
+      allocation/kernel-history dependent; REWRITTEN 2026-10-29 and now
+      8/8 DETERMINISTIC under churn with kb=56 real weights correct to
+      5e-6 (dp4a parity, identical logits fingerprint) and +4 tok/s
+      decode (171 -> 175), but STILL DEFAULT OFF: a residual race at
+      kb=16 ONLY (~3/81920 values slightly off with exact-arithmetic
+      synthetic weights; every other shape 0/81920; real-weight bisects
+      clean; the churn determinism stress 8/8 across 4 consecutive full
+      runs). Root causes found during the rewrite (SASS + a
+      synthetic-weights micro harness that drives the real kernel, now a
+      permanent bench-decode-ops section):
+        1. ptxas ELIDES a warp-uniform mbarrier arrive+try_wait pair
+           (all 32 lanes arrive before waiting => phase trivially
+           complete => the pair is dead code).  The elision silently
+           drops the only CROSS-LANE visibility carrier for cp.async
+           data: fence.proxy.async is PER-THREAD, so lane 5's ld.shared
+           of a word copied by lane 17 raced.  mbarrier-based cp.async
+           handoffs within a single warp are UNSOUND on this ptxas.
+        2. The old REDUCE's bar.sync lets warp 0's partial loads slip
+           past it (DEFER_BLOCKING) -- a second race the audit missed;
+           kb=8 (no loop sync at all) was nondeterministic from this
+           alone.
+        3. The 3-step shfl.sync cross-warp butterfly produced
+           nondeterministically wrong sums (same instruction family as
+           the m=1 shuffle-width bug).
+      The working recipe: per-warp TRIPLE buffers (the overwrite target
+      was last read 2 iterations ago -- no empty-handoff sync needed at
+      all) + per-iteration [cp.async.wait_group 0; fence.proxy.async;
+      bar.sync 0 x3] (the third bar forces the second to complete) +
+      reduce via [st.shared; membar.cta; red.release.cta counter bump /
+      ld.acquire poll; sequential 8-partial sum on tid 0 -- no
+      shuffles].  All mbarrier machinery removed from the loop (ptxas
+      deletes it anyway).  The kb=16 residual (exactly one
+      prefetch+swap cycle) survives triple bars -- the next lever is a
+      bar.warp.sync-equivalent or the documented-ineligible
+      cp.async.mbarrier rewrite.  Run the micro harness:
+      `TEMPURA_ALLOW_SM120_Q6K=1 bench-decode-ops` (section "mbar
+      micro (REAL q6k kernel, synthetic weights)").
 - [ ] Close the 1.22x single-sequence GPU decode gap vs llama.cpp
       (171 vs 209 tok/s, ITL 5.83 ms, 2026-10-28). Was 1.49x (140 tok/s)
       before the lm_head BK=512 fix -- the f32 lm_head GEMV was running at
@@ -790,7 +796,9 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
       bench-quality now shows 100% argmax agreement vs the CPU reference,
       64/64 identical tokens free-running. 2026-10-28 fused-silu raw-format
       port: 134 -> 140 tok/s; lm_head GEMV BK=128 -> 512 (709 -> 1475 GB/s):
-      140 -> 171 tok/s)
+      140 -> 171 tok/s; 2026-10-29 the rewritten sm120 mbar kernel
+      (TEMPURA_ALLOW_SM120_Q6K=1, still default-off): 175 tok/s with an
+      identical logits fingerprint)
 - Llama-3.1-8B Q4K prefill: **5816 tok/s pp128**, TTFT P50 22.1 ms
       (1.26x gap vs llama.cpp 7335; logits det=OK, NaN-free; A/B numerics vs
       exact-dequant max |logit| rel 0.1331 -- the MXFP4 band including the

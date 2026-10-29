@@ -231,6 +231,105 @@ fn main() {
     rope.precompute_table(MAX_POS, HEAD_DIM, THETA, &stream)
         .expect("precompute_table failed");
 
+    // ---- 10. mbarrier primitive micro-test --------------------------------
+    // Isolates the mbarrier arrive/try_wait.parity mechanics from the q6k
+    // kernel: 32 threads, N rounds of [thread 0 stores a round-marker to
+    // smem; all 32 arrive; all wait the phase parity; everyone reads the
+    // marker and checks it equals the round].  Any early wait pass or
+    // visibility failure shows up as a marker mismatch.  This is the
+    // ground truth for whether the primitives work on this hw/ptxas.
+    {
+        use cuda_core::sys;
+        eprintln!("[micro] building module...");
+        let micro_ptx = tempura_kernels::q6k_gemv_v4_ptx::PTX;
+        let ptx_c = std::ffi::CString::new(micro_ptx).unwrap();
+        let mut module: sys::CUmodule = std::ptr::null_mut();
+        eprintln!("[micro] cuModuleLoadData...");
+        let rc = unsafe { sys::cuModuleLoadData(&mut module, ptx_c.as_ptr() as *const _) };
+        assert_eq!(rc, 0, "micro cuModuleLoadData rc={rc}");
+        eprintln!("[micro] cuModuleGetFunction...");
+        let name_c = std::ffi::CString::new(tempura_kernels::q6k_gemv_v4_ptx::ENTRY).unwrap();
+        let mut func: sys::CUfunction = std::ptr::null_mut();
+        let rc = unsafe { sys::cuModuleGetFunction(&mut func, module, name_c.as_ptr()) };
+        assert_eq!(rc, 0, "micro cuModuleGetFunction rc={rc}");
+        eprintln!("[micro] uploading bufs...");
+        const GRID: usize = 64;
+        // Synthetic Q6K blocks: d = (b+1) as f32 bits, all group scales = 1
+        // (stored byte 129), ql/qh = 0 -> q6 = 0 -> (q6-32) = -32, x = 1.0.
+        // Per block: 256 terms of d*1*(-32)*1 = -8192*d.  Per row (kb
+        // blocks): -8192 * sum(b+1, b in 0..kb) = -8192*kb*(kb+1)/2.
+        let mk_weights = |kb: usize| -> Vec<u32> {
+            let mut v = Vec::new();
+            for _row in 0..4096usize {
+                for b in 0..kb {
+                    v.push(((b + 1) as f32).to_bits()); // d
+                    for _ in 0..4 { v.push(0x81818181); } // scales: 129 x4
+                    for _ in 0..32 { v.push(0); }         // ql
+                    for _ in 0..16 { v.push(0); }         // qh
+                }
+            }
+            v
+        };
+        let x_ones = vec![1.0f32; 56 * 256];
+        let x_dev = upload(x_ones, &stream);
+        let out_dev = upload(vec![0.0f32; 4096], &stream);
+        let out_ptr = out_dev.device_pointer().cu_deviceptr();
+        let x_ptr = x_dev.device_pointer().cu_deviceptr();
+        let mut mismatches = 0u32;
+        static row0_checked: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        for &kb in &[8usize, 16, 24, 32, 40, 48, 56] {
+            let w = mk_weights(kb);
+            let w_dev: Arc<Tensor<u32>> = Arc::new(
+                api::copy_host_vec_to_device(&Arc::new(w))
+                    .sync_on(&stream)
+                    .expect("micro w upload"),
+            );
+            let w_ptr = w_dev.device_pointer().cu_deviceptr();
+            let expect = -8192.0f32 * (kb * (kb + 1)) as f32 / 2.0;
+            let n_rows: u32 = 4096;
+            let kb32: u32 = kb as u32;
+            let out_len: u64 = 4096;
+            let x_len: u64 = (kb * 256) as u64;
+            let w_len: u64 = (4096 * kb * 53) as u64;
+            let mut kb_bad_total = 0u32;
+            for it in 0..20u32 {
+                type Vp = *const std::ffi::c_void;
+                let mut args8: [Vp; 8] = [
+                    &out_ptr as *const u64 as Vp,
+                    &out_len as *const u64 as Vp,
+                    &x_ptr as *const u64 as Vp,
+                    &x_len as *const u64 as Vp,
+                    &w_ptr as *const u64 as Vp,
+                    &w_len as *const u64 as Vp,
+                    &n_rows as *const u32 as Vp,
+                    &kb32 as *const u32 as Vp,
+                ];
+                let rc = unsafe {
+                    sys::cuLaunchKernel(
+                        func, 4096, 1, 1, 256, 1, 1, 0,
+                        stream.cu_stream(),
+                        args8.as_mut_ptr() as *mut _,
+                        std::ptr::null_mut(),
+                    )
+                };
+                assert_eq!(rc, 0, "micro cuLaunchKernel rc={rc}");
+                let res = download(&out_dev, &stream);
+                let bad = res.iter().filter(|v| (**v - expect).abs() > 1e-2).count();
+                if bad > 0 {
+                    mismatches += bad as u32;
+                    kb_bad_total += bad as u32;
+                }
+            }
+            println!("  mbar micro kb={kb}: {kb_bad_total}/81920 wrong (20 iters x 4096 rows)");
+        }
+        println!(
+            "  mbar micro (REAL q6k kernel, synthetic weights): wrong={mismatches} -> {}",
+            if mismatches == 0 { "PASS" } else { "FAIL" }
+        );
+        all_ok &= mismatches == 0;
+    }
+
+
     // ---- 1. RoPE table fast path (eager decode route) ----
     let x: Vec<f32> = prng_data(N_HEADS * HEAD_DIM, 1);
     let x_dev = upload(x.clone(), &stream);
@@ -1956,7 +2055,7 @@ fn main() {
 
                 // Shape bisect: kb=8 (ONE loop iteration, no swap) and
                 // kb=16 (two iterations, one swap) from the same weights.
-                for &kbt in &[8usize, 16usize] {
+                for &kbt in &[8usize, 16usize, 24usize, 32usize, 40usize, 48usize, 56usize] {
                     let kt = kbt * 256;
                     let xt: Vec<f32> = x[..kt].to_vec();
                     let xt_dev = upload(xt.clone(), &stream);
