@@ -216,6 +216,26 @@ pub fn perplexity(
     })
 }
 
+/// MMLU-style multiple-choice prompt, matching the standard harness format
+/// (lm-evaluation-harness / Hendrycks): instruction line, question, lettered
+/// choices, "Answer:" -- the model scores the letter tokens that follow.
+pub fn mmlu_format_prompt(subject: &str, question: &str, choices: &[String]) -> String {
+    let subject = subject.replace('_', " ");
+    let mut s = format!(
+        "The following are multiple choice questions (with answers) about {subject}.\n\n{question}\n"
+    );
+    for (i, c) in choices.iter().enumerate() {
+        s.push_str(&format!("{}. {}\n", (b'A' + i as u8) as char, c));
+    }
+    s.push_str("Answer:");
+    s
+}
+
+/// The candidate continuation tokens for the 4 MMLU choices: " A" .. " D"
+/// (leading space, llama-family convention after "Answer:"). Assumes the
+/// caller strips a prepended BOS.
+pub const MMLU_LETTERS: [&str; 4] = [" A", " B", " C", " D"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,5 +507,22 @@ mod tests {
             config: cfg.clone(),
         };
         assert!(perplexity(&model, &cfg, &[1, 2, 3], &PplOptions::default()).is_none());
+    }
+
+    #[test]
+    fn mmlu_prompt_format() {
+        let p = mmlu_format_prompt(
+            "clinical_knowledge",
+            "What is 1+1?",
+            &["one".into(), "two".into(), "three".into(), "four".into()],
+        );
+        assert!(p.starts_with(
+            "The following are multiple choice questions (with answers) about clinical knowledge.\n\n"
+        ));
+        assert!(p.contains("What is 1+1?\n"));
+        assert!(p.contains("A. one\n"));
+        assert!(p.contains("D. four\n"));
+        assert!(p.ends_with("Answer:"));
+        assert_eq!(MMLU_LETTERS, [" A", " B", " C", " D"]);
     }
 }

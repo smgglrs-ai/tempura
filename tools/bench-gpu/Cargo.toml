@@ -45,12 +45,17 @@ path = "src/bench_decode_ops.rs"
 name = "bench-perplexity"
 path = "src/bench_perplexity.rs"
 
+[[bin]]
+name = "bench-mmlu"
+path = "src/bench_mmlu.rs"
+
 [dependencies]
 tempura-kernels = { path = "../../kernels", features = ["cutile", "oxide-gemv"] }
 tempura-engine = { path = "../../engine", features = ["cutile", "oxide-gemv"] }
 cutile = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cutile-rs/cutile" }
 cuda-core = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-core" }
 half = "2"
+serde_json = "1"
 
 [lints]
 workspace = true
