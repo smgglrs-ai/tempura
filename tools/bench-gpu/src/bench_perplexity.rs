@@ -289,6 +289,27 @@ fn main() {
             std::fs::write(format!("{p}.{name}.bin"), bytes)
                 .expect("failed to write probe logits");
         }
+        // TEMPURA_PPL_PROBE_ALL=1: also feed the tokens ONE AT A TIME
+        // (incremental decode) and dump every position's logits to
+        // <p>.cpu.dec.bin. Per-position comparison against llama.cpp's
+        // all-positions dump separates position-dependent error (RoPE)
+        // from multi-key prefill-attention error: decode and prefill
+        // share rope + KV storage but not the seq_len>1 attention path.
+        if std::env::var("TEMPURA_PPL_PROBE_ALL").is_ok() {
+            let mut s = InferenceSession::new(&config, TraceLevel::Off, 0);
+            let mut all: Vec<f32> = Vec::with_capacity(ids.len() * config.vocab_size);
+            let mut first = true;
+            for &t in &ids {
+                let _ = first;
+                let l = cpu_model.forward(&mut s, &[t]);
+                all.extend_from_slice(&l);
+                first = false;
+            }
+            let bytes: Vec<u8> = all.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(format!("{p}.cpu.dec.bin"), bytes)
+                .expect("failed to write decode logits");
+            println!("  decode-per-position logits written to {p}.cpu.dec.bin");
+        }
         println!("  logits written to {p}.cpu.bin / {p}.gpu.bin");
         return;
     }
