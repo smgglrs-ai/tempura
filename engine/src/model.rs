@@ -3850,6 +3850,9 @@ where
             }
 
             for layer in 0..cfg.num_layers {
+                if std::env::var("TEMPURA_PROBE_FLOW").is_ok() {
+                    eprintln!("[flow] entered layer loop, layer {layer}, seq_len {seq_len}");
+                }
                 let layer_kind = cfg
                     .layer_kinds
                     .as_ref()
