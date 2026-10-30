@@ -124,6 +124,9 @@ pub fn perplexity(
     let mut count = 0usize;
     let mut nan_steps = 0usize;
     let mut logprobs = if opts.collect_logprobs { Vec::new() } else { Vec::new() };
+    let debug_topn = std::env::var("TEMPURA_PPL_DEBUG_TOPN")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
 
     for i in 0..n_chunk {
         if opts.progress {
@@ -154,6 +157,23 @@ pub fn perplexity(
             let lp = token_logprob(&logits, chunk[j + 1] as usize);
             if opts.collect_logprobs {
                 logprobs.push(lp);
+            }
+            // TEMPURA_PPL_DEBUG_TOPN=n: for the first n scored positions of
+            // chunk 0, print the target token and the top-5 predictions --
+            // divergence localization against llama.cpp logprobs.
+            if let Some(n_dbg) = debug_topn {
+                if i == 0 && j < first + n_dbg {
+                    let mut idx: Vec<usize> = (0..logits.len()).collect();
+                    idx.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+                    eprintln!(
+                        "  [dbg] chunk0 pos {j}: target={} lp={lp:.3} top5={:?}",
+                        chunk[j + 1],
+                        idx.iter()
+                            .take(5)
+                            .map(|&k| (k, logits[k]))
+                            .collect::<Vec<_>>()
+                    );
+                }
             }
             nll += -lp;
             count += 1;
