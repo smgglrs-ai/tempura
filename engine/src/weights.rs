@@ -383,7 +383,8 @@ impl QuantizedWeights {
             q2x4: HashMap::new(),
             q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
-            q4k_repacked: HashMap::new(), q6k_repacked: HashMap::new(),
+            q4k_repacked: HashMap::new(),
+            q6k_repacked: HashMap::new(),
         }
     }
 
@@ -415,7 +416,8 @@ impl QuantizedWeights {
             q2x4: HashMap::new(),
             q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
-            q4k_repacked: HashMap::new(), q6k_repacked: HashMap::new(),
+            q4k_repacked: HashMap::new(),
+            q6k_repacked: HashMap::new(),
         }
     }
 
@@ -465,7 +467,8 @@ impl QuantizedWeights {
             q2x4: HashMap::new(),
             q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
-            q4k_repacked: HashMap::new(), q6k_repacked: HashMap::new(),
+            q4k_repacked: HashMap::new(),
+            q6k_repacked: HashMap::new(),
         }
     }
 
@@ -491,7 +494,8 @@ impl QuantizedWeights {
             q2x4: HashMap::new(),
             q2_tiled: HashMap::new(),
             q2_row_corrections: HashMap::new(),
-            q4k_repacked: HashMap::new(), q6k_repacked: HashMap::new(),
+            q4k_repacked: HashMap::new(),
+            q6k_repacked: HashMap::new(),
         }
     }
 
@@ -565,15 +569,21 @@ impl QuantizedWeights {
                 Some(&s) => s,
                 None => continue,
             };
-            if n_rows == 0 || k == 0 || n_rows % 8 != 0 { continue; }
+            if n_rows == 0 || k == 0 || n_rows % 8 != 0 {
+                continue;
+            }
             let bpr = k / 256;
-            if bpr == 0 { continue; }
+            if bpr == 0 {
+                continue;
+            }
             let raw = match self.get_q6k(name) {
                 Some(r) => r,
                 None => continue,
             };
             let expected = n_rows * bpr * BLOCK_Q6K_SIZE;
-            if raw.len() != expected { continue; }
+            if raw.len() != expected {
+                continue;
+            }
             let src = unsafe {
                 std::slice::from_raw_parts(raw.as_ptr() as *const BlockQ6K, n_rows * bpr)
             };
@@ -589,7 +599,10 @@ impl QuantizedWeights {
         );
     }
 
-    pub fn get_q6k_repacked(&self, name: &str) -> Option<&[tempura_kernels::ggml::blocks::BlockQ6Kx8]> {
+    pub fn get_q6k_repacked(
+        &self,
+        name: &str,
+    ) -> Option<&[tempura_kernels::ggml::blocks::BlockQ6Kx8]> {
         self.q6k_repacked.get(name).map(|v| v.as_slice())
     }
 
@@ -741,7 +754,8 @@ impl QuantizedWeights {
         self.q2_i2s.retain(|k, _| keep.contains(k.as_str()));
         self.q2x4.retain(|k, _| keep.contains(k.as_str()));
         self.q2_tiled.retain(|k, _| keep.contains(k.as_str()));
-        self.q2_row_corrections.retain(|k, _| keep.contains(k.as_str()));
+        self.q2_row_corrections
+            .retain(|k, _| keep.contains(k.as_str()));
         self.q4k_repacked.retain(|k, _| keep.contains(k.as_str()));
         self.q6k_repacked.retain(|k, _| keep.contains(k.as_str()));
     }
@@ -945,7 +959,10 @@ impl QuantizedWeights {
         }
         if let Some(tensor) = self.get_tl2(name) {
             let corrections = self.get_q2_row_corrections(name);
-            return Some(PreIndexedWeight::Tl2 { tensor, corrections });
+            return Some(PreIndexedWeight::Tl2 {
+                tensor,
+                corrections,
+            });
         }
         if let Some(w) = self.get_i2s(name) {
             return Some(PreIndexedWeight::I2s(w));
@@ -1022,7 +1039,10 @@ impl QuantizedWeights {
         let mut qw = Self::empty();
 
         for shard_path in &shard_paths {
-            eprintln!("[safetensors] loading shard {:?}", shard_path.file_name().unwrap());
+            eprintln!(
+                "[safetensors] loading shard {:?}",
+                shard_path.file_name().unwrap()
+            );
             let bytes = std::fs::read(shard_path)?;
             let st = SafeTensors::deserialize(&bytes)?;
             for (name, view) in st.tensors() {

@@ -98,8 +98,7 @@ impl KvCache {
         // SquaredRelu (BitNet). The tiny_test() config leaves use_f16_kv=false
         // so tests continue to use the F32 path.
         let use_f16 = is_x86_feature_detected!("f16c")
-            && (config.use_f16_kv
-                || config.hidden_act == crate::config::HiddenAct::SquaredRelu);
+            && (config.use_f16_kv || config.hidden_act == crate::config::HiddenAct::SquaredRelu);
         let k: Vec<Vec<f32>> = (0..num_cache_layers)
             .map(|_| {
                 if use_f16 {
