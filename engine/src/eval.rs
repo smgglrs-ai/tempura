@@ -174,6 +174,19 @@ pub fn perplexity(
                             .collect::<Vec<_>>()
                     );
                 }
+                // TEMPURA_PPL_DUMP_LOGITS=path: full logit vector at chunk 0,
+                // first scored position -- correlation diff vs llama.cpp's
+                // --save-all-logits distribution.
+                if i == 0 && j == first {
+                    if let Ok(path) = std::env::var("TEMPURA_PPL_DUMP_LOGITS") {
+                        use std::io::Write;
+                        let mut f = std::fs::File::create(&path).unwrap();
+                        for v in &logits {
+                            f.write_all(&v.to_le_bytes()).unwrap();
+                        }
+                        eprintln!("  [dbg] logits dump written to {path}");
+                    }
+                }
             }
             nll += -lp;
             count += 1;
