@@ -296,6 +296,37 @@ fn main() {
         Some(_) => println!("  Tokenizer: extracted from GGUF metadata"),
         None => println!("  Tokenizer: NOT available, falling back to synthetic tokens"),
     }
+    // Wrap the prompt in the model's own chat template (add_generation_prompt)
+    // so instruct models see their trained input format -- and feed the SAME
+    // rendered text to the llama.cpp arbiter below (-p is raw in llama-cli,
+    // but its tokenizer parses special tokens, so both sides see identical
+    // ids). The 2026-10-30 free-running divergence hunt showed the arbiter
+    // was comparing templated llama.cpp chat output against tempura's
+    // untemplated prompt. TEMPURA_QUALITY_RAW=1 keeps the raw prompt.
+    let prompt_text = if std::env::var("TEMPURA_QUALITY_RAW").is_err() {
+        let rendered = tokenizer.as_ref().and_then(|tok| {
+            tok.apply_chat_template(
+                &[tempura_engine::tokenizer::ChatMessageInput {
+                    role: "user".to_string(),
+                    content: prompt_text.clone(),
+                }],
+                true,
+            )
+            .ok()
+        });
+        match rendered {
+            Some(r) => {
+                println!("  Chat template applied ({} chars)", r.len());
+                r
+            }
+            None => {
+                println!("  Chat template unavailable, using raw prompt");
+                prompt_text
+            }
+        }
+    } else {
+        prompt_text
+    };
     let prompt: Vec<u32> = match &tokenizer {
         Some(tok) => tok.encode(&prompt_text).expect("prompt tokenization failed"),
         None => {
