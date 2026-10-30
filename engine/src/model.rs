@@ -1947,7 +1947,8 @@ where
         // -- ggml_graph_compute_thread translation --------------------------------
         // Workers dispatched ONCE for all layers; per-node SpinBarrier;
         // sequential ops (norm, attention) run on ith==0 only.
-        let can_use_graph_decode = seq_len == 1
+        let can_use_graph_decode = std::env::var("TEMPURA_NO_GRAPH_DECODE").is_err()
+            && seq_len == 1
             && !cfg.parallel_attn_ffn
             && !cfg.use_layernorm
             && !cfg.rmsnorm_offset
@@ -2768,7 +2769,12 @@ where
             // Prefill graph model: infrastructure is wired but numerical correctness
             // needs debugging (produces wrong hidden states vs fallback). Disabled pending fix.
             // Enable with TEMPURA_GRAPH_PREFILL=1 for testing.
-            let can_use_graph_prefill = seq_len > 1
+            // NOTE (2026-10-30): the env check was MISSING -- every multi-token
+            // CPU prefill silently took this known-broken path (found via the
+            // llama.cpp logit-probe length bisect: corr vs llama.cpp collapses
+            // at every seq_len divisible by 4, the Q8Kx4 tile granularity).
+            let can_use_graph_prefill = std::env::var("TEMPURA_GRAPH_PREFILL").is_ok()
+                && seq_len > 1
                 && !cfg.parallel_attn_ffn
                 && !cfg.use_layernorm
                 && !cfg.rmsnorm_offset
