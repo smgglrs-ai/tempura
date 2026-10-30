@@ -356,6 +356,10 @@ impl Tokenizer {
         self.eos_token_id
     }
 
+    pub fn bos_token_id(&self) -> Option<u32> {
+        self.bos_token_id
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
     }

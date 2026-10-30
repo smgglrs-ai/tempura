@@ -44,9 +44,10 @@ engine ──────── models, KV caches, loaders, traces, decoding str
     └─ cli ───── the `tempura` binary: serve, pull, list, inspect
 
 tools/ (workspace): trace-cli (TUI trace viewer), bench (HTTP throughput),
-  bench-gpu (9 GPU benchmarks: bench-real-model, bench-batch, bench-mxfp4,
+  bench-gpu (10 GPU benchmarks: bench-real-model, bench-batch, bench-mxfp4,
   bench-e2e, bench-attn, bench-kernels, bench-speculative, bench-quality,
-  bench-decode-ops), compare (server-vs-server), integration
+  bench-decode-ops, bench-perplexity), compare (server-vs-server),
+  integration
 tools/ (standalone, cargo oxide): oxide-gemv (Q2_0), oxide-gemv-q4k,
   oxide-gemv-q6k, oxide-decode-attn, mxf4-gemv (cute-rs SM120a test)
 
@@ -115,7 +116,7 @@ docs/ (Zola site, deployed by .github/workflows/pages.yml)
   - `speculative.rs` (target+draft), `multi_token.rs` (Medusa heads),
     `disaggregated.rs` (`PrefillWorker`/`DecodeWorker` traits +
     `SessionTransfer`), `dual_pipeline.rs`, `prefix_cache.rs`, `lora.rs`,
-    `tool_call.rs` (hermes/mistral/llama3 parsers + template auto-detect),
+    `eval.rs` (llama.cpp-compatible corpus perplexity), `tool_call.rs` (hermes/mistral/llama3 parsers + template auto-detect),
     `tokenizer.rs` (HF tokenizers + GGUF-metadata extraction + chat
     templates), `trace.rs`/`trace_diff.rs` (first-class traces),
     `cutile_gpu_forward.rs` (~6.7k lines, CUDA-graph decode).
@@ -511,8 +512,8 @@ typical-p/repeat/presence/frequency)
       NOTE: this GGUF (bartowski Llama-3.1-8B Q4_K_M) has a mixed layout
       -- 16 layers with Q6K v+down_proj, 16 with Q4K -- verified from the
       GGUF tensor-type census (193 Q4K + 33 Q6K) and the trace.
-- [ ] **Quality benchmark suite (next session):** implement three
-      implementation-robust quality benchmarks + multi-model validation.
+- [ ] **Quality benchmark suite (in progress):** implementation-robust
+      quality benchmarks + multi-model validation.
       The free-running greedy comparison showed all implementations
       (including llama.cpp's own GPU) produce repetition loops for
       open-ended prompts -- quantized greedy decoding operates at the
@@ -520,12 +521,20 @@ typical-p/repeat/presence/frequency)
       you get a coherent story or a loop. The teacher-forced 89.1%
       agreement is the right internal gate, but external validation
       needs benchmarks that are insensitive to argmax flips:
-      (a) **Perplexity comparison** (WikiText-2 or similar): score a
-          fixed corpus under both tempura and llama.cpp, report
-          side-by-side perplexity. Most robust -- no argmax, directly
-          measures logits quality. Expected: within 0.05 if the math
-          is correct. This is the "are our logits as good as theirs?"
-          number.
+      (a) [x] **Perplexity comparison** (WikiText-2): engine/src/eval.rs
+          + tools/bench-gpu/src/bench_perplexity.rs (bench-perplexity).
+          Replicates llama.cpp's perplexity algorithm exactly (n_ctx
+          chunks, BOS at every chunk start, positions [n_ctx/2, n_ctx-2]
+          scored, f64 log-softmax NLL) but scores via prefill-half +
+          incremental decode (forward returns last-position logits
+          only; causal attention makes per-position logits identical).
+          Corpus: ~/.cache/tempura/eval/wikitext-2-raw/wiki.test.raw
+          (from https://wikitext.smerity.com/wikitext-2-raw-v1.zip).
+          Reports tempura GPU / tempura CPU / llama.cpp (CPU
+          llama-perplexity, -ngl 0) side by side; gate on the GPU/CPU
+          ppl ratio (TEMPURA_PPL_MAX_RATIO, default 1.10). Knobs:
+          TEMPURA_PPL_CTX (512), TEMPURA_PPL_CHUNKS (32; -1 = full
+          corpus), TEMPURA_NO_LLAMA, LLAMA_PPL.
       (b) **MMLU-style log-prob evaluation**: load MMLU questions,
           compute log P(A), log P(B), log P(C), log P(D) under both
           implementations, pick highest. Robust because well-separated

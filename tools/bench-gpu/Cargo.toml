@@ -41,6 +41,10 @@ path = "src/bench_quality.rs"
 name = "bench-decode-ops"
 path = "src/bench_decode_ops.rs"
 
+[[bin]]
+name = "bench-perplexity"
+path = "src/bench_perplexity.rs"
+
 [dependencies]
 tempura-kernels = { path = "../../kernels", features = ["cutile", "oxide-gemv"] }
 tempura-engine = { path = "../../engine", features = ["cutile", "oxide-gemv"] }

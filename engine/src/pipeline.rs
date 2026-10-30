@@ -321,7 +321,10 @@ pub fn capped_batch_chunks(total: usize, min: usize, cap: usize) -> Vec<usize> {
     assert!(min >= 1, "min chunk size must be >= 1");
     assert!(cap >= min, "cap must be >= min");
     assert!(cap >= 2 * min - 1, "cap too small for the split-early tail");
-    assert!(total >= min, "total < min: route to a smaller-row kernel instead");
+    assert!(
+        total >= min,
+        "total < min: route to a smaller-row kernel instead"
+    );
     let mut chunks = Vec::new();
     let mut rem = total;
     while rem > cap {

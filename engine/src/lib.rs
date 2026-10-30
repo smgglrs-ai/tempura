@@ -8,6 +8,7 @@ pub mod cutile_kv_cache;
 pub mod deltanet_state;
 pub mod disaggregated;
 pub mod dual_pipeline;
+pub mod eval;
 pub mod gguf_loader;
 pub mod kv_cache;
 pub mod loader;

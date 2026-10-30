@@ -270,11 +270,13 @@ impl CutileKvCache {
             return Ok(());
         }
         for layer in 0..self.n_layers {
-            let k_host: Vec<f32> = self.k_device[layer].clone()
+            let k_host: Vec<f32> = self.k_device[layer]
+                .clone()
                 .to_host_vec()
                 .sync_on(&self.stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-            let v_host: Vec<f32> = self.v_device[layer].clone()
+            let v_host: Vec<f32> = self.v_device[layer]
+                .clone()
                 .to_host_vec()
                 .sync_on(&self.stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
@@ -360,7 +362,10 @@ impl CutileKvCache {
     /// `[token, kv_head, head_dim]` layout.  Only the first `seq_len * kv_dim`
     /// elements are valid; the rest are zero-initialised.
     pub fn kv_device_tensors(&self, layer: usize) -> (Arc<Tensor<f32>>, Arc<Tensor<f32>>) {
-        (Arc::clone(&self.k_device[layer]), Arc::clone(&self.v_device[layer]))
+        (
+            Arc::clone(&self.k_device[layer]),
+            Arc::clone(&self.v_device[layer]),
+        )
     }
 
     pub fn gpu_max_seq_len(&self) -> usize {
