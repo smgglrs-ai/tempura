@@ -288,6 +288,25 @@ fn main() {
             let bytes: Vec<u8> = l.iter().flat_map(|v| v.to_le_bytes()).collect();
             std::fs::write(format!("{p}.{name}.bin"), bytes)
                 .expect("failed to write probe logits");
+            // TEMPURA_PPL_DUMP_KV=1 (CPU side): the raw f16 K cache for every
+            // layer, position-major [token, kv_heads, head_dim] -- byte-level
+            // diff against llama.cpp's llama_state_seq_get_data K blocks.
+            if name == "cpu" && std::env::var("TEMPURA_PPL_DUMP_KV").is_ok() {
+                let stride = config.num_kv_heads * config.head_dim;
+                let mut out: Vec<u8> = Vec::with_capacity(
+                    config.num_layers * ids.len() * stride * 2,
+                );
+                for layer in 0..config.num_attention_layers() {
+                    let k = s.cache.k_data_f16(layer, ids.len());
+                    for v in k {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                std::fs::write(format!("{p}.kcache.bin"), out)
+                    .expect("failed to write K cache dump");
+                println!("  K cache ({} layers x {} tokens) written to {p}.kcache.bin",
+                    config.num_attention_layers(), ids.len());
+            }
         }
         // TEMPURA_PPL_PROBE_ALL=1: also feed the tokens ONE AT A TIME
         // (incremental decode) and dump every position's logits to
