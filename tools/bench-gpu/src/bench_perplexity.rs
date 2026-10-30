@@ -221,6 +221,7 @@ fn main() {
         max_chunks,
         bos,
         progress: true,
+        collect_logprobs: std::env::var("TEMPURA_PPL_DUMP_LOGPROBS").is_ok(),
     };
 
     // --- GPU model ---
@@ -252,6 +253,23 @@ fn main() {
     let gpu_res = perplexity(&wrapper, &config, &corpus_tokens, &opts)
         .expect("corpus too short for one chunk");
     report_line("tempura GPU", &gpu_res);
+
+    // TEMPURA_PPL_DUMP_LOGPROBS: per-scored-position logprobs of the actual
+    // next token (GPU side), one f64 per line -- diff against llama.cpp's
+    // --save-all-logits log_prob block to localize divergence.
+    if let Ok(path) = std::env::var("TEMPURA_PPL_DUMP_LOGPROBS") {
+        std::fs::write(
+            &path,
+            gpu_res
+                .logprobs
+                .iter()
+                .map(|v| format!("{v:.6}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("failed to write logprob dump");
+        println!("  GPU logprob dump written to {path} ({} positions)", gpu_res.logprobs.len());
+    }
 
     // --- llama.cpp reference ---
     let llama_ppl = if std::env::var("TEMPURA_NO_LLAMA").is_err() {

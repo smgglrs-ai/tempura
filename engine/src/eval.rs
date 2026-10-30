@@ -46,6 +46,9 @@ pub struct PplResult {
     /// Logits vectors containing at least one NaN (quality gate input).
     pub nan_steps: usize,
     pub elapsed_s: f64,
+    /// Per-scored-position logprob of the actual next token (corpus
+    /// order), populated when `PplOptions::collect_logprobs` is set.
+    pub logprobs: Vec<f64>,
 }
 
 impl PplResult {
@@ -75,6 +78,9 @@ pub struct PplOptions {
     /// Print per-chunk progress to stderr (long CPU runs are silent
     /// otherwise).
     pub progress: bool,
+    /// When set, collect the per-scored-position logprobs into the result
+    /// (token logprob of each scored next-token, in corpus order).
+    pub collect_logprobs: bool,
 }
 
 impl Default for PplOptions {
@@ -84,6 +90,7 @@ impl Default for PplOptions {
             max_chunks: None,
             bos: None,
             progress: false,
+            collect_logprobs: false,
         }
     }
 }
@@ -116,6 +123,7 @@ pub fn perplexity(
     let mut nll = 0.0f64;
     let mut count = 0usize;
     let mut nan_steps = 0usize;
+    let mut logprobs = if opts.collect_logprobs { Vec::new() } else { Vec::new() };
 
     for i in 0..n_chunk {
         if opts.progress {
@@ -143,7 +151,11 @@ pub fn perplexity(
         }
         let mut j = first;
         while j < n_ctx - 1 {
-            nll += -token_logprob(&logits, chunk[j + 1] as usize);
+            let lp = token_logprob(&logits, chunk[j + 1] as usize);
+            if opts.collect_logprobs {
+                logprobs.push(lp);
+            }
+            nll += -lp;
             count += 1;
             j += 1;
             if j < n_ctx - 1 {
@@ -167,6 +179,7 @@ pub fn perplexity(
         chunks: n_chunk,
         nan_steps,
         elapsed_s: t0.elapsed().as_secs_f64(),
+        logprobs,
     })
 }
 
