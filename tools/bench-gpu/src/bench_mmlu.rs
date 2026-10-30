@@ -103,9 +103,10 @@ fn load_questions(path: &Path) -> Vec<Question> {
         if choices.len() != 4 || question.is_empty() {
             continue;
         }
+        let prompt = mmlu_format_prompt(&subject, question, &choices);
         out.push(Question {
             subject,
-            prompt: mmlu_format_prompt(&subject, question, &choices),
+            prompt,
             answer: answer.min(3),
         });
     }
