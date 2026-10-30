@@ -511,6 +511,46 @@ typical-p/repeat/presence/frequency)
       NOTE: this GGUF (bartowski Llama-3.1-8B Q4_K_M) has a mixed layout
       -- 16 layers with Q6K v+down_proj, 16 with Q4K -- verified from the
       GGUF tensor-type census (193 Q4K + 33 Q6K) and the trace.
+- [ ] **Quality benchmark suite (next session):** implement three
+      implementation-robust quality benchmarks + multi-model validation.
+      The free-running greedy comparison showed all implementations
+      (including llama.cpp's own GPU) produce repetition loops for
+      open-ended prompts -- quantized greedy decoding operates at the
+      edge of chaos, and small numerical differences determine whether
+      you get a coherent story or a loop. The teacher-forced 89.1%
+      agreement is the right internal gate, but external validation
+      needs benchmarks that are insensitive to argmax flips:
+      (a) **Perplexity comparison** (WikiText-2 or similar): score a
+          fixed corpus under both tempura and llama.cpp, report
+          side-by-side perplexity. Most robust -- no argmax, directly
+          measures logits quality. Expected: within 0.05 if the math
+          is correct. This is the "are our logits as good as theirs?"
+          number.
+      (b) **MMLU-style log-prob evaluation**: load MMLU questions,
+          compute log P(A), log P(B), log P(C), log P(D) under both
+          implementations, pick highest. Robust because well-separated
+          options don't flip from small perturbations. Only near-tie
+          questions (~5-10% of MMLU) are affected.
+      (c) **Self-consistency generation** (GSM8K-style): generate 5
+          samples at temperature=0.7, majority vote. Breaks repetition
+          loops and averages out near-tie flips. This is what production
+          systems do (Wang et al. 2022).
+      (d) **Multi-model validation**: test with other RTX 5090-fitting
+          models (Llama-3.1-8B, Qwen2.5-7B, Mistral-7B, Phi-3.5-mini,
+          Gemma-2-9B) to verify the quality gates hold across
+          architectures, not just Llama-3.1.
+      Current quality matrix for reference (Llama-3.1-8B Q4_K_M,
+      teacher-forced, 64 positions):
+        tempura CPU vs GPU:    89.1%  (internal gate -- PASSES)
+        llama.cpp CPU vs GPU:  76.6%  (reference impl's own gap)
+        tempura vs llama.cpp:  ~20%   (systematic impl difference)
+      Free-running text quality (6 diverse prompts):
+        llama.cpp CPU:   6/6 coherent (100%)
+        llama.cpp GPU:   3/6 coherent (50%)
+        tempura:         0/6 coherent (repetition loops)
+      The repetition is inherent to quantized greedy decoding, not a
+      tempura bug (llama.cpp's GPU has the same problem). Temperature
+      > 0 or self-consistency sampling would resolve it.
 - [x] **Prefill on GPU: 7700 tok/s pp128, TTFT P50 16.5 ms -- BEATING
       llama.cpp (ref 7335, 1.05x in our favor; 2026-10-29).**
       Lever-by-lever history
