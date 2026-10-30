@@ -180,8 +180,14 @@ fn main() {
         None => "all".to_string(),
     });
 
-    let corpus = std::fs::read_to_string(&corpus_path)
-        .unwrap_or_else(|e| panic!("failed to read corpus {}: {e}", corpus_path.display()));
+    let corpus = if std::env::var("TEMPURA_PPL_PROBE").is_ok() {
+        // Probe mode: exact token ids come from the probe file; no corpus
+        // eval runs, so skip the read.
+        String::new()
+    } else {
+        std::fs::read_to_string(&corpus_path)
+            .unwrap_or_else(|e| panic!("failed to read corpus {}: {e}", corpus_path.display()))
+    };
 
     // --- Load GGUF (GPU side) ---
     println!("\nLoading GGUF...");
@@ -242,6 +248,50 @@ fn main() {
         TransformerModel::new(config.clone(), KernelPipeline::cpu_native());
     cpu_model.quantized_weights = Some(qw_cpu);
     println!("  Ready in {:.2}s", t3.elapsed().as_secs_f64());
+
+    // --- TEMPURA_PPL_PROBE=path: reference-bisect mode ------------------
+    // Read exact token ids from `path`, run ONE forward per side, dump the
+    // logits to <path>.cpu.bin / <path>.gpu.bin, exit. Compare against
+    // llama.cpp's tests-ggml/llama_logitprobe.cpp output for the same ids.
+    // Length bisect: 1 token trivializes attention+RoPE (pos 0 self-attend,
+    // identity rotation), so a mismatch there indicts the weight/norm/GEMM
+    // stack; divergence appearing only at longer lengths indicts
+    // attention/RoPE/KV.
+    if let Ok(p) = std::env::var("TEMPURA_PPL_PROBE") {
+        use tempura_engine::session::InferenceSession;
+        use tempura_engine::trace::TraceLevel;
+        use tempura_engine::model::InferenceModel;
+        let ids: Vec<u32> = std::fs::read_to_string(&p)
+            .expect("failed to read probe token file")
+            .split_whitespace()
+            .map(|s| s.parse().expect("bad token id in probe file"))
+            .collect();
+        println!("\n--- probe: {} tokens from {p} ---", ids.len());
+        let stats = |name: &str, l: &[f32]| {
+            let mean = l.iter().sum::<f32>() / l.len() as f32;
+            let std = (l.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / l.len() as f32).sqrt();
+            let mut idx: Vec<usize> = (0..l.len()).collect();
+            idx.sort_unstable_by(|&a, &b| l[b].total_cmp(&l[a]));
+            println!(
+                "  {name}: max={:.3} mean={:.3} std={std:.3} top5={:?}",
+                l.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+                mean,
+                idx.iter().take(5).map(|&k| (k, l[k])).collect::<Vec<_>>()
+            );
+        };
+        let sides: [(&str, &dyn InferenceModel); 2] =
+            [("cpu", &cpu_model), ("gpu", &wrapper)];
+        for (name, model) in sides {
+            let mut s = InferenceSession::new(&config, TraceLevel::Off, 0);
+            let l = model.forward(&mut s, &ids);
+            stats(name, &l);
+            let bytes: Vec<u8> = l.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(format!("{p}.{name}.bin"), bytes)
+                .expect("failed to write probe logits");
+        }
+        println!("  logits written to {p}.cpu.bin / {p}.gpu.bin");
+        return;
+    }
 
     // --- Perplexity on both paths ---
     println!("\n--- tempura CPU ---");
