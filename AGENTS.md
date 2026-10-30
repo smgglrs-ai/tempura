@@ -581,12 +581,34 @@ typical-p/repeat/presence/frequency)
             bug), and every logits fingerprint/baseline measured with
             the wrong rope (re-baseline bench-real-model /
             bench-quality / bench-batch).
+          * FINAL NUMBERS (Llama-3.1-8B Q4_K_M, WikiText-2 test, n_ctx
+            512, 32 chunks): tempura CPU ppl 7.31, tempura GPU 7.97,
+            llama.cpp 7.09. CPU/llama 1.03x, GPU/CPU 1.09x (PASS at the
+            1.10 gate; the GPU excess is the MXFP4 band: the ppl decode
+            steps read KV written by MXFP4 prefill). Logits are now
+            sharp (top 11-17, was ~7 flat). Performance unchanged:
+            decode 219 tok/s, prefill 7575 tok/s, det=OK, NaN-free
+            (bench-real-model fingerprints re-baselined 2026-10-30).
           * The 1-2-token logit probes, the K-cache byte diff, and the
             repeated-token rope-angle extraction (recovered the unroped
             vector from a 1-token probe, read off exact per-(position,
             pair) rotation angles from both implementations' K caches)
             are the reusable playbook; llama.cpp is the reference, never
             a reimplementation.
+          * REMAINING follow-ups: (1) bench-quality's llama.cpp arbiter
+              runs llama-cli WITHOUT the chat template (its -p is raw),
+              so its cross-implementation numbers compare against a
+              nonsense reference -- pass --single-turn or the templated
+              prompt; (2) re-characterize free-running text quality
+              post-fix (greedy on this quantized instruct model still
+              repetition-loops with both tempura and llama.cpp's GPU --
+              edge of chaos -- but tempura with a manual template now
+              produces grammatical, on-theme text where the pre-fix
+              output was degenerate); (3) re-baseline bench-batch
+              fingerprints; (4) validate the qwen/gemma/phi NeoX
+              mappings and the config.rs HF-path conventions against
+              llama.cpp the same way; (5) the graph-prefill path
+              (TEMPURA_GRAPH_PREFILL=1) is still broken and off.
       (b) **MMLU-style log-prob evaluation**: load MMLU questions,
           compute log P(A), log P(B), log P(C), log P(D) under both
           implementations, pick highest. Robust because well-separated
