@@ -112,6 +112,24 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "wrote %s: %d token(s), vocab %d%s\n", argv[3], n, nv,
             dump_all ? " (all positions)" : " (last position)");
 
+    // Optional raw state dump (env LLAMA_STATE_OUT): the sequence state
+    // blob from llama_state_seq_get_data -- contains the serialized KV
+    // cache (per-cell meta, then per-layer K/V tensor bytes). Used for
+    // byte-level K-cache diffs against tempura.
+    if (const char * state_out = getenv("LLAMA_STATE_OUT")) {
+        const size_t state_size = llama_state_seq_get_size(ctx, 0);
+        std::vector<uint8_t> state(state_size);
+        const size_t written = llama_state_seq_get_data(ctx, state.data(), state.size(), 0);
+        FILE * sf = fopen(state_out, "wb");
+        if (sf) {
+            fwrite(state.data(), 1, written, sf);
+            fclose(sf);
+            fprintf(stderr, "wrote %s: %zu bytes of sequence state\n", state_out, written);
+        } else {
+            fprintf(stderr, "failed to open %s\n", state_out);
+        }
+    }
+
     llama_batch_ext_free(batch);
     llama_free(ctx);
     llama_model_free(model);
