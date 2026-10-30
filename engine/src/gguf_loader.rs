@@ -1083,10 +1083,45 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         }
     };
 
-    // Qwen3.5/3.6 use IMROPE (interleaved multi-rope) = adjacent-pair (Norm) RoPE.
-    // Standard GGUF converter permutes Q/K weights for adjacent-pair pairing.
-    // BitNet/ternary GGUF converter does NOT permute -> needs NeoX (split-half) RoPE.
-    let rope_type = if (arch == "qwen35" || arch == "qwen35moe") && !is_bitnet {
+    // RoPE pairing per GGUF architecture, matching llama.cpp's
+    // llama_model_rope_type() table (src/llama-model.cpp). The GGUF
+    // converter permutes Q/K weight rows into adjacent-pair order for
+    // NORM-rope arches and leaves split-half order for NEOX arches --
+    // reading permuted weights with split-half RoPE (the old default)
+    // silently destroys positional information: logits match the reference
+    // at 1-2 tokens but diverge progressively with distance (found
+    // 2026-10-30 via the llama.cpp K-cache diff; Llama-3.1 WikiText-2 ppl
+    // was 640 vs llama.cpp's 7.1).
+    // NORM (adjacent pairs (2i, 2i+1)): llama, llama4, baichuan, internlm2,
+    //   minicpm, xverse, command-r, cohere2, olmo, arctic, deepseek,
+    //   deepseek2, chatglm, glm4, granite, smollm3, ernie4.5, mistral3/4.
+    // NEOX (split pairs (i, i+n/2)): qwen*, phi*, gemma*, falcon, gptneox,
+    //   starcoder2, olmo2, plamo, stablelm, bitnet (also forced below).
+    // Qwen3.5/3.6 use IMROPE (interleaved multi-rope) = adjacent-pair RoPE.
+    let rope_type = if matches!(
+        arch.as_str(),
+        "llama"
+            | "llama4"
+            | "baichuan"
+            | "internlm2"
+            | "minicpm"
+            | "xverse"
+            | "command-r"
+            | "cohere2"
+            | "olmo"
+            | "arctic"
+            | "deepseek"
+            | "deepseek2"
+            | "chatglm"
+            | "glm4"
+            | "granite"
+            | "smollm3"
+            | "ernie45"
+            | "ernie45moe"
+            | "mistral3"
+            | "mistral4"
+    ) || ((arch == "qwen35" || arch == "qwen35moe") && !is_bitnet)
+    {
         crate::config::RopeType::Norm
     } else {
         crate::config::RopeType::Neox
