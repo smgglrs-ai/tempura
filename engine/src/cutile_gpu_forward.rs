@@ -2314,29 +2314,6 @@ impl CutileGpuModel {
         let inter = config.intermediate_size;
         let vocab = config.vocab_size;
 
-        // Norm-rope (adjacent-pair) GGUFs store Q/K rows in interleaved
-        // order; the GPU rope kernels pair contiguous per-head halves.
-        // Permute each head's rows (even -> first half, odd -> second) so
-        // the existing kernels apply the adjacent-pair rotation. CPU-side
-        // weights are a separate QuantizedWeights and are NOT touched.
-        if config.rope_type == crate::config::RopeType::Norm {
-            for layer in 0..config.num_layers {
-                let p = format!("model.layers.{layer}");
-                qw.permute_qk_rows_split_half(
-                    &format!("{p}.self_attn.q_proj.weight"),
-                    q_dim,
-                    h,
-                    head_dim,
-                );
-                qw.permute_qk_rows_split_half(
-                    &format!("{p}.self_attn.k_proj.weight"),
-                    kv_dim,
-                    h,
-                    head_dim,
-                );
-            }
-        }
-
         let h_pad = next_pow2(h.div_ceil(BK) * BK);
         let q_pad = next_pow2(q_dim.div_ceil(BK) * BK);
         let inter_pad = next_pow2(inter.div_ceil(BK) * BK);
