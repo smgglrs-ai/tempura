@@ -1099,7 +1099,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
     //   starcoder2, olmo2, plamo, stablelm, bitnet (also forced below).
     // Qwen3.5/3.6 use IMROPE (interleaved multi-rope) = adjacent-pair RoPE.
     let rope_type = if matches!(
-        arch.as_str(),
+        arch,
         "llama"
             | "llama4"
             | "baichuan"
