@@ -514,6 +514,87 @@ impl QuantizedWeights {
             })
     }
 
+    /// Permute the rows of a Q/K projection of a Norm-rope (adjacent-pair)
+    /// GGUF into split-half order: within each head of `head_dim` rows,
+    /// even rows move to the head's first half and odd rows to the second.
+    /// The GPU rope kernels pair contiguous per-head halves; after this
+    /// permutation those pairs are the GGUF's adjacent (2d, 2d+1) pairs
+    /// that the converter baked into the weight order.
+    ///
+    /// GGML quant blocks are row-aligned (one block = the k-slice of one
+    /// row), so this is a pure block permutation -- no value repacking.
+    /// Covers Q4_K/Q6_K/f32 storage; other formats are left untouched
+    /// (llama-family GGUFs store Q/K as Q4_K/Q6_K).
+    pub fn permute_qk_rows_split_half(
+        &mut self,
+        name: &str,
+        n_rows: usize,
+        k: usize,
+        head_dim: usize,
+    ) {
+        debug_assert!(n_rows % head_dim == 0);
+        let half = head_dim / 2;
+        // new row j maps to old row: within head h = j / head_dim,
+        // d = j % head_dim: old = h*head_dim + (d < half ? 2*d : 2*(d-half)+1)
+        let old_row = |j: usize| -> usize {
+            let (h, d) = (j / head_dim, j % head_dim);
+            if d < half {
+                h * head_dim + 2 * d
+            } else {
+                h * head_dim + 2 * (d - half) + 1
+            }
+        };
+        // Q4_K: 144-byte blocks, 256 elements per block.
+        let bpr = k.div_ceil(256);
+        let take_src = |map: &HashMap<String, Vec<u8>>,
+                        mmap: &HashMap<String, (usize, usize)>,
+                        backing: Option<&[u8]>|
+         -> Option<Vec<u8>> {
+            if let Some(v) = map.get(name) {
+                return Some(v.clone());
+            }
+            let &(off, len) = mmap.get(name)?;
+            backing.map(|m| m[off..off + len].to_vec())
+        };
+        let put = |map: &mut HashMap<String, Vec<u8>>, src: Vec<u8>, block_size: usize| {
+            if src.len() != n_rows * bpr * block_size {
+                return;
+            }
+            let mut dst = vec![0u8; src.len()];
+            for j in 0..n_rows {
+                let (a, b) = (j * bpr, old_row(j) * bpr);
+                dst[a * block_size..(a + bpr) * block_size]
+                    .copy_from_slice(&src[b * block_size..(b + bpr) * block_size]);
+            }
+            map.insert(name.to_string(), dst);
+        };
+        let src_q4k = take_src(&self.q4k_tensors, &self.mmap_q4k, self.mmap.as_deref());
+        if let Some(src) = src_q4k {
+            put(
+                &mut self.q4k_tensors,
+                src,
+                tempura_kernels::ggml::blocks::BLOCK_Q4K_SIZE,
+            );
+        }
+        let src_q6k = take_src(&self.q6k_tensors, &self.mmap_q6k, self.mmap.as_deref());
+        if let Some(src) = src_q6k {
+            put(
+                &mut self.q6k_tensors,
+                src,
+                tempura_kernels::ggml::blocks::BLOCK_Q6K_SIZE,
+            );
+        }
+        if let Some(v) = self.f32_tensors.get(name) {
+            if v.len() == n_rows * k {
+                let mut dst = vec![0.0f32; v.len()];
+                for j in 0..n_rows {
+                    dst[j * k..(j + 1) * k].copy_from_slice(&v[old_row(j) * k..(old_row(j) + 1) * k]);
+                }
+                self.f32_tensors.insert(name.to_string(), dst);
+            }
+        }
+    }
+
     pub fn get_q4k_repacked(
         &self,
         name: &str,

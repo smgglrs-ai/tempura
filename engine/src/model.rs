@@ -10070,7 +10070,7 @@ impl CutileInferenceWrapper {
     /// dequantize them through the [`WeightLoader`] trait.
     pub fn load_quantized(&mut self, qw: crate::weights::QuantizedWeights) {
         self.model.quantized_weights = Some(qw);
-        let qw = self.model.quantized_weights.as_ref().unwrap();
+        let qw = self.model.quantized_weights.as_mut().unwrap();
         match crate::cutile_gpu_forward::CutileGpuModel::from_quantized(qw, &self.model.config) {
             Ok(gm) => {
                 let stream = gm.stream();
@@ -10463,7 +10463,7 @@ impl InferenceModel for CutileInferenceWrapper {
         self.model.load_weights(loader)?;
         // After loading, dequantize and upload all projection weights to the GPU,
         // then create the GPU KV cache backed by the same CUDA stream.
-        let gpu_model_result = if let Some(qw) = &self.model.quantized_weights {
+        let gpu_model_result = if let Some(qw) = self.model.quantized_weights.as_mut() {
             Some(crate::cutile_gpu_forward::CutileGpuModel::from_quantized(
                 qw,
                 &self.model.config,
