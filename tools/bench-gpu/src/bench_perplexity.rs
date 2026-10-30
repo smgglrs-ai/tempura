@@ -207,10 +207,20 @@ fn main() {
         corpus_tokens.len() / n_ctx,
     );
 
+    // TEMPURA_PPL_DUMP_TOKENS=path: write one token id per line and exit --
+    // tokenization diff against llama.cpp's --save-all-logits token block.
+    if let Ok(path) = std::env::var("TEMPURA_PPL_DUMP_TOKENS") {
+        std::fs::write(&path, corpus_tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>().join("\n"))
+            .expect("failed to write token dump");
+        println!("  Token dump written to {path} ({} tokens), exiting", corpus_tokens.len());
+        std::process::exit(0);
+    }
+
     let opts = PplOptions {
         n_ctx,
         max_chunks,
         bos,
+        progress: true,
     };
 
     // --- GPU model ---
