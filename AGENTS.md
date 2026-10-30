@@ -44,9 +44,9 @@ engine ──────── models, KV caches, loaders, traces, decoding str
     └─ cli ───── the `tempura` binary: serve, pull, list, inspect
 
 tools/ (workspace): trace-cli (TUI trace viewer), bench (HTTP throughput),
-  bench-gpu (10 GPU benchmarks: bench-real-model, bench-batch, bench-mxfp4,
+  bench-gpu (11 GPU benchmarks: bench-real-model, bench-batch, bench-mxfp4,
   bench-e2e, bench-attn, bench-kernels, bench-speculative, bench-quality,
-  bench-decode-ops, bench-perplexity), compare (server-vs-server),
+  bench-decode-ops, bench-perplexity, bench-mmlu), compare (server-vs-server),
   integration
 tools/ (standalone, cargo oxide): oxide-gemv (Q2_0), oxide-gemv-q4k,
   oxide-gemv-q6k, oxide-decode-attn, mxf4-gemv (cute-rs SM120a test)
@@ -595,25 +595,54 @@ typical-p/repeat/presence/frequency)
             pair) rotation angles from both implementations' K caches)
             are the reusable playbook; llama.cpp is the reference, never
             a reimplementation.
-          * REMAINING follow-ups: (1) bench-quality's llama.cpp arbiter
-              runs llama-cli WITHOUT the chat template (its -p is raw),
-              so its cross-implementation numbers compare against a
-              nonsense reference -- pass --single-turn or the templated
-              prompt; (2) re-characterize free-running text quality
+          * REMAINING follow-ups: (1) [x] bench-quality's llama.cpp arbiter
+              now renders the prompt through the model's chat template
+              (both sides see identical templated text; post-fix: free-
+              running text coherent, prefill argmax MATCH, llama.cpp
+              teacher-forced agreement 73.4%, GPU/CPU 82.8% PASS);
+              (2) re-characterize free-running text quality
               post-fix (greedy on this quantized instruct model still
               repetition-loops with both tempura and llama.cpp's GPU --
-              edge of chaos -- but tempura with a manual template now
+              edge of chaos -- but tempura with the template now
               produces grammatical, on-theme text where the pre-fix
-              output was degenerate); (3) re-baseline bench-batch
-              fingerprints; (4) validate the qwen/gemma/phi NeoX
-              mappings and the config.rs HF-path conventions against
-              llama.cpp the same way; (5) the graph-prefill path
-              (TEMPURA_GRAPH_PREFILL=1) is still broken and off.
-      (b) **MMLU-style log-prob evaluation**: load MMLU questions,
-          compute log P(A), log P(B), log P(C), log P(D) under both
-          implementations, pick highest. Robust because well-separated
-          options don't flip from small perturbations. Only near-tie
-          questions (~5-10% of MMLU) are affected.
+              output was degenerate); (3) [x] bench-batch re-baselined
+              (M=1 223, M=2 243, M=4 401 tok/s, NaN-free, det=OK,
+              sensible fingerprints); (4) validate the qwen/gemma/phi
+              NeoX mappings and the config.rs HF-path conventions
+              against llama.cpp the same way; (5) the graph-prefill path
+              (TEMPURA_GRAPH_PREFILL=1) is still broken and off;
+              (6) allocation/download during CUDA-graph capture panics
+              the TEMPURA_NO_MXFP4 / TEMPURA_NO_GPU_PREFILL prefill
+              paths (found via MMLU, cutile_gpu_forward.rs:~4837).
+      (b) [x] **MMLU-style log-prob evaluation**: bench-mmlu
+          (tools/bench-gpu/src/bench_mmlu.rs). Per question: prefill the
+          standard harness prompt, read the log-probs of the four
+          answer-letter tokens (" A".." D") from the last-position logits,
+          argmax. Compares CHOICE agreement (robust to argmax noise).
+          Dataset: stratified 250-question sample of cais/mmlu test at
+          ~/.cache/tempura/eval/mmlu/mmlu_sample.jsonl. llama_logitprobe
+          gained a batch mode (one prompt per line, KV cleared between
+          prompts) so the reference runs without reloading the model.
+          Knobs: TEMPURA_MMLU_MIN_AGREE (0.85), TEMPURA_MMLU_NO_CPU,
+          TEMPURA_NO_LLAMA, LLAMA_LOGITPROBE.
+          RESULT (Llama-3.1-8B Q4_K_M, 250 questions, 0-shot):
+            tempura CPU  61.6%   llama.cpp 62.4%   agreement 94.8%
+            tempura GPU  51.2%   agreement vs CPU 58.4%
+          CPU is at reference quality. The GPU's larger drop vs its ppl
+          gap (9%) is the MXFP4 prefill band concentrated: MMLU prompts
+          are single prefills whose ENTIRE KV is MXFP4-written (ppl
+          diluted the error across 256 exact-decode positions per
+          chunk), and 4-way near-tie choices amplify a rel-0.1 logit
+          band into ~40% choice flips. Quantified perf/precision
+          tradeoff -- candidate follow-up: MXFP4 prefill opt-out for
+          quality-sensitive workloads, or higher-precision tiling.
+          NOTE: the GPU-side bisect switches are currently broken for
+          this workload: TEMPURA_NO_MXFP4=1 and TEMPURA_NO_GPU_PREFILL=1
+          both PANIC ("operation not permitted when stream is capturing",
+          cutile_gpu_forward.rs:~4837, Q4_K packed download during CUDA
+          graph capture) -- allocation/download during capture, pre-
+          existing, latent until the MMLU prefills exercised these
+          paths. Open work.
       (c) **Self-consistency generation** (GSM8K-style): generate 5
           samples at temperature=0.7, majority vote. Breaks repetition
           loops and averages out near-tie flips. This is what production

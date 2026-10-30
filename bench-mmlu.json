@@ -1,0 +1,10 @@
+{
+  "model": "/home/fdupont/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+  "sample": "/home/fdupont/.cache/tempura/eval/mmlu/mmlu_sample.jsonl",
+  "questions": 250,
+  "cpu_accuracy": 0.6160,
+  "gpu_accuracy": 0.5120,
+  "llama_accuracy": 0.6240,
+  "gpu_cpu_agreement": 0.5840,
+  "passed": false
+}
