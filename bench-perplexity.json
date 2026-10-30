@@ -1,0 +1,12 @@
+{
+  "model": "/home/fdupont/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+  "corpus": "/home/fdupont/.cache/tempura/eval/wikitext-2-raw/wiki.test.raw",
+  "n_ctx": 512,
+  "max_chunks": 32,
+  "cpu": {"ppl": 7.307116, "nll": 16229.005078, "count": 8160},
+  "gpu": {"ppl": 7.967634, "nll": 16935.162479, "count": 8160},
+  "llama_cpp_ppl": 7.093700,
+  "gpu_cpu_ratio": 1.090394,
+  "gpu_nan_steps": 0,
+  "passed": true
+}
