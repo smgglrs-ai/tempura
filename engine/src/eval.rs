@@ -72,6 +72,9 @@ pub struct PplOptions {
     /// BOS token id substituted at position 0 of EVERY chunk (llama.cpp
     /// replaces the chunk-start token with BOS when the vocab has add_bos).
     pub bos: Option<u32>,
+    /// Print per-chunk progress to stderr (long CPU runs are silent
+    /// otherwise).
+    pub progress: bool,
 }
 
 impl Default for PplOptions {
@@ -80,11 +83,13 @@ impl Default for PplOptions {
             n_ctx: 512,
             max_chunks: None,
             bos: None,
+            progress: false,
         }
     }
 }
 
-/// Corpus perplexity, llama.cpp-compatible.
+/// Corpus perplexity, llama.cpp-compatible, with optional per-chunk progress
+/// (long CPU runs print nothing otherwise).
 ///
 /// `tokens` is the full tokenized corpus INCLUDING the leading BOS (that is
 /// what `common_tokenize(text, true)` produces and what
@@ -113,6 +118,15 @@ pub fn perplexity(
     let mut nan_steps = 0usize;
 
     for i in 0..n_chunk {
+        if opts.progress {
+            eprintln!(
+                "  [ppl] chunk {}/{} (nll/count so far: {:.4}/{})",
+                i + 1,
+                n_chunk,
+                nll,
+                count
+            );
+        }
         let start = i * n_ctx;
         let mut chunk = tokens[start..start + n_ctx].to_vec();
         if let Some(b) = opts.bos {
