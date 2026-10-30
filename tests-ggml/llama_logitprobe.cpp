@@ -9,6 +9,7 @@
 //
 // Build (on the GPU host, against the local llama.cpp checkout):
 //   g++ -O2 -std=c++17 -I ~/Code/github.com/llama.cpp/include \
+//     -I ~/Code/github.com/llama.cpp/ggml/include \
 //     llama_logitprobe.cpp -L ~/Code/github.com/llama.cpp/build/bin -lllama \
 //     -o /tmp/llama-logitprobe
 // Run:
@@ -26,6 +27,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 int main(int argc, char ** argv) {
@@ -45,8 +47,8 @@ int main(int argc, char ** argv) {
     }
 
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx   = 4096;
-    cp.n_batch = 4096;
+    cp.n_ctx    = 4096;
+    cp.n_batch  = 4096;
     cp.n_ubatch = 4096;
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) {
@@ -71,17 +73,26 @@ int main(int argc, char ** argv) {
     }
 
     const int n = (int) tokens.size();
-    llama_batch batch = llama_batch_init(n, 0, 1);
+    llama_batch_ext * batch = llama_batch_ext_init(ctx);
+    llama_batch_ext_clear(batch);
     for (int i = 0; i < n; i++) {
-        llama_batch_add(batch, tokens[i], i, {0}, true);
+        const int32_t idx = llama_batch_ext_add_token(batch, /*seq_id*/ 0, tokens[i]);
+        if (idx < 0) {
+            fprintf(stderr, "batch add failed at %d\n", i);
+            return 1;
+        }
+        llama_pos pos = i;
+        llama_batch_ext_set_pos(batch, idx, &pos);
+        llama_batch_ext_set_output_logits(batch, idx, true);
     }
 
-    if (llama_decode(ctx, batch) != 0) {
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch) != 0) {
         fprintf(stderr, "decode failed\n");
         return 1;
     }
 
-    const int nv = llama_n_vocab(model);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int nv = llama_vocab_n_tokens(vocab);
     FILE * out = fopen(argv[3], "wb");
     if (!out) {
         fprintf(stderr, "failed to open output file\n");
@@ -101,7 +112,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "wrote %s: %d token(s), vocab %d%s\n", argv[3], n, nv,
             dump_all ? " (all positions)" : " (last position)");
 
-    llama_batch_free(batch);
+    llama_batch_ext_free(batch);
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();
