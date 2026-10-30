@@ -535,6 +535,58 @@ typical-p/repeat/presence/frequency)
           ppl ratio (TEMPURA_PPL_MAX_RATIO, default 1.10). Knobs:
           TEMPURA_PPL_CTX (512), TEMPURA_PPL_CHUNKS (32; -1 = full
           corpus), TEMPURA_NO_LLAMA, LLAMA_PPL.
+          RESULT (2026-10-30): FOUND AND FIXED a real, longstanding
+          quality bug that every internal check had masked. tempura
+          scored ppl ~640 vs llama.cpp's 7.1 on the same GGUF+corpus,
+          with GPU and CPU agreeing with each other (89% teacher-forced)
+          -- both wrong the same way. Bisected against llama.cpp with
+          tests-ggml/llama_logitprobe.cpp (links llama.cpp's own model
+          code; dumps reference logits + KV-cache state for an exact
+          token-id sequence) + bench-perplexity TEMPURA_PPL_PROBE
+          (same ids through tempura, dumps logits/K-cache):
+          * ROOT CAUSE: RoPE pairing. The GGUF converter permutes Q/K
+            weight rows into adjacent-pair order for NORM-rope arches
+            (llama.cpp's rope-type table: llama, llama4, deepseek,
+            granite, smollm3, mistral3/4, command-r, ... = NORM/adjacent
+            pairs (2d, 2d+1); qwen*, phi*, gemma*, falcon, gptneox,
+            bitnet = NEOX/split pairs (d, d+half)). tempura applied
+            split-half (NeoX) rope to everything -> reading permuted
+            llama weights with the wrong pairing silently destroys
+            positional information: logits match llama.cpp at 1-2
+            tokens and degrade progressively with distance (the K-cache
+            byte diff showed layer-0 K identical at token 0, same norm
+            but different rotation from token 1 on). Fix: per-arch
+            rope_type in gguf_loader.rs matching llama.cpp's table
+            (CPU applies Norm rope on the raw layout).
+          * GPU: same root cause (its rope kernels hardcode split-half
+            pairing on contiguous per-head halves). Fix: permute Q/K
+            rows at GPU upload (weights.rs
+            permute_qk_rows_split_half -- GGML quant blocks are
+            row-aligned, so it is a pure block permutation) so the
+            existing kernels apply adjacent-pair rotation. GPU-only;
+            CPU weights untouched.
+          * ALSO FOUND: can_use_graph_prefill claimed to be "disabled
+            pending fix" (produces wrong hidden states) but never
+            checked TEMPURA_GRAPH_PREFILL -- every multi-token CPU
+            prefill silently took the broken path (corruption at every
+            seq_len % 4 == 0, the Q8Kx4 tile granularity). Env gate
+            restored.
+          * Post-fix probe corr vs llama.cpp: CPU 0.998-0.999 at every
+            length (1..257); GPU 0.999 with TEMPURA_NO_MXFP4=1 (the
+            remaining default-config gap is the documented MXFP4
+            double-quantization band, rel ~0.10-0.13). All earlier
+            quality numbers are RETRACTED: the 89.1% GPU-vs-CPU
+            teacher-forced agreement, the ~20% llama.cpp agreement, the
+            free-running repetition-loop analysis (the loops were this
+            bug), and every logits fingerprint/baseline measured with
+            the wrong rope (re-baseline bench-real-model /
+            bench-quality / bench-batch).
+          * The 1-2-token logit probes, the K-cache byte diff, and the
+            repeated-token rope-angle extraction (recovered the unroped
+            vector from a 1-token probe, read off exact per-(position,
+            pair) rotation angles from both implementations' K caches)
+            are the reusable playbook; llama.cpp is the reference, never
+            a reimplementation.
       (b) **MMLU-style log-prob evaluation**: load MMLU questions,
           compute log P(A), log P(B), log P(C), log P(D) under both
           implementations, pick highest. Robust because well-separated
