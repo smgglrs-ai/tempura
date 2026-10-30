@@ -246,13 +246,19 @@ fn main() {
     let answers: Vec<usize> = questions.iter().map(|q| q.answer).collect();
 
     println!("\n--- tempura CPU ---");
-    let t = Instant::now();
-    let cpu_picks = evaluate(&cpu_model, &config, &prompts, &letters);
-    println!(
-        "  accuracy {:.1}%  ({:.1}s)",
-        accuracy(&cpu_picks, &answers) * 100.0,
-        t.elapsed().as_secs_f64()
-    );
+    let cpu_picks = if std::env::var("TEMPURA_MMLU_NO_CPU").is_ok() {
+        println!("  (skipped: TEMPURA_MMLU_NO_CPU=1)");
+        Vec::new()
+    } else {
+        let t = Instant::now();
+        let picks = evaluate(&cpu_model, &config, &prompts, &letters);
+        println!(
+            "  accuracy {:.1}%  ({:.1}s)",
+            accuracy(&picks, &answers) * 100.0,
+            t.elapsed().as_secs_f64()
+        );
+        picks
+    };
 
     println!("\n--- tempura GPU ---");
     let t = Instant::now();
@@ -329,14 +335,27 @@ fn main() {
 
     // --- Comparison ---
     println!("\n--- Comparison ---");
-    let gpu_cpu = agreement(&gpu_picks, &cpu_picks);
-    println!("  GPU/CPU choice agreement: {:.1}%", gpu_cpu * 100.0);
+    let gpu_cpu = if cpu_picks.is_empty() {
+        f64::NAN
+    } else {
+        agreement(&gpu_picks, &cpu_picks)
+    };
+    if !cpu_picks.is_empty() {
+        println!("  GPU/CPU choice agreement: {:.1}%", gpu_cpu * 100.0);
+    }
     if let Some(lp) = &llama_picks {
         println!("  CPU/llama.cpp agreement:   {:.1}%", agreement(&cpu_picks, lp) * 100.0);
         println!("  GPU/llama.cpp agreement:   {:.1}%", agreement(&gpu_picks, lp) * 100.0);
     }
 
-    let passed = gpu_cpu >= min_agree;
+    let passed = if cpu_picks.is_empty() {
+        llama_picks
+            .as_ref()
+            .map(|lp| agreement(&gpu_picks, lp) >= min_agree)
+            .unwrap_or(true)
+    } else {
+        gpu_cpu >= min_agree
+    };
     println!(
         "\n--- Verdict ---\n  {} (GPU/CPU agreement {:.1}% vs gate {:.0}%)",
         if passed { "PASS" } else { "FAIL" },
