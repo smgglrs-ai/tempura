@@ -1,5 +1,6 @@
 use super::blocks::*;
-use super::helpers::{bf16_to_f32, f16_to_f32, get_scale_min_k4};
+use super::helpers::{bf16_to_f32, e8m0_to_f32_half, f16_to_f32, get_scale_min_k4, ue4m3_to_f32};
+use super::iq_tables::KVALUES_MXFP4;
 
 // -- Basic quants (QK = 32) -------------------------------------------------
 
@@ -339,89 +340,45 @@ pub fn dequantize_row_tq1_0(blocks: &[BlockTQ1_0], output: &mut [f32]) {
 // -- Micro-FP quants --------------------------------------------------------
 
 pub fn dequantize_row_mxfp4(blocks: &[BlockMxfp4], output: &mut [f32]) {
+    // C-faithful port of llama.cpp dequantize_row_mxfp4: split nibble layout
+    // (byte j: lo nibble = element j, hi nibble = element j + QK/2) and the
+    // half-scale E8M0 decode (kvalues are 2x E2M1, so kvalue * half = value).
     const QK: usize = 32;
     assert_eq!(output.len(), blocks.len() * QK);
     for (i, blk) in blocks.iter().enumerate() {
-        let shared_exp = blk.e as i32;
-        let scale = if shared_exp == 0 {
-            0.0
-        } else {
-            f32::from_bits(
-                ((shared_exp as u32) << 23)
-                    .wrapping_sub(127 << 23)
-                    .wrapping_add(127 << 23),
-            )
-        };
+        let d = e8m0_to_f32_half(blk.e);
         let y = &mut output[i * QK..][..QK];
         for j in 0..QK / 2 {
-            let nibble_lo = blk.qs[j] & 0x0F;
-            let nibble_hi = blk.qs[j] >> 4;
-            y[j * 2] = scale * mxfp4_to_f32(nibble_lo);
-            y[j * 2 + 1] = scale * mxfp4_to_f32(nibble_hi);
+            let x0 = KVALUES_MXFP4[(blk.qs[j] & 0x0F) as usize] as f32;
+            let x1 = KVALUES_MXFP4[(blk.qs[j] >> 4) as usize] as f32;
+            y[j] = x0 * d;
+            y[j + QK / 2] = x1 * d;
         }
     }
 }
 
-fn mxfp4_to_f32(nibble: u8) -> f32 {
-    let sign = (nibble >> 3) & 1;
-    let exp = (nibble >> 1) & 3;
-    let mant = nibble & 1;
-    let val = match (exp, mant) {
-        (0, 0) => 0.0,
-        (0, 1) => 0.5,
-        (1, 0) => 1.0,
-        (1, 1) => 1.5,
-        (2, 0) => 2.0,
-        (2, 1) => 3.0,
-        (3, 0) => 4.0,
-        (3, 1) => 6.0,
-        _ => unreachable!(),
-    };
-    if sign == 1 {
-        -val
-    } else {
-        val
-    }
-}
-
 pub fn dequantize_row_nvfp4(blocks: &[BlockNvfp4], output: &mut [f32]) {
+    // C-faithful port of llama.cpp dequantize_row_nvfp4: per-16-element
+    // sub-blocks with UE4M3 scales (half-convention decode, kvalues are 2x
+    // E2M1) and split nibble layout within each sub-block (byte j of the
+    // sub-block: lo nibble = element j, hi nibble = element j + 8).
     const QK: usize = 64;
     const SUB: usize = 16;
     assert_eq!(output.len(), blocks.len() * QK);
     for (i, blk) in blocks.iter().enumerate() {
         let y = &mut output[i * QK..][..QK];
         for sub in 0..QK / SUB {
-            let scale_byte = blk.d[sub];
-            let scale = ue4m3_to_f32(scale_byte);
+            let d = ue4m3_to_f32(blk.d[sub]);
+            let yb = &mut y[sub * SUB..][..SUB];
             for j in 0..SUB / 2 {
-                let byte_idx = sub * (SUB / 2) + j;
-                let nibble_lo = blk.qs[byte_idx] & 0x0F;
-                let nibble_hi = blk.qs[byte_idx] >> 4;
-                y[sub * SUB + j * 2] = scale * e2m1_to_f32(nibble_lo);
-                y[sub * SUB + j * 2 + 1] = scale * e2m1_to_f32(nibble_hi);
+                let byte = blk.qs[sub * (SUB / 2) + j];
+                let v0 = KVALUES_MXFP4[(byte & 0x0F) as usize] as f32;
+                let v1 = KVALUES_MXFP4[(byte >> 4) as usize] as f32;
+                yb[j] = v0 * d;
+                yb[j + SUB / 2] = v1 * d;
             }
         }
     }
-}
-
-pub(crate) fn ue4m3_to_f32_pub(byte: u8) -> f32 {
-    ue4m3_to_f32(byte)
-}
-
-fn ue4m3_to_f32(byte: u8) -> f32 {
-    let exp = (byte >> 3) as i32;
-    let mant = (byte & 7) as f32 / 8.0 + 1.0;
-    if exp == 0 {
-        (byte & 7) as f32 / 8.0 * f32::from_bits((1u32) << 23) // denorm
-    } else {
-        mant * 2.0f32.powi(exp - 7)
-    }
-}
-
-fn e2m1_to_f32(nibble: u8) -> f32 {
-    let sign = (nibble >> 3) & 1;
-
-    mxfp4_to_f32(nibble & 0x07 | (sign << 3)) // sign already handled in mxfp4_to_f32
 }
 
 // -- IQ quants --------------------------------------------------------------

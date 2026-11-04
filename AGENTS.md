@@ -1011,7 +1011,46 @@ typical-p/repeat/presence/frequency)
       (engine-side LoraRegistry only — now in_progress), and
       p22-radix-attention was a corrupted entry claiming done+pending
       (hash-based prefix cache only — now pending/0).
-- [ ] NVFP4: enum + block size only, no dequant/kernels
+- [x] **NVFP4 complete on CPU (2026-11-04)** — was "enum + block size
+      only" per the stale note; the reality was worse: partially translated
+      paths with THREE divergent UE4M3 decoders and four real bugs, all
+      fixed against llama.cpp master (ggml-quants.c/ggml-impl.h fetched and
+      diffed): (1) `dequantize.rs` had a private arithmetic UE4M3 decode
+      with a subnormal bug (m/8 * 2^-126 instead of man * 2^-9 — the exact
+      bug class llama.cpp fixed in commit 4f232be: transformer amax/6 lands
+      in the subnormal range) and WITHOUT the kvalues half-convention
+      (x0.5), making `vec_dot_nvfp4_q8_0` and the AVX path return 2x the
+      true dot; (2) `dequantize_row_nvfp4` used an adjacent-pairs nibble
+      layout while both vec_dot variants (and llama.cpp) use SPLIT layout
+      (byte j of a 16-elem sub-block: lo = element j, hi = element j+8);
+      (3) `dequantize_row_mxfp4` had the same two bugs (adjacent-pairs +
+      full-scale E8M0 decode instead of half); (4) `quants_llama_scalar`
+      carried a third raw-convention UE4M3 copy. Now: single source of
+      truth `helpers::ue4m3_to_f32` (build.rs-generated 256-entry table,
+      exact ggml_ue4m3_to_fp32 port incl. subnormals, 0/0x7F -> 0,
+      0xFF quirk), new `helpers::f32_to_ue4m3` encoder port (subnormal
+      man*2^-9 path, 448 saturation, NaN/negative -> 0), new
+      `quantize_row_nvfp4` (C-faithful: per-16 amax/6 -> UE4M3, quantize
+      against the DECODED scale, best_index_mxfp4 over KVALUES_MXFP4,
+      split packing). NOTE the format floor: without NVFP4's second-level
+      per-tensor f32 global scale, sub-blocks with amax < 6*2^-9 ~= 0.0117
+      encode to zero (llama.cpp single-level quantize_row_nvfp4_ref has
+      the same floor; real checkpoints carry the tensor-level scale in a
+      separate tensor). Verification: exhaustive 128-byte UE4M3
+      decode->encode round-trip (all canonical bytes; encoder saturates at
+      0x78..=0x7F by construction), quantize->dequant rel-L2 gates
+      (0.30 normal / 0.60 subnormal-scale data), vec_dot vs f64
+      dequantized-both-sides reference (catches the 2x class), generic vs
+      scalar agreement, Kani harnesses (ue4m3_encode_no_panic,
+      nvfp4_quantize_no_panic — CI), Verus module
+      verus-verified/src/nvfp4.rs (UE4M3 field extraction + compose
+      round-trip + encode range + split-layout index arithmetic + nibble
+      packing round-trip + kvalues index safety; in run-verus.sh MODULES —
+      no local Verus binary on the laptop, first run pending). GGUF type
+      id 40 verified against upstream ggml.h. Follow-up: C
+      cross-validation vectors via tests-ggml/gen_test_vectors.c next time
+      a llama.cpp build is available; GPU NVFP4 kernels (Blackwell
+      cvt.rn.satfinite.e2m1x2) remain open.
 - [ ] Multimodal input (Bonsai 2 is text+image; no vision encoder path)
 - [ ] TQ1_0 GPU kernel (CPU-only today)
 

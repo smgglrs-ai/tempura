@@ -238,6 +238,7 @@ MODULES=(
     q2_lut_tiles
     parallel_accumulator
     ggml_quants
+    nvfp4
     deltanet
     hybrid_dispatch
     quantized_gemv

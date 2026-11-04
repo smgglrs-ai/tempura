@@ -576,6 +576,7 @@ pub fn vec_dot_mxfp4_q8_0(n: usize, x: &[BlockMxfp4], y: &[BlockQ8_0]) -> f32 {
 }
 
 pub fn vec_dot_nvfp4_q8_0(n: usize, x: &[BlockNvfp4], y: &[BlockQ8_0]) -> f32 {
+    use super::helpers::ue4m3_to_f32;
     use super::iq_tables::KVALUES_MXFP4;
     const QK: usize = 64;
     const SUB: usize = 16;
@@ -585,7 +586,7 @@ pub fn vec_dot_nvfp4_q8_0(n: usize, x: &[BlockNvfp4], y: &[BlockQ8_0]) -> f32 {
     for ib in 0..nb {
         for s_idx in 0..4usize {
             let ue4m3_byte = x[ib].d[s_idx];
-            let d_sub = super::dequantize::ue4m3_to_f32_pub(ue4m3_byte);
+            let d_sub = ue4m3_to_f32(ue4m3_byte);
             let q8_block = s_idx / 2;
             let q8_off = (s_idx % 2) * SUB;
             let dy = f16_to_f32(y[2 * ib + q8_block].d);

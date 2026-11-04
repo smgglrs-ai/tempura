@@ -9,7 +9,7 @@ use std::arch::x86_64::*;
 use super::blocks::*;
 use super::helpers::f16_to_f32;
 use super::iq_tables::*;
-use super::dequantize::ue4m3_to_f32_pub;
+use super::helpers::ue4m3_to_f32;
 
 const QK_K: usize = 256;
 const QK4_NL: usize = 32;
@@ -397,10 +397,10 @@ pub unsafe fn ggml_vec_dot_nvfp4_q8_0_avx(
         let p3 = _mm_cvtepi32_ps(mul_sum_i8_pairs_128(q4_3, q8_3));
         let dy0 = f16_to_f32(y[2*ib].d);
         let dy1 = f16_to_f32(y[2*ib+1].d);
-        let s0 = ue4m3_to_f32_pub(x[ib].d[0]) * dy0;
-        let s1 = ue4m3_to_f32_pub(x[ib].d[1]) * dy0;
-        let s2 = ue4m3_to_f32_pub(x[ib].d[2]) * dy1;
-        let s3 = ue4m3_to_f32_pub(x[ib].d[3]) * dy1;
+        let s0 = ue4m3_to_f32(x[ib].d[0]) * dy0;
+        let s1 = ue4m3_to_f32(x[ib].d[1]) * dy0;
+        let s2 = ue4m3_to_f32(x[ib].d[2]) * dy1;
+        let s3 = ue4m3_to_f32(x[ib].d[3]) * dy1;
         let p01 = _mm256_set_m128(p1, p0);
         let p23 = _mm256_set_m128(p3, p2);
         let sc01 = _mm256_set_m128(_mm_set1_ps(s1), _mm_set1_ps(s0));

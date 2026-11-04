@@ -77,6 +77,55 @@ pub fn quantize_row_q8_k(src: &[f32], dst: &mut [BlockQ8K]) {
     }
 }
 
+// -- NVFP4 (E2M1 + UE4M3 per-16 sub-block scales, split nibble layout) ------
+
+/// Index of the KVALUES_MXFP4 entry whose product with the (half-convention)
+/// scale d best approximates x -- port of llama.cpp best_index_mxfp4.
+fn best_index_mxfp4(x: f32, d: f32, kvalues: &[i8; 16]) -> u8 {
+    let mut best_index = 0usize;
+    let mut best_err = (kvalues[0] as f32 * d - x).abs();
+    for i in 1..16 {
+        let err = (kvalues[i] as f32 * d - x).abs();
+        if err < best_err {
+            best_index = i;
+            best_err = err;
+        }
+    }
+    best_index as u8
+}
+
+/// Port of llama.cpp quantize_row_nvfp4_ref: per 16-element sub-block, the
+/// UE4M3-encoded scale is amax / 6.0, and byte j of the sub-block packs
+/// element j (lo nibble) with element j + 8 (hi nibble).
+pub fn quantize_row_nvfp4(src: &[f32], dst: &mut [BlockNvfp4]) {
+    use super::helpers::{f32_to_ue4m3, ue4m3_to_f32};
+    use super::iq_tables::KVALUES_MXFP4;
+    const QK: usize = 64;
+    const SUB: usize = 16;
+    assert_eq!(src.len(), dst.len() * QK);
+    for (i, blk) in dst.iter_mut().enumerate() {
+        let xb = &src[i * QK..][..QK];
+        for s in 0..QK / SUB {
+            let sub = &xb[s * SUB..][..SUB];
+            let mut amax = 0.0f32;
+            for &v in sub {
+                amax = amax.max(v.abs());
+            }
+            // UE4M3 scale: amax / 6.0 maps the max E2M1 value (6.0) to amax.
+            // ue4m3_to_f32 returns raw * 0.5, which cancels the 2x E2M1
+            // kvalues table inside best_index_mxfp4.
+            let ue = f32_to_ue4m3(amax / 6.0);
+            blk.d[s] = ue;
+            let d = ue4m3_to_f32(ue);
+            for j in 0..SUB / 2 {
+                let x0 = best_index_mxfp4(sub[j], d, &KVALUES_MXFP4);
+                let x1 = best_index_mxfp4(sub[j + SUB / 2], d, &KVALUES_MXFP4);
+                blk.qs[s * (SUB / 2) + j] = x0 | (x1 << 4);
+            }
+        }
+    }
+}
+
 // -- Raw-byte interface -----------------------------------------------------
 
 pub fn quantize_activations(src: &[f32], dst: &mut [u8], ggml_type: super::GgmlType) {
@@ -269,6 +318,132 @@ mod tests {
         assert_eq!(quantized_row_size(32, super::super::GgmlType::Q8_0), 34);
         assert_eq!(quantized_row_size(256, super::super::GgmlType::Q4K), 144);
     }
+
+    #[test]
+    fn nvfp4_quantize_dequant_roundtrip_bounded() {
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let src: Vec<f32> = (0..512)
+            .map(|_| rng.random_range(-1.0f32..=1.0f32))
+            .collect();
+        let nb = src.len() / 64;
+        let mut blocks = vec![
+            BlockNvfp4 {
+                d: [0; 4],
+                qs: [0; 32],
+            };
+            nb
+        ];
+        quantize_row_nvfp4(&src, &mut blocks);
+        let mut reconstructed = vec![0.0f32; src.len()];
+        super::super::dequantize::dequantize_row_nvfp4(&blocks, &mut reconstructed);
+        let mut sum_sq_err = 0.0f64;
+        let mut sum_sq_ref = 0.0f64;
+        for i in 0..src.len() {
+            let err = (reconstructed[i] - src[i]) as f64;
+            sum_sq_err += err * err;
+            sum_sq_ref += (src[i] as f64) * (src[i] as f64);
+        }
+        let rel_l2 = (sum_sq_err / sum_sq_ref).sqrt();
+        // E2M1 (4-bit) + UE4M3 scale rounding: ~0.2 observed, 0.30 gate.
+        assert!(rel_l2 < 0.30, "NVFP4 roundtrip L2 error: {rel_l2}");
+    }
+
+    #[test]
+    fn nvfp4_quantize_small_scales_subnormal_range() {
+        // llama.cpp hit this as a PPL=5.8M bug: typical transformer weight
+        // amax/6 (~1e-2) lands in the UE4M3 subnormal range (2^-9..2^-6).
+        // The encoded scale must round-trip through the subnormal path, not
+        // underflow to zero. NOTE: sub-blocks with amax < 6*2^-9 ~= 0.0117
+        // are below NVFP4's floor WITHOUT the per-tensor FP32 global scale
+        // (the second-level scale real NVFP4 checkpoints carry) and encode
+        // to zero by design.
+        use super::super::helpers::{f32_to_ue4m3, ue4m3_to_f32};
+        let src: Vec<f32> = (0..64)
+            .map(|i| (i as f32 - 32.0) * 3.0e-3)
+            .collect();
+        let mut blocks = vec![BlockNvfp4 { d: [0; 4], qs: [0; 32] }];
+        quantize_row_nvfp4(&src, &mut blocks);
+        for s in 0..4 {
+            assert_ne!(blocks[0].d[s], 0, "sub-block {s} scale underflowed to 0");
+        }
+        let mut reconstructed = vec![0.0f32; 64];
+        super::super::dequantize::dequantize_row_nvfp4(&blocks, &mut reconstructed);
+        let mut sum_sq_err = 0.0f64;
+        let mut sum_sq_ref = 0.0f64;
+        for i in 0..64 {
+            let err = (reconstructed[i] - src[i]) as f64;
+            sum_sq_err += err * err;
+            sum_sq_ref += (src[i] as f64) * (src[i] as f64);
+        }
+        let rel_l2 = (sum_sq_err / sum_sq_ref).sqrt();
+        assert!(rel_l2 < 0.60, "NVFP4 subnormal-scale L2 error: {rel_l2}");
+        // Direct encode/decode of a subnormal-scale value.
+        let ue = f32_to_ue4m3(2.0e-3);
+        assert!(ue > 0 && ue < 8, "2e-3 should encode as a subnormal, got {ue}");
+        assert!((ue4m3_to_f32(ue) * 2.0 - 2.0e-3).abs() / 2.0e-3 < 0.2);
+    }
+
+    #[test]
+    fn nvfp4_quantize_all_zeros() {
+        let src = [0.0f32; 64];
+        let mut blocks = vec![BlockNvfp4 { d: [0; 4], qs: [0; 32] }];
+        quantize_row_nvfp4(&src, &mut blocks);
+        assert!(blocks[0].d.iter().all(|&d| d == 0));
+        assert!(blocks[0].qs.iter().all(|&q| q == 0));
+    }
+
+    #[test]
+    fn nvfp4_vec_dot_matches_dequantized_reference() {
+        use rand::Rng;
+        use rand::SeedableRng;
+        use super::super::helpers::f16_to_f32;
+        use super::super::vec_dot::vec_dot_nvfp4_q8_0;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let n = 256usize;
+        let src: Vec<f32> = (0..n).map(|_| rng.random_range(-1.0f32..=1.0f32)).collect();
+        let mut blocks = vec![BlockNvfp4 { d: [0; 4], qs: [0; 32] }; n / 64];
+        quantize_row_nvfp4(&src, &mut blocks);
+        let mut deq = vec![0.0f32; n];
+        super::super::dequantize::dequantize_row_nvfp4(&blocks, &mut deq);
+        let mut q8 = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; n / 32];
+        quantize_row_q8_0(&src, &mut q8);
+        // Reference: f64 dot of both DEQUANTIZED operands -- exactly what
+        // vec_dot computes modulo float accumulation order. The old 2x
+        // half-convention bug fails this by a factor of 2.
+        let mut deq_act = vec![0.0f32; n];
+        for (i, blk) in q8.iter().enumerate() {
+            let d = f16_to_f32(blk.d);
+            for j in 0..32 {
+                deq_act[i * 32 + j] = d * blk.qs[j] as f32;
+            }
+        }
+        let dot_q = vec_dot_nvfp4_q8_0(n, &blocks, &q8) as f64;
+        let dot_ref: f64 = (0..n).map(|i| deq[i] as f64 * deq_act[i] as f64).sum();
+        assert!(
+            (dot_q - dot_ref).abs() < 1e-2 * dot_ref.abs().max(1.0),
+            "vec_dot {dot_q} vs dequantized reference {dot_ref}"
+        );
+    }
+
+    #[test]
+    fn nvfp4_generic_and_scalar_vec_dot_agree() {
+        use super::super::quants_llama_generic::ggml_vec_dot_nvfp4_q8_0_generic;
+        use super::super::vec_dot::vec_dot_nvfp4_q8_0;
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let n = 128usize;
+        let src: Vec<f32> = (0..n).map(|_| rng.random_range(-1.0f32..=1.0f32)).collect();
+        let mut blocks = vec![BlockNvfp4 { d: [0; 4], qs: [0; 32] }; n / 64];
+        quantize_row_nvfp4(&src, &mut blocks);
+        let mut q8 = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; n / 32];
+        quantize_row_q8_0(&src, &mut q8);
+        let a = vec_dot_nvfp4_q8_0(n, &blocks, &q8);
+        let b = ggml_vec_dot_nvfp4_q8_0_generic(n, &blocks, &q8);
+        assert!((a - b).abs() < 1e-3 * a.abs().max(1.0), "scalar {a} vs generic {b}");
+    }
 }
 
 #[cfg(kani)]
@@ -333,5 +508,30 @@ mod kani_proofs {
         // 16 * 127 = 2032, 16 * -128 = -2048, both fit in i16 [-32768, 32767]
         assert!(sum >= -2048 && sum <= 2032);
         assert!(sum >= i16::MIN as i32 && sum <= i16::MAX as i32);
+    }
+
+    #[kani::proof]
+    fn ue4m3_encode_no_panic() {
+        let x: f32 = kani::any();
+        let b = f32_to_ue4m3(x);
+        assert!(b <= 0x7E);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn nvfp4_quantize_no_panic() {
+        let src: [f32; 64] = kani::any();
+        for v in src.iter() {
+            kani::assume(v.is_finite());
+        }
+        let mut blocks = [BlockNvfp4 {
+            d: [0; 4],
+            qs: [0; 32],
+        }];
+        quantize_row_nvfp4(&src, &mut blocks);
+        // Encoded scales stay in the valid byte range (saturation at 0x7E).
+        for s in 0..4 {
+            assert!(blocks[0].d[s] <= 0x7E);
+        }
     }
 }

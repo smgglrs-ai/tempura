@@ -128,6 +128,48 @@ pub fn ue4m3_to_f32(x: u8) -> f32 {
     }
 }
 
+/// Quantize a positive f32 scale to a UE4M3 byte (ggml_fp32_to_ue4m3 port).
+/// Round-to-nearest on the 3-bit mantissa, subnormal encoding (man * 2^-9)
+/// for scales below 2^-6, saturation at 448.0 (0x7E). Non-positive / NaN -> 0.
+pub fn f32_to_ue4m3(x: f32) -> u8 {
+    let mut x = x;
+    if !(x > 0.0) {
+        return 0;
+    }
+    if x > 448.0 {
+        x = 448.0;
+    }
+    let bits = x.to_bits();
+    let fp32_exp = ((bits >> 23) & 0xFF) as i32 - 127;
+    let fp32_man = ((bits >> 20) & 0x7) as i32;
+    let ue4m3_exp = fp32_exp + 7;
+    if ue4m3_exp <= 0 {
+        // subnormal: value = man * 2^-9, man = round(x * 2^9)
+        let mut man = (x * 512.0 + 0.5) as i32;
+        if man > 7 {
+            man = 7;
+        }
+        if man < 1 {
+            return 0;
+        }
+        return man as u8;
+    }
+    if ue4m3_exp >= 15 {
+        return 0x7E;
+    }
+    let round_bit = ((bits >> 19) & 1) as i32;
+    let mut ue4m3_man = fp32_man + round_bit;
+    let mut ue4m3_exp = ue4m3_exp;
+    if ue4m3_man > 7 {
+        ue4m3_man = 0;
+        ue4m3_exp += 1;
+        if ue4m3_exp >= 15 {
+            return 0x7E;
+        }
+    }
+    ((ue4m3_exp << 3) | ue4m3_man) as u8
+}
+
 pub fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
@@ -206,6 +248,61 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ue4m3_decode_encode_roundtrips_exhaustively() {
+        // Every canonical byte (0..=0x7F; the decode extracts exp/man from
+        // the low 7 bits, and only 0x7F is the NaN slot) with exp < 15
+        // decodes to a value that re-encodes to the same byte -- including
+        // the subnormal range (exp==0) where amax/6 of typical transformer
+        // weights lands. The encoder saturates at ue4m3_exp >= 15
+        // (0x78..=0x7F are unreachable outputs), so those bytes cannot
+        // round-trip by construction.
+        for b in 0u16..=0x7F {
+            let byte = b as u8;
+            let v = ue4m3_to_f32(byte) * 2.0; // raw scale
+            let re = f32_to_ue4m3(v);
+            if byte == 0x7F {
+                // NaN slot: decodes to 0, re-encodes to 0.
+                assert_eq!(re, 0);
+            } else if byte >= 0x78 {
+                assert_eq!(re, 0x7E, "byte {byte:#04x} must saturate");
+            } else {
+                assert_eq!(re, byte, "byte {byte:#04x}: decoded {v}, re-encoded {re:#04x}");
+            }
+        }
+        // ggml quirk: 0xFF is NOT the NaN slot (only 0x7F is), so it decodes
+        // through the exp/man extraction as exp=15, man=7.
+        assert_eq!(ue4m3_to_f32(0xFF), 240.0);
+    }
+
+    #[test]
+    fn ue4m3_decode_spot_values() {
+        assert_eq!(ue4m3_to_f32(0), 0.0);
+        assert_eq!(ue4m3_to_f32(0x7F), 0.0);
+        // subnormal: man * 2^-9, halved for the kvalues convention
+        assert_eq!(ue4m3_to_f32(1), 1.0 / 1024.0);
+        assert_eq!(ue4m3_to_f32(7), 7.0 / 1024.0);
+        // normal: (1 + man/8) * 2^(exp-7), halved
+        assert_eq!(ue4m3_to_f32(8), 0.5 / 64.0); // exp=1,man=0: 2^-6 / 2
+        assert_eq!(ue4m3_to_f32(0x0F), 0.5 * (1.0 + 7.0 / 8.0) / 64.0);
+        // max normal 0x7E: 448 / 2
+        assert_eq!(ue4m3_to_f32(0x7E), 224.0);
+    }
+
+    #[test]
+    fn ue4m3_encode_edge_cases() {
+        assert_eq!(f32_to_ue4m3(0.0), 0);
+        assert_eq!(f32_to_ue4m3(-1.0), 0);
+        assert_eq!(f32_to_ue4m3(f32::NAN), 0);
+        assert_eq!(f32_to_ue4m3(f32::INFINITY), 0x7E);
+        assert_eq!(f32_to_ue4m3(1e30), 0x7E);
+        assert_eq!(f32_to_ue4m3(448.0), 0x7E);
+        // subnormal: 3 * 2^-9
+        assert_eq!(f32_to_ue4m3(3.0 / 512.0), 3);
+        // rounds to nearest: 5.5/8 mantissa step boundary
+        assert_eq!(f32_to_ue4m3(1.0625), (7 << 3) | 1); // 1.125 = (1+1/8)*2^0
+    }
 
     #[test]
     fn f16_roundtrip() {

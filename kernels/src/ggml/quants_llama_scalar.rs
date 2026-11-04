@@ -6,7 +6,7 @@
 //! SIMD body to handle remaining elements.
 
 use super::blocks::*;
-use super::helpers::f16_to_f32;
+use super::helpers::{f16_to_f32, ue4m3_to_f32};
 use super::quants_llama_generic::*;
 use super::quantize::{quantize_row_q8_0 as quantize_row_q8_0_ref, quantize_row_q8_1 as quantize_row_q8_1_ref};
 
@@ -223,23 +223,4 @@ fn e8m0_to_f32_half(x: u8) -> f32 {
         (x as u32 - 1) << 23
     };
     f32::from_bits(bits)
-}
-
-// UE4M3 (NV fp4 exponent/mantissa encoding) to f32.
-// Matches GGML_CPU_UE4M3_TO_FP32 in ggml-impl.h.
-#[inline(always)]
-fn ue4m3_to_f32(x: u8) -> f32 {
-    // Table-based decode: E[3:0] M[2:0] with bias 7.
-    // Values: 0=0.0, then 2^(e-7) * (1 + m/8) for e>0, m in 0..7.
-    let e = (x >> 3) & 0xf;
-    let m = x & 0x7;
-    if e == 0 {
-        if m == 0 {
-            return 0.0f32;
-        }
-        // subnormal: 2^(-6) * m/8
-        return (m as f32) * (1.0f32 / 64.0f32) * (1.0f32 / 8.0f32);
-    }
-    let scale = f32::from_bits(((e as u32 + 127 - 7) << 23) | ((m as u32) << 20));
-    scale
 }
