@@ -410,6 +410,21 @@ typical-p/repeat/presence/frequency)
 
 ## Open work (verified gaps — do not assume these are done)
 
+- [ ] **Native paged attention kernel (planned: .lean/plan.yml
+      p20-paged-attention-kernel).** What exists is paged KV STORAGE, not
+      paged ATTENTION: the CPU forward path materializes
+      PagedKvCache::k_contiguous()/v_contiguous() before running standard
+      contiguous attention (model.rs), and GPU prefill attention runs over
+      head-major padded buffers after cutile_gather_heads (3 gathers +
+      scatter per layer). The task: a flash-attention variant whose KV tile
+      loop reads logical→physical page addresses from a device-resident
+      block table (same device-side indirection pattern kv_scatter_write
+      uses for writes; kv_len/page table on device keeps it CUDA-graph
+      capturable), ragged last pages masked, CPU reference in
+      kernels/src/attention.rs for DualPipeline grading, VerifiedEquivalent
+      + registry row, Kani/Verus coverage for the tile→page→offset
+      arithmetic. Perf gates: prefill not worse than the gather path at
+      pp128, decode ITL unchanged, gather/scatter kernels gone from nsys.
 - [x] q6k_gemv_sm120_kpar8 (single-seq Q6K GEMV, renamed from
       ..._mbar_kpar8): FIXED and DEFAULT ON since 2026-10-29
       (register-exchange rewrite; TEMPURA_NO_SM120_Q6K=1 opts out).
@@ -643,10 +658,31 @@ typical-p/repeat/presence/frequency)
           graph capture) -- allocation/download during capture, pre-
           existing, latent until the MMLU prefills exercised these
           paths. Open work.
-      (c) **Self-consistency generation** (GSM8K-style): generate 5
-          samples at temperature=0.7, majority vote. Breaks repetition
-          loops and averages out near-tie flips. This is what production
-          systems do (Wang et al. 2022).
+      (c) [x] **Self-consistency generation** (GSM8K-style):
+          bench-selfconsistency (tools/bench-gpu/src/bench_selfconsistency.rs,
+          2026-11-04). K samples per problem at T=0.7 (seeded, deterministic
+          per sample: sample k uses base_seed+k), answer extraction
+          (engine/src/eval.rs extract_answer: "Answer:"/"answer is"/"####"
+          markers, last-number fallback, char-boundary-safe for non-ASCII
+          completions) + majority() vote (canonical per-f64 number format so
+          "3.50"/"3.5" aggregate). Sides: tempura GPU, tempura CPU
+          (TEMPURA_SC_CPU=1), llama.cpp via llama-server
+          (TEMPURA_SC_LLAMA_URL, -ngl 0 CPU llama-server works for the
+          arbiter). Dataset: deterministic 102-problem sample of GSM8K test
+          at ~/.cache/tempura/eval/gsm8k/gsm8k_sample.jsonl, built by
+          scripts/prep-gsm8k.sh (source: openai/grade-school-math GitHub).
+          Knobs: TEMPURA_SC_PROBLEMS/_SAMPLES/_MAX_TOKENS/_SEED/_MAX_GAP,
+          TEMPURA_SC_NO_GPU. bench-gpu now has a default-on `cutile` feature
+          so CPU-only hosts build with `cargo build -p tempura-bench-gpu
+          --release --no-default-features --bin bench-selfconsistency` (the
+          CUDA toolkit was previously required to build the crate at all;
+          the remote workflow is unchanged). Validated end-to-end CPU-only
+          (Qwen2.5-0.5B smoke run); the reference run (Llama-3.1-8B Q4_K_M,
+          full 102 problems x 5 samples) is pending the GPU host. Fixed on
+          the way: the original extract_answer marker scan was an infinite
+          loop (find() from a fixed offset, fresh to_lowercase() allocation
+          every iteration -> OOM SIGKILL) and sliced non-ASCII text at
+          non-char-boundary byte offsets (panicked on a Chinese completion).
       (d) **Multi-model validation**: test with other RTX 5090-fitting
           models (Llama-3.1-8B, Qwen2.5-7B, Mistral-7B, Phi-3.5-mini,
           Gemma-2-9B) to verify the quality gates hold across
@@ -954,6 +990,27 @@ typical-p/repeat/presence/frequency)
 - [ ] NPU backends: `npu-intel`/`npu-qualcomm` are todo!() stubs (OpenVINO /
       QNN SDK required)
 - [ ] Disaggregated serving over network — traits + local worker impl only
+      (planned: .lean/plan.yml p24-pd-disaggregation-network; bind to NIXL,
+      do NOT reinvent transfer protocols. Prior art, not an integration
+      dependency: the author's kv-mesh
+      ~/Code/gitlab.cee.redhat.com/fdupont/kv-mesh knows the NIXL plugin
+      model, but its G3 NVMe tier is a capacity tier, not the PD hot path)
+- [ ] Serving-technique gaps vs vLLM/SGLang (planned as .lean/plan.yml
+      Phase 24, filed 2026-11-04): p24-overlap-scheduling (CPU prepares
+      step N+1 while GPU runs step N — the step loop is synchronous
+      today), p24-kv-swap-preemption (preemption requeues/recomputes; no
+      swap-to-CPU-DRAM path), p24-eagle-speculative (EAGLE draft heads
+      distinct from the done Medusa work), p24-orchestration-surface
+      (engine-side KV export/import + prefix digests so EXTERNAL routers
+      can front tempura — engines and orchestrators are different layers;
+      prior art, consumer-side, in
+      ~/Code/gitlab.cee.redhat.com/fdupont/kv-topology-aware-router-extension),
+      p24-tensor-parallelism-gpu (real multi-GPU TP — p5's done-claim is
+      CPU-foundation only, cuda-oxide has no NCCL). Also re-audited:
+      p22-multi-lora was marked done but the server has NO lora wiring
+      (engine-side LoraRegistry only — now in_progress), and
+      p22-radix-attention was a corrupted entry claiming done+pending
+      (hash-based prefix cache only — now pending/0).
 - [ ] NVFP4: enum + block size only, no dequant/kernels
 - [ ] Multimodal input (Bonsai 2 is text+image; no vision encoder path)
 - [ ] TQ1_0 GPU kernel (CPU-only today)

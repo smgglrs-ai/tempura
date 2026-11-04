@@ -49,11 +49,29 @@ path = "src/bench_perplexity.rs"
 name = "bench-mmlu"
 path = "src/bench_mmlu.rs"
 
+[[bin]]
+name = "bench-selfconsistency"
+path = "src/bench_selfconsistency.rs"
+
+[features]
+# GPU-side bins need the CUDA toolkit at build time; default-on keeps the
+# remote workflow (`scripts/gpu-remote.sh bench`) unchanged. CPU-only hosts
+# build with --no-default-features --bin bench-selfconsistency.
+default = ["cutile"]
+cutile = [
+  "tempura-kernels/cutile",
+  "tempura-kernels/oxide-gemv",
+  "tempura-engine/cutile",
+  "tempura-engine/oxide-gemv",
+  "dep:cutile",
+  "dep:cuda-core",
+]
+
 [dependencies]
-tempura-kernels = { path = "../../kernels", features = ["cutile", "oxide-gemv"] }
-tempura-engine = { path = "../../engine", features = ["cutile", "oxide-gemv"] }
-cutile = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cutile-rs/cutile" }
-cuda-core = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-core" }
+tempura-kernels = { path = "../../kernels" }
+tempura-engine = { path = "../../engine" }
+cutile = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cutile-rs/cutile", optional = true }
+cuda-core = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-core", optional = true }
 half = "2"
 serde_json = "1"
 

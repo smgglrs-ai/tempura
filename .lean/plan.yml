@@ -674,6 +674,11 @@ items:
   - Bit-identical logits for TP=1 vs TP=N (DualPipeline verification)
   - CLI --tensor-parallel N flag
   - Integration test with tiny_test TP=2 on CPU verifies shape and numerical equivalence
+  notes:
+  - '2026-11-04 re-audit: done = CPU-side foundation only (config/sharding
+    plumbing, CPU allreduce identity at TP=1, Verus sharding proofs, TP=2
+    CPU shape test). NO multi-GPU runtime exists — cuda-oxide has no NCCL.
+    Real multi-GPU TP is tracked as p24-tensor-parallelism-gpu.'
   verification:
     quick: cargo test --workspace
 - id: p5-quantization
@@ -2543,6 +2548,57 @@ items:
   verification:
     quick: cargo test --workspace
 
+- id: p20-paged-attention-kernel
+  title: Native paged attention kernel — block-table indirection in the attention math
+  description: 'Phase 20 landed paged KV STORAGE, not paged ATTENTION: the CPU
+    forward path calls PagedKvCache::k_contiguous()/v_contiguous() (model.rs),
+    materializing a gathered copy before running standard contiguous attention,
+    and the GPU prefill path (cutile_flash_attn_heads) runs over head-major
+    padded buffers after cutile_gather_heads. This task removes the gather:
+    the attention kernel itself walks the block table. GPU: a flash-attention
+    variant whose KV tile loop reads logical->physical page addresses from a
+    device-resident block table (per-seq page ids + lengths), the same
+    device-side indirection pattern kv_scatter_write already uses for writes;
+    partial last pages are masked (kv_len is a device scalar, so the kernel
+    stays CUDA-graph-capturable). CPU: a reference block-table attention in
+    kernels/src/attention.rs so DualPipeline can grade the GPU kernel against
+    it. This eliminates the per-layer gather/scatter copies in the prefill
+    chain (3 cutile_gather_heads + cutile_scatter_heads today) and the
+    per-step k_contiguous/v_contiguous copies on the CPU paged path.'
+  status: pending
+  priority: high
+  effort: XL
+  depends_on:
+  - p20-paged-attention
+  scope:
+  - kernels/src/attention.rs
+  - kernels/src/cutile_flash_attention.rs
+  - kernels/src/kv_scatter_write.rs
+  - kernel-api/src/lib.rs
+  - engine/src/model.rs
+  - engine/src/cutile_gpu_forward.rs
+  acceptance:
+  - Flash attention tile loop resolves K/V addresses through a device-resident
+    block table (no gather kernel, no contiguous copy on the hot path)
+  - Partial last page masked correctly (ragged seq_len per sequence)
+  - Works inside CUDA graph capture (page table + kv_len read from device memory)
+  - CPU reference block-table attention; DualPipeline grades GPU vs CPU
+    (block-table walk vs gather-then-attend must match within the documented
+    MXFP4 band)
+  - 'Perf gate: prefill tok/s not worse than the gather-based path at pp128,
+    decode ITL unchanged; nsys shows the gather/scatter kernels gone'
+  - Kani harness for block-table tile arithmetic (tile index -> page id ->
+    physical offset in bounds); Verus proof generalizing it
+  - VerifiedEquivalent impl + row in the verified_equivalent_registry test
+  notes:
+  - '2026-11-04: scoped after audit — the paged data structures, allocator,
+    and Verified* contracts from p20-paged-attention are the foundation; only
+    the attention math needs to become block-table-aware. The kv_scatter_write
+    offset-indirection trick (offset read on device) is the template for
+    graph-safe device-side indirection.'
+  verification:
+    quick: cargo test --workspace
+
   # ============================================================================
   # Phase 21: Kernel Fusion — CUDA Graphs + Fused Operations
   # Eliminate kernel launch overhead, reduce HBM traffic.
@@ -2655,8 +2711,8 @@ items:
 
 - id: p22-multi-lora
   title: Multi-LoRA serving
-  status: done
-  progress: 100
+  status: in_progress
+  progress: 30
   description: 'Serve multiple LoRA adapters from a single base model. Each
     request specifies a LoRA adapter ID. The forward pass applies the adapter
     weights (low-rank A and B matrices) on top of the base model weights.
@@ -2673,18 +2729,26 @@ items:
   - Base model weights shared, adapter weights loaded per-adapter
   - Batched inference with mixed adapters in the same batch
   - Adapter hot-loading without server restart
+  notes:
+  - '2026-11-04 re-audit: was marked done, but only the engine-side
+    foundation exists — LoraAdapter/LoraRegistry (register/get/remove,
+    apply_to_output) in engine/src/lora.rs. The server has NO lora wiring
+    (no lora_adapter request parameter anywhere in server/src), and the
+    forward pass does not apply adapters per-request in a batch. Remaining:
+    per-request adapter selection in the StepPlan, mixed-adapter batched
+    GEMM (S-LoRA/punica-style batched ranks if throughput matters), API +
+    adapter upload/registration endpoints.'
   verification:
     quick: cargo test --workspace
 
 - id: p22-radix-attention
   title: RadixAttention
-  status: done
-  progress: 100 — tree-based prefix sharing
   description: 'Extend prefix caching from hash-based to radix-tree-based
     (SGLang approach). Multi-turn conversations share KV cache for common
     prefixes at the page level. The radix tree tracks which pages are shared
     and reference-counted. Eviction follows LRU on leaf nodes.'
   status: pending
+  progress: 0
   priority: medium
   effort: L
   depends_on:
@@ -2697,6 +2761,11 @@ items:
   - Multi-turn conversations reuse KV cache for shared history
   - Reference counting prevents eviction of shared pages
   - Higher cache hit rate than hash-based approach for chat workloads
+  notes:
+  - '2026-11-04 re-audit: entry was corrupted (duplicate status keys:
+    done + pending, mangled progress line). What exists today is the
+    hash-based SharedPrefixCache (whole-prefix, cache_salt isolation) —
+    no radix tree. Status set to pending / progress 0.'
   verification:
     quick: cargo test --workspace
 
@@ -2767,6 +2836,278 @@ items:
   - Verification pass accepts/rejects draft tokens
   - Output distribution identical to single-token generation
   - Measurable throughput improvement (tokens/sec)
+  verification:
+    quick: cargo test --workspace
+
+  # ============================================================================
+  # Phase 24: Scale-Out Serving
+  # Filed 2026-11-04 from a survey of production-server techniques
+  # (vLLM / SGLang / TensorRT-LLM) vs tempura's current coverage.
+  # Layering rule: tempura is the ENGINE — cluster concerns (topology
+  # routing, placement) belong to orchestrators. The author's kv-mesh
+  # (NIXL G3 backend) and kv-topo-router (llm-d routing) projects are
+  # prior art, not integration targets — see the notes on
+  # p24-pd-disaggregation-network and p24-orchestration-surface.
+  # Radix prefix caching and multi-LoRA corrections live in Phase 22
+  # (p22-radix-attention, p22-multi-lora — both re-audited 2026-11-04).
+  # ============================================================================
+
+- id: p24-overlap-scheduling
+  title: Overlap scheduling — CPU prepares step N+1 while GPU runs step N
+  description: 'The vLLM v1 zero-overhead scheduler pattern: while the GPU
+    executes decode step N, the CPU concurrently runs scheduling (batch
+    composition, prefix-cache lookups, request admission, sampling
+    bookkeeping) for step N+1. Today the engine thread''s step loop is
+    synchronous: schedule -> launch -> wait -> repeat, so CPU scheduling
+    time is serialized into every ITL. This decouples them with a
+    double-buffered step plan: the BatchScheduler emits an immutable StepPlan
+    (slot set, kv lengths, stop conditions) one iteration ahead, the
+    launcher consumes it while the scheduler builds the next. Requires the
+    GPU step to signal completion asynchronously (stream callback /
+    event poll, not a blocking sync) and the sampler to consume logits
+    from the previous step.'
+  status: pending
+  priority: high
+  effort: L
+  depends_on:
+  - p7-wire-batch-scheduler
+  scope:
+  - server/src/batch.rs
+  - server/src/engine_task.rs
+  - engine/src/model.rs
+  acceptance:
+  - Step loop overlaps CPU scheduling with GPU execution (no busy-wait sync
+    between schedule and launch)
+  - Identical outputs to the synchronous loop (determinism preserved — the
+    StepPlan is a pure function of state at step boundary)
+  - ITL improvement measurable at small batch (where per-step CPU overhead
+    is the largest fraction); no ITL regression at M=16
+  - Preemption/admission decisions still take effect at step boundaries only
+    (no mid-step mutation)
+  notes:
+  - '2026-11-04: filed after survey. tempura already isolates HTTP from the
+    engine thread; this pipelining is the remaining CPU overhead. The
+    deterministic-replay property is the constraint to protect: the StepPlan
+    must be recorded in the trace exactly as executed.'
+  verification:
+    quick: cargo test --workspace
+
+- id: p24-kv-swap-preemption
+  title: KV swap-based preemption — cheaper than recompute under memory pressure
+  description: 'When the paged KV pool is exhausted, the BatchScheduler
+    today preempts by requeueing (recompute from scratch on re-admission —
+    the full prompt is re-prefilled). vLLM''s alternative: swap the
+    victim''s KV pages to CPU DRAM, free the GPU pages, and swap back in
+    when the request is re-admitted. Swap wins when the prompt is long
+    (re-prefill is O(prompt_len) GPU compute; swap is O(kv_bytes) PCIe
+    transfer, ~25GB/s over x16). Implement as a G2 tier: a host-side page
+    pool keyed by session, PageSwapManager that moves pages
+    device-to-host and back, and a preemption policy that picks swap vs
+    recompute by estimated cost (prompt_len vs kv_bytes/pcie_bw). This is
+    also the local precursor to the G3/NIXL tiers in
+    p24-pd-disaggregation-network — same page-granular transfer machinery,
+    different destination.'
+  status: pending
+  priority: medium
+  effort: L
+  depends_on:
+  - p20-paged-attention
+  scope:
+  - engine/src/kv_cache.rs
+  - server/src/batch.rs
+  acceptance:
+  - Preempted session''s KV pages transfer to a host pool and back without
+    corruption (bitwise KV bytes, fresh-session replay identical)
+  - Preemption policy chooses swap vs recompute by cost model
+  - 'TLA+ BatchScheduler spec extended: pages are either resident, swapped,
+    or free — conservation invariant updated accordingly'
+  - PageSwapManager pages have a VerifiedKvCache-compatible well-formedness
+    contract
+  notes:
+  - '2026-11-04: filed after survey. Cost rule of thumb: swap wins when
+    kv_bytes/25GB/s < prompt_prefill_time; measure both on the RTX 5090
+    fishtank host.'
+  verification:
+    quick: cargo test --workspace
+
+- id: p24-eagle-speculative
+  title: EAGLE-style speculative decoding — draft from the model's own hidden states
+  description: 'tempura has target+draft speculative decoding and Medusa
+    multi-token heads (p23-multi-token). EAGLE (Yi et al. 2024) is the
+    stronger variant: the draft head conditions on the target model''s
+    SECOND-TO-TOP hidden state (feature-level, not just the sampled token),
+    which fixes the draft''s exposure-bias problem and reaches ~3-5x
+    acceptance vs Medusa''s ~2x. Draft head = one lightweight transformer
+    layer over (hidden_state, embedded_token). Implementation: EAGLE-head
+    loading from GGUF (upstream llama.cpp supports EAGLE GGUFs — the
+    loader work is in gguf_loader.rs), a draft forward that fuses the
+    previous step''s hidden state, and tree-structured verification
+    (multiple draft branches verified in ONE target forward via attention
+    masking — the same masking machinery guided decoding uses). EAGLE-2
+    adds dynamic draft-tree shapes by draft confidence.'
+  status: pending
+  priority: medium
+  effort: XL
+  depends_on:
+  - p23-multi-token
+  scope:
+  - engine/src/speculative.rs
+  - engine/src/gguf_loader.rs
+  - engine/src/model.rs
+  - kernels/src/attention.rs
+  acceptance:
+  - EAGLE draft GGUF loads (head weights + config) and runs the
+    feature-conditioned draft forward
+  - 'Tree verification: multiple draft tokens verified per target forward
+    with correct causal masking (accepted prefix is distribution-identical
+    to autoregressive decoding — the standard speculative-decoding
+    acceptance test)'
+  - Acceptance rate and tokens/step reported by bench-speculative; target
+    2.5x+ effective speedup on Llama-3.1-8B Q4_K_M
+  - Deterministic given seed (tree construction + sampling seeded)
+  notes:
+  - '2026-11-04: filed after survey — distinct from the done Medusa work
+    (p23-multi-token). Cross-validate the draft-head math against
+    llama.cpp''s llama-eagle paths the same way logitprobe was used for
+    perplexity.'
+  verification:
+    quick: cargo test --workspace
+
+- id: p24-pd-disaggregation-network
+  title: Network prefill/decode disaggregation via NIXL
+  description: 'p11-disaggregated-serving landed the traits (PrefillWorker/
+    DecodeWorker, SessionTransfer, KvCacheTransfer) and local workers only.
+    This task makes the transfer real by binding to NIXL (the transfer API
+    the llm-d/AI-infra ecosystem standardized on) rather than inventing a
+    protocol: a NixlTransferBackend implementing KvCacheTransfer hands a
+    session''s paged KV blocks to NIXL agent-side transfer — DRAM-to-DRAM
+    over RDMA for the PD hot path (GBs of active KV per request,
+    latency-critical, once per request). Paged blocks may land out of
+    order; the block table absorbs this, which is a second reason the
+    p20-paged-attention-kernel matters. Plus a coordinator mode in the
+    server that routes prefill vs decode requests.'
+  status: pending
+  priority: medium
+  effort: XL
+  depends_on:
+  - p11-disaggregated-serving
+  - p20-paged-attention
+  scope:
+  - engine/src/disaggregated.rs
+  - engine/src/kv_cache.rs
+  - server/src/engine_task.rs
+  - server/src/api.rs
+  acceptance:
+  - PrefillWorker and DecodeWorker run in separate processes; KV state
+    moves via NIXL (not shared memory), producing identical decode output
+    to single-process inference (the p11 end-to-end test, over the network)
+  - Session KV serialization is page-granular and resumable (partial
+    transfer visible as a partially-filled block table)
+  - 'The never-run-multiple-instances rule is re-examined: document what
+    multi-process operation requires (the rule exists because of memory,
+    not correctness — preflight checks generalize)'
+  - TLA+ spec for the transfer state machine (requested -> in-flight ->
+    hydrated -> running; failure -> fallback to re-prefill)
+  notes:
+  - '2026-11-04 reframe: kv-mesh demoted from "substrate" to prior art.
+    Its G3 NVMe tier solves capacity (retention, cross-request reuse,
+    ~10-200us, background convergence) — a different problem than the PD
+    hot path, which is HBM-to-HBM active KV. NIXL itself is the substrate
+    choice. What kv-mesh genuinely contributes: the author built its NIXL
+    backend plugin, so the plugin model, API surface, and failure modes
+    are familiar — de-risks this task without being in its data path.
+    See ~/Code/gitlab.cee.redhat.com/fdupont/kv-mesh (SPEC.md,
+    VERIFICATION.md). Likewise kv-topo-router is NOT an integration
+    target (it scores llm-d workers via the llm-d KV cache indexer) —
+    the engine-side counterpart is p24-orchestration-surface.'
+  verification:
+    quick: cargo test --workspace
+
+- id: p24-orchestration-surface
+  title: Orchestration surface — make tempura frontable by external routers
+  description: 'Layering decision (2026-11-04): engines and orchestrators are
+    different products. vLLM does not do cluster topology routing — llm-d /
+    Dynamo sit above it. tempura, competing with vLLM, should be
+    ORCHESTRATABLE, not grow its own Valkey placement schema, topology
+    calibrator, or K8s scheduler extenders. This task exposes the engine-side
+    interfaces an external router needs to front N tempura replicas: (1) a
+    page-granular KV export/import API on the paged block table (extends
+    KvCacheTransfer; converges with p20-paged-attention-kernel); (2) a
+    per-replica prefix-digest endpoint — the SharedPrefixCache already knows
+    block hashes; export them cache_salt-partitioned so a router can do
+    prefix-affinity routing without cross-tenant leakage; (3) worker
+    metadata (capacity, KV pool usage, running batch size — /metrics covers
+    much of this in Prometheus form); (4) optional spike: nixl-rust binding
+    feasibility, validating that external KV movement against these
+    interfaces is callable from Rust.'
+  status: pending
+  priority: low
+  effort: L
+  depends_on:
+  - p20-paged-attention
+  scope:
+  - engine/src/prefix_cache.rs
+  - engine/src/disaggregated.rs
+  - engine/src/kv_cache.rs
+  - server/src/api.rs
+  acceptance:
+  - 'KV export/import: a session''s paged KV blocks serialize/deserialize
+    page-granularly through a documented API (not engine-internal types)'
+  - 'Prefix-digest endpoint: block hashes, cache_salt-partitioned, cheap
+    enough to poll per routing decision'
+  - 'Worker metadata endpoint: capacity + KV pool usage + batch size'
+  - A toy router fronts 2 tempura replicas using ONLY these interfaces and
+    routes by prefix affinity (proves the surface is sufficient)
+  - nixl-rust binding spike produces a go/no-go note with findings
+  notes:
+  - '2026-11-04 reframe: replaces the earlier p24-topology-routing draft,
+    which framed porting the router INTO tempura — the wrong layer. Prior
+    art (consumer side) at
+    ~/Code/gitlab.cee.redhat.com/fdupont/kv-topology-aware-router-extension:
+    its TopologyScorer + topology-extended KV cache index documents exactly
+    what an engine must expose; its three-phase placement and
+    desired-vs-actual Valkey reconciliation remain the reference patterns
+    IF a cluster story ever materializes on top of this surface.'
+  verification:
+    quick: cargo test --workspace
+
+- id: p24-tensor-parallelism-gpu
+  title: Real multi-GPU tensor parallelism — NCCL-class allreduce over cuda-oxide
+  description: 'p5-tensor-parallelism is marked done, but what exists is
+    the CPU-side foundation: config/weight-sharding plumbing, the CPU
+    allreduce (identity at TP=1), Verus sharding proofs, and a TP=2 CPU
+    shape test. There is no multi-GPU runtime — cuda-oxide has no NCCL.
+    This task: (1) multi-device GpuContext (per-rank CudaContext, one
+    thread per rank); (2) an allreduce implementation over cuda-oxide —
+    ring-reduce over P2P/copy engines first (NVLink-aware topology
+    discovery), NCCL bind later if ever; (3) column/row-parallel weight
+    sharding at upload (the sharding math is already Verus-proven); (4)
+    layer-boundary sync in the forward pass. Target: models that do not
+    fit one GPU (the immediate motivation — nothing above ~24B Q4 fits a
+    5090) rather than throughput scaling.'
+  status: pending
+  priority: low
+  effort: XL
+  depends_on:
+  - p5-tensor-parallelism
+  scope:
+  - kernels/src/allreduce.rs
+  - engine/src/weights.rs
+  - engine/src/model.rs
+  - engine/src/cutile_gpu_forward.rs
+  acceptance:
+  - TP=2 across two GPUs produces logits within the documented MXFP4 band
+    of TP=1 on a model that fits one GPU
+  - A >24B model (e.g., Llama-3.3-70B Q4 across 4x GPU) runs — the
+    single-GPU-impossible case
+  - 'Allreduce verified: DualPipeline ring-reduce vs CPU reference;
+    deterministic reduction order preserved (tempura''s determinism rule —
+    fixed ring order, no atomic adds)'
+  - Kani harness for ring allreduce index arithmetic
+  notes:
+  - '2026-11-04: filed after survey; corrects the p5 done-claim scope.
+    Note the single-GPU 5090 benchmark numbers must not regress — TP code
+    paths are behind tensor_parallel_size > 1.'
   verification:
     quick: cargo test --workspace
 
