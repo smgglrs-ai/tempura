@@ -26,6 +26,7 @@ use vstd::prelude::*;
 pub mod attention;
 pub mod disaggregated;
 pub mod ggml_quants;
+pub mod nvfp4;
 pub mod gguf;
 pub mod kv_cache;
 pub mod layernorm;
