@@ -236,6 +236,84 @@ pub fn mmlu_format_prompt(subject: &str, question: &str, choices: &[String]) -> 
 /// caller strips a prepended BOS.
 pub const MMLU_LETTERS: [&str; 4] = [" A", " B", " C", " D"];
 
+/// Normalize a parsed number for answer comparison: integers without a
+/// decimal point, others with 6 decimals (canonical per f64 value so
+/// majority votes aggregate "3.50" and "3.5").
+pub fn format_num(v: f64) -> String {
+    if v == v.trunc() && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v:.6}")
+    }
+}
+
+/// Final numeric answer from a model completion (GSM8K self-consistency):
+/// prefers explicit markers ("Answer: X", "answer is X", "####"), falls
+/// back to the last number in the text. Returns None when no number is
+/// present.
+pub fn extract_answer(text: &str) -> Option<String> {
+    let normalized: String = text.chars().filter(|c| *c != ',').collect();
+    let mut best: Option<String> = None;
+    for marker in ["Answer:", "answer is", "answer:", "####"] {
+        // ASCII-case-insensitive scan at char boundaries only -- the model may
+        // reply in any language, so byte offsets from a separately-lowercased
+        // copy would not be boundaries of `normalized`.
+        let m = marker.as_bytes();
+        let bytes = normalized.as_bytes();
+        let mut idx = None;
+        for (i, _) in normalized.char_indices() {
+            if i + m.len() <= bytes.len() && bytes[i..i + m.len()].eq_ignore_ascii_case(m) {
+                idx = Some(i + m.len());
+            }
+        }
+        if let Some(at) = idx {
+            let tail = &normalized[at..];
+            let num: String = tail
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                .collect();
+            if let Ok(v) = num.parse::<f64>() {
+                best = Some(format_num(v));
+            }
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+    // Fallback: last number in the text.
+    let mut last: Option<String> = None;
+    let bytes = normalized.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit()
+            || (bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit())
+        {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            if let Ok(v) = normalized[start..i].parse::<f64>() {
+                last = Some(format_num(v));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    last
+}
+
+/// Majority vote over per-sample answers (None samples are ignored; ties
+/// resolve to the first-encountered max).
+pub fn majority(answers: &[Option<String>]) -> Option<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for a in answers.iter().flatten() {
+        *counts.entry(a.clone()).or_default() += 1;
+    }
+    counts.into_iter().max_by_key(|(_, c)| *c).map(|(a, _)| a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +602,54 @@ mod tests {
         assert!(p.contains("D. four\n"));
         assert!(p.ends_with("Answer:"));
         assert_eq!(MMLU_LETTERS, [" A", " B", " C", " D"]);
+    }
+
+    #[test]
+    fn extracts_marker_answers() {
+        assert_eq!(extract_answer("So 2+2 = 4.\nAnswer: 4"), Some("4".to_string()));
+        assert_eq!(
+            extract_answer("The total is 1,200 dollars. Answer: 1200"),
+            Some("1200".to_string())
+        );
+        assert_eq!(extract_answer("the answer is 52."), Some("52".to_string()));
+        assert_eq!(extract_answer("Answer: 3.5"), Some("3.500000".to_string()));
+        // Later markers win.
+        assert_eq!(
+            extract_answer("Answer: 1 ... Answer: 7"),
+            Some("7".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_last_number_fallback() {
+        assert_eq!(
+            extract_answer("He has 5 apples and buys 7 more, so 12."),
+            Some("12".to_string())
+        );
+        assert_eq!(extract_answer("no numbers here"), None);
+    }
+
+    #[test]
+    fn non_ascii_text_does_not_panic() {
+        // Byte offsets from a lowercased copy are not char boundaries here.
+        assert_eq!(
+            extract_answer("所以答案是 42。Answer: 42"),
+            Some("42".to_string())
+        );
+        assert_eq!(extract_answer(" Türkçe cevap 7"), Some("7".to_string()));
+    }
+
+    #[test]
+    fn majority_vote_picks_mode() {
+        let a = [Some("1".into()), Some("2".into()), Some("1".into())];
+        assert_eq!(majority(&a), Some("1".to_string()));
+        let b = [None, None];
+        assert_eq!(majority(&b), None);
+    }
+
+    #[test]
+    fn format_num_truncates_integers() {
+        assert_eq!(format_num(52.0), "52");
+        assert_eq!(format_num(3.5), "3.500000");
     }
 }
