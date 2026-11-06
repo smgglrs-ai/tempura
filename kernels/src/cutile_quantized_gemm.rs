@@ -2,10 +2,13 @@ use crate::{
     KernelError, MatMulQ, Result, VerificationTier, Q4K_BLOCK_BYTES, Q4K_BLOCK_SIZE, Q4K_GROUPS,
     Q6K_BLOCK_BYTES, Q6K_BLOCK_SIZE, TQ2_BLOCK_BYTES, TQ2_BLOCK_SIZE,
 };
-use crate::gpu_block_layout::{
+// Re-exported (pub use): engine/src/cutile_gpu_forward.rs imports these
+// via tempura_kernels::cutile_quantized_gemm::*, so the move to
+// gpu_block_layout must preserve that path.
+pub use crate::gpu_block_layout::{
     Q2_0_QK, Q2_0_BLOCK_BYTES, Q2_0_PACKED_U32S, Q4K_PACKED_U32S, Q6K_QK, Q6K_PACKED_U32S,
-    dequant_q4k_block, dequant_q6k_block, dequant_tq2_block,
 };
+use crate::gpu_block_layout::{dequant_q4k_block, dequant_q6k_block, dequant_tq2_block};
 use crate::ggml::helpers::f16_to_f32;
 use cuda_core::{Device, Stream};
 use cutile::api;
