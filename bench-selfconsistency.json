@@ -1,0 +1,10 @@
+{
+  "model": "/home/fdupont/.cache/tempura/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+  "sample": "/home/fdupont/.cache/tempura/eval/gsm8k/gsm8k_sample.jsonl",
+  "problems": 102,
+  "samples_per_problem": 5,
+  "gpu_accuracy": 0.6373,
+  "cpu_accuracy": null,
+  "llama_accuracy": 0.5196,
+  "passed": true
+}
