@@ -107,7 +107,7 @@ impl OxideQ6kGemv {
 
         // -- Try oxide-compiled PTX (feature-gated) -----------------------------
         #[cfg(not(feature = "oxide-gemv"))]
-        let (cu_module, cu_function, cu_function_kpar) =
+        let (cu_module, cu_function, cu_function_kpar): (CUmodule, CUfunction, Option<CUfunction>) =
             (std::ptr::null_mut(), std::ptr::null_mut(), None);
 
         #[cfg(feature = "oxide-gemv")]
