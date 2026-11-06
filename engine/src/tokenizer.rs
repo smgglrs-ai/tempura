@@ -122,7 +122,11 @@ pub struct ChatMessageInput {
 }
 
 pub struct Tokenizer {
-    inner: tokenizers::Tokenizer,
+    /// HF tokenizers pipeline (BPE-family vocabs). `None` for SPM vocabs,
+    /// which use the self-contained llama.cpp port in `spm` instead (the
+    /// HF Tokenizer cannot host a custom Model: closed ModelWrapper enum).
+    inner: Option<tokenizers::Tokenizer>,
+    spm: Option<crate::spm_tokenizer::SpmModel>,
     chat_template: ChatTemplate,
     bos_token_id: Option<u32>,
     eos_token_id: Option<u32>,
@@ -146,7 +150,8 @@ impl Tokenizer {
         };
 
         Ok(Self {
-            inner,
+            inner: Some(inner),
+            spm: None,
             chat_template,
             bos_token_id: None,
             eos_token_id: None,
@@ -198,39 +203,30 @@ impl Tokenizer {
         // (found 2026-11-06; Llama-3.1 masked it -- real BPE with merges).
         let is_spm = model_type == "llama" && scores.is_some();
 
+        // SPM: self-contained llama.cpp port (see spm_tokenizer.rs for why
+        // neither BPE-without-merges nor HF Unigram is correct here).
+        let spm = if is_spm {
+            let token_types_slice = metadata
+                .get("tokenizer.ggml.token_type")
+                .and_then(|v| v.as_u32_array());
+            let add_dummy_prefix = match metadata.get("tokenizer.ggml.add_dummy_prefix") {
+                Some(GgufValue::Bool(b)) => *b,
+                _ => true,
+            };
+            Some(
+                crate::spm_tokenizer::SpmModel::new(
+                    &tokens,
+                    scores.as_deref(),
+                    token_types_slice.as_deref(),
+                )
+                .with_add_dummy_prefix(add_dummy_prefix),
+            )
+        } else {
+            None
+        };
+
         let mut inner = if is_spm {
-            // unk_id is REQUIRED by the Unigram lattice for characters with
-            // no trie coverage (byte_fallback does not remove that
-            // requirement); GGUF SPM vocabs carry unknown_token_id. Rare
-            // uncovered chars emit <unk> where llama.cpp would emit <0xNN>
-            // byte tokens -- documented divergence, harmless for natural
-            // language corpora.
-            let unk_id: Option<usize> = metadata
-                .get("tokenizer.ggml.unknown_token_id")
-                .and_then(|v| v.as_u32())
-                .map(|id| id as usize)
-                .or_else(|| {
-                    tokens
-                        .iter()
-                        .position(|t| *t == "<unk>")
-                });
-            let unigram_vocab: Vec<(String, f64)> = tokens
-                .iter()
-                .enumerate()
-                .map(|(id, t)| {
-                    let s = scores
-                        .as_ref()
-                        .and_then(|s| s.get(id))
-                        .copied()
-                        .unwrap_or(-10.0);
-                    ((*t).to_string(), s as f64)
-                })
-                .collect();
-            let unigram =
-                tokenizers::models::unigram::Unigram::from(unigram_vocab, unk_id, true).map_err(
-                    |e| TokenizerError::Load(format!("failed to build Unigram from GGUF: {e}")),
-                )?;
-            tokenizers::Tokenizer::new(unigram)
+            None
         } else {
             let mut vocab = tokenizers::models::bpe::Vocab::new();
             for (id, token) in tokens.iter().enumerate() {
@@ -254,7 +250,7 @@ impl Tokenizer {
                     TokenizerError::Load(format!("failed to build BPE from GGUF: {e}"))
                 })?;
 
-            tokenizers::Tokenizer::new(bpe)
+            Some(tokenizers::Tokenizer::new(bpe))
         };
 
         // Register special tokens (type != 1) so they're matched as whole strings
@@ -265,51 +261,33 @@ impl Tokenizer {
             .get("tokenizer.ggml.token_type")
             .and_then(|v| v.as_u32_array());
         if let Some(ref types) = token_types {
-            let mut special_tokens = Vec::new();
-            for (id, &tt) in types.iter().enumerate() {
-                if tt != 1 && tt != 6 && id < tokens.len() {
-                    let tok_str = tokens[id].to_string();
-                    if !tok_str.is_empty() {
-                        let mut at = tokenizers::AddedToken::from(tok_str, true);
-                        at = at.normalized(false);
-                        special_tokens.push(at);
+            if let Some(ref mut inner) = inner {
+                let mut special_tokens = Vec::new();
+                for (id, &tt) in types.iter().enumerate() {
+                    if tt != 1 && tt != 6 && id < tokens.len() {
+                        let tok_str = tokens[id].to_string();
+                        if !tok_str.is_empty() {
+                            let mut at = tokenizers::AddedToken::from(tok_str, true);
+                            at = at.normalized(false);
+                            special_tokens.push(at);
+                        }
                     }
                 }
-            }
-            if !special_tokens.is_empty() {
-                inner.add_special_tokens(&special_tokens);
+                if !special_tokens.is_empty() {
+                    inner.add_special_tokens(&special_tokens);
+                }
             }
         }
 
         let is_gpt2_bpe = model_type == "gpt2";
 
-        if is_spm {
-            // Metaspace: replace ' ' with the SPM marker U+2581 and prepend
-            // a dummy prefix (tokenizer.ggml.add_dummy_prefix, default
-            // true), matching llama_escape_whitespace + add_dummy_prefix in
-            // llama.cpp. split=false: llama.cpp lets the unigram segmentation
-            // handle word boundaries.
-            // NOTE: with_pre_tokenizer/with_decoder CONSUME and return the
-            // tokenizer -- a bare statement call silently discards the
-            // result (found 2026-11-06: the raw text with literal spaces
-            // reached the Unigram model and every lookup failed).
-            let add_dummy_prefix = match metadata.get("tokenizer.ggml.add_dummy_prefix") {
-                Some(GgufValue::Bool(b)) => *b,
-                _ => true,
-            };
-            use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
-            let scheme = if add_dummy_prefix {
-                PrependScheme::Always
-            } else {
-                PrependScheme::Never
-            };
-            inner.with_pre_tokenizer(Some(Metaspace::new('▁', scheme, false)));
-            inner.with_decoder(Some(Metaspace::new('▁', scheme, false)));
-        } else if is_gpt2_bpe {
-            inner.with_pre_tokenizer(Some(
-                tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, true, false),
-            ));
-            inner.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+        if let Some(ref mut inner) = inner {
+            if is_gpt2_bpe {
+                inner.with_pre_tokenizer(Some(
+                    tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, true, false),
+                ));
+                inner.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+            }
         }
 
         let bos_token = metadata
@@ -378,6 +356,7 @@ impl Tokenizer {
 
         Ok(Self {
             inner,
+            spm,
             chat_template,
             bos_token_id,
             eos_token_id,
@@ -407,24 +386,35 @@ impl Tokenizer {
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {
-        let encoding = self
-            .inner
-            .encode(text, false)
-            .map_err(|e| TokenizerError::Encode(e.to_string()))?;
-        let ids = encoding.get_ids();
+        let ids: Vec<u32> = if let Some(spm) = &self.spm {
+            spm.tokenize_text(text)
+        } else {
+            self.inner
+                .as_ref()
+                .expect("tokenizer has neither HF inner nor SPM model")
+                .encode(text, false)
+                .map_err(|e| TokenizerError::Encode(e.to_string()))?
+                .get_ids()
+                .to_vec()
+        };
         if self.add_bos {
             if let Some(bos) = self.bos_token_id {
                 let mut result = Vec::with_capacity(ids.len() + 1);
                 result.push(bos);
-                result.extend_from_slice(ids);
+                result.extend_from_slice(&ids);
                 return Ok(result);
             }
         }
-        Ok(ids.to_vec())
+        Ok(ids)
     }
 
     pub fn decode(&self, ids: &[u32]) -> Result<String, TokenizerError> {
+        if let Some(spm) = &self.spm {
+            return Ok(spm.decode(ids));
+        }
         self.inner
+            .as_ref()
+            .expect("tokenizer has neither HF inner nor SPM model")
             .decode(ids, true)
             .map_err(|e| TokenizerError::Decode(e.to_string()))
     }
@@ -438,7 +428,13 @@ impl Tokenizer {
     }
 
     pub fn vocab_size(&self) -> usize {
-        self.inner.get_vocab_size(true)
+        if let Some(spm) = &self.spm {
+            return spm.vocab_len();
+        }
+        self.inner
+            .as_ref()
+            .expect("tokenizer has neither HF inner nor SPM model")
+            .get_vocab_size(true)
     }
 
     pub fn vocab_strings(&self) -> Vec<String> {

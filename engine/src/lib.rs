@@ -20,6 +20,7 @@ pub mod pipeline;
 pub mod prefix_cache;
 pub mod schema;
 pub mod session;
+pub mod spm_tokenizer;
 pub mod speculative;
 pub mod tokenizer;
 pub mod tool_call;
