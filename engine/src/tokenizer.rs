@@ -174,37 +174,85 @@ impl Tokenizer {
             .get("tokenizer.ggml.merges")
             .and_then(|v| v.as_string_array());
 
-        let mut vocab = tokenizers::models::bpe::Vocab::new();
-        for (id, token) in tokens.iter().enumerate() {
-            vocab.insert((*token).to_string(), id as u32);
-        }
+        let scores = metadata
+            .get("tokenizer.ggml.scores")
+            .and_then(|v| v.as_f32_array());
 
-        let merge_pairs: tokenizers::models::bpe::Merges = merges
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|m| {
-                let (a, b) = m.split_once(' ')?;
-                Some((a.to_string(), b.to_string()))
+        let model_type = metadata
+            .get("tokenizer.ggml.model")
+            .and_then(|v| match v {
+                GgufValue::String(s) => Some(s.as_str()),
+                _ => None,
             })
-            .collect();
+            .unwrap_or("");
 
-        let bpe = tokenizers::models::bpe::BPE::builder()
-            .vocab_and_merges(vocab, merge_pairs)
-            .byte_fallback(true)
-            .build()
-            .map_err(|e| TokenizerError::Load(format!("failed to build BPE from GGUF: {e}")))?;
+        // SentencePiece path (tokenizer.ggml.model == "llama" with scores,
+        // no merges): llama.cpp tokenizes SPM vocabs with score-greedy
+        // bigram merges over escaped-space text (llama-vocab.cpp
+        // llm_tokenizer_spm_session) -- i.e. unigram segmentation. The HF
+        // tokenizers equivalent is Unigram + Metaspace + byte_fallback. The
+        // previous always-BPE construction could NEVER form multi-char
+        // pieces for these vocabs (no merges), so every character fell to
+        // byte fallback: Mistral-7B v0.3 corpus tokenized to 1.29M tokens
+        // vs llama.cpp's 329k and perplexity came out 8641 vs 5.96
+        // (found 2026-11-06; Llama-3.1 masked it -- real BPE with merges).
+        let is_spm = model_type == "llama" && scores.is_some();
 
-        let mut inner = tokenizers::Tokenizer::new(bpe);
+        let mut inner = if is_spm {
+            let unigram_vocab: Vec<(String, f64)> = tokens
+                .iter()
+                .enumerate()
+                .map(|(id, t)| {
+                    let s = scores
+                        .as_ref()
+                        .and_then(|s| s.get(id))
+                        .copied()
+                        .unwrap_or(-10.0);
+                    ((*t).to_string(), s as f64)
+                })
+                .collect();
+            let unigram = tokenizers::models::unigram::Unigram::from(unigram_vocab, None, true)
+                .map_err(|e| {
+                    TokenizerError::Load(format!("failed to build Unigram from GGUF: {e}"))
+                })?;
+            tokenizers::Tokenizer::new(unigram)
+        } else {
+            let mut vocab = tokenizers::models::bpe::Vocab::new();
+            for (id, token) in tokens.iter().enumerate() {
+                vocab.insert((*token).to_string(), id as u32);
+            }
+
+            let merge_pairs: tokenizers::models::bpe::Merges = merges
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|m| {
+                    let (a, b) = m.split_once(' ')?;
+                    Some((a.to_string(), b.to_string()))
+                })
+                .collect();
+
+            let bpe = tokenizers::models::bpe::BPE::builder()
+                .vocab_and_merges(vocab, merge_pairs)
+                .byte_fallback(true)
+                .build()
+                .map_err(|e| {
+                    TokenizerError::Load(format!("failed to build BPE from GGUF: {e}"))
+                })?;
+
+            tokenizers::Tokenizer::new(bpe)
+        };
 
         // Register special tokens (type != 1) so they're matched as whole strings
-        // before the BPE pre-tokenizer splits them
+        // before the pre-tokenizer splits them. BYTE tokens (type 6) are
+        // excluded: byte_fallback emits their ids internally, and matching
+        // the literal "<0xNN>" text to them is not SPM semantics.
         let token_types = metadata
             .get("tokenizer.ggml.token_type")
             .and_then(|v| v.as_u32_array());
         if let Some(ref types) = token_types {
             let mut special_tokens = Vec::new();
             for (id, &tt) in types.iter().enumerate() {
-                if tt != 1 && id < tokens.len() {
+                if tt != 1 && tt != 6 && id < tokens.len() {
                     let tok_str = tokens[id].to_string();
                     if !tok_str.is_empty() {
                         let mut at = tokenizers::AddedToken::from(tok_str, true);
@@ -218,17 +266,27 @@ impl Tokenizer {
             }
         }
 
-        let model_type = metadata
-            .get("tokenizer.ggml.model")
-            .and_then(|v| match v {
-                GgufValue::String(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .unwrap_or("");
-
         let is_gpt2_bpe = model_type == "gpt2";
 
-        if is_gpt2_bpe {
+        if is_spm {
+            // Metaspace: replace ' ' with the SPM marker U+2581 and prepend
+            // a dummy prefix (tokenizer.ggml.add_dummy_prefix, default
+            // true), matching llama_escape_whitespace + add_dummy_prefix in
+            // llama.cpp. split=false: llama.cpp lets the unigram segmentation
+            // handle word boundaries.
+            let add_dummy_prefix = match metadata.get("tokenizer.ggml.add_dummy_prefix") {
+                Some(GgufValue::Bool(b)) => *b,
+                _ => true,
+            };
+            use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
+            let scheme = if add_dummy_prefix {
+                PrependScheme::Always
+            } else {
+                PrependScheme::Never
+            };
+            inner.with_pre_tokenizer(Some(Metaspace::new('▁', scheme, false)));
+            inner.with_decoder(Some(Metaspace::new('▁', scheme, false)));
+        } else if is_gpt2_bpe {
             inner.with_pre_tokenizer(Some(
                 tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, true, false),
             ));
