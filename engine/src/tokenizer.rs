@@ -199,6 +199,21 @@ impl Tokenizer {
         let is_spm = model_type == "llama" && scores.is_some();
 
         let mut inner = if is_spm {
+            // unk_id is REQUIRED by the Unigram lattice for characters with
+            // no trie coverage (byte_fallback does not remove that
+            // requirement); GGUF SPM vocabs carry unknown_token_id. Rare
+            // uncovered chars emit <unk> where llama.cpp would emit <0xNN>
+            // byte tokens -- documented divergence, harmless for natural
+            // language corpora.
+            let unk_id: Option<usize> = metadata
+                .get("tokenizer.ggml.unknown_token_id")
+                .and_then(|v| v.as_u32())
+                .map(|id| id as usize)
+                .or_else(|| {
+                    tokens
+                        .iter()
+                        .position(|t| *t == "<unk>")
+                });
             let unigram_vocab: Vec<(String, f64)> = tokens
                 .iter()
                 .enumerate()
@@ -211,10 +226,10 @@ impl Tokenizer {
                     ((*t).to_string(), s as f64)
                 })
                 .collect();
-            let unigram = tokenizers::models::unigram::Unigram::from(unigram_vocab, None, true)
-                .map_err(|e| {
-                    TokenizerError::Load(format!("failed to build Unigram from GGUF: {e}"))
-                })?;
+            let unigram =
+                tokenizers::models::unigram::Unigram::from(unigram_vocab, unk_id, true).map_err(
+                    |e| TokenizerError::Load(format!("failed to build Unigram from GGUF: {e}")),
+                )?;
             tokenizers::Tokenizer::new(unigram)
         } else {
             let mut vocab = tokenizers::models::bpe::Vocab::new();
@@ -274,6 +289,10 @@ impl Tokenizer {
             // true), matching llama_escape_whitespace + add_dummy_prefix in
             // llama.cpp. split=false: llama.cpp lets the unigram segmentation
             // handle word boundaries.
+            // NOTE: with_pre_tokenizer/with_decoder CONSUME and return the
+            // tokenizer -- a bare statement call silently discards the
+            // result (found 2026-11-06: the raw text with literal spaces
+            // reached the Unigram model and every lookup failed).
             let add_dummy_prefix = match metadata.get("tokenizer.ggml.add_dummy_prefix") {
                 Some(GgufValue::Bool(b)) => *b,
                 _ => true,
