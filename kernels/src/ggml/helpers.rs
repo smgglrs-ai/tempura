@@ -203,14 +203,11 @@ mod kani_proofs {
         let _ = f16_to_f32(bits);
     }
 
-    #[kani::proof]
-    fn f16_to_f32_finite_for_normal() {
-        let bits: u16 = kani::any();
-        let exp = (bits >> 10) & 0x1f;
-        kani::assume(exp > 0 && exp < 31);
-        let result = f16_to_f32(bits);
-        assert!(result.is_finite());
-    }
+    // f16_to_f32_finite_for_normal was a Kani harness until 2026-11-05: the
+    // lookup with a symbolic u16 index into the 65536-entry table never
+    // finished. The property is exhaustively checked by the unit test
+    // f16_to_f32_finite_for_normal_exhaustive below (stronger: all 65536
+    // bits, not a symbolic sample).
 
     #[kani::proof]
     fn f32_to_f16_no_panic() {
@@ -248,6 +245,19 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f16_to_f32_finite_for_normal_exhaustive() {
+        // Replaces the f16_to_f32_finite_for_normal Kani harness (see the
+        // note in kani_proofs): every normal f16 bit pattern (0 < exp < 31)
+        // decodes to a finite f32. Exhaustive over all 65536 patterns.
+        for bits in 0u16..=65535 {
+            let exp = (bits >> 10) & 0x1f;
+            if exp > 0 && exp < 31 {
+                assert!(f16_to_f32(bits).is_finite(), "bits {bits:#06x}");
+            }
+        }
+    }
 
     #[test]
     fn ue4m3_decode_encode_roundtrips_exhaustively() {

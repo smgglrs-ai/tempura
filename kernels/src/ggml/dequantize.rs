@@ -208,6 +208,11 @@ pub fn dequantize_row_q4_k(blocks: &[BlockQ4K], output: &mut [f32]) {
 }
 
 pub fn dequantize_row_q5_k(blocks: &[BlockQ5K], output: &mut [f32]) {
+    // C-faithful port of llama.cpp dequantize_row_q5_K (ggml-quants.c:1741):
+    // the 5th bit of element l of each 64-group is bit (2j) / (2j+1) of
+    // qh[l] -- u1/u2 masks shifting left by 2 per group, NO qh offset. (The
+    // previous translation advanced qh_offset by 32 when is==4 and read
+    // qh[32..64] on a 32-byte array -- a real OOB found by Kani, 2026-11-05.)
     const QK: usize = 256;
     assert_eq!(output.len(), blocks.len() * QK);
     for (i, blk) in blocks.iter().enumerate() {
@@ -219,7 +224,8 @@ pub fn dequantize_row_q5_k(blocks: &[BlockQ5K], output: &mut [f32]) {
         let mut is = 0usize;
         let mut ql_offset = 0usize;
         let mut y_offset = 0usize;
-        let mut qh_offset = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
         for _j in 0..QK / 64 {
             let (sc0, m0) = get_scale_min_k4(is, &blk.scales);
             let d1 = d * sc0 as f32;
@@ -228,19 +234,18 @@ pub fn dequantize_row_q5_k(blocks: &[BlockQ5K], output: &mut [f32]) {
             let d2 = d * sc1 as f32;
             let m2 = dmin * m1v as f32;
             for l in 0..32 {
-                let hbit = (qh[qh_offset + l] >> (is % 4)) & 1;
-                y[y_offset + l] = d1 * ((ql[ql_offset + l] & 0xF) | (hbit << 4)) as f32 - m1;
+                let h = if qh[l] & u1 != 0 { 16.0f32 } else { 0.0 };
+                y[y_offset + l] = d1 * ((ql[ql_offset + l] & 0xF) as f32 + h) - m1;
             }
             for l in 0..32 {
-                let hbit = (qh[qh_offset + l] >> ((is + 1) % 4)) & 1;
-                y[y_offset + 32 + l] = d2 * ((ql[ql_offset + l] >> 4) | (hbit << 4)) as f32 - m2;
+                let h = if qh[l] & u2 != 0 { 16.0f32 } else { 0.0 };
+                y[y_offset + 32 + l] = d2 * ((ql[ql_offset + l] >> 4) as f32 + h) - m2;
             }
             ql_offset += 32;
             y_offset += 64;
             is += 2;
-            if is == 4 {
-                qh_offset += 32;
-            }
+            u1 <<= 2;
+            u2 <<= 2;
         }
     }
 }
@@ -1347,7 +1352,11 @@ mod kani_proofs {
     #[kani::proof]
     fn dequant_q4_0_no_panic() {
         let blk = BlockQ4_0 {
-            d: kani::any(),
+            // Concrete f16 scale (1.0): a symbolic u16 index into the 65536-entry
+            // f16_to_f32 table made this family cost 12-20 GB of SAT (found
+            // 2026-11-05). Arbitrary-scale decode has f16_to_f32_no_panic;
+            // the payload stays fully symbolic (the indexing safety here).
+            d: 0x3C00,
             qs: kani::any(),
         };
         let mut out = [0.0f32; 32];
@@ -1357,7 +1366,13 @@ mod kani_proofs {
     #[kani::proof]
     fn dequant_q8_0_no_panic() {
         let blk = BlockQ8_0 {
-            d: kani::any(),
+            // Concrete scale (f16 1.0): a symbolic u16 index into the
+            // 65536-entry f16_to_f32 table is what made this family cost
+            // 12-20 GB of SAT (found 2026-11-05). The decode of arbitrary
+            // scale bits has its own harness (f16_to_f32_no_panic); here the
+            // quantized payload stays fully symbolic, which is the indexing
+            // safety this harness exists for.
+            d: 0x3C00,
             qs: kani::any(),
         };
         let mut out = [0.0f32; 32];
@@ -1367,8 +1382,12 @@ mod kani_proofs {
     #[kani::proof]
     fn dequant_q4k_no_panic() {
         let blk = BlockQ4K {
-            d: kani::any(),
-            dmin: kani::any(),
+            // Concrete f16 scale (1.0): a symbolic u16 index into the 65536-entry
+            // f16_to_f32 table made this family cost 12-20 GB of SAT (found
+            // 2026-11-05). Arbitrary-scale decode has f16_to_f32_no_panic;
+            // the payload stays fully symbolic (the indexing safety here).
+            d: 0x3C00,
+            dmin: 0x3C00,
             scales: kani::any(),
             qs: kani::any(),
         };
@@ -1379,10 +1398,14 @@ mod kani_proofs {
     #[kani::proof]
     fn dequant_q6k_no_panic() {
         let blk = BlockQ6K {
+            // Concrete f16 scale (1.0): a symbolic u16 index into the 65536-entry
+            // f16_to_f32 table made this family cost 12-20 GB of SAT (found
+            // 2026-11-05). Arbitrary-scale decode has f16_to_f32_no_panic;
+            // the payload stays fully symbolic (the indexing safety here).
             ql: kani::any(),
             qh: kani::any(),
             scales: kani::any(),
-            d: kani::any(),
+            d: 0x3C00,
         };
         let mut out = [0.0f32; 256];
         dequantize_row_q6_k(&[blk], &mut out);
@@ -1391,8 +1414,12 @@ mod kani_proofs {
     #[kani::proof]
     fn dequant_tq2_0_no_panic() {
         let blk = BlockTQ2_0 {
+            // Concrete f16 scale (1.0): a symbolic u16 index into the 65536-entry
+            // f16_to_f32 table made this family cost 12-20 GB of SAT (found
+            // 2026-11-05). Arbitrary-scale decode has f16_to_f32_no_panic;
+            // the payload stays fully symbolic (the indexing safety here).
             qs: kani::any(),
-            d: kani::any(),
+            d: 0x3C00,
         };
         let mut out = [0.0f32; 256];
         dequantize_row_tq2_0(&[blk], &mut out);
@@ -1437,8 +1464,12 @@ mod kani_proofs {
     #[kani::unwind(17)]
     fn dequant_q4_1_no_panic() {
         let blk = BlockQ4_1 {
-            d: kani::any(),
-            m: kani::any(),
+            // Concrete f16 scale (1.0): a symbolic u16 index into the 65536-entry
+            // f16_to_f32 table made this family cost 12-20 GB of SAT (found
+            // 2026-11-05). Arbitrary-scale decode has f16_to_f32_no_panic;
+            // the payload stays fully symbolic (the indexing safety here).
+            d: 0x3C00,
+            m: 0x3C00,
             qs: kani::any(),
         };
         let mut out = [0.0f32; 32];
@@ -1449,7 +1480,11 @@ mod kani_proofs {
     #[kani::unwind(17)]
     fn dequant_q5_0_no_panic() {
         let blk = BlockQ5_0 {
-            d: kani::any(),
+            // Concrete f16 scale (1.0): a symbolic u16 index into the 65536-entry
+            // f16_to_f32 table made this family cost 12-20 GB of SAT (found
+            // 2026-11-05). Arbitrary-scale decode has f16_to_f32_no_panic;
+            // the payload stays fully symbolic (the indexing safety here).
+            d: 0x3C00,
             qh: kani::any(),
             qs: kani::any(),
         };
@@ -1475,8 +1510,12 @@ mod kani_proofs {
     #[kani::unwind(17)]
     fn dequant_q5_1_no_panic() {
         let blk = BlockQ5_1 {
-            d: kani::any(),
-            m: kani::any(),
+            // Concrete f16 scale (1.0): a symbolic u16 index into the 65536-entry
+            // f16_to_f32 table made this family cost 12-20 GB of SAT (found
+            // 2026-11-05). Arbitrary-scale decode has f16_to_f32_no_panic;
+            // the payload stays fully symbolic (the indexing safety here).
+            d: 0x3C00,
+            m: 0x3C00,
             qh: kani::any(),
             qs: kani::any(),
         };
@@ -1517,10 +1556,14 @@ mod kani_proofs {
     #[kani::unwind(17)]
     fn dequant_q2k_no_panic() {
         let blk = BlockQ2K {
+            // Concrete f16 scale (1.0): a symbolic u16 index into the 65536-entry
+            // f16_to_f32 table made this family cost 12-20 GB of SAT (found
+            // 2026-11-05). Arbitrary-scale decode has f16_to_f32_no_panic;
+            // the payload stays fully symbolic (the indexing safety here).
             scales: kani::any(),
             qs: kani::any(),
-            d: kani::any(),
-            dmin: kani::any(),
+            d: 0x3C00,
+            dmin: 0x3C00,
         };
         let mut out = [0.0f32; 256];
         dequantize_row_q2_k(&[blk], &mut out);
@@ -1530,10 +1573,14 @@ mod kani_proofs {
     #[kani::unwind(257)]
     fn dequant_q3k_no_panic() {
         let blk = BlockQ3K {
+            // Concrete f16 scale (1.0): a symbolic u16 index into the 65536-entry
+            // f16_to_f32 table made this family cost 12-20 GB of SAT (found
+            // 2026-11-05). Arbitrary-scale decode has f16_to_f32_no_panic;
+            // the payload stays fully symbolic (the indexing safety here).
             hmask: kani::any(),
             qs: kani::any(),
             scales: kani::any(),
-            d: kani::any(),
+            d: 0x3C00,
         };
         let mut out = [0.0f32; 256];
         dequantize_row_q3_k(&[blk], &mut out);
@@ -1543,8 +1590,12 @@ mod kani_proofs {
     #[kani::unwind(33)]
     fn dequant_q5k_no_panic() {
         let blk = BlockQ5K {
-            d: kani::any(),
-            dmin: kani::any(),
+            // Concrete f16 scale (1.0): a symbolic u16 index into the 65536-entry
+            // f16_to_f32 table made this family cost 12-20 GB of SAT (found
+            // 2026-11-05). Arbitrary-scale decode has f16_to_f32_no_panic;
+            // the payload stays fully symbolic (the indexing safety here).
+            d: 0x3C00,
+            dmin: 0x3C00,
             scales: kani::any(),
             qh: kani::any(),
             qs: kani::any(),
@@ -1557,9 +1608,13 @@ mod kani_proofs {
     #[kani::unwind(49)]
     fn dequant_tq1_0_no_panic() {
         let blk = BlockTQ1_0 {
+            // Concrete f16 scale (1.0): a symbolic u16 index into the 65536-entry
+            // f16_to_f32 table made this family cost 12-20 GB of SAT (found
+            // 2026-11-05). Arbitrary-scale decode has f16_to_f32_no_panic;
+            // the payload stays fully symbolic (the indexing safety here).
             qs: kani::any(),
             qh: kani::any(),
-            d: kani::any(),
+            d: 0x3C00,
         };
         let mut out = [0.0f32; 256];
         dequantize_row_tq1_0(&[blk], &mut out);

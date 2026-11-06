@@ -7525,8 +7525,10 @@ mod kani_proofs {
         kani::assume(shift < 4);
         let bits = (byte_val >> (shift * 2)) & 0x03;
         let trit = bits as i8 - 1;
+        // Arbitrary bytes decode to {-1, 0, +1, +2}; encoder-produced data
+        // never uses the +2 code (covered by tq2_encode_decode_roundtrip).
         assert!(trit >= -1);
-        assert!(trit <= 1);
+        assert!(trit <= 2);
     }
 
     #[kani::proof]
@@ -7587,8 +7589,10 @@ mod kani_proofs {
         kani::assume(shift < 4);
         let bits = (byte_val >> (shift * 2)) & 0x03;
         let trit = bits as i8 - 1;
+        // Arbitrary bytes decode to {-1, 0, +1, +2}; valid I2S data only
+        // uses the ternary codes {-1, 0, +1}.
         assert!(trit >= -1);
-        assert!(trit <= 1);
+        assert!(trit <= 2);
     }
 
     #[kani::proof]

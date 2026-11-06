@@ -26,6 +26,7 @@ pub mod cutile_matmul;
 pub mod cutile_matmul_host;
 #[cfg(feature = "cutile")]
 pub mod cutile_quantized_gemm;
+pub mod gpu_block_layout;
 pub mod gpu_capabilities;
 /// Pure split-K decode-attention scheduling math (ungated: Kani-verified).
 pub mod decode_attn_splitk;

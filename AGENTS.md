@@ -150,7 +150,7 @@ docs/ (Zola site, deployed by .github/workflows/pages.yml)
   (`system_fingerprint`, `owned_by`, OTel `service.name`) are `tempura`.
 
 - **verus-verified/** (standalone, own `rust-toolchain.toml`, stable 1.96.0) —
-  deductive proofs for ALL inputs. 80 modules, 588 proof functions. Re-declares
+  deductive proofs for ALL inputs. 81 modules, 600 proof functions. Re-declares
   critical structures in `verus!{}` blocks with specs; proves indexing safety,
   struct invariants, state machines, GQA mapping, causal masking, tensor
   parallel sharding, FP8/f16 encodings, BitNet TQ2/I2S packing roundtrips,
@@ -1011,6 +1011,73 @@ typical-p/repeat/presence/frequency)
       (engine-side LoraRegistry only — now in_progress), and
       p22-radix-attention was a corrupted entry claiming done+pending
       (hash-based prefix cache only — now pending/0).
+- [x] **Kani suite made actually runnable + 3 real bugs found (2026-11-05,
+      local install of Kani 0.67.0 + rustup; CI's job had been silently red
+      since 2026-06-15 because the gemm->pulp dep contains global ASM --
+      fixed with -Z unstable-options --ignore-global-asm in kani.yml).**
+      Bugs found by the now-running harnesses:
+      1. **dequantize_row_q5_k had a REAL out-of-bounds**: the translation
+         advanced qh_offset by 32 when is==4 and read qh[32..64] on the
+         32-byte qh array -- any Q5_K model would panic at dequant (the
+         path was never exercised: no Q5K cross-validation vectors, no Q5K
+         model tests). Rewritten C-faithfully (u1/u2 bit masks shifting
+         left 2 per 64-group, llama.cpp ggml-quants.c:1741). The Q5K
+         vec_dot was always correct (different code path).
+      2. **Tl2Config::for_dims accepted odd k**, but the two-LUT packing is
+         pair-based (two_n = m*two_k/2): odd two_k (= k%96) with odd m
+         silently truncates the last weight column. for_dims now rejects
+         odd k (all real BitNet dims are even).
+      3. Three harnesses used symbolic-length Vec allocation (allreduce,
+         speculative x2) -- CBMC unwinds allocation internals without
+         bound (2h / 10GB+ each). Rewritten with concrete lengths.
+      Plus: Kani 0.67/CBMC 6.8 FALSE POSITIVE confirmed with a minimal
+      probe -- the inserted nan-check reports "NaN on division" for
+      1.0/(1.0 + f32::INFINITY) (IEEE: 1/+inf = 0). Affects any harness
+      whose math divides by a saturating denominator (gelu_quick bounded
+      to the polynomial range; fused_sqrelu bounded so the square stays
+      finite). Same class: the full-block dequant_*_no_panic family used a
+      symbolic u16 f16 scale -- a symbolic index into the 65536-entry
+      f16_to_f32 table -- costing 12-20 GB of SAT per harness; the scales
+      are now concrete (f16 1.0) with the payload fully symbolic (the
+      indexing safety these harnesses exist for), bringing each from
+      OOM/15min to 1-46s. The arbitrary-scale decode itself is covered by
+      f16_to_f32_no_panic. Harness bug fixes: tq2/i2s/tl2 trit-range
+      assertions claimed <= 1 but the decode of arbitrary bytes yields
+      {-1,0,1,2} (encoder data is ternary -- covered by the roundtrip
+      harnesses); q8_0_quant_in_range / tl2_per_tensor_quant_positive
+      allowed subnormal amax (127/subnormal overflows to inf; production
+      safe via saturating casts); kani_no_double_coverage evaluated s+1 on
+      an unconstrained u32 (overflow before the assume). 11 harnesses in
+      cutile_quantized_gemm.rs were behind the cutile feature gate and had
+      NEVER run anywhere (cargo kani is featureless) -- the pure host-side
+      block layout/dequant helpers moved to the ungated
+      kernels/src/gpu_block_layout.rs (single definition, re-imported by
+      the gated module). alibi_slopes_* and adaptive_p Kani harnesses
+      (powf / exp-ln chains -- CBMC bit-blasts float transcendentals)
+      converted to unit tests per the float-property convention.
+      Local driver: /tmp/opencode/kani-batched.sh-style per-harness runs
+      with ulimit + timeout (one exploding harness must not OOM the host).
+      Second round (2026-11-06, full-suite drive to 198/220 then the rest):
+      4. moe.rs kani_proofs was NESTED inside #[cfg(test)] mod tests --
+         compiled out for cargo kani (which builds without cfg(test)), so
+         the 4 router/softmax harnesses had never run anywhere. Unwedged,
+         they revealed route() is softmax+Vec (unverifiable in Kani) --
+         now a randomized unit test (router_properties_random).
+      5. kani_splits_tile_exactly assertion was over-strong: trailing
+         splits normalize to the EMPTY range (t0,t0) with t0 > kv_len --
+         safe (identity partial), but "t1 <= kv_len" fails; the invariant
+         is "within [0,kv_len] OR empty".
+      6. q8_k_bsums_partition had a SYMBOLIC loop bound (nb = k/16 from
+         kani::any k) -- CBMC unwound 5000+ iterations for a 16-trip loop;
+         #[kani::unwind(20)] fixed it (15 min -> 0.15 s). Same lesson as
+         the symbolic-length Vec bombs: bound loops explicitly.
+      7. f16_to_f32_finite_for_normal: symbolic u16 index into the 64K
+         table -> exhaustive unit test over all 65536 bits (stronger).
+      8. The 9 sampler/norm full-execution harnesses (dry, xtc, typical,
+         mirostat_v2, repetition_penalty x2, sampler/layernorm/rmsnorm
+         full_execution) -- exp/ln/powf + Vec, several with symbolic-length
+         Vecs -- converted to randomized/exhaustive unit tests per the
+         float-property convention.
 - [x] **NVFP4 complete on CPU (2026-11-04)** — was "enum + block size
       only" per the stale note; the reality was worse: partially translated
       paths with THREE divergent UE4M3 decoders and four real bugs, all
@@ -1063,8 +1130,23 @@ cargo build              # build all workspace crates
                          # AVX-512 SIGILL, hosts with it get the full set
                          # from native anyway)
 cargo test               # 907 test functions (26 ignored)
-cargo kani --package tempura-kernels   # 240 Kani harnesses (kernels+engine)
-./scripts/run-verus.sh   # 588 Verus proof functions, 80 modules
+                         # NOTE: `cargo test --workspace` needs the CUDA
+                         # toolkit on this host (bench-gpu, a workspace
+                         # member, defaults to the cutile feature); on
+                         # CPU-only hosts use --exclude tempura-bench-gpu
+cargo kani --package tempura-kernels -Z unstable-options --ignore-global-asm
+                         # 248 Kani harnesses (kernels+engine). The flag is
+                         # REQUIRED: the gemm->pulp dep contains global ASM
+                         # that Kani 0.67 cannot compile (without it the
+                         # job fails -- CI was silently red on this from
+                         # 2026-06-15 until fixed 2026-11-05). Kani 0.67.0
+                         # (matches CI) + rustup must be installed: the
+                         # Fedora system rustc has no rustup, and cargo kani
+                         # setup needs one (rustup default = 1.99.1 to match
+                         # the system toolchain; the repo's
+                         # rust-toolchain.toml nightly-2026-04-03 is for
+                         # cargo oxide only)
+./scripts/run-verus.sh   # 600 Verus proof functions, 81 modules
 cargo run -p tempura -- --help   # CLI: serve, pull, list, inspect
 cargo run -p tempura -- serve --model /path/to/model.gguf --port 8080
 ```
@@ -1293,20 +1375,21 @@ Kani 0.67.0 runs in CI on every PR and push (`.github/workflows/kani.yml`).
 | **Drift detection** | Struct field / function name sync | `run-verus.sh` script | Automatic on every Verus run |
 | **C cross-validation** | Bit-exact match vs llama.cpp output | `tests-ggml/` vectors | ggml translation fidelity |
 
-### Coverage Summary (2026-10-26, machine-counted)
+### Coverage Summary (2026-11-05, machine-counted)
 
-**Kani:** 240 `#[kani::proof]` harnesses across kernels/ and engine/ —
+**Kani:** 248 `#[kani::proof]` harnesses across kernels/ and engine/ —
 attention, RMSNorm, RoPE, matmul, sampling, turboquant, quantized
-(Q4K/Q5K/Q6K/Q2_0/TQ2/I2S/MXFP4 E2M1/UE8M0), KV cache (plain/paged/fp8),
+(Q4K/Q5K/Q6K/Q2_0/TQ2/I2S/MXFP4 E2M1/UE8M0/NVFP4 UE4M3), KV cache (plain/paged/fp8),
 model, speculative, disaggregated, weights, GGUF, GPU dispatch (grid dims,
 buffer sizes, batch graph eligibility), tl2 LUT, deltanet, MoE, fused,
 guided, ggml ops/repack/vec_dot/dequantize/quantize.
 
-**Verus:** 80 modules, 588 proof functions — indexing safety for all Kani
+**Verus:** 81 modules, 600 proof functions — indexing safety for all Kani
 harnesses that generalize (pure integer/bit), plus struct invariants, loop
 proofs, state machines, GPU kernel decomposition, GQA head mapping, tensor
 parallel sharding, causal masking, flash attention tiles, FP8/f16 encoding,
-BitNet TQ2/I2S packing, MXFP4 bounds, end-to-end pipeline composition, and
+BitNet TQ2/I2S packing, MXFP4 bounds, NVFP4 UE4M3 encode/decode + split
+layout, end-to-end pipeline composition, and
 weight shape validation.
 
 **Property tests:** float-specific harnesses (e.g. `head_dim_scale_never_zero_division`,

@@ -465,6 +465,10 @@ mod kani_proofs {
         let amax: f32 = kani::any();
         kani::assume(val.is_finite() && amax.is_finite());
         kani::assume(amax > 0.0 && amax <= 1e6);
+        // Subnormal amax makes 1/(amax/127) overflow to inf (val * inf);
+        // production is safe because the `as i8` cast saturates. Keep the
+        // domain in the realistic range (float-edge found by Kani).
+        kani::assume(amax >= 1e-30);
         kani::assume(val.abs() <= amax);
         let d = amax / 127.0;
         let id = 1.0 / d;
@@ -473,6 +477,9 @@ mod kani_proofs {
     }
 
     #[kani::proof]
+    // nb = k/16 is symbolic, so the loop bound is symbolic: without an
+    // explicit unwind CBMC unwinds past 5000 iterations (found 2026-11-05).
+    #[kani::unwind(20)]
     fn q8_k_bsums_partition() {
         let k: usize = kani::any();
         kani::assume(k < 256 && k % 16 == 0);
@@ -512,13 +519,14 @@ mod kani_proofs {
 
     #[kani::proof]
     fn ue4m3_encode_no_panic() {
+        use super::super::helpers::f32_to_ue4m3;
         let x: f32 = kani::any();
         let b = f32_to_ue4m3(x);
         assert!(b <= 0x7E);
     }
 
     #[kani::proof]
-    #[kani::unwind(12)]
+    #[kani::unwind(70)]
     fn nvfp4_quantize_no_panic() {
         let src: [f32; 64] = kani::any();
         for v in src.iter() {
