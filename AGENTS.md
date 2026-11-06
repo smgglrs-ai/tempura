@@ -660,8 +660,9 @@ typical-p/repeat/presence/frequency)
           paths. Open work.
       (c) [x] **Self-consistency generation** (GSM8K-style):
           bench-selfconsistency (tools/bench-gpu/src/bench_selfconsistency.rs,
-          2026-11-04). K samples per problem at T=0.7 (seeded, deterministic
-          per sample: sample k uses base_seed+k), answer extraction
+          2026-11-04; REFERENCE RUN 2026-11-06 on fishtank). K samples per
+          problem at T=0.7 (seeded, deterministic per sample: sample k uses
+          base_seed+k), answer extraction
           (engine/src/eval.rs extract_answer: "Answer:"/"answer is"/"####"
           markers, last-number fallback, char-boundary-safe for non-ASCII
           completions) + majority() vote (canonical per-f64 number format so
@@ -672,7 +673,14 @@ typical-p/repeat/presence/frequency)
           at ~/.cache/tempura/eval/gsm8k/gsm8k_sample.jsonl, built by
           scripts/prep-gsm8k.sh (source: openai/grade-school-math GitHub).
           Knobs: TEMPURA_SC_PROBLEMS/_SAMPLES/_MAX_TOKENS/_SEED/_MAX_GAP,
-          TEMPURA_SC_NO_GPU. bench-gpu now has a default-on `cutile` feature
+          TEMPURA_SC_NO_GPU. RESULT (2026-11-06, Llama-3.1-8B Q4_K_M,
+          102 problems x 5 samples, T=0.7): tempura GPU 63.7%,
+          llama.cpp (CPU llama-server arbiter) 52.0% -- gap 11.8 pts,
+          PASS at the 15-pt gate (tempura AHEAD of the reference).
+          llama phase ~2.6 h at ~10 tok/s CPU decode; report at
+          bench-selfconsistency.json. Self-consistency voting behaves as
+          designed: no repetition-loop pathology, coherent multi-sample
+          agreement on arithmetic. bench-gpu now has a default-on `cutile` feature
           so CPU-only hosts build with `cargo build -p tempura-bench-gpu
           --release --no-default-features --bin bench-selfconsistency` (the
           CUDA toolkit was previously required to build the crate at all;

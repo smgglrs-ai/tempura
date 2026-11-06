@@ -349,7 +349,9 @@ fn main() {
     if !gpu_acc.is_nan() && !llama_acc.is_nan() {
         let gap = (gpu_acc - llama_acc).abs();
         println!(
-            "  GPU {gpu_acc:.1}% vs llama {llama_acc:.1}% (gap {:.1} pts, gate {:.0})",
+            "  GPU {:.1}% vs llama {:.1}% (gap {:.1} pts, gate {:.0})",
+            gpu_acc * 100.0,
+            llama_acc * 100.0,
             gap * 100.0,
             max_gap * 100.0
         );
@@ -357,7 +359,7 @@ fn main() {
     }
     if !gpu_acc.is_nan() && !cpu_acc.is_nan() {
         let gap = (gpu_acc - cpu_acc).abs();
-        println!("  GPU {gpu_acc:.1}% vs CPU {cpu_acc:.1}% (gap {:.1} pts)", gap * 100.0);
+        println!("  GPU {:.1}% vs CPU {:.1}% (gap {:.1} pts)", gpu_acc * 100.0, cpu_acc * 100.0, gap * 100.0);
         passed &= gap <= max_gap;
     }
     println!(
