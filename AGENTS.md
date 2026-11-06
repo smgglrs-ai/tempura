@@ -604,6 +604,16 @@ typical-p/repeat/presence/frequency)
             sharp (top 11-17, was ~7 flat). Performance unchanged:
             decode 219 tok/s, prefill 7575 tok/s, det=OK, NaN-free
             (bench-real-model fingerprints re-baselined 2026-10-30).
+          * MULTI-MODEL (d) started 2026-11-06: Mistral-7B-Instruct-v0.3
+            Q4_K_M (llama-family arch, SPM tokenizer): tempura CPU 5.96,
+            GPU 5.98, llama.cpp 5.96 -- GPU/CPU 1.0034, PASS (better
+            than Llama-3.1's 1.09; report bench-perplexity-mistral7b.json).
+            Found + fixed on the way: the GGUF SPM tokenizer was built
+            as HF BPE-without-merges (every char -> byte fallback;
+            Mistral ppl was 8641) and HF Unigram is NOT equivalent to
+            llama.cpp's greedy merge -- engine/src/spm_tokenizer.rs is
+            now an exact port (verified: 328880/328880 tokens, ZERO
+            divergence vs llama.cpp on the full WikiText-2 corpus).
           * The 1-2-token logit probes, the K-cache byte diff, and the
             repeated-token rope-angle extraction (recovered the unroped
             vector from a 1-token probe, read off exact per-(position,
