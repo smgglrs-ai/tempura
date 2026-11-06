@@ -504,20 +504,7 @@ mod kani_proofs {
         assert!(start + hidden_size <= x_len);
     }
 
-    #[kani::proof]
-    #[kani::unwind(5)]
-    fn rmsnorm_full_execution_no_panic() {
-        let hidden_size: usize = kani::any();
-        kani::assume(hidden_size >= 1 && hidden_size <= 4);
-
-        let mut x = vec![1.0f32; hidden_size];
-        let weight = vec![1.0f32; hidden_size];
-        let eps = 1e-6f32;
-
-        let rn = super::CpuRMSNorm;
-        let result = rn.forward(&mut x, &weight, hidden_size, eps);
-        assert!(result.is_ok());
-    }
+    // rmsnorm_full_execution_no_panic: removed 2026-11-05 -- symbolic-length Vec allocation + transcendental math; runs as the unit test below
 
     #[kani::proof]
     fn gpu_rmsnorm_pass_indices_in_bounds() {
@@ -552,6 +539,20 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rmsnorm_full_execution_no_panic_sizes() {
+        // Replaces the rmsnorm_full_execution_no_panic Kani harness (see
+        // the note in kani_proofs): symbolic-length Vec allocation +
+        // sqrt are bit-blasted by CBMC without bound.
+        for hidden_size in [1usize, 2, 3, 4] {
+            let mut x = vec![1.0f32; hidden_size];
+            let weight = vec![1.0f32; hidden_size];
+            let rn = super::CpuRMSNorm;
+            let result = rn.forward(&mut x, &weight, hidden_size, 1e-6);
+            assert!(result.is_ok(), "hidden_size {hidden_size}");
+        }
+    }
     use approx::assert_relative_eq;
 
     #[test]

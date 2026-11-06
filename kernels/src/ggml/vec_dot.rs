@@ -1481,12 +1481,16 @@ mod kani_proofs {
     #[kani::proof]
     #[kani::unwind(17)]
     fn vec_dot_q4_0_q8_0_no_panic() {
+        // Concrete f16 scales (1.0): a symbolic u16 index into the
+        // 65536-entry f16_to_f32 table made this family cost 12-20 GB of
+        // SAT (found 2026-11-05; see the dequant_*_no_panic note). The
+        // payloads stay fully symbolic.
         let x = BlockQ4_0 {
-            d: kani::any(),
+            d: 0x3C00,
             qs: kani::any(),
         };
         let y = BlockQ8_0 {
-            d: kani::any(),
+            d: 0x3C00,
             qs: kani::any(),
         };
         let _ = vec_dot_q4_0_q8_0(32, &[x], &[y]);
@@ -1496,11 +1500,11 @@ mod kani_proofs {
     #[kani::unwind(33)]
     fn vec_dot_q8_0_q8_0_no_panic() {
         let x = BlockQ8_0 {
-            d: kani::any(),
+            d: 0x3C00,
             qs: kani::any(),
         };
         let y = BlockQ8_0 {
-            d: kani::any(),
+            d: 0x3C00,
             qs: kani::any(),
         };
         let _ = vec_dot_q8_0_q8_0(32, &[x], &[y]);
@@ -1511,10 +1515,10 @@ mod kani_proofs {
     fn vec_dot_tq2_0_q8_k_no_panic() {
         let x = BlockTQ2_0 {
             qs: kani::any(),
-            d: kani::any(),
+            d: 0x3C00,
         };
         let y = BlockQ8K {
-            d: kani::any(),
+            d: 0.5, // f32 super-block scale (Q8K d is f32, not f16)
             qs: kani::any(),
             bsums: kani::any(),
         };

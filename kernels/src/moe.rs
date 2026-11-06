@@ -151,6 +151,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn router_properties_random() {
+        // Replaces the four moe Kani harnesses (see the note in
+        // kani_proofs): route() is softmax + Vec allocation, which CBMC
+        // cannot bound; the same properties run here, randomized.
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..200 {
+            let n_experts = rng.random_range(1usize..=8);
+            let n_used = rng.random_range(1usize..=n_experts);
+            let router = MoeRouter::new(n_experts, n_used);
+            let logits: Vec<f32> = (0..n_experts)
+                .map(|_| rng.random_range(-10.0f32..10.0))
+                .collect();
+            let results = router.route(&logits, 1).unwrap();
+            let r = &results[0];
+            assert_eq!(r.expert_indices.len(), n_used);
+            assert_eq!(r.expert_weights.len(), n_used);
+            for &idx in &r.expert_indices {
+                assert!(idx < n_experts, "idx {idx} >= {n_experts}");
+            }
+            let mut sum = 0.0f32;
+            for &w in &r.expert_weights {
+                assert!(w >= 0.0, "negative weight {w}");
+                sum += w;
+            }
+            assert!((sum - 1.0).abs() < 1e-4, "weights sum {sum}");
+        }
+    }
+
+    #[test]
     fn test_softmax_basic() {
         let v = softmax(&[1.0, 2.0, 3.0]);
         assert_eq!(v.len(), 3);
@@ -307,96 +338,18 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[cfg(kani)]
-    mod kani_proofs {
-        use super::*;
+}
 
-        #[kani::proof]
-        #[kani::unwind(10)]
-        fn router_indices_in_bounds() {
-            let n_experts: usize = kani::any();
-            let n_used: usize = kani::any();
-            kani::assume(n_experts >= 1 && n_experts <= 8);
-            kani::assume(n_used >= 1 && n_used <= n_experts);
 
-            let router = MoeRouter::new(n_experts, n_used);
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
 
-            let mut logits = [0.0f32; 8];
-            for i in 0..n_experts {
-                logits[i] = kani::any();
-                kani::assume(logits[i].is_finite());
-            }
-
-            let results = router.route(&logits[..n_experts], 1).unwrap();
-            let r = &results[0];
-
-            assert_eq!(r.expert_indices.len(), n_used);
-            assert_eq!(r.expert_weights.len(), n_used);
-
-            for &idx in &r.expert_indices {
-                assert!(idx < n_experts);
-            }
-        }
-
-        #[kani::proof]
-        #[kani::unwind(10)]
-        fn router_weights_non_negative() {
-            let n_experts: usize = kani::any();
-            let n_used: usize = kani::any();
-            kani::assume(n_experts >= 1 && n_experts <= 4);
-            kani::assume(n_used >= 1 && n_used <= n_experts);
-
-            let router = MoeRouter::new(n_experts, n_used);
-
-            let mut logits = [0.0f32; 4];
-            for i in 0..n_experts {
-                logits[i] = kani::any();
-                kani::assume(logits[i].is_finite());
-                kani::assume(logits[i] >= -100.0 && logits[i] <= 100.0);
-            }
-
-            let results = router.route(&logits[..n_experts], 1).unwrap();
-            for w in &results[0].expert_weights {
-                assert!(*w >= 0.0);
-            }
-        }
-
-        #[kani::proof]
-        #[kani::unwind(10)]
-        fn router_weights_sum_to_one() {
-            let n_experts: usize = kani::any();
-            let n_used: usize = kani::any();
-            kani::assume(n_experts >= 1 && n_experts <= 4);
-            kani::assume(n_used >= 1 && n_used <= n_experts);
-
-            let router = MoeRouter::new(n_experts, n_used);
-
-            let mut logits = [0.0f32; 4];
-            for i in 0..n_experts {
-                logits[i] = kani::any();
-                kani::assume(logits[i].is_finite());
-                kani::assume(logits[i] >= -10.0 && logits[i] <= 10.0);
-            }
-
-            let results = router.route(&logits[..n_experts], 1).unwrap();
-            let sum: f32 = results[0].expert_weights.iter().sum();
-            assert!(
-                (sum - 1.0).abs() < 1e-4,
-                "weights sum = {sum}, expected ~1.0"
-            );
-        }
-
-        #[kani::proof]
-        #[kani::unwind(6)]
-        fn softmax_no_panic() {
-            let mut arr = [0.0f32; 4];
-            for i in 0..4 {
-                arr[i] = kani::any();
-                kani::assume(arr[i].is_finite());
-                kani::assume(arr[i] >= -100.0 && arr[i] <= 100.0);
-            }
-            let result = softmax(&arr);
-            assert_eq!(result.len(), 4);
-        }
-    }
+    // router_indices_in_bounds / router_weights_non_negative /
+    // router_weights_sum_to_one / softmax_no_panic were Kani harnesses
+    // until 2026-11-05 -- and never ran: the module was nested inside
+    // #[cfg(test)] (compiled out for cargo kani). Once unwedged they OOM'd:
+    // route() is softmax (exp) + Vec allocation, both of which CBMC
+    // bit-blasts without bound. The properties run as the randomized unit
+    // test router_properties_random below.
 }

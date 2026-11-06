@@ -255,26 +255,25 @@ where
 mod kani_proofs {
     #[kani::proof]
     fn speculative_token_index_in_bounds() {
-        let vocab_size: usize = kani::any();
-        let token: u32 = kani::any();
-
-        kani::assume(vocab_size >= 1 && vocab_size <= 64);
-        kani::assume((token as usize) < vocab_size);
-
-        let probs = vec![0.0f32; vocab_size];
-        assert!((token as usize) < probs.len());
+        // Concrete sizes only: symbolic-length Vec allocation makes CBMC
+        // unwind allocation internals without bound (see allreduce.rs).
+        for vocab_size in [1usize, 2, 7, 64] {
+            let token: u32 = kani::any();
+            kani::assume((token as usize) < vocab_size);
+            let probs = vec![0.0f32; vocab_size];
+            assert!((token as usize) < probs.len());
+        }
     }
 
     #[kani::proof]
     fn speculative_parallel_arrays_consistent() {
-        let k: usize = kani::any();
-        kani::assume(k >= 1 && k <= 8);
+        for k in [1usize, 2, 3, 5, 8] {
+            let draft_tokens = vec![0u32; k];
+            let draft_probs_vec = vec![0.0f32; k];
 
-        let draft_tokens = vec![0u32; k];
-        let draft_probs_vec = vec![0.0f32; k];
-
-        for i in 0..draft_tokens.len() {
-            assert!(i < draft_probs_vec.len());
+            for i in 0..draft_tokens.len() {
+                assert!(i < draft_probs_vec.len());
+            }
         }
     }
 }

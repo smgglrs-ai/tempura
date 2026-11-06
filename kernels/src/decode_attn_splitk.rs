@@ -144,7 +144,10 @@ mod kani_tests {
         for s in 0..n_splits {
             let (t0, t1) = split_range(kv_len, n_splits, s);
             kani::assert(t0 <= t1, "nonnegative chunk");
-            kani::assert(t1 <= kv_len, "t1 clipped to kv_len");
+            // Trailing splits past kv_len normalise to the EMPTY range
+            // (t0, t0) with t0 > kv_len -- safe (identity partial), so the
+            // invariant is "within [0, kv_len] OR empty", not t1 <= kv_len.
+            kani::assert(t1 <= kv_len || t0 == t1, "clipped to kv_len or empty");
             total += t1 - t0;
         }
         kani::assert(total == kv_len, "exact coverage, no gaps");
@@ -159,7 +162,9 @@ mod kani_tests {
         let s: u32 = kani::any();
         kani::assume(kv_len >= 1 && kv_len <= 64);
         kani::assume(n_splits >= 2 && n_splits <= 8);
-        kani::assume(s + 1 < n_splits);
+        // Bound s BEFORE evaluating s + 1: an unconstrained u32 overflows
+        // the addition (found by Kani, 2026-11-05).
+        kani::assume(s < n_splits - 1);
         let (t0a, t1a) = split_range(kv_len, n_splits, s);
         let (t0b, t1b) = split_range(kv_len, n_splits, s + 1);
         kani::assert(t0b >= t1a, "next split starts at or after previous end");

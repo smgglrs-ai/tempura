@@ -20,7 +20,10 @@ jobs:
         run: cargo install --version ${{ env.KANI_VERSION }} --locked kani-verifier && cargo kani setup
 
       - name: Verify tempura-kernels
-        run: cargo kani --package tempura-kernels
+        run: cargo kani --package tempura-kernels -Z unstable-options --ignore-global-asm
+        # --ignore-global-asm: the `gemm` -> `pulp` dependency contains global
+        # ASM, which Kani 0.67 cannot compile; without this flag the job has
+        # been failing since gemm landed (2026-06-15).
 
       - name: Verify tempura-engine
-        run: cargo kani --package tempura-engine
+        run: cargo kani --package tempura-engine -Z unstable-options --ignore-global-asm

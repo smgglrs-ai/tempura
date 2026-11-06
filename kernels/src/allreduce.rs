@@ -46,13 +46,16 @@ impl AllReduce for CudaAllReduce {
 mod kani_proofs {
     #[kani::proof]
     fn cpu_allreduce_is_identity() {
-        let len: usize = kani::any();
-        kani::assume(len >= 1 && len <= 8);
-        let input = vec![1.0f32; len];
-        let mut output = vec![0.0f32; len];
-        output.copy_from_slice(&input);
-        for i in 0..len {
-            assert!(output[i] == input[i]);
+        // Concrete lengths only: a symbolic length makes CBMC unwind Vec
+        // allocation internals without bound (found 2026-11-05 -- this
+        // harness alone burned >10 GB RSS and 2 h CPU before being killed).
+        for len in [1usize, 2, 3, 4, 5, 6, 7, 8] {
+            let input = vec![1.0f32; len];
+            let mut output = vec![0.0f32; len];
+            output.copy_from_slice(&input);
+            for i in 0..len {
+                assert!(output[i] == input[i]);
+            }
         }
     }
 }

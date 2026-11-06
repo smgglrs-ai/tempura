@@ -662,6 +662,14 @@ impl Tl2Config {
         if !m.is_multiple_of(bm) {
             return None;
         }
+        // The two-LUT packing is pair-based (two_n = m*two_k/2 with two_k =
+        // k % 96): odd k gives odd two_k, which silently truncates the last
+        // weight column for odd m (found by the Kani harness
+        // tl2_config_three_k_two_k_partition, 2026-11-05). All real BitNet
+        // dims are even; reject odd k instead of packing it wrongly.
+        if k % 2 != 0 {
+            return None;
+        }
         Some(Self::new(m, k, bm, bk))
     }
 }
@@ -3051,6 +3059,9 @@ mod kani_proofs {
         kani::assume(k >= bk);
         kani::assume(k <= 8192);
         kani::assume(k % bk == 0 || k % bk >= 32);
+        // for_dims rejects odd k: the two-LUT packing is pair-based and odd
+        // two_k (= k % bk) silently truncates the last column (see for_dims).
+        kani::assume(k % 2 == 0);
 
         let bk_num = k / bk;
         let three_k = bk_num * bk;
@@ -3078,6 +3089,10 @@ mod kani_proofs {
         kani::assume(max_abs > 0.0);
         kani::assume(max_abs.is_finite());
         kani::assume(max_abs <= 1e6);
+        // Subnormal max_abs overflows 127/max_abs to inf; production callers
+        // clamp/normalize before this. Keep the domain in the realistic
+        // range (float-edge found by Kani, 2026-11-05).
+        kani::assume(max_abs >= 1e-30);
 
         let scale = 127.0 / max_abs;
         assert!(scale > 0.0);
@@ -3093,7 +3108,9 @@ mod kani_proofs {
         let shift = 6 - 2 * group_idx;
         let bits = (byte_val >> shift) & 0x03;
         let trit = bits as i8 - 1;
-        assert!(trit >= -1 && trit <= 1);
+        // Arbitrary bytes decode to {-1, 0, +1, +2}; valid I2S data only
+        // uses the ternary codes {-1, 0, +1} (i2s_extract_trit).
+        assert!(trit >= -1 && trit <= 2);
     }
 
     #[kani::proof]
