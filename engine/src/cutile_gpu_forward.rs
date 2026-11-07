@@ -263,7 +263,10 @@ fn f16_bits_to_f32_inline(bits: u16) -> f32 {
             e = e.wrapping_sub(1);
         }
         f &= 0x3ff;
-        let f32_exp = 127 - 15 + 1 + e;
+        // Subnormals push e below 0 (wrapping); the two's-complement sum
+        // reproduces the correct f32 exponent bits -- keep it wrapping so
+        // debug builds don't panic (Qwen2.5 imatrix scales hit this).
+        let f32_exp = 113u32.wrapping_add(e);
         f32::from_bits((sign << 31) | (f32_exp << 23) | (f << 13))
     } else if exp == 31 {
         if frac == 0 {
