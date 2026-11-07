@@ -1947,7 +1947,23 @@ where
         // -- ggml_graph_compute_thread translation --------------------------------
         // Workers dispatched ONCE for all layers; per-node SpinBarrier;
         // sequential ops (norm, attention) run on ith==0 only.
+        // Models with QKV biases (Qwen2/Phi families) fall back to the
+        // regular path: the graph-decode path does not apply them (found
+        // via Qwen2.5-7B, 2026-11-07 -- 1-token logits were bit-identical
+        // with and without the bias fix).
+        let has_qkv_bias = (0..cfg.num_layers).any(|l| {
+            qweights
+                .get_f32(&format!("model.layers.{l}.self_attn.q_proj.bias"))
+                .is_some()
+                || qweights
+                    .get_f32(&format!("model.layers.{l}.self_attn.k_proj.bias"))
+                    .is_some()
+                || qweights
+                    .get_f32(&format!("model.layers.{l}.self_attn.v_proj.bias"))
+                    .is_some()
+        });
         let can_use_graph_decode = std::env::var("TEMPURA_NO_GRAPH_DECODE").is_err()
+            && !has_qkv_bias
             && seq_len == 1
             && !cfg.parallel_attn_ffn
             && !cfg.use_layernorm
