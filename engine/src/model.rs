@@ -4786,14 +4786,20 @@ where
                         }
                     }
 
-                    if cfg.use_layernorm {
+                    // QKV biases (Qwen2/Phi families; GPT-2 also has the
+                    // o_proj bias). NOT gated on use_layernorm: RMSNorm
+                    // arches can carry them too. Added BEFORE rope and
+                    // qk-norm, matching HF (bias is part of the projection).
+                    // The v bias was previously missing entirely.
+                    {
                         let prefix = format!("model.layers.{layer}");
                         if let Some(qb) =
                             qweights.get_f32(&format!("{prefix}.self_attn.q_proj.bias"))
                         {
                             for t in 0..seq_len {
+                                let base = t * q_dim;
                                 for i in 0..q_dim {
-                                    q[t * q_dim + i] += qb[i];
+                                    q[base + i] += qb[i];
                                 }
                             }
                         }
@@ -4801,8 +4807,19 @@ where
                             qweights.get_f32(&format!("{prefix}.self_attn.k_proj.bias"))
                         {
                             for t in 0..seq_len {
+                                let base = t * kv_dim;
                                 for i in 0..kv_dim {
-                                    k[t * kv_dim + i] += kb[i];
+                                    k[base + i] += kb[i];
+                                }
+                            }
+                        }
+                        if let Some(vb) =
+                            qweights.get_f32(&format!("{prefix}.self_attn.v_proj.bias"))
+                        {
+                            for t in 0..seq_len {
+                                let base = t * kv_dim;
+                                for i in 0..kv_dim {
+                                    v[base + i] += vb[i];
                                 }
                             }
                         }
