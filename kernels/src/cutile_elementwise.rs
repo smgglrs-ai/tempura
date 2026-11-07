@@ -22,6 +22,21 @@ pub mod kernels {
         out.store(tile_a + tile_b);
     }
 
+    /// Row-broadcast bias add: out[m, n] = a[m, n] + bias[n].
+    /// `a` is [rows, N] (row-major), `bias` is [N]. In-place safe
+    /// (out == a): each program loads then stores its own row.
+    #[cutile::entry()]
+    pub fn cutile_bias_add_rows<const N: i32>(
+        out: &mut Tensor<f32, { [-1, N] }>,
+        a: &Tensor<f32, { [-1, N] }>,
+        bias: &Tensor<f32, { [N] }>,
+    ) {
+        let pid = program_id(0);
+        let tile_a = a.partition(shape![N]).load([pid]);
+        let tile_b = bias.partition(shape![N]).load([0i32]);
+        out.store(tile_a + tile_b);
+    }
+
     /// SiLU-gated MLP: out[i] = SiLU(gate[i]) * up[i]
     ///
     /// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))

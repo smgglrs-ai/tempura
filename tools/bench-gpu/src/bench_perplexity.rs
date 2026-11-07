@@ -30,7 +30,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tempura_engine::eval::{perplexity, PplOptions, PplResult};
 use tempura_engine::gguf_loader::GgufLoader;
-use tempura_engine::model::{CutileInferenceWrapper, TransformerModel};
+use tempura_engine::model::TransformerModel;
+#[cfg(feature = "cutile")]
+use tempura_engine::model::CutileInferenceWrapper;
 use tempura_engine::pipeline::KernelPipeline;
 use tempura_engine::tokenizer::Tokenizer;
 
@@ -231,12 +233,21 @@ fn main() {
     };
 
     // --- GPU model ---
-    println!("\nUploading weights to GPU...");
-    let t2 = Instant::now();
-    let qw_gpu = loader_gpu.to_quantized_weights();
-    let mut wrapper = CutileInferenceWrapper::new(config.clone());
-    wrapper.load_quantized(qw_gpu);
-    println!("  Loaded in {:.2}s", t2.elapsed().as_secs_f64());
+    // TEMPURA_PPL_NO_GPU=1 skips the GPU side (CPU-only hosts, or models
+    // whose GPU path has open gaps -- e.g. QKV biases are not yet applied
+    // on GPU, see AGENTS.md).
+    #[cfg(feature = "cutile")]
+    let mut wrapper: Option<CutileInferenceWrapper> = None;
+    #[cfg(feature = "cutile")]
+    if std::env::var("TEMPURA_PPL_NO_GPU").is_err() {
+        println!("\nUploading weights to GPU...");
+        let t2 = Instant::now();
+        let qw_gpu = loader_gpu.to_quantized_weights();
+        let mut w = CutileInferenceWrapper::new(config.clone());
+        w.load_quantized(qw_gpu);
+        println!("  Loaded in {:.2}s", t2.elapsed().as_secs_f64());
+        wrapper = Some(w);
+    }
 
     // --- CPU reference model ---
     println!("Building CPU reference model...");
@@ -279,8 +290,15 @@ fn main() {
                 idx.iter().take(5).map(|&k| (k, l[k])).collect::<Vec<_>>()
             );
         };
-        let sides: [(&str, &dyn InferenceModel); 2] =
-            [("cpu", &cpu_model), ("gpu", &wrapper)];
+        #[cfg(feature = "cutile")]
+        let sides: Vec<(&str, &dyn InferenceModel)> = if let Some(ref w) = wrapper {
+            vec![("cpu", &cpu_model as &dyn InferenceModel), ("gpu", w as &dyn InferenceModel)]
+        } else {
+            vec![("cpu", &cpu_model as &dyn InferenceModel)]
+        };
+        #[cfg(not(feature = "cutile"))]
+        let sides: Vec<(&str, &dyn InferenceModel)> =
+            vec![("cpu", &cpu_model as &dyn InferenceModel)];
         for (name, model) in sides {
             let mut s = InferenceSession::new(&config, TraceLevel::Off, 0);
             let l = model.forward(&mut s, &ids);
@@ -339,15 +357,27 @@ fn main() {
         .expect("corpus too short for one chunk");
     report_line("tempura CPU", &cpu_res);
 
-    println!("\n--- tempura GPU ---");
-    let gpu_res = perplexity(&wrapper, &config, &corpus_tokens, &opts)
-        .expect("corpus too short for one chunk");
-    report_line("tempura GPU", &gpu_res);
+    #[cfg(feature = "cutile")]
+    let gpu_res_opt = if let Some(ref wrapper) = wrapper {
+        println!("\n--- tempura GPU ---");
+        let gpu_res = perplexity(wrapper, &config, &corpus_tokens, &opts)
+            .expect("corpus too short for one chunk");
+        report_line("tempura GPU", &gpu_res);
+        Some(gpu_res)
+    } else {
+        println!("\n(tempura GPU side skipped: TEMPURA_PPL_NO_GPU=1)");
+        None
+    };
+    #[cfg(not(feature = "cutile"))]
+    let gpu_res_opt: Option<PplResult> = {
+        println!("\n(tempura GPU side skipped: built without the cutile feature)");
+        None
+    };
 
     // TEMPURA_PPL_DUMP_LOGPROBS: per-scored-position logprobs of the actual
     // next token (GPU side), one f64 per line -- diff against llama.cpp's
     // --save-all-logits log_prob block to localize divergence.
-    if let Ok(path) = std::env::var("TEMPURA_PPL_DUMP_LOGPROBS") {
+    if let (Ok(path), Some(gpu_res)) = (std::env::var("TEMPURA_PPL_DUMP_LOGPROBS"), gpu_res_opt.as_ref()) {
         std::fs::write(
             &path,
             gpu_res
@@ -391,40 +421,46 @@ fn main() {
     };
 
     // --- Comparison ---
-    let gpu_cpu_ratio = gpu_res.ppl / cpu_res.ppl;
     println!("\n--- Comparison ---");
-    println!(
-        "  tempura GPU / tempura CPU: {:.4}x  (1.00x = identical logits quality)",
-        gpu_cpu_ratio
-    );
-    if let (Some(lp), cr) = (llama_ppl, cpu_res.ppl) {
-        println!("  tempura CPU / llama.cpp:    {:.4}x", cr / lp);
-        println!("  tempura GPU / llama.cpp:    {:.4}x", gpu_res.ppl / lp);
+    let gpu_cpu_ratio = gpu_res_opt.as_ref().map(|g| g.ppl / cpu_res.ppl);
+    if let Some(r) = gpu_cpu_ratio {
+        println!(
+            "  tempura GPU / tempura CPU: {:.4}x  (1.00x = identical logits quality)",
+            r
+        );
+    }
+    if let Some(lp) = llama_ppl {
+        println!("  tempura CPU / llama.cpp:    {:.4}x", cpu_res.ppl / lp);
+        if let Some(ref g) = gpu_res_opt {
+            println!("  tempura GPU / llama.cpp:    {:.4}x", g.ppl / lp);
+        }
     }
 
-    let passed = gpu_res.nan_steps == 0
-        && cpu_res.nan_steps == 0
-        && gpu_cpu_ratio <= max_ratio
-        && gpu_cpu_ratio >= 1.0 / max_ratio;
+    let passed = cpu_res.nan_steps == 0
+        && gpu_res_opt.as_ref().map_or(true, |g| {
+            g.nan_steps == 0
+                && g.ppl / cpu_res.ppl <= max_ratio
+                && g.ppl / cpu_res.ppl >= 1.0 / max_ratio
+        });
     println!(
-        "\n--- Verdict ---\n  {} (GPU/CPU ratio {:.4} vs gate {:.2}, NaN steps: gpu {} cpu {})",
+        "\n--- Verdict ---\n  {} (GPU/CPU ratio {} vs gate {:.2}, NaN steps: gpu {} cpu {})",
         if passed { "PASS" } else { "FAIL" },
-        gpu_cpu_ratio,
+        gpu_cpu_ratio.map(|v| format!("{v:.4}")).unwrap_or_else(|| "skipped".into()),
         max_ratio,
-        gpu_res.nan_steps,
+        gpu_res_opt.as_ref().map(|g| g.nan_steps).unwrap_or(0),
         cpu_res.nan_steps,
     );
 
     let json = format!(
-        "{{\n  \"model\": {:?},\n  \"corpus\": {:?},\n  \"n_ctx\": {n_ctx},\n  \"max_chunks\": {},\n  \"cpu\": {{\"ppl\": {:.6}, \"nll\": {:.6}, \"count\": {}}},\n  \"gpu\": {{\"ppl\": {:.6}, \"nll\": {:.6}, \"count\": {}}},\n  \"llama_cpp_ppl\": {},\n  \"gpu_cpu_ratio\": {:.6},\n  \"gpu_nan_steps\": {},\n  \"passed\": {passed}\n}}\n",
+        "{{\n  \"model\": {:?},\n  \"corpus\": {:?},\n  \"n_ctx\": {n_ctx},\n  \"max_chunks\": {},\n  \"cpu\": {{\"ppl\": {:.6}, \"nll\": {:.6}, \"count\": {}}},\n  \"gpu\": {},\n  \"llama_cpp_ppl\": {},\n  \"gpu_cpu_ratio\": {},\n  \"gpu_nan_steps\": {},\n  \"passed\": {passed}\n}}\n",
         model_path.display().to_string(),
         corpus_path.display().to_string(),
         max_chunks.map(|n| n.to_string()).unwrap_or_else(|| "null".into()),
         cpu_res.ppl, cpu_res.nll, cpu_res.count,
-        gpu_res.ppl, gpu_res.nll, gpu_res.count,
+        gpu_res_opt.as_ref().map(|g| format!("{{\"ppl\": {:.6}, \"nll\": {:.6}, \"count\": {}}}", g.ppl, g.nll, g.count)).unwrap_or_else(|| "null".into()),
         llama_ppl.map(|v| format!("{v:.6}")).unwrap_or_else(|| "null".into()),
-        gpu_cpu_ratio,
-        gpu_res.nan_steps,
+        gpu_cpu_ratio.map(|v| format!("{v:.6}")).unwrap_or_else(|| "null".into()),
+        gpu_res_opt.as_ref().map(|g| g.nan_steps).unwrap_or(0),
     );
     std::fs::write("bench-perplexity.json", json)
         .expect("failed to write bench-perplexity.json");
