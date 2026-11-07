@@ -5341,6 +5341,25 @@ impl CpuMatMulQ4KOpt {
     ) -> Result<()> {
         let k = preq.k;
         let blocks_per_row = k / Q6K_BLOCK_SIZE;
+        // OOB guard: the raw-pointer loops below read n*bpr blocks with no
+        // bounds checks -- a caller passing a weight whose layout does not
+        // match (preq.k, n) segfaults deep in the AVX kernel, far from the
+        // cause (Qwen2.5 chunk-2 crash, 2026-11-07).
+        let needed = n
+            .checked_mul(blocks_per_row)
+            .and_then(|v| v.checked_mul(Q6K_BLOCK_BYTES));
+        assert!(
+            matches!(needed, Some(v) if v <= b_quantized.len()),
+            "forward_q6k_preq: weight too small: n={n} bpr={blocks_per_row} k={k} \
+             need {} bytes, have {}",
+            needed.map(|v| v.to_string()).unwrap_or_else(|| "overflow".into()),
+            b_quantized.len()
+        );
+        assert!(
+            a_f32.len() >= k,
+            "forward_q6k_preq: activations too small: k={k}, a_f32.len()={}",
+            a_f32.len()
+        );
 
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
