@@ -423,6 +423,14 @@ pub struct CutileGpuModel {
     /// Eliminates the `api::zeros.sync_on` (= full stream sync + alloc) inside
     /// `decode_attention_device` -- 28 blocked allocs per decode token become zero.
     attn_out_scratch: RefCell<Option<Arc<Tensor<f32>>>>,
+    /// Padded attn-out buffers [m, q_pad] keyed by m (decode: m=1, prefill:
+    /// m=seq_len, batch: m=batch). The pad region beyond q_dim stays zero
+    /// forever (only valid prefixes are D2D-copied in). Allocated lazily on
+    /// the eager first call and PRE-ALLOCATED at the capture sites --
+    /// cudaMallocAsync during stream capture is DriverError 900 (found via
+    /// Qwen2.5-7B, whose q_dim 3584 pads to 4096; Llama/Mistral's 4096
+    /// q_dim needs no padding and never hit this, 2026-11-07).
+    attn_pad_scratch: RefCell<std::collections::HashMap<usize, Arc<Tensor<f32>>>>,
     /// Pooled buffers for on-device prefill attention (`prefill_attention_device`):
     /// head-major Q/K/V gathers, flash output, interleaved output.  Grown on
     /// demand per (seq_pad, kv_pad); zero steady-state allocs per layer.
@@ -2219,6 +2227,7 @@ impl CutileGpuModel {
             post_attn_add_scratch: RefCell::new(post_attn_add_scratch),
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
             attn_out_scratch: RefCell::new(attn_out_scratch),
+            attn_pad_scratch: RefCell::new(std::collections::HashMap::new()),
             prefill_attn_scratch: RefCell::new(PrefillAttnScratch::default()),
             silu_out_scratch: RefCell::new(silu_out_scratch),
             prefill_pre_attn_norm_scratch: RefCell::new(prefill_pre_attn_norm_scratch),
@@ -2603,6 +2612,7 @@ impl CutileGpuModel {
             post_attn_add_scratch: RefCell::new(post_attn_add_scratch),
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
             attn_out_scratch: RefCell::new(attn_out_scratch),
+            attn_pad_scratch: RefCell::new(std::collections::HashMap::new()),
             prefill_attn_scratch: RefCell::new(PrefillAttnScratch::default()),
             silu_out_scratch: RefCell::new(silu_out_scratch),
             prefill_pre_attn_norm_scratch: RefCell::new(prefill_pre_attn_norm_scratch),
@@ -3311,6 +3321,22 @@ impl CutileGpuModel {
         self.attn_out_to_oproj_device_m(attn_out, q_dim, q_pad, 1)
     }
 
+    /// Pre-allocate the [m, q_pad] attn-out pad buffer. MUST be called
+    /// before begin_capture at every graph capture site that will run the
+    /// padding path (allocation during capture is DriverError 900).
+    fn ensure_attn_pad_buf(&self, m: usize) {
+        let mut bufs = self.attn_pad_scratch.borrow_mut();
+        if !bufs.contains_key(&m) {
+            let stream = self.matmul.stream();
+            let buf = Arc::new(
+                api::zeros::<f32>(&[m, self.q_pad])
+                    .sync_on(stream)
+                    .expect("ensure_attn_pad_buf: zeros alloc failed"),
+            );
+            bufs.insert(m, buf);
+        }
+    }
+
     fn attn_out_to_oproj_device_m(
         &self,
         attn_out: &Arc<Tensor<f32>>,
@@ -3326,12 +3352,25 @@ impl CutileGpuModel {
                 .expect("attn_out_to_oproj_device: reshape failed")
                 .into();
         }
-        // Allocate zero-filled padded buffer and D->D copy each row's valid prefix.
-        let padded: Arc<Tensor<f32>> = Arc::new(
-            api::zeros::<f32>(&[m, q_pad])
-                .sync_on(stream)
-                .expect("attn_out_to_oproj_device: zeros alloc failed"),
-        );
+        // Cached zero-filled padded buffer (pre-allocated at capture sites;
+        // lazily created here for eager first calls); D->D copy each row's
+        // valid prefix. The pad region beyond q_dim is never written and
+        // stays zero across calls.
+        let padded: Arc<Tensor<f32>> = {
+            let mut bufs = self.attn_pad_scratch.borrow_mut();
+            match bufs.get(&m) {
+                Some(buf) => buf.clone(),
+                None => {
+                    let buf = Arc::new(
+                        api::zeros::<f32>(&[m, q_pad])
+                            .sync_on(stream)
+                            .expect("attn_out_to_oproj_device: zeros alloc failed"),
+                    );
+                    bufs.insert(m, buf.clone());
+                    buf
+                }
+            }
+        };
         let src_base: CUdeviceptr = attn_out.device_pointer().cu_deviceptr();
         let dst_base: CUdeviceptr = padded.device_pointer().cu_deviceptr();
         for r in 0..m {
@@ -5181,6 +5220,9 @@ impl CutileGpuModel {
             drop(graph_cache);
         } else {
             // -- First step: capture graph, instantiate, launch ----------------
+            // Pre-allocate the attn-out pad buffer (m=1): the padding path
+            // allocates, which is illegal during capture (DriverError 900).
+            self.ensure_attn_pad_buf(1);
             let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
             unsafe {
                 stream
@@ -8118,6 +8160,9 @@ impl CutileGpuModel {
                 *self.batch_post_attn_add_scratch.borrow_mut() = Some(alloc_flat(m * h_pad));
                 *self.batch_ffn_add_scratch.borrow_mut() = Some(alloc_flat(m * h_pad));
                 *self.batch_silu_out_scratch.borrow_mut() = Some(alloc_flat(m * inter_pad));
+                // attn-out pad buffer (see ensure_attn_pad_buf): the padding
+                // path allocates, which is illegal during capture.
+                self.ensure_attn_pad_buf(m);
             }
 
             let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
@@ -8466,6 +8511,9 @@ impl CutileGpuModel {
                 *self.batch_post_attn_add_scratch.borrow_mut() = Some(alloc_flat(m * h_pad));
                 *self.batch_ffn_add_scratch.borrow_mut() = Some(alloc_flat(m * h_pad));
                 *self.batch_silu_out_scratch.borrow_mut() = Some(alloc_flat(m * inter_pad));
+                // attn-out pad buffer (see ensure_attn_pad_buf): the padding
+                // path allocates, which is illegal during capture.
+                self.ensure_attn_pad_buf(m);
             }
 
             let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
