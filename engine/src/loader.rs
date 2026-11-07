@@ -75,7 +75,10 @@ fn f16_to_f32(bits: u16) -> f32 {
             e = e.wrapping_sub(1);
         }
         f &= 0x3ff;
-        let f32_exp = 127 - 15 + 1 + e;
+        // Subnormals push e below 0 (wrapping above); two's-complement sum
+        // reproduces the correct f32 exponent bits (Qwen2.5 imatrix scales
+        // hit subnormal f16 d values).
+        let f32_exp = 113u32.wrapping_add(e);
         f32::from_bits((sign << 31) | (f32_exp << 23) | (f << 13))
     } else if exp == 31 {
         if frac == 0 {
