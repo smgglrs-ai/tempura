@@ -22,14 +22,14 @@ pub mod kernels {
         out.store(tile_a + tile_b);
     }
 
-    /// Row-broadcast bias add: out[m, n] = a[m, n] + bias[n].
-    /// `a` is [rows, N] (row-major), `bias` is [N]. In-place safe
-    /// (out == a): each program loads then stores its own row.
+    /// Row-broadcast bias add: out[row, n] = a[row, n] + bias[n].
+    /// `a` is flat row-major [rows*N], `bias` is [N]; one program per row
+    /// (pid). Same flat-tensor partition pattern as rmsnorm_fused.
     #[cutile::entry()]
     pub fn cutile_bias_add_rows<const N: i32>(
-        out: &mut Tensor<f32, { [-1, N] }>,
-        a: &Tensor<f32, { [-1, N] }>,
-        bias: &Tensor<f32, { [N] }>,
+        out: &mut Tensor<f32, { [N] }>,
+        a: &Tensor<f32, { [-1] }>,
+        bias: &Tensor<f32, { [-1] }>,
     ) {
         let pid = program_id(0);
         let tile_a = a.partition(shape![N]).load([pid]);
