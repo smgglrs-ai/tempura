@@ -782,6 +782,15 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "attn_k.weight" => "self_attn.k_proj.weight",
             "attn_v.weight" => "self_attn.v_proj.weight",
             "attn_output.weight" => "self_attn.o_proj.weight",
+            // QKV biases: Qwen2/Phi-family (and GPT-2 o_proj). Without the
+            // mapping these register under the raw GGUF name and the
+            // model.rs lookups by HF name never find them (found via
+            // Qwen2.5-7B, 2026-11-07: 1-token logit corr 0.91, argmax right,
+            // everything else noise).
+            "attn_q.bias" => "self_attn.q_proj.bias",
+            "attn_k.bias" => "self_attn.k_proj.bias",
+            "attn_v.bias" => "self_attn.v_proj.bias",
+            "attn_output.bias" => "self_attn.o_proj.bias",
             "attn_qkv.weight" => "ssm.qkv_proj.weight",
             "attn_gate.weight" => "ssm.gate_proj.weight",
             "attn_q_norm.weight" => "self_attn.q_norm.weight",
