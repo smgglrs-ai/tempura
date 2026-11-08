@@ -5283,6 +5283,26 @@ impl CpuMatMulQ4KOpt {
         let k = preq.k;
         let blocks_per_row = k / Q4K_BLOCK_SIZE;
 
+        // OOB guard (same as forward_q6k_preq): the raw-pointer loops below
+        // read n*bpr weight blocks and bpr activation blocks with no bounds
+        // checks. The q8k buffer can be empty while is_quantized() is true
+        // (it checks `q8`) -- caught via ASAN/Qwen2.5 chunk crashes.
+        assert!(
+            preq.q8k.len() >= blocks_per_row,
+            "forward_q4k_preq: preq q8k too small: k={k} bpr={blocks_per_row} q8k.len()={}",
+            preq.q8k.len()
+        );
+        let needed = n
+            .checked_mul(blocks_per_row)
+            .and_then(|v| v.checked_mul(Q4K_BLOCK_BYTES));
+        assert!(
+            matches!(needed, Some(v) if v <= b_quantized.len()),
+            "forward_q4k_preq: weight too small: n={n} bpr={blocks_per_row} k={k} \
+             need {} bytes, have {}",
+            needed.map(|v| v.to_string()).unwrap_or_else(|| "overflow".into()),
+            b_quantized.len()
+        );
+
         if preq.is_quantized() {
             use crate::ggml::blocks::{BlockQ4K, BlockQ8K};
             let bpr = blocks_per_row;
