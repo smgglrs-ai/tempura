@@ -6190,6 +6190,19 @@ impl CutileGpuModel {
             && !self.debug_nan_trace
             && prefill_device_attn
             && gpu_kv_cache.has_device_kv()
+            // cuda-oxide v0.5.0 (2026-11-08): the prefill graph is DISABLED
+            // by default. v0.5.0 moved every Allocation::drop free onto a
+            // background retirement thread with a new access-lease lifetime
+            // protocol; a deferred free failing ("Virtual address does not
+            // refer to an active allocation") poisons the context via the
+            // sticky check_err and kills a launch inside the capture with a
+            // moving-target DriverError(1). Eager prefill runs at full
+            // speed (7585 tok/s pp128 -- the graph was worth ~2%). The
+            // quiesce before begin_capture is retained; it is necessary but
+            // not sufficient. Re-enable only after auditing every tensor
+            // lifetime against the v0.5.0 lease protocol. TEMPURA_PREFILL_GRAPH=1
+            // opts back in.
+            && std::env::var("TEMPURA_PREFILL_GRAPH").as_deref() == Ok("1")
             && std::env::var("TEMPURA_NO_PREFILL_GRAPH").as_deref() != Ok("1");
 
         let mut skip_layer_loop = false;
