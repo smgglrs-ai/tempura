@@ -1,0 +1,12 @@
+{
+  "model": "/home/fdupont/.cache/tempura/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+  "corpus": "/home/fdupont/.cache/tempura/eval/wikitext-2-raw/wiki.test.raw",
+  "n_ctx": 512,
+  "max_chunks": 32,
+  "cpu": {"ppl": 6.456687, "nll": 15219.349001, "count": 8160},
+  "gpu": null,
+  "llama_cpp_ppl": 6.296800,
+  "gpu_cpu_ratio": null,
+  "gpu_nan_steps": 0,
+  "passed": true
+}
