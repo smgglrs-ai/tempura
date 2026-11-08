@@ -93,7 +93,7 @@ struct PrefillGraph {
 
 impl Drop for PrefillGraph {
     fn drop(&mut self) {
-        let _ = self.device.bind_to_thread();
+        let _ = self.device.primary_context().and_then(|c| c.bind_to_thread());
         if !self.cu_exec.is_null() {
             let _ = unsafe { cuda_core::sys::cuGraphExecDestroy(self.cu_exec) };
         }
@@ -109,7 +109,7 @@ unsafe impl Sync for PrefillGraph {}
 
 impl Drop for DecodeGraph {
     fn drop(&mut self) {
-        let _ = self.device.bind_to_thread();
+        let _ = self.device.primary_context().and_then(|c| c.bind_to_thread());
         if !self.cu_exec.is_null() {
             let _ = unsafe { cuda_core::sys::cuGraphExecDestroy(self.cu_exec) };
         }
@@ -691,7 +691,7 @@ struct BatchDecodeGraph {
 
 impl Drop for BatchDecodeGraph {
     fn drop(&mut self) {
-        let _ = self.device.bind_to_thread();
+        let _ = self.device.primary_context().and_then(|c| c.bind_to_thread());
         if !self.cu_exec.is_null() {
             let _ = unsafe { cuda_core::sys::cuGraphExecDestroy(self.cu_exec) };
         }
@@ -2109,7 +2109,7 @@ impl CutileGpuModel {
         );
 
         // Extract device before moving `matmul` into the struct.
-        let device = matmul.stream().device().clone();
+        let device = Arc::new(matmul.stream().context().device());
         let stream_kv = device
             .new_stream()
             .expect("CutileGpuModel: stream_kv creation failed");
@@ -2512,7 +2512,7 @@ impl CutileGpuModel {
         );
 
         // Extract device before moving `matmul` into the struct.
-        let device = matmul.stream().device().clone();
+        let device = Arc::new(matmul.stream().context().device());
         let stream_kv = device
             .new_stream()
             .expect("CutileGpuModel: stream_kv creation failed");
