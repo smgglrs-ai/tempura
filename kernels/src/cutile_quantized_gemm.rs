@@ -1251,8 +1251,10 @@ impl CutileQuantizedGemm {
     }
 
     pub fn with_device(ordinal: usize) -> Result<Self> {
-        let device = Device::new(ordinal).map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let device = Arc::new(Device::new(ordinal).map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
         let stream = device
+            .primary_context()
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .new_stream()
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         Ok(Self { device, stream })
@@ -1787,7 +1789,7 @@ mod tests {
 
         let device = Device::new(0).expect("CUDA device 0 not available");
         let stream: std::sync::Arc<cuda_core::Stream> =
-            device.new_stream().expect("stream").into();
+            device.primary_context().expect("ctx").new_stream().expect("stream").into();
         let q6k_gemv = CutileQ6kGemv::from_stream(stream);
 
         let x_dev: std::sync::Arc<cutile::tensor::Tensor<f32>> =
@@ -2117,7 +2119,7 @@ mod tests {
 
         let device = Device::new(0).expect("CUDA device 0 not available");
         let stream: std::sync::Arc<cuda_core::Stream> =
-            device.new_stream().expect("stream").into();
+            device.primary_context().expect("ctx").new_stream().expect("stream").into();
         let q4k_gemv = CutileQ4Gemv::from_stream(stream);
 
         let x_dev: std::sync::Arc<cutile::tensor::Tensor<f32>> =
@@ -2195,7 +2197,7 @@ mod tests {
         // Upload to GPU and dispatch the kernel.
         let device = Device::new(0).expect("CUDA device 0 not available");
         let stream: std::sync::Arc<cuda_core::Stream> =
-            device.new_stream().expect("stream").into();
+            device.primary_context().expect("ctx").new_stream().expect("stream").into();
         let q2_gemv = CutileQ2Gemv::from_stream(stream);
 
         let x_dev: std::sync::Arc<cutile::tensor::Tensor<f32>> =
@@ -2269,7 +2271,7 @@ mod tests {
 
         let device = Device::new(0).expect("CUDA device 0 not available");
         let stream: std::sync::Arc<cuda_core::Stream> =
-            device.new_stream().expect("stream").into();
+            device.primary_context().expect("ctx").new_stream().expect("stream").into();
         let q2_gemv = CutileQ2Gemv::from_stream(stream);
 
         let x_dev: std::sync::Arc<cutile::tensor::Tensor<f32>> =
@@ -2365,7 +2367,7 @@ mod tests {
 
         let device = Device::new(0).expect("CUDA device 0 not available");
         let stream: std::sync::Arc<cuda_core::Stream> =
-            device.new_stream().expect("stream").into();
+            device.primary_context().expect("ctx").new_stream().expect("stream").into();
         let q4k_gemv = CutileQ4Gemv::from_stream(stream);
 
         let x_dev: std::sync::Arc<cutile::tensor::Tensor<f32>> =
@@ -2427,7 +2429,7 @@ mod tests {
 
         let device = Device::new(0).expect("CUDA device 0 not available");
         let stream: std::sync::Arc<cuda_core::Stream> =
-            device.new_stream().expect("stream").into();
+            device.primary_context().expect("ctx").new_stream().expect("stream").into();
         let q6k_gemv = CutileQ6kGemv::from_stream(stream);
 
         let x_dev: std::sync::Arc<cutile::tensor::Tensor<f32>> =
