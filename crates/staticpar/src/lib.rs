@@ -122,6 +122,11 @@ struct Inner {
     done: AtomicUsize,
     shutdown: AtomicBool,
 
+    /// Last generation whose run_raw call fully completed (all workers
+    /// acked).  A worker that wakes to a generation <= closed_gen is LATE:
+    /// the call's frame is gone; executing would be a use-after-return.
+    closed_gen: AtomicU64,
+
     /// Spin budget per dispatch.  Workers spin this many `spin_loop()` calls
     /// before parking.  Tunable via `STATICPAR_SPIN_BUDGET`.
     spin_budget: u64,
@@ -176,6 +181,7 @@ impl StaticPool {
             condvar: Condvar::new(),
             done: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
+            closed_gen: AtomicU64::new(0),
             spin_budget,
             ranges,
             fn_ptr: AtomicU64::new(0),
@@ -381,10 +387,19 @@ impl StaticPool {
             inner.condvar.notify_all();
         }
 
-        // Calling thread does its partition while workers run.
-        if caller_start < caller_end {
-            unsafe { func(caller_start, caller_end, ctx) };
-        }
+        // Calling thread does its partition while workers run.  A panic in
+        // the caller's partition MUST NOT skip the worker wait below: the
+        // workers hold raw pointers into the caller's frame (par_run
+        // closures capture stack locals) -- unwinding past the wait leaves
+        // them reading a dead frame (ASAN: stack-use-after-return, Qwen2.5
+        // ppl chunk crashes, 2026-11-08).
+        let caller_result = if caller_start < caller_end {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                unsafe { func(caller_start, caller_end, ctx) };
+            }))
+        } else {
+            Ok(())
+        };
 
         // Wait for workers. Brief spin first (workers wake fast), then yield.
         let mut spins = 0usize;
@@ -395,6 +410,15 @@ impl StaticPool {
             } else {
                 std::thread::yield_now();
             }
+        }
+
+        // Canary: after the wait, no worker may still execute this
+        // generation.  Workers check closed_gen before PHASE 3 and report
+        // late executions instead of touching a dead frame.
+        inner.closed_gen.store(new_gen, Ordering::Release);
+
+        if let Err(payload) = caller_result {
+            std::panic::resume_unwind(payload);
         }
     }
 }
@@ -460,6 +484,19 @@ fn worker_loop(worker_idx: usize, inner: Arc<Inner>) {
             return;
         }
         last_gen = current_gen;
+
+        // Canary: this generation's call may have already completed (and
+        // closed) while this worker was descheduled -- executing now would
+        // read a dead frame (stack-use-after-return).  Report and skip.
+        if current_gen <= inner.closed_gen.load(Ordering::Acquire) && current_gen > 0 {
+            eprintln!(
+                "[staticpar] LATE WORKER {worker_idx}: gen {current_gen} closed \
+                 (closed_gen {}), skipping execution",
+                inner.closed_gen.load(Ordering::Relaxed)
+            );
+            inner.done.fetch_add(1, Ordering::Release);
+            continue;
+        }
 
         // -- PHASE 3: execute assigned range -------------------------------
         // The Acquire on gen_atomic (phase 1) or the condvar mutex unlock
@@ -569,6 +606,7 @@ mod tests {
             condvar: Condvar::new(),
             done: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
+            closed_gen: AtomicU64::new(0),
             spin_budget,
             ranges,
             fn_ptr: AtomicU64::new(0),
