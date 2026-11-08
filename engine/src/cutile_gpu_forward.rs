@@ -3337,6 +3337,21 @@ impl CutileGpuModel {
     /// Pre-allocate the [m, q_pad] attn-out pad buffer. MUST be called
     /// before begin_capture at every graph capture site that will run the
     /// padding path (allocation during capture is DriverError 900).
+    /// cuda-oxide v0.5.0 defers every Allocation::drop free to a background
+    /// retirement thread (1ms poll; cuMemFreeAsync on the allocation's
+    /// stream). A free landing while that stream is CAPTURING fails with
+    /// DriverError(1) and poisons the context for subsequent launches
+    /// inside the capture -- moving-target failures (silu, attention, ...)
+    /// depending on which launch reads the sticky error first (found via
+    /// compute-sanitizer + the TEMPURA_NO_PREFILL_GRAPH bisect, 2026-11-08).
+    /// No public drain API exists upstream; quiesce by syncing the stream
+    /// (retirement-gating events complete) and letting the 1ms poll cycle
+    /// drain. Cold path: capture happens once per shape.
+    fn quiesce_retirement_before_capture(&self, stream: &Arc<cuda_core::Stream>) {
+        let _ = stream.synchronize();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
     fn ensure_attn_pad_buf(&self, m: usize) {
         let mut bufs = self.attn_pad_scratch.borrow_mut();
         if !bufs.contains_key(&m) {
@@ -5236,6 +5251,9 @@ impl CutileGpuModel {
             // Pre-allocate the attn-out pad buffer (m=1): the padding path
             // allocates, which is illegal during capture (DriverError 900).
             self.ensure_attn_pad_buf(1);
+            // Drain v0.5.0's deferred frees before capturing (see
+            // quiesce_retirement_before_capture).
+            self.quiesce_retirement_before_capture(&stream);
             let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
             unsafe {
                 stream
@@ -6216,6 +6234,11 @@ impl CutileGpuModel {
                 };
                 *self.prefill_last_key.borrow_mut() = Some(key);
                 if should_capture {
+                    // Drain v0.5.0's deferred frees before capturing (see
+                    // quiesce_retirement_before_capture): the eager first
+                    // call dropped layer temporaries whose frees would land
+                    // on this capturing stream.
+                    self.quiesce_retirement_before_capture(&stream);
                     let relaxed =
                         cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
                     unsafe {
@@ -8178,6 +8201,7 @@ impl CutileGpuModel {
                 self.ensure_attn_pad_buf(m);
             }
 
+            self.quiesce_retirement_before_capture(&stream);
             let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
             unsafe {
                 stream
@@ -8529,6 +8553,7 @@ impl CutileGpuModel {
                 self.ensure_attn_pad_buf(m);
             }
 
+            self.quiesce_retirement_before_capture(&stream);
             let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
             unsafe {
                 stream
