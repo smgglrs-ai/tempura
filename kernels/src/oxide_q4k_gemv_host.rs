@@ -186,7 +186,7 @@ impl OxideQ4kGemv {
             let c_ptx = CString::new(ptx_str).ok()?;
             let entry = CString::new(KERNEL_ENTRY).ok()?;
 
-            let _ = stream.device().bind_to_thread().ok()?;
+            let _ = stream.context().bind_to_thread().ok()?;
 
             const CUDA_SUCCESS: u32 = 0;
 
@@ -247,7 +247,7 @@ impl OxideQ4kGemv {
             // -- Try to load sm_120 v4 PTX (Blackwell-native, native GGUF format) ---
             // Query device compute capability. Only attempt the sm_120 PTX when the
             // device is Blackwell (cc >= 1200); other GPUs get the sm_80 oxide fallback.
-            let caps = GpuCapabilities::query(stream.device().cu_device());
+            let caps = GpuCapabilities::query(stream.context().device().cu_device());
             // TEMPURA_NO_SM120_KPAR=1 disables sm120 for debugging (uses dp4a_kpar8 fallback).
             let sm120_disabled = std::env::var("TEMPURA_NO_SM120_KPAR").map(|v| v == "1").unwrap_or(false);
             let (cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_dp4a_kpar8_dual_block) = if !sm120_disabled && caps.cc() >= q4k_gemv_v4_ptx::MIN_CC {

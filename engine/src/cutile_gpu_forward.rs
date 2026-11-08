@@ -5279,7 +5279,7 @@ impl CutileGpuModel {
             *graph_cache = Some(DecodeGraph {
                 cu_exec,
                 cu_graph,
-                device: stream.device().clone(),
+                device: stream.context().device().clone(),
                 captured_k_ptrs,
                 captured_v_ptrs,
             });
@@ -6756,7 +6756,7 @@ impl CutileGpuModel {
             *self.cached_prefill_graph.borrow_mut() = Some(PrefillGraph {
                 cu_exec,
                 cu_graph,
-                device: stream.device().clone(),
+                device: stream.context().device().clone(),
                 seq_len,
                 positions: positions.clone(),
                 captured_k_ptrs,
@@ -8232,7 +8232,7 @@ impl CutileGpuModel {
             *graph_cache = Some(BatchDecodeGraph {
                 cu_exec,
                 cu_graph,
-                device: stream.device().clone(),
+                device: stream.context().device().clone(),
                 m,
                 captured_k_ptrs,
                 captured_v_ptrs,
@@ -8580,7 +8580,7 @@ impl CutileGpuModel {
             *graph_cache = Some(BatchDecodeGraph {
                 cu_exec,
                 cu_graph,
-                device: stream.device().clone(),
+                device: stream.context().device().clone(),
                 m,
                 captured_k_ptrs,
                 captured_v_ptrs,

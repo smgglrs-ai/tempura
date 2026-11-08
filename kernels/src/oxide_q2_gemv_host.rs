@@ -99,7 +99,7 @@ impl OxideQ2Gemv {
             let entry = CString::new(KERNEL_ENTRY).ok()?;
 
             // Bind the stream's device context to this thread before loading.
-            let _ = stream.device().bind_to_thread().ok()?;
+            let _ = stream.context().bind_to_thread().ok()?;
 
             // CUDA_SUCCESS == 0 for all CUDA driver API calls.
             const CUDA_SUCCESS: u32 = 0;
