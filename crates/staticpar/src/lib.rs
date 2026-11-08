@@ -119,13 +119,21 @@ struct Inner {
     mutex: Mutex<u64>,
     condvar: Condvar,
 
-    done: AtomicUsize,
     shutdown: AtomicBool,
 
     /// Last generation whose run_raw call fully completed (all workers
     /// acked).  A worker that wakes to a generation <= closed_gen is LATE:
     /// the call's frame is gone; executing would be a use-after-return.
     closed_gen: AtomicU64,
+
+    /// Per-worker generation acks: acks[i] = the last generation worker i
+    /// executed (or canary-skipped).  run_raw waits until ALL acks equal the
+    /// dispatched generation.  Replaces the aggregate `done` counter for the
+    /// wait: an aggregate count admits phantom increments (a late worker's
+    /// RMW landing in the next generation's window), which completes a call
+    /// early and leaves workers executing a dead frame -- 8 simultaneous
+    /// late workers observed at generation 25977 (Qwen2.5 ppl, 2026-11-08).
+    acks: Box<[AtomicU64]>,
 
     /// Spin budget per dispatch.  Workers spin this many `spin_loop()` calls
     /// before parking.  Tunable via `STATICPAR_SPIN_BUDGET`.
@@ -175,13 +183,16 @@ impl StaticPool {
             .unwrap_or(DEFAULT_SPIN_BUDGET);
 
         let ranges: Box<[u64]> = vec![0u64; n_workers].into_boxed_slice();
+        let acks: Box<[AtomicU64]> = (0..n_workers)
+            .map(|_| AtomicU64::new(0))
+            .collect();
         let inner = Arc::new(Inner {
             gen_atomic: AtomicU64::new(0),
             mutex: Mutex::new(0u64),
             condvar: Condvar::new(),
-            done: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             closed_gen: AtomicU64::new(0),
+            acks,
             spin_budget,
             ranges,
             fn_ptr: AtomicU64::new(0),
@@ -281,7 +292,6 @@ impl StaticPool {
         inner
             .ctx
             .store(&gctx as *const GraphWorkerCtx as usize as u64, Ordering::Relaxed);
-        inner.done.store(0, Ordering::Relaxed);
 
         // Wake workers once for the entire graph.
         let new_gen = inner.gen_atomic.load(Ordering::Relaxed) + 1;
@@ -314,16 +324,24 @@ impl StaticPool {
             gctx.barrier.wait();
         }
 
-        // Wait for all workers to exit graph_worker_fn and signal done.
+        // Wait for all workers to exit graph_worker_fn (per-worker acks of
+        // this generation -- same protocol as run_raw).
         let mut spins = 0usize;
-        while inner.done.load(Ordering::Acquire) < self.n_workers {
-            if spins < 2_000 {
-                spins += 1;
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
+        'gwait: loop {
+            for k in 0..self.n_workers {
+                if inner.acks[k].load(Ordering::Acquire) != new_gen {
+                    if spins < 2_000 {
+                        spins += 1;
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                    continue 'gwait;
+                }
             }
+            break;
         }
+        inner.closed_gen.store(new_gen, Ordering::Release);
     }
 
     /// Run `func(start, end, ctx)` for each static partition of `0..n`.
@@ -367,7 +385,6 @@ impl StaticPool {
             .fn_ptr
             .store(func as *const () as usize as u64, Ordering::Relaxed);
         inner.ctx.store(ctx as usize as u64, Ordering::Relaxed);
-        inner.done.store(0, Ordering::Relaxed);
 
         // Wake workers.
         //
@@ -401,15 +418,24 @@ impl StaticPool {
             Ok(())
         };
 
-        // Wait for workers. Brief spin first (workers wake fast), then yield.
+        // Wait for workers: ALL workers must ack THIS generation (per-worker
+        // acks, not an aggregate count -- phantom increments from a late
+        // worker's RMW landing in the next generation's window complete a
+        // call early and orphan the pool).
         let mut spins = 0usize;
-        while inner.done.load(Ordering::Acquire) < self.n_workers {
-            if spins < 2_000 {
-                spins += 1;
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
+        'wait: loop {
+            for k in 0..self.n_workers {
+                if inner.acks[k].load(Ordering::Acquire) != new_gen {
+                    if spins < 2_000 {
+                        spins += 1;
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                    continue 'wait;
+                }
             }
+            break;
         }
 
         // Canary: after the wait, no worker may still execute this
@@ -494,7 +520,7 @@ fn worker_loop(worker_idx: usize, inner: Arc<Inner>) {
                  (closed_gen {}), skipping execution",
                 inner.closed_gen.load(Ordering::Relaxed)
             );
-            inner.done.fetch_add(1, Ordering::Release);
+            inner.acks[worker_idx].store(current_gen, Ordering::Release);
             continue;
         }
 
@@ -513,7 +539,7 @@ fn worker_loop(worker_idx: usize, inner: Arc<Inner>) {
             unsafe { f(start, end, ctx_raw as *const ()) };
         }
 
-        inner.done.fetch_add(1, Ordering::Release);
+        inner.acks[worker_idx].store(current_gen, Ordering::Release);
     }
 }
 
@@ -600,13 +626,14 @@ mod tests {
         // STATICPAR_SPIN_BUDGET=0 should still work correctly (pure condvar path).
         let spin_budget = 0;
         let ranges: Box<[u64]> = vec![0u64; 4].into_boxed_slice();
+        let acks: Box<[AtomicU64]> = (0..4).map(|_| AtomicU64::new(0)).collect();
         let inner = Arc::new(Inner {
             gen_atomic: AtomicU64::new(0),
             mutex: Mutex::new(0u64),
             condvar: Condvar::new(),
-            done: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             closed_gen: AtomicU64::new(0),
+            acks,
             spin_budget,
             ranges,
             fn_ptr: AtomicU64::new(0),
