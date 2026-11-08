@@ -2108,15 +2108,20 @@ impl CutileGpuModel {
                 .expect("d_rope_sin_row alloc failed"),
         );
 
-        // Extract device before moving `matmul` into the struct.
+        // Extract device + its primary context before moving `matmul` into
+        // the struct (cuda-oxide v0.5.0: streams/events are created on the
+        // Context, not the Device).
         let device = Arc::new(matmul.stream().context().device());
-        let stream_kv = device
+        let ctx = device
+            .primary_context()
+            .expect("CutileGpuModel: primary context failed");
+        let stream_kv = ctx
             .new_stream()
             .expect("CutileGpuModel: stream_kv creation failed");
-        let event_fork = device
+        let event_fork = ctx
             .new_event()
             .expect("CutileGpuModel: event_fork creation failed");
-        let event_kv_done = device
+        let event_kv_done = ctx
             .new_event()
             .expect("CutileGpuModel: event_kv_done creation failed");
 
@@ -2511,15 +2516,20 @@ impl CutileGpuModel {
                 .expect("d_rope_sin_row alloc failed"),
         );
 
-        // Extract device before moving `matmul` into the struct.
+        // Extract device + its primary context before moving `matmul` into
+        // the struct (cuda-oxide v0.5.0: streams/events are created on the
+        // Context, not the Device).
         let device = Arc::new(matmul.stream().context().device());
-        let stream_kv = device
+        let ctx = device
+            .primary_context()
+            .expect("CutileGpuModel: primary context failed");
+        let stream_kv = ctx
             .new_stream()
             .expect("CutileGpuModel: stream_kv creation failed");
-        let event_fork = device
+        let event_fork = ctx
             .new_event()
             .expect("CutileGpuModel: event_fork creation failed");
-        let event_kv_done = device
+        let event_kv_done = ctx
             .new_event()
             .expect("CutileGpuModel: event_kv_done creation failed");
 
