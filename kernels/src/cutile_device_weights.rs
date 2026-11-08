@@ -24,8 +24,11 @@ unsafe impl Sync for CutileDeviceWeights {}
 impl CutileDeviceWeights {
     /// Initialize a weight cache for the given CUDA device ordinal.
     pub fn new(ordinal: usize) -> Result<Self> {
-        let device = Device::new(ordinal).map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        // cuda-oxide v0.5.0: stream creation moved from Device to Context.
+        let device = Arc::new(Device::new(ordinal).map_err(|e| KernelError::InvalidConfig(e.to_string()))?);
         let stream = device
+            .primary_context()
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .new_stream()
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         Ok(Self {
