@@ -102,7 +102,7 @@ impl OxideQ6kGemv {
     /// the hand-written cp.async kernel (`q6k_gemv_sm120_kpar8`).
     /// Returns `None` only when no kernel variant could be loaded at all.
     pub fn try_load(stream: Arc<Stream>) -> Option<Self> {
-        let _ = stream.device().bind_to_thread().ok()?;
+        let _ = stream.context().bind_to_thread().ok()?;
         const CUDA_SUCCESS: u32 = 0;
 
         // -- Try oxide-compiled PTX (feature-gated) -----------------------------
@@ -218,7 +218,7 @@ impl OxideQ6kGemv {
 
         let sm120_cc = {
             let caps = crate::gpu_capabilities::GpuCapabilities::query(
-                stream.device().cu_device()
+                stream.context().device().cu_device()
             );
             caps.cc()
         };

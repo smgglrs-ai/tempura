@@ -7,7 +7,7 @@
 /// # Usage
 ///
 /// ```rust,ignore
-/// let caps = GpuCapabilities::query(stream.device().cu_device());
+/// let caps = GpuCapabilities::query(stream.context().device().cu_device());
 /// let feats = caps.features();
 /// if feats.contains(GpuFeature::DP4A) { /* use dp4a path */ }
 /// let best = KernelVariant::select_best(&variants, &caps)?;
