@@ -366,21 +366,10 @@ impl CutileElementwise {
         // SAFETY: kernel queued async; GPU stream ordering ensures correct execution.
         // Caller syncs before CPU read.
         let (out_t, _g, _u) = unsafe {
-            match kernels::cutile_silu_mul(out_t, gate_t, up_t)
+            kernels::cutile_silu_mul(out_t, gate_t, up_t)
                 .generics(vec![SILU_B.to_string()])
                 .async_on(stream)
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!(
-                        "[silu-mul DEBUG] seq_len={seq_len} inter={inter} n={n} n_pad={n_pad} \
-                         gate.size={} up.size={} SILU_B={SILU_B} err={e}",
-                        gate.size(),
-                        up.size()
-                    );
-                    return Err(KernelError::InvalidConfig(e.to_string()));
-                }
-            }
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
         };
 
         let result = Arc::new(out_t.unpartition());
