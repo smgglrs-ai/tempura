@@ -614,6 +614,53 @@ typical-p/repeat/presence/frequency)
             llama.cpp's greedy merge -- engine/src/spm_tokenizer.rs is
             now an exact port (verified: 328880/328880 tokens, ZERO
             divergence vs llama.cpp on the full WikiText-2 corpus).
+          * Qwen2.5-7B-Instruct Q4_K_M (qwen2 arch, NeoX rope, QKV
+            biases, Q6K k/output, 28/4 GQA heads, q_dim 3584 -> q_pad
+            4096): tempura CPU ppl 6.4567 vs llama.cpp 6.2968 =
+            1.0254x, PASS, 0 NaN (report bench-perplexity-qwen25-7b.json;
+            GPU side deferred, see below). This model flushed out FIVE
+            real bugs Llama/Mistral never exercised:
+            1. QKV biases: map_gguf_name had no .bias entries (the f32
+               tensors registered under raw GGUF names; lookups by HF
+               name always missed), the q/k bias application was gated
+               on use_layernorm (GPT-2 family only), and the v bias was
+               missing entirely. 1-token logit probe: corr 0.91/argmax
+               right -> 0.999/20-of-20 top-20 after the fix.
+            2. The seq_len==1 graph-decode path does not apply QKV
+               biases -> models with biases now fall back to the
+               regular path (1-token output was bit-identical with and
+               without the bias fix).
+            3. staticpar HAD A SILENT RESULT-CORRUPTION RACE: the
+               aggregate done counter admitted phantom increments, so a
+               par_run could return while workers still held its frame
+               (ASAN: stack-use-after-return on the FusedQ4kPreq2Job;
+               8 simultaneous late workers at generation 25977 via the
+               closed_gen canary; the visible symptoms were moving-
+               target segfaults and 'len 0 index 0' panics in q4k/q6k
+               dots + a div-by-zero in attention -- all garbage reads
+               of dead frames). Fixed with per-worker generation acks
+               (run_raw + run_graph_raw wait until every ack equals the
+               dispatched gen) + catch_unwind around the caller's own
+               partition (a panic there used to skip the worker wait)
+               + the closed_gen canary. Qwen ppl then completed 32/32
+               chunks twice, exit 0. NOTE: earlier results computed
+               through heavily contended par_run windows may have been
+               silently wrong at times; re-run if in doubt.
+            4. attn_out_to_oproj_device_m allocated its pad buffer per
+               call: for q_dim 3584 (pads to 4096) the alloc hit during
+               CUDA graph capture (DriverError 900; decode graph
+               captures on the FIRST step). Pad buffers are now cached
+               per m and pre-allocated at all three capture sites.
+            5. f16 subnormal decode overflowed in debug builds at three
+               duplicated copies of the helper (quantized.rs, loader.rs,
+               cutile_gpu_forward.rs) -- Qwen2.5's imatrix scales hit
+               subnormal f16 d values. Now wrapping arithmetic.
+            OPEN for Qwen2.5: GPU-side ppl (needs QKV bias support in
+            cutile_gpu_forward: upload the bias vectors + a row-
+            broadcast add after the q/k/v GEMVs, mind the multi-stream
+            k/v dispatch and the capture sites; TEMPURA_PPL_NO_GPU=1
+            skips the GPU side meanwhile). Phi-3.5-mini ppl not yet
+            run (also has QKV biases -- CPU side should now work).
           * The 1-2-token logit probes, the K-cache byte diff, and the
             repeated-token rope-angle extraction (recovered the unroped
             vector from a 1-token probe, read off exact per-(position,
