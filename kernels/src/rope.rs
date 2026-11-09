@@ -24,6 +24,7 @@ impl RoPE for CpuRoPE {
         head_dim: usize,
         positions: &[u32],
         theta: f32,
+        attn_factor: f32,
     ) -> Result<()> {
         let half_dim = head_dim / 2;
 
@@ -34,8 +35,10 @@ impl RoPE for CpuRoPE {
                     let offset = ((b * seq_len + s) * num_heads + h) * head_dim;
                     for d in 0..half_dim {
                         let freq = pos / theta.powf(2.0 * d as f32 / head_dim as f32);
-                        let cos_val = freq.cos();
-                        let sin_val = freq.sin();
+                        // attn_factor is the ggml mscale (Phi longrope,
+                        // YaRN): cos/sin magnitude, never the angle.
+                        let cos_val = freq.cos() * attn_factor;
+                        let sin_val = freq.sin() * attn_factor;
 
                         let x0 = x[offset + d];
                         let x1 = x[offset + d + half_dim];
@@ -254,6 +257,7 @@ impl RoPE for CpuRoPETable {
         head_dim: usize,
         positions: &[u32],
         _theta: f32,
+        _attn_factor: f32,
     ) -> Result<()> {
         let half = head_dim / 2;
         for b in 0..batch {
@@ -448,6 +452,7 @@ impl RoPE for CpuRoPEUnified {
         head_dim: usize,
         positions: &[u32],
         freq_base: f32,
+        _attn_factor: f32,
     ) -> Result<()> {
         let n_dims = self.n_dims;
         debug_assert!(n_dims <= head_dim);
@@ -729,6 +734,7 @@ impl RoPE for CudaRoPE {
         head_dim: usize,
         positions: &[u32],
         theta: f32,
+        _attn_factor: f32,
     ) -> Result<()> {
         use cuda_core::LaunchConfig;
 
@@ -890,6 +896,7 @@ impl RoPE for CpuRoPEScaled {
         head_dim: usize,
         positions: &[u32],
         _theta: f32,
+        _attn_factor: f32,
     ) -> Result<()> {
         let half_dim = self.inv_freq.len();
         for b in 0..batch {

@@ -267,9 +267,18 @@ where
         head_dim: usize,
         positions: &[u32],
         theta: f32,
+        attn_factor: f32,
     ) -> tempura_kernels::Result<()> {
-        self.rope
-            .forward(x, batch, seq_len, num_heads, head_dim, positions, theta)
+        self.rope.forward(
+            x,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+            positions,
+            theta,
+            attn_factor,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

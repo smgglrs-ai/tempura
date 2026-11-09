@@ -469,6 +469,7 @@ impl RoPE for CutileRoPE {
         head_dim: usize,
         positions: &[u32],
         theta: f32,
+        _attn_factor: f32,
     ) -> Result<()> {
         if !head_dim.is_multiple_of(2) {
             return Err(KernelError::InvalidConfig(format!(
