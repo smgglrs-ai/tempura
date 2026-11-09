@@ -1684,6 +1684,42 @@ impl CutileGpuModel {
             }
             let _ = stream.synchronize();
         }
+
+        // Warm up the tiled rope kernel for non-pow2 head dims (Phi-3.5:
+        // head_dim 96): same capture-time JIT constraint as the bias kernel
+        // above -- the decode graph's rope launch must not compile inside
+        // capture.
+        if let Some((b, tph)) =
+            tempura_kernels::cutile_rope::CutileRoPE::tile_geometry(self.config.head_dim)
+        {
+            let stream = self.matmul.stream();
+            let half = self.config.head_dim / 2;
+            let mk = |n: usize| -> Arc<Tensor<f32>> {
+                Arc::new(
+                    api::zeros::<f32>(&[n])
+                        .sync_on(stream)
+                        .expect("warmup: rope dummy alloc failed"),
+                )
+            };
+            let dummy_x = mk(self.config.head_dim);
+            let dummy_cs = mk(half);
+            let z_tensor = Arc::try_unwrap(mk(self.config.head_dim))
+                .expect("warmup rope z uniquely owned");
+            let (z_out, _x, _c, _s, _pos) = unsafe {
+                tempura_kernels::cutile_rope::kernels::cutile_rope_table_tiled(
+                    z_tensor.partition([b]),
+                    dummy_x,
+                    dummy_cs.clone(),
+                    dummy_cs,
+                    0,
+                )
+                .generics(vec![b.to_string(), tph.to_string()])
+                .async_on(stream)
+                .expect("warmup: rope tiled kernel launch failed")
+            };
+            let _ = z_out.unpartition();
+            let _ = stream.synchronize();
+        }
     }
 
     // -- constructors ----------------------------------------------------------
@@ -2095,6 +2131,10 @@ impl CutileGpuModel {
         // During decode, `forward_device_scratch` reads from this table by
         // position index -- zero H2D uploads per token (was 2 sync H2D per RoPE
         // call, 4 calls per layer x 28 layers = 112 sync_on per token).
+        // mscale (llama.cpp attn_factor, Phi longrope 1.1902) multiplies the
+        // tables and every cos/sin this struct computes -- matching the CPU
+        // reference (kernels/src/rope.rs).
+        cutile_rope.set_mscale(config.rope_attn_factor);
         cutile_rope.precompute_table(
             config.max_seq_len.min(4096),
             head_dim,
@@ -2514,6 +2554,7 @@ impl CutileGpuModel {
             KvScatterWrite::new().expect("KvScatterWrite: failed to load scatter-write PTX kernel");
 
         // Pre-compute the full RoPE frequency table on the GPU once.
+        cutile_rope.set_mscale(config.rope_attn_factor);
         cutile_rope.precompute_table(
             config.max_seq_len.min(4096),
             head_dim,
@@ -3806,7 +3847,13 @@ impl CutileGpuModel {
         };
 
         // Pooled path: try to reclaim the pre-allocated scratch tensor.
-        let maybe_tensor = {
+        // Decode (m == 1) ONLY -- the pool holds [n]-sized decode slots and
+        // forward_*_into CONSUMES its `out` argument on failure. Prefill
+        // consumers of gemm_d2d_slot (f32 weights, e.g. Phi's Q5K attention)
+        // used to take the slot, fail the [m, n]-into on the [n]-sized
+        // buffer, and drop the tensor -- draining the pool and starving the
+        // decode CUDA graph's pooled GEMVs (DriverError 900 inside capture).
+        let maybe_tensor = if m == 1 {
             let mut pool = self.scratch.borrow_mut();
             match pool[slot].take() {
                 Some(arc) => match Arc::try_unwrap(arc) {
@@ -3818,6 +3865,8 @@ impl CutileGpuModel {
                 },
                 None => None,
             }
+        } else {
+            None
         };
 
         if m == 1 {
@@ -3828,13 +3877,31 @@ impl CutileGpuModel {
             let use_coalesced = dw.k_pad % 128 == 0;
             if use_coalesced {
                 if let Some(tensor) = maybe_tensor {
-                    if let Ok(result) = self
+                    match self
                         .matmul
                         .forward_gemv_coalesced_d2d_into(a, &dw.tensor, tensor, dw.n, dw.k_pad)
                     {
-                        self.scratch.borrow_mut()[slot] = Some(result.clone());
-                        return result;
+                        Ok(result) => {
+                            self.scratch.borrow_mut()[slot] = Some(result.clone());
+                            return result;
+                        }
+                        Err(e) => {
+                            // The slot tensor was consumed by the failed call
+                            // (out is moved); warmup_gemms pre-compiles every
+                            // shape so this JIT-miss path should not fire --
+                            // if it does, the allocating fallback below runs
+                            // (legal eager, illegal inside capture).
+                            if std::env::var("TEMPURA_DEBUG_F32_GEMV").is_ok() {
+                                eprintln!(
+                                    "[f32-gemv] {weight_name}: into-path failed (m=1 n={} \
+                                     k_pad={} err {e:?}; falling back to the allocating variant)",
+                                    dw.n, dw.k_pad
+                                );
+                            }
+                        }
                     }
+                } else if std::env::var("TEMPURA_DEBUG_F32_GEMV").is_ok() {
+                    eprintln!("[f32-gemv] {weight_name}: pool miss (slot {slot})");
                 }
                 return self
                     .matmul
@@ -3857,16 +3924,8 @@ impl CutileGpuModel {
                 .expect("CutileGpuModel::gemm_d2d_slot GEMV failed");
         }
 
-        // Prefill (m > 1): use square tiled GEMM.
-        if let Some(tensor) = maybe_tensor {
-            if let Ok(result) = self
-                .matmul
-                .forward_bt_d2d_into(a, &dw.tensor, tensor, m, dw.n, dw.k_pad)
-            {
-                self.scratch.borrow_mut()[slot] = Some(result.clone());
-                return result;
-            }
-        }
+        // Prefill (m > 1): use square tiled GEMM (allocating -- the decode
+        // slot pool is intentionally untouched, see maybe_tensor above).
         self.matmul
             .forward_bt_device_to_device(a, &dw.tensor, m, dw.n, dw.k_pad)
             .expect("CutileGpuModel::gemm_d2d_slot GEMM failed")
@@ -5144,15 +5203,34 @@ impl CutileGpuModel {
         k_pad: usize,
     ) -> Arc<Tensor<f32>> {
         if k_pad == k || a.size() == m * k_pad {
-            return a.clone();
+            // The f32 GEMM consumes rank-2 [m, k_pad]. Activations may arrive
+            // rank-1 flat -- including h_pad-strided ones where h_pad == k_pad
+            // (Phi h=3072 -> h_pad 4096): the layout already matches and the
+            // weight's zero pad columns cancel the activation pad columns,
+            // so only the rank needs fixing.
+            return a
+                .clone()
+                .reshape(&[m, k_pad])
+                .expect("pad_prefill_activation_for_f32_gemm: reshape failed")
+                .into();
         }
-        debug_assert_eq!(
-            a.size(),
-            m * k,
-            "prefill activation is neither [m, k] nor [m, k_pad]"
+        // Remaining cases: the activation's row stride differs from both k
+        // and k_pad (e.g. [m, h_pad] against native k). Download once,
+        // compact the valid k columns per row, zero-pad to k_pad.
+        let stride = if a.size() % m == 0 { a.size() / m } else { k };
+        debug_assert!(
+            stride >= k,
+            "prefill activation stride {stride} < k {k} (size {} m {m})",
+            a.size()
         );
-        let compact = self.download_device_tensor(a);
-        self.to_device_padded(&compact, m, k, k_pad)
+        let host = self.download_device_tensor(a);
+        let mut padded = vec![0.0f32; m * k_pad];
+        for r in 0..m {
+            let src = r * stride;
+            padded[r * k_pad..r * k_pad + k]
+                .copy_from_slice(&host[src..src + k]);
+        }
+        self.to_device(&padded, m, k_pad)
     }
 
     /// The slotted quantized paths use pre-allocated scratch buffers with async dispatch,
@@ -6461,6 +6539,11 @@ impl CutileGpuModel {
         // K/V from the host mirror, ~n_heads+2*n_kv_heads H2D + n_heads D2H
         // + a full stream sync per layer) with 5 async device kernels.
         let prefill_device_attn = seq_len > 1
+            // Non-pow2 head dims (Phi-3.5: 96): the gather/flash/scatter chain
+            // partitions by [*, D] which must be pow2 -- fall back to the
+            // host-staged forward_batched path, which zero-pads the head dim
+            // (exact) before the same flash kernel.
+            && head_dim.is_power_of_two()
             && gpu_kv_cache.can_append_device(seq_len)
             && std::env::var("TEMPURA_NO_GPU_ATTN").as_deref() != Ok("1");
 

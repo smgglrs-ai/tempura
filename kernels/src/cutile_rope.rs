@@ -120,6 +120,77 @@ pub mod kernels {
         }
     }
 
+    /// Non-power-of-two head dims (Phi-3.5: head_dim 96, half 48): cutile
+    /// tile dims must be powers of two, so cutile_rope_interleaved's
+    /// [HALF_DIM] partition cannot run. This variant tiles the flat
+    /// [num_sh * head_dim] tensor into B-element tiles (B = the largest
+    /// pow2 divisor of half) with TPH = head_dim / B tiles per head:
+    /// program pid handles flat tile pid -- head sh = pid / TPH,
+    /// within-head tile j = pid % TPH, second half when j >= TPH/2.
+    /// The rotation pair of tile pid is pid -/+ TPH/2. Same rotation
+    /// formula and store positions as cutile_rope_interleaved -- the
+    /// outputs are element-for-element identical, only the tiling of the
+    /// program grid changes.
+    #[cutile::entry()]
+    pub fn cutile_rope_interleaved_tiled<const B: i32, const TPH: i32>(
+        z: &mut Tensor<f32, { [B] }>,
+        x: &Tensor<f32, { [-1] }>,
+        cos_table: &Tensor<f32, { [-1] }>,
+        sin_table: &Tensor<f32, { [-1] }>,
+    ) {
+        let pid = program_id(0);
+        let ht = TPH / 2;
+        let sh = pid / TPH;
+        let j = pid % TPH;
+        let second = j >= ht;
+        let jj = j % ht;
+        let pair0 = if second { pid - ht } else { pid };
+        let pair1 = if second { pid } else { pid + ht };
+        let tile_x0 = x.partition(shape![B]).load([pair0]);
+        let tile_x1 = x.partition(shape![B]).load([pair1]);
+        let cs_idx = sh * ht + jj;
+        let tile_cos = cos_table.partition(shape![B]).load([cs_idx]);
+        let tile_sin = sin_table.partition(shape![B]).load([cs_idx]);
+        if second {
+            z.store(tile_x0 * tile_sin + tile_x1 * tile_cos);
+        } else {
+            z.store(tile_x0 * tile_cos - tile_x1 * tile_sin);
+        }
+    }
+
+    /// Tiled full-table rotation for the non-graph decode fast path on
+    /// non-power-of-two head dims: cos/sin come from the precomputed
+    /// [max_pos * half] table (or a caller-gathered ONE-ROW buffer with
+    /// pos = 0 -- the CUDA-graph decode path refreshes the row per step
+    /// via gather_row_by_device_pos, so the graph stays position-correct
+    /// without a host pos scalar), row `pos`.
+    #[cutile::entry()]
+    pub fn cutile_rope_table_tiled<const B: i32, const TPH: i32>(
+        z: &mut Tensor<f32, { [B] }>,
+        x: &Tensor<f32, { [-1] }>,
+        cos_table: &Tensor<f32, { [-1] }>,
+        sin_table: &Tensor<f32, { [-1] }>,
+        pos: i32,
+    ) {
+        let pid = program_id(0);
+        let ht = TPH / 2;
+        let j = pid % TPH;
+        let second = j >= ht;
+        let jj = j % ht;
+        let pair0 = if second { pid - ht } else { pid };
+        let pair1 = if second { pid } else { pid + ht };
+        let tile_x0 = x.partition(shape![B]).load([pair0]);
+        let tile_x1 = x.partition(shape![B]).load([pair1]);
+        let cs_idx = pos * ht + jj;
+        let tile_cos = cos_table.partition(shape![B]).load([cs_idx]);
+        let tile_sin = sin_table.partition(shape![B]).load([cs_idx]);
+        if second {
+            z.store(tile_x0 * tile_sin + tile_x1 * tile_cos);
+        } else {
+            z.store(tile_x0 * tile_cos - tile_x1 * tile_sin);
+        }
+    }
+
     /// Deinterleave kernel: split interleaved [num_sh x head_dim] into two half-tensors.
     ///
     /// `x` is a flat [num_sh * head_dim] tensor in interleaved layout:
@@ -291,6 +362,10 @@ pub struct CutileRoPE {
     table_max_pos: usize,
     /// Half of the head dimension used when building the tables (0 when not populated).
     table_half_dim: usize,
+    /// RoPE mscale (llama.cpp attn_factor / YaRN mscale): multiplies every
+    /// cos/sin this struct computes or uploads (Phi longrope: 1.1902). The
+    /// CPU reference (kernels/src/rope.rs) applies the same factor.
+    mscale: f32,
 }
 
 unsafe impl Send for CutileRoPE {}
@@ -317,7 +392,35 @@ impl CutileRoPE {
             sin_table: None,
             table_max_pos: 0,
             table_half_dim: 0,
+            mscale: 1.0,
         })
+    }
+
+    /// Set the RoPE mscale (attn_factor). Must be called before
+    /// `precompute_table` so the decode tables carry it.
+    pub fn set_mscale(&mut self, mscale: f32) {
+        self.mscale = mscale;
+    }
+
+    /// Tile geometry for non-power-of-two head dims (Phi-3.5: head_dim 96,
+    /// half 48 -- cutile tile dims must be pow2, so the [half]-partitioned
+    /// kernels cannot run). Returns `(B, TPH)`: B-element inner tiles
+    /// (B = largest pow2 divisor of half) and TPH = head_dim / B tiles per
+    /// head. `None` when half is already a power of two (use the existing
+    /// kernels) or when no usable B exists (half < 4 -- no real model).
+    pub fn tile_geometry(head_dim: usize) -> Option<(usize, usize)> {
+        if head_dim % 2 != 0 {
+            return None;
+        }
+        let half = head_dim / 2;
+        if half == 0 || half & (half - 1) == 0 {
+            return None;
+        }
+        let b = half & half.wrapping_neg();
+        if b < 4 {
+            return None;
+        }
+        Some((b, head_dim / b))
     }
 
     /// Pre-compute the full RoPE frequency table and upload it to the GPU once.
@@ -345,8 +448,8 @@ impl CutileRoPE {
         for pos in 0..max_pos {
             for d in 0..half {
                 let freq = pos as f32 / theta.powf(2.0 * d as f32 / head_dim as f32);
-                cos_data[pos * half + d] = freq.cos();
-                sin_data[pos * half + d] = freq.sin();
+                cos_data[pos * half + d] = freq.cos() * self.mscale;
+                sin_data[pos * half + d] = freq.sin() * self.mscale;
             }
         }
         let cos_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(cos_data))
@@ -549,8 +652,8 @@ impl CutileRoPE {
                 let sh = s * n_heads + h;
                 for d in 0..half {
                     let freq = pos / theta.powf(2.0 * d as f32 / head_dim as f32);
-                    cos_exp[sh * half + d] = freq.cos();
-                    sin_exp[sh * half + d] = freq.sin();
+                    cos_exp[sh * half + d] = freq.cos() * self.mscale;
+                    sin_exp[sh * half + d] = freq.sin() * self.mscale;
                 }
             }
         }
@@ -565,6 +668,27 @@ impl CutileRoPE {
         // -- 2. Upload cos/sin to device (2 H->D, tiny) -------------------------
         let cos_t = upload_vec(cos_exp)?;
         let sin_t = upload_vec(sin_exp)?;
+
+        // -- Non-pow2 head dims: ONE tiled fused kernel (the [half]-partitioned
+        // chain below cannot run -- cutile tiles must be powers of two).
+        if let Some((b, tph)) = Self::tile_geometry(head_dim) {
+            let z_alloc = api::zeros::<f32>(&[num_sh * head_dim])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            let z_part = z_alloc.partition([b]);
+            let (z_t, _x, _c, _s) = unsafe {
+                kernels::cutile_rope_interleaved_tiled(z_part, x_dev.clone(), cos_t, sin_t)
+                    .generics(vec![b.to_string(), tph.to_string()])
+                    .async_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            };
+            unsafe {
+                stream
+                    .synchronize()
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            }
+            return Ok(Arc::new(z_t.unpartition()));
+        }
 
         // -- 3-5. Deinterleave -> RoPE -> Interleave: all async, one final sync --
         // Allocations (api::zeros) block only for cudaMalloc (fast); the kernel
@@ -734,8 +858,8 @@ impl CutileRoPE {
                     let sh = s * n_heads + h;
                     for d in 0..half {
                         let f = freqs[s * half + d];
-                        cos_exp[sh * half + d] = f.cos();
-                        sin_exp[sh * half + d] = f.sin();
+                        cos_exp[sh * half + d] = f.cos() * self.mscale;
+                        sin_exp[sh * half + d] = f.sin() * self.mscale;
                     }
                 }
             }
@@ -759,8 +883,11 @@ impl CutileRoPE {
         // reads the interleaved input, applies the rotation, writes the
         // interleaved output (bitwise-equal; eliminates 4 memory
         // round-trips and 2 kernel launches per Q/K per layer).
-        // TEMPURA_NO_FUSED_ROPE=1 bisects back to the 3-kernel chain.
-        if std::env::var("TEMPURA_NO_FUSED_ROPE").as_deref() != Ok("1") {
+        // TEMPURA_NO_FUSED_ROPE=1 bisects back to the 3-kernel chain (pow2
+        // halves only -- non-pow2 always takes the fused tiled kernel).
+        if std::env::var("TEMPURA_NO_FUSED_ROPE").as_deref() != Ok("1")
+            || Self::tile_geometry(head_dim).is_some()
+        {
             let x_flat = x_dev.clone();
 
             let z_tensor = scratch
@@ -773,12 +900,34 @@ impl CutileRoPE {
                         .expect("RopeScratch: z fallback alloc failed")
                 });
 
-            let z_part = z_tensor.partition([half]);
-            let (z_t, _x, c_ret, s_ret) = unsafe {
-                kernels::cutile_rope_interleaved(z_part, x_flat, cos_t, sin_t)
+            // Non-pow2 head dims: the tiled fused kernel (same rotation,
+            // B-element tiles; the [half] partition cannot run).
+            let (z_t, c_ret, s_ret) = if let Some((b, tph)) = Self::tile_geometry(head_dim) {
+                let (z_t, _x, c_ret, s_ret) = unsafe {
+                    kernels::cutile_rope_interleaved_tiled(
+                        z_tensor.partition([b]),
+                        x_flat,
+                        cos_t,
+                        sin_t,
+                    )
+                    .generics(vec![b.to_string(), tph.to_string()])
+                    .async_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                };
+                (z_t, c_ret, s_ret)
+            } else {
+                let (z_t, _x, c_ret, s_ret) = unsafe {
+                    kernels::cutile_rope_interleaved(
+                        z_tensor.partition([half]),
+                        x_flat,
+                        cos_t,
+                        sin_t,
+                    )
                     .generics(vec![half.to_string()])
                     .async_on(stream)
                     .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                };
+                (z_t, c_ret, s_ret)
             };
 
             if !cs_hit {
@@ -791,8 +940,8 @@ impl CutileRoPE {
             return Ok(z_arc);
         }
 
-        // -- 3-kernel chain (TEMPURA_NO_FUSED_ROPE=1 bisect path) --------------
-
+        // -- 3-kernel chain (TEMPURA_NO_FUSED_ROPE=1 bisect path; pow2 halves
+        // only -- non-pow2 always takes the fused tiled kernel above) --------
         // x_dev is already rank-1 (1 stride) because all GEMV paths now call
         // unpartition().reshape(&[n]) before returning, which collapses the
         // partition-stride metadata that partition([1]).unpartition() used to leave
@@ -941,8 +1090,8 @@ impl CutileRoPE {
                     let sh = s * n_heads + h;
                     for d in 0..half {
                         let f = freqs[s * half + d];
-                        cos_exp[sh * half + d] = f.cos();
-                        sin_exp[sh * half + d] = f.sin();
+                        cos_exp[sh * half + d] = f.cos() * self.mscale;
+                        sin_exp[sh * half + d] = f.sin() * self.mscale;
                     }
                 }
             }
@@ -975,13 +1124,34 @@ impl CutileRoPE {
                     .expect("RopeScratch: z fallback alloc failed")
             });
 
-        // Fused kernel: 2*num_sh programs, z partitioned as [half].
-        let z_part = z_tensor.partition([half]);
-        let (z_t, _x, c_ret, s_ret) = unsafe {
-            kernels::cutile_rope_interleaved(z_part, x_flat, cos_t, sin_t)
+        // Fused kernel: 2*num_sh programs, z partitioned as [half] (or B-wide
+        // tiles for non-pow2 halves).
+        let (z_t, c_ret, s_ret) = if let Some((b, tph)) = Self::tile_geometry(head_dim) {
+            let (z_t, _x, c_ret, s_ret) = unsafe {
+                kernels::cutile_rope_interleaved_tiled(
+                    z_tensor.partition([b]),
+                    x_flat,
+                    cos_t,
+                    sin_t,
+                )
+                .generics(vec![b.to_string(), tph.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            };
+            (z_t, c_ret, s_ret)
+        } else {
+            let (z_t, _x, c_ret, s_ret) = unsafe {
+                kernels::cutile_rope_interleaved(
+                    z_tensor.partition([half]),
+                    x_flat,
+                    cos_t,
+                    sin_t,
+                )
                 .generics(vec![half.to_string()])
                 .async_on(stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            };
+            (z_t, c_ret, s_ret)
         };
 
         if !cs_hit {
@@ -1070,6 +1240,36 @@ impl CutileRoPE {
         scratch: &mut RopeScratch,
         stream: &Arc<Stream>,
     ) -> Result<Arc<Tensor<f32>>> {
+        // Non-pow2 head dims: ONE tiled kernel replaces the 3-kernel chain
+        // (whose [half] partitions cannot run). pos = 0 with caller-gathered
+        // row buffers (the graph path) degenerates to row semantics.
+        if let Some((b, tph)) = Self::tile_geometry(head_dim) {
+            let z_tensor = scratch
+                .z
+                .take()
+                .and_then(|arc| Arc::try_unwrap(arc).ok())
+                .unwrap_or_else(|| {
+                    api::zeros::<f32>(&[scratch.cap_num_sh * scratch.head_dim])
+                        .sync_on(stream)
+                        .expect("RopeScratch: z fallback alloc failed")
+                });
+            let (z_t, _x, _c, _s, _pos) = unsafe {
+                kernels::cutile_rope_table_tiled(
+                    z_tensor.partition([b]),
+                    x_dev.clone(),
+                    cos_t.clone(),
+                    sin_t.clone(),
+                    pos,
+                )
+                .generics(vec![b.to_string(), tph.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            };
+            let z_arc = Arc::new(z_t.unpartition());
+            scratch.z = Some(z_arc.clone());
+            return Ok(z_arc);
+        }
+
         let generics = vec![half.to_string()];
 
         let z_tensor = scratch

@@ -640,11 +640,49 @@ typical-p/repeat/presence/frequency)
             5.9609 = 1.0192x, PASS, 0 NaN (report
             bench-perplexity-phi35-mini.json; the 0.9942 probe corr gap
             is the exact-f32-Q5K-dequant vs llama's native-Q5K band).
-            GPU side pending (loader splits + Q5K->f32 dequant flow
-            through the GPU upload unchanged, but (a) CutileRoPE requires
-            power-of-two tile dims and Phi head_dim is 96 -- needs a
-            non-pow2 rope kernel or a host-rope fallback; (b) CutileRoPE
-            ignores the new attn_factor mscale param).
+            GPU SIDE VALIDATED 2026-11-09 (late): ppl 6.3598 =
+            GPU/CPU 1.0468x, GPU/llama.cpp 1.0669x, PASS, 0 NaN (63 s
+            for the whole GPU side; decode 184 tok/s ITL 5.43 ms = 1.1x
+            gap; prefill 500 tok/s on the host-staged attention path).
+            Exact-path probe corr 0.9971 (top-5 matches llama/CPU);
+            default-config corr 0.9259 (the MXFP4 band on the Q4K/Q6K
+            projections; the Q5K attention is f32 on GPU). Four more
+            real bugs found and fixed on the way (non-pow2 head_dim 96):
+            1. CutileRoPE: every rope entry point partitioned by [half]
+               (=48) which must be pow2. New tiled kernels
+               (cutile_rope_interleaved_tiled / cutile_rope_table_tiled):
+               B-element inner tiles (B = largest pow2 divisor of half =
+               16 for Phi), TPH = head_dim/B tiles per head, rotation
+               pair at pid -/+ TPH/2; covers the fused prefill path AND
+               the graph-decode table path (pos=0 row semantics). The
+               TEMPURA_NO_FUSED_ROPE bisect is pow2-only. warmup_gemms
+               JIT-warms the tiled decode kernel (capture constraint).
+            2. CutileRoPE mscale: set_mscale(rope_attn_factor) applied
+               at every cos/sin computation site (tables + uploads),
+               matching the CPU reference. Both engine constructors pass
+               config.rope_attn_factor.
+            3. Flash attention: the [*, D]-tiled kernel cannot run at
+               D=96. The HOST-STAGED paths (forward_batched,
+               forward_batched_device_kv, forward_device) now zero-pad
+               head_dim to the next pow2 (96 -> 128) -- EXACT (pad
+               columns contribute 0 to QK^T; pad output columns are
+               never scattered). The on-device prefill chain
+               (gather/flash/scatter kernels) stays pow2-gated in the
+               engine and falls back to the host-staged path (500 tok/s
+               prefill -- perf follow-up: padded gather/scatter kernels
+               would restore the on-device path).
+            4. gemm_d2d_slot DRAINED THE DECODE SLOT POOL during
+               prefill: the pool take happened before the m check, and
+               the m>1 into-attempt on a [n]-sized decode slot always
+               fails (consuming the tensor) -- Phi's f32 Q5K attention
+               weights are the first PREFILL consumers of gemm_d2d_slot,
+               so every prefill layer ate SLOT_Q/K/V, and the decode
+               CUDA graph then hit DriverError 900 (allocating fallback
+               inside capture). Fix: the pool is only taken for m == 1.
+               ALSO fixed pad_prefill_activation_for_f32_gemm (the
+               exact-f32 bisect path): it returned the rank-1 activation
+               to a rank-2 kernel and assumed [m, k] contiguity; now
+               reshapes to [m, k_pad] and is stride-aware.
           * Qwen2.5-7B GPU-side ppl: **VALIDATED 2026-11-09 (late) --
             ppl 6.4512, GPU/CPU 0.9992x, GPU/llama.cpp 1.0245x, PASS,
             0 NaN, 32/32 chunks** (report bench-perplexity-qwen25-7b.json,
@@ -818,15 +856,17 @@ typical-p/repeat/presence/frequency)
               current) unverified -- no gh auth on fishtank; check
               kani.yml via web or auth gh before building on top;
               (9) next-session priorities, in order (updated 2026-11-09
-              late: the Qwen GPU probe + ppl are DONE, see the Qwen GPU
-              entry; (a) below also DONE same day -- Qwen prefill 2417
-              tok/s via stride-inference + compaction in
-              gemm_mxfp4_prefill_ep, ppl 1.0341 PASS, bench-quality
-              81.2% PASS): (a) [x] Qwen prefill perf; (b) Phi GPU needs
-              a non-pow2 rope (head_dim 96) + CutileRoPE mscale;
-              (c) Gemma-2-9B ppl would complete the 5th family;
+              late: (a) and (b) DONE same day): (a) [x] Qwen prefill perf
+              (2417 tok/s via stride-inference + compaction, ppl 1.0341
+              PASS); (b) [x] Phi GPU (tiled rope + mscale + padded flash
+              + pool-drain fix, ppl 6.3598 = 1.0468 PASS, decode 184
+              tok/s); (c) Gemma-2-9B ppl would complete the 5th family;
               (d) batch-decode CUDA graphs (m>=2) QKV bias support;
-              (e) the remaining 3x Qwen prefill gap vs llama.cpp.
+              (e) the remaining 3x Qwen prefill gap vs llama.cpp;
+              (f) Phi prefill perf (500 tok/s on the host-staged
+              attention path -- padded gather/scatter kernels would
+              restore the on-device chain; the f32 Q5K attention GEMMs
+              also lack an MXFP4/GEMV fast path).
       (b) [x] **MMLU-style log-prob evaluation**: bench-mmlu
           (tools/bench-gpu/src/bench_mmlu.rs). Per question: prefill the
           standard harness prompt, read the log-probs of the four
@@ -905,8 +945,8 @@ typical-p/repeat/presence/frequency)
           Remaining: Gemma-2-9B (5th family), plus GPU sides where
           unblocked (Mistral GPU done; Llama-3.1 GPU done; Qwen GPU
           done 2026-11-09 -- ppl 6.4512 PASS, decode 216 tok/s, see the
-          Qwen GPU entry; Phi GPU blocked
-          on the pow2-rope/mscale gaps). Each new family flushed out
+          Qwen GPU entry; Phi GPU done 2026-11-09 -- ppl 6.3598 = 1.0468
+          PASS, decode 184 tok/s, see the Phi entry above). Each new family flushed out
           real bugs the others masked: Mistral (SPM tokenizer), Qwen
           (QKV biases x3, staticpar race, capture-time pad alloc, f16
           subnormals), Phi (fused qkv/gate_up splits, silu+sequential,
