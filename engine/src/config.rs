@@ -45,6 +45,13 @@ pub struct ModelConfig {
     pub ssm_a: Option<f32>,
     pub dt_bias: Option<Vec<f32>>,
     pub rope_dim: Option<usize>,
+    /// RoPE mscale (llama.cpp rope_attn_factor / YaRN mscale): multiplies
+    /// the rope cos/sin, scaling rotated Q and K. Read UNCONDITIONALLY from
+    /// {arch}.rope.scaling.attn_factor -- Phi longrope applies 1.1902 even
+    /// with no rope.scaling.type key (llama.cpp reads it the same way;
+    /// previously parsed into RopeScalingConfig only when a scaling type
+    /// existed and was then never applied).
+    pub rope_attn_factor: f32,
     pub rope_scaling: Option<RopeScalingConfig>,
 }
 
@@ -164,19 +171,6 @@ impl QuantConfig {
 }
 
 impl ModelConfig {
-    /// Attention scale: 1/sqrt(head_dim), multiplied by the rope-scaling
-    /// attn_factor when present. Phi longrope multiplies attention scores by
-    /// attn_factor (HF modeling_phi3.py Phi3LongRoPEScaledRotaryEmbedding);
-    /// YaRN uses the same factor as its mscale (llama.cpp). Parsed but
-    /// previously never applied.
-    pub fn attn_scale(&self) -> f32 {
-        let base = 1.0 / (self.head_dim as f32).sqrt();
-        base * self
-            .rope_scaling
-            .as_ref()
-            .map(|rs| rs.yarn_attn_factor)
-            .unwrap_or(1.0)
-    }
 
     pub fn llama2_7b() -> Self {
         Self {
@@ -213,6 +207,7 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            rope_attn_factor: 1.0,
             rope_scaling: None,
         }
     }
@@ -252,6 +247,7 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            rope_attn_factor: 1.0,
             rope_scaling: None,
         }
     }
@@ -291,6 +287,7 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            rope_attn_factor: 1.0,
             rope_scaling: None,
         }
     }
@@ -330,6 +327,7 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            rope_attn_factor: 1.0,
             rope_scaling: None,
         }
     }
@@ -369,6 +367,7 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            rope_attn_factor: 1.0,
             rope_scaling: None,
         }
     }
@@ -546,6 +545,7 @@ impl ModelConfig {
             ssm_a: None,
             dt_bias: None,
             rope_dim: None,
+            rope_attn_factor: 1.0,
             rope_scaling,
         })
     }

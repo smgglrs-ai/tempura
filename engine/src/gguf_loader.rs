@@ -1333,6 +1333,10 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         deltanet_head_dim: None,
         ssm_a: None,
         dt_bias: None,
+        rope_attn_factor: metadata
+            .get(&format!("{arch}.rope.scaling.attn_factor"))
+            .and_then(|v| v.as_f32())
+            .unwrap_or(1.0),
         rope_dim: if std::env::var("TEMPURA_FULL_ROPE").is_ok() {
             None
         } else {

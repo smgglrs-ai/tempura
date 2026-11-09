@@ -485,7 +485,7 @@ where
                 config.rope_theta,
                 1.0,
                 0.0,
-                1.0,
+                config.rope_attn_factor,
                 32.0,
                 1.0,
                 max_pos,
@@ -953,7 +953,7 @@ where
                     .unwrap();
 
                 let mut attn_out = vec![0.0f32; seq_len * q_dim];
-                let attn_scale = self.config.attn_scale();
+                let attn_scale = 1.0 / (head_dim as f32).sqrt();
                 let cl = cache_layer_map[layer].unwrap();
                 if let Some(ref mut paged) = session.paged_cache {
                     paged.append_kv(cl, &k, &v, seq_len);
@@ -1328,6 +1328,7 @@ where
             || std::env::var("TEMPURA_DETERMINISTIC").is_ok()
         {
             let mut rope = tempura_kernels::rope::CpuRoPEUnified::new(rope_mode, head_dim);
+            rope.attn_factor = cfg.rope_attn_factor;
             if let Some(ref arc_cache) = self.rope_cache {
                 rope.precomputed = Some(arc_cache.clone());
             }
@@ -2221,9 +2222,10 @@ where
                 let head_dim_cap = head_dim;
                 let eps = cfg.layer_norm_eps;
                 let rope_theta_cap = cfg.rope_theta;
+                let rope_attn_factor_cap = cfg.rope_attn_factor;
                 let rope_neox_cap = cfg.rope_type == crate::config::RopeType::Neox;
                 let position_cap = positions[0] as i32;
-                let attn_scale = cfg.attn_scale();
+                let attn_scale = 1.0 / (head_dim as f32).sqrt();
 
                 let pool = tempura_kernels::thread_pool::global_pool();
                 let barrier = tempura_kernels::thread_pool::SpinBarrier::new(pool.thread_count());
@@ -2407,7 +2409,7 @@ where
                                     rope_theta_cap,
                                     1.0,
                                     0.0,
-                                    1.0,
+                                    rope_attn_factor_cap,
                                     0.0,
                                     0.0,
                                     0,
@@ -2423,7 +2425,7 @@ where
                                     rope_theta_cap,
                                     1.0,
                                     0.0,
-                                    1.0,
+                                    rope_attn_factor_cap,
                                     0.0,
                                     0.0,
                                     0,
@@ -2440,7 +2442,7 @@ where
                                     rope_theta_cap,
                                     1.0,
                                     0.0,
-                                    1.0,
+                                    rope_attn_factor_cap,
                                     0.0,
                                     0.0,
                                     0,
@@ -2456,7 +2458,7 @@ where
                                     rope_theta_cap,
                                     1.0,
                                     0.0,
-                                    1.0,
+                                    rope_attn_factor_cap,
                                     0.0,
                                     0.0,
                                     0,
@@ -3051,9 +3053,10 @@ where
                 let n_kv_heads_cap = n_kv_heads;
                 let head_dim_cap = head_dim;
                 let eps = cfg.layer_norm_eps;
-                let attn_scale = cfg.attn_scale();
+                let attn_scale = 1.0 / (head_dim as f32).sqrt();
                 let rope_neox_cap = cfg.rope_type == crate::config::RopeType::Neox;
                 let rope_theta_cap = cfg.rope_theta;
+                let rope_attn_factor_cap = cfg.rope_attn_factor;
                 let positions_cap: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
 
                 let pool = tempura_kernels::thread_pool::global_pool();
@@ -3346,7 +3349,7 @@ where
                                     rope_theta_cap,
                                     1.0,
                                     0.0,
-                                    1.0,
+                                    rope_attn_factor_cap,
                                     0.0,
                                     0.0,
                                     0,
@@ -3362,7 +3365,7 @@ where
                                     rope_theta_cap,
                                     1.0,
                                     0.0,
-                                    1.0,
+                                    rope_attn_factor_cap,
                                     0.0,
                                     0.0,
                                     0,
@@ -3379,7 +3382,7 @@ where
                                     rope_theta_cap,
                                     1.0,
                                     0.0,
-                                    1.0,
+                                    rope_attn_factor_cap,
                                     0.0,
                                     0.0,
                                     0,
@@ -3395,7 +3398,7 @@ where
                                     rope_theta_cap,
                                     1.0,
                                     0.0,
-                                    1.0,
+                                    rope_attn_factor_cap,
                                     0.0,
                                     0.0,
                                     0,
@@ -5041,7 +5044,7 @@ where
                                 n_heads,
                                 n_kv_heads,
                                 head_dim,
-                                cfg.attn_scale(),
+                                1.0 / (head_dim as f32).sqrt(),
                             )
                             .unwrap();
                     } else if let Some(ref sc) = softcap_attn {
@@ -5056,7 +5059,7 @@ where
                             n_heads,
                             n_kv_heads,
                             head_dim,
-                            cfg.attn_scale(),
+                            1.0 / (head_dim as f32).sqrt(),
                         )
                         .unwrap();
                     } else if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
@@ -5072,7 +5075,7 @@ where
                                 n_heads,
                                 n_kv_heads,
                                 head_dim,
-                                cfg.attn_scale(),
+                                1.0 / (head_dim as f32).sqrt(),
                             )
                             .unwrap();
                     } else if std::env::var("TEMPURA_USE_FLASH_ATTN").is_ok()
@@ -5101,7 +5104,7 @@ where
                         }
                         let k_f16 = session.cache.k_data_f16(cl_q, kv_len);
                         let v_f16 = session.cache.v_data_f16(cl_q, kv_len);
-                        let scale = cfg.attn_scale();
+                        let scale = 1.0 / (head_dim as f32).sqrt();
                         tempura_kernels::ggml::flash_attn_llama::flash_attn_ext_f16(
                             &q[..seq_len * q_dim],
                             k_f16,
@@ -5140,7 +5143,7 @@ where
                                 n_heads,
                                 n_kv_heads,
                                 head_dim,
-                                cfg.attn_scale(),
+                                1.0 / (head_dim as f32).sqrt(),
                             )
                             .unwrap();
                     }
@@ -6878,7 +6881,7 @@ where
                                 n_heads,
                                 n_kv_heads,
                                 head_dim,
-                                cfg.attn_scale(),
+                                1.0 / (head_dim as f32).sqrt(),
                             )
                             .unwrap();
 
@@ -10069,7 +10072,7 @@ impl CutileInferenceWrapper {
                 config.rope_theta,
                 1.0,
                 0.0,
-                1.0,
+                config.rope_attn_factor,
                 32.0,
                 1.0,
                 max_pos,

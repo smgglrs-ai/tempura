@@ -525,11 +525,14 @@ impl RoPE for CpuRoPEUnified {
                         self.ext_factor,
                         self.attn_factor,
                     )
-                } else if self.freq_scale != 1.0 {
-                    let scaled = self.freq_scale * theta_extrap;
-                    (scaled.cos(), scaled.sin())
                 } else {
-                    (theta_extrap.cos(), theta_extrap.sin())
+                    // ggml's rope_cache_init routes every non-YaRN path
+                    // through rope_yarn too, where mscale (attn_factor)
+                    // multiplies cos/sin unconditionally.
+                    (
+                        (self.freq_scale * theta_extrap).cos() * self.attn_factor,
+                        (self.freq_scale * theta_extrap).sin() * self.attn_factor,
+                    )
                 };
 
                 cos_cache[i] = cos_val;
@@ -897,9 +900,12 @@ impl RoPE for CpuRoPEScaled {
                     match self.mode {
                         RoPEMode::NeoX => {
                             for d in 0..half_dim {
-                                let angle = pos * self.inv_freq[d] * self.attn_factor;
-                                let cos_val = angle.cos();
-                                let sin_val = angle.sin();
+                                // attn_factor is the ggml mscale: it scales
+                                // the cos/sin MAGNITUDE (Phi longrope, YaRN),
+                                // never the angle.
+                                let angle = pos * self.inv_freq[d];
+                                let cos_val = angle.cos() * self.attn_factor;
+                                let sin_val = angle.sin() * self.attn_factor;
                                 let x0 = x[offset + d];
                                 let x1 = x[offset + d + half_dim];
                                 x[offset + d] = x0 * cos_val - x1 * sin_val;
@@ -908,9 +914,9 @@ impl RoPE for CpuRoPEScaled {
                         }
                         RoPEMode::Normal => {
                             for d in 0..half_dim {
-                                let angle = pos * self.inv_freq[d] * self.attn_factor;
-                                let cos_val = angle.cos();
-                                let sin_val = angle.sin();
+                                let angle = pos * self.inv_freq[d];
+                                let cos_val = angle.cos() * self.attn_factor;
+                                let sin_val = angle.sin() * self.attn_factor;
                                 let x0 = x[offset + d * 2];
                                 let x1 = x[offset + d * 2 + 1];
                                 x[offset + d * 2] = x0 * cos_val - x1 * sin_val;
