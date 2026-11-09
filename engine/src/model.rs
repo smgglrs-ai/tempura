@@ -953,7 +953,7 @@ where
                     .unwrap();
 
                 let mut attn_out = vec![0.0f32; seq_len * q_dim];
-                let attn_scale = 1.0 / (head_dim as f32).sqrt();
+                let attn_scale = self.config.attn_scale();
                 let cl = cache_layer_map[layer].unwrap();
                 if let Some(ref mut paged) = session.paged_cache {
                     paged.append_kv(cl, &k, &v, seq_len);
@@ -2223,7 +2223,7 @@ where
                 let rope_theta_cap = cfg.rope_theta;
                 let rope_neox_cap = cfg.rope_type == crate::config::RopeType::Neox;
                 let position_cap = positions[0] as i32;
-                let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+                let attn_scale = cfg.attn_scale();
 
                 let pool = tempura_kernels::thread_pool::global_pool();
                 let barrier = tempura_kernels::thread_pool::SpinBarrier::new(pool.thread_count());
@@ -3051,7 +3051,7 @@ where
                 let n_kv_heads_cap = n_kv_heads;
                 let head_dim_cap = head_dim;
                 let eps = cfg.layer_norm_eps;
-                let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+                let attn_scale = cfg.attn_scale();
                 let rope_neox_cap = cfg.rope_type == crate::config::RopeType::Neox;
                 let rope_theta_cap = cfg.rope_theta;
                 let positions_cap: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
@@ -5041,7 +5041,7 @@ where
                                 n_heads,
                                 n_kv_heads,
                                 head_dim,
-                                1.0 / (head_dim as f32).sqrt(),
+                                cfg.attn_scale(),
                             )
                             .unwrap();
                     } else if let Some(ref sc) = softcap_attn {
@@ -5056,7 +5056,7 @@ where
                             n_heads,
                             n_kv_heads,
                             head_dim,
-                            1.0 / (head_dim as f32).sqrt(),
+                            cfg.attn_scale(),
                         )
                         .unwrap();
                     } else if self.config.hidden_act == crate::config::HiddenAct::SquaredRelu {
@@ -5072,7 +5072,7 @@ where
                                 n_heads,
                                 n_kv_heads,
                                 head_dim,
-                                1.0 / (head_dim as f32).sqrt(),
+                                cfg.attn_scale(),
                             )
                             .unwrap();
                     } else if std::env::var("TEMPURA_USE_FLASH_ATTN").is_ok()
@@ -5101,7 +5101,7 @@ where
                         }
                         let k_f16 = session.cache.k_data_f16(cl_q, kv_len);
                         let v_f16 = session.cache.v_data_f16(cl_q, kv_len);
-                        let scale = 1.0f32 / (head_dim as f32).sqrt();
+                        let scale = cfg.attn_scale();
                         tempura_kernels::ggml::flash_attn_llama::flash_attn_ext_f16(
                             &q[..seq_len * q_dim],
                             k_f16,
@@ -5140,7 +5140,7 @@ where
                                 n_heads,
                                 n_kv_heads,
                                 head_dim,
-                                1.0 / (head_dim as f32).sqrt(),
+                                cfg.attn_scale(),
                             )
                             .unwrap();
                     }
@@ -6878,7 +6878,7 @@ where
                                 n_heads,
                                 n_kv_heads,
                                 head_dim,
-                                1.0 / (head_dim as f32).sqrt(),
+                                cfg.attn_scale(),
                             )
                             .unwrap();
 

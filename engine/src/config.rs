@@ -164,6 +164,20 @@ impl QuantConfig {
 }
 
 impl ModelConfig {
+    /// Attention scale: 1/sqrt(head_dim), multiplied by the rope-scaling
+    /// attn_factor when present. Phi longrope multiplies attention scores by
+    /// attn_factor (HF modeling_phi3.py Phi3LongRoPEScaledRotaryEmbedding);
+    /// YaRN uses the same factor as its mscale (llama.cpp). Parsed but
+    /// previously never applied.
+    pub fn attn_scale(&self) -> f32 {
+        let base = 1.0 / (self.head_dim as f32).sqrt();
+        base * self
+            .rope_scaling
+            .as_ref()
+            .map(|rs| rs.yarn_attn_factor)
+            .unwrap_or(1.0)
+    }
+
     pub fn llama2_7b() -> Self {
         Self {
             hidden_size: 4096,
