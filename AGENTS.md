@@ -647,20 +647,32 @@ typical-p/repeat/presence/frequency)
             ignores the new attn_factor mscale param).
           * Qwen2.5-7B GPU-side ppl: NOT the v0.5.0 migration. Bisected by
             building four historical states on fishtank (pre-bias, pre-pad-
-            cache, pre-migration + OLD cuda-oxide, current) -- ALL give
-            bit-identical corr -0.0288 with constant argmax. The one 0.98
-            probe reading from the Nov-7 session is irreproducible (exact
-            env unknown, measured amid knob-heavy debugging). Treat the
-            Qwen GPU path as NEVER VALIDATED with deterministic
-            corruption predating all recent work. Known missing: QKV
-            biases on GPU (upload + in-place cutile_bias_add_rows exist
-            and the kernel is verified correct in isolation, but
-            apply_qkv_bias never fires in the probe path -- the bias-map
-            lookup returns None; investigate why before anything else),
-            and the batch-decode graphs lack bias support entirely.
-            TEMPURA_PPL_NO_GPU=1 skips the GPU side. Next step: GPU-side
-            per-op NaN bisection (TEMPURA_DEBUG_NAN=1) + CPU-vs-GPU
-            layer diff on a 2-token probe.
+            cache, pre-migration + OLD cuda-oxide 023f2ac3b, current) --
+            ALL give bit-identical corr -0.0288 with constant argmax. The
+            one 0.98 probe reading from the Nov-7 session is irreproducible
+            (exact env unknown, measured amid knob-heavy debugging). Treat
+            the Qwen GPU path as NEVER VALIDATED with deterministic
+            corruption predating all recent work.
+            QKV bias status (2026-11-09): the earlier "bias-map lookup
+            returns None" theory was WRONG -- the prefill layer loop in
+            forward() calls gemm_any_d2d_slot directly and bypassed
+            dispatch_qkv_multistream entirely, so apply_qkv_bias never
+            executed. Now wired in all three QKV paths (sequential
+            dispatch, oxide multistream, prefill loop; commits facb25f +
+            8df8d34); the kernel itself is verified exact in isolation
+            (/tmp/bias-probe on fishtank, 4x8 row-broadcast match). The
+            probe has NOT been re-run since the prefill wiring -- do that
+            FIRST (it may move corr; the -0.0288 bisects all predate the
+            bias firing). Still missing: batch-decode CUDA graphs (m>=2)
+            have no bias support at all. TEMPURA_PPL_NO_GPU=1 skips the
+            GPU side. If the probe is still garbage after the bias
+            re-check: GPU-side per-op NaN bisection (TEMPURA_DEBUG_NAN=1)
+            + CPU-vs-GPU layer diff on a 2-token probe.
+            NOTE: the GPU bisect switches are broken for prefills --
+            TEMPURA_NO_MXFP4=1 / TEMPURA_NO_GPU_PREFILL=1 panic
+            "operation not permitted when stream is capturing"
+            (allocation/download during CUDA graph capture,
+            cutile_gpu_forward.rs:~4837, pre-existing).
           * Qwen2.5-7B-Instruct Q4_K_M (qwen2 arch, NeoX rope, QKV
             biases, Q6K k/output, 28/4 GQA heads, q_dim 3584 -> q_pad
             4096): tempura CPU ppl 6.4567 vs llama.cpp 6.2968 =
@@ -706,14 +718,26 @@ typical-p/repeat/presence/frequency)
             cutile_gpu_forward: upload the bias vectors + a row-
             broadcast add after the q/k/v GEMVs, mind the multi-stream
             k/v dispatch and the capture sites; TEMPURA_PPL_NO_GPU=1
-            skips the GPU side meanwhile). Phi-3.5-mini ppl not yet
-            run (also has QKV biases -- CPU side should now work).
+            skips the GPU side meanwhile). Phi-3.5-mini ppl has since
+            been run and PASSES on CPU (see the Phi entry above).
           * The 1-2-token logit probes, the K-cache byte diff, and the
             repeated-token rope-angle extraction (recovered the unroped
             vector from a 1-token probe, read off exact per-(position,
             pair) rotation angles from both implementations' K caches)
             are the reusable playbook; llama.cpp is the reference, never
-            a reimplementation.
+            a reimplementation. Concrete artifacts on fishtank (recreate
+            if wiped): /tmp/llama-logitprobe (llama.cpp probe binary,
+            built with -I ggml/include; batch mode for MMLU), probe id
+            files + dumped logits at /tmp/qwen-probe-ids.txt{,.cpu.bin,
+            .gpu.bin} and /tmp/phi-probe-ids.txt{,...}, reference logits
+            /tmp/phi-probe-ref.bin, standalone kernel probes at
+            /tmp/bias-probe and /tmp/phi-load-probe. Method:
+            TEMPURA_PPL_PROBE=<ids file> runs the same ids through
+            tempura and dumps last-position logits; compare corr at the
+            last position vs the llama reference via python struct
+            unpack. CAUTION: kill remote benches by PID or full command
+            line, NEVER by binary name -- a pkill of "bench-perplexity"
+            once killed unrelated in-flight runs (2026-11-09).
           * REMAINING follow-ups: (1) [x] bench-quality's llama.cpp arbiter
               now renders the prompt through the model's chat template
               (both sides see identical templated text; post-fix: free-
@@ -732,7 +756,19 @@ typical-p/repeat/presence/frequency)
               (TEMPURA_GRAPH_PREFILL=1) is still broken and off;
               (6) allocation/download during CUDA-graph capture panics
               the TEMPURA_NO_MXFP4 / TEMPURA_NO_GPU_PREFILL prefill
-              paths (found via MMLU, cutile_gpu_forward.rs:~4837).
+              paths (found via MMLU, cutile_gpu_forward.rs:~4837);
+              (7) batch-decode CUDA graphs (m>=2) have no QKV bias
+              support -- bias models (Qwen2/Phi) compute wrong batch
+              logits until the capture sites apply the same
+              apply_qkv_bias helper;
+              (8) CI status of the 2026-11-09 pushes (76b8eac..
+              current) unverified -- no gh auth on fishtank; check
+              kani.yml via web or auth gh before building on top;
+              (9) next-session priorities, in order: re-run the Qwen
+              GPU probe post-bias-wiring (see the Qwen entry), then
+              per-op NaN bisection if still garbage; Phi GPU needs a
+              non-pow2 rope (head_dim 96) + CutileRoPE mscale;
+              Gemma-2-9B ppl would complete the 5th family.
       (b) [x] **MMLU-style log-prob evaluation**: bench-mmlu
           (tools/bench-gpu/src/bench_mmlu.rs). Per question: prefill the
           standard harness prompt, read the log-probs of the four
@@ -799,6 +835,23 @@ typical-p/repeat/presence/frequency)
           models (Llama-3.1-8B, Qwen2.5-7B, Mistral-7B, Phi-3.5-mini,
           Gemma-2-9B) to verify the quality gates hold across
           architectures, not just Llama-3.1.
+          CPU SWEEP COMPLETE 2026-11-09 -- 4/4 PASS:
+            Llama-3.1-8B   7.31    / llama 7.09    = 1.03x
+                (report bench-perplexity.json lineage)
+            Mistral-7B     5.96    / llama 5.96    = 1.003x
+                (bench-perplexity-mistral7b.json)
+            Qwen2.5-7B     6.4567  / llama 6.2968  = 1.0254x
+                (bench-perplexity-qwen25-7b.json)
+            Phi-3.5-mini   6.0753  / llama 5.9609  = 1.0192x
+                (bench-perplexity-phi35-mini.json)
+          Remaining: Gemma-2-9B (5th family), plus GPU sides where
+          unblocked (Mistral GPU done; Llama-3.1 GPU done; Qwen GPU
+          never validated -- see the Qwen entry above; Phi GPU blocked
+          on the pow2-rope/mscale gaps). Each new family flushed out
+          real bugs the others masked: Mistral (SPM tokenizer), Qwen
+          (QKV biases x3, staticpar race, capture-time pad alloc, f16
+          subnormals), Phi (fused qkv/gate_up splits, silu+sequential,
+          Q5K-as-Q4K catch-all, rope mscale -- 7 total).
       Current quality matrix for reference (Llama-3.1-8B Q4_K_M,
       teacher-forced, 64 positions):
         tempura CPU vs GPU:    89.1%  (internal gate -- PASSES)
