@@ -38,6 +38,24 @@ pub mod kernels {
         out.store(x + tile_b);
     }
 
+    /// Row-broadcast bias add for NON-power-of-two column counts (Qwen2
+    /// q_dim 3584 = 2^9 * 7 -- cutile tile dims must be powers of two, so
+    /// cutile_bias_add_rows cannot partition by [cols]). `out` is flat
+    /// row-major [rows * cols] partitioned into B-element tiles (B a power
+    /// of two dividing cols, TPR = cols / B tiles per row); program pid
+    /// handles flat tile pid, whose bias tile within its row is pid % TPR.
+    /// Same math as cutile_bias_add_rows -- bitwise-equal when TPR == 1.
+    #[cutile::entry()]
+    pub fn cutile_bias_add_rows_tiled<const B: i32, const TPR: i32>(
+        out: &mut Tensor<f32, { [B] }>,
+        bias: &Tensor<f32, { [-1] }>,
+    ) {
+        let pid = program_id(0);
+        let tile_b = bias.partition(shape![B]).load([pid % TPR]);
+        let x = out.load();
+        out.store(x + tile_b);
+    }
+
     /// SiLU-gated MLP: out[i] = SiLU(gate[i]) * up[i]
     ///
     /// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))

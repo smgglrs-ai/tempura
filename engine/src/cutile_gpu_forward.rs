@@ -4215,13 +4215,21 @@ impl CutileGpuModel {
                     self.scratch.borrow_mut()[slot] = pooled.or(Some(arc.clone()));
                     return arc;
                 }
-                let out_part = tensor.partition([cols]);
+                // cutile tile dims must be powers of two: Qwen2's q bias is
+                // 3584 = 2^9 * 7 wide, so partitioning by [cols] (the
+                // original one-program-per-row kernel) panics. Tile with
+                // B = largest pow2 divisor of cols (clamped to 512) and
+                // TPR = cols / B tiles per row; b always divides cols
+                // exactly, so no masking is needed.
+                let b = (cols & cols.wrapping_neg()).min(512);
+                let tpr = cols / b;
+                let out_part = tensor.partition([b]);
                 let (out_part, _) = unsafe {
-                    tempura_kernels::cutile_elementwise::kernels::cutile_bias_add_rows(
+                    tempura_kernels::cutile_elementwise::kernels::cutile_bias_add_rows_tiled(
                         out_part,
                         bias,
                     )
-                    .generics(vec![cols.to_string()])
+                    .generics(vec![b.to_string(), tpr.to_string()])
                     .async_on(self.matmul.stream())
                     .expect("apply_qkv_bias: kernel launch failed")
                 };
