@@ -831,6 +831,57 @@ fn split_fused_qkv(
     ])
 }
 
+/// Split a fused `blk.N.ffn_up.weight` tensor (Phi-3/3.5: gate_up_proj, and
+/// GGUFs built with --fuse-qkv-style FFN fusion) into separate ffn_gate +
+/// ffn_up entries. Layout per llama.cpp phi3 + ggml_swiglu: the matrix is
+/// [hidden, 2*intermediate] row-concatenated -- FIRST intermediate rows are
+/// the gate, LAST intermediate rows are the up projection, and the FFN is
+/// silu(gate) * up (LLM_FFN_SWIGLU).
+///
+/// Only fires when the row count is exactly 2x the metadata
+/// feed_forward_length AND no separate ffn_gate tensor exists (the caller
+/// cannot see the tensor list here, so the model-side consumer tolerates a
+/// redundant gate; in practice fused GGUFs never carry both).
+fn split_fused_ffn_up(
+    gguf_name: &str,
+    dims: &[u64],
+    byte_size: usize,
+    metadata: &HashMap<String, GgufValue>,
+) -> Option<Vec<(String, Vec<u64>, usize, usize)>> {
+    let prefix = gguf_name.strip_suffix(".ffn_up.weight")?;
+    if dims.len() != 2 {
+        return None;
+    }
+    let arch = metadata
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)?;
+    let inter = metadata
+        .get(&format!("{arch}.feed_forward_length"))
+        .and_then(|v| v.as_u32())
+        .map(|v| v as usize)?;
+    let (k, total_rows) = (dims[0] as usize, dims[1] as usize);
+    if total_rows != 2 * inter {
+        return None;
+    }
+    let row_bytes = byte_size / total_rows;
+    if row_bytes * total_rows != byte_size {
+        return None;
+    }
+    let part = |suffix: &str, rows: usize, off: usize| {
+        (
+            format!("{prefix}.{suffix}"),
+            vec![k as u64, rows as u64],
+            off,
+            rows * row_bytes,
+        )
+    };
+    Some(vec![
+        part("ffn_gate.weight", inter, 0),
+        part("ffn_up.weight", inter, inter * row_bytes),
+    ])
+}
+
 fn map_gguf_name(gguf_name: &str) -> Option<String> {
     match gguf_name {
         "token_embd.weight" => return Some("model.embed_tokens.weight".into()),
@@ -1153,7 +1204,12 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
     } else {
         match arch {
             "gpt2" | "gptj" | "gptneox" | "starcoder" | "refact" => crate::config::HiddenAct::Gelu,
-            "phi2" | "phi3" | "phimoe" => crate::config::HiddenAct::Gelu,
+            // phi3: llama.cpp master uses LLM_FFN_SWIGLU (silu-gated) for the
+            // fused gate_up FFN; Phi-3.5-mini's config.json confirms silu
+            // (original Phi-3-mini was gelu_new, but llama.cpp is the
+            // reference and treats all phi3 as swiglu).
+            "phi3" => crate::config::HiddenAct::SiluGate,
+            "phi2" | "phimoe" => crate::config::HiddenAct::Gelu,
             "gemma" | "gemma2" | "gemma3" => crate::config::HiddenAct::GeGLU,
             "falcon" | "mpt" => crate::config::HiddenAct::Gelu,
             _ => crate::config::HiddenAct::SiluGate,
@@ -1579,7 +1635,9 @@ impl GgufLoader {
                     info.name,
                 )));
             }
-            if let Some(parts) = split_fused_qkv(&info.name, &info.dims, byte_size, &metadata) {
+            if let Some(parts) = split_fused_qkv(&info.name, &info.dims, byte_size, &metadata)
+                .or_else(|| split_fused_ffn_up(&info.name, &info.dims, byte_size, &metadata))
+            {
                 for (name, dims, off, len) in parts {
                     views.push(TensorView {
                         name,
