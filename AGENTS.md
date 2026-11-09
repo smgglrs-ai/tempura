@@ -636,10 +636,12 @@ typical-p/repeat/presence/frequency)
             {arch}.rope.scaling.attn_factor (Phi-3.5 carries 1.1902 with
             no rope.scaling.type) and threaded through the RoPE trait
             (kernel-api), all six impls, KernelPipeline::rope, and every
-            call site. Post-fix probe: corr 0.9942 at the last position
-            (the residual gap = exact-f32 dequant vs llama's native-Q5K
-            band). ppl result pending (run 5, chunk 3/32, avg nll 1.81
-            tracking ~6.1 vs llama 5.96).
+            call site. FINAL NUMBERS: tempura CPU ppl 6.0753 vs llama.cpp
+            5.9609 = 1.0192x, PASS, 0 NaN (report
+            bench-perplexity-phi35-mini.json; the 0.9942 probe corr gap
+            is the exact-f32-Q5K-dequant vs llama's native-Q5K band).
+            GPU side pending (needs the same fused-qkv/gate_up handling
+            in cutile_gpu_forward's weight upload).
           * Qwen2.5-7B GPU-side ppl: NOT the v0.5.0 migration. Bisected by
             building four historical states on fishtank (pre-bias, pre-pad-
             cache, pre-migration + OLD cuda-oxide, current) -- ALL give
