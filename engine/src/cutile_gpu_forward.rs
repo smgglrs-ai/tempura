@@ -439,6 +439,12 @@ pub struct CutileGpuModel {
     /// Qwen2.5-7B, whose q_dim 3584 pads to 4096; Llama/Mistral's 4096
     /// q_dim needs no padding and never hit this, 2026-11-07).
     attn_pad_scratch: RefCell<std::collections::HashMap<usize, Arc<Tensor<f32>>>>,
+    /// [m_pad, k] compact activation buffers for the MXFP4 prefill GEMM on
+    /// h != h_pad models (Qwen2.5: rmsnorm emits h_pad=4096-strided rows,
+    /// weights are native k=3584 -- the GEMM needs contiguous k). Keyed by
+    /// (m_pad, k); grow-once per chunk shape.
+    mxfp4_compact_scratch:
+        RefCell<std::collections::HashMap<(usize, usize), Arc<Tensor<f32>>>>,
     /// [m, h_pad] pad buffers for the decode path's o_proj / down_proj
     /// residual-add operands (h != h_pad models, e.g. Qwen2.5 h=3584 ->
     /// h_pad=4096). Two separate maps: the add kernels read both buffers
@@ -2305,6 +2311,7 @@ impl CutileGpuModel {
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
             attn_out_scratch: RefCell::new(attn_out_scratch),
             attn_pad_scratch: RefCell::new(std::collections::HashMap::new()),
+            mxfp4_compact_scratch: RefCell::new(std::collections::HashMap::new()),
             oproj_pad_scratch: RefCell::new(std::collections::HashMap::new()),
             down_pad_scratch: RefCell::new(std::collections::HashMap::new()),
             prefill_attn_scratch: RefCell::new(PrefillAttnScratch::default()),
@@ -2699,6 +2706,7 @@ impl CutileGpuModel {
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
             attn_out_scratch: RefCell::new(attn_out_scratch),
             attn_pad_scratch: RefCell::new(std::collections::HashMap::new()),
+            mxfp4_compact_scratch: RefCell::new(std::collections::HashMap::new()),
             oproj_pad_scratch: RefCell::new(std::collections::HashMap::new()),
             down_pad_scratch: RefCell::new(std::collections::HashMap::new()),
             prefill_attn_scratch: RefCell::new(PrefillAttnScratch::default()),
@@ -4775,7 +4783,7 @@ impl CutileGpuModel {
         let mxfp4 = self.mxfp4_gemm.as_ref()?;
         let dw = self.device_weights_mxfp4_tiled.get(weight_name)?;
         let k = dw.k;
-        if k % 64 != 0 || a.size() != m * k {
+        if k % 64 != 0 {
             return None;
         }
         let n = dw.n;
@@ -4818,6 +4826,59 @@ impl CutileGpuModel {
         let stream = self.matmul.stream();
         let cu_stream = stream.cu_stream();
 
+        // The activation may be row-strided wider than k (h != h_pad models:
+        // Qwen2.5's rmsnorm emits h_pad=4096-strided rows against native
+        // k=3584 weights -- without this the old a.size() == m*k guard
+        // rejected every Qwen prefill GEMM to the 8 tok/s host-dequant
+        // fallback). Infer the stride from the flat size and D->D-compact
+        // the valid rows to contiguous k, which is what the quant kernel +
+        // GEMM consume.
+        let stride = if a.size() == m * k {
+            k
+        } else if a.size() % m == 0 {
+            let s = a.size() / m;
+            if s >= k && s % 32 == 0 {
+                s
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        };
+        let a_eff: Arc<Tensor<f32>> = if stride == k {
+            a.clone()
+        } else {
+            let compact: Arc<Tensor<f32>> = {
+                let mut bufs = self.mxfp4_compact_scratch.borrow_mut();
+                match bufs.get(&(m_pad, k)) {
+                    Some(buf) => buf.clone(),
+                    None => {
+                        // m_pad rows: the quant kernel reads m_pad rows
+                        // (m_valid-masked scales), matching the unstrided
+                        // path's tolerance of pad-row garbage.
+                        let buf = Arc::new(
+                            api::zeros::<f32>(&[m_pad * k])
+                                .sync_on(stream)
+                                .expect("mxfp4 compact buffer alloc failed"),
+                        );
+                        bufs.insert((m_pad, k), buf.clone());
+                        buf
+                    }
+                }
+            };
+            let src_base = a.device_pointer().cu_deviceptr();
+            let dst_base = compact.device_pointer().cu_deviceptr();
+            for r in 0..m {
+                let src = src_base + (r * stride * std::mem::size_of::<f32>()) as u64;
+                let dst = dst_base + (r * k * std::mem::size_of::<f32>()) as u64;
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(dst, src, k, stream)
+                        .expect("mxfp4 compact D->D copy failed");
+                }
+            }
+            compact
+        };
+
         // Grow-on-demand activation buffers. Reused across layers and chunks at
         // whatever [m_pad, k] stride the current call uses (each call's quant +
         // GEMM agree on the stride; no state crosses calls). The alloc's
@@ -4849,7 +4910,7 @@ impl CutileGpuModel {
         let scales = self.prefill_mxfp4_scales.borrow().as_ref().unwrap().clone();
         mxfp4
             .quantize_activation(
-                a,
+                &a_eff,
                 &packed,
                 &scales,
                 m_pad as u32,
@@ -4859,7 +4920,7 @@ impl CutileGpuModel {
             )
             .unwrap_or_else(|e| panic!("mxfp4 prefill quant {weight_name}: {e}"));
         if self.debug_nan_trace {
-            let ab: Vec<f32> = Arc::clone(a).to_host_vec().sync_on(stream).expect("dbg a");
+            let ab: Vec<f32> = Arc::clone(&a_eff).to_host_vec().sync_on(stream).expect("dbg a");
             let pb: Vec<u8> = Arc::clone(&packed)
                 .to_host_vec()
                 .sync_on(stream)
