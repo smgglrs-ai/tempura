@@ -6428,6 +6428,13 @@ impl CutileGpuModel {
                 let q_dev = self.gemm_any_d2d_slot(&normed_dev, q_w_name, seq_len, SLOT_Q);
                 let k_dev = self.gemm_any_d2d_slot(&normed_dev, k_w_name, seq_len, SLOT_K);
                 let v_dev = self.gemm_any_d2d_slot(&normed_dev, v_w_name, seq_len, SLOT_V);
+                // QKV biases (Qwen2/Phi) -- this prefill path bypasses
+                // dispatch_qkv_multistream, so apply here (before rope).
+                let bias_of =
+                    |w: &str| format!("{}.bias", w.strip_suffix(".weight").unwrap_or(w));
+                let q_dev = self.apply_qkv_bias(q_dev, &bias_of(q_w_name), SLOT_Q);
+                let k_dev = self.apply_qkv_bias(k_dev, &bias_of(k_w_name), SLOT_K);
+                let v_dev = self.apply_qkv_bias(v_dev, &bias_of(v_w_name), SLOT_V);
 
                 // -- 2c. RoPE (GPU) -- rotate Q and K entirely on device -----------
                 // Prefill uses the dedicated scratch pair: buffers grow to the
