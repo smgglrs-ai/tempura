@@ -4196,8 +4196,19 @@ impl CutileGpuModel {
         let cols = bias.size();
         // Take the pool's reference so x is uniquely owned.
         let pooled = self.scratch.borrow_mut()[slot].take();
+        if std::env::var("TEMPURA_DEBUG_QKV_BIAS").is_ok() {
+            eprintln!(
+                "[qkv-bias] {bias_name}: x.size={} cols={} pooled={}",
+                x.size(),
+                cols,
+                pooled.is_some()
+            );
+        }
         match Arc::try_unwrap(x) {
             Ok(tensor) => {
+                if std::env::var("TEMPURA_DEBUG_QKV_BIAS").is_ok() {
+                    eprintln!("[qkv-bias] {bias_name}: UNWRAP OK, applying");
+                }
                 if tensor.size() % cols != 0 || tensor.size() == 0 {
                     // Unexpected shape -- restore and skip rather than guess.
                     let arc = Arc::new(tensor);
