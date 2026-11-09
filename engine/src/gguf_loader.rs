@@ -1306,13 +1306,23 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
         } else {
             0.0
         },
-        parallel_attn_ffn: matches!(architecture, crate::config::Architecture::Phi)
-            || metadata
-                .get(&format!("{arch}.attention.use_parallel_residual"))
-                .and_then(|v| match v {
-                    GgufValue::Bool(b) => Some(*b),
-                    _ => None,
-                })
+        // phi2 is parallel attn+FFN; phi3/phimoe switched to SEQUENTIAL
+        // (llama.cpp models/phi3.cpp: attn -> residual -> ffn_norm -> FFN ->
+        // residual). The parallel flag here previously covered all of Phi --
+        // wrong for phi3 and the source of Phi-3.5's constant-logits failure
+        // (the FFN read the attention branch's norm output).
+        parallel_attn_ffn: if matches!(arch, "phi3" | "phimoe") {
+            false
+        } else {
+            matches!(architecture, crate::config::Architecture::Phi)
+                || metadata
+                    .get(&format!("{arch}.attention.use_parallel_residual"))
+                    .and_then(|v| match v {
+                        GgufValue::Bool(b) => Some(*b),
+                        _ => None,
+                    })
+                    .unwrap_or(false)
+        }
                 .unwrap_or(false),
         rmsnorm_offset: matches!(architecture, crate::config::Architecture::Gemma),
         attn_logit_softcapping: metadata
@@ -2847,9 +2857,10 @@ mod tests {
 
         assert_eq!(loader.config.architecture, crate::config::Architecture::Phi);
         // phi3 is silu-gated in llama.cpp master (LLM_FFN_SWIGLU; Phi-3.5
-        // config.json: hidden_act=silu).
+        // config.json: hidden_act=silu) and SEQUENTIAL attn/FFN (phi2 was
+        // parallel; phi3 switched -- llama.cpp models/phi3.cpp).
         assert_eq!(loader.config.hidden_act, crate::config::HiddenAct::SiluGate);
-        assert!(loader.config.parallel_attn_ffn);
+        assert!(!loader.config.parallel_attn_ffn);
         assert!(loader.config.use_layernorm);
     }
 
