@@ -614,6 +614,48 @@ typical-p/repeat/presence/frequency)
             llama.cpp's greedy merge -- engine/src/spm_tokenizer.rs is
             now an exact port (verified: 328880/328880 tokens, ZERO
             divergence vs llama.cpp on the full WikiText-2 corpus).
+          * Phi-3.5-mini ppl (2026-11-09): seven real bugs deep before the
+            first plausible number. In order found: (1) the loader has no
+            fused-attn_qkv support -- split into synthetic attn_q/k/v
+            entries (llama.cpp build_qkv row layout: Q rows, K rows, V
+            rows; whole-quant-block byte slices); (2) the loader has no
+            fused-gate_up FFN support -- Phi-3.5 ffn_up has 2x
+            feed_forward_length rows; split into ffn_gate (first half) +
+            ffn_up (second half) per ggml_swiglu; (3) phi3 was mapped to
+            Gelu + parallel attn/FFN -- llama.cpp master + Phi-3.5
+            config.json say silu + SEQUENTIAL (phi2 was parallel; phi3
+            switched); (4) QuantizedWeights::new_typed's catch-all filed
+            EVERY non-Q6K/TQ2/TQ1 dtype as raw Q4K bytes -- Q5K (this
+            model's attention), Q4_0, Q2K, IQ* all silently became
+            garbage; the mmap loader now force-dequants any type without
+            a typed path (Phi's Q5K -> f32); (5) rope attn_factor is the
+            ggml MSSCALE (cos/sin magnitude), never the attention scale
+            (my first attempt scaled attention -- reverted) and never the
+            angle (CpuRoPEUnified's old semantics, dormant at 1.0);
+            ModelConfig::rope_attn_factor parsed UNCONDITIONALLY from
+            {arch}.rope.scaling.attn_factor (Phi-3.5 carries 1.1902 with
+            no rope.scaling.type) and threaded through the RoPE trait
+            (kernel-api), all six impls, KernelPipeline::rope, and every
+            call site. Post-fix probe: corr 0.9942 at the last position
+            (the residual gap = exact-f32 dequant vs llama's native-Q5K
+            band). ppl result pending (run 5, chunk 3/32, avg nll 1.81
+            tracking ~6.1 vs llama 5.96).
+          * Qwen2.5-7B GPU-side ppl: NOT the v0.5.0 migration. Bisected by
+            building four historical states on fishtank (pre-bias, pre-pad-
+            cache, pre-migration + OLD cuda-oxide, current) -- ALL give
+            bit-identical corr -0.0288 with constant argmax. The one 0.98
+            probe reading from the Nov-7 session is irreproducible (exact
+            env unknown, measured amid knob-heavy debugging). Treat the
+            Qwen GPU path as NEVER VALIDATED with deterministic
+            corruption predating all recent work. Known missing: QKV
+            biases on GPU (upload + in-place cutile_bias_add_rows exist
+            and the kernel is verified correct in isolation, but
+            apply_qkv_bias never fires in the probe path -- the bias-map
+            lookup returns None; investigate why before anything else),
+            and the batch-decode graphs lack bias support entirely.
+            TEMPURA_PPL_NO_GPU=1 skips the GPU side. Next step: GPU-side
+            per-op NaN bisection (TEMPURA_DEBUG_NAN=1) + CPU-vs-GPU
+            layer diff on a 2-token probe.
           * Qwen2.5-7B-Instruct Q4_K_M (qwen2 arch, NeoX rope, QKV
             biases, Q6K k/output, 28/4 GQA heads, q_dim 3584 -> q_pad
             4096): tempura CPU ppl 6.4567 vs llama.cpp 6.2968 =
