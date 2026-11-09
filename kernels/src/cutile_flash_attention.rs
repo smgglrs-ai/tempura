@@ -661,7 +661,11 @@ impl CutileFlashAttention {
 
         let seq_len_pad = seq_len.div_ceil(BR) * BR;
         let kv_len_pad = kv_len.div_ceil(BC) * BC;
-        let head_dim_pad = head_dim;
+        // Non-pow2 head dims (Phi-3.5: 96): the flash kernel's [*, D] tiles
+        // must be powers of two. Zero-padding the head dim is EXACT -- the
+        // pad columns contribute 0 to Q*K and produce 0 output columns that
+        // scatter_output_head never reads.
+        let head_dim_pad = head_dim.next_power_of_two().max(head_dim);
         let heads_per_group = n_heads / n_kv_heads;
         let cache_offset = (kv_len as i32) - (seq_len as i32);
         let stream = &self.stream;
@@ -872,7 +876,8 @@ impl CutileFlashAttention {
 
         let seq_len_pad = seq_len.div_ceil(BR) * BR;
         let kv_len_pad = kv_len.div_ceil(BC) * BC;
-        let head_dim_pad = head_dim;
+        // Non-pow2 head dims: zero-pad to pow2 (exact -- see forward_batched).
+        let head_dim_pad = head_dim.next_power_of_two().max(head_dim);
         let heads_per_group = n_heads / n_kv_heads;
         let cache_offset = (kv_len as i32) - (seq_len as i32);
         let stream = &self.stream;
@@ -1399,8 +1404,10 @@ impl Attention for CutileFlashAttention {
         // Pad dimensions to tile multiples.
         let seq_len_pad = seq_len.div_ceil(BR) * BR;
         let kv_len_pad = kv_len.div_ceil(BC) * BC;
-        // head_dim is a JIT const so it doesn't need padding beyond what the kernel handles.
-        let head_dim_pad = head_dim; // passed as const D; caller must ensure divisibility if needed
+        // head_dim is a JIT const so it doesn't need padding beyond what the
+        // kernel handles -- except non-pow2 dims (Phi-3.5: 96), whose [*, D]
+        // tiles must be powers of two: zero-pad (exact -- see forward_batched).
+        let head_dim_pad = head_dim.next_power_of_two().max(head_dim);
 
         let heads_per_group = num_heads / num_kv_heads;
         let cache_offset = (kv_len as i32) - (seq_len as i32);
