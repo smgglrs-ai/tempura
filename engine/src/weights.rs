@@ -441,8 +441,20 @@ impl QuantizedWeights {
                 GgmlType::TQ1_0 => {
                     i2s_tensors.insert(name.clone(), data.clone());
                 }
-                _ => {
+                // The catch-all previously swallowed EVERY other dtype
+                // (Q5K, Q5_0, Q5_1, Q2K, Q3K, IQ*, ...) as raw Q4K bytes --
+                // silent garbage when consumed by the Q4K kernels. The
+                // loader now force-dequants the 5-bit types; anything else
+                // landing here is a loader gap: skip it so the consumer
+                // fails visibly (MISSING) instead of computing garbage.
+                GgmlType::Q4K => {
                     q4k_tensors.insert(name.clone(), data.clone());
+                }
+                _ => {
+                    eprintln!(
+                        "[weights] WARNING: tensor {name} has dtype {dtype:?} with no \
+                         typed path -- skipping (force-dequant expected upstream)"
+                    );
                 }
             }
         }

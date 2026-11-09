@@ -1676,9 +1676,26 @@ impl GgufLoader {
 
             let is_quantized =
                 !matches!(tv.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
-            // I2S (bitnet.cpp type 39) has no matching GPU quantized kernel yet -- dequantize to f32.
-            // TL1 (type 38, ARM LUT format) also dequantized via TQ1_0 path.
-            let force_dequant = matches!(tv.dtype, GgmlType::I2S | GgmlType::TL1);
+            // Types WITHOUT a typed consume path (Q4K/Q6K/TQ1_0/TQ2_0/Q2_0
+            // have one; everything else -- Q5K, Q5_0/Q5_1, Q4_0/Q4_1, Q8_0,
+            // Q2K/Q3K, IQ*) must dequantize to f32. The catch-all in
+            // QuantizedWeights::new_typed previously misfiled ALL of these
+            // as raw Q4K bytes -- silent garbage (Phi-3.5-mini's Q5K
+            // attention, found via ppl 9057759x, 2026-11-09).
+            let has_typed_path = matches!(
+                tv.dtype,
+                GgmlType::Q4K
+                    | GgmlType::Q6K
+                    | GgmlType::TQ1_0
+                    | GgmlType::TQ2_0
+                    | GgmlType::Q2_0
+                    | GgmlType::F32
+                    | GgmlType::F16
+                    | GgmlType::BF16
+            );
+            // I2S/TL1 keep their special dequant routes below.
+            let force_dequant = !has_typed_path
+                && !matches!(tv.dtype, GgmlType::I2S | GgmlType::TL1);
             let keep_raw = if std::env::var("TEMPURA_F32_ALL").is_ok() {
                 false
             } else {
