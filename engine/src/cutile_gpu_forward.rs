@@ -439,6 +439,12 @@ pub struct CutileGpuModel {
     /// Qwen2.5-7B, whose q_dim 3584 pads to 4096; Llama/Mistral's 4096
     /// q_dim needs no padding and never hit this, 2026-11-07).
     attn_pad_scratch: RefCell<std::collections::HashMap<usize, Arc<Tensor<f32>>>>,
+    /// [m, h_pad] pad buffers for the decode path's o_proj / down_proj
+    /// residual-add operands (h != h_pad models, e.g. Qwen2.5 h=3584 ->
+    /// h_pad=4096). Two separate maps: the add kernels read both buffers
+    /// asynchronously, so o and down cannot share one.
+    oproj_pad_scratch: RefCell<std::collections::HashMap<usize, Arc<Tensor<f32>>>>,
+    down_pad_scratch: RefCell<std::collections::HashMap<usize, Arc<Tensor<f32>>>>,
     /// Pooled buffers for on-device prefill attention (`prefill_attention_device`):
     /// head-major Q/K/V gathers, flash output, interleaved output.  Grown on
     /// demand per (seq_pad, kv_pad); zero steady-state allocs per layer.
@@ -1638,6 +1644,40 @@ impl CutileGpuModel {
         let dummy_h_128 = self.to_device(&vec![0.0f32; 128 * self.h_pad], 128, self.h_pad);
         let _ = self.gemm_d2d(&dummy_h_128, "model.layers.0.self_attn.q_proj.weight", 128);
         let _ = self.gemm_d2d(&dummy_h_128, "model.layers.0.mlp.gate_proj.weight", 128);
+
+        // Warm up the QKV bias kernel for every distinct bias width
+        // (Qwen2/Phi families): the decode CUDA graph captures on the FIRST
+        // decode step, and a cuTile JIT compilation inside capture is illegal.
+        if !self.qkv_biases.is_empty() {
+            let stream = self.matmul.stream();
+            for bias in self.qkv_biases.values() {
+                let cols = bias.size();
+                if cols == 0 {
+                    continue;
+                }
+                let b = (cols & cols.wrapping_neg()).min(512);
+                let tpr = cols / b;
+                let dummy: Arc<Tensor<f32>> = Arc::new(
+                    api::zeros::<f32>(&[cols])
+                        .sync_on(stream)
+                        .expect("warmup: bias dummy alloc failed"),
+                );
+                let dummy_tensor =
+                    Arc::try_unwrap(dummy).expect("warmup dummy uniquely owned");
+                let part = dummy_tensor.partition([b]);
+                let (part, _) = unsafe {
+                    tempura_kernels::cutile_elementwise::kernels::cutile_bias_add_rows_tiled(
+                        part,
+                        bias.clone(),
+                    )
+                    .generics(vec![b.to_string(), tpr.to_string()])
+                    .async_on(stream)
+                    .expect("warmup: bias kernel launch failed")
+                };
+                let _ = part.unpartition();
+            }
+            let _ = stream.synchronize();
+        }
     }
 
     // -- constructors ----------------------------------------------------------
@@ -2265,6 +2305,8 @@ impl CutileGpuModel {
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
             attn_out_scratch: RefCell::new(attn_out_scratch),
             attn_pad_scratch: RefCell::new(std::collections::HashMap::new()),
+            oproj_pad_scratch: RefCell::new(std::collections::HashMap::new()),
+            down_pad_scratch: RefCell::new(std::collections::HashMap::new()),
             prefill_attn_scratch: RefCell::new(PrefillAttnScratch::default()),
             silu_out_scratch: RefCell::new(silu_out_scratch),
             prefill_pre_attn_norm_scratch: RefCell::new(prefill_pre_attn_norm_scratch),
@@ -2657,6 +2699,8 @@ impl CutileGpuModel {
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
             attn_out_scratch: RefCell::new(attn_out_scratch),
             attn_pad_scratch: RefCell::new(std::collections::HashMap::new()),
+            oproj_pad_scratch: RefCell::new(std::collections::HashMap::new()),
+            down_pad_scratch: RefCell::new(std::collections::HashMap::new()),
             prefill_attn_scratch: RefCell::new(PrefillAttnScratch::default()),
             silu_out_scratch: RefCell::new(silu_out_scratch),
             prefill_pre_attn_norm_scratch: RefCell::new(prefill_pre_attn_norm_scratch),
@@ -3394,6 +3438,78 @@ impl CutileGpuModel {
             );
             bufs.insert(m, buf);
         }
+    }
+
+    /// Pre-allocate the [m, h_pad] residual-add pad buffers for the decode
+    /// path. MUST be called before begin_capture at every capture site that
+    /// runs forward_decode_inner with h != h_pad (allocation during capture
+    /// is DriverError 900 -- same class as ensure_attn_pad_buf).
+    fn ensure_residual_pad_bufs(&self, m: usize) {
+        for bufs in [
+            &self.oproj_pad_scratch,
+            &self.down_pad_scratch,
+        ] {
+            let mut bufs = bufs.borrow_mut();
+            if !bufs.contains_key(&m) {
+                let stream = self.matmul.stream();
+                // Rank-1 flat: the consumer (add_device_scratch) partitions
+                // its operands as flat [BLOCK] tiles.
+                let buf = Arc::new(
+                    api::zeros::<f32>(&[m * self.h_pad])
+                        .sync_on(stream)
+                        .expect("ensure_residual_pad_bufs: zeros alloc failed"),
+                );
+                bufs.insert(m, buf);
+            }
+        }
+    }
+
+    /// Capture-safe row padding for the decode path's residual-add operands
+    /// (h -> h_pad, e.g. Qwen2.5 3584 -> 4096): cached zero-filled [m, h_pad]
+    /// buffer + per-row D->D copies of the valid prefix. The pad tail is
+    /// never written and stays zero across calls, so the residual add's
+    /// h_pad-wide reads see exact zeros beyond h. Zero-copy clone when no
+    /// padding is needed. Mirrors attn_out_to_oproj_device_m.
+    fn pad_rows_device(
+        &self,
+        src: &Arc<Tensor<f32>>,
+        valid_cols: usize,
+        pad_cols: usize,
+        m: usize,
+        bufs: &RefCell<std::collections::HashMap<usize, Arc<Tensor<f32>>>>,
+    ) -> Arc<Tensor<f32>> {
+        if pad_cols == valid_cols {
+            return src.clone();
+        }
+        let stream = self.matmul.stream();
+        let padded: Arc<Tensor<f32>> = {
+            let mut bufs = bufs.borrow_mut();
+            match bufs.get(&m) {
+                Some(buf) => buf.clone(),
+                None => {
+                    // Rank-1 flat [m * pad_cols]: the consumer
+                    // (add_device_scratch) partitions rank-1 inputs.
+                    let buf = Arc::new(
+                        api::zeros::<f32>(&[m * pad_cols])
+                            .sync_on(stream)
+                            .expect("pad_rows_device: zeros alloc failed"),
+                    );
+                    bufs.insert(m, buf.clone());
+                    buf
+                }
+            }
+        };
+        let src_base: CUdeviceptr = src.device_pointer().cu_deviceptr();
+        let dst_base: CUdeviceptr = padded.device_pointer().cu_deviceptr();
+        for r in 0..m {
+            let src = src_base + (r * valid_cols * std::mem::size_of::<f32>()) as u64;
+            let dst = dst_base + (r * pad_cols * std::mem::size_of::<f32>()) as u64;
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(dst, src, valid_cols, stream)
+                    .expect("pad_rows_device: D->D copy failed");
+            }
+        }
+        padded
     }
 
     fn attn_out_to_oproj_device_m(
@@ -4195,7 +4311,16 @@ impl CutileGpuModel {
         };
         let cols = bias.size();
         // Take the pool's reference so x is uniquely owned.
-        let pooled = self.scratch.borrow_mut()[slot].take();
+        let mut pooled = self.scratch.borrow_mut()[slot].take();
+        // The slot-pool lifecycle (decode GEMVs) writes the projection into
+        // the pooled slot tensor and returns a CLONE -- x and pooled are the
+        // same allocation with refcount 2, so try_unwrap(x) alone always
+        // fails and the bias would be silently skipped. Dropping the pooled
+        // reference when it aliases x leaves x uniquely owned; the tensor's
+        // device address is unchanged and it goes back into the pool below.
+        if pooled.as_ref().is_some_and(|p| Arc::ptr_eq(p, &x)) {
+            pooled = None;
+        }
         if std::env::var("TEMPURA_DEBUG_QKV_BIAS").is_ok() {
             eprintln!(
                 "[qkv-bias] {bias_name}: x.size={} cols={} pooled={}",
@@ -4241,9 +4366,13 @@ impl CutileGpuModel {
                 arc
             }
             Err(x) => {
-                // Pool held an extra reference we could not take; restore it.
+                // Pool held a non-aliasing reference we could not take;
+                // restore it (or keep the slot populated so a later captured
+                // step does not allocate) and skip the bias.
                 if let Some(p) = pooled {
                     self.scratch.borrow_mut()[slot] = Some(p);
+                } else {
+                    self.scratch.borrow_mut()[slot] = Some(x.clone());
                 }
                 x
             }
@@ -5364,6 +5493,7 @@ impl CutileGpuModel {
             // Pre-allocate the attn-out pad buffer (m=1): the padding path
             // allocates, which is illegal during capture (DriverError 900).
             self.ensure_attn_pad_buf(1);
+            self.ensure_residual_pad_bufs(1);
             // Drain v0.5.0's deferred frees before capturing (see
             // quiesce_retirement_before_capture).
             self.quiesce_retirement_before_capture(&stream);
@@ -5879,10 +6009,17 @@ impl CutileGpuModel {
             // O-projection (GPU, pre-allocated slot).
             let o_dev = self.gemm_any_d2d_slot(&attn_padded_dev, o_w_name, seq_len, SLOT_O);
 
+            // o_dev has h columns; pad to h_pad when h_pad > h (Qwen2.5:
+            // 3584 -> 4096) via the capture-safe D->D path -- the raw
+            // unpadded operand fails the add kernel's extent check and a
+            // host round-trip would be illegal inside CUDA graph capture.
+            let o_padded =
+                self.pad_rows_device(&o_dev, h, self.h_pad, seq_len, &self.oproj_pad_scratch);
+
             // Post-attention residual add (GPU, pre-allocated scratch).
             hidden_dev = self.add_device_scratch(
                 &hidden_dev,
-                &o_dev,
+                &o_padded,
                 seq_len * self.h_pad,
                 &mut self.post_attn_add_scratch.borrow_mut(),
             );
@@ -6015,12 +6152,11 @@ impl CutileGpuModel {
             let down_dev = self.gemm_any_d2d_slot(&gate_silu_dev, down_w_name, seq_len, SLOT_DOWN);
 
             // When h_pad == h (power-of-2 models) no padding is needed.
-            let down_padded = if self.h_pad == h {
-                down_dev
-            } else {
-                let down_host = self.download_device_tensor(&down_dev);
-                self.to_device_flat_padded(&down_host, seq_len, h, self.h_pad)
-            };
+            // Otherwise the capture-safe D->D pad -- the host round-trip this
+            // replaced syncs the stream and allocates, both illegal inside
+            // CUDA graph capture (h != h_pad models capture-broke here).
+            let down_padded =
+                self.pad_rows_device(&down_dev, h, self.h_pad, seq_len, &self.down_pad_scratch);
 
             // Post-FFN residual add (GPU, pre-allocated scratch).
             hidden_dev = self.add_device_scratch(
@@ -6360,6 +6496,11 @@ impl CutileGpuModel {
                 };
                 *self.prefill_last_key.borrow_mut() = Some(key);
                 if should_capture {
+                    // Pre-allocate the residual-add pad buffers for this
+                    // seq_len before capture (the eager first call already
+                    // created them; this is belt-and-suspenders for the
+                    // h != h_pad models whose pad path allocates).
+                    self.ensure_residual_pad_bufs(seq_len);
                     // Drain v0.5.0's deferred frees before capturing (see
                     // quiesce_retirement_before_capture): the eager first
                     // call dropped layer temporaries whose frees would land
@@ -6663,15 +6804,12 @@ impl CutileGpuModel {
                 }
 
                 // -- 2g. Residual add (GPU) ----------------------------------------
-                // o_dev has h columns; pad to h_pad when h_pad > h (rare edge case
-                // e.g. h=5120 -> h_pad=8192).  For models where h_pad == h (the
-                // common case) this is a zero-cost clone.
-                let o_padded = if self.h_pad == h {
-                    o_dev.clone()
-                } else {
-                    let o_host = self.download_device_tensor(&o_dev);
-                    self.to_device_flat_padded(&o_host, seq_len, h, self.h_pad)
-                };
+                // o_dev has h columns; pad to h_pad when h_pad > h (Qwen2.5:
+                // 3584 -> 4096) via the capture-safe D->D path -- the host
+                // round-trip this replaced (download + re-upload) panics when
+                // the prefill layer loop is captured into a CUDA graph.
+                let o_padded =
+                    self.pad_rows_device(&o_dev, h, self.h_pad, seq_len, &self.oproj_pad_scratch);
                 hidden_dev = if seq_len == 1 {
                     self.add_device_scratch(
                         &hidden_dev,
@@ -6848,12 +6986,15 @@ impl CutileGpuModel {
                         }
 
                         // -- 2l. Residual add (GPU) ------------------------------------
-                        let down_padded = if self.h_pad == h {
-                            down_dev.clone()
-                        } else {
-                            let down_host = self.download_device_tensor(&down_dev);
-                            self.to_device_flat_padded(&down_host, seq_len, h, self.h_pad)
-                        };
+                        // Capture-safe D->D pad (host round-trip replaced --
+                        // illegal inside prefill CUDA graph capture).
+                        let down_padded = self.pad_rows_device(
+                            &down_dev,
+                            h,
+                            self.h_pad,
+                            seq_len,
+                            &self.down_pad_scratch,
+                        );
                         if seq_len == 1 {
                             self.add_device_scratch(
                                 &hidden_dev,
@@ -9218,7 +9359,12 @@ impl CutileGpuModel {
             let o_dev = self.gemm_any_d2d_batch(&attn_padded, o_w_name, m, self.q_pad, SLOT_O);
 
             // Post-attention residual add (fresh alloc -- pre-allocated scratch is M=1 sized).
-            hidden_dev = self.add_device_scratch(&hidden_dev, &o_dev, m * self.h_pad, &mut None);
+            // o_dev is [m, h]; pad to h_pad for models with h != h_pad
+            // (Qwen2.5) via the D->D path -- the raw operand fails the add
+            // kernel's extent check.
+            let o_padded =
+                self.pad_rows_device(&o_dev, h, self.h_pad, m, &self.oproj_pad_scratch);
+            hidden_dev = self.add_device_scratch(&hidden_dev, &o_padded, m * self.h_pad, &mut None);
 
             // Post-attention RMSNorm.
             let post_ln_w_dev = self
@@ -9262,7 +9408,9 @@ impl CutileGpuModel {
             let down_dev =
                 self.gemm_any_d2d_batch(&gs_padded, down_w_name, m, self.inter_pad, SLOT_DOWN);
 
-            hidden_dev = self.add_device_scratch(&hidden_dev, &down_dev, m * self.h_pad, &mut None);
+            let down_padded =
+                self.pad_rows_device(&down_dev, h, self.h_pad, m, &self.down_pad_scratch);
+            hidden_dev = self.add_device_scratch(&hidden_dev, &down_padded, m * self.h_pad, &mut None);
         }
 
         // Final norm.
