@@ -22,19 +22,20 @@ pub mod kernels {
         out.store(tile_a + tile_b);
     }
 
-    /// Row-broadcast bias add: out[row, n] = a[row, n] + bias[n].
-    /// `a` is flat row-major [rows*N], `bias` is [N]; one program per row
-    /// (pid). Same flat-tensor partition pattern as rmsnorm_fused.
+    /// In-place row-broadcast bias add: out[row, :] += bias[:].
+    /// `out` is flat row-major [rows*N] partitioned by [N] (one program per
+    /// row); `bias` is [N]. In-place via out.load/out.store (same pattern
+    /// as the upstream `increment` test kernel). Rows beyond the valid
+    /// region (m_pad padding) receive the bias too -- harmless: pad rows
+    /// never enter the KV cache or downstream reads.
     #[cutile::entry()]
     pub fn cutile_bias_add_rows<const N: i32>(
         out: &mut Tensor<f32, { [N] }>,
-        a: &Tensor<f32, { [-1] }>,
         bias: &Tensor<f32, { [-1] }>,
     ) {
-        let pid = program_id(0);
-        let tile_a = a.partition(shape![N]).load([pid]);
         let tile_b = bias.partition(shape![N]).load([0i32]);
-        out.store(tile_a + tile_b);
+        let x = out.load();
+        out.store(x + tile_b);
     }
 
     /// SiLU-gated MLP: out[i] = SiLU(gate[i]) * up[i]
