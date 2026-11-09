@@ -687,22 +687,43 @@ typical-p/repeat/presence/frequency)
             GPU corr 0.9983 with TEMPURA_NO_MXFP4=1 (argmax MATCHES
             llama), 0.9326 default config -- the MXFP4 double-
             quantization band is much wider on Qwen than Llama-3.1's
-            ~0.999. IMPORTANT CAVEAT on the ppl PASS: Qwen prefill runs
-            the EXACT host-dequant fallback (8 tok/s pp128!), not the
-            MXFP4 fast path -- gemm_mxfp4_prefill's a.size() == m*k guard
-            rejects the h_pad-strided (4096) rmsnorm outputs against
-            native k=3584 weights, so every prefill GEMM falls back.
-            The ppl therefore validates the exact path; the default-
-            config MXFP4 band (corr 0.93) is NOT what the ppl measured.
-            Follow-ups: (a) strided/padded MXFP4 prefill for h != h_pad
-            models (row-stride param on the activation quant, or pad the
-            weight k at upload) -- this is also the Qwen prefill perf
-            fix (8 tok/s vs Llama's 7700); (b) batch-decode CUDA graphs
-            (m>=2) still have no QKV bias support; (c) the GPU bisect
-            switches remain broken for PREFILLS (TEMPURA_NO_MXFP4=1 /
-            TEMPURA_NO_GPU_PREFILL=1 panic during capture, pre-existing)
-            -- though they DO work in single-forward probe mode, which
-            is how the 0.9983-vs-0.9326 split above was measured.
+            ~0.999.
+            PREFILL PERF + MXFP4 ON h != h_pad MODELS (same session,
+            later): gemm_mxfp4_prefill_ep now infers the activation's
+            row stride from its flat size (a.size()/m) and D->D-compacts
+            the valid rows into a cached [m_pad, k] buffer before the
+            quant -- previously the a.size() == m*k guard rejected every
+            h_pad-strided activation (Qwen: rmsnorm emits 4096-strided
+            rows against native k=3584 weights), silently routing every
+            Qwen prefill GEMM to the host-dequant fallback that
+            DOWNLOADS AND DEQUANTS THE WHOLE WEIGHT MATRIX PER CALL
+            (8 tok/s pp128, TTFT 15.8 s). Post-fix: prefill 2417 tok/s
+            (TTFT P50 52 ms; llama.cpp 7335 = 3.0x gap remaining),
+            decode unchanged 218. All 197 projections now run MXFP4:
+            ppl (default config) 6.6770 = GPU/CPU 1.0341x, GPU/llama
+            1.0604x, PASS at the 1.10 gate (BETTER than Llama-3.1's
+            accepted 1.09), 0 NaN; bench-quality teacher-forced
+            GPU-vs-CPU 52/64 = 81.2% PASS (GPU-vs-llama 82.8% vs CPU's
+            84.4% -- the band costs ~1.6 pts of llama agreement, same
+            acceptance profile as Llama; report
+            bench-quality-qwen25-7b.json). Logit-level probe corr with
+            the full band: 0.8223 (was 0.9326 when only down_proj ran
+            MXFP4, 0.9983 exact) -- the ppl gate, not logit corr, is
+            the acceptance criterion (a 1.7 logit-mean shift from
+            accumulated 4-bit activation-quant noise moves logits but
+            barely moves sequence-level NLL). The exact path remains
+            one env away (TEMPURA_NO_MXFP4=1).
+            Follow-ups: (a) [x] strided/padded MXFP4 prefill (done --
+            the stride-inference + compaction above); (b) batch-decode
+            CUDA graphs (m>=2) still have no QKV bias support; (c) the
+            GPU bisect switches remain broken for PREFILLS
+            (TEMPURA_NO_MXFP4=1 / TEMPURA_NO_GPU_PREFILL=1 panic during
+            capture, pre-existing) -- though they DO work in
+            single-forward probe mode, which is how the
+            0.9983-vs-0.9326-vs-0.8223 split above was measured;
+            (d) the remaining 3x prefill gap vs llama.cpp (Llama does
+            7700 on the same stack -- Qwen's smaller n=3584 GEMM grids
+            and the per-GEMM compaction copies are the first suspects).
             Historical context (superseded): four historical-state
             bisects all gave corr -0.0288 constant argmax; the Nov-7
             0.98 reading was irreproducible.
@@ -798,12 +819,14 @@ typical-p/repeat/presence/frequency)
               kani.yml via web or auth gh before building on top;
               (9) next-session priorities, in order (updated 2026-11-09
               late: the Qwen GPU probe + ppl are DONE, see the Qwen GPU
-              entry): (a) Qwen prefill perf -- strided/padded MXFP4
-              prefill for h != h_pad models (8 tok/s on the exact
-              fallback today); (b) Phi GPU needs a non-pow2 rope
-              (head_dim 96) + CutileRoPE mscale; (c) Gemma-2-9B ppl
-              would complete the 5th family; (d) batch-decode CUDA
-              graphs (m>=2) QKV bias support.
+              entry; (a) below also DONE same day -- Qwen prefill 2417
+              tok/s via stride-inference + compaction in
+              gemm_mxfp4_prefill_ep, ppl 1.0341 PASS, bench-quality
+              81.2% PASS): (a) [x] Qwen prefill perf; (b) Phi GPU needs
+              a non-pow2 rope (head_dim 96) + CutileRoPE mscale;
+              (c) Gemma-2-9B ppl would complete the 5th family;
+              (d) batch-decode CUDA graphs (m>=2) QKV bias support;
+              (e) the remaining 3x Qwen prefill gap vs llama.cpp.
       (b) [x] **MMLU-style log-prob evaluation**: bench-mmlu
           (tools/bench-gpu/src/bench_mmlu.rs). Per question: prefill the
           standard harness prompt, read the log-probs of the four
