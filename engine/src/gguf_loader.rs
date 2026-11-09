@@ -1322,8 +1322,7 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
                         _ => None,
                     })
                     .unwrap_or(false)
-        }
-                .unwrap_or(false),
+        },
         rmsnorm_offset: matches!(architecture, crate::config::Architecture::Gemma),
         attn_logit_softcapping: metadata
             .get(&format!("{arch}.attention.logit_softcapping"))
