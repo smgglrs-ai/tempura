@@ -345,6 +345,11 @@ pub struct CutileGpuModel {
     /// Pre-uploaded RMSNorm weight vectors (1-D, `[h_pad]` elements) keyed by
     /// their HuggingFace tensor name (e.g. `model.layers.0.input_layernorm.weight`).
     norm_weights: HashMap<String, Arc<Tensor<f32>>>,
+    /// Pre-uploaded attention Q/K/V bias vectors (1-D, `[q_dim]`/`[kv_dim]`)
+    /// keyed by HF name (e.g. `model.layers.0.self_attn.q_proj.bias`) --
+    /// Qwen2/Phi-family. Applied via cutile_bias_add_rows after the
+    /// projections, BEFORE rope (the bias is part of the projection).
+    qkv_biases: HashMap<String, Arc<Tensor<f32>>>,
     matmul: CutileMatMul,
     /// Q4_K on-GPU GEMV dispatcher -- shares the same CUDA stream as `matmul`.
     q4k_gemv: CutileQ4Gemv,
@@ -1660,6 +1665,7 @@ impl CutileGpuModel {
         let mut dw_q6k: HashMap<String, DeviceWeightQ6K> = HashMap::new();
         let mut dw_mxfp4_tiled: HashMap<String, DeviceWeightMxfp4Tiled> = HashMap::new();
         let mut nw: HashMap<String, Arc<Tensor<f32>>> = HashMap::new();
+        let mut qkv_biases: HashMap<String, Arc<Tensor<f32>>> = HashMap::new();
 
         let h = config.hidden_size;
         let n_heads = config.num_attention_heads;
@@ -1849,6 +1855,28 @@ impl CutileGpuModel {
         // Final norm weight.
         if let Some(w) = qw.get_f32("model.norm.weight") {
             Self::upload_norm_weight(matmul.stream(), &mut nw, "model.norm.weight", w, h, h_pad)?;
+        }
+
+        // Attention QKV biases (Qwen2/Phi-family): upload un-padded -- the
+        // bias add runs on the raw [q_dim]/[kv_dim] projection outputs,
+        // before the q_pad padding for the O projection.
+        for l in 0..config.num_layers {
+            let p = format!("model.layers.{l}");
+            for (proj, dim) in [("q_proj", q_dim), ("k_proj", kv_dim), ("v_proj", kv_dim)] {
+                let name = format!("{p}.self_attn.{proj}.bias");
+                if let Some(b) = qw.get_f32(&name) {
+                    if b.len() == dim {
+                        let tensor: Arc<Tensor<f32>> =
+                            api::copy_host_vec_to_device(&Arc::new(b.to_vec()))
+                                .sync_on(matmul.stream())
+                                .map_err(|e| {
+                                    tempura_kernels::KernelError::InvalidConfig(e.to_string())
+                                })?
+                                .into();
+                        qkv_biases.insert(name, tensor);
+                    }
+                }
+            }
         }
 
         // lm_head MXFP4 tiling for the m>1 paths (prefill + batch-decode
@@ -2211,6 +2239,7 @@ impl CutileGpuModel {
             mxfp4_out_inter: None,
             mxfp4_out_h: None,
             norm_weights: nw,
+            qkv_biases,
             matmul,
             q4k_gemv,
             q2_gemv,
@@ -2321,6 +2350,7 @@ impl CutileGpuModel {
         let flash_attn = CutileFlashAttention::new()?;
         let mut dw: HashMap<String, DeviceWeight> = HashMap::new();
         let mut nw: HashMap<String, Arc<Tensor<f32>>> = HashMap::new();
+        let mut qkv_biases: HashMap<String, Arc<Tensor<f32>>> = HashMap::new();
 
         let h = config.hidden_size;
         let n_heads = config.num_attention_heads;
@@ -2601,6 +2631,7 @@ impl CutileGpuModel {
             mxfp4_out_inter: None,
             mxfp4_out_h: None,
             norm_weights: nw,
+            qkv_biases,
             matmul,
             q4k_gemv,
             q2_gemv,
@@ -4148,6 +4179,58 @@ impl CutileGpuModel {
             .expect("gemm_q4k_d2d_slot failed")
     }
 
+    /// In-place QKV bias add (Qwen2/Phi-family): adds the pre-uploaded bias
+    /// to the projection output slot via cutile_bias_add_rows. Takes the
+    /// pool's reference so `x` is uniquely owned for the partition, then
+    /// restores the pool. No allocation -- CUDA-graph capture safe. The
+    /// bias column count is the row width (one program per row).
+    fn apply_qkv_bias(
+        &self,
+        x: Arc<Tensor<f32>>,
+        bias_name: &str,
+        slot: usize,
+    ) -> Arc<Tensor<f32>> {
+        let Some(bias) = self.qkv_biases.get(bias_name).cloned() else {
+            return x;
+        };
+        let cols = bias.size();
+        // Take the pool's reference so x is uniquely owned.
+        let pooled = self.scratch.borrow_mut()[slot].take();
+        match Arc::try_unwrap(x) {
+            Ok(tensor) => {
+                if tensor.size() % cols != 0 || tensor.size() == 0 {
+                    // Unexpected shape -- restore and skip rather than guess.
+                    let arc = Arc::new(tensor);
+                    self.scratch.borrow_mut()[slot] = pooled.or(Some(arc.clone()));
+                    return arc;
+                }
+                let out_part = tensor.partition([cols]);
+                let (out_part, _) = unsafe {
+                    tempura_kernels::cutile_elementwise::kernels::cutile_bias_add_rows(
+                        out_part,
+                        bias,
+                    )
+                    .generics(vec![cols.to_string()])
+                    .async_on(self.matmul.stream())
+                    .expect("apply_qkv_bias: kernel launch failed")
+                };
+                let arc = Arc::new(out_part.unpartition());
+                let mut pool = self.scratch.borrow_mut();
+                if pool[slot].is_none() {
+                    pool[slot] = Some(arc.clone());
+                }
+                arc
+            }
+            Err(x) => {
+                // Pool held an extra reference we could not take; restore it.
+                if let Some(p) = pooled {
+                    self.scratch.borrow_mut()[slot] = Some(p);
+                }
+                x
+            }
+        }
+    }
+
     /// Dispatch Q, K, V projections with multi-stream concurrency for decode (seq_len=1).
     ///
     /// When oxide GEMVs are available for the weight format and seq_len==1, K and V
@@ -4186,6 +4269,11 @@ impl CutileGpuModel {
         let q_dev = self.gemm_any_d2d_slot(normed, q_name, seq_len, SLOT_Q);
         let k_dev = self.gemm_any_d2d_slot(normed, k_name, seq_len, SLOT_K);
         let v_dev = self.gemm_any_d2d_slot(normed, v_name, seq_len, SLOT_V);
+        // QKV biases (Qwen2/Phi): added on the main stream, before rope.
+        let bias_of = |w: &str| format!("{}.bias", w.strip_suffix(".weight").unwrap_or(w));
+        let q_dev = self.apply_qkv_bias(q_dev, &bias_of(q_name), SLOT_Q);
+        let k_dev = self.apply_qkv_bias(k_dev, &bias_of(k_name), SLOT_K);
+        let v_dev = self.apply_qkv_bias(v_dev, &bias_of(v_name), SLOT_V);
         (q_dev, k_dev, v_dev)
     }
 
@@ -4225,6 +4313,12 @@ impl CutileGpuModel {
             .wait_event(&self.event_kv_done)
             .expect("stream_main wait_event(kv_done) failed");
 
+        // QKV biases (Qwen2/Phi): the join above orders the K/V GEMVs, so
+        // adding on the main stream here is race-free.
+        let bias_of = |w: &str| format!("{}.bias", w.strip_suffix(".weight").unwrap_or(w));
+        let q_dev = self.apply_qkv_bias(q_dev, &bias_of(q_name), SLOT_Q);
+        let k_dev = self.apply_qkv_bias(k_dev, &bias_of(k_name), SLOT_K);
+        let v_dev = self.apply_qkv_bias(v_dev, &bias_of(v_name), SLOT_V);
         (q_dev, k_dev, v_dev)
     }
 
