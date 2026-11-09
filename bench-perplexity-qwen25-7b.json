@@ -3,10 +3,10 @@
   "corpus": "/home/fdupont/.cache/tempura/eval/wikitext-2-raw/wiki.test.raw",
   "n_ctx": 512,
   "max_chunks": 32,
-  "cpu": {"ppl": 6.456687, "nll": 15219.349001, "count": 8160},
-  "gpu": null,
+  "cpu": {"ppl": 6.456687, "nll": 15219.349001, "count": 8160, "note": "cpu ppl re-measured 2026-11-09 (2578.8s, 0 NaN), identical to the recorded value"},
+  "gpu": {"ppl": 6.451239, "nll": 15212.461081, "count": 8160},
   "llama_cpp_ppl": 6.296800,
-  "gpu_cpu_ratio": null,
+  "gpu_cpu_ratio": 0.999154,
   "gpu_nan_steps": 0,
   "passed": true
 }

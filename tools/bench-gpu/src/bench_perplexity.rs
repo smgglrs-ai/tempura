@@ -352,10 +352,21 @@ fn main() {
     }
 
     // --- Perplexity on both paths ---
-    println!("\n--- tempura CPU ---");
-    let cpu_res = perplexity(&cpu_model, &config, &corpus_tokens, &opts)
-        .expect("corpus too short for one chunk");
-    report_line("tempura CPU", &cpu_res);
+    // TEMPURA_PPL_NO_CPU=1 skips the CPU side (its number is stable across
+    // runs; GPU iteration does not need to re-pay the ~45 min CPU pass).
+    let cpu_res = if std::env::var("TEMPURA_PPL_NO_CPU").is_ok() {
+        println!("\n(tempura CPU side skipped: TEMPURA_PPL_NO_CPU=1)");
+        None
+    } else {
+        println!("\n--- tempura CPU ---");
+        Some(
+            perplexity(&cpu_model, &config, &corpus_tokens, &opts)
+                .expect("corpus too short for one chunk"),
+        )
+    };
+    if let Some(ref r) = cpu_res {
+        report_line("tempura CPU", r);
+    }
 
     #[cfg(feature = "cutile")]
     let gpu_res_opt = if let Some(ref wrapper) = wrapper {
@@ -421,8 +432,18 @@ fn main() {
     };
 
     // --- Comparison ---
+    // When the CPU side was skipped, the reference ppl comes from
+    // TEMPURA_PPL_CPU_REF (the recorded stable CPU number for this
+    // model+corpus); without it the ratio gate is skipped.
+    let cpu_ref_ppl: Option<f64> = cpu_res
+        .as_ref()
+        .map(|r| r.ppl)
+        .or_else(|| std::env::var("TEMPURA_PPL_CPU_REF").ok().and_then(|v| v.parse().ok()));
     println!("\n--- Comparison ---");
-    let gpu_cpu_ratio = gpu_res_opt.as_ref().map(|g| g.ppl / cpu_res.ppl);
+    let gpu_cpu_ratio = match (&gpu_res_opt, cpu_ref_ppl) {
+        (Some(g), Some(cp)) => Some(g.ppl / cp),
+        _ => None,
+    };
     if let Some(r) = gpu_cpu_ratio {
         println!(
             "  tempura GPU / tempura CPU: {:.4}x  (1.00x = identical logits quality)",
@@ -430,17 +451,20 @@ fn main() {
         );
     }
     if let Some(lp) = llama_ppl {
-        println!("  tempura CPU / llama.cpp:    {:.4}x", cpu_res.ppl / lp);
+        if let Some(cp) = cpu_ref_ppl {
+            println!("  tempura CPU / llama.cpp:    {:.4}x", cp / lp);
+        }
         if let Some(ref g) = gpu_res_opt {
             println!("  tempura GPU / llama.cpp:    {:.4}x", g.ppl / lp);
         }
     }
 
-    let passed = cpu_res.nan_steps == 0
+    let passed = cpu_res.as_ref().map_or(true, |c| c.nan_steps == 0)
         && gpu_res_opt.as_ref().map_or(true, |g| {
             g.nan_steps == 0
-                && g.ppl / cpu_res.ppl <= max_ratio
-                && g.ppl / cpu_res.ppl >= 1.0 / max_ratio
+                && cpu_ref_ppl.map_or(true, |cp| {
+                    g.ppl / cp <= max_ratio && g.ppl / cp >= 1.0 / max_ratio
+                })
         });
     println!(
         "\n--- Verdict ---\n  {} (GPU/CPU ratio {} vs gate {:.2}, NaN steps: gpu {} cpu {})",
@@ -448,15 +472,15 @@ fn main() {
         gpu_cpu_ratio.map(|v| format!("{v:.4}")).unwrap_or_else(|| "skipped".into()),
         max_ratio,
         gpu_res_opt.as_ref().map(|g| g.nan_steps).unwrap_or(0),
-        cpu_res.nan_steps,
+        cpu_res.as_ref().map(|c| c.nan_steps).unwrap_or(0),
     );
 
     let json = format!(
-        "{{\n  \"model\": {:?},\n  \"corpus\": {:?},\n  \"n_ctx\": {n_ctx},\n  \"max_chunks\": {},\n  \"cpu\": {{\"ppl\": {:.6}, \"nll\": {:.6}, \"count\": {}}},\n  \"gpu\": {},\n  \"llama_cpp_ppl\": {},\n  \"gpu_cpu_ratio\": {},\n  \"gpu_nan_steps\": {},\n  \"passed\": {passed}\n}}\n",
+        "{{\n  \"model\": {:?},\n  \"corpus\": {:?},\n  \"n_ctx\": {n_ctx},\n  \"max_chunks\": {},\n  \"cpu\": {},\n  \"gpu\": {},\n  \"llama_cpp_ppl\": {},\n  \"gpu_cpu_ratio\": {},\n  \"gpu_nan_steps\": {},\n  \"passed\": {passed}\n}}\n",
         model_path.display().to_string(),
         corpus_path.display().to_string(),
         max_chunks.map(|n| n.to_string()).unwrap_or_else(|| "null".into()),
-        cpu_res.ppl, cpu_res.nll, cpu_res.count,
+        cpu_res.as_ref().map(|c| format!("{{\"ppl\": {:.6}, \"nll\": {:.6}, \"count\": {}}}", c.ppl, c.nll, c.count)).unwrap_or_else(|| cpu_ref_ppl.map(|v| format!("{{\"ppl\": {v:.6}, \"source\": \"TEMPURA_PPL_CPU_REF\"}}")).unwrap_or_else(|| "null".into())),
         gpu_res_opt.as_ref().map(|g| format!("{{\"ppl\": {:.6}, \"nll\": {:.6}, \"count\": {}}}", g.ppl, g.nll, g.count)).unwrap_or_else(|| "null".into()),
         llama_ppl.map(|v| format!("{v:.6}")).unwrap_or_else(|| "null".into()),
         gpu_cpu_ratio.map(|v| format!("{v:.6}")).unwrap_or_else(|| "null".into()),
