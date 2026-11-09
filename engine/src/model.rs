@@ -174,7 +174,7 @@ fn attention_layer_decode(
             k_rope[hh * rope_dim..(hh + 1) * rope_dim]
                 .copy_from_slice(&k[hh * head_dim..hh * head_dim + rope_dim]);
         }
-        rope.forward(&mut q_rope, 1, 1, n_heads, rope_dim, positions, rope_theta)
+        rope.forward(&mut q_rope, 1, 1, n_heads, rope_dim, positions, rope_theta, 1.0)
             .unwrap();
         rope.forward(
             &mut k_rope,
@@ -184,6 +184,7 @@ fn attention_layer_decode(
             rope_dim,
             positions,
             rope_theta,
+            1.0,
         )
         .unwrap();
         for hh in 0..n_heads {
@@ -195,9 +196,9 @@ fn attention_layer_decode(
                 .copy_from_slice(&k_rope[hh * rope_dim..(hh + 1) * rope_dim]);
         }
     } else {
-        rope.forward(q, 1, 1, n_heads, head_dim, positions, rope_theta)
+        rope.forward(q, 1, 1, n_heads, head_dim, positions, rope_theta, 1.0)
             .unwrap();
-        rope.forward(k, 1, 1, n_kv_heads, head_dim, positions, rope_theta)
+        rope.forward(k, 1, 1, n_kv_heads, head_dim, positions, rope_theta, 1.0)
             .unwrap();
     }
 
@@ -938,6 +939,7 @@ where
                         head_dim,
                         &positions,
                         cfg.rope_theta,
+                                    cfg.rope_attn_factor,
                     )
                     .unwrap();
                 self.pipeline
@@ -949,6 +951,7 @@ where
                         head_dim,
                         &positions,
                         cfg.rope_theta,
+                                    cfg.rope_attn_factor,
                     )
                     .unwrap();
 
@@ -4911,6 +4914,7 @@ where
                                         rope_hd,
                                         &positions,
                                         cfg.rope_theta,
+                                        cfg.rope_attn_factor,
                                     )
                                     .unwrap();
                                 rope_table
@@ -4922,6 +4926,7 @@ where
                                         rope_hd,
                                         &positions,
                                         cfg.rope_theta,
+                                        cfg.rope_attn_factor,
                                     )
                                     .unwrap();
                             } else {
@@ -4934,6 +4939,7 @@ where
                                         rope_hd,
                                         &positions,
                                         cfg.rope_theta,
+                                    cfg.rope_attn_factor,
                                     )
                                     .unwrap();
                                 self.pipeline
@@ -4945,6 +4951,7 @@ where
                                         rope_hd,
                                         &positions,
                                         cfg.rope_theta,
+                                    cfg.rope_attn_factor,
                                     )
                                     .unwrap();
                             }
@@ -4972,6 +4979,7 @@ where
                                     head_dim,
                                     &positions,
                                     cfg.rope_theta,
+                                        cfg.rope_attn_factor,
                                 )
                                 .unwrap();
                             rope_table
@@ -4983,6 +4991,7 @@ where
                                     head_dim,
                                     &positions,
                                     cfg.rope_theta,
+                                        cfg.rope_attn_factor,
                                 )
                                 .unwrap();
                         } else {
@@ -4995,6 +5004,7 @@ where
                                     head_dim,
                                     &positions,
                                     cfg.rope_theta,
+                                    cfg.rope_attn_factor,
                                 )
                                 .unwrap();
                             self.pipeline
@@ -5006,6 +5016,7 @@ where
                                     head_dim,
                                     &positions,
                                     cfg.rope_theta,
+                                    cfg.rope_attn_factor,
                                 )
                                 .unwrap();
                         }
@@ -6811,6 +6822,7 @@ where
                                     rope_hd,
                                     &positions,
                                     cfg.rope_theta,
+                                    cfg.rope_attn_factor,
                                 )
                                 .unwrap();
                             self.pipeline
@@ -6822,6 +6834,7 @@ where
                                     rope_hd,
                                     &positions,
                                     cfg.rope_theta,
+                                    cfg.rope_attn_factor,
                                 )
                                 .unwrap();
                             for hh in 0..n_heads {
@@ -6842,6 +6855,7 @@ where
                                     head_dim,
                                     &positions,
                                     cfg.rope_theta,
+                                    cfg.rope_attn_factor,
                                 )
                                 .unwrap();
                             self.pipeline
@@ -6853,6 +6867,7 @@ where
                                     head_dim,
                                     &positions,
                                     cfg.rope_theta,
+                                    cfg.rope_attn_factor,
                                 )
                                 .unwrap();
                         }
@@ -7492,6 +7507,7 @@ where
                         head_dim,
                         &positions,
                         cfg.rope_theta,
+                        cfg.rope_attn_factor,
                     )
                     .unwrap();
                     rope.forward(
@@ -7502,6 +7518,7 @@ where
                         head_dim,
                         &positions,
                         cfg.rope_theta,
+                        cfg.rope_attn_factor,
                     )
                     .unwrap();
                     if do_profile {
@@ -9094,6 +9111,7 @@ where
                             head_dim,
                             &positions[t_start..t_end],
                             cfg.rope_theta,
+                            cfg.rope_attn_factor,
                         )
                         .unwrap();
                         rope.forward(
@@ -9104,6 +9122,7 @@ where
                             head_dim,
                             &positions[t_start..t_end],
                             cfg.rope_theta,
+                            cfg.rope_attn_factor,
                         )
                         .unwrap();
                     }
@@ -11543,6 +11562,7 @@ mod tests {
             vocab_size: vocab,
             max_seq_len: 64,
             rope_theta: 10000.0,
+            rope_attn_factor: 1.0,
             layer_norm_eps: 1e-5,
             hidden_act: crate::config::HiddenAct::SquaredRelu,
             rope_type: crate::config::RopeType::Norm,
@@ -11691,6 +11711,7 @@ mod tests {
             vocab_size: vocab,
             max_seq_len: 64,
             rope_theta: 10000.0,
+            rope_attn_factor: 1.0,
             layer_norm_eps: 1e-5,
             hidden_act: crate::config::HiddenAct::SquaredRelu,
             rope_type: crate::config::RopeType::Norm,

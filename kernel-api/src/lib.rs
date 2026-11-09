@@ -234,6 +234,7 @@ pub trait RoPE: Send + Sync {
         head_dim: usize,
         positions: &[u32],
         theta: f32,
+        attn_factor: f32,
     ) -> Result<()>;
 
     fn verification_tier(&self) -> VerificationTier {
