@@ -763,6 +763,74 @@ fn tensor_data_size(dtype: GgmlType, num_elements: u64, _dims: &[u64]) -> u64 {
     }
 }
 
+/// Split a fused `blk.N.attn_qkv.weight` tensor (Phi-3/3.5, and GGUFs built
+/// with llama.cpp's --fuse-qkv) into synthetic attn_q/attn_k/attn_v entries.
+///
+/// Layout matches llama.cpp's `llm_graph_context::build_qkv` fused path: the
+/// matrix is a plain row concatenation -- Q rows [0, q_dim), K rows
+/// [q_dim, q_dim+kv_dim), V rows last. Every row is a whole number of quant
+/// blocks (block granularity is along the input dim), so the byte slices are
+/// exact row ranges.
+///
+/// Returns (synthetic gguf name, dims, byte offset, byte length) per part, or
+/// None when the name is not a fused QKV weight or the shape disagrees with
+/// the metadata head counts.
+fn split_fused_qkv(
+    gguf_name: &str,
+    dims: &[u64],
+    byte_size: usize,
+    metadata: &HashMap<String, GgufValue>,
+) -> Option<Vec<(String, Vec<u64>, usize, usize)>> {
+    let prefix = gguf_name.strip_suffix(".attn_qkv.weight")?;
+    if dims.len() != 2 {
+        return None;
+    }
+    let arch = metadata
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)?;
+    let get_usize = |key: &str| -> Option<usize> {
+        metadata
+            .get(&format!("{arch}.{key}"))
+            .and_then(|v| v.as_u32())
+            .map(|v| v as usize)
+    };
+    let heads = get_usize("attention.head_count")?;
+    let kv_heads = get_usize("attention.head_count_kv").unwrap_or(heads);
+    let hidden = get_usize("embedding_length")?;
+    let head_dim = get_usize("attention.key_length").unwrap_or(hidden / heads);
+    let q_dim = heads * head_dim;
+    let kv_dim = kv_heads * head_dim;
+
+    let (k, total_rows) = (dims[0] as usize, dims[1] as usize);
+    if total_rows != q_dim + 2 * kv_dim {
+        // Shape does not match the metadata -- treat as an ordinary tensor
+        // rather than guessing (the Deltanet ssm qkv has a different layout).
+        return None;
+    }
+    let row_bytes = byte_size / total_rows;
+    if row_bytes * total_rows != byte_size {
+        return None;
+    }
+    let part = |suffix: &str, rows: usize, off: usize| {
+        (
+            format!("{prefix}.{suffix}"),
+            vec![k as u64, rows as u64],
+            off,
+            rows * row_bytes,
+        )
+    };
+    Some(vec![
+        part("attn_q.weight", q_dim, 0),
+        part("attn_k.weight", kv_dim, q_dim * row_bytes),
+        part(
+            "attn_v.weight",
+            kv_dim,
+            (q_dim + kv_dim) * row_bytes,
+        ),
+    ])
+}
+
 fn map_gguf_name(gguf_name: &str) -> Option<String> {
     match gguf_name {
         "token_embd.weight" => return Some("model.embed_tokens.weight".into()),
@@ -1488,27 +1556,71 @@ impl GgufLoader {
         let mut f16_raw_tensors: HashMap<String, Vec<u8>> = HashMap::new();
         let mut mmap_ranges: HashMap<String, (usize, usize, GgmlType)> = HashMap::new();
 
+        // Expand fused attn_qkv tensors (Phi-3/3.5, --fuse-qkv GGUFs) into
+        // synthetic attn_q/k/v entries BEFORE processing, so every downstream
+        // path (dequant, mmap ranges, repack, indexed layers) sees ordinary
+        // per-projection tensors. Layout matches llama.cpp build_qkv: Q rows
+        // [0, q_dim), K rows next, V rows last; rows are whole quant blocks,
+        // so the byte slices are exact.
+        struct TensorView {
+            name: String,
+            dims: Vec<u64>,
+            dtype: GgmlType,
+            abs_offset: usize,
+            byte_size: usize,
+        }
+        let mut views: Vec<TensorView> = Vec::with_capacity(tensor_infos.len());
         for (i, info) in tensor_infos.iter().enumerate() {
-            let num_elements: u64 = info.dims.iter().product();
             let byte_size = tensor_byte_sizes_nonq[i];
             let abs_offset = data_start + info.offset as usize;
-
             if abs_offset + byte_size > data.len() {
                 return Err(LoadError::GgufParse(format!(
                     "tensor '{}' data out of bounds",
                     info.name,
                 )));
             }
+            if let Some(parts) = split_fused_qkv(&info.name, &info.dims, byte_size, &metadata) {
+                for (name, dims, off, len) in parts {
+                    views.push(TensorView {
+                        name,
+                        dims,
+                        dtype: info.dtype,
+                        abs_offset: abs_offset + off,
+                        byte_size: len,
+                    });
+                }
+                continue;
+            }
+            views.push(TensorView {
+                name: info.name.clone(),
+                dims: info.dims.clone(),
+                dtype: info.dtype,
+                abs_offset,
+                byte_size,
+            });
+        }
+
+        for tv in &views {
+            let num_elements: u64 = tv.dims.iter().product();
+            let byte_size = tv.byte_size;
+            let abs_offset = tv.abs_offset;
+
+            if abs_offset + byte_size > data.len() {
+                return Err(LoadError::GgufParse(format!(
+                    "tensor '{}' data out of bounds",
+                    tv.name,
+                )));
+            }
 
             let tensor_data = &data[abs_offset..abs_offset + byte_size];
             let ne = num_elements as usize;
-            let mapped_name = map_gguf_name(&info.name).unwrap_or_else(|| info.name.clone());
+            let mapped_name = map_gguf_name(&tv.name).unwrap_or_else(|| tv.name.clone());
 
             let is_quantized =
-                !matches!(info.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
+                !matches!(tv.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
             // I2S (bitnet.cpp type 39) has no matching GPU quantized kernel yet -- dequantize to f32.
             // TL1 (type 38, ARM LUT format) also dequantized via TQ1_0 path.
-            let force_dequant = matches!(info.dtype, GgmlType::I2S | GgmlType::TL1);
+            let force_dequant = matches!(tv.dtype, GgmlType::I2S | GgmlType::TL1);
             let keep_raw = if std::env::var("TEMPURA_F32_ALL").is_ok() {
                 false
             } else {
@@ -1518,13 +1630,13 @@ impl GgufLoader {
                     && !mapped_name.contains("norm.weight")
             };
 
-            if info.dtype == GgmlType::F16 {
+            if tv.dtype == GgmlType::F16 {
                 mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, GgmlType::F16));
             }
             // BF16 projection weights: register for zero-copy MXFP4 conversion.
             // All BF16 tensors still dequantize to f32 (skip_f32 stays false for BF16)
             // so that embed_tokens / norm weights remain accessible via get_f32().
-            let bf16_is_proj = info.dtype == GgmlType::BF16
+            let bf16_is_proj = tv.dtype == GgmlType::BF16
                 && (mapped_name.contains("_proj.weight")
                     || mapped_name.ends_with(".weight")
                         && (mapped_name.contains("self_attn") || mapped_name.contains("mlp")));
@@ -1532,11 +1644,11 @@ impl GgufLoader {
                 mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, GgmlType::BF16));
             }
 
-            let skip_f32 = info.dtype == GgmlType::F16;
+            let skip_f32 = tv.dtype == GgmlType::F16;
 
             let use_mmap = keep_raw
                 && matches!(
-                    info.dtype,
+                    tv.dtype,
                     GgmlType::TQ1_0
                         | GgmlType::TL1
                         | GgmlType::Q4K
@@ -1544,11 +1656,11 @@ impl GgufLoader {
                         | GgmlType::Q2_0
                 );
             if use_mmap {
-                mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, info.dtype));
+                mmap_ranges.insert(mapped_name.clone(), (abs_offset, byte_size, tv.dtype));
             }
 
             if !keep_raw && !skip_f32 {
-                let floats = match info.dtype {
+                let floats = match tv.dtype {
                     GgmlType::F32 => dequant_f32(tensor_data, ne),
                     GgmlType::F16 => dequant_f16(tensor_data, ne),
                     GgmlType::BF16 => dequant_bf16(tensor_data, ne),
@@ -1589,9 +1701,9 @@ impl GgufLoader {
                 raw_tensors.insert(mapped_name.clone(), tensor_data.to_vec());
             }
             if keep_raw || use_mmap {
-                raw_tensor_dims.insert(mapped_name.clone(), info.dims.clone());
+                raw_tensor_dims.insert(mapped_name.clone(), tv.dims.clone());
             }
-            tensor_dtypes.insert(mapped_name.clone(), info.dtype);
+            tensor_dtypes.insert(mapped_name.clone(), tv.dtype);
         }
 
         let vocab_size_from_embed = tensors
