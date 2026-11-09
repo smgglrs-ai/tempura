@@ -2829,7 +2829,9 @@ mod tests {
         let loader = GgufLoader::from_bytes(&data).unwrap();
 
         assert_eq!(loader.config.architecture, crate::config::Architecture::Phi);
-        assert_eq!(loader.config.hidden_act, crate::config::HiddenAct::Gelu);
+        // phi3 is silu-gated in llama.cpp master (LLM_FFN_SWIGLU; Phi-3.5
+        // config.json: hidden_act=silu).
+        assert_eq!(loader.config.hidden_act, crate::config::HiddenAct::SiluGate);
         assert!(loader.config.parallel_attn_ffn);
         assert!(loader.config.use_layernorm);
     }
