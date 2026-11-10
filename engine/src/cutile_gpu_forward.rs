@@ -417,6 +417,17 @@ pub struct CutileGpuModel {
     prefill_k_rope_scratch: RefCell<RopeScratch>,
     /// Pre-allocated RMSNorm scratch for pre-attention norm (seq_len=1 / decode).
     pre_attn_norm_scratch: RefCell<RmsnormScratch>,
+    /// Gemma-2 output norms (attn / FFN output before the residual adds).
+    /// Dedicated scratches: the shared norm scratches' outputs are still
+    /// Arc-referenced at the post-norm points, and a fallback allocation
+    /// inside CUDA graph capture is illegal (DriverError 900).
+    attn_post_norm_scratch: RefCell<RmsnormScratch>,
+    ffn_post_norm_scratch: RefCell<RmsnormScratch>,
+    /// Prefill-chunk-sized variants (the decode-sized buffers above must
+    /// never be resized mid-run -- a grow inside CUDA graph capture is
+    /// DriverError 900; same contract as prefill_pre/post_attn_norm_scratch).
+    prefill_attn_post_norm_scratch: RefCell<RmsnormScratch>,
+    prefill_ffn_post_norm_scratch: RefCell<RmsnormScratch>,
     /// Pre-allocated RMSNorm scratch for post-attention norm (seq_len=1 / decode).
     post_attn_norm_scratch: RefCell<RmsnormScratch>,
     /// Pre-allocated output buffer for the post-attention residual add (seq_len=1).
@@ -1720,6 +1731,32 @@ impl CutileGpuModel {
             let _ = z_out.unpartition();
             let _ = stream.synchronize();
         }
+
+        // GeGLU models (Gemma): pre-allocate the decode gelu scratch and
+        // JIT the kernel -- the decode CUDA graph captures on the FIRST
+        // decode step and gelu_mul_device_scratch would allocate + compile
+        // inside capture (DriverError 900).
+        if self.config.hidden_act == crate::config::HiddenAct::GeGLU {
+            let stream = self.matmul.stream();
+            let gate: Arc<Tensor<f32>> = Arc::new(
+                api::zeros::<f32>(&[self.config.intermediate_size])
+                    .sync_on(stream)
+                    .expect("warmup: gelu dummy alloc failed"),
+            );
+            let out = self
+                .cutile_elementwise
+                .gelu_mul_device_scratch(
+                    &gate,
+                    &gate,
+                    1,
+                    self.config.intermediate_size,
+                    &mut self.silu_out_scratch.borrow_mut(),
+                    stream,
+                )
+                .expect("warmup: gelu kernel failed");
+            let _ = out;
+            let _ = stream.synchronize();
+        }
     }
 
     // -- constructors ----------------------------------------------------------
@@ -1735,6 +1772,15 @@ impl CutileGpuModel {
     ) -> Result<Self, tempura_kernels::KernelError> {
         let matmul = CutileMatMul::new()?;
         let flash_attn = CutileFlashAttention::new()?;
+        // Gemma-2 attention logit softcapping (every flash/decode launch
+        // inherits it; the oxide PTX decode-attn cannot -- gated off below).
+        // TEMPURA_NO_ATTN_SOFTCAP=1 bisects the GPU softcap off.
+        let mut flash_attn = flash_attn;
+        flash_attn.set_attn_softcap(
+            config
+                .attn_logit_softcapping
+                .filter(|_| std::env::var("TEMPURA_NO_ATTN_SOFTCAP").is_err()),
+        );
         // Load oxide Q4K kernel BEFORE weight upload so uses_raw_gguf can guide the format choice.
         let oxide_q4k_gemv_early = OxideQ4kGemv::try_load(matmul.stream().clone());
         let upload_raw_q4k = oxide_q4k_gemv_early
@@ -1932,6 +1978,28 @@ impl CutileGpuModel {
                     h_pad,
                 )?;
             }
+            // Gemma-2 output norms (attn / FFN outputs before the residual
+            // adds; GGUF post_attention_norm / post_ffw_norm).
+            if let Some(w) = qw.get_f32(&format!("{p}.self_attn.post_attention_norm.weight")) {
+                Self::upload_norm_weight(
+                    matmul.stream(),
+                    &mut nw,
+                    &format!("{p}.self_attn.post_attention_norm.weight"),
+                    w,
+                    h,
+                    h_pad,
+                )?;
+            }
+            if let Some(w) = qw.get_f32(&format!("{p}.mlp.post_ffw_norm.weight")) {
+                Self::upload_norm_weight(
+                    matmul.stream(),
+                    &mut nw,
+                    &format!("{p}.mlp.post_ffw_norm.weight"),
+                    w,
+                    h,
+                    h_pad,
+                )?;
+            }
         }
 
         // Final norm weight.
@@ -2020,6 +2088,17 @@ impl CutileGpuModel {
         let cutile_elementwise = CutileElementwise::new()?;
 
         // Attempt to load the oxide-compiled Q2_0, Q4_K, and Q6_K GEMV kernels.
+        // NOTE on the oxide decode-attn + Gemma-2: the PTX kernel has no
+        // attention-softcap support, but cutile_decode_attn (which does) is
+        // BROKEN -- GPU decode corr 0.66 vs 0.9973 on the oxide kernel at
+        // identical inputs (Gemma-2 3-token probe, 2026-11-10; every
+        // previously validated model used the oxide kernel in the graph
+        // path, so cutile_decode_attn was never exercised). The softcap is
+        // inert at ppl context lengths (tempura CPU matched llama.cpp at
+        // 1.0006x without it), so softcap models keep the oxide kernel.
+        // Follow-ups: fix cutile_decode_attn; add softcap to the oxide PTX
+        // for long contexts (scores exceed the 50 cap beyond ~4k ctx).
+        let softcap_model = false;
         let oxide_q2_gemv = OxideQ2Gemv::try_load(matmul.stream().clone());
         let oxide_q4k_gemv = oxide_q4k_gemv_early; // reuse the early-loaded instance (upload format already matched)
         let oxide_q6k_gemv = OxideQ6kGemv::try_load(matmul.stream().clone());
@@ -2027,7 +2106,10 @@ impl CutileGpuModel {
         // TEMPURA_NO_OXIDE_ATTN=1 disables the module (attention falls back to
         // cuTile flash-attn, SiLU to the cutile elementwise path) -- numerical
         // bisect switch for the decode pipeline.
-        let oxide_decode_attn = if std::env::var("TEMPURA_NO_OXIDE_ATTN")
+        let oxide_decode_attn = if softcap_model {
+            eprintln!("[cutile] oxide decode-attn disabled (attention softcapping -- PTX kernel has no softcap support)");
+            None
+        } else if std::env::var("TEMPURA_NO_OXIDE_ATTN")
             .map(|v| v == "1")
             .unwrap_or(false)
         {
@@ -2156,6 +2238,10 @@ impl CutileGpuModel {
         let prefill_k_rope_scratch =
             RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
         let pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let attn_post_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let ffn_post_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let prefill_attn_post_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let prefill_ffn_post_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let post_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let final_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let prefill_pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
@@ -2346,6 +2432,10 @@ impl CutileGpuModel {
             prefill_q_rope_scratch: RefCell::new(prefill_q_rope_scratch),
             prefill_k_rope_scratch: RefCell::new(prefill_k_rope_scratch),
             pre_attn_norm_scratch: RefCell::new(pre_attn_norm_scratch),
+            attn_post_norm_scratch: RefCell::new(attn_post_norm_scratch),
+            ffn_post_norm_scratch: RefCell::new(ffn_post_norm_scratch),
+            prefill_attn_post_norm_scratch: RefCell::new(prefill_attn_post_norm_scratch),
+            prefill_ffn_post_norm_scratch: RefCell::new(prefill_ffn_post_norm_scratch),
             post_attn_norm_scratch: RefCell::new(post_attn_norm_scratch),
             post_attn_add_scratch: RefCell::new(post_attn_add_scratch),
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
@@ -2437,6 +2527,15 @@ impl CutileGpuModel {
     ) -> Result<Self, tempura_kernels::KernelError> {
         let matmul = CutileMatMul::new()?;
         let flash_attn = CutileFlashAttention::new()?;
+        // Gemma-2 attention logit softcapping (every flash/decode launch
+        // inherits it; the oxide PTX decode-attn cannot -- gated off below).
+        // TEMPURA_NO_ATTN_SOFTCAP=1 bisects the GPU softcap off.
+        let mut flash_attn = flash_attn;
+        flash_attn.set_attn_softcap(
+            config
+                .attn_logit_softcapping
+                .filter(|_| std::env::var("TEMPURA_NO_ATTN_SOFTCAP").is_err()),
+        );
         let mut dw: HashMap<String, DeviceWeight> = HashMap::new();
         let mut nw: HashMap<String, Arc<Tensor<f32>>> = HashMap::new();
         let mut qkv_biases: HashMap<String, Arc<Tensor<f32>>> = HashMap::new();
@@ -2492,6 +2591,28 @@ impl CutileGpuModel {
                     h_pad,
                 )?;
             }
+            // Gemma-2 output norms (attn / FFN outputs before the residual
+            // adds; GGUF post_attention_norm / post_ffw_norm).
+            if let Some(w) = mw.get(&format!("{p}.self_attn.post_attention_norm.weight")) {
+                Self::upload_norm_weight(
+                    matmul.stream(),
+                    &mut nw,
+                    &format!("{p}.self_attn.post_attention_norm.weight"),
+                    w,
+                    h,
+                    h_pad,
+                )?;
+            }
+            if let Some(w) = mw.get(&format!("{p}.mlp.post_ffw_norm.weight")) {
+                Self::upload_norm_weight(
+                    matmul.stream(),
+                    &mut nw,
+                    &format!("{p}.mlp.post_ffw_norm.weight"),
+                    w,
+                    h,
+                    h_pad,
+                )?;
+            }
         }
 
         if let Some(w) = mw.get("model.norm.weight") {
@@ -2506,10 +2627,25 @@ impl CutileGpuModel {
         let cutile_elementwise = CutileElementwise::new()?;
 
         // Attempt to load the oxide-compiled Q2_0, Q4_K, and Q6_K GEMV kernels.
+        // NOTE on the oxide decode-attn + Gemma-2: the PTX kernel has no
+        // attention-softcap support, but cutile_decode_attn (which does) is
+        // BROKEN -- GPU decode corr 0.66 vs 0.9973 on the oxide kernel at
+        // identical inputs (Gemma-2 3-token probe, 2026-11-10; every
+        // previously validated model used the oxide kernel in the graph
+        // path, so cutile_decode_attn was never exercised). The softcap is
+        // inert at ppl context lengths (tempura CPU matched llama.cpp at
+        // 1.0006x without it), so softcap models keep the oxide kernel.
+        // Follow-ups: fix cutile_decode_attn; add softcap to the oxide PTX
+        // for long contexts (scores exceed the 50 cap beyond ~4k ctx).
+        let softcap_model = false;
         let oxide_q2_gemv = OxideQ2Gemv::try_load(matmul.stream().clone());
         let oxide_q4k_gemv = OxideQ4kGemv::try_load(matmul.stream().clone());
         let oxide_q6k_gemv = OxideQ6kGemv::try_load(matmul.stream().clone());
-        let oxide_decode_attn = match OxideDecodeAttn::new(matmul.stream().clone()) {
+        let oxide_decode_attn = if softcap_model {
+            eprintln!("[cutile] oxide decode-attn disabled (attention softcapping -- PTX kernel has no softcap support)");
+            None
+        } else {
+            match OxideDecodeAttn::new(matmul.stream().clone()) {
             Ok(oda) => {
                 eprintln!(
                     "[cutile] oxide decode-attn loaded (batch={}, splitk={})",
@@ -2522,6 +2658,7 @@ impl CutileGpuModel {
                 eprintln!("[cutile] oxide decode-attn unavailable: {e}");
                 None
             }
+        }
         };
         // Split-K decode attention scratch: one stable-address buffer for the
         // CUDA graph's lifetime (pointer baked in at capture, never reallocated).
@@ -2576,6 +2713,10 @@ impl CutileGpuModel {
         let prefill_k_rope_scratch =
             RopeScratch::new(matmul.stream(), rope_cap * n_kv_heads, head_dim)?;
         let pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let attn_post_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let ffn_post_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let prefill_attn_post_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
+        let prefill_ffn_post_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let post_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let final_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
         let prefill_pre_attn_norm_scratch = RmsnormScratch::new(matmul.stream(), 1, h_pad)?;
@@ -2742,6 +2883,10 @@ impl CutileGpuModel {
             prefill_q_rope_scratch: RefCell::new(prefill_q_rope_scratch),
             prefill_k_rope_scratch: RefCell::new(prefill_k_rope_scratch),
             pre_attn_norm_scratch: RefCell::new(pre_attn_norm_scratch),
+            attn_post_norm_scratch: RefCell::new(attn_post_norm_scratch),
+            ffn_post_norm_scratch: RefCell::new(ffn_post_norm_scratch),
+            prefill_attn_post_norm_scratch: RefCell::new(prefill_attn_post_norm_scratch),
+            prefill_ffn_post_norm_scratch: RefCell::new(prefill_ffn_post_norm_scratch),
             post_attn_norm_scratch: RefCell::new(post_attn_norm_scratch),
             post_attn_add_scratch: RefCell::new(post_attn_add_scratch),
             ffn_add_scratch: RefCell::new(ffn_add_scratch),
@@ -3123,6 +3268,18 @@ impl CutileGpuModel {
         t.to_host_vec()
             .sync_on(self.matmul.stream())
             .expect("CutileGpuModel: device->host download failed")
+    }
+
+    /// Download logits and apply Gemma-2 final logit softcapping
+    /// (tanh(x/cap)*cap) on the host. Greedy argmax is invariant under the
+    /// monotonic map, so forward_greedy's GPU-side argmax needs no change.
+    fn download_logits(&self, t: &Arc<Tensor<f32>>) -> Vec<f32> {
+        let mut logits = self.download_device_tensor(t);
+        crate::model::apply_final_logit_softcap(
+            &mut logits,
+            self.config.final_logit_softcapping,
+        );
+        logits
     }
 
     /// Residual add reusing a pre-allocated output buffer.
@@ -5812,7 +5969,7 @@ impl CutileGpuModel {
         let logits_arc = self.scratch.borrow()[SLOT_LOGITS]
             .clone()
             .expect("SLOT_LOGITS empty after forward_decode_inner");
-        self.download_device_tensor(&logits_arc)
+        self.download_logits(&logits_arc)
     }
 
     /// TEMPURA_DEBUG_NAN helper: D2H a tensor and eprintln a NaN report.
@@ -6155,10 +6312,41 @@ impl CutileGpuModel {
             let o_padded =
                 self.pad_rows_device(&o_dev, h, self.h_pad, seq_len, &self.oproj_pad_scratch);
 
+            // Gemma-2: norm the attention OUTPUT before the residual add
+            // (GGUF post_attention_norm). The rmsnorm consumes h_pad-strided
+            // rows (h valid, zero tail: the padded weight zeroes the tail).
+            let o_normed = match self
+                .norm_weights
+                .get(&o_w_name.replace("o_proj.weight", "post_attention_norm.weight"))
+                .filter(|_| std::env::var("TEMPURA_NO_GEMMA_POSTNORM").is_err())
+            {
+                Some(w) => self
+                    .cutile_rmsnorm
+                    .forward_device_fused_scratch(
+                        shared_stream,
+                        o_padded,
+                        w,
+                        seq_len,
+                        h,
+                        self.h_pad,
+                        cfg.layer_norm_eps,
+                        &mut self.attn_post_norm_scratch.borrow_mut(),
+                    )
+                    .expect("Gemma attn post-norm failed"),
+                None => o_padded,
+            };
+            // The rmsnorm returns rank-2 [seq_len, h_pad]; the add kernel
+            // partitions rank-1 operands.
+            let o_normed = o_normed
+                .clone()
+                .reshape(&[seq_len * self.h_pad])
+                .expect("Gemma attn post-norm reshape")
+                .into();
+
             // Post-attention residual add (GPU, pre-allocated scratch).
             hidden_dev = self.add_device_scratch(
                 &hidden_dev,
-                &o_padded,
+                &o_normed,
                 seq_len * self.h_pad,
                 &mut self.post_attn_add_scratch.borrow_mut(),
             );
@@ -6198,6 +6386,9 @@ impl CutileGpuModel {
                 .unwrap_or(false);
             let gate_silu_n_dev = if seq_len == 1
                 && !fused_silu_disabled
+                // The fused kernel hard-codes SiLU -- Gemma GeGLU needs the
+                // separate GEMVs + GELU gating below.
+                && cfg.hidden_act != crate::config::HiddenAct::GeGLU
                 && self.device_weights_q4k.contains_key(gate_w_name.as_str())
                 && self.device_weights_q4k.contains_key(up_w_name.as_str())
                 && self
@@ -6242,16 +6433,30 @@ impl CutileGpuModel {
                     self.nan_report(&format!("L{layer} gate-dev"), &gate_dev);
                     self.nan_report(&format!("L{layer} up-dev"), &up_dev);
                 }
-                self.cutile_elementwise
-                    .silu_mul_device_scratch(
-                        &gate_dev,
-                        &up_dev,
-                        seq_len,
-                        inter,
-                        &mut self.silu_out_scratch.borrow_mut(),
-                        &shared_stream,
-                    )
-                    .expect("SiLU-mul failed")
+                // Gemma GeGLU: tanh-approx GELU gating, not SiLU.
+                if cfg.hidden_act == crate::config::HiddenAct::GeGLU {
+                    self.cutile_elementwise
+                        .gelu_mul_device_scratch(
+                            &gate_dev,
+                            &up_dev,
+                            seq_len,
+                            inter,
+                            &mut self.silu_out_scratch.borrow_mut(),
+                            &shared_stream,
+                        )
+                        .expect("GELU-mul failed")
+                } else {
+                    self.cutile_elementwise
+                        .silu_mul_device_scratch(
+                            &gate_dev,
+                            &up_dev,
+                            seq_len,
+                            inter,
+                            &mut self.silu_out_scratch.borrow_mut(),
+                            &shared_stream,
+                        )
+                        .expect("SiLU-mul failed")
+                }
             };
             if self.debug_nan_trace {
                 self.nan_report(&format!("L{layer} gate-silu"), &gate_silu_n_dev);
@@ -6297,15 +6502,43 @@ impl CutileGpuModel {
             let down_padded =
                 self.pad_rows_device(&down_dev, h, self.h_pad, seq_len, &self.down_pad_scratch);
 
+            // Gemma-2: norm the FFN OUTPUT before the residual add (GGUF
+            // post_ffw_norm) -- h_pad-strided rows, h valid.
+            let down_normed = match self
+                .norm_weights
+                .get(&down_w_name.replace("down_proj.weight", "post_ffw_norm.weight"))
+                .filter(|_| std::env::var("TEMPURA_NO_GEMMA_POSTNORM").is_err())
+            {
+                Some(w) => self
+                    .cutile_rmsnorm
+                    .forward_device_fused_scratch(
+                        shared_stream,
+                        down_padded,
+                        w,
+                        seq_len,
+                        h,
+                        self.h_pad,
+                        cfg.layer_norm_eps,
+                        &mut self.ffn_post_norm_scratch.borrow_mut(),
+                    )
+                    .expect("Gemma ffn post-norm failed"),
+                None => down_padded,
+            };
+            let down_normed = down_normed
+                .clone()
+                .reshape(&[seq_len * self.h_pad])
+                .expect("Gemma ffn post-norm reshape")
+                .into();
+
             // Post-FFN residual add (GPU, pre-allocated scratch).
             hidden_dev = self.add_device_scratch(
                 &hidden_dev,
-                &down_padded,
+                &down_normed,
                 seq_len * self.h_pad,
                 &mut self.ffn_add_scratch.borrow_mut(),
             );
             if self.debug_nan_trace {
-                self.nan_report(&format!("L{layer} down-proj"), &down_padded);
+                self.nan_report(&format!("L{layer} down-proj"), &down_normed);
                 self.nan_report(&format!("L{layer} post-ffn-hidden"), &hidden_dev);
             }
         }
@@ -6523,7 +6756,7 @@ impl CutileGpuModel {
                 // The host KV mirror may be stale; we only rebuild it when transitioning
                 // to the CPU fallback path, which does not apply here.
                 let logits_arc = self.forward_decode_with_graph(&hidden, &positions, gpu_kv_cache);
-                return self.download_device_tensor(&logits_arc);
+                return self.download_logits(&logits_arc);
             }
             // Graph-capture correctness gate failed: run the same decode inner
             // WITHOUT a graph.  The cuTile flash-attn gets a fresh host kv_len
@@ -6947,13 +7180,39 @@ impl CutileGpuModel {
                     self.nan_report(&format!("L{layer} o-proj"), &o_dev);
                 }
 
-                // -- 2g. Residual add (GPU) ----------------------------------------
-                // o_dev has h columns; pad to h_pad when h_pad > h (Qwen2.5:
-                // 3584 -> 4096) via the capture-safe D->D path -- the host
-                // round-trip this replaced (download + re-upload) panics when
-                // the prefill layer loop is captured into a CUDA graph.
+                // Gemma-2: norm the attention OUTPUT before the residual add
+                // (GGUF post_attention_norm) -- on the h_pad-strided padded
+                // tensor (pad first; the rmsnorm consumes h_pad-strided rows).
                 let o_padded =
                     self.pad_rows_device(&o_dev, h, self.h_pad, seq_len, &self.oproj_pad_scratch);
+                let o_padded = match self
+                    .norm_weights
+                    .get(&o_w_name.replace("o_proj.weight", "post_attention_norm.weight"))
+                {
+                    Some(w) => self
+                        .cutile_rmsnorm
+                        .forward_device_fused_scratch(
+                            self.matmul.stream(),
+                            o_padded,
+                            w,
+                            seq_len,
+                            h,
+                            self.h_pad,
+                            cfg.layer_norm_eps,
+                            &mut self.prefill_attn_post_norm_scratch.borrow_mut(),
+                        )
+                        .expect("Gemma attn post-norm (prefill) failed"),
+                    None => o_padded,
+                };
+                let o_padded = o_padded
+                    .clone()
+                    .reshape(&[seq_len * self.h_pad])
+                    .expect("Gemma attn post-norm reshape (prefill)")
+                    .into();
+
+                // -- 2g. Residual add (GPU) ----------------------------------------
+                // o_padded is already h_pad-strided (pad + Gemma post-norm
+                // above; for non-Gemma models it is the plain pad).
                 hidden_dev = if seq_len == 1 {
                     self.add_device_scratch(
                         &hidden_dev,
@@ -7013,7 +7272,9 @@ impl CutileGpuModel {
                 // kernel's re-read of the up matrix); falls back wholesale.
                 let gate_dev =
                     self.gemm_any_d2d_slot(&normed2_dev, gate_w_name, seq_len, SLOT_GATE);
-                let (gate_silu_n_dev, up_dev_dbg) = if seq_len > 1 {
+                let (gate_silu_n_dev, up_dev_dbg) = if seq_len > 1
+                    && cfg.hidden_act != crate::config::HiddenAct::GeGLU
+                {
                     match self.gemm_mxfp4_prefill_ep(
                         &normed2_dev,
                         up_w_name,
@@ -7041,17 +7302,39 @@ impl CutileGpuModel {
                     }
                 } else {
                     let up_dev = self.gemm_any_d2d_slot(&normed2_dev, up_w_name, seq_len, SLOT_UP);
-                    let act = self
-                        .cutile_elementwise
-                        .silu_mul_device_scratch(
-                            &gate_dev,
-                            &up_dev,
-                            seq_len,
-                            inter,
-                            &mut self.silu_out_scratch.borrow_mut(),
-                            &self.matmul.stream(),
-                        )
-                        .expect("CutileGpuModel: GPU SiLU-mul failed");
+                    // Gemma GeGLU: GELU gating. m>1 uses the PREFILL scratch
+                    // -- routing it through the decode scratch (silu_out_)
+                    // resized that buffer and forced a realloc inside the
+                    // decode CUDA graph capture (DriverError 900).
+                    let is_geglu = cfg.hidden_act == crate::config::HiddenAct::GeGLU;
+                    let act = if is_geglu {
+                        let scratch = if seq_len > 1 {
+                            &mut self.prefill_silu_scratch.borrow_mut()
+                        } else {
+                            &mut self.silu_out_scratch.borrow_mut()
+                        };
+                        self.cutile_elementwise
+                            .gelu_mul_device_scratch(
+                                &gate_dev,
+                                &up_dev,
+                                seq_len,
+                                inter,
+                                scratch,
+                                &self.matmul.stream(),
+                            )
+                            .expect("CutileGpuModel: GPU GELU-mul failed")
+                    } else {
+                        self.cutile_elementwise
+                            .silu_mul_device_scratch(
+                                &gate_dev,
+                                &up_dev,
+                                seq_len,
+                                inter,
+                                &mut self.silu_out_scratch.borrow_mut(),
+                                &self.matmul.stream(),
+                            )
+                            .expect("CutileGpuModel: GPU SiLU-mul failed")
+                    };
                     (act, Some(up_dev))
                 };
                 if self.debug_nan_trace {
@@ -7129,9 +7412,9 @@ impl CutileGpuModel {
                             self.nan_report(&format!("L{layer} down-proj"), &down_dev);
                         }
 
-                        // -- 2l. Residual add (GPU) ------------------------------------
-                        // Capture-safe D->D pad (host round-trip replaced --
-                        // illegal inside prefill CUDA graph capture).
+                        // Gemma-2: norm the FFN OUTPUT before the residual add
+                        // (GGUF post_ffw_norm) -- on the h_pad-strided padded
+                        // tensor (pad first; the rmsnorm consumes h_pad rows).
                         let down_padded = self.pad_rows_device(
                             &down_dev,
                             h,
@@ -7139,6 +7422,29 @@ impl CutileGpuModel {
                             seq_len,
                             &self.down_pad_scratch,
                         );
+                        let down_padded = match self.norm_weights.get(
+                            &down_w_name.replace("down_proj.weight", "post_ffw_norm.weight"),
+                        ) {
+                            Some(w) => self
+                                .cutile_rmsnorm
+                                .forward_device_fused_scratch(
+                                    self.matmul.stream(),
+                                    down_padded,
+                                    w,
+                                    seq_len,
+                                    h,
+                                    self.h_pad,
+                                    cfg.layer_norm_eps,
+                                    &mut self.prefill_ffn_post_norm_scratch.borrow_mut(),
+                                )
+                                .expect("Gemma ffn post-norm (prefill) failed"),
+                            None => down_padded,
+                        };
+                        let down_padded = down_padded
+                            .clone()
+                            .reshape(&[seq_len * self.h_pad])
+                            .expect("Gemma ffn post-norm reshape (prefill)")
+                            .into();
                         if seq_len == 1 {
                             self.add_device_scratch(
                                 &hidden_dev,
@@ -7309,7 +7615,7 @@ impl CutileGpuModel {
         };
 
         let logits_dev = self.lm_head_gemm(&last_dev, 1, SLOT_LOGITS);
-        self.download_device_tensor(&logits_dev)
+        self.download_logits(&logits_dev)
     }
 
     // -- Batch decode CUDA graph ----------------------------------------------
@@ -8725,7 +9031,7 @@ impl CutileGpuModel {
             .expect("mxfp4 batch graph: final RMSNorm");
 
         let logits_dev = self.lm_head_gemm(&last_dev, m, SLOT_LOGITS);
-        let logits_flat = self.download_device_tensor(&logits_dev);
+        let logits_flat = self.download_logits(&logits_dev);
         Some(logits_flat.chunks(vocab).map(|c| c.to_vec()).collect())
     }
 
@@ -9076,7 +9382,7 @@ impl CutileGpuModel {
 
         // lm_head: [M, H] -> [M, vocab]  -- run outside graph (allocation OK here)
         let logits_dev = self.lm_head_gemm(&last_dev, m, SLOT_LOGITS);
-        let logits_flat = self.download_device_tensor(&logits_dev);
+        let logits_flat = self.download_logits(&logits_dev);
         logits_flat.chunks(vocab).map(|c| c.to_vec()).collect()
     }
 
@@ -9534,12 +9840,25 @@ impl CutileGpuModel {
                 self.gemm_any_d2d_batch(&normed2_dev, gate_w_name, m, self.h_pad, SLOT_GATE);
             let up_dev = self.gemm_any_d2d_batch(&normed2_dev, up_w_name, m, self.h_pad, SLOT_UP);
 
-            // SiLU(gate) x up -- use cuTile silu_mul (GPU, no PCIe round-trip, any M).
+            // Gated multiply -- cuTile (GPU, no PCIe round-trip, any M).
+            // Gemma GeGLU: GELU gating.
             let inter_size = m * cfg.intermediate_size;
-            let gs_dev = self
-                .cutile_elementwise
-                .silu_mul_device(&gate_dev, &up_dev, m, cfg.intermediate_size, &stream)
-                .expect("batch silu_mul_device failed");
+            let gs_dev = if cfg.hidden_act == crate::config::HiddenAct::GeGLU {
+                self.cutile_elementwise
+                    .gelu_mul_device_scratch(
+                        &gate_dev,
+                        &up_dev,
+                        m,
+                        cfg.intermediate_size,
+                        &mut None,
+                        &stream,
+                    )
+                    .expect("batch gelu_mul_device failed")
+            } else {
+                self.cutile_elementwise
+                    .silu_mul_device(&gate_dev, &up_dev, m, cfg.intermediate_size, &stream)
+                    .expect("batch silu_mul_device failed")
+            };
             // Pad inter -> inter_pad if necessary (e.g. Llama-3.1-8B: 14336->16384).
             let inter_sz = cfg.intermediate_size;
             let gs_padded = if self.inter_pad == inter_sz {
@@ -9577,7 +9896,7 @@ impl CutileGpuModel {
 
         // LM head: [M, H] -> [M, vocab]
         let logits_dev = self.gemm_d2d(&last_dev, "lm_head.weight", m);
-        let logits_flat = self.download_device_tensor(&logits_dev);
+        let logits_flat = self.download_logits(&logits_dev);
 
         // Split into M logit vectors.
         logits_flat.chunks(vocab).map(|c| c.to_vec()).collect()

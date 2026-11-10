@@ -51,6 +51,7 @@ pub mod kernels {
         k: &Tensor<f32, { [-1, D] }>,
         v: &Tensor<f32, { [-1, D] }>,
         scale: f32,
+        softcap: f32,
         cache_offset: i32,
         seq_len: i32,
         kv_len: i32,
@@ -114,7 +115,24 @@ pub mod kernels {
             // S = Q @ K^T  [BR x BC]
             let mut qk: Tile<f32, { [BR, BC] }> = constant(0.0f32, shape![BR, BC]);
             qk = mma(tq, tile_k.transpose(), qk);
-            qk = qk * qk_scale;
+            // Gemma-2 attention logit softcapping: cap * tanh(s/cap) on the
+            // SCALED scores, then the exp2 conversion. tanh via
+            // 1 - 2/(exp(2x)+1) -- overflow-safe (x -> inf gives 1,
+            // x -> -inf gives -1).
+            if softcap > 0.0 {
+                let scale_t: Tile<f32, { [BR, BC] }> = broadcast_scalar(scale, shape![BR, BC]);
+                let cap_t: Tile<f32, { [BR, BC] }> = broadcast_scalar(softcap, shape![BR, BC]);
+                let two_t: Tile<f32, { [BR, BC] }> = broadcast_scalar(2.0f32, shape![BR, BC]);
+                let one_t: Tile<f32, { [BR, BC] }> = broadcast_scalar(1.0f32, shape![BR, BC]);
+                let inv_log2_t: Tile<f32, { [BR, BC] }> =
+                    broadcast_scalar(1.0f32 / log2, shape![BR, BC]);
+                let s = qk * scale_t;
+                let e = exp(s * two_t / cap_t);
+                qk = cap_t * (one_t - two_t / (e + one_t));
+                qk = qk * inv_log2_t;
+            } else {
+                qk = qk * qk_scale;
+            }
 
             // Causal mask: allow kv_col <= q_row (causal) and kv_col < kv_len (padding).
             let offs_n: Tile<i32, { [BR, BC] }> =
@@ -183,6 +201,7 @@ pub mod kernels {
         q_tiles_per_head: i32,
         kv_tiles_per_head: i32,
         heads_per_group: i32,
+        softcap: f32,
     ) {
         let q_tile_global = program_id(0);
         let head = q_tile_global / q_tiles_per_head;
@@ -243,7 +262,24 @@ pub mod kernels {
             // S = Q @ K^T  [BR x BC]
             let mut qk: Tile<f32, { [BR, BC] }> = constant(0.0f32, shape![BR, BC]);
             qk = mma(tq, tile_k.transpose(), qk);
-            qk = qk * qk_scale;
+            // Gemma-2 attention logit softcapping: cap * tanh(s/cap) on the
+            // SCALED scores, then the exp2 conversion. tanh via
+            // 1 - 2/(exp(2x)+1) -- overflow-safe (x -> inf gives 1,
+            // x -> -inf gives -1).
+            if softcap > 0.0 {
+                let scale_t: Tile<f32, { [BR, BC] }> = broadcast_scalar(scale, shape![BR, BC]);
+                let cap_t: Tile<f32, { [BR, BC] }> = broadcast_scalar(softcap, shape![BR, BC]);
+                let two_t: Tile<f32, { [BR, BC] }> = broadcast_scalar(2.0f32, shape![BR, BC]);
+                let one_t: Tile<f32, { [BR, BC] }> = broadcast_scalar(1.0f32, shape![BR, BC]);
+                let inv_log2_t: Tile<f32, { [BR, BC] }> =
+                    broadcast_scalar(1.0f32 / log2, shape![BR, BC]);
+                let s = qk * scale_t;
+                let e = exp(s * two_t / cap_t);
+                qk = cap_t * (one_t - two_t / (e + one_t));
+                qk = qk * inv_log2_t;
+            } else {
+                qk = qk * qk_scale;
+            }
 
             // Causal mask: allow kv_col <= q_row (causal) and kv_col < kv_len (padding).
             let offs_n: Tile<i32, { [BR, BC] }> =
@@ -359,7 +395,9 @@ pub mod kernels {
         kv_len: i32,
         scale: f32,
         heads_per_group: i32,
+        softcap: f32,
     ) {
+        let _ = softcap; // reserved: Gemma-2 attention softcapping (see below)
         let h = program_id(0);
         let kv_h = h / heads_per_group;
 
@@ -387,6 +425,11 @@ pub mod kernels {
             let k_tile: Tile<f32, { [HEAD_DIM] }> = part_k.load([cache_blk]);
             let qk_sum: Tile<f32, { [] }> = reduce_sum(q_tile * k_tile, 0i32);
             // Score in exp2 space: Q*K * (scale / log2)
+            // NOTE: the Gemma-2 attention softcap is NOT applied here -- a
+            // value-producing `if softcap > 0` on this score miscompiles in
+            // the cutile DSL (identical wrong logits with softcap = 0,
+            // found via the Gemma-2 decode probe 2026-11-09). Follow-up:
+            // select()-based form.
             let score: Tile<f32, { [1] }> = qk_sum.reshape(shape![1]) * scale_log2;
 
             // Online softmax update (same algebra as cutile_flash_attn_head).
@@ -414,6 +457,11 @@ pub mod kernels {
 pub struct CutileFlashAttention {
     pub(crate) device: Arc<Device>,
     pub(crate) stream: Arc<Stream>,
+    /// Gemma-2 attention logit softcapping (tanh(s/cap)*cap applied to the
+    /// SCALED scores before the softmax). 0.0 = disabled. Set once at model
+    /// construction so every launch site inherits it without threading a
+    /// parameter through each caller.
+    pub(crate) softcap: f32,
 }
 
 unsafe impl Send for CutileFlashAttention {}
@@ -433,7 +481,12 @@ impl CutileFlashAttention {
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
             .new_stream()
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-        Ok(Self { device, stream })
+        Ok(Self { device, stream, softcap: 0.0 })
+    }
+
+    /// Set the attention logit softcap (Gemma-2: 50.0).
+    pub fn set_attn_softcap(&mut self, cap: Option<f32>) {
+        self.softcap = cap.filter(|c| *c > 0.0).unwrap_or(0.0);
     }
 
     pub fn device(&self) -> &Device {
@@ -782,6 +835,7 @@ impl CutileFlashAttention {
                         k_devs[kv_head].clone(),
                         v_devs[kv_head].clone(),
                         scale,
+                        self.softcap,
                         cache_offset,
                         seq_len as i32,
                         kv_len as i32,
@@ -972,6 +1026,7 @@ impl CutileFlashAttention {
                     k_dev,
                     v_dev,
                     scale,
+                    self.softcap,
                     cache_offset,
                     seq_len as i32,
                     kv_len as i32,
@@ -1066,6 +1121,7 @@ impl CutileFlashAttention {
                 kv_len as i32,
                 scale,
                 heads_per_group,
+                self.softcap,
             )
             .generics(generics)
             .async_on(stream)
@@ -1141,6 +1197,7 @@ impl CutileFlashAttention {
                 kv_len as i32,
                 scale,
                 heads_per_group,
+                self.softcap,
             )
             .generics(generics)
             .async_on(stream)
@@ -1274,6 +1331,7 @@ impl CutileFlashAttention {
                 (seq_pad / BR) as i32,
                 (kv_pad / BC) as i32,
                 heads_per_group as i32,
+                self.softcap,
             )
             .generics(vec![BR.to_string(), BC.to_string(), head_dim.to_string()])
             .async_on(stream)
@@ -1483,13 +1541,14 @@ impl Attention for CutileFlashAttention {
                     .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
                     .partition([BR, head_dim_pad]);
 
-                let (out_part, _q, _k, _v, _scale, _co, _sl, _kl) =
+                let (out_part, _q, _k, _v, _scale, _sc, _co, _sl, _kl) =
                     kernels::cutile_flash_attn_head(
                         out_part,
                         q_arc,
                         k_arc,
                         v_arc,
                         scale,
+                        self.softcap,
                         cache_offset,
                         seq_len as i32,
                         kv_len as i32,

@@ -1,0 +1,12 @@
+{
+  "model": "/home/fdupont/.cache/tempura/models/gemma-2-9b-it-Q4_K_M.gguf",
+  "corpus": "/home/fdupont/.cache/tempura/eval/wikitext-2-raw/wiki.test.raw",
+  "n_ctx": 512,
+  "max_chunks": 32,
+  "cpu": {"ppl": 7.731200, "nll": 16689.9, "count": 8160, "note": "cpu ppl from the 2026-11-10 full run (avg nll 2.0453, 0 NaN); gpu run re-used it via TEMPURA_PPL_CPU_REF"},
+  "gpu": {"ppl": 7.683467, "nll": 16638.818168, "count": 8160},
+  "llama_cpp_ppl": 7.726300,
+  "gpu_cpu_ratio": 0.993852,
+  "gpu_nan_steps": 0,
+  "passed": true
+}

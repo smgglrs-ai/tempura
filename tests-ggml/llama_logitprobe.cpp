@@ -36,8 +36,56 @@
 #include <vector>
 
 int main(int argc, char ** argv) {
+    // tokenize mode: llama_logitprobe model.gguf tokenize text.txt out.ids
+    // Writes llama.cpp's tokenization (add_special=true) one id per line --
+    // tokenization diff against tempura's TEMPURA_PPL_DUMP_TOKENS output.
+    if (argc == 5 && std::string(argv[2]) == "tokenize") {
+        llama_backend_init();
+        llama_model_params mp = llama_model_default_params();
+        llama_model * model = llama_model_load_from_file(argv[1], mp);
+        if (!model) {
+            fprintf(stderr, "failed to load model\n");
+            return 1;
+        }
+        const llama_vocab * vo = llama_model_get_vocab(model);
+        FILE * tf = fopen(argv[3], "rb");
+        if (!tf) {
+            fprintf(stderr, "failed to open text file\n");
+            return 1;
+        }
+        fseek(tf, 0, SEEK_END);
+        long sz = ftell(tf);
+        fseek(tf, 0, SEEK_SET);
+        std::string text(sz, '\0');
+        if (fread(text.data(), 1, sz, tf) != (size_t)sz) {
+            fprintf(stderr, "failed to read text file\n");
+            return 1;
+        }
+        fclose(tf);
+        std::vector<llama_token> toks(text.size() + 16);
+        int n = llama_tokenize(vo, text.c_str(), text.size(), toks.data(),
+                               toks.size(), true, false);
+        if (n < 0) {
+            fprintf(stderr, "tokenize failed (rc %d)\n", n);
+            return 1;
+        }
+        FILE * out = fopen(argv[4], "w");
+        for (int i = 0; i < n; i++) {
+            char piece[64];
+            int pl = llama_token_to_piece(vo, toks[i], piece, sizeof(piece), 0, false);
+            if (pl < 0) pl = 0;
+            piece[pl < 63 ? pl : 63] = '\0';
+            fprintf(out, "%d\t%s\n", toks[i], piece);
+        }
+        fclose(out);
+        fprintf(stderr, "tokenized %zu bytes -> %d tokens\n", text.size(), n);
+        return 0;
+    }
     if (argc < 4) {
-        fprintf(stderr, "usage: %s model.gguf tokens.txt logits.bin [all]\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s model.gguf tokens.txt logits.bin [all|batch]\n"
+                "       %s model.gguf tokenize text.txt out.ids\n",
+                argv[0], argv[0]);
         return 1;
     }
     const bool dump_all = argc > 4 && std::string(argv[4]) == "all";

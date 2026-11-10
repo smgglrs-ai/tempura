@@ -38,6 +38,11 @@ pub struct ModelConfig {
     pub parallel_attn_ffn: bool,
     pub rmsnorm_offset: bool,
     pub attn_logit_softcapping: Option<f32>,
+    /// Gemma-2 final logit softcapping: logits = tanh(logits / cap) * cap
+    /// (GGUF {arch}.final_logit_softcapping, HF final_logit_softcapping).
+    /// Applied after the lm_head projection; greedy argmax is invariant
+    /// under the monotonic map, but log-probs are not.
+    pub final_logit_softcapping: Option<f32>,
     pub embedding_scale: bool,
     pub layer_kinds: Option<Vec<LayerKind>>,
     pub deltanet_num_heads: Option<usize>,
@@ -200,6 +205,7 @@ impl ModelConfig {
             parallel_attn_ffn: false,
             rmsnorm_offset: false,
             attn_logit_softcapping: None,
+            final_logit_softcapping: None,
             embedding_scale: false,
             layer_kinds: None,
             deltanet_num_heads: None,
@@ -240,6 +246,7 @@ impl ModelConfig {
             parallel_attn_ffn: false,
             rmsnorm_offset: false,
             attn_logit_softcapping: None,
+            final_logit_softcapping: None,
             embedding_scale: false,
             layer_kinds: None,
             deltanet_num_heads: None,
@@ -280,6 +287,7 @@ impl ModelConfig {
             parallel_attn_ffn: false,
             rmsnorm_offset: false,
             attn_logit_softcapping: None,
+            final_logit_softcapping: None,
             embedding_scale: false,
             layer_kinds: None,
             deltanet_num_heads: None,
@@ -320,6 +328,7 @@ impl ModelConfig {
             parallel_attn_ffn: false,
             rmsnorm_offset: true,
             attn_logit_softcapping: None,
+            final_logit_softcapping: None,
             embedding_scale: true,
             layer_kinds: None,
             deltanet_num_heads: None,
@@ -360,6 +369,7 @@ impl ModelConfig {
             parallel_attn_ffn: true,
             rmsnorm_offset: false,
             attn_logit_softcapping: None,
+            final_logit_softcapping: None,
             embedding_scale: false,
             layer_kinds: None,
             deltanet_num_heads: None,
@@ -536,6 +546,10 @@ impl ModelConfig {
             rmsnorm_offset: matches!(architecture, Architecture::Gemma),
             attn_logit_softcapping: v
                 .get("attn_logit_softcapping")
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32),
+            final_logit_softcapping: v
+                .get("final_logit_softcapping")
                 .and_then(|v| v.as_f64())
                 .map(|v| v as f32),
             embedding_scale: matches!(architecture, Architecture::Gemma),
