@@ -14,7 +14,7 @@ name = "mxf4-gemv"
 path = "src/main.rs"
 
 [dependencies]
-ctm-rs   = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/cute-rs-preview/ctm-rs" }
+cutlass-primitives = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/cute-rs-preview/cutlass-primitives" }
 cuda-device = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/cuda-device" }
 cuda-host   = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/cuda-host" }
 cuda-core   = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-core" }

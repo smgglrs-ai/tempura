@@ -27,7 +27,7 @@
 //   reg[j]: 8 nibbles from n-col (tile_n*8 + t/4), k-rows starting at (t%4)*8+32*j.
 //   Each u32 = one contiguous 4-byte slice (8 nibbles in k-dimension, same n-col).
 //
-// Scale format: ctm_rs::mma_mxf4 uses byte_id=0, thread_id=0 (broadcast from
+// Scale format: cutlass_primitives::mma_mxf4 uses byte_id=0, thread_id=0 (broadcast from
 // thread 0). All warp lanes use thread-0's scale. => One scale pair per (m16 or
 // n8) per k64 tile. a_scales: [M_tiles][k64_tiles][2] u8 (lo=K[0:32], hi=K[32:64]).
 //
@@ -37,8 +37,8 @@
 // Run:
 //   ./target/release/mxf4-gemv
 
-use ctm_rs::mma::{Accumulator16x8, Mxf4A, Mxf4B, ScalePairA, ScalePairB, mma_mxf4};
-use ctm_rs::{cuda_module, float, kernel, thread};
+use cutlass_primitives::mma::{Accumulator16x8, Mxf4A, Mxf4B, ScalePairA, ScalePairB, mma_mxf4};
+use cutlass_primitives::{cuda_module, float, kernel, thread};
 use cuda_core::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
 
@@ -351,7 +351,7 @@ mod kernels {
             let a_hi = unsafe { *a_scales.add(a_scale_base + 1) };
             let scale_a = ScalePairA::from_bits((a_lo as u16) | ((a_hi as u16) << 8));
 
-            // NOTE: unrolled by hand -- ctm-rs arrays of frags did not
+            // NOTE: unrolled by hand -- cutlass-primitives arrays of frags did not
             // index cleanly; 4 explicit blocks keep the register mapping
             // identical to the validated m16n8 kernel.
             let b_reg0 = [
