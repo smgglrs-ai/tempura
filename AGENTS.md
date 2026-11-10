@@ -1260,6 +1260,21 @@ model filename passed to `bench` resolves there). Env overrides:
 (pre-flight thresholds), `GPU_REMOTE_ALLOW_PROCS=1` (skip the
 no-other-instances check when idle CPU-mode servers live on the host). Full
 usage: run the script with no arguments.
+- STORAGE HYGIENE (2026-11-10 cleanup reclaimed ~160 GB across both hosts;
+  these regrow silently): `.claude/worktrees/` accumulates one worktree +
+  `worktree-agent-*` branch per agent session -- prune with
+  `git worktree remove --force` + branch -D, but CHECK
+  `git log --oneline main..<branch>` first (pre-landing versions of
+  squash-merged work show as unmerged; compare by content --
+  `git cat-file -e <tip>` + `git merge-base --is-ancestor <tip> main`
+  audits a batch of tips). `target/debug` + `target/kani` (~55 GB on
+  the laptop) and `tools/*/target` (the PTX lives at the crate ROOTS,
+  tracked or regenerable -- cleaning target/ is safe) are fully
+  regenerable; keep `target/release` (bench binaries) and the cuda-oxide
+  backend .so (cuda-oxide/crates/rustc-codegen-cuda/target/release/
+  librustc_codegen_cuda.so); its target/debug +
+  target/x86_64-unknown-linux-gnu, the root cutile-rs/target and
+  cuda-oxide/target are regenerable.
 
 ## GPU Kernels (cuda-oxide)
 
