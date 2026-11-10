@@ -16,10 +16,16 @@ env:
 jobs:
   kani:
     runs-on: ubuntu-latest
-    # The full kernels+engine suite does not fit the default 30-min window:
-    # first-ever-real run (212) was cancelled by the 30-min timeout mid-suite
-    # with every prior step green. Public repo -> unlimited Actions minutes.
+    # One job per crate, in parallel: the kernels suite alone takes ~90 min
+    # on a GH runner (run 214: kernels step green at ~90 min) and the engine
+    # suite needs more than the remainder of a single 150-min window
+    # (run 214: engine step cancelled by the job timeout ~55 min in).
+    # Each job gets its own 150-min budget; wall time is the max, not the sum.
     timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [tempura-kernels, tempura-engine]
     defaults:
       run:
         working-directory: smgglrs-ai/tempura
@@ -44,11 +50,8 @@ jobs:
       - name: Install Kani
         run: cargo install --version ${{ env.KANI_VERSION }} --locked kani-verifier && cargo kani setup
 
-      - name: Verify tempura-kernels
-        run: cargo kani --package tempura-kernels -Z unstable-options --ignore-global-asm
+      - name: Verify ${{ matrix.package }}
+        run: cargo kani --package ${{ matrix.package }} -Z unstable-options --ignore-global-asm
         # --ignore-global-asm: the `gemm` -> `pulp` dependency contains global
         # ASM, which Kani 0.67 cannot compile; without this flag the job has
         # been failing since gemm landed (2026-06-15).
-
-      - name: Verify tempura-engine
-        run: cargo kani --package tempura-engine -Z unstable-options --ignore-global-asm
