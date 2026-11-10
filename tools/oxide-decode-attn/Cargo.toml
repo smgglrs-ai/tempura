@@ -11,6 +11,6 @@ path = "src/main.rs"
 [workspace]
 
 [dependencies]
-cuda-device = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/cuda-device" }
-cuda-host   = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/cuda-host" }
-cuda-core   = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-core" }
+cuda-device = { path = "../../../../NVLabs/cuda-oxide/cuda-oxide/crates/cuda-device" }
+cuda-host   = { path = "../../../../NVLabs/cuda-oxide/cuda-oxide/crates/cuda-host" }
+cuda-core   = { path = "../../../../NVLabs/cuda-oxide/cuda-core" }

@@ -13,8 +13,26 @@ jobs:
   kani:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: smgglrs-ai/tempura
     steps:
+      # Layout: the tempura crates reference cuda-oxide via RELATIVE sibling
+      # paths (../../NVLabs/cuda-oxide from the workspace root). Cargo resolves
+      # optional path-dep manifests even when the features are off, so the
+      # sibling clone MUST exist for any cargo invocation to succeed -- the
+      # absolute /home/... paths used before made every CI run since the
+      # cuda-oxide deps landed fail in 0s ("failed to load manifest for
+      # dependency cuda-core"); kani.yml was 0/210 green (2026-11-10).
       - uses: actions/checkout@v4
+        with:
+          path: smgglrs-ai/tempura
+
+      - uses: actions/checkout@v4
+        with:
+          repository: NVLabs/cuda-oxide
+          path: NVLabs/cuda-oxide
+          fetch-depth: 1
 
       - name: Install Kani
         run: cargo install --version ${{ env.KANI_VERSION }} --locked kani-verifier && cargo kani setup
