@@ -173,7 +173,14 @@ Scale: 174 first-party Rust files, ~142k lines (workspace crates + tools;
 excludes all `target/` dirs with their generated cuda-bindings, and
 `.claude/worktrees/` copies), plus 80 Verus proof modules (~13.6k lines).
 853 commits on main. CI: `kani.yml` (Kani 0.67.0 on
-every PR/push), `pages.yml`.
+every PR/push), `pages.yml`. NOTE (2026-11-10): kani.yml had NEVER
+passed before run 212 -- 0/210 green. Root cause: absolute /home/...
+path deps on cuda-oxide made every CI cargo invocation fail in 0s
+(cargo resolves optional path-dep manifests even with features off).
+Fixed with relative sibling paths + a cuda-oxide checkout step in the
+workflow; timeout raised 30 -> 150 min (the suite does not fit 30);
+concurrency cancel added. The 2026-11-05 --ignore-global-asm fix was
+only ever validated locally.
 
 ## Key Design Decisions
 
