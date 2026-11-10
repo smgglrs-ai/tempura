@@ -17,9 +17,9 @@ jobs:
   # Classify which areas changed (fast, ~seconds). The verification jobs are
   # 90+ min each; docs-only or script-only pushes must not pay for them.
   # Dependency edges are respected: engine builds against kernels, so a
-  # kernels change runs BOTH jobs; a pure engine change runs only engine.
-  # Shared surface (workspace manifests, lockfile, .cargo config, this
-  # workflow) counts as affecting both.
+  # kernels change runs BOTH kernels and engine verification; a pure engine
+  # change runs only engine. Shared surface (workspace manifests, lockfile,
+  # .cargo config, this workflow) counts as affecting both.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -52,26 +52,61 @@ jobs:
               - '.cargo/**'
               - '.github/workflows/kani.yml'
 
-  kani:
+  # The engine suite exceeds 300 min in ONE job (run 216: cancelled at the
+  # 300-min cap; kernels green at ~103 min in the same run). Split the
+  # engine harnesses across a matrix of shards. This job enumerates the
+  # #[kani::proof] fns in engine/src (cargo kani list cannot run on this
+  # workspace: it rejects --ignore-global-asm, which pulp's global ASM
+  # requires) and emits a JSON matrix. Self-maintaining: every harness
+  # found lands in exactly one shard, so a NEW harness cannot be silently
+  # skipped -- the grep is the source of truth, same source cargo kani
+  # compiles.
+  plan-engine:
     needs: changes
-    # Skipped entirely when the commit touched nothing the proofs cover
-    # (docs, benches' JSON artifacts, scripts, TLA+ specs, the docs site).
-    # NOTE: [skip ci] in a commit message also works natively for a one-off.
-    if: |
-      needs.changes.outputs.tempura-kernels == 'true' ||
-      needs.changes.outputs.tempura-engine == 'true'
+    if: needs.changes.outputs.tempura-engine == 'true'
     runs-on: ubuntu-latest
-    # One job per crate, in parallel: the kernels suite takes ~90 min on a GH
-    # runner (runs 214/215: kernels green at ~90 min both times) and the
-    # engine suite exceeds 150 min (runs 214: cancelled ~55 min in with a
-    # shared budget; 215: cancelled at the 150-min job timeout with a full
-    # budget -- it needs more). 300 min gives the engine job ~2x headroom;
-    # path filtering keeps unaffected pushes from paying any of this.
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enumerate and shard engine harnesses
+        id: plan
+        run: |
+          python3 - <<'EOF'
+          import json, os, pathlib, re, sys
+
+          names = []
+          for f in sorted(pathlib.Path('engine/src').rglob('*.rs')):
+              flag = False
+              for line in f.read_text().splitlines():
+                  if '#[kani::proof]' in line:
+                      flag = True
+                  m = re.search(r'\bfn\s+(\w+)', line)
+                  if flag and m:
+                      names.append(m.group(1))
+                      flag = False
+          names = sorted(set(names))
+          if not names:
+              sys.exit("plan-engine: no #[kani::proof] harnesses found in engine/src -- grep is broken, refusing to emit an empty matrix")
+          # 2 harnesses per shard: the suite is >300 min for ~25 harnesses,
+          # so worst-case pairs need generous headroom (240-min job budget).
+          shards = [names[i:i+2] for i in range(0, len(names), 2)]
+          matrix = {"shard": [" ".join(s) for s in shards]}
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f"matrix={json.dumps(matrix)}\n")
+          print(f"{len(names)} harnesses in {len(shards)} shards:")
+          for s in shards:
+              print("  " + " ".join(s))
+          EOF
+
+  kani-kernels:
+    needs: changes
+    if: needs.changes.outputs.tempura-kernels == 'true'
+    runs-on: ubuntu-latest
+    # The kernels suite takes ~90-105 min on a GH runner (green in runs
+    # 214/215/216).
     timeout-minutes: 300
-    strategy:
-      fail-fast: false
-      matrix:
-        package: [tempura-kernels, tempura-engine]
     defaults:
       run:
         working-directory: smgglrs-ai/tempura
@@ -96,9 +131,45 @@ jobs:
       - name: Install Kani
         run: cargo install --version ${{ env.KANI_VERSION }} --locked kani-verifier && cargo kani setup
 
-      - name: Verify ${{ matrix.package }}
-        if: needs.changes.outputs[matrix.package] == 'true'
-        run: cargo kani --package ${{ matrix.package }} -Z unstable-options --ignore-global-asm
+      - name: Verify tempura-kernels
+        run: cargo kani --package tempura-kernels -Z unstable-options --ignore-global-asm
         # --ignore-global-asm: the `gemm` -> `pulp` dependency contains global
         # ASM, which Kani 0.67 cannot compile; without this flag the job has
         # been failing since gemm landed (2026-06-15).
+
+  kani-engine:
+    needs: [changes, plan-engine]
+    if: needs.changes.outputs.tempura-engine == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan-engine.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: smgglrs-ai/tempura
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: smgglrs-ai/tempura
+
+      - uses: actions/checkout@v4
+        with:
+          repository: NVLabs/cuda-oxide
+          path: NVLabs/cuda-oxide
+          fetch-depth: 1
+
+      - name: Install Kani
+        run: cargo install --version ${{ env.KANI_VERSION }} --locked kani-verifier && cargo kani setup
+
+      - name: Verify tempura-engine shard
+        run: |
+          ARGS=""
+          for h in ${{ matrix.shard }}; do ARGS="$ARGS --harness $h"; done
+          echo "shard: $ARGS"
+          cargo kani --package tempura-engine -Z unstable-options --ignore-global-asm $ARGS
+        # --harness is substring-matched against the fully qualified name;
+        # a name that is a prefix of another may pull it into this shard too
+        # (duplicated work, never a skip). Coverage is guaranteed by
+        # plan-engine: every #[kani::proof] fn in engine/src is in exactly
+        # one shard string.
