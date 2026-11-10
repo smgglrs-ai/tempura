@@ -193,7 +193,15 @@ every PR/push), `pages.yml`.
      **Upstream backend** (`cuda-oxide/crates/rustc-codegen-cuda`,
      toolchain 1.99.1, has dp4a + libm-to-libdevice). The old fork
      (mma.sync, invariant.load) was dropped 2026-10-29: no tempura
-     kernel used the fork-only features.
+     kernel used the fork-only features. DIVERGENCE-FREE POLICY
+     (2026-11-10): tempura builds exclusively against upstream main --
+     the last fork-only dependency (the `vec_width` optimization hint
+     on the three cutile GEMV kernels, from the feat/mma-sync lineage)
+     was removed; gpu-remote.sh builds ALL oxide crates with the
+     upstream backend (oxide-gemv/Q2_0 validated: PTX byte-identical to
+     the fork-built one, self-tests exact). Fork branches stay archived
+     on the fork remote; the untracked fork backend at the cuda-oxide
+     repo root (crates/rustc-codegen-cuda) is dead weight.
    Both coexist: oxide kernels auto-loaded from PTX when present, cuTile
    fallback. A third path: hand-written **sm_120a PTX** modules for Blackwell
    (dp4a/mma.sync/cp.async mbar kernels, stream-K batch GEMM).
