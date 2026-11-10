@@ -527,8 +527,9 @@ typical-p/repeat/presence/frequency)
       NOTE: this GGUF (bartowski Llama-3.1-8B Q4_K_M) has a mixed layout
       -- 16 layers with Q6K v+down_proj, 16 with Q4K -- verified from the
       GGUF tensor-type census (193 Q4K + 33 Q6K) and the trace.
-- [ ] **Quality benchmark suite (in progress):** implementation-robust
-      quality benchmarks + multi-model validation.
+- [x] **Quality benchmark suite:** implementation-robust quality
+      benchmarks + multi-model validation COMPLETE (5-family matrix,
+      2026-11-10; follow-ups below).
       The free-running greedy comparison showed all implementations
       (including llama.cpp's own GPU) produce repetition loops for
       open-ended prompts -- quantized greedy decoding operates at the
@@ -539,7 +540,7 @@ typical-p/repeat/presence/frequency)
       (a) [x] **Perplexity comparison** (WikiText-2): engine/src/eval.rs
           + tools/bench-gpu/src/bench_perplexity.rs (bench-perplexity).
           Replicates llama.cpp's perplexity algorithm exactly (n_ctx
-          chunks, BOS at every chunk start, positions [n_ctx/2, n_ctx-2]
+          chunks, BOS REPLACING the chunk-start token, positions [n_ctx/2, n_ctx-2]
           scored, f64 log-softmax NLL) but scores via prefill-half +
           incremental decode (forward returns last-position logits
           only; causal attention makes per-position logits identical).
@@ -550,285 +551,107 @@ typical-p/repeat/presence/frequency)
           ppl ratio (TEMPURA_PPL_MAX_RATIO, default 1.10). Knobs:
           TEMPURA_PPL_CTX (512), TEMPURA_PPL_CHUNKS (32; -1 = full
           corpus), TEMPURA_NO_LLAMA, LLAMA_PPL.
-          RESULT (2026-10-30): FOUND AND FIXED a real, longstanding
-          quality bug that every internal check had masked. tempura
-          scored ppl ~640 vs llama.cpp's 7.1 on the same GGUF+corpus,
-          with GPU and CPU agreeing with each other (89% teacher-forced)
-          -- both wrong the same way. Bisected against llama.cpp with
-          tests-ggml/llama_logitprobe.cpp (links llama.cpp's own model
-          code; dumps reference logits + KV-cache state for an exact
-          token-id sequence) + bench-perplexity TEMPURA_PPL_PROBE
-          (same ids through tempura, dumps logits/K-cache):
-          * ROOT CAUSE: RoPE pairing. The GGUF converter permutes Q/K
-            weight rows into adjacent-pair order for NORM-rope arches
-            (llama.cpp's rope-type table: llama, llama4, deepseek,
-            granite, smollm3, mistral3/4, command-r, ... = NORM/adjacent
-            pairs (2d, 2d+1); qwen*, phi*, gemma*, falcon, gptneox,
-            bitnet = NEOX/split pairs (d, d+half)). tempura applied
-            split-half (NeoX) rope to everything -> reading permuted
-            llama weights with the wrong pairing silently destroys
-            positional information: logits match llama.cpp at 1-2
-            tokens and degrade progressively with distance (the K-cache
-            byte diff showed layer-0 K identical at token 0, same norm
-            but different rotation from token 1 on). Fix: per-arch
-            rope_type in gguf_loader.rs matching llama.cpp's table
-            (CPU applies Norm rope on the raw layout).
-          * GPU: same root cause (its rope kernels hardcode split-half
-            pairing on contiguous per-head halves). Fix: permute Q/K
-            rows at GPU upload (weights.rs
-            permute_qk_rows_split_half -- GGML quant blocks are
-            row-aligned, so it is a pure block permutation) so the
-            existing kernels apply adjacent-pair rotation. GPU-only;
-            CPU weights untouched.
-          * ALSO FOUND: can_use_graph_prefill claimed to be "disabled
-            pending fix" (produces wrong hidden states) but never
-            checked TEMPURA_GRAPH_PREFILL -- every multi-token CPU
-            prefill silently took the broken path (corruption at every
-            seq_len % 4 == 0, the Q8Kx4 tile granularity). Env gate
-            restored.
-          * Post-fix probe corr vs llama.cpp: CPU 0.998-0.999 at every
-            length (1..257); GPU 0.999 with TEMPURA_NO_MXFP4=1 (the
-            remaining default-config gap is the documented MXFP4
-            double-quantization band, rel ~0.10-0.13). All earlier
-            quality numbers are RETRACTED: the 89.1% GPU-vs-CPU
-            teacher-forced agreement, the ~20% llama.cpp agreement, the
-            free-running repetition-loop analysis (the loops were this
-            bug), and every logits fingerprint/baseline measured with
-            the wrong rope (re-baseline bench-real-model /
-            bench-quality / bench-batch).
-          * FINAL NUMBERS (Llama-3.1-8B Q4_K_M, WikiText-2 test, n_ctx
-            512, 32 chunks): tempura CPU ppl 7.31, tempura GPU 7.97,
-            llama.cpp 7.09. CPU/llama 1.03x, GPU/CPU 1.09x (PASS at the
-            1.10 gate; the GPU excess is the MXFP4 band: the ppl decode
-            steps read KV written by MXFP4 prefill). Logits are now
-            sharp (top 11-17, was ~7 flat). Performance unchanged:
-            decode 219 tok/s, prefill 7575 tok/s, det=OK, NaN-free
-            (bench-real-model fingerprints re-baselined 2026-10-30).
-          * MULTI-MODEL (d) started 2026-11-06: Mistral-7B-Instruct-v0.3
-            Q4_K_M (llama-family arch, SPM tokenizer): tempura CPU 5.96,
-            GPU 5.98, llama.cpp 5.96 -- GPU/CPU 1.0034, PASS (better
-            than Llama-3.1's 1.09; report bench-perplexity-mistral7b.json).
-            Found + fixed on the way: the GGUF SPM tokenizer was built
-            as HF BPE-without-merges (every char -> byte fallback;
-            Mistral ppl was 8641) and HF Unigram is NOT equivalent to
-            llama.cpp's greedy merge -- engine/src/spm_tokenizer.rs is
-            now an exact port (verified: 328880/328880 tokens, ZERO
-            divergence vs llama.cpp on the full WikiText-2 corpus).
-          * Phi-3.5-mini ppl (2026-11-09): seven real bugs deep before the
-            first plausible number. In order found: (1) the loader has no
-            fused-attn_qkv support -- split into synthetic attn_q/k/v
-            entries (llama.cpp build_qkv row layout: Q rows, K rows, V
-            rows; whole-quant-block byte slices); (2) the loader has no
-            fused-gate_up FFN support -- Phi-3.5 ffn_up has 2x
-            feed_forward_length rows; split into ffn_gate (first half) +
-            ffn_up (second half) per ggml_swiglu; (3) phi3 was mapped to
-            Gelu + parallel attn/FFN -- llama.cpp master + Phi-3.5
-            config.json say silu + SEQUENTIAL (phi2 was parallel; phi3
-            switched); (4) QuantizedWeights::new_typed's catch-all filed
-            EVERY non-Q6K/TQ2/TQ1 dtype as raw Q4K bytes -- Q5K (this
-            model's attention), Q4_0, Q2K, IQ* all silently became
-            garbage; the mmap loader now force-dequants any type without
-            a typed path (Phi's Q5K -> f32); (5) rope attn_factor is the
-            ggml MSSCALE (cos/sin magnitude), never the attention scale
-            (my first attempt scaled attention -- reverted) and never the
-            angle (CpuRoPEUnified's old semantics, dormant at 1.0);
-            ModelConfig::rope_attn_factor parsed UNCONDITIONALLY from
-            {arch}.rope.scaling.attn_factor (Phi-3.5 carries 1.1902 with
-            no rope.scaling.type) and threaded through the RoPE trait
-            (kernel-api), all six impls, KernelPipeline::rope, and every
-            call site. FINAL NUMBERS: tempura CPU ppl 6.0753 vs llama.cpp
-            5.9609 = 1.0192x, PASS, 0 NaN (report
-            bench-perplexity-phi35-mini.json; the 0.9942 probe corr gap
-            is the exact-f32-Q5K-dequant vs llama's native-Q5K band).
-            GPU SIDE VALIDATED 2026-11-09 (late): ppl 6.3598 =
-            GPU/CPU 1.0468x, GPU/llama.cpp 1.0669x, PASS, 0 NaN (63 s
-            for the whole GPU side; decode 184 tok/s ITL 5.43 ms = 1.1x
-            gap; prefill 500 tok/s on the host-staged attention path).
-            Exact-path probe corr 0.9971 (top-5 matches llama/CPU);
-            default-config corr 0.9259 (the MXFP4 band on the Q4K/Q6K
-            projections; the Q5K attention is f32 on GPU). Four more
-            real bugs found and fixed on the way (non-pow2 head_dim 96):
-            1. CutileRoPE: every rope entry point partitioned by [half]
-               (=48) which must be pow2. New tiled kernels
-               (cutile_rope_interleaved_tiled / cutile_rope_table_tiled):
-               B-element inner tiles (B = largest pow2 divisor of half =
-               16 for Phi), TPH = head_dim/B tiles per head, rotation
-               pair at pid -/+ TPH/2; covers the fused prefill path AND
-               the graph-decode table path (pos=0 row semantics). The
-               TEMPURA_NO_FUSED_ROPE bisect is pow2-only. warmup_gemms
-               JIT-warms the tiled decode kernel (capture constraint).
-            2. CutileRoPE mscale: set_mscale(rope_attn_factor) applied
-               at every cos/sin computation site (tables + uploads),
-               matching the CPU reference. Both engine constructors pass
-               config.rope_attn_factor.
-            3. Flash attention: the [*, D]-tiled kernel cannot run at
-               D=96. The HOST-STAGED paths (forward_batched,
-               forward_batched_device_kv, forward_device) now zero-pad
-               head_dim to the next pow2 (96 -> 128) -- EXACT (pad
-               columns contribute 0 to QK^T; pad output columns are
-               never scattered). The on-device prefill chain
-               (gather/flash/scatter kernels) stays pow2-gated in the
-               engine and falls back to the host-staged path (500 tok/s
-               prefill -- perf follow-up: padded gather/scatter kernels
-               would restore the on-device path).
-            4. gemm_d2d_slot DRAINED THE DECODE SLOT POOL during
-               prefill: the pool take happened before the m check, and
-               the m>1 into-attempt on a [n]-sized decode slot always
-               fails (consuming the tensor) -- Phi's f32 Q5K attention
-               weights are the first PREFILL consumers of gemm_d2d_slot,
-               so every prefill layer ate SLOT_Q/K/V, and the decode
-               CUDA graph then hit DriverError 900 (allocating fallback
-               inside capture). Fix: the pool is only taken for m == 1.
-               ALSO fixed pad_prefill_activation_for_f32_gemm (the
-               exact-f32 bisect path): it returned the rank-1 activation
-               to a rank-2 kernel and assumed [m, k] contiguity; now
-               reshapes to [m, k_pad] and is stride-aware.
-          * Qwen2.5-7B GPU-side ppl: **VALIDATED 2026-11-09 (late) --
-            ppl 6.4512, GPU/CPU 0.9992x, GPU/llama.cpp 1.0245x, PASS,
-            0 NaN, 32/32 chunks** (report bench-perplexity-qwen25-7b.json,
-            GPU field). Decode 216 tok/s (ITL 4.63 ms) -- BEATING
-            llama.cpp's 209 on the first-ever working Qwen GPU decode
-            (bench-real-model: NaN-free, det=OK). The path from "corr
-            -0.0288 constant-argmax garbage" to here took three more
-            real bugs, all found this session after the bias wiring
-            (facb25f + 8df8d34) made apply_qkv_bias actually execute:
-            1. cutile tile dims must be POWERS OF TWO and Qwen2's q bias
-               is 3584 = 2^9 * 7 wide: cutile_bias_add_rows partitioned
-               the output by [cols] and panicked on first fire (the
-               /tmp/bias-probe validation used a 4x8 shape and could not
-               catch it). New cutile_bias_add_rows_tiled<B, TPR>: B =
-               largest pow2 divisor of cols clamped to 512, bias tile
-               index = pid % TPR; warmup_gemms now JIT-warms every
-               distinct bias width (a cuTile JIT inside decode-graph
-               capture is illegal).
-            2. apply_qkv_bias's Arc::try_unwrap ALWAYS failed in the
-               decode path: the slot-pool GEMVs write the projection into
-               the pooled slot tensor and return a CLONE, so x arrived
-               with refcount 2 and the Err branch silently skipped the
-               bias (TEMPURA_DEBUG_QKV_BIAS showed pooled=true, no
-               "UNWRAP OK"). Fix: when the taken pool ref aliases x
-               (Arc::ptr_eq), drop it -- x becomes uniquely owned, the
-               device address is unchanged, and the tensor returns to
-               the pool after the add.
-            3. forward_decode_inner passed the RAW o_proj/down_proj
-               outputs (h=3584 wide) to add_device_scratch which
-               partitions h_pad=4096-wide tiles -- launch-check failure
-               (this panicked the first GPU ppl attempt at its first
-               decode step; Llama h=4096=h_pad never hits it). Fixed
-               with pad_rows_device: cached rank-1 [m*h_pad] zero-filled
-               buffers + per-row D->D copies (capture-safe -- the host
-               round-trip pads it replaced in the prefill/batch paths
-               are illegal inside CUDA graph capture). Buffers pre-
-               allocated at the decode + prefill capture sites
-               (ensure_residual_pad_bufs).
-            Probe numbers after the full fix (17 tokens vs llama.cpp):
-            GPU corr 0.9983 with TEMPURA_NO_MXFP4=1 (argmax MATCHES
-            llama), 0.9326 default config -- the MXFP4 double-
-            quantization band is much wider on Qwen than Llama-3.1's
-            ~0.999.
-            PREFILL PERF + MXFP4 ON h != h_pad MODELS (same session,
-            later): gemm_mxfp4_prefill_ep now infers the activation's
-            row stride from its flat size (a.size()/m) and D->D-compacts
-            the valid rows into a cached [m_pad, k] buffer before the
-            quant -- previously the a.size() == m*k guard rejected every
-            h_pad-strided activation (Qwen: rmsnorm emits 4096-strided
-            rows against native k=3584 weights), silently routing every
-            Qwen prefill GEMM to the host-dequant fallback that
-            DOWNLOADS AND DEQUANTS THE WHOLE WEIGHT MATRIX PER CALL
-            (8 tok/s pp128, TTFT 15.8 s). Post-fix: prefill 2417 tok/s
-            (TTFT P50 52 ms; llama.cpp 7335 = 3.0x gap remaining),
-            decode unchanged 218. All 197 projections now run MXFP4:
-            ppl (default config) 6.6770 = GPU/CPU 1.0341x, GPU/llama
-            1.0604x, PASS at the 1.10 gate (BETTER than Llama-3.1's
-            accepted 1.09), 0 NaN; bench-quality teacher-forced
-            GPU-vs-CPU 52/64 = 81.2% PASS (GPU-vs-llama 82.8% vs CPU's
-            84.4% -- the band costs ~1.6 pts of llama agreement, same
-            acceptance profile as Llama; report
-            bench-quality-qwen25-7b.json). Logit-level probe corr with
-            the full band: 0.8223 (was 0.9326 when only down_proj ran
-            MXFP4, 0.9983 exact) -- the ppl gate, not logit corr, is
-            the acceptance criterion (a 1.7 logit-mean shift from
-            accumulated 4-bit activation-quant noise moves logits but
-            barely moves sequence-level NLL). The exact path remains
-            one env away (TEMPURA_NO_MXFP4=1).
-            Follow-ups: (a) [x] strided/padded MXFP4 prefill (done --
-            the stride-inference + compaction above); (b) batch-decode
-            CUDA graphs (m>=2) still have no QKV bias support; (c) the
-            GPU bisect switches remain broken for PREFILLS
-            (TEMPURA_NO_MXFP4=1 / TEMPURA_NO_GPU_PREFILL=1 panic during
-            capture, pre-existing) -- though they DO work in
-            single-forward probe mode, which is how the
-            0.9983-vs-0.9326-vs-0.8223 split above was measured;
-            (d) the remaining 3x prefill gap vs llama.cpp (Llama does
-            7700 on the same stack -- Qwen's smaller n=3584 GEMM grids
-            and the per-GEMM compaction copies are the first suspects).
-            Historical context (superseded): four historical-state
-            bisects all gave corr -0.0288 constant argmax; the Nov-7
-            0.98 reading was irreproducible.
-          * Qwen2.5-7B-Instruct Q4_K_M (qwen2 arch, NeoX rope, QKV
-            biases, Q6K k/output, 28/4 GQA heads, q_dim 3584 -> q_pad
-            4096): tempura CPU ppl 6.4567 vs llama.cpp 6.2968 =
-            1.0254x, PASS, 0 NaN (report bench-perplexity-qwen25-7b.json;
-            GPU side deferred, see below). This model flushed out FIVE
-            real bugs Llama/Mistral never exercised:
-            1. QKV biases: map_gguf_name had no .bias entries (the f32
-               tensors registered under raw GGUF names; lookups by HF
-               name always missed), the q/k bias application was gated
-               on use_layernorm (GPT-2 family only), and the v bias was
-               missing entirely. 1-token logit probe: corr 0.91/argmax
-               right -> 0.999/20-of-20 top-20 after the fix.
-            2. The seq_len==1 graph-decode path does not apply QKV
-               biases -> models with biases now fall back to the
-               regular path (1-token output was bit-identical with and
-               without the bias fix).
-            3. staticpar HAD A SILENT RESULT-CORRUPTION RACE: the
-               aggregate done counter admitted phantom increments, so a
-               par_run could return while workers still held its frame
-               (ASAN: stack-use-after-return on the FusedQ4kPreq2Job;
-               8 simultaneous late workers at generation 25977 via the
-               closed_gen canary; the visible symptoms were moving-
-               target segfaults and 'len 0 index 0' panics in q4k/q6k
-               dots + a div-by-zero in attention -- all garbage reads
-               of dead frames). Fixed with per-worker generation acks
-               (run_raw + run_graph_raw wait until every ack equals the
-               dispatched gen) + catch_unwind around the caller's own
-               partition (a panic there used to skip the worker wait)
-               + the closed_gen canary. Qwen ppl then completed 32/32
-               chunks twice, exit 0. NOTE: earlier results computed
-               through heavily contended par_run windows may have been
-               silently wrong at times; re-run if in doubt.
-            4. attn_out_to_oproj_device_m allocated its pad buffer per
-               call: for q_dim 3584 (pads to 4096) the alloc hit during
-               CUDA graph capture (DriverError 900; decode graph
-               captures on the FIRST step). Pad buffers are now cached
-               per m and pre-allocated at all three capture sites.
-            5. f16 subnormal decode overflowed in debug builds at three
-               duplicated copies of the helper (quantized.rs, loader.rs,
-               cutile_gpu_forward.rs) -- Qwen2.5's imatrix scales hit
-               subnormal f16 d values. Now wrapping arithmetic.
-            DONE for Qwen2.5: GPU-side ppl VALIDATED 2026-11-09 (see the
-            Qwen GPU entry above -- ppl 6.4512, PASS; the bias support
-            it needed landed across facb25f, 8df8d34 and this session's
-            three follow-up fixes). Phi-3.5-mini ppl has since been run
-            and PASSES on CPU (see the Phi entry above).
-          * The 1-2-token logit probes, the K-cache byte diff, and the
-            repeated-token rope-angle extraction (recovered the unroped
-            vector from a 1-token probe, read off exact per-(position,
-            pair) rotation angles from both implementations' K caches)
-            are the reusable playbook; llama.cpp is the reference, never
-            a reimplementation. Concrete artifacts on fishtank (recreate
-            if wiped): /tmp/llama-logitprobe (llama.cpp probe binary,
-            built with -I ggml/include; batch mode for MMLU), probe id
-            files + dumped logits at /tmp/qwen-probe-ids.txt{,.cpu.bin,
-            .gpu.bin} and /tmp/phi-probe-ids.txt{,...}, reference logits
-            /tmp/phi-probe-ref.bin, standalone kernel probes at
-            /tmp/bias-probe and /tmp/phi-load-probe. Method:
-            TEMPURA_PPL_PROBE=<ids file> runs the same ids through
-            tempura and dumps last-position logits; compare corr at the
-            last position vs the llama reference via python struct
-            unpack. CAUTION: kill remote benches by PID or full command
-            line, NEVER by binary name -- a pkill of "bench-perplexity"
-            once killed unrelated in-flight runs (2026-11-09).
+          THE 5-FAMILY MATRIX IS COMPLETE (2026-11-10): every CPU and
+          GPU side PASSes the 1.10 gate. Full bug narratives live in
+          the commit messages (each family flushed out real bugs the
+          others masked); the rules they taught are extracted below.
+            Llama-3.1-8B   CPU 7.31    / llama 7.09    = 1.03x    GPU PASS
+            Mistral-7B     CPU 5.96    / llama 5.96    = 1.003x   GPU 5.98
+            Qwen2.5-7B     CPU 6.4567  / llama 6.2968  = 1.025x   GPU 6.6770
+            Phi-3.5-mini   CPU 6.0753  / llama 5.9609  = 1.019x   GPU 6.3598
+            Gemma-2-9B     CPU 7.7312  / llama 7.7263  = 1.0006x  GPU 7.6835
+          Reports: bench-perplexity{,-mistral7b,-qwen25-7b,-phi35-mini,
+          -gemma2-9b}.json. Bug-chain commits: Llama rope pairing +
+          harness (2026-10-30 lineage), Mistral 1f44ac1, Qwen 442ab23 +
+          145e105, Phi 7df8c19, Gemma b0166a7.
+          MXFP4 BAND POLICY: the default GPU config runs Q4K/Q6K
+          projections through MXFP4 double-quantization (logit-level
+          probe corr 0.82-0.93 vs the exact path's ~0.998) -- accepted
+          when the ppl gate passes (Llama 1.09x, Qwen 1.034x, Phi
+          1.047x, Gemma 0.994x). ppl, not logit corr, is the criterion.
+          Exact path: TEMPURA_NO_MXFP4=1 (works in single-forward probe
+          mode; NOT for repeated prefills -- see follow-up (6)).
+          QUALITY-MODEL INVARIANTS (each line prevents a real, fixed
+          bug -- do not "simplify" these away; the narratives live in
+          the commits referenced above):
+            * RoPE pairing: the GGUF converter permutes Q/K rows into
+              adjacent-pair order for NORM-rope arches (llama, llama4,
+              deepseek, granite, smollm3, mistral3/4, command-r, ...)
+              and leaves split-half order for NEOX arches (qwen*,
+              phi*, gemma*, falcon, gptneox, bitnet). Wrong pairing =
+              progressive positional corruption that 1-2-token probes
+              CANNOT catch (corr degrades with distance; llama.cpp's
+              rope-type table in src/llama-model.cpp is the source).
+            * cutile tile dims must be powers of two. Non-pow2 model
+              dims need tiling or zero-padding: Qwen q bias 3584 ->
+              cutile_bias_add_rows_tiled (B = largest pow2 divisor,
+              clamped 512); Phi head_dim 96 -> cutile_rope_*_tiled;
+              flash attention head_dim zero-pad in the host-staged
+              paths (EXACT: pad columns contribute 0 to QK^T, pad
+              output columns are never scattered).
+            * GGUF key spellings: {arch}.attn_logit_softcapping and
+              {arch}.final_logit_softcapping (no "attention." infix);
+              tokenizer.ggml.add_space_prefix (SPM dummy prefix;
+              gemma GGUFs carry 0).
+            * The GGUF converter bakes Gemma's (1+w) norm offset into
+              every norm.weight: rmsnorm_offset stays FALSE for
+              GGUF-loaded gemma (plain rms_norm x w), TRUE for raw HF
+              safetensors weights.
+            * Gemma-2 has FOUR norms per layer: post_attention_norm
+              and post_ffw_norm norm the attention/FFN OUTPUTS before
+              the residual adds (mapped HF names:
+              self_attn.post_attention_norm / mlp.post_ffw_norm).
+            * Gemma FFN is GeGLU (tanh-approx GELU gating), not SiLU:
+              dispatch by cfg.hidden_act; the fused-silu GEMV path and
+              the MXFP4 Silu epilogue are SiLU-only and must stay
+              gated off for GeGLU.
+            * SPM tokenization must match llama.cpp bit-for-bit:
+              USER_DEFINED (type 4) pieces merge as text AND match as
+              RAW-text prefixes BEFORE whitespace escaping (gemma's
+              "\n" and "  " pieces); the merge map has no type filter.
+              A wrong tokenizer yields high ppl with a PERFECT probe
+              corr -- always diff the token count against llama
+              (llama_logitprobe tokenize mode).
+            * CUDA graph capture: ANY allocation, D2H download, or
+              cuTile JIT inside capture = DriverError 900. Pre-size
+              scratch in the constructors/warmup_gemms; keep prefill-
+              sized and decode-sized scratch SEPARATE; forward_*_into
+              CONSUMES its out tensor on failure -- never hand it the
+              decode slot pool for m>1 callers.
+            * cutile_decode_attn IS BROKEN (corr 0.66 vs the oxide
+              kernel's 0.9973 on identical inputs; never exercised --
+              all validated models use oxide attn in the decode graph).
+              Do not route decode through it until fixed. The oxide
+              PTX lacks attention softcapping (inert at ppl context
+              lengths; matters beyond ~4k ctx where scores exceed
+              Gemma-2's 50 cap).
+            * Uniform-data kernel tests cannot catch fragment-mapping,
+              store-permutation, or pairing bugs: validate every new
+              kernel against a random-data CPU reference.
+          CROSS-IMPLEMENTATION DEBUGGING PLAYBOOK (llama.cpp is the
+          reference, never a reimplementation; /tmp artifacts on
+          fishtank, recreate if wiped):
+            * TEMPURA_PPL_PROBE=<ids>: exact token ids through both
+              sides, dump last-position logits (.cpu.bin/.gpu.bin);
+              compare corr + argmax vs /tmp/llama-logitprobe output
+              (modes: last position, `all` per-position, `batch` one
+              prompt per line, `tokenize` for tokenization diffs;
+              needs LD_LIBRARY_PATH=~/Code/github.com/llama.cpp/
+              build/bin).
+            * TEMPURA_PPL_PROBE_ALL=1: per-position DECODE logits for
+              both sides (.cpu.dec.bin/.gpu.dec.bin). A prefill-vs-
+              decode disagreement at the same position localizes
+              decode-path bugs (this found the GeGLU / decode-attn /
+              scratch bugs on Gemma).
+            * TEMPURA_PPL_DUMP_TOKENS / TEMPURA_PPL_DUMP_KV:
+              tokenization and K-cache dumps for byte-level diffs.
+            * TEMPURA_DEBUG_NAN=1: per-op NaN + bits_sum trace; also
+              forces eager execution (D2H during capture is illegal).
+            * Order of operations: fix CPU to reference quality FIRST
+              (corr 0.99+ vs llama at multiple lengths), then
+              GPU-vs-CPU.
+            * Kill remote benches by PID or full command line, NEVER
+              pkill by binary name.
           * REMAINING follow-ups: (1) [x] bench-quality's llama.cpp arbiter
               now renders the prompt through the model's chat template
               (both sides see identical templated text; post-fix: free-
@@ -889,13 +712,9 @@ typical-p/repeat/presence/frequency)
           band into ~40% choice flips. Quantified perf/precision
           tradeoff -- candidate follow-up: MXFP4 prefill opt-out for
           quality-sensitive workloads, or higher-precision tiling.
-          NOTE: the GPU-side bisect switches are currently broken for
-          this workload: TEMPURA_NO_MXFP4=1 and TEMPURA_NO_GPU_PREFILL=1
-          both PANIC ("operation not permitted when stream is capturing",
-          cutile_gpu_forward.rs:~4837, Q4_K packed download during CUDA
-          graph capture) -- allocation/download during capture, pre-
-          existing, latent until the MMLU prefills exercised these
-          paths. Open work.
+          NOTE: the GPU-side bisect switches are broken for this
+          workload (TEMPURA_NO_MXFP4=1 / TEMPURA_NO_GPU_PREFILL=1 panic
+          during CUDA graph capture -- see follow-up (6)). Open work.
       (c) [x] **Self-consistency generation** (GSM8K-style):
           bench-selfconsistency (tools/bench-gpu/src/bench_selfconsistency.rs,
           2026-11-04; REFERENCE RUN 2026-11-06 on fishtank). K samples per
@@ -924,128 +743,16 @@ typical-p/repeat/presence/frequency)
           CUDA toolkit was previously required to build the crate at all;
           the remote workflow is unchanged). Validated end-to-end CPU-only
           (Qwen2.5-0.5B smoke run); the reference run (Llama-3.1-8B Q4_K_M,
-          full 102 problems x 5 samples) is pending the GPU host. Fixed on
-          the way: the original extract_answer marker scan was an infinite
-          loop (find() from a fixed offset, fresh to_lowercase() allocation
-          every iteration -> OOM SIGKILL) and sliced non-ASCII text at
-          non-char-boundary byte offsets (panicked on a Chinese completion).
-      (d) **Multi-model validation**: test with other RTX 5090-fitting
-          models (Llama-3.1-8B, Qwen2.5-7B, Mistral-7B, Phi-3.5-mini,
-          Gemma-2-9B) to verify the quality gates hold across
-          architectures, not just Llama-3.1.
-          CPU SWEEP COMPLETE 2026-11-10 -- 5/5 PASS:
-            Llama-3.1-8B   7.31    / llama 7.09    = 1.03x
-                (report bench-perplexity.json lineage)
-            Mistral-7B     5.96    / llama 5.96    = 1.003x
-                (bench-perplexity-mistral7b.json)
-            Qwen2.5-7B     6.4567  / llama 6.2968  = 1.0254x
-                (bench-perplexity-qwen25-7b.json)
-            Phi-3.5-mini   6.0753  / llama 5.9609  = 1.0192x
-                (bench-perplexity-phi35-mini.json)
-            Gemma-2-9B     7.7312  / llama 7.7263  = 1.0006x
-                (bench-perplexity-gemma2-9b.json)
-          * Gemma-2-9B-it Q4_K_M (gemma2 arch, 42 layers, h=3584,
-            16/8 GQA heads, head_dim 256, GeGLU FFN, attention softcap 50
-            + final logit softcap 30, four norms per layer, NEOX rope):
-            **BOTH SIDES VALIDATED 2026-11-10 -- the 5th family COMPLETE.
-            CPU ppl 7.7312 = 1.0006x llama.cpp (best of all families);
-            GPU ppl 7.6835 = 0.9939x CPU, 0.9945x llama.cpp (BETTER than
-            the reference), PASS, 0 NaN** (report
-            bench-perplexity-gemma2-9b.json). GPU decode 103 tok/s
-            (ITL 9.67 ms, 2.0x gap), prefill 2044 tok/s (3.6x gap).
-            TEN real bugs deep (every one masked by an earlier one):
-            1. final_logit_softcapping did not exist: config field +
-               GGUF {arch}.final_logit_softcapping + HF parse, applied as
-               tanh(x/cap)*cap after lm_head on CPU (both forward paths)
-               and at every GPU logits download (download_logits; greedy
-               argmax is invariant under the monotonic map).
-            2. rmsnorm_offset DOUBLE-APPLIED for GGUF Gemma: the converter
-               (conversion/gemma.py modify_tensors) bakes +1 into every
-               norm.weight; llama.cpp applies plain rms_norm x w. The GGUF
-               loader now sets rmsnorm_offset=false (HF-safetensors keeps
-               it). Symptom: logits mean -11 vs llama's -0.5.
-            3. Gemma-2's four-norm layer: post_attention_norm (attn OUTPUT
-               norm) and post_ffw_norm (FFN OUTPUT norm) -- the GGUF name
-               mapping collided both onto post_attention_layernorm (one
-               overwrote the other) and dropped post_ffw_norm entirely.
-               New mappings self_attn.post_attention_norm /
-               mlp.post_ffw_norm, applied on CPU (forward_quantized) and
-               GPU (pad -> rmsnorm -> add, dedicated capture-safe
-               RmsnormScratches; the shared ones' outputs are still
-               Arc-referenced at the post-norm points -> alloc inside
-               capture).
-            4. TOKENIZER (3 sub-bugs, found via llama_logitprobe's new
-               `tokenize` mode + all-positions diff; final state:
-               291828/291828 tokens, ZERO diffs vs llama.cpp):
-               a. tokenizer.ggml.add_space_prefix (=0 for gemma) was
-                  ignored -- tempura read a nonexistent add_dummy_prefix
-                  key and defaulted true (292552 tokens, ppl 10.75 vs
-                  7.73 despite 0.9994 probe corr -- a textbook
-                  model-fine-tokenizer-wrong case).
-               b. USER_DEFINED (type 4) tokens were excluded from the SPM
-                  merge map -- Gemma's newline pieces are type 4; every
-                  newline fell to byte fallback <0x0A> (3633 diffs).
-                  llama.cpp's token_to_id has no type filter.
-               c. USER_DEFINED tokens must ALSO match as RAW-text
-                  prefixes before whitespace escaping (llama.cpp's
-                  user_defined_token_matcher) -- Gemma's "  " (two real
-                  spaces) can never match escaped text (12 diffs).
-            5. GPU FFN activation was hard-coded SiLU: GeGLU needs GELU
-               (tanh approx). New cutile_gelu_mul kernel (validated
-               EXACT vs the CPU formula on random data, max_err 0.00,
-               /tmp/gelu-check on fishtank) + gelu_mul_device_scratch +
-               dispatch by cfg.hidden_act at every FFN site. The
-               fused-silu GEMV path and the MXFP4 Silu epilogue are
-               gated off for GeGLU.
-            6. attn_logit_softcapping GGUF key is
-               {arch}.attn_logit_softcapping (llama.cpp
-               LLM_KV_ATTN_LOGIT_SOFTCAPPING), NOT
-               {arch}.attention.logit_softcapping -- the config was None,
-               which ALSO defeated the oxide-attn gate (below).
-               Attention softcap now implemented in the cutile flash
-               kernels (overflow-safe tanh via 1-2/(exp(2x)+1) on the
-               scaled scores); it is INERT at ppl context lengths (CPU
-               matched llama at 1.0006x with and without it).
-            7. cutile_decode_attn IS BROKEN: GPU decode corr 0.66 vs
-               0.9973 on the oxide kernel at IDENTICAL inputs (3-token
-               probe, 2026-11-10). Every previously validated model used
-               the oxide kernel in the decode graph, so the cutile path
-               was never exercised. Gemma decode routes through oxide
-               (which lacks attn softcap -- inert at these lengths;
-               follow-up: fix cutile_decode_attn; add softcap to the
-               oxide PTX for >4k-ctx where scores exceed the 50 cap).
-            8. GELU scratch routing: the m>1+GeGLU prefill fell into the
-               decode branch (silu_out_scratch) -- the 300-token prefill
-               resized it, then the decode graph capture reallocated
-               inside capture (DriverError 900). Prefill-sized runs use
-               prefill_silu_scratch; warmup_gemms pre-allocates +
-               JIT-warms the decode gelu scratch/kernel for GeGLU models.
-            9. TEMPURA_PPL_PROBE_ALL now also dumps GPU per-position
-               decode logits (.gpu.dec.bin) -- the prefill-vs-decode
-               disagreement (4.7 mean-abs at the same position) is what
-               localized bugs 5/7/8.
-            10. (carry-over Qwen fix) gemm_d2d_slot's decode slot pool
-                was drained by prefill consumers -- found on Gemma's f32
-                attention weights, fixed with Qwen.
-            Debug artifacts on fishtank: /tmp/gemma-probe-ids.txt,
-            /tmp/gemma-p300.txt (+.cpu.dec.bin/.gpu.dec.bin),
-            /tmp/gemma-p300-ref-all.bin (llama all-positions),
-            /tmp/gemma-llama-tokens.txt (llama tokenize-mode dump),
-            /tmp/gelu-check (standalone kernel check project).
-          Remaining: none for the 5-family matrix. Perf follow-ups:
-          Gemma decode 103 tok/s (2.0x gap -- 42 layers + 4 norms/layer
-          + post-norm kernels in the graph), prefill 2044 (3.6x).
-          All five families are now validated on both sides:
-            Llama-3.1-8B   CPU 7.31 / GPU PASS (oldest lineage)
-            Mistral-7B     CPU 5.96 / GPU 5.98
-            Qwen2.5-7B     CPU 6.4567 / GPU 6.6770 (MXFP4) or 6.4512 (exact)
-            Phi-3.5-mini   CPU 6.0753 / GPU 6.3598
-            Gemma-2-9B     CPU 7.7312 / GPU 7.6835
-          Each new family flushed out
-          real bugs the others masked: Mistral (SPM tokenizer), Qwen
-          (QKV biases x3, staticpar race, capture-time pad alloc, f16
-          subnormals), Phi (fused qkv/gate_up splits, silu+sequential,
-          Q5K-as-Q4K catch-all, rope mscale -- 7 total).
+          full 102 problems x 5 samples) is pending the GPU host.
+      (d) [x] **Multi-model validation**: COMPLETE 2026-11-10 (see the
+          matrix in (a)). Each family flushed out real bugs the others
+          masked: Mistral (SPM tokenizer), Qwen (QKV biases x3, staticpar
+          race, capture-time pad alloc, f16 subnormals, h_pad striding),
+          Phi (fused qkv/gate_up splits, silu+sequential, Q5K-as-Q4K
+          catch-all, rope mscale, non-pow2 head_dim), Gemma (softcapping,
+          norm offset, four-norm layers, tokenizer x3, GeGLU, broken
+          cutile_decode_attn). Bug narratives: commit messages
+          1f44ac1..b0166a7.
       Current quality matrix for reference (Llama-3.1-8B Q4_K_M,
       teacher-forced, 64 positions):
         tempura CPU vs GPU:    89.1%  (internal gate -- PASSES)
