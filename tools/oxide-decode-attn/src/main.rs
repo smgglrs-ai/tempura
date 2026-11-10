@@ -36,7 +36,7 @@
 use cuda_device::{DynamicSharedArray, kernel, thread, warp, float};
 use cuda_host::cuda_module;
 use cuda_core::{CudaContext, DeviceBuffer};
-use cuda_core::simt::LaunchConfig;
+use cuda_core::LaunchConfig;
 
 const WARPS_PER_BLOCK_KPAR: u32 = 8;
 const BLOCK_DIM_KPAR: u32 = WARPS_PER_BLOCK_KPAR * 32;

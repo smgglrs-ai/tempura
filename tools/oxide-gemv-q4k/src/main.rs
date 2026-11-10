@@ -39,7 +39,7 @@ use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, ptx_asm, thread, wa
 use cuda_device::dotprod::dp4a_s32;
 use cuda_host::cuda_module;
 use cuda_core::{CudaContext, DeviceBuffer};
-use cuda_core::simt::LaunchConfig;
+use cuda_core::LaunchConfig;
 
 const WARPS_PER_BLOCK: u32 = 4;
 const WARPS_PER_BLOCK_KPAR: u32 = 8;
