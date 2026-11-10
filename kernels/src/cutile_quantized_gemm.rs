@@ -86,7 +86,7 @@ pub mod kernels {
     ///     dequant: (q - 1) x scale, q ??? {0,1,2,3} -> values ??? {-1,0,1,2} x scale
     ///
     /// Grid: (N, 1, 1) -- one program per output neuron.
-    #[cutile::entry(optimization_hints = (sm_120 = (vec_width = 4,)))]
+    #[cutile::entry]
     pub fn cutile_q2_0_gemv<const K_BLOCKS: i32>(
         z: &mut Tensor<f32, { [1] }>,
         x: &Tensor<f32, { [-1] }>,
@@ -312,7 +312,7 @@ pub mod kernels {
     ///   dequant: within->(half,sub,l,group); lo+hi nibbles->q6 ???[0,63]; dxscx(q6-32)
     ///
     /// Grid: (N, 1, 1) -- one program per output neuron.
-    #[cutile::entry(optimization_hints = (sm_120 = (vec_width = 4,)))]
+    #[cutile::entry]
     pub fn cutile_q6k_gemv<const K_BLOCKS: i32>(
         z: &mut Tensor<f32, { [1] }>,
         x: &Tensor<f32, { [-1] }>,
@@ -515,7 +515,7 @@ pub mod kernels {
     ///   hi = qs[j*32+l] >> 4   -> w = d * sc[2*j+1] * hi  - dmin * m[2*j+1] (element j*64+l+32)
     ///
     /// Grid: (N, 1, 1) -- one program per output neuron.
-    #[cutile::entry(optimization_hints = (sm_120 = (vec_width = 4,)))]
+    #[cutile::entry]
     pub fn cutile_q4k_gemv<const K_BLOCKS: i32>(
         z: &mut Tensor<f32, { [1] }>,
         x: &Tensor<f32, { [-1] }>,
