@@ -204,12 +204,12 @@ fn main() {
 
             let mut x_cpu = x.clone();
             cpu_rope
-                .forward(&mut x_cpu, 1, seq_len, nh, hd, &pos, theta)
+                .forward(&mut x_cpu, 1, seq_len, nh, hd, &pos, theta, 1.0)
                 .unwrap();
 
             let mut x_gpu = x.clone();
             gpu_rope
-                .forward(&mut x_gpu, 1, seq_len, nh, hd, &pos, theta)
+                .forward(&mut x_gpu, 1, seq_len, nh, hd, &pos, theta, 1.0)
                 .unwrap();
 
             let md: f32 = x_cpu

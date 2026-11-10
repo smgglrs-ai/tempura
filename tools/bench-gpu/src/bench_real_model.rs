@@ -55,7 +55,7 @@ fn try_forward(
     // reshape bug hid for a week behind the old catch-all "unsupported shape"
     // message + exit 0 -- a silently-skipped bench looks like a green bench.
     match std::panic::catch_unwind(AssertUnwindSafe(|| wrapper.forward(session, tokens))) {
-        Ok(logits) => logits.ok(),
+        Ok(logits) => Some(logits),
         Err(panic) => {
             let msg = panic
                 .downcast_ref::<&str>()
