@@ -625,6 +625,15 @@ typical-p/repeat/presence/frequency)
               PTX lacks attention softcapping (inert at ppl context
               lengths; matters beyond ~4k ctx where scores exceed
               Gemma-2's 50 cap).
+            * The m=1 Q6K projections return the SHARED kpar scratch
+              (pre-allocated at max(inter, vocab) for lm_head) whenever n
+              fits -- consumers must tolerate OVERSIZED rank-1 tensors and
+              read by explicit element count (add_device_scratch's
+              contract). Exact-count reshapes on these tensors panic
+              (found by the bench-real-model probe 2026-11-10; the probe's
+              catch_unwind mislabels any failure as "unsupported model
+              shape" and exits 0 -- a silently-skipped bench is the
+              symptom, check for "OK -- forward pass works").
             * Uniform-data kernel tests cannot catch fragment-mapping,
               store-permutation, or pairing bugs: validate every new
               kernel against a random-data CPU reference.
