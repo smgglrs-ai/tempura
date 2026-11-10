@@ -14,7 +14,52 @@ env:
   KANI_VERSION: "0.67.0"
 
 jobs:
+  # Classify which areas changed (fast, ~seconds). The verification jobs are
+  # 90+ min each; docs-only or script-only pushes must not pay for them.
+  # Dependency edges are respected: engine builds against kernels, so a
+  # kernels change runs BOTH jobs; a pure engine change runs only engine.
+  # Shared surface (workspace manifests, lockfile, .cargo config, this
+  # workflow) counts as affecting both.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tempura-kernels: ${{ steps.filter.outputs.tempura-kernels }}
+      tempura-engine: ${{ steps.filter.outputs.tempura-engine }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            tempura-kernels:
+              - 'kernels/**'
+              - 'kernel-api/**'
+              - 'tools/**/Cargo.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - '.github/workflows/kani.yml'
+            tempura-engine:
+              - 'engine/**'
+              - 'kernels/**'
+              - 'kernel-api/**'
+              - 'tools/**/Cargo.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - '.github/workflows/kani.yml'
+
   kani:
+    needs: changes
+    # Skipped entirely when the commit touched nothing the proofs cover
+    # (docs, benches' JSON artifacts, scripts, TLA+ specs, the docs site).
+    # NOTE: [skip ci] in a commit message also works natively for a one-off.
+    if: |
+      needs.changes.outputs.tempura-kernels == 'true' ||
+      needs.changes.outputs.tempura-engine == 'true'
     runs-on: ubuntu-latest
     # One job per crate, in parallel: the kernels suite alone takes ~90 min
     # on a GH runner (run 214: kernels step green at ~90 min) and the engine
@@ -51,6 +96,7 @@ jobs:
         run: cargo install --version ${{ env.KANI_VERSION }} --locked kani-verifier && cargo kani setup
 
       - name: Verify ${{ matrix.package }}
+        if: needs.changes.outputs[matrix.package] == 'true'
         run: cargo kani --package ${{ matrix.package }} -Z unstable-options --ignore-global-asm
         # --ignore-global-asm: the `gemm` -> `pulp` dependency contains global
         # ASM, which Kani 0.67 cannot compile; without this flag the job has
