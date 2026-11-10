@@ -644,6 +644,7 @@ fn main() {
                                 (pad / br) as i32,
                                 (pad / bc) as i32,
                                 hpg,
+                                0.0,
                             )
                             .generics(vec![br.to_string(), bc.to_string(), HEAD_DIM.to_string()])
                             .async_on(&sweep_stream)
