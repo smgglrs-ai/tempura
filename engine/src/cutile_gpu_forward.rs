@@ -6336,12 +6336,22 @@ impl CutileGpuModel {
                 None => o_padded,
             };
             // The rmsnorm returns rank-2 [seq_len, h_pad]; the add kernel
-            // partitions rank-1 operands.
-            let o_normed = o_normed
-                .clone()
-                .reshape(&[seq_len * self.h_pad])
-                .expect("Gemma attn post-norm reshape")
-                .into();
+            // partitions rank-1 operands. Oversized rank-1 tensors pass
+            // through unreshaped: the shared Q6K kpar scratch is
+            // max(inter, vocab)-sized and returned whole when n fits, and
+            // the add reads only the first seq_len*h_pad elements via its
+            // explicit count (found by the bench-real-model probe,
+            // 2026-11-10: the unconditional reshape panicked on mixed-quant
+            // Llama -- Q6K down_proj n=4096 vs the vocab-sized scratch).
+            let o_normed: Arc<Tensor<f32>> = if o_normed.size() == seq_len * self.h_pad {
+                o_normed
+                    .clone()
+                    .reshape(&[seq_len * self.h_pad])
+                    .expect("Gemma attn post-norm reshape")
+                    .into()
+            } else {
+                o_normed.clone()
+            };
 
             // Post-attention residual add (GPU, pre-allocated scratch).
             hidden_dev = self.add_device_scratch(
@@ -6524,11 +6534,18 @@ impl CutileGpuModel {
                     .expect("Gemma ffn post-norm failed"),
                 None => down_padded,
             };
-            let down_normed = down_normed
-                .clone()
-                .reshape(&[seq_len * self.h_pad])
-                .expect("Gemma ffn post-norm reshape")
-                .into();
+            let down_normed: Arc<Tensor<f32>> = if down_normed.size() == seq_len * self.h_pad {
+                down_normed
+                    .clone()
+                    .reshape(&[seq_len * self.h_pad])
+                    .expect("Gemma ffn post-norm reshape")
+                    .into()
+            } else {
+                // Oversized shared Q6K kpar scratch: the add kernel reads
+                // only the first seq_len*h_pad elements via its explicit
+                // count (pre-Gemma contract).
+                down_normed.clone()
+            };
 
             // Post-FFN residual add (GPU, pre-allocated scratch).
             hidden_dev = self.add_device_scratch(
@@ -7204,11 +7221,17 @@ impl CutileGpuModel {
                         .expect("Gemma attn post-norm (prefill) failed"),
                     None => o_padded,
                 };
-                let o_padded = o_padded
-                    .clone()
-                    .reshape(&[seq_len * self.h_pad])
-                    .expect("Gemma attn post-norm reshape (prefill)")
-                    .into();
+                let o_padded: Arc<Tensor<f32>> = if o_padded.size() == seq_len * self.h_pad {
+                    o_padded
+                        .clone()
+                        .reshape(&[seq_len * self.h_pad])
+                        .expect("Gemma attn post-norm reshape (prefill)")
+                        .into()
+                } else {
+                    // Oversized shared Q6K kpar scratch: the add reads only
+                    // the first seq_len*h_pad elements via its explicit count.
+                    o_padded.clone()
+                };
 
                 // -- 2g. Residual add (GPU) ----------------------------------------
                 // o_padded is already h_pad-strided (pad + Gemma post-norm
@@ -7440,11 +7463,19 @@ impl CutileGpuModel {
                                 .expect("Gemma ffn post-norm (prefill) failed"),
                             None => down_padded,
                         };
-                        let down_padded = down_padded
-                            .clone()
-                            .reshape(&[seq_len * self.h_pad])
-                            .expect("Gemma ffn post-norm reshape (prefill)")
-                            .into();
+                        let down_padded: Arc<Tensor<f32>> =
+                            if down_padded.size() == seq_len * self.h_pad {
+                                down_padded
+                                    .clone()
+                                    .reshape(&[seq_len * self.h_pad])
+                                    .expect("Gemma ffn post-norm reshape (prefill)")
+                                    .into()
+                            } else {
+                                // Oversized shared Q6K kpar scratch: the add
+                                // reads only the first seq_len*h_pad elements
+                                // via its explicit count.
+                                down_padded.clone()
+                            };
                         if seq_len == 1 {
                             self.add_device_scratch(
                                 &hidden_dev,
