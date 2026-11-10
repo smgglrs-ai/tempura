@@ -61,12 +61,13 @@ jobs:
       needs.changes.outputs.tempura-kernels == 'true' ||
       needs.changes.outputs.tempura-engine == 'true'
     runs-on: ubuntu-latest
-    # One job per crate, in parallel: the kernels suite alone takes ~90 min
-    # on a GH runner (run 214: kernels step green at ~90 min) and the engine
-    # suite needs more than the remainder of a single 150-min window
-    # (run 214: engine step cancelled by the job timeout ~55 min in).
-    # Each job gets its own 150-min budget; wall time is the max, not the sum.
-    timeout-minutes: 150
+    # One job per crate, in parallel: the kernels suite takes ~90 min on a GH
+    # runner (runs 214/215: kernels green at ~90 min both times) and the
+    # engine suite exceeds 150 min (runs 214: cancelled ~55 min in with a
+    # shared budget; 215: cancelled at the 150-min job timeout with a full
+    # budget -- it needs more). 300 min gives the engine job ~2x headroom;
+    # path filtering keeps unaffected pushes from paying any of this.
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
