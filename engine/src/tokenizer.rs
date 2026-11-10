@@ -209,9 +209,17 @@ impl Tokenizer {
             let token_types_slice = metadata
                 .get("tokenizer.ggml.token_type")
                 .and_then(|v| v.as_u32_array());
-            let add_dummy_prefix = match metadata.get("tokenizer.ggml.add_dummy_prefix") {
+            // llama.cpp's key is add_space_prefix (LLM_KV_TOKENIZER_ADD_PREFIX,
+            // SPM default true). Gemma GGUFs carry add_space_prefix=0 -- without
+            // this the dummy "▁" is prepended mid-stream and every tokenization
+            // drifts (Gemma-2-9B: 292552 vs llama.cpp's 291828 corpus tokens,
+            // ppl 10.75 vs 7.73 despite 0.9994 probe corr, 2026-11-09).
+            let add_dummy_prefix = match metadata.get("tokenizer.ggml.add_space_prefix") {
                 Some(GgufValue::Bool(b)) => *b,
-                _ => true,
+                _ => match metadata.get("tokenizer.ggml.add_dummy_prefix") {
+                    Some(GgufValue::Bool(b)) => *b,
+                    _ => true,
+                },
             };
             Some(
                 crate::spm_tokenizer::SpmModel::new(

@@ -919,7 +919,16 @@ fn map_gguf_name(gguf_name: &str) -> Option<String> {
             "ffn_down.weight" => "mlp.down_proj.weight",
             "ffn_sub_norm.weight" => "mlp.ffn_sub_norm.weight",
             "attn_sub_norm.weight" => "self_attn.attn_sub_norm.weight",
-            "post_attention_norm.weight" => "post_attention_layernorm.weight",
+            // Gemma-2's post-norms: the GGUF "post_attention_norm" is the
+            // ATTENTION-OUTPUT norm (applied before the residual add) and
+            // "post_ffw_norm" the FFN-OUTPUT norm -- NOT the Llama-style
+            // pre-FFN residual norm ("ffn_norm" above). Mapping them onto
+            // post_attention_layernorm collided with ffn_norm and left the
+            // FFN output norm unloaded entirely (Gemma-2-9B probe corr 0.35).
+            // NOTE: olmo2-style arches that use post_attention_norm as a
+            // Llama-style pre-FFN norm would need their own mapping.
+            "post_attention_norm.weight" => "self_attn.post_attention_norm.weight",
+            "post_ffw_norm.weight" => "mlp.post_ffw_norm.weight",
             "ssm_in.weight" => "ssm.in_proj.weight",
             "ssm_out.weight" => "ssm.out_proj.weight",
             "ssm_conv1d.weight" => "ssm.conv1d.weight",
@@ -1323,9 +1332,27 @@ pub fn extract_config(metadata: &HashMap<String, GgufValue>) -> Result<ModelConf
                     })
                     .unwrap_or(false)
         },
-        rmsnorm_offset: matches!(architecture, crate::config::Architecture::Gemma),
+        // The GGUF converter (conversion/gemma.py modify_tensors) bakes the
+        // Gemma (1 + w) offset into every norm.weight at conversion time --
+        // llama.cpp's runtime applies plain rms_norm x weight. Adding 1
+        // again here would double the offset (found via Gemma-2-9B, 2026-11-
+        // 09: 17-token probe corr 0.35 vs llama.cpp). The HF-safetensors
+        // path (config.rs) keeps the offset -- raw HF weights do NOT carry
+        // the +1.
+        rmsnorm_offset: false,
+        // GGUF key is {arch}.attn_logit_softcapping (llama.cpp
+        // LLM_KV_ATTN_LOGIT_SOFTCAPPING) -- NOT {arch}.attention.logit_...
+        // (Gemma-2: gemma2.attn_logit_softcapping = 50.0).
         attn_logit_softcapping: metadata
-            .get(&format!("{arch}.attention.logit_softcapping"))
+            .get(&format!("{arch}.attn_logit_softcapping"))
+            .and_then(|v| v.as_f32())
+            .or_else(|| {
+                metadata
+                    .get(&format!("{arch}.attention.logit_softcapping"))
+                    .and_then(|v| v.as_f32())
+            }),
+        final_logit_softcapping: metadata
+            .get(&format!("{arch}.final_logit_softcapping"))
             .and_then(|v| v.as_f32()),
         embedding_scale: matches!(architecture, crate::config::Architecture::Gemma),
         layer_kinds: None,
@@ -2868,7 +2895,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gguf_gemma_has_rmsnorm_offset() {
+    fn test_gguf_gemma_rmsnorm_offset_baked_by_converter() {
         let values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let tensor_bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
 
@@ -2897,7 +2924,9 @@ mod tests {
             loader.config.architecture,
             crate::config::Architecture::Gemma
         );
-        assert!(loader.config.rmsnorm_offset);
+        // The GGUF converter bakes the +1 into norm weights, so the runtime
+        // offset must stay OFF (see the rmsnorm_offset field assignment).
+        assert!(!loader.config.rmsnorm_offset);
         assert!(loader.config.embedding_scale);
         assert!(!loader.config.parallel_attn_ffn);
     }

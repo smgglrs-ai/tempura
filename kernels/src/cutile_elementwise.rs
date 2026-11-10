@@ -76,6 +76,32 @@ pub mod kernels {
         out.store(silu * tile_up);
     }
 
+    /// GELU-gated MLP (Gemma GeGLU): out[i] = gelu(gate[i]) * up[i].
+    /// gelu(x) = 0.5*x*(1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)));
+    /// tanh via 1 - 2/(exp(2y)+1) (overflow-safe: y -> inf gives 1).
+    #[cutile::entry()]
+    pub fn cutile_gelu_mul<const B: i32>(
+        out: &mut Tensor<f32, { [B] }>,
+        gate: &Tensor<f32, { [-1] }>,
+        up: &Tensor<f32, { [-1] }>,
+    ) {
+        let pid = program_id(0);
+        let tile_g = gate.partition(shape![B]).load([pid]);
+        let tile_up = up.partition(shape![B]).load([pid]);
+        let half: Tile<f32, { [B] }> = broadcast_scalar(0.5_f32, shape![B]);
+        let one: Tile<f32, { [B] }> = broadcast_scalar(1.0_f32, shape![B]);
+        let two: Tile<f32, { [B] }> = broadcast_scalar(2.0_f32, shape![B]);
+        let sqrt_2_over_pi: Tile<f32, { [B] }> =
+            broadcast_scalar(0.797_884_56_f32, shape![B]);
+        let gelu_coef: Tile<f32, { [B] }> = broadcast_scalar(0.044_715_f32, shape![B]);
+        // x + 0.044715 * x^3, scaled by sqrt(2/pi).
+        let y = (tile_g + tile_g * tile_g * tile_g * gelu_coef) * sqrt_2_over_pi;
+        let e = exp(y * two);
+        let tanh_y = one - two / (e + one);
+        let g = half * tile_g * (one + tanh_y);
+        out.store(g * tile_up);
+    }
+
     /// Q8 quantize-dequantize round-trip over 32-element blocks.
     ///
     /// Snaps each element to the nearest int8-representable value within
@@ -341,6 +367,98 @@ impl CutileElementwise {
                             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
                     } else {
                         // Pre-allocated for a different seq_len; discard and re-allocate.
+                        if std::env::var("TEMPURA_DEBUG_GELU").is_ok() {
+                            eprintln!(
+                                "[gelu] scratch size mismatch: {} != n_pad {n_pad}",
+                                tensor.size()
+                            );
+                        }
+                        api::zeros::<f32>(&[n_pad])
+                            .sync_on(stream)
+                            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    }
+                }
+                Err(arc_back) => {
+                    if std::env::var("TEMPURA_DEBUG_GELU").is_ok() {
+                        eprintln!("[gelu] scratch not uniquely owned");
+                    }
+                    *scratch = Some(arc_back);
+                    api::zeros::<f32>(&[n_pad])
+                        .sync_on(stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                }
+            },
+            None => {
+                if std::env::var("TEMPURA_DEBUG_GELU").is_ok() {
+                    eprintln!("[gelu] scratch EMPTY (n_pad {n_pad})");
+                }
+                api::zeros::<f32>(&[n_pad])
+                    .sync_on(stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            }
+        };
+        let out_t = out_tensor.partition([SILU_B]);
+
+        let (gate_t, up_t): (Arc<Tensor<f32>>, Arc<Tensor<f32>>) = if n_pad == n {
+            (gate.clone(), up.clone())
+        } else {
+            let gate_host = gate
+                .to_host_vec()
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            let up_host = up
+                .to_host_vec()
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            let (gv, uv) = pad_pair(&gate_host, &up_host, n, n_pad);
+            let gt = api::copy_host_vec_to_device(&gv)
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into();
+            let ut = api::copy_host_vec_to_device(&uv)
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into();
+            (gt, ut)
+        };
+
+        // SAFETY: kernel queued async; GPU stream ordering ensures correct execution.
+        // Caller syncs before CPU read.
+        let (out_t, _g, _u) = unsafe {
+            kernels::cutile_silu_mul(out_t, gate_t, up_t)
+                .generics(vec![SILU_B.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+
+        let result = Arc::new(out_t.unpartition());
+        *scratch = Some(result.clone());
+        Ok(result)
+    }
+
+    /// GELU-gated multiply (Gemma GeGLU) reusing a pre-allocated output
+    /// buffer -- identical buffer lifecycle to `silu_mul_device_scratch`,
+    /// with the SiLU swapped for tanh-approximation GELU.
+    pub fn gelu_mul_device_scratch(
+        &self,
+        gate: &Arc<Tensor<f32>>,
+        up: &Arc<Tensor<f32>>,
+        seq_len: usize,
+        inter: usize,
+        scratch: &mut Option<Arc<Tensor<f32>>>,
+        stream: &Arc<Stream>,
+    ) -> Result<Arc<Tensor<f32>>> {
+        let n = seq_len * inter;
+        let n_pad = n.div_ceil(SILU_B) * SILU_B;
+
+        let out_tensor = match scratch.take() {
+            Some(arc) => match Arc::try_unwrap(arc) {
+                Ok(tensor) => {
+                    if tensor.size() == n_pad {
+                        tensor
+                            .reshape(&[n_pad])
+                            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    } else {
                         api::zeros::<f32>(&[n_pad])
                             .sync_on(stream)
                             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
@@ -382,10 +500,10 @@ impl CutileElementwise {
             (gt, ut)
         };
 
-        // SAFETY: kernel queued async; GPU stream ordering ensures correct execution.
-        // Caller syncs before CPU read.
+        // SAFETY: kernel queued async; GPU stream ordering ensures correct
+        // execution. Caller syncs before CPU read.
         let (out_t, _g, _u) = unsafe {
-            kernels::cutile_silu_mul(out_t, gate_t, up_t)
+            kernels::cutile_gelu_mul(out_t, gate_t, up_t)
                 .generics(vec![SILU_B.to_string()])
                 .async_on(stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
@@ -480,5 +598,59 @@ fn pad_pair(a: &[f32], b: &[f32], n: usize, n_pad: usize) -> (Arc<Vec<f32>>, Arc
         av[..n].copy_from_slice(a);
         bv[..n].copy_from_slice(b);
         (Arc::new(av), Arc::new(bv))
+    }
+}
+
+#[cfg(test)]
+mod gelu_tests {
+    use super::*;
+
+    fn cpu_gelu(x: f32) -> f32 {
+        // ggml gelu_f32 formula (ops_llama::gelu_f32 equivalent)
+        let sqrt_2_over_pi = 0.797_884_560_8_f32;
+        let c = 0.044_715_f32;
+        0.5 * x * (1.0 + (sqrt_2_over_pi * x * (1.0 + c * x * x)).tanh())
+    }
+
+    /// cutile_gelu_mul vs the CPU formula on random data: catches constant,
+    /// operand-order, and tile-math errors (uniform data cannot).
+    #[test]
+    fn gelu_mul_matches_cpu_formula() {
+        use cutile::api;
+        let el = CutileElementwise::new().expect("init");
+        let stream = el.stream().clone();
+        let n = 4096usize;
+        let mut rng: u32 = 0x12345678;
+        let next = || {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((rng >> 8) as f32 / 8388608.0) - 3.0 // [-3, 3) + fat tails via cubes below
+        };
+        let gate: Vec<f32> = (0..n).map(|_| next() * next() * 4.0).collect();
+        let up: Vec<f32> = (0..n).map(|_| next()).collect();
+        let gate_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(gate.clone()))
+            .sync_on(&stream)
+            .expect("upload gate")
+            .into();
+        let up_t: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(up.clone()))
+            .sync_on(&stream)
+            .expect("upload up")
+            .into();
+        let out = el
+            .gelu_mul_device_scratch(&gate_t, &up_t, 1, n, &mut None, &stream)
+            .expect("gelu mul");
+        let got: Vec<f32> = Arc::try_unwrap(out)
+            .expect("unique")
+            .to_host_vec()
+            .sync_on(&stream)
+            .expect("download");
+        let mut max_err = 0.0f32;
+        for i in 0..n {
+            let want = cpu_gelu(gate[i]) * up[i];
+            let err = (got[i] - want).abs();
+            assert!(got[i].is_finite(), "NaN/inf at {i}");
+            max_err = max_err.max(err);
+        }
+        assert!(max_err < 1e-4, "max err {max_err}");
+        eprintln!("gelu_mul max err {max_err:.2e}");
     }
 }

@@ -444,8 +444,22 @@ pub struct TransformerModel<A, N, R, M, S> {
         String,
         String,
         String,
+        String,
+        String,
     )>,
     pub rope_cache: Option<std::sync::Arc<tempura_kernels::rope::RopeCache>>,
+}
+
+/// Gemma-2 final logit softcapping: logits = tanh(logits / cap) * cap.
+/// Monotonic, so greedy argmax is unchanged; log-probs are not.
+pub(crate) fn apply_final_logit_softcap(logits: &mut [f32], cap: Option<f32>) {
+    if let Some(cap) = cap {
+        if cap > 0.0 {
+            for l in logits.iter_mut() {
+                *l = (*l / cap).tanh() * cap;
+            }
+        }
+    }
 }
 
 impl<A, N, R, M, S> TransformerModel<A, N, R, M, S>
@@ -474,6 +488,11 @@ where
                     format!("{p}.mlp.down_proj.weight"),
                     format!("{p}.self_attn.attn_sub_norm.weight"),
                     format!("{p}.mlp.ffn_sub_norm.weight"),
+                    // Gemma-2 output norms: applied to the attention / FFN
+                    // outputs BEFORE the residual adds (GGUF
+                    // post_attention_norm / post_ffw_norm).
+                    format!("{p}.self_attn.post_attention_norm.weight"),
+                    format!("{p}.mlp.post_ffw_norm.weight"),
                 )
             })
             .collect();
@@ -1288,10 +1307,12 @@ where
         self.pipeline
             .matmul_bt(last_hidden, lm_head_w, &mut logits, 1, cfg.vocab_size, h)
             .unwrap();
+        apply_final_logit_softcap(&mut logits, cfg.final_logit_softcapping);
 
         logits
     }
 
+    #[allow(unused_imports)]
     #[allow(unused_imports)]
     pub fn forward_quantized(
         &self,
@@ -1904,6 +1925,8 @@ where
             k_norm: Option<&'a [f32]>,
             attn_sub_norm: Option<&'a [f32]>,
             ffn_sub_norm: Option<&'a [f32]>,
+            attn_post_norm: Option<&'a [f32]>,
+            ffn_post_norm: Option<&'a [f32]>,
             q_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
             k_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
             v_proj_x8: Option<&'a [tempura_kernels::ggml::blocks::BlockQ4Kx8]>,
@@ -1932,6 +1955,8 @@ where
                     down_proj: qweights.resolve_weight(&n.10),
                     attn_sub_norm: qweights.get_f32(&n.11),
                     ffn_sub_norm: qweights.get_f32(&n.12),
+                    attn_post_norm: qweights.get_f32(&n.13),
+                    ffn_post_norm: qweights.get_f32(&n.14),
                     q_proj_x8: qweights.get_q4k_repacked(&n.2),
                     k_proj_x8: qweights.get_q4k_repacked(&n.3),
                     v_proj_x8: qweights.get_q4k_repacked(&n.4),
@@ -3898,6 +3923,8 @@ where
                     ref _down_w_name,
                     ref _attn_sub_norm_name,
                     ref _ffn_sub_norm_name,
+                    ref _attn_post_norm_name,
+                    ref _ffn_post_norm_name,
                 ) = layer_names[layer];
 
                 if layer == 0 && std::env::var("TEMPURA_TRACE_TOKENS").is_ok() {
@@ -5469,6 +5496,24 @@ where
                             eprintln!("[FQ-ATN L3] attn_out_norm={an:.4} o_proj_norm={on:.4}");
                         }
                         if !cfg.parallel_attn_ffn {
+                            // Gemma-2: norm the attention OUTPUT before the
+                            // residual add (GGUF post_attention_norm -- the
+                            // converter already baked the +1 offset in).
+                            if let Some(apn_w) = indexed_layers[layer].attn_post_norm {
+                                self.pipeline
+                                    .rmsnorm_into(
+                                        &o_proj[..seq_len * h],
+                                        apn_w,
+                                        &mut normed[..seq_len * h],
+                                        h,
+                                        cfg.layer_norm_eps,
+                                        TraceLevel::Off,
+                                        &mut None,
+                                    )
+                                    .unwrap();
+                                o_proj[..seq_len * h]
+                                    .copy_from_slice(&normed[..seq_len * h]);
+                            }
                             tempura_kernels::fused::residual_add(
                                 &mut hidden[..seq_len * h],
                                 &o_proj[..seq_len * h],
@@ -5977,6 +6022,23 @@ where
                                 hidden[i] += o_proj[i] + down_out[i];
                             }
                         } else {
+                            // Gemma-2: norm the FFN OUTPUT before the
+                            // residual add (GGUF post_ffw_norm).
+                            if let Some(fpn_w) = indexed_layers[layer].ffn_post_norm {
+                                self.pipeline
+                                    .rmsnorm_into(
+                                        &down_out[..seq_len * h],
+                                        fpn_w,
+                                        &mut normed[..seq_len * h],
+                                        h,
+                                        cfg.layer_norm_eps,
+                                        TraceLevel::Off,
+                                        &mut None,
+                                    )
+                                    .unwrap();
+                                down_out[..seq_len * h]
+                                    .copy_from_slice(&normed[..seq_len * h]);
+                            }
                             tempura_kernels::fused::residual_add(
                                 &mut hidden[..seq_len * h],
                                 &down_out[..seq_len * h],
@@ -6115,6 +6177,7 @@ where
                 .matmul_bt(last_hidden, w, &mut logits, 1, cfg.vocab_size, h)
                 .unwrap();
         }
+        apply_final_logit_softcap(&mut logits, cfg.final_logit_softcapping);
 
         if do_profile {
             let total = fwd_start.elapsed().as_secs_f64() * 1000.0;
@@ -7233,6 +7296,11 @@ where
                     format!("{p}.mlp.down_proj.weight"),
                     format!("{p}.self_attn.attn_sub_norm.weight"),
                     format!("{p}.mlp.ffn_sub_norm.weight"),
+                    // Gemma-2 output norms: applied to the attention / FFN
+                    // outputs BEFORE the residual adds (GGUF
+                    // post_attention_norm / post_ffw_norm).
+                    format!("{p}.self_attn.post_attention_norm.weight"),
+                    format!("{p}.mlp.post_ffw_norm.weight"),
                 )
             })
             .collect();
@@ -7356,6 +7424,8 @@ where
                     ref dn,
                     ref asn,
                     ref fsn,
+                    ref _apn,
+                    ref _fpn,
                 ) = layer_names[layer];
 
                 // -- Fused: copy + RMSNorm + q8_snap + i2s_quantize + TL2 preprocess --
@@ -8006,6 +8076,11 @@ where
                     format!("{p}.mlp.down_proj.weight"),
                     format!("{p}.self_attn.attn_sub_norm.weight"),
                     format!("{p}.mlp.ffn_sub_norm.weight"),
+                    // Gemma-2 output norms: applied to the attention / FFN
+                    // outputs BEFORE the residual adds (GGUF
+                    // post_attention_norm / post_ffw_norm).
+                    format!("{p}.self_attn.post_attention_norm.weight"),
+                    format!("{p}.mlp.post_ffw_norm.weight"),
                 )
             })
             .collect();
@@ -8330,7 +8405,7 @@ where
                 for layer in 0..cfg.num_layers {
                     let (ref iln, ref pln, ref qn, ref kn, ref vn, ref on,
                          ref _qnm, ref _knm, ref gn, ref un, ref dn,
-                         ref asn, ref fsn) = layer_names[layer];
+                         ref asn, ref fsn, ref _apn, ref _fpn) = layer_names[layer];
                     let is_deltanet = layer_kind_vec[layer] == crate::config::LayerKind::DeltaNet;
 
                     if ith == 0 {
@@ -8840,6 +8915,11 @@ where
                     format!("{p}.mlp.down_proj.weight"),
                     format!("{p}.self_attn.attn_sub_norm.weight"),
                     format!("{p}.mlp.ffn_sub_norm.weight"),
+                    // Gemma-2 output norms: applied to the attention / FFN
+                    // outputs BEFORE the residual adds (GGUF
+                    // post_attention_norm / post_ffw_norm).
+                    format!("{p}.self_attn.post_attention_norm.weight"),
+                    format!("{p}.mlp.post_ffw_norm.weight"),
                 )
             })
             .collect();
@@ -8960,6 +9040,8 @@ where
                     ref dn,
                     ref asn,
                     ref fsn,
+                    ref _apn,
+                    ref _fpn,
                 ) = layer_names[layer];
 
                 let t_start = ith * seq_len / nth;
@@ -10079,6 +10161,11 @@ impl CutileInferenceWrapper {
                     format!("{p}.mlp.down_proj.weight"),
                     format!("{p}.self_attn.attn_sub_norm.weight"),
                     format!("{p}.mlp.ffn_sub_norm.weight"),
+                    // Gemma-2 output norms: applied to the attention / FFN
+                    // outputs BEFORE the residual adds (GGUF
+                    // post_attention_norm / post_ffw_norm).
+                    format!("{p}.self_attn.post_attention_norm.weight"),
+                    format!("{p}.mlp.post_ffw_norm.weight"),
                 )
             })
             .collect();

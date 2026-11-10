@@ -25,6 +25,10 @@ pub(crate) struct SpmModel {
     /// Special tokens (types 2/3/4), longest-first for partitioning.
     special_tokens: Vec<(String, u32)>,
     /// tokenizer.ggml.add_dummy_prefix.
+    /// USER_DEFINED (type 4) tokens, longest-first: llama.cpp matches them
+    /// as RAW-TEXT prefixes before whitespace escaping (Gemma's "  " and
+    /// newline pieces) -- user_defined_token_matcher in llama-vocab.cpp.
+    user_defined: Vec<(String, u32)>,
     add_dummy_prefix: bool,
     unk_id: Option<u32>,
 }
@@ -38,12 +42,20 @@ impl SpmModel {
         let mut pieces = HashMap::with_capacity(tokens.len());
         let mut byte_tokens = [0u32; 256];
         let mut special_tokens = Vec::new();
+        let mut user_defined = Vec::new();
         for (id, token) in tokens.iter().enumerate() {
             let score = scores.and_then(|s| s.get(id)).copied().unwrap_or(-10.0);
             let tt = token_types.and_then(|t| t.get(id)).copied().unwrap_or(1);
             match tt {
                 1 => {
                     pieces.insert((*token).to_string(), (id as u32, score));
+                }
+                // USER_DEFINED (4): matched as RAW-text prefixes before
+                // escaping (see user_defined) AND present in the merge map
+                // (llama.cpp's token_to_id has no type filter).
+                4 => {
+                    pieces.insert((*token).to_string(), (id as u32, score));
+                    user_defined.push(((*token).to_string(), id as u32));
                 }
                 6 => {
                     if let Some(hex) = token
@@ -55,18 +67,22 @@ impl SpmModel {
                         }
                     }
                 }
-                2 | 3 | 4 => special_tokens.push(((*token).to_string(), id as u32)),
+                2 | 3 => special_tokens.push(((*token).to_string(), id as u32)),
                 _ => {}
             }
         }
         // Longest-first so partitioning prefers the longest special token.
         special_tokens.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
+        // Longest-first raw-prefix matching (llama.cpp's
+        // user_defined_token_matcher.get_longest_prefix).
+        user_defined.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
         let unk_id = tokens.iter().position(|t| *t == "<unk>").map(|i| i as u32);
         Self {
             pieces,
             byte_tokens,
             all_tokens: tokens.iter().map(|s| s.to_string()).collect(),
             special_tokens,
+            user_defined,
             add_dummy_prefix: true,
             unk_id,
         }
@@ -102,13 +118,55 @@ impl SpmModel {
         output
     }
 
-    /// llama_escape_whitespace + llm_tokenizer_spm_session::tokenize.
+    /// llama_escape_whitespace + llm_tokenizer_spm_session::tokenize, with
+    /// USER_DEFINED raw-text prefix matching first (llama.cpp's
+    /// normalize_prefix checks user_defined_token_matcher BEFORE escaping --
+    /// Gemma's "  " / newline pieces carry real whitespace/newlines and can
+    /// never match the escaped text).
     fn tokenize_raw(&self, text: &str, output: &mut Vec<u32>) {
         if text.is_empty() {
             return;
         }
+        // Fast path: no user-defined tokens -- exactly the old pipeline.
+        if self.user_defined.is_empty() {
+            self.escape_merge(text, true, output);
+            return;
+        }
+        let bytes = text.as_bytes();
+        let mut chunk_start = 0usize;
+        let mut i = 0usize;
+        let mut first_chunk = true;
+        while i < bytes.len() {
+            let mut matched = None;
+            for (s, id) in &self.user_defined {
+                if text[i..].starts_with(s.as_str()) {
+                    matched = Some((s.len(), *id));
+                    break;
+                }
+            }
+            if let Some((len, id)) = matched {
+                if i > chunk_start {
+                    self.escape_merge(&text[chunk_start..i], first_chunk, output);
+                    first_chunk = false;
+                }
+                output.push(id);
+                i += len;
+                chunk_start = i;
+            } else {
+                i += utf8_len(bytes[i]).min(bytes.len() - i);
+            }
+        }
+        if chunk_start < text.len() {
+            self.escape_merge(&text[chunk_start..], first_chunk, output);
+        }
+    }
+
+    /// Escape whitespace (+ optional dummy prefix on the first chunk only --
+    /// llama.cpp prepends it once per input, not per user-defined split) and
+    /// run the bigram merge.
+    fn escape_merge(&self, text: &str, prepend_dummy: bool, output: &mut Vec<u32>) {
         let escaped = text.replace(' ', "\u{2581}");
-        let escaped = if self.add_dummy_prefix {
+        let escaped = if prepend_dummy && self.add_dummy_prefix {
             format!("\u{2581}{}", escaped)
         } else {
             escaped

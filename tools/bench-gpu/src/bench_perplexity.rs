@@ -346,6 +346,21 @@ fn main() {
             std::fs::write(format!("{p}.cpu.dec.bin"), bytes)
                 .expect("failed to write decode logits");
             println!("  decode-per-position logits written to {p}.cpu.dec.bin");
+            // GPU side too: per-position decode logits (prefill->decode
+            // transition debugging; the wrapper's forward handles the KV).
+            #[cfg(feature = "cutile")]
+            if let Some(ref w) = wrapper {
+                let mut gs = InferenceSession::new(&config, TraceLevel::Off, 0);
+                let mut gall: Vec<f32> = Vec::with_capacity(ids.len() * config.vocab_size);
+                for &t in &ids {
+                    let l = w.forward(&mut gs, &[t]);
+                    gall.extend_from_slice(&l);
+                }
+                let gbytes: Vec<u8> = gall.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(format!("{p}.gpu.dec.bin"), gbytes)
+                    .expect("failed to write gpu decode logits");
+                println!("  gpu decode-per-position logits written to {p}.gpu.dec.bin");
+            }
         }
         println!("  logits written to {p}.cpu.bin / {p}.gpu.bin");
         return;
