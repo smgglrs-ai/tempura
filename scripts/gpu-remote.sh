@@ -252,6 +252,13 @@ if [ ! -f "$upstream_backend" ]; then
     exit 1
 fi
 cd "$HOME/Code/github.com/smgglrs-ai/tempura"
+# Pull FIRST: building a stale clone silently produces stale PTX (the exact
+# trap this script's own comments warn about -- found live 2026-11-10, the
+# oxide rebuild compiled pre-fix source until sync was run manually).
+if ! git pull --ff-only -q 2>/dev/null; then
+    echo "error: remote tempura clone is dirty or diverged -- run scripts/gpu-remote.sh sync" >&2
+    exit 1
+fi
 build_upstream() {
     CUDA_OXIDE_BACKEND="$upstream_backend" \
     LD_LIBRARY_PATH="$HOME/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/lib:${LD_LIBRARY_PATH:-}" \

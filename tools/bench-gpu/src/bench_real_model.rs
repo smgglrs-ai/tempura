@@ -50,7 +50,23 @@ fn try_forward(
     session: &mut InferenceSession,
     tokens: &[u32],
 ) -> Option<Vec<f32>> {
-    std::panic::catch_unwind(AssertUnwindSafe(|| wrapper.forward(session, tokens))).ok()
+    // The probe is a REGRESSION TEST for the forward path: a panic here is a
+    // bug, not an "unsupported model shape". The 2026-11-10 Gemma post-norm
+    // reshape bug hid for a week behind the old catch-all "unsupported shape"
+    // message + exit 0 -- a silently-skipped bench looks like a green bench.
+    match std::panic::catch_unwind(AssertUnwindSafe(|| wrapper.forward(session, tokens))) {
+        Ok(logits) => logits.ok(),
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            eprintln!("\n  FORWARD PANIC (this is a bug, NOT an unsupported model shape): {msg}");
+            eprintln!("  Rerun with RUST_BACKTRACE=1 for a backtrace.");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn main() {
@@ -122,9 +138,12 @@ fn main() {
         );
     }
     if probe_result.is_none() {
-        println!("  WARNING: forward pass failed (likely cuTile JIT requires power-of-2 tile");
+        println!("  WARNING: forward pass failed (clean kernel/JIT error -- panics");
         println!(
-            "  dimensions but h={} is not power-of-2).",
+            "  exit non-zero above; this path is a returned Err, e.g. cuTile JIT"
+        );
+        println!(
+            "  shape limits for h={}.",
             config.hidden_size
         );
         println!("  Timing data unavailable for this model shape.");

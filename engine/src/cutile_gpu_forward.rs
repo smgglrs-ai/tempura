@@ -1757,6 +1757,68 @@ impl CutileGpuModel {
             let _ = out;
             let _ = stream.synchronize();
         }
+
+        // Warm up the cuTile quantized GEMV FALLBACKS for every distinct
+        // k_blocks actually present (one JIT specialization per K_BLOCKS
+        // generic). On sm_120 the oxide PTX kernels shadow these paths, so
+        // without this a latent cutile-side break (e.g. an
+        // optimization_hints key upstream cutile rejects -- the vec_width
+        // incident, 2026-11-10) only fires at first dispatch on a host
+        // WITHOUT the oxide PTX. Failing here, at load time, is the
+        // verification-first behavior. Each distinct k_blocks launches with
+        // a weight tensor that actually has that k_blocks (a mismatched
+        // pair would read past the packed buffer).
+        {
+            use tempura_kernels::cutile_quantized_gemm::{Q2_0_QK, Q6K_QK};
+            let stream = self.matmul.stream();
+            let mk_x = |k: usize| -> Arc<Tensor<f32>> {
+                Arc::new(
+                    api::zeros::<f32>(&[next_pow2(k)])
+                        .sync_on(stream)
+                        .expect("warmup: quant GEMV dummy alloc failed"),
+                )
+            };
+            let mut warmed: std::collections::HashSet<usize> = Default::default();
+            for w in self.device_weights_q4k.values() {
+                if warmed.insert(w.k_blocks) {
+                    let x = mk_x(w.k_blocks * Q4K_BLOCK_SIZE);
+                    self.q4k_gemv
+                        .forward_d2d(&x, &w.tensor, w.n, w.k_blocks)
+                        .unwrap_or_else(|e| {
+                            panic!("warmup: cuTile Q4K GEMV (k_blocks={}) failed: {e} -- this \
+                                    fallback path is broken for this model and would fail at \
+                                    first dispatch on hosts without the oxide PTX", w.k_blocks)
+                        });
+                }
+            }
+            warmed.clear();
+            for w in self.device_weights_q6k.values() {
+                if warmed.insert(w.k_blocks) {
+                    let x = mk_x(w.k_blocks * Q6K_QK);
+                    self.q6k_gemv
+                        .forward_d2d(&x, &w.tensor, w.n, w.k_blocks)
+                        .unwrap_or_else(|e| {
+                            panic!("warmup: cuTile Q6K GEMV (k_blocks={}) failed: {e} -- this \
+                                    fallback path is broken for this model and would fail at \
+                                    first dispatch on hosts without the oxide PTX", w.k_blocks)
+                        });
+                }
+            }
+            warmed.clear();
+            for w in self.device_weights_q2.values() {
+                if warmed.insert(w.k_blocks) {
+                    let x = mk_x(w.k_blocks * Q2_0_QK);
+                    self.q2_gemv
+                        .forward_d2d(&x, &w.tensor, w.n, w.k_blocks)
+                        .unwrap_or_else(|e| {
+                            panic!("warmup: cuTile Q2_0 GEMV (k_blocks={}) failed: {e} -- this \
+                                    fallback path is broken for this model and would fail at \
+                                    first dispatch on hosts without the oxide PTX", w.k_blocks)
+                        });
+                }
+            }
+            let _ = stream.synchronize();
+        }
     }
 
     // -- constructors ----------------------------------------------------------
