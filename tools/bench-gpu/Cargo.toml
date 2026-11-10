@@ -70,8 +70,8 @@ cutile = [
 [dependencies]
 tempura-kernels = { path = "../../kernels" }
 tempura-engine = { path = "../../engine" }
-cutile = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cutile-rs/cutile", optional = true }
-cuda-core = { path = "/home/fdupont/Code/github.com/NVLabs/cuda-oxide/cuda-core", optional = true }
+cutile = { path = "../../../../NVLabs/cuda-oxide/cutile-rs/cutile", optional = true }
+cuda-core = { path = "../../../../NVLabs/cuda-oxide/cuda-core", optional = true }
 half = "2"
 serde_json = "1"
 

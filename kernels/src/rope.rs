@@ -1003,6 +1003,7 @@ mod kani_proofs {
             head_dim,
             &positions,
             10000.0,
+            1.0,
         );
     }
 
@@ -1024,7 +1025,7 @@ mod kani_proofs {
         let positions = [0u32];
 
         let rope = super::CpuRoPEUnified::new(super::RoPEMode::Normal, n_dims);
-        let _ = rope.forward(&mut x[..n], 1, 1, 1, head_dim, &positions, 10000.0);
+        let _ = rope.forward(&mut x[..n], 1, 1, 1, head_dim, &positions, 10000.0, 1.0);
 
         // At position 0: theta=0, cos(0)=1, sin(0)=0 -> identity
         for i in 0..n {
