@@ -1258,7 +1258,10 @@ upstream build:
 ```sh
 # Build the codegen backend from upstream (once, or after upstream changes)
 cd ~/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda
-RUSTC_BOOTSTRAP=1 cargo build --release
+T=~/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu
+PATH=$T/bin:$PATH LD_LIBRARY_PATH=$T/lib RUSTC_BOOTSTRAP=1 $T/bin/cargo build --release
+# PATH must put the toolchain's bin first -- see the E0463 note in the
+# cargo oxide build section below (distro /usr/bin/rustc shadows it).
 
 # Set this in every shell that runs cargo oxide build
 export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
@@ -1272,11 +1275,18 @@ which stable rejects — so:
 
 ```sh
 export CUDA_OXIDE_BACKEND=~/Code/github.com/NVLabs/cuda-oxide/cuda-oxide/crates/rustc-codegen-cuda/target/release/librustc_codegen_cuda.so
-export LD_LIBRARY_PATH=~/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/lib:$LD_LIBRARY_PATH
-RUSTC_BOOTSTRAP=1 RUSTUP_TOOLCHAIN=1.99.1 cargo oxide build
+T=~/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu
+export LD_LIBRARY_PATH=$T/lib:$LD_LIBRARY_PATH
+PATH=$T/bin:$PATH RUSTC_BOOTSTRAP=1 RUSTUP_TOOLCHAIN=1.99.1 cargo oxide build
 # If the backend .so is rebuilt from a different toolchain, match
 # LD_LIBRARY_PATH/RUSTUP_TOOLCHAIN to that toolchain (the .so dlopens a
 # versioned librustc_driver-*.so).
+# PATH=$T/bin FIRST is load-bearing: with LD_LIBRARY_PATH set to the
+# toolchain's lib, rustc MUST be that same toolchain's rustc. If /usr/bin/rustc
+# (distro build) shadows it, every rustc_private crate fails E0463 ("can't
+# find crate for rustc_driver") because the distro rustc loads the mismatched
+# librustc_driver .so. Same applies to building the backend itself
+# (2026-11-10, found when rebuilding after the upstream pull).
 ```
 
 Build and benchmark GPU kernels:

@@ -31,7 +31,7 @@ use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, thread, warp};
 use cuda_device::vector::F32x4;
 use cuda_host::cuda_module;
 use cuda_core::{CudaContext, DeviceBuffer};
-use cuda_core::simt::LaunchConfig;
+use cuda_core::LaunchConfig;
 
 const WARPS_PER_BLOCK: u32 = 4;
 const BLOCK_DIM: u32 = WARPS_PER_BLOCK * 32; // 128 threads per block

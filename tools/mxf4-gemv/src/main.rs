@@ -39,7 +39,7 @@
 
 use ctm_rs::mma::{Accumulator16x8, Mxf4A, Mxf4B, ScalePairA, ScalePairB, mma_mxf4};
 use ctm_rs::{cuda_module, float, kernel, thread};
-use cuda_core::simt::LaunchConfig;
+use cuda_core::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
 
 // UE8M0 byte for scale = 1.0: biased exponent 127 = 0x7F.
