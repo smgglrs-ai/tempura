@@ -6,13 +6,20 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: kani-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   KANI_VERSION: "0.67.0"
 
 jobs:
   kani:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The full kernels+engine suite does not fit the default 30-min window:
+    # first-ever-real run (212) was cancelled by the 30-min timeout mid-suite
+    # with every prior step green. Public repo -> unlimited Actions minutes.
+    timeout-minutes: 150
     defaults:
       run:
         working-directory: smgglrs-ai/tempura
