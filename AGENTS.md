@@ -173,14 +173,23 @@ Scale: 174 first-party Rust files, ~142k lines (workspace crates + tools;
 excludes all `target/` dirs with their generated cuda-bindings, and
 `.claude/worktrees/` copies), plus 80 Verus proof modules (~13.6k lines).
 853 commits on main. CI: `kani.yml` (Kani 0.67.0 on
-every PR/push), `pages.yml`. NOTE (2026-11-10): kani.yml had NEVER
-passed before run 212 -- 0/210 green. Root cause: absolute /home/...
-path deps on cuda-oxide made every CI cargo invocation fail in 0s
-(cargo resolves optional path-dep manifests even with features off).
-Fixed with relative sibling paths + a cuda-oxide checkout step in the
-workflow; timeout raised 30 -> 150 min (the suite does not fit 30);
-concurrency cancel added. The 2026-11-05 --ignore-global-asm fix was
-only ever validated locally.
+every PR/push), `pages.yml`. HISTORY (2026-11-10/11): kani.yml had
+NEVER passed before -- 0/210 green. Two root causes, both fixed:
+(1) absolute /home/... path deps on cuda-oxide made every CI cargo
+invocation fail in 0s (cargo resolves optional path-dep manifests
+even with features off) -- fixed with relative sibling paths +
+a cuda-oxide checkout step in the workflow; (2) three engine
+harnesses had symbolic loop bounds (gguf_dequant_q4_0/q8_0_block_size,
+dequant_i8_group_indices_in_bounds -- >116 min EACH locally,
+#[kani::unwind] bounds took them to 2-5 s). First green run: 219
+(2026-11-11), all 25 engine harnesses verified. Workflow shape:
+dorny/paths-filter (docs-only pushes skip everything; kernels changes
+run both kernels+engine; pure engine changes skip kernels), kernels
+as one ~100-min job, engine as singleton-shard matrix jobs enumerated
+from #[kani::proof] greps by a plan job (self-maintaining: new
+harnesses cannot be silently skipped; empty enumeration hard-fails).
+The 2026-11-05 --ignore-global-asm fix was only ever validated
+locally.
 
 ## Key Design Decisions
 
