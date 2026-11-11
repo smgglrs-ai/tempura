@@ -89,9 +89,13 @@ jobs:
           names = sorted(set(names))
           if not names:
               sys.exit("plan-engine: no #[kani::proof] harnesses found in engine/src -- grep is broken, refusing to emit an empty matrix")
-          # 2 harnesses per shard: the suite is >300 min for ~25 harnesses,
-          # so worst-case pairs need generous headroom (240-min job budget).
-          shards = [names[i:i+2] for i in range(0, len(names), 2)]
+          # ONE harness per shard: run 217 showed the gguf/dequant-class
+          # harnesses exceed 2h EACH on a GH runner (three 2-harness shards
+          # hit the 240-min cap; every other shard was green). Pairing can
+          # stack two slow harnesses past any budget. 25 singleton jobs
+          # exceed the 20-concurrent-job free-tier limit, so some queue --
+          # wall time is still bounded by the slowest SINGLE harness.
+          shards = [[n] for n in names]
           matrix = {"shard": [" ".join(s) for s in shards]}
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write(f"matrix={json.dumps(matrix)}\n")
@@ -141,7 +145,10 @@ jobs:
     needs: [changes, plan-engine]
     if: needs.changes.outputs.tempura-engine == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    # Singleton shard: slowest single harness + compile. The gguf/dequant
+    # class ran >2h each on a GH runner (run 217); 300 min gives headroom
+    # without allowing pairing to stack slow harnesses.
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan-engine.outputs.matrix) }}
