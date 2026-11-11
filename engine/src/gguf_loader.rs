@@ -2320,6 +2320,7 @@ mod kani_proofs {
     }
 
     #[kani::proof]
+    #[kani::unwind(9)]
     fn gguf_dequant_q4_0_block_size() {
         let num_elements: usize = kani::any();
         kani::assume(num_elements >= 32 && num_elements <= 256);
@@ -2337,6 +2338,7 @@ mod kani_proofs {
     }
 
     #[kani::proof]
+    #[kani::unwind(9)]
     fn gguf_dequant_q8_0_block_size() {
         let num_elements: usize = kani::any();
         kani::assume(num_elements >= 32 && num_elements <= 256);
