@@ -2145,6 +2145,278 @@ fn main() {
         }
     }
 
+    // ---- 11. paged gather view probe (p20 step 0) ----------------------------
+    // Validates the cutile GatherScatterView primitive a block-table flash
+    // attention KV loop needs: a [BC, D] tile gathered with per-row computed
+    // indices (page resolution via divi/remi + head de-interleave), vs a CPU
+    // reference on RANDOM data with a SHUFFLED page mapping (identity tables
+    // cannot catch index-mapping bugs).  Plus a throughput comparison
+    // against the dense load_pipelined path the gather would replace.
+    {
+        use tempura_kernels::cutile_paged_gather::kernels as pg;
+        let probe_stream = rope.stream().clone();
+
+        // Deterministic Fisher-Yates shuffle for the page mapping.
+        let shuffle = |n: usize, seed: u32| -> Vec<i32> {
+            let mut s = seed.wrapping_mul(2654435761);
+            let mut nxt = || {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                (s >> 8) as usize
+            };
+            let mut v: Vec<i32> = (0..n as i32).collect();
+            for i in (1..n).rev() {
+                let j = nxt() % (i + 1);
+                v.swap(i, j);
+            }
+            v
+        };
+
+        // -- correctness: shuffled pages, ragged tail (kv_len not a multiple
+        //    of BC or block_size) --
+        println!("  -- paged gather correctness (shuffled pages) --");
+        for &(d, nkv, kv_len, bs, bc) in &[
+            (128usize, 8usize, 1000usize, 16usize, 32usize),
+            (128usize, 8usize, 1000usize, 32usize, 32usize),
+            (64usize, 32usize, 512usize, 16usize, 32usize),
+            (128usize, 8usize, 4096usize, 16usize, 64usize),
+        ] {
+            let num_tiles = kv_len.div_ceil(bc);
+            let pad_tokens = num_tiles * bc;
+            let num_pages = pad_tokens / bs; // bc % bs == 0 in every config
+            let pool_rows = pad_tokens * nkv;
+            // Interleaved pool [token, kv_head, D] as rank-2 rows.
+            let pool = prng_data(pool_rows * d, 91);
+            let table = shuffle(num_pages, 92);
+            // CPU reference: same index chain as the kernel.
+            let mut cpu = vec![0.0f32; nkv * num_tiles * bc * d];
+            for kv_h in 0..nkv {
+                for j in 0..num_tiles {
+                    for i in 0..bc {
+                        let tok = j * bc + i;
+                        if tok >= kv_len {
+                            continue;
+                        }
+                        let page = table[tok / bs] as usize;
+                        let row = (page * bs + tok % bs) * nkv + kv_h;
+                        let dst = ((kv_h * num_tiles + j) * bc + i) * d;
+                        cpu[dst..dst + d].copy_from_slice(&pool[row * d..row * d + d]);
+                    }
+                }
+            }
+            let pool_dev: Arc<Tensor<f32>> = api::copy_host_vec_to_device(&Arc::new(pool))
+                .sync_on(&probe_stream)
+                .expect("probe pool upload failed")
+                .reshape(&[pool_rows, d])
+                .expect("probe pool reshape failed")
+                .into();
+            let table_dev: Arc<Tensor<i32>> = api::copy_host_vec_to_device(&Arc::new(table))
+                .sync_on(&probe_stream)
+                .expect("probe table upload failed")
+                .reshape(&[num_pages, 1]) // rank-2: rank-1 gather views fail to JIT
+                .expect("probe table reshape failed")
+                .into();
+            let out_t = api::zeros::<f32>(&[nkv * num_tiles * bc, d])
+                .sync_on(&probe_stream)
+                .expect("probe out alloc failed");
+            let launch = |part: _| -> Result<_, String> {
+                let (p, ..) = unsafe {
+                    pg::paged_gather_tile(
+                        part,
+                        pool_dev.clone(),
+                        table_dev.clone(),
+                        nkv as i32,
+                        num_tiles as i32,
+                        kv_len as i32,
+                        bs as i32,
+                    )
+                    .generics(vec![bc.to_string(), d.to_string()])
+                    .async_on(&probe_stream)
+                    .map_err(|e| e.to_string())?
+                };
+                Ok(p)
+            };
+            let part = match launch(out_t.partition([bc, d])) {
+                Ok(p) => p,
+                Err(e) => {
+                    println!(
+                        "  d={d:<3} nkv={nkv:<2} kv={kv_len:<4} bs={bs:<2} bc={bc:<2} SKIP ({e})"
+                    );
+                    all_ok = false;
+                    continue;
+                }
+            };
+            let gpu = Arc::new(part.unpartition())
+                .to_host_vec()
+                .sync_on(&probe_stream)
+                .expect("probe out download failed");
+            let ok = report(
+                &format!("paged gather d={d:<3} nkv={nkv:<2} bs={bs:<2} bc={bc:<2}"),
+                &gpu,
+                &cpu,
+            );
+            all_ok &= ok;
+        }
+
+        // -- throughput: paged gather vs dense load_pipelined ----------------
+        // Llama-3.1-8B kv heads; kv=4096 (GPU_KV_MAX_SEQ_LEN, 16 MB pool,
+        // partially L2-resident) and kv=16384 (64 MB pool, DRAM-resident).
+        // Grid decomposition matched between the two kernels so ONLY the
+        // load differs.
+        for kv_len in [4096usize, 16384usize] {
+            println!("  -- paged gather throughput (kv={kv_len}) --");
+            {
+            let (d, nkv, bs, bc) = (128usize, 8usize, 16usize, 32usize);
+            let num_tiles = kv_len / bc;
+            let tiles_per_prog = 4usize;
+            let progs_per_head = num_tiles / tiles_per_prog;
+            let grid = nkv * progs_per_head;
+            let pool_rows = kv_len * nkv;
+            let bytes = (pool_rows * d * 4) as f64;
+            let pool = prng_data(pool_rows * d, 93);
+            // Head-major twin of the same data: row kv_h * kv_len + tok.
+            let mut dense = vec![0.0f32; pool_rows * d];
+            for kv_h in 0..nkv {
+                for tok in 0..kv_len {
+                    let src = (tok * nkv + kv_h) * d;
+                    let dst = (kv_h * kv_len + tok) * d;
+                    dense[dst..dst + d].copy_from_slice(&pool[src..src + d]);
+                }
+            }
+            let ident: Vec<i32> = (0..(kv_len / bs) as i32).collect();
+            let shuffled = shuffle(kv_len / bs, 94);
+            let up2d = |data: Vec<f32>| -> Arc<Tensor<f32>> {
+                api::copy_host_vec_to_device(&Arc::new(data))
+                    .sync_on(&probe_stream)
+                    .expect("probe perf upload failed")
+                    .reshape(&[pool_rows, d])
+                    .expect("probe perf reshape failed")
+                    .into()
+            };
+            let pool_dev = up2d(pool);
+            let dense_dev = up2d(dense);
+            let upi32 = |v: Vec<i32>| -> Arc<Tensor<i32>> {
+                api::copy_host_vec_to_device(&Arc::new(v))
+                    .sync_on(&probe_stream)
+                    .expect("probe table upload failed")
+                    .reshape(&[kv_len / bs, 1]) // rank-2: rank-1 gather views fail to JIT
+                    .expect("probe table reshape failed")
+                    .into()
+            };
+            let ident_dev = upi32(ident);
+            let shuf_dev = upi32(shuffled);
+
+            let mut mk_out = || {
+                api::zeros::<f32>(&[grid * d])
+                    .sync_on(&probe_stream)
+                    .expect("probe perf out alloc failed")
+            };
+
+            // (label, table, latency-hinted kernel?) -> run warmup + timed
+            // iters, return (checksum, us/iter).
+            let mut run = |label: &str,
+                           table: &Arc<Tensor<i32>>,
+                           lat4: bool,
+                           dense: bool|
+             -> (Vec<f32>, f64) {
+                let mut part = mk_out().partition([d]);
+                // async_on returns (partition, consumed-args...) -- strip per
+                // branch so all three kernels share one closure type.
+                macro_rules! go {
+                    ($part:expr, $k:expr $(, $arg:expr)* $(,)?) => {{
+                        let (p, ..) = unsafe {
+                            $k($part $(, $arg)*)
+                                .generics(vec![bc.to_string(), d.to_string()])
+                                .async_on(&probe_stream)
+                                .map_err(|e| e.to_string())?
+                        };
+                        Ok(p)
+                    }};
+                }
+                let mut launch = |part: _| -> Result<_, String> {
+                    if dense {
+                        go!(part,
+                            pg::dense_load_bench,
+                            dense_dev.clone(),
+                            num_tiles as i32,
+                            tiles_per_prog as i32)
+                    } else if lat4 {
+                        go!(part,
+                            pg::paged_gather_bench_lat4,
+                            pool_dev.clone(),
+                            table.clone(),
+                            nkv as i32,
+                            num_tiles as i32,
+                            tiles_per_prog as i32,
+                            bs as i32)
+                    } else {
+                        go!(part,
+                            pg::paged_gather_bench,
+                            pool_dev.clone(),
+                            table.clone(),
+                            nkv as i32,
+                            num_tiles as i32,
+                            tiles_per_prog as i32,
+                            bs as i32)
+                    }
+                };
+                for _ in 0..3 {
+                    part = launch(part).unwrap_or_else(|e| panic!("{label} launch: {e}"));
+                }
+                let iters = 50;
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    part = launch(part).unwrap_or_else(|e| panic!("{label} launch: {e}"));
+                }
+                probe_stream.synchronize().expect("probe perf sync failed");
+                let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                let v = Arc::new(part.unpartition())
+                    .to_host_vec()
+                    .sync_on(&probe_stream)
+                    .expect("probe checksum download failed");
+                (v, us)
+            };
+
+            let (dense_sum, dense_us) = run("dense", &ident_dev, false, true);
+            let (gather_sum, gather_us) = run("gather", &ident_dev, false, false);
+            let (lat4_sum, lat4_us) = run("gather+lat4", &ident_dev, true, false);
+            let (_shuf_sum, shuf_us) = run("gather+shuffled", &shuf_dev, false, false);
+
+            // Cross-check the identity-table checksums vs dense.  NOT
+            // bitwise: the gathered and pipelined tiles can carry different
+            // lane layouts, so the reduce_sum tree orders differ -- compare
+            // at the report() tolerance (observed 2026-11-11: bitwise
+            // comparison shows last-ulp rounding diffs on ~80% of
+            // elements, max_abs well under 1e-4).  The shuffled-table run
+            // reads different tokens by design; timing only.
+            for (name, sum) in
+                [("gather vs dense", &gather_sum), ("gather+lat4 vs dense", &lat4_sum)]
+            {
+                all_ok &= report(&format!("checksum {name}"), sum, &dense_sum);
+            }
+            let gbps = |us: f64| bytes / (us * 1e-6) / 1e9;
+            println!(
+                "  dense load_pipelined : {dense_us:8.1} us  {:7.0} GB/s",
+                gbps(dense_us)
+            );
+            println!(
+                "  paged gather         : {gather_us:8.1} us  {:7.0} GB/s  ({:.2}x dense)",
+                gbps(gather_us),
+                dense_us / gather_us
+            );
+            println!(
+                "  paged gather +lat4   : {lat4_us:8.1} us  {:7.0} GB/s  ({:.2}x dense)",
+                gbps(lat4_us),
+                dense_us / lat4_us
+            );
+            println!(
+                "  paged gather +shuf   : {shuf_us:8.1} us  {:7.0} GB/s  ({:.2}x dense)",
+                gbps(shuf_us),
+                dense_us / shuf_us
+            );
+            }
+        }
+    }
+
     println!();
     if all_ok {
         println!("All decode-op mechanisms match CPU math -- the decode");

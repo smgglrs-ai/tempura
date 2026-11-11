@@ -439,13 +439,41 @@ typical-p/repeat/presence/frequency)
       cuda-oxide update to a0a4dc78a absorbed + CI made green): the item is
       now UNBLOCKED -- upstream cute-rs gained SM120a CuTeDSL parity with
       a paged KV scatter reference and TiledCopy/TiledMma primitives
-      (#1686/#1672/#1734 in cuda-oxide; see cute-rs-preview/). Start with
-      the CPU reference (block-table tile loop + ragged last-page masking,
-      kernels/src/attention.rs) as the DualPipeline reference, Kani/Verus
-      on the tile->page->offset arithmetic; then the GPU kernel with the
-      block table + kv_len DEVICE-resident (CUDA-graph capturable, same
-      indirection pattern kv_scatter_write uses); VerifiedEquivalent +
-      registry row; TEMPURA_NO_PAGED_ATTN bisect. Baselines to beat/match:
+      (#1686/#1672/#1734 in cuda-oxide; see cute-rs-preview/).
+      STEP 0 DONE (2026-11-11, bench-decode-ops "paged gather view probe"
+      + bench-probe-gather): the cutile tile-level gather primitive the
+      kernel needs WORKS -- GatherScatterView + load_view_raw gathers a
+      [BC, D] KV tile with fully computed sparse row indices (token ->
+      divi block_idx -> page-id gather -> page*bs+remi offset -> *n_kv_heads
+      +kv_head de-interleave) BIT-EXACT vs a CPU reference on shuffled
+      page mappings with ragged tails (4 shape configs). Throughput in
+      isolation: 0.42-0.48x the dense load_pipelined path (1223 GB/s at
+      kv=4096 / 1499 GB/s = 84% DRAM peak at kv=16384; shuffled pages cost
+      nothing; the Some(4) latency hint is a no-op) -- a net WIN in-pipeline
+      is still expected because the gather deletes the K/V gather/scatter
+      round trips (an extra write+read of all of K/V per layer) and 4 of 5
+      per-layer kernel launches. DSL CONSTRAINT found: RANK-1
+      GatherScatterViews fail to JIT ("Failed to compile type") for both
+      i32 and f32; rank-2 views compile for both -- the block table is
+      passed as rank-2 [-1, 1] (isolated by bench-probe-gather variants
+      A-F, kept as the regression record). Design decisions locked
+      (2026-11-11 design review): build in cutile (not cute-rs -- the
+      paging is expressible with gather views, cute-rs stays an algorithm
+      reference only); block_size=16 stays (pow2 -> shifts, BC=32 spans 2
+      pages, per-column resolution in the sparse index tile); kv_len read
+      from a device scalar (d_kv_len pattern -- upstream cute-rs bakes it
+      as a launch scalar, and the prefill graph's (seq_len, positions) key
+      only pins it under an unenforced invariant); v1 = gather-view K/V
+      with identity table over the existing contiguous pool (isolates
+      kernel work from allocator work), Q gather + out scatter retained;
+      then drop the remaining gathers via scatter views; reverse KV
+      traversal + FIRST/LAST-only masks as a later perf lever. The cute-rs
+      PageRing smem staging is unnecessary for cutile (the loader computes
+      coordinates itself). Remaining sequence: (1) CPU paged reference in
+      kernels/src/attention.rs + Kani/Verus + VerifiedEquivalent registry
+      row (identity table == contiguous attention), (2) GPU kernel v1 +
+      TEMPURA_NO_PAGED_ATTN bisect, graded vs the CPU ref, (3) kill the
+      gathers, (4) real page allocation. Baselines to beat/match:
       prefill 7700 tok/s pp128, decode ITL 4.60 ms, gather/scatter kernels
       gone from nsys. What exists is paged KV STORAGE, not
       paged ATTENTION: the CPU forward path materializes

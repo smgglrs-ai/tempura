@@ -25,6 +25,8 @@ pub mod cutile_matmul;
 #[cfg(feature = "cutile")]
 pub mod cutile_matmul_host;
 #[cfg(feature = "cutile")]
+pub mod cutile_paged_gather;
+#[cfg(feature = "cutile")]
 pub mod cutile_quantized_gemm;
 pub mod gpu_block_layout;
 pub mod gpu_capabilities;
