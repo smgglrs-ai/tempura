@@ -1173,6 +1173,7 @@ impl QuantizedWeights {
 #[cfg(kani)]
 mod kani_proofs {
     #[kani::proof]
+    #[kani::unwind(33)]
     fn dequant_i8_group_indices_in_bounds() {
         let num_elements: usize = kani::any();
         let group_size: usize = kani::any();
