@@ -435,7 +435,19 @@ typical-p/repeat/presence/frequency)
 ## Open work (verified gaps — do not assume these are done)
 
 - [ ] **Native paged attention kernel (planned: .lean/plan.yml
-      p20-paged-attention-kernel).** What exists is paged KV STORAGE, not
+      p20-paged-attention-kernel). NEXT UP (decided 2026-11-11, after the
+      cuda-oxide update to a0a4dc78a absorbed + CI made green): the item is
+      now UNBLOCKED -- upstream cute-rs gained SM120a CuTeDSL parity with
+      a paged KV scatter reference and TiledCopy/TiledMma primitives
+      (#1686/#1672/#1734 in cuda-oxide; see cute-rs-preview/). Start with
+      the CPU reference (block-table tile loop + ragged last-page masking,
+      kernels/src/attention.rs) as the DualPipeline reference, Kani/Verus
+      on the tile->page->offset arithmetic; then the GPU kernel with the
+      block table + kv_len DEVICE-resident (CUDA-graph capturable, same
+      indirection pattern kv_scatter_write uses); VerifiedEquivalent +
+      registry row; TEMPURA_NO_PAGED_ATTN bisect. Baselines to beat/match:
+      prefill 7700 tok/s pp128, decode ITL 4.60 ms, gather/scatter kernels
+      gone from nsys. What exists is paged KV STORAGE, not
       paged ATTENTION: the CPU forward path materializes
       PagedKvCache::k_contiguous()/v_contiguous() before running standard
       contiguous attention (model.rs), and GPU prefill attention runs over
