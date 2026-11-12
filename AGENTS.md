@@ -533,11 +533,35 @@ typical-p/repeat/presence/frequency)
       it; the guard still fails fast on PTX-less hosts). Remaining
       sequence: (3) kill the Q gather + out scatter via scatter views
       (~5.7us/layer more), (4) real page allocation (non-identity
-      tables + page-granular CutileKvCache refactor). Baselines:
+      tables + page-granular CutileKvCache refactor).
+      STEP 3 DONE (2026-11-12): the paged kernel is now FULLY DIRECT --
+      zero gather/scatter kernels, zero head-major scratch.  Q is
+      gathered from the interleaved tensor through a padding::Zero view
+      (pad rows of the last BR tile read as zeros -- the old gather
+      kernel's zero-fill semantics for free); the output is stored
+      DIRECTLY to the interleaved [seq_len, q_dim] buffer through a
+      scatter view whose padding::Zero MASKS out-of-bounds stores (pad
+      rows carry OOB sparse indices that the padding mode drops -- the
+      output tensor stays exactly [seq_len, q_dim], keeping the
+      caller's zero-copy reshape path intact).  Grid is EXPLICIT
+      (.grid(...) -- no mutable output partition to infer it); only
+      out_flat remains pooled.  DSL dead-ends found and recorded:
+      Tensor::as_ptr is HOST-ONLY; i32->i64 scalar casts and
+      PointerTile::reshape do not lower (three masked-pointer-store
+      attempts abandoned -- see the NOTE in the kernel's store block).
+      RESULT: prefill 7797 tok/s pp128 (7525 step-2 -> +3.6%) -- BEATS
+      the gather path (7555 same-binary bisect) by 3.2% and the
+      2026-10-29 7700 baseline; decode 220 unchanged; logits
+      fingerprint IDENTICAL to the gather path; bench-decode-ops 8/8
+      bit-exact + deterministic; bench-quality teacher-forced gate PASS.
+      llama.cpp pp128 reference: 7335 (gap 0.9x in our favor).
+      Remaining: (4) real page allocation (non-identity tables +
+      page-granular CutileKvCache refactor -- the memory-tier wins). Baselines:
       prefill PARITY at pp128 (7525 paged vs 7555 gather, 2026-11-12;
       the 2026-10-29 7700 baseline reads ~7555 on current hw/cuda-oxide
-      state), decode ITL unchanged, gather/scatter kernels: K/V gathers
-      GONE from nsys (Q gather + out scatter remain until step 3). What
+      state), decode ITL unchanged, gather/scatter kernels: ALL GONE
+      from the paged prefill chain (Q gather, K/V gathers, out scatter --
+      one kernel launch per layer). What
       remains un-paged: the CPU forward path still materializes
       PagedKvCache::k_contiguous()/v_contiguous() before running standard
       contiguous attention (model.rs -- the CPU paged reference from step

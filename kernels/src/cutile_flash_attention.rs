@@ -328,51 +328,53 @@ pub mod kernels {
     /// Paged flash attention (multi-head, prefill) -- the p20 paged kernel.
     ///
     /// Identical math to `cutile_flash_attn_heads` (same mma tiling, masks,
-    /// and online-softmax update order), but the K/V tiles are GATHERED
-    /// from the interleaved paged pool through the block table instead of
-    /// loaded from head-major gathered buffers.  REQUIRES block_size == BC
-    /// (one page per tile, asserted by the host): tile j's tokens all live
-    /// in logical block j, so the page id is a single SCALAR table load and
-    /// the pool row is affine:
-    ///   pool_row(i) = (page_j * BC + i) * n_kv_heads + kv_head
-    /// -- no per-column divi/remi and no i32 gather view in the hot loop
-    /// (the general chain, validated by bench-decode-ops' "paged gather
-    /// view probe" and mirrored by the CPU `paged_row_offset`, lives in
-    /// cutile_paged_gather.rs / kernels/src/attention.rs).  The [BC, D]
-    /// tile is gathered with `pool_row` as the sparse row index (D
-    /// contiguous elements per row) -- paging AND de-interleaving in one
-    /// primitive, replacing the 2x cutile_gather_heads + the head-major
-    /// scratch.
+    /// and online-softmax update order), but EVERYTHING is read/written
+    /// in the interleaved layout through indirection -- no gather/scatter
+    /// kernels, no head-major scratch:
+    ///   - Q: gathered from the interleaved [seq_len, n_heads, D] tensor
+    ///     (rows = s*n_heads + head) with padding::Zero -- pad rows of the
+    ///     last BR tile read as zeros, matching the old gather kernel's
+    ///     zero-fill.
+    ///   - K/V: gathered from the paged pool through the block table.
+    ///     REQUIRES block_size == BC (one page per tile, asserted by the
+    ///     host): tile j's tokens all live in logical block j, so the page
+    ///     id is a single SCALAR table load and the pool row is affine:
+    ///     pool_row(i) = (page_j * BC + i) * n_kv_heads + kv_head.
+    ///   - out: written DIRECTLY to the interleaved [seq_len, n_heads, D]
+    ///     tensor via a masked store_ptr_tko (rows = s*n_heads + head;
+    ///     pad rows of the last tile are masked off so the output tensor
+    ///     stays exactly [seq_len, q_dim] -- the caller's zero-copy
+    ///     reshape path requires the exact element count).
     ///
     /// `kv_len` is read from DEVICE memory (`kv_len_dev`, one i32) so a
     /// captured graph replays correctly as the cache grows (the
     /// kv_scatter_write device-offset pattern); `cache_offset` is derived
     /// in-kernel as kv_len - seq_len.  The block table is rank-2 [-1, 1]
     /// because rank-1 gather views do not JIT (bench-probe-gather
-    /// 2026-11-11).  All gather indices stay in bounds by construction:
-    /// the pool covers `max_blocks * block_size` tokens and the table maps
-    /// every block the tile loop can reach; ragged tails are handled by
-    /// the score-side kv_len mask (loads read in-bounds padding).
+    /// 2026-11-11).  All gather/store indices stay in bounds by
+    /// construction (Q pad rows resolve through view padding; K/V pool
+    /// covers max_blocks * block_size tokens; out rows are masked).
+    ///
+    /// Grid: EXPLICIT (q_tiles_per_head * n_heads, 1, 1) -- there is no
+    /// mutable output partition to infer it from.
     ///
     /// BC=16 (== block_size) is the measured optimum for the GATHER path
     /// (bench-real-model A/B 2026-11-12: 7468 vs 7265 at BC=32, 7256 at
     /// BC=8 -- smaller tiles give the manual K-prefetch more overlap
     /// granularity; the DENSE path preferred BC=32, gathers have
     /// different economics).
-    ///
-    /// Grid: (n_heads * seq_pad / BR, 1, 1) -- same as
-    /// `cutile_flash_attn_heads`; `out` partitions [BR, D].
     #[cutile::entry()]
     pub unsafe fn cutile_flash_attn_heads_paged<const BR: i32, const BC: i32, const D: i32>(
-        out: &mut Tensor<f32, { [BR, D] }>,
         q: &Tensor<f32, { [-1, D] }>,
         k_pool: &Tensor<f32, { [-1, D] }>,
         v_pool: &Tensor<f32, { [-1, D] }>,
+        out: &Tensor<f32, { [-1, D] }>,
         block_table: &Tensor<i32, { [-1, 1] }>,
         kv_len_dev: &Tensor<i32, { [-1] }>,
         scale: f32,
         seq_len: i32,
         q_tiles_per_head: i32,
+        n_heads: i32,
         n_kv_heads: i32,
         heads_per_group: i32,
         softcap: f32,
@@ -387,8 +389,24 @@ pub mod kernels {
         let q_tile_idx = q_tile_global % q_tiles_per_head;
         let kv_head = head / heads_per_group;
 
-        let part_q = q.partition(shape![BR, D]);
-        let tq: Tile<f32, { [BR, D] }> = part_q.load([q_tile_global, 0i32]);
+        // Q tile: gathered from the interleaved tensor; pad rows read zero.
+        let q_view: GatherScatterView<f32, { [BR, D] }, 0> =
+            make_gather_scatter_view(q, shape![BR, D], padding::Zero);
+        let q_rows: Tile<i32, { [BR] }> = (iota(shape![BR])
+            + broadcast_scalar(q_tile_idx * BR, shape![BR]))
+            * broadcast_scalar(n_heads, shape![BR])
+            + broadcast_scalar(head, shape![BR]);
+        let (tq, _): (Tile<f32, { [BR, D] }>, Token) = load_view_raw(
+            &q_view,
+            (q_rows, 0i32),
+            None,
+            ordering::Weak,
+            scope::Device,
+            tma::Disabled,
+            None,
+            [false, false],
+            shape![BR, D],
+        );
 
         // exp2 trick: use scale / log2 so exp2(qk * scale/log2) = exp(qk * scale).
         let two: Tile<f32, { [] }> = constant(2.0f32, shape![]);
@@ -568,8 +586,33 @@ pub mod kernels {
             v_cur = v_next;
         }
 
-        // Normalize: divide each row by its softmax denominator.
-        out.store(true_div(acc, l_i.broadcast(shape![BR, D])));
+        // Normalize, then store DIRECTLY to the interleaved output (rows =
+        // s*n_heads + head) through a scatter view with padding::Zero:
+        // pad rows of the last BR tile (s >= seq_len) carry out-of-bounds
+        // sparse indices that the view's padding mode masks off, so the
+        // output tensor stays exactly [seq_len * n_heads, D] (the caller's
+        // zero-copy reshape path requires the exact element count).
+        // NOTE: pointer-tile stores were tried and abandoned --
+        // Tensor::as_ptr is host-only, i32->i64 scalar casts and
+        // PointerTile::reshape do not lower in the DSL (2026-11-12).
+        let norm: Tile<f32, { [BR, D] }> = true_div(acc, l_i.broadcast(shape![BR, D]));
+        let out_rows: Tile<i32, { [BR] }> =
+            iota(shape![BR]) + broadcast_scalar(q_tile_idx * BR, shape![BR]);
+        let elem_rows: Tile<i32, { [BR] }> = out_rows * broadcast_scalar(n_heads, shape![BR])
+            + broadcast_scalar(head, shape![BR]);
+        let out_view: GatherScatterView<f32, { [BR, D] }, 0> =
+            make_gather_scatter_view(out, shape![BR, D], padding::Zero);
+        let _stored: Token = store_view_raw(
+            &out_view,
+            norm,
+            (elem_rows, 0i32),
+            None,
+            ordering::Weak,
+            scope::Device,
+            tma::Disabled,
+            None,
+            [false, false],
+        );
     }
 
     /// De-interleave head rows for one tensor: [len, heads, D] -> [heads, rows_per_head, D].
@@ -1611,22 +1654,26 @@ impl CutileFlashAttention {
         Ok(result)
     }
 
-    /// Paged prefill attention -- K/V gathered from the interleaved pool
-    /// through the block table (p20), replacing the 2x
-    /// `cutile_gather_heads` + head-major scratch of
-    /// [`Self::prefill_attention_device`].  The Q gather and the output
-    /// scatter are unchanged (dropping them via scatter views is a later
-    /// step).
+    /// Paged prefill attention -- the FULLY direct path (p20): Q gathered
+    /// from the interleaved tensor with view padding, K/V gathered from
+    /// the paged pool through the block table, output stored directly to
+    /// the interleaved buffer via a masked pointer store.  NO
+    /// gather/scatter kernels, NO head-major scratch (q_gathered /
+    /// out_gathered are unused here -- only out_flat is pooled).
     ///
     /// `k_pool`/`v_pool` are rank-2 `[-1, head_dim]` views of the flat
     /// interleaved caches (rows = token * n_kv_heads + kv_head; the
     /// zero-copy `Reshape` view of `CutileKvCache`'s rank-1 tensors).
-    /// `block_table` is rank-2 `[max_blocks, 1]` (rank-1 gather views do
-    /// not JIT) and must cover `ceil(kv_len / PAGED_BLOCK_SIZE)` blocks.
-    /// `kv_len_dev` is a one-element i32 device scalar holding `kv_len`;
-    /// the kernel reads it at execution time (CUDA-graph safe) -- the
-    /// host-side `kv_len` argument is used only for validation and
-    /// scratch sizing.
+    /// `q_dev` is the interleaved Q (any rank; viewed as
+    /// `[seq_len * n_heads, head_dim]`).  `block_table` is rank-2
+    /// `[max_blocks, 1]` (rank-1 gather views do not JIT) and must cover
+    /// `ceil(kv_len / PAGED_BLOCK_SIZE)` blocks.  `kv_len_dev` is a
+    /// one-element i32 device scalar holding `kv_len`; the kernel reads
+    /// it at execution time (CUDA-graph safe) -- the host-side `kv_len`
+    /// argument is used only for validation.
+    ///
+    /// Returns the interleaved `[seq_len, n_heads * head_dim]` output
+    /// (the pooled out_flat tensor).
     ///
     /// # Safety
     ///
@@ -1649,6 +1696,8 @@ impl CutileFlashAttention {
         stream: &Arc<Stream>,
         scratch: &mut PrefillAttnScratch,
     ) -> Result<Arc<Tensor<f32>>> {
+        use cutile::tensor::Reshape;
+
         if seq_len == 0 || kv_len == 0 {
             return Err(KernelError::InvalidConfig(format!(
                 "prefill_attention_device_paged: empty seq_len/kv_len ({seq_len}/{kv_len})"
@@ -1676,7 +1725,6 @@ impl CutileFlashAttention {
         }
 
         let seq_pad = seq_len.div_ceil(BR) * BR;
-        let q_rows = n_heads * seq_pad;
         let q_dim = n_heads * head_dim;
         let heads_per_group = n_heads / n_kv_heads;
         // KV tile width for the paged kernel: MUST equal the block size
@@ -1688,71 +1736,48 @@ impl CutileFlashAttention {
         // preferred BC=32, gathers have different economics).
         let bc: usize = PAGED_BLOCK_SIZE;
 
-        // Q gather only (K/V go straight from the pool through the table).
-        let q_g = take_or_alloc(&mut scratch.q_gathered, &[q_rows, head_dim], stream)?;
-        let out_g = take_or_alloc(&mut scratch.out_gathered, &[q_rows, head_dim], stream)?;
-        let out_flat = take_or_alloc(&mut scratch.out_flat, &[seq_len, q_dim], stream)?;
-
-        let gather = |out_t: Tensor<f32>,
-                      src: &Arc<Tensor<f32>>,
-                      src_len: usize,
-                      src_heads: usize,
-                      rows_per_head: usize|
-         -> Result<Arc<Tensor<f32>>> {
-            let (part, ..) = unsafe {
-                kernels::cutile_gather_heads(
-                    out_t.partition([1, head_dim]),
-                    src.clone(),
-                    src_len as i32,
-                    src_heads as i32,
-                    rows_per_head as i32,
-                )
-                .generics(vec![head_dim.to_string()])
-                .async_on(stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-            };
-            Ok(Arc::new(part.unpartition()))
-        };
-        let q_g = gather(q_g, q_dev, seq_len, n_heads, seq_pad)?;
-        scratch.q_gathered = Some(q_g.clone());
+        // Interleaved views (zero-copy): Q [seq_len * n_heads, D] and the
+        // pooled output [seq_len, q_dim] -> [seq_len * n_heads, D].
+        let q_rows_view = q_dev
+            .reshape(&[seq_len * n_heads, head_dim])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let out_flat = Arc::new(take_or_alloc(
+            &mut scratch.out_flat,
+            &[seq_len, q_dim],
+            stream,
+        )?);
+        let out_rows_view = out_flat
+            .reshape(&[seq_len * n_heads, head_dim])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
         // -- paged flash attention: one launch, kv_len read on device -----
-        let (out_part, ..) = unsafe {
+        // Grid is explicit (no mutable output partition to infer it).
+        let _ = unsafe {
             kernels::cutile_flash_attn_heads_paged(
-                out_g.partition([BR, head_dim]),
-                q_g.clone(),
+                q_rows_view.clone(),
                 k_pool.clone(),
                 v_pool.clone(),
+                out_rows_view.clone(),
                 block_table.clone(),
                 kv_len_dev.clone(),
                 scale,
                 seq_len as i32,
                 (seq_pad / BR) as i32,
+                n_heads as i32,
                 n_kv_heads as i32,
                 heads_per_group as i32,
                 self.softcap,
             )
             .generics(vec![BR.to_string(), bc.to_string(), head_dim.to_string()])
+            .grid((((seq_pad / BR) * n_heads) as u32, 1, 1))
             .async_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
         };
-        let out_g = Arc::new(out_part.unpartition());
-        scratch.out_gathered = Some(out_g.clone());
-
-        // -- scatter: head-major -> interleaved [seq_len, q_dim] -----------
-        let (out_part, ..) = unsafe {
-            kernels::cutile_scatter_heads(
-                out_flat.partition([1, head_dim]),
-                out_g.clone(),
-                seq_pad as i32,
-            )
-            .generics(vec![head_dim.to_string()])
-            .async_on(stream)
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-        };
-        let result = Arc::new(out_part.unpartition());
-        scratch.out_flat = Some(result.clone());
-        Ok(result)
+        // Re-pool a clone; the caller's copy must be dropped before the
+        // next call for the take_or_alloc Arc::try_unwrap to hit (same
+        // contract as the gather path).
+        scratch.out_flat = Some(out_flat.clone());
+        Ok(out_flat)
     }
 }
 
