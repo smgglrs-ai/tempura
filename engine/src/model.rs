@@ -980,41 +980,27 @@ where
                 if let Some(ref mut paged) = session.paged_cache {
                     paged.append_kv(cl, &k, &v, seq_len);
                     let kv_len = paged.seq_len + seq_len;
-                    let k_cont = paged.k_contiguous(cl, kv_len);
-                    let v_cont = paged.v_contiguous(cl, kv_len);
-                    if let Some(cap) = cfg.attn_logit_softcapping {
-                        tempura_kernels::attention::CpuAttentionSoftcap::new(cap)
-                            .forward(
-                                &q,
-                                &k_cont,
-                                &v_cont,
-                                &mut attn_out,
-                                1,
-                                seq_len,
-                                kv_len,
-                                n_heads,
-                                n_kv_heads,
-                                head_dim,
-                                attn_scale,
-                            )
-                            .unwrap();
-                    } else {
-                        self.pipeline
-                            .attention(
-                                &q,
-                                &k_cont,
-                                &v_cont,
-                                &mut attn_out,
-                                1,
-                                seq_len,
-                                kv_len,
-                                n_heads,
-                                n_kv_heads,
-                                head_dim,
-                                attn_scale,
-                            )
-                            .unwrap();
-                    }
+                    // Paged attention (p20): read the pool through the
+                    // block table directly -- no k_contiguous/v_contiguous
+                    // materialization (two full gathers per layer removed).
+                    // Flash-order online softmax + Gemma-2 softcapping.
+                    tempura_kernels::attention::CpuPagedAttention
+                        .forward_paged(
+                            &q,
+                            paged.k_pages(cl),
+                            paged.v_pages(cl),
+                            paged.block_table(cl).as_slice(),
+                            paged.block_size(),
+                            &mut attn_out,
+                            seq_len,
+                            kv_len,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            attn_scale,
+                            cfg.attn_logit_softcapping.unwrap_or(0.0),
+                        )
+                        .unwrap();
                 } else {
                     session.cache.append_kv(cl, &k, &v, seq_len);
                     let kv_len = session.cache.seq_len + seq_len;
@@ -11678,6 +11664,7 @@ mod tests {
             parallel_attn_ffn: false,
             rmsnorm_offset: false,
             attn_logit_softcapping: None,
+            final_logit_softcapping: None,
             embedding_scale: false,
             rope_scaling: None,
         };
@@ -11827,6 +11814,7 @@ mod tests {
             parallel_attn_ffn: false,
             rmsnorm_offset: false,
             attn_logit_softcapping: None,
+            final_logit_softcapping: None,
             embedding_scale: false,
             rope_scaling: None,
         };

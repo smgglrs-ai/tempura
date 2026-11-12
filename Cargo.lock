@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "cuda-artifact-finalizer"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libnvvm-sys",
  "nvjitlink-sys",
@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "cuda-device"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytemuck",
  "cuda-macros",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "cuda-host"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cuda-artifact-finalizer",
  "cuda-core",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "cuda-macros"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "oxide-tile-export",
  "proc-macro2",
@@ -789,11 +789,15 @@ version = "0.5.0"
 
 [[package]]
 name = "cuda-target-spec"
-version = "0.3.0"
+version = "0.4.0"
+
+[[package]]
+name = "cuda-toolkit-discovery"
+version = "0.1.0"
 
 [[package]]
 name = "cutile"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "cuda-async",
@@ -815,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "cutile-compiler"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "cuda-async",
@@ -835,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "cutile-ir"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "half",
  "indexmap 2.14.2",
@@ -845,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "cutile-macro"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "convert_case 0.8.0",
  "cutile-compiler",
@@ -1916,9 +1920,10 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libnvvm-sys"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cuda-target-spec",
+ "cuda-toolkit-discovery",
  "libloading",
  "thiserror 2.0.20",
 ]
@@ -2268,8 +2273,9 @@ checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
 name = "nvjitlink-sys"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "cuda-toolkit-discovery",
  "libloading",
  "thiserror 2.0.20",
 ]
@@ -2455,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-tile-export"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2632,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "ptx-parse"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "pulp"
@@ -2937,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "reserved-oxide-symbols"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "ring"

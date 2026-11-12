@@ -618,7 +618,7 @@ fn main() {
                     cpu_paged
                         .forward_paged(
                             &q, &k_pool, &v_pool, &table_u32, BS, &mut cpu, seq_len, kv_len,
-                            N_HEADS, N_KV_HEADS, HEAD_DIM, scale,
+                            N_HEADS, N_KV_HEADS, HEAD_DIM, scale, 0.0,
                         )
                         .expect("CPU paged reference failed");
 

@@ -504,6 +504,7 @@ fn paged_flash_attention(
     num_kv_heads: usize,
     head_dim: usize,
     scale: f32,
+    softcap: f32,
     dot_fn: fn(&[f32], &[f32]) -> f32,
 ) -> Result<()> {
     if block_size == 0 || num_kv_heads == 0 || head_dim == 0 {
@@ -559,6 +560,12 @@ fn paged_flash_attention(
                     let k_offset = paged_row_offset(block_table, block_size, stride, kv_s, kv_h, head_dim);
                     let k_vec = &k_pages[k_offset..k_offset + head_dim];
                     tile_scores[i] = dot_fn(q_vec, k_vec) * scale;
+                    // Gemma-2 logit softcapping: tanh(score/cap)*cap on the
+                    // SCALED scores, before the softmax (same site as
+                    // naive_attention_ggml_softcap / the GPU kernel).
+                    if softcap > 0.0 {
+                        tile_scores[i] = softcap * (tile_scores[i] / softcap).tanh();
+                    }
                     if tile_scores[i] > tile_max {
                         tile_max = tile_scores[i];
                     }
@@ -617,13 +624,16 @@ fn paged_flash_attention(
 }
 
 /// CPU paged attention: the DualPipeline reference for the GPU paged
-/// attention kernel (plan p20).  Not an `Attention` impl -- the paged pool
-/// and block table are extra inputs the trait does not carry.
+/// attention kernel (plan p20), and the ENGINE's CPU paged path -- reads
+/// the paged pool through the block table directly (no k_contiguous/
+/// v_contiguous materialization).  Not an `Attention` impl -- the paged
+/// pool and block table are extra inputs the trait does not carry.
 #[cfg(feature = "cpu")]
 pub struct CpuPagedAttention;
 
 #[cfg(feature = "cpu")]
 impl CpuPagedAttention {
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_paged(
         &self,
         q: &[f32],
@@ -638,6 +648,7 @@ impl CpuPagedAttention {
         num_kv_heads: usize,
         head_dim: usize,
         scale: f32,
+        softcap: f32,
     ) -> Result<()> {
         paged_flash_attention(
             q,
@@ -652,6 +663,7 @@ impl CpuPagedAttention {
             num_kv_heads,
             head_dim,
             scale,
+            softcap,
             dot_f32,
         )
     }
@@ -2553,7 +2565,7 @@ mod tests {
             CpuPagedAttention
                 .forward_paged(
                     &q, &scatter(&k, &ident), &scatter(&v, &ident), &ident, block_size,
-                    &mut out, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale,
+                    &mut out, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale, 0.0,
                 )
                 .unwrap();
             for (i, (a, b)) in out.iter().zip(&flash).enumerate() {
@@ -2568,7 +2580,7 @@ mod tests {
             CpuPagedAttention
                 .forward_paged(
                     &q, &scatter(&k, &shuf), &scatter(&v, &shuf), &shuf, block_size,
-                    &mut out, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale,
+                    &mut out, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale, 0.0,
                 )
                 .unwrap();
             for (i, (a, b)) in out.iter().zip(&flash).enumerate() {
@@ -2579,10 +2591,82 @@ mod tests {
     }
 
     #[test]
+    fn test_paged_attention_softcap_matches_softcap_reference() {
+        // The paged path's softcap branch must agree with the contiguous
+        // CpuAttentionSoftcap reference on the same values.
+        let (num_heads, num_kv_heads, head_dim) = (2usize, 1usize, 8usize);
+        let seq_len = 5usize;
+        let kv_len = 37usize;
+        let block_size = 4usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let cap = 5.0f32;
+
+        let mut s = 0x5EED_u32;
+        let mut nxt = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((s >> 8) & 0xFFFF) as f32 / 65535.0 - 0.5
+        };
+        let q: Vec<f32> = (0..seq_len * num_heads * head_dim).map(|_| nxt()).collect();
+        let k: Vec<f32> = (0..kv_len * num_kv_heads * head_dim).map(|_| nxt()).collect();
+        let v: Vec<f32> = (0..kv_len * num_kv_heads * head_dim).map(|_| nxt()).collect();
+
+        // Contiguous reference with softcapping.
+        let mut ref_out = vec![0.0f32; seq_len * num_heads * head_dim];
+        CpuAttentionSoftcap::new(cap)
+            .forward(
+                &q, &k, &v, &mut ref_out, 1, seq_len, kv_len, num_heads, num_kv_heads,
+                head_dim, scale,
+            )
+            .unwrap();
+
+        // Paged: identity table over the same values (in-order pool, padded).
+        let stride = num_kv_heads * head_dim;
+        let num_blocks = kv_len.div_ceil(block_size);
+        let mut pool = vec![0.0f32; num_blocks * block_size * stride];
+        pool[..kv_len * stride].copy_from_slice(&k);
+        let mut vpool = vec![0.0f32; num_blocks * block_size * stride];
+        vpool[..kv_len * stride].copy_from_slice(&v);
+        let ident: Vec<u32> = (0..num_blocks as u32).collect();
+
+        let mut out = vec![0.0f32; seq_len * num_heads * head_dim];
+        CpuPagedAttention
+            .forward_paged(
+                &q, &pool, &vpool, &ident, block_size, &mut out, seq_len, kv_len,
+                num_heads, num_kv_heads, head_dim, scale, cap,
+            )
+            .unwrap();
+
+        let mut max_abs = 0.0f32;
+        for (i, (a, b)) in out.iter().zip(&ref_out).enumerate() {
+            let d = (a - b).abs();
+            assert!(d < 1e-5, "softcap paged elem {i}: {a} vs {b} (d={d})");
+            max_abs = max_abs.max(d);
+        }
+        // Sanity: the cap must actually be active -- the no-cap paged output
+        // differs from the softcapped reference more than the capped one.
+        let mut nocap = vec![0.0f32; seq_len * num_heads * head_dim];
+        CpuPagedAttention
+            .forward_paged(
+                &q, &pool, &vpool, &ident, block_size, &mut nocap, seq_len, kv_len,
+                num_heads, num_kv_heads, head_dim, scale, 0.0,
+            )
+            .unwrap();
+        let nocap_diff = nocap
+            .iter()
+            .zip(&ref_out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            nocap_diff > max_abs,
+            "softcap inactive: nocap_diff={nocap_diff} capped_diff={max_abs}"
+        );
+    }
+
+    #[test]
     fn test_paged_attention_rejects_short_block_table() {
         let r = CpuPagedAttention.forward_paged(
             &[0.0; 8], &[0.0; 64], &[0.0; 64], &[0, 1], 16, &mut [0.0; 8],
-            1, 33, 1, 1, 8, 1.0, // kv_len 33 needs 3 blocks at bs=16
+            1, 33, 1, 1, 8, 1.0, 0.0, // kv_len 33 needs 3 blocks at bs=16
         );
         assert!(r.is_err());
     }
