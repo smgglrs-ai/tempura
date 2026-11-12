@@ -607,6 +607,10 @@ typical-p/repeat/presence/frequency)
       now part of the weight struct.  (The streamk PTX load failure
       observed in the same logs was a SEPARATE tempura bug, also fixed
       2026-11-12 -- see the sm_120a PTX note under GPU inference.)
+      cuda-oxide e1f6df0ad (2026-11-12 pull) VALIDATED on fishtank:
+      bench-decode-ops 82/82, real-model 7720 pp128 / 217 decode,
+      det=OK, identical logits fingerprint; batch-with-streamk
+      M=16 809 -- all within noise of the a0a4dc78a numbers.
 - [x] q6k_gemv_sm120_kpar8 (single-seq Q6K GEMV, renamed from
       ..._mbar_kpar8): FIXED and DEFAULT ON since 2026-10-29
       (register-exchange rewrite; TEMPURA_NO_SM120_Q6K=1 opts out).
