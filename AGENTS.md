@@ -469,9 +469,27 @@ typical-p/repeat/presence/frequency)
       then drop the remaining gathers via scatter views; reverse KV
       traversal + FIRST/LAST-only masks as a later perf lever. The cute-rs
       PageRing smem staging is unnecessary for cutile (the loader computes
-      coordinates itself). Remaining sequence: (1) CPU paged reference in
-      kernels/src/attention.rs + Kani/Verus + VerifiedEquivalent registry
-      row (identity table == contiguous attention), (2) GPU kernel v1 +
+      coordinates itself).
+      STEP 1 DONE (2026-11-12): CPU paged reference in
+      kernels/src/attention.rs -- paged_flash_attention (same tile loop,
+      causal mask, and online-softmax order as flash_attention; the inner
+      K/V loads resolve through paged_row_offset: block_table[token/bs] ->
+      (page*bs + token%bs)*stride + kv_h*head_dim) + CpuPagedAttention
+      (forward_paged; not an Attention impl -- the pool/table are extra
+      inputs). BITWISE-identical to flash_attention batch=1 with identity
+      AND shuffled page tables (test_paged_attention_identity_and_shuffled_
+      match_flash; ragged kv_len vs FLASH_BC and block_size -- uniform/
+      identity data cannot catch index bugs). Kani:
+      paged_row_offset_in_bounds + paged_row_offset_identity_table (both
+      verified; the CI plan job greps #[kani::proof] so they are
+      self-enrolling). Verus: verus-verified/src/paged_attention.rs, 13
+      proofs (offset in bounds for ALL inputs, identity-table collapse to
+      the contiguous offset, distinct-tokens-distinct-rows within a page
+      -- the write-safety side). VerifiedEquivalent<CpuAttention> row in
+      the kernel-verify registry (error bound 0.0 -- bitwise; cites the
+      Verus lemma). The CPU reference's paged_row_offset mirrors the
+      step-0 GPU gather's index chain exactly. Remaining sequence:
+      (2) GPU kernel v1 +
       TEMPURA_NO_PAGED_ATTN bisect, graded vs the CPU ref, (3) kill the
       gathers, (4) real page allocation. Baselines to beat/match:
       prefill 7700 tok/s pp128, decode ITL 4.60 ms, gather/scatter kernels
