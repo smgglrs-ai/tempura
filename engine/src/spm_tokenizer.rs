@@ -441,8 +441,12 @@ mod tests {
     #[test]
     fn special_tokens_partition() {
         let m = model();
-        // "the " -> [▁the, ▁]; " quick" -> [▁, ▁quick]
-        assert_eq!(m.tokenize_text("the [INST] quick"), vec![4, 19, 2, 19, 5]);
+        // "the " -> [▁the, ▁]; " quick" escapes to "▁quick" -- ONE piece
+        // (the space is consumed by the piece's own ▁ prefix, no separate
+        // dummy marker; the pre-Gemma expectation [4,19,2,19,5] double-
+        // escaped the post-special-token space -- b0166a7's raw-piece
+        // matching, validated against llama.cpp in the 5-family matrix).
+        assert_eq!(m.tokenize_text("the [INST] quick"), vec![4, 19, 2, 5]);
     }
 
     #[test]

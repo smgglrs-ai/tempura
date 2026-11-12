@@ -565,7 +565,29 @@ typical-p/repeat/presence/frequency)
       bit-exact + deterministic; bench-quality teacher-forced gate PASS.
       llama.cpp pp128 reference: 7335 (gap 0.9x in our favor).
       Remaining: (4) real page allocation (non-identity tables +
-      page-granular CutileKvCache refactor -- the memory-tier wins). Baselines:
+      page-granular CutileKvCache refactor -- the memory-tier wins).
+      STEP 4a DONE (2026-11-12): the CPU paged hot path no longer
+      materializes -- model.rs calls CpuPagedAttention::forward_paged
+      directly on the PagedKvCache pools + block tables (the two
+      k_contiguous/v_contiguous gathers PER LAYER are gone; softcap
+      models included via a softcap param on paged_flash_attention,
+      same tanh site as naive_attention_ggml_softcap and the GPU
+      kernel).  Gates: test_paged_forward_matches_contiguous (1e-5)
+      and test_paged_generate_matches_contiguous (identical tokens)
+      both PASS with the flash-order paged attention (vs naive
+      CpuAttention on the contiguous side); new
+      test_paged_attention_softcap_matches_softcap_reference.  Also
+      fixed two more pre-existing cfg(test) breaks invisible to kani
+      CI: model.rs test configs missing final_logit_softcapping
+      (Gemma b0166a7), and a stale spm_tokenizer expectation
+      ([4,19,2,19,5] -> [4,19,2,5]: the post-special-token space is
+      consumed by the piece's own ▁ prefix -- b0166a7's raw-piece
+      matching, validated in the 5-family matrix).  STILL OPEN under
+      step 4: the GPU side (page-granular CutileKvCache allocator,
+      non-identity tables on the GPU pool -- the oxide decode
+      attention PTX reads the pool contiguously, so per-sequence
+      base-page offsets or table-aware PTX kernels are the design
+      decision; prefix sharing/eviction on top). Baselines:
       prefill PARITY at pp128 (7525 paged vs 7555 gather, 2026-11-12;
       the 2026-10-29 7700 baseline reads ~7555 on current hw/cuda-oxide
       state), decode ITL unchanged, gather/scatter kernels: ALL GONE
