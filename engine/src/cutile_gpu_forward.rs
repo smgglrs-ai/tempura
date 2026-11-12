@@ -192,12 +192,21 @@ struct DeviceWeightQ6K {
 /// Dequant in kernel: w[j*64+l] = d*sc[2*j]*lo_nibble - dmin*m[2*j]
 ///                    w[j*64+l+32] = d*sc[2*j+1]*hi_nibble - dmin*m[2*j+1]
 struct DeviceWeightQ4K {
-    /// Packed u32 tensor on GPU, flat shape [n x k_blocks x Q4K_PACKED_U32S].
+    /// Packed u32 tensor on GPU, flat shape [n x k_blocks x (42 or 36)].
     tensor: Arc<Tensor<u32>>,
     /// Number of output neurons.
     n: usize,
     /// Number of Q4_K blocks per row (= k / Q4K_BLOCK_SIZE).
     k_blocks: usize,
+    /// True when `tensor` holds the RAW GGUF 36-u32 block format (chosen
+    /// when the oxide kernel's `uses_raw_gguf` is set).  The cuTile
+    /// `cutile_q4k_gemv` fallback kernel consumes ONLY the repacked
+    /// 42-u32 format -- feeding it raw-format weights reads out of
+    /// bounds (found by compute-sanitizer 2026-11-12: every program with
+    /// pid_n >= 6*n/7 indexes past the tensor; cuda-oxide a0a4dc78a
+    /// traps on partition OOB where older versions silently read
+    /// garbage).
+    uses_raw_gguf: bool,
 }
 
 /// MXFP4-quantized projection weight in E2M1 packed nibble + UE8M0 block-scale format.
@@ -1180,6 +1189,7 @@ impl CutileGpuModel {
                 tensor,
                 n,
                 k_blocks,
+                uses_raw_gguf: false,
             },
         );
         Ok(true)
@@ -1248,6 +1258,7 @@ impl CutileGpuModel {
                 tensor,
                 n,
                 k_blocks,
+                uses_raw_gguf: true,
             },
         );
         Ok(true)
@@ -1779,31 +1790,25 @@ impl CutileGpuModel {
                 )
             };
             let mut warmed: std::collections::HashSet<usize> = Default::default();
-            // PTX presence is decided BEFORE the loop: a cuTile fallback
-            // crash (DriverError 719, cuda-oxide a0a4dc78a -- pre-existing
-            // on main 2026-11-12) poisons the CUDA context, so nothing
-            // (including try_load) succeeds after it.
-            let oxide_q4k_available = tempura_kernels::oxide_q4k_gemv_host::OxideQ4kGemv::try_load(
-                self.matmul.stream().clone(),
-            )
-            .is_some();
             for w in self.device_weights_q4k.values() {
                 if warmed.insert(w.k_blocks) {
-                    // Skip the cuTile fallback warmup when the oxide PTX is
-                    // present: dispatch always prefers oxide (gemm_q4k_d2d),
-                    // and the fallback kernel crashes under cuda-oxide
-                    // a0a4dc78a (DriverError 719, pre-existing on main,
-                    // 2026-11-12) -- a crash that poisons the context for
-                    // everything after it.  On PTX-less hosts the warmup
-                    // still runs and still fails fast (the guard's intent).
-                    if !oxide_q4k_available {
-                        let x = mk_x(w.k_blocks * Q4K_BLOCK_SIZE);
-                        if let Err(e) = self.q4k_gemv.forward_d2d(&x, &w.tensor, w.n, w.k_blocks)
-                        {
-                            panic!("warmup: cuTile Q4K GEMV (k_blocks={}) failed: {e} -- this \
-                                    fallback path is broken for this model and would fail at \
-                                    first dispatch on hosts without the oxide PTX", w.k_blocks);
-                        }
+                    // The cuTile fallback kernel consumes ONLY the repacked
+                    // 42-u32 format.  Raw-GGUF 36-u32 weights (chosen when
+                    // the oxide kernel's uses_raw_gguf is set) make it index
+                    // past the tensor (compute-sanitizer 2026-11-12; the
+                    // crash surfaced as DriverError 719 when cuda-oxide
+                    // a0a4dc78a began trapping partition OOB) -- and the
+                    // dispatch path never uses the fallback for those
+                    // weights anyway (gemm_q4k_d2d prefers oxide).  Warm
+                    // only the format the kernel can actually consume.
+                    if w.uses_raw_gguf {
+                        continue;
+                    }
+                    let x = mk_x(w.k_blocks * Q4K_BLOCK_SIZE);
+                    if let Err(e) = self.q4k_gemv.forward_d2d(&x, &w.tensor, w.n, w.k_blocks) {
+                        panic!("warmup: cuTile Q4K GEMV (k_blocks={}) failed: {e} -- this \
+                                fallback path is broken for this model and would fail at \
+                                first dispatch on hosts without the oxide PTX", w.k_blocks);
                     }
                 }
             }
@@ -4279,6 +4284,15 @@ impl CutileGpuModel {
                 .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
                 .expect("OxideQ4kGemv::forward_d2d failed");
         }
+        // The cuTile fallback consumes ONLY the repacked 42-u32 format;
+        // raw-GGUF weights only exist when the oxide kernel is loaded
+        // (same flag decided the upload format), so this path cannot see
+        // them today -- the debug_assert keeps it that way (feeding raw
+        // weights here reads OOB; see DeviceWeightQ4K::uses_raw_gguf).
+        debug_assert!(
+            !dw.uses_raw_gguf,
+            "cuTile Q4K fallback cannot consume raw-GGUF weights"
+        );
         self.q4k_gemv
             .forward_d2d(&a_flat, &dw.tensor, dw.n, dw.k_blocks)
             .expect("CutileGpuModel::gemm_q4k_d2d failed")
