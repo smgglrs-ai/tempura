@@ -554,9 +554,7 @@ MW_DONE:
     // [+8..+11]: ps1
     // [+12..+15]: ps2
     ld.shared.b32 %r55, [%r22 + 0]; // {dmin_f16, d_f16}
-    mov.b16 %h0, %r55;              // h0 = d (low 16 bits)
-    shr.b32 %r56, %r55, 16;
-    mov.b16 %h1, %r56;              // h1 = dmin (high 16 bits)
+    mov.b32 {%h0, %h1}, %r55;       // h0 = d (low 16 bits), h1 = dmin (high 16 bits)
     cvt.f32.f16 %f0, %h0;
     cvt.f32.f16 %f1, %h1;
     ld.shared.b32 %r24, [%r22 + 4];   // ps0

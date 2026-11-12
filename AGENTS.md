@@ -353,7 +353,16 @@ Qwen3.6-27B weights** — see open work.
 - [x] oxide GEMV: Q2_0, Q4K (dp4a), Q6K (dp4a kpar8 fallback + sm120
       register-exchange kpar8, default on sm_120 since 2026-10-29); oxide decode attn
 - [x] sm_120a native PTX: q4k/q6k GEMV, fused gate+up SiLU, mma.sync batch
-      GEMM, stream-K batch GEMM (persistent blocks, grid=SM_COUNT)
+      GEMM, stream-K batch GEMM (persistent blocks, grid=SM_COUNT;
+      NOTE: the stream-K PTX was DEAD ON ARRIVAL 2026-10-22..2026-11-12
+      -- an invalid `mov.b16 %h, %r32` (b32 source into a b16 dest)
+      made cuModuleLoadData fail rc=218 on every run, silently falling
+      back to mma_batch; ALL batch numbers before 2026-11-12 were
+      measured on the mma_batch fallback.  Fixed with the vector
+      unpack `mov.b32 {%h0, %h1}, %r55`; ptxas-clean; first-ever
+      streamk run 2026-11-12: batch M=1 223, M=2 245, M=4 409, M=5 471,
+      M=8 609, M=16 811 tok/s -- all NaN-free + deterministic, at or
+      above the mma_batch baselines, M=16 +2%)
 - [x] CUDA graphs for single + batch decode (M=2..16+, dynamic
       max_batch_graph from VRAM), KV scatter-write (offset read on device —
       no per-step graph updates)
@@ -595,10 +604,9 @@ typical-p/repeat/presence/frequency)
       expected with no oxide kernels).  LESSON: the
       stale-cubin/silent-garbage class strikes again -- a warmup that
       discards results cannot catch a format mismatch; the format is
-      now part of the weight struct.  (Also observed, pre-existing and
-      graceful: the oxide q4k STREAMK PTX fails cuModuleLoadData
-      rc=218 INVALID_PTX under the new driver and falls back to the
-      dp4a batch path -- worth an upstream look eventually.)
+      now part of the weight struct.  (The streamk PTX load failure
+      observed in the same logs was a SEPARATE tempura bug, also fixed
+      2026-11-12 -- see the sm_120a PTX note under GPU inference.)
 - [x] q6k_gemv_sm120_kpar8 (single-seq Q6K GEMV, renamed from
       ..._mbar_kpar8): FIXED and DEFAULT ON since 2026-10-29
       (register-exchange rewrite; TEMPURA_NO_SM120_Q6K=1 opts out).
