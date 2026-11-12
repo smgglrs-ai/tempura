@@ -569,6 +569,136 @@ fn main() {
             }
         }
 
+        // ---- 3b. Paged prefill attention (p20): GPU kernel vs the CPU
+        // paged reference.  Same shape matrix as 3a plus a SHUFFLED page
+        // mapping (identity tables cannot catch index bugs) and a
+        // determinism re-run (bitwise).  The K/V pools are scattered into
+        // pages under the table so identity and shuffled read the SAME
+        // logical tokens; the CPU reference walks the same table.
+        {
+            use tempura_kernels::attention::CpuPagedAttention;
+            use tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE as BS;
+            let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+            let cap = 512usize;
+            let mut scratch = PrefillAttnScratch::default();
+            let cpu_paged = CpuPagedAttention;
+
+            for &(seq_len, kv_len, seed) in
+                &[(13usize, 13usize, 21u32), (64, 149, 22), (128, 128, 23), (33, 65, 24)]
+            {
+                let q = prng_data(seq_len * N_HEADS * HEAD_DIM, seed);
+                let k = prng_data(cap * N_KV_HEADS * HEAD_DIM, seed + 1);
+                let v = prng_data(cap * N_KV_HEADS * HEAD_DIM, seed + 2);
+                let stride = N_KV_HEADS * HEAD_DIM;
+                let num_blocks = cap / BS;
+                // Scatter the first kv_len tokens of k/v into a pool under a
+                // page table; rows beyond kv_len stay zero (in-bounds padding).
+                let scatter = |contig: &[f32], table: &[usize]| -> Vec<f32> {
+                    let mut pool = vec![0.0f32; cap * stride];
+                    for tok in 0..kv_len {
+                        let page = table[tok / BS];
+                        let dst = (page * BS + tok % BS) * stride;
+                        pool[dst..dst + stride]
+                            .copy_from_slice(&contig[tok * stride..(tok + 1) * stride]);
+                    }
+                    pool
+                };
+
+                for (label, table) in [
+                    ("ident", (0..num_blocks).collect::<Vec<usize>>()),
+                    ("shuf", (0..num_blocks)
+                        .map(|i| (i + 1) % num_blocks)
+                        .collect::<Vec<usize>>()),
+                ] {
+                    let k_pool = scatter(&k, &table);
+                    let v_pool = scatter(&v, &table);
+                    // CPU reference through the same table.
+                    let mut cpu = vec![0.0f32; seq_len * N_HEADS * HEAD_DIM];
+                    let table_u32: Vec<u32> = table.iter().map(|&t| t as u32).collect();
+                    cpu_paged
+                        .forward_paged(
+                            &q, &k_pool, &v_pool, &table_u32, BS, &mut cpu, seq_len, kv_len,
+                            N_HEADS, N_KV_HEADS, HEAD_DIM, scale,
+                        )
+                        .expect("CPU paged reference failed");
+
+                    // GPU: pools as rank-2 views, table rank-2 [blocks, 1],
+                    // kv_len as a device scalar (the engine's exact inputs).
+                    let up2d = |data: Vec<f32>| -> Arc<Tensor<f32>> {
+                        api::copy_host_vec_to_device(&Arc::new(data))
+                            .sync_on(&fa_stream)
+                            .expect("paged pool upload failed")
+                            .reshape(&[cap * N_KV_HEADS, HEAD_DIM])
+                            .expect("paged pool reshape failed")
+                            .into()
+                    };
+                    let k_pool_dev = up2d(k_pool);
+                    let v_pool_dev = up2d(v_pool);
+                    let table_dev: Arc<Tensor<i32>> = api::copy_host_vec_to_device(&Arc::new(
+                        table.iter().map(|&t| t as i32).collect::<Vec<i32>>(),
+                    ))
+                    .sync_on(&fa_stream)
+                    .expect("paged table upload failed")
+                    .reshape(&[num_blocks, 1])
+                    .expect("paged table reshape failed")
+                    .into();
+                    let kv_len_dev: Arc<Tensor<i32>> = api::copy_host_vec_to_device(&Arc::new(
+                        vec![kv_len as i32],
+                    ))
+                    .sync_on(&fa_stream)
+                    .expect("kv_len scalar upload failed")
+                    .into();
+                    let q_dev = upload(q.clone(), &fa_stream);
+
+                    let mut first: Option<Vec<f32>> = None;
+                    for call in 0..2 {
+                        let out = fa
+                            .prefill_attention_device_paged(
+                                &q_dev,
+                                &k_pool_dev,
+                                &v_pool_dev,
+                                &table_dev,
+                                &kv_len_dev,
+                                seq_len,
+                                kv_len,
+                                N_HEADS,
+                                N_KV_HEADS,
+                                HEAD_DIM,
+                                scale,
+                                &fa_stream,
+                                &mut scratch,
+                            )
+                            .expect("prefill_attention_device_paged failed");
+                        let gpu = download(&out, &fa_stream);
+                        match &first {
+                            None => first = Some(gpu),
+                            Some(f) => {
+                                let bad = f
+                                    .iter()
+                                    .zip(&gpu)
+                                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                    .count();
+                                println!(
+                                    "  paged attn determinism ({label} seq={seq_len} kv={kv_len}): bad={bad}/{} -> {}",
+                                    gpu.len(),
+                                    if bad == 0 { "DETERMINISTIC" } else { "NONDETERMINISTIC" }
+                                );
+                                all_ok &= bad == 0;
+                            }
+                        }
+                        if call == 0 {
+                            let f = first.as_ref().unwrap();
+                            all_ok &= report(
+                                &format!("paged attn {label} (seq={seq_len} kv={kv_len})"),
+                                f,
+                                &cpu,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // ---- 3c. Prefill flash-attn tile sweep (BR x BC) ----
         // The multi-head flash kernel runs at ~2.7 TFLOPS at seq=128 (98us
         // per layer, nsys 2026-10-28) -- latency/overhead bound at small

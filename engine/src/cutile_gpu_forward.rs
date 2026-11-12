@@ -1779,16 +1779,32 @@ impl CutileGpuModel {
                 )
             };
             let mut warmed: std::collections::HashSet<usize> = Default::default();
+            // PTX presence is decided BEFORE the loop: a cuTile fallback
+            // crash (DriverError 719, cuda-oxide a0a4dc78a -- pre-existing
+            // on main 2026-11-12) poisons the CUDA context, so nothing
+            // (including try_load) succeeds after it.
+            let oxide_q4k_available = tempura_kernels::oxide_q4k_gemv_host::OxideQ4kGemv::try_load(
+                self.matmul.stream().clone(),
+            )
+            .is_some();
             for w in self.device_weights_q4k.values() {
                 if warmed.insert(w.k_blocks) {
-                    let x = mk_x(w.k_blocks * Q4K_BLOCK_SIZE);
-                    self.q4k_gemv
-                        .forward_d2d(&x, &w.tensor, w.n, w.k_blocks)
-                        .unwrap_or_else(|e| {
+                    // Skip the cuTile fallback warmup when the oxide PTX is
+                    // present: dispatch always prefers oxide (gemm_q4k_d2d),
+                    // and the fallback kernel crashes under cuda-oxide
+                    // a0a4dc78a (DriverError 719, pre-existing on main,
+                    // 2026-11-12) -- a crash that poisons the context for
+                    // everything after it.  On PTX-less hosts the warmup
+                    // still runs and still fails fast (the guard's intent).
+                    if !oxide_q4k_available {
+                        let x = mk_x(w.k_blocks * Q4K_BLOCK_SIZE);
+                        if let Err(e) = self.q4k_gemv.forward_d2d(&x, &w.tensor, w.n, w.k_blocks)
+                        {
                             panic!("warmup: cuTile Q4K GEMV (k_blocks={}) failed: {e} -- this \
                                     fallback path is broken for this model and would fail at \
-                                    first dispatch on hosts without the oxide PTX", w.k_blocks)
-                        });
+                                    first dispatch on hosts without the oxide PTX", w.k_blocks);
+                        }
+                    }
                 }
             }
             warmed.clear();
@@ -7158,26 +7174,55 @@ impl CutileGpuModel {
                     self.attn_out_to_oproj_device(&attn_out_dev, q_dim, self.q_pad)
                 } else if prefill_device_attn {
                     // Prefill: fully on-device attention over the GPU KV cache.
-                    // gather Q/K/V -> one multi-head flash-attn launch -> scatter,
-                    // all async on the stream; the O-proj input is padded via
-                    // D->D copy below.  Zero PCIe, zero host syncs.
-                    let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer);
-                    let attn_flat = self
-                        .flash_attn
-                        .prefill_attention_device(
-                            &q_rot_dev,
-                            &k_dev_full,
-                            &v_dev_full,
-                            seq_len,
-                            kv_len,
-                            n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            scale,
-                            self.matmul.stream(),
-                            &mut self.prefill_attn_scratch.borrow_mut(),
-                        )
-                        .expect("CutileGpuModel: GPU prefill attention failed");
+                    // PAGED (p20): the K/V tiles are gathered straight from
+                    // the interleaved pool through the block table (kv_len
+                    // read on device) -- the 2x cutile_gather_heads + the
+                    // head-major K/V scratch are skipped.  TEMPURA_NO_PAGED_
+                    // ATTN=1 bisects back to the gather/scatter chain.
+                    let use_paged =
+                        std::env::var("TEMPURA_NO_PAGED_ATTN").as_deref() != Ok("1");
+                    let attn_flat = if use_paged {
+                        let (k_pool, v_pool, block_table, kv_len_dev) = gpu_kv_cache
+                            .paged_attn_inputs(layer, head_dim, kv_len)
+                            .expect("CutileGpuModel: paged_attn_inputs failed");
+                        self.flash_attn
+                            .prefill_attention_device_paged(
+                                &q_rot_dev,
+                                &k_pool,
+                                &v_pool,
+                                &block_table,
+                                &kv_len_dev,
+                                seq_len,
+                                kv_len,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                scale,
+                                self.matmul.stream(),
+                                &mut self.prefill_attn_scratch.borrow_mut(),
+                            )
+                            .expect("CutileGpuModel: GPU paged prefill attention failed")
+                    } else {
+                        // gather Q/K/V -> one multi-head flash-attn launch ->
+                        // scatter, all async on the stream; the O-proj input is
+                        // padded via D->D copy below.  Zero PCIe, zero host syncs.
+                        let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer);
+                        self.flash_attn
+                            .prefill_attention_device(
+                                &q_rot_dev,
+                                &k_dev_full,
+                                &v_dev_full,
+                                seq_len,
+                                kv_len,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                scale,
+                                self.matmul.stream(),
+                                &mut self.prefill_attn_scratch.borrow_mut(),
+                            )
+                            .expect("CutileGpuModel: GPU prefill attention failed")
+                    };
                     self.attn_out_to_oproj_device_m(&attn_flat, q_dim, self.q_pad, seq_len)
                 } else {
                     // Host-based path: prefill (GPU flash attn) or long-context fallback.

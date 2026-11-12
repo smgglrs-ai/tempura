@@ -488,25 +488,79 @@ typical-p/repeat/presence/frequency)
       -- the write-safety side). VerifiedEquivalent<CpuAttention> row in
       the kernel-verify registry (error bound 0.0 -- bitwise; cites the
       Verus lemma). The CPU reference's paged_row_offset mirrors the
-      step-0 GPU gather's index chain exactly. Remaining sequence:
-      (2) GPU kernel v1 +
-      TEMPURA_NO_PAGED_ATTN bisect, graded vs the CPU ref, (3) kill the
-      gathers, (4) real page allocation. Baselines to beat/match:
-      prefill 7700 tok/s pp128, decode ITL 4.60 ms, gather/scatter kernels
-      gone from nsys. What exists is paged KV STORAGE, not
-      paged ATTENTION: the CPU forward path materializes
+      step-0 GPU gather's index chain exactly.
+      STEP 2 DONE (2026-11-12): GPU kernel v1 LANDED, at parity with the
+      gather path. cutile_flash_attn_heads_paged (kernels/src/
+      cutile_flash_attention.rs): same mma tiling/masks/softmax order as
+      cutile_flash_attn_heads, K/V tiles gathered from the interleaved
+      pool through the block table; kv_len read from a device i32 scalar
+      at EXECUTION time (kv_len_dev; cache_offset derived in-kernel --
+      graph-safe, the kv_scatter_write pattern); block table rank-2
+      [-1, 1] (rank-1 gather views do not JIT). block_size == BC == 16
+      (one page per tile): the page id is a single SCALAR table load and
+      pool_row is affine -- no per-column divi/remi in the hot loop
+      (Kani: paged_row_offset_affine_one_page_per_tile). Manual software
+      pipelining (gather loads carry no latency hint): K(j+1) AND V(j+1)
+      prefetched before tile j's compute, branch-free clamp on the last
+      tile. Host: prefill_attention_device_paged (Q gather + out scatter
+      retained; k/v head-major scratch DEAD) + CutileKvCache::
+      paged_attn_inputs (zero-copy rank-2 pool views via Reshape,
+      lazily-allocated identity block table [gpu_max_seq_len/16, 1],
+      kv_len scalar updated via async H2D). Engine dispatch at the
+      prefill branch; TEMPURA_NO_PAGED_ATTN=1 bisects to the gather path.
+      PERF TUNING HISTORY (bench-real-model pp128, Llama-3.1-8B Q4_K_M,
+      same-binary A/B): 7161 (naive per-tile gather chain, BC=32) ->
+      7265 (K(j+1) prefetch) -> 7468 (BC=16: smaller tiles give the
+      prefetch more overlap granularity -- the DENSE path preferred
+      BC=32, gathers have different economics; BC=64 6914, BC=8 7256) ->
+      7525 (V(j+1) prefetch too). Gather-path bisect on the same binary:
+      7555. PAGED AT PARITY (0.4%, within noise; both beat llama.cpp
+      7335). Decode unchanged 219. The paged advantage grows with
+      context length (the eliminated K/V gather/scatter round trips are
+      O(kv_len) per layer; at kv=128 they were only ~6us/layer).
+      CORRECTNESS: bench-decode-ops "paged attn" section -- max_abs=0
+      vs the CPU paged reference on 8 configs (4 shapes x identity/
+      shuffled tables, ragged kv, cache-offset history) + bitwise
+      determinism re-runs; bench-real-model NaN-free, det=OK, prefill
+      logits fingerprint IDENTICAL to the gather path (bits_sum
+      216043403379854, argmax 233); bench-quality teacher-forced gate
+      PASS. NOTE: DSL has NO closures in kernels (standalone closure
+      values are rejected -- the gather chains are inlined per site).
+      ALSO FOUND (pre-existing, filed below): the cuTile Q4K GEMV
+      fallback crashes (DriverError 719) under cuda-oxide a0a4dc78a --
+      bench-real-model was BLOCKED on main; the warmup now skips the
+      fallback when the oxide PTX is present (dispatch never touches
+      it; the guard still fails fast on PTX-less hosts). Remaining
+      sequence: (3) kill the Q gather + out scatter via scatter views
+      (~5.7us/layer more), (4) real page allocation (non-identity
+      tables + page-granular CutileKvCache refactor). Baselines:
+      prefill PARITY at pp128 (7525 paged vs 7555 gather, 2026-11-12;
+      the 2026-10-29 7700 baseline reads ~7555 on current hw/cuda-oxide
+      state), decode ITL unchanged, gather/scatter kernels: K/V gathers
+      GONE from nsys (Q gather + out scatter remain until step 3). What
+      remains un-paged: the CPU forward path still materializes
       PagedKvCache::k_contiguous()/v_contiguous() before running standard
-      contiguous attention (model.rs), and GPU prefill attention runs over
-      head-major padded buffers after cutile_gather_heads (3 gathers +
-      scatter per layer). The task: a flash-attention variant whose KV tile
-      loop reads logical→physical page addresses from a device-resident
-      block table (same device-side indirection pattern kv_scatter_write
-      uses for writes; kv_len/page table on device keeps it CUDA-graph
-      capturable), ragged last pages masked, CPU reference in
-      kernels/src/attention.rs for DualPipeline grading, VerifiedEquivalent
-      + registry row, Kani/Verus coverage for the tile→page→offset
-      arithmetic. Perf gates: prefill not worse than the gather path at
-      pp128, decode ITL unchanged, gather/scatter kernels gone from nsys.
+      contiguous attention (model.rs -- the CPU paged reference from step
+      1 can replace it), batch-decode CUDA graphs still run oxide
+      attention over contiguous caches, and the GPU pool is still the
+      contiguous CutileKvCache viewed through an identity table (real
+      page-granular allocation is step 4).
+- [ ] **cuTile Q4K GEMV fallback broken under cuda-oxide a0a4dc78a
+      (found 2026-11-12, pre-existing on main)**: the cutile_quantized_gemm
+      Q4K GEMV crashes with DriverError 719 ("unspecified launch failure")
+      at the constructor warmup -- bench-real-model was fully BLOCKED on
+      main (panics before any benchmark). The last validated benches
+      (2026-11-10 5-family matrix) predate the cuda-oxide update to
+      a0a4dc78a (2026-11-11), so the regression window is that update.
+      Workaround landed with p20 step 2: the warmup SKIPS the cuTile
+      fallback when the oxide Q4K PTX is present (dispatch always prefers
+      oxide -- gemm_q4k_d2d -- so the fallback is never touched on such
+      hosts; PTX-less hosts still fail fast, the guard's original intent;
+      the skip must happen BEFORE any fallback launch because a 719 crash
+      poisons the CUDA context for everything after it). OPEN: root-cause
+      the kernel against upstream (compute-sanitizer on a standalone repro
+      is the playbook), or pin/patch cuda-oxide; the cuTile fallback is
+      dead weight on PTX hosts until then.
 - [x] q6k_gemv_sm120_kpar8 (single-seq Q6K GEMV, renamed from
       ..._mbar_kpar8): FIXED and DEFAULT ON since 2026-10-29
       (register-exchange rewrite; TEMPURA_NO_SM120_Q6K=1 opts out).
