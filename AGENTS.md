@@ -526,11 +526,11 @@ typical-p/repeat/presence/frequency)
       216043403379854, argmax 233); bench-quality teacher-forced gate
       PASS. NOTE: DSL has NO closures in kernels (standalone closure
       values are rejected -- the gather chains are inlined per site).
-      ALSO FOUND (pre-existing, filed below): the cuTile Q4K GEMV
-      fallback crashes (DriverError 719) under cuda-oxide a0a4dc78a --
-      bench-real-model was BLOCKED on main; the warmup now skips the
-      fallback when the oxide PTX is present (dispatch never touches
-      it; the guard still fails fast on PTX-less hosts). Remaining
+      ALSO FOUND + FIXED the same day (see the [x] item below): the
+      cuTile Q4K GEMV warmup crash (DriverError 719) was a tempura
+      format-mismatch bug (raw 36-u32 weights fed to the 42-u32 cuTile
+      kernel) surfaced by cuda-oxide a0a4dc78a's new partition bounds
+      checks -- not an upstream regression. Remaining
       sequence: (3) kill the Q gather + out scatter via scatter views
       (~5.7us/layer more), (4) real page allocation (non-identity
       tables + page-granular CutileKvCache refactor).
@@ -569,22 +569,36 @@ typical-p/repeat/presence/frequency)
       attention over contiguous caches, and the GPU pool is still the
       contiguous CutileKvCache viewed through an identity table (real
       page-granular allocation is step 4).
-- [ ] **cuTile Q4K GEMV fallback broken under cuda-oxide a0a4dc78a
-      (found 2026-11-12, pre-existing on main)**: the cutile_quantized_gemm
-      Q4K GEMV crashes with DriverError 719 ("unspecified launch failure")
-      at the constructor warmup -- bench-real-model was fully BLOCKED on
-      main (panics before any benchmark). The last validated benches
-      (2026-11-10 5-family matrix) predate the cuda-oxide update to
-      a0a4dc78a (2026-11-11), so the regression window is that update.
-      Workaround landed with p20 step 2: the warmup SKIPS the cuTile
-      fallback when the oxide Q4K PTX is present (dispatch always prefers
-      oxide -- gemm_q4k_d2d -- so the fallback is never touched on such
-      hosts; PTX-less hosts still fail fast, the guard's original intent;
-      the skip must happen BEFORE any fallback launch because a 719 crash
-      poisons the CUDA context for everything after it). OPEN: root-cause
-      the kernel against upstream (compute-sanitizer on a standalone repro
-      is the playbook), or pin/patch cuda-oxide; the cuTile fallback is
-      dead weight on PTX hosts until then.
+- [x] **cuTile Q4K GEMV fallback crash under cuda-oxide a0a4dc78a --
+      ROOT-CAUSED and FIXED (2026-11-12, same day)**: NOT a cuda-oxide
+      regression -- a tempura bug the update surfaced.  compute-sanitizer
+      on a standalone repro (bench-probe-q4k -- the kernel is BIT-EXACT
+      on synthetic 42-u32 data) + memcheck on bench-real-model pinned
+      it: when the oxide kernel's uses_raw_gguf is set, Q4K weights are
+      uploaded in the RAW GGUF 36-u32 block format
+      (maybe_upload_q4k_raw), but the cuTile cutile_q4k_gemv fallback
+      kernel indexes with 42-u32 strides -- every program with
+      pid_n >= 6*n/7 reads past the tensor (memcheck: first traps at
+      blocks 3512-3534 of 4096 = 4096*6/7).  Older cuda-oxide silently
+      read OOB garbage (harmless only because the warmup discards
+      results); a0a4dc78a added partition-access bounds checks that
+      TRAP -> DriverError 719, which poisoned the context (bench-real-
+      model was fully blocked on main).  FIX: DeviceWeightQ4K now
+      carries uses_raw_gguf (set at upload); the constructor warmup
+      skips raw-format entries (the cuTile kernel cannot consume them,
+      and gemm_q4k_d2d prefers oxide for those weights anyway) and a
+      debug_assert in gemm_q4k_d2d's cuTile fallback keeps the formats
+      from ever mixing at dispatch.  Validated both ways on fishtank:
+      raw config 7790 tok/s det=OK; PTX-load-forced-fail (repacked
+      42-u32) config runs the cuTile warmup cleanly ("kernel warmup
+      complete", 7800 tok/s prefill, logits det=OK -- decode 12 tok/s
+      expected with no oxide kernels).  LESSON: the
+      stale-cubin/silent-garbage class strikes again -- a warmup that
+      discards results cannot catch a format mismatch; the format is
+      now part of the weight struct.  (Also observed, pre-existing and
+      graceful: the oxide q4k STREAMK PTX fails cuModuleLoadData
+      rc=218 INVALID_PTX under the new driver and falls back to the
+      dp4a batch path -- worth an upstream look eventually.)
 - [x] q6k_gemv_sm120_kpar8 (single-seq Q6K GEMV, renamed from
       ..._mbar_kpar8): FIXED and DEFAULT ON since 2026-10-29
       (register-exchange rewrite; TEMPURA_NO_SM120_Q6K=1 opts out).

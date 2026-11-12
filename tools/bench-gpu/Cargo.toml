@@ -46,6 +46,10 @@ name = "bench-probe-gather"
 path = "src/bench_probe_gather.rs"
 
 [[bin]]
+name = "bench-probe-q4k"
+path = "src/bench_probe_q4k.rs"
+
+[[bin]]
 name = "bench-perplexity"
 path = "src/bench_perplexity.rs"
 
