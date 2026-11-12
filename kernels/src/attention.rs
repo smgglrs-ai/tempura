@@ -448,6 +448,215 @@ fn flash_attention(
     Ok(())
 }
 
+// -- Paged (block-table) attention reference ---------------------------------
+//
+// CPU reference for the paged attention kernel (plan p20): the same
+// online-softmax tile loop as `flash_attention`, but the inner K/V loads
+// resolve logical token positions through a block table into a paged pool
+// instead of reading a contiguous cache.  This is the DualPipeline
+// reference the GPU paged kernel is graded against, and the arithmetic
+// `paged_row_offset` below is the Kani/Verus target (it mirrors the
+// cutile gather's sparse index chain: token -> divi block_idx -> page-id
+// -> page*block_size + remi offset -> *n_kv_heads + kv_head).
+
+/// Resolve the flat element offset of one K/V row in a paged pool.
+///
+/// Pool layout (matches `PagedKvCache` and the GPU interleaved cache):
+/// `[page, token_in_page, kv_head, head_dim]`, so the row for (token,
+/// kv_h) starts at `(page * block_size + token % block_size) * stride +
+/// kv_h * head_dim` where `stride = num_kv_heads * head_dim`.
+///
+/// Kani: `paged_row_offset_in_bounds`; Verus:
+/// `paged_attention::lemma_paged_offset_in_bounds`.
+#[inline]
+pub fn paged_row_offset(
+    block_table: &[u32],
+    block_size: usize,
+    stride: usize,
+    token: usize,
+    kv_h: usize,
+    head_dim: usize,
+) -> usize {
+    let block_idx = token / block_size;
+    let page = block_table[block_idx] as usize;
+    let block_offset = token % block_size;
+    (page * block_size + block_offset) * stride + kv_h * head_dim
+}
+
+/// Block-table flash attention (single sequence, the PagedKvCache shape).
+///
+/// Same tile loop, causal mask, and online-softmax update order as
+/// `flash_attention` with batch == 1 -- with an identity block table and
+/// an in-order pool the two are bitwise identical (validated by
+/// `test_paged_attention_identity_and_shuffled_match_flash`).  Ragged last
+/// pages need no special handling: `kv_len` bounds the tile loop exactly as
+/// in the contiguous reference.
+fn paged_flash_attention(
+    q: &[f32],
+    k_pages: &[f32],
+    v_pages: &[f32],
+    block_table: &[u32],
+    block_size: usize,
+    output: &mut [f32],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    dot_fn: fn(&[f32], &[f32]) -> f32,
+) -> Result<()> {
+    if block_size == 0 || num_kv_heads == 0 || head_dim == 0 {
+        return Err(crate::KernelError::InvalidConfig(
+            "paged_flash_attention: zero block_size/num_kv_heads/head_dim".into(),
+        ));
+    }
+    let stride = num_kv_heads * head_dim;
+    let num_blocks_needed = kv_len.div_ceil(block_size);
+    if block_table.len() < num_blocks_needed {
+        return Err(crate::KernelError::InvalidConfig(format!(
+            "paged_flash_attention: block table covers {} blocks, kv_len {kv_len} needs {num_blocks_needed}",
+            block_table.len()
+        )));
+    }
+    let pool_len = num_blocks_needed * block_size * stride;
+    if k_pages.len() < pool_len || v_pages.len() < pool_len {
+        return Err(crate::KernelError::InvalidConfig(format!(
+            "paged_flash_attention: pool len {}/{}, need {pool_len}",
+            k_pages.len(),
+            v_pages.len()
+        )));
+    }
+
+    let heads_per_group = num_heads / num_kv_heads;
+
+    for h in 0..num_heads {
+        let kv_h = h / heads_per_group;
+        for s in 0..seq_len {
+            let q_offset = (s * num_heads + h) * head_dim;
+            let q_vec = &q[q_offset..q_offset + head_dim];
+
+            let cache_offset = kv_len - seq_len;
+            let causal_limit = cache_offset + s;
+
+            let mut o_acc = vec![0.0f32; head_dim];
+            let mut row_max = f32::NEG_INFINITY;
+            let mut row_sum = 0.0f32;
+
+            let num_tiles = kv_len.div_ceil(FLASH_BC);
+            for tile in 0..num_tiles {
+                let tile_start = tile * FLASH_BC;
+                let tile_end = (tile_start + FLASH_BC).min(kv_len);
+
+                let mut tile_max = f32::NEG_INFINITY;
+                let mut tile_scores = vec![0.0f32; tile_end - tile_start];
+
+                for (i, kv_s) in (tile_start..tile_end).enumerate() {
+                    if kv_s > causal_limit {
+                        tile_scores[i] = f32::NEG_INFINITY;
+                        continue;
+                    }
+                    let k_offset = paged_row_offset(block_table, block_size, stride, kv_s, kv_h, head_dim);
+                    let k_vec = &k_pages[k_offset..k_offset + head_dim];
+                    tile_scores[i] = dot_fn(q_vec, k_vec) * scale;
+                    if tile_scores[i] > tile_max {
+                        tile_max = tile_scores[i];
+                    }
+                }
+
+                if tile_max == f32::NEG_INFINITY {
+                    continue;
+                }
+
+                let new_max = row_max.max(tile_max);
+                let correction = if row_max > f32::NEG_INFINITY {
+                    crate::portable_math::portable_exp(row_max - new_max)
+                } else {
+                    0.0
+                };
+
+                for val in &mut o_acc {
+                    *val *= correction;
+                }
+                row_sum *= correction;
+
+                let mut tile_sum = 0.0f32;
+                for score in &mut tile_scores {
+                    if *score > f32::NEG_INFINITY {
+                        *score = crate::portable_math::portable_exp(*score - new_max);
+                    } else {
+                        *score = 0.0;
+                    }
+                    tile_sum += *score;
+                }
+
+                for (i, kv_s) in (tile_start..tile_end).enumerate() {
+                    let w = tile_scores[i];
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let v_base = paged_row_offset(block_table, block_size, stride, kv_s, kv_h, head_dim);
+                    for d in 0..head_dim {
+                        o_acc[d] += w * v_pages[v_base + d];
+                    }
+                }
+
+                row_sum += tile_sum;
+                row_max = new_max;
+            }
+
+            let o_offset = (s * num_heads + h) * head_dim;
+            let inv_sum = if row_sum > 0.0 { 1.0 / row_sum } else { 0.0 };
+            for d in 0..head_dim {
+                output[o_offset + d] = o_acc[d] * inv_sum;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// CPU paged attention: the DualPipeline reference for the GPU paged
+/// attention kernel (plan p20).  Not an `Attention` impl -- the paged pool
+/// and block table are extra inputs the trait does not carry.
+#[cfg(feature = "cpu")]
+pub struct CpuPagedAttention;
+
+#[cfg(feature = "cpu")]
+impl CpuPagedAttention {
+    pub fn forward_paged(
+        &self,
+        q: &[f32],
+        k_pages: &[f32],
+        v_pages: &[f32],
+        block_table: &[u32],
+        block_size: usize,
+        output: &mut [f32],
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<()> {
+        paged_flash_attention(
+            q,
+            k_pages,
+            v_pages,
+            block_table,
+            block_size,
+            output,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            dot_f32,
+        )
+    }
+}
+
 // -- ALiBi slope computation -----------------------------------------------
 //
 // Translated from ggml's ggml_compute_forward_soft_max_f32 (ops.cpp:5348-5370).
@@ -2147,6 +2356,59 @@ mod kani_proofs {
     }
 
     #[kani::proof]
+    fn paged_row_offset_in_bounds() {
+        // The tile->page->offset arithmetic of the paged attention
+        // reference (and the cutile gather's sparse index chain).  Concrete
+        // dims (per the symbolic-length lesson); symbolic token and table
+        // entries exercise the full div/mod/page chain.
+        const BLOCK_SIZE: usize = 4;
+        const NUM_BLOCKS: usize = 3;
+        const N_KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 4;
+        const NUM_POOL_PAGES: usize = 5;
+
+        let stride = N_KV_HEADS * HEAD_DIM;
+        let pool_len = NUM_POOL_PAGES * BLOCK_SIZE * stride;
+
+        let mut block_table = [0u32; NUM_BLOCKS];
+        for i in 0..NUM_BLOCKS {
+            let page: u32 = kani::any();
+            kani::assume((page as usize) < NUM_POOL_PAGES);
+            block_table[i] = page;
+        }
+
+        let token: usize = kani::any();
+        kani::assume(token < NUM_BLOCKS * BLOCK_SIZE);
+        let kv_h: usize = kani::any();
+        kani::assume(kv_h < N_KV_HEADS);
+
+        let off = super::paged_row_offset(&block_table, BLOCK_SIZE, stride, token, kv_h, HEAD_DIM);
+        assert!(off + HEAD_DIM <= pool_len);
+    }
+
+    #[kani::proof]
+    fn paged_row_offset_identity_table() {
+        // With an identity block table the paged offset collapses to the
+        // contiguous-cache offset -- the arithmetic core of the
+        // identity-table equivalence between paged and flash attention.
+        const BLOCK_SIZE: usize = 4;
+        const NUM_BLOCKS: usize = 3;
+        const N_KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 4;
+
+        let stride = N_KV_HEADS * HEAD_DIM;
+        let block_table = [0u32, 1, 2];
+
+        let token: usize = kani::any();
+        kani::assume(token < NUM_BLOCKS * BLOCK_SIZE);
+        let kv_h: usize = kani::any();
+        kani::assume(kv_h < N_KV_HEADS);
+
+        let off = super::paged_row_offset(&block_table, BLOCK_SIZE, stride, token, kv_h, HEAD_DIM);
+        assert!(off == token * stride + kv_h * HEAD_DIM);
+    }
+
+    #[kani::proof]
     #[kani::unwind(10)]
     fn alibi_slopes_no_panic() {
         let n_heads: usize = kani::any();
@@ -2204,6 +2466,94 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_paged_attention_identity_and_shuffled_match_flash() {
+        // The paged reference must be bitwise-identical to the contiguous
+        // flash reference when the pool holds the same values -- both with
+        // an identity table (in-order pool) and with a SHUFFLED page
+        // mapping (identity tables cannot catch index-mapping bugs).
+        // kv_len is deliberately ragged vs both FLASH_BC and block_size.
+        let (num_heads, num_kv_heads, head_dim) = (4usize, 2usize, 8usize);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let seq_len = 5usize;
+
+        for &(kv_len, block_size) in
+            &[(37usize, 8usize), (64usize, 16usize), (33usize, 4usize)]
+        {
+            let stride = num_kv_heads * head_dim;
+            // Deterministic LCG data (no RNG dependency).
+            let mut s = 0x1234_5678u32;
+            let mut nxt = || {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((s >> 8) & 0xFFFF) as f32 / 65535.0 - 0.5
+            };
+            let q: Vec<f32> = (0..seq_len * num_heads * head_dim).map(|_| nxt()).collect();
+            let k: Vec<f32> = (0..kv_len * stride).map(|_| nxt()).collect();
+            let v: Vec<f32> = (0..kv_len * stride).map(|_| nxt()).collect();
+
+            // Contiguous reference.
+            let mut flash = vec![0.0f32; seq_len * num_heads * head_dim];
+            flash_attention(
+                &q, &k, &v, &mut flash, 1, seq_len, kv_len, num_heads, num_kv_heads,
+                head_dim, scale, dot_f32,
+            )
+            .unwrap();
+
+            let num_blocks = kv_len.div_ceil(block_size);
+            let pool_rows = num_blocks * block_size;
+            // Scatter contiguous K/V into a pool under a given page map.
+            let scatter = |contig: &[f32], table: &[u32]| -> Vec<f32> {
+                let mut pool = vec![0.0f32; pool_rows * stride];
+                for tok in 0..kv_len {
+                    let page = table[tok / block_size] as usize;
+                    let dst = (page * block_size + tok % block_size) * stride;
+                    pool[dst..dst + stride].copy_from_slice(
+                        &contig[tok * stride..(tok + 1) * stride],
+                    );
+                }
+                pool
+            };
+
+            // Identity table.
+            let ident: Vec<u32> = (0..num_blocks as u32).collect();
+            let mut out = vec![0.0f32; seq_len * num_heads * head_dim];
+            CpuPagedAttention
+                .forward_paged(
+                    &q, &scatter(&k, &ident), &scatter(&v, &ident), &ident, block_size,
+                    &mut out, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale,
+                )
+                .unwrap();
+            for (i, (a, b)) in out.iter().zip(&flash).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(),
+                    "identity table kv={kv_len} bs={block_size} elem {i}: {a} vs {b}");
+            }
+
+            // Shuffled pages (rotation by 1 mod num_blocks -- a non-trivial
+            // permutation that avoids fixed points when num_blocks > 1).
+            let shuf: Vec<u32> = (0..num_blocks).map(|i| ((i + 1) % num_blocks) as u32).collect();
+            let mut out = vec![0.0f32; seq_len * num_heads * head_dim];
+            CpuPagedAttention
+                .forward_paged(
+                    &q, &scatter(&k, &shuf), &scatter(&v, &shuf), &shuf, block_size,
+                    &mut out, seq_len, kv_len, num_heads, num_kv_heads, head_dim, scale,
+                )
+                .unwrap();
+            for (i, (a, b)) in out.iter().zip(&flash).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(),
+                    "shuffled table kv={kv_len} bs={block_size} elem {i}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_paged_attention_rejects_short_block_table() {
+        let r = CpuPagedAttention.forward_paged(
+            &[0.0; 8], &[0.0; 64], &[0.0; 64], &[0, 1], 16, &mut [0.0; 8],
+            1, 33, 1, 1, 8, 1.0, // kv_len 33 needs 3 blocks at bs=16
+        );
+        assert!(r.is_err());
+    }
 
     #[test]
     fn alibi_slopes_positive_and_decreasing() {
@@ -3027,5 +3377,17 @@ impl crate::VerifiedEquivalent<CpuAttention> for CpuAttentionF16 {
 impl crate::VerifiedEquivalent<CpuAttention> for CpuAttentionGgml {
     fn max_relative_error() -> f64 { 0.0001 }
     fn proof_name() -> &'static str { "verus:cpu_attention_variants::lemma_ggml_attention_bounded_error" }
+    fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Proven }
+}
+
+#[cfg(feature = "cpu")]
+impl crate::VerifiedEquivalent<CpuAttention> for CpuPagedAttention {
+    /// Bitwise-identical to the contiguous flash reference when the pool
+    /// holds the same values (identity AND shuffled page mappings) --
+    /// test_paged_attention_identity_and_shuffled_match_flash.  The bound
+    /// cites the Kani/Verus coverage of the offset arithmetic, not a
+    /// numerical tolerance.
+    fn max_relative_error() -> f64 { 0.0 }
+    fn proof_name() -> &'static str { "verus:paged_attention::lemma_paged_offset_in_bounds" }
     fn verification_tier() -> crate::VerificationTier { crate::VerificationTier::Proven }
 }

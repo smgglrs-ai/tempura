@@ -166,6 +166,7 @@ MODULES=(
     # Indexing arithmetic (mirror Kani harnesses)
     kv_cache
     attention
+    paged_attention
     rmsnorm
     layernorm
     rope
