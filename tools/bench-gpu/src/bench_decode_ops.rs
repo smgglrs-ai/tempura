@@ -2547,6 +2547,112 @@ fn main() {
         }
     }
 
+    // ---- 12. GPU page pool (p20 step 4b) --------------------------------------
+    // The shared-pool mechanism: contiguous page RUNS from one pool
+    // (first-fit + coalescing, Kani-verified in gpu_page_pool.rs), affine
+    // block tables (base_page + i) through the REAL paged kernel, run
+    // data at non-zero base pages, hole reuse after free.  Validated vs
+    // the CPU paged reference over a mirror of the whole pool.
+    {
+        use tempura_engine::cutile_kv_cache::GpuKvPagePool;
+        use tempura_kernels::attention::CpuPagedAttention;
+        use tempura_kernels::cutile_flash_attention::{
+            CutileFlashAttention, PrefillAttnScratch, PAGED_BLOCK_SIZE as BS,
+        };
+        let fa2 = CutileFlashAttention::new().expect("CutileFlashAttention init failed");
+        let pool_stream = fa2.stream().clone();
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let stride = N_KV_HEADS * HEAD_DIM;
+        let total_pages = 32usize;
+        let mut pool = GpuKvPagePool::new_with_dims(1, stride, total_pages, pool_stream.clone())
+            .expect("pool alloc failed");
+        let mut scratch = PrefillAttnScratch::default();
+
+        // Allocator scenario: A=[0,8), B=[8,16); free A; C=4 pages fits
+        // A's hole at base 0.  B keeps a NON-ZERO base -- the proof that
+        // the kernel reads through the table, not from pool start.
+        let run_a = pool.alloc_run(8, HEAD_DIM).expect("alloc A");
+        let run_b = pool.alloc_run(8, HEAD_DIM).expect("alloc B");
+        let b_base = run_b.base_page();
+        let b_pages = run_b.pages();
+        pool.free_run(&run_a);
+        let run_c = pool.alloc_run(4, HEAD_DIM).expect("alloc C (hole reuse)");
+        println!(
+            "  pool alloc: A=0..8 B={b_base}..{} C={}..{} (hole reuse) free={}/{}",
+            b_base + b_pages,
+            run_c.base_page(),
+            run_c.base_page() + run_c.pages(),
+            pool.free_pages(),
+            pool.total_pages()
+        );
+        all_ok &= run_b.base_page() == 8;
+        all_ok &= run_c.base_page() == 0;
+        all_ok &= pool.free_pages() + pool.allocated_pages() == pool.total_pages();
+
+        // CPU mirror of the whole pool.
+        let pool_tokens = total_pages * BS;
+        let mut cpu_k = vec![0.0f32; pool_tokens * stride];
+        let mut cpu_v = vec![0.0f32; pool_tokens * stride];
+
+        for (label, run) in [("B", &run_b), ("C", &run_c)] {
+            let kv_len = run.capacity_tokens() - 7; // ragged tail
+            let seq_len = 33usize;
+            let seed = match label {
+                "B" => 31u32,
+                _ => 32,
+            };
+            let q = prng_data(seq_len * N_HEADS * HEAD_DIM, seed);
+            let k = prng_data(kv_len * stride, seed + 1);
+            let v = prng_data(kv_len * stride, seed + 2);
+            run.upload_tokens(0, 0, &k, &v)
+                .expect("run upload failed");
+            // Mirror: token t of the run lives at pool row base_page*BS + t.
+            let row0 = run.base_page() * BS;
+            for t in 0..kv_len {
+                let dst = (row0 + t) * stride;
+                cpu_k[dst..dst + stride].copy_from_slice(&k[t * stride..(t + 1) * stride]);
+                cpu_v[dst..dst + stride].copy_from_slice(&v[t * stride..(t + 1) * stride]);
+            }
+            let mut cpu = vec![0.0f32; seq_len * N_HEADS * HEAD_DIM];
+            let table: Vec<u32> = (0..run.pages())
+                .map(|i| (run.base_page() + i) as u32)
+                .collect();
+            CpuPagedAttention
+                .forward_paged(
+                    &q, &cpu_k, &cpu_v, &table, BS, &mut cpu, seq_len, kv_len, N_HEADS,
+                    N_KV_HEADS, HEAD_DIM, scale, 0.0,
+                )
+                .expect("CPU paged reference failed");
+
+            let q_dev = upload(q, &pool_stream);
+            let (k_view, v_view, table_dev, kv_len_dev) =
+                run.paged_attn_inputs(0, kv_len).expect("run attn inputs");
+            let out = fa2
+                .prefill_attention_device_paged(
+                    &q_dev,
+                    &k_view,
+                    &v_view,
+                    &table_dev,
+                    &kv_len_dev,
+                    seq_len,
+                    kv_len,
+                    N_HEADS,
+                    N_KV_HEADS,
+                    HEAD_DIM,
+                    scale,
+                    &pool_stream,
+                    &mut scratch,
+                )
+                .expect("paged pool attention failed");
+            let gpu = download(&out, &pool_stream);
+            all_ok &= report(
+                &format!("pool run {label} (base={}, kv={kv_len})", run.base_page()),
+                &gpu,
+                &cpu,
+            );
+        }
+    }
+
     println!();
     if all_ok {
         println!("All decode-op mechanisms match CPU math -- the decode");
