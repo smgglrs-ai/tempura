@@ -621,7 +621,27 @@ typical-p/repeat/presence/frequency)
       REMAINING for 4b: wire the pool into CutileKvCache/batch decode
       (per-seq 1024MiB full-size buffers -> runs from one shared pool;
       the batch graphs' per-seq base pointers update per replay already
-      so base-page offsets compose), then prefix sharing/eviction. Baselines:
+      so base-page offsets compose), then prefix sharing/eviction.
+      4b-2 DESIGN NOTES (mapped 2026-11-12, ready to execute): pooled
+      mode is for the BATCH caches ONLY (single-seq sessions keep
+      dedicated buffers, base 0 -- zero changes to their paths).  The
+      ~15 batch call sites are UNIFORM raw-pointer extractions
+      (kv_device_tensors(l).{0,1}.device_pointer().cu_deviceptr() --
+      oxide attn, kv_scatter_write destinations, batch_attn_all_k_ptrs
+      arrays, capture-time pointer validation): add a base-offset-aware
+      accessor (kv_device_base_ptrs) and update them mechanically.
+      Sites that pass Arc<Tensor> INTO kernels (gather-path prefill,
+      cutile decode fallback) must NOT see pooled tensors -- batch is
+      decode-only, so this does not arise there.  GROWTH: runs must
+      allocate with HEADROOM (e.g. max(2x needed, +256 tokens)) --
+      run reallocation changes the pointers baked into captured batch
+      graphs, triggering re-capture; without headroom that would fire
+      every 16 decode steps.  The existing "KV cache ptrs changed --
+      re-capturing" validation/replay machinery handles realloc
+      transparently.  sync_host_from_device must become base-offset
+      aware (offset D2H, not whole-pool to_host_vec).  Gate:
+      bench-batch (the batch fingerprints) + bench-real-model +
+      bench-decode-ops after the wiring. Baselines:
       prefill PARITY at pp128 (7525 paged vs 7555 gather, 2026-11-12;
       the 2026-10-29 7700 baseline reads ~7555 on current hw/cuda-oxide
       state), decode ITL unchanged, gather/scatter kernels: ALL GONE
