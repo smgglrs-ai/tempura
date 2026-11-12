@@ -386,3 +386,5 @@ proof fn check_group_sum()
 }
 
 } // verus!
+
+fn main() {}

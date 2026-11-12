@@ -56,7 +56,7 @@ proof fn ue4m3_compose_extract_roundtrip(exp: u8, man: u8)
         &&& byte & 0x07u8 == man
     }),
 {
-    assert(((exp << 3u8) | man) >> 3u8 == exp) by (bit_vector)
+    assert((((exp << 3u8) | man) >> 3u8) & 0x0Fu8 == exp) by (bit_vector)
         requires exp <= 15, man <= 7;
     assert(((exp << 3u8) | man) & 0x07u8 == man) by (bit_vector)
         requires exp <= 15, man <= 7;
@@ -75,7 +75,8 @@ proof fn ue4m3_encode_normal_range(exp: u8, man: u8)
 {
     assert((exp << 3u8) | man == exp * 8 + man) by (bit_vector)
         requires exp <= 15, man <= 7;
-    assert(exp * 8 + man <= 14 * 8 + 7 == 119) by (nonlinear_arith);
+    assert(exp * 8 + man <= 14 * 8 + 7) by (nonlinear_arith)
+        requires exp <= 14, man <= 7;
 }
 
 // Subnormal path: man in [1,7] -> byte in [1,7] (exp field is 0)
@@ -113,7 +114,8 @@ proof fn nvfp4_byte_index_in_bounds(s: nat, j: nat)
         j < 8,
     ensures s * 8 + j < 32,
 {
-    assert(s * 8 + j <= 3 * 8 + 7 == 31) by (nonlinear_arith);
+    assert(s * 8 + j <= 3 * 8 + 7) by (nonlinear_arith)
+        requires s <= 3, j <= 7;
 }
 
 // The two elements a split-layout byte encodes stay inside the 16-element
@@ -138,7 +140,8 @@ proof fn nvfp4_element_index_in_bounds(s: nat, j: nat)
         &&& s * 16 + j + 8 < 64
     },
 {
-    assert(s * 16 + j + 8 <= 3 * 16 + 7 + 8 == 63) by (nonlinear_arith);
+    assert(s * 16 + j + 8 <= 3 * 16 + 7 + 8) by (nonlinear_arith)
+        requires s <= 3, j <= 7;
 }
 
 // The adjacent-pairs layout (element 2j, 2j+1) is a DIFFERENT mapping: for

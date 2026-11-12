@@ -87,7 +87,7 @@ proof fn group32_decomposition(k: nat)
     assert(nb / 32 * 32 + nb % 32 == nb) by (nonlinear_arith);
 }
 
-// i16 accumulator overflow safety: 32 groups x 4 maddubs x max ??254 = ??32512
+// i16 accumulator overflow safety: 32 groups x 4 maddubs x max 254 = 32512
 // fits i16 range [-32768, 32767]
 proof fn i16_accumulator_no_overflow()
     ensures ({
@@ -102,3 +102,5 @@ proof fn i16_accumulator_no_overflow()
 }
 
 }
+
+fn main() {}
