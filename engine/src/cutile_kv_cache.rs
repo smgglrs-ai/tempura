@@ -631,3 +631,282 @@ mod tests {
         }
     }
 }
+
+// ============================================================================
+// Shared GPU KV page pool (p20 step 4b)
+// ============================================================================
+
+/// A shared GPU KV pool with page-run allocation.
+///
+/// Sequences hold CONTIGUOUS runs of `block_size`-token pages allocated
+/// from this pool ([`PageRunAllocator`], Kani-verified in
+/// gpu_page_pool.rs), so a sequence's block table is affine
+/// (`base_page + i`) and every contiguity-assuming reader works from a
+/// base-shifted pointer -- no kernel/PTX changes.  This is the
+/// foundation for sharing one pool across batch sequences (each batch
+/// sequence today costs a FULL max-size buffer -- 1024MiB/seq at 4096
+/// ctx; a run costs only the pages it uses) and for prefix
+/// sharing/eviction later.
+///
+/// NOT yet wired into `CutileKvCache`/the decode graphs (that migration
+/// touches graph-captured base pointers -- recorded as the p20 step-4b
+/// follow-up); validated directly by the "GPU page pool" section of
+/// bench-decode-ops.
+pub struct GpuKvPagePool {
+    /// Per-layer flat pools `[total_pages * page_stride]`, interleaved
+    /// `[page, token_in_page, kv_head, head_dim]`.
+    k_pools: Vec<Arc<Tensor<f32>>>,
+    v_pools: Vec<Arc<Tensor<f32>>>,
+    alloc: crate::gpu_page_pool::PageRunAllocator,
+    /// Elements per page (block_size * kv_dim).
+    page_stride: usize,
+    block_size: usize,
+    kv_dim: usize,
+    stream: Arc<Stream>,
+}
+
+unsafe impl Send for GpuKvPagePool {}
+unsafe impl Sync for GpuKvPagePool {}
+
+/// A contiguous page run allocated from a [`GpuKvPagePool`].
+///
+/// Holds everything the paged attention kernel needs: whole-pool rank-2
+/// views, the run's affine block table (`base_page + i`, rank-2 `[pages,
+/// 1]` -- rank-1 gather views do not JIT), and a kv_len device scalar
+/// (execution-time read, CUDA-graph safe).  Freeing returns the pages to
+/// the pool via [`GpuKvPagePool::free_run`].
+pub struct GpuKvRun {
+    base_page: usize,
+    pages: usize,
+    /// Per-layer rank-2 `[-1, head_dim]` views of the WHOLE pool (rows =
+    /// token * n_kv_heads + kv_head; zero-copy `Reshape` views).
+    k_views: Vec<Arc<Tensor<f32>>>,
+    v_views: Vec<Arc<Tensor<f32>>>,
+    block_table_dev: Arc<Tensor<i32>>,
+    kv_len_dev: Arc<Tensor<i32>>,
+    kv_dim: usize,
+    block_size: usize,
+    stream: Arc<Stream>,
+}
+
+unsafe impl Send for GpuKvRun {}
+unsafe impl Sync for GpuKvRun {}
+
+impl GpuKvPagePool {
+    /// Allocate a pool of `total_pages` pages of `PAGED_BLOCK_SIZE`
+    /// (16) tokens each, for `config`'s layer/kv geometry.
+    pub fn new(
+        config: &ModelConfig,
+        total_pages: usize,
+        stream: Arc<Stream>,
+    ) -> Result<Self, KernelError> {
+        Self::new_with_dims(
+            config.num_layers,
+            config.num_kv_heads * config.head_dim,
+            total_pages,
+            stream,
+        )
+    }
+
+    /// Dimension-explicit constructor (tests / non-ModelConfig callers).
+    pub fn new_with_dims(
+        n_layers: usize,
+        kv_dim: usize,
+        total_pages: usize,
+        stream: Arc<Stream>,
+    ) -> Result<Self, KernelError> {
+        let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
+        let page_stride = block_size * kv_dim;
+        let layer_elems = total_pages * page_stride;
+        let mut k_pools = Vec::with_capacity(n_layers);
+        let mut v_pools = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            let k: Arc<Tensor<f32>> = api::zeros::<f32>(&[layer_elems])
+                .sync_on(&stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into();
+            let v: Arc<Tensor<f32>> = api::zeros::<f32>(&[layer_elems])
+                .sync_on(&stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .into();
+            k_pools.push(k);
+            v_pools.push(v);
+        }
+        Ok(Self {
+            k_pools,
+            v_pools,
+            alloc: crate::gpu_page_pool::PageRunAllocator::new(total_pages),
+            page_stride,
+            block_size,
+            kv_dim,
+            stream,
+        })
+    }
+
+    pub fn free_pages(&self) -> usize {
+        self.alloc.free_pages()
+    }
+
+    pub fn allocated_pages(&self) -> usize {
+        self.alloc.allocated_pages()
+    }
+
+    pub fn total_pages(&self) -> usize {
+        self.alloc.total_pages()
+    }
+
+    /// Allocate a contiguous run of `pages` pages and build its attention
+    /// inputs.  `head_dim` must divide `kv_dim` (the rank-2 view rows are
+    /// `token * n_kv_heads + kv_head`).
+    pub fn alloc_run(
+        &mut self,
+        pages: usize,
+        head_dim: usize,
+    ) -> Option<GpuKvRun> {
+        use cutile::tensor::Reshape;
+
+        if head_dim == 0 || self.kv_dim % head_dim != 0 {
+            return None;
+        }
+        let run = self.alloc.alloc(pages)?;
+        let rows = self.alloc.total_pages() * self.block_size * self.kv_dim / head_dim;
+        let k_views = self
+            .k_pools
+            .iter()
+            .map(|t| t.reshape(&[rows, head_dim]).ok())
+            .collect::<Option<Vec<_>>>()?;
+        let v_views = self
+            .v_pools
+            .iter()
+            .map(|t| t.reshape(&[rows, head_dim]).ok())
+            .collect::<Option<Vec<_>>>()?;
+        // Affine table: block i of this run is physical page base+i.
+        let table: Vec<i32> = (0..pages).map(|i| (run.start + i) as i32).collect();
+        let block_table_dev: Arc<Tensor<i32>> = api::copy_host_vec_to_device(&Arc::new(table))
+            .sync_on(&self.stream)
+            .ok()?
+            .reshape(&[pages, 1])
+            .ok()?
+            .into();
+        let kv_len_dev: Arc<Tensor<i32>> =
+            api::copy_host_vec_to_device(&Arc::new(vec![0i32]))
+                .sync_on(&self.stream)
+                .ok()?
+                .into();
+        Some(GpuKvRun {
+            base_page: run.start,
+            pages,
+            k_views,
+            v_views,
+            block_table_dev,
+            kv_len_dev,
+            kv_dim: self.kv_dim,
+            block_size: self.block_size,
+            stream: self.stream.clone(),
+        })
+    }
+
+    /// Return a run's pages to the pool (coalescing).  The run's views
+    /// may outlive the free (Arc-shared storage) but must not be used
+    /// for attention after the pages are reused.
+    pub fn free_run(&mut self, run: &GpuKvRun) {
+        self.alloc.free(crate::gpu_page_pool::Run {
+            start: run.base_page,
+            pages: run.pages,
+        });
+    }
+}
+
+impl GpuKvRun {
+    pub fn base_page(&self) -> usize {
+        self.base_page
+    }
+
+    pub fn pages(&self) -> usize {
+        self.pages
+    }
+
+    /// Token capacity of the run.
+    pub fn capacity_tokens(&self) -> usize {
+        self.pages * self.block_size
+    }
+
+    /// Element offset of `token` within the flat pool (for raw-pointer
+    /// access by contiguity-assuming readers: base pointer + this offset
+    /// * 4 bytes).
+    pub fn token_elem_offset(&self, token: usize) -> usize {
+        self.base_page * self.block_size * self.kv_dim + token * self.kv_dim
+    }
+
+    /// Upload `k`/`v` host slices (`n * kv_dim` elements each) as `n`
+    /// tokens starting at `token_offset` within the run (async,
+    /// stream-ordered).
+    pub fn upload_tokens(
+        &self,
+        layer: usize,
+        token_offset: usize,
+        k: &[f32],
+        v: &[f32],
+    ) -> Result<(), KernelError> {
+        let n = k.len() / self.kv_dim;
+        debug_assert_eq!(v.len(), k.len());
+        let base = self.token_elem_offset(token_offset);
+        let kp = self.k_views[layer].device_pointer().cu_deviceptr();
+        let vp = self.v_views[layer].device_pointer().cu_deviceptr();
+        unsafe {
+            cuda_core::memcpy_htod_async::<f32>(
+                kp + (base as u64) * 4,
+                k.as_ptr(),
+                n * self.kv_dim,
+                &self.stream,
+            )
+        }
+        .map_err(|e| KernelError::InvalidConfig(format!("pool k upload: {e}")))?;
+        unsafe {
+            cuda_core::memcpy_htod_async::<f32>(
+                vp + (base as u64) * 4,
+                v.as_ptr(),
+                n * self.kv_dim,
+                &self.stream,
+            )
+        }
+        .map_err(|e| KernelError::InvalidConfig(format!("pool v upload: {e}")))?;
+        Ok(())
+    }
+
+    /// Attention inputs for `cutile_flash_attn_heads_paged` /
+    /// `prefill_attention_device_paged`: (k view, v view, block table,
+    /// kv_len scalar).  The kv_len VALUE is uploaded via async H2D
+    /// (stream-ordered before the consuming launch); the scalar's pointer
+    /// is stable across calls (CUDA-graph safe).
+    pub fn paged_attn_inputs(
+        &self,
+        layer: usize,
+        kv_len: usize,
+    ) -> Result<
+        (
+            Arc<Tensor<f32>>,
+            Arc<Tensor<f32>>,
+            Arc<Tensor<i32>>,
+            Arc<Tensor<i32>>,
+        ),
+        KernelError,
+    > {
+        let kv_len_i = kv_len as i32;
+        unsafe {
+            cuda_core::memcpy_htod_async::<i32>(
+                self.kv_len_dev.device_pointer().cu_deviceptr(),
+                &kv_len_i as *const i32,
+                1,
+                &self.stream,
+            )
+        }
+        .map_err(|e| KernelError::InvalidConfig(format!("run kv_len H2D: {e}")))?;
+        Ok((
+            self.k_views[layer].clone(),
+            self.v_views[layer].clone(),
+            self.block_table_dev.clone(),
+            self.kv_len_dev.clone(),
+        ))
+    }
+}

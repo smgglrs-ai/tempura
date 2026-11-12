@@ -24,6 +24,7 @@ use vstd::prelude::*;
 
 // Indexing arithmetic proofs (mirror Kani harnesses)
 pub mod attention;
+pub mod gpu_page_pool;
 pub mod paged_attention;
 pub mod disaggregated;
 pub mod ggml_quants;

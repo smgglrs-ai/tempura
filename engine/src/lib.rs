@@ -10,6 +10,7 @@ pub mod disaggregated;
 pub mod dual_pipeline;
 pub mod eval;
 pub mod gguf_loader;
+pub mod gpu_page_pool;
 pub mod kv_cache;
 pub mod loader;
 pub mod lora;

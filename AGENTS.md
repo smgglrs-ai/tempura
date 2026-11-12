@@ -587,7 +587,41 @@ typical-p/repeat/presence/frequency)
       non-identity tables on the GPU pool -- the oxide decode
       attention PTX reads the pool contiguously, so per-sequence
       base-page offsets or table-aware PTX kernels are the design
-      decision; prefix sharing/eviction on top). Baselines:
+      decision; prefix sharing/eviction on top).
+      STEP 4b-1 DONE (2026-11-12): the GPU page-POOL MECHANISM, validated
+      end-to-end (production wiring is the follow-up).  engine/src/
+      gpu_page_pool.rs (UNGATED -- cargo kani is featureless, the
+      cutile_quantized_gemm lesson): PageRunAllocator -- fixed-capacity
+      array free list ([Run; 128]), BEST-FIT alloc, coalescing free via
+      absorb-then-append (swap-remove only, NO memmove).  GpuKvPagePool
+      + GpuKvRun (cutile_kv_cache.rs, gated): shared per-layer pool
+      tensors, run handles with affine block tables (base+i), per-run
+      kv_len device scalar, whole-pool rank-2 views for the paged
+      kernel, upload_tokens at base-shifted offsets.  Sequences hold
+      CONTIGUOUS runs so every contiguity-assuming reader (oxide decode
+      PTX etc.) works from a base-shifted pointer -- no PTX changes.
+      VALIDATED: bench-decode-ops "GPU page pool" -- two concurrent runs
+      (B at base 8: NON-ZERO table indirection through the real kernel;
+      C reusing A's freed hole), both bit-exact (max_abs=0) vs the CPU
+      paged reference over a whole-pool mirror, conservation holds;
+      Kani: alloc_free_conservation_and_well_formed (154s) +
+      free_rejected_out_of_bounds (16s) -- free-list sorted/disjoint/
+      non-adjacent/in-bounds + page conservation + no-overlap for
+      symbolic request sizes; Verus gpu_page_pool.rs: 4 proofs
+      (well-formedness, conservation, sorted-insert, run disjointness).
+      KANI LESSONS (2026-11-12, the Vec-bomb class again): (1) Vec
+      insert/remove with symbolic positions made CBMC OOM/heap-corrupt
+      at 20+ GB on a 125 GB host -- fixed-capacity arrays with
+      swap-remove only; (2) iterator-adapter folds over runtime-length
+      slices (.iter().map().sum()) are the same bomb -- plain indexed
+      while loops; (3) loops over a structurally-bounded length
+      (free_len <= 128) still fail unwind(N) unless a PROVABLE concrete
+      bound is asserted before the loop (harness asserts free_len <= 8
+      from the concrete op sequence -- CBMC then prunes the unwinding).
+      REMAINING for 4b: wire the pool into CutileKvCache/batch decode
+      (per-seq 1024MiB full-size buffers -> runs from one shared pool;
+      the batch graphs' per-seq base pointers update per replay already
+      so base-page offsets compose), then prefix sharing/eviction. Baselines:
       prefill PARITY at pp128 (7525 paged vs 7555 gather, 2026-11-12;
       the 2026-10-29 7700 baseline reads ~7555 on current hw/cuda-oxide
       state), decode ITL unchanged, gather/scatter kernels: ALL GONE
