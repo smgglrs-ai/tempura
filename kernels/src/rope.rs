@@ -1115,7 +1115,7 @@ mod tests {
         let mut x = original.clone();
         let positions = vec![0u32];
 
-        gpu.forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0)
+        gpu.forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         for (i, (a, b)) in x.iter().zip(original.iter()).enumerate() {
@@ -1134,7 +1134,7 @@ mod tests {
         let mut x = original.clone();
         let positions = vec![0u32];
 
-        rope.forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0)
+        rope.forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         // at position 0, cos=1 sin=0, so output should equal input
@@ -1164,7 +1164,7 @@ mod tests {
             num_heads,
             head_dim,
             &positions,
-            freq_base,
+            freq_base, 1.0,
         )
         .unwrap();
 
@@ -1177,7 +1177,7 @@ mod tests {
                 num_heads,
                 head_dim,
                 &positions,
-                freq_base,
+                freq_base, 1.0,
             )
             .unwrap();
 
@@ -1203,7 +1203,7 @@ mod tests {
         let positions = vec![3u32]; // non-zero position to actually rotate
 
         unified
-            .forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0)
+            .forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         // Dimensions n_dims..head_dim should be unchanged
@@ -1234,7 +1234,7 @@ mod tests {
         let positions = vec![5u32];
 
         unified
-            .forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0)
+            .forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         for i in n_dims..head_dim {
@@ -1256,7 +1256,7 @@ mod tests {
             let mut x = original.clone();
 
             unified
-                .forward(&mut x, 1, 1, 1, head_dim, &[0], 10000.0)
+                .forward(&mut x, 1, 1, 1, head_dim, &[0], 10000.0, 1.0)
                 .unwrap();
 
             for (i, (a, b)) in x.iter().zip(original.iter()).enumerate() {
@@ -1276,7 +1276,7 @@ mod tests {
         let mut x = original.clone();
 
         unified
-            .forward(&mut x, 1, 1, 1, head_dim, &[0], 10000.0)
+            .forward(&mut x, 1, 1, 1, head_dim, &[0], 10000.0, 1.0)
             .unwrap();
 
         for (i, (a, b)) in x.iter().zip(original.iter()).enumerate() {
@@ -1311,7 +1311,7 @@ mod tests {
             num_heads,
             head_dim,
             &positions,
-            freq_base,
+            freq_base, 1.0,
         )
         .unwrap();
 
@@ -1324,7 +1324,7 @@ mod tests {
                 num_heads,
                 head_dim,
                 &positions,
-                freq_base,
+                freq_base, 1.0,
             )
             .unwrap();
 
@@ -1345,12 +1345,12 @@ mod tests {
         let positions = vec![5u32];
 
         let mut x_base = x_orig.clone();
-        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0)
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         let mut x_ones = x_orig.clone();
         with_ones
-            .forward(&mut x_ones, 1, 1, 1, head_dim, &positions, 10000.0)
+            .forward(&mut x_ones, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         for i in 0..head_dim {
@@ -1373,12 +1373,12 @@ mod tests {
         let positions = vec![3u32];
 
         let mut x_ff = x_orig.clone();
-        rope.forward(&mut x_ff, 1, 1, 1, head_dim, &positions, 10000.0)
+        rope.forward(&mut x_ff, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         let base = CpuRoPEUnified::new(RoPEMode::Normal, 8);
         let mut x_base = x_orig.clone();
-        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0)
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         let any_diff = (0..head_dim).any(|i| (x_ff[i] - x_base[i]).abs() > 1e-6);
@@ -1395,12 +1395,12 @@ mod tests {
         let positions = vec![4u32];
 
         let mut x_scaled = x_orig.clone();
-        rope.forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 10000.0)
+        rope.forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         let base = CpuRoPEUnified::new(RoPEMode::Normal, 8);
         let mut x_base = x_orig.clone();
-        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0)
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         let any_diff = (0..head_dim).any(|i| (x_scaled[i] - x_base[i]).abs() > 1e-6);
@@ -1419,12 +1419,12 @@ mod tests {
         let positions = vec![100u32];
 
         let mut x_yarn = x_orig.clone();
-        rope.forward(&mut x_yarn, 1, 1, 1, head_dim, &positions, 10000.0)
+        rope.forward(&mut x_yarn, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         let base = CpuRoPEUnified::new(RoPEMode::Normal, 16);
         let mut x_base = x_orig.clone();
-        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0)
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         let any_diff = (0..head_dim).any(|i| (x_yarn[i] - x_base[i]).abs() > 1e-6);
@@ -1445,7 +1445,7 @@ mod tests {
         let positions = vec![50u32];
 
         let mut x = x_orig.clone();
-        rope.forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0)
+        rope.forward(&mut x, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         let l2: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -1470,12 +1470,12 @@ mod tests {
         let orig: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
 
         let mut x_base = orig.clone();
-        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0)
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         let mut x_scaled = orig.clone();
         scaled
-            .forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 0.0)
+            .forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 0.0, 1.0)
             .unwrap();
 
         for i in 0..head_dim {
@@ -1496,12 +1496,12 @@ mod tests {
 
         let mut x_base = orig.clone();
         CpuRoPEScaled::new_linear(1.0, head_dim, 10000.0)
-            .forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0)
+            .forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0, 1.0)
             .unwrap();
 
         let mut x_scaled = orig.clone();
         CpuRoPEScaled::new_linear(4.0, head_dim, 10000.0)
-            .forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 0.0)
+            .forward(&mut x_scaled, 1, 1, 1, head_dim, &positions, 0.0, 1.0)
             .unwrap();
 
         let any_diff = (0..head_dim).any(|i| (x_base[i] - x_scaled[i]).abs() > 1e-5);
@@ -1519,12 +1519,12 @@ mod tests {
         let llama3 = CpuRoPEScaled::new_llama3(8.0, 8192, 1.0, 4.0, head_dim, 500000.0);
 
         let mut x_base = orig.clone();
-        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0)
+        base.forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0, 1.0)
             .unwrap();
 
         let mut x_llama3 = orig.clone();
         llama3
-            .forward(&mut x_llama3, 1, 1, 1, head_dim, &positions, 0.0)
+            .forward(&mut x_llama3, 1, 1, 1, head_dim, &positions, 0.0, 1.0)
             .unwrap();
 
         // First dimension (highest freq) should match unscaled
@@ -1544,12 +1544,12 @@ mod tests {
 
         let mut x_base = orig.clone();
         CpuRoPEScaled::new_linear(1.0, head_dim, 10000.0)
-            .forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0)
+            .forward(&mut x_base, 1, 1, 1, head_dim, &positions, 0.0, 1.0)
             .unwrap();
 
         let mut x_ntk = orig.clone();
         CpuRoPEScaled::new_ntk(4.0, head_dim, 10000.0)
-            .forward(&mut x_ntk, 1, 1, 1, head_dim, &positions, 0.0)
+            .forward(&mut x_ntk, 1, 1, 1, head_dim, &positions, 0.0, 1.0)
             .unwrap();
 
         let any_diff = (0..head_dim).any(|i| (x_base[i] - x_ntk[i]).abs() > 1e-5);
@@ -1650,7 +1650,7 @@ mod tests {
 
         let positions: Vec<u32> = (0..n_pos as u32).collect();
         let rope = CpuRoPE;
-        rope.forward(&mut input, 1, n_pos, 1, head_dim, &positions, 10000.0)
+        rope.forward(&mut input, 1, n_pos, 1, head_dim, &positions, 10000.0, 1.0)
             .unwrap();
 
         let mut max_diff = 0.0f32;
@@ -1685,7 +1685,7 @@ mod tests {
                 let rope = CpuRoPE;
                 let mut data: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
                 let l2_before: f32 = data.iter().map(|v| v * v).sum::<f32>().sqrt();
-                rope.forward(&mut data, 1, 1, 1, head_dim, &[position], 10000.0).unwrap();
+                rope.forward(&mut data, 1, 1, 1, head_dim, &[position], 10000.0, 1.0).unwrap();
                 let l2_after: f32 = data.iter().map(|v| v * v).sum::<f32>().sqrt();
                 prop_assert!((l2_before - l2_after).abs() < 1e-4,
                     "L2 changed: {l2_before} -> {l2_after}");
@@ -1698,7 +1698,7 @@ mod tests {
                 let rope = CpuRoPE;
                 let original: Vec<f32> = (0..head_dim).map(|i| (i as f32 + 1.0) * 0.3).collect();
                 let mut data = original.clone();
-                rope.forward(&mut data, 1, 1, 1, head_dim, &[0], 10000.0).unwrap();
+                rope.forward(&mut data, 1, 1, 1, head_dim, &[0], 10000.0, 1.0).unwrap();
                 for (i, (a, b)) in original.iter().zip(data.iter()).enumerate() {
                     prop_assert!((a - b).abs() < 1e-5,
                         "position 0 should be identity, diff at {i}: {a} vs {b}");
@@ -1724,10 +1724,10 @@ mod tests {
             let positions = vec![pos];
 
             let mut x_cached = orig.clone();
-            rope_cached.forward(&mut x_cached, 1, 1, 1, head_dim, &positions, freq_base).unwrap();
+            rope_cached.forward(&mut x_cached, 1, 1, 1, head_dim, &positions, freq_base, 1.0).unwrap();
 
             let mut x_onthefly = orig.clone();
-            rope_onthefly.forward(&mut x_onthefly, 1, 1, 1, head_dim, &positions, freq_base).unwrap();
+            rope_onthefly.forward(&mut x_onthefly, 1, 1, 1, head_dim, &positions, freq_base, 1.0).unwrap();
 
             for (i, (a, b)) in x_cached.iter().zip(x_onthefly.iter()).enumerate() {
                 assert!(
@@ -1755,10 +1755,10 @@ mod tests {
             let positions = vec![pos];
 
             let mut x_cached = orig.clone();
-            rope_cached.forward(&mut x_cached, 1, 1, 1, head_dim, &positions, freq_base).unwrap();
+            rope_cached.forward(&mut x_cached, 1, 1, 1, head_dim, &positions, freq_base, 1.0).unwrap();
 
             let mut x_onthefly = orig.clone();
-            rope_onthefly.forward(&mut x_onthefly, 1, 1, 1, head_dim, &positions, freq_base).unwrap();
+            rope_onthefly.forward(&mut x_onthefly, 1, 1, 1, head_dim, &positions, freq_base, 1.0).unwrap();
 
             for (i, (a, b)) in x_cached.iter().zip(x_onthefly.iter()).enumerate() {
                 assert!(

@@ -36,9 +36,10 @@ proof fn softmax_partition(n: nat, k: nat)
         // After selection, the count equals min(k, n) = k (since k <= n).
         let selected = k;
         &&& selected == k
+        // Every index i in [0, selected) satisfies i < n -- implied by
+        // selected <= n (nat arithmetic); stated as a forall it has no
+        // legal trigger (a bare comparison), so it is not repeated.
         &&& selected <= n
-        // Every index i in [0, selected) satisfies i < n
-        &&& forall|i: nat| i < selected ==> i < n
     }),
 {
 }
@@ -145,9 +146,24 @@ proof fn softcapping_end_to_end(tanh_val: int, cap: nat, scale: nat)
     }),
 {
     // |tanh_val| <= scale, so |tanh_val * cap| <= scale * cap
-    let abs_tanh = if tanh_val >= 0 { tanh_val } else { -tanh_val };
-    assert(abs_tanh <= scale as int);
-    assert(abs_tanh * cap as int <= scale as int * cap as int);
+    let product = tanh_val * cap as int;
+    if product >= 0 {
+        assert(tanh_val >= 0) by (nonlinear_arith)
+            requires product == tanh_val * (cap as int), product >= 0, (cap as int) > 0;
+        assert(product <= (scale as int) * (cap as int)) by (nonlinear_arith)
+            requires
+                product == tanh_val * (cap as int),
+                tanh_val <= 1 * (scale as int),
+                (cap as int) > 0;
+    } else {
+        assert(tanh_val < 0) by (nonlinear_arith)
+            requires product == tanh_val * (cap as int), product < 0, (cap as int) > 0;
+        assert(-product <= (scale as int) * (cap as int)) by (nonlinear_arith)
+            requires
+                product == tanh_val * (cap as int),
+                -1 * (scale as int) <= tanh_val,
+                (cap as int) > 0;
+    }
 }
 
 fn main() {}

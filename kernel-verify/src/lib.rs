@@ -929,6 +929,7 @@ fn compare_rope_single(
         cfg.head_dim,
         &positions,
         cfg.theta,
+        1.0,
     );
     let res_b = b.forward(
         &mut x_b,
@@ -938,6 +939,7 @@ fn compare_rope_single(
         cfg.head_dim,
         &positions,
         cfg.theta,
+        1.0,
     );
 
     if let (Ok(()), Ok(())) = (res_a, res_b) {
@@ -1215,6 +1217,13 @@ mod tests {
                 error_bound: <CpuAttentionGgml as VerifiedEquivalent<CpuAttention>>::max_relative_error(),
                 proof: <CpuAttentionGgml as VerifiedEquivalent<CpuAttention>>::proof_name(),
                 tier: "tested",
+            },
+            Row {
+                kernel: "CpuPagedAttention",
+                reference: "CpuAttention",
+                error_bound: <tempura_kernels::attention::CpuPagedAttention as VerifiedEquivalent<CpuAttention>>::max_relative_error(),
+                proof: <tempura_kernels::attention::CpuPagedAttention as VerifiedEquivalent<CpuAttention>>::proof_name(),
+                tier: "proven",
             },
         ];
 

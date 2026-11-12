@@ -59,3 +59,5 @@ proof fn mmap_range_containment(file_size: nat, offset: nat, length: nat)
 }
 
 }
+
+fn main() {}
