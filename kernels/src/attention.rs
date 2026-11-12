@@ -2409,6 +2409,38 @@ mod kani_proofs {
     }
 
     #[kani::proof]
+    fn paged_row_offset_affine_one_page_per_tile() {
+        // The GPU kernel's block_size == BC specialization (see
+        // cutile_flash_attn_heads_paged): with one page per tile the pool
+        // row is the AFFINE chain (page * BC + i) * stride + kv_h * hd,
+        // and it must agree with the general divi/remi chain for
+        // token = page * BC + i.
+        const BLOCK_SIZE: usize = 4;
+        const N_KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 4;
+        const NUM_BLOCKS: usize = 3;
+
+        let stride = N_KV_HEADS * HEAD_DIM;
+        let page: usize = kani::any();
+        let i: usize = kani::any();
+        let kv_h: usize = kani::any();
+        kani::assume(page < NUM_BLOCKS);
+        kani::assume(i < BLOCK_SIZE);
+        kani::assume(kv_h < N_KV_HEADS);
+
+        // Every table entry maps to `page` (the gather view's scalar load).
+        let block_table = [page as u32; NUM_BLOCKS];
+        let token = page * BLOCK_SIZE + i;
+        kani::assume(token < NUM_BLOCKS * BLOCK_SIZE);
+
+        let general = super::paged_row_offset(
+            &block_table, BLOCK_SIZE, stride, token, kv_h, HEAD_DIM,
+        );
+        let affine = (page * BLOCK_SIZE + i) * stride + kv_h * HEAD_DIM;
+        assert!(general == affine);
+    }
+
+    #[kani::proof]
     #[kani::unwind(10)]
     fn alibi_slopes_no_panic() {
         let n_heads: usize = kani::any();

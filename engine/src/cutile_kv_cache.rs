@@ -51,6 +51,18 @@ pub struct CutileKvCache {
     /// last `sync_host_from_device`.  Signals that the host mirror is stale for
     /// the tokens appended without a D->H update.
     host_stale: bool,
+    /// Identity block table for the paged attention kernel, rank-2
+    /// [max_blocks, 1] (rank-1 gather views do not JIT -- see
+    /// cutile_flash_attn_heads_paged).  The GPU pool is contiguous, so
+    /// logical block i IS physical page i.  Lazily allocated once;
+    /// contents never change, so the pointer is CUDA-graph stable.
+    block_table_dev: Option<Arc<Tensor<i32>>>,
+    /// Device scalar holding the current kv_len for the paged attention
+    /// kernel (read at EXECUTION time, not launch time -- CUDA-graph
+    /// safe, the kv_scatter_write device-offset pattern).  Lazily
+    /// allocated once; the VALUE is updated via async H2D before each
+    /// paged launch.
+    kv_len_dev: Option<Arc<Tensor<i32>>>,
 }
 
 // SAFETY: Tensor<f32> and Stream hold raw CUDA pointers but tempura uses a
@@ -103,6 +115,8 @@ impl CutileKvCache {
             v_device,
             gpu_max_seq_len,
             host_stale: false,
+            block_table_dev: None,
+            kv_len_dev: None,
         })
     }
 
@@ -366,6 +380,85 @@ impl CutileKvCache {
             Arc::clone(&self.k_device[layer]),
             Arc::clone(&self.v_device[layer]),
         )
+    }
+
+    /// Inputs for the paged prefill attention kernel (p20): zero-copy
+    /// rank-2 pool views, the identity block table, and the kv_len device
+    /// scalar.  The kv_len VALUE is uploaded via async H2D on this call
+    /// (stream-ordered before the launch that consumes it); the buffer
+    /// pointer is allocated once and never changes, so captured CUDA
+    /// graphs replay correctly as the cache grows.
+    ///
+    /// Pool view layout: `[-1, head_dim]` rows = `token * n_kv_heads +
+    /// kv_head` (the same interleaved bytes as the rank-1 cache, viewed).
+    /// Requires `head_dim` to divide `kv_dim` and `layer` to be valid.
+    pub fn paged_attn_inputs(
+        &mut self,
+        layer: usize,
+        head_dim: usize,
+        kv_len: usize,
+    ) -> Result<
+        (
+            Arc<Tensor<f32>>,
+            Arc<Tensor<f32>>,
+            Arc<Tensor<i32>>,
+            Arc<Tensor<i32>>,
+        ),
+        KernelError,
+    > {
+        use cutile::tensor::Reshape;
+
+        if head_dim == 0 || self.kv_dim % head_dim != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "paged_attn_inputs: head_dim {head_dim} must divide kv_dim {}",
+                self.kv_dim
+            )));
+        }
+        let rows = self.gpu_max_seq_len * self.kv_dim / head_dim;
+        let k_pool = self.k_device[layer]
+            .reshape(&[rows, head_dim])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let v_pool = self.v_device[layer]
+            .reshape(&[rows, head_dim])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+
+        if self.block_table_dev.is_none() {
+            let max_blocks = self
+                .gpu_max_seq_len
+                .div_ceil(tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE);
+            let table: Vec<i32> = (0..max_blocks as i32).collect();
+            let t = api::copy_host_vec_to_device(&Arc::new(table))
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                .reshape(&[max_blocks, 1])
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            self.block_table_dev = Some(Arc::new(t));
+        }
+        if self.kv_len_dev.is_none() {
+            let t = api::copy_host_vec_to_device(&Arc::new(vec![kv_len as i32]))
+                .sync_on(&self.stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            self.kv_len_dev = Some(Arc::new(t));
+        }
+        // Update the kv_len scalar: 4 bytes, async, execution-time read.
+        let kv_len_i = kv_len as i32;
+        let kv_len_dev = self.kv_len_dev.as_ref().unwrap();
+        unsafe {
+            cuda_core::memcpy_htod_async::<i32>(
+                kv_len_dev.device_pointer().cu_deviceptr(),
+                &kv_len_i as *const i32,
+                1,
+                &self.stream,
+            )
+        }
+        .map_err(|e| KernelError::InvalidConfig(format!("paged_attn_inputs kv_len H2D: {e}")))?;
+
+        Ok((
+            k_pool,
+            v_pool,
+            self.block_table_dev.as_ref().unwrap().clone(),
+            kv_len_dev.clone(),
+        ))
     }
 
     pub fn gpu_max_seq_len(&self) -> usize {

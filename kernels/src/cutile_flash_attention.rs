@@ -15,9 +15,17 @@ use crate::{Attention, KernelError, Result, VerificationTier};
 const BR: usize = 16;
 const BC: usize = 32;
 
+/// Logical page size (tokens) for the paged attention kernel -- mirrors the
+/// CPU `PagedKvCache::DEFAULT_BLOCK_SIZE` (16).  The GPU pool is the
+/// existing contiguous `CutileKvCache` tensor viewed through an IDENTITY
+/// block table today; the block size only affects the index-chain
+/// arithmetic (a power of two keeps divi/remi cheap).
+pub const PAGED_BLOCK_SIZE: usize = 16;
+
 #[cutile::module]
 pub mod kernels {
     use cutile::core::*;
+    use cutile::tileir::*;
 
     /// Flash Attention v2 kernel (Dao et al., 2022).
     ///
@@ -311,6 +319,253 @@ pub mod kernels {
                 part_v.load_pipelined::<4>([kv_block_base + j, 0i32]);
             acc = mma(p, tile_v, acc);
             m_i = m_ij;
+        }
+
+        // Normalize: divide each row by its softmax denominator.
+        out.store(true_div(acc, l_i.broadcast(shape![BR, D])));
+    }
+
+    /// Paged flash attention (multi-head, prefill) -- the p20 paged kernel.
+    ///
+    /// Identical math to `cutile_flash_attn_heads` (same mma tiling, masks,
+    /// and online-softmax update order), but the K/V tiles are GATHERED
+    /// from the interleaved paged pool through the block table instead of
+    /// loaded from head-major gathered buffers.  REQUIRES block_size == BC
+    /// (one page per tile, asserted by the host): tile j's tokens all live
+    /// in logical block j, so the page id is a single SCALAR table load and
+    /// the pool row is affine:
+    ///   pool_row(i) = (page_j * BC + i) * n_kv_heads + kv_head
+    /// -- no per-column divi/remi and no i32 gather view in the hot loop
+    /// (the general chain, validated by bench-decode-ops' "paged gather
+    /// view probe" and mirrored by the CPU `paged_row_offset`, lives in
+    /// cutile_paged_gather.rs / kernels/src/attention.rs).  The [BC, D]
+    /// tile is gathered with `pool_row` as the sparse row index (D
+    /// contiguous elements per row) -- paging AND de-interleaving in one
+    /// primitive, replacing the 2x cutile_gather_heads + the head-major
+    /// scratch.
+    ///
+    /// `kv_len` is read from DEVICE memory (`kv_len_dev`, one i32) so a
+    /// captured graph replays correctly as the cache grows (the
+    /// kv_scatter_write device-offset pattern); `cache_offset` is derived
+    /// in-kernel as kv_len - seq_len.  The block table is rank-2 [-1, 1]
+    /// because rank-1 gather views do not JIT (bench-probe-gather
+    /// 2026-11-11).  All gather indices stay in bounds by construction:
+    /// the pool covers `max_blocks * block_size` tokens and the table maps
+    /// every block the tile loop can reach; ragged tails are handled by
+    /// the score-side kv_len mask (loads read in-bounds padding).
+    ///
+    /// BC=16 (== block_size) is the measured optimum for the GATHER path
+    /// (bench-real-model A/B 2026-11-12: 7468 vs 7265 at BC=32, 7256 at
+    /// BC=8 -- smaller tiles give the manual K-prefetch more overlap
+    /// granularity; the DENSE path preferred BC=32, gathers have
+    /// different economics).
+    ///
+    /// Grid: (n_heads * seq_pad / BR, 1, 1) -- same as
+    /// `cutile_flash_attn_heads`; `out` partitions [BR, D].
+    #[cutile::entry()]
+    pub unsafe fn cutile_flash_attn_heads_paged<const BR: i32, const BC: i32, const D: i32>(
+        out: &mut Tensor<f32, { [BR, D] }>,
+        q: &Tensor<f32, { [-1, D] }>,
+        k_pool: &Tensor<f32, { [-1, D] }>,
+        v_pool: &Tensor<f32, { [-1, D] }>,
+        block_table: &Tensor<i32, { [-1, 1] }>,
+        kv_len_dev: &Tensor<i32, { [-1] }>,
+        scale: f32,
+        seq_len: i32,
+        q_tiles_per_head: i32,
+        n_kv_heads: i32,
+        heads_per_group: i32,
+        softcap: f32,
+    ) {
+        // kv_len from device memory at EXECUTION TIME (graph-safe).
+        let kv_len_t: Tile<i32, { [1] }> = kv_len_dev.partition(shape![1]).load([0]);
+        let kv_len: i32 = tile_to_scalar(kv_len_t.reshape(shape![]));
+        let cache_offset: i32 = kv_len - seq_len;
+
+        let q_tile_global = program_id(0);
+        let head = q_tile_global / q_tiles_per_head;
+        let q_tile_idx = q_tile_global % q_tiles_per_head;
+        let kv_head = head / heads_per_group;
+
+        let part_q = q.partition(shape![BR, D]);
+        let tq: Tile<f32, { [BR, D] }> = part_q.load([q_tile_global, 0i32]);
+
+        // exp2 trick: use scale / log2 so exp2(qk * scale/log2) = exp(qk * scale).
+        let two: Tile<f32, { [] }> = constant(2.0f32, shape![]);
+        let log2: f32 = tile_to_scalar(log(two));
+        let qk_scale: Tile<f32, { [BR, BC] }> = broadcast_scalar(scale / log2, shape![BR, BC]);
+
+        // Running statistics for online softmax.
+        let mut m_i: Tile<f32, { [BR, 1] }> = constant(f32::NEG_INFINITY, shape![BR, 1]);
+        let mut l_i: Tile<f32, { [BR, 1] }> = constant(0.0f32, shape![BR, 1]);
+        let mut acc: Tile<f32, { [BR, D] }> = constant(0.0f32, shape![BR, D]);
+
+        // Gather views over the paged pools (built once, before the loop).
+        // (The block table needs no view: block_size == BC gives one page
+        // per tile, so the page id is a scalar partition load.)
+        let k_view: GatherScatterView<f32, { [BC, D] }, 0> =
+            make_gather_scatter_view(k_pool, shape![BC, D], padding::None);
+        let v_view: GatherScatterView<f32, { [BC, D] }, 0> =
+            make_gather_scatter_view(v_pool, shape![BC, D], padding::None);
+
+        // Ceil, NOT truncating division (see cutile_flash_attn_head).
+        let num_kv_tiles: i32 = ceil_div(kv_len, BC);
+
+        // Causal boundary: only process KV tiles reachable from this Q tile.
+        let last_q_row: i32 = q_tile_idx * BR + BR - 1;
+        let causal_limit_row: i32 = if last_q_row < seq_len {
+            last_q_row
+        } else {
+            seq_len - 1
+        };
+        let causal_kv_max: i32 = cache_offset + causal_limit_row;
+        let max_kv_tile: i32 = ceil_div(causal_kv_max + 1, BC);
+        let tile_count: i32 = min(num_kv_tiles, max_kv_tile);
+
+        // Precompute per-lane Q row indices (absolute, including cache offset).
+        let offs_m_iota: Tile<i32, { [BR] }> = iota(shape![BR]);
+        let offs_m_base: Tile<i32, { [BR, 1] }> =
+            broadcast_scalar(q_tile_idx * BR + cache_offset, shape![BR, 1])
+                + offs_m_iota.reshape(shape![BR, 1]);
+        let offs_m: Tile<i32, { [BR, BC] }> = offs_m_base.broadcast(shape![BR, BC]);
+
+        // KV column iota (reused across tiles; each tile adds j*BC).
+        let offs_n_iota: Tile<i32, { [BC] }> = iota(shape![BC]);
+        let offs_n_base: Tile<i32, { [BR, BC] }> =
+            offs_n_iota.reshape(shape![1, BC]).broadcast(shape![BR, BC]);
+
+        let kv_len_tile: Tile<i32, { [BR, BC] }> = broadcast_scalar(kv_len, shape![BR, BC]);
+        let mask_add_true: Tile<f32, { [BR, BC] }> = constant(0.0f32, shape![BR, BC]);
+        let mask_add_false: Tile<f32, { [BR, BC] }> = constant(f32::NEG_INFINITY, shape![BR, BC]);
+
+        // Page-resolution invariants.  block_size == BC (one page per
+        // tile, asserted by the host), so tile j's page id is a single
+        // SCALAR table load and the pool rows are affine in the column
+        // index: pool_row(i) = (page_j * BC + i) * n_kv_heads + kv_head.
+        // (No closures in the DSL -- the chain is inlined per site.)
+        let kvh_mul: Tile<i32, { [BC] }> = broadcast_scalar(n_kv_heads, shape![BC]);
+        let kvh_add: Tile<i32, { [BC] }> = broadcast_scalar(kv_head, shape![BC]);
+        let part_bt = block_table.partition(shape![1, 1]);
+
+        // Manual software pipelining: gather loads carry no automatic
+        // latency hint (load_pipelined is unavailable for gather views),
+        // so K(j+1) AND V(j+1) are prefetched before the compute of tile
+        // j -- a depth-2 extension of the cute-rs fmha_prefill ping-pong.
+        // The last iteration re-loads the final tile (j clamped) to keep
+        // the loop branch-free.
+        //
+        // tile_count >= 1 always: kv_len >= 1 and causal_kv_max >= 0, so
+        // both ceil_divs are >= 1 (see the tile_count computation above).
+        // Tile 0's page is page 0 of the table.
+        let page0_t: Tile<i32, { [1, 1] }> = part_bt.load([0i32, 0i32]);
+        let page0: i32 = tile_to_scalar(page0_t.reshape(shape![]));
+        let pool_rows0: Tile<i32, { [BC] }> =
+            (broadcast_scalar(page0 * BC, shape![BC]) + offs_n_iota) * kvh_mul + kvh_add;
+        let (k_cur, _): (Tile<f32, { [BC, D] }>, Token) = load_view_raw(
+            &k_view,
+            (pool_rows0, 0i32),
+            None,
+            ordering::Weak,
+            scope::Device,
+            tma::Disabled,
+            None,
+            [false, false],
+            shape![BC, D],
+        );
+        let mut k_cur = k_cur;
+        let (v_cur, _): (Tile<f32, { [BC, D] }>, Token) = load_view_raw(
+            &v_view,
+            (pool_rows0, 0i32),
+            None,
+            ordering::Weak,
+            scope::Device,
+            tma::Disabled,
+            None,
+            [false, false],
+            shape![BC, D],
+        );
+        let mut v_cur = v_cur;
+
+        for j in 0i32..tile_count {
+            // -- prefetch K(j+1) and V(j+1) (branch-free clamp) -----------
+            let jn: i32 = if j + 1 < tile_count { j + 1 } else { tile_count - 1 };
+            let page_n_t: Tile<i32, { [1, 1] }> = part_bt.load([jn, 0i32]);
+            let page_n: i32 = tile_to_scalar(page_n_t.reshape(shape![]));
+            let pool_rows_n: Tile<i32, { [BC] }> =
+                (broadcast_scalar(page_n * BC, shape![BC]) + offs_n_iota) * kvh_mul + kvh_add;
+            let (k_next, _): (Tile<f32, { [BC, D] }>, Token) = load_view_raw(
+                &k_view,
+                (pool_rows_n, 0i32),
+                None,
+                ordering::Weak,
+                scope::Device,
+                tma::Disabled,
+                None,
+                [false, false],
+                shape![BC, D],
+            );
+            let (v_next, _): (Tile<f32, { [BC, D] }>, Token) = load_view_raw(
+                &v_view,
+                (pool_rows_n, 0i32),
+                None,
+                ordering::Weak,
+                scope::Device,
+                tma::Disabled,
+                None,
+                [false, false],
+                shape![BC, D],
+            );
+            let tile_v = v_cur;
+
+            // S = Q @ K^T  [BR x BC]
+            let mut qk: Tile<f32, { [BR, BC] }> = constant(0.0f32, shape![BR, BC]);
+            qk = mma(tq, k_cur.transpose(), qk);
+            // Gemma-2 attention logit softcapping (see cutile_flash_attn_heads).
+            if softcap > 0.0 {
+                let scale_t: Tile<f32, { [BR, BC] }> = broadcast_scalar(scale, shape![BR, BC]);
+                let cap_t: Tile<f32, { [BR, BC] }> = broadcast_scalar(softcap, shape![BR, BC]);
+                let two_t: Tile<f32, { [BR, BC] }> = broadcast_scalar(2.0f32, shape![BR, BC]);
+                let one_t: Tile<f32, { [BR, BC] }> = broadcast_scalar(1.0f32, shape![BR, BC]);
+                let inv_log2_t: Tile<f32, { [BR, BC] }> =
+                    broadcast_scalar(1.0f32 / log2, shape![BR, BC]);
+                let s = qk * scale_t;
+                let e = exp(s * two_t / cap_t);
+                qk = cap_t * (one_t - two_t / (e + one_t));
+                qk = qk * inv_log2_t;
+            } else {
+                qk = qk * qk_scale;
+            }
+
+            // Causal mask: allow kv_col <= q_row (causal) and kv_col < kv_len (padding).
+            let offs_n: Tile<i32, { [BR, BC] }> =
+                offs_n_base + broadcast_scalar(j * BC, shape![BR, BC]);
+            let causal_mask: Tile<bool, { [BR, BC] }> = ge_tile(offs_m, offs_n);
+            let bounds_mask: Tile<bool, { [BR, BC] }> = lt_tile(offs_n, kv_len_tile);
+            let combined_mask: Tile<bool, { [BR, BC] }> = causal_mask & bounds_mask;
+            qk = qk + select(combined_mask, mask_add_true, mask_add_false);
+
+            // Online softmax update.
+            let qk_max_1d: Tile<f32, { [BR] }> = reduce_max(qk, 1);
+            let qk_max: Tile<f32, { [BR, 1] }> = qk_max_1d.reshape(shape![BR, 1]);
+            let m_ij: Tile<f32, { [BR, 1] }> = max_tile(m_i, qk_max);
+
+            // Correction factor for previously accumulated rows.
+            let alpha: Tile<f32, { [BR, 1] }> = exp2(m_i - m_ij, ftz::Disabled);
+
+            // P = exp2(S - m_new)  [BR x BC]
+            let qk_shifted: Tile<f32, { [BR, BC] }> = qk - m_ij.broadcast(shape![BR, BC]);
+            let p: Tile<f32, { [BR, BC] }> = exp2(qk_shifted, ftz::Disabled);
+
+            // Update running sum and output accumulator.
+            let l_ij_1d: Tile<f32, { [BR] }> = reduce_sum(p, 1);
+            let l_ij: Tile<f32, { [BR, 1] }> = l_ij_1d.reshape(shape![BR, 1]);
+            l_i = l_i * alpha + l_ij;
+            acc = acc * alpha.broadcast(shape![BR, D]);
+
+            acc = mma(p, tile_v, acc);
+            m_i = m_ij;
+            k_cur = k_next;
+            v_cur = v_next;
         }
 
         // Normalize: divide each row by its softmax denominator.
@@ -1341,6 +1596,150 @@ impl CutileFlashAttention {
         scratch.out_gathered = Some(out_g.clone());
 
         // -- 5. scatter: head-major -> interleaved [seq_len, q_dim] -----------
+        let (out_part, ..) = unsafe {
+            kernels::cutile_scatter_heads(
+                out_flat.partition([1, head_dim]),
+                out_g.clone(),
+                seq_pad as i32,
+            )
+            .generics(vec![head_dim.to_string()])
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+        let result = Arc::new(out_part.unpartition());
+        scratch.out_flat = Some(result.clone());
+        Ok(result)
+    }
+
+    /// Paged prefill attention -- K/V gathered from the interleaved pool
+    /// through the block table (p20), replacing the 2x
+    /// `cutile_gather_heads` + head-major scratch of
+    /// [`Self::prefill_attention_device`].  The Q gather and the output
+    /// scatter are unchanged (dropping them via scatter views is a later
+    /// step).
+    ///
+    /// `k_pool`/`v_pool` are rank-2 `[-1, head_dim]` views of the flat
+    /// interleaved caches (rows = token * n_kv_heads + kv_head; the
+    /// zero-copy `Reshape` view of `CutileKvCache`'s rank-1 tensors).
+    /// `block_table` is rank-2 `[max_blocks, 1]` (rank-1 gather views do
+    /// not JIT) and must cover `ceil(kv_len / PAGED_BLOCK_SIZE)` blocks.
+    /// `kv_len_dev` is a one-element i32 device scalar holding `kv_len`;
+    /// the kernel reads it at execution time (CUDA-graph safe) -- the
+    /// host-side `kv_len` argument is used only for validation and
+    /// scratch sizing.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::prefill_attention_device`]: the returned
+    /// tensor is written asynchronously; rely on stream ordering.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_attention_device_paged(
+        &self,
+        q_dev: &Arc<Tensor<f32>>,
+        k_pool: &Arc<Tensor<f32>>,
+        v_pool: &Arc<Tensor<f32>>,
+        block_table: &Arc<Tensor<i32>>,
+        kv_len_dev: &Arc<Tensor<i32>>,
+        seq_len: usize,
+        kv_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        stream: &Arc<Stream>,
+        scratch: &mut PrefillAttnScratch,
+    ) -> Result<Arc<Tensor<f32>>> {
+        if seq_len == 0 || kv_len == 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "prefill_attention_device_paged: empty seq_len/kv_len ({seq_len}/{kv_len})"
+            )));
+        }
+        if !n_heads.is_multiple_of(n_kv_heads) {
+            return Err(KernelError::InvalidConfig(format!(
+                "n_heads ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
+            )));
+        }
+        let expected_q = seq_len * n_heads * head_dim;
+        let got_q = q_dev.shape().iter().map(|&d| d as usize).product::<usize>();
+        if got_q < expected_q {
+            return Err(KernelError::DimensionMismatch {
+                expected: expected_q,
+                got: got_q,
+            });
+        }
+        let num_blocks_needed = kv_len.div_ceil(PAGED_BLOCK_SIZE);
+        let got_blocks = block_table.shape().iter().map(|&d| d as usize).product::<usize>();
+        if got_blocks < num_blocks_needed {
+            return Err(KernelError::InvalidConfig(format!(
+                "prefill_attention_device_paged: block table covers {got_blocks} blocks, kv_len {kv_len} needs {num_blocks_needed}"
+            )));
+        }
+
+        let seq_pad = seq_len.div_ceil(BR) * BR;
+        let q_rows = n_heads * seq_pad;
+        let q_dim = n_heads * head_dim;
+        let heads_per_group = n_heads / n_kv_heads;
+        // KV tile width for the paged kernel: MUST equal the block size
+        // (one page per tile -- the kernel's page lookup is a scalar
+        // table load under that invariant).  BC=16 is also the measured
+        // optimum for the gather path (bench-real-model A/B 2026-11-12:
+        // 7468 vs 7265 at BC=32, 7256 at BC=8 -- smaller tiles give the
+        // manual K-prefetch more overlap granularity; the DENSE path
+        // preferred BC=32, gathers have different economics).
+        let bc: usize = PAGED_BLOCK_SIZE;
+
+        // Q gather only (K/V go straight from the pool through the table).
+        let q_g = take_or_alloc(&mut scratch.q_gathered, &[q_rows, head_dim], stream)?;
+        let out_g = take_or_alloc(&mut scratch.out_gathered, &[q_rows, head_dim], stream)?;
+        let out_flat = take_or_alloc(&mut scratch.out_flat, &[seq_len, q_dim], stream)?;
+
+        let gather = |out_t: Tensor<f32>,
+                      src: &Arc<Tensor<f32>>,
+                      src_len: usize,
+                      src_heads: usize,
+                      rows_per_head: usize|
+         -> Result<Arc<Tensor<f32>>> {
+            let (part, ..) = unsafe {
+                kernels::cutile_gather_heads(
+                    out_t.partition([1, head_dim]),
+                    src.clone(),
+                    src_len as i32,
+                    src_heads as i32,
+                    rows_per_head as i32,
+                )
+                .generics(vec![head_dim.to_string()])
+                .async_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+            };
+            Ok(Arc::new(part.unpartition()))
+        };
+        let q_g = gather(q_g, q_dev, seq_len, n_heads, seq_pad)?;
+        scratch.q_gathered = Some(q_g.clone());
+
+        // -- paged flash attention: one launch, kv_len read on device -----
+        let (out_part, ..) = unsafe {
+            kernels::cutile_flash_attn_heads_paged(
+                out_g.partition([BR, head_dim]),
+                q_g.clone(),
+                k_pool.clone(),
+                v_pool.clone(),
+                block_table.clone(),
+                kv_len_dev.clone(),
+                scale,
+                seq_len as i32,
+                (seq_pad / BR) as i32,
+                n_kv_heads as i32,
+                heads_per_group as i32,
+                self.softcap,
+            )
+            .generics(vec![BR.to_string(), bc.to_string(), head_dim.to_string()])
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+        let out_g = Arc::new(out_part.unpartition());
+        scratch.out_gathered = Some(out_g.clone());
+
+        // -- scatter: head-major -> interleaved [seq_len, q_dim] -----------
         let (out_part, ..) = unsafe {
             kernels::cutile_scatter_heads(
                 out_flat.partition([1, head_dim]),
