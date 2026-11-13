@@ -10199,12 +10199,73 @@ impl CutileInferenceWrapper {
         match crate::cutile_gpu_forward::CutileGpuModel::from_quantized(qw, &self.model.config) {
             Ok(gm) => {
                 let stream = gm.stream();
-                match crate::cutile_kv_cache::CutileKvCache::new(&self.model.config, stream) {
+                // KV page pool (p20 step 4b-2): the session cache holds a
+                // run from a shared VRAM-sized pool instead of a dedicated
+                // min(max_seq_len, 4096) buffer -- the GPU context cap
+                // lifts to what free VRAM actually allows.  Sizing: a
+                // QUARTER of free VRAM (batch-graph scratch keeps the
+                // rest), at least the old 4096-token default, at most
+                // max_seq_len.  TEMPURA_KV_POOL_TOKENS overrides;
+                // TEMPURA_NO_KV_POOL=1 bisects to the dedicated buffer.
+                let kv = if std::env::var("TEMPURA_NO_KV_POOL")
+                    .as_deref()
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                {
+                    eprintln!("[cutile] KV page pool disabled (TEMPURA_NO_KV_POOL=1)");
+                    crate::cutile_kv_cache::CutileKvCache::new(&self.model.config, stream)
+                } else {
+                    let cfg = &self.model.config;
+                    let bytes_per_token = 2 * cfg.num_layers * cfg.num_kv_heads * cfg.head_dim * 4;
+                    let free = crate::cutile_gpu_forward::query_free_vram_bytes();
+                    let usable = free.saturating_sub(2 << 30) / 4;
+                    let default_tokens =
+                        (usable / bytes_per_token.max(1)).clamp(1, cfg.max_seq_len);
+                    let tokens = std::env::var("TEMPURA_KV_POOL_TOKENS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(default_tokens.max(
+                            crate::cutile_kv_cache::GPU_KV_MAX_SEQ_LEN.min(cfg.max_seq_len),
+                        ))
+                        .min(cfg.max_seq_len);
+                    match crate::cutile_kv_cache::GpuKvPagePool::new_with_dims(
+                        cfg.num_layers,
+                        cfg.num_kv_heads * cfg.head_dim,
+                        tokens
+                            .div_ceil(tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE),
+                        stream.clone(),
+                    ) {
+                        Ok(pool) => {
+                            let pool_pages =
+                                tokens.div_ceil(tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE);
+                            eprintln!(
+                                "[cutile] KV page pool: {tokens} tokens ({pool_pages} pages, \
+                                 {:.2} GiB; free was {:.1} GiB) -- GPU context cap lifted",
+                                (pool_pages * 16 * bytes_per_token / 16) as f64
+                                    / (1 << 30) as f64,
+                                free as f64 / (1 << 30) as f64,
+                            );
+                            crate::cutile_kv_cache::CutileKvCache::new_pooled(
+                                &self.model.config,
+                                std::sync::Arc::new(std::sync::Mutex::new(pool)),
+                                tokens.min(512), // initial run; grows on demand
+                                stream,
+                            )
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[cutile] KV page pool creation failed ({e}); dedicated fallback"
+                            );
+                            crate::cutile_kv_cache::CutileKvCache::new(&self.model.config, stream)
+                        }
+                    }
+                };
+                match kv {
                     Ok(kv) => {
                         eprintln!(
-                            "[cutile] GPU KV cache allocated ({} layers x {} tokens x {} kv_dim)",
+                            "[cutile] GPU KV cache allocated ({} layers x {} tokens cap x {} kv_dim)",
                             self.model.config.num_layers,
-                            self.model.config.max_seq_len,
+                            kv.gpu_capacity_tokens(),
                             self.model.config.num_kv_heads * self.model.config.head_dim,
                         );
                         self.gpu_kv_cache = Some(std::sync::Mutex::new(kv));

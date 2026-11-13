@@ -51,6 +51,24 @@ pub struct CutileKvCache {
     /// last `sync_host_from_device`.  Signals that the host mirror is stale for
     /// the tokens appended without a D->H update.
     host_stale: bool,
+    /// SHARED page pool (p20 step 4b-2): when set, this cache holds a
+    /// CONTIGUOUS RUN of `run_pages` pages starting at `base_page`
+    /// inside the pool (k_device/v_device point at the POOL tensors),
+    /// grown on demand with headroom via extend-in-place-or-realloc.
+    /// `None` = dedicated buffers (all pre-pool behavior, base 0).
+    ///
+    /// SINGLE-CLIENT INVARIANT: the wired configuration (one shared
+    /// session cache per pool) keeps `base_page == 0` structurally --
+    /// `kv_device_tensors`/`paged_attn_inputs` debug_assert it.  Adding a
+    /// second client (concurrent sessions / GPU batch decode) requires
+    /// making the raw-pointer call sites base-offset aware (the ~25
+    /// uniform `kv_device_tensors(...).device_pointer()` extractions --
+    /// see the 4b-2 notes in AGENTS.md).
+    pool: Option<Arc<std::sync::Mutex<GpuKvPagePool>>>,
+    base_page: usize,
+    run_pages: usize,
+    /// Bumped on every capacity change (see [`Self::capacity_gen`]).
+    capacity_gen: usize,
     /// Identity block table for the paged attention kernel, rank-2
     /// [max_blocks, 1] (rank-1 gather views do not JIT -- see
     /// cutile_flash_attn_heads_paged).  The GPU pool is contiguous, so
@@ -117,7 +135,152 @@ impl CutileKvCache {
             host_stale: false,
             block_table_dev: None,
             kv_len_dev: None,
+            pool: None,
+            base_page: 0,
+            run_pages: 0,
+            capacity_gen: 0,
         })
+    }
+
+    /// Pooled mode: hold a run of `initial_tokens` (rounded up to pages,
+    /// with growth headroom) from a shared [`GpuKvPagePool`].
+    ///
+    /// `k_device`/`v_device` point at the pool tensors; `gpu_max_seq_len`
+    /// is the RUN capacity and grows via [`Self::ensure_capacity`].  The
+    /// host mirrors stay at `max_seq_len` (unchanged semantics).  See the
+    /// `pool` field docs for the single-client base-0 invariant.
+    pub fn new_pooled(
+        config: &ModelConfig,
+        pool: Arc<std::sync::Mutex<GpuKvPagePool>>,
+        initial_tokens: usize,
+        stream: Arc<Stream>,
+    ) -> Result<Self, KernelError> {
+        let kv_dim = config.num_kv_heads * config.head_dim;
+        let layer_size = config.max_seq_len * kv_dim;
+        let k_host = (0..config.num_layers)
+            .map(|_| vec![0.0f32; layer_size])
+            .collect();
+        let v_host = (0..config.num_layers)
+            .map(|_| vec![0.0f32; layer_size])
+            .collect();
+
+        let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
+        let need_pages = initial_tokens.div_ceil(block_size);
+        // Growth headroom: at least +256 tokens so a fresh sequence does
+        // not realloc on its second chunk.
+        let alloc_pages = need_pages.max(initial_tokens.div_ceil(block_size) + 16);
+        let (base_page, run_pages, k_device, v_device, gpu_max_seq_len) = {
+            let mut p = pool
+                .lock()
+                .map_err(|_| KernelError::InvalidConfig("pool mutex poisoned".into()))?;
+            let run = p
+                .alloc_pages(alloc_pages)
+                .ok_or_else(|| KernelError::InvalidConfig("KV pool exhausted".into()))?;
+            let k_device = p.k_pool_tensors();
+            let v_device = p.v_pool_tensors();
+            (run.start, run.pages, k_device, v_device, run.pages * block_size)
+        };
+
+        Ok(Self {
+            k_host,
+            v_host,
+            seq_len: 0,
+            n_layers: config.num_layers,
+            kv_dim,
+            max_seq_len: config.max_seq_len,
+            stream,
+            k_device,
+            v_device,
+            gpu_max_seq_len,
+            host_stale: false,
+            block_table_dev: None,
+            kv_len_dev: None,
+            pool: Some(pool),
+            base_page,
+            run_pages,
+            capacity_gen: 0,
+        })
+    }
+
+    /// Byte offset of the run's token 0 within the pool tensors (0 in
+    /// dedicated mode).
+    fn kv_base_byte_offset(&self) -> u64 {
+        let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
+        (self.base_page * block_size * self.kv_dim) as u64 * std::mem::size_of::<f32>() as u64
+    }
+
+    /// Grow the run to hold at least `tokens` tokens (pooled mode only).
+    ///
+    /// Extends in place when the adjacent pages are free (keeps baked
+    /// CUDA-graph pointers stable); otherwise reallocates (D2D copy of
+    /// the live prefix per layer, free the old run -- callers' captured
+    /// graphs detect the pointer change and re-capture).  Growth uses a
+    /// 2x factor to amortize.
+    pub fn ensure_capacity(&mut self, tokens: usize) -> Result<(), KernelError> {
+        let Some(pool_arc) = self.pool.clone() else {
+            return Ok(());
+        };
+        let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
+        let need_pages = tokens.div_ceil(block_size);
+        if need_pages <= self.run_pages {
+            return Ok(());
+        }
+        let mut pool = pool_arc
+            .lock()
+            .map_err(|_| KernelError::InvalidConfig("pool mutex poisoned".into()))?;
+        // Headroom: 2x the current run, at least +256 tokens.
+        let target_pages = need_pages
+            .max(self.run_pages * 2)
+            .max(need_pages + 256 / block_size);
+        if pool.try_extend_run(self.base_page, self.run_pages, target_pages) {
+            self.run_pages = target_pages;
+            self.gpu_max_seq_len = target_pages * block_size;
+            self.capacity_gen += 1;
+            // The cached block table covers the OLD capacity (it is
+            // built lazily from gpu_max_seq_len at first use) -- drop
+            // it so the next paged attention call rebuilds it at the
+            // new size.  (Found by long-ctx ppl: the stale 48-entry
+            // table made the kernel read OOB page ids -> ppl 2718.)
+            self.block_table_dev = None;
+            return Ok(());
+        }
+        // Reallocate: alloc a bigger run, copy the live prefix, free old.
+        let new_run = pool
+            .alloc_pages(target_pages)
+            .ok_or_else(|| KernelError::InvalidConfig("KV pool exhausted on growth".into()))?;
+        let old_base = self.base_page;
+        let f32_bytes = std::mem::size_of::<f32>() as u64;
+        let live_elems = self.seq_len * self.kv_dim;
+        for layer in 0..self.n_layers {
+            let k_src = self.k_device[layer].device_pointer().cu_deviceptr()
+                + (old_base * block_size * self.kv_dim) as u64 * f32_bytes;
+            let v_src = self.v_device[layer].device_pointer().cu_deviceptr()
+                + (old_base * block_size * self.kv_dim) as u64 * f32_bytes;
+            let k_dst = self.k_device[layer].device_pointer().cu_deviceptr()
+                + (new_run.start * block_size * self.kv_dim) as u64 * f32_bytes;
+            let v_dst = self.v_device[layer].device_pointer().cu_deviceptr()
+                + (new_run.start * block_size * self.kv_dim) as u64 * f32_bytes;
+            if live_elems > 0 {
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(k_dst, k_src, live_elems, &self.stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+                    cuda_core::memcpy_dtod_async::<f32>(v_dst, v_src, live_elems, &self.stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+                }
+            }
+        }
+        pool.free_pages_alloc(crate::gpu_page_pool::Run {
+            start: old_base,
+            pages: self.run_pages,
+        });
+        self.base_page = new_run.start;
+        self.run_pages = new_run.pages;
+        self.gpu_max_seq_len = new_run.pages * block_size;
+        self.capacity_gen += 1;
+        // The block table contents changed (new base) -- drop the cached
+        // device table so the next paged attention call rebuilds it.
+        self.block_table_dev = None;
+        Ok(())
     }
 
     pub fn seq_len(&self) -> usize {
@@ -131,7 +294,22 @@ impl CutileKvCache {
     /// Returns `true` if the GPU-resident KV cache is available and has capacity
     /// for the current sequence position.
     pub fn has_device_kv(&self) -> bool {
-        self.gpu_max_seq_len > 0 && self.seq_len < self.gpu_max_seq_len
+        match &self.pool {
+            None => self.gpu_max_seq_len > 0 && self.seq_len < self.gpu_max_seq_len,
+            // Pooled: the run can grow into free pool pages (the growth
+            // happens inside the append; this gate must see the POTENTIAL,
+            // not the current run size -- found via long-ctx ppl 2026-11-12:
+            // the initial 768-token run made every long prefill fall to the
+            // host-staged path before any growth could happen).
+            Some(pool) => match pool.lock() {
+                Ok(p) => {
+                    self.seq_len < self.gpu_max_seq_len
+                        || p.free_pages() > 0
+                        || p.allocated_pages() == 0
+                }
+                Err(_) => false,
+            },
+        }
     }
 
     /// Returns `true` if `append_device_gpu_only` can accept `n` new tokens
@@ -139,7 +317,20 @@ impl CutileKvCache {
     /// (which only guarantees room for one more token), this covers multi-
     /// token prefill chunks.
     pub fn can_append_device(&self, n: usize) -> bool {
-        self.gpu_max_seq_len > 0 && self.seq_len + n <= self.gpu_max_seq_len
+        match &self.pool {
+            None => self.gpu_max_seq_len > 0 && self.seq_len + n <= self.gpu_max_seq_len,
+            // Pooled: growable while the pool has (or can free) enough
+            // pages for the post-append length.
+            Some(pool) => match pool.lock() {
+                Ok(p) => {
+                    let block_size =
+                        tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
+                    let need_pages = (self.seq_len + n).div_ceil(block_size);
+                    need_pages <= self.run_pages + p.free_pages()
+                }
+                Err(_) => false,
+            },
+        }
     }
 
     /// Write `num_new_tokens` K/V rows into the host mirror at the current
@@ -196,6 +387,10 @@ impl CutileKvCache {
         // GPU D->D: copy k_new/v_new into the flat GPU cache at the current
         // sequence offset.  One copy per K and one per V (not per head).
         // The GPU layout matches the host: [seq, kv_dim] interleaved.
+        // Pooled mode grows the run instead of silently skipping.
+        if self.pool.is_some() {
+            self.ensure_capacity(self.seq_len + num_new_tokens)?;
+        }
         if self.seq_len + num_new_tokens > self.gpu_max_seq_len {
             return Ok(());
         }
@@ -203,14 +398,17 @@ impl CutileKvCache {
         let num_elems = num_new_tokens * self.kv_dim;
         let offset_elems = self.seq_len * self.kv_dim;
         let f32_bytes = std::mem::size_of::<f32>() as u64;
+        let base_off = self.kv_base_byte_offset();
 
         let k_src: CUdeviceptr = k_new.device_pointer().cu_deviceptr();
         let v_src: CUdeviceptr = v_new.device_pointer().cu_deviceptr();
 
-        let k_dst: CUdeviceptr =
-            self.k_device[layer].device_pointer().cu_deviceptr() + offset_elems as u64 * f32_bytes;
-        let v_dst: CUdeviceptr =
-            self.v_device[layer].device_pointer().cu_deviceptr() + offset_elems as u64 * f32_bytes;
+        let k_dst: CUdeviceptr = self.k_device[layer].device_pointer().cu_deviceptr()
+            + base_off
+            + offset_elems as u64 * f32_bytes;
+        let v_dst: CUdeviceptr = self.v_device[layer].device_pointer().cu_deviceptr()
+            + base_off
+            + offset_elems as u64 * f32_bytes;
 
         unsafe {
             cuda_core::memcpy_dtod_async::<f32>(k_dst, k_src, num_elems, &self.stream)
@@ -246,6 +444,10 @@ impl CutileKvCache {
     ) -> Result<(), KernelError> {
         use cuda_core::sys::CUdeviceptr;
 
+        // Pooled mode grows the run instead of silently skipping.
+        if self.pool.is_some() {
+            self.ensure_capacity(self.seq_len + num_new_tokens)?;
+        }
         if self.seq_len + num_new_tokens > self.gpu_max_seq_len {
             return Ok(());
         }
@@ -253,14 +455,17 @@ impl CutileKvCache {
         let num_elems = num_new_tokens * self.kv_dim;
         let offset_elems = self.seq_len * self.kv_dim;
         let f32_bytes = std::mem::size_of::<f32>() as u64;
+        let base_off = self.kv_base_byte_offset();
 
         let k_src: CUdeviceptr = k_new.device_pointer().cu_deviceptr();
         let v_src: CUdeviceptr = v_new.device_pointer().cu_deviceptr();
 
-        let k_dst: CUdeviceptr =
-            self.k_device[layer].device_pointer().cu_deviceptr() + offset_elems as u64 * f32_bytes;
-        let v_dst: CUdeviceptr =
-            self.v_device[layer].device_pointer().cu_deviceptr() + offset_elems as u64 * f32_bytes;
+        let k_dst: CUdeviceptr = self.k_device[layer].device_pointer().cu_deviceptr()
+            + base_off
+            + offset_elems as u64 * f32_bytes;
+        let v_dst: CUdeviceptr = self.v_device[layer].device_pointer().cu_deviceptr()
+            + base_off
+            + offset_elems as u64 * f32_bytes;
 
         unsafe {
             cuda_core::memcpy_dtod_async::<f32>(k_dst, k_src, num_elems, &self.stream)
@@ -283,20 +488,42 @@ impl CutileKvCache {
         if kv_len == 0 || kv_len > self.gpu_max_seq_len {
             return Ok(());
         }
+        let base_off = self.kv_base_byte_offset();
+        let f32_bytes = std::mem::size_of::<f32>() as u64;
         for layer in 0..self.n_layers {
-            let k_host: Vec<f32> = self.k_device[layer]
-                .clone()
-                .to_host_vec()
-                .sync_on(&self.stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-            let v_host: Vec<f32> = self.v_device[layer]
-                .clone()
-                .to_host_vec()
-                .sync_on(&self.stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-            self.k_host[layer][..len].copy_from_slice(&k_host[..len]);
-            self.v_host[layer][..len].copy_from_slice(&v_host[..len]);
+            // Offset D2H (raw memcpy): pooled mode must NOT download the
+            // whole pool tensor (to_host_vec) -- the pool can be tens of
+            // GB while the live prefix is small.
+            let k_src = self.k_device[layer].device_pointer().cu_deviceptr() + base_off;
+            let v_src = self.v_device[layer].device_pointer().cu_deviceptr() + base_off;
+            unsafe {
+                let rc = cuda_core::sys::cuMemcpyDtoHAsync_v2(
+                    self.k_host[layer].as_mut_ptr() as *mut _,
+                    k_src,
+                    len * f32_bytes as usize,
+                    self.stream.cu_stream(),
+                );
+                if rc != 0 {
+                    return Err(KernelError::InvalidConfig(format!(
+                        "sync_host k D2H rc={rc}"
+                    )));
+                }
+                let rc = cuda_core::sys::cuMemcpyDtoHAsync_v2(
+                    self.v_host[layer].as_mut_ptr() as *mut _,
+                    v_src,
+                    len * f32_bytes as usize,
+                    self.stream.cu_stream(),
+                );
+                if rc != 0 {
+                    return Err(KernelError::InvalidConfig(format!(
+                        "sync_host v D2H rc={rc}"
+                    )));
+                }
+            }
         }
+        self.stream
+            .synchronize()
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
         self.host_stale = false;
         Ok(())
     }
@@ -376,6 +603,11 @@ impl CutileKvCache {
     /// `[token, kv_head, head_dim]` layout.  Only the first `seq_len * kv_dim`
     /// elements are valid; the rest are zero-initialised.
     pub fn kv_device_tensors(&self, layer: usize) -> (Arc<Tensor<f32>>, Arc<Tensor<f32>>) {
+        // Single-client invariant (see the `pool` field docs): pooled
+        // tensors are handed out only while the run sits at pool base.
+        // A second pool client must make the raw-pointer call sites
+        // base-offset aware first.
+        debug_assert!(self.pool.is_none() || self.base_page == 0);
         (
             Arc::clone(&self.k_device[layer]),
             Arc::clone(&self.v_device[layer]),
@@ -414,7 +646,17 @@ impl CutileKvCache {
                 self.kv_dim
             )));
         }
-        let rows = self.gpu_max_seq_len * self.kv_dim / head_dim;
+        // Single-client invariant (see the `pool` field docs): the
+        // identity table is only valid while the run sits at pool base.
+        debug_assert!(self.pool.is_none() || self.base_page == 0);
+        // View rows from the TENSOR's actual element count: in pooled
+        // mode the tensor is the whole pool (bigger than the run).
+        let tensor_elems = self.k_device[layer]
+            .shape()
+            .iter()
+            .map(|&d| d as usize)
+            .product::<usize>();
+        let rows = tensor_elems / head_dim;
         let k_pool = self.k_device[layer]
             .reshape(&[rows, head_dim])
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
@@ -463,6 +705,18 @@ impl CutileKvCache {
 
     pub fn gpu_max_seq_len(&self) -> usize {
         self.gpu_max_seq_len
+    }
+
+    /// Token capacity of the (possibly pooled) GPU cache.
+    pub fn gpu_capacity_tokens(&self) -> usize {
+        self.gpu_max_seq_len
+    }
+
+    /// Monotonic generation counter, bumped on every capacity change
+    /// (pooled growth).  Captured CUDA graphs compare it to detect
+    /// in-place growth that pointer validation cannot see.
+    pub fn capacity_gen(&self) -> usize {
+        self.capacity_gen
     }
 
     pub fn kv_dim(&self) -> usize {
@@ -749,6 +1003,34 @@ impl GpuKvPagePool {
 
     pub fn allocated_pages(&self) -> usize {
         self.alloc.allocated_pages()
+    }
+
+    /// Allocate `pages` contiguous pages (raw allocator access).
+    pub fn alloc_pages(
+        &mut self,
+        pages: usize,
+    ) -> Option<crate::gpu_page_pool::Run> {
+        self.alloc.alloc(pages)
+    }
+
+    /// Free a raw run (coalescing).
+    pub fn free_pages_alloc(&mut self, run: crate::gpu_page_pool::Run) {
+        self.alloc.free(run);
+    }
+
+    /// Extend the run `[start, start+pages)` to `target_pages` in place
+    /// when the adjacent pages are free.
+    pub fn try_extend_run(&mut self, start: usize, pages: usize, target_pages: usize) -> bool {
+        self.alloc.try_extend(start, pages, target_pages)
+    }
+
+    /// Per-layer pool tensors (Arc clones; the whole pool, NOT the run).
+    pub fn k_pool_tensors(&self) -> Vec<Arc<Tensor<f32>>> {
+        self.k_pools.clone()
+    }
+
+    pub fn v_pool_tensors(&self) -> Vec<Arc<Tensor<f32>>> {
+        self.v_pools.clone()
     }
 
     pub fn total_pages(&self) -> usize {

@@ -641,7 +641,51 @@ typical-p/repeat/presence/frequency)
       transparently.  sync_host_from_device must become base-offset
       aware (offset D2H, not whole-pool to_host_vec).  Gate:
       bench-batch (the batch fingerprints) + bench-real-model +
-      bench-decode-ops after the wiring. Baselines:
+      bench-decode-ops after the wiring.
+      STEP 4b-2 DONE (2026-11-13): the pool is wired into PRODUCTION --
+      CutileInferenceWrapper's shared session cache now holds a run from
+      a VRAM-sized GpuKvPagePool (quarter of free VRAM, >= the old
+      4096-token default; TEMPURA_KV_POOL_TOKENS override,
+      TEMPURA_NO_KV_POOL=1 bisect).  CutileKvCache pooled mode:
+      new_pooled, ensure_capacity (extend-in-place via allocator
+      try_extend, else realloc-with-D2D-copy; 2x growth headroom),
+      base-offset appends, offset-D2H host sync (whole-pool to_host_vec
+      would be catastrophic), growth-aware capacity gates.  THE GPU
+      CONTEXT CAP IS LIFTED: Llama-8B now runs 20k-token contexts on
+      GPU (was 4096) -- validated ppl 6.92@512 / 8.1681@4096
+      (bit-identical to the dedicated no-pool path) / 7.0569@8192 (MORE
+      context = better ppl, as expected); real-model 7757 pp128 / 219
+      decode det=OK identical fingerprint; bench-quality 90.6% PASS.
+      THE BUG HUNT (three bugs, all found by ppl@8192 = 2716 garbage):
+      (1) block_table_dev staleness on growth -- the lazily-built table
+      snapshots the capacity at first use; growth must invalidate it
+      (fixed; defensive -- the gate bug below meant the table path
+      wasn't even live in the failing runs, which is why the fix was
+      bit-identical no-op); (2) the capacity GATES
+      (can_append_device/has_device_kv) check the CURRENT run size, not
+      the growth POTENTIAL -- a 4096-token single forward against the
+      initial 768-token run fell to host-staged paths before any
+      growth could happen (fixed: pooled gates consult pool free
+      pages); DecodeGraph gained captured_capacity_gen because
+      extend-in-place keeps pointers while outgrowing capture-time
+      scratch; (3) THE ACTUAL KILLER, PRE-EXISTING: the RoPE cos/sin
+      table was precomputed to max_seq_len.min(4096) -- positions
+      >= 4096 read past the table -> garbage rotations.  The prefill
+      half of a ppl chunk ends at exactly position 4095; every scored
+      decode position >= 4096 was rotated with garbage.  Latent since
+      the GPU paths were built (nothing ran past 4096 before the cap
+      lift); fixed by precomputing the FULL context (~67MB VRAM at
+      131k).  Also added: oxide decode attn long-kv regression
+      (bench-decode-ops, kv 4097/8192 bit-exact -- the kernels were
+      never the problem).  DIAGNOSTIC PLAYBOOK THAT WORKED: the ppl
+      bisect matrix (pool@512 / no-pool@4096 / pool@4096) cleared the
+      pool in three runs; the kernel-level long-kv test cleared the
+      kernels; the position-4095 boundary in the ppl chunking pointed
+      at position-indexed tables.  REMAINING under 4b: multi-client
+      adoption (concurrent sessions / GPU batch decode on one pool --
+      the base-0 single-client invariant must be lifted, ~25 raw-
+      pointer sites, recorded design notes above), prefix sharing/
+      eviction. Baselines:
       prefill PARITY at pp128 (7525 paged vs 7555 gather, 2026-11-12;
       the 2026-10-29 7700 baseline reads ~7555 on current hw/cuda-oxide
       state), decode ITL unchanged, gather/scatter kernels: ALL GONE

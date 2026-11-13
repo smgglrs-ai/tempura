@@ -1663,6 +1663,45 @@ fn main() {
         let attn_gpu2 = download(&attn_out2, &stream);
         all_ok &= report("oxide decode attention (kpar)", &attn_gpu2, &attn_cpu);
 
+        // Long-KV regression (found 2026-11-12: ppl garbage at ctx 8192 --
+        // decode past the pre-pool 4096 cap had NEVER run on GPU; this is
+        // the direct kernel-level check at the new territory).
+        for long_kv in [4097usize, 8192usize] {
+            let k_cache_l: Vec<f32> = prng_data(long_kv * kv_dim, 121);
+            let v_cache_l: Vec<f32> = prng_data(long_kv * kv_dim, 122);
+            let k_dev_l = upload(k_cache_l.clone(), &stream);
+            let v_dev_l = upload(v_cache_l.clone(), &stream);
+            let kv_len_dev_l = upload(vec![f32::from_bits(long_kv as u32)], &stream);
+            let cpu_l =
+                cpu_gqa_attention(&q_attn, &k_cache_l, &v_cache_l, long_kv, scale);
+
+            let out_s = upload(vec![0.0; N_HEADS * HEAD_DIM], &stream);
+            oda.forward_splitk_d2d(
+                &out_s, &q_attn_dev, &k_dev_l, &v_dev_l, &kv_len_dev_l,
+                &splitk_scratch, N_HEADS, N_KV_HEADS, HEAD_DIM, scale,
+            )
+            .expect("splitk long-kv attention failed");
+            let gpu_s = download(&out_s, &stream);
+            all_ok &= report(
+                &format!("oxide decode attn splitk kv={long_kv}"),
+                &gpu_s,
+                &cpu_l,
+            );
+
+            let out_k = upload(vec![0.0; N_HEADS * HEAD_DIM], &stream);
+            oda.forward_kpar_d2d(
+                &out_k, &q_attn_dev, &k_dev_l, &v_dev_l, &kv_len_dev_l,
+                N_HEADS, N_KV_HEADS, HEAD_DIM, scale,
+            )
+            .expect("kpar long-kv attention failed");
+            let gpu_k = download(&out_k, &stream);
+            all_ok &= report(
+                &format!("oxide decode attn kpar kv={long_kv}"),
+                &gpu_k,
+                &cpu_l,
+            );
+        }
+
         // ---- 6b. Attention with a PRODUCTION-sized dirty cache ----
         // Production caches are [4096 rows] with stale garbage beyond kv_len;
         // the isolated test above used an exactly-sized cache. If a kernel

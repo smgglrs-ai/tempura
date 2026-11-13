@@ -183,6 +183,38 @@ impl PageRunAllocator {
     pub fn free_runs(&self) -> &[Run] {
         &self.free[..self.free_len]
     }
+
+    /// Extend the run `[start, start + pages)` to `target_pages` pages IN
+    /// PLACE if the pages immediately after it are free (growth without
+    /// reallocation -- keeps baked CUDA-graph pointers stable).  Returns
+    /// `true` on success (including the trivial already-big-enough case).
+    pub fn try_extend(&mut self, start: usize, pages: usize, target_pages: usize) -> bool {
+        if target_pages <= pages {
+            return true;
+        }
+        let extra = target_pages - pages;
+        let end = start + pages;
+        let mut i = 0;
+        while i < self.free_len {
+            if self.free[i].start == end && self.free[i].pages >= extra {
+                // Absorb `extra` pages from the front of this free run.
+                let remainder = self.free[i].pages - extra;
+                if remainder == 0 {
+                    self.free[i] = self.free[self.free_len - 1];
+                    self.free_len -= 1;
+                } else {
+                    self.free[i] = Run {
+                        start: end + extra,
+                        pages: remainder,
+                    };
+                }
+                self.allocated += extra;
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +273,25 @@ mod tests {
         let mut a = PageRunAllocator::new(10);
         assert!(a.alloc(11).is_none());
         assert_eq!(a.free_pages(), 10);
+    }
+
+    #[test]
+    fn try_extend_in_place_when_adjacent_free() {
+        let mut a = PageRunAllocator::new(32);
+        let r0 = a.alloc(8).unwrap(); // [0,8)
+        let r1 = a.alloc(8).unwrap(); // [8,16) blocks extension
+        assert!(!a.try_extend(r0.start, r0.pages, 12));
+        // Free the blocker: extension now succeeds in place.
+        a.free(r1);
+        assert!(a.try_extend(r0.start, r0.pages, 12));
+        assert_eq!(a.allocated_pages(), 12);
+        assert_eq!(a.free_pages(), 20);
+        // The extended run [0,12) stays allocated.  Freeing r1 coalesced
+        // with the tail into one [8,32) run; the extension consumed
+        // [8,12), so a fresh 16-page alloc lands at [12,28) -- disjoint.
+        let r2 = a.alloc(16).unwrap();
+        assert_eq!(r2.start, 12);
+        assert_eq!(a.free_pages(), 4);
     }
 }
 
