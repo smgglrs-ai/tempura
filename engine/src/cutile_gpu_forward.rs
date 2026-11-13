@@ -728,6 +728,11 @@ struct BatchDecodeGraph {
     /// the graph is invalidated and re-captured on the next call.
     captured_k_ptrs: Vec<Vec<u64>>,
     captured_v_ptrs: Vec<Vec<u64>>,
+    /// Per-seq KV capacity generations at capture time (p20 4b-3):
+    /// pooled runs GROW in place -- same pointers, bigger run -- which
+    /// outgrows the scratch/grid baked at capture.  Pointer validation
+    /// cannot see it; the generation can.
+    captured_capacity_gens: Vec<usize>,
 }
 
 impl Drop for BatchDecodeGraph {
@@ -8315,11 +8320,11 @@ impl CutileGpuModel {
             // kernel nodes at capture time. They remain valid as long as the SAME KV
             // cache objects are used (checked by the pointer validation in the outer wrapper).
             for r in 0..m {
-                let (k_cache, v_cache) = kv_caches[r].kv_device_tensors(layer);
+                let (k_base, v_base) = kv_caches[r].kv_device_base_ptrs(layer);
                 self.kv_scatter_write
                     .copy_with_device_offset(
                         self.batch_k_rot[r].device_pointer().cu_deviceptr(),
-                        k_cache.device_pointer().cu_deviceptr(),
+                        k_base,
                         write_off_ptr,
                         kv_dim_u32,
                         cu_stream,
@@ -8328,7 +8333,7 @@ impl CutileGpuModel {
                 self.kv_scatter_write
                     .copy_with_device_offset(
                         self.batch_v_seqs[r].device_pointer().cu_deviceptr(),
-                        v_cache.device_pointer().cu_deviceptr(),
+                        v_base,
                         write_off_ptr,
                         kv_dim_u32,
                         cu_stream,
@@ -8403,14 +8408,14 @@ impl CutileGpuModel {
 
             if !used_batch_attn {
                 for r in 0..m {
-                    let (k_full, v_full) = kv_caches[r].kv_device_tensors(layer);
+                    let (k_base, v_base) = kv_caches[r].kv_device_base_ptrs(layer);
                     if let Some(ref oda) = self.oxide_decode_attn {
                         let attn_out = &self.batch_attn_out[r];
-                        oda.forward_kpar_d2d(
+                        oda.forward_kpar_d2d_ptrs(
                             attn_out,
                             &self.batch_q_rot[r],
-                            &k_full,
-                            &v_full,
+                            k_base,
+                            v_base,
                             &self.d_kv_len,
                             n_heads,
                             n_kv_heads,
@@ -8419,6 +8424,9 @@ impl CutileGpuModel {
                         )
                         .expect("batch inner: kpar attention");
                     } else {
+                        // cuTile fallback: whole-tensor pointers (see the
+                        // pooled-run limitation note at the other fallback).
+                        let (k_full, v_full) = kv_caches[r].kv_device_tensors(layer);
                         let attn_out = &self.batch_attn_out[r];
                         let _ = self
                             .flash_attn
@@ -8997,11 +9005,12 @@ impl CutileGpuModel {
                     } else {
                         !(0..cfg.num_layers).all(|l| {
                             (0..m).all(|r| {
-                                let (k, v) = kv_caches[r].kv_device_tensors(l);
-                                k.device_pointer().cu_deviceptr() == dg.captured_k_ptrs[l][r]
-                                    && v.device_pointer().cu_deviceptr() == dg.captured_v_ptrs[l][r]
+                                let (k, v) = kv_caches[r].kv_device_base_ptrs(l);
+                                k == dg.captured_k_ptrs[l][r]
+                                    && v == dg.captured_v_ptrs[l][r]
                             })
-                        })
+                        }) || (0..m).any(|r| kv_caches[r].capacity_gen()
+                            != dg.captured_capacity_gens[r])
                     }
                 }
                 None => false,
@@ -9030,20 +9039,12 @@ impl CutileGpuModel {
                 for l in 0..cfg.num_layers {
                     let k_ptrs: Vec<u64> = (0..m)
                         .map(|r| {
-                            kv_caches[r]
-                                .kv_device_tensors(l)
-                                .0
-                                .device_pointer()
-                                .cu_deviceptr()
+                            kv_caches[r].kv_device_base_ptrs(l).0
                         })
                         .collect();
                     let v_ptrs: Vec<u64> = (0..m)
                         .map(|r| {
-                            kv_caches[r]
-                                .kv_device_tensors(l)
-                                .1
-                                .device_pointer()
-                                .cu_deviceptr()
+                            kv_caches[r].kv_device_base_ptrs(l).1
                         })
                         .collect();
                     unsafe {
@@ -9135,11 +9136,7 @@ impl CutileGpuModel {
                 .map(|l| {
                     (0..m)
                         .map(|r| {
-                            kv_caches[r]
-                                .kv_device_tensors(l)
-                                .0
-                                .device_pointer()
-                                .cu_deviceptr()
+                            kv_caches[r].kv_device_base_ptrs(l).0
                         })
                         .collect()
                 })
@@ -9148,16 +9145,14 @@ impl CutileGpuModel {
                 .map(|l| {
                     (0..m)
                         .map(|r| {
-                            kv_caches[r]
-                                .kv_device_tensors(l)
-                                .1
-                                .device_pointer()
-                                .cu_deviceptr()
+                            kv_caches[r].kv_device_base_ptrs(l).1
                         })
                         .collect()
                 })
                 .collect();
 
+            let captured_capacity_gens: Vec<usize> =
+                (0..m).map(|r| kv_caches[r].capacity_gen()).collect();
             *graph_cache = Some(BatchDecodeGraph {
                 cu_exec,
                 cu_graph,
@@ -9165,6 +9160,7 @@ impl CutileGpuModel {
                 m,
                 captured_k_ptrs,
                 captured_v_ptrs,
+                captured_capacity_gens,
             });
 
             unsafe {
@@ -9344,11 +9340,12 @@ impl CutileGpuModel {
                     } else {
                         !(0..cfg.num_layers).all(|l| {
                             (0..m).all(|r| {
-                                let (k, v) = kv_caches[r].kv_device_tensors(l);
-                                k.device_pointer().cu_deviceptr() == dg.captured_k_ptrs[l][r]
-                                    && v.device_pointer().cu_deviceptr() == dg.captured_v_ptrs[l][r]
+                                let (k, v) = kv_caches[r].kv_device_base_ptrs(l);
+                                k == dg.captured_k_ptrs[l][r]
+                                    && v == dg.captured_v_ptrs[l][r]
                             })
-                        })
+                        }) || (0..m).any(|r| kv_caches[r].capacity_gen()
+                            != dg.captured_capacity_gens[r])
                     }
                 }
                 None => false,
@@ -9380,20 +9377,12 @@ impl CutileGpuModel {
                 for l in 0..cfg.num_layers {
                     let k_ptrs: Vec<u64> = (0..m)
                         .map(|r| {
-                            kv_caches[r]
-                                .kv_device_tensors(l)
-                                .0
-                                .device_pointer()
-                                .cu_deviceptr()
+                            kv_caches[r].kv_device_base_ptrs(l).0
                         })
                         .collect();
                     let v_ptrs: Vec<u64> = (0..m)
                         .map(|r| {
-                            kv_caches[r]
-                                .kv_device_tensors(l)
-                                .1
-                                .device_pointer()
-                                .cu_deviceptr()
+                            kv_caches[r].kv_device_base_ptrs(l).1
                         })
                         .collect();
                     unsafe {
@@ -9484,11 +9473,7 @@ impl CutileGpuModel {
                 .map(|l| {
                     (0..m)
                         .map(|r| {
-                            kv_caches[r]
-                                .kv_device_tensors(l)
-                                .0
-                                .device_pointer()
-                                .cu_deviceptr()
+                            kv_caches[r].kv_device_base_ptrs(l).0
                         })
                         .collect()
                 })
@@ -9497,16 +9482,14 @@ impl CutileGpuModel {
                 .map(|l| {
                     (0..m)
                         .map(|r| {
-                            kv_caches[r]
-                                .kv_device_tensors(l)
-                                .1
-                                .device_pointer()
-                                .cu_deviceptr()
+                            kv_caches[r].kv_device_base_ptrs(l).1
                         })
                         .collect()
                 })
                 .collect();
 
+            let captured_capacity_gens: Vec<usize> =
+                (0..m).map(|r| kv_caches[r].capacity_gen()).collect();
             *graph_cache = Some(BatchDecodeGraph {
                 cu_exec,
                 cu_graph,
@@ -9514,6 +9497,7 @@ impl CutileGpuModel {
                 m,
                 captured_k_ptrs,
                 captured_v_ptrs,
+                captured_capacity_gens,
             });
 
             unsafe {
@@ -9607,6 +9591,17 @@ impl CutileGpuModel {
         let vocab = cfg.vocab_size;
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
         let stream = self.matmul.stream();
+
+        // Pooled caches (p20 4b-3): grow every run to hold the next token
+        // BEFORE the graph replays (the scatter-write destinations and the
+        // attention pointers are baked at capture time).  Extend-in-place
+        // keeps the pointers stable; a realloc triggers re-capture via the
+        // pointer validation below.  No-op when the run has headroom.
+        for r in 0..m {
+            kv_caches[r]
+                .ensure_capacity(kv_caches[r].seq_len() + 1)
+                .expect("batch KV run growth failed (pool exhausted?)");
+        }
 
         // -- 1. Embedding lookup (CPU) ------------------------------------------
         let embed = qweights
@@ -9834,19 +9829,13 @@ impl CutileGpuModel {
                     let k_ptrs: Vec<u64> = kv_caches
                         .iter()
                         .map(|kvc| {
-                            kvc.kv_device_tensors(layer)
-                                .0
-                                .device_pointer()
-                                .cu_deviceptr()
+                            kvc.kv_device_base_ptrs(layer).0
                         })
                         .collect();
                     let v_ptrs: Vec<u64> = kv_caches
                         .iter()
                         .map(|kvc| {
-                            kvc.kv_device_tensors(layer)
-                                .1
-                                .device_pointer()
-                                .cu_deviceptr()
+                            kvc.kv_device_base_ptrs(layer).1
                         })
                         .collect();
                     let kv_lens: Vec<i32> =
@@ -9887,7 +9876,7 @@ impl CutileGpuModel {
                             .expect("batch attn fallback alloc"),
                     );
                     for (r, q_rot) in q_rot_parts.iter().enumerate() {
-                        let (k_full, v_full) = kv_caches[r].kv_device_tensors(layer);
+                        let (k_base, v_base) = kv_caches[r].kv_device_base_ptrs(layer);
                         let kv_len_r = kv_caches[r].seq_len() as i32;
                         // Write kv_len to d_kv_len for this request.
                         let kv_bits = f32::from_bits(kv_len_r as u32);
@@ -9905,11 +9894,11 @@ impl CutileGpuModel {
                                 .sync_on(stream)
                                 .expect("attn out_r alloc"),
                         );
-                        oda.forward_d2d(
+                        oda.forward_d2d_ptrs(
                             &out_r,
                             q_rot,
-                            &k_full,
-                            &v_full,
+                            k_base,
+                            v_base,
                             &self.d_kv_len,
                             n_heads,
                             n_kv_heads,
@@ -9939,6 +9928,12 @@ impl CutileGpuModel {
                         .expect("batch attn cutile fallback alloc"),
                 );
                 for (r, q_rot) in q_rot_parts.iter().enumerate() {
+                    // NOTE: this cuTile fallback consumes WHOLE-TENSOR pointers
+                    // (pool start) -- pooled multi-client runs at non-zero
+                    // base would read wrong rows.  The kernel is already
+                    // documented-broken (corr 0.66, never exercised with
+                    // oxide loaded); pooled batch caches require oxide
+                    // attention (see forward_batch_mxfp4_inner_graph).
                     let (k_full, v_full) = kv_caches[r].kv_device_tensors(layer);
                     let kv_len_r = kv_caches[r].seq_len() as i32;
                     let attn_r = self

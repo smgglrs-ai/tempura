@@ -202,6 +202,10 @@ impl CutileKvCache {
         })
     }
 
+    pub fn base_page(&self) -> usize {
+        self.base_page
+    }
+
     /// Byte offset of the run's token 0 within the pool tensors (0 in
     /// dedicated mode).
     fn kv_base_byte_offset(&self) -> u64 {
@@ -614,6 +618,18 @@ impl CutileKvCache {
         )
     }
 
+    /// Base-shifted raw K/V pointers for this cache's RUN (p20 4b-3):
+    /// pool tensor base + run byte offset.  Multi-client batch paths use
+    /// these; the whole-tensor `kv_device_tensors` pointers point at the
+    /// POOL start and are only valid for base-0 runs.
+    pub fn kv_device_base_ptrs(&self, layer: usize) -> (u64, u64) {
+        let off = self.kv_base_byte_offset();
+        (
+            self.k_device[layer].device_pointer().cu_deviceptr() as u64 + off,
+            self.v_device[layer].device_pointer().cu_deviceptr() as u64 + off,
+        )
+    }
+
     /// Inputs for the paged prefill attention kernel (p20): zero-copy
     /// rank-2 pool views, the identity block table, and the kv_len device
     /// scalar.  The kv_len VALUE is uploaded via async H2D on this call
@@ -717,6 +733,95 @@ impl CutileKvCache {
     /// in-place growth that pointer validation cannot see.
     pub fn capacity_gen(&self) -> usize {
         self.capacity_gen
+    }
+
+    // ========================================================================
+    // Tiering: DRAM fallback (p20 phase 4 / the p24-kv-swap mechanism)
+    // ========================================================================
+
+    /// Swap OUT to the DRAM tier: sync the host mirror (the DRAM copy)
+    /// with the live prefix, then free the GPU run back to the pool.
+    ///
+    /// The sequence's KV now lives ONLY in the host mirror; another
+    /// sequence can use the GPU pages.  Call [`Self::swap_in`] before any
+    /// further GPU attention on this cache.  Attention cannot read a
+    /// partially-swapped sequence (it needs the full prefix every step),
+    /// so the granularity is the WHOLE RUN -- see the p24-kv-swap notes.
+    pub fn swap_out(&mut self) -> Result<(), KernelError> {
+        let Some(pool_arc) = self.pool.clone() else {
+            // Dedicated caches have no pool to return pages to; the host
+            // mirror is maintained by append_device already.
+            return self.sync_host_from_device(self.seq_len);
+        };
+        // Sync first (stream-ordered D2H of the live prefix at the run
+        // base), THEN free -- the pages must not be reused before the
+        // copy completes, which stream ordering guarantees on this
+        // cache's stream.
+        self.sync_host_from_device(self.seq_len)?;
+        let mut pool = pool_arc
+            .lock()
+            .map_err(|_| KernelError::InvalidConfig("pool mutex poisoned".into()))?;
+        pool.free_pages_alloc(crate::gpu_page_pool::Run {
+            start: self.base_page,
+            pages: self.run_pages,
+        });
+        self.base_page = 0;
+        self.run_pages = 0;
+        self.gpu_max_seq_len = 0;
+        self.capacity_gen += 1;
+        self.block_table_dev = None;
+        Ok(())
+    }
+
+    /// Swap IN from the DRAM tier: allocate a fresh run and upload the
+    /// host mirror's live prefix into it.  The block table is rebuilt on
+    /// the next paged attention call (contents = the NEW run's affine
+    /// table); captured graphs re-capture via the capacity-gen check
+    /// (the pointers changed).
+    pub fn swap_in(&mut self, tokens: usize) -> Result<(), KernelError> {
+        let Some(pool_arc) = self.pool.clone() else {
+            return Ok(()); // dedicated: nothing to do (mirror is live)
+        };
+        let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
+        let want = tokens.max(self.seq_len);
+        let need_pages = want.div_ceil(block_size);
+        let mut pool = pool_arc
+            .lock()
+            .map_err(|_| KernelError::InvalidConfig("pool mutex poisoned".into()))?;
+        let run = pool
+            .alloc_pages(need_pages)
+            .ok_or_else(|| KernelError::InvalidConfig("KV pool exhausted on swap-in".into()))?;
+        let f32_bytes = std::mem::size_of::<f32>() as u64;
+        let live_elems = self.seq_len * self.kv_dim;
+        for layer in 0..self.n_layers {
+            let k_dst = self.k_device[layer].device_pointer().cu_deviceptr()
+                + (run.start * block_size * self.kv_dim) as u64 * f32_bytes;
+            let v_dst = self.v_device[layer].device_pointer().cu_deviceptr()
+                + (run.start * block_size * self.kv_dim) as u64 * f32_bytes;
+            if live_elems > 0 {
+                unsafe {
+                    cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                        k_dst,
+                        self.k_host[layer].as_ptr() as *const _,
+                        live_elems * f32_bytes as usize,
+                        self.stream.cu_stream(),
+                    );
+                    cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                        v_dst,
+                        self.v_host[layer].as_ptr() as *const _,
+                        live_elems * f32_bytes as usize,
+                        self.stream.cu_stream(),
+                    );
+                }
+            }
+        }
+        self.base_page = run.start;
+        self.run_pages = run.pages;
+        self.gpu_max_seq_len = run.pages * block_size;
+        self.capacity_gen += 1;
+        self.block_table_dev = None;
+        self.host_stale = false;
+        Ok(())
     }
 
     pub fn kv_dim(&self) -> usize {

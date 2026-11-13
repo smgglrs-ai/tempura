@@ -10322,7 +10322,10 @@ impl CutileInferenceWrapper {
         session.position = target_seq_len;
     }
 
-    /// Allocate `n` fresh KV caches using the GPU model's stream.
+    /// Allocate `n` fresh KV caches sharing ONE GPU page pool (p20 4b-3:
+    /// multi-client -- each cache holds a contiguous RUN; per-seq cost is
+    /// the pages USED, not a full max-size buffer).  Each run starts with
+    /// `initial_tokens` (rounded up, with headroom) and grows on demand.
     ///
     /// Use this to set up persistent caches for `forward_batch_decode_stateful`.
     pub fn new_batch_kv_caches(&self, n: usize) -> Vec<crate::cutile_kv_cache::CutileKvCache> {
@@ -10331,12 +10334,56 @@ impl CutileInferenceWrapper {
             .as_ref()
             .expect("new_batch_kv_caches: GPU model not loaded");
         let stream = gm.stream();
-        (0..n)
-            .map(|_| {
-                crate::cutile_kv_cache::CutileKvCache::new(&self.model.config, stream.clone())
-                    .expect("KV cache alloc")
-            })
-            .collect()
+        let cfg = &self.model.config;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let bytes_per_token = 2 * cfg.num_layers * kv_dim * 4;
+        // Pool sizing: quarter of free VRAM (the session pool takes a
+        // quarter too; together they leave half for batch-graph scratch),
+        // at least enough for n minimal runs.
+        let free = crate::cutile_gpu_forward::query_free_vram_bytes();
+        let usable = free.saturating_sub(2 << 30) / 4;
+        let pool_tokens = (usable / bytes_per_token.max(1))
+            .max(n * 256)
+            .min(cfg.max_seq_len.max(n * 256));
+        let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
+        let pool_pages = pool_tokens.div_ceil(block_size);
+        match crate::cutile_kv_cache::GpuKvPagePool::new_with_dims(
+            cfg.num_layers,
+            kv_dim,
+            pool_pages,
+            stream.clone(),
+        ) {
+            Ok(pool) => {
+                eprintln!(
+                    "[cutile] batch KV page pool: {pool_tokens} tokens ({pool_pages} pages) \
+                     for {n} sequences, free was {:.1} GiB",
+                    free as f64 / (1 << 30) as f64,
+                );
+                let pool = std::sync::Arc::new(std::sync::Mutex::new(pool));
+                (0..n)
+                    .map(|_| {
+                        crate::cutile_kv_cache::CutileKvCache::new_pooled(
+                            cfg,
+                            pool.clone(),
+                            256, // initial run; grows with headroom
+                            stream.clone(),
+                        )
+                        .expect("KV pool run alloc")
+                    })
+                    .collect()
+            }
+            Err(e) => {
+                eprintln!(
+                    "[cutile] batch KV pool failed ({e}); dedicated per-seq fallback"
+                );
+                (0..n)
+                    .map(|_| {
+                        crate::cutile_kv_cache::CutileKvCache::new(&self.model.config, stream.clone())
+                            .expect("KV cache alloc")
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// Batched decode: M requests x 1 token each in one GPU forward pass.

@@ -681,11 +681,37 @@ typical-p/repeat/presence/frequency)
       bisect matrix (pool@512 / no-pool@4096 / pool@4096) cleared the
       pool in three runs; the kernel-level long-kv test cleared the
       kernels; the position-4095 boundary in the ppl chunking pointed
-      at position-indexed tables.  REMAINING under 4b: multi-client
-      adoption (concurrent sessions / GPU batch decode on one pool --
-      the base-0 single-client invariant must be lifted, ~25 raw-
-      pointer sites, recorded design notes above), prefix sharing/
-      eviction. Baselines:
+      at position-indexed tables.
+      STEP 4b-3 + TIERING DONE (2026-11-13): PHASE 4 COMPLETE.
+      MULTI-CLIENT: new_batch_kv_caches allocates n caches as RUNS from
+      one shared VRAM-sized pool (per-seq cost = pages USED, not a full
+      max-size buffer); the batch raw-pointer sites (~15) now use
+      CutileKvCache::kv_device_base_ptrs (run-base pointers) --
+      kv_scatter_write destinations, batch_attn_all_k_ptrs arrays,
+      capture validation, kpar/batch attention fallbacks (new
+      forward_{d2d,kpar}_ptrs wrapper variants; the cuTile flash
+      fallback documents its whole-tensor limitation -- broken kernel
+      anyway).  Growth hooks: forward_batch_decode grows every run
+      BEFORE graph replay (extend-in-place keeps baked pointers; realloc
+      re-captures via pointer validation); BatchDecodeGraph gained
+      captured_capacity_gens (extend evades pointer checks).
+      VALIDATED: bench-batch all M (1..16) verified NaN-free +
+      deterministic at parity (M=16 803 vs 809 dedicated -- within
+      noise).
+      TIERING (DRAM fallback, the p24-kv-swap mechanism):
+      CutileKvCache::swap_out (sync mirror to the DRAM tier, free the
+      GPU run back to the pool) + swap_in (alloc a fresh run --
+      possibly a different base -- upload the mirror back).  Whole-RUN
+      granularity (attention reads the full prefix every step;
+      page-granularity tiering just moves the read cost to PCIe).
+      VALIDATED (bench-decode-ops "KV tiering"): B filled + attention
+      bit-exact -> swap_out (pool fully recovered) -> client D
+      allocates from the freed pages -> swap_in at a DIFFERENT base
+      (20) -> attention bit-exact again vs the same reference.  90/90
+      sections PASS.  NOT YET: scheduler-driven eviction policy
+      (LRU/priority) + NIXL transfers + NVMe tier -- the p24-kv-swap
+      wiring on top of these primitives; prefix sharing/eviction.
+      Baselines:
       prefill PARITY at pp128 (7525 paged vs 7555 gather, 2026-11-12;
       the 2026-10-29 7700 baseline reads ~7555 on current hw/cuda-oxide
       state), decode ITL unchanged, gather/scatter kernels: ALL GONE

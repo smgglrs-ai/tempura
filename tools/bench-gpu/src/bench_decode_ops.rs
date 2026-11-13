@@ -203,8 +203,13 @@ fn cpu_rope(x: &[f32], pos: usize, n_heads: usize) -> Vec<f32> {
     out
 }
 
-fn report(name: &str, gpu: &[f32], cpu: &[f32]) -> bool {
-    let mut max_abs = 0.0f32;
+/// Run-page count of a pooled cache (bench helper; the field is private).
+fn cache_b_run_pages(cache: &tempura_engine::cutile_kv_cache::CutileKvCache) -> usize {
+    cache.gpu_capacity_tokens()
+        / tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE
+}
+
+fn report(name: &str, gpu: &[f32], cpu: &[f32]) -> bool {    let mut max_abs = 0.0f32;
     let mut bad = 0usize;
     for (a, b) in gpu.iter().zip(cpu) {
         let d = (a - b).abs();
@@ -2690,6 +2695,139 @@ fn main() {
                 &cpu,
             );
         }
+    }
+
+    // ---- 13. KV tiering: swap-out / swap-in (p20 phase 4) ------------------
+    // The DRAM-fallback mechanism on the REAL CutileKvCache API: run B
+    // filled + attention-verified; swap_out (mirror synced, pages freed);
+    // a second cache D allocates from the freed pages (multi-client,
+    // disjoint runs); swap_in B (fresh run, mirror re-uploaded); attention
+    // on B must match the ORIGINAL reference bit-exact.
+    {
+        use std::sync::Mutex;
+        use tempura_engine::config::ModelConfig;
+        use tempura_engine::cutile_kv_cache::{CutileKvCache, GpuKvPagePool};
+        use tempura_kernels::attention::CpuPagedAttention;
+        use tempura_kernels::cutile_flash_attention::{
+            CutileFlashAttention, PrefillAttnScratch, PAGED_BLOCK_SIZE as BS,
+        };
+
+        let mut cfg = ModelConfig::tiny_test();
+        cfg.num_layers = 1;
+        cfg.num_attention_heads = N_HEADS;
+        cfg.num_kv_heads = N_KV_HEADS;
+        cfg.head_dim = HEAD_DIM;
+        cfg.max_seq_len = 512;
+
+        let fa3 = CutileFlashAttention::new().expect("CutileFlashAttention init failed");
+        let tier_stream = fa3.stream().clone();
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let stride = N_KV_HEADS * HEAD_DIM;
+
+        let pool = Arc::new(Mutex::new(
+            GpuKvPagePool::new_with_dims(1, stride, 32, tier_stream.clone())
+                .expect("tier pool alloc failed"),
+        ));
+
+        // Sequence B: 128-token run, filled via append_device (which also
+        // maintains the host mirror = the DRAM tier).
+        let kv_len = 100usize;
+        let seq_len = 33usize;
+        let q = prng_data(seq_len * N_HEADS * HEAD_DIM, 61);
+        let k = prng_data(kv_len * stride, 62);
+        let v = prng_data(kv_len * stride, 63);
+        let k_dev = upload(k.clone(), &tier_stream);
+        let v_dev = upload(v.clone(), &tier_stream);
+        let mut cache_b =
+            CutileKvCache::new_pooled(&cfg, pool.clone(), 128, tier_stream.clone())
+                .expect("cache_b alloc failed");
+        cache_b
+            .append_device(0, &k_dev, &v_dev, kv_len)
+            .expect("cache_b append failed");
+        cache_b.advance(kv_len);
+
+        // CPU reference over a whole-pool mirror at B's base.
+        let b_base = cache_b.base_page();
+        let mut cpu_k = vec![0.0f32; 32 * BS * stride];
+        let mut cpu_v = vec![0.0f32; 32 * BS * stride];
+        for t in 0..kv_len {
+            let dst = (b_base * BS + t) * stride;
+            cpu_k[dst..dst + stride].copy_from_slice(&k[t * stride..(t + 1) * stride]);
+            cpu_v[dst..dst + stride].copy_from_slice(&v[t * stride..(t + 1) * stride]);
+        }
+        let table_b: Vec<u32> = (0..cache_b_run_pages(&cache_b))
+            .map(|i| (b_base + i) as u32)
+            .collect();
+        let mut ref_out = vec![0.0f32; seq_len * N_HEADS * HEAD_DIM];
+        CpuPagedAttention
+            .forward_paged(
+                &q, &cpu_k, &cpu_v, &table_b, BS, &mut ref_out, seq_len, kv_len, N_HEADS,
+                N_KV_HEADS, HEAD_DIM, scale, 0.0,
+            )
+            .expect("tiering CPU reference failed");
+
+        let ref_before = ref_out.clone();
+        let run_paged_attn = |cache: &mut CutileKvCache, label: &str, expect: &[f32]| -> bool {
+            let q_dev = upload(q.clone(), &tier_stream);
+            let (k_view, v_view, table_dev, kv_len_dev) = cache
+                .paged_attn_inputs(0, HEAD_DIM, kv_len)
+                .expect("tiering attn inputs failed");
+            let mut scratch = PrefillAttnScratch::default();
+            let out = fa3
+                .prefill_attention_device_paged(
+                    &q_dev, &k_view, &v_view, &table_dev, &kv_len_dev, seq_len, kv_len,
+                    N_HEADS, N_KV_HEADS, HEAD_DIM, scale, &tier_stream, &mut scratch,
+                )
+                .expect("tiering paged attention failed");
+            let gpu = download(&out, &tier_stream);
+            report(label, &gpu, expect)
+        };
+
+        all_ok &= run_paged_attn(&mut cache_b, "tier B before swap", &ref_before);
+
+        // Swap out: mirror synced (DRAM tier), GPU pages freed.
+        cache_b.swap_out().expect("swap_out failed");
+        {
+            let p = pool.lock().unwrap();
+            all_ok &= p.free_pages() == 32; // everything back
+        }
+
+        // Client D takes some of the freed pages (multi-client).
+        let cache_d =
+            CutileKvCache::new_pooled(&cfg, pool.clone(), 64, tier_stream.clone())
+                .expect("cache_d alloc failed");
+        let d_base = cache_d.base_page();
+        println!("  tiering: B was base={b_base}, D now base={d_base}");
+        all_ok &= d_base != b_base || {
+            // D may reuse B's freed hole; what matters is conservation.
+            let p = pool.lock().unwrap();
+            p.free_pages() + p.allocated_pages() == p.total_pages()
+        };
+
+        // Swap B back in: fresh run (possibly different base), mirror
+        // re-uploaded.  Attention must match the ORIGINAL reference.
+        cache_b.swap_in(128).expect("swap_in failed");
+        let b_base2 = cache_b.base_page();
+        println!("  tiering: B swapped back in at base={b_base2}");
+        // Rebuild the CPU reference at the NEW base.
+        let mut cpu_k2 = vec![0.0f32; 32 * BS * stride];
+        let mut cpu_v2 = vec![0.0f32; 32 * BS * stride];
+        for t in 0..kv_len {
+            let dst = (b_base2 * BS + t) * stride;
+            cpu_k2[dst..dst + stride].copy_from_slice(&k[t * stride..(t + 1) * stride]);
+            cpu_v2[dst..dst + stride].copy_from_slice(&v[t * stride..(t + 1) * stride]);
+        }
+        let table_b2: Vec<u32> = (0..cache_b_run_pages(&cache_b))
+            .map(|i| (b_base2 + i) as u32)
+            .collect();
+        CpuPagedAttention
+            .forward_paged(
+                &q, &cpu_k2, &cpu_v2, &table_b2, BS, &mut ref_out, seq_len, kv_len, N_HEADS,
+                N_KV_HEADS, HEAD_DIM, scale, 0.0,
+            )
+            .expect("tiering CPU reference 2 failed");
+        let ref_after = ref_out.clone();
+        all_ok &= run_paged_attn(&mut cache_b, "tier B after swap-in", &ref_after);
     }
 
     println!();
