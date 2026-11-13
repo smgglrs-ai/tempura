@@ -127,6 +127,30 @@ impl OxideDecodeAttn {
         head_dim:   usize,
         scale:      f32,
     ) -> Result<()> {
+        self.forward_d2d_ptrs(
+            out, q,
+            k_cache.device_pointer().cu_deviceptr(),
+            v_cache.device_pointer().cu_deviceptr(),
+            kv_len_dev, n_heads, n_kv_heads, head_dim, scale,
+        )
+    }
+
+    /// Pointer-based variant for POOLED caches (p20 4b-3): `k_ptr`/`v_ptr`
+    /// are the sequence's RUN base addresses (pool base + run offset) --
+    /// the tensor-based form cannot express a non-zero run base.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_d2d_ptrs(
+        &self,
+        out:        &Arc<Tensor<f32>>,
+        q:          &Arc<Tensor<f32>>,
+        k_ptr:      u64,
+        v_ptr:      u64,
+        kv_len_dev: &Arc<Tensor<f32>>,
+        n_heads:    usize,
+        n_kv_heads: usize,
+        head_dim:   usize,
+        scale:      f32,
+    ) -> Result<()> {
         let heads_per_group = (n_heads / n_kv_heads) as u32;
         let kv_len_ptr = kv_len_dev.device_pointer().cu_deviceptr() as u64;
 
@@ -136,8 +160,8 @@ impl OxideDecodeAttn {
         // n_heads is the grid X dimension; kv_stride = n_kv_heads*head_dim computed in kernel.
         let mut out_ptr = out.device_pointer().cu_deviceptr() as u64;
         let mut q_ptr   = q.device_pointer().cu_deviceptr() as u64;
-        let mut k_ptr   = k_cache.device_pointer().cu_deviceptr() as u64;
-        let mut v_ptr   = v_cache.device_pointer().cu_deviceptr() as u64;
+        let mut k_ptr   = k_ptr;
+        let mut v_ptr   = v_ptr;
         let mut kv_p    = kv_len_ptr;
         let mut sc      = scale;
         let mut nkv     = n_kv_heads as u32;
@@ -192,17 +216,44 @@ impl OxideDecodeAttn {
         head_dim:   usize,
         scale:      f32,
     ) -> Result<()> {
+        self.forward_kpar_d2d_ptrs(
+            out, q,
+            k_cache.device_pointer().cu_deviceptr(),
+            v_cache.device_pointer().cu_deviceptr(),
+            kv_len_dev, n_heads, n_kv_heads, head_dim, scale,
+        )
+    }
+
+    /// Pointer-based variant for POOLED caches (p20 4b-3): run-base
+    /// addresses instead of whole-tensor pointers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_kpar_d2d_ptrs(
+        &self,
+        out:        &Arc<Tensor<f32>>,
+        q:          &Arc<Tensor<f32>>,
+        k_ptr:      u64,
+        v_ptr:      u64,
+        kv_len_dev: &Arc<Tensor<f32>>,
+        n_heads:    usize,
+        n_kv_heads: usize,
+        head_dim:   usize,
+        scale:      f32,
+    ) -> Result<()> {
         let f = match self.cu_function_kpar {
             Some(f) => f,
-            None => return self.forward_d2d(out, q, k_cache, v_cache, kv_len_dev, n_heads, n_kv_heads, head_dim, scale),
+            None => {
+                return self.forward_d2d_ptrs(
+                    out, q, k_ptr, v_ptr, kv_len_dev, n_heads, n_kv_heads, head_dim, scale,
+                )
+            }
         };
         let heads_per_group = (n_heads / n_kv_heads) as u32;
         let kv_len_ptr = kv_len_dev.device_pointer().cu_deviceptr() as u64;
 
         let mut out_ptr = out.device_pointer().cu_deviceptr() as u64;
         let mut q_ptr   = q.device_pointer().cu_deviceptr() as u64;
-        let mut k_ptr   = k_cache.device_pointer().cu_deviceptr() as u64;
-        let mut v_ptr   = v_cache.device_pointer().cu_deviceptr() as u64;
+        let mut k_ptr   = k_ptr;
+        let mut v_ptr   = v_ptr;
         let mut kv_p    = kv_len_ptr;
         let mut sc      = scale;
         let mut nkv     = n_kv_heads as u32;
