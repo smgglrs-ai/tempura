@@ -7,6 +7,31 @@ differentiator is verification-first architecture: every layer — from
 quantization bit-packing to the batch scheduler — carries machine-checked
 proofs (Kani, Verus, TLA+) alongside the production code.
 
+**STATUS 2026-11-13: p20 (paged attention + KV page pool + tiering) is
+COMPLETE end-to-end — tempura BEATS llama.cpp on both flagship GPU
+benchmarks (prefill 7757-7797 vs 7335 pp128; decode 217-220 vs 209) with
+20k-token GPU contexts (VRAM-sized pool, was 4096) and multi-client +
+DRAM-tiering KV.  All session commits CI-green (kani.yml).  NEXT SESSION
+PRIORITIES, in order (full rationale in the p20/p24 entries below):
+(1) p24-kv-swap WIRING — the swap_out/swap_in primitives are validated
+(swap granularity = whole runs); remaining: BatchScheduler LRU/priority
+eviction calling swap_out on pool exhaustion (extend TLA+
+BatchScheduler.tla with the swap transitions), NIXL transfers (do NOT
+reinvent protocols -- the author's kv-mesh knows the plugin model),
+NVMe capacity tier.  (2) MMLU GPU gap: MXFP4 prefill precision opt-out
+for quality-sensitive workloads, or higher-precision tiling (the
+rel-0.10 logit band -> ~40% choice-flip on 4-way near-ties is
+quantified; CPU matches llama at 94.8% agreement).  (3) p24-overlap
+scheduling (CPU prepares step N+1 while GPU runs N -- the step loop is
+synchronous).  (4) the small broken edges: cutile_decode_attn (corr
+0.66, dead code), oxide PTX attention softcap >4k ctx (Gemma-2), batch
+QKV bias (Qwen2/Phi batch decode).  NOTE for remote workflows: kill
+stale ssh watchers by PID (their command lines contain 'tempura'/
+'bench-' and trip the gpu-remote preflight pgrep -- hit 3x this
+session); the remote's cuda-oxide is at e1f6df0ad, VALIDATED
+(bench-decode-ops 82/82, 7720 pp128, batch streamk M=16 809, all
+within noise of a0a4dc78a).**
+
 Hardware-agnostic core, Rust-native acceleration:
 
   - CPU SIMD for Intel, AMD and ARM processors (x86 AVX2/AVX-512/F16C/VNNI
