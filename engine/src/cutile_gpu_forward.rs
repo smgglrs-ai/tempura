@@ -67,6 +67,10 @@ struct DecodeGraph {
     /// KV-cache device pointers captured at graph creation, per layer.
     captured_k_ptrs: Vec<u64>,
     captured_v_ptrs: Vec<u64>,
+    /// KV-cache capacity generation at capture time: pooled caches GROW
+    /// in place (same pointers, bigger run -- scratch/grid sized for the
+    /// captured capacity go stale).  Bumped by every ensure_capacity.
+    captured_capacity_gen: usize,
 }
 
 /// CUDA graph for the prefill chunk's layer loop (m > 1). Captured on the
@@ -748,7 +752,7 @@ unsafe impl Sync for CutileGpuModel {}
 
 /// Query free device VRAM using cuMemGetInfo_v2.
 /// Returns 0 on failure (caller treats it as "no headroom").
-fn query_free_vram_bytes() -> usize {
+pub(crate) fn query_free_vram_bytes() -> usize {
     let mut free: usize = 0;
     let mut total: usize = 0;
     let rc = unsafe { cuda_core::sys::cuMemGetInfo_v2(&mut free as *mut _, &mut total as *mut _) };
@@ -2300,8 +2304,13 @@ impl CutileGpuModel {
         // tables and every cos/sin this struct computes -- matching the CPU
         // reference (kernels/src/rope.rs).
         cutile_rope.set_mscale(config.rope_attn_factor);
+        // Full-context table: the KV page pool (p20 4b-2) lifts the GPU
+        // context cap past the old 4096 -- positions >= the table max
+        // read past the cos/sin table and produce garbage rotations
+        // (found 2026-11-13: ppl 2716 at ctx 8192; prefill-half ended
+        // exactly at position 4095).  Worst case ~67MB VRAM at 131k ctx.
         cutile_rope.precompute_table(
-            config.max_seq_len.min(4096),
+            config.max_seq_len,
             head_dim,
             config.rope_theta,
             matmul.stream(),
@@ -2775,8 +2784,13 @@ impl CutileGpuModel {
 
         // Pre-compute the full RoPE frequency table on the GPU once.
         cutile_rope.set_mscale(config.rope_attn_factor);
+        // Full-context table: the KV page pool (p20 4b-2) lifts the GPU
+        // context cap past the old 4096 -- positions >= the table max
+        // read past the cos/sin table and produce garbage rotations
+        // (found 2026-11-13: ppl 2716 at ctx 8192; prefill-half ended
+        // exactly at position 4095).  Worst case ~67MB VRAM at 131k ctx.
         cutile_rope.precompute_table(
-            config.max_seq_len.min(4096),
+            config.max_seq_len,
             head_dim,
             config.rope_theta,
             matmul.stream(),
@@ -5830,13 +5844,17 @@ impl CutileGpuModel {
         // Validate KV-cache device pointers before replay: a different cache
         // object (new session, fresh-cache bench verification pass) must
         // re-capture -- the graph bakes the cache pointers at capture time.
+        // Pooled growth also re-captures: extend-in-place keeps the pointers
+        // but outgrows the scratch/grid sized at capture time.
         {
             let kv_ptrs_stale = match *graph_cache {
-                Some(ref dg) => (0..cfg.num_layers).any(|l| {
-                    let (k, v) = gpu_kv_cache.kv_device_tensors(l);
-                    k.device_pointer().cu_deviceptr() != dg.captured_k_ptrs[l]
-                        || v.device_pointer().cu_deviceptr() != dg.captured_v_ptrs[l]
-                }),
+                Some(ref dg) => {
+                    (0..cfg.num_layers).any(|l| {
+                        let (k, v) = gpu_kv_cache.kv_device_tensors(l);
+                        k.device_pointer().cu_deviceptr() != dg.captured_k_ptrs[l]
+                            || v.device_pointer().cu_deviceptr() != dg.captured_v_ptrs[l]
+                    }) || gpu_kv_cache.capacity_gen() != dg.captured_capacity_gen
+                }
                 None => false,
             };
             if kv_ptrs_stale {
@@ -5941,6 +5959,7 @@ impl CutileGpuModel {
                 device: Arc::new(stream.context().device()),
                 captured_k_ptrs,
                 captured_v_ptrs,
+                captured_capacity_gen: gpu_kv_cache.capacity_gen(),
             });
 
             unsafe {
