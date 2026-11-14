@@ -595,6 +595,139 @@ async fn chat_completions(
         let eos_token = tokenizer.eos_token_id();
         let prompt_tokens = token_ids.len() as u32;
 
+        // Common case (n=1, no logprobs/guided/sampler-chain) runs through
+        // the ENGINE -- the same scheduler/pool/swap path as streaming.
+        // This closes the architectural gap where non-streaming requests
+        // ran generate() directly on the HTTP thread, bypassing the batch
+        // scheduler entirely (and, on GPU models, interleaving concurrent
+        // requests through the wrapper's SHARED session KV cache -- the
+        // direct path below keeps that pre-existing hazard for its
+        // feature-rich requests).
+        let engine_routable = req.n == 1
+            && !want_logprobs
+            && build_guided_decoder(&req.response_format, tokenizer).is_none()
+            && build_tool_guided_decoder(&req.tools, &req.tool_choice, tokenizer).is_none()
+            && sampler_chain.is_empty();
+        if engine_routable {
+            let engine_tx = state.engine_tx.clone();
+            let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<EngineEvent>(64);
+            engine_tx
+                .send(EngineRequest {
+                    id: request_id.clone(),
+                    token_ids,
+                    max_new_tokens: req.max_tokens as usize,
+                    params,
+                    eos_token,
+                    seed: req.seed.unwrap_or(42),
+                    response_tx: resp_tx,
+                })
+                .await
+                .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+
+            let mut generated: Vec<u32> = Vec::with_capacity(req.max_tokens as usize);
+            let timed_out = loop {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break true;
+                }
+                match tokio::time::timeout(deadline - now, resp_rx.recv()).await {
+                    Ok(Some(EngineEvent::Token(t))) => generated.push(t),
+                    Ok(Some(EngineEvent::Done)) | Ok(None) => break false,
+                    Err(_) => break true,
+                }
+            };
+
+            release_slot(&state, &request_id).await;
+
+            if timed_out {
+                metrics::counter!("tempura_request_timeout", "endpoint" => "chat_completions")
+                    .increment(1);
+            }
+            metrics::counter!("tempura_tokens_generated").increment(generated.len() as u64);
+            metrics::histogram!("tempura_request_duration_seconds", "endpoint" => "chat_completions")
+                .record(start.elapsed().as_secs_f64());
+
+            let full_text = tokenizer
+                .decode(&generated)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let (text, mut finish_reason) = check_stop_sequences(&full_text, &stop_sequences);
+            if finish_reason == "length"
+                && (generated.len() as u32) < req.max_tokens
+                && eos_token.is_some_and(|e| generated.last() == Some(&e))
+            {
+                finish_reason = "stop";
+            }
+
+            let (msg, fr) = if let Some(ref tools) = req.tools {
+                if !tools.is_empty()
+                    && !req.tool_choice.as_ref().is_some_and(|tc| tc.is_none())
+                {
+                    let parser = tempura_engine::tool_call::ToolCallParser::new(tools);
+                    if let Some(tool_calls) = parser.parse(text) {
+                        (
+                            ChatMessage {
+                                role: "assistant".to_string(),
+                                content: None,
+                                tool_calls: Some(tool_calls),
+                                tool_call_id: None,
+                            },
+                            "tool_calls".to_string(),
+                        )
+                    } else {
+                        (
+                            ChatMessage {
+                                role: "assistant".to_string(),
+                                content: Some(text.to_string()),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            },
+                            finish_reason.to_string(),
+                        )
+                    }
+                } else {
+                    (
+                        ChatMessage {
+                            role: "assistant".to_string(),
+                            content: Some(text.to_string()),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        },
+                        finish_reason.to_string(),
+                    )
+                }
+            } else {
+                (
+                    ChatMessage {
+                        role: "assistant".to_string(),
+                        content: Some(text.to_string()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    finish_reason.to_string(),
+                )
+            };
+
+            return Ok(Json(ChatCompletionResponse {
+                id: request_id,
+                object: "chat.completion".to_string(),
+                created: 0,
+                model: req.model,
+                system_fingerprint: format!("tempura-{}", env!("CARGO_PKG_VERSION")),
+                choices: vec![ChatChoice {
+                    index: 0,
+                    message: msg,
+                    finish_reason: fr,
+                    logprobs: None,
+                }],
+                usage: Usage {
+                    prompt_tokens,
+                    completion_tokens: generated.len() as u32,
+                    total_tokens: prompt_tokens + generated.len() as u32,
+                },
+            })
+            .into_response());
+        }
+
         let mut choices = Vec::new();
         let mut total_completion_tokens = 0u32;
 
