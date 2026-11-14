@@ -5,6 +5,32 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-14 (f16 KV pool COMPLETE, pieces 1+2 landed): the
+serving pool can store KV as f16 (TEMPURA_KV_F16=1, commits aaacbba +
+023dba7) — halved KV density (128 KiB/token for Llama-8B GQA; the f32
+pool's 256 KiB/token made a 131k context = 32GB, unreachable on a
+32GB card; f16 is llama.cpp's default density).  Everything validated
+end-to-end on fishtank: nonstream-route-smoke PASS (f16 pool banner,
+byte-identical buffered vs SSE, coherent text) AND the full streaming
+A/B PASS (6/6 byte-identical between a 20000-token f16 pool and an
+eviction-forced 3072-token f16 pool; 3 swaps with mirror/device
+bit-checksums EXACT — the quantizing DRAM-mirror roundtrip is exact).
+Piece map: oxide f16 decode-attention twins (exact integer f16→f32
+in-kernel, correspondence-tested at ≤2e-7); cutile_cast_f32_f16 kernel
+(staged append conversion); cutile_flash_attn_heads_paged_f16 prefill
+twin (f16 tiles + convert_tile); LayerTensors dtype-tagged pool
+tensors (dtype-erased pointers, elem_size byte math); graph paths +
+the wrapper's own session cache stay f32 (gated).  REMAINING before
+f16 becomes the DEFAULT: (a) ppl quality gate vs the f32 pool
+(bench-perplexity with the flag on; the MXFP4 lesson — gate on ppl,
+not logit correlation; f16 KV is llama.cpp's default so the
+expectation is a clean pass); (b) optionally extend bench-decode-ops
+with an f16-pool section (kernel-level, random data); (c) flip the
+default + retire the f32 serving path once (a) passes.  Then FP8/
+TurboQuant on the pool as the follow-on (bigger win, attention
+kernels need dequant epilogues).  A quality note: the f16 pool's
+greedy text differs from the f32 pool's (expected — KV rounding
+shifts near-tie logits); both are valid greedy continuations.**
 **STATUS 2026-11-14 (f16 KV pool, piece 1 landed): the oxide decode
 attention now has f16 twins (commit aaacbba) — single-warp/kpar/splitk
 kernels reading K/V as f16 bits with an exact in-kernel integer
