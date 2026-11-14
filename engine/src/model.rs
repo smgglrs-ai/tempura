@@ -10457,16 +10457,22 @@ impl CutileInferenceWrapper {
             .min(cfg.max_seq_len.max(256));
         let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
         let pool_pages = tokens.div_ceil(block_size);
-        match crate::cutile_kv_cache::GpuKvPagePool::new_with_dims(
+        // TEMPURA_KV_F16=1: halved KV density (128 KiB/token for
+        // Llama-8B GQA -- 131k context fits a 32GB card; llama.cpp's
+        // default density).  f32 pools keep every legacy path.
+        let f16 = std::env::var("TEMPURA_KV_F16").as_deref() == Ok("1");
+        match crate::cutile_kv_cache::GpuKvPagePool::new_with_dims_dtype(
             cfg.num_layers,
             kv_dim,
             pool_pages,
             gm.stream(),
+            f16,
         ) {
             Ok(pool) => {
                 eprintln!(
-                    "[cutile] serving KV page pool: {tokens} tokens ({pool_pages} pages), \
+                    "[cutile] serving KV page pool: {tokens} tokens ({pool_pages} pages, {}), \
                      free was {:.1} GiB",
+                    if f16 { "f16" } else { "f32" },
                     free as f64 / (1 << 30) as f64,
                 );
                 Some(std::sync::Arc::new(std::sync::Mutex::new(pool)))

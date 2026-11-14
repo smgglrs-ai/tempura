@@ -50,6 +50,50 @@ pub enum EnsureCapacityError {
 /// cache update (host mirror remains authoritative).
 pub const GPU_KV_MAX_SEQ_LEN: usize = 4096;
 
+/// Per-layer pool/device tensors, dtype-tagged (p24 f16 serving pool).
+/// Raw-pointer sites are dtype-ERASED (a pointer is a pointer); only the
+/// byte-offset math and the typed readers branch on the variant.
+pub enum LayerTensors {
+    F32(Vec<Arc<Tensor<f32>>>),
+    F16(Vec<Arc<Tensor<half::f16>>>),
+}
+
+impl LayerTensors {
+    pub fn is_f16(&self) -> bool {
+        matches!(self, LayerTensors::F16(_))
+    }
+    pub fn elem_size(&self) -> usize {
+        match self {
+            LayerTensors::F32(_) => std::mem::size_of::<f32>(),
+            LayerTensors::F16(_) => std::mem::size_of::<half::f16>(),
+        }
+    }
+    pub fn ptr(&self, layer: usize) -> u64 {
+        match self {
+            LayerTensors::F32(v) => v[layer].device_pointer().cu_deviceptr(),
+            LayerTensors::F16(v) => v[layer].device_pointer().cu_deviceptr(),
+        }
+    }
+    pub fn f32_tensor(&self, layer: usize) -> Option<Arc<Tensor<f32>>> {
+        match self {
+            LayerTensors::F32(v) => Some(Arc::clone(&v[layer])),
+            LayerTensors::F16(_) => None,
+        }
+    }
+    pub fn f16_tensor(&self, layer: usize) -> Option<Arc<Tensor<half::f16>>> {
+        match self {
+            LayerTensors::F32(_) => None,
+            LayerTensors::F16(v) => Some(Arc::clone(&v[layer])),
+        }
+    }
+}
+
+/// Paged-attention pool views, dtype-tagged (see [`LayerTensors`]).
+pub enum PagedAttnViews {
+    F32(Arc<Tensor<f32>>, Arc<Tensor<f32>>),
+    F16(Arc<Tensor<half::f16>>, Arc<Tensor<half::f16>>),
+}
+
 pub struct CutileKvCache {
     /// Host mirrors: k_host[layer] is flat [max_seq_len * kv_dim].
     k_host: Vec<Vec<f32>>,
@@ -63,8 +107,9 @@ pub struct CutileKvCache {
     /// GPU-resident KV cache: k_device[layer] is flat [gpu_max_seq_len * kv_dim].
     /// Layout matches the host mirror: interleaved [token, kv_head, head_dim].
     /// Populated by `append_device`; empty when `gpu_max_seq_len == 0`.
-    k_device: Vec<Arc<Tensor<f32>>>,
-    v_device: Vec<Arc<Tensor<f32>>>,
+    /// F16 variant = the p24 f16 serving pool (halved KV density).
+    k_device: LayerTensors,
+    v_device: LayerTensors,
     gpu_max_seq_len: usize,
     /// True when `append_device_gpu_only` has been called at least once since the
     /// last `sync_host_from_device`.  Signals that the host mirror is stale for
@@ -103,6 +148,11 @@ pub struct CutileKvCache {
     /// allocated once; the VALUE is updated via async H2D before each
     /// paged launch.
     kv_len_dev: Option<Arc<Tensor<i32>>>,
+    /// Lazily-allocated f16 staging for the append path: the f32 source is
+    /// cast into it (cutile_cast_f32_f16), then D2D-copied into the pool.
+    /// Resized to exactly ceil(n/CAST_B)*CAST_B per use (stable within a
+    /// phase: decode = kv_dim, prefill = chunk*kv_dim).
+    f16_stage: Option<Arc<Tensor<half::f16>>>,
 }
 
 // SAFETY: Tensor<f32> and Stream hold raw CUDA pointers but tempura uses a
@@ -151,8 +201,9 @@ impl CutileKvCache {
             kv_dim,
             max_seq_len: config.max_seq_len,
             stream,
-            k_device,
-            v_device,
+            k_device: LayerTensors::F32(k_device),
+            v_device: LayerTensors::F32(v_device),
+            f16_stage: None,
             gpu_max_seq_len,
             host_stale: false,
             block_table_dev: None,
@@ -199,8 +250,17 @@ impl CutileKvCache {
             let run = p
                 .alloc_pages(alloc_pages)
                 .ok_or_else(|| KernelError::InvalidConfig("KV pool exhausted".into()))?;
-            let k_device = p.k_pool_tensors();
-            let v_device = p.v_pool_tensors();
+            let (k_device, v_device) = if p.is_f16() {
+                (
+                    LayerTensors::F16(p.k_pool_tensors_f16()),
+                    LayerTensors::F16(p.v_pool_tensors_f16()),
+                )
+            } else {
+                (
+                    LayerTensors::F32(p.k_pool_tensors()),
+                    LayerTensors::F32(p.v_pool_tensors()),
+                )
+            };
             (run.start, run.pages, k_device, v_device, run.pages * block_size)
         };
 
@@ -219,6 +279,7 @@ impl CutileKvCache {
             block_table_dev: None,
             swap_checksum: None,
             kv_len_dev: None,
+            f16_stage: None,
             pool: Some(pool),
             base_page,
             run_pages,
@@ -252,7 +313,7 @@ impl CutileKvCache {
     /// dedicated mode).
     fn kv_base_byte_offset(&self) -> u64 {
         let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
-        (self.base_page * block_size * self.kv_dim) as u64 * std::mem::size_of::<f32>() as u64
+        (self.base_page * block_size * self.kv_dim) as u64 * self.k_device.elem_size() as u64
     }
 
     /// Grow the run to hold at least `tokens` tokens (pooled mode only).
@@ -310,28 +371,30 @@ impl CutileKvCache {
             }),
         )?;
         let old_base = self.base_page;
-        let f32_bytes = std::mem::size_of::<f32>() as u64;
+        let elem = self.k_device.elem_size() as u64;
         let live_elems = self.seq_len * self.kv_dim;
         for layer in 0..self.n_layers {
-            let k_src = self.k_device[layer].device_pointer().cu_deviceptr()
-                + (old_base * block_size * self.kv_dim) as u64 * f32_bytes;
-            let v_src = self.v_device[layer].device_pointer().cu_deviceptr()
-                + (old_base * block_size * self.kv_dim) as u64 * f32_bytes;
-            let k_dst = self.k_device[layer].device_pointer().cu_deviceptr()
-                + (new_run.start * block_size * self.kv_dim) as u64 * f32_bytes;
-            let v_dst = self.v_device[layer].device_pointer().cu_deviceptr()
-                + (new_run.start * block_size * self.kv_dim) as u64 * f32_bytes;
+            let k_src = self.k_device.ptr(layer)
+                + (old_base * block_size * self.kv_dim) as u64 * elem;
+            let v_src = self.v_device.ptr(layer)
+                + (old_base * block_size * self.kv_dim) as u64 * elem;
+            let k_dst = self.k_device.ptr(layer)
+                + (new_run.start * block_size * self.kv_dim) as u64 * elem;
+            let v_dst = self.v_device.ptr(layer)
+                + (new_run.start * block_size * self.kv_dim) as u64 * elem;
             if live_elems > 0 {
-                unsafe {
-                    cuda_core::memcpy_dtod_async::<f32>(k_dst, k_src, live_elems, &self.stream)
-                        .map_err(|e| {
-                            EnsureCapacityError::Kernel(KernelError::InvalidConfig(e.to_string()))
-                        })?;
-                    cuda_core::memcpy_dtod_async::<f32>(v_dst, v_src, live_elems, &self.stream)
-                        .map_err(|e| {
-                            EnsureCapacityError::Kernel(KernelError::InvalidConfig(e.to_string()))
-                        })?;
-                }
+                let copy = |dst: u64, src: u64| -> Result<(), EnsureCapacityError> {
+                    let r = if self.k_device.is_f16() {
+                        unsafe { cuda_core::memcpy_dtod_async::<half::f16>(dst, src, live_elems, &self.stream) }
+                    } else {
+                        unsafe { cuda_core::memcpy_dtod_async::<f32>(dst, src, live_elems, &self.stream) }
+                    };
+                    r.map_err(|e| {
+                        EnsureCapacityError::Kernel(KernelError::InvalidConfig(e.to_string()))
+                    })
+                };
+                copy(k_dst, k_src)?;
+                copy(v_dst, v_src)?;
             }
         }
         pool.free_pages_alloc(crate::gpu_page_pool::Run {
@@ -461,27 +524,76 @@ impl CutileKvCache {
         }
 
         let num_elems = num_new_tokens * self.kv_dim;
+        self.d2d_into_pool(layer, k_new, v_new, num_elems)?;
+
+        Ok(())
+    }
+
+    /// Copy `num_elems` f32 K/V elements into the pool at the current
+    /// offset (dtype-aware): f32 pools take a straight D2D; f16 pools cast
+    /// through the staging tensor first (cutile_cast_f32_f16).
+    fn d2d_into_pool(
+        &mut self,
+        layer: usize,
+        k_new: &Arc<Tensor<f32>>,
+        v_new: &Arc<Tensor<f32>>,
+        num_elems: usize,
+    ) -> Result<(), KernelError> {
+        use cuda_core::sys::CUdeviceptr;
+
         let offset_elems = self.seq_len * self.kv_dim;
-        let f32_bytes = std::mem::size_of::<f32>() as u64;
+        let elem = self.k_device.elem_size() as u64;
         let base_off = self.kv_base_byte_offset();
 
-        let k_src: CUdeviceptr = k_new.device_pointer().cu_deviceptr();
-        let v_src: CUdeviceptr = v_new.device_pointer().cu_deviceptr();
-
-        let k_dst: CUdeviceptr = self.k_device[layer].device_pointer().cu_deviceptr()
-            + base_off
-            + offset_elems as u64 * f32_bytes;
-        let v_dst: CUdeviceptr = self.v_device[layer].device_pointer().cu_deviceptr()
-            + base_off
-            + offset_elems as u64 * f32_bytes;
-
-        unsafe {
-            cuda_core::memcpy_dtod_async::<f32>(k_dst, k_src, num_elems, &self.stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-            cuda_core::memcpy_dtod_async::<f32>(v_dst, v_src, num_elems, &self.stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        if !self.k_device.is_f16() {
+            let k_src: CUdeviceptr = k_new.device_pointer().cu_deviceptr();
+            let v_src: CUdeviceptr = v_new.device_pointer().cu_deviceptr();
+            let k_dst: CUdeviceptr = self.k_device.ptr(layer) + base_off + offset_elems as u64 * elem;
+            let v_dst: CUdeviceptr = self.v_device.ptr(layer) + base_off + offset_elems as u64 * elem;
+            unsafe {
+                cuda_core::memcpy_dtod_async::<f32>(k_dst, k_src, num_elems, &self.stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+                cuda_core::memcpy_dtod_async::<f32>(v_dst, v_src, num_elems, &self.stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            }
+            return Ok(());
         }
 
+        // f16 pool: cast each source through the staging tensor, then D2D
+        // the cast result into the pool.  The cast is stream-ordered before
+        // the D2D; the staging is reused across calls (exact-size per use).
+        let n_pad = num_elems.div_ceil(tempura_kernels::cutile_elementwise::CAST_B)
+            * tempura_kernels::cutile_elementwise::CAST_B;
+        let mut stage = match self.f16_stage.take() {
+            Some(t) if t.size() == n_pad => t,
+            _ => Arc::new(
+                api::zeros::<half::f16>(&[n_pad])
+                    .sync_on(&self.stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .into(),
+            ),
+        };
+        for src in [k_new, v_new] {
+            stage = tempura_kernels::cutile_elementwise::cast_f32_to_f16_dev(
+                src, stage, num_elems, &self.stream,
+            )?;
+            let dst: CUdeviceptr = if Arc::ptr_eq(src, k_new) {
+                self.k_device.ptr(layer)
+            } else {
+                self.v_device.ptr(layer)
+            } + base_off
+                + offset_elems as u64 * elem;
+            unsafe {
+                cuda_core::memcpy_dtod_async::<half::f16>(
+                    dst,
+                    stage.device_pointer().cu_deviceptr(),
+                    num_elems,
+                    &self.stream,
+                )
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+            }
+        }
+        self.f16_stage = Some(stage);
         Ok(())
     }
 
@@ -518,26 +630,7 @@ impl CutileKvCache {
         }
 
         let num_elems = num_new_tokens * self.kv_dim;
-        let offset_elems = self.seq_len * self.kv_dim;
-        let f32_bytes = std::mem::size_of::<f32>() as u64;
-        let base_off = self.kv_base_byte_offset();
-
-        let k_src: CUdeviceptr = k_new.device_pointer().cu_deviceptr();
-        let v_src: CUdeviceptr = v_new.device_pointer().cu_deviceptr();
-
-        let k_dst: CUdeviceptr = self.k_device[layer].device_pointer().cu_deviceptr()
-            + base_off
-            + offset_elems as u64 * f32_bytes;
-        let v_dst: CUdeviceptr = self.v_device[layer].device_pointer().cu_deviceptr()
-            + base_off
-            + offset_elems as u64 * f32_bytes;
-
-        unsafe {
-            cuda_core::memcpy_dtod_async::<f32>(k_dst, k_src, num_elems, &self.stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-            cuda_core::memcpy_dtod_async::<f32>(v_dst, v_src, num_elems, &self.stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-        }
+        self.d2d_into_pool(layer, k_new, v_new, num_elems)?;
 
         self.host_stale = true;
         Ok(())
@@ -554,18 +647,47 @@ impl CutileKvCache {
             return Ok(());
         }
         let base_off = self.kv_base_byte_offset();
-        let f32_bytes = std::mem::size_of::<f32>() as u64;
+        let elem = self.k_device.elem_size();
+        let is_f16 = self.k_device.is_f16();
+        // f16 pools download into a u16 staging and convert on the host
+        // (the DRAM-tier mirror stays f32 for now).
+        let mut f16_tmp: Vec<u16> = if is_f16 { vec![0u16; len] } else { Vec::new() };
         for layer in 0..self.n_layers {
             // Offset D2H (raw memcpy): pooled mode must NOT download the
             // whole pool tensor (to_host_vec) -- the pool can be tens of
             // GB while the live prefix is small.
-            let k_src = self.k_device[layer].device_pointer().cu_deviceptr() + base_off;
-            let v_src = self.v_device[layer].device_pointer().cu_deviceptr() + base_off;
+            let k_src = self.k_device.ptr(layer) + base_off;
+            let v_src = self.v_device.ptr(layer) + base_off;
+            if is_f16 {
+                for (src, mirror) in [(k_src, &mut self.k_host), (v_src, &mut self.v_host)] {
+                    unsafe {
+                        let rc = cuda_core::sys::cuMemcpyDtoHAsync_v2(
+                            f16_tmp.as_mut_ptr() as *mut _,
+                            src,
+                            len * elem,
+                            self.stream.cu_stream(),
+                        );
+                        if rc != 0 {
+                            return Err(KernelError::InvalidConfig(format!(
+                                "sync_host f16 D2H rc={rc}"
+                            )));
+                        }
+                    }
+                    self.stream
+                        .synchronize()
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+                    let dst = &mut mirror[layer][..len];
+                    for (d, &h) in dst.iter_mut().zip(f16_tmp.iter()) {
+                        *d = half::f16::from_bits(h).to_f32();
+                    }
+                }
+                continue;
+            }
             unsafe {
                 let rc = cuda_core::sys::cuMemcpyDtoHAsync_v2(
                     self.k_host[layer].as_mut_ptr() as *mut _,
                     k_src,
-                    len * f32_bytes as usize,
+                    len * elem,
                     self.stream.cu_stream(),
                 );
                 if rc != 0 {
@@ -576,7 +698,7 @@ impl CutileKvCache {
                 let rc = cuda_core::sys::cuMemcpyDtoHAsync_v2(
                     self.v_host[layer].as_mut_ptr() as *mut _,
                     v_src,
-                    len * f32_bytes as usize,
+                    len * elem,
                     self.stream.cu_stream(),
                 );
                 if rc != 0 {
@@ -654,12 +776,12 @@ impl CutileKvCache {
     /// layout `[gpu_max_seq_len, n_kv_heads, head_dim]`; only the first
     /// `seq_len * kv_dim` elements are valid.  Flash attention kernels receive
     /// `kv_len` as a runtime parameter and iterate only over valid positions.
-    pub fn k_device(&self, layer: usize) -> Arc<Tensor<f32>> {
-        Arc::clone(&self.k_device[layer])
+    pub fn k_device(&self, layer: usize) -> Option<Arc<Tensor<f32>>> {
+        self.k_device.f32_tensor(layer)
     }
 
-    pub fn v_device(&self, layer: usize) -> Arc<Tensor<f32>> {
-        Arc::clone(&self.v_device[layer])
+    pub fn v_device(&self, layer: usize) -> Option<Arc<Tensor<f32>>> {
+        self.v_device.f32_tensor(layer)
     }
 
     /// Return both K and V GPU device tensors for `layer`.
@@ -667,28 +789,32 @@ impl CutileKvCache {
     /// Each tensor is flat `[gpu_max_seq_len * kv_dim]` in interleaved
     /// `[token, kv_head, head_dim]` layout.  Only the first `seq_len * kv_dim`
     /// elements are valid; the rest are zero-initialised.
-    pub fn kv_device_tensors(&self, layer: usize) -> (Arc<Tensor<f32>>, Arc<Tensor<f32>>) {
+    /// None for an f16 pool (callers must use the f16 kernels).
+    pub fn kv_device_tensors(&self, layer: usize) -> Option<(Arc<Tensor<f32>>, Arc<Tensor<f32>>)> {
         // Single-client invariant (see the `pool` field docs): pooled
         // tensors are handed out only while the run sits at pool base.
         // A second pool client must make the raw-pointer call sites
         // base-offset aware first.
         debug_assert!(self.pool.is_none() || self.base_page == 0);
-        (
-            Arc::clone(&self.k_device[layer]),
-            Arc::clone(&self.v_device[layer]),
-        )
+        Some((
+            self.k_device.f32_tensor(layer)?,
+            self.v_device.f32_tensor(layer)?,
+        ))
+    }
+
+    /// Whether this cache's pool tensors hold f16 (p24 f16 serving pool).
+    pub fn kv_f16(&self) -> bool {
+        self.k_device.is_f16()
     }
 
     /// Base-shifted raw K/V pointers for this cache's RUN (p20 4b-3):
     /// pool tensor base + run byte offset.  Multi-client batch paths use
     /// these; the whole-tensor `kv_device_tensors` pointers point at the
-    /// POOL start and are only valid for base-0 runs.
+    /// POOL start and are only valid for base-0 runs.  Dtype-erased:
+    /// f16 pools address f16 elements.
     pub fn kv_device_base_ptrs(&self, layer: usize) -> (u64, u64) {
         let off = self.kv_base_byte_offset();
-        (
-            self.k_device[layer].device_pointer().cu_deviceptr() as u64 + off,
-            self.v_device[layer].device_pointer().cu_deviceptr() as u64 + off,
-        )
+        (self.k_device.ptr(layer) + off, self.v_device.ptr(layer) + off)
     }
 
     /// Inputs for the paged prefill attention kernel (p20): zero-copy
@@ -708,8 +834,7 @@ impl CutileKvCache {
         kv_len: usize,
     ) -> Result<
         (
-            Arc<Tensor<f32>>,
-            Arc<Tensor<f32>>,
+            PagedAttnViews,
             Arc<Tensor<i32>>,
             Arc<Tensor<i32>>,
         ),
@@ -725,18 +850,45 @@ impl CutileKvCache {
         }
         // View rows from the TENSOR's actual element count: in pooled
         // mode the tensor is the whole pool (bigger than the run).
-        let tensor_elems = self.k_device[layer]
-            .shape()
-            .iter()
-            .map(|&d| d as usize)
-            .product::<usize>();
+        let tensor_elems = match &self.k_device {
+            LayerTensors::F32(v) => v[layer]
+                .shape()
+                .iter()
+                .map(|&d| d as usize)
+                .product::<usize>(),
+            LayerTensors::F16(v) => v[layer]
+                .shape()
+                .iter()
+                .map(|&d| d as usize)
+                .product::<usize>(),
+        };
         let rows = tensor_elems / head_dim;
-        let k_pool = self.k_device[layer]
-            .reshape(&[rows, head_dim])
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
-        let v_pool = self.v_device[layer]
-            .reshape(&[rows, head_dim])
-            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let views = match &self.k_device {
+            LayerTensors::F32(_) => PagedAttnViews::F32(
+                self.k_device
+                    .f32_tensor(layer)
+                    .unwrap()
+                    .reshape(&[rows, head_dim])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+                self.v_device
+                    .f32_tensor(layer)
+                    .unwrap()
+                    .reshape(&[rows, head_dim])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+            ),
+            LayerTensors::F16(_) => PagedAttnViews::F16(
+                self.k_device
+                    .f16_tensor(layer)
+                    .unwrap()
+                    .reshape(&[rows, head_dim])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+                self.v_device
+                    .f16_tensor(layer)
+                    .unwrap()
+                    .reshape(&[rows, head_dim])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+            ),
+        };
 
         // Affine table: block i of this run is physical page base+i.  The
         // identity table was only valid for base-0 runs -- with several
@@ -777,8 +929,7 @@ impl CutileKvCache {
         .map_err(|e| KernelError::InvalidConfig(format!("paged_attn_inputs kv_len H2D: {e}")))?;
 
         Ok((
-            k_pool,
-            v_pool,
+            views,
             self.block_table_dev.as_ref().unwrap().clone(),
             kv_len_dev.clone(),
         ))
@@ -865,25 +1016,51 @@ impl CutileKvCache {
             .ok_or_else(|| KernelError::InvalidConfig("KV pool exhausted on swap-in".into()))?;
         let f32_bytes = std::mem::size_of::<f32>() as u64;
         let live_elems = self.seq_len * self.kv_dim;
+        let is_f16 = self.k_device.is_f16();
+        // f16 pools: the f32 mirror is quantized to f16 bits on the host,
+        // then uploaded (matching the append path's cast semantics).
+        let mut f16_tmp: Vec<u16> = if is_f16 && live_elems > 0 {
+            vec![0u16; live_elems]
+        } else {
+            Vec::new()
+        };
         for layer in 0..self.n_layers {
-            let k_dst = self.k_device[layer].device_pointer().cu_deviceptr()
-                + (run.start * block_size * self.kv_dim) as u64 * f32_bytes;
-            let v_dst = self.v_device[layer].device_pointer().cu_deviceptr()
-                + (run.start * block_size * self.kv_dim) as u64 * f32_bytes;
+            let elem = self.k_device.elem_size() as u64;
+            let k_dst = self.k_device.ptr(layer)
+                + (run.start * block_size * self.kv_dim) as u64 * elem;
+            let v_dst = self.v_device.ptr(layer)
+                + (run.start * block_size * self.kv_dim) as u64 * elem;
             if live_elems > 0 {
-                unsafe {
-                    cuda_core::sys::cuMemcpyHtoDAsync_v2(
-                        k_dst,
-                        self.k_host[layer].as_ptr() as *const _,
-                        live_elems * f32_bytes as usize,
-                        self.stream.cu_stream(),
-                    );
-                    cuda_core::sys::cuMemcpyHtoDAsync_v2(
-                        v_dst,
-                        self.v_host[layer].as_ptr() as *const _,
-                        live_elems * f32_bytes as usize,
-                        self.stream.cu_stream(),
-                    );
+                if is_f16 {
+                    for (dst, mirror) in [(k_dst, &self.k_host), (v_dst, &self.v_host)] {
+                        for (d, &s) in f16_tmp.iter_mut().zip(mirror[layer][..live_elems].iter())
+                        {
+                            *d = half::f16::from_f32(s).to_bits();
+                        }
+                        unsafe {
+                            cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                                dst,
+                                f16_tmp.as_ptr() as *const _,
+                                live_elems * elem as usize,
+                                self.stream.cu_stream(),
+                            );
+                        }
+                    }
+                } else {
+                    unsafe {
+                        cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                            k_dst,
+                            self.k_host[layer].as_ptr() as *const _,
+                            live_elems * f32_bytes as usize,
+                            self.stream.cu_stream(),
+                        );
+                        cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                            v_dst,
+                            self.v_host[layer].as_ptr() as *const _,
+                            live_elems * f32_bytes as usize,
+                            self.stream.cu_stream(),
+                        );
+                    }
                 }
             }
         }
@@ -926,26 +1103,49 @@ impl CutileKvCache {
     }
 
     /// Same fingerprint, read back from the device run at `base_page`.
+    /// f16 pools: the f16 bits are converted back to f32 BEFORE summing,
+    /// so the value matches [`Self::mirror_bits_checksum`] (the mirror
+    /// holds the dequantized values).
     fn device_prefix_bits_checksum(&self, base_page: usize, tokens: usize) -> u64 {
         let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
-        let f32_bytes = std::mem::size_of::<f32>();
+        let elem = self.k_device.elem_size();
         let live = tokens * self.kv_dim;
-        let mut buf = vec![0.0f32; live];
+        let is_f16 = self.k_device.is_f16();
+        let mut buf32 = vec![0.0f32; live];
+        let mut buf16 = if is_f16 { vec![0u16; live] } else { Vec::new() };
         let mut cs: u64 = 0;
         let base_off =
-            (base_page * block_size * self.kv_dim) as u64 * f32_bytes as u64;
+            (base_page * block_size * self.kv_dim) as u64 * elem as u64;
         for layer in 0..self.n_layers {
             for is_k in [true, false] {
                 let src = if is_k {
-                    self.k_device[layer].device_pointer().cu_deviceptr() + base_off
+                    self.k_device.ptr(layer) + base_off
                 } else {
-                    self.v_device[layer].device_pointer().cu_deviceptr() + base_off
+                    self.v_device.ptr(layer) + base_off
                 };
+                if is_f16 {
+                    let rc = unsafe {
+                        cuda_core::sys::cuMemcpyDtoHAsync_v2(
+                            buf16.as_mut_ptr() as *mut _,
+                            src,
+                            live * elem,
+                            self.stream.cu_stream(),
+                        )
+                    };
+                    if rc != 0 {
+                        return u64::MAX;
+                    }
+                    self.stream.synchronize().ok();
+                    for &h in &buf16 {
+                        cs = cs.wrapping_add(half::f16::from_bits(h).to_f32().to_bits() as u64);
+                    }
+                    continue;
+                }
                 let rc = unsafe {
                     cuda_core::sys::cuMemcpyDtoHAsync_v2(
-                        buf.as_mut_ptr() as *mut _,
+                        buf32.as_mut_ptr() as *mut _,
                         src,
-                        live * f32_bytes,
+                        live * elem,
                         self.stream.cu_stream(),
                     )
                 };
@@ -953,7 +1153,7 @@ impl CutileKvCache {
                     return u64::MAX; // unreadable -- report as mismatch
                 }
                 self.stream.synchronize().ok();
-                for v in &buf {
+                for v in &buf32 {
                     cs = cs.wrapping_add(v.to_bits() as u64);
                 }
             }
@@ -1177,9 +1377,13 @@ mod tests {
 /// bench-decode-ops.
 pub struct GpuKvPagePool {
     /// Per-layer flat pools `[total_pages * page_stride]`, interleaved
-    /// `[page, token_in_page, kv_head, head_dim]`.
+    /// `[page, token_in_page, kv_head, head_dim]`.  Exactly one of the
+    /// f32/f16 vecs is non-empty (the p24 f16 serving pool halves KV
+    /// density; the wrapper's own session cache stays f32).
     k_pools: Vec<Arc<Tensor<f32>>>,
     v_pools: Vec<Arc<Tensor<f32>>>,
+    k_pools_f16: Vec<Arc<Tensor<half::f16>>>,
+    v_pools_f16: Vec<Arc<Tensor<half::f16>>>,
     alloc: crate::gpu_page_pool::PageRunAllocator,
     /// Elements per page (block_size * kv_dim).
     page_stride: usize,
@@ -1238,32 +1442,66 @@ impl GpuKvPagePool {
         total_pages: usize,
         stream: Arc<Stream>,
     ) -> Result<Self, KernelError> {
+        Self::new_with_dims_dtype(n_layers, kv_dim, total_pages, stream, false)
+    }
+
+    /// [`Self::new_with_dims`] with an explicit dtype: `f16 = true`
+    /// allocates half-size pools (the p24 f16 serving pool).
+    pub fn new_with_dims_dtype(
+        n_layers: usize,
+        kv_dim: usize,
+        total_pages: usize,
+        stream: Arc<Stream>,
+        f16: bool,
+    ) -> Result<Self, KernelError> {
         let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
         let page_stride = block_size * kv_dim;
         let layer_elems = total_pages * page_stride;
-        let mut k_pools = Vec::with_capacity(n_layers);
-        let mut v_pools = Vec::with_capacity(n_layers);
+        let mut k_pools = Vec::new();
+        let mut v_pools = Vec::new();
+        let mut k_pools_f16 = Vec::new();
+        let mut v_pools_f16 = Vec::new();
         for _ in 0..n_layers {
-            let k: Arc<Tensor<f32>> = api::zeros::<f32>(&[layer_elems])
-                .sync_on(&stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                .into();
-            let v: Arc<Tensor<f32>> = api::zeros::<f32>(&[layer_elems])
-                .sync_on(&stream)
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                .into();
-            k_pools.push(k);
-            v_pools.push(v);
+            if f16 {
+                let k: Arc<Tensor<half::f16>> = api::zeros::<half::f16>(&[layer_elems])
+                    .sync_on(&stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .into();
+                let v: Arc<Tensor<half::f16>> = api::zeros::<half::f16>(&[layer_elems])
+                    .sync_on(&stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .into();
+                k_pools_f16.push(k);
+                v_pools_f16.push(v);
+            } else {
+                let k: Arc<Tensor<f32>> = api::zeros::<f32>(&[layer_elems])
+                    .sync_on(&stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .into();
+                let v: Arc<Tensor<f32>> = api::zeros::<f32>(&[layer_elems])
+                    .sync_on(&stream)
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                    .into();
+                k_pools.push(k);
+                v_pools.push(v);
+            }
         }
         Ok(Self {
             k_pools,
             v_pools,
+            k_pools_f16,
+            v_pools_f16,
             alloc: crate::gpu_page_pool::PageRunAllocator::new(total_pages),
             page_stride,
             block_size,
             kv_dim,
             stream,
         })
+    }
+
+    /// Whether this pool stores f16 KV.
+    pub fn is_f16(&self) -> bool {
+        !self.k_pools_f16.is_empty()
     }
 
     pub fn free_pages(&self) -> usize {
@@ -1294,12 +1532,22 @@ impl GpuKvPagePool {
     }
 
     /// Per-layer pool tensors (Arc clones; the whole pool, NOT the run).
+    /// Empty for an f16 pool -- use [`Self::k_pool_tensors_f16`].
     pub fn k_pool_tensors(&self) -> Vec<Arc<Tensor<f32>>> {
         self.k_pools.clone()
     }
 
     pub fn v_pool_tensors(&self) -> Vec<Arc<Tensor<f32>>> {
         self.v_pools.clone()
+    }
+
+    /// Per-layer f16 pool tensors (empty for an f32 pool).
+    pub fn k_pool_tensors_f16(&self) -> Vec<Arc<Tensor<half::f16>>> {
+        self.k_pools_f16.clone()
+    }
+
+    pub fn v_pool_tensors_f16(&self) -> Vec<Arc<Tensor<half::f16>>> {
+        self.v_pools_f16.clone()
     }
 
     pub fn total_pages(&self) -> usize {
@@ -1317,6 +1565,11 @@ impl GpuKvPagePool {
         use cutile::tensor::Reshape;
 
         if head_dim == 0 || self.kv_dim % head_dim != 0 {
+            return None;
+        }
+        // GpuKvRun carries f32 views -- f16 pools use CutileKvCache::
+        // new_pooled + the f16 kernels instead.
+        if self.is_f16() {
             return None;
         }
         let run = self.alloc.alloc(pages)?;

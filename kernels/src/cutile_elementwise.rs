@@ -76,6 +76,34 @@ pub mod kernels {
         out.store(silu * tile_up);
     }
 
+    /// f32 -> f16 element cast (p24 f16 KV pool): one program per B-element
+    /// block.  Used by the KV append path -- the pool stores half the
+    /// bytes; conversion happens in registers.
+    #[cutile::entry()]
+    pub fn cutile_cast_f32_f16<const B: i32>(
+        out: &mut Tensor<half::f16, { [B] }>,
+        src: &Tensor<f32, { [-1] }>,
+    ) {
+        let pid = program_id(0);
+        let tile: Tile<f32, { [B] }> = src.partition(shape![B]).load([pid]);
+        let cast: Tile<half::f16, { [B] }> = convert_tile(tile);
+        out.store(cast);
+    }
+
+    /// f16 -> f32 element cast (p24 f16 KV pool): one program per B-element
+    /// block.  Used by the swap path to rebuild the f32 host mirror from
+    /// an f16 pool (the DRAM tier keeps an f32 mirror for now).
+    #[cutile::entry()]
+    pub fn cutile_cast_f16_f32<const B: i32>(
+        out: &mut Tensor<f32, { [B] }>,
+        src: &Tensor<half::f16, { [-1] }>,
+    ) {
+        let pid = program_id(0);
+        let tile: Tile<half::f16, { [B] }> = src.partition(shape![B]).load([pid]);
+        let cast: Tile<f32, { [B] }> = convert_tile(tile);
+        out.store(cast);
+    }
+
     /// GELU-gated MLP (Gemma GeGLU): out[i] = gelu(gate[i]) * up[i].
     /// gelu(x) = 0.5*x*(1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)));
     /// tanh via 1 - 2/(exp(2y)+1) (overflow-safe: y -> inf gives 1).
@@ -140,6 +168,87 @@ const B: usize = 32;
 /// same math (elementwise -- bitwise-identical for any tile size) with
 /// properly sized memory transactions.
 const SILU_B: usize = 256;
+
+/// Tile width for the f32<->f16 cast kernels (4KB reads / 2KB writes).
+pub const CAST_B: usize = 1024;
+
+/// Cast the first `n` elements of an f32 device tensor into an f16 device
+/// tensor (p24 f16 KV pool append path).  `src` must hold at least
+/// `n` rounded up to a CAST_B multiple; `dst` is RESIZED to that count
+/// (the returned Arc replaces the caller's).  Async on `stream`.
+pub fn cast_f32_to_f16_dev(
+    src: &Arc<Tensor<f32>>,
+    dst: Arc<Tensor<half::f16>>,
+    n: usize,
+    stream: &Arc<Stream>,
+) -> Result<Arc<Tensor<half::f16>>> {
+    let n_pad = n.div_ceil(CAST_B) * CAST_B;
+    if src.size() < n_pad {
+        return Err(KernelError::InvalidConfig(format!(
+            "cast_f32_to_f16: src holds {} elements, need {n_pad}",
+            src.size()
+        )));
+    }
+    let dst_tensor = match Arc::try_unwrap(dst) {
+        Ok(t) if t.size() == n_pad => t,
+        Ok(t) => t
+            .reshape(&[n_pad])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        Err(_) => {
+            return Err(KernelError::InvalidConfig(
+                "cast_f32_to_f16: dst Arc has live clones".into(),
+            ))
+        }
+    };
+    let dst_part = dst_tensor.partition([CAST_B]);
+    // SAFETY: tensors are re-Arc'd from the launch return; accessed only
+    // after subsequent stream ops.
+    let (dst_out, _src) = unsafe {
+        kernels::cutile_cast_f32_f16(dst_part, src.clone())
+            .generics(vec![CAST_B.to_string()])
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+    };
+    Ok(Arc::new(dst_out.unpartition()))
+}
+
+/// Cast the first `n` elements of an f16 device tensor into an f32 device
+/// tensor (p24 f16 KV pool: rebuild the f32 host-mirror staging).  Same
+/// contract as [`cast_f32_to_f16_dev`] with the dtypes swapped.
+pub fn cast_f16_to_f32_dev(
+    src: &Arc<Tensor<half::f16>>,
+    dst: Arc<Tensor<f32>>,
+    n: usize,
+    stream: &Arc<Stream>,
+) -> Result<Arc<Tensor<f32>>> {
+    let n_pad = n.div_ceil(CAST_B) * CAST_B;
+    if src.size() < n_pad {
+        return Err(KernelError::InvalidConfig(format!(
+            "cast_f16_to_f32: src holds {} elements, need {n_pad}",
+            src.size()
+        )));
+    }
+    let dst_tensor = match Arc::try_unwrap(dst) {
+        Ok(t) if t.size() == n_pad => t,
+        Ok(t) => t
+            .reshape(&[n_pad])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        Err(_) => {
+            return Err(KernelError::InvalidConfig(
+                "cast_f16_to_f32: dst Arc has live clones".into(),
+            ))
+        }
+    };
+    let dst_part = dst_tensor.partition([CAST_B]);
+    // SAFETY: see cast_f32_to_f16_dev.
+    let (dst_out, _src) = unsafe {
+        kernels::cutile_cast_f16_f32(dst_part, src.clone())
+            .generics(vec![CAST_B.to_string()])
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+    };
+    Ok(Arc::new(dst_out.unpartition()))
+}
 
 /// GPU-accelerated elementwise operations using NVIDIA cuTile Rust (`cutile-rs`).
 ///

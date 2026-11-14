@@ -5873,7 +5873,7 @@ impl CutileGpuModel {
             let kv_ptrs_stale = match *graph_cache {
                 Some(ref dg) => {
                     (0..cfg.num_layers).any(|l| {
-                        let (k, v) = gpu_kv_cache.kv_device_tensors(l);
+                        let (k, v) = gpu_kv_cache.kv_device_tensors(l).expect("wrapper session cache is f32");
                         k.device_pointer().cu_deviceptr() != dg.captured_k_ptrs[l]
                             || v.device_pointer().cu_deviceptr() != dg.captured_v_ptrs[l]
                     }) || gpu_kv_cache.capacity_gen() != dg.captured_capacity_gen
@@ -5960,6 +5960,7 @@ impl CutileGpuModel {
                 .map(|l| {
                     gpu_kv_cache
                         .kv_device_tensors(l)
+                            .expect("wrapper session cache is f32")
                         .0
                         .device_pointer()
                         .cu_deviceptr()
@@ -5969,6 +5970,7 @@ impl CutileGpuModel {
                 .map(|l| {
                     gpu_kv_cache
                         .kv_device_tensors(l)
+                            .expect("wrapper session cache is f32")
                         .1
                         .device_pointer()
                         .cu_deviceptr()
@@ -6323,7 +6325,7 @@ impl CutileGpuModel {
             // graph-stable: the src/cache pointers are captured once; only the
             // value at d_kv_write_offset changes (updated via H->D before each step).
             let kv_dim_u32 = (n_kv_heads * head_dim) as u32;
-            let (k_cache_arc, v_cache_arc) = gpu_kv_cache.kv_device_tensors(layer);
+            let (k_cache_arc, v_cache_arc) = gpu_kv_cache.kv_device_tensors(layer).expect("wrapper session cache is f32");
             let write_off_ptr = self.d_kv_write_offset.device_pointer().cu_deviceptr();
             let cu_stream_raw = shared_stream.cu_stream();
             self.kv_scatter_write
@@ -6351,7 +6353,7 @@ impl CutileGpuModel {
 
             // GPU decode attention (fused flash-attention, pre-allocated scratch).
             let scale = 1.0 / (head_dim as f32).sqrt();
-            let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer);
+            let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer).expect("wrapper session cache is f32");
 
             // Prefer oxide decode attention (kv_len read from device at execution
             // time -- correct CUDA graph replay without stale kv_len baking).
@@ -7205,12 +7207,14 @@ impl CutileGpuModel {
                 // Falls back to the host-based path when:
                 //   - seq_len > 1 (prefill): GPU flash attention via forward_batched
                 //   - seq_len == 1 but kv_len > GPU_KV_MAX_SEQ_LEN: CPU GQA fallback
-                let attn_padded_dev = if seq_len == 1 && gpu_kv_cache.has_device_kv() {
+                let attn_padded_dev = if seq_len == 1 && gpu_kv_cache.has_device_kv()
+                    && !gpu_kv_cache.kv_f16()
+                {
                     // GPU decode attention: Q on device, K/V from GPU-resident cache.
                     // Use scratch variant to eliminate the per-call api::zeros.sync_on
                     // allocation (a full stream sync + cudaMallocAsync) -- saves 28
                     // blocking allocs per decode token across all layers.
-                    let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer);
+                    let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer).expect("wrapper session cache is f32");
                     let attn_out_dev = self
                         .flash_attn
                         .decode_attention_device_scratch(
@@ -7235,34 +7239,58 @@ impl CutileGpuModel {
                     // read on device) -- the 2x cutile_gather_heads + the
                     // head-major K/V scratch are skipped.  TEMPURA_NO_PAGED_
                     // ATTN=1 bisects back to the gather/scatter chain.
-                    let use_paged =
-                        std::env::var("TEMPURA_NO_PAGED_ATTN").as_deref() != Ok("1");
+                    // f16 pools ALWAYS take the paged path (the gather
+                    // chain's cutile_gather_heads is f32-only).
+                    let use_paged = std::env::var("TEMPURA_NO_PAGED_ATTN").as_deref() != Ok("1")
+                        || gpu_kv_cache.kv_f16();
                     let attn_flat = if use_paged {
-                        let (k_pool, v_pool, block_table, kv_len_dev) = gpu_kv_cache
+                        let (views, block_table, kv_len_dev) = gpu_kv_cache
                             .paged_attn_inputs(layer, head_dim, kv_len)
                             .expect("CutileGpuModel: paged_attn_inputs failed");
-                        self.flash_attn
-                            .prefill_attention_device_paged(
-                                &q_rot_dev,
-                                &k_pool,
-                                &v_pool,
-                                &block_table,
-                                &kv_len_dev,
-                                seq_len,
-                                kv_len,
-                                n_heads,
-                                n_kv_heads,
-                                head_dim,
-                                scale,
-                                self.matmul.stream(),
-                                &mut self.prefill_attn_scratch.borrow_mut(),
-                            )
-                            .expect("CutileGpuModel: GPU paged prefill attention failed")
+                        let attn_flat = match views {
+                            crate::cutile_kv_cache::PagedAttnViews::F32(k_pool, v_pool) => self
+                                .flash_attn
+                                .prefill_attention_device_paged(
+                                    &q_rot_dev,
+                                    &k_pool,
+                                    &v_pool,
+                                    &block_table,
+                                    &kv_len_dev,
+                                    seq_len,
+                                    kv_len,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    scale,
+                                    self.matmul.stream(),
+                                    &mut self.prefill_attn_scratch.borrow_mut(),
+                                )
+                                .expect("CutileGpuModel: GPU paged prefill attention failed"),
+                            crate::cutile_kv_cache::PagedAttnViews::F16(k_pool, v_pool) => self
+                                .flash_attn
+                                .prefill_attention_device_paged_f16(
+                                    &q_rot_dev,
+                                    &k_pool,
+                                    &v_pool,
+                                    &block_table,
+                                    &kv_len_dev,
+                                    seq_len,
+                                    kv_len,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    scale,
+                                    self.matmul.stream(),
+                                    &mut self.prefill_attn_scratch.borrow_mut(),
+                                )
+                                .expect("CutileGpuModel: GPU f16 paged prefill attention failed"),
+                        };
+                        attn_flat
                     } else {
                         // gather Q/K/V -> one multi-head flash-attn launch ->
                         // scatter, all async on the stream; the O-proj input is
                         // padded via D->D copy below.  Zero PCIe, zero host syncs.
-                        let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer);
+                        let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer).expect("wrapper session cache is f32");
                         self.flash_attn
                             .prefill_attention_device(
                                 &q_rot_dev,
@@ -7690,6 +7718,7 @@ impl CutileGpuModel {
                 .map(|l| {
                     gpu_kv_cache
                         .kv_device_tensors(l)
+                            .expect("wrapper session cache is f32")
                         .0
                         .device_pointer()
                         .cu_deviceptr()
@@ -7699,6 +7728,7 @@ impl CutileGpuModel {
                 .map(|l| {
                     gpu_kv_cache
                         .kv_device_tensors(l)
+                            .expect("wrapper session cache is f32")
                         .1
                         .device_pointer()
                         .cu_deviceptr()
@@ -8444,7 +8474,9 @@ impl CutileGpuModel {
                     } else {
                         // cuTile fallback: whole-tensor pointers (see the
                         // pooled-run limitation note at the other fallback).
-                        let (k_full, v_full) = kv_caches[r].kv_device_tensors(layer);
+                        let (k_full, v_full) = kv_caches[r]
+                            .kv_device_tensors(layer)
+                            .expect("f16 pools require the oxide attention kernels");
                         let attn_out = &self.batch_attn_out[r];
                         let _ = self
                             .flash_attn
@@ -9656,9 +9688,14 @@ impl CutileGpuModel {
         // All projection weights must be Q4K (checked once at model load time).
         let positions_equal = positions.windows(2).all(|w| w[0] == w[1]);
         let kv_all_device = kv_caches.iter().all(|kvc| kvc.has_device_kv());
+        // f16 pools cannot use the captured batch graphs yet (kv_scatter_
+        // write and the graph-baked attention are f32) -- the ragged
+        // no-graph path handles them (serving is ragged anyway).
+        let kv_all_f32 = kv_caches.iter().all(|kvc| !kvc.kv_f16());
         let base_ok = m >= 2
             && m <= self.max_batch_graph
             && kv_all_device
+            && kv_all_f32
             && !cfg.use_alibi
             && positions_equal
             && self.oxide_decode_attn.is_some()
@@ -9931,18 +9968,20 @@ impl CutileGpuModel {
                                 .sync_on(stream)
                                 .expect("attn out_r alloc"),
                         );
-                        oda.forward_d2d_ptrs(
-                            &out_r,
-                            q_rot,
-                            k_base,
-                            v_base,
-                            &self.d_kv_len,
-                            n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            scale,
-                        )
-                        .expect("batch attn single step failed");
+                        // f16 pools dispatch to the f16 twin (K/V read as
+                        // f16 bits, converted in-kernel).
+                        let attn_res = if kv_caches[r].kv_f16() {
+                            oda.forward_d2d_ptrs_f16(
+                                &out_r, q_rot, k_base, v_base, &self.d_kv_len, n_heads,
+                                n_kv_heads, head_dim, scale,
+                            )
+                        } else {
+                            oda.forward_d2d_ptrs(
+                                &out_r, q_rot, k_base, v_base, &self.d_kv_len, n_heads,
+                                n_kv_heads, head_dim, scale,
+                            )
+                        };
+                        attn_res.expect("batch attn single step failed");
                         // Copy out_r into attn_out at offset r*q_dim.
                         unsafe {
                             cuda_core::memcpy_dtod_async::<f32>(
@@ -9971,7 +10010,9 @@ impl CutileGpuModel {
                     // documented-broken (corr 0.66, never exercised with
                     // oxide loaded); pooled batch caches require oxide
                     // attention (see forward_batch_mxfp4_inner_graph).
-                    let (k_full, v_full) = kv_caches[r].kv_device_tensors(layer);
+                    let (k_full, v_full) = kv_caches[r]
+                            .kv_device_tensors(layer)
+                            .expect("f16 pools require the oxide attention kernels");
                     let kv_len_r = (kv_caches[r].seq_len() + 1) as i32;
                     let attn_r = self
                         .flash_attn

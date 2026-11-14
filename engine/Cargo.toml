@@ -16,6 +16,7 @@ openmp = ["tempura-kernels/openmp"]
 [dependencies]
 tempura-kernel-api = { path = "../kernel-api" }
 tempura-kernels = { path = "../kernels" }
+half = "2"
 safetensors = "0.5"
 tokenizers = "0.21"
 thiserror = "2"
