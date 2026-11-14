@@ -244,6 +244,7 @@ pub trait RoPE: Send + Sync {
 
 // -- Sampler -----------------------------------------------------------------
 
+#[derive(Debug, Clone)]
 pub struct SamplingParams {
     pub temperature: f32,
     pub top_k: usize,
