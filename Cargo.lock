@@ -3548,6 +3548,7 @@ dependencies = [
  "bytemuck",
  "cuda-core",
  "cutile",
+ "half",
  "hf-chat-template",
  "memmap2",
  "minijinja",
