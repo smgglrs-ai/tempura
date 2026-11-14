@@ -24,6 +24,25 @@ use tempura_kernels::KernelError;
 
 use crate::config::ModelConfig;
 
+/// Recoverable KV-pool exhaustion: what a failed run growth needed vs
+/// what the pool had free.  Carried up to the batch scheduler, which
+/// picks a swap victim ([`CutileKvCache::swap_out`]) and retries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolExhausted {
+    /// Pages the failing growth needed.
+    pub need_pages: usize,
+    /// Pages free in the pool at failure time.
+    pub free_pages: usize,
+}
+
+/// [`CutileKvCache::try_ensure_capacity`] error: pool exhaustion is
+/// RECOVERABLE (evict + retry); kernel errors are not.
+#[derive(Debug)]
+pub enum EnsureCapacityError {
+    Exhausted(PoolExhausted),
+    Kernel(KernelError),
+}
+
 /// Maximum number of tokens stored in the GPU-resident KV cache.
 ///
 /// Set to 4096.  For models with `max_seq_len > GPU_KV_MAX_SEQ_LEN` the GPU
@@ -75,6 +94,9 @@ pub struct CutileKvCache {
     /// logical block i IS physical page i.  Lazily allocated once;
     /// contents never change, so the pointer is CUDA-graph stable.
     block_table_dev: Option<Arc<Tensor<i32>>>,
+    /// Bits-checksum of the host mirror's live prefix at swap_out --
+    /// swap_in verifies its device readback against it (p24 A/B debug).
+    swap_checksum: Option<u64>,
     /// Device scalar holding the current kv_len for the paged attention
     /// kernel (read at EXECUTION time, not launch time -- CUDA-graph
     /// safe, the kv_scatter_write device-offset pattern).  Lazily
@@ -134,6 +156,7 @@ impl CutileKvCache {
             gpu_max_seq_len,
             host_stale: false,
             block_table_dev: None,
+            swap_checksum: None,
             kv_len_dev: None,
             pool: None,
             base_page: 0,
@@ -194,12 +217,31 @@ impl CutileKvCache {
             gpu_max_seq_len,
             host_stale: false,
             block_table_dev: None,
+            swap_checksum: None,
             kv_len_dev: None,
             pool: Some(pool),
             base_page,
             run_pages,
             capacity_gen: 0,
         })
+    }
+
+    /// Token capacity of the current run (pooled mode; 0 = dedicated).
+    pub fn run_pages(&self) -> usize {
+        self.run_pages
+    }
+
+    /// Pages free in the shared pool (None = dedicated mode).  Lets the
+    /// scheduler check swap-in headroom before attempting it.
+    pub fn pool_free_pages(&self) -> Option<usize> {
+        self.pool
+            .as_ref()
+            .and_then(|p| p.lock().ok().map(|p| p.free_pages()))
+    }
+
+    /// Pages a run must hold to cover `tokens` (page granularity).
+    pub fn pages_for_tokens(tokens: usize) -> usize {
+        tokens.div_ceil(tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE)
     }
 
     pub fn base_page(&self) -> usize {
@@ -221,6 +263,18 @@ impl CutileKvCache {
     /// graphs detect the pointer change and re-capture).  Growth uses a
     /// 2x factor to amortize.
     pub fn ensure_capacity(&mut self, tokens: usize) -> Result<(), KernelError> {
+        self.try_ensure_capacity(tokens).map_err(|e| match e {
+            EnsureCapacityError::Exhausted(_) => {
+                KernelError::InvalidConfig("KV pool exhausted on growth".into())
+            }
+            EnsureCapacityError::Kernel(e) => e,
+        })
+    }
+
+    /// [`Self::ensure_capacity`] with a recoverable error: on pool
+    /// exhaustion returns the pages needed and the pages free, so the
+    /// caller (the batch scheduler) can pick a swap victim and retry.
+    pub fn try_ensure_capacity(&mut self, tokens: usize) -> Result<(), EnsureCapacityError> {
         let Some(pool_arc) = self.pool.clone() else {
             return Ok(());
         };
@@ -231,7 +285,7 @@ impl CutileKvCache {
         }
         let mut pool = pool_arc
             .lock()
-            .map_err(|_| KernelError::InvalidConfig("pool mutex poisoned".into()))?;
+            .map_err(|_| EnsureCapacityError::Exhausted(PoolExhausted { need_pages, free_pages: 0 }))?;
         // Headroom: 2x the current run, at least +256 tokens.
         let target_pages = need_pages
             .max(self.run_pages * 2)
@@ -249,9 +303,12 @@ impl CutileKvCache {
             return Ok(());
         }
         // Reallocate: alloc a bigger run, copy the live prefix, free old.
-        let new_run = pool
-            .alloc_pages(target_pages)
-            .ok_or_else(|| KernelError::InvalidConfig("KV pool exhausted on growth".into()))?;
+        let new_run = pool.alloc_pages(target_pages).ok_or(
+            EnsureCapacityError::Exhausted(PoolExhausted {
+                need_pages: target_pages,
+                free_pages: pool.free_pages(),
+            }),
+        )?;
         let old_base = self.base_page;
         let f32_bytes = std::mem::size_of::<f32>() as u64;
         let live_elems = self.seq_len * self.kv_dim;
@@ -267,9 +324,13 @@ impl CutileKvCache {
             if live_elems > 0 {
                 unsafe {
                     cuda_core::memcpy_dtod_async::<f32>(k_dst, k_src, live_elems, &self.stream)
-                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+                        .map_err(|e| {
+                            EnsureCapacityError::Kernel(KernelError::InvalidConfig(e.to_string()))
+                        })?;
                     cuda_core::memcpy_dtod_async::<f32>(v_dst, v_src, live_elems, &self.stream)
-                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+                        .map_err(|e| {
+                            EnsureCapacityError::Kernel(KernelError::InvalidConfig(e.to_string()))
+                        })?;
                 }
             }
         }
@@ -662,9 +723,6 @@ impl CutileKvCache {
                 self.kv_dim
             )));
         }
-        // Single-client invariant (see the `pool` field docs): the
-        // identity table is only valid while the run sits at pool base.
-        debug_assert!(self.pool.is_none() || self.base_page == 0);
         // View rows from the TENSOR's actual element count: in pooled
         // mode the tensor is the whole pool (bigger than the run).
         let tensor_elems = self.k_device[layer]
@@ -680,11 +738,18 @@ impl CutileKvCache {
             .reshape(&[rows, head_dim])
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
 
+        // Affine table: block i of this run is physical page base+i.  The
+        // identity table was only valid for base-0 runs -- with several
+        // pooled sessions every non-base run attended to the FIRST run's
+        // KV through it (identical mush across clients, found by the
+        // p24 streaming A/B).
         if self.block_table_dev.is_none() {
             let max_blocks = self
                 .gpu_max_seq_len
                 .div_ceil(tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE);
-            let table: Vec<i32> = (0..max_blocks as i32).collect();
+            let table: Vec<i32> = (0..max_blocks)
+                .map(|i| (self.base_page + i) as i32)
+                .collect();
             let t = api::copy_host_vec_to_device(&Arc::new(table))
                 .sync_on(&self.stream)
                 .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
@@ -758,6 +823,13 @@ impl CutileKvCache {
         // copy completes, which stream ordering guarantees on this
         // cache's stream.
         self.sync_host_from_device(self.seq_len)?;
+        self.swap_checksum = Some(self.mirror_bits_checksum());
+        let freed_pages = self.run_pages;
+        let cs = self.swap_checksum.unwrap();
+        eprintln!(
+            "[swap] out: seq={} base={} pages={} mirror_cs={cs:016x}",
+            self.seq_len, self.base_page, freed_pages
+        );
         let mut pool = pool_arc
             .lock()
             .map_err(|_| KernelError::InvalidConfig("pool mutex poisoned".into()))?;
@@ -821,12 +893,78 @@ impl CutileKvCache {
         self.capacity_gen += 1;
         self.block_table_dev = None;
         self.host_stale = false;
+        // Verify the uploaded prefix bit-for-bit against the swap_out
+        // checksum (p24 A/B debug: the swapped sessions diverged by one
+        // token at resume -- this pins whether the KV data survived).
+        if let Some(cs_out) = self.swap_checksum {
+            let cs_dev = self.device_prefix_bits_checksum(run.start, self.seq_len);
+            eprintln!(
+                "[swap] in: seq={} base={} pages={} mirror_cs={cs_out:016x} device_cs={cs_dev:016x} {}",
+                self.seq_len,
+                run.start,
+                run.pages,
+                if cs_out == cs_dev { "EXACT" } else { "MISMATCH" }
+            );
+        }
         Ok(())
+    }
+
+    /// Sum of the raw f32 bits of the host mirror's live prefix (all
+    /// layers, K and V) -- a bit-exact fingerprint for swap verification.
+    fn mirror_bits_checksum(&self) -> u64 {
+        let live = self.seq_len * self.kv_dim;
+        let mut cs: u64 = 0;
+        for layer in 0..self.n_layers {
+            for v in &self.k_host[layer][..live] {
+                cs = cs.wrapping_add(v.to_bits() as u64);
+            }
+            for v in &self.v_host[layer][..live] {
+                cs = cs.wrapping_add(v.to_bits() as u64);
+            }
+        }
+        cs
+    }
+
+    /// Same fingerprint, read back from the device run at `base_page`.
+    fn device_prefix_bits_checksum(&self, base_page: usize, tokens: usize) -> u64 {
+        let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
+        let f32_bytes = std::mem::size_of::<f32>();
+        let live = tokens * self.kv_dim;
+        let mut buf = vec![0.0f32; live];
+        let mut cs: u64 = 0;
+        let base_off =
+            (base_page * block_size * self.kv_dim) as u64 * f32_bytes as u64;
+        for layer in 0..self.n_layers {
+            for is_k in [true, false] {
+                let src = if is_k {
+                    self.k_device[layer].device_pointer().cu_deviceptr() + base_off
+                } else {
+                    self.v_device[layer].device_pointer().cu_deviceptr() + base_off
+                };
+                let rc = unsafe {
+                    cuda_core::sys::cuMemcpyDtoHAsync_v2(
+                        buf.as_mut_ptr() as *mut _,
+                        src,
+                        live * f32_bytes,
+                        self.stream.cu_stream(),
+                    )
+                };
+                if rc != 0 {
+                    return u64::MAX; // unreadable -- report as mismatch
+                }
+                self.stream.synchronize().ok();
+                for v in &buf {
+                    cs = cs.wrapping_add(v.to_bits() as u64);
+                }
+            }
+        }
+        cs
     }
 
     pub fn kv_dim(&self) -> usize {
         self.kv_dim
     }
+
 
     /// Upload the live K/V prefix (first `kv_len` tokens) for `layer` to
     /// device and return the resulting device tensors.
@@ -856,6 +994,32 @@ impl CutileKvCache {
             .into();
 
         Ok((k_dev, v_dev))
+    }
+}
+
+impl Drop for CutileKvCache {
+    /// Free the run back to the pool (pooled mode).  Without this, a
+    /// completed session's pages are lost forever when the pool outlives
+    /// the session (the server's process-lifetime pool) -- dropping the
+    /// cache only released the pool Arc.  `swap_out` zeroes `run_pages`,
+    /// so a swapped-out cache drops without double-freeing.
+    ///
+    /// Stream ordering makes the free safe against in-flight kernels:
+    /// every kernel touching this run was launched on the pool's stream,
+    /// and any future writer of these pages is allocated and launched
+    /// behind the free on the same stream (the swap_out argument).
+    fn drop(&mut self) {
+        if self.run_pages == 0 {
+            return;
+        }
+        if let Some(pool_arc) = self.pool.clone() {
+            if let Ok(mut pool) = pool_arc.lock() {
+                pool.free_pages_alloc(crate::gpu_page_pool::Run {
+                    start: self.base_page,
+                    pages: self.run_pages,
+                });
+            }
+        }
     }
 }
 

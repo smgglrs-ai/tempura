@@ -370,6 +370,52 @@ pub trait InferenceModel: Send + Sync {
         &mut self,
         loader: &dyn crate::loader::WeightLoader,
     ) -> Result<(), crate::weights::WeightsError>;
+
+    // ------------------------------------------------------------------
+    // Multi-session GPU serving (p24-kv-swap wiring).  Default impls keep
+    // CPU models on the existing per-session path (None = "not a pooled
+    // GPU model; use forward()").
+    // ------------------------------------------------------------------
+    /// Create the process-shared KV page pool (once).  None = CPU model
+    /// or pool creation failed.
+    #[cfg(feature = "cutile")]
+    fn new_kv_pool(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>>> {
+        None
+    }
+    /// Per-session pooled KV cache from `pool`.
+    #[cfg(feature = "cutile")]
+    fn new_session_kv_cache(
+        &self,
+        _pool: &std::sync::Arc<std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>>,
+        _initial_tokens: usize,
+    ) -> Option<crate::cutile_kv_cache::CutileKvCache> {
+        None
+    }
+    /// Single-sequence forward with a CALLER-SUPPLIED KV cache (the
+    /// per-session run; prefill chunks + m=1 decode).  None = fall back
+    /// to forward().
+    #[cfg(feature = "cutile")]
+    fn forward_with_kv(
+        &self,
+        _session: &mut InferenceSession,
+        _token_ids: &[u32],
+        _kv: &mut crate::cutile_kv_cache::CutileKvCache,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+    /// Batched decode over per-session caches (stateful: advances every
+    /// cache).  None = fall back to per-session forward().
+    #[cfg(feature = "cutile")]
+    fn forward_batch_with_kvs(
+        &self,
+        _token_ids: &[u32],
+        _positions: &[u32],
+        _kv_caches: &mut [crate::cutile_kv_cache::CutileKvCache],
+    ) -> Option<Vec<Vec<f32>>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -10217,7 +10263,7 @@ impl CutileInferenceWrapper {
                 } else {
                     let cfg = &self.model.config;
                     let bytes_per_token = 2 * cfg.num_layers * cfg.num_kv_heads * cfg.head_dim * 4;
-                    let free = crate::cutile_gpu_forward::query_free_vram_bytes();
+                    let free = gm.free_vram_bytes();
                     let usable = free.saturating_sub(2 << 30) / 4;
                     let default_tokens =
                         (usable / bytes_per_token.max(1)).clamp(1, cfg.max_seq_len);
@@ -10340,7 +10386,7 @@ impl CutileInferenceWrapper {
         // Pool sizing: quarter of free VRAM (the session pool takes a
         // quarter too; together they leave half for batch-graph scratch),
         // at least enough for n minimal runs.
-        let free = crate::cutile_gpu_forward::query_free_vram_bytes();
+        let free = gm.free_vram_bytes();
         let usable = free.saturating_sub(2 << 30) / 4;
         let pool_tokens = (usable / bytes_per_token.max(1))
             .max(n * 256)
@@ -10384,6 +10430,69 @@ impl CutileInferenceWrapper {
                     .collect()
             }
         }
+    }
+
+    /// Create the SHARED KV page pool for multi-session serving (the
+    /// p24-kv-swap wiring).  Sized like the session pool (quarter of free
+    /// VRAM, `TEMPURA_KV_POOL_TOKENS` override); created ONCE per process
+    /// and outlived by every session's cache (which frees its run on
+    /// drop).  Returns None when the GPU model isn't loaded or pool
+    /// creation fails.
+    pub fn new_kv_pool(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>>> {
+        let gm = self.gpu_model.as_ref()?;
+        let cfg = &self.model.config;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let bytes_per_token = 2 * cfg.num_layers * kv_dim * 4;
+        let free = gm.free_vram_bytes();
+        let usable = free.saturating_sub(2 << 30) / 4;
+        let default_tokens = (usable / bytes_per_token.max(1))
+            .max(256)
+            .min(cfg.max_seq_len.max(256));
+        let tokens = std::env::var("TEMPURA_KV_POOL_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_tokens)
+            .min(cfg.max_seq_len.max(256));
+        let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
+        let pool_pages = tokens.div_ceil(block_size);
+        match crate::cutile_kv_cache::GpuKvPagePool::new_with_dims(
+            cfg.num_layers,
+            kv_dim,
+            pool_pages,
+            gm.stream(),
+        ) {
+            Ok(pool) => {
+                eprintln!(
+                    "[cutile] serving KV page pool: {tokens} tokens ({pool_pages} pages), \
+                     free was {:.1} GiB",
+                    free as f64 / (1 << 30) as f64,
+                );
+                Some(std::sync::Arc::new(std::sync::Mutex::new(pool)))
+            }
+            Err(e) => {
+                eprintln!("[cutile] serving KV pool creation failed ({e})");
+                None
+            }
+        }
+    }
+
+    /// Per-session KV cache holding a run from the shared pool
+    /// ([`Self::new_kv_pool`]).  The run is freed on drop.
+    pub fn new_session_kv_cache(
+        &self,
+        pool: &std::sync::Arc<std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>>,
+        initial_tokens: usize,
+    ) -> Option<crate::cutile_kv_cache::CutileKvCache> {
+        let gm = self.gpu_model.as_ref()?;
+        crate::cutile_kv_cache::CutileKvCache::new_pooled(
+            &self.model.config,
+            pool.clone(),
+            initial_tokens,
+            gm.stream(),
+        )
+        .ok()
     }
 
     /// Batched decode: M requests x 1 token each in one GPU forward pass.
@@ -10515,6 +10624,52 @@ impl InferenceModel for CutileInferenceWrapper {
         }
         // Fallback: CPU forward (GPU model or KV cache not ready).
         self.model.forward(session, token_ids)
+    }
+    fn new_kv_pool(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>>> {
+        CutileInferenceWrapper::new_kv_pool(self)
+    }
+    fn new_session_kv_cache(
+        &self,
+        pool: &std::sync::Arc<std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>>,
+        initial_tokens: usize,
+    ) -> Option<crate::cutile_kv_cache::CutileKvCache> {
+        CutileInferenceWrapper::new_session_kv_cache(self, pool, initial_tokens)
+    }
+    fn forward_with_kv(
+        &self,
+        session: &mut InferenceSession,
+        token_ids: &[u32],
+        kv: &mut crate::cutile_kv_cache::CutileKvCache,
+    ) -> Option<Vec<f32>> {
+        let gm = self.gpu_model.as_ref()?;
+        let qw = self.model.quantized_weights.as_ref()?;
+        let logits = gm.forward(session.position, token_ids, qw, kv);
+        kv.advance(token_ids.len());
+        session.cache.advance(token_ids.len());
+        session.position += token_ids.len();
+        Some(logits)
+    }
+    fn forward_batch_with_kvs(
+        &self,
+        token_ids: &[u32],
+        positions: &[u32],
+        kv_caches: &mut [crate::cutile_kv_cache::CutileKvCache],
+    ) -> Option<Vec<Vec<f32>>> {
+        if self.gpu_model.is_none() || self.model.quantized_weights.is_none() {
+            return None;
+        }
+        let rows = self.forward_batch_decode_stateful(token_ids, positions, kv_caches);
+        assert_eq!(
+            rows.len(),
+            token_ids.len(),
+            "forward_batch_with_kvs: {} logit rows for m={}, positions {:?}",
+            rows.len(),
+            token_ids.len(),
+            positions
+        );
+        Some(rows)
     }
     fn forward_greedy(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Option<u32> {
         if let (Some(gm), Some(qw), Some(kv_mutex)) = (
@@ -10694,6 +10849,19 @@ impl InferenceModel for CutileInferenceWrapper {
         loader: &dyn crate::loader::WeightLoader,
     ) -> Result<(), crate::weights::WeightsError> {
         self.model.load_weights(loader)?;
+        self.try_upload_gpu();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cutile")]
+impl CutileInferenceWrapper {
+    /// Build the GPU model (weight upload + kernel compile) from the
+    /// already-populated quantized/f32 weights.  Called by load_weights,
+    /// and directly by callers that inject weights without a loader
+    /// (the server's GGUF path -- without this the wrapper silently
+    /// runs CPU forwards).
+    pub fn try_upload_gpu(&mut self) {
         // After loading, dequantize and upload all projection weights to the GPU,
         // then create the GPU KV cache backed by the same CUDA stream.
         let gpu_model_result = if let Some(qw) = self.model.quantized_weights.as_mut() {
@@ -10745,7 +10913,6 @@ impl InferenceModel for CutileInferenceWrapper {
                 }
             }
         }
-        Ok(())
     }
 }
 

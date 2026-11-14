@@ -3081,6 +3081,24 @@ impl CutileGpuModel {
         self.matmul.stream().clone()
     }
 
+    /// Free VRAM in bytes, binding the model's primary context to the
+    /// calling thread first.  The driver API needs a CURRENT context per
+    /// thread; cuda-oxide ops bind internally, but a bare cuMemGetInfo_v2
+    /// from a thread that never built the context (the engine thread)
+    /// fails with rc=201 (INVALID_CONTEXT) and pool sizing sees 0 free.
+    pub fn free_vram_bytes(&self) -> usize {
+        let device = self.matmul.stream().context().device();
+        let _ = device.primary_context().and_then(|c| c.bind_to_thread());
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        let rc = unsafe { cuda_core::sys::cuMemGetInfo_v2(&mut free as *mut _, &mut total as *mut _) };
+        if rc != 0 {
+            eprintln!("[cutile] cuMemGetInfo_v2 failed (rc={rc}); assuming 0 free VRAM");
+            return 0;
+        }
+        free
+    }
+
     /// Returns true if MXFP4 tiled batch GEMM is available (sm_120a hardware + weights loaded).
     pub fn has_mxfp4(&self) -> bool {
         self.mxfp4_gemm.is_some() && !self.device_weights_mxfp4_tiled.is_empty()
@@ -5031,7 +5049,11 @@ impl CutileGpuModel {
         }
 
         // Fallback: M sequential GEMVs (no L2 reuse but still GPU-resident).
-        let mut rows: Vec<Arc<Tensor<f32>>> = Vec::with_capacity(m);
+        let out: Arc<Tensor<f32>> = Arc::new(
+            api::zeros::<f32>(&[m * n])
+                .sync_on(stream)
+                .expect("gemm_any_d2d_batch: output alloc"),
+        );
         for r in 0..m {
             let a_row: Arc<Tensor<f32>> = Arc::new(
                 api::zeros::<f32>(&[row_stride])
@@ -5048,20 +5070,16 @@ impl CutileGpuModel {
                 .expect("gemm_any_d2d_batch: a_row D->D slice");
             }
             let result = self.gemm_any_d2d_slot(&a_row, weight_name, 1, slot);
-            rows.push(result);
-        }
-
-        // Concatenate M results [n] -> flat [m*n] (rank-1, compatible with cuTile ops).
-        let out: Arc<Tensor<f32>> = Arc::new(
-            api::zeros::<f32>(&[m * n])
-                .sync_on(stream)
-                .expect("gemm_any_d2d_batch: output alloc"),
-        );
-        for (r, row) in rows.iter().enumerate() {
+            // Copy row r out IMMEDIATELY, inside the loop: the m=1 slot
+            // GEMVs return the SHARED slot scratch, so deferring the
+            // concat past the next row's GEMV hands every row the LAST
+            // row's result (found by the p24 streaming A/B: all clients
+            // generated one shared sequence -- every projection returned
+            // m copies of the final row).
             unsafe {
                 cuda_core::memcpy_dtod_async::<f32>(
                     out.device_pointer().cu_deviceptr() + (r * n * 4) as u64,
-                    row.device_pointer().cu_deviceptr(),
+                    result.device_pointer().cu_deviceptr(),
                     n,
                     stream,
                 )
@@ -9538,7 +9556,16 @@ impl CutileGpuModel {
         // lm_head: [M, H] -> [M, vocab]  -- run outside graph (allocation OK here)
         let logits_dev = self.lm_head_gemm(&last_dev, m, SLOT_LOGITS);
         let logits_flat = self.download_logits(&logits_dev);
-        logits_flat.chunks(vocab).map(|c| c.to_vec()).collect()
+        let rows: Vec<Vec<f32>> = logits_flat.chunks(vocab).take(m).map(|c| c.to_vec()).collect();
+        assert_eq!(
+            rows.len(),
+            m,
+            "forward_batch_decode (graph): {} logit rows for m={} (logits_flat len {})",
+            rows.len(),
+            m,
+            logits_flat.len()
+        );
+        rows
     }
 
     /// Batched decode: M requests x 1 token each, processed in a single GPU pass.
@@ -9563,23 +9590,14 @@ impl CutileGpuModel {
             return vec![];
         }
 
-        // Single request: delegate to the verified single-sequence CUDA-graph
-        // path. m=1 never qualifies for the batch graph (requires m >= 2), and
-        // the generic no-graph fallback below is slow (per-token allocations)
-        // and was never output-verified (the old "M=1 fallback broken" bug).
-        // forward() leaves seq_len advancement to its caller, so advance here
-        // to preserve forward_batch_decode's stateful contract.
-        if m == 1 {
-            let logits = self.forward(
-                positions[0] as usize,
-                &token_ids[..1],
-                qweights,
-                &mut kv_caches[0],
-            );
-            kv_caches[0].advance_host_seq_len(1);
-            kv_caches[0].mark_host_stale();
-            return vec![logits];
-        }
+        // NOTE: no m==1 special case.  Routing a lone sequence through
+        // the single-seq graph path (exact kpar kernels) while multi-seq
+        // steps run the generic path makes a session's logits depend on
+        // batch COMPOSITION -- the p24 streaming A/B requires
+        // composition-invariant output (byte-identical runs with and
+        // without pool pressure).  The generic path computes every
+        // request independently (per-row GEMVs, per-request attention),
+        // so m=1 through it matches any m.
 
         let cfg = &self.config;
         let h = cfg.hidden_size;
@@ -9814,7 +9832,26 @@ impl CutileGpuModel {
                 kv_caches[r]
                     .append_device_gpu_only(layer, &k_rot, &v_r, 1)
                     .expect("batch KV append failed");
-                q_rot_parts.push(q_rot);
+                // q_rot ALIASES the shared q_rope_scratch output buffer --
+                // copy it out NOW, before the next request's RoPE
+                // overwrites the scratch.  Deferring (pushing the alias
+                // and using it after the loop) made every request's
+                // attention run with the LAST request's Q (p24 A/B).
+                let q_rot_fresh: Arc<Tensor<f32>> = Arc::new(
+                    cutile::api::zeros::<f32>(&[q_dim])
+                        .sync_on(stream)
+                        .expect("q_rot fresh alloc"),
+                );
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        q_rot_fresh.device_pointer().cu_deviceptr(),
+                        q_rot.device_pointer().cu_deviceptr(),
+                        q_dim,
+                        stream,
+                    )
+                    .expect("q_rot D->D copy");
+                }
+                q_rot_parts.push(q_rot_fresh);
             }
 
             // Batch flash attention: one kernel launch, M x n_heads blocks.
@@ -9839,7 +9876,7 @@ impl CutileGpuModel {
                         })
                         .collect();
                     let kv_lens: Vec<i32> =
-                        kv_caches.iter().map(|kvc| kvc.seq_len() as i32).collect();
+                        kv_caches.iter().map(|kvc| (kvc.seq_len() + 1) as i32).collect();
 
                     // Concatenate Q-rotated parts into one tensor for the batch kernel.
                     // q_rot_parts[r] is [q_dim], stack to [m * q_dim].
@@ -9877,7 +9914,7 @@ impl CutileGpuModel {
                     );
                     for (r, q_rot) in q_rot_parts.iter().enumerate() {
                         let (k_base, v_base) = kv_caches[r].kv_device_base_ptrs(layer);
-                        let kv_len_r = kv_caches[r].seq_len() as i32;
+                        let kv_len_r = (kv_caches[r].seq_len() + 1) as i32;
                         // Write kv_len to d_kv_len for this request.
                         let kv_bits = f32::from_bits(kv_len_r as u32);
                         unsafe {
@@ -9935,7 +9972,7 @@ impl CutileGpuModel {
                     // oxide loaded); pooled batch caches require oxide
                     // attention (see forward_batch_mxfp4_inner_graph).
                     let (k_full, v_full) = kv_caches[r].kv_device_tensors(layer);
-                    let kv_len_r = kv_caches[r].seq_len() as i32;
+                    let kv_len_r = (kv_caches[r].seq_len() + 1) as i32;
                     let attn_r = self
                         .flash_attn
                         .decode_attention_device_scratch(
@@ -9963,11 +10000,6 @@ impl CutileGpuModel {
                 }
                 attn_out
             };
-
-            // Advance all KV caches.
-            for kvc in kv_caches.iter_mut() {
-                kvc.advance_host_seq_len(1);
-            }
 
             // O-projection [M, Q_DIM] -> [M, H]
             let attn_padded = self.attn_out_to_oproj_device_m(&attn_out_dev, q_dim, self.q_pad, m);
@@ -10042,6 +10074,17 @@ impl CutileGpuModel {
             hidden_dev = self.add_device_scratch(&hidden_dev, &down_padded, m * self.h_pad, &mut None);
         }
 
+        // Advance the host seq_len ONCE per step, after all layers: every
+        // layer appends its own K/V tensor at the SAME token offset, so
+        // advancing inside the layer loop skewed each layer's writes to
+        // different positions and ran seq_len away at +num_layers per step
+        // (found by the p24 streaming A/B: pool exhaustion + layer-skewed
+        // KV garbage).  Mirrors the graph path's post-replay advance.
+        for kvc in kv_caches.iter_mut().take(m) {
+            kvc.advance_host_seq_len(1);
+            kvc.mark_host_stale();
+        }
+
         // Final norm.
         let final_ln_w_dev = self
             .norm_weights
@@ -10061,10 +10104,24 @@ impl CutileGpuModel {
             .expect("batch final RMSNorm failed");
 
         // LM head: [M, H] -> [M, vocab]
-        let logits_dev = self.gemm_d2d(&last_dev, "lm_head.weight", m);
+        // gemm_any_d2d_batch (NOT lm_head_gemm): lm_head_gemm dispatches
+        // exact kpar at m==1 but MXFP4 tiled at m>1, making the logits
+        // batch-composition dependent.  The batch fn's per-row GEMVs run
+        // the same exact kernel for every row regardless of m --
+        // composition-invariant, which the p24 streaming A/B requires.
+        let logits_dev = self.gemm_any_d2d_batch(&last_dev, "lm_head.weight", m, self.h_pad, SLOT_LOGITS);
         let logits_flat = self.download_logits(&logits_dev);
 
         // Split into M logit vectors.
-        logits_flat.chunks(vocab).map(|c| c.to_vec()).collect()
+        let rows: Vec<Vec<f32>> = logits_flat.chunks(vocab).take(m).map(|c| c.to_vec()).collect();
+        assert_eq!(
+            rows.len(),
+            m,
+            "forward_batch_decode (no-graph): {} logit rows for m={} (logits_flat len {})",
+            rows.len(),
+            m,
+            logits_flat.len()
+        );
+        rows
     }
 }
