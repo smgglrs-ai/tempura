@@ -315,7 +315,7 @@ async fn acquire_slot(
     top_p: f32,
     priority: u8,
 ) -> Result<(), (StatusCode, String)> {
-    let mut scheduler = state.scheduler.lock().await;
+    let mut scheduler = state.scheduler.lock().unwrap();
     scheduler.submit(InferenceRequest {
         id: request_id.to_string(),
         token_ids,
@@ -345,7 +345,7 @@ async fn acquire_slot(
 }
 
 async fn release_slot(state: &AppState, request_id: &str) {
-    let mut scheduler = state.scheduler.lock().await;
+    let mut scheduler = state.scheduler.lock().unwrap();
     scheduler.complete_sequence(request_id);
     record_scheduler_gauges(&scheduler);
 }
@@ -575,7 +575,7 @@ async fn chat_completions(
 
             let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
 
-            let mut sched = scheduler.lock().await;
+            let mut sched = scheduler.lock().unwrap();
             sched.complete_sequence(&rid);
             record_scheduler_gauges(&sched);
         });
@@ -1661,7 +1661,7 @@ mod tests {
             model: std::sync::Arc::new(model),
             tokenizer: None, // tests don't load a real tokenizer
             model_id: "test".to_string(),
-            scheduler: std::sync::Arc::new(tokio::sync::Mutex::new(
+            scheduler: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::batch::BatchScheduler::new(1, 128, 1),
             )),
             trace_store: std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -1745,7 +1745,7 @@ mod tests {
         let pipeline = tempura_engine::pipeline::KernelPipeline::cpu_verified();
         let model = tempura_engine::TransformerModel::new(config, pipeline);
 
-        let scheduler = std::sync::Arc::new(tokio::sync::Mutex::new(
+        let scheduler = std::sync::Arc::new(std::sync::Mutex::new(
             crate::batch::BatchScheduler::new(1, 128, 1),
         ));
 
@@ -1778,7 +1778,7 @@ mod tests {
             .unwrap();
 
         {
-            let sched = scheduler.lock().await;
+            let sched = scheduler.lock().unwrap();
             assert_eq!(sched.active_count(), 1);
             assert_eq!(sched.allocated_slot_count(), 1);
         }
@@ -1793,7 +1793,7 @@ mod tests {
         release_slot(&state, "req-1").await;
 
         {
-            let sched = scheduler.lock().await;
+            let sched = scheduler.lock().unwrap();
             assert_eq!(sched.active_count(), 0);
             assert_eq!(sched.allocated_slot_count(), 0);
         }
@@ -1804,7 +1804,7 @@ mod tests {
             .unwrap();
 
         {
-            let sched = scheduler.lock().await;
+            let sched = scheduler.lock().unwrap();
             assert_eq!(sched.active_count(), 1);
         }
 
