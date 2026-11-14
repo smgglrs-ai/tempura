@@ -32,6 +32,11 @@ pub struct OxideDecodeAttn {
     cu_function_batch:  Option<cuda_core::sys::CUfunction>,
     cu_function_splitk: Option<cuda_core::sys::CUfunction>,
     cu_function_combine: Option<cuda_core::sys::CUfunction>,
+    /// f16 KV-pool twins (p24 f16 serving pool): same signatures and
+    /// launch configs, K/V caches hold f16 bits converted in-kernel.
+    cu_function_f16:        Option<cuda_core::sys::CUfunction>,
+    cu_function_kpar_f16:   Option<cuda_core::sys::CUfunction>,
+    cu_function_splitk_f16: Option<cuda_core::sys::CUfunction>,
     stream:             Arc<Stream>,
 }
 
@@ -106,9 +111,21 @@ impl OxideDecodeAttn {
             (None, None)
         };
 
-        eprintln!("[oxide] loaded decode-attn kernel (PTX {} bytes, kpar={}, batch={}, splitk={})",
-            PTX.len(), cu_function_kpar.is_some(), cu_function_batch.is_some(), cu_function_splitk.is_some());
-        Ok(Self { cu_module, cu_function, cu_function_kpar, cu_function_batch, cu_function_splitk, cu_function_combine, stream })
+        // f16 KV-pool twins (optional -- older PTX without them keeps
+        // working; callers check has_f16()).
+        let load_opt = |name: &str| -> Option<cuda_core::sys::CUfunction> {
+            let cname = std::ffi::CString::new(name).unwrap();
+            let mut f = std::ptr::null_mut::<cuda_core::sys::CUfunc_st>();
+            let rc = unsafe { cuda_core::sys::cuModuleGetFunction(&mut f, cu_module, cname.as_ptr()) };
+            if rc == 0 { Some(f) } else { None }
+        };
+        let cu_function_f16 = load_opt("oxide_decode_attn_f16");
+        let cu_function_kpar_f16 = load_opt("oxide_decode_attn_kpar_f16");
+        let cu_function_splitk_f16 = load_opt("oxide_decode_attn_splitk_f16");
+
+        eprintln!("[oxide] loaded decode-attn kernel (PTX {} bytes, kpar={}, batch={}, splitk={}, f16={})",
+            PTX.len(), cu_function_kpar.is_some(), cu_function_batch.is_some(), cu_function_splitk.is_some(), cu_function_f16.is_some());
+        Ok(Self { cu_module, cu_function, cu_function_kpar, cu_function_batch, cu_function_splitk, cu_function_combine, cu_function_f16, cu_function_kpar_f16, cu_function_splitk_f16, stream })
     }
 
     /// Run decode attention with kv_len read from a device tensor at execution time.
@@ -151,6 +168,60 @@ impl OxideDecodeAttn {
         head_dim:   usize,
         scale:      f32,
     ) -> Result<()> {
+        self.launch_base(
+            self.cu_function,
+            out, q, k_ptr, v_ptr, kv_len_dev, n_heads, n_kv_heads, head_dim, scale,
+        )
+    }
+
+    /// Whether the f16 KV-pool twins are available.
+    pub fn has_f16(&self) -> bool { self.cu_function_f16.is_some() }
+
+    /// [`Self::forward_d2d_ptrs`] for an f16 KV pool: `k_ptr`/`v_ptr`
+    /// address f16-bit elements (p24 f16 serving pool -- halved KV
+    /// density).  Requires [`Self::has_f16`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_d2d_ptrs_f16(
+        &self,
+        out:        &Arc<Tensor<f32>>,
+        q:          &Arc<Tensor<f32>>,
+        k_ptr:      u64,
+        v_ptr:      u64,
+        kv_len_dev: &Arc<Tensor<f32>>,
+        n_heads:    usize,
+        n_kv_heads: usize,
+        head_dim:   usize,
+        scale:      f32,
+    ) -> Result<()> {
+        let f = self.cu_function_f16.ok_or_else(|| {
+            KernelError::InvalidConfig(
+                "OxideDecodeAttn: f16 twins not present in the PTX (rebuild \
+                 tools/oxide-decode-attn)"
+                    .into(),
+            )
+        })?;
+        self.launch_base(
+            f,
+            out, q, k_ptr, v_ptr, kv_len_dev, n_heads, n_kv_heads, head_dim, scale,
+        )
+    }
+
+    /// Shared launch core for the single-warp base kernels (the f32 and
+    /// f16 twins have identical signatures and launch configs).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_base(
+        &self,
+        f:         cuda_core::sys::CUfunction,
+        out:        &Arc<Tensor<f32>>,
+        q:          &Arc<Tensor<f32>>,
+        k_ptr:      u64,
+        v_ptr:      u64,
+        kv_len_dev: &Arc<Tensor<f32>>,
+        n_heads:    usize,
+        n_kv_heads: usize,
+        head_dim:   usize,
+        scale:      f32,
+    ) -> Result<()> {
         let heads_per_group = (n_heads / n_kv_heads) as u32;
         let kv_len_ptr = kv_len_dev.device_pointer().cu_deviceptr() as u64;
 
@@ -170,7 +241,7 @@ impl OxideDecodeAttn {
 
         let mut params: [*mut std::ffi::c_void; 9] = [
             &mut out_ptr as *mut _ as *mut std::ffi::c_void,  // param 0: out (*mut f32)
-            &mut q_ptr   as *mut _ as *mut std::ffi::c_void,  // param 1: q
+            &mut q_ptr   as *mut _ as *mut _ as *mut std::ffi::c_void,  // param 1: q
             &mut k_ptr   as *mut _ as *mut std::ffi::c_void,  // param 2: k_cache
             &mut v_ptr   as *mut _ as *mut std::ffi::c_void,  // param 3: v_cache
             &mut kv_p    as *mut _ as *mut std::ffi::c_void,  // param 4: kv_len_ptr
@@ -183,7 +254,7 @@ impl OxideDecodeAttn {
         let shared_bytes = (2 * head_dim * 4) as u32;
         let rc = unsafe {
             cuda_core::sys::cuLaunchKernel(
-                self.cu_function,
+                f,
                 n_heads as u32, 1, 1,   // grid
                 32, 1, 1,                // block (one warp)
                 shared_bytes,
