@@ -5,6 +5,29 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-14 (f16 KV pool, piece 1 landed): the oxide decode
+attention now has f16 twins (commit aaacbba) — single-warp/kpar/splitk
+kernels reading K/V as f16 bits with an exact in-kernel integer
+f16→f32 (normals, subnormals, inf/NaN), validated on fishtank against
+the f32 kernel on dequant(the same bits) at max_diff ≤ 2e-7 across all
+variants × kv_len {3,13,100} (random data — uniform data cannot catch
+conversion/index bugs).  Host wrapper: has_f16() +
+forward_d2d_ptrs_f16; PTX regenerated + committed.  WHY: the serving
+pool stores KV as raw f32 (256 KiB/token for Llama-8B GQA) — 131k
+context = 32GB, unreachable on a 32GB card; f16 halves it (llama.cpp's
+default density) and halves the DRAM swap tier.  REMAINING for the f16
+pool: (a) GpuKvPagePool/CutileKvCache pool tensors Tensor<f16> (byte
+offsets ×2, kv_base_byte_offset), (b) append path converts f32→f16
+(cutile convert kernel into a per-cache f16 staging tensor, then D2D),
+(c) host mirror f16 (halves DRAM tier; swap checksums adapt), (d) the
+cutile paged PREFILL attention loads Tile<f16> + convert_tile (op
+verified to exist in upstream cutile), (e) the equal-position batch
+CUDA-graph paths + kv_scatter_write gated OFF for f16 pools (f32
+kernels; serving is ragged/no-graph today anyway), (f) gates: the
+streaming A/B (byte-identical vs the f32 pool is NOT expected — f16
+rounds KV; the gate becomes A-vs-A f16 and a ppl ratio check vs the
+f32 pool, TEMPURA_PPL_MAX_RATIO), (g) then FP8/TurboQuant on the pool
+as the follow-on.**
 **STATUS 2026-11-14 (later): non-streaming chat now routes through the
 ENGINE (commit 4626aee) -- plain requests (n=1, no logprobs/guided/
 sampler-chain) submit an EngineRequest and buffer tokens through the
