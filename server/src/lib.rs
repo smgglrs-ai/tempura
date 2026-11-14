@@ -31,7 +31,10 @@ pub struct AppState {
     pub model: Arc<dyn tempura_engine::InferenceModel>,
     pub tokenizer: Option<Arc<Tokenizer>>,
     pub model_id: String,
-    pub scheduler: Arc<Mutex<batch::BatchScheduler>>,
+    /// Shared between the HTTP layer (gauges, acquire_slot) and the
+    /// engine thread.  std::sync::Mutex: guards are never held across
+    /// .await points.
+    pub scheduler: Arc<std::sync::Mutex<batch::BatchScheduler>>,
     pub trace_store: Arc<Mutex<trace_store::TraceStore>>,
     pub metrics_handle: PrometheusHandle,
     pub request_timeout: std::time::Duration,
@@ -214,6 +217,11 @@ pub async fn run_server(args: ServeArgs) {
             if use_gpu {
                 let mut wrapper = tempura_engine::CutileInferenceWrapper::new(config.clone());
                 wrapper.model.quantized_weights = Some(qweights);
+                // Weights were injected without a loader -- build the GPU
+                // model explicitly.  Without this the wrapper silently
+                // runs CPU forwards (found during p24-kv-swap validation:
+                // the server had NEVER done GPU inference on GGUF).
+                wrapper.try_upload_gpu();
                 tracing::info!("cuTile GPU quantized inference ready");
                 Arc::new(wrapper)
             } else {
@@ -239,16 +247,18 @@ pub async fn run_server(args: ServeArgs) {
 
         let scheduler =
             batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len, args.max_batch_size);
+        let scheduler = Arc::new(std::sync::Mutex::new(scheduler));
         let traces = trace_store::TraceStore::new(args.max_traces);
 
         let (engine_tx, engine_rx) =
             tokio::sync::mpsc::channel::<engine_task::EngineRequest>(args.max_batch_size * 4);
         let engine_model = model.clone();
+        let engine_scheduler = Arc::clone(&scheduler);
         std::thread::Builder::new()
             .name("tempura-engine".to_string())
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
-                engine_task::EngineTask::new(engine_model, engine_rx).run();
+                engine_task::EngineTask::new(engine_model, engine_rx, engine_scheduler).run();
             })
             .expect("failed to spawn engine thread");
 
@@ -256,7 +266,7 @@ pub async fn run_server(args: ServeArgs) {
             model,
             tokenizer,
             model_id: model_p.display().to_string(),
-            scheduler: Arc::new(Mutex::new(scheduler)),
+            scheduler,
             trace_store: Arc::new(Mutex::new(traces)),
             metrics_handle,
             request_timeout: std::time::Duration::from_secs(args.request_timeout_secs),
@@ -355,16 +365,18 @@ pub async fn run_server(args: ServeArgs) {
 
     let scheduler =
         batch::BatchScheduler::new(args.max_batch_size, args.max_seq_len, args.max_batch_size);
+    let scheduler = Arc::new(std::sync::Mutex::new(scheduler));
     let traces = trace_store::TraceStore::new(args.max_traces);
 
     let (engine_tx, engine_rx) =
         tokio::sync::mpsc::channel::<engine_task::EngineRequest>(args.max_batch_size * 4);
     let engine_model = model.clone();
+    let engine_scheduler = Arc::clone(&scheduler);
     std::thread::Builder::new()
         .name("tempura-engine".to_string())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
-            engine_task::EngineTask::new(engine_model, engine_rx).run();
+            engine_task::EngineTask::new(engine_model, engine_rx, engine_scheduler).run();
         })
         .expect("failed to spawn engine thread");
 
@@ -372,7 +384,7 @@ pub async fn run_server(args: ServeArgs) {
         model,
         tokenizer,
         model_id,
-        scheduler: Arc::new(Mutex::new(scheduler)),
+        scheduler,
         trace_store: Arc::new(Mutex::new(traces)),
         metrics_handle,
         request_timeout: std::time::Duration::from_secs(args.request_timeout_secs),
