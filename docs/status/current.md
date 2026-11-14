@@ -5,6 +5,29 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-14 (later): non-streaming chat now routes through the
+ENGINE (commit 4626aee) -- plain requests (n=1, no logprobs/guided/
+sampler-chain) submit an EngineRequest and buffer tokens through the
+same scheduler/pool/swap path as streaming; the feature-rich direct
+path (logprobs/guided/n>1/sampler chains) stays on the HTTP-thread
+generate() and retains its documented hazard (concurrent GPU requests
+interleave the wrapper's SHARED session KV cache -- the engine route
+is the safe one).  Validated by scripts/nonstream-route-smoke.sh on
+fishtank: identical byte-for-byte output for the same greedy prompt
+via buffered and SSE responses (re-proving composition invariance
+across requests).  NEXT FOLLOW-UPS, in order: (1) release the
+wrapper's shared session KV cache in server mode (a quarter of VRAM
+sits idle once the serving pool exists; the serving pool is sized
+AFTER it, so pools are ~25% smaller than they could be) -- DESIGN: the
+&mut window before Arc::new in run_server can drop it, but the direct
+path needs a lazy fallback (generate() should own a LOCAL dedicated
+CutileKvCache via gm.forward when the shared one is absent; forward()
+with no cache currently falls to the CPU path which panics on GPU
+models with freed CPU weights); (2) position-synced batch CUDA graphs
+(reading per-row positions from a device array at execution time, the
+d_kv_len pattern extended) -- the ragged no-graph path is correct but
+~1-2 s/step, the dominant serving perf gap; (3) NIXL transfers + NVMe
+tier; (4) batch-decode CUDA-graph QKV bias (Qwen2/Phi).**
 **STATUS 2026-11-14: p24-kv-swap VALIDATION GATE PASSED — the streaming
 A/B is green (6/6 clients byte-identical between a 20000-token pool run
 and a 3072-token eviction-forced run; 3 swap-out/swap-in cycles in the
