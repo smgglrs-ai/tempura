@@ -216,6 +216,141 @@ pub fn perplexity(
     })
 }
 
+/// Pooled-cache perplexity: the SERVING path (shared KV pool, prefill via
+/// `forward_with_kv`, decode via `forward_batch_with_kvs` at m=1 through
+/// the generic batch path) instead of the wrapper's dedicated session
+/// cache.  Used by bench-perplexity (TEMPURA_PPL_POOLED=1) to quality-gate
+/// the f16 pool against the f32 pool — the ppl criterion for flipping
+/// TEMPURA_KV_F16 to the default (gate on ppl, not logit correlation).
+#[cfg(feature = "cutile")]
+pub fn perplexity_pooled(
+    model: &dyn InferenceModel,
+    config: &ModelConfig,
+    tokens: &[u32],
+    opts: &PplOptions,
+) -> Option<PplResult> {
+    let n_ctx = opts.n_ctx;
+    if tokens.len() < n_ctx || n_ctx < 4 {
+        return None;
+    }
+    let n_chunk_max = tokens.len() / n_ctx;
+    let n_chunk = opts.max_chunks.map_or(n_chunk_max, |m| m.min(n_chunk_max));
+    let first = n_ctx / 2;
+
+    let pool = model.new_kv_pool()?;
+    let f16 = std::env::var("TEMPURA_KV_F16").as_deref() == Ok("1");
+    eprintln!(
+        "  [ppl-pooled] serving-path mode ({} KV pool, {} chunks of n_ctx={})",
+        if f16 { "f16" } else { "f32" },
+        n_chunk, n_ctx
+    );
+
+    // TEMPURA_PPL_SPAWN_THREAD=1: run the loop on a fresh thread -- the
+    // engine does its inference on a dedicated thread (context binding,
+    // cuLaunchKernel state); a NaN that only appears on the main thread
+    // isolates thread-local driver state as the cause.
+    if std::env::var("TEMPURA_PPL_SPAWN_THREAD").as_deref() == Ok("1") {
+        return std::thread::scope(|s| {
+            s.spawn(|| perplexity_pooled_inner(model, config, tokens, opts, &pool, n_chunk))
+                .join()
+                .ok()
+                .flatten()
+        });
+    }
+    perplexity_pooled_inner(model, config, tokens, opts, &pool, n_chunk)
+}
+
+#[cfg(feature = "cutile")]
+fn perplexity_pooled_inner(
+    model: &dyn InferenceModel,
+    config: &ModelConfig,
+    tokens: &[u32],
+    opts: &PplOptions,
+    pool: &std::sync::Arc<std::sync::Mutex<crate::cutile_kv_cache::GpuKvPagePool>>,
+    n_chunk: usize,
+) -> Option<PplResult> {
+    let n_ctx = opts.n_ctx;
+    let first = n_ctx / 2;
+    let t0 = Instant::now();
+    let mut nll = 0.0f64;
+    let mut count = 0usize;
+    let mut nan_steps = 0usize;
+
+    for i in 0..n_chunk {
+        if opts.progress {
+            eprintln!(
+                "  [ppl] chunk {}/{} (nll/count so far: {:.4}/{})",
+                i + 1,
+                n_chunk,
+                nll,
+                count
+            );
+        }
+        let start = i * n_ctx;
+        let mut chunk = tokens[start..start + n_ctx].to_vec();
+        if let Some(b) = opts.bos {
+            chunk[0] = b;
+        }
+        // Fresh session + pooled run per chunk (the serving loop's
+        // lifecycle: the run frees on drop).  The run lives in a 1-element
+        // array: forward_batch_with_kvs borrows &mut [CutileKvCache], and
+        // passing &mut [kv] would MOVE it into a dropped temporary.
+        let mut session = InferenceSession::new(config, TraceLevel::Off, 0);
+        let mut kv = [model.new_session_kv_cache(&pool, first + 64)?];
+        let mut logits =
+            model.forward_with_kv(&mut session, &chunk[..first + 1], &mut kv[0])?;
+        if logits.iter().any(|v| v.is_nan()) {
+            nan_steps += 1;
+        }
+        let mut j = first;
+        while j < n_ctx - 1 {
+            let lp = token_logprob(&logits, chunk[j + 1] as usize);
+            nll += -lp;
+            count += 1;
+            j += 1;
+            if j < n_ctx - 1 {
+                let pos = [session.position as u32];
+                let tok = [chunk[j]];
+                // TEMPURA_PPL_DECODE_SINGLE=1: bisect switch -- decode via
+                // the single-seq forward_with_kv path (the wrapper-mode ppl
+                // flow) instead of the m=1 batch path.  Localizes NaN bugs
+                // between the pool setup and the batch decode kernels.
+                let rows = if std::env::var("TEMPURA_PPL_DECODE_SINGLE").as_deref() == Ok("1") {
+                    let l = model.forward_with_kv(&mut session, &tok, &mut kv[0])?;
+                    vec![l]
+                } else {
+                    let r = model.forward_batch_with_kvs(&tok, &pos, &mut kv)?;
+                    // Mirror the engine's decode bookkeeping: the batch
+                    // forward advances the KV run internally, but the
+                    // SESSION position (RoPE) is the caller's job.
+                    session.position += 1;
+                    session.cache.advance(1);
+                    r
+                };
+                logits = rows.into_iter().next()?;
+                if logits.iter().any(|v| v.is_nan()) {
+                    nan_steps += 1;
+                }
+            }
+        }
+    }
+
+    let ppl = if count > 0 {
+        (nll / count as f64).exp()
+    } else {
+        f64::NAN
+    };
+    Some(PplResult {
+        nll,
+        count,
+        ppl,
+        chunks: n_chunk,
+        nan_steps,
+        elapsed_s: t0.elapsed().as_secs_f64(),
+        logprobs: Vec::new(),
+    })
+}
+
 /// MMLU-style multiple-choice prompt, matching the standard harness format
 /// (lm-evaluation-harness / Hendrycks): instruction line, question, lettered
 /// choices, "Answer:" -- the model scores the letter tokens that follow.

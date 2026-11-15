@@ -9953,16 +9953,24 @@ impl CutileGpuModel {
                         let (k_base, v_base) = kv_caches[r].kv_device_base_ptrs(layer);
                         let kv_len_r = (kv_caches[r].seq_len() + 1) as i32;
                         // Write kv_len to d_kv_len for this request.
+                        // SYNCHRONOUS 4-byte H2D: an async copy from this
+                        // loop-iteration stack local can defer past the
+                        // iteration's scope (the next iteration overwrites
+                        // the stack slot with no stream ordering) -- the
+                        // kernel then reads a garbage kv_len and scans OOB
+                        // KV, producing intermittently all-NaN attention
+                        // output.  Found via the pooled-ppl NaN hunt; the
+                        // engine's slower tick cadence masked the race.
                         let kv_bits = f32::from_bits(kv_len_r as u32);
+                        let _ = stream.context().bind_to_thread();
                         unsafe {
-                            cuda_core::memcpy_htod_async::<f32>(
+                            cuda_core::memory::memcpy_htod_sync(
                                 self.d_kv_len.device_pointer().cu_deviceptr(),
                                 &kv_bits as *const f32,
-                                1,
-                                stream,
+                                std::mem::size_of::<f32>(),
                             )
-                            .expect("batch d_kv_len H->D");
                         }
+                        .expect("batch d_kv_len H2D");
                         let out_r = Arc::new(
                             cutile::api::zeros::<f32>(&[q_dim])
                                 .sync_on(stream)
