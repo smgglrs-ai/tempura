@@ -195,11 +195,19 @@ impl GreedyArgmax {
         out_packed: &Arc<Tensor<u32>>,
         n: usize,
     ) -> Result<()> {
+        let out_ptr = out_packed.device_pointer().cu_deviceptr();
+        let logits_ptr = logits.device_pointer().cu_deviceptr();
+        self.launch_ptr(logits_ptr, out_ptr, n)
+    }
+
+    /// Raw-pointer variant for batch decode: `logits_ptr` addresses one
+    /// row of an [m * vocab] device logits tensor (row stride = vocab),
+    /// `out_ptr` the row's 2-u32 packed slot in an [m * 2] u32 buffer.
+    /// Async on the stored stream.
+    pub fn launch_ptr(&self, logits_ptr: u64, out_ptr: u64, n: usize) -> Result<()> {
         if n == 0 {
             return Err(KernelError::InvalidConfig("greedy argmax: n == 0".into()));
         }
-        let out_ptr = out_packed.device_pointer().cu_deviceptr() as u64;
-        let logits_ptr = logits.device_pointer().cu_deviceptr() as u64;
         let n32 = n as u32;
         let grid = n.div_ceil(256 * 8).max(1) as u32;
         let mut params: [*mut std::ffi::c_void; 3] = [

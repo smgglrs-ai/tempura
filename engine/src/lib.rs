@@ -38,7 +38,7 @@ pub use kv_cache::{
 };
 #[cfg(feature = "cutile")]
 pub use model::CutileInferenceWrapper;
-pub use model::{InferenceModel, TokenLogprob, TopLogprob, TransformerModel};
+pub use model::{BatchDecodeOutput, InferenceModel, TokenLogprob, TopLogprob, TransformerModel};
 pub use session::InferenceSession;
 pub use tokenizer::{ChatMessageInput, ChatTemplate};
 pub use trace::{

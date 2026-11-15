@@ -274,6 +274,21 @@ impl Default for SamplingParams {
 }
 
 impl SamplingParams {
+    /// Pure-greedy: the sampled token is the plain argmax of the logits
+    /// (last-max-wins, matching `max_by(partial_cmp)`), with no logit
+    /// mutation beforehand.  At `temperature == 0` the sampler skips
+    /// scaling and picks the argmax; presence/frequency penalties are the
+    /// only pre-sampling logit mutations on the serving path (repeat
+    /// penalty there receives no prior tokens); top-k/top-p/min-p never
+    /// move the argmax.  When this holds, a GPU greedy-argmax kernel
+    /// (`kernels/src/greedy_argmax.rs`) can produce the token without
+    /// downloading the logits row.
+    pub fn is_greedy(&self) -> bool {
+        self.temperature == 0.0
+            && self.presence_penalty == 0.0
+            && self.frequency_penalty == 0.0
+    }
+
     pub fn apply_penalties(&self, logits: &mut [f32], prior_tokens: &[u32]) {
         if self.presence_penalty == 0.0 && self.frequency_penalty == 0.0 {
             return;

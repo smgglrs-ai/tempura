@@ -387,6 +387,9 @@ struct NoGraphBatchScratch {
     /// the add kernel's output never aliases its `a` input (the live hidden
     /// state); the sides alternate across the two adds per layer.
     hidden: std::collections::HashMap<usize, [Option<Arc<Tensor<f32>>>; 2]>,
+    /// GPU greedy-argmax packed outputs [2 * m] u32, keyed m (one packed
+    /// (key<<32)|idx u64 per row; re-zeroed by cuMemsetD32Async per step).
+    argmax_out: std::collections::HashMap<usize, Arc<Tensor<u32>>>,
 }
 
 /// Transformer with all projection weights pre-uploaded to the GPU.
@@ -9718,8 +9721,39 @@ impl CutileGpuModel {
         qweights: &QuantizedWeights,
         kv_caches: &mut [CutileKvCache],
     ) -> Vec<Vec<f32>> {
+        let out = self.forward_batch_decode_greedy(
+            token_ids,
+            positions,
+            qweights,
+            kv_caches,
+            &vec![false; token_ids.len()],
+        );
+        out.into_iter()
+            .map(|o| match o {
+                crate::model::BatchDecodeOutput::Logits(v) => v,
+                crate::model::BatchDecodeOutput::Token(_) => {
+                    unreachable!("forward_batch_decode: greedy token with greedy=[]")
+                }
+            })
+            .collect()
+    }
+
+    /// Dtype-aware batch decode: rows flagged `greedy` are reduced to their
+    /// sampled token via the GPU greedy-argmax kernel BEFORE the logits
+    /// download (4 bytes instead of a vocab-sized row); sampling rows keep
+    /// full logits.  All-greedy batches (the serving default: temperature 0,
+    /// no penalties) skip the logits download entirely.
+    pub fn forward_batch_decode_greedy(
+        &self,
+        token_ids: &[u32],
+        positions: &[u32],
+        qweights: &QuantizedWeights,
+        kv_caches: &mut [CutileKvCache],
+        greedy: &[bool],
+    ) -> Vec<crate::model::BatchDecodeOutput> {
         assert_eq!(token_ids.len(), kv_caches.len());
         assert_eq!(positions.len(), kv_caches.len());
+        assert_eq!(greedy.len(), token_ids.len());
         let m = token_ids.len();
         if m == 0 {
             return vec![];
@@ -9822,7 +9856,24 @@ impl CutileGpuModel {
             let results =
                 self.forward_batch_decode_with_graph(&embeddings, positions, qweights, kv_caches);
             if !results.is_empty() {
-                return results;
+                // Graph path: logits are already downloaded; greedy rows
+                // reduce to a host argmax (same semantics as the GPU
+                // kernel).  The serving pool is f16/e4m3 and always takes
+                // the no-graph tail below -- this branch serves the f32
+                // synchronized-position batch path.
+                return results
+                    .into_iter()
+                    .zip(greedy.iter())
+                    .map(|(logits, &g)| {
+                        if g {
+                            crate::model::BatchDecodeOutput::Token(
+                                crate::model::greedy_argmax_host(&logits),
+                            )
+                        } else {
+                            crate::model::BatchDecodeOutput::Logits(logits)
+                        }
+                    })
+                    .collect();
             }
             // Empty result means graph update failed -- fall through to no-graph path.
         }
@@ -10429,6 +10480,75 @@ impl CutileGpuModel {
         // the same exact kernel for every row regardless of m --
         // composition-invariant, which the p24 streaming A/B requires.
         let logits_dev = self.gemm_any_d2d_batch(&last_dev, "lm_head.weight", m, self.h_pad, SLOT_LOGITS);
+
+        // Greedy fast path: run the GPU argmax on the device logits BEFORE
+        // any download.  All-greedy batches (serving default) download 8*m
+        // bytes instead of m*vocab f32 (~513KB/row); mixed batches still
+        // download the full tensor for the sampling rows.
+        let any_greedy = greedy.iter().any(|&g| g);
+        let all_greedy = greedy.iter().all(|&g| g);
+        if any_greedy && self.greedy_argmax.is_some() {
+            let ga = self.greedy_argmax.as_ref().unwrap();
+            let argmax_out = {
+                let mut ng = self.nograph.borrow_mut();
+                ng.argmax_out
+                    .entry(m)
+                    .or_insert_with(|| {
+                        Arc::new(
+                            cutile::api::zeros::<u32>(&[2 * m])
+                                .sync_on(stream)
+                                .expect("batch argmax out alloc"),
+                        )
+                    })
+                    .clone()
+            };
+            // Zero the packed (key<<32|idx) slots: any real non-NaN float
+            // packs to a nonzero key, so a zeroed slot cannot win.
+            unsafe {
+                cuda_core::sys::cuMemsetD32Async(
+                    argmax_out.device_pointer().cu_deviceptr(),
+                    0,
+                    2 * m as usize,
+                    stream.cu_stream(),
+                );
+            }
+            let logits_base = logits_dev.device_pointer().cu_deviceptr();
+            let out_base = argmax_out.device_pointer().cu_deviceptr();
+            for (r, &g) in greedy.iter().enumerate() {
+                if g {
+                    ga.launch_ptr(
+                        logits_base + (r * vocab * 4) as u64,
+                        out_base + (r * 8) as u64,
+                        vocab,
+                    )
+                    .expect("batch greedy argmax launch");
+                }
+            }
+            let tokens = argmax_out
+                .to_host_vec()
+                .sync_on(stream)
+                .expect("batch argmax download");
+            if all_greedy {
+                return (0..m)
+                    .map(|r| crate::model::BatchDecodeOutput::Token(tokens[2 * r]))
+                    .collect();
+            }
+            // Mixed batch: download the logits for the sampling rows, then
+            // resolve the greedy rows from the already-computed argmax.
+            let logits_flat = self.download_logits(&logits_dev);
+            return (0..m)
+                .map(|r| {
+                    if greedy[r] {
+                        crate::model::BatchDecodeOutput::Token(tokens[2 * r])
+                    } else {
+                        crate::model::BatchDecodeOutput::Logits(
+                            logits_flat[r * vocab..(r + 1) * vocab].to_vec(),
+                        )
+                    }
+                })
+                .collect();
+        }
+
         let logits_flat = self.download_logits(&logits_dev);
 
         // Split into M logit vectors.
@@ -10441,6 +10561,17 @@ impl CutileGpuModel {
             m,
             logits_flat.len()
         );
-        rows
+        rows.into_iter()
+            .zip(greedy.iter())
+            .map(|(logits, &g)| {
+                if g {
+                    // greedy_argmax unavailable (load failure) -- host argmax,
+                    // same semantics.
+                    crate::model::BatchDecodeOutput::Token(crate::model::greedy_argmax_host(&logits))
+                } else {
+                    crate::model::BatchDecodeOutput::Logits(logits)
+                }
+            })
+            .collect()
     }
 }

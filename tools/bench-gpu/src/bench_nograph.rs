@@ -135,28 +135,41 @@ fn main() {
             toks.push(argmax(&logits) as u32);
         }
         let ragged = lens.windows(2).any(|w| w[0] != w[1]);
+        // Greedy flags: the serving engine routes pure-greedy sessions
+        // (temperature 0, no penalties -- every bench/smoke/A-B workload)
+        // through forward_batch_with_kvs_greedy, where the token comes
+        // from the GPU argmax instead of a full logits download + CPU
+        // softmax.  Mirror that here so the bench measures the serving
+        // path.
+        let greedy: Vec<bool> = vec![true; m];
         // Warmup (3 steps): first call sizes all cached scratch for this m.
         for _ in 0..3 {
             let poss: Vec<u32> = sessions.iter().map(|s| s.position as u32).collect();
             let rows = model
-                .forward_batch_with_kvs(&toks, &poss, &mut kvs)
+                .forward_batch_with_kvs_greedy(&toks, &poss, &mut kvs, &greedy)
                 .expect("batch decode failed");
             for (i, s) in sessions.iter_mut().enumerate() {
                 s.position += 1;
                 s.cache.advance(1);
-                toks[i] = argmax(&rows[i]) as u32;
+                toks[i] = match &rows[i] {
+                    tempura_engine::BatchDecodeOutput::Token(t) => *t,
+                    tempura_engine::BatchDecodeOutput::Logits(v) => argmax(v) as u32,
+                };
             }
         }
         let t = Instant::now();
         for _ in 0..steps {
             let poss: Vec<u32> = sessions.iter().map(|s| s.position as u32).collect();
             let rows = model
-                .forward_batch_with_kvs(&toks, &poss, &mut kvs)
+                .forward_batch_with_kvs_greedy(&toks, &poss, &mut kvs, &greedy)
                 .expect("batch decode failed");
             for (i, s) in sessions.iter_mut().enumerate() {
                 s.position += 1;
                 s.cache.advance(1);
-                toks[i] = argmax(&rows[i]) as u32;
+                toks[i] = match &rows[i] {
+                    tempura_engine::BatchDecodeOutput::Token(t) => *t,
+                    tempura_engine::BatchDecodeOutput::Logits(v) => argmax(v) as u32,
+                };
             }
         }
         let elapsed = t.elapsed().as_secs_f64();

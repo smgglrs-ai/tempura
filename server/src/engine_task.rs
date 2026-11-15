@@ -44,13 +44,11 @@ struct ActiveSession {
 }
 
 impl ActiveSession {
-    /// Sample the next token from `logits` (with penalties), emit it, and
-    /// return true when the request is finished.  Shared by the CPU
-    /// per-session path and the GPU batch path.
-    fn sample_and_emit(&mut self, model: &dyn InferenceModel, logits: Vec<f32>) -> bool {
-        let mut logits = logits;
-        self.params.apply_penalties(&mut logits, &self.generated);
-        let token = model.sample_from_logits(&logits, &self.params, &mut self.session);
+    /// Emit an already-sampled token: append it, push it to the client,
+    /// and return true when the request is finished.  Shared by
+    /// `sample_and_emit` (CPU sampling) and the GPU greedy-argmax path
+    /// (token produced on-device, no logits download).
+    fn emit_token(&mut self, token: u32) -> bool {
         self.generated.push(token);
         // A closed response channel (client gone / request timed out)
         // retires the session -- otherwise the engine spins on a dead
@@ -66,6 +64,16 @@ impl ActiveSession {
         self.generated.len() >= self.max_new_tokens
             || self.eos_token == Some(token)
             || client_gone
+    }
+
+    /// Sample the next token from `logits` (with penalties), emit it, and
+    /// return true when the request is finished.  Shared by the CPU
+    /// per-session path and the GPU batch path.
+    fn sample_and_emit(&mut self, model: &dyn InferenceModel, logits: Vec<f32>) -> bool {
+        let mut logits = logits;
+        self.params.apply_penalties(&mut logits, &self.generated);
+        let token = model.sample_from_logits(&logits, &self.params, &mut self.session);
+        self.emit_token(token)
     }
 
     /// CPU-model step (chunked prefill + decode).  Unchanged from the
@@ -477,7 +485,20 @@ impl EngineTask {
             eprintln!("[tick-timing] m={} prep={:?}", stepped.len(), t_prep.elapsed());
         }
         let t_fwd = std::time::Instant::now();
-        let all_logits = match self.model.forward_batch_with_kvs(&toks, &pos, &mut kvs) {
+        // Pure-greedy sessions (temperature 0, no penalties -- the A/B and
+        // smoke workloads) get their token from the GPU greedy-argmax
+        // kernel: 4 bytes downloaded instead of a 513KB logits row, and no
+        // CPU softmax/top-k over 128k floats x m (was ~11 ms/step at m=6).
+        // The engine path never needs logprobs, so greedy rows never
+        // materialize logits on the host.
+        let greedy: Vec<bool> = stepped
+            .iter()
+            .map(|id| sessions.get(id).expect("decode session").params.is_greedy())
+            .collect();
+        let all_outputs = match self
+            .model
+            .forward_batch_with_kvs_greedy(&toks, &pos, &mut kvs, &greedy)
+        {
             Some(l) => l,
             None => {
                 // kvs was built in stepped order; zip (not remove(i) --
@@ -507,18 +528,35 @@ impl EngineTask {
             entry.session.cache.advance(1);
             entry.session.position += 1;
             if std::env::var("TEMPURA_ENGINE_DEBUG_TICKS").is_ok() {
-                // Per-step logits fingerprint: diffing run A vs run B logs
+                // Per-step output fingerprint: diffing run A vs run B logs
                 // pinpoints the first divergent decode step (p24 A/B hunt).
-                let cs: u64 = all_logits[i]
-                    .iter()
-                    .fold(0u64, |a, v| a.wrapping_add(v.to_bits() as u64));
-                eprintln!(
-                    "[logits-cs] {} step={} cs={cs:016x}",
-                    &id[id.len().saturating_sub(6)..],
-                    entry.generated.len()
-                );
+                // Greedy rows have no host logits -- fingerprint the token.
+                match &all_outputs[i] {
+                    tempura_engine::BatchDecodeOutput::Logits(logits) => {
+                        let cs: u64 = logits
+                            .iter()
+                            .fold(0u64, |a, v| a.wrapping_add(v.to_bits() as u64));
+                        eprintln!(
+                            "[logits-cs] {} step={} cs={cs:016x}",
+                            &id[id.len().saturating_sub(6)..],
+                            entry.generated.len()
+                        );
+                    }
+                    tempura_engine::BatchDecodeOutput::Token(t) => {
+                        eprintln!(
+                            "[logits-cs] {} step={} tok={t}",
+                            &id[id.len().saturating_sub(6)..],
+                            entry.generated.len()
+                        );
+                    }
+                }
             }
-            let done = entry.sample_and_emit(self.model.as_ref(), all_logits[i].clone());
+            let done = match &all_outputs[i] {
+                tempura_engine::BatchDecodeOutput::Token(token) => entry.emit_token(*token),
+                tempura_engine::BatchDecodeOutput::Logits(logits) => {
+                    entry.sample_and_emit(self.model.as_ref(), logits.clone())
+                }
+            };
             if done {
                 completed.push(id.clone());
             }

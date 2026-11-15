@@ -416,6 +416,60 @@ pub trait InferenceModel: Send + Sync {
     ) -> Option<Vec<Vec<f32>>> {
         None
     }
+    /// Dtype-aware [`Self::forward_batch_with_kvs`]: rows flagged `greedy`
+    /// (see `SamplingParams::is_greedy`) are reduced
+    /// to their sampled token ON THE GPU when the model supports it --
+    /// a 4-byte download instead of a full logits row -- while sampling
+    /// rows keep full logits.  The engine path never needs logprobs, so a
+    /// greedy row's logits are never materialized on the host.
+    /// None = fall back to per-session forward().
+    #[cfg(feature = "cutile")]
+    fn forward_batch_with_kvs_greedy(
+        &self,
+        token_ids: &[u32],
+        positions: &[u32],
+        kv_caches: &mut [crate::cutile_kv_cache::CutileKvCache],
+        greedy: &[bool],
+    ) -> Option<Vec<BatchDecodeOutput>> {
+        let rows = self.forward_batch_with_kvs(token_ids, positions, kv_caches)?;
+        Some(
+            rows.into_iter()
+                .zip(greedy.iter())
+                .map(|(logits, &g)| {
+                    if g {
+                        BatchDecodeOutput::Token(greedy_argmax_host(&logits))
+                    } else {
+                        BatchDecodeOutput::Logits(logits)
+                    }
+                })
+                .collect(),
+        )
+    }
+}
+
+/// One decode step's output row: either the already-sampled token (pure
+/// greedy rows -- GPU argmax, no logits download) or the full logits row
+/// (everything the sampler chain still has to run on).
+#[derive(Debug, Clone)]
+pub enum BatchDecodeOutput {
+    Token(u32),
+    Logits(Vec<f32>),
+}
+
+/// Host-side greedy argmax matching `max_by(partial_cmp)` semantics
+/// (last-max-wins) -- the same tie-break as the GPU kernel
+/// (`kernels/src/greedy_argmax.rs`).  Semantics note: the CPU sampler
+/// chain argmaxes post-softmax probabilities; exp is monotonic, so the
+/// argmax agrees except when two distinct near-max logits round to the
+/// same probability -- a measure-zero event the GPU single-seq path
+/// (`forward_greedy`) already accepts.
+pub fn greedy_argmax_host(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -10556,6 +10610,28 @@ impl CutileInferenceWrapper {
         gm.forward_batch_decode(token_ids, positions, qw, kv_caches)
     }
 
+    /// [`Self::forward_batch_decode_stateful`] with per-row greedy flags:
+    /// greedy rows come back as sampled tokens (GPU argmax, no logits
+    /// download), sampling rows as full logits.
+    pub fn forward_batch_decode_stateful_greedy(
+        &self,
+        token_ids: &[u32],
+        positions: &[u32],
+        kv_caches: &mut [crate::cutile_kv_cache::CutileKvCache],
+        greedy: &[bool],
+    ) -> Vec<crate::model::BatchDecodeOutput> {
+        let gm = match &self.gpu_model {
+            Some(g) => g,
+            None => panic!("forward_batch_decode_stateful_greedy: GPU model not loaded"),
+        };
+        let qw = self
+            .model
+            .quantized_weights
+            .as_ref()
+            .expect("forward_batch_decode_stateful_greedy: quantized weights not loaded");
+        gm.forward_batch_decode_greedy(token_ids, positions, qw, kv_caches, greedy)
+    }
+
     /// Current GPU KV sequence length (number of K/V entries written).
     pub fn gpu_kv_seq_len(&self) -> usize {
         self.gpu_kv_cache
@@ -10682,6 +10758,26 @@ impl InferenceModel for CutileInferenceWrapper {
             positions
         );
         Some(rows)
+    }
+    fn forward_batch_with_kvs_greedy(
+        &self,
+        token_ids: &[u32],
+        positions: &[u32],
+        kv_caches: &mut [crate::cutile_kv_cache::CutileKvCache],
+        greedy: &[bool],
+    ) -> Option<Vec<BatchDecodeOutput>> {
+        if self.gpu_model.is_none() || self.model.quantized_weights.is_none() {
+            return None;
+        }
+        let out = self.forward_batch_decode_stateful_greedy(token_ids, positions, kv_caches, greedy);
+        assert_eq!(
+            out.len(),
+            token_ids.len(),
+            "forward_batch_with_kvs_greedy: {} rows for m={}",
+            out.len(),
+            token_ids.len()
+        );
+        Some(out)
     }
     fn forward_greedy(&self, session: &mut InferenceSession, token_ids: &[u32]) -> Option<u32> {
         if let (Some(gm), Some(qw), Some(kv_mutex)) = (
