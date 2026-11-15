@@ -198,6 +198,53 @@ impl EngineTask {
         tempura_engine::cutile_kv_cache::CutileKvCache::pages_for_tokens(tokens)
     }
 
+    /// Swap out one scheduler-selected LRU/priority victim (not in
+    /// `protect`).  Returns true when a victim was swapped (or stale
+    /// accounting was cleaned up) and the caller should retry.
+    #[cfg(feature = "cutile")]
+    fn evict_one(&mut self, protect: &[String]) -> bool {
+        let protect_refs: Vec<&str> = protect.iter().map(|s| s.as_str()).collect();
+        let victim = {
+            let Ok(sched) = self.scheduler.lock() else {
+                return false;
+            };
+            sched.select_swap_victim(&protect_refs)
+        };
+        let Some(victim) = victim else {
+            return false;
+        };
+        match self.kv_caches.get_mut(&victim) {
+            Some(vkv) => {
+                let live = vkv.seq_len();
+                let freed = vkv.run_pages();
+                match vkv.swap_out() {
+                    Ok(()) => {
+                        if let Ok(mut sched) = self.scheduler.lock() {
+                            sched.mark_swapped(&victim);
+                        }
+                        eprintln!(
+                            "[engine] swapped out {victim} ({live} tokens, {freed} \
+                             pages) to the DRAM tier"
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("[engine] swap_out failed for {victim}: {e}");
+                        false
+                    }
+                }
+            }
+            None => {
+                // Victim has no GPU run (stale accounting) --
+                // mark it swapped so it stops being selected.
+                if let Ok(mut sched) = self.scheduler.lock() {
+                    sched.mark_swapped(&victim);
+                }
+                true
+            }
+        }
+    }
+
     /// Ensure the run for `id` can hold `tokens`; on pool exhaustion,
     /// swap out a scheduler-selected victim (never one of `protect`) and
     /// retry.  Returns false when no victim can satisfy the growth (the
@@ -220,48 +267,13 @@ impl EngineTask {
                     return false;
                 }
                 Err(tempura_engine::cutile_kv_cache::EnsureCapacityError::Exhausted(info)) => {
-                    let protect_refs: Vec<&str> = protect.iter().map(|s| s.as_str()).collect();
-                    let victim = {
-                        let Ok(sched) = self.scheduler.lock() else {
-                            return false;
-                        };
-                        sched.select_swap_victim(&protect_refs)
-                    };
-                    let Some(victim) = victim else {
+                    if !self.evict_one(protect) {
                         eprintln!(
                             "[engine] KV pool exhausted (need {} pages, {} free) and no \
                              eviction candidate -- deferring {id}",
                             info.need_pages, info.free_pages
                         );
                         return false;
-                    };
-                    match self.kv_caches.get_mut(&victim) {
-                        Some(vkv) => {
-                            let live = vkv.seq_len();
-                            let freed = vkv.run_pages();
-                            match vkv.swap_out() {
-                                Ok(()) => {
-                                    if let Ok(mut sched) = self.scheduler.lock() {
-                                        sched.mark_swapped(&victim);
-                                    }
-                                    eprintln!(
-                                        "[engine] swapped out {victim} ({live} tokens, {freed} \
-                                         pages) to the DRAM tier"
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!("[engine] swap_out failed for {victim}: {e}");
-                                    return false;
-                                }
-                            }
-                        },
-                        None => {
-                            // Victim has no GPU run (stale accounting) --
-                            // mark it swapped so it stops being selected.
-                            if let Ok(mut sched) = self.scheduler.lock() {
-                                sched.mark_swapped(&victim);
-                            }
-                        }
                     }
                 }
             }
@@ -565,6 +577,21 @@ impl EngineTask {
                         self.kv_pool.is_none()
                             || self.pool_free_pages()
                                 >= Self::pages_for(ADMISSION_HEADROOM_TOKENS)
+                            // Idle-pool floor: a pool SMALLER than the
+                            // headroom constant (e.g. 700 tokens) would
+                            // otherwise never admit anything -- requeued
+                            // requests livelock because eviction only
+                            // triggers on growth exhaustion, never on
+                            // admission.  With no active sequences the
+                            // only requirement is room for one fresh
+                            // initial run (256 tokens + the +16-page
+                            // growth margin = 32 pages).
+                            || (self
+                                .scheduler
+                                .lock()
+                                .map(|s| s.active_count() == 0)
+                                .unwrap_or(false)
+                                && self.pool_free_pages() >= Self::pages_for(512))
                     }
                     #[cfg(not(feature = "cutile"))]
                     {
@@ -621,15 +648,27 @@ impl EngineTask {
                     // (512-token initial runs already hold prompt+512
                     // decode tokens and never grow -- the p24 A/B run B
                     // showed zero swaps because of this).
-                    let run = self
+                    let mut run = self
                         .model
                         .new_session_kv_cache(self.kv_pool.as_ref().unwrap(), 256);
+                    if run.is_none() {
+                        // Pool too tight to admit: EVICT an LRU active
+                        // session (admission failure is also an eviction
+                        // trigger -- otherwise a full pool of
+                        // non-growing sessions livelocks requeued
+                        // admissions) and retry once.
+                        if self.evict_one(&[]) {
+                            run = self
+                                .model
+                                .new_session_kv_cache(self.kv_pool.as_ref().unwrap(), 256);
+                        }
+                    }
                     match run {
                         Some(kv) => {
                             self.kv_caches.insert(id.clone(), kv);
                         }
                         None => {
-                            // Pool too tight to admit -- requeue (the
+                            // Still too tight -- requeue (the
                             // payload stays parked until a later admit).
                             eprintln!("[engine] KV pool full at admission of {id}; requeued");
                             sessions.remove(&id);
