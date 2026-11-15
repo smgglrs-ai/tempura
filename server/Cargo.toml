@@ -29,8 +29,14 @@ tracing-opentelemetry = { version = "0.28", optional = true }
 
 [features]
 default = []
-cuda = ["tempura-engine/cutile", "cutile"]
-cutile = ["tempura-engine/cutile"]
+# WHY oxide-gemv is forced into both GPU features (2026-11-15): the serving
+# binary built with only `cutile` had NO oxide Q4K GEMV kernels -- every
+# Q4K projection ran the slow cuTile fallback (0.5 s/step at m=6, 92% of
+# GPU time) while bench-gpu (feature-unified with oxide-gemv) ran the
+# oxide kernels.  The kernels' build.rs falls back to the crate-root PTX
+# or an empty file, so this stays buildable on hosts without cargo oxide.
+cuda = ["tempura-engine/cutile", "tempura-engine/oxide-gemv", "cutile"]
+cutile = ["tempura-engine/cutile", "tempura-engine/oxide-gemv"]
 otlp = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 openmp = ["tempura-engine/openmp"]
 

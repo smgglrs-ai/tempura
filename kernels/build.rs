@@ -107,9 +107,46 @@ fn main() {
     }
 }
 
+/// Ensure `ptx_path` exists so `include_bytes!` in the host wrappers
+/// compiles.  Called after a failed/absent binary extraction: fall back to
+/// the crate-root PTX left by `scripts/gpu-remote.sh oxide` (or a manual
+/// `cargo oxide build`), and finally write an EMPTY file -- the runtime
+/// `try_load` constructors return `None` for empty PTX and the cuTile
+/// fallback is used (non-fatal, same semantics as the feature being off).
+///
+/// WHY this matters (2026-11-15): a fresh fingerprinted OUT_DIR on a host
+/// without the oxide binaries produced a MISSING ptx -> include_bytes!
+/// hard-failed the build OR (with a stale OUT_DIR) embedded whatever old
+/// PTX happened to be there.  The serving binary built WITHOUT the
+/// oxide-gemv feature silently ran every Q4K projection on the slow cuTile
+/// fallback (0.5 s/step at m=6 -- 92% of GPU time in nsys) while the
+/// bench-gpu binary (feature-unified) ran the oxide kernels.
+fn ensure_ptx_file(ptx_path: &std::path::Path, crate_root_ptx: &std::path::Path) {
+    if ptx_path.exists() {
+        return;
+    }
+    if let Ok(bytes) = std::fs::read(crate_root_ptx) {
+        if !bytes.is_empty() {
+            let _ = std::fs::write(ptx_path, &bytes);
+            eprintln!(
+                "build.rs: copied {} -> {}",
+                crate_root_ptx.display(),
+                ptx_path.display()
+            );
+            return;
+        }
+    }
+    let _ = std::fs::write(ptx_path, b"");
+    eprintln!(
+        "build.rs: {} missing and no crate-root PTX at {} -- wrote an empty file \
+         (oxide kernel disabled at runtime; run scripts/gpu-remote.sh oxide)",
+        ptx_path.display(),
+        crate_root_ptx.display()
+    );
+}
+
 fn build_oxide_q2_gemv(out_dir: &str) {
-    use std::process::Command;
-    use std::path::Path;
+    use std::process::Command;    use std::path::Path;
 
     // Path to the oxide-gemv standalone crate (relative to workspace root).
     let oxide_crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -218,6 +255,10 @@ sys.stdout.buffer.write(data[ptx_start:ptx_end])
             eprintln!("build.rs: python3 not available ({e}); oxide kernel disabled");
         }
     }
+    ensure_ptx_file(
+        &ptx_path,
+        &oxide_crate_dir.join("oxide_gemv.ptx"),
+    );
 }
 
 fn build_oxide_q4k_gemv(out_dir: &str) {
@@ -321,6 +362,10 @@ sys.stdout.buffer.write(data[ptx_start:ptx_end])
             eprintln!("build.rs: python3 not available ({e}); Q4K oxide kernel disabled");
         }
     }
+    ensure_ptx_file(
+        &ptx_path,
+        &oxide_crate_dir.join("oxide_gemv_q4k.ptx"),
+    );
 }
 
 fn build_oxide_q6k_gemv(out_dir: &str) {
@@ -424,6 +469,10 @@ sys.stdout.buffer.write(data[ptx_start:ptx_end])
             eprintln!("build.rs: python3 not available ({e}); Q6K oxide kernel disabled");
         }
     }
+    ensure_ptx_file(
+        &ptx_path,
+        &oxide_crate_dir.join("oxide_gemv_q6k.ptx"),
+    );
 }
 
 fn e8m0_to_f32_half_build(x: u8) -> f32 {

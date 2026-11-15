@@ -49,6 +49,21 @@ kill_leftovers() {
     done
 }
 
+# WHY: `cargo build -p tempura` can land tempura-kernels in a NEW
+# fingerprinted out dir with NO oxide PTX -- the engine then silently
+# falls back to the f32 host-dequant GEMM path (~0.5 s/step at m=6,
+# found 2026-11-15: the A/B "passed" at 11 tok/s on the fallback; the
+# gpu-remote bench flow copies PTX, the server build flow did not).
+copy_ptx() {
+    for d in target/release/build/tempura-kernels-*/out; do
+        [ -d "$d" ] || continue
+        cp tools/oxide-gemv/oxide_gemv.ptx               "$d/oxide_q2_gemv.ptx" 2>/dev/null || true
+        cp tools/oxide-gemv-q4k/oxide_gemv_q4k.ptx       "$d/oxide_q4k_gemv.ptx" 2>/dev/null || true
+        cp tools/oxide-gemv-q6k/oxide_gemv_q6k.ptx       "$d/oxide_q6k_gemv.ptx" 2>/dev/null || true
+        cp tools/oxide-decode-attn/oxide_decode_attn.ptx "$d/oxide_decode_attn.ptx" 2>/dev/null || true
+    done
+}
+
 wait_ready() {
     for _ in $(seq 1 120); do
         if curl -sf "http://127.0.0.1:$PORT/ready" >/dev/null 2>&1; then
@@ -95,6 +110,7 @@ kill_leftovers
 
 log "building server (cutile)..."
 cargo build --release -p tempura --features cutile || { log "ERROR: build failed"; exit 1; }
+copy_ptx
 # WHY: a rebuild lands tempura-kernels in a new fingerprinted out dir; the
 # oxide PTX must be copied there again or decode silently falls back.
 for d in target/release/build/tempura-kernels-*/out; do
