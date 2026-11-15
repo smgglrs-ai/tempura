@@ -5,6 +5,80 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-15b (the two remaining no-graph serving cost centers
+closed: GPU greedy argmax for the batch sampler + the oxide BATCH
+decode-attention kernel; engine step 47 -> 31 ms at m=6 = 192 tok/s
+aggregate; all gates green): (1) THE SAMPLER -- sample_and_emit cost
+11 ms of the 47 ms step at m=6: forward_batch_decode downloaded FULL
+logits rows (m x 128256 f32 = ~513 KB/row) and CpuSampler::apply
+SORTED the whole vocab on the CPU before the argmax.  FIX: sessions
+that are pure greedy (temperature == 0, no presence/frequency
+penalties -- new SamplingParams::is_greedy in kernel-api; top-k/top-p/
+min-p never move the argmax) now run the EXISTING GPU greedy-argmax
+kernel (greedy_argmax.rs, the u64 packed-key atomicMax whose tie-break
+matches max_by -- forward_greedy's kernel) on the DEVICE logits row
+before any download.  New InferenceModel::forward_batch_with_kvs_greedy
+returns BatchDecodeOutput::Token(u32) for greedy rows / Logits(Vec) for
+sampling rows; CutileGpuModel::forward_batch_decode_greedy launches the
+argmax per greedy row on the [m x vocab] lm_head output (GreedyArgmax::
+launch_ptr raw-pointer variant, cached [2m] u32 packed scratch), and
+all-greedy batches (the serving default) download 8*m bytes instead of
+m*vocab f32 -- the logits never reach the host.  Mixed batches dispatch
+per row.  The engine path never needs logprobs so this is always safe
+there.  MEASURED (TEMPURA_ENGINE_DEBUG_TICKS, 6-client streaming load):
+sample+emit 11 ms -> 7.5 MICROseconds per step at m=6.  Semantics note:
+the CPU chain argmaxes post-softmax probs; exp is monotonic so the
+argmax agrees except in a ~6e-8-relative near-tie window -- the
+divergence forward_greedy already ships with; all gates compare
+new-vs-new so determinism is unaffected.  (2) THE BATCH ATTENTION
+KERNEL -- oxide_decode_attn_batch (+ f16/e4m3 twins) now EXISTS in
+tools/oxide-decode-attn: grid (n_heads, m), 256 threads, one block per
+(request, head) pair running the kpar warp structure verbatim,
+parameterized per block by the request's K/V run base addresses (read
+from a device [m] u64 array -- the u64->pointer cast compiles fine in
+the oxide dialect), its kv_len (device [m] i32 array), and its Q row of
+the [m*n_heads*head_dim] batch Q tensor.  Per-request independent ->
+composition invariant; per-block math bit-identical to a per-request
+kpar launch (crate self-test: random per-request data, m in {2,3,6},
+bit-identical for all three dtypes; memcheck/racecheck/initcheck
+clean).  Host wrapper: forward_batch_d2d_ptrs{,_f16,_e4m3} on
+pre-uploaded device arrays (the old forward_batch_d2d alloc'd per
+call); forward_batch_graph_d2d keeps the 11-param ABI with the kpar
+grid/smem.  Engine no-graph wiring: cached per-m device arrays +
+grow-only host staging Vecs (kv_len_stage lesson), 3 tiny main-stream
+H2Ds per layer, kernel writes straight into attn_out (per-request
+out_r buffers + m scatter D2Ds per layer gone).  Dispatch m >= 2 only
+(at m=1 the direct launch is a wash), uniform pool dtype; per-request
+kpar stays the fallback.  NUMBERS (fishtank, RTX 5090, Llama-3.1-8B
+Q4_K_M, f16 pool, bench-nograph 400-step contexts): engine step at m=6
+46.6 -> 31.2 ms = 129 -> 192 tok/s aggregate (47 -> 31 ms vs yesterday
+counting the sampler fix; short-ctx m=6 32.9 -> 28.7 ms; m=1
+unchanged, direct path kept).  GATES ALL GREEN on the final tree:
+6-client kv-swap A/B PASS on f16 AND e4m3 (6/6 byte-identical, swaps
+exercised); pooled ppl 8 chunks f16 8.6838 / e4m3 8.6282 --
+BIT-IDENTICAL to the pre-change baselines (the batch kernel is
+numerically exact vs per-request); nonstream-route-smoke PASS;
+kv-restart-var PASS (no cross-restart variance); bench-ab-repro
+solo/repeat/interleave/m=2/m=3 checksums all IDENTICAL; local cargo
+test green (916).  DEBUGGING NOTE (oxide crate): during bring-up the
+batch self-test failed intermittently at m=3 (~50% of runs, always row
+2) with BOTH the reference kpar and the batch kernel producing
+garbage; the failures disappeared after a cargo-clean rebuild and
+never recurred (40+ runs, 3 sanitizers x3, full suite x10).  Root
+cause was never positively identified -- most plausibly stale
+build-artifact mixing during the remote source-sed bisection (the
+first "0.68 s" builds were cached).  If the batch self-test ever
+flakes again: clean-rebuild the crate FIRST, then suspect the k_ptrs
+indirection.  FOLLOW-UPS (open): (a) Option B -- batch GEMVs via the
+general-M streamk/mma kernels (weights read once per projection
+instead of m times; the per-row GEMV floor at m=6 is ~29 GB of weight
+traffic per step -- now the DOMINANT cost at ~25 ms of the 31 ms
+step); (b) m=1 serving decode is ~110 tok/s vs the single-seq graph's
+217 (composition invariance forbids routing m=1 there; position-
+synced batch graphs are the structural fix); (c) the sampler's CPU
+path (non-greedy sessions) still downloads full logits rows -- a GPU
+softmax/top-k would extend the same trick to sampled sessions.**
+
 **STATUS 2026-11-15 (ragged no-graph serving decode 4.3-8.4x faster; TWO
 root causes found -- a missing-feature server build and the sync-per-alloc
 no-graph path; all gates green): the dominant serving perf gap is closed
