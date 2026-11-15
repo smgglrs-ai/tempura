@@ -220,8 +220,9 @@ pub fn perplexity(
 /// `forward_with_kv`, decode via `forward_batch_with_kvs` at m=1 through
 /// the generic batch path) instead of the wrapper's dedicated session
 /// cache.  Used by bench-perplexity (TEMPURA_PPL_POOLED=1) to quality-gate
-/// the f16 pool against the f32 pool — the ppl criterion for flipping
-/// TEMPURA_KV_F16 to the default (gate on ppl, not logit correlation).
+/// the serving pool's dtype — the f16 default was flipped on this gate
+/// 2026-11-15 (f16/f32 ppl ratio 1.0003 at 8 chunks, gate on ppl, not
+/// logit correlation); TEMPURA_KV_F32=1 restores the f32 pool for A/B.
 #[cfg(feature = "cutile")]
 pub fn perplexity_pooled(
     model: &dyn InferenceModel,
@@ -238,7 +239,10 @@ pub fn perplexity_pooled(
     let first = n_ctx / 2;
 
     let pool = model.new_kv_pool()?;
-    let f16 = std::env::var("TEMPURA_KV_F16").as_deref() == Ok("1");
+    // Mirror the pool default (model.rs new_kv_pool): f16 unless
+    // TEMPURA_KV_F32=1 (the pre-flip TEMPURA_KV_F16=1 is now the default
+    // and stays accepted as a no-op).
+    let f16 = std::env::var("TEMPURA_KV_F32").as_deref() != Ok("1");
     eprintln!(
         "  [ppl-pooled] serving-path mode ({} KV pool, {} chunks of n_ctx={})",
         if f16 { "f16" } else { "f32" },

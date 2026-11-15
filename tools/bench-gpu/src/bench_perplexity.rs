@@ -387,9 +387,10 @@ fn main() {
     let gpu_res_opt = if let Some(ref wrapper) = wrapper {
         // TEMPURA_PPL_POOLED=1: score through the SERVING path (shared KV
         // pool + forward_with_kv prefill + m=1 batched decode) instead of
-        // the wrapper's dedicated session cache.  With TEMPURA_KV_F16=1
-        // this is the f16-pool quality gate (the criterion for flipping
-        // the f16 default -- gate on ppl, not logit correlation).
+        // the wrapper's dedicated session cache.  The pool dtype follows
+        // the serving default (f16; TEMPURA_KV_F32=1 restores f32) -- this
+        // is the f16-pool quality gate (the criterion for the default,
+        // gate on ppl, not logit correlation).
         let pooled = std::env::var("TEMPURA_PPL_POOLED").as_deref() == Ok("1");
         println!("\n--- tempura GPU ---");
         let gpu_res = if pooled {

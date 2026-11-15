@@ -5,6 +5,50 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-15 (pooled-ppl NaN ROOT-CAUSED + FIXED; f16 KV pool is
+now the DEFAULT): the m=1 batch-decode NaN in perplexity_pooled was the
+Q4K sm120 batch GEMV called with m != 2 — that PTX kernel is M=2
+HARDCODED (q4k_batch_sm120_ptx.rs: "param_m_rows not read"; it
+unconditionally reads a row-1 activation base and writes row-1 outputs
+at out[n..2n]).  gemm_any_d2d_batch forwarded ANY m to it; at m=1 the
+row-1 read ran past the q8 quantize scratch and the row-1 WRITE landed
+n f32 elements past the [n] output tensor — silent neighbor corruption
+in the cudaMallocAsync pool.  That explains the full symptom set:
+deterministic per run (fixed allocation layout), build-dependent NaN
+counts (2032/2040 recorded, 508/508 after a rebuild), f32/f16 count
+drift (different pool layouts), and the "clean" server on chat data
+(the corrupted 16KB happened to land in free pool memory there — its
+coherent text was luck, not correctness).  The composition-invariance
+work removing the m==1 single-seq special case is what first routed
+m=1 into the kernel.  FIX (commit 07f74ce, three layers):
+oxide_q4k_gemv_host refuses m != 2 in forward_sm120_batch_d2d(_into)
+with a clear error; gemm_any_d2d_batch dispatches to it only at m == 2
+(other m take the exact per-row GEMV fallback); TEMPURA_NO_SM120_Q4K_
+BATCH=1 bisects the dispatch.  Hunt tooling landed with it:
+TEMPURA_PPL_NAN_PROBE=1 (per-step NaN tuples, zero GPU work),
+TEMPURA_PPL_M2=1 (dummy second batch member — this probe pinned
+m=1-specific), and pooled mode now honors collect_logprobs so
+TEMPURA_PPL_DUMP_LOGPROBS works for batch-vs-single diffs.
+VALIDATION: pooled ppl m=1 f32 5.3993@1c / 6.1737@2c, f16 6.1644@2c,
+m=2 f16 5.3922@1c == m=1 f16 (composition-invariant), DECODE_SINGLE
+5.3894@1c (matches the pre-hunt record) — all 0 NaN; nonstream-route-
+smoke PASS; local cargo test green.  THE f16 GATE PASSED — pooled f32
+8.6799 vs f16 8.6827 at 8 chunks (ratio 1.0003, gate <=1.01, 0 NaN
+both) — so TEMPURA_KV_F16's default is FLIPPED ON in new_kv_pool
+(engine/src/model.rs; TEMPURA_KV_F32=1 restores the f32 pool; commit
+follows 07f74ce); the smoke re-ran green on the f16 pool (banner
+"512 pages, f16", byte-identical buffered vs SSE).  Follow-ups
+recorded: (a) TEMPURA_NO_MXFP4=1 is NOT a clean bisect for the
+no-graph batch path — it computes wrong logits at ANY m (m=1:
+4.8857 vs 5.3993 correct) even after the sm120 fix; root-cause when
+next needed; (b) the m>=2 f32 equal-position batch GRAPH path scores
+ppl 7.5 vs 5.4 exact — that is the documented MXFP4 tensor-core
+approximation (activation quantization ~0.1 rel logit delta), not a
+regression, and serving never uses it (ragged / f16 -> no-graph, which
+is exact and composition-invariant); (c) NEXT: FP8/TurboQuant on the
+pool (bigger win; attention kernels need dequant epilogues), and
+optionally a bench-decode-ops f16-pool section.**
+
 **STATUS 2026-11-15: ppl gate for the f16 default-flip BLOCKED on an open
 harness bug (commit c94572d landed the tooling + one real fix).
 perplexity_pooled (TEMPURA_PPL_POOLED=1) scores the corpus through the

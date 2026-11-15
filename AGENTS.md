@@ -334,6 +334,9 @@ Qwen3.6-27B weights** — see open work.
 - [x] Continuous batching with priority preemption + preemption-requeue,
       chunked prefill (512-token), prefix caching with cache_salt tenant
       isolation
+- [x] Serving KV pool stores f16 by default (128 KiB/token GQA; ppl-gated
+      2026-11-15: f16/f32 ratio 1.0003 on WikiText-2; TEMPURA_KV_F32=1
+      restores f32)
 - [x] Dedicated engine thread (async HTTP ↔ sync SIMD isolation)
 - [x] Prometheus metrics, OpenTelemetry export (`otlp` feature), readiness,
       black-box /health/inference, API-key auth, timeouts, graceful shutdown
