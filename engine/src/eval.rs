@@ -276,6 +276,21 @@ fn perplexity_pooled_inner(
     let mut count = 0usize;
     let mut nan_steps = 0usize;
 
+    // TEMPURA_PPL_NAN_PROBE=1: minimal-invasiveness NaN localization --
+    // the logits are already downloaded each step, so this adds NO GPU
+    // work.  Prints the first N failing (chunk, decode-step, position,
+    // kv_len, token) tuples and each chunk's first-NaN step index.
+    // (Named _NAN_PROBE: TEMPURA_PPL_PROBE is the bench's token-file
+    // reference-bisect knob.)
+    let probe = std::env::var("TEMPURA_PPL_NAN_PROBE").as_deref() == Ok("1");
+    let mut probe_printed = 0usize;
+    // TEMPURA_PPL_M2=1: bisect switch -- decode with a dummy second
+    // request in the batch (same token, own pooled run).  If kv[0]'s
+    // logits go clean at m=2 the bug is m=1-specific in the generic
+    // batch path; if still NaN it is general.
+    let m2 = std::env::var("TEMPURA_PPL_M2").as_deref() == Ok("1");
+    let mut logprobs = Vec::new();
+
     for i in 0..n_chunk {
         if opts.progress {
             eprintln!(
@@ -296,42 +311,97 @@ fn perplexity_pooled_inner(
         // array: forward_batch_with_kvs borrows &mut [CutileKvCache], and
         // passing &mut [kv] would MOVE it into a dropped temporary.
         let mut session = InferenceSession::new(config, TraceLevel::Off, 0);
-        let mut kv = [model.new_session_kv_cache(&pool, first + 64)?];
+        let mut kv = model.new_session_kv_cache(&pool, first + 64)?;
+        // The m=2 probe's dummy request: its own pooled run, prefilled
+        // with the same prefix so its KV stays well-formed (the batch
+        // forward appends to it each step like any batch member).
+        let mut kv_dummy = if m2 {
+            let mut d = model.new_session_kv_cache(&pool, first + 64)?;
+            let mut ds = InferenceSession::new(config, TraceLevel::Off, 0);
+            let _ = model.forward_with_kv(&mut ds, &chunk[..first + 1], &mut d)?;
+            Some(d)
+        } else {
+            None
+        };
         let mut logits =
-            model.forward_with_kv(&mut session, &chunk[..first + 1], &mut kv[0])?;
+            model.forward_with_kv(&mut session, &chunk[..first + 1], &mut kv)?;
         if logits.iter().any(|v| v.is_nan()) {
             nan_steps += 1;
         }
         let mut j = first;
+        let mut step = 0usize;
+        let mut first_nan_step: Option<usize> = None;
         while j < n_ctx - 1 {
             let lp = token_logprob(&logits, chunk[j + 1] as usize);
+            if opts.collect_logprobs {
+                logprobs.push(lp);
+            }
             nll += -lp;
             count += 1;
             j += 1;
             if j < n_ctx - 1 {
-                let pos = [session.position as u32];
-                let tok = [chunk[j]];
-                // TEMPURA_PPL_DECODE_SINGLE=1: bisect switch -- decode via
-                // the single-seq forward_with_kv path (the wrapper-mode ppl
-                // flow) instead of the m=1 batch path.  Localizes NaN bugs
-                // between the pool setup and the batch decode kernels.
-                let rows = if std::env::var("TEMPURA_PPL_DECODE_SINGLE").as_deref() == Ok("1") {
-                    let l = model.forward_with_kv(&mut session, &tok, &mut kv[0])?;
-                    vec![l]
+                step += 1;
+                let pos = session.position as u32;
+                let tok = chunk[j];
+                let decode_single =
+                    std::env::var("TEMPURA_PPL_DECODE_SINGLE").as_deref() == Ok("1");
+                let (rows, kv_back, dummy_back) = if decode_single {
+                    // TEMPURA_PPL_DECODE_SINGLE=1: bisect switch -- decode
+                    // via the single-seq forward_with_kv path (the
+                    // wrapper-mode ppl flow) instead of the batch path.
+                    // Localizes NaN bugs between the pool setup and the
+                    // batch decode kernels.
+                    let l = model.forward_with_kv(&mut session, &[tok], &mut kv)?;
+                    (vec![l], Some(kv), None)
+                } else if m2 {
+                    // TEMPURA_PPL_M2=1: batch the real request with the
+                    // dummy -- discriminates an m=1-specific batch-path
+                    // bug from a general one.
+                    let dummy = kv_dummy.take().expect("m2 dummy");
+                    let mut pair = [kv, dummy];
+                    let toks = [tok, tok];
+                    let poss = [pos, pos];
+                    let r = model.forward_batch_with_kvs(&toks, &poss, &mut pair)?;
+                    session.position += 1;
+                    session.cache.advance(1);
+                    let [kv0, dummy0] = pair;
+                    (r, Some(kv0), Some(dummy0))
                 } else {
-                    let r = model.forward_batch_with_kvs(&tok, &pos, &mut kv)?;
+                    let mut arr = [kv];
+                    let r = model.forward_batch_with_kvs(&[tok], &[pos], &mut arr)?;
                     // Mirror the engine's decode bookkeeping: the batch
                     // forward advances the KV run internally, but the
                     // SESSION position (RoPE) is the caller's job.
                     session.position += 1;
                     session.cache.advance(1);
-                    r
+                    let [kv0] = arr;
+                    (r, Some(kv0), None)
                 };
+                kv = kv_back.expect("kv back");
+                if let Some(d) = dummy_back {
+                    kv_dummy = Some(d);
+                }
                 logits = rows.into_iter().next()?;
                 if logits.iter().any(|v| v.is_nan()) {
                     nan_steps += 1;
+                    if first_nan_step.is_none() {
+                        first_nan_step = Some(step);
+                    }
+                    if probe && probe_printed < 20 {
+                        probe_printed += 1;
+                        eprintln!(
+                            "  [ppl-probe] NaN logits: chunk={} step={} j={} pos={} kv_len={} tok={}",
+                            i, step, j, session.position - 1, kv.seq_len(), chunk[j]
+                        );
+                    }
                 }
             }
+        }
+        if probe {
+            eprintln!(
+                "  [ppl-probe] chunk {i}: first NaN decode step = {:?} (of {step})",
+                first_nan_step
+            );
         }
     }
 
@@ -347,7 +417,7 @@ fn perplexity_pooled_inner(
         chunks: n_chunk,
         nan_steps,
         elapsed_s: t0.elapsed().as_secs_f64(),
-        logprobs: Vec::new(),
+        logprobs,
     })
 }
 

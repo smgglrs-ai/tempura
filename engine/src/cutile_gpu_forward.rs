@@ -5011,7 +5011,14 @@ impl CutileGpuModel {
 
         // sm_120 batch Q4K kernel: hand-written PTX with static smem, avoids error 719.
         // Only available when uses_raw_gguf=true (weights in native 36-u32 GGUF format).
-        if is_q4k {
+        // M=2 ONLY: the PTX is M=2 hardcoded (param_m_rows is not read; it
+        // unconditionally writes row-1 outputs at out[n..2n] -- at m=1 that
+        // is 16KB past the [n] output tensor, silently corrupting whatever
+        // is allocated next in the pool; at m>2 rows 3+ are never computed).
+        // Found by the pooled-ppl m=1 NaN hunt.  Other m values fall
+        // through to the per-row GEMV fallback below (the graph path
+        // prefers the general-M stream-K/MMA batch kernels).
+        if is_q4k && m == 2 && std::env::var("TEMPURA_NO_SM120_Q4K_BATCH").as_deref() != Ok("1") {
             if let Some(oxide) = &self.oxide_q4k_gemv {
                 if oxide.has_sm120_batch() && oxide.uses_raw_gguf {
                     let dw = self.device_weights_q4k.get(weight_name).unwrap();

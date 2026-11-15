@@ -1302,6 +1302,23 @@ impl OxideQ4kGemv {
             Some(f) => f,
             None => return Err(KernelError::InvalidConfig("sm120_batch not loaded".into())),
         };
+        // The sm120 batch PTX is M=2 HARDCODED (q4k_batch_sm120_ptx.rs:
+        // "param_m_rows not read (M=2 hardcoded)" -- it unconditionally
+        // reads a row-1 activation base and writes row-1 outputs at
+        // out[n..2n]).  Calling it with m != 2 reads activations past the
+        // quantize scratch and WRITES past the [m*n] output tensor --
+        // silent neighbor corruption in the cudaMallocAsync pool (found
+        // by the pooled-ppl m=1 NaN hunt: deterministic, allocation-
+        // layout-dependent NaN/garbage).  Refuse any m != 2 here so no
+        // caller can misuse the kernel; general-M batches must use the
+        // stream-K / MMA batch kernels or the per-row fallback.
+        if m != 2 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_sm120_batch_d2d: the sm120 batch kernel is M=2 \
+                 hardcoded (param_m_rows is not read); got m={m}.  Use the \
+                 stream-K/MMA batch kernels or the per-row GEMV fallback."
+            )));
+        }
         let q8_quant_fn = match self.cu_q8_quantize {
             Some(f) => f,
             None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
@@ -1419,6 +1436,14 @@ impl OxideQ4kGemv {
             Some(f) => f,
             None => return Err(KernelError::InvalidConfig("sm120_batch not loaded".into())),
         };
+        // M=2 hardcoded PTX -- see forward_sm120_batch_d2d.  m != 2 would
+        // read past the quantize scratch and write past `out`.
+        if m != 2 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_sm120_batch_d2d_into: the sm120 batch kernel is \
+                 M=2 hardcoded; got m={m}"
+            )));
+        }
         let q8_quant_fn = match self.cu_q8_quantize {
             Some(f) => f,
             None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
