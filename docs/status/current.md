@@ -5,6 +5,33 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-15: ppl gate for the f16 default-flip BLOCKED on an open
+harness bug (commit c94572d landed the tooling + one real fix).
+perplexity_pooled (TEMPURA_PPL_POOLED=1) scores the corpus through the
+serving flow (pool + forward_with_kv prefill + m=1 forward_batch_with_kvs
+decode) — and it NaNs DETERMINISTICALLY in the m=1 batch decode: identical
+counts every run (2032/2040 scored positions f32, 2027/2040 f16), BOTH
+dtypes (NOT f16-specific), wiki corpus.  The same batch path serves
+correctly in the server (f16 A/B + smoke PASS, byte-identical, bit-exact
+swaps); the wrapper-mode ppl on the same corpus is clean (7.9754@32c);
+pooled + TEMPURA_PPL_DECODE_SINGLE (single-seq decode on the same pool) is
+clean (0 NaN).  FIXED en route (real bug regardless): the per-request
+kv_len H2D in the batch attention fallback raced its loop-iteration stack
+slot (async copy deferring past the iteration scope -> garbage kv_len ->
+OOB KV scans); now a synchronous 4-byte copy.  NEXT STEPS for the hunt:
+(a) the NaN is deterministic + data-dependent — diff per-position logprobs
+between pooled-batch and pooled-single runs (TEMPURA_PPL_DUMP_LOGPROBS) to
+find the first divergent position and whether it correlates with specific
+tokens; (b) try m=2 batches (a dummy second cache) — discriminates
+m=1-specific vs general batch-path; (c) suspicion list: the oxide BASE
+single-warp attention kernel (only the batch fallback uses it — the
+single-seq paths use kpar/splitk; the server used the same base kernel
+successfully on CHAT data, so corpus data may matter), probe contamination
+under cuda-oxide v0.5.0's retirement-thread lease (extra D2H downloads
+inside the layer loop), or an m=1 edge in the generic batch path
+(post-m==1-removal) that chat-shaped data never exercised.  The f16
+default flip stays BLOCKED until this resolves; server-side f16 remains
+fully validated.**
 **STATUS 2026-11-14 (f16 KV pool COMPLETE, pieces 1+2 landed): the
 serving pool can store KV as f16 (TEMPURA_KV_F16=1, commits aaacbba +
 023dba7) — halved KV density (128 KiB/token for Llama-8B GQA; the f32
