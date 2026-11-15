@@ -34,6 +34,12 @@ unsafe impl Send for RmsnormScratch {}
 unsafe impl Sync for RmsnormScratch {}
 
 impl RmsnormScratch {
+    /// Empty scratch (no buffers yet) -- the no-graph batch decode path
+    /// lazily allocates per (norm site, batch size) on first use.
+    pub fn empty() -> Self {
+        Self { sum_t: None, scale_t: None, out_t: None }
+    }
+
     /// Pre-allocate with a single blocking `sync_on` per buffer -- called once
     /// at model construction.  `seq_len` should be 1 (decode).
     pub fn new(

@@ -317,6 +317,78 @@ const SLOT_DOWN: usize = 6;
 const SLOT_LOGITS: usize = 7;
 const NUM_SLOTS: usize = 8;
 
+/// Per-request row buffers for the no-graph ragged batch decode path.
+struct NoGraphRowBufs {
+    /// [q_pad] Q slice (tail beyond q_dim stays zero, as with the fresh
+    /// `api::zeros` this replaces).
+    q_r: Arc<Tensor<f32>>,
+    /// [kv_pad] K slice.
+    k_r: Arc<Tensor<f32>>,
+    /// [kv_pad] V slice.
+    v_r: Arc<Tensor<f32>>,
+    /// [q_dim] Q after RoPE, copied out of the shared rope scratch.
+    q_rot: Arc<Tensor<f32>>,
+    /// [q_dim] per-request attention output (attention fallback).
+    attn_out_r: Arc<Tensor<f32>>,
+}
+
+impl Clone for NoGraphRowBufs {
+    fn clone(&self) -> Self {
+        Self {
+            q_r: self.q_r.clone(),
+            k_r: self.k_r.clone(),
+            v_r: self.v_r.clone(),
+            q_rot: self.q_rot.clone(),
+            attn_out_r: self.attn_out_r.clone(),
+        }
+    }
+}
+
+/// Scratch pool for the no-graph ragged batch decode path
+/// (`forward_batch_decode`'s generic fallback -- the serving path).
+///
+/// Everything is cached by batch size m: ragged serving steps vary m call to
+/// call, and the underlying scratch users size-check exactly, so a single
+/// entry would realloc (a full stream sync) on every m change.  m is bounded
+/// by the client count, so the pool stays small.
+///
+/// Reusing these buffers is numerics-neutral: every buffer is either fully
+/// overwritten before each use (stream-ordered D->D copies / kernel writes)
+/// or its pad tail provably stays zero, matching the fresh `api::zeros`
+/// allocations this pool replaces.  What it removes is the ~3000 blocking
+/// `api::zeros(...).sync_on(...)` calls (= full cuStreamSynchronize + alloc)
+/// per step at m=6 that made the no-graph path run ~0.5-0.7 s/step.
+#[derive(Default)]
+struct NoGraphBatchScratch {
+    /// Per-slot GEMM output rows [m * n], keyed (slot, n, m).  One buffer per
+    /// key is safe across layers and steps: same-stream ordering guarantees
+    /// the previous consumer of a slot's output finished reading before the
+    /// next layer's same-slot GEMV writes it, and no consumer of a projection
+    /// output outlives its layer (lm_head logits are downloaded before the
+    /// next step's SLOT_LOGITS write).
+    gemm_out: std::collections::HashMap<(usize, usize, usize), Arc<Tensor<f32>>>,
+    /// Per-slot activation row [row_stride], keyed (slot, row_stride).  Fully
+    /// overwritten by the D->D row slice before the row's GEMV reads it.
+    a_row: std::collections::HashMap<(usize, usize), Arc<Tensor<f32>>>,
+    /// Per-request row buffer sets, keyed m.
+    rows: std::collections::HashMap<usize, Vec<NoGraphRowBufs>>,
+    /// Attention output concat [m * q_dim], keyed m.
+    attn_out: std::collections::HashMap<usize, Arc<Tensor<f32>>>,
+    /// Batch attention Q concat [m * q_dim], keyed m (oxide batch kernel path).
+    q_batch: std::collections::HashMap<usize, Arc<Tensor<f32>>>,
+    /// RMSNorm scratch per (site, m): site 0 = input_layernorm,
+    /// 1 = post_attention_layernorm, 2 = final norm.
+    rms: std::collections::HashMap<(usize, usize), RmsnormScratch>,
+    /// SiLU/GeGLU gated-multiply output scratch, keyed m.
+    silu: std::collections::HashMap<usize, Option<Arc<Tensor<f32>>>>,
+    /// FFN inter padding buffer [m * inter_pad], keyed m (tail stays zero).
+    inter_pad: std::collections::HashMap<usize, Arc<Tensor<f32>>>,
+    /// Residual-add ping-pong buffers [m * h_pad], keyed m.  Two buffers so
+    /// the add kernel's output never aliases its `a` input (the live hidden
+    /// state); the sides alternate across the two adds per layer.
+    hidden: std::collections::HashMap<usize, [Option<Arc<Tensor<f32>>>; 2]>,
+}
+
 /// Transformer with all projection weights pre-uploaded to the GPU.
 ///
 /// Create once with [`CutileGpuModel::from_quantized`] at model load time, then call
@@ -547,6 +619,9 @@ pub struct CutileGpuModel {
     /// the launch (the pre-c94572d stack local could be overwritten before
     /// an async copy read it).
     kv_len_stage: std::cell::RefCell<Vec<f32>>,
+    /// Scratch pool for the no-graph ragged batch decode path (see
+    /// [`NoGraphBatchScratch`]).
+    nograph: RefCell<NoGraphBatchScratch>,
     /// Current token position for RoPE (f32 for cuTile compatibility).
     d_positions: Arc<Tensor<f32>>,
     /// KV cache write slot before the current step's append (raw i32, not a cuTile tensor).
@@ -2561,6 +2636,7 @@ impl CutileGpuModel {
             d_embed,
             d_kv_len,
             kv_len_stage,
+            nograph: RefCell::new(NoGraphBatchScratch::default()),
             d_positions,
             d_kv_write_offset,
             d_rope_cos_row,
@@ -3019,6 +3095,7 @@ impl CutileGpuModel {
             d_embed,
             d_kv_len,
             kv_len_stage,
+            nograph: RefCell::new(NoGraphBatchScratch::default()),
             d_positions,
             d_kv_write_offset,
             d_rope_cos_row,
@@ -5030,17 +5107,44 @@ impl CutileGpuModel {
         // is now a no-op for this path, kept for compatibility.
 
         // Fallback: M sequential GEMVs (no L2 reuse but still GPU-resident).
-        let out: Arc<Tensor<f32>> = Arc::new(
-            api::zeros::<f32>(&[m * n])
-                .sync_on(stream)
-                .expect("gemm_any_d2d_batch: output alloc"),
-        );
+        // Output buffer cached by (slot, n, m) and the activation row by
+        // (slot, row_stride): the fresh `api::zeros(...).sync_on(...)` this
+        // replaces is a FULL cuStreamSynchronize + alloc per call, which at
+        // 7 projections x 32 layers x (1 + m) calls serialized the whole
+        // step (~1500 drains at m=6).  Buffer reuse is safe: every element
+        // of both buffers is overwritten (D->D copy) before it is read, in
+        // stream order, and no projection output outlives its layer.
+        let out: Arc<Tensor<f32>> = {
+            let mut pool = self.nograph.borrow_mut();
+            match pool.gemm_out.get(&(slot, n, m)) {
+                Some(buf) => buf.clone(),
+                None => {
+                    let buf = Arc::new(
+                        api::zeros::<f32>(&[m * n])
+                            .sync_on(stream)
+                            .expect("gemm_any_d2d_batch: output alloc"),
+                    );
+                    pool.gemm_out.insert((slot, n, m), buf.clone());
+                    buf
+                }
+            }
+        };
+        let a_row: Arc<Tensor<f32>> = {
+            let mut pool = self.nograph.borrow_mut();
+            match pool.a_row.get(&(slot, row_stride)) {
+                Some(buf) => buf.clone(),
+                None => {
+                    let buf = Arc::new(
+                        api::zeros::<f32>(&[row_stride])
+                            .sync_on(stream)
+                            .expect("gemm_any_d2d_batch: a_row alloc"),
+                    );
+                    pool.a_row.insert((slot, row_stride), buf.clone());
+                    buf
+                }
+            }
+        };
         for r in 0..m {
-            let a_row: Arc<Tensor<f32>> = Arc::new(
-                api::zeros::<f32>(&[row_stride])
-                    .sync_on(stream)
-                    .expect("gemm_any_d2d_batch: a_row alloc"),
-            );
             unsafe {
                 cuda_core::memcpy_dtod_async::<f32>(
                     a_row.device_pointer().cu_deviceptr(),
@@ -9742,6 +9846,8 @@ impl CutileGpuModel {
 
         // Upload concatenated hidden [M, H] to device.
         let mut hidden_dev = self.to_device_flat_padded(&hidden, m, h, self.h_pad);
+        // Residual-add ping-pong side (see the per-layer add sites).
+        let mut hidden_side: usize = 0;
 
         for layer in 0..cfg.num_layers {
             let (
@@ -9760,88 +9866,124 @@ impl CutileGpuModel {
                 .norm_weights
                 .get(input_ln_name)
                 .expect("input_layernorm weight missing");
-            let normed_dev = self
-                .cutile_rmsnorm
-                .forward_device_fused(
-                    stream,
-                    hidden_dev.clone(),
-                    input_ln_w_dev,
-                    m,
-                    h,
-                    self.h_pad,
-                    cfg.layer_norm_eps,
-                )
-                .expect("batch RMSNorm failed");
+            // Scratch variant (cached per (site, m) buffers): the plain
+            // forward_device_fused does 3 api::zeros.sync_on + a trailing
+            // stream.synchronize per call = 4 full pipeline drains x 2 norms
+            // x 32 layers per step.  Bitwise-identical kernels.
+            let normed_dev = {
+                let mut ng = self.nograph.borrow_mut();
+                let scratch = ng
+                    .rms
+                    .entry((0, m))
+                    .or_insert_with(RmsnormScratch::empty);
+                self.cutile_rmsnorm
+                    .forward_device_fused_scratch(
+                        stream,
+                        hidden_dev.clone(),
+                        input_ln_w_dev,
+                        m,
+                        h,
+                        self.h_pad,
+                        cfg.layer_norm_eps,
+                        scratch,
+                    )
+                    .expect("batch RMSNorm failed")
+            };
 
             // QKV projections [M, H] -> [M, Q_DIM] / [M, KV_DIM]
-            // normed_dev is [m, h_pad] from forward_device_fused; row stride = h_pad.
+            // normed_dev is [m, h_pad] from forward_device_fused_scratch; row stride = h_pad.
             let q_dev = self.gemm_any_d2d_batch(&normed_dev, q_w_name, m, self.h_pad, SLOT_Q);
             let k_dev = self.gemm_any_d2d_batch(&normed_dev, k_w_name, m, self.h_pad, SLOT_K);
             let v_dev = self.gemm_any_d2d_batch(&normed_dev, v_w_name, m, self.h_pad, SLOT_V);
+            // The next layer's site-0 rmsnorm reclaims this buffer via
+            // Arc::try_unwrap -- drop our reference as soon as the last
+            // consumer (the v GEMV's activation-row slice) is enqueued.
+            drop(normed_dev);
 
             // RoPE per-request (each has its own position).
             // Process each request's Q/K slice individually.
             let kv_pad = next_pow2(kv_dim.div_ceil(BK) * BK);
+            // Cached per-request row buffers (the fresh api::zeros per row
+            // this replaces was m x 3 full stream syncs per layer).
+            let row_bufs: Vec<NoGraphRowBufs> = {
+                let mut ng = self.nograph.borrow_mut();
+                ng.rows
+                    .entry(m)
+                    .or_insert_with(|| {
+                        (0..m)
+                            .map(|_| NoGraphRowBufs {
+                                q_r: Arc::new(
+                                    api::zeros::<f32>(&[self.q_pad])
+                                        .sync_on(stream)
+                                        .expect("q_r alloc"),
+                                ),
+                                k_r: Arc::new(
+                                    api::zeros::<f32>(&[kv_pad])
+                                        .sync_on(stream)
+                                        .expect("k_r alloc"),
+                                ),
+                                v_r: Arc::new(
+                                    api::zeros::<f32>(&[kv_pad])
+                                        .sync_on(stream)
+                                        .expect("v_r alloc"),
+                                ),
+                                q_rot: Arc::new(
+                                    api::zeros::<f32>(&[q_dim])
+                                        .sync_on(stream)
+                                        .expect("q_rot alloc"),
+                                ),
+                                attn_out_r: Arc::new(
+                                    api::zeros::<f32>(&[q_dim])
+                                        .sync_on(stream)
+                                        .expect("attn out_r alloc"),
+                                ),
+                            })
+                            .collect()
+                    })
+                    .clone()
+            };
             let mut q_rot_parts: Vec<Arc<cutile::tensor::Tensor<f32>>> = Vec::with_capacity(m);
             for r in 0..m {
-                // Extract per-request Q/K/V slices via D->D memcpy into fresh [q_dim] tensors.
-                let q_r = {
-                    let t = Arc::new(
-                        cutile::api::zeros::<f32>(&[self.q_pad])
-                            .sync_on(stream)
-                            .expect("q_r alloc"),
-                    );
-                    unsafe {
-                        cuda_core::memcpy_dtod_async::<f32>(
-                            t.device_pointer().cu_deviceptr(),
-                            q_dev.device_pointer().cu_deviceptr() + (r * self.q_pad * 4) as u64,
-                            q_dim,
-                            stream,
-                        )
-                        .expect("q_r D->D");
-                    }
-                    t
-                };
-                let k_r = {
-                    let t = Arc::new(
-                        cutile::api::zeros::<f32>(&[kv_pad])
-                            .sync_on(stream)
-                            .expect("k_r alloc"),
-                    );
-                    unsafe {
-                        cuda_core::memcpy_dtod_async::<f32>(
-                            t.device_pointer().cu_deviceptr(),
-                            k_dev.device_pointer().cu_deviceptr() + (r * kv_pad * 4) as u64,
-                            kv_dim,
-                            stream,
-                        )
-                        .expect("k_r D->D");
-                    }
-                    t
-                };
-                let v_r = {
-                    let t = Arc::new(
-                        cutile::api::zeros::<f32>(&[kv_pad])
-                            .sync_on(stream)
-                            .expect("v_r alloc"),
-                    );
-                    unsafe {
-                        cuda_core::memcpy_dtod_async::<f32>(
-                            t.device_pointer().cu_deviceptr(),
-                            v_dev.device_pointer().cu_deviceptr() + (r * kv_pad * 4) as u64,
-                            kv_dim,
-                            stream,
-                        )
-                        .expect("v_r D->D");
-                    }
-                    t
-                };
+                // Extract per-request Q/K/V slices via D->D memcpy into the
+                // cached row buffers (fully overwritten each layer in stream
+                // order; the pad tail beyond q_dim/kv_dim is never written and
+                // stays zero, matching the fresh zeros this replaced).
+                let q_r = &row_bufs[r].q_r;
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        q_r.device_pointer().cu_deviceptr(),
+                        q_dev.device_pointer().cu_deviceptr() + (r * self.q_pad * 4) as u64,
+                        q_dim,
+                        stream,
+                    )
+                    .expect("q_r D->D");
+                }
+                let k_r = &row_bufs[r].k_r;
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        k_r.device_pointer().cu_deviceptr(),
+                        k_dev.device_pointer().cu_deviceptr() + (r * kv_pad * 4) as u64,
+                        kv_dim,
+                        stream,
+                    )
+                    .expect("k_r D->D");
+                }
+                let v_r = &row_bufs[r].v_r;
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        v_r.device_pointer().cu_deviceptr(),
+                        v_dev.device_pointer().cu_deviceptr() + (r * kv_pad * 4) as u64,
+                        kv_dim,
+                        stream,
+                    )
+                    .expect("v_r D->D");
+                }
 
                 let pos_r = [positions[r]];
                 let q_rot = self
                     .cutile_rope
                     .forward_device_scratch(
-                        &q_r,
+                        q_r,
                         &pos_r,
                         1,
                         n_heads,
@@ -9854,7 +9996,7 @@ impl CutileGpuModel {
                 let k_rot = self
                     .cutile_rope
                     .forward_device_scratch(
-                        &k_r,
+                        k_r,
                         &pos_r,
                         1,
                         n_kv_heads,
@@ -9866,18 +10008,15 @@ impl CutileGpuModel {
                     .expect("batch K RoPE failed");
 
                 kv_caches[r]
-                    .append_device_gpu_only(layer, &k_rot, &v_r, 1)
+                    .append_device_gpu_only(layer, &k_rot, v_r, 1)
                     .expect("batch KV append failed");
                 // q_rot ALIASES the shared q_rope_scratch output buffer --
                 // copy it out NOW, before the next request's RoPE
                 // overwrites the scratch.  Deferring (pushing the alias
                 // and using it after the loop) made every request's
                 // attention run with the LAST request's Q (p24 A/B).
-                let q_rot_fresh: Arc<Tensor<f32>> = Arc::new(
-                    cutile::api::zeros::<f32>(&[q_dim])
-                        .sync_on(stream)
-                        .expect("q_rot fresh alloc"),
-                );
+                // Destination is the cached per-request q_rot buffer.
+                let q_rot_fresh = &row_bufs[r].q_rot;
                 unsafe {
                     cuda_core::memcpy_dtod_async::<f32>(
                         q_rot_fresh.device_pointer().cu_deviceptr(),
@@ -9887,17 +10026,25 @@ impl CutileGpuModel {
                     )
                     .expect("q_rot D->D copy");
                 }
-                q_rot_parts.push(q_rot_fresh);
+                q_rot_parts.push(q_rot_fresh.clone());
             }
 
             // Batch flash attention: one kernel launch, M x n_heads blocks.
             let attn_out_dev = if let Some(ref oda) = self.oxide_decode_attn {
                 if oda.has_batch() {
-                    let attn_out = Arc::new(
-                        cutile::api::zeros::<f32>(&[m * q_dim])
-                            .sync_on(stream)
-                            .expect("batch attn out alloc"),
-                    );
+                    let attn_out = {
+                        let mut ng = self.nograph.borrow_mut();
+                        ng.attn_out
+                            .entry(m)
+                            .or_insert_with(|| {
+                                Arc::new(
+                                    cutile::api::zeros::<f32>(&[m * q_dim])
+                                        .sync_on(stream)
+                                        .expect("batch attn out alloc"),
+                                )
+                            })
+                            .clone()
+                    };
                     // Collect per-request KV cache device pointers and kv_lens.
                     let k_ptrs: Vec<u64> = kv_caches
                         .iter()
@@ -9916,11 +10063,19 @@ impl CutileGpuModel {
 
                     // Concatenate Q-rotated parts into one tensor for the batch kernel.
                     // q_rot_parts[r] is [q_dim], stack to [m * q_dim].
-                    let q_batch = Arc::new(
-                        cutile::api::zeros::<f32>(&[m * q_dim])
-                            .sync_on(stream)
-                            .expect("q_batch alloc"),
-                    );
+                    let q_batch = {
+                        let mut ng = self.nograph.borrow_mut();
+                        ng.q_batch
+                            .entry(m)
+                            .or_insert_with(|| {
+                                Arc::new(
+                                    cutile::api::zeros::<f32>(&[m * q_dim])
+                                        .sync_on(stream)
+                                        .expect("q_batch alloc"),
+                                )
+                            })
+                            .clone()
+                    };
                     // Copy each q_rot_parts[r] into q_batch at offset r*q_dim.
                     // Use D->D async memcpy via cutile.
                     for (r, q_r) in q_rot_parts.iter().enumerate() {
@@ -9943,11 +10098,19 @@ impl CutileGpuModel {
                     attn_out
                 } else {
                     // Fallback: run single-request attention M times.
-                    let attn_out = Arc::new(
-                        cutile::api::zeros::<f32>(&[m * q_dim])
-                            .sync_on(stream)
-                            .expect("batch attn fallback alloc"),
-                    );
+                    let attn_out = {
+                        let mut ng = self.nograph.borrow_mut();
+                        ng.attn_out
+                            .entry(m)
+                            .or_insert_with(|| {
+                                Arc::new(
+                                    cutile::api::zeros::<f32>(&[m * q_dim])
+                                        .sync_on(stream)
+                                        .expect("batch attn fallback alloc"),
+                                )
+                            })
+                            .clone()
+                    };
                     for (r, q_rot) in q_rot_parts.iter().enumerate() {
                         let (k_base, v_base) = kv_caches[r].kv_device_base_ptrs(layer);
                         let kv_len_r = (kv_caches[r].seq_len() + 1) as i32;
@@ -9991,27 +10154,29 @@ impl CutileGpuModel {
                             }
                             .expect("batch d_kv_len H2D");
                         }
-                        let out_r = Arc::new(
-                            cutile::api::zeros::<f32>(&[q_dim])
-                                .sync_on(stream)
-                                .expect("attn out_r alloc"),
-                        );
+                        let out_r = &row_bufs[r].attn_out_r;
+                        // K-parallel kernel (8 warps per head) -- the base
+                        // single-warp kernel serialized the kv scan and
+                        // dominated long-context steps (199 ms/step at
+                        // kv~440, m=6 pre-kpar).  Per-request independent
+                        // (own block, own kv_len/pointers) so composition
+                        // invariance holds; used for every m.
                         // f16/e4m3 pools dispatch to the dtype twins (K/V
                         // read as raw bits, converted in-kernel).
                         let attn_res = if kv_caches[r].kv_f16() {
-                            oda.forward_d2d_ptrs_f16(
+                            oda.forward_kpar_d2d_ptrs_f16(
                                 &out_r, q_rot, k_base, v_base, &self.d_kv_len, n_heads,
                                 n_kv_heads, head_dim, scale,
                             )
                         } else if kv_caches[r].kv_dtype()
                             == crate::cutile_kv_cache::KvDtype::E4M3
                         {
-                            oda.forward_d2d_ptrs_e4m3(
+                            oda.forward_kpar_d2d_ptrs_e4m3(
                                 &out_r, q_rot, k_base, v_base, &self.d_kv_len, n_heads,
                                 n_kv_heads, head_dim, scale,
                             )
                         } else {
-                            oda.forward_d2d_ptrs(
+                            oda.forward_kpar_d2d_ptrs(
                                 &out_r, q_rot, k_base, v_base, &self.d_kv_len, n_heads,
                                 n_kv_heads, head_dim, scale,
                             )
@@ -10033,11 +10198,19 @@ impl CutileGpuModel {
             } else {
                 // cuTile fallback: run M sequential single-request attention calls.
                 // Slower than the batch oxide kernel but correct on all hardware.
-                let attn_out = Arc::new(
-                    cutile::api::zeros::<f32>(&[m * q_dim])
-                        .sync_on(stream)
-                        .expect("batch attn cutile fallback alloc"),
-                );
+                let attn_out = {
+                    let mut ng = self.nograph.borrow_mut();
+                    ng.attn_out
+                        .entry(m)
+                        .or_insert_with(|| {
+                            Arc::new(
+                                cutile::api::zeros::<f32>(&[m * q_dim])
+                                    .sync_on(stream)
+                                    .expect("batch attn cutile fallback alloc"),
+                            )
+                        })
+                        .clone()
+                };
                 for (r, q_rot) in q_rot_parts.iter().enumerate() {
                     // NOTE: this cuTile fallback consumes WHOLE-TENSOR pointers
                     // (pool start) -- pooled multi-client runs at non-zero
@@ -10082,64 +10255,122 @@ impl CutileGpuModel {
             // attn_padded is [m, q_pad] from attn_out_to_oproj_device_m; row stride = q_pad.
             let o_dev = self.gemm_any_d2d_batch(&attn_padded, o_w_name, m, self.q_pad, SLOT_O);
 
-            // Post-attention residual add (fresh alloc -- pre-allocated scratch is M=1 sized).
+            // Post-attention residual add.  Ping-pong between two cached
+            // [m * h_pad] buffers (keyed m) so the add kernel's output never
+            // aliases its live input; the old `&mut None` allocated (full
+            // stream sync) twice per layer.
             // o_dev is [m, h]; pad to h_pad for models with h != h_pad
             // (Qwen2.5) via the D->D path -- the raw operand fails the add
             // kernel's extent check.
             let o_padded =
                 self.pad_rows_device(&o_dev, h, self.h_pad, m, &self.oproj_pad_scratch);
-            hidden_dev = self.add_device_scratch(&hidden_dev, &o_padded, m * self.h_pad, &mut None);
+            hidden_dev = {
+                let mut ng = self.nograph.borrow_mut();
+                let scr = &mut ng.hidden.entry(m).or_insert([None, None])[hidden_side ^ 1];
+                self.add_device_scratch(&hidden_dev, &o_padded, m * self.h_pad, scr)
+            };
+            hidden_side ^= 1;
 
-            // Post-attention RMSNorm.
+            // Post-attention RMSNorm (scratch variant -- see the site-0 note).
             let post_ln_w_dev = self
                 .norm_weights
                 .get(post_ln_name)
                 .expect("post_attention_layernorm weight missing");
-            let normed2_dev = self
-                .cutile_rmsnorm
-                .forward_device_fused(
-                    stream,
-                    hidden_dev.clone(),
-                    post_ln_w_dev,
-                    m,
-                    h,
-                    self.h_pad,
-                    cfg.layer_norm_eps,
-                )
-                .expect("batch post-attn RMSNorm failed");
+            let normed2_dev = {
+                let mut ng = self.nograph.borrow_mut();
+                let scratch = ng
+                    .rms
+                    .entry((1, m))
+                    .or_insert_with(RmsnormScratch::empty);
+                self.cutile_rmsnorm
+                    .forward_device_fused_scratch(
+                        stream,
+                        hidden_dev.clone(),
+                        post_ln_w_dev,
+                        m,
+                        h,
+                        self.h_pad,
+                        cfg.layer_norm_eps,
+                        scratch,
+                    )
+                    .expect("batch post-attn RMSNorm failed")
+            };
 
             // FFN: gate/up/down projections.
             // normed2_dev is [m, h_pad]; row stride = h_pad.
             let gate_dev =
                 self.gemm_any_d2d_batch(&normed2_dev, gate_w_name, m, self.h_pad, SLOT_GATE);
             let up_dev = self.gemm_any_d2d_batch(&normed2_dev, up_w_name, m, self.h_pad, SLOT_UP);
+            drop(normed2_dev);
 
             // Gated multiply -- cuTile (GPU, no PCIe round-trip, any M).
-            // Gemma GeGLU: GELU gating.
-            let inter_size = m * cfg.intermediate_size;
+            // Gemma GeGLU: GELU gating.  Cached per-m output scratch (the
+            // plain silu_mul_device allocates + syncs per call).
             let gs_dev = if cfg.hidden_act == crate::config::HiddenAct::GeGLU {
+                let mut ng = self.nograph.borrow_mut();
+                let scr = ng.silu.entry(m).or_insert(None);
                 self.cutile_elementwise
                     .gelu_mul_device_scratch(
                         &gate_dev,
                         &up_dev,
                         m,
                         cfg.intermediate_size,
-                        &mut None,
+                        scr,
                         &stream,
                     )
                     .expect("batch gelu_mul_device failed")
             } else {
+                let mut ng = self.nograph.borrow_mut();
+                let scr = ng.silu.entry(m).or_insert(None);
                 self.cutile_elementwise
-                    .silu_mul_device(&gate_dev, &up_dev, m, cfg.intermediate_size, &stream)
+                    .silu_mul_device_scratch(
+                        &gate_dev,
+                        &up_dev,
+                        m,
+                        cfg.intermediate_size,
+                        scr,
+                        &stream,
+                    )
                     .expect("batch silu_mul_device failed")
             };
-            // Pad inter -> inter_pad if necessary (e.g. Llama-3.1-8B: 14336->16384).
+            // Pad inter -> inter_pad if necessary (e.g. Llama-3.1-8B:
+            // 14336->16384) -- on-device into a cached per-m buffer.  The
+            // old path downloaded the whole [m, inter] tensor to the host
+            // and re-uploaded it (2 blocking syncs + 2 PCIe crossings per
+            // layer).  The buffer's pad tail is never written and stays
+            // zero, exactly matching the host zero-fill it replaces.
             let inter_sz = cfg.intermediate_size;
             let gs_padded = if self.inter_pad == inter_sz {
                 gs_dev
             } else {
-                let gs_host = self.download_device_tensor(&gs_dev);
-                self.to_device_padded(&gs_host, m, inter_sz, self.inter_pad)
+                let padded = {
+                    let mut ng = self.nograph.borrow_mut();
+                    ng.inter_pad
+                        .entry(m)
+                        .or_insert_with(|| {
+                            Arc::new(
+                                api::zeros::<f32>(&[m * self.inter_pad])
+                                    .sync_on(stream)
+                                    .expect("gs inter pad alloc"),
+                            )
+                        })
+                        .clone()
+                };
+                let src_base = gs_dev.device_pointer().cu_deviceptr();
+                let dst_base = padded.device_pointer().cu_deviceptr();
+                for r in 0..m {
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            dst_base + (r * self.inter_pad * 4) as u64,
+                            src_base + (r * inter_sz * 4) as u64,
+                            inter_sz,
+                            stream,
+                        )
+                        .expect("gs inter pad D->D");
+                    }
+                }
+                drop(gs_dev);
+                padded
             };
             // gs_padded is [m, inter_pad] (after silu + padding); row stride = inter_pad.
             let down_dev =
@@ -10147,7 +10378,12 @@ impl CutileGpuModel {
 
             let down_padded =
                 self.pad_rows_device(&down_dev, h, self.h_pad, m, &self.down_pad_scratch);
-            hidden_dev = self.add_device_scratch(&hidden_dev, &down_padded, m * self.h_pad, &mut None);
+            hidden_dev = {
+                let mut ng = self.nograph.borrow_mut();
+                let scr = &mut ng.hidden.entry(m).or_insert([None, None])[hidden_side ^ 1];
+                self.add_device_scratch(&hidden_dev, &down_padded, m * self.h_pad, scr)
+            };
+            hidden_side ^= 1;
         }
 
         // Advance the host seq_len ONCE per step, after all layers: every
@@ -10161,23 +10397,30 @@ impl CutileGpuModel {
             kvc.mark_host_stale();
         }
 
-        // Final norm.
+        // Final norm (scratch variant -- see the site-0 note).
         let final_ln_w_dev = self
             .norm_weights
             .get("model.norm.weight")
-            .expect("model.norm.weight missing");
-        let last_dev = self
-            .cutile_rmsnorm
-            .forward_device_fused(
-                stream,
-                hidden_dev,
-                final_ln_w_dev,
-                m,
-                h,
-                self.h_pad,
-                cfg.layer_norm_eps,
-            )
-            .expect("batch final RMSNorm failed");
+            .expect("model.norm weight missing");
+        let last_dev = {
+            let mut ng = self.nograph.borrow_mut();
+            let scratch = ng
+                .rms
+                .entry((2, m))
+                .or_insert_with(RmsnormScratch::empty);
+            self.cutile_rmsnorm
+                .forward_device_fused_scratch(
+                    stream,
+                    hidden_dev,
+                    final_ln_w_dev,
+                    m,
+                    h,
+                    self.h_pad,
+                    cfg.layer_norm_eps,
+                    scratch,
+                )
+                .expect("batch final RMSNorm failed")
+        };
 
         // LM head: [M, H] -> [M, vocab]
         // gemm_any_d2d_batch (NOT lm_head_gemm): lm_head_gemm dispatches

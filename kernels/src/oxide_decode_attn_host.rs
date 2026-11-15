@@ -41,6 +41,9 @@ pub struct OxideDecodeAttn {
     /// launch configs, K/V caches hold e4m3 bits (u8) converted in-kernel
     /// via the shared tempura_kernels::e4m3 helpers.
     cu_function_e4m3:        Option<cuda_core::sys::CUfunction>,
+    /// e4m3 K-parallel twin (falls back to the base e4m3 kernel when the
+    /// PTX lacks it).
+    cu_function_kpar_e4m3:   Option<cuda_core::sys::CUfunction>,
     stream:             Arc<Stream>,
 }
 
@@ -127,10 +130,11 @@ impl OxideDecodeAttn {
         let cu_function_kpar_f16 = load_opt("oxide_decode_attn_kpar_f16");
         let cu_function_splitk_f16 = load_opt("oxide_decode_attn_splitk_f16");
         let cu_function_e4m3 = load_opt("oxide_decode_attn_e4m3");
+        let cu_function_kpar_e4m3 = load_opt("oxide_decode_attn_kpar_e4m3");
 
         eprintln!("[oxide] loaded decode-attn kernel (PTX {} bytes, kpar={}, batch={}, splitk={}, f16={}, e4m3={})",
             PTX.len(), cu_function_kpar.is_some(), cu_function_batch.is_some(), cu_function_splitk.is_some(), cu_function_f16.is_some(), cu_function_e4m3.is_some());
-        Ok(Self { cu_module, cu_function, cu_function_kpar, cu_function_batch, cu_function_splitk, cu_function_combine, cu_function_f16, cu_function_kpar_f16, cu_function_splitk_f16, cu_function_e4m3, stream })
+        Ok(Self { cu_module, cu_function, cu_function_kpar, cu_function_batch, cu_function_splitk, cu_function_combine, cu_function_f16, cu_function_kpar_f16, cu_function_splitk_f16, cu_function_e4m3, cu_function_kpar_e4m3, stream })
     }
 
     /// Run decode attention with kv_len read from a device tensor at execution time.
@@ -355,6 +359,77 @@ impl OxideDecodeAttn {
                 )
             }
         };
+        self.launch_kpar_on(f, out, q, k_ptr, v_ptr, kv_len_dev, n_heads, n_kv_heads, head_dim, scale)
+    }
+
+    /// [`Self::forward_kpar_d2d_ptrs`] for an f16 KV pool.  Falls back to
+    /// the base f16 kernel when the kpar f16 twin is absent from the PTX.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_kpar_d2d_ptrs_f16(
+        &self,
+        out:        &Arc<Tensor<f32>>,
+        q:          &Arc<Tensor<f32>>,
+        k_ptr:      u64,
+        v_ptr:      u64,
+        kv_len_dev: &Arc<Tensor<f32>>,
+        n_heads:    usize,
+        n_kv_heads: usize,
+        head_dim:   usize,
+        scale:      f32,
+    ) -> Result<()> {
+        let f = match self.cu_function_kpar_f16 {
+            Some(f) => f,
+            None => {
+                return self.forward_d2d_ptrs_f16(
+                    out, q, k_ptr, v_ptr, kv_len_dev, n_heads, n_kv_heads, head_dim, scale,
+                )
+            }
+        };
+        self.launch_kpar_on(f, out, q, k_ptr, v_ptr, kv_len_dev, n_heads, n_kv_heads, head_dim, scale)
+    }
+
+    /// [`Self::forward_kpar_d2d_ptrs`] for an e4m3 KV pool.  Falls back to
+    /// the base e4m3 kernel when the kpar e4m3 twin is absent from the PTX.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_kpar_d2d_ptrs_e4m3(
+        &self,
+        out:        &Arc<Tensor<f32>>,
+        q:          &Arc<Tensor<f32>>,
+        k_ptr:      u64,
+        v_ptr:      u64,
+        kv_len_dev: &Arc<Tensor<f32>>,
+        n_heads:    usize,
+        n_kv_heads: usize,
+        head_dim:   usize,
+        scale:      f32,
+    ) -> Result<()> {
+        let f = match self.cu_function_kpar_e4m3 {
+            Some(f) => f,
+            None => {
+                return self.forward_d2d_ptrs_e4m3(
+                    out, q, k_ptr, v_ptr, kv_len_dev, n_heads, n_kv_heads, head_dim, scale,
+                )
+            }
+        };
+        self.launch_kpar_on(f, out, q, k_ptr, v_ptr, kv_len_dev, n_heads, n_kv_heads, head_dim, scale)
+    }
+
+    /// Shared kpar launch body (all KV dtypes use the same signature and
+    /// launch config; the kernels convert K/V bits in-kernel).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_kpar_on(
+        &self,
+        f:          cuda_core::sys::CUfunction,
+        out:        &Arc<Tensor<f32>>,
+        q:          &Arc<Tensor<f32>>,
+        k_ptr:      u64,
+        v_ptr:      u64,
+        kv_len_dev: &Arc<Tensor<f32>>,
+        n_heads:    usize,
+        n_kv_heads: usize,
+        head_dim:   usize,
+        scale:      f32,
+    ) -> Result<()> {
         let heads_per_group = (n_heads / n_kv_heads) as u32;
         let kv_len_ptr = kv_len_dev.device_pointer().cu_deviceptr() as u64;
 

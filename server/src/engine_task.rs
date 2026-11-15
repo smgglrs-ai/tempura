@@ -457,6 +457,9 @@ impl EngineTask {
             return vec![];
         }
 
+        let dbg_timing = std::env::var("TEMPURA_ENGINE_DEBUG_TICKS").is_ok();
+        let t_prep = std::time::Instant::now();
+
         let mut toks = Vec::with_capacity(stepped.len());
         let mut pos = Vec::with_capacity(stepped.len());
         for id in &stepped {
@@ -470,6 +473,10 @@ impl EngineTask {
             .iter()
             .map(|id| self.kv_caches.remove(id).expect("kv"))
             .collect();
+        if dbg_timing {
+            eprintln!("[tick-timing] m={} prep={:?}", stepped.len(), t_prep.elapsed());
+        }
+        let t_fwd = std::time::Instant::now();
         let all_logits = match self.model.forward_batch_with_kvs(&toks, &pos, &mut kvs) {
             Some(l) => l,
             None => {
@@ -482,6 +489,10 @@ impl EngineTask {
                 return vec![];
             }
         };
+        if dbg_timing {
+            eprintln!("[tick-timing] forward={:?}", t_fwd.elapsed());
+        }
+        let t_sample = std::time::Instant::now();
 
         let mut completed = Vec::new();
         // remove(i) inside this loop would shift kvs after every removal
@@ -514,6 +525,9 @@ impl EngineTask {
         }
 
         // LRU clock + footprint for the eviction policy.
+        if dbg_timing {
+            eprintln!("[tick-timing] sample+emit={:?}", t_sample.elapsed());
+        }
         {
             let Ok(mut sched) = self.scheduler.lock() else {
                 return completed;
