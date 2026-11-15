@@ -5009,51 +5009,16 @@ impl CutileGpuModel {
                 .unwrap_or(0)
         };
 
-        // sm_120 batch Q4K kernel: hand-written PTX with static smem, avoids error 719.
-        // Only available when uses_raw_gguf=true (weights in native 36-u32 GGUF format).
-        // M=2 ONLY: the PTX is M=2 hardcoded (param_m_rows is not read; it
-        // unconditionally writes row-1 outputs at out[n..2n] -- at m=1 that
-        // is 16KB past the [n] output tensor, silently corrupting whatever
-        // is allocated next in the pool; at m>2 rows 3+ are never computed).
-        // Found by the pooled-ppl m=1 NaN hunt.  Other m values fall
-        // through to the per-row GEMV fallback below (the graph path
-        // prefers the general-M stream-K/MMA batch kernels).
-        if is_q4k && m == 2 && std::env::var("TEMPURA_NO_SM120_Q4K_BATCH").as_deref() != Ok("1") {
-            if let Some(oxide) = &self.oxide_q4k_gemv {
-                if oxide.has_sm120_batch() && oxide.uses_raw_gguf {
-                    let dw = self.device_weights_q4k.get(weight_name).unwrap();
-                    // `a` is flat [m * row_stride]; the batch kernel reads it row-major.
-                    // k = k_blocks * 256; row_stride may be padded -- pass just k elements
-                    // by building a trimmed [m * k] view if needed.
-                    let k = dw.k_blocks * 256;
-                    let a_trimmed: Arc<Tensor<f32>> = if row_stride == k {
-                        a.clone()
-                    } else {
-                        // row_stride != k: copy each row's k elements into a compact [m*k] tensor.
-                        let compact = Arc::new(
-                            api::zeros::<f32>(&[m * k])
-                                .sync_on(stream)
-                                .expect("gemm_any_d2d_batch sm120: compact alloc"),
-                        );
-                        for r in 0..m {
-                            unsafe {
-                                cuda_core::memcpy_dtod_async::<f32>(
-                                    compact.device_pointer().cu_deviceptr() + (r * k * 4) as u64,
-                                    a.device_pointer().cu_deviceptr() + (r * row_stride * 4) as u64,
-                                    k,
-                                    stream,
-                                )
-                                .expect("gemm_any_d2d_batch sm120: row copy");
-                            }
-                        }
-                        compact
-                    };
-                    return oxide
-                        .forward_sm120_batch_d2d(&a_trimmed, &dw.tensor, m, dw.n, dw.k_blocks)
-                        .expect("sm120_batch Q4K GEMV failed");
-                }
-            }
-        }
+        // sm_120 batch Q4K kernel: NOT dispatched here (removed 2026-11-15).
+        // The PTX is M=2 hardcoded (07f74ce guarded m!=2), but even at
+        // m==2 its numerics differ from the per-row GEMVs every other m
+        // uses -- reintroducing batch-COMPOSITION dependence (a session's
+        // logits changed depending on whether its tick happened to be
+        // m==2; found by the 6-client A/B failing on main post-07f74ce,
+        // run-A varying across restarts).  The kernel remains in use by
+        // the equal-position CUDA-graph paths, where the captured
+        // composition is fixed per graph.  TEMPURA_NO_SM120_Q4K_BATCH=1
+        // is now a no-op for this path, kept for compatibility.
 
         // Fallback: M sequential GEMVs (no L2 reuse but still GPU-resident).
         let out: Arc<Tensor<f32>> = Arc::new(
