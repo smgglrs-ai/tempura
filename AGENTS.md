@@ -326,6 +326,13 @@ Qwen3.6-27B weights** — see open work.
 **Serving**
 - [x] OpenAI-compatible chat/completions/completions/models/responses/
       embeddings/tokenize/detokenize; SSE streaming with include_usage
+- [x] ragged no-graph batch decode (the multi-client serving path):
+      ~47 ms/step at m=6 with ~440-token contexts (~129 tok/s aggregate;
+      was 199 ms pre-2026-11-15) -- sync-free scratch pool + kpar
+      attention + oxide kernels IN THE SERVER BUILD (the cli->server
+      feature chain never enabled oxide-gemv before 2026-11-15: serving
+      ran the slow cuTile Q4K fallback at 0.5 s/step while every
+      benchmark, feature-unified with bench-gpu, ran oxide)
 - [x] Logprobs, top-logprobs, stop sequences, n completions, presence/
       frequency penalties, seed, max_completion_tokens alias
 - [x] Tool/function calling (hermes/mistral/llama3 parsers + auto-detect),

@@ -5,6 +5,73 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-15 (ragged no-graph serving decode 4.3-8.4x faster; TWO
+root causes found -- a missing-feature server build and the sync-per-alloc
+no-graph path; all gates green): the dominant serving perf gap is closed
+to ~130 tok/s aggregate at m=6 (was ~10-30).  (1) THE SERVER HAS NEVER
+HAD OXIDE KERNELS: `cargo build -p tempura --features cutile` wires
+cli->server->engine `cutile` but NOT `oxide-gemv` (feature unification
+via bench-gpu masked it for every benchmark) -- every Q4K projection in
+SERVING ran the slow cuTile `cutile_q4k_gemv` fallback: nsys on the live
+6-client server showed it at 92% of GPU time (2394 instances, 427us avg),
+0.52 s/step at m=6, GPU "100% SM / 1% memory" -- the exact signature of
+the documented "50x gap".  FIX: tempura-server's cutile/cuda features
+now enable tempura-engine/oxide-gemv; kernels/build.rs gained
+ensure_ptx_file (extract-from-binary -> copy the crate-root PTX left by
+`gpu-remote.sh oxide` -> write an EMPTY file so include_bytes! still
+compiles and runtime try_load returns None -- a fresh fingerprinted
+OUT_DIR previously embedded whatever stale PTX happened to be there);
+scripts/kv-swap-ab-validate.sh copies the PTX after its server build.
+ALONE this took the live 6-client server from 521 -> 62 ms/step.
+(2) THE NO-GRAPH PATH SYNC-PER-ALLOC: every `api::zeros(...).sync_on(s)`
+is a FULL cuStreamSynchronize + alloc; the ragged batch path did ~3000
+of them per step at m=6 (rmsnorm 3+trailing-sync x2 x32 layers, gemm
+out+row allocs x7 x32 x(1+m), per-request q/k/v/rope/attn buffers,
+`&mut None` residual adds, silu, and an inter->inter_pad HOST
+round-trip: D2H+pad+H2D per layer -- Llama 14336->16384).  FIX: a
+NoGraphBatchScratch pool on CutileGpuModel caches every buffer by
+(slot,n,m)/(site,m)/m -- gemm out rows, activation rows, per-request
+q_r/k_r/v_r/q_rot/attn_out, rmsnorm scratch (forward_device_fused_
+scratch, bitwise-identical kernels), silu/GeGLU scratch, device-side
+inter padding, and ping-pong residual-add buffers.  Numerics-neutral:
+every buffer is fully overwritten in stream order or its pad tail
+provably stays zero.  (3) ATTENTION: the per-request fallback used the
+BASE single-warp kernel (step time grew linearly with kv_len: 86 ms
+short-ctx -> 199 ms at kv~440, m=6); it now dispatches the K-PAR kernel
+(+ new forward_kpar_d2d_ptrs_f16/_e4m3 twins -- the e4m3 kpar twin is
+now loaded from the PTX too).  Per-request independent -> composition
+invariant; used for every m.  NUMBERS (RTX 5090, Llama-3.1-8B Q4_K_M,
+f16 pool, bench-nograph = new permanent bench, m=1..6): engine step
+400-step contexts (kv up to ~440) 199.3 -> 46.6 ms at m=6 = 30.1 ->
+128.9 tok/s aggregate (4.3x); short ctx 85.9 -> 32.9 ms = 182 tok/s
+(2.6x); m=1 27.6 -> 9.0 ms = 36 -> 111 tok/s.  LIVE SERVER (6 clients,
+512 tokens, engine-thread timing): forward 521 -> 62 ms/step; the
+6-client kv-swap A/B wall time 285 s -> 34 s per run (8.4x).  GATES ALL
+GREEN on the final tree: bench-ab-repro (m=2 AND m=3 batch checksums
+bit-identical to solo, plus interleave S1); pooled ppl 8 chunks f16
+8.6838 (baseline 8.6827, ratio 1.0001) / e4m3 8.6282 (baseline 8.6366,
+ratio 0.999), 0 NaN both; FULL 6-client kv-swap A/B PASS on f16 AND
+( first time) e4m3 -- 6/6 byte-identical, 3-4 swaps, mirror checksums
+exact; nonstream-route-smoke PASS; kv-restart-var PASS (3 clients x 199
+steps, texts + all logits checksums identical across restarts); local
+cargo test green (867).  NOTE: the earlier "0.5-0.7 s/step" baseline was
+PARTLY the missing-oxide bug (the A/B servers always built without
+oxide-gemv); like-for-like on main with oxide present, the engine-step
+improvement is 4.3x long-ctx / 2.6x short-ctx, and the end-to-end
+serving gain vs yesterday's tree is 8.4x.  FOLLOW-UPS (open):
+(a) oxide_decode_attn_batch is MISSING FROM THE PTX -- the kernel was
+never written in tools/oxide-decode-attn/src/main.rs (has_batch() =
+false, both graph and no-graph paths fall back to per-request
+launches); writing it (+ f16/e4m3 twins) would collapse the m attention
+launches per layer; (b) sample_and_emit costs 11 ms/step at m=6 (sampler
+chain over 128k logits x6 -- CPU); (c) Option B (batch GEMVs via the
+general-M streamk/mma kernels, weights read once per projection instead
+of m times) is the next engine-side lever -- the per-row GEMV floor at
+m=6 is ~29 GB of weight traffic per step; (d) m=1 serving decode is
+111 tok/s vs the single-seq graph's 217 (composition invariance forbids
+routing m=1 there; position-synced batch graphs are the structural
+fix).**
+
 **STATUS 2026-11-15 (6-client A/B flakiness ROOT-CAUSED + FIXED; the gate is
 green on f16 main again): the cross-restart/batch-composition divergence was
 a NULL-stream kv_len H2D racing the batch attention kernels.  In
