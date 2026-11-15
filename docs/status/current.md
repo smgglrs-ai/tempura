@@ -5,6 +5,44 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-15 (e4m3/FP8 KV pool landed, opt-in TEMPURA_KV_DTYPE=e4m3;
+f16 stays default): the serving pool can now store KV as e4m3 (u8 bits,
+64 KiB/token for Llama-8B GQA -- 4x f32 density, vLLM's production KV
+format), mirroring the f16 p24 blueprint end to end.  Piece map: ONE
+shared e4m3 bit-math implementation (kernels/src/e4m3.rs -- RNE write,
++-448 saturation, NaN->0x7F, subnormals FLUSHED to signed zero on BOTH
+sides so round-trips and cross-path checksums stay exact; the oxide tool
+include!s it and compiles it to PTX); cutile_cast_f32_e4m3/_e4m3_f32
+append/mirror kernels (tile-level ports, two DSL quirks found: u32
+literals >= 2^31 break the DSL's i32 literal parser, and shli/trunci
+with overflow::None omit the overflow attribute bytecode serialization
+requires -- use NoUnsignedWrap); cutile_flash_attn_heads_paged_e4m3
+prefill twin; oxide decode-attn e4m3 twins (base/kpar/splitk, *const
+u8); engine KvDtype enum refactor (ONE env parse point; TEMPURA_KV_F32=1
+stays the f32 alias); dtype-aware staging append, DRAM-mirror syncs,
+swap checksums, dispatch.  GATES: (1) oxide self-tests all green (f16
+AND e4m3, all variants x kv_len {3,13,100}, exact by construction);
+(2) nonstream-route-smoke e4m3 PASS (banner, byte-identical, coherent);
+(3) ppl gate: pooled WikiText-2 8 chunks e4m3 8.6366 vs f16 8.6827
+(ratio 0.995, gate <= 1.02), 0 NaN -- e4m3 stays OPT-IN; (4) f16
+regression smoke PASS on the refactored code; (5) local cargo tests
+green.  THE 6-CLIENT kv-swap A/B DID NOT PASS for e4m3 (5/6 mismatch)
+-- but this is NOT an e4m3 issue: THE SAME GATE FAILS ON MAIN (bf681c3)
+WITH THE DEFAULT F16 POOL (4/6 mismatch, artifacts /tmp/kv-swap-ab.*
+on fishtank).  Root-cause evidence: first divergences occur BEFORE any
+swap (token ~60 of ~500; swaps happen at seq ~500), server A alone
+produces different texts across restarts, and the e4m3 run's 3 swaps
+all had mirror/device bit-checksums EXACT with 0 NaN -- the swap
+mechanism is bit-faithful; the mismatch is concurrent-batch composition
+nondeterminism (suspect: gemm_any_d2d_batch's m==2 -> sm120 Q4K batch
+kernel vs per-row GEMV at other m -- the 07f74ce neighborhood; also
+matches the m=1/m=2 ppl deltas recorded 2026-11-15).  FOLLOW-UP (open):
+root-cause the batch-composition token divergence and restore the
+6-client A/B gate to green on f16 main (candidates: m==2 sm120 batch
+GEMV vs per-row GEMV numerics; TEMPURA_NO_SM120_Q4K=1 bisect;
+per-token logprob diff between m=1 and m=2 pooled runs via
+TEMPURA_PPL_DUMP_LOGPROBS); then re-run the 6-client A/B for e4m3.**
+
 **STATUS 2026-11-15 (pooled-ppl NaN ROOT-CAUSED + FIXED; f16 KV pool is
 now the DEFAULT): the m=1 batch-decode NaN in perplexity_pooled was the
 Q4K sm120 batch GEMV called with m != 2 — that PTX kernel is M=2

@@ -336,7 +336,10 @@ Qwen3.6-27B weights** — see open work.
       isolation
 - [x] Serving KV pool stores f16 by default (128 KiB/token GQA; ppl-gated
       2026-11-15: f16/f32 ratio 1.0003 on WikiText-2; TEMPURA_KV_F32=1
-      restores f32)
+      restores f32).  e4m3 (FP8, 64 KiB/token, vLLM's production density)
+      opt-in via TEMPURA_KV_DTYPE=e4m3 (ppl-gated: e4m3/f16 ratio 0.995;
+      shared e4m3 bit-math helpers in tempura-kernels used by the cutile
+      cast/prefill kernels, the oxide decode twins, and the mirror syncs)
 - [x] Dedicated engine thread (async HTTP ↔ sync SIMD isolation)
 - [x] Prometheus metrics, OpenTelemetry export (`otlp` feature), readiness,
       black-box /health/inference, API-key auth, timeouts, graceful shutdown
