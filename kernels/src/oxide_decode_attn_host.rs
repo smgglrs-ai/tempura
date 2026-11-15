@@ -37,6 +37,10 @@ pub struct OxideDecodeAttn {
     cu_function_f16:        Option<cuda_core::sys::CUfunction>,
     cu_function_kpar_f16:   Option<cuda_core::sys::CUfunction>,
     cu_function_splitk_f16: Option<cuda_core::sys::CUfunction>,
+    /// e4m3 KV-pool twins (TEMPURA_KV_DTYPE=e4m3): same signatures and
+    /// launch configs, K/V caches hold e4m3 bits (u8) converted in-kernel
+    /// via the shared tempura_kernels::e4m3 helpers.
+    cu_function_e4m3:        Option<cuda_core::sys::CUfunction>,
     stream:             Arc<Stream>,
 }
 
@@ -122,10 +126,11 @@ impl OxideDecodeAttn {
         let cu_function_f16 = load_opt("oxide_decode_attn_f16");
         let cu_function_kpar_f16 = load_opt("oxide_decode_attn_kpar_f16");
         let cu_function_splitk_f16 = load_opt("oxide_decode_attn_splitk_f16");
+        let cu_function_e4m3 = load_opt("oxide_decode_attn_e4m3");
 
-        eprintln!("[oxide] loaded decode-attn kernel (PTX {} bytes, kpar={}, batch={}, splitk={}, f16={})",
-            PTX.len(), cu_function_kpar.is_some(), cu_function_batch.is_some(), cu_function_splitk.is_some(), cu_function_f16.is_some());
-        Ok(Self { cu_module, cu_function, cu_function_kpar, cu_function_batch, cu_function_splitk, cu_function_combine, cu_function_f16, cu_function_kpar_f16, cu_function_splitk_f16, stream })
+        eprintln!("[oxide] loaded decode-attn kernel (PTX {} bytes, kpar={}, batch={}, splitk={}, f16={}, e4m3={})",
+            PTX.len(), cu_function_kpar.is_some(), cu_function_batch.is_some(), cu_function_splitk.is_some(), cu_function_f16.is_some(), cu_function_e4m3.is_some());
+        Ok(Self { cu_module, cu_function, cu_function_kpar, cu_function_batch, cu_function_splitk, cu_function_combine, cu_function_f16, cu_function_kpar_f16, cu_function_splitk_f16, cu_function_e4m3, stream })
     }
 
     /// Run decode attention with kv_len read from a device tensor at execution time.
@@ -176,6 +181,38 @@ impl OxideDecodeAttn {
 
     /// Whether the f16 KV-pool twins are available.
     pub fn has_f16(&self) -> bool { self.cu_function_f16.is_some() }
+
+    /// Whether the e4m3 KV-pool twins are available.
+    pub fn has_e4m3(&self) -> bool { self.cu_function_e4m3.is_some() }
+
+    /// [`Self::forward_d2d_ptrs`] for an e4m3 KV pool: `k_ptr`/`v_ptr`
+    /// address u8 e4m3-bit elements (TEMPURA_KV_DTYPE=e4m3 -- quarter KV
+    /// density).  Requires [`Self::has_e4m3`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_d2d_ptrs_e4m3(
+        &self,
+        out:        &Arc<Tensor<f32>>,
+        q:          &Arc<Tensor<f32>>,
+        k_ptr:      u64,
+        v_ptr:      u64,
+        kv_len_dev: &Arc<Tensor<f32>>,
+        n_heads:    usize,
+        n_kv_heads: usize,
+        head_dim:   usize,
+        scale:      f32,
+    ) -> Result<()> {
+        let f = self.cu_function_e4m3.ok_or_else(|| {
+            KernelError::InvalidConfig(
+                "OxideDecodeAttn: e4m3 twins not present in the PTX (rebuild \
+                 tools/oxide-decode-attn)"
+                    .into(),
+            )
+        })?;
+        self.launch_base(
+            f,
+            out, q, k_ptr, v_ptr, kv_len_dev, n_heads, n_kv_heads, head_dim, scale,
+        )
+    }
 
     /// [`Self::forward_d2d_ptrs`] for an f16 KV pool: `k_ptr`/`v_ptr`
     /// address f16-bit elements (p24 f16 serving pool -- halved KV

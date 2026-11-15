@@ -104,6 +104,113 @@ pub mod kernels {
         out.store(cast);
     }
 
+    /// f32 -> e4m3 element cast (e4m3 KV pool): one program per B-element
+    /// block.  Tile-level port of `tempura_kernels::e4m3::f32_to_e4m3_bits`
+    /// (the ONE shared implementation, which this mirrors bit-for-bit):
+    /// RNE on the 20 dropped mantissa bits, saturation to +-448, subnormal
+    /// flush, NaN -> 0x7F.  Storage is raw u8.
+    #[cutile::entry()]
+    pub fn cutile_cast_f32_e4m3<const B: i32>(
+        out: &mut Tensor<u8, { [B] }>,
+        src: &Tensor<f32, { [-1] }>,
+    ) {
+        let pid = program_id(0);
+        let x: Tile<f32, { [B] }> = src.partition(shape![B]).load([pid]);
+
+        // NaN detect on the ORIGINAL bits (float min/max would swallow
+        // NaN -- max(NaN, 448) = 448 on PTX).  abs > inf-bits <=> NaN;
+        // both fit positive-i32 so the tile compare is sign-agnostic.
+        let xb: Tile<u32, { [B] }> = bitcast(x);
+        let m_abs: Tile<u32, { [B] }> = broadcast_scalar(0x7FFF_FFFF_u32, shape![B]);
+        let m_inf: Tile<u32, { [B] }> = broadcast_scalar(0x7F80_0000_u32, shape![B]);
+        let is_nan: Tile<bool, { [B] }> = gt_tile(andi(xb, m_abs), m_inf);
+
+        // Saturate to +-448 (E4M3FN has no infinity).
+        let lo: Tile<f32, { [B] }> = broadcast_scalar(-448.0_f32, shape![B]);
+        let hi: Tile<f32, { [B] }> = broadcast_scalar(448.0_f32, shape![B]);
+        let xc = min_tile(max_tile(x, lo), hi);
+
+        let bits: Tile<u32, { [B] }> = bitcast(xc);
+        // Sign bit via the top byte (bits >> 24 & 0x80) -- the DSL cannot
+        // parse the u32 literal 0x8000_0000 (i32 literal overflow).
+        let c_24: Tile<u32, { [B] }> = broadcast_scalar(24_u32, shape![B]);
+        let c_80: Tile<u32, { [B] }> = broadcast_scalar(0x80_u32, shape![B]);
+        let sign8: Tile<u32, { [B] }> = andi(shri(bits, c_24), c_80);
+        let abs: Tile<u32, { [B] }> = andi(bits, m_abs);
+        let c_23: Tile<u32, { [B] }> = broadcast_scalar(23_u32, shape![B]);
+        let exp: Tile<u32, { [B] }> = shri(abs, c_23);
+        let c_man: Tile<u32, { [B] }> = broadcast_scalar(0x007F_FFFF_u32, shape![B]);
+        let man: Tile<u32, { [B] }> = andi(abs, c_man);
+
+        // Normal iff f32 exponent >= 121 (2^-6, the smallest e4m3
+        // normal); below that -> signed zero (subnormal flush).
+        let c_120: Tile<u32, { [B] }> = broadcast_scalar(120_u32, shape![B]);
+        let is_norm: Tile<bool, { [B] }> = gt_tile(exp, c_120);
+
+        // RNE on the 20 dropped mantissa bits.
+        let c_20: Tile<u32, { [B] }> = broadcast_scalar(20_u32, shape![B]);
+        let kept: Tile<u32, { [B] }> = shri(man, c_20);
+        let c_drop: Tile<u32, { [B] }> = broadcast_scalar(0x000F_FFFF_u32, shape![B]);
+        let dropped: Tile<u32, { [B] }> = andi(man, c_drop);
+        let c_half: Tile<u32, { [B] }> = broadcast_scalar(0x0008_0000_u32, shape![B]);
+        let gt_half: Tile<bool, { [B] }> = gt_tile(dropped, c_half);
+        let eq_half: Tile<bool, { [B] }> = eq_tile(dropped, c_half);
+        let c_1: Tile<u32, { [B] }> = broadcast_scalar(1_u32, shape![B]);
+        let odd: Tile<bool, { [B] }> = eq_tile(andi(kept, c_1), c_1);
+        let round_up: Tile<bool, { [B] }> = gt_half | (eq_half & odd);
+        let c_0: Tile<u32, { [B] }> = broadcast_scalar(0_u32, shape![B]);
+        let kept2: Tile<u32, { [B] }> = kept + select(round_up, c_1, c_0);
+        // Carry: kept2 == 8 -> mantissa 0, exponent +1.  (e2 = 16 is
+        // unreachable: the 448 clamp caps the top binade -- see the
+        // shared helper's docs.)
+        let c_8: Tile<u32, { [B] }> = broadcast_scalar(8_u32, shape![B]);
+        let carry: Tile<bool, { [B] }> = eq_tile(kept2, c_8);
+        let man_f: Tile<u32, { [B] }> = select(carry, c_0, kept2);
+        let e2f: Tile<u32, { [B] }> =
+            (exp - c_120) + select(carry, c_1, c_0); // wraps on flush lanes; discarded
+        let c_3: Tile<u32, { [B] }> = broadcast_scalar(3_u32, shape![B]);
+        let body: Tile<u32, { [B] }> = ori(ori(shli(e2f, c_3, overflow::NoUnsignedWrap), man_f), sign8);
+        let res: Tile<u32, { [B] }> = select(is_norm, body, sign8);
+        let res: Tile<u32, { [B] }> = select(is_nan, broadcast_scalar(0x7F_u32, shape![B]), res);
+        let c_ff: Tile<u32, { [B] }> = broadcast_scalar(0xFF_u32, shape![B]);
+        let b8: Tile<u8, { [B] }> = trunci(andi(res, c_ff), overflow::NoUnsignedWrap);
+        out.store(b8);
+    }
+
+    /// e4m3 -> f32 element cast (e4m3 KV pool): one program per B-element
+    /// block.  Tile-level port of `tempura_kernels::e4m3::e4m3_bits_to_f32`
+    /// (EXACT for normals; subnormals flush to signed zero; the exp==15
+    /// NaN encodings map through the normal path -- unreachable from our
+    /// writer).  Used by the swap path to rebuild the f32 host mirror.
+    #[cutile::entry()]
+    pub fn cutile_cast_e4m3_f32<const B: i32>(
+        out: &mut Tensor<f32, { [B] }>,
+        src: &Tensor<u8, { [-1] }>,
+    ) {
+        let pid = program_id(0);
+        let raw: Tile<u8, { [B] }> = src.partition(shape![B]).load([pid]);
+        let w: Tile<u32, { [B] }> = exti(raw);
+        let c_80: Tile<u32, { [B] }> = broadcast_scalar(0x80_u32, shape![B]);
+        let c_3: Tile<u32, { [B] }> = broadcast_scalar(3_u32, shape![B]);
+        let c_0f: Tile<u32, { [B] }> = broadcast_scalar(0x0F_u32, shape![B]);
+        let c_07: Tile<u32, { [B] }> = broadcast_scalar(0x07_u32, shape![B]);
+        let c_20: Tile<u32, { [B] }> = broadcast_scalar(20_u32, shape![B]);
+        let c_23: Tile<u32, { [B] }> = broadcast_scalar(23_u32, shape![B]);
+        let c_24: Tile<u32, { [B] }> = broadcast_scalar(24_u32, shape![B]);
+        let c_120: Tile<u32, { [B] }> = broadcast_scalar(120_u32, shape![B]);
+        let c_0: Tile<u32, { [B] }> = broadcast_scalar(0_u32, shape![B]);
+        let sign: Tile<u32, { [B] }> = shli(andi(w, c_80), c_24, overflow::NoUnsignedWrap);
+        let exp: Tile<u32, { [B] }> = andi(shri(w, c_3), c_0f);
+        let man: Tile<u32, { [B] }> = shli(andi(w, c_07), c_20, overflow::NoUnsignedWrap);
+        // f32 bits = sign | (exp + 120) << 23 | man << 20; exp == 0
+        // (subnormal encodings) -> signed zero.
+        let norm: Tile<u32, { [B] }> =
+            ori(ori(sign, shli(exp + c_120, c_23, overflow::NoUnsignedWrap)), man);
+        let bits: Tile<u32, { [B] }> = select(ne_tile(exp, c_0), norm, sign);
+        let f: Tile<f32, { [B] }> = bitcast(bits);
+        out.store(f);
+    }
+
     /// GELU-gated MLP (Gemma GeGLU): out[i] = gelu(gate[i]) * up[i].
     /// gelu(x) = 0.5*x*(1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)));
     /// tanh via 1 - 2/(exp(2y)+1) (overflow-safe: y -> inf gives 1).
@@ -243,6 +350,84 @@ pub fn cast_f16_to_f32_dev(
     // SAFETY: see cast_f32_to_f16_dev.
     let (dst_out, _src) = unsafe {
         kernels::cutile_cast_f16_f32(dst_part, src.clone())
+            .generics(vec![CAST_B.to_string()])
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+    };
+    Ok(Arc::new(dst_out.unpartition()))
+}
+
+/// Cast the first `n` elements of an f32 device tensor into an e4m3
+/// (u8) device tensor (e4m3 KV pool append path).  Same contract as
+/// [`cast_f32_to_f16_dev`] with e4m3 storage; the kernel mirrors the
+/// shared `tempura_kernels::e4m3::f32_to_e4m3_bits` bit-for-bit.
+pub fn cast_f32_to_e4m3_dev(
+    src: &Arc<Tensor<f32>>,
+    dst: Arc<Tensor<u8>>,
+    n: usize,
+    stream: &Arc<Stream>,
+) -> Result<Arc<Tensor<u8>>> {
+    let n_pad = n.div_ceil(CAST_B) * CAST_B;
+    if src.size() < n_pad {
+        return Err(KernelError::InvalidConfig(format!(
+            "cast_f32_to_e4m3: src holds {} elements, need {n_pad}",
+            src.size()
+        )));
+    }
+    let dst_tensor = match Arc::try_unwrap(dst) {
+        Ok(t) if t.size() == n_pad => t,
+        Ok(t) => t
+            .reshape(&[n_pad])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        Err(_) => {
+            return Err(KernelError::InvalidConfig(
+                "cast_f32_to_e4m3: dst Arc has live clones".into(),
+            ))
+        }
+    };
+    let dst_part = dst_tensor.partition([CAST_B]);
+    // SAFETY: tensors are re-Arc'd from the launch return; accessed only
+    // after subsequent stream ops.
+    let (dst_out, _src) = unsafe {
+        kernels::cutile_cast_f32_e4m3(dst_part, src.clone())
+            .generics(vec![CAST_B.to_string()])
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+    };
+    Ok(Arc::new(dst_out.unpartition()))
+}
+
+/// Cast the first `n` elements of an e4m3 (u8) device tensor into an f32
+/// device tensor (e4m3 KV pool: rebuild the f32 host-mirror staging).
+/// Same contract as [`cast_f32_to_f16_dev`] with the dtypes swapped.
+pub fn cast_e4m3_to_f32_dev(
+    src: &Arc<Tensor<u8>>,
+    dst: Arc<Tensor<f32>>,
+    n: usize,
+    stream: &Arc<Stream>,
+) -> Result<Arc<Tensor<f32>>> {
+    let n_pad = n.div_ceil(CAST_B) * CAST_B;
+    if src.size() < n_pad {
+        return Err(KernelError::InvalidConfig(format!(
+            "cast_e4m3_to_f32: src holds {} elements, need {n_pad}",
+            src.size()
+        )));
+    }
+    let dst_tensor = match Arc::try_unwrap(dst) {
+        Ok(t) if t.size() == n_pad => t,
+        Ok(t) => t
+            .reshape(&[n_pad])
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+        Err(_) => {
+            return Err(KernelError::InvalidConfig(
+                "cast_e4m3_to_f32: dst Arc has live clones".into(),
+            ))
+        }
+    };
+    let dst_part = dst_tensor.partition([CAST_B]);
+    // SAFETY: see cast_f32_to_e4m3_dev.
+    let (dst_out, _src) = unsafe {
+        kernels::cutile_cast_e4m3_f32(dst_part, src.clone())
             .generics(vec![CAST_B.to_string()])
             .async_on(stream)
             .map_err(|e| KernelError::InvalidConfig(e.to_string()))?

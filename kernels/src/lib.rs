@@ -59,6 +59,7 @@ pub mod cutile_rmsnorm;
 pub mod cutile_rope;
 pub mod deltanet;
 pub mod dispatch;
+pub mod e4m3;
 pub mod f16_gemv;
 pub mod fused;
 pub mod ggml;
