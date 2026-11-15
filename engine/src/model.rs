@@ -10462,20 +10462,23 @@ impl CutileInferenceWrapper {
         // Quality-gated 2026-11-15: pooled serving-path ppl on WikiText-2,
         // 8 chunks: f32 8.6799 vs f16 8.6827 (ratio 1.0003, gate <=1.01),
         // 0 NaN steps both -- see docs/status.  TEMPURA_KV_F32=1 restores
-        // the f32 pool (256 KiB/token) for bisecting.
-        let f16 = std::env::var("TEMPURA_KV_F32").as_deref() != Ok("1");
+        // the f32 pool (256 KiB/token) for bisecting.  e4m3 (64
+        // KiB/token, vLLM's production KV density) is OPT-IN via
+        // TEMPURA_KV_DTYPE=e4m3 -- 3 mantissa bits make it lossier than
+        // f16 (ppl-gated; see docs/status), so f16 stays the default.
+        let dtype = crate::cutile_kv_cache::KvDtype::from_env();
         match crate::cutile_kv_cache::GpuKvPagePool::new_with_dims_dtype(
             cfg.num_layers,
             kv_dim,
             pool_pages,
             gm.stream(),
-            f16,
+            dtype,
         ) {
             Ok(pool) => {
                 eprintln!(
                     "[cutile] serving KV page pool: {tokens} tokens ({pool_pages} pages, {}), \
                      free was {:.1} GiB",
-                    if f16 { "f16" } else { "f32" },
+                    dtype.as_str(),
                     free as f64 / (1 << 30) as f64,
                 );
                 Some(std::sync::Arc::new(std::sync::Mutex::new(pool)))

@@ -50,15 +50,63 @@ pub enum EnsureCapacityError {
 /// cache update (host mirror remains authoritative).
 pub const GPU_KV_MAX_SEQ_LEN: usize = 4096;
 
-/// Per-layer pool/device tensors, dtype-tagged (p24 f16 serving pool).
-/// Raw-pointer sites are dtype-ERASED (a pointer is a pointer); only the
-/// byte-offset math and the typed readers branch on the variant.
+/// KV pool storage dtype (the p24 f16 pool + the e4m3 follow-on).
+/// f16 = the default (128 KiB/token for Llama-8B GQA); e4m3 = opt-in
+/// via TEMPURA_KV_DTYPE=e4m3 (64 KiB/token, vLLM's production KV
+/// density; 3 mantissa bits -- quality-gated, see docs/status).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvDtype {
+    F32,
+    F16,
+    E4M3,
+}
+
+impl KvDtype {
+    /// Serving-pool dtype from the environment: TEMPURA_KV_DTYPE
+    /// (f32|f16|e4m3, default f16), with TEMPURA_KV_F32=1 as an f32
+    /// alias (existing status references / bisect workflows use it).
+    /// ONE parse point shared by model.rs new_kv_pool and eval.rs.
+    pub fn from_env() -> Self {
+        if std::env::var("TEMPURA_KV_F32").as_deref() == Ok("1") {
+            return KvDtype::F32;
+        }
+        match std::env::var("TEMPURA_KV_DTYPE").as_deref() {
+            Ok("f32") => KvDtype::F32,
+            Ok("e4m3") => KvDtype::E4M3,
+            // f16 and anything unset/unknown: the default.  An invalid
+            // value falls back to the default rather than failing the
+            // server -- the banner prints the resolved dtype.
+            _ => KvDtype::F16,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            KvDtype::F32 => "f32",
+            KvDtype::F16 => "f16",
+            KvDtype::E4M3 => "e4m3",
+        }
+    }
+}
+
+/// Per-layer pool/device tensors, dtype-tagged (p24 f16 serving pool;
+/// e4m3 follow-on).  Raw-pointer sites are dtype-ERASED (a pointer is a
+/// pointer); only the byte-offset math and the typed readers branch on
+/// the variant.
 pub enum LayerTensors {
     F32(Vec<Arc<Tensor<f32>>>),
     F16(Vec<Arc<Tensor<half::f16>>>),
+    E4M3(Vec<Arc<Tensor<u8>>>),
 }
 
 impl LayerTensors {
+    pub fn kv_dtype(&self) -> KvDtype {
+        match self {
+            LayerTensors::F32(_) => KvDtype::F32,
+            LayerTensors::F16(_) => KvDtype::F16,
+            LayerTensors::E4M3(_) => KvDtype::E4M3,
+        }
+    }
     pub fn is_f16(&self) -> bool {
         matches!(self, LayerTensors::F16(_))
     }
@@ -66,24 +114,32 @@ impl LayerTensors {
         match self {
             LayerTensors::F32(_) => std::mem::size_of::<f32>(),
             LayerTensors::F16(_) => std::mem::size_of::<half::f16>(),
+            LayerTensors::E4M3(_) => std::mem::size_of::<u8>(),
         }
     }
     pub fn ptr(&self, layer: usize) -> u64 {
         match self {
             LayerTensors::F32(v) => v[layer].device_pointer().cu_deviceptr(),
             LayerTensors::F16(v) => v[layer].device_pointer().cu_deviceptr(),
+            LayerTensors::E4M3(v) => v[layer].device_pointer().cu_deviceptr(),
         }
     }
     pub fn f32_tensor(&self, layer: usize) -> Option<Arc<Tensor<f32>>> {
         match self {
             LayerTensors::F32(v) => Some(Arc::clone(&v[layer])),
-            LayerTensors::F16(_) => None,
+            LayerTensors::F16(_) | LayerTensors::E4M3(_) => None,
         }
     }
     pub fn f16_tensor(&self, layer: usize) -> Option<Arc<Tensor<half::f16>>> {
         match self {
-            LayerTensors::F32(_) => None,
+            LayerTensors::F32(_) | LayerTensors::E4M3(_) => None,
             LayerTensors::F16(v) => Some(Arc::clone(&v[layer])),
+        }
+    }
+    pub fn e4m3_tensor(&self, layer: usize) -> Option<Arc<Tensor<u8>>> {
+        match self {
+            LayerTensors::F32(_) | LayerTensors::F16(_) => None,
+            LayerTensors::E4M3(v) => Some(Arc::clone(&v[layer])),
         }
     }
 }
@@ -92,6 +148,7 @@ impl LayerTensors {
 pub enum PagedAttnViews {
     F32(Arc<Tensor<f32>>, Arc<Tensor<f32>>),
     F16(Arc<Tensor<half::f16>>, Arc<Tensor<half::f16>>),
+    E4M3(Arc<Tensor<u8>>, Arc<Tensor<u8>>),
 }
 
 pub struct CutileKvCache {
@@ -153,6 +210,8 @@ pub struct CutileKvCache {
     /// Resized to exactly ceil(n/CAST_B)*CAST_B per use (stable within a
     /// phase: decode = kv_dim, prefill = chunk*kv_dim).
     f16_stage: Option<Arc<Tensor<half::f16>>>,
+    /// Same staging contract for e4m3 pools (cutile_cast_f32_e4m3).
+    e4m3_stage: Option<Arc<Tensor<u8>>>,
 }
 
 // SAFETY: Tensor<f32> and Stream hold raw CUDA pointers but tempura uses a
@@ -204,6 +263,7 @@ impl CutileKvCache {
             k_device: LayerTensors::F32(k_device),
             v_device: LayerTensors::F32(v_device),
             f16_stage: None,
+            e4m3_stage: None,
             gpu_max_seq_len,
             host_stale: false,
             block_table_dev: None,
@@ -250,16 +310,19 @@ impl CutileKvCache {
             let run = p
                 .alloc_pages(alloc_pages)
                 .ok_or_else(|| KernelError::InvalidConfig("KV pool exhausted".into()))?;
-            let (k_device, v_device) = if p.is_f16() {
-                (
+            let (k_device, v_device) = match p.dtype() {
+                KvDtype::F16 => (
                     LayerTensors::F16(p.k_pool_tensors_f16()),
                     LayerTensors::F16(p.v_pool_tensors_f16()),
-                )
-            } else {
-                (
+                ),
+                KvDtype::E4M3 => (
+                    LayerTensors::E4M3(p.k_pool_tensors_e4m3()),
+                    LayerTensors::E4M3(p.v_pool_tensors_e4m3()),
+                ),
+                KvDtype::F32 => (
                     LayerTensors::F32(p.k_pool_tensors()),
                     LayerTensors::F32(p.v_pool_tensors()),
-                )
+                ),
             };
             (run.start, run.pages, k_device, v_device, run.pages * block_size)
         };
@@ -280,6 +343,7 @@ impl CutileKvCache {
             swap_checksum: None,
             kv_len_dev: None,
             f16_stage: None,
+            e4m3_stage: None,
             pool: Some(pool),
             base_page,
             run_pages,
@@ -384,10 +448,16 @@ impl CutileKvCache {
                 + (new_run.start * block_size * self.kv_dim) as u64 * elem;
             if live_elems > 0 {
                 let copy = |dst: u64, src: u64| -> Result<(), EnsureCapacityError> {
-                    let r = if self.k_device.is_f16() {
-                        unsafe { cuda_core::memcpy_dtod_async::<half::f16>(dst, src, live_elems, &self.stream) }
-                    } else {
-                        unsafe { cuda_core::memcpy_dtod_async::<f32>(dst, src, live_elems, &self.stream) }
+                    let r = match self.k_device.kv_dtype() {
+                        KvDtype::F16 => unsafe {
+                            cuda_core::memcpy_dtod_async::<half::f16>(dst, src, live_elems, &self.stream)
+                        },
+                        KvDtype::E4M3 => unsafe {
+                            cuda_core::memcpy_dtod_async::<u8>(dst, src, live_elems, &self.stream)
+                        },
+                        KvDtype::F32 => unsafe {
+                            cuda_core::memcpy_dtod_async::<f32>(dst, src, live_elems, &self.stream)
+                        },
                     };
                     r.map_err(|e| {
                         EnsureCapacityError::Kernel(KernelError::InvalidConfig(e.to_string()))
@@ -530,8 +600,9 @@ impl CutileKvCache {
     }
 
     /// Copy `num_elems` f32 K/V elements into the pool at the current
-    /// offset (dtype-aware): f32 pools take a straight D2D; f16 pools cast
-    /// through the staging tensor first (cutile_cast_f32_f16).
+    /// offset (dtype-aware): f32 pools take a straight D2D; f16/e4m3
+    /// pools cast through the staging tensor first
+    /// (cutile_cast_f32_f16 / cutile_cast_f32_e4m3).
     fn d2d_into_pool(
         &mut self,
         layer: usize,
@@ -545,7 +616,7 @@ impl CutileKvCache {
         let elem = self.k_device.elem_size() as u64;
         let base_off = self.kv_base_byte_offset();
 
-        if !self.k_device.is_f16() {
+        if self.k_device.kv_dtype() == KvDtype::F32 {
             let k_src: CUdeviceptr = k_new.device_pointer().cu_deviceptr();
             let v_src: CUdeviceptr = v_new.device_pointer().cu_deviceptr();
             let k_dst: CUdeviceptr = self.k_device.ptr(layer) + base_off + offset_elems as u64 * elem;
@@ -559,41 +630,76 @@ impl CutileKvCache {
             return Ok(());
         }
 
-        // f16 pool: cast each source through the staging tensor, then D2D
-        // the cast result into the pool.  The cast is stream-ordered before
-        // the D2D; the staging is reused across calls (exact-size per use).
+        // f16 / e4m3 pools: cast each source through the staging tensor,
+        // then D2D the cast result into the pool.  The cast is
+        // stream-ordered before the D2D; the staging is reused across
+        // calls (exact-size per use).
         let n_pad = num_elems.div_ceil(tempura_kernels::cutile_elementwise::CAST_B)
             * tempura_kernels::cutile_elementwise::CAST_B;
-        let mut stage = match self.f16_stage.take() {
-            Some(t) if t.size() == n_pad => t,
-            _ => Arc::new(
-                api::zeros::<half::f16>(&[n_pad])
-                    .sync_on(&self.stream)
-                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                    .into(),
-            ),
-        };
-        for src in [k_new, v_new] {
-            stage = tempura_kernels::cutile_elementwise::cast_f32_to_f16_dev(
-                src, stage, num_elems, &self.stream,
-            )?;
-            let dst: CUdeviceptr = if Arc::ptr_eq(src, k_new) {
-                self.k_device.ptr(layer)
-            } else {
-                self.v_device.ptr(layer)
-            } + base_off
-                + offset_elems as u64 * elem;
-            unsafe {
-                cuda_core::memcpy_dtod_async::<half::f16>(
-                    dst,
-                    stage.device_pointer().cu_deviceptr(),
-                    num_elems,
-                    &self.stream,
-                )
-                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+        let is_e4m3 = self.k_device.kv_dtype() == KvDtype::E4M3;
+        if is_e4m3 {
+            let mut stage = match self.e4m3_stage.take() {
+                Some(t) if t.size() == n_pad => t,
+                _ => Arc::new(
+                    api::zeros::<u8>(&[n_pad])
+                        .sync_on(&self.stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .into(),
+                ),
+            };
+            for src in [k_new, v_new] {
+                stage = tempura_kernels::cutile_elementwise::cast_f32_to_e4m3_dev(
+                    src, stage, num_elems, &self.stream,
+                )?;
+                let dst: CUdeviceptr = if Arc::ptr_eq(src, k_new) {
+                    self.k_device.ptr(layer)
+                } else {
+                    self.v_device.ptr(layer)
+                } + base_off
+                    + offset_elems as u64 * elem;
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<u8>(
+                        dst,
+                        stage.device_pointer().cu_deviceptr(),
+                        num_elems,
+                        &self.stream,
+                    )
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+                }
             }
+            self.e4m3_stage = Some(stage);
+        } else {
+            let mut stage = match self.f16_stage.take() {
+                Some(t) if t.size() == n_pad => t,
+                _ => Arc::new(
+                    api::zeros::<half::f16>(&[n_pad])
+                        .sync_on(&self.stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .into(),
+                ),
+            };
+            for src in [k_new, v_new] {
+                stage = tempura_kernels::cutile_elementwise::cast_f32_to_f16_dev(
+                    src, stage, num_elems, &self.stream,
+                )?;
+                let dst: CUdeviceptr = if Arc::ptr_eq(src, k_new) {
+                    self.k_device.ptr(layer)
+                } else {
+                    self.v_device.ptr(layer)
+                } + base_off
+                    + offset_elems as u64 * elem;
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<half::f16>(
+                        dst,
+                        stage.device_pointer().cu_deviceptr(),
+                        num_elems,
+                        &self.stream,
+                    )
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+                }
+            }
+            self.f16_stage = Some(stage);
         }
-        self.f16_stage = Some(stage);
         Ok(())
     }
 
@@ -648,17 +754,19 @@ impl CutileKvCache {
         }
         let base_off = self.kv_base_byte_offset();
         let elem = self.k_device.elem_size();
-        let is_f16 = self.k_device.is_f16();
-        // f16 pools download into a u16 staging and convert on the host
-        // (the DRAM-tier mirror stays f32 for now).
-        let mut f16_tmp: Vec<u16> = if is_f16 { vec![0u16; len] } else { Vec::new() };
+        let dtype = self.k_device.kv_dtype();
+        // f16/e4m3 pools download into a raw-bits staging and convert on
+        // the host via the SHARED e4m3/f16 helpers (the DRAM-tier mirror
+        // stays f32 for now).
+        let mut f16_tmp: Vec<u16> = if dtype == KvDtype::F16 { vec![0u16; len] } else { Vec::new() };
+        let mut e4m3_tmp: Vec<u8> = if dtype == KvDtype::E4M3 { vec![0u8; len] } else { Vec::new() };
         for layer in 0..self.n_layers {
             // Offset D2H (raw memcpy): pooled mode must NOT download the
             // whole pool tensor (to_host_vec) -- the pool can be tens of
             // GB while the live prefix is small.
             let k_src = self.k_device.ptr(layer) + base_off;
             let v_src = self.v_device.ptr(layer) + base_off;
-            if is_f16 {
+            if dtype == KvDtype::F16 {
                 for (src, mirror) in [(k_src, &mut self.k_host), (v_src, &mut self.v_host)] {
                     unsafe {
                         let rc = cuda_core::sys::cuMemcpyDtoHAsync_v2(
@@ -679,6 +787,31 @@ impl CutileKvCache {
                     let dst = &mut mirror[layer][..len];
                     for (d, &h) in dst.iter_mut().zip(f16_tmp.iter()) {
                         *d = half::f16::from_bits(h).to_f32();
+                    }
+                }
+                continue;
+            }
+            if dtype == KvDtype::E4M3 {
+                for (src, mirror) in [(k_src, &mut self.k_host), (v_src, &mut self.v_host)] {
+                    unsafe {
+                        let rc = cuda_core::sys::cuMemcpyDtoHAsync_v2(
+                            e4m3_tmp.as_mut_ptr() as *mut _,
+                            src,
+                            len * elem,
+                            self.stream.cu_stream(),
+                        );
+                        if rc != 0 {
+                            return Err(KernelError::InvalidConfig(format!(
+                                "sync_host e4m3 D2H rc={rc}"
+                            )));
+                        }
+                    }
+                    self.stream
+                        .synchronize()
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?;
+                    let dst = &mut mirror[layer][..len];
+                    for (d, &b) in dst.iter_mut().zip(e4m3_tmp.iter()) {
+                        *d = tempura_kernels::e4m3::e4m3_bits_to_f32(b);
                     }
                 }
                 continue;
@@ -807,6 +940,17 @@ impl CutileKvCache {
         self.k_device.is_f16()
     }
 
+    /// This cache's pool storage dtype.
+    pub fn kv_dtype(&self) -> KvDtype {
+        self.k_device.kv_dtype()
+    }
+
+    /// Whether this cache's pool tensors hold f32 (the only dtype the
+    /// f32 attention/graph kernels can read).
+    pub fn kv_f32(&self) -> bool {
+        self.k_device.kv_dtype() == KvDtype::F32
+    }
+
     /// Base-shifted raw K/V pointers for this cache's RUN (p20 4b-3):
     /// pool tensor base + run byte offset.  Multi-client batch paths use
     /// these; the whole-tensor `kv_device_tensors` pointers point at the
@@ -861,6 +1005,11 @@ impl CutileKvCache {
                 .iter()
                 .map(|&d| d as usize)
                 .product::<usize>(),
+            LayerTensors::E4M3(v) => v[layer]
+                .shape()
+                .iter()
+                .map(|&d| d as usize)
+                .product::<usize>(),
         };
         let rows = tensor_elems / head_dim;
         let views = match &self.k_device {
@@ -884,6 +1033,18 @@ impl CutileKvCache {
                     .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
                 self.v_device
                     .f16_tensor(layer)
+                    .unwrap()
+                    .reshape(&[rows, head_dim])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+            ),
+            LayerTensors::E4M3(_) => PagedAttnViews::E4M3(
+                self.k_device
+                    .e4m3_tensor(layer)
+                    .unwrap()
+                    .reshape(&[rows, head_dim])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+                self.v_device
+                    .e4m3_tensor(layer)
                     .unwrap()
                     .reshape(&[rows, head_dim])
                     .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
@@ -1016,11 +1177,18 @@ impl CutileKvCache {
             .ok_or_else(|| KernelError::InvalidConfig("KV pool exhausted on swap-in".into()))?;
         let f32_bytes = std::mem::size_of::<f32>() as u64;
         let live_elems = self.seq_len * self.kv_dim;
-        let is_f16 = self.k_device.is_f16();
-        // f16 pools: the f32 mirror is quantized to f16 bits on the host,
-        // then uploaded (matching the append path's cast semantics).
-        let mut f16_tmp: Vec<u16> = if is_f16 && live_elems > 0 {
+        let dtype = self.k_device.kv_dtype();
+        // f16/e4m3 pools: the f32 mirror is quantized to the pool's bits
+        // on the host via the SHARED helpers (matching the append path's
+        // cast semantics -- e4m3 RNE + saturation + subnormal flush),
+        // then uploaded.
+        let mut f16_tmp: Vec<u16> = if dtype == KvDtype::F16 && live_elems > 0 {
             vec![0u16; live_elems]
+        } else {
+            Vec::new()
+        };
+        let mut e4m3_tmp: Vec<u8> = if dtype == KvDtype::E4M3 && live_elems > 0 {
+            vec![0u8; live_elems]
         } else {
             Vec::new()
         };
@@ -1031,7 +1199,7 @@ impl CutileKvCache {
             let v_dst = self.v_device.ptr(layer)
                 + (run.start * block_size * self.kv_dim) as u64 * elem;
             if live_elems > 0 {
-                if is_f16 {
+                if dtype == KvDtype::F16 {
                     for (dst, mirror) in [(k_dst, &self.k_host), (v_dst, &self.v_host)] {
                         for (d, &s) in f16_tmp.iter_mut().zip(mirror[layer][..live_elems].iter())
                         {
@@ -1041,6 +1209,21 @@ impl CutileKvCache {
                             cuda_core::sys::cuMemcpyHtoDAsync_v2(
                                 dst,
                                 f16_tmp.as_ptr() as *const _,
+                                live_elems * elem as usize,
+                                self.stream.cu_stream(),
+                            );
+                        }
+                    }
+                } else if dtype == KvDtype::E4M3 {
+                    for (dst, mirror) in [(k_dst, &self.k_host), (v_dst, &self.v_host)] {
+                        for (d, &s) in e4m3_tmp.iter_mut().zip(mirror[layer][..live_elems].iter())
+                        {
+                            *d = tempura_kernels::e4m3::f32_to_e4m3_bits(s);
+                        }
+                        unsafe {
+                            cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                                dst,
+                                e4m3_tmp.as_ptr() as *const _,
                                 live_elems * elem as usize,
                                 self.stream.cu_stream(),
                             );
@@ -1103,16 +1286,19 @@ impl CutileKvCache {
     }
 
     /// Same fingerprint, read back from the device run at `base_page`.
-    /// f16 pools: the f16 bits are converted back to f32 BEFORE summing,
-    /// so the value matches [`Self::mirror_bits_checksum`] (the mirror
-    /// holds the dequantized values).
+    /// f16/e4m3 pools: the raw bits are converted back to f32 BEFORE
+    /// summing, so the value matches [`Self::mirror_bits_checksum`] (the
+    /// mirror holds the dequantized values; the e4m3 conversion is the
+    /// SHARED reader -- exact for normals, subnormals flush, same as the
+    /// mirror sync).
     fn device_prefix_bits_checksum(&self, base_page: usize, tokens: usize) -> u64 {
         let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
         let elem = self.k_device.elem_size();
         let live = tokens * self.kv_dim;
-        let is_f16 = self.k_device.is_f16();
+        let dtype = self.k_device.kv_dtype();
         let mut buf32 = vec![0.0f32; live];
-        let mut buf16 = if is_f16 { vec![0u16; live] } else { Vec::new() };
+        let mut buf16 = if dtype == KvDtype::F16 { vec![0u16; live] } else { Vec::new() };
+        let mut buf8 = if dtype == KvDtype::E4M3 { vec![0u8; live] } else { Vec::new() };
         let mut cs: u64 = 0;
         let base_off =
             (base_page * block_size * self.kv_dim) as u64 * elem as u64;
@@ -1123,7 +1309,7 @@ impl CutileKvCache {
                 } else {
                     self.v_device.ptr(layer) + base_off
                 };
-                if is_f16 {
+                if dtype == KvDtype::F16 {
                     let rc = unsafe {
                         cuda_core::sys::cuMemcpyDtoHAsync_v2(
                             buf16.as_mut_ptr() as *mut _,
@@ -1138,6 +1324,26 @@ impl CutileKvCache {
                     self.stream.synchronize().ok();
                     for &h in &buf16 {
                         cs = cs.wrapping_add(half::f16::from_bits(h).to_f32().to_bits() as u64);
+                    }
+                    continue;
+                }
+                if dtype == KvDtype::E4M3 {
+                    let rc = unsafe {
+                        cuda_core::sys::cuMemcpyDtoHAsync_v2(
+                            buf8.as_mut_ptr() as *mut _,
+                            src,
+                            live * elem,
+                            self.stream.cu_stream(),
+                        )
+                    };
+                    if rc != 0 {
+                        return u64::MAX;
+                    }
+                    self.stream.synchronize().ok();
+                    for &b in &buf8 {
+                        cs = cs.wrapping_add(
+                            tempura_kernels::e4m3::e4m3_bits_to_f32(b).to_bits() as u64,
+                        );
                     }
                     continue;
                 }
@@ -1384,6 +1590,9 @@ pub struct GpuKvPagePool {
     v_pools: Vec<Arc<Tensor<f32>>>,
     k_pools_f16: Vec<Arc<Tensor<half::f16>>>,
     v_pools_f16: Vec<Arc<Tensor<half::f16>>>,
+    /// e4m3 pools: raw u8 e4m3 bits (TEMPURA_KV_DTYPE=e4m3).
+    k_pools_e4m3: Vec<Arc<Tensor<u8>>>,
+    v_pools_e4m3: Vec<Arc<Tensor<u8>>>,
     alloc: crate::gpu_page_pool::PageRunAllocator,
     /// Elements per page (block_size * kv_dim).
     page_stride: usize,
@@ -1442,17 +1651,18 @@ impl GpuKvPagePool {
         total_pages: usize,
         stream: Arc<Stream>,
     ) -> Result<Self, KernelError> {
-        Self::new_with_dims_dtype(n_layers, kv_dim, total_pages, stream, false)
+        Self::new_with_dims_dtype(n_layers, kv_dim, total_pages, stream, KvDtype::F32)
     }
 
-    /// [`Self::new_with_dims`] with an explicit dtype: `f16 = true`
-    /// allocates half-size pools (the p24 f16 serving pool).
+    /// [`Self::new_with_dims`] with an explicit dtype: F16 halves and
+    /// E4M3 quarters the pool bytes (the p24 f16 serving pool + its e4m3
+    /// follow-on; the wrapper's own session cache stays f32).
     pub fn new_with_dims_dtype(
         n_layers: usize,
         kv_dim: usize,
         total_pages: usize,
         stream: Arc<Stream>,
-        f16: bool,
+        dtype: KvDtype,
     ) -> Result<Self, KernelError> {
         let block_size = tempura_kernels::cutile_flash_attention::PAGED_BLOCK_SIZE;
         let page_stride = block_size * kv_dim;
@@ -1461,29 +1671,46 @@ impl GpuKvPagePool {
         let mut v_pools = Vec::new();
         let mut k_pools_f16 = Vec::new();
         let mut v_pools_f16 = Vec::new();
+        let mut k_pools_e4m3 = Vec::new();
+        let mut v_pools_e4m3 = Vec::new();
         for _ in 0..n_layers {
-            if f16 {
-                let k: Arc<Tensor<half::f16>> = api::zeros::<half::f16>(&[layer_elems])
-                    .sync_on(&stream)
-                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                    .into();
-                let v: Arc<Tensor<half::f16>> = api::zeros::<half::f16>(&[layer_elems])
-                    .sync_on(&stream)
-                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                    .into();
-                k_pools_f16.push(k);
-                v_pools_f16.push(v);
-            } else {
-                let k: Arc<Tensor<f32>> = api::zeros::<f32>(&[layer_elems])
-                    .sync_on(&stream)
-                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                    .into();
-                let v: Arc<Tensor<f32>> = api::zeros::<f32>(&[layer_elems])
-                    .sync_on(&stream)
-                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
-                    .into();
-                k_pools.push(k);
-                v_pools.push(v);
+            match dtype {
+                KvDtype::F16 => {
+                    let k: Arc<Tensor<half::f16>> = api::zeros::<half::f16>(&[layer_elems])
+                        .sync_on(&stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .into();
+                    let v: Arc<Tensor<half::f16>> = api::zeros::<half::f16>(&[layer_elems])
+                        .sync_on(&stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .into();
+                    k_pools_f16.push(k);
+                    v_pools_f16.push(v);
+                }
+                KvDtype::E4M3 => {
+                    let k: Arc<Tensor<u8>> = api::zeros::<u8>(&[layer_elems])
+                        .sync_on(&stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .into();
+                    let v: Arc<Tensor<u8>> = api::zeros::<u8>(&[layer_elems])
+                        .sync_on(&stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .into();
+                    k_pools_e4m3.push(k);
+                    v_pools_e4m3.push(v);
+                }
+                KvDtype::F32 => {
+                    let k: Arc<Tensor<f32>> = api::zeros::<f32>(&[layer_elems])
+                        .sync_on(&stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .into();
+                    let v: Arc<Tensor<f32>> = api::zeros::<f32>(&[layer_elems])
+                        .sync_on(&stream)
+                        .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+                        .into();
+                    k_pools.push(k);
+                    v_pools.push(v);
+                }
             }
         }
         Ok(Self {
@@ -1491,12 +1718,25 @@ impl GpuKvPagePool {
             v_pools,
             k_pools_f16,
             v_pools_f16,
+            k_pools_e4m3,
+            v_pools_e4m3,
             alloc: crate::gpu_page_pool::PageRunAllocator::new(total_pages),
             page_stride,
             block_size,
             kv_dim,
             stream,
         })
+    }
+
+    /// This pool's storage dtype.
+    pub fn dtype(&self) -> KvDtype {
+        if !self.k_pools.is_empty() {
+            KvDtype::F32
+        } else if !self.k_pools_f16.is_empty() {
+            KvDtype::F16
+        } else {
+            KvDtype::E4M3
+        }
     }
 
     /// Whether this pool stores f16 KV.
@@ -1541,13 +1781,22 @@ impl GpuKvPagePool {
         self.v_pools.clone()
     }
 
-    /// Per-layer f16 pool tensors (empty for an f32 pool).
+    /// Per-layer f16 pool tensors (empty for an f32/e4m3 pool).
     pub fn k_pool_tensors_f16(&self) -> Vec<Arc<Tensor<half::f16>>> {
         self.k_pools_f16.clone()
     }
 
     pub fn v_pool_tensors_f16(&self) -> Vec<Arc<Tensor<half::f16>>> {
         self.v_pools_f16.clone()
+    }
+
+    /// Per-layer e4m3 (u8) pool tensors (empty for f32/f16 pools).
+    pub fn k_pool_tensors_e4m3(&self) -> Vec<Arc<Tensor<u8>>> {
+        self.k_pools_e4m3.clone()
+    }
+
+    pub fn v_pool_tensors_e4m3(&self) -> Vec<Arc<Tensor<u8>>> {
+        self.v_pools_e4m3.clone()
     }
 
     pub fn total_pages(&self) -> usize {
@@ -1567,9 +1816,9 @@ impl GpuKvPagePool {
         if head_dim == 0 || self.kv_dim % head_dim != 0 {
             return None;
         }
-        // GpuKvRun carries f32 views -- f16 pools use CutileKvCache::
-        // new_pooled + the f16 kernels instead.
-        if self.is_f16() {
+        // GpuKvRun carries f32 views -- f16/e4m3 pools use CutileKvCache::
+        // new_pooled + the dtype twins instead.
+        if self.dtype() != KvDtype::F32 {
             return None;
         }
         let run = self.alloc.alloc(pages)?;

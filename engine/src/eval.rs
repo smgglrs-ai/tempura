@@ -239,13 +239,13 @@ pub fn perplexity_pooled(
     let first = n_ctx / 2;
 
     let pool = model.new_kv_pool()?;
-    // Mirror the pool default (model.rs new_kv_pool): f16 unless
-    // TEMPURA_KV_F32=1 (the pre-flip TEMPURA_KV_F16=1 is now the default
-    // and stays accepted as a no-op).
-    let f16 = std::env::var("TEMPURA_KV_F32").as_deref() != Ok("1");
+    // Mirror the pool dtype parse (model.rs new_kv_pool uses the same
+    // KvDtype::from_env -- ONE parse point; the pre-flip TEMPURA_KV_F16=1
+    // stays accepted as a no-op).
+    let dtype = crate::cutile_kv_cache::KvDtype::from_env();
     eprintln!(
         "  [ppl-pooled] serving-path mode ({} KV pool, {} chunks of n_ctx={})",
-        if f16 { "f16" } else { "f32" },
+        dtype.as_str(),
         n_chunk, n_ctx
     );
 
