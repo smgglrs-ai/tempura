@@ -61,6 +61,10 @@ path = "src/bench_mmlu.rs"
 name = "bench-selfconsistency"
 path = "src/bench_selfconsistency.rs"
 
+[[bin]]
+name = "bench-ab-repro"
+path = "src/bench_ab_repro.rs"
+
 [features]
 # GPU-side bins need the CUDA toolkit at build time; default-on keeps the
 # remote workflow (`scripts/gpu-remote.sh bench`) unchanged. CPU-only hosts

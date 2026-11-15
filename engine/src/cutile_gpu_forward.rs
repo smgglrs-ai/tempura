@@ -542,6 +542,11 @@ pub struct CutileGpuModel {
     // and replayed N times without cuStreamBeginCapture per token.
     /// kv_len after the current step's KV append (f32 for cuTile compatibility; read by flash attention).
     d_kv_len: Arc<Tensor<f32>>,
+    /// Host-side staging for the per-request `d_kv_len` H2D in the batch
+    /// attention fallback.  Model-owned so the async copy's source outlives
+    /// the launch (the pre-c94572d stack local could be overwritten before
+    /// an async copy read it).
+    kv_len_stage: std::cell::RefCell<Vec<f32>>,
     /// Current token position for RoPE (f32 for cuTile compatibility).
     d_positions: Arc<Tensor<f32>>,
     /// KV cache write slot before the current step's append (raw i32, not a cuTile tensor).
@@ -2381,6 +2386,7 @@ impl CutileGpuModel {
                 .sync_on(matmul.stream())
                 .expect("d_kv_len alloc failed"),
         );
+        let kv_len_stage = std::cell::RefCell::new(vec![0.0f32]);
         let d_positions = Arc::new(
             api::zeros::<f32>(&[1])
                 .sync_on(matmul.stream())
@@ -2554,6 +2560,7 @@ impl CutileGpuModel {
             prefill_mxfp4_scales: RefCell::new(None),
             d_embed,
             d_kv_len,
+            kv_len_stage,
             d_positions,
             d_kv_write_offset,
             d_rope_cos_row,
@@ -2855,6 +2862,7 @@ impl CutileGpuModel {
                 .sync_on(matmul.stream())
                 .expect("d_kv_len alloc failed"),
         );
+        let kv_len_stage = std::cell::RefCell::new(vec![0.0f32]);
         let d_positions = Arc::new(
             api::zeros::<f32>(&[1])
                 .sync_on(matmul.stream())
@@ -3010,6 +3018,7 @@ impl CutileGpuModel {
             prefill_mxfp4_scales: RefCell::new(None),
             d_embed,
             d_kv_len,
+            kv_len_stage,
             d_positions,
             d_kv_write_offset,
             d_rope_cos_row,
@@ -9943,24 +9952,45 @@ impl CutileGpuModel {
                         let (k_base, v_base) = kv_caches[r].kv_device_base_ptrs(layer);
                         let kv_len_r = (kv_caches[r].seq_len() + 1) as i32;
                         // Write kv_len to d_kv_len for this request.
-                        // SYNCHRONOUS 4-byte H2D: an async copy from this
-                        // loop-iteration stack local can defer past the
-                        // iteration's scope (the next iteration overwrites
-                        // the stack slot with no stream ordering) -- the
-                        // kernel then reads a garbage kv_len and scans OOB
-                        // KV, producing intermittently all-NaN attention
-                        // output.  Found via the pooled-ppl NaN hunt; the
-                        // engine's slower tick cadence masked the race.
+                        // STREAM-ORDERED async H2D on the main stream from a
+                        // MODEL-OWNED per-request staging slot.  Two prior
+                        // bugs shaped this: (1) the original async copy read
+                        // a loop-iteration stack local that could be
+                        // overwritten before the copy executed (garbage
+                        // kv_len, OOB KV scans -- the pooled-ppl NaN); (2)
+                        // c94572d's fix used memcpy_htod_sync, which runs on
+                        // the NULL stream -- and every cuda-core stream is
+                        // CU_STREAM_NON_BLOCKING, so a NULL-stream copy has
+                        // NO ordering vs the main stream.  In an m >= 2 batch
+                        // the loop's next H2D could execute while the
+                        // previous request's attention kernel was still in
+                        // flight, so that kernel read the WRONG kv_len and
+                        // attended over a neighboring run's length -- wrong
+                        // but plausible logits, firing only when the batch
+                        // composition was m >= 2 and only when the race won
+                        // (the 6-client A/B's cross-restart divergence;
+                        // single-client runs never race).  Main-stream
+                        // ordering makes the write land after all prior
+                        // kernels and before this request's kernel; the
+                        // per-request staging slot keeps the source stable
+                        // even if the driver defers a pageable async copy.
                         let kv_bits = f32::from_bits(kv_len_r as u32);
-                        let _ = stream.context().bind_to_thread();
-                        unsafe {
-                            cuda_core::memory::memcpy_htod_sync(
-                                self.d_kv_len.device_pointer().cu_deviceptr(),
-                                &kv_bits as *const f32,
-                                std::mem::size_of::<f32>(),
-                            )
+                        {
+                            let mut stage = self.kv_len_stage.borrow_mut();
+                            if stage.len() <= r {
+                                stage.resize(r + 1, 0.0);
+                            }
+                            stage[r] = kv_bits;
+                            unsafe {
+                                cuda_core::memcpy_htod_async::<f32>(
+                                    self.d_kv_len.device_pointer().cu_deviceptr(),
+                                    stage.as_ptr().add(r),
+                                    1,
+                                    stream,
+                                )
+                            }
+                            .expect("batch d_kv_len H2D");
                         }
-                        .expect("batch d_kv_len H2D");
                         let out_r = Arc::new(
                             cutile::api::zeros::<f32>(&[q_dim])
                                 .sync_on(stream)

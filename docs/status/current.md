@@ -5,6 +5,54 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-15 (6-client A/B flakiness ROOT-CAUSED + FIXED; the gate is
+green on f16 main again): the cross-restart/batch-composition divergence was
+a NULL-stream kv_len H2D racing the batch attention kernels.  In
+forward_batch_decode's per-request attention fallback
+(engine/src/cutile_gpu_forward.rs), each request writes its kv_len to the
+shared d_kv_len device scalar before launching its attention kernel.  The
+c94572d fix for the pooled-ppl NaN replaced the (stack-unsafe) async H2D
+with memcpy_htod_sync -- but a synchronous cuMemcpyHtoD runs on the NULL
+stream, and EVERY cuda-core stream is created CU_STREAM_NON_BLOCKING, so
+the NULL-stream copy has NO ordering vs the engine's main stream.  At
+m >= 2 the loop's next request's H2D could execute while the previous
+request's attention kernel was still in flight; that kernel then read the
+NEIGHBOR's kv_len and attended over the wrong length (neighboring pooled
+run's rows -- wrong-but-plausible values, small logit deltas, no NaN).
+This explains the full symptom set: only multi-client flows diverge
+(single-client m=1 never has a second H2D in the tick), run A varies
+across server restarts (race fires per timing/GPU queue state), the first
+divergence lands at the decode step where the batch first becomes m >= 2
+(verified with per-step [logits-cs] fingerprints: the session whose early
+steps never overlapped a batch-mate was bit-identical for all 199 steps),
+the 2026-11-14 PASS was luck (pre-c94572d the copy was at least
+stream-ordered; its stack-lifetime bug fired rarely), and why
+TEMPURA_NO_SM120_Q4K_BATCH=1 "didn't fix it" (kernel bisects cannot fix a
+host-side copy race).  FIX: the per-request kv_len H2D is now a
+main-stream memcpy_htod_async from a model-owned per-request staging slot
+(kv_len_stage: RefCell<Vec<f32>> -- stable source address even if the
+driver defers a pageable async copy, sized to the batch).  HUNT TOOLING
+landed with it: tools/bench-gpu bench-ab-repro (deterministic single-
+process interleave/composition scenarios; found the race fires only at
+m >= 2 and variably per run), scripts/kv-restart-var.sh (2-server-restart
+3-client variance gate with per-session first-divergent-step reporting),
+scripts/kv-swap-ab-mini.sh (fast 3-client A/B).  VALIDATION (fishtank,
+RTX 5090, Llama-3.1-8B-Instruct-Q4_K_M, f16 pool): bench-ab-repro 3x runs
+-- m=2 AND m=3 batch checksums bit-identical to the m=1 solo baseline
+(pre-fix: m>=2 diverged at a per-run-random step); kv-restart-var
+(3 clients x 100 tokens, two fresh servers): all 3 texts + all 297
+per-step logits checksums IDENTICAL across restarts; FULL 6-client
+kv-swap A/B PASS (6/6 byte-identical, 3 swaps, bit-checksums exact);
+nonstream-route-smoke PASS; local cargo test green (867 tests).  The
+e4m3 re-run of the 6-client gate is now unblocked (same fix applies --
+the f16/e4m3 twins share the launch path).  Also fixed en route
+(hygiene, 231f6df): the sm120 m==2 Q4K batch GEMV dispatch removed from
+gemm_any_d2d_batch.  FOLLOW-UP (open, minor): scripts/kv-swap-ab-mini.sh
+run B with a very small pool (700 tokens) exposed an admission livelock
+-- requeued admissions never trigger eviction, so 2 of 3 clients starved
+until request timeout; root-cause when next touching the scheduler (the
+full gate's 3072-token pool does not hit it).**
+
 **STATUS 2026-11-15 (e4m3/FP8 KV pool landed, opt-in TEMPURA_KV_DTYPE=e4m3;
 f16 stays default): the serving pool can now store KV as e4m3 (u8 bits,
 64 KiB/token for Llama-8B GQA -- 4x f32 density, vLLM's production KV
@@ -42,6 +90,11 @@ root-cause the batch-composition token divergence and restore the
 GEMV vs per-row GEMV numerics; TEMPURA_NO_SM120_Q4K=1 bisect;
 per-token logprob diff between m=1 and m=2 pooled runs via
 TEMPURA_PPL_DUMP_LOGPROBS); then re-run the 6-client A/B for e4m3.**
+      [RESOLVED same day: the real cause was the NULL-stream d_kv_len H2D
+      racing the batch attention kernels (c94572d's memcpy_htod_sync has no
+      ordering vs the non-blocking main stream) -- see the newer status
+      entry above; the m==2 dispatch was also removed as hygiene (231f6df),
+      but it was not the cause.]
 
 **STATUS 2026-11-15 (pooled-ppl NaN ROOT-CAUSED + FIXED; f16 KV pool is
 now the DEFAULT): the m=1 batch-decode NaN in perplexity_pooled was the
