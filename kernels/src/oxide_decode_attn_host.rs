@@ -44,6 +44,10 @@ pub struct OxideDecodeAttn {
     /// e4m3 K-parallel twin (falls back to the base e4m3 kernel when the
     /// PTX lacks it).
     cu_function_kpar_e4m3:   Option<cuda_core::sys::CUfunction>,
+    /// f16/e4m3 BATCH twins: same 11-param ABI as the f32 batch kernel,
+    /// grid (n_heads, m), kpar warp structure.
+    cu_function_batch_f16:   Option<cuda_core::sys::CUfunction>,
+    cu_function_batch_e4m3:  Option<cuda_core::sys::CUfunction>,
     stream:             Arc<Stream>,
 }
 
@@ -131,10 +135,12 @@ impl OxideDecodeAttn {
         let cu_function_splitk_f16 = load_opt("oxide_decode_attn_splitk_f16");
         let cu_function_e4m3 = load_opt("oxide_decode_attn_e4m3");
         let cu_function_kpar_e4m3 = load_opt("oxide_decode_attn_kpar_e4m3");
+        let cu_function_batch_f16 = load_opt("oxide_decode_attn_batch_f16");
+        let cu_function_batch_e4m3 = load_opt("oxide_decode_attn_batch_e4m3");
 
-        eprintln!("[oxide] loaded decode-attn kernel (PTX {} bytes, kpar={}, batch={}, splitk={}, f16={}, e4m3={})",
-            PTX.len(), cu_function_kpar.is_some(), cu_function_batch.is_some(), cu_function_splitk.is_some(), cu_function_f16.is_some(), cu_function_e4m3.is_some());
-        Ok(Self { cu_module, cu_function, cu_function_kpar, cu_function_batch, cu_function_splitk, cu_function_combine, cu_function_f16, cu_function_kpar_f16, cu_function_splitk_f16, cu_function_e4m3, cu_function_kpar_e4m3, stream })
+        eprintln!("[oxide] loaded decode-attn kernel (PTX {} bytes, kpar={}, batch={}, batch_f16={}, batch_e4m3={}, splitk={}, f16={}, e4m3={})",
+            PTX.len(), cu_function_kpar.is_some(), cu_function_batch.is_some(), cu_function_batch_f16.is_some(), cu_function_batch_e4m3.is_some(), cu_function_splitk.is_some(), cu_function_f16.is_some(), cu_function_e4m3.is_some());
+        Ok(Self { cu_module, cu_function, cu_function_kpar, cu_function_batch, cu_function_splitk, cu_function_combine, cu_function_f16, cu_function_kpar_f16, cu_function_splitk_f16, cu_function_e4m3, cu_function_kpar_e4m3, cu_function_batch_f16, cu_function_batch_e4m3, stream })
     }
 
     /// Run decode attention with kv_len read from a device tensor at execution time.
@@ -587,12 +593,173 @@ impl OxideDecodeAttn {
     /// Whether the batch variant is available.
     pub fn has_batch(&self) -> bool { self.cu_function_batch.is_some() }
 
+    /// Whether the f16 batch twin is available.
+    pub fn has_batch_f16(&self) -> bool { self.cu_function_batch_f16.is_some() }
+
+    /// Whether the e4m3 batch twin is available.
+    pub fn has_batch_e4m3(&self) -> bool { self.cu_function_batch_e4m3.is_some() }
+
+    /// Shared batch launch core: grid (n_heads, m) -- one block per
+    /// (request, head) pair running the KPAR warp structure (8 warps).
+    /// All three KV-dtype kernels share this ABI and launch config.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_batch_on(
+        &self,
+        f:         cuda_core::sys::CUfunction,
+        out:       &Arc<Tensor<f32>>,  // [m * n_heads * head_dim]
+        q:         &Arc<Tensor<f32>>,  // [m * n_heads * head_dim]
+        k_ptrs_dev: u64,               // device array [m] u64 K run bases
+        v_ptrs_dev: u64,               // device array [m] u64 V run bases
+        kv_lens_dev: u64,              // device array [m] i32 kv_lens
+        m:          usize,
+        n_heads:    usize,
+        n_kv_heads: usize,
+        head_dim:   usize,
+        scale:      f32,
+    ) -> Result<()> {
+        let kv_stride = (n_kv_heads * head_dim) as u32;
+
+        let mut out_ptr  = out.device_pointer().cu_deviceptr() as u64;
+        let mut q_ptr    = q.device_pointer().cu_deviceptr() as u64;
+        let mut kp       = k_ptrs_dev;
+        let mut vp       = v_ptrs_dev;
+        let mut kvlp     = kv_lens_dev;
+        let mut bs       = m as u32;
+        let mut nh       = n_heads as u32;
+        let mut nkv      = n_kv_heads as u32;
+        let mut hd       = head_dim as u32;
+        let mut kv_str   = kv_stride;
+        let mut sc       = scale;
+
+        let mut params: [*mut std::ffi::c_void; 11] = [
+            &mut out_ptr as *mut _ as *mut _,
+            &mut q_ptr   as *mut _ as *mut _,
+            &mut kp      as *mut _ as *mut _,
+            &mut vp      as *mut _ as *mut _,
+            &mut kvlp    as *mut _ as *mut _,
+            &mut bs      as *mut _ as *mut _,
+            &mut nh      as *mut _ as *mut _,
+            &mut nkv     as *mut _ as *mut _,
+            &mut hd      as *mut _ as *mut _,
+            &mut kv_str  as *mut _ as *mut _,
+            &mut sc      as *mut _ as *mut _,
+        ];
+
+        // kpar warp structure: smem (head_dim*(W+1) + 2*W) * 4 bytes.
+        let w = WARPS_PER_BLOCK_KPAR as usize;
+        let shared_bytes = ((head_dim * (w + 1) + 2 * w) * 4) as u32;
+        let block_dim = WARPS_PER_BLOCK_KPAR * 32;
+
+        let rc = unsafe {
+            cuda_core::sys::cuLaunchKernel(
+                f,
+                n_heads as u32, m as u32, 1,
+                block_dim, 1, 1,
+                shared_bytes,
+                self.stream.cu_stream(),
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "OxideDecodeAttn::launch_batch_on cuLaunchKernel failed: {rc}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Batched decode attention over per-request POOLED KV runs, f32 pool:
+    /// one kernel launch per layer for the whole batch (the no-graph ragged
+    /// path's replacement for m per-request kpar launches).
+    ///
+    /// `k_ptrs_dev`/`v_ptrs_dev` are device arrays of [m] u64 run base
+    /// addresses and `kv_lens_dev` a device array of [m] i32 kv_lens --
+    /// all uploaded by the caller on the SAME stream before this call
+    /// (main-stream issue ordering; see the kv_len H2D race notes in
+    /// cutile_gpu_forward).  Requires [`Self::has_batch`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch_d2d_ptrs(
+        &self,
+        out:         &Arc<Tensor<f32>>,  // [m * n_heads * head_dim]
+        q:           &Arc<Tensor<f32>>,  // [m * n_heads * head_dim]
+        k_ptrs_dev:  u64,
+        v_ptrs_dev:  u64,
+        kv_lens_dev: u64,
+        m:           usize,
+        n_heads:     usize,
+        n_kv_heads:  usize,
+        head_dim:    usize,
+        scale:       f32,
+    ) -> Result<()> {
+        let f = self.cu_function_batch.ok_or_else(|| {
+            KernelError::InvalidConfig(
+                "oxide_decode_attn_batch not available in this PTX (rebuild \
+                 tools/oxide-decode-attn)"
+                    .into(),
+            )
+        })?;
+        self.launch_batch_on(f, out, q, k_ptrs_dev, v_ptrs_dev, kv_lens_dev, m, n_heads, n_kv_heads, head_dim, scale)
+    }
+
+    /// [`Self::forward_batch_d2d_ptrs`] for an f16 KV pool (K/V runs hold
+    /// f16 bits).  Requires [`Self::has_batch_f16`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch_d2d_ptrs_f16(
+        &self,
+        out:         &Arc<Tensor<f32>>,
+        q:           &Arc<Tensor<f32>>,
+        k_ptrs_dev:  u64,
+        v_ptrs_dev:  u64,
+        kv_lens_dev: u64,
+        m:           usize,
+        n_heads:     usize,
+        n_kv_heads:  usize,
+        head_dim:    usize,
+        scale:       f32,
+    ) -> Result<()> {
+        let f = self.cu_function_batch_f16.ok_or_else(|| {
+            KernelError::InvalidConfig(
+                "oxide_decode_attn_batch_f16 not available in this PTX (rebuild \
+                 tools/oxide-decode-attn)"
+                    .into(),
+            )
+        })?;
+        self.launch_batch_on(f, out, q, k_ptrs_dev, v_ptrs_dev, kv_lens_dev, m, n_heads, n_kv_heads, head_dim, scale)
+    }
+
+    /// [`Self::forward_batch_d2d_ptrs`] for an e4m3 KV pool (K/V runs hold
+    /// e4m3 bits).  Requires [`Self::has_batch_e4m3`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch_d2d_ptrs_e4m3(
+        &self,
+        out:         &Arc<Tensor<f32>>,
+        q:           &Arc<Tensor<f32>>,
+        k_ptrs_dev:  u64,
+        v_ptrs_dev:  u64,
+        kv_lens_dev: u64,
+        m:           usize,
+        n_heads:     usize,
+        n_kv_heads:  usize,
+        head_dim:    usize,
+        scale:       f32,
+    ) -> Result<()> {
+        let f = self.cu_function_batch_e4m3.ok_or_else(|| {
+            KernelError::InvalidConfig(
+                "oxide_decode_attn_batch_e4m3 not available in this PTX (rebuild \
+                 tools/oxide-decode-attn)"
+                    .into(),
+            )
+        })?;
+        self.launch_batch_on(f, out, q, k_ptrs_dev, v_ptrs_dev, kv_lens_dev, m, n_heads, n_kv_heads, head_dim, scale)
+    }
+
     /// Batch decode attention for CUDA graph capture (pre-allocated device arrays).
     ///
-    /// Unlike `forward_batch_d2d`, does NOT call cuMemAllocAsync.
-    /// All device arrays must be pre-allocated with stable addresses.
-    /// `kv_lens_dev` is updated H->D BEFORE each graph launch by the caller;
-    /// `k_ptrs_dev` and `v_ptrs_dev` are stable (baked in at graph capture).
+    /// Unlike the `_ptrs` family this bakes the device-array POINTERS into
+    /// the captured graph; the arrays' contents (per-request run bases and
+    /// kv_lens) are updated H->D by the caller between replays.  f32 pools
+    /// only (the batch graph path is gated on kv_f32).
     pub fn forward_batch_graph_d2d(
         &self,
         out:         &Arc<Tensor<f32>>,  // [M * n_heads * head_dim]
@@ -641,15 +808,18 @@ impl OxideDecodeAttn {
             &mut sc      as *mut _ as *mut _,
         ];
 
-        let shared_bytes = (2 * head_dim * 4) as u32;
-        let grid_x = (m * n_heads) as u32;
+        // kpar warp structure: smem (head_dim*(W+1) + 2*W) * 4 bytes,
+        // grid (n_heads, m) -- one block per (request, head) pair.
+        let w = WARPS_PER_BLOCK_KPAR as usize;
+        let shared_bytes = ((head_dim * (w + 1) + 2 * w) * 4) as u32;
+        let block_dim = WARPS_PER_BLOCK_KPAR * 32;
         let stream = self.stream.cu_stream();
 
         let rc = unsafe {
             cuda_core::sys::cuLaunchKernel(
                 f,
-                grid_x, 1, 1,
-                32, 1, 1,
+                n_heads as u32, m as u32, 1,
+                block_dim, 1, 1,
                 shared_bytes,
                 stream,
                 params.as_mut_ptr(),
@@ -659,138 +829,6 @@ impl OxideDecodeAttn {
         if rc != 0 {
             return Err(KernelError::InvalidConfig(format!(
                 "OxideDecodeAttn::forward_batch_graph_d2d cuLaunchKernel failed: {rc}"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Batched decode attention: one block per (request, head) pair.
-    ///
-    /// `k_cache_ptrs` and `v_cache_ptrs` are CUdeviceptr values (device pointers
-    /// to each request's KV cache) stored in host Vecs -- uploaded to device as a
-    /// small array before the kernel launch.
-    pub fn forward_batch_d2d(
-        &self,
-        out:          &Arc<Tensor<f32>>,   // [M * n_heads * head_dim]
-        q:            &Arc<Tensor<f32>>,   // [M * n_heads * head_dim]
-        k_cache_ptrs: &[u64],              // [M] CUdeviceptr per request
-        v_cache_ptrs: &[u64],              // [M] CUdeviceptr per request
-        kv_lens:      &[i32],              // [M] current kv_len per request
-        n_heads:      usize,
-        n_kv_heads:   usize,
-        head_dim:     usize,
-        scale:        f32,
-    ) -> Result<()> {
-        let f = match self.cu_function_batch {
-            Some(f) => f,
-            None => return Err(KernelError::InvalidConfig(
-                "oxide_decode_attn_batch not available in this PTX".into()
-            )),
-        };
-        let batch_size = kv_lens.len();
-
-        // Upload pointer arrays to device (tiny H->D, ~8 x batch_size bytes each).
-        let stream = self.stream.cu_stream();
-        let k_ptrs_dev = unsafe {
-            let mut dev_ptr: u64 = 0;
-            cuda_core::sys::cuMemAllocAsync(
-                &mut dev_ptr as *mut u64,
-                (batch_size * 8) as usize,
-                stream,
-            );
-            cuda_core::sys::cuMemcpyHtoDAsync_v2(
-                dev_ptr,
-                k_cache_ptrs.as_ptr() as *const std::ffi::c_void,
-                batch_size * 8,
-                stream,
-            );
-            dev_ptr
-        };
-        let v_ptrs_dev = unsafe {
-            let mut dev_ptr: u64 = 0;
-            cuda_core::sys::cuMemAllocAsync(
-                &mut dev_ptr as *mut u64,
-                (batch_size * 8) as usize,
-                stream,
-            );
-            cuda_core::sys::cuMemcpyHtoDAsync_v2(
-                dev_ptr,
-                v_cache_ptrs.as_ptr() as *const std::ffi::c_void,
-                batch_size * 8,
-                stream,
-            );
-            dev_ptr
-        };
-        let kv_lens_dev = unsafe {
-            let mut dev_ptr: u64 = 0;
-            cuda_core::sys::cuMemAllocAsync(
-                &mut dev_ptr as *mut u64,
-                (batch_size * 4) as usize,
-                stream,
-            );
-            cuda_core::sys::cuMemcpyHtoDAsync_v2(
-                dev_ptr,
-                kv_lens.as_ptr() as *const std::ffi::c_void,
-                batch_size * 4,
-                stream,
-            );
-            dev_ptr
-        };
-
-        let kv_stride = (n_kv_heads * head_dim) as u32;
-        let heads_per_group = (n_heads / n_kv_heads) as u32;
-
-        let mut out_ptr   = out.device_pointer().cu_deviceptr() as u64;
-        let mut q_ptr     = q.device_pointer().cu_deviceptr() as u64;
-        let mut kp        = k_ptrs_dev;
-        let mut vp        = v_ptrs_dev;
-        let mut kvlp      = kv_lens_dev;
-        let mut bs        = batch_size as u32;
-        let mut nh        = n_heads as u32;
-        let mut nkv       = n_kv_heads as u32;
-        let mut hd        = head_dim as u32;
-        let mut kv_str    = kv_stride;
-        let mut sc        = scale;
-
-        let mut params: [*mut std::ffi::c_void; 11] = [
-            &mut out_ptr as *mut _ as *mut _,
-            &mut q_ptr   as *mut _ as *mut _,
-            &mut kp      as *mut _ as *mut _,
-            &mut vp      as *mut _ as *mut _,
-            &mut kvlp    as *mut _ as *mut _,
-            &mut bs      as *mut _ as *mut _,
-            &mut nh      as *mut _ as *mut _,
-            &mut nkv     as *mut _ as *mut _,
-            &mut hd      as *mut _ as *mut _,
-            &mut kv_str  as *mut _ as *mut _,
-            &mut sc      as *mut _ as *mut _,
-        ];
-
-        let shared_bytes = (2 * head_dim * 4) as u32;
-        let grid_x = (batch_size * n_heads) as u32;
-
-        let rc = unsafe {
-            cuda_core::sys::cuLaunchKernel(
-                f,
-                grid_x, 1, 1,
-                32, 1, 1,
-                shared_bytes,
-                stream,
-                params.as_mut_ptr(),
-                std::ptr::null_mut(),
-            )
-        };
-
-        // Free temp device allocations asynchronously.
-        unsafe {
-            cuda_core::sys::cuMemFreeAsync(k_ptrs_dev, stream);
-            cuda_core::sys::cuMemFreeAsync(v_ptrs_dev, stream);
-            cuda_core::sys::cuMemFreeAsync(kv_lens_dev, stream);
-        }
-
-        if rc != 0 {
-            return Err(KernelError::InvalidConfig(format!(
-                "OxideDecodeAttn::forward_batch_d2d cuLaunchKernel failed: {rc}"
             )));
         }
         Ok(())

@@ -1163,6 +1163,405 @@ mod kernels {
         }
     }
 
+    // ------------------------------------------------------------------
+    // BATCH twins: one block per (request, head) pair, grid (n_heads, m).
+    // Each block reads its request's K/V base address from a device
+    // u64 array and its kv_len from a device i32 array (uploaded once
+    // per step per layer by the host), and its Q row from the
+    // [m * n_heads * head_dim] batch Q tensor.  The per-block math is
+    // the KPAR kernel's online-softmax warp structure verbatim, so a
+    // batch launch is bit-identical to m per-request KPAR launches on
+    // the same data (composition invariance).  Each block touches only
+    // its own request's K/V -- no cross-request reads or writes.
+    // ------------------------------------------------------------------
+
+    #[kernel]
+    pub unsafe fn oxide_decode_attn_batch(
+        out:     *mut f32,          // [m * n_heads * head_dim]
+        q:       *const f32,        // [m * n_heads * head_dim]
+        k_ptrs:  *const u64,        // [m] device array: per-request K run base
+        v_ptrs:  *const u64,        // [m] device array: per-request V run base
+        kv_lens: *const i32,        // [m] device array: per-request kv_len
+        _m:      u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        kv_stride: u32,             // n_kv_heads * head_dim
+        scale:   f32,
+    ) {
+        let h       = thread::blockIdx_x();
+        let r       = thread::blockIdx_y();
+        let tid     = thread::threadIdx_x();
+        let warp_id = tid / 32;
+        let lane    = tid % 32;
+
+        let kv_len = *kv_lens.add(r as usize);
+        if kv_len <= 0 { return; }
+
+        let k_cache = *k_ptrs.add(r as usize) as *const f32;
+        let v_cache = *v_ptrs.add(r as usize) as *const f32;
+
+        let kv_h      = h / (n_heads / n_kv_heads);
+        let ln2: f32  = 0.693_147_18_f32;
+        let scale_log2 = scale / ln2;
+
+        let smem: *mut f32 = DynamicSharedArray::<f32>::get();
+        let w = WARPS_PER_BLOCK_KPAR;
+
+        // Q staging: smem[0..head_dim] -- row r's head h.
+        let q_base = (r * n_heads + h) * head_dim;
+        let mut i = tid;
+        while i < head_dim {
+            *smem.add(i as usize) = *q.add((q_base + i) as usize);
+            i += BLOCK_DIM_KPAR;
+        }
+        let acc_base = (head_dim + 2 * w + warp_id * head_dim) as usize;
+        let mut ai = lane;
+        while ai < head_dim {
+            *smem.add(acc_base + ai as usize) = 0.0_f32;
+            ai += 32;
+        }
+        thread::sync_threads();
+
+        let mut m_local: f32 = f32::NEG_INFINITY;
+        let mut l_local: f32 = 0.0_f32;
+
+        let mut t = warp_id as i32;
+        while t < kv_len {
+            let kv_base = (t as u32 * kv_stride + kv_h * head_dim) as usize;
+
+            let mut qk: f32 = 0.0_f32;
+            let mut di = lane;
+            while di < head_dim {
+                qk += *smem.add(di as usize) * *k_cache.add(kv_base + di as usize);
+                di += 32;
+            }
+            qk = warp::reduce_sum_f32(qk);
+
+            let score = qk * scale_log2;
+            let m_new  = if score > m_local { score } else { m_local };
+            let alpha: f32 = float::ex2_approx_f32(m_local - m_new);
+            let p:     f32 = float::ex2_approx_f32(score - m_new);
+
+            l_local = l_local * alpha + p;
+
+            let mut vi = lane;
+            while vi < head_dim {
+                let v_val = *v_cache.add(kv_base + vi as usize);
+                let old   = *smem.add(acc_base + vi as usize);
+                *smem.add(acc_base + vi as usize) = old * alpha + v_val * p;
+                vi += 32;
+            }
+            m_local = m_new;
+            t += WARPS_PER_BLOCK_KPAR as i32;
+        }
+
+        if lane == 0 {
+            *smem.add((head_dim + warp_id) as usize) = m_local;
+            *smem.add((head_dim + w + warp_id) as usize) = l_local;
+        }
+        thread::sync_threads();
+
+        let mut m_global: f32 = f32::NEG_INFINITY;
+        let mut ww = 0u32;
+        while ww < w {
+            let mw = *smem.add((head_dim + ww) as usize);
+            if mw > m_global { m_global = mw; }
+            ww += 1;
+        }
+
+        let alpha_w: f32 = float::ex2_approx_f32(m_local - m_global);
+        let mut di = lane;
+        while di < head_dim {
+            let a = *smem.add(acc_base + di as usize);
+            *smem.add(acc_base + di as usize) = a * alpha_w;
+            di += 32;
+        }
+        thread::sync_threads();
+
+        if warp_id == 0 {
+            let mut l_global: f32 = 0.0_f32;
+            let mut ww = 0u32;
+            while ww < w {
+                let mw = *smem.add((head_dim + ww) as usize);
+                let lw = *smem.add((head_dim + w + ww) as usize);
+                l_global += float::ex2_approx_f32(mw - m_global) * lw;
+                ww += 1;
+            }
+
+            let out_base = (r * n_heads + h) * head_dim;
+            let mut oi = lane;
+            while oi < head_dim {
+                let mut total: f32 = 0.0_f32;
+                let mut ww = 0u32;
+                while ww < w {
+                    total += *smem.add((head_dim + 2 * w + ww * head_dim + oi) as usize);
+                    ww += 1;
+                }
+                *out.add((out_base + oi) as usize) = total / l_global;
+                oi += 32;
+            }
+        }
+    }
+
+    /// f16 KV-pool batch twin: K/V caches hold f16 bits (u16).
+    #[kernel]
+    pub unsafe fn oxide_decode_attn_batch_f16(
+        out:     *mut f32,
+        q:       *const f32,
+        k_ptrs:  *const u64,
+        v_ptrs:  *const u64,
+        kv_lens: *const i32,
+        _m:      u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        kv_stride: u32,
+        scale:   f32,
+    ) {
+        let h       = thread::blockIdx_x();
+        let r       = thread::blockIdx_y();
+        let tid     = thread::threadIdx_x();
+        let warp_id = tid / 32;
+        let lane    = tid % 32;
+
+        let kv_len = *kv_lens.add(r as usize);
+        if kv_len <= 0 { return; }
+
+        let k_cache = *k_ptrs.add(r as usize) as *const u16;
+        let v_cache = *v_ptrs.add(r as usize) as *const u16;
+
+        let kv_h      = h / (n_heads / n_kv_heads);
+        let ln2: f32  = 0.693_147_18_f32;
+        let scale_log2 = scale / ln2;
+
+        let smem: *mut f32 = DynamicSharedArray::<f32>::get();
+        let w = WARPS_PER_BLOCK_KPAR;
+
+        let q_base = (r * n_heads + h) * head_dim;
+        let mut i = tid;
+        while i < head_dim {
+            *smem.add(i as usize) = *q.add((q_base + i) as usize);
+            i += BLOCK_DIM_KPAR;
+        }
+        let acc_base = (head_dim + 2 * w + warp_id * head_dim) as usize;
+        let mut ai = lane;
+        while ai < head_dim {
+            *smem.add(acc_base + ai as usize) = 0.0_f32;
+            ai += 32;
+        }
+        thread::sync_threads();
+
+        let mut m_local: f32 = f32::NEG_INFINITY;
+        let mut l_local: f32 = 0.0_f32;
+
+        let mut t = warp_id as i32;
+        while t < kv_len {
+            let kv_base = (t as u32 * kv_stride + kv_h * head_dim) as usize;
+
+            let mut qk: f32 = 0.0_f32;
+            let mut di = lane;
+            while di < head_dim {
+                qk += *smem.add(di as usize) * f16_bits_to_f32(*k_cache.add(kv_base + di as usize));
+                di += 32;
+            }
+            qk = warp::reduce_sum_f32(qk);
+
+            let score = qk * scale_log2;
+            let m_new  = if score > m_local { score } else { m_local };
+            let alpha: f32 = float::ex2_approx_f32(m_local - m_new);
+            let p:     f32 = float::ex2_approx_f32(score - m_new);
+
+            l_local = l_local * alpha + p;
+
+            let mut vi = lane;
+            while vi < head_dim {
+                let v_val = f16_bits_to_f32(*v_cache.add(kv_base + vi as usize));
+                let old   = *smem.add(acc_base + vi as usize);
+                *smem.add(acc_base + vi as usize) = old * alpha + v_val * p;
+                vi += 32;
+            }
+            m_local = m_new;
+            t += WARPS_PER_BLOCK_KPAR as i32;
+        }
+
+        if lane == 0 {
+            *smem.add((head_dim + warp_id) as usize) = m_local;
+            *smem.add((head_dim + w + warp_id) as usize) = l_local;
+        }
+        thread::sync_threads();
+
+        let mut m_global: f32 = f32::NEG_INFINITY;
+        let mut ww = 0u32;
+        while ww < w {
+            let mw = *smem.add((head_dim + ww) as usize);
+            if mw > m_global { m_global = mw; }
+            ww += 1;
+        }
+
+        let alpha_w: f32 = float::ex2_approx_f32(m_local - m_global);
+        let mut di = lane;
+        while di < head_dim {
+            let a = *smem.add(acc_base + di as usize);
+            *smem.add(acc_base + di as usize) = a * alpha_w;
+            di += 32;
+        }
+        thread::sync_threads();
+
+        if warp_id == 0 {
+            let mut l_global: f32 = 0.0_f32;
+            let mut ww = 0u32;
+            while ww < w {
+                let mw = *smem.add((head_dim + ww) as usize);
+                let lw = *smem.add((head_dim + w + ww) as usize);
+                l_global += float::ex2_approx_f32(mw - m_global) * lw;
+                ww += 1;
+            }
+
+            let out_base = (r * n_heads + h) * head_dim;
+            let mut oi = lane;
+            while oi < head_dim {
+                let mut total: f32 = 0.0_f32;
+                let mut ww = 0u32;
+                while ww < w {
+                    total += *smem.add((head_dim + 2 * w + ww * head_dim + oi) as usize);
+                    ww += 1;
+                }
+                *out.add((out_base + oi) as usize) = total / l_global;
+                oi += 32;
+            }
+        }
+    }
+
+    /// e4m3 KV-pool batch twin: K/V caches hold e4m3 bits (u8).
+    #[kernel]
+    pub unsafe fn oxide_decode_attn_batch_e4m3(
+        out:     *mut f32,
+        q:       *const f32,
+        k_ptrs:  *const u64,
+        v_ptrs:  *const u64,
+        kv_lens: *const i32,
+        _m:      u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        kv_stride: u32,
+        scale:   f32,
+    ) {
+        let h       = thread::blockIdx_x();
+        let r       = thread::blockIdx_y();
+        let tid     = thread::threadIdx_x();
+        let warp_id = tid / 32;
+        let lane    = tid % 32;
+
+        let kv_len = *kv_lens.add(r as usize);
+        if kv_len <= 0 { return; }
+
+        let k_cache = *k_ptrs.add(r as usize) as *const u8;
+        let v_cache = *v_ptrs.add(r as usize) as *const u8;
+
+        let kv_h      = h / (n_heads / n_kv_heads);
+        let ln2: f32  = 0.693_147_18_f32;
+        let scale_log2 = scale / ln2;
+
+        let smem: *mut f32 = DynamicSharedArray::<f32>::get();
+        let w = WARPS_PER_BLOCK_KPAR;
+
+        let q_base = (r * n_heads + h) * head_dim;
+        let mut i = tid;
+        while i < head_dim {
+            *smem.add(i as usize) = *q.add((q_base + i) as usize);
+            i += BLOCK_DIM_KPAR;
+        }
+        let acc_base = (head_dim + 2 * w + warp_id * head_dim) as usize;
+        let mut ai = lane;
+        while ai < head_dim {
+            *smem.add(acc_base + ai as usize) = 0.0_f32;
+            ai += 32;
+        }
+        thread::sync_threads();
+
+        let mut m_local: f32 = f32::NEG_INFINITY;
+        let mut l_local: f32 = 0.0_f32;
+
+        let mut t = warp_id as i32;
+        while t < kv_len {
+            let kv_base = (t as u32 * kv_stride + kv_h * head_dim) as usize;
+
+            let mut qk: f32 = 0.0_f32;
+            let mut di = lane;
+            while di < head_dim {
+                qk += *smem.add(di as usize) * e4m3_bits_to_f32(*k_cache.add(kv_base + di as usize));
+                di += 32;
+            }
+            qk = warp::reduce_sum_f32(qk);
+
+            let score = qk * scale_log2;
+            let m_new  = if score > m_local { score } else { m_local };
+            let alpha: f32 = float::ex2_approx_f32(m_local - m_new);
+            let p:     f32 = float::ex2_approx_f32(score - m_new);
+
+            l_local = l_local * alpha + p;
+
+            let mut vi = lane;
+            while vi < head_dim {
+                let v_val = e4m3_bits_to_f32(*v_cache.add(kv_base + vi as usize));
+                let old   = *smem.add(acc_base + vi as usize);
+                *smem.add(acc_base + vi as usize) = old * alpha + v_val * p;
+                vi += 32;
+            }
+            m_local = m_new;
+            t += WARPS_PER_BLOCK_KPAR as i32;
+        }
+
+        if lane == 0 {
+            *smem.add((head_dim + warp_id) as usize) = m_local;
+            *smem.add((head_dim + w + warp_id) as usize) = l_local;
+        }
+        thread::sync_threads();
+
+        let mut m_global: f32 = f32::NEG_INFINITY;
+        let mut ww = 0u32;
+        while ww < w {
+            let mw = *smem.add((head_dim + ww) as usize);
+            if mw > m_global { m_global = mw; }
+            ww += 1;
+        }
+
+        let alpha_w: f32 = float::ex2_approx_f32(m_local - m_global);
+        let mut di = lane;
+        while di < head_dim {
+            let a = *smem.add(acc_base + di as usize);
+            *smem.add(acc_base + di as usize) = a * alpha_w;
+            di += 32;
+        }
+        thread::sync_threads();
+
+        if warp_id == 0 {
+            let mut l_global: f32 = 0.0_f32;
+            let mut ww = 0u32;
+            while ww < w {
+                let mw = *smem.add((head_dim + ww) as usize);
+                let lw = *smem.add((head_dim + w + ww) as usize);
+                l_global += float::ex2_approx_f32(mw - m_global) * lw;
+                ww += 1;
+            }
+
+            let out_base = (r * n_heads + h) * head_dim;
+            let mut oi = lane;
+            while oi < head_dim {
+                let mut total: f32 = 0.0_f32;
+                let mut ww = 0u32;
+                while ww < w {
+                    total += *smem.add((head_dim + 2 * w + ww * head_dim + oi) as usize);
+                    ww += 1;
+                }
+                *out.add((out_base + oi) as usize) = total / l_global;
+                oi += 32;
+            }
+        }
+    }
+
     #[kernel]
     pub unsafe fn oxide_decode_attn_splitk_e4m3(
         scratch:    *mut f32,
@@ -1318,6 +1717,14 @@ mod kernels {
 fn main() {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
     let stream = ctx.default_stream();
+
+    // Debug gate: TEMPURA_BATCH_ONLY=1 skips everything except the batch
+    // tests (bisecting an intermittent m=3 failure).
+    let batch_only = std::env::var("TEMPURA_BATCH_ONLY").is_ok();
+    if batch_only {
+        batch_tests(&ctx, stream.clone());
+        return;
+    }
 
     // Small test: n_heads=4, n_kv_heads=2, head_dim=8, kv_len=3
     let n_heads: usize = 4;
@@ -1790,6 +2197,365 @@ fn main() {
             out_dev.to_host_vec(&stream).unwrap()
         });
     }
+
+
+    
+#[allow(clippy::too_many_lines)]
+fn batch_tests(ctx: &std::sync::Arc<CudaContext>, stream: std::sync::Arc<cuda_core::Stream>) {
+    let n_heads: usize = 4;
+    let n_kv_heads: usize = 2;
+    let head_dim: usize = 8;
+    let heads_per_group = (n_heads / n_kv_heads) as u32;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let kv_max = 128usize;
+    let w = WARPS_PER_BLOCK_KPAR as usize;
+    let kpar_smem = ((head_dim * (w + 1) + 2 * w) * std::mem::size_of::<f32>()) as u32;
+    let kpar_cfg = LaunchConfig {
+        grid_dim:  (n_heads as u32, 1, 1),
+        block_dim: (BLOCK_DIM_KPAR, 1, 1),
+        shared_mem_bytes: kpar_smem,
+    };
+    let f32_to_f16_bits = |x: f32| -> u16 {
+        let b = x.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let exp = ((b >> 23) & 0xFF) as i32;
+        let man = b & 0x7F_FFFF;
+        if exp == 0xFF {
+            return sign | 0x7C00;
+        }
+        let e2 = exp - 127 + 15;
+        if e2 >= 0x1F {
+            return sign | 0x7C00;
+        }
+        if e2 <= 0 {
+            return sign;
+        }
+        sign | ((e2 as u16) << 10) | ((man >> 13) as u16)
+    };
+    let module = kernels::load(ctx).expect("load oxide decode-attn module");
+    // -- Tests 10-12: BATCH twins (grid (n_heads, m)) ---------------------------
+    //
+    // Composition invariance contract: a batch launch must be BIT-IDENTICAL
+    // to m independent single-request kpar launches on the same per-request
+    // data (the engine's A/B gates compare batched vs solo sessions).  Each
+    // request gets a DIFFERENT kv_len and different random K/V so a block
+    // reading a neighbor's pointers or kv_len cannot pass.
+    let kv_lens_all: [usize; 6] = [3, 13, 100, 7, 1, 64];
+    let q_batch_rng: Vec<f32> = (0..6 * n_heads * head_dim)
+        .map(|i| ((((i * 22695477 + 1) >> 16) as i32 % 21) - 10) as f32 * 0.07)
+        .collect();
+
+    let batch_cfg_for = |m: u32| LaunchConfig {
+        grid_dim:  (n_heads as u32, m, 1),
+        block_dim: (BLOCK_DIM_KPAR, 1, 1),
+        shared_mem_bytes: kpar_smem,
+    };
+
+    for &m in &[2usize, 3, 6] {
+        if std::env::var("TEMPURA_BATCH_M").is_ok() {
+            let only: usize = std::env::var("TEMPURA_BATCH_M").unwrap().parse().unwrap();
+            if m != only {
+                continue;
+            }
+        }
+        let kv_lens: Vec<i32> = kv_lens_all[..m].iter().map(|&l| l as i32).collect();
+        // Per-request K/V: distinct random data per request, each request's
+        // cache covering its own kv_len tokens of the shared kv_max buffer.
+        let k_req: Vec<Vec<f32>> = (0..m)
+            .map(|r| {
+                (0..kv_max * n_kv_heads * head_dim)
+                    .map(|i| {
+                        let seed = (i as i64 * 1103515245 + 12345 + r as i64 * 977) as i32;
+                        ((((seed >> 16) as i32) % 13) - 6) as f32 * 0.1
+                    })
+                    .collect()
+            })
+            .collect();
+        let v_req: Vec<Vec<f32>> = (0..m)
+            .map(|r| {
+                (0..kv_max * n_kv_heads * head_dim)
+                    .map(|i| {
+                        let x = (i as u32).wrapping_mul(2654435761).wrapping_add((r as u32 + 7) * 911);
+                        (((x >> 13) & 0xFF) as f32) / 255.0
+                    })
+                    .collect()
+            })
+            .collect();
+        let q_rows: Vec<Vec<f32>> = (0..m)
+            .map(|r| q_batch_rng[r * n_heads * head_dim..(r + 1) * n_heads * head_dim].to_vec())
+            .collect();
+        let q_batch: Vec<f32> = q_rows.iter().flatten().copied().collect();
+
+        // -- f32 batch vs per-row kpar: bit-identical --------------------------
+        {
+            let k_devs: Vec<_> = k_req
+                .iter()
+                .map(|k| DeviceBuffer::from_host(&stream, k).unwrap())
+                .collect();
+            let v_devs: Vec<_> = v_req
+                .iter()
+                .map(|v| DeviceBuffer::from_host(&stream, v).unwrap())
+                .collect();
+            let q_devs: Vec<_> = q_rows
+                .iter()
+                .map(|q| DeviceBuffer::from_host(&stream, q).unwrap())
+                .collect();
+            let q_batch_dev = DeviceBuffer::from_host(&stream, &q_batch).unwrap();
+            let k_ptrs: Vec<u64> = k_devs.iter().map(|k| k.cu_deviceptr() as u64).collect();
+            let v_ptrs: Vec<u64> = v_devs.iter().map(|v| v.cu_deviceptr() as u64).collect();
+            let kv_lens_dev = DeviceBuffer::from_host(&stream, &kv_lens).unwrap();
+            let k_ptrs_dev = DeviceBuffer::from_host(&stream, &k_ptrs).unwrap();
+            let v_ptrs_dev = DeviceBuffer::from_host(&stream, &v_ptrs).unwrap();
+
+            // Reference: per-row kpar launches.
+            let mut reference: Vec<f32> = Vec::with_capacity(m * n_heads * head_dim);
+            for r in 0..m {
+                let kv_dev = DeviceBuffer::from_host(&stream, &[kv_lens[r]]).unwrap();
+                let mut out_dev =
+                    DeviceBuffer::<f32>::zeroed(&stream, n_heads * head_dim).unwrap();
+                unsafe {
+                    module.oxide_decode_attn_kpar(
+                        stream.as_ref(),
+                        kpar_cfg,
+                        out_dev.cu_deviceptr() as *mut f32,
+                        q_devs[r].cu_deviceptr() as *const f32,
+                        k_devs[r].cu_deviceptr() as *const f32,
+                        v_devs[r].cu_deviceptr() as *const f32,
+                        kv_dev.cu_deviceptr() as *const i32,
+                        scale,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        heads_per_group,
+                    )
+                }
+                .expect("kpar reference launch");
+                reference.extend(out_dev.to_host_vec(&stream).unwrap());
+            }
+
+            let mut out_dev =
+                DeviceBuffer::<f32>::zeroed(&stream, m * n_heads * head_dim).unwrap();
+            unsafe {
+                module.oxide_decode_attn_batch(
+                    stream.as_ref(),
+                    batch_cfg_for(m as u32),
+                    out_dev.cu_deviceptr() as *mut f32,
+                    q_batch_dev.cu_deviceptr() as *const f32,
+                    k_ptrs_dev.cu_deviceptr() as *const u64,
+                    v_ptrs_dev.cu_deviceptr() as *const u64,
+                    kv_lens_dev.cu_deviceptr() as *const i32,
+                    m as u32,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    (n_kv_heads * head_dim) as u32,
+                    scale,
+                )
+            }
+            .expect("batch f32 launch");
+            let batch_out = out_dev.to_host_vec(&stream).unwrap();
+
+            let mismatch = reference
+                .iter()
+                .zip(batch_out.iter())
+                .enumerate()
+                .find(|(_, (a, b))| a.to_bits() != b.to_bits());
+            match mismatch {
+                None => println!(
+                    "oxide-decode-attn batch f32 (m={m}): PASSED bit-identical to per-row kpar"
+                ),
+                Some((idx, (a, b))) => {
+                    let row = idx / (n_heads * head_dim);
+                    eprintln!(
+                        "oxide-decode-attn batch f32 (m={m}): FAILED at idx={idx} row={row} (ref {a} vs batch {b})"
+                    );
+                    eprintln!("  ref  row{row} [0..8] = {:?}", &reference[row * n_heads * head_dim..(row * n_heads * head_dim + 8)]);
+                    eprintln!("  bat  row{row} [0..8] = {:?}", &batch_out[row * n_heads * head_dim..(row * n_heads * head_dim + 8)]);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // -- f16 batch twin vs per-row kpar f16: bit-identical ------------------
+        if std::env::var("TEMPURA_BATCH_SKIP_F16").is_ok() { continue; }
+        {
+            let to16 = |k: &Vec<f32>| -> Vec<u16> {
+                k.iter().map(|&x| f32_to_f16_bits(x)).collect::<Vec<u16>>()
+            };
+            let k_devs: Vec<_> = k_req.iter().map(|k| {
+                let b = to16(k);
+                DeviceBuffer::from_host(&stream, &b).unwrap()
+            }).collect();
+            let v_devs: Vec<_> = v_req.iter().map(|v| {
+                let b = to16(v);
+                DeviceBuffer::from_host(&stream, &b).unwrap()
+            }).collect();
+            let q_devs: Vec<_> = q_rows
+                .iter()
+                .map(|q| DeviceBuffer::from_host(&stream, q).unwrap())
+                .collect();
+            let q_batch_dev = DeviceBuffer::from_host(&stream, &q_batch).unwrap();
+            let k_ptrs: Vec<u64> = k_devs.iter().map(|k| k.cu_deviceptr() as u64).collect();
+            let v_ptrs: Vec<u64> = v_devs.iter().map(|v| v.cu_deviceptr() as u64).collect();
+            let kv_lens_dev = DeviceBuffer::from_host(&stream, &kv_lens).unwrap();
+            let k_ptrs_dev = DeviceBuffer::from_host(&stream, &k_ptrs).unwrap();
+            let v_ptrs_dev = DeviceBuffer::from_host(&stream, &v_ptrs).unwrap();
+
+            let mut reference: Vec<f32> = Vec::with_capacity(m * n_heads * head_dim);
+            for r in 0..m {
+                let kv_dev = DeviceBuffer::from_host(&stream, &[kv_lens[r]]).unwrap();
+                let mut out_dev =
+                    DeviceBuffer::<f32>::zeroed(&stream, n_heads * head_dim).unwrap();
+                unsafe {
+                    module.oxide_decode_attn_kpar_f16(
+                        stream.as_ref(),
+                        kpar_cfg,
+                        out_dev.cu_deviceptr() as *mut f32,
+                        q_devs[r].cu_deviceptr() as *const f32,
+                        k_devs[r].cu_deviceptr() as *const u16,
+                        v_devs[r].cu_deviceptr() as *const u16,
+                        kv_dev.cu_deviceptr() as *const i32,
+                        scale,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        heads_per_group,
+                    )
+                }
+                .expect("kpar f16 reference launch");
+                reference.extend(out_dev.to_host_vec(&stream).unwrap());
+            }
+
+            let mut out_dev =
+                DeviceBuffer::<f32>::zeroed(&stream, m * n_heads * head_dim).unwrap();
+            unsafe {
+                module.oxide_decode_attn_batch_f16(
+                    stream.as_ref(),
+                    batch_cfg_for(m as u32),
+                    out_dev.cu_deviceptr() as *mut f32,
+                    q_batch_dev.cu_deviceptr() as *const f32,
+                    k_ptrs_dev.cu_deviceptr() as *const u64,
+                    v_ptrs_dev.cu_deviceptr() as *const u64,
+                    kv_lens_dev.cu_deviceptr() as *const i32,
+                    m as u32,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    (n_kv_heads * head_dim) as u32,
+                    scale,
+                )
+            }
+            .expect("batch f16 launch");
+            let batch_out = out_dev.to_host_vec(&stream).unwrap();
+
+            let mismatch = reference
+                .iter()
+                .zip(batch_out.iter())
+                .find(|(a, b)| a.to_bits() != b.to_bits());
+            match mismatch {
+                None => println!(
+                    "oxide-decode-attn batch f16 (m={m}): PASSED bit-identical to per-row kpar"
+                ),
+                Some((a, b)) => {
+                    eprintln!(
+                        "oxide-decode-attn batch f16 (m={m}): FAILED (ref {a} vs batch {b})"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // -- e4m3 batch twin vs per-row kpar e4m3: bit-identical ----------------
+        if std::env::var("TEMPURA_BATCH_SKIP_E4M3").is_ok() { continue; }
+        {
+            let k_devs: Vec<_> = k_req
+                .iter()
+                .map(|k| {
+                    let b: Vec<u8> = k.iter().map(|&x| f32_to_e4m3_bits(x)).collect();
+                    DeviceBuffer::from_host(&stream, &b).unwrap()
+                })
+                .collect();
+            let v_devs: Vec<_> = v_req
+                .iter()
+                .map(|v| {
+                    let b: Vec<u8> = v.iter().map(|&x| f32_to_e4m3_bits(x)).collect();
+                    DeviceBuffer::from_host(&stream, &b).unwrap()
+                })
+                .collect();
+            let q_devs: Vec<_> = q_rows
+                .iter()
+                .map(|q| DeviceBuffer::from_host(&stream, q).unwrap())
+                .collect();
+            let q_batch_dev = DeviceBuffer::from_host(&stream, &q_batch).unwrap();
+            let k_ptrs: Vec<u64> = k_devs.iter().map(|k| k.cu_deviceptr() as u64).collect();
+            let v_ptrs: Vec<u64> = v_devs.iter().map(|v| v.cu_deviceptr() as u64).collect();
+            let kv_lens_dev = DeviceBuffer::from_host(&stream, &kv_lens).unwrap();
+            let k_ptrs_dev = DeviceBuffer::from_host(&stream, &k_ptrs).unwrap();
+            let v_ptrs_dev = DeviceBuffer::from_host(&stream, &v_ptrs).unwrap();
+
+            let mut reference: Vec<f32> = Vec::with_capacity(m * n_heads * head_dim);
+            for r in 0..m {
+                let kv_dev = DeviceBuffer::from_host(&stream, &[kv_lens[r]]).unwrap();
+                let mut out_dev =
+                    DeviceBuffer::<f32>::zeroed(&stream, n_heads * head_dim).unwrap();
+                unsafe {
+                    module.oxide_decode_attn_kpar_e4m3(
+                        stream.as_ref(),
+                        kpar_cfg,
+                        out_dev.cu_deviceptr() as *mut f32,
+                        q_devs[r].cu_deviceptr() as *const f32,
+                        k_devs[r].cu_deviceptr() as *const u8,
+                        v_devs[r].cu_deviceptr() as *const u8,
+                        kv_dev.cu_deviceptr() as *const i32,
+                        scale,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        heads_per_group,
+                    )
+                }
+                .expect("kpar e4m3 reference launch");
+                reference.extend(out_dev.to_host_vec(&stream).unwrap());
+            }
+
+            let mut out_dev =
+                DeviceBuffer::<f32>::zeroed(&stream, m * n_heads * head_dim).unwrap();
+            unsafe {
+                module.oxide_decode_attn_batch_e4m3(
+                    stream.as_ref(),
+                    batch_cfg_for(m as u32),
+                    out_dev.cu_deviceptr() as *mut f32,
+                    q_batch_dev.cu_deviceptr() as *const f32,
+                    k_ptrs_dev.cu_deviceptr() as *const u64,
+                    v_ptrs_dev.cu_deviceptr() as *const u64,
+                    kv_lens_dev.cu_deviceptr() as *const i32,
+                    m as u32,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    (n_kv_heads * head_dim) as u32,
+                    scale,
+                )
+            }
+            .expect("batch e4m3 launch");
+            let batch_out = out_dev.to_host_vec(&stream).unwrap();
+
+            let mismatch = reference
+                .iter()
+                .zip(batch_out.iter())
+                .find(|(a, b)| a.to_bits() != b.to_bits());
+            match mismatch {
+                None => println!(
+                    "oxide-decode-attn batch e4m3 (m={m}): PASSED bit-identical to per-row kpar"
+                ),
+                Some((a, b)) => {
+                    eprintln!(
+                        "oxide-decode-attn batch e4m3 (m={m}): FAILED (ref {a} vs batch {b})"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+}
 
     println!("oxide-decode-attn: all tests PASSED");
 }

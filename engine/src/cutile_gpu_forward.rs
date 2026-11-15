@@ -387,6 +387,19 @@ struct NoGraphBatchScratch {
     /// the add kernel's output never aliases its `a` input (the live hidden
     /// state); the sides alternate across the two adds per layer.
     hidden: std::collections::HashMap<usize, [Option<Arc<Tensor<f32>>>; 2]>,
+    /// Batch-attention device arrays, keyed m: [m] u64 K run bases, [m] u64
+    /// V run bases, [m] i32 kv_lens.  Uploaded per layer per step (async,
+    /// main stream) from the host staging vectors below; stable device
+    /// addresses for the life of the m-batch.
+    batch_k_ptrs: std::collections::HashMap<usize, Arc<Tensor<u64>>>,
+    batch_v_ptrs: std::collections::HashMap<usize, Arc<Tensor<u64>>>,
+    batch_kv_lens: std::collections::HashMap<usize, Arc<Tensor<i32>>>,
+    /// Host staging for the batch-attention array uploads (grow-only; a
+    /// pending pageable async copy needs a stable source address -- the
+    /// kv_len_stage lesson).
+    batch_k_stage: Vec<u64>,
+    batch_v_stage: Vec<u64>,
+    batch_kv_len_stage: Vec<i32>,
     /// GPU greedy-argmax packed outputs [2 * m] u32, keyed m (one packed
     /// (key<<32)|idx u64 per row; re-zeroed by cuMemsetD32Async per step).
     argmax_out: std::collections::HashMap<usize, Arc<Tensor<u32>>>,
@@ -10080,9 +10093,22 @@ impl CutileGpuModel {
                 q_rot_parts.push(q_rot_fresh.clone());
             }
 
-            // Batch flash attention: one kernel launch, M x n_heads blocks.
+            // Batch flash attention: one kernel launch, grid (n_heads, m).
             let attn_out_dev = if let Some(ref oda) = self.oxide_decode_attn {
-                if oda.has_batch() {
+                // Batch kernel dispatch: m >= 2 only (at m=1 the direct
+                // per-request launch is a wash), uniform KV dtype across the
+                // batch (pools never mix), and the dtype's batch twin present
+                // in the PTX.  Anything else keeps the per-request path.
+                let dtype = kv_caches[0].kv_dtype();
+                let dtype_uniform = kv_caches.iter().all(|kvc| kvc.kv_dtype() == dtype);
+                let batch_ok = m >= 2
+                    && dtype_uniform
+                    && match dtype {
+                        crate::cutile_kv_cache::KvDtype::F16 => oda.has_batch_f16(),
+                        crate::cutile_kv_cache::KvDtype::E4M3 => oda.has_batch_e4m3(),
+                        crate::cutile_kv_cache::KvDtype::F32 => oda.has_batch(),
+                    };
+                if batch_ok {
                     let attn_out = {
                         let mut ng = self.nograph.borrow_mut();
                         ng.attn_out
@@ -10141,11 +10167,109 @@ impl CutileGpuModel {
                         }
                     }
 
-                    oda.forward_batch_d2d(
-                        &attn_out, &q_batch, &k_ptrs, &v_ptrs, &kv_lens, n_heads, n_kv_heads,
-                        head_dim, scale,
-                    )
-                    .expect("oxide_decode_attn_batch failed");
+                    // Stable per-m device arrays for the pointer/kv_len
+                    // indirection, filled from grow-only host staging Vecs
+                    // (async pageable copies need a stable source address --
+                    // the kv_len_stage lesson).  Main-stream issue ordering
+                    // guarantees the uploads land before this layer's kernel
+                    // and after all prior kernels.
+                    let (k_ptrs_dev, v_ptrs_dev, kv_lens_dev) = {
+                        let mut ng = self.nograph.borrow_mut();
+                        let k_dev = ng
+                            .batch_k_ptrs
+                            .entry(m)
+                            .or_insert_with(|| {
+                                Arc::new(
+                                    cutile::api::zeros::<u64>(&[m])
+                                        .sync_on(stream)
+                                        .expect("batch k_ptrs alloc"),
+                                )
+                            })
+                            .clone();
+                        let v_dev = ng
+                            .batch_v_ptrs
+                            .entry(m)
+                            .or_insert_with(|| {
+                                Arc::new(
+                                    cutile::api::zeros::<u64>(&[m])
+                                        .sync_on(stream)
+                                        .expect("batch v_ptrs alloc"),
+                                )
+                            })
+                            .clone();
+                        let l_dev = ng
+                            .batch_kv_lens
+                            .entry(m)
+                            .or_insert_with(|| {
+                                Arc::new(
+                                    cutile::api::zeros::<i32>(&[m])
+                                        .sync_on(stream)
+                                        .expect("batch kv_lens alloc"),
+                                )
+                            })
+                            .clone();
+                        ng.batch_k_stage.clear();
+                        ng.batch_k_stage.extend_from_slice(&k_ptrs);
+                        ng.batch_v_stage.clear();
+                        ng.batch_v_stage.extend_from_slice(&v_ptrs);
+                        ng.batch_kv_len_stage.clear();
+                        ng.batch_kv_len_stage.extend_from_slice(&kv_lens);
+                        unsafe {
+                            cuda_core::memcpy_htod_async::<u64>(
+                                k_dev.device_pointer().cu_deviceptr(),
+                                ng.batch_k_stage.as_ptr(),
+                                m,
+                                stream,
+                            )
+                        }
+                        .expect("batch k_ptrs H2D");
+                        unsafe {
+                            cuda_core::memcpy_htod_async::<u64>(
+                                v_dev.device_pointer().cu_deviceptr(),
+                                ng.batch_v_stage.as_ptr(),
+                                m,
+                                stream,
+                            )
+                        }
+                        .expect("batch v_ptrs H2D");
+                        unsafe {
+                            cuda_core::memcpy_htod_async::<i32>(
+                                l_dev.device_pointer().cu_deviceptr(),
+                                ng.batch_kv_len_stage.as_ptr(),
+                                m,
+                                stream,
+                            )
+                        }
+                        .expect("batch kv_lens H2D");
+                        (
+                            k_dev.device_pointer().cu_deviceptr(),
+                            v_dev.device_pointer().cu_deviceptr(),
+                            l_dev.device_pointer().cu_deviceptr(),
+                        )
+                    };
+
+                    // The kernel writes every (r, h) block's output directly
+                    // into attn_out -- no per-request out_r buffers, no
+                    // scatter copies.  Per-request independent (each block
+                    // reads only its own request's K/V/kv_len) so batch
+                    // composition invariance holds; the per-block math is
+                    // the kpar kernel's verbatim, so output is bit-identical
+                    // to the per-request path.
+                    let attn_res = match dtype {
+                        crate::cutile_kv_cache::KvDtype::F16 => oda.forward_batch_d2d_ptrs_f16(
+                            &attn_out, &q_batch, k_ptrs_dev, v_ptrs_dev, kv_lens_dev, m,
+                            n_heads, n_kv_heads, head_dim, scale,
+                        ),
+                        crate::cutile_kv_cache::KvDtype::E4M3 => oda.forward_batch_d2d_ptrs_e4m3(
+                            &attn_out, &q_batch, k_ptrs_dev, v_ptrs_dev, kv_lens_dev, m,
+                            n_heads, n_kv_heads, head_dim, scale,
+                        ),
+                        crate::cutile_kv_cache::KvDtype::F32 => oda.forward_batch_d2d_ptrs(
+                            &attn_out, &q_batch, k_ptrs_dev, v_ptrs_dev, kv_lens_dev, m,
+                            n_heads, n_kv_heads, head_dim, scale,
+                        ),
+                    };
+                    attn_res.expect("oxide_decode_attn_batch failed");
                     attn_out
                 } else {
                     // Fallback: run single-request attention M times.
