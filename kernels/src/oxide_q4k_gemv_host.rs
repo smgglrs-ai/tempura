@@ -109,6 +109,12 @@ pub struct OxideQ4kGemv {
     /// computing the full K-dimension per tile. 100% SM utilisation regardless of N.
     cu_streamk_module:          Option<CUmodule>,
     cu_streamk:                 Option<CUfunction>,
+    /// Optional sm_120 M-row batch kpar8 GEMV (own hand-written PTX module).
+    /// Reads each weight block ONCE for all m rows; per-row math bit-identical
+    /// to the per-row kpar8 kernel (the no-graph ragged batch decode path's
+    /// Q4K projection kernel).
+    cu_sm120_kpar_batch_module: Option<CUmodule>,
+    cu_sm120_kpar_batch:        Option<CUfunction>,
     /// SM count stored at load time (from CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).
     sm_count:                   u32,
     /// Selected Q4K+Q8_1 kpar dispatch function: sm120 or dp4a_kpar8 (sm_80) fallback.
@@ -162,6 +168,11 @@ impl Drop for OxideQ4kGemv {
             }
         }
         if let Some(m) = self.cu_streamk_module {
+            if !m.is_null() {
+                let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
+            }
+        }
+        if let Some(m) = self.cu_sm120_kpar_batch_module {
             if !m.is_null() {
                 let _ = unsafe { cuda_core::sys::cuModuleUnload(m) };
             }
@@ -467,6 +478,47 @@ impl OxideQ4kGemv {
                 None
             };
 
+            // -- Load sm_120 M-row batch kpar8 PTX (own module) -------------------
+            // The kpar8 warp structure with an m-loop: weights read once per
+            // block for all m rows, per-row math bit-identical to the per-row
+            // kernel. Used by the no-graph ragged batch decode path.
+            let mut cu_kpar_batch_mod: Option<CUmodule> = None;
+            let cu_sm120_kpar_batch: Option<CUfunction> = if !sm120_disabled && caps.cc() >= q4k_gemv_v4_ptx::MIN_CC {
+                let ptx_cstr = CString::new(q4k_gemv_v4_ptx::PTX_BATCH).unwrap_or_default();
+                let mut kb_mod = std::mem::MaybeUninit::uninit();
+                let rc = unsafe {
+                    cuda_core::sys::cuModuleLoadData(
+                        kb_mod.as_mut_ptr(),
+                        ptx_cstr.as_ptr() as *const _,
+                    )
+                };
+                if rc == CUDA_SUCCESS {
+                    let kb_mod = unsafe { kb_mod.assume_init() };
+                    let entry = CString::new(q4k_gemv_v4_ptx::ENTRY_BATCH).unwrap_or_default();
+                    let mut kb_fn = std::mem::MaybeUninit::uninit();
+                    let rc2 = unsafe {
+                        cuda_core::sys::cuModuleGetFunction(kb_fn.as_mut_ptr(), kb_mod, entry.as_ptr())
+                    };
+                    if rc2 == CUDA_SUCCESS {
+                        eprintln!(
+                            "oxide-gemv-q4k: loaded sm_120 kpar8 BATCH PTX ({} bytes) -- weights read once for all m rows, per-row bit-identical to kpar8",
+                            q4k_gemv_v4_ptx::PTX_BATCH.len(),
+                        );
+                        cu_kpar_batch_mod = Some(kb_mod);
+                        Some(unsafe { kb_fn.assume_init() })
+                    } else {
+                        let _ = unsafe { cuda_core::sys::cuModuleUnload(kb_mod) };
+                        eprintln!("oxide-gemv-q4k: cuModuleGetFunction(kpar8_batch) failed (rc={rc2})");
+                        None
+                    }
+                } else {
+                    eprintln!("oxide-gemv-q4k: cuModuleLoadData(kpar8_batch PTX) failed (rc={rc})");
+                    None
+                }
+            } else {
+                None
+            };
+
             // -- Build KernelVariant table and select best kpar dispatch ---------
             // (select_best = max min_cc; ties resolve to the LAST pushed entry,
             // so the dual-block unroll wins over single-block kpar8 on sm_120.)
@@ -497,7 +549,7 @@ impl OxideQ4kGemv {
             let uses_sm120 = kpar_dispatch.as_ref().map(|v| v.min_cc >= 1200).unwrap_or(false);
 
             eprintln!(
-                "oxide-gemv-q4k: loaded (oxide PTX {} bytes, entry={}, q8={}, q8_dp4a_kpar4={}, q8_dp4a={}, q8_dp4a_raw={}, q8_dp4a_kpar8={}, sm120_dp4a_kpar8={}, kpar_dispatch={}, fused_silu={}, sm120_fused_silu={}, batch={}, sm120_batch={}, mma_batch={}, streamk={}, sm_count={})",
+                "oxide-gemv-q4k: loaded (oxide PTX {} bytes, entry={}, q8={}, q8_dp4a_kpar4={}, q8_dp4a={}, q8_dp4a_raw={}, q8_dp4a_kpar8={}, sm120_dp4a_kpar8={}, kpar_dispatch={}, fused_silu={}, sm120_fused_silu={}, batch={}, sm120_batch={}, mma_batch={}, streamk={}, kpar8_batch={}, sm_count={})",
                 OXIDE_Q4K_PTX.len(),
                 KERNEL_ENTRY,
                 cu_q8_gemv.is_some(),
@@ -513,6 +565,7 @@ impl OxideQ4kGemv {
                 cu_sm120_batch.is_some(),
                 cu_mma_batch.is_some(),
                 cu_streamk.is_some(),
+                cu_sm120_kpar_batch.is_some(),
                 caps.sm_count,
             );
             // dp4a_raw: raw GGUF format for the oxide sm_80 path -- benchmarked and DISABLED.
@@ -521,7 +574,7 @@ impl OxideQ4kGemv {
             // Q8_1 scratch) when uses_raw_gguf=true, so K/V weights can also be native.
             let uses_raw_gguf = uses_sm120;
             Some(Self {
-                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_module: cu_sm120_fused_mod, cu_sm120_fused_silu, cu_sm120_batch_module: cu_sm120_batch_mod, cu_sm120_batch, cu_mma_batch_module: cu_mma_batch_mod, cu_mma_batch, cu_streamk_module: cu_streamk_mod, cu_streamk, sm_count: caps.sm_count, kpar_dispatch, uses_raw_gguf, stream,
+                cu_module, cu_function, cu_q8_quantize, cu_q8_gemv, cu_q8_dp4a_kpar4, cu_q8_dp4a, cu_q8_dp4a_raw, cu_q8_dp4a_kpar8, cu_batch_gemv, cu_colocated, cu_smem, cu_fused_silu, cu_sm120_module, cu_sm120_dp4a_kpar8, cu_sm120_fused_module: cu_sm120_fused_mod, cu_sm120_fused_silu, cu_sm120_batch_module: cu_sm120_batch_mod, cu_sm120_batch, cu_mma_batch_module: cu_mma_batch_mod, cu_mma_batch, cu_streamk_module: cu_streamk_mod, cu_streamk, cu_sm120_kpar_batch_module: cu_kpar_batch_mod, cu_sm120_kpar_batch, sm_count: caps.sm_count, kpar_dispatch, uses_raw_gguf, stream,
                 q8_qs_scratch:      std::cell::RefCell::new(None),
                 q8_ds_scratch:      std::cell::RefCell::new(None),
                 q8_out_scratch:     std::cell::RefCell::new(None),
@@ -1264,23 +1317,49 @@ impl OxideQ4kGemv {
     }
 
     /// Returns true when the sm_120 batch GEMV kernel is loaded (static smem, Blackwell-safe).
+    /// DISABLED for graph dispatch (2026-11-16): the PTX is M=2-harcoded and
+    /// never numerically validated; with streamk/mma_batch also disabled
+    /// (nibble-layout bugs, see has_mma_batch), routing all-Q4K models
+    /// through it would panic at m != 2. Those models now take the no-graph
+    /// path (which has the bit-identical kpar8 batch kernel). Re-enable only
+    /// after validation + a general-M rewrite.
     pub fn has_sm120_batch(&self) -> bool {
-        self.cu_sm120_batch.is_some() && self.cu_q8_quantize.is_some()
+        false
     }
 
     /// Returns true when the sm_120 MMA batch GEMM kernel is loaded (INT8 tensor cores).
-    /// Currently disabled: the simple (N/8,1,1) grid has low SM occupancy vs dp4a.
-    /// Re-enable when stream-K variant (grid=SM_COUNT, fixup pass) is implemented.
+    /// DISABLED: bench-probe-q4k-batch (2026-11-16) showed this kernel and the
+    /// stream-K variant misparse the Q4K sub-block nibble/scale layout
+    /// (12-31% rel error vs the validated kpar8 GEMV on random data; they
+    /// pair weight nibbles with the wrong activation elements and use a
+    /// wrong dequant convention -- raw nibble, no -8 offset, no /32 scale).
+    /// Their outputs were only ever NaN/determinism checked, which cannot
+    /// catch this (the mxf4-gemv lesson). Do NOT dispatch until fixed and
+    /// probe-validated; the graph path's stream-K preference is dormant on
+    /// Q4_K_M (all its Q4K projections route to MXFP4).
     pub fn has_mma_batch(&self) -> bool {
         false
     }
 
     /// Returns true when the sm_120 stream-K batch GEMM kernel is loaded.
-    /// Currently disabled: without cp.async pipelining the sequential tile loop
-    /// stalls on DRAM latency, giving worse throughput than dp4a batch at k_blocks=16.
-    /// Re-enable when cp.async overlap (next-tile prefetch during current-tile mma) is added.
+    /// DISABLED (2026-11-16): bench-probe-q4k-batch showed this kernel (and
+    /// mma_batch) misparse the Q4K sub-block nibble/scale layout -- 12-31%
+    /// rel error vs the validated kpar8 GEMV on random data. It was only
+    /// ever NaN/determinism checked. Dormant on Q4_K_M (the graph path
+    /// routes its Q4K projections to MXFP4), but all-Q4K models must not
+    /// dispatch it. Do not re-enable until fixed and probe-validated; use
+    /// has_sm120_kpar_batch() (bit-identical batch kpar8) instead.
     pub fn has_streamk_batch(&self) -> bool {
-        self.cu_streamk.is_some() && self.cu_q8_quantize.is_some()
+        false
+    }
+
+    /// Returns true when the sm_120 M-row batch kpar8 kernel is loaded.
+    /// This is the CORRECT general-M batch kernel: per-row math is
+    /// bit-identical to the per-row kpar8 GEMV (unlike mma_batch/streamk,
+    /// which misparse the Q4K sub-block nibble layout -- see
+    /// bench-probe-q4k-batch: 12-31% rel error vs the kpar8 reference).
+    pub fn has_sm120_kpar_batch(&self) -> bool {
+        self.cu_sm120_kpar_batch.is_some() && self.cu_q8_quantize.is_some()
     }
 
     /// Batched Q4K+Q8_1 GEMV on sm_120: quantize M rows then launch grid=(N,M,1).
@@ -1618,6 +1697,129 @@ impl OxideQ4kGemv {
         Ok(())
     }
 
+    /// Row-offset variant of [`Self::forward_mma_batch_d2d_into`] for ragged
+    /// batches larger than the kernel's 16-row m16 tile capacity.
+    ///
+    /// Computes rows `[x_row, x_row + m)` of X into rows `[out_row, out_row + m)`
+    /// of OUT against the SAME packed weights. The kernel's per-row math is
+    /// independent of the row window (each output row depends only on its own
+    /// activation row -- activation loads are predicated on `d_row < m`), so
+    /// chunking leaves every row's numerics identical to a smaller batch: no
+    /// batch-composition dependence. `m` must be in 1..=16.
+    pub fn forward_mma_batch_d2d_rows(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        x_row: usize,
+        packed: &Arc<Tensor<u32>>,
+        out: &Arc<Tensor<f32>>,
+        out_row: usize,
+        m: usize,
+        n: usize,
+        k_blocks: usize,
+        x_qs: &Arc<Tensor<u32>>,
+        x_ds: &Arc<Tensor<u32>>,
+    ) -> Result<()> {
+        if m == 0 || m > 16 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_mma_batch_d2d_rows: m must be in 1..=16 (m16n8k32 tile); got {m}"
+            )));
+        }
+        let k = k_blocks * 256;
+        let row_bytes = k * 4;
+        let x_row_bytes = x_row * row_bytes;
+        let out_row_bytes = out_row * n * 4;
+        if x_row_bytes + m * row_bytes > x.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_mma_batch_d2d_rows: x slice [{x_row}, {}+{m}) x {k} exceeds \
+                 tensor ({} f32)",
+                x_row,
+                x.size()
+            )));
+        }
+        if out_row_bytes + m * n * 4 > out.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_mma_batch_d2d_rows: out slice [{out_row}, {}+{m}) x {n} \
+                 exceeds tensor ({} f32)",
+                out_row,
+                out.size()
+            )));
+        }
+
+        let mma_fn = match self.cu_mma_batch {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("mma_batch not loaded".into())),
+        };
+        let q8_quant_fn = match self.cu_q8_quantize {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
+        };
+
+        let k_total = m * k;
+        let k_q8_blocks_total = k_total.div_ceil(32);
+        let cu_stream = self.stream.cu_stream();
+
+        // Quantize the chunk's m*K activations in one call (async), offset to
+        // the chunk's first row.
+        {
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len: u64 = (k_total / 4) as u64;
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len: u64 = k_q8_blocks_total as u64;
+            let x_ptr: u64 = x.device_pointer().cu_deviceptr() + x_row_bytes as u64;
+            let x_len: u64 = x.size() as u64 - (x_row_bytes / 4) as u64;
+            let k_u32: u32 = k_total as u32;
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr as *const _ as *mut c_void,
+                &qs_len as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ds_len as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &x_len as *const _ as *mut c_void,
+                &k_u32 as *const _ as *mut c_void,
+            ];
+            let grid_x = k_q8_blocks_total.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            unsafe {
+                launch_kernel(q8_quant_fn, (grid_x, 1, 1), (BLOCK_DIM, 1, 1), 0, cu_stream, &mut params)
+            }.map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 mma_batch rows: {e}")))?;
+        }
+
+        // Launch MMA batch kernel: grid (ceil(n/8), 1, 1), block (warps*32, 1, 1).
+        {
+            let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ou_ptr: u64 = out.device_pointer().cu_deviceptr() + out_row_bytes as u64;
+            let n_u32: u32 = n as u32;
+            let kb_u32: u32 = k_blocks as u32;
+            let m_u32: u32 = m as u32;
+            let mut params: [*mut c_void; 7] = [
+                &wt_ptr as *const _ as *mut c_void,
+                &qs_ptr as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ou_ptr as *const _ as *mut c_void,
+                &n_u32 as *const _ as *mut c_void,
+                &kb_u32 as *const _ as *mut c_void,
+                &m_u32 as *const _ as *mut c_void,
+            ];
+            let grid_x = n_u32.div_ceil(8);
+            let warps = if k_blocks * 8 % 4 == 0 { 4u32 } else { 2u32 };
+            let block_dim = warps * 32;
+            unsafe {
+                launch_kernel(
+                    mma_fn,
+                    (grid_x, 1, 1),
+                    (block_dim, 1, 1),
+                    0,            // static smem in PTX
+                    cu_stream,
+                    &mut params,
+                )
+            }.map_err(|e| KernelError::InvalidConfig(format!("mma_batch q4k gemm rows: {e}")))?;
+        }
+
+        // No stream.synchronize() -- caller owns the sync.
+        Ok(())
+    }
+
     /// Stream-K batch GEMM: grid=(SM_COUNT,1,1), persistent blocks.
     ///
     /// Each SM gets a contiguous range of output column tiles and computes
@@ -1708,6 +1910,263 @@ impl OxideQ4kGemv {
                     &mut params,
                 )
             }.map_err(|e| KernelError::InvalidConfig(format!("streamk q4k gemm: {e}")))?;
+        }
+
+        // No stream.synchronize() -- caller owns the sync.
+        Ok(())
+    }
+
+    /// Row-offset variant of [`Self::forward_streamk_batch_d2d_into`] for
+    /// ragged batches larger than the kernel's 16-row capacity.
+    ///
+    /// Computes rows `[x_row, x_row + m)` of X into rows `[out_row, out_row + m)`
+    /// of OUT against the SAME packed weights. The kernel's per-row math is
+    /// independent of the row window (each output row depends only on its own
+    /// activation row; activation loads are predicated on `d_row < m`), so
+    /// chunking a batch of M > 16 rows into ceil(M/16) launches leaves every
+    /// row's numerics identical to a 16-row-or-fewer batch -- no
+    /// batch-composition dependence.
+    ///
+    /// `x_qs`/`x_ds` are scratch for the chunk's `m` rows (the quantize
+    /// kernel writes exactly `m * k` elements; `m` must be <= 16).
+    pub fn forward_streamk_batch_d2d_rows(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        x_row: usize,
+        packed: &Arc<Tensor<u32>>,
+        out: &Arc<Tensor<f32>>,
+        out_row: usize,
+        m: usize,
+        n: usize,
+        k_blocks: usize,
+        x_qs: &Arc<Tensor<u32>>,
+        x_ds: &Arc<Tensor<u32>>,
+    ) -> Result<()> {
+        if m == 0 || m > 16 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_streamk_batch_d2d_rows: m must be in 1..=16 (kernel has 16 \
+                 smem reduction rows); got {m}"
+            )));
+        }
+        let k = k_blocks * 256;
+        let row_bytes = k * 4;
+        let x_row_bytes = x_row * row_bytes;
+        let out_row_bytes = out_row * n * 4;
+        if x_row_bytes + m * row_bytes > x.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_streamk_batch_d2d_rows: x slice [{x_row}, {}+{m}) x {k} exceeds \
+                 tensor ({} f32)",
+                x_row,
+                x.size()
+            )));
+        }
+        if out_row_bytes + m * n * 4 > out.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_streamk_batch_d2d_rows: out slice [{out_row}, {}+{m}) x {n} \
+                 exceeds tensor ({} f32)",
+                out_row,
+                out.size()
+            )));
+        }
+
+        let sk_fn = match self.cu_streamk {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("streamk not loaded".into())),
+        };
+        let q8_quant_fn = match self.cu_q8_quantize {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
+        };
+
+        let k_total = m * k;
+        let k_q8_blocks_total = k_total.div_ceil(32);
+        let cu_stream = self.stream.cu_stream();
+        let sm_count = self.sm_count.max(1);
+
+        // Quantize the chunk's m*K activations in one call (async). Base
+        // pointers are offset to the chunk's first row.
+        {
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len: u64 = (k_total / 4) as u64;
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len: u64 = k_q8_blocks_total as u64;
+            let x_ptr: u64 = x.device_pointer().cu_deviceptr() + x_row_bytes as u64;
+            let x_len: u64 = x.size() as u64 - (x_row_bytes / 4) as u64;
+            let k_u32: u32 = k_total as u32;
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr as *const _ as *mut c_void,
+                &qs_len as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ds_len as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &x_len as *const _ as *mut c_void,
+                &k_u32 as *const _ as *mut c_void,
+            ];
+            let grid_x = k_q8_blocks_total.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            unsafe {
+                launch_kernel(q8_quant_fn, (grid_x, 1, 1), (BLOCK_DIM, 1, 1), 0, cu_stream, &mut params)
+            }.map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 streamk rows: {e}")))?;
+        }
+
+        // Launch stream-K kernel: grid=(SM_COUNT,1,1), block=(256,1,1) -- 8 warps.
+        {
+            let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ou_ptr: u64 = out.device_pointer().cu_deviceptr() + out_row_bytes as u64;
+            let n_u32: u32 = n as u32;
+            let kb_u32: u32 = k_blocks as u32;
+            let m_u32: u32 = m as u32;
+            let sm_u32: u32 = sm_count;
+            let mut params: [*mut c_void; 8] = [
+                &wt_ptr as *const _ as *mut c_void,
+                &qs_ptr as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ou_ptr as *const _ as *mut c_void,
+                &n_u32 as *const _ as *mut c_void,
+                &kb_u32 as *const _ as *mut c_void,
+                &m_u32 as *const _ as *mut c_void,
+                &sm_u32 as *const _ as *mut c_void,
+            ];
+            unsafe {
+                launch_kernel(
+                    sk_fn,
+                    (sm_count, 1, 1),
+                    (256, 1, 1),   // 8 warps
+                    0,             // static smem in PTX (5120 bytes)
+                    cu_stream,
+                    &mut params,
+                )
+            }.map_err(|e| KernelError::InvalidConfig(format!("streamk q4k gemm rows: {e}")))?;
+        }
+
+        // No stream.synchronize() -- caller owns the sync.
+        Ok(())
+    }
+
+    /// sm_120 M-row batch kpar8 GEMV (native GGUF Q4K) with row-window
+    /// offsets: computes rows `[x_row, x_row + m)` of X into rows
+    /// `[out_row, out_row + m)` of OUT against the SAME packed weights.
+    ///
+    /// The kernel reads each weight block ONCE for all m rows and is
+    /// BIT-IDENTICAL per row to the per-row kpar8 GEMV (see
+    /// [`q4k_gemv_v4_ptx::PTX_BATCH`]), so chunking a batch of M > 16 rows
+    /// into ceil(M/16) launches leaves every row's numerics unchanged -- no
+    /// batch-composition dependence. `m` must be in 1..=16 (smem rows).
+    ///
+    /// `x` is flat [m_total * k] f32 row-major (the window starts at
+    /// `x_row`); `packed` is native GGUF Q4K [n * k_blocks * 36 u32];
+    /// `x_qs`/`x_ds` are Q8_1 scratch for the window's m rows; `out` is
+    /// [m_total * n] f32 (rows at `out_row`).
+    pub fn forward_sm120_kpar_batch_d2d_rows(
+        &self,
+        x: &Arc<Tensor<f32>>,
+        x_row: usize,
+        packed: &Arc<Tensor<u32>>,
+        out: &Arc<Tensor<f32>>,
+        out_row: usize,
+        m: usize,
+        n: usize,
+        k_blocks: usize,
+        x_qs: &Arc<Tensor<u32>>,
+        x_ds: &Arc<Tensor<u32>>,
+    ) -> Result<()> {
+        if m == 0 || m > 16 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_sm120_kpar_batch_d2d_rows: m must be in 1..=16 (2048 B smem row \
+                 budget); got {m}"
+            )));
+        }
+        let k = k_blocks * 256;
+        let row_bytes = k * 4;
+        let x_row_bytes = x_row * row_bytes;
+        let out_row_bytes = out_row * n * 4;
+        if x_row_bytes + m * row_bytes > x.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_sm120_kpar_batch_d2d_rows: x slice [{x_row}, {}+{m}) x {k} exceeds \
+                 tensor ({} f32)",
+                x_row,
+                x.size()
+            )));
+        }
+        if out_row_bytes + m * n * 4 > out.size() * 4 {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_sm120_kpar_batch_d2d_rows: out slice [{out_row}, {}+{m}) x {n} \
+                 exceeds tensor ({} f32)",
+                out_row,
+                out.size()
+            )));
+        }
+
+        let batch_fn = match self.cu_sm120_kpar_batch {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("sm120 kpar8 batch not loaded".into())),
+        };
+        let q8_quant_fn = match self.cu_q8_quantize {
+            Some(f) => f,
+            None => return Err(KernelError::InvalidConfig("q8 quantize kernel not loaded".into())),
+        };
+
+        let k_total = m * k;
+        let k_q8_blocks_total = k_total.div_ceil(32);
+        let cu_stream = self.stream.cu_stream();
+
+        // Quantize the window's m*K activations in one call (async). The
+        // quantize kernel's per-32-element blocks never cross a row
+        // boundary (k is a multiple of 256), so the per-row Q8_1 values are
+        // identical to per-row quantization.
+        {
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let qs_len: u64 = (k_total / 4) as u64;
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ds_len: u64 = k_q8_blocks_total as u64;
+            let x_ptr: u64 = x.device_pointer().cu_deviceptr() + x_row_bytes as u64;
+            let x_len: u64 = x.size() as u64 - (x_row_bytes / 4) as u64;
+            let k_u32: u32 = k_total as u32;
+            let mut params: [*mut c_void; 7] = [
+                &qs_ptr as *const _ as *mut c_void,
+                &qs_len as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ds_len as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &x_len as *const _ as *mut c_void,
+                &k_u32 as *const _ as *mut c_void,
+            ];
+            let grid_x = k_q8_blocks_total.div_ceil(WARPS_PER_BLOCK as usize) as u32;
+            unsafe {
+                launch_kernel(q8_quant_fn, (grid_x, 1, 1), (BLOCK_DIM, 1, 1), 0, cu_stream, &mut params)
+            }.map_err(|e| KernelError::InvalidConfig(format!("quantize_q8_1 kpar8_batch: {e}")))?;
+        }
+
+        // Launch the batch kpar8 kernel: grid (n, 1, 1), block (256, 1, 1),
+        // static smem in PTX (2048 B).
+        {
+            let wt_ptr: u64 = packed.device_pointer().cu_deviceptr();
+            let qs_ptr: u64 = x_qs.device_pointer().cu_deviceptr();
+            let ds_ptr: u64 = x_ds.device_pointer().cu_deviceptr();
+            let ou_ptr: u64 = out.device_pointer().cu_deviceptr() + out_row_bytes as u64;
+            let n_u32: u32 = n as u32;
+            let kb_u32: u32 = k_blocks as u32;
+            let m_u32: u32 = m as u32;
+            let mut params: [*mut c_void; 7] = [
+                &wt_ptr as *const _ as *mut c_void,
+                &qs_ptr as *const _ as *mut c_void,
+                &ds_ptr as *const _ as *mut c_void,
+                &ou_ptr as *const _ as *mut c_void,
+                &n_u32 as *const _ as *mut c_void,
+                &kb_u32 as *const _ as *mut c_void,
+                &m_u32 as *const _ as *mut c_void,
+            ];
+            unsafe {
+                launch_kernel(
+                    batch_fn,
+                    (n_u32, 1, 1),
+                    (256, 1, 1),  // 8 warps (kpar8 structure)
+                    0,            // static smem in PTX (2048 bytes)
+                    cu_stream,
+                    &mut params,
+                )
+            }.map_err(|e| KernelError::InvalidConfig(format!("kpar8_batch q4k gemv: {e}")))?;
         }
 
         // No stream.synchronize() -- caller owns the sync.
