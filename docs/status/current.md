@@ -5,6 +5,89 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-16d (position-synced RAGGED batch CUDA graphs for m>=2
+serving decode -- the composition-invariance blocker solved by making
+every per-step value device-read; m=2..6 step 21.6 -> 21.3 ms short-ctx /
+23.8 -> 23.5 ms long-ctx at m=6 -- a MODEST, honest win: the m>=2 step is
+kernel-bound, the m=1 route's 2x came from being launch-bound; all gates
+green, ppl EXACTLY at baseline): (1) THE DESIGN -- m>=2 batch steps with
+ragged per-session positions on f16/e4m3 pools now route through
+(m, dtype)-keyed CUDA graphs (forward_batch_decode_greedy's new arm ->
+forward_batch_ragged_graph; TEMPURA_NO_M2P_GRAPH=1 bisects; f32 pools
+keep the existing paths).  EVERY per-step value the captured graph
+consumes is read from DEVICE memory at execution time: per-row positions
+(the in-graph d2d_gather_row cos/sin row gathers read
+d_positions_batch[r]), per-row KV write offsets (each session's kv_len),
+per-row kv_lens, and the per-layer K/V run base pointers (one
+[layers][m] H->D upload whose stride m matches the graphs' baked
+layer*m*8 offsets) -- so the graphs are batch-COMPOSITION-INDEPENDENT:
+any m sessions of the same pool dtype replay the same graph.  Session
+churn, ragged positions, and pool growth NEVER re-capture and need NO
+run-pointer validation (the base arrays are refreshed per step; the
+equal-position graphs' baked-values assumption is untouched because they
+are f32-only and this route is f16/e4m3-only).  (2) NEW KERNELS --
+kv_scatter_write_rows{,_f16,_e4m3} (kernels/src/kv_scatter_write.rs):
+grid (ceil(kv_dim/B), m) batch KV scatter with per-row src pointer /
+cache base / write offset all read from device arrays; the cast bit-math
+is the single-seq twins' verbatim.  Probe-gated in bench-decode-ops
+("kv scatter write rows"): batch vs per-row twins BIT-EXACT at m=4 on
+adversarial per-row data (RNE ties / saturation / NaN lanes landing on
+different elements per row) with distinct per-row offsets -- f32/f16/
+e4m3 all 0 mismatched elements.  (The first probe run failed f32 with 3
+mismatches: a PROBE bug -- the source tensors dropped before the
+kernels read them, cuda-oxide's deferred free recycled the memory;
+keeping them alive fixed it.  The kernels were right.)  (3)
+BIT-IDENTITY -- the captured body (forward_batch_ragged_graph_body)
+mirrors the generic no-graph m>=2 path op-for-op (the SAME
+gemm_any_d2d_batch m-loop batch GEMVs, the same per-(site,m) rmsnorm
+scratch, the oxide batch attention, silu/add/pad helpers, the same
+residual ping-pong) with exactly the three device-read substitutions
+the m=1 route already proved bit-identical: table RoPE via gathered
+rows, scatter twins for the append (same cast bit-math as the generic
+cast + D2D), device-read scalars.  The first step per (m, dtype) runs
+the body once FOR REAL (the step's compute + warm-up of every per-m
+pool -- allocation inside capture is DriverError 900), syncs, then
+captures the same op sequence (recorded, not executed; the warm-up
+result is the step's output).  The generic tail's greedy-argmax/
+download block was extracted verbatim into finish_batch_outputs and is
+shared.  (4) NUMBERS (fishtank, RTX 5090, Llama-3.1-8B Q4_K_M, f16
+pool, bench-nograph, before = same tree with TEMPURA_NO_M2P_GRAPH=1):
+short ctx (48 steps): m=1 5.2 -> 5.2 (UNCHANGED -- own route), m=2
+9.7 -> 9.4, m=3 12.2 -> 11.8, m=4 14.9 -> 14.4, m=5 18.0 -> 17.5, m=6
+21.6 -> 21.3 ms = 278 -> 281 tok/s.  Long ctx (400 steps, kv ~440):
+m=1 7.6 -> 7.6, m=2 11.9 -> 11.6, m=3 14.3 -> 13.9, m=4 16.9 -> 16.6,
+m=5 20.2 -> 19.8, m=6 23.8 -> 23.5 ms = 252.5 -> 254.9 tok/s.  THE
+HONEST BREAKDOWN: the win is ~0.3-0.5 ms/step (~2%), NOT the m=1
+route's 2x -- because the m>=2 generic step is KERNEL-bound: the host
+enqueues the ~1500 launches asynchronously and runs ahead of the GPU
+(unlike m=1, whose step was launch-latency-bound with the host as the
+bottleneck).  The graph removes the residual un-hidden host time only;
+the step is now squarely bound by the batch GEMV weight traffic +
+attention kernel time (the structural next levers are kernel-side:
+fusing the per-row rope/copy-out chain, a batched rope, or attention/
+GEMM improvements -- not launch overhead).  (5) GATES ALL GREEN on the
+final tree (md5-verified code, [m2p_graph] capture evidence in every
+serving log): 6-client kv-swap A/B PASS on f16 AND e4m3 (byte-identical
+per client; 5/4 swap-out lines in run B; [m2p_graph] captured m=2..6 on
+BOTH dtypes in BOTH runs -- the churn/cache-transition exercise);
+bench-ab-repro solo/repeat/interleave/m=2/m=3 checksums IDENTICAL and --
+the graph-vs-generic gate -- the FULL checksum vector is byte-identical
+between a TEMPURA_NO_M2P_GRAPH=1 run and a graph-routed run; pooled ppl
+8 chunks f16 8.6838 / e4m3 8.6282 EXACTLY the pre-change baselines, 0
+NaN (m=1 route, doubly proving no m=1 perturbation); nonstream-route-
+smoke PASS; kv-restart-var PASS; probe-q4k-batch + probe-q6k-batch
+PASS; bench-decode-ops PASS (incl. the new rows probes); local cargo
+test green (919).  VALIDATION-PROCESS NOTE: two early ppl runs (8.6790,
+both dtypes identical) were run WITHOUT TEMPURA_PPL_POOLED=1 (the
+wrapper-session path, dtype-independent -- not a regression) and on a
+stale binary missing the oxide-decode-attn PTX in its build out dir;
+the gate runs above were re-run on the rebuilt binary with the PTX
+re-copied.  FOLLOW-UPS (open): the m>=2 step is kernel-bound -- the
+next structural lever is a batched RoPE (today m x 2 rope launches + m
+q_rot + m k_rot D->D copy-outs per layer inside the graph) and/or
+fusing the row-slice/copy chain; the graph replay itself is not the
+bottleneck.**
+
 **STATUS 2026-11-16c (m=1 serving decode routed through the single-seq
 CUDA graph -- the composition-invariance blocker solved with a
 bit-identity-pinned capture; single-client decode 10.4 -> 5.2 ms/step

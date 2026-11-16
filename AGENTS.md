@@ -327,7 +327,7 @@ Qwen3.6-27B weights** — see open work.
 - [x] OpenAI-compatible chat/completions/completions/models/responses/
       embeddings/tokenize/detokenize; SSE streaming with include_usage
 - [x] ragged no-graph batch decode (the multi-client serving path):
-      ~24 ms/step at m=6 with ~440-token contexts (~254 tok/s aggregate;
+      ~23.5 ms/step at m=6 with ~440-token contexts (~255 tok/s aggregate;
       was 199 ms pre-2026-11-15, 47 ms after the sync-free + oxide-kernel
       fixes, 31 ms after the batch decode-attention + GPU argmax kernels,
       27 ms after the Q4K batch GEMV; 2026-11-16: Q4K AND Q6K projections
@@ -352,7 +352,19 @@ Qwen3.6-27B weights** — see open work.
       generic path dispatches at m=1, so solo and batched decode are
       bit-identical; single-client 10.4 -> 5.2 ms/step short-ctx,
       9.0 -> 7.6 ms at 400-step ctx; TEMPURA_NO_M1_GRAPH=1 bisects; see
-      the 2026-11-16c status entry)
+      the 2026-11-16c status entry); 2026-11-16d: m>=2 ticks route
+      through position-synced RAGGED batch CUDA graphs on f16/e4m3
+      pools, keyed (m, dtype), with EVERY per-step value device-read
+      (per-row positions via in-graph RoPE row gathers, per-row KV write
+      offsets + kv_lens + per-layer run base pointers re-uploaded per
+      replay) -- batch-composition-INDEPENDENT (session churn never
+      re-captures), new kv_scatter_write_rows{,_f16,_e4m3} per-row-
+      offset batch scatter kernels (probe-gated bit-exact vs the twins),
+      body bit-identity-pinned to the generic path (graph-routed and
+      generic-routed checksums byte-identical, bench-ab-repro);
+      m=6 21.6 -> 21.3 ms short-ctx, 23.8 -> 23.5 long -- a modest win,
+      the m>=2 step is kernel-bound (see the 2026-11-16d status entry
+      for the honest breakdown); TEMPURA_NO_M2P_GRAPH=1 bisects
 - [x] Logprobs, top-logprobs, stop sequences, n completions, presence/
       frequency penalties, seed, max_completion_tokens alias
 - [x] Tool/function calling (hermes/mistral/llama3 parsers + auto-detect),
