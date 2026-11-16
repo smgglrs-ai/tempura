@@ -435,6 +435,40 @@ struct NoGraphBatchScratch {
     q4k_batch_act: std::collections::HashMap<(usize, usize, usize), Arc<Tensor<f32>>>,
 }
 
+/// Device arrays + host staging for the ragged (position-synced) batch
+/// CUDA-graph route (`m >= 2`, f16/e4m3 pools).
+///
+/// Every per-step value the captured graph consumes is read from DEVICE
+/// memory at execution time; this struct holds those stable device arrays
+/// (allocated once, addresses baked into the captured graphs) plus the
+/// grow-only host staging vectors the async H->D uploads copy from (the
+/// kv_len_stage lesson: a pending pageable async copy needs a stable
+/// source address).
+struct RaggedGraphState {
+    /// Per-row positions `[max_batch_graph]`, f32 bit-encoded (the
+    /// gather_row_by_device_pos convention; read back as i32).
+    d_positions_batch: Arc<Tensor<f32>>,
+    /// Per-row KV write offsets `[max_batch_graph]` i32 (each session's
+    /// kv_len -- the append slot for this step).
+    d_kv_write_offsets: Arc<Tensor<i32>>,
+    /// Per-row RoPE cos/sin row buffers `[max_batch_graph] [head_dim/2]`,
+    /// refreshed in-graph by d2d_gather_row reading d_positions_batch.
+    rope_cos_rows: Vec<Arc<Tensor<f32>>>,
+    rope_sin_rows: Vec<Arc<Tensor<f32>>>,
+    /// The logits output buffer per captured `(m, dtype)` graph (the body's
+    /// lm_head batch GEMV destination -- `gemm_out[(SLOT_LOGITS, vocab, m)]`
+    /// for quantized lm_heads, the SLOT_LOGITS scratch otherwise).
+    logits: RefCell<std::collections::HashMap<(usize, u8), Arc<Tensor<f32>>>>,
+    // -- host staging (grow-only, stable addresses for async H2D) --
+    hidden_stage: RefCell<Vec<f32>>,
+    pos_stage: RefCell<Vec<f32>>,
+    off_stage: RefCell<Vec<i32>>,
+    kvlen_stage: RefCell<Vec<i32>>,
+    /// `[num_layers * m]` per-layer K/V run base pointers, one upload.
+    kptr_stage: RefCell<Vec<u64>>,
+    vptr_stage: RefCell<Vec<u64>>,
+}
+
 /// Transformer with all projection weights pre-uploaded to the GPU.
 ///
 /// Create once with [`CutileGpuModel::from_quantized`] at model load time, then call
@@ -850,6 +884,22 @@ pub struct CutileGpuModel {
     /// Separate from cached_batch_graph so both dp4a and MXFP4 graphs can coexist.
     /// Captured with forward_batch_mxfp4_inner_graph (MXFP4 unconditional).
     cached_mxfp4_batch_graph: RefCell<Option<BatchDecodeGraph>>,
+
+    /// Ragged (position-synced) batch CUDA graphs for `m >= 2` serving
+    /// steps on f16/e4m3 pools, keyed `(m, dtype_tag)`.  All per-step
+    /// scalars (per-row positions, per-row KV write offsets, per-row
+    /// kv_lens, per-layer run base pointers) are read from device arrays
+    /// uploaded H->D before each replay, so a graph is
+    /// batch-COMPOSITION-independent: any m sessions sharing the pool
+    /// dtype replay the same graph -- no re-capture on session churn and
+    /// no run-pointer validation (the base arrays are refreshed per step).
+    /// TEMPURA_NO_M2P_GRAPH=1 bisects the route off.
+    ragged_batch_graphs: RefCell<std::collections::HashMap<(usize, u8), BatchDecodeGraph>>,
+
+    /// Lazily-allocated device arrays + host staging for the ragged graph
+    /// route (see `RaggedGraphState`).  None until the first eligible
+    /// m >= 2 step.
+    ragged_graph_state: RefCell<Option<RaggedGraphState>>,
 
     /// True when every projection weight in every layer is Q4K -- a precondition
     /// for the batch CUDA graph path (which only handles Q4K projections).
@@ -2696,6 +2746,8 @@ impl CutileGpuModel {
             d_kv_len,
             kv_len_stage,
             nograph: RefCell::new(NoGraphBatchScratch::default()),
+            ragged_batch_graphs: RefCell::new(std::collections::HashMap::new()),
+            ragged_graph_state: RefCell::new(None),
             d_positions,
             d_kv_write_offset,
             d_rope_cos_row,
@@ -3156,6 +3208,8 @@ impl CutileGpuModel {
             d_kv_len,
             kv_len_stage,
             nograph: RefCell::new(NoGraphBatchScratch::default()),
+            ragged_batch_graphs: RefCell::new(std::collections::HashMap::new()),
+            ragged_graph_state: RefCell::new(None),
             d_positions,
             d_kv_write_offset,
             d_rope_cos_row,
@@ -10324,6 +10378,955 @@ impl CutileGpuModel {
         rows
     }
 
+    /// Ensure the ragged-graph device arrays exist (lazy, first eligible
+    /// m >= 2 step) and upload the STABLE pointer arrays: the batch
+    /// scatter-write source pointers (per-row K-after-RoPE / V row buffer
+    /// addresses -- model-lifetime stable) into `batch_src_{k,v}_ptrs_dev`.
+    fn ensure_ragged_graph_state(&self) -> Option<()> {
+        if self.ragged_graph_state.borrow().is_some() {
+            return Some(());
+        }
+        let stream = self.matmul.stream();
+        let cfg = &self.config;
+        let mb = self.max_batch_graph;
+        let half = cfg.head_dim / 2;
+        // The per-row rope row buffers must match the table's half dim.
+        let (_, _, table_half, _) = self.cutile_rope.table_ptrs()?;
+        if table_half != half {
+            return None;
+        }
+        let d_positions_batch = Arc::new(
+            api::zeros::<f32>(&[mb])
+                .sync_on(stream)
+                .expect("ragged graph: d_positions_batch alloc"),
+        );
+        let d_kv_write_offsets = Arc::new(
+            api::zeros::<i32>(&[mb])
+                .sync_on(stream)
+                .expect("ragged graph: d_kv_write_offsets alloc"),
+        );
+        let rope_cos_rows = (0..mb)
+            .map(|_| {
+                Arc::new(
+                    api::zeros::<f32>(&[half])
+                        .sync_on(stream)
+                        .expect("ragged graph: cos row alloc"),
+                )
+            })
+            .collect();
+        let rope_sin_rows = (0..mb)
+            .map(|_| {
+                Arc::new(
+                    api::zeros::<f32>(&[half])
+                        .sync_on(stream)
+                        .expect("ragged graph: sin row alloc"),
+                )
+            })
+            .collect();
+        // Stable scatter src pointer arrays: batch_k_rot[r] / batch_v_seqs[r]
+        // device addresses (fixed for the model's lifetime).
+        let k_srcs: Vec<u64> = (0..mb)
+            .map(|r| self.batch_k_rot[r].device_pointer().cu_deviceptr())
+            .collect();
+        let v_srcs: Vec<u64> = (0..mb)
+            .map(|r| self.batch_v_seqs[r].device_pointer().cu_deviceptr())
+            .collect();
+        unsafe {
+            let rc_k = cuda_core::sys::cuMemcpyHtoD_v2(
+                self.batch_src_k_ptrs_dev,
+                k_srcs.as_ptr() as *const std::ffi::c_void,
+                (mb * 8) as usize,
+            );
+            let rc_v = cuda_core::sys::cuMemcpyHtoD_v2(
+                self.batch_src_v_ptrs_dev,
+                v_srcs.as_ptr() as *const std::ffi::c_void,
+                (mb * 8) as usize,
+            );
+            if rc_k != 0 || rc_v != 0 {
+                eprintln!("[m2p_graph] src ptr array upload failed (k={rc_k}, v={rc_v})");
+                return None;
+            }
+        }
+        *self.ragged_graph_state.borrow_mut() = Some(RaggedGraphState {
+            d_positions_batch,
+            d_kv_write_offsets,
+            rope_cos_rows,
+            rope_sin_rows,
+            hidden_stage: RefCell::new(vec![0.0; mb * self.h_pad]),
+            pos_stage: RefCell::new(vec![0.0; mb]),
+            off_stage: RefCell::new(vec![0; mb]),
+            kvlen_stage: RefCell::new(vec![0; mb]),
+            kptr_stage: RefCell::new(vec![0; cfg.num_layers * mb]),
+            vptr_stage: RefCell::new(vec![0; cfg.num_layers * mb]),
+            logits: RefCell::new(std::collections::HashMap::new()),
+        });
+        Some(())
+    }
+
+    /// The captured body of the ragged (position-synced) batch graph.
+    ///
+    /// Mirrors the generic no-graph m >= 2 path op-for-op -- the SAME
+    /// kernels in the SAME order (per-(site,m) rmsnorm scratch, the
+    /// gemm_any_d2d_batch m-loop batch GEMVs, per-row table RoPE, the
+    /// oxide batch attention, silu/add/pad helpers, the same ng.* per-m
+    /// buffers) -- with exactly three device-read substitutions, each
+    /// bit-identity-proven by the m=1 graph route:
+    ///   (a) RoPE cos/sin rows are gathered per row from d_positions_batch
+    ///       (the from_table kernel with pos=0 on a gathered row computes
+    ///       the identical rotation the generic path's pos=p table read
+    ///       does);
+    ///   (b) the KV append runs through the per-row-offset batch scatter
+    ///       twins (same in-kernel cast bit-math as the generic append's
+    ///       cast + D2D -- probe-gated in bench-decode-ops);
+    ///   (c) positions / write offsets / kv_lens / run base pointers are
+    ///       read from device arrays at execution time.
+    ///
+    /// Runs unchanged OUTSIDE capture (warm-up: this step's real compute,
+    /// which also populates every per-m pool the capture pass must not
+    /// allocate in) and INSIDE capture (recorded, not executed).
+    ///
+    /// Returns the logits tensor (`gemm_out[(SLOT_LOGITS, vocab, m)]`).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batch_ragged_graph_body(
+        &self,
+        m: usize,
+        dtype: crate::cutile_kv_cache::KvDtype,
+        rs: &RaggedGraphState,
+    ) -> Arc<Tensor<f32>> {
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+        let n_heads = cfg.num_attention_heads;
+        let n_kv_heads = cfg.num_kv_heads;
+        let head_dim = cfg.head_dim;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let inter = cfg.intermediate_size;
+        let stream = self.matmul.stream();
+        let cu_stream = stream.cu_stream();
+
+        // In-graph per-row RoPE cos/sin gathers (read each row's position
+        // from d_positions_batch at EXECUTION time).
+        let (cos_t, sin_t, half, max_pos) = self
+            .cutile_rope
+            .table_ptrs()
+            .expect("ragged graph body: rope table missing (route gates on it)");
+        let pos_base = rs.d_positions_batch.device_pointer().cu_deviceptr();
+        for r in 0..m {
+            self.kv_scatter_write
+                .gather_row_by_device_pos(
+                    cos_t,
+                    rs.rope_cos_rows[r].device_pointer().cu_deviceptr(),
+                    pos_base + (r * 4) as u64,
+                    half as u32,
+                    max_pos as u32,
+                    cu_stream,
+                )
+                .expect("ragged graph body: cos row gather failed");
+            self.kv_scatter_write
+                .gather_row_by_device_pos(
+                    sin_t,
+                    rs.rope_sin_rows[r].device_pointer().cu_deviceptr(),
+                    pos_base + (r * 4) as u64,
+                    half as u32,
+                    max_pos as u32,
+                    cu_stream,
+                )
+                .expect("ragged graph body: sin row gather failed");
+        }
+
+        let kv_dim_u32 = kv_dim as u32;
+        let kv_pad = next_pow2(kv_dim.div_ceil(BK) * BK);
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        #[allow(clippy::type_complexity)]
+        let layer_names: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )> = (0..cfg.num_layers)
+            .map(|l| {
+                let p = format!("model.layers.{l}");
+                (
+                    format!("{p}.input_layernorm.weight"),
+                    format!("{p}.post_attention_layernorm.weight"),
+                    format!("{p}.self_attn.q_proj.weight"),
+                    format!("{p}.self_attn.k_proj.weight"),
+                    format!("{p}.self_attn.v_proj.weight"),
+                    format!("{p}.self_attn.o_proj.weight"),
+                    format!("{p}.mlp.gate_proj.weight"),
+                    format!("{p}.mlp.up_proj.weight"),
+                    format!("{p}.mlp.down_proj.weight"),
+                )
+            })
+            .collect();
+
+        let mut hidden_dev: Arc<Tensor<f32>> = self.batch_hidden.clone();
+        let mut hidden_side: usize = 0;
+
+        for layer in 0..cfg.num_layers {
+            let (
+                ref input_ln_name,
+                ref post_ln_name,
+                ref q_w_name,
+                ref k_w_name,
+                ref v_w_name,
+                ref o_w_name,
+                ref gate_w_name,
+                ref up_w_name,
+                ref down_w_name,
+            ) = layer_names[layer];
+
+            // Pre-attention RMSNorm (same per-(site, m) scratch as the
+            // generic path).
+            let input_ln_w_dev = self
+                .norm_weights
+                .get(input_ln_name)
+                .expect("input_layernorm weight missing");
+            let normed_dev = {
+                let mut ng = self.nograph.borrow_mut();
+                let scratch = ng
+                    .rms
+                    .entry((0, m))
+                    .or_insert_with(RmsnormScratch::empty);
+                self.cutile_rmsnorm
+                    .forward_device_fused_scratch(
+                        stream,
+                        hidden_dev.clone(),
+                        input_ln_w_dev,
+                        m,
+                        h,
+                        self.h_pad,
+                        cfg.layer_norm_eps,
+                        scratch,
+                    )
+                    .expect("ragged graph body: batch RMSNorm failed")
+            };
+
+            // QKV projections (m-loop batch GEMVs -- bit-identical per row).
+            let q_dev = self.gemm_any_d2d_batch(&normed_dev, q_w_name, m, self.h_pad, SLOT_Q);
+            let k_dev = self.gemm_any_d2d_batch(&normed_dev, k_w_name, m, self.h_pad, SLOT_K);
+            let v_dev = self.gemm_any_d2d_batch(&normed_dev, v_w_name, m, self.h_pad, SLOT_V);
+            drop(normed_dev);
+
+            // Per-row slice -> RoPE -> stable copy-out (the generic path's
+            // row_bufs structure on the model-lifetime batch_* buffers).
+            for r in 0..m {
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        self.batch_q_seqs[r].device_pointer().cu_deviceptr(),
+                        q_dev.device_pointer().cu_deviceptr() + (r * self.q_pad * 4) as u64,
+                        q_dim,
+                        stream,
+                    )
+                    .expect("ragged graph body: q_r D->D");
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        self.batch_k_seqs[r].device_pointer().cu_deviceptr(),
+                        k_dev.device_pointer().cu_deviceptr() + (r * kv_pad * 4) as u64,
+                        kv_dim,
+                        stream,
+                    )
+                    .expect("ragged graph body: k_r D->D");
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        self.batch_v_seqs[r].device_pointer().cu_deviceptr(),
+                        v_dev.device_pointer().cu_deviceptr() + (r * kv_pad * 4) as u64,
+                        kv_dim,
+                        stream,
+                    )
+                    .expect("ragged graph body: v_r D->D");
+                }
+
+                let q_rot = self
+                    .cutile_rope
+                    .forward_device_scratch_graph(
+                        &self.batch_q_seqs[r],
+                        n_heads,
+                        head_dim,
+                        &rs.rope_cos_rows[r],
+                        &rs.rope_sin_rows[r],
+                        &mut self.q_rope_scratch.borrow_mut(),
+                        stream,
+                    )
+                    .expect("ragged graph body: Q RoPE failed");
+                // Copy out NOW: the shared rope scratch is overwritten by
+                // the next row (the generic path's q_rot copy-out lesson).
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        self.batch_q_rot[r].device_pointer().cu_deviceptr(),
+                        q_rot.device_pointer().cu_deviceptr(),
+                        q_dim,
+                        stream,
+                    )
+                    .expect("ragged graph body: q_rot D->D copy");
+                }
+                let k_rot = self
+                    .cutile_rope
+                    .forward_device_scratch_graph(
+                        &self.batch_k_seqs[r],
+                        n_kv_heads,
+                        head_dim,
+                        &rs.rope_cos_rows[r],
+                        &rs.rope_sin_rows[r],
+                        &mut self.k_rope_scratch.borrow_mut(),
+                        stream,
+                    )
+                    .expect("ragged graph body: K RoPE failed");
+                unsafe {
+                    cuda_core::memcpy_dtod_async::<f32>(
+                        self.batch_k_rot[r].device_pointer().cu_deviceptr(),
+                        k_rot.device_pointer().cu_deviceptr(),
+                        kv_dim,
+                        stream,
+                    )
+                    .expect("ragged graph body: k_rot D->D copy");
+                }
+            }
+
+            // KV scatter-write: ONE batch launch per tensor, every row's
+            // src ptr / cache base / write offset read from device arrays
+            // at execution time (composition-independent replay).
+            {
+                let bases_k = self.batch_attn_all_k_ptrs + (layer * m * 8) as u64;
+                let bases_v = self.batch_attn_all_v_ptrs + (layer * m * 8) as u64;
+                let offs = rs.d_kv_write_offsets.device_pointer().cu_deviceptr();
+                let res = match dtype {
+                    crate::cutile_kv_cache::KvDtype::F32 => self
+                        .kv_scatter_write
+                        .copy_m_with_per_row_offsets(
+                            self.batch_src_k_ptrs_dev,
+                            bases_k,
+                            offs,
+                            kv_dim_u32,
+                            m as u32,
+                            cu_stream,
+                        )
+                        .and_then(|_| {
+                            self.kv_scatter_write.copy_m_with_per_row_offsets(
+                                self.batch_src_v_ptrs_dev,
+                                bases_v,
+                                offs,
+                                kv_dim_u32,
+                                m as u32,
+                                cu_stream,
+                            )
+                        }),
+                    crate::cutile_kv_cache::KvDtype::F16 => self
+                        .kv_scatter_write
+                        .copy_m_with_per_row_offsets_f16(
+                            self.batch_src_k_ptrs_dev,
+                            bases_k,
+                            offs,
+                            kv_dim_u32,
+                            m as u32,
+                            cu_stream,
+                        )
+                        .and_then(|_| {
+                            self.kv_scatter_write.copy_m_with_per_row_offsets_f16(
+                                self.batch_src_v_ptrs_dev,
+                                bases_v,
+                                offs,
+                                kv_dim_u32,
+                                m as u32,
+                                cu_stream,
+                            )
+                        }),
+                    crate::cutile_kv_cache::KvDtype::E4M3 => self
+                        .kv_scatter_write
+                        .copy_m_with_per_row_offsets_e4m3(
+                            self.batch_src_k_ptrs_dev,
+                            bases_k,
+                            offs,
+                            kv_dim_u32,
+                            m as u32,
+                            cu_stream,
+                        )
+                        .and_then(|_| {
+                            self.kv_scatter_write.copy_m_with_per_row_offsets_e4m3(
+                                self.batch_src_v_ptrs_dev,
+                                bases_v,
+                                offs,
+                                kv_dim_u32,
+                                m as u32,
+                                cu_stream,
+                            )
+                        }),
+                };
+                res.expect("ragged graph body: KV scatter-write failed");
+            }
+
+            // Batch flash attention: the oxide batch kernel on per-layer
+            // device ptr arrays + per-row kv_lens (all refreshed per step).
+            let attn_out_dev = {
+                let oda = self.oxide_decode_attn.as_ref().unwrap();
+                let attn_out = {
+                    let mut ng = self.nograph.borrow_mut();
+                    ng.attn_out
+                        .entry(m)
+                        .or_insert_with(|| {
+                            Arc::new(
+                                cutile::api::zeros::<f32>(&[m * q_dim])
+                                    .sync_on(stream)
+                                    .expect("ragged graph body: batch attn out alloc"),
+                            )
+                        })
+                        .clone()
+                };
+                let q_batch = {
+                    let mut ng = self.nograph.borrow_mut();
+                    ng.q_batch
+                        .entry(m)
+                        .or_insert_with(|| {
+                            Arc::new(
+                                cutile::api::zeros::<f32>(&[m * q_dim])
+                                    .sync_on(stream)
+                                    .expect("ragged graph body: q_batch alloc"),
+                            )
+                        })
+                        .clone()
+                };
+                for r in 0..m {
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            q_batch.device_pointer().cu_deviceptr() + (r * q_dim * 4) as u64,
+                            self.batch_q_rot[r].device_pointer().cu_deviceptr(),
+                            q_dim,
+                            stream,
+                        )
+                        .expect("ragged graph body: q_batch D->D copy");
+                    }
+                }
+                let layer_k_ptrs_dev = self.batch_attn_all_k_ptrs + (layer * m * 8) as u64;
+                let layer_v_ptrs_dev = self.batch_attn_all_v_ptrs + (layer * m * 8) as u64;
+                let res = match dtype {
+                    crate::cutile_kv_cache::KvDtype::F16 => oda.forward_batch_d2d_ptrs_f16(
+                        &attn_out,
+                        &q_batch,
+                        layer_k_ptrs_dev,
+                        layer_v_ptrs_dev,
+                        self.batch_attn_kv_lens_dev,
+                        m,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        scale,
+                    ),
+                    crate::cutile_kv_cache::KvDtype::E4M3 => oda.forward_batch_d2d_ptrs_e4m3(
+                        &attn_out,
+                        &q_batch,
+                        layer_k_ptrs_dev,
+                        layer_v_ptrs_dev,
+                        self.batch_attn_kv_lens_dev,
+                        m,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        scale,
+                    ),
+                    crate::cutile_kv_cache::KvDtype::F32 => oda.forward_batch_d2d_ptrs(
+                        &attn_out,
+                        &q_batch,
+                        layer_k_ptrs_dev,
+                        layer_v_ptrs_dev,
+                        self.batch_attn_kv_lens_dev,
+                        m,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        scale,
+                    ),
+                };
+                res.expect("ragged graph body: oxide_decode_attn_batch failed");
+                attn_out
+            };
+
+            // O-projection (generic-path structure).
+            let attn_padded = self.attn_out_to_oproj_device_m(&attn_out_dev, q_dim, self.q_pad, m);
+            let o_dev = self.gemm_any_d2d_batch(&attn_padded, o_w_name, m, self.q_pad, SLOT_O);
+            let o_padded = self.pad_rows_device(&o_dev, h, self.h_pad, m, &self.oproj_pad_scratch);
+            hidden_dev = {
+                let mut ng = self.nograph.borrow_mut();
+                let scr = &mut ng.hidden.entry(m).or_insert([None, None])[hidden_side ^ 1];
+                self.add_device_scratch(&hidden_dev, &o_padded, m * self.h_pad, scr)
+            };
+            hidden_side ^= 1;
+
+            // Post-attention RMSNorm.
+            let post_ln_w_dev = self
+                .norm_weights
+                .get(post_ln_name)
+                .expect("post_attention_layernorm weight missing");
+            let normed2_dev = {
+                let mut ng = self.nograph.borrow_mut();
+                let scratch = ng
+                    .rms
+                    .entry((1, m))
+                    .or_insert_with(RmsnormScratch::empty);
+                self.cutile_rmsnorm
+                    .forward_device_fused_scratch(
+                        stream,
+                        hidden_dev.clone(),
+                        post_ln_w_dev,
+                        m,
+                        h,
+                        self.h_pad,
+                        cfg.layer_norm_eps,
+                        scratch,
+                    )
+                    .expect("ragged graph body: batch post-attn RMSNorm failed")
+            };
+
+            // FFN gate/up projections.
+            let gate_dev =
+                self.gemm_any_d2d_batch(&normed2_dev, gate_w_name, m, self.h_pad, SLOT_GATE);
+            let up_dev = self.gemm_any_d2d_batch(&normed2_dev, up_w_name, m, self.h_pad, SLOT_UP);
+            drop(normed2_dev);
+
+            // Gated multiply (same per-m scratch as the generic path).
+            let gs_dev = if cfg.hidden_act == crate::config::HiddenAct::GeGLU {
+                let mut ng = self.nograph.borrow_mut();
+                let scr = ng.silu.entry(m).or_insert(None);
+                self.cutile_elementwise
+                    .gelu_mul_device_scratch(
+                        &gate_dev,
+                        &up_dev,
+                        m,
+                        cfg.intermediate_size,
+                        scr,
+                        &stream,
+                    )
+                    .expect("ragged graph body: batch gelu_mul_device failed")
+            } else {
+                let mut ng = self.nograph.borrow_mut();
+                let scr = ng.silu.entry(m).or_insert(None);
+                self.cutile_elementwise
+                    .silu_mul_device_scratch(
+                        &gate_dev,
+                        &up_dev,
+                        m,
+                        cfg.intermediate_size,
+                        scr,
+                        &stream,
+                    )
+                    .expect("ragged graph body: batch silu_mul_device failed")
+            };
+            // inter -> inter_pad (same per-m buffer + row D->D copies).
+            let inter_sz = cfg.intermediate_size;
+            let gs_padded = if self.inter_pad == inter_sz {
+                gs_dev
+            } else {
+                let padded = {
+                    let mut ng = self.nograph.borrow_mut();
+                    ng.inter_pad
+                        .entry(m)
+                        .or_insert_with(|| {
+                            Arc::new(
+                                api::zeros::<f32>(&[m * self.inter_pad])
+                                    .sync_on(stream)
+                                    .expect("ragged graph body: gs inter pad alloc"),
+                            )
+                        })
+                        .clone()
+                };
+                let src_base = gs_dev.device_pointer().cu_deviceptr();
+                let dst_base = padded.device_pointer().cu_deviceptr();
+                for r in 0..m {
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            dst_base + (r * self.inter_pad * 4) as u64,
+                            src_base + (r * inter_sz * 4) as u64,
+                            inter_sz,
+                            stream,
+                        )
+                        .expect("ragged graph body: gs inter pad D->D");
+                    }
+                }
+                drop(gs_dev);
+                padded
+            };
+            let down_dev =
+                self.gemm_any_d2d_batch(&gs_padded, down_w_name, m, self.inter_pad, SLOT_DOWN);
+
+            let down_padded =
+                self.pad_rows_device(&down_dev, h, self.h_pad, m, &self.down_pad_scratch);
+            hidden_dev = {
+                let mut ng = self.nograph.borrow_mut();
+                let scr = &mut ng.hidden.entry(m).or_insert([None, None])[hidden_side ^ 1];
+                self.add_device_scratch(&hidden_dev, &down_padded, m * self.h_pad, scr)
+            };
+            hidden_side ^= 1;
+        }
+
+        // Final norm + lm_head INSIDE the graph (the m=1 route's shape):
+        // the logits land in gemm_out[(SLOT_LOGITS, vocab, m)] -- the same
+        // buffer the generic path's lm_head batch GEMV writes.
+        let final_ln_w_dev = self
+            .norm_weights
+            .get("model.norm.weight")
+            .expect("model.norm weight missing");
+        let last_dev = {
+            let mut ng = self.nograph.borrow_mut();
+            let scratch = ng
+                .rms
+                .entry((2, m))
+                .or_insert_with(RmsnormScratch::empty);
+            self.cutile_rmsnorm
+                .forward_device_fused_scratch(
+                    stream,
+                    hidden_dev,
+                    final_ln_w_dev,
+                    m,
+                    h,
+                    self.h_pad,
+                    cfg.layer_norm_eps,
+                    scratch,
+                )
+                .expect("ragged graph body: batch final RMSNorm failed")
+        };
+        self.gemm_any_d2d_batch(&last_dev, "lm_head.weight", m, self.h_pad, SLOT_LOGITS)
+    }
+
+    /// m >= 2 ragged (position-synced) batch decode through a CUDA graph.
+    ///
+    /// Per step (outside the graph): upload the embeddings, per-row
+    /// positions, per-row write offsets, per-row kv_lens, and the
+    /// per-layer K/V run base pointers into the stable device arrays, then
+    /// replay the (m, dtype)-keyed graph.  On the first step for a key the
+    /// body runs once for real (this step's compute + warm-up of every
+    /// per-m pool -- allocation inside capture is DriverError 900), is
+    /// synced, and is then captured (recorded, not executed).
+    ///
+    /// Returns None only when the state cannot be initialized; capture
+    /// failures fall back to the (already computed) warm-up result and
+    /// simply don't cache a graph.
+    fn forward_batch_ragged_graph(
+        &self,
+        hidden: &[f32],
+        positions: &[u32],
+        kv_caches: &mut [CutileKvCache],
+        greedy: &[bool],
+    ) -> Option<Vec<crate::model::BatchDecodeOutput>> {
+        let m = kv_caches.len();
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+        let stream = self.matmul.stream();
+        let cu_stream = stream.cu_stream();
+        let dtype = kv_caches[0].kv_dtype();
+        let dtype_tag = match dtype {
+            crate::cutile_kv_cache::KvDtype::F32 => 0u8,
+            crate::cutile_kv_cache::KvDtype::F16 => 1u8,
+            crate::cutile_kv_cache::KvDtype::E4M3 => 2u8,
+        };
+
+        self.ensure_ragged_graph_state()?;
+        let rs_ref = self.ragged_graph_state.borrow();
+        let rs = rs_ref.as_ref().unwrap();
+
+        // -- Per-step uploads (stable host staging; stream-ordered) -------
+        // Embeddings -> batch_hidden rows (h -> h_pad padded, interleaved:
+        // row r's valid h elements followed by its zero pad tail).
+        {
+            let mut stage = rs.hidden_stage.borrow_mut();
+            stage.clear();
+            if self.h_pad == h {
+                stage.extend_from_slice(hidden);
+            } else {
+                let pad = vec![0.0f32; self.h_pad - h];
+                for r in 0..m {
+                    stage.extend_from_slice(&hidden[r * h..(r + 1) * h]);
+                    stage.extend_from_slice(&pad);
+                }
+            }
+            unsafe {
+                cuda_core::memcpy_htod_async::<f32>(
+                    self.batch_hidden.device_pointer().cu_deviceptr(),
+                    stage.as_ptr(),
+                    m * self.h_pad,
+                    stream,
+                )
+            }
+            .expect("m2p graph: batch_hidden H->D");
+        }
+        // Per-row positions (f32 bit-encoded -- the gather kernel reads the
+        // i32 bit pattern back).
+        {
+            let mut pos = rs.pos_stage.borrow_mut();
+            pos.clear();
+            pos.extend(positions.iter().map(|&p| f32::from_bits(p)));
+            unsafe {
+                cuda_core::memcpy_htod_async::<f32>(
+                    rs.d_positions_batch.device_pointer().cu_deviceptr(),
+                    pos.as_ptr(),
+                    m,
+                    stream,
+                )
+            }
+            .expect("m2p graph: d_positions_batch H->D");
+        }
+        // Per-row write offsets (each session's kv_len) + kv_lens (+1).
+        {
+            let mut off = rs.off_stage.borrow_mut();
+            off.clear();
+            off.extend(kv_caches.iter().map(|kvc| kvc.seq_len() as i32));
+            unsafe {
+                cuda_core::memcpy_htod_async::<i32>(
+                    rs.d_kv_write_offsets.device_pointer().cu_deviceptr(),
+                    off.as_ptr(),
+                    m,
+                    stream,
+                )
+            }
+            .expect("m2p graph: d_kv_write_offsets H->D");
+        }
+        {
+            let mut kl = rs.kvlen_stage.borrow_mut();
+            kl.clear();
+            kl.extend(kv_caches.iter().map(|kvc| (kvc.seq_len() + 1) as i32));
+            unsafe {
+                cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                    self.batch_attn_kv_lens_dev,
+                    kl.as_ptr() as *const std::ffi::c_void,
+                    m * 4,
+                    cu_stream,
+                );
+            }
+        }
+        // Per-layer K/V run base pointers: one [layers][m] upload whose row
+        // stride m matches the graphs' baked layer*m*8 offsets.
+        {
+            let mut kp = rs.kptr_stage.borrow_mut();
+            let mut vp = rs.vptr_stage.borrow_mut();
+            kp.clear();
+            vp.clear();
+            for l in 0..cfg.num_layers {
+                for kvc in kv_caches.iter().take(m) {
+                    let (k, v) = kvc.kv_device_base_ptrs(l);
+                    kp.push(k);
+                    vp.push(v);
+                }
+            }
+            debug_assert_eq!(kp.len(), cfg.num_layers * m);
+            unsafe {
+                cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                    self.batch_attn_all_k_ptrs,
+                    kp.as_ptr() as *const std::ffi::c_void,
+                    cfg.num_layers * m * 8,
+                    cu_stream,
+                );
+                cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                    self.batch_attn_all_v_ptrs,
+                    vp.as_ptr() as *const std::ffi::c_void,
+                    cfg.num_layers * m * 8,
+                    cu_stream,
+                );
+            }
+        }
+
+        // -- Replay or capture ----------------------------------------------
+        let mut graphs = self.ragged_batch_graphs.borrow_mut();
+        if let Some(dg) = graphs.get(&(m, dtype_tag)) {
+            unsafe {
+                cuda_core::sys::cuGraphLaunch(dg.cu_exec, cu_stream);
+            }
+            unsafe {
+                stream.synchronize().expect("m2p graph replay sync");
+            }
+            drop(graphs);
+            drop(rs_ref);
+            for kvc in kv_caches.iter_mut().take(m) {
+                kvc.advance_host_seq_len(1);
+                kvc.mark_host_stale();
+            }
+            let logits_dev = self
+                .ragged_graph_state
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .logits
+                .borrow()
+                .get(&(m, dtype_tag))
+                .cloned()
+                .expect("m2p graph: logits buffer missing after replay");
+            return Some(self.finish_batch_outputs(&logits_dev, m, greedy));
+        }
+
+        // Warm-up: run the body for real (this step's compute; also
+        // populates every per-m pool so the capture pass allocates
+        // nothing -- allocation inside capture is DriverError 900), then
+        // capture the same op sequence (recorded, NOT executed).
+        let warm_logits = self.forward_batch_ragged_graph_body(m, dtype, rs);
+        self.quiesce_retirement_before_capture(&stream);
+        self.ensure_attn_pad_buf(m);
+        self.ensure_residual_pad_bufs(m);
+        let relaxed = cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
+        if unsafe { stream.begin_capture(relaxed) }.is_err() {
+            eprintln!("[m2p_graph] begin_capture failed (m={m}); warm-up result used");
+        } else {
+            let cap_logits = self.forward_batch_ragged_graph_body(m, dtype, rs);
+            match unsafe { stream.end_capture() } {
+                Ok(cu_graph) => {
+                    let mut cu_exec_uninit =
+                        std::mem::MaybeUninit::<cuda_core::sys::CUgraphExec>::uninit();
+                    let rc = unsafe {
+                        cuda_core::sys::cuGraphInstantiateWithFlags(
+                            cu_exec_uninit.as_mut_ptr(),
+                            cu_graph,
+                            0,
+                        )
+                    };
+                    if rc != 0 {
+                        eprintln!("[m2p_graph] instantiate rc={rc} (m={m}); warm-up result used");
+                    } else {
+                        let cu_exec = unsafe { cu_exec_uninit.assume_init() };
+                        let rc_up = unsafe { cuda_core::sys::cuGraphUpload(cu_exec, cu_stream) };
+                        if rc_up != 0 {
+                            eprintln!(
+                                "[m2p_graph] cuGraphUpload rc={rc_up} (continuing; first launch uploads)"
+                            );
+                        }
+                        eprintln!(
+                            "[m2p_graph] captured m={m} dtype={dtype_tag} ({} layers)",
+                            cfg.num_layers
+                        );
+                        rs.logits
+                            .borrow_mut()
+                            .insert((m, dtype_tag), cap_logits.clone());
+                        graphs.insert(
+                            (m, dtype_tag),
+                            BatchDecodeGraph {
+                                cu_exec,
+                                cu_graph,
+                                device: Arc::new(stream.context().device()),
+                                m,
+                                // Unused: this route validates nothing --
+                                // every per-step value is device-read, so
+                                // there is nothing to go stale.
+                                captured_k_ptrs: vec![],
+                                captured_v_ptrs: vec![],
+                                captured_capacity_gens: vec![],
+                            },
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[m2p_graph] end_capture failed: {e:?} (m={m}); warm-up result used"
+                    );
+                }
+            }
+        }
+        drop(graphs);
+        drop(rs_ref);
+        // The capture pass recorded but did not execute; the warm-up run's
+        // logits (same buffer) are this step's result either way.
+        for kvc in kv_caches.iter_mut().take(m) {
+            kvc.advance_host_seq_len(1);
+            kvc.mark_host_stale();
+        }
+        Some(self.finish_batch_outputs(&warm_logits, m, greedy))
+    }
+
+    /// Greedy argmax / logits download tail shared by the generic and
+    /// ragged-graph batch paths (extracted verbatim from the generic tail
+    /// -- the same kernels, the same semantics).
+    fn finish_batch_outputs(
+        &self,
+        logits_dev: &Arc<Tensor<f32>>,
+        m: usize,
+        greedy: &[bool],
+    ) -> Vec<crate::model::BatchDecodeOutput> {
+        let vocab = self.config.vocab_size;
+        let stream = self.matmul.stream();
+        let any_greedy = greedy.iter().any(|&g| g);
+        let all_greedy = greedy.iter().all(|&g| g);
+        if any_greedy && self.greedy_argmax.is_some() {
+            let ga = self.greedy_argmax.as_ref().unwrap();
+            let argmax_out = {
+                let mut ng = self.nograph.borrow_mut();
+                ng.argmax_out
+                    .entry(m)
+                    .or_insert_with(|| {
+                        Arc::new(
+                            cutile::api::zeros::<u32>(&[2 * m])
+                                .sync_on(stream)
+                                .expect("batch argmax out alloc"),
+                        )
+                    })
+                    .clone()
+            };
+            // Zero the packed (key<<32|idx) slots: any real non-NaN float
+            // packs to a nonzero key, so a zeroed slot cannot win.
+            unsafe {
+                cuda_core::sys::cuMemsetD32Async(
+                    argmax_out.device_pointer().cu_deviceptr(),
+                    0,
+                    2 * m as usize,
+                    stream.cu_stream(),
+                );
+            }
+            let logits_base = logits_dev.device_pointer().cu_deviceptr();
+            let out_base = argmax_out.device_pointer().cu_deviceptr();
+            for (r, &g) in greedy.iter().enumerate() {
+                if g {
+                    ga.launch_ptr(
+                        logits_base + (r * vocab * 4) as u64,
+                        out_base + (r * 8) as u64,
+                        vocab,
+                    )
+                    .expect("batch greedy argmax launch");
+                }
+            }
+            let tokens = argmax_out
+                .to_host_vec()
+                .sync_on(stream)
+                .expect("batch argmax download");
+            if all_greedy {
+                return (0..m)
+                    .map(|r| crate::model::BatchDecodeOutput::Token(tokens[2 * r]))
+                    .collect();
+            }
+            // Mixed batch: download the logits for the sampling rows, then
+            // resolve the greedy rows from the already-computed argmax.
+            let logits_flat = self.download_logits(&logits_dev);
+            return (0..m)
+                .map(|r| {
+                    if greedy[r] {
+                        crate::model::BatchDecodeOutput::Token(tokens[2 * r])
+                    } else {
+                        crate::model::BatchDecodeOutput::Logits(
+                            logits_flat[r * vocab..(r + 1) * vocab].to_vec(),
+                        )
+                    }
+                })
+                .collect();
+        }
+
+        let logits_flat = self.download_logits(&logits_dev);
+        let rows: Vec<Vec<f32>> = logits_flat.chunks(vocab).take(m).map(|c| c.to_vec()).collect();
+        assert_eq!(
+            rows.len(),
+            m,
+            "forward_batch_decode (m2p graph): {} logit rows for m={} (logits_flat len {})",
+            rows.len(),
+            m,
+            logits_flat.len()
+        );
+        rows.into_iter()
+            .zip(greedy.iter())
+            .map(|(logits, &g)| {
+                if g {
+                    crate::model::BatchDecodeOutput::Token(crate::model::greedy_argmax_host(&logits))
+                } else {
+                    crate::model::BatchDecodeOutput::Logits(logits)
+                }
+            })
+            .collect()
+    }
+
     /// Batched decode: M requests x 1 token each, processed in a single GPU pass.
     ///
     /// Each request has its own KV cache (`kv_caches[r]`) and current token
@@ -10495,6 +11498,50 @@ impl CutileGpuModel {
                 return vec![crate::model::BatchDecodeOutput::Logits(logits)];
             }
             // None: capture failed -- fall through to the generic path.
+        }
+
+        // -- m>=2 ragged position-synced batch graph (f16/e4m3 pools) ----------
+        // The serving route: every per-step scalar (per-row positions, KV
+        // write offsets, kv_lens, per-layer run base pointers) is device-
+        // read, so the (m, dtype)-keyed graphs are batch-COMPOSITION-
+        // independent -- ragged positions and session churn are fine (that
+        // is the point).  The captured composition is pinned to the
+        // generic no-graph path's per-op kernels (the same gemm_any_d2d_
+        // batch m-loop GEMVs, the same per-(site,m) rmsnorm scratch, the
+        // same table-RoPE rotation, the oxide batch attention, scatter
+        // twins with the generic append's cast bit-math), so graph-routed
+        // and generic-routed steps are bit-identical and the m-dependent
+        // ROUTING is safe (the m=1 precedent).  f32 pools keep the
+        // existing paths (the equal-position graph reads the shared
+        // batch_attn_* arrays with capture-time values).  TEMPURA_NO_
+        // M2P_GRAPH=1 bisects back to the generic path.
+        if m >= 2
+            && m <= self.max_batch_graph
+            && std::env::var("TEMPURA_NO_M2P_GRAPH").as_deref() != Ok("1")
+            && !self.debug_nan_trace
+            && self.oxide_decode_attn.is_some()
+            && kv_caches.iter().all(|kvc| kvc.has_device_kv())
+            && !cfg.use_alibi
+            && positions.iter().all(|&p| {
+                p >= 1 && (p as usize) < self.cutile_rope.table_max_pos()
+            })
+        {
+            let dtype = kv_caches[0].kv_dtype();
+            let dtype_uniform = kv_caches.iter().all(|kvc| kvc.kv_dtype() == dtype);
+            let oda = self.oxide_decode_attn.as_ref().unwrap();
+            let twin_ok = match dtype {
+                crate::cutile_kv_cache::KvDtype::F16 => oda.has_batch_f16(),
+                crate::cutile_kv_cache::KvDtype::E4M3 => oda.has_batch_e4m3(),
+                crate::cutile_kv_cache::KvDtype::F32 => false,
+            };
+            if dtype_uniform && twin_ok {
+                if let Some(out) =
+                    self.forward_batch_ragged_graph(&hidden, positions, kv_caches, greedy)
+                {
+                    return out;
+                }
+                // None: state init failed -- fall through to the generic path.
+            }
         }
 
         // -- Batch CUDA graph path ---------------------------------------------
@@ -11283,97 +12330,8 @@ impl CutileGpuModel {
         // composition-invariant, which the p24 streaming A/B requires.
         let logits_dev = self.gemm_any_d2d_batch(&last_dev, "lm_head.weight", m, self.h_pad, SLOT_LOGITS);
 
-        // Greedy fast path: run the GPU argmax on the device logits BEFORE
-        // any download.  All-greedy batches (serving default) download 8*m
-        // bytes instead of m*vocab f32 (~513KB/row); mixed batches still
-        // download the full tensor for the sampling rows.
-        let any_greedy = greedy.iter().any(|&g| g);
-        let all_greedy = greedy.iter().all(|&g| g);
-        if any_greedy && self.greedy_argmax.is_some() {
-            let ga = self.greedy_argmax.as_ref().unwrap();
-            let argmax_out = {
-                let mut ng = self.nograph.borrow_mut();
-                ng.argmax_out
-                    .entry(m)
-                    .or_insert_with(|| {
-                        Arc::new(
-                            cutile::api::zeros::<u32>(&[2 * m])
-                                .sync_on(stream)
-                                .expect("batch argmax out alloc"),
-                        )
-                    })
-                    .clone()
-            };
-            // Zero the packed (key<<32|idx) slots: any real non-NaN float
-            // packs to a nonzero key, so a zeroed slot cannot win.
-            unsafe {
-                cuda_core::sys::cuMemsetD32Async(
-                    argmax_out.device_pointer().cu_deviceptr(),
-                    0,
-                    2 * m as usize,
-                    stream.cu_stream(),
-                );
-            }
-            let logits_base = logits_dev.device_pointer().cu_deviceptr();
-            let out_base = argmax_out.device_pointer().cu_deviceptr();
-            for (r, &g) in greedy.iter().enumerate() {
-                if g {
-                    ga.launch_ptr(
-                        logits_base + (r * vocab * 4) as u64,
-                        out_base + (r * 8) as u64,
-                        vocab,
-                    )
-                    .expect("batch greedy argmax launch");
-                }
-            }
-            let tokens = argmax_out
-                .to_host_vec()
-                .sync_on(stream)
-                .expect("batch argmax download");
-            if all_greedy {
-                return (0..m)
-                    .map(|r| crate::model::BatchDecodeOutput::Token(tokens[2 * r]))
-                    .collect();
-            }
-            // Mixed batch: download the logits for the sampling rows, then
-            // resolve the greedy rows from the already-computed argmax.
-            let logits_flat = self.download_logits(&logits_dev);
-            return (0..m)
-                .map(|r| {
-                    if greedy[r] {
-                        crate::model::BatchDecodeOutput::Token(tokens[2 * r])
-                    } else {
-                        crate::model::BatchDecodeOutput::Logits(
-                            logits_flat[r * vocab..(r + 1) * vocab].to_vec(),
-                        )
-                    }
-                })
-                .collect();
-        }
-
-        let logits_flat = self.download_logits(&logits_dev);
-
-        // Split into M logit vectors.
-        let rows: Vec<Vec<f32>> = logits_flat.chunks(vocab).take(m).map(|c| c.to_vec()).collect();
-        assert_eq!(
-            rows.len(),
-            m,
-            "forward_batch_decode (no-graph): {} logit rows for m={} (logits_flat len {})",
-            rows.len(),
-            m,
-            logits_flat.len()
-        );
-        rows.into_iter()
-            .zip(greedy.iter())
-            .map(|(logits, &g)| {
-                if g {
-                    // greedy_argmax unavailable (load failure) -- host argmax,
-                    // same semantics.
-                    crate::model::BatchDecodeOutput::Token(crate::model::greedy_argmax_host(&logits))
-                } else {
-                    crate::model::BatchDecodeOutput::Logits(logits)
-                }
-            })
-            .collect()
+        // Greedy argmax / download tail shared with the ragged-graph route
+        // (extracted verbatim -- same kernels, same semantics).
+        self.finish_batch_outputs(&logits_dev, m, greedy)
     }
 }

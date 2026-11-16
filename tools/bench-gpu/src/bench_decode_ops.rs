@@ -703,6 +703,263 @@ fn main() {
         all_ok &= ok8;
     }
 
+    // ---- 3c. per-row-offset batch scatter twins (ragged graph route) ----
+    // The m>=2 ragged CUDA-graph route appends K/V for all M sequences in
+    // ONE kv_scatter_write_rows{,_f16,_e4m3} launch: per-row src pointer,
+    // per-row cache base, and per-row write offset all read from device
+    // arrays.  Composition invariance requires the batch kernels to be
+    // BIT-IDENTICAL to the per-row twins (the generic append path's
+    // semantics): different data per row, different offsets per row, and
+    // untouched rows stay zero.
+    {
+        let m = 4usize;
+        // Distinct adversarial data per row (row r = adversarial lane set
+        // rotated by r; the RNE-tie/saturation/NaN lanes land on different
+        // elements per row).
+        let row_data: Vec<Vec<f32>> = (0..m)
+            .map(|r| {
+                let mut v = prng_data(kv_dim, 40 + r as u32);
+                let adv: Vec<f32> = vec![
+                    0.0, -0.0, 1.0, -1.0, 1.0625, 1.1875, 15.5, 0.015625, 0.01, -0.001, 448.0,
+                    -448.0, 449.0, 1e30, -1e30, f32::INFINITY, f32::NEG_INFINITY, f32::NAN,
+                    65505.0, 65520.0, 6.1035156e-5, 5.96e-8, 2.98e-8, 1e-8, -1e-8, 0.5,
+                    0.49999997,
+                ];
+                for (i, a) in adv.iter().enumerate() {
+                    v[(i + r * 37) % kv_dim] = *a;
+                }
+                v
+            })
+            .collect();
+        let row_offs: Vec<i32> = vec![7, 0, 15, 3];
+        let src_ptrs: Vec<u64> = (0..m)
+            .map(|r| {
+                upload(row_data[r].clone(), &stream)
+                    .device_pointer()
+                    .cu_deviceptr()
+            })
+            .collect();
+        // Device arrays: src ptrs, cache bases (all rows share the pool
+        // base -- the kernel adds off * kv_dim), per-row offsets.
+        let mut src_ptrs_dev: cuda_core::sys::CUdeviceptr = 0;
+        let mut bases_dev: cuda_core::sys::CUdeviceptr = 0;
+        let mut offs_dev: cuda_core::sys::CUdeviceptr = 0;
+        let rc1 = unsafe {
+            cuda_core::sys::cuMemAlloc_v2(&mut src_ptrs_dev, m * 8)
+        };
+        let rc2 = unsafe { cuda_core::sys::cuMemAlloc_v2(&mut bases_dev, m * 8) };
+        let rc3 = unsafe { cuda_core::sys::cuMemAlloc_v2(&mut offs_dev, m * 4) };
+        assert_eq!((rc1, rc2, rc3), (0, 0, 0), "rows probe array allocs");
+        unsafe {
+            cuda_core::sys::cuMemcpyHtoD_v2(
+                src_ptrs_dev,
+                src_ptrs.as_ptr() as *const std::ffi::c_void,
+                m * 8,
+            );
+        }
+
+        // f32 rows: batch vs per-row twins on an f32 pool.
+        {
+            let pool: Arc<Tensor<f32>> = api::zeros::<f32>(&[rows * kv_dim])
+                .sync_on(&stream)
+                .expect("rows probe f32 pool alloc")
+                .into();
+            let bases: Vec<u64> = vec![pool.device_pointer().cu_deviceptr(); m];
+            unsafe {
+                cuda_core::sys::cuMemcpyHtoD_v2(
+                    bases_dev,
+                    bases.as_ptr() as *const std::ffi::c_void,
+                    m * 8,
+                );
+                cuda_core::sys::cuMemcpyHtoD_v2(
+                    offs_dev,
+                    row_offs.as_ptr() as *const std::ffi::c_void,
+                    m * 4,
+                );
+            }
+            scatter
+                .copy_m_with_per_row_offsets(
+                    src_ptrs_dev,
+                    bases_dev,
+                    offs_dev,
+                    kv_dim as u32,
+                    m as u32,
+                    cu_stream,
+                )
+                .expect("rows f32 batch scatter failed");
+            let batch_out = download(&pool, &stream);
+
+            let pool2: Arc<Tensor<f32>> = api::zeros::<f32>(&[rows * kv_dim])
+                .sync_on(&stream)
+                .expect("rows probe f32 pool2 alloc")
+                .into();
+            for r in 0..m {
+                let mut off_bits = [0u32; 1];
+                off_bits[0] = row_offs[r] as u32;
+                let off_t = upload(vec![f32::from_bits(off_bits[0])], &stream);
+                scatter
+                    .copy_with_device_offset(
+                        src_ptrs[r],
+                        pool2.device_pointer().cu_deviceptr(),
+                        off_t.device_pointer().cu_deviceptr(),
+                        kv_dim as u32,
+                        cu_stream,
+                    )
+                    .expect("rows f32 twin scatter failed");
+            }
+            let twin_out = download(&pool2, &stream);
+            let mismatches = batch_out
+                .iter()
+                .zip(&twin_out)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let ok = mismatches == 0;
+            println!(
+                "  kv scatter write rows f32 (m={m}): {} ({mismatches} mismatched elements)",
+                if ok { "PASS" } else { "FAIL" }
+            );
+            all_ok &= ok;
+        }
+
+        // f16 rows.
+        {
+            let pool: Arc<Tensor<half::f16>> = api::zeros::<half::f16>(&[rows * kv_dim])
+                .sync_on(&stream)
+                .expect("rows probe f16 pool alloc")
+                .into();
+            let pool_ptr = pool.device_pointer().cu_deviceptr();
+            let bases: Vec<u64> = vec![pool_ptr; m];
+            unsafe {
+                cuda_core::sys::cuMemcpyHtoD_v2(
+                    bases_dev,
+                    bases.as_ptr() as *const std::ffi::c_void,
+                    m * 8,
+                );
+            }
+            scatter
+                .copy_m_with_per_row_offsets_f16(
+                    src_ptrs_dev,
+                    bases_dev,
+                    offs_dev,
+                    kv_dim as u32,
+                    m as u32,
+                    cu_stream,
+                )
+                .expect("rows f16 batch scatter failed");
+            let batch_out: Vec<u16> = Arc::clone(&pool)
+                .to_host_vec()
+                .sync_on(&stream)
+                .expect("rows probe f16 download")
+                .iter()
+                .map(|h| h.to_bits())
+                .collect();
+
+            let pool2: Arc<Tensor<half::f16>> = api::zeros::<half::f16>(&[rows * kv_dim])
+                .sync_on(&stream)
+                .expect("rows probe f16 pool2 alloc")
+                .into();
+            for r in 0..m {
+                let off_t = upload(vec![f32::from_bits(row_offs[r] as u32)], &stream);
+                scatter
+                    .copy_with_device_offset_f16(
+                        src_ptrs[r],
+                        pool2.device_pointer().cu_deviceptr(),
+                        off_t.device_pointer().cu_deviceptr(),
+                        kv_dim as u32,
+                        cu_stream,
+                    )
+                    .expect("rows f16 twin scatter failed");
+            }
+            let twin_out: Vec<u16> = Arc::clone(&pool2)
+                .to_host_vec()
+                .sync_on(&stream)
+                .expect("rows probe f16 twin download")
+                .iter()
+                .map(|h| h.to_bits())
+                .collect();
+            let mismatches = batch_out
+                .iter()
+                .zip(&twin_out)
+                .filter(|(a, b)| a != b)
+                .count();
+            let ok = mismatches == 0;
+            println!(
+                "  kv scatter write rows f16 (m={m}): {} ({mismatches} mismatched elements)",
+                if ok { "PASS" } else { "FAIL" }
+            );
+            all_ok &= ok;
+        }
+
+        // e4m3 rows.
+        {
+            let pool: Arc<Tensor<u8>> = api::zeros::<u8>(&[rows * kv_dim])
+                .sync_on(&stream)
+                .expect("rows probe e4m3 pool alloc")
+                .into();
+            let pool_ptr = pool.device_pointer().cu_deviceptr();
+            let bases: Vec<u64> = vec![pool_ptr; m];
+            unsafe {
+                cuda_core::sys::cuMemcpyHtoD_v2(
+                    bases_dev,
+                    bases.as_ptr() as *const std::ffi::c_void,
+                    m * 8,
+                );
+            }
+            scatter
+                .copy_m_with_per_row_offsets_e4m3(
+                    src_ptrs_dev,
+                    bases_dev,
+                    offs_dev,
+                    kv_dim as u32,
+                    m as u32,
+                    cu_stream,
+                )
+                .expect("rows e4m3 batch scatter failed");
+            let batch_out: Vec<u8> = Arc::clone(&pool)
+                .to_host_vec()
+                .sync_on(&stream)
+                .expect("rows probe e4m3 download");
+
+            let pool2: Arc<Tensor<u8>> = api::zeros::<u8>(&[rows * kv_dim])
+                .sync_on(&stream)
+                .expect("rows probe e4m3 pool2 alloc")
+                .into();
+            for r in 0..m {
+                let off_t = upload(vec![f32::from_bits(row_offs[r] as u32)], &stream);
+                scatter
+                    .copy_with_device_offset_e4m3(
+                        src_ptrs[r],
+                        pool2.device_pointer().cu_deviceptr(),
+                        off_t.device_pointer().cu_deviceptr(),
+                        kv_dim as u32,
+                        cu_stream,
+                    )
+                    .expect("rows e4m3 twin scatter failed");
+            }
+            let twin_out: Vec<u8> = Arc::clone(&pool2)
+                .to_host_vec()
+                .sync_on(&stream)
+                .expect("rows probe e4m3 twin download");
+            let mismatches = batch_out
+                .iter()
+                .zip(&twin_out)
+                .filter(|(a, b)| a != b)
+                .count();
+            let ok = mismatches == 0;
+            println!(
+                "  kv scatter write rows e4m3 (m={m}): {} ({mismatches} mismatched elements)",
+                if ok { "PASS" } else { "FAIL" }
+            );
+            all_ok &= ok;
+        }
+
+        unsafe {
+            cuda_core::sys::cuMemFree_v2(src_ptrs_dev);
+            cuda_core::sys::cuMemFree_v2(bases_dev);
+            cuda_core::sys::cuMemFree_v2(offs_dev);
+        }
+    }
+
     // ---- 3b. On-device prefill attention (gather/flash/scatter) ----
     // The new prefill path (prefill_attention_device) must match the CPU
     // causal GQA reference on RANDOM data at every shape class: partial

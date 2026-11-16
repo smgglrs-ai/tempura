@@ -352,6 +352,273 @@ done_batch:
     ret;
 }
 
+// Per-row-offset batch entries (kv_scatter_write_rows{,_f16,_e4m3}):
+//   Grid:  (ceil(kv_dim / BLOCK_SIZE), M, 1).
+//   Block: BLOCK_SIZE threads.
+//   Params: src_ptrs (*const u64 [M]), cache_bases (*const u64 [M]),
+//           write_offs (*const i32 [M] -- PER-ROW write slot), kv_dim (u32),
+//           m (u32).
+// The ragged (position-synced) batch CUDA-graph route: each sequence r has
+// its OWN write offset (its session's kv_len), read from write_offs[r] at
+// EXECUTION time, and its own source pointer and cache base, read from the
+// device pointer arrays.  Everything per-step is device-read, so a captured
+// graph is batch-COMPOSITION-independent (any M sessions of the same pool
+// dtype share one graph; the arrays are re-uploaded H->D before each
+// replay).  The cast bit-math is the twin kernels' verbatim (f16:
+// cvt.rn.f16.f32; e4m3: the shared e4m3::f32_to_e4m3_bits port), so the
+// pool bytes are bit-identical to both the per-row twins and the generic
+// append path's cast + D2D -- probe-gated in bench-decode-ops alongside
+// the twins.
+//
+// Per-row-offset batch entry (f32): every sequence reads its own write
+// offset from write_offs[blockIdx.y].
+.visible .entry kv_scatter_write_rows(
+    .param .u64 param_src_ptrs,
+    .param .u64 param_cache_bases,
+    .param .u64 param_write_offs,
+    .param .u32 param_kv_dim,
+    .param .u32 param_m
+)
+{
+    // %r0 = kv_dim  %r1 = ctaid.x  %r2 = ntid.x  %r3 = tid  %r4 = write_off
+    // %r5 = seq_idx  %r6 = m
+    // %rd0 = src_ptrs  %rd1 = cache_bases  %rd2 = write_offs
+    // %rd3 = src_ptr  %rd4 = cache_base  %rd5 = seq64  %rd6 = scratch
+    // %rd7 = kv_dim64  %rd8 = tid64  %rd9 = dst_elem  %rd10 = dst_byte
+    // %rd11 = src_byte
+    .reg .u32   %r<8>;
+    .reg .u64   %rd<12>;
+    .reg .f32   %f1;
+    .reg .pred  %p1;
+
+    ld.param.u64 %rd0, [param_src_ptrs];
+    ld.param.u64 %rd1, [param_cache_bases];
+    ld.param.u64 %rd2, [param_write_offs];
+    ld.param.u32 %r0,  [param_kv_dim];
+    ld.param.u32 %r6,  [param_m];
+
+    mov.u32 %r5, %ctaid.y;
+    setp.ge.u32 %p1, %r5, %r6;
+    @%p1 bra done_rows;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r3, %r1, %r2, %r3;
+
+    setp.ge.u32 %p1, %r3, %r0;
+    @%p1 bra done_rows;
+
+    cvt.u64.u32 %rd5, %r5;
+    shl.b64     %rd6, %rd5, 3;
+
+    add.u64       %rd3, %rd0, %rd6;
+    ld.global.u64 %rd3, [%rd3];
+
+    add.u64       %rd4, %rd1, %rd6;
+    ld.global.u64 %rd4, [%rd4];
+
+    // per-row write offset: write_offs[seq_idx]
+    shl.b64       %rd6, %rd5, 2;
+    add.u64       %rd6, %rd2, %rd6;
+    ld.global.s32 %r4,  [%rd6];
+    cvt.u64.s32   %rd6, %r4;
+    cvt.u64.u32   %rd7, %r0;
+    cvt.u64.u32   %rd8, %r3;
+
+    mul.lo.u64  %rd9, %rd6, %rd7;
+    add.u64     %rd9, %rd9, %rd8;
+
+    shl.b64  %rd10, %rd9, 2;
+    add.u64  %rd10, %rd4, %rd10;
+
+    shl.b64  %rd11, %rd8, 2;
+    add.u64  %rd11, %rd3, %rd11;
+
+    ld.global.f32 %f1, [%rd11];
+    st.global.f32 [%rd10], %f1;
+
+done_rows:
+    ret;
+}
+
+// Per-row-offset batch f16 twin: same addressing, cvt.rn.f16.f32 + b16 store.
+.visible .entry kv_scatter_write_rows_f16(
+    .param .u64 param_src_ptrs,
+    .param .u64 param_cache_bases,
+    .param .u64 param_write_offs,
+    .param .u32 param_kv_dim,
+    .param .u32 param_m
+)
+{
+    .reg .u32   %r<8>;
+    .reg .u64   %rd<12>;
+    .reg .b16   %h1;
+    .reg .f32   %f1;
+    .reg .pred  %p1;
+
+    ld.param.u64 %rd0, [param_src_ptrs];
+    ld.param.u64 %rd1, [param_cache_bases];
+    ld.param.u64 %rd2, [param_write_offs];
+    ld.param.u32 %r0,  [param_kv_dim];
+    ld.param.u32 %r6,  [param_m];
+
+    mov.u32 %r5, %ctaid.y;
+    setp.ge.u32 %p1, %r5, %r6;
+    @%p1 bra done_rows_f16;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r3, %r1, %r2, %r3;
+
+    setp.ge.u32 %p1, %r3, %r0;
+    @%p1 bra done_rows_f16;
+
+    cvt.u64.u32 %rd5, %r5;
+    shl.b64     %rd6, %rd5, 3;
+
+    add.u64       %rd3, %rd0, %rd6;
+    ld.global.u64 %rd3, [%rd3];
+
+    add.u64       %rd4, %rd1, %rd6;
+    ld.global.u64 %rd4, [%rd4];
+
+    shl.b64       %rd6, %rd5, 2;
+    add.u64       %rd6, %rd2, %rd6;
+    ld.global.s32 %r4,  [%rd6];
+    cvt.u64.s32   %rd6, %r4;
+    cvt.u64.u32   %rd7, %r0;
+    cvt.u64.u32   %rd8, %r3;
+
+    mul.lo.u64  %rd9, %rd6, %rd7;
+    add.u64     %rd9, %rd9, %rd8;
+
+    shl.b64  %rd10, %rd9, 1;
+    add.u64  %rd10, %rd4, %rd10;
+
+    shl.b64  %rd11, %rd8, 2;
+    add.u64  %rd11, %rd3, %rd11;
+
+    ld.global.f32  %f1, [%rd11];
+    cvt.rn.f16.f32  %h1, %f1;
+    st.global.b16  [%rd10], %h1;
+
+done_rows_f16:
+    ret;
+}
+
+// Per-row-offset batch e4m3 twin: same addressing, e4m3 bit-math + u8 store.
+// Register use mirrors the single-seq twin; %r7 is the (single) scratch reg.
+.visible .entry kv_scatter_write_rows_e4m3(
+    .param .u64 param_src_ptrs,
+    .param .u64 param_cache_bases,
+    .param .u64 param_write_offs,
+    .param .u32 param_kv_dim,
+    .param .u32 param_m
+)
+{
+    // %r9 = x bits  %r10 = sign8  %r11 = abs  %r12 = clamped bits  %r13 = exp
+    // %r14 = is_norm  %r15 = man/dropped  %r16 = kept  %r17 = round_up
+    // %r18 = eq_half/carry  %r19 = is_nan  %r7 = scratch
+    .reg .u32   %r<20>;
+    .reg .u64   %rd<12>;
+    .reg .f32   %f<3>;
+    .reg .pred  %p1;
+
+    ld.param.u64 %rd0, [param_src_ptrs];
+    ld.param.u64 %rd1, [param_cache_bases];
+    ld.param.u64 %rd2, [param_write_offs];
+    ld.param.u32 %r0,  [param_kv_dim];
+    ld.param.u32 %r6,  [param_m];
+
+    mov.u32 %r5, %ctaid.y;
+    setp.ge.u32 %p1, %r5, %r6;
+    @%p1 bra done_rows_e4m3;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r3, %r1, %r2, %r3;
+
+    setp.ge.u32 %p1, %r3, %r0;
+    @%p1 bra done_rows_e4m3;
+
+    cvt.u64.u32 %rd5, %r5;
+    shl.b64     %rd6, %rd5, 3;
+
+    add.u64       %rd3, %rd0, %rd6;
+    ld.global.u64 %rd3, [%rd3];
+
+    add.u64       %rd4, %rd1, %rd6;
+    ld.global.u64 %rd4, [%rd4];
+
+    shl.b64       %rd6, %rd5, 2;
+    add.u64       %rd6, %rd2, %rd6;
+    ld.global.s32 %r4,  [%rd6];
+    cvt.u64.s32   %rd6, %r4;
+    cvt.u64.u32   %rd7, %r0;
+    cvt.u64.u32   %rd8, %r3;
+
+    mul.lo.u64  %rd9, %rd6, %rd7;
+    add.u64     %rd9, %rd9, %rd8;
+    add.u64     %rd10, %rd4, %rd9;         // dst byte addr (1 byte/elem)
+
+    shl.b64  %rd11, %rd8, 2;
+    add.u64  %rd11, %rd3, %rd11;
+    ld.global.f32 %f1, [%rd11];
+
+    // NaN detect on the ORIGINAL bits: abs > inf-bits.
+    mov.b32 %r9, %f1;
+    and.b32 %r11, %r9, 0x7FFFFFFF;
+    setp.gt.u32 %p1, %r11, 0x7F800000;
+    selp.b32 %r19, 1, 0, %p1;              // is_nan
+
+    max.f32 %f2, %f1, 0fC3E00000;          // -448.0
+    min.f32 %f2, %f2, 0f43E00000;          //  448.0
+
+    mov.b32 %r12, %f2;
+    and.b32 %r11, %r12, 0x7FFFFFFF;        // abs (clamped)
+    shr.u32 %r13, %r11, 23;                // exp
+    shr.u32 %r10, %r12, 24;
+    and.b32 %r10, %r10, 0x80;              // sign8
+
+    setp.gt.u32 %p1, %r13, 120;
+    selp.b32 %r14, 1, 0, %p1;              // is_norm
+
+    and.b32 %r15, %r11, 0x007FFFFF;        // man
+    shr.u32 %r16, %r15, 20;                // kept
+    and.b32 %r15, %r15, 0x000FFFFF;        // dropped
+
+    setp.gt.u32 %p1, %r15, 0x00080000;
+    selp.b32 %r17, 1, 0, %p1;              // gt_half
+    setp.eq.u32 %p1, %r15, 0x00080000;
+    selp.b32 %r18, 1, 0, %p1;              // eq_half
+    and.b32 %r7, %r16, 1;                  // kept LSB
+    and.b32 %r7, %r7, %r18;                // eq_half && odd
+    add.u32 %r17, %r17, %r7;               // round_up (0/1)
+
+    add.u32 %r16, %r16, %r17;              // kept2
+    setp.eq.u32 %p1, %r16, 8;
+    selp.b32 %r15, 0, %r16, %p1;           // man_f
+    selp.b32 %r18, 1, 0, %p1;              // carry
+    sub.u32 %r13, %r13, 120;               // e2
+    add.u32 %r13, %r13, %r18;
+    shl.b32 %r13, %r13, 3;
+    or.b32  %r13, %r13, %r15;
+    or.b32  %r13, %r13, %r10;              // body
+
+    setp.ne.b32 %p1, %r14, 0;
+    selp.b32 %r13, %r13, %r10, %p1;
+    setp.ne.b32 %p1, %r19, 0;
+    selp.b32 %r13, 0x7F, %r13, %p1;
+
+    st.global.u8 [%rd10], %r13;
+
+done_rows_e4m3:
+    ret;
+}
+
 // Row-gather entry: dst[tid] = src[pos * row_len + tid], pos from device memory.
 // The position scalar is uploaded by the engine as an f32 bitcast, so it is
 // read back with ld.global.s32 (the register is untyped; the bit pattern is
@@ -424,6 +691,9 @@ const KERNEL_NAME_F16: &str = "kv_scatter_write_f16";
 const KERNEL_NAME_E4M3: &str = "kv_scatter_write_e4m3";
 const KERNEL_NAME_BATCH: &str = "kv_scatter_write_batch";
 const KERNEL_NAME_GATHER: &str = "d2d_gather_row";
+const KERNEL_NAME_ROWS: &str = "kv_scatter_write_rows";
+const KERNEL_NAME_ROWS_F16: &str = "kv_scatter_write_rows_f16";
+const KERNEL_NAME_ROWS_E4M3: &str = "kv_scatter_write_rows_e4m3";
 
 /// Scatter-write kernel loader and launcher.
 ///
@@ -437,6 +707,9 @@ pub struct KvScatterWrite {
     cu_function_e4m3:   sys::CUfunction,
     cu_function_batch:  sys::CUfunction,
     cu_function_gather: sys::CUfunction,
+    cu_function_rows: sys::CUfunction,
+    cu_function_rows_f16: sys::CUfunction,
+    cu_function_rows_e4m3: sys::CUfunction,
 }
 
 unsafe impl Send for KvScatterWrite {}
@@ -524,7 +797,22 @@ impl KvScatterWrite {
             )));
         }
 
-        Ok(Self { cu_module, cu_function, cu_function_f16, cu_function_e4m3, cu_function_batch, cu_function_gather })
+        let resolve = |name: &str| -> Result<sys::CUfunction> {
+            let cname = std::ffi::CString::new(name).unwrap();
+            let mut f = std::ptr::null_mut::<sys::CUfunc_st>();
+            let rc = unsafe { sys::cuModuleGetFunction(&mut f, cu_module, cname.as_ptr()) };
+            if rc != 0 {
+                return Err(KernelError::InvalidConfig(format!(
+                    "KvScatterWrite: cuModuleGetFunction({name}) failed: {rc}"
+                )));
+            }
+            Ok(f)
+        };
+        let cu_function_rows = resolve(KERNEL_NAME_ROWS)?;
+        let cu_function_rows_f16 = resolve(KERNEL_NAME_ROWS_F16)?;
+        let cu_function_rows_e4m3 = resolve(KERNEL_NAME_ROWS_E4M3)?;
+
+        Ok(Self { cu_module, cu_function, cu_function_f16, cu_function_e4m3, cu_function_batch, cu_function_gather, cu_function_rows, cu_function_rows_f16, cu_function_rows_e4m3 })
     }
 
     /// Copy `kv_dim` f32 elements from `src_ptr` into
@@ -711,6 +999,128 @@ impl KvScatterWrite {
         if rc != 0 {
             return Err(KernelError::InvalidConfig(format!(
                 "KvScatterWrite::copy_m_with_device_offsets cuLaunchKernel failed: {rc}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Per-row-offset batch scatter for RAGGED (position-synced) batches:
+    /// like [`Self::copy_m_with_device_offsets`] but every sequence r reads
+    /// its OWN write slot from `write_offs_dev[r]` (an `[m] i32` device
+    /// array) -- each session's kv_len, not a shared synchronised offset.
+    ///
+    /// `src_ptrs_dev` / `cache_bases_dev` are `[m] u64` device arrays read
+    /// at execution time, so a CUDA graph capturing this kernel is
+    /// batch-composition-independent (the arrays are re-uploaded H->D
+    /// before each replay).  The f32 flavor stores raw f32 elements.
+    pub fn copy_m_with_per_row_offsets(
+        &self,
+        src_ptrs_dev:    sys::CUdeviceptr,
+        cache_bases_dev: sys::CUdeviceptr,
+        write_offs_dev:  sys::CUdeviceptr,
+        kv_dim:          u32,
+        m:               u32,
+        cu_stream:       sys::CUstream,
+    ) -> Result<()> {
+        self.launch_rows(
+            self.cu_function_rows,
+            src_ptrs_dev,
+            cache_bases_dev,
+            write_offs_dev,
+            kv_dim,
+            m,
+            cu_stream,
+        )
+    }
+
+    /// [`Self::copy_m_with_per_row_offsets`] for an f16 KV pool: the f32
+    /// source is converted with cvt.rn.f16.f32 (bit-identical to both the
+    /// single-seq f16 twin and the generic append path's cutile_cast_f32_f16)
+    /// and stored as u16 elements.
+    pub fn copy_m_with_per_row_offsets_f16(
+        &self,
+        src_ptrs_dev:    sys::CUdeviceptr,
+        cache_bases_dev: sys::CUdeviceptr,
+        write_offs_dev:  sys::CUdeviceptr,
+        kv_dim:          u32,
+        m:               u32,
+        cu_stream:       sys::CUstream,
+    ) -> Result<()> {
+        self.launch_rows(
+            self.cu_function_rows_f16,
+            src_ptrs_dev,
+            cache_bases_dev,
+            write_offs_dev,
+            kv_dim,
+            m,
+            cu_stream,
+        )
+    }
+
+    /// [`Self::copy_m_with_per_row_offsets`] for an e4m3 KV pool: the f32
+    /// source is converted with the shared e4m3 bit-math (bit-identical to
+    /// both the single-seq e4m3 twin and cutile_cast_f32_e4m3) and stored
+    /// as u8 elements.
+    pub fn copy_m_with_per_row_offsets_e4m3(
+        &self,
+        src_ptrs_dev:    sys::CUdeviceptr,
+        cache_bases_dev: sys::CUdeviceptr,
+        write_offs_dev:  sys::CUdeviceptr,
+        kv_dim:          u32,
+        m:               u32,
+        cu_stream:       sys::CUstream,
+    ) -> Result<()> {
+        self.launch_rows(
+            self.cu_function_rows_e4m3,
+            src_ptrs_dev,
+            cache_bases_dev,
+            write_offs_dev,
+            kv_dim,
+            m,
+            cu_stream,
+        )
+    }
+
+    fn launch_rows(
+        &self,
+        cu_function:     sys::CUfunction,
+        src_ptrs_dev:    sys::CUdeviceptr,
+        cache_bases_dev: sys::CUdeviceptr,
+        write_offs_dev:  sys::CUdeviceptr,
+        kv_dim:          u32,
+        m:               u32,
+        cu_stream:       sys::CUstream,
+    ) -> Result<()> {
+        let grid_x = kv_dim.div_ceil(BLOCK_SIZE);
+
+        let mut p_srcs  = src_ptrs_dev;
+        let mut p_bases = cache_bases_dev;
+        let mut p_woffs = write_offs_dev;
+        let mut p_dim   = kv_dim;
+        let mut p_m     = m;
+
+        let mut params: [*mut std::ffi::c_void; 5] = [
+            &mut p_srcs  as *mut _ as *mut std::ffi::c_void,
+            &mut p_bases as *mut _ as *mut std::ffi::c_void,
+            &mut p_woffs as *mut _ as *mut std::ffi::c_void,
+            &mut p_dim   as *mut _ as *mut std::ffi::c_void,
+            &mut p_m     as *mut _ as *mut std::ffi::c_void,
+        ];
+
+        let rc = unsafe {
+            sys::cuLaunchKernel(
+                cu_function,
+                grid_x, m, 1,
+                BLOCK_SIZE, 1, 1,
+                0,
+                cu_stream,
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "KvScatterWrite::copy_m_with_per_row_offsets cuLaunchKernel failed: {rc}"
             )));
         }
         Ok(())
