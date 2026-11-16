@@ -5281,6 +5281,104 @@ impl CutileGpuModel {
             return out;
         }
 
+        // Q6K batch db: the same recipe for the Q6K projections (v/down_proj
+        // and a quantized lm_head in Q4_K_M -- the remaining per-row GEMVs:
+        // ~1.65 GB/layer-set + 431 MB lm_head per STEP x m). The kernel is
+        // the kpar8_db warp structure (the per-row variant this path
+        // dispatches by default) with an m-loop, so every output row is
+        // BIT-IDENTICAL to running the per-row GEMV on that row alone
+        // (bench-probe-q6k-batch: bit-exact on random data at m in
+        // {1,2,4,6} across the v/down/lm_head shapes): composition-invariant
+        // at any m. m == 1 keeps the direct per-row kpar GEMV (verified
+        // bit-identical at m=1 by the probe -- m-dependent DISPATCH, no
+        // m-dependent NUMERICS). TEMPURA_NO_SM120_Q6K_BATCH=1 bisects back
+        // to the per-row GEMVs.
+        let use_q6k_db_batch = is_q6k
+            && m >= 2
+            && std::env::var("TEMPURA_NO_SM120_Q6K_BATCH").as_deref() != Ok("1")
+            && self
+                .oxide_q6k_gemv
+                .as_ref()
+                .map(|o| o.has_sm120_db_batch())
+                .unwrap_or(false);
+        if use_q6k_db_batch {
+            let dw = self.device_weights_q6k.get(weight_name).unwrap();
+            let k = dw.k_blocks * tempura_kernels::cutile_quantized_gemm::Q6K_QK;
+            // Compact row-major [m, k] activation (the db batch kernel reads
+            // flat f32 rows; the Q8_1 quantize step the Q4K arm needs does
+            // not apply here). Shared with the Q4K arm's pool: keyed by
+            // (slot, k, m), and a given slot+model has one k per weight.
+            let act: Arc<Tensor<f32>> = if a.size() == m * k {
+                a.clone()
+            } else {
+                let compact = {
+                    let mut pool = self.nograph.borrow_mut();
+                    pool.q4k_batch_act
+                        .entry((slot, k, m))
+                        .or_insert_with(|| {
+                            Arc::new(
+                                api::zeros::<f32>(&[m * k])
+                                    .sync_on(stream)
+                                    .expect("gemm_any_d2d_batch: q6k batch act alloc"),
+                            )
+                        })
+                        .clone()
+                };
+                for r in 0..m {
+                    unsafe {
+                        cuda_core::memcpy_dtod_async::<f32>(
+                            compact.device_pointer().cu_deviceptr() + (r * k * 4) as u64,
+                            a.device_pointer().cu_deviceptr() + (r * row_stride * 4) as u64,
+                            k,
+                            stream,
+                        )
+                        .expect("gemm_any_d2d_batch: q6k batch act compact D->D");
+                    }
+                }
+                compact
+            };
+            // Output [m, n]: same cached buffer the per-row path uses. Safe
+            // to reuse -- the kernel fully overwrites rows [0, m) x [0, n)
+            // (one block per output neuron, direct st.global writes).
+            let out: Arc<Tensor<f32>> = {
+                let mut pool = self.nograph.borrow_mut();
+                match pool.gemm_out.get(&(slot, n, m)) {
+                    Some(buf) => buf.clone(),
+                    None => {
+                        let buf = Arc::new(
+                            api::zeros::<f32>(&[m * n])
+                                .sync_on(stream)
+                                .expect("gemm_any_d2d_batch: output alloc"),
+                        );
+                        pool.gemm_out.insert((slot, n, m), buf.clone());
+                        buf
+                    }
+                }
+            };
+            let oxide = self.oxide_q6k_gemv.as_ref().unwrap();
+            let mut row_start = 0;
+            while row_start < m {
+                let rows = (m - row_start).min(16);
+                oxide
+                    .forward_sm120_db_batch_d2d_rows(
+                        &act,
+                        row_start,
+                        &dw.tensor,
+                        &out,
+                        row_start,
+                        rows,
+                        n,
+                        dw.k_blocks,
+                        stream.cu_stream(),
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!("gemm_any_d2d_batch: Q6K db batch GEMM {weight_name}: {e}")
+                    });
+                row_start += rows;
+            }
+            return out;
+        }
+
         // Fallback: M sequential GEMVs (no L2 reuse but still GPU-resident).
         // Output buffer cached by (slot, n, m) and the activation row by
         // (slot, row_stride): the fresh `api::zeros(...).sync_on(...)` this
