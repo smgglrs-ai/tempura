@@ -27,6 +27,31 @@ use cuda_core::sys;
 //           write_off_ptr (u64 -> *const i32 -- single offset shared by all seqs),
 //           kv_dim (u32), m (u32).
 //
+// f16 twin (kv_scatter_write_f16): same addressing as the f32 entry, but
+// the f32 source element is converted with cvt.rn.f16.f32 (IEEE
+// round-to-nearest-even, subnormals preserved -- no .ftz) and stored as a
+// b16 element.  This must stay BIT-IDENTICAL to the generic KV append
+// path's cast kernel (cutile_cast_f32_f16, convert_tile f32->f16): a
+// session decoded alone through the captured graph must produce the same
+// pool bytes as the same session decoded inside a batch, which appends
+// via cast + D2D.  Parity is probe-gated in bench-decode-ops ("kv
+// scatter-write dtype twins") against both the cast kernel and the CPU
+// half::f16::from_f32 reference on adversarial data.
+//
+// Params: identical to kv_scatter_write (src is f32, cache_base is a u16
+// element array).
+//
+// e4m3 twin (kv_scatter_write_e4m3): scalar PTX port of the ONE shared
+// implementation tempura_kernels::e4m3::f32_to_e4m3_bits (which the
+// cutile_cast_f32_e4m3 tile kernel also mirrors bit-for-bit): RNE on the
+// 20 dropped mantissa bits, saturation to +-448, subnormal flush (f32
+// exponent < 121 -> signed zero), NaN -> 0x7F.  Stored as a u8 element.
+// The min/max clamp runs on the ORIGINAL f32 (NaN lanes are overridden by
+// the is_nan select at the end, matching the cutile kernel's select
+// order); the round-up carry (kept == 7 -> mantissa 0, exponent +1) can
+// only reach e2 = 16 from values >= 464, which the 448 clamp made
+// unreachable.
+
 // Row-gather kernel (d2d_gather_row):
 //   Grid:  ceil(row_len / BLOCK_SIZE) blocks.
 //   Block: BLOCK_SIZE threads.
@@ -92,6 +117,158 @@ const PTX_SOURCE: &str = r#"
     st.global.f32 [%rd7], %f1;
 
 done_single:
+    ret;
+}
+
+// f16 twin: dst element index = row * kv_dim + tid, byte address = 2 * elem.
+.visible .entry kv_scatter_write_f16(
+    .param .u64 param_src,
+    .param .u64 param_cache_base,
+    .param .u64 param_write_off_ptr,
+    .param .u32 param_kv_dim
+)
+{
+    .reg .u32   %r<8>;
+    .reg .u64   %rd<10>;
+    .reg .b16   %h1;
+    .reg .f32   %f1;
+    .reg .pred  %p1;
+
+    ld.param.u64 %rd0, [param_src];
+    ld.param.u64 %rd1, [param_cache_base];
+    ld.param.u64 %rd2, [param_write_off_ptr];
+    ld.param.u32 %r0,  [param_kv_dim];
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r3, %r1, %r2, %r3;
+
+    setp.ge.u32 %p1, %r3, %r0;
+    @%p1 bra done_f16;
+
+    ld.global.s32 %r4,  [%rd2];
+    cvt.u64.s32   %rd3, %r4;
+    cvt.u64.u32   %rd4, %r0;
+    cvt.u64.u32   %rd5, %r3;
+
+    mul.lo.u64  %rd6, %rd3, %rd4;
+    add.u64     %rd6, %rd6, %rd5;
+
+    shl.b64  %rd7, %rd6, 1;
+    add.u64  %rd7, %rd1, %rd7;
+
+    shl.b64  %rd8, %rd5, 2;
+    add.u64  %rd8, %rd0, %rd8;
+
+    ld.global.f32  %f1, [%rd8];
+    cvt.rn.f16.f32  %h1, %f1;
+    st.global.b16  [%rd7], %h1;
+
+done_f16:
+    ret;
+}
+
+// e4m3 twin: scalar port of e4m3::f32_to_e4m3_bits; dst byte = elem index.
+// %r9 = x bits  %r10 = sign8  %r11 = abs  %r12 = clamped bits  %r13 = exp
+// %r14 = is_norm  %r15 = man/dropped  %r16 = kept  %r17 = round_up
+// %r18 = eq_half/carry  %r19 = is_nan  %r6/%r7 = scratch  %f2 = clamped x
+.visible .entry kv_scatter_write_e4m3(
+    .param .u64 param_src,
+    .param .u64 param_cache_base,
+    .param .u64 param_write_off_ptr,
+    .param .u32 param_kv_dim
+)
+{
+    .reg .u32   %r<20>;
+    .reg .u64   %rd<10>;
+    .reg .f32   %f<3>;
+    .reg .pred  %p1;
+
+    ld.param.u64 %rd0, [param_src];
+    ld.param.u64 %rd1, [param_cache_base];
+    ld.param.u64 %rd2, [param_write_off_ptr];
+    ld.param.u32 %r0,  [param_kv_dim];
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r3, %r1, %r2, %r3;
+
+    setp.ge.u32 %p1, %r3, %r0;
+    @%p1 bra done_e4m3;
+
+    ld.global.s32 %r4,  [%rd2];
+    cvt.u64.s32   %rd3, %r4;
+    cvt.u64.u32   %rd4, %r0;
+    cvt.u64.u32   %rd5, %r3;
+
+    mul.lo.u64  %rd6, %rd3, %rd4;
+    add.u64     %rd6, %rd6, %rd5;
+    add.u64     %rd7, %rd1, %rd6;          // dst byte addr (1 byte/elem)
+
+    shl.b64  %rd8, %rd5, 2;
+    add.u64  %rd8, %rd0, %rd8;
+    ld.global.f32 %f1, [%rd8];
+
+    // NaN detect on the ORIGINAL bits: abs > inf-bits.
+    mov.b32 %r9, %f1;
+    and.b32 %r11, %r9, 0x7FFFFFFF;
+    setp.gt.u32 %p1, %r11, 0x7F800000;
+    selp.b32 %r19, 1, 0, %p1;              // is_nan
+
+    // Clamp to [-448, 448] (E4M3FN has no infinity).  NaN lanes are
+    // overridden by the is_nan select at the end (same order as the
+    // cutile tile kernel's select chain).  448.0 = 0x43E00000.
+    max.f32 %f2, %f1, 0fC3E00000;          // -448.0
+    min.f32 %f2, %f2, 0f43E00000;          //  448.0
+
+    mov.b32 %r12, %f2;
+    and.b32 %r11, %r12, 0x7FFFFFFF;        // abs (clamped)
+    shr.u32 %r13, %r11, 23;                // exp
+    shr.u32 %r10, %r12, 24;
+    and.b32 %r10, %r10, 0x80;              // sign8
+
+    // Normal iff f32 exponent > 120 (2^-6 = smallest e4m3 normal);
+    // below -> signed zero (subnormal flush).
+    setp.gt.u32 %p1, %r13, 120;
+    selp.b32 %r14, 1, 0, %p1;              // is_norm
+
+    and.b32 %r15, %r11, 0x007FFFFF;        // man
+    shr.u32 %r16, %r15, 20;                // kept
+    and.b32 %r15, %r15, 0x000FFFFF;        // dropped
+
+    // RNE: round up when dropped > half, or == half and kept LSB is 1.
+    // gt_half and eq_half&odd are disjoint -> sum them.
+    setp.gt.u32 %p1, %r15, 0x00080000;
+    selp.b32 %r17, 1, 0, %p1;              // gt_half
+    setp.eq.u32 %p1, %r15, 0x00080000;
+    selp.b32 %r18, 1, 0, %p1;              // eq_half
+    and.b32 %r6, %r16, 1;                  // kept LSB
+    and.b32 %r6, %r6, %r18;                // eq_half && odd
+    add.u32 %r17, %r17, %r6;               // round_up (0/1)
+
+    add.u32 %r16, %r16, %r17;              // kept2
+    // Carry: kept2 == 8 -> mantissa 0, exponent +1.  (e2 = 16 is
+    // unreachable: the 448 clamp caps the top binade.)
+    setp.eq.u32 %p1, %r16, 8;
+    selp.b32 %r15, 0, %r16, %p1;           // man_f
+    selp.b32 %r18, 1, 0, %p1;              // carry
+    sub.u32 %r13, %r13, 120;               // e2 (wraps on flush lanes; discarded)
+    add.u32 %r13, %r13, %r18;
+    shl.b32 %r13, %r13, 3;
+    or.b32  %r13, %r13, %r15;
+    or.b32  %r13, %r13, %r10;              // body
+
+    // res = is_norm ? body : sign8; res = is_nan ? 0x7F : res
+    setp.ne.b32 %p1, %r14, 0;
+    selp.b32 %r13, %r13, %r10, %p1;
+    setp.ne.b32 %p1, %r19, 0;
+    selp.b32 %r13, 0x7F, %r13, %p1;
+
+    st.global.u8 [%rd7], %r13;
+
+done_e4m3:
     ret;
 }
 
@@ -243,6 +420,8 @@ done_gather:
 
 const BLOCK_SIZE: u32 = 256;
 const KERNEL_NAME: &str = "kv_scatter_write";
+const KERNEL_NAME_F16: &str = "kv_scatter_write_f16";
+const KERNEL_NAME_E4M3: &str = "kv_scatter_write_e4m3";
 const KERNEL_NAME_BATCH: &str = "kv_scatter_write_batch";
 const KERNEL_NAME_GATHER: &str = "d2d_gather_row";
 
@@ -254,6 +433,8 @@ const KERNEL_NAME_GATHER: &str = "d2d_gather_row";
 pub struct KvScatterWrite {
     cu_module:          sys::CUmodule,
     cu_function:        sys::CUfunction,
+    cu_function_f16:    sys::CUfunction,
+    cu_function_e4m3:   sys::CUfunction,
     cu_function_batch:  sys::CUfunction,
     cu_function_gather: sys::CUfunction,
 }
@@ -295,6 +476,30 @@ impl KvScatterWrite {
             )));
         }
 
+        let name_f16 = std::ffi::CString::new(KERNEL_NAME_F16).unwrap();
+        let mut cu_function_f16 = std::ptr::null_mut::<sys::CUfunc_st>();
+        let rc = unsafe {
+            sys::cuModuleGetFunction(&mut cu_function_f16, cu_module, name_f16.as_ptr())
+        };
+        if rc != 0 {
+            let _ = unsafe { sys::cuModuleUnload(cu_module) };
+            return Err(KernelError::InvalidConfig(format!(
+                "KvScatterWrite: cuModuleGetFunction({KERNEL_NAME_F16}) failed: {rc}"
+            )));
+        }
+
+        let name_e4m3 = std::ffi::CString::new(KERNEL_NAME_E4M3).unwrap();
+        let mut cu_function_e4m3 = std::ptr::null_mut::<sys::CUfunc_st>();
+        let rc = unsafe {
+            sys::cuModuleGetFunction(&mut cu_function_e4m3, cu_module, name_e4m3.as_ptr())
+        };
+        if rc != 0 {
+            let _ = unsafe { sys::cuModuleUnload(cu_module) };
+            return Err(KernelError::InvalidConfig(format!(
+                "KvScatterWrite: cuModuleGetFunction({KERNEL_NAME_E4M3}) failed: {rc}"
+            )));
+        }
+
         let name_batch = std::ffi::CString::new(KERNEL_NAME_BATCH).unwrap();
         let mut cu_function_batch = std::ptr::null_mut::<sys::CUfunc_st>();
         let rc = unsafe {
@@ -319,7 +524,7 @@ impl KvScatterWrite {
             )));
         }
 
-        Ok(Self { cu_module, cu_function, cu_function_batch, cu_function_gather })
+        Ok(Self { cu_module, cu_function, cu_function_f16, cu_function_e4m3, cu_function_batch, cu_function_gather })
     }
 
     /// Copy `kv_dim` f32 elements from `src_ptr` into
@@ -362,6 +567,97 @@ impl KvScatterWrite {
         if rc != 0 {
             return Err(KernelError::InvalidConfig(format!(
                 "KvScatterWrite::copy_with_device_offset cuLaunchKernel failed: {rc}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// [`Self::copy_with_device_offset`] for an f16 KV pool: the f32 source
+    /// element is converted with IEEE RNE (cvt.rn.f16.f32, bit-identical to
+    /// the generic append path's cutile_cast_f32_f16) and stored as u16 at
+    /// `cache_base[write_off * kv_dim + i]` (u16 elements).
+    pub fn copy_with_device_offset_f16(
+        &self,
+        src_ptr:       sys::CUdeviceptr,
+        cache_base:    sys::CUdeviceptr,
+        write_off_ptr: sys::CUdeviceptr,
+        kv_dim:        u32,
+        cu_stream:     sys::CUstream,
+    ) -> Result<()> {
+        let grid = (kv_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        let mut p_src   = src_ptr;
+        let mut p_cache = cache_base;
+        let mut p_woff  = write_off_ptr;
+        let mut p_dim   = kv_dim;
+
+        let mut params: [*mut std::ffi::c_void; 4] = [
+            &mut p_src   as *mut _ as *mut std::ffi::c_void,
+            &mut p_cache as *mut _ as *mut std::ffi::c_void,
+            &mut p_woff  as *mut _ as *mut std::ffi::c_void,
+            &mut p_dim   as *mut _ as *mut std::ffi::c_void,
+        ];
+
+        let rc = unsafe {
+            sys::cuLaunchKernel(
+                self.cu_function_f16,
+                grid, 1, 1,
+                BLOCK_SIZE, 1, 1,
+                0,
+                cu_stream,
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "KvScatterWrite::copy_with_device_offset_f16 cuLaunchKernel failed: {rc}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// [`Self::copy_with_device_offset`] for an e4m3 KV pool: the f32 source
+    /// element is converted with the shared e4m3 bit-math (RNE, +-448
+    /// saturation, subnormal flush, NaN -> 0x7F -- bit-identical to
+    /// cutile_cast_f32_e4m3 and `e4m3::f32_to_e4m3_bits`) and stored as u8
+    /// at `cache_base[write_off * kv_dim + i]` (u8 elements).
+    pub fn copy_with_device_offset_e4m3(
+        &self,
+        src_ptr:       sys::CUdeviceptr,
+        cache_base:    sys::CUdeviceptr,
+        write_off_ptr: sys::CUdeviceptr,
+        kv_dim:        u32,
+        cu_stream:     sys::CUstream,
+    ) -> Result<()> {
+        let grid = (kv_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        let mut p_src   = src_ptr;
+        let mut p_cache = cache_base;
+        let mut p_woff  = write_off_ptr;
+        let mut p_dim   = kv_dim;
+
+        let mut params: [*mut std::ffi::c_void; 4] = [
+            &mut p_src   as *mut _ as *mut std::ffi::c_void,
+            &mut p_cache as *mut _ as *mut std::ffi::c_void,
+            &mut p_woff  as *mut _ as *mut std::ffi::c_void,
+            &mut p_dim   as *mut _ as *mut std::ffi::c_void,
+        ];
+
+        let rc = unsafe {
+            sys::cuLaunchKernel(
+                self.cu_function_e4m3,
+                grid, 1, 1,
+                BLOCK_SIZE, 1, 1,
+                0,
+                cu_stream,
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "KvScatterWrite::copy_with_device_offset_e4m3 cuLaunchKernel failed: {rc}"
             )));
         }
         Ok(())

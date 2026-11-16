@@ -516,6 +516,193 @@ fn main() {
     cpu_c[row_off * kv_dim..(row_off + 1) * kv_dim].copy_from_slice(&src);
     all_ok &= report("kv scatter write (row 7 of 16)", &gpu_c, &cpu_c);
 
+    // ---- 3a. KV scatter-write dtype twins vs the cast kernels ----------
+    // The m=1 CUDA-graph route appends K/V with kv_scatter_write_f16/_e4m3
+    // while the generic batch path appends via cutile_cast_f32_f16/_e4m3 +
+    // D2D.  Composition invariance REQUIRES both writers to produce the
+    // same pool bytes bit-for-bit; this probe checks scatter-twin vs cast
+    // kernel vs the CPU references (half::f16::from_f32 /
+    // e4m3::f32_to_e4m3_bits) on adversarial data: RNE tie points, the
+    // smallest normals, subnormal flushes, saturation, inf, NaN, and
+    // signed zeros.  (Uniform data cannot catch conversion bugs -- the
+    // mxf4 lesson.)
+    {
+        use tempura_kernels::cutile_elementwise::{cast_f32_to_e4m3_dev, cast_f32_to_f16_dev};
+        use tempura_kernels::e4m3::f32_to_e4m3_bits;
+
+        let kv_dim = N_KV_HEADS * HEAD_DIM; // 1024 == CAST_B
+        let mut vals: Vec<f32> = prng_data(kv_dim, 7);
+        let adv: Vec<f32> = vec![
+            0.0, -0.0, 1.0, -1.0,
+            1.0625,              // RNE tie -> even (1.0) in both f16 and e4m3
+            1.1875,              // e4m3 tie -> even (kept 2)
+            15.5,                // e4m3 tie with odd kept -> carry into exp
+            0.015625,            // e4m3 smallest normal (2^-6)
+            0.01, 0.001, -0.001, // e4m3 subnormal flush -> signed zero
+            448.0, -448.0, 449.0, 1e30, -1e30, // e4m3 saturation to +-448
+            f32::INFINITY, f32::NEG_INFINITY, f32::NAN,
+            65505.0, 65520.0,    // f16 rounding boundary (max normal 65504)
+            6.1035156e-5,        // f16 smallest normal (2^-14)
+            5.96e-8,             // f16 tie at half the smallest subnormal
+            2.98e-8,             // f16 smallest subnormal
+            1e-8, -1e-8,         // f16 rounds to signed zero
+            0.5, 0.49999997,     // e4m3: exact 0.5 / just below
+        ];
+        for (i, v) in adv.iter().enumerate() {
+            vals[i] = *v;
+        }
+        let src_dev = upload(vals.clone(), &stream);
+        // Reuse the outer `rows` (16) / `row_off` (7) / `off_dev`: the
+        // twins must land on the SAME device-read row offset as the f32
+        // entry.
+
+        // -- f16 twin --
+        // CPU reference.  NaN note: the GPU cvt (and the cutile cast
+        // kernel, which is what the generic append path uses -- the pool's
+        // ground truth) maps f32 NaN to 0x7FFF, while half::from_f32
+        // canonicalizes to the qNaN 0x7E00; the composition-invariance
+        // requirement is scatter == cast, so the CPU check excludes the
+        // NaN lane and the GPU convention is asserted directly.
+        let cpu_f16: Vec<u16> = vals
+            .iter()
+            .map(|v| {
+                if v.is_nan() {
+                    0x7FFF
+                } else {
+                    half::f16::from_f32(*v).to_bits()
+                }
+            })
+            .collect();
+        let mut stage16: Arc<Tensor<half::f16>> = Arc::new(
+            api::zeros::<half::f16>(&[kv_dim])
+                .sync_on(&stream)
+                .expect("f16 stage alloc")
+                .into(),
+        );
+        stage16 =
+            cast_f32_to_f16_dev(&src_dev, stage16, kv_dim, &stream).expect("cast f16 failed");
+        let cast16: Vec<u16> = Arc::clone(&stage16)
+            .to_host_vec()
+            .sync_on(&stream)
+            .expect("f16 stage download")
+            .iter()
+            .map(|h| h.to_bits())
+            .collect();
+        let pool16: Arc<Tensor<half::f16>> = Arc::new(
+            api::zeros::<half::f16>(&[rows * kv_dim])
+                .sync_on(&stream)
+                .expect("f16 pool alloc")
+                .into(),
+        );
+        scatter
+            .copy_with_device_offset_f16(
+                src_dev.device_pointer().cu_deviceptr(),
+                pool16.device_pointer().cu_deviceptr(),
+                off_dev.device_pointer().cu_deviceptr(),
+                kv_dim as u32,
+                cu_stream,
+            )
+            .expect("scatter write f16 failed");
+        let pool16_rows: Vec<half::f16> = Arc::clone(&pool16)
+            .to_host_vec()
+            .sync_on(&stream)
+            .expect("f16 pool download");
+        let pool16_bits: Vec<u16> = pool16_rows.iter().map(|h| h.to_bits()).collect();
+        let scatter16 = &pool16_bits[row_off * kv_dim..(row_off + 1) * kv_dim];
+        let rest_zero16 = pool16_bits
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i < row_off * kv_dim || *i >= (row_off + 1) * kv_dim)
+            .all(|(_, b)| *b == 0);
+        let cast_vs_cpu = cast16.iter().zip(&cpu_f16).filter(|(a, b)| a != b).count();
+        let scat_vs_cpu = scatter16.iter().zip(&cpu_f16).filter(|(a, b)| a != b).count();
+        let scat_vs_cast = scatter16.iter().zip(&cast16).filter(|(a, b)| a != b).count();
+        let ok16 = cast_vs_cpu == 0
+            && scat_vs_cpu == 0
+            && scat_vs_cast == 0
+            && rest_zero16
+            && row_off * kv_dim < pool16_bits.len();
+        println!(
+            "  kv scatter write f16 twin: {} (cast-vs-cpu {cast_vs_cpu}, scatter-vs-cpu \
+             {scat_vs_cpu}, scatter-vs-cast {scat_vs_cast}, other-rows-zero {rest_zero16})",
+            if ok16 { "PASS" } else { "FAIL" }
+        );
+        if !ok16 {
+            for i in 0..adv.len() {
+                if cast16[i] != cpu_f16[i] || scatter16[i] != cpu_f16[i] {
+                    println!(
+                        "    lane {i}: x={} cpu_f16={:04x} cast={:04x} scatter={:04x}",
+                        vals[i], cpu_f16[i], cast16[i], scatter16[i]
+                    );
+                }
+            }
+        }
+        all_ok &= ok16;
+
+        // -- e4m3 twin --
+        let cpu_e4m3: Vec<u8> = vals.iter().map(|v| f32_to_e4m3_bits(*v)).collect();
+        let mut stage8: Arc<Tensor<u8>> = Arc::new(
+            api::zeros::<u8>(&[kv_dim])
+                .sync_on(&stream)
+                .expect("e4m3 stage alloc")
+                .into(),
+        );
+        stage8 =
+            cast_f32_to_e4m3_dev(&src_dev, stage8, kv_dim, &stream).expect("cast e4m3 failed");
+        let cast8: Vec<u8> = Arc::clone(&stage8)
+            .to_host_vec()
+            .sync_on(&stream)
+            .expect("e4m3 stage download");
+        let pool8: Arc<Tensor<u8>> = Arc::new(
+            api::zeros::<u8>(&[rows * kv_dim])
+                .sync_on(&stream)
+                .expect("e4m3 pool alloc")
+                .into(),
+        );
+        scatter
+            .copy_with_device_offset_e4m3(
+                src_dev.device_pointer().cu_deviceptr(),
+                pool8.device_pointer().cu_deviceptr(),
+                off_dev.device_pointer().cu_deviceptr(),
+                kv_dim as u32,
+                cu_stream,
+            )
+            .expect("scatter write e4m3 failed");
+        let pool8_rows: Vec<u8> = Arc::clone(&pool8)
+            .to_host_vec()
+            .sync_on(&stream)
+            .expect("e4m3 pool download");
+        let scatter8 = &pool8_rows[row_off * kv_dim..(row_off + 1) * kv_dim];
+        let rest_zero8 = pool8_rows
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i < row_off * kv_dim || *i >= (row_off + 1) * kv_dim)
+            .all(|(_, b)| *b == 0);
+        let cast_vs_cpu8 = cast8.iter().zip(&cpu_e4m3).filter(|(a, b)| a != b).count();
+        let scat_vs_cpu8 = scatter8.iter().zip(&cpu_e4m3).filter(|(a, b)| a != b).count();
+        let scat_vs_cast8 = scatter8.iter().zip(&cast8).filter(|(a, b)| a != b).count();
+        let ok8 = cast_vs_cpu8 == 0
+            && scat_vs_cpu8 == 0
+            && scat_vs_cast8 == 0
+            && rest_zero8;
+        println!(
+            "  kv scatter write e4m3 twin: {} (cast-vs-cpu {cast_vs_cpu8}, scatter-vs-cpu \
+             {scat_vs_cpu8}, scatter-vs-cast {scat_vs_cast8}, other-rows-zero {rest_zero8})",
+            if ok8 { "PASS" } else { "FAIL" }
+        );
+        if !ok8 {
+            for i in 0..adv.len() {
+                if cast8[i] != cpu_e4m3[i] || scatter8[i] != cpu_e4m3[i] {
+                    println!(
+                        "    lane {i}: x={} cpu_e4m3={:02x} cast={:02x} scatter={:02x}",
+                        vals[i], cpu_e4m3[i], cast8[i], scatter8[i]
+                    );
+                }
+            }
+        }
+        all_ok &= ok8;
+    }
+
     // ---- 3b. On-device prefill attention (gather/flash/scatter) ----
     // The new prefill path (prefill_attention_device) must match the CPU
     // causal GQA reference on RANDOM data at every shape class: partial
@@ -2769,9 +2956,15 @@ fn main() {
         let ref_before = ref_out.clone();
         let run_paged_attn = |cache: &mut CutileKvCache, label: &str, expect: &[f32]| -> bool {
             let q_dev = upload(q.clone(), &tier_stream);
-            let (k_view, v_view, table_dev, kv_len_dev) = cache
+            let (views, table_dev, kv_len_dev) = cache
                 .paged_attn_inputs(0, HEAD_DIM, kv_len)
                 .expect("tiering attn inputs failed");
+            // The tiering bench builds an f32 pool; the f16/e4m3 view
+            // variants are covered by the serving gates.
+            let (k_view, v_view) = match views {
+                tempura_engine::cutile_kv_cache::PagedAttnViews::F32(k, v) => (k, v),
+                _ => panic!("tiering bench expects an f32 pool"),
+            };
             let mut scratch = PrefillAttnScratch::default();
             let out = fa3
                 .prefill_attention_device_paged(
