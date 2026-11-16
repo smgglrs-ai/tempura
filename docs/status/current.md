@@ -5,6 +5,97 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-16 (no-graph serving decode: the Q4K projections now read
+weights ONCE per batch instead of once per request -- engine step 31.1 ->
+26.8 ms at m=6 = 193 -> 224 tok/s aggregate (short-ctx 208 -> 244); the
+batch kernel is BIT-IDENTICAL per row to the per-row kpar8 GEMV, so all
+numerics gates pass at ratio 1.0000; ALSO FOUND + DISABLED: the stream-K
+and MMA batch kernels are numerically WRONG; all gates green): (1) THE
+KERNEL -- `q4k_gemv_sm120_kpar8_batch` (new entry in
+kernels/src/q4k_gemv_v4_ptx.rs, own PTX module): the validated kpar8 warp
+structure VERBATIM with an m-loop over activation rows. Each thread loads
+its weight-block data once per K-loop iteration and computes all m rows'
+dp4a partials against it; per-row accumulators live in local memory (PTX
+cannot index registers; the loads/stores do not alter arithmetic). Every
+per-row operation -- dp4a inputs, term multiply/subtract order, the
+per-block accumulate order, the K-loop block order (blk = warp_id, +8),
+the 3-step XOR-bfly reduction (c=0x181F) and the cross-warp/final sums --
+is identical to a per-row kpar8 launch, so each output row is
+BITWISE-EQUAL to running the per-row GEMV on that row alone (the oxide
+BATCH decode-attention approach, applied to GEMVs). Grid (n,1,1), block
+(256,1,1), static smem 2048 B (16 rows x the kpar8 128 B slots), m <= 16
+per launch. VALIDATION: new bench-probe-q4k-batch (random native-GGUF
+blocks -- random 6-bit cross-byte-packed scales, random nibbles, per the
+mxf4 lesson that uniform data cannot catch layout bugs -- vs the per-row
+sm120 kpar8 as ground truth): bit-exact at m in {1,2,4,6} on all four
+projection shapes (4096x4096, 1024x4096, 14336x4096, 4096x14336).
+(Bring-up bug, fixed: the reduction's smem slot address double-multiplied
+the row offset -- slot units vs bytes -- corrupting rows at m>=2 and
+writing past the 2 KB buffer at m>=6, caught by the probe before any
+engine wiring.) (2) THE ENGINE PATH -- gemm_any_d2d_batch dispatches Q4K
+weights (q/k/o/gate/up in Q4_K_M) through
+forward_sm120_kpar_batch_d2d_rows for every m >= 2, chunking m > 16 over
+16-row windows (chunking cannot change per-row numerics). Compact [m*k]
+activations via the cached nograph pool when row_stride != k; Q8_1
+scratch keyed (k, min(m,16)); output in the existing gemm_out pool.
+m == 1 KEEPS the per-row kpar GEMV: the probe verified bit-identity
+between the batch kernel at m=1 and the per-row path, so this
+m-dependent DISPATCH introduces no m-dependent NUMERICS (the one case
+the no-m-dependent-dispatch rule allows) and saves ~7 us/projection of
+batch-kernel overhead. Bisect: TEMPURA_NO_SM120_KPAR_BATCH=1 reverts to
+per-row GEMVs. (3) THE BROKEN KERNELS -- the original plan (route the
+no-graph path through the EXISTING oxide stream-K / MMA batch kernels,
+which read weights once and are general-M) was implemented first and
+REJECTED on evidence: the ppl gate exploded (pooled f16 1.89e6 vs 8.68
+baseline, 0 NaN). Root cause via the probe: BOTH kernels misparse the
+Q4K sub-block layout -- they pair weight nibbles with the wrong
+activation elements (sub-block mw reads lo-nibbles of bytes 32*mw, but
+the true GGUF layout -- confirmed by the kpar8 kernel AND the engine's
+CPU dequant -- maps sub-block 2j to lo-nibbles of bytes 32j and sub-block
+2j+1 to HI-nibbles of the SAME bytes) and use a wrong dequant convention
+(raw nibble 0..15 with NO -8 offset and NO /32 scale factor). 12-31% rel
+error vs the kpar8 reference on random data at every shape and m. They
+were never numerically validated: only NaN/determinism checks ever ran
+on them (the exact mxf4-gemv lesson), and on Q4_K_M they were dormant in
+the graph path (all Q4K projections route to MXFP4). All three
+has_sm120_batch/has_mma_batch/has_streamk_batch now return false with
+pointers to the probe; all-Q4K models thereby fall back from the (wrong)
+Q4K batch graph to the no-graph path -- which now has the correct fast
+batch kernel. Follow-up recorded: fix or delete the streamk/mma PTX;
+wire the kpar8 batch kernel into the graph path. The 2026-11-12
+streamk graph-path batch numbers (M=1..16) and all pre-2026-11-12
+mma_batch graph numbers were computed with these wrong kernels and are
+RETRACTED as quality-unverified (they were NaN-free + deterministic --
+internally consistent garbage). (4) GRAPH-PATH PPL RE-MEASURED CLEANLY
+(the unexplained "7.5 vs 5.4" note from 2026-11-14): pooled f32 pool +
+TEMPURA_PPL_M2=1 (m=2 equal-position dummy member -> MXFP4 batch graph)
+8 chunks = 11.3059 vs the f32 no-graph baseline 8.6799 = ratio 1.3025 --
+the MXFP4 activation-quantization approximation, ~stable across chunk
+counts (was 1.39x at 1-2 chunks). Serving never uses this path (f16/e4m3
+pools -> no-graph, exact). NUMBERS (fishtank, RTX 5090, Llama-3.1-8B
+Q4_K_M, f16 pool, bench-nograph, before = main 3d3172b same day):
+400-step contexts: m=1 9.0 -> 8.9 ms (unchanged, per-row kept), m=2
+13.0 -> 12.6, m=3 17.4 -> 15.7, m=4 21.9 -> 19.1, m=5 26.5 -> 22.7,
+m=6 31.1 -> 26.8 ms = 193.2 -> 223.9 tok/s aggregate (+16%). Short ctx
+(48 steps): m=6 28.8 -> 24.6 ms = 208 -> 244 tok/s (+17%); m=1 10.5 ->
+10.6 (unchanged). The weight-traffic model predicted more (m x
+weight_read -> 1 x weight_read on ~3 GB of Q4K weights = ~15 GB saved at
+m=6): the measured reality is that the per-row kpar8 GEMV is
+latency-bound, not bandwidth-bound, so removing 5/6 of the weight READS
+saves less than the raw bytes suggest (the batch kernel adds m x dp4a +
+activation-load work per thread, serialized in the same latency chains).
+The remaining no-graph costs: the Q6K projections (v/down + lm_head in
+Q4_K_M) still run per-row GEMVs (~1.65 GB/layer-set + 431 MB lm_head per
+STEP x m -- a bit-identical q6k batch kernel is the same recipe); the
+m=1 step (~9 ms) is now dominated by the same latency-bound per-row
+GEMVs. GATES ALL GREEN on the final tree: 6-client kv-swap A/B PASS on
+f16 AND e4m3 (byte-identical, swaps exercised); pooled ppl 8 chunks f16
+8.6838 / e4m3 8.6282 -- BIT-IDENTICAL to the pre-change baselines (ratio
+1.0000, 0 NaN; the batch kernel is numerically exact vs per-row);
+nonstream-route-smoke PASS; kv-restart-var PASS; bench-ab-repro
+solo/repeat/interleave/m=2/m=3 checksums all IDENTICAL; local cargo test
+green (916).**
+
 **STATUS 2026-11-15b (the two remaining no-graph serving cost centers
 closed: GPU greedy argmax for the batch sampler + the oxide BATCH
 decode-attention kernel; engine step 47 -> 31 ms at m=6 = 192 tok/s

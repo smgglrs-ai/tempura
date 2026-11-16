@@ -327,13 +327,20 @@ Qwen3.6-27B weights** — see open work.
 - [x] OpenAI-compatible chat/completions/completions/models/responses/
       embeddings/tokenize/detokenize; SSE streaming with include_usage
 - [x] ragged no-graph batch decode (the multi-client serving path):
-      ~31 ms/step at m=6 with ~440-token contexts (~192 tok/s aggregate;
+      ~27 ms/step at m=6 with ~440-token contexts (~224 tok/s aggregate;
       was 199 ms pre-2026-11-15, 47 ms after the sync-free + oxide-kernel
-      fixes) -- sync-free scratch pool + kpar attention + the oxide BATCH
+      fixes, 31 ms after the batch decode-attention + GPU argmax kernels;
+      2026-11-16: Q4K projections batched through the bit-identical
+      sm120 kpar8 batch kernel -- weights read once per batch, per-row
+      numerics bit-exact vs the per-row GEMV, bench-probe-q4k-batch is
+      the regression gate; the earlier stream-K/MMA batch kernels are
+      DISABLED -- numerically wrong, see the 2026-11-16 status entry) --
+      sync-free scratch pool + kpar attention + the oxide BATCH
       decode-attention kernel (one launch per layer, grid (n_heads, m),
-      bit-identical to per-request kpar) + GPU greedy argmax for pure-greedy
-      sessions (sample+emit 11 ms -> ~8 us: the token is computed on-device,
-      logits rows never downloaded; sampling sessions keep full logits)
+      bit-identical to per-request kpar) + GPU greedy argmax for
+      pure-greedy sessions (sample+emit 11 ms -> ~8 us: the token is
+      computed on-device, logits rows never downloaded; sampling sessions
+      keep full logits)
 - [x] Logprobs, top-logprobs, stop sequences, n completions, presence/
       frequency penalties, seed, max_completion_tokens alias
 - [x] Tool/function calling (hermes/mistral/llama3 parsers + auto-detect),
@@ -382,7 +389,15 @@ Qwen3.6-27B weights** — see open work.
       unpack `mov.b32 {%h0, %h1}, %r55`; ptxas-clean; first-ever
       streamk run 2026-11-12: batch M=1 223, M=2 245, M=4 409, M=5 471,
       M=8 609, M=16 811 tok/s -- all NaN-free + deterministic, at or
-      above the mma_batch baselines, M=16 +2%)
+      above the mma_batch baselines, M=16 +2%.  RETRACTED 2026-11-16:
+      bench-probe-q4k-batch showed BOTH the stream-K and mma_batch
+      kernels misparse the Q4K sub-block nibble/scale layout (12-31% rel
+      error vs the per-row kpar8 reference on random data) -- those
+      numbers were internally consistent garbage; both kernels are
+      disabled at the has_* level pending a fix. The CORRECT general-M
+      batch kernel is q4k_gemv_sm120_kpar8_batch (bit-identical per row
+      to the per-row kpar8 GEMV); the no-graph serving path uses it since
+      2026-11-16)
 - [x] CUDA graphs for single + batch decode (M=2..16+, dynamic
       max_batch_graph from VRAM), KV scatter-write (offset read on device —
       no per-step graph updates)

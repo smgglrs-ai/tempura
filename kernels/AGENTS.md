@@ -160,3 +160,14 @@ Current results (RTX 5090, see `bench-gpu-rtx5090.json`):
 
 If you see `Symbol cuda_device__mma_sync__... not found`, the backend is stale.
 Rebuild it from upstream and set `CUDA_OXIDE_BACKEND`.
+
+WARNING (2026-11-16): the hand-written q4k_mma_batch / q4k_streamk_batch /
+q4k_batch_sm120 PTX kernels are numerically WRONG (misparse the Q4K
+sub-block nibble/scale layout -- 12-31% rel error vs the per-row kpar8
+GEMV on random data; found by bench-probe-q4k-batch, which cross-checks
+every batch kernel against the per-row reference on random native-GGUF
+blocks). They are disabled at the has_* level. Do not re-enable any
+batch kernel without running that probe first. The correct general-M
+Q4K batch kernel is `q4k_gemv_sm120_kpar8_batch` in
+kernels/src/q4k_gemv_v4_ptx.rs (the kpar8 warp structure with an m-loop;
+bit-identical per row to the per-row GEMV).
