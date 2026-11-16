@@ -54,6 +54,10 @@ name = "bench-probe-q4k-batch"
 path = "src/bench_probe_q4k_batch.rs"
 
 [[bin]]
+name = "bench-probe-q6k-batch"
+path = "src/bench_probe_q6k_batch.rs"
+
+[[bin]]
 name = "bench-perplexity"
 path = "src/bench_perplexity.rs"
 

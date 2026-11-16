@@ -1283,5 +1283,670 @@ pub const ENTRY: &str = "q6k_gemv_sm120_kpar8";
 /// Dual-block direct-load variant entry (same module, second entry).
 pub const ENTRY_DB: &str = "q6k_gemv_sm120_kpar8_db";
 
+/// M-row batch variant of [`ENTRY_DB`] (own module -- see [`PTX_DB_BATCH`]).
+pub const ENTRY_DB_BATCH: &str = "q6k_gemv_sm120_kpar8_db_batch";
+
+/// PTX module for the sm_120 M-row batch Q6K GEMV (native 53-u32 GGUF format).
+///
+/// Replicates the dual-block direct-load [`ENTRY_DB`] warp structure VERBATIM
+/// with an m-loop over activation rows (the q4k_gemv_sm120_kpar8_batch
+/// recipe, applied to the q6k db kernel -- the variant the no-graph serving
+/// path dispatches per row by default). Each thread loads its weight-block
+/// words ONCE per K-loop iteration (dual blocks A/A+8, back-to-back loads,
+/// L2 prefetch -- no smem, no cp.async, no barriers in the loop) and
+/// computes all m rows' FMAs against them: the weight matrix is read ONCE
+/// per launch for the whole batch instead of once per request.
+///
+/// Every per-row arithmetic operation -- the register-exchange broadcasts,
+/// the f5 = d*sc*(q6-32) multiply order, the 8-step FMA order per block,
+/// the block order (blkA = warp_id, +16; block A then block A+8), the
+/// 5-step full-warp butterfly reduction, and the cross-warp handoff (lane-0
+/// partials + thread-0 SEQUENTIAL sum of the 8 warp partials) -- is
+/// identical to a per-row `q6k_gemv_sm120_kpar8_db` launch, so each output
+/// row is BITWISE-EQUAL to running the per-row GEMV on that row alone: no
+/// batch-composition dependence, at any m.
+///
+/// Per-row accumulators live in local memory (`lacc[64]`, m <= 16 f32):
+/// PTX cannot index registers, and the local loads/stores do not alter the
+/// arithmetic. Row loops are bounded by runtime `m` uniformly across the
+/// CTA (the only CTA barriers are the counter-init pair before the loop and
+/// the reduction handoff after it).
+///
+/// Grid: (n, 1, 1). Block: (256, 1, 1). Static smem 520 B (16 rows x 8
+/// warps x 4 B partials + u32 handoff counter). Params: out, out_len, x,
+/// x_len, packed, packed_len, n, k_blocks, m. `x` is [m * k] f32
+/// row-major (row r at r * k_blocks * 256); output is [m * n] row-major.
+pub const PTX_DB_BATCH: &str = r#"
+.version 8.7
+.target sm_120
+.address_size 64
+
+// q6k_gemv_sm120_kpar8_db_batch: M-row batch of q6k_gemv_sm120_kpar8_db.
+// Weights (native GGUF Q6K, 53 u32/block) read once per block for ALL m
+// rows; per-row math bit-identical to the per-row db kernel.
+.visible .entry q6k_gemv_sm120_kpar8_db_batch(
+    .param .u64 param_out,
+    .param .u64 param_out_len,
+    .param .u64 param_x,
+    .param .u64 param_x_len,
+    .param .u64 param_packed,
+    .param .u64 param_packed_len,
+    .param .u32 param_n,
+    .param .u32 param_k_blocks,
+    .param .u32 param_m
+)
+{
+    .reg .u32  %r<110>;
+    .reg .u64  %rd<16>;
+    .reg .f32  %f<32>;
+    .reg .pred %p<16>;
+
+    // m f32 per-thread accumulators (m <= 16; runtime-indexed -> local).
+    .local  .align 4 .b8 lacc[64];
+    // [0..511]: 16 rows x 8 warps x 4 B cross-warp partials;
+    // [512..515]: u32 reduce handoff counter.
+    .shared .align 8 .b8 smem_buf[520];
+
+    ld.param.u64 %rd0,  [param_out];
+    ld.param.u64 %rd1,  [param_x];
+    ld.param.u64 %rd2,  [param_packed];
+    ld.param.u32 %r0,   [param_n];
+    ld.param.u32 %r1,   [param_k_blocks];
+    ld.param.u32 %r2,   [param_m];
+
+    mov.u32 %r3, %ctaid.x;          // n_out = blockIdx.x
+    setp.ge.u32 %p0, %r3, %r0;
+    @%p0 bra DONE;
+
+    mov.u32 %r4, %tid.x;            // tid (0..255)
+    and.b32 %r5, %r4, 31;           // lane
+    shr.u32 %r6, %r4, 5;            // warp_id (0..7)
+
+    and.b32 %r7, %r5, 3;
+    shl.b32 %r7, %r7, 3;            // byte_shift = (lane % 4) * 8
+    shr.u32 %r8, %r5, 2;            // lane_div4
+    shr.u32 %r9, %r5, 4;
+    shl.b32 %r9, %r9, 3;            // sc_shift_even (0 or 8)
+    add.u32 %r10, %r9, 16;          // sc_shift_odd (16 or 24)
+    setp.lt.u32 %p1, %r5, 21;       // round-2 predicate
+    shl.b32 %r11, %r5, 2;           // lane*4
+    setp.lt.u32 %p8, %r8, 3;        // ql_d round select (q < 3)
+
+    // Row stride in elements: k = k_blocks * 256.
+    mul.lo.u32 %r12, %r1, 256;
+
+    // Constants: 128.0 (scale bias), 32.0 (q6 centering).
+    mov.f32 %f20, 0f43000000;
+    mov.f32 %f21, 0f42000000;
+
+    // Zero lacc[0..m).
+    mov.u64 %rd15, lacc;
+    mov.u32 %r13, 0;
+ZLOOP:
+    setp.ge.u32 %p2, %r13, %r2;
+    @%p2 bra ZDONE;
+    shl.b32 %r14, %r13, 2;
+    cvt.u64.u32 %rd14, %r14;
+    add.u64 %rd14, %rd14, %rd15;
+    st.local.f32 [%rd14], 0f00000000;
+    add.u32 %r13, %r13, 1;
+    bra ZLOOP;
+ZDONE:
+
+    // Cross-warp reduce handoff counter at smem_buf+512 (zeroed by
+    // thread 0); double barrier (DEFER_BLOCKING quirk -- see kpar8).
+    mov.u32 %r99, smem_buf;
+    add.u32 %r99, %r99, 512;
+    setp.eq.u32 %p9, %r4, 0;
+    @%p9 st.shared.u32 [%r99], 0;
+    bar.sync 0;
+    bar.sync 0;
+
+    // -- K-loop: blkA = warp_id, warp_id+16, ... (blocks A and A+8 per pass)
+    mov.u32 %r30, %r6;
+
+KLOOP_DB:
+    setp.ge.u32 %p0, %r30, %r1;     // blkA >= k_blocks?
+    @%p0 bra REDUCE;
+
+    // baseA = packed + (n_out*k_blocks + blkA) * 212
+    mad.lo.u32 %r32, %r3, %r1, %r30;
+    mul.lo.u32 %r33, %r32, 212;
+    cvt.u64.u32 %rd4, %r33;
+    add.u64 %rd4, %rd2, %rd4;
+
+    // blkB = blkA + 8; clamp baseB to baseA when invalid.
+    add.u32 %r31, %r30, 8;
+    setp.lt.u32 %p10, %r31, %r1;    // %p10 = B valid
+    mad.lo.u32 %r61, %r3, %r1, %r31;
+    mul.lo.u32 %r62, %r61, 212;
+    cvt.u64.u32 %rd5, %r62;
+    add.u64 %rd5, %rd2, %rd5;
+    selp.u64 %rd5, %rd5, %rd4, %p10;
+
+    // Prefetch the block pair 16 blocks ahead into L2.
+    add.u32 %r63, %r30, 16;
+    setp.lt.u32 %p11, %r63, %r1;
+    add.u64 %rd6, %rd4, 3392;       // 16 * 212
+    selp.u64 %rd6, %rd6, %rd4, %p11;
+    prefetch.global.L2 [%rd6];
+    add.u64 %rd6, %rd6, 128;
+    selp.u64 %rd6, %rd6, %rd4, %p11;
+    prefetch.global.L2 [%rd6];
+
+    // Load block A + block B words straight into registers (db verbatim).
+    cvt.u64.u32 %rd7, %r11;
+    add.u64 %rd7, %rd4, %rd7;
+    ld.global.nc.b32 %r40, [%rd7];              // Ra (word lane)
+    add.u64 %rd7, %rd7, 128;
+    @%p1 ld.global.nc.b32 %r51, [%rd7];         // Pa (word 32+lane)
+    cvt.u64.u32 %rd7, %r11;
+    add.u64 %rd7, %rd5, %rd7;
+    ld.global.nc.b32 %r58, [%rd7];              // Rb (word lane)
+    add.u64 %rd7, %rd7, 128;
+    @%p1 ld.global.nc.b32 %r59, [%rd7];         // Pb (word 32+lane)
+
+    // -- Register-exchange consume for block A (db verbatim) -----------------
+    shfl.sync.idx.b32 %r57, %r40, 0, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f1, %r57;                // d
+
+    shfl.sync.idx.b32 %r41, %r40, 1, 0x1F, 0xFFFFFFFF;  // sc_01
+    shfl.sync.idx.b32 %r42, %r40, 2, 0x1F, 0xFFFFFFFF;  // sc_23
+    shfl.sync.idx.b32 %r43, %r40, 3, 0x1F, 0xFFFFFFFF;  // sc_45
+    shfl.sync.idx.b32 %r44, %r40, 4, 0x1F, 0xFFFFFFFF;  // sc_67
+
+    add.u32 %r54, %r8, 5;
+    shfl.sync.idx.b32 %r53, %r40, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r45, %r53, %r7;
+    and.b32 %r45, %r45, 255;          // ql_a
+
+    add.u32 %r54, %r8, 13;
+    shfl.sync.idx.b32 %r53, %r40, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r46, %r53, %r7;
+    and.b32 %r46, %r46, 255;          // ql_b
+
+    add.u32 %r54, %r8, 21;
+    shfl.sync.idx.b32 %r53, %r40, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r47, %r53, %r7;
+    and.b32 %r47, %r47, 255;          // ql_c
+
+    add.u32 %r54, %r8, 29;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r40, %r54, 0x1F, 0xFFFFFFFF;
+    shfl.sync.idx.b32 %r55, %r51, %r54, 0x1F, 0xFFFFFFFF;
+    selp.b32 %r56, %r53, %r55, %p8;
+    shr.u32 %r48, %r56, %r7;
+    and.b32 %r48, %r48, 255;          // ql_d
+
+    add.u32 %r54, %r8, 37;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r51, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r49, %r53, %r7;
+    and.b32 %r49, %r49, 255;          // qh_0
+
+    add.u32 %r54, %r8, 45;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r51, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r50, %r53, %r7;
+    and.b32 %r50, %r50, 255;          // qh_1
+
+    // f5[step] = d*sc*(q6-32) for block A, steps 0..7 (db multiply order),
+    // computed ONCE per block -- row-independent, so reuse across all m
+    // rows preserves each row's per-step operand exactly.
+    // Step 0: sc=sc_01>>even, lo=ql_a&0xF, hi=qh_0&0x3
+    shr.u32 %r61, %r41, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    and.b32 %r62, %r45, 15;
+    and.b32 %r63, %r49, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f22, %f1, %f2;
+    mul.f32 %f22, %f22, %f3;
+    // Step 1: sc=sc_01>>odd, lo=ql_b&0xF, hi=(qh_0>>2)&0x3
+    shr.u32 %r61, %r41, %r10;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    and.b32 %r62, %r46, 15;
+    shr.u32 %r63, %r49, 2;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f23, %f1, %f2;
+    mul.f32 %f23, %f23, %f3;
+    // Step 2: sc=sc_23>>even, lo=(ql_a>>4)&0xF, hi=(qh_0>>4)&0x3
+    shr.u32 %r61, %r42, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    shr.u32 %r62, %r45, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r49, 4;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f24, %f1, %f2;
+    mul.f32 %f24, %f24, %f3;
+    // Step 3: sc=sc_23>>odd, lo=(ql_b>>4)&0xF, hi=(qh_0>>6)&0x3
+    shr.u32 %r61, %r42, %r10;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    shr.u32 %r62, %r46, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r49, 6;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f25, %f1, %f2;
+    mul.f32 %f25, %f25, %f3;
+    // Step 4: sc=sc_45>>even, lo=ql_c&0xF, hi=qh_1&0x3
+    shr.u32 %r61, %r43, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    and.b32 %r62, %r47, 15;
+    and.b32 %r63, %r50, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f26, %f1, %f2;
+    mul.f32 %f26, %f26, %f3;
+    // Step 5: sc=sc_45>>odd, lo=ql_d&0xF, hi=(qh_1>>2)&0x3
+    shr.u32 %r61, %r43, %r10;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    and.b32 %r62, %r48, 15;
+    shr.u32 %r63, %r50, 2;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f27, %f1, %f2;
+    mul.f32 %f27, %f27, %f3;
+    // Step 6: sc=sc_67>>even, lo=(ql_c>>4)&0xF, hi=(qh_1>>4)&0x3
+    shr.u32 %r61, %r44, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    shr.u32 %r62, %r47, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r50, 4;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f28, %f1, %f2;
+    mul.f32 %f28, %f28, %f3;
+    // Step 7: sc=sc_67>>odd, lo=(ql_d>>4)&0xF, hi=(qh_1>>6)&0x3
+    shr.u32 %r61, %r44, %r10;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    shr.u32 %r62, %r48, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r50, 6;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f29, %f1, %f2;
+    mul.f32 %f29, %f29, %f3;
+
+    // -- Row loop for block A: acc[r] += f5[s] * x[r][...] -------------------
+    mov.u32 %r48, 0;
+RLOOP_A:
+    setp.ge.u32 %p6, %r48, %r2;
+    @%p6 bra RLOOP_A_DONE;
+    // Row base = x + (r*k + blkA*256 + lane) * 4; running pointer += 128/step.
+    mul.lo.u32 %r64, %r48, %r12;
+    mad.lo.u32 %r64, %r30, 256, %r64;
+    add.u32 %r64, %r64, %r5;
+    shl.b32 %r64, %r64, 2;
+    cvt.u64.u32 %rd7, %r64;
+    add.u64 %rd7, %rd1, %rd7;
+    // lacc[r] address.
+    shl.b32 %r65, %r48, 2;
+    cvt.u64.u32 %rd8, %r65;
+    add.u64 %rd8, %rd8, %rd15;
+    ld.local.f32 %f5, [%rd8];
+
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f22, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f23, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f24, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f25, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f26, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f27, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f28, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    fma.rn.f32 %f5, %f29, %f4, %f5;
+
+    st.local.f32 [%rd8], %f5;
+    add.u32 %r48, %r48, 1;
+    bra RLOOP_A;
+RLOOP_A_DONE:
+
+    // -- Block B (skipped entirely when blkB >= k_blocks; uniform per warp) ---
+    @!%p10 bra SKIP_B;
+
+    shfl.sync.idx.b32 %r57, %r58, 0, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f10, %r57;               // dB
+
+    shfl.sync.idx.b32 %r41, %r58, 1, 0x1F, 0xFFFFFFFF;
+    shfl.sync.idx.b32 %r42, %r58, 2, 0x1F, 0xFFFFFFFF;
+    shfl.sync.idx.b32 %r43, %r58, 3, 0x1F, 0xFFFFFFFF;
+    shfl.sync.idx.b32 %r44, %r58, 4, 0x1F, 0xFFFFFFFF;
+
+    add.u32 %r54, %r8, 5;
+    shfl.sync.idx.b32 %r53, %r58, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r45, %r53, %r7;
+    and.b32 %r45, %r45, 255;
+
+    add.u32 %r54, %r8, 13;
+    shfl.sync.idx.b32 %r53, %r58, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r46, %r53, %r7;
+    and.b32 %r46, %r46, 255;
+
+    add.u32 %r54, %r8, 21;
+    shfl.sync.idx.b32 %r53, %r58, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r47, %r53, %r7;
+    and.b32 %r47, %r47, 255;
+
+    add.u32 %r54, %r8, 29;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r58, %r54, 0x1F, 0xFFFFFFFF;
+    shfl.sync.idx.b32 %r55, %r59, %r54, 0x1F, 0xFFFFFFFF;
+    selp.b32 %r56, %r53, %r55, %p8;
+    shr.u32 %r48, %r56, %r7;
+    and.b32 %r48, %r48, 255;
+
+    add.u32 %r54, %r8, 37;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r59, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r49, %r53, %r7;
+    and.b32 %r49, %r49, 255;
+
+    add.u32 %r54, %r8, 45;
+    and.b32 %r54, %r54, 31;
+    shfl.sync.idx.b32 %r53, %r59, %r54, 0x1F, 0xFFFFFFFF;
+    shr.u32 %r50, %r53, %r7;
+    and.b32 %r50, %r50, 255;
+
+    // f5[step] for block B.
+    shr.u32 %r61, %r41, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    and.b32 %r62, %r45, 15;
+    and.b32 %r63, %r49, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f22, %f10, %f2;
+    mul.f32 %f22, %f22, %f3;
+    shr.u32 %r61, %r41, %r10;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    and.b32 %r62, %r46, 15;
+    shr.u32 %r63, %r49, 2;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f23, %f10, %f2;
+    mul.f32 %f23, %f23, %f3;
+    shr.u32 %r61, %r42, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    shr.u32 %r62, %r45, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r49, 4;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f24, %f10, %f2;
+    mul.f32 %f24, %f24, %f3;
+    shr.u32 %r61, %r42, %r10;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    shr.u32 %r62, %r46, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r49, 6;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f25, %f10, %f2;
+    mul.f32 %f25, %f25, %f3;
+    shr.u32 %r61, %r43, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    and.b32 %r62, %r47, 15;
+    and.b32 %r63, %r50, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f26, %f10, %f2;
+    mul.f32 %f26, %f26, %f3;
+    shr.u32 %r61, %r43, %r10;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    and.b32 %r62, %r48, 15;
+    shr.u32 %r63, %r50, 2;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f27, %f10, %f2;
+    mul.f32 %f27, %f27, %f3;
+    shr.u32 %r61, %r44, %r9;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    shr.u32 %r62, %r47, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r50, 4;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f28, %f10, %f2;
+    mul.f32 %f28, %f28, %f3;
+    shr.u32 %r61, %r44, %r10;
+    and.b32 %r61, %r61, 255;
+    cvt.rn.f32.u32 %f2, %r61;
+    sub.f32 %f2, %f2, %f20;
+    shr.u32 %r62, %r48, 4;
+    and.b32 %r62, %r62, 15;
+    shr.u32 %r63, %r50, 6;
+    and.b32 %r63, %r63, 3;
+    shl.b32 %r63, %r63, 4;
+    or.b32  %r62, %r62, %r63;
+    cvt.rn.f32.u32 %f3, %r62;
+    sub.f32 %f3, %f3, %f21;
+    mul.f32 %f29, %f10, %f2;
+    mul.f32 %f29, %f29, %f3;
+
+    // -- Row loop for block B ---------------------------------------------------
+    mov.u32 %r48, 0;
+RLOOP_B:
+    setp.ge.u32 %p6, %r48, %r2;
+    @%p6 bra RLOOP_B_DONE;
+    mul.lo.u32 %r64, %r48, %r12;
+    mad.lo.u32 %r64, %r31, 256, %r64;
+    add.u32 %r64, %r64, %r5;
+    shl.b32 %r64, %r64, 2;
+    cvt.u64.u32 %rd7, %r64;
+    add.u64 %rd7, %rd1, %rd7;
+    shl.b32 %r65, %r48, 2;
+    cvt.u64.u32 %rd8, %r65;
+    add.u64 %rd8, %rd8, %rd15;
+    ld.local.f32 %f5, [%rd8];
+
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f22, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f23, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f24, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f25, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f26, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f27, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    add.u64 %rd7, %rd7, 128;
+    fma.rn.f32 %f5, %f28, %f4, %f5;
+    ld.global.nc.f32 %f4, [%rd7];
+    fma.rn.f32 %f5, %f29, %f4, %f5;
+
+    st.local.f32 [%rd8], %f5;
+    add.u32 %r48, %r48, 1;
+    bra RLOOP_B;
+RLOOP_B_DONE:
+
+SKIP_B:
+    add.u32 %r30, %r30, 16;
+    bra KLOOP_DB;
+
+    // -- Per-row reduction: 5-step full-warp butterfly (db verbatim), then
+    // lane 0 stores the warp partial; the cross-warp handoff is the
+    // st.shared + membar.cta + red.release counter / ld.acquire poll, and
+    // thread 0 sums the 8 partials SEQUENTIALLY (db order: w=0..7).
+REDUCE:
+    mov.u32 %r48, 0;
+RRED:
+    setp.ge.u32 %p6, %r48, %r2;
+    @%p6 bra RRED_DONE;
+    shl.b32 %r65, %r48, 2;
+    cvt.u64.u32 %rd8, %r65;
+    add.u64 %rd8, %rd8, %rd15;
+    ld.local.f32 %f0, [%rd8];
+
+    mov.b32 %r71, %f0;
+    shfl.sync.bfly.b32 %r72, %r71, 16, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f6, %r72; add.f32 %f0, %f0, %f6;
+    mov.b32 %r71, %f0;
+    shfl.sync.bfly.b32 %r72, %r71, 8, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f6, %r72; add.f32 %f0, %f0, %f6;
+    mov.b32 %r71, %f0;
+    shfl.sync.bfly.b32 %r72, %r71, 4, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f6, %r72; add.f32 %f0, %f0, %f6;
+    mov.b32 %r71, %f0;
+    shfl.sync.bfly.b32 %r72, %r71, 2, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f6, %r72; add.f32 %f0, %f0, %f6;
+    mov.b32 %r71, %f0;
+    shfl.sync.bfly.b32 %r72, %r71, 1, 0x1F, 0xFFFFFFFF;
+    mov.b32 %f6, %r72; add.f32 %f0, %f0, %f6;
+
+    setp.eq.u32 %p4, %r5, 0;
+    mov.u32 %r73, smem_buf;
+    shl.b32 %r74, %r48, 5;           // row * 32 bytes
+    mad.lo.u32 %r75, %r6, 4, %r74;   // + warp_id * 4
+    add.u32 %r75, %r75, %r73;
+    @%p4 st.shared.f32 [%r75], %f0;
+
+    add.u32 %r48, %r48, 1;
+    bra RRED;
+RRED_DONE:
+    @%p4 membar.cta;
+    @%p4 red.release.cta.shared.add.u32 [%r99], 1;
+    setp.eq.u32 %p5, %r6, 0;
+    @!%p5 bra DONE;
+REDUCE_WAIT:
+    ld.acquire.cta.shared.u32 %r78, [%r99];
+    setp.lt.u32 %p9, %r78, 8;
+    @%p9 bra REDUCE_WAIT;
+    membar.cta;
+
+    // Thread 0: per row, sequential sum of the 8 warp partials (db order)
+    // -> out[r*n + n_out].
+    setp.eq.u32 %p4, %r4, 0;
+    mov.u32 %r48, 0;
+ROUT:
+    setp.ge.u32 %p6, %r48, %r2;
+    @%p6 bra DONE;
+    mov.u32 %r77, smem_buf;
+    shl.b32 %r76, %r48, 5;
+    add.u32 %r77, %r77, %r76;
+    mov.f32 %f7, 0f00000000;
+    @%p4 ld.shared.f32 %f8, [%r77];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+4];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+8];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+12];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+16];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+20];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+24];
+    @%p4 add.f32 %f7, %f7, %f8;
+    @%p4 ld.shared.f32 %f8, [%r77+28];
+    @%p4 add.f32 %f7, %f7, %f8;
+    mad.lo.u32 %r79, %r48, %r0, %r3;  // r * n + n_out
+    shl.b32 %r79, %r79, 2;
+    cvt.u64.u32 %rd9, %r79;
+    add.u64 %rd9, %rd9, %rd0;
+    @%p4 st.global.f32 [%rd9], %f7;
+    add.u32 %r48, %r48, 1;
+    bra ROUT;
+
+DONE:
+    ret;
+}
+"#;
+
 /// Minimum compute capability (sm_120 = Blackwell consumer).
 pub const MIN_CC: u32 = 1200;
