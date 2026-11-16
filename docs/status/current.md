@@ -5,6 +5,94 @@ Archive completed items to docs/history/.
 
 ## Latest session status
 
+**STATUS 2026-11-16b (the Q6K projections join the bit-identical batch
+party + the sampled-session sampler defused; engine step 26.8 -> 23.6 ms
+at m=6 = 224 -> 254 tok/s aggregate (short-ctx 24.6 -> 21.6); sample+emit
+for SAMPLED sessions 10.4 ms -> 0.87 ms; all gates green): (1) THE Q6K
+BATCH KERNEL -- `q6k_gemv_sm120_kpar8_db_batch` (kernels/src/
+q6k_gemv_v4_ptx.rs, own PTX module): the dual-block direct-load kpar8_db
+warp structure (the per-row variant the no-graph path DISPATCHES to by
+default via select_kpar_fn) VERBATIM with an m-loop over activation
+rows, the exact q4k_gemv_sm120_kpar8_batch recipe. Each thread loads its
+weight-block words once per K-loop iteration (dual blocks A/A+8,
+back-to-back ld.global.nc, L2 prefetch, no smem/cp.async/barriers in the
+loop) and computes all m rows' FMAs against them: the Q6K weights
+(v_proj + down_proj + the quantized lm_head in Q4_K_M -- ~1.65 GB/layer-
+set + 431 MB lm_head per STEP x m) are read ONCE per batch instead of
+once per request. f5 = d*sc*(q6-32) is computed once per block-step
+(row-independent) and reused across rows; per-row accumulators live in
+local memory (lacc[64], m <= 16); the 5-step butterfly + the cross-warp
+handoff (lane-0 partials, red.release counter, thread-0 SEQUENTIAL sum)
+are db-verbatim, so each output row is BITWISE-EQUAL to a per-row db
+launch. VALIDATION: new bench-probe-q6k-batch (random native-GGUF 53-u32
+blocks -- random f32 d, random scale bytes, random ql/qh words -- vs
+the per-row kpar dispatch as ground truth): bit-exact at m in {1,2,4,6}
+on (1024,16) v_proj, (4096,16), (4096,56) down, AND (128256,16)
+lm_head-shaped probes. FIRST-TRY CLEAN (no bring-up bugs -- the q4k
+recipe transplanted). (2) THE EXISTING two-phase q6k_gemv_sm120_batch
+(graph path) PROBED: NOT bit-identical to per-row (max rel err
+6e-5..2.4e-4 -- its cross-warp reduce is a 3-step lane butterfly, not
+the sequential thread-0 sum; a reduce-ORDER difference, not a layout
+misparse -- numerically fine, just not composition-invariant). Verdict:
+it STAYS on the equal-position graph paths (captured composition is
+fixed per graph) and must NEVER be routed to a ragged path; documented
+in kernels/AGENTS.md. (3) ENGINE WIRING -- gemm_any_d2d_batch's new Q6K
+arm mirrors the Q4K arm: compact [m*k] activations (shared
+q4k_batch_act pool, keyed (slot,k,m)), output in the gemm_out pool,
+16-row chunking, m == 1 keeps the per-row kpar GEMV (probe-proven
+bit-identity at m=1 -> m-dependent DISPATCH, no m-dependent NUMERICS).
+The lm_head dispatch in the no-graph path goes through
+gemm_any_d2d_batch (line ~10765), so the quantized lm_head picks the
+batch kernel up for free; output handling is the existing [m*n] gemm_out
+buffer + download_logits (the oversized-tensor invariant unchanged; the
+greedy GPU-argmax path reads the same buffer). Bisect:
+TEMPURA_NO_SM120_Q6K_BATCH=1 reverts to per-row GEMVs. NUMBERS
+(fishtank, RTX 5090, Llama-3.1-8B Q4_K_M, f16 pool, bench-nograph,
+before = main a78913d same day): 400-step contexts: m=1 9.0 -> 9.0 ms
+(unchanged, per-row kept), m=2 12.6 -> 11.8, m=3 15.7 -> 14.3,
+m=4 19.1 -> 17.0, m=5 22.7 -> 20.2, m=6 26.8 -> 23.6 ms =
+223.9 -> 253.8 tok/s aggregate (+13%). Short ctx (48 steps): m=6
+24.6 -> 21.6 ms = 244 -> 277 tok/s (+13%); m=1 10.5 -> 10.3
+(unchanged). (4) THE SAMPLED-SESSION SAMPLER -- measured first
+(scripts/measure-sample-cost.sh: 6-client temp=0.8 streaming load under
+TEMPURA_ENGINE_DEBUG_TICKS): sample+emit p50 10.37 ms / p90 10.76 ms
+per step at m=6 (298/300 ticks at m=6) -- the CpuSampler's FULL-VOCAB
+SORT (128k x m, twice when top_p < 1.0) plus O(v) softmax/sample walks.
+FIX (CPU-side, no GPU kernel): a fused decode-path sampler --
+Sampler::sample_from_logits (new provided trait method, kernel-api) +
+CpuSampler::sample_fused (kernels/src/sampling.rs): temperature (same
+l/T division), min_p, top-k via a bounded MIN-HEAP (one streaming pass,
+O(n log k), deterministic lower-index tie-break), softmax over the k
+candidates in descending order, top-p, and the RNG walk over the kept
+candidates in INDEX order (equivalent to the full path's whole-array
+walk -- excluded entries are zero). Same r -> same token as the full
+path (unit test: fused == apply+sample_token on random logits, 5 param
+configs x 20 trials); greedy rows and typical_p < 1.0 fall back to the
+full path. Kani: topk_heap_selection_in_bounds (heap indexing, no
+OOB, sortedness). MEASURED AFTER: sample+emit p50 10.37 -> 0.87 ms
+(p90 0.89) at m=6/temp=0.8 -- 12x, and UNDER the 2 ms build/skip bar.
+(5) THE GPU-SIDE SAMPLER (option b: GPU temperature-softmax + top-k,
+download top-k, CPU top-p + RNG): SKIPPED ON MEASUREMENT. The download
+is NOT the cost (m x 513 KB at ~20 GB/s ~ 150 us, inside forward --
+forward p50 23.7 ms unchanged by either sampler); the cost was the CPU
+sort, now eliminated host-side. A GPU top-k kernel would save at most
+the remaining ~0.7 ms of O(n) CPU passes (scale + NaN scan + heap
+compare) minus kernel launch + its own costs -- under the 2 ms bar by
+the task's own rounding-error criterion. Do not build it without a
+load that shows sampled sessions dominating again. GATES ALL GREEN on
+the final tree: probe-q4k-batch PASS; probe-q6k-batch PASS (db_batch
+bit-identical at every shape x m); 6-client kv-swap A/B PASS on f16 AND
+e4m3 (byte-identical, swaps exercised); pooled ppl 8 chunks f16 8.6838 /
+e4m3 8.6282 -- BIT-IDENTICAL to the pre-change baselines (the batch
+kernel is numerically exact vs per-row; the ppl path decodes at m=1 and
+never dispatches it, doubly unchanged); nonstream-route-smoke PASS;
+kv-restart-var PASS; bench-ab-repro solo/repeat/interleave/m=2/m=3
+checksums all IDENTICAL; local cargo test green (919, +3 sampler
+tests). FOLLOW-UPS (open): m=1 decode (~9 ms) is now the latency-bound
+per-row GEMV floor (position-synced batch graphs are the structural
+fix); the O(n) sampler passes could fuse into one pass (~0.4 ms more)
+if ever worth it.**
+
 **STATUS 2026-11-16 (no-graph serving decode: the Q4K projections now read
 weights ONCE per batch instead of once per request -- engine step 31.1 ->
 26.8 ms at m=6 = 193 -> 224 tok/s aggregate (short-ctx 208 -> 244); the

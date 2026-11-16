@@ -327,20 +327,25 @@ Qwen3.6-27B weights** — see open work.
 - [x] OpenAI-compatible chat/completions/completions/models/responses/
       embeddings/tokenize/detokenize; SSE streaming with include_usage
 - [x] ragged no-graph batch decode (the multi-client serving path):
-      ~27 ms/step at m=6 with ~440-token contexts (~224 tok/s aggregate;
+      ~24 ms/step at m=6 with ~440-token contexts (~254 tok/s aggregate;
       was 199 ms pre-2026-11-15, 47 ms after the sync-free + oxide-kernel
-      fixes, 31 ms after the batch decode-attention + GPU argmax kernels;
-      2026-11-16: Q4K projections batched through the bit-identical
-      sm120 kpar8 batch kernel -- weights read once per batch, per-row
-      numerics bit-exact vs the per-row GEMV, bench-probe-q4k-batch is
-      the regression gate; the earlier stream-K/MMA batch kernels are
-      DISABLED -- numerically wrong, see the 2026-11-16 status entry) --
+      fixes, 31 ms after the batch decode-attention + GPU argmax kernels,
+      27 ms after the Q4K batch GEMV; 2026-11-16: Q4K AND Q6K projections
+      (v/down + quantized lm_head) batched through bit-identical sm120
+      m-loop batch kernels -- weights read once per batch, per-row
+      numerics bit-exact vs the per-row GEMVs, bench-probe-q4k-batch /
+      bench-probe-q6k-batch are the regression gates; the earlier
+      stream-K/MMA batch kernels are DISABLED -- numerically wrong, see
+      the 2026-11-16 status entry) --
       sync-free scratch pool + kpar attention + the oxide BATCH
       decode-attention kernel (one launch per layer, grid (n_heads, m),
       bit-identical to per-request kpar) + GPU greedy argmax for
       pure-greedy sessions (sample+emit 11 ms -> ~8 us: the token is
-      computed on-device, logits rows never downloaded; sampling sessions
-      keep full logits)
+      computed on-device, logits rows never downloaded) + the fused
+      top-k-heap CPU sampler for sampled sessions (sample+emit 10.4 ms
+      -> 0.87 ms at m=6/temp=0.8: O(n log k) selection instead of the
+      full-vocab sort; GPU-side top-k kernel measured NOT worth building
+      -- see the 2026-11-16 status entry)
 - [x] Logprobs, top-logprobs, stop sequences, n completions, presence/
       frequency penalties, seed, max_completion_tokens alias
 - [x] Tool/function calling (hermes/mistral/llama3 parsers + auto-detect),
@@ -474,7 +479,8 @@ Qwen3.6-27B weights** — see open work.
 
 **Decoding strategies**: speculative (target+draft), Medusa multi-token,
 guided (json/json_schema), sampler chain (temperature/top-k/top-p/min-p/
-typical-p/repeat/presence/frequency)
+typical-p/repeat/presence/frequency; decode path uses the fused top-k-heap
+sampler -- O(n log k), token-identical to the full chain)
 
 ## Build & Test
 

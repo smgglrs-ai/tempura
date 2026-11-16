@@ -171,3 +171,15 @@ batch kernel without running that probe first. The correct general-M
 Q4K batch kernel is `q4k_gemv_sm120_kpar8_batch` in
 kernels/src/q4k_gemv_v4_ptx.rs (the kpar8 warp structure with an m-loop;
 bit-identical per row to the per-row GEMV).
+
+WARNING (2026-11-16, Q6K): the two-phase `q6k_gemv_sm120_batch` (the
+equal-position graph-path kernel) is NOT bit-identical to the per-row
+kpar8/kpar8_db GEMVs (max rel err 6e-5..2.4e-4 on random data -- its
+cross-warp reduction is a 3-step lane butterfly, not the per-row
+kernels' sequential thread-0 sum; see bench-probe-q6k-batch, which
+prints the comparison). It stays on the graph paths where the captured
+composition is fixed; NEVER route a ragged/no-graph path through it.
+The correct general-M Q6K batch kernel for the no-graph path is
+`q6k_gemv_sm120_kpar8_db_batch` in kernels/src/q6k_gemv_v4_ptx.rs (the
+kpar8_db warp structure with an m-loop; bit-identical per row to the
+per-row db GEMV, probe-gated).
