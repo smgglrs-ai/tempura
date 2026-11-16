@@ -2,7 +2,7 @@ use crate::{KernelError, Result, RoPE, VerificationTier};
 use cuda_core::{Device, Stream};
 use cutile::api;
 use cutile::prelude::{DeviceOp, TileKernel, ToHostVec};
-use cutile::tensor::{IntoPartition, Tensor};
+use cutile::tensor::{IntoPartition, Reshape, Tensor};
 use std::sync::Arc;
 
 #[cutile::module]
@@ -155,6 +155,63 @@ pub mod kernels {
             z.store(tile_x0 * tile_sin + tile_x1 * tile_cos);
         } else {
             z.store(tile_x0 * tile_cos - tile_x1 * tile_sin);
+        }
+    }
+
+    /// Batched per-row table rotation for ragged batch decode (m requests,
+    /// one position each): ONE launch rotates every request's Q (or K).
+    ///
+    /// Grid: 2 * m * N_HEADS programs, pid decomposed as
+    ///   r = pid / (2 * N_HEADS), h = (pid % (2 * N_HEADS)) / 2,
+    ///   half_idx = pid % 2
+    /// -- the cutile_rope_interleaved program layout with the (seq, head)
+    /// pair drawn from a batch row instead of a prefill sequence slot.
+    ///
+    /// Differences from cutile_rope_interleaved (neither changes any output
+    /// element's value):
+    ///   - `x` rows are STRIDED: row r starts at tile `r * SRC_TILES`
+    ///     (SRC_TILES = src_stride / HALF_DIM), so the kernel reads the
+    ///     projection output directly -- no per-request extraction copies.
+    ///   - cos/sin come from `cos_rows`/`sin_rows`, flat `[m * HALF_DIM]`
+    ///     per-row gathered table rows (tile index `r`), refreshed per step
+    ///     by the engine via `KvScatterWrite::gather_row_by_device_pos` --
+    ///     the same table rows the per-request `cutile_rope_from_table`
+    ///     path reads at `pos`, so the rotation is bit-identical per
+    ///     element (same tile loads, same `a*c - b*s` / `a*s + b*c`
+    ///     expressions, same store positions).
+    ///
+    /// `z` is the contiguous interleaved output `[m * N_HEADS * 2 *
+    /// HALF_DIM]`; program pid stores its tile at pid (the
+    /// cutile_rope_interleaved store discipline).
+    ///
+    /// Power-of-two halves only (the `[HALF_DIM]` partition); callers gate
+    /// on `CutileRoPE::tile_geometry(head_dim).is_none()`.
+    #[cutile::entry()]
+    pub fn cutile_rope_rows_batch<
+        const HALF_DIM: i32,
+        const N_HEADS: i32,
+        const SRC_TILES: i32,
+    >(
+        z: &mut Tensor<f32, { [HALF_DIM] }>,
+        x: &Tensor<f32, { [-1] }>,
+        cos_rows: &Tensor<f32, { [-1] }>,
+        sin_rows: &Tensor<f32, { [-1] }>,
+    ) {
+        let pid = program_id(0);
+        let per_row = 2 * N_HEADS;
+        let r = pid / per_row;
+        let rem = pid % per_row;
+        let h = rem / 2;
+        let half_idx = rem % 2;
+        let base = r * SRC_TILES + 2 * h;
+        let tile_x0 = x.partition(shape![HALF_DIM]).load([base]);
+        let tile_x1 = x.partition(shape![HALF_DIM]).load([base + 1]);
+        let tile_cos = cos_rows.partition(shape![HALF_DIM]).load([r]);
+        let tile_sin = sin_rows.partition(shape![HALF_DIM]).load([r]);
+        if half_idx == 0 {
+            z.store(tile_x0 * tile_cos - tile_x1 * tile_sin);
+        } else {
+            z.store(tile_x0 * tile_sin + tile_x1 * tile_cos);
         }
     }
 
@@ -1224,6 +1281,99 @@ impl CutileRoPE {
         debug_assert_eq!(cos_row.size(), half, "cos_row must hold exactly one table row");
         debug_assert_eq!(sin_row.size(), half, "sin_row must hold exactly one table row");
         self.rope_launch_from_table(x_dev, 0, head_dim, half, cos_row, sin_row, scratch, stream)
+    }
+
+    /// Batched per-row RoPE for ragged multi-request decode: ONE kernel
+    /// launch rotates all `m` requests' Q (or K) tensor, reading each row
+    /// directly from the strided projection output and writing the
+    /// contiguous interleaved output `[m * n_heads * head_dim]`.
+    ///
+    /// `cos_rows`/`sin_rows` are the per-row gathered table rows
+    /// (`[m * half]`, refreshed per step by the engine via
+    /// `KvScatterWrite::gather_row_by_device_pos` -- the same precomputed
+    /// table `forward_device_scratch`'s seq_len==1 fast path reads).  The
+    /// rotation is the `cutile_rope_interleaved` math on those rows, so it
+    /// is bit-identical per element to the per-request table rope this
+    /// replaces (probe-gated in bench-decode-ops, "batched rope rows").
+    ///
+    /// `z` is a caller-managed reclaimed output buffer (the
+    /// `RmsnormScratch`/`RopeScratch` pattern: `Some` is try_unwrapped when
+    /// the previous caller dropped its Arc, giving a stable device address
+    /// per m for CUDA-graph capture; a shared/undersized buffer falls back
+    /// to a fresh allocation).  Power-of-two halves only; `src_stride`
+    /// must be a multiple of `half`.
+    pub fn forward_rows_batch(
+        &self,
+        x_dev: &Arc<Tensor<f32>>,
+        cos_rows: &Arc<Tensor<f32>>,
+        sin_rows: &Arc<Tensor<f32>>,
+        m: usize,
+        n_heads: usize,
+        head_dim: usize,
+        src_stride: usize,
+        z: &mut Option<Arc<Tensor<f32>>>,
+        stream: &Arc<Stream>,
+    ) -> Result<Arc<Tensor<f32>>> {
+        if !head_dim.is_multiple_of(2) {
+            return Err(KernelError::InvalidConfig(format!(
+                "head_dim must be even, got {head_dim}"
+            )));
+        }
+        let half = head_dim / 2;
+        if Self::tile_geometry(head_dim).is_some() {
+            return Err(KernelError::InvalidConfig(format!(
+                "forward_rows_batch: non-power-of-two halves (head_dim {head_dim}) not supported"
+            )));
+        }
+        if src_stride % half != 0 {
+            return Err(KernelError::InvalidConfig(format!(
+                "src_stride {src_stride} not a multiple of half {half}"
+            )));
+        }
+        if cos_rows.size() != m * half || sin_rows.size() != m * half {
+            return Err(KernelError::DimensionMismatch {
+                expected: m * half,
+                got: cos_rows.size().min(sin_rows.size()),
+            });
+        }
+        let n_out = m * n_heads * head_dim;
+        let fresh = || -> Result<Tensor<f32>> {
+            Ok(api::zeros::<f32>(&[n_out])
+                .sync_on(stream)
+                .map_err(|e| KernelError::InvalidConfig(e.to_string()))?)
+        };
+        let z_tensor = match z.take() {
+            Some(arc) => match Arc::try_unwrap(arc) {
+                Ok(t) if t.size() == n_out => t
+                    .reshape(&[n_out])
+                    .map_err(|e| KernelError::InvalidConfig(e.to_string()))?,
+                Ok(_) => fresh()?,
+                Err(arc_back) => {
+                    *z = Some(arc_back);
+                    fresh()?
+                }
+            },
+            None => fresh()?,
+        };
+        let src_tiles = (src_stride / half) as i32;
+        let (z_t, _x, _c, _s) = unsafe {
+            kernels::cutile_rope_rows_batch(
+                z_tensor.partition([half]),
+                x_dev.clone(),
+                cos_rows.clone(),
+                sin_rows.clone(),
+            )
+            .generics(vec![
+                half.to_string(),
+                n_heads.to_string(),
+                src_tiles.to_string(),
+            ])
+            .async_on(stream)
+            .map_err(|e| KernelError::InvalidConfig(e.to_string()))?
+        };
+        let z_arc = Arc::new(z_t.unpartition());
+        *z = Some(z_arc.clone());
+        Ok(z_arc)
     }
 
     /// Shared table-rotation launch: deinterleave -> `cutile_rope_from_table`
