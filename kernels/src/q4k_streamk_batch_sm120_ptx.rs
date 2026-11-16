@@ -9,6 +9,20 @@
 /// (n8-column tiles) and processes them sequentially, computing the FULL
 /// K-dimension reduction for each tile before writing to output.
 ///
+/// # Fragment layout (m16n8k32.row.col.s8.s8.s32 -- PTX ISA)
+///
+/// FIXED 2026-11-16f together with q4k_mma_batch_sm120: the original
+/// lane%16/lane/16-based fragment mapping was wrong (A rows, B column, D
+/// (row, col) all misplaced -- the mxf4-gemv fragment-mapping lesson), and
+/// the Q4K nibble layout/dequant convention misread (byte group mw%4 /
+/// hi-select mw>=4 / -8 offset / /32 scale). The TRUE layout, with
+///   tid = lane & 3 (threadID_in_group), gid = lane >> 2 (groupID):
+///   A: a0 (gid, k=tid*4), a1 (gid+8, tid*4), a2 (gid, 16+tid*4), a3 (gid+8, 16+tid*4)
+///   B: b0 (col=gid, tid*4), b1 (col=gid, 16+tid*4)
+///   D: d_j: row = gid + 8*(j>>1), col = 2*tid + (j&1)
+///   Q4K: byte group j = mw>>1 holds sub-blocks 2j (lo nibbles) / 2j+1 (hi);
+///        nibble = raw unsigned 0..15, sc/mv = raw 6-bit ints.
+///
 /// # cp.async double-buffer
 ///
 /// While MW_LOOP computes k_block K, threads 0-7 async-load k_block K+1's
@@ -20,22 +34,16 @@
 ///
 /// # Shared memory layout (5120 bytes, 8-warp variant)
 ///
-/// [0..127]:    smem_d8[8]    f32 super-scale d (header buffer A)
-/// [128..255]:  smem_dmin8[8] f32 super-min dmin (header buffer A)
-/// [256..319]:  smem_sc8[64]  u8 sub-block scales (header buffer A)
-/// [320..383]:  smem_mv8[64]  u8 sub-block min-vals (header buffer A)
-/// [384..4479]: smem_partial[8 warps][16 rows][8 cols] f32 = 4096 bytes
+/// [0..383]:     header buffer A (d8[8] f32, dmin8[8] f32, sc8[64] u8, mv8[64] u8)
+/// [384..4479]:  smem_partial[8 warps][16 rows][8 cols] f32 = 4096 bytes
+///               slot(row, col) = 384 + warp_id*512 + (row*8 + col)*4
 /// [4480..4607]: smem_raw_A[8 neurons][16 bytes] -- cp.async staging
 /// [4608..4735]: smem_raw_B[8 neurons][16 bytes] -- cp.async staging
-/// [4736..4863]: smem_d8[8]    f32 (header buffer B)
-/// [4864..4991]: smem_dmin8[8] f32 (header buffer B)
-/// [4992..5055]: smem_sc8[64]  u8  (header buffer B)
-/// [5056..5119]: smem_mv8[64]  u8  (header buffer B)
-/// Total: 5120 bytes
+/// [4736..5119]: header buffer B
 ///
 /// # Synchronisation
 ///
-/// kb=0: sync header load + bar.sync 0 (same as before)
+/// kb=0: sync header load + bar.sync 0
 /// kb>0: header arrives via cp.async + extraction after MW_LOOP
 ///       cp.async.wait_group 0 + bar.sync 0 + extraction + bar.sync 0
 
@@ -81,21 +89,8 @@ pub const PTX: &str = r#"
     // r5   = tid.x (constant)
     // r6   = lane  (constant)
     // r7   = warp_id (constant)
-    // r8   = d_row = lane%16  (constant)
-    // r9   = lane&16          (constant)
-    // r10  = lane/16          (constant)
-    // r11  = d_col_base (0 or 4) (constant)
-    // r12  = lane%8 = local neuron (constant)
-    // r13  = lane/8 = k-group (constant)
-    // r14  = global neuron = n_tile_base + lane%8 (updated per tile)
-    // r15  = warp_id * 512
-    // r16  = (lane%16)*32
-    // r17  = smem_partial slot abs addr (constant after setup)
-    // r18  = smem_buf base addr (constant)
-    // r19  = d_row * k_blocks * 256 (x_qs row offset)
-    // r20  = d_row * k_blocks * 32  (x_ds row offset)
-    // r21  = kb (k_blocks loop counter, reset per tile)
-    // r60  = mw (sub-block counter, 0..7, reset per kb)
+    // r8   = tid = lane&3 (constant)
+    // r9   = gid = lane>>2 (constant)
     // r130 = sm_count
     // r131 = n_col_tiles
     // r132 = tiles_per_block
@@ -103,12 +98,13 @@ pub const PTX: &str = r#"
     // r134 = my_tile_start
     // r135 = my_tile_end
     // r136 = cur_tile (outer tile loop counter)
-    // r137 = buf_hdr_off: 0 = header buf A, 2688 = header buf B
-    // r138 = raw_off: 2432 = raw staging A, 2560 = raw staging B
+    // r137 = buf_hdr_off: 0 = header buf A, 4736 = header buf B
+    // r138 = raw_off: 4480 = raw staging A, 4608 = raw staging B
     // r139 = temp (next_kb, swap scratch)
-    .reg .u32  %r<145>;
-    .reg .u64  %rd<30>;
-    .reg .f32  %f<70>;
+    // r140-r160 = fragment-mapping constants + per-sub-block temps
+    .reg .u32  %r<170>;
+    .reg .u64  %rd<40>;
+    .reg .f32  %f<80>;
     .reg .pred %p<20>;
     .reg .b16  %h<6>;
 
@@ -124,46 +120,56 @@ pub const PTX: &str = r#"
     ld.param.u32 %r2,   [param_m];
     ld.param.u32 %r130, [param_sm_count];
 
-    // ---- Thread decomposition (tile-independent) -------------------------
-    mov.u32 %r5,  %tid.x;
-    and.b32 %r6,  %r5, 31;          // lane
-    shr.u32 %r7,  %r5, 5;           // warp_id (0..7)
-    and.b32 %r8,  %r6, 15;          // d_row = lane%16
-    and.b32 %r9,  %r6, 16;          // lane&16
-    shr.u32 %r10, %r6, 4;           // lane/16
-    shl.b32 %r11, %r10, 2;          // d_col_base: 0 or 4
-    and.b32 %r12, %r6, 7;           // lane%8 = local neuron within n8 tile
-    shr.u32 %r13, %r6, 3;           // lane/8 = k-group index (0..3)
+    // ---- Thread decomposition (TRUE m16n8k32 fragment layout) -------------
+    mov.u32 %r5, %tid.x;
+    and.b32 %r6, %r5, 31;          // lane
+    shr.u32 %r7, %r5, 5;           // warp_id (0..7)
+    and.b32 %r8, %r6, 3;           // tid = lane & 3
+    shr.u32 %r9, %r6, 2;           // gid = lane >> 2 (0..7)
+    add.u32 %r151, %r9, 8;         // gid + 8
+    shl.b32 %r141, %r8, 1;         // col0 = 2*tid
+    shl.b32 %r145, %r8, 2;         // tid * 4 (k byte offset within a half)
 
-    // ---- Thread predicates (tile-independent) ----------------------------
-    setp.lt.u32 %p1, %r5, 8;        // tid < 8 (header-loading threads)
-    setp.lt.u32 %p2, %r8, %r2;      // d_row < m (valid activation row)
+    // ---- Thread predicates ------------------------------------------------
+    setp.lt.u32 %p1, %r5, 8;        // tid.x < 8 (header-loading threads)
+    setp.lt.u32 %p2, %r9, %r2;      // gid < m (row gid valid)
     setp.eq.u32 %p3, %r7, 0;        // warp_id == 0 (reduction warp)
+    setp.lt.u32 %p4, %r151, %r2;    // gid+8 < m (row gid+8 valid)
 
-    // ---- smem_partial slot address (tile-independent layout) ------------
-    // slot = smem_buf + 384 + warp_id*512 + (lane%16)*32 + (lane&16)
+    // ---- smem_partial slots (this thread's 4 D elements) -------------------
+    // D elements: rows {gid, gid+8} x cols {2*tid, 2*tid+1}.
+    // slot(row, col) = 384 + warp_id*512 + (row*8 + col)*4
+    //   s0 = slot(gid, col0); s1 = s0+4; s2 = s0+256; s3 = s2+4
     shl.b32 %r15, %r7, 9;           // warp_id * 512
-    shl.b32 %r16, %r8, 5;           // (lane%16) * 32
-    or.b32  %r17, %r16, %r9;        // + lane&16
-    add.u32 %r17, %r15, %r17;
-    add.u32 %r17, %r17, 384;        // + smem_partial_offset
+    shl.b32 %r142, %r9, 5;          // gid * 32
+    shl.b32 %r143, %r8, 3;          // (2*tid) * 4
+    add.u32  %r144, %r142, %r143;
+    add.u32  %r144, %r144, %r15;
+    add.u32  %r144, %r144, 384;
     mov.u32 %r18, smem_buf;
-    add.u32 %r17, %r18, %r17;       // absolute smem_partial slot address
+    add.u32 %r17, %r18, %r144;      // s0
 
-    // ---- Activation row base pointers (tile-independent) ----------------
+    // ---- Activation row bases (rows gid and gid+8; tile-independent) ------
     // x_qs row stride: k_blocks * 64 u32 = k_blocks * 256 bytes
-    mul.lo.u32 %r19, %r8, %r1;      // d_row * k_blocks
-    shl.b32    %r19, %r19, 8;       // * 256 bytes
+    mul.lo.u32 %r19, %r9, %r1;
+    shl.b32    %r19, %r19, 8;
+    mul.lo.u32 %r20, %r151, %r1;
+    shl.b32    %r20, %r20, 8;
     cvt.u64.u32 %rd4, %r19;
-    add.u64    %rd4, %rd1, %rd4;    // x_qs row base for d_row
-
+    add.u64    %rd4, %rd1, %rd4;    // x_qs row gid
+    cvt.u64.u32 %rd12, %r20;
+    add.u64    %rd12, %rd1, %rd12;  // x_qs row gid+8
     // x_ds row stride: k_blocks * 8 u32 = k_blocks * 32 bytes
-    mul.lo.u32 %r20, %r8, %r1;
+    mul.lo.u32 %r19, %r9, %r1;
+    shl.b32    %r19, %r19, 5;
+    mul.lo.u32 %r20, %r151, %r1;
     shl.b32    %r20, %r20, 5;
-    cvt.u64.u32 %rd5, %r20;
-    add.u64    %rd5, %rd2, %rd5;    // x_ds row base for d_row
+    cvt.u64.u32 %rd5, %r19;
+    add.u64    %rd5, %rd2, %rd5;    // x_ds row gid
+    cvt.u64.u32 %rd13, %r20;
+    add.u64    %rd13, %rd2, %rd13;  // x_ds row gid+8
 
-    // ---- Compute tile assignment for this block -------------------------
+    // ---- Compute tile assignment for this block ---------------------------
     // n_col_tiles = ceil(N / 8)
     add.u32 %r131, %r0, 7;
     shr.u32 %r131, %r131, 3;        // n_col_tiles
@@ -194,29 +200,27 @@ TILE_LOOP:
     // n_tile_base = cur_tile * 8
     shl.b32 %r3, %r136, 3;
 
-    // Global neuron for B loads: n_tile_base + lane%8
-    add.u32 %r14, %r3, %r12;
+    // B column (neuron) for this thread: col = gid
+    add.u32 %r12, %r3, %r9;
 
     // Reset double-buffer state for this tile
-    // buf_hdr_off = 0 (header buffer A active)
-    // raw_off = 4480 (raw staging A for next prefetch)
     mov.u32 %r137, 0;
     mov.u32 %r138, 4480;
 
-    // Zero smem_partial for this tile (each thread zeroes its own slot).
-    // No preceding bar.sync needed -- bar.sync at SKIP_WRITE of previous
-    // tile ensures warp-0 has finished reading smem_partial before we zero.
-    st.shared.f32 [%r17 + 0],  0f00000000;
-    st.shared.f32 [%r17 + 4],  0f00000000;
-    st.shared.f32 [%r17 + 8],  0f00000000;
-    st.shared.f32 [%r17 + 12], 0f00000000;
+    // Zero smem_partial for this tile (each thread zeroes its 4 slots).
+    // No preceding bar.sync needed -- bar.sync 1 at SKIP_WRITE of the
+    // previous tile ensures warp-0 has finished reading smem_partial.
+    st.shared.f32 [%r17 + 0],   0f00000000;
+    st.shared.f32 [%r17 + 4],   0f00000000;
+    st.shared.f32 [%r17 + 256], 0f00000000;
+    st.shared.f32 [%r17 + 260], 0f00000000;
 
     // ---- Outer K-block loop ---------------------------------------------
     mov.u32 %r21, 0;                 // kb = 0
 
 KB_LOOP:
-    setp.ge.u32 %p4, %r21, %r1;
-    @%p4 bra KB_DONE;
+    setp.ge.u32 %p5, %r21, %r1;
+    @%p5 bra KB_DONE;
 
     // is this the first k-block? has a next k-block?
     setp.eq.u32 %p13, %r21, 0;      // p13 = (kb == 0)
@@ -233,7 +237,6 @@ KB_LOOP:
     //   (n_tile_base + tid) * k_blocks * 144 + 0 * 144
     mul.lo.u32 %r22, %r5, %r1;      // tid * k_blocks
     mul.lo.u32 %r22, %r22, 144;
-    // mad.lo.u32 %r22, 0, 144, %r22 -- kb=0 so no offset
     mul.lo.u32 %r23, %r3, %r1;      // n_tile_base * k_blocks
     mul.lo.u32 %r23, %r23, 144;
     add.u32    %r22, %r22, %r23;
@@ -266,32 +269,30 @@ KB_LOOP:
     shr.u32 %r36, %r26, 8;  and.b32 %r36, %r36, 255;
     and.b32 %r37, %r24, 192; shr.u32 %r37, %r37, 2;
     shr.u32 %r38, %r24, 8;  and.b32 %r38, %r38, 192; shr.u32 %r38, %r38, 2;
-    and.b32 %r39, %r35, 15;  or.b32 %r39, %r39, %r37;   // sc[4]
-    and.b32 %r40, %r36, 15;  or.b32 %r40, %r40, %r38;   // sc[5]
+    and.b32 %r39, %r35, 15;  or.b32 %r39, %r39, %r37;
+    and.b32 %r40, %r36, 15;  or.b32 %r40, %r40, %r38;
     shr.u32 %r41, %r35, 4;  and.b32 %r41, %r41, 15;
     and.b32 %r42, %r25, 192; shr.u32 %r42, %r42, 2;
-    or.b32  %r41, %r41, %r42;                             // m_val[4]
+    or.b32  %r41, %r41, %r42;
     shr.u32 %r43, %r36, 4;  and.b32 %r43, %r43, 15;
     shr.u32 %r44, %r25, 8;  and.b32 %r44, %r44, 192; shr.u32 %r44, %r44, 2;
-    or.b32  %r43, %r43, %r44;                             // m_val[5]
+    or.b32  %r43, %r43, %r44;
     shr.u32 %r45, %r26, 16; and.b32 %r45, %r45, 255;
     shr.u32 %r46, %r26, 24; and.b32 %r46, %r46, 255;
     shr.u32 %r47, %r24, 16; and.b32 %r47, %r47, 192; shr.u32 %r47, %r47, 2;
     shr.u32 %r48, %r24, 24; and.b32 %r48, %r48, 192; shr.u32 %r48, %r48, 2;
-    and.b32 %r49, %r45, 15; or.b32 %r49, %r49, %r47;   // sc[6]
-    and.b32 %r50, %r46, 15; or.b32 %r50, %r50, %r48;   // sc[7]
+    and.b32 %r49, %r45, 15; or.b32 %r49, %r49, %r47;
+    and.b32 %r50, %r46, 15; or.b32 %r50, %r50, %r48;
     shr.u32 %r51, %r45, 4;  and.b32 %r51, %r51, 15;
     shr.u32 %r52, %r25, 16; and.b32 %r52, %r52, 192; shr.u32 %r52, %r52, 2;
-    or.b32  %r51, %r51, %r52;                             // m_val[6]
+    or.b32  %r51, %r51, %r52;
     shr.u32 %r53, %r46, 4;  and.b32 %r53, %r53, 15;
     shr.u32 %r54, %r25, 24; and.b32 %r54, %r54, 192; shr.u32 %r54, %r54, 2;
-    or.b32  %r53, %r53, %r54;                             // m_val[7]
+    or.b32  %r53, %r53, %r54;
 
     // Store to header buffer A (buf_hdr_off=0): neuron index = tid (0..7)
-    // %r137 == 0 here (first kb, reset at tile start)
     shl.b32 %r55, %r5, 2;           // tid * 4 bytes
     mov.u32 %r56, smem_buf;
-    // buf_hdr_off == 0 here, no need to add
     add.u32 %r57, %r56, %r55;
     st.shared.f32 [%r57 + 0],   %f0;  // smem_d8[tid]
     st.shared.f32 [%r57 + 128], %f1;  // smem_dmin8[tid]
@@ -299,7 +300,7 @@ KB_LOOP:
     // smem_sc8[tid][8] at smem_buf + 256 + tid*8
     shl.b32 %r58, %r5, 3;           // tid * 8
     add.u32 %r58, %r58, 256;
-    add.u32 %r58, %r56, %r58;
+    add.u32 %r58, %r58, %r56;
     st.shared.u8 [%r58 + 0], %r27;  // sc[0]
     st.shared.u8 [%r58 + 1], %r28;  // sc[1]
     st.shared.u8 [%r58 + 2], %r29;  // sc[2]
@@ -345,7 +346,6 @@ SKIP_SYNC_HDR:
     add.u64 %rd6, %rd0, %rd6;       // ptr to next Q4K block header
 
     // Compute smem destination: smem_buf + raw_off + tid*16
-    // raw_off is in %r138 (2432 or 2560)
     shl.b32 %r22, %r5, 4;           // tid * 16
     add.u32 %r22, %r22, %r138;      // + raw_off
     add.u32 %r22, %r22, %r18;       // + smem_buf base
@@ -365,142 +365,151 @@ SKIP_PREFETCH:
     mov.u32 %r60, 0;                 // mw = 0
 
 MW_LOOP:
-    setp.ge.u32 %p5, %r60, 8;
-    @%p5 bra MW_DONE;
+    setp.ge.u32 %p6, %r60, 8;
+    @%p6 bra MW_DONE;
 
     // Check warp assignment: (kb*8 + mw) % 8 == warp_id?
     mul.lo.u32 %r61, %r21, 8;
     add.u32    %r61, %r61, %r60;    // global_sub = kb*8 + mw
     and.b32    %r62, %r61, 7;       // global_sub % 8
-    setp.eq.u32 %p6, %r62, %r7;
-    @!%p6 bra MW_NEXT;
+    setp.eq.u32 %p8, %r62, %r7;
+    @!%p8 bra MW_NEXT;
 
-    // ---- Load Q8_1 activation INT8 for this sub-block -------------------
+    // ---- Load Q8_1 activation fragments (A) --------------------------------
+    // a0: row gid, k half 0; a1: row gid+8, k half 0;
+    // a2: row gid, k half 1; a3: row gid+8, k half 1
     mul.lo.u32 %r63, %r21, 8;
-    add.u32    %r63, %r63, %r60;    // kb*8 + mw
-    shl.b32    %r63, %r63, 5;       // * 32 bytes
-    add.u32    %r63, %r63, %r9;     // + lane&16 (k-half selector)
-    cvt.u64.u32 %rd7, %r63;
-    add.u64    %rd7, %rd4, %rd7;   // x_qs row + sub-block offset
+    add.u32    %r63, %r63, %r60;    // kb*8+mw
+    shl.b32    %r63, %r63, 5;       // * 32 bytes (q8 block stride)
+    cvt.u64.u32 %rd14, %r63;
+    add.u64 %rd7,  %rd4,  %rd14;    // row gid block base
+    add.u64 %rd14, %rd12, %rd14;    // row gid+8 block base
 
     mov.u32 %r64, 0; mov.u32 %r65, 0;
     mov.u32 %r66, 0; mov.u32 %r67, 0;
-    @%p2 ld.global.nc.b32 %r64, [%rd7 + 0];
-    @%p2 ld.global.nc.b32 %r65, [%rd7 + 4];
-    @%p2 ld.global.nc.b32 %r66, [%rd7 + 8];
-    @%p2 ld.global.nc.b32 %r67, [%rd7 + 12];
+    cvt.u64.u32 %rd17, %r145;
+    add.u64 %rd18, %rd7,  %rd17;    // a0 address (row gid, k half 0)
+    add.u64 %rd19, %rd14, %rd17;    // a1 address (row gid+8, k half 0)
+    @%p2 ld.global.nc.b32 %r64, [%rd18];
+    @%p4 ld.global.nc.b32 %r65, [%rd19];
+    @%p2 ld.global.nc.b32 %r66, [%rd18 + 16];
+    @%p4 ld.global.nc.b32 %r67, [%rd19 + 16];
 
-    // ---- Load Q8_1 scale for this sub-block -----------------------------
+    // ---- Load Q8_1 scales for rows gid (f2) and gid+8 (f40) ----------------
     mul.lo.u32 %r68, %r21, 8;
-    add.u32    %r68, %r68, %r60;
-    shl.b32    %r68, %r68, 2;       // * 4 bytes (one u32 per block)
+    add.u32    %r68, %r68, %r60;    // kb*8+mw
+    shl.b32    %r68, %r68, 2;       // * 4 bytes (one u32 per q8 block)
     cvt.u64.u32 %rd8, %r68;
-    add.u64    %rd8, %rd5, %rd8;
+    add.u64 %rd15, %rd13, %rd8;     // row gid+8 ds address
+    add.u64 %rd8,  %rd5,  %rd8;     // row gid ds address
     mov.b16    %h2, 0;
-    @%p2 ld.global.nc.b16 %h2, [%rd8];  // f16 scale from low 16 bits
-    cvt.f32.f16 %f2, %h2;
+    mov.b16    %h3, 0;
+    @%p2 ld.global.nc.b16 %h2, [%rd8];
+    @%p4 ld.global.nc.b16 %h3, [%rd15];
+    cvt.f32.f16 %f2,  %h2;
+    cvt.f32.f16 %f40, %h3;
 
-    // ---- Activation partial sum for min-scale correction ----------------
+    // ---- Row sums for the min term ------------------------------------------
+    // s_lo (r69): row gid partial = bytesum(a0) + bytesum(a2)
+    // s_hi (r70): row gid+8 partial = bytesum(a1) + bytesum(a3)
+    // Full 32-byte row sums via a 2-step XOR butterfly over the 4-lane group.
     mov.u32 %r69, 0;
-    shl.b32 %r70, %r64, 24; shr.s32 %r70, %r70, 24; add.s32 %r69, %r69, %r70;
-    shl.b32 %r70, %r64, 16; shr.s32 %r70, %r70, 24; add.s32 %r69, %r69, %r70;
-    shl.b32 %r70, %r64, 8;  shr.s32 %r70, %r70, 24; add.s32 %r69, %r69, %r70;
-    shr.s32 %r70, %r64, 24;                           add.s32 %r69, %r69, %r70;
-    shl.b32 %r70, %r65, 24; shr.s32 %r70, %r70, 24; add.s32 %r69, %r69, %r70;
-    shl.b32 %r70, %r65, 16; shr.s32 %r70, %r70, 24; add.s32 %r69, %r69, %r70;
-    shl.b32 %r70, %r65, 8;  shr.s32 %r70, %r70, 24; add.s32 %r69, %r69, %r70;
-    shr.s32 %r70, %r65, 24;                           add.s32 %r69, %r69, %r70;
-    shl.b32 %r70, %r66, 24; shr.s32 %r70, %r70, 24; add.s32 %r69, %r69, %r70;
-    shl.b32 %r70, %r66, 16; shr.s32 %r70, %r70, 24; add.s32 %r69, %r69, %r70;
-    shl.b32 %r70, %r66, 8;  shr.s32 %r70, %r70, 24; add.s32 %r69, %r69, %r70;
-    shr.s32 %r70, %r66, 24;                           add.s32 %r69, %r69, %r70;
-    shl.b32 %r70, %r67, 24; shr.s32 %r70, %r70, 24; add.s32 %r69, %r69, %r70;
-    shl.b32 %r70, %r67, 16; shr.s32 %r70, %r70, 24; add.s32 %r69, %r69, %r70;
-    shl.b32 %r70, %r67, 8;  shr.s32 %r70, %r70, 24; add.s32 %r69, %r69, %r70;
-    shr.s32 %r70, %r67, 24;                           add.s32 %r69, %r69, %r70;
-    // Combine k-halves: butterfly XOR 16 => sum all 32 elements
-    shfl.sync.bfly.b32 %r71, %r69, 16, 31, 0xFFFFFFFF;
-    add.s32 %r69, %r69, %r71;       // full row_sum over 32 elements
+    shl.b32 %r71, %r64, 24; shr.s32 %r71, %r71, 24; add.s32 %r69, %r69, %r71;
+    shl.b32 %r71, %r64, 16; shr.s32 %r71, %r71, 24; add.s32 %r69, %r69, %r71;
+    shl.b32 %r71, %r64, 8;  shr.s32 %r71, %r71, 24; add.s32 %r69, %r69, %r71;
+    shr.s32 %r71, %r64, 24;                            add.s32 %r69, %r69, %r71;
+    shl.b32 %r71, %r66, 24; shr.s32 %r71, %r71, 24; add.s32 %r69, %r69, %r71;
+    shl.b32 %r71, %r66, 16; shr.s32 %r71, %r71, 24; add.s32 %r69, %r69, %r71;
+    shl.b32 %r71, %r66, 8;  shr.s32 %r71, %r71, 24; add.s32 %r69, %r69, %r71;
+    shr.s32 %r71, %r66, 24;                            add.s32 %r69, %r69, %r71;
+    mov.u32 %r70, 0;
+    shl.b32 %r71, %r65, 24; shr.s32 %r71, %r71, 24; add.s32 %r70, %r70, %r71;
+    shl.b32 %r71, %r65, 16; shr.s32 %r71, %r71, 24; add.s32 %r70, %r70, %r71;
+    shl.b32 %r71, %r65, 8;  shr.s32 %r71, %r71, 24; add.s32 %r70, %r70, %r71;
+    shr.s32 %r71, %r65, 24;                            add.s32 %r70, %r70, %r71;
+    shl.b32 %r71, %r67, 24; shr.s32 %r71, %r71, 24; add.s32 %r70, %r70, %r71;
+    shl.b32 %r71, %r67, 16; shr.s32 %r71, %r71, 24; add.s32 %r70, %r70, %r71;
+    shl.b32 %r71, %r67, 8;  shr.s32 %r71, %r71, 24; add.s32 %r70, %r70, %r71;
+    shr.s32 %r71, %r67, 24;                            add.s32 %r70, %r70, %r71;
 
-    // ---- Load Q4K nibbles and dequant to INT8 for B matrix --------------
-    and.b32 %r72, %r60, 3;          // mw % 4
-    shl.b32 %r72, %r72, 5;          // * 32 (byte offset within qs area)
-    shl.b32 %r73, %r13, 2;          // (lane/8) * 4
+    shfl.sync.bfly.b32 %r72, %r69, 1, 31, 0xFFFFFFFF;
+    add.s32 %r69, %r69, %r72;
+    shfl.sync.bfly.b32 %r72, %r69, 2, 31, 0xFFFFFFFF;
+    add.s32 %r69, %r69, %r72;     // rowsum(row gid)
+    shfl.sync.bfly.b32 %r72, %r70, 1, 31, 0xFFFFFFFF;
+    add.s32 %r70, %r70, %r72;
+    shfl.sync.bfly.b32 %r72, %r70, 2, 31, 0xFFFFFFFF;
+    add.s32 %r70, %r70, %r72;     // rowsum(row gid+8)
 
-    // Weight byte offset: neuron * k_blocks * 144 + kb * 144 + 16 + mw_offset + k_offset
-    mul.lo.u32 %r74, %r14, %r1;     // global_neuron * k_blocks
+    // ---- Load Q4K nibbles for B (col = gid, k halves tid*4 / 16+tid*4) ----
+    // Byte group j = mw>>1 (sub-blocks 2j, 2j+1 share qs[32j..32j+31]);
+    // hi nibbles selected when mw is ODD. The nibble IS the value (raw
+    // unsigned 0..15 -- no -8; the min term carries it via dmin*mv).
+    shr.u32 %r72, %r60, 1;        // byte group j = mw>>1
+    shl.b32 %r72, %r72, 5;        // * 32
+
+    // Weight byte offset: neuron * k_blocks * 144 + kb * 144 + 16 + j*32
+    mul.lo.u32 %r74, %r12, %r1;   // neuron * k_blocks
     mul.lo.u32 %r74, %r74, 144;
     mad.lo.u32 %r74, %r21, 144, %r74; // + kb * 144
     add.u32    %r74, %r74, 16;      // + qs_area_start
-    add.u32    %r74, %r74, %r72;    // + mw_byte_offset
-    add.u32    %r75, %r74, %r73;    // + k_byte_offset (b0: k-half 0)
-    add.u32    %r76, %r75, 16;      // + 16 (b1: k-half 1)
+    add.u32    %r74, %r74, %r72;    // + byte group offset
+    add.u32    %r75, %r74, %r145;   // + tid*4 (b0: k half 0)
+    add.u32    %r76, %r75, 16;      // + 16 (b1: k half 1)
 
     cvt.u64.u32 %rd9,  %r75; add.u64 %rd9,  %rd0, %rd9;
     cvt.u64.u32 %rd10, %r76; add.u64 %rd10, %rd0, %rd10;
     ld.global.nc.b32 %r77, [%rd9];   // raw nibbles for b0
     ld.global.nc.b32 %r78, [%rd10];  // raw nibbles for b1
 
-    // Dequant nibbles to signed INT8: use hi nibbles when mw >= 4
-    setp.ge.u32 %p7, %r60, 4;
+    and.b32 %r150, %r60, 1;
+    setp.ne.u32 %p7, %r150, 0;
     mov.u32 %r79, 0x0F0F0F0F;
-    mov.u32 %r80, 0x08080808;
     and.b32 %r81, %r77, %r79;
     shr.u32 %r82, %r77, 4; and.b32 %r82, %r82, %r79;
-    selp.u32 %r83, %r82, %r81, %p7; // select hi vs lo nibbles
-    sub.u32  %r83, %r83, %r80;       // subtract 8: range -8..7
+    selp.u32 %r83, %r82, %r81, %p7; // select hi vs lo nibbles by mw parity
     and.b32 %r84, %r78, %r79;
     shr.u32 %r85, %r78, 4; and.b32 %r85, %r85, %r79;
     selp.u32 %r86, %r85, %r84, %p7;
-    sub.u32  %r86, %r86, %r80;
 
-    // ---- Load per-neuron Q4K scales from smem for this sub-block --------
-    // Use buf_hdr_off (%r137) to select header buffer A (0) or B (2688).
-    mov.u32 %r87, smem_buf;
-    add.u32 %r87, %r87, %r137;      // + buf_hdr_off: points to active header
-    shl.b32 %r88, %r11, 2;          // d_col_base * 4 bytes
-    add.u32 %r89, %r87, %r88;
-    ld.shared.f32 %f3,  [%r89 + 0];   // d[n+0]
-    ld.shared.f32 %f4,  [%r89 + 4];   // d[n+1]
-    ld.shared.f32 %f5,  [%r89 + 8];   // d[n+2]
-    ld.shared.f32 %f6,  [%r89 + 12];  // d[n+3]
-    ld.shared.f32 %f7,  [%r89 + 128]; // dmin[n+0]
-    ld.shared.f32 %f8,  [%r89 + 132]; // dmin[n+1]
-    ld.shared.f32 %f9,  [%r89 + 136]; // dmin[n+2]
-    ld.shared.f32 %f10, [%r89 + 140]; // dmin[n+3]
+    // ---- Per-column Q4K scales (cols col0 = 2*tid and col0+1) --------------
+    // Header buffer selected by buf_hdr_off (%r137).
+    mov.u32 %r152, smem_buf;
+    add.u32 %r152, %r152, %r137;    // active header base
+    shl.b32 %r146, %r141, 2;        // col0 * 4 (f32 tables)
+    add.u32 %r147, %r152, %r146;
+    ld.shared.f32 %f3,  [%r147];       // d[col0]
+    ld.shared.f32 %f4,  [%r147 + 4];   // d[col0+1]
+    ld.shared.f32 %f7,  [%r147 + 128]; // dmin[col0]
+    ld.shared.f32 %f8,  [%r147 + 132]; // dmin[col0+1]
 
-    // smem_sc8[n_local][mw]: base at header_base + 256 + n_local*8, index by mw
-    shl.b32 %r90, %r11, 3;          // d_col_base * 8
-    add.u32 %r91, %r87, %r90;
-    add.u32 %r91, %r91, 256;        // sc8 base for n=d_col_base
-    add.u32 %r92, %r91, %r60;       // + mw
-    ld.shared.u8 %r93,  [%r92 + 0];   // sc[n+0][mw]
-    ld.shared.u8 %r94,  [%r92 + 8];   // sc[n+1][mw]
-    ld.shared.u8 %r95,  [%r92 + 16];  // sc[n+2][mw]
-    ld.shared.u8 %r96,  [%r92 + 24];  // sc[n+3][mw]
-    add.u32 %r97, %r92, 64;           // mv8 offset (sc8+64 within header)
-    ld.shared.u8 %r98,  [%r97 + 0];   // mv[n+0][mw]
-    ld.shared.u8 %r99,  [%r97 + 8];   // mv[n+1][mw]
-    ld.shared.u8 %r100, [%r97 + 16];  // mv[n+2][mw]
-    ld.shared.u8 %r101, [%r97 + 24];  // mv[n+3][mw]
+    // sc8[c][mw] at header + 256 + c*8 + mw; mv8 at +64
+    shl.b32 %r148, %r141, 3;        // col0 * 8
+    add.u32 %r149, %r152, %r148;
+    add.u32 %r149, %r149, 256;
+    add.u32 %r149, %r149, %r60;     // + mw
+    ld.shared.u8 %r93,  [%r149];       // sc[col0][mw]
+    ld.shared.u8 %r94,  [%r149 + 8];   // sc[col0+1][mw]
+    add.u32 %r153, %r149, 64;
+    ld.shared.u8 %r98,  [%r153];       // mv[col0][mw]
+    ld.shared.u8 %r99,  [%r153 + 8];   // mv[col0+1][mw]
 
-    // scale_pos[0..3] = d[n+i] * (sc[n+i][mw] / 32) * d_q8
-    cvt.rn.f32.u32 %f11, %r93; mul.f32 %f11, %f11, 0f3D000000; mul.f32 %f11, %f3, %f11; mul.f32 %f11, %f11, %f2;
-    cvt.rn.f32.u32 %f12, %r94; mul.f32 %f12, %f12, 0f3D000000; mul.f32 %f12, %f4, %f12; mul.f32 %f12, %f12, %f2;
-    cvt.rn.f32.u32 %f13, %r95; mul.f32 %f13, %f13, 0f3D000000; mul.f32 %f13, %f5, %f13; mul.f32 %f13, %f13, %f2;
-    cvt.rn.f32.u32 %f14, %r96; mul.f32 %f14, %f14, 0f3D000000; mul.f32 %f14, %f6, %f14; mul.f32 %f14, %f14, %f2;
-    // scale_min[0..3] = dmin[n+i] * (mv[n+i][mw] / 32) * d_q8
-    cvt.rn.f32.u32 %f15, %r98;  mul.f32 %f15, %f15, 0f3D000000; mul.f32 %f15, %f7,  %f15; mul.f32 %f15, %f15, %f2;
-    cvt.rn.f32.u32 %f16, %r99;  mul.f32 %f16, %f16, 0f3D000000; mul.f32 %f16, %f8,  %f16; mul.f32 %f16, %f16, %f2;
-    cvt.rn.f32.u32 %f17, %r100; mul.f32 %f17, %f17, 0f3D000000; mul.f32 %f17, %f9,  %f17; mul.f32 %f17, %f17, %f2;
-    cvt.rn.f32.u32 %f18, %r101; mul.f32 %f18, %f18, 0f3D000000; mul.f32 %f18, %f10, %f18; mul.f32 %f18, %f18, %f2;
+    // pos[row][col] = d[col] * sc[col][mw] * d8[row];  min = dmin*mv*d8
+    cvt.rn.f32.u32 %f11, %r93;
+    cvt.rn.f32.u32 %f12, %r94;
+    cvt.rn.f32.u32 %f15, %r98;
+    cvt.rn.f32.u32 %f16, %r99;
+    mul.f32 %f17, %f3, %f11;  mul.f32 %f17, %f17, %f2;    // pos row-lo col0
+    mul.f32 %f18, %f4, %f12;  mul.f32 %f18, %f18, %f2;    // pos row-lo col1
+    mul.f32 %f41, %f3, %f11;  mul.f32 %f41, %f41, %f40;   // pos row-hi col0
+    mul.f32 %f42, %f4, %f12;  mul.f32 %f42, %f42, %f40;   // pos row-hi col1
+    mul.f32 %f19, %f7, %f15;  mul.f32 %f19, %f19, %f2;    // min row-lo col0
+    mul.f32 %f20, %f8, %f16;  mul.f32 %f20, %f20, %f2;    // min row-lo col1
+    mul.f32 %f43, %f7, %f15;  mul.f32 %f43, %f43, %f40;   // min row-hi col0
+    mul.f32 %f44, %f8, %f16;  mul.f32 %f44, %f44, %f40;   // min row-hi col1
 
-    // min correction: row_sum_f * scale_min[0..3]
-    cvt.rn.f32.s32 %f19, %r69;
-    mul.f32 %f20, %f19, %f15;
-    mul.f32 %f21, %f19, %f16;
-    mul.f32 %f22, %f19, %f17;
-    mul.f32 %f23, %f19, %f18;
+    cvt.rn.f32.s32 %f21, %r69;   // rowsum(row gid)
+    cvt.rn.f32.s32 %f45, %r70;   // rowsum(row gid+8)
 
     // ---- MMA: D = A * B --------------------------------------------------
     mov.u32 %r102, 0; mov.u32 %r103, 0;
@@ -511,16 +520,23 @@ MW_LOOP:
         {%r83,  %r86},
         {%r102, %r103, %r104, %r105};
 
-    // Scale and accumulate into smem_partial
-    cvt.rn.f32.s32 %f24, %r102; mul.f32 %f24, %f24, %f11; sub.f32 %f24, %f24, %f20;
-    cvt.rn.f32.s32 %f25, %r103; mul.f32 %f25, %f25, %f12; sub.f32 %f25, %f25, %f21;
-    cvt.rn.f32.s32 %f26, %r104; mul.f32 %f26, %f26, %f13; sub.f32 %f26, %f26, %f22;
-    cvt.rn.f32.s32 %f27, %r105; mul.f32 %f27, %f27, %f14; sub.f32 %f27, %f27, %f23;
+    // ---- Scale + min term, accumulate into smem_partial --------------------
+    // d0: (gid, col0); d1: (gid, col0+1); d2: (gid+8, col0); d3: (gid+8, col0+1)
+    cvt.rn.f32.s32 %f24, %r102; mul.f32 %f24, %f24, %f17;
+    mul.f32 %f25, %f21, %f19;   sub.f32 %f24, %f24, %f25;
+    ld.shared.f32 %f28, [%r17 + 0];   add.f32 %f28, %f28, %f24;  st.shared.f32 [%r17 + 0],   %f28;
 
-    ld.shared.f32 %f28, [%r17 + 0];  add.f32 %f28, %f28, %f24;  st.shared.f32 [%r17 + 0],  %f28;
-    ld.shared.f32 %f29, [%r17 + 4];  add.f32 %f29, %f29, %f25;  st.shared.f32 [%r17 + 4],  %f29;
-    ld.shared.f32 %f30, [%r17 + 8];  add.f32 %f30, %f30, %f26;  st.shared.f32 [%r17 + 8],  %f30;
-    ld.shared.f32 %f31, [%r17 + 12]; add.f32 %f31, %f31, %f27;  st.shared.f32 [%r17 + 12], %f31;
+    cvt.rn.f32.s32 %f24, %r103; mul.f32 %f24, %f24, %f18;
+    mul.f32 %f25, %f21, %f20;   sub.f32 %f24, %f24, %f25;
+    ld.shared.f32 %f28, [%r17 + 4];   add.f32 %f28, %f28, %f24;  st.shared.f32 [%r17 + 4],   %f28;
+
+    cvt.rn.f32.s32 %f24, %r104; mul.f32 %f24, %f24, %f41;
+    mul.f32 %f25, %f45, %f43;   sub.f32 %f24, %f24, %f25;
+    ld.shared.f32 %f28, [%r17 + 256]; add.f32 %f28, %f28, %f24;  st.shared.f32 [%r17 + 256], %f28;
+
+    cvt.rn.f32.s32 %f24, %r105; mul.f32 %f24, %f24, %f42;
+    mul.f32 %f25, %f45, %f44;   sub.f32 %f24, %f24, %f25;
+    ld.shared.f32 %f28, [%r17 + 260]; add.f32 %f28, %f28, %f24;  st.shared.f32 [%r17 + 260], %f28;
 
 MW_NEXT:
     add.u32 %r60, %r60, 1;
@@ -534,7 +550,6 @@ MW_DONE:
     @!%p12 bra KB_LOOP_DONE;
 
     // Wait for the cp.async.cg issued above to complete.
-    // wait_group 0: all outstanding async groups must complete.
     cp.async.wait_group 0;
 
     // Barrier: raw header data in smem_raw is now visible to all threads.
@@ -600,7 +615,6 @@ MW_DONE:
     selp.u32 %r56, 4736, 0, %p15;   // r56 = next_hdr_off
 
     // Store extracted header into NEXT header buffer
-    // next header base = smem_buf + next_hdr_off
     add.u32 %r57, %r18, %r56;       // r57 = smem_buf + next_hdr_off
 
     // d8, dmin8: at next_hdr_base + 0 + tid*4 and + 128
@@ -652,61 +666,74 @@ KB_DONE:
     bar.sync 0;   // ensure all K-loop smem_partial writes are visible
 
     @!%p3 bra SKIP_WRITE;  // non-warp-0: skip to barrier
-    @!%p2 bra SKIP_WRITE;  // warp-0, invalid row: skip to barrier
 
-    // Warp 0: read partial sums from all 8 warps.
-    ld.shared.f32 %f32, [%r17 + 0];
-    ld.shared.f32 %f33, [%r17 + 4];
-    ld.shared.f32 %f34, [%r17 + 8];
-    ld.shared.f32 %f35, [%r17 + 12];
-    ld.shared.f32 %f36, [%r17 + 512];
-    ld.shared.f32 %f37, [%r17 + 516];
-    ld.shared.f32 %f38, [%r17 + 520];
-    ld.shared.f32 %f39, [%r17 + 524];
-    ld.shared.f32 %f40, [%r17 + 1024];
-    ld.shared.f32 %f41, [%r17 + 1028];
-    ld.shared.f32 %f42, [%r17 + 1032];
-    ld.shared.f32 %f43, [%r17 + 1036];
-    ld.shared.f32 %f44, [%r17 + 1536];
-    ld.shared.f32 %f45, [%r17 + 1540];
-    ld.shared.f32 %f46, [%r17 + 1544];
-    ld.shared.f32 %f47, [%r17 + 1548];
-    ld.shared.f32 %f48, [%r17 + 2048];
-    ld.shared.f32 %f49, [%r17 + 2052];
-    ld.shared.f32 %f50, [%r17 + 2056];
-    ld.shared.f32 %f51, [%r17 + 2060];
-    ld.shared.f32 %f52, [%r17 + 2560];
-    ld.shared.f32 %f53, [%r17 + 2564];
-    ld.shared.f32 %f54, [%r17 + 2568];
-    ld.shared.f32 %f55, [%r17 + 2572];
+    // This thread's D elements: rows {gid, gid+8} x cols {col0, col0+1}.
+    // Partials from the 8 warps sit at slot + w*512.
+    ld.shared.f32 %f50, [%r17 + 0];
+    ld.shared.f32 %f51, [%r17 + 512];
+    ld.shared.f32 %f52, [%r17 + 1024];
+    ld.shared.f32 %f53, [%r17 + 1536];
+    ld.shared.f32 %f54, [%r17 + 2048];
+    ld.shared.f32 %f55, [%r17 + 2560];
     ld.shared.f32 %f56, [%r17 + 3072];
-    ld.shared.f32 %f57, [%r17 + 3076];
-    ld.shared.f32 %f58, [%r17 + 3080];
-    ld.shared.f32 %f59, [%r17 + 3084];
-    ld.shared.f32 %f60, [%r17 + 3584];
-    ld.shared.f32 %f61, [%r17 + 3588];
-    ld.shared.f32 %f62, [%r17 + 3592];
-    ld.shared.f32 %f63, [%r17 + 3596];
+    ld.shared.f32 %f57, [%r17 + 3584];
+    add.f32 %f50, %f50, %f51; add.f32 %f50, %f50, %f52; add.f32 %f50, %f50, %f53;
+    add.f32 %f50, %f50, %f54; add.f32 %f50, %f50, %f55; add.f32 %f50, %f50, %f56;
+    add.f32 %f50, %f50, %f57;
 
-    add.f32 %f32, %f32, %f36; add.f32 %f32, %f32, %f40; add.f32 %f32, %f32, %f44;
-    add.f32 %f32, %f32, %f48; add.f32 %f32, %f32, %f52; add.f32 %f32, %f32, %f56; add.f32 %f32, %f32, %f60;
-    add.f32 %f33, %f33, %f37; add.f32 %f33, %f33, %f41; add.f32 %f33, %f33, %f45;
-    add.f32 %f33, %f33, %f49; add.f32 %f33, %f33, %f53; add.f32 %f33, %f33, %f57; add.f32 %f33, %f33, %f61;
-    add.f32 %f34, %f34, %f38; add.f32 %f34, %f34, %f42; add.f32 %f34, %f34, %f46;
-    add.f32 %f34, %f34, %f50; add.f32 %f34, %f34, %f54; add.f32 %f34, %f34, %f58; add.f32 %f34, %f34, %f62;
-    add.f32 %f35, %f35, %f39; add.f32 %f35, %f35, %f43; add.f32 %f35, %f35, %f47;
-    add.f32 %f35, %f35, %f51; add.f32 %f35, %f35, %f55; add.f32 %f35, %f35, %f59; add.f32 %f35, %f35, %f63;
+    ld.shared.f32 %f58, [%r17 + 4];
+    ld.shared.f32 %f59, [%r17 + 516];
+    ld.shared.f32 %f60, [%r17 + 1028];
+    ld.shared.f32 %f61, [%r17 + 1540];
+    ld.shared.f32 %f62, [%r17 + 2052];
+    ld.shared.f32 %f63, [%r17 + 2564];
+    ld.shared.f32 %f64, [%r17 + 3076];
+    ld.shared.f32 %f65, [%r17 + 3588];
+    add.f32 %f58, %f58, %f59; add.f32 %f58, %f58, %f60; add.f32 %f58, %f58, %f61;
+    add.f32 %f58, %f58, %f62; add.f32 %f58, %f58, %f63; add.f32 %f58, %f58, %f64;
+    add.f32 %f58, %f58, %f65;
 
-    // Write to global out[d_row * N + n_tile_base + d_col_base + 0..3]
-    add.u32 %r106, %r3, %r11;           // n_tile_base + d_col_base
-    mad.lo.u32 %r107, %r8, %r0, %r106;  // d_row * N + n_tile_base + d_col_base
-    shl.b32    %r107, %r107, 2;          // * 4 bytes
-    cvt.u64.u32 %rd11, %r107;
+    ld.shared.f32 %f62, [%r17 + 256];
+    ld.shared.f32 %f63, [%r17 + 768];
+    ld.shared.f32 %f64, [%r17 + 1280];
+    ld.shared.f32 %f65, [%r17 + 1792];
+    ld.shared.f32 %f66, [%r17 + 2304];
+    ld.shared.f32 %f67, [%r17 + 2816];
+    ld.shared.f32 %f68, [%r17 + 3328];
+    ld.shared.f32 %f69, [%r17 + 3840];
+    add.f32 %f62, %f62, %f63; add.f32 %f62, %f62, %f64; add.f32 %f62, %f62, %f65;
+    add.f32 %f62, %f62, %f66; add.f32 %f62, %f62, %f67; add.f32 %f62, %f62, %f68;
+    add.f32 %f62, %f62, %f69;
+
+    ld.shared.f32 %f66, [%r17 + 260];
+    ld.shared.f32 %f67, [%r17 + 772];
+    ld.shared.f32 %f68, [%r17 + 1284];
+    ld.shared.f32 %f69, [%r17 + 1796];
+    ld.shared.f32 %f70, [%r17 + 2308];
+    ld.shared.f32 %f71, [%r17 + 2820];
+    ld.shared.f32 %f72, [%r17 + 3332];
+    ld.shared.f32 %f73, [%r17 + 3844];
+    add.f32 %f66, %f66, %f67; add.f32 %f66, %f66, %f68; add.f32 %f66, %f66, %f69;
+    add.f32 %f66, %f66, %f70; add.f32 %f66, %f66, %f71; add.f32 %f66, %f66, %f72;
+    add.f32 %f66, %f66, %f73;
+
+    // Write out[row * N + n_tile_base + col]:
+    //   d0 -> (gid, col0); d1 -> (gid, col0+1); d2 -> (gid+8, col0); d3 -> (gid+8, col0+1)
+    mad.lo.u32 %r106, %r9, %r0, %r3;    // gid * N + n_tile_base
+    add.u32    %r106, %r106, %r141;     // + col0
+    shl.b32    %r106, %r106, 2;
+    cvt.u64.u32 %rd11, %r106;
     add.u64    %rd11, %rd3, %rd11;
-    st.global.f32 [%rd11 + 0],  %f32;
-    st.global.f32 [%rd11 + 4],  %f33;
-    st.global.f32 [%rd11 + 8],  %f34;
-    st.global.f32 [%rd11 + 12], %f35;
+    @%p2 st.global.f32 [%rd11 + 0], %f50;
+    @%p2 st.global.f32 [%rd11 + 4], %f58;
+
+    mad.lo.u32 %r107, %r151, %r0, %r3;  // (gid+8) * N + n_tile_base
+    add.u32    %r107, %r107, %r141;     // + col0
+    shl.b32    %r107, %r107, 2;
+    cvt.u64.u32 %rd16, %r107;
+    add.u64    %rd16, %rd3, %rd16;
+    @%p4 st.global.f32 [%rd16 + 0], %f62;
+    @%p4 st.global.f32 [%rd16 + 4], %f66;
 
 SKIP_WRITE:
     bar.sync 1;

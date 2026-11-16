@@ -1,15 +1,26 @@
 // bench-probe-q4k-batch -- correctness cross-validation of the sm_120 Q4K
-// batch GEMM kernels (q4k_mma_batch_sm120, q4k_streamk_batch_sm120)
-// against the per-row kpar GEMV (q4k_gemv_sm120_dp4a_kpar8_dual_block),
-// on RANDOM native-GGUF Q4K blocks.
+// batch GEMM kernels (q4k_mma_batch_sm120, q4k_streamk_batch_sm120, and the
+// kpar8 batch) against the per-row kpar GEMV
+// (q4k_gemv_sm120_dp4a_kpar8_dual_block), on RANDOM native-GGUF Q4K blocks.
 //
 // Why random data: uniform/simple data cannot catch scale-extraction or
 // fragment-mapping bugs (the mxf4-gemv lesson) -- real weights exercise
 // every bit of the 6-bit cross-byte scale packing. The kpar per-row GEMV
 // is the ground truth here: it is the kernel the single-seq decode path
 // ships with, validated end-to-end (bench-quality teacher-forced PASS vs
-// the CPU reference). The batch kernels were previously only ever
-// NaN/determinism checked in the graph path -- this probe closes that gap.
+// the CPU reference).
+//
+// Acceptance:
+//   - kpar8_batch: BIT-IDENTICAL to the per-row reference (it replicates
+//     the kpar8 warp structure verbatim; this gates the no-graph path).
+//   - mma_batch / streamk_batch: <= 1e-5 max rel error. The mma.sync
+//     products are exact int8; the only permitted divergence from the
+//     per-row reference is the f32 SUM ORDER (the mma K-parallel warp
+//     partials + smem reduction vs the kpar butterfly), which is ~1e-6
+//     rel on random data. Anything above 1e-5 is a layout bug, not sum
+//     order (the 2026-11-16 retraction measured 12-31% on the broken
+//     kernels; fixed 2026-11-16f: byte group mw>>1, hi-select mw&1, raw
+//     nibble / raw 6-bit scales).
 //
 // Run: scripts/gpu-remote.sh bench probe-q4k-batch
 
@@ -99,6 +110,8 @@ fn upload<T: cutile::DType + Default + Clone>(
 
 fn main() {
     let shapes: &[(usize, usize, &str)] = &[
+        (64, 1, "tiny [n=64, k=256]"),
+        (64, 2, "tiny2 [n=64, k=512]"),
         (4096, 16, "q_proj [n=4096, k=4096]"),
         (1024, 16, "k/v_proj [n=1024, k=4096]"),
         (14336, 16, "gate/up [n=14336, k=4096]"),
@@ -112,11 +125,13 @@ fn main() {
         .expect("stream");
     let oxide = OxideQ4kGemv::try_load(stream.clone()).expect("oxide q4k load");
     println!(
-        "probe-q4k-batch: kpar_batch={} (mma/streamk dispatch disabled: {} / {})",
+        "probe-q4k-batch: kpar_batch={} mma_batch={} streamk_batch={}",
         oxide.has_sm120_kpar_batch(),
         oxide.has_mma_batch(),
         oxide.has_streamk_batch(),
     );
+    assert!(oxide.has_mma_batch(), "mma_batch PTX not loaded");
+    assert!(oxide.has_streamk_batch(), "streamk_batch PTX not loaded");
     assert!(oxide.uses_raw_gguf, "expected native-GGUF upload format (sm120 active)");
     // The kpar per-row ground truth needs the pre-allocated KV-stream Q8_1
     // scratch (see submit_sm120_kpar_kv_into_slot).
@@ -207,9 +222,11 @@ fn main() {
                 );
             }
 
-            // 2) mma_batch / streamk: DOCUMENTED BROKEN (sub-block nibble/
-            //    scale layout misparse, 12-31% rel error). Informational:
-            //    they must never be dispatched until fixed.
+            // 2) mma_batch / streamk: tensor-core paths. The mma.sync int8
+            //    products are exact; only the f32 sum ORDER may differ from
+            //    the per-row reference (K-parallel warp partials vs the kpar
+            //    butterfly) -> <= 1e-5 rel on random data. Anything more is
+            //    a layout bug (the 2026-11-16 retraction was 12-31%).
             for (kernel, is_mma) in [("mma", true), ("streamk", false)] {
                 let out = Arc::new(
                     api::zeros::<f32>(&[m * n]).sync_on(&stream).expect("out alloc"),
@@ -224,7 +241,11 @@ fn main() {
                     )
                 };
                 if let Err(e) = res {
-                    println!("  {label} m={m} {kernel}: SKIP ({e})");
+                    // Not loaded is a hard failure too: the probe must cover
+                    // every kernel the PTX ships (a silently-unloaded kernel
+                    // is exactly how the 2026-11-16 retraction slipped).
+                    any_fail = true;
+                    println!("  {label} m={m} {kernel}: FAIL (launch error: {e})");
                     continue;
                 }
                 let got = out.to_host_vec().sync_on(&stream).expect("out download");
@@ -239,14 +260,16 @@ fn main() {
                         let rel = ((a - b).abs() / denom) as f64;
                         row_max = row_max.max(rel);
                     }
-                    if row_max > 1e-3 {
+                    if row_max > 1e-5 {
                         bad_rows += 1;
                     }
                     max_rel = max_rel.max(row_max);
                 }
-                // Expected MISMATCH (documented broken); print for the record.
+                if bad_rows > 0 {
+                    any_fail = true;
+                }
                 println!(
-                    "  {label} m={m} {kernel}: {} (max rel err {max_rel:.3e}, bad rows {bad_rows}/{m}) [expected MISMATCH: documented broken]",
+                    "  {label} m={m} {kernel}: {} (max rel err {max_rel:.3e}, bad rows {bad_rows}/{m}, gate 1e-5)",
                     if bad_rows == 0 { "OK" } else { "MISMATCH" }
                 );
             }

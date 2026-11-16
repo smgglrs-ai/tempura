@@ -1328,29 +1328,24 @@ impl OxideQ4kGemv {
     }
 
     /// Returns true when the sm_120 MMA batch GEMM kernel is loaded (INT8 tensor cores).
-    /// DISABLED: bench-probe-q4k-batch (2026-11-16) showed this kernel and the
-    /// stream-K variant misparse the Q4K sub-block nibble/scale layout
-    /// (12-31% rel error vs the validated kpar8 GEMV on random data; they
-    /// pair weight nibbles with the wrong activation elements and use a
-    /// wrong dequant convention -- raw nibble, no -8 offset, no /32 scale).
-    /// Their outputs were only ever NaN/determinism checked, which cannot
-    /// catch this (the mxf4-gemv lesson). Do NOT dispatch until fixed and
-    /// probe-validated; the graph path's stream-K preference is dormant on
-    /// Q4_K_M (all its Q4K projections route to MXFP4).
+    /// RE-ENABLED 2026-11-16f: the Q4K sub-block layout misparse is FIXED
+    /// (byte group mw>>1 with hi-nibble select on odd mw; raw nibble 0..15
+    /// and raw 6-bit scales -- the kpar8 convention) and bench-probe-q4k-batch
+    /// now gates the kernel at <= 1e-5 max rel error vs the per-row kpar8
+    /// reference on random native-GGUF blocks (sum-order-only divergence;
+    /// the broken version measured 12-31%). NOT bit-identical to the per-row
+    /// GEMV: only dispatch where the batch composition is fixed per capture
+    /// (the equal-position graph paths) -- never a ragged/no-graph serving
+    /// path, whose composition-invariance contract requires bit-identity.
     pub fn has_mma_batch(&self) -> bool {
-        false
+        self.uses_raw_gguf && self.cu_mma_batch.is_some()
     }
 
     /// Returns true when the sm_120 stream-K batch GEMM kernel is loaded.
-    /// DISABLED (2026-11-16): bench-probe-q4k-batch showed this kernel (and
-    /// mma_batch) misparse the Q4K sub-block nibble/scale layout -- 12-31%
-    /// rel error vs the validated kpar8 GEMV on random data. It was only
-    /// ever NaN/determinism checked. Dormant on Q4_K_M (the graph path
-    /// routes its Q4K projections to MXFP4), but all-Q4K models must not
-    /// dispatch it. Do not re-enable until fixed and probe-validated; use
-    /// has_sm120_kpar_batch() (bit-identical batch kpar8) instead.
+    /// RE-ENABLED 2026-11-16f: same fix + probe gate as has_mma_batch (see
+    /// there). Same dispatch rule: graph paths only.
     pub fn has_streamk_batch(&self) -> bool {
-        false
+        self.uses_raw_gguf && self.cu_streamk.is_some()
     }
 
     /// Returns true when the sm_120 M-row batch kpar8 kernel is loaded.
@@ -1802,8 +1797,10 @@ impl OxideQ4kGemv {
                 &m_u32 as *const _ as *mut c_void,
             ];
             let grid_x = n_u32.div_ceil(8);
-            let warps = if k_blocks * 8 % 4 == 0 { 4u32 } else { 2u32 };
-            let block_dim = warps * 32;
+            // 8 warps: the PTX stripes the 8 sub-blocks per k-block across
+            // 8 warps ((kb*8+mw) % 8 == warp_id) and the reduction sums 8
+            // per-warp partials -- block dim must be 256.
+            let block_dim = 256u32;
             unsafe {
                 launch_kernel(
                     mma_fn,
