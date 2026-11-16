@@ -493,6 +493,157 @@ fn main() {
     let cpu_k = cpu_rope(&xk, TEST_POS, N_KV_HEADS);
     all_ok &= report("rope graph path (gather+from_table)", &gpu_g, &cpu_k);
 
+    // ---- 2b. Batched rope rows (ragged batch decode route) -----------------
+    // The batched per-row rope (ONE launch for the whole batch, strided
+    // source, per-row gathered cos/sin rows) must be BIT-IDENTICAL to the
+    // per-request table rope it replaces (forward_device_scratch seq_len=1
+    // -> cutile_rope_from_table).  Adversarial: per-row positions DISTINCT,
+    // source row stride != row_dim (the engine's q_pad/kv_pad padding), and
+    // the reclaimed z buffer exercised twice (second call reuses it).
+    {
+        let m = 4usize;
+        let positions: Vec<u32> = vec![85, 7, 4095, 1234];
+        let half = HEAD_DIM / 2;
+        // (label, n_heads) -- the Q shape and the K/GQA shape.
+        for (label, n_heads) in [("q", N_HEADS), ("k", N_KV_HEADS)] {
+            let row_dim = n_heads * HEAD_DIM;
+            let src_stride = row_dim + half; // adversarial padded stride
+            let mut x = prng_data(m * src_stride, 30 + n_heads as u32);
+            // Distinct garbage in the pad tails so strided reads that grab
+            // the wrong row/elements cannot pass by coincidence.
+            for r in 0..m {
+                for d in row_dim..src_stride {
+                    x[r * src_stride + d] = f32::from_bits(0x7f800000 + r as u32);
+                }
+            }
+            let x_dev = upload(x.clone(), &stream);
+            // Per-row gathered cos/sin rows (the engine's exact mechanism:
+            // d_positions f32-bitcast + gather_row_by_device_pos).
+            let mut pos_bits = Vec::with_capacity(m);
+            for &p in &positions {
+                pos_bits.push(f32::from_bits(p));
+            }
+            let pos_dev = upload(pos_bits, &stream);
+            let cos_rows: Arc<Tensor<f32>> = api::zeros::<f32>(&[m * half])
+                .sync_on(&stream)
+                .expect("batched rope probe cos alloc")
+                .into();
+            let sin_rows: Arc<Tensor<f32>> = api::zeros::<f32>(&[m * half])
+                .sync_on(&stream)
+                .expect("batched rope probe sin alloc")
+                .into();
+            let pos_base = pos_dev.device_pointer().cu_deviceptr();
+            for r in 0..m {
+                scatter
+                    .gather_row_by_device_pos(
+                        cos_ptr,
+                        cos_rows.device_pointer().cu_deviceptr() + (r * half * 4) as u64,
+                        pos_base + (r * 4) as u64,
+                        half as u32,
+                        max_pos as u32,
+                        cu_stream,
+                    )
+                    .expect("batched rope probe cos gather failed");
+                scatter
+                    .gather_row_by_device_pos(
+                        sin_ptr,
+                        sin_rows.device_pointer().cu_deviceptr() + (r * half * 4) as u64,
+                        pos_base + (r * 4) as u64,
+                        half as u32,
+                        max_pos as u32,
+                        cu_stream,
+                    )
+                    .expect("batched rope probe sin gather failed");
+            }
+            // Batched (twice: the second call must reclaim the same z).
+            let mut z: Option<Arc<Tensor<f32>>> = None;
+            let batch_out = rope
+                .forward_rows_batch(
+                    &x_dev,
+                    &cos_rows,
+                    &sin_rows,
+                    m,
+                    n_heads,
+                    HEAD_DIM,
+                    src_stride,
+                    &mut z,
+                    &stream,
+                )
+                .expect("batched rope probe forward failed");
+            let batch_bits: Vec<u32> = download(&batch_out, &stream)
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            let z_addr = z.as_ref().unwrap().device_pointer().cu_deviceptr();
+            let batch_bits2 = {
+                // Drop the caller Arc first (the engine drops the layer's
+                // rope output before the next layer's call) so the second
+                // call exercises the try_unwrap reclaim of the same buffer.
+                drop(batch_out);
+                let batch_out2 = rope
+                    .forward_rows_batch(
+                        &x_dev,
+                        &cos_rows,
+                        &sin_rows,
+                        m,
+                        n_heads,
+                        HEAD_DIM,
+                        src_stride,
+                        &mut z,
+                        &stream,
+                    )
+                    .expect("batched rope probe forward (reclaim) failed");
+                let bits: Vec<u32> = download(&batch_out2, &stream)
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect();
+                drop(batch_out2);
+                bits
+            };
+            let reclaim_ok = z.as_ref().unwrap().device_pointer().cu_deviceptr() == z_addr;
+            if !reclaim_ok {
+                println!("  batched rope rows {label} (z reclaim): FAIL (buffer moved)");
+                all_ok = false;
+            }
+            if batch_bits != batch_bits2 {
+                println!("  batched rope rows {label} (repeat): FAIL");
+                all_ok = false;
+            }
+            // Reference: the per-request table rope, one row at a time.
+            let mut ref_bits: Vec<u32> = Vec::with_capacity(m * row_dim);
+            let mut r_scratch = RopeScratch::new(&stream, n_heads, HEAD_DIM).unwrap();
+            for r in 0..m {
+                let row: Vec<f32> =
+                    x[r * src_stride..r * src_stride + row_dim].to_vec();
+                let row_dev = upload(row, &stream);
+                let out = rope
+                    .forward_device_scratch(
+                        &row_dev,
+                        &[positions[r]],
+                        1,
+                        n_heads,
+                        HEAD_DIM,
+                        THETA,
+                        &mut r_scratch,
+                        &stream,
+                    )
+                    .expect("batched rope probe reference failed");
+                ref_bits.extend(download(&out, &stream).iter().map(|v| v.to_bits()));
+            }
+            let mismatches = batch_bits
+                .iter()
+                .zip(&ref_bits)
+                .filter(|(a, b)| a != b)
+                .count();
+            let ok = mismatches == 0 && batch_bits.len() == ref_bits.len();
+            println!(
+                "  batched rope rows {label} (m={m}, stride={src_stride}): {} ({mismatches} mismatched elements)",
+                if ok { "PASS" } else { "FAIL" }
+            );
+            all_ok &= ok;
+        }
+    }
+
     // ---- 3. KV scatter-write placement ----
     let kv_dim = N_KV_HEADS * HEAD_DIM;
     let rows = 16usize;
