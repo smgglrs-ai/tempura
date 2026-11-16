@@ -127,6 +127,25 @@ impl Drop for DecodeGraph {
 unsafe impl Send for DecodeGraph {}
 unsafe impl Sync for DecodeGraph {}
 
+/// Which numerics contract `forward_decode_inner` must honor.
+///
+/// `Wrapper` is the single-seq CUDA-graph path used by the wrapper's own
+/// session cache: it prefers the split-K attention (faster grid fill; NOT
+/// bit-identical to kpar, ~1e-6) and the fused gate+up SiLU GEMV.
+///
+/// `PooledM1` is the serving m=1 graph route over a POOLED run: it must be
+/// BIT-IDENTICAL to the generic no-graph batch path at m=1 (the
+/// composition-invariance requirement -- a session decoded alone must
+/// produce the same logits as the same session decoded inside a batch).
+/// It therefore uses the per-row kpar attention twins (never splitk),
+/// separate gate/up GEMVs + silu_mul (never the fused kernel), and the
+/// dtype scatter-write twins for the KV append.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecodeInnerMode {
+    Wrapper,
+    PooledM1,
+}
+
 // BK must be a multiple that divides all standard hidden / intermediate
 // dimensions (4096, 11008, 14336, ...).  16 matches the tiling constant used
 // inside CutileMatMul::forward_bt_device_to_device.
@@ -681,6 +700,19 @@ pub struct CutileGpuModel {
     /// allowing per-step parameters (pos, kv_len, KV cache write offset) to vary
     /// while the graph topology stays fixed.
     cached_decode_graph: RefCell<Option<DecodeGraph>>,
+    /// Per-RUN decode graphs for the serving m=1 route (PooledM1 mode).
+    /// Keyed by (layer-0 K run base pointer, pool dtype tag): a pooled
+    /// graph is a "decode step on the run at base X in dtype D" template
+    /// -- session-agnostic (all per-step scalars are device-read), so
+    /// runs reused at the same base share the graph legitimately.
+    /// Validated against the current run base pointers on every call; a
+    /// realloc/swap that moves the run re-captures.  Deliberately NOT
+    /// keyed on capacity_gen: nothing in this graph depends on capacity
+    /// (kv_len / write offset / position are device-read, the kpar
+    /// attention grid is fixed), so extend-in-place growth replays fine.
+    /// Capped: cleared wholesale when it exceeds 32 entries (freed runs
+    /// leave stale entries behind; re-capture is cheap and rare).
+    pooled_decode_graphs: RefCell<HashMap<(u64, u8), DecodeGraph>>,
     /// CUDA graph for the prefill chunk's layer loop (captured on 2nd call
     /// with the same key, replayed on 3rd+). None when not yet captured.
     cached_prefill_graph: RefCell<Option<PrefillGraph>>,
@@ -2671,6 +2703,7 @@ impl CutileGpuModel {
             kv_scatter_write,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
+            pooled_decode_graphs: RefCell::new(HashMap::new()),
             cached_prefill_graph: RefCell::new(None),
             prefill_last_key: RefCell::new(None),
             prefill_last_row: RefCell::new(None),
@@ -3130,6 +3163,7 @@ impl CutileGpuModel {
             kv_scatter_write,
             final_norm_scratch: RefCell::new(final_norm_scratch),
             cached_decode_graph: RefCell::new(None),
+            pooled_decode_graphs: RefCell::new(HashMap::new()),
             cached_prefill_graph: RefCell::new(None),
             prefill_last_key: RefCell::new(None),
             prefill_last_row: RefCell::new(None),
@@ -4868,6 +4902,11 @@ impl CutileGpuModel {
         // Multi-stream path: oxide f32 GEMV available for Q4K, Q6K, or Q2 K/V weights.
         // TEMPURA_NO_MULTISTREAM=1 bisects the stream_kv fork/join off (decode
         // numerics debugging -- see bench-quality / bench-decode-ops).
+        // PooledM1 (serving m=1 graph route) also takes it: the KV-stream
+        // submits use the SAME kernels as the generic path's main-stream
+        // dispatch (Q4K: kpar_dispatch.cu_fn + the same q8 quantize kernel,
+        // separate scratch; Q6K: the same select_kpar_fn) -- deterministic
+        // kernels, so only the stream differs, not the output bits.
         if seq_len == 1 && std::env::var("TEMPURA_NO_MULTISTREAM").as_deref() != Ok("1") {
             let has_q4k_kv = self.oxide_q4k_gemv.is_some()
                 && (self.device_weights_q4k.contains_key(k_name)
@@ -6212,7 +6251,7 @@ impl CutileGpuModel {
             // (async D2H during stream capture is not).
             drop(graph_cache);
             let hidden_dev = self.d_embed.clone();
-            self.forward_decode_inner(hidden_dev, positions, gpu_kv_cache);
+            self.forward_decode_inner(hidden_dev, positions, gpu_kv_cache, DecodeInnerMode::Wrapper);
             unsafe {
                 stream.synchronize().expect("nan-trace stream sync failed");
             }
@@ -6292,7 +6331,7 @@ impl CutileGpuModel {
             }
 
             let hidden_dev = self.d_embed.clone();
-            self.forward_decode_inner(hidden_dev, positions, gpu_kv_cache);
+            self.forward_decode_inner(hidden_dev, positions, gpu_kv_cache, DecodeInnerMode::Wrapper);
 
             let cu_graph = unsafe { stream.end_capture().expect("cuStreamEndCapture failed") };
 
@@ -6361,6 +6400,222 @@ impl CutileGpuModel {
         self.scratch.borrow()[SLOT_LOGITS]
             .clone()
             .expect("SLOT_LOGITS empty after graph launch")
+    }
+
+    /// Capture/replay the single-seq decode CUDA graph on a POOLED run
+    /// (the serving m=1 route).
+    ///
+    /// Same machinery as [`Self::forward_decode_with_graph`] but for pooled
+    /// serving runs: graphs are cached per RUN (keyed by the layer-0 K run
+    /// base pointer + pool dtype tag) and validated against the current
+    /// per-layer run base pointers on every call -- a growth realloc or a
+    /// swap that moves the run re-captures; extend-in-place growth replays
+    /// (nothing in this graph depends on capacity: kv_len / write offset /
+    /// position are all device-read, the kpar attention grid is fixed).
+    ///
+    /// The captured composition honors the PooledM1 numerics contract:
+    /// bit-identical to the generic no-graph batch path at m=1 (per-row
+    /// kpar GEMVs, kpar attention twins, dtype scatter-write append).  A
+    /// pooled graph is session-agnostic -- every per-step scalar is
+    /// device-read -- so a run reused at the same base legitimately
+    /// shares the graph.
+    ///
+    /// Returns the device logits tensor (SLOT_LOGITS), or None when
+    /// capture fails (the caller falls back to the generic path) or when
+    /// TEMPURA_DEBUG_NAN is active (the generic path carries the NaN
+    /// instrumentation).
+    fn forward_decode_with_graph_pooled(
+        &self,
+        embedding: &[f32],
+        position: u32,
+        gpu_kv_cache: &mut CutileKvCache,
+    ) -> Option<Arc<Tensor<f32>>> {
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+        let stream = self.matmul.stream();
+        let cu_stream = stream.cu_stream();
+
+        if self.debug_nan_trace {
+            return None;
+        }
+
+        // -- Always: upload embedding + scalars before capture or launch --
+        let embed_src: Vec<f32> = if self.h_pad == h {
+            embedding.to_vec()
+        } else {
+            let mut v = vec![0.0f32; self.h_pad];
+            v[..h].copy_from_slice(&embedding[..h]);
+            v
+        };
+        unsafe {
+            cuda_core::memcpy_htod_async::<f32>(
+                self.d_embed.device_pointer().cu_deviceptr(),
+                embed_src.as_ptr(),
+                self.h_pad,
+                stream,
+            )
+            .expect("d_embed H->D copy failed");
+        }
+        let kv_write_off = gpu_kv_cache.seq_len() as i32;
+        let kv_len_bits: f32 = f32::from_bits((kv_write_off + 1) as u32);
+        let pos_bits: f32 = f32::from_bits(position);
+        unsafe {
+            cuda_core::memcpy_htod_async::<f32>(
+                self.d_kv_len.device_pointer().cu_deviceptr(),
+                &kv_len_bits as *const f32,
+                1,
+                stream,
+            )
+            .expect("d_kv_len H->D copy failed");
+            cuda_core::memcpy_htod_async::<f32>(
+                self.d_positions.device_pointer().cu_deviceptr(),
+                &pos_bits as *const f32,
+                1,
+                stream,
+            )
+            .expect("d_positions H->D copy failed");
+            cuda_core::memcpy_htod_async::<i32>(
+                self.d_kv_write_offset.device_pointer().cu_deviceptr(),
+                &kv_write_off as *const i32,
+                1,
+                stream,
+            )
+            .expect("d_kv_write_offset H->D copy failed");
+        }
+
+        // Run identity: layer-0 K base pointer + dtype tag.
+        let dtype_tag = match gpu_kv_cache.kv_dtype() {
+            crate::cutile_kv_cache::KvDtype::F32 => 0u8,
+            crate::cutile_kv_cache::KvDtype::F16 => 1u8,
+            crate::cutile_kv_cache::KvDtype::E4M3 => 2u8,
+        };
+        let (k0_base, _v0_base) = gpu_kv_cache.kv_device_base_ptrs(0);
+        let key = (k0_base, dtype_tag);
+
+        let mut graphs = self.pooled_decode_graphs.borrow_mut();
+        if graphs.len() > 32 {
+            // Cap: entries for freed runs accumulate silently (the model is
+            // not notified when a run is freed); re-capture is cheap.
+            graphs.clear();
+        }
+        // Validate every layer's run base pointers against the cached
+        // graph (the key only pins layer 0).
+        let stale = match graphs.get(&key) {
+            Some(dg) => (0..cfg.num_layers).any(|l| {
+                let (k, v) = gpu_kv_cache.kv_device_base_ptrs(l);
+                k != dg.captured_k_ptrs[l] || v != dg.captured_v_ptrs[l]
+            }),
+            None => false,
+        };
+        if stale {
+            eprintln!("[m1_graph] run ptrs changed -- re-capturing");
+            graphs.remove(&key);
+        }
+
+        if let Some(dg) = graphs.get(&key) {
+            // -- Subsequent steps: plain replay --------------------------------
+            unsafe {
+                cuda_core::sys::cuGraphLaunch(dg.cu_exec, cu_stream);
+            }
+            unsafe {
+                stream
+                    .synchronize()
+                    .expect("stream sync after m=1 graph launch failed");
+            }
+        } else {
+            // -- First step on this run: capture, instantiate, launch --------
+            self.ensure_attn_pad_buf(1);
+            self.ensure_residual_pad_bufs(1);
+            self.quiesce_retirement_before_capture(&stream);
+            let relaxed =
+                cuda_core::sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED;
+            unsafe {
+                stream
+                    .begin_capture(relaxed)
+                    .expect("m=1 cuStreamBeginCapture failed");
+            }
+
+            let hidden_dev = self.d_embed.clone();
+            self.forward_decode_inner(
+                hidden_dev,
+                &[position],
+                gpu_kv_cache,
+                DecodeInnerMode::PooledM1,
+            );
+
+            let cu_graph = match unsafe { stream.end_capture() } {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!(
+                        "[m1_graph] end_capture failed: {e:?} (falling back to generic path)"
+                    );
+                    return None;
+                }
+            };
+
+            let mut cu_exec_uninit = MaybeUninit::<cuda_core::sys::CUgraphExec>::uninit();
+            let rc = unsafe {
+                cuda_core::sys::cuGraphInstantiateWithFlags(
+                    cu_exec_uninit.as_mut_ptr(),
+                    cu_graph,
+                    0,
+                )
+            };
+            if rc != 0 {
+                eprintln!(
+                    "[m1_graph] cuGraphInstantiateWithFlags rc={rc} (falling back to generic path)"
+                );
+                return None;
+            }
+            let cu_exec = unsafe { cu_exec_uninit.assume_init() };
+            let rc_up = unsafe { cuda_core::sys::cuGraphUpload(cu_exec, cu_stream) };
+            if rc_up != 0 {
+                eprintln!("[m1_graph] cuGraphUpload rc={rc_up} (continuing; first launch uploads)");
+            }
+
+            // Record the run base pointers this graph was captured with.
+            let captured_k_ptrs: Vec<u64> = (0..cfg.num_layers)
+                .map(|l| gpu_kv_cache.kv_device_base_ptrs(l).0)
+                .collect();
+            let captured_v_ptrs: Vec<u64> = (0..cfg.num_layers)
+                .map(|l| gpu_kv_cache.kv_device_base_ptrs(l).1)
+                .collect();
+            eprintln!(
+                "[m1_graph] captured for run k0={k0_base:#x} dtype={dtype_tag} ({} layers)",
+                cfg.num_layers
+            );
+
+            graphs.insert(
+                key,
+                DecodeGraph {
+                    cu_exec,
+                    cu_graph,
+                    device: Arc::new(stream.context().device()),
+                    captured_k_ptrs,
+                    captured_v_ptrs,
+                    // Informational only: this graph deliberately replays
+                    // across capacity growth (see the field docs).
+                    captured_capacity_gen: gpu_kv_cache.capacity_gen(),
+                },
+            );
+
+            unsafe {
+                cuda_core::sys::cuGraphLaunch(cu_exec, cu_stream);
+            }
+            unsafe {
+                stream
+                    .synchronize()
+                    .expect("stream sync after first m=1 graph launch failed");
+            }
+        }
+        drop(graphs);
+
+        // Logits are mirrored into SLOT_LOGITS by lm_head_gemm (m=1).
+        Some(
+            self.scratch.borrow()[SLOT_LOGITS]
+                .clone()
+                .expect("SLOT_LOGITS empty after m=1 graph launch"),
+        )
     }
 
     /// Refresh the CUDA-graph-stable RoPE cos/sin row buffers for the CURRENT
@@ -6457,7 +6712,7 @@ impl CutileGpuModel {
 
         // Upload embedding to a fresh device tensor (normal non-graph path).
         let hidden_dev = self.to_device_flat_padded(embedding, 1, h, self.h_pad);
-        self.forward_decode_inner(hidden_dev, positions, gpu_kv_cache);
+        self.forward_decode_inner(hidden_dev, positions, gpu_kv_cache, DecodeInnerMode::Wrapper);
 
         // Sync the stream and download logits from SLOT_LOGITS.
         let logits_arc = self.scratch.borrow()[SLOT_LOGITS]
@@ -6518,6 +6773,7 @@ impl CutileGpuModel {
         mut hidden_dev: Arc<Tensor<f32>>,
         positions: &[u32],
         gpu_kv_cache: &mut CutileKvCache,
+        mode: DecodeInnerMode,
     ) {
         let cfg = &self.config;
         let h = cfg.hidden_size;
@@ -6682,28 +6938,81 @@ impl CutileGpuModel {
             // d_kv_write_offset (read from device at execution time).  This is
             // graph-stable: the src/cache pointers are captured once; only the
             // value at d_kv_write_offset changes (updated via H->D before each step).
+            // Dtype-aware (m=1 graph route): f16/e4m3 pools convert in-kernel
+            // with the SAME bit-math as the generic append path's cast kernels
+            // (cutile_cast_f32_f16/_e4m3) -- composition invariance requires
+            // the pool bytes to be identical whichever path appended them.
+            // kv_device_base_ptrs is run-base-shifted and dtype-erased: for
+            // the wrapper's f32 base-0 cache it equals the whole-tensor
+            // pointers, so Wrapper-mode behavior is unchanged.
             let kv_dim_u32 = (n_kv_heads * head_dim) as u32;
-            let (k_cache_arc, v_cache_arc) = gpu_kv_cache.kv_device_tensors(layer).expect("wrapper session cache is f32");
+            let (k_run_base, v_run_base) = gpu_kv_cache.kv_device_base_ptrs(layer);
             let write_off_ptr = self.d_kv_write_offset.device_pointer().cu_deviceptr();
             let cu_stream_raw = shared_stream.cu_stream();
-            self.kv_scatter_write
-                .copy_with_device_offset(
-                    k_rot_dev.device_pointer().cu_deviceptr(),
-                    k_cache_arc.device_pointer().cu_deviceptr(),
-                    write_off_ptr,
-                    kv_dim_u32,
-                    cu_stream_raw,
-                )
-                .expect("KV scatter-write K failed");
-            self.kv_scatter_write
-                .copy_with_device_offset(
-                    v_dev.device_pointer().cu_deviceptr(),
-                    v_cache_arc.device_pointer().cu_deviceptr(),
-                    write_off_ptr,
-                    kv_dim_u32,
-                    cu_stream_raw,
-                )
-                .expect("KV scatter-write V failed");
+            let k_src_ptr = k_rot_dev.device_pointer().cu_deviceptr();
+            let v_src_ptr = v_dev.device_pointer().cu_deviceptr();
+            match gpu_kv_cache.kv_dtype() {
+                crate::cutile_kv_cache::KvDtype::F32 => {
+                    self.kv_scatter_write
+                        .copy_with_device_offset(
+                            k_src_ptr,
+                            k_run_base,
+                            write_off_ptr,
+                            kv_dim_u32,
+                            cu_stream_raw,
+                        )
+                        .expect("KV scatter-write K failed");
+                    self.kv_scatter_write
+                        .copy_with_device_offset(
+                            v_src_ptr,
+                            v_run_base,
+                            write_off_ptr,
+                            kv_dim_u32,
+                            cu_stream_raw,
+                        )
+                        .expect("KV scatter-write V failed");
+                }
+                crate::cutile_kv_cache::KvDtype::F16 => {
+                    self.kv_scatter_write
+                        .copy_with_device_offset_f16(
+                            k_src_ptr,
+                            k_run_base,
+                            write_off_ptr,
+                            kv_dim_u32,
+                            cu_stream_raw,
+                        )
+                        .expect("KV scatter-write K (f16) failed");
+                    self.kv_scatter_write
+                        .copy_with_device_offset_f16(
+                            v_src_ptr,
+                            v_run_base,
+                            write_off_ptr,
+                            kv_dim_u32,
+                            cu_stream_raw,
+                        )
+                        .expect("KV scatter-write V (f16) failed");
+                }
+                crate::cutile_kv_cache::KvDtype::E4M3 => {
+                    self.kv_scatter_write
+                        .copy_with_device_offset_e4m3(
+                            k_src_ptr,
+                            k_run_base,
+                            write_off_ptr,
+                            kv_dim_u32,
+                            cu_stream_raw,
+                        )
+                        .expect("KV scatter-write K (e4m3) failed");
+                    self.kv_scatter_write
+                        .copy_with_device_offset_e4m3(
+                            v_src_ptr,
+                            v_run_base,
+                            write_off_ptr,
+                            kv_dim_u32,
+                            cu_stream_raw,
+                        )
+                        .expect("KV scatter-write V (e4m3) failed");
+                }
+            }
             gpu_kv_cache.mark_host_stale();
 
             // kv_len includes the token just appended.
@@ -6711,7 +7020,6 @@ impl CutileGpuModel {
 
             // GPU decode attention (fused flash-attention, pre-allocated scratch).
             let scale = 1.0 / (head_dim as f32).sqrt();
-            let (k_dev_full, v_dev_full) = gpu_kv_cache.kv_device_tensors(layer).expect("wrapper session cache is f32");
 
             // Prefer oxide decode attention (kv_len read from device at execution
             // time -- correct CUDA graph replay without stale kv_len baking).
@@ -6738,41 +7046,80 @@ impl CutileGpuModel {
                         ),
                     }
                 };
-                // Split-K variant: grid (n_heads x 16) fills all SMs; the
-                // kpar fallback still beats the single-warp scan.
-                if let Some(ref splitk_scratch) = self.attn_splitk_scratch {
-                    oda.forward_splitk_d2d(
-                        &out_tensor,
-                        &q_rot_dev,
-                        &k_dev_full,
-                        &v_dev_full,
-                        &self.d_kv_len,
-                        splitk_scratch,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        scale,
-                    )
-                    .expect("oxide decode attention splitk failed");
+                if mode == DecodeInnerMode::PooledM1 {
+                    // Serving m=1 graph route: the per-request kpar twins on
+                    // the RUN base pointers, dispatched by pool dtype -- the
+                    // EXACT kernels the generic no-graph path dispatches at
+                    // m=1 (bit-identity; NEVER splitk here: its different
+                    // reduce order breaks composition invariance).
+                    let (k_base, v_base) = gpu_kv_cache.kv_device_base_ptrs(layer);
+                    let res = if gpu_kv_cache.kv_f16() {
+                        oda.forward_kpar_d2d_ptrs_f16(
+                            &out_tensor, &q_rot_dev, k_base, v_base, &self.d_kv_len,
+                            n_heads, n_kv_heads, head_dim, scale,
+                        )
+                    } else if gpu_kv_cache.kv_dtype()
+                        == crate::cutile_kv_cache::KvDtype::E4M3
+                    {
+                        oda.forward_kpar_d2d_ptrs_e4m3(
+                            &out_tensor, &q_rot_dev, k_base, v_base, &self.d_kv_len,
+                            n_heads, n_kv_heads, head_dim, scale,
+                        )
+                    } else {
+                        oda.forward_kpar_d2d_ptrs(
+                            &out_tensor, &q_rot_dev, k_base, v_base, &self.d_kv_len,
+                            n_heads, n_kv_heads, head_dim, scale,
+                        )
+                    };
+                    res.expect("oxide decode attention kpar (pooled m=1) failed");
                 } else {
-                    oda.forward_kpar_d2d(
-                        &out_tensor,
-                        &q_rot_dev,
-                        &k_dev_full,
-                        &v_dev_full,
-                        &self.d_kv_len,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        scale,
-                    )
-                    .expect("oxide decode attention kpar failed");
+                    // Wrapper mode: whole-tensor pointers (base-0 f32 cache).
+                    // PooledM1 never reaches here (the m=1 route gates on
+                    // oxide_decode_attn being present).
+                    let (k_dev_full, v_dev_full) = gpu_kv_cache
+                        .kv_device_tensors(layer)
+                        .expect("wrapper session cache is f32");
+                    // Split-K variant: grid (n_heads x 16) fills all SMs; the
+                    // kpar fallback still beats the single-warp scan.
+                    if let Some(ref splitk_scratch) = self.attn_splitk_scratch {
+                        oda.forward_splitk_d2d(
+                            &out_tensor,
+                            &q_rot_dev,
+                            &k_dev_full,
+                            &v_dev_full,
+                            &self.d_kv_len,
+                            splitk_scratch,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            scale,
+                        )
+                        .expect("oxide decode attention splitk failed");
+                    } else {
+                        oda.forward_kpar_d2d(
+                            &out_tensor,
+                            &q_rot_dev,
+                            &k_dev_full,
+                            &v_dev_full,
+                            &self.d_kv_len,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            scale,
+                        )
+                        .expect("oxide decode attention kpar failed");
+                    }
                 }
                 self.attn_out_scratch
                     .borrow_mut()
                     .replace(out_tensor.clone());
                 out_tensor
             } else {
+                // cuTile fallback (no oxide attention): wrapper-only, whole
+                // -tensor pointers.  PooledM1 gates on oxide_decode_attn.
+                let (k_dev_full, v_dev_full) = gpu_kv_cache
+                    .kv_device_tensors(layer)
+                    .expect("wrapper session cache is f32");
                 self.flash_attn
                     .decode_attention_device_scratch(
                         &q_rot_dev,
@@ -6889,6 +7236,7 @@ impl CutileGpuModel {
                 .map(|v| v == "1")
                 .unwrap_or(false);
             let gate_silu_n_dev = if seq_len == 1
+                && mode == DecodeInnerMode::Wrapper
                 && !fused_silu_disabled
                 // The fused kernel hard-codes SiLU -- Gemma GeGLU needs the
                 // separate GEMVs + GELU gating below.
@@ -10074,6 +10422,79 @@ impl CutileGpuModel {
             for v in &mut hidden {
                 *v *= s;
             }
+        }
+
+        // -- m=1 single-seq CUDA-graph route ------------------------------------
+        // The one allowed m-dependent DISPATCH: the captured composition is
+        // pinned to the generic path's per-op kernels (per-row kpar GEMVs
+        // via gemm_any_d2d_slot -- the same function the m=1 arm of
+        // gemm_any_d2d_batch dispatches; the kper attention twins the
+        // per-request fallback dispatches; the dtype scatter-write twins
+        // applying the same cast bit-math as d2d_into_pool; RoPE via the
+        // same from_table kernel the generic path's seq_len==1 fast path
+        // uses), so a session decoded ALONE through the graph produces
+        // BIT-IDENTICAL logits to the same session decoded inside a batch
+        // -- the composition-invariance gates (6-client kv-swap A/B,
+        // bench-ab-repro) prove it.  The graph eliminates ~200
+        // cuLaunchKernel submissions per step (the generic m=1 step is
+        // launch-latency-bound at ~9-10 ms vs the graph's ~4.6 ms).
+        // TEMPURA_NO_M1_GRAPH=1 bisects back to the generic path.
+        if m == 1
+            && std::env::var("TEMPURA_NO_M1_GRAPH").as_deref() != Ok("1")
+            && self.oxide_decode_attn.is_some()
+            && kv_caches[0].has_device_kv()
+            && !cfg.use_alibi
+            && positions[0] >= 1
+            && (positions[0] as usize) < self.cutile_rope.table_max_pos()
+        {
+            if let Some(logits_dev) =
+                self.forward_decode_with_graph_pooled(&hidden[..h], positions[0], &mut kv_caches[0])
+            {
+                // Same post-step contract as the generic path below.
+                kv_caches[0].advance_host_seq_len(1);
+                kv_caches[0].mark_host_stale();
+                if greedy[0] && self.greedy_argmax.is_some() {
+                    let ga = self.greedy_argmax.as_ref().unwrap();
+                    let argmax_out = {
+                        let mut ng = self.nograph.borrow_mut();
+                        ng.argmax_out
+                            .entry(1usize)
+                            .or_insert_with(|| {
+                                Arc::new(
+                                    cutile::api::zeros::<u32>(&[2])
+                                        .sync_on(stream)
+                                        .expect("m=1 argmax out alloc"),
+                                )
+                            })
+                            .clone()
+                    };
+                    unsafe {
+                        cuda_core::sys::cuMemsetD32Async(
+                            argmax_out.device_pointer().cu_deviceptr(),
+                            0,
+                            2,
+                            stream.cu_stream(),
+                        );
+                    }
+                    ga.launch_ptr(
+                        logits_dev.device_pointer().cu_deviceptr(),
+                        argmax_out.device_pointer().cu_deviceptr(),
+                        vocab,
+                    )
+                    .expect("m=1 graph greedy argmax launch");
+                    let tokens = argmax_out
+                        .to_host_vec()
+                        .sync_on(stream)
+                        .expect("m=1 argmax download");
+                    return vec![crate::model::BatchDecodeOutput::Token(tokens[0])];
+                }
+                let mut logits = self.download_logits(&logits_dev);
+                // The slot/kpar output may be oversized (max(inter, vocab));
+                // the generic path returns exactly [vocab].
+                logits.truncate(vocab);
+                return vec![crate::model::BatchDecodeOutput::Logits(logits)];
+            }
+            // None: capture failed -- fall through to the generic path.
         }
 
         // -- Batch CUDA graph path ---------------------------------------------
