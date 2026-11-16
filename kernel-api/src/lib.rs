@@ -312,6 +312,25 @@ pub trait Sampler: Send + Sync {
     fn apply(&self, logits: &[f32], output: &mut [f32], params: &SamplingParams) -> Result<()>;
     fn sample_token(&self, probs: &[f32], rng: Option<&mut dyn RngCore>) -> u32;
 
+    /// Fused decode-path sample: pre-softmax filters + softmax + top-k/
+    /// top-p + RNG draw in one pass over the k = min(top_k, vocab)
+    /// surviving candidates -- O(n log k) instead of the full-vocab sort
+    /// of `apply` + `sample_token` (which costs ~1.7 ms/row at vocab
+    /// 128k; ~10 ms/step at m=6 on the serving path, measured
+    /// 2026-11-16). Returns None when the implementation or the sampling
+    /// configuration does not support the fused path (e.g. greedy rows,
+    /// typical-p filtering); the caller falls back to `apply` +
+    /// `sample_token`.
+    fn sample_from_logits(
+        &self,
+        logits: &[f32],
+        params: &SamplingParams,
+        rng: Option<&mut dyn RngCore>,
+    ) -> Option<u32> {
+        let _ = (logits, params, rng);
+        None
+    }
+
     fn verification_tier(&self) -> VerificationTier {
         VerificationTier::Compiled
     }

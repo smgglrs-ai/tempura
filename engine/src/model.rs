@@ -11122,17 +11122,35 @@ where
         params: &SamplingParams,
         session: &mut InferenceSession,
     ) -> u32 {
+        if params.temperature != 0.0 {
+            // Sampled row: fused decode-path sampler first (top-k heap
+            // selection + O(k) softmax/top-p/sample) -- the full path's
+            // double full-vocab sort cost ~1.7 ms/row at vocab 128k
+            // (~10 ms/step at m=6 on the serving path, measured
+            // 2026-11-16). Falls back to apply + sample_token for configs
+            // the fused path does not cover.
+            let rng = &mut session.rng;
+            let fused =
+                self.pipeline
+                    .sampler
+                    .sample_from_logits(logits, params, Some(&mut *rng));
+            if let Some(tok) = fused {
+                return tok;
+            }
+            let mut probs = vec![0.0f32; logits.len()];
+            self.pipeline
+                .sampler
+                .apply(logits, &mut probs, params)
+                .unwrap();
+            return self.pipeline.sampler.sample_token(&probs, Some(rng));
+        }
+        // Greedy row (temperature 0): the exact full-path semantics.
         let mut probs = vec![0.0f32; logits.len()];
         self.pipeline
             .sampler
             .apply(logits, &mut probs, params)
             .unwrap();
-        let rng_ref: Option<&mut dyn rand::RngCore> = if params.temperature == 0.0 {
-            None
-        } else {
-            Some(&mut session.rng)
-        };
-        self.pipeline.sampler.sample_token(&probs, rng_ref)
+        self.pipeline.sampler.sample_token(&probs, None)
     }
     fn load_weights(
         &mut self,
